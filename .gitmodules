@@ -1,0 +1,4 @@
+[submodule "third_party/klipper"]
+	path = third_party/klipper
+	url = https://github.com/findlayfeng/klipper.git
+	branch = klipperx

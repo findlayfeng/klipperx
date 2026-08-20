@@ -1,0 +1,13 @@
+# KlipperX Test Support
+#
+# This crate provides test utilities for KlipperX.
+# Its build.rs builds the klipper host shared library (libklipper_host.so)
+# so that tests can load it at runtime.
+
+[package]
+name = "klipperx-test-support"
+version = "0.1.0"
+edition = "2021"
+description = "Test support for KlipperX - builds klipper host library for tests"
+
+[dependencies]

@@ -56,8 +56,8 @@ pub struct Parser {
 /// Parsed inbound message from the interface.
 #[derive(Debug, Clone)]
 pub struct InboundMessage {
-    /// Msg name (e.g. `"temperature_report"`).
-    pub name: String,
+    /// Msg id (use `Parser::id_to_name` to resolve to a human-readable name).
+    pub id: u8,
     /// Decoded parameter values in command definition order.
     pub params: Vec<ArgValue>,
 }
@@ -65,10 +65,10 @@ pub struct InboundMessage {
 /// A one-shot waiter registered by [`Parser::send_and_wait`].
 struct PendingWaiter {
     /// Unique id used to remove exactly this waiter — several concurrent
-    /// waiters may share the same message name.
+    /// waiters may share the same message id.
     id: u64,
-    /// Name of the awaited inbound message.
-    name: String,
+    /// Id of the awaited inbound message.
+    msg_id: u8,
     /// Channel used to deliver the decoded parameter values.
     tx: oneshot::Sender<Vec<ArgValue>>,
 }
@@ -412,6 +412,19 @@ impl Parser {
             ));
         }
 
+        // Resolve wait_name → id so the waiter can be matched against the
+        // inbound cmd_id without re-doing a name comparison for every payload.
+        let wait_id: u8 = {
+            let guard = self
+                .msgs
+                .lock()
+                .map_err(|_| MsgError::new("msgs lock poisoned"))?;
+            guard
+                .get_by_name(wait_name)
+                .map(|c| c.id)
+                .ok_or_else(|| MsgError::new(format!("Unknown wait message: {}", wait_name)))?
+        };
+
         // Register the waiter before sending so a fast response cannot
         // arrive between the send and the registration.
         let (tx, rx) = oneshot::channel();
@@ -423,7 +436,7 @@ impl Parser {
                 .map_err(|_| MsgError::new("waiters lock poisoned"))?;
             waiters.push(PendingWaiter {
                 id: waiter_id,
-                name: wait_name.to_string(),
+                msg_id: wait_id,
                 tx,
             });
         }
@@ -559,20 +572,19 @@ impl Parser {
         let cmd_id = parser.pop()?;
 
         // Look up command by id and extract data (lock held briefly)
-        let (name, param_defs, has_callback) = {
+        let (param_defs, has_callback) = {
             let guard = msgs.lock()
                 .map_err(|_| MsgError::new("msgs lock poisoned"))?;
             let cmd = guard
                 .get_by_id(&cmd_id)
                 .ok_or_else(|| MsgError::new(format!("Unknown command id: {}", cmd_id)))?;
 
-            let name = cmd.name.clone();
             let (param_defs, has_callback): (Vec<(String, ArgType)>, bool) =
                 match &cmd.command {
                     MsgEntry::Base(base) => (base.params().to_vec(), false),
                     MsgEntry::Handler(handler) => (handler.msg().params().to_vec(), true),
                 };
-            (name, param_defs, has_callback)
+            (param_defs, has_callback)
         }; // guard dropped here
 
         let param_types: Vec<ArgType> = param_defs.iter().map(|(_, t)| *t).collect();
@@ -584,7 +596,7 @@ impl Parser {
                 .map_err(|_| MsgError::new("waiters lock poisoned"))?;
             guard
                 .iter()
-                .position(|w| w.name == name)
+                .position(|w| w.msg_id == cmd_id)
                 .map(|pos| guard.remove(pos))
         };
         if let Some(waiter) = waiter {
@@ -596,12 +608,12 @@ impl Parser {
         if has_callback {
             let mut queue = callback_queue.lock()
                 .map_err(|_| MsgError::new("callback queue lock poisoned"))?;
-            queue.push_back(InboundMessage { name, params });
+            queue.push_back(InboundMessage { id: cmd_id, params });
             return Ok(());
         }
 
         // 3. Everything else is forwarded to the inbox channel.
-        tx.send(InboundMessage { name, params })
+        tx.send(InboundMessage { id: cmd_id, params })
             .await
             .map_err(|_| MsgError::new("inbox receiver dropped"))?;
 
@@ -1078,12 +1090,12 @@ mod tests {
 
         parser.waiters.lock().unwrap().push(PendingWaiter {
             id: id1,
-            name: "temperature".to_string(),
+            msg_id: 32,
             tx: tx1,
         });
         parser.waiters.lock().unwrap().push(PendingWaiter {
             id: id2,
-            name: "temperature".to_string(),
+            msg_id: 32,
             tx: tx2,
         });
 
@@ -1351,7 +1363,7 @@ mod tests {
         // The bound message lands in the callback queue.
         let msgs = collect_callback_msgs(&parser, 1).await;
         assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0].name, "temp_report");
+        assert_eq!(msgs[0].id, 31);
         assert_eq!(msgs[0].params, vec![ArgValue::UInt32(250)]);
 
         // The unbound message is forwarded to the inbox channel.
@@ -1359,7 +1371,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(forwarded.name, "identify_response");
+        assert_eq!(forwarded.id, 0);
         assert_eq!(
             forwarded.params,
             vec![ArgValue::UInt32(4), ArgValue::Str("abcd".to_string())]
@@ -1478,8 +1490,10 @@ mod tests {
         let mut parser = Parser::new(Arc::new(interface));
         let _rx = parser.start_inbox().await.unwrap();
 
+        // Use "identify_response" (id=0) — it's registered in DEFAULT_MESSAGES.
+        // The send fails with "Unknown command" (UNKNOWN cmd), not the wait lookup.
         let result = parser
-            .send_and_wait("UNKNOWN", &[], "temperature", Some(Duration::from_secs(1)))
+            .send_and_wait("UNKNOWN", &[], "identify_response", Some(Duration::from_secs(1)))
             .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().msg.contains("Unknown command"));

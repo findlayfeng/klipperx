@@ -1,5 +1,4 @@
-pub use super::super::frame::MESSAGE_PAYLOAD_MAX;
-pub use super::MsgBase;
+use super::super::frame::MESSAGE_PAYLOAD_MAX;
 
 /// Protocol error.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,6 +27,12 @@ impl From<serde_json::Error> for ProtoError {
     }
 }
 
+impl From<super::MsgError> for ProtoError {
+    fn from(e: super::MsgError) -> Self {
+        ProtoError::new(e.msg)
+    }
+}
+
 /// Result type used for protocol operations.
 pub type ProtoResult<T> = Result<T, ProtoError>;
 
@@ -43,7 +48,7 @@ pub enum ArgType {
 }
 
 /// Parameter value enum carrying the actual parameter data.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ArgValue {
     UInt16(u16),
     Int16(i16),
@@ -68,70 +73,55 @@ impl ArgValue {
 
     /// Attempt to convert this ArgValue to the target ArgType.
     ///
-    /// Supported conversions (numeric types only):
-    /// - Int16 ↔ UInt16
-    /// - Int32 ↔ UInt32
-    /// - Int16 → Int32, UInt16 → UInt32 (widening)
-    /// - Int16 → UInt32, UInt16 → Int32 (cross-width)
+    /// Only lossless conversions are supported (numeric types only):
+    /// - Widening: Int16 → Int32, UInt16 → UInt32, UInt16 → Int32
+    /// - Same width with a range check: Int16 ↔ UInt16, Int32 ↔ UInt32
     ///
-    /// Returns the converted value on success, or `Err(())` if
-    /// no conversion is possible.
+    /// Conversions that would wrap or lose information are rejected with
+    /// `Err(())`: negative values cannot convert to unsigned types, and
+    /// unsigned values above the target's maximum cannot convert to signed
+    /// types. Str/Bytes never convert to or from numeric types.
     pub fn try_convert_to(&self, target: ArgType) -> Result<ArgValue, ()> {
         // Same type — no conversion needed
         if self.arg_type() == target {
             return Ok(self.clone());
         }
 
-        // String and Bytes are not convertible to numeric types
-        if matches!(self, ArgValue::Str(_) | ArgValue::Bytes(_)) && !matches!(target, ArgType::Str | ArgType::Bytes) {
-            return Err(());
-        }
-
-        // Same category (Str/Bytes) but different variant — not supported
-        if matches!(self, ArgValue::Str(_) | ArgValue::Bytes(_)) && matches!(target, ArgType::Str | ArgType::Bytes) {
-            return Err(());
-        }
-
-        // Numeric conversions
-        let result = match (self, target) {
-            // Int16 ↔ UInt16
-            (ArgValue::Int16(v), ArgType::UInt16) => ArgValue::UInt16(*v as u16),
-            (ArgValue::UInt16(v), ArgType::Int16) => {
-                let i = *v as i16;
-                ArgValue::Int16(i)
+        match (self, target) {
+            // Int16 ↔ UInt16 (negative → unsigned is rejected)
+            (ArgValue::Int16(v), ArgType::UInt16) if *v >= 0 => {
+                Ok(ArgValue::UInt16(*v as u16))
+            }
+            (ArgValue::UInt16(v), ArgType::Int16) if *v <= i16::MAX as u16 => {
+                Ok(ArgValue::Int16(*v as i16))
             }
 
-            // Int32 ↔ UInt32
-            (ArgValue::Int32(v), ArgType::UInt32) => ArgValue::UInt32(*v as u32),
-            (ArgValue::UInt32(v), ArgType::Int32) => {
-                let i = *v as i32;
-                ArgValue::Int32(i)
+            // Int32 ↔ UInt32 (negative → unsigned is rejected)
+            (ArgValue::Int32(v), ArgType::UInt32) if *v >= 0 => {
+                Ok(ArgValue::UInt32(*v as u32))
+            }
+            (ArgValue::UInt32(v), ArgType::Int32) if *v <= i32::MAX as u32 => {
+                Ok(ArgValue::Int32(*v as i32))
             }
 
-            // Int16 → Int32 (widening)
-            (ArgValue::Int16(v), ArgType::Int32) => ArgValue::Int32(*v as i32),
+            // Widening conversions are always lossless
+            (ArgValue::Int16(v), ArgType::Int32) => Ok(ArgValue::Int32(*v as i32)),
+            (ArgValue::UInt16(v), ArgType::UInt32) => Ok(ArgValue::UInt32(*v as u32)),
+            (ArgValue::UInt16(v), ArgType::Int32) => Ok(ArgValue::Int32(*v as i32)),
 
-            // UInt16 → UInt32 (widening)
-            (ArgValue::UInt16(v), ArgType::UInt32) => ArgValue::UInt32(*v as u32),
-
-            // UInt16 → Int32
-            (ArgValue::UInt16(v), ArgType::Int32) => ArgValue::Int32(*v as i32),
-
-            // Int16 → UInt32
-            (ArgValue::Int16(v), ArgType::UInt32) => ArgValue::UInt32(*v as u32),
-
-            // Unsupported: Str/Bytes to numeric, numeric to Str/Bytes, etc.
-            _ => return Err(()),
-        };
-
-        Ok(result)
+            // Unsupported: Str/Bytes to numeric, numeric to Str/Bytes,
+            // narrowing, and out-of-range signedness changes.
+            _ => Err(()),
+        }
     }
 }
 
 /// Message payload for encoding and decoding parameters.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Payload {
-    pub raw: Vec<u8>,
+    /// Raw payload bytes. Private so that the [`MESSAGE_PAYLOAD_MAX`] limit
+    /// cannot be bypassed; use [`Payload::payload`] for read access.
+    raw: Vec<u8>,
 }
 
 impl Default for Payload {
@@ -201,7 +191,14 @@ impl Payload {
 
     /// Push a u16 value in 7-bit varint format.
     pub fn push_u16(&mut self, v: u16) -> ProtoResult<()> {
-        if self.len() + 3 > MESSAGE_PAYLOAD_MAX {
+        let needed = if v > U16_MASK14 {
+            3
+        } else if v > U16_MASK7 {
+            2
+        } else {
+            1
+        };
+        if self.len() + needed > MESSAGE_PAYLOAD_MAX {
             return Err(ProtoError::new("payload exceeds maximum length"));
         }
 
@@ -220,7 +217,18 @@ impl Payload {
 
     /// Push a u32 value in 7-bit varint format.
     pub fn push_u32(&mut self, v: u32) -> ProtoResult<()> {
-        if self.len() + 5 > MESSAGE_PAYLOAD_MAX {
+        let needed = if v > U32_MASK28 {
+            5
+        } else if v > U32_MASK21 {
+            4
+        } else if v > U32_MASK14 {
+            3
+        } else if v > U32_MASK7 {
+            2
+        } else {
+            1
+        };
+        if self.len() + needed > MESSAGE_PAYLOAD_MAX {
             return Err(ProtoError::new("payload exceeds maximum length"));
         }
 
@@ -281,6 +289,11 @@ impl Payload {
     pub fn as_parser(&self) -> PayloadParser<'_> {
         PayloadParser { raw: &self.raw }
     }
+
+    /// Consume the payload and return the raw bytes.
+    pub fn into_raw(self) -> Vec<u8> {
+        self.raw
+    }
 }
 
 /// Payload parser for decoding parameters from byte stream.
@@ -289,6 +302,16 @@ pub struct PayloadParser<'a> {
 }
 
 impl PayloadParser<'_> {
+    /// Returns `true` if all bytes have been consumed.
+    pub fn is_empty(&self) -> bool {
+        self.raw.is_empty()
+    }
+
+    /// Number of bytes left to parse.
+    pub fn remaining(&self) -> usize {
+        self.raw.len()
+    }
+
     /// Pop a single byte.
     pub fn pop(&mut self) -> ProtoResult<u8> {
         if self.raw.is_empty() {
@@ -648,6 +671,112 @@ mod tests {
         assert_eq!(values[0], ArgValue::UInt32(1));
         assert_eq!(values[1], ArgValue::UInt32(2));
         assert_eq!(values[2], ArgValue::UInt32(3));
+    }
+
+    #[test]
+    fn test_try_convert_to_lossless_range_checks() {
+        // In-range same-width conversions succeed.
+        assert_eq!(
+            ArgValue::Int16(100).try_convert_to(ArgType::UInt16).unwrap(),
+            ArgValue::UInt16(100)
+        );
+        assert_eq!(
+            ArgValue::UInt16(32767).try_convert_to(ArgType::Int16).unwrap(),
+            ArgValue::Int16(32767)
+        );
+        assert_eq!(
+            ArgValue::Int32(42).try_convert_to(ArgType::UInt32).unwrap(),
+            ArgValue::UInt32(42)
+        );
+
+        // Out-of-range / sign-losing conversions are rejected instead of
+        // wrapping.
+        assert!(ArgValue::Int16(-1).try_convert_to(ArgType::UInt16).is_err());
+        assert!(ArgValue::UInt16(40000).try_convert_to(ArgType::Int16).is_err());
+        assert!(ArgValue::Int32(-1).try_convert_to(ArgType::UInt32).is_err());
+        assert!(
+            ArgValue::UInt32(i32::MAX as u32 + 1)
+                .try_convert_to(ArgType::Int32)
+                .is_err()
+        );
+        assert!(ArgValue::Int16(-1).try_convert_to(ArgType::UInt32).is_err());
+
+        // Widening conversions remain lossless for negative values.
+        assert_eq!(
+            ArgValue::Int16(-1).try_convert_to(ArgType::Int32).unwrap(),
+            ArgValue::Int32(-1)
+        );
+
+        // Narrowing conversions (Int32 → Int16, UInt32 → UInt16) are not
+        // supported at all.
+        assert!(ArgValue::Int32(-1).try_convert_to(ArgType::Int16).is_err());
+        assert!(ArgValue::UInt32(100).try_convert_to(ArgType::UInt16).is_err());
+
+        // Same type is a no-op; Str/Bytes never convert to or from numerics.
+        assert_eq!(
+            ArgValue::UInt32(7).try_convert_to(ArgType::UInt32).unwrap(),
+            ArgValue::UInt32(7)
+        );
+        assert!(ArgValue::Str("x".to_string()).try_convert_to(ArgType::UInt32).is_err());
+        assert!(ArgValue::Bytes(vec![]).try_convert_to(ArgType::Str).is_err());
+        assert!(ArgValue::UInt32(1).try_convert_to(ArgType::Str).is_err());
+    }
+
+    #[test]
+    fn test_push_u16_exact_size_bound() {
+        // With one byte left, a 1-byte varint still fits…
+        let mut p = Payload::new();
+        for _ in 0..MESSAGE_PAYLOAD_MAX - 1 {
+            p.push(0).unwrap();
+        }
+        assert!(p.push_u16(0).is_ok());
+        assert_eq!(p.len(), MESSAGE_PAYLOAD_MAX);
+
+        // …but a 2-byte varint does not.
+        let mut p = Payload::new();
+        for _ in 0..MESSAGE_PAYLOAD_MAX - 1 {
+            p.push(0).unwrap();
+        }
+        assert!(p.push_u16(1000).is_err());
+        assert_eq!(p.len(), MESSAGE_PAYLOAD_MAX - 1);
+    }
+
+    #[test]
+    fn test_push_u32_exact_size_bound() {
+        // With two bytes left, a 2-byte varint still fits…
+        let mut p = Payload::new();
+        for _ in 0..MESSAGE_PAYLOAD_MAX - 2 {
+            p.push(0).unwrap();
+        }
+        assert!(p.push_u32(200).is_ok()); // 200 > 127 → 2 bytes
+        assert_eq!(p.len(), MESSAGE_PAYLOAD_MAX);
+
+        // …but a 3-byte varint does not.
+        let mut p = Payload::new();
+        for _ in 0..MESSAGE_PAYLOAD_MAX - 2 {
+            p.push(0).unwrap();
+        }
+        assert!(p.push_u32(20000).is_err()); // 20000 > 16383 → 3 bytes
+    }
+
+    #[test]
+    fn test_parser_is_empty_and_remaining() {
+        let mut p = Payload::new();
+        p.push_u32(1).unwrap();
+        let mut parser = p.as_parser();
+        assert!(!parser.is_empty());
+        assert_eq!(parser.remaining(), 1);
+        parser.pop_u32().unwrap();
+        assert!(parser.is_empty());
+        assert_eq!(parser.remaining(), 0);
+    }
+
+    #[test]
+    fn test_into_raw() {
+        let mut p = Payload::new();
+        p.push_u16(300).unwrap();
+        let raw = p.into_raw();
+        assert_eq!(raw.len(), 2);
     }
 
     #[test]

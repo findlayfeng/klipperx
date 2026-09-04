@@ -3,7 +3,8 @@ use super::proto::{ArgType, Payload, ProtoError, ProtoResult, ArgValue};
 use super::super::frame::MESSAGE_PAYLOAD_MAX;
 use super::super::traits::KlippyInterface;
 use multi_index_map::MultiIndexMap;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
@@ -21,7 +22,6 @@ const SEND_COALESCE_WINDOW: Duration = Duration::from_millis(1);
 const SEND_COALESCE_THRESHOLD: usize = MESSAGE_PAYLOAD_MAX * 2 / 3;
 
 /// Default Klipper message formats for identify request/response.
-#[allow(dead_code)]
 const DEFAULT_MESSAGES: &[(u8, &str)] = &[
     (0, "identify_response offset=%u data=%.*s"),
     (1, "identify offset=%c count=%c"),
@@ -62,11 +62,17 @@ pub struct InboundMessage {
 
 /// A one-shot waiter registered by [`Parser::send_and_wait`].
 struct PendingWaiter {
+    /// Unique id used to remove exactly this waiter — several concurrent
+    /// waiters may share the same message name.
+    id: u64,
     /// Name of the awaited inbound message.
     name: String,
     /// Channel used to deliver the decoded parameter values.
     tx: oneshot::Sender<Vec<ArgValue>>,
 }
+
+/// Monotonic counter assigning a unique id to every pending waiter.
+static NEXT_WAITER_ID: AtomicU64 = AtomicU64::new(0);
 
 impl Parser {
     /// Create a new parser and register default message formats.
@@ -82,19 +88,26 @@ impl Parser {
         };
 
         for (id, format_str) in DEFAULT_MESSAGES {
-            let _ = parser.register(*id, format_str);
+            parser
+                .register(*id, format_str)
+                .expect("built-in default message formats must be valid");
         }
         parser
     }
 
     /// Register a message format with the given ID.
     ///
-    /// The command is always registered as a [`MsgEntry::Base`], which can
-    /// be used for outbound `send()` calls. Use [`Self::bind()`] to convert it
-    /// to a [`MsgEntry::Handler`] for inbound dispatch.
-    fn register(&mut self, id: u8, format: &str) -> ProtoResult<()> {
-        let (name, base) =
-            MsgBase::parse(format).map_err(|e| ProtoError::new(e.to_string()))?;
+    /// The format string is parsed into a [`MsgBase`] and stored under both
+    /// its numeric `id` and its name. The command is always registered as a
+    /// [`MsgEntry::Base`], which can be used for outbound [`Self::send`]
+    /// calls. Use [`Self::bind`] to convert it to a [`MsgEntry::Handler`]
+    /// for inbound dispatch.
+    ///
+    /// # Errors
+    /// Returns an error if the format string is invalid, or if the `id`
+    /// or the parsed command name is already registered.
+    pub fn register(&mut self, id: u8, format: &str) -> ProtoResult<()> {
+        let (name, base) = MsgBase::parse(format)?;
         let cmd = MsgEntry::Base(base);
 
         let mut map = self.msgs.lock()
@@ -113,10 +126,11 @@ impl Parser {
     /// Bind a callback to a registered command.
     ///
     /// Converts the command from `Base` to `Handler` with the provided callback.
+    /// If the command already has a callback, the new callback replaces it.
     /// The callback receives a slice of `ArgValue` containing all decoded
     /// parameter values in command definition order.
     ///
-    /// Returns an error if the command is not found or already has a callback.
+    /// Returns an error if the command is not found.
     pub fn bind(
         &mut self,
         cmd_name: &str,
@@ -161,9 +175,14 @@ impl Parser {
     /// Returns `ProtoError` if:
     /// - The command name is not found in the registry
     /// - The command is a `Handler` type (only `Base` msgs can be sent)
-    /// - Positional params don't match the expected parameter count or order
-    /// - Named params reference unknown parameter names
-    /// - Parameter types don't match the command definition
+    /// - A positional param appears after a named param
+    /// - The same named param is provided twice, or one param is provided
+    ///   both positionally and by name
+    /// - A named param does not match any parameter defined by the command
+    /// - Positional params exceed the command's parameter count, or a
+    ///   required param is missing
+    /// - Parameter types don't match the command definition and no lossless
+    ///   conversion is possible
     /// - The interface send fails
     ///
     /// # Example
@@ -207,41 +226,67 @@ impl Parser {
             }
         }; // guard dropped here
 
-        // Separate positional and named parameters
-        let mut positional_count = 0;
-        let mut named_params: Vec<(&str, &ArgValue)> = Vec::new();
+        // Split params into positional values and a name→value map,
+        // rejecting ordering violations and duplicates up front.
+        let mut positional: Vec<&ArgValue> = Vec::with_capacity(params.len());
+        let mut named_map: HashMap<&str, &ArgValue> = HashMap::new();
+        let mut named_started = false;
 
         for param in params {
             match param {
-                Param::Positional(_) => {
-                    positional_count += 1;
+                Param::Positional(v) => {
+                    if named_started {
+                        return Err(ProtoError::new(format!(
+                            "Positional param after named param for '{}': positional params must come first",
+                            cmd_name
+                        )));
+                    }
+                    positional.push(v);
                 }
-                Param::Named(name, _) => {
-                    named_params.push((name.as_str(), param.value()));
+                Param::Named(name, v) => {
+                    named_started = true;
+                    if named_map.insert(name.as_str(), v).is_some() {
+                        return Err(ProtoError::new(format!(
+                            "Duplicate named param '{}' for '{}'",
+                            name, cmd_name
+                        )));
+                    }
                 }
             }
         }
 
         // Validate positional params count
-        if positional_count > param_defs.len() {
+        if positional.len() > param_defs.len() {
             return Err(ProtoError::new(format!(
                 "Too many positional params for '{}': expected at most {}, got {}",
                 cmd_name,
                 param_defs.len(),
-                positional_count
+                positional.len()
             )));
         }
 
-        // Build a map of named params for quick lookup
-        let named_map: std::collections::HashMap<&str, &ArgValue> = named_params.into_iter().collect();
+        // Every named param must reference a parameter defined by the command.
+        for name in named_map.keys() {
+            if !param_defs.iter().any(|(def_name, _)| def_name.as_str() == *name) {
+                return Err(ProtoError::new(format!(
+                    "Unknown param '{}' for '{}'",
+                    name, cmd_name
+                )));
+            }
+        }
 
         // Build the final parameter list in command definition order
         let mut final_params: Vec<ArgValue> = Vec::with_capacity(param_defs.len());
 
         for (i, (param_name, expected_type)) in param_defs.iter().enumerate() {
-            let value = if i < positional_count {
-                // Positional param - get from params list
-                params[i].value().clone()
+            let value = if i < positional.len() {
+                if named_map.contains_key(param_name.as_str()) {
+                    return Err(ProtoError::new(format!(
+                        "Param '{}' for '{}' provided both positionally and by name",
+                        param_name, cmd_name
+                    )));
+                }
+                positional[i].clone()
             } else if let Some(&named_value) = named_map.get(param_name.as_str()) {
                 // Named param - look up by name
                 named_value.clone()
@@ -255,8 +300,8 @@ impl Parser {
             // Validate type — attempt conversion if types don't match
             if value.arg_type() != *expected_type {
                 if let Ok(converted) = value.try_convert_to(*expected_type) {
-                    eprintln!(
-                        "[WARNING] Param type conversion for '{}' param '{}': {:?} -> {:?}",
+                    tracing::warn!(
+                        "param type conversion for '{}' param '{}': {:?} -> {:?}",
                         cmd_name,
                         param_name,
                         value.arg_type(),
@@ -368,12 +413,14 @@ impl Parser {
         // Register the waiter before sending so a fast response cannot
         // arrive between the send and the registration.
         let (tx, rx) = oneshot::channel();
+        let waiter_id = NEXT_WAITER_ID.fetch_add(1, Ordering::Relaxed);
         {
             let mut waiters = self
                 .waiters
                 .lock()
                 .map_err(|_| ProtoError::new("waiters lock poisoned"))?;
             waiters.push(PendingWaiter {
+                id: waiter_id,
                 name: wait_name.to_string(),
                 tx,
             });
@@ -381,7 +428,7 @@ impl Parser {
 
         // Send the command; on failure the waiter must not linger.
         if let Err(e) = self.send(cmd_name, params).await {
-            self.remove_waiter(wait_name);
+            self.remove_waiter(waiter_id);
             return Err(e);
         }
 
@@ -389,7 +436,7 @@ impl Parser {
             Some(duration) => match tokio::time::timeout(duration, rx).await {
                 Ok(result) => result,
                 Err(_) => {
-                    self.remove_waiter(wait_name);
+                    self.remove_waiter(waiter_id);
                     return Err(ProtoError::new(format!(
                         "timeout waiting for message '{}'",
                         wait_name
@@ -402,10 +449,10 @@ impl Parser {
         received.map_err(|_| ProtoError::new("inbox task terminated"))
     }
 
-    /// Remove a single pending waiter by name (no-op if absent).
-    fn remove_waiter(&self, name: &str) {
+    /// Remove a single pending waiter by id (no-op if absent).
+    fn remove_waiter(&self, id: u64) {
         if let Ok(mut waiters) = self.waiters.lock() {
-            if let Some(pos) = waiters.iter().position(|w| w.name == name) {
+            if let Some(pos) = waiters.iter().position(|w| w.id == id) {
                 waiters.remove(pos);
             }
         }
@@ -473,11 +520,17 @@ impl Parser {
                     )
                     .await
                     {
-                        eprintln!("[inbox] error processing payload: {}", e);
+                        // The inbox channel is this task's only output: once
+                        // its receiver is dropped there is no reason to keep
+                        // draining the interface.
+                        if tx.is_closed() {
+                            break;
+                        }
+                        tracing::error!("[inbox] error processing payload: {}", e);
                     }
                 }
                 Err(e) => {
-                    eprintln!("[inbox] receive error: {}", e);
+                    tracing::error!("[inbox] receive error: {}", e);
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
             }
@@ -612,21 +665,19 @@ async fn run_sender(interface: Arc<dyn KlippyInterface>, mut rx: mpsc::Receiver<
                         if batch.try_merge(&next_payload).is_ok() {
                             acks.push(next_ack);
                         } else {
-                            // Merge failed (size limit reached): save whether
-                            // the new payload is large before moving it into
-                            // batch via replace.
-                            let is_large = next_payload.len() >= SEND_COALESCE_THRESHOLD;
-                            let pending = std::mem::replace(&mut batch, next_payload);
-                            let pending_acks = std::mem::replace(&mut acks, vec![]);
+                            // Merge failed (size limit reached): flush the
+                            // pending batch, then handle the payload that
+                            // triggered the flush.
+                            let pending = std::mem::take(&mut batch);
+                            let pending_acks = std::mem::take(&mut acks);
                             send_and_ack(&interface, pending, pending_acks).await;
 
-                            if is_large {
-                                // Send the large payload immediately.
-                                send_and_ack(&interface, batch, vec![next_ack]).await;
-                                batch = Payload::new();
-                                acks.clear();
+                            if next_payload.len() >= SEND_COALESCE_THRESHOLD {
+                                // Large payloads are sent immediately.
+                                send_and_ack(&interface, next_payload, vec![next_ack]).await;
                             } else {
                                 // New payload is small: it opens a fresh window.
+                                batch = next_payload;
                                 acks = vec![next_ack];
                                 deadline = Instant::now() + SEND_COALESCE_WINDOW;
                             }
@@ -881,7 +932,164 @@ mod tests {
         let params = vec![Param::Named("Z".to_string(), ArgValue::UInt32(100))];
         let result = parser.send("G1", &params).await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().msg.contains("Missing required param"));
+        assert!(result.unwrap_err().msg.contains("Unknown param 'Z'"));
+    }
+
+    #[tokio::test]
+    async fn test_send_unknown_named_param_with_complete_positional() {
+        // All required params are covered positionally, but an extra named
+        // param must still be rejected instead of being silently dropped.
+        let mapping = vec![MappingEntry {
+            input: Frame::new(0, Vec::new()),
+            outputs: vec![],
+        }];
+        let interface = TestInterface::new(mapping);
+        let mut parser = Parser::new(Arc::new(interface));
+        register_g1_cmd(&mut parser);
+
+        let params = vec![
+            Param::Positional(ArgValue::UInt32(100)),
+            Param::Positional(ArgValue::UInt32(200)),
+            Param::Named("Z".to_string(), ArgValue::UInt32(300)),
+        ];
+        let result = parser.send("G1", &params).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().msg.contains("Unknown param 'Z'"));
+    }
+
+    #[tokio::test]
+    async fn test_send_positional_after_named() {
+        let mapping = vec![MappingEntry {
+            input: Frame::new(0, Vec::new()),
+            outputs: vec![],
+        }];
+        let interface = TestInterface::new(mapping);
+        let mut parser = Parser::new(Arc::new(interface));
+        register_g1_cmd(&mut parser);
+
+        // Positional params must come before named params.
+        let params = vec![
+            Param::Named("X".to_string(), ArgValue::UInt32(100)),
+            Param::Positional(ArgValue::UInt32(200)),
+        ];
+        let result = parser.send("G1", &params).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().msg;
+        assert!(err_msg.contains("positional params must come first"), "Error message: {}", err_msg);
+    }
+
+    #[tokio::test]
+    async fn test_send_duplicate_named_param() {
+        let mapping = vec![MappingEntry {
+            input: Frame::new(0, Vec::new()),
+            outputs: vec![],
+        }];
+        let interface = TestInterface::new(mapping);
+        let mut parser = Parser::new(Arc::new(interface));
+        register_g1_cmd(&mut parser);
+
+        let params = vec![
+            Param::Named("X".to_string(), ArgValue::UInt32(100)),
+            Param::Named("X".to_string(), ArgValue::UInt32(200)),
+            Param::Named("Y".to_string(), ArgValue::UInt32(300)),
+        ];
+        let result = parser.send("G1", &params).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().msg.contains("Duplicate named param 'X'"));
+    }
+
+    #[tokio::test]
+    async fn test_send_param_both_positional_and_named() {
+        let mapping = vec![MappingEntry {
+            input: Frame::new(0, Vec::new()),
+            outputs: vec![],
+        }];
+        let interface = TestInterface::new(mapping);
+        let mut parser = Parser::new(Arc::new(interface));
+        register_g1_cmd(&mut parser);
+
+        let params = vec![
+            Param::Positional(ArgValue::UInt32(100)), // X
+            Param::Named("X".to_string(), ArgValue::UInt32(999)),
+            Param::Named("Y".to_string(), ArgValue::UInt32(200)),
+        ];
+        let result = parser.send("G1", &params).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().msg;
+        assert!(
+            err_msg.contains("both positionally and by name"),
+            "Error message: {}",
+            err_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_send_conversion_out_of_range_rejected() {
+        // u32::MAX cannot convert to Int32 losslessly: must be a type
+        // mismatch error, not a wrapped negative value.
+        let mapping = vec![MappingEntry {
+            input: Frame::new(0, Vec::new()),
+            outputs: vec![],
+        }];
+        let interface = TestInterface::new(mapping);
+        let mut parser = Parser::new(Arc::new(interface));
+
+        let _ = parser.register(23, "CMD val=%i");
+
+        let params = vec![Param::Positional(ArgValue::UInt32(u32::MAX))];
+        let result = parser.send("CMD", &params).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().msg;
+        assert!(err_msg.contains("Param type mismatch"), "Error message: {}", err_msg);
+    }
+
+    #[tokio::test]
+    async fn test_send_negative_to_unsigned_rejected() {
+        // A negative value must not silently wrap into a huge unsigned one.
+        let mapping = vec![MappingEntry {
+            input: Frame::new(0, Vec::new()),
+            outputs: vec![],
+        }];
+        let interface = TestInterface::new(mapping);
+        let mut parser = Parser::new(Arc::new(interface));
+
+        let _ = parser.register(25, "CMD val=%u");
+
+        let params = vec![Param::Positional(ArgValue::Int32(-5))];
+        let result = parser.send("CMD", &params).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().msg;
+        assert!(err_msg.contains("Param type mismatch"), "Error message: {}", err_msg);
+    }
+
+    #[test]
+    fn test_remove_waiter_by_id_only_removes_target() {
+        // Two waiters share the same message name; removing one by id must
+        // leave the other untouched.
+        let interface = TestInterface::new(vec![]);
+        let parser = Parser::new(Arc::new(interface));
+
+        let (tx1, _rx1) = oneshot::channel();
+        let (tx2, _rx2) = oneshot::channel();
+        let id1 = NEXT_WAITER_ID.fetch_add(1, Ordering::Relaxed);
+        let id2 = NEXT_WAITER_ID.fetch_add(1, Ordering::Relaxed);
+
+        parser.waiters.lock().unwrap().push(PendingWaiter {
+            id: id1,
+            name: "temperature".to_string(),
+            tx: tx1,
+        });
+        parser.waiters.lock().unwrap().push(PendingWaiter {
+            id: id2,
+            name: "temperature".to_string(),
+            tx: tx2,
+        });
+
+        // The second waiter is removed; the first must remain.
+        parser.remove_waiter(id2);
+        let waiters = parser.waiters.lock().unwrap();
+        assert_eq!(waiters.len(), 1);
+        assert_eq!(waiters[0].id, id1);
     }
 
     #[tokio::test]

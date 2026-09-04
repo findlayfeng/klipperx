@@ -37,7 +37,7 @@ pub mod interface {
 // Re-export common types for convenience
 pub use error::KlippyError;
 pub use msg::proto::Payload;
-pub use msg::CommandBase;
+pub use msg::MsgBase;
 pub use traits::{
     InterfaceEvent, KlippyInterface, Printer, PrinterEvent, PrinterObject, PrinterState,
     StateMessage,

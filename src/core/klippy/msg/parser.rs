@@ -76,6 +76,35 @@ impl Parser {
         Ok(())
     }
 
+    /// Bind a callback to a registered command.
+    ///
+    /// Converts the command from `Base` to `Handler` with the provided callback.
+    /// Returns an error if the command is not found or already has a callback.
+    pub fn bind(
+        &mut self,
+        cmd_name: &str,
+        callback: impl FnMut(&ArgValue) + 'static,
+    ) -> ProtoResult<()> {
+        let (id, name) = self
+            .commands
+            .get_by_name(cmd_name)
+            .map(|c| (c.id, c.name.clone()))
+            .ok_or_else(|| ProtoError::new(format!("Unknown command: {}", cmd_name)))?;
+
+        let entry = self
+            .commands
+            .remove_by_name(&name)
+            .ok_or_else(|| ProtoError::new(format!("Command not found: {}", cmd_name)))?;
+
+        let command = entry.command.with_callback(callback);
+
+        self.commands
+            .try_insert(Command { id, name, command })
+            .map_err(|e| ProtoError::new(e.to_string()))?;
+
+        Ok(())
+    }
+
     /// Send a command with the given name and parameter values.
     ///
     /// 
@@ -708,5 +737,53 @@ mod tests {
         assert!(result.is_err());
         let err_msg = result.unwrap_err().msg;
         assert!(err_msg.contains("Param type mismatch"), "Error message: {}", err_msg);
+    }
+
+    #[tokio::test]
+    async fn test_bind_command() {
+        let mapping = vec![MappingEntry {
+            input: Frame::new(0, Vec::new()),
+            outputs: vec![],
+        }];
+        let interface = TestInterface::new(mapping);
+        let mut parser = Parser::new(Arc::new(interface));
+        register_g1_cmd(&mut parser);
+
+        // Bind a callback to the G1 command
+        let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let called_clone = Arc::clone(&called);
+        parser.bind("G1", move |_value| {
+            called_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+        }).unwrap();
+
+        // Verify the command now has a handler
+        let cmd = parser.commands.get_by_name("G1").unwrap();
+        assert!(matches!(cmd.command, CommandEntry::Handler(_)));
+
+        // Verify the command can no longer be sent
+        let params = vec![
+            Param::Positional(ArgValue::UInt32(100)),
+            Param::Positional(ArgValue::UInt32(200)),
+        ];
+        let result = parser.send("G1", &params).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().msg.contains("Handler"));
+
+        // Verify the callback was stored
+        assert!(!called.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn test_bind_unknown_command() {
+        let mapping = vec![MappingEntry {
+            input: Frame::new(0, Vec::new()),
+            outputs: vec![],
+        }];
+        let interface = TestInterface::new(mapping);
+        let mut parser = Parser::new(Arc::new(interface));
+
+        let result = parser.bind("UNKNOWN", |_value| {});
+        assert!(result.is_err());
+        assert!(result.unwrap_err().msg.contains("Unknown command"));
     }
 }

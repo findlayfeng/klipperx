@@ -119,3 +119,7 @@ kinematics: cartesian
 max_velocity: 500
 max_accel: 3000
 ```
+
+---
+
+- [← 用户手册首页](README.md)

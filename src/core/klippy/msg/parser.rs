@@ -3,6 +3,7 @@ use super::proto::{ArgType, Payload, ProtoError, ProtoResult, ArgValue};
 use super::super::frame::MESSAGE_PAYLOAD_MAX;
 use super::super::traits::KlippyInterface;
 use multi_index_map::MultiIndexMap;
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
@@ -44,14 +45,27 @@ pub struct Parser {
     outbox: AsyncMutex<Option<mpsc::Sender<OutItem>>>,
     /// Sender for inbound messages (set when inbox is started).
     inbound_tx: AsyncMutex<Option<mpsc::Sender<InboundMessage>>>,
+    /// Inbound messages whose command has a registered callback.
+    callback_queue: Arc<Mutex<VecDeque<InboundMessage>>>,
+    /// Pending one-shot waiters registered by [`Self::send_and_wait`].
+    waiters: Arc<Mutex<Vec<PendingWaiter>>>,
 }
 
 /// Parsed inbound message from the interface.
+#[derive(Debug, Clone)]
 pub struct InboundMessage {
     /// Msg name (e.g. `"temperature_report"`).
     pub name: String,
     /// Decoded parameter values in command definition order.
     pub params: Vec<ArgValue>,
+}
+
+/// A one-shot waiter registered by [`Parser::send_and_wait`].
+struct PendingWaiter {
+    /// Name of the awaited inbound message.
+    name: String,
+    /// Channel used to deliver the decoded parameter values.
+    tx: oneshot::Sender<Vec<ArgValue>>,
 }
 
 impl Parser {
@@ -63,6 +77,8 @@ impl Parser {
             interface,
             outbox: AsyncMutex::new(None),
             inbound_tx: AsyncMutex::new(None),
+            callback_queue: Arc::new(Mutex::new(VecDeque::new())),
+            waiters: Arc::new(Mutex::new(Vec::new())),
         };
 
         for (id, format_str) in DEFAULT_MESSAGES {
@@ -167,23 +183,29 @@ impl Parser {
     /// parser.send("G1", &params).await?;
     /// ```
     pub async fn send(&self, cmd_name: &str, params: &[Param]) -> ProtoResult<()> {
-        let guard = self
-            .msgs
-            .lock()
-            .map_err(|_| ProtoError::new("msgs lock poisoned"))?;
-        let cmd = guard
-            .get_by_name(cmd_name)
-            .ok_or_else(|| ProtoError::new(format!("Unknown command: {}", cmd_name)))?;
+        // Look up the command and extract the id and parameter definitions.
+        // The lock is scoped so the guard is dropped before any `.await` —
+        // holding a std Mutex guard across an await could block a
+        // single-threaded executor once the inbox task also locks `msgs`.
+        let (cmd_id, param_defs): (u8, Vec<(String, ArgType)>) = {
+            let guard = self
+                .msgs
+                .lock()
+                .map_err(|_| ProtoError::new("msgs lock poisoned"))?;
+            let cmd = guard
+                .get_by_name(cmd_name)
+                .ok_or_else(|| ProtoError::new(format!("Unknown command: {}", cmd_name)))?;
 
-        let param_defs: Vec<(String, ArgType)> = match &cmd.command {
-            MsgEntry::Base(base) => base.params().to_vec(),
-            MsgEntry::Handler(_) => {
-                return Err(ProtoError::new(format!(
-                    "Cannot send Handler type command: {}",
-                    cmd_name
-                )));
+            match &cmd.command {
+                MsgEntry::Base(base) => (cmd.id, base.params().to_vec()),
+                MsgEntry::Handler(_) => {
+                    return Err(ProtoError::new(format!(
+                        "Cannot send Handler type command: {}",
+                        cmd_name
+                    )));
+                }
             }
-        };
+        }; // guard dropped here
 
         // Separate positional and named parameters
         let mut positional_count = 0;
@@ -256,7 +278,7 @@ impl Parser {
         }
 
         let mut payload = Payload::new();
-        payload.push(cmd.id)?;
+        payload.push(cmd_id)?;
         for value in final_params {
             payload.push_value(&value)?;
         }
@@ -277,6 +299,116 @@ impl Parser {
             .map_err(|_| ProtoError::new("outbox task terminated"))??;
 
         Ok(())
+    }
+
+    /// Synchronously drain the receive queue of messages that have a
+    /// registered callback.
+    ///
+    /// While the inbox is running (see [`Self::start_inbox`]), every inbound
+    /// message whose command was bound to a callback via [`Self::bind`] is
+    /// queued internally instead of being forwarded to the inbox channel.
+    /// This method returns all currently queued messages and removes them
+    /// from the queue.
+    ///
+    /// The call is synchronous and never waits: it returns immediately with
+    /// whatever is queued at the moment of the call (possibly an empty vec).
+    pub fn take_callback_msgs(&self) -> ProtoResult<Vec<InboundMessage>> {
+        let mut queue = self
+            .callback_queue
+            .lock()
+            .map_err(|_| ProtoError::new("callback queue lock poisoned"))?;
+        Ok(queue.drain(..).collect())
+    }
+
+    /// Send a command and wait for a specific inbound message, returning the
+    /// parameter values attached to that message.
+    ///
+    /// A one-shot waiter for `wait_name` is registered *before* the command
+    /// is sent, so a fast response cannot be missed. When the inbox task
+    /// receives a message named `wait_name`, its decoded parameter values —
+    /// in the order defined by the message format — are delivered to the
+    /// waiter and become the return value of this method.
+    ///
+    /// A waited message takes precedence over a registered callback: if the
+    /// message was also bound via [`Self::bind`], it is delivered here and
+    /// is not queued for [`Self::take_callback_msgs`].
+    ///
+    /// # Arguments
+    /// * `cmd_name` - The command to send (same semantics as [`Self::send`]).
+    /// * `params` - Parameters for the command.
+    /// * `wait_name` - Name of the inbound message to wait for.
+    /// * `timeout` - Optional maximum wait duration; `None` waits indefinitely.
+    ///
+    /// # Errors
+    /// Returns `ProtoError` if:
+    /// - The inbox was not started via [`Self::start_inbox`]
+    /// - The send fails (same errors as [`Self::send`]); the waiter is removed
+    /// - The timeout expires; the waiter is removed
+    /// - The inbox task terminated before the message arrived
+    ///
+    /// # Example
+    /// ```ignore
+    /// let params = parser
+    ///     .send_and_wait("M105", &[], "temperature", Some(Duration::from_secs(1)))
+    ///     .await?;
+    /// ```
+    pub async fn send_and_wait(
+        &self,
+        cmd_name: &str,
+        params: &[Param],
+        wait_name: &str,
+        timeout: Option<Duration>,
+    ) -> ProtoResult<Vec<ArgValue>> {
+        if self.inbound_tx.lock().await.is_none() {
+            return Err(ProtoError::new(
+                "inbox not started: call start_inbox() first",
+            ));
+        }
+
+        // Register the waiter before sending so a fast response cannot
+        // arrive between the send and the registration.
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut waiters = self
+                .waiters
+                .lock()
+                .map_err(|_| ProtoError::new("waiters lock poisoned"))?;
+            waiters.push(PendingWaiter {
+                name: wait_name.to_string(),
+                tx,
+            });
+        }
+
+        // Send the command; on failure the waiter must not linger.
+        if let Err(e) = self.send(cmd_name, params).await {
+            self.remove_waiter(wait_name);
+            return Err(e);
+        }
+
+        let received = match timeout {
+            Some(duration) => match tokio::time::timeout(duration, rx).await {
+                Ok(result) => result,
+                Err(_) => {
+                    self.remove_waiter(wait_name);
+                    return Err(ProtoError::new(format!(
+                        "timeout waiting for message '{}'",
+                        wait_name
+                    )));
+                }
+            },
+            None => rx.await,
+        };
+
+        received.map_err(|_| ProtoError::new("inbox task terminated"))
+    }
+
+    /// Remove a single pending waiter by name (no-op if absent).
+    fn remove_waiter(&self, name: &str) {
+        if let Ok(mut waiters) = self.waiters.lock() {
+            if let Some(pos) = waiters.iter().position(|w| w.name == name) {
+                waiters.remove(pos);
+            }
+        }
     }
 
     /// Lazily start the outbox task and return its sender.
@@ -311,9 +443,11 @@ impl Parser {
         let (tx, rx) = mpsc::channel(64);
         let interface = Arc::clone(&self.interface);
         let msgs = self.msgs.clone();
+        let callback_queue = Arc::clone(&self.callback_queue);
+        let waiters = Arc::clone(&self.waiters);
         let tx_clone = tx.clone();
         tokio::spawn(async move {
-            Self::run_inbox(interface, msgs, tx_clone).await
+            Self::run_inbox(interface, msgs, callback_queue, waiters, tx_clone).await
         });
         *self.inbound_tx.lock().await = Some(tx);
         Ok(rx)
@@ -323,12 +457,22 @@ impl Parser {
     async fn run_inbox(
         interface: Arc<dyn KlippyInterface>,
         msgs: MsgRegistry,
+        callback_queue: Arc<Mutex<VecDeque<InboundMessage>>>,
+        waiters: Arc<Mutex<Vec<PendingWaiter>>>,
         tx: mpsc::Sender<InboundMessage>,
     ) {
         loop {
             match interface.receive().await {
                 Ok(payload) => {
-                    if let Err(e) = Self::process_single(&msgs, &payload, &tx).await {
+                    if let Err(e) = Self::process_single(
+                        &msgs,
+                        &callback_queue,
+                        &waiters,
+                        &payload,
+                        &tx,
+                    )
+                    .await
+                    {
                         eprintln!("[inbox] error processing payload: {}", e);
                     }
                 }
@@ -340,9 +484,19 @@ impl Parser {
         }
     }
 
-    /// Parse a single inbound payload and enqueue the result.
+    /// Parse a single inbound payload and route the result.
+    ///
+    /// Routing order:
+    /// 1. If [`Parser::send_and_wait`] is waiting for this message name,
+    ///    deliver the decoded params to that waiter.
+    /// 2. Otherwise, if the command has a registered callback (bound via
+    ///    [`Parser::bind`]), enqueue the message on the callback queue for
+    ///    [`Parser::take_callback_msgs`].
+    /// 3. Otherwise, forward the message to the inbox channel.
     async fn process_single(
         msgs: &MsgRegistry,
+        callback_queue: &Arc<Mutex<VecDeque<InboundMessage>>>,
+        waiters: &Arc<Mutex<Vec<PendingWaiter>>>,
         payload: &Payload,
         tx: &mpsc::Sender<InboundMessage>,
     ) -> ProtoResult<()> {
@@ -350,7 +504,7 @@ impl Parser {
         let cmd_id = parser.pop()?;
 
         // Look up command by id and extract data (lock held briefly)
-        let (name, param_defs) = {
+        let (name, param_defs, has_callback) = {
             let guard = msgs.lock()
                 .map_err(|_| ProtoError::new("msgs lock poisoned"))?;
             let cmd = guard
@@ -358,17 +512,40 @@ impl Parser {
                 .ok_or_else(|| ProtoError::new(format!("Unknown command id: {}", cmd_id)))?;
 
             let name = cmd.name.clone();
-            let param_defs: Vec<(String, ArgType)> = match &cmd.command {
-                MsgEntry::Base(base) => base.params().to_vec(),
-                MsgEntry::Handler(handler) => handler.msg().params().to_vec(),
-            };
-            (name, param_defs)
+            let (param_defs, has_callback): (Vec<(String, ArgType)>, bool) =
+                match &cmd.command {
+                    MsgEntry::Base(base) => (base.params().to_vec(), false),
+                    MsgEntry::Handler(handler) => (handler.msg().params().to_vec(), true),
+                };
+            (name, param_defs, has_callback)
         }; // guard dropped here
 
         let param_types: Vec<ArgType> = param_defs.iter().map(|(_, t)| *t).collect();
         let params: Vec<ArgValue> = parser.pop_values(&param_types)?;
 
-        // Enqueue to the inbound channel
+        // 1. A pending send_and_wait() waiter takes precedence (FIFO).
+        let waiter = {
+            let mut guard = waiters.lock()
+                .map_err(|_| ProtoError::new("waiters lock poisoned"))?;
+            guard
+                .iter()
+                .position(|w| w.name == name)
+                .map(|pos| guard.remove(pos))
+        };
+        if let Some(waiter) = waiter {
+            let _ = waiter.tx.send(params);
+            return Ok(());
+        }
+
+        // 2. Messages with a registered callback go to the callback queue.
+        if has_callback {
+            let mut queue = callback_queue.lock()
+                .map_err(|_| ProtoError::new("callback queue lock poisoned"))?;
+            queue.push_back(InboundMessage { name, params });
+            return Ok(());
+        }
+
+        // 3. Everything else is forwarded to the inbox channel.
         tx.send(InboundMessage { name, params })
             .await
             .map_err(|_| ProtoError::new("inbox receiver dropped"))?;
@@ -893,5 +1070,209 @@ mod tests {
         let result = parser.bind("UNKNOWN", |_values| {});
         assert!(result.is_err());
         assert!(result.unwrap_err().msg.contains("Unknown command"));
+    }
+
+    // -----------------------------------------------------------------------
+    // take_callback_msgs / send_and_wait
+    // -----------------------------------------------------------------------
+
+    /// Poll `take_callback_msgs` until `count` messages have been collected.
+    async fn collect_callback_msgs(parser: &Parser, count: usize) -> Vec<InboundMessage> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        let mut collected = Vec::new();
+        while collected.len() < count {
+            collected.extend(parser.take_callback_msgs().unwrap());
+            if collected.len() >= count {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for callback messages"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        collected
+    }
+
+    #[tokio::test]
+    async fn test_take_callback_msgs_empty() {
+        let interface = TestInterface::new(vec![]);
+        let parser = Parser::new(Arc::new(interface));
+        assert!(parser.take_callback_msgs().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_callback_msg_routing() {
+        // One send triggers two inbound frames: a bound message (goes to the
+        // callback queue) and an unbound message (forwarded to the inbox
+        // channel).
+        let mut m105_payload = Payload::new();
+        m105_payload.push(5).unwrap();
+
+        let mut temp_report = Payload::new();
+        temp_report.push(31).unwrap();
+        temp_report.push_u32(250).unwrap();
+
+        let mut identify = Payload::new();
+        identify.push(0).unwrap();
+        identify.push_u32(4).unwrap();
+        identify.push_bytes(b"abcd").unwrap();
+
+        let mapping = vec![MappingEntry {
+            input: Frame::new(0, m105_payload.payload().to_vec()),
+            outputs: vec![
+                Frame::new(0, temp_report.payload().to_vec()),
+                Frame::new(1, identify.payload().to_vec()),
+            ],
+        }];
+        let interface = TestInterface::new(mapping);
+        let mut parser = Parser::new(Arc::new(interface));
+        register_m105_cmd(&mut parser);
+
+        // Bind a callback to the inbound message.
+        let _ = parser.register(31, "temp_report value=%u");
+        parser.bind("temp_report", |_values| {}).unwrap();
+
+        let mut rx = parser.start_inbox().await.unwrap();
+
+        // Trigger the two inbound frames.
+        parser.send("M105", &[]).await.unwrap();
+
+        // The bound message lands in the callback queue.
+        let msgs = collect_callback_msgs(&parser, 1).await;
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].name, "temp_report");
+        assert_eq!(msgs[0].params, vec![ArgValue::UInt32(250)]);
+
+        // The unbound message is forwarded to the inbox channel.
+        let forwarded = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(forwarded.name, "identify_response");
+        assert_eq!(
+            forwarded.params,
+            vec![ArgValue::UInt32(4), ArgValue::Str("abcd".to_string())]
+        );
+
+        // Nothing else was queued or forwarded.
+        assert!(parser.take_callback_msgs().unwrap().is_empty());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn test_send_and_wait_returns_params() {
+        let mut m105_payload = Payload::new();
+        m105_payload.push(5).unwrap();
+
+        let mut temperature = Payload::new();
+        temperature.push(32).unwrap();
+        temperature.push_u32(77).unwrap();
+
+        let mapping = vec![MappingEntry {
+            input: Frame::new(0, m105_payload.payload().to_vec()),
+            outputs: vec![Frame::new(0, temperature.payload().to_vec())],
+        }];
+        let interface = TestInterface::new(mapping);
+        let mut parser = Parser::new(Arc::new(interface));
+        register_m105_cmd(&mut parser);
+        let _ = parser.register(32, "temperature value=%u");
+
+        let _rx = parser.start_inbox().await.unwrap();
+
+        let params = parser
+            .send_and_wait("M105", &[], "temperature", Some(Duration::from_secs(1)))
+            .await
+            .unwrap();
+        assert_eq!(params, vec![ArgValue::UInt32(77)]);
+
+        // The waiter was consumed.
+        assert!(parser.waiters.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_send_and_wait_precedence_over_callback() {
+        // Same as above, but the waited message is also bound to a callback:
+        // the waiter wins and the callback queue stays empty.
+        let mut m105_payload = Payload::new();
+        m105_payload.push(5).unwrap();
+
+        let mut temperature = Payload::new();
+        temperature.push(32).unwrap();
+        temperature.push_u32(77).unwrap();
+
+        let mapping = vec![MappingEntry {
+            input: Frame::new(0, m105_payload.payload().to_vec()),
+            outputs: vec![Frame::new(0, temperature.payload().to_vec())],
+        }];
+        let interface = TestInterface::new(mapping);
+        let mut parser = Parser::new(Arc::new(interface));
+        register_m105_cmd(&mut parser);
+        let _ = parser.register(32, "temperature value=%u");
+        parser.bind("temperature", |_values| {}).unwrap();
+
+        let _rx = parser.start_inbox().await.unwrap();
+
+        let params = parser
+            .send_and_wait("M105", &[], "temperature", Some(Duration::from_secs(1)))
+            .await
+            .unwrap();
+        assert_eq!(params, vec![ArgValue::UInt32(77)]);
+        assert!(parser.take_callback_msgs().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_send_and_wait_timeout() {
+        let mut m105_payload = Payload::new();
+        m105_payload.push(5).unwrap();
+
+        let mapping = vec![MappingEntry {
+            input: Frame::new(0, m105_payload.payload().to_vec()),
+            outputs: vec![], // no response
+        }];
+        let interface = TestInterface::new(mapping);
+        let mut parser = Parser::new(Arc::new(interface));
+        register_m105_cmd(&mut parser);
+        let _ = parser.register(32, "temperature value=%u");
+
+        let _rx = parser.start_inbox().await.unwrap();
+
+        let result = parser
+            .send_and_wait("M105", &[], "temperature", Some(Duration::from_millis(100)))
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().msg.contains("timeout waiting"));
+
+        // The waiter was removed after the timeout.
+        assert!(parser.waiters.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_send_and_wait_inbox_not_started() {
+        let interface = TestInterface::new(vec![]);
+        let mut parser = Parser::new(Arc::new(interface));
+        register_m105_cmd(&mut parser);
+
+        let result = parser
+            .send_and_wait("M105", &[], "temperature", Some(Duration::from_millis(50)))
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().msg.contains("inbox not started"));
+    }
+
+    #[tokio::test]
+    async fn test_send_and_wait_send_failure_removes_waiter() {
+        // The send fails because the command is unknown; the registered
+        // waiter must not linger.
+        let interface = TestInterface::new(vec![]);
+        let mut parser = Parser::new(Arc::new(interface));
+        let _rx = parser.start_inbox().await.unwrap();
+
+        let result = parser
+            .send_and_wait("UNKNOWN", &[], "temperature", Some(Duration::from_secs(1)))
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().msg.contains("Unknown command"));
+        assert!(parser.waiters.lock().unwrap().is_empty());
     }
 }

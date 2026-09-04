@@ -73,8 +73,9 @@ impl Parser {
 
     /// Register a message format with the given ID.
     ///
-    /// - If `id & 1 == 1`, the message is treated as a regular (response) format.
-    /// - If `id & 1 == 0`, the message is treated as a request format.
+    /// The command is always registered as a [`CommandEntry::Base`], which can
+    /// be used for outbound `send()` calls. Use [`Self::bind()`] to convert it
+    /// to a [`CommandEntry::Handler`] for inbound dispatch.
     fn register(&mut self, id: u8, format: &str) -> ProtoResult<()> {
         let (name, base) =
             CommandBase::parse(format).map_err(|e| ProtoError::new(e.to_string()))?;
@@ -484,12 +485,12 @@ mod tests {
     }
 
     fn register_g1_cmd(parser: &mut Parser) {
-        // Register "G1 X=%u Y=%u" with id=3 (regular message, odd id)
+        // Register "G1 X=%u Y=%u" with id=3
         let _ = parser.register(3, "G1 X=%u Y=%u");
     }
 
     fn register_m105_cmd(parser: &mut Parser) {
-        // Register "M105" with no params (id=5, regular message)
+        // Register "M105" with no params
         let _ = parser.register(5, "M105");
     }
 
@@ -552,7 +553,7 @@ mod tests {
         let interface = TestInterface::new(mapping);
         let mut parser = Parser::new(Arc::new(interface));
 
-        // Register a command with string param (odd ID = Regular type)
+        // Register a command with a string param
         let _ = parser.register(7, "CMD label=%s");
 
         // Send UInt32 instead of Str

@@ -173,8 +173,8 @@ impl CommandBase {
 /// ```
 /// # use klipperx::core::klippy::msg::{CommandBase, CommandHandler, ArgValue};
 /// let (name, command) = CommandBase::parse("config_digital_out oid=%u pin=%s").unwrap();
-/// let mut handler = CommandHandler::new(command, |_| {
-///     println!("command received");
+/// let mut handler = CommandHandler::new(command, |values| {
+///     println!("command received with {} params", values.len());
 /// });
 /// assert_eq!(name, "config_digital_out");
 /// ```
@@ -182,7 +182,7 @@ pub struct CommandHandler {
     /// The underlying command definition.
     command: CommandBase,
     /// Callback invoked when this command is matched.
-    callback: Box<dyn FnMut(&ArgValue)>,
+    callback: Box<dyn FnMut(&[ArgValue]) + Send>,
 }
 
 impl std::fmt::Debug for CommandHandler {
@@ -196,12 +196,12 @@ impl std::fmt::Debug for CommandHandler {
 impl CommandHandler {
     /// Create a new `CommandHandler` from a `Command` and a callback.
     ///
-    /// The callback receives a reference to `ArgValue` which contains the
-    /// decoded parameter values. Use `params.get_int()`, `params.get_str()`,
-    /// `params.get_float()`, or `params.get_bytes()` to extract values.
+    /// The callback receives a slice of `ArgValue` containing all decoded
+    /// parameter values in command definition order. Use
+    /// `values[i].clone()` or pattern matching to extract values.
     pub fn new(
         command: CommandBase,
-        callback: impl FnMut(&ArgValue) + 'static,
+        callback: impl FnMut(&[ArgValue]) + Send + 'static,
     ) -> Self {
         Self {
             command,
@@ -216,15 +216,14 @@ impl CommandHandler {
 
     /// Set or replace the callback function.
     ///
-    /// The callback receives a reference to `ArgValue` which contains the
-    /// decoded parameter values. Use `params.get_int()`, `params.get_str()`,
-    /// `params.get_float()`, or `params.get_bytes()` to extract values.
-    pub fn set_callback(&mut self, callback: impl FnMut(&ArgValue) + 'static) {
+    /// The callback receives a slice of `ArgValue` containing all decoded
+    /// parameter values in command definition order.
+    pub fn set_callback(&mut self, callback: impl FnMut(&[ArgValue]) + Send + 'static) {
         self.callback = Box::new(callback);
     }
 
     /// Invoke the callback with the given parameters.
-    pub fn invoke_callback(&mut self, params: &ArgValue) -> CommandResult<()> {
+    pub fn invoke_callback(&mut self, params: &[ArgValue]) -> CommandResult<()> {
         (self.callback)(params);
         Ok(())
     }
@@ -262,10 +261,13 @@ impl From<CommandBase> for CommandEntry {
 impl CommandEntry {
     /// Convert a `Base` entry to a `Handler` by providing a callback.
     ///
+    /// The callback receives a slice of `ArgValue` containing all decoded
+    /// parameter values in command definition order.
+    ///
     /// Returns `self` unchanged if already a `Handler`.
     pub fn with_callback(
         self,
-        callback: impl FnMut(&ArgValue) + 'static,
+        callback: impl FnMut(&[ArgValue]) + Send + 'static,
     ) -> Self {
         match self {
             CommandEntry::Base(base) => CommandHandler::new(base, callback).into(),
@@ -354,7 +356,7 @@ mod tests {
     #[test]
     fn test_set_callback() {
         let mut handler = CommandHandler::new(CommandBase::new(vec![]), |_| {});
-        handler.set_callback(|_: &ArgValue| {});
+        handler.set_callback(|_: &[ArgValue]| {});
     }
 
     #[test]
@@ -367,8 +369,8 @@ mod tests {
         let mut handler = CommandHandler::new(CommandBase::new(vec![]), move |_| {
             invoked_clone.store(true, Ordering::SeqCst);
         });
-        let value = ArgValue::Str("test".to_string());
-        assert!(handler.invoke_callback(&value).is_ok());
+        let values = vec![ArgValue::Str("test".to_string())];
+        assert!(handler.invoke_callback(&values).is_ok());
         assert!(invoked.load(Ordering::SeqCst));
     }
 
@@ -379,7 +381,7 @@ mod tests {
     #[test]
     fn test_deref_access_params() {
         let (name, command) = CommandBase::parse("G1 X=%u Y=%u").unwrap();
-        let handler = CommandHandler::new(command, |_| {});
+        let handler = CommandHandler::new(command, |_: &[ArgValue]| {});
         assert_eq!(name, "G1");
         // Access params() via Deref<Target=CommandBase>
         assert_eq!(handler.params().len(), 2);
@@ -388,7 +390,7 @@ mod tests {
     #[test]
     fn test_deref_access_format() {
         let (name, command) = CommandBase::parse("G1 X=%u Y=%u").unwrap();
-        let handler = CommandHandler::new(command, |_| {});
+        let handler = CommandHandler::new(command, |_: &[ArgValue]| {});
         assert_eq!(name, "G1");
         // Access format() via Deref<Target=CommandBase>
         assert_eq!(handler.format(), "X=%u Y=%u");
@@ -400,7 +402,7 @@ mod tests {
 
     #[test]
     fn test_handler_debug() {
-        let handler = CommandHandler::new(CommandBase::new(vec![]), |_| {});
+        let handler = CommandHandler::new(CommandBase::new(vec![]), |_: &[ArgValue]| {});
         let debug_str = format!("{:?}", handler);
         assert!(debug_str.contains("CommandHandler"));
         assert!(!debug_str.contains("has_callback"));

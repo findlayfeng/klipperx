@@ -148,6 +148,9 @@ impl MsgBase {
     }
 
     /// Returns the format string by reconstructing it from name and params.
+    ///
+    /// Note: the Str variants `%*s` and `%.*s` normalize to `%s` here, since
+    /// [`ArgType`] does not distinguish them.
     pub fn format(&self) -> String {
         let mut parts = Vec::new();
         for (name, atype) in &self.params {
@@ -179,7 +182,7 @@ impl MsgBase {
 /// ```
 /// # use klipperx::core::klippy::msg::{MsgBase, MsgHandler, ArgValue};
 /// let (name, command) = MsgBase::parse("config_digital_out oid=%u pin=%s").unwrap();
-/// let mut handler = MsgHandler::new(command, |values| {
+/// let handler = MsgHandler::new(command, |values| {
 ///     println!("command received with {} params", values.len());
 /// });
 /// assert_eq!(name, "config_digital_out");
@@ -228,9 +231,8 @@ impl MsgHandler {
     }
 
     /// Invoke the callback with the given parameters.
-    pub fn invoke_callback(&mut self, params: &[ArgValue]) -> MsgResult<()> {
+    pub fn invoke_callback(&mut self, params: &[ArgValue]) {
         (self.callback)(params);
-        Ok(())
     }
 }
 
@@ -264,19 +266,20 @@ impl From<MsgBase> for MsgEntry {
 }
 
 impl MsgEntry {
-    /// Convert a `Base` entry to a `Handler` by providing a callback.
+    /// Attach a callback to this entry.
     ///
-    /// The callback receives a slice of `ArgValue` containing all decoded
-    /// parameter values in command definition order.
-    ///
-    /// Returns `self` unchanged if already a `Handler`.
+    /// A `Base` entry is converted into a `Handler`. If the entry is already
+    /// a `Handler`, the existing callback is replaced with the new one.
     pub fn with_callback(
         self,
         callback: impl FnMut(&[ArgValue]) + Send + 'static,
     ) -> Self {
         match self {
             MsgEntry::Base(base) => MsgHandler::new(base, callback).into(),
-            MsgEntry::Handler(ref _handler) => self,
+            MsgEntry::Handler(mut handler) => {
+                handler.set_callback(callback);
+                MsgEntry::Handler(handler)
+            }
         }
     }
 
@@ -375,7 +378,7 @@ mod tests {
             invoked_clone.store(true, Ordering::SeqCst);
         });
         let values = vec![ArgValue::Str("test".to_string())];
-        assert!(handler.invoke_callback(&values).is_ok());
+        handler.invoke_callback(&values);
         assert!(invoked.load(Ordering::SeqCst));
     }
 

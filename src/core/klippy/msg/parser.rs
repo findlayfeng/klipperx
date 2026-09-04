@@ -18,7 +18,7 @@ const SEND_COALESCE_THRESHOLD: usize = MESSAGE_PAYLOAD_MAX * 2 / 3;
 
 /// Default Klipper message formats for identify request/response.
 #[allow(dead_code)]
-const DEFAULT_MESSAGES: &[(u32, &str)] = &[
+const DEFAULT_MESSAGES: &[(u8, &str)] = &[
     (0, "identify_response offset=%u data=%.*s"),
     (1, "identify offset=%c count=%c"),
 ];
@@ -28,7 +28,7 @@ const DEFAULT_MESSAGES: &[(u32, &str)] = &[
 // #[multi_index_hash(rustc_hash::FxBuildHasher)]
 pub struct Command {
     #[multi_index(hashed_unique)]
-    id: u32,
+    id: u8,
     #[multi_index(hashed_unique)]
     name: String,
     command: CommandEntry,
@@ -60,7 +60,7 @@ impl Parser {
     ///
     /// - If `id & 1 == 1`, the message is treated as a regular (response) format.
     /// - If `id & 1 == 0`, the message is treated as a request format.
-    fn register(&mut self, id: u32, format: &str) -> ProtoResult<()> {
+    fn register(&mut self, id: u8, format: &str) -> ProtoResult<()> {
         let (name, base) =
             CommandBase::parse(format).map_err(|e| ProtoError::new(e.to_string()))?;
         let cmd = match id & 0x1 {
@@ -210,6 +210,7 @@ impl Parser {
         }
 
         let mut payload = Payload::new();
+        payload.push(cmd.id)?;
         for value in final_params {
             payload.push_value(&value)?;
         }
@@ -352,38 +353,25 @@ mod tests {
     /// Helper to build expected payload using Payload methods.
     fn build_g1_payload(x: u32, y: u32) -> Payload {
         let mut p = Payload::new();
+        p.push(3).unwrap(); // G1 cmd id
         p.push_u32(x).unwrap();
         p.push_u32(y).unwrap();
         p
     }
 
-    /// Helper to build string payload.
-    fn build_string_payload(s: &str) -> Payload {
-        let mut p = Payload::new();
-        p.push_bytes(s.as_bytes()).unwrap();
-        p
-    }
-
-    /// Helper to build bytes payload.
-    fn build_bytes_payload(bytes: &[u8]) -> Payload {
-        let mut p = Payload::new();
-        p.push_bytes(bytes).unwrap();
-        p
-    }
-
     fn register_g1_cmd(parser: &mut Parser) {
-        // Register "G1 X=%u Y=%u" with id=0x10001 (regular message, odd id)
-        let _ = parser.register(0x10001, "G1 X=%u Y=%u");
+        // Register "G1 X=%u Y=%u" with id=3 (regular message, odd id)
+        let _ = parser.register(3, "G1 X=%u Y=%u");
     }
 
     fn register_m105_cmd(parser: &mut Parser) {
-        // Register "M105" with no params (id=0x10003, regular message)
-        let _ = parser.register(0x10003, "M105");
+        // Register "M105" with no params (id=5, regular message)
+        let _ = parser.register(5, "M105");
     }
 
     fn register_request_cmd(parser: &mut Parser) {
         // Register "REQ" as a request type command (even id)
-        let _ = parser.register(0x10002, "REQ param=%u");
+        let _ = parser.register(2, "REQ param=%u");
     }
 
     #[tokio::test]
@@ -446,7 +434,7 @@ mod tests {
         let mut parser = Parser::new(Arc::new(interface));
 
         // Register a command with string param (odd ID = Regular type)
-        let _ = parser.register(0x10011, "CMD label=%s");
+        let _ = parser.register(7, "CMD label=%s");
 
         // Send UInt32 instead of Str
         let params = vec![Param::Positional(ArgValue::UInt32(42))];
@@ -458,8 +446,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_command_no_params() {
+        let mut expected = Payload::new();
+        expected.push(5).unwrap(); // M105 cmd id
         let mapping = vec![MappingEntry {
-            input: Frame::new(0, Vec::new()),
+            input: Frame::new(0, expected.payload().to_vec()),
             outputs: vec![],
         }];
         let interface = TestInterface::new(mapping);
@@ -472,7 +462,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_string_param() {
-        let expected = build_string_payload("hello");
+        let mut expected = Payload::new();
+        expected.push(9).unwrap(); // TEST cmd id
+        expected.push_bytes(b"hello").unwrap();
         let mapping = vec![MappingEntry {
             input: Frame::new(0, expected.payload().to_vec()),
             outputs: vec![],
@@ -481,7 +473,7 @@ mod tests {
         let mut parser = Parser::new(Arc::new(interface));
 
         // Register a command with a string param
-        let _ = parser.register(0x10005, "TEST name=%s");
+        let _ = parser.register(9, "TEST name=%s");
 
         let params = vec![Param::Positional(ArgValue::Str("hello".to_string()))];
         parser.send("TEST", &params).await.unwrap();
@@ -489,7 +481,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_bytes_param() {
-        let expected = build_bytes_payload(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        let mut expected = Payload::new();
+        expected.push(11).unwrap(); // TEST cmd id
+        expected.push_bytes(&[0xDE, 0xAD, 0xBE, 0xEF]).unwrap();
         let mapping = vec![MappingEntry {
             input: Frame::new(0, expected.payload().to_vec()),
             outputs: vec![],
@@ -498,7 +492,7 @@ mod tests {
         let mut parser = Parser::new(Arc::new(interface));
 
         // Register a command with a bytes param
-        let _ = parser.register(0x10007, "TEST data=%c");
+        let _ = parser.register(11, "TEST data=%c");
 
         let params = vec![Param::Positional(ArgValue::Bytes(vec![0xDE, 0xAD, 0xBE, 0xEF]))];
         parser.send("TEST", &params).await.unwrap();
@@ -507,6 +501,7 @@ mod tests {
     #[tokio::test]
     async fn test_send_mixed_params() {
         let mut expected = Payload::new();
+        expected.push(13).unwrap(); // CMD cmd id
         expected.push_u32(42).unwrap();
         expected.push_bytes(b"test_label").unwrap();
         expected.push_bytes(&[0x01, 0x02]).unwrap();
@@ -519,7 +514,7 @@ mod tests {
         let mut parser = Parser::new(Arc::new(interface));
 
         // Register a command with mixed types: uint32, string, bytes
-        let _ = parser.register(0x10009, "CMD oid=%u label=%s raw=%c");
+        let _ = parser.register(13, "CMD oid=%u label=%s raw=%c");
 
         let params = vec![
             Param::Positional(ArgValue::UInt32(42)),
@@ -532,6 +527,7 @@ mod tests {
     #[tokio::test]
     async fn test_send_named_params() {
         let mut expected = Payload::new();
+        expected.push(3).unwrap(); // G1 cmd id
         expected.push_u32(100).unwrap();
         expected.push_u32(200).unwrap();
 
@@ -554,6 +550,7 @@ mod tests {
     #[tokio::test]
     async fn test_send_mixed_positional_named() {
         let mut expected = Payload::new();
+        expected.push(3).unwrap(); // G1 cmd id
         expected.push_u32(100).unwrap();
         expected.push_u32(200).unwrap();
 
@@ -631,7 +628,8 @@ mod tests {
     #[tokio::test]
     async fn test_send_multiple_commands() {
         let g1_payload = build_g1_payload(100, 200);
-        let m105_payload = Payload::new();
+        let mut m105_payload = Payload::new();
+        m105_payload.push(5).unwrap(); // M105 cmd id
 
         let mapping = vec![
             MappingEntry {
@@ -664,6 +662,7 @@ mod tests {
     async fn test_send_with_type_conversion_int32_to_uint32() {
         // Register command expecting UInt32
         let mut expected = Payload::new();
+        expected.push(15).unwrap(); // CMD cmd id
         expected.push_u32(42).unwrap();
 
         let mapping = vec![MappingEntry {
@@ -673,7 +672,7 @@ mod tests {
         let interface = TestInterface::new(mapping);
         let mut parser = Parser::new(Arc::new(interface));
 
-        let _ = parser.register(0x10013, "CMD val=%u");
+        let _ = parser.register(15, "CMD val=%u");
 
         // Send Int32 instead of UInt32 — should warn and convert
         let params = vec![Param::Positional(ArgValue::Int32(42))];
@@ -683,6 +682,7 @@ mod tests {
     #[tokio::test]
     async fn test_send_with_type_conversion_int16_to_uint16() {
         let mut expected = Payload::new();
+        expected.push(17).unwrap(); // CMD cmd id
         expected.push_u16(100).unwrap();
 
         let mapping = vec![MappingEntry {
@@ -692,7 +692,7 @@ mod tests {
         let interface = TestInterface::new(mapping);
         let mut parser = Parser::new(Arc::new(interface));
 
-        let _ = parser.register(0x10015, "CMD val=%hu");
+        let _ = parser.register(17, "CMD val=%hu");
 
         // Send Int16 instead of UInt16 — should warn and convert
         let params = vec![Param::Positional(ArgValue::Int16(100))];
@@ -702,6 +702,7 @@ mod tests {
     #[tokio::test]
     async fn test_send_with_type_conversion_uint16_to_int32() {
         let mut expected = Payload::new();
+        expected.push(19).unwrap(); // CMD cmd id
         expected.push_u32(100).unwrap();
 
         let mapping = vec![MappingEntry {
@@ -711,7 +712,7 @@ mod tests {
         let interface = TestInterface::new(mapping);
         let mut parser = Parser::new(Arc::new(interface));
 
-        let _ = parser.register(0x10017, "CMD val=%i");
+        let _ = parser.register(19, "CMD val=%i");
 
         // Send UInt16 instead of Int32 — should warn and convert
         let params = vec![Param::Positional(ArgValue::UInt16(100))];
@@ -727,7 +728,7 @@ mod tests {
         let interface = TestInterface::new(mapping);
         let mut parser = Parser::new(Arc::new(interface));
 
-        let _ = parser.register(0x10019, "CMD val=%s");
+        let _ = parser.register(21, "CMD val=%s");
 
         // Send UInt32 instead of Str — conversion not possible
         let params = vec![Param::Positional(ArgValue::UInt32(42))];

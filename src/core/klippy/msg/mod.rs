@@ -1,9 +1,11 @@
 pub mod error;
+pub mod param;
 pub mod parser;
 pub mod proto;
 
 // Re-export commonly-used items for convenience
 pub use error::{MsgError, MsgResult};
+pub use param::Param;
 pub use proto::{ArgType, ArgValue};
 
 // ===========================================================================

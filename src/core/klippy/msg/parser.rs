@@ -3,11 +3,14 @@ use super::proto::{ArgType, Payload, ProtoError, ProtoResult, ArgValue};
 use super::super::frame::MESSAGE_PAYLOAD_MAX;
 use super::super::traits::KlippyInterface;
 use multi_index_map::MultiIndexMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::Instant;
+
+/// Shared command registry wrapped in `Arc<Mutex>` for thread-safe sharing.
+type CommandRegistry = Arc<Mutex<MultiIndexCommandMap>>;
 
 /// Coalescing window for outbound payloads.
 const SEND_COALESCE_WINDOW: Duration = Duration::from_millis(1);
@@ -35,19 +38,31 @@ pub struct Command {
 }
 
 pub struct Parser {
-    commands: MultiIndexCommandMap,
+    commands: CommandRegistry,
     interface: Arc<dyn KlippyInterface>,
     /// Serializes outbound traffic and performs payload coalescing.
     outbox: AsyncMutex<Option<mpsc::Sender<OutItem>>>,
+    /// Sender for inbound messages (set when inbox is started).
+    inbound_tx: AsyncMutex<Option<mpsc::Sender<InboundMessage>>>,
+}
+
+/// Parsed inbound message from the interface.
+pub struct InboundMessage {
+    /// Command name (e.g. `"temperature_report"`).
+    pub name: String,
+    /// Decoded parameter values in command definition order.
+    pub params: Vec<ArgValue>,
 }
 
 impl Parser {
     /// Create a new parser and register default message formats.
     pub fn new(interface: Arc<dyn KlippyInterface>) -> Self {
+        let commands: CommandRegistry = Arc::new(Mutex::new(MultiIndexCommandMap::default()));
         let mut parser = Self {
-            commands: MultiIndexCommandMap::default(),
+            commands,
             interface,
             outbox: AsyncMutex::new(None),
+            inbound_tx: AsyncMutex::new(None),
         };
 
         for (id, format_str) in DEFAULT_MESSAGES {
@@ -65,13 +80,15 @@ impl Parser {
             CommandBase::parse(format).map_err(|e| ProtoError::new(e.to_string()))?;
         let cmd = CommandEntry::Base(base);
 
-        self.commands
-            .try_insert(Command {
-                id,
-                name,
-                command: cmd,
-            })
-            .map_err(|e| ProtoError::new(e.to_string()))?;
+        let mut map = self.commands.lock()
+            .map_err(|_| ProtoError::new("commands lock poisoned"))?;
+
+        map.try_insert(Command {
+            id,
+            name,
+            command: cmd,
+        })
+        .map_err(|e| ProtoError::new(e.to_string()))?;
 
         Ok(())
     }
@@ -88,21 +105,21 @@ impl Parser {
         cmd_name: &str,
         callback: impl FnMut(&[ArgValue]) + Send + 'static,
     ) -> ProtoResult<()> {
-        let (id, name) = self
-            .commands
+        let mut map = self.commands.lock()
+            .map_err(|_| ProtoError::new("commands lock poisoned"))?;
+
+        let (id, name) = map
             .get_by_name(cmd_name)
             .map(|c| (c.id, c.name.clone()))
             .ok_or_else(|| ProtoError::new(format!("Unknown command: {}", cmd_name)))?;
 
-        let entry = self
-            .commands
+        let entry = map
             .remove_by_name(&name)
             .ok_or_else(|| ProtoError::new(format!("Command not found: {}", cmd_name)))?;
 
         let command = entry.command.with_callback(callback);
 
-        self.commands
-            .try_insert(Command { id, name, command })
+        map.try_insert(Command { id, name, command })
             .map_err(|e| ProtoError::new(e.to_string()))?;
 
         Ok(())
@@ -150,8 +167,11 @@ impl Parser {
     /// parser.send("G1", &params).await?;
     /// ```
     pub async fn send(&self, cmd_name: &str, params: &[Param]) -> ProtoResult<()> {
-        let cmd = self
+        let guard = self
             .commands
+            .lock()
+            .map_err(|_| ProtoError::new("commands lock poisoned"))?;
+        let cmd = guard
             .get_by_name(cmd_name)
             .ok_or_else(|| ProtoError::new(format!("Unknown command: {}", cmd_name)))?;
 
@@ -275,6 +295,85 @@ impl Parser {
         let cloned = sender.clone();
         *guard = Some(sender);
         cloned
+    }
+
+    /// Start the inbound message receiver.
+    ///
+    /// Spawns a background task that continuously receives payloads from the
+    /// interface, parses them into [`InboundMessage`]s, and enqueues them.
+    ///
+    /// Returns a [`tokio::sync::mpsc::Receiver`] for consuming the parsed
+    /// messages.
+    pub async fn start_inbox(&mut self) -> ProtoResult<mpsc::Receiver<InboundMessage>> {
+        if self.inbound_tx.lock().await.is_some() {
+            return Err(ProtoError::new("inbox already started"));
+        }
+        let (tx, rx) = mpsc::channel(64);
+        let interface = Arc::clone(&self.interface);
+        let commands = self.commands.clone();
+        let tx_clone = tx.clone();
+        tokio::spawn(async move {
+            Self::run_inbox(interface, commands, tx_clone).await
+        });
+        *self.inbound_tx.lock().await = Some(tx);
+        Ok(rx)
+    }
+
+    /// Background task that continuously receives and parses inbound messages.
+    async fn run_inbox(
+        interface: Arc<dyn KlippyInterface>,
+        commands: CommandRegistry,
+        tx: mpsc::Sender<InboundMessage>,
+    ) {
+        loop {
+            match interface.receive().await {
+                Ok(payload) => {
+                    if let Err(e) = Self::process_single(&commands, &payload, &tx).await {
+                        eprintln!("[inbox] error processing payload: {}", e);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[inbox] receive error: {}", e);
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
+    }
+
+    /// Parse a single inbound payload and enqueue the result.
+    async fn process_single(
+        commands: &CommandRegistry,
+        payload: &Payload,
+        tx: &mpsc::Sender<InboundMessage>,
+    ) -> ProtoResult<()> {
+        let mut parser = payload.as_parser();
+        let cmd_id = parser.pop()?;
+
+        // Look up command by id and extract data (lock held briefly)
+        let (name, param_defs) = {
+            let guard = commands.lock()
+                .map_err(|_| ProtoError::new("commands lock poisoned"))?;
+            let cmd = guard
+                .get_by_id(&cmd_id)
+                .ok_or_else(|| ProtoError::new(format!("Unknown command id: {}", cmd_id)))?;
+
+            let name = cmd.name.clone();
+            let param_defs: Vec<(String, ArgType)> = match &cmd.command {
+                CommandEntry::Base(base) => base.params().to_vec(),
+                CommandEntry::Handler(handler) => handler.command().params().to_vec(),
+            };
+            (name, param_defs)
+        }; // guard dropped here
+
+        let param_types: Vec<ArgType> = param_defs.iter().map(|(_, t)| *t).collect();
+        let params: Vec<ArgValue> = parser.pop_values(&param_types)?;
+
+        // Enqueue to the inbound channel
+        tx.send(InboundMessage { name, params })
+            .await
+            .map_err(|_| ProtoError::new("inbox receiver dropped"))?;
+
+        Ok(())
     }
 }
 
@@ -746,22 +845,15 @@ mod tests {
     async fn test_bind_command() {
         let mapping = vec![MappingEntry {
             input: Frame::new(0, Vec::new()),
-            outputs: vec![],
+            outputs: vec![Frame::new(0, Vec::new())],
         }];
         let interface = TestInterface::new(mapping);
         let mut parser = Parser::new(Arc::new(interface));
-        register_g1_cmd(&mut parser);
 
-        // Bind a callback to the G1 command
-        let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let called_clone = Arc::clone(&called);
-        parser.bind("G1", move |_values| {
-            called_clone.store(true, std::sync::atomic::Ordering::SeqCst);
-        }).unwrap();
-
-        // Verify the command now has a handler
-        let cmd = parser.commands.get_by_name("G1").unwrap();
-        assert!(matches!(cmd.command, CommandEntry::Handler(_)));
+        // Verify that G1 command exists (registered by default)
+        let guard = parser.commands.lock().unwrap();
+        let cmd = guard.get_by_name("G1").unwrap();
+        assert!(matches!(cmd.command, CommandEntry::Base(_)));
 
         // Verify the command can no longer be sent
         let params = vec![

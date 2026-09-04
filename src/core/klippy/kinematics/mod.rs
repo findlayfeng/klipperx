@@ -6,8 +6,6 @@
 //
 // Available implementations:
 // - `none`: Dummy no-op kinematics for testing
-//
-// Reference: `third_party/klipper/klippy/kinematics/`
 
 pub mod kinematics;
 pub mod none;

@@ -9,7 +9,7 @@
 // Payload content is opaque to this module.
 
 // ===========================================================================
-// Frame constants (mirrors msgproto.py)
+// Frame constants
 // ===========================================================================
 
 /// Minimum frame length.
@@ -45,8 +45,6 @@ pub const MESSAGE_SYNC: u8 = 0x7e;
 // ===========================================================================
 
 /// Compute CRC-16-CCITT over a variable number of byte slices.
-///
-/// Mirrors `crc16_ccitt()` in msgproto.py, returning a `u16` CRC value.
 ///
 /// All referenced slices are concatenated in order for CRC computation.
 /// Initial CRC value is always `0xFFFF`.
@@ -104,8 +102,6 @@ impl Frame {
     /// Returns:
     ///   - `Ok(())` if valid
     ///   - `Err(reason)` if invalid
-    ///
-    /// Mirrors `check_packet()` in msgproto.py.
     pub fn check(raw: &[u8]) -> Result<(), &'static str> {
         // Need at least a minimum frame
         if raw.len() < MESSAGE_MIN {
@@ -178,8 +174,6 @@ impl Frame {
     }
 
     /// Encode a frame with the given sequence number and payload.
-    ///
-    /// Mirrors `encode_msgblock()` in msgproto.py.
     pub fn encode(seq: u8, payload: &[u8]) -> Vec<u8> {
         let msglen = MESSAGE_MIN + payload.len();
         let seq_byte = (seq & MESSAGE_SEQ_MASK) | MESSAGE_DEST;
@@ -205,7 +199,7 @@ mod tests {
     #[test]
     fn test_crc16_ccitt() {
         let crc = crc16_ccitt!(b"123456789");
-        // Custom CRC-16-CCITT variant from msgproto.py
+        // Custom CRC-16-CCITT variant
         assert_eq!(crc, 0x6F91);
     }
 

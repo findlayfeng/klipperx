@@ -10,7 +10,7 @@ use std::sync::Arc;
 use super::error::KlippyError;
 
 
-/// Printer state categories, mirroring klippy.py Printer.get_state_message()
+/// Printer state categories reported by `Printer::get_state_message`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PrinterState {
     /// During startup, before config is fully loaded
@@ -24,7 +24,7 @@ pub enum PrinterState {
 }
 
 impl PrinterState {
-    /// Get the state category string, matching Klipper's internal constants
+    /// Get the state category string ("startup", "ready", "shutdown", "error")
     pub fn as_category(&self) -> &'static str {
         match self {
             PrinterState::Startup => "startup",
@@ -41,7 +41,7 @@ impl Default for PrinterState {
     }
 }
 
-/// State message pair matching Klipper's Printer.get_state_message() return
+/// State message pair returned by `Printer::get_state_message`.
 #[derive(Debug, Clone)]
 pub struct StateMessage {
     /// The full state message string
@@ -65,8 +65,9 @@ pub enum InterfaceEvent {
     Default,
 }
 
-/// Klipper event names used in the event handler system.
-/// These match the event strings in klippy.py:
+/// Printer event types used in the event handler system.
+///
+/// Each variant maps to a wire event name (see [`PrinterEvent::as_str`]):
 ///   klippy:mcu_identify, klippy:connect, klippy:ready,
 ///   klippy:shutdown, klippy:analyze_shutdown, klippy:disconnect,
 ///   klippy:firmware_restart, klippy:notify_mcu_error
@@ -83,7 +84,7 @@ pub enum PrinterEvent {
 }
 
 impl PrinterEvent {
-    /// Get the event name string matching Klipper's event names
+    /// Get the event name string (e.g. "klippy:ready")
     pub fn as_str(&self) -> &str {
         match self {
             PrinterEvent::McuIdentify => "klippy:mcu_identify",
@@ -98,9 +99,8 @@ impl PrinterEvent {
     }
 }
 
-/// Abstract interface for the Klipper Printer object registry and lifecycle.
+/// Abstract interface for the printer object registry and lifecycle.
 ///
-/// This trait mirrors the `Printer` class in `third_party/klipper/klippy/klippy.py`.
 /// It provides:
 /// - **Object registry**: add/lookup printer objects (steppers, extruders, etc.)
 /// - **State management**: track printer state (startup/ready/shutdown/error)
@@ -121,33 +121,26 @@ impl PrinterEvent {
 /// ```
 pub trait Printer: Send + Sync {
     /// Get the current state message and category.
-    /// Mirrors `Printer.get_state_message()` in klippy.py
     fn get_state_message(&self) -> StateMessage;
 
     /// Check if the printer is in the shutdown state.
-    /// Mirrors `Printer.is_shutdown()` in klippy.py
     fn is_shutdown(&self) -> bool;
 
     /// Add an object to the printer's object registry.
-    /// Mirrors `Printer.add_object()` in klippy.py.
     ///
     /// Objects are identified by a string name. Adding an object
-    /// with a duplicate name will return an error, matching Klipper's
-    /// "Printer object 'X' already created" behavior.
+    /// with a duplicate name will return an error.
     fn add_object(&self, name: &str, obj: Arc<dyn PrinterObject>) -> Result<(), KlippyError>;
 
     /// Look up an object by name from the registry.
-    /// Mirrors `Printer.lookup_object()` in klippy.py.
     fn lookup_object<T: PrinterObject + 'static>(&self, name: &str) -> Option<Arc<T>>;
 
     /// Look up objects whose names start with a given prefix.
-    /// Mirrors `Printer.lookup_objects()` in klippy.py.
     ///
     /// Returns a list of (name, object) pairs.
     fn lookup_objects(&self, module: Option<&str>) -> Vec<(String, Arc<dyn PrinterObject>)>;
 
     /// Register an event handler callback for a specific event.
-    /// Mirrors `Printer.register_event_handler()` in klippy.py.
     ///
     /// Events include: klippy:connect, klippy:ready, klippy:shutdown,
     /// klippy:disconnect, klippy:firmware_restart, etc.
@@ -156,13 +149,11 @@ pub trait Printer: Send + Sync {
         F: Fn() + Send + Sync + 'static;
 
     /// Send an event to all registered handlers.
-    /// Mirrors `Printer.send_event()` in klippy.py.
     ///
     /// Returns a list of results from each handler.
     fn send_event(&self, event: &PrinterEvent) -> Vec<Result<(), KlippyError>>;
 
     /// Invoke the shutdown sequence.
-    /// Mirrors `Printer.invoke_shutdown()` in klippy.py.
     ///
     /// This will:
     /// 1. Set the printer state to shutdown/error
@@ -171,7 +162,6 @@ pub trait Printer: Send + Sync {
     fn invoke_shutdown(&self, msg: &str, details: Option<HashMap<String, String>>);
 
     /// Request the printer to exit its main run loop.
-    /// Mirrors `Printer.request_exit()` in klippy.py.
     ///
     /// The `result` determines what happens after the run loop exits:
     /// - "exit" / "error_exit": terminate the process
@@ -179,7 +169,6 @@ pub trait Printer: Send + Sync {
     fn request_exit(&self, result: &str);
 
     /// Run the printer's main event loop.
-    /// Mirrors `Printer.run()` in klippy.py.
     ///
     /// This is the main entry point that starts the reactor loop
     /// and processes events until the printer is shut down.
@@ -191,8 +180,6 @@ pub trait Printer: Send + Sync {
 /// Each Klipper config section (e.g., [stepper_x], [extruder], [printer])
 /// creates a printer object. These objects are stored in the Printer's
 /// object registry and can be looked up by name.
-///
-/// This mirrors the dynamic object model in Klipper's Printer class.
 pub trait PrinterObject: Send + Sync {
     /// Get the name/identifier of this object
     fn name(&self) -> &str;

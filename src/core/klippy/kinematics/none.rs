@@ -1,14 +1,13 @@
 // Dummy "none" kinematics support (for developer testing)
 //
-// This module implements a no-op kinematics class for Klipper, mirroring
-// `third_party/klipper/klippy/kinematics/none.py`.
+// This module implements a no-op kinematics class.
 //
 // Unlike real kinematics (cartesian, delta, corexy, etc.), NoneKinematics:
 // - Returns no steppers
 // - Always reports position [0, 0, 0]
 // - All operations (homing, move validation, position setting) are no-ops
 //
-// This is useful for testing Klipper's host-side logic without a real printer.
+// This is useful for testing host-side logic without a real printer.
 
 use std::collections::HashMap;
 
@@ -19,11 +18,8 @@ use super::kinematics::{
 
 /// Dummy kinematics that performs no coordinate transformation.
 ///
-/// Mirrors `NoneKinematics` in `third_party/klipper/klippy/kinematics/none.py`.
-///
 /// # Fields
 /// - `axes_minmax`: The minimum/maximum axis bounds, always `(0.0, 0.0, 0.0)`.
-///   Mirrors `self.axes_minmax = toolhead.Coord((0., 0., 0.))` in the original.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct NoneKinematics {
     /// Axis minimum/maximum bounds (x, y, z).
@@ -33,10 +29,6 @@ pub struct NoneKinematics {
 
 impl NoneKinematics {
     /// Create a new NoneKinematics instance.
-    ///
-    /// Mirrors `NoneKinematics.__init__(self, toolhead, config)` in klippy.py.
-    /// The `toolhead` and `config` parameters are ignored since this is a no-op
-    /// kinematics used only for testing.
     pub fn new() -> Self {
         Self {
             axes_minmax: Coord::new(0.0, 0.0, 0.0),
@@ -53,7 +45,6 @@ impl Default for NoneKinematics {
 impl Kinematics for NoneKinematics {
     /// Get the list of steppers for this kinematics.
     ///
-    /// Mirrors `get_steppers(self)` in klippy.py.
     /// Returns an empty list since there are no real steppers.
     fn get_steppers(&self) -> Vec<StepperHandle> {
         Vec::new()
@@ -61,7 +52,6 @@ impl Kinematics for NoneKinematics {
 
     /// Calculate the toolhead position from stepper positions.
     ///
-    /// Mirrors `calc_position(self, stepper_positions)` in klippy.py.
     /// Always returns `[0, 0, 0]` since no real axes exist.
     fn calc_position(&self, _stepper_positions: &HashMap<String, f64>) -> Coord {
         Coord::new(0.0, 0.0, 0.0)
@@ -69,7 +59,6 @@ impl Kinematics for NoneKinematics {
 
     /// Set the current toolhead position.
     ///
-    /// Mirrors `set_position(self, newpos, homing_axes)` in klippy.py.
     /// No-op for dummy kinematics.
     fn set_position(&self, _newpos: Coord, _homing_axes: &HomingAxes) {
         // No-op
@@ -77,7 +66,6 @@ impl Kinematics for NoneKinematics {
 
     /// Clear the homing state for specified axes.
     ///
-    /// Mirrors `clear_homing_state(self, clear_axes)` in klippy.py.
     /// No-op for dummy kinematics.
     fn clear_homing_state(&self, _clear_axes: &HomingAxes) {
         // No-op
@@ -85,7 +73,6 @@ impl Kinematics for NoneKinematics {
 
     /// Perform a homing operation.
     ///
-    /// Mirrors `home(self, homing_state)` in klippy.py.
     /// No-op for dummy kinematics.
     fn home(&self, _homing_state: &mut HomingState) {
         // No-op
@@ -93,15 +80,12 @@ impl Kinematics for NoneKinematics {
 
     /// Validate a move for kinematic constraints.
     ///
-    /// Mirrors `check_move(self, move)` in klippy.py.
     /// No-op for dummy kinematics — all moves are accepted.
     fn check_move(&self, _move: &Move) -> Result<(), KinematicsError> {
         Ok(())
     }
 
     /// Get the status information for this kinematics.
-    ///
-    /// Mirrors `get_status(self, eventtime)` in klippy.py.
     fn get_status(&self, _eventtime: Option<f64>) -> KinematicsStatus {
         KinematicsStatus::new("", self.axes_minmax, self.axes_minmax)
     }
@@ -109,9 +93,8 @@ impl Kinematics for NoneKinematics {
 
 /// Load function for creating a NoneKinematics instance.
 ///
-/// Mirrors `load_kinematics(toolhead, config)` in klippy.py.
-/// In a full implementation, this would be called by the config loader
-/// when it encounters `kinematics: none` in the config file.
+/// Called by the config loader when it encounters `kinematics: none`
+/// in the config file.
 pub fn load_kinematics() -> NoneKinematics {
     NoneKinematics::new()
 }

@@ -1,29 +1,17 @@
-// Klipper kinematics trait
+// Kinematics trait
 //
-// This module defines the abstract interface for all Klipper kinematics
+// This module defines the abstract interface for all kinematics
 // implementations (cartesian, delta, corexy, winch, polar, etc.).
 //
 // Each kinematics type defines how stepper motor positions map to
 // toolhead (x, y, z) coordinates. The trait captures the common interface
 // shared by all kinematics implementations.
-//
-// Reference: `third_party/klipper/klippy/kinematics/`
-//   cartesian.py  - CartKinematics
-//   corexy.py     - CoreXYKinematics
-//   corexz.py     - CoreXZKinematics
-//   delta.py      - DeltaKinematics
-//   deltesian.py  - DeltesianKinematics
-//   polar.py      - PolarKinematics
-//   rotary_delta.py - RotaryDeltaKinematics
-//   winch.py      - WinchKinematics
-//   none.py       - NoneKinematics
 
 use std::collections::HashMap;
 
-/// A 3D coordinate (x, y, z), mirroring Klipper's `Coord` tuple.
+/// A 3D coordinate (x, y, z).
 ///
-/// `Coord` is a simple tuple-like struct with named accessors for x, y, z components.
-/// In Klipper's Python code, it's implemented as a `tuple` subclass with properties.
+/// A simple struct with named accessors for the x, y, z components.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Coord {
     pub x: f64,
@@ -207,7 +195,6 @@ impl std::fmt::Display for HomingAxes {
 
 /// Homing state for tracking homing operations.
 ///
-/// Mirrors the homing state concept from Klipper's `extras/homing.py`.
 /// Used by `Kinematics::home()` for all kinematics types.
 #[derive(Debug, Clone)]
 pub struct HomingState {
@@ -223,7 +210,6 @@ impl HomingState {
     }
 
     /// Set the axes being homed.
-    /// Mirrors `HomingMove.set_axes()` in klipper.py.
     pub fn set_axes(&mut self, axes: HomingAxes) {
         self.axes = axes;
     }
@@ -242,7 +228,6 @@ impl Default for HomingState {
 
 /// A move to be validated by kinematics.
 ///
-/// Mirrors the move concept from Klipper's `toolhead.py`.
 /// Used by `Kinematics::check_move()` for move validation.
 ///
 /// Key fields:
@@ -304,15 +289,6 @@ impl Move {
 }
 
 /// Status information returned by `get_status()`.
-///
-/// Mirrors the return value of kinematics `get_status()` in klippy.py:
-/// ```python
-/// return {
-///     'homed_axes': 'xyz',  # string of homed axes
-///     'axis_minimum': Coord(...),
-///     'axis_maximum': Coord(...),
-/// }
-/// ```
 #[derive(Debug, Clone)]
 pub struct KinematicsStatus {
     /// Compressed string of homed axes, e.g., "xyz" or ""
@@ -337,19 +313,10 @@ impl KinematicsStatus {
     }
 }
 
-/// Abstract trait for Klipper kinematics implementations.
+/// Abstract trait for kinematics implementations.
 ///
 /// This trait captures the common interface shared by all kinematics
-/// classes in `third_party/klipper/klippy/kinematics/`:
-///   - `CartKinematics` (cartesian.py)
-///   - `CoreXYKinematics` (corexy.py)
-///   - `CoreXZKinematics` (corexz.py)
-///   - `DeltaKinematics` (delta.py)
-///   - `DeltesianKinematics` (deltesian.py)
-///   - `PolarKinematics` (polar.py)
-///   - `RotaryDeltaKinematics` (rotary_delta.py)
-///   - `WinchKinematics` (winch.py)
-///   - `NoneKinematics` (none.py)
+/// implementations (cartesian, delta, corexy, winch, polar, etc.).
 ///
 /// Each kinematics type defines how stepper motor positions map to
 /// toolhead (x, y, z) coordinates.
@@ -373,15 +340,10 @@ impl KinematicsStatus {
 pub trait Kinematics: Send + Sync {
     /// Get the list of steppers for this kinematics.
     ///
-    /// Mirrors `get_steppers(self)` in klippy.py.
-    ///
-    /// In Klipper, steppers are `PrinterStepper` objects. In Rust,
-    /// this returns a list of stepper identifiers or handles.
+    /// Returns a list of stepper identifiers or handles.
     fn get_steppers(&self) -> Vec<StepperHandle>;
 
     /// Calculate the toolhead position from stepper positions.
-    ///
-    /// Mirrors `calc_position(self, stepper_positions)` in klippy.py.
     ///
     /// This is the core kinematic transformation: converting individual
     /// stepper positions into Cartesian (x, y, z) coordinates.
@@ -397,8 +359,6 @@ pub trait Kinematics: Send + Sync {
 
     /// Set the internal position tracking.
     ///
-    /// Mirrors `set_position(self, newpos, homing_axes)` in klippy.py.
-    ///
     /// Called after homing or at startup to initialize position tracking.
     ///
     /// # Arguments
@@ -407,8 +367,6 @@ pub trait Kinematics: Send + Sync {
     fn set_position(&self, newpos: Coord, homing_axes: &HomingAxes);
 
     /// Clear the homing state for specified axes.
-    ///
-    /// Mirrors `clear_homing_state(self, clear_axes)` in klippy.py.
     ///
     /// Resets limit tracking for the specified axes, putting them
     /// back into an "unhomed" state.
@@ -419,8 +377,6 @@ pub trait Kinematics: Send + Sync {
 
     /// Perform a homing operation.
     ///
-    /// Mirrors `home(self, homing_state)` in klippy.py.
-    ///
     /// Each kinematics type homes differently:
     /// - **Cartesian/CoreXY**: each axis homed independently in order
     /// - **Delta**: all axes homed simultaneously
@@ -430,8 +386,6 @@ pub trait Kinematics: Send + Sync {
     fn home(&self, homing_state: &mut HomingState);
 
     /// Validate a move for kinematic constraints.
-    ///
-    /// Mirrors `check_move(self, move)` in klippy.py.
     ///
     /// Called before executing a move to ensure it's within bounds.
     /// May modify the move's speed/acceleration limits.
@@ -444,8 +398,6 @@ pub trait Kinematics: Send + Sync {
     fn check_move(&self, move_obj: &Move) -> Result<(), KinematicsError>;
 
     /// Get the status information for this kinematics.
-    ///
-    /// Mirrors `get_status(self, eventtime)` in klippy.py.
     ///
     /// Returns data used by the UI to display homed axes and axis bounds.
     ///
@@ -479,8 +431,7 @@ impl std::error::Error for KinematicsError {}
 
 /// A handle to a stepper motor for this kinematics.
 ///
-/// In Klipper, this is a `PrinterStepper` object. In Rust, it's an
-/// identifier that can be used to query stepper state.
+/// An identifier that can be used to query stepper state.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct StepperHandle {
     /// Stepper name (e.g., "stepper_x", "stepper_y", "stepper_z")
@@ -503,7 +454,6 @@ impl std::fmt::Display for StepperHandle {
 
 /// Factory function type for creating kinematics instances.
 ///
-/// Mirrors `load_kinematics(toolhead, config)` in klippy.py.
 /// Each kinematics module exports this function.
 pub type KinematicsFactory = fn() -> Box<dyn Kinematics>;
 
@@ -511,12 +461,6 @@ pub type KinematicsFactory = fn() -> Box<dyn Kinematics>;
 ///
 /// Given a kinematics type name (e.g., "cartesian", "delta", "corexy", "none"),
 /// returns a boxed `Kinematics` trait object.
-///
-/// This is the Rust equivalent of Klipper's module import system:
-/// ```python
-/// mod = importlib.import_module('kinematics.' + module_name)
-/// return mod.load_kinematics(toolhead, config)
-/// ```
 ///
 /// # Arguments
 /// * `kinematics_type` - The kinematics type name (e.g., "none", "cartesian")

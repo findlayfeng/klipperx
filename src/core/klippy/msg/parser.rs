@@ -79,11 +79,14 @@ impl Parser {
     /// Bind a callback to a registered command.
     ///
     /// Converts the command from `Base` to `Handler` with the provided callback.
+    /// The callback receives a slice of `ArgValue` containing all decoded
+    /// parameter values in command definition order.
+    ///
     /// Returns an error if the command is not found or already has a callback.
     pub fn bind(
         &mut self,
         cmd_name: &str,
-        callback: impl FnMut(&ArgValue) + 'static,
+        callback: impl FnMut(&[ArgValue]) + Send + 'static,
     ) -> ProtoResult<()> {
         let (id, name) = self
             .commands
@@ -752,7 +755,7 @@ mod tests {
         // Bind a callback to the G1 command
         let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let called_clone = Arc::clone(&called);
-        parser.bind("G1", move |_value| {
+        parser.bind("G1", move |_values| {
             called_clone.store(true, std::sync::atomic::Ordering::SeqCst);
         }).unwrap();
 
@@ -782,7 +785,7 @@ mod tests {
         let interface = TestInterface::new(mapping);
         let mut parser = Parser::new(Arc::new(interface));
 
-        let result = parser.bind("UNKNOWN", |_value| {});
+        let result = parser.bind("UNKNOWN", |_values| {});
         assert!(result.is_err());
         assert!(result.unwrap_err().msg.contains("Unknown command"));
     }

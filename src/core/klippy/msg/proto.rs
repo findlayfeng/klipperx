@@ -1,5 +1,5 @@
 pub use super::super::frame::MESSAGE_PAYLOAD_MAX;
-pub use super::command::CommandBase;
+pub use super::MsgBase;
 
 /// Protocol error.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -54,8 +54,13 @@ pub const MESSAGE_SYNC: u8 = 0x7e;
 /// # Examples
 ///
 /// ```
-/// let crc = crc16_ccitt!(&data);
-/// let crc = crc16_ccitt!(&header, &payload, &trailer);
+/// # use klipperx::crc16_ccitt;
+/// let data = b"hello";
+/// let crc = crc16_ccitt!(data);
+/// let header = b"hdr";
+/// let payload = b"pld";
+/// let trailer = b"trl";
+/// let crc = crc16_ccitt!(header, payload, trailer);
 /// ```
 #[macro_export]
 macro_rules! crc16_ccitt {

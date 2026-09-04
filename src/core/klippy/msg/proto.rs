@@ -1,40 +1,5 @@
+use super::error::{MsgError, MsgResult};
 use super::super::frame::MESSAGE_PAYLOAD_MAX;
-
-/// Protocol error.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProtoError {
-    pub msg: String,
-}
-
-impl ProtoError {
-    /// Create a new protocol error.
-    pub fn new(msg: impl Into<String>) -> Self {
-        Self { msg: msg.into() }
-    }
-}
-
-impl std::fmt::Display for ProtoError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.msg)
-    }
-}
-
-impl std::error::Error for ProtoError {}
-
-impl From<serde_json::Error> for ProtoError {
-    fn from(e: serde_json::Error) -> Self {
-        ProtoError::new(e.to_string())
-    }
-}
-
-impl From<super::MsgError> for ProtoError {
-    fn from(e: super::MsgError) -> Self {
-        ProtoError::new(e.msg)
-    }
-}
-
-/// Result type used for protocol operations.
-pub type ProtoResult<T> = Result<T, ProtoError>;
 
 /// Parameter type enum.
 #[derive(Debug, Clone, PartialEq, Copy, Eq, Hash)]
@@ -163,18 +128,18 @@ impl Payload {
     }
 
     /// Append a single byte to the payload.
-    pub fn push(&mut self, byte: u8) -> ProtoResult<()> {
+    pub fn push(&mut self, byte: u8) -> MsgResult<()> {
         if self.len() >= MESSAGE_PAYLOAD_MAX {
-            return Err(ProtoError::new("payload exceeds maximum length"));
+            return Err(MsgError::new("payload exceeds maximum length"));
         }
         self.raw.push(byte);
         Ok(())
     }
 
     /// Extend the payload with multiple bytes.
-    pub fn extend(&mut self, bytes: &[u8]) -> ProtoResult<()> {
+    pub fn extend(&mut self, bytes: &[u8]) -> MsgResult<()> {
         if self.len() + bytes.len() > MESSAGE_PAYLOAD_MAX {
-            return Err(ProtoError::new("payload exceeds maximum length"));
+            return Err(MsgError::new("payload exceeds maximum length"));
         }
         self.raw.extend_from_slice(bytes);
         Ok(())
@@ -185,12 +150,12 @@ impl Payload {
     /// If the combined length would not exceed [`MESSAGE_PAYLOAD_MAX`], the
     /// bytes of `other` are appended to this payload and `Ok(())` is returned.
     /// Otherwise this payload is left unchanged and an error is returned.
-    pub fn try_merge(&mut self, other: &Payload) -> ProtoResult<()> {
+    pub fn try_merge(&mut self, other: &Payload) -> MsgResult<()> {
         self.extend(other.payload())
     }
 
     /// Push a u16 value in 7-bit varint format.
-    pub fn push_u16(&mut self, v: u16) -> ProtoResult<()> {
+    pub fn push_u16(&mut self, v: u16) -> MsgResult<()> {
         let needed = if v > U16_MASK14 {
             3
         } else if v > U16_MASK7 {
@@ -199,7 +164,7 @@ impl Payload {
             1
         };
         if self.len() + needed > MESSAGE_PAYLOAD_MAX {
-            return Err(ProtoError::new("payload exceeds maximum length"));
+            return Err(MsgError::new("payload exceeds maximum length"));
         }
 
         if v > U16_MASK14 {
@@ -216,7 +181,7 @@ impl Payload {
     }
 
     /// Push a u32 value in 7-bit varint format.
-    pub fn push_u32(&mut self, v: u32) -> ProtoResult<()> {
+    pub fn push_u32(&mut self, v: u32) -> MsgResult<()> {
         let needed = if v > U32_MASK28 {
             5
         } else if v > U32_MASK21 {
@@ -229,7 +194,7 @@ impl Payload {
             1
         };
         if self.len() + needed > MESSAGE_PAYLOAD_MAX {
-            return Err(ProtoError::new("payload exceeds maximum length"));
+            return Err(MsgError::new("payload exceeds maximum length"));
         }
 
         if v > U32_MASK28 {
@@ -254,9 +219,9 @@ impl Payload {
     }
 
     /// Push a byte array (length prefix followed by data).
-    pub fn push_bytes(&mut self, bytes: &[u8]) -> ProtoResult<()> {
+    pub fn push_bytes(&mut self, bytes: &[u8]) -> MsgResult<()> {
         if self.len() + 1 + bytes.len() > MESSAGE_PAYLOAD_MAX {
-            return Err(ProtoError::new("payload exceeds maximum length"));
+            return Err(MsgError::new("payload exceeds maximum length"));
         }
 
         self.raw.push(bytes.len() as u8);
@@ -266,7 +231,7 @@ impl Payload {
     }
 
     /// Push an ArgValue (dispatches to appropriate push method based on variant).
-    pub fn push_value(&mut self, value: &ArgValue) -> ProtoResult<()> {
+    pub fn push_value(&mut self, value: &ArgValue) -> MsgResult<()> {
         match value {
             ArgValue::UInt16(v) => self.push_u16(*v),
             ArgValue::Int16(v) => self.push_u16(*v as u16),
@@ -278,7 +243,7 @@ impl Payload {
     }
 
     /// Extend with multiple ArgValue.
-    pub fn extend_values(&mut self, values: &[ArgValue]) -> ProtoResult<()> {
+    pub fn extend_values(&mut self, values: &[ArgValue]) -> MsgResult<()> {
         for v in values {
             self.push_value(v)?;
         }
@@ -313,9 +278,9 @@ impl PayloadParser<'_> {
     }
 
     /// Pop a single byte.
-    pub fn pop(&mut self) -> ProtoResult<u8> {
+    pub fn pop(&mut self) -> MsgResult<u8> {
         if self.raw.is_empty() {
-            return Err(ProtoError::new("payload underflow"));
+            return Err(MsgError::new("payload underflow"));
         }
         let byte = self.raw[0];
         self.raw = &self.raw[1..];
@@ -323,10 +288,10 @@ impl PayloadParser<'_> {
     }
 
     /// Pop a byte array (length prefix followed by data).
-    pub fn pop_bytes(&mut self) -> ProtoResult<Vec<u8>> {
+    pub fn pop_bytes(&mut self) -> MsgResult<Vec<u8>> {
         let len = self.pop()? as usize;
         if self.raw.len() < len {
-            return Err(ProtoError::new("payload underflow"));
+            return Err(MsgError::new("payload underflow"));
         }
         let bytes = self.raw[..len].to_vec();
         self.raw = &self.raw[len..];
@@ -334,16 +299,16 @@ impl PayloadParser<'_> {
     }
 
     /// Pop a UTF-8 string.
-    pub fn pop_string(&mut self) -> ProtoResult<String> {
+    pub fn pop_string(&mut self) -> MsgResult<String> {
         let bytes = self.pop_bytes()?;
         match String::from_utf8(bytes) {
             Ok(s) => Ok(s),
-            Err(_) => Err(ProtoError::new("invalid UTF-8 string")),
+            Err(_) => Err(MsgError::new("invalid UTF-8 string")),
         }
     }
 
     /// Pop a u32 value in 7-bit varint format.
-    pub fn pop_u32(&mut self) -> ProtoResult<u32> {
+    pub fn pop_u32(&mut self) -> MsgResult<u32> {
         let mut val: u32 = 0;
         loop {
             let byte = self.pop()?;
@@ -355,7 +320,7 @@ impl PayloadParser<'_> {
             }
 
             if val > U32_MASK25 {
-                return Err(ProtoError::new("u32 encoding too long"));
+                return Err(MsgError::new("u32 encoding too long"));
             }
 
             val <<= 7;
@@ -364,27 +329,27 @@ impl PayloadParser<'_> {
     }
 
     /// Pop an i32 value (as u32 internally).
-    pub fn pop_i32(&mut self) -> ProtoResult<i32> {
+    pub fn pop_i32(&mut self) -> MsgResult<i32> {
         Ok(self.pop_u32()? as i32)
     }
 
     /// Pop a u16 value in 7-bit varint format.
-    pub fn pop_u16(&mut self) -> ProtoResult<u16> {
+    pub fn pop_u16(&mut self) -> MsgResult<u16> {
         let val: u32 = self.pop_u32()?;
         if val > u16::MAX as u32 {
-            return Err(ProtoError::new("u16 encoding too long"));
+            return Err(MsgError::new("u16 encoding too long"));
         }
 
         Ok(val as u16)
     }
 
     /// Pop an i16 value (as u16 internally).
-    pub fn pop_i16(&mut self) -> ProtoResult<i16> {
+    pub fn pop_i16(&mut self) -> MsgResult<i16> {
         Ok(self.pop_u16()? as i16)
     }
 
     /// Pop a value according to the given ArgType.
-    pub fn pop_value(&mut self, arg_type: ArgType) -> ProtoResult<ArgValue> {
+    pub fn pop_value(&mut self, arg_type: ArgType) -> MsgResult<ArgValue> {
         match arg_type {
             ArgType::UInt16 => Ok(ArgValue::UInt16(self.pop_u16()?)),
             ArgType::Int16 => Ok(ArgValue::Int16(self.pop_i16()?)),
@@ -396,7 +361,7 @@ impl PayloadParser<'_> {
     }
 
     /// Pop multiple values according to the given ArgTypes.
-    pub fn pop_values(&mut self, arg_types: &[ArgType]) -> ProtoResult<Vec<ArgValue>> {
+    pub fn pop_values(&mut self, arg_types: &[ArgType]) -> MsgResult<Vec<ArgValue>> {
         let mut values = Vec::with_capacity(arg_types.len());
         for arg_type in arg_types {
             values.push(self.pop_value(*arg_type)?);

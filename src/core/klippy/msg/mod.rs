@@ -1,8 +1,10 @@
+pub mod error;
 pub mod parser;
 pub mod proto;
 
-// Re-export proto items for use in parser tests
-pub use proto::{ArgType, ArgValue, ProtoError, ProtoResult};
+// Re-export commonly-used items for convenience
+pub use error::{MsgError, MsgResult};
+pub use proto::{ArgType, ArgValue};
 
 // ===========================================================================
 // MsgBase handling for Klipper message protocol.
@@ -13,65 +15,7 @@ pub use proto::{ArgType, ArgValue, ProtoError, ProtoResult};
 // for handling matched messages.
 // ===========================================================================
 
-// ===========================================================================
-// Function Call Parameters
-// ===========================================================================
 
-/// Function call parameters.
-///
-/// - `Positional(ArgValue)`: Positional parameters, must be passed in the
-///   order defined by the command.
-/// - `Named(String, ArgValue)`: Named parameters, can be passed in any order.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Param {
-    Positional(ArgValue),
-    Named(String, ArgValue),
-}
-
-impl Param {
-    /// Get the parameter value.
-    pub fn value(&self) -> &ArgValue {
-        match self {
-            Param::Positional(v) => v,
-            Param::Named(_, v) => v,
-        }
-    }
-
-    /// Get the parameter name (if named).
-    pub fn name(&self) -> Option<&str> {
-        match self {
-            Param::Positional(_) => None,
-            Param::Named(name, _) => Some(name),
-        }
-    }
-}
-
-// ===========================================================================
-// Self-defined MsgError / MsgResult
-// ===========================================================================
-
-/// Error raised by command operations.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MsgError {
-    pub msg: String,
-}
-
-impl MsgError {
-    pub fn new(msg: impl Into<String>) -> Self {
-        Self { msg: msg.into() }
-    }
-}
-
-impl std::fmt::Display for MsgError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.msg)
-    }
-}
-
-impl std::error::Error for MsgError {}
-
-/// Result type used for command operations.
-pub type MsgResult<T> = Result<T, MsgError>;
 
 // ===========================================================================
 // MsgBase

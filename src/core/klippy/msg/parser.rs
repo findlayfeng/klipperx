@@ -1,5 +1,39 @@
-use super::{MsgBase, MsgEntry, Param};
-use super::proto::{ArgType, Payload, ProtoError, ProtoResult, ArgValue};
+use super::error::{MsgError, MsgResult};
+use super::proto::{ArgType, Payload, ArgValue};
+use super::{MsgBase, MsgEntry};
+
+// ===========================================================================
+// Function Call Parameters
+// ===========================================================================
+
+/// Function call parameters.
+///
+/// - `Positional(ArgValue)`: Positional parameters, must be passed in the
+///   order defined by the command.
+/// - `Named(String, ArgValue)`: Named parameters, can be passed in any order.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Param {
+    Positional(ArgValue),
+    Named(String, ArgValue),
+}
+
+impl Param {
+    /// Get the parameter value.
+    pub fn value(&self) -> &ArgValue {
+        match self {
+            Param::Positional(v) => v,
+            Param::Named(_, v) => v,
+        }
+    }
+
+    /// Get the parameter name (if named).
+    pub fn name(&self) -> Option<&str> {
+        match self {
+            Param::Positional(_) => None,
+            Param::Named(name, _) => Some(name),
+        }
+    }
+}
 use super::super::frame::MESSAGE_PAYLOAD_MAX;
 use super::super::traits::KlippyInterface;
 use multi_index_map::MultiIndexMap;
@@ -106,19 +140,19 @@ impl Parser {
     /// # Errors
     /// Returns an error if the format string is invalid, or if the `id`
     /// or the parsed command name is already registered.
-    pub fn register(&mut self, id: u8, format: &str) -> ProtoResult<()> {
+    pub fn register(&mut self, id: u8, format: &str) -> MsgResult<()> {
         let (name, base) = MsgBase::parse(format)?;
         let cmd = MsgEntry::Base(base);
 
         let mut map = self.msgs.lock()
-            .map_err(|_| ProtoError::new("msgs lock poisoned"))?;
+            .map_err(|_| MsgError::new("msgs lock poisoned"))?;
 
         map.try_insert(Msg {
             id,
             name,
             command: cmd,
         })
-        .map_err(|e| ProtoError::new(e.to_string()))?;
+        .map_err(|e| MsgError::new(e.to_string()))?;
 
         Ok(())
     }
@@ -135,23 +169,23 @@ impl Parser {
         &mut self,
         cmd_name: &str,
         callback: impl FnMut(&[ArgValue]) + Send + 'static,
-    ) -> ProtoResult<()> {
+    ) -> MsgResult<()> {
         let mut map = self.msgs.lock()
-            .map_err(|_| ProtoError::new("msgs lock poisoned"))?;
+            .map_err(|_| MsgError::new("msgs lock poisoned"))?;
 
         let (id, name) = map
             .get_by_name(cmd_name)
             .map(|c| (c.id, c.name.clone()))
-            .ok_or_else(|| ProtoError::new(format!("Unknown command: {}", cmd_name)))?;
+            .ok_or_else(|| MsgError::new(format!("Unknown command: {}", cmd_name)))?;
 
         let entry = map
             .remove_by_name(&name)
-            .ok_or_else(|| ProtoError::new(format!("Msg not found: {}", cmd_name)))?;
+            .ok_or_else(|| MsgError::new(format!("Msg not found: {}", cmd_name)))?;
 
         let command = entry.command.with_callback(callback);
 
         map.try_insert(Msg { id, name, command })
-            .map_err(|e| ProtoError::new(e.to_string()))?;
+            .map_err(|e| MsgError::new(e.to_string()))?;
 
         Ok(())
     }
@@ -172,7 +206,7 @@ impl Parser {
     /// * `params` - List of `Param` (positional followed by named)
     ///
     /// # Errors
-    /// Returns `ProtoError` if:
+    /// Returns `MsgError` if:
     /// - The command name is not found in the registry
     /// - The command is a `Handler` type (only `Base` msgs can be sent)
     /// - A positional param appears after a named param
@@ -201,7 +235,7 @@ impl Parser {
     /// ];
     /// parser.send("G1", &params).await?;
     /// ```
-    pub async fn send(&self, cmd_name: &str, params: &[Param]) -> ProtoResult<()> {
+    pub async fn send(&self, cmd_name: &str, params: &[Param]) -> MsgResult<()> {
         // Look up the command and extract the id and parameter definitions.
         // The lock is scoped so the guard is dropped before any `.await` —
         // holding a std Mutex guard across an await could block a
@@ -210,15 +244,15 @@ impl Parser {
             let guard = self
                 .msgs
                 .lock()
-                .map_err(|_| ProtoError::new("msgs lock poisoned"))?;
+                .map_err(|_| MsgError::new("msgs lock poisoned"))?;
             let cmd = guard
                 .get_by_name(cmd_name)
-                .ok_or_else(|| ProtoError::new(format!("Unknown command: {}", cmd_name)))?;
+                .ok_or_else(|| MsgError::new(format!("Unknown command: {}", cmd_name)))?;
 
             match &cmd.command {
                 MsgEntry::Base(base) => (cmd.id, base.params().to_vec()),
                 MsgEntry::Handler(_) => {
-                    return Err(ProtoError::new(format!(
+                    return Err(MsgError::new(format!(
                         "Cannot send Handler type command: {}",
                         cmd_name
                     )));
@@ -236,7 +270,7 @@ impl Parser {
             match param {
                 Param::Positional(v) => {
                     if named_started {
-                        return Err(ProtoError::new(format!(
+                        return Err(MsgError::new(format!(
                             "Positional param after named param for '{}': positional params must come first",
                             cmd_name
                         )));
@@ -246,7 +280,7 @@ impl Parser {
                 Param::Named(name, v) => {
                     named_started = true;
                     if named_map.insert(name.as_str(), v).is_some() {
-                        return Err(ProtoError::new(format!(
+                        return Err(MsgError::new(format!(
                             "Duplicate named param '{}' for '{}'",
                             name, cmd_name
                         )));
@@ -257,7 +291,7 @@ impl Parser {
 
         // Validate positional params count
         if positional.len() > param_defs.len() {
-            return Err(ProtoError::new(format!(
+            return Err(MsgError::new(format!(
                 "Too many positional params for '{}': expected at most {}, got {}",
                 cmd_name,
                 param_defs.len(),
@@ -268,7 +302,7 @@ impl Parser {
         // Every named param must reference a parameter defined by the command.
         for name in named_map.keys() {
             if !param_defs.iter().any(|(def_name, _)| def_name.as_str() == *name) {
-                return Err(ProtoError::new(format!(
+                return Err(MsgError::new(format!(
                     "Unknown param '{}' for '{}'",
                     name, cmd_name
                 )));
@@ -281,7 +315,7 @@ impl Parser {
         for (i, (param_name, expected_type)) in param_defs.iter().enumerate() {
             let value = if i < positional.len() {
                 if named_map.contains_key(param_name.as_str()) {
-                    return Err(ProtoError::new(format!(
+                    return Err(MsgError::new(format!(
                         "Param '{}' for '{}' provided both positionally and by name",
                         param_name, cmd_name
                     )));
@@ -291,7 +325,7 @@ impl Parser {
                 // Named param - look up by name
                 named_value.clone()
             } else {
-                return Err(ProtoError::new(format!(
+                return Err(MsgError::new(format!(
                     "Missing required param '{}' for '{}'",
                     param_name, cmd_name
                 )));
@@ -309,7 +343,7 @@ impl Parser {
                     );
                     final_params.push(converted);
                 } else {
-                    return Err(ProtoError::new(format!(
+                    return Err(MsgError::new(format!(
                         "Param type mismatch for '{}' param '{}': expected {:?}, got {:?}",
                         cmd_name,
                         param_name,
@@ -338,10 +372,10 @@ impl Parser {
                 ack: ack_tx,
             })
             .await
-            .map_err(|_| ProtoError::new("outbox closed"))?;
+            .map_err(|_| MsgError::new("outbox closed"))?;
         ack_rx
             .await
-            .map_err(|_| ProtoError::new("outbox task terminated"))??;
+            .map_err(|_| MsgError::new("outbox task terminated"))??;
 
         Ok(())
     }
@@ -357,11 +391,11 @@ impl Parser {
     ///
     /// The call is synchronous and never waits: it returns immediately with
     /// whatever is queued at the moment of the call (possibly an empty vec).
-    pub fn take_callback_msgs(&self) -> ProtoResult<Vec<InboundMessage>> {
+    pub fn take_callback_msgs(&self) -> MsgResult<Vec<InboundMessage>> {
         let mut queue = self
             .callback_queue
             .lock()
-            .map_err(|_| ProtoError::new("callback queue lock poisoned"))?;
+            .map_err(|_| MsgError::new("callback queue lock poisoned"))?;
         Ok(queue.drain(..).collect())
     }
 
@@ -385,7 +419,7 @@ impl Parser {
     /// * `timeout` - Optional maximum wait duration; `None` waits indefinitely.
     ///
     /// # Errors
-    /// Returns `ProtoError` if:
+    /// Returns `MsgError` if:
     /// - The inbox was not started via [`Self::start_inbox`]
     /// - The send fails (same errors as [`Self::send`]); the waiter is removed
     /// - The timeout expires; the waiter is removed
@@ -403,9 +437,9 @@ impl Parser {
         params: &[Param],
         wait_name: &str,
         timeout: Option<Duration>,
-    ) -> ProtoResult<Vec<ArgValue>> {
+    ) -> MsgResult<Vec<ArgValue>> {
         if self.inbound_tx.lock().await.is_none() {
-            return Err(ProtoError::new(
+            return Err(MsgError::new(
                 "inbox not started: call start_inbox() first",
             ));
         }
@@ -418,7 +452,7 @@ impl Parser {
             let mut waiters = self
                 .waiters
                 .lock()
-                .map_err(|_| ProtoError::new("waiters lock poisoned"))?;
+                .map_err(|_| MsgError::new("waiters lock poisoned"))?;
             waiters.push(PendingWaiter {
                 id: waiter_id,
                 name: wait_name.to_string(),
@@ -437,7 +471,7 @@ impl Parser {
                 Ok(result) => result,
                 Err(_) => {
                     self.remove_waiter(waiter_id);
-                    return Err(ProtoError::new(format!(
+                    return Err(MsgError::new(format!(
                         "timeout waiting for message '{}'",
                         wait_name
                     )));
@@ -446,7 +480,7 @@ impl Parser {
             None => rx.await,
         };
 
-        received.map_err(|_| ProtoError::new("inbox task terminated"))
+        received.map_err(|_| MsgError::new("inbox task terminated"))
     }
 
     /// Remove a single pending waiter by id (no-op if absent).
@@ -483,9 +517,9 @@ impl Parser {
     ///
     /// Returns a [`tokio::sync::mpsc::Receiver`] for consuming the parsed
     /// messages.
-    pub async fn start_inbox(&mut self) -> ProtoResult<mpsc::Receiver<InboundMessage>> {
+    pub async fn start_inbox(&mut self) -> MsgResult<mpsc::Receiver<InboundMessage>> {
         if self.inbound_tx.lock().await.is_some() {
-            return Err(ProtoError::new("inbox already started"));
+            return Err(MsgError::new("inbox already started"));
         }
         let (tx, rx) = mpsc::channel(64);
         let interface = Arc::clone(&self.interface);
@@ -552,17 +586,17 @@ impl Parser {
         waiters: &Arc<Mutex<Vec<PendingWaiter>>>,
         payload: &Payload,
         tx: &mpsc::Sender<InboundMessage>,
-    ) -> ProtoResult<()> {
+    ) -> MsgResult<()> {
         let mut parser = payload.as_parser();
         let cmd_id = parser.pop()?;
 
         // Look up command by id and extract data (lock held briefly)
         let (name, param_defs, has_callback) = {
             let guard = msgs.lock()
-                .map_err(|_| ProtoError::new("msgs lock poisoned"))?;
+                .map_err(|_| MsgError::new("msgs lock poisoned"))?;
             let cmd = guard
                 .get_by_id(&cmd_id)
-                .ok_or_else(|| ProtoError::new(format!("Unknown command id: {}", cmd_id)))?;
+                .ok_or_else(|| MsgError::new(format!("Unknown command id: {}", cmd_id)))?;
 
             let name = cmd.name.clone();
             let (param_defs, has_callback): (Vec<(String, ArgType)>, bool) =
@@ -579,7 +613,7 @@ impl Parser {
         // 1. A pending send_and_wait() waiter takes precedence (FIFO).
         let waiter = {
             let mut guard = waiters.lock()
-                .map_err(|_| ProtoError::new("waiters lock poisoned"))?;
+                .map_err(|_| MsgError::new("waiters lock poisoned"))?;
             guard
                 .iter()
                 .position(|w| w.name == name)
@@ -593,7 +627,7 @@ impl Parser {
         // 2. Messages with a registered callback go to the callback queue.
         if has_callback {
             let mut queue = callback_queue.lock()
-                .map_err(|_| ProtoError::new("callback queue lock poisoned"))?;
+                .map_err(|_| MsgError::new("callback queue lock poisoned"))?;
             queue.push_back(InboundMessage { name, params });
             return Ok(());
         }
@@ -601,7 +635,7 @@ impl Parser {
         // 3. Everything else is forwarded to the inbox channel.
         tx.send(InboundMessage { name, params })
             .await
-            .map_err(|_| ProtoError::new("inbox receiver dropped"))?;
+            .map_err(|_| MsgError::new("inbox receiver dropped"))?;
 
         Ok(())
     }
@@ -610,18 +644,18 @@ impl Parser {
 /// One outbound payload together with the completion signal for the caller.
 struct OutItem {
     payload: Payload,
-    ack: oneshot::Sender<ProtoResult<()>>,
+    ack: oneshot::Sender<MsgResult<()>>,
 }
 
 /// Send `payload` through `interface` and resolve every `ack` with the result.
 async fn send_and_ack(
     interface: &Arc<dyn KlippyInterface>,
     payload: Payload,
-    acks: Vec<oneshot::Sender<ProtoResult<()>>>,
+    acks: Vec<oneshot::Sender<MsgResult<()>>>,
 ) {
     let result = match interface.send(&payload).await {
         Ok(()) => Ok(()),
-        Err(e) => Err(ProtoError::new(e.to_string())),
+        Err(e) => Err(MsgError::new(e.to_string())),
     };
     for ack in acks {
         let _ = ack.send(result.clone());

@@ -841,33 +841,45 @@ mod tests {
         assert!(err_msg.contains("Param type mismatch"), "Error message: {}", err_msg);
     }
 
-    // TODO: Fix test_bind_command - hangs on lock acquisition
-    // #[tokio::test]
-    // async fn test_bind_command() {
-    //     let mapping = vec![MappingEntry {
-    //         input: Frame::new(0, Vec::new()),
-    //         outputs: vec![Frame::new(0, Vec::new())],
-    //     }];
-    //     let interface = TestInterface::new(mapping);
-    //     let mut parser = Parser::new(Arc::new(interface));
-    //
-    //     // Verify that G1 command exists (registered by default)
-    //     let guard = parser.commands.lock().unwrap();
-    //     let cmd = guard.get_by_name("G1").unwrap();
-    //     assert!(matches!(cmd.command, CommandEntry::Base(_)));
-    //
-    //     // Verify the command can no longer be sent
-    //     let params = vec![
-    //         Param::Positional(ArgValue::UInt32(100)),
-    //         Param::Positional(ArgValue::UInt32(200)),
-    //     ];
-    //     let result = parser.send("G1", &params).await;
-    //     assert!(result.is_err());
-    //     assert!(result.unwrap_err().msg.contains("Handler"));
-    //
-    //     // Verify the callback was stored
-    //     assert!(!called.load(std::sync::atomic::Ordering::SeqCst));
-    // }
+    #[tokio::test]
+    async fn test_bind_command() {
+        let mapping = vec![MappingEntry {
+            input: Frame::new(0, Vec::new()),
+            outputs: vec![],
+        }];
+        let interface = TestInterface::new(mapping);
+        let mut parser = Parser::new(Arc::new(interface));
+        register_g1_cmd(&mut parser);
+
+        // Bind a callback to the G1 command.
+        let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let called_clone = Arc::clone(&called);
+        parser
+            .bind("G1", move |_values| {
+                called_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+            })
+            .unwrap();
+
+        // The command is now a Handler. Keep the guard in its own scope so it
+        // is released before `send()` locks the same (non-reentrant) mutex.
+        {
+            let guard = parser.commands.lock().unwrap();
+            let cmd = guard.get_by_name("G1").unwrap();
+            assert!(matches!(cmd.command, CommandEntry::Handler(_)));
+        }
+
+        // A bound command can no longer be sent.
+        let params = vec![
+            Param::Positional(ArgValue::UInt32(100)),
+            Param::Positional(ArgValue::UInt32(200)),
+        ];
+        let result = parser.send("G1", &params).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().msg.contains("Handler"));
+
+        // The callback was only stored, not invoked (no message received).
+        assert!(!called.load(std::sync::atomic::Ordering::SeqCst));
+    }
 
     #[tokio::test]
     async fn test_bind_unknown_command() {

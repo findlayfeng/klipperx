@@ -63,10 +63,7 @@ impl Parser {
     fn register(&mut self, id: u8, format: &str) -> ProtoResult<()> {
         let (name, base) =
             CommandBase::parse(format).map_err(|e| ProtoError::new(e.to_string()))?;
-        let cmd = match id & 0x1 {
-            0 => CommandEntry::Request(base.into()),
-            _ => CommandEntry::Regular(base),
-        };
+        let cmd = CommandEntry::Base(base);
 
         self.commands
             .try_insert(Command {
@@ -81,9 +78,7 @@ impl Parser {
 
     /// Send a command with the given name and parameter values.
     ///
-    /// Only `Regular` type commands can be sent. `Request` type commands
-    /// (registered with even ID) cannot be sent via this method.
-    ///
+    /// 
     /// Supports both positional and named parameters:
     /// - Positional parameters (`Param::Positional`) must come first and follow
     ///   the command's parameter order
@@ -128,12 +123,11 @@ impl Parser {
             .get_by_name(cmd_name)
             .ok_or_else(|| ProtoError::new(format!("Unknown command: {}", cmd_name)))?;
 
-        // Only Regular type commands can be sent
         let param_defs: Vec<(String, ArgType)> = match &cmd.command {
-            CommandEntry::Regular(base) => base.params().to_vec(),
-            CommandEntry::Request(_) => {
+            CommandEntry::Base(base) => base.params().to_vec(),
+            CommandEntry::Handler(_) => {
                 return Err(ProtoError::new(format!(
-                    "Cannot send Request type command: {}",
+                    "Cannot send Handler type command: {}",
                     cmd_name
                 )));
             }
@@ -369,11 +363,6 @@ mod tests {
         let _ = parser.register(5, "M105");
     }
 
-    fn register_request_cmd(parser: &mut Parser) {
-        // Register "REQ" as a request type command (even id)
-        let _ = parser.register(2, "REQ param=%u");
-    }
-
     #[tokio::test]
     async fn test_send_g1_with_params() {
         let expected = build_g1_payload(100, 200);
@@ -606,23 +595,6 @@ mod tests {
         let result = parser.send("G1", &params).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().msg.contains("Too many positional params"));
-    }
-
-    #[tokio::test]
-    async fn test_send_request_type_not_allowed() {
-        let mapping = vec![MappingEntry {
-            input: Frame::new(0, Vec::new()),
-            outputs: vec![],
-        }];
-        let interface = TestInterface::new(mapping);
-        let mut parser = Parser::new(Arc::new(interface));
-        register_request_cmd(&mut parser);
-
-        // Request type commands (even id) cannot be sent
-        let params = vec![Param::Positional(ArgValue::UInt32(1))];
-        let result = parser.send("REQ", &params).await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().msg.contains("Cannot send Request type command"));
     }
 
     #[tokio::test]

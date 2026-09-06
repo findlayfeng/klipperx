@@ -25,7 +25,7 @@ const SEND_COALESCE_THRESHOLD: usize = MESSAGE_PAYLOAD_MAX * 2 / 3;
 
 /// Default Klipper message formats for identify request/response.
 const DEFAULT_MESSAGES: &[(u8, &str)] = &[
-    (0, "identify_response offset=%u data=%c"),
+    (0, "identify_response offset=%u data=%.*s"),
     (1, "identify offset=%c count=%c"),
 ];
 

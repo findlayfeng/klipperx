@@ -23,3 +23,37 @@ impl Mcu {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::klippy::interface::test::TestInterface;
+    use crate::core::klippy::mcu::McuRestartMethod;
+
+    #[test]
+    fn test_mcu_from_config() {
+        let interface = Box::new(TestInterface::new(vec![]));
+        let config = McuConfig {
+            name: "zboard".to_string(),
+            restart_method: McuRestartMethod::Arduino,
+            interface,
+        };
+
+        let mcu = Mcu::from_config(config);
+        assert_eq!(mcu.name, "zboard");
+        // Parser should have the default messages registered (identify_request/response)
+    }
+
+    #[test]
+    fn test_mcu_from_config_empty_name() {
+        let interface = Box::new(TestInterface::new(vec![]));
+        let config = McuConfig {
+            name: String::new(),
+            restart_method: McuRestartMethod::Command,
+            interface,
+        };
+
+        let mcu = Mcu::from_config(config);
+        assert_eq!(mcu.name, "");
+    }
+}

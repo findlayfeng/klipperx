@@ -25,7 +25,7 @@ const SEND_COALESCE_THRESHOLD: usize = MESSAGE_PAYLOAD_MAX * 2 / 3;
 
 /// Default Klipper message formats for identify request/response.
 const DEFAULT_MESSAGES: &[(u8, &str)] = &[
-    (0, "identify_response offset=%u data=%.*s"),
+    (0, "identify_response offset=%u data=%c"),
     (1, "identify offset=%c count=%c"),
 ];
 
@@ -1374,7 +1374,7 @@ mod tests {
         assert_eq!(forwarded.id, 0);
         assert_eq!(
             forwarded.params,
-            vec![ArgValue::UInt32(4), ArgValue::Str("abcd".to_string())]
+            vec![ArgValue::UInt32(4), ArgValue::Bytes(b"abcd".to_vec())]
         );
 
         // Nothing else was queued or forwarded.

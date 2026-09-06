@@ -1,0 +1,722 @@
+//! Identify protocol: data dictionary negotiation between host (klippy) and MCU (firmware).
+//!
+//! The identify mechanism establishes communication by exchanging a JSON-formatted
+//! configuration and command description from the MCU to the host. The data is
+//! zlib-compressed and transferred in chunks via the identify request/response
+//! message pair.
+//!
+//! # Protocol
+//!
+//! | Message ID | Format | Direction |
+//! |------------|--------|-----------|
+//! | `0` | `identify_response offset=%u data=%.*s` | MCU → host |
+//! | `1` | `identify offset=%c count=%c` | host → MCU |
+//!
+//! The host sends `identify offset=N count=40` repeatedly, and the MCU responds
+//! with `identify_response` carrying the offset and data chunk. When the offset
+//! equals the total data length and the data is empty, the exchange is complete.
+//!
+//! # Example
+//!
+//! ```ignore
+//! use crate::core::klippy::mcu::identify::do_identify;
+//! use tokio::time::Duration;
+//!
+//! let identify_data = do_identify(&mut parser, Duration::from_secs(10)).await?;
+//! println!("MCU version: {}", identify_data.version);
+//! ```
+
+use flate2::read::ZlibDecoder;
+use std::io::Read;
+use tokio::time::Duration;
+
+use crate::core::klippy::msg::parser::Parser;
+use crate::core::klippy::msg::param::Param;
+use crate::core::klippy::msg::proto::ArgValue;
+
+/// Maximum number of chunks allowed during identify exchange.
+/// Prevents infinite loops in case of corrupted MCU responses.
+const MAX_IDENTIFY_CHUNKS: u32 = 1024;
+
+/// Size of each identify data chunk (bytes).
+const IDENTIFY_CHUNK_SIZE: u8 = 40;
+
+/// Parsed identify data from the MCU.
+///
+/// Contains the firmware's command/response/output dictionaries,
+/// enumeration mappings, compile-time configuration constants,
+/// and version information.
+#[derive(Debug, Clone, Default)]
+pub struct IdentifyData {
+    /// Enum constant mappings (e.g., pin names → IDs, static strings → IDs).
+    pub enumerations: serde_json::Value,
+    /// MCU-received command format strings → command ID mappings.
+    pub commands: serde_json::Value,
+    /// MCU-sent response format strings → response ID mappings.
+    pub responses: serde_json::Value,
+    /// Asynchronous output format strings → ID mappings.
+    pub output: serde_json::Value,
+    /// Firmware compile-time constants (CLOCK_FREQ, MCU, SERIAL_BAUD, etc.).
+    pub config: serde_json::Value,
+    /// Firmware version string (from git describe).
+    pub version: String,
+    /// Cross-compiler toolchain version (e.g., "gcc: 12.3.1 binutils: 2.41").
+    pub build_versions: String,
+    /// Firmware application type (fixed: "Klipper").
+    pub app: String,
+    /// License identifier (fixed: "GNU GPLv3").
+    pub license: String,
+}
+
+/// Error types for identify operations.
+#[derive(Debug, Clone)]
+pub struct IdentifyError {
+    pub kind: IdentifyErrorKind,
+}
+
+#[derive(Debug, Clone)]
+pub enum IdentifyErrorKind {
+    /// The identify exchange timed out.
+    Timeout,
+    /// Zlib decompression failed.
+    Decompress(String),
+    /// JSON parsing failed.
+    JsonParse(String),
+    /// The MCU responded unexpectedly or the exchange failed.
+    Failed(String),
+}
+
+impl std::fmt::Display for IdentifyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.kind {
+            IdentifyErrorKind::Timeout => write!(f, "identify timeout"),
+            IdentifyErrorKind::Decompress(msg) => write!(f, "decompression failed: {msg}"),
+            IdentifyErrorKind::JsonParse(msg) => write!(f, "json parse error: {msg}"),
+            IdentifyErrorKind::Failed(msg) => write!(f, "identify failed: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for IdentifyError {}
+
+impl IdentifyData {
+    /// Get a specific command ID by its format string.
+    pub fn get_command_id(&self, format: &str) -> Option<u32> {
+        self.commands
+            .get(format)
+            .and_then(|v| v.as_u64())
+            .map(|id| id as u32)
+    }
+
+    /// Get a specific response ID by its format string.
+    pub fn get_response_id(&self, format: &str) -> Option<u32> {
+        self.responses
+            .get(format)
+            .and_then(|v| v.as_u64())
+            .map(|id| id as u32)
+    }
+
+    /// Get an enumeration value by category and name.
+    pub fn get_enumeration(&self, category: &str, name: &str) -> Option<u32> {
+        self.enumerations
+            .get(category)
+            .and_then(|cat| cat.as_object())
+            .and_then(|map| map.get(name))
+            .and_then(|v| v.as_u64())
+            .map(|id| id as u32)
+    }
+
+    /// Get a configuration value by key.
+    pub fn get_config<T: serde::de::DeserializeOwned>(&self, key: &str) -> Option<T> {
+        self.config.get(key).and_then(|v| serde_json::from_value(v.clone()).ok())
+    }
+
+    /// Get all configuration keys.
+    pub fn config_keys(&self) -> Vec<String> {
+        self.config
+            .as_object()
+            .map(|map| map.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+}
+
+/// Performs the full identify exchange with the MCU.
+///
+/// Sends identify requests and collects zlib-compressed response data until
+/// the MCU signals completion. The collected data is decompressed and parsed
+/// into an [`IdentifyData`] struct.
+///
+/// # Arguments
+/// * `parser` - The message parser with identify request/response already registered.
+/// * `timeout` - Maximum duration for the entire identify exchange.
+///
+/// # Errors
+/// Returns [`IdentifyError`] if:
+/// - The exchange times out
+/// - Zlib decompression fails
+/// - JSON parsing fails
+/// - The MCU responds unexpectedly
+pub async fn do_identify(
+    parser: &mut Parser,
+    timeout: Duration,
+) -> Result<IdentifyData, IdentifyError> {
+    // Start the inbox to receive inbound messages
+    let mut inbox = parser.start_inbox().await.map_err(|e| IdentifyError {
+        kind: IdentifyErrorKind::Failed(format!("failed to start inbox: {e}")),
+    })?;
+
+    let mut raw_data = Vec::new();
+    let mut offset: u32 = 0;
+    let mut chunks: u32 = 0;
+
+    loop {
+        chunks += 1;
+        if chunks > MAX_IDENTIFY_CHUNKS {
+            return Err(IdentifyError {
+                kind: IdentifyErrorKind::Failed(format!(
+                    "exceeded maximum identify chunks ({MAX_IDENTIFY_CHUNKS})"
+                )),
+            });
+        }
+
+        // Send identify request
+        // Format: "identify offset=%c count=%c" — both params are bytes (7-bit varint encoded)
+        let request_params = vec![
+            Param::Positional(ArgValue::Bytes(encode_varint32(offset))),
+            Param::Positional(ArgValue::Bytes(encode_varint32(IDENTIFY_CHUNK_SIZE as u32))),
+        ];
+
+        // Send the request
+        tokio::time::timeout(timeout, parser.send("identify", &request_params))
+            .await
+            .map_err(|_| IdentifyError {
+                kind: IdentifyErrorKind::Timeout,
+            })?
+            .map_err(|e| IdentifyError {
+                kind: IdentifyErrorKind::Failed(format!("send identify request: {e}")),
+            })?;
+
+        // Wait for identify_response from inbox
+        let response_msg = tokio::time::timeout(
+            timeout,
+            inbox.recv(),
+        )
+        .await
+        .map_err(|_| IdentifyError {
+            kind: IdentifyErrorKind::Timeout,
+        })?
+        .ok_or_else(|| IdentifyError {
+            kind: IdentifyErrorKind::Failed("inbox channel closed".to_string()),
+        })?;
+
+        // Verify it's the expected message
+        if response_msg.id != 0 {
+            return Err(IdentifyError {
+                kind: IdentifyErrorKind::Failed(format!(
+                    "expected identify_response (id=0), got id={}",
+                    response_msg.id
+                )),
+            });
+        }
+
+        let response_params = response_msg.params;
+
+        // Parse response: offset (u32) + data (bytes)
+        if response_params.len() < 2 {
+            return Err(IdentifyError {
+                kind: IdentifyErrorKind::Failed(
+                    "identify_response: expected at least 2 parameters".to_string(),
+                ),
+            });
+        }
+
+        let resp_offset = match &response_params[0] {
+            ArgValue::UInt32(v) => v,
+            _ => {
+                return Err(IdentifyError {
+                    kind: IdentifyErrorKind::Failed(
+                        "identify_response: first param must be UInt32 (offset)".to_string(),
+                    ),
+                });
+            }
+        };
+
+        let resp_data = match &response_params[1] {
+            ArgValue::Bytes(v) => v.clone(),
+            _ => {
+                return Err(IdentifyError {
+                    kind: IdentifyErrorKind::Failed(
+                        "identify_response: second param must be Bytes (data)".to_string(),
+                    ),
+                });
+            }
+        };
+
+        // Check if the response offset matches our expected offset
+        if *resp_offset != offset {
+            return Err(IdentifyError {
+                kind: IdentifyErrorKind::Failed(format!(
+                    "identify_response: unexpected offset {resp_offset}, expected {offset}"
+                )),
+            });
+        }
+
+        // Append data chunk
+        raw_data.extend_from_slice(&resp_data);
+
+        // If data is empty, the exchange is complete
+        if resp_data.is_empty() {
+            break;
+        }
+
+        // Advance offset
+        offset += resp_data.len() as u32;
+    }
+
+    // Decompress zlib data
+    let mut decoder = ZlibDecoder::new(&raw_data[..]);
+    let mut json_bytes = Vec::new();
+    decoder
+        .read_to_end(&mut json_bytes)
+        .map_err(|e| IdentifyError {
+            kind: IdentifyErrorKind::Decompress(e.to_string()),
+        })?;
+
+    // Parse JSON
+    let json_value: serde_json::Value = serde_json::from_slice(&json_bytes).map_err(|e| {
+        IdentifyError {
+            kind: IdentifyErrorKind::JsonParse(e.to_string()),
+        }
+    })?;
+
+    // Convert to IdentifyData
+    Ok(IdentifyData {
+        enumerations: json_value
+            .get("enumerations")
+            .unwrap_or(&serde_json::Value::Null)
+            .clone(),
+        commands: json_value
+            .get("commands")
+            .unwrap_or(&serde_json::Value::Null)
+            .clone(),
+        responses: json_value
+            .get("responses")
+            .unwrap_or(&serde_json::Value::Null)
+            .clone(),
+        output: json_value
+            .get("output")
+            .unwrap_or(&serde_json::Value::Null)
+            .clone(),
+        config: json_value
+            .get("config")
+            .unwrap_or(&serde_json::Value::Null)
+            .clone(),
+        version: json_value
+            .get("version")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        build_versions: json_value
+            .get("build_versions")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        app: json_value
+            .get("app")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        license: json_value
+            .get("license")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+    })
+}
+
+/// Encode a u32 as a 7-bit varint byte array (big-endian).
+fn encode_varint32(v: u32) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    let mut val = v;
+    loop {
+        let byte = (val & 0x7F) as u8;
+        val >>= 7;
+        if val != 0 {
+            bytes.push(byte | 0x80);
+        } else {
+            bytes.push(byte);
+            break;
+        }
+    }
+    bytes
+}
+
+/// Extract the total data length from a completed identify exchange.
+///
+/// Returns the length as stored in the last identify_response before
+/// the empty response that signals completion.
+pub fn identify_data_length(raw_chunks: &[(u32, &[u8])]) -> Option<u32> {
+    raw_chunks.last().map(|(offset, data)| {
+        if data.is_empty() {
+            *offset
+        } else {
+            *offset + data.len() as u32
+        }
+    })
+}
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::klippy::frame::Frame;
+    use std::sync::Arc;
+    use crate::core::klippy::interface::test::{TestInterface, MappingEntry};
+    use crate::core::klippy::msg::proto::Payload;
+    use flate2::write::ZlibEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+
+    /// Build identify request payload: cmd_id + offset(varint bytes) + count(varint bytes)
+    fn build_identify_request_payload(offset: u32, count: u32) -> Payload {
+        let mut p = Payload::new();
+        p.push(1).unwrap(); // cmd_id = 1 (identify)
+        p.push_bytes(&encode_varint32(offset)).unwrap();
+        p.push_bytes(&encode_varint32(count)).unwrap();
+        p
+    }
+
+    /// Build identify_response payload: cmd_id + offset(u32) + data(bytes)
+    fn build_response_payload(offset: u32, data: &[u8]) -> Payload {
+        let mut p = Payload::new();
+        p.push(0).unwrap(); // cmd_id = 0 (identify_response)
+        p.push_u32(offset).unwrap();
+        p.push_bytes(data).unwrap();
+        p
+    }
+
+    /// Build zlib-compressed JSON payload for identify_response.
+    fn build_identify_json() -> Vec<u8> {
+        let json = serde_json::json!({
+            "enumerations": {
+                "pin": {"PA0": 0, "PA1": 1},
+                "static_string_id": {"temperature_sensor": 0}
+            },
+            "commands": {
+                "G1 X=%u Y=%u": 3,
+                "M105": 5
+            },
+            "responses": {
+                "temperature_sensor temp=X": 10,
+                "error msg=%s": 11
+            },
+            "output": {
+                "report status": 20
+            },
+            "config": {
+                "CLOCK_FREQ": 48000000,
+                "MCU": "stm32",
+                "SERIAL_BAUD": 250000
+            },
+            "version": "v0.12.0-234-gabc123",
+            "build_versions": "gcc: 12.3.1 binutils: 2.41",
+            "app": "Klipper",
+            "license": "GNU GPLv3"
+        });
+
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder
+            .write_all(&serde_json::to_vec(&json).unwrap())
+            .unwrap();
+        encoder.finish().unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_do_identify_single_chunk() {
+        let json_data = build_identify_json();
+
+        // Split into chunks of 40 bytes
+        let chunks: Vec<Vec<u8>> = json_data
+            .as_slice()
+            .chunks(IDENTIFY_CHUNK_SIZE as usize)
+            .map(|c| c.to_vec())
+            .collect();
+
+        // Build test mappings: each request → response
+        // Input seq numbers are auto-incremented by TestInterface (0, 1, 2, ...)
+        // Output seq numbers must match the expected receive sequence (0, 1, 2, ...)
+        let mut mappings = Vec::new();
+        let mut expected_offset: u32 = 0;
+        let mut response_seq: u8 = 0;
+
+        for (i, chunk) in chunks.iter().enumerate() {
+            let request_payload = build_identify_request_payload(expected_offset, IDENTIFY_CHUNK_SIZE as u32);
+            let response_payload = build_response_payload(expected_offset, chunk);
+
+            mappings.push(MappingEntry {
+                input: Frame::new(i as u8, request_payload.into_raw()),
+                outputs: vec![Frame::new(response_seq, response_payload.into_raw())],
+            });
+            expected_offset += chunk.len() as u32;
+            response_seq = response_seq.wrapping_add(1);
+        }
+
+        // Final empty response to signal completion
+        let request_payload = build_identify_request_payload(expected_offset, IDENTIFY_CHUNK_SIZE as u32);
+        let response_payload = build_response_payload(expected_offset, &[]);
+        mappings.push(MappingEntry {
+            input: Frame::new(chunks.len() as u8, request_payload.into_raw()),
+            outputs: vec![Frame::new(response_seq, response_payload.into_raw())],
+        });
+
+        let interface = TestInterface::new(mappings);
+        let mut parser = Parser::new(Arc::new(interface));
+        // Start the inbox so that send_and_wait() can receive responses
+
+        let result = do_identify(&mut parser, Duration::from_secs(10)).await;
+        assert!(result.is_ok(), "identify failed: {:?}", result);
+
+        let data = result.unwrap();
+        assert_eq!(data.version, "v0.12.0-234-gabc123");
+        assert_eq!(data.app, "Klipper");
+        assert_eq!(data.license, "GNU GPLv3");
+        assert_eq!(data.build_versions, "gcc: 12.3.1 binutils: 2.41");
+
+        // Check commands
+        assert_eq!(data.get_command_id("G1 X=%u Y=%u"), Some(3));
+        assert_eq!(data.get_command_id("M105"), Some(5));
+        assert_eq!(data.get_command_id("UNKNOWN"), None);
+
+        // Check responses
+        assert_eq!(
+            data.get_response_id("temperature_sensor temp=X"),
+            Some(10)
+        );
+        assert_eq!(data.get_response_id("error msg=%s"), Some(11));
+
+        // Check enumerations
+        assert_eq!(data.get_enumeration("pin", "PA0"), Some(0));
+        assert_eq!(data.get_enumeration("pin", "PA1"), Some(1));
+        assert_eq!(
+            data.get_enumeration("static_string_id", "temperature_sensor"),
+            Some(0)
+        );
+
+        // Check config
+        assert_eq!(data.get_config::<u32>("CLOCK_FREQ"), Some(48000000));
+        assert_eq!(data.get_config::<String>("MCU"), Some("stm32".to_string()));
+        assert_eq!(data.get_config::<u32>("SERIAL_BAUD"), Some(250000));
+
+        // Check config keys
+        let keys = data.config_keys();
+        assert!(keys.contains(&"CLOCK_FREQ".to_string()));
+        assert!(keys.contains(&"MCU".to_string()));
+        assert!(keys.contains(&"SERIAL_BAUD".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_do_identify_empty_identify_data() {
+        let json = serde_json::json!({
+            "enumerations": {},
+            "commands": {},
+            "responses": {},
+            "output": {},
+            "config": {},
+            "version": "",
+            "build_versions": "",
+            "app": "",
+            "license": ""
+        });
+
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&serde_json::to_vec(&json).unwrap()).unwrap();
+        let zlib_data = encoder.finish().unwrap();
+
+        // Single chunk of data, then empty response
+        let mut mappings = Vec::new();
+        let chunk_size = zlib_data.len().min(IDENTIFY_CHUNK_SIZE as usize);
+        let first_chunk = zlib_data[..chunk_size].to_vec();
+        let remaining = if zlib_data.len() > chunk_size {
+            &zlib_data[chunk_size..]
+        } else {
+            &[][..]
+        };
+
+        // First chunk
+        let request = build_identify_request_payload(0, IDENTIFY_CHUNK_SIZE as u32);
+        mappings.push(MappingEntry {
+            input: Frame::new(0, request.into_raw()),
+            outputs: vec![Frame::new(0, build_response_payload(0, &first_chunk).into_raw())],
+        });
+        let mut resp_seq: u8 = 1;
+
+        // Remaining chunks (if any)
+        let mut offset = chunk_size as u32;
+        for (i, chunk) in remaining.chunks(IDENTIFY_CHUNK_SIZE as usize).enumerate() {
+            let request = build_identify_request_payload(offset, IDENTIFY_CHUNK_SIZE as u32);
+            mappings.push(MappingEntry {
+                input: Frame::new((i + 1) as u8, request.into_raw()),
+                outputs: vec![Frame::new(resp_seq, build_response_payload(offset, chunk).into_raw())],
+            });
+            offset += chunk.len() as u32;
+            resp_seq = resp_seq.wrapping_add(1);
+        }
+
+        // Final empty response
+        let request = build_identify_request_payload(offset, IDENTIFY_CHUNK_SIZE as u32);
+        mappings.push(MappingEntry {
+            input: Frame::new((mappings.len()) as u8, request.into_raw()),
+            outputs: vec![Frame::new(resp_seq, build_response_payload(offset, &[]).into_raw())],
+        });
+
+        let interface = TestInterface::new(mappings);
+        let mut parser = Parser::new(Arc::new(interface));
+        let data = do_identify(&mut parser, Duration::from_secs(10)).await.unwrap();
+
+        assert_eq!(data.version, "");
+        assert_eq!(data.app, "");
+        assert!(data.enumerations.is_object());
+        assert!(data.commands.is_object());
+    }
+
+    #[tokio::test]
+    async fn test_do_identify_too_many_chunks() {
+        // Create a minimal zlib payload that fits in one chunk
+        let json = serde_json::json!({"v": "t"});
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&serde_json::to_vec(&json).unwrap()).unwrap();
+        let zlib_data = encoder.finish().unwrap();
+
+        // Build mappings: send all zlib data in one chunk, then empty to finish
+        let mut mappings = Vec::new();
+        let mut offset: u32 = 0;
+        let mut resp_seq: u8 = 0;
+
+        // First chunk: do_identify always requests IDENTIFY_CHUNK_SIZE bytes;
+        // MCU returns all available data (zlib_data) in one response
+        let request = build_identify_request_payload(offset, IDENTIFY_CHUNK_SIZE as u32);
+        mappings.push(MappingEntry {
+            input: Frame::new(0, request.into_raw()),
+            outputs: vec![Frame::new(resp_seq, build_response_payload(offset, &zlib_data).into_raw())],
+        });
+        offset += zlib_data.len() as u32;
+        resp_seq = resp_seq.wrapping_add(1);
+
+        // Final empty response
+        let request = build_identify_request_payload(offset, IDENTIFY_CHUNK_SIZE as u32);
+        mappings.push(MappingEntry {
+            input: Frame::new(1, request.into_raw()),
+            outputs: vec![Frame::new(resp_seq, build_response_payload(offset, &[]).into_raw())],
+        });
+
+        let interface = TestInterface::new(mappings);
+        let mut parser = Parser::new(Arc::new(interface));
+
+        // This should succeed because we only have 2 chunks, not 1024
+        let result = do_identify(&mut parser, Duration::from_secs(10)).await;
+        assert!(result.is_ok(), "identify failed: {:?}", result);
+    }
+
+    #[test]
+    fn test_identify_data_length() {
+        let chunk1: &[u8] = b"hello world";
+        let chunk2: &[u8] = b"foo bar baz";
+        let empty: &[u8] = b"";
+
+        let chunks = vec![
+            (0, chunk1),
+            (chunk1.len() as u32, chunk2),
+            ((chunk1.len() + chunk2.len()) as u32, empty),
+        ];
+
+        assert_eq!(
+            identify_data_length(&chunks),
+            Some((chunk1.len() + chunk2.len()) as u32)
+        );
+    }
+
+    #[test]
+    fn test_identify_data_length_single_empty() {
+        let empty: &[u8] = b"";
+        let chunks = vec![(0, empty)];
+        assert_eq!(identify_data_length(&chunks), Some(0));
+    }
+
+    #[test]
+    fn test_identify_data_length_no_empty() {
+        let chunk1: &[u8] = b"hello";
+        let chunks = vec![(0, chunk1)];
+        // No empty chunk → returns computed length
+        assert_eq!(identify_data_length(&chunks), Some(5));
+    }
+
+    #[test]
+    fn test_identify_data_length_empty_input() {
+        let chunks: Vec<(u32, &[u8])> = vec![];
+        assert_eq!(identify_data_length(&chunks), None);
+    }
+
+    #[test]
+    fn test_identify_error_display() {
+        let err = IdentifyError {
+            kind: IdentifyErrorKind::Timeout,
+        };
+        assert_eq!(format!("{err}"), "identify timeout");
+
+        let err = IdentifyError {
+            kind: IdentifyErrorKind::Decompress("bad data".to_string()),
+        };
+        assert_eq!(format!("{err}"), "decompression failed: bad data");
+
+        let err = IdentifyError {
+            kind: IdentifyErrorKind::JsonParse("invalid json".to_string()),
+        };
+        assert_eq!(format!("{err}"), "json parse error: invalid json");
+
+        let err = IdentifyError {
+            kind: IdentifyErrorKind::Failed("mcu error".to_string()),
+        };
+        assert_eq!(format!("{err}"), "identify failed: mcu error");
+    }
+
+    /// Simple test to verify TestInterface + Parser + inbox flow works
+    #[tokio::test]
+    async fn test_inbox_receive_simple() {
+        let mapping = vec![
+            MappingEntry {
+                input: Frame::new(
+                    0,
+                    // identify request: cmd_id=1, offset_bytes=[1,0], count_bytes=[1,40]
+                    vec![1, 1, 0, 1, 40],
+                ),
+                outputs: vec![Frame::new(
+                    0,
+                    // identify_response: cmd_id=0, offset=u32(0), data=[40]
+                    vec![0, 0, 1, 40],
+                )],
+            },
+        ];
+        let interface = TestInterface::new(mapping);
+        let mut parser = Parser::new(Arc::new(interface));
+
+        // Start inbox
+        let mut inbox = parser.start_inbox().await.unwrap();
+
+        // Send identify request
+        let params = vec![
+            Param::Positional(ArgValue::Bytes(vec![0])),
+            Param::Positional(ArgValue::Bytes(vec![40])),
+        ];
+        parser.send("identify", &params).await.unwrap();
+
+        // Receive from inbox
+        let msg = tokio::time::timeout(Duration::from_secs(2), inbox.recv()).await;
+        assert!(msg.is_ok(), "inbox recv timed out: {:?}", msg);
+        let msg = msg.unwrap();
+        assert!(msg.is_some(), "inbox recv returned None");
+        assert_eq!(msg.unwrap().id, 0); // identify_response
+    }
+}

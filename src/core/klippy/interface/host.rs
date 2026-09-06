@@ -18,6 +18,8 @@
 //   klipper_host_is_shutdown()- Check shutdown status
 //   klipper_host_get_clock() - Get current clock time
 
+#![allow(static_mut_refs)]
+
 use crate::core::klippy::error::KlippyError;
 use crate::core::klippy::traits::{InterfaceEvent, KlippyInterface};
 use tracing::{info, warn};

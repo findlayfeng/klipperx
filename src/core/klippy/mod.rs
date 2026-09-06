@@ -26,7 +26,7 @@ pub mod interface {
 
     // Klipper host library interface (dynamic linking)
     // Loads libklipper_host.so at runtime and resolves function pointers
-    // pub mod host;
+    pub mod host;
 
     // Test interface - only available in test mode
     // Provides pre-defined responses for deterministic testing

@@ -9,12 +9,17 @@
 //!
 //! | Message ID | Format | Direction |
 //! |------------|--------|-----------|
-//! | `0` | `identify_response offset=%u data=%.*s` | MCU → host |
+//! | `0` | `identify_response offset=%u data=%c` | MCU → host |
 //! | `1` | `identify offset=%c count=%c` | host → MCU |
 //!
 //! The host sends `identify offset=N count=40` repeatedly, and the MCU responds
 //! with `identify_response` carrying the offset and data chunk. When the offset
 //! equals the total data length and the data is empty, the exchange is complete.
+//!
+//! # Security
+//!
+//! The implementation enforces a maximum decompressed data size (1 MB) to prevent
+//! zip-bomb style attacks where a tiny compressed payload expands to enormous data.
 //!
 //! # Example
 //!
@@ -39,7 +44,12 @@ use crate::core::klippy::msg::proto::ArgValue;
 const MAX_IDENTIFY_CHUNKS: u32 = 1024;
 
 /// Size of each identify data chunk (bytes).
-const IDENTIFY_CHUNK_SIZE: u8 = 40;
+const IDENTIFY_CHUNK_SIZE: u32 = 40;
+
+/// Maximum allowed decompressed data size (1 MB).
+/// Prevents zip-bomb style attacks where a tiny compressed payload
+/// expands to enormous data, causing OOM.
+const MAX_IDENTIFY_DATA_SIZE: usize = 1024 * 1024;
 
 /// Parsed identify data from the MCU.
 ///
@@ -138,6 +148,16 @@ impl IdentifyData {
             .map(|map| map.keys().cloned().collect())
             .unwrap_or_default()
     }
+}
+
+/// Helper macro to extract a JSON field with a default fallback.
+macro_rules! json_field {
+    ($json:expr, $key:expr, $default:expr) => {
+        $json
+            .get($key)
+            .map(|v| v.clone())
+            .unwrap_or_else(|| $default.clone())
+    };
 }
 
 /// Performs the full identify exchange with the MCU.
@@ -261,6 +281,16 @@ pub async fn do_identify(
             });
         }
 
+        // Check total data size before appending (zip-bomb protection)
+        if raw_data.len() + resp_data.len() > MAX_IDENTIFY_DATA_SIZE {
+            return Err(IdentifyError {
+                kind: IdentifyErrorKind::Failed(format!(
+                    "identify data exceeds maximum size ({} bytes)",
+                    MAX_IDENTIFY_DATA_SIZE
+                )),
+            });
+        }
+
         // Append data chunk
         raw_data.extend_from_slice(&resp_data);
 
@@ -291,26 +321,11 @@ pub async fn do_identify(
 
     // Convert to IdentifyData
     Ok(IdentifyData {
-        enumerations: json_value
-            .get("enumerations")
-            .unwrap_or(&serde_json::Value::Null)
-            .clone(),
-        commands: json_value
-            .get("commands")
-            .unwrap_or(&serde_json::Value::Null)
-            .clone(),
-        responses: json_value
-            .get("responses")
-            .unwrap_or(&serde_json::Value::Null)
-            .clone(),
-        output: json_value
-            .get("output")
-            .unwrap_or(&serde_json::Value::Null)
-            .clone(),
-        config: json_value
-            .get("config")
-            .unwrap_or(&serde_json::Value::Null)
-            .clone(),
+        enumerations: json_field!(json_value, "enumerations", serde_json::Value::Null),
+        commands: json_field!(json_value, "commands", serde_json::Value::Null),
+        responses: json_field!(json_value, "responses", serde_json::Value::Null),
+        output: json_field!(json_value, "output", serde_json::Value::Null),
+        config: json_field!(json_value, "config", serde_json::Value::Null),
         version: json_value
             .get("version")
             .and_then(|v| v.as_str())
@@ -718,5 +733,55 @@ mod tests {
         let msg = msg.unwrap();
         assert!(msg.is_some(), "inbox recv returned None");
         assert_eq!(msg.unwrap().id, 0); // identify_response
+    }
+
+    #[tokio::test]
+    async fn test_do_identify_offset_mismatch() {
+        let json = serde_json::json!({"v": "t"});
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&serde_json::to_vec(&json).unwrap()).unwrap();
+        let zlib_data = encoder.finish().unwrap();
+
+        // Build mappings where response offset doesn't match request offset
+        let mut mappings = Vec::new();
+        let request = build_identify_request_payload(0, IDENTIFY_CHUNK_SIZE);
+        // Response offset is wrong (1 instead of 0)
+        mappings.push(MappingEntry {
+            input: Frame::new(0, request.into_raw()),
+            outputs: vec![Frame::new(
+                0,
+                build_response_payload(1, &zlib_data).into_raw(),
+            )],
+        });
+
+        let interface = TestInterface::new(mappings);
+        let mut parser = Parser::new(Arc::new(interface));
+
+        let result = do_identify(&mut parser, Duration::from_secs(10)).await;
+        assert!(result.is_err());
+        assert!(format!("{:?}", result).contains("unexpected offset"));
+    }
+
+    #[test]
+    fn test_encode_varint32_basic() {
+        // Value 0
+        assert_eq!(encode_varint32(0), vec![0]);
+        // Value 127 (max single byte)
+        assert_eq!(encode_varint32(127), vec![127]);
+        // Value 128 (requires 2 bytes)
+        assert_eq!(encode_varint32(128), vec![0x80, 0x01]);
+        // Value 300
+        assert_eq!(encode_varint32(300), vec![0xAC, 0x02]);
+        // Value 16383 (max 2 bytes)
+        assert_eq!(encode_varint32(16383), vec![0xFF, 0x7F]);
+        // Value 16384 (requires 3 bytes)
+        assert_eq!(encode_varint32(16384), vec![0x80, 0x80, 0x01]);
+    }
+
+    #[test]
+    fn test_identify_data_length_offset_boundary() {
+        // When last chunk has data, total = offset + data.len()
+        let chunks: Vec<(u32, &[u8])> = vec![(10, b"hello")];
+        assert_eq!(identify_data_length(&chunks), Some(15));
     }
 }

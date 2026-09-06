@@ -70,7 +70,8 @@ impl MsgBase {
                 "%hu" => ArgType::UInt16,
                 "%hi" => ArgType::Int16,
                 "%c" => ArgType::Bytes,
-                "%s" | "%*s" | "%.*s" => ArgType::Str,
+                "%.*s" => ArgType::Bytes,
+                "%s" | "%*s" => ArgType::Str,
                 _ => {
                     return Err(MsgError::new(format!(
                         "unknown type specifier: {}",
@@ -95,8 +96,8 @@ impl MsgBase {
 
     /// Returns the format string by reconstructing it from name and params.
     ///
-    /// Note: the Str variants `%*s` and `%.*s` normalize to `%s` here, since
-    /// [`ArgType`] does not distinguish them.
+    /// Note: `%*s` normalizes to `%s`, and `%.*s` normalizes to `%c` here,
+    /// since [`ArgType`] does not distinguish between these variants.
     pub fn format(&self) -> String {
         let mut parts = Vec::new();
         for (name, atype) in &self.params {
@@ -265,7 +266,7 @@ mod tests {
         assert_eq!(cmd.params[4].1, ArgType::Str);
         assert_eq!(cmd.params[5].1, ArgType::Bytes);
         assert_eq!(cmd.params[6].1, ArgType::Str);
-        assert_eq!(cmd.params[7].1, ArgType::Str);
+        assert_eq!(cmd.params[7].1, ArgType::Bytes);
     }
 
     #[test]

@@ -23,12 +23,6 @@ const SEND_COALESCE_WINDOW: Duration = Duration::from_millis(1);
 /// This is 2/3 of the maximum payload length.
 const SEND_COALESCE_THRESHOLD: usize = MESSAGE_PAYLOAD_MAX * 2 / 3;
 
-/// Default Klipper message formats for identify request/response.
-const DEFAULT_MESSAGES: &[(u8, &str)] = &[
-    (0, "identify_response offset=%u data=%.*s"),
-    (1, "identify offset=%c count=%c"),
-];
-
 #[derive(MultiIndexMap, Debug)]
 #[multi_index_derive(Debug)]
 // #[multi_index_hash(rustc_hash::FxBuildHasher)]
@@ -80,7 +74,7 @@ impl Parser {
     /// Create a new parser and register default message formats.
     pub fn new(interface: Arc<dyn KlippyInterface>) -> Self {
         let msgs: MsgRegistry = Arc::new(Mutex::new(MultiIndexMsgMap::default()));
-        let mut parser = Self {
+        let parser = Self {
             msgs,
             interface,
             outbox: AsyncMutex::new(None),
@@ -88,12 +82,6 @@ impl Parser {
             callback_queue: Arc::new(Mutex::new(VecDeque::new())),
             waiters: Arc::new(Mutex::new(Vec::new())),
         };
-
-        for (id, format_str) in DEFAULT_MESSAGES {
-            parser
-                .register(*id, format_str)
-                .expect("built-in default message formats must be valid");
-        }
         parser
     }
 
@@ -1335,21 +1323,23 @@ mod tests {
         temp_report.push(31).unwrap();
         temp_report.push_u32(250).unwrap();
 
-        let mut identify = Payload::new();
-        identify.push(0).unwrap();
-        identify.push_u32(4).unwrap();
-        identify.push_bytes(b"abcd").unwrap();
+        let mut test_resp = Payload::new();
+        test_resp.push(99).unwrap();
+        test_resp.push_u32(4).unwrap();
+        test_resp.push_bytes(b"abcd").unwrap();
 
         let mapping = vec![MappingEntry {
             input: Frame::new(0, m105_payload.payload().to_vec()),
             outputs: vec![
                 Frame::new(0, temp_report.payload().to_vec()),
-                Frame::new(1, identify.payload().to_vec()),
+                Frame::new(1, test_resp.payload().to_vec()),
             ],
         }];
         let interface = TestInterface::new(mapping);
         let mut parser = Parser::new(Arc::new(interface));
         register_m105_cmd(&mut parser);
+        // Register test_response so inbox task can process id=99 messages
+        parser.register(99, "test_response value=%u data=%.*s").unwrap();
 
         // Bind a callback to the inbound message.
         let _ = parser.register(31, "temp_report value=%u");
@@ -1371,7 +1361,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(forwarded.id, 0);
+        assert_eq!(forwarded.id, 99);
         assert_eq!(
             forwarded.params,
             vec![ArgValue::UInt32(4), ArgValue::Bytes(b"abcd".to_vec())]
@@ -1488,12 +1478,14 @@ mod tests {
         // waiter must not linger.
         let interface = TestInterface::new(vec![]);
         let mut parser = Parser::new(Arc::new(interface));
+        // Register a test response so send_and_wait can resolve the wait target
+        parser.register(99, "test_response value=%u").unwrap();
         let _rx = parser.start_inbox().await.unwrap();
 
-        // Use "identify_response" (id=0) — it's registered in DEFAULT_MESSAGES.
+        // Use "test_response" (id=99) — registered above.
         // The send fails with "Unknown command" (UNKNOWN cmd), not the wait lookup.
         let result = parser
-            .send_and_wait("UNKNOWN", &[], "identify_response", Some(Duration::from_secs(1)))
+            .send_and_wait("UNKNOWN", &[], "test_response", Some(Duration::from_secs(1)))
             .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().msg.contains("Unknown command"));

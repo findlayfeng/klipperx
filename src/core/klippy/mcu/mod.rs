@@ -21,11 +21,17 @@ impl Mcu {
     /// Create a new `Mcu` object from an `McuConfig`.
     ///
     /// The interface is already stored in the `McuConfig`. A `Parser` is created
-    /// from the interface and stored in the struct.
+    /// from the interface, and the default identify messages are registered.
     pub fn from_config(config: McuConfig) -> Self {
+        let mut parser = Parser::new(config.interface.into());
+        for (id, format_str) in identify::DEFAULT_MESSAGES {
+            parser
+                .register(*id, format_str)
+                .expect("default identify message formats must be valid");
+        }
         Self {
             name: config.name,
-            parser: Parser::new(config.interface.into()),
+            parser,
         }
     }
 }

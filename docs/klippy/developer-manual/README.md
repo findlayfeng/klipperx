@@ -19,6 +19,7 @@
 - [Parser API 参考](parser-api.md) — 消息注册、发送、接收的使用说明
 - [消息结构](message-structure.md) — `MsgBase` / `MsgHandler` / `MsgEntry`
 - [内部架构](architecture.md) — 合并发送、路由优先级、性能特性
+- [Identify 机制](identify.md) — 主机与 MCU 间的数据字典协商流程
 - [测试](testing.md) — 测试覆盖与运行方式
 
 ---

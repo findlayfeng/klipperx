@@ -9,7 +9,7 @@
 //!
 //! | Message ID | Format | Direction |
 //! |------------|--------|-----------|
-//! | `0` | `identify_response offset=%u data=%c` | MCU → host |
+//! | `0` | `identify_response offset=%u data=%.*s` | MCU → host |
 //! | `1` | `identify offset=%c count=%c` | host → MCU |
 //!
 //! The host sends `identify offset=N count=40` repeatedly, and the MCU responds

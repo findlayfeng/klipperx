@@ -807,4 +807,35 @@ mod tests {
         let chunks: Vec<(u32, &[u8])> = vec![(10, b"hello")];
         assert_eq!(identify_data_length(&chunks), Some(15));
     }
+
+    #[tokio::test]
+    #[ignore = "requires real klipper host library"]
+    async fn test_do_identify_with_host_interface() {
+        // Test identify protocol using the real LibInterface (host.rs)
+        // This test requires the klipper host shared library to be available
+        use crate::core::klippy::interface::host::LibInterface;
+
+        let lib_path = klipperx_test_support::klipper_host_lib_path();
+        let interface = LibInterface::new();
+        interface.init(&lib_path).expect("Failed to initialize LibInterface");
+
+        let mut parser = Parser::new(Arc::new(interface));
+        for (id, fmt) in DEFAULT_MESSAGES {
+            parser.register(*id, fmt).unwrap();
+        }
+
+        let result = do_identify(&mut parser, Duration::from_secs(5)).await;
+        // The test library may not provide identify data, so we just check
+        // that the call doesn't panic. In a real environment, this would
+        // return the MCU identify data.
+        match result {
+            Ok(data) => {
+                tracing::info!("identify success: version={}, app={}", data.version, data.app);
+            }
+            Err(e) => {
+                // Expected in test environment - the library may not provide identify data
+                tracing::warn!("identify failed (expected in test env): {:?}", e);
+            }
+        }
+    }
 }

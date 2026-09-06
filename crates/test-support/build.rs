@@ -17,7 +17,6 @@ fn main() {
         .expect("test-support must live at crates/test-support")
         .to_path_buf();
     let klipper_dir = workspace_root.join("third_party/klipper");
-    let lib_path = klipper_dir.join("out/libklipper_host.so");
 
     // Always build the library before each test run to ensure it's up to date
     println!("cargo:warning=KlipperX test-support: Building klipper host shared library...");

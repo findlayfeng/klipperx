@@ -19,12 +19,9 @@ fn main() {
     let klipper_dir = workspace_root.join("third_party/klipper");
     let lib_path = klipper_dir.join("out/libklipper_host.so");
 
-    if lib_path.exists() && is_up_to_date(&klipper_dir, &lib_path) {
-        println!("cargo:rerun-if-changed={}", lib_path.display());
-    } else {
-        println!("cargo:warning=KlipperX test-support: Building klipper host shared library...");
-        build_klipper_shared_lib(&klipper_dir);
-    }
+    // Always build the library before each test run to ensure it's up to date
+    println!("cargo:warning=KlipperX test-support: Building klipper host shared library...");
+    build_klipper_shared_lib(&klipper_dir);
 
     // No compile-time linking is needed here: host.rs loads the library
     // at runtime via libloading (dlopen), so the linker never sees it.
@@ -61,32 +58,4 @@ fn build_klipper_shared_lib(klipper_dir: &Path) {
     assert!(status.success(), "make failed");
 }
 
-fn is_up_to_date(klipper_dir: &Path, lib_path: &Path) -> bool {
-    let sources = [
-        "src/Kconfig",
-        "src/host/Kconfig",
-        "src/host/Makefile",
-        "src/host/main.c",
-        "src/host/gpio.c",
-        "src/host/timer.c",
-        "src/host/serial.c",
-    ];
 
-    let lib_mtime = std::fs::metadata(lib_path)
-        .ok()
-        .and_then(|m| m.modified().ok());
-
-    if let Some(lib_mtime) = lib_mtime {
-        for source in &sources {
-            let source_path = klipper_dir.join(source);
-            if let Ok(metadata) = std::fs::metadata(&source_path) {
-                if let Ok(modified) = metadata.modified() {
-                    if modified > lib_mtime {
-                        return false;
-                    }
-                }
-            }
-        }
-    }
-    true
-}

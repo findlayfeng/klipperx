@@ -809,10 +809,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires real klipper host library"]
     async fn test_do_identify_with_host_interface() {
         // Test identify protocol using the real LibInterface (host.rs)
-        // This test requires the klipper host shared library to be available
+        // The klipper host shared library is built by test-support build.rs
+        // before each test run
         use crate::core::klippy::interface::host::LibInterface;
 
         let lib_path = klipperx_test_support::klipper_host_lib_path();

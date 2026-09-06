@@ -10,7 +10,7 @@
 //! | Message ID | Format | Direction |
 //! |------------|--------|-----------|
 //! | `0` | `identify_response offset=%u data=%.*s` | MCU → host |
-//! | `1` | `identify offset=%c count=%c` | host → MCU |
+//! | `1` | `identify offset=%u count=%c` | host → MCU |
 //!
 //! The host sends `identify offset=N count=40` repeatedly, and the MCU responds
 //! with `identify_response` carrying the offset and data chunk. When the offset
@@ -45,7 +45,7 @@ use crate::core::klippy::msg::proto::ArgValue;
 /// [`Mcu::from_config`](super::Mcu::from_config).
 pub const DEFAULT_MESSAGES: &[(u8, &str)] = &[
     (0, "identify_response offset=%u data=%.*s"),
-    (1, "identify offset=%c count=%c"),
+    (1, "identify offset=%u count=%c"),
 ];
 
 /// Maximum number of chunks allowed during identify exchange.
@@ -209,10 +209,10 @@ pub async fn do_identify(
         }
 
         // Send identify request
-        // Format: "identify offset=%c count=%c" — both params are bytes (7-bit varint encoded)
+        // Format: "identify offset=%u count=%c" — offset is u32, count is bytes (7-bit varint)
         let request_params = vec![
-            Param::Positional(ArgValue::Bytes(encode_varint32(offset))),
-            Param::Positional(ArgValue::Bytes(encode_varint32(IDENTIFY_CHUNK_SIZE as u32))),
+            Param::Positional(ArgValue::UInt32(offset)),
+            Param::Positional(ArgValue::Bytes(encode_varint32(IDENTIFY_CHUNK_SIZE))),
         ];
 
         // Send the request
@@ -408,8 +408,8 @@ mod tests {
     fn build_identify_request_payload(offset: u32, count: u32) -> Payload {
         let mut p = Payload::new();
         p.push(1).unwrap(); // cmd_id = 1 (identify)
-        p.push_bytes(&encode_varint32(offset)).unwrap();
-        p.push_bytes(&encode_varint32(count)).unwrap();
+        p.push_u32(offset).unwrap(); // offset=%u
+        p.push_bytes(&encode_varint32(count)).unwrap(); // count=%c
         p
     }
 
@@ -721,8 +721,8 @@ mod tests {
             MappingEntry {
                 input: Frame::new(
                     0,
-                    // identify request: cmd_id=1, offset_bytes=[1,0], count_bytes=[1,40]
-                    vec![1, 1, 0, 1, 40],
+                    // identify request: cmd_id=1, offset=u32(0), count_bytes=[1,40]
+                    vec![1, 0, 1, 40],
                 ),
                 outputs: vec![Frame::new(
                     0,
@@ -742,7 +742,7 @@ mod tests {
 
         // Send identify request
         let params = vec![
-            Param::Positional(ArgValue::Bytes(vec![0])),
+            Param::Positional(ArgValue::UInt32(0)),
             Param::Positional(ArgValue::Bytes(vec![40])),
         ];
         parser.send("identify", &params).await.unwrap();

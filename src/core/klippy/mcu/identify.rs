@@ -39,6 +39,15 @@ use crate::core::klippy::msg::parser::Parser;
 use crate::core::klippy::msg::param::Param;
 use crate::core::klippy::msg::proto::ArgValue;
 
+/// Default Klipper message formats for identify request/response.
+///
+/// These are registered when creating a new [`Mcu`](super::Mcu) via
+/// [`Mcu::from_config`](super::Mcu::from_config).
+pub const DEFAULT_MESSAGES: &[(u8, &str)] = &[
+    (0, "identify_response offset=%u data=%.*s"),
+    (1, "identify offset=%c count=%c"),
+];
+
 /// Maximum number of chunks allowed during identify exchange.
 /// Prevents infinite loops in case of corrupted MCU responses.
 const MAX_IDENTIFY_CHUNKS: u32 = 1024;
@@ -489,7 +498,9 @@ mod tests {
 
         let interface = TestInterface::new(mappings);
         let mut parser = Parser::new(Arc::new(interface));
-        // Start the inbox so that send_and_wait() can receive responses
+        for (id, fmt) in DEFAULT_MESSAGES {
+            parser.register(*id, fmt).unwrap();
+        }
 
         let result = do_identify(&mut parser, Duration::from_secs(10)).await;
         assert!(result.is_ok(), "identify failed: {:?}", result);
@@ -589,6 +600,9 @@ mod tests {
 
         let interface = TestInterface::new(mappings);
         let mut parser = Parser::new(Arc::new(interface));
+        for (id, fmt) in DEFAULT_MESSAGES {
+            parser.register(*id, fmt).unwrap();
+        }
         let data = do_identify(&mut parser, Duration::from_secs(10)).await.unwrap();
 
         assert_eq!(data.version, "");
@@ -629,6 +643,9 @@ mod tests {
 
         let interface = TestInterface::new(mappings);
         let mut parser = Parser::new(Arc::new(interface));
+        for (id, fmt) in DEFAULT_MESSAGES {
+            parser.register(*id, fmt).unwrap();
+        }
 
         // This should succeed because we only have 2 chunks, not 1024
         let result = do_identify(&mut parser, Duration::from_secs(10)).await;
@@ -716,6 +733,9 @@ mod tests {
         ];
         let interface = TestInterface::new(mapping);
         let mut parser = Parser::new(Arc::new(interface));
+        for (id, fmt) in DEFAULT_MESSAGES {
+            parser.register(*id, fmt).unwrap();
+        }
 
         // Start inbox
         let mut inbox = parser.start_inbox().await.unwrap();
@@ -756,6 +776,9 @@ mod tests {
 
         let interface = TestInterface::new(mappings);
         let mut parser = Parser::new(Arc::new(interface));
+        for (id, fmt) in DEFAULT_MESSAGES {
+            parser.register(*id, fmt).unwrap();
+        }
 
         let result = do_identify(&mut parser, Duration::from_secs(10)).await;
         assert!(result.is_err());

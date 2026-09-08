@@ -181,11 +181,6 @@ impl Identify {
     /// - JSON parsing fails
     /// - The MCU responds unexpectedly
     pub async fn fetch(parser: &mut Parser, timeout: Duration) -> Result<Self, IdentifyError> {
-        // Start inbox for send_and_wait to work
-        parser.start_inbox().await.map_err(|e| IdentifyError {
-            kind: IdentifyErrorKind::Failed(format!("failed to start inbox: {e}")),
-        })?;
-
         let mut raw_data = Vec::new();
         let mut offset: u32 = 0;
 
@@ -632,22 +627,24 @@ mod tests {
             parser.register(*id, fmt).unwrap();
         }
 
-        // Start inbox
-        let mut inbox = parser.start_inbox().await.unwrap();
-
-        // Send identify request
-        let params = vec![
-            Param::Positional(ArgValue::UInt32(0)),
-            Param::Positional(ArgValue::UInt8(40)),
-        ];
-        parser.send("identify", &params).await.unwrap();
-
-        // Receive from inbox
-        let msg = tokio::time::timeout(Duration::from_secs(2), inbox.recv()).await;
-        assert!(msg.is_ok(), "inbox recv timed out: {:?}", msg);
-        let msg = msg.unwrap();
-        assert!(msg.is_some(), "inbox recv returned None");
-        assert_eq!(msg.unwrap().id, 0); // identify_response
+        // Use send_and_wait to verify inbox integration
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            parser.send_and_wait(
+                "identify",
+                &[
+                    Param::Positional(ArgValue::UInt32(0)),
+                    Param::Positional(ArgValue::UInt8(40)),
+                ],
+                "identify_response",
+                None,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(response.len(), 2); // offset + data
+        assert_eq!(response[0], ArgValue::UInt32(0));
     }
 
     #[tokio::test]

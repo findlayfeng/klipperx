@@ -212,7 +212,7 @@ pub async fn do_identify(
         // Format: "identify offset=%u count=%c" — offset is u32, count is bytes (7-bit varint)
         let request_params = vec![
             Param::Positional(ArgValue::UInt32(offset)),
-            Param::Positional(ArgValue::Bytes(encode_varint32(IDENTIFY_CHUNK_SIZE))),
+            Param::Positional(ArgValue::UInt8(IDENTIFY_CHUNK_SIZE as u8)),
         ];
 
         // Send the request
@@ -358,37 +358,6 @@ pub async fn do_identify(
     })
 }
 
-/// Encode a u32 as a 7-bit varint byte array (big-endian).
-fn encode_varint32(v: u32) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    let mut val = v;
-    loop {
-        let byte = (val & 0x7F) as u8;
-        val >>= 7;
-        if val != 0 {
-            bytes.push(byte | 0x80);
-        } else {
-            bytes.push(byte);
-            break;
-        }
-    }
-    bytes
-}
-
-/// Extract the total data length from a completed identify exchange.
-///
-/// Returns the length as stored in the last identify_response before
-/// the empty response that signals completion.
-pub fn identify_data_length(raw_chunks: &[(u32, &[u8])]) -> Option<u32> {
-    raw_chunks.last().map(|(offset, data)| {
-        if data.is_empty() {
-            *offset
-        } else {
-            *offset + data.len() as u32
-        }
-    })
-}
-
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -409,7 +378,7 @@ mod tests {
         let mut p = Payload::new();
         p.push(1).unwrap(); // cmd_id = 1 (identify)
         p.push_u32(offset).unwrap(); // offset=%u
-        p.push_bytes(&encode_varint32(count)).unwrap(); // count=%c
+        p.push_u8(count as u8).unwrap(); // count=%c -> UInt8
         p
     }
 
@@ -653,45 +622,6 @@ mod tests {
     }
 
     #[test]
-    fn test_identify_data_length() {
-        let chunk1: &[u8] = b"hello world";
-        let chunk2: &[u8] = b"foo bar baz";
-        let empty: &[u8] = b"";
-
-        let chunks = vec![
-            (0, chunk1),
-            (chunk1.len() as u32, chunk2),
-            ((chunk1.len() + chunk2.len()) as u32, empty),
-        ];
-
-        assert_eq!(
-            identify_data_length(&chunks),
-            Some((chunk1.len() + chunk2.len()) as u32)
-        );
-    }
-
-    #[test]
-    fn test_identify_data_length_single_empty() {
-        let empty: &[u8] = b"";
-        let chunks = vec![(0, empty)];
-        assert_eq!(identify_data_length(&chunks), Some(0));
-    }
-
-    #[test]
-    fn test_identify_data_length_no_empty() {
-        let chunk1: &[u8] = b"hello";
-        let chunks = vec![(0, chunk1)];
-        // No empty chunk → returns computed length
-        assert_eq!(identify_data_length(&chunks), Some(5));
-    }
-
-    #[test]
-    fn test_identify_data_length_empty_input() {
-        let chunks: Vec<(u32, &[u8])> = vec![];
-        assert_eq!(identify_data_length(&chunks), None);
-    }
-
-    #[test]
     fn test_identify_error_display() {
         let err = IdentifyError {
             kind: IdentifyErrorKind::Timeout,
@@ -721,8 +651,8 @@ mod tests {
             MappingEntry {
                 input: Frame::new(
                     0,
-                    // identify request: cmd_id=1, offset=u32(0), count_bytes=[1,40]
-                    vec![1, 0, 1, 40],
+                    // identify request: cmd_id=1, offset=u32(0), count=UInt8(40)
+                    vec![1, 0, 40],
                 ),
                 outputs: vec![Frame::new(
                     0,
@@ -743,7 +673,7 @@ mod tests {
         // Send identify request
         let params = vec![
             Param::Positional(ArgValue::UInt32(0)),
-            Param::Positional(ArgValue::Bytes(vec![40])),
+            Param::Positional(ArgValue::UInt8(40)),
         ];
         parser.send("identify", &params).await.unwrap();
 
@@ -783,29 +713,6 @@ mod tests {
         let result = do_identify(&mut parser, Duration::from_secs(10)).await;
         assert!(result.is_err());
         assert!(format!("{:?}", result).contains("unexpected offset"));
-    }
-
-    #[test]
-    fn test_encode_varint32_basic() {
-        // Value 0
-        assert_eq!(encode_varint32(0), vec![0]);
-        // Value 127 (max single byte)
-        assert_eq!(encode_varint32(127), vec![127]);
-        // Value 128 (requires 2 bytes)
-        assert_eq!(encode_varint32(128), vec![0x80, 0x01]);
-        // Value 300
-        assert_eq!(encode_varint32(300), vec![0xAC, 0x02]);
-        // Value 16383 (max 2 bytes)
-        assert_eq!(encode_varint32(16383), vec![0xFF, 0x7F]);
-        // Value 16384 (requires 3 bytes)
-        assert_eq!(encode_varint32(16384), vec![0x80, 0x80, 0x01]);
-    }
-
-    #[test]
-    fn test_identify_data_length_offset_boundary() {
-        // When last chunk has data, total = offset + data.len()
-        let chunks: Vec<(u32, &[u8])> = vec![(10, b"hello")];
-        assert_eq!(identify_data_length(&chunks), Some(15));
     }
 
     #[tokio::test]

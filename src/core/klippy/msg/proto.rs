@@ -4,6 +4,7 @@ use super::super::frame::MESSAGE_PAYLOAD_MAX;
 /// Parameter type enum.
 #[derive(Debug, Clone, PartialEq, Copy, Eq, Hash)]
 pub enum ArgType {
+    UInt8,
     UInt16,
     Int16,
     UInt32,
@@ -15,6 +16,7 @@ pub enum ArgType {
 /// Parameter value enum carrying the actual parameter data.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ArgValue {
+    UInt8(u8),
     UInt16(u16),
     Int16(i16),
     UInt32(u32),
@@ -27,6 +29,7 @@ impl ArgValue {
     /// Get the ArgType corresponding to this ArgValue.
     pub fn arg_type(&self) -> ArgType {
         match self {
+            ArgValue::UInt8(_) => ArgType::UInt8,
             ArgValue::UInt16(_) => ArgType::UInt16,
             ArgValue::Int16(_) => ArgType::Int16,
             ArgValue::UInt32(_) => ArgType::UInt32,
@@ -70,6 +73,10 @@ impl ArgValue {
             }
 
             // Widening conversions are always lossless
+            (ArgValue::UInt8(v), ArgType::Int16) => Ok(ArgValue::Int16(*v as i16)),
+            (ArgValue::UInt8(v), ArgType::UInt16) => Ok(ArgValue::UInt16(*v as u16)),
+            (ArgValue::UInt8(v), ArgType::Int32) => Ok(ArgValue::Int32(*v as i32)),
+            (ArgValue::UInt8(v), ArgType::UInt32) => Ok(ArgValue::UInt32(*v as u32)),
             (ArgValue::Int16(v), ArgType::Int32) => Ok(ArgValue::Int32(*v as i32)),
             (ArgValue::UInt16(v), ArgType::UInt32) => Ok(ArgValue::UInt32(*v as u32)),
             (ArgValue::UInt16(v), ArgType::Int32) => Ok(ArgValue::Int32(*v as i32)),
@@ -77,6 +84,39 @@ impl ArgValue {
             // Unsupported: Str/Bytes to numeric, numeric to Str/Bytes,
             // narrowing, and out-of-range signedness changes.
             _ => Err(()),
+        }
+    }
+}
+
+/// Format string specifiers used in Klipper message format strings.
+/// These map between [`ArgType`] variants and their string representations.
+impl ArgType {
+    /// Parse a format string specifier into an [`ArgType`].
+    ///
+    /// Returns `Err(())` if the specifier is not recognized.
+    pub fn parse_format(specifier: &str) -> Result<Self, ()> {
+        match specifier {
+            "%u" => Ok(ArgType::UInt32),
+            "%i" => Ok(ArgType::Int32),
+            "%hu" => Ok(ArgType::UInt16),
+            "%hi" => Ok(ArgType::Int16),
+            "%c" => Ok(ArgType::UInt8),
+            "%.*s" => Ok(ArgType::Bytes),
+            "%s" | "%*s" => Ok(ArgType::Str),
+            _ => Err(()),
+        }
+    }
+
+    /// Convert this [`ArgType`] to its format string specifier.
+    pub fn format_str(&self) -> &'static str {
+        match self {
+            ArgType::UInt32 => "%u",
+            ArgType::Int32 => "%i",
+            ArgType::UInt16 => "%hu",
+            ArgType::Int16 => "%hi",
+            ArgType::UInt8 => "%c",
+            ArgType::Str => "%s",
+            ArgType::Bytes => "%.*s",
         }
     }
 }
@@ -99,6 +139,7 @@ const fn mask(bits: u32) -> u32 {
     (1u32 << bits) - 1
 }
 
+const U8_MASK7: u8 = mask(7) as u8;
 const U16_MASK7: u16 = mask(7) as u16;
 const U16_MASK14: u16 = mask(14) as u16;
 const U32_MASK7: u32 = mask(7);
@@ -218,6 +259,22 @@ impl Payload {
         Ok(())
     }
 
+    /// Push a u8 value in 7-bit varint format.
+    pub fn push_u8(&mut self, v: u8) -> MsgResult<()> {
+        let needed = if v > U8_MASK7 { 2 } else { 1 };
+        if self.len() + needed > MESSAGE_PAYLOAD_MAX {
+            return Err(MsgError::new("payload exceeds maximum length"));
+        }
+
+        if v > U8_MASK7 {
+            self.raw.push(((v >> 7) & 0x01 | 0x80) as u8);
+        }
+
+        self.raw.push((v & 0x7f) as u8);
+
+        Ok(())
+    }
+
     /// Push a byte array (length prefix followed by data).
     pub fn push_bytes(&mut self, bytes: &[u8]) -> MsgResult<()> {
         if self.len() + 1 + bytes.len() > MESSAGE_PAYLOAD_MAX {
@@ -233,6 +290,7 @@ impl Payload {
     /// Push an ArgValue (dispatches to appropriate push method based on variant).
     pub fn push_value(&mut self, value: &ArgValue) -> MsgResult<()> {
         match value {
+            ArgValue::UInt8(v) => self.push_u8(*v),
             ArgValue::UInt16(v) => self.push_u16(*v),
             ArgValue::Int16(v) => self.push_u16(*v as u16),
             ArgValue::UInt32(v) => self.push_u32(*v),
@@ -348,9 +406,24 @@ impl PayloadParser<'_> {
         Ok(self.pop_u16()? as i16)
     }
 
+    /// Pop a u8 value in 7-bit varint format.
+    pub fn pop_u8(&mut self) -> MsgResult<u8> {
+        let val: u32 = self.pop_u32()?;
+        if val > u8::MAX as u32 {
+            return Err(MsgError::new("u8 encoding too long"));
+        }
+        Ok(val as u8)
+    }
+
+    /// Pop an i8 value (as u8 internally).
+    pub fn pop_i8(&mut self) -> MsgResult<i8> {
+        Ok(self.pop_u8()? as i8)
+    }
+
     /// Pop a value according to the given ArgType.
     pub fn pop_value(&mut self, arg_type: ArgType) -> MsgResult<ArgValue> {
         match arg_type {
+            ArgType::UInt8 => Ok(ArgValue::UInt8(self.pop_u8()?)),
             ArgType::UInt16 => Ok(ArgValue::UInt16(self.pop_u16()?)),
             ArgType::Int16 => Ok(ArgValue::Int16(self.pop_i16()?)),
             ArgType::UInt32 => Ok(ArgValue::UInt32(self.pop_u32()?)),
@@ -377,6 +450,35 @@ impl PayloadParser<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // Big-endian 7-bit varint u8 encoding roundtrip
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_push_pop_u8_roundtrip() {
+        let values = [0u8, 1, 127, 128, 255];
+        for &v in &values {
+            let mut payload = Payload::new();
+            payload.push_u8(v).unwrap();
+            let popped = payload.as_parser().pop_u8().unwrap();
+            assert_eq!(popped, v);
+        }
+    }
+
+    #[test]
+    fn test_push_pop_u8_boundary_7bit() {
+        // 7-bit boundary: 0-127 encode as 1 byte, 128+ needs 2 bytes
+        let mut payload = Payload::new();
+        payload.push_u8(127).unwrap();
+        assert_eq!(payload.len(), 1);
+        assert_eq!(payload.as_parser().pop_u8().unwrap(), 127);
+
+        let mut payload = Payload::new();
+        payload.push_u8(128).unwrap();
+        assert_eq!(payload.len(), 2);
+        assert_eq!(payload.as_parser().pop_u8().unwrap(), 128);
+    }
 
     // -----------------------------------------------------------------------
     // Big-endian 7-bit varint u16 encoding roundtrip
@@ -604,6 +706,7 @@ mod tests {
     fn test_push_pop_all_arg_values() {
         let mut payload = Payload::new();
 
+        payload.push_value(&ArgValue::UInt8(42)).unwrap();
         payload.push_value(&ArgValue::UInt16(1234)).unwrap();
         payload.push_value(&ArgValue::Int16(-567)).unwrap();
         payload.push_value(&ArgValue::UInt32(12345)).unwrap();
@@ -612,6 +715,7 @@ mod tests {
         payload.push_value(&ArgValue::Bytes(vec![1, 2, 3])).unwrap();
 
         let mut parser = payload.as_parser();
+        assert_eq!(parser.pop_value(ArgType::UInt8).unwrap(), ArgValue::UInt8(42));
         assert_eq!(parser.pop_value(ArgType::UInt16).unwrap(), ArgValue::UInt16(1234));
         assert_eq!(parser.pop_value(ArgType::Int16).unwrap(), ArgValue::Int16(-567));
         assert_eq!(parser.pop_value(ArgType::UInt32).unwrap(), ArgValue::UInt32(12345));
@@ -640,6 +744,24 @@ mod tests {
 
     #[test]
     fn test_try_convert_to_lossless_range_checks() {
+        // UInt8 widening conversions are always lossless.
+        assert_eq!(
+            ArgValue::UInt8(255).try_convert_to(ArgType::Int16).unwrap(),
+            ArgValue::Int16(255)
+        );
+        assert_eq!(
+            ArgValue::UInt8(100).try_convert_to(ArgType::UInt16).unwrap(),
+            ArgValue::UInt16(100)
+        );
+        assert_eq!(
+            ArgValue::UInt8(1).try_convert_to(ArgType::Int32).unwrap(),
+            ArgValue::Int32(1)
+        );
+        assert_eq!(
+            ArgValue::UInt8(255).try_convert_to(ArgType::UInt32).unwrap(),
+            ArgValue::UInt32(255)
+        );
+
         // In-range same-width conversions succeed.
         assert_eq!(
             ArgValue::Int16(100).try_convert_to(ArgType::UInt16).unwrap(),

@@ -842,7 +842,7 @@ mod tests {
         let mut parser = Parser::new(Arc::new(interface));
 
         // Register a command with a bytes param
-        let _ = parser.register(11, "TEST data=%c");
+        let _ = parser.register(11, "TEST data=%.*s");
 
         let params = vec![Param::Positional(ArgValue::Bytes(vec![0xDE, 0xAD, 0xBE, 0xEF]))];
         parser.send("TEST", &params).await.unwrap();
@@ -864,7 +864,7 @@ mod tests {
         let mut parser = Parser::new(Arc::new(interface));
 
         // Register a command with mixed types: uint32, string, bytes
-        let _ = parser.register(13, "CMD oid=%u label=%s raw=%c");
+        let _ = parser.register(13, "CMD oid=%u label=%s raw=%.*s");
 
         let params = vec![
             Param::Positional(ArgValue::UInt32(42)),

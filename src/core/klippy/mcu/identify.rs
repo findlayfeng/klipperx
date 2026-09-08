@@ -24,11 +24,11 @@
 //! # Example
 //!
 //! ```ignore
-//! use crate::core::klippy::mcu::identify::do_identify;
+//! use crate::core::klippy::mcu::identify::Identify;
 //! use tokio::time::Duration;
 //!
-//! let identify_data = do_identify(&mut parser, Duration::from_secs(10)).await?;
-//! println!("MCU version: {}", identify_data.version);
+//! let identify = Identify::fetch(&mut parser, Duration::from_secs(10)).await?;
+//! println!("MCU version: {}", identify.version);
 //! ```
 
 use flate2::read::ZlibDecoder;
@@ -66,7 +66,7 @@ const MAX_IDENTIFY_DATA_SIZE: usize = 1024 * 1024;
 /// enumeration mappings, compile-time configuration constants,
 /// and version information.
 #[derive(Debug, Clone, Default)]
-pub struct IdentifyData {
+pub struct Identify {
     /// Enum constant mappings (e.g., pin names → IDs, static strings → IDs).
     pub enumerations: serde_json::Value,
     /// MCU-received command format strings → command ID mappings.
@@ -118,7 +118,17 @@ impl std::fmt::Display for IdentifyError {
 
 impl std::error::Error for IdentifyError {}
 
-impl IdentifyData {
+/// Helper macro to extract a JSON field with a default fallback.
+macro_rules! json_field {
+    ($json:expr, $key:expr, $default:expr) => {
+        $json
+            .get($key)
+            .map(|v| v.clone())
+            .unwrap_or_else(|| $default.clone())
+    };
+}
+
+impl Identify {
     /// Get a specific command ID by its format string.
     pub fn get_command_id(&self, format: &str) -> Option<u32> {
         self.commands
@@ -157,205 +167,192 @@ impl IdentifyData {
             .map(|map| map.keys().cloned().collect())
             .unwrap_or_default()
     }
-}
 
-/// Helper macro to extract a JSON field with a default fallback.
-macro_rules! json_field {
-    ($json:expr, $key:expr, $default:expr) => {
-        $json
-            .get($key)
-            .map(|v| v.clone())
-            .unwrap_or_else(|| $default.clone())
-    };
-}
+    /// Performs the full identify exchange with the MCU.
+    ///
+    /// Sends identify requests and collects zlib-compressed response data until
+    /// the MCU signals completion. The collected data is decompressed and parsed
+    /// into an [`Identify`] struct.
+    ///
+    /// # Arguments
+    /// * `parser` - The message parser with identify request/response already registered.
+    /// * `timeout` - Maximum duration for the entire identify exchange.
+    ///
+    /// # Errors
+    /// Returns [`IdentifyError`] if:
+    /// - The exchange times out
+    /// - Zlib decompression fails
+    /// - JSON parsing fails
+    /// - The MCU responds unexpectedly
+    pub async fn fetch(parser: &mut Parser, timeout: Duration) -> Result<Self, IdentifyError> {
+        // Start the inbox to receive inbound messages
+        let mut inbox = parser.start_inbox().await.map_err(|e| IdentifyError {
+            kind: IdentifyErrorKind::Failed(format!("failed to start inbox: {e}")),
+        })?;
 
-/// Performs the full identify exchange with the MCU.
-///
-/// Sends identify requests and collects zlib-compressed response data until
-/// the MCU signals completion. The collected data is decompressed and parsed
-/// into an [`IdentifyData`] struct.
-///
-/// # Arguments
-/// * `parser` - The message parser with identify request/response already registered.
-/// * `timeout` - Maximum duration for the entire identify exchange.
-///
-/// # Errors
-/// Returns [`IdentifyError`] if:
-/// - The exchange times out
-/// - Zlib decompression fails
-/// - JSON parsing fails
-/// - The MCU responds unexpectedly
-pub async fn do_identify(
-    parser: &mut Parser,
-    timeout: Duration,
-) -> Result<IdentifyData, IdentifyError> {
-    // Start the inbox to receive inbound messages
-    let mut inbox = parser.start_inbox().await.map_err(|e| IdentifyError {
-        kind: IdentifyErrorKind::Failed(format!("failed to start inbox: {e}")),
-    })?;
+        let mut raw_data = Vec::new();
+        let mut offset: u32 = 0;
+        let mut chunks: u32 = 0;
 
-    let mut raw_data = Vec::new();
-    let mut offset: u32 = 0;
-    let mut chunks: u32 = 0;
+        loop {
+            chunks += 1;
+            if chunks > MAX_IDENTIFY_CHUNKS {
+                return Err(IdentifyError {
+                    kind: IdentifyErrorKind::Failed(format!(
+                        "exceeded maximum identify chunks ({MAX_IDENTIFY_CHUNKS})"
+                    )),
+                });
+            }
 
-    loop {
-        chunks += 1;
-        if chunks > MAX_IDENTIFY_CHUNKS {
-            return Err(IdentifyError {
-                kind: IdentifyErrorKind::Failed(format!(
-                    "exceeded maximum identify chunks ({MAX_IDENTIFY_CHUNKS})"
-                )),
-            });
-        }
+            // Send identify request
+            // Format: "identify offset=%u count=%c" — offset is u32, count is bytes (7-bit varint)
+            let request_params = vec![
+                Param::Positional(ArgValue::UInt32(offset)),
+                Param::Positional(ArgValue::UInt8(IDENTIFY_CHUNK_SIZE as u8)),
+            ];
 
-        // Send identify request
-        // Format: "identify offset=%u count=%c" — offset is u32, count is bytes (7-bit varint)
-        let request_params = vec![
-            Param::Positional(ArgValue::UInt32(offset)),
-            Param::Positional(ArgValue::UInt8(IDENTIFY_CHUNK_SIZE as u8)),
-        ];
+            // Send the request
+            tokio::time::timeout(timeout, parser.send("identify", &request_params))
+                .await
+                .map_err(|_| IdentifyError {
+                    kind: IdentifyErrorKind::Timeout,
+                })?
+                .map_err(|e| IdentifyError {
+                    kind: IdentifyErrorKind::Failed(format!("send identify request: {e}")),
+                })?;
 
-        // Send the request
-        tokio::time::timeout(timeout, parser.send("identify", &request_params))
+            // Wait for identify_response from inbox
+            let response_msg = tokio::time::timeout(
+                timeout,
+                inbox.recv(),
+            )
             .await
             .map_err(|_| IdentifyError {
                 kind: IdentifyErrorKind::Timeout,
             })?
-            .map_err(|e| IdentifyError {
-                kind: IdentifyErrorKind::Failed(format!("send identify request: {e}")),
+            .ok_or_else(|| IdentifyError {
+                kind: IdentifyErrorKind::Failed("inbox channel closed".to_string()),
             })?;
 
-        // Wait for identify_response from inbox
-        let response_msg = tokio::time::timeout(
-            timeout,
-            inbox.recv(),
-        )
-        .await
-        .map_err(|_| IdentifyError {
-            kind: IdentifyErrorKind::Timeout,
-        })?
-        .ok_or_else(|| IdentifyError {
-            kind: IdentifyErrorKind::Failed("inbox channel closed".to_string()),
+            // Verify it's the expected message
+            if response_msg.id != 0 {
+                return Err(IdentifyError {
+                    kind: IdentifyErrorKind::Failed(format!(
+                        "expected identify_response (id=0), got id={}",
+                        response_msg.id
+                    )),
+                });
+            }
+
+            let response_params = response_msg.params;
+
+            // Parse response: offset (u32) + data (bytes)
+            if response_params.len() < 2 {
+                return Err(IdentifyError {
+                    kind: IdentifyErrorKind::Failed(
+                        "identify_response: expected at least 2 parameters".to_string(),
+                    ),
+                });
+            }
+
+            let resp_offset = match &response_params[0] {
+                ArgValue::UInt32(v) => v,
+                _ => {
+                    return Err(IdentifyError {
+                        kind: IdentifyErrorKind::Failed(
+                            "identify_response: first param must be UInt32 (offset)".to_string(),
+                        ),
+                    });
+                }
+            };
+
+            let resp_data = match &response_params[1] {
+                ArgValue::Bytes(v) => v.clone(),
+                _ => {
+                    return Err(IdentifyError {
+                        kind: IdentifyErrorKind::Failed(
+                            "identify_response: second param must be Bytes (data)".to_string(),
+                        ),
+                    });
+                }
+            };
+
+            // Check if the response offset matches our expected offset
+            if *resp_offset != offset {
+                return Err(IdentifyError {
+                    kind: IdentifyErrorKind::Failed(format!(
+                        "identify_response: unexpected offset {resp_offset}, expected {offset}"
+                    )),
+                });
+            }
+
+            // Check total data size before appending (zip-bomb protection)
+            if raw_data.len() + resp_data.len() > MAX_IDENTIFY_DATA_SIZE {
+                return Err(IdentifyError {
+                    kind: IdentifyErrorKind::Failed(format!(
+                        "identify data exceeds maximum size ({} bytes)",
+                        MAX_IDENTIFY_DATA_SIZE
+                    )),
+                });
+            }
+
+            // Append data chunk
+            raw_data.extend_from_slice(&resp_data);
+
+            // If data is empty, the exchange is complete
+            if resp_data.is_empty() {
+                break;
+            }
+
+            // Advance offset
+            offset += resp_data.len() as u32;
+        }
+
+        // Decompress zlib data
+        let mut decoder = ZlibDecoder::new(&raw_data[..]);
+        let mut json_bytes = Vec::new();
+        decoder
+            .read_to_end(&mut json_bytes)
+            .map_err(|e| IdentifyError {
+                kind: IdentifyErrorKind::Decompress(e.to_string()),
+            })?;
+
+        // Parse JSON
+        let json_value: serde_json::Value = serde_json::from_slice(&json_bytes).map_err(|e| {
+            IdentifyError {
+                kind: IdentifyErrorKind::JsonParse(e.to_string()),
+            }
         })?;
 
-        // Verify it's the expected message
-        if response_msg.id != 0 {
-            return Err(IdentifyError {
-                kind: IdentifyErrorKind::Failed(format!(
-                    "expected identify_response (id=0), got id={}",
-                    response_msg.id
-                )),
-            });
-        }
-
-        let response_params = response_msg.params;
-
-        // Parse response: offset (u32) + data (bytes)
-        if response_params.len() < 2 {
-            return Err(IdentifyError {
-                kind: IdentifyErrorKind::Failed(
-                    "identify_response: expected at least 2 parameters".to_string(),
-                ),
-            });
-        }
-
-        let resp_offset = match &response_params[0] {
-            ArgValue::UInt32(v) => v,
-            _ => {
-                return Err(IdentifyError {
-                    kind: IdentifyErrorKind::Failed(
-                        "identify_response: first param must be UInt32 (offset)".to_string(),
-                    ),
-                });
-            }
-        };
-
-        let resp_data = match &response_params[1] {
-            ArgValue::Bytes(v) => v.clone(),
-            _ => {
-                return Err(IdentifyError {
-                    kind: IdentifyErrorKind::Failed(
-                        "identify_response: second param must be Bytes (data)".to_string(),
-                    ),
-                });
-            }
-        };
-
-        // Check if the response offset matches our expected offset
-        if *resp_offset != offset {
-            return Err(IdentifyError {
-                kind: IdentifyErrorKind::Failed(format!(
-                    "identify_response: unexpected offset {resp_offset}, expected {offset}"
-                )),
-            });
-        }
-
-        // Check total data size before appending (zip-bomb protection)
-        if raw_data.len() + resp_data.len() > MAX_IDENTIFY_DATA_SIZE {
-            return Err(IdentifyError {
-                kind: IdentifyErrorKind::Failed(format!(
-                    "identify data exceeds maximum size ({} bytes)",
-                    MAX_IDENTIFY_DATA_SIZE
-                )),
-            });
-        }
-
-        // Append data chunk
-        raw_data.extend_from_slice(&resp_data);
-
-        // If data is empty, the exchange is complete
-        if resp_data.is_empty() {
-            break;
-        }
-
-        // Advance offset
-        offset += resp_data.len() as u32;
+        // Convert to Identify
+        Ok(Identify {
+            enumerations: json_field!(json_value, "enumerations", serde_json::Value::Null),
+            commands: json_field!(json_value, "commands", serde_json::Value::Null),
+            responses: json_field!(json_value, "responses", serde_json::Value::Null),
+            output: json_field!(json_value, "output", serde_json::Value::Null),
+            config: json_field!(json_value, "config", serde_json::Value::Null),
+            version: json_value
+                .get("version")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            build_versions: json_value
+                .get("build_versions")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            app: json_value
+                .get("app")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            license: json_value
+                .get("license")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+        })
     }
-
-    // Decompress zlib data
-    let mut decoder = ZlibDecoder::new(&raw_data[..]);
-    let mut json_bytes = Vec::new();
-    decoder
-        .read_to_end(&mut json_bytes)
-        .map_err(|e| IdentifyError {
-            kind: IdentifyErrorKind::Decompress(e.to_string()),
-        })?;
-
-    // Parse JSON
-    let json_value: serde_json::Value = serde_json::from_slice(&json_bytes).map_err(|e| {
-        IdentifyError {
-            kind: IdentifyErrorKind::JsonParse(e.to_string()),
-        }
-    })?;
-
-    // Convert to IdentifyData
-    Ok(IdentifyData {
-        enumerations: json_field!(json_value, "enumerations", serde_json::Value::Null),
-        commands: json_field!(json_value, "commands", serde_json::Value::Null),
-        responses: json_field!(json_value, "responses", serde_json::Value::Null),
-        output: json_field!(json_value, "output", serde_json::Value::Null),
-        config: json_field!(json_value, "config", serde_json::Value::Null),
-        version: json_value
-            .get("version")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        build_versions: json_value
-            .get("build_versions")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        app: json_value
-            .get("app")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        license: json_value
-            .get("license")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-    })
 }
 
 // ===========================================================================
@@ -471,7 +468,7 @@ mod tests {
             parser.register(*id, fmt).unwrap();
         }
 
-        let result = do_identify(&mut parser, Duration::from_secs(10)).await;
+        let result = Identify::fetch(&mut parser, Duration::from_secs(10)).await;
         assert!(result.is_ok(), "identify failed: {:?}", result);
 
         let data = result.unwrap();
@@ -572,7 +569,7 @@ mod tests {
         for (id, fmt) in DEFAULT_MESSAGES {
             parser.register(*id, fmt).unwrap();
         }
-        let data = do_identify(&mut parser, Duration::from_secs(10)).await.unwrap();
+        let data = Identify::fetch(&mut parser, Duration::from_secs(10)).await.unwrap();
 
         assert_eq!(data.version, "");
         assert_eq!(data.app, "");
@@ -593,7 +590,7 @@ mod tests {
         let mut offset: u32 = 0;
         let mut resp_seq: u8 = 0;
 
-        // First chunk: do_identify always requests IDENTIFY_CHUNK_SIZE bytes;
+        // First chunk: Identify::fetch always requests IDENTIFY_CHUNK_SIZE bytes;
         // MCU returns all available data (zlib_data) in one response
         let request = build_identify_request_payload(offset, IDENTIFY_CHUNK_SIZE as u32);
         mappings.push(MappingEntry {
@@ -617,7 +614,7 @@ mod tests {
         }
 
         // This should succeed because we only have 2 chunks, not 1024
-        let result = do_identify(&mut parser, Duration::from_secs(10)).await;
+        let result = Identify::fetch(&mut parser, Duration::from_secs(10)).await;
         assert!(result.is_ok(), "identify failed: {:?}", result);
     }
 
@@ -710,7 +707,7 @@ mod tests {
             parser.register(*id, fmt).unwrap();
         }
 
-        let result = do_identify(&mut parser, Duration::from_secs(10)).await;
+        let result = Identify::fetch(&mut parser, Duration::from_secs(10)).await;
         assert!(result.is_err());
         assert!(format!("{:?}", result).contains("unexpected offset"));
     }
@@ -731,7 +728,7 @@ mod tests {
             parser.register(*id, fmt).unwrap();
         }
 
-        let result = do_identify(&mut parser, Duration::from_secs(5)).await;
+        let result = Identify::fetch(&mut parser, Duration::from_secs(5)).await;
         // The test library may not provide identify data, so we just check
         // that the call doesn't panic. In a real environment, this would
         // return the MCU identify data.

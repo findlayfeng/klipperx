@@ -1,7 +1,7 @@
 mod identify;
 mod restart_method;
 
-pub use identify::{do_identify, IdentifyData, IdentifyError, IdentifyErrorKind};
+pub use identify::{Identify, IdentifyError, IdentifyErrorKind};
 pub use restart_method::McuRestartMethod;
 
 use crate::core::klippy::config::mcu::McuConfig;

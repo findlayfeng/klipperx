@@ -677,11 +677,14 @@ mod tests {
         assert!(format!("{:?}", result).contains("unexpected offset"));
     }
 
+    /// Test identify protocol using the real LibInterface (host.rs).
+    ///
+    /// This test requires a real MCU connection and is ignored by default.
+    /// Run with `cargo test -- --ignored test_do_identify_with_host_interface`
+    /// when you have a connected MCU.
     #[tokio::test]
+    #[ignore]
     async fn test_do_identify_with_host_interface() {
-        // Test identify protocol using the real LibInterface (host.rs)
-        // The klipper host shared library is built by test-support build.rs
-        // before each test run
         use crate::core::klippy::interface::host::LibInterface;
 
         let lib_path = klipperx_test_support::klipper_host_lib_path();
@@ -693,18 +696,9 @@ mod tests {
             parser.register(*id, fmt).unwrap();
         }
 
-        let result = Identify::fetch(&mut parser, Duration::from_secs(5)).await;
-        // The test library may not provide identify data, so we just check
-        // that the call doesn't panic. In a real environment, this would
-        // return the MCU identify data.
-        match result {
-            Ok(data) => {
-                tracing::info!("identify success: version={}, app={}", data.version, data.app);
-            }
-            Err(e) => {
-                // Expected in test environment - the library may not provide identify data
-                tracing::warn!("identify failed (expected in test env): {:?}", e);
-            }
-        }
+        let data = Identify::fetch(&mut parser, Duration::from_secs(5))
+            .await
+            .expect("identify failed");
+        tracing::info!("identify success: version={}, app={}", data.version, data.app);
     }
 }

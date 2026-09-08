@@ -290,7 +290,7 @@ impl Parser {
             // Validate type — attempt conversion if types don't match
             if value.arg_type() != *expected_type {
                 if let Ok(converted) = value.try_convert_to(*expected_type) {
-                    tracing::warn!(
+                    tracing::debug!(
                         "param type conversion for '{}' param '{}': {:?} -> {:?}",
                         cmd_name,
                         param_name,
@@ -317,6 +317,14 @@ impl Parser {
         for value in final_params {
             payload.push_value(&value)?;
         }
+
+        tracing::debug!(
+            "[MSG] SEND {} (id={}) {} bytes: {}",
+            cmd_name,
+            cmd_id,
+            payload.len(),
+            hex::encode(payload.payload())
+        );
 
         // All outbound payloads go through the outbox task so that the send
         // order is preserved while small payloads may be coalesced into one.
@@ -512,6 +520,11 @@ impl Parser {
         loop {
             match interface.receive().await {
                 Ok(payload) => {
+                    tracing::debug!(
+                        "[INBOX] Received {} bytes: {}",
+                        payload.len(),
+                        hex::encode(payload.payload())
+                    );
                     if let Err(e) = Self::process_single(
                         &msgs,
                         &callback_queue,
@@ -576,6 +589,12 @@ impl Parser {
         let param_types: Vec<ArgType> = param_defs.iter().map(|(_, t)| *t).collect();
         let params: Vec<ArgValue> = parser.pop_values(&param_types)?;
 
+        // Log the parsed inbound message
+        tracing::debug!(
+            "[INBOX] Parsed cmd_id={} params={:?}",
+            cmd_id, params
+        );
+
         // 1. A pending send_and_wait() waiter takes precedence (FIFO).
         let waiter = {
             let mut guard = waiters.lock()
@@ -619,6 +638,11 @@ async fn send_and_ack(
     payload: Payload,
     acks: Vec<oneshot::Sender<MsgResult<()>>>,
 ) {
+    tracing::debug!(
+        "[OUTBOX] Sending {} bytes: {}",
+        payload.len(),
+        hex::encode(payload.payload())
+    );
     let result = match interface.send(&payload).await {
         Ok(()) => Ok(()),
         Err(e) => Err(MsgError::new(e.to_string())),

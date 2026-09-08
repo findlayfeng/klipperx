@@ -64,21 +64,9 @@ impl MsgBase {
                 .ok_or_else(|| MsgError::new(format!("invalid parameter format: {}", part)))?;
             let param_name = part[..eq].to_string();
             let typ = &part[eq + 1..];
-            let arg_type = match typ {
-                "%u" => ArgType::UInt32,
-                "%i" => ArgType::Int32,
-                "%hu" => ArgType::UInt16,
-                "%hi" => ArgType::Int16,
-                "%c" => ArgType::Bytes,
-                "%.*s" => ArgType::Bytes,
-                "%s" | "%*s" => ArgType::Str,
-                _ => {
-                    return Err(MsgError::new(format!(
-                        "unknown type specifier: {}",
-                        typ
-                    )))
-                }
-            };
+            let arg_type = ArgType::parse_format(typ).map_err(|_| {
+                MsgError::new(format!("unknown type specifier: {}", typ))
+            })?;
             params.push((param_name, arg_type));
         }
         Ok((name, Self { params }))
@@ -99,19 +87,11 @@ impl MsgBase {
     /// Note: `%*s` normalizes to `%s`, and `%.*s` normalizes to `%c` here,
     /// since [`ArgType`] does not distinguish between these variants.
     pub fn format(&self) -> String {
-        let mut parts = Vec::new();
-        for (name, atype) in &self.params {
-            let typ = match atype {
-                ArgType::UInt32 => "%u",
-                ArgType::Int32 => "%i",
-                ArgType::UInt16 => "%hu",
-                ArgType::Int16 => "%hi",
-                ArgType::Str => "%s",
-                ArgType::Bytes => "%c",
-            };
-            parts.push(format!("{}={}", name, typ));
-        }
-        parts.join(" ")
+        self.params
+            .iter()
+            .map(|(name, atype)| format!("{}={}", name, atype.format_str()))
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 }
 
@@ -264,7 +244,7 @@ mod tests {
         assert_eq!(cmd.params[2].1, ArgType::UInt16);
         assert_eq!(cmd.params[3].1, ArgType::Int16);
         assert_eq!(cmd.params[4].1, ArgType::Str);
-        assert_eq!(cmd.params[5].1, ArgType::Bytes);
+        assert_eq!(cmd.params[5].1, ArgType::UInt8);
         assert_eq!(cmd.params[6].1, ArgType::Str);
         assert_eq!(cmd.params[7].1, ArgType::Bytes);
     }
@@ -301,7 +281,7 @@ mod tests {
             ("f".to_string(), ArgType::Bytes),
         ];
         let cmd = MsgBase::new(params);
-        assert_eq!(cmd.format(), "a=%u b=%i c=%hu d=%hi e=%s f=%c");
+        assert_eq!(cmd.format(), "a=%u b=%i c=%hu d=%hi e=%s f=%.*s");
     }
 
     // -----------------------------------------------------------------------

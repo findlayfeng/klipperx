@@ -339,11 +339,11 @@ impl Parser {
     /// Synchronously drain the receive queue of messages that have a
     /// registered callback.
     ///
-    /// While the inbox is running (see [`Self::start_inbox`]), every inbound
-    /// message whose command was bound to a callback via [`Self::bind`] is
-    /// queued internally instead of being forwarded to the inbox channel.
-    /// This method returns all currently queued messages and removes them
-    /// from the queue.
+    /// While the inbox is running (started automatically via [`Self::ensure_inbox`]),
+    /// every inbound message whose command was bound to a callback via
+    /// [`Self::bind`] is queued internally instead of being forwarded to the
+    /// inbox channel. This method returns all currently queued messages and
+    /// removes them from the queue.
     ///
     /// The call is synchronous and never waits: it returns immediately with
     /// whatever is queued at the moment of the call (possibly an empty vec).
@@ -376,10 +376,10 @@ impl Parser {
     ///
     /// # Errors
     /// Returns `MsgError` if:
-    /// - The inbox was not started via [`Self::start_inbox`]
     /// - The send fails (same errors as [`Self::send`]); the waiter is removed
     /// - The timeout expires; the waiter is removed
     /// - The inbox task terminated before the message arrived
+    /// - The `wait_name` is not a registered message
     ///
     /// # Example
     /// ```ignore
@@ -394,11 +394,7 @@ impl Parser {
         wait_name: &str,
         timeout: Option<Duration>,
     ) -> MsgResult<Vec<ArgValue>> {
-        if self.inbound_tx.lock().await.is_none() {
-            return Err(MsgError::new(
-                "inbox not started: call start_inbox() first",
-            ));
-        }
+        self.ensure_inbox().await?;
 
         // Resolve wait_name → id so the waiter can be matched against the
         // inbound cmd_id without re-doing a name comparison for every payload.
@@ -479,18 +475,20 @@ impl Parser {
         cloned
     }
 
-    /// Start the inbound message receiver.
+    /// Lazily start the inbox task if not already running.
     ///
-    /// Spawns a background task that continuously receives payloads from the
-    /// interface, parses them into [`InboundMessage`]s, and enqueues them.
+    /// The inbox task continuously receives payloads from the interface,
+    /// parses them into [`InboundMessage`]s, and dispatches them to
+    /// callbacks and waiters.
     ///
-    /// Returns a [`tokio::sync::mpsc::Receiver`] for consuming the parsed
-    /// messages.
-    pub async fn start_inbox(&mut self) -> MsgResult<mpsc::Receiver<InboundMessage>> {
+    /// This method is automatically called by [`Self::send_and_wait`].
+    /// For tests that need to trigger inbox processing without `send_and_wait`,
+    /// call this method explicitly before sending messages.
+    pub async fn ensure_inbox(&self) -> MsgResult<()> {
         if self.inbound_tx.lock().await.is_some() {
-            return Err(MsgError::new("inbox already started"));
+            return Ok(());
         }
-        let (tx, rx) = mpsc::channel(64);
+        let (tx, _rx) = mpsc::channel(64);
         let interface = Arc::clone(&self.interface);
         let msgs = self.msgs.clone();
         let callback_queue = Arc::clone(&self.callback_queue);
@@ -500,7 +498,7 @@ impl Parser {
             Self::run_inbox(interface, msgs, callback_queue, waiters, tx_clone).await
         });
         *self.inbound_tx.lock().await = Some(tx);
-        Ok(rx)
+        Ok(())
     }
 
     /// Background task that continuously receives and parses inbound messages.
@@ -1345,7 +1343,8 @@ mod tests {
         let _ = parser.register(31, "temp_report value=%u");
         parser.bind("temp_report", |_values| {}).unwrap();
 
-        let mut rx = parser.start_inbox().await.unwrap();
+        // Ensure inbox is running for callback processing.
+        parser.ensure_inbox().await.unwrap();
 
         // Trigger the two inbound frames.
         parser.send("M105", &[]).await.unwrap();
@@ -1356,20 +1355,8 @@ mod tests {
         assert_eq!(msgs[0].id, 31);
         assert_eq!(msgs[0].params, vec![ArgValue::UInt32(250)]);
 
-        // The unbound message is forwarded to the inbox channel.
-        let forwarded = tokio::time::timeout(Duration::from_secs(1), rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(forwarded.id, 99);
-        assert_eq!(
-            forwarded.params,
-            vec![ArgValue::UInt32(4), ArgValue::Bytes(b"abcd".to_vec())]
-        );
-
-        // Nothing else was queued or forwarded.
+        // Nothing else was queued.
         assert!(parser.take_callback_msgs().unwrap().is_empty());
-        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -1389,8 +1376,6 @@ mod tests {
         let mut parser = Parser::new(Arc::new(interface));
         register_m105_cmd(&mut parser);
         let _ = parser.register(32, "temperature value=%u");
-
-        let _rx = parser.start_inbox().await.unwrap();
 
         let params = parser
             .send_and_wait("M105", &[], "temperature", Some(Duration::from_secs(1)))
@@ -1423,8 +1408,6 @@ mod tests {
         let _ = parser.register(32, "temperature value=%u");
         parser.bind("temperature", |_values| {}).unwrap();
 
-        let _rx = parser.start_inbox().await.unwrap();
-
         let params = parser
             .send_and_wait("M105", &[], "temperature", Some(Duration::from_secs(1)))
             .await
@@ -1447,8 +1430,6 @@ mod tests {
         register_m105_cmd(&mut parser);
         let _ = parser.register(32, "temperature value=%u");
 
-        let _rx = parser.start_inbox().await.unwrap();
-
         let result = parser
             .send_and_wait("M105", &[], "temperature", Some(Duration::from_millis(100)))
             .await;
@@ -1460,19 +1441,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_send_and_wait_inbox_not_started() {
-        let interface = TestInterface::new(vec![]);
-        let mut parser = Parser::new(Arc::new(interface));
-        register_m105_cmd(&mut parser);
-
-        let result = parser
-            .send_and_wait("M105", &[], "temperature", Some(Duration::from_millis(50)))
-            .await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().msg.contains("inbox not started"));
-    }
-
-    #[tokio::test]
     async fn test_send_and_wait_send_failure_removes_waiter() {
         // The send fails because the command is unknown; the registered
         // waiter must not linger.
@@ -1480,7 +1448,6 @@ mod tests {
         let mut parser = Parser::new(Arc::new(interface));
         // Register a test response so send_and_wait can resolve the wait target
         parser.register(99, "test_response value=%u").unwrap();
-        let _rx = parser.start_inbox().await.unwrap();
 
         // Use "test_response" (id=99) — registered above.
         // The send fails with "Unknown command" (UNKNOWN cmd), not the wait lookup.

@@ -22,7 +22,7 @@
 
 use crate::core::klippy::error::KlippyError;
 use crate::core::klippy::traits::{InterfaceEvent, KlippyInterface};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use libloading::{Library, Symbol};
 use std::collections::HashMap;
@@ -286,6 +286,11 @@ pub fn klipper_shutdown() {
 /// Returns the number of bytes consumed (always len on success).
 pub fn klipper_input(data: &[u8]) -> usize {
     if klipper_is_loaded() {
+        debug!(
+            "[KLIPPER] INPUT {} bytes: {}",
+            data.len(),
+            hex::encode(&data[..data.len().min(200)])
+        );
         unsafe {
             if let Some(input_fn) = &KLIPPER_INPUT_FN {
                 input_fn(data.as_ptr(), data.len()) as usize
@@ -308,7 +313,15 @@ pub fn klipper_output(buf: &mut [u8]) -> usize {
     if klipper_is_loaded() {
         unsafe {
             if let Some(output_fn) = &KLIPPER_OUTPUT_FN {
-                output_fn(buf.as_mut_ptr(), buf.len())
+                let len = output_fn(buf.as_mut_ptr(), buf.len());
+                if len > 0 {
+                    debug!(
+                        "[KLIPPER] OUTPUT {} bytes: {}",
+                        len,
+                        hex::encode(&buf[..len.min(200)])
+                    );
+                }
+                len
             } else {
                 0
             }

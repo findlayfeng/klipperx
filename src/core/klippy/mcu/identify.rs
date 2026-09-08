@@ -35,8 +35,8 @@ use flate2::read::ZlibDecoder;
 use std::io::Read;
 use tokio::time::Duration;
 
-use crate::core::klippy::msg::parser::Parser;
 use crate::core::klippy::msg::param::Param;
+use crate::core::klippy::msg::parser::Parser;
 use crate::core::klippy::msg::proto::ArgValue;
 
 /// Default Klipper message formats for identify request/response.
@@ -47,10 +47,6 @@ pub const DEFAULT_MESSAGES: &[(u8, &str)] = &[
     (0, "identify_response offset=%u data=%.*s"),
     (1, "identify offset=%u count=%c"),
 ];
-
-/// Maximum number of chunks allowed during identify exchange.
-/// Prevents infinite loops in case of corrupted MCU responses.
-const MAX_IDENTIFY_CHUNKS: u32 = 1024;
 
 /// Size of each identify data chunk (bytes).
 const IDENTIFY_CHUNK_SIZE: u32 = 40;
@@ -185,66 +181,38 @@ impl Identify {
     /// - JSON parsing fails
     /// - The MCU responds unexpectedly
     pub async fn fetch(parser: &mut Parser, timeout: Duration) -> Result<Self, IdentifyError> {
-        // Start the inbox to receive inbound messages
-        let mut inbox = parser.start_inbox().await.map_err(|e| IdentifyError {
+        // Start inbox for send_and_wait to work
+        parser.start_inbox().await.map_err(|e| IdentifyError {
             kind: IdentifyErrorKind::Failed(format!("failed to start inbox: {e}")),
         })?;
 
         let mut raw_data = Vec::new();
         let mut offset: u32 = 0;
-        let mut chunks: u32 = 0;
 
         loop {
-            chunks += 1;
-            if chunks > MAX_IDENTIFY_CHUNKS {
-                return Err(IdentifyError {
-                    kind: IdentifyErrorKind::Failed(format!(
-                        "exceeded maximum identify chunks ({MAX_IDENTIFY_CHUNKS})"
-                    )),
-                });
-            }
-
-            // Send identify request
-            // Format: "identify offset=%u count=%c" — offset is u32, count is bytes (7-bit varint)
+            // Send identify request: "identify offset=%u count=%c"
             let request_params = vec![
                 Param::Positional(ArgValue::UInt32(offset)),
                 Param::Positional(ArgValue::UInt8(IDENTIFY_CHUNK_SIZE as u8)),
             ];
 
-            // Send the request
-            tokio::time::timeout(timeout, parser.send("identify", &request_params))
-                .await
-                .map_err(|_| IdentifyError {
-                    kind: IdentifyErrorKind::Timeout,
-                })?
-                .map_err(|e| IdentifyError {
-                    kind: IdentifyErrorKind::Failed(format!("send identify request: {e}")),
-                })?;
-
-            // Wait for identify_response from inbox
-            let response_msg = tokio::time::timeout(
+            // Send request and wait for identify_response
+            let response_params = tokio::time::timeout(
                 timeout,
-                inbox.recv(),
+                parser.send_and_wait(
+                    "identify",
+                    &request_params,
+                    "identify_response",
+                    None,
+                ),
             )
             .await
             .map_err(|_| IdentifyError {
                 kind: IdentifyErrorKind::Timeout,
             })?
-            .ok_or_else(|| IdentifyError {
-                kind: IdentifyErrorKind::Failed("inbox channel closed".to_string()),
+            .map_err(|e| IdentifyError {
+                kind: IdentifyErrorKind::Failed(format!("identify request failed: {e}")),
             })?;
-
-            // Verify it's the expected message
-            if response_msg.id != 0 {
-                return Err(IdentifyError {
-                    kind: IdentifyErrorKind::Failed(format!(
-                        "expected identify_response (id=0), got id={}",
-                        response_msg.id
-                    )),
-                });
-            }
-
-            let response_params = response_msg.params;
 
             // Parse response: offset (u32) + data (bytes)
             if response_params.len() < 2 {

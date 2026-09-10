@@ -50,11 +50,10 @@ pub struct StateMessage {
     pub category: PrinterState,
 }
 
-/// Interface event types for KlippyInterface event system.
+/// Interface event types for the interface event system.
 ///
-/// This is a generic event type used by the `KlippyInterface` trait
-/// for its event handler registration. It is separate from `PrinterEvent`
-/// which is Klipper-specific.
+/// This is a generic event type used for event handler registration.
+/// It is separate from `PrinterEvent` which is Klipper-specific.
 ///
 /// Currently only supports a single default event. Additional variants
 /// can be added as needed.
@@ -192,7 +191,7 @@ pub trait PrinterObject: Send + Sync {
 }
 
 
-/// Error type for KlippyInterface receive operations.
+/// Error type for interface receive operations.
 ///
 /// Represents various failure modes that can occur when receiving
 /// data from a Klipper device.
@@ -205,6 +204,7 @@ pub enum InterfaceError {
     /// Invalid or malformed data received
     InvalidData,
     /// Generic error with an optional message
+    SendError(String),
     Other(String),
 }
 
@@ -214,6 +214,7 @@ impl std::fmt::Display for InterfaceError {
             InterfaceError::ConnectionLost => write!(f, "Connection lost"),
             InterfaceError::Timeout => write!(f, "Receive timeout"),
             InterfaceError::InvalidData => write!(f, "Invalid data received"),
+            InterfaceError::SendError(msg) => write!(f, "Send error: {}", msg),
             InterfaceError::Other(msg) => write!(f, "{}", msg),
         }
     }
@@ -225,46 +226,5 @@ impl std::error::Error for InterfaceError {}
 /// Uses the big-endian 7-bit varint-encoded payload from msg/proto.rs.
 pub use super::msg::proto::Payload;
 
-/// Abstract interface for Klipper device communication
-///
-/// This trait defines the core communication interface for interacting
-/// with a Klipper printer. It uses an event-driven architecture with
-/// async command sending.
-#[async_trait::async_trait]
-pub trait KlippyInterface: Send + Sync + Clone {
-    /// Send a payload asynchronously.
-    ///
-    /// # Arguments
-    /// * `payload` - The raw payload bytes to send.
-    ///
-    /// # Returns
-    /// `Ok(())` on success, or an error if the send failed.
-    ///
-    /// # Example
-    /// ```ignore
-    /// interface.send(payload).await?;
-    /// ```
-    async fn send(&self, payload: &Payload) -> Result<(), KlippyError>;
-
-    /// Receive a payload asynchronously.
-    ///
-    /// # Returns
-    /// `Ok(Payload)` containing the received data on success,
-    /// or an `InterfaceError` if the receive operation failed.
-    ///
-    /// # Example
-    /// ```ignore
-    /// match interface.receive().await {
-    ///     Ok(payload) => {
-    ///         println!("Received {} bytes", payload.len());
-    ///     }
-    ///     Err(InterfaceError::Timeout) => {
-    ///         println!("Receive timed out");
-    ///     }
-    ///     Err(e) => {
-    ///         println!("Receive error: {}", e);
-    ///     }
-    /// }
-    /// ```
-    async fn receive(&self) -> Result<Payload, InterfaceError>;
-}
+/// Re-export the abstract communication interface from the `interface` module.
+pub use super::interface::Interface;

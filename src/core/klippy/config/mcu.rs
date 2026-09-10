@@ -1,4 +1,5 @@
 use crate::core::klippy::mcu::McuRestartMethod;
+use crate::core::klippy::interface::Interface;
 use super::section::ConfigSection;
 
 /// MCU (Microcontroller Unit) configuration parsed from config file.
@@ -8,14 +9,7 @@ pub struct McuConfig {
     /// MCU restart method
     pub restart_method: McuRestartMethod,
     /// MCU interface for communication
-    pub interface: McuInterface,
-}
-
-/// MCU interface kind — determines which concrete interface type is used.
-pub enum McuInterface {
-    /// Test interface for deterministic testing (only available in test builds).
-    #[cfg(test)]
-    Test(crate::core::klippy::interface::test::TestInterface),
+    pub interface: Interface,
 }
 
 impl McuConfig {
@@ -61,14 +55,13 @@ impl McuConfig {
 
     /// Create the appropriate interface based on section content.
     #[allow(dead_code, unused_variables)]
-    fn create_interface(section: &ConfigSection) -> Result<McuInterface, String> {
+    fn create_interface(section: &ConfigSection) -> Result<Interface, String> {
         // Check for test configuration (only available in test builds)
         #[cfg(test)]
         if section.get("test").is_some() {
             let test_value = section.get("test").unwrap();
             let mappings = Self::parse_test_config(test_value)?;
-            let interface = crate::core::klippy::interface::test::TestInterface::new(mappings);
-            return Ok(McuInterface::Test(interface));
+            return Ok(Interface::test_new(mappings));
         }
 
         Err("no supported interface configuration found (test, serial, canbus, ...)".to_string())
@@ -137,6 +130,7 @@ fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::klippy::interface::InterfaceDevice;
 
     #[test]
     fn test_parse_mcu_config_no_test() {
@@ -168,7 +162,7 @@ test:
         let mcu_config = McuConfig::from_section(mcu_section).unwrap();
         assert_eq!(mcu_config.name, "");
         assert_eq!(mcu_config.restart_method, McuRestartMethod::Arduino);
-        assert!(matches!(mcu_config.interface, McuInterface::Test(_)));
+        assert!(matches!(*mcu_config.interface.device.lock().unwrap(), InterfaceDevice::Test(_)));
     }
 
     #[test]
@@ -186,7 +180,7 @@ test: 01 02 03
         let mcu_config = McuConfig::from_section(mcu_section).unwrap();
         assert_eq!(mcu_config.name, "");
         assert_eq!(mcu_config.restart_method, McuRestartMethod::Arduino);
-        assert!(matches!(mcu_config.interface, McuInterface::Test(_)));
+        assert!(matches!(*mcu_config.interface.device.lock().unwrap(), InterfaceDevice::Test(_)));
     }
 
     #[test]
@@ -204,7 +198,7 @@ test:
         let mcu_section = config.get_section("mcu zboard").unwrap();
         let mcu_config = McuConfig::from_section(mcu_section).unwrap();
         assert_eq!(mcu_config.name, "zboard");
-        assert!(matches!(mcu_config.interface, McuInterface::Test(_)));
+        assert!(matches!(*mcu_config.interface.device.lock().unwrap(), InterfaceDevice::Test(_)));
     }
 
     #[test]
@@ -222,7 +216,7 @@ test:
         let mcu_section = config.get_section("mcu").unwrap();
         let mcu_config = McuConfig::from_section(mcu_section).unwrap();
         assert_eq!(mcu_config.restart_method, McuRestartMethod::Command);
-        assert!(matches!(mcu_config.interface, McuInterface::Test(_)));
+        assert!(matches!(*mcu_config.interface.device.lock().unwrap(), InterfaceDevice::Test(_)));
     }
 
     #[test]
@@ -239,6 +233,6 @@ test:
         let mcu_section = config.get_section("mcu").unwrap();
         let mcu_config = McuConfig::from_section(mcu_section).unwrap();
         assert_eq!(mcu_config.restart_method, McuRestartMethod::Arduino);
-        assert!(matches!(mcu_config.interface, McuInterface::Test(_)));
+        assert!(matches!(*mcu_config.interface.device.lock().unwrap(), InterfaceDevice::Test(_)));
     }
 }

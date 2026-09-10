@@ -39,8 +39,6 @@ use std::io::Read;
 use tokio::time::Duration;
 
 #[cfg(test)]
-use crate::core::klippy::interface::test::TestInterface;
-#[cfg(test)]
 use crate::core::klippy::msg::parser::Parser;
 #[cfg(test)]
 use crate::core::klippy::msg::param::Param;
@@ -193,7 +191,7 @@ impl Identify {
     /// - JSON parsing fails
     /// - The MCU responds unexpectedly
     #[cfg(test)]
-    pub async fn fetch(parser: &mut Parser<TestInterface>, timeout: Duration) -> Result<Self, IdentifyError> {
+    pub async fn fetch(parser: &mut Parser, timeout: Duration) -> Result<Self, IdentifyError> {
         let mut raw_data = Vec::new();
         let mut offset: u32 = 0;
 
@@ -339,7 +337,8 @@ impl Identify {
 mod tests {
     use super::*;
     use crate::core::klippy::frame::Frame;
-    use crate::core::klippy::interface::test::{TestInterface, MappingEntry};
+    use crate::core::klippy::interface::test::{TestDevice, MappingEntry};
+    use crate::core::klippy::interface::Interface;
     use crate::core::klippy::msg::proto::Payload;
     use flate2::write::ZlibEncoder;
     use flate2::Compression;
@@ -411,7 +410,7 @@ mod tests {
             .collect();
 
         // Build test mappings: each request → response
-        // Input seq numbers are auto-incremented by TestInterface (0, 1, 2, ...)
+        // Input seq numbers are auto-incremented by TestDevice (0, 1, 2, ...)
         // Output seq numbers must match the expected receive sequence (0, 1, 2, ...)
         let mut mappings = Vec::new();
         let mut expected_offset: u32 = 0;
@@ -437,7 +436,7 @@ mod tests {
             outputs: vec![Frame::new(response_seq, response_payload.into_raw())],
         });
 
-        let interface = TestInterface::new(mappings);
+        let interface = Interface::test_new(mappings);
         let mut parser = Parser::new(interface);
         for (id, fmt) in DEFAULT_MESSAGES {
             parser.register(*id, fmt).unwrap();
@@ -539,7 +538,7 @@ mod tests {
             outputs: vec![Frame::new(resp_seq, build_response_payload(offset, &[]).into_raw())],
         });
 
-        let interface = TestInterface::new(mappings);
+        let interface = Interface::test_new(mappings);
         let mut parser = Parser::new(interface);
         for (id, fmt) in DEFAULT_MESSAGES {
             parser.register(*id, fmt).unwrap();
@@ -582,7 +581,7 @@ mod tests {
             outputs: vec![Frame::new(resp_seq, build_response_payload(offset, &[]).into_raw())],
         });
 
-        let interface = TestInterface::new(mappings);
+        let interface = Interface::test_new(mappings);
         let mut parser = Parser::new(interface);
         for (id, fmt) in DEFAULT_MESSAGES {
             parser.register(*id, fmt).unwrap();
@@ -616,7 +615,7 @@ mod tests {
         assert_eq!(format!("{err}"), "identify failed: mcu error");
     }
 
-    /// Simple test to verify TestInterface + Parser + inbox flow works
+    /// Simple test to verify TestDevice + Parser + inbox flow works
     #[tokio::test]
     async fn test_inbox_receive_simple() {
         let mapping = vec![
@@ -633,7 +632,7 @@ mod tests {
                 )],
             },
         ];
-        let interface = TestInterface::new(mapping);
+        let interface = Interface::test_new(mapping);
         let mut parser = Parser::new(interface);
         for (id, fmt) in DEFAULT_MESSAGES {
             parser.register(*id, fmt).unwrap();
@@ -678,7 +677,7 @@ mod tests {
             )],
         });
 
-        let interface = TestInterface::new(mappings);
+        let interface = Interface::test_new(mappings);
         let mut parser = Parser::new(interface);
         for (id, fmt) in DEFAULT_MESSAGES {
             parser.register(*id, fmt).unwrap();
@@ -706,7 +705,7 @@ mod tests {
     //     let interface = LibInterface::new();
     //     interface.init(&lib_path).expect("Failed to initialize LibInterface");
     //
-    //     let mut parser = Parser::new(interface);
+    //     let mut parser = Parser::new(Interface::Test(interface));
     //     for (id, fmt) in DEFAULT_MESSAGES {
     //         parser.register(*id, fmt).unwrap();
     //     }

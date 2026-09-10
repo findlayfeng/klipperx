@@ -5,7 +5,7 @@ pub use identify::{Identify, IdentifyError, IdentifyErrorKind};
 pub use restart_method::McuRestartMethod;
 
 #[cfg(test)]
-use crate::core::klippy::config::mcu::{McuConfig, McuInterface};
+use crate::core::klippy::config::mcu::McuConfig;
 #[cfg(test)]
 use crate::core::klippy::msg::parser::Parser;
 
@@ -17,7 +17,7 @@ pub struct Mcu {
     /// MCU name
     pub name: String,
     /// Message parser for communication
-    pub parser: Parser<crate::core::klippy::interface::test::TestInterface>,
+    pub parser: Parser,
 }
 
 #[cfg(test)]
@@ -27,11 +27,7 @@ impl Mcu {
     /// The interface is already stored in the `McuConfig`. A `Parser` is created
     /// from the interface, and the default identify messages are registered.
     pub fn from_config(config: McuConfig) -> Result<Self, String> {
-        let interface = match config.interface {
-            McuInterface::Test(interface) => interface,
-        };
-
-        let mut parser = Parser::new(interface);
+        let mut parser = Parser::new(config.interface);
         for (id, format_str) in identify::DEFAULT_MESSAGES {
             parser
                 .register(*id, format_str)

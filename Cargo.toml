@@ -25,6 +25,7 @@ serde = { version = "1", features = ["derive"] }
 flate2 = "1"
 libc = "0.2"
 libloading = "0.8"
+crossbeam-channel = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tokio = { version = "1", features = ["full"] }

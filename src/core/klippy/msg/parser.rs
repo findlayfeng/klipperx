@@ -34,9 +34,9 @@ pub struct Msg {
     command: MsgEntry,
 }
 
-pub struct Parser {
+pub struct Parser<I: KlippyInterface> {
     msgs: MsgRegistry,
-    interface: Arc<dyn KlippyInterface>,
+    interface: I,
     /// Serializes outbound traffic and performs payload coalescing.
     outbox: AsyncMutex<Option<mpsc::Sender<OutItem>>>,
     /// Sender for inbound messages (set when inbox is started).
@@ -70,9 +70,9 @@ struct PendingWaiter {
 /// Monotonic counter assigning a unique id to every pending waiter.
 static NEXT_WAITER_ID: AtomicU64 = AtomicU64::new(0);
 
-impl Parser {
+impl<I: KlippyInterface + 'static> Parser<I> {
     /// Create a new parser and register default message formats.
-    pub fn new(interface: Arc<dyn KlippyInterface>) -> Self {
+    pub fn new(interface: I) -> Self {
         let msgs: MsgRegistry = Arc::new(Mutex::new(MultiIndexMsgMap::default()));
         let parser = Self {
             msgs,
@@ -476,7 +476,7 @@ impl Parser {
             return sender.clone();
         }
         let (sender, receiver) = mpsc::channel::<OutItem>(64);
-        let interface = Arc::clone(&self.interface);
+        let interface = self.interface.clone();
         tokio::spawn(async move { run_sender(interface, receiver).await });
         let cloned = sender.clone();
         *guard = Some(sender);
@@ -497,7 +497,7 @@ impl Parser {
             return Ok(());
         }
         let (tx, _rx) = mpsc::channel(64);
-        let interface = Arc::clone(&self.interface);
+        let interface = self.interface.clone();
         let msgs = self.msgs.clone();
         let callback_queue = Arc::clone(&self.callback_queue);
         let waiters = Arc::clone(&self.waiters);
@@ -511,7 +511,7 @@ impl Parser {
 
     /// Background task that continuously receives and parses inbound messages.
     async fn run_inbox(
-        interface: Arc<dyn KlippyInterface>,
+        interface: I,
         msgs: MsgRegistry,
         callback_queue: Arc<Mutex<VecDeque<InboundMessage>>>,
         waiters: Arc<Mutex<Vec<PendingWaiter>>>,
@@ -633,8 +633,8 @@ struct OutItem {
 }
 
 /// Send `payload` through `interface` and resolve every `ack` with the result.
-async fn send_and_ack(
-    interface: &Arc<dyn KlippyInterface>,
+async fn send_and_ack<I: KlippyInterface>(
+    interface: &I,
     payload: Payload,
     acks: Vec<oneshot::Sender<MsgResult<()>>>,
 ) {
@@ -664,7 +664,7 @@ async fn send_and_ack(
 ///
 /// If a merge fails, the pending batch is flushed. If the new payload is large
 /// (≥ threshold) it is sent immediately; otherwise it opens a fresh window.
-async fn run_sender(interface: Arc<dyn KlippyInterface>, mut rx: mpsc::Receiver<OutItem>) {
+async fn run_sender<I: KlippyInterface>(interface: I, mut rx: mpsc::Receiver<OutItem>) {
     while let Some(OutItem { payload, ack }) = rx.recv().await {
         // Large payloads are sent immediately without coalescing.
         if payload.len() >= SEND_COALESCE_THRESHOLD {
@@ -736,12 +736,12 @@ mod tests {
         p
     }
 
-    fn register_g1_cmd(parser: &mut Parser) {
+    fn register_g1_cmd<I: KlippyInterface + 'static>(parser: &mut Parser<I>) {
         // Register "G1 X=%u Y=%u" with id=3
         let _ = parser.register(3, "G1 X=%u Y=%u");
     }
 
-    fn register_m105_cmd(parser: &mut Parser) {
+    fn register_m105_cmd<I: KlippyInterface + 'static>(parser: &mut Parser<I>) {
         // Register "M105" with no params
         let _ = parser.register(5, "M105");
     }
@@ -754,7 +754,7 @@ mod tests {
             outputs: vec![],
         }];
         let interface = TestInterface::new(mapping);
-        let mut parser = Parser::new(Arc::new(interface));
+        let mut parser = Parser::new(interface);
         register_g1_cmd(&mut parser);
 
         let params = vec![
@@ -771,7 +771,7 @@ mod tests {
             outputs: vec![],
         }];
         let interface = TestInterface::new(mapping);
-        let parser = Parser::new(Arc::new(interface));
+        let parser = Parser::new(interface);
 
         let params = vec![Param::Positional(ArgValue::UInt32(1))];
         let result = parser.send("UNKNOWN_CMD", &params).await;
@@ -786,7 +786,7 @@ mod tests {
             outputs: vec![],
         }];
         let interface = TestInterface::new(mapping);
-        let mut parser = Parser::new(Arc::new(interface));
+        let mut parser = Parser::new(interface);
         register_g1_cmd(&mut parser);
 
         // G1 expects 2 params, send only 1
@@ -803,7 +803,7 @@ mod tests {
             outputs: vec![],
         }];
         let interface = TestInterface::new(mapping);
-        let mut parser = Parser::new(Arc::new(interface));
+        let mut parser = Parser::new(interface);
 
         // Register a command with a string param
         let _ = parser.register(7, "CMD label=%s");
@@ -825,7 +825,7 @@ mod tests {
             outputs: vec![],
         }];
         let interface = TestInterface::new(mapping);
-        let mut parser = Parser::new(Arc::new(interface));
+        let mut parser = Parser::new(interface);
         register_m105_cmd(&mut parser);
 
         let params: Vec<Param> = vec![];
@@ -842,7 +842,7 @@ mod tests {
             outputs: vec![],
         }];
         let interface = TestInterface::new(mapping);
-        let mut parser = Parser::new(Arc::new(interface));
+        let mut parser = Parser::new(interface);
 
         // Register a command with a string param
         let _ = parser.register(9, "TEST name=%s");
@@ -861,7 +861,7 @@ mod tests {
             outputs: vec![],
         }];
         let interface = TestInterface::new(mapping);
-        let mut parser = Parser::new(Arc::new(interface));
+        let mut parser = Parser::new(interface);
 
         // Register a command with a bytes param
         let _ = parser.register(11, "TEST data=%.*s");
@@ -883,7 +883,7 @@ mod tests {
             outputs: vec![],
         }];
         let interface = TestInterface::new(mapping);
-        let mut parser = Parser::new(Arc::new(interface));
+        let mut parser = Parser::new(interface);
 
         // Register a command with mixed types: uint32, string, bytes
         let _ = parser.register(13, "CMD oid=%u label=%s raw=%.*s");
@@ -908,7 +908,7 @@ mod tests {
             outputs: vec![],
         }];
         let interface = TestInterface::new(mapping);
-        let mut parser = Parser::new(Arc::new(interface));
+        let mut parser = Parser::new(interface);
         register_g1_cmd(&mut parser);
 
         // Named params in reverse order (Y before X)
@@ -931,7 +931,7 @@ mod tests {
             outputs: vec![],
         }];
         let interface = TestInterface::new(mapping);
-        let mut parser = Parser::new(Arc::new(interface));
+        let mut parser = Parser::new(interface);
         register_g1_cmd(&mut parser);
 
         // X as positional, Y as named
@@ -949,7 +949,7 @@ mod tests {
             outputs: vec![],
         }];
         let interface = TestInterface::new(mapping);
-        let mut parser = Parser::new(Arc::new(interface));
+        let mut parser = Parser::new(interface);
         register_g1_cmd(&mut parser);
 
         // Use unknown param name
@@ -968,7 +968,7 @@ mod tests {
             outputs: vec![],
         }];
         let interface = TestInterface::new(mapping);
-        let mut parser = Parser::new(Arc::new(interface));
+        let mut parser = Parser::new(interface);
         register_g1_cmd(&mut parser);
 
         let params = vec![
@@ -988,7 +988,7 @@ mod tests {
             outputs: vec![],
         }];
         let interface = TestInterface::new(mapping);
-        let mut parser = Parser::new(Arc::new(interface));
+        let mut parser = Parser::new(interface);
         register_g1_cmd(&mut parser);
 
         // Positional params must come before named params.
@@ -1009,7 +1009,7 @@ mod tests {
             outputs: vec![],
         }];
         let interface = TestInterface::new(mapping);
-        let mut parser = Parser::new(Arc::new(interface));
+        let mut parser = Parser::new(interface);
         register_g1_cmd(&mut parser);
 
         let params = vec![
@@ -1029,7 +1029,7 @@ mod tests {
             outputs: vec![],
         }];
         let interface = TestInterface::new(mapping);
-        let mut parser = Parser::new(Arc::new(interface));
+        let mut parser = Parser::new(interface);
         register_g1_cmd(&mut parser);
 
         let params = vec![
@@ -1056,7 +1056,7 @@ mod tests {
             outputs: vec![],
         }];
         let interface = TestInterface::new(mapping);
-        let mut parser = Parser::new(Arc::new(interface));
+        let mut parser = Parser::new(interface);
 
         let _ = parser.register(23, "CMD val=%i");
 
@@ -1075,7 +1075,7 @@ mod tests {
             outputs: vec![],
         }];
         let interface = TestInterface::new(mapping);
-        let mut parser = Parser::new(Arc::new(interface));
+        let mut parser = Parser::new(interface);
 
         let _ = parser.register(25, "CMD val=%u");
 
@@ -1091,7 +1091,7 @@ mod tests {
         // Two waiters share the same message name; removing one by id must
         // leave the other untouched.
         let interface = TestInterface::new(vec![]);
-        let parser = Parser::new(Arc::new(interface));
+        let parser = Parser::new(interface);
 
         let (tx1, _rx1) = oneshot::channel();
         let (tx2, _rx2) = oneshot::channel();
@@ -1123,7 +1123,7 @@ mod tests {
             outputs: vec![],
         }];
         let interface = TestInterface::new(mapping);
-        let mut parser = Parser::new(Arc::new(interface));
+        let mut parser = Parser::new(interface);
         register_g1_cmd(&mut parser);
 
         // G1 expects 2 params, send 3 positional
@@ -1154,7 +1154,7 @@ mod tests {
             },
         ];
         let interface = TestInterface::new(mapping);
-        let mut parser = Parser::new(Arc::new(interface));
+        let mut parser = Parser::new(interface);
         register_g1_cmd(&mut parser);
         register_m105_cmd(&mut parser);
 
@@ -1182,7 +1182,7 @@ mod tests {
             outputs: vec![],
         }];
         let interface = TestInterface::new(mapping);
-        let mut parser = Parser::new(Arc::new(interface));
+        let mut parser = Parser::new(interface);
 
         let _ = parser.register(15, "CMD val=%u");
 
@@ -1202,7 +1202,7 @@ mod tests {
             outputs: vec![],
         }];
         let interface = TestInterface::new(mapping);
-        let mut parser = Parser::new(Arc::new(interface));
+        let mut parser = Parser::new(interface);
 
         let _ = parser.register(17, "CMD val=%hu");
 
@@ -1222,7 +1222,7 @@ mod tests {
             outputs: vec![],
         }];
         let interface = TestInterface::new(mapping);
-        let mut parser = Parser::new(Arc::new(interface));
+        let mut parser = Parser::new(interface);
 
         let _ = parser.register(19, "CMD val=%i");
 
@@ -1238,7 +1238,7 @@ mod tests {
             outputs: vec![],
         }];
         let interface = TestInterface::new(mapping);
-        let mut parser = Parser::new(Arc::new(interface));
+        let mut parser = Parser::new(interface);
 
         let _ = parser.register(21, "CMD val=%s");
 
@@ -1257,7 +1257,7 @@ mod tests {
             outputs: vec![],
         }];
         let interface = TestInterface::new(mapping);
-        let mut parser = Parser::new(Arc::new(interface));
+        let mut parser = Parser::new(interface);
         register_g1_cmd(&mut parser);
 
         // Bind a callback to the G1 command.
@@ -1297,7 +1297,7 @@ mod tests {
             outputs: vec![],
         }];
         let interface = TestInterface::new(mapping);
-        let mut parser = Parser::new(Arc::new(interface));
+        let mut parser = Parser::new(interface);
 
         let result = parser.bind("UNKNOWN", |_values| {});
         assert!(result.is_err());
@@ -1309,7 +1309,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Poll `take_callback_msgs` until `count` messages have been collected.
-    async fn collect_callback_msgs(parser: &Parser, count: usize) -> Vec<InboundMessage> {
+    async fn collect_callback_msgs<I: KlippyInterface + 'static>(parser: &Parser<I>, count: usize) -> Vec<InboundMessage> {
         let deadline = std::time::Instant::now() + Duration::from_secs(1);
         let mut collected = Vec::new();
         while collected.len() < count {
@@ -1329,7 +1329,7 @@ mod tests {
     #[tokio::test]
     async fn test_take_callback_msgs_empty() {
         let interface = TestInterface::new(vec![]);
-        let parser = Parser::new(Arc::new(interface));
+        let parser = Parser::new(interface);
         assert!(parser.take_callback_msgs().unwrap().is_empty());
     }
 
@@ -1358,7 +1358,7 @@ mod tests {
             ],
         }];
         let interface = TestInterface::new(mapping);
-        let mut parser = Parser::new(Arc::new(interface));
+        let mut parser = Parser::new(interface);
         register_m105_cmd(&mut parser);
         // Register test_response so inbox task can process id=99 messages
         parser.register(99, "test_response value=%u data=%.*s").unwrap();
@@ -1397,7 +1397,7 @@ mod tests {
             outputs: vec![Frame::new(0, temperature.payload().to_vec())],
         }];
         let interface = TestInterface::new(mapping);
-        let mut parser = Parser::new(Arc::new(interface));
+        let mut parser = Parser::new(interface);
         register_m105_cmd(&mut parser);
         let _ = parser.register(32, "temperature value=%u");
 
@@ -1427,7 +1427,7 @@ mod tests {
             outputs: vec![Frame::new(0, temperature.payload().to_vec())],
         }];
         let interface = TestInterface::new(mapping);
-        let mut parser = Parser::new(Arc::new(interface));
+        let mut parser = Parser::new(interface);
         register_m105_cmd(&mut parser);
         let _ = parser.register(32, "temperature value=%u");
         parser.bind("temperature", |_values| {}).unwrap();
@@ -1450,7 +1450,7 @@ mod tests {
             outputs: vec![], // no response
         }];
         let interface = TestInterface::new(mapping);
-        let mut parser = Parser::new(Arc::new(interface));
+        let mut parser = Parser::new(interface);
         register_m105_cmd(&mut parser);
         let _ = parser.register(32, "temperature value=%u");
 
@@ -1469,7 +1469,7 @@ mod tests {
         // The send fails because the command is unknown; the registered
         // waiter must not linger.
         let interface = TestInterface::new(vec![]);
-        let mut parser = Parser::new(Arc::new(interface));
+        let mut parser = Parser::new(interface);
         // Register a test response so send_and_wait can resolve the wait target
         parser.register(99, "test_response value=%u").unwrap();
 

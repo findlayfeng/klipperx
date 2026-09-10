@@ -1,6 +1,5 @@
-use super::section::ConfigSection;
 use crate::core::klippy::mcu::McuRestartMethod;
-use crate::core::klippy::traits::KlippyInterface;
+use super::section::ConfigSection;
 
 /// MCU (Microcontroller Unit) configuration parsed from config file.
 pub struct McuConfig {
@@ -9,26 +8,34 @@ pub struct McuConfig {
     /// MCU restart method
     pub restart_method: McuRestartMethod,
     /// MCU interface for communication
-    pub interface: Box<dyn KlippyInterface>,
+    pub interface: McuInterface,
+}
+
+/// MCU interface kind — determines which concrete interface type is used.
+pub enum McuInterface {
+    /// Test interface for deterministic testing (only available in test builds).
+    #[cfg(test)]
+    Test(crate::core::klippy::interface::test::TestInterface),
 }
 
 impl McuConfig {
-    /// Parse MCU configuration from a section.
+    /// Parse MCU configuration from a ConfigSection.
     ///
-    /// The name is taken from the section's sub field (e.g., "mcu zboard" → "zboard").
-    /// The restart_method is parsed from the section's restart_method parameter.
-    /// If a 'test' config exists, a TestInterface is created automatically.
+    /// Inspects the section to determine the interface type:
+    /// - If `test` config block exists and building for tests → creates `TestInterface`
+    /// - Otherwise → returns an error (no interface configured)
+    ///
+    /// # Arguments
+    /// * `section` — The MCU configuration section from the config file.
+    ///
+    /// # Returns
+    /// `Ok(McuConfig)` with the appropriate interface type,
+    /// or `Err` if no supported interface configuration is found.
     pub fn from_section(section: &ConfigSection) -> Result<Self, String> {
-        // Get name from sub field
-        let name = section.sub.clone().unwrap_or_default();
+        // Parse common fields
+        let (name, restart_method) = Self::parse_common(section);
 
-        // Parse restart_method
-        let restart_method = section
-            .get_str("restart_method")
-            .and_then(McuRestartMethod::from_str)
-            .unwrap_or(McuRestartMethod::Arduino);
-
-        // Create interface
+        // Determine interface type from section content
         let interface = Self::create_interface(section)?;
 
         Ok(Self {
@@ -38,24 +45,33 @@ impl McuConfig {
         })
     }
 
-    /// Create interface based on config.
-    fn create_interface(section: &ConfigSection) -> Result<Box<dyn KlippyInterface>, String> {
-        // Test mode: create TestInterface if test config exists
+    /// Parse common MCU configuration fields.
+    fn parse_common(section: &ConfigSection) -> (String, McuRestartMethod) {
+        // Get name from sub field
+        let name = section.sub.clone().unwrap_or_default();
+
+        // Parse restart_method
+        let restart_method = section
+            .get_str("restart_method")
+            .and_then(McuRestartMethod::from_str)
+            .unwrap_or(McuRestartMethod::Arduino);
+
+        (name, restart_method)
+    }
+
+    /// Create the appropriate interface based on section content.
+    #[allow(dead_code, unused_variables)]
+    fn create_interface(section: &ConfigSection) -> Result<McuInterface, String> {
+        // Check for test configuration (only available in test builds)
         #[cfg(test)]
-        if let Some(test_value) = section.get("test") {
+        if section.get("test").is_some() {
+            let test_value = section.get("test").unwrap();
             let mappings = Self::parse_test_config(test_value)?;
-            return Ok(Box::new(
-                crate::core::klippy::interface::test::TestInterface::new(mappings),
-            ));
+            let interface = crate::core::klippy::interface::test::TestInterface::new(mappings);
+            return Ok(McuInterface::Test(interface));
         }
 
-        // Non-test mode: normal interface creation (to be implemented)
-        #[cfg(not(test))]
-        {
-            let _ = section;
-        }
-
-        Err("interface not created".to_string())
+        Err("no supported interface configuration found (test, serial, canbus, ...)".to_string())
     }
 
     /// Parse test config into mapping entries.
@@ -106,6 +122,7 @@ impl McuConfig {
     }
 }
 
+/// Decode a hex string to bytes.
 #[cfg(test)]
 fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
     if s.len() % 2 != 0 {
@@ -132,7 +149,7 @@ baud: 250000
         let (config, _) = crate::core::klippy::config::Config::from_str(config_str).unwrap();
         let mcu_section = config.get_section("mcu").unwrap();
         let result = McuConfig::from_section(mcu_section);
-        assert!(result.is_err());
+        assert!(result.is_err(), "expected error when no 'test' config exists");
     }
 
     #[test]
@@ -151,6 +168,7 @@ test:
         let mcu_config = McuConfig::from_section(mcu_section).unwrap();
         assert_eq!(mcu_config.name, "");
         assert_eq!(mcu_config.restart_method, McuRestartMethod::Arduino);
+        assert!(matches!(mcu_config.interface, McuInterface::Test(_)));
     }
 
     #[test]
@@ -168,6 +186,7 @@ test: 01 02 03
         let mcu_config = McuConfig::from_section(mcu_section).unwrap();
         assert_eq!(mcu_config.name, "");
         assert_eq!(mcu_config.restart_method, McuRestartMethod::Arduino);
+        assert!(matches!(mcu_config.interface, McuInterface::Test(_)));
     }
 
     #[test]
@@ -185,6 +204,7 @@ test:
         let mcu_section = config.get_section("mcu zboard").unwrap();
         let mcu_config = McuConfig::from_section(mcu_section).unwrap();
         assert_eq!(mcu_config.name, "zboard");
+        assert!(matches!(mcu_config.interface, McuInterface::Test(_)));
     }
 
     #[test]
@@ -202,5 +222,23 @@ test:
         let mcu_section = config.get_section("mcu").unwrap();
         let mcu_config = McuConfig::from_section(mcu_section).unwrap();
         assert_eq!(mcu_config.restart_method, McuRestartMethod::Command);
+        assert!(matches!(mcu_config.interface, McuInterface::Test(_)));
+    }
+
+    #[test]
+    fn test_parse_mcu_config_default_restart_method() {
+        let config_str = r#"
+[mcu]
+serial: /dev/ttyACM0
+
+test:
+    aa bb
+"#;
+
+        let (config, _) = crate::core::klippy::config::Config::from_str(config_str).unwrap();
+        let mcu_section = config.get_section("mcu").unwrap();
+        let mcu_config = McuConfig::from_section(mcu_section).unwrap();
+        assert_eq!(mcu_config.restart_method, McuRestartMethod::Arduino);
+        assert!(matches!(mcu_config.interface, McuInterface::Test(_)));
     }
 }

@@ -56,6 +56,7 @@ pub struct MappingEntry {
 /// let result = interface.receive().await.unwrap();
 /// assert_eq!(result.payload(), b"hello");
 /// ```
+#[derive(Clone)]
 pub struct TestInterface {
     tx: Arc<tokio::sync::Mutex<mpsc::Sender<Frame>>>,
     rx: Arc<tokio::sync::Mutex<mpsc::Receiver<Frame>>>,

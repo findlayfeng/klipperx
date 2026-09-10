@@ -30,8 +30,7 @@ pub mod interface {
     // Temporarily disabled from build — see interface/host.rs
     // pub mod host;
 
-    // Test interface - only available in test mode
-    // Provides pre-defined responses for deterministic testing
+    // Test interface - provides pre-defined responses for deterministic testing
     #[cfg(test)]
     pub mod test;
 }

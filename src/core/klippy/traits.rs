@@ -231,7 +231,7 @@ pub use super::msg::proto::Payload;
 /// with a Klipper printer. It uses an event-driven architecture with
 /// async command sending.
 #[async_trait::async_trait]
-pub trait KlippyInterface: Send + Sync {
+pub trait KlippyInterface: Send + Sync + Clone {
     /// Send a payload asynchronously.
     ///
     /// # Arguments

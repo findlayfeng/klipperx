@@ -31,29 +31,40 @@
 //! println!("MCU version: {}", identify.version);
 //! ```
 
+#[cfg(test)]
 use flate2::read::ZlibDecoder;
+#[cfg(test)]
 use std::io::Read;
+#[cfg(test)]
 use tokio::time::Duration;
 
-use crate::core::klippy::msg::param::Param;
+#[cfg(test)]
+use crate::core::klippy::interface::test::TestInterface;
+#[cfg(test)]
 use crate::core::klippy::msg::parser::Parser;
+#[cfg(test)]
+use crate::core::klippy::msg::param::Param;
+#[cfg(test)]
 use crate::core::klippy::msg::proto::ArgValue;
 
 /// Default Klipper message formats for identify request/response.
 ///
 /// These are registered when creating a new [`Mcu`](super::Mcu) via
 /// [`Mcu::from_config`](super::Mcu::from_config).
+#[allow(dead_code)]
 pub const DEFAULT_MESSAGES: &[(u8, &str)] = &[
     (0, "identify_response offset=%u data=%.*s"),
     (1, "identify offset=%u count=%c"),
 ];
 
 /// Size of each identify data chunk (bytes).
+#[allow(dead_code)]
 const IDENTIFY_CHUNK_SIZE: u32 = 40;
 
 /// Maximum allowed decompressed data size (1 MB).
 /// Prevents zip-bomb style attacks where a tiny compressed payload
 /// expands to enormous data, causing OOM.
+#[allow(dead_code)]
 const MAX_IDENTIFY_DATA_SIZE: usize = 1024 * 1024;
 
 /// Parsed identify data from the MCU.
@@ -115,6 +126,7 @@ impl std::fmt::Display for IdentifyError {
 impl std::error::Error for IdentifyError {}
 
 /// Helper macro to extract a JSON field with a default fallback.
+#[cfg(test)]
 macro_rules! json_field {
     ($json:expr, $key:expr, $default:expr) => {
         $json
@@ -180,7 +192,8 @@ impl Identify {
     /// - Zlib decompression fails
     /// - JSON parsing fails
     /// - The MCU responds unexpectedly
-    pub async fn fetch(parser: &mut Parser, timeout: Duration) -> Result<Self, IdentifyError> {
+    #[cfg(test)]
+    pub async fn fetch(parser: &mut Parser<TestInterface>, timeout: Duration) -> Result<Self, IdentifyError> {
         let mut raw_data = Vec::new();
         let mut offset: u32 = 0;
 
@@ -326,7 +339,6 @@ impl Identify {
 mod tests {
     use super::*;
     use crate::core::klippy::frame::Frame;
-    use std::sync::Arc;
     use crate::core::klippy::interface::test::{TestInterface, MappingEntry};
     use crate::core::klippy::msg::proto::Payload;
     use flate2::write::ZlibEncoder;
@@ -426,7 +438,7 @@ mod tests {
         });
 
         let interface = TestInterface::new(mappings);
-        let mut parser = Parser::new(Arc::new(interface));
+        let mut parser = Parser::new(interface);
         for (id, fmt) in DEFAULT_MESSAGES {
             parser.register(*id, fmt).unwrap();
         }
@@ -528,7 +540,7 @@ mod tests {
         });
 
         let interface = TestInterface::new(mappings);
-        let mut parser = Parser::new(Arc::new(interface));
+        let mut parser = Parser::new(interface);
         for (id, fmt) in DEFAULT_MESSAGES {
             parser.register(*id, fmt).unwrap();
         }
@@ -571,7 +583,7 @@ mod tests {
         });
 
         let interface = TestInterface::new(mappings);
-        let mut parser = Parser::new(Arc::new(interface));
+        let mut parser = Parser::new(interface);
         for (id, fmt) in DEFAULT_MESSAGES {
             parser.register(*id, fmt).unwrap();
         }
@@ -622,7 +634,7 @@ mod tests {
             },
         ];
         let interface = TestInterface::new(mapping);
-        let mut parser = Parser::new(Arc::new(interface));
+        let mut parser = Parser::new(interface);
         for (id, fmt) in DEFAULT_MESSAGES {
             parser.register(*id, fmt).unwrap();
         }
@@ -667,7 +679,7 @@ mod tests {
         });
 
         let interface = TestInterface::new(mappings);
-        let mut parser = Parser::new(Arc::new(interface));
+        let mut parser = Parser::new(interface);
         for (id, fmt) in DEFAULT_MESSAGES {
             parser.register(*id, fmt).unwrap();
         }
@@ -694,7 +706,7 @@ mod tests {
     //     let interface = LibInterface::new();
     //     interface.init(&lib_path).expect("Failed to initialize LibInterface");
     //
-    //     let mut parser = Parser::new(Arc::new(interface));
+    //     let mut parser = Parser::new(interface);
     //     for (id, fmt) in DEFAULT_MESSAGES {
     //         parser.register(*id, fmt).unwrap();
     //     }

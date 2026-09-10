@@ -677,28 +677,31 @@ mod tests {
         assert!(format!("{:?}", result).contains("unexpected offset"));
     }
 
-    /// Test identify protocol using the real LibInterface (host.rs).
-    ///
-    /// This test requires a real MCU connection and is ignored by default.
-    /// Run with `cargo test -- --ignored test_do_identify_with_host_interface`
-    /// when you have a connected MCU.
-    #[tokio::test]
-    #[ignore]
-    async fn test_do_identify_with_host_interface() {
-        use crate::core::klippy::interface::host::LibInterface;
-
-        let lib_path = klipperx_test_support::klipper_host_lib_path();
-        let interface = LibInterface::new();
-        interface.init(&lib_path).expect("Failed to initialize LibInterface");
-
-        let mut parser = Parser::new(Arc::new(interface));
-        for (id, fmt) in DEFAULT_MESSAGES {
-            parser.register(*id, fmt).unwrap();
-        }
-
-        let data = Identify::fetch(&mut parser, Duration::from_secs(5))
-            .await
-            .expect("identify failed");
-        tracing::info!("identify success: version={}, app={}", data.version, data.app);
-    }
+    // Temporarily disabled: requires interface::host::LibInterface which is commented out from build.
+    // To re-enable, uncomment the test below and uncomment `pub mod host;` in mod.rs.
+    //
+    // /// Test identify protocol using the real LibInterface (host.rs).
+    // ///
+    // /// This test requires a real MCU connection and is ignored by default.
+    // /// Run with `cargo test -- --ignored test_do_identify_with_host_interface`
+    // /// when you have a connected MCU.
+    // #[tokio::test]
+    // #[ignore]
+    // async fn test_do_identify_with_host_interface() {
+    //     use crate::core::klippy::interface::host::LibInterface;
+    //
+    //     let lib_path = klipperx_test_support::klipper_host_lib_path();
+    //     let interface = LibInterface::new();
+    //     interface.init(&lib_path).expect("Failed to initialize LibInterface");
+    //
+    //     let mut parser = Parser::new(Arc::new(interface));
+    //     for (id, fmt) in DEFAULT_MESSAGES {
+    //         parser.register(*id, fmt).unwrap();
+    //     }
+    //
+    //     let data = Identify::fetch(&mut parser, Duration::from_secs(5))
+    //         .await
+    //         .expect("identify failed");
+    //     tracing::info!("identify success: version={}, app={}", data.version, data.app);
+    // }
 }

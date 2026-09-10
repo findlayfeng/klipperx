@@ -3,7 +3,8 @@
 // This module provides:
 // - KlippyInterface trait: abstract interface for printer communication
 // - SerialInterface: serial interface implementation
-// - LibInterface: real implementation using klipper host library (tests only)
+// - LibInterface: real implementation using klipper host library (temporarily disabled)
+//   See interface/host.rs for the original implementation (commented out from build)
 
 pub mod config;
 pub mod error;
@@ -26,7 +27,8 @@ pub mod interface {
 
     // Klipper host library interface (dynamic linking)
     // Loads libklipper_host.so at runtime and resolves function pointers
-    pub mod host;
+    // Temporarily disabled from build — see interface/host.rs
+    // pub mod host;
 
     // Test interface - only available in test mode
     // Provides pre-defined responses for deterministic testing

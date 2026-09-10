@@ -25,13 +25,13 @@ pub use section::ConfigSection;
 #[derive(Debug, Clone)]
 pub struct Config {
     /// All sections, indexed by key (unique) and id (non-unique)
-    sections: section::MultiIndexConfigSectionMap,
+    sections: section::ConfigSectionMap,
 }
 
 impl Config {
     pub fn new() -> Self {
         Self {
-            sections: section::MultiIndexConfigSectionMap::default(),
+            sections: section::ConfigSectionMap::default(),
         }
     }
 

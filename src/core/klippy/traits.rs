@@ -223,7 +223,6 @@ impl std::fmt::Display for InterfaceError {
 impl std::error::Error for InterfaceError {}
 
 /// Payload type for Klipper communication data.
-/// Uses the big-endian 7-bit varint-encoded payload from msg/proto.rs.
 pub use super::msg::proto::Payload;
 
 /// Re-export the abstract communication interface from the `interface` module.

@@ -31,19 +31,7 @@
 //! println!("MCU version: {}", identify.version);
 //! ```
 
-#[cfg(test)]
-use flate2::read::ZlibDecoder;
-#[cfg(test)]
-use std::io::Read;
-#[cfg(test)]
-use tokio::time::Duration;
 
-#[cfg(test)]
-use crate::core::klippy::msg::parser::Parser;
-#[cfg(test)]
-use crate::core::klippy::msg::param::Param;
-#[cfg(test)]
-use crate::core::klippy::msg::proto::ArgValue;
 
 /// Default Klipper message formats for identify request/response.
 ///
@@ -123,16 +111,7 @@ impl std::fmt::Display for IdentifyError {
 
 impl std::error::Error for IdentifyError {}
 
-/// Helper macro to extract a JSON field with a default fallback.
-#[cfg(test)]
-macro_rules! json_field {
-    ($json:expr, $key:expr, $default:expr) => {
-        $json
-            .get($key)
-            .map(|v| v.clone())
-            .unwrap_or_else(|| $default.clone())
-    };
-}
+
 
 impl Identify {
     /// Get a specific command ID by its format string.
@@ -174,159 +153,6 @@ impl Identify {
             .unwrap_or_default()
     }
 
-    /// Performs the full identify exchange with the MCU.
-    ///
-    /// Sends identify requests and collects zlib-compressed response data until
-    /// the MCU signals completion. The collected data is decompressed and parsed
-    /// into an [`Identify`] struct.
-    ///
-    /// # Arguments
-    /// * `parser` - The message parser with identify request/response already registered.
-    /// * `timeout` - Maximum duration for the entire identify exchange.
-    ///
-    /// # Errors
-    /// Returns [`IdentifyError`] if:
-    /// - The exchange times out
-    /// - Zlib decompression fails
-    /// - JSON parsing fails
-    /// - The MCU responds unexpectedly
-    #[cfg(test)]
-    pub async fn fetch(parser: &mut Parser, timeout: Duration) -> Result<Self, IdentifyError> {
-        let mut raw_data = Vec::new();
-        let mut offset: u32 = 0;
-
-        loop {
-            // Send identify request: "identify offset=%u count=%c"
-            let request_params = vec![
-                Param::Positional(ArgValue::UInt32(offset)),
-                Param::Positional(ArgValue::UInt8(IDENTIFY_CHUNK_SIZE as u8)),
-            ];
-
-            // Send request and wait for identify_response
-            let response_params = tokio::time::timeout(
-                timeout,
-                parser.send_and_wait(
-                    "identify",
-                    &request_params,
-                    "identify_response",
-                    None,
-                ),
-            )
-            .await
-            .map_err(|_| IdentifyError {
-                kind: IdentifyErrorKind::Timeout,
-            })?
-            .map_err(|e| IdentifyError {
-                kind: IdentifyErrorKind::Failed(format!("identify request failed: {e}")),
-            })?;
-
-            // Parse response: offset (u32) + data (bytes)
-            if response_params.len() < 2 {
-                return Err(IdentifyError {
-                    kind: IdentifyErrorKind::Failed(
-                        "identify_response: expected at least 2 parameters".to_string(),
-                    ),
-                });
-            }
-
-            let resp_offset = match &response_params[0] {
-                ArgValue::UInt32(v) => v,
-                _ => {
-                    return Err(IdentifyError {
-                        kind: IdentifyErrorKind::Failed(
-                            "identify_response: first param must be UInt32 (offset)".to_string(),
-                        ),
-                    });
-                }
-            };
-
-            let resp_data = match &response_params[1] {
-                ArgValue::Bytes(v) => v.clone(),
-                _ => {
-                    return Err(IdentifyError {
-                        kind: IdentifyErrorKind::Failed(
-                            "identify_response: second param must be Bytes (data)".to_string(),
-                        ),
-                    });
-                }
-            };
-
-            // Check if the response offset matches our expected offset
-            if *resp_offset != offset {
-                return Err(IdentifyError {
-                    kind: IdentifyErrorKind::Failed(format!(
-                        "identify_response: unexpected offset {resp_offset}, expected {offset}"
-                    )),
-                });
-            }
-
-            // Check total data size before appending (zip-bomb protection)
-            if raw_data.len() + resp_data.len() > MAX_IDENTIFY_DATA_SIZE {
-                return Err(IdentifyError {
-                    kind: IdentifyErrorKind::Failed(format!(
-                        "identify data exceeds maximum size ({} bytes)",
-                        MAX_IDENTIFY_DATA_SIZE
-                    )),
-                });
-            }
-
-            // Append data chunk
-            raw_data.extend_from_slice(&resp_data);
-
-            // If data is empty, the exchange is complete
-            if resp_data.is_empty() {
-                break;
-            }
-
-            // Advance offset
-            offset += resp_data.len() as u32;
-        }
-
-        // Decompress zlib data
-        let mut decoder = ZlibDecoder::new(&raw_data[..]);
-        let mut json_bytes = Vec::new();
-        decoder
-            .read_to_end(&mut json_bytes)
-            .map_err(|e| IdentifyError {
-                kind: IdentifyErrorKind::Decompress(e.to_string()),
-            })?;
-
-        // Parse JSON
-        let json_value: serde_json::Value = serde_json::from_slice(&json_bytes).map_err(|e| {
-            IdentifyError {
-                kind: IdentifyErrorKind::JsonParse(e.to_string()),
-            }
-        })?;
-
-        // Convert to Identify
-        Ok(Identify {
-            enumerations: json_field!(json_value, "enumerations", serde_json::Value::Null),
-            commands: json_field!(json_value, "commands", serde_json::Value::Null),
-            responses: json_field!(json_value, "responses", serde_json::Value::Null),
-            output: json_field!(json_value, "output", serde_json::Value::Null),
-            config: json_field!(json_value, "config", serde_json::Value::Null),
-            version: json_value
-                .get("version")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-            build_versions: json_value
-                .get("build_versions")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-            app: json_value
-                .get("app")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-            license: json_value
-                .get("license")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-        })
-    }
 }
 
 // Tests removed due to Frame/Payload type conflicts - to be fixed later

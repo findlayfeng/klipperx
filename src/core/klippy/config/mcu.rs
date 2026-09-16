@@ -1,5 +1,5 @@
 use crate::core::klippy::mcu::McuRestartMethod;
-use crate::core::klippy::interface::Interface;
+use crate::core::klippy::interface::TestInterface;
 use super::section::ConfigSection;
 
 /// MCU (Microcontroller Unit) configuration parsed from config file.
@@ -9,7 +9,7 @@ pub struct McuConfig {
     /// MCU restart method
     pub restart_method: McuRestartMethod,
     /// MCU interface for communication
-    pub interface: Interface,
+    pub interface: TestInterface,
 }
 
 impl McuConfig {
@@ -54,16 +54,22 @@ impl McuConfig {
     }
 
     /// Create the appropriate interface based on section content.
-    #[allow(dead_code, unused_variables)]
-    fn create_interface(section: &ConfigSection) -> Result<Interface, String> {
-        // Check for test configuration (only available in test builds)
-        #[cfg(test)]
+    #[cfg(test)]
+    fn create_interface(section: &ConfigSection) -> Result<TestInterface, String> {
         if section.get("test").is_some() {
             let test_value = section.get("test").unwrap();
             let mappings = Self::parse_test_config(test_value)?;
-            return Ok(Interface::test_new(mappings));
+            return Ok(TestInterface::new(
+                crate::core::klippy::interface::test::TestDevice::new(mappings),
+            ));
         }
 
+        Err("no supported interface configuration found (test, serial, canbus, ...)".to_string())
+    }
+
+    /// Create the appropriate interface based on section content.
+    #[cfg(not(test))]
+    fn create_interface(_section: &ConfigSection) -> Result<TestInterface, String> {
         Err("no supported interface configuration found (test, serial, canbus, ...)".to_string())
     }
 

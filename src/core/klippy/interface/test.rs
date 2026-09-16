@@ -18,15 +18,15 @@ pub struct MappingEntry {
 /// configured output frame(s) for `receive()`.
 ///
 /// **Thread safety**: `TestDevice` is `Send` but not `Sync` — it must be
-/// shared through an outer `Mutex` (e.g. `Arc<Mutex<InterfaceDevice>>` in
-/// `Interface::run()`). The outer `Mutex` already serializes all access,
-/// so no inner `Mutex` is needed on any field.
+/// shared through an outer `Mutex` (e.g. `Arc<Mutex<TestDevice>>` in
+/// `Interface::run()`). Each field that needs `Sync` is individually protected
+/// (e.g. `mapping` uses its own `Mutex` since `VecDeque` is not `Sync`).
 pub struct TestDevice {
     /// `crossbeam::channel::Sender` is `Clone + Send + Sync` — direct field.
     buf_tx: Sender<Frame>,
-    /// `crossbeam::channel::Receiver::recv()` takes `&self` — no inner `Mutex`.
+    /// `crossbeam::channel::Receiver` — `recv_blocking()` takes `&self`.
     buf_rx: Receiver<Frame>,
-    /// FIFO queue of input→output mappings — protected by outer `Mutex`.
+    /// FIFO queue of input→output mappings — protected by its own `Mutex`.
     mapping: Mutex<VecDeque<MappingEntry>>,
 }
 
@@ -68,11 +68,7 @@ impl Device for TestDevice {
     }
 
     fn receive(&self) -> Frame {
-        // crossbeam::Receiver::recv() takes &self — no inner Mutex needed.
-        // The outer Mutex (InterfaceDevice or TestDevice) serializes all access.
-        self.buf_rx.recv().unwrap_or_else(|_| {
-            panic!("TestDevice receive channel closed")
-        })
+        self.buf_rx.recv().unwrap()
     }
 }
 
@@ -97,7 +93,7 @@ mod tests {
         let result = device.send(&input);
         assert!(result.is_ok());
 
-        let received = device.receive().await;
+        let received = device.receive();
         assert_eq!(received, output);
     }
 
@@ -121,11 +117,11 @@ mod tests {
 
         // First send/receive
         assert!(device.send(&input1).is_ok());
-        assert_eq!(device.receive().await, output1);
+        assert_eq!(device.receive(), output1);
 
         // Second send/receive
         assert!(device.send(&input2).is_ok());
-        assert_eq!(device.receive().await, output2);
+        assert_eq!(device.receive(), output2);
     }
 
     #[test]
@@ -176,9 +172,9 @@ mod tests {
         }]);
 
         assert!(device.send(&input).is_ok());
-        assert_eq!(device.receive().await, output1);
-        assert_eq!(device.receive().await, output2);
-        assert_eq!(device.receive().await, output3);
+        assert_eq!(device.receive(), output1);
+        assert_eq!(device.receive(), output2);
+        assert_eq!(device.receive(), output3);
     }
 
     #[test]
@@ -213,7 +209,7 @@ mod tests {
         assert!(device.send(&input).is_err());
 
         // But we can still receive the queued outputs
-        assert_eq!(device.receive().await, output);
+        assert_eq!(device.receive(), output);
     }
 
     #[tokio::test]
@@ -228,7 +224,7 @@ mod tests {
         }]);
 
         assert!(device.send(&input).is_ok());
-        let received = device.receive().await;
+        let received = device.receive();
         assert_eq!(received, output);
     }
 
@@ -256,20 +252,14 @@ mod tests {
         let device_send = device.clone();
         let device_recv = device.clone();
 
-        let send_handle = tokio::task::spawn(async move {
+        let send_handle = tokio::task::spawn_blocking(move || {
             device_send.lock().unwrap().send(&input1).unwrap();
             device_send.lock().unwrap().send(&input2).unwrap();
         });
 
-        let recv_handle = tokio::task::spawn(async move {
-            let r1 = {
-                let device = device_recv.lock().unwrap();
-                device.receive().await
-            };
-            let r2 = {
-                let device = device_recv.lock().unwrap();
-                device.receive().await
-            };
+        let recv_handle = tokio::task::spawn_blocking(move || {
+            let r1 = device_recv.lock().unwrap().receive();
+            let r2 = device_recv.lock().unwrap().receive();
             (r1, r2)
         });
 

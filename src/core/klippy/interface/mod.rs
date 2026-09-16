@@ -12,38 +12,65 @@ pub trait Device: Send + Sync {
     fn receive(&self) -> Frame;
 }
 
-pub enum InterfaceDevice {
-    /// Test device for deterministic testing (only available in test builds).
-    #[cfg(test)]
-    Test(test::TestDevice),
+/// Generic interface for communicating with a Klipper device.
+///
+/// `D` is the underlying device type (e.g. [`TestDevice`](test::TestDevice)
+/// in tests, or a real serial/socket device in production).
+pub struct Interface<D: Device> {
+    device: Arc<D>,
 }
 
-pub struct Interface {
-    device: Arc<InterfaceDevice>,
-}
-
-impl Interface {
-    pub fn new(device: InterfaceDevice) -> Self {
+impl<D: Device + 'static> Interface<D> {
+    pub fn new(device: D) -> Self {
         Self {
             device: Arc::new(device),
         }
     }
 
     pub async fn send(&self, frame: Frame) -> Result<(), InterfaceError> {
-        match self.device.as_ref() {
-            #[cfg(test)]
-            InterfaceDevice::Test(test_device) => test_device.send(&frame),
-            #[cfg(not(test))]
-            _ => todo!("Implement send for other device types: {frame:?}"),
-        }
+        let device = Arc::clone(&self.device);
+        tokio::task::spawn_blocking(move || device.send(&frame))
+            .await
+            .expect("Interface send task panicked")
     }
 
     pub async fn receive(&self) -> Frame {
-        match self.device.as_ref() {
-            #[cfg(test)]
-            InterfaceDevice::Test(test_device) => test_device.receive(),
-            #[cfg(not(test))]
-            _ => todo!("Implement receive for other device types"),
+        let device = Arc::clone(&self.device);
+        tokio::task::spawn_blocking(move || device.receive())
+            .await
+            .expect("Interface receive task panicked")
+    }
+}
+
+impl<D: Device + Clone> Clone for Interface<D> {
+    fn clone(&self) -> Self {
+        Self {
+            device: Arc::clone(&self.device),
         }
     }
 }
+
+/// Placeholder device for non-test builds (returns errors).
+#[cfg(not(test))]
+#[derive(Debug, Clone)]
+pub struct StubDevice;
+
+#[cfg(not(test))]
+impl Device for StubDevice {
+    fn send(&self, _frame: &Frame) -> Result<(), InterfaceError> {
+        Err(InterfaceError::Other(
+            "StubDevice: no real device configured".to_string(),
+        ))
+    }
+    fn receive(&self) -> Frame {
+        Frame::new(0, Vec::new())
+    }
+}
+
+/// Concrete interface type for test builds.
+#[cfg(test)]
+pub type TestInterface = Interface<test::TestDevice>;
+
+/// Concrete interface type for non-test builds (uses stub device).
+#[cfg(not(test))]
+pub type TestInterface = Interface<StubDevice>;

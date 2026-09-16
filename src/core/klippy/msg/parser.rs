@@ -43,12 +43,6 @@ impl MsgMap {
     fn get_by_name(&self, name: &str) -> Option<&Msg> {
         self.by_name.get(name).and_then(|id| self.by_id.get(id))
     }
-
-    /// Remove a message by name, keeping both indexes in sync.
-    fn remove_by_name(&mut self, name: &str) -> Option<Msg> {
-        let id = self.by_name.remove(name)?;
-        self.by_id.remove(&id)
-    }
 }
 
 pub struct Parser {
@@ -110,19 +104,25 @@ impl Parser {
             .lock()
             .map_err(|_| MsgError::new("msgs lock poisoned"))?;
 
-        let (id, name) = map
-            .get_by_name(cmd_name)
-            .map(|c| (c.id, c.name.clone()))
+        let id = *map
+            .by_name
+            .get(cmd_name)
             .ok_or_else(|| MsgError::new(format!("Unknown command: {}", cmd_name)))?;
 
-        let entry = map
-            .remove_by_name(&name)
+        // Remove from both indexes before re-inserting
+        map.by_name.remove(cmd_name);
+        let msg = map
+            .by_id
+            .remove(&id)
             .ok_or_else(|| MsgError::new(format!("Msg not found: {}", cmd_name)))?;
 
-        let command = entry.command.with_callback(callback);
-
-        map.try_insert(Msg { id, name, command })
-            .map_err(|e| MsgError::new(e.to_string()))?;
+        let command = msg.command.with_callback(callback);
+        map.try_insert(Msg {
+            id,
+            name: msg.name,
+            command,
+        })
+        .map_err(|e| MsgError::new(e))?;
 
         Ok(())
     }
@@ -209,5 +209,609 @@ impl Parser {
         }
 
         Ok(result)
+    }
+}
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+
+    // -----------------------------------------------------------------------
+    // MsgMap
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_msgmap_insert_and_lookup() {
+        let mut map = MsgMap::default();
+        map.try_insert(Msg {
+            id: 1,
+            name: "CMD_A".to_string(),
+            command: MsgEntry::Base(MsgBase::parse("CMD_A x=%u").unwrap().1),
+        }).unwrap();
+
+        assert!(map.get_by_id(&1).is_some());
+        assert!(map.get_by_name("CMD_A").is_some());
+        assert!(map.get_by_id(&2).is_none());
+        assert!(map.get_by_name("CMD_B").is_none());
+    }
+
+    #[test]
+    fn test_msgmap_duplicate_id_rejected() {
+        let mut map = MsgMap::default();
+        map.try_insert(Msg {
+            id: 1,
+            name: "CMD_A".to_string(),
+            command: MsgEntry::Base(MsgBase::new(vec![])),
+        }).unwrap();
+
+        let result = map.try_insert(Msg {
+            id: 1,
+            name: "CMD_B".to_string(),
+            command: MsgEntry::Base(MsgBase::new(vec![])),
+        });
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("duplicate id"));
+    }
+
+    #[test]
+    fn test_msgmap_duplicate_name_rejected() {
+        let mut map = MsgMap::default();
+        map.try_insert(Msg {
+            id: 1,
+            name: "CMD_A".to_string(),
+            command: MsgEntry::Base(MsgBase::new(vec![])),
+        }).unwrap();
+
+        let result = map.try_insert(Msg {
+            id: 2,
+            name: "CMD_A".to_string(),
+            command: MsgEntry::Base(MsgBase::new(vec![])),
+        });
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("duplicate name"));
+    }
+
+    #[test]
+    fn test_msgmap_by_name_resolves_through_by_id() {
+        let mut map = MsgMap::default();
+        let base = MsgBase::parse("TEST a=%u b=%s").unwrap().1;
+        map.try_insert(Msg {
+            id: 42,
+            name: "TEST".to_string(),
+            command: MsgEntry::Base(base),
+        }).unwrap();
+
+        let msg = map.get_by_name("TEST").unwrap();
+        assert_eq!(msg.id, 42);
+        let param_len = match &msg.command {
+            MsgEntry::Base(b) => b.params().len(),
+            MsgEntry::Handler(h) => h.params().len(),
+        };
+        assert_eq!(param_len, 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // Parser::new
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parser_new_is_empty() {
+        let parser = Parser::new();
+        // Can't directly check emptiness, but encoding/decoding should fail
+        let result = parser.encode("unknown", &[]);
+        assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Parser::register
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_register_success() {
+        let mut parser = Parser::new();
+        let result = parser.register(1, "CMD_A x=%u");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_register_multiple_commands() {
+        let mut parser = Parser::new();
+        parser.register(1, "CMD_A x=%u").unwrap();
+        parser.register(2, "CMD_B y=%s z=%c").unwrap();
+        parser.register(3, "CMD_C").unwrap(); // no params
+
+        // All should be accessible
+        let payload = parser.encode("CMD_A", &[ArgValue::UInt32(42)]).unwrap();
+        assert_eq!(payload.payload()[0], 1);
+
+        let payload = parser.encode("CMD_B", &[ArgValue::Str("hello".to_string()), ArgValue::UInt8(99)]).unwrap();
+        assert_eq!(payload.payload()[0], 2);
+
+        let payload = parser.encode("CMD_C", &[]).unwrap();
+        assert_eq!(payload.payload()[0], 3);
+    }
+
+    #[test]
+    fn test_register_duplicate_id_fails() {
+        let mut parser = Parser::new();
+        parser.register(1, "CMD_A x=%u").unwrap();
+        let result = parser.register(1, "CMD_B y=%u");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().msg.contains("duplicate id"));
+    }
+
+    #[test]
+    fn test_register_duplicate_name_fails() {
+        let mut parser = Parser::new();
+        parser.register(1, "CMD_A x=%u").unwrap();
+        let result = parser.register(2, "CMD_A y=%u");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().msg.contains("duplicate name"));
+    }
+
+    #[test]
+    fn test_register_invalid_format_fails() {
+        let mut parser = Parser::new();
+        // Empty type specifier is invalid
+        let result = parser.register(1, "CMD name=");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().msg.contains("unknown type specifier"));
+    }
+
+    #[test]
+    fn test_register_unknown_type_fails() {
+        let mut parser = Parser::new();
+        let result = parser.register(1, "CMD x=%x");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().msg.contains("unknown type specifier"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Parser::bind
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_bind_success() {
+        let mut parser = Parser::new();
+        parser.register(1, "CMD_A x=%u").unwrap();
+
+        parser.bind("CMD_A", |_| {}).unwrap();
+
+        // Encode should still work after binding
+        let payload = parser.encode("CMD_A", &[ArgValue::UInt32(10)]).unwrap();
+        assert_eq!(payload.payload()[0], 1);
+
+        // Decode should work and return correct values
+        let result = parser.decode(payload).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, "CMD_A");
+        assert_eq!(result[0].1[0], ArgValue::UInt32(10));
+    }
+
+    #[test]
+    fn test_bind_unknown_command_fails() {
+        let mut parser = Parser::new();
+        parser.register(1, "CMD_A x=%u").unwrap();
+        let result = parser.bind("NONEXISTENT", |_| {});
+        assert!(result.is_err());
+        assert!(result.unwrap_err().msg.contains("Unknown command"));
+    }
+
+    #[test]
+    fn test_bind_replaces_callback() {
+        let mut parser = Parser::new();
+        parser.register(1, "CMD_A x=%u").unwrap();
+
+        // First bind
+        parser.bind("CMD_A", |_| {}).unwrap();
+
+        // Second bind replaces the callback
+        parser.bind("CMD_A", |_| {}).unwrap();
+
+        // Encode/decode should still work
+        let payload = parser.encode("CMD_A", &[ArgValue::UInt32(1)]).unwrap();
+        let result = parser.decode(payload).unwrap();
+        assert_eq!(result[0].1[0], ArgValue::UInt32(1));
+    }
+
+    #[test]
+    fn test_bind_still_decodes_correctly() {
+        let mut parser = Parser::new();
+        parser.register(1, "CMD_MULTI a=%u b=%s c=%c").unwrap();
+
+        // Bind a callback (callback not invoked during decode)
+        parser.bind("CMD_MULTI", |_| {}).unwrap();
+
+        let payload = parser.encode(
+            "CMD_MULTI",
+            &[
+                ArgValue::UInt32(42),
+                ArgValue::Str("hello".to_string()),
+                ArgValue::UInt8(99),
+            ],
+        ).unwrap();
+
+        let result = parser.decode(payload).unwrap();
+        assert_eq!(result[0].0, "CMD_MULTI");
+        assert_eq!(result[0].1.len(), 3);
+        assert_eq!(result[0].1[0], ArgValue::UInt32(42));
+        assert_eq!(result[0].1[1], ArgValue::Str("hello".to_string()));
+        assert_eq!(result[0].1[2], ArgValue::UInt8(99));
+    }
+
+    // -----------------------------------------------------------------------
+    // Parser::encode
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_encode_no_params() {
+        let mut parser = Parser::new();
+        parser.register(1, "NOP").unwrap();
+        let payload = parser.encode("NOP", &[]).unwrap();
+        assert_eq!(payload.payload(), &[1]);
+    }
+
+    #[test]
+    fn test_encode_single_param() {
+        let mut parser = Parser::new();
+        parser.register(1, "GET_X val=%u").unwrap();
+        let payload = parser.encode("GET_X", &[ArgValue::UInt32(123)]).unwrap();
+        assert_eq!(payload.payload()[0], 1); // msg id
+    }
+
+    #[test]
+    fn test_encode_multiple_param_types() {
+        let mut parser = Parser::new();
+        parser.register(1, "MULTI a=%u b=%i c=%hu d=%hi e=%s f=%c").unwrap();
+        let payload = parser.encode(
+            "MULTI",
+            &[
+                ArgValue::UInt32(100),
+                ArgValue::Int32(-200),
+                ArgValue::UInt16(300),
+                ArgValue::Int16(-400),
+                ArgValue::Str("test".to_string()),
+                ArgValue::UInt8(50),
+            ],
+        ).unwrap();
+        assert_eq!(payload.payload()[0], 1);
+    }
+
+    #[test]
+    fn test_encode_unknown_name_fails() {
+        let mut parser = Parser::new();
+        parser.register(1, "CMD_A x=%u").unwrap();
+        let result = parser.encode("UNKNOWN", &[ArgValue::UInt32(1)]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().msg.contains("Unknown message name"));
+    }
+
+    #[test]
+    fn test_encode_wrong_param_count_too_many() {
+        let mut parser = Parser::new();
+        parser.register(1, "CMD_A x=%u").unwrap();
+        let result = parser.encode("CMD_A", &[ArgValue::UInt32(1), ArgValue::UInt32(2)]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().msg.contains("expected 1 parameters, got 2"));
+    }
+
+    #[test]
+    fn test_encode_wrong_param_count_too_few() {
+        let mut parser = Parser::new();
+        parser.register(1, "CMD_A x=%u y=%s").unwrap();
+        let result = parser.encode("CMD_A", &[ArgValue::UInt32(1)]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().msg.contains("expected 2 parameters, got 1"));
+    }
+
+    #[test]
+    fn test_encode_handler_still_works() {
+        // After binding, encode should still work (Handler also has params)
+        let mut parser = Parser::new();
+        parser.register(1, "CMD_A x=%u").unwrap();
+        parser.bind("CMD_A", |_| {}).unwrap();
+
+        let payload = parser.encode("CMD_A", &[ArgValue::UInt32(99)]).unwrap();
+        assert_eq!(payload.payload()[0], 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Parser::decode
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_decode_no_params() {
+        let mut parser = Parser::new();
+        parser.register(1, "NOP").unwrap();
+        let mut payload = Payload::new();
+        payload.push(1).unwrap();
+
+        let result = parser.decode(payload).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, "NOP");
+        assert!(result[0].1.is_empty());
+    }
+
+    #[test]
+    fn test_decode_single_param() {
+        let mut parser = Parser::new();
+        parser.register(1, "GET_X val=%u").unwrap();
+        let mut payload = Payload::new();
+        payload.push(1).unwrap();
+        payload.push_u32(42).unwrap();
+
+        let result = parser.decode(payload).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, "GET_X");
+        assert_eq!(result[0].1[0], ArgValue::UInt32(42));
+    }
+
+    #[test]
+    fn test_decode_multiple_params() {
+        let mut parser = Parser::new();
+        parser.register(1, "CMD a=%u b=%s c=%c").unwrap();
+        let mut payload = Payload::new();
+        payload.push(1).unwrap();
+        payload.push_u32(100).unwrap();
+        payload.push_bytes("hello".as_bytes()).unwrap();
+        payload.push_u8(42).unwrap();
+
+        let result = parser.decode(payload).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, "CMD");
+        assert_eq!(result[0].1.len(), 3);
+        assert_eq!(result[0].1[0], ArgValue::UInt32(100));
+        assert_eq!(result[0].1[1], ArgValue::Str("hello".to_string()));
+        assert_eq!(result[0].1[2], ArgValue::UInt8(42));
+    }
+
+    #[test]
+    fn test_decode_multiple_messages_batch() {
+        let mut parser = Parser::new();
+        parser.register(1, "MSG_A x=%u").unwrap();
+        parser.register(2, "MSG_B y=%s").unwrap();
+        parser.register(3, "MSG_C").unwrap();
+
+        let mut payload = Payload::new();
+        payload.push(1).unwrap();
+        payload.push_u32(10).unwrap();
+        payload.push(2).unwrap();
+        payload.push_bytes("world".as_bytes()).unwrap();
+        payload.push(3).unwrap();
+
+        let result = parser.decode(payload).unwrap();
+        assert_eq!(result.len(), 3);
+
+        assert_eq!(result[0].0, "MSG_A");
+        assert_eq!(result[0].1[0], ArgValue::UInt32(10));
+
+        assert_eq!(result[1].0, "MSG_B");
+        assert_eq!(result[1].1[0], ArgValue::Str("world".to_string()));
+
+        assert_eq!(result[2].0, "MSG_C");
+        assert!(result[2].1.is_empty());
+    }
+
+    #[test]
+    fn test_decode_unknown_id_fails() {
+        let mut parser = Parser::new();
+        parser.register(1, "CMD_A x=%u").unwrap();
+        let mut payload = Payload::new();
+        payload.push(99).unwrap(); // unknown id
+
+        let result = parser.decode(payload);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().msg.contains("Unknown message id"));
+    }
+
+    #[test]
+    fn test_decode_bytes_param() {
+        let mut parser = Parser::new();
+        parser.register(1, "RAW data=%.*s").unwrap();
+        let mut payload = Payload::new();
+        payload.push(1).unwrap();
+        payload.push_bytes(&[0xDE, 0xAD, 0xBE, 0xEF]).unwrap();
+
+        let result = parser.decode(payload).unwrap();
+        assert_eq!(result[0].1[0], ArgValue::Bytes(vec![0xDE, 0xAD, 0xBE, 0xEF]));
+    }
+
+    #[test]
+    fn test_decode_signed_values() {
+        let mut parser = Parser::new();
+        parser.register(1, "SIGNED a=%i b=%hi").unwrap();
+        let mut payload = Payload::new();
+        payload.push(1).unwrap();
+        payload.push_u32(0xFFFFFFFF).unwrap(); // -1 as signed u32
+        payload.push_u16(0xFFFF).unwrap(); // -1 as signed u16
+
+        let result = parser.decode(payload).unwrap();
+        assert_eq!(result[0].1[0], ArgValue::Int32(-1));
+        assert_eq!(result[0].1[1], ArgValue::Int16(-1));
+    }
+
+    // -----------------------------------------------------------------------
+    // Integration: encode → decode roundtrip
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_encode_decode_roundtrip_no_params() {
+        let mut parser = Parser::new();
+        parser.register(1, "NOP").unwrap();
+
+        let payload = parser.encode("NOP", &[]).unwrap();
+        let decoded = parser.decode(payload).unwrap();
+
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].0, "NOP");
+        assert!(decoded[0].1.is_empty());
+    }
+
+    #[test]
+    fn test_encode_decode_roundtrip_all_types() {
+        let mut parser = Parser::new();
+        parser.register(
+            1,
+            "ALL a=%u b=%i c=%hu d=%hi e=%s f=%c g=%.*s",
+        ).unwrap();
+
+        let values = vec![
+            ArgValue::UInt32(0xDEADBEEF),
+            ArgValue::Int32(-12345),
+            ArgValue::UInt16(1234),
+            ArgValue::Int16(-567),
+            ArgValue::Str("klipper".to_string()),
+            ArgValue::UInt8(255),
+            ArgValue::Bytes(vec![0x00, 0xFF, 0xAA]),
+        ];
+
+        let payload = parser.encode("ALL", &values).unwrap();
+        let decoded = parser.decode(payload).unwrap();
+
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].0, "ALL");
+        assert_eq!(decoded[0].1.len(), 7);
+        for (expected, actual) in values.iter().zip(decoded[0].1.iter()) {
+            assert_eq!(expected, actual);
+        }
+    }
+
+    #[test]
+    fn test_encode_decode_roundtrip_multiple_messages() {
+        let mut parser = Parser::new();
+        parser.register(1, "A x=%u").unwrap();
+        parser.register(2, "B y=%s").unwrap();
+
+        let mut payload_a = parser.encode("A", &[ArgValue::UInt32(1)]).unwrap();
+        let payload_b = parser.encode("B", &[ArgValue::Str("test".to_string())]).unwrap();
+        payload_a.try_merge(&payload_b).unwrap();
+
+        let decoded = parser.decode(payload_a).unwrap();
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].0, "A");
+        assert_eq!(decoded[0].1[0], ArgValue::UInt32(1));
+        assert_eq!(decoded[1].0, "B");
+        assert_eq!(decoded[1].1[0], ArgValue::Str("test".to_string()));
+    }
+
+    // -----------------------------------------------------------------------
+    // Integration: register → bind → decode → callback
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_bind_decode_lifecycle() {
+        let mut parser = Parser::new();
+        parser.register(1, "TEST_CMD a=%u b=%s").unwrap();
+
+        // Bind a callback
+        parser.bind("TEST_CMD", |_| {}).unwrap();
+
+        // Encode with the bound command
+        let payload = parser.encode(
+            "TEST_CMD",
+            &[
+                ArgValue::UInt32(42),
+                ArgValue::Str("hello".to_string()),
+            ],
+        ).unwrap();
+
+        // Decode should return correct values
+        let result = parser.decode(payload).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, "TEST_CMD");
+        assert_eq!(result[0].1.len(), 2);
+        assert_eq!(result[0].1[0], ArgValue::UInt32(42));
+        assert_eq!(result[0].1[1], ArgValue::Str("hello".to_string()));
+    }
+
+    #[test]
+    fn test_bind_decode_multiple_batch() {
+        let mut parser = Parser::new();
+        parser.register(1, "CMD_A x=%u").unwrap();
+        parser.register(2, "CMD_B y=%s").unwrap();
+
+        // Bind callbacks to both commands
+        parser.bind("CMD_A", |_| {}).unwrap();
+        parser.bind("CMD_B", |_| {}).unwrap();
+
+        let mut payload = parser.encode("CMD_A", &[ArgValue::UInt32(1)]).unwrap();
+        let payload_b = parser.encode("CMD_B", &[ArgValue::Str("b".to_string())]).unwrap();
+        payload.try_merge(&payload_b).unwrap();
+
+        let result = parser.decode(payload).unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].0, "CMD_A");
+        assert_eq!(result[0].1[0], ArgValue::UInt32(1));
+        assert_eq!(result[1].0, "CMD_B");
+        assert_eq!(result[1].1[0], ArgValue::Str("b".to_string()));
+    }
+
+    // -----------------------------------------------------------------------
+    // Edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parser_arc_sharing() {
+        // Parser uses Arc<Mutex<...>>, so cloning should share state
+        let mut parser = Parser::new();
+        parser.register(1, "SHARED x=%u").unwrap();
+
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(parser));
+        {
+            let p = shared.lock().unwrap();
+            let payload = p.encode("SHARED", &[ArgValue::UInt32(77)]).unwrap();
+            let decoded = p.decode(payload).unwrap();
+            assert_eq!(decoded[0].1[0], ArgValue::UInt32(77));
+        }
+        // State persists after unlock
+        {
+            let p = shared.lock().unwrap();
+            assert!(p.encode("SHARED", &[ArgValue::UInt32(1)]).is_ok());
+        }
+    }
+
+    #[test]
+    fn test_register_then_bind_then_encode() {
+        // Full lifecycle: register (Base) → bind (Handler) → encode (still works)
+        let mut parser = Parser::new();
+        parser.register(1, "LIFECYCLE a=%u b=%s c=%c").unwrap();
+        parser.bind("LIFECYCLE", |_| {}).unwrap();
+
+        let payload = parser.encode(
+            "LIFECYCLE",
+            &[
+                ArgValue::UInt32(1),
+                ArgValue::Str("test".to_string()),
+                ArgValue::UInt8(2),
+            ],
+        ).unwrap();
+
+        let decoded = parser.decode(payload).unwrap();
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].0, "LIFECYCLE");
+        assert_eq!(decoded[0].1.len(), 3);
+    }
+
+    #[test]
+    fn test_bind_on_handler_still_works() {
+        // bind on a command that's already a Handler should replace the callback
+        let mut parser = Parser::new();
+        parser.register(1, "REBIND x=%u").unwrap();
+
+        // First bind
+        parser.bind("REBIND", |_| {}).unwrap();
+
+        // Re-bind should replace the callback
+        parser.bind("REBIND", |_| {}).unwrap();
+
+        // Encode/decode should still work
+        let payload = parser.encode("REBIND", &[ArgValue::UInt32(1)]).unwrap();
+        let result = parser.decode(payload).unwrap();
+        assert_eq!(result[0].1[0], ArgValue::UInt32(1));
     }
 }

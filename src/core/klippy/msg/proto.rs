@@ -155,6 +155,11 @@ impl Payload {
         }
     }
 
+    /// Create a Payload from raw bytes.
+    pub fn from_raw(raw: Vec<u8>) -> Self {
+        Self { raw }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.raw.is_empty()
     }

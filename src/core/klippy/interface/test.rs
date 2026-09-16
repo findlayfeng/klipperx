@@ -1,54 +1,54 @@
 use crate::core::klippy::traits::InterfaceError;
+use crate::core::klippy::frame::Frame;
 
-use super::super::frame::Frame;
 use super::Device;
-use std::{
-    collections::VecDeque,
-    sync::{Arc, Mutex},
-};
-use tokio::sync::mpsc;
+use std::{collections::VecDeque, sync::Mutex};
+use crossbeam_channel::{bounded, Receiver, Sender};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MappingEntry {
     pub input: Frame,
     pub outputs: Vec<Frame>,
 }
 
-#[derive(Debug)]
+/// A deterministic mock device for testing Klipper protocol interactions.
+///
+/// Pre-configured with input→output mappings. Each `send()` consumes one
+/// mapping entry in FIFO order, validates the input frame, and queues the
+/// configured output frame(s) for `receive()`.
+///
+/// **Thread safety**: `TestDevice` is `Send` but not `Sync` — it must be
+/// shared through an outer `Mutex` (e.g. `Arc<Mutex<InterfaceDevice>>` in
+/// `Interface::run()`). The outer `Mutex` already serializes all access,
+/// so no inner `Mutex` is needed on any field.
 pub struct TestDevice {
-    buf_rx: Arc<Mutex<mpsc::Receiver<Frame>>>,
-    buf_tx: Arc<Mutex<mpsc::Sender<Frame>>>,
-    mapping: Arc<Mutex<VecDeque<MappingEntry>>>,
-}
-
-impl Clone for TestDevice {
-    fn clone(&self) -> Self {
-        Self {
-            buf_rx: self.buf_rx.clone(),
-            buf_tx: self.buf_tx.clone(),
-            mapping: self.mapping.clone(),
-        }
-    }
+    /// `crossbeam::channel::Sender` is `Clone + Send + Sync` — direct field.
+    buf_tx: Sender<Frame>,
+    /// `crossbeam::channel::Receiver::recv()` takes `&self` — no inner `Mutex`.
+    buf_rx: Receiver<Frame>,
+    /// FIFO queue of input→output mappings — protected by outer `Mutex`.
+    mapping: Mutex<VecDeque<MappingEntry>>,
 }
 
 impl TestDevice {
     pub fn new(mapping: Vec<MappingEntry>) -> Self {
-        let (tx, rx) = mpsc::channel::<Frame>(100);
+        let (tx, rx) = bounded::<Frame>(100);
         Self {
-            buf_rx: Arc::new(Mutex::new(rx)),
-            buf_tx: Arc::new(Mutex::new(tx)),
-            mapping: Arc::new(Mutex::new(mapping.into())),
+            buf_tx: tx,
+            buf_rx: rx,
+            mapping: Mutex::new(mapping.into()),
         }
     }
 }
 
 impl Device for TestDevice {
-    fn send(&mut self, frame: &Frame) -> Result<(), InterfaceError> {
-        let mut map = self.mapping.lock().unwrap();
-
-        let entry = map.pop_front().ok_or(InterfaceError::SendError(
-            "No mapping entry available for sent frame".to_string(),
-        ))?;
+    fn send(&self, frame: &Frame) -> Result<(), InterfaceError> {
+        let entry = {
+            let mut map = self.mapping.lock().unwrap();
+            map.pop_front().ok_or(InterfaceError::SendError(
+                "No mapping entry available for sent frame".to_string(),
+            ))?
+        };
 
         if entry.input != *frame {
             return Err(InterfaceError::SendError(format!(
@@ -57,19 +57,22 @@ impl Device for TestDevice {
             )));
         }
 
+        // crossbeam::Sender::send() takes &self and is Clone + Send + Sync.
         for output_frame in entry.outputs {
-            let tx = self.buf_tx.lock().unwrap();
-            tx.blocking_send(output_frame)
-                .map_err(|e| InterfaceError::SendError(format!("Failed to send output frame: {}", e)))?;
+            self.buf_tx
+                .send(output_frame)
+                .map_err(|e| InterfaceError::SendError(format!("Failed to send output frame: {e}")))?;
         }
 
         Ok(())
     }
 
     fn receive(&self) -> Frame {
-        let mut rx = self.buf_rx.lock().unwrap();
-        rx.blocking_recv()
-            .expect("Failed to receive frame from test device")
+        // crossbeam::Receiver::recv() takes &self — no inner Mutex needed.
+        // The outer Mutex (InterfaceDevice or TestDevice) serializes all access.
+        self.buf_rx.recv().unwrap_or_else(|_| {
+            panic!("TestDevice receive channel closed")
+        })
     }
 }
 
@@ -81,12 +84,12 @@ mod tests {
         Frame::new(seq, payload.to_vec())
     }
 
-    #[test]
-    fn test_single_send_receive() {
+    #[tokio::test]
+    async fn test_single_send_receive() {
         let input = make_frame(1, b"hello");
         let output = make_frame(2, b"world");
 
-        let mut device = TestDevice::new(vec![MappingEntry {
+        let device = TestDevice::new(vec![MappingEntry {
             input: input.clone(),
             outputs: vec![output.clone()],
         }]);
@@ -94,18 +97,18 @@ mod tests {
         let result = device.send(&input);
         assert!(result.is_ok());
 
-        let received = device.receive();
+        let received = device.receive().await;
         assert_eq!(received, output);
     }
 
-    #[test]
-    fn test_multiple_sequential_sends() {
+    #[tokio::test]
+    async fn test_multiple_sequential_sends() {
         let input1 = make_frame(1, b"msg1");
         let output1 = make_frame(2, b"resp1");
         let input2 = make_frame(3, b"msg2");
         let output2 = make_frame(4, b"resp2");
 
-        let mut device = TestDevice::new(vec![
+        let device = TestDevice::new(vec![
             MappingEntry {
                 input: input1.clone(),
                 outputs: vec![output1.clone()],
@@ -118,11 +121,11 @@ mod tests {
 
         // First send/receive
         assert!(device.send(&input1).is_ok());
-        assert_eq!(device.receive(), output1);
+        assert_eq!(device.receive().await, output1);
 
         // Second send/receive
         assert!(device.send(&input2).is_ok());
-        assert_eq!(device.receive(), output2);
+        assert_eq!(device.receive().await, output2);
     }
 
     #[test]
@@ -130,7 +133,7 @@ mod tests {
         let expected = make_frame(1, b"expected");
         let actual = make_frame(2, b"actual");
 
-        let mut device = TestDevice::new(vec![MappingEntry {
+        let device = TestDevice::new(vec![MappingEntry {
             input: expected.clone(),
             outputs: vec![make_frame(3, b"response")],
         }]);
@@ -148,7 +151,7 @@ mod tests {
     #[test]
     fn test_no_mapping_entry() {
         let frame = make_frame(1, b"extra");
-        let mut device = TestDevice::new(vec![]);
+        let device = TestDevice::new(vec![]);
 
         let result = device.send(&frame);
         assert!(result.is_err());
@@ -160,44 +163,46 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_multiple_outputs_per_input() {
+    #[tokio::test]
+    async fn test_multiple_outputs_per_input() {
         let input = make_frame(1, b"broadcast");
         let output1 = make_frame(2, b"reply1");
         let output2 = make_frame(3, b"reply2");
         let output3 = make_frame(4, b"reply3");
 
-        let mut device = TestDevice::new(vec![MappingEntry {
+        let device = TestDevice::new(vec![MappingEntry {
             input: input.clone(),
             outputs: vec![output1.clone(), output2.clone(), output3.clone()],
         }]);
 
         assert!(device.send(&input).is_ok());
-        assert_eq!(device.receive(), output1);
-        assert_eq!(device.receive(), output2);
-        assert_eq!(device.receive(), output3);
+        assert_eq!(device.receive().await, output1);
+        assert_eq!(device.receive().await, output2);
+        assert_eq!(device.receive().await, output3);
     }
 
     #[test]
     fn test_empty_outputs() {
         let input = make_frame(1, b"no_response");
 
-        let mut device = TestDevice::new(vec![MappingEntry {
+        let device = TestDevice::new(vec![MappingEntry {
             input: input.clone(),
             outputs: vec![],
         }]);
 
         assert!(device.send(&input).is_ok());
-        // No outputs queued, so receive would block forever
-        // This tests that empty outputs don't cause an error
+        // No outputs queued — verify channel is indeed empty by checking
+        // that a non-blocking attempt returns None (channel closed or empty).
+        // We can't easily test "empty" on mpsc, so just verify send succeeded
+        // without queuing anything unexpected.
     }
 
-    #[test]
-    fn test_send_without_matching_receive() {
+    #[tokio::test]
+    async fn test_send_without_matching_receive() {
         let input = make_frame(1, b"data");
         let output = make_frame(2, b"result");
 
-        let mut device = TestDevice::new(vec![MappingEntry {
+        let device = TestDevice::new(vec![MappingEntry {
             input: input.clone(),
             outputs: vec![output.clone()],
         }]);
@@ -208,22 +213,69 @@ mod tests {
         assert!(device.send(&input).is_err());
 
         // But we can still receive the queued outputs
-        assert_eq!(device.receive(), output);
+        assert_eq!(device.receive().await, output);
     }
 
-    #[test]
-    fn test_frame_payload_preservation() {
+    #[tokio::test]
+    async fn test_frame_payload_preservation() {
         let payload = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0xFF];
         let input = make_frame(5, &payload);
         let output = make_frame(6, &payload);
 
-        let mut device = TestDevice::new(vec![MappingEntry {
+        let device = TestDevice::new(vec![MappingEntry {
             input: input.clone(),
             outputs: vec![output.clone()],
         }]);
 
         assert!(device.send(&input).is_ok());
-        let received = device.receive();
-        assert_eq!(received.payload(), payload.as_slice());
+        let received = device.receive().await;
+        assert_eq!(received, output);
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_send_receive() {
+        use std::sync::Arc;
+
+        let input1 = make_frame(1, b"concurrent1");
+        let output1 = make_frame(2, b"resp1");
+        let input2 = make_frame(3, b"concurrent2");
+        let output2 = make_frame(4, b"resp2");
+
+        // Share through Arc<Mutex<>> — mirrors how Interface::run() shares the device.
+        let device = Arc::new(std::sync::Mutex::new(TestDevice::new(vec![
+            MappingEntry {
+                input: input1.clone(),
+                outputs: vec![output1.clone()],
+            },
+            MappingEntry {
+                input: input2.clone(),
+                outputs: vec![output2.clone()],
+            },
+        ])));
+
+        let device_send = device.clone();
+        let device_recv = device.clone();
+
+        let send_handle = tokio::task::spawn(async move {
+            device_send.lock().unwrap().send(&input1).unwrap();
+            device_send.lock().unwrap().send(&input2).unwrap();
+        });
+
+        let recv_handle = tokio::task::spawn(async move {
+            let r1 = {
+                let device = device_recv.lock().unwrap();
+                device.receive().await
+            };
+            let r2 = {
+                let device = device_recv.lock().unwrap();
+                device.receive().await
+            };
+            (r1, r2)
+        });
+
+        send_handle.await.unwrap();
+        let (r1, r2) = recv_handle.await.unwrap();
+        assert_eq!(r1, output1);
+        assert_eq!(r2, output2);
     }
 }

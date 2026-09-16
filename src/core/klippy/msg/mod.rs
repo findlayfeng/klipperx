@@ -6,7 +6,6 @@ pub mod proto;
 // Re-export commonly-used items for convenience
 pub use error::{MsgError, MsgResult};
 pub use param::Param;
-pub use parser::InboundMessage;
 pub use proto::{ArgType, ArgValue};
 
 // ===========================================================================

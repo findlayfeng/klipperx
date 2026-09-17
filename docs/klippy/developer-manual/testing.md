@@ -2,6 +2,8 @@
 
 测试与被测代码同文件，位于各模块的 `#[cfg(test)] mod tests`，不需要外部进程或真实串口。底层 IO 由 `interface::test::TestDevice` 模拟：它按 FIFO 逐条比对收到的帧，并把预设的输出帧排队给 `receive()`。
 
+另有一个**真实设备**测试：`interface::host::HostDevice` 通过 `dlopen` 加载 klipper 的 host 库（`third_party/klipper/src/host/`），并在其中跑一个 `get_clock` 往返。该库由 dev-dependency `klipperx-test-support` 的 `build.rs` 调 `make` 构建（`third_party/klipper/out/libklipper_host.so`），所以它需要 `make` 与 C 工具链；库的全局状态决定了一个进程同一时刻只能有一个 `HostDevice`。
+
 ## 运行
 
 ```bash
@@ -43,11 +45,19 @@ cargo test --lib test_install_skips   # 单个用例（按名过滤）
 | `identify.rs` | 两个视图对 `IDENTIFY_MESSAGES` 的双向校验（`args()` 的字节形状、编码后解码与 `args()` 一致、按名取 `offset` / `data`）、空 `data` 的完成标记、参数类型或名字不符时报 `Decode`；`IDENTIFY_CHUNK_SIZE` 与 Klipper 的 `count=40` 一致（端到端分块流程见 `identify.rs` 的测试） |
 | `clock.rs` | 读取时钟、32 位回绕值、握手前失败、超时；另有不依赖 MCU 的 `ClockSync` 实现，验证 trait 作为测试缝可用。**该文件目前不参与编译**（`pub mod clock;` 被注释），这 5 个测试与文件一起休眠，恢复时自动回归 |
 
+### `interface`
+
+| 模块 | 覆盖 |
+|------|------|
+| `host.rs` | 分包重组（整帧未到不吐帧、一次读里多帧、读边界落在帧中间）、乱码后按下一个 SYNC 重新同步、CRC 损坏帧被跳过且不影响其后的帧、整段无 SYNC 时保持失步；库路径不存在时报错；对着**真实 host 库**的全流程：`starting` 帧、`get_clock` ↔ `clock` 往返、`shutdown` 后 `receive()` 返回 `None` |
+
 ## 写 MCU 相关测试的两个要点
 
 1. **帧要比得完整**：`TestDevice` 比对的是 `Frame`（seq + payload）。请求 payload 可以直接用 `Payload::push_*` 拼，或 `Parser::encode` 得到。
 2. **序号必须对齐**：发送任务每批 +1，接收任务另有独立计数器、只数**收到的**帧，两者都只取低 4 位。每个请求都有响应时，第 i 次交换的请求与响应帧序号都是 `i & 0xf`；但**某个请求没有响应时两者会错开**——只用 `send_msg` 时第一个「被收到的帧」是第 2 个请求的响应，它的序号必须是 0 而不是 1（`mod.rs::test_send_msg_puts_the_command_on_the_wire` 就是这个形状）。
    序号只有 4 位，超过 16 次交换会回绕，忘记 `& 0x0f` 会让第 17 帧起被静默丢弃（表现为超时）。
+
+`HostDevice` 的往返测试示范了怎么对付一个**阻塞**的 `receive()`：它从独立线程调用并把结果送回 channel，主线程用 `recv_timeout` 给出 5 秒上限——否则一个真出了问题的手感就是测试永久挂住。
 
 握手测试的现成写法见 `identify.rs` 的 `chunked_mappings`：它按块大小生成「请求帧 → 响应帧」映射，并用 `flate2` 现场压缩字典内容。
 

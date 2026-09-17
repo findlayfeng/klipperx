@@ -3,8 +3,8 @@
 // This module provides:
 // - Interface enum: abstract interface for printer communication
 // - SerialInterface: serial interface implementation
-// - LibInterface: real implementation using klipper host library (temporarily disabled)
-//   See interface/host.rs for the original implementation (commented out from build)
+// - HostDevice: real implementation running klipper's host library, loaded at
+//   runtime (see interface/host.rs)
 
 pub mod cmd;
 pub mod config;
@@ -29,6 +29,7 @@ pub use msg::Msg;
 pub use traits::{
     InterfaceEvent, Printer, PrinterEvent, PrinterObject, PrinterState, StateMessage,
 };
+// pub use interface::host::HostDevice;
 // pub use interface::serial::SerialInterface;
 // pub use interface::canbus::CanbusInterface;
 // pub use mcu::{MCU, McuError, McuPin, PinParams};

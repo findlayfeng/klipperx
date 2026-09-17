@@ -14,6 +14,7 @@ pub mod cmd;
 pub use codec::{McuCommand, McuResponse, Params};
 pub use dictionary::{Dictionary, Enumeration, MessageDef, OutputDef};
 pub use error::{McuCallError, McuError};
+pub use identify::{Identify, IDENTIFY_TIMEOUT};
 pub use restart_method::McuRestartMethod;
 
 use crate::core::klippy::config::mcu::McuConfig;
@@ -35,9 +36,9 @@ use tracing::{debug, error, info, warn};
 /// The host owns no message formats beyond the identify pair: everything else is
 /// learned from the MCU's data dictionary. [`Mcu::install_dictionary`] is what
 /// turns a freshly created object into a usable one; the typed command API
-/// ([`Mcu::send_msg`] / [`Mcu::call_msg`]) refuses to run before that. The
-/// handshake that produces the dictionary is a command module — see
-/// [`cmd::identify::connect`].
+/// ([`Mcu::send_msg`] / [`Mcu::call_msg`]) refuses to run before that.
+/// [`Mcu::connect`] does the whole bootstrap in one call, and [`Mcu::identify`]
+/// exposes the handshake on its own for a custom timeout or a retry.
 pub struct Mcu {
     /// MCU name
     name: String,
@@ -217,11 +218,50 @@ impl Mcu {
         }
     }
 
+    /// Create an MCU and complete the identify handshake.
+    ///
+    /// This is the normal entry point: it connects, fetches the firmware's data
+    /// dictionary, and installs it, leaving a fully usable MCU. The handle is an
+    /// [`Arc`] because command modules share it — dropping the last one shuts the
+    /// device down (see the [`Drop`] implementation).
+    ///
+    /// # Errors
+    /// Returns [`McuError`] if the handshake fails. The partially initialized MCU
+    /// is dropped, which shuts the interface down again.
+    pub async fn connect(config: McuConfig) -> Result<Arc<Mcu>, McuError> {
+        let mcu = Arc::new(Mcu::from(config));
+        mcu.identify(IDENTIFY_TIMEOUT).await?;
+        Ok(mcu)
+    }
+
+    /// Run the identify handshake: fetch the firmware data dictionary and install
+    /// it.
+    ///
+    /// Returns the number of messages newly registered from the dictionary.
+    /// Calling this on an MCU that is already identified replaces the dictionary;
+    /// messages already registered are skipped, so an interrupted handshake can be
+    /// retried.
+    ///
+    /// # Errors
+    /// Returns [`McuError`] if the exchange fails, the payload cannot be decoded,
+    /// or the dictionary cannot be installed.
+    pub async fn identify(&self, timeout: Duration) -> Result<usize, McuError> {
+        let identify = Identify::fetch(self, timeout).await?;
+        let dictionary = Dictionary::from_json(identify.data)?;
+        let installed = self.install_dictionary(dictionary)?;
+
+        info!(
+            "MCU '{}' identified: {} messages registered",
+            self.name, installed
+        );
+        Ok(installed)
+    }
+
     /// Install the firmware's data dictionary.
     ///
-    /// This is the second half of the handshake: once the dictionary is known,
-    /// every command and response the firmware implements becomes usable. Two
-    /// things happen:
+    /// Called by [`Mcu::identify`] once the identify payload has been fetched; it
+    /// is public because a dictionary can also arrive from elsewhere, such as a
+    /// cached copy or a test fixture. Two things happen:
     ///
     /// * commands and responses are registered with the parser. The receive task
     ///   holds a clone of the same [`Parser`], so decoded messages become

@@ -35,6 +35,8 @@
 
 | 方法 | 说明 |
 |------|------|
+| `Mcu::connect(config) -> Arc<Mcu>` | 正常入口：建连 + identify 握手 + 安装字典 |
+| `identify(timeout) -> Result<usize>` | 单独执行握手，返回新注册的消息条数 |
 | `install_dictionary(dict) -> Result<usize>` | 安装字典（注册到 `Parser` 并留存） |
 | `dictionary() -> Option<Arc<Dictionary>>` | 已安装的字典 |
 | `is_identified() -> bool` | 是否已完成握手 |
@@ -44,9 +46,9 @@
 | `send_msg::<C>(&C)` | 类型化单向发送 |
 | `call_msg::<C, R>(&C, timeout)` | 类型化请求/响应 |
 
-`Mcu` 不是 `Clone`，并且实现了 `Drop`：最后一个句柄被释放时调用 `Interface::shutdown()` 并 abort 接收任务。因此特性层统一持有 `Arc<Mcu>`，不要克隆。
+`Mcu` 不是 `Clone`，并且实现了 `Drop`：最后一个句柄被释放时调用 `Interface::shutdown()` 并 abort 接收任务。因此命令层统一持有 `Arc<Mcu>`，不要克隆。
 
-`Mcu` 自己不执行握手：字典从哪来是协议知识，属于 `mcu::cmd`。正常入口是 [`cmd::identify::connect`](identify.md)，它建连、握手、装着字典后返回 `Arc<Mcu>`。
+正常入口是 `Mcu::connect(config)`：建连 + 握手 + 安装字典后返回 `Arc<Mcu>`；需要自定义超时或重试时用 `Mcu::identify(timeout)`。identify 的格式与分块拼装属于传输层（`mcu::identify`，见 [Identify 机制](identify.md)），因为它是唯一在字典存在之前运行的交换。
 
 ### 裸接口与类型化接口
 
@@ -56,7 +58,7 @@
 | 返回值 | `Payload` / `Vec<ArgValue>` | 自定义类型 |
 | 握手门禁 | 无 | 无字典时返回 `McuError::NotIdentified` |
 | 名称校验 | 发送时才由 `Parser` 报错 | 发送**前**即报 `UnknownMessage` |
-| 用途 | identify 握手、极底层调试 | 特性层 |
+| 用途 | identify 握手、极底层调试 | 命令层 |
 
 ## `Dictionary` — 固件自述的协议
 
@@ -159,12 +161,14 @@ pub trait ClockSync {
 - 命令模块由 `Arc<Mcu>` 构造，多个模块可共用一个 MCU。
 - trait 也是一道测试缝：`mcu::cmd::clock` 的测试里就有一个不依赖 MCU 的 `FixedClock` 实现。
 
+identify 是唯一的例外：它不在这一层，格式由主机自有、且运行在字典存在之前，所以与传输放在一起（`mcu::identify`，入口 `Mcu::connect`）。除此之外**任何**命令都应走上表的模式。
+
 ## 新增一条命令的步骤
 
 1. **确认固件协议**：在固件的 `.dict`（或生成的字典）里找到 `commands` / `responses` 中的格式串，记下消息名与参数名。**不要**把它们抄成主机侧的常量。
 2. **定义消息类型**：在所属 `cmd` 模块里实现 `McuCommand` / `McuResponse`，只写 `NAME` 与 `args()` / `decode()`。
 3. **定义或扩展能力 trait**：在命令层暴露一个语义化方法（如 `get_clock`），并提供一个 `Mcu*` 实现调 `Mcu::call_msg` / `send_msg`。
-4. **不需要手工注册**：[`cmd::identify::connect`](identify.md) 会把字典里所有命令与响应装进 `Parser`。
+4. **不需要手工注册**：[`Mcu::connect`](identify.md) 会把字典里所有命令与响应装进 `Parser`。
 5. **补测试**：用 `TestDevice` 的 `MappingEntry` 构造期望的收发帧（见下）。
 
 ### 测试要点：帧序号

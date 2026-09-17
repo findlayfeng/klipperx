@@ -17,6 +17,20 @@ pub struct McuConfig {
     pub interface: Interface,
 }
 
+/// Parse Klipper's `canbus_uuid`: six bytes as twelve hex digits.
+fn parse_canbus_uuid(text: &str) -> Result<[u8; 6], String> {
+    let text = text.trim();
+    if text.len() != 12 {
+        return Err(format!("expected 12 hex digits, got {}", text.len()));
+    }
+    let mut uuid = [0u8; 6];
+    for (i, byte) in uuid.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&text[i * 2..i * 2 + 2], 16)
+            .map_err(|_| format!("'{text}' is not hexadecimal"))?;
+    }
+    Ok(uuid)
+}
+
 /// The connection keys a `[mcu]` section may carry, in the order errors list
 /// them. Exactly one of them names the transport, the way Klipper's own `[mcu]`
 /// works (`serial` or `canbus_uuid`): see [`McuConfig::create_interface`].
@@ -24,14 +38,14 @@ pub struct McuConfig {
 /// `test` exists in test builds only — it is how the unit tests script a device.
 fn interface_keys() -> &'static [&'static str] {
     #[cfg(test)]
-    return &["host_library", "serial", "canserial_nodeid", "test"];
+    return &["host_library", "serial", "canbus_uuid", "test"];
     #[cfg(not(test))]
-    return &["host_library", "serial", "canserial_nodeid"];
+    return &["host_library", "serial", "canbus_uuid"];
 }
 
 /// Klipper's node-id range: ids are mapped to `0x100 + 2 * nodeid`, and the MCU
 /// answers on the next arbitration id, so the whole 11-bit id space has to fit.
-const MAX_CANSERIAL_NODEID: u32 = 0x37f;
+const MAX_CANBUS_NODEID: u32 = 0x37f;
 
 impl McuConfig {
     /// Parse MCU configuration from a ConfigSection.
@@ -53,8 +67,9 @@ impl McuConfig {
     ///
     /// ```ini
     /// [mcu]
-    /// canserial_nodeid: 2
-    /// canserial_interface: can0
+    /// canbus_uuid: 11aa22bb33cc
+    /// canbus_interface: can0
+    /// canbus_nodeid: 2
     /// ```
     ///
     /// `baud` only applies to `serial`, and defaults to Klipper's 250000.
@@ -111,30 +126,47 @@ impl McuConfig {
             ));
         }
 
-        if section.has("canserial_nodeid") {
-            let nodeid = match section.get_str("canserial_nodeid") {
+        if let Some(text) = section.get_str("canbus_uuid") {
+            let uuid = parse_canbus_uuid(text).map_err(|e| {
+                format!(
+                    "MCU '{}' has an invalid canbus_uuid: {e}",
+                    section.identifier()
+                )
+            })?;
+            let interface = section
+                .get_str("canbus_interface")
+                .unwrap_or("can0")
+                .to_string();
+            // Klipper hands out node ids from its `[canbus_ids]` section; klipperx
+            // has no such allocator yet, so the section states the id itself.
+            let nodeid = match section.get_str("canbus_nodeid") {
                 Some(text) => match text.parse::<u32>() {
-                    Ok(nodeid) if (1..=MAX_CANSERIAL_NODEID).contains(&nodeid) => nodeid,
+                    Ok(nodeid) if (1..=MAX_CANBUS_NODEID).contains(&nodeid) => nodeid,
                     _ => {
                         return Err(format!(
-                            "MCU '{}' has an invalid canserial_nodeid: '{text}' \
-                             (expected 1..={MAX_CANSERIAL_NODEID})",
+                            "MCU '{}' has an invalid canbus_nodeid: '{text}' \
+                             (expected 1..={MAX_CANBUS_NODEID})",
                             section.identifier()
                         ))
                     }
                 },
                 None => {
                     return Err(format!(
-                        "MCU '{}' needs a value for canserial_nodeid",
+                        "MCU '{}' is on a CAN bus, so it needs a canbus_nodeid \
+                         (klipperx does not allocate one yet)",
                         section.identifier()
                     ))
                 }
             };
-            let interface = section
-                .get_str("canserial_interface")
-                .unwrap_or("can0")
-                .to_string();
-            return Interface::canserial(&interface, nodeid).map_err(|e| format!("canserial: {e}"));
+            return Interface::canserial(&interface, uuid, nodeid)
+                .map_err(|e| format!("canbus: {e}"));
+        }
+
+        if section.has("canbus_nodeid") || section.has("canbus_interface") {
+            return Err(format!(
+                "MCU '{}' needs a canbus_uuid to go with its CAN settings",
+                section.identifier()
+            ));
         }
 
         if let Some(path) = section.get_str("host_library") {
@@ -326,36 +358,66 @@ mod tests {
         assert!(err.contains("/dev/not-a-serial-port"), "{err}");
     }
 
+    /// A CAN section, with `overrides` on top of a complete one.
+    fn can_section(overrides: &[(&str, &str)]) -> ConfigSection {
+        let mut section = section_with("canbus_uuid", "11aa22bb33cc");
+        section.parameters.insert(
+            "canbus_nodeid".to_string(),
+            ConfigValue::Single("2".to_string()),
+        );
+        for (key, value) in overrides {
+            section
+                .parameters
+                .insert(key.to_string(), ConfigValue::Single(value.to_string()));
+        }
+        section
+    }
+
     #[test]
-    fn test_canserial_key_becomes_the_can_interface() {
+    fn test_canbus_keys_become_the_can_interface() {
         // No CAN interface in the test environment, so the routing shows up as the
         // socket's error naming the interface we asked for.
-        let mut section = section_with("canserial_nodeid", "2");
-        section.parameters.insert(
-            "canserial_interface".to_string(),
-            ConfigValue::Single("can99".to_string()),
-        );
+        let section = can_section(&[("canbus_interface", "can99")]);
         let err = McuConfig::new(&section).unwrap_err();
-        assert!(err.starts_with("canserial: "), "{err}");
+        assert!(err.starts_with("canbus: "), "{err}");
         assert!(err.contains("can99"), "{err}");
     }
 
     #[test]
-    fn test_canserial_nodeid_is_validated() {
-        for bad in ["0", "fast", "900"] {
-            let section = section_with("canserial_nodeid", bad);
+    fn test_canbus_uuid_is_parsed_as_klipper_writes_it() {
+        assert_eq!(
+            parse_canbus_uuid("11aa22bb33cc").unwrap(),
+            [0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc]
+        );
+        for bad in ["11aa22bb33c", "11aa22bb33ccdd", "11aa22bb33cg", ""] {
+            let section = can_section(&[("canbus_uuid", bad)]);
             let err = McuConfig::new(&section).unwrap_err();
-            assert!(err.contains("invalid canserial_nodeid"), "{bad}: {err}");
+            assert!(err.contains("invalid canbus_uuid"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn test_canbus_nodeid_is_validated() {
+        for bad in ["0", "fast", "900"] {
+            let section = can_section(&[("canbus_nodeid", bad)]);
+            let err = McuConfig::new(&section).unwrap_err();
+            assert!(err.contains("invalid canbus_nodeid"), "{bad}: {err}");
         }
 
-        let mut section = section_with("canserial_nodeid", "2");
-        section.parameters.insert(
-            "canserial_interface".to_string(),
-            ConfigValue::Single("can0".to_string()),
-        );
         // A valid node id gets as far as the socket, which is where it fails here.
-        let err = McuConfig::new(&section).unwrap_err();
+        let err = McuConfig::new(&can_section(&[])).unwrap_err();
         assert!(err.contains("no CAN interface named 'can0'"), "{err}");
+    }
+
+    #[test]
+    fn test_canbus_settings_without_a_uuid_are_reported() {
+        let section = section_with("canbus_nodeid", "2");
+        let err = McuConfig::new(&section).unwrap_err();
+        assert!(err.contains("needs a canbus_uuid"), "{err}");
+
+        let section = section_with("canbus_interface", "can0");
+        let err = McuConfig::new(&section).unwrap_err();
+        assert!(err.contains("needs a canbus_uuid"), "{err}");
     }
 
     #[test]

@@ -33,7 +33,7 @@ pub trait Device: Send + Sync {
 /// One variant per transport a `[mcu]` section can ask for:
 /// - `Serial(SerialDevice)` — a real MCU on a tty (`serial:`)
 /// - `CanSerial(CanSerialDevice)` — a real MCU reached over CAN, using Klipper's
-///   can-serial link (`canserial_interface:` + `canserial_nodeid:`)
+///   can-serial link (`canbus_uuid:` + `canbus_interface:` + `canbus_nodeid:`)
 /// - `Host(HostDevice)` — klipper's host library, loaded from a shared object
 ///   (`host_library:`)
 /// - `Test(TestDevice)` — a scripted device, in test builds (`test:`)
@@ -66,15 +66,15 @@ impl Interface {
         Ok(Self::Serial(Arc::new(SerialDevice::open(path, baud)?)))
     }
 
-    /// Create an interface for a real MCU on the CAN interface `name`, at the
-    /// CAN node `nodeid`.
+    /// Create an interface for the MCU `uuid` on the CAN interface `name`, brought
+    /// up as node `nodeid`.
     ///
     /// # Errors
     /// Returns [`InterfaceError`] if the interface does not exist or the socket
     /// cannot be set up.
-    pub fn canserial(name: &str, nodeid: u32) -> Result<Self, InterfaceError> {
+    pub fn canserial(name: &str, uuid: [u8; 6], nodeid: u32) -> Result<Self, InterfaceError> {
         Ok(Self::CanSerial(Arc::new(CanSerialDevice::open(
-            name, nodeid,
+            name, uuid, nodeid,
         )?)))
     }
 

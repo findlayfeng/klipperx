@@ -3,6 +3,8 @@ pub mod param;
 pub mod parser;
 pub mod proto;
 
+use std::sync::{Arc, Mutex};
+
 // Re-export commonly-used items for convenience
 pub use error::{MsgError, MsgResult};
 pub use param::Param;
@@ -118,7 +120,7 @@ pub struct MsgHandler {
     /// The underlying command definition.
     msg: MsgBase,
     /// Callback invoked when this command is matched.
-    callback: Box<dyn FnMut(&[ArgValue]) + Send>,
+    callback: Arc<Mutex<Box<dyn FnMut(&[ArgValue]) + Send>>>,
 }
 
 impl std::fmt::Debug for MsgHandler {
@@ -140,7 +142,7 @@ impl MsgHandler {
         callback: impl FnMut(&[ArgValue]) + Send + 'static,
     ) -> Self {
         Self { msg,
-            callback: Box::new(callback),
+            callback: Arc::new(Mutex::new(Box::new(callback))),
         }
     }
 
@@ -154,12 +156,12 @@ impl MsgHandler {
     /// The callback receives a slice of `ArgValue` containing all decoded
     /// parameter values in command definition order.
     pub fn set_callback(&mut self, callback: impl FnMut(&[ArgValue]) + Send + 'static) {
-        self.callback = Box::new(callback);
+        *self.callback.lock().unwrap() = Box::new(callback);
     }
 
     /// Invoke the callback with the given parameters.
     pub fn invoke_callback(&mut self, params: &[ArgValue]) {
-        (self.callback)(params);
+        (self.callback.lock().unwrap())(params);
     }
 }
 

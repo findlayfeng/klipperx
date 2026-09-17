@@ -18,7 +18,7 @@ pub struct Msg {
 /// resolved through the id index so each message is stored exactly once.
 #[derive(Debug, Default)]
 struct MsgMap {
-    by_id: HashMap<u8, Msg>,
+    by_id: HashMap<u8, Arc<Msg>>,
     by_name: HashMap<String, u8>,
 }
 
@@ -32,16 +32,16 @@ impl MsgMap {
             return Err(format!("duplicate name: {}", msg.name));
         }
         self.by_name.insert(msg.name.clone(), msg.id);
-        self.by_id.insert(msg.id, msg);
+        self.by_id.insert(msg.id, Arc::new(msg));
         Ok(())
     }
 
     fn get_by_id(&self, id: &u8) -> Option<&Msg> {
-        self.by_id.get(id)
+        self.by_id.get(id).map(|arc| arc.as_ref())
     }
 
     fn get_by_name(&self, name: &str) -> Option<&Msg> {
-        self.by_name.get(name).and_then(|id| self.by_id.get(id))
+        self.by_name.get(name).and_then(|id| self.by_id.get(id).map(|arc| arc.as_ref()))
     }
 }
 
@@ -112,14 +112,16 @@ impl Parser {
 
         // Remove from both indexes before re-inserting
         map.by_name.remove(cmd_name);
-        let msg = map
+        let arc_msg = map
             .by_id
             .remove(&id)
             .ok_or_else(|| MsgError::new(format!("Msg not found: {}", cmd_name)))?;
 
+        // We own this Arc (just removed from the map under Mutex), so try_unwrap always succeeds
+        let msg = Arc::try_unwrap(arc_msg).unwrap_or_else(|_| unreachable!("ref count should be 1"));
         let command = msg.command.with_callback(callback);
         map.try_insert(Msg {
-            id,
+            id: msg.id,
             name: msg.name,
             command,
         })
@@ -174,10 +176,10 @@ impl Parser {
     /// and the remaining bytes are decoded according to that message's
     /// parameter type list.
     ///
-    /// Returns `Vec<(String, Vec<ArgValue>)>` where each tuple contains a message
-    /// Name and its decoded parameter values, in the order they appear in the
-    /// payload.
-    pub fn decode(&self, payload: Payload) -> MsgResult<Vec<(String, Vec<ArgValue>)>> {
+    /// Returns `Vec<(Arc<Msg>, Vec<ArgValue>)>` where each tuple contains an
+    /// owned reference to the message definition and its decoded parameter
+    /// values, in the order they appear in the payload.
+    pub fn decode(&self, payload: Payload) -> MsgResult<Vec<(Arc<Msg>, Vec<ArgValue>)>> {
         let map = self
             .msgs
             .lock()
@@ -191,12 +193,13 @@ impl Parser {
             let id = parser.pop()?;
 
             // Look up the message definition
-            let msg = map
-                .get_by_id(&id)
+            let arc_msg = map
+                .by_id
+                .get(&id)
                 .ok_or_else(|| MsgError::new(format!("Unknown message id: {}", id)))?;
 
             // Decode parameters according to the message's parameter types
-            let param_types = match &msg.command {
+            let param_types = match &arc_msg.command {
                 MsgEntry::Base(base) => base.params(),
                 MsgEntry::Handler(handler) => handler.params(),
             };
@@ -206,7 +209,7 @@ impl Parser {
                 values.push(parser.pop_value(*arg_type)?);
             }
 
-            result.push((msg.name.clone(), values));
+            result.push((arc_msg.clone(), values));
         }
 
         Ok(result)
@@ -390,7 +393,7 @@ mod tests {
         // Decode should work and return correct values
         let result = parser.decode(payload).unwrap();
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].0, "CMD_A");
+        assert_eq!(result[0].0.name, "CMD_A");
         assert_eq!(result[0].1[0], ArgValue::UInt32(10));
     }
 
@@ -438,7 +441,7 @@ mod tests {
         ).unwrap();
 
         let result = parser.decode(payload).unwrap();
-        assert_eq!(result[0].0, "CMD_MULTI");
+        assert_eq!(result[0].0.name, "CMD_MULTI");
         assert_eq!(result[0].1.len(), 3);
         assert_eq!(result[0].1[0], ArgValue::UInt32(42));
         assert_eq!(result[0].1[1], ArgValue::Str("hello".to_string()));
@@ -534,7 +537,7 @@ mod tests {
 
         let result = parser.decode(payload).unwrap();
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].0, "NOP");
+        assert_eq!(result[0].0.name, "NOP");
         assert!(result[0].1.is_empty());
     }
 
@@ -548,7 +551,7 @@ mod tests {
 
         let result = parser.decode(payload).unwrap();
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].0, "GET_X");
+        assert_eq!(result[0].0.name, "GET_X");
         assert_eq!(result[0].1[0], ArgValue::UInt32(42));
     }
 
@@ -564,7 +567,7 @@ mod tests {
 
         let result = parser.decode(payload).unwrap();
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].0, "CMD");
+        assert_eq!(result[0].0.name, "CMD");
         assert_eq!(result[0].1.len(), 3);
         assert_eq!(result[0].1[0], ArgValue::UInt32(100));
         assert_eq!(result[0].1[1], ArgValue::Str("hello".to_string()));
@@ -588,13 +591,13 @@ mod tests {
         let result = parser.decode(payload).unwrap();
         assert_eq!(result.len(), 3);
 
-        assert_eq!(result[0].0, "MSG_A");
+        assert_eq!(result[0].0.name, "MSG_A");
         assert_eq!(result[0].1[0], ArgValue::UInt32(10));
 
-        assert_eq!(result[1].0, "MSG_B");
+        assert_eq!(result[1].0.name, "MSG_B");
         assert_eq!(result[1].1[0], ArgValue::Str("world".to_string()));
 
-        assert_eq!(result[2].0, "MSG_C");
+        assert_eq!(result[2].0.name, "MSG_C");
         assert!(result[2].1.is_empty());
     }
 
@@ -649,7 +652,7 @@ mod tests {
         let decoded = parser.decode(payload).unwrap();
 
         assert_eq!(decoded.len(), 1);
-        assert_eq!(decoded[0].0, "NOP");
+        assert_eq!(decoded[0].0.name, "NOP");
         assert!(decoded[0].1.is_empty());
     }
 
@@ -675,7 +678,7 @@ mod tests {
         let decoded = parser.decode(payload).unwrap();
 
         assert_eq!(decoded.len(), 1);
-        assert_eq!(decoded[0].0, "ALL");
+        assert_eq!(decoded[0].0.name, "ALL");
         assert_eq!(decoded[0].1.len(), 7);
         for (expected, actual) in values.iter().zip(decoded[0].1.iter()) {
             assert_eq!(expected, actual);
@@ -694,9 +697,9 @@ mod tests {
 
         let decoded = parser.decode(payload_a).unwrap();
         assert_eq!(decoded.len(), 2);
-        assert_eq!(decoded[0].0, "A");
+        assert_eq!(decoded[0].0.name, "A");
         assert_eq!(decoded[0].1[0], ArgValue::UInt32(1));
-        assert_eq!(decoded[1].0, "B");
+        assert_eq!(decoded[1].0.name, "B");
         assert_eq!(decoded[1].1[0], ArgValue::Str("test".to_string()));
     }
 
@@ -724,7 +727,7 @@ mod tests {
         // Decode should return correct values
         let result = parser.decode(payload).unwrap();
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].0, "TEST_CMD");
+        assert_eq!(result[0].0.name, "TEST_CMD");
         assert_eq!(result[0].1.len(), 2);
         assert_eq!(result[0].1[0], ArgValue::UInt32(42));
         assert_eq!(result[0].1[1], ArgValue::Str("hello".to_string()));
@@ -746,9 +749,9 @@ mod tests {
 
         let result = parser.decode(payload).unwrap();
         assert_eq!(result.len(), 2);
-        assert_eq!(result[0].0, "CMD_A");
+        assert_eq!(result[0].0.name, "CMD_A");
         assert_eq!(result[0].1[0], ArgValue::UInt32(1));
-        assert_eq!(result[1].0, "CMD_B");
+        assert_eq!(result[1].0.name, "CMD_B");
         assert_eq!(result[1].1[0], ArgValue::Str("b".to_string()));
     }
 
@@ -794,7 +797,7 @@ mod tests {
 
         let decoded = parser.decode(payload).unwrap();
         assert_eq!(decoded.len(), 1);
-        assert_eq!(decoded[0].0, "LIFECYCLE");
+        assert_eq!(decoded[0].0.name, "LIFECYCLE");
         assert_eq!(decoded[0].1.len(), 3);
     }
 

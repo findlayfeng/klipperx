@@ -12,7 +12,7 @@
 
 ```
                      ┌──────────────── cmd ─────────────────┐
-                     │ ClockSync / McuClock / …             │
+                     │ 命令模块（当前无启用的模块）           │
                      │ call_msg::<GetClock, ClockState>()   │
                      └───────────────┬──────────────────────┘
                                      │ McuCommand / McuResponse
@@ -162,9 +162,11 @@ pub trait ClockSync {
 
 - 能力 trait 用 `impl Future + Send` 而不是 `async fn`：`async fn` in trait 已稳定但不是 dyn-safe，且 `Send` 会变成隐式假设（触发 `async_fn_in_trait` lint）。显式写出后，返回值可直接用于 `tokio::spawn`。
 - 命令模块由 `Arc<Mcu>` 构造，多个模块可共用一个 MCU。
-- trait 也是一道测试缝：`cmd::clock` 的测试里就有一个不依赖 MCU 的 `FixedClock` 实现。
+- trait 也是一道测试缝：`cmd/clock.rs` 的测试里就有一个不依赖 MCU 的 `FixedClock` 实现（该文件目前不参与编译，见下）。
 
-identify 是唯一的例外：它不在这一层，格式由主机自有、且运行在字典存在之前，所以它单独成一个与 `mcu` 平级的模块（`identify`，入口 `Mcu::connect`）。除此之外**任何**命令都应走上表的模式。
+上面这段 `ClockSync` 是**示例**：它所在的 `cmd/clock.rs` 当前没有编译进来（`cmd/mod.rs` 里的 `pub mod clock;` 被注释掉），文件与其测试原样保留，恢复时取消注释即可。除此之外**任何**命令都应走上表的模式。
+
+identify 是唯一的例外：它不在这一层，格式由主机自有、且运行在字典存在之前，所以它单独成一个与 `mcu` 平级的模块（`identify`，入口 `Mcu::connect`）。
 
 ## 新增一条命令的步骤
 

@@ -57,7 +57,7 @@
 | 文件 | 职责 |
 |------|------|
 | `mod.rs` | 命令词汇：`McuCommand` / `McuResponse` / `Params`，以及类型化调用 `Mcu::send_msg` / `Mcu::call_msg` |
-| `clock.rs` | `ClockSync` / `McuClock`：`get_clock` ↔ `clock` |
+| `clock.rs` | `ClockSync` / `McuClock`：`get_clock` ↔ `clock`（**暂不参与编译**：`pub mod clock;` 在 `mod.rs` 里被注释掉，文件与测试原样保留） |
 | `identify.rs` | `identify` / `identify_response` 的类型化视图（分片驱动在 `identify.rs`） |
 
 ### `identify.rs` — Identify 引导

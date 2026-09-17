@@ -33,7 +33,7 @@
 | 文件 | 职责 |
 |------|------|
 | `mod.rs` | `Mcu`：收发任务、`send` / `call`、`connect` / `identify`、字典安装与查询；只声明 `cmd` 不引用它 |
-| `identify.rs` | identify 交换：主机侧唯一的格式定义、类型化视图、分块抓取与解压 |
+| `identify.rs` | identify 交换：主机侧唯一的格式定义、分块驱动与解压（命令视图在 `mcu::cmd::identify`） |
 | `dictionary.rs` | `Dictionary`：解析固件字典、枚举展开、安装进 `Parser` |
 | `codec.rs` | `McuCommand` / `McuResponse` / `Params`：类型化消息视图 |
 | `pending.rs` | `PendingCalls`：同步请求/响应记账 |
@@ -46,8 +46,9 @@
 |------|------|
 | `mod.rs` | 命令层说明与再导出 |
 | `clock.rs` | `ClockSync` / `McuClock`：`get_clock` ↔ `clock` |
+| `identify.rs` | `identify` / `identify_response` 的类型化视图（分片驱动在 `mcu::identify`） |
 
-identify 不在这里：它是**产出**字典的引导交换，格式由主机自有，且运行在 `call_msg` 可用之前，因此它在 `mcu` 层与传输放在一起。
+identify 的命令视图按同一规则放在这里；但它的分片驱动与主机自有格式留在 `mcu::identify`——它是唯一在字典存在之前运行的交换，那时 `call_msg` 还不能用。
 
 ## 目录
 

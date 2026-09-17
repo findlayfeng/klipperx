@@ -61,6 +61,13 @@ pub enum McuError {
     /// The MCU has not completed the identify handshake yet, so no dictionary
     /// is installed and no command can be resolved.
     NotIdentified,
+    /// The identify exchange broke protocol: a chunk arrived out of order, or
+    /// the payload exceeded the size limit.
+    IdentifyProtocol(String),
+    /// The identify payload is not valid zlib data.
+    IdentifyCompression(String),
+    /// The decompressed identify payload is not valid JSON.
+    IdentifyJson(String),
     /// A message could not be registered, encoded, or decoded.
     Msg(MsgError),
     /// A synchronous request/response call failed.
@@ -78,6 +85,11 @@ impl std::fmt::Display for McuError {
             McuError::NotIdentified => {
                 write!(f, "MCU has not completed the identify handshake")
             }
+            McuError::IdentifyProtocol(msg) => write!(f, "identify protocol error: {}", msg),
+            McuError::IdentifyCompression(msg) => {
+                write!(f, "cannot decompress identify payload: {}", msg)
+            }
+            McuError::IdentifyJson(msg) => write!(f, "cannot parse identify payload: {}", msg),
             McuError::Msg(e) => write!(f, "{}", e),
             McuError::Call(e) => write!(f, "{}", e),
         }
@@ -92,7 +104,10 @@ impl std::error::Error for McuError {
             McuError::Dictionary(_)
             | McuError::UnknownMessage(_)
             | McuError::Decode(_)
-            | McuError::NotIdentified => None,
+            | McuError::NotIdentified
+            | McuError::IdentifyProtocol(_)
+            | McuError::IdentifyCompression(_)
+            | McuError::IdentifyJson(_) => None,
         }
     }
 }
@@ -172,6 +187,22 @@ mod tests {
         assert_eq!(
             McuError::NotIdentified.to_string(),
             "MCU has not completed the identify handshake"
+        );
+    }
+
+    #[test]
+    fn test_mcu_error_identify_variants() {
+        assert_eq!(
+            McuError::IdentifyProtocol("offset mismatch".to_string()).to_string(),
+            "identify protocol error: offset mismatch"
+        );
+        assert_eq!(
+            McuError::IdentifyCompression("bad header".to_string()).to_string(),
+            "cannot decompress identify payload: bad header"
+        );
+        assert_eq!(
+            McuError::IdentifyJson("expected value".to_string()).to_string(),
+            "cannot parse identify payload: expected value"
         );
     }
 }

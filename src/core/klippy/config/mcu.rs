@@ -24,10 +24,14 @@ pub struct McuConfig {
 /// `test` exists in test builds only — it is how the unit tests script a device.
 fn interface_keys() -> &'static [&'static str] {
     #[cfg(test)]
-    return &["host_library", "serial", "test"];
+    return &["host_library", "serial", "canserial_nodeid", "test"];
     #[cfg(not(test))]
-    return &["host_library", "serial"];
+    return &["host_library", "serial", "canserial_nodeid"];
 }
+
+/// Klipper's node-id range: ids are mapped to `0x100 + 2 * nodeid`, and the MCU
+/// answers on the next arbitration id, so the whole 11-bit id space has to fit.
+const MAX_CANSERIAL_NODEID: u32 = 0x37f;
 
 impl McuConfig {
     /// Parse MCU configuration from a ConfigSection.
@@ -42,6 +46,15 @@ impl McuConfig {
     ///
     /// [mcu simulated]
     /// host_library: /path/to/libklipper_host.so
+    /// ```
+    ///
+    /// A CAN-connected MCU names its node id instead of a device path, and the
+    /// CAN interface it is on (Klipper's default is `can0`):
+    ///
+    /// ```ini
+    /// [mcu]
+    /// canserial_nodeid: 2
+    /// canserial_interface: can0
     /// ```
     ///
     /// `baud` only applies to `serial`, and defaults to Klipper's 250000.
@@ -96,6 +109,32 @@ impl McuConfig {
                 section.identifier(),
                 requested.join(", ")
             ));
+        }
+
+        if section.has("canserial_nodeid") {
+            let nodeid = match section.get_str("canserial_nodeid") {
+                Some(text) => match text.parse::<u32>() {
+                    Ok(nodeid) if (1..=MAX_CANSERIAL_NODEID).contains(&nodeid) => nodeid,
+                    _ => {
+                        return Err(format!(
+                            "MCU '{}' has an invalid canserial_nodeid: '{text}' \
+                             (expected 1..={MAX_CANSERIAL_NODEID})",
+                            section.identifier()
+                        ))
+                    }
+                },
+                None => {
+                    return Err(format!(
+                        "MCU '{}' needs a value for canserial_nodeid",
+                        section.identifier()
+                    ))
+                }
+            };
+            let interface = section
+                .get_str("canserial_interface")
+                .unwrap_or("can0")
+                .to_string();
+            return Interface::canserial(&interface, nodeid).map_err(|e| format!("canserial: {e}"));
         }
 
         if let Some(path) = section.get_str("host_library") {
@@ -285,6 +324,38 @@ mod tests {
         let err = McuConfig::new(&section).unwrap_err();
         assert!(err.starts_with("serial: "), "{err}");
         assert!(err.contains("/dev/not-a-serial-port"), "{err}");
+    }
+
+    #[test]
+    fn test_canserial_key_becomes_the_can_interface() {
+        // No CAN interface in the test environment, so the routing shows up as the
+        // socket's error naming the interface we asked for.
+        let mut section = section_with("canserial_nodeid", "2");
+        section.parameters.insert(
+            "canserial_interface".to_string(),
+            ConfigValue::Single("can99".to_string()),
+        );
+        let err = McuConfig::new(&section).unwrap_err();
+        assert!(err.starts_with("canserial: "), "{err}");
+        assert!(err.contains("can99"), "{err}");
+    }
+
+    #[test]
+    fn test_canserial_nodeid_is_validated() {
+        for bad in ["0", "fast", "900"] {
+            let section = section_with("canserial_nodeid", bad);
+            let err = McuConfig::new(&section).unwrap_err();
+            assert!(err.contains("invalid canserial_nodeid"), "{bad}: {err}");
+        }
+
+        let mut section = section_with("canserial_nodeid", "2");
+        section.parameters.insert(
+            "canserial_interface".to_string(),
+            ConfigValue::Single("can0".to_string()),
+        );
+        // A valid node id gets as far as the socket, which is where it fails here.
+        let err = McuConfig::new(&section).unwrap_err();
+        assert!(err.contains("no CAN interface named 'can0'"), "{err}");
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use crate::core::klippy::mcu::McuRestartMethod;
-use crate::core::klippy::interface::TestInterface;
+use crate::core::klippy::interface::Interface;
 use super::section::ConfigSection;
 
 /// MCU (Microcontroller Unit) configuration parsed from config file.
@@ -9,14 +9,14 @@ pub struct McuConfig {
     /// MCU restart method
     pub restart_method: McuRestartMethod,
     /// MCU interface for communication
-    pub interface: TestInterface,
+    pub interface: Interface,
 }
 
 impl McuConfig {
     /// Parse MCU configuration from a ConfigSection.
     ///
     /// Inspects the section to determine the interface type:
-    /// - If `test` config block exists and building for tests → creates `TestInterface`
+    /// - If `test` config block exists and building for tests → creates `Interface::Test`
     /// - Otherwise → returns an error (no interface configured)
     ///
     /// # Arguments
@@ -25,7 +25,7 @@ impl McuConfig {
     /// # Returns
     /// `Ok(McuConfig)` with the appropriate interface type,
     /// or `Err` if no supported interface configuration is found.
-    pub fn from_section(section: &ConfigSection) -> Result<Self, String> {
+    pub fn new(section: &ConfigSection) -> Result<Self, String> {
         // Parse common fields
         let (name, restart_method) = Self::parse_common(section);
 
@@ -54,22 +54,16 @@ impl McuConfig {
     }
 
     /// Create the appropriate interface based on section content.
-    #[cfg(test)]
-    fn create_interface(section: &ConfigSection) -> Result<TestInterface, String> {
+    fn create_interface(section: &ConfigSection) -> Result<Interface, String> {
+        #[cfg(test)]
         if section.get("test").is_some() {
             let test_value = section.get("test").unwrap();
             let mappings = Self::parse_test_config(test_value)?;
-            return Ok(TestInterface::new(
+            return Ok(Interface::new(
                 crate::core::klippy::interface::test::TestDevice::new(mappings),
             ));
         }
 
-        Err("no supported interface configuration found (test, serial, canbus, ...)".to_string())
-    }
-
-    /// Create the appropriate interface based on section content.
-    #[cfg(not(test))]
-    fn create_interface(_section: &ConfigSection) -> Result<TestInterface, String> {
         Err("no supported interface configuration found (test, serial, canbus, ...)".to_string())
     }
 

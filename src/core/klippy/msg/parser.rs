@@ -11,8 +11,8 @@ use std::sync::{Arc, Mutex};
 /// resolved through the id index so each message is stored exactly once.
 #[derive(Debug, Default)]
 struct MsgMap {
-    by_id: HashMap<u8, Arc<Msg>>,
-    by_name: HashMap<String, u8>,
+    by_id: HashMap<i16, Arc<Msg>>,
+    by_name: HashMap<String, i16>,
 }
 
 impl MsgMap {
@@ -29,12 +29,12 @@ impl MsgMap {
         Ok(())
     }
 
-    fn get_by_id(&self, id: &u8) -> Option<&Msg> {
-        self.by_id.get(id).map(|arc| arc.as_ref())
+    fn get_by_id(&self, id: &i16) -> Option<&Arc<Msg>> {
+        self.by_id.get(id)
     }
 
-    fn get_by_name(&self, name: &str) -> Option<&Msg> {
-        self.by_name.get(name).and_then(|id| self.by_id.get(id).map(|arc| arc.as_ref()))
+    fn get_by_name(&self, name: &str) -> Option<&Arc<Msg>> {
+        self.by_name.get(name).and_then(|id| self.by_id.get(id))
     }
 }
 
@@ -59,7 +59,7 @@ impl Parser {
     /// # Errors
     /// Returns an error if the format string is invalid, or if the `id`
     /// or the parsed command name is already registered.
-    pub fn register(&mut self, id: u8, format: &str) -> MsgResult<()> {
+    pub fn register(&mut self, id: i16, format: &str) -> MsgResult<()> {
         let msg = Msg::parse(id, format)?;
 
         let mut map = self
@@ -95,22 +95,14 @@ impl Parser {
             .get(cmd_name)
             .ok_or_else(|| MsgError::new(format!("Unknown command: {}", cmd_name)))?;
 
-        // Remove from both indexes before re-inserting
-        map.by_name.remove(cmd_name);
+        // `Arc::make_mut` clones the message if a `decode` caller still holds
+        // an `Arc` to it, so binding never panics and needs no remove/reinsert.
         let arc_msg = map
             .by_id
-            .remove(&id)
+            .get_mut(&id)
             .ok_or_else(|| MsgError::new(format!("Msg not found: {}", cmd_name)))?;
-
-        let msg = Arc::try_unwrap(arc_msg).unwrap_or_else(|_| unreachable!("ref count should be 1"));
         let callback: super::MsgCallback = Arc::new(Mutex::new(Box::new(callback)));
-        map.try_insert(Msg {
-            id: msg.id,
-            name: msg.name,
-            params: msg.params,
-            callback: Some(callback),
-        })
-        .map_err(|e| MsgError::new(e))?;
+        Arc::make_mut(arc_msg).callback = Some(callback);
 
         Ok(())
     }
@@ -118,10 +110,13 @@ impl Parser {
     /// Encode a single command by message name.
     ///
     /// The payload format is: `[msg_id, param1, param2, ...]`.
-    /// The number of values must match the command's expected parameter count.
+    /// The number of values must match the command's expected parameter count,
+    /// and each value must either match its declared [`ArgType`] or be
+    /// losslessly convertible to it (see [`ArgValue::try_convert_to`]).
     ///
     /// # Errors
-    /// Returns an error if the message name is not found.
+    /// Returns an error if the message name is not found, the argument count
+    /// is wrong, or an argument cannot be converted to the declared type.
     pub fn encode(&self, name: &str, values: &[ArgValue]) -> MsgResult<Payload> {
         let map = self
             .msgs
@@ -143,9 +138,18 @@ impl Parser {
         }
 
         let mut payload = Payload::new();
-        payload.push(msg.id)?;
-        for value in values {
-            payload.push_value(value)?;
+        // Message ids use the same signed VLQ encoding as `%i`.
+        payload.push_i16(msg.id)?;
+        for (value, (param_name, arg_type)) in values.iter().zip(param_types) {
+            let converted = value.try_convert_to(*arg_type).map_err(|_| {
+                MsgError::new(format!(
+                    "parameter '{}' expects {}, got {}",
+                    param_name,
+                    arg_type.format_str(),
+                    value.arg_type().format_str()
+                ))
+            })?;
+            payload.push_value(&converted)?;
         }
 
         Ok(payload)
@@ -171,13 +175,12 @@ impl Parser {
         let mut parser = payload.as_parser();
 
         while !parser.is_empty() {
-            // First byte is the message ID
-            let id = parser.pop()?;
+            // The message id is a signed VLQ (see `Msg::id`).
+            let id = parser.pop_i16()?;
 
             // Look up the message definition
             let arc_msg = map
-                .by_id
-                .get(&id)
+                .get_by_id(&id)
                 .ok_or_else(|| MsgError::new(format!("Unknown message id: {}", id)))?;
 
             // Decode parameters according to the message's parameter types
@@ -476,6 +479,57 @@ mod tests {
 
         let payload = parser.encode("CMD_A", &[ArgValue::UInt32(99)]).unwrap();
         assert_eq!(payload.payload()[0], 1);
+    }
+
+    #[test]
+    fn test_encode_validates_param_types() {
+        let mut parser = Parser::new();
+        parser.register(1, "CMD_A x=%u b=%s").unwrap();
+
+        // A string supplied for `%u` is rejected instead of being encoded with
+        // the wrong wire form.
+        let err = parser
+            .encode("CMD_A", &[ArgValue::Str("nope".to_string()), ArgValue::Str("s".to_string())])
+            .unwrap_err();
+        assert!(err.msg.contains("parameter 'x' expects %u"));
+
+        // A losslessly convertible value is accepted.
+        let payload = parser
+            .encode("CMD_A", &[ArgValue::UInt16(1234), ArgValue::Bytes(b"s".to_vec())])
+            .unwrap();
+        assert_eq!(payload.payload()[0], 1);
+    }
+
+    #[test]
+    fn test_encode_msgid_is_vlq() {
+        // Host ids >= 0x60 need two bytes; negative ids use the sign-extended
+        // form. Both must round-trip through decode.
+        for id in [0i16, 1, 95, 96, 12287, -1, -32, -4096] {
+            let mut parser = Parser::new();
+            parser.register(id, "CMD_A x=%u").unwrap();
+            let payload = parser.encode("CMD_A", &[ArgValue::UInt32(7)]).unwrap();
+            let decoded = parser.decode(payload).unwrap();
+            assert_eq!(decoded.len(), 1);
+            assert_eq!(decoded[0].0.id, id);
+            assert_eq!(decoded[0].1[0], ArgValue::UInt32(7));
+        }
+    }
+
+    #[test]
+    fn test_bind_after_decode_does_not_panic() {
+        let mut parser = Parser::new();
+        parser.register(1, "CMD_A x=%u").unwrap();
+
+        // A decode caller still holds an `Arc<Msg>` when `bind` is called.
+        let payload = parser.encode("CMD_A", &[ArgValue::UInt32(1)]).unwrap();
+        let decoded = parser.decode(payload).unwrap();
+        let held = decoded[0].0.clone();
+
+        parser.bind("CMD_A", |_| {}).unwrap();
+
+        // The decoded snapshot keeps its old callback (None); the registry is
+        // updated without panicking.
+        assert!(held.callback.is_none());
     }
 
     // -----------------------------------------------------------------------

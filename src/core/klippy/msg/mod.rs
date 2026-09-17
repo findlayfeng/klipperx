@@ -20,8 +20,12 @@ pub type MsgCallback = Arc<Mutex<Box<dyn FnMut(&[ArgValue]) + Send>>>;
 /// A complete message definition with id, name, parameters, and optional callback.
 #[derive(Clone)]
 pub struct Msg {
-    /// Message ID (numeric identifier).
-    pub id: u8,
+    /// Message ID (host-side id from the firmware identify response).
+    ///
+    /// Klipper encodes ids as a signed VLQ, so ids for encoded values in
+    /// `0x60..=0x7f` and `>= 0x3000` appear here as negative numbers; `i16`
+    /// covers the full range (`-4096..=12287`).
+    pub id: i16,
     /// Message name (string identifier).
     pub name: String,
     /// Parameter list in declaration order: (parameter_name, parameter_type).
@@ -68,7 +72,7 @@ impl Msg {
     /// The `id` defaults to 0 and `callback` is `None`.
     ///
     /// Returns `MsgError` if the format string is empty or malformed.
-    pub fn parse(id: u8, fmt: &str) -> MsgResult<Self> {
+    pub fn parse(id: i16, fmt: &str) -> MsgResult<Self> {
         let trimmed = fmt.trim();
         if trimmed.is_empty() {
             return Err(MsgError::new("empty format string"));
@@ -99,7 +103,7 @@ impl Msg {
     }
 
     /// Create a `Msg` from components.
-    pub fn new(id: u8, name: impl Into<String>, params: Vec<(String, ArgType)>) -> Self {
+    pub fn new(id: i16, name: impl Into<String>, params: Vec<(String, ArgType)>) -> Self {
         Self {
             id,
             name: name.into(),
@@ -115,14 +119,21 @@ impl Msg {
 
     /// Returns the format string by reconstructing it from name and params.
     ///
-    /// Note: `%*s` normalizes to `%s`, and `%.*s` normalizes to `%c` here,
-    /// since [`ArgType`] does not distinguish between these variants.
+    /// Note: `%*s` normalizes to `%s`, since [`ArgType`] does not distinguish
+    /// between the two string variants. Command names with no parameters are
+    /// returned as just the name.
     pub fn format(&self) -> String {
-        self.params
+        let params = self
+            .params
             .iter()
             .map(|(name, atype)| format!("{}={}", name, atype.format_str()))
             .collect::<Vec<_>>()
-            .join(" ")
+            .join(" ");
+        if params.is_empty() {
+            self.name.clone()
+        } else {
+            format!("{} {}", self.name, params)
+        }
     }
 }
 
@@ -185,7 +196,15 @@ mod tests {
             ("f".to_string(), ArgType::Bytes),
         ];
         let msg = Msg::new(1, "test", params);
-        assert_eq!(msg.format(), "a=%u b=%i c=%hu d=%hi e=%s f=%.*s");
+        assert_eq!(msg.format(), "test a=%u b=%i c=%hu d=%hi e=%s f=%.*s");
+    }
+
+    #[test]
+    fn test_format_roundtrip() {
+        for fmt in ["NOP", "CMD x=%u", "COMBINED a=%u b=%i c=%hu d=%hi e=%s f=%.*s"] {
+            let msg = Msg::parse(1, fmt).unwrap();
+            assert_eq!(msg.format(), fmt);
+        }
     }
 
     // -----------------------------------------------------------------------

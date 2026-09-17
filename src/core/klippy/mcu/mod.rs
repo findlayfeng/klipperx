@@ -101,13 +101,34 @@ impl Mcu {
 
             loop {
                 let frame = interface.receive().await;
+
                 if frame.seq() != seq {
-                    todo!()
+                    eprintln!(
+                        "[mcu] seq mismatch: expected {seq}, got {}",
+                        frame.seq()
+                    );
+                    seq += 1;
+                    continue;
                 }
 
                 seq += 1;
 
-                let _ = parser_for_task.decode(frame.into()).expect("todo");
+                let decoded = match parser_for_task.decode(frame.into()) {
+                    Ok(msgs) => msgs,
+                    Err(e) => {
+                        eprintln!("[mcu] decode error: {e}");
+                        continue;
+                    }
+                };
+
+                for (msg, params) in decoded {
+                    if let Some(callback) = &msg.callback {
+                        let mut cb = callback.lock().unwrap();
+                        cb(params.as_slice());
+                    } else {
+                        todo!("no callback registered for {} (id={})", msg.name, msg.id)
+                    }
+                }
             }
         });
 

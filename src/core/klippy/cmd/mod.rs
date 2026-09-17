@@ -8,8 +8,7 @@
 //!   [`Mcu::call_msg`] that run them;
 //! * the command modules themselves: the bootstrap pair in `identify`, the
 //!   base infrastructure commands in `allocate_oids` / `config` / `uptime` /
-//!   `shutdown`, and `clock` (`get_clock` ↔ `clock`), which is written but
-//!   switched off — see the commented-out declaration below.
+//!   `shutdown`, and `clock` (`get_clock` ↔ `clock`).
 //!
 //! The transport in [`mcu`](crate::core::klippy::mcu) owns frames, the data
 //! dictionary, and the *bare* pair [`Mcu::send`](crate::core::klippy::mcu::Mcu::send) /
@@ -61,17 +60,14 @@
 //! [`Mcu::connect`](crate::core::klippy::mcu::Mcu::connect) — so several modules
 //! can use one MCU, and dropping the last handle shuts the device down.
 
-// `clock` is deliberately out of the build for now: the file is kept as it was,
-// tests and all, but nothing here should depend on it yet. Bring it back by
-// uncommenting this declaration and the re-export below.
-// pub mod clock;
 pub mod allocate_oids;
+pub mod clock;
 pub mod config;
 pub mod identify;
 pub mod shutdown;
 pub mod uptime;
 
-// pub use clock::{ClockState, ClockSync, GetClock, McuClock};
+pub use clock::{ClockState, ClockSync, GetClock, McuClock};
 
 use crate::core::klippy::mcu::{Dictionary, Enumeration, Mcu, McuError};
 use crate::core::klippy::msg::proto::{ArgType, ArgValue};
@@ -466,33 +462,9 @@ mod tests {
         .unwrap()
     }
 
-    /// `get_clock` / `clock clock=%u` — the smallest request/response pair.
-    ///
-    /// These tests only need *a* pair to exercise the typed calls, so the types
-    /// are defined here rather than taken from `clock.rs`, which is currently
-    /// out of the build.
-    struct GetClock;
-
-    impl McuCommand for GetClock {
-        const NAME: &'static str = "get_clock";
-        fn args(&self) -> Vec<ArgValue> {
-            Vec::new()
-        }
-    }
-
-    #[derive(Debug, PartialEq)]
-    struct ClockState {
-        clock: u32,
-    }
-
-    impl McuResponse for ClockState {
-        const NAME: &'static str = "clock";
-        fn decode(params: &Params<'_>) -> Result<Self, McuError> {
-            Ok(Self {
-                clock: params.get_u32("clock")?,
-            })
-        }
-    }
+    /// `get_clock` / `clock clock=%u` — the smallest request/response pair,
+    /// taken from `clock.rs` so the typed calls are exercised against the real
+    /// command definitions rather than a local copy.
 
     /// `get_uptime` / `uptime high=%u clock=%u` — two parameters, so the
     /// round-trip exercises more than a single name lookup.

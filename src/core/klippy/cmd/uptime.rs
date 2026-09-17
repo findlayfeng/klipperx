@@ -9,7 +9,8 @@
 //! | host → MCU | `get_uptime` |
 //! | MCU → host | `uptime high=%u clock=%u` |
 //!
-//! `clock` is the same low word `get_clock` returns (parked in `cmd/clock.rs`);
+//! `clock` is the same low word `get_clock` returns (defined in
+//! `cmd/clock.rs`);
 //! `high` is the number of times it has wrapped since boot. The pair
 //! gives a monotonic value that can be ordered across a wrap, which is what
 //! clock synchronisation needs at connect time. The per-message `stats`

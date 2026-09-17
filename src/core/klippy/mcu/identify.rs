@@ -37,7 +37,7 @@
 ///
 /// These are registered when creating a new [`Mcu`](super::Mcu) via
 /// [`Mcu::from_config`](super::Mcu::from_config).
-pub const DEFAULT_MESSAGES: &[(u8, &str)] = &[
+pub const DEFAULT_MESSAGES: &[(i16, &str)] = &[
     (0, "identify_response offset=%u data=%.*s"),
     (1, "identify offset=%u count=%c"),
 ];

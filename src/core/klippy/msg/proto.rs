@@ -41,48 +41,56 @@ impl ArgValue {
 
     /// Attempt to convert this ArgValue to the target ArgType.
     ///
-    /// Only lossless conversions are supported (numeric types only):
-    /// - Widening: Int16 → Int32, UInt16 → UInt32, UInt16 → Int32
-    /// - Same width with a range check: Int16 ↔ UInt16, Int32 ↔ UInt32
+    /// The conversion is only performed when it is lossless:
+    /// - Any integer → any integer, provided the value is representable in the
+    ///   target type's range (this covers both widening and checked narrowing;
+    ///   sign-losing or truncating conversions are rejected).
+    /// - `Str` ↔ `Bytes`, which share the same wire encoding (Bytes → Str also
+    ///   requires valid UTF-8).
     ///
-    /// Conversions that would wrap or lose information are rejected with
-    /// `Err(())`: negative values cannot convert to unsigned types, and
-    /// unsigned values above the target's maximum cannot convert to signed
-    /// types. Str/Bytes never convert to or from numeric types.
+    /// Everything else (numbers ↔ strings/buffers) is rejected with `Err(())`.
     pub fn try_convert_to(&self, target: ArgType) -> Result<ArgValue, ()> {
         // Same type — no conversion needed
         if self.arg_type() == target {
             return Ok(self.clone());
         }
 
+        // `%s` and `%.*s`/`%*s` share the same length-prefixed wire encoding.
         match (self, target) {
-            // Int16 ↔ UInt16 (negative → unsigned is rejected)
-            (ArgValue::Int16(v), ArgType::UInt16) if *v >= 0 => {
-                Ok(ArgValue::UInt16(*v as u16))
+            (ArgValue::Str(s), ArgType::Bytes) => {
+                return Ok(ArgValue::Bytes(s.as_bytes().to_vec()));
             }
-            (ArgValue::UInt16(v), ArgType::Int16) if *v <= i16::MAX as u16 => {
-                Ok(ArgValue::Int16(*v as i16))
+            (ArgValue::Bytes(b), ArgType::Str) => {
+                return std::str::from_utf8(b)
+                    .map(|s| ArgValue::Str(s.to_string()))
+                    .map_err(|_| ());
             }
+            _ => {}
+        }
 
-            // Int32 ↔ UInt32 (negative → unsigned is rejected)
-            (ArgValue::Int32(v), ArgType::UInt32) if *v >= 0 => {
-                Ok(ArgValue::UInt32(*v as u32))
+        // Numeric conversions, range checked so no value is silently wrapped.
+        let n = match self {
+            ArgValue::UInt8(v) => i64::from(*v),
+            ArgValue::UInt16(v) => i64::from(*v),
+            ArgValue::Int16(v) => i64::from(*v),
+            ArgValue::UInt32(v) => i64::from(*v),
+            ArgValue::Int32(v) => i64::from(*v),
+            _ => return Err(()),
+        };
+        match target {
+            ArgType::UInt8 if (0..=u8::MAX as i64).contains(&n) => Ok(ArgValue::UInt8(n as u8)),
+            ArgType::UInt16 if (0..=u16::MAX as i64).contains(&n) => {
+                Ok(ArgValue::UInt16(n as u16))
             }
-            (ArgValue::UInt32(v), ArgType::Int32) if *v <= i32::MAX as u32 => {
-                Ok(ArgValue::Int32(*v as i32))
+            ArgType::Int16 if (i16::MIN as i64..=i16::MAX as i64).contains(&n) => {
+                Ok(ArgValue::Int16(n as i16))
             }
-
-            // Widening conversions are always lossless
-            (ArgValue::UInt8(v), ArgType::Int16) => Ok(ArgValue::Int16(*v as i16)),
-            (ArgValue::UInt8(v), ArgType::UInt16) => Ok(ArgValue::UInt16(*v as u16)),
-            (ArgValue::UInt8(v), ArgType::Int32) => Ok(ArgValue::Int32(*v as i32)),
-            (ArgValue::UInt8(v), ArgType::UInt32) => Ok(ArgValue::UInt32(*v as u32)),
-            (ArgValue::Int16(v), ArgType::Int32) => Ok(ArgValue::Int32(*v as i32)),
-            (ArgValue::UInt16(v), ArgType::UInt32) => Ok(ArgValue::UInt32(*v as u32)),
-            (ArgValue::UInt16(v), ArgType::Int32) => Ok(ArgValue::Int32(*v as i32)),
-
-            // Unsupported: Str/Bytes to numeric, numeric to Str/Bytes,
-            // narrowing, and out-of-range signedness changes.
+            ArgType::UInt32 if (0..=u32::MAX as i64).contains(&n) => {
+                Ok(ArgValue::UInt32(n as u32))
+            }
+            ArgType::Int32 if (i32::MIN as i64..=i32::MAX as i64).contains(&n) => {
+                Ok(ArgValue::Int32(n as i32))
+            }
             _ => Err(()),
         }
     }
@@ -135,18 +143,27 @@ impl Default for Payload {
     }
 }
 
-const fn mask(bits: u32) -> u32 {
-    (1u32 << bits) - 1
+/// Number of bytes needed to encode `v` using Klipper's variable-length
+/// integer (VLQ) encoding.
+///
+/// This mirrors `encode_int()` in the firmware (`src/command.c`) and
+/// `PT_uint32.encode()` in `msgproto.py`: `v` is interpreted as a signed
+/// 32-bit value, so negative numbers use a compact sign-extended form and
+/// share the encoder with unsigned values.
+fn vlq_len(v: u32) -> usize {
+    let sv = v as i32;
+    if (-(1 << 5)..(3 << 5)).contains(&sv) {
+        1
+    } else if (-(1 << 12)..(3 << 12)).contains(&sv) {
+        2
+    } else if (-(1 << 19)..(3 << 19)).contains(&sv) {
+        3
+    } else if (-(1 << 26)..(3 << 26)).contains(&sv) {
+        4
+    } else {
+        5
+    }
 }
-
-const U8_MASK7: u8 = mask(7) as u8;
-const U16_MASK7: u16 = mask(7) as u16;
-const U16_MASK14: u16 = mask(14) as u16;
-const U32_MASK7: u32 = mask(7);
-const U32_MASK14: u32 = mask(14);
-const U32_MASK21: u32 = mask(21);
-const U32_MASK25: u32 = mask(25);
-const U32_MASK28: u32 = mask(28);
 
 impl Payload {
     pub fn new() -> Self {
@@ -200,84 +217,50 @@ impl Payload {
         self.extend(other.payload())
     }
 
-    /// Push a u16 value in 7-bit varint format.
-    pub fn push_u16(&mut self, v: u16) -> MsgResult<()> {
-        let needed = if v > U16_MASK14 {
-            3
-        } else if v > U16_MASK7 {
-            2
-        } else {
-            1
-        };
-        if self.len() + needed > MESSAGE_PAYLOAD_MAX {
+    /// Append `v` as a Klipper VLQ.
+    ///
+    /// The most significant 7-bit group is written first; every byte except
+    /// the last has its high bit set as a continuation marker. Negative
+    /// values (and unsigned values with bit 31 set) are written in the same
+    /// compact sign-extended form the firmware's `parse_int()` expects.
+    fn push_vlq(&mut self, v: u32) -> MsgResult<()> {
+        let len = vlq_len(v);
+        if self.len() + len > MESSAGE_PAYLOAD_MAX {
             return Err(MsgError::new("payload exceeds maximum length"));
         }
-
-        if v > U16_MASK14 {
-            self.raw.push(((v >> 14) & 0x7f | 0x80) as u8);
+        for i in (0..len).rev() {
+            let mut byte = ((v >> (i * 7)) & 0x7f) as u8;
+            if i > 0 {
+                byte |= 0x80;
+            }
+            self.raw.push(byte);
         }
-
-        if v > U16_MASK7 {
-            self.raw.push(((v >> 7) & 0x7f | 0x80) as u8);
-        }
-
-        self.raw.push((v & 0x7f) as u8);
-
         Ok(())
     }
 
-    /// Push a u32 value in 7-bit varint format.
-    pub fn push_u32(&mut self, v: u32) -> MsgResult<()> {
-        let needed = if v > U32_MASK28 {
-            5
-        } else if v > U32_MASK21 {
-            4
-        } else if v > U32_MASK14 {
-            3
-        } else if v > U32_MASK7 {
-            2
-        } else {
-            1
-        };
-        if self.len() + needed > MESSAGE_PAYLOAD_MAX {
-            return Err(MsgError::new("payload exceeds maximum length"));
-        }
-
-        if v > U32_MASK28 {
-            self.raw.push(((v >> 28) & 0x7f | 0x80) as u8);
-        }
-
-        if v > U32_MASK21 {
-            self.raw.push(((v >> 21) & 0x7f | 0x80) as u8);
-        }
-
-        if v > U32_MASK14 {
-            self.raw.push(((v >> 14) & 0x7f | 0x80) as u8);
-        }
-
-        if v > U32_MASK7 {
-            self.raw.push(((v >> 7) & 0x7f | 0x80) as u8);
-        }
-
-        self.raw.push((v & 0x7f) as u8);
-
-        Ok(())
-    }
-
-    /// Push a u8 value in 7-bit varint format.
+    /// Push an unsigned 8-bit value (`%c`).
     pub fn push_u8(&mut self, v: u8) -> MsgResult<()> {
-        let needed = if v > U8_MASK7 { 2 } else { 1 };
-        if self.len() + needed > MESSAGE_PAYLOAD_MAX {
-            return Err(MsgError::new("payload exceeds maximum length"));
-        }
+        self.push_vlq(v as u32)
+    }
 
-        if v > U8_MASK7 {
-            self.raw.push(((v >> 7) & 0x01 | 0x80) as u8);
-        }
+    /// Push an unsigned 16-bit value (`%hu`).
+    pub fn push_u16(&mut self, v: u16) -> MsgResult<()> {
+        self.push_vlq(v as u32)
+    }
 
-        self.raw.push((v & 0x7f) as u8);
+    /// Push an unsigned 32-bit value (`%u`).
+    pub fn push_u32(&mut self, v: u32) -> MsgResult<()> {
+        self.push_vlq(v)
+    }
 
-        Ok(())
+    /// Push a signed 16-bit value (`%hi`).
+    pub fn push_i16(&mut self, v: i16) -> MsgResult<()> {
+        self.push_vlq(v as i32 as u32)
+    }
+
+    /// Push a signed 32-bit value (`%i`, and message ids).
+    pub fn push_i32(&mut self, v: i32) -> MsgResult<()> {
+        self.push_vlq(v as u32)
     }
 
     /// Push a byte array (length prefix followed by data).
@@ -297,9 +280,9 @@ impl Payload {
         match value {
             ArgValue::UInt8(v) => self.push_u8(*v),
             ArgValue::UInt16(v) => self.push_u16(*v),
-            ArgValue::Int16(v) => self.push_u16(*v as u16),
+            ArgValue::Int16(v) => self.push_i16(*v),
             ArgValue::UInt32(v) => self.push_u32(*v),
-            ArgValue::Int32(v) => self.push_u32(*v as u32),
+            ArgValue::Int32(v) => self.push_i32(*v),
             ArgValue::Str(v) => self.push_bytes(v.as_bytes()),
             ArgValue::Bytes(v) => self.push_bytes(v),
         }
@@ -370,33 +353,30 @@ impl PayloadParser<'_> {
         }
     }
 
-    /// Pop a u32 value in 7-bit varint format.
+    /// Pop a Klipper VLQ as an unsigned 32-bit value.
+    ///
+    /// This mirrors `parse_int()` in the firmware (`src/command.c`). The first
+    /// byte carries a sign bit (bits 5 and 6), so values that were encoded
+    /// from negative numbers come back as their two's-complement form.
     pub fn pop_u32(&mut self) -> MsgResult<u32> {
-        let mut val: u32 = 0;
-        loop {
-            let byte = self.pop()?;
-
-            val |= (byte & 0x7F) as u32;
-
-            if byte & 0x80 == 0 {
-                break;
-            }
-
-            if val > U32_MASK25 {
-                return Err(MsgError::new("u32 encoding too long"));
-            }
-
-            val <<= 7;
+        let mut byte = self.pop()?;
+        let mut val = (byte & 0x7f) as u32;
+        if byte & 0x60 == 0x60 {
+            val |= 0xffff_ffe0;
+        }
+        while byte & 0x80 != 0 {
+            byte = self.pop()?;
+            val = (val << 7) | (byte & 0x7f) as u32;
         }
         Ok(val)
     }
 
-    /// Pop an i32 value (as u32 internally).
+    /// Pop a signed 32-bit value (`%i`).
     pub fn pop_i32(&mut self) -> MsgResult<i32> {
         Ok(self.pop_u32()? as i32)
     }
 
-    /// Pop a u16 value in 7-bit varint format.
+    /// Pop an unsigned 16-bit value (`%hu`), rejecting out-of-range encodings.
     pub fn pop_u16(&mut self) -> MsgResult<u16> {
         let val: u32 = self.pop_u32()?;
         if val > u16::MAX as u32 {
@@ -406,12 +386,12 @@ impl PayloadParser<'_> {
         Ok(val as u16)
     }
 
-    /// Pop an i16 value (as u16 internally).
+    /// Pop a signed 16-bit value (`%hi`).
     pub fn pop_i16(&mut self) -> MsgResult<i16> {
-        Ok(self.pop_u16()? as i16)
+        Ok(self.pop_u32()? as i32 as i16)
     }
 
-    /// Pop a u8 value in 7-bit varint format.
+    /// Pop an unsigned 8-bit value (`%c`), rejecting out-of-range encodings.
     pub fn pop_u8(&mut self) -> MsgResult<u8> {
         let val: u32 = self.pop_u32()?;
         if val > u8::MAX as u32 {
@@ -420,9 +400,9 @@ impl PayloadParser<'_> {
         Ok(val as u8)
     }
 
-    /// Pop an i8 value (as u8 internally).
+    /// Pop a signed 8-bit value.
     pub fn pop_i8(&mut self) -> MsgResult<i8> {
-        Ok(self.pop_u8()? as i8)
+        Ok(self.pop_u32()? as i32 as i8)
     }
 
     /// Pop a value according to the given ArgType.
@@ -457,7 +437,7 @@ mod tests {
     use super::*;
 
     // -----------------------------------------------------------------------
-    // Big-endian 7-bit varint u8 encoding roundtrip
+    // Klipper VLQ u8 encoding roundtrip
     // -----------------------------------------------------------------------
 
     #[test]
@@ -472,21 +452,21 @@ mod tests {
     }
 
     #[test]
-    fn test_push_pop_u8_boundary_7bit() {
-        // 7-bit boundary: 0-127 encode as 1 byte, 128+ needs 2 bytes
+    fn test_push_pop_u8_boundary_6bit() {
+        // Klipper VLQ boundary: 0-95 encode as 1 byte, 96+ need 2 bytes
         let mut payload = Payload::new();
-        payload.push_u8(127).unwrap();
+        payload.push_u8(95).unwrap();
         assert_eq!(payload.len(), 1);
-        assert_eq!(payload.as_parser().pop_u8().unwrap(), 127);
+        assert_eq!(payload.as_parser().pop_u8().unwrap(), 95);
 
         let mut payload = Payload::new();
-        payload.push_u8(128).unwrap();
+        payload.push_u8(96).unwrap();
         assert_eq!(payload.len(), 2);
-        assert_eq!(payload.as_parser().pop_u8().unwrap(), 128);
+        assert_eq!(payload.as_parser().pop_u8().unwrap(), 96);
     }
 
     // -----------------------------------------------------------------------
-    // Big-endian 7-bit varint u16 encoding roundtrip
+    // Klipper VLQ u16 encoding roundtrip
     // -----------------------------------------------------------------------
 
     #[test]
@@ -501,44 +481,78 @@ mod tests {
     }
 
     #[test]
-    fn test_push_pop_u16_boundary_7bit() {
-        // 7-bit boundary: 0-127 encode as 1 byte, 128+ needs 2 bytes
+    fn test_push_pop_u16_boundary_6bit() {
+        // Klipper VLQ boundary: 0-95 encode as 1 byte, 96+ need 2 bytes
         let mut payload = Payload::new();
-        payload.push_u16(127).unwrap();
+        payload.push_u16(95).unwrap();
         assert_eq!(payload.len(), 1);
-        assert_eq!(payload.as_parser().pop_u16().unwrap(), 127);
+        assert_eq!(payload.as_parser().pop_u16().unwrap(), 95);
 
         let mut payload = Payload::new();
-        payload.push_u16(128).unwrap();
+        payload.push_u16(96).unwrap();
         assert_eq!(payload.len(), 2);
-        assert_eq!(payload.as_parser().pop_u16().unwrap(), 128);
+        assert_eq!(payload.as_parser().pop_u16().unwrap(), 96);
     }
 
     #[test]
-    fn test_push_pop_u16_boundary_14bit() {
-        // 14-bit boundary: 0-16383 encode as 2 bytes, 16384+ needs 3 bytes
+    fn test_push_pop_u16_boundary_12bit() {
+        // Second boundary: 0-12287 encode as 2 bytes, 12288+ needs 3 bytes
         let mut payload = Payload::new();
-        payload.push_u16(16383).unwrap();
+        payload.push_u16(12287).unwrap();
         assert_eq!(payload.len(), 2);
-        assert_eq!(payload.as_parser().pop_u16().unwrap(), 16383);
+        assert_eq!(payload.as_parser().pop_u16().unwrap(), 12287);
 
         let mut payload = Payload::new();
-        payload.push_u16(16384).unwrap();
+        payload.push_u16(12288).unwrap();
         assert_eq!(payload.len(), 3);
-        assert_eq!(payload.as_parser().pop_u16().unwrap(), 16384);
+        assert_eq!(payload.as_parser().pop_u16().unwrap(), 12288);
     }
 
     #[test]
-    fn test_push_pop_u16_signed_values() {
-        // Int16/UInt16 push uses u16 encoding, pop returns u16
-        let mut payload = Payload::new();
-        payload.push_value(&ArgValue::Int16(-1)).unwrap();
-        let popped = payload.as_parser().pop_value(ArgType::UInt16).unwrap();
-        assert_eq!(popped, ArgValue::UInt16(u16::MAX));
+    fn test_signed_encoding_matches_klipper() {
+        // Byte vectors produced by Klipper's `encode_int()` (`src/command.c`)
+        // and `PT_uint32.encode()` (`msgproto.py`).
+        for (value, expected) in [
+            (0i32, &[0x00][..]),
+            (95, &[0x5f][..]),
+            (96, &[0x80, 0x60][..]),
+            (127, &[0x80, 0x7f][..]),
+            (128, &[0x81, 0x00][..]),
+            (12287, &[0xdf, 0x7f][..]),
+            (12288, &[0x80, 0xe0, 0x00][..]),
+            (-1, &[0x7f][..]),
+            (-32, &[0x60][..]),
+            (-33, &[0xff, 0x5f][..]),
+            (-567, &[0xfb, 0x49][..]),
+            (-4096, &[0xe0, 0x00][..]),
+            (-4097, &[0xff, 0xdf, 0x7f][..]),
+            (-65536, &[0xfc, 0x80, 0x00][..]),
+            (-67108864, &[0xe0, 0x80, 0x80, 0x00][..]),
+            (-67108865, &[0x8f, 0xdf, 0xff, 0xff, 0x7f][..]),
+            (-100000000, &[0x8f, 0xd0, 0xa8, 0xbe, 0x00][..]),
+            (i32::MAX, &[0x87, 0xff, 0xff, 0xff, 0x7f][..]),
+            (i32::MIN, &[0x88, 0x80, 0x80, 0x80, 0x00][..]),
+        ] {
+            let mut payload = Payload::new();
+            payload.push_i32(value).unwrap();
+            assert_eq!(payload.payload(), expected, "i32 value {value}");
+            assert_eq!(payload.as_parser().pop_i32().unwrap(), value);
+        }
+
+        // Unsigned values share the encoder for the non-negative range.
+        for (value, expected) in [
+            (96u32, &[0x80, 0x60][..]),
+            (12345, &[0x80, 0xe0, 0x39][..]),
+        ] {
+            let mut payload = Payload::new();
+            payload.push_u32(value).unwrap();
+            assert_eq!(payload.payload(), expected, "u32 value {value}");
+            assert_eq!(payload.as_parser().pop_u32().unwrap(), value);
+        }
     }
 
     // -----------------------------------------------------------------------
-    // Big-endian 7-bit varint u32 encoding roundtrip
+    // Klipper VLQ u32 encoding roundtrip
     // -----------------------------------------------------------------------
 
     #[test]
@@ -567,42 +581,31 @@ mod tests {
 
     #[test]
     fn test_push_pop_u32_byte_counts() {
-        // Verify byte counts at each 7-bit varint boundary
-        let mut p = Payload::new();
-        p.push_u32(0).unwrap();
-        assert_eq!(p.len(), 1); // 0 takes 1 byte (0x00)
+        // Verify byte counts at each Klipper VLQ boundary
+        for (value, len) in [
+            (0u32, 1),
+            (95, 1),
+            (96, 2),
+            (12287, 2),
+            (12288, 3),
+            (1572863, 3),
+            (1572864, 4),
+            (201326591, 4),
+            (201326592, 5),
+            (268435456, 5),
+        ] {
+            let mut p = Payload::new();
+            p.push_u32(value).unwrap();
+            assert_eq!(p.len(), len, "value {value}");
+            assert_eq!(p.as_parser().pop_u32().unwrap(), value);
+        }
 
+        // Unsigned values with bit 31 set are encoded like the negative i32
+        // with the same bit pattern and still decode back to the same u32.
         let mut p = Payload::new();
-        p.push_u32(127).unwrap();
-        assert_eq!(p.len(), 1); // 7 bits fit in 1 byte
-
-        let mut p = Payload::new();
-        p.push_u32(128).unwrap();
-        assert_eq!(p.len(), 2); // 8 bits need 2 bytes
-
-        let mut p = Payload::new();
-        p.push_u32(16383).unwrap();
-        assert_eq!(p.len(), 2); // 14 bits fit in 2 bytes
-
-        let mut p = Payload::new();
-        p.push_u32(16384).unwrap();
-        assert_eq!(p.len(), 3); // 15 bits need 3 bytes
-
-        let mut p = Payload::new();
-        p.push_u32(2097151).unwrap();
-        assert_eq!(p.len(), 3); // 21 bits fit in 3 bytes
-
-        let mut p = Payload::new();
-        p.push_u32(2097152).unwrap();
-        assert_eq!(p.len(), 4); // 22 bits need 4 bytes
-
-        let mut p = Payload::new();
-        p.push_u32(268435455).unwrap();
-        assert_eq!(p.len(), 4); // 28 bits fit in 4 bytes
-
-        let mut p = Payload::new();
-        p.push_u32(268435456).unwrap();
-        assert_eq!(p.len(), 5); // 29 bits need 5 bytes (max for u32)
+        p.push_u32(u32::MAX).unwrap();
+        assert_eq!(p.payload(), &[0x7f]);
+        assert_eq!(p.as_parser().pop_u32().unwrap(), u32::MAX);
     }
 
     #[test]
@@ -614,7 +617,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // 7-bit varint decoding errors
+    // VLQ decoding errors
     // -----------------------------------------------------------------------
 
     #[test]
@@ -628,26 +631,17 @@ mod tests {
     }
 
     #[test]
-    fn test_pop_u32_overflow() {
-        // pop_u32 is big-endian 7-bit: first byte → highest 7 bits.
-        //
-        // Trace: val |= B[6:0]; check overflow; val <<= 7
-        // After byte 0: val = B0[6:0]            (max 7 bits)
-        // After byte 1: val = B0[6:0]<<7 | B1[6:0] (max 14 bits)
-        // After byte 2: val = ...<<7 | B2[6:0]      (max 21 bits)
-        // After byte 3: val = ...<<7 | B3[6:0]      (max 28 bits)
-        //   → check: val > U32_MASK25 (25 bits)? If B0=B1=B2=B3=0xFF:
-        //     val = 0x7F<<21 | 0x7F<<14 | 0x7F<<7 | 0x7F = 0x0FFFFFFF
-        //     0x0FFFFFFF = 268435455 > U32_MASK25 = 33554431 → overflow!
+    fn test_pop_u32_five_byte_encoding() {
+        // Five-byte encoding of u32::MAX as produced by Klipper's
+        // `PT_uint32.encode()` (unsigned path).
         let mut payload = Payload::new();
-        payload.raw.extend_from_slice(&[
-            0xFF, 0xFF, 0xFF, 0xFF, // 4 continuation bytes
-            0x00,                    // final byte (break)
-        ]);
-        // After processing byte 3 (0xFF), val = 0x0FFFFFFF > U32_MASK25
-        let result = payload.as_parser().pop_u32();
-        assert!(result.is_err(), "expected overflow error, got {:?}", result);
-        assert!(result.unwrap_err().msg.contains("too long"));
+        payload.raw.extend_from_slice(&[0x8F, 0xFF, 0xFF, 0xFF, 0x7F]);
+        assert_eq!(payload.as_parser().pop_u32().unwrap(), u32::MAX);
+
+        // Five-byte encoding of i32::MIN (C `encode_int`).
+        let mut payload = Payload::new();
+        payload.raw.extend_from_slice(&[0x88, 0x80, 0x80, 0x80, 0x00]);
+        assert_eq!(payload.as_parser().pop_i32().unwrap(), i32::MIN);
     }
 
     #[test]
@@ -748,8 +742,8 @@ mod tests {
     }
 
     #[test]
-    fn test_try_convert_to_lossless_range_checks() {
-        // UInt8 widening conversions are always lossless.
+    fn test_try_convert_to_range_checks() {
+        // Widening conversions succeed.
         assert_eq!(
             ArgValue::UInt8(255).try_convert_to(ArgType::Int16).unwrap(),
             ArgValue::Int16(255)
@@ -759,29 +753,25 @@ mod tests {
             ArgValue::UInt16(100)
         );
         assert_eq!(
-            ArgValue::UInt8(1).try_convert_to(ArgType::Int32).unwrap(),
-            ArgValue::Int32(1)
-        );
-        assert_eq!(
-            ArgValue::UInt8(255).try_convert_to(ArgType::UInt32).unwrap(),
-            ArgValue::UInt32(255)
-        );
-
-        // In-range same-width conversions succeed.
-        assert_eq!(
-            ArgValue::Int16(100).try_convert_to(ArgType::UInt16).unwrap(),
-            ArgValue::UInt16(100)
-        );
-        assert_eq!(
             ArgValue::UInt16(32767).try_convert_to(ArgType::Int16).unwrap(),
             ArgValue::Int16(32767)
         );
+
+        // Narrowing is allowed when the value still fits.
         assert_eq!(
-            ArgValue::Int32(42).try_convert_to(ArgType::UInt32).unwrap(),
-            ArgValue::UInt32(42)
+            ArgValue::UInt32(100).try_convert_to(ArgType::UInt16).unwrap(),
+            ArgValue::UInt16(100)
+        );
+        assert_eq!(
+            ArgValue::Int32(-1).try_convert_to(ArgType::Int16).unwrap(),
+            ArgValue::Int16(-1)
+        );
+        assert_eq!(
+            ArgValue::Int16(-1).try_convert_to(ArgType::Int32).unwrap(),
+            ArgValue::Int32(-1)
         );
 
-        // Out-of-range / sign-losing conversions are rejected instead of
+        // Sign-losing or truncating conversions are rejected instead of
         // wrapping.
         assert!(ArgValue::Int16(-1).try_convert_to(ArgType::UInt16).is_err());
         assert!(ArgValue::UInt16(40000).try_convert_to(ArgType::Int16).is_err());
@@ -791,26 +781,20 @@ mod tests {
                 .try_convert_to(ArgType::Int32)
                 .is_err()
         );
-        assert!(ArgValue::Int16(-1).try_convert_to(ArgType::UInt32).is_err());
+        assert!(ArgValue::Int32(0x1_0000).try_convert_to(ArgType::UInt16).is_err());
 
-        // Widening conversions remain lossless for negative values.
+        // `%s` and `%.*s` share a wire format and may be converted, but
+        // numbers never convert to or from strings/buffers.
         assert_eq!(
-            ArgValue::Int16(-1).try_convert_to(ArgType::Int32).unwrap(),
-            ArgValue::Int32(-1)
+            ArgValue::Str("hi".to_string()).try_convert_to(ArgType::Bytes).unwrap(),
+            ArgValue::Bytes(b"hi".to_vec())
         );
-
-        // Narrowing conversions (Int32 → Int16, UInt32 → UInt16) are not
-        // supported at all.
-        assert!(ArgValue::Int32(-1).try_convert_to(ArgType::Int16).is_err());
-        assert!(ArgValue::UInt32(100).try_convert_to(ArgType::UInt16).is_err());
-
-        // Same type is a no-op; Str/Bytes never convert to or from numerics.
         assert_eq!(
-            ArgValue::UInt32(7).try_convert_to(ArgType::UInt32).unwrap(),
-            ArgValue::UInt32(7)
+            ArgValue::Bytes(b"hi".to_vec()).try_convert_to(ArgType::Str).unwrap(),
+            ArgValue::Str("hi".to_string())
         );
+        assert!(ArgValue::Bytes(vec![0xFF, 0xFE]).try_convert_to(ArgType::Str).is_err());
         assert!(ArgValue::Str("x".to_string()).try_convert_to(ArgType::UInt32).is_err());
-        assert!(ArgValue::Bytes(vec![]).try_convert_to(ArgType::Str).is_err());
         assert!(ArgValue::UInt32(1).try_convert_to(ArgType::Str).is_err());
     }
 
@@ -874,7 +858,7 @@ mod tests {
     #[test]
     fn test_try_merge_within_limit() {
         let mut a = Payload::new();
-        a.push_u32(100).unwrap(); // 1 byte (7-bit varint)
+        a.push_u32(95).unwrap(); // 1 byte (Klipper VLQ)
         let b = build_bytes(b"hello"); // 5 raw bytes
 
         a.try_merge(&b).unwrap();

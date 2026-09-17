@@ -23,8 +23,9 @@ pub struct MappingEntry {
 /// (e.g. `mapping` uses its own `Mutex` since `VecDeque` is not `Sync`).
 #[derive(Debug)]
 pub struct TestDevice {
-    /// `crossbeam::channel::Sender` is `Clone + Send + Sync` — direct field.
-    buf_tx: Sender<Frame>,
+    /// `crossbeam::channel::Sender` wrapped in `Option` — `take()` on the last
+    /// mapping closes the channel by dropping the sender.
+    buf_tx: Mutex<Option<Sender<Frame>>>,
     /// `crossbeam::channel::Receiver` — `recv_blocking()` takes `&self`.
     buf_rx: Receiver<Frame>,
     /// FIFO queue of input→output mappings — protected by its own `Mutex`.
@@ -35,7 +36,7 @@ impl TestDevice {
     pub fn new(mapping: Vec<MappingEntry>) -> Self {
         let (tx, rx) = bounded::<Frame>(100);
         Self {
-            buf_tx: tx,
+            buf_tx: Mutex::new(Some(tx.clone())),
             buf_rx: rx,
             mapping: Mutex::new(mapping.into()),
         }
@@ -44,11 +45,25 @@ impl TestDevice {
 
 impl Device for TestDevice {
     fn send(&self, frame: &Frame) -> Result<(), InterfaceError> {
-        let entry = {
+        let (entry, tx) = {
             let mut map = self.mapping.lock().unwrap();
-            map.pop_front().ok_or(InterfaceError::SendError(
+            let entry = map.pop_front().ok_or(InterfaceError::SendError(
                 "No mapping entry available for sent frame".to_string(),
-            ))?
+            ))?;
+
+            // Clone the sender for sending outside the lock.
+            let tx = self.buf_tx.lock().unwrap().clone().ok_or_else(|| {
+                InterfaceError::SendError("channel already closed".to_string())
+            })?;
+
+            // Drop the sender when all mappings are consumed.
+            // Dropping the last sender closes the channel, causing `receive()`
+            // to panic on `unwrap()` and exit background tasks.
+            if map.is_empty() {
+                self.buf_tx.lock().unwrap().take();
+            }
+
+            (entry, tx)
         };
 
         if entry.input != *frame {
@@ -58,10 +73,8 @@ impl Device for TestDevice {
             )));
         }
 
-        // crossbeam::Sender::send() takes &self and is Clone + Send + Sync.
         for output_frame in entry.outputs {
-            self.buf_tx
-                .send(output_frame)
+            tx.send(output_frame)
                 .map_err(|e| InterfaceError::SendError(format!("Failed to send output frame: {e}")))?;
         }
 

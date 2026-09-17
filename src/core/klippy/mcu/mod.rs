@@ -330,3 +330,110 @@ impl From<(String, Interface)> for Mcu {
         Self::from_parts(name, interface)
     }
 }
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::klippy::interface::test::TestDevice;
+    use crate::core::klippy::interface::Interface;
+
+    fn make_frame(seq: u8, payload: &[u8]) -> Frame {
+        Frame::new(seq, payload.to_vec())
+    }
+
+    // -----------------------------------------------------------------------
+    // Mcu creation
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_mcu_creation() {
+        let device = TestDevice::new(vec![]);
+        let interface = Interface::new(device);
+        let mcu = Mcu::from(("test_mcu".to_string(), interface));
+
+        assert_eq!(mcu.name(), "test_mcu");
+    }
+
+    // -----------------------------------------------------------------------
+    // Parser helpers (no background tasks needed)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_send_invalid_command() {
+        let device = TestDevice::new(vec![]);
+        let interface = Interface::new(device);
+        let mcu = Mcu::from(("test_mcu".to_string(), interface));
+
+        let result = mcu.send("nonexistent_cmd", &[ArgValue::UInt32(0)]);
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_send_wrong_param_count() {
+        let device = TestDevice::new(vec![]);
+        let interface = Interface::new(device);
+        let mcu = Mcu::from(("test_mcu".to_string(), interface));
+
+        // %u requires one param
+        let result = mcu.send("test_cmd", &[]);
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_send_wrong_param_type() {
+        let device = TestDevice::new(vec![]);
+        let interface = Interface::new(device);
+        let mcu = Mcu::from(("test_mcu".to_string(), interface));
+
+        // test_cmd expects x=%u but we pass a string
+        let result = mcu.send("test_cmd", &[ArgValue::Str("bad".to_string())]);
+        assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Parser encode / decode roundtrip (no background tasks)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parser_encode_decode_roundtrip() {
+        let mut parser = Parser::new();
+        parser.register(100, "test_cmd x=%u").unwrap();
+        parser.register(101, "test_resp val=%u data=%.*s").unwrap();
+
+        // Encode
+        let payload = parser.encode("test_cmd", &[ArgValue::UInt32(42)]).unwrap();
+        let raw = payload.into_raw();
+
+        // Decode
+        let frame = make_frame(0, &raw);
+        let decoded = parser.decode(frame.into()).unwrap();
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].0.name, "test_cmd");
+        assert_eq!(decoded[0].0.id, 100);
+        assert_eq!(decoded[0].1.len(), 1);
+        assert_eq!(decoded[0].1[0], ArgValue::UInt32(42));
+    }
+
+    #[test]
+    fn test_parser_decode_response_message() {
+        let mut parser = Parser::new();
+        parser.register(101, "test_resp val=%u data=%.*s").unwrap();
+
+        let mut payload = Payload::new();
+        payload.push_i16(101).unwrap();
+        payload.push_u32(99).unwrap();
+        payload.push_bytes(b"ok").unwrap();
+
+        let frame = make_frame(0x10, &payload.into_raw());
+        let decoded = parser.decode(frame.into()).unwrap();
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].0.name, "test_resp");
+        assert_eq!(decoded[0].1.len(), 2);
+        assert_eq!(decoded[0].1[0], ArgValue::UInt32(99));
+        assert_eq!(decoded[0].1[1], ArgValue::Bytes(b"ok".to_vec()));
+    }
+}

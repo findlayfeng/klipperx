@@ -30,8 +30,8 @@
 
 | 文件 | 职责 |
 |------|------|
-| `mod.rs` | `Mcu`：收发任务、`send` / `call`、字典安装、`connect` / `identify` |
-| `identify.rs` | 握手协议：`IDENTIFY_MESSAGES`、`Identify`、分块抓取与解压 |
+| `mod.rs` | `Mcu`：收发任务、`send` / `call`、字典安装与查询 |
+| `identify.rs` | 主机侧唯一的格式定义：`IDENTIFY_MESSAGES` |
 | `dictionary.rs` | `Dictionary`：解析固件字典、枚举展开、安装进 `Parser` |
 | `codec.rs` | `McuCommand` / `McuResponse` / `Params`：类型化消息视图 |
 | `pending.rs` | `PendingCalls`：同步请求/响应记账 |
@@ -43,6 +43,7 @@
 | 文件 | 职责 |
 |------|------|
 | `mod.rs` | 特征层说明与再导出 |
+| `identify.rs` | 引导特征：握手协议、分块抓取与解压、`connect` 入口 |
 | `clock.rs` | `ClockSync` / `McuClock`：`get_clock` ↔ `clock` |
 
 ## 目录

@@ -316,7 +316,8 @@ impl Mcu {
     /// Typed call that also works **before** the identify handshake.
     ///
     /// The identify exchange is the only one that precedes the dictionary, so
-    /// this exists for [`Identify::fetch`](super::identify::Identify::fetch)
+    /// this exists for
+    /// [`Identify::fetch`](crate::core::klippy::feature::identify::Identify::fetch)
     /// alone; every other caller must use [`Mcu::call_msg`] so that a missing
     /// handshake is reported instead of silently attempting a command the parser
     /// does not know yet.

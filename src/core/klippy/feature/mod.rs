@@ -25,9 +25,14 @@
 //! of the signature instead of an implicit, lint-flagged assumption.
 //!
 //! Features are constructed from an `Arc<Mcu>` — the shared handle returned by
-//! [`Mcu::connect`](crate::core::klippy::mcu::Mcu::connect) — so several features
-//! can use one MCU, and dropping the last handle shuts the device down.
+//! [`identify::connect`] — so several features can use one MCU, and dropping the
+//! last handle shuts the device down.
+//!
+//! [`identify`] is the bootstrap feature: it is the one exchange that runs before
+//! a data dictionary exists, and it is what produces the handle the others need.
 
 pub mod clock;
+pub mod identify;
 
 pub use clock::{ClockState, ClockSync, GetClock, McuClock};
+pub use identify::{Identify, McuIdentify};

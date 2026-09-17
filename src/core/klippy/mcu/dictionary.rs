@@ -41,7 +41,6 @@
 //! digits of the declared name as the first index.
 
 use super::error::McuError;
-use super::identify::Identify;
 use crate::core::klippy::msg::parser::Parser;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -169,11 +168,6 @@ pub struct Dictionary {
 }
 
 impl Dictionary {
-    /// Parse the dictionary carried by an identify payload.
-    pub fn parse(identify: &Identify) -> Result<Self, McuError> {
-        Self::from_json(identify.data.clone())
-    }
-
     /// Parse a decoded identify JSON body.
     ///
     /// # Errors
@@ -451,10 +445,14 @@ mod tests {
         Dictionary::from_json(serde_json::from_str(DICT_JSON).unwrap()).unwrap()
     }
 
-    fn identify_of(json: &str) -> Identify {
-        Identify {
-            data: serde_json::from_str(json).unwrap(),
-        }
+    fn identify_of(json: &str) -> serde_json::Value {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn test_parse_accepts_decoded_identify_body() {
+        let dict = Dictionary::from_json(identify_of(DICT_JSON)).unwrap();
+        assert_eq!(dict.message("get_clock").unwrap().id, 5);
     }
 
     // -----------------------------------------------------------------------
@@ -493,10 +491,11 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_from_identify() {
-        let dict = Dictionary::parse(&identify_of(DICT_JSON)).unwrap();
-        assert_eq!(dict.message("get_clock").unwrap().id, 5);
+    fn test_parse_keeps_unknown_top_level_fields() {
+        let dict = dict();
         assert_eq!(dict.raw()["app"], "Klipper");
+        assert_eq!(dict.raw()["version"], "v0.12.0-1-g1234567");
+        assert_eq!(dict.raw()["build_versions"], "gcc: 12.3.1");
     }
 
     #[test]

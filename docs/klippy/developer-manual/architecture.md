@@ -72,7 +72,7 @@ Frame ─► seq 校验 ─► Parser::decode ─► 逐条消息路由
 
 ## 数据字典的装载时机
 
-`Mcu::from_parts` 只注册 identify 一对；握手（`mcu::identify`）完成后 `install_dictionary` 把命令与响应注册进 `Parser`。之所以不需要重启接收任务：
+`Mcu::new`（内部 `from_parts`）只注册 identify 一对；`Mcu::connect`/`Mcu::identify`（都在 `mcu::identify`）完成后 `install_dictionary` 把命令与响应注册进 `Parser`。之所以不需要重启接收任务：
 
 ```rust
 let parser_for_task = parser.clone();   // 同一个 Arc<Mutex<MsgMap>>

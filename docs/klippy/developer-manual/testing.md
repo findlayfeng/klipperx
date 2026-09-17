@@ -28,7 +28,7 @@ cargo test --lib test_install_skips   # 单个用例（按名过滤）
 | `pending.rs` | 注册/配对/取消、未知名字不消费、先到先得、接收端已关闭、只取消一条 |
 | `dictionary.rs` | 三张消息表的解析（含 `output` 原样保留）、枚举单值与区间展开、常量、各类畸形输入、`install` 的跳过语义与不注册 `output` |
 | `identify.rs` | 单块与多块拼装（含 4 位序号回绕）、offset 错位、zlib 损坏、非 JSON、MCU 静默、zip bomb 上限、`Mcu::identify` 与 `Mcu::connect` 全流程 |
-| `mod.rs` | MCU 构造、发送错误路径、`Drop` 中止接收任务并释放阻塞读 |
+| `mod.rs` | 构造后未识别（`new` 只注册 identify 一对）、发送错误路径、`Drop` 中止接收任务并释放阻塞读 |
 
 ### `mcu::cmd`
 

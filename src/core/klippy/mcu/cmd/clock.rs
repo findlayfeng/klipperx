@@ -147,10 +147,7 @@ mod tests {
 
     /// An identified MCU whose only exchange is `get_clock` → `clock`.
     fn mcu_answering(mappings: Vec<MappingEntry>) -> Arc<Mcu> {
-        let mcu = Mcu::from((
-            "test_mcu".to_string(),
-            Interface::new(TestDevice::new(mappings)),
-        ));
+        let mcu = Mcu::for_test("test_mcu", Interface::new(TestDevice::new(mappings)));
         mcu.install_dictionary(dictionary()).unwrap();
         Arc::new(mcu)
     }
@@ -187,10 +184,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_clock_before_identify_fails() {
-        let mcu = Mcu::from((
-            "test_mcu".to_string(),
-            Interface::new(TestDevice::new(Vec::new())),
-        ));
+        let mcu = Mcu::for_test("test_mcu", Interface::new(TestDevice::new(Vec::new())));
         let clock = McuClock::new(Arc::new(mcu));
 
         let err = clock.get_clock().await.unwrap_err();
@@ -200,10 +194,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_clock_times_out_when_mcu_stays_silent() {
-        let mcu = Mcu::from((
-            "test_mcu".to_string(),
-            Interface::new(TestDevice::new(Vec::new())),
-        ));
+        let mcu = Mcu::for_test("test_mcu", Interface::new(TestDevice::new(Vec::new())));
         mcu.install_dictionary(dictionary()).unwrap();
         let clock = McuClock::new(Arc::new(mcu)).with_timeout(Duration::from_millis(50));
 

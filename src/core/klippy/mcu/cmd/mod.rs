@@ -544,10 +544,7 @@ mod tests {
     }
 
     fn mcu_with(dictionary: Dictionary, mappings: Vec<MappingEntry>) -> Mcu {
-        let mcu = Mcu::from((
-            "test_mcu".to_string(),
-            Interface::new(TestDevice::new(mappings)),
-        ));
+        let mcu = Mcu::for_test("test_mcu", Interface::new(TestDevice::new(mappings)));
         // A fresh `Mcu` registers the identify pair, so the dictionary entries
         // install cleanly on top.
         mcu.install_dictionary(dictionary).unwrap();
@@ -720,10 +717,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_msg_before_identify_fails() {
-        let mcu = Mcu::from((
-            "test_mcu".to_string(),
-            Interface::new(TestDevice::new(Vec::new())),
-        ));
+        let mcu = Mcu::for_test("test_mcu", Interface::new(TestDevice::new(Vec::new())));
 
         assert!(!mcu.is_identified());
         let err = mcu.send_msg(&GetClock).unwrap_err();
@@ -732,10 +726,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_install_dictionary_reports_installed_count() {
-        let mcu = Mcu::from((
-            "test_mcu".to_string(),
-            Interface::new(TestDevice::new(Vec::new())),
-        ));
+        let mcu = Mcu::for_test("test_mcu", Interface::new(TestDevice::new(Vec::new())));
 
         // 3 commands + 3 responses; the dictionary has no identify entries.
         assert_eq!(mcu.install_dictionary(dictionary()).unwrap(), 6);

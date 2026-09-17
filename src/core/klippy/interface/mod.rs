@@ -1,10 +1,14 @@
+pub mod host;
 #[cfg(test)]
 pub mod test;
+
+pub use host::HostDevice;
 #[cfg(test)]
 pub use test::{MappingEntry, TestDevice};
 
 use super::frame::Frame;
 use super::traits::InterfaceError;
+use std::path::Path;
 use std::sync::Arc;
 
 pub trait Device: Send + Sync {
@@ -22,11 +26,13 @@ pub trait Device: Send + Sync {
 
 /// Interface for communicating with a Klipper device.
 ///
-/// At runtime, this is either:
-/// - `Test(TestDevice)` — when building for tests
-/// - `Stub(StubDevice)` — for all other builds
+/// At runtime, this is one of:
+/// - `Host(HostDevice)` — klipper's host library, loaded from a shared object
+/// - `Test(TestDevice)` — a scripted device, in test builds
+/// - `Stub(StubDevice)` — nothing configured
 #[derive(Debug, Clone)]
 pub enum Interface {
+    Host(Arc<HostDevice>),
     #[cfg(test)]
     Test(Arc<TestDevice>),
     Stub(Arc<StubDevice>),
@@ -45,8 +51,23 @@ impl Interface {
         Self::Stub(Arc::new(StubDevice))
     }
 
+    /// Create an interface running klipper's host library from `path`.
+    ///
+    /// # Errors
+    /// Returns [`InterfaceError`] if the library cannot be loaded, does not
+    /// export the expected symbols, or fails to initialize.
+    pub fn host(path: impl AsRef<Path>) -> Result<Self, InterfaceError> {
+        Ok(Self::Host(Arc::new(HostDevice::load(path)?)))
+    }
+
     pub async fn send(&self, frame: Frame) -> Result<(), InterfaceError> {
         match self {
+            Self::Host(device) => {
+                let device = Arc::clone(device);
+                tokio::task::spawn_blocking(move || device.send(&frame))
+                    .await
+                    .expect("Interface send task panicked")
+            }
             #[cfg(test)]
             Self::Test(device) => {
                 let device = Arc::clone(device);
@@ -65,6 +86,12 @@ impl Interface {
 
     pub async fn receive(&self) -> Option<Frame> {
         match self {
+            Self::Host(device) => {
+                let device = Arc::clone(device);
+                tokio::task::spawn_blocking(move || device.receive())
+                    .await
+                    .expect("Interface receive task panicked")
+            }
             #[cfg(test)]
             Self::Test(device) => {
                 let device = Arc::clone(device);
@@ -84,6 +111,7 @@ impl Interface {
     /// Shut down the underlying device, unblocking any pending `receive()`.
     pub fn shutdown(&self) {
         match self {
+            Self::Host(device) => device.shutdown(),
             #[cfg(test)]
             Self::Test(device) => device.shutdown(),
             Self::Stub(device) => device.shutdown(),

@@ -9,10 +9,11 @@
 //! * the command modules themselves: `clock` wraps `get_clock` / `clock`, the
 //!   next one will wrap `set_digital_out`, and so on.
 //!
-//! The transport below owns frames, the data dictionary, and the *bare* pair
-//! [`Mcu::send`](super::Mcu::send) / [`Mcu::call`](super::Mcu::call), which take
-//! message names as strings. Everything that names a message in the type system —
-//! its definition, its parameters, its typed call — lives here.
+//! The transport in [`mcu`](crate::core::klippy::mcu) owns frames, the data
+//! dictionary, and the *bare* pair [`Mcu::send`](crate::core::klippy::mcu::Mcu::send) /
+//! [`Mcu::call`](crate::core::klippy::mcu::Mcu::call), which take message names as
+//! strings. Everything that names a message in the type system — its definition,
+//! its parameters, its typed call — lives here.
 //!
 //! # Reading parameters by name
 //!
@@ -24,28 +25,25 @@
 //!
 //! # Why a separate layer
 //!
-//! Three responsibilities are kept apart on purpose. Command modules live
-//! *inside* `mcu` as its outermost sublayer, but the split is the same one that
-//! separates `mcu` from `msg`:
+//! Three responsibilities are kept apart on purpose, one module each:
 //!
 //! | Layer | Owns | Knows about |
 //! |---|---|---|
-//! | `msg` | format strings ↔ bytes | nothing but the codec |
-//! | `mcu` | frames, the data dictionary, bare named access | only the identify pair |
-//! | `mcu::cmd` | *which* messages exist and what they mean | the firmware protocol |
+//! | [`msg`](crate::core::klippy::msg) | format strings ↔ bytes | nothing but the codec |
+//! | [`mcu`](crate::core::klippy::mcu) | frames, the data dictionary, bare named access | only the identify pair |
+//! | `cmd` | *which* messages exist and what they mean | the firmware protocol |
 //!
-//! The dependency runs one way for everything that is a *capability*: a command
-//! module uses `Mcu`, while the frame, dictionary, and bare-call code never
-//! mention one. The single edge back is identify — `mcu::identify` drives the pair
-//! defined in `cmd::identify` and encodes it with the traits defined below,
-//! because that exchange belongs to the transport (it is the one command whose
-//! formats the host owns, and it runs before any dictionary exists).
+//! `cmd` uses `mcu`; the frame, dictionary, and bare-call code over there mentions
+//! no command module. The bootstrap in [`identify`](crate::core::klippy::identify)
+//! is the one exchange that points the other way, and only because it has to: it
+//! is the one command whose formats the host owns and it runs before any
+//! dictionary exists (see below).
 //!
 //! Identify's transfer is therefore not here, but its definition is: the
 //! `identify` / `identify_response` pair is the bootstrap exchange that produces
 //! the dictionary, so its formats are host-owned and its chunk loop lives in
-//! `mcu::identify`. What stays in the command layer is the part every command has
-//! — the typed view and the arguments it sends.
+//! [`identify`](crate::core::klippy::identify). What stays in the command layer is
+//! the part every command has — the typed view and the arguments it sends.
 //!
 //! Because the host learns every format from the firmware, a command never
 //! hard-codes a format string or a wire id: it names the message and its
@@ -58,17 +56,15 @@
 //! of the signature instead of an implicit, lint-flagged assumption.
 //!
 //! Modules are constructed from an `Arc<Mcu>` — the shared handle returned by
-//! [`Mcu::connect`](super::Mcu::connect) — so several modules can use one MCU, and
-//! dropping the last handle shuts the device down.
+//! [`Mcu::connect`](crate::core::klippy::mcu::Mcu::connect) — so several modules
+//! can use one MCU, and dropping the last handle shuts the device down.
 
 pub mod clock;
 pub mod identify;
 
 pub use clock::{ClockState, ClockSync, GetClock, McuClock};
 
-use super::dictionary::{Dictionary, Enumeration};
-use super::error::McuError;
-use super::Mcu;
+use crate::core::klippy::mcu::{Dictionary, Enumeration, Mcu, McuError};
 use crate::core::klippy::msg::proto::{ArgType, ArgValue};
 use crate::core::klippy::msg::Msg;
 use std::sync::Arc;
@@ -365,7 +361,7 @@ impl Mcu {
     ///
     /// The identify exchange is the only one that precedes the dictionary, so
     /// this exists for
-    /// [`Identify::fetch`](super::identify::Identify::fetch) alone; every other
+    /// [`Identify::fetch`](crate::core::klippy::identify::Identify::fetch) alone; every other
     /// caller must use [`Mcu::call_msg`] so that a missing handshake is reported
     /// instead of silently attempting a command the parser does not know yet.
     pub(crate) async fn call_msg_ungated<C: McuCommand, R: McuResponse>(
@@ -397,13 +393,6 @@ impl Mcu {
             None => Params::new(msg, &values),
         };
         R::decode(&params)
-    }
-
-    /// Look up a message, failing fast when the dictionary does not define it.
-    fn require_message(&self, name: &str) -> Result<Arc<Msg>, McuError> {
-        self.parser
-            .lookup(name)
-            .ok_or_else(|| McuError::UnknownMessage(name.to_string()))
     }
 }
 

@@ -4,40 +4,39 @@
 //! Construction ([`Mcu::new`]) only brings the transport up: the parser knows the
 //! host's identify formats and nothing else, so typed commands answer
 //! [`McuError::NotIdentified`] until the identify handshake installs a dictionary.
-//! That handshake is [`Mcu::connect`], and it is defined in `identify`, together
-//! with the transfer it drives — this module does not call it.
+//! That handshake is [`Mcu::connect`], defined in [`identify`]
+//! together with the transfer it drives — this module does not call it.
 //!
-//! Anything that names a message in the type system — [`McuCommand`](cmd::McuCommand),
-//! [`McuResponse`](cmd::McuResponse), [`Params`](cmd::Params), and the typed calls
-//! — lives one level up in [`cmd`], together with the command modules themselves.
-//! Identify straddles both: its formats, its transfer, and its entry points are
-//! transport work in `identify`, while its two typed views are defined in
-//! [`cmd::identify`].
+//! Anything that names a message in the type system —
+//! [`McuCommand`](super::cmd::McuCommand), [`McuResponse`](super::cmd::McuResponse),
+//! [`Params`](super::cmd::Params), and the typed calls — lives beside this module
+//! in [`cmd`](super::cmd), together with the command modules themselves. Identify
+//! straddles both: its formats, its transfer, and its entry points are transport
+//! work in [`identify`], while its two typed views are defined in
+//! [`cmd::identify`](super::cmd::identify).
+//!
+//! The one thing the transport asks of the modules beside it is the parser it
+//! starts with: [`Mcu::new`] calls `identify::new_parser`, because the two formats
+//! it has to know before anything else are identify's.
 
 mod dictionary;
 mod error;
-mod identify;
 mod pending;
 mod restart_method;
 
-// Keep this declaration free of a doc comment: rustdoc resolves links in a
-// module's documentation against the scope its `mod` declaration lives in, so an
-// outer `///` here would push the links in `cmd`'s own docs into `mcu`'s
-// scope (where `identify` names the private transport module).
-pub mod cmd;
-
 pub use dictionary::{Dictionary, Enumeration, MessageDef, OutputDef};
 pub use error::{McuCallError, McuError};
-pub use identify::{Identify, IDENTIFY_TIMEOUT};
 pub use restart_method::McuRestartMethod;
 
 use crate::core::klippy::config::mcu::McuConfig;
 use crate::core::klippy::frame::{Frame, MESSAGE_PAYLOAD_MAX};
+use crate::core::klippy::identify;
 use crate::core::klippy::interface::Interface;
 use crate::core::klippy::mcu::pending::PendingCalls;
 use crate::core::klippy::msg::error::MsgError;
 use crate::core::klippy::msg::parser::Parser;
 use crate::core::klippy::msg::proto::{ArgValue, Payload};
+use crate::core::klippy::msg::Msg;
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{sleep, Duration};
@@ -56,8 +55,9 @@ use tracing::{debug, error, info, warn};
 /// the dictionary does not come from this MCU.
 ///
 /// The host owns no message formats beyond the identify pair, and the typed
-/// command API ([`Mcu::send_msg`] / [`Mcu::call_msg`], defined in [`cmd`] next to
-/// the vocabulary they use) refuses to run before the dictionary is in place.
+/// command API ([`Mcu::send_msg`] / [`Mcu::call_msg`], defined in [`cmd`](super::cmd)
+/// next to the vocabulary they use) refuses to run before the dictionary is in
+/// place.
 pub struct Mcu {
     /// MCU name
     name: String,
@@ -293,6 +293,17 @@ impl Mcu {
     /// Require an installed dictionary before running a typed command.
     pub(crate) fn require_dictionary(&self) -> Result<Arc<Dictionary>, McuError> {
         self.dictionary().ok_or(McuError::NotIdentified)
+    }
+
+    /// Look up a registered message, failing fast when it is unknown.
+    ///
+    /// The typed calls in [`crate::core::klippy::cmd`] resolve both names through
+    /// this before sending anything, which is what turns an unimplemented message
+    /// into an immediate error instead of a timeout.
+    pub(crate) fn require_message(&self, name: &str) -> Result<Arc<Msg>, McuError> {
+        self.parser
+            .lookup(name)
+            .ok_or_else(|| McuError::UnknownMessage(name.to_string()))
     }
 
     /// Send a batched payload to the MCU.

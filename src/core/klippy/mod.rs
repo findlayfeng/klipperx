@@ -6,9 +6,11 @@
 // - LibInterface: real implementation using klipper host library (temporarily disabled)
 //   See interface/host.rs for the original implementation (commented out from build)
 
+pub mod cmd;
 pub mod config;
 pub mod error;
 pub mod frame;
+pub mod identify;
 pub mod kinematics;
 pub mod mcu;
 pub mod msg;

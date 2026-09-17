@@ -16,7 +16,7 @@
 //! It wraps at 2^32 ticks; a 64-bit view needs the `get_uptime`/`uptime` pair,
 //! which is not implemented yet.
 
-use crate::core::klippy::mcu::cmd::{McuCommand, McuResponse, Params};
+use crate::core::klippy::cmd::{McuCommand, McuResponse, Params};
 use crate::core::klippy::mcu::{Mcu, McuError};
 use crate::core::klippy::msg::proto::ArgValue;
 use std::future::Future;

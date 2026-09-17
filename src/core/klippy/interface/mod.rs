@@ -1,8 +1,10 @@
 pub mod host;
+pub mod serial;
 #[cfg(test)]
 pub mod test;
 
 pub use host::HostDevice;
+pub use serial::SerialDevice;
 #[cfg(test)]
 pub use test::{MappingEntry, TestDevice};
 
@@ -27,11 +29,13 @@ pub trait Device: Send + Sync {
 /// Interface for communicating with a Klipper device.
 ///
 /// At runtime, this is one of:
+/// - `Serial(SerialDevice)` — a real MCU on a tty
 /// - `Host(HostDevice)` — klipper's host library, loaded from a shared object
 /// - `Test(TestDevice)` — a scripted device, in test builds
 /// - `Stub(StubDevice)` — nothing configured
 #[derive(Debug, Clone)]
 pub enum Interface {
+    Serial(Arc<SerialDevice>),
     Host(Arc<HostDevice>),
     #[cfg(test)]
     Test(Arc<TestDevice>),
@@ -51,6 +55,15 @@ impl Interface {
         Self::Stub(Arc::new(StubDevice))
     }
 
+    /// Create an interface for a real MCU on the serial port `path`.
+    ///
+    /// # Errors
+    /// Returns [`InterfaceError`] if the port cannot be opened or put into raw
+    /// mode at `baud`.
+    pub fn serial(path: impl AsRef<std::path::Path>, baud: u32) -> Result<Self, InterfaceError> {
+        Ok(Self::Serial(Arc::new(SerialDevice::open(path, baud)?)))
+    }
+
     /// Create an interface running klipper's host library from `path`.
     ///
     /// # Errors
@@ -62,6 +75,12 @@ impl Interface {
 
     pub async fn send(&self, frame: Frame) -> Result<(), InterfaceError> {
         match self {
+            Self::Serial(device) => {
+                let device = Arc::clone(device);
+                tokio::task::spawn_blocking(move || device.send(&frame))
+                    .await
+                    .expect("Interface send task panicked")
+            }
             Self::Host(device) => {
                 let device = Arc::clone(device);
                 tokio::task::spawn_blocking(move || device.send(&frame))
@@ -86,6 +105,12 @@ impl Interface {
 
     pub async fn receive(&self) -> Option<Frame> {
         match self {
+            Self::Serial(device) => {
+                let device = Arc::clone(device);
+                tokio::task::spawn_blocking(move || device.receive())
+                    .await
+                    .expect("Interface receive task panicked")
+            }
             Self::Host(device) => {
                 let device = Arc::clone(device);
                 tokio::task::spawn_blocking(move || device.receive())
@@ -111,6 +136,7 @@ impl Interface {
     /// Shut down the underlying device, unblocking any pending `receive()`.
     pub fn shutdown(&self) {
         match self {
+            Self::Serial(device) => device.shutdown(),
             Self::Host(device) => device.shutdown(),
             #[cfg(test)]
             Self::Test(device) => device.shutdown(),

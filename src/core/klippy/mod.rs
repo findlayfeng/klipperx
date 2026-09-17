@@ -2,7 +2,7 @@
 //
 // This module provides:
 // - Interface enum: abstract interface for printer communication
-// - SerialInterface: serial interface implementation
+// - SerialDevice: a real MCU on a serial port (see interface/serial.rs)
 // - HostDevice: real implementation running klipper's host library, loaded at
 //   runtime (see interface/host.rs)
 
@@ -23,14 +23,12 @@ pub mod interface;
 
 // Re-export common types for convenience
 pub use error::KlippyError;
-pub use interface::Interface;
+pub use interface::{HostDevice, Interface, SerialDevice};
 pub use msg::proto::Payload;
 pub use msg::Msg;
 pub use traits::{
     InterfaceEvent, Printer, PrinterEvent, PrinterObject, PrinterState, StateMessage,
 };
-// pub use interface::host::HostDevice;
-// pub use interface::serial::SerialInterface;
 // pub use interface::canbus::CanbusInterface;
 // pub use mcu::{MCU, McuError, McuPin, PinParams};
 // pub use mcu::{add_printer_objects, get_printer_mcu};

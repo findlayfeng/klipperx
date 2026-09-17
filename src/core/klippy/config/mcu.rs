@@ -22,8 +22,6 @@ pub struct McuConfig {
 /// works (`serial` or `canbus_uuid`): see [`McuConfig::create_interface`].
 ///
 /// `test` exists in test builds only — it is how the unit tests script a device.
-/// `serial` is part of the format but its transport is not implemented yet, so it
-/// is recognized and refused by name instead of being mistaken for "no interface".
 fn interface_keys() -> &'static [&'static str] {
     #[cfg(test)]
     return &["host_library", "serial", "test"];
@@ -39,8 +37,14 @@ impl McuConfig {
     ///
     /// ```ini
     /// [mcu]
+    /// serial: /dev/ttyACM0
+    /// baud: 250000
+    ///
+    /// [mcu simulated]
     /// host_library: /path/to/libklipper_host.so
     /// ```
+    ///
+    /// `baud` only applies to `serial`, and defaults to Klipper's 250000.
     ///
     /// # Arguments
     /// * `section` — The MCU configuration section from the config file.
@@ -98,12 +102,21 @@ impl McuConfig {
             return Interface::host(path).map_err(|e| format!("host_library: {e}"));
         }
 
-        if section.has("serial") {
-            return Err(format!(
-                "MCU '{}': the serial transport is not implemented yet, \
-                 use host_library: <libklipper_host.so>",
-                section.identifier()
-            ));
+        if let Some(path) = section.get_str("serial") {
+            let baud = match section.get_str("baud") {
+                // A rate of zero would ask the kernel to hang the line up.
+                Some(text) => match text.parse::<u32>() {
+                    Ok(baud) if baud > 0 => baud,
+                    _ => {
+                        return Err(format!(
+                            "MCU '{}' has an invalid baud: '{text}'",
+                            section.identifier()
+                        ))
+                    }
+                },
+                None => crate::core::klippy::interface::serial::DEFAULT_BAUD,
+            };
+            return Interface::serial(path, baud).map_err(|e| format!("serial: {e}"));
         }
 
         #[cfg(test)]
@@ -265,11 +278,24 @@ mod tests {
     }
 
     #[test]
-    fn test_serial_is_recognized_but_not_implemented() {
-        let section = section_with("serial", "/dev/ttyACM0");
+    fn test_serial_key_becomes_the_serial_interface() {
+        // A port that cannot be opened still proves the routing: the error names
+        // the port, which only the serial device's own error does.
+        let section = section_with("serial", "/dev/not-a-serial-port");
         let err = McuConfig::new(&section).unwrap_err();
-        assert!(err.contains("serial transport"), "{err}");
-        assert!(err.contains("host_library"), "{err}");
+        assert!(err.starts_with("serial: "), "{err}");
+        assert!(err.contains("/dev/not-a-serial-port"), "{err}");
+    }
+
+    #[test]
+    fn test_invalid_baud_is_rejected_before_opening_the_port() {
+        let mut section = section_with("serial", "/dev/not-a-serial-port");
+        section
+            .parameters
+            .insert("baud".to_string(), ConfigValue::Single("fast".to_string()));
+        let err = McuConfig::new(&section).unwrap_err();
+        assert!(err.contains("invalid baud"), "{err}");
+        assert!(err.contains("fast"), "{err}");
     }
 
     #[test]

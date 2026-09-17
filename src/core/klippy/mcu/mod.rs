@@ -14,7 +14,7 @@ pub use restart_method::McuRestartMethod;
 use crate::core::klippy::config::mcu::McuConfig;
 use crate::core::klippy::frame::{Frame, MESSAGE_PAYLOAD_MAX};
 use crate::core::klippy::interface::Interface;
-use crate::core::klippy::mcu::identify::IDENTIFY_MESSAGES;
+use crate::core::klippy::mcu::identify::{IDENTIFY_MESSAGES, IDENTIFY_TIMEOUT};
 use crate::core::klippy::mcu::pending::PendingCalls;
 use crate::core::klippy::msg::error::MsgError;
 use crate::core::klippy::msg::parser::Parser;
@@ -198,6 +198,45 @@ impl Mcu {
             interface,
             recv_handle: Some(recv_handle),
         }
+    }
+
+    /// Create an MCU and complete the identify handshake.
+    ///
+    /// This is the normal entry point: it connects, fetches the firmware's data
+    /// dictionary, and installs it, leaving a fully usable MCU. The handle is an
+    /// [`Arc`] because features share it — dropping the last one shuts the device
+    /// down (see the [`Drop`] implementation).
+    ///
+    /// # Errors
+    /// Returns [`McuError`] if the handshake fails. The partially initialized MCU
+    /// is dropped, which shuts the interface down again.
+    pub async fn connect(config: McuConfig) -> Result<Arc<Mcu>, McuError> {
+        let mcu = Arc::new(Mcu::from(config));
+        mcu.identify(IDENTIFY_TIMEOUT).await?;
+        Ok(mcu)
+    }
+
+    /// Run the identify handshake: fetch the firmware data dictionary and install
+    /// it.
+    ///
+    /// Returns the number of messages newly registered from the dictionary.
+    /// Calling this on an MCU that is already identified replaces the dictionary;
+    /// messages already registered are skipped, so an interrupted handshake can be
+    /// retried.
+    ///
+    /// # Errors
+    /// Returns [`McuError`] if the exchange fails, the payload cannot be decoded,
+    /// or the dictionary cannot be installed.
+    pub async fn identify(&self, timeout: Duration) -> Result<usize, McuError> {
+        let identify = Identify::fetch(self, timeout).await?;
+        let dictionary = Dictionary::parse(&identify)?;
+        let installed = self.install_dictionary(dictionary)?;
+
+        info!(
+            "MCU '{}' identified: {} messages registered",
+            self.name, installed
+        );
+        Ok(installed)
     }
 
     /// Install the firmware's data dictionary.

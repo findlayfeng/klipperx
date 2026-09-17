@@ -309,11 +309,46 @@ impl Mcu {
         timeout: Duration,
     ) -> Result<R, McuError> {
         let dictionary = self.require_dictionary()?;
+        self.call_typed::<C, R>(cmd, timeout, Some(dictionary))
+            .await
+    }
+
+    /// Typed call that also works **before** the identify handshake.
+    ///
+    /// The identify exchange is the only one that precedes the dictionary, so
+    /// this exists for [`Identify::fetch`](super::identify::Identify::fetch)
+    /// alone; every other caller must use [`Mcu::call_msg`] so that a missing
+    /// handshake is reported instead of silently attempting a command the parser
+    /// does not know yet.
+    pub(crate) async fn call_msg_ungated<C: McuCommand, R: McuResponse>(
+        &self,
+        cmd: &C,
+        timeout: Duration,
+    ) -> Result<R, McuError> {
+        self.call_typed::<C, R>(cmd, timeout, None).await
+    }
+
+    /// Shared body of the typed calls.
+    ///
+    /// Both names are resolved before the command is sent, so a message the
+    /// firmware does not implement fails immediately instead of waiting for
+    /// `timeout`.
+    async fn call_typed<C: McuCommand, R: McuResponse>(
+        &self,
+        cmd: &C,
+        timeout: Duration,
+        dictionary: Option<Arc<Dictionary>>,
+    ) -> Result<R, McuError> {
         self.require_message(C::NAME)?;
         let msg = self.require_message(R::NAME)?;
 
         let values = self.call(C::NAME, &cmd.args(), R::NAME, timeout).await?;
-        R::decode(&Params::new(msg, &values).with_dictionary(dictionary))
+
+        let params = match dictionary {
+            Some(dictionary) => Params::new(msg, &values).with_dictionary(dictionary),
+            None => Params::new(msg, &values),
+        };
+        R::decode(&params)
     }
 
     /// Look up a message, failing fast when the dictionary does not define it.

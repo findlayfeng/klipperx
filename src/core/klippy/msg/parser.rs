@@ -45,6 +45,7 @@ impl MsgMap {
     }
 }
 
+#[derive(Clone)]
 pub struct Parser {
     msgs: Arc<Mutex<MsgMap>>,
 }

@@ -37,7 +37,6 @@
 ///
 /// These are registered when creating a new [`Mcu`](super::Mcu) via
 /// [`Mcu::from_config`](super::Mcu::from_config).
-#[allow(dead_code)]
 pub const DEFAULT_MESSAGES: &[(u8, &str)] = &[
     (0, "identify_response offset=%u data=%.*s"),
     (1, "identify offset=%u count=%c"),

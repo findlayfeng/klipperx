@@ -4,7 +4,8 @@
 //! This module owns the transfer:
 //!
 //! * [`IDENTIFY_MESSAGES`] — the two formats the host is allowed to hard-code,
-//!   registered by [`Mcu::new`](super::Mcu::new) at construction time.
+//!   and [`new_parser`], which hands out the registry that already knows them
+//!   (`Mcu::new` calls it at construction time).
 //! * the chunked transfer itself: request a chunk, append it, stop at the empty
 //!   terminator, then decompress and decode the body ([`Identify::fetch`]).
 //!
@@ -45,6 +46,7 @@
 use super::cmd::identify::{IdentifyChunk, IdentifyRequest};
 use super::{Dictionary, Mcu, McuError};
 use crate::core::klippy::config::mcu::McuConfig;
+use crate::core::klippy::msg::parser::Parser;
 use flate2::read::ZlibDecoder;
 use std::io::Read;
 use std::sync::Arc;
@@ -60,6 +62,22 @@ pub const IDENTIFY_MESSAGES: &[(i16, &str)] = &[
     (0, "identify_response offset=%u data=%.*s"),
     (1, "identify offset=%u count=%c"),
 ];
+
+/// The parser an [`Mcu`](super::Mcu) starts with: an empty registry that already
+/// knows [`IDENTIFY_MESSAGES`].
+///
+/// Registration belongs next to the formats it registers, and giving out the
+/// finished registry rather than a `register_formats(&mut parser)` step means a
+/// future construction path cannot forget to call it. Every other format arrives
+/// with the firmware dictionary (see
+/// [`Mcu::install_dictionary`](super::Mcu::install_dictionary)).
+pub(crate) fn new_parser() -> Parser {
+    let mut parser = Parser::new();
+    parser
+        .register_all(IDENTIFY_MESSAGES)
+        .expect("the host-owned identify formats must be valid");
+    parser
+}
 
 /// Timeout for the complete identify handshake, used by
 /// [`Mcu::identify`](super::Mcu::identify) and

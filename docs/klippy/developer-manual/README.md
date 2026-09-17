@@ -33,7 +33,7 @@
 | 文件 | 职责 |
 |------|------|
 | `mod.rs` | `Mcu`：构造（`new`）、收发任务、`send` / `call`、字典安装与查询、`Drop`；只声明 `cmd` 不引用它 |
-| `identify.rs` | identify 交换：主机侧唯一的格式定义、分块驱动与解压、`connect` / `identify` 入口（命令视图在 `mcu::cmd::identify`） |
+| `identify.rs` | identify 交换：主机侧唯一的格式定义与注册、分块驱动与解压、`connect` / `identify` 入口（命令视图在 `mcu::cmd::identify`） |
 | `dictionary.rs` | `Dictionary`：解析固件字典、枚举展开、安装进 `Parser` |
 | `pending.rs` | `PendingCalls`：同步请求/响应记账 |
 | `error.rs` | `McuError`（总括）、`McuCallError`（`call` 专用） |

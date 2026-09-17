@@ -3,8 +3,6 @@ pub mod param;
 pub mod parser;
 pub mod proto;
 
-use std::sync::{Arc, Mutex};
-
 // Re-export commonly-used items for convenience
 pub use error::{MsgError, MsgResult};
 pub use param::Param;
@@ -98,132 +96,6 @@ impl MsgBase {
 }
 
 // ===========================================================================
-// MsgHandler
-// ===========================================================================
-
-/// A `MsgBase` with a callback for handling matched messages.
-///
-/// `MsgHandler` wraps a `MsgBase` and provides callback functionality.
-/// It implements `Deref<Target = MsgBase>` so all `MsgBase` methods are
-/// directly accessible.
-///
-/// # Example
-/// ```
-/// # use klipperx::core::klippy::msg::{MsgBase, MsgHandler, ArgValue};
-/// let (name, command) = MsgBase::parse("config_digital_out oid=%u pin=%s").unwrap();
-/// let handler = MsgHandler::new(command, |values| {
-///     println!("command received with {} params", values.len());
-/// });
-/// assert_eq!(name, "config_digital_out");
-/// ```
-pub struct MsgHandler {
-    /// The underlying command definition.
-    msg: MsgBase,
-    /// Callback invoked when this command is matched.
-    callback: Arc<Mutex<Box<dyn FnMut(&[ArgValue]) + Send>>>,
-}
-
-impl std::fmt::Debug for MsgHandler {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MsgHandler")
-            .field("msg", &self.msg)
-            .finish()
-    }
-}
-
-impl MsgHandler {
-    /// Create a new `MsgHandler` from a `MsgBase` and a callback.
-    ///
-    /// The callback receives a slice of `ArgValue` containing all decoded
-    /// parameter values in command definition order. Use
-    /// `values[i].clone()` or pattern matching to extract values.
-    pub fn new(
-        msg: MsgBase,
-        callback: impl FnMut(&[ArgValue]) + Send + 'static,
-    ) -> Self {
-        Self { msg,
-            callback: Arc::new(Mutex::new(Box::new(callback))),
-        }
-    }
-
-    /// Returns a reference to the underlying `MsgBase`.
-    pub fn msg(&self) -> &MsgBase {
-        &self.msg
-    }
-
-    /// Set or replace the callback function.
-    ///
-    /// The callback receives a slice of `ArgValue` containing all decoded
-    /// parameter values in command definition order.
-    pub fn set_callback(&mut self, callback: impl FnMut(&[ArgValue]) + Send + 'static) {
-        *self.callback.lock().unwrap() = Box::new(callback);
-    }
-
-    /// Invoke the callback with the given parameters.
-    pub fn invoke_callback(&mut self, params: &[ArgValue]) {
-        (self.callback.lock().unwrap())(params);
-    }
-}
-
-impl std::ops::Deref for MsgHandler {
-    type Target = MsgBase;
-
-    fn deref(&self) -> &Self::Target {
-        &self.msg
-    }
-}
-
-/// A command entry that wraps a parsed command format.
-#[derive(Debug)]
-pub enum MsgEntry {
-    /// A base command format (no callback).
-    Base(MsgBase),
-    /// A command handler with a callback.
-    Handler(MsgHandler),
-}
-
-impl From<MsgHandler> for MsgEntry {
-    fn from(handler: MsgHandler) -> Self {
-        Self::Handler(handler)
-    }
-}
-
-impl From<MsgBase> for MsgEntry {
-    fn from(base: MsgBase) -> Self {
-        Self::Base(base)
-    }
-}
-
-impl MsgEntry {
-    /// Attach a callback to this entry.
-    ///
-    /// A `Base` entry is converted into a `Handler`. If the entry is already
-    /// a `Handler`, the existing callback is replaced with the new one.
-    pub fn with_callback(
-        self,
-        callback: impl FnMut(&[ArgValue]) + Send + 'static,
-    ) -> Self {
-        match self {
-            MsgEntry::Base(base) => MsgHandler::new(base, callback).into(),
-            MsgEntry::Handler(mut handler) => {
-                handler.set_callback(callback);
-                MsgEntry::Handler(handler)
-            }
-        }
-    }
-
-    /// Convert a `Handler` entry to a `Base` by discarding the callback.
-    ///
-    /// Returns `self` unchanged if already a `Base`.
-    pub fn into_base(self) -> Self {
-        match self {
-            MsgEntry::Base(_) => self,
-            MsgEntry::Handler(handler) => handler.msg().clone().into(),
-        }
-    }
-}
-
-// ===========================================================================
 // Tests
 // ===========================================================================
 
@@ -284,65 +156,6 @@ mod tests {
         ];
         let cmd = MsgBase::new(params);
         assert_eq!(cmd.format(), "a=%u b=%i c=%hu d=%hi e=%s f=%.*s");
-    }
-
-    // -----------------------------------------------------------------------
-    // MsgHandler callback lifecycle
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_set_callback() {
-        let mut handler = MsgHandler::new(MsgBase::new(vec![]), |_| {});
-        handler.set_callback(|_: &[ArgValue]| {});
-    }
-
-    #[test]
-    fn test_invoke_callback_success() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::sync::Arc;
-
-        let invoked = Arc::new(AtomicBool::new(false));
-        let invoked_clone = invoked.clone();
-        let mut handler = MsgHandler::new(MsgBase::new(vec![]), move |_| {
-            invoked_clone.store(true, Ordering::SeqCst);
-        });
-        let values = vec![ArgValue::Str("test".to_string())];
-        handler.invoke_callback(&values);
-        assert!(invoked.load(Ordering::SeqCst));
-    }
-
-    // -----------------------------------------------------------------------
-    // MsgHandler Deref behavior
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_deref_access_params() {
-        let (name, command) = MsgBase::parse("G1 X=%u Y=%u").unwrap();
-        let handler = MsgHandler::new(command, |_: &[ArgValue]| {});
-        assert_eq!(name, "G1");
-        // Access params() via Deref<Target=MsgBase>
-        assert_eq!(handler.params().len(), 2);
-    }
-
-    #[test]
-    fn test_deref_access_format() {
-        let (name, command) = MsgBase::parse("G1 X=%u Y=%u").unwrap();
-        let handler = MsgHandler::new(command, |_: &[ArgValue]| {});
-        assert_eq!(name, "G1");
-        // Access format() via Deref<Target=MsgBase>
-        assert_eq!(handler.format(), "X=%u Y=%u");
-    }
-
-    // -----------------------------------------------------------------------
-    // MsgHandler Debug
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_handler_debug() {
-        let handler = MsgHandler::new(MsgBase::new(vec![]), |_: &[ArgValue]| {});
-        let debug_str = format!("{:?}", handler);
-        assert!(debug_str.contains("MsgHandler"));
-        assert!(!debug_str.contains("has_callback"));
     }
 
     // -----------------------------------------------------------------------

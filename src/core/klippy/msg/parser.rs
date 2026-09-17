@@ -73,6 +73,24 @@ impl Parser {
         Ok(())
     }
 
+    /// Check whether a command name is registered in the parser.
+    pub fn is_registered(&self, name: &str) -> bool {
+        let map = match self.msgs.lock() {
+            Ok(guard) => guard,
+            Err(_) => return false,
+        };
+        map.get_by_name(name).is_some()
+    }
+
+    /// Check whether a registered command has a callback bound.
+    pub fn has_callback(&self, name: &str) -> bool {
+        let map = match self.msgs.lock() {
+            Ok(guard) => guard,
+            Err(_) => return false,
+        };
+        map.get_by_name(name).map(|msg| msg.callback.is_some()).unwrap_or(false)
+    }
+
     /// Bind a callback to a registered command.
     ///
     /// If the command already has a callback, the new callback replaces it.

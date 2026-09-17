@@ -12,8 +12,47 @@ use crate::core::klippy::msg::error::MsgError;
 use crate::core::klippy::msg::parser::Parser;
 use crate::core::klippy::msg::proto::{ArgValue, Payload};
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::time::{sleep, Duration};
+
+/// Error returned by [`Mcu::call`].
+#[derive(Debug)]
+pub enum McuCallError {
+    /// The command name is not registered in the message parser.
+    CommandNotFound(String),
+    /// The command already has a callback bound — `call` is only for
+    /// synchronous request/response pairs.
+    CommandHasCallback(String),
+    /// The send buffer is full and the command could not be queued.
+    SendFailed(String),
+    /// The expected response did not arrive before `timeout` elapsed.
+    Timeout(String),
+}
+
+impl std::fmt::Display for McuCallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            McuCallError::CommandNotFound(name) => {
+                write!(f, "command not found: {}", name)
+            }
+            McuCallError::CommandHasCallback(name) => {
+                write!(f, "command already has callback: {}", name)
+            }
+            McuCallError::SendFailed(msg) => write!(f, "send failed: {}", msg),
+            McuCallError::Timeout(msg) => write!(f, "timeout: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for McuCallError {}
+
+/// A pending call waiting for a response from the MCU.
+struct PendingCall {
+    /// Name of the response message to match against.
+    response_name: String,
+    /// Sender to deliver the decoded parameters.
+    response_tx: oneshot::Sender<Vec<ArgValue>>,
+}
 
 /// MCU object that represents a physical microcontroller unit.
 ///
@@ -27,6 +66,8 @@ pub struct Mcu {
     identify: Arc<Mutex<Option<Identify>>>,
     /// Sender for outbound payload queue
     send_buf_tx: mpsc::Sender<Payload>,
+    /// Pending synchronous calls waiting for responses.
+    pending_calls: Arc<Mutex<Vec<PendingCall>>>,
 }
 
 impl Mcu {
@@ -95,6 +136,9 @@ impl Mcu {
         let mut parser = Parser::new();
         Self::init_parser(&mut parser);
         let parser_for_task = parser.clone();
+        let pending_calls: Arc<Mutex<Vec<PendingCall>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let pending_calls_for_task = pending_calls.clone();
 
         tokio::spawn(async move {
             let mut seq = 0u8;
@@ -122,11 +166,26 @@ impl Mcu {
                 };
 
                 for (msg, params) in decoded {
+                    // Pending call has priority — if matched, consume and skip callback.
+                    let mut pending = pending_calls_for_task.lock().await;
+                    if let Some(idx) = pending
+                        .iter()
+                        .position(|pc| pc.response_name == msg.name)
+                    {
+                        let call = pending.remove(idx);
+                        let _ = call.response_tx.send(params);
+                        continue;
+                    }
+                    // No pending call — fall back to callback.
                     if let Some(callback) = &msg.callback {
                         let mut cb = callback.lock().unwrap();
                         cb(params.as_slice());
                     } else {
-                        todo!("no callback registered for {} (id={})", msg.name, msg.id)
+                        // No callback and no pending call — discard with warning.
+                        eprintln!(
+                            "[mcu] warning: unhandled message {} (id={}), discarding",
+                            msg.name, msg.id
+                        );
                     }
                 }
             }
@@ -137,6 +196,7 @@ impl Mcu {
             parser,
             identify: Arc::new(Mutex::new(None)),
             send_buf_tx,
+            pending_calls,
         }
     }
 
@@ -173,6 +233,95 @@ impl Mcu {
             .try_send(payload)
             .map_err(|e| MsgError::new(e.to_string()))?;
         Ok(())
+    }
+
+    /// Send a command and wait for the response message.
+    ///
+    /// This is a synchronous request/response pattern: the command is sent,
+    /// then the caller blocks (async) until the response message arrives or
+    /// `timeout` elapses.
+    ///
+    /// # Requirements
+    /// - `command` must be registered in the message parser.
+    /// - `command` must **not** have a callback bound (callback-registered
+    ///   messages are for asynchronous notification, not request/response).
+    /// - The response message identified by `response_name` must also be
+    ///   registered (with or without a callback).
+    ///
+    /// # Errors
+    /// Returns [`McuCallError`] if the command is unknown, already has a
+    /// callback, the send buffer is full, or the response does not arrive
+    /// within `timeout`.
+    pub async fn call(
+        &self,
+        command: &str,
+        args: &[ArgValue],
+        response_name: &str,
+        timeout: Duration,
+    ) -> Result<Vec<ArgValue>, McuCallError> {
+        // 1. Verify command is registered; warn if it has a callback.
+        if !self.parser.is_registered(command) {
+            return Err(McuCallError::CommandNotFound(command.to_string()));
+        }
+        if self.parser.has_callback(command) {
+            eprintln!(
+                "[mcu] warning: command '{}' already has a callback, call may not work as expected",
+                command
+            );
+        }
+
+        // 2. Create a oneshot channel for the response.
+        let (tx, rx) = oneshot::channel::<Vec<ArgValue>>();
+
+        // 3. Register the pending call.
+        {
+            let mut pending = self.pending_calls.lock().await;
+            pending.push(PendingCall {
+                response_name: response_name.to_string(),
+                response_tx: tx,
+            });
+        }
+
+        // 4. Send the command.
+        if let Err(e) = self.send(command, args) {
+            // Clean up the pending call on send failure.
+            self.pending_calls
+                .lock()
+                .await
+                .retain(|pc| pc.response_name != response_name);
+            return Err(McuCallError::SendFailed(e.msg));
+        }
+
+        // 5. Wait for the response.
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(params)) => {
+                // Clean up the pending call.
+                self.pending_calls
+                    .lock()
+                    .await
+                    .retain(|pc| pc.response_name != response_name);
+                Ok(params)
+            }
+            Ok(Err(_recv)) => {
+                // Receiver dropped (shouldn't happen in normal flow).
+                self.pending_calls
+                    .lock()
+                    .await
+                    .retain(|pc| pc.response_name != response_name);
+                Err(McuCallError::SendFailed("response receiver dropped".to_string()))
+            }
+            Err(_) => {
+                // Timeout — clean up the pending call.
+                self.pending_calls
+                    .lock()
+                    .await
+                    .retain(|pc| pc.response_name != response_name);
+                Err(McuCallError::Timeout(format!(
+                    "no response for {} within {:?}",
+                    response_name, timeout
+                )))
+            }
+        }
     }
 }
 

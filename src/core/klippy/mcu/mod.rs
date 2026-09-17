@@ -3,13 +3,13 @@ mod identify;
 mod restart_method;
 
 pub use error::McuCallError;
-pub use identify::{Identify, IdentifyError, IdentifyErrorKind};
+pub use identify::Identify;
 pub use restart_method::McuRestartMethod;
 
 use crate::core::klippy::config::mcu::McuConfig;
 use crate::core::klippy::frame::{Frame, MESSAGE_PAYLOAD_MAX};
 use crate::core::klippy::interface::Interface;
-use crate::core::klippy::mcu::identify::DEFAULT_MESSAGES;
+use crate::core::klippy::mcu::identify::IDENTIFY_MESSAGES;
 use crate::core::klippy::msg::error::MsgError;
 use crate::core::klippy::msg::parser::Parser;
 use crate::core::klippy::msg::proto::{ArgValue, Payload};
@@ -47,13 +47,14 @@ pub struct Mcu {
 }
 
 impl Mcu {
-    /// Initialize the parser with default identify messages.
+    /// Initialize the parser with the host-defined identify messages.
+    ///
+    /// Every other message format comes from the MCU's data dictionary and is
+    /// installed later (see [`Mcu::identify`]).
     fn init_parser(parser: &mut Parser) {
-        for (id, fmt) in DEFAULT_MESSAGES {
-            parser
-                .register(*id, fmt)
-                .expect("default identify message format must be valid");
-        }
+        parser
+            .register_all(IDENTIFY_MESSAGES)
+            .expect("identify message formats must be valid");
     }
 
     /// Create a new MCU from a name and interface.

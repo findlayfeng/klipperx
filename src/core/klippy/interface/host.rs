@@ -14,10 +14,11 @@
 //!
 //! **Its main loop blocks.** `klipper_host_run` only returns once
 //! `klipper_host_shutdown` is called, so it gets a thread of its own. Output is
-//! pull-only, so a second thread polls `klipper_host_output` and forwards what it
-//! reads to [`HostDevice::receive`] over a channel — when that thread stops, the
-//! channel disconnects and a blocked `receive` returns `None`, which is exactly
-//! the "no further frames will ever arrive" contract of [`Device::receive`].
+//! pull-only, so a second thread waits in `klipper_host_output_wait` and forwards
+//! what it reads to [`HostDevice::receive`] over a channel — when that thread
+//! stops, the channel disconnects and a blocked `receive` returns `None`, which
+//! is exactly the "no further frames will ever arrive" contract of
+//! [`Device::receive`].
 //!
 //! ```text
 //!   send(Frame) ─► klipper_host_input ──────┐
@@ -25,9 +26,14 @@
 //!                                    klipper runtime thread
 //!                                     (klipper_host_run)
 //!                                           │
-//!   receive() ◄── framing ◄── channel ◄── poller thread
-//!                                  (klipper_host_output)
+//!   receive() ◄── framing ◄── channel ◄── reader thread
+//!                              (klipper_host_output_wait)
 //! ```
+//!
+//! Both directions can block, and both are all-or-nothing: `klipper_host_input`
+//! waits for room rather than truncating a frame, and the library grows its
+//! output buffer rather than dropping a response, so a slow host costs latency
+//! and not a desynchronised stream.
 //!
 //! **Its state is process-global.** Klipper's globals live inside the shared
 //! library, so one device per process is the supported configuration, and the
@@ -45,16 +51,16 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
 use tracing::{debug, info, warn};
 
-/// Bytes asked of `klipper_host_output` per poll. Klipper emits at most
+/// Bytes asked of `klipper_host_output_wait` per read. Klipper emits at most
 /// [`MESSAGE_MAX`] bytes per frame, so this drains several frames per call.
 const OUTPUT_BATCH: usize = 512;
 
-/// Idle time between polls when Klipper has nothing to send. Small enough to
-/// stay well inside a command's round trip, large enough not to spin a core.
-const POLL_INTERVAL: Duration = Duration::from_micros(200);
+/// How long the output thread blocks in the library when there is nothing to
+/// read. Data wakes it immediately, so this only bounds how often it rechecks
+/// the stop flag — and klipper's own shutdown wakes it too.
+const OUTPUT_WAIT_MS: u32 = 100;
 
 // ===========================================================================
 // The library's C API (third_party/klipper/src/host/klipper_host.h)
@@ -62,7 +68,7 @@ const POLL_INTERVAL: Duration = Duration::from_micros(200);
 
 type InitFn = unsafe extern "C" fn() -> c_int;
 type InputFn = unsafe extern "C" fn(*const c_uchar, usize) -> c_long;
-type OutputFn = unsafe extern "C" fn(*mut c_uchar, usize) -> usize;
+type OutputWaitFn = unsafe extern "C" fn(*mut c_uchar, usize, u32) -> usize;
 type RunFn = unsafe extern "C" fn();
 type ShutdownFn = unsafe extern "C" fn();
 
@@ -75,7 +81,7 @@ type ShutdownFn = unsafe extern "C" fn();
 struct Symbols {
     init: InitFn,
     input: InputFn,
-    output: OutputFn,
+    output_wait: OutputWaitFn,
     run: RunFn,
     shutdown: ShutdownFn,
 }
@@ -96,7 +102,7 @@ impl Symbols {
         Ok(Self {
             init: unsafe { get(library, b"klipper_host_init\0")? },
             input: unsafe { get(library, b"klipper_host_input\0")? },
-            output: unsafe { get(library, b"klipper_host_output\0")? },
+            output_wait: unsafe { get(library, b"klipper_host_output_wait\0")? },
             run: unsafe { get(library, b"klipper_host_run\0")? },
             shutdown: unsafe { get(library, b"klipper_host_shutdown\0")? },
         })
@@ -290,26 +296,28 @@ impl HostDevice {
                 .map_err(|e| InterfaceError::Other(format!("failed to spawn runtime: {e}")))?,
         );
 
-        // Output has to be polled. This thread owns the sender, so when it stops
-        // the channel disconnects and every blocked `receive` wakes up with
-        // `None` — no separate "unblock" signal needed.
+        // Output is pull-only, so it gets a thread of its own. That thread owns
+        // the sender, so when it stops the channel disconnects and every blocked
+        // `receive` wakes up with `None` — no separate "unblock" signal needed.
         let poller_stopped = Arc::clone(&stopped);
-        let poller_output = symbols.output;
+        let poller_output_wait = symbols.output_wait;
         let poller = thread::Builder::new()
             .name("klipper-output".to_string())
             .spawn(move || {
                 let mut buf = vec![0u8; OUTPUT_BATCH];
                 while !poller_stopped.load(Ordering::Relaxed) {
-                    let read = unsafe { poller_output(buf.as_mut_ptr(), buf.len()) };
+                    // Blocks in the library until a frame arrives or the wait
+                    // expires, so no polling interval is needed here.
+                    let read =
+                        unsafe { poller_output_wait(buf.as_mut_ptr(), buf.len(), OUTPUT_WAIT_MS) };
                     if read == 0 {
-                        thread::sleep(POLL_INTERVAL);
                         continue;
                     }
                     if output_tx.send(buf[..read].to_vec()).is_err() {
                         break; // nobody is receiving any more
                     }
                 }
-                debug!("klipper output poller stopped");
+                debug!("klipper output reader stopped");
             });
         match poller {
             Ok(handle) => threads.push(handle),
@@ -423,6 +431,7 @@ mod tests {
     use super::*;
     use crate::core::klippy::interface::Interface;
     use crate::core::klippy::msg::proto::Payload;
+    use std::time::Duration;
 
     // -----------------------------------------------------------------------
     // Framing — no library needed

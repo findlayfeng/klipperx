@@ -1,9 +1,11 @@
+mod dictionary;
 mod error;
 mod identify;
 mod pending;
 mod restart_method;
 
-pub use error::McuCallError;
+pub use dictionary::{Dictionary, Enumeration, MessageDef, OutputDef};
+pub use error::{McuCallError, McuError};
 pub use identify::Identify;
 pub use restart_method::McuRestartMethod;
 

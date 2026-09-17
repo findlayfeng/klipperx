@@ -40,6 +40,10 @@ pub struct Mcu {
     send_buf_tx: mpsc::Sender<Payload>,
     /// Pending synchronous calls waiting for responses.
     pending_calls: Arc<Mutex<Vec<PendingCall>>>,
+    /// Interface clone kept so the device can be shut down on drop.
+    interface: Interface,
+    /// Handle to the receive task, used to abort it on drop.
+    recv_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Mcu {
@@ -114,11 +118,16 @@ impl Mcu {
             Arc::new(Mutex::new(Vec::new()));
         let pending_calls_for_task = pending_calls.clone();
 
-        tokio::spawn(async move {
+        let interface_for_recv = interface.clone();
+        let recv_handle = tokio::spawn(async move {
             let mut seq = 0u8;
 
             loop {
-                let frame = interface.receive().await;
+                let frame = match interface_for_recv.receive().await {
+                    Some(frame) => frame,
+                    // Device shut down: no more frames will arrive.
+                    None => break,
+                };
 
                 if frame.seq() != (seq & 0xf) {
                     warn!(
@@ -183,6 +192,8 @@ impl Mcu {
             identify: Arc::new(Mutex::new(None)),
             send_buf_tx,
             pending_calls,
+            interface,
+            recv_handle: Some(recv_handle),
         }
     }
 
@@ -320,6 +331,24 @@ impl Mcu {
     }
 }
 
+impl Drop for Mcu {
+    /// Shut down the interface and abort the receive task when `Mcu` is dropped.
+    ///
+    /// The receive task runs an infinite loop calling `interface.receive().await`,
+    /// so it has no natural exit condition. That call is backed by a synchronous
+    /// device read inside `spawn_blocking`, which **cannot** be cancelled by
+    /// aborting the async task. If the blocked read is not released, its thread
+    /// stays parked forever and the runtime hangs during shutdown. Calling
+    /// [`Interface::shutdown`] first unblocks that read; the abort then
+    /// guarantees the task itself is torn down promptly.
+    fn drop(&mut self) {
+        self.interface.shutdown();
+        if let Some(handle) = self.recv_handle.take() {
+            handle.abort();
+        }
+    }
+}
+
 impl From<McuConfig> for Mcu {
     fn from(value: McuConfig) -> Self {
         Self::from_parts(value.name, value.interface)
@@ -339,7 +368,7 @@ impl From<(String, Interface)> for Mcu {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::klippy::interface::test::TestDevice;
+    use crate::core::klippy::interface::test::{MappingEntry, TestDevice};
     use crate::core::klippy::interface::Interface;
 
     fn make_frame(seq: u8, payload: &[u8]) -> Frame {
@@ -436,5 +465,63 @@ mod tests {
         assert_eq!(decoded[0].1.len(), 2);
         assert_eq!(decoded[0].1[0], ArgValue::UInt32(99));
         assert_eq!(decoded[0].1[1], ArgValue::Bytes(b"ok".to_vec()));
+    }
+
+    // -----------------------------------------------------------------------
+    // Drop / shutdown
+    // -----------------------------------------------------------------------
+
+    /// Dropping the `Mcu` must shut down cleanly even when the underlying
+    /// device keeps its receive channel open forever.
+    ///
+    /// The `TestDevice` is filled with extra (unconsumed) mappings on purpose:
+    /// `TestDevice::send` only drops the last `buf_tx` sender once all mappings
+    /// have been consumed, so with mappings still queued the frame channel stays
+    /// open and `receive()` blocks indefinitely. This guarantees the receive
+    /// task does not end on its own, so the test truly exercises the shutdown
+    /// path added by `impl Drop for Mcu`.
+    ///
+    /// The test verifies two things:
+    /// 1. the async receive task is aborted, and
+    /// 2. the blocking device read is released (via `Interface::shutdown`),
+    ///    so the runtime shuts down instead of hanging on a parked
+    ///    `spawn_blocking` thread.
+    #[tokio::test]
+    async fn test_drop_aborts_receive_task_with_open_interface() {
+        let mappings: Vec<MappingEntry> = (0..4)
+            .map(|i| MappingEntry {
+                input: make_frame(i, b"cmd"),
+                outputs: vec![make_frame(i + 16, b"resp")],
+            })
+            .collect();
+
+        let device = TestDevice::new(mappings);
+        let interface = Interface::new(device);
+        let mcu = Mcu::from(("drop_test".to_string(), interface));
+
+        // `JoinHandle` is not `Clone`; an `AbortHandle` lets us observe the
+        // receive task after the `Mcu` (and its `JoinHandle`) is gone.
+        let abort_handle = mcu
+            .recv_handle
+            .as_ref()
+            .expect("receive task handle must be present")
+            .abort_handle();
+
+        // Let the receive task start and block inside `interface.receive()`.
+        sleep(Duration::from_millis(20)).await;
+        assert!(
+            !abort_handle.is_finished(),
+            "receive task should still be running while the interface is open"
+        );
+
+        // Actively drop the `Mcu`; this must abort the receive task.
+        drop(mcu);
+
+        // Give the runtime a chance to process the cancellation.
+        sleep(Duration::from_millis(20)).await;
+        assert!(
+            abort_handle.is_finished(),
+            "receive task should be aborted after the Mcu is dropped"
+        );
     }
 }

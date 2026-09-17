@@ -9,7 +9,15 @@ use std::sync::Arc;
 
 pub trait Device: Send + Sync {
     fn send(&self, frame: &Frame) -> Result<(), InterfaceError>;
-    fn receive(&self) -> Frame;
+    /// Block until a frame is received, or return `None` once the device has
+    /// been shut down (no further frames will ever arrive).
+    fn receive(&self) -> Option<Frame>;
+    /// Unblock any in-flight [`Device::receive`] and prevent further receives.
+    ///
+    /// A synchronous device read runs inside `spawn_blocking`, which cannot be
+    /// cancelled by aborting the async task that awaits it. Calling this on
+    /// shutdown releases that blocked thread so the runtime can exit.
+    fn shutdown(&self);
 }
 
 /// Interface for communicating with a Klipper device.
@@ -55,7 +63,7 @@ impl Interface {
         }
     }
 
-    pub async fn receive(&self) -> Frame {
+    pub async fn receive(&self) -> Option<Frame> {
         match self {
             #[cfg(test)]
             Self::Test(device) => {
@@ -72,6 +80,15 @@ impl Interface {
             }
         }
     }
+
+    /// Shut down the underlying device, unblocking any pending `receive()`.
+    pub fn shutdown(&self) {
+        match self {
+            #[cfg(test)]
+            Self::Test(device) => device.shutdown(),
+            Self::Stub(device) => device.shutdown(),
+        }
+    }
 }
 
 /// Placeholder device for non-test builds (returns errors).
@@ -84,9 +101,12 @@ impl Device for StubDevice {
             "StubDevice: no real device configured".to_string(),
         ))
     }
-    fn receive(&self) -> Frame {
-        Frame::new(0, Vec::new())
+    fn receive(&self) -> Option<Frame> {
+        // The stub has no real transport: report the stream as closed so the
+        // receive loop exits instead of spinning on empty frames.
+        None
     }
+    fn shutdown(&self) {}
 }
 
 // ===========================================================================
@@ -118,7 +138,7 @@ mod tests {
         assert!(result.is_ok());
 
         // Receive should return the expected output
-        let output = interface.receive().await;
+        let output = interface.receive().await.expect("frame available");
         assert_eq!(output, expected_output);
     }
 
@@ -155,7 +175,7 @@ mod tests {
             let result = interface.send(input.clone()).await;
             assert!(result.is_ok(), "send #{} failed", idx);
 
-            let output = interface.receive().await;
+            let output = interface.receive().await.expect("frame available");
             assert_eq!(output, *expected_output, "output #{} mismatch", idx);
         }
     }
@@ -218,11 +238,11 @@ mod tests {
 
         // First use
         assert!(interface.send(input.clone()).await.is_ok());
-        assert_eq!(interface.receive().await, output1);
+        assert_eq!(interface.receive().await.unwrap(), output1);
 
         // Second use via clone
         assert!(cloned.send(input).await.is_ok());
-        assert_eq!(cloned.receive().await, output2);
+        assert_eq!(cloned.receive().await.unwrap(), output2);
     }
 
     #[tokio::test]
@@ -243,7 +263,7 @@ mod tests {
         assert!(interface.send(input).await.is_ok());
 
         for (i, expected) in outputs.iter().enumerate() {
-            let received = interface.receive().await;
+            let received = interface.receive().await.expect("frame available");
             assert_eq!(
                 received, *expected,
                 "output #{} mismatch: expected {:?}, got {:?}",
@@ -265,7 +285,7 @@ mod tests {
         let interface = Interface::new(device);
 
         assert!(interface.send(input).await.is_ok());
-        let output = interface.receive().await;
+        let output = interface.receive().await.expect("frame available");
         assert_eq!(output.payload(), payload.as_slice());
         assert_eq!(output.seq(), 20);
     }

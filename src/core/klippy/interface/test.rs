@@ -81,8 +81,17 @@ impl Device for TestDevice {
         Ok(())
     }
 
-    fn receive(&self) -> Frame {
-        self.buf_rx.recv().unwrap()
+    fn receive(&self) -> Option<Frame> {
+        // `None` means the channel was closed: either every mapping has been
+        // consumed, or `shutdown()` was called. Either way the receive loop
+        // should stop instead of blocking forever.
+        self.buf_rx.recv().ok()
+    }
+
+    fn shutdown(&self) {
+        // Dropping the last sender closes the channel, which unblocks a
+        // pending `receive()` and lets its thread terminate.
+        self.buf_tx.lock().unwrap().take();
     }
 }
 
@@ -107,7 +116,7 @@ mod tests {
         let result = device.send(&input);
         assert!(result.is_ok());
 
-        let received = device.receive();
+        let received = device.receive().expect("frame available");
         assert_eq!(received, output);
     }
 
@@ -131,11 +140,11 @@ mod tests {
 
         // First send/receive
         assert!(device.send(&input1).is_ok());
-        assert_eq!(device.receive(), output1);
+        assert_eq!(device.receive().unwrap(), output1);
 
         // Second send/receive
         assert!(device.send(&input2).is_ok());
-        assert_eq!(device.receive(), output2);
+        assert_eq!(device.receive().unwrap(), output2);
     }
 
     #[test]
@@ -186,9 +195,9 @@ mod tests {
         }]);
 
         assert!(device.send(&input).is_ok());
-        assert_eq!(device.receive(), output1);
-        assert_eq!(device.receive(), output2);
-        assert_eq!(device.receive(), output3);
+        assert_eq!(device.receive().unwrap(), output1);
+        assert_eq!(device.receive().unwrap(), output2);
+        assert_eq!(device.receive().unwrap(), output3);
     }
 
     #[test]
@@ -223,7 +232,7 @@ mod tests {
         assert!(device.send(&input).is_err());
 
         // But we can still receive the queued outputs
-        assert_eq!(device.receive(), output);
+        assert_eq!(device.receive().unwrap(), output);
     }
 
     #[tokio::test]
@@ -238,7 +247,7 @@ mod tests {
         }]);
 
         assert!(device.send(&input).is_ok());
-        let received = device.receive();
+        let received = device.receive().expect("frame available");
         assert_eq!(received, output);
     }
 
@@ -272,8 +281,8 @@ mod tests {
         });
 
         let recv_handle = tokio::task::spawn_blocking(move || {
-            let r1 = device_recv.lock().unwrap().receive();
-            let r2 = device_recv.lock().unwrap().receive();
+            let r1 = device_recv.lock().unwrap().receive().unwrap();
+            let r2 = device_recv.lock().unwrap().receive().unwrap();
             (r1, r2)
         });
 

@@ -8,6 +8,7 @@
 
 pub mod config;
 pub mod error;
+pub mod feature;
 pub mod frame;
 pub mod kinematics;
 pub mod mcu;

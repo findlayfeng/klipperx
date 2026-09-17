@@ -7,8 +7,9 @@
 //! layer: [`Mcu::from_parts`](super::Mcu) registers them at construction time.
 //!
 //! The protocol that drives them — chunked requests, decompression, and
-//! dictionary installation — is a feature, since it is host-side protocol logic
-//! rather than transport: see [`feature::identify`](super::feature::identify).
+//! dictionary installation — lives in the command layer, since it is host-side
+//! protocol logic rather than transport: see
+//! [`cmd::identify`](super::cmd::identify).
 //!
 //! Both entries are repeated verbatim in the firmware-provided dictionary, so
 //! installing that dictionary must skip messages which are already registered

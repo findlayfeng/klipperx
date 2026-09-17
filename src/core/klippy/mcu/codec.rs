@@ -2,7 +2,7 @@
 //!
 //! The host does not own any message format: the dictionary installed after the
 //! identify handshake does. This module adds the thin typing layer on top of
-//! [`Mcu::send`](super::Mcu::send) / [`Mcu::call`](super::Mcu::call) so feature
+//! [`Mcu::send`](super::Mcu::send) / [`Mcu::call`](super::Mcu::call) so command
 //! code can name a message and its parameters without repeating the wire
 //! format.
 //!
@@ -317,7 +317,7 @@ impl Mcu {
     ///
     /// The identify exchange is the only one that precedes the dictionary, so
     /// this exists for
-    /// [`Identify::fetch`](super::feature::identify::Identify::fetch) alone;
+    /// [`Identify::fetch`](super::cmd::identify::Identify::fetch) alone;
     /// every other caller must use [`Mcu::call_msg`] so that a missing handshake
     /// is reported instead of silently attempting a command the parser does not
     /// know yet.

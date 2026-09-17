@@ -1,9 +1,9 @@
 //! Command modules — the layer that actually speaks the MCU protocol.
 //!
 //! Each module in here owns one group of firmware commands and exposes them as a
-//! capability: `clock` wraps `get_clock` / `clock`, `identify` wraps the
-//! handshake, and so on. The trait in a module is what callers depend on; the
-//! `Mcu*` type beside it is the implementation that issues typed commands
+//! capability: `clock` wraps `get_clock` / `clock`, and the next one will wrap
+//! `set_digital_out`, and so on. The trait in a module is what callers depend on;
+//! the `Mcu*` type beside it is the implementation that issues typed commands
 //! through [`Mcu`](super::Mcu).
 //!
 //! # Why a separate layer
@@ -26,6 +26,11 @@
 //! never hard-codes a format string or a wire id: it names the message and its
 //! parameters, and the dictionary supplies the rest.
 //!
+//! Identify is deliberately absent: it is the bootstrap exchange that *produces*
+//! the dictionary, its formats are host-owned, and it runs before
+//! [`Mcu::call_msg`](super::Mcu::call_msg) is usable. It therefore lives with the
+//! transport, in `mcu::identify`, driven by [`Mcu::connect`](super::Mcu::connect).
+//!
 //! # Adding a command module
 //!
 //! Traits here return `impl Future<…> + Send` rather than using `async fn`, so
@@ -33,14 +38,9 @@
 //! of the signature instead of an implicit, lint-flagged assumption.
 //!
 //! Modules are constructed from an `Arc<Mcu>` — the shared handle returned by
-//! [`identify::connect`] — so several modules can use one MCU, and dropping the
-//! last handle shuts the device down.
-//!
-//! [`identify`] is the bootstrap module: it is the one exchange that runs before
-//! a data dictionary exists, and it is what produces the handle the others need.
+//! [`Mcu::connect`](super::Mcu::connect) — so several modules can use one MCU, and
+//! dropping the last handle shuts the device down.
 
 pub mod clock;
-pub mod identify;
 
 pub use clock::{ClockState, ClockSync, GetClock, McuClock};
-pub use identify::{Identify, McuIdentify};

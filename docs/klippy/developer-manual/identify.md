@@ -24,33 +24,36 @@ Identify 是 Klipper 主机端（klippy）与 MCU 端（固件）之间建立通
 
 ## 代码位置
 
+全部在 `mcu::identify`（传输层，不是命令层）：
+
 | 内容 | 位置 |
 |------|------|
-| 主机侧格式定义（唯一的硬编码例外） | `mcu::identify::IDENTIFY_MESSAGES` |
-| 握手协议、分块、解压、安装字典 | `mcu::cmd::identify` |
+| 主机侧格式定义（唯一的硬编码例外） | `IDENTIFY_MESSAGES` |
+| 类型化消息视图 | `IdentifyRequest` / `IdentifyChunk`（`McuCommand` / `McuResponse`） |
+| 分块请求、拼接、解压、JSON 解析 | `Identify::fetch` |
+| 抓取 + 建字典 + 安装 | `Mcu::identify` |
+| 建连 + 握手（常用入口） | `Mcu::connect` |
 
-字典属于协议知识，而 identify 是唯一在字典存在之前运行的交换，因此它按命令模块的方式书写：类型化消息视图（`IdentifyRequest` / `IdentifyChunk`）加协议逻辑，只是走 [`Mcu::call_msg_ungated`](mcu-protocol.md) 而不是普通的 `call_msg`。
+**为什么不是命令模块**：命令层放的是「格式来自字典、通过普通类型化调用路径执行」的命令；identify 两点都相反——格式由主机自有（字典无法描述传递字典的那条消息），且运行在字典存在之前，`Mcu::call_msg` 那时还会拒绝执行，只能走 `Mcu::call_msg_ungated`。分块循环也不是能力，而是「把 N..N+40 这段字节取回来拼起来」的链路层工作，因此与格式定义放在一起。
 
 ## Rust API
 
 ```rust
 // 正常入口：建连 + 握手 + 安装字典，返回可共享的句柄
-let mcu: Arc<Mcu> = mcu::cmd::identify::connect(config).await?;
+let mcu: Arc<Mcu> = Mcu::connect(config).await?;
 
-// 需要自定义超时、重试，或先看原始负载
-let mcu = Arc::new(Mcu::from(config));
-let identify = McuIdentify::new(Arc::clone(&mcu))
-    .with_timeout(Duration::from_secs(5));
+// 需要自定义超时或重试时，单独调用握手
+let mcu = Mcu::from(config);
+let installed = mcu.identify(Duration::from_secs(5)).await?;  // 抓取 + 建字典 + 安装
 
-let installed = identify.identify().await?;        // 抓取 + 解析 + 安装
-let raw: Identify = identify.fetch().await?;        // 只抓取
-let dictionary = Dictionary::from_json(raw.data)?;  // 自行处置
+// 只要原始负载：标识符名未建模，未知字段不丢失
+// （`Identify::fetch` 是 crate 内部接口，由 `Mcu::identify` 调用）
 ```
 
-- `connect` 与 `McuIdentify::new` 都使用固定的 `IDENTIFY_TIMEOUT`（10 秒，覆盖整个握手）；`with_timeout` 可覆盖。
-- `McuIdentify::identify` 是「抓取 → `Dictionary::from_json` → `Mcu::install_dictionary`」的连写；重复调用会替换字典，已注册的消息被跳过，因此握手中断后可以重试。
+- `Mcu::connect` 使用固定的 `IDENTIFY_TIMEOUT`（10 秒，覆盖整个握手）；`Mcu::identify(timeout)` 可覆盖。
+- `Mcu::identify` 是「抓取 → `Dictionary::from_json` → `Mcu::install_dictionary`」的连写；重复调用会替换字典，已注册的消息被跳过，因此握手中断后可以重试。
 - `Identify` 只保存完整 JSON（`data: serde_json::Value`），不建模具体字段，未知或未来的字段不会丢失、也不会导致拒绝。结构化视图是 `Dictionary`。
-- `McuIdentify` 没有对应的能力 trait：握手是一次性引导，只有一个实现、没有替代后端。
+- identify 没有能力 trait：它是一次性引导，只有一个实现、没有替代后端，且没有任何命令模块会持有它。
 
 ## 数据字典字段
 

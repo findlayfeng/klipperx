@@ -317,10 +317,9 @@ impl Mcu {
     ///
     /// The identify exchange is the only one that precedes the dictionary, so
     /// this exists for
-    /// [`Identify::fetch`](super::cmd::identify::Identify::fetch) alone;
-    /// every other caller must use [`Mcu::call_msg`] so that a missing handshake
-    /// is reported instead of silently attempting a command the parser does not
-    /// know yet.
+    /// [`Identify::fetch`](super::identify::Identify::fetch) alone; every other
+    /// caller must use [`Mcu::call_msg`] so that a missing handshake is reported
+    /// instead of silently attempting a command the parser does not know yet.
     pub(crate) async fn call_msg_ungated<C: McuCommand, R: McuResponse>(
         &self,
         cmd: &C,

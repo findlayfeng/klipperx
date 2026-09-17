@@ -95,9 +95,9 @@ let parser_for_task = parser.clone();   // 同一个 Arc<Mutex<MsgMap>>
 
 ## 已实现与未实现
 
-已实现：帧收发与校验、合并发送、同步请求/响应、identify 握手与字典安装（`identify`）、类型化消息与按名取参（`cmd`）。`cmd/clock.rs`（`ClockSync` / `McuClock`，读固件时钟）已写好但暂未参与编译。
+已实现：帧收发与校验、合并发送、同步请求/响应、identify 握手与字典安装（`identify`）、类型化消息与按名取参（`cmd`）。`cmd/` 下的基础命令模块已经就位：`allocate_oids`、`get_config` / `finalize_config`、`get_uptime`、`emergency_stop` / `clear_shutdown`（`basecmd.c` 的四个分区），以及引导用的 `identify` 一对。事件消息也走上回调投递：`Mcu::bind_event` 把处理器绑到某条响应上，接收任务在无待配对调用时调用它（`event/stats.rs` 的 `stats` 是第一个）。`cmd/clock.rs`（`ClockSync` / `McuClock`，读固件时钟）已写好但暂未参与编译。
 
-未实现（详见 [MCU 协议与数据字典](mcu-protocol.md#当前未实现)）：事件 / 异步 `output` 投递、并发同名响应的区分、枚举参与 `ArgType` 编解码、命名参数。
+未实现（详见 [MCU 协议与数据字典](mcu-protocol.md#当前未实现)）：`output` 表的异步投递（`Dictionary` 已解析但不注册，回调只对 `responses` 里的消息生效）、并发同名响应的区分、枚举参与 `ArgType` 编解码、命名参数。
 
 `msg` 层也没有 `Default for Parser`：`Parser::new()` 是空注册表，identify 消息由 `identify::new_parser` 显式注册（`Mcu::new` 取用），避免编解码层反向依赖具体协议。
 

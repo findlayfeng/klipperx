@@ -9,6 +9,7 @@
 pub mod cmd;
 pub mod config;
 pub mod error;
+pub mod event;
 pub mod frame;
 pub mod identify;
 pub mod kinematics;

@@ -242,6 +242,10 @@ impl Mcu {
     /// or because the dictionary comes from somewhere else.
     ///
     /// The two background tasks outlive this call and are stopped by [`Drop`].
+    ///
+    /// `config.restart_method` is not read here: restarting the firmware is a
+    /// planned feature, and the field is only carried until then (see
+    /// [`McuRestartMethod`]).
     pub fn new(config: McuConfig) -> Self {
         Self::from_parts(config.name, config.interface)
     }

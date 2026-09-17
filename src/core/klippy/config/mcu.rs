@@ -7,7 +7,11 @@ use crate::core::klippy::mcu::McuRestartMethod;
 pub struct McuConfig {
     /// MCU name (from ConfigSection's sub field)
     pub name: String,
-    /// MCU restart method
+    /// MCU restart method.
+    ///
+    /// Parsed and stored, but **not consumed yet** — restarting the firmware is a
+    /// planned feature (see [`McuRestartMethod`]). Kept so a config that sets
+    /// `restart_method` parses the same way it will once the restart path exists.
     pub restart_method: McuRestartMethod,
     /// MCU interface for communication
     pub interface: Interface,
@@ -38,6 +42,10 @@ impl McuConfig {
     }
 
     /// Parse common MCU configuration fields.
+    ///
+    /// `restart_method` defaults to [`McuRestartMethod::Arduino`] (Klipper's
+    /// default). The value is deliberately parsed even though nothing reads it
+    /// yet: see the field documentation on [`McuConfig::restart_method`].
     fn parse_common(section: &ConfigSection) -> (String, McuRestartMethod) {
         let name = section.sub.clone().unwrap_or_default();
 

@@ -14,6 +14,7 @@ use crate::core::klippy::msg::proto::{ArgValue, Payload};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::time::{sleep, Duration};
+use tracing::{debug, error, info, warn};
 
 /// Error returned by [`Mcu::call`].
 #[derive(Debug)]
@@ -82,6 +83,7 @@ impl Mcu {
 
     /// Create a new MCU from a name and interface.
     fn from_parts(name: String, interface: Interface) -> Self {
+        info!("Creating MCU: {name}");
         let (send_buf_tx, mut send_buf_rx) = mpsc::channel::<Payload>(32);
         let interface_for_send = interface.clone();
 
@@ -129,6 +131,7 @@ impl Mcu {
                 }
 
                 // send the batched payload to the MCU
+                debug!("Sending batch: {} bytes", payload.len());
                 Self::send_batch(&interface_for_send, &mut seq, payload).await;
             }
         });
@@ -147,8 +150,8 @@ impl Mcu {
                 let frame = interface.receive().await;
 
                 if frame.seq() != seq {
-                    eprintln!(
-                        "[mcu] seq mismatch: expected {seq}, got {}",
+                    warn!(
+                        "Seq mismatch: expected {seq}, got {}",
                         frame.seq()
                     );
                     seq += 1;
@@ -158,9 +161,12 @@ impl Mcu {
                 seq += 1;
 
                 let decoded = match parser_for_task.decode(frame.into()) {
-                    Ok(msgs) => msgs,
+                    Ok(msgs) => {
+                        debug!("Decoded {} messages", msgs.len());
+                        msgs
+                    }
                     Err(e) => {
-                        eprintln!("[mcu] decode error: {e}");
+                        error!("Decode error: {e}");
                         continue;
                     }
                 };
@@ -172,18 +178,26 @@ impl Mcu {
                         .iter()
                         .position(|pc| pc.response_name == msg.name)
                     {
+                        debug!(
+                            "Pending call matched: {} (id={}), delivering {} params",
+                            msg.name, msg.id, params.len()
+                        );
                         let call = pending.remove(idx);
                         let _ = call.response_tx.send(params);
                         continue;
                     }
                     // No pending call — fall back to callback.
                     if let Some(callback) = &msg.callback {
+                        debug!(
+                            "Invoking callback for {} (id={})",
+                            msg.name, msg.id
+                        );
                         let mut cb = callback.lock().unwrap();
                         cb(params.as_slice());
                     } else {
                         // No callback and no pending call — discard with warning.
-                        eprintln!(
-                            "[mcu] warning: unhandled message {} (id={}), discarding",
+                        warn!(
+                            "Unhandled message {} (id={}), discarding",
                             msg.name, msg.id
                         );
                     }
@@ -210,7 +224,7 @@ impl Mcu {
             .await
         {
             Ok(()) => *seq = (seq_num + 1) & 0xf,
-            Err(e) => eprintln!("[mcu:{seq_num}] send failed: {e}"),
+            Err(e) => error!("Send failed (seq={seq_num}): {e}"),
         }
     }
 
@@ -264,11 +278,12 @@ impl Mcu {
             return Err(McuCallError::CommandNotFound(command.to_string()));
         }
         if self.parser.has_callback(command) {
-            eprintln!(
-                "[mcu] warning: command '{}' already has a callback, call may not work as expected",
+            warn!(
+                "Command '{}' already has a callback, call may not work as expected",
                 command
             );
         }
+        info!("Calling command: {command} (response: {response_name}, timeout: {:?})", timeout);
 
         // 2. Create a oneshot channel for the response.
         let (tx, rx) = oneshot::channel::<Vec<ArgValue>>();
@@ -284,6 +299,7 @@ impl Mcu {
 
         // 4. Send the command.
         if let Err(e) = self.send(command, args) {
+            warn!("Failed to send command '{}': {e}", command);
             // Clean up the pending call on send failure.
             self.pending_calls
                 .lock()
@@ -291,10 +307,12 @@ impl Mcu {
                 .retain(|pc| pc.response_name != response_name);
             return Err(McuCallError::SendFailed(e.msg));
         }
+        debug!("Command '{}' sent, waiting for response '{}'", command, response_name);
 
         // 5. Wait for the response.
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(params)) => {
+                debug!("Response received for '{}': {} params", response_name, params.len());
                 // Clean up the pending call.
                 self.pending_calls
                     .lock()
@@ -308,6 +326,7 @@ impl Mcu {
                     .lock()
                     .await
                     .retain(|pc| pc.response_name != response_name);
+                error!("Response receiver dropped for '{}'", response_name);
                 Err(McuCallError::SendFailed("response receiver dropped".to_string()))
             }
             Err(_) => {
@@ -316,6 +335,10 @@ impl Mcu {
                     .lock()
                     .await
                     .retain(|pc| pc.response_name != response_name);
+                warn!(
+                    "Timeout waiting for response '{}'",
+                    response_name
+                );
                 Err(McuCallError::Timeout(format!(
                     "no response for {} within {:?}",
                     response_name, timeout

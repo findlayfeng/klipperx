@@ -28,18 +28,21 @@ pub trait Device: Send + Sync {
 
 /// Interface for communicating with a Klipper device.
 ///
-/// At runtime, this is one of:
-/// - `Serial(SerialDevice)` — a real MCU on a tty
+/// One variant per transport a `[mcu]` section can ask for:
+/// - `Serial(SerialDevice)` — a real MCU on a tty (`serial:`)
 /// - `Host(HostDevice)` — klipper's host library, loaded from a shared object
-/// - `Test(TestDevice)` — a scripted device, in test builds
-/// - `Stub(StubDevice)` — nothing configured
+///   (`host_library:`)
+/// - `Test(TestDevice)` — a scripted device, in test builds (`test:`)
+///
+/// There is no "configured nothing" variant on purpose: a section that names no
+/// transport is reported when it is parsed, rather than turned into an interface
+/// that fails on every call.
 #[derive(Debug, Clone)]
 pub enum Interface {
     Serial(Arc<SerialDevice>),
     Host(Arc<HostDevice>),
     #[cfg(test)]
     Test(Arc<TestDevice>),
-    Stub(Arc<StubDevice>),
 }
 
 impl Interface {
@@ -47,12 +50,6 @@ impl Interface {
     #[cfg(test)]
     pub fn new(device: TestDevice) -> Self {
         Self::Test(Arc::new(device))
-    }
-
-    /// Create a stub interface (always returns errors).
-    #[cfg(not(test))]
-    pub fn stub() -> Self {
-        Self::Stub(Arc::new(StubDevice))
     }
 
     /// Create an interface for a real MCU on the serial port `path`.
@@ -94,12 +91,6 @@ impl Interface {
                     .await
                     .expect("Interface send task panicked")
             }
-            Self::Stub(device) => {
-                let device = Arc::clone(device);
-                tokio::task::spawn_blocking(move || device.send(&frame))
-                    .await
-                    .expect("Interface send task panicked")
-            }
         }
     }
 
@@ -124,12 +115,6 @@ impl Interface {
                     .await
                     .expect("Interface receive task panicked")
             }
-            Self::Stub(device) => {
-                let device = Arc::clone(device);
-                tokio::task::spawn_blocking(move || device.receive())
-                    .await
-                    .expect("Interface receive task panicked")
-            }
         }
     }
 
@@ -140,27 +125,8 @@ impl Interface {
             Self::Host(device) => device.shutdown(),
             #[cfg(test)]
             Self::Test(device) => device.shutdown(),
-            Self::Stub(device) => device.shutdown(),
         }
     }
-}
-
-/// Placeholder device for non-test builds (returns errors).
-#[derive(Debug, Clone)]
-pub struct StubDevice;
-
-impl Device for StubDevice {
-    fn send(&self, _frame: &Frame) -> Result<(), InterfaceError> {
-        Err(InterfaceError::Other(
-            "StubDevice: no real device configured".to_string(),
-        ))
-    }
-    fn receive(&self) -> Option<Frame> {
-        // The stub has no real transport: report the stream as closed so the
-        // receive loop exits instead of spinning on empty frames.
-        None
-    }
-    fn shutdown(&self) {}
 }
 
 // ===========================================================================

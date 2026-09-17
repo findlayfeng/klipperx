@@ -1,29 +1,8 @@
 use super::error::{MsgError, MsgResult};
 use super::proto::{ArgValue, Payload};
-use super::MsgDef;
+use super::Msg;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-
-/// Callback type for message handlers.
-type MsgCallback = Arc<Mutex<Box<dyn FnMut(&[ArgValue]) + Send>>>;
-
-pub struct Msg {
-    id: u8,
-    name: String,
-    def: MsgDef,
-    callback: Option<MsgCallback>,
-}
-
-impl std::fmt::Debug for Msg {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Msg")
-            .field("id", &self.id)
-            .field("name", &self.name)
-            .field("def", &self.def)
-            .field("callback", &self.callback.is_some())
-            .finish()
-    }
-}
 
 /// Registry of messages indexed by both id and name.
 ///
@@ -74,34 +53,28 @@ impl Parser {
 
     /// Register a message format with the given ID.
     ///
-    /// The format string is parsed into a [`MsgDef`] and stored under both
+    /// The format string is parsed into a [`Msg`] and stored under both
     /// its numeric `id` and its name. Use [`Self::bind`] to register a callback.
     ///
     /// # Errors
     /// Returns an error if the format string is invalid, or if the `id`
     /// or the parsed command name is already registered.
     pub fn register(&mut self, id: u8, format: &str) -> MsgResult<()> {
-        let (name, def) = MsgDef::parse(format)?;
+        let msg = Msg::parse(id, format)?;
 
         let mut map = self
             .msgs
             .lock()
             .map_err(|_| MsgError::new("msgs lock poisoned"))?;
 
-        map.try_insert(Msg {
-            id,
-            name,
-            def,
-            callback: None,
-        })
-        .map_err(|e| MsgError::new(e.to_string()))?;
+        map.try_insert(msg)
+            .map_err(|e| MsgError::new(e.to_string()))?;
 
         Ok(())
     }
 
     /// Bind a callback to a registered command.
     ///
-    /// Converts the command from `Base` to `Handler` with the provided callback.
     /// If the command already has a callback, the new callback replaces it.
     /// The callback receives a slice of `ArgValue` containing all decoded
     /// parameter values in command definition order.
@@ -130,11 +103,11 @@ impl Parser {
             .ok_or_else(|| MsgError::new(format!("Msg not found: {}", cmd_name)))?;
 
         let msg = Arc::try_unwrap(arc_msg).unwrap_or_else(|_| unreachable!("ref count should be 1"));
-        let callback: MsgCallback = Arc::new(Mutex::new(Box::new(callback)));
+        let callback: super::MsgCallback = Arc::new(Mutex::new(Box::new(callback)));
         map.try_insert(Msg {
             id: msg.id,
             name: msg.name,
-            def: msg.def,
+            params: msg.params,
             callback: Some(callback),
         })
         .map_err(|e| MsgError::new(e))?;
@@ -159,7 +132,7 @@ impl Parser {
             .get_by_name(name)
             .ok_or_else(|| MsgError::new(format!("Unknown message name: {}", name)))?;
 
-        let param_types = msg.def.params();
+        let param_types = msg.params();
 
         if values.len() != param_types.len() {
             return Err(MsgError::new(format!(
@@ -208,7 +181,7 @@ impl Parser {
                 .ok_or_else(|| MsgError::new(format!("Unknown message id: {}", id)))?;
 
             // Decode parameters according to the message's parameter types
-            let param_types = arc_msg.def.params();
+            let param_types = arc_msg.params();
 
             let mut values = Vec::with_capacity(param_types.len());
             for (_, arg_type) in param_types {
@@ -229,6 +202,7 @@ impl Parser {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::ArgType;
 
 
     // -----------------------------------------------------------------------
@@ -238,12 +212,7 @@ mod tests {
     #[test]
     fn test_msgmap_insert_and_lookup() {
         let mut map = MsgMap::default();
-        map.try_insert(Msg {
-            id: 1,
-            name: "CMD_A".to_string(),
-            def: MsgDef::parse("CMD_A x=%u").unwrap().1,
-            callback: None,
-        }).unwrap();
+        map.try_insert(Msg::new(1, "CMD_A", vec![("x".to_string(), ArgType::UInt32)])).unwrap();
 
         assert!(map.get_by_id(&1).is_some());
         assert!(map.get_by_name("CMD_A").is_some());
@@ -254,19 +223,9 @@ mod tests {
     #[test]
     fn test_msgmap_duplicate_id_rejected() {
         let mut map = MsgMap::default();
-        map.try_insert(Msg {
-            id: 1,
-            name: "CMD_A".to_string(),
-            def: MsgDef::new(vec![]),
-            callback: None,
-        }).unwrap();
+        map.try_insert(Msg::new(1, "CMD_A", vec![])).unwrap();
 
-        let result = map.try_insert(Msg {
-            id: 1,
-            name: "CMD_B".to_string(),
-            def: MsgDef::new(vec![]),
-            callback: None,
-        });
+        let result = map.try_insert(Msg::new(1, "CMD_B", vec![]));
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("duplicate id"));
     }
@@ -274,19 +233,9 @@ mod tests {
     #[test]
     fn test_msgmap_duplicate_name_rejected() {
         let mut map = MsgMap::default();
-        map.try_insert(Msg {
-            id: 1,
-            name: "CMD_A".to_string(),
-            def: MsgDef::new(vec![]),
-            callback: None,
-        }).unwrap();
+        map.try_insert(Msg::new(1, "CMD_A", vec![])).unwrap();
 
-        let result = map.try_insert(Msg {
-            id: 2,
-            name: "CMD_A".to_string(),
-            def: MsgDef::new(vec![]),
-            callback: None,
-        });
+        let result = map.try_insert(Msg::new(2, "CMD_A", vec![]));
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("duplicate name"));
     }
@@ -294,18 +243,14 @@ mod tests {
     #[test]
     fn test_msgmap_by_name_resolves_through_by_id() {
         let mut map = MsgMap::default();
-        let def = MsgDef::parse("TEST a=%u b=%s").unwrap().1;
-        map.try_insert(Msg {
-            id: 42,
-            name: "TEST".to_string(),
-            def,
-            callback: None,
-        }).unwrap();
+        map.try_insert(Msg::new(42, "TEST", vec![
+            ("a".to_string(), ArgType::UInt32),
+            ("b".to_string(), ArgType::Str),
+        ])).unwrap();
 
         let msg = map.get_by_name("TEST").unwrap();
         assert_eq!(msg.id, 42);
-        let param_len = msg.def.params().len();
-        assert_eq!(param_len, 2);
+        assert_eq!(msg.params().len(), 2);
     }
 
     // -----------------------------------------------------------------------
@@ -790,7 +735,7 @@ mod tests {
 
     #[test]
     fn test_register_then_bind_then_encode() {
-        // Full lifecycle: register (Base) → bind (Handler) → encode (still works)
+        // Full lifecycle: register → bind → encode (still works)
         let mut parser = Parser::new();
         parser.register(1, "LIFECYCLE a=%u b=%s c=%c").unwrap();
         parser.bind("LIFECYCLE", |_| {}).unwrap();

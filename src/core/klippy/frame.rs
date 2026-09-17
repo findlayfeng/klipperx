@@ -209,8 +209,9 @@ impl Frame {
 /// [`Frame::parse`] handles one frame at a time; a device that transports bytes
 /// needs the stateful half of the same job, because a read can stop mid-frame,
 /// carry several frames, or contain bytes that were corrupted on the way. Every
-/// byte-stream device shares this type — the host library today, a serial port or
-/// a socket next — so no device has to invent its own idea of where a frame ends.
+/// byte-stream device shares this type — the serial port and the host library
+/// today, a socket next — so no device has to invent its own idea of where a
+/// frame ends.
 ///
 /// The recovery policy is Klipper's own (`msgblock_check` in
 /// `klippy/chelper/msgblock.c`), and it is about where to look next rather than

@@ -66,7 +66,8 @@ cargo test --lib test_install_skips   # 单个用例（按名过滤）
 
 | 模块 | 覆盖 |
 |------|------|
-| `host.rs` | 库路径不存在时报错；对着**真实 host 库**的全流程：`starting` 帧、`get_clock` ↔ `clock` 往返、`shutdown` 后 `receive()` 返回 `None`（帧的重组逻辑由 `frame::FrameStream` 的测试覆盖） |
+| `serial.rs` | 用**虚拟串口**（`posix_openpt` 开的 pty 对）验证：`send` 写出的就是线上的整帧（raw 模式没有做任何转换）、`receive` 把分片的字节重新拼成帧、`shutdown` 让阻塞中的 `receive` 返回 `None`、打不开的端口报错并带上路径；另有一例走 `Interface` 的异步收发 |
+| `host.rs` | 库路径不存在时报错；对着**真实 host 库**走完整 identify 引导（见 `identify` 一节）+ `shutdown` 后 `receive()` 返回 `None`（帧的重组逻辑由 `frame::FrameStream` 的测试覆盖） |
 
 ## 写 MCU 相关测试的两个要点
 

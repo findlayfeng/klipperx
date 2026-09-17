@@ -94,22 +94,23 @@ points:
 
 | 参数 | 值 | 说明 |
 |------|-----|------|
-| `host_library` | klipper host 库（`libklipper_host.so`）的路径 | 在主机进程内运行一份 klipper 固件；目前唯一已实现的传输 |
-| `serial` | 串口设备路径（如 `/dev/ttyACM0`） | 格式已定义，但**传输尚未实现**，配置后会明确报错 |
+| `serial` | 串口设备路径（如 `/dev/ttyACM0`） | 打开真实 MCU 所在的串口；可配 `baud`（默认 250000） |
+| `host_library` | klipper host 库（`libklipper_host.so`）的路径 | 在主机进程内运行一份 klipper 固件（模拟与自测用） |
 | `test` | 每行 `输入帧 输出帧...`（十六进制） | 仅测试构建可用，供单元测试脚本化一个假设备 |
 
 ```ini
 [mcu]
-host_library: /usr/local/lib/libklipper_host.so
-
-[mcu zboard]
 serial: /dev/serial/by-path/platform-3f980000.usb-usb-0:1.3:1.0-port0
+baud: 250000
+
+[mcu simulated]
+host_library: /usr/local/lib/libklipper_host.so
 
 [mcu fake]
 test: 06 10 05 00 00 7e
 ```
 
-节名取自节的 sub（`[mcu zboard]` → `zboard`），`restart_method` 也在这里设置。
+节名取自节的 sub（`[mcu zboard]` → `zboard`），`restart_method` 也在这里设置。串口按 raw 模式打开：不回显、不做 CR/LF 转换、不启用协议没用到的流控。
 
 ## 示例配置
 

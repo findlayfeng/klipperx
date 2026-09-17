@@ -30,6 +30,7 @@ Identify 是 Klipper 主机端（klippy）与 MCU 端（固件）之间建立通
 |------|------|
 | 命令定义（类型化视图、`count` 参数） | `mcu::cmd::identify`：`IdentifyRequest` / `IdentifyChunk` |
 | 主机侧格式定义（唯一的硬编码例外） | `mcu::identify::IDENTIFY_MESSAGES` |
+| 格式注册（构造时 `Mcu` 拿到的起始 `Parser`） | `mcu::identify::new_parser` |
 | 分块请求、拼接、解压、JSON 解析 | `mcu::identify::Identify::fetch` |
 | 抓取 + 建字典 + 安装 | `Mcu::identify` |
 | 建连 + 握手（常用入口） | `Mcu::connect` |

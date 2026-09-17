@@ -34,7 +34,6 @@ pub use restart_method::McuRestartMethod;
 use crate::core::klippy::config::mcu::McuConfig;
 use crate::core::klippy::frame::{Frame, MESSAGE_PAYLOAD_MAX};
 use crate::core::klippy::interface::Interface;
-use crate::core::klippy::mcu::identify::IDENTIFY_MESSAGES;
 use crate::core::klippy::mcu::pending::PendingCalls;
 use crate::core::klippy::msg::error::MsgError;
 use crate::core::klippy::msg::parser::Parser;
@@ -92,19 +91,19 @@ impl std::fmt::Debug for Mcu {
 }
 
 impl Mcu {
-    /// Initialize the parser with the host-defined identify messages.
-    ///
-    /// Every other message format comes from the MCU's data dictionary and is
-    /// installed later (see [`Mcu::install_dictionary`]).
-    fn init_parser(parser: &mut Parser) {
-        parser
-            .register_all(IDENTIFY_MESSAGES)
-            .expect("identify message formats must be valid");
-    }
-
     /// Create a new MCU from a name and interface.
     fn from_parts(name: String, interface: Interface) -> Self {
         info!("Creating MCU: {name}");
+        // The parser starts out knowing only the two formats the host owns; every
+        // other format arrives with the firmware dictionary. It is built before the
+        // receive task starts, and that task gets a clone of the same registry, so
+        // installing a dictionary later needs no restart (see
+        // [`Mcu::install_dictionary`]).
+        let parser = identify::new_parser();
+        let parser_for_task = parser.clone();
+        let pending_calls = PendingCalls::new();
+        let pending_calls_for_task = pending_calls.clone();
+
         let (send_buf_tx, mut send_buf_rx) = mpsc::channel::<Payload>(32);
         let interface_for_send = interface.clone();
 
@@ -156,12 +155,6 @@ impl Mcu {
                 Self::send_batch(&interface_for_send, &mut seq, payload).await;
             }
         });
-
-        let mut parser = Parser::new();
-        Self::init_parser(&mut parser);
-        let parser_for_task = parser.clone();
-        let pending_calls = PendingCalls::new();
-        let pending_calls_for_task = pending_calls.clone();
 
         let interface_for_recv = interface.clone();
         let recv_handle = tokio::spawn(async move {

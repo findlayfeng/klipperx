@@ -441,6 +441,31 @@ impl Mcu {
             }
         }
     }
+
+    /// Bind a callback to a registered message, replacing any existing one.
+    ///
+    /// This is the callback counterpart of [`Mcu::send`] / [`Mcu::call`]: the
+    /// typed entry point is `Mcu::bind_event` in
+    /// [`event`](crate::core::klippy::event), which decodes the values by name
+    /// before handing them to the handler. The callback receives the decoded
+    /// parameter values in message declaration order and runs on the receive
+    /// task.
+    ///
+    /// # Errors
+    /// Returns [`McuError::Msg`] if no message called `name` is registered.
+    pub(crate) fn bind_callback(
+        &self,
+        name: &str,
+        callback: impl FnMut(&[ArgValue]) + Send + 'static,
+    ) -> Result<(), McuError> {
+        // `Parser` is a thin handle over shared state, and `bind` only needs
+        // `&mut` on the handle, so cloning it is enough to bind while `&self`
+        // is borrowed. The clone shares the registry the receive task reads, so
+        // the callback is live immediately.
+        let mut parser = self.parser.clone();
+        parser.bind(name, callback)?;
+        Ok(())
+    }
 }
 
 impl Drop for Mcu {

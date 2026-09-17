@@ -6,9 +6,10 @@
 //!   [`McuResponse`] for the two directions, [`Params`] for reading response
 //!   parameters by name, and the typed calls [`Mcu::send_msg`] /
 //!   [`Mcu::call_msg`] that run them;
-//! * the command modules themselves. None of them is compiled in at the moment:
-//!   `clock` (`get_clock` ↔ `clock`) is written but switched off — see the
-//!   commented-out declaration below.
+//! * the command modules themselves: the bootstrap pair in `identify`, the
+//!   base infrastructure commands in `allocate_oids` / `config` / `uptime` /
+//!   `shutdown`, and `clock` (`get_clock` ↔ `clock`), which is written but
+//!   switched off — see the commented-out declaration below.
 //!
 //! The transport in [`mcu`](crate::core::klippy::mcu) owns frames, the data
 //! dictionary, and the *bare* pair [`Mcu::send`](crate::core::klippy::mcu::Mcu::send) /
@@ -64,7 +65,11 @@
 // tests and all, but nothing here should depend on it yet. Bring it back by
 // uncommenting this declaration and the re-export below.
 // pub mod clock;
+pub mod allocate_oids;
+pub mod config;
 pub mod identify;
+pub mod shutdown;
+pub mod uptime;
 
 // pub use clock::{ClockState, ClockSync, GetClock, McuClock};
 

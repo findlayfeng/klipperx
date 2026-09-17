@@ -12,8 +12,8 @@
 
 ```
                      ┌──────────────── cmd ─────────────────┐
-                     │ 命令模块（当前无启用的模块）           │
-                     │ call_msg::<GetClock, ClockState>()   │
+                     │ 命令模块（identify、basecmd 命令）      │
+                     │ call_msg::<GetConfig, ConfigState>() │
                      └───────────────┬──────────────────────┘
                                      │ McuCommand / McuResponse
                                      ▼
@@ -46,6 +46,8 @@
 | `call(name, args, response_name, timeout)` | **裸**同步请求/响应（不做握手门禁） |
 | `send_msg::<C>(&C)` | 类型化单向发送（定义在 `cmd`） |
 | `call_msg::<C, R>(&C, timeout)` | 类型化请求/响应（定义在 `cmd`） |
+| `bind_callback(name, cb)` | **裸**回调绑定（定义在 `mcu`，不做握手门禁） |
+| `bind_event::<E>(handler)` | 类型化事件订阅：按名解码为 `E` 后交给 `FnMut(E)`（定义在 `event`） |
 
 `Mcu` 不是 `Clone`，并且实现了 `Drop`：最后一个句柄被释放时调用 `Interface::shutdown()` 并 abort 接收任务。因此命令层统一持有 `Arc<Mcu>`，不要克隆。
 
@@ -122,7 +124,7 @@ pub trait McuResponse: Sized {
 ### 按名字读参数
 
 ```rust
-Ok(ClockState { clock: params.get_u32("clock")? })
+Ok(Uptime { high: params.get_u32("high")?, clock: params.get_u32("clock")? })
 ```
 
 `Params` 通过 `Msg::params` 把参数名映射到位置。**不要按下标取参数**：参数顺序由固件决定，某个固件版本插入或调整一个参数，按下标解就会静默解错，而按名字解会直接失败。
@@ -144,8 +146,8 @@ let name = params.get_enum("static_string_id", "static_string_id")?;
 ### 调用示例
 
 ```rust
-let state: ClockState = mcu.call_msg::<GetClock, ClockState>(&GetClock, timeout).await?;
-mcu.send_msg(&SetDigitalOut { oid, value })?;
+let state: ConfigState = mcu.call_msg::<GetConfig, ConfigState>(&GetConfig, timeout).await?;
+mcu.send_msg(&AllocateOids { count: oid_count })?;
 ```
 
 `call_msg` 在发送**之前**就解析命令名与响应名，所以固件不实现的消息会立刻失败，而不是白等一个超时。
@@ -153,6 +155,8 @@ mcu.send_msg(&SetDigitalOut { oid, value })?;
 ## 命令层：把消息包装成能力
 
 命令层的词汇本身在 `cmd`：两个方向的 trait（`McuCommand` / `McuResponse`）、按名取参的 `Params`，以及把它们跑起来的 `Mcu::send_msg` / `Mcu::call_msg`（Rust 允许把固有 `impl` 写在其它模块，`Mcu` 的文档页仍会把它们列在一起）。传输层只剩下按名字收发的 `send` / `call`。
+
+事件是 `cmd` 的同级层（`event`）：它复用这里的 `Params`，用 `Mcu::bind_event` 把回调绑到字典 `responses` 表里的消息上；因为事件没有请求，所以不经过 `call_msg`，只走 `Parser` 的回调路径（底层是 `mcu` 的 `Mcu::bind_callback`）。
 
 ```rust
 pub trait ClockSync {
@@ -165,6 +169,8 @@ pub trait ClockSync {
 - trait 也是一道测试缝：`cmd/clock.rs` 的测试里就有一个不依赖 MCU 的 `FixedClock` 实现（该文件目前不参与编译，见下）。
 
 上面这段 `ClockSync` 是**示例**：它所在的 `cmd/clock.rs` 当前没有编译进来（`cmd/mod.rs` 里的 `pub mod clock;` 被注释掉），文件与其测试原样保留，恢复时取消注释即可。除此之外**任何**命令都应走上表的模式。
+
+`basecmd.c` 的基础命令（`alloc` / `config` / `uptime` / `shutdown` 四个文件）只有类型化视图，没有对应的 trait：它们是连接与配置期的生命周期操作，当前只有一个实现，也不存在需要替换的后端，等出现使用者时再抽 trait 不迟。
 
 identify 是唯一的例外：它不在这一层，格式由主机自有、且运行在字典存在之前，所以它单独成一个与 `mcu` 平级的模块（`identify`，入口 `Mcu::connect`）。
 
@@ -189,7 +195,7 @@ identify 是唯一的例外：它不在这一层，格式由主机自有、且�
 
 | 项 | 说明 |
 |----|------|
-| 事件 / 异步 `output` | `output` 表已解析但不注册，`Parser` 也没有异步投递通道 |
+| `output` 表的异步投递 | `sendf` 类事件（`responses` 表）已可经 `Mcu::bind_event` 回调投递；但 `output()` 申报的消息留在 `output` 表里，`Dictionary` 已解析却**不注册**，也没有对应通道 |
 | 并发同名响应 | `PendingCalls` 只按响应名匹配，先到先得；两个并发 `get_clock` 会互相抢答，需要 `oid` 之类的区分参数 |
 | 枚举参与编解码 | `ArgType` 没有枚举变体，枚举只在 `Params::get_enum` 与 `Dictionary` 里手工解析 |
 | 命名参数 | `Param` 类型已定义但未接入 `Parser::encode` |

@@ -1,6 +1,6 @@
 # Klipperx 开发手册
 
-面向贡献者与模块维护者的技术参考。涵盖消息编解码（`msg`）、MCU 传输与数据字典（`mcu`）、命令层（`cmd`）与 identify 引导（`identify`）的 API 用法、内部结构与设计取舍。
+面向贡献者与模块维护者的技术参考。涵盖消息编解码（`msg`）、MCU 传输与数据字典（`mcu`）、命令层（`cmd`）、事件层（`event`）与 identify 引导（`identify`）的 API 用法、内部结构与设计取舍。
 
 ## 分层结构
 
@@ -9,14 +9,15 @@
 | 编解码引擎 | `src/core/klippy/msg/` | 格式串 ↔ 字节 | **不知道**：只认 `%u` / `%.*s` |
 | MCU 传输 | `src/core/klippy/mcu/` | 帧收发、`Parser`、数据字典、裸命名访问（`send` / `call`） | 只知道 `identify` 一对（起始 `Parser`） |
 | 命令层 | `src/core/klippy/cmd/` | 命令词汇（`McuCommand` / `McuResponse` / `Params`）、类型化调用、各命令模块 | 全部 |
+| 事件层 | `src/core/klippy/event/` | 事件词汇（`McuEvent`）、回调注册（`Mcu::bind_event`）、各事件模块 | 事件消息（当前只有 `stats`） |
 | Identify 引导 | `src/core/klippy/identify.rs` | 主机自有格式、分块驱动与解压、`connect` / `identify` 入口 | `identify` 一对 |
 
-`cmd` 与 `identify` 与 `mcu` **平级**，不是 `mcu` 的子模块：传输代码（帧、`Parser`、字典、裸 `send` / `call`）不引用任何能力，命令与引导都是建立在它之上的模块。
+`cmd`、`event`、`identify` 与 `mcu` **平级**，不是 `mcu` 的子模块：传输代码（帧、`Parser`、字典、裸 `send` / `call`）不引用任何能力，命令、事件与引导都是建立在它之上的模块。
 
-依赖边一共只有这四条：
+依赖边一共只有这五条：
 
 ```
-  msg  ←──  mcu  ←──  cmd
+  msg  ←──  mcu  ←──  cmd  ←──  event
              ↑          ↑
         identify ───────┘
 ```
@@ -24,6 +25,7 @@
 | 边 | 说明 |
 |----|------|
 | `cmd → mcu → msg` | 正常的向下依赖：命令层用传输，传输用编解码 |
+| `event → cmd → mcu` | 事件层复用命令层的 `Params` 与类型化调用风格，不引用具体命令模块 |
 | `identify → mcu` | 引导交换要通过传输收发、并把字典装进 `Parser` |
 | `identify → cmd::identify` | identify 的命令定义（类型化视图、`count` 参数）也放在命令层 |
 | `mcu → identify` | **唯一的反向上行边**，只有一处：构造时取起始 `Parser`（`identify::new_parser`）。`Mcu` 在认识任何消息之前必须先认识 `identify` 这一对，这个先后关系无法用分层表达，只能接受这条边（理由见 [Identify 机制](identify.md)） |
@@ -57,8 +59,21 @@
 | 文件 | 职责 |
 |------|------|
 | `mod.rs` | 命令词汇：`McuCommand` / `McuResponse` / `Params`，以及类型化调用 `Mcu::send_msg` / `Mcu::call_msg` |
+| `allocate_oids.rs` | `allocate_oids`：预留对象 id（固件 `basecmd.c` 的 Low level allocation） |
+| `config.rs` | `get_config` / `finalize_config`：配置 CRC 握手（`basecmd.c` 的 Config CRC） |
+| `uptime.rs` | `get_uptime`：读 64 位固件时钟（`basecmd.c` 的 Timing and load stats） |
+| `shutdown.rs` | `emergency_stop` / `clear_shutdown`：固件停机与解锁（`basecmd.c` 的 Misc commands） |
 | `clock.rs` | `ClockSync` / `McuClock`：`get_clock` ↔ `clock`（**暂不参与编译**：`pub mod clock;` 在 `mod.rs` 里被注释掉，文件与测试原样保留） |
 | `identify.rs` | `identify` / `identify_response` 的类型化视图（分片驱动在 `identify.rs`） |
+
+### `event/` — 事件层
+
+与 `cmd` 平级的目录：命令由主机发起，事件由固件发起，两者的注册与投递方式不同，因此分成两层。事件层复用命令层的 `Params`，不引用任何具体命令模块。
+
+| 文件 | 职责 |
+|------|------|
+| `mod.rs` | 事件词汇：`McuEvent`，以及回调注册 `Mcu::bind_event`（底层 `Mcu::bind_callback` 在 `mcu`） |
+| `stats.rs` | `stats` 事件（`basecmd.c` 的 `stats_update` 定时推送）；`register_stats_logging` 为占位订阅（只记日志） |
 
 ### `identify.rs` — Identify 引导
 

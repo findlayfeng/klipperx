@@ -53,6 +53,17 @@ pub struct Mcu {
     recv_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
+impl std::fmt::Debug for Mcu {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The parser, interface, and channels have no useful representation, so
+        // report the identifying facts only.
+        f.debug_struct("Mcu")
+            .field("name", &self.name)
+            .field("identified", &self.is_identified())
+            .finish_non_exhaustive()
+    }
+}
+
 impl Mcu {
     /// Initialize the parser with the host-defined identify messages.
     ///

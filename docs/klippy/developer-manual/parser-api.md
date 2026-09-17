@@ -1,182 +1,118 @@
 # Parser API 参考
 
-## 概述
+`Parser` 是 `msg` 层的注册表与编解码入口：按名字或 id 索引消息定义，并把「消息名 + 参数值」翻译成字节，或反过来。
 
-`Parser` 封装了 Klipper 消息协议的消息注册、发送、接收和路由。
+`Parser` **不负责 I/O**。帧的收发、批处理、请求/响应配对都在 `mcu` 层（见 [MCU 协议与数据字典](mcu-protocol.md)）。
 
 ## 核心类型
 
-### `Param` — 命令参数
-
 ```rust
-pub enum Param {
-    Positional(ArgValue),          // 位置参数，按命令定义顺序传入
-    Named(String, ArgValue),       // 命名参数，可任意顺序
+#[derive(Clone)]
+pub struct Parser { /* Arc<Mutex<MsgMap>> */ }
+
+pub struct MsgMap {
+    by_id: HashMap<i16, Arc<Msg>>,
+    by_name: HashMap<String, i16>,   // name → id，再经 by_id 解析
 }
 ```
 
-位置参数必须全部在命名参数之前。支持的类型转换（`ArgValue` → 目标类型）在 lossless 范围内自动进行，并输出 warn 日志。
+- 两个索引都是**唯一**的：id 或 name 重复会被拒绝（`duplicate id` / `duplicate name`）。
+- `Parser` 是廉价句柄：`clone()` 共享同一份注册表。`Mcu` 正是靠这一点让接收任务在握手后立刻看到新注册的消息。
 
-### `InboundMessage` — 入站消息
+## 构造与注册
+
+### `Parser::new() -> Parser`
+
+创建一个**空**注册表。identify 消息由 `Mcu::from_parts` 显式注册（见 `IDENTIFY_MESSAGES`），`Parser` 自己不带任何内置格式。
+
+### `Parser::register(&mut self, id: i16, format: &str) -> MsgResult<()>`
+
+注册一条消息。格式串由空格分隔，首 token 为消息名，其余为 `name=type`。
 
 ```rust
-pub struct InboundMessage {
-    pub id: u8,                    // 消息命令 id（注册时指定）
-    pub params: Vec<ArgValue>,     // 解码后的参数值
+let mut parser = Parser::new();
+parser.register(5, "get_clock")?;                              // 无参数
+parser.register(18, "clock clock=%u")?;                        // 一个 uint32
+parser.register(15, "shutdown clock=%u static_string_id=%hu")?; // 混合类型
+```
+
+可能失败：格式串为空、参数缺少 `=`、类型说明符未知、id 或 name 重复。
+
+### `Parser::register_all(&mut self, msgs: &[(i16, &str)]) -> MsgResult<()>`
+
+批量注册。**首个失败即返回**，此前已成功的注册保留（因此调用方若需要「要么全成要么全不成」，应先自行校验）。用于装载数据字典与 identify 对内建格式。
+
+### `Parser::is_registered(&self, name: &str) -> bool`
+
+名字是否已注册。`Dictionary::install` 用它跳过固件字典中重复出现的 identify 消息。
+
+## 查找
+
+### `Parser::lookup(&self, name: &str) -> Option<Arc<Msg>>`
+
+按名取消息定义。返回 `Arc<Msg>`，其中带有固件字典给出的**参数名与类型**——`Params` 就是靠它把响应参数按名字取出。
+
+### `Parser::has_callback(&self, name: &str) -> bool`
+
+该消息是否绑定了入站回调。
+
+## 编码（出站）
+
+### `Parser::encode(&self, name: &str, values: &[ArgValue]) -> MsgResult<Payload>`
+
+按注册的顺序编码一条命令：先写入 id（有符号 VLQ），再依次写参数。
+
+```rust
+let payload = parser.encode("clock", &[ArgValue::UInt32(1234)])?;
+```
+
+参数个数必须与声明一致；每个值必须匹配声明类型，或可无损转换为声明类型（见 `ArgValue::try_convert_to`）。
+
+## 解码（入站）
+
+### `Parser::decode(&self, payload: Payload) -> MsgResult<Vec<(Arc<Msg>, Vec<ArgValue>)>>`
+
+按顺序解析一段 payload 中的**所有**消息块，返回每条消息的定义与参数值（顺序与 payload 中一致）。
+
+```rust
+let decoded = parser.decode(frame.into())?;
+for (msg, params) in decoded {
+    println!("{} (id={}) -> {:?}", msg.name, msg.id, params);
 }
 ```
 
-## 快速开始
+任一 id 未注册、或参数字节不足，都会返回 `MsgError`（`mcu` 层会记录日志并跳过该帧）。
 
-```rust
-use std::sync::Arc;
-use klipperx::core::klippy::msg::Parser;
-use klipperx::core::klippy::msg::param::Param;
-use klipperx::core::klippy::msg::proto::ArgValue;
-use klipperx::core::klippy::traits::KlippyInterface;
-
-// 1. 创建 Parser（需要实现 KlippyInterface 的实例）
-let interface: Arc<dyn KlippyInterface> = /* ... */;
-let mut parser = Parser::new(interface);
-
-// 2. 注册命令格式（id, 格式字符串）
-parser.register(3, "G1 X=%u Y=%u").unwrap();
-
-// 3. 发送命令
-parser.send("G1", &[
-    Param::Positional(ArgValue::UInt32(100)),
-    Param::Positional(ArgValue::UInt32(200)),
-]).await.unwrap();
-
-// 4. 启动 inbox 接收入站消息
-let mut rx = parser.start_inbox().await.unwrap();
-
-// 5. 接收未经回调绑定的消息
-while let Some(msg) = rx.recv().await {
-    println!("收到 cmd_id={} 参数={:?}", msg.id, msg.params);
-}
-```
-
-## API 参考
-
-### `Parser::new(interface: Arc<dyn KlippyInterface>) -> Self`
-
-创建一个新的 `Parser`，自动注册内置的 identify 消息格式：
-- id=0: `identify_response offset=%u data=%.*s`
-- id=1: `identify offset=%c count=%c`
-
-### `Parser::register(&mut self, id: u8, format: &str) -> MsgResult<()>`
-
-注册一个消息格式。格式字符串是空格分隔的 token，首 token 为命令名，后续为 `name=type` 对。
-
-支持的类型说明符：
-
-| 类型 | 含义 |
-|------|------|
-| `%u` | uint32 |
-| `%i` | int32 |
-| `%hu` | uint16 |
-| `%hi` | int16 |
-| `%s` / `%*s` / `%.*s` | 字符串 |
-| `%c` | 字节数组 |
-
-**示例**：
-```rust
-parser.register(5, "M105")?;                         // 无参数
-parser.register(3, "G1 X=%u Y=%u")?;                 // 两个 uint32 参数
-parser.register(9, "TEST name=%s data=%c")?;          // 混合类型
-```
+## 回调绑定
 
 ### `Parser::bind(&mut self, cmd_name: &str, callback: impl FnMut(&[ArgValue]) + Send + 'static) -> MsgResult<()>`
 
-为已注册的命令绑定入站回调。绑定后此命令**不能再用于 `send`**。
+为已注册消息绑定入站回调，重复绑定会替换旧回调。回调接收**按声明顺序**排开的参数值。
 
 ```rust
-// 所有入站 "temp_report" 消息都进入 callback_queue，而不是 inbox channel
-parser.bind("temp_report", |values| {
-    println!("温度报告: {:?}", values);
+parser.bind("shutdown", |params| {
+    eprintln!("MCU shutdown: {:?}", params);
 })?;
 ```
 
-### `Parser::send(&self, cmd_name: &str, params: &[Param]) -> MsgResult<()>`
+绑定只是记录在 `Msg::callback` 上；**消息如何被投递由 `mcu` 层决定**：
 
-发送一个命令。支持位置参数和命名参数。
+1. 若有同步调用（`Mcu::call`）正在等待该响应名，投递给该调用，回调**不会**触发；
+2. 否则若有绑定回调，调用回调；
+3. 否则记录 `Unhandled message … discarding` 警告。
 
-**位置参数**（按顺序）：
-```rust
-parser.send("G1", &[
-    Param::Positional(ArgValue::UInt32(100)),  // X
-    Param::Positional(ArgValue::UInt32(200)),  // Y
-]).await?;
-```
+注意 `bind` 接收 `&mut self`，但内部是 `Arc::make_mut`，所以即使有 `decode` 调用方仍持有该 `Msg` 的 `Arc` 也不会 panic。
 
-**命名参数**（任意顺序）：
-```rust
-parser.send("G1", &[
-    Param::Named("Y".to_string(), ArgValue::UInt32(200)),
-    Param::Named("X".to_string(), ArgValue::UInt32(100)),
-]).await?;
-```
-
-**混合使用**：
-```rust
-parser.send("G1", &[
-    Param::Positional(ArgValue::UInt32(100)),   // X（位置）
-    Param::Named("Y".to_string(), ArgValue::UInt32(200)),  // Y（命名）
-]).await?;
-```
-
-**常见错误**：
-- 命令未注册 → `Unknown command`
-- 命令已绑定回调 → `Cannot send Handler type`
-- 位置参数出现在命名参数之后 → `Positional param after named param`
-- 命名参数重复 → `Duplicate named param`
-- 位置参数过多 → `Too many positional params`
-- 未知的命名参数名 → `Unknown param`
-- 同一参数同时提供位置和命名 → `provided both positionally and by name`
-- 缺少必填参数 → `Missing required param`
-- 类型不匹配且无法转换 → `Param type mismatch`
-
-### `Parser::send_and_wait(&self, cmd_name: &str, params: &[Param], wait_name: &str, timeout: Option<Duration>) -> MsgResult<Vec<ArgValue>>`
-
-发送命令后等待特定入站消息返回。waiter 在发送前注册，确保不会错过快速响应。
+## 错误类型
 
 ```rust
-let params = parser
-    .send_and_wait("M105", &[], "temperature", Some(Duration::from_secs(1)))
-    .await?;
-// params 即为 "temperature" 消息解码后的参数值
+pub struct MsgError { pub msg: String }
+pub type MsgResult<T> = Result<T, MsgError>;
 ```
 
-**路由优先级**：`send_and_wait` 的 waiter 优先级高于 `bind` 注册的回调。如果等待的消息恰好也绑定了回调，消息会投递给 waiter 而非 callback_queue。
-
-### `Parser::take_callback_msgs(&self) -> MsgResult<Vec<InboundMessage>>`
-
-同步取出所有已绑定的回调消息（非阻塞，立即返回，可能为空）。
-
-```rust
-let msgs = parser.take_callback_msgs()?;
-for msg in msgs {
-    println!("bound cmd_id={} params={:?}", msg.id, msg.params);
-}
-```
-
-通常在主循环中定期轮询，或在 inbox 消息处理循环中穿插调用。
-
-### `Parser::start_inbox(&mut self) -> MsgResult<mpsc::Receiver<InboundMessage>>`
-
-启动 inbox 后台任务，持续接收并解析入站消息。返回一个 `Receiver` 用于消费 **未绑定回调** 的消息。
-
-```rust
-let mut rx = parser.start_inbox().await?;
-while let Some(msg) = rx.recv().await {
-    handle_message(msg.id, &msg.params);
-}
-```
-
-**注意**：绑定回调的消息（通过 `bind`）不会进入此 channel，而是进入 `callback_queue`，通过 `take_callback_msgs()` 取出。
+`MsgError` 是字符串型错误，`Display` 直接打印 `msg`。上层用 `McuError::Msg` 包装它。
 
 ---
 
 - [← 开发手册首页](README.md)
-- [消息结构 →](message-structure.md)
+- [消息编解码 ←](message-structure.md) · [MCU 协议与数据字典 →](mcu-protocol.md)

@@ -12,50 +12,72 @@ pub trait Device: Send + Sync {
     fn receive(&self) -> Frame;
 }
 
-/// Generic interface for communicating with a Klipper device.
+/// Interface for communicating with a Klipper device.
 ///
-/// `D` is the underlying device type (e.g. [`TestDevice`](test::TestDevice)
-/// in tests, or a real serial/socket device in production).
-pub struct Interface<D: Device> {
-    device: Arc<D>,
+/// At runtime, this is either:
+/// - `Test(TestDevice)` — when building for tests
+/// - `Stub(StubDevice)` — for all other builds
+#[derive(Clone)]
+pub enum Interface {
+    #[cfg(test)]
+    Test(Arc<TestDevice>),
+    Stub(Arc<StubDevice>),
 }
 
-impl<D: Device + 'static> Interface<D> {
-    pub fn new(device: D) -> Self {
-        Self {
-            device: Arc::new(device),
-        }
+impl Interface {
+    /// Create a new `Interface` wrapping the given device.
+    #[cfg(test)]
+    pub fn new(device: TestDevice) -> Self {
+        Self::Test(Arc::new(device))
+    }
+
+    /// Create a stub interface (always returns errors).
+    #[cfg(not(test))]
+    pub fn stub() -> Self {
+        Self::Stub(Arc::new(StubDevice))
     }
 
     pub async fn send(&self, frame: Frame) -> Result<(), InterfaceError> {
-        let device = Arc::clone(&self.device);
-        tokio::task::spawn_blocking(move || device.send(&frame))
-            .await
-            .expect("Interface send task panicked")
+        match self {
+            #[cfg(test)]
+            Self::Test(device) => {
+                let device = Arc::clone(device);
+                tokio::task::spawn_blocking(move || device.send(&frame))
+                    .await
+                    .expect("Interface send task panicked")
+            }
+            Self::Stub(device) => {
+                let device = Arc::clone(device);
+                tokio::task::spawn_blocking(move || device.send(&frame))
+                    .await
+                    .expect("Interface send task panicked")
+            }
+        }
     }
 
     pub async fn receive(&self) -> Frame {
-        let device = Arc::clone(&self.device);
-        tokio::task::spawn_blocking(move || device.receive())
-            .await
-            .expect("Interface receive task panicked")
-    }
-}
-
-impl<D: Device + Clone> Clone for Interface<D> {
-    fn clone(&self) -> Self {
-        Self {
-            device: Arc::clone(&self.device),
+        match self {
+            #[cfg(test)]
+            Self::Test(device) => {
+                let device = Arc::clone(device);
+                tokio::task::spawn_blocking(move || device.receive())
+                    .await
+                    .expect("Interface receive task panicked")
+            }
+            Self::Stub(device) => {
+                let device = Arc::clone(device);
+                tokio::task::spawn_blocking(move || device.receive())
+                    .await
+                    .expect("Interface receive task panicked")
+            }
         }
     }
 }
 
 /// Placeholder device for non-test builds (returns errors).
-#[cfg(not(test))]
 #[derive(Debug, Clone)]
 pub struct StubDevice;
 
-#[cfg(not(test))]
 impl Device for StubDevice {
     fn send(&self, _frame: &Frame) -> Result<(), InterfaceError> {
         Err(InterfaceError::Other(
@@ -66,11 +88,3 @@ impl Device for StubDevice {
         Frame::new(0, Vec::new())
     }
 }
-
-/// Concrete interface type for test builds.
-#[cfg(test)]
-pub type TestInterface = Interface<test::TestDevice>;
-
-/// Concrete interface type for non-test builds (uses stub device).
-#[cfg(not(test))]
-pub type TestInterface = Interface<StubDevice>;

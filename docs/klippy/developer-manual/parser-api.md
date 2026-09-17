@@ -23,7 +23,7 @@ pub struct MsgMap {
 
 ### `Parser::new() -> Parser`
 
-创建一个**空**注册表。identify 消息由 `Mcu::from_parts` 显式注册（见 `IDENTIFY_MESSAGES`），`Parser` 自己不带任何内置格式。
+创建一个**空**注册表。identify 消息由 `Mcu::new`（内部经 `from_parts`）显式注册（见 `IDENTIFY_MESSAGES`），`Parser` 自己不带任何内置格式。
 
 ### `Parser::register(&mut self, id: i16, format: &str) -> MsgResult<()>`
 

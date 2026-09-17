@@ -4,16 +4,17 @@
 //! This module owns the transfer:
 //!
 //! * [`IDENTIFY_MESSAGES`] — the two formats the host is allowed to hard-code,
-//!   registered by [`Mcu::from_parts`](super::Mcu) at construction time.
+//!   registered by [`Mcu::new`](super::Mcu::new) at construction time.
 //! * the chunked transfer itself: request a chunk, append it, stop at the empty
 //!   terminator, then decompress and decode the body ([`Identify::fetch`]).
 //!
 //! The typed views of those two messages — and the chunk size, which is the
 //! command's own argument — come from the command layer like every other
 //! command's, in [`cmd::identify`](super::cmd::identify).
-//! [`Mcu::identify`](super::Mcu::identify) and
-//! [`Mcu::connect`](super::Mcu::connect) turn the fetched payload into an
-//! installed dictionary.
+//!
+//! [`Mcu::connect`] and [`Mcu::identify`] are defined here too, so the whole
+//! bootstrap reads in one place: bring the transport up ([`Mcu::new`]), transfer
+//! the payload, decode it, install the dictionary.
 //!
 //! # Why the transfer lives here and not in the command layer
 //!
@@ -42,11 +43,13 @@
 //! zip-bomb style attacks where a tiny compressed payload expands to enormous data.
 
 use super::cmd::identify::{IdentifyChunk, IdentifyRequest};
-use super::{Mcu, McuError};
+use super::{Dictionary, Mcu, McuError};
+use crate::core::klippy::config::mcu::McuConfig;
 use flate2::read::ZlibDecoder;
 use std::io::Read;
+use std::sync::Arc;
 use tokio::time::Duration;
-use tracing::debug;
+use tracing::{debug, info};
 
 /// The identify request/response message formats defined by the host.
 ///
@@ -182,6 +185,67 @@ impl Identify {
 // in [`cmd::identify`](super::cmd::identify).
 
 // ===========================================================================
+// The bootstrap, step by step
+// ===========================================================================
+
+impl Mcu {
+    /// Bring up an MCU and complete the identify handshake.
+    ///
+    /// This is the normal entry point. The flow is deliberately linear:
+    ///
+    /// 1. [`Mcu::new`] — transport up, parser knows only the identify formats;
+    /// 2. [`Mcu::identify`] — transfer the payload, turn it into a
+    ///    [`Dictionary`], and install it;
+    /// 3. hand back the shared [`Arc`] that command modules take.
+    ///
+    /// Step 3 is why the handle is an `Arc`: `Mcu` shuts the device down when the
+    /// last handle is dropped, and command modules each hold one.
+    ///
+    /// # Errors
+    /// Returns [`McuError`] if any step of the handshake fails. The partially
+    /// initialized MCU is dropped on the way out, which shuts the interface down
+    /// again.
+    pub async fn connect(config: McuConfig) -> Result<Arc<Mcu>, McuError> {
+        let mcu = Arc::new(Mcu::new(config));
+        mcu.identify(IDENTIFY_TIMEOUT).await?;
+        Ok(mcu)
+    }
+
+    /// Transfer the firmware data dictionary and install it.
+    ///
+    /// Returns the number of messages newly registered from the dictionary.
+    /// Calling this on an MCU that is already identified replaces the dictionary;
+    /// messages already registered are skipped, so an interrupted handshake can be
+    /// retried.
+    ///
+    /// Three things happen, in order: the compressed payload is fetched by
+    /// `Identify::fetch`, decoded from JSON into a [`Dictionary`], and handed to
+    /// [`Mcu::install_dictionary`](super::Mcu::install_dictionary). Nothing is
+    /// registered until the payload has decoded successfully, so a garbled
+    /// dictionary leaves the MCU exactly as unidentified as it was.
+    ///
+    /// Use [`Mcu::connect`] instead unless the default [`IDENTIFY_TIMEOUT`] is
+    /// wrong, the handshake has to be retried, or the payload is wanted before the
+    /// dictionary is installed.
+    ///
+    /// # Errors
+    /// Returns [`McuError`] if the exchange fails, the payload cannot be decoded,
+    /// or the dictionary cannot be installed.
+    pub async fn identify(&self, timeout: Duration) -> Result<usize, McuError> {
+        let identify = Identify::fetch(self, timeout).await?;
+        let dictionary = Dictionary::from_json(identify.data)?;
+        let installed = self.install_dictionary(dictionary)?;
+
+        info!(
+            "MCU '{}' identified: {} messages registered",
+            self.name(),
+            installed
+        );
+        Ok(installed)
+    }
+}
+
+// ===========================================================================
 // Tests
 // ===========================================================================
 
@@ -279,10 +343,7 @@ mod tests {
     }
 
     fn mcu_with(mappings: Vec<MappingEntry>) -> Mcu {
-        Mcu::from((
-            "test_mcu".to_string(),
-            Interface::new(TestDevice::new(mappings)),
-        ))
+        Mcu::for_test("test_mcu", Interface::new(TestDevice::new(mappings)))
     }
 
     /// Fetch with a short timeout — the default is 10 s, too slow for tests that

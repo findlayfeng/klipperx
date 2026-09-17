@@ -1,11 +1,17 @@
 //! The transport layer: frames, the message parser, the firmware data dictionary,
 //! and the bare `send` / `call` pair that take message names as strings.
 //!
+//! Construction ([`Mcu::new`]) only brings the transport up: the parser knows the
+//! host's identify formats and nothing else, so typed commands answer
+//! [`McuError::NotIdentified`] until the identify handshake installs a dictionary.
+//! That handshake is [`Mcu::connect`], and it is defined in `identify`, together
+//! with the transfer it drives — this module does not call it.
+//!
 //! Anything that names a message in the type system — [`McuCommand`](cmd::McuCommand),
 //! [`McuResponse`](cmd::McuResponse), [`Params`](cmd::Params), and the typed calls
 //! — lives one level up in [`cmd`], together with the command modules themselves.
-//! Identify straddles both: its formats and chunked transfer are transport work
-//! ([`Mcu::connect`] / [`Mcu::identify`]), while its two typed views are defined in
+//! Identify straddles both: its formats, its transfer, and its entry points are
+//! transport work in `identify`, while its two typed views are defined in
 //! [`cmd::identify`].
 
 mod dictionary;
@@ -39,15 +45,20 @@ use tokio::time::{sleep, Duration};
 use tracing::{debug, error, info, warn};
 /// MCU object that represents a physical microcontroller unit.
 ///
-/// Created by consuming an `McuConfig` which already contains the interface.
+/// Two steps, in this order:
 ///
-/// The host owns no message formats beyond the identify pair: everything else is
-/// learned from the MCU's data dictionary. [`Mcu::install_dictionary`] is what
-/// turns a freshly created object into a usable one; the typed command API
-/// ([`Mcu::send_msg`] / [`Mcu::call_msg`], defined in [`cmd`] next to the
-/// vocabulary they use) refuses to run before that.
-/// [`Mcu::connect`] does the whole bootstrap in one call, and [`Mcu::identify`]
-/// exposes the handshake on its own for a custom timeout or a retry.
+/// 1. [`Mcu::new`] brings up the transport. It is infallible, and the result is
+///    not usable yet: only the host's identify messages are registered.
+/// 2. [`Mcu::connect`] performs the identify handshake, which installs the
+///    firmware's data dictionary and thereby makes every command the firmware
+///    implements available.
+///
+/// [`Mcu::install_dictionary`] is the second half of step 2 on its own, for when
+/// the dictionary does not come from this MCU.
+///
+/// The host owns no message formats beyond the identify pair, and the typed
+/// command API ([`Mcu::send_msg`] / [`Mcu::call_msg`], defined in [`cmd`] next to
+/// the vocabulary they use) refuses to run before the dictionary is in place.
 pub struct Mcu {
     /// MCU name
     name: String,
@@ -227,43 +238,19 @@ impl Mcu {
         }
     }
 
-    /// Create an MCU and complete the identify handshake.
+    /// Build the transport for `config`: the parser with the host's identify
+    /// formats, the send task, and the receive task.
     ///
-    /// This is the normal entry point: it connects, fetches the firmware's data
-    /// dictionary, and installs it, leaving a fully usable MCU. The handle is an
-    /// [`Arc`] because command modules share it — dropping the last one shuts the
-    /// device down (see the [`Drop`] implementation).
+    /// The result is **not identified**. Until a dictionary is installed, the
+    /// only message that can be exchanged is identify itself, and the typed
+    /// command API answers [`McuError::NotIdentified`]. [`Mcu::connect`] is the
+    /// normal entry point; use this one when the interface has to be brought up
+    /// before the handshake — to inspect it, to retry it with a custom timeout,
+    /// or because the dictionary comes from somewhere else.
     ///
-    /// # Errors
-    /// Returns [`McuError`] if the handshake fails. The partially initialized MCU
-    /// is dropped, which shuts the interface down again.
-    pub async fn connect(config: McuConfig) -> Result<Arc<Mcu>, McuError> {
-        let mcu = Arc::new(Mcu::from(config));
-        mcu.identify(IDENTIFY_TIMEOUT).await?;
-        Ok(mcu)
-    }
-
-    /// Run the identify handshake: fetch the firmware data dictionary and install
-    /// it.
-    ///
-    /// Returns the number of messages newly registered from the dictionary.
-    /// Calling this on an MCU that is already identified replaces the dictionary;
-    /// messages already registered are skipped, so an interrupted handshake can be
-    /// retried.
-    ///
-    /// # Errors
-    /// Returns [`McuError`] if the exchange fails, the payload cannot be decoded,
-    /// or the dictionary cannot be installed.
-    pub async fn identify(&self, timeout: Duration) -> Result<usize, McuError> {
-        let identify = Identify::fetch(self, timeout).await?;
-        let dictionary = Dictionary::from_json(identify.data)?;
-        let installed = self.install_dictionary(dictionary)?;
-
-        info!(
-            "MCU '{}' identified: {} messages registered",
-            self.name, installed
-        );
-        Ok(installed)
+    /// The two background tasks outlive this call and are stopped by [`Drop`].
+    pub fn new(config: McuConfig) -> Self {
+        Self::from_parts(config.name, config.interface)
     }
 
     /// Install the firmware's data dictionary.
@@ -450,15 +437,14 @@ impl Drop for Mcu {
     }
 }
 
-impl From<McuConfig> for Mcu {
-    fn from(value: McuConfig) -> Self {
-        Self::from_parts(value.name, value.interface)
-    }
-}
-
-impl From<(String, Interface)> for Mcu {
-    fn from((name, interface): (String, Interface)) -> Self {
-        Self::from_parts(name, interface)
+#[cfg(test)]
+impl Mcu {
+    /// Build a transport over a bare interface, without a config.
+    ///
+    /// Tests talk to a [`TestDevice`](crate::core::klippy::interface::test::TestDevice)
+    /// rather than a real `McuConfig`, and most of them never identify.
+    pub(crate) fn for_test(name: impl Into<String>, interface: Interface) -> Self {
+        Self::from_parts(name.into(), interface)
     }
 }
 
@@ -481,12 +467,20 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn test_mcu_creation() {
-        let device = TestDevice::new(vec![]);
-        let interface = Interface::new(device);
-        let mcu = Mcu::from(("test_mcu".to_string(), interface));
+    async fn test_new_starts_unidentified() {
+        let mcu = Mcu::new(McuConfig {
+            name: "test_mcu".to_string(),
+            restart_method: McuRestartMethod::Command,
+            interface: Interface::new(TestDevice::new(vec![])),
+        });
 
         assert_eq!(mcu.name(), "test_mcu");
+
+        // Construction is transport only: the parser knows the host's identify
+        // pair and nothing else. Everything else arrives with `Mcu::connect`.
+        assert!(!mcu.is_identified());
+        assert!(mcu.parser.is_registered("identify"));
+        assert!(mcu.parser.is_registered("identify_response"));
     }
 
     // -----------------------------------------------------------------------
@@ -497,7 +491,7 @@ mod tests {
     async fn test_send_invalid_command() {
         let device = TestDevice::new(vec![]);
         let interface = Interface::new(device);
-        let mcu = Mcu::from(("test_mcu".to_string(), interface));
+        let mcu = Mcu::for_test("test_mcu", interface);
 
         let result = mcu.send("nonexistent_cmd", &[ArgValue::UInt32(0)]);
         assert!(result.is_err());
@@ -507,7 +501,7 @@ mod tests {
     async fn test_send_wrong_param_count() {
         let device = TestDevice::new(vec![]);
         let interface = Interface::new(device);
-        let mcu = Mcu::from(("test_mcu".to_string(), interface));
+        let mcu = Mcu::for_test("test_mcu", interface);
 
         // %u requires one param
         let result = mcu.send("test_cmd", &[]);
@@ -518,7 +512,7 @@ mod tests {
     async fn test_send_wrong_param_type() {
         let device = TestDevice::new(vec![]);
         let interface = Interface::new(device);
-        let mcu = Mcu::from(("test_mcu".to_string(), interface));
+        let mcu = Mcu::for_test("test_mcu", interface);
 
         // test_cmd expects x=%u but we pass a string
         let result = mcu.send("test_cmd", &[ArgValue::Str("bad".to_string())]);
@@ -598,7 +592,7 @@ mod tests {
 
         let device = TestDevice::new(mappings);
         let interface = Interface::new(device);
-        let mcu = Mcu::from(("drop_test".to_string(), interface));
+        let mcu = Mcu::for_test("drop_test", interface);
 
         // `JoinHandle` is not `Clone`; an `AbortHandle` lets us observe the
         // receive task after the `Mcu` (and its `JoinHandle`) is gone.

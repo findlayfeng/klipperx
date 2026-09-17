@@ -35,7 +35,8 @@
 
 | 方法 | 说明 |
 |------|------|
-| `Mcu::connect(config) -> Arc<Mcu>` | 正常入口：建连 + identify 握手 + 安装字典 |
+| `Mcu::new(config) -> Mcu` | 只起传输：注册 identify 格式、起收发任务，**未识别** |
+| `Mcu::connect(config) -> Arc<Mcu>` | 正常入口：`new` + identify 握手 + 安装字典 |
 | `identify(timeout) -> Result<usize>` | 单独执行握手，返回新注册的消息条数 |
 | `install_dictionary(dict) -> Result<usize>` | 安装字典（注册到 `Parser` 并留存） |
 | `dictionary() -> Option<Arc<Dictionary>>` | 已安装的字典 |
@@ -48,7 +49,7 @@
 
 `Mcu` 不是 `Clone`，并且实现了 `Drop`：最后一个句柄被释放时调用 `Interface::shutdown()` 并 abort 接收任务。因此命令层统一持有 `Arc<Mcu>`，不要克隆。
 
-正常入口是 `Mcu::connect(config)`：建连 + 握手 + 安装字典后返回 `Arc<Mcu>`；需要自定义超时或重试时用 `Mcu::identify(timeout)`。identify 的格式与分块拼装属于传输层（`mcu::identify`，见 [Identify 机制](identify.md)），因为它是唯一在字典存在之前运行的交换。
+构造与识别是两步：`Mcu::new(config)` 只把传输拉起来，之后 `Mcu::identify(timeout)` 抓取并安装字典；正常入口 `Mcu::connect(config)` 把这步串起来并返回 `Arc<Mcu>`。`connect` 与 `identify` 都定义在 `mcu::identify`，因此整条引导流程与它的格式定义、分块驱动在同一个文件里。identify 的格式与分块拼装属于传输层（`mcu::identify`，见 [Identify 机制](identify.md)），因为它是唯一在字典存在之前运行的交换。
 
 ### 裸接口与类型化接口
 

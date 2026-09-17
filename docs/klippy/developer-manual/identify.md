@@ -42,8 +42,8 @@ Identify 是 Klipper 主机端（klippy）与 MCU 端（固件）之间建立通
 // 正常入口：建连 + 握手 + 安装字典，返回可共享的句柄
 let mcu: Arc<Mcu> = Mcu::connect(config).await?;
 
-// 需要自定义超时或重试时，单独调用握手
-let mcu = Mcu::from(config);
+// 需要自定义超时或重试时，分两步
+let mcu = Mcu::new(config);   // 只起传输，尚未识别
 let installed = mcu.identify(Duration::from_secs(5)).await?;  // 抓取 + 建字典 + 安装
 
 // 只要原始负载：标识符名未建模，未知字段不丢失

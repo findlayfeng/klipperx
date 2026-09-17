@@ -1,3 +1,9 @@
+// ===========================================================================
+// Error types for MCU-level operations.
+// ===========================================================================
+
+use crate::core::klippy::msg::error::MsgError;
+
 /// Error returned by [`Mcu::call`](super::Mcu::call).
 #[derive(Debug)]
 pub enum McuCallError {
@@ -21,10 +27,113 @@ impl std::fmt::Display for McuCallError {
             McuCallError::CommandHasCallback(name) => {
                 write!(f, "command already has callback: {}", name)
             }
-            McuCallError::SendFailed(msg) => write!(f, "send failed: {}", msg),
-            McuCallError::Timeout(msg) => write!(f, "timeout: {}", msg),
+            McuCallError::SendFailed(msg) => {
+                write!(f, "send failed: {}", msg)
+            }
+            McuCallError::Timeout(msg) => {
+                write!(f, "timeout: {}", msg)
+            }
         }
     }
 }
 
 impl std::error::Error for McuCallError {}
+
+/// Error returned by MCU-level operations.
+///
+/// This is the umbrella error for everything that can go wrong above the raw
+/// message codec: identifying an MCU, installing its data dictionary, and
+/// running typed commands against it.
+#[derive(Debug)]
+pub enum McuError {
+    /// The MCU data dictionary is malformed, or a message could not be
+    /// registered from it.
+    Dictionary(String),
+    /// A message could not be registered, encoded, or decoded.
+    Msg(MsgError),
+    /// A synchronous request/response call failed.
+    Call(McuCallError),
+}
+
+impl std::fmt::Display for McuError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            McuError::Dictionary(msg) => write!(f, "invalid data dictionary: {}", msg),
+            McuError::Msg(e) => write!(f, "{}", e),
+            McuError::Call(e) => write!(f, "{}", e),
+        }
+    }
+}
+
+impl std::error::Error for McuError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            McuError::Msg(e) => Some(e),
+            McuError::Call(e) => Some(e),
+            McuError::Dictionary(_) => None,
+        }
+    }
+}
+
+impl From<MsgError> for McuError {
+    fn from(e: MsgError) -> Self {
+        McuError::Msg(e)
+    }
+}
+
+impl From<McuCallError> for McuError {
+    fn from(e: McuCallError) -> Self {
+        McuError::Call(e)
+    }
+}
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_mcu_call_error_display() {
+        assert_eq!(
+            McuCallError::CommandNotFound("get_clock".to_string()).to_string(),
+            "command not found: get_clock"
+        );
+        assert_eq!(
+            McuCallError::Timeout("no response".to_string()).to_string(),
+            "timeout: no response"
+        );
+    }
+
+    #[test]
+    fn test_mcu_error_from_msg_error() {
+        let err: McuError = MsgError::new("unknown message name: nope").into();
+        assert!(matches!(err, McuError::Msg(_)));
+        assert_eq!(err.to_string(), "unknown message name: nope");
+    }
+
+    #[test]
+    fn test_mcu_error_from_call_error() {
+        let err: McuError = McuCallError::CommandNotFound("x".to_string()).into();
+        assert!(matches!(err, McuError::Call(_)));
+        assert_eq!(err.to_string(), "command not found: x");
+    }
+
+    #[test]
+    fn test_mcu_error_dictionary_display() {
+        let err = McuError::Dictionary("'commands' must be an object".to_string());
+        assert_eq!(
+            err.to_string(),
+            "invalid data dictionary: 'commands' must be an object"
+        );
+        assert!(std::error::Error::source(&err).is_none());
+    }
+
+    #[test]
+    fn test_mcu_error_source_chain() {
+        let err: McuError = MsgError::new("boom").into();
+        assert!(std::error::Error::source(&err).is_some());
+    }
+}

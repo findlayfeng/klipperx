@@ -4,7 +4,7 @@
 //! host. Because a dictionary cannot describe the exchange that delivers it, this
 //! pair is the only command whose wire formats the host hard-codes; those two
 //! entries stay next to the transport that has to register them before anything
-//! else is known (they are `mcu::identify::IDENTIFY_MESSAGES`).
+//! else is known (they are `identify::IDENTIFY_MESSAGES`).
 //!
 //! What is defined here is what every other command module defines: the typed
 //! view. `IdentifyRequest` says "send me bytes `offset..offset+40`", and
@@ -13,15 +13,15 @@
 //!
 //! Driving those two is the chunked transfer: following the offset, capping the
 //! size, decompressing, decoding. That is not a command concern — the command
-//! only ever sends one window — so it lives with the transport in `mcu::identify`,
+//! only ever sends one window — so it lives in the sibling `identify` module,
 //! which is also where the public entry points are
-//! ([`Mcu::connect`](super::super::Mcu::connect) /
-//! [`Mcu::identify`](super::super::Mcu::identify)).
+//! ([`Mcu::connect`](crate::core::klippy::mcu::Mcu::connect) /
+//! [`Mcu::identify`](crate::core::klippy::mcu::Mcu::identify)).
 //!
 //! Both views are crate-internal: nothing outside needs to name the identify
-//! messages, and the driver in `mcu::identify` is their only caller.
+//! messages, and the driver in `identify` is their only caller.
 
-use crate::core::klippy::mcu::cmd::{McuCommand, McuResponse, Params};
+use crate::core::klippy::cmd::{McuCommand, McuResponse, Params};
 use crate::core::klippy::mcu::McuError;
 use crate::core::klippy::msg::proto::ArgValue;
 

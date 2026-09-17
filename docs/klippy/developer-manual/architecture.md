@@ -1,11 +1,11 @@
 # 内部架构
 
-本文描述 `msg` / `mcu` 两层实际运行的机制：帧如何被合并发出、入站消息如何路由、请求/响应如何配对。其中 `mcu` 自下而上分两段：传输、identify 引导与字典（`mcu`），和说其余协议的命令模块（`mcu::cmd`）。
+本文描述实际运行的机制：帧如何被合并发出、入站消息如何路由、请求/响应如何配对。主角是传输层 `mcu`（帧、`Parser`、字典、请求响应配对）；它上面的 `cmd`（命令模块）与 `identify`（引导交换）是同级模块，只通过 `Mcu` 的公开/ crate 内部接口使用它。
 
 ## 总览
 
 ```
-                     ┌───────────── mcu::cmd ─────────────┐
+                     ┌─────────────── cmd ────────────────┐
                      │ call_msg / send_msg                │
                      └───────────────┬────────────────────┘
                                      ▼
@@ -72,7 +72,7 @@ Frame ─► seq 校验 ─► Parser::decode ─► 逐条消息路由
 
 ## 数据字典的装载时机
 
-`Mcu::new`（内部 `from_parts`）只注册 identify 一对；`Mcu::connect`/`Mcu::identify`（都在 `mcu::identify`）完成后 `install_dictionary` 把命令与响应注册进 `Parser`。之所以不需要重启接收任务：
+`Mcu::new`（内部 `from_parts`）拿到的注册表只认识 identify 一对（由 `identify::new_parser` 构造）；`Mcu::connect`/`Mcu::identify`（都在 `identify.rs`）完成后 `install_dictionary` 把命令与响应注册进 `Parser`。之所以不需要重启接收任务：
 
 ```rust
 let parser_for_task = parser.clone();   // 同一个 Arc<Mutex<MsgMap>>
@@ -94,11 +94,11 @@ let parser_for_task = parser.clone();   // 同一个 Arc<Mutex<MsgMap>>
 
 ## 已实现与未实现
 
-已实现：帧收发与校验、合并发送、同步请求/响应、identify 握手与字典安装（`mcu::identify`）、类型化消息与按名取参（`mcu::cmd`）、`mcu::cmd::clock`。
+已实现：帧收发与校验、合并发送、同步请求/响应、identify 握手与字典安装（`identify`）、类型化消息与按名取参（`cmd`）、`cmd::clock`。
 
 未实现（详见 [MCU 协议与数据字典](mcu-protocol.md#当前未实现)）：事件 / 异步 `output` 投递、并发同名响应的区分、枚举参与 `ArgType` 编解码、命名参数。
 
-`msg` 层也没有 `Default for Parser`：`Parser::new()` 是空注册表，identify 消息由 `Mcu` 显式注册，避免编解码层反向依赖具体协议。
+`msg` 层也没有 `Default for Parser`：`Parser::new()` 是空注册表，identify 消息由 `identify::new_parser` 显式注册（`Mcu::new` 取用），避免编解码层反向依赖具体协议。
 
 ## 性能特性
 

@@ -1,6 +1,6 @@
 # MCU 协议与数据字典
 
-`mcu` 层负责与一颗物理 MCU 通信，并在握手后把固件自述的协议变成可用的类型化接口。它的子模块 `mcu::cmd` 则定义「有哪些命令、它们是什么意思」。
+`mcu` 层负责与一颗物理 MCU 通信，并在握手后把固件自述的协议变成可用的类型化接口。与它平级的 `cmd` 定义「有哪些命令、它们是什么意思」，`identify` 负责把字典取回来。
 
 ## 核心约束
 
@@ -11,7 +11,7 @@
 ## 数据流
 
 ```
-                     ┌────────────── mcu::cmd ──────────────┐
+                     ┌──────────────── cmd ─────────────────┐
                      │ ClockSync / McuClock / …             │
                      │ call_msg::<GetClock, ClockState>()   │
                      └───────────────┬──────────────────────┘
@@ -35,7 +35,7 @@
 
 | 方法 | 说明 |
 |------|------|
-| `Mcu::new(config) -> Mcu` | 只起传输：注册 identify 格式、起收发任务，**未识别** |
+| `Mcu::new(config) -> Mcu` | 只起传输：起始注册表只含 identify 一对（`identify::new_parser`）、起收发任务，**未识别** |
 | `Mcu::connect(config) -> Arc<Mcu>` | 正常入口：`new` + identify 握手 + 安装字典 |
 | `identify(timeout) -> Result<usize>` | 单独执行握手，返回新注册的消息条数 |
 | `install_dictionary(dict) -> Result<usize>` | 安装字典（注册到 `Parser` 并留存） |
@@ -44,12 +44,12 @@
 | `name() -> &str` | MCU 名称 |
 | `send(name, &[ArgValue])` | **裸**单向发送（不做握手门禁） |
 | `call(name, args, response_name, timeout)` | **裸**同步请求/响应（不做握手门禁） |
-| `send_msg::<C>(&C)` | 类型化单向发送（定义在 `mcu::cmd`） |
-| `call_msg::<C, R>(&C, timeout)` | 类型化请求/响应（定义在 `mcu::cmd`） |
+| `send_msg::<C>(&C)` | 类型化单向发送（定义在 `cmd`） |
+| `call_msg::<C, R>(&C, timeout)` | 类型化请求/响应（定义在 `cmd`） |
 
 `Mcu` 不是 `Clone`，并且实现了 `Drop`：最后一个句柄被释放时调用 `Interface::shutdown()` 并 abort 接收任务。因此命令层统一持有 `Arc<Mcu>`，不要克隆。
 
-构造与识别是两步：`Mcu::new(config)` 只把传输拉起来，之后 `Mcu::identify(timeout)` 抓取并安装字典；正常入口 `Mcu::connect(config)` 把这步串起来并返回 `Arc<Mcu>`。`connect` 与 `identify` 都定义在 `mcu::identify`，因此整条引导流程与它的格式定义、分块驱动在同一个文件里。identify 的格式与分块拼装属于传输层（`mcu::identify`，见 [Identify 机制](identify.md)），因为它是唯一在字典存在之前运行的交换。
+构造与识别是两步：`Mcu::new(config)` 只把传输拉起来，之后 `Mcu::identify(timeout)` 抓取并安装字典；正常入口 `Mcu::connect(config)` 把这步串起来并返回 `Arc<Mcu>`。`connect` 与 `identify` 都定义在 `identify.rs`（与 `mcu` 平级的模块），因此整条引导流程与它的格式定义、分块驱动在同一个文件里。identify 的格式与分块拼装不放在命令层（`identify`，见 [Identify 机制](identify.md)），因为它是唯一在字典存在之前运行的交换；`mcu` 反过来只在构造时向它要起始 `Parser`，那是整个仓库唯一的反向上行边。
 
 ### 裸接口与类型化接口
 
@@ -152,7 +152,7 @@ mcu.send_msg(&SetDigitalOut { oid, value })?;
 
 ## 命令层：把消息包装成能力
 
-命令层的词汇本身也在 `mcu::cmd`：两个方向的 trait（`McuCommand` / `McuResponse`）、按名取参的 `Params`，以及把它们跑起来的 `Mcu::send_msg` / `Mcu::call_msg`（Rust 允许把固有 `impl` 写在其它模块，`Mcu` 的文档页仍会把它们列在一起）。传输层只剩下按名字收发的 `send` / `call`。
+命令层的词汇本身在 `cmd`：两个方向的 trait（`McuCommand` / `McuResponse`）、按名取参的 `Params`，以及把它们跑起来的 `Mcu::send_msg` / `Mcu::call_msg`（Rust 允许把固有 `impl` 写在其它模块，`Mcu` 的文档页仍会把它们列在一起）。传输层只剩下按名字收发的 `send` / `call`。
 
 ```rust
 pub trait ClockSync {
@@ -162,9 +162,9 @@ pub trait ClockSync {
 
 - 能力 trait 用 `impl Future + Send` 而不是 `async fn`：`async fn` in trait 已稳定但不是 dyn-safe，且 `Send` 会变成隐式假设（触发 `async_fn_in_trait` lint）。显式写出后，返回值可直接用于 `tokio::spawn`。
 - 命令模块由 `Arc<Mcu>` 构造，多个模块可共用一个 MCU。
-- trait 也是一道测试缝：`mcu::cmd::clock` 的测试里就有一个不依赖 MCU 的 `FixedClock` 实现。
+- trait 也是一道测试缝：`cmd::clock` 的测试里就有一个不依赖 MCU 的 `FixedClock` 实现。
 
-identify 是唯一的例外：它不在这一层，格式由主机自有、且运行在字典存在之前，所以与传输放在一起（`mcu::identify`，入口 `Mcu::connect`）。除此之外**任何**命令都应走上表的模式。
+identify 是唯一的例外：它不在这一层，格式由主机自有、且运行在字典存在之前，所以它单独成一个与 `mcu` 平级的模块（`identify`，入口 `Mcu::connect`）。除此之外**任何**命令都应走上表的模式。
 
 ## 新增一条命令的步骤
 

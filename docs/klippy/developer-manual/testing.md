@@ -7,7 +7,7 @@
 ```bash
 cargo test --lib                      # 全部单元测试
 cargo test --lib mcu                  # mcu 层
-cargo test --lib mcu::cmd::clock     # 单个命令模块
+cargo test --lib cmd::clock          # 单个命令模块
 cargo test --lib test_install_skips   # 单个用例（按名过滤）
 ```
 
@@ -27,15 +27,20 @@ cargo test --lib test_install_skips   # 单个用例（按名过滤）
 |------|------|
 | `pending.rs` | 注册/配对/取消、未知名字不消费、先到先得、接收端已关闭、只取消一条 |
 | `dictionary.rs` | 三张消息表的解析（含 `output` 原样保留）、枚举单值与区间展开、常量、各类畸形输入、`install` 的跳过语义与不注册 `output` |
-| `identify.rs` | 单块与多块拼装（含 4 位序号回绕）、offset 错位、zlib 损坏、非 JSON、MCU 静默、zip bomb 上限、`Mcu::identify` 与 `Mcu::connect` 全流程 |
 | `mod.rs` | 构造后未识别（`new` 只注册 identify 一对）、发送错误路径、`Drop` 中止接收任务并释放阻塞读 |
 
-### `mcu::cmd`
+### `identify`
+
+| 模块 | 覆盖 |
+|------|------|
+| `identify.rs` | 单块与多块拼装（含 4 位序号回绕）、offset 错位、zlib 损坏、非 JSON、MCU 静默、zip bomb 上限、`Mcu::identify` 与 `Mcu::connect` 全流程 |
+
+### `cmd`
 
 | 模块 | 覆盖 |
 |------|------|
 | `mod.rs` | `Params` 按名取参、无损转换与拒绝收窄、未声明参数报已声明列表、类型不符报两侧类型、字符串/字节互换与非法 UTF-8、`get_enum` 三种路径；`send_msg` / `call_msg` 的握手门禁、未知消息、参数不匹配、往返解码、超时、解码失败 |
-| `identify.rs` | 无独立测试：两个视图由 `mcu::identify` 的端到端测试覆盖（手工构造的请求帧会校验 `args()` 的 id / offset / count，回应帧走 `IdentifyChunk::decode`） |
+| `identify.rs` | 无独立测试：两个视图由 `identify.rs` 的端到端测试覆盖（手工构造的请求帧会校验 `args()` 的 id / offset / count，回应帧走 `IdentifyChunk::decode`） |
 | `clock.rs` | 读取时钟、32 位回绕值、握手前失败、超时；另有不依赖 MCU 的 `ClockSync` 实现，验证 trait 作为测试缝可用 |
 
 ## 写 MCU 相关测试的两个要点
@@ -43,13 +48,16 @@ cargo test --lib test_install_skips   # 单个用例（按名过滤）
 1. **帧要比得完整**：`TestDevice` 比对的是 `Frame`（seq + payload）。请求 payload 可以直接用 `Payload::push_*` 拼，或 `Parser::encode` 得到。
 2. **序号必须对齐**：发送任务每批 +1、接收任务要求收到的帧从 0 开始递增，两者都只取低 4 位。第 i 次交换的请求与响应帧序号都应为 `i & 0xf`；超过 16 次交换会回绕，忘记 `& 0x0f` 会让第 17 帧起被静默丢弃（表现为超时）。
 
-握手测试的现成写法见 `mcu/cmd/identify.rs` 的 `chunked_mappings`：它按块大小生成「请求帧 → 响应帧」映射，并用 `flate2` 现场压缩字典内容。
+握手测试的现成写法见 `identify.rs` 的 `chunked_mappings`：它按块大小生成「请求帧 → 响应帧」映射，并用 `flate2` 现场压缩字典内容。
 
 ## 文档同步
 
-改动 `msg` / `mcu` / `mcu::cmd` 的公开 API 或分层职责时，请同时更新本手册对应页面（见 [开发手册首页](README.md) 的目录）。
+改动 `msg` / `mcu` / `cmd` / `identify` 的公开 API 或分层职责时，请同时更新本手册对应页面（见 [开发手册首页](README.md) 的目录）。
 
-`cargo doc --no-deps --lib` 的警告数应与改动前一致（目前库里已有 10 条残留于 `frame.rs` / `kinematics` / `msg/parser.rs` / `traits.rs`）。新增模块时注意一个陷阱：**模块的文档链接是在它的 `mod` 声明所在作用域里解析的**，所以给 `mcu/mod.rs` 里的 `pub mod cmd;` 写 `///` 文档，会把 `cmd` 自己文档中的裸路径拉到 `mcu` 作用域（在那里 `identify` 指的是私有的传输模块）。`mcu/mod.rs` 因此用 `//` 而不是 `///` 注释这一行。
+`cargo doc --no-deps --lib` 的警告数应与改动前一致（目前库里已有 10 条残留于 `frame.rs` / `kinematics` / `msg/parser.rs` / `traits.rs`）。新增模块时注意两个陷阱：
+
+1. **模块的文档链接是在它的 `mod` 声明所在作用域里解析的**，不是在被声明模块自己的作用域里。`klippy/mod.rs` 里的 `pub mod …;` 因此都不带 `///` 文档。
+2. **把私有模块提升为 `pub mod` 会激活它的公开文档检查**：模块文档里指向 `pub(crate)` 项的链接会报 `links to private item`。`identify` 从 `mcu` 的子模块提升为顶层公开模块时就遇到这一点，需要把这类链接改成纯代码 span。
 
 ---
 

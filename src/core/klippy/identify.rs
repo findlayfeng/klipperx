@@ -3,11 +3,12 @@
 //!
 //! This module owns the transfer:
 //!
-//! * [`IDENTIFY_MESSAGES`] — the two formats the host is allowed to hard-code,
-//!   and [`new_parser`], which hands out the registry that already knows them
-//!   (`Mcu::new` calls it at construction time).
+//! * [`IDENTIFY_MESSAGES`] — the two formats the host is allowed to hard-code —
+//!   and `new_parser`, which hands out the registry that already knows them
+//!   ([`Mcu::new`](crate::core::klippy::mcu::Mcu::new) calls it at construction
+//!   time).
 //! * the chunked transfer itself: request a chunk, append it, stop at the empty
-//!   terminator, then decompress and decode the body ([`Identify::fetch`]).
+//!   terminator, then decompress and decode the body (`Identify::fetch`).
 //!
 //! The typed views of those two messages — and the chunk size, which is the
 //! command's own argument — come from the command layer like every other
@@ -19,16 +20,16 @@
 //!
 //! # Why the transfer lives here and not in the command layer
 //!
-//! [`mcu::cmd`](super::cmd) holds the commands that describe firmware
+//! [`cmd`](super::cmd) holds the commands that describe firmware
 //! capabilities: their formats come from the dictionary, and they run through
 //! the ordinary typed call path. Identify is the opposite on both counts.
 //!
 //! * The host owns the formats. A dictionary cannot describe the exchange that
 //!   delivers it, so these two formats are the single exception to "formats come
 //!   from the firmware", and the transport has to know them at construction time.
-//! * It runs *before* any dictionary exists, so [`Mcu::call_msg`](super::Mcu::call_msg)
+//! * It runs *before* any dictionary exists, so [`Mcu::call_msg`](crate::core::klippy::mcu::Mcu::call_msg)
 //!   — which refuses to run unidentified — is unavailable; the exchange uses
-//!   [`Mcu::call_msg_ungated`](super::Mcu::call_msg_ungated).
+//!   `Mcu::call_msg_ungated`.
 //!
 //! The chunk loop is also not a capability: a request only ever asks for one
 //! window of bytes, and assembling a stream of those into a payload is the
@@ -36,7 +37,7 @@
 //!
 //! Both entries are repeated verbatim in the firmware-provided dictionary, so
 //! installing that dictionary must skip messages which are already registered
-//! (see [`Dictionary::install`](super::Dictionary::install)).
+//! (see [`Dictionary::install`](crate::core::klippy::mcu::Dictionary::install)).
 //!
 //! # Security
 //!
@@ -44,8 +45,8 @@
 //! zip-bomb style attacks where a tiny compressed payload expands to enormous data.
 
 use super::cmd::identify::{IdentifyChunk, IdentifyRequest};
-use super::{Dictionary, Mcu, McuError};
 use crate::core::klippy::config::mcu::McuConfig;
+use crate::core::klippy::mcu::{Dictionary, Mcu, McuError};
 use crate::core::klippy::msg::parser::Parser;
 use flate2::read::ZlibDecoder;
 use std::io::Read;
@@ -63,14 +64,14 @@ pub const IDENTIFY_MESSAGES: &[(i16, &str)] = &[
     (1, "identify offset=%u count=%c"),
 ];
 
-/// The parser an [`Mcu`](super::Mcu) starts with: an empty registry that already
+/// The parser an [`Mcu`](crate::core::klippy::mcu::Mcu) starts with: an empty registry that already
 /// knows [`IDENTIFY_MESSAGES`].
 ///
 /// Registration belongs next to the formats it registers, and giving out the
 /// finished registry rather than a `register_formats(&mut parser)` step means a
 /// future construction path cannot forget to call it. Every other format arrives
 /// with the firmware dictionary (see
-/// [`Mcu::install_dictionary`](super::Mcu::install_dictionary)).
+/// [`Mcu::install_dictionary`](crate::core::klippy::mcu::Mcu::install_dictionary)).
 pub(crate) fn new_parser() -> Parser {
     let mut parser = Parser::new();
     parser
@@ -80,8 +81,8 @@ pub(crate) fn new_parser() -> Parser {
 }
 
 /// Timeout for the complete identify handshake, used by
-/// [`Mcu::identify`](super::Mcu::identify) and
-/// [`Mcu::connect`](super::Mcu::connect).
+/// [`Mcu::identify`](crate::core::klippy::mcu::Mcu::identify) and
+/// [`Mcu::connect`](crate::core::klippy::mcu::Mcu::connect).
 ///
 /// Each chunk request gets the whole budget: a healthy MCU answers in
 /// microseconds, so a shorter per-chunk timeout would only add tuning knobs.
@@ -102,7 +103,7 @@ const MAX_IDENTIFY_DATA_SIZE: usize = 1024 * 1024;
 /// preserved verbatim so that unknown or future fields are never lost or
 /// rejected.
 ///
-/// [`Dictionary`](super::Dictionary) is the structured view built from it.
+/// [`Dictionary`] is the structured view built from it.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Identify {
     /// Complete JSON body as received from the MCU, uncompressed and decoded.
@@ -238,7 +239,7 @@ impl Mcu {
     ///
     /// Three things happen, in order: the compressed payload is fetched by
     /// `Identify::fetch`, decoded from JSON into a [`Dictionary`], and handed to
-    /// [`Mcu::install_dictionary`](super::Mcu::install_dictionary). Nothing is
+    /// [`Mcu::install_dictionary`](crate::core::klippy::mcu::Mcu::install_dictionary). Nothing is
     /// registered until the payload has decoded successfully, so a garbled
     /// dictionary leaves the MCU exactly as unidentified as it was.
     ///
@@ -270,11 +271,11 @@ impl Mcu {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::klippy::cmd::identify::IDENTIFY_CHUNK_SIZE;
     use crate::core::klippy::config::mcu::McuConfig;
     use crate::core::klippy::frame::Frame;
     use crate::core::klippy::interface::test::{MappingEntry, TestDevice};
     use crate::core::klippy::interface::Interface;
-    use crate::core::klippy::mcu::cmd::identify::IDENTIFY_CHUNK_SIZE;
     use crate::core::klippy::mcu::McuRestartMethod;
     use crate::core::klippy::msg::proto::Payload;
     use flate2::write::ZlibEncoder;

@@ -1,7 +1,8 @@
 //! The MCU data dictionary — the firmware's description of its own protocol.
 //!
 //! The dictionary is the counterpart of the host-side handshake in
-//! [`identify`](super::identify): the MCU sends it once, and from then on it is
+//! [`identify`](crate::core::klippy::identify): the MCU sends it once, and from
+//! then on it is
 //! the single source of truth for
 //!
 //! * which commands and responses exist ([`MessageDef`]),
@@ -398,7 +399,7 @@ fn bad_enum(name: &str, reason: &str) -> McuError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::klippy::mcu::identify::IDENTIFY_MESSAGES;
+    use crate::core::klippy::identify::IDENTIFY_MESSAGES;
     use crate::core::klippy::msg::proto::{ArgValue, Payload};
 
     /// A dictionary with the same shape as a real firmware's, trimmed down.

@@ -11,7 +11,7 @@ Identify 是 Klipper 主机端（klippy）与 MCU 端（固件）之间建立通
 | `0` | `identify_response offset=%u data=%.*s` | MCU → 主机 |
 | `1` | `identify offset=%u count=%c` | 主机 → MCU |
 
-两条定义见 `mcu::identify::IDENTIFY_MESSAGES`，与 Klipper 的 `msgproto.DefaultMessages` 一致。它们在固件字典里也会原样出现一次，所以 `Dictionary::install` 必须跳过已注册的消息，否则会因 id / name 重复而失败。
+两条定义见 `identify::IDENTIFY_MESSAGES`，与 Klipper 的 `msgproto.DefaultMessages` 一致。它们在固件字典里也会原样出现一次，所以 `Dictionary::install` 必须跳过已注册的消息，否则会因 id / name 重复而失败。
 
 **工作流程**（`Identify::fetch`）：
 
@@ -24,18 +24,26 @@ Identify 是 Klipper 主机端（klippy）与 MCU 端（固件）之间建立通
 
 ## 代码位置
 
-全部在 `mcu::identify`（传输层，不是命令层）：
+`identify` 模块与 `mcu`、`cmd` 平级（都在 `src/core/klippy/` 下），**不在**命令层：
 
 | 内容 | 位置 |
 |------|------|
-| 命令定义（类型化视图、`count` 参数） | `mcu::cmd::identify`：`IdentifyRequest` / `IdentifyChunk` |
-| 主机侧格式定义（唯一的硬编码例外） | `mcu::identify::IDENTIFY_MESSAGES` |
-| 格式注册（构造时 `Mcu` 拿到的起始 `Parser`） | `mcu::identify::new_parser` |
-| 分块请求、拼接、解压、JSON 解析 | `mcu::identify::Identify::fetch` |
+| 命令定义（类型化视图、`count` 参数） | `cmd::identify`：`IdentifyRequest` / `IdentifyChunk` |
+| 主机侧格式定义（唯一的硬编码例外） | `identify::IDENTIFY_MESSAGES` |
+| 格式注册（构造时 `Mcu` 拿到的起始 `Parser`） | `identify::new_parser` |
+| 分块请求、拼接、解压、JSON 解析 | `identify::Identify::fetch` |
 | 抓取 + 建字典 + 安装 | `Mcu::identify` |
 | 建连 + 握手（常用入口） | `Mcu::connect` |
 
-拆成两处的理由：**命令的定义**（名称、参数、解码）与其它命令一样放在命令层 `cmd`；**分片驱动**不是命令的一部分——一条 `identify` 只请求一个窗口 `offset..offset+40`，把一串这样的回应拼成负载是链路层的事——所以它和主机自有的格式定义一起留在 `mcu::identify`。这也是唯一一处 `mcu` 反向引用 `cmd`：因为 identify 是唯一在字典存在之前运行的交换，`Mcu::call_msg` 那时还会拒绝执行，只能走 `Mcu::call_msg_ungated`。
+`Mcu::identify` 与 `Mcu::connect` 是写在 `identify.rs` 里的固有 `impl Mcu`，所以整条引导流程与它的格式定义、分块驱动在同一个文件里。
+
+拆成两处的理由：**命令的定义**（名称、参数、解码）与其它命令一样放在命令层 `cmd`；**分片驱动**不是命令的一部分——一条 `identify` 只请求一个窗口 `offset..offset+40`，把一串这样的回应拼成负载是链路层的事——所以它和主机自有的格式定义一起留在 `identify`。
+
+### 为什么 `identify` 与 `mcu` 平级，而不是它的子模块
+
+它曾经是 `mcu/identify.rs`，只能作为传输的内部细节被引用。它与 `mcu`、`cmd` 是同等地位的模块：一个协议关注点，只不过恰好是主机自己定义的那个。
+
+代价是 `mcu` 与 `identify` 互相引用——传输在构造时调用 `identify::new_parser`，`identify` 反过来用 `Mcu::call_msg_ungated` 与 `Mcu::install_dictionary` 驱动传输。这个环是引导交换的真实形状：谁也不能排在前面。`identify` 还从 `cmd` 取两个类型化视图，因为命令的定义按统一规则归命令层。
 
 ## Rust API
 

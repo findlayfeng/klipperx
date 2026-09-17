@@ -21,7 +21,8 @@
 //! Both views are crate-internal: nothing outside needs to name the identify
 //! messages, and the driver in `mcu::identify` is their only caller.
 
-use crate::core::klippy::mcu::{McuCommand, McuError, McuResponse, Params};
+use crate::core::klippy::mcu::cmd::{McuCommand, McuResponse, Params};
+use crate::core::klippy::mcu::McuError;
 use crate::core::klippy::msg::proto::ArgValue;
 
 /// Number of bytes requested per chunk — the `count` argument of `identify`.

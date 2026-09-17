@@ -94,7 +94,7 @@ let parser_for_task = parser.clone();   // 同一个 Arc<Mutex<MsgMap>>
 
 ## 已实现与未实现
 
-已实现：帧收发与校验、合并发送、同步请求/响应、identify 握手与字典安装（`mcu::identify`）、类型化消息与按名取参（`mcu::codec`）、`mcu::cmd::clock`。
+已实现：帧收发与校验、合并发送、同步请求/响应、identify 握手与字典安装（`mcu::identify`）、类型化消息与按名取参（`mcu::cmd`）、`mcu::cmd::clock`。
 
 未实现（详见 [MCU 协议与数据字典](mcu-protocol.md#当前未实现)）：事件 / 异步 `output` 投递、并发同名响应的区分、枚举参与 `ArgType` 编解码、命名参数。
 

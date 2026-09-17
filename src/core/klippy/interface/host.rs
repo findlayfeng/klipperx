@@ -9,7 +9,8 @@
 //! **It is a byte stream, not a frame queue.** `klipper_host_output` hands back
 //! raw protocol bytes, which may split a frame across calls or glue several
 //! together, so [`HostDevice::receive`] buffers them through
-//! [`FrameStream`] — the reassembler every byte-stream device shares; `send` goes
+//! [`FrameStream`](crate::core::klippy::frame::FrameStream) — the reassembler every
+//! byte-stream device shares; `send` goes
 //! the other way and encodes a frame to bytes.
 //! Neither side needs to know about the other's boundaries.
 //!
@@ -36,13 +37,24 @@
 //! output buffer rather than dropping a response, so a slow host costs latency
 //! and not a desynchronised stream.
 //!
+//! **Two I/O modes, chosen at compile time.** In a test build the library is
+//! read and written one byte per call, so every frame travels the whole
+//! reassembly path ([`FrameStream`](crate::core::klippy::frame::FrameStream))
+//! against real firmware. In a release build the
+//! library is asked for whole frames (`klipper_host_output_frame`, which it only
+//! has when built with `CONFIG_HOST_FRAME_API`), and reassembly is skipped
+//! entirely — the same thing `TestDevice` does, for the
+//! same reason: there is nothing to reassemble when the boundary is already known.
+//!
 //! **Its state is process-global.** Klipper's globals live inside the shared
 //! library, so one device per process is the supported configuration, and the
 //! threads it spawns must be joined before the library is unloaded — hence the
 //! explicit teardown in [`Drop`].
 
 use super::Device;
-use crate::core::klippy::frame::{Frame, FrameStream};
+use crate::core::klippy::frame::Frame;
+#[cfg(test)]
+use crate::core::klippy::frame::FrameStream;
 use crate::core::klippy::traits::InterfaceError;
 use crossbeam_channel::{unbounded, Receiver};
 use libloading::Library;
@@ -54,10 +66,17 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use tracing::{debug, info, warn};
 
-/// Bytes asked of `klipper_host_output_wait` per read. Klipper emits at most
-/// [`MESSAGE_MAX`](crate::core::klippy::frame::MESSAGE_MAX) bytes per frame, so
-/// this drains several frames per call.
-const OUTPUT_BATCH: usize = 512;
+/// Bytes asked of the library per read.
+///
+/// A test build reads a byte at a time, which is the hardest case for
+/// reassembly: no read ever contains a whole frame, so every frame goes through
+/// [`FrameStream`]. A release build asks for one frame at a time, and
+/// [`MESSAGE_MAX`](crate::core::klippy::frame::MESSAGE_MAX) is the largest one
+/// the protocol can produce.
+#[cfg(test)]
+const OUTPUT_BATCH: usize = 1;
+#[cfg(not(test))]
+const OUTPUT_BATCH: usize = crate::core::klippy::frame::MESSAGE_MAX;
 
 /// How long the output thread blocks in the library when there is nothing to
 /// read. Data wakes it immediately, so this only bounds how often it rechecks
@@ -70,7 +89,9 @@ const OUTPUT_WAIT_MS: u32 = 100;
 
 type InitFn = unsafe extern "C" fn() -> c_int;
 type InputFn = unsafe extern "C" fn(*const c_uchar, usize) -> c_long;
-type OutputWaitFn = unsafe extern "C" fn(*mut c_uchar, usize, u32) -> usize;
+/// One read from the library: bytes into `buf`, up to `buf_size`, waiting up to
+/// `timeout_ms`. Both the byte-stream and the frame API have this shape.
+type OutputFn = unsafe extern "C" fn(*mut c_uchar, usize, u32) -> usize;
 type RunFn = unsafe extern "C" fn();
 type ShutdownFn = unsafe extern "C" fn();
 
@@ -83,7 +104,9 @@ type ShutdownFn = unsafe extern "C" fn();
 struct Symbols {
     init: InitFn,
     input: InputFn,
-    output_wait: OutputWaitFn,
+    /// `klipper_host_output_wait` while testing, `klipper_host_output_frame` in a
+    /// release build — see [`Symbols::resolve`].
+    output: OutputFn,
     run: RunFn,
     shutdown: ShutdownFn,
 }
@@ -104,7 +127,23 @@ impl Symbols {
         Ok(Self {
             init: unsafe { get(library, b"klipper_host_init\0")? },
             input: unsafe { get(library, b"klipper_host_input\0")? },
-            output_wait: unsafe { get(library, b"klipper_host_output_wait\0")? },
+            // A test build takes the byte stream apart itself; a release build
+            // wants the library's frame API, which exists only when it was built
+            // with CONFIG_HOST_FRAME_API.
+            #[cfg(test)]
+            output: unsafe { get(library, b"klipper_host_output_wait\0")? },
+            #[cfg(not(test))]
+            output: unsafe {
+                library
+                    .get::<OutputFn>(b"klipper_host_output_frame\0")
+                    .map_err(|e| {
+                        InterfaceError::Other(format!(
+                            "klipper host library has no klipper_host_output_frame: rebuild it \
+                             with CONFIG_HOST_FRAME_API=y, or use a test build ({e})"
+                        ))
+                    })
+                    .map(|symbol| *symbol)?
+            },
             run: unsafe { get(library, b"klipper_host_run\0")? },
             shutdown: unsafe { get(library, b"klipper_host_shutdown\0")? },
         })
@@ -158,6 +197,9 @@ pub struct HostDevice {
     /// Raw bytes from Klipper, in arrival order.
     output: Receiver<Vec<u8>>,
     /// Bytes pulled from `output`, reassembled into frames.
+    ///
+    /// A release build is handed whole frames and never needs this.
+    #[cfg(test)]
     stream: Mutex<FrameStream>,
     /// Set by `shutdown`, checked by both worker threads and by `receive`.
     stopped: Arc<AtomicBool>,
@@ -217,16 +259,17 @@ impl HostDevice {
         // the sender, so when it stops the channel disconnects and every blocked
         // `receive` wakes up with `None` — no separate "unblock" signal needed.
         let poller_stopped = Arc::clone(&stopped);
-        let poller_output_wait = symbols.output_wait;
+        let poller_read = symbols.output;
         let poller = thread::Builder::new()
             .name("klipper-output".to_string())
             .spawn(move || {
                 let mut buf = vec![0u8; OUTPUT_BATCH];
                 while !poller_stopped.load(Ordering::Relaxed) {
-                    // Blocks in the library until a frame arrives or the wait
-                    // expires, so no polling interval is needed here.
-                    let read =
-                        unsafe { poller_output_wait(buf.as_mut_ptr(), buf.len(), OUTPUT_WAIT_MS) };
+                    // Blocks in the library until data arrives or the wait expires,
+                    // so no polling interval is needed here. How much arrives is
+                    // the mode's business: a byte while testing, a whole frame in a
+                    // release build.
+                    let read = unsafe { poller_read(buf.as_mut_ptr(), buf.len(), OUTPUT_WAIT_MS) };
                     if read == 0 {
                         continue;
                     }
@@ -258,6 +301,7 @@ impl HostDevice {
             _library: library,
             library_path,
             output,
+            #[cfg(test)]
             stream: Mutex::new(FrameStream::new()),
             stopped,
             threads: Mutex::new(threads),
@@ -286,7 +330,25 @@ impl Device for HostDevice {
         }
 
         let bytes = frame.raw_bytes();
+
+        // A test build hands the frame over one byte per call, so the library's
+        // receive path sees the stream the way a real link would deliver it. A
+        // release build gives it the frame in one call.
+        #[cfg(test)]
+        let written = {
+            let mut taken = 0;
+            for byte in &bytes {
+                let n = unsafe { (self.symbols.input)(byte as *const c_uchar, 1) };
+                if n != 1 {
+                    break;
+                }
+                taken += n;
+            }
+            taken
+        };
+        #[cfg(not(test))]
         let written = unsafe { (self.symbols.input)(bytes.as_ptr(), bytes.len()) };
+
         if written != bytes.len() as c_long {
             return Err(InterfaceError::SendError(format!(
                 "klipper_host_input took {written} of {} bytes",
@@ -302,13 +364,25 @@ impl Device for HostDevice {
             if self.stopped.load(Ordering::Relaxed) {
                 return None;
             }
+            // Bytes that have already arrived may hold another frame; a release
+            // build gets whole frames, so there is never anything left over.
+            #[cfg(test)]
             if let Some(frame) = self.stream.lock().unwrap().next() {
                 return Some(frame);
             }
             match self.output.recv() {
                 Ok(bytes) => {
                     debug!("received {} bytes from klipper", bytes.len());
+
+                    // A test build reassembles the stream; a release build is
+                    // handed whole frames and only has to validate them.
+                    #[cfg(test)]
                     self.stream.lock().unwrap().push(&bytes);
+                    #[cfg(not(test))]
+                    match Frame::parse(&bytes) {
+                        Some(frame) => return Some(frame),
+                        None => warn!("klipper sent {} bytes that are not a frame", bytes.len()),
+                    }
                 }
                 // The poller stopped: the stream is over.
                 Err(_) => return None,

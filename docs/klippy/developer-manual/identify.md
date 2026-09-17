@@ -22,23 +22,35 @@ Identify 是 Klipper 主机端（klippy）与 MCU 端（固件）之间建立通
 
 与 Klipper 的一个差异：Klipper 在 offset 不匹配时不追加数据、继续用同一 offset 重试（可能无限循环）；本实现直接报 `McuError::IdentifyProtocol`，避免死循环，也避免把错位的数据拼成一份看似合法的字典。
 
+## 代码位置
+
+| 内容 | 位置 |
+|------|------|
+| 主机侧格式定义（唯一的硬编码例外） | `mcu::identify::IDENTIFY_MESSAGES` |
+| 握手协议、分块、解压、安装字典 | `feature::identify` |
+
+字典属于协议知识，而 identify 是唯一在字典存在之前运行的交换，因此它按特征层的方式书写：类型化消息视图（`IdentifyRequest` / `IdentifyChunk`）加协议逻辑，只是走 [`Mcu::call_msg_ungated`](mcu-protocol.md) 而不是普通的 `call_msg`。
+
 ## Rust API
 
 ```rust
-// 正常入口：建连 + 握手 + 安装字典
-let mcu: Arc<Mcu> = Mcu::connect(config).await?;
+// 正常入口：建连 + 握手 + 安装字典，返回可共享的句柄
+let mcu: Arc<Mcu> = feature::identify::connect(config).await?;
 
-// 需要自定义超时时，拆开两步
-let mcu = Mcu::from(config);
-let installed = mcu.identify(Duration::from_secs(5)).await?;
+// 需要自定义超时、重试，或先看原始负载
+let mcu = Arc::new(Mcu::from(config));
+let identify = McuIdentify::new(Arc::clone(&mcu))
+    .with_timeout(Duration::from_secs(5));
 
-// 只抓取负载（crate 内部使用）
-let identify: Identify = Identify::fetch(&mcu, timeout).await?;
+let installed = identify.identify().await?;        // 抓取 + 解析 + 安装
+let raw: Identify = identify.fetch().await?;        // 只抓取
+let dictionary = Dictionary::from_json(raw.data)?;  // 自行处置
 ```
 
-- `Mcu::connect` 使用固定的 `IDENTIFY_TIMEOUT`（10 秒，覆盖整个握手）。
-- `Mcu::identify` 是「抓取 → `Dictionary::parse` → `install_dictionary`」的连写；重复调用会替换字典，已注册的消息被跳过，因此握手中断后可以重试。
+- `connect` 与 `McuIdentify::new` 都使用固定的 `IDENTIFY_TIMEOUT`（10 秒，覆盖整个握手）；`with_timeout` 可覆盖。
+- `McuIdentify::identify` 是「抓取 → `Dictionary::from_json` → `Mcu::install_dictionary`」的连写；重复调用会替换字典，已注册的消息被跳过，因此握手中断后可以重试。
 - `Identify` 只保存完整 JSON（`data: serde_json::Value`），不建模具体字段，未知或未来的字段不会丢失、也不会导致拒绝。结构化视图是 `Dictionary`。
+- `McuIdentify` 没有对应的能力 trait：握手是一次性引导，只有一个实现、没有替代后端。
 
 ## 数据字典字段
 

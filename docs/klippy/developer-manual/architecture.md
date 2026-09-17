@@ -72,7 +72,7 @@ Frame ─► seq 校验 ─► Parser::decode ─► 逐条消息路由
 
 ## 数据字典的装载时机
 
-`Mcu::from_parts` 只注册 identify 一对；握手完成后 `install_dictionary` 把命令与响应注册进 `Parser`。之所以不需要重启接收任务：
+`Mcu::from_parts` 只注册 identify 一对；握手（`feature::identify`）完成后 `install_dictionary` 把命令与响应注册进 `Parser`。之所以不需要重启接收任务：
 
 ```rust
 let parser_for_task = parser.clone();   // 同一个 Arc<Mutex<MsgMap>>
@@ -94,7 +94,7 @@ let parser_for_task = parser.clone();   // 同一个 Arc<Mutex<MsgMap>>
 
 ## 已实现与未实现
 
-已实现：帧收发与校验、合并发送、同步请求/响应、identify 握手、数据字典解析与安装、类型化消息与按名取参、`feature::clock`。
+已实现：帧收发与校验、合并发送、同步请求/响应、identify 握手与字典安装（`feature::identify`）、类型化消息与按名取参（`mcu::codec`）、`feature::clock`。
 
 未实现（详见 [MCU 协议与数据字典](mcu-protocol.md#当前未实现)）：事件 / 异步 `output` 投递、并发同名响应的区分、枚举参与 `ArgType` 编解码、命名参数。
 

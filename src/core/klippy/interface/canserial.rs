@@ -21,8 +21,15 @@
 //! # Naming
 //!
 //! This is the *can serial* transport: Klipper's serial link, carried over CAN.
-//! The name `canbus` is deliberately not used here — it is kept for an interface
-//! that speaks the CAN protocol itself rather than borrowing the bus as a wire.
+//! Type names therefore say `CanSerial`, and the name `Canbus` is kept for an
+//! interface that speaks the CAN protocol itself rather than borrowing the bus as
+//! a wire.
+//!
+//! Configuration keys are a different matter: they follow Klipper's `[mcu]`
+//! vocabulary (`canbus_uuid`, `canbus_interface`, and `canbus_nodeid` as Klipper's
+//! own console and `serialhdl.connect_canbus` spell it), because those describe
+//! the printer's wiring rather than this implementation, and a Klipper config
+//! should keep working.
 
 use super::Device;
 use crate::core::klippy::frame::{Frame, FrameStream};
@@ -45,6 +52,11 @@ const CAN_FRAME_SIZE: usize = 16;
 
 /// Klipper's node-id mapping: `nodeid` → `0x100 + 2 * nodeid`.
 const NODE_ID_BASE: u32 = 0x100;
+
+/// Klipper's admin arbitration id, and the command that tells an unassigned MCU
+/// which node id to take (`klippy/serialhdl.py`).
+const ADMIN_ID: u32 = 0x3f0;
+const CMD_SET_NODEID: u8 = 0x01;
 
 /// How long a receive waits for a frame before rechecking the stop flag.
 const POLL_TIMEOUT_MS: libc::c_int = 100;
@@ -129,6 +141,19 @@ impl CanFrame {
     }
 }
 
+/// The admin frame that assigns `nodeid` to the MCU with `uuid`: the command byte,
+/// the UUID most significant byte first, then the node id.
+///
+/// The MCU answers on its new id only once it has seen this, which is why a config
+/// needs the UUID even when it states the node id.
+fn set_nodeid_payload(uuid: [u8; 6], nodeid: u32) -> [u8; CAN_DATA_BYTES] {
+    let mut data = [0u8; CAN_DATA_BYTES];
+    data[0] = CMD_SET_NODEID;
+    data[1..7].copy_from_slice(&uuid);
+    data[7] = nodeid as u8;
+    data
+}
+
 /// The half of the transport that touches no socket: the mapping between Klipper's
 /// byte stream and CAN frames.
 #[derive(Debug)]
@@ -203,26 +228,37 @@ impl CanSerialLink {
 pub struct CanSerialDevice {
     socket: File,
     interface: String,
+    uuid: [u8; 6],
     nodeid: u32,
     link: Mutex<CanSerialLink>,
     stopped: AtomicBool,
 }
 
 impl CanSerialDevice {
-    /// Open `interface` and talk to the node `nodeid`.
+    /// Open `interface` and bring the MCU `uuid` up as node `nodeid`.
+    ///
+    /// The node id lives in the host, not in the MCU: this sends Klipper's admin
+    /// frame before any traffic, and the MCU starts answering on the node's
+    /// arbitration id only after it has seen its UUID and new id.
     ///
     /// # Errors
     /// Returns [`InterfaceError`] when the interface does not exist, the socket
-    /// cannot be created (no CAN support), or it cannot be bound or filtered.
-    pub fn open(interface: &str, nodeid: u32) -> Result<Self, InterfaceError> {
+    /// cannot be created (no CAN support), it cannot be bound or filtered, or the
+    /// node id could not be handed over.
+    pub fn open(interface: &str, uuid: [u8; 6], nodeid: u32) -> Result<Self, InterfaceError> {
         let link = CanSerialLink::for_node(nodeid);
         let index = interface_index(interface)?;
         let socket = open_socket()?;
         bind_interface(&socket, index)?;
         filter_answers(&socket, link.rx_id())?;
 
+        let assignment = CanFrame::new(ADMIN_ID, &set_nodeid_payload(uuid, nodeid))?;
+        (&socket)
+            .write_all(&assignment.to_abi())
+            .map_err(|e| InterfaceError::Other(format!("failed to send the node id: {e}")))?;
+
         info!(
-            "can serial link ready on {interface}: node {nodeid}, writing to {:#x}, \
+            "can serial link ready on {interface}: node {nodeid} assigned, writing to {:#x}, \
              reading {:#x}",
             link.tx_id(),
             link.rx_id()
@@ -230,10 +266,16 @@ impl CanSerialDevice {
         Ok(Self {
             socket,
             interface: interface.to_string(),
+            uuid,
             nodeid,
             link: Mutex::new(link),
             stopped: AtomicBool::new(false),
         })
+    }
+
+    /// The UUID this device assigned a node id to.
+    pub fn uuid(&self) -> [u8; 6] {
+        self.uuid
     }
 
     /// The interface this device opened.
@@ -562,8 +604,19 @@ mod tests {
     }
 
     #[test]
+    fn test_node_assignment_frame_matches_klipper() {
+        // `klippy/serialhdl.py`: CMD_SET_NODEID, the UUID most significant byte
+        // first, then the node id.
+        let payload = set_nodeid_payload([0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc], 2);
+        assert_eq!(payload, [0x01, 0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc, 0x02]);
+        assert_eq!(set_nodeid_payload([0; 6], 1)[7], 1);
+    }
+
+    #[test]
     fn test_open_reports_a_missing_interface() {
-        let err = CanSerialDevice::open("can99", 2).unwrap_err();
+        // The interface is checked before anything is sent, so this needs no CAN
+        // bus to assign a node on.
+        let err = CanSerialDevice::open("can99", [0; 6], 2).unwrap_err();
         assert!(
             err.to_string().contains("no CAN interface named 'can99'"),
             "{err}"

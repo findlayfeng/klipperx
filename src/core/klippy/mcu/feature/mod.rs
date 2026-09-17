@@ -2,17 +2,22 @@
 //!
 //! A *feature* wraps one capability of the firmware (a clock query, a digital
 //! output, an endstop, …) behind a trait, and implements it by issuing typed
-//! commands through [`Mcu`](crate::core::klippy::mcu::Mcu).
+//! commands through [`Mcu`](super::Mcu).
 //!
 //! # Why a separate layer
 //!
-//! Three responsibilities are kept apart on purpose:
+//! Three responsibilities are kept apart on purpose. Features live *inside*
+//! `mcu` as its outermost sublayer, but the split is the same one that separates
+//! `mcu` from `msg`:
 //!
 //! | Layer | Owns | Knows about |
 //! |---|---|---|
 //! | `msg` | format strings ↔ bytes | nothing but the codec |
-//! | `mcu` | frames, the identify handshake, the data dictionary | only the identify pair |
-//! | `feature` | *which* messages exist and what they mean | the firmware protocol |
+//! | `mcu` | frames, the data dictionary, typed message access | only the identify pair |
+//! | `mcu::feature` | *which* messages exist and what they mean | the firmware protocol |
+//!
+//! The dependency still points one way: `feature` uses `Mcu`, and the transport
+//! and dictionary code never mention a feature. `mcu` only declares the module.
 //!
 //! Because the host learns every format from the firmware, a feature never
 //! hard-codes a format string or a wire id: it names the message and its

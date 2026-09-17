@@ -5,6 +5,12 @@ mod identify;
 mod pending;
 mod restart_method;
 
+// Keep this declaration free of a doc comment: rustdoc resolves links in a
+// module's documentation against the scope its `mod` declaration lives in, so an
+// outer `///` here would push the links in `feature`'s own docs into `mcu`'s
+// scope (where `identify` names the private transport module).
+pub mod feature;
+
 pub use codec::{McuCommand, McuResponse, Params};
 pub use dictionary::{Dictionary, Enumeration, MessageDef, OutputDef};
 pub use error::{McuCallError, McuError};
@@ -22,7 +28,6 @@ use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{sleep, Duration};
 use tracing::{debug, error, info, warn};
-
 /// MCU object that represents a physical microcontroller unit.
 ///
 /// Created by consuming an `McuConfig` which already contains the interface.
@@ -32,7 +37,7 @@ use tracing::{debug, error, info, warn};
 /// turns a freshly created object into a usable one; the typed command API
 /// ([`Mcu::send_msg`] / [`Mcu::call_msg`]) refuses to run before that. The
 /// handshake that produces the dictionary is a feature — see
-/// [`feature::identify::connect`](crate::core::klippy::feature::identify::connect).
+/// [`feature::identify::connect`].
 pub struct Mcu {
     /// MCU name
     name: String,

@@ -1,6 +1,6 @@
 # MCU 协议与数据字典
 
-`mcu` 层负责与一颗物理 MCU 通信，并在握手后把固件自述的协议变成可用的类型化接口。`feature` 层则在这一层之上定义「有哪些命令、它们是什么意思」。
+`mcu` 层负责与一颗物理 MCU 通信，并在握手后把固件自述的协议变成可用的类型化接口。它的子模块 `mcu::feature` 则定义「有哪些命令、它们是什么意思」。
 
 ## 核心约束
 
@@ -11,12 +11,12 @@
 ## 数据流
 
 ```
-                      ┌─────────────── feature ───────────────┐
-                      │ ClockSync / McuClock / …              │
-                      │  call_msg::<GetClock, ClockState>()   │
-                      └───────────────┬───────────────────────┘
-                                      │ McuCommand / McuResponse
-                                      ▼
+                     ┌──────────── mcu::feature ────────────┐
+                     │ ClockSync / McuClock / …             │
+                     │ call_msg::<GetClock, ClockState>()   │
+                     └───────────────┬──────────────────────┘
+                                     │ McuCommand / McuResponse
+                                     ▼
    ┌──────────────────────────── Mcu ────────────────────────────┐
    │ Parser（共享注册表）   Dictionary（枚举/常量/消息表）          │
    │ send()／call()          PendingCalls（请求响应配对）           │
@@ -46,7 +46,7 @@
 
 `Mcu` 不是 `Clone`，并且实现了 `Drop`：最后一个句柄被释放时调用 `Interface::shutdown()` 并 abort 接收任务。因此特性层统一持有 `Arc<Mcu>`，不要克隆。
 
-`Mcu` 自己不执行握手：字典从哪来是协议知识，属于特征层。正常入口是 [`feature::identify::connect`](identify.md)，它建连、握手、装着字典后返回 `Arc<Mcu>`。
+`Mcu` 自己不执行握手：字典从哪来是协议知识，属于 `mcu::feature`。正常入口是 [`feature::identify::connect`](identify.md)，它建连、握手、装着字典后返回 `Arc<Mcu>`。
 
 ### 裸接口与类型化接口
 
@@ -157,7 +157,7 @@ pub trait ClockSync {
 
 - 特征 trait 用 `impl Future + Send` 而不是 `async fn`：`async fn` in trait 已稳定但不是 dyn-safe，且 `Send` 会变成隐式假设（触发 `async_fn_in_trait` lint）。显式写出后，返回值可直接用于 `tokio::spawn`。
 - 特征由 `Arc<Mcu>` 构造，多个特征可共用一个 MCU。
-- trait 也是一道测试缝：`feature::clock` 的测试里就有一个不依赖 MCU 的 `FixedClock` 实现。
+- trait 也是一道测试缝：`mcu::feature::clock` 的测试里就有一个不依赖 MCU 的 `FixedClock` 实现。
 
 ## 新增一条命令的步骤
 

@@ -1,29 +1,29 @@
 # 内部架构
 
-本文描述 `msg` / `mcu` 两层实际运行的机制：帧如何被合并发出、入站消息如何路由、请求/响应如何配对。
+本文描述 `msg` / `mcu` 两层实际运行的机制：帧如何被合并发出、入站消息如何路由、请求/响应如何配对。其中 `mcu` 自下而上分两段：传输与字典（`mcu`）和说协议的特征（`mcu::feature`）。
 
 ## 总览
 
 ```
-                      ┌─────────────── feature ───────────────┐
-                      │ call_msg / send_msg                   │
-                      └───────────────┬───────────────────────┘
-                                      ▼
-   ┌──────────────────────────── Mcu ────────────────────────────┐
-   │ Parser（共享注册表）          Dictionary（消息表/枚举/常量）  │
-   │ send() ─► mpsc<Payload>       PendingCalls（请求响应配对）    │
-   │ call() ─► 注册 PendingCall                                    │
-   └──────┬───────────────────────────────────▲──────────────────┘
-          │                                   │
-   ┌──────▼───────┐                    ┌──────┴───────┐
-   │ 发送任务      │                    │ 接收任务      │
-   │ 合并批处理    │                    │ 校验/解码/路由│
-   └──────┬───────┘                    └──────▲───────┘
-          │ Frame                             │ Frame
-          ▼                                   │
-   ┌────────────── Interface（Device）────────────────────────────┐
-   │ send() / receive() 均在 spawn_blocking 中执行                │
-   └──────────────────────────────────────────────────────────────┘
+                     ┌─────────── mcu::feature ───────────┐
+                     │ call_msg / send_msg                │
+                     └───────────────┬────────────────────┘
+                                     ▼
+  ┌──────────────────────────── Mcu ────────────────────────────┐
+  │ Parser（共享注册表）          Dictionary（消息表/枚举/常量）  │
+  │ send() ─► mpsc<Payload>       PendingCalls（请求响应配对）    │
+  │ call() ─► 注册 PendingCall                                    │
+  └──────┬───────────────────────────────────▲──────────────────┘
+         │                                   │
+  ┌──────▼───────┐                    ┌──────┴───────┐
+  │ 发送任务      │                    │ 接收任务      │
+  │ 合并批处理    │                    │ 校验/解码/路由│
+  └──────┬───────┘                    └──────▲───────┘
+         │ Frame                             │ Frame
+         ▼                                   │
+  ┌────────────── Interface（Device）────────────────────────────┐
+  │ send() / receive() 均在 spawn_blocking 中执行                │
+  └───────────────────────────────────────────────────────┘
 ```
 
 一个 `Mcu` 启动两个 `tokio` 任务：发送任务消费 `mpsc<Payload>`，接收任务在 `interface.receive()` 上循环。`Parser` 的 `clone()` 共享同一份注册表，字典因此可以在任务启动之后再装载。
@@ -72,7 +72,7 @@ Frame ─► seq 校验 ─► Parser::decode ─► 逐条消息路由
 
 ## 数据字典的装载时机
 
-`Mcu::from_parts` 只注册 identify 一对；握手（`feature::identify`）完成后 `install_dictionary` 把命令与响应注册进 `Parser`。之所以不需要重启接收任务：
+`Mcu::from_parts` 只注册 identify 一对；握手（`mcu::feature::identify`）完成后 `install_dictionary` 把命令与响应注册进 `Parser`。之所以不需要重启接收任务：
 
 ```rust
 let parser_for_task = parser.clone();   // 同一个 Arc<Mutex<MsgMap>>
@@ -94,7 +94,7 @@ let parser_for_task = parser.clone();   // 同一个 Arc<Mutex<MsgMap>>
 
 ## 已实现与未实现
 
-已实现：帧收发与校验、合并发送、同步请求/响应、identify 握手与字典安装（`feature::identify`）、类型化消息与按名取参（`mcu::codec`）、`feature::clock`。
+已实现：帧收发与校验、合并发送、同步请求/响应、identify 握手与字典安装（`mcu::feature::identify`）、类型化消息与按名取参（`mcu::codec`）、`mcu::feature::clock`。
 
 未实现（详见 [MCU 协议与数据字典](mcu-protocol.md#当前未实现)）：事件 / 异步 `output` 投递、并发同名响应的区分、枚举参与 `ArgType` 编解码、命名参数。
 

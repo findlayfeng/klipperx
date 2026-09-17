@@ -73,6 +73,22 @@ impl Parser {
         Ok(())
     }
 
+    /// Register a batch of message formats.
+    ///
+    /// Registration stops at the first failure; messages registered before the
+    /// failure remain in place. This is intended for bulk-loading a message
+    /// table (e.g. a data dictionary) where a partial load is still useful for
+    /// diagnostics.
+    ///
+    /// # Errors
+    /// Returns the error of the first format that fails to register.
+    pub fn register_all(&mut self, msgs: &[(i16, &str)]) -> MsgResult<()> {
+        for (id, format) in msgs {
+            self.register(*id, format)?;
+        }
+        Ok(())
+    }
+
     /// Check whether a command name is registered in the parser.
     pub fn is_registered(&self, name: &str) -> bool {
         let map = match self.msgs.lock() {
@@ -295,6 +311,30 @@ mod tests {
         let mut parser = Parser::new();
         let result = parser.register(1, "CMD_A x=%u");
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_register_all() {
+        let mut parser = Parser::new();
+        parser
+            .register_all(&[(0, "CMD_A x=%u"), (1, "CMD_B"), (2, "CMD_C y=%.*s")])
+            .unwrap();
+
+        assert!(parser.is_registered("CMD_A"));
+        assert!(parser.is_registered("CMD_B"));
+        assert!(parser.is_registered("CMD_C"));
+        assert!(parser.encode("CMD_A", &[ArgValue::UInt32(7)]).is_ok());
+    }
+
+    #[test]
+    fn test_register_all_stops_at_first_failure() {
+        let mut parser = Parser::new();
+        // The second entry reuses an id that is already taken.
+        let result = parser.register_all(&[(0, "CMD_A x=%u"), (0, "CMD_B")]);
+
+        assert!(result.is_err());
+        assert!(parser.is_registered("CMD_A"));
+        assert!(!parser.is_registered("CMD_B"));
     }
 
     #[test]

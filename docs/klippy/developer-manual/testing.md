@@ -7,7 +7,7 @@
 ```bash
 cargo test --lib                      # 全部单元测试
 cargo test --lib mcu                  # mcu 层
-cargo test --lib cmd::clock          # 单个命令模块
+cargo test --lib cmd::tests          # 单个命令模块
 cargo test --lib test_install_skips   # 单个用例（按名过滤）
 ```
 
@@ -41,7 +41,7 @@ cargo test --lib test_install_skips   # 单个用例（按名过滤）
 |------|------|
 | `mod.rs` | `Params` 按名取参（含无参消息与 `declared()`）、无损转换与拒绝收窄、未声明参数报已声明列表、类型不符报两侧类型、字符串/字节互换与非法 UTF-8、`get_enum` 的命名 / `?<value>` 回退 / 两类错误；`send_msg` 的握手门禁、成功上线、未知消息、参数不匹配；`call_msg` 的往返解码、超时、未知响应名、解码失败 |
 | `identify.rs` | 无独立测试：两个视图由 `identify.rs` 的端到端测试覆盖（手工构造的请求帧会校验 `args()` 的 id / offset / count，回应帧走 `IdentifyChunk::decode`） |
-| `clock.rs` | 读取时钟、32 位回绕值、握手前失败、超时；另有不依赖 MCU 的 `ClockSync` 实现，验证 trait 作为测试缝可用 |
+| `clock.rs` | 读取时钟、32 位回绕值、握手前失败、超时；另有不依赖 MCU 的 `ClockSync` 实现，验证 trait 作为测试缝可用。**该文件目前不参与编译**（`pub mod clock;` 被注释），这 5 个测试与文件一起休眠，恢复时自动回归 |
 
 ## 写 MCU 相关测试的两个要点
 

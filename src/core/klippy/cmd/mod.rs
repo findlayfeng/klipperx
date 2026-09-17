@@ -6,8 +6,9 @@
 //!   [`McuResponse`] for the two directions, [`Params`] for reading response
 //!   parameters by name, and the typed calls [`Mcu::send_msg`] /
 //!   [`Mcu::call_msg`] that run them;
-//! * the command modules themselves: `clock` wraps `get_clock` / `clock`, the
-//!   next one will wrap `set_digital_out`, and so on.
+//! * the command modules themselves. None of them is compiled in at the moment:
+//!   `clock` (`get_clock` ↔ `clock`) is written but switched off — see the
+//!   commented-out declaration below.
 //!
 //! The transport in [`mcu`](crate::core::klippy::mcu) owns frames, the data
 //! dictionary, and the *bare* pair [`Mcu::send`](crate::core::klippy::mcu::Mcu::send) /
@@ -59,10 +60,13 @@
 //! [`Mcu::connect`](crate::core::klippy::mcu::Mcu::connect) — so several modules
 //! can use one MCU, and dropping the last handle shuts the device down.
 
-pub mod clock;
+// `clock` is deliberately out of the build for now: the file is kept as it was,
+// tests and all, but nothing here should depend on it yet. Bring it back by
+// uncommenting this declaration and the re-export below.
+// pub mod clock;
 pub mod identify;
 
-pub use clock::{ClockState, ClockSync, GetClock, McuClock};
+// pub use clock::{ClockState, ClockSync, GetClock, McuClock};
 
 use crate::core::klippy::mcu::{Dictionary, Enumeration, Mcu, McuError};
 use crate::core::klippy::msg::proto::{ArgType, ArgValue};
@@ -438,10 +442,6 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// The subset of a firmware dictionary these tests need.
-    ///
-    /// `GetClock` / `ClockState` are *not* redefined here: they are the real
-    /// types from [`clock`](super::clock), already in scope through the
-    /// `super::*` glob above.
     fn dictionary() -> Dictionary {
         Dictionary::from_json(json!({
             "commands": {
@@ -459,6 +459,34 @@ mod tests {
             }
         }))
         .unwrap()
+    }
+
+    /// `get_clock` / `clock clock=%u` — the smallest request/response pair.
+    ///
+    /// These tests only need *a* pair to exercise the typed calls, so the types
+    /// are defined here rather than taken from `clock.rs`, which is currently
+    /// out of the build.
+    struct GetClock;
+
+    impl McuCommand for GetClock {
+        const NAME: &'static str = "get_clock";
+        fn args(&self) -> Vec<ArgValue> {
+            Vec::new()
+        }
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct ClockState {
+        clock: u32,
+    }
+
+    impl McuResponse for ClockState {
+        const NAME: &'static str = "clock";
+        fn decode(params: &Params<'_>) -> Result<Self, McuError> {
+            Ok(Self {
+                clock: params.get_u32("clock")?,
+            })
+        }
     }
 
     /// `get_uptime` / `uptime high=%u clock=%u` — two parameters, so the

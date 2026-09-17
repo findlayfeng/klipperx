@@ -1,14 +1,28 @@
 use super::error::{MsgError, MsgResult};
 use super::proto::{ArgValue, Payload};
-use super::{MsgBase, MsgEntry};
+use super::MsgBase;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-#[derive(Debug)]
+/// Callback type for message handlers.
+type MsgCallback = Arc<Mutex<Box<dyn FnMut(&[ArgValue]) + Send>>>;
+
 pub struct Msg {
     id: u8,
     name: String,
-    command: MsgEntry,
+    base: MsgBase,
+    callback: Option<MsgCallback>,
+}
+
+impl std::fmt::Debug for Msg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Msg")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("base", &self.base)
+            .field("callback", &self.callback.is_some())
+            .finish()
+    }
 }
 
 /// Registry of messages indexed by both id and name.
@@ -59,18 +73,15 @@ impl Parser {
     }
 
     /// Register a message format with the given ID.
-    ///    /// The format string is parsed into a [`MsgBase`] and stored under both
-    /// its numeric `id` and its name. The command is always registered as a
-    /// [`MsgEntry::Base`], which can be used for outbound [`Self::send`]
-    /// calls. Use [`Self::bind`] to convert it to a [`MsgEntry::Handler`]
-    /// for inbound dispatch.
+    ///
+    /// The format string is parsed into a [`MsgBase`] and stored under both
+    /// its numeric `id` and its name. Use [`Self::bind`] to register a callback.
     ///
     /// # Errors
     /// Returns an error if the format string is invalid, or if the `id`
     /// or the parsed command name is already registered.
     pub fn register(&mut self, id: u8, format: &str) -> MsgResult<()> {
         let (name, base) = MsgBase::parse(format)?;
-        let cmd = MsgEntry::Base(base);
 
         let mut map = self
             .msgs
@@ -80,7 +91,8 @@ impl Parser {
         map.try_insert(Msg {
             id,
             name,
-            command: cmd,
+            base,
+            callback: None,
         })
         .map_err(|e| MsgError::new(e.to_string()))?;
 
@@ -117,13 +129,13 @@ impl Parser {
             .remove(&id)
             .ok_or_else(|| MsgError::new(format!("Msg not found: {}", cmd_name)))?;
 
-        // We own this Arc (just removed from the map under Mutex), so try_unwrap always succeeds
         let msg = Arc::try_unwrap(arc_msg).unwrap_or_else(|_| unreachable!("ref count should be 1"));
-        let command = msg.command.with_callback(callback);
+        let callback: MsgCallback = Arc::new(Mutex::new(Box::new(callback)));
         map.try_insert(Msg {
             id: msg.id,
             name: msg.name,
-            command,
+            base: msg.base,
+            callback: Some(callback),
         })
         .map_err(|e| MsgError::new(e))?;
 
@@ -147,10 +159,7 @@ impl Parser {
             .get_by_name(name)
             .ok_or_else(|| MsgError::new(format!("Unknown message name: {}", name)))?;
 
-        let param_types = match &msg.command {
-            MsgEntry::Base(base) => base.params(),
-            MsgEntry::Handler(handler) => handler.params(),
-        };
+        let param_types = msg.base.params();
 
         if values.len() != param_types.len() {
             return Err(MsgError::new(format!(
@@ -199,10 +208,7 @@ impl Parser {
                 .ok_or_else(|| MsgError::new(format!("Unknown message id: {}", id)))?;
 
             // Decode parameters according to the message's parameter types
-            let param_types = match &arc_msg.command {
-                MsgEntry::Base(base) => base.params(),
-                MsgEntry::Handler(handler) => handler.params(),
-            };
+            let param_types = arc_msg.base.params();
 
             let mut values = Vec::with_capacity(param_types.len());
             for (_, arg_type) in param_types {
@@ -235,7 +241,8 @@ mod tests {
         map.try_insert(Msg {
             id: 1,
             name: "CMD_A".to_string(),
-            command: MsgEntry::Base(MsgBase::parse("CMD_A x=%u").unwrap().1),
+            base: MsgBase::parse("CMD_A x=%u").unwrap().1,
+            callback: None,
         }).unwrap();
 
         assert!(map.get_by_id(&1).is_some());
@@ -250,13 +257,15 @@ mod tests {
         map.try_insert(Msg {
             id: 1,
             name: "CMD_A".to_string(),
-            command: MsgEntry::Base(MsgBase::new(vec![])),
+            base: MsgBase::new(vec![]),
+            callback: None,
         }).unwrap();
 
         let result = map.try_insert(Msg {
             id: 1,
             name: "CMD_B".to_string(),
-            command: MsgEntry::Base(MsgBase::new(vec![])),
+            base: MsgBase::new(vec![]),
+            callback: None,
         });
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("duplicate id"));
@@ -268,13 +277,15 @@ mod tests {
         map.try_insert(Msg {
             id: 1,
             name: "CMD_A".to_string(),
-            command: MsgEntry::Base(MsgBase::new(vec![])),
+            base: MsgBase::new(vec![]),
+            callback: None,
         }).unwrap();
 
         let result = map.try_insert(Msg {
             id: 2,
             name: "CMD_A".to_string(),
-            command: MsgEntry::Base(MsgBase::new(vec![])),
+            base: MsgBase::new(vec![]),
+            callback: None,
         });
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("duplicate name"));
@@ -287,15 +298,13 @@ mod tests {
         map.try_insert(Msg {
             id: 42,
             name: "TEST".to_string(),
-            command: MsgEntry::Base(base),
+            base,
+            callback: None,
         }).unwrap();
 
         let msg = map.get_by_name("TEST").unwrap();
         assert_eq!(msg.id, 42);
-        let param_len = match &msg.command {
-            MsgEntry::Base(b) => b.params().len(),
-            MsgEntry::Handler(h) => h.params().len(),
-        };
+        let param_len = msg.base.params().len();
         assert_eq!(param_len, 2);
     }
 

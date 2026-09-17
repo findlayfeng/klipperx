@@ -167,17 +167,33 @@ impl Mcu {
                     None => break,
                 };
 
-                if frame.seq() != (seq & 0xf) {
+                // The MCU stamps every frame it sends while handling a block with
+                // that block's sequence, so one request can produce several frames
+                // sharing a sequence: a response per message, plus the ack that
+                // carries no payload. Sequence numbers therefore identify the block
+                // being answered, not the individual frame, and only ever move
+                // forward — a frame is either another answer to the block we are
+                // waiting on (`seq`), or the first answer to the block after it
+                // (`seq + 1`). Klipper's client tracks the same thing with a send
+                // window; this transport sends one block at a time and never
+                // retransmits, so the window collapses to those two values.
+                if frame.seq() != seq && frame.seq() != (seq + 1) & 0xf {
                     warn!(
-                        "Seq mismatch: expected {}, got {}",
-                        seq & 0xf,
+                        "Seq mismatch: expected {} or {}, got {}",
+                        seq,
+                        (seq + 1) & 0xf,
                         frame.seq()
                     );
-                    seq += 1;
                     continue;
                 }
+                seq = frame.seq();
 
-                seq += 1;
+                // An empty frame is the MCU's acknowledgement of a block: it exists
+                // to advance the sequence, and carries nothing to decode.
+                if frame.payload().is_empty() {
+                    debug!("Ack for block {}", frame.seq());
+                    continue;
+                }
 
                 let decoded = match parser_for_task.decode(frame.into()) {
                     Ok(msgs) => {
@@ -489,6 +505,89 @@ mod tests {
         assert!(!mcu.is_identified());
         assert!(mcu.parser.is_registered("identify"));
         assert!(mcu.parser.is_registered("identify_response"));
+    }
+
+    /// The shapes a real MCU produces for one request: the response, and the ack
+    /// that carries no payload at all.
+    #[tokio::test]
+    async fn test_acks_and_repeated_sequences_are_accepted() {
+        let mut parser = Parser::new();
+        parser.register(5, "get_clock").unwrap();
+        parser.register(18, "clock clock=%u").unwrap();
+
+        let request = make_frame(0, &[5]);
+        let mut answer = Payload::new();
+        answer.push_i16(18).unwrap();
+        answer.push_u32(0x1234).unwrap();
+
+        // The firmware stamps everything it sends while handling a block with that
+        // block's sequence, so the ack repeats the response's sequence. A transport
+        // that expected a new number per frame would drop the ack, advance its
+        // counter, and then reject the next exchange's answer.
+        let device = TestDevice::new(vec![
+            MappingEntry {
+                input: request.clone(),
+                outputs: vec![
+                    make_frame(0, &answer.clone().into_raw()),
+                    make_frame(0, &[]), // ack: no payload
+                ],
+            },
+            MappingEntry {
+                input: make_frame(1, &[5]),
+                outputs: vec![make_frame(1, &answer.into_raw())],
+            },
+        ]);
+        let mcu = Mcu::for_test("test_mcu", Interface::new(device));
+        let dictionary = Dictionary::from_json(serde_json::json!({
+            "commands": {"get_clock": 5},
+            "responses": {"clock clock=%u": 18}
+        }))
+        .unwrap();
+        mcu.install_dictionary(dictionary).unwrap();
+
+        // Both exchanges have to complete: the first proves the ack was ignored
+        // rather than counted, the second proves it did not desynchronise the
+        // stream.
+        for _ in 0..2 {
+            let params = mcu
+                .call("get_clock", &[], "clock", Duration::from_millis(500))
+                .await
+                .expect("both exchanges must complete");
+            assert_eq!(params, vec![ArgValue::UInt32(0x1234)]);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_stale_sequence_is_dropped() {
+        let mut parser = Parser::new();
+        parser.register(5, "get_clock").unwrap();
+        parser.register(18, "clock clock=%u").unwrap();
+        let mut answer = Payload::new();
+        answer.push_i16(18).unwrap();
+        answer.push_u32(1).unwrap();
+
+        // A frame numbered well behind the block being answered is not part of
+        // this exchange, so it is dropped and the call times out.
+        let device = TestDevice::new(vec![MappingEntry {
+            input: make_frame(0, &[5]),
+            outputs: vec![make_frame(9, &answer.into_raw())],
+        }]);
+        let mcu = Mcu::for_test("test_mcu", Interface::new(device));
+        let dictionary = Dictionary::from_json(serde_json::json!({
+            "commands": {"get_clock": 5},
+            "responses": {"clock clock=%u": 18}
+        }))
+        .unwrap();
+        mcu.install_dictionary(dictionary).unwrap();
+
+        let err = mcu
+            .call("get_clock", &[], "clock", Duration::from_millis(50))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, McuCallError::Timeout(_)),
+            "expected a timeout, got {err:?}"
+        );
     }
 
     // -----------------------------------------------------------------------

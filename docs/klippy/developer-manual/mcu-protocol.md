@@ -191,6 +191,7 @@ identify 是唯一的例外：它不在这一层，格式由主机自有、且�
 | 并发同名响应 | `PendingCalls` 只按响应名匹配，先到先得；两个并发 `get_clock` 会互相抢答，需要 `oid` 之类的区分参数 |
 | 枚举参与编解码 | `ArgType` 没有枚举变体，枚举只在 `Params::get_enum` 与 `Dictionary` 里手工解析 |
 | 命名参数 | `Param` 类型已定义但未接入 `Parser::encode` |
+| 固件重启 | `McuConfig.restart_method` 已解析并保留在配置里，但**尚无重启路径**读取它（`Mcu::new` 明确忽略）。这是计划中的功能，实现时按该字段分派，不要当死代码删掉 |
 
 ---
 

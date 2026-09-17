@@ -1,4 +1,13 @@
 /// MCU restart method
+///
+/// **Not implemented yet.** This is a planned feature: the value is parsed from the
+/// config file and carried in [`McuConfig`](crate::core::klippy::config::mcu::McuConfig)
+/// so that a printer config using `restart_method` keeps loading, but nothing reads
+/// it — no firmware restart path exists yet.
+///
+/// When that path is implemented (Klipper's `mcu.py` restart / `config_reset`),
+/// this enum is what it will switch on. Do not remove it as dead code in the
+/// meantime.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum McuRestartMethod {
     /// Toggle DTR (common on Arduino boards and clones)

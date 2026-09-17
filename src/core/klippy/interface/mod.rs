@@ -17,7 +17,7 @@ pub trait Device: Send + Sync {
 /// At runtime, this is either:
 /// - `Test(TestDevice)` — when building for tests
 /// - `Stub(StubDevice)` — for all other builds
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub enum Interface {
     #[cfg(test)]
     Test(Arc<TestDevice>),

@@ -21,6 +21,7 @@ pub struct MappingEntry {
 /// shared through an outer `Mutex` (e.g. `Arc<Mutex<TestDevice>>` in
 /// `Interface::run()`). Each field that needs `Sync` is individually protected
 /// (e.g. `mapping` uses its own `Mutex` since `VecDeque` is not `Sync`).
+#[derive(Debug)]
 pub struct TestDevice {
     /// `crossbeam::channel::Sender` is `Clone + Send + Sync` — direct field.
     buf_tx: Sender<Frame>,

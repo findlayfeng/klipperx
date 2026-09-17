@@ -7,9 +7,9 @@ mod restart_method;
 
 // Keep this declaration free of a doc comment: rustdoc resolves links in a
 // module's documentation against the scope its `mod` declaration lives in, so an
-// outer `///` here would push the links in `feature`'s own docs into `mcu`'s
+// outer `///` here would push the links in `cmd`'s own docs into `mcu`'s
 // scope (where `identify` names the private transport module).
-pub mod feature;
+pub mod cmd;
 
 pub use codec::{McuCommand, McuResponse, Params};
 pub use dictionary::{Dictionary, Enumeration, MessageDef, OutputDef};
@@ -36,8 +36,8 @@ use tracing::{debug, error, info, warn};
 /// learned from the MCU's data dictionary. [`Mcu::install_dictionary`] is what
 /// turns a freshly created object into a usable one; the typed command API
 /// ([`Mcu::send_msg`] / [`Mcu::call_msg`]) refuses to run before that. The
-/// handshake that produces the dictionary is a feature — see
-/// [`feature::identify::connect`].
+/// handshake that produces the dictionary is a command module — see
+/// [`cmd::identify::connect`].
 pub struct Mcu {
     /// MCU name
     name: String,

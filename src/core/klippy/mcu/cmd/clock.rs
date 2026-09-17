@@ -80,7 +80,7 @@ pub struct McuClock {
 }
 
 impl McuClock {
-    /// Create a clock feature for `mcu`, using [`CLOCK_TIMEOUT`].
+    /// Create a [`ClockSync`] for `mcu`, using [`CLOCK_TIMEOUT`].
     pub fn new(mcu: Arc<Mcu>) -> Self {
         Self {
             mcu,
@@ -94,7 +94,7 @@ impl McuClock {
         self
     }
 
-    /// The MCU this feature talks to.
+    /// The MCU this module talks to.
     pub fn mcu(&self) -> &Arc<Mcu> {
         &self.mcu
     }
@@ -125,7 +125,7 @@ mod tests {
     use crate::core::klippy::msg::proto::Payload;
     use serde_json::json;
 
-    /// Only the messages this feature needs, as the firmware would publish them.
+    /// Only the messages this module needs, as the firmware would publish them.
     fn dictionary() -> Dictionary {
         Dictionary::from_json(json!({
             "commands": {"get_clock": 5},
@@ -216,7 +216,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// A `ClockSync` implementation with no MCU behind it, which is the reason
-    /// the feature is expressed as a trait.
+    /// the capability is expressed as a trait.
     struct FixedClock(u32);
 
     impl ClockSync for FixedClock {

@@ -1,4 +1,4 @@
-//! Identify handshake — the bootstrap feature.
+//! Identify handshake — the bootstrap command module.
 //!
 //! The identify mechanism establishes communication by exchanging a
 //! JSON-formatted configuration and command description from the MCU to the host.
@@ -16,12 +16,12 @@
 //! with `identify_response` carrying the offset and data chunk. When the offset
 //! equals the total data length and the data is empty, the exchange is complete.
 //!
-//! # Why this is a feature
+//! # Why this lives here
 //!
 //! This is the one exchange that runs *before* a data dictionary exists, so it
 //! cannot use the ordinary typed call path — it goes through
 //! `Mcu::call_msg_ungated` instead. Everything else about it looks like any
-//! other feature: typed message views (`IdentifyRequest`, `IdentifyChunk`) plus
+//! other command module: typed message views (`IdentifyRequest`, `IdentifyChunk`) plus
 //! protocol logic, which is why it lives here rather than in `mcu`.
 //!
 //! It deliberately has no capability trait, unlike [`ClockSync`](super::ClockSync):
@@ -264,7 +264,7 @@ impl McuIdentify {
 ///
 /// This is the normal entry point: it connects, fetches the firmware's data
 /// dictionary, and installs it, leaving a fully usable MCU. The handle is an
-/// [`Arc`] because features share it — dropping the last one shuts the device
+/// [`Arc`] because command modules share it — dropping the last one shuts the device
 /// down.
 ///
 /// # Errors

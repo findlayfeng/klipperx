@@ -1,6 +1,6 @@
 # MCU 协议与数据字典
 
-`mcu` 层负责与一颗物理 MCU 通信，并在握手后把固件自述的协议变成可用的类型化接口。它的子模块 `mcu::feature` 则定义「有哪些命令、它们是什么意思」。
+`mcu` 层负责与一颗物理 MCU 通信，并在握手后把固件自述的协议变成可用的类型化接口。它的子模块 `mcu::cmd` 则定义「有哪些命令、它们是什么意思」。
 
 ## 核心约束
 
@@ -11,7 +11,7 @@
 ## 数据流
 
 ```
-                     ┌──────────── mcu::feature ────────────┐
+                     ┌────────────── mcu::cmd ──────────────┐
                      │ ClockSync / McuClock / …             │
                      │ call_msg::<GetClock, ClockState>()   │
                      └───────────────┬──────────────────────┘
@@ -46,7 +46,7 @@
 
 `Mcu` 不是 `Clone`，并且实现了 `Drop`：最后一个句柄被释放时调用 `Interface::shutdown()` 并 abort 接收任务。因此特性层统一持有 `Arc<Mcu>`，不要克隆。
 
-`Mcu` 自己不执行握手：字典从哪来是协议知识，属于 `mcu::feature`。正常入口是 [`feature::identify::connect`](identify.md)，它建连、握手、装着字典后返回 `Arc<Mcu>`。
+`Mcu` 自己不执行握手：字典从哪来是协议知识，属于 `mcu::cmd`。正常入口是 [`cmd::identify::connect`](identify.md)，它建连、握手、装着字典后返回 `Arc<Mcu>`。
 
 ### 裸接口与类型化接口
 
@@ -147,7 +147,7 @@ mcu.send_msg(&SetDigitalOut { oid, value })?;
 
 `call_msg` 在发送**之前**就解析命令名与响应名，所以固件不实现的消息会立刻失败，而不是白等一个超时。
 
-## 特征层：把消息包装成能力
+## 命令层：把消息包装成能力
 
 ```rust
 pub trait ClockSync {
@@ -155,16 +155,16 @@ pub trait ClockSync {
 }
 ```
 
-- 特征 trait 用 `impl Future + Send` 而不是 `async fn`：`async fn` in trait 已稳定但不是 dyn-safe，且 `Send` 会变成隐式假设（触发 `async_fn_in_trait` lint）。显式写出后，返回值可直接用于 `tokio::spawn`。
-- 特征由 `Arc<Mcu>` 构造，多个特征可共用一个 MCU。
-- trait 也是一道测试缝：`mcu::feature::clock` 的测试里就有一个不依赖 MCU 的 `FixedClock` 实现。
+- 能力 trait 用 `impl Future + Send` 而不是 `async fn`：`async fn` in trait 已稳定但不是 dyn-safe，且 `Send` 会变成隐式假设（触发 `async_fn_in_trait` lint）。显式写出后，返回值可直接用于 `tokio::spawn`。
+- 命令模块由 `Arc<Mcu>` 构造，多个模块可共用一个 MCU。
+- trait 也是一道测试缝：`mcu::cmd::clock` 的测试里就有一个不依赖 MCU 的 `FixedClock` 实现。
 
 ## 新增一条命令的步骤
 
 1. **确认固件协议**：在固件的 `.dict`（或生成的字典）里找到 `commands` / `responses` 中的格式串，记下消息名与参数名。**不要**把它们抄成主机侧的常量。
-2. **定义消息类型**：在所属 feature 文件里实现 `McuCommand` / `McuResponse`，只写 `NAME` 与 `args()` / `decode()`。
-3. **定义或扩展能力 trait**：在特征层暴露一个语义化方法（如 `get_clock`），并提供一个 `Mcu*` 实现调 `Mcu::call_msg` / `send_msg`。
-4. **不需要手工注册**：[`feature::identify::connect`](identify.md) 会把字典里所有命令与响应装进 `Parser`。
+2. **定义消息类型**：在所属 `cmd` 模块里实现 `McuCommand` / `McuResponse`，只写 `NAME` 与 `args()` / `decode()`。
+3. **定义或扩展能力 trait**：在命令层暴露一个语义化方法（如 `get_clock`），并提供一个 `Mcu*` 实现调 `Mcu::call_msg` / `send_msg`。
+4. **不需要手工注册**：[`cmd::identify::connect`](identify.md) 会把字典里所有命令与响应装进 `Parser`。
 5. **补测试**：用 `TestDevice` 的 `MappingEntry` 构造期望的收发帧（见下）。
 
 ### 测试要点：帧序号

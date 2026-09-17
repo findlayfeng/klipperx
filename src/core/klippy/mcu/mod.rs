@@ -8,8 +8,9 @@ use crate::core::klippy::config::mcu::McuConfig;
 use crate::core::klippy::frame::{Frame, MESSAGE_PAYLOAD_MAX};
 use crate::core::klippy::interface::Interface;
 use crate::core::klippy::mcu::identify::DEFAULT_MESSAGES;
+use crate::core::klippy::msg::error::MsgError;
 use crate::core::klippy::msg::parser::Parser;
-use crate::core::klippy::msg::proto::Payload;
+use crate::core::klippy::msg::proto::{ArgValue, Payload};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::{sleep, Duration};
@@ -22,68 +23,26 @@ pub struct Mcu {
     name: String,
     /// Message parser for communication
     parser: Parser,
-    /// Communication interface to the MCU
-    interface: Interface,
     /// Parsed identify data from the MCU (populated after identify handshake)
     identify: Arc<Mutex<Option<Identify>>>,
-}
-
-impl From<McuConfig> for Mcu {
-    fn from(value: McuConfig) -> Self {
-        let mut mcu: Self = (value.name, value.interface).into();
-
-        for (id, fmt) in DEFAULT_MESSAGES {
-            mcu.parser
-                .register(*id, fmt)
-                .expect("default identify message format must be valid");
-        }
-
-        mcu
-    }
-}
-
-impl From<(String, Interface)> for Mcu {
-    fn from((name, interface): (String, Interface)) -> Self {
-        Self {
-            name,
-            parser: Parser::new(),
-            interface,
-            identify: Arc::new(Mutex::new(None)),
-        }
-    }
+    /// Sender for outbound payload queue
+    send_buf_tx: mpsc::Sender<Payload>,
 }
 
 impl Mcu {
-    /// Send a batched payload to the MCU.
-    ///
-    /// Increments the sequence number on success, logs errors.
-    async fn send_batch(interface: &Interface, seq: &mut u8, payload: Payload) {
-        let seq_num = *seq;
-        match interface
-            .send(Frame::new(seq_num, payload.into_raw()))
-            .await
-        {
-            Ok(()) => *seq = (seq_num + 1) & 0xf,
-            Err(e) => eprintln!("[mcu:{seq_num}] send failed: {e}"),
+    /// Initialize the parser with default identify messages.
+    fn init_parser(parser: &mut Parser) {
+        for (id, fmt) in DEFAULT_MESSAGES {
+            parser
+                .register(*id, fmt)
+                .expect("default identify message format must be valid");
         }
     }
 
-    /// Get the MCU name.
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    /// Run the MCU communication loop in a separate async task.
-    ///
-    /// This method shares the MCU state via Arc and spawns a new tokio task
-    /// that runs the main communication loop. The loop batches outbound payloads
-    /// until the buffer is sufficiently full or a timeout expires, then sends them.
-    ///
-    /// Returns a sender channel for batching outbound payloads before sending.
-    /// When the sender is dropped, the task will clean up automatically.
-    pub fn run(&self) -> mpsc::Sender<Payload> {
-        let interface = self.interface.clone();
+    /// Create a new MCU from a name and interface.
+    fn from_parts(name: String, interface: Interface) -> Self {
         let (send_buf_tx, mut send_buf_rx) = mpsc::channel::<Payload>(32);
+        let interface_for_send = interface.clone();
 
         tokio::spawn(async move {
             let mut seq = 0u8;
@@ -109,7 +68,7 @@ impl Mcu {
                                 Some(next_payload) => {
                                     if payload.try_merge(&next_payload).is_err() {
                                         // Merge failed (would exceed max), send current batch first
-                                        Self::send_batch(&interface, &mut seq, payload).await;
+                                        Self::send_batch(&interface_for_send, &mut seq, payload).await;
                                         // Start new batch with next
                                         payload = next_payload;
                                         continue;
@@ -129,10 +88,81 @@ impl Mcu {
                 }
 
                 // send the batched payload to the MCU
-                Self::send_batch(&interface, &mut seq, payload).await;
+                Self::send_batch(&interface_for_send, &mut seq, payload).await;
             }
         });
 
-        send_buf_tx
+        let mut parser = Parser::new();
+        Self::init_parser(&mut parser);
+        let parser_for_task = parser.clone();
+
+        tokio::spawn(async move {
+            let mut seq = 0u8;
+
+            loop {
+                let frame = interface.receive().await;
+                if frame.seq() != seq {
+                    todo!()
+                }
+
+                seq += 1;
+
+                let _ = parser_for_task.decode(frame.into()).expect("todo");
+            }
+        });
+
+        Self {
+            name,
+            parser,
+            identify: Arc::new(Mutex::new(None)),
+            send_buf_tx,
+        }
+    }
+
+    /// Send a batched payload to the MCU.
+    ///
+    /// Increments the sequence number on success, logs errors.
+    async fn send_batch(interface: &Interface, seq: &mut u8, payload: Payload) {
+        let seq_num = *seq;
+        match interface
+            .send(Frame::new(seq_num, payload.into_raw()))
+            .await
+        {
+            Ok(()) => *seq = (seq_num + 1) & 0xf,
+            Err(e) => eprintln!("[mcu:{seq_num}] send failed: {e}"),
+        }
+    }
+
+    /// Get the MCU name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Encode and send a command to the MCU.
+    ///
+    /// Converts the command name and arguments to a [`Payload`] using the
+    /// registered message format, then queues it for sending.
+    ///
+    /// # Errors
+    /// Returns [`MsgError`] if the message name is unknown, the arguments
+    /// don't match the expected parameter count, or the send buffer is full.
+    pub fn send(&self, name: &str, args: &[ArgValue]) -> Result<(), MsgError> {
+        let payload = self.parser.encode(name, args)?;
+        self.send_buf_tx
+            .try_send(payload)
+            .map_err(|e| MsgError::new(e.to_string()))?;
+        Ok(())
+    }
+}
+
+impl From<McuConfig> for Mcu {
+    fn from(value: McuConfig) -> Self {
+        Self::from_parts(value.name, value.interface)
+    }
+}
+
+impl From<(String, Interface)> for Mcu {
+    fn from((name, interface): (String, Interface)) -> Self {
+        Self::from_parts(name, interface)
     }
 }

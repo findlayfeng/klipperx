@@ -12,6 +12,8 @@
 // Frame constants
 // ===========================================================================
 
+use crate::core::klippy::Payload;
+
 /// Minimum frame length.
 pub const MESSAGE_MIN: usize = 5;
 /// Maximum frame length.
@@ -89,6 +91,12 @@ pub struct Frame {
     seq: u8,
     /// Payload data between header and trailer.
     payload: Vec<u8>,
+}
+
+impl Into<Payload> for Frame {
+    fn into(self) -> Payload {
+        Payload::from_raw(self.payload)
+    }
 }
 
 impl Frame {

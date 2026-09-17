@@ -27,15 +27,15 @@ Identify 是 Klipper 主机端（klippy）与 MCU 端（固件）之间建立通
 | 内容 | 位置 |
 |------|------|
 | 主机侧格式定义（唯一的硬编码例外） | `mcu::identify::IDENTIFY_MESSAGES` |
-| 握手协议、分块、解压、安装字典 | `feature::identify` |
+| 握手协议、分块、解压、安装字典 | `mcu::feature::identify` |
 
-字典属于协议知识，而 identify 是唯一在字典存在之前运行的交换，因此它按特征层的方式书写：类型化消息视图（`IdentifyRequest` / `IdentifyChunk`）加协议逻辑，只是走 [`Mcu::call_msg_ungated`](mcu-protocol.md) 而不是普通的 `call_msg`。
+字典属于协议知识，而 identify 是唯一在字典存在之前运行的交换，因此它按特征的方式书写：类型化消息视图（`IdentifyRequest` / `IdentifyChunk`）加协议逻辑，只是走 [`Mcu::call_msg_ungated`](mcu-protocol.md) 而不是普通的 `call_msg`。
 
 ## Rust API
 
 ```rust
 // 正常入口：建连 + 握手 + 安装字典，返回可共享的句柄
-let mcu: Arc<Mcu> = feature::identify::connect(config).await?;
+let mcu: Arc<Mcu> = mcu::feature::identify::connect(config).await?;
 
 // 需要自定义超时、重试，或先看原始负载
 let mcu = Arc::new(Mcu::from(config));

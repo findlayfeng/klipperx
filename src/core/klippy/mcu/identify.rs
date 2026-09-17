@@ -8,8 +8,7 @@
 //!
 //! The protocol that drives them — chunked requests, decompression, and
 //! dictionary installation — is a feature, since it is host-side protocol logic
-//! rather than transport: see
-//! [`feature::identify`](crate::core::klippy::feature::identify).
+//! rather than transport: see [`feature::identify`](super::feature::identify).
 //!
 //! Both entries are repeated verbatim in the firmware-provided dictionary, so
 //! installing that dictionary must skip messages which are already registered

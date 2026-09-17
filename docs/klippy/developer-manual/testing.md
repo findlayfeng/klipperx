@@ -35,6 +35,7 @@ cargo test --lib test_install_skips   # 单个用例（按名过滤）
 
 | 模块 | 覆盖 |
 |------|------|
+| `identify.rs` | 无独立测试：两个视图由 `mcu::identify` 的端到端测试覆盖（手工构造的请求帧会校验 `args()` 的 id / offset / count，回应帧走 `IdentifyChunk::decode`） |
 | `clock.rs` | 读取时钟、32 位回绕值、握手前失败、超时；另有不依赖 MCU 的 `ClockSync` 实现，验证 trait 作为测试缝可用 |
 
 ## 写 MCU 相关测试的两个要点

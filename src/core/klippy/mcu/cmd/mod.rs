@@ -18,18 +18,22 @@
 //! | `mcu` | frames, the data dictionary, typed message access | only the identify pair |
 //! | `mcu::cmd` | *which* messages exist and what they mean | the firmware protocol |
 //!
-//! The dependency still points one way: `cmd` uses `Mcu`, and the transport and
-//! dictionary code never mention a command module. `mcu` only declares the
-//! module.
+//! The dependency runs one way for everything that is a *capability*: a command
+//! module uses `Mcu`, while the frame, dictionary, and codec code never mention
+//! one. The single edge back is identify — `mcu::identify` drives the pair defined
+//! in `cmd::identify`, because that exchange belongs to the transport (it is the
+//! one command whose formats the host owns, and it runs before any dictionary
+//! exists).
 //!
 //! Because the host learns every format from the firmware, a command module
 //! never hard-codes a format string or a wire id: it names the message and its
 //! parameters, and the dictionary supplies the rest.
 //!
-//! Identify is deliberately absent: it is the bootstrap exchange that *produces*
-//! the dictionary, its formats are host-owned, and it runs before
-//! [`Mcu::call_msg`](super::Mcu::call_msg) is usable. It therefore lives with the
-//! transport, in `mcu::identify`, driven by [`Mcu::connect`](super::Mcu::connect).
+//! Identify is here even though its *transfer* is not: the pair
+//! (`identify` / `identify_response`) is the bootstrap exchange that produces the
+//! dictionary, so its formats are host-owned and its chunk loop lives with the
+//! transport in `mcu::identify`. What stays in the command layer is the part
+//! every command has — the typed view and the arguments it sends.
 //!
 //! # Adding a command module
 //!
@@ -42,5 +46,6 @@
 //! dropping the last handle shuts the device down.
 
 pub mod clock;
+pub mod identify;
 
 pub use clock::{ClockState, ClockSync, GetClock, McuClock};

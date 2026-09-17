@@ -28,13 +28,13 @@ Identify 是 Klipper 主机端（klippy）与 MCU 端（固件）之间建立通
 
 | 内容 | 位置 |
 |------|------|
-| 主机侧格式定义（唯一的硬编码例外） | `IDENTIFY_MESSAGES` |
-| 类型化消息视图 | `IdentifyRequest` / `IdentifyChunk`（`McuCommand` / `McuResponse`） |
-| 分块请求、拼接、解压、JSON 解析 | `Identify::fetch` |
+| 命令定义（类型化视图、`count` 参数） | `mcu::cmd::identify`：`IdentifyRequest` / `IdentifyChunk` |
+| 主机侧格式定义（唯一的硬编码例外） | `mcu::identify::IDENTIFY_MESSAGES` |
+| 分块请求、拼接、解压、JSON 解析 | `mcu::identify::Identify::fetch` |
 | 抓取 + 建字典 + 安装 | `Mcu::identify` |
 | 建连 + 握手（常用入口） | `Mcu::connect` |
 
-**为什么不是命令模块**：命令层放的是「格式来自字典、通过普通类型化调用路径执行」的命令；identify 两点都相反——格式由主机自有（字典无法描述传递字典的那条消息），且运行在字典存在之前，`Mcu::call_msg` 那时还会拒绝执行，只能走 `Mcu::call_msg_ungated`。分块循环也不是能力，而是「把 N..N+40 这段字节取回来拼起来」的链路层工作，因此与格式定义放在一起。
+拆成两处的理由：**命令的定义**（名称、参数、解码）与其它命令一样放在命令层 `cmd`；**分片驱动**不是命令的一部分——一条 `identify` 只请求一个窗口 `offset..offset+40`，把一串这样的回应拼成负载是链路层的事——所以它和主机自有的格式定义一起留在 `mcu::identify`。这也是唯一一处 `mcu` 反向引用 `cmd`：因为 identify 是唯一在字典存在之前运行的交换，`Mcu::call_msg` 那时还会拒绝执行，只能走 `Mcu::call_msg_ungated`。
 
 ## Rust API
 

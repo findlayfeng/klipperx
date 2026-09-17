@@ -1,35 +1,36 @@
 //! Identify — the bootstrap exchange that hands the firmware's data dictionary
 //! to the host.
 //!
-//! This module owns three things that belong together:
+//! This module owns the transfer:
 //!
 //! * [`IDENTIFY_MESSAGES`] — the two formats the host is allowed to hard-code,
 //!   registered by [`Mcu::from_parts`](super::Mcu) at construction time.
-//! * the typed views over them ([`IdentifyRequest`], [`IdentifyChunk`]).
 //! * the chunked transfer itself: request a chunk, append it, stop at the empty
 //!   terminator, then decompress and decode the body ([`Identify::fetch`]).
 //!
+//! The typed views of those two messages — and the chunk size, which is the
+//! command's own argument — come from the command layer like every other
+//! command's, in [`cmd::identify`](super::cmd::identify).
 //! [`Mcu::identify`](super::Mcu::identify) and
 //! [`Mcu::connect`](super::Mcu::connect) turn the fetched payload into an
 //! installed dictionary.
 //!
-//! # Why this is not a command module
+//! # Why the transfer lives here and not in the command layer
 //!
 //! [`mcu::cmd`](super::cmd) holds the commands that describe firmware
 //! capabilities: their formats come from the dictionary, and they run through
-//! the ordinary typed call path. Identify is the exact opposite, on both counts.
+//! the ordinary typed call path. Identify is the opposite on both counts.
 //!
 //! * The host owns the formats. A dictionary cannot describe the exchange that
 //!   delivers it, so these two formats are the single exception to "formats come
-//!   from the firmware".
+//!   from the firmware", and the transport has to know them at construction time.
 //! * It runs *before* any dictionary exists, so [`Mcu::call_msg`](super::Mcu::call_msg)
 //!   — which refuses to run unidentified — is unavailable; the exchange uses
 //!   [`Mcu::call_msg_ungated`](super::Mcu::call_msg_ungated).
 //!
-//! The chunk loop is transport work, not a capability: the request merely says
-//! "send me bytes `N..N+40`", and assembling those bytes is what the link layer
-//! has to do with them. So the whole exchange lives here, next to the formats it
-//! is built from.
+//! The chunk loop is also not a capability: a request only ever asks for one
+//! window of bytes, and assembling a stream of those into a payload is the
+//! counterpart of the framing this layer already hard-codes.
 //!
 //! Both entries are repeated verbatim in the firmware-provided dictionary, so
 //! installing that dictionary must skip messages which are already registered
@@ -40,8 +41,8 @@
 //! The implementation enforces a maximum decompressed data size (1 MB) to prevent
 //! zip-bomb style attacks where a tiny compressed payload expands to enormous data.
 
-use super::{Mcu, McuCommand, McuError, McuResponse, Params};
-use crate::core::klippy::msg::proto::ArgValue;
+use super::cmd::identify::{IdentifyChunk, IdentifyRequest};
+use super::{Mcu, McuError};
 use flate2::read::ZlibDecoder;
 use std::io::Read;
 use tokio::time::Duration;
@@ -64,11 +65,6 @@ pub const IDENTIFY_MESSAGES: &[(i16, &str)] = &[
 /// Each chunk request gets the whole budget: a healthy MCU answers in
 /// microseconds, so a shorter per-chunk timeout would only add tuning knobs.
 pub const IDENTIFY_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Number of bytes requested per identify chunk.
-///
-/// Matches Klipper's hard-coded `count=40`.
-const IDENTIFY_CHUNK_SIZE: u32 = 40;
 
 /// Maximum allowed payload size (1 MB), applied both to the compressed bytes
 /// received and to the decompressed body.
@@ -181,38 +177,9 @@ impl Identify {
     }
 }
 
-/// `identify offset=%u count=%c` — host → MCU request for one chunk.
-struct IdentifyRequest {
-    offset: u32,
-}
-
-impl McuCommand for IdentifyRequest {
-    const NAME: &'static str = "identify";
-
-    fn args(&self) -> Vec<ArgValue> {
-        vec![
-            ArgValue::UInt32(self.offset),
-            ArgValue::UInt8(IDENTIFY_CHUNK_SIZE as u8),
-        ]
-    }
-}
-
-/// `identify_response offset=%u data=%.*s` — MCU → host chunk.
-struct IdentifyChunk {
-    offset: u32,
-    data: Vec<u8>,
-}
-
-impl McuResponse for IdentifyChunk {
-    const NAME: &'static str = "identify_response";
-
-    fn decode(params: &Params<'_>) -> Result<Self, McuError> {
-        Ok(Self {
-            offset: params.get_u32("offset")?,
-            data: params.get_bytes("data")?,
-        })
-    }
-}
+// The typed views of the two messages (`IdentifyRequest`, `IdentifyChunk`) and the
+// chunk size — the command's own argument — are defined with the other commands,
+// in [`cmd::identify`](super::cmd::identify).
 
 // ===========================================================================
 // Tests
@@ -225,6 +192,7 @@ mod tests {
     use crate::core::klippy::frame::Frame;
     use crate::core::klippy::interface::test::{MappingEntry, TestDevice};
     use crate::core::klippy::interface::Interface;
+    use crate::core::klippy::mcu::cmd::identify::IDENTIFY_CHUNK_SIZE;
     use crate::core::klippy::mcu::McuRestartMethod;
     use crate::core::klippy::msg::proto::Payload;
     use flate2::write::ZlibEncoder;

@@ -1,4 +1,13 @@
-mod codec;
+//! The transport layer: frames, the message parser, the firmware data dictionary,
+//! and the bare `send` / `call` pair that take message names as strings.
+//!
+//! Anything that names a message in the type system — [`McuCommand`](cmd::McuCommand),
+//! [`McuResponse`](cmd::McuResponse), [`Params`](cmd::Params), and the typed calls
+//! — lives one level up in [`cmd`], together with the command modules themselves.
+//! Identify straddles both: its formats and chunked transfer are transport work
+//! ([`Mcu::connect`] / [`Mcu::identify`]), while its two typed views are defined in
+//! [`cmd::identify`].
+
 mod dictionary;
 mod error;
 mod identify;
@@ -11,7 +20,6 @@ mod restart_method;
 // scope (where `identify` names the private transport module).
 pub mod cmd;
 
-pub use codec::{McuCommand, McuResponse, Params};
 pub use dictionary::{Dictionary, Enumeration, MessageDef, OutputDef};
 pub use error::{McuCallError, McuError};
 pub use identify::{Identify, IDENTIFY_TIMEOUT};
@@ -36,7 +44,8 @@ use tracing::{debug, error, info, warn};
 /// The host owns no message formats beyond the identify pair: everything else is
 /// learned from the MCU's data dictionary. [`Mcu::install_dictionary`] is what
 /// turns a freshly created object into a usable one; the typed command API
-/// ([`Mcu::send_msg`] / [`Mcu::call_msg`]) refuses to run before that.
+/// ([`Mcu::send_msg`] / [`Mcu::call_msg`], defined in [`cmd`] next to the
+/// vocabulary they use) refuses to run before that.
 /// [`Mcu::connect`] does the whole bootstrap in one call, and [`Mcu::identify`]
 /// exposes the handshake on its own for a custom timeout or a retry.
 pub struct Mcu {

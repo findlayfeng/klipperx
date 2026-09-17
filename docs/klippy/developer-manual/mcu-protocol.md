@@ -43,8 +43,8 @@
 | `name() -> &str` | MCU 名称 |
 | `send(name, &[ArgValue])` | **裸**单向发送（不做握手门禁） |
 | `call(name, args, response_name, timeout)` | **裸**同步请求/响应（不做握手门禁） |
-| `send_msg::<C>(&C)` | 类型化单向发送 |
-| `call_msg::<C, R>(&C, timeout)` | 类型化请求/响应 |
+| `send_msg::<C>(&C)` | 类型化单向发送（定义在 `mcu::cmd`） |
+| `call_msg::<C, R>(&C, timeout)` | 类型化请求/响应（定义在 `mcu::cmd`） |
 
 `Mcu` 不是 `Clone`，并且实现了 `Drop`：最后一个句柄被释放时调用 `Interface::shutdown()` 并 abort 接收任务。因此命令层统一持有 `Arc<Mcu>`，不要克隆。
 
@@ -150,6 +150,8 @@ mcu.send_msg(&SetDigitalOut { oid, value })?;
 `call_msg` 在发送**之前**就解析命令名与响应名，所以固件不实现的消息会立刻失败，而不是白等一个超时。
 
 ## 命令层：把消息包装成能力
+
+命令层的词汇本身也在 `mcu::cmd`：两个方向的 trait（`McuCommand` / `McuResponse`）、按名取参的 `Params`，以及把它们跑起来的 `Mcu::send_msg` / `Mcu::call_msg`（Rust 允许把固有 `impl` 写在其它模块，`Mcu` 的文档页仍会把它们列在一起）。传输层只剩下按名字收发的 `send` / `call`。
 
 ```rust
 pub trait ClockSync {

@@ -27,7 +27,6 @@ cargo test --lib test_install_skips   # 单个用例（按名过滤）
 |------|------|
 | `pending.rs` | 注册/配对/取消、未知名字不消费、先到先得、接收端已关闭、只取消一条 |
 | `dictionary.rs` | 三张消息表的解析（含 `output` 原样保留）、枚举单值与区间展开、常量、各类畸形输入、`install` 的跳过语义与不注册 `output` |
-| `codec.rs` | `Params` 按名取参、无损转换与拒绝收窄、未声明参数报已声明列表、类型不符报两侧类型、字符串/字节互换与非法 UTF-8、`get_enum` 三种路径；`send_msg` / `call_msg` 的握手门禁、未知消息、参数不匹配、往返解码、超时、解码失败 |
 | `identify.rs` | 单块与多块拼装（含 4 位序号回绕）、offset 错位、zlib 损坏、非 JSON、MCU 静默、zip bomb 上限、`Mcu::identify` 与 `Mcu::connect` 全流程 |
 | `mod.rs` | MCU 构造、发送错误路径、`Drop` 中止接收任务并释放阻塞读 |
 
@@ -35,6 +34,7 @@ cargo test --lib test_install_skips   # 单个用例（按名过滤）
 
 | 模块 | 覆盖 |
 |------|------|
+| `mod.rs` | `Params` 按名取参、无损转换与拒绝收窄、未声明参数报已声明列表、类型不符报两侧类型、字符串/字节互换与非法 UTF-8、`get_enum` 三种路径；`send_msg` / `call_msg` 的握手门禁、未知消息、参数不匹配、往返解码、超时、解码失败 |
 | `identify.rs` | 无独立测试：两个视图由 `mcu::identify` 的端到端测试覆盖（手工构造的请求帧会校验 `args()` 的 id / offset / count，回应帧走 `IdentifyChunk::decode`） |
 | `clock.rs` | 读取时钟、32 位回绕值、握手前失败、超时；另有不依赖 MCU 的 `ClockSync` 实现，验证 trait 作为测试缝可用 |
 

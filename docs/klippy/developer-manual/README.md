@@ -4,15 +4,15 @@
 
 ## 分层结构
 
-依赖方向单向向下（`mcu::cmd → mcu → msg`）。命令层是 `mcu` 最上层的子模块，但它不因此获得特权：下面的传输、字典与编解码代码不提任何命令模块。
+依赖方向单向向下（`mcu::cmd → mcu → msg`）。命令层是 `mcu` 最上层的子模块：传输代码（帧、`Parser`、字典、裸 `send` / `call`）不认识任何能力；唯一的反向边是 identify 引导（`mcu::identify` 用命令层的词汇与视图），理由见 [Identify 机制](identify.md)。
 
 | 层 | 路径 | 职责 | 知道哪些具体命令 |
 |----|------|------|------------------|
 | 编解码引擎 | `src/core/klippy/msg/` | 格式串 ↔ 字节 | **不知道**：只认 `%u` / `%.*s` |
-| MCU 通信 | `src/core/klippy/mcu/` | 帧收发、数据字典、类型化消息访问 | 只知道 `identify` 一对 |
-| 命令层 | `src/core/klippy/mcu/cmd/` | 消息语义、对外能力 | 全部 |
+| MCU 通信 | `src/core/klippy/mcu/` | 帧收发、`Parser`、数据字典、裸命名访问（`send` / `call`）、identify 引导 | 只知道 `identify` 一对 |
+| 命令层 | `src/core/klippy/mcu/cmd/` | 命令词汇（`McuCommand` / `McuResponse` / `Params`）、类型化调用、各命令模块 | 全部 |
 
-`mcu/mod.rs` 只声明 `pub mod cmd;`，不引用其中的任何名字，所以反向依赖在编译期就成立不了：子模块只是目录归属，分层规则与 `mcu` / `msg` 之间一样严。
+`mcu/mod.rs` 只声明 `pub mod cmd;`，本身不引用其中的任何名字，所以传输与字典代码无法依赖某个能力。整个仓库里 `mcu` 指向 `cmd` 的地方只有 `mcu::identify` 的引导驱动，且它有明确理由（见上）。
 
 核心约束：**除 `identify` / `identify_response` 外，主机不定义任何收发命令格式**。其余格式全部来自固件在 identify 阶段下发的数据字典（见 [MCU 协议与数据字典](mcu-protocol.md)）。
 
@@ -35,7 +35,6 @@
 | `mod.rs` | `Mcu`：收发任务、`send` / `call`、`connect` / `identify`、字典安装与查询；只声明 `cmd` 不引用它 |
 | `identify.rs` | identify 交换：主机侧唯一的格式定义、分块驱动与解压（命令视图在 `mcu::cmd::identify`） |
 | `dictionary.rs` | `Dictionary`：解析固件字典、枚举展开、安装进 `Parser` |
-| `codec.rs` | `McuCommand` / `McuResponse` / `Params`：类型化消息视图 |
 | `pending.rs` | `PendingCalls`：同步请求/响应记账 |
 | `error.rs` | `McuError`（总括）、`McuCallError`（`call` 专用） |
 | `restart_method.rs` | `McuRestartMethod` 配置枚举 |
@@ -44,7 +43,7 @@
 
 | 文件 | 职责 |
 |------|------|
-| `mod.rs` | 命令层说明与再导出 |
+| `mod.rs` | 命令词汇：`McuCommand` / `McuResponse` / `Params`，以及类型化调用 `Mcu::send_msg` / `Mcu::call_msg` |
 | `clock.rs` | `ClockSync` / `McuClock`：`get_clock` ↔ `clock` |
 | `identify.rs` | `identify` / `identify_response` 的类型化视图（分片驱动在 `mcu::identify`） |
 

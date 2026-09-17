@@ -120,9 +120,10 @@ impl Mcu {
             loop {
                 let frame = interface.receive().await;
 
-                if frame.seq() != seq {
+                if frame.seq() != (seq & 0xf) {
                     warn!(
-                        "Seq mismatch: expected {seq}, got {}",
+                        "Seq mismatch: expected {}, got {}",
+                        seq & 0xf,
                         frame.seq()
                     );
                     seq += 1;

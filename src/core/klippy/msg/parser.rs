@@ -1,6 +1,6 @@
 use super::error::{MsgError, MsgResult};
 use super::proto::{ArgValue, Payload};
-use super::MsgBase;
+use super::MsgDef;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -10,7 +10,7 @@ type MsgCallback = Arc<Mutex<Box<dyn FnMut(&[ArgValue]) + Send>>>;
 pub struct Msg {
     id: u8,
     name: String,
-    base: MsgBase,
+    def: MsgDef,
     callback: Option<MsgCallback>,
 }
 
@@ -19,7 +19,7 @@ impl std::fmt::Debug for Msg {
         f.debug_struct("Msg")
             .field("id", &self.id)
             .field("name", &self.name)
-            .field("base", &self.base)
+            .field("def", &self.def)
             .field("callback", &self.callback.is_some())
             .finish()
     }
@@ -74,14 +74,14 @@ impl Parser {
 
     /// Register a message format with the given ID.
     ///
-    /// The format string is parsed into a [`MsgBase`] and stored under both
+    /// The format string is parsed into a [`MsgDef`] and stored under both
     /// its numeric `id` and its name. Use [`Self::bind`] to register a callback.
     ///
     /// # Errors
     /// Returns an error if the format string is invalid, or if the `id`
     /// or the parsed command name is already registered.
     pub fn register(&mut self, id: u8, format: &str) -> MsgResult<()> {
-        let (name, base) = MsgBase::parse(format)?;
+        let (name, def) = MsgDef::parse(format)?;
 
         let mut map = self
             .msgs
@@ -91,7 +91,7 @@ impl Parser {
         map.try_insert(Msg {
             id,
             name,
-            base,
+            def,
             callback: None,
         })
         .map_err(|e| MsgError::new(e.to_string()))?;
@@ -134,7 +134,7 @@ impl Parser {
         map.try_insert(Msg {
             id: msg.id,
             name: msg.name,
-            base: msg.base,
+            def: msg.def,
             callback: Some(callback),
         })
         .map_err(|e| MsgError::new(e))?;
@@ -159,7 +159,7 @@ impl Parser {
             .get_by_name(name)
             .ok_or_else(|| MsgError::new(format!("Unknown message name: {}", name)))?;
 
-        let param_types = msg.base.params();
+        let param_types = msg.def.params();
 
         if values.len() != param_types.len() {
             return Err(MsgError::new(format!(
@@ -208,7 +208,7 @@ impl Parser {
                 .ok_or_else(|| MsgError::new(format!("Unknown message id: {}", id)))?;
 
             // Decode parameters according to the message's parameter types
-            let param_types = arc_msg.base.params();
+            let param_types = arc_msg.def.params();
 
             let mut values = Vec::with_capacity(param_types.len());
             for (_, arg_type) in param_types {
@@ -241,7 +241,7 @@ mod tests {
         map.try_insert(Msg {
             id: 1,
             name: "CMD_A".to_string(),
-            base: MsgBase::parse("CMD_A x=%u").unwrap().1,
+            def: MsgDef::parse("CMD_A x=%u").unwrap().1,
             callback: None,
         }).unwrap();
 
@@ -257,14 +257,14 @@ mod tests {
         map.try_insert(Msg {
             id: 1,
             name: "CMD_A".to_string(),
-            base: MsgBase::new(vec![]),
+            def: MsgDef::new(vec![]),
             callback: None,
         }).unwrap();
 
         let result = map.try_insert(Msg {
             id: 1,
             name: "CMD_B".to_string(),
-            base: MsgBase::new(vec![]),
+            def: MsgDef::new(vec![]),
             callback: None,
         });
         assert!(result.is_err());
@@ -277,14 +277,14 @@ mod tests {
         map.try_insert(Msg {
             id: 1,
             name: "CMD_A".to_string(),
-            base: MsgBase::new(vec![]),
+            def: MsgDef::new(vec![]),
             callback: None,
         }).unwrap();
 
         let result = map.try_insert(Msg {
             id: 2,
             name: "CMD_A".to_string(),
-            base: MsgBase::new(vec![]),
+            def: MsgDef::new(vec![]),
             callback: None,
         });
         assert!(result.is_err());
@@ -294,17 +294,17 @@ mod tests {
     #[test]
     fn test_msgmap_by_name_resolves_through_by_id() {
         let mut map = MsgMap::default();
-        let base = MsgBase::parse("TEST a=%u b=%s").unwrap().1;
+        let def = MsgDef::parse("TEST a=%u b=%s").unwrap().1;
         map.try_insert(Msg {
             id: 42,
             name: "TEST".to_string(),
-            base,
+            def,
             callback: None,
         }).unwrap();
 
         let msg = map.get_by_name("TEST").unwrap();
         assert_eq!(msg.id, 42);
-        let param_len = msg.base.params().len();
+        let param_len = msg.def.params().len();
         assert_eq!(param_len, 2);
     }
 

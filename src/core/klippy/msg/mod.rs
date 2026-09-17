@@ -9,44 +9,30 @@ pub use param::Param;
 pub use proto::{ArgType, ArgValue};
 
 // ===========================================================================
-// MsgBase handling for Klipper message protocol.
+// MsgDef handling for Klipper message protocol.
 //
-// Provides the `MsgBase` struct — a parsed command containing the name
+// Provides the `MsgDef` struct — a parsed command containing the name
 // and parameter list. Encoding/decoding logic is in `proto.rs`.
-// Also provides `MsgHandler` — a `MsgBase` with an optional callback
-// for handling matched messages.
 // ===========================================================================
 
 
-
-// ===========================================================================
-// MsgBase
-// ===========================================================================
 
 /// A parsed command format containing only the name and parameter list.
 ///
 /// Encoding/decoding methods are provided as standalone functions in `proto.rs`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct MsgBase {
+pub struct MsgDef {
     /// Parameter list in declaration order: (parameter_name, parameter_type).
     pub params: Vec<(String, ArgType)>,
 }
 
-impl MsgBase {
-    /// Parse a Klipper message format string into a `MsgBase`.
+impl MsgDef {
+    /// Parse a Klipper message format string into a `MsgDef`.
     ///
     /// Format strings are space-separated tokens where the first token is the
     /// command name and remaining tokens are `name=type` pairs.
     ///
     /// Returns `MsgError` if the format string is empty or malformed.
-    ///
-    /// # Examples
-    /// ```
-    /// # use klipperx::core::klippy::msg::MsgBase;
-    /// let (name, cmd) = MsgBase::parse("config_digital_out oid=%u pin=%s").unwrap();
-    /// assert_eq!(name, "config_digital_out");
-    /// assert_eq!(cmd.params().len(), 2);
-    /// ```
     pub fn parse(fmt: &str) -> MsgResult<(String, Self)> {
         let trimmed = fmt.trim();
         if trimmed.is_empty() {
@@ -72,7 +58,7 @@ impl MsgBase {
         Ok((name, Self { params }))
     }
 
-    /// Create a `MsgBase` from components.
+    /// Create a `MsgDef` from a parameter list.
     pub fn new(params: Vec<(String, ArgType)>) -> Self {
         Self { params }
     }
@@ -82,7 +68,7 @@ impl MsgBase {
         &self.params
     }
 
-    /// Returns the format string by reconstructing it from name and params.
+    /// Returns the format string by reconstructing it from params.
     ///
     /// Note: `%*s` normalizes to `%s`, and `%.*s` normalizes to `%c` here,
     /// since [`ArgType`] does not distinguish between these variants.
@@ -104,13 +90,13 @@ mod tests {
     use super::*;
 
     // -----------------------------------------------------------------------
-    // MsgBase::parse
+    // MsgDef::parse
     // -----------------------------------------------------------------------
 
     #[test]
     fn test_parse_all_arg_types() {
         let fmt = "test_cmd a=%u b=%i c=%hu d=%hi e=%s f=%c g=%*s h=%.*s";
-        let (name, cmd) = MsgBase::parse(fmt).unwrap();
+        let (name, cmd) = MsgDef::parse(fmt).unwrap();
         assert_eq!(name, "test_cmd");
         assert_eq!(cmd.params.len(), 8);
         assert_eq!(cmd.params[0].1, ArgType::UInt32);
@@ -125,21 +111,21 @@ mod tests {
 
     #[test]
     fn test_parse_error_empty_string() {
-        let result = MsgBase::parse("");
+        let result = MsgDef::parse("");
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().msg, "empty format string");
     }
 
     #[test]
     fn test_parse_error_invalid_param() {
-        let result = MsgBase::parse("CMD badparam");
+        let result = MsgDef::parse("CMD badparam");
         assert!(result.is_err());
         assert!(result.unwrap_err().msg.contains("invalid parameter format"));
     }
 
     #[test]
     fn test_parse_error_unknown_type() {
-        let result = MsgBase::parse("CMD x=%x");
+        let result = MsgDef::parse("CMD x=%x");
         assert!(result.is_err());
         assert!(result.unwrap_err().msg.contains("unknown type specifier"));
     }
@@ -154,20 +140,20 @@ mod tests {
             ("e".to_string(), ArgType::Str),
             ("f".to_string(), ArgType::Bytes),
         ];
-        let cmd = MsgBase::new(params);
+        let cmd = MsgDef::new(params);
         assert_eq!(cmd.format(), "a=%u b=%i c=%hu d=%hi e=%s f=%.*s");
     }
 
     // -----------------------------------------------------------------------
-    // MsgBase Hash (for use in collections)
+    // MsgDef Hash (for use in collections)
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_command_base_hash() {
+    fn test_command_def_hash() {
         use std::collections::HashSet;
 
-        let cmd1 = MsgBase::new(vec![("x".to_string(), ArgType::Int32)]);
-        let cmd2 = MsgBase::new(vec![("x".to_string(), ArgType::Int32)]);
+        let cmd1 = MsgDef::new(vec![("x".to_string(), ArgType::Int32)]);
+        let cmd2 = MsgDef::new(vec![("x".to_string(), ArgType::Int32)]);
 
         let mut set = HashSet::new();
         set.insert(cmd1);

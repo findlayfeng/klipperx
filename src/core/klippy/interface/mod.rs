@@ -1,8 +1,10 @@
+pub mod canserial;
 pub mod host;
 pub mod serial;
 #[cfg(test)]
 pub mod test;
 
+pub use canserial::CanSerialDevice;
 pub use host::HostDevice;
 pub use serial::SerialDevice;
 #[cfg(test)]
@@ -30,6 +32,8 @@ pub trait Device: Send + Sync {
 ///
 /// One variant per transport a `[mcu]` section can ask for:
 /// - `Serial(SerialDevice)` — a real MCU on a tty (`serial:`)
+/// - `CanSerial(CanSerialDevice)` — a real MCU reached over CAN, using Klipper's
+///   can-serial link (`canserial_interface:` + `canserial_nodeid:`)
 /// - `Host(HostDevice)` — klipper's host library, loaded from a shared object
 ///   (`host_library:`)
 /// - `Test(TestDevice)` — a scripted device, in test builds (`test:`)
@@ -40,6 +44,7 @@ pub trait Device: Send + Sync {
 #[derive(Debug, Clone)]
 pub enum Interface {
     Serial(Arc<SerialDevice>),
+    CanSerial(Arc<CanSerialDevice>),
     Host(Arc<HostDevice>),
     #[cfg(test)]
     Test(Arc<TestDevice>),
@@ -61,6 +66,18 @@ impl Interface {
         Ok(Self::Serial(Arc::new(SerialDevice::open(path, baud)?)))
     }
 
+    /// Create an interface for a real MCU on the CAN interface `name`, at the
+    /// CAN node `nodeid`.
+    ///
+    /// # Errors
+    /// Returns [`InterfaceError`] if the interface does not exist or the socket
+    /// cannot be set up.
+    pub fn canserial(name: &str, nodeid: u32) -> Result<Self, InterfaceError> {
+        Ok(Self::CanSerial(Arc::new(CanSerialDevice::open(
+            name, nodeid,
+        )?)))
+    }
+
     /// Create an interface running klipper's host library from `path`.
     ///
     /// # Errors
@@ -73,6 +90,12 @@ impl Interface {
     pub async fn send(&self, frame: Frame) -> Result<(), InterfaceError> {
         match self {
             Self::Serial(device) => {
+                let device = Arc::clone(device);
+                tokio::task::spawn_blocking(move || device.send(&frame))
+                    .await
+                    .expect("Interface send task panicked")
+            }
+            Self::CanSerial(device) => {
                 let device = Arc::clone(device);
                 tokio::task::spawn_blocking(move || device.send(&frame))
                     .await
@@ -102,6 +125,12 @@ impl Interface {
                     .await
                     .expect("Interface receive task panicked")
             }
+            Self::CanSerial(device) => {
+                let device = Arc::clone(device);
+                tokio::task::spawn_blocking(move || device.receive())
+                    .await
+                    .expect("Interface receive task panicked")
+            }
             Self::Host(device) => {
                 let device = Arc::clone(device);
                 tokio::task::spawn_blocking(move || device.receive())
@@ -122,6 +151,7 @@ impl Interface {
     pub fn shutdown(&self) {
         match self {
             Self::Serial(device) => device.shutdown(),
+            Self::CanSerial(device) => device.shutdown(),
             Self::Host(device) => device.shutdown(),
             #[cfg(test)]
             Self::Test(device) => device.shutdown(),
@@ -165,18 +195,9 @@ mod tests {
     #[tokio::test]
     async fn test_interface_multiple_send_receive() {
         let pairs: Vec<(Frame, Frame)> = vec![
-            (
-                make_frame(1, b"msg1"),
-                make_frame(2, b"resp1"),
-            ),
-            (
-                make_frame(3, b"msg2"),
-                make_frame(4, b"resp2"),
-            ),
-            (
-                make_frame(5, b"msg3"),
-                make_frame(6, b"resp3"),
-            ),
+            (make_frame(1, b"msg1"), make_frame(2, b"resp1")),
+            (make_frame(3, b"msg2"), make_frame(4, b"resp2")),
+            (make_frame(5, b"msg3"), make_frame(6, b"resp3")),
         ];
 
         let mappings: Vec<MappingEntry> = pairs
@@ -285,9 +306,12 @@ mod tests {
         for (i, expected) in outputs.iter().enumerate() {
             let received = interface.receive().await.expect("frame available");
             assert_eq!(
-                received, *expected,
+                received,
+                *expected,
                 "output #{} mismatch: expected {:?}, got {:?}",
-                i + 1, expected, received
+                i + 1,
+                expected,
+                received
             );
         }
     }

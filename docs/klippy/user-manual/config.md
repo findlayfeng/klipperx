@@ -88,6 +88,29 @@ points:
 [exclude_object]
 ```
 
+## MCU 连接方式
+
+`[mcu]` 节用**一个**连接参数说明主机怎么和这颗 MCU 通信——和 Klipper 一样（Klipper 用 `serial` 或 `canbus_uuid`）。同时给出多个是配置错误，会直接报错，而不是按某个优先级挑一个。
+
+| 参数 | 值 | 说明 |
+|------|-----|------|
+| `host_library` | klipper host 库（`libklipper_host.so`）的路径 | 在主机进程内运行一份 klipper 固件；目前唯一已实现的传输 |
+| `serial` | 串口设备路径（如 `/dev/ttyACM0`） | 格式已定义，但**传输尚未实现**，配置后会明确报错 |
+| `test` | 每行 `输入帧 输出帧...`（十六进制） | 仅测试构建可用，供单元测试脚本化一个假设备 |
+
+```ini
+[mcu]
+host_library: /usr/local/lib/libklipper_host.so
+
+[mcu zboard]
+serial: /dev/serial/by-path/platform-3f980000.usb-usb-0:1.3:1.0-port0
+
+[mcu fake]
+test: 06 10 05 00 00 7e
+```
+
+节名取自节的 sub（`[mcu zboard]` → `zboard`），`restart_method` 也在这里设置。
+
 ## 示例配置
 
 以下是一个完整的示例：

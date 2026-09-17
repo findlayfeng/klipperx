@@ -17,19 +17,38 @@ pub struct McuConfig {
     pub interface: Interface,
 }
 
+/// The connection keys a `[mcu]` section may carry, in the order errors list
+/// them. Exactly one of them names the transport, the way Klipper's own `[mcu]`
+/// works (`serial` or `canbus_uuid`): see [`McuConfig::create_interface`].
+///
+/// `test` exists in test builds only — it is how the unit tests script a device.
+/// `serial` is part of the format but its transport is not implemented yet, so it
+/// is recognized and refused by name instead of being mistaken for "no interface".
+fn interface_keys() -> &'static [&'static str] {
+    #[cfg(test)]
+    return &["host_library", "serial", "test"];
+    #[cfg(not(test))]
+    return &["host_library", "serial"];
+}
+
 impl McuConfig {
     /// Parse MCU configuration from a ConfigSection.
     ///
-    /// Inspects the section to determine the interface type:
-    /// - In test builds: checks for a `test` config block
-    /// - In production: returns an error (no interface configured)
+    /// The name comes from the section's sub (`[mcu zboard]` → `zboard`), and the
+    /// interface from one of the connection keys (see `interface_keys`):
+    ///
+    /// ```ini
+    /// [mcu]
+    /// host_library: /path/to/libklipper_host.so
+    /// ```
     ///
     /// # Arguments
     /// * `section` — The MCU configuration section from the config file.
     ///
     /// # Returns
-    /// `Ok(McuConfig)` with the appropriate interface type,
-    /// or `Err` if no supported interface configuration is found.
+    /// `Ok(McuConfig)` with the appropriate interface type, or `Err` when the
+    /// section names no interface, names several, or names one that cannot be
+    /// brought up.
     pub fn new(section: &ConfigSection) -> Result<Self, String> {
         let (name, restart_method) = Self::parse_common(section);
         let interface = Self::create_interface(section)?;
@@ -57,58 +76,90 @@ impl McuConfig {
         (name, restart_method)
     }
 
-    fn _create_interface(_section: &ConfigSection) -> Result<Interface, String> {
-        Err("no supported interface configuration found (test, serial, canbus, ...)".to_string())
-    }
-    /// Create the appropriate interface based on section content.
-    #[cfg(test)]
+    /// Create the interface the section asks for.
+    ///
+    /// One connection key selects it. Two of them is a configuration mistake, not
+    /// a preference order, so it is reported rather than resolved silently.
     fn create_interface(section: &ConfigSection) -> Result<Interface, String> {
-        if let Some(test_value) = section.get("test") {
-            let lines: Vec<String> = test_value.lines().iter().map(|s| s.to_string()).collect();
-
-            let mut mappings = Vec::new();
-            for line in lines {
-                let trimmed = line.trim();
-                if trimmed.is_empty() || trimmed.starts_with('#') {
-                    continue;
-                }
-
-                let hex_bytes: Vec<&str> = trimmed.split_whitespace().collect();
-                if hex_bytes.is_empty() {
-                    continue;
-                }
-
-                let input = Self::hex_decode_bytes(hex_bytes[0]).unwrap_or_default();
-                let output_bytes: Vec<Vec<u8>> = hex_bytes[1..]
-                    .iter()
-                    .map(|h| Self::hex_decode_bytes(h).unwrap_or_default())
-                    .collect();
-
-                if !output_bytes.is_empty() {
-                    let input_frame = super::super::frame::Frame::new(0, input);
-                    let output_frames: Vec<super::super::frame::Frame> = output_bytes
-                        .into_iter()
-                        .map(|payload| super::super::frame::Frame::new(0, payload))
-                        .collect();
-                    mappings.push(crate::core::klippy::interface::test::MappingEntry {
-                        input: input_frame,
-                        outputs: output_frames,
-                    });
-                }
-            }
-
-            return Ok(Interface::new(
-                crate::core::klippy::interface::test::TestDevice::new(mappings),
+        let requested: Vec<&str> = interface_keys()
+            .iter()
+            .copied()
+            .filter(|key| section.has(key))
+            .collect();
+        if requested.len() > 1 {
+            return Err(format!(
+                "MCU '{}' sets more than one interface: {}",
+                section.identifier(),
+                requested.join(", ")
             ));
         }
 
-        Self::_create_interface(section)
+        if let Some(path) = section.get_str("host_library") {
+            return Interface::host(path).map_err(|e| format!("host_library: {e}"));
+        }
+
+        if section.has("serial") {
+            return Err(format!(
+                "MCU '{}': the serial transport is not implemented yet, \
+                 use host_library: <libklipper_host.so>",
+                section.identifier()
+            ));
+        }
+
+        #[cfg(test)]
+        if let Some(test_value) = section.get("test") {
+            return Ok(Interface::new(Self::test_device(test_value)));
+        }
+
+        let how = if cfg!(test) {
+            "set host_library: <libklipper_host.so> (or test: <frame mappings>)"
+        } else {
+            "set host_library: <libklipper_host.so>"
+        };
+        Err(format!(
+            "MCU '{}' needs an interface: {how}",
+            section.identifier()
+        ))
     }
 
-    /// Create the appropriate interface based on section content.
-    #[cfg(not(test))]
-    fn create_interface(section: &ConfigSection) -> Result<Interface, String> {
-        Self::_create_interface(section)
+    /// Build a scripted device from a `test:` block of hex frame mappings
+    /// (test builds only).
+    #[cfg(test)]
+    fn test_device(
+        test_value: &super::value::ConfigValue,
+    ) -> crate::core::klippy::interface::test::TestDevice {
+        let mut mappings = Vec::new();
+        for line in test_value.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+
+            let hex_bytes: Vec<&str> = trimmed.split_whitespace().collect();
+            if hex_bytes.is_empty() {
+                continue;
+            }
+
+            let input = Self::hex_decode_bytes(hex_bytes[0]).unwrap_or_default();
+            let output_bytes: Vec<Vec<u8>> = hex_bytes[1..]
+                .iter()
+                .map(|h| Self::hex_decode_bytes(h).unwrap_or_default())
+                .collect();
+
+            if !output_bytes.is_empty() {
+                let input_frame = super::super::frame::Frame::new(0, input);
+                let output_frames: Vec<super::super::frame::Frame> = output_bytes
+                    .into_iter()
+                    .map(|payload| super::super::frame::Frame::new(0, payload))
+                    .collect();
+                mappings.push(crate::core::klippy::interface::test::MappingEntry {
+                    input: input_frame,
+                    outputs: output_frames,
+                });
+            }
+        }
+
+        crate::core::klippy::interface::test::TestDevice::new(mappings)
     }
 
     /// Decode a hex string to bytes (test helper).
@@ -138,6 +189,15 @@ mod tests {
                 ConfigValue::Multi(test_lines.iter().map(|s| s.to_string()).collect()),
             );
         }
+        section
+    }
+
+    /// A section with one `key: value` parameter.
+    fn section_with(key: &str, value: &str) -> ConfigSection {
+        let mut section = ConfigSection::new("mcu", None);
+        section
+            .parameters
+            .insert(key.to_string(), ConfigValue::Single(value.to_string()));
         section
     }
 
@@ -175,9 +235,41 @@ mod tests {
     #[test]
     fn test_parse_mcu_config_no_interface() {
         let section = make_section(&[]);
-        let result = McuConfig::new(&section);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("no supported interface"));
+        let err = McuConfig::new(&section).unwrap_err();
+        // The error has to say how to fix the section, not just that it is wrong.
+        assert!(err.contains("needs an interface"), "{err}");
+        assert!(err.contains("host_library"), "{err}");
+    }
+
+    #[test]
+    fn test_host_library_key_becomes_the_host_interface() {
+        // A path that cannot be loaded still proves the routing: the error is the
+        // library's, not the "needs an interface" one.
+        let section = section_with("host_library", "/nonexistent/libklipper_host.so");
+        let err = McuConfig::new(&section).unwrap_err();
+        assert!(err.starts_with("host_library: "), "{err}");
+        assert!(err.contains("/nonexistent/libklipper_host.so"), "{err}");
+    }
+
+    #[test]
+    fn test_two_interface_keys_are_rejected() {
+        let mut section = section_with("host_library", "/nonexistent/libklipper_host.so");
+        section.parameters.insert(
+            "serial".to_string(),
+            ConfigValue::Single("/dev/ttyACM0".to_string()),
+        );
+
+        let err = McuConfig::new(&section).unwrap_err();
+        assert!(err.contains("more than one interface"), "{err}");
+        assert!(err.contains("host_library, serial"), "{err}");
+    }
+
+    #[test]
+    fn test_serial_is_recognized_but_not_implemented() {
+        let section = section_with("serial", "/dev/ttyACM0");
+        let err = McuConfig::new(&section).unwrap_err();
+        assert!(err.contains("serial transport"), "{err}");
+        assert!(err.contains("host_library"), "{err}");
     }
 
     #[test]

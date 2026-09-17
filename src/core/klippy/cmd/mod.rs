@@ -437,52 +437,32 @@ mod tests {
     // Test dictionary and messages
     // -----------------------------------------------------------------------
 
+    /// The subset of a firmware dictionary these tests need.
+    ///
+    /// `GetClock` / `ClockState` are *not* redefined here: they are the real
+    /// types from [`clock`](super::clock), already in scope through the
+    /// `super::*` glob above.
     fn dictionary() -> Dictionary {
         Dictionary::from_json(json!({
             "commands": {
                 "get_clock": 5,
                 "get_uptime": 4,
-                "clear_shutdown": 2
+                "clear_shutdown": 2,
+                "debug_ping data=%*s": 10
             },
             "responses": {
                 "clock clock=%u": 18,
-                "uptime high=%u clock=%u": 17,
-                "is_shutdown static_string_id=%hu": 14
+                "uptime high=%u clock=%u": 17
             },
             "enumerations": {
                 "static_string_id": {"Timer too close": 3}
-            },
-            "config": {"CLOCK_FREQ": 20000000}
+            }
         }))
         .unwrap()
     }
 
-    /// `get_clock` — takes no arguments.
-    struct GetClock;
-
-    impl McuCommand for GetClock {
-        const NAME: &'static str = "get_clock";
-        fn args(&self) -> Vec<ArgValue> {
-            Vec::new()
-        }
-    }
-
-    /// `clock clock=%u`
-    #[derive(Debug, PartialEq)]
-    struct ClockState {
-        clock: u32,
-    }
-
-    impl McuResponse for ClockState {
-        const NAME: &'static str = "clock";
-        fn decode(params: &Params<'_>) -> Result<Self, McuError> {
-            Ok(Self {
-                clock: params.get_u32("clock")?,
-            })
-        }
-    }
-
-    /// `get_uptime` / `uptime high=%u clock=%u`
+    /// `get_uptime` / `uptime high=%u clock=%u` — two parameters, so the
+    /// round-trip exercises more than a single name lookup.
     struct GetUptime;
 
     impl McuCommand for GetUptime {
@@ -508,14 +488,14 @@ mod tests {
         }
     }
 
-    /// `is_shutdown static_string_id=%hu`
-    #[derive(Debug)]
-    struct IsShutdown;
+    /// `debug_ping data=%*s` — only used to send a payload big enough that the
+    /// send task cannot merge it with the next frame.
+    struct DebugPing(String);
 
-    impl McuResponse for IsShutdown {
-        const NAME: &'static str = "is_shutdown";
-        fn decode(_params: &Params<'_>) -> Result<Self, McuError> {
-            Ok(Self)
+    impl McuCommand for DebugPing {
+        const NAME: &'static str = "debug_ping";
+        fn args(&self) -> Vec<ArgValue> {
+            vec![ArgValue::Str(self.0.clone())]
         }
     }
 
@@ -532,6 +512,11 @@ mod tests {
         out.into_raw()
     }
 
+    /// Frame carrying `parts` as the message id followed by its arguments.
+    fn frame(seq: u8, parts: &[ArgValue]) -> Frame {
+        Frame::new(seq, payload(parts))
+    }
+
     fn mcu_with(dictionary: Dictionary, mappings: Vec<MappingEntry>) -> Mcu {
         let mcu = Mcu::for_test("test_mcu", Interface::new(TestDevice::new(mappings)));
         // A fresh `Mcu` registers the identify pair, so the dictionary entries
@@ -540,10 +525,8 @@ mod tests {
         mcu
     }
 
-    // -----------------------------------------------------------------------
-    // Params
-    // -----------------------------------------------------------------------
-
+    /// Decoded parameters of a one-off message, for `Params` tests that need no
+    /// device.
     fn params_for(format: &str, id: i16, values: &[ArgValue]) -> (Parser, Vec<ArgValue>) {
         let mut parser = Parser::new();
         parser.register(id, format).unwrap();
@@ -553,6 +536,25 @@ mod tests {
         let decoded = parser.decode(encoded).unwrap();
         (parser, decoded[0].1.clone())
     }
+
+    /// `Params` over `is_shutdown static_string_id=%hu` values, with the fixture
+    /// enumeration attached unless `with_dictionary` is false.
+    fn shutdown_params(values: &[ArgValue], with_dictionary: bool) -> Params<'_> {
+        let mut parser = Parser::new();
+        parser
+            .register(14, "is_shutdown static_string_id=%hu")
+            .unwrap();
+        let params = Params::new(parser.lookup("is_shutdown").unwrap(), values);
+        if with_dictionary {
+            params.with_dictionary(Arc::new(dictionary()))
+        } else {
+            params
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Params
+    // -----------------------------------------------------------------------
 
     #[test]
     fn test_params_read_by_name_not_position() {
@@ -571,23 +573,52 @@ mod tests {
         assert_eq!(params.get_u32("high").unwrap(), 9);
         assert!(params.has("clock"));
         assert!(!params.has("missing"));
+
+        // The declaration is readable as the firmware gave it.
+        let declared: Vec<(&str, ArgType)> = params
+            .declared()
+            .iter()
+            .map(|(name, atype)| (name.as_str(), *atype))
+            .collect();
+        assert_eq!(
+            declared,
+            vec![("clock", ArgType::UInt32), ("high", ArgType::UInt32)]
+        );
     }
 
     #[test]
-    fn test_params_convert_widening_and_range_checked() {
+    fn test_params_of_a_message_without_parameters() {
+        let (parser, values) = params_for("clear_shutdown", 2, &[]);
+        let params = Params::new(parser.lookup("clear_shutdown").unwrap(), &values);
+
+        assert_eq!(params.message_name(), "clear_shutdown");
+        assert_eq!(params.len(), 0);
+        assert!(params.is_empty());
+        assert!(params.declared().is_empty());
+        assert!(!params.has("anything"));
+    }
+
+    #[test]
+    fn test_params_conversions_widen_and_range_check() {
         let (parser, values) = params_for(
-            "state a=%c b=%hi",
+            "state a=%c b=%hi c=%hu",
             1,
-            &[ArgValue::UInt8(5), ArgValue::Int16(-2)],
+            &[
+                ArgValue::UInt8(5),
+                ArgValue::Int16(-2),
+                ArgValue::UInt16(4000),
+            ],
         );
         let params = Params::new(parser.lookup("state").unwrap(), &values);
 
-        // Widening is allowed.
+        // Widening and exact reads both go through the typed accessors.
         assert_eq!(params.get_u32("a").unwrap(), 5);
         assert_eq!(params.get_i32("b").unwrap(), -2);
+        assert_eq!(params.get_i16("b").unwrap(), -2);
+        assert_eq!(params.get_u16("c").unwrap(), 4000);
+
         // Narrowing a negative value is refused, not wrapped.
-        let err = params.get_u8("b").unwrap_err();
-        assert!(matches!(err, McuError::Decode(_)));
+        assert!(matches!(params.get_u8("b"), Err(McuError::Decode(_))));
     }
 
     #[test]
@@ -631,37 +662,21 @@ mod tests {
     }
 
     #[test]
-    fn test_params_get_enum_resolves_name_and_falls_back() {
-        let dict = Arc::new(dictionary());
-        let (parser, values) = params_for(
-            "is_shutdown static_string_id=%hu",
-            14,
-            &[ArgValue::UInt16(3)],
-        );
-        let params =
-            Params::new(parser.lookup("is_shutdown").unwrap(), &values).with_dictionary(dict);
-
+    fn test_params_get_enum_names_values_and_falls_back() {
+        let values = vec![ArgValue::UInt16(3)];
+        let named = shutdown_params(&values, true);
         assert_eq!(
-            params
+            named
                 .get_enum("static_string_id", "static_string_id")
                 .unwrap(),
             "Timer too close"
         );
-    }
 
-    #[test]
-    fn test_params_get_enum_unnamed_value_renders_question_mark() {
-        let dict = Arc::new(dictionary());
-        let (parser, values) = params_for(
-            "is_shutdown static_string_id=%hu",
-            14,
-            &[ArgValue::UInt16(99)],
-        );
-        let params =
-            Params::new(parser.lookup("is_shutdown").unwrap(), &values).with_dictionary(dict);
-
+        // A value the firmware did not name renders as `?<value>`, like Klipper.
+        let values = vec![ArgValue::UInt16(99)];
+        let unnamed = shutdown_params(&values, true);
         assert_eq!(
-            params
+            unnamed
                 .get_enum("static_string_id", "static_string_id")
                 .unwrap(),
             "?99"
@@ -669,35 +684,23 @@ mod tests {
     }
 
     #[test]
-    fn test_params_get_enum_without_dictionary_fails() {
-        let (parser, values) = params_for(
-            "is_shutdown static_string_id=%hu",
-            14,
-            &[ArgValue::UInt16(3)],
-        );
-        let params = Params::new(parser.lookup("is_shutdown").unwrap(), &values);
+    fn test_params_get_enum_reports_missing_dictionary_and_enumeration() {
+        let values = vec![ArgValue::UInt16(3)];
 
-        let err = params
+        let without = shutdown_params(&values, false);
+        let err = without
             .get_enum("static_string_id", "static_string_id")
             .unwrap_err();
-        assert!(err.to_string().contains("without a dictionary"));
-    }
+        assert!(err.to_string().contains("without a dictionary"), "{err}");
 
-    #[test]
-    fn test_params_get_enum_unknown_enumeration_fails() {
-        let dict = Arc::new(dictionary());
-        let (parser, values) = params_for(
-            "is_shutdown static_string_id=%hu",
-            14,
-            &[ArgValue::UInt16(3)],
-        );
-        let params =
-            Params::new(parser.lookup("is_shutdown").unwrap(), &values).with_dictionary(dict);
-
-        let err = params
+        let unknown = shutdown_params(&values, true);
+        let err = unknown
             .get_enum("nonexistent", "static_string_id")
             .unwrap_err();
-        assert!(err.to_string().contains("no enumeration 'nonexistent'"));
+        assert!(
+            err.to_string().contains("no enumeration 'nonexistent'"),
+            "{err}"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -714,15 +717,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_install_dictionary_reports_installed_count() {
-        let mcu = Mcu::for_test("test_mcu", Interface::new(TestDevice::new(Vec::new())));
+    async fn test_send_msg_puts_the_command_on_the_wire() {
+        // 45 bytes of data push the payload past the batching threshold, so it
+        // leaves as its own frame instead of being merged into the next one.
+        let data = "x".repeat(45);
+        let mappings = vec![
+            MappingEntry {
+                input: frame(0, &[ArgValue::UInt8(10), ArgValue::Str(data.clone())]),
+                outputs: Vec::new(),
+            },
+            MappingEntry {
+                input: frame(1, &[ArgValue::UInt8(5)]),
+                // The first command has no response, so this is the first frame
+                // the receive task ever sees: it counts received frames, so the
+                // seq has to be 0 even though the request went out as seq 1.
+                outputs: vec![frame(0, &[ArgValue::UInt8(18), ArgValue::UInt32(0x1234)])],
+            },
+        ];
+        let mcu = mcu_with(dictionary(), mappings);
 
-        // 3 commands + 3 responses; the dictionary has no identify entries.
-        assert_eq!(mcu.install_dictionary(dictionary()).unwrap(), 6);
-        assert!(mcu.is_identified());
+        mcu.send_msg(&DebugPing(data)).unwrap();
 
-        let installed = mcu.dictionary().expect("dictionary installed");
-        assert_eq!(installed.constant_f64("CLOCK_FREQ"), Some(20_000_000.0));
+        // The device compares frames in FIFO order, so this response can only
+        // arrive if the typed send really put `debug_ping` on the wire first.
+        let state = mcu
+            .call_msg::<GetClock, ClockState>(&GetClock, Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(state.clock, 0x1234);
     }
 
     #[tokio::test]
@@ -760,36 +782,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_call_msg_roundtrip() {
-        // The command encodes to its firmware id (5); the response is
-        // `clock clock=%u` (id 18) with the clock value 0x1234.
+        // `get_uptime` encodes to its firmware id (4); the response is
+        // `uptime high=%u clock=%u` (id 17), decoded by name.
         let mappings = vec![MappingEntry {
-            input: Frame::new(0, payload(&[ArgValue::UInt8(5)])),
-            outputs: vec![Frame::new(
+            input: frame(0, &[ArgValue::UInt8(4)]),
+            outputs: vec![frame(
                 0,
-                payload(&[ArgValue::UInt8(18), ArgValue::UInt32(0x1234)]),
-            )],
-        }];
-        let mcu = mcu_with(dictionary(), mappings);
-
-        let response = mcu
-            .call_msg::<GetClock, ClockState>(&GetClock, Duration::from_secs(1))
-            .await
-            .unwrap();
-
-        assert_eq!(response, ClockState { clock: 0x1234 });
-    }
-
-    #[tokio::test]
-    async fn test_call_msg_decodes_multiple_parameters_by_name() {
-        let mappings = vec![MappingEntry {
-            input: Frame::new(0, payload(&[ArgValue::UInt8(4)])),
-            outputs: vec![Frame::new(
-                0,
-                payload(&[
+                &[
                     ArgValue::UInt8(17),
                     ArgValue::UInt32(1),
-                    ArgValue::UInt32(0xabcd),
-                ]),
+                    ArgValue::UInt32(0x1234),
+                ],
             )],
         }];
         let mcu = mcu_with(dictionary(), mappings);
@@ -803,25 +806,25 @@ mod tests {
             response,
             Uptime {
                 high: 1,
-                clock: 0xabcd
+                clock: 0x1234
             }
         );
     }
 
     #[tokio::test]
     async fn test_call_msg_times_out_when_mcu_stays_silent() {
-        // Nothing is mapped, so the device never answers. The response name is
-        // known, so the call must reach the timeout path.
+        // Nothing is mapped, so the device never answers. Both names are known,
+        // so the call must reach the timeout path.
         let mcu = mcu_with(dictionary(), Vec::new());
 
         let err = mcu
-            .call_msg::<GetClock, IsShutdown>(&GetClock, Duration::from_millis(50))
+            .call_msg::<GetClock, ClockState>(&GetClock, Duration::from_millis(50))
             .await
             .unwrap_err();
 
         match err {
             McuError::Call(McuCallError::Timeout(msg)) => {
-                assert!(msg.contains("no response for is_shutdown"), "{msg}");
+                assert!(msg.contains("no response for clock"), "{msg}");
             }
             other => panic!("expected a timeout, got {other:?}"),
         }
@@ -860,11 +863,8 @@ mod tests {
         }
 
         let mappings = vec![MappingEntry {
-            input: Frame::new(0, payload(&[ArgValue::UInt8(5)])),
-            outputs: vec![Frame::new(
-                0,
-                payload(&[ArgValue::UInt8(18), ArgValue::UInt32(1)]),
-            )],
+            input: frame(0, &[ArgValue::UInt8(5)]),
+            outputs: vec![frame(0, &[ArgValue::UInt8(18), ArgValue::UInt32(1)])],
         }];
         let mcu = mcu_with(dictionary(), mappings);
 

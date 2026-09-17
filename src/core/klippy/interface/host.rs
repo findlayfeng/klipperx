@@ -346,8 +346,10 @@ impl Drop for HostDevice {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::klippy::interface::Interface;
-    use crate::core::klippy::msg::proto::Payload;
+    use crate::core::klippy::config::mcu::McuConfig;
+    use crate::core::klippy::config::{ConfigSection, ConfigValue};
+    use crate::core::klippy::mcu::Mcu;
+    use crate::core::klippy::msg::proto::ArgValue;
     use std::time::Duration;
 
     // -----------------------------------------------------------------------
@@ -371,63 +373,86 @@ mod tests {
         klipperx_test_support::klipper_host_lib_path()
     }
 
-    /// A full exchange with a real klipper inside the library.
+    /// An `[mcu]` section pointing at the library, so the test configures its MCU
+    /// the way a user's config file would.
+    fn mcu_section() -> ConfigSection {
+        let mut section = ConfigSection::new("mcu", Some("host_test"));
+        section.parameters.insert(
+            "host_library".to_string(),
+            ConfigValue::Single(library_path().display().to_string()),
+        );
+        section
+    }
+
+    /// The identify handshake against a real klipper inside the library.
     ///
-    /// Driven through [`Interface`] rather than [`HostDevice`] so the test also
-    /// covers the dispatch `Interface` adds on top — `HostDevice`'s own building
-    /// blocks are covered by the framer tests above.
+    /// This is the whole bootstrap on real firmware: ask for the payload chunk by
+    /// chunk, reassemble it, decompress it, parse it into a [`Dictionary`], install
+    /// that, and then use what it installed. It is the only test that starts from
+    /// bytes produced by klipper's own build rather than by a fixture, which is
+    /// what makes it worth its cost: the ids, the format strings, and the clock
+    /// frequency all come from the firmware.
+    ///
+    /// [`Dictionary`]: crate::core::klippy::mcu::Dictionary
     #[tokio::test]
-    async fn test_round_trip_against_the_real_library() {
-        const GET_CLOCK: i16 = 5;
-        const CLOCK: i16 = 18;
+    async fn test_identify_against_the_real_library() {
+        let config = McuConfig::new(&mcu_section()).expect("the [mcu] section");
+        assert_eq!(config.name, "host_test");
+        let interface = config.interface.clone();
 
-        let interface = Interface::host(library_path()).unwrap();
-
-        // `Interface::receive` blocks until a frame arrives, so every read gets a
-        // deadline: a test that hangs is worse than one that fails.
-        let read = |what: &'static str, message_id: u8| {
-            let interface = interface.clone();
-            async move {
-                tokio::time::timeout(Duration::from_secs(5), async move {
-                    while let Some(frame) = interface.receive().await {
-                        if frame.payload().first() == Some(&message_id) {
-                            return frame;
-                        }
-                    }
-                    panic!("klipper stream ended before the {what} frame");
-                })
-                .await
-                .unwrap_or_else(|_| panic!("no {what} frame within 5s"))
-            }
-        };
-
-        // Klipper announces itself as soon as its runtime thread is up, which is
-        // what proves the runtime thread, the poller, and the framing all work.
-        let starting = read("starting", 13).await;
-        assert_eq!(starting.payload()[0], 13);
-
-        // `get_clock` takes no arguments, so the payload is just its message id —
-        // the id the library was built with (5), as in its data dictionary.
-        let mut request = Payload::new();
-        request.push_i16(GET_CLOCK).unwrap();
-        interface
-            .send(Frame::new(0, request.into_raw()))
+        // The handshake takes milliseconds; this only bounds a hang in a test that
+        // would otherwise sit in the transport's own 10 second chunk timeout.
+        let mcu = tokio::time::timeout(Duration::from_secs(20), Mcu::connect(config))
             .await
-            .unwrap();
+            .expect("identify handshake timed out")
+            .expect("identify handshake failed");
 
-        // ... and the answer is id 18 followed by a u32 clock.
-        let answer = read("clock", 18).await;
-        let payload = Payload::from_raw(answer.payload().to_vec());
-        let mut parser = payload.as_parser();
-        assert_eq!(parser.pop_i16().unwrap(), CLOCK);
-        let clock = parser.pop_u32().unwrap();
-        assert!(parser.is_empty(), "trailing bytes after clock");
-        debug!("klipper clock reads {clock}");
+        assert!(mcu.is_identified());
+        let dictionary = mcu.dictionary().expect("a dictionary was installed");
 
-        // Shutting down stops the poller, which is what makes a blocked
-        // `receive` return `None` instead of hanging forever.
-        interface.shutdown();
+        // A 40 byte chunk cannot carry the compressed payload (it is ~700 bytes),
+        // so reaching this point means the chunk loop reassembled several of them
+        // - more than the sequence counter has values, since it wraps at 16.
+        let message_count = dictionary.messages().count();
+        assert!(
+            message_count >= 20,
+            "expected the firmware's whole dictionary, got {message_count} messages"
+        );
+
+        // The clock frequency is fixed by the configuration `test-support` builds
+        // the library with, so it pins both the dictionary and that config.
+        assert_eq!(dictionary.constant_f64("CLOCK_FREQ"), Some(20_000_000.0));
+
+        // The two commands used below have to be there, and the host's own
+        // definitions have to have survived the install: the identify pair is in
+        // the firmware dictionary too, and re-registering it would have failed.
+        let get_clock = dictionary.message("get_clock").expect("get_clock");
+        let clock = dictionary.message("clock").expect("clock");
+        assert_eq!(dictionary.message("identify").unwrap().id, 1);
+        debug!(
+            "firmware dictionary: {message_count} messages, get_clock id {}, clock id {}",
+            get_clock.id, clock.id
+        );
+
+        // ... and the dictionary is not just installed but usable: `get_clock` is
+        // answered with the low 32 bits of the firmware's tick counter. The ids are
+        // deliberately not asserted - the point of the dictionary is that the host
+        // does not care what they are.
+        let params = mcu
+            .call("get_clock", &[], "clock", Duration::from_secs(1))
+            .await
+            .expect("get_clock after identify");
+        assert_eq!(params.len(), 1);
+        assert!(
+            matches!(params[0], ArgValue::UInt32(_)),
+            "clock should be a `%u` value, got {:?}",
+            params[0]
+        );
+        debug!("firmware clock reads {:?}", params[0]);
+
+        // Dropping the MCU shuts the device down, which is what lets a process
+        // build another one later; the interface clone shows the effect.
+        drop(mcu);
         assert_eq!(interface.receive().await, None);
-        assert_eq!(interface.receive().await, None, "shutdown is idempotent");
     }
 }

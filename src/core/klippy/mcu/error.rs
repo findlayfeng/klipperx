@@ -49,6 +49,18 @@ pub enum McuError {
     /// The MCU data dictionary is malformed, or a message could not be
     /// registered from it.
     Dictionary(String),
+    /// A command or response name is not in the installed dictionary.
+    ///
+    /// Either the firmware does not implement the message, or the identify
+    /// handshake has not run yet.
+    UnknownMessage(String),
+    /// A response parameter is missing, or does not hold the type the host
+    /// expects. This means the host and the firmware disagree about the
+    /// message — a protocol mismatch, not a transient error.
+    Decode(String),
+    /// The MCU has not completed the identify handshake yet, so no dictionary
+    /// is installed and no command can be resolved.
+    NotIdentified,
     /// A message could not be registered, encoded, or decoded.
     Msg(MsgError),
     /// A synchronous request/response call failed.
@@ -59,6 +71,13 @@ impl std::fmt::Display for McuError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             McuError::Dictionary(msg) => write!(f, "invalid data dictionary: {}", msg),
+            McuError::UnknownMessage(name) => {
+                write!(f, "message not in MCU dictionary: {}", name)
+            }
+            McuError::Decode(msg) => write!(f, "cannot decode response: {}", msg),
+            McuError::NotIdentified => {
+                write!(f, "MCU has not completed the identify handshake")
+            }
             McuError::Msg(e) => write!(f, "{}", e),
             McuError::Call(e) => write!(f, "{}", e),
         }
@@ -70,7 +89,10 @@ impl std::error::Error for McuError {
         match self {
             McuError::Msg(e) => Some(e),
             McuError::Call(e) => Some(e),
-            McuError::Dictionary(_) => None,
+            McuError::Dictionary(_)
+            | McuError::UnknownMessage(_)
+            | McuError::Decode(_)
+            | McuError::NotIdentified => None,
         }
     }
 }
@@ -135,5 +157,21 @@ mod tests {
     fn test_mcu_error_source_chain() {
         let err: McuError = MsgError::new("boom").into();
         assert!(std::error::Error::source(&err).is_some());
+    }
+
+    #[test]
+    fn test_mcu_error_typed_message_variants() {
+        assert_eq!(
+            McuError::UnknownMessage("get_clock".to_string()).to_string(),
+            "message not in MCU dictionary: get_clock"
+        );
+        assert_eq!(
+            McuError::Decode("missing parameter 'clock'".to_string()).to_string(),
+            "cannot decode response: missing parameter 'clock'"
+        );
+        assert_eq!(
+            McuError::NotIdentified.to_string(),
+            "MCU has not completed the identify handshake"
+        );
     }
 }

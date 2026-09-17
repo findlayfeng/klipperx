@@ -1,9 +1,11 @@
+mod codec;
 mod dictionary;
 mod error;
 mod identify;
 mod pending;
 mod restart_method;
 
+pub use codec::{McuCommand, McuResponse, Params};
 pub use dictionary::{Dictionary, Enumeration, MessageDef, OutputDef};
 pub use error::{McuCallError, McuError};
 pub use identify::Identify;
@@ -17,21 +19,30 @@ use crate::core::klippy::mcu::pending::PendingCalls;
 use crate::core::klippy::msg::error::MsgError;
 use crate::core::klippy::msg::parser::Parser;
 use crate::core::klippy::msg::proto::{ArgValue, Payload};
-use std::sync::Arc;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use std::sync::{Arc, Mutex as StdMutex};
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::{sleep, Duration};
 use tracing::{debug, error, info, warn};
 
 /// MCU object that represents a physical microcontroller unit.
 ///
 /// Created by consuming an `McuConfig` which already contains the interface.
+///
+/// The host owns no message formats beyond the identify pair: everything else is
+/// learned from the MCU's data dictionary. [`Mcu::install_dictionary`] is what
+/// turns a freshly created object into a usable one; the typed command API
+/// ([`Mcu::send_msg`] / [`Mcu::call_msg`]) refuses to run before that.
 pub struct Mcu {
     /// MCU name
     name: String,
     /// Message parser for communication
     parser: Parser,
-    /// Parsed identify data from the MCU (populated after identify handshake)
-    identify: Arc<Mutex<Option<Identify>>>,
+    /// The firmware's data dictionary, installed after the identify handshake.
+    ///
+    /// Protected by a plain mutex rather than an async one: it is only read and
+    /// written in short, non-awaiting critical sections, and `send_msg` needs to
+    /// check it from a synchronous context.
+    dictionary: StdMutex<Option<Arc<Dictionary>>>,
     /// Sender for outbound payload queue
     send_buf_tx: mpsc::Sender<Payload>,
     /// Pending synchronous calls waiting for responses.
@@ -181,12 +192,61 @@ impl Mcu {
         Self {
             name,
             parser,
-            identify: Arc::new(Mutex::new(None)),
+            dictionary: StdMutex::new(None),
             send_buf_tx,
             pending_calls,
             interface,
             recv_handle: Some(recv_handle),
         }
+    }
+
+    /// Install the firmware's data dictionary.
+    ///
+    /// This is the second half of the handshake: once the dictionary is known,
+    /// every command and response the firmware implements becomes usable. Two
+    /// things happen:
+    ///
+    /// * commands and responses are registered with the parser. The receive task
+    ///   holds a clone of the same [`Parser`], so decoded messages become
+    ///   available immediately — no task restart, no parser rebuild.
+    /// * the dictionary itself is retained, for enumerations and constants.
+    ///
+    /// Returns the number of messages that were newly registered.
+    ///
+    /// # Errors
+    /// Returns [`McuError`] if a format string cannot be parsed, or if an id or
+    /// name collides with a different, already-registered message.
+    pub fn install_dictionary(&self, dictionary: Dictionary) -> Result<usize, McuError> {
+        // `Parser` is a thin handle over shared state, and `register` only needs
+        // `&mut` on the handle, so cloning it is enough to install while `&self`
+        // is borrowed. The clone shares the registry the receive task uses.
+        let mut parser = self.parser.clone();
+        let installed = dictionary.install(&mut parser)?;
+
+        let mut slot = self.dictionary.lock().expect("dictionary lock poisoned");
+        *slot = Some(Arc::new(dictionary));
+        Ok(installed)
+    }
+
+    /// The installed data dictionary, or `None` before the identify handshake.
+    pub fn dictionary(&self) -> Option<Arc<Dictionary>> {
+        self.dictionary
+            .lock()
+            .expect("dictionary lock poisoned")
+            .clone()
+    }
+
+    /// Whether the identify handshake has installed a dictionary.
+    pub fn is_identified(&self) -> bool {
+        self.dictionary
+            .lock()
+            .expect("dictionary lock poisoned")
+            .is_some()
+    }
+
+    /// Require an installed dictionary before running a typed command.
+    pub(crate) fn require_dictionary(&self) -> Result<Arc<Dictionary>, McuError> {
+        self.dictionary().ok_or(McuError::NotIdentified)
     }
 
     /// Send a batched payload to the MCU.

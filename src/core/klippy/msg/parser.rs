@@ -107,6 +107,17 @@ impl Parser {
         map.get_by_name(name).map(|msg| msg.callback.is_some()).unwrap_or(false)
     }
 
+    /// Look up a registered message by name.
+    ///
+    /// Returns a shared handle to the message definition, which carries the
+    /// parameter names and types as given by the firmware dictionary.
+    /// Returns `None` when the name is unknown, or when the registry lock is
+    /// poisoned.
+    pub fn lookup(&self, name: &str) -> Option<Arc<Msg>> {
+        let map = self.msgs.lock().ok()?;
+        map.get_by_name(name).cloned()
+    }
+
     /// Bind a callback to a registered command.
     ///
     /// If the command already has a callback, the new callback replaces it.
@@ -311,6 +322,24 @@ mod tests {
         let mut parser = Parser::new();
         let result = parser.register(1, "CMD_A x=%u");
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_lookup_returns_registered_message() {
+        let mut parser = Parser::new();
+        parser.register(7, "CMD x=%u y=%s").unwrap();
+
+        let msg = parser.lookup("CMD").expect("registered message");
+        assert_eq!(msg.id, 7);
+        assert_eq!(msg.params.len(), 2);
+        assert_eq!(msg.params[0].0, "x");
+        assert_eq!(msg.params[1].0, "y");
+    }
+
+    #[test]
+    fn test_lookup_unknown_name_is_none() {
+        let parser = Parser::new();
+        assert!(parser.lookup("MISSING").is_none());
     }
 
     #[test]

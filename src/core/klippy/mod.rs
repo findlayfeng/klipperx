@@ -23,7 +23,7 @@ pub mod interface;
 pub use error::KlippyError;
 pub use interface::Interface;
 pub use msg::proto::Payload;
-pub use msg::MsgDef;
+pub use msg::Msg;
 pub use traits::{
     InterfaceEvent, Printer, PrinterEvent, PrinterObject, PrinterState, StateMessage,
 };

@@ -33,7 +33,7 @@ cargo test --lib test_install_skips   # 单个用例（按名过滤）
 
 | 模块 | 覆盖 |
 |------|------|
-| `identify.rs` | 单块与多块拼装（含 4 位序号回绕）、offset 错位、zlib 损坏、非 JSON、MCU 静默、zip bomb 上限、`Mcu::identify` 与 `Mcu::connect` 全流程 |
+| `identify.rs` | 单块与多块拼装（含短末块与 4 位序号回绕）、offset 错位、zlib 损坏、**裸 deflate 被拒**（必须是 zlib 包装）、非 JSON、MCU 静默、zip bomb 上限、`Mcu::identify` 与 `Mcu::connect` 全流程 |
 
 ### `cmd`
 

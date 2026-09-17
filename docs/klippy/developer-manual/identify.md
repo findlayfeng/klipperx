@@ -17,10 +17,22 @@ Identify 是 Klipper 主机端（klippy）与 MCU 端（固件）之间建立通
 
 1. 主机发送 `identify offset=N count=40`，请求从偏移量 N 开始、最多 40 字节的数据
 2. MCU 回复 `identify_response`，携带当前偏移量和数据块
-3. 当 `offset == len(identify_data)` 且数据为空时，表示传输完成
+3. 当固件发回**空数据块**时表示传输完成（固件在 `offset >= isize` 时把 `count` 置 0）
 4. 把完整负载做 **zlib 解压**，再解析成 JSON，得到 `Identify { data }`
 
 与 Klipper 的一个差异：Klipper 在 offset 不匹配时不追加数据、继续用同一 offset 重试（可能无限循环）；本实现直接报 `McuError::IdentifyProtocol`，避免死循环，也避免把错位的数据拼成一份看似合法的字典。
+
+### 固件侧行为（源码依据）
+
+主机这边的几个假设都能在 `third_party/klipper` 里找到出处，列出来是为了让它们不被当成巧合：
+
+| 事实 | 出处 |
+|------|------|
+| 字典是**先压缩再编进固件**的：`command_identify_data` 来自 `zlib.compress`（本仓库的样本构建：699 字节压缩 → 1323 字节解压，头部 `0x78 0xda`，即 zlib 包装 + 最高压缩级别） | `scripts/buildcommands.py` 生成的 `out/compile_time_request.c` |
+| 请求的 `count` 是 `%c`（单字节）；`offset + count` 越过末尾时固件把它截断，`offset >= isize` 时直接发 0 字节 | `src/basecmd.c::command_identify` |
+| 所以**末块可能短于 40 字节**，主机必须按实际收到的长度推进偏移（`fetch_compressed` 用 `payload.len()`），不能假定每块都是 40；而「0 字节」就是完成标记 | 同上 |
+
+因此解压必须用 **zlib**（`ZlibDecoder`）：固件带的头部就是 zlib 的，裸 deflate 虽然数据相同却少了它。`identify.rs::test_decompress_requires_the_zlib_wrapper` 专门钉住这一点；短末块与完成标记由 `test_fetch_single_chunk` / `test_fetch_multiple_chunks_wrapping_sequence_numbers` 覆盖。
 
 ## 代码位置
 

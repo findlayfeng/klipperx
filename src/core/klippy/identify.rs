@@ -278,7 +278,7 @@ mod tests {
     use crate::core::klippy::interface::Interface;
     use crate::core::klippy::mcu::McuRestartMethod;
     use crate::core::klippy::msg::proto::Payload;
-    use flate2::write::ZlibEncoder;
+    use flate2::write::{DeflateEncoder, ZlibEncoder};
     use flate2::Compression;
     use std::io::Write;
     use std::sync::Arc;
@@ -461,6 +461,23 @@ mod tests {
     // -----------------------------------------------------------------------
     // Decompression limits
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_decompress_requires_the_zlib_wrapper() {
+        // The firmware stores the dictionary as `zlib.compress(...)` output, so
+        // the payload starts with a zlib header (`0x78 0xda` at the default
+        // level — verified against a build's `compile_time_request.c`, where the
+        // 699-byte blob decompresses to the 1323-byte dictionary). Raw deflate
+        // carries the same data without that header, and `DeflateDecoder` would
+        // happily accept it, so this pins the wrapper we require.
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(b"{}").unwrap();
+        let raw = encoder.finish().unwrap();
+        assert!(!raw.starts_with(&[0x78]));
+
+        let err = Identify::decompress(&raw).unwrap_err();
+        assert!(matches!(err, McuError::IdentifyCompression(_)), "{err:?}");
+    }
 
     #[test]
     fn test_decompress_rejects_zip_bomb() {

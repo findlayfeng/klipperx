@@ -200,6 +200,113 @@ impl Frame {
     }
 }
 
+// ===========================================================================
+// Stream reassembly
+// ===========================================================================
+
+/// Reassembles frames out of a byte stream.
+///
+/// [`Frame::parse`] handles one frame at a time; a device that transports bytes
+/// needs the stateful half of the same job, because a read can stop mid-frame,
+/// carry several frames, or contain bytes that were corrupted on the way. Every
+/// byte-stream device shares this type — the host library today, a serial port or
+/// a socket next — so no device has to invent its own idea of where a frame ends.
+///
+/// The recovery policy is Klipper's own (`msgblock_check` in
+/// `klippy/chelper/msgblock.c`), and it is about where to look next rather than
+/// how much to guess: a frame ends with a SYNC byte, so after anything invalid the
+/// next SYNC is the cheapest safe place to start again. Dropping one byte at a
+/// time would be worse — the following length byte can then demand more bytes than
+/// will ever arrive, stalling a perfectly good frame behind it.
+///
+/// Two consequences of that policy, both inherited from Klipper:
+///
+/// * junk before a SYNC is discarded together with it, so a frame that arrives
+///   while the stream is desynchronised can be skipped as well;
+/// * a read containing no SYNC at all is dropped entirely, and the stream stays
+///   desynchronised until a SYNC shows up.
+///
+/// # Examples
+///
+/// ```
+/// # use klipperx::core::klippy::frame::{Frame, FrameStream};
+/// let mut stream = FrameStream::new();
+/// stream.push(&Frame::encode(1, b"hello"));
+/// assert_eq!(stream.next(), Some(Frame::new(1, b"hello".to_vec())));
+/// assert_eq!(stream.next(), None); // nothing buffered, nothing claimed
+/// ```
+#[derive(Debug, Default)]
+pub struct FrameStream {
+    buffer: Vec<u8>,
+    /// Set when an error was seen and no SYNC followed it: until the next SYNC,
+    /// every byte in the stream is garbage.
+    needs_sync: bool,
+}
+
+impl FrameStream {
+    /// An empty stream.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add bytes as they arrive.
+    pub fn push(&mut self, bytes: &[u8]) {
+        self.buffer.extend_from_slice(bytes);
+    }
+
+    /// Take the next complete frame, if one has arrived.
+    ///
+    /// Returns `None` both when more bytes are needed and when the buffer is
+    /// unusable, so callers keep feeding the stream until a frame appears or the
+    /// input ends.
+    pub fn next(&mut self) -> Option<Frame> {
+        loop {
+            if self.needs_sync {
+                self.skip_to_sync();
+            }
+            if self.buffer.len() < MESSAGE_MIN {
+                return None;
+            }
+
+            let length = self.buffer[MESSAGE_POS_LEN] as usize;
+            if !(MESSAGE_MIN..=MESSAGE_MAX).contains(&length) {
+                self.skip_to_sync();
+                continue;
+            }
+            if self.buffer.len() < length {
+                return None; // the rest of the frame is still in flight
+            }
+
+            match Frame::parse(&self.buffer[..length]) {
+                Some(frame) => {
+                    self.buffer.drain(..length);
+                    return Some(frame);
+                }
+                // SYNC byte or CRC did not check out.
+                None => self.skip_to_sync(),
+            }
+        }
+    }
+
+    /// Discard everything up to and including the next SYNC byte.
+    ///
+    /// When there is none, the buffer is entirely garbage: drop it and stay
+    /// desynchronised, so the next read is scanned for a SYNC instead of being
+    /// appended to bytes that can never frame anything.
+    fn skip_to_sync(&mut self) {
+        match self.buffer.iter().position(|&byte| byte == MESSAGE_SYNC) {
+            Some(position) => {
+                self.buffer.drain(..=position);
+                self.needs_sync = false;
+            }
+            None => {
+                self.buffer.clear();
+                self.needs_sync = true;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,5 +395,113 @@ mod tests {
         assert_eq!(frame2.payload(), b"def");
         let consumed2 = frame2.frame_length();
         assert_eq!(consumed2, f2.len());
+    }
+
+    // -----------------------------------------------------------------------
+    // FrameStream
+    // -----------------------------------------------------------------------
+
+    /// Feed bytes to a stream the way a device would: in chunks, pulling out
+    /// whatever that completes.
+    fn frames_from(chunks: &[&[u8]]) -> Vec<Frame> {
+        let mut stream = FrameStream::new();
+        let mut frames = Vec::new();
+        for chunk in chunks {
+            stream.push(chunk);
+            while let Some(frame) = stream.next() {
+                frames.push(frame);
+            }
+        }
+        frames
+    }
+
+    #[test]
+    fn test_frame_stream_waits_for_a_whole_frame() {
+        let encoded = Frame::encode(3, b"hello");
+
+        // Nothing until the last byte arrives.
+        for split in 1..encoded.len() {
+            let frames = frames_from(&[&encoded[..split]]);
+            assert!(frames.is_empty(), "framed at {split} of {}", encoded.len());
+        }
+        assert_eq!(
+            frames_from(&[&encoded]),
+            vec![Frame::new(3, b"hello".to_vec())]
+        );
+    }
+
+    #[test]
+    fn test_frame_stream_splits_a_concatenated_stream() {
+        let first = Frame::encode(1, b"abc");
+        let second = Frame::encode(2, b"def");
+        let mut stream = first.clone();
+        stream.extend_from_slice(&second);
+
+        let expected = vec![
+            Frame::new(1, b"abc".to_vec()),
+            Frame::new(2, b"def".to_vec()),
+        ];
+        assert_eq!(frames_from(&[&stream]), expected);
+
+        // Same result when the read boundary falls inside the first frame.
+        let split = first.len() - 1;
+        assert_eq!(frames_from(&[&stream[..split], &stream[split..]]), expected);
+    }
+
+    #[test]
+    fn test_frame_stream_resynchronizes_on_the_next_sync() {
+        let good = Frame::encode(4, b"payload");
+        let mut stream = vec![0xff, 0x00, MESSAGE_SYNC]; // not a frame
+        stream.extend_from_slice(&good);
+
+        assert_eq!(
+            frames_from(&[&stream]),
+            vec![Frame::new(4, b"payload".to_vec())]
+        );
+    }
+
+    #[test]
+    fn test_frame_stream_drops_a_corrupt_frame_and_keeps_the_next() {
+        let mut corrupt = Frame::encode(5, b"payload");
+        corrupt[MESSAGE_MIN] ^= 0xff; // flip a payload byte: CRC no longer matches
+        let good = Frame::encode(6, b"next");
+
+        let mut stream = corrupt;
+        stream.extend_from_slice(&good);
+
+        // The corrupt frame is skipped up to its own trailing SYNC, so the frame
+        // behind it survives — worth pinning, because dropping one byte at a time
+        // instead would resynchronise on a length byte that may never come.
+        assert_eq!(
+            frames_from(&[&stream]),
+            vec![Frame::new(6, b"next".to_vec())]
+        );
+    }
+
+    #[test]
+    fn test_frame_stream_survives_a_read_without_sync() {
+        let good = Frame::encode(7, b"later");
+        let mut stream = FrameStream::new();
+
+        // Too short to judge: nothing is framed and nothing is discarded.
+        stream.push(&[0x01, 0x02, 0x03]);
+        assert_eq!(stream.next(), None);
+        assert!(!stream.needs_sync);
+
+        // A read long enough to hold a frame but with an impossible length byte,
+        // and no SYNC to resynchronise on, is dropped whole: the stream stays
+        // desynchronised instead of trying to frame the junk.
+        stream.push(&[0xff, 0x00, 0x01, 0x02, 0x03]);
+        assert_eq!(stream.next(), None);
+        assert!(stream.needs_sync);
+
+        // The next SYNC ends the resynchronisation: bytes before it are dropped,
+        // and a frame read after it is framed normally.
+        stream.push(&good);
+        assert_eq!(stream.next(), None, "expected to skip the first frame");
+
+        stream.push(&good);
+        assert_eq!(stream.next(), Some(Frame::new(7, b"later".to_vec())));
+        assert!(!stream.needs_sync);
     }
 }

@@ -8,8 +8,9 @@
 //!
 //! **It is a byte stream, not a frame queue.** `klipper_host_output` hands back
 //! raw protocol bytes, which may split a frame across calls or glue several
-//! together, so [`HostDevice::receive`] buffers and frames them itself (the
-//! `Framer` below); `send` goes the other way and encodes a frame to bytes.
+//! together, so [`HostDevice::receive`] buffers them through
+//! [`FrameStream`] — the reassembler every byte-stream device shares; `send` goes
+//! the other way and encodes a frame to bytes.
 //! Neither side needs to know about the other's boundaries.
 //!
 //! **Its main loop blocks.** `klipper_host_run` only returns once
@@ -41,7 +42,7 @@
 //! explicit teardown in [`Drop`].
 
 use super::Device;
-use crate::core::klippy::frame::{Frame, MESSAGE_MAX, MESSAGE_MIN, MESSAGE_POS_LEN, MESSAGE_SYNC};
+use crate::core::klippy::frame::{Frame, FrameStream};
 use crate::core::klippy::traits::InterfaceError;
 use crossbeam_channel::{unbounded, Receiver};
 use libloading::Library;
@@ -54,7 +55,8 @@ use std::thread::{self, JoinHandle};
 use tracing::{debug, info, warn};
 
 /// Bytes asked of `klipper_host_output_wait` per read. Klipper emits at most
-/// [`MESSAGE_MAX`] bytes per frame, so this drains several frames per call.
+/// [`MESSAGE_MAX`](crate::core::klippy::frame::MESSAGE_MAX) bytes per frame, so
+/// this drains several frames per call.
 const OUTPUT_BATCH: usize = 512;
 
 /// How long the output thread blocks in the library when there is nothing to
@@ -110,91 +112,6 @@ impl Symbols {
 }
 
 // ===========================================================================
-// Framing
-// ===========================================================================
-
-/// Reassembles protocol frames out of a byte stream.
-///
-/// The library hands over raw bytes, so a read can stop mid-frame, carry several
-/// frames, or contain bytes corrupted in transit. This is the same recovery
-/// Klipper's own `msgblock_check` (`klippy/chelper/msgblock.c`) implements, and
-/// for the same reason: a frame ends with a SYNC byte, so the cheapest safe
-/// resynchronisation point is the *next* SYNC rather than an educated guess at
-/// how much of the buffer was junk.
-///
-/// Two consequences worth knowing, both inherited from Klipper:
-///
-/// * a bad frame costs every byte up to and including the following SYNC, so a
-///   frame that arrives while [`Framer::need_sync`] is set can be skipped;
-/// * if a read contains no SYNC at all, the whole read is dropped, and the
-///   framer stays desynchronised until a SYNC shows up.
-#[derive(Debug, Default)]
-struct Framer {
-    buffer: Vec<u8>,
-    /// Set when an error was seen and no SYNC followed it: until the next SYNC,
-    /// every byte in the stream is garbage.
-    need_sync: bool,
-}
-
-impl Framer {
-    /// Add bytes as they arrive.
-    fn push(&mut self, bytes: &[u8]) {
-        self.buffer.extend_from_slice(bytes);
-    }
-
-    /// Take the next complete frame, if one has arrived.
-    ///
-    /// Returns `None` both when more bytes are needed and when the buffer is
-    /// unusable, so callers simply keep feeding this until a frame appears.
-    fn next(&mut self) -> Option<Frame> {
-        loop {
-            if self.need_sync {
-                self.skip_to_sync();
-            }
-            if self.buffer.len() < MESSAGE_MIN {
-                return None;
-            }
-
-            let length = self.buffer[MESSAGE_POS_LEN] as usize;
-            if !(MESSAGE_MIN..=MESSAGE_MAX).contains(&length) {
-                self.skip_to_sync();
-                continue;
-            }
-            if self.buffer.len() < length {
-                return None; // the rest of the frame is still in flight
-            }
-
-            match Frame::parse(&self.buffer[..length]) {
-                Some(frame) => {
-                    self.buffer.drain(..length);
-                    return Some(frame);
-                }
-                // SYNC byte or CRC did not check out.
-                None => self.skip_to_sync(),
-            }
-        }
-    }
-
-    /// Discard everything up to and including the next SYNC byte.
-    ///
-    /// When there is none, the buffer is entirely garbage: drop it and stay
-    /// desynchronised, so the next read is scanned for a SYNC instead of being
-    /// appended to bytes that can never frame anything.
-    fn skip_to_sync(&mut self) {
-        match self.buffer.iter().position(|&byte| byte == MESSAGE_SYNC) {
-            Some(position) => {
-                self.buffer.drain(..=position);
-                self.need_sync = false;
-            }
-            None => {
-                self.buffer.clear();
-                self.need_sync = true;
-            }
-        }
-    }
-}
-
-// ===========================================================================
 // HostDevice
 // ===========================================================================
 
@@ -241,7 +158,7 @@ pub struct HostDevice {
     /// Raw bytes from Klipper, in arrival order.
     output: Receiver<Vec<u8>>,
     /// Bytes pulled from `output`, reassembled into frames.
-    framer: Mutex<Framer>,
+    stream: Mutex<FrameStream>,
     /// Set by `shutdown`, checked by both worker threads and by `receive`.
     stopped: Arc<AtomicBool>,
     threads: Mutex<Vec<JoinHandle<()>>>,
@@ -341,7 +258,7 @@ impl HostDevice {
             _library: library,
             library_path,
             output,
-            framer: Mutex::new(Framer::default()),
+            stream: Mutex::new(FrameStream::new()),
             stopped,
             threads: Mutex::new(threads),
         })
@@ -385,13 +302,13 @@ impl Device for HostDevice {
             if self.stopped.load(Ordering::Relaxed) {
                 return None;
             }
-            if let Some(frame) = self.framer.lock().unwrap().next() {
+            if let Some(frame) = self.stream.lock().unwrap().next() {
                 return Some(frame);
             }
             match self.output.recv() {
                 Ok(bytes) => {
                     debug!("received {} bytes from klipper", bytes.len());
-                    self.framer.lock().unwrap().push(&bytes);
+                    self.stream.lock().unwrap().push(&bytes);
                 }
                 // The poller stopped: the stream is over.
                 Err(_) => return None,
@@ -432,115 +349,6 @@ mod tests {
     use crate::core::klippy::interface::Interface;
     use crate::core::klippy::msg::proto::Payload;
     use std::time::Duration;
-
-    // -----------------------------------------------------------------------
-    // Framing — no library needed
-    // -----------------------------------------------------------------------
-
-    /// Feed bytes to a framer the way the poller would: in chunks, pulling out
-    /// whatever completes.
-    fn frames_from(chunks: &[&[u8]]) -> Vec<Frame> {
-        let mut framer = Framer::default();
-        let mut frames = Vec::new();
-        for chunk in chunks {
-            framer.push(chunk);
-            while let Some(frame) = framer.next() {
-                frames.push(frame);
-            }
-        }
-        frames
-    }
-
-    #[test]
-    fn test_framer_waits_for_a_whole_frame() {
-        let encoded = Frame::encode(3, b"hello");
-
-        // Nothing until the last byte arrives.
-        for split in 1..encoded.len() {
-            let frames = frames_from(&[&encoded[..split]]);
-            assert!(frames.is_empty(), "framed at {split} of {}", encoded.len());
-        }
-        assert_eq!(
-            frames_from(&[&encoded]),
-            vec![Frame::new(3, b"hello".to_vec())]
-        );
-    }
-
-    #[test]
-    fn test_framer_splits_a_concatenated_stream() {
-        let first = Frame::encode(1, b"abc");
-        let second = Frame::encode(2, b"def");
-        let mut stream = first.clone();
-        stream.extend_from_slice(&second);
-
-        let expected = vec![
-            Frame::new(1, b"abc".to_vec()),
-            Frame::new(2, b"def".to_vec()),
-        ];
-        assert_eq!(frames_from(&[&stream]), expected);
-
-        // Same result when the read boundary falls inside the first frame.
-        let split = first.len() - 1;
-        assert_eq!(frames_from(&[&stream[..split], &stream[split..]]), expected);
-    }
-
-    #[test]
-    fn test_framer_resynchronizes_on_the_next_sync() {
-        let good = Frame::encode(4, b"payload");
-        let mut stream = vec![0xff, 0x00, MESSAGE_SYNC]; // not a frame
-        stream.extend_from_slice(&good);
-
-        assert_eq!(
-            frames_from(&[&stream]),
-            vec![Frame::new(4, b"payload".to_vec())]
-        );
-    }
-
-    #[test]
-    fn test_framer_drops_a_corrupt_frame_and_keeps_the_next() {
-        let mut corrupt = Frame::encode(5, b"payload");
-        corrupt[MESSAGE_MIN] ^= 0xff; // flip a payload byte: CRC no longer matches
-        let good = Frame::encode(6, b"next");
-
-        let mut stream = corrupt;
-        stream.extend_from_slice(&good);
-
-        // The corrupt frame is skipped up to its own trailing SYNC, so the frame
-        // behind it survives — worth pinning, because dropping one byte at a time
-        // instead would resynchronise on a length byte that may never come.
-        assert_eq!(
-            frames_from(&[&stream]),
-            vec![Frame::new(6, b"next".to_vec())]
-        );
-    }
-
-    #[test]
-    fn test_framer_survives_a_read_without_sync() {
-        let good = Frame::encode(7, b"later");
-        let mut framer = Framer::default();
-
-        // Too short to judge: nothing is framed and nothing is discarded.
-        framer.push(&[0x01, 0x02, 0x03]);
-        assert_eq!(framer.next(), None);
-        assert!(!framer.need_sync);
-
-        // A read long enough to hold a frame but with an impossible length byte,
-        // and no SYNC to resynchronise on, is dropped whole: the framer stays
-        // desynchronised instead of trying to frame the junk.
-        framer.push(&[0xff, 0x00, 0x01, 0x02, 0x03]);
-        assert_eq!(framer.next(), None);
-        assert!(framer.need_sync);
-        assert!(framer.buffer.is_empty());
-
-        // The next SYNC ends the resynchronisation: bytes before it are dropped,
-        // and a frame read after it is framed normally.
-        framer.push(&good);
-        assert_eq!(framer.next(), None, "expected to skip the first frame");
-
-        framer.push(&good);
-        assert_eq!(framer.next(), Some(Frame::new(7, b"later".to_vec())));
-        assert!(!framer.need_sync);
-    }
 
     // -----------------------------------------------------------------------
     // The library itself

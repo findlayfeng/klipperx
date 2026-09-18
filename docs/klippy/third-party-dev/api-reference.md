@@ -100,7 +100,7 @@
 | `state` | string | 打印机状态：`startup` / `ready` / `shutdown` / `error` |
 | `state_message` | string | 状态描述信息 |
 | `hostname` | string | 主机名 |
-| `klipper_path` | string | Klipper 安装路径 |
+| `klipper_path` | string | Klipper 安装路径；本主机没有 Klipper 源码树，报一个**不存在的路径**，理由见下 |
 | `python_path` | string | 解释型主机就报自己的解释器路径；本主机不是解释型的，报一个**不存在的路径**，理由见下 |
 | `process_id` | int | 进程 ID |
 | `user_id` / `group_id` | int | 运行用户/组 ID |
@@ -109,7 +109,7 @@
 | `software_version` | string | Klipper 软件版本 |
 | `cpu_info` | string | CPU 描述字符串，如 `"4 core ARMv7 Processor rev 4 (v7l)"`（非对象，客户端直接展示） |
 
-> **`python_path` 为什么是不存在的路径**：这个字段只有 Moonraker 在用（它自己的文档也标注为 "moonraker use only"），而它把它当作 Klipper 安装的 **virtualenv 解释器**：填进更新项的 `env`，再推导出 `<venv>/bin/python` 跑 `-m pip`（`update_manager/app_deploy.py` 的 `_configure_virtualenv`）。所以存在且可执行、但不是 `<venv>/bin/python` 形状的路径会让 Moonraker **启动失败**（`Invalid virtualenv at path …`，因为 `<parent>/bin/activate` 不存在），而一个不存在的路径只会让 Klipper 更新项退化为 no-op（`update_manager.py` 只在路径存在时才升级 deploy 类）——这正是没有 Klipper 源码树的主机想要的。字段本身必须存在：Moonraker 在 `_save_path_info` 里直接下标取值。
+> **`klipper_path` / `python_path` 为什么是不存在的路径**：这两个键 Moonraker 都在 `_save_path_info` 里直接下标取值（缺了会 `KeyError`），而它只在 `klipper_path` 与 `python_path` 的父目录**都存在**时才给 Klipper 更新项装上真正的 deploy 类（`components/update_manager/update_manager.py`：`os.path.exists(kcfg["path"]) and os.path.exists(kcfg["env"])`），否则退回 `BaseDeploy`（no-op）。本主机没有 Klipper 源码树也没有解释器，报不存在的路径正好让它退化为 no-op。`python_path` 另有一层约束：这个字段只有 Moonraker 在用（它自己的文档也标注为 "moonraker use only"），而它把它当作 Klipper 安装的 **virtualenv 解释器**：填进更新项的 `env`，再推导出 `<venv>/bin/python` 跑 `-m pip`（`update_manager/app_deploy.py` 的 `_configure_virtualenv`）。所以存在且可执行、但不是 `<venv>/bin/python` 形状的路径会让 Moonraker **启动失败**（`Invalid virtualenv at path …`，因为 `<parent>/bin/activate` 不存在）—— 这正是不能报本主机自己二进制的原因。
 
 ---
 

@@ -11,13 +11,15 @@
 //!
 //! # Status
 //!
-//! The parameters and the response shape are defined here; gathering the values
-//! is a `todo!()`. Nothing about the wire contract is open:
+//! Written and registered (see [`super::register`]). The values come from two
+//! places:
 //!
-//! * `state` / `state_message` come from the printer's state message;
+//! * `state` / `state_message` from the printer's state message;
 //! * `hostname`, the two paths, the three ids, `software_version` and
-//!   `cpu_info` come from the host process;
-//! * `log_file` is `null` when klippy was started without a log file.
+//!   `cpu_info` from the host process, the last two through [`StartArgs`].
+//!
+//! `log_file` is `null` when the host is not logging to a file, which it never
+//! is yet: the host logs to stdout.
 //!
 //! ```json
 //! {
@@ -26,27 +28,82 @@
 //!     "state": "ready",
 //!     "state_message": "Printer is ready",
 //!     "hostname": "klipper",
-//!     "klipper_path": "/home/pi/klipper",
-//!     "python_path": "/usr/bin/python3",
+//!     "klipper_path": "/nonexistent/klipper",
+//!     "python_path": "/nonexistent/python3",
 //!     "process_id": 12345,
 //!     "user_id": 1000,
 //!     "group_id": 1000,
-//!     "log_file": "/tmp/klippy.log",
+//!     "log_file": null,
 //!     "config_file": "/home/pi/printer.cfg",
-//!     "software_version": "v0.12.0-123-gabcdef",
+//!     "software_version": "0.1.0",
 //!     "cpu_info": "4 core ARMv7 Processor rev 4 (v7l)"
 //!   }
 //! }
 //! ```
 
+use std::sync::Arc;
+
 use serde::Serialize;
 use serde_json::Value;
+use tracing::info;
 
 use crate::core::klippy::api::protocol::{ApiError, Params, Request};
 use crate::core::klippy::api::registry::{Endpoint, EndpointContext};
+use crate::core::klippy::api::start_args::StartArgs;
+use crate::core::klippy::printer::Printer;
+
+/// The Klipper installation this host does not have.
+///
+/// Upstream reports its own checkout (`klippy/webhooks.py:390`); this host is
+/// not Klipper and has none, so it reports a path that does not exist. That is
+/// the treatment [`InfoResponse::python_path`] documents at length, and it holds
+/// for both fields: Moonraker indexes them without a default
+/// (`moonraker/components/klippy_connection.py`, `_save_path_info`), and only
+/// sets up its Klipper updater when both exist
+/// (`components/update_manager/update_manager.py`:
+/// `os.path.exists(kcfg["path"]) and os.path.exists(kcfg["env"])`), so a path
+/// that does not exist leaves that updater a no-op instead of pointing it at a
+/// directory that is not Klipper. Both keys must still be present strings.
+const NO_KLIPPER_PATH: &str = "/nonexistent/klipper";
+
+/// The interpreter this host does not have. See [`NO_KLIPPER_PATH`].
+const NO_PYTHON_PATH: &str = "/nonexistent/python3";
 
 /// The `info` endpoint.
-pub struct Info;
+pub struct Info {
+    printer: Arc<Printer>,
+    start_args: StartArgs,
+}
+
+impl Info {
+    /// Build the endpoint over the machine whose state it reports and the
+    /// arguments this host was started with.
+    pub fn new(printer: Arc<Printer>, start_args: StartArgs) -> Self {
+        Self {
+            printer,
+            start_args,
+        }
+    }
+
+    /// The response: the printer's state, and the host's own facts.
+    fn response(&self) -> InfoResponse {
+        let state = self.printer.get_state_message();
+        InfoResponse {
+            state: state.category.as_category().to_string(),
+            state_message: state.message,
+            hostname: hostname(),
+            klipper_path: NO_KLIPPER_PATH.to_string(),
+            python_path: NO_PYTHON_PATH.to_string(),
+            process_id: std::process::id(),
+            user_id: current_user_id(),
+            group_id: current_group_id(),
+            log_file: self.start_args.log_file.clone(),
+            config_file: self.start_args.config_file.clone(),
+            software_version: self.start_args.software_version.clone(),
+            cpu_info: self.start_args.cpu_info.clone(),
+        }
+    }
+}
 
 impl Endpoint for Info {
     fn path(&self) -> &'static str {
@@ -56,18 +113,47 @@ impl Endpoint for Info {
     fn handle(&self, request: &Request, _context: &EndpointContext<'_>) -> Result<Value, ApiError> {
         let params = InfoParams::from_request(request)?;
 
-        // TODO: log `params.client_info` as the connection's rollover
-        // information, as upstream's `set_client_info` does, so a connection
-        // can be told apart in the klippy log.
-        //
-        // TODO: build the response. The printer's state message supplies
-        // `state` and `state_message`; the remaining fields come from the host
-        // process (hostname, the klipper and interpreter paths, the process and
-        // user/group ids, the version, the log and config paths, and the CPU
-        // description). Then return `InfoResponse::into_value`.
-        let _ = params;
-        todo!("info: gather the printer state and host information")
+        // Upstream records `client_info` on the connection so an analysed
+        // shutdown can print who was connected (`WebRequest.set_client_info`);
+        // this host keeps no per-connection record yet, so the identity is
+        // logged and otherwise ignored.
+        if let Some(client_info) = &params.client_info {
+            info!("Client info: {client_info}");
+        }
+
+        Ok(self.response().into_value())
     }
+}
+
+/// The host name, as upstream's `socket.gethostname()` reports it.
+fn hostname() -> String {
+    let mut buf = [0 as libc::c_char; 256];
+    // SAFETY: `buf` is a writable buffer of exactly the length passed, which is
+    // what `gethostname` requires.
+    let result = unsafe { libc::gethostname(buf.as_mut_ptr(), buf.len()) };
+    if result != 0 {
+        return "?".to_string();
+    }
+    // The name is NUL-terminated unless it was truncated to fit; taking the
+    // bytes up to the first NUL (or the whole buffer) covers both.
+    let bytes: Vec<u8> = buf
+        .iter()
+        .take_while(|byte| **byte != 0)
+        .map(|byte| *byte as u8)
+        .collect();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// The effective user id, as upstream's `os.getuid()` reports it.
+fn current_user_id() -> u32 {
+    // SAFETY: `getuid` takes no arguments and cannot fail.
+    unsafe { libc::getuid() }
+}
+
+/// The effective group id, as upstream's `os.getgid()` reports it.
+fn current_group_id() -> u32 {
+    // SAFETY: `getgid` takes no arguments and cannot fail.
+    unsafe { libc::getgid() }
 }
 
 /// The `info` request parameters.
@@ -119,7 +205,8 @@ pub struct InfoResponse {
     pub state_message: String,
     /// Host name of the machine running klippy.
     pub hostname: String,
-    /// Directory holding the klipper installation.
+    /// Directory holding the Klipper installation, or a path that does not
+    /// exist when there is none — see [`NO_KLIPPER_PATH`].
     pub klipper_path: String,
     /// Interpreter running the host software, or a path that does not exist.
     ///
@@ -176,10 +263,35 @@ impl InfoResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::klippy::api::registry::Api;
+    use crate::core::klippy::api::test_support::{context, silent_target};
     use serde_json::json;
 
     fn request(body: &str) -> Request {
         Request::parse(body.as_bytes()).expect("test body is a valid request")
+    }
+
+    /// The start arguments a host would have gathered.
+    fn start_args() -> StartArgs {
+        StartArgs {
+            config_file: "/home/pi/printer.cfg".to_string(),
+            log_file: None,
+            software_version: "0.1.0".to_string(),
+            cpu_info: "4 core ARMv7 Processor rev 4 (v7l)".to_string(),
+        }
+    }
+
+    fn endpoint() -> (Info, Arc<Printer>) {
+        let printer = Arc::new(Printer::new());
+        (Info::new(Arc::clone(&printer), start_args()), printer)
+    }
+
+    /// Run one `info` request through the endpoint.
+    fn ask(endpoint: &Info, body: &str) -> Value {
+        let api = Api::new();
+        endpoint
+            .handle(&request(body), &context(&api, silent_target()))
+            .unwrap()
     }
 
     fn sample() -> InfoResponse {
@@ -201,7 +313,64 @@ mod tests {
 
     #[test]
     fn test_the_endpoint_path_is_the_documented_one() {
-        assert_eq!(Info.path(), "info");
+        let (endpoint, _printer) = endpoint();
+        assert_eq!(endpoint.path(), "info");
+    }
+
+    #[test]
+    fn test_the_handler_reports_the_printers_state() {
+        let (endpoint, printer) = endpoint();
+
+        let response = ask(&endpoint, r#"{"method":"info"}"#);
+        assert_eq!(response["state"], "startup");
+        assert_eq!(response["state_message"], "Starting up");
+
+        printer.invoke_shutdown("Printer is halted");
+
+        let response = ask(&endpoint, r#"{"method":"info"}"#);
+        assert_eq!(response["state"], "shutdown");
+        assert_eq!(response["state_message"], "Printer is halted");
+    }
+
+    #[test]
+    fn test_the_handler_reports_the_host_arguments() {
+        let (endpoint, _printer) = endpoint();
+
+        let response = ask(&endpoint, r#"{"method":"info"}"#);
+
+        assert_eq!(response["config_file"], "/home/pi/printer.cfg");
+        assert_eq!(response["software_version"], "0.1.0");
+        assert_eq!(response["cpu_info"], "4 core ARMv7 Processor rev 4 (v7l)");
+        assert_eq!(response["log_file"], Value::Null);
+        assert_eq!(response["process_id"], std::process::id());
+    }
+
+    #[test]
+    fn test_the_two_klipper_paths_are_present_and_do_not_exist() {
+        // See `NO_KLIPPER_PATH`: Moonraker indexes both without a default and
+        // only enables its Klipper updater when both exist, so "present but
+        // nonexistent" is the answer for a host that has neither.
+        let (endpoint, _printer) = endpoint();
+
+        let response = ask(&endpoint, r#"{"method":"info"}"#);
+
+        for key in ["klipper_path", "python_path"] {
+            let path = response[key].as_str().expect("a string");
+            assert!(!path.is_empty(), "{key} is empty");
+            assert!(!std::path::Path::new(path).exists(), "{key} exists: {path}");
+        }
+    }
+
+    #[test]
+    fn test_client_info_is_logged_but_never_answered() {
+        let (endpoint, _printer) = endpoint();
+
+        let response = ask(
+            &endpoint,
+            r#"{"method":"info","params":{"client_info":{"name":"Moonraker"}}}"#,
+        );
+
+        assert!(!response.as_object().unwrap().contains_key("client_info"));
     }
 
     #[test]

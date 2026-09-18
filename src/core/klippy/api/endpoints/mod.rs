@@ -8,19 +8,16 @@
 //!
 //! # Status
 //!
-//! Only `info` exists so far, and only its definition: the handler body is a
-//! `todo!()`, so it is deliberately **not registered** — a request to an
-//! unregistered path gets `no registered callback`, whereas a registered
-//! `todo!()` would panic and drop the connection. The rest of the documented
-//! surface is not written yet — the table below is the checklist, and because
-//! nothing but the built-in is registered, `list_endpoints` currently reports
-//! one path.
+//! [`info`](info), [`objects/list`](objects_list) and [`objects/query`](objects_query)
+//! are written and registered by [`register`](super::register); the rest of the
+//! documented surface is not written yet, so the table below is the checklist
+//! and `list_endpoints` reports those three plus the built-in.
 //!
 //! | Endpoint | Status |
 //! |---|---|
-//! | `info` | defined, handler `todo!()`, **not registered** |
+//! | `info` | done |
 //! | `list_endpoints` | done ([`registry`](super::registry)) |
-//! | `objects/list`, `objects/query` | done, **not registered** (no host builds a printer yet) |
+//! | `objects/list`, `objects/query` | done |
 //! | `objects/subscribe` | not started — needs the reactor |
 //! | `emergency_stop` | not started |
 //! | `register_remote_method` | not started |

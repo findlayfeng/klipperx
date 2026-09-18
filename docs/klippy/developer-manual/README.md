@@ -175,12 +175,14 @@ identify 的命令**定义**（名称、参数、解码）与其它命令一样�
 
 客户端一侧的入口，对应 klipper 的 `klippy/webhooks.py`：外部工具（Fluidd / Mainsail / Moonraker 等）连上 API server，发 `0x03` 分隔的 JSON 请求。监听位置由 `-a/--api-server` 给出：默认是 Unix Domain Socket 路径（与上游一致），写成 `tcp:<host>:<port>` 则监听 TCP；**不给这个选项就不起服务**，这一点也与上游一致。线上的形状（请求/应答、无 `id` 不应答、推送模板、错误文案）以 [Klippy API 参考](../third-party-dev/api-reference.md) 为准，两边要一起改。
 
-主机这边只有两个文件：`mod.rs`（说明 + 转出 `klippy-api` 的类型）与 `endpoints/`。
+主机这边是 `mod.rs`（说明 + 转出 `klippy-api` 的类型 + `register`）、`endpoints/`、`webhooks.rs` 与 `start_args.rs`。
 
 | 文件 | 职责 |
 |------|------|
-| `mod.rs` | 说明主机侧与 API 的分界，并把 `klippy-api` 的四个模块转出，主机代码不必到处跨包 |
-| `endpoints/` | 一个端点一个文件；目前只有 `info.rs`，且 handler 为 `todo!()`、**尚未注册**，参数与响应形状（`InfoParams` / `InfoResponse`）已定义 |
+| `mod.rs` | 说明主机侧与 API 的分界，把 `klippy-api` 的四个模块转出，并提供 `register`：一次把服务器这一侧（`webhooks` + 端点）装到机器上 |
+| `endpoints/` | 一个端点一个文件：`info.rs`、`objects_list.rs`、`objects_query.rs`；参数、响应形状与 handler 都在各文件里 |
+| `webhooks.rs` | 服务器自己的打印机对象：名字与字段对齐上游 `webhooks.get_status`，读的是机器状态 |
+| `start_args.rs` | 主机启动参数（`config_file` / `log_file` / `software_version` / `cpu_info`）：上游放在 printer 上（29 处 `get_start_args`），这里归主机侧，`info` 是第一个消费者 |
 
 API 本身在 `crates/klippy-api/src/`：
 

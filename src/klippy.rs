@@ -4,7 +4,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
-use crate::core::klippy::api::{self, AddressError, Api, ApiTarget, Server};
+use crate::core::klippy::api::{self, AddressError, Api, ApiTarget, Server, StartArgs};
 use crate::core::klippy::config::Config;
 use crate::core::klippy::printer::Printer;
 
@@ -158,7 +158,7 @@ pub fn run(
         // (`klippy/klippy.py:36-40`) and no path is half-built when a request
         // arrives. Everything is registered before the listener is bound.
         let mut api = Api::new();
-        api::register(&mut api, &printer)?;
+        api::register(&mut api, &printer, StartArgs::collect(config_file.clone()))?;
         let api = Arc::new(api);
 
         let server = match target {

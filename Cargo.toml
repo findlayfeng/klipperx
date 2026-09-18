@@ -14,6 +14,10 @@ path = "src/main.rs"
 name = "klippy"
 path = "src/bin/klippy/main.rs"
 
+[[bin]]
+name = "klippy-client"
+path = "src/bin/klippy-client/main.rs"
+
 [lib]
 name = "klipperx"
 path = "src/lib.rs"

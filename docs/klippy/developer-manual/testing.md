@@ -20,6 +20,7 @@ cargo test --lib                      # 全部单元测试
 cargo test --lib mcu                  # mcu 层
 cargo test --lib cmd::tests          # 单个命令模块
 cargo test --lib api::server         # API 层的连接与监听（会真开 socket）
+cargo test --lib client              # 客户端（同样会真开 socket）
 cargo test --lib test_install_skips   # 单个用例（按名过滤）
 ```
 
@@ -68,7 +69,7 @@ cargo test --lib test_install_skips   # 单个用例（按名过滤）
 
 ### `api`
 
-两层测法：协议与寄存器层**不需要 socket**（`ClientConnection::receive` 直接吃字节，推送由实现了 `PushTarget` 的测试替身接住）；监听与连接层用**真的 socket**，在临时目录里 bind Unix socket、在 `127.0.0.1:0` 上 bind TCP，然后真连上去发请求。唯一还没被覆盖的是 `info` 的 handler（`todo!()`，且因此尚未注册）。
+两层测法：协议与寄存器层**不需要 socket**（`ClientConnection::receive` 直接吃字节，推送由实现了 `PushTarget` 的测试替身接住）；监听与连接层用**真的 socket**，在临时目录里 bind Unix socket、在 `127.0.0.1:0` 上 bind TCP，然后真连上去发请求。唯一还没被覆盖的是 `info` 的 handler（`todo!()`，且因此尚未注册）。手工验证用 `klipperx api` / `klipperx console`（见 [第三方开发手册](../third-party-dev/README.md)）。
 
 | 模块 | 覆盖 |
 |------|------|
@@ -77,6 +78,16 @@ cargo test --lib test_install_skips   # 单个用例（按名过滤）
 | `registry.rs` | 路径唯一（普通端点与 mux 路径同一命名空间）、mux 各实例的 key 必须一致且 value 不重复、`list_endpoints` 排序并含 mux 路径、按名分发与未知方法报错、端点拿得到自己的连接、mux 按 key 选实例 / 缺 key / 未知值 / 非字符串值、注册 `None` 时 key 可省略；remote method 的模板合并推送、多连接、重复注册替换模板、已断开连接被清理、无活动连接与未注册两种错误 |
 | `server.rs` | **真 socket**：Unix 与 TCP 各一个往返、TCP 上报的 target 是绑定后的地址（不是 `:0`）、未知方法与 handler 失败都回 `error`、一次写里两条请求按序应答、跨 TCP 分段的消息只应答一次、两个客户端同时被服务。**socket 文件**：遗留文件名被 bind 替换成真 socket、server 被 abort 后文件消失。**单连接**（无 socket）：应答字段顺序（`id` 在前，靠不经 `Value` 直接序列化保证）、无 `id` 不应答、畸形消息被跳过而连接继续可用、推送与应答同样入队、连接关闭后不再入队、`push` 能唤醒等待方（用 `Notify`，带超时断言）、空发件箱 flush 直接成功、写不进去的客户端被 5 秒超时切断（用 `start_paused` 让暂停时钟直接跳过这 5 秒，无需真等） |
 | `endpoints/info.rs` | 端点路径、`client_info` 可省略且必须是对象、响应 12 个字段与文档逐个对齐、`log_file` 为 `None` 时是 `null` 而非缺字段、响应不回显 `client_info`（handler 体是 `todo!()`，所以只测定义） |
+
+### `client`
+
+同样是**真 socket**：每个用例自己起一个 `Server`（Unix 或 TCP），然后用客户端连上去，因此这一层测的是「两边真的能对话」，而不是各自的自说自话。
+
+| 模块 | 覆盖 |
+|------|------|
+| `client.rs` | `PARAMS` 必须是 JSON 对象（数组 / 数字 / 非 JSON 分别报错并说明实际类型）、`--api-server` 与主机同一套解析（socket 路径、`tcp:`、`http://` 被拒） |
+| `client/connection.rs` | 请求得到应答且 `id` 与发出的方法名配对、错误应答仍然是应答（可读到 `error.message`）、无 `id` 的消息归为推送、`"id": null` 发出后不等待也不登记、一次读里的多条消息都会被依次交出、连接被挂断时报连接错误而不是挂着、连不上时错误里带上尝试过的地址、**被取消的读不会影响下一次读**（console 每读一行输入都会与 socket 竞争，这条是回归测试）、TCP 也能连 |
+| `client/console.rs` | 裸方法名会补 `id`、方法 + JSON 参数、参数写错只提示不结束会话、整条 JSON 原样发送（显式 `id` 不被覆盖、缺 `id` 时补上、`"id": null` 保留）、缺 `method` 本地拒绝、本地命令不发给服务端、`.subscribe <名字>` 的请求体、`.subscribe` 无参数时先 `objects/list` 再订阅全部、失败应答的报错文本、打印格式（短载荷同行、结构化载荷在标签下方缩进） |
 
 ### 帧与字节流
 
@@ -106,7 +117,7 @@ cargo test --lib test_install_skips   # 单个用例（按名过滤）
 
 ## 文档同步
 
-改动 `msg` / `mcu` / `cmd` / `event` / `identify` / `api` 的公开 API 或分层职责时，请同时更新本手册对应页面（见 [开发手册首页](README.md) 的目录）。
+改动 `msg` / `mcu` / `cmd` / `event` / `identify` / `api` / `client` 的公开 API 或分层职责时，请同时更新本手册对应页面（见 [开发手册首页](README.md) 的目录）。
 
 `cargo doc --no-deps --lib` 的警告数应与改动前一致（目前库里已有 10 条残留于 `frame.rs` / `kinematics` / `msg/parser.rs` / `printer.rs`）。新增模块时注意两个陷阱：
 

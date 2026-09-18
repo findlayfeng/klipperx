@@ -20,8 +20,12 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::time::Instant;
 
+use serde_json::Value;
 use tracing::error;
+
+use crate::core::klippy::error::KlippyError;
 
 // ===========================================================================
 // PrinterState
@@ -122,15 +126,46 @@ const MESSAGE_STARTUP: &str = "Starting up";
 /// The message reported once the printer is ready.
 const MESSAGE_READY: &str = "Printer is ready";
 
-/// The machine a host runs: its lifecycle, and the state it reports.
+// ===========================================================================
+// StatusSource
+// ===========================================================================
+
+/// A part of the machine that can report its state to a client.
+///
+/// Each registered source is one printer object as far as `objects/list`,
+/// `objects/query` and `objects/subscribe` are concerned: its keys are the
+/// fields a client may ask for. Upstream's objects opt in by defining
+/// `get_status(eventtime)`; here the trait is the opt-in, so the machine's
+/// status table holds exactly the objects a client can see.
+///
+/// `eventtime` is the printer's monotonic clock ([`Printer::eventtime`]), which
+/// a source may use to date what it reports — upstream passes the reactor's
+/// clock for the same reason.
+pub trait StatusSource: Send + Sync {
+    /// Report this object's status as a JSON object.
+    ///
+    /// Must not block: it is called on whatever thread asks, including the API
+    /// connection that is waiting for the reply.
+    fn get_status(&self, eventtime: f64) -> Value;
+}
+
+/// The machine a host runs: its lifecycle, the state it reports, and the parts
+/// that can report status of their own.
 ///
 /// Shared rather than borrowed (`&self` throughout): an exit request arrives
 /// from another thread — the API server, in the host — while the run loop is
-/// idling.
+/// idling, and status queries are answered on the connection that asked.
 pub struct Printer {
     inner: Mutex<Inner>,
     /// Paired with `inner`, to wake the run loop when an exit is requested.
     exit_requested: Condvar,
+    /// What status queries are dated from.
+    started: Instant,
+    /// The parts that can report status, in registration order.
+    ///
+    /// Empty until a part registers itself: the machine has none of its own,
+    /// and the API server's `webhooks` object is the host's, not the machine's.
+    status: Mutex<Vec<(String, Arc<dyn StatusSource>)>>,
 }
 
 struct Inner {
@@ -147,7 +182,13 @@ struct Inner {
 }
 
 impl Printer {
-    /// Create a printer that has not come up yet.
+    /// Create a printer that has not come up yet, with no parts registered.
+    ///
+    /// Nothing reports status until a part registers itself — and the first one
+    /// to do so is the host's API server, with the `webhooks` object upstream
+    /// registers in `Printer.__init__`. A client cannot be connected before
+    /// that: the host registers the server's objects and endpoints before it
+    /// binds the socket.
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(Inner {
@@ -158,7 +199,75 @@ impl Printer {
                 handlers: HashMap::new(),
             }),
             exit_requested: Condvar::new(),
+            started: Instant::now(),
+            status: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Seconds since the printer was built, the clock status is dated with.
+    ///
+    /// Monotonic and near zero at startup, which is what a client needs to tell
+    /// one report from the next. Upstream reads the reactor's clock here; the
+    /// reactor arrives with the run loop (see the `TODO`s), and this stands in
+    /// for it until then.
+    pub fn eventtime(&self) -> f64 {
+        self.started.elapsed().as_secs_f64()
+    }
+
+    /// Register a part of the machine that can report status.
+    ///
+    /// Registration order is the order `objects/list` reports, and the order
+    /// upstream's registry uses.
+    ///
+    /// # Errors
+    /// Returns [`KlippyError::Internal`] if `name` is already taken: two parts
+    /// answering to one name is a wiring mistake in klippy that no client can
+    /// provoke. (It deserves an error type of its own; the vocabulary is still
+    /// missing — see the `TODO`.)
+    pub fn add_status_object(
+        &self,
+        name: &str,
+        source: Arc<dyn StatusSource>,
+    ) -> Result<(), KlippyError> {
+        let mut status = self.status.lock().unwrap_or_else(|p| p.into_inner());
+        if status.iter().any(|(taken, _)| taken == name) {
+            return Err(KlippyError::Internal(format!(
+                "printer object '{name}' already has status"
+            )));
+        }
+        status.push((name.to_string(), source));
+        Ok(())
+    }
+
+    /// The names of the registered status objects, in registration order.
+    pub fn status_objects(&self) -> Vec<String> {
+        self.status
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
+    /// Ask one registered object for its status.
+    ///
+    /// Returns `None` for a name nobody registered; the caller decides what an
+    /// unknown object means (upstream answers an empty status rather than
+    /// failing the request).
+    ///
+    /// The source is called without the table's lock held: a source may ask the
+    /// printer something of its own — the API server's `webhooks` object reads
+    /// the state this very type keeps — and a lock held across it would
+    /// deadlock there.
+    pub fn status_of(&self, name: &str, eventtime: f64) -> Option<Value> {
+        let source = {
+            let status = self.status.lock().unwrap_or_else(|p| p.into_inner());
+            status
+                .iter()
+                .find(|(taken, _)| taken == name)
+                .map(|(_, source)| Arc::clone(source))
+        }?;
+        Some(source.get_status(eventtime))
     }
 
     /// Get the current state message and category.
@@ -523,5 +632,102 @@ mod tests {
         let state = printer.get_state_message();
         assert_eq!(state.message, "Printer is halted");
         assert_eq!(state.category, PrinterState::Shutdown);
+    }
+
+    /// A source whose status the test wrote.
+    struct Fixed(Value);
+
+    impl StatusSource for Fixed {
+        fn get_status(&self, _eventtime: f64) -> Value {
+            self.0.clone()
+        }
+    }
+
+    #[test]
+    fn test_a_new_printer_has_no_status_objects() {
+        // The machine has no parts yet, and the first object a host registers —
+        // the API server's `webhooks` — is the host's, not the machine's.
+        let printer = Printer::new();
+
+        assert_eq!(printer.status_objects(), Vec::<String>::new());
+        assert_eq!(printer.status_of("webhooks", printer.eventtime()), None);
+    }
+
+    #[test]
+    fn test_status_objects_come_back_in_registration_order() {
+        let printer = Printer::new();
+        for name in ["webhooks", "extruder", "heater_bed"] {
+            printer
+                .add_status_object(name, Arc::new(Fixed(serde_json::json!({}))))
+                .unwrap();
+        }
+
+        assert_eq!(
+            printer.status_objects(),
+            ["webhooks", "extruder", "heater_bed"]
+        );
+    }
+
+    #[test]
+    fn test_a_duplicate_status_object_is_rejected() {
+        let printer = Printer::new();
+        printer
+            .add_status_object(
+                "webhooks",
+                Arc::new(Fixed(serde_json::json!({"by": "first"}))),
+            )
+            .unwrap();
+
+        let err = printer
+            .add_status_object(
+                "webhooks",
+                Arc::new(Fixed(serde_json::json!({"by": "second"}))),
+            )
+            .unwrap_err();
+
+        assert!(err.to_string().contains("webhooks"), "{err}");
+        // The first registration stands.
+        assert_eq!(
+            printer.status_of("webhooks", 0.0),
+            Some(serde_json::json!({"by": "first"}))
+        );
+    }
+
+    #[test]
+    fn test_an_unregistered_object_has_no_status() {
+        let printer = Printer::new();
+
+        assert_eq!(printer.status_of("nope", printer.eventtime()), None);
+    }
+
+    #[test]
+    fn test_status_queries_are_handed_the_object_that_was_asked_for() {
+        let printer = Printer::new();
+        printer
+            .add_status_object("echo", Arc::new(Fixed(serde_json::json!({"who": "echo"}))))
+            .unwrap();
+        printer
+            .add_status_object(
+                "other",
+                Arc::new(Fixed(serde_json::json!({"who": "other"}))),
+            )
+            .unwrap();
+
+        assert_eq!(
+            printer.status_of("other", 0.0),
+            Some(serde_json::json!({"who": "other"}))
+        );
+    }
+
+    #[test]
+    fn test_eventtime_is_monotonic_and_starts_near_zero() {
+        let printer = Printer::new();
+
+        let first = printer.eventtime();
+        thread::sleep(std::time::Duration::from_millis(5));
+        let second = printer.eventtime();
+
+        assert!((0.0..1.0).contains(&first), "{first}");
+        assert!(second > first, "{second} <= {first}");
     }
 }

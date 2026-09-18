@@ -10,9 +10,12 @@
 
 ## 动手试一下
 
-`klipperx` 自带两个客户端子命令，用的是与本文档相同的协议（`0x03` 分隔的 JSON），
+仓库里自带两个客户端子命令，用的是与本文档相同的协议（`0x03` 分隔的 JSON），
 可以直接拿来对照实现。两者都接受与主机相同的 `-a/--api-server` 写法：socket 路径，
 或 `tcp:<host>:<port>`。
+
+下面用 `klipperx` 写；只想装客户端的那台机器可以用独立二进制 `klippy-client`，
+子命令与参数完全一致（`klippy-client api …`、`klippy-client console …`）。
 
 发一条请求并打印应答：
 

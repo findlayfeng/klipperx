@@ -134,6 +134,18 @@ identify 的命令**定义**（名称、参数、解码）与其它命令一样�
 
 端点自己不拼应答信封：它只返回 payload 或 `ApiError`，`id` 的回显与「无 `id` 就不应答」由 `protocol.rs` 一处决定，端点无从弄错。
 
+## 二进制
+
+| 二进制 | 入口 | 是什么 |
+|--------|------|--------|
+| `klipperx` | `src/main.rs` | 项目的 CLI：`klippy`（跑主机）、`api`、`console` |
+| `klippy` | `src/bin/klippy/main.rs` | 只有主机，等价于 `klipperx klippy`（名字取自上游的 `klippy.py`） |
+| `klippy-client` | `src/bin/klippy-client/main.rs` | 只有客户端，等价于 `klipperx api` / `klipperx console` |
+
+参数定义全在库里（`klippy::AppArgs`、`client::ApiArgs` / `ConsoleArgs`），二进制只做三件事：解析命令行、装日志（`logging::init`）、把错误打成一行并以退出码 1 结束。后两个二进制只装载各自那部分，因此命令行与帮助文本是干净的。
+
+注意 `[[bin]]` 目标**共用同一个库**：单独编译 `klippy-client` 并不会少编一个依赖——这个 crate 的依赖是一套（`reqwest`、`flate2`、`libloading` 等主机要用的东西依旧会一起编），只是命令行是客户端而已。真要一个不带主机依赖的客户端，得把 api 层的 `protocol` / `address` 抽成单独的 crate，让客户端二进制只依赖它；现在没这么做。
+
 ## 目录
 
 - [消息编解码（msg）](message-structure.md) — `Msg` / `ArgType` / `ArgValue` / `Payload`

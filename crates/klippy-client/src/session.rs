@@ -489,7 +489,8 @@ Local commands:
   .subscribe a b watch only the named objects
   .quit          leave, after printing any reply still owed (also ^D)
 
-Replies print as `<id> (<method>) <result>`; pushes print as `< <message>`."
+Replies and pushes carry their direction; line mode prints one compact JSON line
+each, the window shows the body as YAML by default."
 }
 
 /// One line, as the protocol is written on the wire.

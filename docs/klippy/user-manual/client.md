@@ -132,14 +132,19 @@ $ klippy-client api -a /tmp/klippy_uds list_endpoints
 ```text
 ● ready · Printer is ready
 Connected to unix:/tmp/klippy_uds.
-1 > {"id":1,"method":"info","params":{}}
-2 > {"id":2,"method":"list_endpoints","params":{}}
-2 (list_endpoints)
-endpoints:
-- list_endpoints
-- info
-- objects/list
-- objects/query
+> id: 1
+  method: info
+  params: {}
+> id: 2
+  method: list_endpoints
+  params: {}
+< id: 2
+  result:
+    endpoints:
+    - list_endpoints
+    - info
+    - objects/list
+    - objects/query
 klippy> objects/query {objects: {toolhead: [position]}}
 Enter send · ↑↓ history · PgUp/PgDn scroll · .help · ^C quit
 ```
@@ -147,9 +152,10 @@ Enter send · ↑↓ history · PgUp/PgDn scroll · .help · ^C quit
 第一行是状态行（左边那个符号：`●` 就绪、`◌` 启动中或状态未知、`▲` 出错/停机、
 `✕` 已断开），最后一行是按键提示，中间是日志，倒数第二行是你的输入。
 
-> 响应与推送渲染成 **YAML**（树状、不用给每个键加引号），而你自己发出去的那行仍是
-> 线上的紧凑 JSON（`Sent`）——窗口看的是数据，不是字节。行模式（`--plain` 或管道）
-> 不这样：它保持“每件事一行”的 JSON，便于重定向和 grep。
+> 每条消息以 `<`（收到）或 `>`（发出）开头、空一格再写正文，正文默认是 **YAML**
+> （树状、不用给每个键加引号）；`.json` / `.yaml` 在窗口里切换正文格式，标记与
+> 空格不变。相邻两条用略有差异的底色隔开。行模式（`--plain` 或管道）不这样：
+> 它保持“每件事一行”的紧凑 JSON，便于重定向和 grep。
 
 ### 按键
 
@@ -194,6 +200,7 @@ Enter send · ↑↓ history · PgUp/PgDn scroll · .help · ^C quit
 | `.subscribe` | 先问主机有哪些对象（`objects/list`），再订阅全部，之后状态变化会持续出现 |
 | `.subscribe <对象> …` | 只订阅指定的对象，例如 `.subscribe toolhead extruder heater_bed` |
 | `.quit`（或 `.exit`） | 退出；已经在路上的应答会先打出来 |
+| `.yaml` / `.json` | **仅窗口**：把消息正文在 YAML（默认）与紧凑 JSON 之间切换，`<`/`>` 标记不变 |
 
 想要停止订阅，直接退出即可：协议规定客户端靠断开连接来取消订阅。
 
@@ -201,10 +208,13 @@ Enter send · ↑↓ history · PgUp/PgDn scroll · .help · ^C quit
 
 | 前缀 | 含义 |
 |------|------|
-| `2 > {"id":2,…}` | 客户端**发出去**的请求（灰色） |
-| `2 (list_endpoints) { … }` | 编号为 2 的请求的应答，括号里是当初发的方法名 |
+| `> id: 2` | 客户端**发出去**的请求（灰色），正文是 YAML |
+| `< id: 2` | 编号为 2 的请求的应答；应答里带 `id`，按它与上面那条对应（`method` 不再重复显示） |
 | `! 3 (objects/query) Missing Argument [objects]` | 请求失败（这里是缺参数），后面是主机的错误说明（红色） |
-| `< {"id": null, "method": "klippy:status", …}` | 主机主动推来的消息，不是你问了才有的 —— 订阅之后就会看到 |
+| `< method: klippy:status` | 主机主动推来的消息（没有 `id`）—— 订阅之后就会看到 |
+
+`.json` 只改正文的写法：上面的前缀变成 `> {"id":2,…}` / `< {"id":2,…}`，
+标记、空格与底色条纹都不变。
 
 ### 没有终端的时候
 

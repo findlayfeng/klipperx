@@ -42,14 +42,20 @@ struct Cli {
 
 #[derive(clap::Subcommand, Debug)]
 enum Commands {
-    /// Run the host: load the config and serve the API
+    // The about comes from `klippy::ABOUT` rather than a doc comment, so that
+    // this subcommand and the `klippy` binary cannot describe themselves
+    // differently.
     //
     // `arg_required_else_help` makes `klipperx klippy` on its own print this
     // help instead of complaining about the config file it was not given:
     // someone who types that is asking what the options are. Any other argument
     // — `klipperx klippy -a /tmp/x` — still gets the complaint, because then they
     // *were* trying to run something.
-    #[command(name = "klippy", arg_required_else_help = true)]
+    #[command(
+        name = "klippy",
+        about = klipperx::klippy::ABOUT,
+        arg_required_else_help = true
+    )]
     Klippy(klipperx::klippy::AppArgs),
 
     /// Send one API request and print the reply

@@ -1,6 +1,6 @@
-# Klippy Web API 参考文档
+# Klippy API 参考文档
 
-本文档描述 Klipper 主机端（klippy）通过 Unix Domain Socket 暴露的 Web API 接口。外部客户端（如 Fluidd、Mainsail、Moonraker）通过这些接口与打印机通信。
+本文档描述 Klipper 主机端（klippy）通过 Unix Domain Socket 暴露的 API 接口。外部客户端（如 Fluidd、Mainsail、Moonraker）通过这些接口与打印机通信。
 
 ## 通信协议概述
 

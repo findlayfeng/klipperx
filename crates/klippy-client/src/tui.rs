@@ -150,6 +150,8 @@ struct App {
     /// log's — but only that one: a later, typed `info` is the user's, and it
     /// belongs in the log like any other reply.
     greeted: bool,
+    /// How message bodies are shown: YAML by default, JSON on demand.
+    format: Format,
 }
 
 /// What the header says about the connection.
@@ -163,6 +165,15 @@ enum Status {
     Closed(String),
 }
 
+/// How the window shows a message body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Format {
+    /// Block YAML: a tree with no quoting, the default.
+    Yaml,
+    /// Compact JSON: the wire form, for when the exact bytes matter.
+    Json,
+}
+
 impl App {
     fn new() -> Self {
         Self {
@@ -172,6 +183,7 @@ impl App {
             status: Status::Unknown,
             quit: false,
             greeted: false,
+            format: Format::Yaml,
         }
     }
 
@@ -186,6 +198,45 @@ impl App {
         }
         if was_at_bottom {
             self.scroll = 0;
+        }
+    }
+
+    /// Handle a local command only the window has.
+    ///
+    /// Returns whether the line was one; the session's own commands
+    /// (`.subscribe`, `.quit`) go to the session. `.yaml` and `.json` are the
+    /// window's because the line front-end has nothing to switch — it is one
+    /// compact JSON line per event by design — and `.help` is answered here so
+    /// that the window's commands sit in the same list as the session's.
+    fn window_command(&mut self, line: &str) -> bool {
+        match line.trim() {
+            ".yaml" | ".json" => {
+                self.format = if line.trim() == ".json" {
+                    Format::Json
+                } else {
+                    Format::Yaml
+                };
+                let name = match self.format {
+                    Format::Yaml => "YAML",
+                    Format::Json => "JSON",
+                };
+                self.push(Entry::notice(
+                    Notice::Info,
+                    format!("message bodies are now {name}"),
+                ));
+                true
+            }
+            ".help" => {
+                self.push(Entry::notice(
+                    Notice::Info,
+                    format!(
+                        "{}\n\nWindow:\n  .yaml / .json   show message bodies as YAML or JSON",
+                        session::usage()
+                    ),
+                ));
+                true
+            }
+            _ => false,
         }
     }
 }
@@ -350,9 +401,11 @@ async fn handle_key(
                 return Ok(Control::Continue);
             }
             app.scroll = 0;
-            match session.handle_line(&line, app).await? {
-                Control::Continue => (),
-                Control::Quit => app.quit = true,
+            if !app.window_command(&line) {
+                match session.handle_line(&line, app).await? {
+                    Control::Continue => (),
+                    Control::Quit => app.quit = true,
+                }
             }
         }
         // Scrolling the log, which is the reason the panes exist: the printer's
@@ -500,15 +553,18 @@ fn visible_lines(app: &App, width: usize, height: usize) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
     let wanted = height + app.scroll;
 
-    for entry in app.entries.iter().rev() {
-        let style = entry_style(entry);
+    for (index, entry) in app.entries.iter().enumerate().rev() {
+        let style = stripe(entry_style(entry), index);
         // Wrapped by hand rather than by `Paragraph::wrap`: the pane has to know
         // how many lines each entry takes to scroll by the right amount.
         // Backwards, like the entries: the pane is collected from its bottom
         // up, so the last wrapped line of an entry is the one nearest the
         // bottom. Collecting forward and reversing the whole list at the end
         // would put an entry's own lines in reverse order.
-        for line in wrap(&entry_text(entry), width).into_iter().rev() {
+        for line in wrap(&entry_text(entry, app.format), width)
+            .into_iter()
+            .rev()
+        {
             lines.push(Line::from(Span::styled(line, style)));
             if lines.len() >= wanted {
                 break;
@@ -547,23 +603,58 @@ fn entry_style(entry: &Entry) -> Style {
     }
 }
 
+/// The dark tint that tells one entry from the next.
+///
+/// Every other entry gets it, so two consecutive messages do not read as one
+/// block. It is a dark grey because the rest of the palette — dim grey info
+/// lines, coloured errors — assumes a dark terminal.
+const STRIPE: Color = Color::Indexed(236);
+
+/// Give alternating entries the stripe background.
+fn stripe(style: Style, index: usize) -> Style {
+    if index % 2 == 1 {
+        style.bg(STRIPE)
+    } else {
+        style
+    }
+}
+
 /// What the window shows for an entry.
 ///
-/// Replies and pushes are trees, and the window renders them as YAML — the
-/// shape a tree is read in, without the quoting a JSON line needs. The line
-/// front-end deliberately keeps the compact JSON instead: it wants one line per
-/// event. Everything already written as a sentence (a sent request, an error, a
-/// notice, a log line) is left to [`Entry::text`].
-fn entry_text(entry: &Entry) -> String {
+/// A message body is a tree, and the window renders it as [`Format::Yaml`] by
+/// default — the shape a tree is read in, without the quoting a JSON line needs
+/// — behind a `<` (received) or `>` (sent) marker. Everything already written as
+/// a sentence (an error, a notice, a log line) is left to [`Entry::text`]; the
+/// line front-end uses that for all of it, deliberately: it wants one compact
+/// JSON line per event.
+fn entry_text(entry: &Entry, format: Format) -> String {
     match entry {
-        Entry::Reply(reply) if !reply.is_error() => format!(
-            "{} ({})\n{}",
-            reply.id,
-            reply.method.as_deref().unwrap_or("?"),
-            yaml(reply.payload())
-        ),
-        Entry::Push(message) => format!("<\n{}", yaml(message)),
+        Entry::Sent { message, .. } => marked('>', &body(message, format)),
+        Entry::Reply(reply) if !reply.is_error() => marked('<', &body(&reply.message, format)),
+        Entry::Push(message) => marked('<', &body(message, format)),
         other => other.text(),
+    }
+}
+
+/// Put a `<`/`>` marker in front of a body, indenting the rest under it.
+fn marked(marker: char, body: &str) -> String {
+    let mut lines = body.lines();
+    let first = lines.next().unwrap_or_default();
+    let mut text = format!("{marker} {first}");
+    for line in lines {
+        text.push('\n');
+        text.push_str("  ");
+        text.push_str(line);
+    }
+    text
+}
+
+/// One value in the window's current [`Format`].
+fn body(value: &Value, format: Format) -> String {
+    match format {
+        Format::Yaml => yaml(value),
+        // The wire form, which is also the last resort of `yaml`.
+        Format::Json => serde_json::to_string(value).unwrap_or_else(|_| "null".to_string()),
     }
 }
 
@@ -968,8 +1059,9 @@ mod tests {
             text.contains("Connected to unix:/tmp/klippy_uds."),
             "{text}"
         );
-        assert!(text.contains("2 > {\"id\":2,"), "{text}");
-        assert!(text.contains("<\nmethod: klippy:status"), "{text}");
+        assert!(text.contains("> id: 2"), "{text}");
+        assert!(text.contains("method: objects/query"), "{text}");
+        assert!(text.contains("< method: klippy:status"), "{text}");
     }
 
     #[test]
@@ -1145,20 +1237,23 @@ mod tests {
         assert_eq!(log_text(&app, 10, 4), ["first", "second"]);
     }
 
-    #[test]
-    fn test_a_reply_is_shown_as_yaml() {
-        let reply = crate::connection::Reply {
+    /// A reply with a known shape.
+    fn query_reply() -> crate::connection::Reply {
+        crate::connection::Reply {
             id: serde_json::json!(2),
             method: Some("objects/query".to_string()),
             message: serde_json::json!({
                 "id": 2,
                 "result": {"eventtime": 1.5, "status": {"mcu": {"mcu_version": "abc"}}}
             }),
-        };
+        }
+    }
 
-        let text = entry_text(&Entry::Reply(reply));
+    #[test]
+    fn test_a_reply_is_shown_as_yaml_behind_a_marker() {
+        let text = entry_text(&Entry::Reply(query_reply()), Format::Yaml);
 
-        assert!(text.starts_with("2 (objects/query)\n"), "{text}");
+        assert!(text.starts_with("< id: 2\n  result:\n"), "{text}");
         assert!(text.contains("eventtime: 1.5"), "{text}");
         assert!(text.contains("mcu_version: abc"), "{text}");
         // Not the compact JSON the wire carries.
@@ -1166,15 +1261,48 @@ mod tests {
     }
 
     #[test]
-    fn test_a_push_is_shown_as_yaml() {
-        let text = entry_text(&Entry::Push(serde_json::json!({
-            "method": "klippy:status",
-            "params": {"state": "ready"}
-        })));
+    fn test_json_keeps_the_marker_and_the_wire_form() {
+        let text = entry_text(&Entry::Reply(query_reply()), Format::Json);
 
-        assert!(text.starts_with("<\n"), "{text}");
-        assert!(text.contains("method: klippy:status"), "{text}");
+        assert!(text.starts_with("< {\"id\":2,"), "{text}");
+        assert!(text.contains("\"mcu_version\":\"abc\""), "{text}");
+        // One line: a JSON body has no continuation to indent.
+        assert_eq!(text.lines().count(), 1, "{text}");
+    }
+
+    #[test]
+    fn test_a_push_is_shown_as_yaml_behind_a_marker() {
+        let text = entry_text(
+            &Entry::Push(serde_json::json!({
+                "method": "klippy:status",
+                "params": {"state": "ready"}
+            })),
+            Format::Yaml,
+        );
+
+        assert!(
+            text.starts_with("< method: klippy:status\n  params:\n"),
+            "{text}"
+        );
         assert!(text.contains("state: ready"), "{text}");
+    }
+
+    #[test]
+    fn test_a_sent_entry_is_shown_behind_a_marker() {
+        let entry = Entry::Sent {
+            id: Some(2),
+            method: "objects/query".to_string(),
+            message: serde_json::json!({"id": 2, "method": "objects/query"}),
+        };
+
+        assert_eq!(
+            entry_text(&entry, Format::Yaml),
+            "> id: 2\n  method: objects/query"
+        );
+        assert_eq!(
+            entry_text(&entry, Format::Json),
+            "> {\"id\":2,\"method\":\"objects/query\"}"
+        );
     }
 
     #[test]
@@ -1188,24 +1316,46 @@ mod tests {
             }),
         };
 
-        assert_eq!(
-            entry_text(&Entry::Reply(reply)),
-            "! 3 (gcode/script) Printer is halted"
+        for format in [Format::Yaml, Format::Json] {
+            assert_eq!(
+                entry_text(&Entry::Reply(reply.clone()), format),
+                "! 3 (gcode/script) Printer is halted"
+            );
+        }
+    }
+
+    #[test]
+    fn test_the_format_command_switches_and_says_so() {
+        let mut app = app_with(Vec::new());
+        assert_eq!(app.format, Format::Yaml, "YAML is the default");
+
+        assert!(app.window_command(".json"));
+        assert_eq!(app.format, Format::Json);
+        assert!(app.window_command(".yaml"));
+        assert_eq!(app.format, Format::Yaml);
+        assert!(
+            !app.window_command(".subscribe"),
+            "the session's own command"
+        );
+        assert!(
+            app.entries
+                .iter()
+                .any(|entry| entry.text().contains("message bodies are now JSON")),
+            "the switch is confirmed in the log"
         );
     }
 
     #[test]
-    fn test_a_sent_entry_stays_the_wire_line() {
-        let entry = Entry::Sent {
-            id: Some(2),
-            method: "objects/query".to_string(),
-            message: serde_json::json!({"id": 2, "method": "objects/query"}),
-        };
+    fn test_adjacent_entries_have_different_backgrounds() {
+        let app = app_with(vec![
+            Entry::notice(Notice::Info, "first"),
+            Entry::notice(Notice::Info, "second"),
+        ]);
 
-        assert_eq!(
-            entry_text(&entry),
-            "2 > {\"id\":2,\"method\":\"objects/query\"}"
-        );
+        let lines = visible_lines(&app, 20, 4);
+
+        assert_eq!(lines[0].spans[0].style.bg, None);
+        assert_eq!(lines[1].spans[0].style.bg, Some(STRIPE));
     }
 
     /// The header's lines as plain text.

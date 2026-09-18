@@ -12,6 +12,10 @@
 //! `load_config_prefix` — the same two entry points upstream looks up on the
 //! module (`klippy/klippy.py:90-99`).
 //!
+//! The step itself is [`Printer::load_config`], defined here rather than in
+//! `printer.rs` so that the machine's core does not import its parts — the same
+//! split as `Mcu::connect` living in `identify.rs`.
+//!
 //! # Order
 //!
 //! Main sections first, in table order, then prefix sections, in table order.
@@ -64,54 +68,70 @@ const FACTORIES: &[(&str, Factories)] = &[(
     },
 )];
 
-/// Load every printer object the config describes into `printer`.
-///
-/// The printer is expected to be freshly built: loading twice would trip the
-/// duplicate-name check, which is the intent — a name is registered once.
-///
-/// # Errors
-/// Returns [`KlippyError::Internal`] if a factory rejects a section, if a name
-/// is already taken, or if a section nothing claims is left over — the last is
-/// upstream's `Section '%s' is not a valid config section`
-/// (`klippy/configfile.py:431`).
-pub fn load_config(config: &Config, printer: &Arc<Printer>) -> Result<(), KlippyError> {
-    let mut claimed: Vec<String> = Vec::new();
+impl Printer {
+    /// Load every printer object the config describes into this machine.
+    ///
+    /// The receiver is `&Arc<Self>` rather than `&self` because a factory is
+    /// handed the shared handle: an object may hold on to the machine it belongs
+    /// to — to register handlers, or to look another object up as it is built.
+    /// Defining this next to the table keeps the machine's core free of its
+    /// parts.
+    ///
+    /// The printer is expected to be freshly built: loading twice would trip the
+    /// duplicate-name check, which is the intent — a name is registered once.
+    ///
+    /// # Order
+    ///
+    /// This is not the first thing that happens to a fresh machine. The API
+    /// server's own object (`webhooks`) is registered *before* the config is
+    /// loaded, so that `objects/list` starts with it as upstream's does (see
+    /// [`api::register`](crate::core::klippy::api::register)); a host that loads
+    /// first and registers it afterwards reorders that list.
+    ///
+    /// # Errors
+    /// Returns [`KlippyError::Internal`] if a factory rejects a section, if a
+    /// name is already taken, or if a section nothing claims is left over — the
+    /// last is upstream's `Section '%s' is not a valid config section`
+    /// (`klippy/configfile.py:431`).
+    pub fn load_config(self: &Arc<Self>, config: &Config) -> Result<(), KlippyError> {
+        let mut claimed: Vec<String> = Vec::new();
 
-    for (id, factories) in FACTORIES {
-        let Some(load) = factories.load_config else {
-            continue;
-        };
-        let Some(section) = config.get_section(id) else {
-            continue;
-        };
-        register(load, section, printer, &mut claimed)?;
-    }
-
-    for (id, factories) in FACTORIES {
-        let Some(load) = factories.load_config_prefix else {
-            continue;
-        };
-        for section in config.get_sections_by_id(id) {
-            // The bare `[id]` is the main section above; only `[id <name>]` is a
-            // prefix section, which is what upstream's `get_prefix_sections`
-            // returns.
-            if section.sub.is_none() {
+        for (id, factories) in FACTORIES {
+            let Some(load) = factories.load_config else {
                 continue;
+            };
+            let Some(section) = config.get_section(id) else {
+                continue;
+            };
+            register(load, section, self, &mut claimed)?;
+        }
+
+        for (id, factories) in FACTORIES {
+            let Some(load) = factories.load_config_prefix else {
+                continue;
+            };
+            for section in config.get_sections_by_id(id) {
+                // The bare `[id]` is the main section above; only `[id <name>]`
+                // is a prefix section, which is what upstream's
+                // `get_prefix_sections` returns.
+                if section.sub.is_none() {
+                    continue;
+                }
+                register(load, section, self, &mut claimed)?;
             }
-            register(load, section, printer, &mut claimed)?;
         }
-    }
 
-    for section in config.sections_vec() {
-        let identifier = section.identifier();
-        if !claimed.iter().any(|name| name == &identifier) {
-            return Err(KlippyError::Internal(format!(
-                "Section '{identifier}' is not a valid config section"
-            )));
+        for section in config.sections_vec() {
+            let identifier = section.identifier();
+            if !claimed.iter().any(|name| name == &identifier) {
+                return Err(KlippyError::Internal(format!(
+                    "Section '{identifier}' is not a valid config section"
+                )));
+            }
         }
-    }
 
-    Ok(())
+        Ok(())
+    }
 }
 
 /// Build and register one section, recording it as claimed.
@@ -143,7 +163,7 @@ mod tests {
 
     fn load(text: &str) -> (Arc<Printer>, Result<(), KlippyError>) {
         let printer = Arc::new(Printer::new());
-        let result = load_config(&config(text), &printer);
+        let result = printer.load_config(&config(text));
         (printer, result)
     }
 

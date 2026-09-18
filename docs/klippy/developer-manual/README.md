@@ -78,6 +78,38 @@ MCU 一侧的依赖边一共只有这五条：
 
 它**复用** `klippy-api` 的 `protocol`（分帧、请求形状）与 `address`（`ApiTarget` / `Transport`），不把协议再实现一遍：两边对分隔符或 `id` 语义若有分歧，那就不是在验证任何东西。依赖方向只有一条：`klippy-client → klippy-api`，API 不知道客户端存在。
 
+### 主机自带的那扇窗口（`klippy --tui`）
+
+`klipperx klippy --tui` 把上面那个客户端嵌进主机进程，所以它不需要 `-a`、也不
+可能被外面连上：
+
+```
+klippy::run
+  ├─ logging::to_window(entries)   ← 主机自己的日志改道进窗口
+  ├─ tokio::io::duplex(64 KiB)
+  │    ├─ 一端交给 klippy_api::server::serve(ClientConnection::new(api))
+  │    └─ 另一端交给 Session::from_transport(…) → tui::run_session(session, logs)
+  ├─ klippy_process(config)        ← 主机主循环（目前只等中断）
+  └─ 窗口结束时：abort 主循环 → 关窗口 → 退日志改道 → 收尾
+```
+
+`serve` 在这里是公开的：它本来就是 `Server::run` 对每条连接做的事，嵌一个客户端
+只是把「从 socket 收来的连接」换成「进程内的管道」，协议一模一样。
+
+两处容易漏的东西：
+
+- **日志要合流**。窗口占着备用屏幕，主机再往 stdout 打日志就会糊在窗口上，而
+  这些日志恰恰是操作者要看的。所以 `src/logging.rs` 装了两层：常规的格式化输出
+  （窗口在时写进 `io::sink()`，由 `HostOutput` 这个 `MakeWriter` 按 `WINDOW` 决定），
+  以及 `ToWindow` 这一层——它把每条记录的等级与文本复制成 `Entry::Log` 送进窗口。
+  `logging::to_window` 返回的 `WindowGuard` 用 Drop 把改道收回去，于是窗口关掉、
+  主机还在跑时，日志自动回到 stdout。
+  另外，`record_str` 和 `record_debug` **都要实现**：字面量消息（`info!("done")`）
+  走前者，带参数的消息（`info!("{} of {}", …)`）走后者，只实现后者会得到一屏空行。
+- **终端要还回去**。窗口是被 abort 掉的（主机先退出时就是这条路径），futures 被
+  丢弃时不会执行后面的清理，所以还原终端放在 `TerminalGuard` 的 Drop 里；谁先结束
+  都能把终端还原。
+
 它是唯一**依赖不重合**的包：`cargo tree -p klippy-client` 里没有 `reqwest` / `flate2` / `libloading`（TUI 用的 `ratatui` 是它自己的），实测 debug 56.6 MB / release 3.5 MB，而 `klipperx` 是 95.4 MB。代价是 `main.rs` 里那二十行日志初始化与主机重复——为它单开一个 crate 比重复更糟。
 
 ## 模块结构

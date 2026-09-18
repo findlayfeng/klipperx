@@ -623,7 +623,7 @@ fn entry_style(entry: &Entry, message_index: usize) -> Style {
 /// colour in many themes, which is exactly the “I cannot see any colour” a pair
 /// of greys produces. Plain ANSI foregrounds rather than a 256-colour
 /// background, so they work wherever colour is shown at all.
-const MESSAGE_COLORS: [Color; 2] = [Color::LightBlue, Color::LightMagenta];
+const MESSAGE_COLORS: [Color; 2] = [Color::LightYellow, Color::LightGreen];
 
 /// Whether an entry is a message, rather than the window talking to itself.
 fn is_message(entry: &Entry) -> bool {

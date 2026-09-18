@@ -1,8 +1,13 @@
-use klipperx::klippy;
-use klippy_client as client;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
 
-use clap::Parser;
-use tracing::error;
+use clap::{Args, Parser};
+use tracing::{error, warn};
+
+use klipperx::{klippy, logging};
+use klippy_client as client;
+use klippy_client::session::{Entry, LogLevel};
 
 /// The command line.
 ///
@@ -36,8 +41,37 @@ struct Cli {
     command: Option<Commands>,
 
     /// The host, when no subcommand is given
+    //
+    // Flattened without an `Option`, unlike the usual "default subcommand"
+    // recipe: the host's arguments cannot be a group of their own, because they
+    // arrive through two levels of flatten and clap cannot see the inner ones
+    // when it decides whether such a group was used. Nothing needs to be
+    // optional for that to work here — the config file is checked when the host
+    // starts, not when the command line is parsed.
     #[command(flatten)]
-    host: Option<klipperx::klippy::AppArgs>,
+    host: HostArgs,
+}
+
+/// The host, plus the one option that is `klipperx`'s own.
+///
+/// The window is not the host's: it is a client, and it drags in a terminal
+/// library the `klippy` binary — which only ever serves the API — has no use
+/// for. So it is declared here, where the window can be, rather than in
+/// `klippy::AppArgs`, where the host's own options live.
+#[derive(Args, Debug)]
+struct HostArgs {
+    #[command(flatten)]
+    host: klippy::AppArgs,
+
+    /// Open a local client window on this host's own API
+    ///
+    /// Runs a `klippy-client` window against this process, over an in-process
+    /// pipe rather than the socket — so it needs no `-a`, and the host's own log
+    /// lines appear in the window alongside the API traffic that produced them.
+    /// Leaving the window stops the host. Without a terminal this is a warning
+    /// and the host runs headless.
+    #[arg(long)]
+    tui: bool,
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -56,12 +90,19 @@ enum Commands {
         about = klipperx::klippy::ABOUT,
         arg_required_else_help = true
     )]
-    Klippy(klipperx::klippy::AppArgs),
+    Klippy(HostArgs),
 
     /// Send one API request and print the reply
+    ///
+    /// On its own — `klipperx api` — this prints its help, like `klippy` does: a
+    /// subcommand asked for by name and given nothing else is a question.
+    #[command(arg_required_else_help = true)]
     Api(client::ApiArgs),
 
     /// Connect to the API and enter an interactive session
+    ///
+    /// On its own — `klipperx console` — this prints its help, like `klippy`.
+    #[command(arg_required_else_help = true)]
     Console(client::ConsoleArgs),
 }
 
@@ -71,20 +112,104 @@ fn main() {
     klipperx::logging::init(cli.verbose);
 
     let result = match (cli.command, cli.host) {
-        (Some(Commands::Klippy(args)), _) => klippy::run(args),
+        (Some(Commands::Klippy(args)), _) => run_host(args),
         (Some(Commands::Api(args)), _) => client::run_api(args),
         (Some(Commands::Console(args)), _) => client::run_console(args),
         // No subcommand: the arguments were the host's all along.
-        (None, Some(host)) => klippy::run(host),
-        // Unreachable as things stand — clap rejects a bare `klipperx` (help)
-        // and any flag without a config file — but the match has to say
-        // something, and "a config file is required" is what is true.
-        (None, None) => Err("a config file is required: try 'klipperx <CONFIG_FILE>'".into()),
+        (None, host) => run_host(host),
     };
     if let Err(e) = result {
         error!("Error: {}", e);
         std::process::exit(1);
     }
+}
+
+/// Run the host, with a window on it if one was asked for.
+fn run_host(args: HostArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let windowed = args.tui && client::tui::is_available();
+    if args.tui && !windowed {
+        warn!("--tui needs a terminal on stdin and stdout; running without a window");
+    }
+    if !windowed {
+        return klippy::run(args.host, None);
+    }
+
+    // The window shows the host's own log lines, so they are copied into it
+    // rather than written underneath it. Deciding that here, before the host
+    // starts, is what gets the host's first lines into the window too; the guard
+    // that keeps the redirect lives in the window and falls with it.
+    let (records, logs) = tokio::sync::mpsc::unbounded_channel();
+    let window = Window {
+        _redirect: logging::to_window(records),
+        logs: Some(logs),
+    };
+    klippy::run(args.host, Some(Box::new(window)))
+}
+
+/// A `klippy-client` window on the host's own API.
+struct Window {
+    /// Keeps the host's records going to the window rather than to stdout.
+    _redirect: logging::WindowGuard,
+    /// The host's records, until the window takes them.
+    logs: Option<tokio::sync::mpsc::UnboundedReceiver<logging::Record>>,
+}
+
+impl klippy::Attachment for Window {
+    fn run<'a>(
+        &'a mut self,
+        api: Arc<klippy_api::Api>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + 'a>> {
+        Box::pin(async move {
+            // The host serves one end of an in-process pipe and the client talks
+            // on the other: no socket, no `-a`, and the protocol in between is
+            // the same as it would be over either.
+            let (host_side, client_side) = tokio::io::duplex(64 * 1024);
+            tokio::spawn(klippy_api::server::serve(
+                klippy_api::ClientConnection::new(api),
+                Box::new(host_side),
+            ));
+            let session =
+                client::Session::from_transport(Box::new(client_side), "this host (in-process)");
+            let logs = self.logs.take().map(host_log);
+            client::tui::run_session(session, logs)
+                .await
+                .map_err(|err| err.to_string())
+        })
+    }
+}
+
+/// Join the host's records to the window's entries.
+///
+/// The two sides have a level type each — the price of the host not depending on
+/// a client — so they meet here, where both are in scope. Whatever the host has
+/// already logged is moved across first and without waiting: it happened before
+/// the window existed, and the window shows it first.
+fn host_log(
+    mut records: tokio::sync::mpsc::UnboundedReceiver<logging::Record>,
+) -> tokio::sync::mpsc::UnboundedReceiver<Entry> {
+    let (entries, window) = tokio::sync::mpsc::unbounded_channel();
+    while let Ok(record) = records.try_recv() {
+        let _ = entries.send(to_entry(record));
+    }
+    tokio::spawn(async move {
+        while let Some(record) = records.recv().await {
+            if entries.send(to_entry(record)).is_err() {
+                break; // the window is gone
+            }
+        }
+    });
+    window
+}
+
+/// One host record, as the window's vocabulary has it.
+fn to_entry((level, text): logging::Record) -> Entry {
+    let level = match level {
+        logging::Level::Debug => LogLevel::Debug,
+        logging::Level::Info => LogLevel::Info,
+        logging::Level::Warn => LogLevel::Warn,
+        logging::Level::Error => LogLevel::Error,
+    };
+    Entry::Log { level, text }
 }
 
 // ===========================================================================
@@ -101,15 +226,15 @@ mod tests {
     }
 
     /// The host arguments of a command line that named no subcommand.
-    fn host_of(cli: Cli) -> klipperx::klippy::AppArgs {
+    fn host_of(cli: Cli) -> HostArgs {
         assert!(cli.command.is_none(), "no subcommand was named");
-        cli.host.expect("the host arguments were given")
+        cli.host
     }
 
     #[test]
     fn test_the_host_is_what_runs_when_no_subcommand_is_given() {
         let host = host_of(parse(&["printer.cfg"]).expect("a config file is enough"));
-        assert_eq!(host.config_file, "printer.cfg");
+        assert_eq!(host.host.config_file.as_deref(), Some("printer.cfg"));
         assert!(!host.tui);
     }
 
@@ -121,8 +246,8 @@ mod tests {
         assert!(cli.verbose);
         let host = host_of(cli);
         assert!(host.tui);
-        assert_eq!(host.config_file, "printer.cfg");
-        assert_eq!(host.api_server.as_deref(), Some("/tmp/x"));
+        assert_eq!(host.host.config_file.as_deref(), Some("printer.cfg"));
+        assert_eq!(host.host.api_server.as_deref(), Some("/tmp/x"));
     }
 
     #[test]
@@ -132,11 +257,41 @@ mod tests {
         let cli = parse(&["klippy", "printer.cfg", "-a", "/tmp/x"]).unwrap();
         match cli.command {
             Some(Commands::Klippy(args)) => {
-                assert_eq!(args.config_file, "printer.cfg");
-                assert_eq!(args.api_server.as_deref(), Some("/tmp/x"));
+                assert_eq!(args.host.config_file.as_deref(), Some("printer.cfg"));
+                assert_eq!(args.host.api_server.as_deref(), Some("/tmp/x"));
+                assert!(!args.tui, "--tui was not asked for");
             }
             other => panic!("expected the host, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_a_client_subcommand_alone_prints_its_help() {
+        // The same courtesy `klippy` gets: naming a subcommand and saying
+        // nothing else is a question about it.
+        for name in ["api", "console", "klippy"] {
+            let error = parse(&[name]).expect_err("nothing was asked for");
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand,
+                "{name}"
+            );
+            let help = error.to_string();
+            assert!(help.contains(&format!("klipperx {name}")), "{help}");
+        }
+    }
+
+    #[test]
+    fn test_the_window_option_is_the_cli_s_own() {
+        // `--tui` is not part of the host: the `klippy` binary does not offer it.
+        // Here it is accepted by both spellings of the host.
+        let named = parse(&["klippy", "printer.cfg", "--tui"]).unwrap();
+        match named.command {
+            Some(Commands::Klippy(args)) => assert!(args.tui),
+            other => panic!("expected the host, got {other:?}"),
+        }
+        let default = host_of(parse(&["printer.cfg", "--tui"]).unwrap());
+        assert!(default.tui);
     }
 
     #[test]
@@ -161,17 +316,21 @@ mod tests {
     }
 
     #[test]
-    fn test_a_bare_invocation_asks_for_a_config_file() {
-        // Not a silent no-op: clap prints the help, whose usage line names what
-        // the default subcommand needs.
+    fn test_a_bare_invocation_prints_the_help() {
         let error = parse(&[]).expect_err("nothing at all was asked for");
-        let message = error.to_string();
-        assert!(message.contains("CONFIG_FILE"), "{message}");
-
-        // A flag and nothing else counts as using the host's arguments, so clap
-        // demands the config file for that too.
-        let error = parse(&["-v"]).expect_err("a flag is not a config file");
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+        );
         assert!(error.to_string().contains("CONFIG_FILE"), "{error}");
+    }
+
+    #[test]
+    fn test_a_flag_without_a_config_file_parses_and_is_caught_later() {
+        // Clap cannot demand the config file — it would demand it of
+        // `klipperx api …` too — so the host is the one that says so.
+        let host = host_of(parse(&["-v"]).expect("a flag on its own parses"));
+        assert!(host.host.config_file.is_none());
     }
 
     #[test]
@@ -188,13 +347,16 @@ mod tests {
         assert!(help.contains("--api-server"), "{help}");
 
         // With an argument it is a real attempt at running the host, so a
-        // missing config file is worth complaining about.
-        let error = parse(&["klippy", "--tui"]).expect_err("no config file");
-        assert_eq!(
-            error.kind(),
-            clap::error::ErrorKind::MissingRequiredArgument
-        );
-        assert!(error.to_string().contains("CONFIG_FILE"), "{error}");
+        // missing config file is worth complaining about — by the host, which is
+        // the only place that can tell a host invocation from a client one.
+        let cli = parse(&["klippy", "--tui"]).expect("a flag on its own parses");
+        match cli.command {
+            Some(Commands::Klippy(args)) => {
+                assert!(args.tui);
+                assert!(args.host.config_file.is_none());
+            }
+            other => panic!("expected the host, got {other:?}"),
+        }
     }
 
     #[test]

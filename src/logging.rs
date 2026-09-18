@@ -27,7 +27,25 @@ use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 
-use klippy_client::session::{Entry, LogLevel};
+/// How loud a record is, for whatever is showing them.
+///
+/// Written here rather than reusing the window's own level type: this module is
+/// the host's, and the host must not have to know that a window exists — let
+/// alone link a terminal library for one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Level {
+    /// Development detail, shown with `--verbose`.
+    Debug,
+    /// Something happened.
+    Info,
+    /// Something is off but the host carries on.
+    Warn,
+    /// Something failed.
+    Error,
+}
+
+/// One record, as a window receives it.
+pub type Record = (Level, String);
 
 /// Where a window, if one is up, receives this process's log records.
 ///
@@ -35,7 +53,7 @@ use klippy_client::session::{Entry, LogLevel};
 /// before the command line has been looked at, and the window is opened later —
 /// and because a log record can come from any thread. `None` means no window:
 /// records go to stdout only.
-static WINDOW: Mutex<Option<UnboundedSender<Entry>>> = Mutex::new(None);
+static WINDOW: Mutex<Option<UnboundedSender<Record>>> = Mutex::new(None);
 
 /// Install the global tracing subscriber.
 ///
@@ -71,7 +89,7 @@ pub fn init(verbose: bool) {
 /// While the guard lives, log records are also sent to `entries` instead of
 /// being written to stdout — the window shows them, so writing them twice would
 /// mean writing them onto the window.
-pub fn to_window(entries: UnboundedSender<Entry>) -> WindowGuard {
+pub fn to_window(entries: UnboundedSender<Record>) -> WindowGuard {
     *WINDOW.lock().expect("the window slot is not poisoned") = Some(entries);
     WindowGuard
 }
@@ -86,7 +104,7 @@ impl Drop for WindowGuard {
 }
 
 /// Whether a window is currently showing this process's log.
-fn window() -> Option<UnboundedSender<Entry>> {
+fn window() -> Option<UnboundedSender<Record>> {
     WINDOW
         .lock()
         .expect("the window slot is not poisoned")
@@ -127,19 +145,16 @@ where
         event.record(&mut message);
 
         let level = match *event.metadata().level() {
-            tracing::Level::TRACE | tracing::Level::DEBUG => LogLevel::Debug,
-            tracing::Level::INFO => LogLevel::Info,
-            tracing::Level::WARN => LogLevel::Warn,
-            tracing::Level::ERROR => LogLevel::Error,
+            tracing::Level::TRACE | tracing::Level::DEBUG => Level::Debug,
+            tracing::Level::INFO => Level::Info,
+            tracing::Level::WARN => Level::Warn,
+            tracing::Level::ERROR => Level::Error,
         };
 
         // The window may have gone away between the check above and here; a
         // dropped record is not worth reporting, since the only place to report
         // it is the window that is gone.
-        let _ = entries.send(Entry::Log {
-            level,
-            text: message.0,
-        });
+        let _ = entries.send((level, message.0));
     }
 }
 
@@ -204,23 +219,18 @@ mod tests {
             tracing::info!("API server listening on {}", "unix:/tmp/x");
         });
 
-        let received: Vec<(LogLevel, String)> = std::iter::from_fn(|| logs.try_recv().ok())
-            .map(|entry| match entry {
-                Entry::Log { level, text } => (level, text),
-                other => panic!("expected a log entry, got {other:?}"),
-            })
-            .collect();
+        let received: Vec<Record> = std::iter::from_fn(|| logs.try_recv().ok()).collect();
 
         assert_eq!(
             received,
             vec![
                 (
-                    LogLevel::Info,
+                    Level::Info,
                     "Successfully parsed config with 1 sections".into()
                 ),
-                (LogLevel::Warn, "dropping malformed request".into()),
-                (LogLevel::Debug, "a detail".into()),
-                (LogLevel::Info, "API server listening on unix:/tmp/x".into()),
+                (Level::Warn, "dropping malformed request".into()),
+                (Level::Debug, "a detail".into()),
+                (Level::Info, "API server listening on unix:/tmp/x".into()),
             ]
         );
 

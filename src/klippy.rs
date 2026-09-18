@@ -1,11 +1,11 @@
 use clap::Parser;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
-use tokio::sync::mpsc::unbounded_channel;
 use tracing::{debug, info, warn};
 
 use crate::core::klippy::api::{AddressError, Api, ApiTarget, Server};
 use crate::core::klippy::config::Config;
-use crate::logging;
 
 /// What the host is, in one line.
 ///
@@ -26,18 +26,13 @@ pub struct AppArgs {
     #[arg(short, long, value_name = "ADDR")]
     pub api_server: Option<String>,
 
-    /// Open a local client window on this host's own API
-    ///
-    /// Runs a `klippy-client` window against this process, over an in-process
-    /// pipe rather than the socket — so it needs no `-a`, and the host's own log
-    /// lines appear in the window alongside the API traffic that produced them.
-    /// Leaving the window stops the host. Without a terminal this is a warning
-    /// and the host runs headless.
-    #[arg(long)]
-    pub tui: bool,
-
     /// Config file path
-    pub config_file: String,
+    ///
+    /// Optional to the parser, required to [`run`]: a subcommand can be given
+    /// instead of a config file, and clap cannot express "required unless one of
+    /// my subcommands is used" for an argument that arrives through a `flatten`.
+    /// The check below therefore says the same thing, with the same wording.
+    pub config_file: Option<String>,
 }
 
 /// Klippy process that receives the parsed config
@@ -59,12 +54,41 @@ async fn klippy_process(config: Config) {
     }
 }
 
-/// Main run function for klippy subcommand
-pub fn run(args: AppArgs) -> Result<(), Box<dyn std::error::Error>> {
-    debug!("Config file: {}", args.config_file);
+/// Something to run alongside the host, attached to its own API.
+///
+/// `klipperx --tui` is the only implementation: a client talking to this host
+/// over an in-process pipe. It is a trait so that the host does not have to know
+/// that a terminal, a client or a TUI library exists — and so that the `klippy`
+/// binary, which never runs a window, does not link any of it.
+pub trait Attachment {
+    /// Run until the attachment is finished, with the endpoint table the host is
+    /// serving.
+    ///
+    /// Returning stops the host: whatever is attached is the user interface of
+    /// the invocation that asked for it. The endpoint table is the host's, so an
+    /// attachment that wants to talk to it can serve one end of its own pipe
+    /// with it (`klippy_api::server::serve`).
+    fn run<'a>(
+        &'a mut self,
+        api: Arc<Api>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + 'a>>;
+}
+
+/// Main run function for klippy subcommand.
+///
+/// `attachment` is an optional client to run alongside the host, on the host's
+/// own API; see [`Attachment`].
+pub fn run(
+    args: AppArgs,
+    attachment: Option<Box<dyn Attachment>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config_file = args
+        .config_file
+        .ok_or("the following required argument was not provided: <CONFIG_FILE>")?;
+    debug!("Config file: {config_file}");
 
     // Parse the config file
-    let (config, sources) = Config::from_file(&args.config_file)?;
+    let (config, sources) = Config::from_file(&config_file)?;
     debug!("Config sources: {:?}", sources);
     info!(
         "Successfully parsed config with {} sections",
@@ -87,23 +111,6 @@ pub fn run(args: AppArgs) -> Result<(), Box<dyn std::error::Error>> {
                 return Err(format!("{err}\n\nFor more information, try '--help'.").into());
             }
         },
-    };
-
-    // A window is not just another command line option: it takes the terminal,
-    // and it needs the host's own log lines routed into it rather than written
-    // under it. Deciding here — before the runtime, before anything logs — is
-    // what makes the first lines the host prints appear in the window too.
-    let windowed = args.tui && klippy_client::tui::is_available();
-    if args.tui && !windowed {
-        warn!("--tui needs a terminal on stdin and stdout; running without a window");
-    }
-    let window_log = if windowed {
-        let (entries, logs) = unbounded_channel();
-        // The guard keeps the redirect for as long as the window is up, and puts
-        // the host's output back on stdout when it is not.
-        Some((logging::to_window(entries), logs))
-    } else {
-        None
     };
 
     // One runtime for the whole process, and the only place one is created:
@@ -138,41 +145,18 @@ pub fn run(args: AppArgs) -> Result<(), Box<dyn std::error::Error>> {
             }
         };
 
-        // The window talks to this host over a pipe rather than the socket: no
-        // `-a` is needed for it, it cannot be reached from outside, and the two
-        // ends run the protocol either way. One end is served like any other
-        // connection; the other is the client's.
-        let window = match window_log {
-            None => None,
-            Some((guard, logs)) => {
+        match attachment {
+            // Whatever is attached to this host is the user interface of the
+            // invocation that asked for it, so when it is done the host is too —
+            // and the host's own shutdown conditions (a signal, a config error)
+            // end the attachment instead. Waiting on one and then stopping the
+            // other is what keeps those two from disagreeing.
+            Some(mut attachment) => {
                 let api = Arc::new(Api::new());
-                let (host_side, client_side) = tokio::io::duplex(64 * 1024);
-                tokio::spawn(klippy_api::server::serve(
-                    klippy_api::ClientConnection::new(Arc::clone(&api)),
-                    Box::new(host_side),
-                ));
-                let session = klippy_client::Session::from_transport(
-                    Box::new(client_side),
-                    "this host (in-process)",
-                );
-                Some((
-                    guard,
-                    tokio::spawn(klippy_client::tui::run_session(session, Some(logs))),
-                ))
-            }
-        };
-
-        match window {
-            // The window is this invocation's user interface, so leaving it
-            // stops the host — the operator said they were done. The host's own
-            // shutdown conditions (a signal, a config error) end the window
-            // instead, which is why this waits on the window and never on both.
-            Some((guard, window)) => {
                 let host = tokio::spawn(klippy_process(config));
-                let outcome = window.await;
+                let outcome = attachment.run(api).await;
                 host.abort();
-                drop(guard);
-                outcome??;
+                outcome.map_err(|err| -> Box<dyn std::error::Error> { err.into() })?;
             }
             None => klippy_process(config).await,
         }

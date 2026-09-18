@@ -78,37 +78,45 @@ MCU 一侧的依赖边一共只有这五条：
 
 它**复用** `klippy-api` 的 `protocol`（分帧、请求形状）与 `address`（`ApiTarget` / `Transport`），不把协议再实现一遍：两边对分隔符或 `id` 语义若有分歧，那就不是在验证任何东西。依赖方向只有一条：`klippy-client → klippy-api`，API 不知道客户端存在。
 
-### 主机自带的那扇窗口（`klippy --tui`）
+### 主机自带的那扇窗口（`klipperx --tui`）
 
-`klipperx klippy --tui` 把上面那个客户端嵌进主机进程，所以它不需要 `-a`、也不
-可能被外面连上：
+`klipperx klippy printer.cfg --tui`（子命令也可省）打开一个 klippy-client 窗口，
+连的是这个进程自己。它**不是主机的功能，而是 `klipperx` 这个 CLI 的**：窗口是
+客户端，会拖进一整个终端库，而只负责提供 API 的 `klippy` 二进制根本用不到。
 
 ```
-klippy::run
-  ├─ logging::to_window(entries)   ← 主机自己的日志改道进窗口
-  ├─ tokio::io::duplex(64 KiB)
-  │    ├─ 一端交给 klippy_api::server::serve(ClientConnection::new(api))
-  │    └─ 另一端交给 Session::from_transport(…) → tui::run_session(session, logs)
-  ├─ klippy_process(config)        ← 主机主循环（目前只等中断）
-  └─ 窗口结束时：abort 主循环 → 关窗口 → 退日志改道 → 收尾
+klipperx（bin，src/main.rs）
+  ├─ logging::to_window(records)   ← 主机日志改道进窗口，不再写 stdout
+  ├─ Window                        ← 实现 klippy::Attachment
+  └─ klippy::run(AppArgs, Some(Box::new(window)))
+       ├─ Api / Server / klippy_process(config)     ← 照常
+       └─ Attachment::run(api)
+            ├─ tokio::io::duplex(64 KiB)
+            │    ├─ 一端：klippy_api::server::serve(ClientConnection::new(api))
+            │    └─ 另一端：Session::from_transport(…) → tui::run_session(session, logs)
+            └─ 日志记录 (Level, String) → Entry::Log
 ```
 
-`serve` 在这里是公开的：它本来就是 `Server::run` 对每条连接做的事，嵌一个客户端
-只是把「从 socket 收来的连接」换成「进程内的管道」，协议一模一样。
+边界：
 
-两处容易漏的东西：
+- 主机库只知道 `klippy::Attachment` —— 一个「给我 API，我跑到我结束为止」的钩子
+  （`Pin<Box<dyn Future>>`）。它不知道终端、客户端或 TUI 库存在，`logging` 也只发
+  中立的 `(Level, String)`。两套日志等级类型在 bin 里对接：那是两边的词汇相遇的
+  地方，也正因为如此，`klippy` 二进制不再链接 ratatui / crossterm
+  （release 7.1 → 6.3 MB，`strings` 里一个 ratatui 都不剩），并且不再接受
+  `--tui` —— 那本来就是 CLI 的选项。
+- 钩子返回就意味着主机停下：附加进来的东西就是这次调用的界面。反过来，主机自己
+  的停机条件（信号、配置错误）会让钩子结束：先等一个再停另一个，两者就不会互相
+  矛盾。
 
-- **日志要合流**。窗口占着备用屏幕，主机再往 stdout 打日志就会糊在窗口上，而
-  这些日志恰恰是操作者要看的。所以 `src/logging.rs` 装了两层：常规的格式化输出
-  （窗口在时写进 `io::sink()`，由 `HostOutput` 这个 `MakeWriter` 按 `WINDOW` 决定），
-  以及 `ToWindow` 这一层——它把每条记录的等级与文本复制成 `Entry::Log` 送进窗口。
-  `logging::to_window` 返回的 `WindowGuard` 用 Drop 把改道收回去，于是窗口关掉、
-  主机还在跑时，日志自动回到 stdout。
-  另外，`record_str` 和 `record_debug` **都要实现**：字面量消息（`info!("done")`）
-  走前者，带参数的消息（`info!("{} of {}", …)`）走后者，只实现后者会得到一屏空行。
-- **终端要还回去**。窗口是被 abort 掉的（主机先退出时就是这条路径），futures 被
-  丢弃时不会执行后面的清理，所以还原终端放在 `TerminalGuard` 的 Drop 里；谁先结束
-  都能把终端还原。
+三处不留神就会错的地方（都有测试或注释守着）：
+
+- **日志要先改道再启动主机**，否则主机最早几行会写到窗口上；`logging::to_window`
+  返回的 `WindowGuard` 用 Drop 收回改道，所以窗口关掉而主机还在跑时日志回到 stdout。
+- **`record_str` 与 `record_debug` 两个钩子都要实现**：字面量消息（`info!("done")`）
+  走前者，带参数的消息走后者，只实现后者会得到一屏空行。
+- **终端还原放在 `TerminalGuard` 的 Drop 里**：窗口任务是被 abort 的（主机先退出
+  时），futures 被丢弃不会执行后面的清理。
 
 它是唯一**依赖不重合**的包：`cargo tree -p klippy-client` 里没有 `reqwest` / `flate2` / `libloading`（TUI 用的 `ratatui` 是它自己的），实测 debug 56.6 MB / release 3.5 MB，而 `klipperx` 是 95.4 MB。代价是 `main.rs` 里那二十行日志初始化与主机重复——为它单开一个 crate 比重复更糟。
 
@@ -190,7 +198,7 @@ API 本身在 `crates/klippy-api/src/`：
 | 二进制 | 入口 | 是什么 |
 |--------|------|--------|
 | `klipperx` | `src/main.rs` | 项目的 CLI：跑主机（默认，也写作 `klippy`）、`api`、`console` |
-| `klippy` | `src/bin/klippy/main.rs` | 只有主机，等价于 `klipperx klippy`（名字取自上游的 `klippy.py`） |
+| `klippy` | `src/bin/klippy/main.rs` | 只有主机，等价于 `klipperx klippy`（名字取自上游的 `klippy.py`）；没有 `--tui`，不链接客户端与终端库（release 6.3 MB vs `klipperx` 7.6 MB） |
 | `klippy-client` | `crates/klippy-client/src/main.rs` | 只有客户端，等价于 `klipperx api` / `klipperx console`；**自成一个包**，不编主机 |
 
 `klipperx` 的顶层参数里嵌着一份 `AppArgs`（`Option<AppArgs>`，与 `klippy` 子命令同一类型、`args_conflicts_with_subcommands` 保证两者不能混用），所以不带子命令时 `klipperx printer.cfg` 就是 `klipperx klippy printer.cfg`。那个 `Option` 不是为了可空：clap 只有在整组参数可选时才会放过组内必填项（配置文件），否则 `klipperx api …` 会来要一个它根本不需要的配置文件。

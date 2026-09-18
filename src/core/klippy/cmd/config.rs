@@ -84,6 +84,26 @@ impl McuCommand for FinalizeConfig {
     }
 }
 
+/// `config_reset` — drop the configuration and return to an unconfigured MCU.
+///
+/// The firmware accepts it **only while shut down** (`src/basecmd.c:262`), and
+/// it clears the CRC, the oid table, and the move queue. The host uses it to
+/// recover an MCU that shut down, so that a normal configuration can be sent
+/// again instead of restarting the firmware. The declaration lives with each
+/// board's entry point rather than in `basecmd.c` (for example
+/// `src/linux/main.c:59`), so it is not present on every firmware.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConfigReset;
+
+impl McuCommand for ConfigReset {
+    const NAME: &'static str = "config_reset";
+
+    fn args(&self) -> Vec<ArgValue> {
+        // No parameters.
+        Vec::new()
+    }
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================

@@ -72,6 +72,11 @@ pub enum McuError {
     Msg(MsgError),
     /// A synchronous request/response call failed.
     Call(McuCallError),
+    /// The MCU configuration phase failed: the configuration is internally
+    /// inconsistent (`CrcMismatch`, an exhausted oid range), the MCU is in a
+    /// state that cannot be configured, or the build was asked for at the
+    /// wrong time (before identify, or twice).
+    Config(String),
 }
 
 impl std::fmt::Display for McuError {
@@ -92,6 +97,7 @@ impl std::fmt::Display for McuError {
             McuError::IdentifyJson(msg) => write!(f, "cannot parse identify payload: {}", msg),
             McuError::Msg(e) => write!(f, "{}", e),
             McuError::Call(e) => write!(f, "{}", e),
+            McuError::Config(msg) => write!(f, "cannot configure MCU: {}", msg),
         }
     }
 }
@@ -107,7 +113,8 @@ impl std::error::Error for McuError {
             | McuError::NotIdentified
             | McuError::IdentifyProtocol(_)
             | McuError::IdentifyCompression(_)
-            | McuError::IdentifyJson(_) => None,
+            | McuError::IdentifyJson(_)
+            | McuError::Config(_) => None,
         }
     }
 }

@@ -52,6 +52,9 @@
   上游 `klippy/webhooks.py:467`）把变化的字段用 `response_template` 推给连接；连接关闭即
   退订、最后一个退订时定时器自停；`objects/query` 与它共用字段选择
   （`api/endpoints/objects_subscribe.rs`、`objects_query.rs`）。
+- **MCU 配置构建层（F1）**：`ConfigBuilder` 的 oid 发号、`config` / `restart` / `init` 三张命令表、
+  config 回调、CRC 与 `finalize_config`，以及 `configure()` 的 `get_config` 两段式下发；
+  `McuObject` 在 connect 时把累积的配置交给固件（`mcu/config.rs`、`mcu/object.rs`）。
 
 ## 待办
 
@@ -64,14 +67,13 @@
 | B2 | MCU 关闭与错误上报（含 `last_stats`） | A2 |
 | B3 | `gcode` 层与 `gcode/*` 端点 | C1 |
 | B4 | 其余端点（estop / remote method / pause_resume / …） | B3 等 |
-| F1 | MCU 配置构建层（oid / config 命令 / CRC） | — |
-| F2 | pin 解析与 `pins` 对象 | F1 |
-| F3 | GPIO 输出（`digital_out`） | F1、F2 |
-| F4 | PWM（硬件 / 软件） | F1、F2 |
-| F5 | ADC | F1、F2 |
-| F6 | SPI 总线 | F1、F2 |
-| F7 | I2C 总线 | F1、F2 |
-| F8 | endstop / trsync | F1、F2、C1 |
+| F2 | pin 解析与 `pins` 对象 | F1 ✓ |
+| F3 | GPIO 输出（`digital_out`） | F1 ✓、F2 |
+| F4 | PWM（硬件 / 软件） | F1 ✓、F2 |
+| F5 | ADC | F1 ✓、F2 |
+| F6 | SPI 总线 | F1 ✓、F2 |
+| F7 | I2C 总线 | F1 ✓、F2 |
+| F8 | endstop / trsync | F1 ✓、F2、C1 |
 | F9 | 输入与外设资源（buttons / pulse_counter / …） | F1–F7 |
 | C1 | toolhead 与 kinematics | — |
 | C2 | 配置装载收尾（option 校验、第二个住户） | — |
@@ -184,38 +186,38 @@
 
 上游把这些叫 printer objects 下面的「资源」：主机用一个 **oid** 和一个 **pin 描述**
 建立资源对象，把 `config_*` 命令攒起来，在 `finalize_config` 之前算一个 CRC 一次性下发，
-之后用 `queue_*` / `set_*` / `*_transfer` 命令驱动。我们现在只到命令层（`allocate_oids` /
-`get_config` / `finalize_config` / `get_uptime` / `emergency_stop` / `get_clock`），
-**没有 oid 计数、没有 config 命令累积与 CRC、没有 pin 解析、没有一个 `config_*` 资源**，
-所以任何真实 printer.cfg 里带引脚的东西都还接不上。
+之后用 `queue_*` / `set_*` / `*_transfer` 命令驱动。命令层（`allocate_oids` / `get_config` /
+`finalize_config` / `get_uptime` / `emergency_stop` / `get_clock`）已就位，**F1 已把 oid 发号、
+config 命令累积与 CRC、两段式下发补齐**；剩下的缺口是 **pin 解析（F2）与任何一个 `config_*`
+资源（F3–F9）**，所以真实 printer.cfg 里带引脚的东西还接不上。
 
-F 组的 **F2–F9 都依赖 F1**（配置构建层），F3–F9 还需 F2（pin 解析）才能把引脚填进命令；
-F1 只依赖已有的 `Printer` 注册表与 `cmd` 层。
+F 组的 **F2–F9 都依赖 F1（已完成）**，F3–F9 还需 F2（pin 解析）才能把引脚填进命令。
 
-#### F1 MCU 配置构建层（oid / config 命令 / CRC）
+#### F1 MCU 配置构建层（oid / config 命令 / CRC）—— 已完成
 
-上游 `MCUConfigHelper`（`klippy/mcu.py:979-1143`），也就是“怎么把一台真实 MCU 配起来”：
+上游 `MCUConfigHelper`（`klippy/mcu.py:979-1143`）。实现在 `src/core/klippy/mcu/config.rs`
+的 `ConfigBuilder`，由 `McuObject` 在**建对象时**持有、在 connect（identify 之后）时
+`configure()`：
 
-- [ ] **oid 计数**：`create_oid()` 单调发号（`:1118`），`_finalize_config` 把
-      `allocate_oids count=N` 插在最前（`:1004-1020`）。我们只有 `AllocateOids` 命令类型，没有发号器。
-- [ ] **config 命令累积**：`add_config_cmd(cmd, is_init, on_restart)` 分三张表 —— `config` /
-      `restart` / `init`（`:1125`），以及 `register_config_callback`（`:1122`）、
-      `register_post_init_callback`。现在每个命令都是当场 `send`/`call`，没有“先攒后发”的阶段。
-- [ ] **CRC 与 finalize**：`_finalize_config` 跑完回调 → 插入 `allocate_oids` → 用
-      pin resolver 改写命令文本 → `crc = zlib.crc32('\n'.join(config_cmds))` → 追加
-      `finalize_config crc=`（`:1004-1020`）。**CRC 是对命令文本的换行拼接算的**，
-      不是对编码后的字节，这一点要和固件对账。
-- [ ] **两段式下发**：先 `get_config` 问 `is_config/crc/is_shutdown/move_count`
-      （`cmd/config.rs` 已有 `GetConfig`/`ConfigState`），配置不一致就送全量
-      `config + init`，一致就只送 `restart + init`；送完再问一次，然后跑 post-init
-      回调（`:1047-1085`）。重启/CRC 不匹配的处理见 Q7 / D2。
-- [ ] **`seconds_to_clock`**：`int(time * CLOCK_FREQ)`（`:1140`），需要从字典读常量
-      `CLOCK_FREQ`；`get_query_slot`（`:1136`）给周期查询排一个错开的时钟槽。
-- [ ] **`request_move_queue_slot`**（`:1142`）：给运动队列预留槽位，`get_config` 的
-      `move_count` 要够。只影响运动层，但和 F1 一起做最省事。
-- [ ] **`config_reset`**（无参数；基类在 `src/basecmd.c:262`，声明在各板子的 `main.c`，如
-      `src/linux/main.c:59`）：只在停机时可用，清了 CRC、oid 与运动队列；上游在 shutdown
-      恢复路径里用。我们还没有这条命令类型。
+- [x] **oid 计数**：`create_oid()` 单调从 0 发号（上游 `:1118`），`build` 把
+      `allocate_oids count=N` 插在最前（`:1004-1020`）；走完 `MAX_OIDS`（255）报错不回绕，
+      定稿后不能再领。
+- [x] **config 命令累积**：`add_config_cmd` / `add_restart_cmd` / `add_init_cmd` 三张表
+      （`:1125`），`register_config_callback`（在 build 时跑，可继续领 oid/加命令，拿到 `&Mcu`
+      故可用 `seconds_to_clock`）与 `register_post_init_callback`。
+- [x] **CRC 与 finalize**：`build` 跑回调 → 插 `allocate_oids` → 对 `config` 列表的**编码字节**
+      算 CRC-32 → 追加 `finalize_config crc=`。**与上游不同**：上游哈希命令文本，我们没有命令
+      文本，改为哈希 wire 字节；固件只存不算，所以只要自洽就行（模块文档里写清楚）。
+      上游的 pin 名改写属于 F2。
+- [x] **两段式下发**：`configure()` 先 `get_config`；未配置则送 `config + init`，已配置且 CRC
+      一致则只送 `restart + init`，CRC 不一致报错（重启路径见 D2）；再问一次，检查
+      `move_count`，跑 post-init 回调（`:1047-1085`）。
+- [x] **`seconds_to_clock`**：`(seconds * CLOCK_FREQ)`，从字典读常量（`:1140`）。`get_query_slot`
+      （`:1136`）需要 print-time 时钟，留给它的消费者（ADC / endstop）一起做。
+- [x] **`request_move_queue_slot`**（`:1142`）：预留运动队列槽位，`configure` 用 `move_count` 对账。
+- [x] **`config_reset`** 命令类型（无参数；`src/basecmd.c:262`，声明在各板子的 `main.c`，如
+      `src/linux/main.c:59`）。发送它的 shutdown 恢复路径仍属于 B2。
+- 详见 `docs/klippy/developer-manual/testing.md` 的 `config.rs` 一行。
 
 #### F2 pin 解析与 `pins` 对象
 

@@ -4,8 +4,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
-use crate::core::klippy::api::{AddressError, Api, ApiTarget, Server};
+use crate::core::klippy::api::{self, AddressError, Api, ApiTarget, Server};
 use crate::core::klippy::config::Config;
+use crate::core::klippy::printer::Printer;
 
 /// What the host is, in one line.
 ///
@@ -41,22 +42,38 @@ pub struct AppArgs {
     pub config_file: Option<String>,
 }
 
-/// Klippy process that receives the parsed config
+/// Run one printer: bring it up, then idle until something asks it to stop.
 ///
-/// Until the printer main loop exists this only keeps the process — and with it
-/// the API server — alive.
-async fn klippy_process(config: Config) {
-    // TODO: turn the config into printer objects, connect the MCUs, fire
-    // `klippy:ready`, and run until a shutdown is requested.
-    debug!(
-        "Klippy process started with {} sections",
-        config.sections_vec().len()
-    );
+/// The machine is built, its config loaded and the API server serving it by the
+/// time this is called. The run loop blocks, so it gets a blocking thread of its
+/// own; the interrupt means "ask the printer to exit", not "kill the process",
+/// so the printer still goes down in order.
+async fn klippy_process(printer: Arc<Printer>) {
+    printer.bring_up().await;
 
-    // The printer's own shutdown conditions (a config error, an MCU going away)
-    // will end this loop; for now the operator's interrupt is the only one.
-    if let Err(err) = tokio::signal::ctrl_c().await {
-        warn!("cannot listen for an interrupt: {err}");
+    // The printer's own shutdown conditions (an MCU going away, a client's
+    // emergency stop) end the loop on their own; until they exist, the
+    // operator's interrupt is the only one. A task rather than a `select!`, so
+    // that the blocking loop below is awaited exactly once — and so that an
+    // exit requested from somewhere else (an attached window closing) ends it
+    // without waiting for an interrupt.
+    let interrupt_printer = Arc::clone(&printer);
+    let interrupt = tokio::spawn(async move {
+        if let Err(err) = tokio::signal::ctrl_c().await {
+            warn!("cannot listen for an interrupt: {err}");
+        }
+        interrupt_printer.request_exit("exit");
+    });
+
+    let result = {
+        let printer = Arc::clone(&printer);
+        tokio::task::spawn_blocking(move || printer.run()).await
+    };
+    interrupt.abort();
+
+    match result {
+        Ok(result) => debug!("printer stopped: {result}"),
+        Err(err) => warn!("the run loop did not finish: {err}"),
     }
 }
 
@@ -131,20 +148,26 @@ pub fn run(
         .build()?;
 
     runtime.block_on(async move {
+        // The machine, built before anything is served: the endpoint table is
+        // registered and then the config's objects are loaded, so that a client
+        // never observes a half-built table or a half-built machine.
+        let printer = Arc::new(Printer::new());
+
+        // The server's own object (`webhooks`) and the endpoints come first, so
+        // that `objects/list` starts with `webhooks` as upstream's does
+        // (`klippy/klippy.py:36-40`) and no path is half-built when a request
+        // arrives. Everything is registered before the listener is bound.
+        let mut api = Api::new();
+        api::register(&mut api, &printer)?;
+        let api = Arc::new(api);
+
         let server = match target {
             None => {
                 info!("Empty --api-server: not starting the API server");
                 None
             }
             Some(target) => {
-                // Endpoints are registered before the listener is bound, so a
-                // client can never observe a half-built table.
-                let api = Api::new();
-                // TODO: register the remaining endpoints as they are written.
-                // `Info` is defined but stays unregistered until its handler
-                // exists: a `todo!()` would panic the connection instead of
-                // answering it.
-                let server = Server::bind(target, Arc::new(api)).await?;
+                let server = Server::bind(target, Arc::clone(&api)).await?;
                 // `target` is resolved by the bind, so a `tcp:…:0` port is
                 // reported as the one the kernel chose.
                 info!("API server listening on {}", server.target());
@@ -152,20 +175,34 @@ pub fn run(
             }
         };
 
+        debug!(
+            "Klippy process started with {} sections",
+            config.sections_vec().len()
+        );
+
+        // Config-driven objects. A config the loader rejects halts the printer
+        // rather than ending the process: clients can still connect and read
+        // why (upstream's `_read_config` does the same — it sets the state and
+        // lets the reactor keep running).
+        if let Err(err) = printer.load_config(&config) {
+            printer.invoke_shutdown(&format!("{err}"));
+        }
+
         match attachment {
             // Whatever is attached to this host is the user interface of the
-            // invocation that asked for it, so when it is done the host is too —
-            // and the host's own shutdown conditions (a signal, a config error)
-            // end the attachment instead. Waiting on one and then stopping the
-            // other is what keeps those two from disagreeing.
+            // invocation that asked for it, so when it is done the host is too
+            // — and the host's own shutdown conditions end the attachment
+            // instead. Asking the printer to exit is what lets its run loop
+            // return in order, rather than dropping a loop that still holds the
+            // machine.
             Some(mut attachment) => {
-                let api = Arc::new(Api::new());
-                let host = tokio::spawn(klippy_process(config));
-                let outcome = attachment.run(api).await;
-                host.abort();
+                let host = tokio::spawn(klippy_process(Arc::clone(&printer)));
+                let outcome = attachment.run(Arc::clone(&api)).await;
+                printer.request_exit("exit");
+                let _ = host.await;
                 outcome.map_err(|err| -> Box<dyn std::error::Error> { err.into() })?;
             }
-            None => klippy_process(config).await,
+            None => klippy_process(printer).await,
         }
 
         // The printer has stopped, so the API server goes with it. Aborting is

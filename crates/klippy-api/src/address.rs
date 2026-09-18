@@ -37,7 +37,7 @@ use std::str::FromStr;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpStream, UnixStream};
 
-use crate::core::klippy::error::KlippyError;
+use crate::error::TransportError;
 
 /// A read/write API socket, whichever transport it arrived on.
 ///
@@ -86,13 +86,13 @@ impl ApiTarget {
     /// Dial the API server at this target.
     ///
     /// # Errors
-    /// Returns [`KlippyError::Connection`] if the socket cannot be reached —
+    /// Returns [`TransportError::Connect`] if the socket cannot be reached —
     /// the usual cause being that no API server is listening there.
-    pub async fn connect(&self) -> Result<Box<dyn Transport>, KlippyError> {
+    pub async fn connect(&self) -> Result<Box<dyn Transport>, TransportError> {
         match self {
             ApiTarget::Unix(path) => {
                 let stream = UnixStream::connect(path).await.map_err(|err| {
-                    KlippyError::Connection(format!(
+                    TransportError::Connect(format!(
                         "cannot connect to unix socket {}: {err}",
                         path.display()
                     ))
@@ -101,7 +101,7 @@ impl ApiTarget {
             }
             ApiTarget::Tcp(address) => {
                 let stream = TcpStream::connect(address).await.map_err(|err| {
-                    KlippyError::Connection(format!("cannot connect to tcp {address}: {err}"))
+                    TransportError::Connect(format!("cannot connect to tcp {address}: {err}"))
                 })?;
                 // Small requests, sent as soon as they exist: Nagle would only
                 // delay them behind the acknowledgment of the previous one.

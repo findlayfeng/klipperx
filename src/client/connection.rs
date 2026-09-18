@@ -32,7 +32,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 
 use crate::core::klippy::api::address::{ApiTarget, Transport};
 use crate::core::klippy::api::protocol::{encode, Framing};
-use crate::core::klippy::error::KlippyError;
+use crate::core::klippy::api::TransportError;
 
 /// Bytes asked of the socket per read.
 const READ_SIZE: usize = 4096;
@@ -122,8 +122,8 @@ impl Connection {
     /// Dial `target`.
     ///
     /// # Errors
-    /// Returns [`KlippyError::Connection`] if the socket cannot be reached.
-    pub async fn connect(target: &ApiTarget) -> Result<Self, KlippyError> {
+    /// Returns [`TransportError`] if the socket cannot be reached.
+    pub async fn connect(target: &ApiTarget) -> Result<Self, TransportError> {
         let (reader, writer) = tokio::io::split(target.connect().await?);
         Ok(Self {
             reader,
@@ -168,12 +168,12 @@ impl Connection {
     /// Build and send a request with a fresh `id`.
     ///
     /// # Errors
-    /// Returns [`KlippyError::Connection`] if the request cannot be written.
+    /// Returns [`TransportError`] if the request cannot be written.
     pub async fn request(
         &mut self,
         method: &str,
         params: Map<String, Value>,
-    ) -> Result<u64, KlippyError> {
+    ) -> Result<u64, TransportError> {
         let id = self.take_id();
         let message = json!({ "id": id, "method": method, "params": params });
         self.send(&message).await?;
@@ -188,8 +188,8 @@ impl Connection {
     /// client's choice.
     ///
     /// # Errors
-    /// Returns [`KlippyError::Connection`] if the message cannot be written.
-    pub async fn send(&mut self, message: &Value) -> Result<(), KlippyError> {
+    /// Returns [`TransportError`] if the message cannot be written.
+    pub async fn send(&mut self, message: &Value) -> Result<(), TransportError> {
         if let Some(id) = answerable_id(message) {
             if let Some(method) = message.get("method").and_then(Value::as_str) {
                 self.pending.insert(id.to_string(), method.to_string());
@@ -199,12 +199,11 @@ impl Connection {
         self.writer
             .write_all(&encode(message))
             .await
-            .map_err(|err| {
-                KlippyError::Connection(format!("cannot send to the API server: {err}"))
-            })?;
-        self.writer.flush().await.map_err(|err| {
-            KlippyError::Connection(format!("cannot flush to the API server: {err}"))
-        })?;
+            .map_err(|err| TransportError::Io(format!("cannot send to the API server: {err}")))?;
+        self.writer
+            .flush()
+            .await
+            .map_err(|err| TransportError::Io(format!("cannot flush to the API server: {err}")))?;
         Ok(())
     }
 
@@ -219,9 +218,9 @@ impl Connection {
     /// must not end a session.
     ///
     /// # Errors
-    /// Returns [`KlippyError::Connection`] when the server closes the
+    /// Returns [`TransportError::Closed`] when the server closes the
     /// connection, which is how it reports a shutdown.
-    pub async fn receive(&mut self) -> Result<Incoming, KlippyError> {
+    pub async fn receive(&mut self) -> Result<Incoming, TransportError> {
         loop {
             if let Some(message) = self.queued.pop_front() {
                 return Ok(self.classify(message));
@@ -235,13 +234,11 @@ impl Connection {
             let read = self.reader.read(&mut self.buffer[..]).await;
             let read = match read {
                 Ok(0) => {
-                    return Err(KlippyError::Connection(
-                        "the API server closed the connection".to_string(),
-                    ));
+                    return Err(TransportError::Closed);
                 }
                 Ok(read) => read,
                 Err(err) => {
-                    return Err(KlippyError::Connection(format!(
+                    return Err(TransportError::Io(format!(
                         "cannot read from the API server: {err}"
                     )));
                 }
@@ -565,7 +562,7 @@ mod tests {
             .receive()
             .await
             .expect_err("a hung-up connection must be an error");
-        assert!(matches!(error, KlippyError::Connection(_)), "{error:?}");
+        assert!(matches!(error, TransportError::Closed), "{error:?}");
         assert!(
             error.to_string().contains("closed the connection"),
             "{error}"
@@ -573,7 +570,7 @@ mod tests {
     }
 
     /// Connect where nothing is listening, and return the error.
-    async fn fail(target: ApiTarget) -> KlippyError {
+    async fn fail(target: ApiTarget) -> TransportError {
         match target.connect().await {
             Ok(_) => panic!("connecting to nothing must fail"),
             Err(error) => error,

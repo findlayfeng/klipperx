@@ -32,7 +32,6 @@ use clap::Args;
 use serde_json::{Map, Value};
 
 use crate::core::klippy::api::address::ApiTarget;
-use crate::core::klippy::error::KlippyError;
 
 use connection::{Connection, Incoming, Reply};
 use console::Console;
@@ -80,7 +79,7 @@ pub fn run_api(args: ApiArgs) -> Result<(), Box<dyn std::error::Error>> {
     let params = parse_params(&args.params)?;
     let timeout = std::time::Duration::from_secs_f64(args.timeout.max(0.001));
 
-    let reply: Result<Reply, KlippyError> = runtime()?.block_on(async {
+    let reply: Result<Reply, Box<dyn std::error::Error>> = runtime()?.block_on(async {
         let wait = async {
             let mut connection = Connection::connect(&target).await?;
             let id = connection.request(&args.method, params).await?;
@@ -102,10 +101,7 @@ pub fn run_api(args: ApiArgs) -> Result<(), Box<dyn std::error::Error>> {
         // a script waiting forever.
         match tokio::time::timeout(timeout, wait).await {
             Ok(result) => result,
-            Err(_) => Err(KlippyError::Request(format!(
-                "no reply to '{}' within {}s",
-                args.method, args.timeout
-            ))),
+            Err(_) => Err(format!("no reply to '{}' within {}s", args.method, args.timeout).into()),
         }
     });
 

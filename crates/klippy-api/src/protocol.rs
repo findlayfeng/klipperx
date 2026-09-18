@@ -19,7 +19,7 @@
 //! endpoint can override that — keeping the rule in one function means no
 //! handler can accidentally answer a fire-and-forget request.
 //!
-//! [`Api`]: crate::core::klippy::api::Api
+//! [`Api`]: crate::Api
 
 use serde::Serialize;
 use serde_json::{Map, Value};

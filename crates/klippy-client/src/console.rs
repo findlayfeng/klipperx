@@ -412,7 +412,9 @@ fn indent(label: &str, payload: &Value) -> String {
     if !pretty.contains('\n') {
         return format!("{label}{pretty}");
     }
-    format!("{label}\n  {}", pretty.replace('\n', "\n  "))
+    // `trim_end` because the label is written with a trailing space for the
+    // one-line case, and a payload on the next line must not leave it dangling.
+    format!("{}\n  {}", label.trim_end(), pretty.replace('\n', "\n  "))
 }
 
 /// One line, as the protocol is written on the wire.
@@ -792,7 +794,7 @@ mod tests {
         let text = indent("2 (objects/query) ", &json!({"state": "ready"}));
         assert_eq!(
             text,
-            "2 (objects/query) \n  {\n    \"state\": \"ready\"\n  }"
+            "2 (objects/query)\n  {\n    \"state\": \"ready\"\n  }"
         );
     }
 

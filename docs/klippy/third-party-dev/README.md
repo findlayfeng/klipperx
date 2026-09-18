@@ -30,7 +30,7 @@ $ klipperx api -a /tmp/klippy_uds 'objects/query' '{"objects": {"toolhead": ["po
 $ klipperx api -a tcp:127.0.0.1:7125 info
 ```
 
-进入交互式会话：
+进入交互式会话（在终端里是一扇窗口，下面是把它管到管道里的样子，两者同一次会话）：
 
 ```console
 $ klipperx console -a /tmp/klippy_uds
@@ -77,6 +77,9 @@ Disconnected from unix:/tmp/klippy_uds.
 消息（无 `id`）以 `<` 开头单独打印 —— 这也是 `.subscribe` 之后能一直看到状态更新
 的原因。
 
+> `klipperx console` 在终端里开的是全屏窗口（状态行 + 日志 + 输入行），要行式
+> 输出用 `--plain` 或直接接管道，用法见[用户手册](../user-manual/client.md)。
+>
 > 上游自带的两个客户端（`scripts/whconsole.py`、`scripts/motan/data_logger.py`）
 > 只支持 Unix socket，也只看自己那一件事，不能用来验证 TCP 监听。
 

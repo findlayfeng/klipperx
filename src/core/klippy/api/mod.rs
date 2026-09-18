@@ -24,10 +24,10 @@
 //! # Status
 //!
 //! [`register`] installs the server's own object and every endpoint that is
-//! written: `webhooks`, `info`, `objects/list` and `objects/query`. The rest of
-//! the documented surface — `objects/subscribe`, `emergency_stop`,
+//! written: `webhooks`, `info`, `objects/list`, `objects/query` and
+//! `objects/subscribe`. The rest of the documented surface — `emergency_stop`,
 //! `register_remote_method`, the `gcode/*` family, `pause_resume/*` and the
-//! `*/dump_*` mux endpoints — is not written, so `list_endpoints` reports four
+//! `*/dump_*` mux endpoints — is not written, so `list_endpoints` reports five
 //! paths besides the built-in.
 //!
 //! The public reference for the endpoints themselves (paths, parameters,
@@ -47,7 +47,7 @@ use std::sync::Arc;
 use crate::core::klippy::error::KlippyError;
 use crate::core::klippy::printer::Printer;
 
-pub use endpoints::{Info, ObjectsList, ObjectsQuery};
+pub use endpoints::{Info, ObjectsList, ObjectsQuery, ObjectsSubscribe};
 pub use start_args::StartArgs;
 pub use webhooks::{WebhooksStatus, WEBHOOKS_OBJECT};
 
@@ -101,6 +101,8 @@ pub fn register(
     api.register(ObjectsList::new(Arc::clone(printer)))
         .map_err(RegistrationError::Endpoint)?;
     api.register(ObjectsQuery::new(Arc::clone(printer)))
+        .map_err(RegistrationError::Endpoint)?;
+    api.register(ObjectsSubscribe::new(Arc::clone(printer)))
         .map_err(RegistrationError::Endpoint)?;
     Ok(())
 }
@@ -166,7 +168,13 @@ mod tests {
         assert_eq!(printer.objects(), [WEBHOOKS_OBJECT]);
         assert_eq!(
             api.endpoints(),
-            ["info", "list_endpoints", "objects/list", "objects/query",]
+            [
+                "info",
+                "list_endpoints",
+                "objects/list",
+                "objects/query",
+                "objects/subscribe",
+            ]
         );
     }
 

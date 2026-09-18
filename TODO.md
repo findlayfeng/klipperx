@@ -102,6 +102,30 @@ runtime、重启循环）是它上面的一层。
 
 - [ ] `docs/klippy/developer-manual/`：补 printer 一节，并在 README 的分层表里加
       `printer` 一行（现在只有 msg / mcu / cmd / event / identify / api）。
+
+### T8 `python_path` 的取消（**远期，依赖外部项目**）
+
+- [ ] **现状**：`info` 里这个字段只被 Moonraker 使用，且它把它当 Klipper 的
+      virtualenv 解释器（`update_manager/app_deploy.py` 的 `_configure_virtualenv`），
+      因此我们的主机目前只能报一个**不存在的路径**（让它的 Klipper 更新项退化为
+      no-op），不能报自己的二进制（会让 Moonraker 报 `Invalid virtualenv` 而起不来）。
+      字段本身还必须存在：它直接下标取 `self._klippy_info["python_path"]`
+      （`klippy_connection.py` 的 `_save_path_info`）。
+- [ ] **想做的**：这是一个 Klipper 实现细节，本主机没有解释器也没有 Klipper 源码树，
+      报一个不存在（或任何）路径都是在编数据；理想是**取消**这个字段。
+- [ ] **阻塞在外部**：取消会让 Moonraker 的 `_save_path_info` 抛 `KeyError`（不在它的
+      `except ServerError` 里），连接任务出错、它反复重连。上游把下标取值改成
+      `.get()`（或用 `client_info` 判类型）之后才能自由。所以这条要等与 Moonraker 的
+      沟通/上游改动，排在很后面。
+- [ ] **过渡期的可选做法：按请求认出 Moonraker，只对它发这个字段**（其余客户端不发）。
+      可行手段：① `client_info.program == "Moonraker"`
+      （`moonraker/components/klippy_apis.py`：首次 info 带 `{'client_info': {'program': "Moonraker", 'version': …}}`）
+      —— 自报、可缺、且**只有识别那次请求带**，因此要按连接记住；
+      ② `SO_PEERCRED` 取对端 pid，再看 `/proc/<pid>/comm`（Moonraker 现在是 Python 进程，
+      comm 未必是 moonraker）—— 更硬但要先把对端身份从 server 层传到
+      `EndpointContext`（现在没有）。上游只把 `client_info` 当日志用，故这属于本项目的
+      自定义兼容层，要有到期日。
+
 ## 未决问题
 
 - [ ] **Q2 事件系统的形状**：封闭枚举（现状 `PrinterEvent`）还是开放总线（上游 30+ 个

@@ -121,10 +121,28 @@ pub struct InfoResponse {
     pub hostname: String,
     /// Directory holding the klipper installation.
     pub klipper_path: String,
-    /// Interpreter running the host software.
+    /// Interpreter running the host software, or a path that does not exist.
     ///
-    /// Upstream reports its own interpreter here; a host software that is not
-    /// interpreted reports the path of the executable it runs under.
+    /// Upstream reports its own interpreter here, and this field is the one
+    /// part of the response that is both Klipper-specific and load-bearing:
+    /// **Moonraker is its only consumer**, and it reads it as the *virtualenv*
+    /// of the Klipper installation — `env` in its update manager, from which it
+    /// derives `<venv>/bin/python` and runs `-m pip` with it
+    /// (`update_manager/app_deploy.py`, `_configure_virtualenv`). Three shapes
+    /// of value matter there:
+    ///
+    /// * a real `<venv>/bin/python` makes Moonraker manage the Klipper repo;
+    /// * an existing executable that is *not* in a virtualenv makes it fail to
+    ///   start (`Invalid virtualenv at path …`, because `<parent>/bin/activate`
+    ///   is missing) — so this host must **not** report its own binary here;
+    /// * a path that does not exist leaves the Klipper updater a no-op
+    ///   (`update_manager.py`: the deploy class is only upgraded when the path
+    ///   exists), which is what a host with no Klipper checkout wants.
+    ///
+    /// The key must still be present: Moonraker indexes
+    /// `self._klippy_info["python_path"]` without a default
+    /// (`klippy_connection.py`, `_save_path_info`). Frontends do not read it
+    /// at all, and Moonraker's own docs mark it "moonraker use only".
     pub python_path: String,
     /// Process id of the host software.
     pub process_id: u32,

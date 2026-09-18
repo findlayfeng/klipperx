@@ -37,10 +37,11 @@
 //! # Input that is not a terminal
 //!
 //! A piped stdin — `printf 'list_endpoints\n' | klipperx console` — is served
-//! the same way, minus the banner and the prompt, and the session ends a second
-//! after the input runs out rather than immediately: requests that
-//! were just sent are still owed replies, and dropping them would make a simple
-//! pipeline print nothing at all. For scripting, `klipperx api` is the tool.
+//! the same way, minus the banner and the prompt, and leaving — by ^D, by `.quit`,
+//! or by the pipe running out — first prints the replies still owed, for up to a
+//! second: requests that were just sent have not been answered yet, and dropping
+//! them would make a simple pipeline print nothing at all. A session with nothing
+//! outstanding leaves at once. For scripting, `klipperx api` is the tool.
 //!
 //! # Known gaps
 //!
@@ -63,8 +64,11 @@ use crate::core::klippy::error::KlippyError;
 
 use super::connection::{Connection, Incoming, Reply};
 
-/// How long to keep listening after stdin runs out, so that replies already on
-/// their way are printed before the session ends.
+/// How long to keep listening at most, after input ends or `.quit` is typed, so
+/// that replies already on their way are printed before the session ends.
+///
+/// This is the ceiling, not the wait: a session with nothing outstanding leaves
+/// at once (see [`Console::drain`]).
 const EOF_GRACE: Duration = Duration::from_secs(1);
 
 /// What a local command tells the loop to do.
@@ -159,11 +163,9 @@ impl Console {
                     }
                     Ok(Some(line)) => match self.handle_line(&line).await? {
                         Control::Continue => (),
-                        // An explicit `.quit` means now, replies or not.
-                        Control::Quit => {
-                            println!("Disconnected from {}.", self.target);
-                            return Ok(());
-                        }
+                        // `.quit` stops taking input; what is still owed is read
+                        // below, the same way it is when input ends on its own.
+                        Control::Quit => break,
                     },
                 },
                 // A push, or a late reply. Printed as it arrives, which is what
@@ -184,14 +186,16 @@ impl Console {
         Ok(())
     }
 
-    /// Keep printing what arrives for a moment after the input ended.
+    /// Print the replies still owed, for at most a moment, before leaving.
     ///
     /// The requests just read may not have been answered yet — a pipe delivers
-    /// every line before the server has seen the first one — so ending here
-    /// would drop the very output the session was started for.
+    /// every line before the server has seen the first one — so ending here would
+    /// drop the very output the session was started for. Waiting only while
+    /// something is actually owed is what keeps leaving instant in the normal
+    /// case, where every request has already been answered on screen.
     async fn drain(&mut self) {
         let deadline = tokio::time::Instant::now() + EOF_GRACE;
-        loop {
+        while self.connection.has_pending() {
             match tokio::time::timeout_at(deadline, self.connection.receive()).await {
                 // The grace period is over.
                 Err(_) => return,
@@ -295,7 +299,7 @@ impl Console {
              \x20 .help          this text\n\
              \x20 .subscribe     watch every object (`objects/list` + `objects/subscribe`)\n\
              \x20 .subscribe a b watch only the named objects\n\
-             \x20 .quit          leave (also ^D)\n\
+             \x20 .quit          leave, after printing any reply still owed (also ^D)\n\
              \n\
              Replies print as `<id> (<method>) <result>`; pushes print as `< <message>`."
         );

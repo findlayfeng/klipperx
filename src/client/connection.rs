@@ -146,6 +146,16 @@ impl Connection {
         id
     }
 
+    /// Whether a reply is still owed.
+    ///
+    /// True from the moment a request is sent until its reply has been handed
+    /// out, and false for fire-and-forget requests, which by definition never
+    /// get one. A caller that is about to stop reading — an interactive console
+    /// on its way out — can use this to decide whether waiting is worthwhile.
+    pub fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
     /// The last `id` issued, or 0 before the first request.
     ///
     /// A reply carries this id, so a caller that did not keep the return value
@@ -490,6 +500,29 @@ mod tests {
         // Nothing comes back, so a read has to time out rather than end.
         let quiet = tokio::time::timeout(Duration::from_millis(100), connection.receive()).await;
         assert!(quiet.is_err(), "a fire-and-forget request was answered");
+
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn test_a_reply_is_owed_only_until_it_arrives() {
+        let path = SocketPath::new("pending");
+        let task = serve(&path).await;
+        let mut connection = connect(&path).await;
+
+        assert!(!connection.has_pending());
+        let id = connection.request("echo", Map::new()).await.unwrap();
+        assert!(connection.has_pending(), "a request owes a reply");
+
+        let _ = connection.receive().await.unwrap();
+        assert!(!connection.has_pending(), "id {id} was answered");
+
+        // Fire-and-forget never owes anything.
+        connection
+            .send(&json!({"id": null, "method": "echo"}))
+            .await
+            .unwrap();
+        assert!(!connection.has_pending());
 
         task.abort();
     }

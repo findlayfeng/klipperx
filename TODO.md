@@ -41,14 +41,11 @@ runtime、重启循环）是它上面的一层。
 - [x] `api::register(api, printer)`（`src/core/klippy/api/mod.rs`）一次装完服务器这一侧：
       先登 `webhooks`、再登端点；之后 `Printer::new()` 的状态表是空的（机器没有组成部分），
       客户端看到的 `objects/list` 从一开始就含 `webhooks`。
-- [ ] **端点与对象尚未接入主机**：需要在建 `Printer` 之后、**bind 之前**调用一次
-      `api::register`（上游的时序：`Printer.__init__` 先登 `webhooks`（内部就 bind 了
-      socket），配置里的一切 `configfile` / `mcu*` / `toolhead` 都是之后才登的 ——
-      所以「连上了就一定有 `webhooks`」这条保证靠的是顺序，不是占位对象）。
-      注册先于 bind 这条只能靠代码结构保证，单测只能锁住注册函数的效果。
-      装载侧已经就绪：`printer.load_config(&config)`（`load.rs` 里的 `Printer` 方法）
-      与 `Printer::bring_up()` 都写好了，主机按「`api::register`（webhooks 在前）→
-      `load_config` → bind → bring_up → run」串起来即可（见 T2）。
+- [x] **端点与对象已接入主机**：`src/klippy.rs` 在建出 `Printer` 后先
+      `api::register(&mut api, &printer)`、再 bind，配置对象随后由 `printer.load_config`
+      装载 —— `webhooks` 因此先于 `mcu` 登记（上游时序：`Printer.__init__` 先登
+      `webhooks`，`configfile` / `mcu*` / `toolhead` 都之后才登），`objects/list` 是
+      `["webhooks", "mcu", …]`。「连上了就一定有 `webhooks`」靠的是这段顺序。
 - [x] `[mcu]` 作为住户：`mcu::object::McuObject`（`src/core/klippy/mcu/object.rs`）。
       由 `Printer::load_config`（`src/core/klippy/load.rs`）从 `[mcu]` / `[mcu <name>]` 建出
       并登记（注册键是 section
@@ -62,15 +59,16 @@ runtime、重启循环）是它上面的一层。
 
 ### T2 主机层（机器外面的东西）
 
-- [ ] `src/klippy.rs::klippy_process` 现在只有一个 `ctrl_c`：改成「建机器 → 起 runtime →
-      跑机器 → 按结果重启或退出」的循环（上游 `klippy/klippy.py:355` 的 `while 1`）。
-      装载与上线都已就绪：`api::register` 之后 `printer.load_config(&config)`，再
-      `printer.bring_up().await`，然后把同步的 `printer.run()` 交给 `spawn_blocking`；
-      `ctrl_c` 要接到当前那台机器的 `request_exit("exit")`。
-- [ ] `api → printer` 这条边：`objects/*` 与 `webhooks` 已经写好在 `api::register` 一处，
-      主机建出 `Printer` 后在 **bind 之前**调它即可（顺序要求见 T1 最后一条未完成项）；
-      `info` 的 handler 还是 `todo!()`（`src/core/klippy/api/endpoints/info.rs`），
-      `get_state_message()` + `PrinterState::as_category()` 已经就绪，接上即可。
+- [x] `src/klippy.rs::klippy_process`：现在是「建机器 → `api::register` → bind →
+      `printer.load_config(&config)`（失败即 `invoke_shutdown`，与服务保持在线，与上游
+      `_read_config` 失败一样）→ `printer.bring_up().await` →
+      `spawn_blocking(printer.run())`」；`ctrl_c` 在一个任务里等，接到该机器的
+      `request_exit("exit")`。附着的窗口结束时也是先 `request_exit` 再 await 主机，
+      而不是 abort 掉一个还握着机器的 run loop。
+      **未做：重启循环**。`firmware_restart` 现在只记录并退出，见 Q7。
+- [ ] `info` 的 handler 还是 `todo!()`（`src/core/klippy/api/endpoints/info.rs`），
+      `get_state_message()` + `PrinterState::as_category()` 已经就绪，接上即可；
+      它要主机层的 start args（见下一条）。
 - [ ] start args / rollover info / 日志（`get_start_args` 29 处、`set_rollover_info` 7 处）
       归主机层，不进机器。
 
@@ -161,6 +159,11 @@ runtime、重启循环）是它上面的一层。
       `printer.objects`（`klippy/extras/gcode_macro.py:41`）。
 - [ ] **Q6 退出结果的语义**：`"exit" / "error_exit" / "firmware_restart"` 由谁解释、
       `run()` 的返回值怎么变成进程退出码（`klippy/klippy.py:355-370`）。
+- [ ] **Q7 重启时 API 与打印机的关系**：`firmware_restart` 要重建机器，但端点与
+      `webhooks` 把 `Arc<Printer>` 烤在了自己身上。要么每次重启重建 Api + Server
+      （上游每次重新 bind socket），要么一个 Api 配一个可换入的 printer 槽
+      （`RwLock<Arc<Printer>>` / ArcSwap）。前者要动 `--tui` 的 in-process server，
+      后者要改 `api::register` 与三个端点/对象的构造。定下来之前不做重启循环。
 
 ## 证据索引（上游，供回头分析时查）
 

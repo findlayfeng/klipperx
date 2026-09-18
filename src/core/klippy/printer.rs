@@ -432,6 +432,13 @@ impl Printer {
     /// while connecting never becomes ready, and the `klippy:connect` event is
     /// only fired once every object is up.
     pub async fn bring_up(&self) {
+        // A printer that was already halted — a config the loader rejected, a
+        // shutdown that raced this call — has nothing to bring up. Connecting
+        // its parts anyway would reach a device for a machine that is stopped.
+        if self.category() != PrinterState::Startup {
+            return;
+        }
+
         for (name, object) in self.registry() {
             if let Err(err) = object.connect().await {
                 self.invoke_shutdown(&format!("{name}: {err}"));
@@ -762,6 +769,31 @@ mod tests {
         let state = printer.get_state_message();
         assert_eq!(state.category, PrinterState::Shutdown);
         assert!(state.message.contains("broken"), "{}", state.message);
+    }
+
+    #[tokio::test]
+    async fn test_a_printer_that_shut_down_does_not_connect_its_objects() {
+        let printer = Printer::new();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        printer
+            .add_object(
+                "part",
+                Arc::new(Part {
+                    name: "part",
+                    log: Arc::clone(&log),
+                    fails: false,
+                }),
+            )
+            .unwrap();
+        printer.invoke_shutdown("Printer is halted");
+
+        printer.bring_up().await;
+
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "an object was connected for a machine that is stopped"
+        );
+        assert_eq!(printer.get_state_message().category, PrinterState::Shutdown);
     }
 
     /// A part whose status the test wrote.

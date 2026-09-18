@@ -1,0 +1,22 @@
+[package]
+name = "klippy-client"
+version = "0.1.0"
+edition = "2021"
+description = "Klipper API client: one request, or an interactive session"
+license = "GPL-3.0"
+
+[lib]
+name = "klippy_client"
+path = "src/lib.rs"
+
+[[bin]]
+name = "klippy-client"
+path = "src/main.rs"
+
+[dependencies]
+klippy-api = { path = "../klippy-api" }
+clap = { version = "4", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["net", "io-util", "io-std", "sync", "time", "rt", "macros"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

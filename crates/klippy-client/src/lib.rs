@@ -10,8 +10,8 @@
 //!
 //! | Subcommand | What it is |
 //! |---|---|
-//! | `klipperx api` | one request, print the reply, exit — for scripts |
-//! | `klipperx console` | an interactive session: type requests, watch pushes |
+//! | `api` | one request, print the reply, exit — for scripts |
+//! | `console` | an interactive session: type requests, watch pushes |
 //!
 //! Both take the same `-a/--api-server` value as the host takes, and both reuse
 //! the host's parser for it ([`ApiTarget`]), so `unix:` paths and `tcp:` addresses
@@ -20,10 +20,15 @@
 //! # Where the protocol lives
 //!
 //! The protocol is not re-implemented here. [`connection`] reuses
-//! [`api::protocol`](crate::core::klippy::api::protocol)'s framing and the same
-//! `0x03`-delimited JSON the server writes, and the endpoints it calls are the
-//! ones in `docs/klippy/third-party-dev/api-reference.md`. A client that
-//! disagreed with the server about any of that would only be testing itself.
+//! [`klippy_api::protocol`]'s framing and the same `0x03`-delimited JSON the
+//! server writes, and the endpoints it calls are the ones in
+//! `docs/klippy/third-party-dev/api-reference.md`. A client that disagreed with
+//! the server about any of that would only be testing itself.
+//!
+//! It is a crate of its own, depending on [`klippy_api`] and nothing else of
+//! this project, so that this binary does not compile or link the host: no
+//! `reqwest`, no `flate2`, no `libloading`. What a client shares with the host is
+//! the API, which is exactly what that crate is.
 
 pub mod connection;
 pub mod console;
@@ -31,7 +36,7 @@ pub mod console;
 use clap::Args;
 use serde_json::{Map, Value};
 
-use crate::core::klippy::api::address::ApiTarget;
+use klippy_api::address::ApiTarget;
 
 use connection::{Connection, Incoming, Reply};
 use console::Console;

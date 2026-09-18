@@ -1,4 +1,4 @@
-//! The interactive console: `klipperx console`.
+//! The interactive console: `klippy-client console`.
 //!
 //! A session is two independent streams — what the user types and what the
 //! server sends — so the loop `select!`s between them. That is the whole point
@@ -59,8 +59,8 @@ use std::time::Duration;
 use serde_json::{json, Map, Value};
 use tokio::io::AsyncBufReadExt;
 
-use crate::core::klippy::api::address::ApiTarget;
-use crate::core::klippy::api::TransportError;
+use klippy_api::address::ApiTarget;
+use klippy_api::TransportError;
 
 use super::connection::{Connection, Incoming, Reply};
 
@@ -449,9 +449,9 @@ fn parse_params(value: &str) -> Result<Map<String, Value>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::klippy::api::protocol::{ApiError, Request};
-    use crate::core::klippy::api::registry::{Api, Endpoint, EndpointContext};
-    use crate::core::klippy::api::server::Server;
+    use klippy_api::protocol::{ApiError, Request};
+    use klippy_api::registry::{Api, Endpoint, EndpointContext};
+    use klippy_api::server::Server;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;

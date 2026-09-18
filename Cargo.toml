@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/klippy-api", "crates/test-support"]
+members = ["crates/klippy-api", "crates/klippy-client", "crates/test-support"]
 resolver = "2"
 
 [package]
@@ -18,16 +18,13 @@ path = "src/main.rs"
 name = "klippy"
 path = "src/bin/klippy/main.rs"
 
-[[bin]]
-name = "klippy-client"
-path = "src/bin/klippy-client/main.rs"
-
 [lib]
 name = "klipperx"
 path = "src/lib.rs"
 
 [dependencies]
 klippy-api = { path = "crates/klippy-api" }
+klippy-client = { path = "crates/klippy-client" }
 clap = { version = "4", features = ["derive"] }
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }

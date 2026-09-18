@@ -1,4 +1,3 @@
-pub mod client;
 pub mod core;
 pub mod klippy;
 pub mod logging;

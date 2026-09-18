@@ -127,7 +127,7 @@ cargo test -p klipperx --lib test_install_skips  # 单个用例（按名过滤�
 
 改动 `msg` / `mcu` / `cmd` / `event` / `identify` / `api` 的公开 API 或分层职责时，请同时更新本手册对应页面（见 [开发手册首页](README.md) 的目录）；改动 `crates/klippy-api` / `crates/klippy-client` 时同理（它们的公开 API 就是别人依赖的协议）。
 
-`cargo doc --no-deps --lib` 的警告数应与改动前一致（根包目前有 10 条残留于 `frame.rs` / `kinematics` / `msg/parser.rs` / `printer.rs`；`klippy-api` 与 `klippy-client` 是 0 条）。新增模块时注意两个陷阱：
+`cargo doc --no-deps --lib` 的警告数应与改动前一致（根包目前有 2 条残留于 `frame.rs` / `msg/parser.rs`；`klippy-api` 与 `klippy-client` 是 0 条）。新增模块时注意两个陷阱：
 
 1. **模块的文档链接是在它的 `mod` 声明所在作用域里解析的**，不是在被声明模块自己的作用域里。`klippy/mod.rs` 里的 `pub mod …;` 因此都不带 `///` 文档。
 2. **把私有模块提升为 `pub mod` 会激活它的公开文档检查**：模块文档里指向 `pub(crate)` 项的链接会报 `links to private item`。`identify` 从 `mcu` 的子模块提升为顶层公开模块时就遇到这一点，需要把这类链接改成纯代码 span。

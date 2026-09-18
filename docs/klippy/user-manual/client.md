@@ -64,6 +64,10 @@ WARN  api: dropping malformed request (invalid JSON …): not json
   进窗口的日志区；窗口关掉后如果主机还在跑，日志会回到 stdout。
 - `--verbose` 打开 DEBUG，所以主机更啰嗦时窗口也会显示那些细节。
 - 没有终端（比如 systemd 里）时 `--tui` 只打印一行警告，主机照常无窗口运行。
+- 这个选项属于 `klipperx`，**独立二进制 `klippy` 没有它**：窗口是客户端，会带进
+  一整套终端界面库，而只负责提供 API 的 `klippy` 用不到 —— 不装它的 `klippy`
+  因此小一号（release 6.3 MB，带窗口的 `klipperx` 是 7.6 MB）。要在独立主机上加
+  窗口，另开一个终端跑 `klippy-client console -a …` 即可。
 
 > **安全提醒**：API 没有任何认证，能连上的人就能操作打印机。TCP 监听只应开在
 > 可信网络上（本机 `127.0.0.1` 或内网），不要直接暴露到公网。Unix socket 也

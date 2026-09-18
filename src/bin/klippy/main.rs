@@ -26,7 +26,7 @@ fn main() {
 
     klipperx::logging::init(cli.verbose);
 
-    if let Err(e) = klippy::run(cli.args) {
+    if let Err(e) = klippy::run(cli.args, None) {
         error!("Error: {}", e);
         std::process::exit(1);
     }
@@ -59,22 +59,26 @@ mod tests {
     }
 
     #[test]
-    fn test_a_flag_without_a_config_file_is_an_error() {
-        // Then they were trying to run something, and the missing file is worth
-        // saying.
-        let error = parse(&["--tui"]).expect_err("no config file");
-        assert_eq!(
-            error.kind(),
-            clap::error::ErrorKind::MissingRequiredArgument
-        );
-        assert!(error.to_string().contains("CONFIG_FILE"), "{error}");
+    fn test_a_flag_without_a_config_file_parses_and_is_caught_later() {
+        // Clap cannot demand the config file, since the same arguments are the
+        // optional half of `klipperx`'s command line; the host says so instead.
+        let cli = parse(&["-v"]).expect("a flag on its own parses");
+        assert!(cli.args.config_file.is_none());
+    }
+
+    #[test]
+    fn test_the_window_is_not_this_binary_s_business() {
+        // `--tui` belongs to `klipperx`: a host that only serves the API has no
+        // use for a window, and not offering it keeps the terminal library out
+        // of this binary.
+        let error = parse(&["printer.cfg", "--tui"]).expect_err("unknown option");
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
     }
 
     #[test]
     fn test_the_arguments_are_the_hosts_own() {
-        let cli = parse(&["printer.cfg", "--tui", "-a", "/tmp/x"]).unwrap();
-        assert!(cli.args.tui);
-        assert_eq!(cli.args.config_file, "printer.cfg");
+        let cli = parse(&["printer.cfg", "-a", "/tmp/x"]).unwrap();
+        assert_eq!(cli.args.config_file.as_deref(), Some("printer.cfg"));
         assert_eq!(cli.args.api_server.as_deref(), Some("/tmp/x"));
     }
 

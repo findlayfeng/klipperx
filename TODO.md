@@ -46,10 +46,12 @@ runtime、重启循环）是它上面的一层。
       socket），配置里的一切 `configfile` / `mcu*` / `toolhead` 都是之后才登的 ——
       所以「连上了就一定有 `webhooks`」这条保证靠的是顺序，不是占位对象）。
       注册先于 bind 这条只能靠代码结构保证，单测只能锁住注册函数的效果。
-      装载侧已经就绪：`load::load_config(&config, &printer)` 与 `Printer::bring_up()`
-      都写好了，主机按「load → register → bind → bring_up → run」串起来即可（见 T2）。
+      装载侧已经就绪：`printer.load_config(&config)`（`load.rs` 里的 `Printer` 方法）
+      与 `Printer::bring_up()` 都写好了，主机按「`api::register`（webhooks 在前）→
+      `load_config` → bind → bring_up → run」串起来即可（见 T2）。
 - [x] `[mcu]` 作为住户：`mcu::object::McuObject`（`src/core/klippy/mcu/object.rs`）。
-      由 `load::load_config` 从 `[mcu]` / `[mcu <name>]` 建出并登记（注册键是 section
+      由 `Printer::load_config`（`src/core/klippy/load.rs`）从 `[mcu]` / `[mcu <name>]` 建出
+      并登记（注册键是 section
       identifier，自己的名字是去掉 `mcu ` 前缀的 sub —— `klippy/mcu.py:1151-1153`）；
       section 的解析与设备打开放在 `PrinterObject::connect` 里，`get_status` 报 identify 的
       `mcu_version` / `mcu_build_versions` / `mcu_constants`（`klippy/mcu.py:938-948`）。
@@ -62,8 +64,8 @@ runtime、重启循环）是它上面的一层。
 
 - [ ] `src/klippy.rs::klippy_process` 现在只有一个 `ctrl_c`：改成「建机器 → 起 runtime →
       跑机器 → 按结果重启或退出」的循环（上游 `klippy/klippy.py:355` 的 `while 1`）。
-      装载与上线都已就绪：`load::load_config(&config, &printer)` 之后
-      `printer.bring_up().await`，再把同步的 `printer.run()` 交给 `spawn_blocking`；
+      装载与上线都已就绪：`api::register` 之后 `printer.load_config(&config)`，再
+      `printer.bring_up().await`，然后把同步的 `printer.run()` 交给 `spawn_blocking`；
       `ctrl_c` 要接到当前那台机器的 `request_exit("exit")`。
 - [ ] `api → printer` 这条边：`objects/*` 与 `webhooks` 已经写好在 `api::register` 一处，
       主机建出 `Printer` 后在 **bind 之前**调它即可（顺序要求见 T1 最后一条未完成项）；

@@ -9,8 +9,8 @@
 //! ```
 //!
 //! Upstream filters its registry down to the objects that define
-//! `get_status`; here the status table *is* that filter — an object is in it
-//! because it registered a [`StatusSource`](crate::core::klippy::printer::StatusSource),
+//! `get_status`; here the registry *is* that filter — an object is in it
+//! because it implements [`PrinterObject`](crate::core::klippy::printer::PrinterObject),
 //! so every name it holds is one `objects/query` can answer for.
 //!
 //! # Status
@@ -49,7 +49,7 @@ impl Endpoint for ObjectsList {
         _request: &Request,
         _context: &EndpointContext<'_>,
     ) -> Result<Value, ApiError> {
-        Ok(json!({ "objects": self.printer.status_objects() }))
+        Ok(json!({ "objects": self.printer.objects() }))
     }
 }
 
@@ -90,7 +90,7 @@ mod tests {
         let printer = Arc::new(Printer::new());
         for name in ["webhooks", "extruder", "heater_bed", "toolhead"] {
             printer
-                .add_status_object(name, Arc::new(FixedStatus(json!({}))))
+                .add_object(name, Arc::new(FixedStatus(json!({}))))
                 .unwrap();
         }
         let request = Request::parse(br#"{"method":"objects/list"}"#).unwrap();
@@ -123,7 +123,7 @@ mod tests {
     fn test_the_registry_reaches_the_endpoint_by_path() {
         let printer = Arc::new(Printer::new());
         printer
-            .add_status_object("extruder", Arc::new(FixedStatus(json!({}))))
+            .add_object("extruder", Arc::new(FixedStatus(json!({}))))
             .unwrap();
         let mut api = Api::new();
         api.register(ObjectsList::new(printer)).unwrap();

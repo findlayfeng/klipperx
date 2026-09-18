@@ -31,7 +31,7 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 
-use crate::core::klippy::printer::{Printer, StatusSource};
+use crate::core::klippy::printer::{Printer, PrinterObject};
 
 /// The object name clients ask for, as upstream registers it.
 pub const WEBHOOKS_OBJECT: &str = "webhooks";
@@ -48,7 +48,7 @@ impl WebhooksStatus {
     }
 }
 
-impl StatusSource for WebhooksStatus {
+impl PrinterObject for WebhooksStatus {
     fn get_status(&self, _eventtime: f64) -> Value {
         let state = self.printer.get_state_message();
         json!({
@@ -89,10 +89,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_the_object_follows_the_printer_into_the_ready_state() {
+    #[tokio::test]
+    async fn test_the_object_follows_the_printer_into_the_ready_state() {
         let printer = Arc::new(Printer::new());
         let status = WebhooksStatus::new(Arc::clone(&printer));
+        printer.bring_up().await;
         printer.request_exit("exit");
 
         assert_eq!(printer.run(), "exit");

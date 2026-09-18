@@ -73,7 +73,7 @@ cargo test -p klipperx --lib test_install_skips  # 单个用例（按名过滤�
 
 | 模块 | 覆盖 |
 |------|------|
-| `printer.rs` | 状态与事件名即线上名；生命周期：新机器是 `startup`、`run` 上线到 `ready` 并按序发 `connect`/`ready`/（firmware_restart）/`disconnect`、handler 按注册顺序调用、`run` 等另一线程的 `request_exit`（等 `ready` 而不是 sleep 来定序）、先请求退出则不等待、首个退出结果固定、`invoke_shutdown` 只接受首条消息、停机后 `run` 不会变成 `ready`；status 表：**新机器没有任何状态对象**（`webhooks` 是主机侧的）、注册顺序、重名被拒且首个注册保留、未注册对象返回 `None`、按名取到的是那个对象、`eventtime` 单调且从 0 起 |
+| `printer.rs` | 状态与事件名即线上名；生命周期：新机器是 `startup`、`bring_up` 先按注册顺序 `connect` 每个对象再上线到 `ready` 并按序发 `connect`/`ready`/（firmware_restart）/`disconnect`、对象 `connect` 失败即 `invoke_shutdown` 并带上原因、handler 按注册顺序调用、`run` 等另一线程的 `request_exit`（先在另一线程起 `run`）、先请求退出则不等待、首个退出结果固定、`invoke_shutdown` 只接受首条消息、停机后 `bring_up` 不会变成 `ready`；对象表：**新机器没有任何对象**（`webhooks` 是主机侧的）、注册顺序、重名被拒且首个注册保留、按名 `lookup_object` 拿得到且未注册返回 `None`、`connect` 默认是空实现、`eventtime` 单调且从 0 起 |
 
 ### `klippy-api`
 

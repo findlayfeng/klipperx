@@ -2,7 +2,7 @@
 //!
 //! klippy is started with `-a <target>` and the API server listens there: a
 //! Unix Domain Socket by default, or TCP when the target says so (see
-//! [`ListenTarget`]). One task accepts connections, and each connection gets a
+//! [`ApiTarget`]). One task accepts connections, and each connection gets a
 //! task of its own.
 //!
 //! # Why a task per connection
@@ -46,7 +46,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, UnixListener};
 use tokio::sync::Notify;
 use tokio::time::{timeout, Duration};
@@ -54,7 +54,7 @@ use tracing::warn;
 
 use crate::core::klippy::error::KlippyError;
 
-use super::address::ListenTarget;
+use super::address::{ApiTarget, Transport};
 use super::protocol::{encode, Framing, MalformedRequest, PushTarget, Request};
 use super::registry::Api;
 
@@ -71,14 +71,6 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 // Listener
 // ===========================================================================
 
-/// A connected client, whichever transport it arrived on.
-///
-/// The two socket types have nothing in common but their traits, so the
-/// connection task works on the trait instead of matching on the transport four
-/// times over.
-trait Transport: AsyncRead + AsyncWrite + Unpin + Send {}
-impl<T: AsyncRead + AsyncWrite + Unpin + Send> Transport for T {}
-
 /// A bound listening socket.
 enum Listener {
     Unix {
@@ -90,9 +82,9 @@ enum Listener {
 
 impl Listener {
     /// Bind `target`, creating the socket file for a Unix target.
-    async fn bind(target: &ListenTarget) -> Result<Self, KlippyError> {
+    async fn bind(target: &ApiTarget) -> Result<Self, KlippyError> {
         match target {
-            ListenTarget::Unix(path) => {
+            ApiTarget::Unix(path) => {
                 // A socket file left by a killed run would make this fail with
                 // "address already in use", so it goes first — upstream removes
                 // it for the same reason. Removing it while a live server holds
@@ -119,7 +111,7 @@ impl Listener {
                     path: path.clone(),
                 })
             }
-            ListenTarget::Tcp(address) => {
+            ApiTarget::Tcp(address) => {
                 let listener = TcpListener::bind(address).await.map_err(|err| {
                     KlippyError::Connection(format!("cannot bind tcp {address}: {err}"))
                 })?;
@@ -164,9 +156,9 @@ impl Listener {
     }
 
     /// `requested`, with a TCP port of `0` replaced by the bound one.
-    fn resolved_target(&self, requested: &ListenTarget) -> ListenTarget {
+    fn resolved_target(&self, requested: &ApiTarget) -> ApiTarget {
         match (requested, self.local_addr()) {
-            (ListenTarget::Tcp(_), Some(addr)) => ListenTarget::Tcp(addr.to_string()),
+            (ApiTarget::Tcp(_), Some(addr)) => ApiTarget::Tcp(addr.to_string()),
             _ => requested.clone(),
         }
     }
@@ -191,7 +183,7 @@ impl Drop for Listener {
 
 /// The API server: a bound listener and the endpoint table it serves.
 pub struct Server {
-    target: ListenTarget,
+    target: ApiTarget,
     listener: Listener,
     api: Arc<Api>,
 }
@@ -206,7 +198,7 @@ impl Server {
     ///
     /// # Errors
     /// Returns [`KlippyError::Connection`] if the listener cannot be created.
-    pub async fn bind(target: ListenTarget, api: Arc<Api>) -> Result<Self, KlippyError> {
+    pub async fn bind(target: ApiTarget, api: Arc<Api>) -> Result<Self, KlippyError> {
         let listener = Listener::bind(&target).await?;
         // Resolve once, here, so that `target` means "where this is listening"
         // everywhere else instead of "what the operator typed".
@@ -222,7 +214,7 @@ impl Server {
     ///
     /// Not necessarily the one asked for: a TCP port of `0` is replaced by the
     /// port the kernel chose, so this is always usable as an address.
-    pub fn target(&self) -> &ListenTarget {
+    pub fn target(&self) -> &ApiTarget {
         &self.target
     }
 
@@ -505,6 +497,7 @@ mod tests {
     use std::pin::Pin;
     use std::sync::atomic::AtomicUsize;
     use std::task::{Context, Poll};
+    use tokio::io::AsyncRead;
     use tokio::net::{TcpStream, UnixStream};
 
     // -----------------------------------------------------------------------
@@ -638,7 +631,7 @@ mod tests {
     }
 
     /// Start a server on `target`, failing the test if it cannot bind.
-    async fn bind(target: ListenTarget) -> Server {
+    async fn bind(target: ApiTarget) -> Server {
         Server::bind(target, api()).await.expect("cannot bind")
     }
 
@@ -695,7 +688,7 @@ mod tests {
     async fn test_a_request_is_answered_over_a_unix_socket() {
         let dir = TempDir::new("unix");
         let path = dir.join("klippy_uds");
-        let server = bind(ListenTarget::Unix(path.clone())).await;
+        let server = bind(ApiTarget::Unix(path.clone())).await;
         assert_eq!(server.socket_path(), Some(path.as_path()));
         assert_eq!(server.local_addr(), None);
         let task = tokio::spawn(server.run());
@@ -719,7 +712,7 @@ mod tests {
     #[tokio::test]
     async fn test_a_request_is_answered_over_tcp() {
         // Port 0: the kernel picks, and the server reports what it chose.
-        let server = bind(ListenTarget::Tcp("127.0.0.1:0".to_string())).await;
+        let server = bind(ApiTarget::Tcp("127.0.0.1:0".to_string())).await;
         let addr = server.local_addr().expect("a TCP server has an address");
         assert_eq!(server.socket_path(), None);
         // The reported target is the bound address, not `127.0.0.1:0`.
@@ -747,7 +740,7 @@ mod tests {
     async fn test_an_unknown_method_and_a_failing_handler_both_answer() {
         let dir = TempDir::new("errors");
         let path = dir.join("klippy_uds");
-        let server = bind(ListenTarget::Unix(path.clone())).await;
+        let server = bind(ApiTarget::Unix(path.clone())).await;
         let task = tokio::spawn(server.run());
 
         let mut stream = UnixStream::connect(&path).await.expect("cannot connect");
@@ -774,7 +767,7 @@ mod tests {
     async fn test_a_relayed_push_arrives_without_further_requests() {
         let dir = TempDir::new("push");
         let path = dir.join("klippy_uds");
-        let server = bind(ListenTarget::Unix(path.clone())).await;
+        let server = bind(ApiTarget::Unix(path.clone())).await;
         let task = tokio::spawn(server.run());
 
         let mut stream = UnixStream::connect(&path).await.expect("cannot connect");
@@ -798,7 +791,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_a_request_split_across_tcp_segments_is_answered_once() {
-        let server = bind(ListenTarget::Tcp("127.0.0.1:0".to_string())).await;
+        let server = bind(ApiTarget::Tcp("127.0.0.1:0".to_string())).await;
         let addr = server.local_addr().unwrap();
         let task = tokio::spawn(server.run());
 
@@ -825,7 +818,7 @@ mod tests {
             .unwrap();
 
         // The bind must replace the stale file with a real listening socket.
-        let server = bind(ListenTarget::Unix(path.clone())).await;
+        let server = bind(ApiTarget::Unix(path.clone())).await;
         assert!(is_socket(&path));
         drop(server);
     }
@@ -834,7 +827,7 @@ mod tests {
     async fn test_dropping_the_server_removes_the_socket_file() {
         let dir = TempDir::new("cleanup");
         let path = dir.join("klippy_uds");
-        let server = bind(ListenTarget::Unix(path.clone())).await;
+        let server = bind(ApiTarget::Unix(path.clone())).await;
         let task = tokio::spawn(server.run());
         assert!(path.exists());
 
@@ -851,7 +844,7 @@ mod tests {
     async fn test_two_clients_are_served_at_the_same_time() {
         let dir = TempDir::new("clients");
         let path = dir.join("klippy_uds");
-        let server = bind(ListenTarget::Unix(path.clone())).await;
+        let server = bind(ApiTarget::Unix(path.clone())).await;
         let task = tokio::spawn(server.run());
 
         let mut first = UnixStream::connect(&path).await.expect("cannot connect");

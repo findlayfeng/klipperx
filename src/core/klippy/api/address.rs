@@ -1,4 +1,4 @@
-//! Where the API server listens.
+//! Where the API server is.
 //!
 //! Upstream klippy takes one option, `-a/--api-server`, holding the filename of
 //! a Unix Domain Socket — and it has **no default**: without the option, no
@@ -9,9 +9,9 @@
 //! reach the API without a socket tunnel. Both forms live in one option rather
 //! than two, because a target is either one or the other and never both.
 //!
-//! | Value | Listens on |
+//! | Value | The API server is at |
 //! |---|---|
-//! | `/tmp/klippy_uds` | Unix Domain Socket at that path (upstream's form) |
+//! | `/tmp/klippy_uds` | a Unix Domain Socket at that path (upstream's form) |
 //! | `unix:/tmp/klippy_uds` | the same, written explicitly |
 //! | `tcp:127.0.0.1:7125` | TCP |
 //! | `tcp://[::1]:7125` | TCP, IPv6 |
@@ -24,14 +24,35 @@
 //! would then fail to bind with a confusing message. `http://127.0.0.1:7125`
 //! is the case that matters: that is Moonraker's own port, not this socket, and
 //! it used to be the default here.
+//!
+//! Both directions of the API meet here: [`Server`](super::Server) binds the
+//! target, and [`ApiTarget::connect`] dials it. Everything above the socket is
+//! written against [`Transport`], which is the one thing a listener and a
+//! dialer have in common.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-/// Where to listen, as parsed from the `--api-server` option.
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::{TcpStream, UnixStream};
+
+use crate::core::klippy::error::KlippyError;
+
+/// A read/write API socket, whichever transport it arrived on.
+///
+/// The two socket types have nothing in common but their traits, so everything
+/// above the socket — framing, requests, dispatch, a connection's read and write
+/// halves — is written against this instead of matching on the transport over
+/// and over. The server gets one from accepting a connection; a client gets one
+/// from [`ApiTarget::connect`].
+pub trait Transport: AsyncRead + AsyncWrite + Unpin + Send {}
+
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> Transport for T {}
+
+/// Where the API server is, as parsed from the `--api-server` option.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ListenTarget {
+pub enum ApiTarget {
     /// A Unix Domain Socket at this filesystem path.
     Unix(PathBuf),
     /// A TCP listen address, still unresolved: `host:port`, so that a name
@@ -40,34 +61,62 @@ pub enum ListenTarget {
     Tcp(String),
 }
 
-impl ListenTarget {
+impl ApiTarget {
     /// Whether this target is a Unix Domain Socket.
     pub fn is_unix(&self) -> bool {
-        matches!(self, ListenTarget::Unix(_))
+        matches!(self, ApiTarget::Unix(_))
     }
 
     /// The socket path, if this is a Unix Domain Socket target.
     pub fn as_unix(&self) -> Option<&Path> {
         match self {
-            ListenTarget::Unix(path) => Some(path),
-            ListenTarget::Tcp(_) => None,
+            ApiTarget::Unix(path) => Some(path),
+            ApiTarget::Tcp(_) => None,
         }
     }
 
     /// The unresolved TCP address, if this is a TCP target.
     pub fn as_tcp(&self) -> Option<&str> {
         match self {
-            ListenTarget::Tcp(address) => Some(address),
-            ListenTarget::Unix(_) => None,
+            ApiTarget::Tcp(address) => Some(address),
+            ApiTarget::Unix(_) => None,
+        }
+    }
+
+    /// Dial the API server at this target.
+    ///
+    /// # Errors
+    /// Returns [`KlippyError::Connection`] if the socket cannot be reached —
+    /// the usual cause being that no API server is listening there.
+    pub async fn connect(&self) -> Result<Box<dyn Transport>, KlippyError> {
+        match self {
+            ApiTarget::Unix(path) => {
+                let stream = UnixStream::connect(path).await.map_err(|err| {
+                    KlippyError::Connection(format!(
+                        "cannot connect to unix socket {}: {err}",
+                        path.display()
+                    ))
+                })?;
+                Ok(Box::new(stream))
+            }
+            ApiTarget::Tcp(address) => {
+                let stream = TcpStream::connect(address).await.map_err(|err| {
+                    KlippyError::Connection(format!("cannot connect to tcp {address}: {err}"))
+                })?;
+                // Small requests, sent as soon as they exist: Nagle would only
+                // delay them behind the acknowledgment of the previous one.
+                let _ = stream.set_nodelay(true);
+                Ok(Box::new(stream))
+            }
         }
     }
 }
 
-impl fmt::Display for ListenTarget {
+impl fmt::Display for ApiTarget {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ListenTarget::Unix(path) => write!(f, "unix:{}", path.display()),
-            ListenTarget::Tcp(address) => write!(f, "tcp:{address}"),
+            ApiTarget::Unix(path) => write!(f, "unix:{}", path.display()),
+            ApiTarget::Tcp(address) => write!(f, "tcp:{address}"),
         }
     }
 }
@@ -111,7 +160,7 @@ impl fmt::Display for AddressError {
 
 impl std::error::Error for AddressError {}
 
-impl FromStr for ListenTarget {
+impl FromStr for ApiTarget {
     type Err = AddressError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
@@ -124,10 +173,10 @@ impl FromStr for ListenTarget {
             if rest.is_empty() {
                 return Err(AddressError::EmptySocketPath);
             }
-            return Ok(ListenTarget::Unix(PathBuf::from(rest)));
+            return Ok(ApiTarget::Unix(PathBuf::from(rest)));
         }
         if let Some(rest) = strip_scheme(value, "tcp") {
-            return Ok(ListenTarget::Tcp(check_tcp(rest)?));
+            return Ok(ApiTarget::Tcp(check_tcp(rest)?));
         }
 
         // A scheme we do not know is a mistake worth naming, not a filename.
@@ -137,9 +186,9 @@ impl FromStr for ListenTarget {
 
         // A bare `host:port` is TCP; anything else is a socket path, as upstream.
         if !value.starts_with('/') && value.contains(':') {
-            return Ok(ListenTarget::Tcp(check_tcp(value)?));
+            return Ok(ApiTarget::Tcp(check_tcp(value)?));
         }
-        Ok(ListenTarget::Unix(PathBuf::from(value)))
+        Ok(ApiTarget::Unix(PathBuf::from(value)))
     }
 }
 
@@ -177,7 +226,7 @@ fn check_tcp(address: &str) -> Result<String, AddressError> {
 mod tests {
     use super::*;
 
-    fn parse(value: &str) -> ListenTarget {
+    fn parse(value: &str) -> ApiTarget {
         value.parse().expect("test value parses")
     }
 
@@ -186,11 +235,11 @@ mod tests {
         // Upstream's form, and the reason a bare value must stay a path.
         assert_eq!(
             parse("/tmp/klippy_uds"),
-            ListenTarget::Unix(PathBuf::from("/tmp/klippy_uds"))
+            ApiTarget::Unix(PathBuf::from("/tmp/klippy_uds"))
         );
         assert_eq!(
             parse("klippy_uds"),
-            ListenTarget::Unix(PathBuf::from("klippy_uds"))
+            ApiTarget::Unix(PathBuf::from("klippy_uds"))
         );
         assert!(parse("/tmp/klippy_uds").is_unix());
         assert_eq!(
@@ -205,7 +254,7 @@ mod tests {
         for value in ["unix:/tmp/klippy_uds", "unix:///tmp/klippy_uds"] {
             assert_eq!(
                 parse(value),
-                ListenTarget::Unix(PathBuf::from("/tmp/klippy_uds")),
+                ApiTarget::Unix(PathBuf::from("/tmp/klippy_uds")),
                 "{value}"
             );
         }
@@ -220,20 +269,20 @@ mod tests {
         ] {
             assert_eq!(
                 parse(value),
-                ListenTarget::Tcp("127.0.0.1:7125".to_string()),
+                ApiTarget::Tcp("127.0.0.1:7125".to_string()),
                 "{value}"
             );
         }
         // A name is kept unresolved so the listener resolves it.
         assert_eq!(
             parse("tcp:localhost:7125"),
-            ListenTarget::Tcp("localhost:7125".to_string())
+            ApiTarget::Tcp("localhost:7125".to_string())
         );
         assert_eq!(
             parse("[::1]:7125"),
-            ListenTarget::Tcp("[::1]:7125".to_string())
+            ApiTarget::Tcp("[::1]:7125".to_string())
         );
-        assert_eq!(parse(":7125"), ListenTarget::Tcp(":7125".to_string()));
+        assert_eq!(parse(":7125"), ApiTarget::Tcp(":7125".to_string()));
     }
 
     #[test]
@@ -248,13 +297,10 @@ mod tests {
 
     #[test]
     fn test_an_empty_value_is_rejected() {
-        assert_eq!("".parse::<ListenTarget>().unwrap_err(), AddressError::Empty);
+        assert_eq!("".parse::<ApiTarget>().unwrap_err(), AddressError::Empty);
+        assert_eq!("   ".parse::<ApiTarget>().unwrap_err(), AddressError::Empty);
         assert_eq!(
-            "   ".parse::<ListenTarget>().unwrap_err(),
-            AddressError::Empty
-        );
-        assert_eq!(
-            "unix:".parse::<ListenTarget>().unwrap_err(),
+            "unix:".parse::<ApiTarget>().unwrap_err(),
             AddressError::EmptySocketPath
         );
     }
@@ -263,15 +309,15 @@ mod tests {
     fn test_a_tcp_target_must_end_in_a_port() {
         // `tcp:` is explicit, so it cannot fall back to being a filename.
         assert_eq!(
-            "tcp:127.0.0.1".parse::<ListenTarget>().unwrap_err(),
+            "tcp:127.0.0.1".parse::<ApiTarget>().unwrap_err(),
             AddressError::MissingPort("127.0.0.1".to_string())
         );
         assert_eq!(
-            "tcp:127.0.0.1:http".parse::<ListenTarget>().unwrap_err(),
+            "tcp:127.0.0.1:http".parse::<ApiTarget>().unwrap_err(),
             AddressError::InvalidPort("127.0.0.1:http".to_string())
         );
         assert_eq!(
-            "tcp:127.0.0.1:".parse::<ListenTarget>().unwrap_err(),
+            "tcp:127.0.0.1:".parse::<ApiTarget>().unwrap_err(),
             AddressError::MissingPort("127.0.0.1:".to_string())
         );
     }
@@ -280,7 +326,7 @@ mod tests {
     fn test_an_unknown_scheme_is_named_rather_than_taken_as_a_path() {
         // The old default was Moonraker's HTTP address; catching it is the point.
         assert_eq!(
-            "http://127.0.0.1:7125".parse::<ListenTarget>().unwrap_err(),
+            "http://127.0.0.1:7125".parse::<ApiTarget>().unwrap_err(),
             AddressError::UnknownScheme("http".to_string())
         );
         assert!(AddressError::UnknownScheme("http".to_string())

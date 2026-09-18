@@ -2,7 +2,7 @@ use clap::Parser;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
-use crate::core::klippy::api::{AddressError, Api, ListenTarget, Server};
+use crate::core::klippy::api::{AddressError, Api, ApiTarget, Server};
 use crate::core::klippy::config::Config;
 
 /// Klippy CLI application
@@ -66,7 +66,7 @@ pub fn run(args: AppArgs) -> Result<(), Box<dyn std::error::Error>> {
     // like any other bad option, not after the printer has begun to come up.
     let target = match args.api_server.as_deref() {
         None => None,
-        Some(address) => match address.parse::<ListenTarget>() {
+        Some(address) => match address.parse::<ApiTarget>() {
             Ok(target) => Some(target),
             Err(err) => {
                 // A bad address is an option error, so it is reported the way

@@ -19,7 +19,7 @@
 //!
 //! `--api-server` names the listener: a Unix Domain Socket path by default
 //! (upstream's form), or a TCP address written `tcp:<host:port>` (see
-//! [`ListenTarget`]). With no `--api-server` there is no server at all, which
+//! [`ApiTarget`]). With no `--api-server` there is no server at all, which
 //! is upstream's default too. Both transports carry the same protocol; TCP
 //! exists so a client on another machine can reach the API, and it has no
 //! authentication, so it belongs on a trusted network only.
@@ -94,7 +94,7 @@ pub mod protocol;
 pub mod registry;
 pub mod server;
 
-pub use address::{AddressError, ListenTarget};
+pub use address::{AddressError, ApiTarget, Transport};
 pub use protocol::{
     encode, ApiError, ApiErrorBody, Framing, MalformedRequest, Params, PushTarget, Request,
     Response, ResponseTemplate, DELIMITER,

@@ -619,10 +619,11 @@ fn entry_style(entry: &Entry, message_index: usize) -> Style {
 
 /// The two colours a message alternates between.
 ///
-/// Plain ANSI foregrounds rather than a 256-colour background: a background tint
-/// is invisible on many terminals (and on a dark terminal a dark tint is no tint
-/// at all), while these differ wherever colour is shown at all.
-const MESSAGE_COLORS: [Color; 2] = [Color::White, Color::Gray];
+/// Two different hues, not two shades of white: ANSI 7 and 15 are the same
+/// colour in many themes, which is exactly the “I cannot see any colour” a pair
+/// of greys produces. Plain ANSI foregrounds rather than a 256-colour
+/// background, so they work wherever colour is shown at all.
+const MESSAGE_COLORS: [Color; 2] = [Color::LightBlue, Color::LightMagenta];
 
 /// Whether an entry is a message, rather than the window talking to itself.
 fn is_message(entry: &Entry) -> bool {
@@ -1385,6 +1386,30 @@ mod tests {
 
         assert_eq!(colours.len(), 2, "{lines:?}");
         assert_ne!(colours[0], colours[1], "{lines:?}");
+    }
+
+    #[test]
+    fn test_the_message_colours_reach_the_rendered_cells() {
+        // The pane's `Line` styles are one thing; what the terminal is told is
+        // another. This checks the second: the cells of the two message rows
+        // must carry the two colours.
+        let app = app_with(vec![
+            Entry::Push(serde_json::json!({"method": "a"})),
+            Entry::Push(serde_json::json!({"method": "b"})),
+        ]);
+
+        let mut terminal = Terminal::new(TestBackend::new(20, 8)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let buffer = terminal.backend().buffer();
+
+        let colours: Vec<Color> = (0..8)
+            .filter(|row| buffer[(0, *row)].symbol() == "<")
+            .map(|row| buffer[(0, row)].fg)
+            .collect();
+
+        assert_eq!(colours.len(), 2, "{colours:?}");
+        assert_eq!(colours[0], MESSAGE_COLORS[0]);
+        assert_eq!(colours[1], MESSAGE_COLORS[1]);
     }
 
     /// The header's lines as plain text.

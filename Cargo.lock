@@ -684,6 +684,7 @@ dependencies = [
  "flate2",
  "hex",
  "klipperx-test-support",
+ "klippy-api",
  "libc",
  "libloading",
  "reqwest",
@@ -697,6 +698,16 @@ dependencies = [
 [[package]]
 name = "klipperx-test-support"
 version = "0.1.0"
+
+[[package]]
+name = "klippy-api"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "lazy_static"

@@ -430,7 +430,7 @@ impl Endpoint for ListEndpoints {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::klippy::api::protocol::{Params, ResponseTemplate};
+    use crate::protocol::{Params, ResponseTemplate};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
 

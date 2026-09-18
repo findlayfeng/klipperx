@@ -52,7 +52,7 @@ use tokio::sync::Notify;
 use tokio::time::{timeout, Duration};
 use tracing::warn;
 
-use crate::core::klippy::error::KlippyError;
+use crate::error::TransportError;
 
 use super::address::{ApiTarget, Transport};
 use super::protocol::{encode, Framing, MalformedRequest, PushTarget, Request};
@@ -82,7 +82,7 @@ enum Listener {
 
 impl Listener {
     /// Bind `target`, creating the socket file for a Unix target.
-    async fn bind(target: &ApiTarget) -> Result<Self, KlippyError> {
+    async fn bind(target: &ApiTarget) -> Result<Self, TransportError> {
         match target {
             ApiTarget::Unix(path) => {
                 // A socket file left by a killed run would make this fail with
@@ -94,14 +94,14 @@ impl Listener {
                     Ok(()) => (),
                     Err(err) if err.kind() == std::io::ErrorKind::NotFound => (),
                     Err(err) => {
-                        return Err(KlippyError::Connection(format!(
+                        return Err(TransportError::Bind(format!(
                             "cannot remove stale socket {}: {err}",
                             path.display()
                         )))
                     }
                 }
                 let listener = UnixListener::bind(path).map_err(|err| {
-                    KlippyError::Connection(format!(
+                    TransportError::Bind(format!(
                         "cannot bind unix socket {}: {err}",
                         path.display()
                     ))
@@ -113,7 +113,7 @@ impl Listener {
             }
             ApiTarget::Tcp(address) => {
                 let listener = TcpListener::bind(address).await.map_err(|err| {
-                    KlippyError::Connection(format!("cannot bind tcp {address}: {err}"))
+                    TransportError::Bind(format!("cannot bind tcp {address}: {err}"))
                 })?;
                 Ok(Listener::Tcp(listener))
             }
@@ -197,8 +197,8 @@ impl Server {
     /// operator is looking, before any serving starts.
     ///
     /// # Errors
-    /// Returns [`KlippyError::Connection`] if the listener cannot be created.
-    pub async fn bind(target: ApiTarget, api: Arc<Api>) -> Result<Self, KlippyError> {
+    /// Returns [`TransportError::Bind`] if the listener cannot be created.
+    pub async fn bind(target: ApiTarget, api: Arc<Api>) -> Result<Self, TransportError> {
         let listener = Listener::bind(&target).await?;
         // Resolve once, here, so that `target` means "where this is listening"
         // everywhere else instead of "what the operator typed".
@@ -248,7 +248,7 @@ impl Server {
     /// the connection and the accept must not take the server down with it.
     /// Only dropping the server stops it, so this returns `Ok` only if it is
     /// ever given a way to stop.
-    pub async fn run(self) -> Result<(), KlippyError> {
+    pub async fn run(self) -> Result<(), TransportError> {
         loop {
             let stream = match self.listener.accept().await {
                 Ok(stream) => stream,
@@ -490,8 +490,8 @@ fn report_malformed(error: &MalformedRequest, body: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::klippy::api::protocol::{ApiError, DELIMITER};
-    use crate::core::klippy::api::registry::{Endpoint, EndpointContext};
+    use crate::protocol::{ApiError, DELIMITER};
+    use crate::registry::{Endpoint, EndpointContext};
     use serde_json::json;
     use std::io::Write as _;
     use std::pin::Pin;

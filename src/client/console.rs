@@ -60,7 +60,7 @@ use serde_json::{json, Map, Value};
 use tokio::io::AsyncBufReadExt;
 
 use crate::core::klippy::api::address::ApiTarget;
-use crate::core::klippy::error::KlippyError;
+use crate::core::klippy::api::TransportError;
 
 use super::connection::{Connection, Incoming, Reply};
 
@@ -89,8 +89,8 @@ impl Console {
     /// Connect and greet the user.
     ///
     /// # Errors
-    /// Returns [`KlippyError::Connection`] if the server cannot be reached.
-    pub async fn new(target: ApiTarget) -> Result<Self, KlippyError> {
+    /// Returns [`TransportError::Connect`] if the server cannot be reached
+    pub async fn new(target: ApiTarget) -> Result<Self, TransportError> {
         let connection = Connection::connect(&target).await?;
         println!("Connected to {target}.");
         let mut console = Self { target, connection };
@@ -102,7 +102,7 @@ impl Console {
     ///
     /// Failures are reported and survived: an uninteresting `info` is no reason
     /// to refuse a session, and seeing the error is often the point.
-    async fn handshake(&mut self) -> Result<(), KlippyError> {
+    async fn handshake(&mut self) -> Result<(), TransportError> {
         let id = self.connection.request("info", Map::new()).await?;
         match self.await_reply(id).await? {
             None => println!("info: no reply"),
@@ -136,9 +136,9 @@ impl Console {
     /// Read requests until the user leaves or the server goes away.
     ///
     /// # Errors
-    /// Returns [`KlippyError`] only for a read that failed outright; the server
+    /// Returns [`TransportError`] only for a read that failed outright; the server
     /// closing the connection is reported and ends the session normally.
-    pub async fn run(mut self) -> Result<(), KlippyError> {
+    pub async fn run(mut self) -> Result<(), TransportError> {
         // A terminal is told what the syntax is and shown a prompt; a pipe is
         // not, so that its output is only the answers.
         let interactive = std::io::stdin().is_terminal();
@@ -209,7 +209,7 @@ impl Console {
     }
 
     /// Handle one typed line.
-    async fn handle_line(&mut self, line: &str) -> Result<Control, KlippyError> {
+    async fn handle_line(&mut self, line: &str) -> Result<Control, TransportError> {
         let line = line.trim();
         if line.is_empty() {
             return Ok(Control::Continue);
@@ -242,7 +242,7 @@ impl Console {
     }
 
     /// Send a line the user wrote as a JSON object.
-    async fn send_json(&mut self, line: &str) -> Result<Control, KlippyError> {
+    async fn send_json(&mut self, line: &str) -> Result<Control, TransportError> {
         let mut message: Value = match serde_json::from_str(line) {
             Ok(message) => message,
             Err(err) => {
@@ -271,7 +271,7 @@ impl Console {
     }
 
     /// Handle a `.`-prefixed line, which the server never sees.
-    async fn local_command(&mut self, command: &str) -> Result<Control, KlippyError> {
+    async fn local_command(&mut self, command: &str) -> Result<Control, TransportError> {
         let (name, rest) = match command.split_once(char::is_whitespace) {
             None => (command, ""),
             Some((name, rest)) => (name, rest.trim()),
@@ -306,7 +306,7 @@ impl Console {
     }
 
     /// Subscribe to objects, so their updates start arriving as pushes.
-    async fn subscribe(&mut self, selection: &str) -> Result<(), KlippyError> {
+    async fn subscribe(&mut self, selection: &str) -> Result<(), TransportError> {
         let requested: Vec<&str> = selection.split_whitespace().collect();
 
         let names = if requested.is_empty() {
@@ -370,7 +370,7 @@ impl Console {
     /// loop is not running while a command is being handled — so this is the one
     /// place that consumes messages outside the loop. Anything skipped is
     /// printed, so nothing is silently dropped.
-    async fn await_reply(&mut self, id: u64) -> Result<Option<Reply>, KlippyError> {
+    async fn await_reply(&mut self, id: u64) -> Result<Option<Reply>, TransportError> {
         loop {
             match self.connection.receive().await? {
                 Incoming::Reply(reply) if reply.id == json!(id) => return Ok(Some(reply)),

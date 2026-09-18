@@ -29,10 +29,6 @@ pub struct AppArgs {
     #[arg(long)]
     pub tui: bool,
 
-    /// Input TTY device
-    #[arg(long)]
-    pub input_tty: Option<String>,
-
     /// Config file path
     pub config_file: String,
 }
@@ -58,9 +54,6 @@ async fn klippy_process(config: Config) {
 
 /// Main run function for klippy subcommand
 pub fn run(args: AppArgs) -> Result<(), Box<dyn std::error::Error>> {
-    if let Some(ref tty) = args.input_tty {
-        debug!("Input TTY: {}", tty);
-    }
     debug!("Config file: {}", args.config_file);
 
     // Parse the config file

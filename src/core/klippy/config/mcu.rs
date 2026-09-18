@@ -98,7 +98,10 @@ impl McuConfig {
     /// default). The value is deliberately parsed even though nothing reads it
     /// yet: see the field documentation on [`McuConfig::restart_method`].
     fn parse_common(section: &ConfigSection) -> (String, McuRestartMethod) {
-        let name = section.sub.clone().unwrap_or_default();
+        // Upstream names an MCU by its config section with the `mcu ` prefix
+        // stripped (`klippy/mcu.py:1151-1153`): the main `[mcu]` is "mcu", and
+        // `[mcu zboard]` is "zboard". Not an empty string for the main one.
+        let name = section.sub.clone().unwrap_or_else(|| section.id.clone());
 
         let restart_method = section
             .get_str("restart_method")
@@ -291,7 +294,7 @@ mod tests {
         let result = McuConfig::new(&section);
         assert!(result.is_ok());
         let config = result.unwrap();
-        assert_eq!(config.name, "");
+        assert_eq!(config.name, "mcu");
         assert_eq!(config.restart_method, McuRestartMethod::Arduino);
     }
 

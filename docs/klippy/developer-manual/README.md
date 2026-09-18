@@ -58,6 +58,18 @@ MCU 一侧的依赖边一共只有这五条：
 
 `api` 内部自己是分层的（协议 ↔ 注册表 ↔ 连接），与 MCU 一侧的 `msg` / `mcu` / `cmd` 分法同构：底层的分帧不知道任何端点，端点也不知道字节怎么分帧。
 
+### `src/client/` — 自带的客户端
+
+主机自己的客户端**不在** `src/core/klippy/` 下，因为它不是主机的一部分：它是 `klipperx api` / `klipperx console` 两个子命令背后的东西，只对外说话。
+
+| 文件 | 职责 |
+|------|------|
+| `client.rs` | 两个子命令的参数与入口；`--api-server` 与主机共用同一个解析 |
+| `client/connection.rs` | `Connection`：分帧、`id` 分配与回收、应答按 `id` 配对并标注方法名、推送识别 |
+| `client/console.rs` | 交互式会话：stdin 与 socket 同时 `select!`、本地命令、推送打印 |
+
+它**复用** api 层的 `protocol`（分帧、请求形状）与 `address`（`ApiTarget` / `Transport`），不把协议再实现一遍：两边对分隔符或 `id` 语义若有分歧，那就不是在验证任何东西。依赖方向只有一条：`client → api`，api 层不知道客户端存在。
+
 ## 模块结构
 
 ### `msg/` — 消息编解码
@@ -114,7 +126,7 @@ identify 的命令**定义**（名称、参数、解码）与其它命令一样�
 | 文件 | 职责 |
 |------|------|
 | `mod.rs` | 层的说明：监听位置、`0x03` 分帧、请求/应答与推送的形状、并发模型、模块表、待实现清单 |
-| `address.rs` | `ListenTarget`：把 `--api-server` 的值解析成 socket 路径或 TCP 地址；未知 scheme（比如曾经的 `http://…:7125`）直接报错而不是当成文件名 |
+| `address.rs` | `ApiTarget`：把 `--api-server` 的值解析成 socket 路径或 TCP 地址；未知 scheme（比如曾经的 `http://…:7125`）直接报错而不是当成文件名。`Transport` 也在这里：两个方向都只用它一个类型看待 socket |
 | `protocol.rs` | `Framing`（粘包 / 拆包）、`Request` / `Response`、`Params` 访问器、`ApiError`、`ResponseTemplate`、`PushTarget`；不认 socket，也不认端点 |
 | `registry.rs` | `Endpoint` / `MuxEndpoint` trait、`Api` 注册表与 `dispatch`、mux 的 key 选择、remote method、内建 `list_endpoints`；注册期错误单独用 `RegistrationError` |
 | `server.rs` | `Listener`（两种传输）、`Server::bind` / `run`（accept 循环）、`ClientConnection`（分帧状态、发件箱、`Notify` 唤醒、关闭标志，即端点拿到的 `PushTarget`），以及每条连接的读写 `select!` 与 5 秒写超时 |

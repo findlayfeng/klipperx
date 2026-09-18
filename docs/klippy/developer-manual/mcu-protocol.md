@@ -168,9 +168,9 @@ pub trait ClockSync {
 - 命令模块由 `Arc<Mcu>` 构造，多个模块可共用一个 MCU。
 - trait 也是一道测试缝：`cmd/clock.rs` 的测试里就有一个不依赖 MCU 的 `FixedClock` 实现（该文件目前不参与编译，见下）。
 
-上面这段 `ClockSync` 是**示例**：它所在的 `cmd/clock.rs` 当前没有编译进来（`cmd/mod.rs` 里的 `pub mod clock;` 被注释掉），文件与其测试原样保留，恢复时取消注释即可。除此之外**任何**命令都应走上表的模式。
+上面这段 `ClockSync` 是**已编译**的：`cmd/clock.rs` 通过 `pub mod clock;` 进入编译，`ClockSync` / `McuClock` 把时钟同步与 `Mcu` 解耦，测试里有一个不依赖 MCU 的 `FixedClock` 替身。除此之外**任何**命令都应走上表的模式。
 
-`basecmd.c` 的基础命令（`alloc` / `config` / `uptime` / `shutdown` 四个文件）只有类型化视图，没有对应的 trait：它们是连接与配置期的生命周期操作，当前只有一个实现，也不存在需要替换的后端，等出现使用者时再抽 trait 不迟。
+`basecmd.c` 的基础命令（`alloc` / `config` / `uptime` / `shutdown` 四个文件）只有类型化视图，没有对应的 trait：它们是连接与配置期的生命周期操作，当前只有一个实现，也不存在需要替换的后端，等出现使用者时再抽 trait 不迟。其中分配与配置期不是一条条即时发出的，而是由 `mcu/config.rs` 的 `ConfigBuilder` 攒起来一次性下发，见 [MCU 配置构建](mcu-config.md)。
 
 identify 是唯一的例外：它不在这一层，格式由主机自有、且运行在字典存在之前，所以它单独成一个与 `mcu` 平级的模块（`identify`，入口 `Mcu::connect`）。
 
@@ -204,4 +204,4 @@ identify 是唯一的例外：它不在这一层，格式由主机自有、且�
 ---
 
 - [← 开发手册首页](README.md)
-- [Parser API 参考 ←](parser-api.md) · [Identify 机制 →](identify.md)
+- [Parser API 参考 ←](parser-api.md) · [MCU 配置构建 →](mcu-config.md)

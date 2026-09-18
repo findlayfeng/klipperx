@@ -1,6 +1,6 @@
 # Klipperx 开发手册
 
-面向贡献者与模块维护者的技术参考。涵盖消息编解码（`msg`）、MCU 传输与数据字典（`mcu`）、命令层（`cmd`）、事件层（`event`）、identify 引导（`identify`）、机器的时钟与定时器（`reactor`）与客户端 API 层（`api`）的内部结构与设计取舍。
+面向贡献者与模块维护者的技术参考。涵盖消息编解码（`msg`）、MCU 传输与数据字典（`mcu`）、MCU 配置构建（`ConfigBuilder`）、命令层（`cmd`）、事件层（`event`）、identify 引导（`identify`）、机器的时钟与定时器（`reactor`）与客户端 API 层（`api`）的内部结构与设计取舍。
 
 > **第三方 API 接口**（G-Code 命令、API 端点等）参见 [第三方开发手册](../third-party-dev/README.md)。
 
@@ -143,7 +143,7 @@ klipperx（bin，src/main.rs）
 |------|------|
 | `mod.rs` | `Mcu`：构造（`new`）、收发任务、`send` / `call`、字典安装与查询、`seconds_to_clock`、`Drop`；构造时向 `identify` 取起始 `Parser`，本身不引用任何命令 |
 | `object.rs` | `McuObject`：`[mcu]` / `[mcu <name>]` 作为打印机对象，以及工厂 `load_config` / `load_config_prefix`。section 只在 `PrinterObject::connect` 时才解析、开设备、跑 identify，随后把累积的配置交给固件，`get_status` 报 identify 快照 |
-| `config.rs` | `ConfigBuilder`：配置期的 oid 发号器、`config` / `restart` / `init` 三张命令表、config 回调、CRC 与 `finalize_config`，以及 `configure()` 的 `get_config` 两段式握手 |
+| `config.rs` | [`ConfigBuilder`](mcu-config.md)：配置期的 oid 发号器、`config` / `restart` / `init` 三张命令表、config 回调、CRC 与 `finalize_config`，以及 `configure()` 的 `get_config` 两段式握手 |
 | `dictionary.rs` | `Dictionary`：解析固件字典、枚举展开、安装进 `Parser` |
 | `pending.rs` | `PendingCalls`：同步请求/响应记账 |
 | `error.rs` | `McuError`（总括）、`McuCallError`（`call` 专用） |
@@ -158,7 +158,7 @@ klipperx（bin，src/main.rs）
 | `config.rs` | `get_config` / `finalize_config`：配置 CRC 握手（`basecmd.c` 的 Config CRC） |
 | `uptime.rs` | `get_uptime`：读 64 位固件时钟（`basecmd.c` 的 Timing and load stats） |
 | `shutdown.rs` | `emergency_stop` / `clear_shutdown`：固件停机与解锁（`basecmd.c` 的 Misc commands） |
-| `clock.rs` | `ClockSync` / `McuClock`：`get_clock` ↔ `clock`（**暂不参与编译**：`pub mod clock;` 在 `mod.rs` 里被注释掉，文件与测试原样保留） |
+| `clock.rs` | `ClockSync` / `McuClock`：`get_clock` ↔ `clock`（已编译；用能力 trait 把时钟同步与 `Mcu` 解耦，测试里用不依赖 MCU 的 `FixedClock`） |
 | `identify.rs` | `identify` / `identify_response` 的类型化视图（分片驱动在 `identify.rs`） |
 
 ### `event/` — 事件层
@@ -231,6 +231,7 @@ API 本身在 `crates/klippy-api/src/`：
 - [消息编解码（msg）](message-structure.md) — `Msg` / `ArgType` / `ArgValue` / `Payload`
 - [Parser API 参考](parser-api.md) — 注册、编码、解码、回调绑定
 - [MCU 协议与数据字典](mcu-protocol.md) — `Mcu`、`Dictionary`、类型化调用、命令层与新增命令流程
+- [MCU 配置构建（ConfigBuilder）](mcu-config.md) — 配置期的 oid、三张命令表、CRC（与上游的差异）与两段式下发
 - [Identify 机制](identify.md) — 主机与 MCU 间的数据字典协商流程
 - [时钟与定时器（reactor）](reactor.md) — 机器的时钟、定时器契约，以及与上游 reactor/greenlet 的对应
 - [内部架构](architecture.md) — 收发任务、合并发送、路由优先级、性能特性

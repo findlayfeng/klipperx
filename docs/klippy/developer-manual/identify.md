@@ -115,4 +115,4 @@ let installed = mcu.identify(Duration::from_secs(5)).await?;  // 抓取 + 建字
 ---
 
 - [← 开发手册首页](README.md)
-- [MCU 协议与数据字典 ←](mcu-protocol.md) · [内部架构 →](architecture.md)
+- [MCU 配置构建 ←](mcu-config.md) · [内部架构 →](architecture.md)

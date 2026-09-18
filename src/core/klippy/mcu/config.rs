@@ -34,8 +34,12 @@
 //!
 //! * not configured → send `config` + `init`, then ask again;
 //! * configured and the CRC matches → send `restart` + `init` only;
-//! * configured with a different CRC → refuse ([`McuError::Config`]); the
-//!   restart path that would fix it belongs to the restart loop (TODO D2).
+//! * configured with a different CRC → refuse ([`McuError::Config`]). Resending
+//!   cannot fix it: the firmware locks its configuration at `finalize_config`
+//!   (a second one shuts down with "Already finalized"), so a different
+//!   configuration needs a reset (`config_reset`) or a firmware restart —
+//!   upstream requests the restart before refusing, for the same reason. Those
+//!   paths are TODO B2 / D2.
 //!
 //! # The CRC
 //!
@@ -435,6 +439,11 @@ impl ConfigBuilder {
 
         let reused = before.is_config;
         if reused {
+            // A different CRC cannot be repaired by sending the configuration
+            // again: `finalize_config` already locked the firmware (a second
+            // one would shutdown with "Already finalized", `src/basecmd.c:173`),
+            // so only a reset or a firmware restart can change it (TODO B2 / D2).
+            // Report it and stop.
             if before.crc != crc {
                 return Err(McuError::Config(format!(
                     "MCU '{}' is configured with CRC {:#010x}, the host computed {:#010x}",

@@ -3,8 +3,6 @@
 // This module defines error types used throughout the Klippy device
 // communication system.
 
-
-
 /// Klipper device communication errors
 #[derive(Debug)]
 pub enum KlippyError {

@@ -219,18 +219,12 @@ impl Mcu {
                     }
                     // No pending call — fall back to callback.
                     if let Some(callback) = &msg.callback {
-                        debug!(
-                            "Invoking callback for {} (id={})",
-                            msg.name, msg.id
-                        );
+                        debug!("Invoking callback for {} (id={})", msg.name, msg.id);
                         let mut cb = callback.lock().unwrap();
                         cb(params.as_slice());
                     } else {
                         // No callback and no pending call — discard with warning.
-                        warn!(
-                            "Unhandled message {} (id={}), discarding",
-                            msg.name, msg.id
-                        );
+                        warn!("Unhandled message {} (id={}), discarding", msg.name, msg.id);
                     }
                 }
             }
@@ -395,7 +389,10 @@ impl Mcu {
                 command
             );
         }
-        info!("Calling command: {command} (response: {response_name}, timeout: {:?})", timeout);
+        info!(
+            "Calling command: {command} (response: {response_name}, timeout: {:?})",
+            timeout
+        );
 
         // 2. Create a oneshot channel for the response.
         let (tx, rx) = oneshot::channel::<Vec<ArgValue>>();
@@ -412,28 +409,34 @@ impl Mcu {
             self.pending_calls.cancel(response_name).await;
             return Err(McuCallError::SendFailed(e.msg));
         }
-        debug!("Command '{}' sent, waiting for response '{}'", command, response_name);
+        debug!(
+            "Command '{}' sent, waiting for response '{}'",
+            command, response_name
+        );
 
         // 5. Wait for the response. A successful resolve already consumed the
         // registration, so only the failure paths need to clean up.
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(params)) => {
-                debug!("Response received for '{}': {} params", response_name, params.len());
+                debug!(
+                    "Response received for '{}': {} params",
+                    response_name,
+                    params.len()
+                );
                 Ok(params)
             }
             Ok(Err(_recv)) => {
                 // Receiver dropped (shouldn't happen in normal flow).
                 self.pending_calls.cancel(response_name).await;
                 error!("Response receiver dropped for '{}'", response_name);
-                Err(McuCallError::SendFailed("response receiver dropped".to_string()))
+                Err(McuCallError::SendFailed(
+                    "response receiver dropped".to_string(),
+                ))
             }
             Err(_) => {
                 // Timeout — clean up the pending call.
                 self.pending_calls.cancel(response_name).await;
-                warn!(
-                    "Timeout waiting for response '{}'",
-                    response_name
-                );
+                warn!("Timeout waiting for response '{}'", response_name);
                 Err(McuCallError::Timeout(format!(
                     "no response for {} within {:?}",
                     response_name, timeout

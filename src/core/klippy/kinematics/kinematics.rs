@@ -41,9 +41,7 @@ impl Coord {
 
     /// Check if this coordinate is approximately zero.
     pub fn is_near_zero(&self, epsilon: f64) -> bool {
-        self.x.abs() < epsilon
-            && self.y.abs() < epsilon
-            && self.z.abs() < epsilon
+        self.x.abs() < epsilon && self.y.abs() < epsilon && self.z.abs() < epsilon
     }
 }
 
@@ -261,10 +259,7 @@ impl Move {
             end_pos.y - start_pos.y,
             end_pos.z - start_pos.z,
         ];
-        let move_d = (axes_d[0].powi(2)
-            + axes_d[1].powi(2)
-            + axes_d[2].powi(2))
-        .sqrt();
+        let move_d = (axes_d[0].powi(2) + axes_d[1].powi(2) + axes_d[2].powi(2)).sqrt();
         let inv_move_d = if move_d > 0.0 { 1.0 / move_d } else { 0.0 };
         let axes_r = [
             axes_d[0] * inv_move_d,
@@ -300,11 +295,7 @@ pub struct KinematicsStatus {
 }
 
 impl KinematicsStatus {
-    pub fn new(
-        homed_axes: &str,
-        axis_minimum: Coord,
-        axis_maximum: Coord,
-    ) -> Self {
+    pub fn new(homed_axes: &str, axis_minimum: Coord, axis_maximum: Coord) -> Self {
         Self {
             homed_axes: homed_axes.to_string(),
             axis_minimum,

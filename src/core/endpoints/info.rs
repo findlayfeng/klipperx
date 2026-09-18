@@ -10,7 +10,8 @@ pub fn handle_info(client_info: Option<&str>) -> serde_json::Value {
 
     // In a real implementation, these would come from klippy start_args
     let software_version = env::var("KLIPPER_VERSION").unwrap_or_else(|_| "0.1.0".to_string());
-    let klipper_path = env::var("KLIPPER_PATH").unwrap_or_else(|_| "/usr/share/klipper".to_string());
+    let klipper_path =
+        env::var("KLIPPER_PATH").unwrap_or_else(|_| "/usr/share/klipper".to_string());
     let cpu_info = env::var("KLIPPER_CPU_INFO").unwrap_or_else(|_| "x86_64".to_string());
     let log_file = env::var("KLIPPER_LOG_FILE").ok();
     let config_file = env::var("KLIPPER_CONFIG_FILE").ok();

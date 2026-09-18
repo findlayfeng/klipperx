@@ -104,7 +104,9 @@ impl Parser {
             Ok(guard) => guard,
             Err(_) => return false,
         };
-        map.get_by_name(name).map(|msg| msg.callback.is_some()).unwrap_or(false)
+        map.get_by_name(name)
+            .map(|msg| msg.callback.is_some())
+            .unwrap_or(false)
     }
 
     /// Look up a registered message by name.
@@ -249,9 +251,8 @@ impl Parser {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::ArgType;
-
+    use super::*;
 
     // -----------------------------------------------------------------------
     // MsgMap
@@ -260,7 +261,12 @@ mod tests {
     #[test]
     fn test_msgmap_insert_and_lookup() {
         let mut map = MsgMap::default();
-        map.try_insert(Msg::new(1, "CMD_A", vec![("x".to_string(), ArgType::UInt32)])).unwrap();
+        map.try_insert(Msg::new(
+            1,
+            "CMD_A",
+            vec![("x".to_string(), ArgType::UInt32)],
+        ))
+        .unwrap();
 
         assert!(map.get_by_id(&1).is_some());
         assert!(map.get_by_name("CMD_A").is_some());
@@ -291,10 +297,15 @@ mod tests {
     #[test]
     fn test_msgmap_by_name_resolves_through_by_id() {
         let mut map = MsgMap::default();
-        map.try_insert(Msg::new(42, "TEST", vec![
-            ("a".to_string(), ArgType::UInt32),
-            ("b".to_string(), ArgType::Str),
-        ])).unwrap();
+        map.try_insert(Msg::new(
+            42,
+            "TEST",
+            vec![
+                ("a".to_string(), ArgType::UInt32),
+                ("b".to_string(), ArgType::Str),
+            ],
+        ))
+        .unwrap();
 
         let msg = map.get_by_name("TEST").unwrap();
         assert_eq!(msg.id, 42);
@@ -377,7 +388,12 @@ mod tests {
         let payload = parser.encode("CMD_A", &[ArgValue::UInt32(42)]).unwrap();
         assert_eq!(payload.payload()[0], 1);
 
-        let payload = parser.encode("CMD_B", &[ArgValue::Str("hello".to_string()), ArgValue::UInt8(99)]).unwrap();
+        let payload = parser
+            .encode(
+                "CMD_B",
+                &[ArgValue::Str("hello".to_string()), ArgValue::UInt8(99)],
+            )
+            .unwrap();
         assert_eq!(payload.payload()[0], 2);
 
         let payload = parser.encode("CMD_C", &[]).unwrap();
@@ -475,14 +491,16 @@ mod tests {
         // Bind a callback (callback not invoked during decode)
         parser.bind("CMD_MULTI", |_| {}).unwrap();
 
-        let payload = parser.encode(
-            "CMD_MULTI",
-            &[
-                ArgValue::UInt32(42),
-                ArgValue::Str("hello".to_string()),
-                ArgValue::UInt8(99),
-            ],
-        ).unwrap();
+        let payload = parser
+            .encode(
+                "CMD_MULTI",
+                &[
+                    ArgValue::UInt32(42),
+                    ArgValue::Str("hello".to_string()),
+                    ArgValue::UInt8(99),
+                ],
+            )
+            .unwrap();
 
         let result = parser.decode(payload).unwrap();
         assert_eq!(result[0].0.name, "CMD_MULTI");
@@ -515,18 +533,22 @@ mod tests {
     #[test]
     fn test_encode_multiple_param_types() {
         let mut parser = Parser::new();
-        parser.register(1, "MULTI a=%u b=%i c=%hu d=%hi e=%s f=%c").unwrap();
-        let payload = parser.encode(
-            "MULTI",
-            &[
-                ArgValue::UInt32(100),
-                ArgValue::Int32(-200),
-                ArgValue::UInt16(300),
-                ArgValue::Int16(-400),
-                ArgValue::Str("test".to_string()),
-                ArgValue::UInt8(50),
-            ],
-        ).unwrap();
+        parser
+            .register(1, "MULTI a=%u b=%i c=%hu d=%hi e=%s f=%c")
+            .unwrap();
+        let payload = parser
+            .encode(
+                "MULTI",
+                &[
+                    ArgValue::UInt32(100),
+                    ArgValue::Int32(-200),
+                    ArgValue::UInt16(300),
+                    ArgValue::Int16(-400),
+                    ArgValue::Str("test".to_string()),
+                    ArgValue::UInt8(50),
+                ],
+            )
+            .unwrap();
         assert_eq!(payload.payload()[0], 1);
     }
 
@@ -545,7 +567,10 @@ mod tests {
         parser.register(1, "CMD_A x=%u").unwrap();
         let result = parser.encode("CMD_A", &[ArgValue::UInt32(1), ArgValue::UInt32(2)]);
         assert!(result.is_err());
-        assert!(result.unwrap_err().msg.contains("expected 1 parameters, got 2"));
+        assert!(result
+            .unwrap_err()
+            .msg
+            .contains("expected 1 parameters, got 2"));
     }
 
     #[test]
@@ -554,7 +579,10 @@ mod tests {
         parser.register(1, "CMD_A x=%u y=%s").unwrap();
         let result = parser.encode("CMD_A", &[ArgValue::UInt32(1)]);
         assert!(result.is_err());
-        assert!(result.unwrap_err().msg.contains("expected 2 parameters, got 1"));
+        assert!(result
+            .unwrap_err()
+            .msg
+            .contains("expected 2 parameters, got 1"));
     }
 
     #[test]
@@ -576,13 +604,22 @@ mod tests {
         // A string supplied for `%u` is rejected instead of being encoded with
         // the wrong wire form.
         let err = parser
-            .encode("CMD_A", &[ArgValue::Str("nope".to_string()), ArgValue::Str("s".to_string())])
+            .encode(
+                "CMD_A",
+                &[
+                    ArgValue::Str("nope".to_string()),
+                    ArgValue::Str("s".to_string()),
+                ],
+            )
             .unwrap_err();
         assert!(err.msg.contains("parameter 'x' expects %u"));
 
         // A losslessly convertible value is accepted.
         let payload = parser
-            .encode("CMD_A", &[ArgValue::UInt16(1234), ArgValue::Bytes(b"s".to_vec())])
+            .encode(
+                "CMD_A",
+                &[ArgValue::UInt16(1234), ArgValue::Bytes(b"s".to_vec())],
+            )
             .unwrap();
         assert_eq!(payload.payload()[0], 1);
     }
@@ -717,7 +754,10 @@ mod tests {
         payload.push_bytes(&[0xDE, 0xAD, 0xBE, 0xEF]).unwrap();
 
         let result = parser.decode(payload).unwrap();
-        assert_eq!(result[0].1[0], ArgValue::Bytes(vec![0xDE, 0xAD, 0xBE, 0xEF]));
+        assert_eq!(
+            result[0].1[0],
+            ArgValue::Bytes(vec![0xDE, 0xAD, 0xBE, 0xEF])
+        );
     }
 
     #[test]
@@ -754,10 +794,9 @@ mod tests {
     #[test]
     fn test_encode_decode_roundtrip_all_types() {
         let mut parser = Parser::new();
-        parser.register(
-            1,
-            "ALL a=%u b=%i c=%hu d=%hi e=%s f=%c g=%.*s",
-        ).unwrap();
+        parser
+            .register(1, "ALL a=%u b=%i c=%hu d=%hi e=%s f=%c g=%.*s")
+            .unwrap();
 
         let values = vec![
             ArgValue::UInt32(0xDEADBEEF),
@@ -787,7 +826,9 @@ mod tests {
         parser.register(2, "B y=%s").unwrap();
 
         let mut payload_a = parser.encode("A", &[ArgValue::UInt32(1)]).unwrap();
-        let payload_b = parser.encode("B", &[ArgValue::Str("test".to_string())]).unwrap();
+        let payload_b = parser
+            .encode("B", &[ArgValue::Str("test".to_string())])
+            .unwrap();
         payload_a.try_merge(&payload_b).unwrap();
 
         let decoded = parser.decode(payload_a).unwrap();
@@ -811,13 +852,12 @@ mod tests {
         parser.bind("TEST_CMD", |_| {}).unwrap();
 
         // Encode with the bound command
-        let payload = parser.encode(
-            "TEST_CMD",
-            &[
-                ArgValue::UInt32(42),
-                ArgValue::Str("hello".to_string()),
-            ],
-        ).unwrap();
+        let payload = parser
+            .encode(
+                "TEST_CMD",
+                &[ArgValue::UInt32(42), ArgValue::Str("hello".to_string())],
+            )
+            .unwrap();
 
         // Decode should return correct values
         let result = parser.decode(payload).unwrap();
@@ -839,7 +879,9 @@ mod tests {
         parser.bind("CMD_B", |_| {}).unwrap();
 
         let mut payload = parser.encode("CMD_A", &[ArgValue::UInt32(1)]).unwrap();
-        let payload_b = parser.encode("CMD_B", &[ArgValue::Str("b".to_string())]).unwrap();
+        let payload_b = parser
+            .encode("CMD_B", &[ArgValue::Str("b".to_string())])
+            .unwrap();
         payload.try_merge(&payload_b).unwrap();
 
         let result = parser.decode(payload).unwrap();
@@ -881,14 +923,16 @@ mod tests {
         parser.register(1, "LIFECYCLE a=%u b=%s c=%c").unwrap();
         parser.bind("LIFECYCLE", |_| {}).unwrap();
 
-        let payload = parser.encode(
-            "LIFECYCLE",
-            &[
-                ArgValue::UInt32(1),
-                ArgValue::Str("test".to_string()),
-                ArgValue::UInt8(2),
-            ],
-        ).unwrap();
+        let payload = parser
+            .encode(
+                "LIFECYCLE",
+                &[
+                    ArgValue::UInt32(1),
+                    ArgValue::Str("test".to_string()),
+                    ArgValue::UInt8(2),
+                ],
+            )
+            .unwrap();
 
         let decoded = parser.decode(payload).unwrap();
         assert_eq!(decoded.len(), 1);

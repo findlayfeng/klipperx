@@ -66,11 +66,17 @@ runtime、重启循环）是它上面的一层。
       `request_exit("exit")`。附着的窗口结束时也是先 `request_exit` 再 await 主机，
       而不是 abort 掉一个还握着机器的 run loop。
       **未做：重启循环**。`firmware_restart` 现在只记录并退出，见 Q7。
-- [ ] `info` 的 handler 还是 `todo!()`（`src/core/klippy/api/endpoints/info.rs`），
-      `get_state_message()` + `PrinterState::as_category()` 已经就绪，接上即可；
-      它要主机层的 start args（见下一条）。
-- [ ] start args / rollover info / 日志（`get_start_args` 29 处、`set_rollover_info` 7 处）
-      归主机层，不进机器。
+- [x] `info`（`src/core/klippy/api/endpoints/info.rs`）：状态取自
+      `get_state_message()`；其余字段由主机侧的 `api/start_args.rs` 与进程自身提供
+      （`gethostname` / `getuid` / `getgid` / `std::process::id`）。`klipper_path` 与
+      `python_path` 都报**不存在的路径**（`/nonexistent/...`）：Moonraker 在
+      `_save_path_info` 里直接下标取两者，而它只在两者都存在时启用 Klipper 更新项
+      （`update_manager.py`），所以不存在路径让那项退化为 no-op。`client_info` 只记日志，
+      不回显。
+- [ ] start args / rollover info / 日志（上游 `get_start_args` 29 处、`set_rollover_info`
+      7 处）归主机层，不进机器。`StartArgs`（`api/start_args.rs`）已有 `config_file` /
+      `log_file` / `software_version` / `cpu_info` 四个字段供 `info` 用；rollover 与
+      `--logfile` 未做（`log_file` 恒为 `null`）。
 
 ### T3 reactor 抽象与 `run()` 的形态
 

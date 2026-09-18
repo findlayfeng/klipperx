@@ -23,22 +23,19 @@
 //!
 //! # Status
 //!
-//! `info` is defined but only its *shape*: its handler body is a `todo!()`, so
-//! it is deliberately **not registered** — a request to an unregistered path
-//! gets `no registered callback`, whereas a registered `todo!()` would panic and
-//! drop the connection. `objects/list` and `objects/query` are written and
-//! tested but equally unregistered: [`register`] is the one call that installs
-//! the server's objects and endpoints together, and no host calls it yet — the
-//! printer's own lifecycle still waits for one. `objects/subscribe`,
-//! `emergency_stop`, `register_remote_method`, the `gcode/*` family,
-//! `pause_resume/*` and the `*/dump_*` mux endpoints are not written, so
-//! `list_endpoints` currently reports only the built-in.
+//! [`register`] installs the server's own object and every endpoint that is
+//! written: `webhooks`, `info`, `objects/list` and `objects/query`. The rest of
+//! the documented surface — `objects/subscribe`, `emergency_stop`,
+//! `register_remote_method`, the `gcode/*` family, `pause_resume/*` and the
+//! `*/dump_*` mux endpoints — is not written, so `list_endpoints` reports four
+//! paths besides the built-in.
 //!
 //! The public reference for the endpoints themselves (paths, parameters,
 //! response fields) is `docs/klippy/third-party-dev/api-reference.md`; keep the
 //! two in step when an endpoint is added.
 
 pub mod endpoints;
+pub mod start_args;
 pub mod webhooks;
 
 #[cfg(test)]
@@ -50,7 +47,8 @@ use std::sync::Arc;
 use crate::core::klippy::error::KlippyError;
 use crate::core::klippy::printer::Printer;
 
-pub use endpoints::{ObjectsList, ObjectsQuery};
+pub use endpoints::{Info, ObjectsList, ObjectsQuery};
+pub use start_args::StartArgs;
 pub use webhooks::{WebhooksStatus, WEBHOOKS_OBJECT};
 
 // The API, re-exported so that this module is the host's single name for it.
@@ -77,6 +75,9 @@ pub use klippy_api::{
 ///    (`klippy/webhooks.py:564`, reached from `klippy/klippy.py:36-40`);
 /// 2. then the endpoints, so that no path is half-built when a request arrives.
 ///
+/// `start_args` is the host's own: the `info` endpoint reports it, and the
+/// machine never sees it.
+///
 /// The caller must do this **before binding the listener**: a printer that is
 /// served before its objects are registered is one a client can observe only
 /// halfway up, and no client can provoke a duplicate registration to find out.
@@ -84,13 +85,19 @@ pub use klippy_api::{
 /// # Errors
 /// Returns [`RegistrationError`] if a name or a path is already taken — a
 /// wiring mistake in klippy, never something a client can cause.
-pub fn register(api: &mut Api, printer: &Arc<Printer>) -> Result<(), RegistrationError> {
+pub fn register(
+    api: &mut Api,
+    printer: &Arc<Printer>,
+    start_args: StartArgs,
+) -> Result<(), RegistrationError> {
     printer
         .add_object(
             WEBHOOKS_OBJECT,
             Arc::new(WebhooksStatus::new(Arc::clone(printer))),
         )
         .map_err(RegistrationError::Status)?;
+    api.register(Info::new(Arc::clone(printer), start_args))
+        .map_err(RegistrationError::Endpoint)?;
     api.register(ObjectsList::new(Arc::clone(printer)))
         .map_err(RegistrationError::Endpoint)?;
     api.register(ObjectsQuery::new(Arc::clone(printer)))
@@ -143,25 +150,44 @@ mod tests {
         klippy_api::Request::parse(body.as_bytes()).expect("test body is a valid request")
     }
 
+    /// The start arguments a host would have gathered.
+    fn start_args() -> StartArgs {
+        StartArgs::collect("/tmp/printer.cfg")
+    }
+
     #[test]
     fn test_registering_installs_the_servers_object_and_its_endpoints() {
         let printer = Arc::new(Printer::new());
         let mut api = Api::new();
 
-        register(&mut api, &printer).unwrap();
+        register(&mut api, &printer, start_args()).unwrap();
 
         assert_eq!(printer.objects(), [WEBHOOKS_OBJECT]);
         assert_eq!(
             api.endpoints(),
-            ["list_endpoints", "objects/list", "objects/query",]
+            ["info", "list_endpoints", "objects/list", "objects/query",]
         );
+    }
+
+    #[test]
+    fn test_a_client_can_reach_info_through_the_registry() {
+        let printer = Arc::new(Printer::new());
+        let mut api = Api::new();
+        register(&mut api, &printer, start_args()).unwrap();
+
+        let response = api
+            .dispatch(&request(r#"{"method":"info"}"#), silent_target())
+            .unwrap();
+
+        assert_eq!(response["state"], "startup");
+        assert_eq!(response["config_file"], "/tmp/printer.cfg");
     }
 
     #[test]
     fn test_a_client_can_follow_the_state_through_the_registered_object() {
         let printer = Arc::new(Printer::new());
         let mut api = Api::new();
-        register(&mut api, &printer).unwrap();
+        register(&mut api, &printer, start_args()).unwrap();
 
         let response = api
             .dispatch(
@@ -192,9 +218,9 @@ mod tests {
     fn test_registering_twice_is_a_wiring_mistake_not_a_client_error() {
         let printer = Arc::new(Printer::new());
         let mut api = Api::new();
-        register(&mut api, &printer).unwrap();
+        register(&mut api, &printer, start_args()).unwrap();
 
-        let err = register(&mut api, &printer).unwrap_err();
+        let err = register(&mut api, &printer, start_args()).unwrap_err();
 
         assert!(
             matches!(err, RegistrationError::Status(_)),

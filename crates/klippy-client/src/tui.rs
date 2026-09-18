@@ -366,24 +366,35 @@ async fn handle_key(
     Ok(Control::Continue)
 }
 
-/// The three panes.
+/// The panes.
+///
+/// The header's height is not fixed: a state message can be a sentence (a
+/// shutdown reason usually is), and the status bar is the only place it is
+/// shown, so it wraps and the log starts below it. It never takes so much that
+/// the log, the input and the footer lose their rows.
 fn draw(frame: &mut Frame, app: &App) {
-    let [header, log, input, footer] = Layout::vertical([
-        Constraint::Length(1),
+    let area = frame.area();
+    let mut header = header_lines(app, area.width as usize);
+    header.truncate(area.height.saturating_sub(3).max(1) as usize);
+    let header_height = header.len() as u16;
+
+    let [header_area, log, input, footer] = Layout::vertical([
+        Constraint::Length(header_height),
         Constraint::Min(1),
         Constraint::Length(1),
         Constraint::Length(1),
     ])
-    .areas(frame.area());
+    .areas(area);
 
-    draw_header(frame, app, header);
+    frame.render_widget(Paragraph::new(Text::from(header)), header_area);
     draw_log(frame, app, log);
     draw_input(frame, app, input);
     draw_footer(frame, app, footer);
 }
 
-fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
-    let (marker, text, style) = match &app.status {
+/// What the header says: the marker, the text, and the style of both.
+fn header(app: &App) -> (&'static str, String, Style) {
+    match &app.status {
         Status::Connected { state, message } => (
             match state.as_str() {
                 "ready" => "●",
@@ -407,12 +418,32 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
             format!("disconnected: {why}"),
             Style::new().fg(Color::Red),
         ),
-    };
-    let line = Line::from(vec![
-        Span::styled(format!("{marker} "), style),
-        Span::styled(text, style.add_modifier(Modifier::BOLD)),
-    ]);
-    frame.render_widget(Paragraph::new(line), area);
+    }
+}
+
+/// The header's lines, wrapped to `width` columns.
+///
+/// The marker leads only the first line; the rest are indented by its width so
+/// the state reads as one block.
+fn header_lines(app: &App, width: usize) -> Vec<Line<'static>> {
+    let (marker, text, style) = header(app);
+    let prefix = format!("{marker} ");
+    let indent = prefix.chars().count();
+    wrap(&text, width.saturating_sub(indent).max(1))
+        .into_iter()
+        .enumerate()
+        .map(|(index, chunk)| {
+            let lead = if index == 0 {
+                Span::styled(prefix.clone(), style)
+            } else {
+                Span::raw(" ".repeat(indent))
+            };
+            Line::from(vec![
+                lead,
+                Span::styled(chunk, style.add_modifier(Modifier::BOLD)),
+            ])
+        })
+        .collect()
 }
 
 fn draw_log(frame: &mut Frame, app: &App, area: Rect) {
@@ -473,7 +504,11 @@ fn visible_lines(app: &App, width: usize, height: usize) -> Vec<Line<'static>> {
         let style = entry_style(entry);
         // Wrapped by hand rather than by `Paragraph::wrap`: the pane has to know
         // how many lines each entry takes to scroll by the right amount.
-        for line in wrap(&entry.text(), width) {
+        // Backwards, like the entries: the pane is collected from its bottom
+        // up, so the last wrapped line of an entry is the one nearest the
+        // bottom. Collecting forward and reversing the whole list at the end
+        // would put an entry's own lines in reverse order.
+        for line in wrap(&entry.text(), width).into_iter().rev() {
             lines.push(Line::from(Span::styled(line, style)));
             if lines.len() >= wanted {
                 break;
@@ -1037,5 +1072,79 @@ mod tests {
         assert_eq!(wrap("", 4), vec![""]);
         // Short lines are untouched, long ones are not lost.
         assert_eq!(wrap("abc", 10), vec!["abc"]);
+    }
+
+    /// The log pane's lines as plain text.
+    fn log_text(app: &App, width: usize, height: usize) -> Vec<String> {
+        visible_lines(app, width, height)
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_a_long_entry_wraps_in_reading_order() {
+        // The continuation comes *after* the first part, which is what
+        // collecting the pane bottom-up has to preserve.
+        let app = app_with(vec![Entry::notice(Notice::Info, "abcdefghij")]);
+
+        assert_eq!(log_text(&app, 4, 4), ["abcd", "efgh", "ij"]);
+    }
+
+    #[test]
+    fn test_a_multi_line_entry_keeps_its_line_order() {
+        let app = app_with(vec![Entry::notice(Notice::Info, "one\ntwo\nthree")]);
+
+        assert_eq!(log_text(&app, 10, 4), ["one", "two", "three"]);
+    }
+
+    #[test]
+    fn test_the_newest_entry_is_at_the_bottom() {
+        let app = app_with(vec![
+            Entry::notice(Notice::Info, "first"),
+            Entry::notice(Notice::Info, "second"),
+        ]);
+
+        assert_eq!(log_text(&app, 10, 4), ["first", "second"]);
+    }
+
+    /// The header's lines as plain text.
+    fn header_text(app: &App, width: usize) -> Vec<String> {
+        header_lines(app, width)
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_a_long_header_wraps_and_keeps_the_whole_message() {
+        let mut app = app_with(Vec::new());
+        app.status = Status::Connected {
+            state: "shutdown".to_string(),
+            message: "Internal: Section 'board_pins arduino-standard' is not valid".to_string(),
+        };
+
+        let lines = header_text(&app, 20);
+        let joined: String = lines
+            .iter()
+            .map(|line| line.trim_start())
+            .collect::<Vec<_>>()
+            .join("");
+
+        assert!(lines.len() > 1, "the header did not wrap: {lines:?}");
+        assert_eq!(
+            joined,
+            "▲ shutdown · Internal: Section 'board_pins arduino-standard' is not valid"
+        );
     }
 }

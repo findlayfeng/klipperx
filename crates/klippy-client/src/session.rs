@@ -30,10 +30,35 @@
 
 use serde_json::{json, Map, Value};
 
-use klippy_api::address::ApiTarget;
+use klippy_api::address::{ApiTarget, Transport};
 use klippy_api::TransportError;
 
 use crate::connection::{Connection, Incoming, Reply};
+
+/// How loud a line from the host's own log is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogLevel {
+    /// Development detail, shown with `--verbose`.
+    Debug,
+    /// Something happened.
+    Info,
+    /// Something is off but the host carries on.
+    Warn,
+    /// Something failed.
+    Error,
+}
+
+impl LogLevel {
+    /// The tag a front-end shows in front of the line.
+    pub fn tag(&self) -> &'static str {
+        match self {
+            LogLevel::Debug => "DEBUG",
+            LogLevel::Info => "INFO ",
+            LogLevel::Warn => "WARN ",
+            LogLevel::Error => "ERROR",
+        }
+    }
+}
 
 /// How loud a client notice is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,6 +91,13 @@ pub enum Entry {
     Push(Value),
     /// Something the client has to say.
     Notice { kind: Notice, text: String },
+    /// A line from the host's own log.
+    ///
+    /// Only a host that embedded a client can produce these — nothing arrives
+    /// on the wire for them — which is why they are separate from [`Notice`]:
+    /// they are the host talking about itself, and a front-end shows the two
+    /// differently.
+    Log { level: LogLevel, text: String },
 }
 
 impl Entry {
@@ -94,6 +126,7 @@ impl Entry {
             }
             Entry::Push(message) => format!("< {}", compact(message)),
             Entry::Notice { text, .. } => text.clone(),
+            Entry::Log { level, text } => format!("{} {text}", level.tag()),
         }
     }
 }
@@ -124,7 +157,8 @@ pub enum Control {
 
 /// A session with an API server.
 pub struct Session {
-    target: ApiTarget,
+    /// What to call the other end, for the greeting and for errors.
+    label: String,
     connection: Connection,
 }
 
@@ -135,12 +169,26 @@ impl Session {
     /// Returns [`TransportError`] if the server cannot be reached.
     pub async fn connect(target: ApiTarget) -> Result<Self, TransportError> {
         let connection = Connection::connect(&target).await?;
-        Ok(Self { target, connection })
+        Ok(Self {
+            label: target.to_string(),
+            connection,
+        })
     }
 
-    /// Where this session is connected.
-    pub fn target(&self) -> &ApiTarget {
-        &self.target
+    /// A session over a transport that is already connected.
+    ///
+    /// `label` is what the session calls the other end — a host that embedded a
+    /// client has no address to name, and says so.
+    pub fn from_transport(transport: Box<dyn Transport>, label: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            connection: Connection::from_transport(transport),
+        }
+    }
+
+    /// What this session calls the other end.
+    pub fn label(&self) -> &str {
+        &self.label
     }
 
     /// Ask the server who it is, the way every real client starts.

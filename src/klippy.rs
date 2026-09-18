@@ -1,9 +1,11 @@
 use clap::Parser;
 use std::sync::Arc;
+use tokio::sync::mpsc::unbounded_channel;
 use tracing::{debug, info, warn};
 
 use crate::core::klippy::api::{AddressError, Api, ApiTarget, Server};
 use crate::core::klippy::config::Config;
+use crate::logging;
 
 /// Klippy CLI application
 #[derive(Parser, Debug)]
@@ -16,6 +18,16 @@ pub struct AppArgs {
     /// target belongs on a trusted network only.
     #[arg(short, long, value_name = "ADDR")]
     pub api_server: Option<String>,
+
+    /// Open a local client window on this host's own API
+    ///
+    /// Runs a `klippy-client` window against this process, over an in-process
+    /// pipe rather than the socket — so it needs no `-a`, and the host's own log
+    /// lines appear in the window alongside the API traffic that produced them.
+    /// Leaving the window stops the host. Without a terminal this is a warning
+    /// and the host runs headless.
+    #[arg(long)]
+    pub tui: bool,
 
     /// Input TTY device
     #[arg(long)]
@@ -77,6 +89,23 @@ pub fn run(args: AppArgs) -> Result<(), Box<dyn std::error::Error>> {
         },
     };
 
+    // A window is not just another command line option: it takes the terminal,
+    // and it needs the host's own log lines routed into it rather than written
+    // under it. Deciding here — before the runtime, before anything logs — is
+    // what makes the first lines the host prints appear in the window too.
+    let windowed = args.tui && klippy_client::tui::is_available();
+    if args.tui && !windowed {
+        warn!("--tui needs a terminal on stdin and stdout; running without a window");
+    }
+    let window_log = if windowed {
+        let (entries, logs) = unbounded_channel();
+        // The guard keeps the redirect for as long as the window is up, and puts
+        // the host's output back on stdout when it is not.
+        Some((logging::to_window(entries), logs))
+    } else {
+        None
+    };
+
     // One runtime for the whole process, and the only place one is created:
     // every async task in klippy (the MCU send and receive tasks, the API
     // server's accept loop and its per-connection tasks) runs here. It is
@@ -109,7 +138,44 @@ pub fn run(args: AppArgs) -> Result<(), Box<dyn std::error::Error>> {
             }
         };
 
-        klippy_process(config).await;
+        // The window talks to this host over a pipe rather than the socket: no
+        // `-a` is needed for it, it cannot be reached from outside, and the two
+        // ends run the protocol either way. One end is served like any other
+        // connection; the other is the client's.
+        let window = match window_log {
+            None => None,
+            Some((guard, logs)) => {
+                let api = Arc::new(Api::new());
+                let (host_side, client_side) = tokio::io::duplex(64 * 1024);
+                tokio::spawn(klippy_api::server::serve(
+                    klippy_api::ClientConnection::new(Arc::clone(&api)),
+                    Box::new(host_side),
+                ));
+                let session = klippy_client::Session::from_transport(
+                    Box::new(client_side),
+                    "this host (in-process)",
+                );
+                Some((
+                    guard,
+                    tokio::spawn(klippy_client::tui::run_session(session, Some(logs))),
+                ))
+            }
+        };
+
+        match window {
+            // The window is this invocation's user interface, so leaving it
+            // stops the host — the operator said they were done. The host's own
+            // shutdown conditions (a signal, a config error) end the window
+            // instead, which is why this waits on the window and never on both.
+            Some((guard, window)) => {
+                let host = tokio::spawn(klippy_process(config));
+                let outcome = window.await;
+                host.abort();
+                drop(guard);
+                outcome??;
+            }
+            None => klippy_process(config).await,
+        }
 
         // The printer has stopped, so the API server goes with it. Aborting is
         // enough: dropping the listener removes the socket file.

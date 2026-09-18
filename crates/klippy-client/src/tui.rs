@@ -57,7 +57,7 @@ use serde_json::Value;
 use klippy_api::address::ApiTarget;
 use klippy_api::TransportError;
 
-use crate::session::{self, Control, Entry, Notice, Output, Session};
+use crate::session::{self, Control, Entry, LogLevel, Notice, Output, Session};
 
 /// How often the keyboard thread wakes to check whether it should stop.
 ///
@@ -72,24 +72,64 @@ const LEAVE_GRACE: Duration = Duration::from_secs(1);
 /// How many entries the log keeps before dropping the oldest.
 const LOG_LIMIT: usize = 2_000;
 
-/// Run the window until the user leaves or the connection drops.
+/// Open a window on `target`.
 ///
 /// # Errors
-/// Returns [`TransportError`] if the server goes away. The terminal is restored
-/// either way, so the error is readable on the normal screen afterwards.
+/// Returns [`TransportError`] if the server cannot be reached or goes away.
 pub async fn run(target: ApiTarget) -> Result<(), TransportError> {
     let session = Session::connect(target).await?;
+    run_session(session, None).await
+}
 
-    // Set before anything can fail: a panic inside the window must still give
-    // the terminal back, which is what ratatui's panic hook and `restore` are
-    // for.
+/// Show a window on an existing session.
+///
+/// `host_log` is where a host that embedded this window sends its own log
+/// records (see the host's `logging` module). They are interleaved with the
+/// protocol traffic in the log pane, which is the point: in one window, what the
+/// client asked, what the server answered, and what the host said about itself
+/// belong in the order they happened.
+///
+/// # Errors
+/// Returns [`TransportError`] if the connection goes away. Dropping the future —
+/// the host shutting down under it, say — restores the terminal just the same,
+/// because the guard that does so is dropped with it.
+pub async fn run_session(
+    session: Session,
+    host_log: Option<tokio::sync::mpsc::UnboundedReceiver<Entry>>,
+) -> Result<(), TransportError> {
+    // Taken before anything can fail: a panic inside the window, or the future
+    // being dropped, must still give the terminal back.
+    let _terminal = TerminalGuard::take();
     let terminal = ratatui::init();
-    let outcome = event_loop(session, terminal).await;
-    ratatui::restore();
+    let outcome = event_loop(session, terminal, host_log).await;
     outcome
 }
 
+/// Gives the terminal back when the window ends, however it ends.
+///
+/// `ratatui::init` installs a panic hook that restores the terminal, but nothing
+/// restores it when the future is simply dropped — which is what happens when
+/// the host shuts down while the window is up. A guard does, because dropping
+/// the future drops its locals.
+struct TerminalGuard;
+
+impl TerminalGuard {
+    /// Take the terminal, restoring it when the returned guard is dropped.
+    fn take() -> Self {
+        Self
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        ratatui::restore();
+    }
+}
+
 /// Whether this process can draw a window at all.
+///
+/// Both ends have to be a terminal: a window drawn into a pipe would be a
+/// screenful of escape codes.
 pub fn is_available() -> bool {
     std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
 }
@@ -204,11 +244,22 @@ fn field(value: &Value, name: &str) -> String {
 async fn event_loop(
     mut session: Session,
     mut terminal: ratatui::DefaultTerminal,
+    mut host_log: Option<tokio::sync::mpsc::UnboundedReceiver<Entry>>,
 ) -> Result<(), TransportError> {
     let mut app = App::new();
+
+    // A host that embedded this window logged things before it existed — config,
+    // listeners, and so on. Those lines happened first, so they go first; they
+    // are the beginning of the story the window is telling.
+    if let Some(logs) = host_log.as_mut() {
+        while let Ok(entry) = logs.try_recv() {
+            app.write(entry);
+        }
+    }
+
     app.push(Entry::notice(
         Notice::Info,
-        format!("Connected to {}.", session.target()),
+        format!("Connected to {}.", session.label()),
     ));
     session.handshake(&mut app).await?;
 
@@ -223,10 +274,16 @@ async fn event_loop(
         enum Step {
             Key(Option<Event>),
             Message(Result<crate::connection::Incoming, TransportError>),
+            HostLog(Option<Entry>),
         }
         let step = tokio::select! {
             key = keys.recv() => Step::Key(key),
             message = session.receive() => Step::Message(message),
+            // A host that embedded this window keeps talking about itself while
+            // the printer runs; its lines go into the same log, in order.
+            entry = async { host_log.as_mut()?.recv().await }, if host_log.is_some() => {
+                Step::HostLog(entry)
+            }
         };
 
         match step {
@@ -242,6 +299,10 @@ async fn event_loop(
                 }
             }
             Step::Key(Some(_)) => (),
+            // A closed channel means the host stopped logging; the window keeps
+            // working, it just has nothing more to say about itself.
+            Step::HostLog(None) => host_log = None,
+            Step::HostLog(Some(entry)) => app.write(entry),
             Step::Message(Ok(message)) => app.write(message.into()),
             Step::Message(Err(err)) => {
                 app.status = Status::Closed(err.to_string());
@@ -436,6 +497,12 @@ fn entry_style(entry: &Entry) -> Style {
         // A failed request is the thing the user has to notice.
         Entry::Reply(reply) if reply.is_error() => Style::new().fg(Color::Red),
         Entry::Reply(_) | Entry::Push(_) => Style::new(),
+        Entry::Log { level, .. } => match level {
+            LogLevel::Debug => Style::new().add_modifier(Modifier::DIM),
+            LogLevel::Info => Style::new().fg(Color::DarkGray),
+            LogLevel::Warn => Style::new().fg(Color::Yellow),
+            LogLevel::Error => Style::new().fg(Color::Red),
+        },
         Entry::Notice { kind, .. } => match kind {
             Notice::Info => Style::new().fg(Color::Cyan),
             Notice::Hint => Style::new().fg(Color::Yellow),

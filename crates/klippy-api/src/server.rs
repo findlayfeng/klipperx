@@ -268,7 +268,12 @@ impl Server {
 /// Both reasons to write are waited on at once, so a push is delivered as soon
 /// as it is queued even while the client sends nothing, and a request is
 /// answered as soon as it arrives even while nothing is being pushed.
-async fn serve(connection: Arc<ClientConnection>, stream: Box<dyn Transport>) {
+///
+/// [`Server::run`] calls this for every connection it accepts. It is public
+/// because a host may want a client without a socket at all: hand it one end of
+/// [`tokio::io::duplex`] and serve the other, and the same protocol runs over an
+/// in-process pipe.
+pub async fn serve(connection: Arc<ClientConnection>, stream: Box<dyn Transport>) {
     let (mut reader, mut writer) = tokio::io::split(stream);
     let mut buf = vec![0u8; READ_SIZE];
 

@@ -45,6 +45,7 @@ use serde_json::{Map, Value};
 use klippy_api::address::ApiTarget;
 
 use connection::{Connection, Incoming, Reply};
+pub use session::Session;
 
 /// Where the API server is, for the client subcommands.
 #[derive(Args, Debug)]
@@ -144,6 +145,8 @@ pub fn run_console(args: ConsoleArgs) -> Result<(), Box<dyn std::error::Error>> 
     let target = parse_target(&args.server.api_server)?;
     let windowed = !args.plain && tui::is_available();
     runtime()?.block_on(async move {
+        // The window takes a session rather than a target, so that a host can
+        // hand it one over a pipe instead — see `klippy::run`.
         if windowed {
             tui::run(target).await
         } else {

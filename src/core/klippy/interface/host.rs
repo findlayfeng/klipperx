@@ -55,7 +55,7 @@ use super::Device;
 use crate::core::klippy::frame::Frame;
 #[cfg(test)]
 use crate::core::klippy::frame::FrameStream;
-use crate::core::klippy::traits::InterfaceError;
+use super::error::InterfaceError;
 use crossbeam_channel::{unbounded, Receiver};
 use libloading::Library;
 use std::fmt;

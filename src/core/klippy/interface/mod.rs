@@ -1,17 +1,18 @@
 pub mod canserial;
+pub mod error;
 pub mod host;
 pub mod serial;
 #[cfg(test)]
 pub mod test;
 
 pub use canserial::CanSerialDevice;
+pub use error::InterfaceError;
 pub use host::HostDevice;
 pub use serial::SerialDevice;
 #[cfg(test)]
 pub use test::{MappingEntry, TestDevice};
 
 use super::frame::Frame;
-use super::traits::InterfaceError;
 use std::path::Path;
 use std::sync::Arc;
 

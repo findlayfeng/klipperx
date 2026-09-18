@@ -33,7 +33,7 @@
 
 use super::Device;
 use crate::core::klippy::frame::{Frame, FrameStream};
-use crate::core::klippy::traits::InterfaceError;
+use super::error::InterfaceError;
 use std::ffi::CString;
 use std::fmt;
 use std::fs::File;

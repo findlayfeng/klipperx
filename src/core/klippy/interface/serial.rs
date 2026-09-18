@@ -20,7 +20,7 @@
 
 use super::Device;
 use crate::core::klippy::frame::{Frame, FrameStream};
-use crate::core::klippy::traits::InterfaceError;
+use super::error::InterfaceError;
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};

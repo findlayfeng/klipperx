@@ -1,4 +1,4 @@
-use crate::core::klippy::traits::InterfaceError;
+use super::error::InterfaceError;
 use crate::core::klippy::frame::Frame;
 
 use super::Device;

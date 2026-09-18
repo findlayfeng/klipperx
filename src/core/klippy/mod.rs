@@ -17,7 +17,7 @@ pub mod mcu;
 pub mod msg;
 pub mod printer;
 // pub mod toolhead;
-pub mod traits;
+
 
 // Dynamic library loading interface
 pub mod interface;
@@ -27,9 +27,7 @@ pub use error::KlippyError;
 pub use interface::{HostDevice, Interface, SerialDevice};
 pub use msg::proto::Payload;
 pub use msg::Msg;
-pub use traits::{
-    InterfaceEvent, Printer, PrinterEvent, PrinterObject, PrinterState, StateMessage,
-};
+pub use printer::{Printer, PrinterEvent, PrinterObject, PrinterState, StateMessage};
 // pub use interface::canbus::CanbusInterface;
 // pub use mcu::{MCU, McuError, McuPin, PinParams};
 // pub use mcu::{add_printer_objects, get_printer_mcu};

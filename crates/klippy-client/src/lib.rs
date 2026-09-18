@@ -11,7 +11,11 @@
 //! | Subcommand | What it is |
 //! |---|---|
 //! | `api` | one request, print the reply, exit — for scripts |
-//! | `console` | an interactive session: type requests, watch pushes |
+//! | `console` | an interactive session: a window on a terminal, lines in a pipe |
+//!
+//! The window is [`tui`]; a pipe — or `--plain` — gets [`console`], which prints
+//! the same events one line at a time. Both drive the same [`session`], so the
+//! difference between them is exactly the difference in how they render.
 //!
 //! Both take the same `-a/--api-server` value as the host takes, and both reuse
 //! the host's parser for it ([`ApiTarget`]), so `unix:` paths and `tcp:` addresses
@@ -32,6 +36,8 @@
 
 pub mod connection;
 pub mod console;
+pub mod session;
+pub mod tui;
 
 use clap::Args;
 use serde_json::{Map, Value};
@@ -39,7 +45,6 @@ use serde_json::{Map, Value};
 use klippy_api::address::ApiTarget;
 
 use connection::{Connection, Incoming, Reply};
-use console::Console;
 
 /// Where the API server is, for the client subcommands.
 #[derive(Args, Debug)]
@@ -72,6 +77,10 @@ pub struct ApiArgs {
 pub struct ConsoleArgs {
     #[command(flatten)]
     pub server: ApiServerArg,
+
+    /// Print lines instead of opening a window, even on a terminal
+    #[arg(long)]
+    pub plain: bool,
 }
 
 /// Run `klipperx api`: one request, one reply.
@@ -123,12 +132,24 @@ pub fn run_api(args: ApiArgs) -> Result<(), Box<dyn std::error::Error>> {
 
 /// Run `klipperx console`: an interactive session.
 ///
+/// A terminal gets the full-screen window; a pipe, or `--plain`, gets one line
+/// per event. The window needs both ends to be a terminal — a window drawn into
+/// a pipe would be a screenful of escape codes.
+///
 /// # Errors
-/// Returns an error if the target is malformed or the server cannot be reached;
-/// once the session is running, a closed connection ends it without an error.
+/// Returns an error if the target is malformed or the server cannot be reached,
+/// and — from the window, where a lost connection has nowhere to be shown after
+/// the terminal is restored — if the connection goes away mid-session.
 pub fn run_console(args: ConsoleArgs) -> Result<(), Box<dyn std::error::Error>> {
     let target = parse_target(&args.server.api_server)?;
-    runtime()?.block_on(async { Console::new(target).await?.run().await })?;
+    let windowed = !args.plain && tui::is_available();
+    runtime()?.block_on(async move {
+        if windowed {
+            tui::run(target).await
+        } else {
+            console::run(target).await
+        }
+    })?;
     Ok(())
 }
 

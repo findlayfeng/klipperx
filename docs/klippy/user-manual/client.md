@@ -26,6 +26,37 @@ $ klipperx klippy ~/printer.cfg -a tcp:127.0.0.1:7125     # TCP，供别的机�
 **不给 `-a` 就不启动 API**，客户端也就无从连接 —— 这与上游一致，是有意的：
 一个默认在某处静默监听的程序会让人意外。
 
+### 顺便开个窗口
+
+主机可以自己开一扇客户端窗口，不用另外起进程、也不用 `-a`：
+
+```console
+$ klipperx klippy ~/printer.cfg --tui
+```
+
+它会对着**自己**跑一个客户端（走进程内的管道，不经过 socket），于是窗口里既有
+客户端发出去的请求和主机的应答，也有主机自己的日志 —— 两者按发生顺序混在同一
+条日志里，这是把两边放在一起看的唯一办法：
+
+```text
+◌ state unknown
+INFO  API server listening on unix:/tmp/klippy_uds
+DEBUG Klippy process started with 1 sections
+Connected to this host (in-process).
+1 > {"id":1,"method":"info","params":{}}
+info: webhooks: No registered callback for path 'info'
+WARN  api: dropping malformed request (invalid JSON …): not json
+```
+
+要点：
+
+- 窗口就是这次运行的界面：**关掉窗口，主机也跟着停**。想让它一直跑，就别用
+  `--tui`（或另开一个终端跑 `klippy-client console` 连它）。
+- 加了 `--tui` 之后主机自己的日志不再往 stdout 写（否则会糊在窗口上），全都
+  进窗口的日志区；窗口关掉后如果主机还在跑，日志会回到 stdout。
+- `--verbose` 打开 DEBUG，所以主机更啰嗦时窗口也会显示那些细节。
+- 没有终端（比如 systemd 里）时 `--tui` 只打印一行警告，主机照常无窗口运行。
+
 > **安全提醒**：API 没有任何认证，能连上的人就能操作打印机。TCP 监听只应开在
 > 可信网络上（本机 `127.0.0.1` 或内网），不要直接暴露到公网。Unix socket 也
 > 一样，靠文件权限保护。

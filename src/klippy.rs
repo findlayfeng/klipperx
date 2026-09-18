@@ -18,13 +18,19 @@ pub const ABOUT: &str = "Run the host: load the config and serve the API";
 #[derive(Parser, Debug)]
 #[command(name = "klippy", version, about)]
 pub struct AppArgs {
-    /// API server listen target: a socket path (default), or `tcp:<host:port>`
+    /// API server listen target: a socket path, or `tcp:<host:port>`
     ///
-    /// Omitted means no API server is started, as in klipper. The socket is
-    /// this host's whole external interface and has no authentication, so a TCP
-    /// target belongs on a trusted network only.
-    #[arg(short, long, value_name = "ADDR")]
-    pub api_server: Option<String>,
+    /// Defaults to the shared API path, so that a client started without
+    /// arguments finds this host. Give an empty value to serve nothing at all —
+    /// the API has no authentication, and a host that does not want one should
+    /// not have to guess at a path that disables it.
+    #[arg(
+        short,
+        long,
+        value_name = "ADDR",
+        default_value = klippy_api::address::DEFAULT_API_SERVER
+    )]
+    pub api_server: String,
 
     /// Config file path
     ///
@@ -100,9 +106,10 @@ pub fn run(
 
     // Resolving the target before the runtime starts means a typo is reported
     // like any other bad option, not after the printer has begun to come up.
-    let target = match args.api_server.as_deref() {
-        None => None,
-        Some(address) => match address.parse::<ApiTarget>() {
+    let target = if args.api_server.trim() == klippy_api::address::NO_API_SERVER {
+        None
+    } else {
+        match args.api_server.parse::<ApiTarget>() {
             Ok(target) => Some(target),
             Err(err) => {
                 // A bad address is an option error, so it is reported the way
@@ -110,7 +117,7 @@ pub fn run(
                 let err: AddressError = err;
                 return Err(format!("{err}\n\nFor more information, try '--help'.").into());
             }
-        },
+        }
     };
 
     // One runtime for the whole process, and the only place one is created:
@@ -126,7 +133,7 @@ pub fn run(
     runtime.block_on(async move {
         let server = match target {
             None => {
-                info!("No --api-server given: not starting the API server");
+                info!("Empty --api-server: not starting the API server");
                 None
             }
             Some(target) => {

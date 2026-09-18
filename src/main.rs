@@ -53,11 +53,11 @@ struct Cli {
 }
 
 /// The host, plus the one option that is `klipperx`'s own.
-///
-/// The window is not the host's: it is a client, and it drags in a terminal
-/// library the `klippy` binary — which only ever serves the API — has no use
-/// for. So it is declared here, where the window can be, rather than in
-/// `klippy::AppArgs`, where the host's own options live.
+//
+// The window is not the host's: it is a client, and it drags in a terminal
+// library the `klippy` binary — which only ever serves the API — has no use for.
+// So it is declared here, where the window can be, rather than in
+// `klippy::AppArgs`, where the host's own options live.
 #[derive(Args, Debug)]
 struct HostArgs {
     #[command(flatten)]
@@ -93,16 +93,19 @@ enum Commands {
     Klippy(HostArgs),
 
     /// Send one API request and print the reply
-    ///
-    /// On its own — `klipperx api` — this prints its help, like `klippy` does: a
-    /// subcommand asked for by name and given nothing else is a question.
+    //
+    // `arg_required_else_help`: naming a subcommand and saying nothing else is a
+    // question about it, so it is answered with its help — the same courtesy
+    // `klippy` gets, and the same as `klipperx` on its own.
     #[command(arg_required_else_help = true)]
     Api(client::ApiArgs),
 
     /// Connect to the API and enter an interactive session
-    ///
-    /// On its own — `klipperx console` — this prints its help, like `klippy`.
-    #[command(arg_required_else_help = true)]
+    //
+    // No `arg_required_else_help`, unlike `api`: this subcommand's arguments all
+    // have defaults, so `klipperx console` on its own is not a question but an
+    // instruction — connect to the shared API path and open a window. `api`
+    // keeps the attribute because it is genuinely missing its method.
     Console(client::ConsoleArgs),
 }
 
@@ -247,7 +250,7 @@ mod tests {
         let host = host_of(cli);
         assert!(host.tui);
         assert_eq!(host.host.config_file.as_deref(), Some("printer.cfg"));
-        assert_eq!(host.host.api_server.as_deref(), Some("/tmp/x"));
+        assert_eq!(host.host.api_server, "/tmp/x");
     }
 
     #[test]
@@ -258,7 +261,7 @@ mod tests {
         match cli.command {
             Some(Commands::Klippy(args)) => {
                 assert_eq!(args.host.config_file.as_deref(), Some("printer.cfg"));
-                assert_eq!(args.host.api_server.as_deref(), Some("/tmp/x"));
+                assert_eq!(args.host.api_server, "/tmp/x");
                 assert!(!args.tui, "--tui was not asked for");
             }
             other => panic!("expected the host, got {other:?}"),
@@ -266,10 +269,11 @@ mod tests {
     }
 
     #[test]
-    fn test_a_client_subcommand_alone_prints_its_help() {
-        // The same courtesy `klippy` gets: naming a subcommand and saying
-        // nothing else is a question about it.
-        for name in ["api", "console", "klippy"] {
+    fn test_a_subcommand_alone_is_answered_with_its_help() {
+        // `klippy` and `api` are missing something without arguments — a config
+        // file, a method — so naming them and saying nothing else is a question,
+        // and the answer is the help.
+        for name in ["klippy", "api"] {
             let error = parse(&[name]).expect_err("nothing was asked for");
             assert_eq!(
                 error.kind(),
@@ -279,6 +283,57 @@ mod tests {
             let help = error.to_string();
             assert!(help.contains(&format!("klipperx {name}")), "{help}");
         }
+
+        // `console` is not: every one of its arguments has a default, so on its
+        // own it means "connect to the shared API path and open a window".
+        let cli = parse(&["console"]).expect("console needs no arguments");
+        match cli.command {
+            Some(Commands::Console(args)) => assert!(
+                !args.plain && args.server.api_server == klippy_api::address::DEFAULT_API_SERVER
+            ),
+            other => panic!("expected `console`, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_the_api_path_has_one_default_for_everyone() {
+        // No `-a` anywhere: the host serves on the shared path, and a client
+        // connects to it. That is the whole point of the default.
+        let host = host_of(parse(&["printer.cfg"]).unwrap());
+        assert_eq!(
+            host.host.api_server,
+            klippy_api::address::DEFAULT_API_SERVER
+        );
+
+        let client = parse(&["api", "list_endpoints"]).unwrap();
+        match client.command {
+            Some(Commands::Api(args)) => {
+                assert_eq!(
+                    args.server.api_server,
+                    klippy_api::address::DEFAULT_API_SERVER
+                );
+            }
+            other => panic!("expected `api`, got {other:?}"),
+        }
+
+        let console = parse(&["console"]).unwrap();
+        match console.command {
+            Some(Commands::Console(args)) => {
+                assert_eq!(
+                    args.server.api_server,
+                    klippy_api::address::DEFAULT_API_SERVER
+                );
+            }
+            other => panic!("expected `console`, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_an_empty_api_path_is_how_a_host_declines_to_serve() {
+        // A host may say "no API"; the empty value is how, and it survives to
+        // the host, which is the only thing that can tell which side it is.
+        let host = host_of(parse(&["printer.cfg", "-a", ""]).unwrap());
+        assert_eq!(host.host.api_server, "");
     }
 
     #[test]

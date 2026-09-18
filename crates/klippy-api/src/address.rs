@@ -39,6 +39,28 @@ use tokio::net::{TcpStream, UnixStream};
 
 use crate::error::TransportError;
 
+/// Where the API lives when nobody says otherwise.
+///
+/// One default for all three binaries — the host serves here, and `klipperx
+/// api`, `klipperx console` and `klippy-client` connect here — because a client
+/// that had to be told the path would fail at exactly the moment an operator
+/// wants it to work.
+///
+/// The path is upstream Klipper's own example (`docs/API_Server.md`), which is
+/// why it is under `/tmp` and not somewhere more private. It is a conventional
+/// choice, not a secure one: the socket has no authentication, and `/tmp` is
+/// shared, so a host that should not be reachable by every local user must say
+/// so — either with a path of its own, or with [`NO_API_SERVER`].
+pub const DEFAULT_API_SERVER: &str = "/tmp/klippy_uds";
+
+/// A `--api-server` value meaning "do not serve at all".
+///
+/// A host may decline to have an API — a service that only prints does not need
+/// one — so its `--api-server` accepts an empty value. A client cannot: it has
+/// nowhere else to connect, and an empty target is an error there (see
+/// [`AddressError::Empty`]).
+pub const NO_API_SERVER: &str = "";
+
 /// A read/write API socket, whichever transport it arrived on.
 ///
 /// The two socket types have nothing in common but their traits, so everything
@@ -125,6 +147,9 @@ impl fmt::Display for ApiTarget {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AddressError {
     /// The value was empty.
+    ///
+    /// A host treats an empty value as [`NO_API_SERVER`] before it gets here; a
+    /// client has no such reading, so this is what it reports.
     Empty,
     /// A `unix:` prefix was used with no path after it.
     EmptySocketPath,

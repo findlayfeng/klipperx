@@ -12,9 +12,13 @@
 客户端连的是**主机的 API**，不是别的什么东西。启动主机时用 `-a` 指定监听位置：
 
 ```console
-$ klipperx klippy ~/printer.cfg -a /tmp/klippy_uds        # Unix socket（默认形式）
-$ klipperx klippy ~/printer.cfg -a tcp:127.0.0.1:7125     # TCP，供别的机器连
+$ klipperx ~/printer.cfg -a /tmp/klippy_uds               # Unix socket（默认形式）
+$ klipperx ~/printer.cfg -a tcp:127.0.0.1:7125            # TCP，供别的机器连
 ```
+
+跑主机是 `klipperx` 的**默认动作**，所以 `klippy` 这个子命令名可以省：上面两行与
+`klipperx klippy ~/printer.cfg -a …` 完全等价（文档里两种写法都会出现）。其余
+子命令（`api`、`console`）不能省。
 
 | `-a` 的写法 | 含义 |
 |-------------|------|

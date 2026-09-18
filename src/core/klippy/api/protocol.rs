@@ -91,10 +91,14 @@ impl Framing {
 
 /// Serialize `message` and append the delimiter, ready to be written.
 ///
-/// Compaction matches the protocol's single-line framing; a
-/// [`serde_json::Value`] has no serializer that can fail, so this is infallible.
-pub fn encode(message: &Value) -> Vec<u8> {
-    let mut body = serde_json::to_vec(message).expect("a serde_json::Value always serializes");
+/// Generic over the message rather than taking a [`serde_json::Value`] so that
+/// replies keep their field order: going through `Value` would collect the
+/// object into a sorted map and emit `error` before `id`. Compaction matches the
+/// protocol's single-line framing. Every type here is plain data, so the only
+/// possible failure — a key or a number JSON cannot represent — cannot happen;
+/// the panic is unreachable rather than tolerated.
+pub fn encode<T: Serialize>(message: &T) -> Vec<u8> {
+    let mut body = serde_json::to_vec(message).expect("the message is plain JSON data");
     body.push(DELIMITER);
     body
 }
@@ -228,7 +232,8 @@ impl Request {
 /// A reply to a request that carried an `id`.
 ///
 /// Serialized as a single JSON object with the `id` first, so the wire shape
-/// matches the reference documentation exactly.
+/// matches the reference documentation exactly. That order survives because the
+/// bytes are produced straight from this type, without a `Value` in between.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum Response {

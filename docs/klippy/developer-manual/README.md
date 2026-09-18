@@ -49,9 +49,12 @@ MCU 一侧的依赖边一共只有这五条：
 
 | 边 | 状态 |
 |----|------|
-| `api → error` | 已有：`KlippyError` 是 `Server::run` 的返回类型 |
+| `api → error` | 已有：`KlippyError` 是 `Server::bind` / `Server::run` 的错误类型 |
+| `api → tokio 运行时` | 已有：accept 循环与每连接一个任务跑在 host 建的 runtime 上（见 `klippy::run`）；API 层自己不建线程，socket 收发是异步的 |
 | `api → printer`、`api → gcode` | **计划中**：`info` 的 handler 仍是 `todo!()`，`objects/*` 与 `gcode/*` 尚未开始，所以这两条边还没出现在代码里 |
 | `api → mcu` / `cmd` / `event` | **没有**，将来也不应该有：端点经 `printer` / `gcode` 间接使用协议层，不直接碰帧与字典 |
+
+**并发模型**：`api` 用一个任务 accept、一个任务服务一条连接。所以跨连接并行、同连接内的请求保持顺序（客户端 pipeline 时看到的顺序与上游一致）；一个卡住的客户端只占住自己的任务。上游是一个线程 + reactor + 每连接一对 fd 回调，形状等价，只是用任务代替了 greenlet。推送给连接用的是**同步**的 `PushTarget::push`（入队 + `Notify` 唤醒该连接的任务），因此任何任务/线程都能推，不需要持有 runtime；“写不动超过 5 秒就断开”与上游的 `blocking_count` 同义。
 
 `api` 内部自己是分层的（协议 ↔ 注册表 ↔ 连接），与 MCU 一侧的 `msg` / `mcu` / `cmd` 分法同构：底层的分帧不知道任何端点，端点也不知道字节怎么分帧。
 
@@ -106,15 +109,16 @@ identify 的命令**定义**（名称、参数、解码）与其它命令一样�
 
 ### `api/` — 客户端 API 层
 
-客户端一侧的入口，对应 klipper 的 `klippy/webhooks.py`：外部工具（Fluidd / Mainsail / Moonraker 等）连上 klippy 用 `-a` 创建的 Unix Domain Socket，发 `0x03` 分隔的 JSON 请求。线上的形状（请求/应答、无 `id` 不应答、推送模板、错误文案）以 [Klippy API 参考](../third-party-dev/api-reference.md) 为准，两边要一起改。
+客户端一侧的入口，对应 klipper 的 `klippy/webhooks.py`：外部工具（Fluidd / Mainsail / Moonraker 等）连上 API server，发 `0x03` 分隔的 JSON 请求。监听位置由 `-a/--api-server` 给出：默认是 Unix Domain Socket 路径（与上游一致），写成 `tcp:<host>:<port>` 则监听 TCP；**不给这个选项就不起服务**，这一点也与上游一致。线上的形状（请求/应答、无 `id` 不应答、推送模板、错误文案）以 [Klippy API 参考](../third-party-dev/api-reference.md) 为准，两边要一起改。
 
 | 文件 | 职责 |
 |------|------|
-| `mod.rs` | 层的说明：`0x03` 分帧、请求/应答与推送的形状、模块表、待实现清单 |
+| `mod.rs` | 层的说明：监听位置、`0x03` 分帧、请求/应答与推送的形状、并发模型、模块表、待实现清单 |
+| `address.rs` | `ListenTarget`：把 `--api-server` 的值解析成 socket 路径或 TCP 地址；未知 scheme（比如曾经的 `http://…:7125`）直接报错而不是当成文件名 |
 | `protocol.rs` | `Framing`（粘包 / 拆包）、`Request` / `Response`、`Params` 访问器、`ApiError`、`ResponseTemplate`、`PushTarget`；不认 socket，也不认端点 |
 | `registry.rs` | `Endpoint` / `MuxEndpoint` trait、`Api` 注册表与 `dispatch`、mux 的 key 选择、remote method、内建 `list_endpoints`；注册期错误单独用 `RegistrationError` |
-| `server.rs` | `Server`（socket 路径 + `Api`）与 `ClientConnection`（分帧状态、发件箱、关闭标志，即端点拿到的 `PushTarget`）。`Server::run` 仍是 `todo!()` |
-| `endpoints/` | 一个端点一个文件；目前只有 `info.rs`，且 handler 为 `todo!()`，参数与响应形状（`InfoParams` / `InfoResponse`）已定义 |
+| `server.rs` | `Listener`（两种传输）、`Server::bind` / `run`（accept 循环）、`ClientConnection`（分帧状态、发件箱、`Notify` 唤醒、关闭标志，即端点拿到的 `PushTarget`），以及每条连接的读写 `select!` 与 5 秒写超时 |
+| `endpoints/` | 一个端点一个文件；目前只有 `info.rs`，且 handler 为 `todo!()`、**尚未注册**，参数与响应形状（`InfoParams` / `InfoResponse`）已定义 |
 
 端点自己不拼应答信封：它只返回 payload 或 `ApiError`，`id` 的回显与「无 `id` 就不应答」由 `protocol.rs` 一处决定，端点无从弄错。
 

@@ -9,13 +9,16 @@
 //! # Status
 //!
 //! Only `info` exists so far, and only its definition: the handler body is a
-//! `todo!()`, so the endpoint is registered and dispatchable but panics when
-//! called. The rest of the documented surface is not written yet — the table
-//! below is the checklist.
+//! `todo!()`, so it is deliberately **not registered** — a request to an
+//! unregistered path gets `no registered callback`, whereas a registered
+//! `todo!()` would panic and drop the connection. The rest of the documented
+//! surface is not written yet — the table below is the checklist, and because
+//! nothing but the built-in is registered, `list_endpoints` currently reports
+//! one path.
 //!
 //! | Endpoint | Status |
 //! |---|---|
-//! | `info` | defined, handler `todo!()` |
+//! | `info` | defined, handler `todo!()`, **not registered** |
 //! | `list_endpoints` | done ([`registry`](super::registry)) |
 //! | `emergency_stop` | not started |
 //! | `register_remote_method` | not started |

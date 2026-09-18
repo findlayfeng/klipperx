@@ -1,7 +1,7 @@
-//! Client-facing API layer — the JSON protocol on the Unix Domain Socket.
+//! Client-facing API layer — the JSON protocol the API server speaks.
 //!
 //! This is the layer external applications speak to: Fluidd, Mainsail,
-//! Moonraker and KlipperScreen all connect to the socket klippy creates and
+//! Moonraker and KlipperScreen all connect to the API server klippy starts and
 //! send it JSON requests. It is the counterpart of klipper's
 //! `klippy/webhooks.py`, and it sits above every other module here — it is the
 //! only layer that is allowed to know about printer objects, g-code and the
@@ -14,6 +14,15 @@
 //!                          ▲
 //!     msg  ←──  mcu  ←──  cmd  ←──  event
 //! ```
+//!
+//! # Where it listens
+//!
+//! `--api-server` names the listener: a Unix Domain Socket path by default
+//! (upstream's form), or a TCP address written `tcp:<host:port>` (see
+//! [`ListenTarget`]). With no `--api-server` there is no server at all, which
+//! is upstream's default too. Both transports carry the same protocol; TCP
+//! exists so a client on another machine can reach the API, and it has no
+//! authentication, so it belongs on a trusted network only.
 //!
 //! # The wire
 //!
@@ -33,42 +42,59 @@
 //! error. A reply is `{"id": …, "result": …}` or
 //! `{"id": …, "error": {"error": "WebRequestError", "message": …}}`.
 //!
+//! # Concurrency
+//!
+//! One task accepts connections and one task serves each of them, so a client
+//! that is slow, blocked or silent costs only its own task. Requests on one
+//! connection stay ordered, which is what a client that pipelines expects,
+//! while different connections make progress independently.
+//!
+//! The API server owns no thread of its own: it runs on whatever tokio runtime
+//! the host runs on, and its socket I/O is asynchronous, unlike the serial port
+//! and the host library, which need `spawn_blocking`.
+//!
 //! # Pushes
 //!
 //! Some endpoints answer and then keep sending. Those take a
-//! `response_template` parameter and are handed the requesting connection, so
-//! they can push messages built from that template (see [`ResponseTemplate`]
-//! and [`PushTarget`]).
+//! `response_template` parameter and are handed the requesting connection as an
+//! owned handle they may keep (see [`ResponseTemplate`] and [`PushTarget`]).
+//! Pushing is synchronous and callable from any task or thread: it queues bytes
+//! and wakes the connection's task, which is the only thing that touches the
+//! socket.
 //!
 //! # Modules
 //!
 //! | Module | Owns |
 //! |---|---|
+//! | [`address`] | the `--api-server` value: socket path or TCP address |
 //! | [`protocol`] | framing, request/reply shapes, parameter access, errors |
 //! | [`registry`] | the endpoint table, dispatch, mux endpoints, remote methods |
-//! | [`server`] | the Unix Domain Socket and per-connection state |
+//! | [`server`] | the listening socket and the per-connection task |
 //! | [`endpoints`] | one file per client-facing endpoint |
 //!
 //! # Status
 //!
-//! This module is a skeleton. The protocol and registry layers are complete and
-//! tested; what is missing is deliberate:
+//! The transport, protocol and registry layers are complete and tested; what is
+//! missing is the endpoints themselves:
 //!
-//! * the socket accept loop in [`server::Server::run`] is a `todo!()`;
 //! * [`endpoints`] defines only the `info` endpoint, and only its *shape* — its
-//!   handler body is a `todo!()`;
+//!   handler body is a `todo!()`, so it is deliberately **not registered** yet:
+//!   answering a panic would be worse than answering "no such endpoint";
 //! * `emergency_stop`, `register_remote_method`, the `objects/*` family, the
-//!   `gcode/*` family and the `*/dump_*` mux endpoints are not written yet.
+//!   `gcode/*` family, `pause_resume/*` and the `*/dump_*` mux endpoints are not
+//!   written yet, so `list_endpoints` reports only the built-in for now.
 //!
 //! The public reference for the endpoints themselves (paths, parameters,
 //! response fields) is `docs/klippy/third-party-dev/api-reference.md`; keep the
 //! two in step when an endpoint is added.
 
+pub mod address;
 pub mod endpoints;
 pub mod protocol;
 pub mod registry;
 pub mod server;
 
+pub use address::{AddressError, ListenTarget};
 pub use protocol::{
     encode, ApiError, ApiErrorBody, Framing, MalformedRequest, Params, PushTarget, Request,
     Response, ResponseTemplate, DELIMITER,

@@ -159,6 +159,11 @@
       （`klippy/klippy.py:144` `:151`），shutdown 分析走 `klippy:analyze_shutdown`
       （`klippy/klippy.py:216-220`）。当前 `PrinterEvent` 的 handler 无参，表达不了，
       见 Q2 / Q3。
+- [ ] **连接层停机标志与 `config_reset`**：上游 `_send_get_config` 先查连接层的
+      `conn_helper.is_shutdown()`（收到 shutdown 消息时置位，`klippy/mcu.py:769-910`），
+      再查 `get_config` 的 `is_shutdown` 字段；恢复路径用 `config_reset` 清 CRC/oid/运动队列
+      （`MCUConfigHelper` 的 restart helper，`klippy/mcu.py:756-770`）。`config_reset` 命令
+      类型已在 F1，**发送**它属于这里。
 
 ### B3（新）gcode 层与 gcode/* 端点
 
@@ -370,6 +375,13 @@ kinematics 已随 Printer 重构删除，从这里重新开始：
       结果只 `debug!`（`src/klippy.rs`），没有任何东西按结果重建机器。上游的主循环在
       `klippy/klippy.py:355-370` 按 `res` 决定退出还是 `time.sleep(1.)` 后重建。
 - [ ] 前置是 Q7（API 与打印机的关系）；`start_reason`（D1）也要跟着这条进来。
+- [ ] **CRC 不匹配时重启**：上游发现已配置但 CRC 不一致时，先
+      `request_exit('firmware_restart')`（`check_restart_on_crc_mismatch`，
+      `klippy/mcu.py:678-685`、`:1057-1059`），**不是**重发配置——`finalize_config`
+      已锁住固件（第二次会 `Already finalized`）。重启方法按 `restart_method` 分派
+      （`:756-770`），也就是 `McuConfig.restart_method` 的第一个读者。另有
+      `start_reason == 'firmware_restart'` 却仍已配置时 raise “Failed automated reset”
+      的前置门（`:1053-1056`）。详见 `docs/klippy/developer-manual/mcu-config.md`。
 
 ### E1（旧 T7）文档
 

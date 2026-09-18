@@ -6,10 +6,12 @@
 
 ### 连接方式
 
-- **传输层**：Unix Domain Socket
+- **传输层**：Unix Domain Socket（默认）；本实现也支持 TCP 监听，两种传输承载完全相同的协议
 - **消息格式**：JSON
 - **消息分隔符**：`\x03` (ASCII ETX)
 - **编码**：JSON（紧凑格式，字段间无空格）
+
+> 监听位置由主机启动参数 `-a/--api-server` 决定：默认是 Unix Domain Socket 的文件名（与上游一致），写成 `tcp:<host>:<port>` 则监听 TCP；**不给该参数就不启动服务**。TCP 监听没有认证，只应开在可信网络上。
 
 ### 请求格式
 

@@ -85,8 +85,8 @@
   "group_id": 1000,
   "log_file": "/tmp/klippy.log",
   "config_file": "/home/pi/printer.cfg",
-  "software_version": "v0.12.0-xxx",
-  "cpu_info": {"model": "Raspberry Pi 4", "cores": 4}
+  "software_version": "v0.12.0-123-gabcdef",
+  "cpu_info": "4 core ARMv7 Processor rev 4 (v7l)"
 }
 ```
 
@@ -99,10 +99,10 @@
 | `python_path` | string | Python 解释器路径 |
 | `process_id` | int | 进程 ID |
 | `user_id` / `group_id` | int | 运行用户/组 ID |
-| `log_file` | string | 日志文件路径 |
+| `log_file` | string/null | 日志文件路径；未指定日志文件时为 `null` |
 | `config_file` | string | 配置文件路径 |
 | `software_version` | string | Klipper 软件版本 |
-| `cpu_info` | object | CPU 信息 |
+| `cpu_info` | string | CPU 描述字符串，如 `"4 core ARMv7 Processor rev 4 (v7l)"`（非对象，客户端直接展示） |
 
 ---
 

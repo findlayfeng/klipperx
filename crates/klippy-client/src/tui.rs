@@ -1,0 +1,974 @@
+//! The full-screen front-end: `klippy-client console` on a terminal.
+//!
+//! Three panes and a keyboard:
+//!
+//! ```text
+//! ● ready · Printer is ready
+//! 1 (list_endpoints)
+//!   {
+//!     "endpoints": ["list_endpoints"]
+//!   }
+//! < {"id": null, "method": "klippy:status", "params": {...}}
+//! klippy> objects/query {"objects": {"toolhead": ["position"]}}
+//! Enter send · ↑↓ history · PgUp/PgDn scroll · .help · ^C quit
+//! ```
+//!
+//! The header tracks the printer's state, the log holds everything that
+//! happened, and the last line is the hint. Nothing is bordered: the window is
+//! usually a few dozen rows of printer output, and every column counts.
+//!
+//! Everything the session does arrives as an [`Entry`] and is appended to the
+//! log pane; the window exists to make that log readable while the printer is
+//! running. Pushes are the reason: a subscription keeps printing under a line
+//! mode session too, but only a window can show it without fighting the prompt
+//! for the same line.
+//!
+//! # Threads and tasks
+//!
+//! One task (the one running [`run`]) draws and owns all the state, one blocking
+//! thread reads keystrokes, and the session's socket reads are raced against
+//! those keystrokes in the same `select!`. The keyboard thread polls with a
+//! timeout rather than blocking forever, so that leaving the window does not
+//! leave a thread asleep in `read` — which would also hold up the runtime's
+//! shutdown.
+//!
+//! # Not covered
+//!
+//! * No mouse, no text selection, no copy/paste handling beyond what the
+//!   terminal does with the alternate screen.
+//! * No reconnection: the window closes when the server goes away, after
+//!   printing why. Reconnecting would mean re-establishing every subscription.
+//! * The log keeps everything for the life of the session; a very chatty
+//!   subscription will grow it without bound.
+
+use std::io::IsTerminal as _;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span, Text};
+use ratatui::widgets::Paragraph;
+use ratatui::Frame;
+use serde_json::Value;
+
+use klippy_api::address::ApiTarget;
+use klippy_api::TransportError;
+
+use crate::session::{self, Control, Entry, Notice, Output, Session};
+
+/// How often the keyboard thread wakes to check whether it should stop.
+///
+/// It cannot be interrupted out of `event::read`, so the thread polls instead;
+/// this is the price of leaving the window instantly.
+const KEY_POLL: Duration = Duration::from_millis(100);
+
+/// How long to keep reading after the window is closing, so replies already on
+/// their way are not lost.
+const LEAVE_GRACE: Duration = Duration::from_secs(1);
+
+/// How many entries the log keeps before dropping the oldest.
+const LOG_LIMIT: usize = 2_000;
+
+/// Run the window until the user leaves or the connection drops.
+///
+/// # Errors
+/// Returns [`TransportError`] if the server goes away. The terminal is restored
+/// either way, so the error is readable on the normal screen afterwards.
+pub async fn run(target: ApiTarget) -> Result<(), TransportError> {
+    let session = Session::connect(target).await?;
+
+    // Set before anything can fail: a panic inside the window must still give
+    // the terminal back, which is what ratatui's panic hook and `restore` are
+    // for.
+    let terminal = ratatui::init();
+    let outcome = event_loop(session, terminal).await;
+    ratatui::restore();
+    outcome
+}
+
+/// Whether this process can draw a window at all.
+pub fn is_available() -> bool {
+    std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+}
+
+/// The window's state: everything the next frame is drawn from.
+struct App {
+    entries: Vec<Entry>,
+    input: Input,
+    /// Lines scrolled back from the bottom of the log.
+    scroll: usize,
+    /// The connection's state, shown in the header.
+    status: Status,
+    /// Set by a local command that asked to leave.
+    quit: bool,
+    /// Whether the handshake's `info` has been answered.
+    ///
+    /// Until it has, an `info` reply is the header's business rather than the
+    /// log's — but only that one: a later, typed `info` is the user's, and it
+    /// belongs in the log like any other reply.
+    greeted: bool,
+}
+
+/// What the header says about the connection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Status {
+    /// Connected, with whatever `info` reported.
+    Connected { state: String, message: String },
+    /// Connected, but `info` did not answer usefully.
+    Unknown,
+    /// The connection is gone.
+    Closed(String),
+}
+
+impl App {
+    fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            input: Input::default(),
+            scroll: 0,
+            status: Status::Unknown,
+            quit: false,
+            greeted: false,
+        }
+    }
+
+    fn push(&mut self, entry: Entry) {
+        // A new entry makes the newest line interesting again, so the view
+        // returns to the bottom — unless the user scrolled back to read
+        // something, in which case their place is kept.
+        let was_at_bottom = self.scroll == 0;
+        self.entries.push(entry);
+        if self.entries.len() > LOG_LIMIT {
+            self.entries.drain(..self.entries.len() - LOG_LIMIT);
+        }
+        if was_at_bottom {
+            self.scroll = 0;
+        }
+    }
+}
+
+impl Output for App {
+    fn write(&mut self, entry: Entry) {
+        match &entry {
+            // The handshake's `info` is the header's business, not the log's:
+            // showing it twice would be noise.
+            Entry::Reply(reply) if !self.greeted => {
+                self.greeted = true;
+                if reply.method.as_deref() == Some("info") && !reply.is_error() {
+                    let result = reply.result().cloned().unwrap_or(Value::Null);
+                    self.status = Status::Connected {
+                        state: field(&result, "state"),
+                        message: field(&result, "state_message").replace('\n', " "),
+                    };
+                    return;
+                }
+            }
+            // After that it is the `webhooks` object that reports the state, on
+            // every change — so a subscription keeps the header honest without
+            // anyone asking.
+            Entry::Push(message) => {
+                let status = message
+                    .get("params")
+                    .and_then(|params| params.get("status"))
+                    .and_then(|status| status.get("webhooks"));
+                if let Some(status) = status {
+                    let state = status.get("state").and_then(Value::as_str);
+                    let message = status.get("state_message").and_then(Value::as_str);
+                    if let (Some(state), Some(message)) = (state, message) {
+                        self.status = Status::Connected {
+                            state: state.to_string(),
+                            message: message.replace('\n', " "),
+                        };
+                    }
+                }
+            }
+            _ => (),
+        }
+        self.push(entry);
+    }
+}
+
+/// A string field of a JSON object, or `?`.
+fn field(value: &Value, name: &str) -> String {
+    value
+        .get(name)
+        .and_then(Value::as_str)
+        .unwrap_or("?")
+        .to_string()
+}
+
+/// Draw, read keys, read the socket, until one of them says stop.
+async fn event_loop(
+    mut session: Session,
+    mut terminal: ratatui::DefaultTerminal,
+) -> Result<(), TransportError> {
+    let mut app = App::new();
+    app.push(Entry::notice(
+        Notice::Info,
+        format!("Connected to {}.", session.target()),
+    ));
+    session.handshake(&mut app).await?;
+
+    let (mut keys, keyboard) = spawn_keyboard();
+    let outcome = loop {
+        terminal
+            .draw(|frame| draw(frame, &app))
+            .expect("drawing failed");
+
+        // Nothing here borrows `app`: the futures are built before the branches
+        // run, and the branches then own both `app` and `session` freely.
+        enum Step {
+            Key(Option<Event>),
+            Message(Result<crate::connection::Incoming, TransportError>),
+        }
+        let step = tokio::select! {
+            key = keys.recv() => Step::Key(key),
+            message = session.receive() => Step::Message(message),
+        };
+
+        match step {
+            // The keyboard thread is gone, which only happens on shutdown.
+            Step::Key(None) => break Ok(()),
+            Step::Key(Some(Event::Key(key))) => {
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+                match handle_key(&mut app, &mut session, key).await? {
+                    Control::Continue => (),
+                    Control::Quit => break Ok(()),
+                }
+            }
+            Step::Key(Some(_)) => (),
+            Step::Message(Ok(message)) => app.write(message.into()),
+            Step::Message(Err(err)) => {
+                app.status = Status::Closed(err.to_string());
+                app.push(Entry::notice(Notice::Failure, err.to_string()));
+                break Err(err);
+            }
+        }
+
+        if app.quit {
+            break Ok(());
+        }
+    };
+
+    // Leaving is not the same as abandoning: replies to what was just typed are
+    // still owed, and the window is still up to show them for a moment.
+    session.drain(&mut app, LEAVE_GRACE).await;
+    terminal
+        .draw(|frame| draw(frame, &app))
+        .expect("drawing failed");
+
+    stop_keyboard(keyboard);
+    outcome
+}
+
+/// One keypress.
+async fn handle_key(
+    app: &mut App,
+    session: &mut Session,
+    key: KeyEvent,
+) -> Result<Control, TransportError> {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match (key.code, ctrl) {
+        // Leaving: ^C, ^D and Esc all mean "I am done", and all of them are
+        // what a terminal user will try.
+        (KeyCode::Char('c') | KeyCode::Char('d'), true) | (KeyCode::Esc, _) => {
+            return Ok(Control::Quit)
+        }
+        (KeyCode::Char('l'), true) => {
+            app.entries.clear();
+            app.scroll = 0;
+        }
+        (KeyCode::Enter, _) => {
+            let line = app.input.take();
+            if line.is_empty() {
+                return Ok(Control::Continue);
+            }
+            app.scroll = 0;
+            match session.handle_line(&line, app).await? {
+                Control::Continue => (),
+                Control::Quit => app.quit = true,
+            }
+        }
+        // Scrolling the log, which is the reason the panes exist: the printer's
+        // own output would otherwise push everything else away.
+        (KeyCode::PageUp, _) => app.scroll = app.scroll.saturating_add(10),
+        (KeyCode::PageDown, _) => app.scroll = app.scroll.saturating_sub(10),
+        (KeyCode::Up, true) => app.scroll = app.scroll.saturating_add(1),
+        (KeyCode::Down, true) => app.scroll = app.scroll.saturating_sub(1),
+        (code, _) => app.input.edit(code, ctrl),
+    }
+    Ok(Control::Continue)
+}
+
+/// The three panes.
+fn draw(frame: &mut Frame, app: &App) {
+    let [header, log, input, footer] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(frame.area());
+
+    draw_header(frame, app, header);
+    draw_log(frame, app, log);
+    draw_input(frame, app, input);
+    draw_footer(frame, app, footer);
+}
+
+fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
+    let (marker, text, style) = match &app.status {
+        Status::Connected { state, message } => (
+            match state.as_str() {
+                "ready" => "●",
+                "startup" => "◌",
+                _ => "▲",
+            },
+            format!("{state} · {message}"),
+            match state.as_str() {
+                "ready" => Style::new().fg(Color::Green),
+                "startup" => Style::new().fg(Color::Yellow),
+                _ => Style::new().fg(Color::Red),
+            },
+        ),
+        Status::Unknown => (
+            "◌",
+            "state unknown".to_string(),
+            Style::new().add_modifier(Modifier::DIM),
+        ),
+        Status::Closed(why) => (
+            "✕",
+            format!("disconnected: {why}"),
+            Style::new().fg(Color::Red),
+        ),
+    };
+    let line = Line::from(vec![
+        Span::styled(format!("{marker} "), style),
+        Span::styled(text, style.add_modifier(Modifier::BOLD)),
+    ]);
+    frame.render_widget(Paragraph::new(line), area);
+}
+
+fn draw_log(frame: &mut Frame, app: &App, area: Rect) {
+    let lines = visible_lines(app, area.width as usize, area.height as usize);
+    // The lines were collected from the bottom up, so they are already the ones
+    // the pane is meant to show.
+    frame.render_widget(Paragraph::new(Text::from(lines)), area);
+}
+
+fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
+    let prompt = if session::is_local(&app.input.text()) {
+        // A local command is the client's own, so it is marked as such before it
+        // is even sent.
+        Span::styled("local> ", Style::new().fg(Color::Magenta))
+    } else {
+        Span::styled("klippy> ", Style::new().fg(Color::Blue))
+    };
+    let prompt_width = prompt.content.chars().count() as u16;
+
+    // Only the tail of a long line fits; the cursor decides which tail.
+    let available = area.width.saturating_sub(prompt_width).max(1) as usize;
+    let (shown, cursor_column) = app.input.window(available);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![prompt, Span::raw(shown)])),
+        area,
+    );
+    frame.set_cursor_position((area.x + prompt_width + cursor_column as u16, area.y));
+}
+
+fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
+    let hint = if app.quit {
+        "leaving…".to_string()
+    } else if app.scroll > 0 {
+        format!(
+            "scrolled back {} lines · PgDn to return · ^C quit",
+            app.scroll
+        )
+    } else {
+        "Enter send · ↑↓ history · PgUp/PgDn scroll · .help · ^C quit".to_string()
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(hint)).style(Style::new().add_modifier(Modifier::DIM)),
+        area,
+    );
+}
+
+/// The lines the log pane shows, newest last.
+///
+/// Built from the bottom up and stopped as soon as the pane is full, so a log
+/// of thousands of entries costs no more to draw than a short one.
+fn visible_lines(app: &App, width: usize, height: usize) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let wanted = height + app.scroll;
+
+    for entry in app.entries.iter().rev() {
+        let style = entry_style(entry);
+        // Wrapped by hand rather than by `Paragraph::wrap`: the pane has to know
+        // how many lines each entry takes to scroll by the right amount.
+        for line in wrap(&entry.text(), width) {
+            lines.push(Line::from(Span::styled(line, style)));
+            if lines.len() >= wanted {
+                break;
+            }
+        }
+        if lines.len() >= wanted {
+            break;
+        }
+    }
+
+    lines.truncate(wanted);
+    lines.reverse();
+    lines
+}
+
+/// How an entry looks.
+fn entry_style(entry: &Entry) -> Style {
+    match entry {
+        // What was sent is context, not news.
+        Entry::Sent { .. } => Style::new().add_modifier(Modifier::DIM),
+        // A failed request is the thing the user has to notice.
+        Entry::Reply(reply) if reply.is_error() => Style::new().fg(Color::Red),
+        Entry::Reply(_) | Entry::Push(_) => Style::new(),
+        Entry::Notice { kind, .. } => match kind {
+            Notice::Info => Style::new().fg(Color::Cyan),
+            Notice::Hint => Style::new().fg(Color::Yellow),
+            Notice::Problem => Style::new().fg(Color::Red),
+            Notice::Failure => Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+        },
+    }
+}
+
+/// Break `text` into lines of at most `width` columns.
+///
+/// Counts characters rather than displaying them, which is right for JSON and
+/// wrong only for wide glyphs — of which a JSON reply has none.
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    for raw in text.split('\n') {
+        if raw.is_empty() {
+            lines.push(String::new());
+            continue;
+        }
+        let mut current = String::new();
+        let mut used = 0;
+        for character in raw.chars() {
+            if used == width {
+                lines.push(std::mem::take(&mut current));
+                used = 0;
+            }
+            current.push(character);
+            used += 1;
+        }
+        lines.push(current);
+    }
+    lines
+}
+
+// ===========================================================================
+// Input
+// ===========================================================================
+
+/// The editable line at the bottom of the window.
+///
+/// The terminal is in raw mode, so every editing key a user expects has to be
+/// implemented here: there is no line discipline left to do it.
+#[derive(Default)]
+pub struct Input {
+    buffer: Vec<char>,
+    /// Where the next character goes, in characters from the start.
+    cursor: usize,
+    history: Vec<String>,
+    /// Where `Up`/`Down` currently are in `history`, counting back from the end.
+    recall: Option<usize>,
+}
+
+impl Input {
+    /// The line as it stands.
+    pub fn text(&self) -> String {
+        self.buffer.iter().collect()
+    }
+
+    /// Whether there is nothing to send.
+    pub fn is_empty(&self) -> bool {
+        self.buffer.is_empty()
+    }
+
+    /// Take the line, remembering it for `Up`.
+    pub fn take(&mut self) -> String {
+        let line = self.text();
+        if !line.trim().is_empty() {
+            self.history.push(line.clone());
+        }
+        self.buffer.clear();
+        self.cursor = 0;
+        self.recall = None;
+        line
+    }
+
+    /// Apply one key to the line.
+    pub fn edit(&mut self, code: KeyCode, ctrl: bool) {
+        match (code, ctrl) {
+            (KeyCode::Char(character), false) => self.insert(character),
+            (KeyCode::Char('a'), true) => self.cursor = 0,
+            (KeyCode::Char('e'), true) => self.cursor = self.buffer.len(),
+            // The usual way to abandon a half-typed line.
+            (KeyCode::Char('u'), true) => {
+                self.buffer.clear();
+                self.cursor = 0;
+            }
+            (KeyCode::Backspace, _) => {
+                if self.cursor > 0 {
+                    self.cursor -= 1;
+                    self.buffer.remove(self.cursor);
+                }
+            }
+            (KeyCode::Delete, _) => {
+                if self.cursor < self.buffer.len() {
+                    self.buffer.remove(self.cursor);
+                }
+            }
+            (KeyCode::Left, _) => self.cursor = self.cursor.saturating_sub(1),
+            (KeyCode::Right, _) => {
+                self.cursor = (self.cursor + 1).min(self.buffer.len());
+            }
+            (KeyCode::Home, _) => self.cursor = 0,
+            (KeyCode::End, _) => self.cursor = self.buffer.len(),
+            (KeyCode::Up, _) => self.recall_older(),
+            (KeyCode::Down, _) => self.recall_newer(),
+            _ => (),
+        }
+    }
+
+    fn insert(&mut self, character: char) {
+        self.buffer.insert(self.cursor, character);
+        self.cursor += 1;
+    }
+
+    /// Step back through what was typed before.
+    fn recall_older(&mut self) {
+        if self.history.is_empty() {
+            return;
+        }
+        let index = match self.recall {
+            None => self.history.len() - 1,
+            Some(0) => 0,
+            Some(index) => index - 1,
+        };
+        self.recall = Some(index);
+        self.buffer = self.history[index].chars().collect();
+        self.cursor = self.buffer.len();
+    }
+
+    /// Step forward again, ending at the empty line that was being typed.
+    fn recall_newer(&mut self) {
+        let Some(index) = self.recall else { return };
+        if index + 1 >= self.history.len() {
+            self.recall = None;
+            self.buffer.clear();
+        } else {
+            self.recall = Some(index + 1);
+            self.buffer = self.history[index + 1].chars().collect();
+        }
+        self.cursor = self.buffer.len();
+    }
+
+    /// The part of the line that fits in `width` columns, and where the cursor
+    /// lands inside it.
+    fn window(&self, width: usize) -> (String, usize) {
+        if self.buffer.len() <= width {
+            return (self.text(), self.cursor);
+        }
+        // Scroll just enough to keep the cursor visible.
+        let start = self.cursor.saturating_sub(width.saturating_sub(1));
+        let shown: String = self.buffer[start..].iter().take(width).collect();
+        (shown, self.cursor - start)
+    }
+}
+
+// ===========================================================================
+// Keyboard
+// ===========================================================================
+
+/// A thread reading keys, and the flag that stops it.
+struct Keyboard {
+    stop: Arc<AtomicBool>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+/// Read terminal events on a thread of their own.
+///
+/// `event::read` blocks, and nothing can interrupt it, so the thread polls with
+/// a timeout: that way the flag is noticed within [`KEY_POLL`], and the runtime's
+/// shutdown is not held up by a thread asleep in a read.
+fn spawn_keyboard() -> (tokio::sync::mpsc::UnboundedReceiver<Event>, Keyboard) {
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stopping = Arc::clone(&stop);
+
+    let handle = std::thread::Builder::new()
+        .name("klippy-client-keys".to_string())
+        .spawn(move || {
+            while !stopping.load(Ordering::Relaxed) {
+                match event::poll(KEY_POLL) {
+                    Ok(true) => match event::read() {
+                        Ok(event) => {
+                            if sender.send(event).is_err() {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    },
+                    Ok(false) => continue,
+                    Err(_) => break,
+                }
+            }
+        })
+        .expect("cannot spawn the keyboard thread");
+
+    (
+        receiver,
+        Keyboard {
+            stop,
+            thread: handle,
+        },
+    )
+}
+
+/// Ask the keyboard thread to stop, and wait for it to notice.
+///
+/// Joining is not politeness: the thread holds a `read` on the terminal, and
+/// leaving it in flight while the terminal is restored is how a client ends up
+/// eating the shell's next few keystrokes.
+fn stop_keyboard(keyboard: Keyboard) {
+    keyboard.stop.store(true, Ordering::Relaxed);
+    // The thread polls with a timeout, so this waits at most `KEY_POLL` — not
+    // for a keypress.
+    let _ = keyboard.thread.join();
+}
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    /// Draw the window into a buffer and return it as text, one string per row.
+    fn render(app: &App, width: u16, height: u16) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..height)
+            .map(|row| {
+                (0..width)
+                    .map(|column| buffer[(column, row)].symbol().to_string())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    fn app_with(entries: Vec<Entry>) -> App {
+        let mut app = App::new();
+        app.status = Status::Connected {
+            state: "ready".to_string(),
+            message: "Printer is ready".to_string(),
+        };
+        for entry in entries {
+            app.push(entry);
+        }
+        app
+    }
+
+    // -----------------------------------------------------------------------
+    // Input
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_editing_at_the_cursor() {
+        let mut input = Input::default();
+        for character in "helo".chars() {
+            input.edit(KeyCode::Char(character), false);
+        }
+        // The cursor is at the end; step back over the `l` and put it back.
+        input.edit(KeyCode::Left, false);
+        input.edit(KeyCode::Char('l'), false);
+        assert_eq!(input.text(), "hello");
+
+        input.edit(KeyCode::Home, false);
+        input.edit(KeyCode::Delete, false);
+        assert_eq!(input.text(), "ello");
+        input.edit(KeyCode::End, false);
+        input.edit(KeyCode::Backspace, false);
+        assert_eq!(input.text(), "ell");
+    }
+
+    #[test]
+    fn test_ctrl_a_and_ctrl_e_move_the_cursor() {
+        let mut input = Input::default();
+        for character in "abc".chars() {
+            input.edit(KeyCode::Char(character), false);
+        }
+        input.edit(KeyCode::Char('a'), true);
+        input.edit(KeyCode::Char('X'), false);
+        assert_eq!(input.text(), "Xabc");
+
+        input.edit(KeyCode::Char('e'), true);
+        input.edit(KeyCode::Char('Y'), false);
+        assert_eq!(input.text(), "XabcY");
+    }
+
+    #[test]
+    fn test_ctrl_u_abandons_the_line_without_remembering_it() {
+        let mut input = Input::default();
+        for character in "half typed".chars() {
+            input.edit(KeyCode::Char(character), false);
+        }
+        input.edit(KeyCode::Char('u'), true);
+        assert!(input.is_empty());
+        // Nothing went into history, so there is nothing to recall.
+        input.edit(KeyCode::Up, false);
+        assert!(input.is_empty());
+    }
+
+    #[test]
+    fn test_take_remembers_the_line_and_clears_it() {
+        let mut input = Input::default();
+        for character in "info".chars() {
+            input.edit(KeyCode::Char(character), false);
+        }
+        assert_eq!(input.take(), "info");
+        assert!(input.is_empty());
+        // Whitespace is not worth remembering.
+        input.edit(KeyCode::Char(' '), false);
+        assert_eq!(input.take(), " ");
+        input.edit(KeyCode::Up, false);
+        assert_eq!(input.text(), "info");
+    }
+
+    #[test]
+    fn test_history_walks_back_and_forward_to_an_empty_line() {
+        let mut input = Input::default();
+        for line in ["first", "second"] {
+            for character in line.chars() {
+                input.edit(KeyCode::Char(character), false);
+            }
+            input.take();
+        }
+
+        input.edit(KeyCode::Up, false);
+        assert_eq!(input.text(), "second");
+        input.edit(KeyCode::Up, false);
+        assert_eq!(input.text(), "first");
+        // The oldest entry is the end of the history, not a wrap-around.
+        input.edit(KeyCode::Up, false);
+        assert_eq!(input.text(), "first");
+        input.edit(KeyCode::Down, false);
+        assert_eq!(input.text(), "second");
+        // Past the newest is the line that was being typed, which is empty.
+        input.edit(KeyCode::Down, false);
+        assert!(input.is_empty());
+    }
+
+    #[test]
+    fn test_a_long_line_scrolls_to_keep_the_cursor_visible() {
+        let mut input = Input::default();
+        for character in "0123456789".chars() {
+            input.edit(KeyCode::Char(character), false);
+        }
+        // Ten characters do not fit in four columns. The cursor needs a cell of
+        // its own, so the last four columns are three characters plus the cursor
+        // — which is what a shell prompt does too.
+        let (shown, cursor) = input.window(4);
+        assert_eq!(shown, "789");
+        assert_eq!(cursor, 3);
+        assert!(shown.chars().count() < 4, "the cursor needs a cell too");
+
+        // Far enough back that the cursor is not at the end: the window ends at
+        // the cursor, showing the lines it is between.
+        input.edit(KeyCode::Home, false);
+        input.edit(KeyCode::Right, false);
+        input.edit(KeyCode::Right, false);
+        let (shown, cursor) = input.window(4);
+        assert_eq!(shown, "0123");
+        assert_eq!(cursor, 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // Drawing
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_the_header_shows_the_printer_state() {
+        let rows = render(&app_with(Vec::new()), 60, 6);
+        assert!(rows[0].contains("ready"), "{rows:?}");
+        assert!(rows[0].contains("Printer is ready"), "{rows:?}");
+    }
+
+    #[test]
+    fn test_the_log_shows_replies_pushes_and_notices() {
+        let app = app_with(vec![
+            Entry::notice(Notice::Info, "Connected to unix:/tmp/klippy_uds."),
+            Entry::Sent {
+                id: Some(2),
+                method: "objects/query".to_string(),
+                message: serde_json::json!({"id": 2, "method": "objects/query"}),
+            },
+            Entry::Push(serde_json::json!({"method": "klippy:status"})),
+        ]);
+        let rows = render(&app, 60, 8);
+        let text = rows.join("\n");
+
+        assert!(
+            text.contains("Connected to unix:/tmp/klippy_uds."),
+            "{text}"
+        );
+        assert!(text.contains("2 > {\"id\":2,"), "{text}");
+        assert!(text.contains("< {\"method\":\"klippy:status\"}"), "{text}");
+    }
+
+    #[test]
+    fn test_an_error_reply_is_marked() {
+        let reply = crate::connection::Reply {
+            id: serde_json::json!(3),
+            method: Some("gcode/script".to_string()),
+            message: serde_json::json!({
+                "id": 3,
+                "error": {"error": "WebRequestError", "message": "Printer is halted"}
+            }),
+        };
+        let rows = render(&app_with(vec![Entry::Reply(reply)]), 60, 6);
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("! 3 (gcode/script) Printer is halted")),
+            "{rows:?}"
+        );
+    }
+
+    #[test]
+    fn test_the_hint_line_names_the_keys() {
+        let rows = render(&app_with(Vec::new()), 70, 6);
+        let footer = rows.last().unwrap();
+        assert!(footer.contains("Enter send"), "{footer}");
+        assert!(footer.contains("^C quit"), "{footer}");
+    }
+
+    #[test]
+    fn test_scrolling_back_keeps_the_view_and_says_so() {
+        let entries: Vec<Entry> = (1..=8)
+            .map(|n| Entry::notice(Notice::Info, format!("line {n}")))
+            .collect();
+        let mut app = app_with(entries);
+        // Five rows: header, two rows of log, input, hint. Without scrolling the
+        // log shows its tail.
+        let rows = render(&app, 40, 5);
+        assert!(rows[1].contains("line 7"), "{rows:?}");
+        assert!(rows[2].contains("line 8"), "{rows:?}");
+
+        // Four lines back, the same two-row window shows the pair four lines up.
+        app.scroll = 4;
+        let rows = render(&app, 40, 5);
+        assert!(rows[1].contains("line 3"), "{rows:?}");
+        assert!(rows[2].contains("line 4"), "{rows:?}");
+        assert!(rows.last().unwrap().contains("scrolled back 4"), "{rows:?}");
+
+        // Scrolling past the start shows the start, not an empty pane.
+        app.scroll = 999;
+        let rows = render(&app, 40, 5);
+        assert!(rows[1].contains("line 1"), "{rows:?}");
+    }
+
+    #[test]
+    fn test_a_new_entry_returns_the_view_to_the_bottom() {
+        let mut app = app_with(vec![Entry::notice(Notice::Info, "line 1")]);
+        app.scroll = 0;
+        app.push(Entry::notice(Notice::Info, "line 2"));
+        assert_eq!(app.scroll, 0, "a new entry is worth looking at");
+
+        // But a user who scrolled back keeps their place.
+        app.scroll = 3;
+        app.push(Entry::notice(Notice::Info, "line 3"));
+        assert_eq!(app.scroll, 3);
+    }
+
+    #[test]
+    fn test_the_input_line_shows_the_prompt_and_the_cursor() {
+        let mut app = app_with(Vec::new());
+        for character in "list_endpoints".chars() {
+            app.input.edit(KeyCode::Char(character), false);
+        }
+        let rows = render(&app, 40, 5);
+        assert!(rows[3].starts_with("klippy> list_endpoints"), "{rows:?}");
+
+        // A local command is marked as one before it is sent.
+        app.input.edit(KeyCode::Char('u'), true);
+        for character in ".help".chars() {
+            app.input.edit(KeyCode::Char(character), false);
+        }
+        let rows = render(&app, 40, 5);
+        assert!(rows[3].starts_with("local> .help"), "{rows:?}");
+    }
+
+    #[test]
+    fn test_styles_tell_the_kinds_apart() {
+        let ok = crate::connection::Reply {
+            id: serde_json::json!(1),
+            method: Some("echo".to_string()),
+            message: serde_json::json!({"id": 1, "result": {}}),
+        };
+        let failed = crate::connection::Reply {
+            id: serde_json::json!(2),
+            method: Some("echo".to_string()),
+            message: serde_json::json!({
+                "id": 2,
+                "error": {"error": "WebRequestError", "message": "no"}
+            }),
+        };
+
+        // A sent request is context, a failed one is news, a push is data.
+        assert_eq!(
+            entry_style(&Entry::Sent {
+                id: Some(1),
+                method: "echo".to_string(),
+                message: serde_json::json!({}),
+            })
+            .add_modifier,
+            Modifier::DIM
+        );
+        assert_eq!(entry_style(&Entry::Reply(failed)).fg, Some(Color::Red));
+        assert_eq!(entry_style(&Entry::Reply(ok)).fg, None);
+        assert_eq!(entry_style(&Entry::Push(serde_json::json!({}))).fg, None);
+        assert_eq!(
+            entry_style(&Entry::notice(Notice::Problem, "x")).fg,
+            Some(Color::Red)
+        );
+    }
+
+    #[test]
+    fn test_a_lost_connection_is_shown_in_the_header() {
+        let mut app = app_with(Vec::new());
+        app.status = Status::Closed("the API server closed the connection".to_string());
+        let rows = render(&app, 60, 6);
+        assert!(rows[0].contains("disconnected"), "{rows:?}");
+    }
+
+    #[test]
+    fn test_wrapping_counts_characters() {
+        assert_eq!(wrap("abcd", 2), vec!["ab", "cd"]);
+        assert_eq!(wrap("ab\ncd", 4), vec!["ab", "cd"]);
+        assert_eq!(wrap("", 4), vec![""]);
+        // Short lines are untouched, long ones are not lost.
+        assert_eq!(wrap("abc", 10), vec!["abc"]);
+    }
+}

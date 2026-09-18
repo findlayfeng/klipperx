@@ -16,6 +16,7 @@ path = "src/main.rs"
 [dependencies]
 klippy-api = { path = "../klippy-api" }
 clap = { version = "4", features = ["derive"] }
+ratatui = { version = "0.30", default-features = false, features = ["std", "crossterm"] }
 serde_json = "1"
 tokio = { version = "1", features = ["net", "io-util", "io-std", "sync", "time", "rt", "macros"] }
 tracing = "0.1"

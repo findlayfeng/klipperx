@@ -51,7 +51,12 @@ pub use session::Session;
 #[derive(Args, Debug)]
 pub struct ApiServerArg {
     /// API server address: a socket path, or `tcp:<host>:<port>`
-    #[arg(short, long, value_name = "ADDR")]
+    #[arg(
+        short,
+        long,
+        value_name = "ADDR",
+        default_value = klippy_api::address::DEFAULT_API_SERVER
+    )]
     pub api_server: String,
 }
 

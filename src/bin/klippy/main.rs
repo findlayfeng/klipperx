@@ -79,7 +79,15 @@ mod tests {
     fn test_the_arguments_are_the_hosts_own() {
         let cli = parse(&["printer.cfg", "-a", "/tmp/x"]).unwrap();
         assert_eq!(cli.args.config_file.as_deref(), Some("printer.cfg"));
-        assert_eq!(cli.args.api_server.as_deref(), Some("/tmp/x"));
+        assert_eq!(cli.args.api_server, "/tmp/x");
+    }
+
+    #[test]
+    fn test_the_api_path_defaults_to_the_shared_one() {
+        // The standalone host serves where a client looks by default, so a
+        // client needs no arguments either.
+        let cli = parse(&["printer.cfg"]).unwrap();
+        assert_eq!(cli.args.api_server, klippy_api::address::DEFAULT_API_SERVER);
     }
 
     #[test]

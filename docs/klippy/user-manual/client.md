@@ -12,7 +12,8 @@
 客户端连的是**主机的 API**，不是别的什么东西。启动主机时用 `-a` 指定监听位置：
 
 ```console
-$ klipperx ~/printer.cfg -a /tmp/klippy_uds               # Unix socket（默认形式）
+$ klipperx ~/printer.cfg                                  # 默认：/tmp/klippy_uds
+$ klipperx ~/printer.cfg -a /run/klipper/api              # 自己指定路径
 $ klipperx ~/printer.cfg -a tcp:127.0.0.1:7125            # TCP，供别的机器连
 ```
 
@@ -22,13 +23,18 @@ $ klipperx ~/printer.cfg -a tcp:127.0.0.1:7125            # TCP，供别的机�
 
 | `-a` 的写法 | 含义 |
 |-------------|------|
-| `/tmp/klippy_uds` | 在该路径建一个 Unix Domain Socket（与上游 Klipper 一致） |
+| **不给** | 用默认路径 `/tmp/klippy_uds`（主机与客户端共用同一个默认值） |
+| `/tmp/klippy_uds` | 在该路径建一个 Unix Domain Socket（上游 Klipper 文档里的示例路径） |
 | `unix:/tmp/klippy_uds` | 同上，写得更明确 |
 | `tcp:127.0.0.1:7125` | 监听 TCP |
 | `127.0.0.1:7125` | 同上（裸 `主机:端口` 简写） |
+| `''`（空值） | **不启动 API**（只给主机用：客户端必须有地址） |
 
-**不给 `-a` 就不启动 API**，客户端也就无从连接 —— 这与上游一致，是有意的：
-一个默认在某处静默监听的程序会让人意外。
+**默认值是统一的**：主机不给 `-a` 就监听 `/tmp/klippy_uds`，而 `klipperx api`、
+`klipperx console`、`klippy-client` 不给 `-a` 就去找同一个路径 —— 所以两边都不用
+被交代两次，`klipperx console` 一条命令就能连上刚起的主机。
+
+不想要 API 就给空值（`-a ''`）：API 没有认证，一个不需要它的主机不该被迫监听。
 
 > 从上游 Klipper 过来的话：`-I/--input-tty`（把 G-Code 输入挂在一个 pty 上，
 > 上游默认 `/tmp/printer`）以及 `-l`（日志文件）、`-i`/`-o`（调试输入输出）都还
@@ -70,8 +76,10 @@ WARN  api: dropping malformed request (invalid JSON …): not json
   窗口，另开一个终端跑 `klippy-client console -a …` 即可。
 
 > **安全提醒**：API 没有任何认证，能连上的人就能操作打印机。TCP 监听只应开在
-> 可信网络上（本机 `127.0.0.1` 或内网），不要直接暴露到公网。Unix socket 也
-> 一样，靠文件权限保护。
+> 可信网络上（本机 `127.0.0.1` 或内网），不要直接暴露到公网。Unix socket 靠文件
+> 权限保护，而默认路径在 `/tmp`（沿用上游的示例路径）—— 共享目录、路径可猜，
+> 同一个机器上的其他用户因此也能连上。多用户机器请改成自己的路径，或者用
+> `-a ''` 干脆不开。
 
 ## 二、拿客户端
 

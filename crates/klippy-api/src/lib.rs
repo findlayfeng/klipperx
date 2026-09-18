@@ -53,11 +53,16 @@
 //!
 //! # Where it listens
 //!
-//! `--api-server` names the listener: a Unix Domain Socket path by default
-//! (upstream's form), or a TCP address written `tcp:<host>:port` (see
-//! [`ApiTarget`]). Both transports carry the same protocol; TCP exists so a
-//! client on another machine can reach the API, and it has no authentication, so
-//! it belongs on a trusted network only.
+//! `--api-server` names the listener: a Unix Domain Socket path by default, or a
+//! TCP address written `tcp:<host>:port` (see [`ApiTarget`]). Both transports
+//! carry the same protocol; TCP exists so a client on another machine can reach
+//! the API, and it has no authentication, so it belongs on a trusted network
+//! only.
+//!
+//! Omitting it means [`DEFAULT_API_SERVER`] — the same path for the host and for
+//! its clients, so `klipperx console` finds a host that was started with nothing
+//! but a config file. A host that wants no API at all says
+//! [`NO_API_SERVER`]; a client cannot, since it has nowhere else to connect.
 //!
 //! # Concurrency
 //!
@@ -88,7 +93,7 @@ pub mod protocol;
 pub mod registry;
 pub mod server;
 
-pub use address::{AddressError, ApiTarget, Transport};
+pub use address::{AddressError, ApiTarget, Transport, DEFAULT_API_SERVER, NO_API_SERVER};
 pub use error::TransportError;
 pub use protocol::{
     encode, ApiError, ApiErrorBody, Framing, MalformedRequest, Params, PushTarget, Request,

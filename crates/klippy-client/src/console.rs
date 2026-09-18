@@ -40,7 +40,7 @@ pub async fn run(target: ApiTarget) -> Result<(), TransportError> {
     let mut out = Stdout::new(std::io::stdin().is_terminal());
     out.write(Entry::notice(
         Notice::Info,
-        format!("Connected to {}.", session.target()),
+        format!("Connected to {}.", session.label()),
     ));
 
     session.handshake(&mut out).await?;
@@ -83,7 +83,7 @@ pub async fn run(target: ApiTarget) -> Result<(), TransportError> {
     session.drain(&mut out, LEAVE_GRACE).await;
     out.write(Entry::notice(
         Notice::Info,
-        format!("Disconnected from {}.", session.target()),
+        format!("Disconnected from {}.", session.label()),
     ));
     Ok(())
 }

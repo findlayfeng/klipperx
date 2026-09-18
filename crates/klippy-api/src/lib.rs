@@ -75,7 +75,7 @@
 //! | [`address`] | the `--api-server` value: socket path or TCP address, and the socket both directions traffic in |
 //! | [`protocol`] | framing, request/reply shapes, parameter access, errors |
 //! | [`registry`] | the endpoint table, dispatch, mux endpoints, remote methods |
-//! | [`server`] | the listening socket and the per-connection task |
+//! | [`server`] | the listening socket, the per-connection task, and [`serve`] for a connection that did not come from a socket |
 //! | [`error`] | socket failures, as opposed to request failures |
 //!
 //! The public reference for the endpoints themselves (paths, parameters,
@@ -95,4 +95,4 @@ pub use protocol::{
     Response, ResponseTemplate, DELIMITER,
 };
 pub use registry::{Api, Endpoint, EndpointContext, MuxEndpoint, RegistrationError};
-pub use server::{ClientConnection, Server};
+pub use server::{serve, ClientConnection, Server};

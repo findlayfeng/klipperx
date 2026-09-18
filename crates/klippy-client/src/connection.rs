@@ -124,8 +124,20 @@ impl Connection {
     /// # Errors
     /// Returns [`TransportError`] if the socket cannot be reached.
     pub async fn connect(target: &ApiTarget) -> Result<Self, TransportError> {
-        let (reader, writer) = tokio::io::split(target.connect().await?);
-        Ok(Self {
+        Ok(Self::from_transport(target.connect().await?))
+    }
+
+    /// Wrap a transport that is already connected.
+    ///
+    /// A client normally dials a target, but a host can hand one end of an
+    /// in-process pipe to a server and the other to a client: the protocol is
+    /// the same either way, and only the dialling is missing. The socket is
+    /// taken apart into halves here so that reading and writing can be raced
+    /// against each other, as [`Connection::receive`] and [`Connection::send`]
+    /// are meant to be.
+    pub fn from_transport(transport: Box<dyn Transport>) -> Self {
+        let (reader, writer) = tokio::io::split(transport);
+        Self {
             reader,
             writer,
             framing: Framing::new(),
@@ -133,7 +145,7 @@ impl Connection {
             buffer: vec![0u8; READ_SIZE],
             next_id: 1,
             pending: HashMap::new(),
-        })
+        }
     }
 
     /// Take the `id` for a new request, advancing the counter.

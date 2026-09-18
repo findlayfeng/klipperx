@@ -155,6 +155,7 @@ fn register(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::klippy::reactor::ManualReactor;
 
     /// Parse a config from its text, as the host does from a file.
     fn config(text: &str) -> Config {
@@ -162,7 +163,7 @@ mod tests {
     }
 
     fn load(text: &str) -> (Arc<Printer>, Result<(), KlippyError>) {
-        let printer = Arc::new(Printer::new());
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
         let result = printer.load_config(&config(text));
         (printer, result)
     }

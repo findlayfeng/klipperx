@@ -62,17 +62,18 @@ mod tests {
     use super::*;
     use crate::core::klippy::api::registry::Api;
     use crate::core::klippy::api::test_support::{context, silent_target, FixedStatus};
+    use crate::core::klippy::reactor::ManualReactor;
     use serde_json::json;
 
     #[test]
     fn test_the_endpoint_path_is_the_documented_one() {
-        let printer = Arc::new(Printer::new());
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
         assert_eq!(ObjectsList::new(printer).path(), "objects/list");
     }
 
     #[test]
     fn test_a_printer_with_no_parts_lists_nothing() {
-        let printer = Arc::new(Printer::new());
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
         let request = Request::parse(br#"{"method":"objects/list"}"#).unwrap();
         let api = Api::new();
 
@@ -87,7 +88,7 @@ mod tests {
 
     #[test]
     fn test_the_list_is_in_registration_order() {
-        let printer = Arc::new(Printer::new());
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
         for name in ["webhooks", "extruder", "heater_bed", "toolhead"] {
             printer
                 .add_object(name, Arc::new(FixedStatus(json!({}))))
@@ -108,7 +109,7 @@ mod tests {
 
     #[test]
     fn test_the_endpoint_takes_no_parameters() {
-        let printer = Arc::new(Printer::new());
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
         // A client sending junk is not rejected: upstream's handler reads no
         // parameter, so there is nothing to validate.
         let request = Request::parse(br#"{"method":"objects/list","params":{"x":1}}"#).unwrap();
@@ -121,7 +122,7 @@ mod tests {
 
     #[test]
     fn test_the_registry_reaches_the_endpoint_by_path() {
-        let printer = Arc::new(Printer::new());
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
         printer
             .add_object("extruder", Arc::new(FixedStatus(json!({}))))
             .unwrap();

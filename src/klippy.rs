@@ -7,6 +7,7 @@ use tracing::{debug, info, warn};
 use crate::core::klippy::api::{self, AddressError, Api, ApiTarget, Server, StartArgs};
 use crate::core::klippy::config::Config;
 use crate::core::klippy::printer::Printer;
+use crate::core::klippy::reactor::TokioReactor;
 
 /// What the host is, in one line.
 ///
@@ -150,8 +151,12 @@ pub fn run(
     runtime.block_on(async move {
         // The machine, built before anything is served: the endpoint table is
         // registered and then the config's objects are loaded, so that a client
-        // never observes a half-built table or a half-built machine.
-        let printer = Arc::new(Printer::new());
+        // never observes a half-built table or a half-built machine. Its reactor
+        // is this runtime — timers are tokio tasks, and the clock is tokio's, so
+        // nothing here builds a second event loop.
+        let printer = Arc::new(Printer::new(Arc::new(TokioReactor::new(
+            tokio::runtime::Handle::current(),
+        ))));
 
         // The server's own object (`webhooks`) and the endpoints come first, so
         // that `objects/list` starts with `webhooks` as upstream's does

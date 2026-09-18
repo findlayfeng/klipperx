@@ -16,6 +16,7 @@ pub mod load;
 pub mod mcu;
 pub mod msg;
 pub mod printer;
+pub mod reactor;
 // pub mod toolhead;
 
 // Client-facing API over the Unix Domain Socket
@@ -30,6 +31,7 @@ pub use interface::{HostDevice, Interface, SerialDevice};
 pub use msg::proto::Payload;
 pub use msg::Msg;
 pub use printer::{Printer, PrinterEvent, PrinterState, StateMessage};
+pub use reactor::{ManualReactor, Reactor, TimerCallback, TimerHandle, TokioReactor};
 // pub use interface::canbus::CanbusInterface;
 // pub use mcu::{MCU, McuError, McuPin, PinParams};
 // pub use mcu::{add_printer_objects, get_printer_mcu};

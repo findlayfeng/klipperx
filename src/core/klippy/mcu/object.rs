@@ -147,6 +147,7 @@ mod tests {
     use super::*;
     use crate::core::klippy::interface::test::TestDevice;
     use crate::core::klippy::interface::Interface;
+    use crate::core::klippy::reactor::ManualReactor;
 
     fn section(sub: Option<&str>) -> ConfigSection {
         ConfigSection::new("mcu", sub)
@@ -213,7 +214,7 @@ mod tests {
 
     #[test]
     fn test_the_loader_builds_an_object_from_the_section() {
-        let printer = Arc::new(Printer::new());
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
 
         let object = load_config(&section(Some("zboard")), &printer).unwrap();
 

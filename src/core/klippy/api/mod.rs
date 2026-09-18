@@ -144,6 +144,7 @@ impl std::error::Error for RegistrationError {
 mod tests {
     use super::*;
     use crate::core::klippy::api::test_support::silent_target;
+    use crate::core::klippy::reactor::ManualReactor;
     use serde_json::json;
 
     fn request(body: &str) -> klippy_api::Request {
@@ -157,7 +158,7 @@ mod tests {
 
     #[test]
     fn test_registering_installs_the_servers_object_and_its_endpoints() {
-        let printer = Arc::new(Printer::new());
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
         let mut api = Api::new();
 
         register(&mut api, &printer, start_args()).unwrap();
@@ -171,7 +172,7 @@ mod tests {
 
     #[test]
     fn test_a_client_can_reach_info_through_the_registry() {
-        let printer = Arc::new(Printer::new());
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
         let mut api = Api::new();
         register(&mut api, &printer, start_args()).unwrap();
 
@@ -185,7 +186,7 @@ mod tests {
 
     #[test]
     fn test_a_client_can_follow_the_state_through_the_registered_object() {
-        let printer = Arc::new(Printer::new());
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
         let mut api = Api::new();
         register(&mut api, &printer, start_args()).unwrap();
 
@@ -216,7 +217,7 @@ mod tests {
 
     #[test]
     fn test_registering_twice_is_a_wiring_mistake_not_a_client_error() {
-        let printer = Arc::new(Printer::new());
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
         let mut api = Api::new();
         register(&mut api, &printer, start_args()).unwrap();
 

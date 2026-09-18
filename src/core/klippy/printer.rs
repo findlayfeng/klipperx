@@ -8,10 +8,14 @@
 // after a restart are the host's, not the machine's.
 //
 // The machine has a registry of parts and a two-phase lifecycle: objects are
-// built and registered, then connected, then the printer idles until something
-// asks it to exit. No part is loaded from the config into it yet — that is the
-// config-driven loading layer — so it still runs empty; the parts arrive with
-// their layers.
+// built and registered (the config-driven loader does that — see `load.rs`),
+// then connected, then the printer idles until something asks it to exit. The
+// machine has no parts of its own: the API server's `webhooks` is the host's,
+// and the rest come from the config.
+//
+// Time comes from a reactor (`reactor.rs`), which the machine is handed rather
+// than builds: a printer does not own a runtime, so whoever brings it up chooses
+// what drives timers and what the clock reads.
 //
 // This module defines:
 // - `PrinterState`: printer state categories
@@ -23,12 +27,12 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
-use std::time::Instant;
 
 use serde_json::Value;
 use tracing::error;
 
 use crate::core::klippy::error::KlippyError;
+use crate::core::klippy::reactor::Reactor;
 
 // ===========================================================================
 // PrinterState
@@ -186,8 +190,11 @@ pub struct Printer {
     inner: Mutex<Inner>,
     /// Paired with `inner`, to wake the run loop when an exit is requested.
     exit_requested: Condvar,
-    /// What status queries are dated from.
-    started: Instant,
+    /// What status queries are dated from, and what timers are scheduled on.
+    ///
+    /// The machine is handed this rather than building one: a printer does not
+    /// own a runtime, so the host decides what drives time (see `reactor.rs`).
+    reactor: Arc<dyn Reactor>,
     /// The machine's parts, in registration order.
     ///
     /// Empty until a part registers itself: the machine has none of its own,
@@ -211,12 +218,18 @@ struct Inner {
 impl Printer {
     /// Create a printer that has not come up yet, with no parts registered.
     ///
+    /// The reactor is taken rather than built so that the machine has no
+    /// runtime of its own: the host passes one over the runtime it already
+    /// runs ([`TokioReactor`](crate::core::klippy::reactor::TokioReactor)), and
+    /// a test passes one it can step by hand
+    /// ([`ManualReactor`](crate::core::klippy::reactor::ManualReactor)).
+    ///
     /// Nothing reports status until a part registers itself — and the first one
     /// to do so is the host's API server, with the `webhooks` object upstream
     /// registers in `Printer.__init__`. A client cannot be connected before
     /// that: the host registers the server's objects and endpoints before it
     /// binds the socket.
-    pub fn new() -> Self {
+    pub fn new(reactor: Arc<dyn Reactor>) -> Self {
         Self {
             inner: Mutex::new(Inner {
                 message: MESSAGE_STARTUP.to_string(),
@@ -226,19 +239,28 @@ impl Printer {
                 handlers: HashMap::new(),
             }),
             exit_requested: Condvar::new(),
-            started: Instant::now(),
+            reactor,
             objects: Mutex::new(Vec::new()),
         }
     }
 
-    /// Seconds since the printer was built, the clock status is dated with.
+    /// The reactor this printer was built with.
+    ///
+    /// Upstream's `get_reactor`: objects ask the printer for it to schedule a
+    /// timer (121 call sites there), and it is the same clock
+    /// [`Printer::eventtime`] reports.
+    pub fn reactor(&self) -> Arc<dyn Reactor> {
+        Arc::clone(&self.reactor)
+    }
+
+    /// Seconds since the reactor was built, the clock status is dated with.
     ///
     /// Monotonic and near zero at startup, which is what a client needs to tell
-    /// one report from the next. Upstream reads the reactor's clock here; the
-    /// reactor arrives with the run loop (see the `TODO`s), and this stands in
-    /// for it until then.
+    /// one report from the next. This is the reactor's `monotonic()`
+    /// (`klippy/reactor.py:111`), read through the one clock the machine has;
+    /// the machine keeps no time of its own.
     pub fn eventtime(&self) -> f64 {
-        self.started.elapsed().as_secs_f64()
+        self.reactor.monotonic()
     }
 
     /// Register a part of the machine.
@@ -496,11 +518,9 @@ impl Printer {
     }
 }
 
-impl Default for Printer {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+// A `Default` implementation is deliberately absent: building a printer means
+// choosing what drives its clock, and a type that picked one for the caller
+// would be hiding the runtime it promised not to depend on.
 
 // ===========================================================================
 // Tests
@@ -509,9 +529,18 @@ impl Default for Printer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::klippy::reactor::ManualReactor;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
     use std::thread;
+
+    /// A printer on a clock the test controls.
+    ///
+    /// No runtime: the machine's tests exercise the lifecycle, not timers, and
+    /// a reactor the test can step is deterministic when one is added.
+    fn new_printer() -> Printer {
+        Printer::new(Arc::new(ManualReactor::new()))
+    }
 
     /// Register a handler that records the event name it was called for.
     fn record(printer: &Printer, event: PrinterEvent, log: &Arc<Mutex<Vec<&'static str>>>) {
@@ -545,7 +574,7 @@ mod tests {
 
     #[test]
     fn test_a_new_printer_is_starting_up() {
-        let printer = Printer::new();
+        let printer = new_printer();
 
         let state = printer.get_state_message();
         assert_eq!(state.message, MESSAGE_STARTUP);
@@ -554,7 +583,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_bring_up_comes_up_ready_and_reports_it() {
-        let printer = Printer::new();
+        let printer = new_printer();
         let ready = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&ready);
         printer.register_event_handler(
@@ -574,7 +603,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_the_lifecycle_events_fire_in_order() {
-        let printer = Printer::new();
+        let printer = new_printer();
         let log = Arc::new(Mutex::new(Vec::new()));
         for event in [
             PrinterEvent::Connect,
@@ -602,7 +631,7 @@ mod tests {
 
     #[test]
     fn test_handlers_run_in_registration_order() {
-        let printer = Printer::new();
+        let printer = new_printer();
         let order = Arc::new(Mutex::new(Vec::new()));
         for name in ["first", "second"] {
             let order = Arc::clone(&order);
@@ -619,7 +648,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_run_waits_for_an_exit_request_from_another_thread() {
-        let printer = Arc::new(Printer::new());
+        let printer = Arc::new(new_printer());
         printer.bring_up().await;
         assert_eq!(printer.get_state_message().category, PrinterState::Ready);
 
@@ -643,7 +672,7 @@ mod tests {
 
     #[test]
     fn test_a_printer_asked_to_exit_before_it_ran_does_not_wait() {
-        let printer = Printer::new();
+        let printer = new_printer();
         printer.request_exit("error_exit");
 
         assert_eq!(printer.run(), "error_exit");
@@ -651,7 +680,7 @@ mod tests {
 
     #[test]
     fn test_the_first_exit_result_stands() {
-        let printer = Printer::new();
+        let printer = new_printer();
         printer.request_exit("exit");
         printer.request_exit("firmware_restart");
 
@@ -660,7 +689,7 @@ mod tests {
 
     #[test]
     fn test_invoke_shutdown_halts_the_printer_and_fires_the_event() {
-        let printer = Printer::new();
+        let printer = new_printer();
         let halts = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&halts);
         printer.register_event_handler(
@@ -680,7 +709,7 @@ mod tests {
 
     #[test]
     fn test_only_the_first_shutdown_message_is_reported() {
-        let printer = Printer::new();
+        let printer = new_printer();
         printer.invoke_shutdown("Printer is halted");
         printer.invoke_shutdown("something else went wrong");
 
@@ -689,7 +718,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_a_printer_that_shut_down_before_it_ran_never_becomes_ready() {
-        let printer = Printer::new();
+        let printer = new_printer();
         printer.invoke_shutdown("Printer is halted");
         printer.request_exit("exit");
 
@@ -729,7 +758,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_bring_up_connects_the_objects_in_registration_order() {
-        let printer = Printer::new();
+        let printer = new_printer();
         let log = Arc::new(Mutex::new(Vec::new()));
         for name in ["first", "second"] {
             printer
@@ -752,7 +781,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_an_object_that_fails_to_connect_halts_the_printer() {
-        let printer = Printer::new();
+        let printer = new_printer();
         printer
             .add_object(
                 "broken",
@@ -773,7 +802,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_a_printer_that_shut_down_does_not_connect_its_objects() {
-        let printer = Printer::new();
+        let printer = new_printer();
         let log = Arc::new(Mutex::new(Vec::new()));
         printer
             .add_object(
@@ -809,7 +838,7 @@ mod tests {
     fn test_a_new_printer_has_no_objects() {
         // The machine has no parts yet, and the first object a host registers —
         // the API server's `webhooks` — is the host's, not the machine's.
-        let printer = Printer::new();
+        let printer = new_printer();
 
         assert_eq!(printer.objects(), Vec::<String>::new());
         assert!(printer.lookup_object("webhooks").is_none());
@@ -818,7 +847,7 @@ mod tests {
 
     #[test]
     fn test_objects_come_back_in_registration_order() {
-        let printer = Printer::new();
+        let printer = new_printer();
         for name in ["webhooks", "extruder", "heater_bed"] {
             printer
                 .add_object(name, Arc::new(Fixed(serde_json::json!({}))))
@@ -830,7 +859,7 @@ mod tests {
 
     #[test]
     fn test_a_registered_object_can_be_looked_up_by_name() {
-        let printer = Printer::new();
+        let printer = new_printer();
         printer
             .add_object(
                 "webhooks",
@@ -849,7 +878,7 @@ mod tests {
 
     #[test]
     fn test_a_duplicate_object_is_rejected() {
-        let printer = Printer::new();
+        let printer = new_printer();
         printer
             .add_object(
                 "webhooks",
@@ -874,14 +903,14 @@ mod tests {
 
     #[test]
     fn test_an_unregistered_object_has_no_status() {
-        let printer = Printer::new();
+        let printer = new_printer();
 
         assert_eq!(printer.status_of("nope", printer.eventtime()), None);
     }
 
     #[test]
     fn test_status_queries_are_handed_the_object_that_was_asked_for() {
-        let printer = Printer::new();
+        let printer = new_printer();
         printer
             .add_object("echo", Arc::new(Fixed(serde_json::json!({"who": "echo"}))))
             .unwrap();
@@ -899,14 +928,31 @@ mod tests {
     }
 
     #[test]
-    fn test_eventtime_is_monotonic_and_starts_near_zero() {
-        let printer = Printer::new();
+    fn test_eventtime_is_the_reactors_clock() {
+        // The machine keeps no clock of its own: `eventtime` is whatever the
+        // reactor it was handed reads, which is what makes a fake reactor a
+        // complete fake of time.
+        let manual = Arc::new(ManualReactor::new());
+        let printer = Printer::new(manual.clone());
 
         let first = printer.eventtime();
-        thread::sleep(std::time::Duration::from_millis(5));
-        let second = printer.eventtime();
+        assert_eq!(first, 0.0);
 
-        assert!((0.0..1.0).contains(&first), "{first}");
+        manual.advance(1.5);
+        let second = printer.eventtime();
+        assert_eq!(second, 1.5);
         assert!(second > first, "{second} <= {first}");
+    }
+
+    #[test]
+    fn test_the_printer_hands_back_the_reactor_it_was_built_with() {
+        let manual = Arc::new(ManualReactor::new());
+        let printer = Printer::new(manual.clone());
+
+        assert_eq!(printer.reactor().monotonic(), printer.eventtime());
+
+        manual.advance(2.0);
+
+        assert_eq!(printer.reactor().monotonic(), 2.0);
     }
 }

@@ -65,6 +65,17 @@ cargo test --lib test_install_skips   # 单个用例（按名过滤）
 | `mod.rs` | `Mcu::bind_event` 端到端投递（绑定的回调经 `Parser` 回调收到事件帧）、握手前 `NotIdentified`、字典缺失报 `UnknownMessage`、占位日志订阅可绑定 |
 | `stats.rs` | `stats` 事件按名解码（`count` / `sum` / `sumsq`）、参数类型不符报 `Decode` |
 
+### `api`
+
+**不需要 socket**：`ClientConnection::receive` 直接吃字节，推送由实现了 `PushTarget` 的测试替身接住，所以一条「收字节 → 分帧 → 分发 → 排队应答」的链路能在单元测试里跑完。没被覆盖的只有两处 `todo!()`：`Server::run` 与 `info` 的 handler。
+
+| 模块 | 覆盖 |
+|------|------|
+| `protocol.rs` | 分帧（一次读里多条、一条被拆成多次读、前导分隔符产生的空消息）、`encode` 的分隔符结尾；请求解析（`id` 缺失与为 `null` 均视为不要应答、非对象 / 无 `method` / `params` 非对象一律拒绝、非字符串 `id` 原样保留）；应答形状（result / error、无 `id` 时失败也静默）；`Params` 区分缺失与类型错、整数可作浮点而浮点不可作整数、`true` 不是整数、`get_or` 不检查默认值；模板合并（`params` 冲突时模板优先，同上游）、模板可省略且类型受检 |
+| `registry.rs` | 路径唯一（普通端点与 mux 路径同一命名空间）、mux 各实例的 key 必须一致且 value 不重复、`list_endpoints` 排序并含 mux 路径、按名分发与未知方法报错、端点拿得到自己的连接、mux 按 key 选实例 / 缺 key / 未知值 / 非字符串值、注册 `None` 时 key 可省略；remote method 的模板合并推送、多连接、重复注册替换模板、已断开连接被清理、无活动连接与未注册两种错误 |
+| `server.rs` | 一条请求一条应答、未知方法回 `error`、handler 失败回 `error`、无 `id` 的请求分发但不应答、一次读里多条按序应答、跨读拆分的消息只应答一次、畸形消息被跳过而连接继续可用、推送与应答同样入队、连接关闭后不再入队、发出字节以分隔符结尾 |
+| `endpoints/info.rs` | 端点路径、`client_info` 可省略且必须是对象、响应 12 个字段与文档逐个对齐、`log_file` 为 `None` 时是 `null` 而非缺字段、响应不回显 `client_info`（handler 体是 `todo!()`，所以只测定义） |
+
 ### 帧与字节流
 
 | 模块 | 覆盖 |
@@ -93,9 +104,9 @@ cargo test --lib test_install_skips   # 单个用例（按名过滤）
 
 ## 文档同步
 
-改动 `msg` / `mcu` / `cmd` / `identify` 的公开 API 或分层职责时，请同时更新本手册对应页面（见 [开发手册首页](README.md) 的目录）。
+改动 `msg` / `mcu` / `cmd` / `event` / `identify` / `api` 的公开 API 或分层职责时，请同时更新本手册对应页面（见 [开发手册首页](README.md) 的目录）。
 
-`cargo doc --no-deps --lib` 的警告数应与改动前一致（目前库里已有 10 条残留于 `frame.rs` / `kinematics` / `msg/parser.rs` / `traits.rs`）。新增模块时注意两个陷阱：
+`cargo doc --no-deps --lib` 的警告数应与改动前一致（目前库里已有 10 条残留于 `frame.rs` / `kinematics` / `msg/parser.rs` / `printer.rs`）。新增模块时注意两个陷阱：
 
 1. **模块的文档链接是在它的 `mod` 声明所在作用域里解析的**，不是在被声明模块自己的作用域里。`klippy/mod.rs` 里的 `pub mod …;` 因此都不带 `///` 文档。
 2. **把私有模块提升为 `pub mod` 会激活它的公开文档检查**：模块文档里指向 `pub(crate)` 项的链接会报 `links to private item`。`identify` 从 `mcu` 的子模块提升为顶层公开模块时就遇到这一点，需要把这类链接改成纯代码 span。

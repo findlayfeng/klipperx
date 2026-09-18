@@ -138,6 +138,7 @@ klipperx（bin，src/main.rs）
 | 文件 | 职责 |
 |------|------|
 | `mod.rs` | `Mcu`：构造（`new`）、收发任务、`send` / `call`、字典安装与查询、`Drop`；构造时向 `identify` 取起始 `Parser`，本身不引用任何命令 |
+| `object.rs` | `McuObject`：`[mcu]` / `[mcu <name>]` 作为打印机对象，以及工厂 `load_config` / `load_config_prefix`。section 只在 `PrinterObject::connect` 时才解析、开设备、跑 identify，`get_status` 报 identify 快照 |
 | `dictionary.rs` | `Dictionary`：解析固件字典、枚举展开、安装进 `Parser` |
 | `pending.rs` | `PendingCalls`：同步请求/响应记账 |
 | `error.rs` | `McuError`（总括）、`McuCallError`（`call` 专用） |

@@ -21,11 +21,13 @@
 
 mod dictionary;
 mod error;
+mod object;
 mod pending;
 mod restart_method;
 
 pub use dictionary::{Dictionary, Enumeration, MessageDef, OutputDef};
 pub use error::{McuCallError, McuError};
+pub use object::{load_config, load_config_prefix, McuObject};
 pub use restart_method::McuRestartMethod;
 
 use crate::core::klippy::config::mcu::McuConfig;

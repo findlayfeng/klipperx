@@ -15,14 +15,20 @@ runtime、重启循环）是它上面的一层。
   上游证据：`klippy/toolhead.py:242` 是唯一装载点，`Printer` 类不知道 kinematics。
 - **MCU 一侧的分层已定**：`msg → mcu → cmd`，`event` / `identify` 平级
   （`docs/klippy/developer-manual/architecture.md`、`README.md` 的分层表）。
+- **上线（bring-up）是机器的，executor 是调用方的**：`PrinterObject::connect()` 返回
+  一个 boxed `Future`（`std::future::Future`，不是 tokio 的），`Printer::bring_up()` 是
+  async，同步的 `run()` 只等退出。机器因此不依赖任何 runtime，谁驱动 `bring_up` 谁带
+  executor。上游的 `klippy:connect` handler 在这里被 `connect()` 方法取代，事件留给
+  观察者。
 - **客户端 API 的线形状**以 `docs/klippy/third-party-dev/api-reference.md` 为准。
 
 ## 待办
 
 ### T1 printer object：先做「状态表」，不做「服务定位器」
 
-- [x] `name -> Arc<dyn StatusSource>`（`get_status(eventtime) -> Value`）在 `Printer` 上：
-      `add_status_object` / `status_objects` / `status_of`（`src/core/klippy/printer.rs`）。
+- [x] 对象表在 `Printer` 上：`add_object` / `objects` / `lookup_object` / `status_of`
+      （`src/core/klippy/printer.rs`）。早先的 `StatusSource` 已收敛为 `PrinterObject`
+      （`get_status` 之外多一个 `connect()`，见「已定」一节）。
 - [x] `objects/list` 与 `objects/query`（`src/core/klippy/api/endpoints/objects_{list,query}.rs`）：
       上游的三个可见行为都对齐 —— 未知对象回 `{}` 而不是报错、不存在的字段回 `null`、
       `null` 字段列表取全部；`objects` 参数的三类错误文本也一致（`Invalid argument`）。
@@ -40,10 +46,14 @@ runtime、重启循环）是它上面的一层。
       socket），配置里的一切 `configfile` / `mcu*` / `toolhead` 都是之后才登的 ——
       所以「连上了就一定有 `webhooks`」这条保证靠的是顺序，不是占位对象）。
       注册先于 bind 这条只能靠代码结构保证，单测只能锁住注册函数的效果。
-- [ ] `[mcu]` 作为住户：**卡在 T2**。上游 `mcu.get_status` 报的是 identify 的
-      `mcu_version` / `mcu_build_versions` / `mcu_constants` 加 `last_stats`
-      （`klippy/mcu.py:922-975`），而这些要 MCU 连上（有字典）之后才有；
-      `config/mcu.rs` 只给传输配置，不是上游那个 status。等 T2 连 MCU 时一并加。
+      装载侧已经就绪：`load::load_config(&config, &printer)` 与 `Printer::bring_up()`
+      都写好了，主机按「load → register → bind → bring_up → run」串起来即可（见 T2）。
+- [x] `[mcu]` 作为住户：`mcu::object::McuObject`（`src/core/klippy/mcu/object.rs`）。
+      由 `load::load_config` 从 `[mcu]` / `[mcu <name>]` 建出并登记（注册键是 section
+      identifier，自己的名字是去掉 `mcu ` 前缀的 sub —— `klippy/mcu.py:1151-1153`）；
+      section 的解析与设备打开放在 `PrinterObject::connect` 里，`get_status` 报 identify 的
+      `mcu_version` / `mcu_build_versions` / `mcu_constants`（`klippy/mcu.py:938-948`）。
+      `last_stats` 仍未报：stats 事件目前只打日志（`event/stats.rs`）。
 - [ ] `objects/subscribe`：0.25s 轮询 + `response_template`（`klippy/webhooks.py:490-560`），
       推送走已有的 `PushTarget`。它需要一个定时器（T3）与「只推变化」的比对（上游
       用全局 `last_query` 与每个订阅自己的字段表），所以跟在 T3 后面做。
@@ -52,6 +62,9 @@ runtime、重启循环）是它上面的一层。
 
 - [ ] `src/klippy.rs::klippy_process` 现在只有一个 `ctrl_c`：改成「建机器 → 起 runtime →
       跑机器 → 按结果重启或退出」的循环（上游 `klippy/klippy.py:355` 的 `while 1`）。
+      装载与上线都已就绪：`load::load_config(&config, &printer)` 之后
+      `printer.bring_up().await`，再把同步的 `printer.run()` 交给 `spawn_blocking`；
+      `ctrl_c` 要接到当前那台机器的 `request_exit("exit")`。
 - [ ] `api → printer` 这条边：`objects/*` 与 `webhooks` 已经写好在 `api::register` 一处，
       主机建出 `Printer` 后在 **bind 之前**调它即可（顺序要求见 T1 最后一条未完成项）；
       `info` 的 handler 还是 `todo!()`（`src/core/klippy/api/endpoints/info.rs`），
@@ -63,8 +76,8 @@ runtime、重启循环）是它上面的一层。
 
 - [ ] 机器需要一个定时器/延后回调接口（上游 `get_reactor()` 110 处），但 `Printer`
       与单测不该被拖着起 tokio。先定一个最小 trait（`call_later`、`register_callback`）。
-- [ ] `Printer::run()` 目前是同步阻塞（`src/core/klippy/printer.rs` 用 `Condvar` 等
-      `request_exit`）；接上 runtime 后决定：async run / 内部 `block_on` / 主机只 spawn。
+- [x] `run()` 的形态已定（T5 顺带解决）：`bring_up()` 是 async，`run()` 保持同步只等
+      退出，机器只用 `std::future::Future`、不起 tokio。reactor 抽象本身仍未做。
 
 ### T4 toolhead 与 kinematics（kinematics 已删，从这里重新开始）
 
@@ -83,15 +96,22 @@ runtime、重启循环）是它上面的一层。
 - [ ] step 生成层的运动学（上游 `rail.setup_itersolve('cartesian_stepper_alloc', axis)`、
       `kinematics/kinematic_stepper.py`）在我们这儿还没有对应物，运动规划整个未开始。
 
-### T5 配置驱动装载（推迟到有第二个对象）
+### T5 配置驱动装载
 
-- [ ] 静态工厂表：`section 名 -> fn(&Config, &ConfigSection) -> Result<Arc<dyn PrinterObject>>`，
-      `load_config` / `load_config_prefix` 两条（`klippy/klippy.py:90`、
-      `klippy/extras/temperature_sensor.py:41`）。
-- [ ] 两段式构造：`new` 只登记自己，接线放 connect 阶段（上游靠 `add_printer_objects`
-      分批 + `klippy:connect` 延后），否则互相 lookup 的模块会死锁或拿到半成品。
-- [ ] section 合法性校验：上游 `klippy/configfile.py:429` 直接拿注册表当 schema
-      （`Section 'x' is not a valid config section`）。
+- [x] 静态工厂表：`src/core/klippy/load.rs` 的 `Factories { load_config,
+      load_config_prefix }`，按 section id 索引；`[mcu]` 走前者、`[mcu <name>]` 走后
+      者（上游 `load_config` / `load_config_prefix`，`klippy/klippy.py:90-99`）。
+      顺序是「主 section 在前、前缀 section 在后」，各自按表序。
+- [x] 两段式构造：`PrinterObject::connect()` + `Printer::bring_up()`（对象按注册顺序
+      connect，失败即带原因 halt）。工厂只建对象，设备要到 connect 才打开 ——
+      `McuObject` 存整个 section，`McuConfig::new` 推迟到 connect。
+- [x] section 合法性校验（section 级）：装载后仍未被任何工厂认领的 section 报
+      `Section 'x' is not a valid config section`（`klippy/configfile.py:431`）。
+- [ ] option 级校验：上游拿访问追踪当 schema（`klippy/configfile.py:435-441`），
+      `ConfigSection` 还没有访问记录，未做。
+- [ ] 住户只有 MCU。上游在 `_read_config` 里显式加载的 `pins` / `configfile` /
+      `toolhead` 还没有入口，所以任何真实 printer.cfg 现在都会在未认领的 section 上
+      报错；第二个住户进来时按同一张表补。
 
 ### T6 错误词汇
 
@@ -149,6 +169,8 @@ runtime、重启循环）是它上面的一层。
 | 对象注册表（add / lookup / load） | `klippy/klippy.py:70-113` |
 | `objects/list`、`query`、`subscribe` | `klippy/webhooks.py:480-560` |
 | section 校验用注册表 | `klippy/configfile.py:425-445` |
+| mcu 作为 printer object、它的 status | `klippy/mcu.py:1147-1170`、`:1239-1246`、`:938-975` |
+| 工厂装载 `load_config` / `load_config_prefix` | `klippy/klippy.py:90-113` |
 | kinematics 的装载与接缝 | `klippy/toolhead.py:235-252`、`:389` `:400` `:482` `:507` `:522` |
 | 各 kinematics 的差异 | `klippy/kinematics/*.py`（`home` / `check_move` / `calc_position` / `get_status`） |
 | 通用回零驱动 | `klippy/extras/homing.py:165-300` |

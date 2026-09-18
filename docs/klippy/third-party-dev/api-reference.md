@@ -9,7 +9,7 @@
 - **传输层**：Unix Domain Socket
 - **消息格式**：JSON
 - **消息分隔符**：`\x03` (ASCII ETX)
-- **编码**：`msgspec.json.encode`（优先）/ `json.dumps`（备选），字段间无空格
+- **编码**：JSON（紧凑格式，字段间无空格）
 
 ### 请求格式
 
@@ -35,17 +35,25 @@
 {"id": "<请求id>", "error": {"error": "WebRequestError", "message": "错误信息"}}
 ```
 
-无 id 的请求：
-```json
-{"result": { ... }}
-```
+无 id 的请求（`id` 为 `null` 或省略）：
+
+服务端**不发送任何响应**——收到 `id` 为 `null` 的请求后只执行、不回包。这类请求用于「即发即忘」场景，例如 `gcode/script`、`emergency_stop`；需要结果时应显式传入 `id`。
 
 ### 服务端推送（Subscription）
 
-客户端可以通过 `response_template` 参数订阅服务端推送。服务端推送格式：
+客户端可以通过 `response_template` 参数订阅服务端推送。推送消息由服务端把 `params` 合并进客户端提供的模板生成：`params` 放入 `params` 字段，模板中的其他字段（如 `id`、`method`）原样保留。因此推送格式**完全取决于模板**，服务端不会自动补充 `id`，也不会覆盖模板中的 `method`。推荐模板：
+
+```json
+{"id": null, "method": "<method>"}
+```
+
+合并后即：
+
 ```json
 {"id": null, "method": "<method>", "params": { ... }}
 ```
+
+> 若模板中不含 `method`，推送将不带 `method` 字段。
 
 ---
 
@@ -152,13 +160,15 @@
 | `remote_method` | string | 是 | 远程方法名称 |
 | `response_template` | object | 是 | 推送消息的模板格式 |
 
+> 服务端推送时，消息为 `{"params": {...}}` 与 `response_template` 合并（同 Subscription 机制）。若注册后连接已关闭，服务端会清理该注册；当某方法已无活动连接时，服务端内部调用会报 `No active connections for method '<method>'`。
+
 ---
 
 ## Objects 相关端点
 
 ### 5. `objects/list` — 列出所有可查询对象
 
-获取所有注册了 `get_status()` 方法的打印机对象列表。
+获取所有可查询状态的打印机对象列表。列表随已加载模块动态变化，下列仅为示例：
 
 **请求：**
 ```json
@@ -254,7 +264,9 @@
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | `objects` | object | 是 | 对象名到字段列表的映射 |
-| `response_template` | object | 是 | 推送消息模板 |
+| `response_template` | object | 否 | 推送消息模板，默认 `{}` |
+
+> **注意**：`objects/subscribe` 除了周期推送外，还会**立即把当前状态作为本次请求的响应返回**（等价于一次 `objects/query` 全量查询，所有字段都会返回，不受「仅变化时推送」限制）。
 
 **推送格式：**
 ```json
@@ -280,7 +292,7 @@
 
 ### 8. `gcode/help` — 获取可用 G-Code 命令列表
 
-获取所有注册的 G-Code 命令及其帮助信息。
+获取所有注册的 G-Code 命令及其帮助信息。返回值为扁平的 `{命令名: 帮助文本}` 字典，内容随已加载模块动态变化，下列仅为示例：
 
 **请求：**
 ```json
@@ -311,7 +323,7 @@
 
 ### 9. `gcode/script` — 执行 G-Code 脚本
 
-异步执行 G-Code 脚本（不等待响应）。
+同步解析并执行脚本；命令级错误会立即作为 `error` 返回，但**运动不会被等待完成**。
 
 **请求：**
 ```json
@@ -329,7 +341,7 @@
 
 **响应：** 无参数响应（`{}`）
 
-> **注意**：此方法不等待命令执行完成，也不返回执行结果。如需同步执行，通过 `objects/query` 轮询相关状态。
+> **注意**：脚本会被同步解析并执行，因此**命令级错误是立即返回的**（未知命令、参数错误等会作为 `error` 响应返回）。但**运动不会被等待完成**——移动入队后即返回。如需等待运动结束，通过 `objects/query` 轮询 `toolhead.print_time`、`print_stats.state` 等状态。
 
 ---
 
@@ -378,7 +390,7 @@
 
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
-| `response_template` | object | 是 | 推送消息模板 |
+| `response_template` | object | 否 | 推送消息模板，默认 `{}` |
 
 **推送格式：**
 ```json
@@ -448,13 +460,25 @@
 {"method": "query_endstops/status"}
 ```
 
-**响应：** 无参数响应（`{}`）
+**响应：** 直接返回所有限位开关的当前状态：
 
-> 查询结果可通过 `objects/query` 查询 `query_endstops` 对象的 `last_query` 字段获取：
+```json
+{
+  "endstop_x": "open",
+  "endstop_y": "TRIGGERED",
+  "endstop_z": "open"
+}
+```
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `<endstop_name>` | string | `"open"` 或 `"TRIGGERED"` |
+
+> 查询结果同时缓存在 `query_endstops` 对象的 `last_query` 字段，可通过 `objects/query` 获取：
 > ```json
 > {"objects": {"query_endstops": ["last_query"]}}
 > ```
-> 返回格式：`{"last_query": {"endstop_x": true, "endstop_y": false, ...}}`
+> 返回格式：`{"last_query": {"endstop_x": 0, "endstop_y": 1}}`。注意 `last_query` 的值是限位开关的原始电平（`0` / `1` **整数**），与端点响应中的字符串不同。
 
 ---
 
@@ -467,28 +491,71 @@
 {"method": "bed_mesh/dump_mesh"}
 ```
 
-**响应：** 无参数响应（`{}`）
+**响应：** 返回当前网格、所有已保存 profile 以及可选的标定数据：
 
-> 网格数据可通过 `objects/query` 查询 `bed_mesh` 对象获取：
+```json
+{
+  "current_mesh": {
+    "name": "default",
+    "probed_matrix": [[0.1, 0.0], [0.0, -0.1]],
+    "mesh_matrix": [[0.1, 0.0], [0.0, -0.1]],
+    "mesh_params": { ... }
+  },
+  "profiles": { "default": { ... } },
+  "calibration": { ... }
+}
+```
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `mesh_args` | object | 否 | 传入时额外返回 `calibration` 字段（手动探测参数） |
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `current_mesh` | object | 当前激活网格；未探测时为 `{}` |
+| `profiles` | object | 所有已保存的 profile |
+| `calibration` | object | 仅在传入 `mesh_args` 时存在 |
+
+> 运行期状态也可通过 `objects/query` 查询 `bed_mesh` 对象：
 > ```json
-> {"objects": {"bed_mesh": ["mesh_max", "mesh_min", "probed_matrix", "mesh", "profile_name"]}}
+> {"objects": {"bed_mesh": ["mesh_max", "mesh_min", "probed_matrix", "mesh_matrix", "profile_name", "profiles"]}}
 > ```
 
 ---
 
-## Bulk Sensor 相关端点（多路复用）
+## Bulk Sensor / 数据转储相关端点（多路复用）
 
-以下端点使用 mux 机制，通过路径中的 `key` 参数区分不同实例。
+以下端点使用 mux 机制：同一条路径可以为多个实例注册，调用时通过**普通请求参数**（非路径参数）指定实例名。例如：
 
-### 18. `sensor_bulk_data/{sensor_type}` — 批量传感器数据
+- 路径 `adxl345/dump_adxl345` 的 key 为 `sensor`，因此需传 `"sensor": "adxl345"`
+- 路径 `motion_report/dump_stepper` 的 key 为 `name`，因此需传 `"name": "stepper_x"`
 
-用于批量传感器（bulk sensor）数据订阅，如振动传感器等。
+若该 key 下注册了默认实例（其取值为 `null`），则该参数可省略；否则缺失或取值非法会报错。
 
-**请求：**
+### 18. 数据转储端点一览
+
+| 端点路径 | mux key | 典型 value | 说明 |
+|----------|---------|-----------|------|
+| `adxl345/dump_adxl345` | `sensor` | 配置节名，如 `adxl345` | ADXL345 加速度数据 |
+| `angle/dump_angle` | `sensor` | 配置节名，如 `my_angle` | 磁编码角度传感器数据 |
+| `bmi160/dump_bmi160` | `sensor` | 配置节名 | BMI160 加速度数据 |
+| `icm20948/dump_icm20948` | `sensor` | 配置节名 | ICM20948 加速度数据 |
+| `ldc1612/dump_ldc1612` | `sensor` | 配置节名 | LDC1612 涡流传感器数据 |
+| `lis2dw/dump_lis2dw` | `sensor` | 配置节名 | LIS2DW 加速度数据 |
+| `mpu9250/dump_mpu9250` | `sensor` | 配置节名 | MPU9250 加速度数据 |
+| `motion_report/dump_stepper` | `name` | 步进电机名 | 步进脉冲时间戳 |
+| `motion_report/dump_trapq` | `name` | trapq 名 | 梯形运动队列 |
+| `tmc/stallguard_dump` | `name` | 步进电机名 | TMC StallGuard 数据 |
+| `load_cell/dump_force` | `load_cell` | load cell 名 | 称重传感器采样流 |
+| `load_cell_probe/dump_taps` | `load_cell_probe` | 名称 | 探针敲击事件 |
+
+**请求示例（订阅 ADXL345 数据）：**
+
 ```json
 {
-  "method": "sensor_bulk_data/adxl345",
+  "method": "adxl345/dump_adxl345",
   "params": {
+    "sensor": "adxl345",
     "response_template": {
       "id": null,
       "method": "sensor:bulk_data"
@@ -499,35 +566,35 @@
 
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
-| `sensor_type` | string | 是 | 传感器名称（路径参数） |
-| `response_template` | object | 是 | 推送消息模板 |
+| `<key>` | string | 视注册情况 | 实例名（如 `sensor` / `name` / `load_cell`），见上表 |
+| `response_template` | object | 否 | 推送消息模板，默认 `{}` |
 
----
+**响应（同步）：** 本次请求会立即返回数据头（header），供客户端解析后续二进制/数组数据：
 
-## Load Cell 相关端点（多路复用）
+```json
+{"header": ["time", "x_acceleration", "y_acceleration", "z_acceleration"]}
+```
 
-### 19. `load_cell/{load_cell_name}/...` — 称重传感器操作
+**推送：** 每个批次以 `params` 推送：
 
-用于 load cell 称重传感器的数据订阅。
-
-**请求：**
 ```json
 {
-  "method": "load_cell/my_loadcell",
+  "method": "sensor:bulk_data",
   "params": {
-    "response_template": {
-      "id": null,
-      "method": "load_cell:data"
-    }
+    "data": [[...], [...]],
+    "errors": 0,
+    "overflows": 0
   }
 }
 ```
+
+> `params` 的具体键由各个传感器决定（常见为 `data` / `errors` / `overflows` / `interval` / `count`）。客户端应使用同步响应里的 `header` 来解析 `data`。
 
 ---
 
 ## 打印机对象状态说明
 
-以下对象注册了 `get_status(eventtime)` 方法，可通过 `objects/query` 或 `objects/subscribe` 获取状态：
+以下打印机对象提供状态信息，可通过 `objects/query` 或 `objects/subscribe` 获取：
 
 ### `toolhead`
 
@@ -542,7 +609,11 @@
 | `max_accel` | float | 最大加速度（mm/s²） |
 | `minimum_cruise_ratio` | float | 最小巡航比例 |
 | `square_corner_velocity` | float | 方角速度（mm/s） |
-| `extra_axes` | object | 额外轴映射 `{轴名: 索引}` |
+| `extra_axes_status` | object | 额外轴映射 `{轴名: 索引}` |
+| `homed_axes` | string | 已归位轴组成的字符串，如 `"xyz"`（来自运动学） |
+| `axis_minimum` | Coord | 运动学最小坐标（来自运动学） |
+| `axis_maximum` | Coord | 运动学最大坐标（来自运动学） |
+| `cone_start_z` | float | 仅 delta 运动学额外提供 |
 
 ### `webhooks`
 
@@ -566,7 +637,10 @@
 | `speed` | float | 当前速度（mm/s） |
 | `speed_factor` | float | 速度系数（默认 1.0） |
 | `extrude_factor` | float | 挤出系数（默认 1.0） |
-| `last_position` | Coord | 上次位置 `[x, y, z, e]` |
+| `position` | Coord | 上次设置的位置 `[x, y, z, e]` |
+| `gcode_position` | Coord | 含着所有偏移后的当前 G-Code 坐标 |
+| `homing_origin` | Coord | 归位原点偏移（`SET_GCODE_OFFSET` 的结果） |
+| `axis_map` | array | 轴映射，元素为 `[轴字母, 轴索引]` |
 
 ### `configfile`
 
@@ -599,7 +673,7 @@
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | `speed` | float | 风扇转速（0.0 ~ 1.0） |
-| `rpm` | int/null | 风扇转速（RPM），如无测速则为 null |
+| `rpm` | float/null | 风扇转速（RPM），如无测速则为 null |
 
 ### `pause_resume`
 
@@ -615,41 +689,44 @@
 | `total_duration` | float | 总打印时长（秒） |
 | `print_duration` | float | 实际打印时长（秒） |
 | `filament_used` | float | 已使用耗材长度（mm） |
-| `state` | string | 打印状态：`offline` / `printing` / `paused` / `error` / `cancelled` / `completed` |
+| `state` | string | 打印状态：`standby` / `printing` / `paused` / `complete` / `cancelled` / `error` |
 | `message` | string | 状态消息 |
+| `info` | object | 当前/总层数：`{total_layer, current_layer}`（可能为 null） |
 
 ### `bed_mesh`
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| `profile_name` | string | 当前网格配置文件名 |
-| `mesh_max` | Coord | 网格最大坐标 `[x, y]` |
+| `profile_name` | string | 当前网格配置文件名（未探测时为空串） |
 | `mesh_min` | Coord | 网格最小坐标 `[x, y]` |
+| `mesh_max` | Coord | 网格最大坐标 `[x, y]` |
 | `probed_matrix` | array | 实测 Z 值矩阵 |
-| `mesh` | array | 插值后 Z 值矩阵 |
-| `z_mesh` | bool/null | 是否启用网格补偿 |
-| `fade_start` | float | Fade 起始 Z 值 |
-| `fade_end` | float | Fade 结束 Z 值 |
-| `fade_target` | float/null | Fade 目标 Z 值 |
+| `mesh_matrix` | array | 插值/补偿后 Z 值矩阵 |
+| `profiles` | object | 所有已保存的网格 profile |
 
 ### `query_endstops`
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| `last_query` | object | 上次查询结果 `{endstop_name: value}` |
+| `last_query` | object | 上次查询结果 `{endstop_name: 0 或 1}`（原始电平整数） |
 
 ### `virtual_sdcard`
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| `status` | string | SD 卡状态：`off` / `printing` / `paused` |
-| `file` | string/null | 当前打印文件路径 |
+| `file_path` | string/null | 当前文件路径，未打印时为 null |
+| `progress` | float | 打印进度（0.0 ~ 1.0） |
+| `is_active` | bool | 是否正在从虚拟 SD 卡打印 |
+| `file_position` | int | 当前文件读取位置（字节） |
+| `file_size` | int | 文件总大小（字节） |
 
 ### `idle_timeout`
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| `state` | string | 空闲超时状态：`Ready` / `Idle` / `Timeout` |
+| `state` | string | 空闲超时状态：`Ready` / `Printing` / `Idle` |
+| `printing_time` | float | 本次打印已持续时长（秒），非 `Printing` 状态为 0 |
+| `idle_timeout` | float | 配置的空闲超时时间（秒） |
 
 ---
 
@@ -660,7 +737,7 @@
 ### 运动控制
 | 命令 | 说明 |
 |------|------|
-| `G0` / `G1` | 直线移动（G0 快速，G1 受速度限制） |
+| `G0` / `G1` | 直线移动（Klipper 中两者等价，均受速度限制） |
 | `G2` / `G3` | 圆弧插补（需 `gcode_arcs` 模块） |
 | `G28` | 归位所有轴（可指定 `X` / `Y` / `Z`） |
 | `G90` | 绝对坐标模式 |
@@ -712,18 +789,22 @@
 | `HELP` | 显示可用扩展命令 |
 | `M114` | 获取当前位置 |
 | `M119` | 查询限位开关状态 |
+| `BED_MESH_CALIBRATE` | 执行床面探测并生成网格（`bed_mesh`） |
 | `BED_MESH_CLEAR` | 清除床面网格 |
-| `BED_MESH_PROFILE` | 加载床面网格配置 |
-| `BED_MESH_ADJUST` | 调整床面网格偏移 |
+| `BED_MESH_PROFILE` | 加载/保存/删除床面网格 profile |
+| `BED_MESH_OFFSET` | 调整床面网格偏移 |
 | `BED_MESH_OUTPUT` | 输出床面网格数据 |
-| `PROBE_CALIBRATE` | 探针校准 |
-| `QUAD_GANTRY_LEVEL` | 四梁水平校准 |
-| `LEVEL_LINERS` / `LEVEL_CORNERS` | 直线/角点调平 |
-| `SCREWS_TILT_ADJUST` | 螺丝倾斜调整 |
-| `INPUT_SHAPER` | 输入整形校准 |
+| `PROBE_CALIBRATE` | 探针校准（`probe`） |
+| `QUAD_GANTRY_LEVEL` | 四梁水平校准（`quad_gantry_level`） |
+| `Z_TILT_ADJUST` | Z 轴倾斜调整（`z_tilt`） |
+| `BED_SCREWS_ADJUST` | 床面螺丝调整（`bed_screws`） |
+| `SCREWS_TILT_CALCULATE` | 螺丝倾斜计算（`screws_tilt_adjust`） |
+| `SHAPER_CALIBRATE` | 输入整形校准（`resonance_tester`） |
 | `QUERY_ENDSTOPS` | 查询限位开关 |
-| `FORCE_MOVE` | 强制移动轴（调试用） |
-| `MANUAL_PROBE` | 手动探测 |
+| `FORCE_MOVE` | 强制移动轴（`force_move`，调试用） |
+| `MANUAL_PROBE` | 手动探测（`manual_probe`） |
+
+> 上表只列出常见命令，实际可用命令以 `gcode/help` 的返回（或 `objects/query` 查询 `gcode.commands`）为准；部分命令需要先启用对应模块（如 `gcode_arcs`、`bed_mesh`、`probe`、`z_tilt`）。
 
 ---
 
@@ -744,10 +825,16 @@
 
 | 错误 | 触发条件 |
 |------|----------|
-| `No registered callback for path` | 请求的端点路径不存在 |
-| `Missing Argument [...]` | 缺少必需的请求参数 |
-| `Invalid Argument Type [...]` | 参数类型不匹配 |
-| `Printer is halted` | 打印机处于 shutdown/error 状态 |
+| `webhooks: No registered callback for path '<path>'` | 请求的端点路径不存在 |
+| `Missing Argument [<name>]` | 缺少必需的请求参数 |
+| `Invalid Argument Type [<name>]` | 参数类型与预期不符 |
+| `Multiple calls to send not allowed` | 同一个请求被重复应答 |
+| `Internal Error on WebRequest: <method>` | 端点处理逻辑抛出预期外的异常；会记录日志并**触发 klippy shutdown** |
+| gcode 层异常文本（如 `Unknown command:"XXX"`、`Must home axis first`） | 命令执行失败或打印机未就绪 |
+
+> 打印机处于 shutdown/error 时的文本（如 `Printer is halted`）出现在 `info` 响应的 `state_message` 字段中，**不是**错误响应。
+
+> 若推送/响应的 JSON 无法序列化，会记录 `json encoding error` 并触发 klippy shutdown。
 
 ---
 
@@ -767,7 +854,8 @@
 
 ```
 1. 发送 {"id": "4", "method": "gcode/script", "params": {"script": "M105"}}
-2. 通过 gcode/subscribe_output 接收 "ok T:200.5"
+2. 通过 gcode/subscribe_output 接收原始输出（M105 返回形如 "T:200.5 /200.0"，
+   经 gcode/script 执行时不会带 "ok " 前缀）
 3. 或通过 objects/query 查询 extruder 温度
 ```
 

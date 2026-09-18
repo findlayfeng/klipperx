@@ -1,6 +1,8 @@
 # Klipperx 开发手册
 
-面向贡献者与模块维护者的技术参考。涵盖消息编解码（`msg`）、MCU 传输与数据字典（`mcu`）、命令层（`cmd`）、事件层（`event`）与 identify 引导（`identify`）的 API 用法、内部结构与设计取舍。
+面向贡献者与模块维护者的技术参考。涵盖消息编解码（`msg`）、MCU 传输与数据字典（`mcu`）、命令层（`cmd`）、事件层（`event`）与 identify 引导（`identify`）的内部结构与设计取舍。
+
+> **第三方 Web API 接口**（G-Code 命令、Webhooks 端点等）参见 [第三方开发手册](../third-party-dev/README.md)。
 
 ## 分层结构
 

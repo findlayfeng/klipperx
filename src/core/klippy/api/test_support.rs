@@ -12,7 +12,7 @@ use serde_json::Value;
 use crate::core::klippy::api::protocol::PushTarget;
 use crate::core::klippy::api::registry::Api;
 use crate::core::klippy::api::EndpointContext;
-use crate::core::klippy::printer::StatusSource;
+use crate::core::klippy::printer::PrinterObject;
 
 /// A connection whose pushes are dropped.
 pub struct SilentTarget;
@@ -30,21 +30,21 @@ pub fn silent_target() -> Arc<dyn PushTarget> {
     Arc::new(SilentTarget)
 }
 
-/// A status source with a fixed status, for tests that need an object whose
-/// answer the test wrote.
+/// An object with a fixed status, for tests that need an object whose answer
+/// the test wrote.
 pub struct FixedStatus(pub Value);
 
-impl StatusSource for FixedStatus {
+impl PrinterObject for FixedStatus {
     fn get_status(&self, _eventtime: f64) -> Value {
         self.0.clone()
     }
 }
 
-/// A status source that echoes the `eventtime` it was asked with, so a test can
+/// An object that echoes the `eventtime` it was asked with, so a test can
 /// check what the endpoint passed down.
 pub struct EchoEventtime;
 
-impl StatusSource for EchoEventtime {
+impl PrinterObject for EchoEventtime {
     fn get_status(&self, eventtime: f64) -> Value {
         serde_json::json!({ "eventtime": eventtime })
     }

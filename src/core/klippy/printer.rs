@@ -7,10 +7,11 @@
 // Starting a process, logging, serving the API, and building the next printer
 // after a restart are the host's, not the machine's.
 //
-// Today the machine has no parts: there are no MCUs, no toolhead, no kinematics
-// and no printer objects, so what is here is a lifecycle and a state machine
-// with nothing to drive. The parts arrive with their layers, and this type
-// grows with them.
+// The machine has a registry of parts and a two-phase lifecycle: objects are
+// built and registered, then connected, then the printer idles until something
+// asks it to exit. No part is loaded from the config into it yet — that is the
+// config-driven loading layer — so it still runs empty; the parts arrive with
+// their layers.
 //
 // This module defines:
 // - `PrinterState`: printer state categories
@@ -19,6 +20,8 @@
 // - `Printer`: the machine
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Instant;
 
@@ -127,26 +130,50 @@ const MESSAGE_STARTUP: &str = "Starting up";
 const MESSAGE_READY: &str = "Printer is ready";
 
 // ===========================================================================
-// StatusSource
+// PrinterObject
 // ===========================================================================
 
-/// A part of the machine that can report its state to a client.
+/// A printer object's connection step, as a future the machine can await.
 ///
-/// Each registered source is one printer object as far as `objects/list`,
-/// `objects/query` and `objects/subscribe` are concerned: its keys are the
-/// fields a client may ask for. Upstream's objects opt in by defining
+/// A boxed future rather than an `async fn` because the machine holds its parts
+/// as `Arc<dyn PrinterObject>`, and an `async fn` in a trait is not
+/// object-safe. Nothing here is tokio's: the type is [`std::future::Future`],
+/// so the machine needs no runtime of its own — whoever drives
+/// [`Printer::bring_up`] brings the executor.
+pub type ConnectFuture<'a> = Pin<Box<dyn Future<Output = Result<(), KlippyError>> + Send + 'a>>;
+
+/// A part of the machine.
+///
+/// One registered object is one printer object as far as `objects/list`,
+/// `objects/query` and `objects/subscribe` are concerned: its status keys are
+/// the fields a client may ask for. Upstream's objects opt in by defining
 /// `get_status(eventtime)`; here the trait is the opt-in, so the machine's
-/// status table holds exactly the objects a client can see.
+/// registry holds exactly the objects a client can see.
 ///
 /// `eventtime` is the printer's monotonic clock ([`Printer::eventtime`]), which
-/// a source may use to date what it reports — upstream passes the reactor's
+/// an object may use to date what it reports — upstream passes the reactor's
 /// clock for the same reason.
-pub trait StatusSource: Send + Sync {
+pub trait PrinterObject: Send + Sync {
     /// Report this object's status as a JSON object.
     ///
     /// Must not block: it is called on whatever thread asks, including the API
     /// connection that is waiting for the reply.
     fn get_status(&self, eventtime: f64) -> Value;
+
+    /// Connect this object: the second half of two-phase construction.
+    ///
+    /// Objects are built and registered first, then connected in registration
+    /// order by [`Printer::bring_up`], so an object may look up another one
+    /// that was registered before it without ever seeing a half-built one.
+    /// Upstream has the same split but spells the second half as
+    /// `klippy:connect` handlers; here it is a method, and the event is left to
+    /// observers.
+    ///
+    /// The default is "nothing to do", which is what an object that needs no
+    /// connection uses.
+    fn connect<'a>(&'a self) -> ConnectFuture<'a> {
+        Box::pin(async { Ok::<(), KlippyError>(()) })
+    }
 }
 
 /// The machine a host runs: its lifecycle, the state it reports, and the parts
@@ -161,11 +188,11 @@ pub struct Printer {
     exit_requested: Condvar,
     /// What status queries are dated from.
     started: Instant,
-    /// The parts that can report status, in registration order.
+    /// The machine's parts, in registration order.
     ///
     /// Empty until a part registers itself: the machine has none of its own,
     /// and the API server's `webhooks` object is the host's, not the machine's.
-    status: Mutex<Vec<(String, Arc<dyn StatusSource>)>>,
+    objects: Mutex<Vec<(String, Arc<dyn PrinterObject>)>>,
 }
 
 struct Inner {
@@ -200,7 +227,7 @@ impl Printer {
             }),
             exit_requested: Condvar::new(),
             started: Instant::now(),
-            status: Mutex::new(Vec::new()),
+            objects: Mutex::new(Vec::new()),
         }
     }
 
@@ -214,39 +241,54 @@ impl Printer {
         self.started.elapsed().as_secs_f64()
     }
 
-    /// Register a part of the machine that can report status.
+    /// Register a part of the machine.
     ///
-    /// Registration order is the order `objects/list` reports, and the order
-    /// upstream's registry uses.
+    /// Registration order is the order `objects/list` reports, the order
+    /// [`Printer::bring_up`] connects in, and the order upstream's registry
+    /// uses.
     ///
     /// # Errors
     /// Returns [`KlippyError::Internal`] if `name` is already taken: two parts
     /// answering to one name is a wiring mistake in klippy that no client can
     /// provoke. (It deserves an error type of its own; the vocabulary is still
     /// missing — see the `TODO`.)
-    pub fn add_status_object(
+    pub fn add_object(
         &self,
         name: &str,
-        source: Arc<dyn StatusSource>,
+        object: Arc<dyn PrinterObject>,
     ) -> Result<(), KlippyError> {
-        let mut status = self.status.lock().unwrap_or_else(|p| p.into_inner());
-        if status.iter().any(|(taken, _)| taken == name) {
+        let mut objects = self.objects.lock().unwrap_or_else(|p| p.into_inner());
+        if objects.iter().any(|(taken, _)| taken == name) {
             return Err(KlippyError::Internal(format!(
-                "printer object '{name}' already has status"
+                "printer object '{name}' already registered"
             )));
         }
-        status.push((name.to_string(), source));
+        objects.push((name.to_string(), object));
         Ok(())
     }
 
-    /// The names of the registered status objects, in registration order.
-    pub fn status_objects(&self) -> Vec<String> {
-        self.status
+    /// The names of the registered objects, in registration order.
+    pub fn objects(&self) -> Vec<String> {
+        self.objects
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .iter()
             .map(|(name, _)| name.clone())
             .collect()
+    }
+
+    /// Look up one registered object by name.
+    ///
+    /// `None` for a name nobody registered. The handle is cloned out and the
+    /// lock released, so the caller may use the object freely — including
+    /// asking it for status, or asking the printer something else it needs.
+    pub fn lookup_object(&self, name: &str) -> Option<Arc<dyn PrinterObject>> {
+        self.objects
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .find(|(taken, _)| taken == name)
+            .map(|(_, object)| Arc::clone(object))
     }
 
     /// Ask one registered object for its status.
@@ -255,19 +297,12 @@ impl Printer {
     /// unknown object means (upstream answers an empty status rather than
     /// failing the request).
     ///
-    /// The source is called without the table's lock held: a source may ask the
-    /// printer something of its own — the API server's `webhooks` object reads
-    /// the state this very type keeps — and a lock held across it would
+    /// The object is called without the registry's lock held: an object may ask
+    /// the printer something of its own — the API server's `webhooks` object
+    /// reads the state this very type keeps — and a lock held across it would
     /// deadlock there.
     pub fn status_of(&self, name: &str, eventtime: f64) -> Option<Value> {
-        let source = {
-            let status = self.status.lock().unwrap_or_else(|p| p.into_inner());
-            status
-                .iter()
-                .find(|(taken, _)| taken == name)
-                .map(|(_, source)| Arc::clone(source))
-        }?;
-        Some(source.get_status(eventtime))
+        Some(self.lookup_object(name)?.get_status(eventtime))
     }
 
     /// Get the current state message and category.
@@ -350,21 +385,19 @@ impl Printer {
         self.exit_requested.notify_all();
     }
 
-    /// Run the printer: bring it up, then idle until it is asked to exit.
+    /// Idle until the printer is asked to exit, and return what it was asked
+    /// with.
     ///
-    /// Startup is upstream's `_connect`: fire `klippy:connect`, and — if that
-    /// left the printer starting up — report it ready and fire `klippy:ready`.
-    /// The call then blocks until [`Printer::request_exit`] is called, and fires
-    /// `klippy:disconnect` — plus `klippy:firmware_restart` when that is what
-    /// the exit asked for — before returning the result.
+    /// This is the run loop without the bring-up: callers await
+    /// [`Printer::bring_up`] first, then block here — which is why bring-up is
+    /// a future while this stays a plain blocking call. Blocks until
+    /// [`Printer::request_exit`] is called, then fires `klippy:disconnect` —
+    /// plus `klippy:firmware_restart` when that is what the exit asked for.
     ///
-    /// A printer that was already halted before it ran never comes up, and one
-    /// that was already asked to exit does not wait.
+    /// A printer that was already asked to exit does not wait.
     ///
     /// Returns the result the exit was requested with.
     pub fn run(&self) -> String {
-        self.come_up();
-
         let result = self.wait_for_exit();
 
         // What upstream does when the reactor loop ends: a run that was asked
@@ -390,12 +423,25 @@ impl Printer {
             .unwrap_or_else(|poison| poison.into_inner())
     }
 
-    /// Come up: connect, then report ready.
+    /// Bring the machine up: connect its parts, then report ready.
     ///
-    /// Upstream's `_connect`, without the MCUs there are none of. Both callbacks
-    /// can halt the printer, and upstream re-checks its state between them: a
-    /// printer that shut down while connecting never becomes ready.
-    fn come_up(&self) {
+    /// Upstream's `_connect`. Objects are connected in registration order — the
+    /// second half of two-phase construction — and an object that fails to
+    /// connect halts the printer with the reason, as upstream's `_connect`
+    /// does. The state is re-checked after every step: a printer that shut down
+    /// while connecting never becomes ready, and the `klippy:connect` event is
+    /// only fired once every object is up.
+    pub async fn bring_up(&self) {
+        for (name, object) in self.registry() {
+            if let Err(err) = object.connect().await {
+                self.invoke_shutdown(&format!("{name}: {err}"));
+                return;
+            }
+            if self.category() != PrinterState::Startup {
+                return;
+            }
+        }
+
         self.send_event(&PrinterEvent::Connect);
 
         {
@@ -408,6 +454,20 @@ impl Printer {
         }
 
         self.send_event(&PrinterEvent::Ready);
+    }
+
+    /// The registry as a snapshot, so connecting does not hold its lock across
+    /// an await.
+    fn registry(&self) -> Vec<(String, Arc<dyn PrinterObject>)> {
+        self.objects
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    /// What the printer is doing.
+    fn category(&self) -> PrinterState {
+        self.lock().category.clone()
     }
 
     /// Block until an exit has been requested, and return its result.
@@ -485,8 +545,8 @@ mod tests {
         assert_eq!(state.category, PrinterState::Startup);
     }
 
-    #[test]
-    fn test_run_comes_up_ready_and_reports_it() {
+    #[tokio::test]
+    async fn test_bring_up_comes_up_ready_and_reports_it() {
         let printer = Printer::new();
         let ready = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&ready);
@@ -496,9 +556,8 @@ mod tests {
                 counter.fetch_add(1, Ordering::SeqCst);
             }),
         );
-        printer.request_exit("exit");
 
-        assert_eq!(printer.run(), "exit");
+        printer.bring_up().await;
 
         assert_eq!(ready.load(Ordering::SeqCst), 1);
         let state = printer.get_state_message();
@@ -506,8 +565,8 @@ mod tests {
         assert_eq!(state.category, PrinterState::Ready);
     }
 
-    #[test]
-    fn test_run_fires_the_lifecycle_events_in_order() {
+    #[tokio::test]
+    async fn test_the_lifecycle_events_fire_in_order() {
         let printer = Printer::new();
         let log = Arc::new(Mutex::new(Vec::new()));
         for event in [
@@ -521,6 +580,7 @@ mod tests {
         }
         printer.request_exit("firmware_restart");
 
+        printer.bring_up().await;
         assert_eq!(printer.run(), "firmware_restart");
         assert_eq!(
             *log.lock().unwrap(),
@@ -550,26 +610,25 @@ mod tests {
         assert_eq!(*order.lock().unwrap(), ["first", "second"]);
     }
 
-    #[test]
-    fn test_run_waits_for_an_exit_request_from_another_thread() {
+    #[tokio::test]
+    async fn test_run_waits_for_an_exit_request_from_another_thread() {
         let printer = Arc::new(Printer::new());
-        let (ready_tx, ready_rx) = mpsc::channel();
-        printer.register_event_handler(
-            PrinterEvent::Ready,
-            Box::new(move || {
-                ready_tx.send(()).expect("the test is still listening");
-            }),
-        );
+        printer.bring_up().await;
+        assert_eq!(printer.get_state_message().category, PrinterState::Ready);
 
+        let (started_tx, started_rx) = mpsc::channel();
         let runner = {
             let printer = Arc::clone(&printer);
-            thread::spawn(move || printer.run())
+            thread::spawn(move || {
+                started_tx.send(()).expect("the test is still listening");
+                printer.run()
+            })
         };
 
-        // The printer keeps idling until the exit arrives; waiting for `ready`
-        // rather than sleeping is what makes the ordering deterministic.
-        ready_rx.recv().expect("run fires klippy:ready");
-        assert_eq!(printer.get_state_message().category, PrinterState::Ready);
+        // The loop parks on the exit condition; the signal proves it is running
+        // on another thread, and the wakeup below is what proves it was parked
+        // there.
+        started_rx.recv().expect("the run loop started");
         printer.request_exit("exit");
 
         assert_eq!(runner.join().expect("the run loop returned"), "exit");
@@ -621,12 +680,13 @@ mod tests {
         assert_eq!(printer.get_state_message().message, "Printer is halted");
     }
 
-    #[test]
-    fn test_a_printer_that_shut_down_before_it_ran_never_becomes_ready() {
+    #[tokio::test]
+    async fn test_a_printer_that_shut_down_before_it_ran_never_becomes_ready() {
         let printer = Printer::new();
         printer.invoke_shutdown("Printer is halted");
         printer.request_exit("exit");
 
+        printer.bring_up().await;
         assert_eq!(printer.run(), "exit");
 
         let state = printer.get_state_message();
@@ -634,52 +694,139 @@ mod tests {
         assert_eq!(state.category, PrinterState::Shutdown);
     }
 
-    /// A source whose status the test wrote.
+    /// A part that records that it was connected, and can be made to fail.
+    struct Part {
+        name: &'static str,
+        log: Arc<Mutex<Vec<&'static str>>>,
+        fails: bool,
+    }
+
+    impl PrinterObject for Part {
+        fn get_status(&self, _eventtime: f64) -> Value {
+            serde_json::json!({})
+        }
+
+        fn connect<'a>(&'a self) -> ConnectFuture<'a> {
+            let name = self.name;
+            let log = Arc::clone(&self.log);
+            let fails = self.fails;
+            Box::pin(async move {
+                log.lock().unwrap_or_else(|p| p.into_inner()).push(name);
+                if fails {
+                    return Err(KlippyError::Internal(format!("{name} is broken")));
+                }
+                Ok(())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bring_up_connects_the_objects_in_registration_order() {
+        let printer = Printer::new();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        for name in ["first", "second"] {
+            printer
+                .add_object(
+                    name,
+                    Arc::new(Part {
+                        name,
+                        log: Arc::clone(&log),
+                        fails: false,
+                    }),
+                )
+                .unwrap();
+        }
+
+        printer.bring_up().await;
+
+        assert_eq!(*log.lock().unwrap(), ["first", "second"]);
+        assert_eq!(printer.get_state_message().category, PrinterState::Ready);
+    }
+
+    #[tokio::test]
+    async fn test_an_object_that_fails_to_connect_halts_the_printer() {
+        let printer = Printer::new();
+        printer
+            .add_object(
+                "broken",
+                Arc::new(Part {
+                    name: "broken",
+                    log: Arc::new(Mutex::new(Vec::new())),
+                    fails: true,
+                }),
+            )
+            .unwrap();
+
+        printer.bring_up().await;
+
+        let state = printer.get_state_message();
+        assert_eq!(state.category, PrinterState::Shutdown);
+        assert!(state.message.contains("broken"), "{}", state.message);
+    }
+
+    /// A part whose status the test wrote.
     struct Fixed(Value);
 
-    impl StatusSource for Fixed {
+    impl PrinterObject for Fixed {
         fn get_status(&self, _eventtime: f64) -> Value {
             self.0.clone()
         }
     }
 
     #[test]
-    fn test_a_new_printer_has_no_status_objects() {
+    fn test_a_new_printer_has_no_objects() {
         // The machine has no parts yet, and the first object a host registers —
         // the API server's `webhooks` — is the host's, not the machine's.
         let printer = Printer::new();
 
-        assert_eq!(printer.status_objects(), Vec::<String>::new());
+        assert_eq!(printer.objects(), Vec::<String>::new());
+        assert!(printer.lookup_object("webhooks").is_none());
         assert_eq!(printer.status_of("webhooks", printer.eventtime()), None);
     }
 
     #[test]
-    fn test_status_objects_come_back_in_registration_order() {
+    fn test_objects_come_back_in_registration_order() {
         let printer = Printer::new();
         for name in ["webhooks", "extruder", "heater_bed"] {
             printer
-                .add_status_object(name, Arc::new(Fixed(serde_json::json!({}))))
+                .add_object(name, Arc::new(Fixed(serde_json::json!({}))))
                 .unwrap();
         }
 
-        assert_eq!(
-            printer.status_objects(),
-            ["webhooks", "extruder", "heater_bed"]
-        );
+        assert_eq!(printer.objects(), ["webhooks", "extruder", "heater_bed"]);
     }
 
     #[test]
-    fn test_a_duplicate_status_object_is_rejected() {
+    fn test_a_registered_object_can_be_looked_up_by_name() {
         let printer = Printer::new();
         printer
-            .add_status_object(
+            .add_object(
+                "webhooks",
+                Arc::new(Fixed(serde_json::json!({ "who": "webhooks" }))),
+            )
+            .unwrap();
+
+        let object = printer.lookup_object("webhooks").expect("registered");
+
+        assert_eq!(
+            object.get_status(0.0),
+            serde_json::json!({"who": "webhooks"})
+        );
+        assert!(printer.lookup_object("nope").is_none());
+    }
+
+    #[test]
+    fn test_a_duplicate_object_is_rejected() {
+        let printer = Printer::new();
+        printer
+            .add_object(
                 "webhooks",
                 Arc::new(Fixed(serde_json::json!({"by": "first"}))),
             )
             .unwrap();
 
         let err = printer
-            .add_status_object(
+            .add_object(
                 "webhooks",
                 Arc::new(Fixed(serde_json::json!({"by": "second"}))),
             )
@@ -704,10 +851,10 @@ mod tests {
     fn test_status_queries_are_handed_the_object_that_was_asked_for() {
         let printer = Printer::new();
         printer
-            .add_status_object("echo", Arc::new(Fixed(serde_json::json!({"who": "echo"}))))
+            .add_object("echo", Arc::new(Fixed(serde_json::json!({"who": "echo"}))))
             .unwrap();
         printer
-            .add_status_object(
+            .add_object(
                 "other",
                 Arc::new(Fixed(serde_json::json!({"who": "other"}))),
             )

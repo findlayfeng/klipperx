@@ -165,13 +165,13 @@ mod tests {
         // What a host installs before it serves anything: the API server's own
         // object, then whatever parts exist.
         printer
-            .add_status_object(
+            .add_object(
                 WEBHOOKS_OBJECT,
                 Arc::new(WebhooksStatus::new(Arc::clone(&printer))),
             )
             .unwrap();
         printer
-            .add_status_object(
+            .add_object(
                 "toolhead",
                 Arc::new(FixedStatus(json!({
                     "position": [20.0, 30.0, 5.0, 0.0],
@@ -252,9 +252,7 @@ mod tests {
     #[test]
     fn test_the_answer_carries_the_eventtime_the_sources_were_given() {
         let printer = Arc::new(Printer::new());
-        printer
-            .add_status_object("echo", Arc::new(EchoEventtime))
-            .unwrap();
+        printer.add_object("echo", Arc::new(EchoEventtime)).unwrap();
         let endpoint = ObjectsQuery::new(Arc::clone(&printer));
         let api = Api::new();
         let request = request(r#"{"method":"objects/query","params":{"objects":{"echo":null}}}"#);
@@ -270,8 +268,8 @@ mod tests {
         assert!(response["eventtime"].as_f64().unwrap() >= 0.0);
     }
 
-    #[test]
-    fn test_the_servers_object_reports_the_printers_state() {
+    #[tokio::test]
+    async fn test_the_servers_object_reports_the_printers_state() {
         let (endpoint, printer, api) = endpoint();
         let request =
             request(r#"{"method":"objects/query","params":{"objects":{"webhooks":null}}}"#);
@@ -287,8 +285,7 @@ mod tests {
             json!({"state": "startup", "state_message": "Starting up"})
         );
 
-        printer.request_exit("exit");
-        assert_eq!(printer.run(), "exit");
+        printer.bring_up().await;
         assert_eq!(
             ask(),
             json!({"state": "ready", "state_message": "Printer is ready"})

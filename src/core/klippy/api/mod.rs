@@ -86,7 +86,7 @@ pub use klippy_api::{
 /// wiring mistake in klippy, never something a client can cause.
 pub fn register(api: &mut Api, printer: &Arc<Printer>) -> Result<(), RegistrationError> {
     printer
-        .add_status_object(
+        .add_object(
             WEBHOOKS_OBJECT,
             Arc::new(WebhooksStatus::new(Arc::clone(printer))),
         )
@@ -150,7 +150,7 @@ mod tests {
 
         register(&mut api, &printer).unwrap();
 
-        assert_eq!(printer.status_objects(), [WEBHOOKS_OBJECT]);
+        assert_eq!(printer.objects(), [WEBHOOKS_OBJECT]);
         assert_eq!(
             api.endpoints(),
             ["list_endpoints", "objects/list", "objects/query",]

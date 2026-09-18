@@ -508,7 +508,7 @@ fn visible_lines(app: &App, width: usize, height: usize) -> Vec<Line<'static>> {
         // up, so the last wrapped line of an entry is the one nearest the
         // bottom. Collecting forward and reversing the whole list at the end
         // would put an entry's own lines in reverse order.
-        for line in wrap(&entry.text(), width).into_iter().rev() {
+        for line in wrap(&entry_text(entry), width).into_iter().rev() {
             lines.push(Line::from(Span::styled(line, style)));
             if lines.len() >= wanted {
                 break;
@@ -544,6 +544,38 @@ fn entry_style(entry: &Entry) -> Style {
             Notice::Problem => Style::new().fg(Color::Red),
             Notice::Failure => Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
         },
+    }
+}
+
+/// What the window shows for an entry.
+///
+/// Replies and pushes are trees, and the window renders them as YAML — the
+/// shape a tree is read in, without the quoting a JSON line needs. The line
+/// front-end deliberately keeps the compact JSON instead: it wants one line per
+/// event. Everything already written as a sentence (a sent request, an error, a
+/// notice, a log line) is left to [`Entry::text`].
+fn entry_text(entry: &Entry) -> String {
+    match entry {
+        Entry::Reply(reply) if !reply.is_error() => format!(
+            "{} ({})\n{}",
+            reply.id,
+            reply.method.as_deref().unwrap_or("?"),
+            yaml(reply.payload())
+        ),
+        Entry::Push(message) => format!("<\n{}", yaml(message)),
+        other => other.text(),
+    }
+}
+
+/// One value as block-style YAML, without the trailing newline.
+///
+/// YAML is what the window shows, but it is never what goes on the wire, so a
+/// value it cannot write still has to be shown: the compact JSON is the
+/// fallback, and `null` the fallback's fallback.
+fn yaml(value: &Value) -> String {
+    match serde_yaml::to_string(value) {
+        Ok(text) => text.trim_end().to_string(),
+        Err(_) => serde_json::to_string(value).unwrap_or_else(|_| "null".to_string()),
     }
 }
 
@@ -937,7 +969,7 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("2 > {\"id\":2,"), "{text}");
-        assert!(text.contains("< {\"method\":\"klippy:status\"}"), "{text}");
+        assert!(text.contains("<\nmethod: klippy:status"), "{text}");
     }
 
     #[test]
@@ -1111,6 +1143,69 @@ mod tests {
         ]);
 
         assert_eq!(log_text(&app, 10, 4), ["first", "second"]);
+    }
+
+    #[test]
+    fn test_a_reply_is_shown_as_yaml() {
+        let reply = crate::connection::Reply {
+            id: serde_json::json!(2),
+            method: Some("objects/query".to_string()),
+            message: serde_json::json!({
+                "id": 2,
+                "result": {"eventtime": 1.5, "status": {"mcu": {"mcu_version": "abc"}}}
+            }),
+        };
+
+        let text = entry_text(&Entry::Reply(reply));
+
+        assert!(text.starts_with("2 (objects/query)\n"), "{text}");
+        assert!(text.contains("eventtime: 1.5"), "{text}");
+        assert!(text.contains("mcu_version: abc"), "{text}");
+        // Not the compact JSON the wire carries.
+        assert!(!text.contains("{\"eventtime\""), "{text}");
+    }
+
+    #[test]
+    fn test_a_push_is_shown_as_yaml() {
+        let text = entry_text(&Entry::Push(serde_json::json!({
+            "method": "klippy:status",
+            "params": {"state": "ready"}
+        })));
+
+        assert!(text.starts_with("<\n"), "{text}");
+        assert!(text.contains("method: klippy:status"), "{text}");
+        assert!(text.contains("state: ready"), "{text}");
+    }
+
+    #[test]
+    fn test_an_error_reply_stays_a_sentence() {
+        let reply = crate::connection::Reply {
+            id: serde_json::json!(3),
+            method: Some("gcode/script".to_string()),
+            message: serde_json::json!({
+                "id": 3,
+                "error": {"error": "WebRequestError", "message": "Printer is halted"}
+            }),
+        };
+
+        assert_eq!(
+            entry_text(&Entry::Reply(reply)),
+            "! 3 (gcode/script) Printer is halted"
+        );
+    }
+
+    #[test]
+    fn test_a_sent_entry_stays_the_wire_line() {
+        let entry = Entry::Sent {
+            id: Some(2),
+            method: "objects/query".to_string(),
+            message: serde_json::json!({"id": 2, "method": "objects/query"}),
+        };
+
+        assert_eq!(
+            entry_text(&entry),
+            "2 > {\"id\":2,\"method\":\"objects/query\"}"
+        );
     }
 
     /// The header's lines as plain text.

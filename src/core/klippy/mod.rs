@@ -29,7 +29,7 @@ pub use error::KlippyError;
 pub use interface::{HostDevice, Interface, SerialDevice};
 pub use msg::proto::Payload;
 pub use msg::Msg;
-pub use printer::{Printer, PrinterEvent, PrinterObject, PrinterState, StateMessage};
+pub use printer::{load_printer, Printer, PrinterEvent, PrinterState, StateMessage};
 // pub use interface::canbus::CanbusInterface;
 // pub use mcu::{MCU, McuError, McuPin, PinParams};
 // pub use mcu::{add_printer_objects, get_printer_mcu};

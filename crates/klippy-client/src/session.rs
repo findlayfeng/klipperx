@@ -24,9 +24,12 @@
 //! # Typing
 //!
 //! Before a line is sent it is looked at three ways, in this order: empty, a
-//! `.`-prefixed local command, a whole JSON object, or `method` followed by an
-//! optional JSON parameter object. Only the last three can produce a request,
-//! and a malformed one is a notice rather than an error — the session stays up.
+//! `.`-prefixed local command, a whole request object, or `method` followed by
+//! optional parameters. Requests and parameters are written in YAML — of which
+//! JSON is a subset, so a line that was valid as JSON still is — because a
+//! request is a small tree and YAML is what a tree is written in without
+//! quoting every key. Only the last three can produce a request, and a
+//! malformed one is a notice rather than an error — the session stays up.
 
 use serde_json::{json, Map, Value};
 
@@ -250,11 +253,11 @@ impl Session {
             return self.local_command(command, out).await;
         }
 
-        // A whole JSON object is taken as written, so every field the protocol
-        // has — `id`, `params`, anything a future version adds — is reachable
-        // from the session. Only a missing `id` is filled in.
+        // A whole request object is taken as written, so every field the
+        // protocol has — `id`, `params`, anything a future version adds — is
+        // reachable from the session. Only a missing `id` is filled in.
         if line.starts_with('{') {
-            return self.send_json(line, out).await;
+            return self.send_object(line, out).await;
         }
 
         // Otherwise: `method` and optional parameters.
@@ -273,23 +276,26 @@ impl Session {
         Ok(Control::Continue)
     }
 
-    /// Send a line the user wrote as a JSON object.
-    async fn send_json(
+    /// Send a line the user wrote as a whole request object.
+    ///
+    /// The line is YAML, so a request can be written without quoting its keys;
+    /// JSON is a subset of YAML, so the wire form is still accepted as written.
+    async fn send_object(
         &mut self,
         line: &str,
         out: &mut impl Output,
     ) -> Result<Control, TransportError> {
-        let mut message: Value = match serde_json::from_str(line) {
+        let mut message: Value = match serde_yaml::from_str(line) {
             Ok(message) => message,
             Err(err) => {
-                out.write(Entry::notice(Notice::Problem, format!("not JSON: {err}")));
+                out.write(Entry::notice(Notice::Problem, format!("not YAML: {err}")));
                 return Ok(Control::Continue);
             }
         };
         let Some(object) = message.as_object_mut() else {
             out.write(Entry::notice(
                 Notice::Problem,
-                "a request must be a JSON object",
+                "a request must be a mapping",
             ));
             return Ok(Control::Continue);
         };
@@ -473,8 +479,9 @@ impl Session {
 pub fn usage() -> &'static str {
     "\
 Type a request: a method name (`info`), a method and parameters
-(`objects/query {\"objects\": {\"toolhead\": null}}`), or a whole JSON object.
-An `id` is added when you leave it out; `\"id\": null` sends it unanswered.
+(`objects/query {objects: {toolhead: null}}`), or a whole request object.
+They are YAML — JSON is YAML too. An `id` is added when you leave it out;
+`{id: null, ...}` sends it unanswered.
 
 Local commands:
   .help          this text
@@ -491,17 +498,20 @@ pub fn compact(value: &Value) -> String {
 }
 
 /// Parse the parameters of a shorthand request.
+///
+/// YAML, so `{objects: {toolhead: null}}` needs no quoting; JSON is a subset of
+/// YAML, so anything that used to parse still does.
 fn parse_params(value: &str) -> Result<Map<String, Value>, String> {
     if value.is_empty() {
         return Ok(Map::new());
     }
-    match serde_json::from_str::<Value>(value) {
+    match serde_yaml::from_str::<Value>(value) {
         Ok(Value::Object(params)) => Ok(params),
         Ok(other) => Err(format!(
-            "parameters must be a JSON object, not {}",
+            "parameters must be a mapping, not {}",
             kind_of(&other)
         )),
-        Err(err) => Err(format!("parameters are not JSON: {err}")),
+        Err(err) => Err(format!("parameters are not YAML: {err}")),
     }
 }
 
@@ -815,7 +825,7 @@ mod tests {
         let dir = SocketDir::new("badparams");
         let (mut session, mut out, task) = session(&dir).await;
 
-        for line in ["echo [1,2,3]", "echo not json"] {
+        for line in ["echo [1,2,3]", "echo not a mapping", "echo {a: [1, 2"] {
             assert_eq!(
                 session.handle_line(line, &mut out).await.unwrap(),
                 Control::Continue
@@ -823,12 +833,50 @@ mod tests {
         }
 
         assert!(out.sent().is_empty(), "{:?}", out.texts());
-        assert_eq!(
-            out.texts(),
-            vec![
-                "parameters must be a JSON object, not an array",
-                "parameters are not JSON: expected ident at line 1 column 2",
-            ],
+        // A YAML sequence and a YAML scalar are both readable, just not
+        // parameters; only the unterminated mapping is a parse error.
+        assert_eq!(out.texts()[0], "parameters must be a mapping, not an array");
+        assert_eq!(out.texts()[1], "parameters must be a mapping, not a string");
+        assert!(
+            out.texts()[2].starts_with("parameters are not YAML:"),
+            "{:?}",
+            out.texts()
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn test_yaml_parameters_need_no_quotes() {
+        let dir = SocketDir::new("yamlparams");
+        let (mut session, mut out, task) = session(&dir).await;
+
+        session
+            .handle_line("echo {value: 3}", &mut out)
+            .await
+            .unwrap();
+        settle(&mut session, &mut out).await;
+
+        assert!(
+            out.texts().iter().any(|text| text.contains("\"got\":3")),
+            "{:?}",
+            out.texts()
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn test_a_whole_request_object_may_be_yaml() {
+        let dir = SocketDir::new("yamlobject");
+        let (mut session, mut out, task) = session(&dir).await;
+
+        session
+            .handle_line("{method: echo, params: {value: 7}}", &mut out)
+            .await
+            .unwrap();
+        settle(&mut session, &mut out).await;
+
+        assert!(
+            out.texts().iter().any(|text| text.contains("\"got\":7")),
             "{:?}",
             out.texts()
         );
@@ -910,7 +958,7 @@ mod tests {
         let dir = SocketDir::new("notrequest");
         let (mut session, mut out, task) = session(&dir).await;
 
-        for line in [r#"{"params": {}}"#, "echo not json"] {
+        for line in [r#"{"params": {}}"#, "echo [1,2]"] {
             assert_eq!(
                 session.handle_line(line, &mut out).await.unwrap(),
                 Control::Continue
@@ -920,11 +968,12 @@ mod tests {
         assert!(out.sent().is_empty(), "{:?}", out.texts());
         let texts = out.texts();
         assert!(texts[0].contains("needs a \"method\""), "{texts:?}");
-        assert!(texts[1].contains("not JSON"), "{texts:?}");
+        assert!(texts[1].contains("must be a mapping"), "{texts:?}");
 
-        // A line that is neither local, nor a JSON object, nor a method followed
-        // by JSON is still taken as `method [params]` — whatever the method name
-        // happens to look like. The server is the one that rejects it.
+        // A line that is neither local, nor a request object, nor a method
+        // followed by parameters is still taken as `method [params]` — whatever
+        // the method name happens to look like. The server is the one that
+        // rejects it.
         session.handle_line("[1,2]", &mut out).await.unwrap();
         let Entry::Sent { id, method, .. } = out.sent()[0] else {
             panic!("expected a sent entry")

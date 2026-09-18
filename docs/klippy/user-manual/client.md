@@ -130,22 +130,26 @@ $ klippy-client api -a /tmp/klippy_uds list_endpoints
 存在的理由。
 
 ```text
-◌ state unknown
+● ready · Printer is ready
 Connected to unix:/tmp/klippy_uds.
-info: webhooks: No registered callback for path 'info'
+1 > {"id":1,"method":"info","params":{}}
 2 > {"id":2,"method":"list_endpoints","params":{}}
-2 (list_endpoints) {"endpoints":["list_endpoints"]}
-< {"id": null, "method": "klippy:status", "params": {...}}
-klippy> objects/query {"objects": {"toolhead": ["position"]}}
+2 (list_endpoints)
+endpoints:
+- list_endpoints
+- info
+- objects/list
+- objects/query
+klippy> objects/query {objects: {toolhead: [position]}}
 Enter send · ↑↓ history · PgUp/PgDn scroll · .help · ^C quit
 ```
 
 第一行是状态行（左边那个符号：`●` 就绪、`◌` 启动中或状态未知、`▲` 出错/停机、
 `✕` 已断开），最后一行是按键提示，中间是日志，倒数第二行是你的输入。
 
-> 上面 `info` 那行报未实现，是因为主机目前只有 `list_endpoints`（见第五节）。
-> 等 `info` 写好后，状态行会显示 `● ready · Printer is ready`，那行错误就不会
-> 出现。
+> 响应与推送渲染成 **YAML**（树状、不用给每个键加引号），而你自己发出去的那行仍是
+> 线上的紧凑 JSON（`Sent`）——窗口看的是数据，不是字节。行模式（`--plain` 或管道）
+> 不这样：它保持“每件事一行”的 JSON，便于重定向和 grep。
 
 ### 按键
 
@@ -168,13 +172,15 @@ Enter send · ↑↓ history · PgUp/PgDn scroll · .help · ^C quit
 
 ### 一行就是一个请求
 
+参数与整条请求都写 YAML（JSON 是 YAML 的子集，所以原来那样写也照样能用）：
+
 | 你敲的 | 发出去的东西 |
 |--------|--------------|
 | `info` | `{"id": 1, "method": "info", "params": {}}` |
-| `objects/query {"objects": {"toolhead": ["position"]}}` | 同上，`params` 取自后面的 JSON |
-| `{"id": 9, "method": "gcode/script", "params": {"script": "M115"}}` | 原样发送 |
+| `objects/query {objects: {toolhead: [position]}}` | 同上，`params` 取自后面的 YAML |
+| `{id: 9, method: gcode/script, params: {script: M115}}` | 原样发送 |
 
-`id` 是请求的编号，缺省时由客户端补上（这样应答能对上号）。写 `"id": null`
+`id` 是请求的编号，缺省时由客户端补上（这样应答能对上号）。写 `{id: null, …}`
 则按协议原样发送"不要应答"的消息 —— 这是协议本身的语义，不是客户端在偷懒。
 
 ### 本地命令

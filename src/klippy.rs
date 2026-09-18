@@ -7,6 +7,13 @@ use crate::core::klippy::api::{AddressError, Api, ApiTarget, Server};
 use crate::core::klippy::config::Config;
 use crate::logging;
 
+/// What the host is, in one line.
+///
+/// The `klippy` binary and the `klippy` subcommand of `klipperx` are the same
+/// program spelled two ways, so they say the same thing about themselves — and
+/// say it once.
+pub const ABOUT: &str = "Run the host: load the config and serve the API";
+
 /// Klippy CLI application
 #[derive(Parser, Debug)]
 #[command(name = "klippy", version, about)]

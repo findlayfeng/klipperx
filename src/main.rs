@@ -1,4 +1,5 @@
-use klipperx::{client, klippy};
+use klipperx::klippy;
+use klippy_client as client;
 
 use clap::Parser;
 use tracing::error;

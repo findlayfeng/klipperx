@@ -16,13 +16,15 @@ CONFIG_MACH_HOST=y
 ## 运行
 
 ```bash
-cargo test --lib                      # 全部单元测试
-cargo test --lib mcu                  # mcu 层
-cargo test --lib cmd::tests          # 单个命令模块
-cargo test --lib api::server         # API 层的连接与监听（会真开 socket）
-cargo test --lib client              # 客户端（同样会真开 socket）
-cargo test --lib test_install_skips   # 单个用例（按名过滤）
+cargo test --workspace                 # 全部单元测试（三个包）
+cargo test -p klipperx --lib mcu       # mcu 层
+cargo test -p klipperx --lib cmd::tests # 单个命令模块
+cargo test -p klippy-api               # API 层（会真开 socket 的部分在 server.rs）
+cargo test -p klippy-client            # 客户端（同样会真开 socket）
+cargo test -p klipperx --lib test_install_skips  # 单个用例（按名过滤）
 ```
+
+> **注意 `--workspace`**：这是 workspace，而 `cargo test` 在非虚拟 workspace 里只跑**根包**（也就是主机）。`--lib` 后面那些过滤词同理只作用于被选中的包。想覆盖 klippy-api / klippy-client，要么 `--workspace`，要么 `-p <包名>`。
 
 ## 覆盖范围
 
@@ -67,9 +69,9 @@ cargo test --lib test_install_skips   # 单个用例（按名过滤）
 | `mod.rs` | `Mcu::bind_event` 端到端投递（绑定的回调经 `Parser` 回调收到事件帧）、握手前 `NotIdentified`、字典缺失报 `UnknownMessage`、占位日志订阅可绑定 |
 | `stats.rs` | `stats` 事件按名解码（`count` / `sum` / `sumsq`）、参数类型不符报 `Decode` |
 
-### `api`
+### `klippy-api`
 
-两层测法：协议与寄存器层**不需要 socket**（`ClientConnection::receive` 直接吃字节，推送由实现了 `PushTarget` 的测试替身接住）；监听与连接层用**真的 socket**，在临时目录里 bind Unix socket、在 `127.0.0.1:0` 上 bind TCP，然后真连上去发请求。唯一还没被覆盖的是 `info` 的 handler（`todo!()`，且因此尚未注册）。手工验证用 `klipperx api` / `klipperx console`（见 [第三方开发手册](../third-party-dev/README.md)）。
+两层测法：协议与寄存器层**不需要 socket**（`ClientConnection::receive` 直接吃字节，推送由实现了 `PushTarget` 的测试替身接住）；监听与连接层用**真的 socket**，在临时目录里 bind Unix socket、在 `127.0.0.1:0` 上 bind TCP，然后真连上去发请求。端点（主机侧的部分）只测到定义，因为 `info` 的 handler 还是 `todo!()`、也因此尚未注册。手工验证用 `klippy-client api` / `klippy-client console`（见 [第三方开发手册](../third-party-dev/README.md)）。
 
 | 模块 | 覆盖 |
 |------|------|
@@ -77,9 +79,10 @@ cargo test --lib test_install_skips   # 单个用例（按名过滤）
 | `protocol.rs` | 分帧（一次读里多条、一条被拆成多次读、前导分隔符产生的空消息）、`encode` 的分隔符结尾；请求解析（`id` 缺失与为 `null` 均视为不要应答、非对象 / 无 `method` / `params` 非对象一律拒绝、非字符串 `id` 原样保留）；应答形状（result / error、无 `id` 时失败也静默）；`Params` 区分缺失与类型错、整数可作浮点而浮点不可作整数、`true` 不是整数、`get_or` 不检查默认值；模板合并（`params` 冲突时模板优先，同上游）、模板可省略且类型受检 |
 | `registry.rs` | 路径唯一（普通端点与 mux 路径同一命名空间）、mux 各实例的 key 必须一致且 value 不重复、`list_endpoints` 排序并含 mux 路径、按名分发与未知方法报错、端点拿得到自己的连接、mux 按 key 选实例 / 缺 key / 未知值 / 非字符串值、注册 `None` 时 key 可省略；remote method 的模板合并推送、多连接、重复注册替换模板、已断开连接被清理、无活动连接与未注册两种错误 |
 | `server.rs` | **真 socket**：Unix 与 TCP 各一个往返、TCP 上报的 target 是绑定后的地址（不是 `:0`）、未知方法与 handler 失败都回 `error`、一次写里两条请求按序应答、跨 TCP 分段的消息只应答一次、两个客户端同时被服务。**socket 文件**：遗留文件名被 bind 替换成真 socket、server 被 abort 后文件消失。**单连接**（无 socket）：应答字段顺序（`id` 在前，靠不经 `Value` 直接序列化保证）、无 `id` 不应答、畸形消息被跳过而连接继续可用、推送与应答同样入队、连接关闭后不再入队、`push` 能唤醒等待方（用 `Notify`，带超时断言）、空发件箱 flush 直接成功、写不进去的客户端被 5 秒超时切断（用 `start_paused` 让暂停时钟直接跳过这 5 秒，无需真等） |
-| `endpoints/info.rs` | 端点路径、`client_info` 可省略且必须是对象、响应 12 个字段与文档逐个对齐、`log_file` 为 `None` 时是 `null` 而非缺字段、响应不回显 `client_info`（handler 体是 `todo!()`，所以只测定义） |
+| `error.rs` | `Bind` / `Connect` / `Io` 的 Display 直接给出调用处拼好的文本，`Closed` 给出固定文案 |
+| （主机侧）`endpoints/info.rs` | 端点路径、`client_info` 可省略且必须是对象、响应 12 个字段与文档逐个对齐、`log_file` 为 `None` 时是 `null` 而非缺字段、响应不回显 `client_info`（handler 体是 `todo!()`，所以只测定义） |
 
-### `client`
+### `klippy-client`
 
 同样是**真 socket**：每个用例自己起一个 `Server`（Unix 或 TCP），然后用客户端连上去，因此这一层测的是「两边真的能对话」，而不是各自的自说自话。
 
@@ -117,9 +120,9 @@ cargo test --lib test_install_skips   # 单个用例（按名过滤）
 
 ## 文档同步
 
-改动 `msg` / `mcu` / `cmd` / `event` / `identify` / `api` / `client` 的公开 API 或分层职责时，请同时更新本手册对应页面（见 [开发手册首页](README.md) 的目录）。
+改动 `msg` / `mcu` / `cmd` / `event` / `identify` / `api` 的公开 API 或分层职责时，请同时更新本手册对应页面（见 [开发手册首页](README.md) 的目录）；改动 `crates/klippy-api` / `crates/klippy-client` 时同理（它们的公开 API 就是别人依赖的协议）。
 
-`cargo doc --no-deps --lib` 的警告数应与改动前一致（目前库里已有 10 条残留于 `frame.rs` / `kinematics` / `msg/parser.rs` / `printer.rs`）。新增模块时注意两个陷阱：
+`cargo doc --no-deps --lib` 的警告数应与改动前一致（根包目前有 10 条残留于 `frame.rs` / `kinematics` / `msg/parser.rs` / `printer.rs`；`klippy-api` 与 `klippy-client` 是 0 条）。新增模块时注意两个陷阱：
 
 1. **模块的文档链接是在它的 `mod` 声明所在作用域里解析的**，不是在被声明模块自己的作用域里。`klippy/mod.rs` 里的 `pub mod …;` 因此都不带 `///` 文档。
 2. **把私有模块提升为 `pub mod` 会激活它的公开文档检查**：模块文档里指向 `pub(crate)` 项的链接会报 `links to private item`。`identify` 从 `mcu` 的子模块提升为顶层公开模块时就遇到这一点，需要把这类链接改成纯代码 span。

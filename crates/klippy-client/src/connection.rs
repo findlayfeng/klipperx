@@ -1,8 +1,8 @@
 //! A connection to an API server: framing, request ids, and reply routing.
 //!
-//! This is the client half of the protocol in
-//! [`api::protocol`](crate::core::klippy::api::protocol). It reuses that
-//! module's framing and request shapes rather than re-deriving them — the
+//! This is the client half of the protocol in [`klippy_api::protocol`]. It
+//! reuses that crate's framing and request shapes rather than re-deriving
+//! them — the
 //! delimiter, the `id` echo and the `error` object are the same facts on both
 //! sides, and a client that disagreed about them would be testing nothing.
 //!
@@ -30,9 +30,9 @@ use std::collections::VecDeque;
 use serde_json::{json, Map, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 
-use crate::core::klippy::api::address::{ApiTarget, Transport};
-use crate::core::klippy::api::protocol::{encode, Framing};
-use crate::core::klippy::api::TransportError;
+use klippy_api::address::{ApiTarget, Transport};
+use klippy_api::protocol::{encode, Framing};
+use klippy_api::TransportError;
 
 /// Bytes asked of the socket per read.
 const READ_SIZE: usize = 4096;
@@ -286,9 +286,9 @@ fn answerable_id(message: &Value) -> Option<&Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::klippy::api::protocol::{ApiError, Request};
-    use crate::core::klippy::api::registry::{Api, Endpoint, EndpointContext};
-    use crate::core::klippy::api::server::Server;
+    use klippy_api::protocol::{ApiError, Request};
+    use klippy_api::registry::{Api, Endpoint, EndpointContext};
+    use klippy_api::server::Server;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;

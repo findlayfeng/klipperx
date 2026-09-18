@@ -13,11 +13,13 @@
 | 命令层 | `src/core/klippy/cmd/` | 命令词汇（`McuCommand` / `McuResponse` / `Params`）、类型化调用、各命令模块 | 全部 |
 | 事件层 | `src/core/klippy/event/` | 事件词汇（`McuEvent`）、回调注册（`Mcu::bind_event`）、各事件模块 | 事件消息（当前只有 `stats`） |
 | Identify 引导 | `src/core/klippy/identify.rs` | 主机自有格式、分块驱动与解压、`connect` / `identify` 入口 | `identify` 一对 |
-| 客户端 API | `src/core/klippy/api/` | Unix Domain Socket、`0x03` 分帧、请求分发、端点与推送 | **不涉及**：只认客户端端点 |
+| 客户端 API | `crates/klippy-api/` + `src/core/klippy/api/` | Unix Domain Socket、`0x03` 分帧、请求分发、端点与推送 | **不涉及**：只认客户端端点 |
 
 `cmd`、`event`、`identify` 与 `mcu` **平级**，不是 `mcu` 的子模块：传输代码（帧、`Parser`、字典、裸 `send` / `call`）不引用任何能力，命令、事件与引导都是建立在它之上的模块。
 
 `api` 与前五者都不同：它不在 MCU 数据通路上，而是客户端一侧的入口（对应 klipper 的 `klippy/webhooks.py`）。它不发送 MCU 消息、也不被 MCU 消息驱动，端点需要数据时向 `printer` / `gcode` 取。
+
+它也是唯一**跨包**的一层：API 本身（协议、地址、服务端）在 `crates/klippy-api`，因为客户端也要用它，而客户端不能依赖主机；主机这边只剩端点。
 
 MCU 一侧的依赖边一共只有这五条：
 
@@ -49,7 +51,7 @@ MCU 一侧的依赖边一共只有这五条：
 
 | 边 | 状态 |
 |----|------|
-| `api → error` | 已有：`KlippyError` 是 `Server::bind` / `Server::run` 的错误类型 |
+| `klippy-api → TransportError` | 已有：socket 层面的失败用自己的错误类型（`Bind` / `Connect` / `Closed` / `Io`），不认识主机的 `KlippyError` |
 | `api → tokio 运行时` | 已有：accept 循环与每连接一个任务跑在 host 建的 runtime 上（见 `klippy::run`）；API 层自己不建线程，socket 收发是异步的 |
 | `api → printer`、`api → gcode` | **计划中**：`info` 的 handler 仍是 `todo!()`，`objects/*` 与 `gcode/*` 尚未开始，所以这两条边还没出现在代码里 |
 | `api → mcu` / `cmd` / `event` | **没有**，将来也不应该有：端点经 `printer` / `gcode` 间接使用协议层，不直接碰帧与字典 |
@@ -58,17 +60,20 @@ MCU 一侧的依赖边一共只有这五条：
 
 `api` 内部自己是分层的（协议 ↔ 注册表 ↔ 连接），与 MCU 一侧的 `msg` / `mcu` / `cmd` 分法同构：底层的分帧不知道任何端点，端点也不知道字节怎么分帧。
 
-### `src/client/` — 自带的客户端
+### `crates/klippy-client/` — 自带的客户端
 
-主机自己的客户端**不在** `src/core/klippy/` 下，因为它不是主机的一部分：它是 `klipperx api` / `klipperx console` 两个子命令背后的东西，只对外说话。
+客户端**不在**本包里（`klipperx`），因为它不是主机的一部分：它只对外说话。它自成一个包，因此编译它不会编主机的东西。
 
 | 文件 | 职责 |
 |------|------|
-| `client.rs` | 两个子命令的参数与入口；`--api-server` 与主机共用同一个解析 |
-| `client/connection.rs` | `Connection`：分帧、`id` 分配与回收、应答按 `id` 配对并标注方法名、推送识别 |
-| `client/console.rs` | 交互式会话：stdin 与 socket 同时 `select!`、本地命令、推送打印 |
+| `lib.rs` | `klipperx api` / `klipperx console` 以及 `klippy-client` 三处的参数与入口；`--api-server` 与主机共用同一个解析 |
+| `connection.rs` | `Connection`：分帧、`id` 分配与回收、应答按 `id` 配对并标注方法名、推送识别 |
+| `console.rs` | 交互式会话：stdin 与 socket 同时 `select!`、本地命令、推送打印 |
+| `main.rs` | `klippy-client` 二进制（另有一套二十行的日志初始化，见下） |
 
-它**复用** api 层的 `protocol`（分帧、请求形状）与 `address`（`ApiTarget` / `Transport`），不把协议再实现一遍：两边对分隔符或 `id` 语义若有分歧，那就不是在验证任何东西。依赖方向只有一条：`client → api`，api 层不知道客户端存在。
+它**复用** `klippy-api` 的 `protocol`（分帧、请求形状）与 `address`（`ApiTarget` / `Transport`），不把协议再实现一遍：两边对分隔符或 `id` 语义若有分歧，那就不是在验证任何东西。依赖方向只有一条：`klippy-client → klippy-api`，API 不知道客户端存在。
+
+它是唯一**依赖不重合**的包：`cargo tree -p klippy-client` 里没有 `reqwest` / `flate2` / `libloading`，实测 debug 体积 49.7 MB（`klipperx` 95.4 MB）。代价是 `main.rs` 里那二十行日志初始化与主机重复——为它单开一个 crate 比重复更糟。
 
 ## 模块结构
 
@@ -123,14 +128,23 @@ identify 的命令**定义**（名称、参数、解码）与其它命令一样�
 
 客户端一侧的入口，对应 klipper 的 `klippy/webhooks.py`：外部工具（Fluidd / Mainsail / Moonraker 等）连上 API server，发 `0x03` 分隔的 JSON 请求。监听位置由 `-a/--api-server` 给出：默认是 Unix Domain Socket 路径（与上游一致），写成 `tcp:<host>:<port>` 则监听 TCP；**不给这个选项就不起服务**，这一点也与上游一致。线上的形状（请求/应答、无 `id` 不应答、推送模板、错误文案）以 [Klippy API 参考](../third-party-dev/api-reference.md) 为准，两边要一起改。
 
+主机这边只有两个文件：`mod.rs`（说明 + 转出 `klippy-api` 的类型）与 `endpoints/`。
+
 | 文件 | 职责 |
 |------|------|
-| `mod.rs` | 层的说明：监听位置、`0x03` 分帧、请求/应答与推送的形状、并发模型、模块表、待实现清单 |
+| `mod.rs` | 说明主机侧与 API 的分界，并把 `klippy-api` 的四个模块转出，主机代码不必到处跨包 |
+| `endpoints/` | 一个端点一个文件；目前只有 `info.rs`，且 handler 为 `todo!()`、**尚未注册**，参数与响应形状（`InfoParams` / `InfoResponse`）已定义 |
+
+API 本身在 `crates/klippy-api/src/`：
+
+| 文件 | 职责 |
+|------|------|
+| `lib.rs` | crate 说明：线上的形状、监听位置、并发模型、模块表 |
 | `address.rs` | `ApiTarget`：把 `--api-server` 的值解析成 socket 路径或 TCP 地址；未知 scheme（比如曾经的 `http://…:7125`）直接报错而不是当成文件名。`Transport` 也在这里：两个方向都只用它一个类型看待 socket |
 | `protocol.rs` | `Framing`（粘包 / 拆包）、`Request` / `Response`、`Params` 访问器、`ApiError`、`ResponseTemplate`、`PushTarget`；不认 socket，也不认端点 |
 | `registry.rs` | `Endpoint` / `MuxEndpoint` trait、`Api` 注册表与 `dispatch`、mux 的 key 选择、remote method、内建 `list_endpoints`；注册期错误单独用 `RegistrationError` |
 | `server.rs` | `Listener`（两种传输）、`Server::bind` / `run`（accept 循环）、`ClientConnection`（分帧状态、发件箱、`Notify` 唤醒、关闭标志，即端点拿到的 `PushTarget`），以及每条连接的读写 `select!` 与 5 秒写超时 |
-| `endpoints/` | 一个端点一个文件；目前只有 `info.rs`，且 handler 为 `todo!()`、**尚未注册**，参数与响应形状（`InfoParams` / `InfoResponse`）已定义 |
+| `error.rs` | `TransportError`：socket 层面的失败（`Bind` / `Connect` / `Closed` / `Io`），与请求层面的 `ApiError` 分开 |
 
 端点自己不拼应答信封：它只返回 payload 或 `ApiError`，`id` 的回显与「无 `id` 就不应答」由 `protocol.rs` 一处决定，端点无从弄错。
 
@@ -140,11 +154,11 @@ identify 的命令**定义**（名称、参数、解码）与其它命令一样�
 |--------|------|--------|
 | `klipperx` | `src/main.rs` | 项目的 CLI：`klippy`（跑主机）、`api`、`console` |
 | `klippy` | `src/bin/klippy/main.rs` | 只有主机，等价于 `klipperx klippy`（名字取自上游的 `klippy.py`） |
-| `klippy-client` | `src/bin/klippy-client/main.rs` | 只有客户端，等价于 `klipperx api` / `klipperx console` |
+| `klippy-client` | `crates/klippy-client/src/main.rs` | 只有客户端，等价于 `klipperx api` / `klipperx console`；**自成一个包**，不编主机 |
 
-参数定义全在库里（`klippy::AppArgs`、`client::ApiArgs` / `ConsoleArgs`），二进制只做三件事：解析命令行、装日志（`logging::init`）、把错误打成一行并以退出码 1 结束。后两个二进制只装载各自那部分，因此命令行与帮助文本是干净的。
+参数定义全在库里（`klippy::AppArgs`、`klippy_client::{ApiArgs, ConsoleArgs}`），二进制只做三件事：解析命令行、装日志、把错误打成一行并以退出码 1 结束。后两个二进制只装载各自那部分，因此命令行与帮助文本是干净的。
 
-注意 `[[bin]]` 目标**共用同一个库**：单独编译 `klippy-client` 并不会少编一个依赖——这个 crate 的依赖是一套（`reqwest`、`flate2`、`libloading` 等主机要用的东西依旧会一起编），只是命令行是客户端而已。真要一个不带主机依赖的客户端，得把 api 层的 `protocol` / `address` 抽成单独的 crate，让客户端二进制只依赖它；现在没这么做。
+`klippy` 与 `klipperx` 在同一个包里，共用一套依赖；`klippy-client` 在另一个包里，只依赖 `klippy-api` 与 clap / serde_json / tokio / tracing，所以它既不会编 `reqwest` / `flate2` / `libloading`，产物也小得多（实测 debug 49.7 MB vs 95.4 MB）。
 
 ## 目录
 

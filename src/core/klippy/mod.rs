@@ -19,6 +19,10 @@ pub mod printer;
 // pub mod toolhead;
 
 
+// Client-facing API over the Unix Domain Socket
+pub mod api;
+
+
 // Dynamic library loading interface
 pub mod interface;
 

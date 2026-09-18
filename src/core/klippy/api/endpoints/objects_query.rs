@@ -26,10 +26,9 @@
 //!
 //! # Status
 //!
-//! Written and tested; **not registered** yet, because no host builds a printer
-//! to hand it (see the `TODO`). `objects/subscribe` — the same query on a
-//! 0.25 s timer, pushing what changed — is not written: it needs the reactor
-//! the machine does not have yet.
+//! Written, tested and registered by [`register`](super::register).
+//! `objects/subscribe` is the same query on a repeated timer; the field
+//! selection both use lives in [`select_fields`].
 
 use std::sync::Arc;
 
@@ -105,6 +104,14 @@ impl ObjectsQueryParams {
         })
     }
 
+    /// The names and requested fields, as the client sent them.
+    ///
+    /// `objects/subscribe` reads this to build the field lists it will track;
+    /// the query itself only answers once.
+    pub fn objects(&self) -> &Map<String, Value> {
+        &self.objects
+    }
+
     /// Answer the query against `printer`.
     ///
     /// The printer's clock is read once, so every object in the answer is dated
@@ -113,30 +120,46 @@ impl ObjectsQueryParams {
         let eventtime = printer.eventtime();
         let mut status = Map::new();
         for (name, fields) in &self.objects {
-            let full = match printer.status_of(name, eventtime) {
-                Some(Value::Object(full)) => full,
-                // An unknown object (or one reporting something other than an
-                // object) has no fields to give.
-                _ => Map::new(),
-            };
-            let selected = match fields {
-                Value::Null => Value::Object(full),
-                Value::Array(fields) => {
-                    let mut selected = Map::new();
-                    for field in fields {
-                        let field = field.as_str().expect("validated to be strings");
-                        // A field the object does not have is answered with
-                        // `null`, not left out.
-                        let value = full.get(field).cloned().unwrap_or(Value::Null);
-                        selected.insert(field.to_string(), value);
-                    }
-                    Value::Object(selected)
-                }
-                _ => unreachable!("validated in from_params"),
-            };
-            status.insert(name.clone(), selected);
+            let full = status_object(printer, name, eventtime);
+            status.insert(name.clone(), select_fields(full, fields));
         }
         json!({ "eventtime": eventtime, "status": status })
+    }
+}
+
+/// Every field `name` reports, or an empty object if it reports none.
+///
+/// An unknown object (or one reporting something other than an object) has no
+/// fields to give, which is not an error — upstream answers `{}` too, and
+/// `objects/subscribe` needs the same reading to expand a `null` field list.
+///
+/// `pub(crate)` because the two endpoints of the family share it: the query
+/// selects fields out of it once, the subscription selects them every tick.
+pub(crate) fn status_object(printer: &Printer, name: &str, eventtime: f64) -> Map<String, Value> {
+    match printer.status_of(name, eventtime) {
+        Some(Value::Object(full)) => full,
+        _ => Map::new(),
+    }
+}
+
+/// The subset of `full` a client asked for.
+///
+/// JSON `null` means all of it; an array means exactly those fields, and a
+/// field the object does not have is answered with `null` rather than left out,
+/// so a client can tell "not asked" from "not there".
+pub(crate) fn select_fields(full: Map<String, Value>, requested: &Value) -> Value {
+    match requested {
+        Value::Null => Value::Object(full),
+        Value::Array(fields) => {
+            let mut selected = Map::new();
+            for field in fields {
+                let field = field.as_str().expect("validated to be strings");
+                let value = full.get(field).cloned().unwrap_or(Value::Null);
+                selected.insert(field.to_string(), value);
+            }
+            Value::Object(selected)
+        }
+        _ => unreachable!("validated in from_params"),
     }
 }
 

@@ -48,6 +48,10 @@
   `call_later`）与两个实现（主机 `TokioReactor`、测试 `ManualReactor`）；`Printer` 持有
   `Arc<dyn Reactor>`，`eventtime` 走它，机器不拥有 runtime（`reactor.rs`、
   `docs/klippy/developer-manual/reactor.md`）。
+- **`objects/subscribe`**：请求立即回一份全量快照，随后每 0.25 s（`SUBSCRIPTION_REFRESH_TIME`，
+  上游 `klippy/webhooks.py:467`）把变化的字段用 `response_template` 推给连接；连接关闭即
+  退订、最后一个退订时定时器自停；`objects/query` 与它共用字段选择
+  （`api/endpoints/objects_subscribe.rs`、`objects_query.rs`）。
 
 ## 待办
 
@@ -57,7 +61,6 @@
 |---|---|---|
 | A1b | reactor 串行调度器与延迟度量 | A1 ✓ |
 | A2 | 错误词汇（`CommandError` / `ConfigError`） | — |
-| B1 | `objects/subscribe` | A1 ✓ |
 | B2 | MCU 关闭与错误上报（含 `last_stats`） | A2 |
 | B3 | `gcode` 层与 `gcode/*` 端点 | C1 |
 | B4 | 其余端点（estop / remote method / pause_resume / …） | B3 等 |
@@ -117,13 +120,19 @@
       的重复名（`printer.rs` 的 TODO）、`load.rs` 的工厂拒绝与未认领 section（`load.rs`
       的 `TODO`）、`McuObject::connect` 的 section 解析。
 
-### B1（旧 T1 剩余）objects/subscribe
+### B1（旧 T1 剩余）objects/subscribe —— 已完成
 
-- [ ] 0.25s 轮询 + `response_template`（`klippy/webhooks.py:482` 注册、`:561` 实现），
-      推送走已有的 `PushTarget`（`crates/klippy-api/src/protocol.rs:507`，
-      `ResponseTemplate` 已就位）。
-- [ ] 需要 A1 的定时器与「只推变化」的比对：上游用全局 `last_query` 与每个订阅自己的
-      字段表，两次查询里同一个值变了才推。
+- [x] 0.25 s 轮询 + `response_template`（`klippy/webhooks.py:482` 注册、`:561` 实现），
+      推送走 `PushTarget`；`ResponseTemplate` 包住每次推送。端点：
+      `src/core/klippy/api/endpoints/objects_subscribe.rs`，由 `api::register` 安装。
+- [x] 只推变化：每个订阅自己记一份「上次推给它的值」（`Subscription::last`），tick 里与
+      当次 `get_status` 比对；同一 tick 内每个对象只查一次，多个订阅者共用（上游的 `query`
+      缓存）。`null` 字段列表展开为对象当时的字段；连接关闭即退订，定时器在最后一个退订时
+      自停。
+- [x] 两处有意与上游不同，写在模块文档里：回包在**请求时**就发（不等下一个 tick），且
+      变化是相对**该连接上次所见**而非全局快照——本主机没有 pending-query tick，这两点
+      在稳态下与上游一致。
+- 详见 `docs/klippy/developer-manual/testing.md` 的 `objects_subscribe.rs` 一行。
 
 ### B2（新）MCU 关闭与错误上报
 

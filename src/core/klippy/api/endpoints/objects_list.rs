@@ -15,9 +15,7 @@
 //!
 //! # Status
 //!
-//! Written and tested; **not registered** yet, because no host builds a printer
-//! to hand it (see the `TODO`). A request to the unregistered path gets
-//! `no registered callback`.
+//! Written, tested and registered by [`register`](super::register).
 
 use std::sync::Arc;
 

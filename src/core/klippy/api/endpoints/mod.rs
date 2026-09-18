@@ -8,17 +8,18 @@
 //!
 //! # Status
 //!
-//! [`info`](info), [`objects/list`](objects_list) and [`objects/query`](objects_query)
-//! are written and registered by [`register`](super::register); the rest of the
-//! documented surface is not written yet, so the table below is the checklist
-//! and `list_endpoints` reports those three plus the built-in.
+//! [`info`](info), [`objects/list`](objects_list), [`objects/query`](objects_query)
+//! and [`objects/subscribe`](objects_subscribe) are written and registered by
+//! [`register`](super::register); the rest of the documented surface is not
+//! written yet, so the table below is the checklist and `list_endpoints`
+//! reports those four plus the built-in.
 //!
 //! | Endpoint | Status |
 //! |---|---|
 //! | `info` | done |
 //! | `list_endpoints` | done ([`registry`](super::registry)) |
 //! | `objects/list`, `objects/query` | done |
-//! | `objects/subscribe` | not started — needs the reactor |
+//! | `objects/subscribe` | done ([`objects_subscribe`]) |
 //! | `emergency_stop` | not started |
 //! | `register_remote_method` | not started |
 //! | `gcode/help`, `gcode/script`, `gcode/restart` | not started |
@@ -31,7 +32,9 @@
 pub mod info;
 pub mod objects_list;
 pub mod objects_query;
+pub mod objects_subscribe;
 
 pub use info::{Info, InfoParams, InfoResponse};
 pub use objects_list::ObjectsList;
 pub use objects_query::{ObjectsQuery, ObjectsQueryParams};
+pub use objects_subscribe::{ObjectsSubscribe, SUBSCRIPTION_REFRESH_TIME};

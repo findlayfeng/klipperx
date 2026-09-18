@@ -12,6 +12,7 @@ pub mod error;
 pub mod event;
 pub mod frame;
 pub mod identify;
+pub mod load;
 pub mod mcu;
 pub mod msg;
 pub mod printer;

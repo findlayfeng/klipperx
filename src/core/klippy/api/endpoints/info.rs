@@ -265,6 +265,7 @@ mod tests {
     use super::*;
     use crate::core::klippy::api::registry::Api;
     use crate::core::klippy::api::test_support::{context, silent_target};
+    use crate::core::klippy::reactor::ManualReactor;
     use serde_json::json;
 
     fn request(body: &str) -> Request {
@@ -282,7 +283,7 @@ mod tests {
     }
 
     fn endpoint() -> (Info, Arc<Printer>) {
-        let printer = Arc::new(Printer::new());
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
         (Info::new(Arc::clone(&printer), start_args()), printer)
     }
 

@@ -65,6 +65,7 @@ impl PrinterObject for WebhooksStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::klippy::reactor::ManualReactor;
 
     #[test]
     fn test_the_object_name_is_the_documented_one() {
@@ -73,7 +74,7 @@ mod tests {
 
     #[test]
     fn test_the_object_reports_the_printers_state() {
-        let printer = Arc::new(Printer::new());
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
         let status = WebhooksStatus::new(Arc::clone(&printer));
 
         assert_eq!(
@@ -91,7 +92,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_the_object_follows_the_printer_into_the_ready_state() {
-        let printer = Arc::new(Printer::new());
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
         let status = WebhooksStatus::new(Arc::clone(&printer));
         printer.bring_up().await;
         printer.request_exit("exit");

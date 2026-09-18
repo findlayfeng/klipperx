@@ -152,6 +152,7 @@ mod tests {
         context, silent_target, EchoEventtime, FixedStatus,
     };
     use crate::core::klippy::api::webhooks::{WebhooksStatus, WEBHOOKS_OBJECT};
+    use crate::core::klippy::reactor::ManualReactor;
     use serde_json::json;
 
     fn request(body: &str) -> Request {
@@ -161,7 +162,7 @@ mod tests {
     /// An endpoint over a printer with one extra object, and a registry to
     /// build a context from.
     fn endpoint() -> (ObjectsQuery, Arc<Printer>, Api) {
-        let printer = Arc::new(Printer::new());
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
         // What a host installs before it serves anything: the API server's own
         // object, then whatever parts exist.
         printer
@@ -251,7 +252,7 @@ mod tests {
 
     #[test]
     fn test_the_answer_carries_the_eventtime_the_sources_were_given() {
-        let printer = Arc::new(Printer::new());
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
         printer.add_object("echo", Arc::new(EchoEventtime)).unwrap();
         let endpoint = ObjectsQuery::new(Arc::clone(&printer));
         let api = Api::new();

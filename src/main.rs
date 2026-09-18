@@ -1,4 +1,4 @@
-use klipperx::klippy;
+use klipperx::{client, klippy};
 
 use clap::Parser;
 use tracing::{debug, error};
@@ -17,9 +17,15 @@ struct Cli {
 
 #[derive(clap::Subcommand, Debug)]
 enum Commands {
-    /// Klippy subcommand
+    /// Run the host: load the config and serve the API
     #[command(name = "klippy")]
     Klippy(klipperx::klippy::AppArgs),
+
+    /// Send one API request and print the reply
+    Api(client::ApiArgs),
+
+    /// Connect to the API and enter an interactive session
+    Console(client::ConsoleArgs),
 }
 
 fn main() {
@@ -43,10 +49,14 @@ fn main() {
 
     debug!("Debug mode enabled");
 
-    if let Some(Commands::Klippy(args)) = cli.command {
-        if let Err(e) = klippy::run(args) {
-            error!("Error: {}", e);
-            std::process::exit(1);
-        }
+    let result = match cli.command {
+        Some(Commands::Klippy(args)) => klippy::run(args),
+        Some(Commands::Api(args)) => client::run_api(args),
+        Some(Commands::Console(args)) => client::run_console(args),
+        None => Ok(()),
+    };
+    if let Err(e) = result {
+        error!("Error: {}", e);
+        std::process::exit(1);
     }
 }

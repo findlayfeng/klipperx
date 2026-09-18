@@ -64,6 +64,15 @@
 | B2 | MCU 关闭与错误上报（含 `last_stats`） | A2 |
 | B3 | `gcode` 层与 `gcode/*` 端点 | C1 |
 | B4 | 其余端点（estop / remote method / pause_resume / …） | B3 等 |
+| F1 | MCU 配置构建层（oid / config 命令 / CRC） | — |
+| F2 | pin 解析与 `pins` 对象 | F1 |
+| F3 | GPIO 输出（`digital_out`） | F1、F2 |
+| F4 | PWM（硬件 / 软件） | F1、F2 |
+| F5 | ADC | F1、F2 |
+| F6 | SPI 总线 | F1、F2 |
+| F7 | I2C 总线 | F1、F2 |
+| F8 | endstop / trsync | F1、F2、C1 |
+| F9 | 输入与外设资源（buttons / pulse_counter / …） | F1–F7 |
 | C1 | toolhead 与 kinematics | — |
 | C2 | 配置装载收尾（option 校验、第二个住户） | — |
 | D1 | 主机层 start args / rollover / `--logfile` | — |
@@ -170,6 +179,152 @@
 - [ ] `query_endstops/status`：等 endstop / homing。
 - [ ] `bed_mesh/dump_mesh` 与 `*/dump_*` 多路复用端点（`klippy/webhooks.py:335`
       `_handle_mux`）：等对应 extras（`bed_mesh`、`adxl345` 等）。
+
+### F（新）MCU 基础资源：GPIO / SPI / I2C / ADC / PWM
+
+上游把这些叫 printer objects 下面的「资源」：主机用一个 **oid** 和一个 **pin 描述**
+建立资源对象，把 `config_*` 命令攒起来，在 `finalize_config` 之前算一个 CRC 一次性下发，
+之后用 `queue_*` / `set_*` / `*_transfer` 命令驱动。我们现在只到命令层（`allocate_oids` /
+`get_config` / `finalize_config` / `get_uptime` / `emergency_stop` / `get_clock`），
+**没有 oid 计数、没有 config 命令累积与 CRC、没有 pin 解析、没有一个 `config_*` 资源**，
+所以任何真实 printer.cfg 里带引脚的东西都还接不上。
+
+F 组的 **F2–F9 都依赖 F1**（配置构建层），F3–F9 还需 F2（pin 解析）才能把引脚填进命令；
+F1 只依赖已有的 `Printer` 注册表与 `cmd` 层。
+
+#### F1 MCU 配置构建层（oid / config 命令 / CRC）
+
+上游 `MCUConfigHelper`（`klippy/mcu.py:979-1143`），也就是“怎么把一台真实 MCU 配起来”：
+
+- [ ] **oid 计数**：`create_oid()` 单调发号（`:1118`），`_finalize_config` 把
+      `allocate_oids count=N` 插在最前（`:1004-1020`）。我们只有 `AllocateOids` 命令类型，没有发号器。
+- [ ] **config 命令累积**：`add_config_cmd(cmd, is_init, on_restart)` 分三张表 —— `config` /
+      `restart` / `init`（`:1125`），以及 `register_config_callback`（`:1122`）、
+      `register_post_init_callback`。现在每个命令都是当场 `send`/`call`，没有“先攒后发”的阶段。
+- [ ] **CRC 与 finalize**：`_finalize_config` 跑完回调 → 插入 `allocate_oids` → 用
+      pin resolver 改写命令文本 → `crc = zlib.crc32('\n'.join(config_cmds))` → 追加
+      `finalize_config crc=`（`:1004-1020`）。**CRC 是对命令文本的换行拼接算的**，
+      不是对编码后的字节，这一点要和固件对账。
+- [ ] **两段式下发**：先 `get_config` 问 `is_config/crc/is_shutdown/move_count`
+      （`cmd/config.rs` 已有 `GetConfig`/`ConfigState`），配置不一致就送全量
+      `config + init`，一致就只送 `restart + init`；送完再问一次，然后跑 post-init
+      回调（`:1047-1085`）。重启/CRC 不匹配的处理见 Q7 / D2。
+- [ ] **`seconds_to_clock`**：`int(time * CLOCK_FREQ)`（`:1140`），需要从字典读常量
+      `CLOCK_FREQ`；`get_query_slot`（`:1136`）给周期查询排一个错开的时钟槽。
+- [ ] **`request_move_queue_slot`**（`:1142`）：给运动队列预留槽位，`get_config` 的
+      `move_count` 要够。只影响运动层，但和 F1 一起做最省事。
+- [ ] **`config_reset`**（无参数；基类在 `src/basecmd.c:262`，声明在各板子的 `main.c`，如
+      `src/linux/main.c:59`）：只在停机时可用，清了 CRC、oid 与运动队列；上游在 shutdown
+      恢复路径里用。我们还没有这条命令类型。
+
+#### F2 pin 解析与 `pins` 对象
+
+主机侧的引脚词汇，独立于任何具体资源：上游 `klippy/pins.py`（`PrinterPins` `:60`、
+`PinResolver` `:18`）：
+
+- [ ] `parse_pin`：`[chip:]pin` 描述，`!` 取反、`^`/`~` 上拉（`:67-95`）。单个主机进程
+      可挂多个 MCU，`chip` 就是 MCU 名（默认 `mcu`）。
+- [ ] `lookup_pin` / `setup_pin`：同一个 pin 重复使用要同 `share_type` 且极性一致，否则报
+      `pin X used multiple times in config`；`allow_multi_use_pin` / `reset_pin_sharing`
+      是例外口子（`:96-119`）。
+- [ ] `PinResolver`：`reserve_pin` / `alias_pin` / `update_command` —— 后者把命令文本里的
+      `pin=<名字>` 换成别名并查保留（`:24-49`）。`RESERVE_PINS_*` 常量在 identify 时预留
+      （`klippy/mcu.py:1091-1100`），`BUS_PINS_<bus>` 在总线建立时预留
+      （`klippy/extras/bus.py:9-32`）。
+- [ ] `add_printer_objects` 把 `pins` 注册成 printer object（`pins.py:137`）。字典里的
+      `pin` 枚举（名字→编号）已经在 `Dictionary::enumeration` 里，pin 描述最终靠它编码；
+      报错文案要对齐：`Pin 'X' is not a valid pin name on mcu 'Y'`
+      （`mcu.py:1021-1032`）。
+
+#### F3 GPIO 输出
+
+- [ ] `MCU_digital_out`（`klippy/mcu.py:408-449`）：`config_digital_out oid=%c pin=%u
+      value=%c default_value=%c max_duration=%u` + 重启时的 `update_digital_out
+      oid=%c value=%c` + 带时钟的 `queue_digital_out oid=%c clock=%u on_ticks=%u`。
+      固件 `src/gpiocmds.c:127` `:174` `:195`。
+- [ ] `MCU_bus_digital_out`（`klippy/extras/bus.py:337` 以后）：挂在命令队列上、与运动
+      同步的输出；同样一对 `config_digital_out` + `update_digital_out`。
+- [ ] 上位消费者：`output_pin`（`klippy/extras/output_pin.py`）、风扇/库门等。
+- 跟 F1 的 `max_duration` 约束：`start_value == shutdown_value`，否则建配置就报错。
+
+#### F4 PWM（硬件 / 软件）
+
+上游 `MCU_pwm`（`klippy/mcu.py:451-553`）：
+
+- [ ] **硬件**：`config_pwm_out oid=%c pin=%u cycle_ticks=%u value=%hu default_value=%hu
+      max_duration=%u` + `queue_pwm_out oid=%c clock=%u value=%hu`
+      （固件 `src/pwmcmds.c:78` `:105`），满量程取常量 `PWM_MAX`。
+- [ ] **软件**：没有硬件 PWM 时用 `config_digital_out` + `set_digital_out_pwm_cycle
+      oid=%c cycle_ticks=%u` + `queue_digital_out`（固件 `src/gpiocmds.c:141` `:174`），
+      满量程是 `cycle_ticks`。
+- [ ] `next_aligned_print_time`（`:531`）：软件 PWM 的值变化要对齐到周期边界，不能任意时刻改。
+- [ ] `pin_type` 是 `pwm`，可翻转；`shutdown_value` 在软件 PWM 下必须是 0 或 1。
+
+#### F5 ADC
+
+上游 `MCU_adc`（`klippy/mcu.py:555-655`）：
+
+- [ ] `config_analog_in oid=%c pin=%u` + 周期查询 `query_analog_in oid=%c clock=%u
+      sample_ticks=%u sample_count=%c rest_ticks=%u bytes_per_report=%c min_value=%hu
+      max_value=%hu range_check_count=%c`，回应是 `analog_in_state oid=%c next_clock=%u
+      value=%hu`（固件 `src/adccmds.c:75` `:100`）。
+- [ ] 采样批处理（`batch_num`）与旧格式兼容分支：上游先试 `bytes_per_report`，拿不到就退回
+      一次性 `sample_count`（`:619-655`）。我们的字典是运行期下发的，所以“有没有这条命令”
+      可以直接用 `Dictionary::message` 判断。
+- [ ] 满量程 `ADC_MAX` 常量、`sample_count * ADC_MAX < 2^16` 的上限、`get_query_slot` 的
+      查询相位。消费者：`thermistor` / `adc_temperature` / `temperature_sensor`。
+
+#### F6 SPI 总线
+
+上游 `MCU_SPI`（`klippy/extras/bus.py:42-155`）：
+
+- [ ] 设备侧：`config_spi oid=%c pin=%u cs_active_high=%c`（或 `config_spi_without_cs`），
+      总线侧：`spi_set_bus oid=%c spi_bus=%u mode=%u rate=%u`，收发：
+      `spi_send oid=%c data=%*s`、`spi_transfer oid=%c data=%*s` /
+      `spi_transfer_response oid=%c response=%*s`；还有 `config_spi_shutdown`
+      （固件 `src/spicmds.c:37` `:62` `:122` `:157`）。
+- [ ] `resolve_bus_name`（`bus.py:9-32`）：从字典的 `spi_bus`（或通用 `bus`）枚举里取总线号；
+      没写 `spi_bus` 时要求总线 0 在枚举里，否则报 `Must specify spi_bus on mcu 'X'`；未知总线报
+      `Unknown spi_bus 'X'`。
+- [ ] 软件 SPI（`spi_software_{miso,mosi,sclk}_pin`）：`spi_set_sw_bus`（新）/ 
+      `spi_set_software_bus`（旧），固件 `src/spi_software.c`。
+- [ ] `MCU_SPI_from_config`（`bus.py:124`）：从 section 读 `cs_pin` / `spi_speed` /
+      `spi_bus` / 软件引脚，`cs_pin=None` 时不占用引脚的共享。
+
+#### F7 I2C 总线
+
+上游 `MCU_I2C`（`klippy/extras/bus.py:161` 以后）：
+
+- [ ] 设备侧：`config_i2c oid=%c`，总线侧：`i2c_set_bus oid=%c i2c_bus=%u rate=%u
+      address=%u`；传输：`i2c_transfer oid=%c write=%*s read_len=%u` /
+      `i2c_response oid=%c i2c_bus_status=%c response=%*s`，或新式的 `i2c_write` /
+      `i2c_read` + `i2c_read_response`（固件 `src/i2ccmds.c:32` `:48` `:107`）。
+- [ ] `i2c_bus_status` 不是 `SUCCESS` 时上游会 `invoke_shutdown`
+      （`bus.py:295-300`）；`i2c_write` 的 retry 与 `async_write_only` 是可选分支。
+- [ ] 软件 I2C（`i2c_software_{scl,sda}_pin`）：`i2c_set_sw_bus`，固件 `src/i2c_software.c`。
+
+#### F8 endstop / trsync（与 C1 共享）
+
+- [ ] `MCU_endstop`（`klippy/mcu.py:340-407`）：`config_endstop oid=%c pin=%c pull_up=%c`、
+      回零 `endstop_home oid=%c clock=%u sample_ticks=%u sample_count=%c rest_ticks=%u
+      pin_value=%c trsync_oid=%c trigger_reason=%c`、查询 `endstop_query_state oid=%c` /
+      `endstop_state oid=%c homing=%c next_clock=%u pin_value=%c`（固件 `src/endstop.c:72`
+      `:97` `:115`）。
+- [ ] `MCU_trsync` / `TriggerDispatch`（`mcu.py:155-339`）：多 MCU 同步触发
+      （`src/trsync.c`），回零结束时用来同时停各个轴。这是 C1 回零的直接前置。
+- [ ] 消费者是 `homing`（`klippy/extras/homing.py`），所以这条要等 toolhead 的接口
+      （`home_rails` / `get_trigger_position`，见 C1）一起定。
+
+#### F9 其他输入与外设资源
+
+建立在 F1–F6 之上，各自一个 `config_*` + 查询/事件：
+
+- [ ] `buttons`（`src/buttons.c`，`config_buttons` / `buttons_add` / `buttons_query` /
+      `buttons_ack`）—— 暂停/恢复按钮、耗材检测。
+- [ ] `pulse_counter`、`neopixel` / `dotstar` / `led`、`tmcuart`、`sdcard` / `sdio`、
+      `lcd_hd44780` / `lcd_st7920`、`sensor_bulk`（批量传感器上报）与各类 SPI/I2C 传感器
+      （`sensor_adxl345` / `sensor_lis2dw` / …）。
+- 这些是 extras，不阻塞运动；等 F1–F6 完成、真有对应 section 时再逐个接。
 
 ### C1（旧 T4）toolhead 与 kinematics
 
@@ -290,3 +445,10 @@ kinematics 已随 Printer 重构删除，从这里重新开始：
 | IDEX / 双滑车 | `klippy/kinematics/idex_modes.py`、`klippy/kinematics/cartesian.py:19-30` |
 | step 生成层的运动学 | `klippy/kinematics/kinematic_stepper.py`、`rail.setup_itersolve(...)` |
 | 惰性装载 | `klippy/extras/adc_temperature.py:51` `load_object(config, 'query_adc')` |
+| MCU 配置构建（oid / config 命令 / CRC / pin 解析） | `klippy/mcu.py:979-1143`、`klippy/pins.py:18-137` |
+| 固件配置区（allocate_oids / get_config / finalize / config_reset） | `src/basecmd.c:235-380` |
+| GPIO 输出 / PWM（软件） | `klippy/mcu.py:408-553`、`src/gpiocmds.c:127-215` |
+| 硬件 PWM | `klippy/mcu.py:451-553`、`src/pwmcmds.c:78-130` |
+| ADC 采样与周期查询 | `klippy/mcu.py:555-655`、`src/adccmds.c:75-115` |
+| SPI / I2C 总线 | `klippy/extras/bus.py:9-336`、`src/spicmds.c`、`src/i2ccmds.c` |
+| endstop / trsync 触发 | `klippy/mcu.py:155-407`、`src/endstop.c:72-120`、`src/trsync.c` |

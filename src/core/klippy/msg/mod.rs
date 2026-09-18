@@ -89,9 +89,8 @@ impl Msg {
                 .ok_or_else(|| MsgError::new(format!("invalid parameter format: {}", part)))?;
             let param_name = part[..eq].to_string();
             let typ = &part[eq + 1..];
-            let arg_type = ArgType::parse_format(typ).map_err(|_| {
-                MsgError::new(format!("unknown type specifier: {}", typ))
-            })?;
+            let arg_type = ArgType::parse_format(typ)
+                .map_err(|_| MsgError::new(format!("unknown type specifier: {}", typ)))?;
             params.push((param_name, arg_type));
         }
         Ok(Self {
@@ -201,7 +200,11 @@ mod tests {
 
     #[test]
     fn test_format_roundtrip() {
-        for fmt in ["NOP", "CMD x=%u", "COMBINED a=%u b=%i c=%hu d=%hi e=%s f=%.*s"] {
+        for fmt in [
+            "NOP",
+            "CMD x=%u",
+            "COMBINED a=%u b=%i c=%hu d=%hi e=%s f=%.*s",
+        ] {
             let msg = Msg::parse(1, fmt).unwrap();
             assert_eq!(msg.format(), fmt);
         }

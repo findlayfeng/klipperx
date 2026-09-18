@@ -7,19 +7,19 @@
 // - Multiline values: indented lines continue previous value
 // - Empty sections: [id] with no parameters
 
+pub mod mcu;
+pub mod section;
 pub mod source;
 pub mod value;
-pub mod section;
-pub mod mcu;
 
 use std::collections::HashSet;
 use std::fs;
 use std::io::Read;
 use std::path::Path;
 
+pub use section::ConfigSection;
 pub use source::ConfigSource;
 pub use value::ConfigValue;
-pub use section::ConfigSection;
 
 /// Represents a complete Klipper configuration file
 #[derive(Debug, Clone)]
@@ -86,7 +86,9 @@ impl Config {
     /// Create a Config from any source implementing `std::io::Read`.
     pub fn from_read<R: Read>(mut reader: R) -> Result<(Self, Vec<ConfigSource>), String> {
         let mut content = String::new();
-        reader.read_to_string(&mut content).map_err(|e| format!("Failed to read config: {}", e))?;
+        reader
+            .read_to_string(&mut content)
+            .map_err(|e| format!("Failed to read config: {}", e))?;
         let source = ConfigSource::None(content);
         Self::parse(source)
     }
@@ -107,10 +109,17 @@ impl Config {
     /// Parse a config from a URL.
     pub fn from_url(url: &str) -> Result<(Self, Vec<ConfigSource>), String> {
         let client = reqwest::blocking::Client::new();
-        let response = client.get(url).send().map_err(|e| format!("Failed to fetch config from URL '{}': {}", url, e))?;
+        let response = client
+            .get(url)
+            .send()
+            .map_err(|e| format!("Failed to fetch config from URL '{}': {}", url, e))?;
 
         if !response.status().is_success() {
-            return Err(format!("Failed to fetch config from URL '{}': HTTP {}", url, response.status()));
+            return Err(format!(
+                "Failed to fetch config from URL '{}': HTTP {}",
+                url,
+                response.status()
+            ));
         }
 
         let source = ConfigSource::Url(url.to_string());
@@ -118,7 +127,11 @@ impl Config {
     }
 
     /// Internal parse logic with include support.
-    fn parse_with_includes(content: &str, source: &ConfigSource, visited: &mut HashSet<ConfigSource>) -> Result<(Self, Vec<ConfigSource>), String> {
+    fn parse_with_includes(
+        content: &str,
+        source: &ConfigSource,
+        visited: &mut HashSet<ConfigSource>,
+    ) -> Result<(Self, Vec<ConfigSource>), String> {
         let mut config = Self::new();
         let mut sources = Vec::new();
         let mut current_section: Option<ConfigSection> = None;
@@ -145,13 +158,13 @@ impl Config {
                                 )
                             })?;
 
-                        let include_source = Self::resolve_include_source(include_path_str, source)?;
+                        let include_source =
+                            Self::resolve_include_source(include_path_str, source)?;
 
                         if visited.contains(&include_source) {
                             return Err(format!(
                                 "Line {}: Circular include detected: {}",
-                                line_num,
-                                include_source
+                                line_num, include_source
                             ));
                         }
 
@@ -180,13 +193,14 @@ impl Config {
                 continue;
             }
 
-            let section = current_section.as_mut().ok_or_else(|| {
-                format!("Line {}: Parameter outside of section", line_num)
-            })?;
+            let section = current_section
+                .as_mut()
+                .ok_or_else(|| format!("Line {}: Parameter outside of section", line_num))?;
 
             if is_multiline && (line.starts_with(' ') || line.starts_with('\t')) {
                 if let Some(key) = &current_key {
-                    if let Some(ConfigValue::Multi(ref mut lines)) = section.parameters.get_mut(key) {
+                    if let Some(ConfigValue::Multi(ref mut lines)) = section.parameters.get_mut(key)
+                    {
                         lines.push(trimmed.to_string());
                         continue;
                     }
@@ -207,17 +221,25 @@ impl Config {
 
             if value_str.is_empty() {
                 is_multiline = true;
-                section.parameters.insert(key, ConfigValue::Multi(Vec::new()));
+                section
+                    .parameters
+                    .insert(key, ConfigValue::Multi(Vec::new()));
             } else {
-                section.parameters.insert(key, ConfigValue::Single(value_str.to_string()));
+                section
+                    .parameters
+                    .insert(key, ConfigValue::Single(value_str.to_string()));
             }
         }
 
         if let Some(section) = current_section {
             if section.id == "include" {
-                let include_path_str = section.sub.as_deref()
+                let include_path_str = section
+                    .sub
+                    .as_deref()
                     .or_else(|| section.get_str("path"))
-                    .ok_or_else(|| "[include] section requires a 'path' parameter or sub field".to_string())?;
+                    .ok_or_else(|| {
+                    "[include] section requires a 'path' parameter or sub field".to_string()
+                })?;
 
                 let include_source = Self::resolve_include_source(include_path_str, source)?;
                 if visited.contains(&include_source) {
@@ -243,15 +265,25 @@ impl Config {
     /// Read content from a ConfigSource
     fn read_source(source: &ConfigSource) -> Result<String, String> {
         match source {
-            ConfigSource::File(path) => fs::read_to_string(path).map_err(|e| format!("Failed to read file '{}': {}", path.display(), e)),
+            ConfigSource::File(path) => fs::read_to_string(path)
+                .map_err(|e| format!("Failed to read file '{}': {}", path.display(), e)),
             ConfigSource::Url(url) => {
                 let client = reqwest::blocking::Client::new();
-                let response = client.get(url).send().map_err(|e| format!("Failed to fetch URL '{}': {}", url, e))?;
+                let response = client
+                    .get(url)
+                    .send()
+                    .map_err(|e| format!("Failed to fetch URL '{}': {}", url, e))?;
                 if !response.status().is_success() {
-                    return Err(format!("Failed to fetch URL '{}': HTTP {}", url, response.status()));
+                    return Err(format!(
+                        "Failed to fetch URL '{}': HTTP {}",
+                        url,
+                        response.status()
+                    ));
                 }
-                response.text().map_err(|e| format!("Failed to read URL '{}': {}", url, e))
-            },
+                response
+                    .text()
+                    .map_err(|e| format!("Failed to read URL '{}': {}", url, e))
+            }
             ConfigSource::None(s) => Ok(s.clone()),
         }
     }
@@ -302,7 +334,9 @@ impl Config {
         for segment in segments {
             match segment {
                 "." => continue,
-                ".." => { resolved.pop(); }
+                ".." => {
+                    resolved.pop();
+                }
                 _ => resolved.push(segment),
             }
         }
@@ -316,7 +350,10 @@ impl Config {
     }
 
     /// Resolve an include path relative to the current config's source.
-    pub(crate) fn resolve_include_source(path_param: &str, source: &ConfigSource) -> Result<ConfigSource, String> {
+    pub(crate) fn resolve_include_source(
+        path_param: &str,
+        source: &ConfigSource,
+    ) -> Result<ConfigSource, String> {
         if path_param.starts_with("http://") || path_param.starts_with("https://") {
             return Ok(ConfigSource::Url(path_param.to_string()));
         }
@@ -330,7 +367,7 @@ impl Config {
                     let base_dir = base_path.parent().unwrap_or(Path::new("."));
                     Ok(ConfigSource::File(base_dir.join(path)))
                 }
-            },
+            }
             ConfigSource::Url(base_url) => {
                 if let Some(base_dir) = Self::url_parent(base_url) {
                     let resolved_url = format!("{}/{}", base_dir, path_param);
@@ -338,12 +375,13 @@ impl Config {
                 } else {
                     Ok(ConfigSource::Url(path_param.to_string()))
                 }
-            },
+            }
             ConfigSource::None(_) => {
-                let cwd = std::env::current_dir().map_err(|e| format!("Failed to get current directory: {}", e))?;
+                let cwd = std::env::current_dir()
+                    .map_err(|e| format!("Failed to get current directory: {}", e))?;
                 let resolved_path = cwd.join(path);
                 Ok(ConfigSource::File(resolved_path))
-            },
+            }
         }
     }
 }

@@ -2,8 +2,8 @@ use super::error::InterfaceError;
 use crate::core::klippy::frame::Frame;
 
 use super::Device;
-use std::{collections::VecDeque, sync::Mutex};
 use crossbeam_channel::{bounded, Receiver, Sender};
+use std::{collections::VecDeque, sync::Mutex};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct MappingEntry {
@@ -52,9 +52,10 @@ impl Device for TestDevice {
             ))?;
 
             // Clone the sender for sending outside the lock.
-            let tx = self.buf_tx.lock().unwrap().clone().ok_or_else(|| {
-                InterfaceError::SendError("channel already closed".to_string())
-            })?;
+            let tx =
+                self.buf_tx.lock().unwrap().clone().ok_or_else(|| {
+                    InterfaceError::SendError("channel already closed".to_string())
+                })?;
 
             // Drop the sender when all mappings are consumed.
             // Dropping the last sender closes the channel, causing `receive()`
@@ -74,8 +75,9 @@ impl Device for TestDevice {
         }
 
         for output_frame in entry.outputs {
-            tx.send(output_frame)
-                .map_err(|e| InterfaceError::SendError(format!("Failed to send output frame: {e}")))?;
+            tx.send(output_frame).map_err(|e| {
+                InterfaceError::SendError(format!("Failed to send output frame: {e}"))
+            })?;
         }
 
         Ok(())

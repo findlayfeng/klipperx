@@ -1,5 +1,5 @@
-use super::error::{MsgError, MsgResult};
 use super::super::frame::MESSAGE_PAYLOAD_MAX;
+use super::error::{MsgError, MsgResult};
 
 /// Parameter type enum.
 #[derive(Debug, Clone, PartialEq, Copy, Eq, Hash)]
@@ -79,15 +79,11 @@ impl ArgValue {
         };
         match target {
             ArgType::UInt8 if (0..=u8::MAX as i64).contains(&n) => Ok(ArgValue::UInt8(n as u8)),
-            ArgType::UInt16 if (0..=u16::MAX as i64).contains(&n) => {
-                Ok(ArgValue::UInt16(n as u16))
-            }
+            ArgType::UInt16 if (0..=u16::MAX as i64).contains(&n) => Ok(ArgValue::UInt16(n as u16)),
             ArgType::Int16 if (i16::MIN as i64..=i16::MAX as i64).contains(&n) => {
                 Ok(ArgValue::Int16(n as i16))
             }
-            ArgType::UInt32 if (0..=u32::MAX as i64).contains(&n) => {
-                Ok(ArgValue::UInt32(n as u32))
-            }
+            ArgType::UInt32 if (0..=u32::MAX as i64).contains(&n) => Ok(ArgValue::UInt32(n as u32)),
             ArgType::Int32 if (i32::MIN as i64..=i32::MAX as i64).contains(&n) => {
                 Ok(ArgValue::Int32(n as i32))
             }
@@ -540,10 +536,7 @@ mod tests {
         }
 
         // Unsigned values share the encoder for the non-negative range.
-        for (value, expected) in [
-            (96u32, &[0x80, 0x60][..]),
-            (12345, &[0x80, 0xe0, 0x39][..]),
-        ] {
+        for (value, expected) in [(96u32, &[0x80, 0x60][..]), (12345, &[0x80, 0xe0, 0x39][..])] {
             let mut payload = Payload::new();
             payload.push_u32(value).unwrap();
             assert_eq!(payload.payload(), expected, "u32 value {value}");
@@ -635,12 +628,16 @@ mod tests {
         // Five-byte encoding of u32::MAX as produced by Klipper's
         // `PT_uint32.encode()` (unsigned path).
         let mut payload = Payload::new();
-        payload.raw.extend_from_slice(&[0x8F, 0xFF, 0xFF, 0xFF, 0x7F]);
+        payload
+            .raw
+            .extend_from_slice(&[0x8F, 0xFF, 0xFF, 0xFF, 0x7F]);
         assert_eq!(payload.as_parser().pop_u32().unwrap(), u32::MAX);
 
         // Five-byte encoding of i32::MIN (C `encode_int`).
         let mut payload = Payload::new();
-        payload.raw.extend_from_slice(&[0x88, 0x80, 0x80, 0x80, 0x00]);
+        payload
+            .raw
+            .extend_from_slice(&[0x88, 0x80, 0x80, 0x80, 0x00]);
         assert_eq!(payload.as_parser().pop_i32().unwrap(), i32::MIN);
     }
 
@@ -658,12 +655,7 @@ mod tests {
 
     #[test]
     fn test_push_pop_bytes_roundtrip() {
-        let test_cases = [
-            b"".as_slice(),
-            b"hello",
-            b"\x00\x01\x02",
-            &[0u8; 50],
-        ];
+        let test_cases = [b"".as_slice(), b"hello", b"\x00\x01\x02", &[0u8; 50]];
         for data in test_cases {
             let mut payload = Payload::new();
             payload.push_bytes(data).unwrap();
@@ -710,16 +702,36 @@ mod tests {
         payload.push_value(&ArgValue::Int16(-567)).unwrap();
         payload.push_value(&ArgValue::UInt32(12345)).unwrap();
         payload.push_value(&ArgValue::Int32(-12345)).unwrap();
-        payload.push_value(&ArgValue::Str("hello".to_string())).unwrap();
+        payload
+            .push_value(&ArgValue::Str("hello".to_string()))
+            .unwrap();
         payload.push_value(&ArgValue::Bytes(vec![1, 2, 3])).unwrap();
 
         let mut parser = payload.as_parser();
-        assert_eq!(parser.pop_value(ArgType::UInt8).unwrap(), ArgValue::UInt8(42));
-        assert_eq!(parser.pop_value(ArgType::UInt16).unwrap(), ArgValue::UInt16(1234));
-        assert_eq!(parser.pop_value(ArgType::Int16).unwrap(), ArgValue::Int16(-567));
-        assert_eq!(parser.pop_value(ArgType::UInt32).unwrap(), ArgValue::UInt32(12345));
-        assert_eq!(parser.pop_value(ArgType::Int32).unwrap(), ArgValue::Int32(-12345));
-        assert_eq!(parser.pop_value(ArgType::Str).unwrap(), ArgValue::Str("hello".to_string()));
+        assert_eq!(
+            parser.pop_value(ArgType::UInt8).unwrap(),
+            ArgValue::UInt8(42)
+        );
+        assert_eq!(
+            parser.pop_value(ArgType::UInt16).unwrap(),
+            ArgValue::UInt16(1234)
+        );
+        assert_eq!(
+            parser.pop_value(ArgType::Int16).unwrap(),
+            ArgValue::Int16(-567)
+        );
+        assert_eq!(
+            parser.pop_value(ArgType::UInt32).unwrap(),
+            ArgValue::UInt32(12345)
+        );
+        assert_eq!(
+            parser.pop_value(ArgType::Int32).unwrap(),
+            ArgValue::Int32(-12345)
+        );
+        assert_eq!(
+            parser.pop_value(ArgType::Str).unwrap(),
+            ArgValue::Str("hello".to_string())
+        );
         assert_eq!(
             parser.pop_value(ArgType::Bytes).unwrap(),
             ArgValue::Bytes(vec![1, 2, 3])
@@ -749,17 +761,23 @@ mod tests {
             ArgValue::Int16(255)
         );
         assert_eq!(
-            ArgValue::UInt8(100).try_convert_to(ArgType::UInt16).unwrap(),
+            ArgValue::UInt8(100)
+                .try_convert_to(ArgType::UInt16)
+                .unwrap(),
             ArgValue::UInt16(100)
         );
         assert_eq!(
-            ArgValue::UInt16(32767).try_convert_to(ArgType::Int16).unwrap(),
+            ArgValue::UInt16(32767)
+                .try_convert_to(ArgType::Int16)
+                .unwrap(),
             ArgValue::Int16(32767)
         );
 
         // Narrowing is allowed when the value still fits.
         assert_eq!(
-            ArgValue::UInt32(100).try_convert_to(ArgType::UInt16).unwrap(),
+            ArgValue::UInt32(100)
+                .try_convert_to(ArgType::UInt16)
+                .unwrap(),
             ArgValue::UInt16(100)
         );
         assert_eq!(
@@ -774,27 +792,37 @@ mod tests {
         // Sign-losing or truncating conversions are rejected instead of
         // wrapping.
         assert!(ArgValue::Int16(-1).try_convert_to(ArgType::UInt16).is_err());
-        assert!(ArgValue::UInt16(40000).try_convert_to(ArgType::Int16).is_err());
+        assert!(ArgValue::UInt16(40000)
+            .try_convert_to(ArgType::Int16)
+            .is_err());
         assert!(ArgValue::Int32(-1).try_convert_to(ArgType::UInt32).is_err());
-        assert!(
-            ArgValue::UInt32(i32::MAX as u32 + 1)
-                .try_convert_to(ArgType::Int32)
-                .is_err()
-        );
-        assert!(ArgValue::Int32(0x1_0000).try_convert_to(ArgType::UInt16).is_err());
+        assert!(ArgValue::UInt32(i32::MAX as u32 + 1)
+            .try_convert_to(ArgType::Int32)
+            .is_err());
+        assert!(ArgValue::Int32(0x1_0000)
+            .try_convert_to(ArgType::UInt16)
+            .is_err());
 
         // `%s` and `%.*s` share a wire format and may be converted, but
         // numbers never convert to or from strings/buffers.
         assert_eq!(
-            ArgValue::Str("hi".to_string()).try_convert_to(ArgType::Bytes).unwrap(),
+            ArgValue::Str("hi".to_string())
+                .try_convert_to(ArgType::Bytes)
+                .unwrap(),
             ArgValue::Bytes(b"hi".to_vec())
         );
         assert_eq!(
-            ArgValue::Bytes(b"hi".to_vec()).try_convert_to(ArgType::Str).unwrap(),
+            ArgValue::Bytes(b"hi".to_vec())
+                .try_convert_to(ArgType::Str)
+                .unwrap(),
             ArgValue::Str("hi".to_string())
         );
-        assert!(ArgValue::Bytes(vec![0xFF, 0xFE]).try_convert_to(ArgType::Str).is_err());
-        assert!(ArgValue::Str("x".to_string()).try_convert_to(ArgType::UInt32).is_err());
+        assert!(ArgValue::Bytes(vec![0xFF, 0xFE])
+            .try_convert_to(ArgType::Str)
+            .is_err());
+        assert!(ArgValue::Str("x".to_string())
+            .try_convert_to(ArgType::UInt32)
+            .is_err());
         assert!(ArgValue::UInt32(1).try_convert_to(ArgType::Str).is_err());
     }
 
@@ -897,8 +925,14 @@ mod tests {
         payload.extend_values(&values).unwrap();
 
         let mut parser = payload.as_parser();
-        assert_eq!(parser.pop_value(ArgType::UInt32).unwrap(), ArgValue::UInt32(1));
-        assert_eq!(parser.pop_value(ArgType::Str).unwrap(), ArgValue::Str("test".to_string()));
+        assert_eq!(
+            parser.pop_value(ArgType::UInt32).unwrap(),
+            ArgValue::UInt32(1)
+        );
+        assert_eq!(
+            parser.pop_value(ArgType::Str).unwrap(),
+            ArgValue::Str("test".to_string())
+        );
         assert_eq!(
             parser.pop_value(ArgType::Bytes).unwrap(),
             ArgValue::Bytes(vec![0xDE, 0xAD])

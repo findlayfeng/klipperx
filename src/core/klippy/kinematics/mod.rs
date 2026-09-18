@@ -12,7 +12,7 @@ pub mod none;
 
 // Re-export common types
 pub use kinematics::{
-    Coord, HomingAxes, HomingState, Kinematics, KinematicsError, KinematicsFactory,
-    KinematicsStatus, Move, StepperHandle, load_kinematics,
+    load_kinematics, Coord, HomingAxes, HomingState, Kinematics, KinematicsError,
+    KinematicsFactory, KinematicsStatus, Move, StepperHandle,
 };
-pub use none::{NoneKinematics, load_kinematics as load_none_kinematics};
+pub use none::{load_kinematics as load_none_kinematics, NoneKinematics};

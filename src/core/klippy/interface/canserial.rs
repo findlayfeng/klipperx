@@ -31,9 +31,9 @@
 //! the printer's wiring rather than this implementation, and a Klipper config
 //! should keep working.
 
+use super::error::InterfaceError;
 use super::Device;
 use crate::core::klippy::frame::{Frame, FrameStream};
-use super::error::InterfaceError;
 use std::ffi::CString;
 use std::fmt;
 use std::fs::File;

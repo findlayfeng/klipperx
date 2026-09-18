@@ -47,6 +47,9 @@ mod tests {
         assert_eq!(format!("{}", none_source), "<in-memory:empty>");
 
         let none_source_with_content = ConfigSource::None("test content".to_string());
-        assert_eq!(format!("{}", none_source_with_content), "<in-memory:test content>");
+        assert_eq!(
+            format!("{}", none_source_with_content),
+            "<in-memory:test content>"
+        );
     }
 }

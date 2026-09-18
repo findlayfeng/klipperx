@@ -51,11 +51,11 @@
 //! threads it spawns must be joined before the library is unloaded — hence the
 //! explicit teardown in [`Drop`].
 
+use super::error::InterfaceError;
 use super::Device;
 use crate::core::klippy::frame::Frame;
 #[cfg(test)]
 use crate::core::klippy::frame::FrameStream;
-use super::error::InterfaceError;
 use crossbeam_channel::{unbounded, Receiver};
 use libloading::Library;
 use std::fmt;

@@ -59,9 +59,7 @@ impl ConfigSectionMap {
     /// Iterate over all sections. See the type-level docs for why this does
     /// not filter by a specific id.
     pub fn iter_by_id(&self) -> impl Iterator<Item = &ConfigSection> + '_ {
-        self.keys
-            .iter()
-            .filter_map(move |key| self.by_key.get(key))
+        self.keys.iter().filter_map(move |key| self.by_key.get(key))
     }
 }
 

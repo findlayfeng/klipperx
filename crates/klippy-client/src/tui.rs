@@ -553,8 +553,16 @@ fn visible_lines(app: &App, width: usize, height: usize) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
     let wanted = height + app.scroll;
 
-    for (index, entry) in app.entries.iter().enumerate().rev() {
-        let style = stripe(entry_style(entry), index);
+    // Messages alternate between two colours; the index counts messages, not
+    // entries, so two in a row never look alike however many log lines sit
+    // between them.
+    let mut messages_left = app.entries.iter().filter(|entry| is_message(entry)).count();
+
+    for entry in app.entries.iter().rev() {
+        if is_message(entry) {
+            messages_left -= 1;
+        }
+        let style = entry_style(entry, messages_left);
         // Wrapped by hand rather than by `Paragraph::wrap`: the pane has to know
         // how many lines each entry takes to scroll by the right amount.
         // Backwards, like the entries: the pane is collected from its bottom
@@ -581,13 +589,19 @@ fn visible_lines(app: &App, width: usize, height: usize) -> Vec<Line<'static>> {
 }
 
 /// How an entry looks.
-fn entry_style(entry: &Entry) -> Style {
+///
+/// Messages alternate between two colours — `message_index` is the message's
+/// position among messages, not among entries — so two messages in a row never
+/// look alike however many log lines sit between them. A failed request is red
+/// instead: it is the one thing that must not blend in. Log lines and notices
+/// keep their own colours.
+fn entry_style(entry: &Entry, message_index: usize) -> Style {
     match entry {
-        // What was sent is context, not news.
-        Entry::Sent { .. } => Style::new().add_modifier(Modifier::DIM),
         // A failed request is the thing the user has to notice.
         Entry::Reply(reply) if reply.is_error() => Style::new().fg(Color::Red),
-        Entry::Reply(_) | Entry::Push(_) => Style::new(),
+        Entry::Sent { .. } | Entry::Reply(_) | Entry::Push(_) => {
+            Style::new().fg(MESSAGE_COLORS[message_index % MESSAGE_COLORS.len()])
+        }
         Entry::Log { level, .. } => match level {
             LogLevel::Debug => Style::new().add_modifier(Modifier::DIM),
             LogLevel::Info => Style::new().fg(Color::DarkGray),
@@ -603,20 +617,16 @@ fn entry_style(entry: &Entry) -> Style {
     }
 }
 
-/// The dark tint that tells one entry from the next.
+/// The two colours a message alternates between.
 ///
-/// Every other entry gets it, so two consecutive messages do not read as one
-/// block. It is a dark grey because the rest of the palette — dim grey info
-/// lines, coloured errors — assumes a dark terminal.
-const STRIPE: Color = Color::Indexed(236);
+/// Plain ANSI foregrounds rather than a 256-colour background: a background tint
+/// is invisible on many terminals (and on a dark terminal a dark tint is no tint
+/// at all), while these differ wherever colour is shown at all.
+const MESSAGE_COLORS: [Color; 2] = [Color::White, Color::Gray];
 
-/// Give alternating entries the stripe background.
-fn stripe(style: Style, index: usize) -> Style {
-    if index % 2 == 1 {
-        style.bg(STRIPE)
-    } else {
-        style
-    }
+/// Whether an entry is a message, rather than the window talking to itself.
+fn is_message(entry: &Entry) -> bool {
+    matches!(entry, Entry::Sent { .. } | Entry::Reply(_) | Entry::Push(_))
 }
 
 /// What the window shows for an entry.
@@ -1147,7 +1157,12 @@ mod tests {
     }
 
     #[test]
-    fn test_styles_tell_the_kinds_apart() {
+    fn test_a_message_alternates_between_two_colours() {
+        let sent = Entry::Sent {
+            id: Some(1),
+            method: "echo".to_string(),
+            message: serde_json::json!({}),
+        };
         let ok = crate::connection::Reply {
             id: serde_json::json!(1),
             method: Some("echo".to_string()),
@@ -1162,21 +1177,27 @@ mod tests {
             }),
         };
 
-        // A sent request is context, a failed one is news, a push is data.
+        // One colour, the other, and back again.
+        assert_eq!(entry_style(&sent, 0).fg, Some(MESSAGE_COLORS[0]));
         assert_eq!(
-            entry_style(&Entry::Sent {
-                id: Some(1),
-                method: "echo".to_string(),
-                message: serde_json::json!({}),
-            })
-            .add_modifier,
-            Modifier::DIM
+            entry_style(&Entry::Push(serde_json::json!({})), 1).fg,
+            Some(MESSAGE_COLORS[1])
         );
-        assert_eq!(entry_style(&Entry::Reply(failed)).fg, Some(Color::Red));
-        assert_eq!(entry_style(&Entry::Reply(ok)).fg, None);
-        assert_eq!(entry_style(&Entry::Push(serde_json::json!({}))).fg, None);
         assert_eq!(
-            entry_style(&Entry::notice(Notice::Problem, "x")).fg,
+            entry_style(&Entry::Reply(ok), 2).fg,
+            Some(MESSAGE_COLORS[0])
+        );
+
+        // A failed request is red wherever it falls in the alternation.
+        assert_eq!(
+            entry_style(&Entry::Reply(failed.clone()), 0).fg,
+            Some(Color::Red)
+        );
+        assert_eq!(entry_style(&Entry::Reply(failed), 1).fg, Some(Color::Red));
+
+        // The window's own lines keep their colours.
+        assert_eq!(
+            entry_style(&Entry::notice(Notice::Problem, "x"), 0).fg,
             Some(Color::Red)
         );
     }
@@ -1346,16 +1367,24 @@ mod tests {
     }
 
     #[test]
-    fn test_adjacent_entries_have_different_backgrounds() {
+    fn test_two_messages_in_a_row_get_different_colours() {
+        // A log line between them must not break the alternation: it counts
+        // messages, not entries.
         let app = app_with(vec![
-            Entry::notice(Notice::Info, "first"),
-            Entry::notice(Notice::Info, "second"),
+            Entry::Push(serde_json::json!({"method": "a"})),
+            Entry::notice(Notice::Info, "a log line between them"),
+            Entry::Push(serde_json::json!({"method": "b"})),
         ]);
 
-        let lines = visible_lines(&app, 20, 4);
+        let lines = visible_lines(&app, 40, 8);
+        let colours: Vec<Option<Color>> = lines
+            .iter()
+            .filter(|line| line.spans[0].content.starts_with('<'))
+            .map(|line| line.spans[0].style.fg)
+            .collect();
 
-        assert_eq!(lines[0].spans[0].style.bg, None);
-        assert_eq!(lines[1].spans[0].style.bg, Some(STRIPE));
+        assert_eq!(colours.len(), 2, "{lines:?}");
+        assert_ne!(colours[0], colours[1], "{lines:?}");
     }
 
     /// The header's lines as plain text.

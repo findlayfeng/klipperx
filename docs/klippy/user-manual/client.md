@@ -74,37 +74,46 @@ $ klippy-client api -a /tmp/klippy_uds list_endpoints
 
 ## 四、交互式：`klippy-client console`
 
-打开就进入一个会话，连上后先自我介绍（问一次主机的 `info`）：
+在终端里打开一扇窗口：上面是打印机状态，中间是实时日志，下面是你敲命令的地方。
+**推送**（订阅来的状态更新）会一直往日志里追加，不跟你抢提示符 —— 这正是窗口
+存在的理由。
 
-```console
-$ klippy-client console -a /tmp/klippy_uds
+```text
+◌ state unknown
 Connected to unix:/tmp/klippy_uds.
-Printer is ready — Printer is ready (v0.12.0-123-gabcdef, 4 core ARMv7 Processor rev 4 (v7l))
-Type a request: a method name (`info`), a method and parameters
-(`objects/query {"objects": {"toolhead": null}}`), or a whole JSON object.
-An `id` is added when you leave it out; `"id": null` sends it unanswered.
-
-Local commands:
-  .help          this text
-  .subscribe     watch every object (`objects/list` + `objects/subscribe`)
-  .subscribe a b watch only the named objects
-  .quit          leave, after printing any reply still owed (also ^D)
-
-Replies print as `<id> (<method>) <result>`; pushes print as `< <message>`.
-klippy> list_endpoints
-2 (list_endpoints)
-  {
-    "endpoints": [
-      "list_endpoints"
-    ]
-  }
-klippy> .quit
-Disconnected from unix:/tmp/klippy_uds.
+info: webhooks: No registered callback for path 'info'
+2 > {"id":2,"method":"list_endpoints","params":{}}
+2 (list_endpoints) {"endpoints":["list_endpoints"]}
+< {"id": null, "method": "klippy:status", "params": {...}}
+klippy> objects/query {"objects": {"toolhead": ["position"]}}
+Enter send · ↑↓ history · PgUp/PgDn scroll · .help · ^C quit
 ```
 
-> 上面第一行 `Printer is ready — …` 是问 `info` 的结果；编号从 2 起是因为
-> `info` 已经用掉了 1。等 `info` 端点写好后就是这个样子，目前那里会打印一行
-> `info: webhooks: No registered callback for path 'info'`（见第五节的说明）。
+第一行是状态行（左边那个符号：`●` 就绪、`◌` 启动中或状态未知、`▲` 出错/停机、
+`✕` 已断开），最后一行是按键提示，中间是日志，倒数第二行是你的输入。
+
+> 上面 `info` 那行报未实现，是因为主机目前只有 `list_endpoints`（见第五节）。
+> 等 `info` 写好后，状态行会显示 `● ready · Printer is ready`，那行错误就不会
+> 出现。
+
+### 按键
+
+| 按键 | 作用 |
+|------|------|
+| `Enter` | 发送这一行 |
+| `↑` / `↓` | 翻之前敲过的命令 |
+| `PgUp` / `PgDn` | 日志往上 / 往下翻（`Ctrl+↑` / `Ctrl+↓` 一次一行） |
+| `←` `→` `Home` `End` `Backspace` `Delete` | 行内编辑 |
+| `Ctrl+A` / `Ctrl+E` | 跳到行首 / 行尾 |
+| `Ctrl+U` | 清掉这一行（不记进历史） |
+| `Ctrl+L` | 清空日志 |
+| `Ctrl+C` / `Ctrl+D` / `Esc` | 退出（欠着的应答会先打完） |
+
+翻看旧日志时，最下面那行会提示 `scrolled back N lines`；按 `PgDn` 回到底部，
+或者直接敲下一条命令也会回到最新处。
+
+窗口用的是终端的备用屏幕，所以**退出之后你终端原本的 scrollback 里没有这些
+内容**。想要能滚回去、能重定向、能 grep 的输出，就用下一节的行模式。
 
 ### 一行就是一个请求
 
@@ -119,28 +128,44 @@ Disconnected from unix:/tmp/klippy_uds.
 
 ### 本地命令
 
-以 `.` 开头的行由客户端自己处理，不会发给主机：
+以 `.` 开头的行由客户端自己处理，不会发给主机。这类行在输入时提示符会变成
+`local>`：
 
 | 命令 | 作用 |
 |------|------|
-| `.help` | 打印这一行的说明 |
-| `.subscribe` | 先问主机有哪些对象（`objects/list`），再订阅全部，之后状态变化会持续打出来 |
+| `.help` | 把这一行的说明打进日志 |
+| `.subscribe` | 先问主机有哪些对象（`objects/list`），再订阅全部，之后状态变化会持续出现 |
 | `.subscribe <对象> …` | 只订阅指定的对象，例如 `.subscribe toolhead extruder heater_bed` |
-| `.quit`（或 `.exit`） | 退出会话；已经在路上的应答会先打出来 |
+| `.quit`（或 `.exit`） | 退出；已经在路上的应答会先打出来 |
 
-想要停止订阅，直接 `.quit` 即可：协议规定客户端靠断开连接来取消订阅。
+想要停止订阅，直接退出即可：协议规定客户端靠断开连接来取消订阅。
 
-### 输出怎么读
+### 日志怎么读
 
 | 前缀 | 含义 |
 |------|------|
-| `1 (list_endpoints) { … }` | 编号为 1 的请求的应答，括号里是当初发的方法名 |
-| `! 2 (objects/query) Missing Argument [objects]` | 请求失败（这里是缺参数），后面是主机的错误说明 |
-| `< {"id": null, "method": "klippy:status", …}` | 主机主动推来的消息，不是你问了才有的 —— `.subscribe` 之后就会看到 |
+| `2 > {"id":2,…}` | 客户端**发出去**的请求（灰色） |
+| `2 (list_endpoints) { … }` | 编号为 2 的请求的应答，括号里是当初发的方法名 |
+| `! 3 (objects/query) Missing Argument [objects]` | 请求失败（这里是缺参数），后面是主机的错误说明（红色） |
+| `< {"id": null, "method": "klippy:status", …}` | 主机主动推来的消息，不是你问了才有的 —— 订阅之后就会看到 |
 
-`^D`（或让管道结束）与 `.quit` 等效，只是前者在输入用完后还会等一小会儿，
-把欠着的应答打完再退出。所以 `printf 'list_endpoints\n' | klippy-client console -a …`
-也能用；不过真要写脚本，用 `klippy-client api` 更直接。
+### 没有终端的时候
+
+窗口需要终端。输入或输出只要有一头是管道（`printf … | klippy-client console`），
+就自动换成**行模式**：一次一行、没有提示符、没有窗口，输出可以直接重定向。
+在终端里想强制用它，加 `--plain`：
+
+```console
+$ printf 'list_endpoints\n' | klippy-client console -a /tmp/klippy_uds
+Connected to unix:/tmp/klippy_uds.
+info: webhooks: No registered callback for path 'info'
+2 (list_endpoints) {"endpoints":["list_endpoints"]}
+Disconnected from unix:/tmp/klippy_uds.
+$ klippy-client console --plain -a /tmp/klippy_uds
+```
+
+输入用完之后，客户端会再多等一小会儿（最多一秒）把欠着的应答打完再退出 ——
+管道会把所有行一次性送到，主机还没看见第一条，不等就会把答案丢掉。
 
 ## 五、能做什么
 

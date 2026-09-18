@@ -68,12 +68,17 @@ MCU 一侧的依赖边一共只有这五条：
 |------|------|
 | `lib.rs` | `klipperx api` / `klipperx console` 以及 `klippy-client` 三处的参数与入口；`--api-server` 与主机共用同一个解析 |
 | `connection.rs` | `Connection`：分帧、`id` 分配与回收、应答按 `id` 配对并标注方法名、推送识别 |
-| `console.rs` | 交互式会话：stdin 与 socket 同时 `select!`、本地命令、推送打印 |
+| `session.rs` | `Session`：把一行输入解释成请求或本地命令、登记发出去的请求、把收到的东西变成 `Entry`；不打印任何东西 |
+| `tui.rs` | 全屏窗口：三块面板、键位、行编辑与历史、日志滚动；把 `Entry` 画出来 |
+| `console.rs` | 行模式：一次一行写到 stdout；管道与 `--plain` 走这条 |
 | `main.rs` | `klippy-client` 二进制（另有一套二十行的日志初始化，见下） |
+
+两个前端共用 `session.rs`，差别只在怎么画：一个写行、一个开窗。这一层切分让
+行模式不需要终端也能测，而窗口里的日志不过是 `Entry` 的列表。
 
 它**复用** `klippy-api` 的 `protocol`（分帧、请求形状）与 `address`（`ApiTarget` / `Transport`），不把协议再实现一遍：两边对分隔符或 `id` 语义若有分歧，那就不是在验证任何东西。依赖方向只有一条：`klippy-client → klippy-api`，API 不知道客户端存在。
 
-它是唯一**依赖不重合**的包：`cargo tree -p klippy-client` 里没有 `reqwest` / `flate2` / `libloading`，实测 debug 体积 49.7 MB（`klipperx` 95.4 MB）。代价是 `main.rs` 里那二十行日志初始化与主机重复——为它单开一个 crate 比重复更糟。
+它是唯一**依赖不重合**的包：`cargo tree -p klippy-client` 里没有 `reqwest` / `flate2` / `libloading`（TUI 用的 `ratatui` 是它自己的），实测 debug 56.6 MB / release 3.5 MB，而 `klipperx` 是 95.4 MB。代价是 `main.rs` 里那二十行日志初始化与主机重复——为它单开一个 crate 比重复更糟。
 
 ## 模块结构
 

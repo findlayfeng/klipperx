@@ -43,7 +43,13 @@ struct Cli {
 #[derive(clap::Subcommand, Debug)]
 enum Commands {
     /// Run the host: load the config and serve the API
-    #[command(name = "klippy")]
+    //
+    // `arg_required_else_help` makes `klipperx klippy` on its own print this
+    // help instead of complaining about the config file it was not given:
+    // someone who types that is asking what the options are. Any other argument
+    // — `klipperx klippy -a /tmp/x` — still gets the complaint, because then they
+    // *were* trying to run something.
+    #[command(name = "klippy", arg_required_else_help = true)]
     Klippy(klipperx::klippy::AppArgs),
 
     /// Send one API request and print the reply
@@ -159,6 +165,29 @@ mod tests {
         // A flag and nothing else counts as using the host's arguments, so clap
         // demands the config file for that too.
         let error = parse(&["-v"]).expect_err("a flag is not a config file");
+        assert!(error.to_string().contains("CONFIG_FILE"), "{error}");
+    }
+
+    #[test]
+    fn test_the_host_subcommand_on_its_own_prints_its_help() {
+        // Not the missing-argument error: whoever types this is asking what the
+        // options are, so answering with the help is the answer.
+        let error = parse(&["klippy"]).expect_err("nothing was asked for");
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+        );
+        let help = error.to_string();
+        assert!(help.contains("Usage: klipperx klippy"), "{help}");
+        assert!(help.contains("--api-server"), "{help}");
+
+        // With an argument it is a real attempt at running the host, so a
+        // missing config file is worth complaining about.
+        let error = parse(&["klippy", "--tui"]).expect_err("no config file");
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
         assert!(error.to_string().contains("CONFIG_FILE"), "{error}");
     }
 

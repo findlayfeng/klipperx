@@ -21,22 +21,41 @@ runtime、重启循环）是它上面的一层。
 
 ### T1 printer object：先做「状态表」，不做「服务定位器」
 
-- [ ] `name -> Arc<dyn StatusSource>`（`get_status(eventtime) -> Value`）：`objects/list`
-      只列有状态的、`objects/query` 直接用它（`klippy/webhooks.py:484`、`:510`）。
-- [ ] 第一个住户：`[mcu]` —— `src/core/klippy/config/mcu.rs` 已经能解析这个 section，
-      上游 `klippy/mcu.py:1234` 的 `get_status` 是现成的返回形状。
-- [ ] 先不做 downcast、不做工厂表：等第一个「模块之间按名字互相找」的需求出现再说
+- [x] `name -> Arc<dyn StatusSource>`（`get_status(eventtime) -> Value`）在 `Printer` 上：
+      `add_status_object` / `status_objects` / `status_of`（`src/core/klippy/printer.rs`）。
+- [x] `objects/list` 与 `objects/query`（`src/core/klippy/api/endpoints/objects_{list,query}.rs`）：
+      上游的三个可见行为都对齐 —— 未知对象回 `{}` 而不是报错、不存在的字段回 `null`、
+      `null` 字段列表取全部；`objects` 参数的三类错误文本也一致（`Invalid argument`）。
+- [x] 先不做 downcast、不做工厂表：等第一个「模块之间按名字互相找」的需求出现再说
       （上游 `lookup_object` 有 424 处，但我们目前还没有第二个对象）。
+- [x] 第一个住户是 `webhooks`，装在**服务器这一侧**（`src/core/klippy/api/webhooks.rs`）：
+      对象名与字段（`state` / `state_message`）对齐上游 `webhooks.get_status`，但它属于
+      API 服务器而不是机器 —— 上游也是 `webhooks` 模块把自己登记成打印机对象的
+      （`klippy/webhooks.py:564`，而它读的是 `printer.get_state_message()`）。
+- [x] `api::register(api, printer)`（`src/core/klippy/api/mod.rs`）一次装完服务器这一侧：
+      先登 `webhooks`、再登端点；之后 `Printer::new()` 的状态表是空的（机器没有组成部分），
+      客户端看到的 `objects/list` 从一开始就含 `webhooks`。
+- [ ] **端点与对象尚未接入主机**：需要在建 `Printer` 之后、**bind 之前**调用一次
+      `api::register`（上游的时序：`Printer.__init__` 先登 `webhooks`（内部就 bind 了
+      socket），配置里的一切 `configfile` / `mcu*` / `toolhead` 都是之后才登的 ——
+      所以「连上了就一定有 `webhooks`」这条保证靠的是顺序，不是占位对象）。
+      注册先于 bind 这条只能靠代码结构保证，单测只能锁住注册函数的效果。
+- [ ] `[mcu]` 作为住户：**卡在 T2**。上游 `mcu.get_status` 报的是 identify 的
+      `mcu_version` / `mcu_build_versions` / `mcu_constants` 加 `last_stats`
+      （`klippy/mcu.py:922-975`），而这些要 MCU 连上（有字典）之后才有；
+      `config/mcu.rs` 只给传输配置，不是上游那个 status。等 T2 连 MCU 时一并加。
 - [ ] `objects/subscribe`：0.25s 轮询 + `response_template`（`klippy/webhooks.py:490-560`），
-      推送走已有的 `PushTarget`。
+      推送走已有的 `PushTarget`。它需要一个定时器（T3）与「只推变化」的比对（上游
+      用全局 `last_query` 与每个订阅自己的字段表），所以跟在 T3 后面做。
 
 ### T2 主机层（机器外面的东西）
 
 - [ ] `src/klippy.rs::klippy_process` 现在只有一个 `ctrl_c`：改成「建机器 → 起 runtime →
       跑机器 → 按结果重启或退出」的循环（上游 `klippy/klippy.py:355` 的 `while 1`）。
-- [ ] `api → printer` 这条边：`EndpointContext` 目前只有 `api` + `client`，`info` 的
-      handler 还是 `todo!()`（`src/core/klippy/api/endpoints/info.rs`）；`get_state_message()`
-      + `PrinterState::as_category()` 已经就绪，接上即可。
+- [ ] `api → printer` 这条边：`objects/*` 与 `webhooks` 已经写好在 `api::register` 一处，
+      主机建出 `Printer` 后在 **bind 之前**调它即可（顺序要求见 T1 最后一条未完成项）；
+      `info` 的 handler 还是 `todo!()`（`src/core/klippy/api/endpoints/info.rs`），
+      `get_state_message()` + `PrinterState::as_category()` 已经就绪，接上即可。
 - [ ] start args / rollover info / 日志（`get_start_args` 29 处、`set_rollover_info` 7 处）
       归主机层，不进机器。
 

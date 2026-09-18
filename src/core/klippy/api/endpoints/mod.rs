@@ -20,9 +20,10 @@
 //! |---|---|
 //! | `info` | defined, handler `todo!()`, **not registered** |
 //! | `list_endpoints` | done ([`registry`](super::registry)) |
+//! | `objects/list`, `objects/query` | done, **not registered** (no host builds a printer yet) |
+//! | `objects/subscribe` | not started — needs the reactor |
 //! | `emergency_stop` | not started |
 //! | `register_remote_method` | not started |
-//! | `objects/list`, `objects/query`, `objects/subscribe` | not started |
 //! | `gcode/help`, `gcode/script`, `gcode/restart` | not started |
 //! | `gcode/firmware_restart`, `gcode/subscribe_output` | not started |
 //! | `pause_resume/{pause,resume,cancel}` | not started |
@@ -31,5 +32,9 @@
 //! | the `*/dump_*` mux endpoints | not started |
 
 pub mod info;
+pub mod objects_list;
+pub mod objects_query;
 
 pub use info::{Info, InfoParams, InfoResponse};
+pub use objects_list::ObjectsList;
+pub use objects_query::{ObjectsQuery, ObjectsQueryParams};

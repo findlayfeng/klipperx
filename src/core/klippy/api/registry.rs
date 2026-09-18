@@ -78,13 +78,14 @@ pub struct EndpointContext<'a> {
     /// The registry, for endpoints that describe it (`list_endpoints`) or push
     /// through it (remote methods).
     pub api: &'a Api,
-    /// The connection the request arrived on.
+    /// The connection the request arrived on, as an owned handle.
     ///
     /// Request/response endpoints ignore it. Endpoints that keep sending after
     /// they reply — `objects/subscribe`, `gcode/subscribe_output`, the
-    /// `*/dump_*` family — register it so pushes stop when the client goes
-    /// away.
-    pub client: &'a dyn PushTarget,
+    /// `*/dump_*` family — clone it and keep it, which is what lets a
+    /// subscription outlive its request; pushes stop when the client goes away
+    /// ([`PushTarget::is_closed`]).
+    pub client: Arc<dyn PushTarget>,
 }
 
 // ===========================================================================
@@ -369,10 +370,18 @@ impl Api {
 
     /// Run one request through the endpoint it names.
     ///
+    /// `client` is taken by value because an endpoint that subscribes keeps it;
+    /// the caller passes its own handle, so the clone costs one atomic
+    /// increment per request.
+    ///
     /// # Errors
     /// Returns [`ApiError::UnknownEndpoint`] if no endpoint or mux path matches
     /// the method, otherwise whatever the handler returned.
-    pub fn dispatch(&self, request: &Request, client: &dyn PushTarget) -> Result<Value, ApiError> {
+    pub fn dispatch(
+        &self,
+        request: &Request,
+        client: Arc<dyn PushTarget>,
+    ) -> Result<Value, ApiError> {
         let context = EndpointContext { api: self, client };
 
         if let Some(mux) = self.mux.get(request.method()) {
@@ -536,8 +545,8 @@ mod tests {
 
     /// Dispatch `body` against `api` with a throwaway connection.
     fn dispatch(api: &Api, body: &str) -> Result<Value, ApiError> {
-        let target = RecordingTarget::new();
-        api.dispatch(&request(body), target.as_ref())
+        let target: Arc<dyn PushTarget> = RecordingTarget::new();
+        api.dispatch(&request(body), target)
     }
 
     fn template(fields: Value) -> ResponseTemplate {
@@ -674,13 +683,15 @@ mod tests {
         let target = RecordingTarget::new();
 
         let result = api
-            .dispatch(&request(r#"{"method":"connection"}"#), target.as_ref())
+            .dispatch(&request(r#"{"method":"connection"}"#), target.clone())
             .unwrap();
         assert_eq!(result, json!({"closed": false}));
 
+        // The endpoint is handed the connection itself, not a snapshot: what
+        // the target reports changes underneath the same handle.
         target.close();
         let result = api
-            .dispatch(&request(r#"{"method":"connection"}"#), target.as_ref())
+            .dispatch(&request(r#"{"method":"connection"}"#), target.clone())
             .unwrap();
         assert_eq!(result, json!({"closed": true}));
     }

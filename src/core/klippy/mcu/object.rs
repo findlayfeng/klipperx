@@ -12,6 +12,11 @@
 //! effects — no serial port is opened just to read the file — which is also why
 //! the whole [`ConfigSection`] is kept rather than a parsed [`McuConfig`].
 //!
+//! The object also owns the MCU's [`ConfigBuilder`], created here rather than at
+//! connect: resources add their oids and `config_*` commands while the config
+//! file is loaded, and connect is what finally sends them
+//! (`builder.configure`), after identify has made the dictionary available.
+//!
 //! The reported fields are the three identify ones. `last_stats` is upstream's
 //! fourth (`klippy/mcu.py:975`) and is **not** reported yet: it is accumulated
 //! from the `stats` event, which today is only logged
@@ -25,7 +30,7 @@ use serde_json::{json, Map, Value};
 use crate::core::klippy::config::mcu::McuConfig;
 use crate::core::klippy::config::ConfigSection;
 use crate::core::klippy::error::KlippyError;
-use crate::core::klippy::mcu::{Dictionary, Mcu};
+use crate::core::klippy::mcu::{ConfigBuilder, Dictionary, Mcu};
 use crate::core::klippy::printer::{ConnectFuture, Printer, PrinterObject};
 
 /// The printer object for one `[mcu]` / `[mcu <name>]` section.
@@ -37,6 +42,13 @@ pub struct McuObject {
     /// (`klippy/mcu.py:1151-1153`). Not the section identifier — that is what
     /// the registry key is, and the two differ for every secondary MCU.
     name: String,
+    /// The configuration this MCU's resources build up, and the handshake that
+    /// sends it on connect (`mcu/config.rs`).
+    ///
+    /// Built at construction, not at connect, because resources add their
+    /// `config_*` commands while the config file is being loaded — long before
+    /// the device is opened.
+    config: Arc<ConfigBuilder>,
     /// What `objects/query` reports; `{}` until the handshake fills it, which is
     /// what upstream's `_get_status_info` starts as.
     status: Mutex<Value>,
@@ -52,6 +64,7 @@ impl McuObject {
         Self {
             section,
             name,
+            config: Arc::new(ConfigBuilder::new()),
             status: Mutex::new(json!({})),
             mcu: Mutex::new(None),
         }
@@ -60,6 +73,15 @@ impl McuObject {
     /// The MCU's own name, as upstream's `MCU.get_name` reports it.
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// The configuration builder for this MCU.
+    ///
+    /// What a resource (a pin, a bus, a sensor) uses to reserve an oid and add
+    /// its `config_*` command. It exists before the device does, which is the
+    /// point: the config file is loaded before anything connects.
+    pub fn config(&self) -> Arc<ConfigBuilder> {
+        Arc::clone(&self.config)
     }
 
     /// Take ownership of a connected MCU and snapshot its identify status.
@@ -89,6 +111,13 @@ impl PrinterObject for McuObject {
             // dlopen-ing the host library blocks, briefly, on this task.
             let config = McuConfig::new(&self.section).map_err(KlippyError::Internal)?;
             let mcu = Mcu::connect(config)
+                .await
+                .map_err(|err| KlippyError::Connection(err.to_string()))?;
+            // Identify installed the dictionary; now the accumulated
+            // configuration can be encoded and sent, and the firmware either
+            // adopts it or confirms it already has it (`mcu/config.rs`).
+            self.config
+                .configure(&mcu)
                 .await
                 .map_err(|err| KlippyError::Connection(err.to_string()))?;
             self.attach(mcu);
@@ -151,6 +180,17 @@ mod tests {
 
     fn section(sub: Option<&str>) -> ConfigSection {
         ConfigSection::new("mcu", sub)
+    }
+
+    #[test]
+    fn test_the_config_builder_exists_before_the_device_does() {
+        // Resources add their `config_*` commands while the config file is
+        // loaded — long before anything connects — so the builder has to be
+        // usable from the object as it is built.
+        let object = McuObject::new(section(None));
+
+        assert_eq!(object.config().create_oid().unwrap(), 0);
+        assert!(!object.config().is_finalized());
     }
 
     #[test]

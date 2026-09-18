@@ -19,12 +19,14 @@
 //! starts with: [`Mcu::new`] calls `identify::new_parser`, because the two formats
 //! it has to know before anything else are identify's.
 
+mod config;
 mod dictionary;
 mod error;
 mod object;
 mod pending;
 mod restart_method;
 
+pub use config::{BuiltConfig, ConfigBuilder, ConfigCallback, Configured, PostInitCallback};
 pub use dictionary::{Dictionary, Enumeration, MessageDef, OutputDef};
 pub use error::{McuCallError, McuError};
 pub use object::{load_config, load_config_prefix, McuObject};
@@ -339,6 +341,60 @@ impl Mcu {
     /// Get the MCU name.
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// The firmware's clock frequency (`CLOCK_FREQ`), in ticks per second.
+    ///
+    /// Read from the installed dictionary, so it is only available after the
+    /// identify handshake. This is what turns host seconds into firmware clock
+    /// ticks for every timed command (`queue_*`, `spi_send`, ADC sampling).
+    ///
+    /// # Errors
+    /// Returns [`McuError::NotIdentified`] before the handshake and
+    /// [`McuError::Config`] if the dictionary has no `CLOCK_FREQ`.
+    pub fn clock_freq(&self) -> Result<f64, McuError> {
+        let dictionary = self.require_dictionary()?;
+        dictionary
+            .constant_f64("CLOCK_FREQ")
+            .ok_or_else(|| McuError::Config("dictionary has no CLOCK_FREQ".to_string()))
+    }
+
+    /// Convert seconds to firmware clock ticks, as upstream's
+    /// `MCU.seconds_to_clock` (`klippy/mcu.py:1140`).
+    ///
+    /// # Errors
+    /// As [`Mcu::clock_freq`].
+    pub fn seconds_to_clock(&self, seconds: f64) -> Result<u64, McuError> {
+        let freq = self.clock_freq()?;
+        Ok((seconds * freq).max(0.0) as u64)
+    }
+
+    /// Encode a command without sending it.
+    ///
+    /// The configuration phase needs the bytes before they are queued: it
+    /// hashes them into the configuration CRC. Everything else goes through
+    /// [`Mcu::send`], which encodes and queues in one step.
+    ///
+    /// # Errors
+    /// Returns [`McuError::Msg`] if the name is unknown or the arguments do not
+    /// match the firmware's format string.
+    pub(crate) fn encode(&self, name: &str, args: &[ArgValue]) -> Result<Payload, McuError> {
+        Ok(self.parser.encode(name, args)?)
+    }
+
+    /// Queue an already-encoded payload, waiting for room.
+    ///
+    /// The send channel is bounded, so a configuration of hundreds of commands
+    /// would overflow [`Mcu::send`]'s non-blocking `try_send`. This is the
+    /// blocking-in-the-async-sense counterpart the configuration phase uses.
+    ///
+    /// # Errors
+    /// Returns [`McuError::Msg`] if the send task has gone away.
+    pub(crate) async fn send_payload(&self, payload: Payload) -> Result<(), McuError> {
+        self.send_buf_tx
+            .send(payload)
+            .await
+            .map_err(|e| McuError::Msg(MsgError::new(e.to_string())))
     }
 
     /// Encode and send a command to the MCU.

@@ -1,6 +1,6 @@
 # Klipperx 开发手册
 
-面向贡献者与模块维护者的技术参考。涵盖消息编解码（`msg`）、MCU 传输与数据字典（`mcu`）、MCU 配置构建（`ConfigBuilder`）、引脚解析（`pins`）、命令层（`cmd`）、事件层（`event`）、identify 引导（`identify`）、机器的时钟与定时器（`reactor`）与客户端 API 层（`api`）的内部结构与设计取舍。
+面向贡献者与模块维护者的技术参考。涵盖消息编解码（`msg`）、MCU 传输与数据字典（`mcu`）、MCU 配置构建（`ConfigBuilder`）、引脚解析（`pins`）、G-Code 调度（`gcode`）、命令层（`cmd`）、事件层（`event`）、identify 引导（`identify`）、机器的时钟与定时器（`reactor`）与客户端 API 层（`api`）的内部结构与设计取舍。
 
 > **第三方 API 接口**（G-Code 命令、API 端点等）参见 [第三方开发手册](../third-party-dev/README.md)。
 
@@ -58,7 +58,7 @@ MCU 一侧的依赖边一共只有这五条：
 | `klippy-api → TransportError` | 已有：socket 层面的失败用自己的错误类型（`Bind` / `Connect` / `Closed` / `Io`），不认识主机的 `KlippyError` |
 | `api → tokio 运行时` | 已有：accept 循环与每连接一个任务跑在 host 建的 runtime 上（见 `klippy::run`）；API 层自己不建线程，socket 收发是异步的 |
 | `api → printer` | 已有：`api::register`（`src/core/klippy/api/mod.rs`）把服务器的对象与端点一次装到机器上，`objects/list`、`objects/query` 与 `webhooks` 都由它安装；必须在 bind 之前调用 |
-| `api → gcode` | **计划中**：`gcode/*` 尚未开始 |
+| `api → gcode` | **部分**：`gcode` 调度器已就绪（G1，`src/core/klippy/gcode.rs`），`gcode/*` 端点属 G3 |
 | `api → mcu` / `cmd` / `event` | **没有**，将来也不应该有：端点经 `printer` / `gcode` 间接使用协议层，不直接碰帧与字典 |
 
 **并发模型**：`api` 用一个任务 accept、一个任务服务一条连接。所以跨连接并行、同连接内的请求保持顺序（客户端 pipeline 时看到的顺序与上游一致）；一个卡住的客户端只占住自己的任务。上游是一个线程 + reactor + 每连接一对 fd 回调，形状等价，只是用任务代替了 greenlet。推送给连接用的是**同步**的 `PushTarget::push`（入队 + `Notify` 唤醒该连接的任务），因此任何任务/线程都能推，不需要持有 runtime；“写不动超过 5 秒就断开”与上游的 `blocking_count` 同义。
@@ -200,6 +200,18 @@ identify 的命令**定义**（名称、参数、解码）与其它命令一样�
 | `PinType` / `PinParams` / `PinError` | 资源类型决定描述可带哪些修饰（`!` / `^` / `~`）、解析结果、上游原文的错误文案 |
 
 数字从哪来：上游把引脚**名字**留在命令文本里，发送时由 msgparser 查字典的 `pin` 枚举；这里编码器只接受 `ArgValue`，所以名字要在**配置回调**（build 时、有字典）里换成编号，见 [MCU 配置构建](mcu-config.md)。资源的派发（上游 `setup_pin`）在 `PrinterPins::setup_digital_out` 上，由 chip（`McuChip`）建出 `McuDigitalOut`；PWM / ADC / endstop 随各自的 TODO 项加。
+
+### `gcode.rs` — G-Code 调度器
+
+与 `printer.rs` / `pins.rs` 平级的单文件模块：把一行 g-code 解析成命令名与参数，查命令表，运行处理器。对应上游 `klippy/gcode.py`。
+
+| 项 | 职责 |
+|------|------|
+| `GCodeDispatch` | printer object `gcode`：`register_command` / `register_mux_command`（`SET_PIN PIN=…` 这类按一个参数选处理器）、`run_script`、输出处理器、`get_status` 报命令表（所以它是**可查询**对象） |
+| `GcodeCommand` | 交给处理器的已解析命令：`get_str` / `get_int` / `get_float`（缺参 / 解析失败 / 超范围都报上游文案的 `CommandError`），以及 `respond_info` / `respond_raw` |
+| 传统 / 扩展命令 | 传统（`M110`、`G1`）参数是 `S200` 这种“字母+值”；扩展（`SET_PIN`）是 `KEY=VALUE`，带 shell 引号——后者在分派时重解析（上游 `_get_extended_params`） |
+
+它在 `load_config` 里**最先**注册（在 `pins` 之前），因为资源与 `[board_pins]` 建对象时要往它注册命令；按上游，它是 `Printer.__init__` 的早对象。不含运动命令（G0/G1/G28 由 toolhead 注册，见 C1/G4），也不含 `ok` 应答与 `gcode:command_error` 事件（无文件输出协议、事件集未开放）。
 
 ### `api/` — 客户端 API 层
 

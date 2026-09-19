@@ -68,8 +68,14 @@
   输出处理器 / `get_status` 报命令表）与 `GcodeCommand`（传统 `S200` 与扩展 `KEY=VALUE`
   两套参数、`get_*` 的上游文案错误）、内置命令与未 ready 行为（`src/core/klippy/gcode.rs`）。
   在 `load_config` 里最先注册（`pins` 之前）。
-- **`output_pin` 与 `SET_PIN`（G2）**：`[output_pin <name>]`（`pin` / `value` / `shutdown_value` /
-  `maximum_mcu_duration`）用 `setup_digital_out` 建输出并注册 `SET_PIN PIN=… VALUE=…`；
+- **MCU 停机上报与就地复位（B2 大部）**：`shutdown` / `is_shutdown` / `starting` 事件
+  （`event/shutdown.rs`，`static_string_id` 解成原因），`McuObject` 在配置握手后绑成打印机停机；
+  `configure` 在固件停机或 CRC 不一致时用 `emergency_stop` + `config_reset` 就地复位再配置
+  （`mcu/config.rs`）。**真板子不必再先断电**。剩 `emergency_stop` 对象/端点与 `last_stats`。
+- **`output_pin` 的无条件 `setup_max_duration(0)`（修 G2 的 bug）**：此前默认 2 s 会让
+  `value: 1` + `shutdown_value: 0` 在 build 时报错；现与上游一致（`extras/output_pin.rs`）。
+- **`output_pin` 与 `SET_PIN`（G2）**：`[output_pin <name>]`（`pin` / `value` / `shutdown_value`）
+  用 `setup_digital_out` 建输出（无条件 `setup_max_duration(0)`）并注册 `SET_PIN PIN=… VALUE=…`；
   从 API 发 `gcode/script` 就能点灯（端点属 G3）。`pwm` 暂拒，`SET_PIN` 先立即生效
   （`extras/output_pin.rs`、`load.rs`）。
 - **`gcode/*` 端点（G3 的四个）**：`gcode/help` / `gcode/script` / `gcode/restart` /
@@ -95,7 +101,7 @@
 | G4 | 运动命令（G0/G1/G28…） | G1 ✓、C1 |
 | A1b | reactor 串行调度器与延迟度量 | A1 ✓ |
 | A2 | 错误词汇（`CommandError` / `ConfigError`） | — |
-| B2 | MCU 关闭与错误上报（含 `last_stats`） | A2 |
+| B2 | MCU 剩余：`emergency_stop` 对象/端点与 `last_stats` | — |
 | B4 | 其余端点（estop / remote method / pause_resume / …） | G3 等 |
 | F3 | `MCU_bus_digital_out`（命令队列/运动同步输出） | C1 |
 | F4 | PWM（硬件 / 软件） | F1 ✓、F2 ✓ |
@@ -174,25 +180,28 @@
       在稳态下与上游一致。
 - 详见 `docs/klippy/developer-manual/testing.md` 的 `objects_subscribe.rs` 一行。
 
-### B2（新）MCU 关闭与错误上报
+### B2（新）MCU 关闭与错误上报 —— 大体完成，剩 emergency_stop 对象与 stats
 
-- [ ] **命令已定义但没人调用**：`emergency_stop` / `clear_shutdown` 在
-      `cmd/shutdown.rs` 里，但没有任何 printer object、也没有端点发它们。MCU 停机时主机
-      应发 `emergency_stop`，恢复时发 `clear_shutdown`（上游挂在 MCU 的 shutdown 处理上，
-      `klippy/mcu.py:801-802` `:883`）。`emergency_stop` 端点本身见 B4。
+- [x] **固件停机上报**：`shutdown` / `is_shutdown` / `starting` 三个事件（`event/shutdown.rs`），
+      `static_string_id` 经字典枚举解成原因文本。`McuObject::connect` 在配置握手**之后**
+      把它们绑成 `printer.invoke_shutdown(...)`——顺序很重要：`configure` 自己可能发
+      `emergency_stop`，绑晚了才不会把自己的复位当成意外停机。上游 `klippy/mcu.py:813-835`
+      `:880-881`。
+- [x] **`config_reset` 的发送**：`configure` 发现固件已停机或 CRC 不一致时就地复位——
+      运行中先 `emergency_stop`、再 `config_reset`（只在停机时可跑），然后重新配置；固件没有
+      `config_reset` 时按「停机」/「CRC 不一致」两种情形报错，提示断电或等 D2（`mcu/config.rs`）。
+      上游在它的 restart helper 里做同一件事（`:756-770`），只是在一个新进程里。
+- [ ] **`emergency_stop` / `clear_shutdown` 的对象与端点**：`cmd/shutdown.rs` 的两个命令现在
+      只有 `configure` 的复位路径在用 `emergency_stop`；还缺“主机侧停机时通知 MCU”与
+      `emergency_stop` 端点（端点本身见 B4，上游 `klippy/mcu.py:801-802` `:883`）。
 - [ ] **`last_stats` 仍未报**：`stats` 事件现在只打日志（`event/stats.rs` 的
       `register_stats_logging`），所以 `McuObject::get_status` 只报三个 identify 字段。
       上游由 `MCUStatsHelper` 累计（`klippy/mcu.py:912` `:974-975`），`get_status` 多一个
       `last_stats`（`klippy/mcu.py:1235`）。需要先有 stats 消费者。
 - [ ] **错误上报带载荷**：上游 `klippy:notify_mcu_error` 带 `msg` 与 details
       （`klippy/klippy.py:144` `:151`），shutdown 分析走 `klippy:analyze_shutdown`
-      （`klippy/klippy.py:216-220`）。当前 `PrinterEvent` 的 handler 无参，表达不了，
-      见 Q2 / Q3。
-- [ ] **连接层停机标志与 `config_reset`**：上游 `_send_get_config` 先查连接层的
-      `conn_helper.is_shutdown()`（收到 shutdown 消息时置位，`klippy/mcu.py:769-910`），
-      再查 `get_config` 的 `is_shutdown` 字段；恢复路径用 `config_reset` 清 CRC/oid/运动队列
-      （`MCUConfigHelper` 的 restart helper，`klippy/mcu.py:756-770`）。`config_reset` 命令
-      类型已在 F1，**发送**它属于这里。
+      （`klippy/klippy.py:216-220`）。当前 `PrinterEvent` 的 handler 无参，表达不了；
+      我们现在的做法是把原因写进状态消息（上游放在 details 里），见 Q2 / Q3。
 
 ### G（新，先做）GCODE 驱动
 
@@ -230,8 +239,9 @@
 
 - [x] `load.rs` 工厂表加 `[output_pin <name>]`（`load_config_prefix`）；加载测试证明
       真实 section 被认领（`[gcode, pins, mcu, output_pin fan]`）。
-- [x] 选项：`pin`（必填）、`value`（默认 0）、`shutdown_value`（默认 0）、
-      `maximum_mcu_duration`（默认 2 s），各自校验并报上游风格的配置错误。
+- [x] 选项：`pin`（必填）、`value`（默认 0）、`shutdown_value`（默认 0），各自校验并报
+      上游风格的配置错误；**无条件 `setup_max_duration(0)`**，同上游 `PrinterOutputPin`
+      （所以 `value: 1` + 默认 `shutdown_value: 0` 是合法的）。
 - [x] 用 `PrinterPins::setup_digital_out` 建数字输出，把 start/shutdown/max_duration 设进去；
       以 section 的 sub 注册到 `SET_PIN` 的 mux（`PIN=<name>`）。
 - [x] `SET_PIN PIN=<name> VALUE=<0..1>`：**现为立即 `update_digital_out`**（`>=0.5` 为开），
@@ -564,6 +574,8 @@ kinematics 已随 Printer 重构删除，从这里重新开始：
 | section 校验用注册表 | `klippy/configfile.py:425-445` |
 | mcu 作为 printer object、它的 status | `klippy/mcu.py:1147-1170`、`:1235`、`:938-975` |
 | stats 累计与 shutdown 处理 | `klippy/mcu.py:801-802`、`:883`、`:912`、`:974-975` |
+| 固件停机/重启事件 | `src/sched.c:310` `:318` `:351`、`klippy/mcu.py:813-835` `:880-881` |
+| `config_reset` 与 restart helper | `src/basecmd.c:262-272`、`klippy/mcu.py:756-770` |
 | 工厂装载 `load_config` / `load_config_prefix` | `klippy/klippy.py:90-113` |
 | reactor 定时器 / 回调 / 时钟 | `klippy/reactor.py:111` `:145` `:187` |
 | kinematics 的装载与接缝 | `klippy/toolhead.py:235-252`、`:389` `:400` `:482` `:507` `:522` |

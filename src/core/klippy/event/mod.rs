@@ -36,12 +36,15 @@
 //! | Module | Events |
 //! |---|---|
 //! | [`stats`] | `stats` — periodic scheduler timing from `stats_update` |
+//! | [`shutdown`] | `shutdown` / `is_shutdown` / `starting` — the firmware stopping or restarting |
 
+pub mod shutdown;
 pub mod stats;
 
 #[cfg(test)]
 mod test_support;
 
+pub use shutdown::{IsShutdown, Shutdown, Starting};
 pub use stats::Stats;
 
 use crate::core::klippy::cmd::Params;

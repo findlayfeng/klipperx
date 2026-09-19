@@ -13,7 +13,11 @@
 //! | `pin` | the pin description, required |
 //! | `value` | level to drive at startup (default 0) |
 //! | `shutdown_value` | level the firmware falls back to (default 0) |
-//! | `maximum_mcu_duration` | longest a scheduled change may be outstanding, seconds (default 2) |
+//!
+//! `maximum_mcu_duration` is deliberately **not** an option: upstream's
+//! `PrinterOutputPin` calls `setup_max_duration(0.)` unconditionally
+//! (`klippy/extras/output_pin.py:217`), so the firmware's "return to the
+//! shutdown level" limit is off and `value` and `shutdown_value` may differ.
 //!
 //! # What is not here
 //!
@@ -35,9 +39,6 @@ use crate::core::klippy::config::ConfigSection;
 use crate::core::klippy::gcode::{CommandError, CommandHandler, GCodeDispatch, GCODE_OBJECT};
 use crate::core::klippy::pins::{DigitalOut, PrinterPins, PINS_OBJECT};
 use crate::core::klippy::printer::{Printer, PrinterObject};
-
-/// The default `maximum_mcu_duration`, matching upstream.
-const DEFAULT_MAX_DURATION: f64 = 2.0;
 
 /// One configured `[output_pin <name>]`.
 ///
@@ -74,19 +75,12 @@ impl OutputPin {
 
         let value = get_float(section, "value")?.unwrap_or(0.0);
         let shutdown_value = get_float(section, "shutdown_value")?.unwrap_or(0.0);
-        let maximum_mcu_duration =
-            get_float(section, "maximum_mcu_duration")?.unwrap_or(DEFAULT_MAX_DURATION);
         for (option, v) in [("value", value), ("shutdown_value", shutdown_value)] {
             if !(0.0..=1.0).contains(&v) {
                 return Err(format!(
                     "Option '{option}' in section '{identifier}' must be between 0 and 1"
                 ));
             }
-        }
-        if maximum_mcu_duration < 0.0 {
-            return Err(format!(
-                "Option 'maximum_mcu_duration' in section '{identifier}' must not be negative"
-            ));
         }
 
         let pins = printer
@@ -95,7 +89,10 @@ impl OutputPin {
         let pin = pins
             .setup_digital_out(pin_desc, None)
             .map_err(|err| format!("{identifier}: {err}"))?;
-        pin.setup_max_duration(maximum_mcu_duration);
+        // Upstream disables the firmware's max-duration limit for an
+        // `output_pin` unconditionally, which is what lets `value` and
+        // `shutdown_value` differ.
+        pin.setup_max_duration(0.0);
         pin.setup_start_value(value >= 0.5, shutdown_value >= 0.5);
 
         let gcode = printer
@@ -291,15 +288,7 @@ mod tests {
     #[test]
     fn test_a_digital_output_is_configured_with_its_levels() {
         let (printer, chip) = printer();
-        let section = section(
-            "fan",
-            "PA1",
-            &[
-                ("value", "1"),
-                ("shutdown_value", "0"),
-                ("maximum_mcu_duration", "0"),
-            ],
-        );
+        let section = section("fan", "PA1", &[("value", "1"), ("shutdown_value", "0")]);
 
         OutputPin::new(&section, &printer).unwrap();
 

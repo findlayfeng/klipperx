@@ -10,6 +10,7 @@ pub mod cmd;
 pub mod config;
 pub mod error;
 pub mod event;
+pub mod extras;
 pub mod frame;
 pub mod gcode;
 pub mod identify;

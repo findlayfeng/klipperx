@@ -76,19 +76,22 @@
   `gcode/firmware_restart`；命令错误用新增的 `ApiError::CommandError`（不关停 klippy）；
   端点按请求从 `printer` 取 `gcode`（`api/endpoints/gcode.rs`、`crates/klippy-api/src/protocol.rs`）。
   这样**从 API 发 `SET_PIN` 点灯已经通了**。
+- **`gcode/subscribe_output`（G3 剩余）**：连接被包成带 `is_closed` 的 `OutputHandler`，推
+  `{response: line}`；输出处理器从“只增”改成可剪。**TUI 新增 g-code 模式**（`^G` / `.gcode`）：
+  整行走 `gcode/script`，首次进入自动订阅，`// …` 与 `!! …` 都会显示（`gcode.rs`、
+  `crates/klippy-client/src/{session,tui}.rs`）。
 
 ## 待办
 
-**当前选择：GCODE 驱动**。G1（调度器）、G2（`output_pin` + `SET_PIN`）与 G3 的四条端点已完成，
-**已可从 API 发 `SET_PIN` 点灯**；剩 G3 的 `gcode/subscribe_output` 与 G4（运动命令，随 C1）。
-执行层做不到的地方先用占位：`SET_PIN` 现为立即 `update_digital_out`（不排程），
-`gcode/restart` 直接退出进程（无重启循环 D2）。
+**当前选择：GCODE 驱动**。G1（调度器）、G2（`output_pin` + `SET_PIN`）与 G3（全部 `gcode/*`，
+含 `subscribe_output`）已完成，**已可从 API 或 TUI 的 g-code 模式点灯并看到输出**；
+剩 G4（运动命令，随 C1）。执行层做不到的地方先用占位：`SET_PIN` 现为立即
+`update_digital_out`（不排程），`gcode/restart` 直接退出进程（无重启循环 D2）。
 
 编号保留旧文件的 T/Q 以便对照，新增项给新号。依赖列的是**工具性前置**，不是自然顺序。
 
 | # | 事项 | 依赖 |
 |---|---|---|
-| G3 | `gcode/subscribe_output`（其余 `gcode/*` 已落地） | G1 ✓ |
 | G4 | 运动命令（G0/G1/G28…） | G1 ✓、C1 |
 | A1b | reactor 串行调度器与延迟度量 | A1 ✓ |
 | A2 | 错误词汇（`CommandError` / `ConfigError`） | — |
@@ -237,7 +240,7 @@
 - 未做：`pwm` / `cycle_time`（F4，现在**显式拒绝**而不是当数字输出）、
       `scale` / `static_value` / `template`（display 模板）。
 
-#### G3 `gcode/*` 端点 —— 四条已落地，剩 `subscribe_output`
+#### G3 `gcode/*` 端点 —— 已完成
 
 实现：`src/core/klippy/api/endpoints/gcode.rs`，在 `api::register` 里装上。端点**按请求**
 从 `printer` 取 `gcode`（`load_config` 在 `api::register` 之后才建它；取不到时报打印机状态）。
@@ -247,9 +250,11 @@
       `ApiError::CommandError`，**不关停 klippy**），成功回 `{}`。
 - [x] `gcode/restart` / `gcode/firmware_restart`（`:440-442`）：跑内置 `RESTART` /
       `FIRMWARE_RESTART`（= `request_exit`），主机侧语义接 D2（现在会退出进程）。
-- [ ] `gcode/subscribe_output`（`:443-444`）：把输出处理器接到发起请求的连接（`PushTarget`）
-      并推 `{response: line}`。需要**可移除的输出处理器**（连接关闭时摘掉），
-      现在的 `register_output_handler` 只增不减。
+- [x] `gcode/subscribe_output`（`:443-444`）：把请求连接包成一个 `OutputHandler`，推
+      `{response: line}`；连接关闭后由 `GCodeDispatch` 在下次输出时摘掉（`is_closed`）。
+      输出处理器因此从"只增"改成带 `is_closed` 的 trait（`Fn(&str)` 仍有 blanket impl）。
+- 客户端：TUI 的 **g-code 模式**（`^G` / `.gcode`）用 `gcode/script` 发整行，首次进入时
+      自动订阅一次 `gcode/subscribe_output`，所以 `// …` 输出与 `!! …` 错误都看得到。
 
 #### G4 运动命令（G0/G1/G28/G92/M114…）
 

@@ -146,7 +146,7 @@ Connected to unix:/tmp/klippy_uds.
     - objects/list
     - objects/query
 klippy> objects/query {objects: {toolhead: [position]}}
-Enter send · ↑↓ history · PgUp/PgDn scroll · .help · ^C quit
+Enter send · ↑↓ history · PgUp/PgDn · ^G g-code · .help · ^C quit
 ```
 
 第一行是状态行（左边那个符号：`●` 就绪、`◌` 启动中或状态未知、`▲` 出错/停机、
@@ -167,6 +167,7 @@ Enter send · ↑↓ history · PgUp/PgDn scroll · .help · ^C quit
 | `←` `→` `Home` `End` `Backspace` `Delete` | 行内编辑 |
 | `Ctrl+A` / `Ctrl+E` | 跳到行首 / 行尾 |
 | `Ctrl+U` | 清掉这一行（不记进历史） |
+| `Ctrl+G` | 在请求模式与 g-code 模式之间切换（同 `.gcode`） |
 | `Ctrl+L` | 清空日志 |
 | `Ctrl+C` / `Ctrl+D` / `Esc` | 退出（欠着的应答会先打完） |
 
@@ -175,6 +176,20 @@ Enter send · ↑↓ history · PgUp/PgDn scroll · .help · ^C quit
 
 窗口用的是终端的备用屏幕，所以**退出之后你终端原本的 scrollback 里没有这些
 内容**。想要能滚回去、能重定向、能 grep 的输出，就用下一节的行模式。
+
+### G-code 模式
+
+按 `Ctrl+G`（或敲 `.gcode`）切换「请求模式」与「g-code 模式」，输入提示符会从
+`klippy>` 变成 `gcode>`。g-code 模式下整行都当作脚本发给 `gcode/script`，所以直接敲命令：
+
+```
+gcode> SET_PIN PIN=fan VALUE=1
+```
+
+第一次进入 g-code 模式时会自动订阅一次 `gcode/subscribe_output`，于是命令的
+`// …` 信息与 `!! …` 错误会以推送的形式出现在日志里（不订阅的话只能看到命令的应答，
+`respond_info` 看不到）。`.` 开头的本地命令在两种模式下都有效，所以 `.quit`、`.help`
+不会被当成 g-code 发出去。
 
 ### 一行就是一个请求
 

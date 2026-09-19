@@ -57,7 +57,25 @@ pub const GCODE_OBJECT: &str = "gcode";
 pub type CommandHandler = Arc<dyn Fn(&GcodeCommand) -> Result<(), CommandError> + Send + Sync>;
 
 /// A sink for the lines the dispatcher emits.
-pub type OutputHandler = Arc<dyn Fn(&str) + Send + Sync>;
+///
+/// Implemented for any `Fn(&str)`, which is all a simple sink is. A sink that
+/// belongs to a client also reports when that client goes away, so the
+/// dispatcher can drop it: `gcode/subscribe_output` is the first of those.
+pub trait OutputHandler: Send + Sync {
+    /// Hand one line to the sink.
+    fn emit(&self, line: &str);
+
+    /// Whether this sink is gone and should be dropped.
+    fn is_closed(&self) -> bool {
+        false
+    }
+}
+
+impl<F: Fn(&str) + Send + Sync> OutputHandler for F {
+    fn emit(&self, line: &str) {
+        self(line)
+    }
+}
 
 /// A G-Code command failed.
 ///
@@ -265,7 +283,7 @@ struct Inner {
     commands: Mutex<Commands>,
     /// Where output goes. `register_output_handler` adds; `gcode/subscribe_output`
     /// will be the first client-facing one.
-    outputs: Mutex<Vec<OutputHandler>>,
+    outputs: Mutex<Vec<Arc<dyn OutputHandler>>>,
 }
 
 /// The `gcode` printer object: the command table and the script runner.
@@ -434,7 +452,11 @@ impl GCodeDispatch {
     }
 
     /// Add an output handler, called for every line the dispatcher emits.
-    pub fn register_output_handler(&self, handler: OutputHandler) {
+    ///
+    /// A handler that reports [`OutputHandler::is_closed`] is dropped the next
+    /// time a line is emitted, which is how a disconnected subscriber stops
+    /// being called.
+    pub fn register_output_handler(&self, handler: Arc<dyn OutputHandler>) {
         self.inner
             .outputs
             .lock()
@@ -716,13 +738,16 @@ impl Inner {
     }
 
     fn respond_raw(&self, msg: &str) {
-        let outputs = self
-            .outputs
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .clone();
-        for handler in outputs {
-            handler(msg);
+        let handlers = {
+            let mut outputs = self
+                .outputs
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            outputs.retain(|handler| !handler.is_closed());
+            outputs.clone()
+        };
+        for handler in handlers {
+            handler.emit(msg);
         }
     }
 
@@ -975,7 +1000,7 @@ mod tests {
         let output = Arc::new(Mutex::new(Vec::new()));
         {
             let output = Arc::clone(&output);
-            dispatch.register_output_handler(Arc::new(move |line| {
+            dispatch.register_output_handler(Arc::new(move |line: &str| {
                 output
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())

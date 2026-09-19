@@ -144,6 +144,11 @@ struct App {
     status: Status,
     /// Set by a local command that asked to leave.
     quit: bool,
+    /// Whether typed lines are sent as G-Code (`gcode/script`).
+    gcode: bool,
+    /// Whether this window has already subscribed to G-Code output; every
+    /// `gcode/subscribe_output` registers another output handler.
+    gcode_subscribed: bool,
     /// Whether the handshake's `info` has been answered.
     ///
     /// Until it has, an `info` reply is the header's business rather than the
@@ -182,9 +187,38 @@ impl App {
             scroll: 0,
             status: Status::Unknown,
             quit: false,
+            gcode: false,
+            gcode_subscribed: false,
             greeted: false,
             format: Format::Yaml,
         }
+    }
+
+    /// Flip between request mode and g-code mode.
+    fn toggle_gcode(&mut self) {
+        self.gcode = !self.gcode;
+        let text = if self.gcode {
+            "g-code mode: typed lines go to gcode/script (^G or .gcode to leave)"
+        } else {
+            "request mode: typed lines are requests"
+        };
+        self.push(Entry::notice(Notice::Info, text));
+    }
+
+    /// Subscribe to G-Code output the first time g-code mode is entered.
+    ///
+    /// Subscribing is what makes `respond_info` and errors visible: without it
+    /// the only sign of a command is its reply.
+    async fn ensure_gcode_subscription(
+        &mut self,
+        session: &mut Session,
+    ) -> Result<(), TransportError> {
+        if !self.gcode || self.gcode_subscribed {
+            return Ok(());
+        }
+        session.subscribe_gcode_output(self).await?;
+        self.gcode_subscribed = true;
+        Ok(())
     }
 
     fn push(&mut self, entry: Entry) {
@@ -210,6 +244,10 @@ impl App {
     /// that the window's commands sit in the same list as the session's.
     fn window_command(&mut self, line: &str) -> bool {
         match line.trim() {
+            ".gcode" => {
+                self.toggle_gcode();
+                true
+            }
             ".yaml" | ".json" => {
                 self.format = if line.trim() == ".json" {
                     Format::Json
@@ -230,7 +268,7 @@ impl App {
                 self.push(Entry::notice(
                     Notice::Info,
                     format!(
-                        "{}\n\nWindow:\n  .yaml / .json   show message bodies as YAML or JSON",
+                        "{}\n\nWindow:\n  .yaml / .json   show message bodies as YAML or JSON\n  .gcode          toggle g-code mode (^G): typed lines go to gcode/script",
                         session::usage()
                     ),
                 ));
@@ -395,14 +433,28 @@ async fn handle_key(
             app.entries.clear();
             app.scroll = 0;
         }
+        // Switching what a typed line means: a request, or G-Code.
+        (KeyCode::Char('g'), true) => {
+            app.toggle_gcode();
+            app.ensure_gcode_subscription(session).await?;
+        }
         (KeyCode::Enter, _) => {
             let line = app.input.take();
             if line.is_empty() {
                 return Ok(Control::Continue);
             }
             app.scroll = 0;
-            if !app.window_command(&line) {
-                match session.handle_line(&line, app).await? {
+            if app.window_command(&line) {
+                // Entering g-code mode is the window's business, but the output
+                // subscription it needs belongs to the session.
+                app.ensure_gcode_subscription(session).await?;
+            } else {
+                let outcome = if app.gcode {
+                    session.handle_gcode_line(&line, app).await?
+                } else {
+                    session.handle_line(&line, app).await?
+                };
+                match outcome {
                     Control::Continue => (),
                     Control::Quit => app.quit = true,
                 }
@@ -511,6 +563,9 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
         // A local command is the client's own, so it is marked as such before it
         // is even sent.
         Span::styled("local> ", Style::new().fg(Color::Magenta))
+    } else if app.gcode {
+        // In g-code mode the whole line is the script.
+        Span::styled("gcode> ", Style::new().fg(Color::Yellow))
     } else {
         Span::styled("klippy> ", Style::new().fg(Color::Blue))
     };
@@ -535,8 +590,10 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
             "scrolled back {} lines · PgDn to return · ^C quit",
             app.scroll
         )
+    } else if app.gcode {
+        "g-code mode · Enter send · ^G request mode · .gcode · ^C quit".to_string()
     } else {
-        "Enter send · ↑↓ history · PgUp/PgDn scroll · .help · ^C quit".to_string()
+        "Enter send · ↑↓ history · PgUp/PgDn · ^G g-code · .help · ^C quit".to_string()
     };
     frame.render_widget(
         Paragraph::new(Line::from(hint)).style(Style::new().add_modifier(Modifier::DIM)),
@@ -1154,6 +1211,33 @@ mod tests {
             app.input.edit(KeyCode::Char(character), false);
         }
         let rows = render(&app, 40, 5);
+        assert!(rows[3].starts_with("local> .help"), "{rows:?}");
+    }
+
+    #[test]
+    fn test_gcode_mode_shows_its_prompt_and_toggles_back() {
+        let mut app = app_with(Vec::new());
+        app.toggle_gcode();
+        for character in "SET_PIN PIN=fan VALUE=1".chars() {
+            app.input.edit(KeyCode::Char(character), false);
+        }
+
+        let rows = render(&app, 60, 5);
+        assert!(rows[3].starts_with("gcode> "), "{rows:?}");
+        assert!(rows.last().unwrap().contains("g-code mode"), "{rows:?}");
+
+        // Back to request mode.
+        app.toggle_gcode();
+        let rows = render(&app, 60, 5);
+        assert!(rows[3].starts_with("klippy> "), "{rows:?}");
+
+        // A local command keeps its own prompt even in g-code mode.
+        app.toggle_gcode();
+        app.input.edit(KeyCode::Char('u'), true);
+        for character in ".help".chars() {
+            app.input.edit(KeyCode::Char(character), false);
+        }
+        let rows = render(&app, 60, 5);
         assert!(rows[3].starts_with("local> .help"), "{rows:?}");
     }
 

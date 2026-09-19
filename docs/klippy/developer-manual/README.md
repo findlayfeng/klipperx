@@ -73,8 +73,8 @@ MCU 一侧的依赖边一共只有这五条：
 |------|------|
 | `lib.rs` | `klipperx api` / `klipperx console` 以及 `klippy-client` 三处的参数与入口；`--api-server` 与主机共用同一个解析 |
 | `connection.rs` | `Connection`：分帧、`id` 分配与回收、应答按 `id` 配对并标注方法名、推送识别 |
-| `session.rs` | `Session`：把一行输入解释成请求或本地命令、登记发出去的请求、把收到的东西变成 `Entry`；不打印任何东西 |
-| `tui.rs` | 全屏窗口：三块面板、键位、行编辑与历史、日志滚动；把 `Entry` 画出来 |
+| `session.rs` | `Session`：把一行输入解释成请求或本地命令（`handle_line`）、把整行当 g-code 发（`handle_gcode_line`）、订阅 g-code 输出（`subscribe_gcode_output`）、登记发出去的请求、把收到的东西变成 `Entry`；不打印任何东西 |
+| `tui.rs` | 全屏窗口：三块面板、键位（`^G` / `.gcode` 切请求/g-code 模式，进入时自动订阅 g-code 输出）、行编辑与历史、日志滚动；把 `Entry` 画出来 |
 | `console.rs` | 行模式：一次一行写到 stdout；管道与 `--plain` 走这条 |
 | `main.rs` | `klippy-client` 二进制（另有一套二十行的日志初始化，见下） |
 

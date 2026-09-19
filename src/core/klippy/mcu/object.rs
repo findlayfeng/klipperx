@@ -23,14 +23,16 @@
 //! ([`register_stats_logging`](crate::core::klippy::event::stats::register_stats_logging)).
 //! It comes back with the statistics consumer.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use serde_json::{json, Map, Value};
+use tracing::warn;
 
 use crate::core::klippy::config::mcu::McuConfig;
 use crate::core::klippy::config::ConfigSection;
 use crate::core::klippy::error::KlippyError;
-use crate::core::klippy::mcu::{ConfigBuilder, Dictionary, Mcu, McuChip};
+use crate::core::klippy::event::{IsShutdown, McuEvent, Shutdown, Starting};
+use crate::core::klippy::mcu::{ConfigBuilder, Dictionary, Mcu, McuChip, McuError};
 use crate::core::klippy::pins::{PinError, PrinterPins, PINS_OBJECT};
 use crate::core::klippy::printer::{ConnectFuture, Printer, PrinterObject};
 
@@ -49,6 +51,10 @@ pub struct McuObject {
     /// What `objects/query` reports; `{}` until the handshake fills it, which is
     /// what upstream's `_get_status_info` starts as.
     status: Mutex<Value>,
+    /// The machine, for reporting a firmware shutdown. `Weak` because the
+    /// printer's registry owns this object: a strong handle would be a cycle
+    /// that keeps the printer (and its device) alive forever.
+    printer: Weak<Printer>,
 }
 
 impl McuObject {
@@ -62,7 +68,7 @@ impl McuObject {
     /// # Errors
     /// Returns [`PinError::DuplicateChip`] if another `[mcu]` section already
     /// claimed this name (`[mcu]` and `[mcu mcu]` would collide).
-    pub fn new(section: ConfigSection, printer: &Printer) -> Result<Self, PinError> {
+    pub fn new(section: ConfigSection, printer: &Arc<Printer>) -> Result<Self, PinError> {
         let name = section.sub.clone().unwrap_or_else(|| section.id.clone());
         let pins = printer
             .lookup_object_as::<PrinterPins>(PINS_OBJECT)
@@ -75,6 +81,7 @@ impl McuObject {
             section,
             chip,
             status: Mutex::new(json!({})),
+            printer: Arc::downgrade(printer),
         })
     }
 
@@ -130,6 +137,49 @@ impl McuObject {
         }
         Ok(())
     }
+
+    /// Report a firmware shutdown, restart, or already-stopped state.
+    ///
+    /// The events carry the reason; the machine is what knows what a stop
+    /// means, so the handler only hands it over. Bound **after** the
+    /// configuration handshake, so that a reset this host performs while
+    /// configuring does not look like a spontaneous stop (see
+    /// `mcu/config.rs`, which clears a stopped or differently-configured
+    /// firmware before sending the configuration).
+    fn bind_shutdown(&self, mcu: &Mcu) -> Result<(), McuError> {
+        let name = self.chip.name().to_string();
+
+        if has_message(mcu, Shutdown::NAME) {
+            let printer = self.printer.clone();
+            let name = name.clone();
+            mcu.bind_event::<Shutdown, _>(move |event| {
+                let msg = match event.clock {
+                    Some(clock) => {
+                        format!("MCU '{name}' shutdown: {} (clock {clock})", event.reason)
+                    }
+                    None => format!("MCU '{name}' shutdown: {}", event.reason),
+                };
+                report_shutdown(&printer, &msg);
+            })?;
+        }
+        if has_message(mcu, IsShutdown::NAME) {
+            let printer = self.printer.clone();
+            let name = name.clone();
+            mcu.bind_event::<IsShutdown, _>(move |event| {
+                report_shutdown(
+                    &printer,
+                    &format!("MCU '{name}' is shutdown: {}", event.reason),
+                );
+            })?;
+        }
+        if has_message(mcu, Starting::NAME) {
+            let printer = self.printer.clone();
+            mcu.bind_event::<Starting, _>(move |_| {
+                report_shutdown(&printer, &format!("MCU '{name}' restarted"));
+            })?;
+        }
+        Ok(())
+    }
 }
 
 impl PrinterObject for McuObject {
@@ -165,9 +215,31 @@ impl PrinterObject for McuObject {
                 .configure(&mcu)
                 .await
                 .map_err(|err| KlippyError::Connection(err.to_string()))?;
+            // Only now does a firmware shutdown mean something the machine
+            // should report: the configuration handshake is done, so nothing
+            // this host sent is still in flight.
+            self.bind_shutdown(&mcu)
+                .map_err(|err| KlippyError::Internal(err.to_string()))?;
             self.set_status(&mcu);
             Ok(())
         })
+    }
+}
+
+/// Whether the firmware's dictionary declares `name`.
+///
+/// Older or trimmed firmware may not send every message; binding a missing one
+/// would fail the whole connect for no reason.
+fn has_message(mcu: &Mcu, name: &str) -> bool {
+    mcu.dictionary()
+        .is_some_and(|dictionary| dictionary.message(name).is_some())
+}
+
+/// Log a firmware stop and put the machine into its shutdown state.
+fn report_shutdown(printer: &Weak<Printer>, msg: &str) {
+    warn!("{msg}");
+    if let Some(printer) = printer.upgrade() {
+        printer.invoke_shutdown(msg);
     }
 }
 
@@ -220,9 +292,13 @@ pub fn load_config_prefix(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::klippy::interface::test::TestDevice;
+    use crate::core::klippy::frame::Frame;
+    use crate::core::klippy::interface::test::{MappingEntry, TestDevice};
     use crate::core::klippy::interface::Interface;
+    use crate::core::klippy::msg::proto::Payload;
+    use crate::core::klippy::printer::PrinterState;
     use crate::core::klippy::reactor::ManualReactor;
+    use tokio::time::Duration;
 
     fn section(sub: Option<&str>) -> ConfigSection {
         ConfigSection::new("mcu", sub)
@@ -289,6 +365,49 @@ mod tests {
         // The reserved pins cannot be resolved; a free one can.
         assert!(object.chip.pins().resolve_pin("mcu", "PA0").is_err());
         assert!(object.chip.pins().resolve_pin("mcu", "PA2").is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_a_firmware_shutdown_stops_the_printer() {
+        let printer = printer();
+        let object = McuObject::new(section(None), &printer).unwrap();
+
+        // The firmware answers the request with an unsolicited `shutdown`, the
+        // way it does when one of its shutdown handlers runs.
+        let mut request = Payload::new();
+        request.push_i16(4).unwrap(); // get_uptime
+        let mut shutdown = Payload::new();
+        shutdown.push_i16(20).unwrap(); // shutdown
+        shutdown.push_u32(1234).unwrap(); // clock
+        shutdown.push_u16(0).unwrap(); // static_string_id 0
+
+        let device = TestDevice::new(vec![MappingEntry {
+            input: Frame::new(0, request.into_raw()),
+            outputs: vec![Frame::new(0, shutdown.into_raw())],
+        }]);
+        let mcu = Mcu::for_test("mcu", Interface::new(device));
+        mcu.install_dictionary(
+            Dictionary::from_json(json!({
+                "commands": {"get_uptime": 4},
+                "responses": {"shutdown clock=%u static_string_id=%hu": 20},
+                "enumerations": {"static_string_id": {"Move queue overflow": 0}}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        object.bind_shutdown(&mcu).unwrap();
+        mcu.send("get_uptime", &[]).unwrap();
+        // Let the receive task decode and dispatch the shutdown frame.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let state = printer.get_state_message();
+        assert_eq!(state.category, PrinterState::Shutdown);
+        assert!(
+            state.message.contains("Move queue overflow"),
+            "{}",
+            state.message
+        );
     }
 
     #[test]

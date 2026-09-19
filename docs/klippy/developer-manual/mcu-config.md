@@ -70,7 +70,7 @@ McuObject::new
                                    post-init 回调
 ```
 
-失败统一是 `McuError::Config`：固件停机、CRC 不匹配、固件拒绝配置、运动队列槽位不够。`McuObject::connect` 把它转成 `KlippyError::Connection`。
+失败统一是 `McuError::Config`：固件停机且无法复位、CRC 不一致且无法复位、固件拒绝配置、运动队列槽位不够。`McuObject::connect` 把它转成 `KlippyError::Connection`。（停机与 CRC 不一致**能复位时**不会报错：`configure` 会先 `config_reset` 再配置，见下。）
 
 ## oid
 
@@ -172,7 +172,7 @@ void command_finalize_config(uint32_t *args) {
 | `_send_get_config` 先查**连接层**的 shutdown 标志（`conn_helper.is_shutdown()`），再查 `get_config` 的 `is_shutdown` 字段，两者都 raise | `:1039-1046` | 只查 `is_shutdown` 字段（连接层 shutdown 属 B2） |
 | 未配置时先 `check_restart_on_send_config()`：`restart_method == 'rpi_usb'` 要先做一次 USB 断电重启才发配置 | `:686-689`、`:1052` | 不做（无重启路径，D2） |
 | 已配置时先看 `start_reason == 'firmware_restart'`，是则 raise “Failed automated reset”（说明复位没生效），**再**算 CRC | `:1053-1056` | 不做（无 `start_reason`，D1/D2） |
-| **CRC 不匹配时先 `check_restart_on_crc_mismatch()`：请求一次 `request_exit('firmware_restart')`、pause 2 s、然后才 raise** | `:678-685`、`:1057-1059` | 直接报 `McuError::Config`（不重启） |
+| **CRC 不匹配时先 `check_restart_on_crc_mismatch()`：请求一次 `request_exit('firmware_restart')`、pause 2 s、然后才 raise** | `:678-685`、`:1057-1059` | 就地复位：`emergency_stop` + `config_reset` 后重新配置（没有 `config_reset` 才报 `McuError::Config`） |
 | pin 名在 `_finalize_config` 里改写；非法 pin 的错误到**发送时**才被 `_send_cfg_init_commands` 捕获并转成 config error | `:1009-1013`、`:1021-1032` | F2 会在**加入命令时**就改写/报错，编码在 build 时，错误也在 build 暴露 |
 | 发送后第二次 `get_config`：`fileoutput` 模式下跳过 `is_config` 断言 | `:1066-1068` | 总是断言 |
 | `move_count` 与预留槽：把 `move_count - reserved` 交给 `steppersync` | `:1070-1078` | 只校验 `move_count >= reserved`（无运动层，C1） |
@@ -190,7 +190,9 @@ MCU 'mcu' is configured with CRC 0x…, the host computed 0x…
 
 **CRC 不匹配不能靠重发配置来修**：固件一旦 `finalize_config` 就把配置锁住——之后 `oid_alloc` 报 `Can't assign oid`（`src/basecmd.c:204`），再发一次 `finalize_config` 报 `Already finalized`（`src/basecmd.c:173`）。所以重发不只是无效，还会把 MCU 直接打进 shutdown。要换配置只能**复位**：停机时用 `config_reset`（`src/basecmd.c:262`，清 CRC/oid/运动队列），或者重启固件。这正是不匹配时上游**先请求 firmware_restart 再 raise** 的原因——它不重发，它重启。
 
-所以我们现在直接报错是对的（把“不能继续”说清楚），缺的只是后续动作：重启路径（D2）与 `config_reset` 的发送（B2）。等它们到位，这个错误会变成“触发重启，下一轮重新配置”。上游在没有重启 helper 可用时（如 `start_reason == 'firmware_restart'`）同样是直接 raise。
+我们现在也复位，但**在原连接里**：`configure` 发现固件已停机或 CRC 不一致时，发 `config_reset`（运行中的固件先发 `emergency_stop`，因为 `config_reset` 只在停机时可跑），再重新 `get_config`、发这份配置。上游是下一个进程里做同一件事（它的重启 helper），所以我们把“固件的停机事件”**放在这次握手之后**再绑（`mcu/object.rs`）——否则自己发起的 `emergency_stop` 会被当成一次意外停机。
+
+没有 `config_reset` 的固件（该命令按板子声明，不在 `basecmd.c`）仍然只能报错，提示断电或等重启循环（D2）。上游在没有重启 helper 可用时（如 `start_reason == 'firmware_restart'`）同样是直接 raise。
 
 ### 对 F2（pin 解析）的约束
 
@@ -230,8 +232,8 @@ MCU 'mcu' is configured with CRC 0x…, the host computed 0x…
 
 - **pin 名改写**：F2 的 `PinResolver`。见上一节对 F2 的约束。
 - **`get_query_slot`**：它把周期查询排到一个绝对的 print-time 时钟上（`:1136`），需要时钟/运动层；由它的消费者（ADC、endstop）带进来。
-- **`config_reset` 的发送**：命令类型已定义，但「停机后复位再配置」的路径属于 MCU shutdown 处理（TODO B2）。
-- **CRC 不匹配的重启路径**：属于重启循环（TODO D2）。`McuConfig.restart_method` 也仍是解析后保留、无人读取。
+- **`config_reset` 的发送**：已完成（`configure` 在固件停机或 CRC 不一致时就地复位；无 `config_reset` 时报错）。
+- **CRC 不匹配时的进程重启**：仍属于重启循环（D2）。`McuConfig.restart_method` 也仍是解析后保留、无人读取。
 
 ---
 

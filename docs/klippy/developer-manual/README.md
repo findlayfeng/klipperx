@@ -142,8 +142,8 @@ klipperx（bin，src/main.rs）
 | 文件 | 职责 |
 |------|------|
 | `mod.rs` | `Mcu`：构造（`new`）、收发任务、`send` / `call`、字典安装与查询、`seconds_to_clock`、`Drop`；构造时向 `identify` 取起始 `Parser`，本身不引用任何命令 |
-| `object.rs` | `McuObject`：`[mcu]` / `[mcu <name>]` 作为打印机对象，以及工厂 `load_config` / `load_config_prefix`。section 只在 `PrinterObject::connect` 时才解析、开设备、跑 identify，随后把累积的配置交给固件，`get_status` 报 identify 快照 |
-| `config.rs` | [`ConfigBuilder`](mcu-config.md)：配置期的 oid 发号器、`config` / `restart` / `init` 三张命令表、config 回调、CRC 与 `finalize_config`，以及 `configure()` 的 `get_config` 两段式握手 |
+| `object.rs` | `McuObject`：`[mcu]` / `[mcu <name>]` 作为打印机对象，以及工厂 `load_config` / `load_config_prefix`。section 只在 `PrinterObject::connect` 时才解析、开设备、跑 identify，随后把累积的配置交给固件（需要时先复位），再把固件的 `shutdown`/`is_shutdown`/`starting` 绑成打印机停机；`get_status` 报 identify 快照 |
+| `config.rs` | [`ConfigBuilder`](mcu-config.md)：配置期的 oid 发号器、`config` / `restart` / `init` 三张命令表、config 回调、CRC 与 `finalize_config`，`configure()` 的 `get_config` 两段式握手，以及“停机或 CRC 不一致时先 `config_reset` 再配置”的原地复位 |
 | `pin.rs` | `McuChip`（MCU 作为 pin chip，实现 `PinChip`）与 `McuDigitalOut`：数字输出的 oid、`config_digital_out` / `update_digital_out` 与运行期的 `queue_digital_out`；pin 名→编号在 config 回调里完成 |
 | `dictionary.rs` | `Dictionary`：解析固件字典、枚举展开、安装进 `Parser` |
 | `pending.rs` | `PendingCalls`：同步请求/响应记账 |
@@ -171,6 +171,7 @@ klipperx（bin，src/main.rs）
 |------|------|
 | `mod.rs` | 事件词汇：`McuEvent`，以及回调注册 `Mcu::bind_event`（底层 `Mcu::bind_callback` 在 `mcu`） |
 | `stats.rs` | `stats` 事件（`basecmd.c` 的 `stats_update` 定时推送）；`register_stats_logging` 为占位订阅（只记日志） |
+| `shutdown.rs` | `shutdown` / `is_shutdown` / `starting`：固件停机/重启事件；`static_string_id` 经字典枚举解成原因文本，由 `McuObject` 绑成打印机停机 |
 
 ### `identify.rs` — Identify 引导
 
@@ -220,7 +221,7 @@ identify 的命令**定义**（名称、参数、解码）与其它命令一样�
 
 | 文件 | 职责 |
 |------|------|
-| `output_pin.rs` | `[output_pin <name>]`：读 `pin` / `value` / `shutdown_value` / `maximum_mcu_duration`，用 `PrinterPins::setup_digital_out` 建数字输出，向 `gcode` 注册 `SET_PIN PIN=<name> VALUE=<0..1>`；`get_status` 报 `value`。`pwm` 暂拒（F4），`SET_PIN` 先立即 `update_digital_out`（无时钟层） |
+| `output_pin.rs` | `[output_pin <name>]`：读 `pin` / `value` / `shutdown_value`，用 `PrinterPins::setup_digital_out` 建数字输出（无条件 `setup_max_duration(0)`，同上游），向 `gcode` 注册 `SET_PIN PIN=<name> VALUE=<0..1>`；`get_status` 报 `value`。`pwm` 暂拒（F4），`SET_PIN` 先立即 `update_digital_out`（无时钟层） |
 
 ### `api/` — 客户端 API 层
 

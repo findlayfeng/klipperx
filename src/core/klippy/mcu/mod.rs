@@ -24,12 +24,14 @@ mod dictionary;
 mod error;
 mod object;
 mod pending;
+mod pin;
 mod restart_method;
 
 pub use config::{BuiltConfig, ConfigBuilder, ConfigCallback, Configured, PostInitCallback};
 pub use dictionary::{Dictionary, Enumeration, MessageDef, OutputDef};
 pub use error::{McuCallError, McuError};
 pub use object::{load_config, load_config_prefix, McuObject};
+pub use pin::{McuChip, McuDigitalOut};
 pub use restart_method::McuRestartMethod;
 
 use crate::core::klippy::config::mcu::McuConfig;

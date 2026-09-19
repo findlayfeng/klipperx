@@ -131,6 +131,15 @@ impl From<McuCallError> for McuError {
     }
 }
 
+impl From<crate::core::klippy::pins::PinError> for McuError {
+    /// A pin mistake is a configuration mistake: the resource could not be
+    /// built from what the config file said. It surfaces through `build`, which
+    /// already reports [`McuError::Config`].
+    fn from(e: crate::core::klippy::pins::PinError) -> Self {
+        McuError::Config(e.to_string())
+    }
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================

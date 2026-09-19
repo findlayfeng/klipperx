@@ -144,6 +144,7 @@ klipperx（bin，src/main.rs）
 | `mod.rs` | `Mcu`：构造（`new`）、收发任务、`send` / `call`、字典安装与查询、`seconds_to_clock`、`Drop`；构造时向 `identify` 取起始 `Parser`，本身不引用任何命令 |
 | `object.rs` | `McuObject`：`[mcu]` / `[mcu <name>]` 作为打印机对象，以及工厂 `load_config` / `load_config_prefix`。section 只在 `PrinterObject::connect` 时才解析、开设备、跑 identify，随后把累积的配置交给固件，`get_status` 报 identify 快照 |
 | `config.rs` | [`ConfigBuilder`](mcu-config.md)：配置期的 oid 发号器、`config` / `restart` / `init` 三张命令表、config 回调、CRC 与 `finalize_config`，以及 `configure()` 的 `get_config` 两段式握手 |
+| `pin.rs` | `McuChip`（MCU 作为 pin chip，实现 `PinChip`）与 `McuDigitalOut`：数字输出的 oid、`config_digital_out` / `update_digital_out` 与运行期的 `queue_digital_out`；pin 名→编号在 config 回调里完成 |
 | `dictionary.rs` | `Dictionary`：解析固件字典、枚举展开、安装进 `Parser` |
 | `pending.rs` | `PendingCalls`：同步请求/响应记账 |
 | `error.rs` | `McuError`（总括）、`McuCallError`（`call` 专用） |
@@ -159,6 +160,7 @@ klipperx（bin，src/main.rs）
 | `uptime.rs` | `get_uptime`：读 64 位固件时钟（`basecmd.c` 的 Timing and load stats） |
 | `shutdown.rs` | `emergency_stop` / `clear_shutdown`：固件停机与解锁（`basecmd.c` 的 Misc commands） |
 | `clock.rs` | `ClockSync` / `McuClock`：`get_clock` ↔ `clock`（已编译；用能力 trait 把时钟同步与 `Mcu` 解耦，测试里用不依赖 MCU 的 `FixedClock`） |
+| `gpio.rs` | `config_digital_out` / `update_digital_out` / `queue_digital_out` / `set_digital_out_pwm_cycle`：数字输出与软件 PWM 周期（固件 `gpiocmds.c`） |
 | `identify.rs` | `identify` / `identify_response` 的类型化视图（分片驱动在 `identify.rs`） |
 
 ### `event/` — 事件层
@@ -192,11 +194,12 @@ identify 的命令**定义**（名称、参数、解码）与其它命令一样�
 
 | 项 | 职责 |
 |------|------|
-| `PrinterPins` | 注册成 printer object `pins`：`parse_pin` / `lookup_pin`（共享与重复使用）/ `reset_pin_sharing` / `allow_multi_use_pin`；**注册但不可查询**（`is_queryable` = false，上游 `objects/list` 也是这样滤掉它的） |
+| `PrinterPins` | 注册成 printer object `pins`：`parse_pin` / `lookup_pin`（共享与重复使用）/ `reset_pin_sharing` / `allow_multi_use_pin` / **`setup_digital_out`**（校验后交给 chip 建资源）；**注册但不可查询**（`is_queryable` = false，上游 `objects/list` 也是这样滤掉它的） |
 | `PinResolver` | 每个 MCU 一份别名与保留：`reserve_pin` / `alias_pin` / `resolve`（上游 `update_command` 去掉文本改写）；`RESERVE_PINS_*` 在 MCU connect 时预留 |
+| `PinChip` / `DigitalOut` | chip 侧接口与资源接口；`McuChip` / `McuDigitalOut`（`mcu/pin.rs`）是第一个实现 |
 | `PinType` / `PinParams` / `PinError` | 资源类型决定描述可带哪些修饰（`!` / `^` / `~`）、解析结果、上游原文的错误文案 |
 
-数字从哪来：上游把引脚**名字**留在命令文本里，发送时由 msgparser 查字典的 `pin` 枚举；这里编码器只接受 `ArgValue`，所以名字要在**配置回调**（build 时、有字典）里换成编号，见 [MCU 配置构建](mcu-config.md)。`pins` 只做到“解析 + 别名/保留”，`setup_pin` 到资源的派发属于 F3。
+数字从哪来：上游把引脚**名字**留在命令文本里，发送时由 msgparser 查字典的 `pin` 枚举；这里编码器只接受 `ArgValue`，所以名字要在**配置回调**（build 时、有字典）里换成编号，见 [MCU 配置构建](mcu-config.md)。资源的派发（上游 `setup_pin`）在 `PrinterPins::setup_digital_out` 上，由 chip（`McuChip`）建出 `McuDigitalOut`；PWM / ADC / endstop 随各自的 TODO 项加。
 
 ### `api/` — 客户端 API 层
 

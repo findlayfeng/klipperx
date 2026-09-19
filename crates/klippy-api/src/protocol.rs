@@ -308,6 +308,13 @@ pub enum ApiError {
     /// client; the server owns that decision, this variant only carries the
     /// text.
     Internal(String),
+    /// A command handler refused the request and said why.
+    ///
+    /// The text is the handler's own (a G-Code `CommandError`: unknown command,
+    /// missing parameter, …). Unlike [`ApiError::Internal`] it does not take
+    /// klippy down — the client asked for something that does not work, which is
+    /// the client's problem.
+    CommandError(String),
 }
 
 impl ApiError {
@@ -347,6 +354,7 @@ impl fmt::Display for ApiError {
                 write!(f, "No active connections for method '{method}'")
             }
             ApiError::Internal(message) => f.write_str(message),
+            ApiError::CommandError(message) => f.write_str(message),
         }
     }
 }

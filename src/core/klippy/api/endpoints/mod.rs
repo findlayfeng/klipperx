@@ -8,11 +8,11 @@
 //!
 //! # Status
 //!
-//! [`info`](info), [`objects/list`](objects_list), [`objects/query`](objects_query)
-//! and [`objects/subscribe`](objects_subscribe) are written and registered by
-//! [`register`](super::register); the rest of the documented surface is not
-//! written yet, so the table below is the checklist and `list_endpoints`
-//! reports those four plus the built-in.
+//! [`info`](info), [`objects/list`](objects_list), [`objects/query`](objects_query),
+//! [`objects/subscribe`](objects_subscribe) and the four [`gcode`](gcode)
+//! endpoints are written and registered by [`register`](super::register); the
+//! rest of the documented surface is not written yet, so the table below is the
+//! checklist.
 //!
 //! | Endpoint | Status |
 //! |---|---|
@@ -20,20 +20,22 @@
 //! | `list_endpoints` | done ([`registry`](super::registry)) |
 //! | `objects/list`, `objects/query` | done |
 //! | `objects/subscribe` | done ([`objects_subscribe`]) |
+//! | `gcode/help`, `gcode/script`, `gcode/restart`, `gcode/firmware_restart` | done ([`gcode`]) |
+//! | `gcode/subscribe_output` | not started — needs a removable output handler |
 //! | `emergency_stop` | not started |
 //! | `register_remote_method` | not started |
-//! | `gcode/help`, `gcode/script`, `gcode/restart` | not started |
-//! | `gcode/firmware_restart`, `gcode/subscribe_output` | not started |
 //! | `pause_resume/{pause,resume,cancel}` | not started |
 //! | `query_endstops/status` | not started |
 //! | `bed_mesh/dump_mesh` | not started |
 //! | the `*/dump_*` mux endpoints | not started |
 
+pub mod gcode;
 pub mod info;
 pub mod objects_list;
 pub mod objects_query;
 pub mod objects_subscribe;
 
+pub use gcode::{GcodeHelp, GcodeRestart, GcodeScript};
 pub use info::{Info, InfoParams, InfoResponse};
 pub use objects_list::ObjectsList;
 pub use objects_query::{ObjectsQuery, ObjectsQueryParams};

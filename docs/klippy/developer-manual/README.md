@@ -58,7 +58,7 @@ MCU 一侧的依赖边一共只有这五条：
 | `klippy-api → TransportError` | 已有：socket 层面的失败用自己的错误类型（`Bind` / `Connect` / `Closed` / `Io`），不认识主机的 `KlippyError` |
 | `api → tokio 运行时` | 已有：accept 循环与每连接一个任务跑在 host 建的 runtime 上（见 `klippy::run`）；API 层自己不建线程，socket 收发是异步的 |
 | `api → printer` | 已有：`api::register`（`src/core/klippy/api/mod.rs`）把服务器的对象与端点一次装到机器上，`objects/list`、`objects/query` 与 `webhooks` 都由它安装；必须在 bind 之前调用 |
-| `api → gcode` | **部分**：`gcode` 调度器已就绪（G1，`src/core/klippy/gcode.rs`），`gcode/*` 端点属 G3 |
+| `api → gcode` | 已有：`gcode` 调度器（G1，`src/core/klippy/gcode.rs`）与四个 `gcode/*` 端点（G3，`api/endpoints/gcode.rs`，按请求查找 `gcode`）；`gcode/subscribe_output` 未做 |
 | `api → mcu` / `cmd` / `event` | **没有**，将来也不应该有：端点经 `printer` / `gcode` 间接使用协议层，不直接碰帧与字典 |
 
 **并发模型**：`api` 用一个任务 accept、一个任务服务一条连接。所以跨连接并行、同连接内的请求保持顺序（客户端 pipeline 时看到的顺序与上游一致）；一个卡住的客户端只占住自己的任务。上游是一个线程 + reactor + 每连接一对 fd 回调，形状等价，只是用任务代替了 greenlet。推送给连接用的是**同步**的 `PushTarget::push`（入队 + `Notify` 唤醒该连接的任务），因此任何任务/线程都能推，不需要持有 runtime；“写不动超过 5 秒就断开”与上游的 `blocking_count` 同义。
@@ -231,7 +231,7 @@ identify 的命令**定义**（名称、参数、解码）与其它命令一样�
 | 文件 | 职责 |
 |------|------|
 | `mod.rs` | 说明主机侧与 API 的分界，把 `klippy-api` 的四个模块转出，并提供 `register`：一次把服务器这一侧（`webhooks` + 端点）装到机器上 |
-| `endpoints/` | 一个端点一个文件：`info.rs`、`objects_list.rs`、`objects_query.rs`、`objects_subscribe.rs`；参数、响应形状与 handler 都在各文件里。`objects/query` 与 `objects/subscribe` 共用字段选择（`select_fields` / `status_object`） |
+| `endpoints/` | 一个端点一个文件：`info.rs`、`objects_list.rs`、`objects_query.rs`、`objects_subscribe.rs`、`gcode.rs`；参数、响应形状与 handler 都在各文件里。`objects/query` 与 `objects/subscribe` 共用字段选择（`select_fields` / `status_object`），`gcode/*` 按请求从 `printer` 里取 `gcode` |
 | `webhooks.rs` | 服务器自己的打印机对象：名字与字段对齐上游 `webhooks.get_status`，读的是机器状态 |
 | `start_args.rs` | 主机启动参数（`config_file` / `log_file` / `software_version` / `cpu_info`）：上游放在 printer 上（29 处 `get_start_args`），这里归主机侧，`info` 是第一个消费者 |
 

@@ -72,18 +72,23 @@
   `maximum_mcu_duration`）用 `setup_digital_out` 建输出并注册 `SET_PIN PIN=… VALUE=…`；
   从 API 发 `gcode/script` 就能点灯（端点属 G3）。`pwm` 暂拒，`SET_PIN` 先立即生效
   （`extras/output_pin.rs`、`load.rs`）。
+- **`gcode/*` 端点（G3 的四个）**：`gcode/help` / `gcode/script` / `gcode/restart` /
+  `gcode/firmware_restart`；命令错误用新增的 `ApiError::CommandError`（不关停 klippy）；
+  端点按请求从 `printer` 取 `gcode`（`api/endpoints/gcode.rs`、`crates/klippy-api/src/protocol.rs`）。
+  这样**从 API 发 `SET_PIN` 点灯已经通了**。
 
 ## 待办
 
-**当前选择：GCODE 驱动**。G1（调度器）与 G2（`output_pin` + `SET_PIN`）已完成；
-下一步 **G3**（`gcode/*` 端点，把命令从 API 放出来）。执行层做不到的地方先用占位：
-`SET_PIN` 现为立即 `update_digital_out`（不排程），运动命令随 C1。
+**当前选择：GCODE 驱动**。G1（调度器）、G2（`output_pin` + `SET_PIN`）与 G3 的四条端点已完成，
+**已可从 API 发 `SET_PIN` 点灯**；剩 G3 的 `gcode/subscribe_output` 与 G4（运动命令，随 C1）。
+执行层做不到的地方先用占位：`SET_PIN` 现为立即 `update_digital_out`（不排程），
+`gcode/restart` 直接退出进程（无重启循环 D2）。
 
 编号保留旧文件的 T/Q 以便对照，新增项给新号。依赖列的是**工具性前置**，不是自然顺序。
 
 | # | 事项 | 依赖 |
 |---|---|---|
-| G3 | `gcode/*` 端点 | G1 ✓ |
+| G3 | `gcode/subscribe_output`（其余 `gcode/*` 已落地） | G1 ✓ |
 | G4 | 运动命令（G0/G1/G28…） | G1 ✓、C1 |
 | A1b | reactor 串行调度器与延迟度量 | A1 ✓ |
 | A2 | 错误词汇（`CommandError` / `ConfigError`） | — |
@@ -232,13 +237,19 @@
 - 未做：`pwm` / `cycle_time`（F4，现在**显式拒绝**而不是当数字输出）、
       `scale` / `static_value` / `template`（display 模板）。
 
-#### G3 `gcode/*` 端点
+#### G3 `gcode/*` 端点 —— 四条已落地，剩 `subscribe_output`
 
-- [ ] `gcode/script`（`klippy/webhooks.py:439`）、`gcode/help`（`:438`）。
-- [ ] `gcode/subscribe_output`（`:443-444`）：把输出处理器接到发起请求的连接（`PushTarget`），
-      与 `objects/subscribe` 同形。
-- [ ] `gcode/restart` / `gcode/firmware_restart`（`:440-442`）：只是
-      `run_script('restart' / 'firmware_restart')`，主机侧语义接 D2。
+实现：`src/core/klippy/api/endpoints/gcode.rs`，在 `api::register` 里装上。端点**按请求**
+从 `printer` 取 `gcode`（`load_config` 在 `api::register` 之后才建它；取不到时报打印机状态）。
+
+- [x] `gcode/help`（`klippy/webhooks.py:438`）：返回扁平的 `{命令: 帮助}`。
+- [x] `gcode/script`（`:439`）：`run_script`；命令级错误作为 `error` 回（新增
+      `ApiError::CommandError`，**不关停 klippy**），成功回 `{}`。
+- [x] `gcode/restart` / `gcode/firmware_restart`（`:440-442`）：跑内置 `RESTART` /
+      `FIRMWARE_RESTART`（= `request_exit`），主机侧语义接 D2（现在会退出进程）。
+- [ ] `gcode/subscribe_output`（`:443-444`）：把输出处理器接到发起请求的连接（`PushTarget`）
+      并推 `{response: line}`。需要**可移除的输出处理器**（连接关闭时摘掉），
+      现在的 `register_output_handler` 只增不减。
 
 #### G4 运动命令（G0/G1/G28/G92/M114…）
 

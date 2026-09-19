@@ -35,6 +35,7 @@ use std::sync::Arc;
 use crate::core::klippy::config::{Config, ConfigSection};
 use crate::core::klippy::error::KlippyError;
 use crate::core::klippy::mcu::{load_config as load_mcu, load_config_prefix as load_mcu_prefix};
+use crate::core::klippy::pins::{PrinterPins, PINS_OBJECT};
 use crate::core::klippy::printer::{Printer, PrinterObject};
 
 /// Builds one printer object from a config section.
@@ -88,12 +89,22 @@ impl Printer {
     /// [`api::register`](crate::core::klippy::api::register)); a host that loads
     /// first and registers it afterwards reorders that list.
     ///
+    /// [`PrinterPins`](crate::core::klippy::pins::PrinterPins) is registered
+    /// next, unconditionally, because every resource and `[board_pins]` reaches
+    /// it while sections are being loaded — and the MCU objects register
+    /// themselves as chips as they are built. Upstream loads the same two
+    /// modules up front (`pins` then `mcu`, `klippy/klippy.py:118-119`).
+    /// `pins` is registered but never queryable, so `objects/list` still starts
+    /// with `webhooks`.
+    ///
     /// # Errors
     /// Returns [`KlippyError::Internal`] if a factory rejects a section, if a
     /// name is already taken, or if a section nothing claims is left over — the
     /// last is upstream's `Section '%s' is not a valid config section`
     /// (`klippy/configfile.py:431`).
     pub fn load_config(self: &Arc<Self>, config: &Config) -> Result<(), KlippyError> {
+        self.add_object(PINS_OBJECT, Arc::new(PrinterPins::new()))?;
+
         let mut claimed: Vec<String> = Vec::new();
 
         for (id, factories) in FACTORIES {
@@ -173,7 +184,9 @@ mod tests {
         let (printer, result) = load("[mcu]\nserial: /dev/not-opened-yet\n");
 
         result.unwrap();
-        assert_eq!(printer.objects(), ["mcu"]);
+        // `pins` is registered before the table (upstream loads `pins` and
+        // `mcu` up front), then the section's own object.
+        assert_eq!(printer.objects(), ["pins", "mcu"]);
     }
 
     #[test]
@@ -187,7 +200,10 @@ mod tests {
         result.unwrap();
         // The main section first, then the prefix sections in config order —
         // upstream's `add_printer_objects` order (`klippy/mcu.py:1239-1246`).
-        assert_eq!(printer.objects(), ["mcu", "mcu zboard", "mcu toolhead"]);
+        assert_eq!(
+            printer.objects(),
+            ["pins", "mcu", "mcu zboard", "mcu toolhead"]
+        );
     }
 
     #[test]
@@ -202,11 +218,12 @@ mod tests {
     }
 
     #[test]
-    fn test_a_config_with_no_objects_loads_nothing() {
+    fn test_a_config_with_no_objects_loads_only_pins() {
         let (printer, result) = load("");
 
         result.unwrap();
-        assert!(printer.objects().is_empty());
+        // `pins` is unconditional; no section contributed anything else.
+        assert_eq!(printer.objects(), ["pins"]);
     }
 
     #[test]
@@ -218,6 +235,6 @@ mod tests {
         let (printer, result) = load("[mcu]\nserial: /dev/not-a-serial-port\n");
 
         result.unwrap();
-        assert_eq!(printer.objects(), ["mcu"]);
+        assert_eq!(printer.objects(), ["pins", "mcu"]);
     }
 }

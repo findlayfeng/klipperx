@@ -55,6 +55,11 @@
 - **MCU 配置构建层（F1）**：`ConfigBuilder` 的 oid 发号、`config` / `restart` / `init` 三张命令表、
   config 回调、CRC 与 `finalize_config`，以及 `configure()` 的 `get_config` 两段式下发；
   `McuObject` 在 connect 时把累积的配置交给固件（`mcu/config.rs`、`mcu/object.rs`）。
+- **引脚解析与 `pins` 对象（F2）**：`PrinterPins` 的 `parse_pin` / `lookup_pin` / 共享与
+  多用途，`PinResolver` 的别名与保留，`RESERVE_PINS_*` 在 connect 时预留；`pins` 注册但
+  不可查询，为此 `PrinterObject` 加了 `is_queryable` / `queryable_objects`，并加了
+  `lookup_object_as`（`src/core/klippy/pins.rs`、`printer.rs`、`mcu/object.rs`）。
+  `setup_pin` 的资源派发与 pin→编号跟随 F3。
 
 ## 待办
 
@@ -67,13 +72,12 @@
 | B2 | MCU 关闭与错误上报（含 `last_stats`） | A2 |
 | B3 | `gcode` 层与 `gcode/*` 端点 | C1 |
 | B4 | 其余端点（estop / remote method / pause_resume / …） | B3 等 |
-| F2 | pin 解析与 `pins` 对象 | F1 ✓ |
-| F3 | GPIO 输出（`digital_out`） | F1 ✓、F2 |
-| F4 | PWM（硬件 / 软件） | F1 ✓、F2 |
-| F5 | ADC | F1 ✓、F2 |
-| F6 | SPI 总线 | F1 ✓、F2 |
-| F7 | I2C 总线 | F1 ✓、F2 |
-| F8 | endstop / trsync | F1 ✓、F2、C1 |
+| F3 | GPIO 输出（`digital_out`） | F1 ✓、F2 ✓ |
+| F4 | PWM（硬件 / 软件） | F1 ✓、F2 ✓ |
+| F5 | ADC | F1 ✓、F2 ✓ |
+| F6 | SPI 总线 | F1 ✓、F2 ✓ |
+| F7 | I2C 总线 | F1 ✓、F2 ✓ |
+| F8 | endstop / trsync | F1 ✓、F2 ✓、C1 |
 | F9 | 输入与外设资源（buttons / pulse_counter / …） | F1–F7 |
 | C1 | toolhead 与 kinematics | — |
 | C2 | 配置装载收尾（option 校验、第二个住户） | — |
@@ -224,27 +228,50 @@ F 组的 **F2–F9 都依赖 F1（已完成）**，F3–F9 还需 F2（pin 解�
       `src/linux/main.c:59`）。发送它的 shutdown 恢复路径仍属于 B2。
 - 详见 `docs/klippy/developer-manual/testing.md` 的 `config.rs` 一行。
 
-#### F2 pin 解析与 `pins` 对象
+#### F2 pin 解析与 `pins` 对象 —— 已完成
 
 主机侧的引脚词汇，独立于任何具体资源：上游 `klippy/pins.py`（`PrinterPins` `:60`、
-`PinResolver` `:18`）：
+`PinResolver` `:18`）。实现在 `src/core/klippy/pins.rs`，`load_config` 在加载任何 section
+之前先注册 `pins`。
 
-- [ ] `parse_pin`：`[chip:]pin` 描述，`!` 取反、`^`/`~` 上拉（`:67-95`）。单个主机进程
-      可挂多个 MCU，`chip` 就是 MCU 名（默认 `mcu`）。
-- [ ] `lookup_pin` / `setup_pin`：同一个 pin 重复使用要同 `share_type` 且极性一致，否则报
+- [x] `parse_pin`：`[chip:]pin` 描述，`!` 取反、`^`/`~` 上拉（`:67-95`）；修饰只在
+      `PinType` 允许时生效；未知 chip、畸形描述（带上格式提示）报上游原文。
+- [x] `lookup_pin`：同一 pin 重复使用要同 `share_type` 且极性一致，否则报
       `pin X used multiple times in config`；`allow_multi_use_pin` / `reset_pin_sharing`
       是例外口子（`:96-119`）。
-- [ ] `PinResolver`：`reserve_pin` / `alias_pin` / `update_command` —— 后者把命令文本里的
-      `pin=<名字>` 换成别名并查保留（`:24-49`）。`RESERVE_PINS_*` 常量在 identify 时预留
-      （`klippy/mcu.py:1091-1100`），`BUS_PINS_<bus>` 在总线建立时预留
-      （`klippy/extras/bus.py:9-32`）。
-- [ ] `add_printer_objects` 把 `pins` 注册成 printer object（`pins.py:137`）。字典里的
-      `pin` 枚举（名字→编号）已经在 `Dictionary::enumeration` 里，pin 描述最终靠它编码；
-      报错文案要对齐：`Pin 'X' is not a valid pin name on mcu 'Y'`
-      （`mcu.py:1021-1032`）。
+- [x] `PinResolver`：`reserve_pin` / `alias_pin` / `resolve` —— `resolve` 是上游
+      `update_command`（`:41-49`）去掉文本改写后的部分：跟别名、报“pin X is an alias for Y”、
+      拒绝保留引脚。`RESERVE_PINS_*` 在 `McuObject::connect` 里预留
+      （上游 `klippy/mcu.py:1091-1100`）。
+- [x] `pins` 作为 printer object 注册（`pins.py:137`），**但不可查询**：上游
+      `objects/list` 只留带 `get_status` 的对象，为此给 `PrinterObject` 加了
+      `is_queryable`（默认 true）与 `queryable_objects()`，并顺手加了 `lookup_object_as`
+      （按名取回具体类型，上游 `printer.lookup_object('pins')` 的 Rust 写法）。
+      报错文案对齐：`Pin 'X' is not a valid pin name on mcu 'Y'`（`mcu.py:1021-1032`）
+      属于数字解析那一步（见下）。
+
+**本条未做、已拆分出去的**：
+
+- [ ] **`setup_pin` 的资源派发**（`pins.py:114-117`）：上游把校验过的引脚交给 chip（MCU），
+      由它建 `MCU_digital_out` / `MCU_pwm` / `MCU_adc` / `MCU_endstop`。返回类型就是资源本身，
+      所以跟随 **F3+** 一起做；`register_chip` 现在只建 per-chip 的 `PinResolver`，
+      F3 再给它接上资源工厂。
+- [ ] **数字解析**：上游把引脚名留在命令文本里，发送时由 msgparser 查字典的 `pin` 枚举；
+      我们编码器只吃 `ArgValue`，所以名字要在 **config 回调**（build 时、有字典）里换成编号。
+      这一步随第一个资源（F3）落地。
+- [ ] **`[board_pins]`**（`klippy/extras/board_pins.py`）：调用 `alias_pin` / `reserve_pin` 的
+      section，需要 config 的 list 解析与一个新工厂项；解析器 API 已就绪，section 随配置装载
+      （C2）一起接。
+- [ ] **`BUS_PINS_<bus>`**：由 SPI/I2C 在开总线时预留（`klippy/extras/bus.py:9-32`），随 F6/F7。
 
 #### F3 GPIO 输出
 
+- [ ] **接上 `setup_pin` 派发**（F2 留下的）：`PrinterPins` 把校验过的 `PinParams` 交给
+      chip（MCU）上的 `setup_pin(pin_type, params)`，由它建具体的资源对象；`McuObject`
+      实现这个 chip 接口（上游 `klippy/mcu.py:1111-1116` 的 `pcs` 表）。
+- [ ] **pin 名 → 编号**：在资源的 config 回调里用字典的 `pin` 枚举把名字换成数字（build 时
+      才有字典）；未知名字报上游原文 `Pin 'X' is not a valid pin name on mcu 'Y'`
+      （`klippy/mcu.py:1021-1032`）。
 - [ ] `MCU_digital_out`（`klippy/mcu.py:408-449`）：`config_digital_out oid=%c pin=%u
       value=%c default_value=%c max_duration=%u` + 重启时的 `update_digital_out
       oid=%c value=%c` + 带时钟的 `queue_digital_out oid=%c clock=%u on_ticks=%u`。
@@ -427,7 +454,8 @@ kinematics 已随 Printer 重构删除，从这里重新开始：
 - [ ] **Q4 `get_status` 的返回形状**：`serde_json::Value`（贴上游、客户端零适配）还是
       typed + serde。
 - [ ] **Q5 要不要反射式能力**：`lookup_objects(module)` 前缀遍历、`gcode_macro` 的
-      `printer.objects`（`klippy/extras/gcode_macro.py:41`）。
+      `printer.objects`（`klippy/extras/gcode_macro.py:41`）。**部分已做**：F2 为了
+      `pins` 加了 `Printer::lookup_object_as::<T>(name)`（单名取回具体类型）；前缀遍历仍未定。
 - [ ] **Q6 退出结果的语义**：`"exit" / "error_exit" / "firmware_restart"` 由谁解释、
       `run()` 的返回值怎么变成进程退出码（`klippy/klippy.py:355-370`，`error_exit` 退 -1）。
 - [ ] **Q7 重启时 API 与打印机的关系**：`firmware_restart` 要重建机器，但端点与
@@ -460,6 +488,7 @@ kinematics 已随 Printer 重构删除，从这里重新开始：
 | step 生成层的运动学 | `klippy/kinematics/kinematic_stepper.py`、`rail.setup_itersolve(...)` |
 | 惰性装载 | `klippy/extras/adc_temperature.py:51` `load_object(config, 'query_adc')` |
 | MCU 配置构建（oid / config 命令 / CRC / pin 解析） | `klippy/mcu.py:979-1143`、`klippy/pins.py:18-137` |
+| 引脚别名 section（`alias_pin` / `reserve_pin` 的调用方） | `klippy/extras/board_pins.py` |
 | 固件配置区（allocate_oids / get_config / finalize / config_reset） | `src/basecmd.c:235-380` |
 | GPIO 输出 / PWM（软件） | `klippy/mcu.py:408-553`、`src/gpiocmds.c:127-215` |
 | 硬件 PWM | `klippy/mcu.py:451-553`、`src/pwmcmds.c:78-130` |

@@ -47,7 +47,7 @@ impl Endpoint for ObjectsList {
         _request: &Request,
         _context: &EndpointContext<'_>,
     ) -> Result<Value, ApiError> {
-        Ok(json!({ "objects": self.printer.objects() }))
+        Ok(json!({ "objects": self.printer.queryable_objects() }))
     }
 }
 
@@ -60,6 +60,7 @@ mod tests {
     use super::*;
     use crate::core::klippy::api::registry::Api;
     use crate::core::klippy::api::test_support::{context, silent_target, FixedStatus};
+    use crate::core::klippy::pins::PrinterPins;
     use crate::core::klippy::reactor::ManualReactor;
     use serde_json::json;
 
@@ -116,6 +117,28 @@ mod tests {
         assert!(ObjectsList::new(printer)
             .handle(&request, &context(&api, silent_target()))
             .is_ok());
+    }
+
+    #[test]
+    fn test_a_registered_but_unqueryable_object_is_not_listed() {
+        // `pins` is a printer object but has no status, so upstream's
+        // `objects/list` leaves it out — the registry and the queryable set
+        // differ.
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        printer
+            .add_object("pins", Arc::new(PrinterPins::new()))
+            .unwrap();
+        printer
+            .add_object("toolhead", Arc::new(FixedStatus(json!({}))))
+            .unwrap();
+        let request = Request::parse(br#"{"method":"objects/list"}"#).unwrap();
+        let api = Api::new();
+
+        let response = ObjectsList::new(printer)
+            .handle(&request, &context(&api, silent_target()))
+            .unwrap();
+
+        assert_eq!(response, json!({ "objects": ["toolhead"] }));
     }
 
     #[test]

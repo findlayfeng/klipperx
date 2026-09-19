@@ -31,6 +31,7 @@ use crate::core::klippy::config::mcu::McuConfig;
 use crate::core::klippy::config::ConfigSection;
 use crate::core::klippy::error::KlippyError;
 use crate::core::klippy::mcu::{ConfigBuilder, Dictionary, Mcu};
+use crate::core::klippy::pins::{PinError, PrinterPins, PINS_OBJECT};
 use crate::core::klippy::printer::{ConnectFuture, Printer, PrinterObject};
 
 /// The printer object for one `[mcu]` / `[mcu <name>]` section.
@@ -49,6 +50,10 @@ pub struct McuObject {
     /// `config_*` commands while the config file is being loaded — long before
     /// the device is opened.
     config: Arc<ConfigBuilder>,
+    /// The shared pin registry, so this MCU can declare its chip name and
+    /// reserve its `RESERVE_PINS_*` constants. Held from construction because
+    /// the chip has to be known before resources resolve pins.
+    pins: Arc<PrinterPins>,
     /// What `objects/query` reports; `{}` until the handshake fills it, which is
     /// what upstream's `_get_status_info` starts as.
     status: Mutex<Value>,
@@ -59,15 +64,29 @@ pub struct McuObject {
 
 impl McuObject {
     /// Build the object for `section`, without touching the device.
-    pub fn new(section: ConfigSection) -> Self {
+    ///
+    /// Also declares this MCU as a chip on the shared `pins` object, as
+    /// upstream's `MCUConfigHelper.__init__` does
+    /// (`klippy/mcu.py:996-997`): a pin description may name this MCU as its
+    /// chip from the moment the config file mentions it.
+    ///
+    /// # Errors
+    /// Returns [`PinError::DuplicateChip`] if another `[mcu]` section already
+    /// claimed this name (`[mcu]` and `[mcu mcu]` would collide).
+    pub fn new(section: ConfigSection, printer: &Printer) -> Result<Self, PinError> {
         let name = section.sub.clone().unwrap_or_else(|| section.id.clone());
-        Self {
+        let pins = printer
+            .lookup_object_as::<PrinterPins>(PINS_OBJECT)
+            .expect("the loader registers `pins` before any section");
+        pins.register_chip(&name)?;
+        Ok(Self {
             section,
             name,
             config: Arc::new(ConfigBuilder::new()),
+            pins,
             status: Mutex::new(json!({})),
             mcu: Mutex::new(None),
-        }
+        })
     }
 
     /// The MCU's own name, as upstream's `MCU.get_name` reports it.
@@ -93,6 +112,35 @@ impl McuObject {
         *self.status.lock().unwrap_or_else(|p| p.into_inner()) = status;
         *self.mcu.lock().unwrap_or_else(|p| p.into_inner()) = Some(mcu);
     }
+
+    /// Reserve the pins the firmware says belong to it.
+    ///
+    /// The dictionary carries `RESERVE_PINS_<name>` constants as
+    /// comma-separated pin lists (UART, USB, …); upstream reserves them at
+    /// `klippy:mcu_identify` (`klippy/mcu.py:1091-1100`), which is just after
+    /// identify here. A pin already reserved for something else is a config
+    /// error, because the resource that wants it would silently fight the
+    /// firmware.
+    fn reserve_pins(&self, mcu: &Mcu) -> Result<(), PinError> {
+        let Some(dictionary) = mcu.dictionary() else {
+            return Ok(());
+        };
+        for (key, value) in dictionary.constants() {
+            let Some(reserve_name) = key.strip_prefix("RESERVE_PINS_") else {
+                continue;
+            };
+            let Some(pins) = value.as_str() else {
+                continue;
+            };
+            for pin in pins.split(',') {
+                let pin = pin.trim();
+                if !pin.is_empty() {
+                    self.pins.reserve_pin(&self.name, pin, reserve_name)?;
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl PrinterObject for McuObject {
@@ -113,9 +161,13 @@ impl PrinterObject for McuObject {
             let mcu = Mcu::connect(config)
                 .await
                 .map_err(|err| KlippyError::Connection(err.to_string()))?;
-            // Identify installed the dictionary; now the accumulated
-            // configuration can be encoded and sent, and the firmware either
-            // adopts it or confirms it already has it (`mcu/config.rs`).
+            // Identify installed the dictionary; reserve the pins the firmware
+            // owns before anything resolves one.
+            self.reserve_pins(&mcu)
+                .map_err(|err| KlippyError::Internal(err.to_string()))?;
+            // Now the accumulated configuration can be encoded and sent, and the
+            // firmware either adopts it or confirms it already has it
+            // (`mcu/config.rs`).
             self.config
                 .configure(&mcu)
                 .await
@@ -152,7 +204,8 @@ pub fn load_config(
     section: &ConfigSection,
     _printer: &Arc<Printer>,
 ) -> Result<Arc<dyn PrinterObject>, String> {
-    Ok(Arc::new(McuObject::new(section.clone())))
+    let object = McuObject::new(section.clone(), _printer).map_err(|err| err.to_string())?;
+    Ok(Arc::new(object))
 }
 
 /// Upstream's `load_config_prefix` for `[mcu <name>]`.
@@ -182,12 +235,75 @@ mod tests {
         ConfigSection::new("mcu", sub)
     }
 
+    /// A printer with the `pins` object, as the loader leaves it before any
+    /// section is loaded.
+    fn printer() -> Arc<Printer> {
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        printer
+            .add_object(PINS_OBJECT, Arc::new(PrinterPins::new()))
+            .unwrap();
+        printer
+    }
+
+    /// An MCU object for `sub`, over such a printer.
+    fn object(sub: Option<&str>) -> McuObject {
+        McuObject::new(section(sub), &printer()).unwrap()
+    }
+
+    #[test]
+    fn test_an_mcu_registers_itself_as_a_chip() {
+        // A pin description may name this MCU from the moment the config file
+        // mentions it, so the chip is declared when the object is built.
+        let printer = printer();
+        McuObject::new(section(Some("zboard")), &printer).unwrap();
+
+        let pins = printer
+            .lookup_object_as::<PrinterPins>(PINS_OBJECT)
+            .unwrap();
+        assert_eq!(pins.chips(), ["zboard"]);
+    }
+
+    #[test]
+    fn test_two_mcus_cannot_claim_the_same_chip_name() {
+        let printer = printer();
+        McuObject::new(section(None), &printer).unwrap();
+
+        let err = match McuObject::new(section(None), &printer) {
+            Ok(_) => panic!("a second MCU claimed the same chip name"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(err, PinError::DuplicateChip(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn test_reserve_pins_marks_what_the_firmware_owns() {
+        let object = object(None);
+        let mcu = Mcu::for_test("mcu", Interface::new(TestDevice::new(vec![])));
+        mcu.install_dictionary(
+            Dictionary::from_json(json!({
+                "config": {
+                    "CLOCK_FREQ": 20000000,
+                    "RESERVE_PINS_uart0": "PA0,PA1",
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        object.reserve_pins(&mcu).unwrap();
+
+        // The reserved pins cannot be resolved; a free one can.
+        assert!(object.pins.resolve_pin("mcu", "PA0").is_err());
+        assert!(object.pins.resolve_pin("mcu", "PA2").is_ok());
+    }
+
     #[test]
     fn test_the_config_builder_exists_before_the_device_does() {
         // Resources add their `config_*` commands while the config file is
         // loaded — long before anything connects — so the builder has to be
         // usable from the object as it is built.
-        let object = McuObject::new(section(None));
+        let object = object(None);
 
         assert_eq!(object.config().create_oid().unwrap(), 0);
         assert!(!object.config().is_finalized());
@@ -197,20 +313,20 @@ mod tests {
     fn test_the_mcus_own_name_is_the_section_without_the_id() {
         // `[mcu]` is "mcu"; `[mcu zboard]` is "zboard" — the registry key keeps
         // the id (`mcu zboard`), the name does not (`klippy/mcu.py:1151-1153`).
-        assert_eq!(McuObject::new(section(None)).name(), "mcu");
-        assert_eq!(McuObject::new(section(Some("zboard"))).name(), "zboard");
+        assert_eq!(object(None).name(), "mcu");
+        assert_eq!(object(Some("zboard")).name(), "zboard");
     }
 
     #[test]
     fn test_status_is_empty_until_connected() {
-        let object = McuObject::new(section(None));
+        let object = object(None);
 
         assert_eq!(object.get_status(0.0), json!({}));
     }
 
     #[tokio::test]
     async fn test_a_connected_mcu_reports_its_identify_snapshot() {
-        let object = McuObject::new(section(None));
+        let object = object(None);
         let mcu = Arc::new(Mcu::for_test(
             "mcu",
             Interface::new(TestDevice::new(vec![])),
@@ -244,7 +360,7 @@ mod tests {
             "serial".to_string(),
             crate::core::klippy::config::ConfigValue::Single("/dev/not-a-serial-port".to_string()),
         );
-        let object = McuObject::new(section);
+        let object = McuObject::new(section, &printer()).unwrap();
 
         let err = object.connect().await.unwrap_err();
 
@@ -254,7 +370,7 @@ mod tests {
 
     #[test]
     fn test_the_loader_builds_an_object_from_the_section() {
-        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        let printer = printer();
 
         let object = load_config(&section(Some("zboard")), &printer).unwrap();
 

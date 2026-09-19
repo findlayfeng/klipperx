@@ -23,6 +23,7 @@
 // - `PrinterEvent`: the lifecycle events a printer fires at its handlers
 // - `Printer`: the machine
 
+use std::any::Any;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -157,12 +158,25 @@ pub type ConnectFuture<'a> = Pin<Box<dyn Future<Output = Result<(), KlippyError>
 /// `eventtime` is the printer's monotonic clock ([`Printer::eventtime`]), which
 /// an object may use to date what it reports — upstream passes the reactor's
 /// clock for the same reason.
-pub trait PrinterObject: Send + Sync {
+pub trait PrinterObject: Any + Send + Sync {
     /// Report this object's status as a JSON object.
     ///
     /// Must not block: it is called on whatever thread asks, including the API
     /// connection that is waiting for the reply.
     fn get_status(&self, eventtime: f64) -> Value;
+
+    /// Whether this part appears in `objects/list` and can be queried.
+    ///
+    /// Upstream's `objects/list` keeps only objects that define `get_status`,
+    /// but `pins` is registered without one
+    /// (`klippy/pins.py`: `PrinterPins` has no `get_status`). Here the trait is
+    /// the registration and this is the filter, so a part that is in the
+    /// registry but not client-visible overrides this to `false`. A query for
+    /// such a name still answers `{}`, as upstream's "no `get_status`" path
+    /// does.
+    fn is_queryable(&self) -> bool {
+        true
+    }
 
     /// Connect this object: the second half of two-phase construction.
     ///
@@ -297,6 +311,33 @@ impl Printer {
             .iter()
             .map(|(name, _)| name.clone())
             .collect()
+    }
+
+    /// The names of the objects a client may query, in registration order.
+    ///
+    /// What `objects/list` reports. A registered part that reports no status
+    /// (`pins`) is left out, which is upstream's `hasattr(o, 'get_status')`
+    /// filter.
+    pub fn queryable_objects(&self) -> Vec<String> {
+        self.objects
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter(|(_, object)| object.is_queryable())
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
+    /// Look up one registered object and return it as its concrete type.
+    ///
+    /// The escape hatch for the few places that need to *use* an object rather
+    /// than ask it for status — a resource reaching `pins`, for instance. It is
+    /// the Rust spelling of upstream's `printer.lookup_object('pins')`, and it
+    /// returns `None` for a name that is unregistered or is a different type.
+    pub fn lookup_object_as<T: PrinterObject>(&self, name: &str) -> Option<Arc<T>> {
+        let object = self.lookup_object(name)?;
+        let any: Arc<dyn Any + Send + Sync> = object;
+        any.downcast::<T>().ok()
     }
 
     /// Look up one registered object by name.
@@ -874,6 +915,46 @@ mod tests {
             serde_json::json!({"who": "webhooks"})
         );
         assert!(printer.lookup_object("nope").is_none());
+    }
+
+    #[test]
+    fn test_queryable_objects_leave_out_parts_that_report_no_status() {
+        // `objects/list` shows only parts a client can query; `pins` is
+        // registered but has no status, so the two sets differ.
+        struct Hidden;
+        impl PrinterObject for Hidden {
+            fn get_status(&self, _eventtime: f64) -> Value {
+                serde_json::json!({})
+            }
+            fn is_queryable(&self) -> bool {
+                false
+            }
+        }
+        let printer = new_printer();
+        printer.add_object("pins", Arc::new(Hidden)).unwrap();
+        printer
+            .add_object("toolhead", Arc::new(Fixed(serde_json::json!({}))))
+            .unwrap();
+
+        assert_eq!(printer.objects(), ["pins", "toolhead"]);
+        assert_eq!(printer.queryable_objects(), ["toolhead"]);
+    }
+
+    #[test]
+    fn test_lookup_object_as_returns_the_concrete_type() {
+        let printer = new_printer();
+        printer
+            .add_object("fixed", Arc::new(Fixed(serde_json::json!({"a": 1}))))
+            .unwrap();
+
+        let fixed = printer
+            .lookup_object_as::<Fixed>("fixed")
+            .expect("same type");
+        assert_eq!(fixed.0, serde_json::json!({"a": 1}));
+        // A different type under the same name, and an unregistered name, are
+        // both `None`.
+        assert!(printer.lookup_object_as::<Part>("fixed").is_none());
+        assert!(printer.lookup_object_as::<Fixed>("nope").is_none());
     }
 
     #[test]

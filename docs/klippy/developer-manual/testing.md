@@ -144,6 +144,12 @@ cargo test -p klipperx --lib test_install_skips  # 单个用例（按名过滤�
 
 **所有字节流设备共用 `frame::FrameStream`**：它把「一段字节里哪儿是帧」这件事收在一处。写新设备（串口、socket 之类）时不要自己再实现一遍同步逻辑。
 
+### `extras`
+
+| 模块 | 覆盖 |
+|------|------|
+| `output_pin.rs` | `value` / `shutdown_value` / `maximum_mcu_duration` 落到 `setup_start_value` / `setup_max_duration`；`SET_PIN PIN=… VALUE=…` 驱动输出（`>=0.5` 为开）并更新 `get_status`；缺 `VALUE` 报错；两个 pin 各自独立；缺 `pin` / 非数字 `value` / `pwm: true` 各自报配置错误 |
+
 ### `interface`
 
 | 模块 | 覆盖 |

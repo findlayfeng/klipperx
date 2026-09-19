@@ -34,6 +34,7 @@ use std::sync::Arc;
 
 use crate::core::klippy::config::{Config, ConfigSection};
 use crate::core::klippy::error::KlippyError;
+use crate::core::klippy::extras::output_pin::load_config_prefix as load_output_pin;
 use crate::core::klippy::gcode::{GCodeDispatch, GCODE_OBJECT};
 use crate::core::klippy::mcu::{load_config as load_mcu, load_config_prefix as load_mcu_prefix};
 use crate::core::klippy::pins::{PrinterPins, PINS_OBJECT};
@@ -62,13 +63,22 @@ pub struct Factories {
 }
 
 /// Every section id this host knows, in load order.
-const FACTORIES: &[(&str, Factories)] = &[(
-    "mcu",
-    Factories {
-        load_config: Some(load_mcu),
-        load_config_prefix: Some(load_mcu_prefix),
-    },
-)];
+const FACTORIES: &[(&str, Factories)] = &[
+    (
+        "mcu",
+        Factories {
+            load_config: Some(load_mcu),
+            load_config_prefix: Some(load_mcu_prefix),
+        },
+    ),
+    (
+        "output_pin",
+        Factories {
+            load_config: None,
+            load_config_prefix: Some(load_output_pin),
+        },
+    ),
+];
 
 impl Printer {
     /// Load every printer object the config describes into this machine.
@@ -243,5 +253,22 @@ mod tests {
 
         result.unwrap();
         assert_eq!(printer.objects(), ["gcode", "pins", "mcu"]);
+    }
+
+    #[test]
+    fn test_an_output_pin_section_is_claimed_by_its_factory() {
+        // The first real resource section: `[mcu]` registers the chip while it
+        // is built, `[output_pin fan]` looks it up and builds a digital output.
+        let (printer, result) = load(
+            "[mcu]\nserial: /dev/a\n\
+             [output_pin fan]\npin: PA1\n",
+        );
+
+        result.unwrap();
+        // Main sections first, then the prefix section.
+        assert_eq!(
+            printer.objects(),
+            ["gcode", "pins", "mcu", "output_pin fan"]
+        );
     }
 }

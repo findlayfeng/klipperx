@@ -68,18 +68,21 @@
   输出处理器 / `get_status` 报命令表）与 `GcodeCommand`（传统 `S200` 与扩展 `KEY=VALUE`
   两套参数、`get_*` 的上游文案错误）、内置命令与未 ready 行为（`src/core/klippy/gcode.rs`）。
   在 `load_config` 里最先注册（`pins` 之前）。
+- **`output_pin` 与 `SET_PIN`（G2）**：`[output_pin <name>]`（`pin` / `value` / `shutdown_value` /
+  `maximum_mcu_duration`）用 `setup_digital_out` 建输出并注册 `SET_PIN PIN=… VALUE=…`；
+  从 API 发 `gcode/script` 就能点灯（端点属 G3）。`pwm` 暂拒，`SET_PIN` 先立即生效
+  （`extras/output_pin.rs`、`load.rs`）。
 
 ## 待办
 
-**当前选择：GCODE 驱动**。G1（调度器）已完成；下一步 **G2**（`output_pin` + `SET_PIN`），
-做完就能在真机上点灯。执行层做不到的地方先用占位（`SET_PIN` 先立即 `update_digital_out`，
-不排程；运动命令随 C1），详见 G 组。
+**当前选择：GCODE 驱动**。G1（调度器）与 G2（`output_pin` + `SET_PIN`）已完成；
+下一步 **G3**（`gcode/*` 端点，把命令从 API 放出来）。执行层做不到的地方先用占位：
+`SET_PIN` 现为立即 `update_digital_out`（不排程），运动命令随 C1。
 
 编号保留旧文件的 T/Q 以便对照，新增项给新号。依赖列的是**工具性前置**，不是自然顺序。
 
 | # | 事项 | 依赖 |
 |---|---|---|
-| G2 | `output_pin` 与 `SET_PIN`（真机点灯入口） | G1 ✓、F2 ✓ |
 | G3 | `gcode/*` 端点 | G1 ✓ |
 | G4 | 运动命令（G0/G1/G28…） | G1 ✓、C1 |
 | A1b | reactor 串行调度器与延迟度量 | A1 ✓ |
@@ -212,21 +215,22 @@
 - 未做（不在 G1 范围）：`ok` 应答（文件输出协议）、`gcode:command_error` 事件（Q2）、
       `run_script` 的 reactor mutex、`M117/M118` 等特殊默认处理。
 
-#### G2 `output_pin` 与 `SET_PIN`（真机点灯的入口）
+#### G2 `output_pin` 与 `SET_PIN`（真机点灯的入口）—— 已完成
 
-从 F3 挪过来：数字输出的 MCU 资源已完成，缺的是调用它的 section。
+实现：`src/core/klippy/extras/output_pin.rs`（上游 `klippy/extras/output_pin.py` 的
+数字输出子集），工厂由 `load.rs` 的表接入。
 
-- [ ] `load.rs` 工厂表加 `[output_pin <name>]`（`load_config_prefix`），对应上游
-      `klippy/extras/output_pin.py` 的 `load_config_prefix`。
-- [ ] 选项先做数字输出子集：`pin`（必填）、`value`（起始电平，默认 0）、`shutdown_value`
-      （默认 0）、`maximum_mcu_duration`（默认 2 s，即 F3 的 `setup_max_duration`）；上游还有
-      `pwm` / `cycle_time` / `scale` / `static_value` / `template`，随 PWM（F4）与模板再做。
-- [ ] 用 `PrinterPins::setup_digital_out` 建 `McuDigitalOut`，把 start/shutdown/max_duration
-      设进去；以 section 名注册，`SET_PIN` 用 `PIN=<name>` 选。
-- [ ] `SET_PIN PIN=<name> VALUE=<0|1>`：上游走 `GCodeRequestQueue`、用 toolhead 的 print_time
-      排程；**我们先直接 `update_digital_out`（立即生效）**，排程/时钟版留到时钟层与 C1
-      （`queue_digital_out` 已能收绝对时钟）。
-- [ ] `get_status` 报 `value`（供 `objects/query` / `objects/subscribe`）。
+- [x] `load.rs` 工厂表加 `[output_pin <name>]`（`load_config_prefix`）；加载测试证明
+      真实 section 被认领（`[gcode, pins, mcu, output_pin fan]`）。
+- [x] 选项：`pin`（必填）、`value`（默认 0）、`shutdown_value`（默认 0）、
+      `maximum_mcu_duration`（默认 2 s），各自校验并报上游风格的配置错误。
+- [x] 用 `PrinterPins::setup_digital_out` 建数字输出，把 start/shutdown/max_duration 设进去；
+      以 section 的 sub 注册到 `SET_PIN` 的 mux（`PIN=<name>`）。
+- [x] `SET_PIN PIN=<name> VALUE=<0..1>`：**现为立即 `update_digital_out`**（`>=0.5` 为开），
+      上游的 `GCodeRequestQueue` 排程版留到时钟层与 C1（`queue_digital_out` 已能收绝对时钟）。
+- [x] `get_status` 报 `value`（可查询 / 可订阅）。
+- 未做：`pwm` / `cycle_time`（F4，现在**显式拒绝**而不是当数字输出）、
+      `scale` / `static_value` / `template`（display 模板）。
 
 #### G3 `gcode/*` 端点
 

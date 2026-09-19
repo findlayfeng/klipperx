@@ -213,6 +213,15 @@ identify 的命令**定义**（名称、参数、解码）与其它命令一样�
 
 它在 `load_config` 里**最先**注册（在 `pins` 之前），因为资源与 `[board_pins]` 建对象时要往它注册命令；按上游，它是 `Printer.__init__` 的早对象。不含运动命令（G0/G1/G28 由 toolhead 注册，见 C1/G4），也不含 `ok` 应答与 `gcode:command_error` 事件（无文件输出协议、事件集未开放）。
 
+### `extras/` — 建立在核心之上的 `[<section>]` 模块
+
+对应上游 `klippy/extras/`：它们是核心（pin 层、G-Code 调度器、MCU 配置）的**使用者**，
+通过 `load.rs` 的工厂表接入，核心不反过来引用它们。
+
+| 文件 | 职责 |
+|------|------|
+| `output_pin.rs` | `[output_pin <name>]`：读 `pin` / `value` / `shutdown_value` / `maximum_mcu_duration`，用 `PrinterPins::setup_digital_out` 建数字输出，向 `gcode` 注册 `SET_PIN PIN=<name> VALUE=<0..1>`；`get_status` 报 `value`。`pwm` 暂拒（F4），`SET_PIN` 先立即 `update_digital_out`（无时钟层） |
+
 ### `api/` — 客户端 API 层
 
 客户端一侧的入口，对应 klipper 的 `klippy/webhooks.py`：外部工具（Fluidd / Mainsail / Moonraker 等）连上 API server，发 `0x03` 分隔的 JSON 请求。监听位置由 `-a/--api-server` 给出：默认是 Unix Domain Socket 路径（与上游一致），写成 `tcp:<host>:<port>` 则监听 TCP；**不给这个选项就不起服务**，这一点也与上游一致。线上的形状（请求/应答、无 `id` 不应答、推送模板、错误文案）以 [Klippy API 参考](../third-party-dev/api-reference.md) 为准，两边要一起改。

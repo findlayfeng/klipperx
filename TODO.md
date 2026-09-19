@@ -59,7 +59,11 @@
   多用途，`PinResolver` 的别名与保留，`RESERVE_PINS_*` 在 connect 时预留；`pins` 注册但
   不可查询，为此 `PrinterObject` 加了 `is_queryable` / `queryable_objects`，并加了
   `lookup_object_as`（`src/core/klippy/pins.rs`、`printer.rs`、`mcu/object.rs`）。
-  `setup_pin` 的资源派发与 pin→编号跟随 F3。
+- **GPIO 数字输出（F3 的 MCU 部分）**：`PinChip` / `DigitalOut` 接口与 `PrinterPins::setup_digital_out`
+  派发；`McuChip` + `McuDigitalOut` 在 config 回调里把 pin 名→编号，发出 `config_digital_out`
+  （含 `max_duration`、start/shutdown 约束）与 restart 的 `update_digital_out`，运行期可
+  `queue_digital_out` / `update_digital_out`（`cmd/gpio.rs`、`mcu/pin.rs`）。`output_pin`
+  消费者与 bus 同步输出等 gcode/运动层。
 
 ## 待办
 
@@ -72,7 +76,7 @@
 | B2 | MCU 关闭与错误上报（含 `last_stats`） | A2 |
 | B3 | `gcode` 层与 `gcode/*` 端点 | C1 |
 | B4 | 其余端点（estop / remote method / pause_resume / …） | B3 等 |
-| F3 | GPIO 输出（`digital_out`） | F1 ✓、F2 ✓ |
+| F3 | GPIO 输出（MCU 资源已完成；剩 bus 同步输出与 `output_pin` 消费者） | C1、B3 |
 | F4 | PWM（硬件 / 软件） | F1 ✓、F2 ✓ |
 | F5 | ADC | F1 ✓、F2 ✓ |
 | F6 | SPI 总线 | F1 ✓、F2 ✓ |
@@ -264,22 +268,26 @@ F 组的 **F2–F9 都依赖 F1（已完成）**，F3–F9 还需 F2（pin 解�
       （C2）一起接。
 - [ ] **`BUS_PINS_<bus>`**：由 SPI/I2C 在开总线时预留（`klippy/extras/bus.py:9-32`），随 F6/F7。
 
-#### F3 GPIO 输出
+#### F3 GPIO 输出 —— MCU 资源已完成，消费者等 gcode
 
-- [ ] **接上 `setup_pin` 派发**（F2 留下的）：`PrinterPins` 把校验过的 `PinParams` 交给
-      chip（MCU）上的 `setup_pin(pin_type, params)`，由它建具体的资源对象；`McuObject`
-      实现这个 chip 接口（上游 `klippy/mcu.py:1111-1116` 的 `pcs` 表）。
-- [ ] **pin 名 → 编号**：在资源的 config 回调里用字典的 `pin` 枚举把名字换成数字（build 时
-      才有字典）；未知名字报上游原文 `Pin 'X' is not a valid pin name on mcu 'Y'`
-      （`klippy/mcu.py:1021-1032`）。
-- [ ] `MCU_digital_out`（`klippy/mcu.py:408-449`）：`config_digital_out oid=%c pin=%u
+- [x] **接上芯片派发**（F2 留下的）：`PrinterPins::setup_digital_out` 把校验过的 `PinParams`
+      交给 chip；chip 接口是 `PinChip`（每种资源一个方法），`McuChip`（`mcu/pin.rs`）实现它，
+      对应上游 `klippy/mcu.py:1111-1116` 的 `pcs` 表。
+- [x] **pin 名 → 编号**：`McuDigitalOut` 在 config 回调里用字典的 `pin` 枚举把名字换成数字；
+      未知名字报 `Pin 'X' is not a valid pin name on mcu 'Y'`（`klippy/mcu.py:1021-1032`）。
+      别名/保留的解析在同一个回调里、在枚举之前。
+- [x] `MCU_digital_out`（`klippy/mcu.py:408-449`）：`config_digital_out oid=%c pin=%u
       value=%c default_value=%c max_duration=%u` + 重启时的 `update_digital_out
-      oid=%c value=%c` + 带时钟的 `queue_digital_out oid=%c clock=%u on_ticks=%u`。
-      固件 `src/gpiocmds.c:127` `:174` `:195`。
-- [ ] `MCU_bus_digital_out`（`klippy/extras/bus.py:337` 以后）：挂在命令队列上、与运动
-      同步的输出；同样一对 `config_digital_out` + `update_digital_out`。
-- [ ] 上位消费者：`output_pin`（`klippy/extras/output_pin.py`）、风扇/库门等。
-- 跟 F1 的 `max_duration` 约束：`start_value == shutdown_value`，否则建配置就报错。
+      oid=%c value=%c` + 运行期 `queue_digital_out oid=%c clock=%u on_ticks=%u`。
+      命令类型在 `cmd/gpio.rs`，资源在 `mcu/pin.rs`；固件 `src/gpiocmds.c:127` `:174` `:195`。
+      `max_duration` 的 start==shutdown 约束与 `MAX_SCHEDULE_TICKS` 上限已实现。
+- [ ] **`MCU_bus_digital_out`**（`klippy/extras/bus.py:337` 以后）：挂在命令队列上、与运动
+      同步的输出；需要命令队列/运动层（C1）。
+- [ ] **上位消费者 `output_pin`**（`klippy/extras/output_pin.py`）：靠 gcode 的 `SET_PIN`
+      驱动，并依赖 `display` / `motion_queuing` / `toolhead`；等 gcode 层（B3）与运动层（C1）。
+      目前用单测直接验证 `McuDigitalOut` 的配置与发送。
+- 运行期 `queue_digital_out` 收的是**绝对固件时钟**；print_time → clock 的换算属于时钟层
+      （`cmd/clock.rs` 的 `ClockSync` 现只有 `get_clock`，偏移跟踪未做）。
 
 #### F4 PWM（硬件 / 软件）
 

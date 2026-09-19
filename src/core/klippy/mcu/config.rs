@@ -111,8 +111,11 @@ struct Command {
 /// It is handed the builder to add commands to and the MCU for the facts that
 /// only exist after identify (`CLOCK_FREQ`, the dictionary). Upstream's
 /// `register_config_callback` binds methods that capture both; passing them in
-/// avoids the reference cycle that capturing the builder would create.
-pub type ConfigCallback = Box<dyn Fn(&ConfigBuilder, &Mcu) + Send + Sync>;
+/// avoids the reference cycle that capturing the builder would create. It
+/// returns a result because this is where a resource turns a config-file pin
+/// description into a number, and an unknown or reserved pin has to fail the
+/// build rather than be silently dropped.
+pub type ConfigCallback = Box<dyn Fn(&ConfigBuilder, &Mcu) -> Result<(), McuError> + Send + Sync>;
 
 /// A callback run after the firmware has accepted the configuration.
 ///
@@ -332,7 +335,7 @@ impl ConfigBuilder {
             let callbacks = std::mem::take(&mut state.callbacks);
             drop(state);
             for callback in callbacks {
-                callback(self, mcu);
+                callback(self, mcu)?;
             }
         }
 
@@ -824,6 +827,7 @@ mod tests {
                     assert_eq!(mcu.seconds_to_clock(1.0).unwrap(), 20_000_000);
                     let oid = builder.create_oid().unwrap();
                     builder.add_config_cmd(&TestOut { oid, value: 7 }).unwrap();
+                    Ok(())
                 }))
                 .unwrap();
         }
@@ -847,6 +851,7 @@ mod tests {
             builder
                 .register_config_callback(Box::new(move |_, _| {
                     calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
                 }))
                 .unwrap();
         }
@@ -875,7 +880,7 @@ mod tests {
             .is_err());
         assert!(builder.request_move_queue_slot().is_err());
         assert!(builder
-            .register_config_callback(Box::new(|_, _| {}))
+            .register_config_callback(Box::new(|_, _| Ok(())))
             .is_err());
         assert!(builder
             .register_post_init_callback(Box::new(|_| {}))

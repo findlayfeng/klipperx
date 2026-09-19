@@ -30,7 +30,7 @@ use serde_json::{json, Map, Value};
 use crate::core::klippy::config::mcu::McuConfig;
 use crate::core::klippy::config::ConfigSection;
 use crate::core::klippy::error::KlippyError;
-use crate::core::klippy::mcu::{ConfigBuilder, Dictionary, Mcu};
+use crate::core::klippy::mcu::{ConfigBuilder, Dictionary, Mcu, McuChip};
 use crate::core::klippy::pins::{PinError, PrinterPins, PINS_OBJECT};
 use crate::core::klippy::printer::{ConnectFuture, Printer, PrinterObject};
 
@@ -39,27 +39,16 @@ pub struct McuObject {
     /// The section as parsed, kept whole so the device is only opened at
     /// connect time.
     section: ConfigSection,
-    /// The MCU's own name: `mcu`, or the sub for `[mcu zboard]`
-    /// (`klippy/mcu.py:1151-1153`). Not the section identifier — that is what
-    /// the registry key is, and the two differ for every secondary MCU.
-    name: String,
-    /// The configuration this MCU's resources build up, and the handshake that
-    /// sends it on connect (`mcu/config.rs`).
+    /// This MCU as a pin chip: its name, its configuration builder, and the
+    /// slot resources use to reach the device once it connects (`mcu/pin.rs`).
     ///
     /// Built at construction, not at connect, because resources add their
     /// `config_*` commands while the config file is being loaded — long before
     /// the device is opened.
-    config: Arc<ConfigBuilder>,
-    /// The shared pin registry, so this MCU can declare its chip name and
-    /// reserve its `RESERVE_PINS_*` constants. Held from construction because
-    /// the chip has to be known before resources resolve pins.
-    pins: Arc<PrinterPins>,
+    chip: McuChip,
     /// What `objects/query` reports; `{}` until the handshake fills it, which is
     /// what upstream's `_get_status_info` starts as.
     status: Mutex<Value>,
-    /// The connected transport, kept so it outlives this handle: dropping the
-    /// last [`Arc<Mcu>`] shuts the interface down.
-    mcu: Mutex<Option<Arc<Mcu>>>,
 }
 
 impl McuObject {
@@ -78,20 +67,20 @@ impl McuObject {
         let pins = printer
             .lookup_object_as::<PrinterPins>(PINS_OBJECT)
             .expect("the loader registers `pins` before any section");
-        pins.register_chip(&name)?;
+        let chip = McuChip::new(name, Arc::new(ConfigBuilder::new()), Arc::clone(&pins));
+        // The chip is registered by value-shared handle, so the slot the
+        // resources read is the same one connect fills.
+        pins.register_chip(chip.name(), Arc::new(chip.clone()))?;
         Ok(Self {
             section,
-            name,
-            config: Arc::new(ConfigBuilder::new()),
-            pins,
+            chip,
             status: Mutex::new(json!({})),
-            mcu: Mutex::new(None),
         })
     }
 
     /// The MCU's own name, as upstream's `MCU.get_name` reports it.
     pub fn name(&self) -> &str {
-        &self.name
+        self.chip.name()
     }
 
     /// The configuration builder for this MCU.
@@ -100,17 +89,16 @@ impl McuObject {
     /// its `config_*` command. It exists before the device does, which is the
     /// point: the config file is loaded before anything connects.
     pub fn config(&self) -> Arc<ConfigBuilder> {
-        Arc::clone(&self.config)
+        self.chip.config()
     }
 
-    /// Take ownership of a connected MCU and snapshot its identify status.
-    fn attach(&self, mcu: Arc<Mcu>) {
+    /// Snapshot a connected MCU's identify status for `objects/query`.
+    fn set_status(&self, mcu: &Mcu) {
         let status = mcu
             .dictionary()
             .map(|dictionary| status_from(&dictionary))
             .unwrap_or_else(|| json!({}));
         *self.status.lock().unwrap_or_else(|p| p.into_inner()) = status;
-        *self.mcu.lock().unwrap_or_else(|p| p.into_inner()) = Some(mcu);
     }
 
     /// Reserve the pins the firmware says belong to it.
@@ -125,17 +113,18 @@ impl McuObject {
         let Some(dictionary) = mcu.dictionary() else {
             return Ok(());
         };
+        let pins = self.chip.pins();
         for (key, value) in dictionary.constants() {
             let Some(reserve_name) = key.strip_prefix("RESERVE_PINS_") else {
                 continue;
             };
-            let Some(pins) = value.as_str() else {
+            let Some(pin_list) = value.as_str() else {
                 continue;
             };
-            for pin in pins.split(',') {
+            for pin in pin_list.split(',') {
                 let pin = pin.trim();
                 if !pin.is_empty() {
-                    self.pins.reserve_pin(&self.name, pin, reserve_name)?;
+                    pins.reserve_pin(self.chip.name(), pin, reserve_name)?;
                 }
             }
         }
@@ -161,6 +150,9 @@ impl PrinterObject for McuObject {
             let mcu = Mcu::connect(config)
                 .await
                 .map_err(|err| KlippyError::Connection(err.to_string()))?;
+            // Make the device reachable by resources before the configuration
+            // is built; a resource's runtime methods need it.
+            self.chip.attach(Arc::clone(&mcu));
             // Identify installed the dictionary; reserve the pins the firmware
             // owns before anything resolves one.
             self.reserve_pins(&mcu)
@@ -168,11 +160,12 @@ impl PrinterObject for McuObject {
             // Now the accumulated configuration can be encoded and sent, and the
             // firmware either adopts it or confirms it already has it
             // (`mcu/config.rs`).
-            self.config
+            self.chip
+                .config()
                 .configure(&mcu)
                 .await
                 .map_err(|err| KlippyError::Connection(err.to_string()))?;
-            self.attach(mcu);
+            self.set_status(&mcu);
             Ok(())
         })
     }
@@ -294,8 +287,8 @@ mod tests {
         object.reserve_pins(&mcu).unwrap();
 
         // The reserved pins cannot be resolved; a free one can.
-        assert!(object.pins.resolve_pin("mcu", "PA0").is_err());
-        assert!(object.pins.resolve_pin("mcu", "PA2").is_ok());
+        assert!(object.chip.pins().resolve_pin("mcu", "PA0").is_err());
+        assert!(object.chip.pins().resolve_pin("mcu", "PA2").is_ok());
     }
 
     #[test]
@@ -341,7 +334,7 @@ mod tests {
         )
         .unwrap();
 
-        object.attach(mcu);
+        object.set_status(&mcu);
 
         assert_eq!(
             object.get_status(0.0),

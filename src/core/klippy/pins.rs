@@ -43,11 +43,11 @@
 //!
 //! # Not here
 //!
-//! * **`setup_pin`**: upstream's `PrinterPins.setup_pin` hands a validated pin
-//!   to the chip (the MCU), which creates the resource object
-//!   (`MCU_digital_out` / `MCU_pwm` / `MCU_adc` / `MCU_endstop`). Those resource
-//!   types are F3+, so the dispatch comes with them; this module stops at the
-//!   validated [`PinParams`].
+//! * **The other resource kinds**: upstream's `PrinterPins.setup_pin` dispatches
+//!   on the pin type to `MCU_digital_out` / `MCU_pwm` / `MCU_adc` /
+//!   `MCU_endstop`. Only digital outputs exist so far
+//!   ([`PrinterPins::setup_digital_out`]); the others arrive with their TODO
+//!   items, as more methods on [`PinChip`].
 //! * **`[board_pins]`**: the section that calls [`PrinterPins::alias_pin`] and
 //!   [`PrinterPins::reserve_pin`] (`klippy/extras/board_pins.py`). The resolver
 //!   API is here; the section loader needs config list parsing and comes with
@@ -57,10 +57,11 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde_json::{json, Value};
 
+use crate::core::klippy::mcu::McuError;
 use crate::core::klippy::printer::PrinterObject;
 
 /// The name clients and other modules use to find this object.
@@ -128,6 +129,48 @@ impl PinParams {
     }
 }
 
+/// A digital output resource: a pin that is driven high or low.
+///
+/// The trait is the seam between "which pin" (`PrinterPins`) and "what the
+/// firmware does with it" (`mcu/pin.rs`). The clocked methods take an absolute
+/// firmware clock; turning wall or print time into one is the clock layer's job.
+pub trait DigitalOut: Send + Sync {
+    /// The longest a scheduled change may be outstanding, in seconds. `0.0`
+    /// removes the firmware's limit.
+    fn setup_max_duration(&self, max_duration: f64);
+
+    /// The level to drive at startup and the level the firmware falls back to
+    /// on shutdown.
+    fn setup_start_value(&self, start_value: bool, shutdown_value: bool);
+
+    /// Change the level at `clock` (`queue_digital_out`).
+    ///
+    /// # Errors
+    /// Returns [`McuError`] if the output is not configured yet or the MCU is
+    /// not connected.
+    fn queue_digital_out(&self, clock: u32, value: bool) -> Result<(), McuError>;
+
+    /// Change the level now (`update_digital_out`).
+    ///
+    /// # Errors
+    /// As [`DigitalOut::queue_digital_out`].
+    fn update_digital_out(&self, value: bool) -> Result<(), McuError>;
+}
+
+/// The chip (MCU) side of pin setup.
+///
+/// Upstream's `MCU.setup_pin` dispatches on the pin type to `MCU_digital_out`,
+/// `MCU_pwm`, `MCU_adc` or `MCU_endstop` (`klippy/mcu.py:1111-1116`). Here the
+/// dispatch is one method per resource kind, added with the kinds; only
+/// `digital_out` exists so far.
+pub trait PinChip: Send + Sync {
+    /// Build the digital output for an already-validated pin.
+    ///
+    /// # Errors
+    /// Returns a [`PinError`] if the chip cannot build the resource.
+    fn setup_digital_out(&self, params: &PinParams) -> Result<Arc<dyn DigitalOut>, PinError>;
+}
+
 /// A pin description or pin-sharing mistake.
 ///
 /// The messages are upstream's (`klippy/pins.py`), because a user sees them as
@@ -167,6 +210,15 @@ pub enum PinError {
     Reserved { pin: String, reserved_for: String },
     /// The pin was referenced under two different names.
     IsAlias { name: String, canonical: String },
+    /// The pin name is not in the firmware's `pin` enumeration.
+    InvalidName { pin: String, chip: String },
+    /// The chip does not build this kind of resource (yet).
+    Unsupported(String),
+    /// A pin with a maximum duration must start and shut down at the same
+    /// level, or the firmware would have nothing to fall back to.
+    MaxDurationMismatch,
+    /// The maximum duration does not fit the firmware's scheduler.
+    MaxDurationTooLarge,
 }
 
 impl fmt::Display for PinError {
@@ -210,6 +262,17 @@ impl fmt::Display for PinError {
             PinError::IsAlias { name, canonical } => {
                 write!(f, "pin {name} is an alias for {canonical}")
             }
+            PinError::InvalidName { pin, chip } => {
+                write!(f, "Pin '{pin}' is not a valid pin name on mcu '{chip}'")
+            }
+            PinError::Unsupported(kind) => {
+                write!(f, "pin type {kind} not supported on this mcu")
+            }
+            PinError::MaxDurationMismatch => write!(
+                f,
+                "Pin with max duration must have start value equal to shutdown value"
+            ),
+            PinError::MaxDurationTooLarge => write!(f, "Digital pin max duration too large"),
         }
     }
 }
@@ -364,6 +427,8 @@ struct PinsState {
     chips: Vec<String>,
     /// One resolver per chip.
     resolvers: HashMap<String, PinResolver>,
+    /// The chip handles that build resources, keyed by name.
+    chip_impls: HashMap<String, Arc<dyn PinChip>>,
     /// Pins already handed out, keyed `chip:pin`.
     active_pins: HashMap<String, PinParams>,
     /// Pins that may be used by more than one owner, keyed `chip:pin`.
@@ -386,20 +451,22 @@ impl PrinterPins {
             state: Mutex::new(PinsState {
                 chips: Vec::new(),
                 resolvers: HashMap::new(),
+                chip_impls: HashMap::new(),
                 active_pins: HashMap::new(),
                 allow_multi_use: HashSet::new(),
             }),
         }
     }
 
-    /// Declare an MCU so its name is a valid chip and it has a resolver.
+    /// Declare an MCU: its name becomes a valid chip, it gets a resolver, and
+    /// `chip` is what builds resources on its behalf.
     ///
-    /// Upstream's `register_chip` also stores the chip object, which is what
-    /// `setup_pin` dispatches to; that dispatch is F3+.
+    /// Upstream's `register_chip(chip_name, chip)` stores the MCU object, which
+    /// `setup_pin` then dispatches to (`klippy/pins.py:126-130`).
     ///
     /// # Errors
     /// Returns [`PinError::DuplicateChip`] if the name is taken.
-    pub fn register_chip(&self, chip_name: &str) -> Result<(), PinError> {
+    pub fn register_chip(&self, chip_name: &str, chip: Arc<dyn PinChip>) -> Result<(), PinError> {
         let mut state = self.lock();
         if state.resolvers.contains_key(chip_name) {
             return Err(PinError::DuplicateChip(chip_name.to_string()));
@@ -408,6 +475,7 @@ impl PrinterPins {
         state
             .resolvers
             .insert(chip_name.to_string(), PinResolver::new());
+        state.chip_impls.insert(chip_name.to_string(), chip);
         Ok(())
     }
 
@@ -582,6 +650,40 @@ impl PrinterPins {
         Ok(())
     }
 
+    /// Look up a pin and build a digital output on the chip it names.
+    ///
+    /// The pin is validated and reserved exactly as [`PrinterPins::lookup_pin`]
+    /// does; `share_type` is how a caller that legitimately shares a pin (a
+    /// multi-pin device) says so.
+    ///
+    /// # Errors
+    /// Returns whatever validation reports, or the chip's own error.
+    pub fn setup_digital_out(
+        &self,
+        description: &str,
+        share_type: Option<&str>,
+    ) -> Result<Arc<dyn DigitalOut>, PinError> {
+        let pin_type = PinType::DigitalOut;
+        let params = self.lookup_pin(
+            description,
+            pin_type.can_invert(),
+            pin_type.can_pullup(),
+            share_type,
+        )?;
+        let chip = self.chip(&params.chip_name)?;
+        chip.setup_digital_out(&params)
+    }
+
+    /// The registered chip under `name`, cloned out so the caller does not hold
+    /// the state lock while the chip builds a resource.
+    fn chip(&self, name: &str) -> Result<Arc<dyn PinChip>, PinError> {
+        self.lock()
+            .chip_impls
+            .get(name)
+            .cloned()
+            .ok_or_else(|| PinError::UnknownChip(name.to_string()))
+    }
+
     fn lock(&self) -> MutexGuard<'_, PinsState> {
         self.state
             .lock()
@@ -617,11 +719,61 @@ impl PrinterObject for PrinterPins {
 mod tests {
     use super::*;
 
+    /// A chip that records the pins it was asked to build.
+    #[derive(Default)]
+    struct TestChip {
+        seen: Mutex<Vec<PinParams>>,
+        created: Mutex<Vec<Arc<FakeDigitalOut>>>,
+    }
+
+    impl PinChip for TestChip {
+        fn setup_digital_out(&self, params: &PinParams) -> Result<Arc<dyn DigitalOut>, PinError> {
+            self.seen
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(params.clone());
+            let out = Arc::new(FakeDigitalOut::default());
+            self.created
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(Arc::clone(&out));
+            Ok(out)
+        }
+    }
+
+    /// A digital output that records what it was told to do.
+    #[derive(Default)]
+    struct FakeDigitalOut {
+        updates: Mutex<Vec<bool>>,
+        queued: Mutex<Vec<(u32, bool)>>,
+    }
+
+    impl DigitalOut for FakeDigitalOut {
+        fn setup_max_duration(&self, _max_duration: f64) {}
+        fn setup_start_value(&self, _start_value: bool, _shutdown_value: bool) {}
+        fn queue_digital_out(&self, clock: u32, value: bool) -> Result<(), McuError> {
+            self.queued
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push((clock, value));
+            Ok(())
+        }
+        fn update_digital_out(&self, value: bool) -> Result<(), McuError> {
+            self.updates
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(value);
+            Ok(())
+        }
+    }
+
     /// A registry with one chip called `mcu` and one called `zboard`.
     fn pins() -> PrinterPins {
         let pins = PrinterPins::new();
-        pins.register_chip("mcu").unwrap();
-        pins.register_chip("zboard").unwrap();
+        pins.register_chip("mcu", Arc::new(TestChip::default()))
+            .unwrap();
+        pins.register_chip("zboard", Arc::new(TestChip::default()))
+            .unwrap();
         pins
     }
 
@@ -692,9 +844,43 @@ mod tests {
     fn test_a_duplicate_chip_is_rejected() {
         let pins = pins();
         assert_eq!(
-            pins.register_chip("mcu").unwrap_err(),
+            pins.register_chip("mcu", Arc::new(TestChip::default()))
+                .unwrap_err(),
             PinError::DuplicateChip("mcu".to_string())
         );
+    }
+
+    #[test]
+    fn test_setup_digital_out_validates_then_asks_the_chip() {
+        let pins = PrinterPins::new();
+        let chip = Arc::new(TestChip::default());
+        pins.register_chip("mcu", chip.clone()).unwrap();
+
+        let out = pins.setup_digital_out("!PA1", None).unwrap();
+        out.update_digital_out(true).unwrap();
+
+        // The chip was handed the parsed parameters. A digital output may be
+        // inverted but not pulled, so `^` would be rejected.
+        let seen = chip.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].pin, "PA1");
+        assert!(seen[0].invert);
+        assert_eq!(seen[0].pullup, 0);
+        drop(seen);
+
+        // And the resource it returned is the one the caller drives.
+        let created = chip.created.lock().unwrap();
+        assert_eq!(*created[0].updates.lock().unwrap(), [true]);
+    }
+
+    #[test]
+    fn test_setup_digital_out_reports_an_unknown_chip() {
+        let pins = PrinterPins::new();
+        let err = match pins.setup_digital_out("nope:PA1", None) {
+            Ok(_) => panic!("an unknown chip was accepted"),
+            Err(err) => err,
+        };
+        assert_eq!(err, PinError::UnknownChip("nope".to_string()));
     }
 
     // -----------------------------------------------------------------------

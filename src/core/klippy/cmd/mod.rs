@@ -63,11 +63,13 @@
 pub mod allocate_oids;
 pub mod clock;
 pub mod config;
+pub mod gpio;
 pub mod identify;
 pub mod shutdown;
 pub mod uptime;
 
 pub use clock::{ClockState, ClockSync, GetClock, McuClock};
+pub use gpio::{ConfigDigitalOut, QueueDigitalOut, SetDigitalOutPwmCycle, UpdateDigitalOut};
 
 use crate::core::klippy::mcu::{Dictionary, Enumeration, Mcu, McuError};
 use crate::core::klippy::msg::proto::{ArgType, ArgValue};

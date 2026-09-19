@@ -25,11 +25,10 @@
 //!
 //! [`register`] installs the server's own object and every endpoint that is
 //! written: `webhooks`, `info`, `objects/list`, `objects/query`,
-//! `objects/subscribe`, and the four `gcode/*` endpoints. The rest of the
-//! documented surface — `gcode/subscribe_output`, `emergency_stop`,
-//! `register_remote_method`, `pause_resume/*` and the `*/dump_*` mux endpoints
-//! — is not written, so `list_endpoints` reports nine paths besides the
-//! built-in.
+//! `objects/subscribe`, and the five `gcode/*` endpoints. The rest of the
+//! documented surface — `emergency_stop`, `register_remote_method`,
+//! `pause_resume/*` and the `*/dump_*` mux endpoints — is not written, so
+//! `list_endpoints` reports ten paths besides the built-in.
 //!
 //! The public reference for the endpoints themselves (paths, parameters,
 //! response fields) is `docs/klippy/third-party-dev/api-reference.md`; keep the
@@ -49,7 +48,8 @@ use crate::core::klippy::error::KlippyError;
 use crate::core::klippy::printer::Printer;
 
 pub use endpoints::{
-    GcodeHelp, GcodeRestart, GcodeScript, Info, ObjectsList, ObjectsQuery, ObjectsSubscribe,
+    GcodeHelp, GcodeRestart, GcodeScript, GcodeSubscribeOutput, Info, ObjectsList, ObjectsQuery,
+    ObjectsSubscribe,
 };
 pub use start_args::StartArgs;
 pub use webhooks::{WebhooksStatus, WEBHOOKS_OBJECT};
@@ -117,6 +117,8 @@ pub fn register(
     api.register(GcodeRestart::restart(Arc::clone(printer)))
         .map_err(RegistrationError::Endpoint)?;
     api.register(GcodeRestart::firmware_restart(Arc::clone(printer)))
+        .map_err(RegistrationError::Endpoint)?;
+    api.register(GcodeSubscribeOutput::new(Arc::clone(printer)))
         .map_err(RegistrationError::Endpoint)?;
     Ok(())
 }
@@ -187,6 +189,7 @@ mod tests {
                 "gcode/help",
                 "gcode/restart",
                 "gcode/script",
+                "gcode/subscribe_output",
                 "info",
                 "list_endpoints",
                 "objects/list",

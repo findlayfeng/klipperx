@@ -1,4 +1,5 @@
-//! `gcode/help`, `gcode/script`, `gcode/restart`, `gcode/firmware_restart`.
+//! `gcode/help`, `gcode/script`, `gcode/restart`, `gcode/firmware_restart`,
+//! `gcode/subscribe_output`.
 //!
 //! The API's door into the G-Code dispatcher (`core/klippy/gcode.rs`), upstream
 //! `GCodeHelper` (`klippy/webhooks.py:429-452`):
@@ -9,6 +10,7 @@
 //! | `gcode/script` | `{}`, or an `error` reply with the command's message |
 //! | `gcode/restart` | `{}`; runs the `RESTART` command |
 //! | `gcode/firmware_restart` | `{}`; runs the `FIRMWARE_RESTART` command |
+//! | `gcode/subscribe_output` | `{}`; later lines are pushed as `{response: line}` |
 //!
 //! # Why the dispatcher is looked up per request
 //!
@@ -20,19 +22,20 @@
 //! lookup fails and the request gets the printer's state message as a command
 //! error, which is what a script sent that early deserves.
 //!
-//! # Not here
+//! # Output subscriptions
 //!
-//! * **`gcode/subscribe_output`**: the push side of G-Code output. It needs an
-//!   output handler registered per connection and removed when that connection
-//!   goes away, which the output-handler table does not support yet.
+//! A subscriber is an [`OutputHandler`] over the requesting connection: it
+//! pushes `template + {response: line}` and reports itself closed with the
+//! connection, so the dispatcher drops it at the next line. Upstream keeps the
+//! same map and prunes it on disconnect.
 
 use std::sync::Arc;
 
 use serde_json::{json, Value};
 
-use crate::core::klippy::api::protocol::{ApiError, Request};
+use crate::core::klippy::api::protocol::{ApiError, PushTarget, Request, ResponseTemplate};
 use crate::core::klippy::api::registry::{Endpoint, EndpointContext};
-use crate::core::klippy::gcode::{GCodeDispatch, GCODE_OBJECT};
+use crate::core::klippy::gcode::{GCodeDispatch, OutputHandler, GCODE_OBJECT};
 use crate::core::klippy::printer::Printer;
 
 /// Resolve the dispatcher, reporting the printer state if it is not up yet.
@@ -144,8 +147,55 @@ impl Endpoint for GcodeRestart {
     }
 }
 
-// ===========================================================================
-// Tests
+/// One connection's output subscription.
+///
+/// Emits `template + {response: line}` and reports itself closed with the
+/// connection, so the dispatcher drops it at the next line.
+struct Subscription {
+    client: Arc<dyn PushTarget>,
+    template: ResponseTemplate,
+}
+
+impl OutputHandler for Subscription {
+    fn emit(&self, line: &str) {
+        if !self.client.is_closed() {
+            let params = json!({ "response": line });
+            self.client.push(self.template.message(params));
+        }
+    }
+
+    fn is_closed(&self) -> bool {
+        self.client.is_closed()
+    }
+}
+
+/// `gcode/subscribe_output` — push every line the dispatcher emits.
+pub struct GcodeSubscribeOutput {
+    printer: Arc<Printer>,
+}
+
+impl GcodeSubscribeOutput {
+    /// Build the endpoint over the machine whose output it subscribes to.
+    pub fn new(printer: Arc<Printer>) -> Self {
+        Self { printer }
+    }
+}
+
+impl Endpoint for GcodeSubscribeOutput {
+    fn path(&self) -> &'static str {
+        "gcode/subscribe_output"
+    }
+
+    fn handle(&self, request: &Request, context: &EndpointContext<'_>) -> Result<Value, ApiError> {
+        let template = ResponseTemplate::from_params(&request.params())?;
+        let gcode = gcode(&self.printer)?;
+        gcode.register_output_handler(Arc::new(Subscription {
+            client: context.client.clone(),
+            template,
+        }));
+        Ok(json!({}))
+    }
+}
 // ===========================================================================
 
 #[cfg(test)]
@@ -192,8 +242,40 @@ mod tests {
             "gcode/restart"
         );
         assert_eq!(
-            GcodeRestart::firmware_restart(printer).path(),
+            GcodeRestart::firmware_restart(Arc::clone(&printer)).path(),
             "gcode/firmware_restart"
+        );
+        assert_eq!(
+            GcodeSubscribeOutput::new(printer).path(),
+            "gcode/subscribe_output"
+        );
+    }
+
+    #[test]
+    fn test_subscribing_pushes_output_lines() {
+        use crate::core::klippy::api::test_support::RecordingTarget;
+
+        let printer = printer();
+        let api = Api::new();
+        let target = RecordingTarget::new();
+        let body = r#"{"method":"gcode/subscribe_output","params":{"response_template":{"method":"gcode:output","id":null}}}"#;
+
+        GcodeSubscribeOutput::new(Arc::clone(&printer))
+            .handle(&request(body), &context(&api, target.clone()))
+            .unwrap();
+
+        // Anything the dispatcher says now reaches the subscriber.
+        gcode(&printer).run_script("M115").unwrap();
+
+        let pushes = target.pushes();
+        assert_eq!(pushes[0]["method"], "gcode:output");
+        assert_eq!(pushes[0]["id"], Value::Null);
+        assert!(
+            pushes[0]["params"]["response"]
+                .as_str()
+                .unwrap()
+                .contains("FIRMWARE_NAME"),
+            "{pushes:?}"
         );
     }
 

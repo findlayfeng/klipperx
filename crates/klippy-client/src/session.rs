@@ -276,6 +276,55 @@ impl Session {
         Ok(Control::Continue)
     }
 
+    /// Interpret one typed line as G-Code.
+    ///
+    /// What the window's g-code mode calls: the whole line is the script, so a
+    /// command is typed the way it is written (`SET_PIN PIN=fan VALUE=1`)
+    /// rather than as a request object. A `.`-prefixed line is still a local
+    /// command, so `.quit` is not sent to the printer.
+    ///
+    /// # Errors
+    /// Returns [`TransportError`] if the request cannot be sent.
+    pub async fn handle_gcode_line(
+        &mut self,
+        line: &str,
+        out: &mut impl Output,
+    ) -> Result<Control, TransportError> {
+        let line = line.trim();
+        if line.is_empty() {
+            return Ok(Control::Continue);
+        }
+        if let Some(command) = line.strip_prefix('.') {
+            return self.local_command(command, out).await;
+        }
+        let mut params = Map::new();
+        params.insert("script".to_string(), json!(line));
+        self.request("gcode/script", params, out).await?;
+        Ok(Control::Continue)
+    }
+
+    /// Subscribe this connection to G-Code output (`gcode/subscribe_output`).
+    ///
+    /// The output template names the pushes, so a line reads on its own; the
+    /// front-end must call this at most once per connection, because every call
+    /// registers another output handler.
+    ///
+    /// # Errors
+    /// Returns [`TransportError`] if the request cannot be sent.
+    pub async fn subscribe_gcode_output(
+        &mut self,
+        out: &mut impl Output,
+    ) -> Result<(), TransportError> {
+        let mut params = Map::new();
+        params.insert(
+            "response_template".to_string(),
+            json!({"id": null, "method": "gcode:output"}),
+        );
+        self.request("gcode/subscribe_output", params, out).await?;
+        out.write(Entry::notice(Notice::Info, "Watching G-Code output."));
+        Ok(())
+    }
+
     /// Send a line the user wrote as a whole request object.
     ///
     /// The line is YAML, so a request can be written without quoting its keys;
@@ -586,6 +635,26 @@ mod tests {
         }
     }
 
+    /// Answers `gcode/script` by echoing the script, so a g-code line can be
+    /// followed to a reply.
+    struct GcodeScript;
+
+    impl Endpoint for GcodeScript {
+        fn path(&self) -> &'static str {
+            "gcode/script"
+        }
+
+        fn handle(
+            &self,
+            request: &Request,
+            _context: &EndpointContext<'_>,
+        ) -> Result<Value, ApiError> {
+            Ok(json!({
+                "script": request.params().get_or("script", &Value::Null).clone()
+            }))
+        }
+    }
+
     /// What `objects/list` reports, so `.subscribe` has something to find.
     struct ListObjects;
 
@@ -703,6 +772,7 @@ mod tests {
         api.register(Info).unwrap();
         api.register(Echo).unwrap();
         api.register(Failing).unwrap();
+        api.register(GcodeScript).unwrap();
         api.register(ListObjects).unwrap();
         api.register(Subscribe).unwrap();
         let server = Server::bind(dir.target(), Arc::new(api))
@@ -818,6 +888,70 @@ mod tests {
             "{:?}",
             out.texts()
         );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn test_a_gcode_line_is_sent_as_a_script() {
+        let dir = SocketDir::new("gcode");
+        let (mut session, mut out, task) = session(&dir).await;
+
+        session
+            .handle_gcode_line("SET_PIN PIN=fan VALUE=1", &mut out)
+            .await
+            .unwrap();
+        settle(&mut session, &mut out).await;
+
+        // The whole line is the script, sent as `gcode/script`.
+        let sent = out.sent();
+        assert_eq!(sent.len(), 1);
+        match sent[0] {
+            Entry::Sent {
+                method, message, ..
+            } => {
+                assert_eq!(method, "gcode/script");
+                assert_eq!(message["params"]["script"], "SET_PIN PIN=fan VALUE=1");
+            }
+            other => panic!("expected a sent entry, got {other:?}"),
+        }
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn test_a_local_command_still_works_in_gcode_mode() {
+        let dir = SocketDir::new("gcodequit");
+        let (mut session, mut out, task) = session(&dir).await;
+
+        // `.quit` is the client's, not a g-code line to send.
+        assert_eq!(
+            session.handle_gcode_line(".quit", &mut out).await.unwrap(),
+            Control::Quit
+        );
+        assert!(out.sent().is_empty(), "{:?}", out.texts());
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn test_subscribing_to_gcode_output_sends_the_template() {
+        let dir = SocketDir::new("gcodeout");
+        let (mut session, mut out, task) = session(&dir).await;
+
+        session.subscribe_gcode_output(&mut out).await.unwrap();
+
+        let sent = out.sent();
+        assert_eq!(sent.len(), 1);
+        match sent[0] {
+            Entry::Sent {
+                method, message, ..
+            } => {
+                assert_eq!(method, "gcode/subscribe_output");
+                assert_eq!(
+                    message["params"]["response_template"]["method"],
+                    "gcode:output"
+                );
+            }
+            other => panic!("expected a sent entry, got {other:?}"),
+        }
         task.abort();
     }
 

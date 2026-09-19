@@ -67,16 +67,25 @@
 
 ## 待办
 
+**当前选择：先做 G（GCODE 驱动）**。理由：F1–F3 已经把「配置 → 真实资源」打通，
+缺的只是一个把 g-code 文本变成命令调用的层与它的第一个消费者（`output_pin`），
+而**上游的 gcode 层本身不依赖 toolhead**（toolhead 只是注册 G0/G1/G28 等运动命令的
+一个消费者）。所以 G1–G3 可以排在 C1 前面，做完就能在真机上用 `SET_PIN` 点灯；
+运动命令（G4）随 toolhead 一起。
+
 编号保留旧文件的 T/Q 以便对照，新增项给新号。依赖列的是**工具性前置**，不是自然顺序。
 
 | # | 事项 | 依赖 |
 |---|---|---|
+| G1 | gcode 调度器（命令表、`run_script`、输出） | A2 |
+| G2 | `output_pin` 与 `SET_PIN`（真机点灯入口） | G1、F2 ✓ |
+| G3 | `gcode/*` 端点 | G1 |
+| G4 | 运动命令（G0/G1/G28…） | G1、C1 |
 | A1b | reactor 串行调度器与延迟度量 | A1 ✓ |
 | A2 | 错误词汇（`CommandError` / `ConfigError`） | — |
 | B2 | MCU 关闭与错误上报（含 `last_stats`） | A2 |
-| B3 | `gcode` 层与 `gcode/*` 端点 | C1 |
-| B4 | 其余端点（estop / remote method / pause_resume / …） | B3 等 |
-| F3 | GPIO 输出（MCU 资源已完成；剩 bus 同步输出与 `output_pin` 消费者） | C1、B3 |
+| B4 | 其余端点（estop / remote method / pause_resume / …） | G3 等 |
+| F3 | `MCU_bus_digital_out`（命令队列/运动同步输出） | C1 |
 | F4 | PWM（硬件 / 软件） | F1 ✓、F2 ✓ |
 | F5 | ADC | F1 ✓、F2 ✓ |
 | F6 | SPI 总线 | F1 ✓、F2 ✓ |
@@ -173,14 +182,57 @@
       （`MCUConfigHelper` 的 restart helper，`klippy/mcu.py:756-770`）。`config_reset` 命令
       类型已在 F1，**发送**它属于这里。
 
-### B3（新）gcode 层与 gcode/* 端点
+### G（新，先做）GCODE 驱动
 
-- [ ] `gcode` 层本身不存在（`src/core/klippy/` 下没有 `gcode`）：没有 g-code 解释器、
-      命令注册表、`run_script`。它是 toolhead 的第一个使用者，也是这一族端点的全部内容：
-      `gcode/help`、`gcode/script`、`gcode/restart`、`gcode/firmware_restart`、
-      `gcode/subscribe_output`（`klippy/webhooks.py:438-444`）。
-- [ ] `gcode/restart` / `gcode/firmware_restart` 只是 `run_script('restart' /
-      'firmware_restart')`（`klippy/webhooks.py:449-452`），主机侧语义接 D2。
+上游参考：`klippy/gcode.py`（调度器）、`klippy/extras/output_pin.py`（第一个消费者）、
+`klippy/webhooks.py:438-452`（端点）。**不依赖 toolhead**：toolhead 只是注册运动命令的
+一个消费者。
+
+#### G1 gcode 调度器（不含运动命令）
+
+- [ ] `gcode` 作为 printer object 注册。上游在 `Printer.__init__` 的早对象里与 `webhooks`
+      一起装（`klippy/klippy.py:36-40`），比 `pins` 还早；我们目前 `webhooks` 由
+      `api::register` 装、`pins` 由 `load_config` 装，注册位置要在动手时定下（放在
+      `load_config`、且在 `pins` 之前最接近上游）。
+- [ ] 命令表：`register_command(name, handler, desc)`（上游 `gcode.py:120-140`），处理器拿一个
+      参数视图（`get()` / `get_float()` / `get_int()`，未声明参数报错）；命令名大小写不敏感。
+- [ ] `run_script(script)`：按行切分、去注释、解析 `KEY=VALUE`、忽略空行；一条出错即停并把
+      错误包成 `CommandError`（A2）。
+- [ ] 输出：`register_output_handler` / `respond_info` / `respond_raw`，给
+      `gcode/subscribe_output` 与以后的 `M117` 用。
+- [ ] 未知命令报上游文案（`Unknown command:"..."`）；内置命令先只做最小的（`output_pin`
+      的 `SET_PIN` 是它自己注册的，不在这里）。
+- [ ] 上游 `GCodeDispatch` 没有 `get_status`，所以 `gcode` 应是**注册但不可查询**的对象
+      （`is_queryable` = false，同 `pins`）。
+
+#### G2 `output_pin` 与 `SET_PIN`（真机点灯的入口）
+
+从 F3 挪过来：数字输出的 MCU 资源已完成，缺的是调用它的 section。
+
+- [ ] `load.rs` 工厂表加 `[output_pin <name>]`（`load_config_prefix`），对应上游
+      `klippy/extras/output_pin.py` 的 `load_config_prefix`。
+- [ ] 选项先做数字输出子集：`pin`（必填）、`value`（起始电平，默认 0）、`shutdown_value`
+      （默认 0）、`maximum_mcu_duration`（默认 2 s，即 F3 的 `setup_max_duration`）；上游还有
+      `pwm` / `cycle_time` / `scale` / `static_value` / `template`，随 PWM（F4）与模板再做。
+- [ ] 用 `PrinterPins::setup_digital_out` 建 `McuDigitalOut`，把 start/shutdown/max_duration
+      设进去；以 section 名注册，`SET_PIN` 用 `PIN=<name>` 选。
+- [ ] `SET_PIN PIN=<name> VALUE=<0|1>`：上游走 `GCodeRequestQueue`、用 toolhead 的 print_time
+      排程；**我们先直接 `update_digital_out`（立即生效）**，排程/时钟版留到时钟层与 C1
+      （`queue_digital_out` 已能收绝对时钟）。
+- [ ] `get_status` 报 `value`（供 `objects/query` / `objects/subscribe`）。
+
+#### G3 `gcode/*` 端点
+
+- [ ] `gcode/script`（`klippy/webhooks.py:439`）、`gcode/help`（`:438`）。
+- [ ] `gcode/subscribe_output`（`:443-444`）：把输出处理器接到发起请求的连接（`PushTarget`），
+      与 `objects/subscribe` 同形。
+- [ ] `gcode/restart` / `gcode/firmware_restart`（`:440-442`）：只是
+      `run_script('restart' / 'firmware_restart')`，主机侧语义接 D2。
+
+#### G4 运动命令（G0/G1/G28/G92/M114…）
+
+- [ ] 由 toolhead 注册，随 **C1**；gcode 层不需为它们改什么，只要命令表够通用
+      （含 `register_mux_command`，给 `SET_PIN` 这类 `PIN=` 选择用）。
 
 ### B4（新）其余端点
 
@@ -256,19 +308,16 @@ F 组的 **F2–F9 都依赖 F1（已完成）**，F3–F9 还需 F2（pin 解�
 
 **本条未做、已拆分出去的**：
 
-- [ ] **`setup_pin` 的资源派发**（`pins.py:114-117`）：上游把校验过的引脚交给 chip（MCU），
-      由它建 `MCU_digital_out` / `MCU_pwm` / `MCU_adc` / `MCU_endstop`。返回类型就是资源本身，
-      所以跟随 **F3+** 一起做；`register_chip` 现在只建 per-chip 的 `PinResolver`，
-      F3 再给它接上资源工厂。
-- [ ] **数字解析**：上游把引脚名留在命令文本里，发送时由 msgparser 查字典的 `pin` 枚举；
-      我们编码器只吃 `ArgValue`，所以名字要在 **config 回调**（build 时、有字典）里换成编号。
-      这一步随第一个资源（F3）落地。
+- [x] **`setup_pin` 的资源派发**（`pins.py:114-117`）：已在 **F3** 落地（`PrinterPins::setup_digital_out`
+      → `PinChip` → `McuDigitalOut`）；PWM / ADC / endstop 随 F4 / F5 / F8 各自加一个方法。
+- [x] **数字解析**：已在 **F3** 落地——`McuDigitalOut` 在 config 回调（build 时、有字典）里用
+      `pin` 枚举把名字换成编号。
 - [ ] **`[board_pins]`**（`klippy/extras/board_pins.py`）：调用 `alias_pin` / `reserve_pin` 的
       section，需要 config 的 list 解析与一个新工厂项；解析器 API 已就绪，section 随配置装载
       （C2）一起接。
 - [ ] **`BUS_PINS_<bus>`**：由 SPI/I2C 在开总线时预留（`klippy/extras/bus.py:9-32`），随 F6/F7。
 
-#### F3 GPIO 输出 —— MCU 资源已完成，消费者等 gcode
+#### F3 GPIO 数字输出 —— 已完成（bus 同步输出等 C1）
 
 - [x] **接上芯片派发**（F2 留下的）：`PrinterPins::setup_digital_out` 把校验过的 `PinParams`
       交给 chip；chip 接口是 `PinChip`（每种资源一个方法），`McuChip`（`mcu/pin.rs`）实现它，
@@ -283,9 +332,8 @@ F 组的 **F2–F9 都依赖 F1（已完成）**，F3–F9 还需 F2（pin 解�
       `max_duration` 的 start==shutdown 约束与 `MAX_SCHEDULE_TICKS` 上限已实现。
 - [ ] **`MCU_bus_digital_out`**（`klippy/extras/bus.py:337` 以后）：挂在命令队列上、与运动
       同步的输出；需要命令队列/运动层（C1）。
-- [ ] **上位消费者 `output_pin`**（`klippy/extras/output_pin.py`）：靠 gcode 的 `SET_PIN`
-      驱动，并依赖 `display` / `motion_queuing` / `toolhead`；等 gcode 层（B3）与运动层（C1）。
-      目前用单测直接验证 `McuDigitalOut` 的配置与发送。
+- [x] 上位消费者 `output_pin` 的**前置**已具备：`PrinterPins::setup_digital_out` 返回
+      `McuDigitalOut`。section 本身移到 **G2**（它是 gcode 驱动的第一个消费者）。
 - 运行期 `queue_digital_out` 收的是**绝对固件时钟**；print_time → clock 的换算属于时钟层
       （`cmd/clock.rs` 的 `ClockSync` 现只有 `get_clock`，偏移跟踪未做）。
 
@@ -484,6 +532,8 @@ kinematics 已随 Printer 重构删除，从这里重新开始：
 | `objects/list`、`query`、`subscribe` | `klippy/webhooks.py:480-560` |
 | `emergency_stop` / `register_remote_method` / mux | `klippy/webhooks.py:319-340` |
 | `gcode/*` 端点 | `klippy/webhooks.py:438-452` |
+| gcode 调度器（命令表 / `run_script` / 输出） | `klippy/gcode.py` |
+| `output_pin`（`SET_PIN` / `GCodeRequestQueue`） | `klippy/extras/output_pin.py` |
 | section 校验用注册表 | `klippy/configfile.py:425-445` |
 | mcu 作为 printer object、它的 status | `klippy/mcu.py:1147-1170`、`:1235`、`:938-975` |
 | stats 累计与 shutdown 处理 | `klippy/mcu.py:801-802`、`:883`、`:912`、`:974-975` |

@@ -34,6 +34,7 @@ use std::sync::Arc;
 
 use crate::core::klippy::config::{Config, ConfigSection};
 use crate::core::klippy::error::KlippyError;
+use crate::core::klippy::gcode::{GCodeDispatch, GCODE_OBJECT};
 use crate::core::klippy::mcu::{load_config as load_mcu, load_config_prefix as load_mcu_prefix};
 use crate::core::klippy::pins::{PrinterPins, PINS_OBJECT};
 use crate::core::klippy::printer::{Printer, PrinterObject};
@@ -97,12 +98,18 @@ impl Printer {
     /// `pins` is registered but never queryable, so `objects/list` still starts
     /// with `webhooks`.
     ///
+    /// [`GCodeDispatch`](crate::core::klippy::gcode::GCodeDispatch) comes first
+    /// of all, because `pins` sections and resources register commands with it
+    /// as they are built. Upstream registers the same object in
+    /// `Printer.__init__` (`klippy/klippy.py:36-40`), before the config is read.
+    ///
     /// # Errors
     /// Returns [`KlippyError::Internal`] if a factory rejects a section, if a
     /// name is already taken, or if a section nothing claims is left over — the
     /// last is upstream's `Section '%s' is not a valid config section`
     /// (`klippy/configfile.py:431`).
     pub fn load_config(self: &Arc<Self>, config: &Config) -> Result<(), KlippyError> {
+        self.add_object(GCODE_OBJECT, Arc::new(GCodeDispatch::new(Arc::clone(self))))?;
         self.add_object(PINS_OBJECT, Arc::new(PrinterPins::new()))?;
 
         let mut claimed: Vec<String> = Vec::new();
@@ -186,7 +193,7 @@ mod tests {
         result.unwrap();
         // `pins` is registered before the table (upstream loads `pins` and
         // `mcu` up front), then the section's own object.
-        assert_eq!(printer.objects(), ["pins", "mcu"]);
+        assert_eq!(printer.objects(), ["gcode", "pins", "mcu"]);
     }
 
     #[test]
@@ -202,7 +209,7 @@ mod tests {
         // upstream's `add_printer_objects` order (`klippy/mcu.py:1239-1246`).
         assert_eq!(
             printer.objects(),
-            ["pins", "mcu", "mcu zboard", "mcu toolhead"]
+            ["gcode", "pins", "mcu", "mcu zboard", "mcu toolhead"]
         );
     }
 
@@ -218,12 +225,12 @@ mod tests {
     }
 
     #[test]
-    fn test_a_config_with_no_objects_loads_only_pins() {
+    fn test_a_config_with_no_objects_loads_only_the_builtins() {
         let (printer, result) = load("");
 
         result.unwrap();
-        // `pins` is unconditional; no section contributed anything else.
-        assert_eq!(printer.objects(), ["pins"]);
+        // `gcode` and `pins` are unconditional; no section contributed anything else.
+        assert_eq!(printer.objects(), ["gcode", "pins"]);
     }
 
     #[test]
@@ -235,6 +242,6 @@ mod tests {
         let (printer, result) = load("[mcu]\nserial: /dev/not-a-serial-port\n");
 
         result.unwrap();
-        assert_eq!(printer.objects(), ["pins", "mcu"]);
+        assert_eq!(printer.objects(), ["gcode", "pins", "mcu"]);
     }
 }

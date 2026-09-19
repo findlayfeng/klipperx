@@ -64,23 +64,24 @@
   （含 `max_duration`、start/shutdown 约束）与 restart 的 `update_digital_out`，运行期可
   `queue_digital_out` / `update_digital_out`（`cmd/gpio.rs`、`mcu/pin.rs`）。`output_pin`
   消费者与 bus 同步输出等 gcode/运动层。
+- **GCODE 调度器（G1）**：`GCodeDispatch`（命令表 / `register_mux_command` / `run_script` /
+  输出处理器 / `get_status` 报命令表）与 `GcodeCommand`（传统 `S200` 与扩展 `KEY=VALUE`
+  两套参数、`get_*` 的上游文案错误）、内置命令与未 ready 行为（`src/core/klippy/gcode.rs`）。
+  在 `load_config` 里最先注册（`pins` 之前）。
 
 ## 待办
 
-**当前选择：先做 G（GCODE 驱动）**。理由：F1–F3 已经把「配置 → 真实资源」打通，
-缺的只是一个把 g-code 文本变成命令调用的层与它的第一个消费者（`output_pin`），
-而**上游的 gcode 层本身不依赖 toolhead**（toolhead 只是注册 G0/G1/G28 等运动命令的
-一个消费者）。所以 G1–G3 可以排在 C1 前面，做完就能在真机上用 `SET_PIN` 点灯；
-运动命令（G4）随 toolhead 一起。
+**当前选择：GCODE 驱动**。G1（调度器）已完成；下一步 **G2**（`output_pin` + `SET_PIN`），
+做完就能在真机上点灯。执行层做不到的地方先用占位（`SET_PIN` 先立即 `update_digital_out`，
+不排程；运动命令随 C1），详见 G 组。
 
 编号保留旧文件的 T/Q 以便对照，新增项给新号。依赖列的是**工具性前置**，不是自然顺序。
 
 | # | 事项 | 依赖 |
 |---|---|---|
-| G1 | gcode 调度器（命令表、`run_script`、输出） | A2 |
-| G2 | `output_pin` 与 `SET_PIN`（真机点灯入口） | G1、F2 ✓ |
-| G3 | `gcode/*` 端点 | G1 |
-| G4 | 运动命令（G0/G1/G28…） | G1、C1 |
+| G2 | `output_pin` 与 `SET_PIN`（真机点灯入口） | G1 ✓、F2 ✓ |
+| G3 | `gcode/*` 端点 | G1 ✓ |
+| G4 | 运动命令（G0/G1/G28…） | G1 ✓、C1 |
 | A1b | reactor 串行调度器与延迟度量 | A1 ✓ |
 | A2 | 错误词汇（`CommandError` / `ConfigError`） | — |
 | B2 | MCU 关闭与错误上报（含 `last_stats`） | A2 |
@@ -188,22 +189,28 @@
 `klippy/webhooks.py:438-452`（端点）。**不依赖 toolhead**：toolhead 只是注册运动命令的
 一个消费者。
 
-#### G1 gcode 调度器（不含运动命令）
+#### G1 gcode 调度器 —— 已完成
 
-- [ ] `gcode` 作为 printer object 注册。上游在 `Printer.__init__` 的早对象里与 `webhooks`
-      一起装（`klippy/klippy.py:36-40`），比 `pins` 还早；我们目前 `webhooks` 由
-      `api::register` 装、`pins` 由 `load_config` 装，注册位置要在动手时定下（放在
-      `load_config`、且在 `pins` 之前最接近上游）。
-- [ ] 命令表：`register_command(name, handler, desc)`（上游 `gcode.py:120-140`），处理器拿一个
-      参数视图（`get()` / `get_float()` / `get_int()`，未声明参数报错）；命令名大小写不敏感。
-- [ ] `run_script(script)`：按行切分、去注释、解析 `KEY=VALUE`、忽略空行；一条出错即停并把
-      错误包成 `CommandError`（A2）。
-- [ ] 输出：`register_output_handler` / `respond_info` / `respond_raw`，给
-      `gcode/subscribe_output` 与以后的 `M117` 用。
-- [ ] 未知命令报上游文案（`Unknown command:"..."`）；内置命令先只做最小的（`output_pin`
-      的 `SET_PIN` 是它自己注册的，不在这里）。
-- [ ] 上游 `GCodeDispatch` 没有 `get_status`，所以 `gcode` 应是**注册但不可查询**的对象
-      （`is_queryable` = false，同 `pins`）。
+实现：`src/core/klippy/gcode.rs`（`GCodeDispatch` / `GcodeCommand` / `CommandError`），
+在 `load_config` 里**最先**注册（在 `pins` 之前）。上游 `klippy/gcode.py`。
+
+- [x] `gcode` 作为 printer object，在 `load_config`、`pins` 之前注册（上游放
+      `Printer.__init__` 早对象；我们 `webhooks` 由 `api::register` 先装，所以
+      `objects/list` 的顺序是 webhooks→gcode）。
+- [x] 命令表 `register_command(name, handler, desc, when_not_ready)`；非传统名做上游的
+      合法性校验；重名报 `gcode command X already registered`。
+- [x] `register_mux_command(cmd, key, value, handler, desc)`：一个 key、按值选处理器，
+      未注册值报上游文案（选项列表排序以保证稳定）。
+- [x] `run_script`：解析（传统 `S200` / 扩展 `KEY=VALUE` 带引号、行号、`;` 注释）、
+      一条出错即停并回 `!!`，返回 `CommandError`。
+- [x] 输出：`register_output_handler` / `respond_info`（`// ` 前缀）/ `respond_raw` /
+      `respond_error`（`!! `）。
+- [x] 未知命令报 `Unknown command:"..."`；未 ready 时报状态消息；内置 `M110` / `M112` /
+      `M115` / `RESTART` / `FIRMWARE_RESTART` / `ECHO` / `STATUS` / `HELP`（`when_not_ready`）。
+- [x] 与上游一致的 `get_status`：`{commands: {名: {help}}}`，所以 `gcode` 是**可查询**对象
+      （早先记成不可查询是错的——上游 `GCodeDispatch.get_status` 就返回命令表）。
+- 未做（不在 G1 范围）：`ok` 应答（文件输出协议）、`gcode:command_error` 事件（Q2）、
+      `run_script` 的 reactor mutex、`M117/M118` 等特殊默认处理。
 
 #### G2 `output_pin` 与 `SET_PIN`（真机点灯的入口）
 

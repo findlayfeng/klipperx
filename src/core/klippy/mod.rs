@@ -11,6 +11,7 @@ pub mod config;
 pub mod error;
 pub mod event;
 pub mod frame;
+pub mod gcode;
 pub mod identify;
 pub mod load;
 pub mod mcu;
@@ -28,6 +29,7 @@ pub mod interface;
 
 // Re-export common types for convenience
 pub use error::KlippyError;
+pub use gcode::{CommandError, CommandHandler, GCodeDispatch, GcodeCommand, GCODE_OBJECT};
 pub use interface::{HostDevice, Interface, SerialDevice};
 pub use msg::proto::Payload;
 pub use msg::Msg;

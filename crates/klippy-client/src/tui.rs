@@ -1020,17 +1020,23 @@ fn entry_style(entry: &Entry, message_index: usize) -> Style {
             Style::new().fg(MESSAGE_COLORS[message_index % MESSAGE_COLORS.len()])
         }
         Entry::Log { level, .. } => match level {
-            // Line-by-line detail is the quietest thing in the pane, but it has
-            // to be told apart from `DEBUG`, so it gets a colour of its own
-            // rather than the same dim grey.
-            LogLevel::Trace => Style::new().fg(Color::Blue),
-            LogLevel::Debug => Style::new().add_modifier(Modifier::DIM),
-            LogLevel::Info => Style::new().fg(Color::DarkGray),
+            // The five levels keep the colours the host's own `tracing` output
+            // uses on a terminal — purple, blue, green, yellow, red — so a line
+            // reads the same in both places. Every line also carries its tag, so
+            // the colour is a second cue rather than the only one.
+            LogLevel::Trace => Style::new().fg(Color::Magenta),
+            LogLevel::Debug => Style::new().fg(Color::Blue),
+            LogLevel::Info => Style::new().fg(Color::Green),
             LogLevel::Warn => Style::new().fg(Color::Yellow),
             LogLevel::Error => Style::new().fg(Color::Red),
         },
         Entry::Notice { kind, .. } => match kind {
-            Notice::Info => Style::new().fg(Color::Cyan),
+            // The window's everyday voice is plain: the colours belong to the
+            // host's lines and to the printer's messages, and that keeps the
+            // pane free of a sixth hue that means nothing in particular.
+            Notice::Info => Style::new(),
+            // A hint or a problem keeps the hue of the level it means, the way
+            // `Warn` and `Error` share it with them.
             Notice::Hint => Style::new().fg(Color::Yellow),
             Notice::Problem => Style::new().fg(Color::Red),
             Notice::Failure => Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
@@ -1044,7 +1050,10 @@ fn entry_style(entry: &Entry, message_index: usize) -> Style {
 /// colour in many themes, which is exactly the “I cannot see any colour” a pair
 /// of greys produces. Plain ANSI foregrounds rather than a 256-colour
 /// background, so they work wherever colour is shown at all.
-const MESSAGE_COLORS: [Color; 2] = [Color::LightYellow, Color::LightGreen];
+///
+/// Neither is a hue the five log levels use (`TRACE`…`ERROR`), so a message is
+/// never mistaken for a log line at a glance.
+const MESSAGE_COLORS: [Color; 2] = [Color::Cyan, Color::White];
 
 /// Whether an entry is a message, rather than the window talking to itself.
 fn is_message(entry: &Entry) -> bool {
@@ -2267,7 +2276,7 @@ mod tests {
     }
 
     #[test]
-    fn test_a_trace_line_looks_like_neither_debug_nor_info() {
+    fn test_the_level_colours_match_the_hosts_own() {
         let style = |level| {
             entry_style(
                 &Entry::Log {
@@ -2278,10 +2287,26 @@ mod tests {
             )
         };
 
-        // TRACE has a line-by-line noise of its own, and it has to be told apart
-        // from the `DEBUG` chatter beside it — a colour, not the same dim grey.
-        assert_eq!(style(LogLevel::Trace).fg, Some(Color::Blue));
-        assert_ne!(style(LogLevel::Trace), style(LogLevel::Debug));
-        assert_ne!(style(LogLevel::Trace), style(LogLevel::Info));
+        // The same five hues `tracing` paints levels with on a terminal.
+        assert_eq!(style(LogLevel::Trace).fg, Some(Color::Magenta));
+        assert_eq!(style(LogLevel::Debug).fg, Some(Color::Blue));
+        assert_eq!(style(LogLevel::Info).fg, Some(Color::Green));
+        assert_eq!(style(LogLevel::Warn).fg, Some(Color::Yellow));
+        assert_eq!(style(LogLevel::Error).fg, Some(Color::Red));
+
+        // A message never takes one of them, so a log line and a message are
+        // told apart by more than their markers.
+        for level in [
+            LogLevel::Trace,
+            LogLevel::Debug,
+            LogLevel::Info,
+            LogLevel::Warn,
+            LogLevel::Error,
+        ] {
+            assert!(
+                !MESSAGE_COLORS.contains(&style(level).fg.unwrap()),
+                "{level:?} shares a colour with the messages"
+            );
+        }
     }
 }

@@ -32,7 +32,7 @@
 //! should keep working.
 
 use super::error::InterfaceError;
-use super::Device;
+use super::{describe_frame, hex_runs, Device};
 use crate::core::klippy::frame::{Frame, FrameStream};
 use std::ffi::CString;
 use std::fmt;
@@ -322,15 +322,7 @@ impl Device for CanSerialDevice {
         // The message block goes out as a burst of CAN frames; the kernel queues
         // them, so a full bus costs latency rather than a lost frame.
         let bytes = frame.raw_bytes();
-        trace!(
-            "tx frame [{}]: {}",
-            self.id(),
-            bytes
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<Vec<_>>()
-                .join(" ")
-        );
+        trace!("tx frame [{}]: {}", self.id(), describe_frame(&bytes));
         let frames: Vec<CanFrame> = self.link.lock().unwrap().frames(&bytes).collect();
         for can_frame in &frames {
             (&self.socket)
@@ -367,16 +359,10 @@ impl Device for CanSerialDevice {
                 Ok(read) if read >= CAN_FRAME_SIZE => {
                     let can_frame = CanFrame::from_abi(&raw);
                     if self.link.lock().unwrap().accept(&can_frame) {
-                        trace!(
-                            "rx frame [{}]: {}",
-                            self.id(),
-                            can_frame
-                                .data()
-                                .iter()
-                                .map(|b| format!("{b:02x}"))
-                                .collect::<Vec<_>>()
-                                .join(" ")
-                        );
+                        // One CAN frame carries eight bytes of the message block,
+                        // not a block of its own, so there are no parts to split:
+                        // only the bytes, in runs.
+                        trace!("rx frame [{}]: {}", self.id(), hex_runs(can_frame.data()));
                         debug!("received CAN frame of {} bytes", can_frame.data().len());
                     } else {
                         debug!("ignoring CAN frame for id {:#x}", can_frame.id());

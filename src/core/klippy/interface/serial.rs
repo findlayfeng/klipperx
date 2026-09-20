@@ -19,7 +19,7 @@
 //! [`FrameStream`]: crate::core::klippy::frame::FrameStream
 
 use super::error::InterfaceError;
-use super::Device;
+use super::{describe_frame, Device};
 use crate::core::klippy::frame::{Frame, FrameStream};
 use std::fmt;
 use std::fs::{File, OpenOptions};
@@ -116,15 +116,7 @@ impl Device for SerialDevice {
         }
 
         let bytes = frame.raw_bytes();
-        trace!(
-            "tx frame [{}]: {}",
-            self.id(),
-            bytes
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<Vec<_>>()
-                .join(" ")
-        );
+        trace!("tx frame [{}]: {}", self.id(), describe_frame(&bytes));
         (&self.port).write_all(&bytes).map_err(|e| {
             InterfaceError::SendError(format!(
                 "serial write to {} failed: {e}",
@@ -150,15 +142,7 @@ impl Device for SerialDevice {
             match (&self.port).read(&mut buf) {
                 Ok(0) => continue, // timeout: no bytes were waiting
                 Ok(read) => {
-                    trace!(
-                        "rx frame [{}]: {}",
-                        self.id(),
-                        buf[..read]
-                            .iter()
-                            .map(|b| format!("{b:02x}"))
-                            .collect::<Vec<_>>()
-                            .join(" ")
-                    );
+                    trace!("rx frame [{}]: {}", self.id(), describe_frame(&buf[..read]));
                     debug!("received {} bytes from {}", read, self.path.display());
                     self.stream.lock().unwrap().push(&buf[..read]);
                 }

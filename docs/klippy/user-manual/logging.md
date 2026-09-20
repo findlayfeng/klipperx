@@ -87,7 +87,7 @@ WARN  api: dropping malformed request (invalid JSON …): not json
 - `WARN` — 异常情况但主机仍在运行，如请求格式错误
 - `ERROR` — 严重错误，可能导致功能不可用
 - `DEBUG` — 内部调试信息，如配置节数量、状态变化等
-- `TRACE` — 接口层帧的字节内容（十六进制）
+- `TRACE` — 接口层帧的字节内容（按帧结构分段，十六进制）
 
 在 `DEBUG` 级别下，日志会包含模块名称前缀，如 `klippy`、`api`、`webhooks` 等，方便定位问题来源。
 
@@ -99,9 +99,23 @@ WARN  api: dropping malformed request (invalid JSON …): not json
 |------|-------------|
 | `INFO` | `serial port /dev/ttyACM0 open at 250000 baud` |
 | `DEBUG` | `sent 15 bytes to /dev/ttyACM0`、`received 32 bytes from /dev/ttyACM0` |
-| `TRACE` | 按字节打印帧的十六进制内容（如 `01 02 03 ff fe`） |
+| `TRACE` | `tx frame [serial0]: 0a11 \| 01020304 05 \| 31d87e` |
 
 `DEBUG` 级别只显示字节数量，`TRACE` 级别才会打印帧的实际字节内容。
+
+`TRACE` 的字节按帧的结构分成三段，用 `|` 隔开：
+
+```text
+tx frame [serial0]: 0a11 | 01020304 05 | 31d87e
+```
+
+- `0a11` —— 头：长度 `0x0a`（10 字节，含头尾）与序号字节 `0x11`（低 4 位是序号，`0x10` 是 DEST 标志）
+- `01020304 05` —— 载荷
+- `31d87e` —— 尾：CRC（2 字节）与 SYNC（`0x7e`）
+
+每一段内每 4 字节为一组、组间一个空格；不足 4 字节的余数整段连写（如上面的
+`01020304 05`）。不是完整一帧的字节（读到半帧、两帧粘在一起、CAN 上的一段
+数据）没有结构可分，就只按 4 字节一组打印。
 
 ## 常见问题
 

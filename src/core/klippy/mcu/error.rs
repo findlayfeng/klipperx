@@ -82,6 +82,15 @@ pub enum McuError {
     Msg(MsgError),
     /// A synchronous request/response call failed.
     Call(McuCallError),
+    /// The firmware must be reset before this configuration can be sent, and
+    /// its only way to do that is the `reset` command — which reboots the MCU
+    /// and so drops the connection the handshake is using.
+    ///
+    /// A firmware that has `config_reset` is reset in place instead, and one
+    /// with neither command reports [`McuError::Config`]. The caller of the
+    /// handshake handles this by sending `reset`, reconnecting, and retrying
+    /// (`mcu/object.rs`).
+    ResetRequired,
     /// The MCU configuration phase failed: the configuration is internally
     /// inconsistent (`CrcMismatch`, an exhausted oid range), the MCU is in a
     /// state that cannot be configured, or the build was asked for at the
@@ -114,6 +123,9 @@ impl std::fmt::Display for McuError {
             McuError::IdentifyJson(msg) => write!(f, "cannot parse identify payload: {}", msg),
             McuError::Msg(e) => write!(f, "{}", e),
             McuError::Call(e) => write!(f, "{}", e),
+            McuError::ResetRequired => {
+                write!(f, "the firmware must be reset with the 'reset' command")
+            }
             McuError::Config(msg) => write!(f, "cannot configure MCU: {}", msg),
         }
     }
@@ -132,6 +144,7 @@ impl std::error::Error for McuError {
             | McuError::IdentifyProtocol(_)
             | McuError::IdentifyCompression(_)
             | McuError::IdentifyJson(_)
+            | McuError::ResetRequired
             | McuError::Config(_) => None,
         }
     }

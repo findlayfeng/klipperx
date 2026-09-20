@@ -43,8 +43,11 @@
 //!   `longjmp` out of the block being dispatched (`src/sched.c`), so a
 //!   `config_reset` batched behind the stop would never run (see
 //!   [`stop_firmware`]). A firmware without `config_reset` (the command is
-//!   declared per board) is refused instead, with a message pointing at a power
-//!   cycle or the restart loop (TODO D2). Upstream resets the same way, one
+//!   declared per board) but with `reset` is reported as
+//!   [`McuError::ResetRequired`]: `reset` reboots the MCU and drops the
+//!   connection, so the caller sends it, reconnects, and runs the handshake
+//!   again (`mcu/object.rs`). Only a firmware with neither command is refused,
+//!   with a message pointing at a power cycle. Upstream resets the same way, one
 //!   process later, through its restart helper — which is why `mcu/object.rs`
 //!   binds its shutdown events only *after* this handshake: a reset this host
 //!   performs is not a spontaneous stop.
@@ -74,7 +77,9 @@
 use std::sync::{Mutex, MutexGuard};
 
 use crate::core::klippy::cmd::allocate_oids::AllocateOids;
-use crate::core::klippy::cmd::config::{ConfigReset, ConfigState, FinalizeConfig, GetConfig};
+use crate::core::klippy::cmd::config::{
+    ConfigReset, ConfigState, FinalizeConfig, GetConfig, Reset,
+};
 use crate::core::klippy::cmd::shutdown::EmergencyStop;
 use crate::core::klippy::cmd::McuCommand;
 use crate::core::klippy::event::{McuEvent, Shutdown};
@@ -451,14 +456,32 @@ impl ConfigBuilder {
     pub async fn configure(&self, mcu: &Mcu) -> Result<Configured, McuError> {
         // Building first means the CRC is known before the firmware is asked
         // anything — the reset decision below needs it.
-        let BuiltConfig {
-            crc,
-            move_slots,
-            config,
-            restart,
-            init,
-            mut post_init,
-        } = self.build(mcu)?;
+        let mut built = self.build(mcu)?;
+        self.handshake(mcu, &mut built).await
+    }
+
+    /// Ask the firmware what it has, reset it if it must be, and send the
+    /// configuration.
+    ///
+    /// [`ConfigBuilder::configure`] is [`ConfigBuilder::build`] followed by
+    /// this. It is separate because a firmware whose only reset is its own
+    /// `reset` command reboots the MCU, which drops the connection: the caller
+    /// reconnects and calls this again with the same [`BuiltConfig`]
+    /// (`mcu/object.rs`). The built commands stay valid because the firmware
+    /// that comes back has the same dictionary.
+    ///
+    /// # Errors
+    /// As [`ConfigBuilder::configure`], plus [`McuError::ResetRequired`] when a
+    /// reset is needed and the firmware has neither `config_reset` nor a way to
+    /// do it from here (a firmware with only `reset` cannot be reset without
+    /// dropping this connection).
+    pub async fn handshake(
+        &self,
+        mcu: &Mcu,
+        built: &mut BuiltConfig,
+    ) -> Result<Configured, McuError> {
+        let crc = built.crc;
+        let move_slots = built.move_slots;
 
         let mut before = get_config(mcu).await?;
         // Read before anything below resets the firmware: what the board reports
@@ -472,7 +495,9 @@ impl ConfigBuilder {
         // `src/basecmd.c:173`) and a stopped one refuses to run anything else.
         // `config_reset` clears the CRC, the oids and the shutdown latch
         // (`src/basecmd.c:262`), but only accepts to run while stopped, so an
-        // emergency stop comes first when the firmware is still running.
+        // emergency stop comes first when the firmware is still running. A
+        // firmware without it reports [`McuError::ResetRequired`] instead, and
+        // the caller reboots it with `reset`.
         if before.is_shutdown || (before.is_config && before.crc != crc) {
             reset_firmware(mcu, &before, crc).await?;
             before = get_config(mcu).await?;
@@ -493,16 +518,16 @@ impl ConfigBuilder {
 
         let reused = before.is_config;
         if reused {
-            for payload in restart {
-                mcu.send_payload(payload).await?;
+            for payload in &built.restart {
+                mcu.send_payload(payload.clone()).await?;
             }
         } else {
-            for payload in config {
-                mcu.send_payload(payload).await?;
+            for payload in &built.config {
+                mcu.send_payload(payload.clone()).await?;
             }
         }
-        for payload in init {
-            mcu.send_payload(payload).await?;
+        for payload in &built.init {
+            mcu.send_payload(payload.clone()).await?;
         }
 
         // The firmware answers in request order, so this second query is
@@ -523,7 +548,7 @@ impl ConfigBuilder {
             )));
         }
 
-        for callback in post_init.drain(..) {
+        for callback in built.take_post_init() {
             callback(mcu);
         }
         Ok(Configured {
@@ -591,6 +616,12 @@ async fn get_config(mcu: &Mcu) -> Result<ConfigState, McuError> {
 /// command is declared per board, not in `basecmd.c`).
 async fn reset_firmware(mcu: &Mcu, state: &ConfigState, crc: u32) -> Result<(), McuError> {
     if !mcu.has_message(ConfigReset::NAME) {
+        if mcu.has_message(Reset::NAME) {
+            // `reset` reboots the firmware, which drops this connection; the
+            // caller reconnects and re-runs the handshake (`mcu/object.rs`).
+            // Nothing may be sent from here.
+            return Err(McuError::ResetRequired);
+        }
         let reason = if state.is_shutdown {
             "is shutdown".to_string()
         } else {
@@ -1167,6 +1198,31 @@ mod tests {
         mcu
     }
 
+    /// The dictionary with `reset` but without `config_reset`: a board that can
+    /// only clear itself by rebooting (STM32 and the other `armcm_reset` boards).
+    fn dictionary_with_reset_only() -> Dictionary {
+        Dictionary::from_json(json!({
+            "commands": {
+                "reset": 16,
+                "allocate_oids count=%c": 2,
+                "get_config": 7,
+                "finalize_config crc=%u": 6
+            },
+            "responses": {
+                "config is_config=%c crc=%u is_shutdown=%c move_count=%hu": 9
+            },
+            "config": {"CLOCK_FREQ": 20000000}
+        }))
+        .unwrap()
+    }
+
+    fn scripted_mcu_with_reset_only(mappings: Vec<MappingEntry>) -> Mcu {
+        let mcu = Mcu::for_test("test_mcu", Interface::new(TestDevice::new(mappings)));
+        mcu.install_dictionary(dictionary_with_reset_only())
+            .unwrap();
+        mcu
+    }
+
     /// The dictionary without a `shutdown` response: a firmware that stops on
     /// `emergency_stop` but never reports the stop.
     fn dictionary_without_shutdown() -> Dictionary {
@@ -1225,6 +1281,40 @@ mod tests {
 
         assert!(matches!(err, McuError::Config(_)), "{err:?}");
         assert!(err.to_string().contains("CRC"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_configure_asks_for_a_reset_when_only_reset_is_available() {
+        // Already configured with another CRC, and the only way to clear it is
+        // the firmware's `reset` — which reboots the MCU and drops this
+        // connection. The handshake reports that instead of sending anything, so
+        // the caller can reconnect and retry (`mcu/object.rs`).
+        let mcu = scripted_mcu_with_reset_only(vec![MappingEntry {
+            input: Frame::new(0, get_config_payload()),
+            outputs: vec![Frame::new(
+                0,
+                config_response(true, 0xdead_beef, false, 500),
+            )],
+        }]);
+        let builder = ConfigBuilder::new();
+
+        let err = builder.configure(&mcu).await.unwrap_err();
+
+        assert!(matches!(err, McuError::ResetRequired), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn test_configure_asks_for_a_reset_when_only_reset_is_available_and_shutdown() {
+        // The same, for a firmware that is stopped rather than configured.
+        let mcu = scripted_mcu_with_reset_only(vec![MappingEntry {
+            input: Frame::new(0, get_config_payload()),
+            outputs: vec![Frame::new(0, config_response(false, 0, true, 0))],
+        }]);
+        let builder = ConfigBuilder::new();
+
+        let err = builder.configure(&mcu).await.unwrap_err();
+
+        assert!(matches!(err, McuError::ResetRequired), "{err:?}");
     }
 
     #[tokio::test]

@@ -104,6 +104,27 @@ impl McuCommand for ConfigReset {
     }
 }
 
+/// `reset` — reboot the firmware (`src/generic/armcm_reset.c:44` and the AVR /
+/// ATSAM / AR100 equivalents).
+///
+/// Unlike `config_reset`, which clears the configuration **without** dropping
+/// the connection, `reset` restarts the MCU: a native-USB board re-enumerates
+/// and the sequence numbers start over, so the host must open a new connection
+/// before it can send anything else. It is the command upstream's `command`
+/// restart method prefers when the firmware declares it (`klippy/mcu.py:736-745`);
+/// STM32 boards have it and do not have `config_reset`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Reset;
+
+impl McuCommand for Reset {
+    const NAME: &'static str = "reset";
+
+    fn args(&self) -> Vec<ArgValue> {
+        // No parameters.
+        Vec::new()
+    }
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================

@@ -112,7 +112,7 @@ oid 的**分配顺序 = 对象创建顺序 = config 里的顺序**，因此配�
 3. 按两者决定：
    - `!is_config`：设备未配置（新上电，或刚被复位）→ 发 `config` 列表 + `init`；
    - `is_config && crc == 主机值`：设备上留的正是这份配置 → 只发 `restart` + `init`；
-   - `is_config && crc != 主机值`：设备上是另一份配置 → 先复位（`config_reset`，见 [CRC 一节](#crc我们与上游算的不是同一样东西)），再发 `config` + `init`。
+   - `is_config && crc != 主机值`：设备上是另一份配置 → 先复位（`config_reset` 就地，或 `reset` + 重连；见 [CRC 一节](#crc我们与上游算的不是同一样东西)），再发 `config` + `init`。
 
 固件**不重算、也不校验**这个值，只是原样存取（`src/basecmd.c:256` `:248`）。它是主机的缓存键：命中省掉一次配置下发，未命中就必须复位重配（配置期已由 `finalize_config` 锁住，不能就地重发）。因此它只需满足两条：
 
@@ -205,7 +205,7 @@ void command_finalize_config(uint32_t *args) {
 | `_send_get_config` 先查**连接层**的 shutdown 标志（`conn_helper.is_shutdown()`），再查 `get_config` 的 `is_shutdown` 字段，两者都 raise | `:1039-1046` | 只查 `is_shutdown` 字段（连接层 shutdown 属 B2） |
 | 未配置时先 `check_restart_on_send_config()`：`restart_method == 'rpi_usb'` 要先做一次 USB 断电重启才发配置 | `:686-689`、`:1052` | 不做（无重启路径，D2） |
 | 已配置时先看 `start_reason == 'firmware_restart'`，是则 raise “Failed automated reset”（说明复位没生效），**再**算 CRC | `:1053-1056` | 不做（无 `start_reason`，D1/D2） |
-| **CRC 不匹配时先 `check_restart_on_crc_mismatch()`：请求一次 `request_exit('firmware_restart')`、pause 2 s、然后才 raise** | `:678-685`、`:1057-1059` | 就地复位：`emergency_stop` + `config_reset` 后重新配置（没有 `config_reset` 才报 `McuError::Config`） |
+| **CRC 不匹配时先 `check_restart_on_crc_mismatch()`：请求一次 `request_exit('firmware_restart')`、pause 2 s、然后才 raise** | `:678-685`、`:1057-1059` | 就地复位：`emergency_stop` + `config_reset` 后重新配置；无 `config_reset` 但有 `reset` 则发 `reset` + 重连 + 重试握手；两者都没有才报 `McuError::Config` |
 | pin 名在 `_finalize_config` 里改写；非法 pin 的错误到**发送时**才被 `_send_cfg_init_commands` 捕获并转成 config error | `:1009-1013`、`:1021-1032` | F2 会在**加入命令时**就改写/报错，编码在 build 时，错误也在 build 暴露 |
 | 发送后第二次 `get_config`：`fileoutput` 模式下跳过 `is_config` 断言 | `:1066-1068` | 总是断言 |
 | `move_count` 与预留槽：把 `move_count - reserved` 交给 `steppersync` | `:1070-1078` | 只校验 `move_count >= reserved`（无运动层，C1） |
@@ -225,7 +225,7 @@ MCU 'mcu' is configured with CRC 0x…, the host computed 0x…
 
 我们现在也复位，但**在原连接里**：`configure` 发现固件已停机或 CRC 不一致时，发 `config_reset`（运行中的固件先发 `emergency_stop`，因为 `config_reset` 只在停机时可跑），再重新 `get_config`、发这份配置。上游是下一个进程里做同一件事（它的重启 helper），所以我们把“固件的停机事件”**放在这次握手之后**再绑（`mcu/object.rs`）——否则自己发起的 `emergency_stop` 会被当成一次意外停机。
 
-没有 `config_reset` 的固件（该命令按板子声明，不在 `basecmd.c`）仍然只能报错，提示断电或等重启循环（D2）。上游在没有重启 helper 可用时（如 `start_reason == 'firmware_restart'`）同样是直接 raise。
+没有 `config_reset` 的固件不再只能报错：如果它声明了 `reset`，`handshake` 返回 `McuError::ResetRequired`，`McuObject::connect` 就发 `reset`、重开连接、用同一份 `BuiltConfig` 重跑握手（`mcu/config.rs`、`mcu/object.rs`）。`reset` 重启 MCU（native USB 的板子会重新枚举），所以不能像 `config_reset` 那样就地做完；真板未验，与 arduino / cheetah / rpi_usb 一样只报“未测试”。两者都没有的固件仍然报错，提示断电。上游在没有重启 helper 可用时（如 `start_reason == 'firmware_restart'`）同样是直接 raise。
 
 ### 对 F2（pin 解析）的约束
 
@@ -265,8 +265,9 @@ MCU 'mcu' is configured with CRC 0x…, the host computed 0x…
 
 - **pin 名改写**：F2 的 `PinResolver`。见上一节对 F2 的约束。
 - **`get_query_slot`**：它把周期查询排到一个绝对的 print-time 时钟上（`:1136`），需要时钟/运动层；由它的消费者（ADC、endstop）带进来。
-- **`config_reset` 的发送**：已完成（`configure` 在固件停机或 CRC 不一致时就地复位；无 `config_reset` 时报错）。
-- **CRC 不匹配时的进程重启**：仍属于重启循环（D2）。`McuConfig.restart_method` 也仍是解析后保留、无人读取。
+- **固件复位（`config_reset` / `reset`）**：已完成。`config_reset` 就地清；只有 `reset` 的固件发 `reset` + 重连 + 重试握手；两者都没有才报错。
+- **`rpi_usb` 的两处连接期门控**：串口不在先上电、未配置先断电再配置（`klippy/mcu.py:692-700`），属重启循环（TODO D2）。
+- **CRC 不匹配时的进程重启**：仍属于重启循环（D2）。`McuConfig.restart_method` 已被读取：`McuObject::connect` 用它挑 `command` 的 `reset`，`McuConfig::open` 用它给 cheetah 定 RTS，物理分派在 `mcu/restart.rs`。
 
 ---
 

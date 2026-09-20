@@ -489,8 +489,28 @@ impl Mcu {
     /// Returns [`MsgError`] if the message name is unknown, the arguments
     /// don't match the expected parameter count, or the send buffer is full.
     pub fn send(&self, name: &str, args: &[ArgValue]) -> Result<(), MsgError> {
+        self.enqueue(name, args, None)
+    }
+
+    /// The body of [`Mcu::send`], plus what the caller will be waiting for.
+    ///
+    /// A call is one round trip, so it gets one line: `send identify offset=0
+    /// count=40 (waiting for identify_response)` says what went out and what is
+    /// expected back, where two lines said half of that each.
+    fn enqueue(
+        &self,
+        name: &str,
+        args: &[ArgValue],
+        waiting_for: Option<&str>,
+    ) -> Result<(), MsgError> {
         let payload = self.parser.encode(name, args)?;
-        debug!("send {}", self.describe_command(name, args));
+        match waiting_for {
+            Some(response) => debug!(
+                "send {} (waiting for {response})",
+                self.describe_command(name, args)
+            ),
+            None => debug!("send {}", self.describe_command(name, args)),
+        }
         self.send_buf_tx
             .try_send(payload)
             .map_err(|e| MsgError::new(e.to_string()))?;
@@ -543,10 +563,6 @@ impl Mcu {
                 command
             );
         }
-        info!(
-            "Calling command: {command} (response: {response_name}, timeout: {:?})",
-            timeout
-        );
 
         // 2. Create a oneshot channel for the response.
         let (tx, rx) = oneshot::channel::<Vec<ArgValue>>();
@@ -556,29 +572,20 @@ impl Mcu {
             .register(response_name.to_string(), tx)
             .await;
 
-        // 4. Send the command.
-        if let Err(e) = self.send(command, args) {
+        // 4. Send the command. Its line names the response it is waiting for.
+        if let Err(e) = self.enqueue(command, args, Some(response_name)) {
             warn!("Failed to send command '{}': {e}", command);
             // Clean up the pending call on send failure.
             self.pending_calls.cancel(response_name).await;
             return Err(McuCallError::SendFailed(e.msg));
         }
-        debug!(
-            "Command '{}' sent, waiting for response '{}'",
-            command, response_name
-        );
 
         // 5. Wait for the response. A successful resolve already consumed the
         // registration, so only the failure paths need to clean up.
         match tokio::time::timeout(timeout, rx).await {
-            Ok(Ok(params)) => {
-                debug!(
-                    "Response received for '{}': {} params",
-                    response_name,
-                    params.len()
-                );
-                Ok(params)
-            }
+            // The response itself was logged where it was decoded, with its
+            // parameters; there is nothing left to say here.
+            Ok(Ok(params)) => Ok(params),
             Ok(Err(_recv)) => {
                 // Receiver dropped (shouldn't happen in normal flow).
                 self.pending_calls.cancel(response_name).await;

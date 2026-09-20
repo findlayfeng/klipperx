@@ -29,6 +29,8 @@
 //!
 //! - **Mouse wheel**: scroll up/down by 3 lines
 //! - **Click/drag the scrollbar**: go to that part of the log
+//! - **^S** (or `.mouse`): hand the mouse back to the terminal so text can be
+//!   selected and copied there, and take it again afterwards
 //! - **PgUp/PgDn**: scroll by a page
 //! - **Home**: jump to the top (oldest lines)
 //! - **End**: jump to the bottom (newest line)
@@ -39,7 +41,8 @@
 //!
 //! The unit is a rendered line, not a logged entry: a single entry wrapped over
 //! several rows can be read a line at a time, and one keystroke moves what the
-//! eye counts, not what the protocol happened to delimit.
+//! eye counts, not what the protocol happened to delimit. A log line's level is
+//! coloured and the line itself is not, the way `tracing` prints it.
 //!
 //! The log's rightmost column is a scrollbar. It is always reserved, so the text
 //! never shifts sideways when the log outgrows the pane, and the thumb appears
@@ -57,8 +60,10 @@
 //!
 //! # Not covered
 //!
-//! * No text selection, no copy/paste handling beyond what the terminal does
-//!   with the alternate screen.
+//! * Selection and copying are the terminal's, not the window's — but a
+//!   terminal only selects with a mouse it owns, and the window needs the mouse
+//!   for its wheel and its scrollbar. `^S` / `.mouse` gives it back when that
+//!   matters, and takes it again afterwards.
 //! * No reconnection: the window closes when the server goes away, after
 //!   printing why. Reconnecting would mean re-establishing every subscription.
 //! * The log keeps everything for the life of the session; a very chatty
@@ -128,9 +133,6 @@ pub async fn run_session(
     // being dropped, must still give the terminal back.
     let _terminal = TerminalGuard::take();
     let terminal = ratatui::init();
-    // Enable mouse capture for wheel scrolling
-    let _mouse = ratatui::crossterm::event::EnableMouseCapture;
-    ratatui::crossterm::execute!(std::io::stdout(), _mouse).ok();
     let outcome = event_loop(session, terminal, host_log).await;
     outcome
 }
@@ -186,6 +188,10 @@ struct App {
     /// Whether a scrollbar drag is in progress. The button holds the drag, not
     /// the pointer's column, so this survives the pointer leaving the bar.
     dragging: bool,
+    /// Whether the window has taken the mouse. While it has, the wheel scrolls
+    /// and the scrollbar drags — and the terminal cannot select text, because it
+    /// never sees the drag. `^S` / `.mouse` hands it back.
+    mouse: bool,
     /// The connection's state, shown in the header.
     status: Status,
     /// Set by a local command that asked to leave.
@@ -237,6 +243,7 @@ impl App {
             heights: RefCell::new(Heights::default()),
             gutter: Cell::new(Rect::new(0, 0, 0, 0)),
             dragging: false,
+            mouse: true,
             status: Status::Unknown,
             quit: false,
             gcode: false,
@@ -244,6 +251,23 @@ impl App {
             greeted: false,
             format: Format::Yaml,
         }
+    }
+
+    /// Take the mouse for the window, or hand it back to the terminal.
+    ///
+    /// A captured mouse is the window's: the wheel scrolls the log and the
+    /// scrollbar is a target. But a captured mouse also means the terminal never
+    /// sees a drag, so its own selection cannot start — the two gestures cannot
+    /// both be had. Releasing it trades the wheel and the scrollbar for the
+    /// terminal's selection; `^S` or `.mouse` takes it back.
+    fn toggle_mouse(&mut self) {
+        self.mouse = !self.mouse;
+        let text = if self.mouse {
+            "mouse captured: the wheel and the scrollbar are the window's (^S or .mouse to release)"
+        } else {
+            "mouse released: drag to select text, copy it with the terminal (^S or .mouse to capture)"
+        };
+        self.push(Entry::notice(Notice::Info, text));
     }
 
     /// Flip between request mode and g-code mode.
@@ -438,6 +462,10 @@ impl App {
                 self.toggle_gcode();
                 true
             }
+            ".mouse" => {
+                self.toggle_mouse();
+                true
+            }
             ".yaml" | ".json" => {
                 self.format = if line.trim() == ".json" {
                     Format::Json
@@ -458,7 +486,7 @@ impl App {
                 self.push(Entry::notice(
                     Notice::Info,
                     format!(
-                        "{}\n\nWindow:\n  .yaml / .json   show message bodies as YAML or JSON\n  .gcode          toggle g-code mode (^G): typed lines go to gcode/script",
+                        "{}\n\nWindow:\n  .yaml / .json   show message bodies as YAML or JSON\n  .gcode          toggle g-code mode (^G): typed lines go to gcode/script\n  .mouse          hand the mouse back to the terminal (^S) so text can be selected",
                         session::usage()
                     ),
                 ));
@@ -519,6 +547,20 @@ fn field(value: &Value, name: &str) -> String {
         .to_string()
 }
 
+/// Take the terminal's mouse for the window, or give it back.
+///
+/// A window that has the mouse gets the wheel and the scrollbar; a terminal that
+/// has it gets its own selection. Only one of them can, which is why `^S` exists.
+fn set_mouse_capture(captured: bool) {
+    use ratatui::crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+
+    let _ = if captured {
+        ratatui::crossterm::execute!(std::io::stdout(), EnableMouseCapture)
+    } else {
+        ratatui::crossterm::execute!(std::io::stdout(), DisableMouseCapture)
+    };
+}
+
 /// Draw, read keys, read the socket, until one of them says stop.
 async fn event_loop(
     mut session: Session,
@@ -543,7 +585,15 @@ async fn event_loop(
     session.handshake(&mut app).await?;
 
     let (mut keys, keyboard) = spawn_keyboard();
+    // The window holds the mouse unless the reader has handed it back, and the
+    // terminal has to be told which way it is. The last state applied is kept
+    // here so the escape sequence goes out on a change, not every frame.
+    let mut captured = false;
     let outcome = loop {
+        if app.mouse != captured {
+            captured = app.mouse;
+            set_mouse_capture(captured);
+        }
         terminal
             .draw(|frame| draw(frame, &app))
             .expect("drawing failed");
@@ -626,6 +676,8 @@ async fn handle_key(
             app.entries.clear();
             app.scroll = 0;
         }
+        // Handing the mouse back so the terminal can select text.
+        (KeyCode::Char('s'), true) => app.toggle_mouse(),
         // Switching what a typed line means: a request, or G-Code.
         (KeyCode::Char('g'), true) => {
             app.toggle_gcode();
@@ -854,6 +906,10 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
 
     let hint = if app.quit {
         "leaving…".to_string()
+    } else if !app.mouse {
+        // A released mouse is a mode the reader has to remember: the gestures
+        // they just used no longer do anything, and the terminal's do.
+        "mouse released · drag to select · ^S capture · ^C quit".to_string()
     } else if back > 0 {
         let lines = if back == 1 { "line" } else { "lines" };
         format!(
@@ -976,11 +1032,9 @@ fn visible_lines(app: &App, width: usize, height: usize, total: usize) -> Viewpo
             0
         };
         let style = entry_style(entry, index);
-        for line in wrap(&entry_text(entry, app.format), width)
-            .into_iter()
-            .rev()
-        {
-            lines.push(Line::from(Span::styled(line, style)));
+        let wrapped = wrap(&entry_text(entry, app.format), width);
+        for (position, text) in wrapped.into_iter().enumerate().rev() {
+            lines.push(entry_line(entry, text, position == 0, style));
             if lines.len() >= cap {
                 break 'entries;
             }
@@ -1003,6 +1057,35 @@ fn visible_lines(app: &App, width: usize, height: usize, total: usize) -> Viewpo
         first: total.saturating_sub(shown + skip),
         shown,
     }
+}
+
+/// One wrapped line of an entry, styled.
+///
+/// A log line is the exception: only its level is coloured, and the line itself
+/// is left plain — what the host's own `tracing` output does, and what keeps a
+/// pane of prose readable. Everything else (a message body, a notice, a failed
+/// reply) is styled whole, because its colour is the only thing marking it.
+///
+/// `first` says whether this is the entry's first line, since that is the one
+/// `entry_text` puts the tag in front of.
+fn entry_line(entry: &Entry, text: String, first: bool, style: Style) -> Line<'static> {
+    let Entry::Log { level, .. } = entry else {
+        return Line::from(Span::styled(text, style));
+    };
+    if !first {
+        return Line::from(Span::raw(text));
+    }
+
+    // The tag `entry_text` wrote, and the space after it. A pane too narrow for
+    // the tag colours what fits rather than dropping the tag's colour.
+    let tag_width = level.tag().chars().count() + 1;
+    if text.chars().count() <= tag_width {
+        return Line::from(Span::styled(text, style));
+    }
+    let mut chars = text.chars();
+    let tag: String = chars.by_ref().take(tag_width).collect();
+    let rest: String = chars.collect();
+    Line::from(vec![Span::styled(tag, style), Span::raw(rest)])
 }
 
 /// How an entry looks.
@@ -1533,6 +1616,33 @@ mod tests {
         assert!(footer.contains("Enter send"), "{footer}");
         assert!(footer.contains("^C quit"), "{footer}");
         assert!(footer.contains("Home/End"), "{footer}");
+    }
+
+    #[test]
+    fn test_the_mouse_can_be_handed_back_to_the_terminal() {
+        let mut app = app_with(Vec::new());
+        assert!(app.mouse, "the window holds the mouse to begin with");
+
+        // A captured mouse is the window's, so the terminal never sees a drag
+        // and cannot select. `.mouse` (and `^S`) hands it back, and says so in
+        // the log.
+        assert!(app.window_command(".mouse"));
+        assert!(!app.mouse);
+        let said = app.entries.last().expect("a notice").text();
+        assert!(said.contains("mouse released"), "{said}");
+
+        // The footer keeps saying it too: it is a mode to remember, because the
+        // gestures that worked a moment ago no longer do anything.
+        let rows = render(&app, 60, 5);
+        assert!(rows.last().unwrap().contains("mouse released"), "{rows:?}");
+
+        // And back again.
+        assert!(app.window_command(".mouse"));
+        assert!(app.mouse);
+        let said = app.entries.last().expect("a notice").text();
+        assert!(said.contains("mouse captured"), "{said}");
+        let rows = render(&app, 60, 5);
+        assert!(!rows.last().unwrap().contains("mouse released"), "{rows:?}");
     }
 
     #[test]
@@ -2308,5 +2418,66 @@ mod tests {
                 "{level:?} shares a colour with the messages"
             );
         }
+    }
+
+    #[test]
+    fn test_only_the_level_tag_of_a_log_line_is_coloured() {
+        let entry = Entry::Log {
+            level: LogLevel::Info,
+            text: "API server listening".to_string(),
+        };
+        let style = entry_style(&entry, 0);
+
+        // The tag `entry_text` wrote, then the line itself, plain.
+        let line = entry_line(
+            &entry,
+            "INFO  API server listening".to_string(),
+            true,
+            style,
+        );
+        assert_eq!(line.spans.len(), 2, "{line:?}");
+        assert_eq!(line.spans[0].content.as_ref(), "INFO  ");
+        assert_eq!(line.spans[0].style.fg, Some(Color::Green));
+        assert_eq!(line.spans[1].content.as_ref(), "API server listening");
+        assert_eq!(line.spans[1].style, Style::default(), "plain on purpose");
+
+        // A wrapped continuation has no tag left to colour.
+        let more = entry_line(&entry, "and more".to_string(), false, style);
+        assert_eq!(more.spans.len(), 1);
+        assert_eq!(more.spans[0].style, Style::default());
+
+        // A message is styled whole: its colour is the only thing marking it.
+        let message = Entry::Push(serde_json::json!({"method": "a"}));
+        let line = entry_line(
+            &message,
+            "< method: a".to_string(),
+            true,
+            entry_style(&message, 0),
+        );
+        assert_eq!(line.spans.len(), 1);
+        assert_eq!(line.spans[0].style.fg, Some(MESSAGE_COLORS[0]));
+    }
+
+    #[test]
+    fn test_the_rendered_log_line_leaves_the_message_plain() {
+        let app = app_with(vec![Entry::Log {
+            level: LogLevel::Info,
+            text: "hello".to_string(),
+        }]);
+        let mut terminal = Terminal::new(TestBackend::new(40, 6)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let buffer = terminal.backend().buffer();
+
+        // A short log sits at the top of its pane: header row, then the log.
+        let row = 1;
+        assert_eq!(buffer[(0, row)].symbol(), "I");
+        assert_eq!(buffer[(0, row)].fg, Color::Green, "the tag is coloured");
+        assert_eq!(buffer[(4, row)].fg, Color::Green, "...all of it");
+        assert_eq!(buffer[(6, row)].symbol(), "h", "the message starts here");
+        assert_eq!(
+            buffer[(6, row)].fg,
+            Color::Reset,
+            "and the message itself is not"
+        );
     }
 }

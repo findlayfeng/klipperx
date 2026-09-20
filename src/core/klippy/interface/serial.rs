@@ -49,6 +49,11 @@ pub struct SerialDevice {
 }
 
 impl SerialDevice {
+    /// Returns a short identifier for logging: `"/dev/ttyACM0"`.
+    fn id(&self) -> String {
+        self.path.display().to_string()
+    }
+
     /// Open `path` at `baud` and put the line into raw mode.
     ///
     /// # Errors
@@ -112,8 +117,8 @@ impl Device for SerialDevice {
 
         let bytes = frame.raw_bytes();
         trace!(
-            "tx frame to {}: {}",
-            self.path.display(),
+            "tx frame [{}]: {}",
+            self.id(),
             bytes
                 .iter()
                 .map(|b| format!("{b:02x}"))
@@ -146,8 +151,8 @@ impl Device for SerialDevice {
                 Ok(0) => continue, // timeout: no bytes were waiting
                 Ok(read) => {
                     trace!(
-                        "rx from {}: {}",
-                        self.path.display(),
+                        "rx frame [{}]: {}",
+                        self.id(),
                         buf[..read]
                             .iter()
                             .map(|b| format!("{b:02x}"))

@@ -235,6 +235,15 @@ pub struct CanSerialDevice {
 }
 
 impl CanSerialDevice {
+    /// Returns a short identifier for logging: `"can0:0x300"`.
+    fn id(&self) -> String {
+        format!(
+            "{}:{:#x}",
+            self.interface,
+            self.link.lock().unwrap().tx_id()
+        )
+    }
+
     /// Open `interface` and bring the MCU `uuid` up as node `nodeid`.
     ///
     /// The node id lives in the host, not in the MCU: this sends Klipper's admin
@@ -314,7 +323,8 @@ impl Device for CanSerialDevice {
         // them, so a full bus costs latency rather than a lost frame.
         let bytes = frame.raw_bytes();
         trace!(
-            "tx frame: {}",
+            "tx frame [{}]: {}",
+            self.id(),
             bytes
                 .iter()
                 .map(|b| format!("{b:02x}"))
@@ -358,7 +368,8 @@ impl Device for CanSerialDevice {
                     let can_frame = CanFrame::from_abi(&raw);
                     if self.link.lock().unwrap().accept(&can_frame) {
                         trace!(
-                            "rx can frame: {}",
+                            "rx frame [{}]: {}",
+                            self.id(),
                             can_frame
                                 .data()
                                 .iter()

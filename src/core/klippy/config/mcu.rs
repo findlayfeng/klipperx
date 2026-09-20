@@ -1,4 +1,5 @@
 use super::section::ConfigSection;
+use crate::core::klippy::interface::usb::UsbPowerMethod;
 use crate::core::klippy::interface::{Interface, SerialDevice};
 use crate::core::klippy::mcu::McuRestartMethod;
 use std::sync::Arc;
@@ -22,6 +23,11 @@ pub struct McuConfig {
     pub restart_method: McuRestartMethod,
     /// What to open, described but not opened.
     pub transport: Transport,
+    /// Which mechanism `rpi_usb` uses to switch the port's power.
+    ///
+    /// Only meaningful with `restart_method: rpi_usb`; see
+    /// [`UsbPowerMethod`] and `interface/usb.rs`.
+    pub usb_power: UsbPowerMethod,
 }
 
 /// The transport a section asks for, described before anything is opened.
@@ -129,12 +135,43 @@ impl McuConfig {
         }
         let restart_method = Self::parse_restart_method(section, serial)?;
         info!("MCU '{name}' restart method: {}", restart_method.as_str());
+        let usb_power = Self::parse_usb_power(section, &restart_method)?;
 
         Ok(Self {
             name,
             restart_method,
             transport,
+            usb_power,
         })
+    }
+
+    /// Resolve the `usb_power` option: which mechanism `rpi_usb` uses.
+    ///
+    /// Only meaningful with `restart_method: rpi_usb`; a value given for another
+    /// method is reported and ignored, the way `restart_method` itself is off a
+    /// serial MCU.
+    fn parse_usb_power(
+        section: &ConfigSection,
+        restart_method: &McuRestartMethod,
+    ) -> Result<UsbPowerMethod, String> {
+        let Some(text) = section.get_str("usb_power") else {
+            return Ok(UsbPowerMethod::default());
+        };
+        let method = UsbPowerMethod::parse(text).ok_or_else(|| {
+            format!(
+                "MCU '{}' has an invalid usb_power: '{text}' (expected one of {})",
+                section.identifier(),
+                UsbPowerMethod::CHOICES.join(", ")
+            )
+        })?;
+        if *restart_method != McuRestartMethod::RpiUsb {
+            warn!(
+                "MCU '{}' sets usb_power, which only applies to restart_method 'rpi_usb'; \
+                 ignored",
+                section.identifier()
+            );
+        }
+        Ok(method)
     }
 
     /// Open the transport this config describes.
@@ -262,7 +299,7 @@ impl McuConfig {
                         ))
                     }
                 },
-                None => crate::core::klippy::interface::serial::DEFAULT_BAUD,
+                None => crate::core::klippy::interface::devices::serial::DEFAULT_BAUD,
             };
             return Ok(Transport::Serial {
                 path: path.to_string(),
@@ -291,7 +328,7 @@ impl McuConfig {
     #[cfg(test)]
     fn test_device(
         test_value: &super::value::ConfigValue,
-    ) -> crate::core::klippy::interface::test::TestDevice {
+    ) -> crate::core::klippy::interface::devices::test::TestDevice {
         let mut mappings = Vec::new();
         for line in test_value.lines() {
             let trimmed = line.trim();
@@ -316,14 +353,16 @@ impl McuConfig {
                     .into_iter()
                     .map(|payload| super::super::frame::Frame::new(0, payload))
                     .collect();
-                mappings.push(crate::core::klippy::interface::test::MappingEntry {
-                    input: input_frame,
-                    outputs: output_frames,
-                });
+                mappings.push(
+                    crate::core::klippy::interface::devices::test::MappingEntry {
+                        input: input_frame,
+                        outputs: output_frames,
+                    },
+                );
             }
         }
 
-        crate::core::klippy::interface::test::TestDevice::new(mappings)
+        crate::core::klippy::interface::devices::test::TestDevice::new(mappings)
     }
 
     /// Decode a hex string to bytes (test helper).
@@ -477,6 +516,43 @@ mod tests {
         // meaningless there is not an error — it simply does not apply.
         let method = McuConfig::parse_restart_method(&section, false).unwrap();
         assert_eq!(method, McuRestartMethod::Command);
+    }
+
+    #[test]
+    fn test_usb_power_defaults_to_auto_and_is_validated() {
+        // Unset: `auto`.
+        let section = make_section(&["01 02"]);
+        assert_eq!(
+            McuConfig::parse_usb_power(&section, &McuRestartMethod::RpiUsb).unwrap(),
+            UsbPowerMethod::Auto
+        );
+
+        // A valid value is taken as written.
+        let with = |value: &str| {
+            let mut section = make_section(&["01 02"]);
+            section.parameters.insert(
+                "usb_power".to_string(),
+                ConfigValue::Single(value.to_string()),
+            );
+            section
+        };
+        assert_eq!(
+            McuConfig::parse_usb_power(&with("sysfs"), &McuRestartMethod::RpiUsb).unwrap(),
+            UsbPowerMethod::Sysfs
+        );
+
+        // A typo is a config error, not a silent default.
+        let err =
+            McuConfig::parse_usb_power(&with("bogus"), &McuRestartMethod::RpiUsb).unwrap_err();
+        assert!(err.contains("usb_power"), "{err}");
+        assert!(err.contains("bogus"), "{err}");
+
+        // With another restart method the option has no effect; it is reported
+        // and ignored rather than refused.
+        assert_eq!(
+            McuConfig::parse_usb_power(&with("sysfs"), &McuRestartMethod::Arduino).unwrap(),
+            UsbPowerMethod::Sysfs
+        );
     }
 
     #[test]

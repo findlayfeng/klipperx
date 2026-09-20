@@ -31,9 +31,9 @@
 //! the printer's wiring rather than this implementation, and a Klipper config
 //! should keep working.
 
-use super::error::InterfaceError;
-use super::{describe_frame, Device};
 use crate::core::klippy::frame::{Frame, FrameStream};
+use crate::core::klippy::interface::error::InterfaceError;
+use crate::core::klippy::interface::{describe_frame, Device};
 use std::ffi::CString;
 use std::fmt;
 use std::fs::File;
@@ -144,12 +144,15 @@ impl CanFrame {
 /// One CAN frame as the bus carries it: its arbitration id, then its eight data
 /// bytes — a *slice* of a message block rather than a block of its own.
 ///
-/// The block is described with [`describe_frame`](super::describe_frame) once its
+/// The block is described with [`describe_frame`](crate::core::klippy::interface::describe_frame) once its
 /// slices are together again; this is the other half of the story, and the two
 /// are logged separately because they are different things. A block small enough
 /// to fit one CAN frame still gets both lines.
 fn describe_can_frame(id: u32, data: &[u8]) -> String {
-    format!("id {id:#x} data {}", super::hex_runs(data))
+    format!(
+        "id {id:#x} data {}",
+        crate::core::klippy::interface::hex_runs(data)
+    )
 }
 
 /// The admin frame that assigns `nodeid` to the MCU with `uuid`: the command byte,

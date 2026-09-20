@@ -51,11 +51,11 @@
 //! threads it spawns must be joined before the library is unloaded — hence the
 //! explicit teardown in [`Drop`].
 
-use super::error::InterfaceError;
-use super::{describe_frame, Device};
 use crate::core::klippy::frame::Frame;
 #[cfg(test)]
 use crate::core::klippy::frame::FrameStream;
+use crate::core::klippy::interface::error::InterfaceError;
+use crate::core::klippy::interface::{describe_frame, Device};
 use crossbeam_channel::{unbounded, Receiver};
 use libloading::Library;
 use std::fmt;
@@ -185,7 +185,7 @@ impl Drop for Claim {
 
 /// A [`Device`] backed by klipper's host library.
 ///
-/// [`Device`]: super::Device
+/// [`Device`]: crate::core::klippy::interface::Device
 pub struct HostDevice {
     /// Held for the lifetime of the device, so a second one is refused.
     _claim: Claim,

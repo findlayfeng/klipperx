@@ -732,7 +732,7 @@ impl Drop for Mcu {
 impl Mcu {
     /// Build a transport over a bare interface, without a config.
     ///
-    /// Tests talk to a [`TestDevice`](crate::core::klippy::interface::test::TestDevice)
+    /// Tests talk to a [`TestDevice`](crate::core::klippy::interface::devices::test::TestDevice)
     /// rather than a real `McuConfig`, and most of them never identify.
     pub(crate) fn for_test(name: impl Into<String>, interface: Interface) -> Self {
         Self::from_parts(name.into(), interface)
@@ -746,7 +746,7 @@ impl Mcu {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::klippy::interface::test::{MappingEntry, TestDevice};
+    use crate::core::klippy::interface::devices::test::{MappingEntry, TestDevice};
     use crate::core::klippy::interface::Interface;
 
     fn make_frame(seq: u8, payload: &[u8]) -> Frame {

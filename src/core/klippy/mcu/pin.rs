@@ -331,7 +331,7 @@ fn pin_number(mcu: &Mcu, name: &str, chip_name: &str) -> Result<u32, PinError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::klippy::interface::test::TestDevice;
+    use crate::core::klippy::interface::devices::test::TestDevice;
     use crate::core::klippy::interface::Interface;
     use crate::core::klippy::mcu::Dictionary;
     use serde_json::json;

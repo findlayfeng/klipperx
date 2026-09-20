@@ -120,7 +120,7 @@ impl ClockSync for McuClock {
 mod tests {
     use super::*;
     use crate::core::klippy::frame::Frame;
-    use crate::core::klippy::interface::test::{MappingEntry, TestDevice};
+    use crate::core::klippy::interface::devices::test::{MappingEntry, TestDevice};
     use crate::core::klippy::interface::Interface;
     use crate::core::klippy::mcu::Dictionary;
     use crate::core::klippy::msg::proto::Payload;

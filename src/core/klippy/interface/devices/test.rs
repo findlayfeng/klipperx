@@ -1,7 +1,7 @@
-use super::error::InterfaceError;
 use crate::core::klippy::frame::Frame;
+use crate::core::klippy::interface::error::InterfaceError;
 
-use super::Device;
+use crate::core::klippy::interface::Device;
 use crossbeam_channel::{bounded, Receiver, Sender};
 use std::{
     collections::VecDeque,
@@ -69,7 +69,7 @@ impl TestDevice {
     /// A handle that lists every frame this device accepts, in order.
     ///
     /// Take it before the device is moved into an
-    /// [`Interface`](super::Interface); the handle shares state with the device.
+    /// [`Interface`](crate::core::klippy::interface::Interface); the handle shares state with the device.
     pub fn recorder(&self) -> FrameRecorder {
         self.recorded.clone()
     }

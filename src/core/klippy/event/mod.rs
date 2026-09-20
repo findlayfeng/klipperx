@@ -129,7 +129,7 @@ mod tests {
     use super::*;
     use crate::core::klippy::cmd::uptime::GetUptime;
     use crate::core::klippy::event::test_support::{frame, mcu};
-    use crate::core::klippy::interface::test::TestDevice;
+    use crate::core::klippy::interface::devices::test::TestDevice;
     use crate::core::klippy::interface::Interface;
     use crate::core::klippy::msg::proto::ArgValue;
     use tokio::sync::mpsc;
@@ -139,18 +139,20 @@ mod tests {
     async fn test_bound_handler_receives_the_event() {
         // A `stats` report is unsolicited on the wire; the test device emits one
         // in reply to an unrelated command so there is a frame to receive.
-        let mappings = vec![crate::core::klippy::interface::test::MappingEntry {
-            input: frame(0, &[ArgValue::UInt8(4)]),
-            outputs: vec![frame(
-                0,
-                &[
-                    ArgValue::UInt8(12),
-                    ArgValue::UInt32(5),
-                    ArgValue::UInt32(100),
-                    ArgValue::UInt32(2500),
-                ],
-            )],
-        }];
+        let mappings = vec![
+            crate::core::klippy::interface::devices::test::MappingEntry {
+                input: frame(0, &[ArgValue::UInt8(4)]),
+                outputs: vec![frame(
+                    0,
+                    &[
+                        ArgValue::UInt8(12),
+                        ArgValue::UInt32(5),
+                        ArgValue::UInt32(100),
+                        ArgValue::UInt32(2500),
+                    ],
+                )],
+            },
+        ];
         let mcu = mcu(mappings);
         let (tx, mut rx) = mpsc::unbounded_channel();
         mcu.bind_event::<Stats, _>(move |stats| {

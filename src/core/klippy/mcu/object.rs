@@ -217,6 +217,10 @@ impl PrinterObject for McuObject {
             // same moment (`klippy/mcu.py:1147`). Opening a serial port or
             // dlopen-ing the host library blocks, briefly, on this task.
             let config = McuConfig::new(&self.section).map_err(KlippyError::Internal)?;
+            // Check at startup, not at the first restart, that an `rpi_usb` reset
+            // will be able to switch this port's power (and say which udev rule
+            // to install if it will not).
+            super::restart::check_usb_power(&config);
             // A `firmware_restart` is the one bring-up that resets the firmware
             // itself, and it has to happen while the transport is still closed.
             if self.is_firmware_restart() {
@@ -312,7 +316,7 @@ pub fn load_config_prefix(
 mod tests {
     use super::*;
     use crate::core::klippy::frame::Frame;
-    use crate::core::klippy::interface::test::{MappingEntry, TestDevice};
+    use crate::core::klippy::interface::devices::test::{MappingEntry, TestDevice};
     use crate::core::klippy::interface::Interface;
     use crate::core::klippy::msg::proto::Payload;
     use crate::core::klippy::printer::PrinterState;

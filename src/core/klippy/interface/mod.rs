@@ -1,19 +1,15 @@
-pub mod canserial;
+pub mod devices;
 pub mod error;
-pub mod host;
 #[cfg(test)]
 pub(crate) mod pty;
-pub mod serial;
-#[cfg(test)]
-pub mod test;
 pub mod usb;
 
-pub use canserial::CanSerialDevice;
-pub use error::InterfaceError;
-pub use host::HostDevice;
-pub use serial::SerialDevice;
+pub use devices::canserial::CanSerialDevice;
+pub use devices::host::HostDevice;
+pub use devices::serial::SerialDevice;
 #[cfg(test)]
-pub use test::{MappingEntry, TestDevice};
+pub use devices::test::{MappingEntry, TestDevice};
+pub use error::InterfaceError;
 
 use super::frame::{Frame, MESSAGE_HEADER_SIZE, MESSAGE_MAX, MESSAGE_MIN, MESSAGE_TRAILER_SIZE};
 use std::path::Path;
@@ -291,7 +287,7 @@ mod trace_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::klippy::interface::test::TestDevice;
+    use crate::core::klippy::interface::devices::test::TestDevice;
 
     fn make_frame(seq: u8, payload: &[u8]) -> Frame {
         Frame::new(seq, payload.to_vec())

@@ -9,9 +9,10 @@ pub struct McuConfig {
     pub name: String,
     /// MCU restart method.
     ///
-    /// Parsed and stored, but **not consumed yet** — restarting the firmware is a
-    /// planned feature (see [`McuRestartMethod`]). Kept so a config that sets
-    /// `restart_method` parses the same way it will once the restart path exists.
+    /// Resolved to the effective method: `command` for a non-serial MCU, the
+    /// config's own value (default `arduino`) for a serial one. The physical
+    /// restart is still pending — only `command` has a path today, through
+    /// `config_reset` ([`McuRestartMethod`]).
     pub restart_method: McuRestartMethod,
     /// MCU interface for communication
     pub interface: Interface,
@@ -82,8 +83,13 @@ impl McuConfig {
     /// section names no interface, names several, or names one that cannot be
     /// brought up.
     pub fn new(section: &ConfigSection) -> Result<Self, String> {
-        let (name, restart_method) = Self::parse_common(section);
+        // Upstream names an MCU by its config section with the `mcu ` prefix
+        // stripped (`klippy/mcu.py:1151-1153`): the main `[mcu]` is "mcu", and
+        // `[mcu zboard]` is "zboard". Not an empty string for the main one.
+        let name = section.sub.clone().unwrap_or_else(|| section.id.clone());
         let interface = Self::create_interface(section)?;
+        let restart_method =
+            Self::parse_restart_method(section, matches!(interface, Interface::Serial(_)))?;
 
         Ok(Self {
             name,
@@ -92,23 +98,32 @@ impl McuConfig {
         })
     }
 
-    /// Parse common MCU configuration fields.
+    /// Resolve `restart_method` for an MCU whose transport is (or is not) serial.
     ///
-    /// `restart_method` defaults to [`McuRestartMethod::Arduino`] (Klipper's
-    /// default). The value is deliberately parsed even though nothing reads it
-    /// yet: see the field documentation on [`McuConfig::restart_method`].
-    fn parse_common(section: &ConfigSection) -> (String, McuRestartMethod) {
-        // Upstream names an MCU by its config section with the `mcu ` prefix
-        // stripped (`klippy/mcu.py:1151-1153`): the main `[mcu]` is "mcu", and
-        // `[mcu zboard]` is "zboard". Not an empty string for the main one.
-        let name = section.sub.clone().unwrap_or_else(|| section.id.clone());
-
-        let restart_method = section
-            .get_str("restart_method")
-            .and_then(McuRestartMethod::parse)
-            .unwrap_or(McuRestartMethod::Arduino);
-
-        (name, restart_method)
+    /// Upstream reads the option **only** when the MCU is on a serial port
+    /// (`klippy/mcu.py:668-671`); every other transport resets with `command`.
+    /// An unknown value is a config error rather than silently becoming the
+    /// default — upstream's `getchoice` refuses it too (`:666-671`).
+    ///
+    /// The `serial` flag is a parameter rather than a look at the interface so
+    /// the rule can be exercised without a real serial port.
+    fn parse_restart_method(
+        section: &ConfigSection,
+        serial: bool,
+    ) -> Result<McuRestartMethod, String> {
+        if !serial {
+            return Ok(McuRestartMethod::Command);
+        }
+        match section.get_str("restart_method") {
+            None => Ok(McuRestartMethod::Arduino),
+            Some(text) => McuRestartMethod::parse(text).ok_or_else(|| {
+                format!(
+                    "MCU '{}' has an invalid restart_method: '{text}' (expected one of {})",
+                    section.identifier(),
+                    McuRestartMethod::CHOICES.join(", ")
+                )
+            }),
+        }
     }
 
     /// Create the interface the section asks for.
@@ -295,7 +310,9 @@ mod tests {
         assert!(result.is_ok());
         let config = result.unwrap();
         assert_eq!(config.name, "mcu");
-        assert_eq!(config.restart_method, McuRestartMethod::Arduino);
+        // A `test:` MCU is not serial, so it resets with `command` like every
+        // non-serial transport.
+        assert_eq!(config.restart_method, McuRestartMethod::Command);
     }
 
     #[test]
@@ -314,9 +331,43 @@ mod tests {
             "restart_method".to_string(),
             ConfigValue::Single("rpi_usb".to_string()),
         );
-        let result = McuConfig::new(&section);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap().restart_method, McuRestartMethod::RpiUsb);
+        // A serial MCU reads the option; the value is taken as written.
+        let method = McuConfig::parse_restart_method(&section, true).unwrap();
+        assert_eq!(method, McuRestartMethod::RpiUsb);
+    }
+
+    #[test]
+    fn test_a_serial_mcu_defaults_to_arduino() {
+        let section = make_section(&["01 02"]);
+        let method = McuConfig::parse_restart_method(&section, true).unwrap();
+        assert_eq!(method, McuRestartMethod::Arduino);
+    }
+
+    #[test]
+    fn test_an_unknown_restart_method_is_a_config_error() {
+        let mut section = make_section(&["01 02"]);
+        section.parameters.insert(
+            "restart_method".to_string(),
+            ConfigValue::Single("bogus".to_string()),
+        );
+        let err = McuConfig::parse_restart_method(&section, true).unwrap_err();
+        assert!(err.contains("restart_method"), "{err}");
+        assert!(err.contains("bogus"), "{err}");
+        // The error names the valid choices, so the config can be fixed.
+        assert!(err.contains("cheetah"), "{err}");
+    }
+
+    #[test]
+    fn test_a_non_serial_mcu_resets_with_command_and_ignores_the_option() {
+        let mut section = make_section(&["01 02"]);
+        section.parameters.insert(
+            "restart_method".to_string(),
+            ConfigValue::Single("cheetah".to_string()),
+        );
+        // Upstream does not read the option off serial, so a value that is
+        // meaningless there is not an error — it simply does not apply.
+        let method = McuConfig::parse_restart_method(&section, false).unwrap();
+        assert_eq!(method, McuRestartMethod::Command);
     }
 
     #[test]

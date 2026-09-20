@@ -34,6 +34,7 @@
 | G2b | 用 GCODE 控制 GPIO：`SET_PIN` 时序（数字与 PWM 均已可驱动） | C1 |
 | G1b | gcode 调度器与上游的行为差异（ack / cmd_default / ECHO / mux 缺省…） | Q2、C1 |
 | G4 | 运动命令（G0/G1/G28…） | G1、C1 |
+| S1 | 压力测试工具（`klipperx stress`）剩余：stepper 资源、别名解析、端到端测试 | C1 |
 | A2 | 错误词汇（`CommandError` / `ConfigError`） | — |
 | B2 | MCU 剩余：`emergency_stop` 对象/端点、`last_stats`、错误载荷、本地 shutdown 标志、`command` 的固件 `reset` | — |
 | B4 | 其余端点（estop / remote method / pause_resume / …） | G3 等 |
@@ -71,6 +72,29 @@
 - [ ] **`output_pin` 的其余上游选项**：`scale`（PWM 用，`output_pin.py:207-214`）、
       `TEMPLATE` + `template_evaluator`（display 模板，`output_pin.py:88-170`）——与开关
       GPIO 本身无关，按需再补。
+
+### S1 压力测试工具（`klipperx stress`）剩余
+
+**是什么**：`klipperx stress <config> <mcu>` 给一块 MCU 逐步加大步进负载（`queue_step`）到它
+`shutdown`（`Timer too close` / `Move queue overflow`）。负载选的是上游步进引擎
+（`src/stepper.c`）；设计、分段与失败形态见 `docs/klippy/developer-manual/stress.md`。
+
+**已做**：连接 / identify、从 `[stepper_*]` 借 step/dir 引脚并解析（`PA0` / `mcu:PA0` / 尾随
+`!`）、用 `ConfigBuilder` 配置一个压力 stepper（**无 `config_reset` 的固件走 `reset` + 重连 +
+重试握手**）、按 `STAGE_RATES` 分段加压、检测 `is_shutdown` 并报出原因（绑 `shutdown` /
+`is_shutdown` 的 `static_string_id`）；`cmd/stepper.rs` 补了 typed 命令（`config_stepper` /
+`queue_step` / `reset_step_clock` / `set_next_step_dir` / `stepper_get_position`）。
+
+**真板实测**：STM32F103（72 MHz）上 `--rate-step 1.1` 得到 339 623 步/秒存活、375 000 步/秒
+shutdown（`Stepper too far in past`），即真值在 339 623 – 375 000 之间。
+
+- [ ] **stepper 资源（C1）**：工具的 `invert_step` / `step_pulse_ticks` 硬编码为 0，也没读
+      `[stepper_*]` 的 `microsteps` / `enable_pin`；真正的 stepper 资源随 C1 做，之后压力工具
+      改成复用它。
+- [ ] **`[board_pins]` 别名**：现在只解析引脚名本身，别名未展开（`pins.rs` 已有解析器）。
+- [ ] **端到端测试**：可照 `identify` 的 `chunked_mappings` 脚本化 identify + config +
+      `queue_step`，用 `TestDevice` 覆盖一次加压（及 `ResetRequired` 路径）。目前只测了段计算、
+      引脚解析与命令编码。
 
 ### A2 错误词汇
 

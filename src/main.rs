@@ -107,6 +107,14 @@ enum Commands {
     // instruction — connect to the shared API path and open a window. `api`
     // keeps the attribute because it is genuinely missing its method.
     Console(client::ConsoleArgs),
+
+    /// Stress-test one MCU's step generation until it errors
+    //
+    // A bench tool, not part of the host: it takes the named MCU over and ramps
+    // `queue_step` load until the firmware shuts down. `arg_required_else_help`
+    // because both the config file and the MCU name are required.
+    #[command(arg_required_else_help = true)]
+    Stress(klipperx::stress::StressArgs),
 }
 
 fn main() {
@@ -118,6 +126,7 @@ fn main() {
         (Some(Commands::Klippy(args)), _) => run_host(args),
         (Some(Commands::Api(args)), _) => client::run_api(args),
         (Some(Commands::Console(args)), _) => client::run_console(args),
+        (Some(Commands::Stress(args)), _) => klipperx::stress::run(args),
         // No subcommand: the arguments were the host's all along.
         (None, host) => run_host(host),
     };

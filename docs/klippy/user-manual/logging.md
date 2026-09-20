@@ -143,6 +143,14 @@ send set_pin oid=3 value=1
 recv identify_response offset=0 data=b"x\x9c\x01\xff"
 ```
 
+一问一答（`call`）的发出那行还会写出在等哪条应答，所以一轮往返在日志里就是两行 ——
+一条 `send`、一条 `recv`，不另起一行说「在等什么」：
+
+```text
+send identify offset=0 count=40 (waiting for identify_response)
+recv identify_response offset=0 data=b"x\x9c\x01\xff"
+```
+
 值的写法（与 Klipper 的 `MessageFormat.format_params` 一致）：整数十进制，
 动态字符串（`%s` / `%*s` / `%.*s`）**加引号并转义**，字节用 `b"…"`、不可打印的
 字节写作 `\xNN`。所以带空格或换行的值不会跟前后文粘在一起，能直接读回去。

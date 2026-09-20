@@ -31,6 +31,8 @@
 
 | # | 事项 | 依赖 |
 |---|---|---|
+| G2b | 用 GCODE 控制 GPIO：`SET_PIN` 时序与 PWM（数字开关已通） | C1、F4 |
+| F4 | PWM（硬件 / 软件） | F1、F2 |
 | G1b | gcode 调度器与上游的行为差异（ack / cmd_default / ECHO / mux 缺省…） | Q2、C1 |
 | G4 | 运动命令（G0/G1/G28…） | G1、C1 |
 | A1b | reactor 串行调度器与延迟度量 | A1 |
@@ -38,7 +40,6 @@
 | B2 | MCU 剩余：`emergency_stop` 对象/端点、`last_stats`、`restart_method` 校验 | — |
 | B4 | 其余端点（estop / remote method / pause_resume / …） | G3 等 |
 | F3 | `MCU_bus_digital_out`（命令队列/运动同步输出） | C1 |
-| F4 | PWM（硬件 / 软件） | F1、F2 |
 | F5 | ADC | F1、F2 |
 | F6 | SPI 总线 | F1、F2 |
 | F7 | I2C 总线 | F1、F2 |
@@ -51,6 +52,34 @@
 | D3 | `command` 接管一块**还在跑**的板子（序号对齐已做；剩 RTO 定时重传、`reset` 命令） | — |
 | E1 | 文档 | — |
 | E2 | `python_path` 的取消 | 外部项目 |
+
+### G2b 用 GCODE 控制 GPIO（现状与剩余）
+
+**现状：数字开关这条链已经通了，不需要新实现。** `[output_pin <name>]`
+（`extras/output_pin.rs`）读 `pin` / `value` / `shutdown_value`，经
+`PrinterPins::setup_digital_out`（`pins.rs`）建出 `McuDigitalOut`，在配置阶段发
+`config_digital_out`（`mcu/pin.rs`、`cmd/gpio.rs`），并注册 mux 命令
+`SET_PIN PIN=<name> VALUE=<0..1>`；运行时走 `update_digital_out` 立即改电平，`>=0.5` 为开、
+`!` 前缀翻转（`mcu/pin.rs:207-248`）。单测覆盖 `output_pin` 8 条 + `mcu/pin` 的
+build/编码，真设备路径未上硬件验证。
+
+所以「用 GCODE 控制一个 GPIO」缺的不是数字开关本身，而是下面这些（也是本节的待办）：
+
+- [ ] **真板端到端验证**：`config.cfg` 加一段 `[output_pin <name>]` + `pin: <PAx>`，用
+      `SET_PIN PIN=<name> VALUE=1` 点亮、`VALUE=0` 熄灭，确认 `config_digital_out` 的
+      oid/初始电平与 `update_digital_out` 都真的上了线（现有测试都在假 chip / 假设备上）。
+- [ ] **模拟量（亮度 / 转速）：等 F4 PWM**。`output_pin` 现在对 `pwm: true` 直接报配置错
+      （`output_pin.rs` 的 `new`）。要跟上游一样，需要 F4 把 `pwm` 的 pin stack 打通
+      （硬件 `config_pwm_out` / 软件 `set_digital_out_pwm_cycle`），`output_pin` 再改用
+      `setup_pin('pwm', …)` + `set_pwm(print_time, value)`（`klippy/extras/output_pin.py:178-247`）。
+- [ ] **与运动 / 打印时间同步的 `SET_PIN`**（上游 `GCodeRequestQueue`，
+      `klippy/extras/output_pin.py:13-85` `:249-269`）：上游把请求排进 toolhead 的
+      lookahead、在 print time 生效，并对移动中的 pin 变化与 MCU 最小调度间隔做对齐；
+      我们没有 toolhead / print time，只能立即 `update_digital_out`（`output_pin.rs` 头注释）。
+      随 **C1**；对一个独立 GPIO 不紧急，但打印中改 pin 不会与 move 同步。
+- [ ] **`output_pin` 的其余上游选项**：`scale`（PWM 用，`output_pin.py:207-214`）、
+      `TEMPLATE` + `template_evaluator`（display 模板，`output_pin.py:88-170`）——与开关
+      GPIO 本身无关，按需再补。
 
 ### A1b reactor 的串行调度器与延迟度量
 
@@ -595,7 +624,8 @@ open + identify，同样要接上一块没被复位的固件。
       命令级错误用 `ApiError::CommandError`，不关停 klippy（`api/endpoints/gcode.rs`）。
 - **`output_pin` 与 `SET_PIN`（G2）**：`[output_pin <name>]` 用 `setup_digital_out` 建数字
       输出并注册 `SET_PIN PIN=… VALUE=…`；无条件 `setup_max_duration(0)`（`extras/output_pin.rs`、
-      `load.rs`）。`pwm` 暂拒，`SET_PIN` 先立即生效。
+      `load.rs`）。`pwm` 暂拒，`SET_PIN` 先立即生效。数字开关这条链已通；与上游的剩余差异
+      （时序 / PWM）见 **G2b**。
 - **GCODE 调度器（G1）**：`GCodeDispatch` 的命令表 / `register_mux_command` / `run_script` /
       输出处理器 / 内置命令，`load_config` 里最先注册（`gcode.rs`）。与上游的剩余行为差异见
       **G1b**。
@@ -642,7 +672,7 @@ open + identify，同样要接上一块没被复位的固件。
 | `gcode/*` 端点 | `klippy/webhooks.py:438-452` |
 | gcode 调度器（命令表 / `run_script` / 输出） | `klippy/gcode.py:105-388` |
 | `GCodeIO`（伪 tty / 文件输入、`ack` 协议） | `klippy/gcode.py:390-494` |
-| `output_pin`（`SET_PIN` / `GCodeRequestQueue`） | `klippy/extras/output_pin.py` |
+| `output_pin`（`SET_PIN` / `GCodeRequestQueue` / 模板） | `klippy/extras/output_pin.py:13-269` |
 | section 校验用注册表 | `klippy/configfile.py:425-445` |
 | mcu 作为 printer object、它的 status | `klippy/mcu.py:1147-1170`、`:1235`、`:938-975` |
 | stats 累计与 shutdown 处理 | `klippy/mcu.py:801-802`、`:883`、`:912`、`:974-975` |

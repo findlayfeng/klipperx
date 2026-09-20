@@ -484,11 +484,11 @@ async fn handle_key(
         // own output would otherwise push everything else away.
         (KeyCode::PageUp, _) => app.scroll = app.scroll.saturating_add(10),
         (KeyCode::PageDown, _) => app.scroll = app.scroll.saturating_sub(10),
-        (KeyCode::Home, _) => app.scroll = 0,
-        (KeyCode::End, _) => {
+        (KeyCode::Home, _) => {
             let max_scroll = app.entries.len().saturating_sub(1);
             app.scroll = max_scroll;
         }
+        (KeyCode::End, _) => app.scroll = 0,
         (KeyCode::Up, true) => app.scroll = app.scroll.saturating_add(1),
         (KeyCode::Down, true) => app.scroll = app.scroll.saturating_sub(1),
         (code, _) => app.input.edit(code, ctrl),
@@ -627,7 +627,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         "leaving…".to_string()
     } else if app.scroll > 0 {
         format!(
-            "scrolled back {} lines · Home top · End bottom · PgDn return · ^C quit",
+            "scrolled back {} lines · End bottom · Home top · PgDn return · ^C quit",
             app.scroll
         )
     } else if app.gcode {

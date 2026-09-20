@@ -1,0 +1,31 @@
+#!/bin/sh
+#
+# Keep every commit rustfmt-clean.
+#
+# Runs `cargo fmt --all`, then restages the Rust files that were already staged,
+# so the commit carries the formatted code instead of failing after the fact.
+# Restaging is per whole file: a partially-staged .rs file loses its unstaged
+# half, so format before staging if that matters to you.
+#
+# Enable once per checkout:
+#     git config core.hooksPath .githooks
+set -e
+
+if ! command -v cargo >/dev/null 2>&1; then
+    echo "pre-commit: cargo not found; skipping rustfmt" >&2
+    exit 0
+fi
+
+cargo fmt --all
+
+git diff --cached --name-only --diff-filter=ACM -- '*.rs' |
+    while IFS= read -r file; do
+        [ -f "$file" ] && git add -- "$file"
+    done
+
+# Nothing unformatted may slip through: if rustfmt still has work, the tree was
+# not formattable (a syntax error, say), and the commit should not happen.
+if ! cargo fmt --all -- --check >/dev/null 2>&1; then
+    echo "pre-commit: rustfmt still reports changes; commit aborted" >&2
+    exit 1
+fi

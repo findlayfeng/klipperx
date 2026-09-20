@@ -340,16 +340,23 @@ DTR”隐式满足，但那是驱动副作用，不算实现。**
         上溯到 USB 设备，取父 hub 的 `busnum`/`devnum` 与端口号（`<hub>.<port>` / 根 hub 的
         `<bus>-<port>`）。纯 sysfs 读取、无需权限，**有单测**（假 sysfs 树）。不抄上游的
         `-h 0 -P 2`：端口从拓扑得出（将来可加一个配置项作覆盖）。
-      - **切电**（`usb.rs::set_port_power`）：`nusb`（**纯 Rust**，无 libusb）对 hub 发
-        `SET_FEATURE`/`CLEAR_FEATURE(PORT_POWER)`；`restart.rs` 里 `spawn_blocking` 跑，
+      - **切电**：两条路，`usb_power`（`auto`/`sysfs`/`libusb`）选。`sysfs` 写内核 ≥ 6.0 的
+        端口 `disable` 文件（用 glob `*port<N>` 兼容命名，ABI 文档的 `port<X>` 与 7.x 的
+        `<hub>-port<X>` 都认）；`libusb` 用 `nusb`（**纯 Rust**，无 libusb）对 hub 发
+        `SET_FEATURE`/`CLEAR_FEATURE(PORT_POWER)`。`restart.rs` 里 `spawn_blocking` 跑，
         中间夹 2 s（`USB_POWER_OFF`），再等 tty 回来（`USB_PORT_RETURN_TIMEOUT`，顺带满足
         上游 `check_restart_on_attach`）。
-      - **权限（用 udev，不用 sudo）**：打开 `/dev/bus/usb/...` 需 root，上游因此 `sudo`；
-        改为**限定到该 hub 的 udev 规则**（VID/PID 放行或 `TAG+="uaccess"`），误差文案会
-        提示。
-      - 同样是**未在真板测过**：执行前有 `warn_untested` 告警；`usb` 控制传输本身无自动化。
+      - **权限（用 udev，不用 sudo）**：两条路都要 root，上游因此 `sudo`；改为限定到该 hub 的
+        udev 规则。`scripts/klipperx-usb-udev.sh` 按串口设备从 sysfs 生成并安装它（`--install`
+        用 `sudo sh -c "cat > …"` 写 `/etc/udev/rules.d/` 再重载 udev）；
+        `usb::recommended_rules` 在告警里给同样两条。
+      - **上线探测**：`restart::check_usb_power` 在每次 connect 按 `usb_power` 探一次（含写权限），
+        两条都不可用就告警并附上该 hub 的规则，不必等第一次 `FIRMWARE_RESTART`。
+      - 同样是**未在真板测过**：执行前有 `warn_untested` 告警；两条路本身都无自动化。
       注：“上电复位前不许 configure”（`:696`）在我们的“先复位、再 open、再 configure”
       顺序下天然成立。
+      待真板确认：树莓派 5 的板载 hub 自称 per-port、实为 ganged，只切一个端口切不掉 VBUS，
+      需按实际硬件验证。
 - [ ] **CRC 不匹配仍走就地复位（有意偏离上游）**：上游发现已配置但 CRC 不一致时先
       `request_exit('firmware_restart')`（`check_restart_on_crc_mismatch`，
       `klippy/mcu.py:678-685`、`:1057-1059`），让重启循环做物理复位；我们用 `configure` 里的

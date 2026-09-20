@@ -132,26 +132,30 @@ CAN 专用的打印，原因见[内部架构](../developer-manual/architecture.m
 
 ### 命令日志
 
-`mcu` 层在 `DEBUG` 下把进出的每条命令连同参数打成一行，参数名取自固件字典
-（也就是报文格式串里的名字）：
+`mcu` 层在 `DEBUG` 下把进出的每条命令连同参数打成一行，用的就是**报文自己的定义
+格式**（`set_pin oid=%c value=%c`）——把类型占位符换成值，参数名与顺序都来自
+固件字典：
 
 ```text
 send get_clock oid=1
 recv clock clock=1234567
 send set_pin oid=3 value=1
+recv identify_response offset=0 data=b"x\x9c\x01\xff"
 ```
 
-值的写法：整数十进制、字符串原样、字节按 4 字节一组的十六进制（与帧日志同一套）。
+值的写法（与 Klipper 的 `MessageFormat.format_params` 一致）：整数十进制，
+动态字符串（`%s` / `%*s` / `%.*s`）**加引号并转义**，字节用 `b"…"`、不可打印的
+字节写作 `\xNN`。所以带空格或换行的值不会跟前后文粘在一起，能直接读回去。
 字典里没有的消息只打名字。只有 `DEBUG` 及以上才会查字典、拼字符串。
 
 ### 窗口里的级别前缀
 
-窗口（`--tui`）的日志面板只有 `DEBUG` / `INFO` / `WARN` / `ERROR` 四种前缀，
-**`TRACE` 归入 `DEBUG`**，所以帧字节那种 `TRACE` 行在窗口里前缀是 `DEBUG`。
-想拼一拼时看时间戳或模块名可以区分，但只看前缀区分不了。
+窗口（`--tui`）的日志面板用 `TRACE` / `DEBUG` / `INFO` / `WARN` / `ERROR` 五种
+前缀，宿主侧的 `TRACE` 现在是自己一档（不再归入 `DEBUG`），帧字节那种行前缀就是
+`TRACE`，并且用蓝色显示，与 `DEBUG` 的暗色区分开。
 
-还有一个容易踩的点：`--verbose` 把过滤器设成 `debug`，**TRACE 事件因此被过滤掉**，
-在窗口里看不到帧字节。要看帧字节用 `RUST_LOG`：
+有一个容易踩的点：`--verbose` 把过滤器设成 `debug`，**TRACE 事件因此被过滤掉**，
+在窗口里看不到帧字节。要看帧字节得用 `RUST_LOG`：
 
 ```bash
 RUST_LOG=klipperx=trace klipperx ~/printer.cfg --tui

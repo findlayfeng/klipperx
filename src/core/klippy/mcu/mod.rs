@@ -37,7 +37,7 @@ pub use restart_method::McuRestartMethod;
 use crate::core::klippy::config::mcu::McuConfig;
 use crate::core::klippy::frame::{Frame, MESSAGE_PAYLOAD_MAX};
 use crate::core::klippy::identify;
-use crate::core::klippy::interface::{hex_runs, Interface};
+use crate::core::klippy::interface::Interface;
 use crate::core::klippy::mcu::pending::PendingCalls;
 use crate::core::klippy::msg::error::MsgError;
 use crate::core::klippy::msg::parser::Parser;
@@ -96,12 +96,14 @@ impl std::fmt::Debug for Mcu {
     }
 }
 
-/// A command or response as a log line describes it: its name, then each
-/// parameter as `name=value`, in the dictionary's declaration order.
+/// A message as a log line renders it: the definition's own words with the type
+/// specifiers replaced by the values — `set_pin oid=3 value=1`.
 ///
-/// The names are the firmware's own — the dictionary's — which is the point:
-/// `offset=100` reads better than a tuple of values, and a parameter that is
-/// wrong, missing, or in the wrong place is obvious once it is named.
+/// This is Klipper's own debug format (`MessageFormat.format_params` in
+/// `klippy/msgproto.py`): the dictionary's parameter names, in declaration
+/// order, with the values spliced into the `name=%x` slots. Nothing has to be
+/// invented for the log to read well — the definition already says how the
+/// message is written.
 fn describe_message(msg: &Msg, values: &[ArgValue]) -> String {
     let mut text = msg.name.clone();
     for (index, value) in values.iter().enumerate() {
@@ -115,8 +117,13 @@ fn describe_message(msg: &Msg, values: &[ArgValue]) -> String {
     text
 }
 
-/// One parameter value, as a log line shows it: integers in decimal, a string as
-/// itself, bytes in hex — the same 4-byte runs the interface logs frames in.
+/// One parameter value, as the debug format shows it: integers in decimal, a
+/// string quoted and escaped, bytes as a byte-string literal.
+///
+/// A dynamic string — the `%s`/`%*s`/`%.*s` family — can hold anything,
+/// including a space or a newline, so it is quoted the way Klipper reprs it:
+/// otherwise a value would run into the format around it and the line could not
+/// be read back.
 fn describe_value(value: &ArgValue) -> String {
     match value {
         ArgValue::UInt8(v) => v.to_string(),
@@ -124,9 +131,49 @@ fn describe_value(value: &ArgValue) -> String {
         ArgValue::Int16(v) => v.to_string(),
         ArgValue::UInt32(v) => v.to_string(),
         ArgValue::Int32(v) => v.to_string(),
-        ArgValue::Str(v) => v.clone(),
-        ArgValue::Bytes(v) => hex_runs(v),
+        ArgValue::Str(v) => describe_str(v),
+        ArgValue::Bytes(v) => describe_bytes(v),
     }
+}
+
+/// A string in a form that can be read and written back: quoted, with the
+/// characters that would run into the format around it escaped.
+fn describe_str(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    for ch in text.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            ch if ch.is_control() => out.push_str(&format!("\\u{{{:x}}}", ch as u32)),
+            ch => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// The same for bytes, which need not be UTF-8: printable ASCII shows through,
+/// and everything else becomes `\xNN`.
+fn describe_bytes(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() + 3);
+    out.push_str("b\"");
+    for &byte in bytes {
+        match byte {
+            b'"' => out.push_str("\\\""),
+            b'\\' => out.push_str("\\\\"),
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            b'\t' => out.push_str("\\t"),
+            0x20..=0x7e => out.push(byte as char),
+            _ => out.push_str(&format!("\\x{byte:02x}")),
+        }
+    }
+    out.push('"');
+    out
 }
 
 impl Mcu {
@@ -864,14 +911,23 @@ mod tests {
 
     #[test]
     fn test_describe_message_names_the_parameters() {
-        // The names come from the message's format string, in declaration order.
+        // The shape is the definition's own: `test_resp val=%u data=%.*s` with
+        // the specifiers replaced by values, dynamic strings quoted.
         let response = Msg::parse(101, "test_resp val=%u data=%.*s").unwrap();
         assert_eq!(
             describe_message(
                 &response,
                 &[ArgValue::UInt32(7), ArgValue::Bytes(vec![0xaa, 0xbb])]
             ),
-            "test_resp val=7 data=aabb"
+            r#"test_resp val=7 data=b"\xaa\xbb""#
+        );
+
+        // A string is quoted, so a value with a space cannot run into the
+        // format around it.
+        let ping = Msg::parse(10, "debug_ping data=%*s").unwrap();
+        assert_eq!(
+            describe_message(&ping, &[ArgValue::Str("two words".into())]),
+            r#"debug_ping data="two words""#
         );
 
         // A message with no parameters is just its name.
@@ -886,12 +942,20 @@ mod tests {
         assert_eq!(describe_value(&ArgValue::Int16(-3)), "-3");
         assert_eq!(describe_value(&ArgValue::UInt32(4)), "4");
         assert_eq!(describe_value(&ArgValue::Int32(-5)), "-5");
-        assert_eq!(describe_value(&ArgValue::Str("abc".into())), "abc");
 
-        // Bytes are hex in the same 4-byte runs the interface uses for frames.
+        // Strings are quoted and escaped; non-ASCII text stays itself.
+        assert_eq!(describe_value(&ArgValue::Str("abc".into())), r#""abc""#);
+        assert_eq!(describe_value(&ArgValue::Str("a\nb".into())), r#""a\nb""#);
+        assert_eq!(describe_value(&ArgValue::Str("温度".into())), "\"温度\"");
+
+        // Bytes are the same idea, but every non-printable byte is escaped.
         assert_eq!(
-            describe_value(&ArgValue::Bytes(vec![1, 2, 3, 4, 5])),
-            "01020304 05"
+            describe_value(&ArgValue::Bytes(b"hi there".to_vec())),
+            r#"b"hi there""#
+        );
+        assert_eq!(
+            describe_value(&ArgValue::Bytes(vec![1, 2, 0xff])),
+            r#"b"\x01\x02\xff""#
         );
     }
 }

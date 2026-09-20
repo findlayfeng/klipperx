@@ -207,6 +207,7 @@ fn host_log(
 /// One host record, as the window's vocabulary has it.
 fn to_entry((level, text): logging::Record) -> Entry {
     let level = match level {
+        logging::Level::Trace => LogLevel::Trace,
         logging::Level::Debug => LogLevel::Debug,
         logging::Level::Info => LogLevel::Info,
         logging::Level::Warn => LogLevel::Warn,

@@ -34,6 +34,8 @@ use tracing_subscriber::EnvFilter;
 /// alone link a terminal library for one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Level {
+    /// Line-by-line detail: the bytes on the wire, and the like.
+    Trace,
     /// Development detail, shown with `--verbose`.
     Debug,
     /// Something happened.
@@ -145,7 +147,8 @@ where
         event.record(&mut message);
 
         let level = match *event.metadata().level() {
-            tracing::Level::TRACE | tracing::Level::DEBUG => Level::Debug,
+            tracing::Level::TRACE => Level::Trace,
+            tracing::Level::DEBUG => Level::Debug,
             tracing::Level::INFO => Level::Info,
             tracing::Level::WARN => Level::Warn,
             tracing::Level::ERROR => Level::Error,
@@ -216,6 +219,7 @@ mod tests {
             tracing::info!("Successfully parsed config with 1 sections");
             tracing::warn!("dropping malformed request");
             tracing::debug!("a detail");
+            tracing::trace!("tx frame: 0a11 | 01020304 05 | 31d87e");
             tracing::info!("API server listening on {}", "unix:/tmp/x");
         });
 
@@ -230,6 +234,7 @@ mod tests {
                 ),
                 (Level::Warn, "dropping malformed request".into()),
                 (Level::Debug, "a detail".into()),
+                (Level::Trace, "tx frame: 0a11 | 01020304 05 | 31d87e".into()),
                 (Level::Info, "API server listening on unix:/tmp/x".into()),
             ]
         );

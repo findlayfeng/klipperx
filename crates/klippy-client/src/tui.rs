@@ -27,12 +27,16 @@
 //!
 //! The log supports scrolling to review past output:
 //!
-//! - **Mouse wheel**: scroll up/down by 10 entries
-//! - **PgUp/PgDn**: scroll by 10 entries
-//! - **Home**: jump to top (oldest entries, scroll=0)
-//! - **End**: jump to bottom (newest entries, scroll=max)
-//! - When scrolled back, new entries do not auto-scroll the view — your place
-//!   is kept until you return to the bottom.
+//! - **Mouse wheel**: scroll up/down by 3 lines
+//! - **PgUp/PgDn**: scroll by a page
+//! - **Home**: jump to the top (oldest lines)
+//! - **End**: jump to the bottom (newest line)
+//! - When scrolled back, new entries do not move the view — your place is kept
+//!   until you return to the bottom.
+//!
+//! The unit is a rendered line, not a logged entry: a single entry wrapped over
+//! several rows can be read a line at a time, and one keystroke moves what the
+//! eye counts, not what the protocol happened to delimit.
 //!
 //! # Threads and tasks
 //!
@@ -52,6 +56,7 @@
 //! * The log keeps everything for the life of the session; a very chatty
 //!   subscription will grow it without bound.
 
+use std::cell::Cell;
 use std::io::IsTerminal as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -154,12 +159,15 @@ pub fn is_available() -> bool {
 struct App {
     entries: Vec<Entry>,
     input: Input,
-    /// Index of the first entry visible in the viewport (0 = top).
+    /// How many rendered lines the viewport is scrolled back from the bottom
+    /// (0 = the newest line). Counted in lines, not entries, so a wrapped entry
+    /// scrolls a row at a time.
     scroll: usize,
-    /// Whether the viewport is pinned (fixed) or follows the bottom.
-    /// When false (default), new entries push the viewport to the bottom.
-    /// When true, new entries are appended but the viewport stays put.
-    pinned: bool,
+    /// Height of the log pane as last drawn, so PgUp/PgDn move a real page.
+    viewport: Cell<usize>,
+    /// Width of the log pane as last drawn. A pinned view needs it to count the
+    /// lines a new entry adds below the viewport.
+    width: Cell<usize>,
     /// The connection's state, shown in the header.
     status: Status,
     /// Set by a local command that asked to leave.
@@ -205,7 +213,8 @@ impl App {
             entries: Vec::new(),
             input: Input::default(),
             scroll: 0,
-            pinned: false,
+            viewport: Cell::new(0),
+            width: Cell::new(0),
             status: Status::Unknown,
             quit: false,
             gcode: false,
@@ -243,19 +252,29 @@ impl App {
     }
 
     fn push(&mut self, entry: Entry) {
+        // A viewport scrolled back is anchored to the lines it is showing, not
+        // to the bottom: the new entry lands below it, so the offset grows by
+        // the lines that entry takes. At the bottom (`scroll == 0`) the view
+        // follows the new entry, which is what a log should do.
+        let added = if self.scroll > 0 {
+            self.lines_of(&entry)
+        } else {
+            0
+        };
         self.entries.push(entry);
         if self.entries.len() > LOG_LIMIT {
             self.entries.drain(..self.entries.len() - LOG_LIMIT);
         }
-        // If pinned, the viewport stays put. Otherwise follow the bottom.
-        if !self.pinned {
-            self.scroll = self.entries.len().saturating_sub(1);
-        }
-        // If scroll exceeds bounds, clamp it.
-        let max_scroll = self.entries.len().saturating_sub(1);
-        if self.scroll > max_scroll {
-            self.scroll = max_scroll;
-        }
+        self.scroll = self.scroll.saturating_add(added);
+    }
+
+    /// How many rendered lines an entry occupies at the pane's last width.
+    ///
+    /// The renderer lays text out exactly this way, so the count keeps a pinned
+    /// viewport over the same lines when new output arrives.
+    fn lines_of(&self, entry: &Entry) -> usize {
+        let width = self.width.get().max(1);
+        wrap(&entry_text(entry, self.format), width).len()
     }
 
     /// Handle a local command only the window has.
@@ -489,32 +508,28 @@ async fn handle_key(
         // Scrolling the log, which is the reason the panes exist: the printer's
         // own output would otherwise push everything else away.
         (KeyCode::PageUp, _) => {
-            // View older = move toward top = decrease scroll
-            app.pinned = true;
-            app.scroll = app.scroll.saturating_sub(10);
+            // Scroll up = view older = add a page of lines.
+            app.scroll = app.scroll.saturating_add(app.viewport.get().max(1));
         }
         (KeyCode::PageDown, _) => {
-            // View newer = move toward bottom = increase scroll
-            app.pinned = false;
-            app.scroll = app.scroll.saturating_add(10);
+            // Scroll down = view newer = drop a page of lines.
+            app.scroll = app.scroll.saturating_sub(app.viewport.get().max(1));
         }
         (KeyCode::Home, _) => {
-            // Top = oldest = scroll = 0
-            app.pinned = true;
-            app.scroll = 0;
+            // Top = oldest. The renderer clamps this to the top of the log, so
+            // it fills the pane with the oldest lines rather than leaving it
+            // empty (which is what an unclamped offset would do).
+            app.scroll = usize::MAX;
         }
         (KeyCode::End, _) => {
-            // Bottom = newest = scroll = max
-            app.pinned = false;
-            app.scroll = app.entries.len().saturating_sub(1);
+            // Bottom = newest.
+            app.scroll = 0;
         }
         (KeyCode::Up, true) => {
-            app.pinned = true;
-            app.scroll = app.scroll.saturating_sub(1);
+            app.scroll = app.scroll.saturating_add(1);
         }
         (KeyCode::Down, true) => {
-            app.pinned = false;
-            app.scroll = app.scroll.saturating_add(1);
+            app.scroll = app.scroll.saturating_sub(1);
         }
         (code, _) => app.input.edit(code, ctrl),
     }
@@ -522,17 +537,15 @@ async fn handle_key(
 }
 
 /// Handle mouse events (wheel scrolling).
-fn handle_mouse(_app: &mut App, mouse: MouseEvent) {
+fn handle_mouse(app: &mut App, mouse: MouseEvent) {
     match mouse.kind {
         MouseEventKind::ScrollUp => {
-            // Scroll up = view older content = move toward top = decrease scroll
-            _app.pinned = true;
-            _app.scroll = _app.scroll.saturating_sub(10);
+            // Scroll up = view older content.
+            app.scroll = app.scroll.saturating_add(3);
         }
         MouseEventKind::ScrollDown => {
-            // Scroll down = view newer content = move toward bottom = increase scroll
-            _app.pinned = false;
-            _app.scroll = _app.scroll.saturating_add(10);
+            // Scroll down = view newer content.
+            app.scroll = app.scroll.saturating_sub(3);
         }
         _ => (),
     }
@@ -619,9 +632,11 @@ fn header_lines(app: &App, width: usize) -> Vec<Line<'static>> {
 }
 
 fn draw_log(frame: &mut Frame, app: &App, area: Rect) {
+    // Remember the pane's shape: PgUp/PgDn move a page, and a pinned viewport
+    // counts new lines at this width.
+    app.viewport.set(area.height as usize);
+    app.width.set(area.width as usize);
     let lines = visible_lines(app, area.width as usize, area.height as usize);
-    // The lines were collected from the bottom up, so they are already the ones
-    // the pane is meant to show.
     frame.render_widget(Paragraph::new(Text::from(lines)), area);
 }
 
@@ -650,12 +665,11 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
-    let max_scroll = app.entries.len().saturating_sub(1);
-    let is_at_bottom = app.scroll >= max_scroll;
+    let is_at_bottom = app.scroll == 0;
     let hint = if app.quit {
         "leaving…".to_string()
     } else if !is_at_bottom {
-        format!("viewing older entries · End bottom · Home top · PgDn return · ^C quit")
+        "viewing older entries · End bottom · Home top · PgDn return · ^C quit".to_string()
     } else if app.gcode {
         "g-code mode · Enter send · ^G request mode · .gcode · ^C quit".to_string()
     } else {
@@ -668,114 +682,53 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-/// The lines the log pane shows, newest last.
+/// The lines the log pane shows, oldest first.
 ///
-/// `scroll` is the index of the first entry to show (0 = top).
-/// When `pinned` is false, shows the bottom (newest) screenful.
-/// When `pinned` is true, shows from `scroll` forward.
-/// If entries don't fill the pane, all entries are shown (no padding).
+/// `scroll` is how many rendered lines the pane is scrolled back from the
+/// bottom (0 = the newest line). The pane shows `height` lines ending there,
+/// clamped to the top of the log, so scrolling past the end shows the oldest
+/// lines rather than an empty pane.
 fn visible_lines(app: &App, width: usize, height: usize) -> Vec<Line<'static>> {
     let width = width.max(1);
+    let want = app.scroll;
 
-    // When not pinned, collect from the bottom (newest entries first).
-    if !app.pinned {
-        return collect_from_bottom(app, width, height);
-    }
-
-    // When pinned, collect forward from scroll index.
-    let mut lines = collect_forward(app, width, height);
-    // When pinned and scrolled back, still show newest entries if available.
-    // Clamp to show at most `height` lines starting from scroll.
-    lines.truncate(height);
-    lines
-}
-
-/// Collect lines from the bottom (newest entries), up to `height` lines.
-fn collect_from_bottom(app: &App, width: usize, height: usize) -> Vec<Line<'static>> {
-    let mut lines: Vec<Line<'static>> = Vec::new();
-
-    // Count total messages for alternating colours.
+    // Collect the newest lines, newest first, until the pane and the scrolled-
+    // past lines fit. `usize::MAX` (Home) collects the whole log, which the
+    // clamp below turns into the top of it.
+    let cap = height.saturating_add(want);
     let total_messages = app.entries.iter().filter(|entry| is_message(entry)).count();
-    let mut message_counter = 0;
-
-    // Iterate backwards from the last entry.
-    for entry in app.entries.iter().rev() {
-        if is_message(entry) {
-            // Assign index: newest gets highest value.
-            let idx = total_messages - message_counter - 1;
-            message_counter += 1;
-            let style = entry_style(entry, idx);
-            for line in wrap(&entry_text(entry, app.format), width)
-                .into_iter()
-                .rev()
-            {
-                lines.push(Line::from(Span::styled(line, style)));
-                if lines.len() >= height {
-                    break;
-                }
-            }
-            if lines.len() >= height {
-                break;
-            }
-        } else {
-            let style = entry_style(entry, 0);
-            for line in wrap(&entry_text(entry, app.format), width)
-                .into_iter()
-                .rev()
-            {
-                lines.push(Line::from(Span::styled(line, style)));
-                if lines.len() >= height {
-                    break;
-                }
-            }
-            if lines.len() >= height {
-                break;
-            }
-        }
-    }
-
-    // Reverse to get oldest-first order.
-    lines.reverse();
-    lines
-}
-
-/// Collect lines forward from the scroll index, up to `height` lines.
-fn collect_forward(app: &App, width: usize, height: usize) -> Vec<Line<'static>> {
+    let mut messages_seen = 0;
     let mut lines: Vec<Line<'static>> = Vec::new();
-
-    // Start from the scroll index (clamp to valid range)
-    let start = app.scroll.min(app.entries.len().saturating_sub(1));
-
-    let mut message_counter = 0;
-
-    for entry in &app.entries[start..] {
-        if is_message(entry) {
-            let idx = message_counter;
-            message_counter += 1;
-            let style = entry_style(entry, idx);
-            for line in wrap(&entry_text(entry, app.format), width) {
-                lines.push(Line::from(Span::styled(line, style)));
-                if lines.len() >= height {
-                    break;
-                }
-            }
-            if lines.len() >= height {
-                break;
-            }
+    'entries: for entry in app.entries.iter().rev() {
+        // The colour alternates by absolute message index, counted from the
+        // newest, so a message keeps its colour however far the log is
+        // scrolled.
+        let index = if is_message(entry) {
+            let index = total_messages - messages_seen - 1;
+            messages_seen += 1;
+            index
         } else {
-            let style = entry_style(entry, 0);
-            for line in wrap(&entry_text(entry, app.format), width) {
-                lines.push(Line::from(Span::styled(line, style)));
-                if lines.len() >= height {
-                    break;
-                }
-            }
-            if lines.len() >= height {
-                break;
+            0
+        };
+        let style = entry_style(entry, index);
+        for line in wrap(&entry_text(entry, app.format), width)
+            .into_iter()
+            .rev()
+        {
+            lines.push(Line::from(Span::styled(line, style)));
+            if lines.len() >= cap {
+                break 'entries;
             }
         }
     }
 
+    // `lines` is newest-first. The pane ends `skip` lines above the bottom and
+    // reaches `height` lines further up. Clamping `skip` is what keeps a
+    // scrolled-to-the-end view showing the oldest lines instead of nothing.
+    let skip = want.min(lines.len().saturating_sub(height));
+    lines.drain(..skip);
+    lines.truncate(height);
+    lines.reverse();
     lines
 }
 
@@ -1112,14 +1065,11 @@ mod tests {
             state: "ready".to_string(),
             message: "Printer is ready".to_string(),
         };
-        // Set scroll to 0 (top) so all entries are visible in tests.
-        // In normal use, push() sets scroll to bottom.
-        app.scroll = 0;
+        // `push` leaves the offset alone, so a fresh app is already at the
+        // bottom and every entry is in view.
         for entry in entries {
             app.push(entry);
         }
-        // Reset to top for tests so all entries are visible.
-        app.scroll = 0;
         app
     }
 
@@ -1305,45 +1255,79 @@ mod tests {
             .map(|n| Entry::notice(Notice::Info, format!("line {n}")))
             .collect();
         let mut app = app_with(entries);
-        // Five rows: header, two rows of log, input, hint.
-        // With 2 log rows and 8 entries, at bottom we see entries 6 and 7.
-        // scroll = 6 means start from entry 6, showing entries 6 and 7.
-        app.scroll = 6;
+        // Five rows: header, two rows of log, input, hint. Eight one-line
+        // entries in a two-row pane: at the bottom we see lines 7 and 8.
+        assert_eq!(app.scroll, 0, "a fresh log follows the newest line");
         let rows = render(&app, 40, 5);
         assert!(rows[1].contains("line 7"), "{rows:?}");
         assert!(rows[2].contains("line 8"), "{rows:?}");
 
-        // Scroll back 4 entries: scroll = 6 - 4 = 2, shows line 3 and line 4.
-        app.pinned = true;
-        app.scroll = 2;
+        // Scrolled back six lines: the pane ends at line 2, so it shows the
+        // oldest lines, 1 and 2.
+        app.scroll = 6;
         let rows = render(&app, 40, 5);
-        assert!(rows[1].contains("line 3"), "{rows:?}");
-        assert!(rows[2].contains("line 4"), "{rows:?}");
+        assert!(rows[1].contains("line 1"), "{rows:?}");
+        assert!(rows[2].contains("line 2"), "{rows:?}");
         assert!(
             rows.last().unwrap().contains("viewing older entries"),
             "{rows:?}"
         );
 
-        // Scrolling past the end shows the end, not an empty pane.
-        app.scroll = 999;
+        // Scrolling past the end shows the top, not an empty pane.
+        app.scroll = usize::MAX;
         let rows = render(&app, 40, 5);
-        assert!(rows[1].contains("line 8"), "{rows:?}");
+        assert!(rows[1].contains("line 1"), "{rows:?}");
+        assert!(rows[2].contains("line 2"), "{rows:?}");
+    }
+
+    #[test]
+    fn test_a_wrapped_entry_scrolls_a_line_at_a_time() {
+        // One entry, three rows tall, in a two-row pane.
+        let mut app = app_with(vec![Entry::notice(Notice::Info, "one\ntwo\nthree")]);
+        let rows = render(&app, 40, 5);
+        assert!(rows[1].contains("two"), "{rows:?}");
+        assert!(rows[2].contains("three"), "{rows:?}");
+
+        // One line of scroll, not one whole entry: the top becomes reachable.
+        app.scroll = 1;
+        let rows = render(&app, 40, 5);
+        assert!(rows[1].contains("one"), "{rows:?}");
+        assert!(rows[2].contains("two"), "{rows:?}");
+
+        // And past the top is still the top.
+        app.scroll = usize::MAX;
+        let rows = render(&app, 40, 5);
+        assert!(rows[1].contains("one"), "{rows:?}");
     }
 
     #[test]
     fn test_a_new_entry_returns_the_view_to_the_bottom() {
         let mut app = app_with(vec![Entry::notice(Notice::Info, "line 1")]);
-        // scroll = 0 means top (first entry). With 1 entry, top = bottom.
-        app.scroll = 0;
+        // At the bottom, a new entry is worth looking at.
         app.push(Entry::notice(Notice::Info, "line 2"));
-        // New entry should push to bottom: scroll = entries.len() - 1 = 1
-        assert_eq!(app.scroll, 1, "a new entry is worth looking at");
+        assert_eq!(app.scroll, 0, "a new entry is worth looking at");
+    }
 
-        // Pin the viewport: user scrolled back, new entries don't push.
-        app.pinned = true;
-        app.scroll = 0; // at top
-        app.push(Entry::notice(Notice::Info, "line 3"));
-        assert_eq!(app.scroll, 0, "pinned viewport stays put");
+    #[test]
+    fn test_a_new_entry_does_not_move_a_scrolled_back_view() {
+        let entries: Vec<Entry> = (1..=8)
+            .map(|n| Entry::notice(Notice::Info, format!("line {n}")))
+            .collect();
+        let mut app = app_with(entries);
+        app.scroll = 6;
+        // The first draw is also what tells the window how wide the pane is.
+        let before = render(&app, 40, 5);
+        assert!(before[1].contains("line 1"), "{before:?}");
+        assert!(before[2].contains("line 2"), "{before:?}");
+
+        app.push(Entry::notice(Notice::Info, "line 9"));
+        assert_eq!(app.scroll, 7, "the new line is counted below the viewport");
+        let after = render(&app, 40, 5);
+        assert_eq!(before[1..3], after[1..3], "a scrolled-back view is pinned");
+
+        // A wrapped entry adds as many lines as it takes on screen.
+        app.push(Entry::notice(Notice::Info, "a\nb\nc"));
+        assert_eq!(app.scroll, 10, "three more lines landed below the viewport");
     }
 
     #[test]

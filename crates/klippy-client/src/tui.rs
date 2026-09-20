@@ -10,7 +10,7 @@
 //!   }
 //! < {"id": null, "method": "klippy:status", "params": {...}}
 //! klippy> objects/query {"objects": {"toolhead": ["position"]}}
-//! Enter send · ↑↓ history · PgUp/PgDn · Home/End (log) · ^G g-code · .help · ^C quit
+//! Enter send · ↑↓ history · PgUp/PgDn/Home/End log · ^↑/^↓ line · ^G g-code · .help · ^C quit
 //! ```
 //!
 //! The header tracks the printer's state, the log holds everything that
@@ -183,6 +183,9 @@ struct App {
     /// The scrollbar's column as last drawn, so a click can find it. Zero-sized
     /// when the log fits and no bar is drawn.
     gutter: Cell<Rect>,
+    /// Whether a scrollbar drag is in progress. The button holds the drag, not
+    /// the pointer's column, so this survives the pointer leaving the bar.
+    dragging: bool,
     /// The connection's state, shown in the header.
     status: Status,
     /// Set by a local command that asked to leave.
@@ -233,6 +236,7 @@ impl App {
             width: Cell::new(0),
             heights: RefCell::new(Heights::default()),
             gutter: Cell::new(Rect::new(0, 0, 0, 0)),
+            dragging: false,
             status: Status::Unknown,
             quit: false,
             gcode: false,
@@ -349,6 +353,20 @@ impl App {
             return None;
         }
         Some((row - gutter.y) as usize)
+    }
+
+    /// The track row a pointer is on while dragging, clamped to the track.
+    ///
+    /// Once a drag has begun the pointer is allowed to wander off the bar —
+    /// sideways out of its column, or above and below the pane. The button is
+    /// what holds the drag, so a row outside the track means the top or the
+    /// bottom of the log rather than losing the drag.
+    fn clamp_track_row(&self, row: u16) -> usize {
+        let gutter = self.gutter.get();
+        if gutter.height == 0 {
+            return 0;
+        }
+        row.saturating_sub(gutter.y).min(gutter.height - 1) as usize
     }
 
     /// Scroll so the pointer's place on the track is in view.
@@ -658,13 +676,21 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
             // Scroll down = view newer content.
             app.scroll = app.scroll.saturating_sub(3);
         }
-        // Clicking or dragging the bar goes where the pointer is. The drag
-        // events carry the same cell, so one branch serves both.
-        MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Drag(MouseButton::Left) => {
-            if let Some(track) = app.gutter_row(mouse.column, mouse.row) {
+        // A press on the bar takes hold of it. A press anywhere else lets go:
+        // only the bar starts a drag.
+        MouseEventKind::Down(MouseButton::Left) => match app.gutter_row(mouse.column, mouse.row) {
+            Some(track) => {
+                app.dragging = true;
                 app.scroll_to_track(track);
             }
+            None => app.dragging = false,
+        },
+        // The drag follows the pointer's row even when it leaves the bar's
+        // column; `gutter_row` would have dropped it there.
+        MouseEventKind::Drag(MouseButton::Left) if app.dragging => {
+            app.scroll_to_track(app.clamp_track_row(mouse.row));
         }
+        MouseEventKind::Up(MouseButton::Left) => app.dragging = false,
         _ => (),
     }
 }
@@ -817,15 +843,26 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
-    let is_at_bottom = app.scroll == 0;
+    // How far back the log really is. `scroll` can be past the top (`Home` is
+    // `usize::MAX`) and a log that fits cannot be scrolled at all, so the offset
+    // is clamped before it is shown — and so that one line of scrolling is
+    // still one visible word in the hint.
+    let range = app
+        .total_lines(app.width.get().max(1))
+        .saturating_sub(app.viewport.get().max(1));
+    let back = app.scroll.min(range);
+
     let hint = if app.quit {
         "leaving…".to_string()
-    } else if !is_at_bottom {
-        "viewing older entries · End bottom · Home top · PgDn return · ^C quit".to_string()
+    } else if back > 0 {
+        let lines = if back == 1 { "line" } else { "lines" };
+        format!(
+            "viewing older entries · {back} {lines} back · ↑↓ scroll · End bottom · Home top · ^C quit"
+        )
     } else if app.gcode {
         "g-code mode · Enter send · ^G request mode · .gcode · ^C quit".to_string()
     } else {
-        "Enter send · ↑↓ history · PgUp/PgDn · Home/End log · ^G g-code · .help · ^C quit"
+        "Enter send · ↑↓ history · PgUp/PgDn/Home/End log · ^↑/^↓ line · ^G g-code · .help · ^C quit"
             .to_string()
     };
     frame.render_widget(
@@ -1751,6 +1788,105 @@ mod tests {
         assert_eq!(app.scroll, 0);
         handle_mouse(&mut app, click(MouseEventKind::ScrollUp, gutter.y));
         assert_eq!(app.scroll, 3, "the wheel still scrolls by three lines");
+    }
+
+    #[test]
+    fn test_a_drag_survives_leaving_the_bar() {
+        let entries: Vec<Entry> = (1..=20)
+            .map(|n| Entry::notice(Notice::Info, format!("line {n}")))
+            .collect();
+        let mut app = app_with(entries);
+        let _ = render(&app, 40, 8);
+        let gutter = app.gutter.get();
+
+        let event = |kind, column, row| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::empty(),
+        };
+
+        // Take hold of the bar in its middle.
+        handle_mouse(
+            &mut app,
+            event(
+                MouseEventKind::Down(MouseButton::Left),
+                gutter.x,
+                gutter.y + 2,
+            ),
+        );
+        assert_eq!(app.scroll, 8, "the pointer's row picked the offset");
+
+        // Wander left, out of the bar's column, and to the last row: the button
+        // holds the drag, so it keeps following the pointer.
+        handle_mouse(
+            &mut app,
+            event(MouseEventKind::Drag(MouseButton::Left), 0, gutter.y + 4),
+        );
+        assert_eq!(app.scroll, 0, "the bottom row is the bottom of the log");
+
+        // Above the pane clamps to the top instead of getting lost.
+        handle_mouse(
+            &mut app,
+            event(MouseEventKind::Drag(MouseButton::Left), 0, 0),
+        );
+        assert_eq!(app.scroll, 15);
+
+        // Releasing lets go: a drag afterwards moves nothing.
+        handle_mouse(&mut app, event(MouseEventKind::Up(MouseButton::Left), 0, 0));
+        handle_mouse(
+            &mut app,
+            event(
+                MouseEventKind::Drag(MouseButton::Left),
+                gutter.x,
+                gutter.y + 2,
+            ),
+        );
+        assert_eq!(app.scroll, 15, "the button is up; the drag is over");
+
+        // A press on the bar takes hold; a press on the text lets go.
+        handle_mouse(
+            &mut app,
+            event(
+                MouseEventKind::Down(MouseButton::Left),
+                gutter.x,
+                gutter.y + 2,
+            ),
+        );
+        assert!(app.dragging);
+        handle_mouse(
+            &mut app,
+            event(MouseEventKind::Down(MouseButton::Left), 0, gutter.y + 2),
+        );
+        assert!(!app.dragging, "only the bar starts a drag");
+    }
+
+    #[test]
+    fn test_the_hint_says_how_far_back_the_log_is() {
+        let entries: Vec<Entry> = (1..=8)
+            .map(|n| Entry::notice(Notice::Info, format!("line {n}")))
+            .collect();
+        let mut app = app_with(entries);
+
+        // At the bottom the hint is about typing, not about scrolling.
+        let rows = render(&app, 60, 5);
+        assert!(rows.last().unwrap().contains("↑↓ history"), "{rows:?}");
+
+        // One line is worth saying: the thumb barely moves on a short track,
+        // but the hint has the room to count.
+        app.scroll = 1;
+        let rows = render(&app, 60, 5);
+        assert!(rows.last().unwrap().contains("1 line back"), "{rows:?}");
+
+        app.scroll = 3;
+        let rows = render(&app, 60, 5);
+        assert!(rows.last().unwrap().contains("3 lines back"), "{rows:?}");
+
+        // Past the top the offset is the furthest back there is — eight lines
+        // in a two-row pane — not `usize::MAX`.
+        app.scroll = usize::MAX;
+        let rows = render(&app, 60, 5);
+        assert!(rows.last().unwrap().contains("6 lines back"), "{rows:?}");
     }
 
     #[test]

@@ -148,7 +148,8 @@ impl ObjectsSubscribe {
             return;
         }
         let inner = Arc::clone(&self.inner);
-        let handle = self.inner.reactor.register_timer(
+        let handle = self.inner.reactor.register_timer_named(
+            "objects/subscribe",
             Box::new(move |eventtime| inner.tick(eventtime)),
             self.inner.reactor.monotonic() + SUBSCRIPTION_REFRESH_TIME,
         );

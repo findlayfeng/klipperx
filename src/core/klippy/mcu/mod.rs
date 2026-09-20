@@ -100,6 +100,13 @@ pub struct Mcu {
     pending_calls: PendingCalls,
     /// Interface clone kept so the device can be shut down on drop.
     interface: Interface,
+    /// The runtime this connection's transport tasks run on.
+    ///
+    /// Taken from the [`Interface`] at construction so the sender task, the
+    /// receiver task and the device's own blocking I/O all share one runtime.
+    /// It is the machine runtime; a future split from the API runtime (TODO A3)
+    /// changes only where the interface picked it up.
+    handle: tokio::runtime::Handle,
     /// The sequence state of this connection, shared with both of its tasks: the
     /// number the next block carries, and whether the connection had to take over a
     /// session that was already running (see [`Wire`]).
@@ -393,6 +400,9 @@ impl Mcu {
         let parser_for_task = parser.clone();
         let pending_calls = PendingCalls::new();
         let pending_calls_for_task = pending_calls.clone();
+        // Both transport tasks run on the interface's runtime, not the ambient
+        // one. Cloned once and shared, since `Handle::spawn` only borrows it.
+        let handle = interface.handle().clone();
 
         let wire = Arc::new(Wire::default());
         let (send_buf_tx, mut send_buf_rx) = mpsc::channel::<SendItem>(32);
@@ -404,7 +414,7 @@ impl Mcu {
         let interface_for_send = interface.clone();
         let wire_for_send = Arc::clone(&wire);
 
-        tokio::spawn(async move {
+        handle.spawn(async move {
             let mut sender = Sender::new(Arc::clone(&wire_for_send));
 
             loop {
@@ -502,7 +512,7 @@ impl Mcu {
 
         let interface_for_recv = interface.clone();
         let wire_for_recv = Arc::clone(&wire);
-        let recv_handle = tokio::spawn(async move {
+        let recv_handle = handle.spawn(async move {
             // The firmware's counter in this connection's unwrapped numbering, and
             // how many frames have been accepted: the first frame is what says
             // whether the firmware was already running (`Wire::took_over`).
@@ -613,6 +623,7 @@ impl Mcu {
             send_buf_tx,
             pending_calls,
             interface,
+            handle,
             wire,
             clock_base: StdMutex::new(None),
             recv_handle: Some(recv_handle),
@@ -636,6 +647,16 @@ impl Mcu {
     /// board on its **closed** port in between (`mcu/restart.rs`).
     pub fn new(name: impl Into<String>, interface: Interface) -> Self {
         Self::from_parts(name.into(), interface)
+    }
+
+    /// The runtime this connection's transport tasks run on.
+    ///
+    /// Taken from the [`Interface`] when it was opened, so the sender task, the
+    /// receiver task and the device's own blocking I/O all share it. A caller
+    /// that needs to schedule work alongside a connection uses this rather than
+    /// the ambient runtime.
+    pub fn handle(&self) -> &tokio::runtime::Handle {
+        &self.handle
     }
 
     /// Whether this connection had to take over a session that was already

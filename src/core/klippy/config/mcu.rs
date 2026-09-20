@@ -2,7 +2,6 @@ use super::section::ConfigSection;
 use crate::core::klippy::interface::usb::UsbPowerMethod;
 use crate::core::klippy::interface::{Interface, SerialDevice};
 use crate::core::klippy::mcu::McuRestartMethod;
-use std::sync::Arc;
 use tracing::{info, warn};
 
 /// MCU (Microcontroller Unit) configuration parsed from config file.
@@ -397,7 +396,7 @@ impl Transport {
                 if !rts {
                     device.set_rts(false).map_err(|e| format!("serial: {e}"))?;
                 }
-                Ok(Interface::Serial(Arc::new(device)))
+                Ok(Interface::from_serial(device))
             }
             Transport::Can {
                 interface,

@@ -50,6 +50,14 @@ pub struct AppArgs {
 /// the loader rejects, an MCU that is gone.
 const RESTART_DELAY: std::time::Duration = std::time::Duration::from_millis(1000);
 
+/// How long a reactor dispatch round may run before it is reported.
+///
+/// Upstream's garbage collector uses the same 50 ms threshold
+/// (`klippy/extras/garbage_collection.py`, `THRESHOLD`). The subscription tick
+/// is the only periodic callback and normally takes well under a millisecond,
+/// so a round this long means something blocked the reactor.
+const LATENCY_WARNING: f64 = 0.05;
+
 /// Whether a run result asks for the printer to be built again.
 ///
 /// `"exit"` / `"error_exit"` end the process; these two rebuild the machine
@@ -58,12 +66,36 @@ fn is_restart(result: &str) -> bool {
     matches!(result, "restart" | "firmware_restart")
 }
 
+/// Log a reactor that ran a dispatch round past [`LATENCY_WARNING`].
+///
+/// Upstream's `_analyze_callback` (`extras/garbage_collection.py:20`) spells the
+/// same thing; here the names come from registration rather than introspection.
+fn report_reactor_latency(report: crate::core::klippy::LatencyReport) {
+    warn!(
+        "Reactor busy for {:.3}s with {} callback(s):",
+        report.busy,
+        report.callbacks.len()
+    );
+    for callback in &report.callbacks {
+        warn!(
+            "  {} ran {:.3}s late, took {:.3}s",
+            callback.name, callback.lateness, callback.duration
+        );
+    }
+}
+
 /// Run one printer until something asks it to stop, rebuilding it on a restart.
+///
+/// This future runs **on the machine runtime**: the reactor's dispatcher, the
+/// MCU transport tasks, the device's blocking I/O and the blocking `run()` loop
+/// below all belong to that runtime, and this is the future its driver thread
+/// `block_on`s. The interrupt that asks the printer to exit is a host concern
+/// and lives on the API runtime instead (see [`run`]); `request_exit` is a
+/// condition variable, so crossing runtimes is fine.
 ///
 /// The machine is built, its config loaded and the API server serving it by the
 /// time this is called. The run loop blocks, so it gets a blocking thread of its
-/// own; the interrupt means "ask the printer to exit", not "kill the process",
-/// so the printer still goes down in order.
+/// own.
 ///
 /// A restart reloads the same parsed config rather than re-reading the file, so
 /// an edit on disk takes effect at the next *start*, like upstream. The machine
@@ -72,24 +104,6 @@ fn is_restart(result: &str) -> bool {
 /// to Q7 — no printer slot to swap, because the printer is rebuilt under its
 /// one handle).
 async fn klippy_process(printer: Arc<Printer>, config: Arc<Config>) {
-    // The printer's own shutdown conditions (an MCU going away, a client's
-    // emergency stop) end the loop on their own; until they exist, the
-    // operator's interrupt is the only one. A task rather than a `select!`, so
-    // that the blocking loop below is awaited exactly once — and so that an
-    // exit requested from somewhere else (an attached window closing) ends it
-    // without waiting for an interrupt. It is a loop because a restart clears
-    // the exit request, so the listener has to be armed again for the next run.
-    let interrupt_printer = Arc::clone(&printer);
-    let interrupt = tokio::spawn(async move {
-        loop {
-            if let Err(err) = tokio::signal::ctrl_c().await {
-                warn!("cannot listen for an interrupt: {err}");
-                return;
-            }
-            interrupt_printer.request_exit("exit");
-        }
-    });
-
     loop {
         printer.bring_up().await;
 
@@ -118,8 +132,6 @@ async fn klippy_process(printer: Arc<Printer>, config: Arc<Config>) {
         }
         tokio::time::sleep(RESTART_DELAY).await;
     }
-
-    interrupt.abort();
 
     // The run loop has ended for good, so the machine comes down here — while
     // the runtime that built it is still up. A device's transport can have a
@@ -193,26 +205,48 @@ pub fn run(
         }
     };
 
-    // One runtime for the whole process, and the only place one is created:
-    // every async task in klippy (the MCU send and receive tasks, the API
-    // server's accept loop and its per-connection tasks) runs here. It is
-    // multi-threaded because endpoint handlers, subscription timers and MCU
-    // traffic are independent work: on a single thread one slow endpoint would
-    // hold up MCU responses and every other client with them.
-    let runtime = tokio::runtime::Builder::new_multi_thread()
+    // The machine gets its own runtime and its own driver thread: its timers,
+    // MCU transport tasks and device I/O must not queue behind client traffic,
+    // and a slow endpoint must not be able to delay a machine callback. The API
+    // keeps the process's multi-threaded runtime. This is TODO A3 — two
+    // runtimes, split along the boundary that matters for timing.
+    //
+    // Two workers for the machine, not more: the device's blocking reads run on
+    // the blocking pool (see `Interface`), so the workers only carry the
+    // reactor dispatcher, the MCU send and receive tasks, and bring-up/restart.
+    let machine_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_name("klippy-mcu")
+        .enable_all()
+        .build()?;
+    let machine_handle = machine_runtime.handle().clone();
+
+    // The reactor is built over the machine runtime and handed to the printer
+    // explicitly, so the machine never has to ask for the ambient runtime. The
+    // dispatcher task is spawned here, on that handle, before the runtime is
+    // driven — it runs as soon as the driver thread starts.
+    let printer = Arc::new(Printer::new(Arc::new(TokioReactor::new(
+        machine_handle.clone(),
+    ))));
+
+    // A diagnostic for the machine's own timing: if a dispatch round runs
+    // longer than this, say so, naming the callbacks that ran in it. Upstream
+    // wires the same notifier from its garbage collector
+    // (`extras/garbage_collection.py`); we have none, so the warning is the
+    // whole point (TODO A1b).
+    printer
+        .reactor()
+        .set_latency_notifier(LATENCY_WARNING, Arc::new(report_reactor_latency));
+
+    // The API runtime: the accept loop, one task per connection, and whatever is
+    // attached to the host. It is multi-threaded because endpoint handlers are
+    // independent work and one slow client must not hold up another.
+    let api_runtime = tokio::runtime::Builder::new_multi_thread()
+        .thread_name("klippy-api")
         .enable_all()
         .build()?;
 
-    runtime.block_on(async move {
-        // The machine, built before anything is served: the endpoint table is
-        // registered and then the config's objects are loaded, so that a client
-        // never observes a half-built table or a half-built machine. Its reactor
-        // is this runtime — timers are tokio tasks, and the clock is tokio's, so
-        // nothing here builds a second event loop.
-        let printer = Arc::new(Printer::new(Arc::new(TokioReactor::new(
-            tokio::runtime::Handle::current(),
-        ))));
-
+    api_runtime.block_on(async move {
         // The server's own object (`webhooks`) and the endpoints come first, so
         // that `objects/list` starts with `webhooks` as upstream's does
         // (`klippy/klippy.py:36-40`) and no path is half-built when a request
@@ -240,13 +274,50 @@ pub fn run(
             config.sections_vec().len()
         );
 
-        // Config-driven objects. A config the loader rejects halts the printer
-        // rather than ending the process: clients can still connect and read
-        // why (upstream's `_read_config` does the same — it sets the state and
-        // lets the reactor keep running).
-        if let Err(err) = printer.load_config(&config) {
-            printer.invoke_shutdown(&format!("{err}"));
+        // Config-driven objects, run under the machine runtime's context so any
+        // machine-side handle the loader picks up is the machine's. A config the
+        // loader rejects halts the printer rather than ending the process:
+        // clients can still connect and read why (upstream's `_read_config`
+        // does the same — it sets the state and lets the reactor keep running).
+        {
+            let _machine = machine_handle.enter();
+            if let Err(err) = printer.load_config(&config) {
+                printer.invoke_shutdown(&format!("{err}"));
+            }
         }
+
+        // The operator's interrupt is a host concern, so it runs on the API
+        // runtime; it only asks the printer to exit, and `request_exit` is a
+        // condition variable, so it crosses runtimes freely. A task rather than
+        // a `select!`, so the blocking run loop below is awaited exactly once,
+        // and so an exit requested from somewhere else (an attached window
+        // closing) ends it without waiting for an interrupt. It is a loop
+        // because a restart clears the exit request, so the listener has to be
+        // armed again for the next run.
+        let interrupt = {
+            let printer = Arc::clone(&printer);
+            tokio::spawn(async move {
+                loop {
+                    if let Err(err) = tokio::signal::ctrl_c().await {
+                        warn!("cannot listen for an interrupt: {err}");
+                        return;
+                    }
+                    printer.request_exit("exit");
+                }
+            })
+        };
+
+        // The machine runs on its own runtime, driven from a thread of its own:
+        // `block_on` cannot be nested, so the API runtime cannot drive it. Its
+        // driver thread parks in `block_on` for the whole run, which is fine —
+        // the machine's tasks run on that runtime's workers, not on this thread.
+        let machine_printer = Arc::clone(&printer);
+        let machine_config = Arc::clone(&config);
+        let machine_thread = std::thread::Builder::new()
+            .name("klippy-machine".into())
+            .spawn(move || {
+                machine_runtime.block_on(klippy_process(machine_printer, machine_config));
+            })?;
 
         match attachment {
             // Whatever is attached to this host is the user interface of the
@@ -256,14 +327,18 @@ pub fn run(
             // return in order, rather than dropping a loop that still holds the
             // machine.
             Some(mut attachment) => {
-                let host = tokio::spawn(klippy_process(Arc::clone(&printer), Arc::clone(&config)));
                 let outcome = attachment.run(Arc::clone(&api)).await;
                 printer.request_exit("exit");
-                let _ = host.await;
+                let _ = machine_thread.join();
                 outcome.map_err(|err| -> Box<dyn std::error::Error> { err.into() })?;
             }
-            None => klippy_process(printer, config).await,
+            None => {
+                let _ = machine_thread.join();
+            }
         }
+
+        interrupt.abort();
+        let _ = interrupt.await;
 
         // The printer has stopped, so the API server goes with it. Aborting is
         // enough: dropping the listener removes the socket file.
@@ -350,5 +425,40 @@ mod tests {
         // instead of ending the loop; `exit` then ended it.
         assert_eq!(connects.load(Ordering::SeqCst), 2);
         assert_eq!(printer.get_state_message().category, PrinterState::Ready);
+    }
+
+    #[test]
+    fn test_a_transport_captures_the_machine_runtime_not_the_ambient_one() {
+        // A3's mechanism: `Interface` stores whatever runtime is current when it
+        // is opened, and the loader opens transports under the *machine* handle
+        // (`run` enters it around `load_config`). Opened inside that context, a
+        // `test:` interface must carry the machine runtime, not the API one.
+        use crate::core::klippy::interface::devices::test::TestDevice;
+        use crate::core::klippy::interface::Interface;
+
+        let machine = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let api = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let machine_handle = machine.handle().clone();
+
+        api.block_on(async {
+            let interface = {
+                let _machine = machine_handle.enter();
+                Interface::new(TestDevice::new(vec![]))
+            };
+            assert_eq!(interface.handle().id(), machine_handle.id());
+            assert_ne!(
+                interface.handle().id(),
+                tokio::runtime::Handle::current().id(),
+                "the transport must not carry the ambient (API) runtime"
+            );
+        });
     }
 }

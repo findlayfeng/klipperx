@@ -326,7 +326,10 @@ impl PrinterObject for McuObject {
             let usb_reset =
                 self.is_firmware_restart() && config.restart_method == McuRestartMethod::RpiUsb;
             if self.is_firmware_restart() {
-                if let Err(err) = super::restart::reset_firmware(&config).await {
+                if let Err(err) =
+                    super::restart::reset_firmware(&config, &tokio::runtime::Handle::current())
+                        .await
+                {
                     if usb_reset {
                         self.usb_reset_unusable(&config, &err);
                     }

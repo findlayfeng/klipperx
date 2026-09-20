@@ -38,7 +38,10 @@ pub use msg::proto::Payload;
 pub use msg::Msg;
 pub use pins::{PinError, PinParams, PinResolver, PinType, PrinterPins, PINS_OBJECT};
 pub use printer::{Printer, PrinterEvent, PrinterState, StateMessage};
-pub use reactor::{ManualReactor, Reactor, TimerCallback, TimerHandle, TokioReactor};
+pub use reactor::{
+    CallbackRun, LatencyCallback, LatencyReport, ManualReactor, Reactor, TimerCallback,
+    TimerHandle, TokioReactor,
+};
 // pub use interface::canbus::CanbusInterface;
 // pub use mcu::{MCU, McuError, McuPin, PinParams};
 // pub use mcu::{add_printer_objects, get_printer_mcu};

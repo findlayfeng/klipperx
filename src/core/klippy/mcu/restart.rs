@@ -60,7 +60,10 @@ const RE_ENUMERATE_SETTLE: Duration = Duration::from_millis(1000);
 /// # Errors
 /// Returns a message prefixed with the transport when the reset itself fails, so
 /// it reads the same way the open errors do.
-pub async fn reset_firmware(config: &McuConfig) -> Result<(), String> {
+pub async fn reset_firmware(
+    config: &McuConfig,
+    handle: &tokio::runtime::Handle,
+) -> Result<(), String> {
     match config.restart_method {
         // Nothing before the connection: `config_reset` clears the firmware once
         // it is up (`mcu/config.rs`).
@@ -83,7 +86,7 @@ pub async fn reset_firmware(config: &McuConfig) -> Result<(), String> {
         // Verified on hardware: the hub reports `PORT_POWER` off and the board
         // re-enumerates under a new node, so no "untested" warning here.
         McuRestartMethod::RpiUsb => match &config.transport {
-            Transport::Serial { path, .. } => rpi_usb_reset(path, config.usb_power).await,
+            Transport::Serial { path, .. } => rpi_usb_reset(path, config.usb_power, handle).await,
             _ => Ok(()),
         },
     }
@@ -230,7 +233,11 @@ async fn cheetah_reset(path: &str) -> Result<(), String> {
 /// Upstream shells out to a compiled `hub-ctrl` with `sudo`; here the port is
 /// read from sysfs and switched the way `usb_power` asks (`interface/usb.rs`).
 /// The port must be closed, and the caller opens it afterwards.
-async fn rpi_usb_reset(serial_path: &str, method: usb::UsbPowerMethod) -> Result<(), String> {
+async fn rpi_usb_reset(
+    serial_path: &str,
+    method: usb::UsbPowerMethod,
+    handle: &tokio::runtime::Handle,
+) -> Result<(), String> {
     let tty = PathBuf::from(serial_path);
     let port = usb::resolve_tty_port(&tty)?;
     // Resolve the mechanism per reset, so a hub that was replugged (or a udev
@@ -240,9 +247,9 @@ async fn rpi_usb_reset(serial_path: &str, method: usb::UsbPowerMethod) -> Result
     // comes back.
     let before = device_node(&tty);
 
-    usb_set_power(&port, &power, false).await?;
+    usb_set_power(&port, &power, false, handle).await?;
     tokio::time::sleep(USB_POWER_OFF).await;
-    usb_set_power(&port, &power, true).await?;
+    usb_set_power(&port, &power, true, handle).await?;
 
     // The caller is about to open the port, so wait for the board to be back
     // rather than opening the instance that is still on its way out.
@@ -250,10 +257,16 @@ async fn rpi_usb_reset(serial_path: &str, method: usb::UsbPowerMethod) -> Result
 }
 
 /// Switch one hub port, off the runtime: `nusb`'s blocking path does the syscalls.
-async fn usb_set_power(port: &usb::UsbPort, power: &usb::UsbPower, on: bool) -> Result<(), String> {
+async fn usb_set_power(
+    port: &usb::UsbPort,
+    power: &usb::UsbPower,
+    on: bool,
+    handle: &tokio::runtime::Handle,
+) -> Result<(), String> {
     let port = port.clone();
     let power = power.clone();
-    tokio::task::spawn_blocking(move || usb::set_port_power(&port, &power, on))
+    handle
+        .spawn_blocking(move || usb::set_port_power(&port, &power, on))
         .await
         .map_err(|e| format!("usb: {e}"))?
 }
@@ -379,9 +392,12 @@ mod tests {
     #[tokio::test]
     async fn test_command_leaves_the_transport_alone() {
         // `command` is reset after the connection is up, so nothing happens here.
-        reset_firmware(&no_transport(McuRestartMethod::Command))
-            .await
-            .unwrap();
+        reset_firmware(
+            &no_transport(McuRestartMethod::Command),
+            &tokio::runtime::Handle::current(),
+        )
+        .await
+        .unwrap();
     }
 
     #[test]
@@ -414,7 +430,9 @@ mod tests {
             McuRestartMethod::Cheetah,
             McuRestartMethod::RpiUsb,
         ] {
-            reset_firmware(&no_transport(method)).await.unwrap();
+            reset_firmware(&no_transport(method), &tokio::runtime::Handle::current())
+                .await
+                .unwrap();
         }
     }
 
@@ -422,9 +440,12 @@ mod tests {
     async fn test_arduino_routes_to_the_serial_reset() {
         // The reset opens the port itself, so a path that cannot be opened is
         // where the dispatch shows: the error is the serial one, wrapped.
-        let err = reset_firmware(&serial(McuRestartMethod::Arduino))
-            .await
-            .unwrap_err();
+        let err = reset_firmware(
+            &serial(McuRestartMethod::Arduino),
+            &tokio::runtime::Handle::current(),
+        )
+        .await
+        .unwrap_err();
         assert!(err.starts_with("serial: "), "{err}");
         assert!(err.contains("/dev/not-a-serial-port"), "{err}");
     }
@@ -433,9 +454,12 @@ mod tests {
     async fn test_rpi_usb_needs_a_usb_tty() {
         // The port has to be a USB one for its power to be switched; the error
         // from the sysfs lookup is what comes back.
-        let err = reset_firmware(&serial(McuRestartMethod::RpiUsb))
-            .await
-            .unwrap_err();
+        let err = reset_firmware(
+            &serial(McuRestartMethod::RpiUsb),
+            &tokio::runtime::Handle::current(),
+        )
+        .await
+        .unwrap_err();
         assert!(err.starts_with("usb: "), "{err}");
     }
 
@@ -458,9 +482,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_cheetah_routes_to_the_serial_reset() {
-        let err = reset_firmware(&serial(McuRestartMethod::Cheetah))
-            .await
-            .unwrap_err();
+        let err = reset_firmware(
+            &serial(McuRestartMethod::Cheetah),
+            &tokio::runtime::Handle::current(),
+        )
+        .await
+        .unwrap_err();
         assert!(err.starts_with("serial: "), "{err}");
         assert!(err.contains("/dev/not-a-serial-port"), "{err}");
     }

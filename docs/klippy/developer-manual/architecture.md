@@ -54,7 +54,7 @@
 RUST_LOG=klipperx=trace klipperx ~/printer.cfg --tui
 ```
 
-`--verbose` 不行：它把过滤器固定成 `debug` 并且忽略 `RUST_LOG`，TRACE 会被过滤掉。各级别与各类行的完整例子见用户手册的[日志与调试](../user-manual/logging.md)。
+`--verbose` 单独用只看得到 `debug`；和 `RUST_LOG` 一起用时取更详细的那个，所以上面这条命令照样是 `trace`。各级别与各类行的完整例子见用户手册的[日志与调试](../user-manual/logging.md)。
 
 ## 发送侧：合并批处理
 

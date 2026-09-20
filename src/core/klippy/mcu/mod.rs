@@ -37,7 +37,7 @@ pub use restart_method::McuRestartMethod;
 use crate::core::klippy::config::mcu::McuConfig;
 use crate::core::klippy::frame::{Frame, MESSAGE_PAYLOAD_MAX};
 use crate::core::klippy::identify;
-use crate::core::klippy::interface::Interface;
+use crate::core::klippy::interface::{hex_runs, Interface};
 use crate::core::klippy::mcu::pending::PendingCalls;
 use crate::core::klippy::msg::error::MsgError;
 use crate::core::klippy::msg::parser::Parser;
@@ -93,6 +93,39 @@ impl std::fmt::Debug for Mcu {
             .field("name", &self.name)
             .field("identified", &self.is_identified())
             .finish_non_exhaustive()
+    }
+}
+
+/// A command or response as a log line describes it: its name, then each
+/// parameter as `name=value`, in the dictionary's declaration order.
+///
+/// The names are the firmware's own — the dictionary's — which is the point:
+/// `offset=100` reads better than a tuple of values, and a parameter that is
+/// wrong, missing, or in the wrong place is obvious once it is named.
+fn describe_message(msg: &Msg, values: &[ArgValue]) -> String {
+    let mut text = msg.name.clone();
+    for (index, value) in values.iter().enumerate() {
+        let name = msg
+            .params
+            .get(index)
+            .map(|(name, _)| name.as_str())
+            .unwrap_or("?");
+        text.push_str(&format!(" {name}={}", describe_value(value)));
+    }
+    text
+}
+
+/// One parameter value, as a log line shows it: integers in decimal, a string as
+/// itself, bytes in hex — the same 4-byte runs the interface logs frames in.
+fn describe_value(value: &ArgValue) -> String {
+    match value {
+        ArgValue::UInt8(v) => v.to_string(),
+        ArgValue::UInt16(v) => v.to_string(),
+        ArgValue::Int16(v) => v.to_string(),
+        ArgValue::UInt32(v) => v.to_string(),
+        ArgValue::Int32(v) => v.to_string(),
+        ArgValue::Str(v) => v.clone(),
+        ArgValue::Bytes(v) => hex_runs(v),
     }
 }
 
@@ -213,6 +246,7 @@ impl Mcu {
                 };
 
                 for (msg, params) in decoded {
+                    debug!("recv {}", describe_message(&msg, &params));
                     // Pending call has priority — if matched, consume and skip callback.
                     if pending_calls_for_task.resolve(&msg.name, &params).await {
                         debug!(
@@ -409,10 +443,23 @@ impl Mcu {
     /// don't match the expected parameter count, or the send buffer is full.
     pub fn send(&self, name: &str, args: &[ArgValue]) -> Result<(), MsgError> {
         let payload = self.parser.encode(name, args)?;
+        debug!("send {}", self.describe_command(name, args));
         self.send_buf_tx
             .try_send(payload)
             .map_err(|e| MsgError::new(e.to_string()))?;
         Ok(())
+    }
+
+    /// A command on its way out, as its DEBUG line shows it: the dictionary's
+    /// own parameter names when it has the message, the name alone otherwise.
+    ///
+    /// Called as a field of the log line, so neither the lookup nor the
+    /// formatting happens unless DEBUG is on.
+    fn describe_command(&self, name: &str, args: &[ArgValue]) -> String {
+        match self.parser.lookup(name) {
+            Some(msg) => describe_message(&msg, args),
+            None => name.to_string(),
+        }
     }
 
     /// Send a command and wait for the response message.
@@ -812,6 +859,39 @@ mod tests {
         assert!(
             abort_handle.is_finished(),
             "receive task should be aborted after the Mcu is dropped"
+        );
+    }
+
+    #[test]
+    fn test_describe_message_names_the_parameters() {
+        // The names come from the message's format string, in declaration order.
+        let response = Msg::parse(101, "test_resp val=%u data=%.*s").unwrap();
+        assert_eq!(
+            describe_message(
+                &response,
+                &[ArgValue::UInt32(7), ArgValue::Bytes(vec![0xaa, 0xbb])]
+            ),
+            "test_resp val=7 data=aabb"
+        );
+
+        // A message with no parameters is just its name.
+        let bare = Msg::parse(5, "get_clock").unwrap();
+        assert_eq!(describe_message(&bare, &[]), "get_clock");
+    }
+
+    #[test]
+    fn test_describe_value_shows_each_type_readably() {
+        assert_eq!(describe_value(&ArgValue::UInt8(1)), "1");
+        assert_eq!(describe_value(&ArgValue::UInt16(2)), "2");
+        assert_eq!(describe_value(&ArgValue::Int16(-3)), "-3");
+        assert_eq!(describe_value(&ArgValue::UInt32(4)), "4");
+        assert_eq!(describe_value(&ArgValue::Int32(-5)), "-5");
+        assert_eq!(describe_value(&ArgValue::Str("abc".into())), "abc");
+
+        // Bytes are hex in the same 4-byte runs the interface uses for frames.
+        assert_eq!(
+            describe_value(&ArgValue::Bytes(vec![1, 2, 3, 4, 5])),
+            "01020304 05"
         );
     }
 }

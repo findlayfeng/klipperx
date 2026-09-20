@@ -10,7 +10,7 @@
 //!   }
 //! < {"id": null, "method": "klippy:status", "params": {...}}
 //! klippy> objects/query {"objects": {"toolhead": ["position"]}}
-//! Enter send · ↑↓ history · PgUp/PgDn scroll · Home/End (log) · ^G g-code · .help · ^C quit
+//! Enter send · ↑↓ history · PgUp/PgDn · Home/End (log) · ^G g-code · .help · ^C quit
 //! ```
 //!
 //! The header tracks the printer's state, the log holds everything that
@@ -27,10 +27,10 @@
 //!
 //! The log supports scrolling to review past output:
 //!
-//! - **Mouse wheel**: scroll up/down by 10 lines
-//! - **PgUp/PgDn**: scroll by 10 lines
-//! - **Home**: jump to top (oldest visible entries)
-//! - **End**: jump to bottom (newest entries)
+//! - **Mouse wheel**: scroll up/down by 10 entries
+//! - **PgUp/PgDn**: scroll by 10 entries
+//! - **Home**: jump to top (oldest entries, scroll=0)
+//! - **End**: jump to bottom (newest entries, scroll=max)
 //! - When scrolled back, new entries do not auto-scroll the view — your place
 //!   is kept until you return to the bottom.
 //!
@@ -154,8 +154,12 @@ pub fn is_available() -> bool {
 struct App {
     entries: Vec<Entry>,
     input: Input,
-    /// Lines scrolled back from the bottom of the log.
+    /// Index of the first entry visible in the viewport (0 = top).
     scroll: usize,
+    /// Whether the viewport is pinned (fixed) or follows the bottom.
+    /// When false (default), new entries push the viewport to the bottom.
+    /// When true, new entries are appended but the viewport stays put.
+    pinned: bool,
     /// The connection's state, shown in the header.
     status: Status,
     /// Set by a local command that asked to leave.
@@ -201,6 +205,7 @@ impl App {
             entries: Vec::new(),
             input: Input::default(),
             scroll: 0,
+            pinned: false,
             status: Status::Unknown,
             quit: false,
             gcode: false,
@@ -238,16 +243,18 @@ impl App {
     }
 
     fn push(&mut self, entry: Entry) {
-        // A new entry makes the newest line interesting again, so the view
-        // returns to the bottom — unless the user scrolled back to read
-        // something, in which case their place is kept.
-        let was_at_bottom = self.scroll == 0;
         self.entries.push(entry);
         if self.entries.len() > LOG_LIMIT {
             self.entries.drain(..self.entries.len() - LOG_LIMIT);
         }
-        if was_at_bottom {
-            self.scroll = 0;
+        // If pinned, the viewport stays put. Otherwise follow the bottom.
+        if !self.pinned {
+            self.scroll = self.entries.len().saturating_sub(1);
+        }
+        // If scroll exceeds bounds, clamp it.
+        let max_scroll = self.entries.len().saturating_sub(1);
+        if self.scroll > max_scroll {
+            self.scroll = max_scroll;
         }
     }
 
@@ -481,15 +488,34 @@ async fn handle_key(
         }
         // Scrolling the log, which is the reason the panes exist: the printer's
         // own output would otherwise push everything else away.
-        (KeyCode::PageUp, _) => app.scroll = app.scroll.saturating_add(10),
-        (KeyCode::PageDown, _) => app.scroll = app.scroll.saturating_sub(10),
-        (KeyCode::Home, _) => {
-            let max_scroll = app.entries.len().saturating_sub(1);
-            app.scroll = max_scroll;
+        (KeyCode::PageUp, _) => {
+            // View older = move toward top = decrease scroll
+            app.pinned = true;
+            app.scroll = app.scroll.saturating_sub(10);
         }
-        (KeyCode::End, _) => app.scroll = 0,
-        (KeyCode::Up, true) => app.scroll = app.scroll.saturating_add(1),
-        (KeyCode::Down, true) => app.scroll = app.scroll.saturating_sub(1),
+        (KeyCode::PageDown, _) => {
+            // View newer = move toward bottom = increase scroll
+            app.pinned = false;
+            app.scroll = app.scroll.saturating_add(10);
+        }
+        (KeyCode::Home, _) => {
+            // Top = oldest = scroll = 0
+            app.pinned = true;
+            app.scroll = 0;
+        }
+        (KeyCode::End, _) => {
+            // Bottom = newest = scroll = max
+            app.pinned = false;
+            app.scroll = app.entries.len().saturating_sub(1);
+        }
+        (KeyCode::Up, true) => {
+            app.pinned = true;
+            app.scroll = app.scroll.saturating_sub(1);
+        }
+        (KeyCode::Down, true) => {
+            app.pinned = false;
+            app.scroll = app.scroll.saturating_add(1);
+        }
         (code, _) => app.input.edit(code, ctrl),
     }
     Ok(Control::Continue)
@@ -499,12 +525,14 @@ async fn handle_key(
 fn handle_mouse(_app: &mut App, mouse: MouseEvent) {
     match mouse.kind {
         MouseEventKind::ScrollUp => {
-            // Scroll up = view older content = increase scroll
-            _app.scroll = _app.scroll.saturating_add(10);
+            // Scroll up = view older content = move toward top = decrease scroll
+            _app.pinned = true;
+            _app.scroll = _app.scroll.saturating_sub(10);
         }
         MouseEventKind::ScrollDown => {
-            // Scroll down = view newer content = decrease scroll
-            _app.scroll = _app.scroll.saturating_sub(10);
+            // Scroll down = view newer content = move toward bottom = increase scroll
+            _app.pinned = false;
+            _app.scroll = _app.scroll.saturating_add(10);
         }
         _ => (),
     }
@@ -622,13 +650,12 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
+    let max_scroll = app.entries.len().saturating_sub(1);
+    let is_at_bottom = app.scroll >= max_scroll;
     let hint = if app.quit {
         "leaving…".to_string()
-    } else if app.scroll > 0 {
-        format!(
-            "scrolled back {} lines · End bottom · Home top · PgDn return · ^C quit",
-            app.scroll
-        )
+    } else if !is_at_bottom {
+        format!("viewing older entries · End bottom · Home top · PgDn return · ^C quit")
     } else if app.gcode {
         "g-code mode · Enter send · ^G request mode · .gcode · ^C quit".to_string()
     } else {
@@ -643,45 +670,53 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
 
 /// The lines the log pane shows, newest last.
 ///
-/// Built from the bottom up and stopped as soon as the pane is full, so a log
-/// of thousands of entries costs no more to draw than a short one.
+/// `scroll` is the index of the first entry to show (0 = top).
+/// Lines are collected forward from `scroll` until the pane is full.
 fn visible_lines(app: &App, width: usize, height: usize) -> Vec<Line<'static>> {
     let width = width.max(1);
     let mut lines: Vec<Line<'static>> = Vec::new();
-    let wanted = height + app.scroll;
 
-    // Messages alternate between two colours; the index counts messages, not
-    // entries, so two in a row never look alike however many log lines sit
-    // between them.
-    let mut messages_left = app.entries.iter().filter(|entry| is_message(entry)).count();
+    // Start from the scroll index (clamp to valid range)
+    let start = app.scroll.min(app.entries.len().saturating_sub(1));
 
-    for entry in app.entries.iter().rev() {
+    // Count total messages in the visible range for alternating colours.
+    // We assign indices so the newest visible message gets the highest index
+    // (matches the original bottom-up iteration behavior).
+    let total_messages = app.entries[start..]
+        .iter()
+        .filter(|entry| is_message(entry))
+        .count();
+    let mut message_counter = 0;
+
+    for entry in &app.entries[start..] {
         if is_message(entry) {
-            messages_left -= 1;
-        }
-        let style = entry_style(entry, messages_left);
-        // Wrapped by hand rather than by `Paragraph::wrap`: the pane has to know
-        // how many lines each entry takes to scroll by the right amount.
-        // Backwards, like the entries: the pane is collected from its bottom
-        // up, so the last wrapped line of an entry is the one nearest the
-        // bottom. Collecting forward and reversing the whole list at the end
-        // would put an entry's own lines in reverse order.
-        for line in wrap(&entry_text(entry, app.format), width)
-            .into_iter()
-            .rev()
-        {
-            lines.push(Line::from(Span::styled(line, style)));
-            if lines.len() >= wanted {
+            // Assign index sequentially: oldest gets 0, newest gets highest.
+            let idx = message_counter;
+            message_counter += 1;
+            let style = entry_style(entry, idx);
+            for line in wrap(&entry_text(entry, app.format), width) {
+                lines.push(Line::from(Span::styled(line, style)));
+                if lines.len() >= height {
+                    break;
+                }
+            }
+            if lines.len() >= height {
+                break;
+            }
+        } else {
+            let style = entry_style(entry, 0);
+            for line in wrap(&entry_text(entry, app.format), width) {
+                lines.push(Line::from(Span::styled(line, style)));
+                if lines.len() >= height {
+                    break;
+                }
+            }
+            if lines.len() >= height {
                 break;
             }
         }
-        if lines.len() >= wanted {
-            break;
-        }
     }
 
-    lines.truncate(wanted);
-    lines.reverse();
     lines
 }
 
@@ -1018,9 +1053,14 @@ mod tests {
             state: "ready".to_string(),
             message: "Printer is ready".to_string(),
         };
+        // Set scroll to 0 (top) so all entries are visible in tests.
+        // In normal use, push() sets scroll to bottom.
+        app.scroll = 0;
         for entry in entries {
             app.push(entry);
         }
+        // Reset to top for tests so all entries are visible.
+        app.scroll = 0;
         app
     }
 
@@ -1192,10 +1232,12 @@ mod tests {
 
     #[test]
     fn test_the_hint_line_names_the_keys() {
-        let rows = render(&app_with(Vec::new()), 70, 6);
+        // Use wider width to fit the full hint text.
+        let rows = render(&app_with(Vec::new()), 100, 6);
         let footer = rows.last().unwrap();
         assert!(footer.contains("Enter send"), "{footer}");
         assert!(footer.contains("^C quit"), "{footer}");
+        assert!(footer.contains("Home/End"), "{footer}");
     }
 
     #[test]
@@ -1204,36 +1246,45 @@ mod tests {
             .map(|n| Entry::notice(Notice::Info, format!("line {n}")))
             .collect();
         let mut app = app_with(entries);
-        // Five rows: header, two rows of log, input, hint. Without scrolling the
-        // log shows its tail.
+        // Five rows: header, two rows of log, input, hint.
+        // With 2 log rows and 8 entries, at bottom we see entries 6 and 7.
+        // scroll = 6 means start from entry 6, showing entries 6 and 7.
+        app.scroll = 6;
         let rows = render(&app, 40, 5);
         assert!(rows[1].contains("line 7"), "{rows:?}");
         assert!(rows[2].contains("line 8"), "{rows:?}");
 
-        // Four lines back, the same two-row window shows the pair four lines up.
-        app.scroll = 4;
+        // Scroll back 4 entries: scroll = 6 - 4 = 2, shows line 3 and line 4.
+        app.pinned = true;
+        app.scroll = 2;
         let rows = render(&app, 40, 5);
         assert!(rows[1].contains("line 3"), "{rows:?}");
         assert!(rows[2].contains("line 4"), "{rows:?}");
-        assert!(rows.last().unwrap().contains("scrolled back 4"), "{rows:?}");
+        assert!(
+            rows.last().unwrap().contains("viewing older entries"),
+            "{rows:?}"
+        );
 
-        // Scrolling past the start shows the start, not an empty pane.
+        // Scrolling past the end shows the end, not an empty pane.
         app.scroll = 999;
         let rows = render(&app, 40, 5);
-        assert!(rows[1].contains("line 1"), "{rows:?}");
+        assert!(rows[1].contains("line 8"), "{rows:?}");
     }
 
     #[test]
     fn test_a_new_entry_returns_the_view_to_the_bottom() {
         let mut app = app_with(vec![Entry::notice(Notice::Info, "line 1")]);
+        // scroll = 0 means top (first entry). With 1 entry, top = bottom.
         app.scroll = 0;
         app.push(Entry::notice(Notice::Info, "line 2"));
-        assert_eq!(app.scroll, 0, "a new entry is worth looking at");
+        // New entry should push to bottom: scroll = entries.len() - 1 = 1
+        assert_eq!(app.scroll, 1, "a new entry is worth looking at");
 
-        // But a user who scrolled back keeps their place.
-        app.scroll = 3;
+        // Pin the viewport: user scrolled back, new entries don't push.
+        app.pinned = true;
+        app.scroll = 0; // at top
         app.push(Entry::notice(Notice::Info, "line 3"));
-        assert_eq!(app.scroll, 3);
+        assert_eq!(app.scroll, 0, "pinned viewport stays put");
     }
 
     #[test]

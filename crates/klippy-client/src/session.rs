@@ -328,6 +328,25 @@ impl Session {
         Ok(())
     }
 
+    /// Restart the firmware (`gcode/firmware_restart`).
+    ///
+    /// The server runs the `FIRMWARE_RESTART` command: the printer is rebuilt
+    /// and comes back, so a moment of `startup` follows and a subscription may
+    /// need re-establishing. The API connection itself stays up — the host
+    /// rebuilds the printer in place rather than restarting the server.
+    ///
+    /// # Errors
+    /// Returns [`TransportError`] if the request cannot be sent.
+    pub async fn firmware_restart(&mut self, out: &mut impl Output) -> Result<(), TransportError> {
+        self.request("gcode/firmware_restart", Map::new(), out)
+            .await?;
+        out.write(Entry::notice(
+            Notice::Info,
+            "Restarting the firmware; the printer will come back up.",
+        ));
+        Ok(())
+    }
+
     /// Send a line the user wrote as a whole request object.
     ///
     /// The line is YAML, so a request can be written without quoting its keys;
@@ -400,6 +419,10 @@ impl Session {
             // first asking which objects exist, and every real client does this
             // pair of calls at startup.
             "subscribe" | "sub" => self.subscribe(rest, out).await?,
+            // The firmware restart is worth a name of its own: without one it
+            // is the request `gcode/firmware_restart`, which is a mouthful to
+            // type in g-code mode where lines are not methods.
+            "firmware_restart" | "restart_firmware" => self.firmware_restart(out).await?,
             other => out.write(Entry::notice(
                 Notice::Problem,
                 format!("unknown command '.{other}'; try '.help'"),
@@ -539,6 +562,8 @@ Local commands:
   .help          this text
   .subscribe     watch every object (`objects/list` + `objects/subscribe`)
   .subscribe a b watch only the named objects
+  .firmware_restart
+                 restart the firmware; the printer comes back up
   .quit          leave, after printing any reply still owed (also ^D)
 
 Replies and pushes carry their direction; line mode prints one compact JSON line
@@ -655,6 +680,24 @@ mod tests {
             Ok(json!({
                 "script": request.params().get_or("script", &Value::Null).clone()
             }))
+        }
+    }
+
+    /// Answers `gcode/firmware_restart` with the empty result the real endpoint
+    /// sends before the host goes down.
+    struct FirmwareRestart;
+
+    impl Endpoint for FirmwareRestart {
+        fn path(&self) -> &'static str {
+            "gcode/firmware_restart"
+        }
+
+        fn handle(
+            &self,
+            _request: &Request,
+            _context: &EndpointContext<'_>,
+        ) -> Result<Value, ApiError> {
+            Ok(json!({}))
         }
     }
 
@@ -776,6 +819,7 @@ mod tests {
         api.register(Echo).unwrap();
         api.register(Failing).unwrap();
         api.register(GcodeScript).unwrap();
+        api.register(FirmwareRestart).unwrap();
         api.register(ListObjects).unwrap();
         api.register(Subscribe).unwrap();
         let server = Server::bind(dir.target(), Arc::new(api))
@@ -955,6 +999,64 @@ mod tests {
             }
             other => panic!("expected a sent entry, got {other:?}"),
         }
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn test_firmware_restart_sends_the_endpoint() {
+        let dir = SocketDir::new("fwrestart");
+        let (mut session, mut out, task) = session(&dir).await;
+
+        session.firmware_restart(&mut out).await.unwrap();
+
+        // One request: `gcode/firmware_restart`, with no parameters.
+        let sent = out.sent();
+        assert_eq!(sent.len(), 1);
+        match sent[0] {
+            Entry::Sent {
+                method, message, ..
+            } => {
+                assert_eq!(method, "gcode/firmware_restart");
+                assert_eq!(message["params"], json!({}));
+            }
+            other => panic!("expected a sent entry, got {other:?}"),
+        }
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn test_firmware_restart_is_a_local_command() {
+        let dir = SocketDir::new("fwrestartlocal");
+        let (mut session, mut out, task) = session(&dir).await;
+
+        // The `.`-prefixed name reaches the same request, in either input mode.
+        assert_eq!(
+            session
+                .handle_line(".firmware_restart", &mut out)
+                .await
+                .unwrap(),
+            Control::Continue
+        );
+        assert_eq!(
+            session
+                .handle_gcode_line(".firmware_restart", &mut out)
+                .await
+                .unwrap(),
+            Control::Continue
+        );
+
+        let methods: Vec<&str> = out
+            .sent()
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::Sent { method, .. } => Some(method.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            methods,
+            ["gcode/firmware_restart", "gcode/firmware_restart"]
+        );
         task.abort();
     }
 

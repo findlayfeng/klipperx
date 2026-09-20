@@ -38,6 +38,11 @@
 //! several rows can be read a line at a time, and one keystroke moves what the
 //! eye counts, not what the protocol happened to delimit.
 //!
+//! The log's rightmost column is a scrollbar. It is always reserved, so the text
+//! never shifts sideways when the log outgrows the pane, and the thumb appears
+//! only when there is something to scroll. Because the log pane itself owns that
+//! column, it is one column narrower than the window.
+//!
 //! # Threads and tasks
 //!
 //! One task (the one running [`run`]) draws and owns all the state, one blocking
@@ -56,7 +61,7 @@
 //! * The log keeps everything for the life of the session; a very chatty
 //!   subscription will grow it without bound.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::io::IsTerminal as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -68,7 +73,7 @@ use ratatui::crossterm::event::{
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
 use ratatui::Frame;
 use serde_json::Value;
 
@@ -168,6 +173,9 @@ struct App {
     /// Width of the log pane as last drawn. A pinned view needs it to count the
     /// lines a new entry adds below the viewport.
     width: Cell<usize>,
+    /// The whole log's rendered height, so the scrollbar can show how much of
+    /// it is on screen without re-wrapping the log every frame.
+    heights: RefCell<Heights>,
     /// The connection's state, shown in the header.
     status: Status,
     /// Set by a local command that asked to leave.
@@ -199,9 +207,10 @@ enum Status {
 }
 
 /// How the window shows a message body.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum Format {
     /// Block YAML: a tree with no quoting, the default.
+    #[default]
     Yaml,
     /// Compact JSON: the wire form, for when the exact bytes matter.
     Json,
@@ -215,6 +224,7 @@ impl App {
             scroll: 0,
             viewport: Cell::new(0),
             width: Cell::new(0),
+            heights: RefCell::new(Heights::default()),
             status: Status::Unknown,
             quit: false,
             gcode: false,
@@ -256,25 +266,53 @@ impl App {
         // to the bottom: the new entry lands below it, so the offset grows by
         // the lines that entry takes. At the bottom (`scroll == 0`) the view
         // follows the new entry, which is what a log should do.
-        let added = if self.scroll > 0 {
-            self.lines_of(&entry)
-        } else {
-            0
-        };
-        self.entries.push(entry);
-        if self.entries.len() > LOG_LIMIT {
-            self.entries.drain(..self.entries.len() - LOG_LIMIT);
+        let width = self.width.get().max(1);
+        let height = entry_height(&entry, width, self.format);
+        let added = if self.scroll > 0 { height } else { 0 };
+
+        // The heights parallel the entries. A pane resize or a body-format
+        // switch re-wraps the whole log; anything that shortened the entries
+        // without touching the heights (`Ctrl+L`) shows up here too. Measuring
+        // one entry per push is what lets the scrollbar show the whole log
+        // without re-wrapping it.
+        let mut measured = self.heights.borrow_mut();
+        if measured.width != width
+            || measured.format != self.format
+            || measured.heights.len() != self.entries.len()
+        {
+            measured.remeasure(&self.entries, width, self.format);
         }
+
+        self.entries.push(entry);
+        measured.push(height);
+
+        if self.entries.len() > LOG_LIMIT {
+            let dropped = self.entries.len() - LOG_LIMIT;
+            self.entries.drain(..dropped);
+            measured.drop_front(dropped);
+        }
+        drop(measured);
+
         self.scroll = self.scroll.saturating_add(added);
     }
 
-    /// How many rendered lines an entry occupies at the pane's last width.
+    /// The whole log's rendered height at `width`, the number a scrollbar wants.
     ///
-    /// The renderer lays text out exactly this way, so the count keeps a pinned
-    /// viewport over the same lines when new output arrives.
-    fn lines_of(&self, entry: &Entry) -> usize {
-        let width = self.width.get().max(1);
-        wrap(&entry_text(entry, self.format), width).len()
+    /// Wrapping is the only reason this differs from `entries.len()`, and it is
+    /// not free, so the per-entry heights are kept and only measured again when
+    /// the pane width, the body format, or the set of entries changed.
+    fn total_lines(&self, width: usize) -> usize {
+        let width = width.max(1);
+        let mut measured = self.heights.borrow_mut();
+        // The heights parallel the entries; if anything emptied one without the
+        // other (`Ctrl+L`), the two disagree and the log is measured again.
+        if measured.width != width
+            || measured.format != self.format
+            || measured.heights.len() != self.entries.len()
+        {
+            measured.remeasure(&self.entries, width, self.format);
+        }
+        measured.total
     }
 
     /// Handle a local command only the window has.
@@ -632,12 +670,40 @@ fn header_lines(app: &App, width: usize) -> Vec<Line<'static>> {
 }
 
 fn draw_log(frame: &mut Frame, app: &App, area: Rect) {
-    // Remember the pane's shape: PgUp/PgDn move a page, and a pinned viewport
-    // counts new lines at this width.
-    app.viewport.set(area.height as usize);
-    app.width.set(area.width as usize);
-    let lines = visible_lines(app, area.width as usize, area.height as usize);
-    frame.render_widget(Paragraph::new(Text::from(lines)), area);
+    // The rightmost column belongs to the scrollbar, so the log wraps one
+    // column short of the pane. Reserving it even when the log fits keeps the
+    // text from jumping sideways the moment the log outgrows the pane.
+    let [text, gutter] =
+        Layout::horizontal([Constraint::Min(1), Constraint::Length(1)]).areas(area);
+
+    // Remember the pane's shape: PgUp/PgDn move a page, a pinned viewport
+    // counts new lines at this width, and the heights are measured at it.
+    app.viewport.set(text.height as usize);
+    app.width.set(text.width as usize);
+
+    let width = text.width as usize;
+    let total = app.total_lines(width);
+    let view = visible_lines(app, width, text.height as usize, total);
+    frame.render_widget(Paragraph::new(Text::from(view.lines)), text);
+
+    if total > text.height as usize {
+        let mut state = ScrollbarState::new(total)
+            .position(scrollbar_position(view.first, total, view.shown))
+            .viewport_content_length(view.shown);
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                // Arrow heads would eat a two-row track whole, and the window
+                // has no use for them.
+                .begin_symbol(None)
+                .end_symbol(None)
+                .track_symbol(Some("│"))
+                .thumb_symbol("█")
+                .track_style(Style::new().fg(Color::DarkGray))
+                .thumb_style(Style::new().fg(Color::Gray)),
+            gutter,
+            &mut state,
+        );
+    }
 }
 
 fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
@@ -682,13 +748,89 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
+/// The log's rendered height, entry by entry.
+///
+/// The scrollbar needs the whole log's height, and wrapping every entry to get
+/// it would be the most expensive thing the window does — the log is capped at
+/// [`LOG_LIMIT`] entries, so it is not a small number. The heights are therefore
+/// kept: one entry per [`App::push`], the whole log only when the pane width or
+/// body format changes, since either one re-wraps everything.
+#[derive(Default)]
+struct Heights {
+    /// The pane width these heights were measured at (0 = never measured).
+    width: usize,
+    /// The body format they were measured in.
+    format: Format,
+    /// One height per entry, parallel to `App::entries`.
+    heights: Vec<usize>,
+    /// The sum of `heights`.
+    total: usize,
+}
+
+impl Heights {
+    fn remeasure(&mut self, entries: &[Entry], width: usize, format: Format) {
+        self.width = width;
+        self.format = format;
+        self.heights.clear();
+        self.total = 0;
+        for entry in entries {
+            let height = entry_height(entry, width, format);
+            self.heights.push(height);
+            self.total += height;
+        }
+    }
+
+    fn push(&mut self, height: usize) {
+        self.heights.push(height);
+        self.total += height;
+    }
+
+    fn drop_front(&mut self, count: usize) {
+        self.total -= self.heights.drain(..count).sum::<usize>();
+    }
+}
+
+/// How many rendered lines an entry takes at `width`.
+///
+/// The renderer lays text out exactly this way, so this is both the scrollbar's
+/// arithmetic and what keeps a pinned viewport over the same lines when new
+/// output arrives.
+fn entry_height(entry: &Entry, width: usize, format: Format) -> usize {
+    wrap(&entry_text(entry, format), width.max(1)).len()
+}
+
+/// Where a viewport starting at `first` belongs on the scrollbar's track.
+///
+/// The widget spreads `position` over `0..total-1`, but a `shown`-line viewport
+/// can only start as late as `total - shown`, so handing it `first` directly
+/// would stop the thumb short of the bottom when the log is following. Stretch
+/// the offset over the range the bar actually has, and both ends stay flush.
+fn scrollbar_position(first: usize, total: usize, shown: usize) -> usize {
+    match total.checked_sub(shown) {
+        Some(range) if range > 0 => first.saturating_mul(total - 1) / range,
+        _ => 0,
+    }
+}
+
+/// One frame's worth of the log: the lines to draw, and where they sit in the
+/// whole log — which is what a scrollbar reports.
+struct Viewport {
+    /// The lines to draw, oldest first.
+    lines: Vec<Line<'static>>,
+    /// The first shown line's index, counted from the top of the log.
+    first: usize,
+    /// How many lines the pane shows.
+    shown: usize,
+}
+
 /// The lines the log pane shows, oldest first.
 ///
 /// `scroll` is how many rendered lines the pane is scrolled back from the
 /// bottom (0 = the newest line). The pane shows `height` lines ending there,
 /// clamped to the top of the log, so scrolling past the end shows the oldest
-/// lines rather than an empty pane.
-fn visible_lines(app: &App, width: usize, height: usize) -> Vec<Line<'static>> {
+/// lines rather than an empty pane. `total` is the whole log's height, which
+/// `visible_lines` itself has no reason to measure.
+fn visible_lines(app: &App, width: usize, height: usize, total: usize) -> Viewport {
     let width = width.max(1);
     let want = app.scroll;
 
@@ -728,8 +870,16 @@ fn visible_lines(app: &App, width: usize, height: usize) -> Vec<Line<'static>> {
     let skip = want.min(lines.len().saturating_sub(height));
     lines.drain(..skip);
     lines.truncate(height);
+    let shown = lines.len();
     lines.reverse();
-    lines
+
+    Viewport {
+        lines,
+        // `skip` lines were dropped from the bottom, and `shown` reach up from
+        // there, so this is the topmost line's place in the whole log.
+        first: total.saturating_sub(shown + skip),
+        shown,
+    }
 }
 
 /// How an entry looks.
@@ -1331,6 +1481,62 @@ mod tests {
     }
 
     #[test]
+    fn test_the_log_height_counts_wrapped_lines() {
+        // A fresh app measures at width 1, so the first query has to remeasure.
+        let mut app = app_with(vec![Entry::notice(Notice::Info, "one\ntwo\nthree")]);
+        assert_eq!(app.total_lines(40), 3);
+
+        app.push(Entry::notice(Notice::Info, "four"));
+        assert_eq!(app.total_lines(40), 4, "one more entry, one more line");
+
+        // The same log is taller in a narrower pane, and the scrollbar must not
+        // keep reporting the width it was measured at before.
+        assert_eq!(app.total_lines(4), 5, "'three' wraps into two rows at 4");
+
+        // Clearing the log clears the measured heights with it.
+        app.entries.clear();
+        assert_eq!(app.total_lines(40), 0, "a cleared log has no height");
+        app.push(Entry::notice(Notice::Info, "fresh"));
+        assert_eq!(app.total_lines(40), 1, "and it measures again from there");
+    }
+
+    #[test]
+    fn test_the_scrollbar_is_absent_when_the_log_fits() {
+        let app = app_with(vec![Entry::notice(Notice::Info, "one line")]);
+        assert_eq!(
+            log_gutter(&app, 40, 5),
+            vec![" ", " "],
+            "a log that fits leaves the gutter empty"
+        );
+    }
+
+    #[test]
+    fn test_the_scrollbar_follows_the_scroll_position() {
+        let entries: Vec<Entry> = (1..=20)
+            .map(|n| Entry::notice(Notice::Info, format!("line {n}")))
+            .collect();
+        let mut app = app_with(entries);
+
+        // A fresh log follows the newest line, so the thumb sits at the bottom.
+        let bottom = log_gutter(&app, 40, 8);
+        assert_eq!(bottom.len(), 5, "the log pane's own rows");
+        assert_eq!(bottom.last().unwrap(), "█", "{bottom:?}");
+        assert!(bottom[..4].iter().all(|cell| cell == "│"), "{bottom:?}");
+
+        // Scrolling back moves the thumb up the track.
+        app.scroll = 8;
+        let back = log_gutter(&app, 40, 8);
+        assert_eq!(back[2], "█", "{back:?}");
+
+        // Home puts it at the top, and there it stays however far past the top
+        // the offset is.
+        app.scroll = usize::MAX;
+        let top = log_gutter(&app, 40, 8);
+        assert_eq!(top[0], "█", "{top:?}");
+        assert!(top[1..].iter().all(|cell| cell == "│"), "{top:?}");
+    }
+
+    #[test]
     fn test_the_input_line_shows_the_prompt_and_the_cursor() {
         let mut app = app_with(Vec::new());
         for character in "list_endpoints".chars() {
@@ -1440,7 +1646,9 @@ mod tests {
 
     /// The log pane's lines as plain text.
     fn log_text(app: &App, width: usize, height: usize) -> Vec<String> {
-        visible_lines(app, width, height)
+        let total = app.total_lines(width);
+        visible_lines(app, width, height, total)
+            .lines
             .iter()
             .map(|line| {
                 line.spans
@@ -1449,6 +1657,22 @@ mod tests {
                     .collect::<String>()
             })
             .collect()
+    }
+
+    /// The log pane's rightmost column, one cell per row: the scrollbar gutter.
+    fn scrollbar_column(app: &App, width: u16, height: u16) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..height)
+            .map(|row| buffer[(width - 1, row)].symbol().to_string())
+            .collect()
+    }
+
+    /// The gutter rows that belong to the log pane: everything between the
+    /// header row and the two rows the input line and the footer take.
+    fn log_gutter(app: &App, width: u16, height: u16) -> Vec<String> {
+        scrollbar_column(app, width, height)[1..(height as usize - 2)].to_vec()
     }
 
     #[test]
@@ -1614,7 +1838,8 @@ mod tests {
             Entry::Push(serde_json::json!({"method": "b"})),
         ]);
 
-        let lines = visible_lines(&app, 40, 8);
+        let total = app.total_lines(40);
+        let lines = visible_lines(&app, 40, 8, total).lines;
         let colours: Vec<Option<Color>> = lines
             .iter()
             .filter(|line| line.spans[0].content.starts_with('<'))

@@ -218,7 +218,7 @@ mod tests {
         printer.load_config(&config).unwrap();
         assert_eq!(printer.objects(), ["gcode", "pins", "mcu"]);
 
-        printer.reset_for_restart();
+        printer.reset_for_restart("restart");
         printer.load_config(&config).unwrap();
 
         assert_eq!(printer.objects(), ["gcode", "pins", "mcu"]);

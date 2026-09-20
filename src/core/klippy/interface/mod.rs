@@ -1,6 +1,8 @@
 pub mod canserial;
 pub mod error;
 pub mod host;
+#[cfg(test)]
+pub(crate) mod pty;
 pub mod serial;
 #[cfg(test)]
 pub mod test;

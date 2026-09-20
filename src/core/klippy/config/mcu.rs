@@ -4,6 +4,10 @@ use crate::core::klippy::mcu::McuRestartMethod;
 use tracing::{info, warn};
 
 /// MCU (Microcontroller Unit) configuration parsed from config file.
+///
+/// Parsing does not touch a device: [`McuConfig::open`] is what opens the
+/// transport. The split lets a firmware restart reset the board on its **closed**
+/// port, between the two (`mcu/object.rs`, `mcu/restart.rs`).
 #[derive(Debug)]
 pub struct McuConfig {
     /// MCU name (from ConfigSection's sub field)
@@ -12,11 +16,34 @@ pub struct McuConfig {
     ///
     /// Resolved to the effective method: `command` for a non-serial MCU, the
     /// config's own value (default `arduino`) for a serial one. The physical
-    /// restart is still pending — only `command` has a path today, through
-    /// `config_reset` ([`McuRestartMethod`]).
+    /// restart is still pending for `cheetah`/`rpi_usb` — only `command` and
+    /// `arduino` have a path today ([`McuRestartMethod`]).
     pub restart_method: McuRestartMethod,
-    /// MCU interface for communication
-    pub interface: Interface,
+    /// What to open, described but not opened.
+    pub transport: Transport,
+}
+
+/// The transport a section asks for, described before anything is opened.
+///
+/// Keeping the description separate from the opened [`Interface`] is what lets
+/// the host reset a firmware on its **closed** port — a reset needs the port
+/// path, and the device must not be open — between parsing the section and
+/// opening the device (see [`McuConfig::open`]).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Transport {
+    /// A tty at a line speed.
+    Serial { path: String, baud: u32 },
+    /// A Klipper can-serial link (a CAN interface and node id).
+    Can {
+        interface: String,
+        uuid: [u8; 6],
+        nodeid: u32,
+    },
+    /// Klipper's host library, loaded from a shared object.
+    Host { library: String },
+    /// A scripted device, in test builds (`test:`).
+    #[cfg(test)]
+    Test(super::value::ConfigValue),
 }
 
 /// Parse Klipper's `canbus_uuid`: six bytes as twelve hex digits.
@@ -88,8 +115,8 @@ impl McuConfig {
         // stripped (`klippy/mcu.py:1151-1153`): the main `[mcu]` is "mcu", and
         // `[mcu zboard]` is "zboard". Not an empty string for the main one.
         let name = section.sub.clone().unwrap_or_else(|| section.id.clone());
-        let interface = Self::create_interface(section)?;
-        let serial = matches!(interface, Interface::Serial(_));
+        let transport = Self::transport_for(section)?;
+        let serial = matches!(transport, Transport::Serial { .. });
 
         // The option only means something on a serial port. Say so rather than
         // dropping it silently, then report what the MCU will actually use.
@@ -105,8 +132,17 @@ impl McuConfig {
         Ok(Self {
             name,
             restart_method,
-            interface,
+            transport,
         })
+    }
+
+    /// Open the transport this config describes.
+    ///
+    /// # Errors
+    /// Returns the transport's own message (`serial: …`, `canbus: …`,
+    /// `host_library: …`) when it cannot be opened.
+    pub fn open(&self) -> Result<Interface, String> {
+        self.transport.open()
     }
 
     /// Resolve `restart_method` for an MCU whose transport is (or is not) serial.
@@ -137,11 +173,12 @@ impl McuConfig {
         }
     }
 
-    /// Create the interface the section asks for.
+    /// Describe the transport the section asks for, without opening it.
     ///
     /// One connection key selects it. Two of them is a configuration mistake, not
-    /// a preference order, so it is reported rather than resolved silently.
-    fn create_interface(section: &ConfigSection) -> Result<Interface, String> {
+    /// a preference order, so it is reported rather than resolved silently. Every
+    /// check lives here; [`Transport::open`] only performs the side effects.
+    fn transport_for(section: &ConfigSection) -> Result<Transport, String> {
         let requested: Vec<&str> = interface_keys()
             .iter()
             .copied()
@@ -187,8 +224,11 @@ impl McuConfig {
                     ))
                 }
             };
-            return Interface::canserial(&interface, uuid, nodeid)
-                .map_err(|e| format!("canbus: {e}"));
+            return Ok(Transport::Can {
+                interface,
+                uuid,
+                nodeid,
+            });
         }
 
         if section.has("canbus_nodeid") || section.has("canbus_interface") {
@@ -199,7 +239,9 @@ impl McuConfig {
         }
 
         if let Some(path) = section.get_str("host_library") {
-            return Interface::host(path).map_err(|e| format!("host_library: {e}"));
+            return Ok(Transport::Host {
+                library: path.to_string(),
+            });
         }
 
         if let Some(path) = section.get_str("serial") {
@@ -216,12 +258,15 @@ impl McuConfig {
                 },
                 None => crate::core::klippy::interface::serial::DEFAULT_BAUD,
             };
-            return Interface::serial(path, baud).map_err(|e| format!("serial: {e}"));
+            return Ok(Transport::Serial {
+                path: path.to_string(),
+                baud,
+            });
         }
 
         #[cfg(test)]
         if let Some(test_value) = section.get("test") {
-            return Ok(Interface::new(Self::test_device(test_value)));
+            return Ok(Transport::Test(test_value.clone()));
         }
 
         let how = if cfg!(test) {
@@ -285,6 +330,36 @@ impl McuConfig {
             .step_by(2)
             .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| e.to_string()))
             .collect()
+    }
+}
+
+impl Transport {
+    /// Open the described transport.
+    ///
+    /// This is where the side effects — opening a tty, a CAN socket, or the host
+    /// library — and the errors that name them live. Parsing, and every config
+    /// check, happened in [`McuConfig::new`].
+    ///
+    /// # Errors
+    /// Returns a message prefixed with the transport that failed.
+    pub fn open(&self) -> Result<Interface, String> {
+        match self {
+            Transport::Serial { path, baud } => {
+                Interface::serial(path, *baud).map_err(|e| format!("serial: {e}"))
+            }
+            Transport::Can {
+                interface,
+                uuid,
+                nodeid,
+            } => {
+                Interface::canserial(interface, *uuid, *nodeid).map_err(|e| format!("canbus: {e}"))
+            }
+            Transport::Host { library } => {
+                Interface::host(library).map_err(|e| format!("host_library: {e}"))
+            }
+            #[cfg(test)]
+            Transport::Test(value) => Ok(Interface::new(McuConfig::test_device(value))),
+        }
     }
 }
 
@@ -401,11 +476,14 @@ mod tests {
     }
 
     #[test]
-    fn test_host_library_key_becomes_the_host_interface() {
-        // A path that cannot be loaded still proves the routing: the error is the
-        // library's, not the "needs an interface" one.
+    fn test_host_library_key_becomes_the_host_transport() {
+        // Parsing routes it to the host transport; opening is what touches the
+        // library, so the failure is the library's, not "needs an interface".
         let section = section_with("host_library", "/nonexistent/libklipper_host.so");
-        let err = McuConfig::new(&section).unwrap_err();
+        let config = McuConfig::new(&section).unwrap();
+        assert!(matches!(&config.transport, Transport::Host { .. }));
+
+        let err = config.open().unwrap_err();
         assert!(err.starts_with("host_library: "), "{err}");
         assert!(err.contains("/nonexistent/libklipper_host.so"), "{err}");
     }
@@ -424,11 +502,17 @@ mod tests {
     }
 
     #[test]
-    fn test_serial_key_becomes_the_serial_interface() {
-        // A port that cannot be opened still proves the routing: the error names
-        // the port, which only the serial device's own error does.
+    fn test_serial_key_becomes_the_serial_transport() {
         let section = section_with("serial", "/dev/not-a-serial-port");
-        let err = McuConfig::new(&section).unwrap_err();
+        let config = McuConfig::new(&section).unwrap();
+        assert!(matches!(
+            config.transport,
+            Transport::Serial { ref path, .. } if path == "/dev/not-a-serial-port"
+        ));
+
+        // A port that cannot be opened proves the routing: the error names the
+        // port, which only the serial device's own error does.
+        let err = config.open().unwrap_err();
         assert!(err.starts_with("serial: "), "{err}");
         assert!(err.contains("/dev/not-a-serial-port"), "{err}");
     }
@@ -449,11 +533,17 @@ mod tests {
     }
 
     #[test]
-    fn test_canbus_keys_become_the_can_interface() {
-        // No CAN interface in the test environment, so the routing shows up as the
-        // socket's error naming the interface we asked for.
+    fn test_canbus_keys_become_the_can_transport() {
         let section = can_section(&[("canbus_interface", "can99")]);
-        let err = McuConfig::new(&section).unwrap_err();
+        let config = McuConfig::new(&section).unwrap();
+        assert!(matches!(
+            config.transport,
+            Transport::Can { ref interface, .. } if interface == "can99"
+        ));
+
+        // No CAN interface in the test environment, so opening shows up as the
+        // socket's error naming the interface we asked for.
+        let err = config.open().unwrap_err();
         assert!(err.starts_with("canbus: "), "{err}");
         assert!(err.contains("can99"), "{err}");
     }
@@ -480,7 +570,10 @@ mod tests {
         }
 
         // A valid node id gets as far as the socket, which is where it fails here.
-        let err = McuConfig::new(&can_section(&[])).unwrap_err();
+        let err = McuConfig::new(&can_section(&[]))
+            .unwrap()
+            .open()
+            .unwrap_err();
         assert!(err.contains("no CAN interface named 'can0'"), "{err}");
     }
 

@@ -25,6 +25,7 @@ mod error;
 mod object;
 mod pending;
 mod pin;
+mod restart;
 mod restart_method;
 
 pub use config::{BuiltConfig, ConfigBuilder, ConfigCallback, Configured, PostInitCallback};
@@ -34,7 +35,6 @@ pub use object::{load_config, load_config_prefix, McuObject};
 pub use pin::{McuChip, McuDigitalOut};
 pub use restart_method::McuRestartMethod;
 
-use crate::core::klippy::config::mcu::McuConfig;
 use crate::core::klippy::frame::{Frame, MESSAGE_PAYLOAD_MAX};
 use crate::core::klippy::identify;
 use crate::core::klippy::interface::Interface;
@@ -359,8 +359,8 @@ impl Mcu {
         }
     }
 
-    /// Build the transport for `config`: the parser with the host's identify
-    /// formats, the send task, and the receive task.
+    /// Build the transport for an MCU called `name`: the parser with the host's
+    /// identify formats, the send task, and the receive task.
     ///
     /// The result is **not identified**. Until a dictionary is installed, the
     /// only message that can be exchanged is identify itself, and the typed
@@ -371,11 +371,11 @@ impl Mcu {
     ///
     /// The two background tasks outlive this call and are stopped by [`Drop`].
     ///
-    /// `config.restart_method` is not read here: the transport is built the same
-    /// way whatever the method is, and the physical restart (DTR toggles, USB
-    /// power) is not implemented yet (see [`McuRestartMethod`]).
-    pub fn new(config: McuConfig) -> Self {
-        Self::from_parts(config.name, config.interface)
+    /// The interface arrives already open: a [`McuConfig`] describes a transport
+    /// and `McuConfig::open` opens it, so that a firmware restart can reset the
+    /// board on its **closed** port in between (`mcu/restart.rs`).
+    pub fn new(name: impl Into<String>, interface: Interface) -> Self {
+        Self::from_parts(name.into(), interface)
     }
 
     /// Install the firmware's data dictionary.
@@ -759,11 +759,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_new_starts_unidentified() {
-        let mcu = Mcu::new(McuConfig {
-            name: "test_mcu".to_string(),
-            restart_method: McuRestartMethod::Command,
-            interface: Interface::new(TestDevice::new(vec![])),
-        });
+        let mcu = Mcu::new("test_mcu", Interface::new(TestDevice::new(vec![])));
 
         assert_eq!(mcu.name(), "test_mcu");
 

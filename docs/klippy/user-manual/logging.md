@@ -10,7 +10,7 @@ KlipperX 的日志系统基于 Rust 的 `tracing` 框架，支持多种级别和
 | `WARN` | 警告，主机仍可继续运行 | 请求格式异常、超时 |
 | `INFO` | 正常信息（**默认级别**） | 启动完成、API 监听地址 |
 | `DEBUG` | 调试细节，仅在排查问题时开启 | 配置节数、内部状态变化 |
-| `TRACE` | 最详细的追踪信息 | 内部函数调用链 |
+| `TRACE` | 最详细的追踪信息 | 接口帧的字节内容 |
 
 默认情况下只显示 `INFO` 及以上级别的日志。
 
@@ -87,8 +87,21 @@ WARN  api: dropping malformed request (invalid JSON …): not json
 - `WARN` — 异常情况但主机仍在运行，如请求格式错误
 - `ERROR` — 严重错误，可能导致功能不可用
 - `DEBUG` — 内部调试信息，如配置节数量、状态变化等
+- `TRACE` — 接口层帧的字节内容（十六进制）
 
 在 `DEBUG` 级别下，日志会包含模块名称前缀，如 `klippy`、`api`、`webhooks` 等，方便定位问题来源。
+
+### 接口帧日志
+
+接口层（`interface`）的日志按级别递增显示不同细节：
+
+| 级别 | 接口日志示例 |
+|------|-------------|
+| `INFO` | `serial port /dev/ttyACM0 open at 250000 baud` |
+| `DEBUG` | `sent 15 bytes to /dev/ttyACM0`、`received 32 bytes from /dev/ttyACM0` |
+| `TRACE` | 按字节打印帧的十六进制内容（如 `01 02 03 ff fe`） |
+
+`DEBUG` 级别只显示字节数量，`TRACE` 级别才会打印帧的实际字节内容。
 
 ## 常见问题
 

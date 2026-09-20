@@ -32,7 +32,7 @@
 //! should keep working.
 
 use super::error::InterfaceError;
-use super::{describe_frame, hex_runs, Device};
+use super::{describe_frame, Device};
 use crate::core::klippy::frame::{Frame, FrameStream};
 use std::ffi::CString;
 use std::fmt;
@@ -359,10 +359,17 @@ impl Device for CanSerialDevice {
                 Ok(read) if read >= CAN_FRAME_SIZE => {
                     let can_frame = CanFrame::from_abi(&raw);
                     if self.link.lock().unwrap().accept(&can_frame) {
-                        // One CAN frame carries eight bytes of the message block,
-                        // not a block of its own, so there are no parts to split:
-                        // only the bytes, in runs.
-                        trace!("rx frame [{}]: {}", self.id(), hex_runs(can_frame.data()));
+                        // The eight data bytes are a slice of the serial byte
+                        // stream, not a frame of their own: the block's header
+                        // and trailer are the serial format's, and only a whole
+                        // block has parts to split. The same formatter as the
+                        // serial port is therefore the right one — it falls back
+                        // to plain runs when a slice is not a whole frame.
+                        trace!(
+                            "rx frame [{}]: {}",
+                            self.id(),
+                            describe_frame(can_frame.data())
+                        );
                         debug!("received CAN frame of {} bytes", can_frame.data().len());
                     } else {
                         debug!("ignoring CAN frame for id {:#x}", can_frame.id());

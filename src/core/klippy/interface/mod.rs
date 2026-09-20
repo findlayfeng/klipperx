@@ -264,6 +264,21 @@ mod trace_tests {
         let pair = [frame.clone(), frame].concat();
         assert_eq!(describe_frame(&pair), hex_runs(&pair));
     }
+
+    #[test]
+    fn test_a_can_slice_is_formatted_as_a_serial_frame() {
+        // CAN carries the serial byte stream cut every eight bytes, so a frame
+        // that fills one CAN frame arrives whole and splits as usual.
+        let whole = Frame::encode(1, &[1, 2, 3]);
+        assert_eq!(whole.len(), 8, "one CAN frame's worth");
+        let expected = format!("0811 | 010203 | {:02x}{:02x}7e", whole[5], whole[6]);
+        assert_eq!(describe_frame(&whole), expected);
+
+        // A longer frame is cut, so its first slice is a fragment with no whole
+        // frame's parts to show; the same formatter degrades to runs.
+        let longer = Frame::encode(1, &[0; 6]);
+        assert_eq!(describe_frame(&longer[..8]), hex_runs(&longer[..8]));
+    }
 }
 
 // ===========================================================================

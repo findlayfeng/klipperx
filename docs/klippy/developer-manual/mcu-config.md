@@ -2,7 +2,7 @@
 
 一台真实 MCU 的配置是**一次性**下发的：每个资源（引脚、总线、传感器）先领一个 **oid**，再用一条 `config_*` 命令登记自己；主机把这些命令攒起来，算一个 CRC，随 `finalize_config` 一起发出去。之后固件靠 oid 引用这些对象，不再需要重复引脚与总线参数。
 
-本文说明这一层为什么存在、我们的 `ConfigBuilder` 怎么工作，以及**我们的 CRC 与上游算的不是同一样东西**——这是本层唯一一处有意偏离，展开在 [CRC 一节](#crc我们与上游算的不是同一样东西)。
+本文说明这一层为什么存在、设备侧保存了什么、怎么校验，以及**我们的 CRC 与上游算的不是同一样东西**——这是本层唯一一处有意偏离，展开在 [CRC 一节](#crc我们与上游算的不是同一样东西)。
 
 上游参考：`klippy/mcu.py` 的 `MCUConfigHelper`（`:979-1143`）与 `src/basecmd.c` 的分配/配置区。
 
@@ -87,6 +87,44 @@ McuObject::new
 
 oid 的**分配顺序 = 对象创建顺序 = config 里的顺序**，因此配置命令的字节序列是确定的——这正是下面 CRC 能当缓存键的前提。
 
+## 设备侧的配置与校验
+
+前面讲的是主机侧的构建。设备侧保存的是这次构建的**结果**，以及一个用来判断它是否仍是当前这份配置的校验值。
+
+### 设备侧的配置是什么
+
+固件在配置期建立、此后只读的状态：
+
+| 状态 | 固件位置 | 建立 / 清除 |
+|---|---|---|
+| 对象表 `oids`（`oid_count` 个槽） | `src/basecmd.c:189-190` | `allocate_oids` 一次分配（`:227`），`oid_alloc` 逐槽占据（`:200`） |
+| 运动队列（`move_count`） | `src/basecmd.c:170` 一带 | `finalize_config` 调 `move_finalize()` 定稿（`:255`） |
+| 配置校验值 `config_crc` | `src/basecmd.c:242` | `finalize_config crc=%u` 写入（`:256`）；`config_reset` 清零（`:267`） |
+
+`finalize_config` 终结配置期：之后 `oid_alloc` 报 `Can't assign oid`（`src/basecmd.c:203`），第二次 `finalize_config` 报 `Already finalized`（`:173`）。所以设备上的一份配置在**一次上电周期内只能建立一次**，要换成另一份必须先复位。
+
+### 如何校验
+
+`get_config` 把这三样以 `config is_config=%c crc=%u is_shutdown=%c move_count=%hu` 报回主机（`src/basecmd.c:244-250`）。主机连接时的流程是：
+
+1. `ConfigBuilder::build` 把这次要下发的 `config` 列表（含 `allocate_oids`）编码并算出 CRC；
+2. 发 `get_config`，读回设备侧的 `is_config` / `crc`；
+3. 按两者决定：
+   - `!is_config`：设备未配置（新上电，或刚被复位）→ 发 `config` 列表 + `init`；
+   - `is_config && crc == 主机值`：设备上留的正是这份配置 → 只发 `restart` + `init`；
+   - `is_config && crc != 主机值`：设备上是另一份配置 → 先复位（`config_reset`，见 [CRC 一节](#crc我们与上游算的不是同一样东西)），再发 `config` + `init`。
+
+固件**不重算、也不校验**这个值，只是原样存取（`src/basecmd.c:256` `:248`）。它是主机的缓存键：命中省掉一次配置下发，未命中就必须复位重配（配置期已由 `finalize_config` 锁住，不能就地重发）。因此它只需满足两条：
+
+- **确定性**：同一份配置，两次运行算出同一个值；
+- **敏感性**：配置变了，值几乎必然不同（CRC32 抗意外碰撞约 2⁻³²）。
+
+### 校验值的存续
+
+`config_crc` 是固件的 RAM 全局（`src/basecmd.c:242`），只在三处变化：`finalize_config` 写入、`config_reset` 清零、上电（BSS 归零）。主机断开、重连都不改变它，所以设备会带着上一次连接留下的配置和校验值等待下一次握手。
+
+至于校验的输入具体是什么字节，见下一节：我们与上游选的不是同一样东西。
+
 ## CRC：我们与上游算的不是同一样东西
 
 ### 上游算的是命令文本
@@ -125,23 +163,18 @@ let crc = crc32(&hashed);
 
 每条命令 = `[消息 id（VLQ）] ++ [按声明顺序编码的参数]`，所以上面那条在线上大致是 `0a 00 <PA1 的枚举值> 00 00 <2000000>`（示意，整数编码细节取决于 `%c`/`%u`）。**哈希的就是真正要发出去的字节。**
 
-### 为什么这样做不错：固件根本不关心这个值
+### 为什么这样做不错：固件不关心这个值
 
-CRC 不是完整性校验，只是一把**缓存键**。固件收到它只是存起来：
+（设备侧怎么存、怎么校验见上一节。）固件收到 CRC 只是存起来：
 
 ```c
 void command_finalize_config(uint32_t *args) {
     move_finalize();
-    config_crc = args[0];          // src/basecmd.c:258
+    config_crc = args[0];          // src/basecmd.c:256
 }
 ```
 
-`get_config` 再原样回给主机（`src/basecmd.c:247`）。固件不重算、不校验。所以真正的要求只有两条：
-
-1. **确定性**：同一份配置，两次运行算出同一个值；
-2. **敏感性**：配置变了，值几乎必然不同（CRC32 抗意外碰撞约 2⁻³²）。
-
-用文本还是用字节，两条都满足。
+`get_config` 再原样回给主机（`src/basecmd.c:248`）。哈希方案只需满足上一节的确定性与敏感性两条；用文本还是用字节都满足，下面比较两者在边界情形下的取舍。
 
 ### 差异只会在哪儿显形
 
@@ -182,7 +215,7 @@ void command_finalize_config(uint32_t *args) {
 
 ### 唯一的实际代价
 
-把一个「上游 Klipper 刚用同一份 printer.cfg 配好」的 MCU 交给我们时，上游存的 CRC 和我们算的对不上。现在的 `configure` 遇到「已配置且 CRC 不一致」会直接报错：
+把一个「上游 Klipper 刚用同一份 printer.cfg 配好」的 MCU 交给我们时，上游存的 CRC 和我们算的对不上。现在的 `configure` 遇到「已配置且 CRC 不一致」时先尝试复位（见下），不能复位才报错：
 
 ```
 MCU 'mcu' is configured with CRC 0x…, the host computed 0x…

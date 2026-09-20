@@ -1,1 +1,4 @@
 /target
+
+# Local debug configuration, not part of the tree.
+/config.cfg

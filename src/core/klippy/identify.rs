@@ -260,8 +260,39 @@ impl Mcu {
             self.name(),
             installed
         );
+        if let Some(dictionary) = self.dictionary() {
+            debug!("{}", describe_dictionary(self.name(), &dictionary));
+        }
         Ok(installed)
     }
+}
+
+/// What the firmware reported about itself, as one DEBUG record.
+///
+/// The shape upstream's `MCUConnectHelper.log_info` prints (`klippy/mcu.py:845`):
+/// the version pair, how many messages the firmware declared, and its
+/// compile-time constants. Constants are sorted because they arrive in a
+/// `HashMap`, which has no order — two runs of the same firmware should read the
+/// same.
+fn describe_dictionary(name: &str, dictionary: &Dictionary) -> String {
+    let raw = dictionary.raw();
+    let field = |key: &str| raw.get(key).and_then(|value| value.as_str()).unwrap_or("?");
+    let mut constants: Vec<String> = dictionary
+        .constants()
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect();
+    constants.sort();
+    format!(
+        "MCU '{name}' firmware: {} {} / {} ({} commands, {} responses)\n\
+         MCU '{name}' constants: {}",
+        field("app"),
+        field("version"),
+        field("build_versions"),
+        dictionary.commands().len(),
+        dictionary.responses().len(),
+        constants.join(" ")
+    )
 }
 
 // ===========================================================================
@@ -311,7 +342,7 @@ mod tests {
         let mut payload = Payload::new();
         payload.push_i16(1).unwrap();
         payload.push_u32(offset).unwrap();
-        payload.push_u8(IDENTIFY_CHUNK_SIZE as u8).unwrap();
+        payload.push_u8(IDENTIFY_CHUNK_SIZE).unwrap();
         payload.into_raw()
     }
 
@@ -513,6 +544,18 @@ mod tests {
         let dictionary = mcu.dictionary().unwrap();
         assert_eq!(dictionary.message("get_clock").unwrap().id, 5);
         assert_eq!(dictionary.constant_f64("CLOCK_FREQ"), Some(20_000_000.0));
+    }
+
+    #[test]
+    fn test_describe_dictionary_summarises_the_firmware() {
+        let dictionary =
+            Dictionary::from_json(serde_json::from_str(DICTIONARY_JSON).unwrap()).unwrap();
+
+        let summary = describe_dictionary("mcu", &dictionary);
+
+        assert!(summary.contains("Klipper v0.12.0-1-g1234567"), "{summary}");
+        assert!(summary.contains("3 commands, 3 responses"), "{summary}");
+        assert!(summary.contains("CLOCK_FREQ=20000000"), "{summary}");
     }
 
     #[tokio::test]

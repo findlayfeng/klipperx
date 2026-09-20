@@ -52,7 +52,7 @@
 //! explicit teardown in [`Drop`].
 
 use super::error::InterfaceError;
-use super::Device;
+use super::{describe_frame, Device};
 use crate::core::klippy::frame::Frame;
 #[cfg(test)]
 use crate::core::klippy::frame::FrameStream;
@@ -360,15 +360,7 @@ impl Device for HostDevice {
                 bytes.len()
             )));
         }
-        trace!(
-            "tx frame [{}]: {}",
-            self.id(),
-            bytes
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<Vec<_>>()
-                .join(" ")
-        );
+        trace!("tx frame [{}]: {}", self.id(), describe_frame(&bytes));
         debug!("sent {} bytes to klipper", bytes.len());
         Ok(())
     }
@@ -386,15 +378,7 @@ impl Device for HostDevice {
             }
             match self.output.recv() {
                 Ok(bytes) => {
-                    trace!(
-                        "rx frame [{}]: {}",
-                        self.id(),
-                        bytes
-                            .iter()
-                            .map(|b| format!("{b:02x}"))
-                            .collect::<Vec<_>>()
-                            .join(" ")
-                    );
+                    trace!("rx frame [{}]: {}", self.id(), describe_frame(&bytes));
                     debug!("received {} bytes from klipper", bytes.len());
 
                     // A test build reassembles the stream; a release build is

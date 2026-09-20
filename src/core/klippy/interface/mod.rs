@@ -12,7 +12,7 @@ pub use serial::SerialDevice;
 #[cfg(test)]
 pub use test::{MappingEntry, TestDevice};
 
-use super::frame::Frame;
+use super::frame::{Frame, MESSAGE_HEADER_SIZE, MESSAGE_MAX, MESSAGE_MIN, MESSAGE_TRAILER_SIZE};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -157,6 +157,112 @@ impl Interface {
             #[cfg(test)]
             Self::Test(device) => device.shutdown(),
         }
+    }
+}
+
+// ===========================================================================
+// TRACE formatting
+// ===========================================================================
+
+/// Bytes as 4-byte runs separated by a space.
+///
+/// A run shorter than four bytes is written whole, so the last run of a section
+/// never trails a space: `01020304 05060708 090a`.
+pub(crate) fn hex_runs(bytes: &[u8]) -> String {
+    bytes
+        .chunks(4)
+        .map(|run| {
+            run.iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// One frame's wire bytes, split into the parts the protocol gives them:
+/// header (length, sequence) | payload | trailer (CRC, SYNC).
+///
+/// A flat dump makes the reader count bytes to find where the payload starts and
+/// ends; `0a11 | 01020304 05 | 1a2b7e` does not. Bytes that are not one whole
+/// frame — a read that stopped mid-frame, two frames glued together — have no
+/// such parts, so they fall back to [`hex_runs`].
+pub(crate) fn describe_frame(raw: &[u8]) -> String {
+    match frame_parts(raw) {
+        Some((header, payload, trailer)) => format!(
+            "{} | {} | {}",
+            hex_runs(header),
+            hex_runs(payload),
+            hex_runs(trailer)
+        ),
+        None => hex_runs(raw),
+    }
+}
+
+/// Split a whole frame into its header, payload and trailer.
+///
+/// Only the length byte is trusted, and only when it describes exactly the bytes
+/// given: a frame with a bad CRC is still a frame, and seeing where its parts
+/// begin is the reason to log it at all.
+fn frame_parts(raw: &[u8]) -> Option<(&[u8], &[u8], &[u8])> {
+    let length = usize::from(*raw.first()?);
+    if raw.len() != length || !(MESSAGE_MIN..=MESSAGE_MAX).contains(&length) {
+        return None;
+    }
+    let payload_end = length - MESSAGE_TRAILER_SIZE;
+    Some((
+        &raw[..MESSAGE_HEADER_SIZE],
+        &raw[MESSAGE_HEADER_SIZE..payload_end],
+        &raw[payload_end..],
+    ))
+}
+
+#[cfg(test)]
+mod trace_tests {
+    use super::*;
+
+    #[test]
+    fn test_hex_runs_groups_four_bytes_with_one_space() {
+        assert_eq!(hex_runs(&[]), "");
+        assert_eq!(hex_runs(&[0xab]), "ab");
+        assert_eq!(hex_runs(&[1, 2, 3, 4]), "01020304");
+        assert_eq!(hex_runs(&[1, 2, 3, 4, 5, 6]), "01020304 0506");
+        assert_eq!(
+            hex_runs(&[1, 2, 3, 4, 5, 6, 7, 8, 9]),
+            "01020304 05060708 09"
+        );
+    }
+
+    #[test]
+    fn test_describe_frame_splits_header_payload_and_trailer() {
+        let frame = Frame::encode(1, &[1, 2, 3, 4, 5]);
+        assert_eq!(frame.len(), 10, "five bytes of overhead plus the payload");
+
+        // length+sequence | payload in 4-byte runs | CRC+SYNC
+        let expected = format!("0a11 | 01020304 05 | {:02x}{:02x}7e", frame[7], frame[8]);
+        assert_eq!(describe_frame(&frame), expected);
+    }
+
+    #[test]
+    fn test_describe_frame_leaves_an_empty_payload_empty() {
+        let frame = Frame::encode(2, &[]);
+        assert_eq!(frame.len(), MESSAGE_MIN);
+
+        // The parts stay three even when the middle one has no bytes.
+        let expected = format!("0512 |  | {:02x}{:02x}7e", frame[2], frame[3]);
+        assert_eq!(describe_frame(&frame), expected);
+    }
+
+    #[test]
+    fn test_describe_frame_falls_back_when_the_bytes_are_not_one_frame() {
+        let frame = Frame::encode(1, &[9, 9]);
+
+        // A fragment: the length byte promises more than arrived.
+        assert_eq!(describe_frame(&frame[..3]), hex_runs(&frame[..3]));
+
+        // Two frames glued together: no single length describes them.
+        let pair = [frame.clone(), frame].concat();
+        assert_eq!(describe_frame(&pair), hex_runs(&pair));
     }
 }
 

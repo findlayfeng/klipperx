@@ -276,13 +276,12 @@ impl Mcu {
 
 /// The error a failed [`Mcu::connect`] reports.
 ///
-/// A firmware that answered from an older session never rebooted, and that is the
-/// whole reason the handshake failed: report it as what it is instead of as the
-/// timeout it causes. The caller is the one that can act on it — this is how an
-/// `rpi_usb` reset finds out that switching the port's power did not reset the
-/// board (`mcu/object.rs`).
+/// A connection that had to take over a session already running is a board nothing
+/// reset; when its handshake *still* fails, say so, because the timeout that
+/// follows is only a symptom of it (`mcu/object.rs` is the caller that asked for
+/// the reset).
 fn connect_error(mcu: &Mcu, err: McuError) -> McuError {
-    if mcu.answered_from_old_session() {
+    if mcu.took_over_session() {
         McuError::OldSession(err.to_string())
     } else {
         err
@@ -392,7 +391,19 @@ mod tests {
             let data = &compressed[offset..end];
             mappings.push(MappingEntry {
                 input: Frame::new(seq, request_payload(offset as u32)),
-                outputs: vec![Frame::new(seq, response_payload(offset as u32, data))],
+                // What a real firmware sends while handling a block: the response,
+                // and then the empty ack. Both are stamped with the counter
+                // *after* taking the block (`src/command.c:301-305`), which is the
+                // number the host's send window reads to drop the block it took —
+                // without the ack a transfer of more than `MAX_PENDING_BLOCKS`
+                // chunks would wait for room that never comes.
+                outputs: vec![
+                    Frame::new(
+                        seq.wrapping_add(1) & 0x0f,
+                        response_payload(offset as u32, data),
+                    ),
+                    Frame::new(seq.wrapping_add(1) & 0x0f, Vec::new()),
+                ],
             });
             seq = seq.wrapping_add(1) & 0x0f;
             offset = end;
@@ -508,9 +519,10 @@ mod tests {
     #[tokio::test]
     async fn test_a_failed_handshake_from_an_older_session_says_so() {
         // The firmware answers the identify request with a sequence from a
-        // session this host never opened: the receive task drops it — and notes
-        // it — so the handshake times out. What the caller is told names the real
-        // cause, because a board that answers like this never rebooted.
+        // session this host never opened: the connection takes it over and sends
+        // the request again (there is no mapping for that second attempt here), so
+        // the handshake times out. What the caller is told names the real cause,
+        // because a board that answers like this never rebooted.
         let mcu = mcu_with(vec![MappingEntry {
             input: Frame::new(0, request_payload(0)),
             outputs: vec![Frame::new(9, response_payload(0, &compress(b"{}")))],
@@ -520,12 +532,12 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, McuError::Call(_)), "{err:?}");
-        assert!(mcu.answered_from_old_session());
+        assert!(mcu.took_over_session());
 
         let err = connect_error(&mcu, err);
         assert!(matches!(err, McuError::OldSession(_)), "{err:?}");
         assert!(
-            err.to_string().contains("answered from an older session"),
+            err.to_string().contains("still in an earlier session"),
             "{err}"
         );
     }
@@ -540,7 +552,7 @@ mod tests {
         let err = Identify::fetch(&mcu, Duration::from_millis(50))
             .await
             .unwrap_err();
-        assert!(!mcu.answered_from_old_session());
+        assert!(!mcu.took_over_session());
         assert!(matches!(connect_error(&mcu, err), McuError::Call(_)));
     }
 

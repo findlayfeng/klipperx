@@ -465,6 +465,25 @@ mod tests {
         section
     }
 
+    /// Open the host library again, once the process-wide slot is free.
+    ///
+    /// One device at a time is the library's rule, and the previous one is only
+    /// really gone a moment after it is dropped: `Mcu::drop` shuts the device down
+    /// and the transport's tasks end afterwards, which is when their clones of the
+    /// interface go. So the wait is on the *task* teardown, not on the drop.
+    async fn reopen(config: &McuConfig) -> crate::core::klippy::Interface {
+        for _ in 0..200 {
+            match config.open() {
+                Ok(interface) => return interface,
+                Err(e) => {
+                    debug!("host library not free yet: {e}");
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+        }
+        panic!("the previous klipper host device never went away");
+    }
+
     /// The identify handshake against a real klipper inside the library.
     ///
     /// This is the whole bootstrap on real firmware: ask for the payload chunk by
@@ -477,6 +496,15 @@ mod tests {
     /// [`Dictionary`]: crate::core::klippy::mcu::Dictionary
     #[tokio::test]
     async fn test_identify_against_the_real_library() {
+        // Klipper's state — including the sequence counter that says where the
+        // firmware is — lives in the library's statics, and `HostDevice::load`
+        // dlopens it while `Drop` dlcloses it: a second device would map the code
+        // again and start from the initializers, which is *not* what an MCU does
+        // when a host disconnects. Holding one more handle keeps the mapping alive
+        // across both devices, which is what makes the second connection below meet
+        // a firmware that was never reset.
+        let _pinned = unsafe { Library::new(library_path()) }.expect("the library maps");
+
         let config = McuConfig::new(&mcu_section()).expect("the [mcu] section");
         assert_eq!(config.name, "host_test");
         let interface = config.open().expect("the host library opens");
@@ -485,7 +513,7 @@ mod tests {
         // would otherwise sit in the transport's own 10 second chunk timeout.
         let mcu = tokio::time::timeout(
             Duration::from_secs(20),
-            Mcu::connect(config.name, interface.clone()),
+            Mcu::connect(&config.name, interface.clone()),
         )
         .await
         .expect("identify handshake timed out")
@@ -536,6 +564,42 @@ mod tests {
 
         // Dropping the MCU shuts the device down, which is what lets a process
         // build another one later; the interface clone shows the effect.
+        drop(mcu);
+        assert_eq!(interface.receive().await, None);
+        drop(interface);
+
+        // A second connection in the same process finds the firmware exactly where
+        // the first one left it: klipper's sequence counter is one static that only
+        // an accepted block moves (`src/command.c:16,301-305`), and shutting the
+        // device down does not clear it. That is the situation any MCU is in when
+        // it was never power-cycled — the one `restart_method: command` has to work
+        // in — and the transport takes that session over instead of stalling on a
+        // sequence that does not start over.
+        let interface = reopen(&config).await;
+        let mcu = tokio::time::timeout(
+            Duration::from_secs(20),
+            Mcu::connect(&config.name, interface.clone()),
+        )
+        .await
+        .expect("the second identify handshake timed out")
+        .expect("the second identify handshake failed");
+        assert!(
+            mcu.took_over_session(),
+            "the firmware was still in the session the first connection left"
+        );
+
+        // And the adopted number is the one the firmware answers on: the same
+        // command works over it.
+        let params = mcu
+            .call("get_clock", &[], "clock", Duration::from_secs(1))
+            .await
+            .expect("get_clock after the takeover");
+        assert!(
+            matches!(params[0], ArgValue::UInt32(_)),
+            "clock should be a `%u` value, got {:?}",
+            params[0]
+        );
+
         drop(mcu);
         assert_eq!(interface.receive().await, None);
     }

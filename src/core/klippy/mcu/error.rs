@@ -61,14 +61,15 @@ pub enum McuError {
     /// The MCU has not completed the identify handshake yet, so no dictionary
     /// is installed and no command can be resolved.
     NotIdentified,
-    /// The firmware answered from a session **older** than this connection: its
-    /// sequence does not start over, so it was already talking to somebody when
-    /// the port was opened — it never rebooted.
+    /// The firmware was in a session that came **before** this connection, and the
+    /// handshake did not finish even after the connection took it over: the
+    /// firmware's sequence does not start over, so it was already talking to
+    /// somebody when the port was opened — it never rebooted.
     ///
-    /// An `rpi_usb` reset leaves a board like this when switching the port's
-    /// power disconnects the device without resetting it (a hub that does not
-    /// really switch power, or a board powered from its own supply). The message
-    /// is what the handshake reported under it.
+    /// An `rpi_usb` reset leaves a board like this when switching the port's power
+    /// disconnects the device without resetting it (a hub that does not really
+    /// switch power, or a board powered from its own supply). The message is what
+    /// the handshake reported under it.
     OldSession(String),
     /// The identify exchange broke protocol: a chunk arrived out of order, or
     /// the payload exceeded the size limit.
@@ -100,7 +101,11 @@ impl std::fmt::Display for McuError {
                 write!(f, "MCU has not completed the identify handshake")
             }
             McuError::OldSession(msg) => {
-                write!(f, "the firmware answered from an older session ({msg})")
+                write!(
+                    f,
+                    "the firmware was still in an earlier session, which the connection took \
+                     over, and the handshake failed ({msg})"
+                )
             }
             McuError::IdentifyProtocol(msg) => write!(f, "identify protocol error: {}", msg),
             McuError::IdentifyCompression(msg) => {
@@ -217,10 +222,9 @@ mod tests {
             McuError::NotIdentified.to_string(),
             "MCU has not completed the identify handshake"
         );
-        assert_eq!(
-            McuError::OldSession("timeout: no response".to_string()).to_string(),
-            "the firmware answered from an older session (timeout: no response)"
-        );
+        assert!(McuError::OldSession("timeout: no response".to_string())
+            .to_string()
+            .starts_with("the firmware was still in an earlier session"),);
         assert!(std::error::Error::source(&McuError::OldSession(String::new())).is_none());
     }
 

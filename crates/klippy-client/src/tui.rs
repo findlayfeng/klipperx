@@ -28,9 +28,12 @@
 //! The log supports scrolling to review past output:
 //!
 //! - **Mouse wheel**: scroll up/down by 3 lines
+//! - **Click/drag the scrollbar**: go to that part of the log
 //! - **PgUp/PgDn**: scroll by a page
 //! - **Home**: jump to the top (oldest lines)
 //! - **End**: jump to the bottom (newest line)
+//! - **↑/↓**: walk the typed-line history at the bottom; once the log is
+//!   scrolled back they move it a line at a time, which `Ctrl+↑/↓` always does
 //! - When scrolled back, new entries do not move the view — your place is kept
 //!   until you return to the bottom.
 //!
@@ -68,7 +71,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ratatui::crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
 };
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -176,6 +180,9 @@ struct App {
     /// The whole log's rendered height, so the scrollbar can show how much of
     /// it is on screen without re-wrapping the log every frame.
     heights: RefCell<Heights>,
+    /// The scrollbar's column as last drawn, so a click can find it. Zero-sized
+    /// when the log fits and no bar is drawn.
+    gutter: Cell<Rect>,
     /// The connection's state, shown in the header.
     status: Status,
     /// Set by a local command that asked to leave.
@@ -225,6 +232,7 @@ impl App {
             viewport: Cell::new(0),
             width: Cell::new(0),
             heights: RefCell::new(Heights::default()),
+            gutter: Cell::new(Rect::new(0, 0, 0, 0)),
             status: Status::Unknown,
             quit: false,
             gcode: false,
@@ -294,6 +302,90 @@ impl App {
         drop(measured);
 
         self.scroll = self.scroll.saturating_add(added);
+    }
+
+    /// Move the log for a scrolling key, and say whether the key was one.
+    ///
+    /// `Ctrl+↑/↓` scrolls a line from anywhere. The plain arrows scroll only
+    /// once the log is scrolled back: at the bottom they walk the typed-line
+    /// history, which is what the hand expects there.
+    fn scroll_key(&mut self, code: KeyCode, ctrl: bool) -> bool {
+        match (code, ctrl) {
+            (KeyCode::PageUp, _) => {
+                self.scroll = self.scroll.saturating_add(self.viewport.get().max(1));
+            }
+            (KeyCode::PageDown, _) => {
+                self.scroll = self.scroll.saturating_sub(self.viewport.get().max(1));
+            }
+            (KeyCode::Home, _) => {
+                // Top = oldest. The renderer clamps this to the top of the log,
+                // so it fills the pane with the oldest lines rather than
+                // leaving it empty.
+                self.scroll = usize::MAX;
+            }
+            (KeyCode::End, _) => self.scroll = 0,
+            (KeyCode::Up, _) if ctrl || self.scroll > 0 => {
+                self.scroll = self.scroll.saturating_add(1);
+            }
+            (KeyCode::Down, _) if ctrl || self.scroll > 0 => {
+                self.scroll = self.scroll.saturating_sub(1);
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// The scrollbar track row a mouse cell points at, if it points at one.
+    ///
+    /// The bar is one column at the right edge of the log pane; the row is
+    /// counted from the top of that pane. Nothing to scroll means nothing to
+    /// hit.
+    fn gutter_row(&self, column: u16, row: u16) -> Option<usize> {
+        let gutter = self.gutter.get();
+        if gutter.width == 0 || gutter.height == 0 {
+            return None;
+        }
+        if column != gutter.x || row < gutter.y || row >= gutter.y + gutter.height {
+            return None;
+        }
+        Some((row - gutter.y) as usize)
+    }
+
+    /// Scroll so the pointer's place on the track is in view.
+    ///
+    /// `track_row` is counted from the top of the log pane. The thumb's middle
+    /// follows the pointer, so grabbing the thumb does not make the log jump
+    /// out from under the cursor.
+    fn scroll_to_track(&mut self, track_row: usize) {
+        let height = self.gutter.get().height as usize;
+        if height == 0 {
+            return;
+        }
+        let total = self.total_lines(self.width.get().max(1));
+        let shown = height.min(total);
+        let range = total.saturating_sub(shown);
+        if range == 0 {
+            self.scroll = 0;
+            return;
+        }
+
+        // The thumb's length, near enough to what the widget draws for the hit
+        // area to feel right. `total > shown`, so this cannot divide by zero.
+        let thumb = (shown * height / total).clamp(1, height);
+        let travel = height.saturating_sub(thumb);
+        // A track with no room to move has only one place to be.
+        let first = match travel {
+            0 => 0,
+            travel => {
+                track_row
+                    .saturating_sub(thumb / 2)
+                    .min(travel)
+                    .saturating_mul(range)
+                    / travel
+            }
+        };
+        // `first` counts from the top; `scroll` counts from the bottom.
+        self.scroll = range.saturating_sub(first);
     }
 
     /// The whole log's rendered height at `width`, the number a scrollbar wants.
@@ -544,37 +636,18 @@ async fn handle_key(
             }
         }
         // Scrolling the log, which is the reason the panes exist: the printer's
-        // own output would otherwise push everything else away.
-        (KeyCode::PageUp, _) => {
-            // Scroll up = view older = add a page of lines.
-            app.scroll = app.scroll.saturating_add(app.viewport.get().max(1));
+        // own output would otherwise push everything else away. Whatever this
+        // is not, the input line owns.
+        (code, _) => {
+            if !app.scroll_key(code, ctrl) {
+                app.input.edit(code, ctrl);
+            }
         }
-        (KeyCode::PageDown, _) => {
-            // Scroll down = view newer = drop a page of lines.
-            app.scroll = app.scroll.saturating_sub(app.viewport.get().max(1));
-        }
-        (KeyCode::Home, _) => {
-            // Top = oldest. The renderer clamps this to the top of the log, so
-            // it fills the pane with the oldest lines rather than leaving it
-            // empty (which is what an unclamped offset would do).
-            app.scroll = usize::MAX;
-        }
-        (KeyCode::End, _) => {
-            // Bottom = newest.
-            app.scroll = 0;
-        }
-        (KeyCode::Up, true) => {
-            app.scroll = app.scroll.saturating_add(1);
-        }
-        (KeyCode::Down, true) => {
-            app.scroll = app.scroll.saturating_sub(1);
-        }
-        (code, _) => app.input.edit(code, ctrl),
     }
     Ok(Control::Continue)
 }
 
-/// Handle mouse events (wheel scrolling).
+/// Handle mouse events (wheel scrolling, and the scrollbar as a target).
 fn handle_mouse(app: &mut App, mouse: MouseEvent) {
     match mouse.kind {
         MouseEventKind::ScrollUp => {
@@ -584,6 +657,13 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
         MouseEventKind::ScrollDown => {
             // Scroll down = view newer content.
             app.scroll = app.scroll.saturating_sub(3);
+        }
+        // Clicking or dragging the bar goes where the pointer is. The drag
+        // events carry the same cell, so one branch serves both.
+        MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Drag(MouseButton::Left) => {
+            if let Some(track) = app.gutter_row(mouse.column, mouse.row) {
+                app.scroll_to_track(track);
+            }
         }
         _ => (),
     }
@@ -687,6 +767,9 @@ fn draw_log(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(Text::from(view.lines)), text);
 
     if total > text.height as usize {
+        // The bar is a target as well as a picture: remembering where it was
+        // drawn is what lets a click land on it.
+        app.gutter.set(gutter);
         let mut state = ScrollbarState::new(total)
             .position(scrollbar_position(view.first, total, view.shown))
             .viewport_content_length(view.shown);
@@ -703,6 +786,9 @@ fn draw_log(frame: &mut Frame, app: &App, area: Rect) {
             gutter,
             &mut state,
         );
+    } else {
+        // Nothing to scroll: the column stays, but it is not a target.
+        app.gutter.set(Rect::new(0, 0, 0, 0));
     }
 }
 
@@ -1534,6 +1620,137 @@ mod tests {
         let top = log_gutter(&app, 40, 8);
         assert_eq!(top[0], "█", "{top:?}");
         assert!(top[1..].iter().all(|cell| cell == "│"), "{top:?}");
+    }
+
+    #[test]
+    fn test_the_arrows_scroll_once_the_log_is_scrolled_back() {
+        let mut app = app_with(vec![Entry::notice(Notice::Info, "line")]);
+        app.viewport.set(3);
+
+        // At the bottom the arrows are the history's, so they fall through.
+        assert!(!app.scroll_key(KeyCode::Up, false));
+        assert!(!app.scroll_key(KeyCode::Down, false));
+        assert_eq!(app.scroll, 0);
+
+        // Ctrl+↑ scrolls a line from the bottom, the way it always has.
+        assert!(app.scroll_key(KeyCode::Up, true));
+        assert_eq!(app.scroll, 1);
+
+        // Scrolled back, the plain arrows move the log a line at a time.
+        assert!(app.scroll_key(KeyCode::Up, false));
+        assert_eq!(app.scroll, 2);
+        assert!(app.scroll_key(KeyCode::Down, false));
+        assert_eq!(app.scroll, 1);
+        assert!(app.scroll_key(KeyCode::Down, false));
+        assert_eq!(app.scroll, 0, "Down returns to the bottom");
+
+        // And back at the bottom they are the history's again.
+        assert!(!app.scroll_key(KeyCode::Down, false));
+
+        // The paging keys stay the log's whatever the offset.
+        assert!(app.scroll_key(KeyCode::PageUp, false));
+        assert_eq!(app.scroll, 3, "a page is the pane's height");
+        assert!(app.scroll_key(KeyCode::End, false));
+        assert_eq!(app.scroll, 0);
+        assert!(app.scroll_key(KeyCode::Home, false));
+        assert_eq!(app.scroll, usize::MAX);
+
+        // Anything else is the input line's.
+        assert!(!app.scroll_key(KeyCode::Char('x'), false));
+        assert!(!app.scroll_key(KeyCode::Left, false));
+    }
+
+    #[test]
+    fn test_the_scrollbar_is_a_mouse_target() {
+        let entries: Vec<Entry> = (1..=20)
+            .map(|n| Entry::notice(Notice::Info, format!("line {n}")))
+            .collect();
+        let mut app = app_with(entries);
+        // The first draw is what puts the bar (and its column) on screen.
+        let _ = render(&app, 40, 8);
+        let gutter = app.gutter.get();
+        assert_eq!(gutter.width, 1, "the bar owns the last column");
+
+        // The pointer has to be in the bar's own column and its own rows.
+        assert_eq!(app.gutter_row(gutter.x, gutter.y), Some(0));
+        assert_eq!(
+            app.gutter_row(gutter.x, gutter.y + gutter.height - 1),
+            Some(4)
+        );
+        assert_eq!(
+            app.gutter_row(gutter.x - 1, gutter.y),
+            None,
+            "text is not a target"
+        );
+        assert_eq!(app.gutter_row(gutter.x, gutter.y + gutter.height), None);
+
+        // The top of the track is the top of the log, the bottom is the newest
+        // line, and the middle is in between.
+        app.scroll_to_track(0);
+        assert_eq!(app.scroll, 15, "the oldest lines");
+        assert_eq!(log_gutter(&app, 40, 8)[0], "█", "the thumb follows");
+
+        app.scroll_to_track(2);
+        assert_eq!(app.scroll, 8, "the middle");
+
+        app.scroll_to_track(4);
+        assert_eq!(app.scroll, 0, "the newest line, and following again");
+    }
+
+    #[test]
+    fn test_a_log_that_fits_has_no_mouse_target() {
+        let app = app_with(vec![Entry::notice(Notice::Info, "one line")]);
+        let _ = render(&app, 40, 8);
+        assert_eq!(app.gutter.get().width, 0, "no bar, no target");
+        assert_eq!(app.gutter_row(39, 2), None);
+    }
+
+    #[test]
+    fn test_a_click_and_a_drag_on_the_bar_scroll_the_log() {
+        let entries: Vec<Entry> = (1..=20)
+            .map(|n| Entry::notice(Notice::Info, format!("line {n}")))
+            .collect();
+        let mut app = app_with(entries);
+        let _ = render(&app, 40, 8);
+        let gutter = app.gutter.get();
+
+        let click = |kind, row| MouseEvent {
+            kind,
+            column: gutter.x,
+            row,
+            modifiers: KeyModifiers::empty(),
+        };
+
+        // A press at the top of the track goes to the oldest lines.
+        handle_mouse(
+            &mut app,
+            click(MouseEventKind::Down(MouseButton::Left), gutter.y),
+        );
+        assert_eq!(app.scroll, 15);
+
+        // A drag at the bottom goes back to the newest line.
+        handle_mouse(
+            &mut app,
+            click(
+                MouseEventKind::Drag(MouseButton::Left),
+                gutter.y + gutter.height - 1,
+            ),
+        );
+        assert_eq!(app.scroll, 0);
+
+        // A click in the text, or on the wheel's own kind, is not the bar's.
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: gutter.x - 1,
+                row: gutter.y,
+                modifiers: KeyModifiers::empty(),
+            },
+        );
+        assert_eq!(app.scroll, 0);
+        handle_mouse(&mut app, click(MouseEventKind::ScrollUp, gutter.y));
+        assert_eq!(app.scroll, 3, "the wheel still scrolls by three lines");
     }
 
     #[test]

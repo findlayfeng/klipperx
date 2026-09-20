@@ -97,11 +97,10 @@
       （`klippy/klippy.py:144` `:151`），shutdown 分析走 `klippy:analyze_shutdown`
       （`klippy/klippy.py:216-220`）。当前 `PrinterEvent` 的 handler 无参，表达不了；
       我们现在的做法是把原因写进状态消息（上游放在 details 里），见 Q2 / Q3。
-- [ ] **`restart_method` 只解析不使用，且非法值被静默吞掉**：`config/mcu.rs:106-109` 的
-      `.and_then(from_str).unwrap_or(Arduino)`，拼错会静默变成 Arduino；上游 `getchoice`
-      直接报配置错误（`klippy/mcu.py:666-671`），且对 CAN（无 baud）强制 `command`、不读
-      配置（`:712-713`）。四种方法里 arduino / cheetah / rpi_usb 都要断开并重开 transport；
-      重载时重开顺带覆盖了 arduino 的 DTR，其余仍靠 `config_reset`（`command`）。
+- [x] **`restart_method` 的校验与默认**：未知值报配置错（不再静默变 Arduino）、非串口
+      （CAN / host）恒为 `command` 且不读该项、串口缺省 `arduino`，与上游 `getchoice` +
+      `if baud` 对齐（`klippy/mcu.py:666-671`）。“是串口”做成参数以便不依赖真串口测试。
+      四种方法的**物理分派**（arduino / cheetah / rpi_usb）见 D2。
 - [ ] **不认 `reset` 命令**：`mcu/config.rs` 缺 `config_reset` 就报「断电」。上游
       `_restart_via_command` 优先 `reset`，没有才 `force_local_shutdown` + `config_reset`
       （`klippy/mcu.py:730-746`）。
@@ -267,11 +266,52 @@ kinematics 已随 Printer 重构删除，从这里重新开始：
 ### D2 重启循环（剩余）
 
 循环本身已完成（见文末）：`klippy_process` 是循环，`run()` 返回重启类结果就
-`reset_for_restart()` + `load_config()` + `RESTART_DELAY` 后重来。剩下的是与上游不同的两块：
+`reset_for_restart()` + `load_config()` + `RESTART_DELAY` 后重来。剩下的是与上游不同的几块。
 
-- [ ] **`restart_method` 的读者**：本地的就地复位只能做 `command`（`config_reset`）；重载时
-      重开 transport 顺带覆盖了 arduino 的 DTR 复位，但 cheetah / rpi_usb 没有显式分派。
-      落地前 `McuConfig.restart_method` 一直是只解析不使用（见 B2）。
+#### `restart_method` 分派：分析
+
+上游 `MCURestartHelper` 在 `klippy:firmware_restart` 事件上按方法四选一
+（`klippy/mcu.py:746-770`）：
+
+| 方法 | 动作 | 依赖 |
+|---|---|---|
+| `command` | 有 `reset` 就用它，否则 `force_local_shutdown` + 15 ms + `config_reset`，再 disconnect | 固件命令（B2 已做 `config_reset`，差 `reset`） |
+| `arduino`（含未设） | disconnect 后以 2400 打开、`read(1)`、DTR true→false（`serialhdl.py:392`） | tty DTR |
+| `cheetah` | disconnect 后 RTS 拉高、DTR 两轮翻转、RTS 拉低（`serialhdl.py:365`） | tty DTR+RTS |
+| `rpi_usb` | disconnect 后 `hub-ctrl -h 0 -P 2 -p 0` → 2 s → `-p 1`（`chelper/__init__.py:339`） | 外部 `hub-ctrl` + sudo |
+
+外加三处按方法的**连接期门控**：`rpi_usb` 且串口不存在 → 先启动一次去上电（`:693`）；
+`rpi_usb` → 上电复位前不许 configure（`:696`）；`cheetah` → 连接时 RTS 必须拉低（`:703`）。
+方法只在**有 baud（串口）**时从配置读，CAN 恒为 `command`（`:668-671`）；`CANBUS_BRIDGE` 的
+MCU 默认跳过（`:749`）。
+
+**我们已经有的**：`command`（`config_reset` + 事件屏障，见 B2）；以及“关掉再开”的形状
+（`reset_for_restart` 丢对象关设备 → `bring_up` 重开）。**`arduino` 可能被“重开 tty 会拉
+DTR”隐式满足，但那是驱动副作用，不算实现。**
+
+**缺口（按依赖）**：
+
+1. **没有 `start_reason`**（D1）：`connect` 分不清“首次启动”与“firmware_restart 后的重连”，
+   而 attach 期门控全靠它；循环知道原因，`McuObject` 不知道。
+2. **分派点/时序对不上**：`run()` 发 `FirmwareRestart` 时串口还开着，drop 在 `run()` 返回
+   之后；自然的落点是 connect **之前**，但 `McuConfig::new` 把解析与打开耦合了（内部
+   `create_interface` 直接 `SerialDevice::open`），要先拆开才能在打开前复位/上电/定 RTS。
+3. **`serial.rs` 没有 modem 线控制**：要加 DTR/RTS（`TIOCMBIS`/`TIOCMBIC`）并能以 2400 短暂
+   打开再关。
+4. **`rpi_usb` 要外部程序**：`hub-ctrl.c` 在 `third_party/klipper/lib/hub-ctrl/`，但上游现场
+   gcc 编译 + `sudo` 跑；对 Rust 主机是环境/权限问题。
+5. **`restart_method` 没被带到分派点**：`Mcu::new` 只取 name+interface，字段被丢
+   （`mcu/mod.rs:374-376`）。
+6. **校验与默认**（本轮先做）。
+7. **`reset` 命令**（B2 单列）。
+
+**推进顺序**：⑥ `restart_method` 校验/默认（纯正确性，无物理）→ ② `McuConfig` 解析/打开拆分
+→ ① `start_reason`（D1）→ ③ `serial.rs` DTR/RTS + `arduino` 显式复位 → ⑤ `cheetah`（复用
+原语 + attach RTS）→ ④ `rpi_usb`（外部依赖，最后或明确不支持）。
+
+- [x] **⑥ `restart_method` 校验/默认**：未知值报配置错，非串口（CAN / host）恒为 `command`、
+      不读该项，串口缺省为 `arduino`（对齐上游 `getchoice` + `if baud`，`klippy/mcu.py:666-671`）。
+      真分派与 identify 期的 `None + 无 SERIAL_BAUD → command` 细化随上面顺序来。
 - [ ] **CRC 不匹配仍走就地复位（有意偏离上游）**：上游发现已配置但 CRC 不一致时先
       `request_exit('firmware_restart')`（`check_restart_on_crc_mismatch`，
       `klippy/mcu.py:678-685`、`:1057-1059`），让重启循环做物理复位；我们用 `configure` 里的

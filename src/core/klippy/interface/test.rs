@@ -3,12 +3,32 @@ use crate::core::klippy::frame::Frame;
 
 use super::Device;
 use crossbeam_channel::{bounded, Receiver, Sender};
-use std::{collections::VecDeque, sync::Mutex};
+use std::{
+    collections::VecDeque,
+    sync::{Arc, Mutex},
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct MappingEntry {
     pub input: Frame,
     pub outputs: Vec<Frame>,
+}
+
+/// Records the frames a [`TestDevice`] accepted, in order.
+///
+/// For tests that assert on the wire shape — how many blocks went out and what
+/// is in each — rather than on a scripted exchange. Take one with
+/// [`TestDevice::recorder`] before the device is moved into an interface.
+#[derive(Debug, Clone, Default)]
+pub struct FrameRecorder {
+    frames: Arc<Mutex<Vec<Frame>>>,
+}
+
+impl FrameRecorder {
+    /// The frames accepted so far, oldest first.
+    pub fn frames(&self) -> Vec<Frame> {
+        self.frames.lock().unwrap().clone()
+    }
 }
 
 /// A deterministic mock device for testing Klipper protocol interactions.
@@ -30,6 +50,9 @@ pub struct TestDevice {
     buf_rx: Receiver<Frame>,
     /// FIFO queue of input→output mappings — protected by its own `Mutex`.
     mapping: Mutex<VecDeque<MappingEntry>>,
+    /// Every frame this device accepted, shared with the test that holds the
+    /// [`FrameRecorder`] handle.
+    recorded: FrameRecorder,
 }
 
 impl TestDevice {
@@ -39,7 +62,16 @@ impl TestDevice {
             buf_tx: Mutex::new(Some(tx.clone())),
             buf_rx: rx,
             mapping: Mutex::new(mapping.into()),
+            recorded: FrameRecorder::default(),
         }
+    }
+
+    /// A handle that lists every frame this device accepts, in order.
+    ///
+    /// Take it before the device is moved into an
+    /// [`Interface`](super::Interface); the handle shares state with the device.
+    pub fn recorder(&self) -> FrameRecorder {
+        self.recorded.clone()
     }
 }
 
@@ -73,6 +105,8 @@ impl Device for TestDevice {
                 entry.input, frame
             )));
         }
+
+        self.recorded.frames.lock().unwrap().push(frame.clone());
 
         for output_frame in entry.outputs {
             tx.send(output_frame).map_err(|e| {

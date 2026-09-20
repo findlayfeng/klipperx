@@ -47,6 +47,22 @@ use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{sleep, Duration};
 use tracing::{debug, error, info, warn};
+/// One item on the outbound queue: a message, or a barrier that asks the send
+/// task to flush what is already queued.
+///
+/// The send task coalesces payloads queued close together into one wire block,
+/// which is what most callers want — but some need two commands to land in
+/// **separate** blocks, because the first makes the firmware leave the block it
+/// is dispatching (its shutdown is a `longjmp`, `src/sched.c`) and drop the rest
+/// of it. Such a caller asks for a boundary with [`Mcu::flush`].
+#[derive(Debug)]
+enum SendItem {
+    /// A message to append to the current batch.
+    Payload(Payload),
+    /// Send whatever is queued so far, then signal completion.
+    Flush(oneshot::Sender<()>),
+}
+
 /// MCU object that represents a physical microcontroller unit.
 ///
 /// Two steps, in this order:
@@ -75,8 +91,8 @@ pub struct Mcu {
     /// written in short, non-awaiting critical sections, and `send_msg` needs to
     /// check it from a synchronous context.
     dictionary: StdMutex<Option<Arc<Dictionary>>>,
-    /// Sender for outbound payload queue
-    send_buf_tx: mpsc::Sender<Payload>,
+    /// Sender for the outbound queue: messages and flush barriers.
+    send_buf_tx: mpsc::Sender<SendItem>,
     /// Pending synchronous calls waiting for responses.
     pending_calls: PendingCalls,
     /// Interface clone kept so the device can be shut down on drop.
@@ -190,31 +206,38 @@ impl Mcu {
         let pending_calls = PendingCalls::new();
         let pending_calls_for_task = pending_calls.clone();
 
-        let (send_buf_tx, mut send_buf_rx) = mpsc::channel::<Payload>(32);
+        let (send_buf_tx, mut send_buf_rx) = mpsc::channel::<SendItem>(32);
         let interface_for_send = interface.clone();
 
         tokio::spawn(async move {
             let mut seq = 0u8;
 
             loop {
-                // Wait for at least one payload to start a batch
+                // Wait for the first message of a batch. A flush with nothing
+                // queued before it is already satisfied.
                 let mut payload = match send_buf_rx.recv().await {
-                    Some(p) => p,
+                    Some(SendItem::Payload(p)) => p,
+                    Some(SendItem::Flush(done)) => {
+                        let _ = done.send(());
+                        continue;
+                    }
                     None => break, // channel closed
                 };
 
-                // Try to batch more payloads
+                // Coalesce more payloads until the batch is full, a flush asks
+                // for a boundary, or the line goes idle.
+                let mut flush_done = None;
                 loop {
                     // Check if buffer is sufficiently full
                     if payload.len() >= MESSAGE_PAYLOAD_MAX * 2 / 3 {
                         break;
                     }
 
-                    // Wait for more data or timeout
+                    // Wait for more data, a flush, or a short idle timeout.
                     tokio::select! {
                         maybe_next = send_buf_rx.recv() => {
                             match maybe_next {
-                                Some(next_payload) => {
+                                Some(SendItem::Payload(next_payload)) => {
                                     if payload.try_merge(&next_payload).is_err() {
                                         // Merge failed (would exceed max), send current batch first
                                         Self::send_batch(&interface_for_send, &mut seq, payload).await;
@@ -222,6 +245,11 @@ impl Mcu {
                                         payload = next_payload;
                                         continue;
                                     }
+                                }
+                                Some(SendItem::Flush(done)) => {
+                                    // Boundary requested: send this batch now.
+                                    flush_done = Some(done);
+                                    break;
                                 }
                                 None => {
                                     // Channel closed
@@ -239,6 +267,9 @@ impl Mcu {
                 // send the batched payload to the MCU
                 debug!("Sending batch: {} bytes", payload.len());
                 Self::send_batch(&interface_for_send, &mut seq, payload).await;
+                if let Some(done) = flush_done {
+                    let _ = done.send(());
+                }
             }
         });
 
@@ -407,6 +438,14 @@ impl Mcu {
             .ok_or_else(|| McuError::UnknownMessage(name.to_string()))
     }
 
+    /// Whether the firmware declares `name`.
+    ///
+    /// Older or trimmed firmware may not send every message. Callers that can
+    /// degrade use this instead of [`Mcu::require_message`]'s hard failure.
+    pub(crate) fn has_message(&self, name: &str) -> bool {
+        self.parser.lookup(name).is_some()
+    }
+
     /// Send a batched payload to the MCU.
     ///
     /// Increments the sequence number on success, logs errors.
@@ -475,7 +514,7 @@ impl Mcu {
     /// Returns [`McuError::Msg`] if the send task has gone away.
     pub(crate) async fn send_payload(&self, payload: Payload) -> Result<(), McuError> {
         self.send_buf_tx
-            .send(payload)
+            .send(SendItem::Payload(payload))
             .await
             .map_err(|e| McuError::Msg(MsgError::new(e.to_string())))
     }
@@ -512,9 +551,42 @@ impl Mcu {
             None => debug!("send {}", self.describe_command(name, args)),
         }
         self.send_buf_tx
-            .try_send(payload)
+            .try_send(SendItem::Payload(payload))
             .map_err(|e| MsgError::new(e.to_string()))?;
         Ok(())
+    }
+
+    /// Wait until everything queued before this call has been written to the
+    /// transport.
+    ///
+    /// The send task coalesces payloads that are queued close together into one
+    /// wire block. That is usually what a caller wants, but not always: a command
+    /// that makes the firmware leave the block it is dispatching has to be alone
+    /// in its block. Queueing a barrier and waiting here forces that boundary —
+    /// payloads queued **after** the barrier are not covered, which is the point.
+    ///
+    /// This says the bytes reached the transport, **not** that the firmware has
+    /// read or acted on them. It is a flush, not an acknowledgement; waiting for
+    /// an effect needs the message that reports it (see `mcu/config.rs`).
+    ///
+    /// # Errors
+    /// Returns [`McuError::Call`] if the send task is gone, or if the barrier was
+    /// not reached within `timeout` (a wedged transport).
+    pub async fn flush(&self, timeout: Duration) -> Result<(), McuError> {
+        let (done_tx, done_rx) = oneshot::channel();
+        self.send_buf_tx
+            .send(SendItem::Flush(done_tx))
+            .await
+            .map_err(|e| McuError::Call(McuCallError::SendFailed(e.to_string())))?;
+        match tokio::time::timeout(timeout, done_rx).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => {
+                Err(McuCallError::SendFailed("the send task dropped the flush".to_string()).into())
+            }
+            Err(_) => {
+                Err(McuCallError::Timeout(format!("flush not reached within {timeout:?}")).into())
+            }
+        }
     }
 
     /// A command on its way out, as its DEBUG line shows it: the dictionary's
@@ -534,6 +606,12 @@ impl Mcu {
     /// This is a synchronous request/response pattern: the command is sent,
     /// then the caller blocks (async) until the response message arrives or
     /// `timeout` elapses.
+    ///
+    /// The response does not have to be a direct answer to `command`: as long as
+    /// the name matches, this also waits for a message the firmware pushes in
+    /// reaction. That is how the configuration phase waits for `shutdown` after
+    /// sending `emergency_stop` (`mcu/config.rs`): registration happens before
+    /// the command goes out, so a fast report cannot race ahead of it.
     ///
     /// # Requirements
     /// - `command` must be registered in the message parser.
@@ -777,6 +855,58 @@ mod tests {
             matches!(err, McuCallError::Timeout(_)),
             "expected a timeout, got {err:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // flush — forcing a block boundary
+    // -----------------------------------------------------------------------
+
+    /// `flush` separates what is queued before it from what comes after: the two
+    /// commands reach the wire as two frames instead of one coalesced frame.
+    #[tokio::test]
+    async fn test_flush_forces_a_block_boundary() {
+        let device = TestDevice::new(vec![
+            MappingEntry {
+                input: make_frame(0, &[5]),
+                outputs: vec![],
+            },
+            MappingEntry {
+                input: make_frame(1, &[6]),
+                outputs: vec![],
+            },
+        ]);
+        let recorder = device.recorder();
+        let mcu = Mcu::for_test("test_mcu", Interface::new(device));
+        let dictionary = Dictionary::from_json(serde_json::json!({
+            "commands": {"get_clock": 5, "get_uptime": 6}
+        }))
+        .unwrap();
+        mcu.install_dictionary(dictionary).unwrap();
+
+        // Queued close together these would coalesce; the barrier keeps them
+        // apart. A merged frame would match neither mapping, so it would not be
+        // recorded and the count would not reach two.
+        mcu.send("get_clock", &[]).unwrap();
+        mcu.flush(Duration::from_millis(500)).await.unwrap();
+        mcu.send("get_uptime", &[]).unwrap();
+        mcu.flush(Duration::from_millis(500)).await.unwrap();
+
+        let frames = recorder.frames();
+        assert_eq!(frames.len(), 2, "expected two frames, got {frames:?}");
+        assert_eq!(frames[0].payload(), &[5]);
+        assert_eq!(frames[1].payload(), &[6]);
+    }
+
+    /// A flush with nothing queued before it is already satisfied.
+    #[tokio::test]
+    async fn test_flush_with_nothing_queued_completes() {
+        let device = TestDevice::new(vec![]);
+        let recorder = device.recorder();
+        let mcu = Mcu::for_test("test_mcu", Interface::new(device));
+
+        mcu.flush(Duration::from_millis(500)).await.unwrap();
+
+        assert!(recorder.frames().is_empty());
     }
 
     // -----------------------------------------------------------------------

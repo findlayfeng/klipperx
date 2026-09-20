@@ -204,23 +204,13 @@ async fn cheetah_reset(path: &str) -> Result<(), String> {
 /// The port must be closed, and the caller opens it afterwards.
 async fn rpi_usb_reset(serial_path: &str, method: usb::UsbPowerMethod) -> Result<(), String> {
     let tty = PathBuf::from(serial_path);
-    // The tty's own name, taken before the port goes off: a `by-id` symlink is
-    // gone while the device is.
-    let real = fs::canonicalize(&tty)
-        .map_err(|e| format!("usb: cannot resolve {}: {e}", tty.display()))?;
-    let name = real
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| format!("usb: not a tty path: {}", tty.display()))?
-        .to_string();
-
-    let port = usb::resolve_tty_port(&real)?;
+    let port = usb::resolve_tty_port(&tty)?;
     // Resolve the mechanism per reset, so a hub that was replugged (or a udev
     // rule that only now applies) is picked up again.
     let power = usb::probe(&port, method)?;
     // The device's own node number, to tell the old instance from the one that
     // comes back.
-    let before = device_node(&name);
+    let before = device_node(&tty);
 
     usb_set_power(&port, &power, false).await?;
     tokio::time::sleep(USB_POWER_OFF).await;
@@ -228,7 +218,7 @@ async fn rpi_usb_reset(serial_path: &str, method: usb::UsbPowerMethod) -> Result
 
     // The caller is about to open the port, so wait for the board to be back
     // rather than opening the instance that is still on its way out.
-    wait_for_new_device(&name, before, &tty, USB_PORT_RETURN_TIMEOUT).await
+    wait_for_new_device(&tty, before, USB_PORT_RETURN_TIMEOUT).await
 }
 
 /// Switch one hub port, off the runtime: `nusb`'s blocking path does the syscalls.
@@ -240,15 +230,22 @@ async fn usb_set_power(port: &usb::UsbPort, power: &usb::UsbPower, on: bool) -> 
         .map_err(|e| format!("usb: {e}"))?
 }
 
-/// The USB device node (`major:minor`) a tty hangs off, or `None` when it is not
-/// there.
+/// The USB device node (`major:minor`) behind a tty path, or `None` when the tty
+/// or its device is not there.
 ///
 /// This is the only signal that changes when a board re-enumerates. Neither the
 /// `/dev` node nor the tty's sysfs link does: Linux keeps a device around when its
 /// port is switched off through the hub, and only tears it down once the port is
 /// powered again (measured: the node number went `189:40` → `189:41` across a
 /// cycle, while both of the obvious signals stayed "present" the whole time).
-fn device_node(name: &str) -> Option<String> {
+///
+/// The path is resolved on **every** call. A `by-id` path keeps naming the device
+/// while it comes back under another tty, whereas `/sys/class/tty` is keyed by the
+/// tty's own name — so resolving once, before the reset, would lose a device that
+/// returned as `ttyACM1`.
+fn device_node(tty: &Path) -> Option<String> {
+    let real = fs::canonicalize(tty).ok()?;
+    let name = real.file_name()?.to_str()?;
     let interface = fs::canonicalize(Path::new("/sys/class/tty").join(name).join("device")).ok()?;
     let usb = interface.parent()?;
     fs::read_to_string(usb.join("dev"))
@@ -267,9 +264,8 @@ fn device_node(name: &str) -> Option<String> {
 /// more while the port is missing (`klippy/mcu.py:693`); waiting here keeps it in
 /// one place.
 async fn wait_for_new_device(
-    name: &str,
-    before: Option<String>,
     tty: &Path,
+    before: Option<String>,
     timeout: Duration,
 ) -> Result<(), String> {
     let Some(before) = before else {
@@ -279,7 +275,7 @@ async fn wait_for_new_device(
     let mut seen = Reenumeration::default();
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        if seen.done(device_node(name).as_deref(), &before) {
+        if seen.done(device_node(tty).as_deref(), &before) {
             return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {

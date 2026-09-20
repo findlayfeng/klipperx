@@ -166,6 +166,9 @@ recv identify_response offset=0 data=b"x\x9c\x01\xff"
 标记），窗口自己的提示则是素色（`Hint` 黄、`Problem` / `Failure` 红，与同含义的
 级别共用一色）。
 
+日志行**只有级别那一截染色**（`INFO ` / `WARN ` 这样），后面的正文用终端默认
+前景色（正常是白），和 `tracing` 直接输出到终端时一致。
+
 有一个容易踩的点：`--verbose` 把过滤器设成 `debug`，**TRACE 事件因此被过滤掉**，
 在窗口里看不到帧字节。要看帧字节得用 `RUST_LOG`：
 

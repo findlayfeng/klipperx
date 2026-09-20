@@ -307,7 +307,7 @@ DTR”隐式满足，但那是驱动副作用，不算实现。**
 
 **推进顺序**：⑥ `restart_method` 校验/默认 ✓ → ② `McuConfig` 解析/打开拆分 ✓ →
 ① `start_reason`（最小切片）✓ → ③ `serial.rs` DTR/RTS + `arduino` 显式复位 ✓ →
-⑤ `cheetah`（复用原语 + attach RTS）→ ④ `rpi_usb`（外部依赖，最后或明确不支持）。
+⑤ `cheetah`（含 attach RTS）✓ → ④ `rpi_usb`（外部依赖，最后或明确不支持）。
 
 - [x] **⑥ `restart_method` 校验/默认**：未知值报配置错，非串口（CAN / host）恒为 `command`、
       且配置了该项时告警，串口缺省为 `arduino`（对齐上游 `getchoice` + `if baud`，
@@ -320,15 +320,16 @@ DTR”隐式满足，但那是驱动副作用，不算实现。**
       把 D1 的 `StartArgs` / `info` 接上仍待做。
 - [x] **③ `serial.rs` DTR/RTS + arduino 复位**：`ModemLines`（`set_dtr` / `set_rts`，
       `TIOCMBIS`/`TIOCMBIC`）+ `mcu/restart.rs::reset_firmware`—— `command` 不动、
-      `arduino` 以 2400 开、排空、DTR 三拍（`klippy/serialhdl.py:392`）、`cheetah`/`rpi_usb`
-      记 warning 后继续（仍靠 `config_reset` 恢复）。在 `McuObject::connect` 的 open **之前**、
-      且仅 `firmware_restart` 时调用。注：pty 不模拟 modem 线（`TIOCMBIS` = `ENOTTY`），
-      DTR/RTS 翻转没有端到端测试，只测了 `ModemLines` 能开 tty + 分派到串口复位；
-      **实际执行时会告警「未在真板上测过」**。
-- [ ] **⑤ `cheetah`**：复用 `ModemLines`（2400 + RTS/DTR 序列，`serialhdl.py:365`），
-      再加“attach 时 RTS 拉低”（`lookup_attach_uart_rts`，`klippy/mcu.py:703`）—— 后者要在
-      **打开设备时**就把 RTS 置低，可能要给 `Transport::Serial` 或 `SerialDevice::open` 加一个
-      参数。
+      `arduino` 以 2400 开、排空、DTR 三拍（`klippy/serialhdl.py:392`）、`rpi_usb` 记 warning
+      后继续（仍靠 `config_reset` 恢复）。在 `McuObject::connect` 的 open **之前**、且仅
+      `firmware_restart` 时调用。
+- [x] **⑤ `cheetah`**：`cheetah_reset`——以 2400 开、RTS 拉高、排空，然后 DTR 两轮翻转、
+      中间把 RTS 拉低（`klippy/serialhdl.py:365`）；另加**连接期**的 RTS 拉低
+      （`lookup_attach_uart_rts`，`klippy/mcu.py:703-705`）：`McuConfig::open` 对 cheetah
+      传 `rts=false`，`Transport::open(rts)` 在打开后立即 `SerialDevice::set_rts(false)`。
+- 注（③/⑤ 共有）：pty 不模拟 modem 线（`TIOCMBIS` = `ENOTTY`），所以 DTR/RTS 序列
+      **没有端到端测试**，只测了 `ModemLines` 能开 tty + 分派到串口复位；两条路径**实际执行
+      时都告警「未在真板上测过」**，手工测试确认后把这两条 warn 删掉。
 - [ ] **④ `rpi_usb`**：`hub-ctrl` + `sudo` + attach 上电门控（`:693` `:696`），最环境相关。
 - [ ] **CRC 不匹配仍走就地复位（有意偏离上游）**：上游发现已配置但 CRC 不一致时先
       `request_exit('firmware_restart')`（`check_restart_on_crc_mismatch`，

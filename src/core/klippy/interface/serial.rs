@@ -97,6 +97,17 @@ impl SerialDevice {
     pub fn baud(&self) -> u32 {
         self.baud
     }
+
+    /// Assert or deassert RTS on the open port.
+    ///
+    /// Cheetah boards need RTS deasserted for the whole connection, or a reset
+    /// triggers their built-in bootloader (`klippy/mcu.py:703-705`).
+    ///
+    /// # Errors
+    /// Returns [`InterfaceError`] if the kernel rejects the ioctl.
+    pub fn set_rts(&self, asserted: bool) -> Result<(), InterfaceError> {
+        set_modem_line(&self.port, libc::TIOCM_RTS, asserted)
+    }
 }
 
 impl fmt::Debug for SerialDevice {

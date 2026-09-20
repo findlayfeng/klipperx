@@ -546,16 +546,37 @@ impl Printer {
         result
     }
 
+    /// Drop the parts the config loaded, and the event handlers they registered.
+    ///
+    /// This is what shuts their devices down. A transport can have a blocking
+    /// read parked on a worker thread — an MCU's receive task always runs one —
+    /// and only dropping the part releases it (see [`Mcu`](crate::core::klippy::mcu::Mcu)'s
+    /// `Drop`). The host calls this before the runtime it built is dropped:
+    /// waiting for the whole `Printer` to drop would leave that read parked,
+    /// because the API endpoints (and the subscription timers they own) keep the
+    /// printer alive past the run loop.
+    ///
+    /// The reactor and the host's own objects are kept: they belong to the
+    /// process, not to the config.
+    pub fn teardown(&self) {
+        let keep = self.lock().host_objects.unwrap_or(0);
+        self.objects
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .truncate(keep);
+        self.lock().handlers.clear();
+    }
+
     /// Take the machine down so it can be brought up again on the same printer.
     ///
     /// Drops every part the config loaded — which shuts their devices down and
-    /// closes them — and keeps the parts the host registered before the config,
-    /// i.e. the API server's `webhooks`. The state goes back to `Startup`, the
-    /// exit request is cleared, and the event handlers are forgotten (the parts
-    /// that registered them are gone). [`Printer::load_config`] +
-    /// [`Printer::bring_up`] + [`Printer::run`] can then run again on the same
-    /// `Arc<Printer>`, which is what keeps the endpoints and any attachment
-    /// valid across a restart.
+    /// closes them (see [`Printer::teardown`]) — and keeps the parts the host
+    /// registered before the config, i.e. the API server's `webhooks`. The state
+    /// goes back to `Startup`, the exit request is cleared, and the event
+    /// handlers are forgotten (the parts that registered them are gone).
+    /// [`Printer::load_config`] + [`Printer::bring_up`] + [`Printer::run`] can
+    /// then run again on the same `Arc<Printer>`, which is what keeps the
+    /// endpoints and any attachment valid across a restart.
     ///
     /// The reactor and the host's parts are kept: they belong to the process,
     /// not to the config.
@@ -564,18 +585,13 @@ impl Printer {
     /// a `firmware_restart` is what makes an MCU reset its firmware rather than
     /// just reconnect (`mcu/restart.rs`).
     pub fn reset_for_restart(&self, reason: &str) {
-        let keep = self.lock().host_objects.unwrap_or(0);
-        self.objects
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .truncate(keep);
+        self.teardown();
 
         let mut inner = self.lock();
         inner.message = MESSAGE_STARTUP.to_string();
         inner.category = PrinterState::Startup;
         inner.shutdown = false;
         inner.run_result = None;
-        inner.handlers.clear();
         inner.start_reason = Some(reason.to_string());
     }
 
@@ -847,6 +863,27 @@ mod tests {
         let state = printer.get_state_message();
         assert_eq!(state.category, PrinterState::Startup);
         assert_eq!(state.message, MESSAGE_STARTUP);
+    }
+
+    #[tokio::test]
+    async fn test_teardown_drops_the_configs_parts_and_keeps_the_state() {
+        let printer = new_printer();
+        printer
+            .add_object("webhooks", Arc::new(Fixed(serde_json::json!({}))))
+            .unwrap();
+        printer.mark_host_objects();
+        printer
+            .add_object("gcode", Arc::new(Fixed(serde_json::json!({}))))
+            .unwrap();
+        printer.bring_up().await;
+
+        printer.teardown();
+
+        // The config's parts are gone — dropping them is what closes their
+        // devices — while the host's `webhooks` stays. Unlike a restart, the
+        // state is left alone: this is the host's last teardown, not a rebuild.
+        assert_eq!(printer.objects(), ["webhooks"]);
+        assert_eq!(printer.get_state_message().category, PrinterState::Ready);
     }
 
     #[test]

@@ -28,7 +28,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use nusb::transfer::{ControlOut, ControlType, Recipient};
+use nusb::transfer::{ControlIn, ControlOut, ControlType, Recipient};
 use nusb::MaybeFuture;
 use tracing::debug;
 
@@ -38,6 +38,10 @@ const USB_PORT_FEAT_POWER: u16 = 8;
 /// `SET_FEATURE` / `CLEAR_FEATURE` (`linux/usb/ch9.h`).
 const SET_FEATURE: u8 = 3;
 const CLEAR_FEATURE: u8 = 1;
+/// `GET_DESCRIPTOR`: how the hub's own class descriptor is asked for.
+const GET_DESCRIPTOR: u8 = 6;
+/// `wValue` for the hub class descriptor: type `0x29`, index 0.
+const HUB_DESCRIPTOR: u16 = 0x2900;
 /// How long the port-power control transfer may take.
 const CONTROL_TIMEOUT: Duration = Duration::from_millis(1000);
 
@@ -150,18 +154,87 @@ pub fn set_port_power(port: &UsbPort, power: &UsbPower, on: bool) -> Result<(), 
 /// The first covers the control request, naming the hub by the ids it reports in
 /// sysfs; the second makes the sysfs attribute writable, which udev can only do
 /// with `RUN+=` — `MODE=` applies to `/dev` nodes, not to sysfs.
+///
+/// The glob is one level *below* the hub, where `disable_path` looks for the
+/// file: `$devpath` is the hub's own device directory, and its ports hang off
+/// the interface directory under it (`<hub>:<cfg>.<if>/<hub>-port<N>/disable`).
+/// `$devpath/*port*/disable` would reach only the hub's `port` symlink — the
+/// port of the *next* hub up that feeds this one — and nothing at all on a
+/// root hub. `scripts/klipperx-usb-udev.sh` emits these same two rules.
 pub fn recommended_rules(port: &UsbPort) -> String {
     let (vendor, product) = hub_ids(&port.hub_dir);
     format!(
-        "SUBSYSTEM==\"usb\", ATTR{{idVendor}}==\"{vendor}\", ATTR{{idProduct}}==\"{product}\", TAG+=\"uaccess\"\n\
-         SUBSYSTEM==\"usb\", DRIVER==\"hub|usb\", \\\n\
-         \x20   RUN+=\"/bin/sh -c \\\"chmod -f 660 $sys$devpath/*port*/disable || true\\\"\""
+        r#"SUBSYSTEM=="usb", ATTR{{idVendor}}=="{vendor}", ATTR{{idProduct}}=="{product}", TAG+="uaccess"
+SUBSYSTEM=="usb", DRIVER=="hub|usb", ATTR{{idVendor}}=="{vendor}", ATTR{{idProduct}}=="{product}", \
+  RUN+="/bin/sh -c \"chmod -f 660 $sys$devpath/*/*port*/disable || true\""#
     )
 }
 
 // ===========================================================================
 // The two mechanisms
 // ===========================================================================
+
+/// What a hub reports it can do about the power of its ports.
+///
+/// The low two bits of `wHubCharacteristics` in the hub class descriptor, which
+/// is the only thing that says whether switching a port's power can reset a board
+/// at all — the id, the model and being a root hub say nothing (see the user
+/// manual).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortPower {
+    /// `0b00`: the ports are switched together. Cutting one cuts every port of
+    /// the hub, so anything else on it goes down too.
+    Ganged,
+    /// `0b01`: every port has a switch of its own — the useful case.
+    PerPort,
+    /// `0b10`: **no power switching**. A port can still be disabled — that is
+    /// what the sysfs `disable` file and `CLEAR_FEATURE(PORT_POWER)` end up doing
+    /// — but VBUS stays on, so a board on it is only disconnected, never reset.
+    Unsupported,
+}
+
+/// Read the hub class descriptor of `port`'s hub through its low two
+/// `wHubCharacteristics` bits.
+///
+/// `None` when the hub cannot be opened (no access to its `/dev/bus/usb` node, or
+/// no hub there) or does not answer: nothing can be concluded about the port then,
+/// and the caller keeps its default of trying the switch and checking the board
+/// afterwards.
+///
+/// Only the hub itself is asked — a root hub answers this too, which is how a
+/// machine whose MCU sits on one finds out whether the port is switchable at all.
+pub fn port_power(port: &UsbPort) -> Option<PortPower> {
+    let hub = open_hub(port).ok()?;
+    let request = ControlIn {
+        control_type: ControlType::Class,
+        recipient: Recipient::Device,
+        request: GET_DESCRIPTOR,
+        value: HUB_DESCRIPTOR,
+        index: 0,
+        // `bLength` of a hub class descriptor; the bits that matter are in its
+        // first five bytes.
+        length: 9,
+    };
+    let data = hub.control_in(request, CONTROL_TIMEOUT).wait().ok()?;
+    power_from_hub_descriptor(&data)
+}
+
+/// The port-power bits of a hub class descriptor.
+///
+/// Split out from [`port_power`] because it is the whole decision, and it can be
+/// checked against descriptors instead of against hardware.
+fn power_from_hub_descriptor(descriptor: &[u8]) -> Option<PortPower> {
+    // bLength, bDescriptorType (0x29), bNbrPorts, then wHubCharacteristics.
+    if descriptor.len() < 5 || descriptor[1] != 0x29 {
+        return None;
+    }
+    let characteristics = u16::from_le_bytes([descriptor[3], descriptor[4]]);
+    Some(match characteristics & 0b11 {
+        0 => PortPower::Ganged,
+        1 => PortPower::PerPort,
+        _ => PortPower::Unsupported,
+    })
+}
 
 /// The sysfs route: the port's `disable` file, if it exists and we may write it.
 fn probe_sysfs(port: &UsbPort) -> Result<UsbPower, String> {
@@ -268,10 +341,26 @@ fn hub_ids(hub_dir: &Path) -> (String, String) {
 }
 
 /// Open the hub device by the bus/address sysfs reports.
+///
+/// `nusb::list_devices()` leaves root hubs out on purpose (its Linux backend
+/// drops the `usbN` names), and they are only reachable through the bus list. A
+/// device plugged straight into one — an MCU on a plain port, with no hub in
+/// between — still has to have its port switched, so the root hubs are offered to
+/// the search as well.
 fn open_hub(port: &UsbPort) -> Result<nusb::Device, String> {
-    let info = nusb::list_devices()
+    let devices = nusb::list_devices()
         .wait()
-        .map_err(|e| format!("cannot list devices: {e}"))?
+        .map_err(|e| format!("cannot list devices: {e}"))?;
+    let root_hubs = match nusb::list_buses().wait() {
+        Ok(buses) => buses.map(|bus| bus.root_hub().clone()).collect::<Vec<_>>(),
+        Err(e) => {
+            // Not fatal: an ordinary hub is in `devices` already.
+            debug!("usb: cannot list buses ({e}); no root hub to consider");
+            Vec::new()
+        }
+    };
+    let info = devices
+        .chain(root_hubs)
         .find(|info| info.busnum() == port.bus && info.device_address() == port.device)
         .ok_or_else(|| "not found".to_string())?;
     info.open()
@@ -508,6 +597,94 @@ mod tests {
     }
 
     #[test]
+    fn test_a_device_under_several_hubs_switches_the_nearest_one() {
+        let sysfs = Sysfs::new("stacked");
+        // usb1 (root) → 1-1 → 1-1.4 → the MCU on port 3 of 1-1.4.
+        let root = sysfs.node("usb1", 1, 1);
+        sysfs.hub(&root, "1-0", "1d6b", "0002", 1, "usb1-port{n}");
+        let outer = sysfs.node("usb1/1-1", 1, 2);
+        // The outer hub feeds an inner hub of its own id, the way a stack of
+        // identical hubs looks: the ids cannot tell the two layers apart.
+        sysfs.hub(&outer, "1-1", "0424", "2137", 4, "1-1-port{n}");
+        let inner = sysfs.node("usb1/1-1/1-1.4", 1, 3);
+        sysfs.hub(&inner, "1-1.4", "0424", "2137", 3, "1-1.4-port{n}");
+        let mcu = sysfs.node("usb1/1-1/1-1.4/1-1.4.3", 1, 4);
+        let iface = mcu.join("1-1.4.3:1.0");
+        fs::create_dir_all(&iface).unwrap();
+        sysfs.tty("ttyACM0", iface);
+
+        let port = resolve_tty_port_in(sysfs.root(), Path::new("/dev/ttyACM0")).unwrap();
+        let inner = fs::canonicalize(&inner).unwrap();
+        // The hub is the one directly above the MCU — not the root hub, and not
+        // the outer hub that shares its ids.
+        assert_eq!(port.hub_dir, inner);
+        assert_eq!((port.bus, port.device, port.port), (1, 3, 3));
+
+        // And the switch is that hub's port 3, where the MCU sits.
+        let switch = disable_path(&port.hub_dir, port.port).unwrap();
+        assert_eq!(switch, inner.join("1-1.4:1.0/1-1.4-port3/disable"));
+        assert_eq!(
+            probe(&port, UsbPowerMethod::Sysfs),
+            Ok(UsbPower::Sysfs(switch))
+        );
+    }
+
+    #[test]
+    fn test_the_switch_of_a_device_on_a_root_hub_is_found() {
+        let sysfs = Sysfs::new("root-switch");
+        let root = sysfs.node("usb1", 1, 1);
+        // A root hub's ports hang off its single interface, named after it.
+        sysfs.hub(&root, "1-0", "1d6b", "0002", 1, "usb1-port{n}");
+        let mcu = sysfs.node("usb1/1-1", 1, 2);
+        sysfs.tty("ttyACM0", mcu);
+
+        let port = resolve_tty_port_in(sysfs.root(), Path::new("/dev/ttyACM0")).unwrap();
+        assert_eq!((port.bus, port.device, port.port), (1, 1, 1));
+        let switch = disable_path(&port.hub_dir, port.port).unwrap();
+        assert_eq!(
+            switch,
+            fs::canonicalize(&root)
+                .unwrap()
+                .join("1-0:1.0/usb1-port1/disable")
+        );
+        assert!(switch.is_file());
+    }
+
+    #[test]
+    fn test_the_port_power_bits_of_a_hub_descriptor() {
+        // Real bytes: an AMD xHCI root hub (`0929020a000a0004ff`) —
+        // `wHubCharacteristics = 0x000a`, which says it has no power switching,
+        // and is why switching a port on it only disconnects the board.
+        assert_eq!(
+            power_from_hub_descriptor(&[0x09, 0x29, 0x02, 0x0a, 0x00, 0x0a, 0x00, 0x04, 0xff]),
+            Some(PortPower::Unsupported)
+        );
+        // `0x0009` is per-port, `0x0008` ganged; the rest of the word is other
+        // characteristics and must not be looked at.
+        assert_eq!(
+            power_from_hub_descriptor(&[0x09, 0x29, 0x04, 0x09, 0xe0]),
+            Some(PortPower::PerPort)
+        );
+        assert_eq!(
+            power_from_hub_descriptor(&[0x09, 0x29, 0x07, 0x08, 0x00]),
+            Some(PortPower::Ganged)
+        );
+        // A reserved value is treated as no switching, which is the safe read.
+        assert_eq!(
+            power_from_hub_descriptor(&[0x09, 0x29, 0x04, 0x0b, 0x00]),
+            Some(PortPower::Unsupported)
+        );
+        // Anything that is not a hub class descriptor (or is too short) says
+        // nothing, and the caller goes back to trying.
+        assert_eq!(power_from_hub_descriptor(&[]), None);
+        assert_eq!(power_from_hub_descriptor(&[0x09, 0x29, 0x04]), None);
+        assert_eq!(
+            power_from_hub_descriptor(&[0x09, 0x2a, 0x04, 0x09, 0x00]),
+            None
+        );
+    }
+
+    #[test]
     fn test_the_recommended_rule_names_the_hub_by_its_ids() {
         let sysfs = Sysfs::new("rule");
         let hub = sysfs.node("usb1/1-1", 1, 2);
@@ -520,8 +697,29 @@ mod tests {
             hub_dir: fs::canonicalize(&hub).unwrap(),
         };
         let rule = recommended_rules(&port);
-        assert!(rule.contains("idVendor") && rule.contains("1d6b"), "{rule}");
-        assert!(rule.contains("1d6b") && rule.contains("0002"), "{rule}");
-        assert!(rule.contains("*port*/disable"), "{rule}");
+        // Both rules name the hub: the control request goes to it…
+        assert_eq!(rule.matches("1d6b").count(), 2, "{rule}");
+        assert_eq!(rule.matches("0002").count(), 2, "{rule}");
+        // …and the chmod reaches its ports, one level below it — not its
+        // own `port` symlink, which is the port of the hub above it.
+        assert!(rule.contains("$sys$devpath/*/*port*/disable"), "{rule}");
+        assert!(!rule.contains("devpath/*port*/disable"), "{rule}");
+    }
+
+    #[test]
+    fn test_the_script_emits_the_same_rules_as_the_warning() {
+        // The warning prints the rules and the script installs them; a drift here
+        // silently breaks the sysfs route, because a glob one level too shallow
+        // grants the port of the hub *above* the MCU (and nothing at all on a root
+        // hub). The script escapes the `$`, so match with the backslash.
+        let script = include_str!("../../../../scripts/klipperx-usb-udev.sh");
+        assert!(
+            script.contains(r"\$devpath/*/*port*/disable"),
+            "the script's RUN+= glob drifted"
+        );
+        assert!(
+            !script.contains(r"\$devpath/*port*/disable"),
+            "the script's RUN+= glob is one level too shallow"
+        );
     }
 }

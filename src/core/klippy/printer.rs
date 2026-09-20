@@ -32,6 +32,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use serde_json::Value;
 use tracing::error;
 
+use crate::core::klippy::config::value::ConfigValue;
 use crate::core::klippy::error::KlippyError;
 use crate::core::klippy::reactor::Reactor;
 
@@ -214,6 +215,14 @@ pub struct Printer {
     /// Empty until a part registers itself: the machine has none of its own,
     /// and the API server's `webhooks` object is the host's, not the machine's.
     objects: Mutex<Vec<(String, Arc<dyn PrinterObject>)>>,
+    /// Option values that override the **in-memory** config, per section.
+    ///
+    /// A restart reloads the same parsed config and never re-reads the file
+    /// (`klippy.rs`), and [`Printer::reset_for_restart`] drops the objects built
+    /// from it, so something a part learns about its own section at run time has
+    /// to be kept here to reach the next bring-up. The loader applies these as it
+    /// hands a section over (`load.rs`); the file on disk is the operator's.
+    config_overrides: Mutex<HashMap<String, HashMap<String, ConfigValue>>>,
 }
 
 struct Inner {
@@ -266,7 +275,39 @@ impl Printer {
             exit_requested: Condvar::new(),
             reactor,
             objects: Mutex::new(Vec::new()),
+            config_overrides: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Override `<option> = <value>` in the section named `identifier` — in
+    /// memory only, for the rest of the process.
+    ///
+    /// For a part that finds out at run time that an option cannot work as
+    /// written: the next bring-up reads this section again, and the loader applies
+    /// what is recorded here on top of it. The config file is untouched, and
+    /// restarting the process reads it as written.
+    pub fn override_config(&self, identifier: &str, option: &str, value: ConfigValue) {
+        self.config_overrides
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entry(identifier.to_string())
+            .or_default()
+            .insert(option.to_string(), value);
+    }
+
+    /// The overrides recorded for `identifier`, for the loader to apply.
+    pub(crate) fn overrides_for(&self, identifier: &str) -> Vec<(String, ConfigValue)> {
+        self.config_overrides
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(identifier)
+            .map(|options| {
+                options
+                    .iter()
+                    .map(|(option, value)| (option.clone(), value.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// The reactor this printer was built with.
@@ -806,6 +847,51 @@ mod tests {
         let state = printer.get_state_message();
         assert_eq!(state.category, PrinterState::Startup);
         assert_eq!(state.message, MESSAGE_STARTUP);
+    }
+
+    #[test]
+    fn test_overrides_are_remembered_per_section() {
+        let printer = new_printer();
+        assert!(printer.overrides_for("mcu").is_empty());
+
+        printer.override_config(
+            "mcu",
+            "restart_method",
+            ConfigValue::Single("command".to_string()),
+        );
+        printer.override_config(
+            "mcu zboard",
+            "restart_method",
+            ConfigValue::Single("arduino".to_string()),
+        );
+
+        assert_eq!(
+            printer.overrides_for("mcu"),
+            vec![(
+                "restart_method".to_string(),
+                ConfigValue::Single("command".to_string())
+            )]
+        );
+        // Another section is untouched, and re-recording replaces.
+        assert_eq!(
+            printer.overrides_for("mcu zboard"),
+            vec![(
+                "restart_method".to_string(),
+                ConfigValue::Single("arduino".to_string())
+            )]
+        );
+        printer.override_config(
+            "mcu",
+            "restart_method",
+            ConfigValue::Single("cheetah".to_string()),
+        );
+        assert_eq!(
+            printer.overrides_for("mcu"),
+            vec![(
+                "restart_method".to_string(),
+                ConfigValue::Single("cheetah".to_string())
+            )]
+        );
     }
 
     #[test]

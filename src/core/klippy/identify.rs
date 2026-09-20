@@ -221,7 +221,9 @@ impl Mcu {
     /// last handle is dropped, and command modules each hold one.
     ///
     /// # Errors
-    /// Returns [`McuError`] if any step of the handshake fails. The partially
+    /// Returns [`McuError`] if any step of the handshake fails, and
+    /// [`McuError::OldSession`] when the firmware turned out to be mid-session —
+    /// a board that kept running rather than one that just came up. The partially
     /// initialized MCU is dropped on the way out, which shuts the interface down
     /// again.
     pub async fn connect(
@@ -229,7 +231,9 @@ impl Mcu {
         interface: Interface,
     ) -> Result<Arc<Mcu>, McuError> {
         let mcu = Arc::new(Mcu::new(name, interface));
-        mcu.identify(IDENTIFY_TIMEOUT).await?;
+        if let Err(err) = mcu.identify(IDENTIFY_TIMEOUT).await {
+            return Err(connect_error(&mcu, err));
+        }
         Ok(mcu)
     }
 
@@ -267,6 +271,21 @@ impl Mcu {
             debug!("{}", describe_dictionary(self.name(), &dictionary));
         }
         Ok(installed)
+    }
+}
+
+/// The error a failed [`Mcu::connect`] reports.
+///
+/// A firmware that answered from an older session never rebooted, and that is the
+/// whole reason the handshake failed: report it as what it is instead of as the
+/// timeout it causes. The caller is the one that can act on it — this is how an
+/// `rpi_usb` reset finds out that switching the port's power did not reset the
+/// board (`mcu/object.rs`).
+fn connect_error(mcu: &Mcu, err: McuError) -> McuError {
+    if mcu.answered_from_old_session() {
+        McuError::OldSession(err.to_string())
+    } else {
+        err
     }
 }
 
@@ -484,6 +503,45 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, McuError::Call(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn test_a_failed_handshake_from_an_older_session_says_so() {
+        // The firmware answers the identify request with a sequence from a
+        // session this host never opened: the receive task drops it — and notes
+        // it — so the handshake times out. What the caller is told names the real
+        // cause, because a board that answers like this never rebooted.
+        let mcu = mcu_with(vec![MappingEntry {
+            input: Frame::new(0, request_payload(0)),
+            outputs: vec![Frame::new(9, response_payload(0, &compress(b"{}")))],
+        }]);
+
+        let err = Identify::fetch(&mcu, Duration::from_millis(50))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, McuError::Call(_)), "{err:?}");
+        assert!(mcu.answered_from_old_session());
+
+        let err = connect_error(&mcu, err);
+        assert!(matches!(err, McuError::OldSession(_)), "{err:?}");
+        assert!(
+            err.to_string().contains("answered from an older session"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_failed_handshake_from_a_fresh_firmware_keeps_its_error() {
+        // A board that just came up answers nothing at all here: the handshake
+        // fails the same way, but nothing says the firmware was already running,
+        // so the error is reported as it is.
+        let mcu = mcu_with(vec![]);
+
+        let err = Identify::fetch(&mcu, Duration::from_millis(50))
+            .await
+            .unwrap_err();
+        assert!(!mcu.answered_from_old_session());
+        assert!(matches!(connect_error(&mcu, err), McuError::Call(_)));
     }
 
     // -----------------------------------------------------------------------

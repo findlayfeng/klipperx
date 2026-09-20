@@ -29,10 +29,13 @@ use serde_json::{json, Map, Value};
 use tracing::warn;
 
 use crate::core::klippy::config::mcu::McuConfig;
+use crate::core::klippy::config::value::ConfigValue;
 use crate::core::klippy::config::ConfigSection;
 use crate::core::klippy::error::KlippyError;
 use crate::core::klippy::event::{IsShutdown, McuEvent, Shutdown, Starting};
-use crate::core::klippy::mcu::{ConfigBuilder, Dictionary, Mcu, McuChip, McuError};
+use crate::core::klippy::mcu::{
+    ConfigBuilder, Dictionary, Mcu, McuChip, McuError, McuRestartMethod,
+};
 use crate::core::klippy::pins::{PinError, PrinterPins, PINS_OBJECT};
 use crate::core::klippy::printer::{ConnectFuture, Printer, PrinterObject};
 
@@ -151,6 +154,38 @@ impl McuObject {
             == Some("firmware_restart")
     }
 
+    /// Report that `rpi_usb` cannot reset this MCU's firmware, and use `command`
+    /// for it from now on.
+    ///
+    /// `observed` is what was seen, and it is one of four things: the hub reports
+    /// no port power switching at all (found before anything is switched), the
+    /// switch itself failed, the board answered from an older session, or it still
+    /// carried its configuration — a board that rebooted does neither. The first
+    /// needs no attempt and the rest are attempts that did not work; in every case
+    /// repeating the switch would keep `firmware_restart` from ever working, so the
+    /// method becomes `command` — upstream's generic path, which resets the
+    /// firmware through its own `config_reset` (`mcu/config.rs`).
+    ///
+    /// The replacement is recorded on the printer, not here: a restart reloads the
+    /// parsed config and rebuilds this object, and the config file is not written
+    /// to (see [`Printer::override_config`]). Printed when it happens — the
+    /// fallback is what keeps it from happening again.
+    fn usb_reset_unusable(&self, config: &McuConfig, observed: &str) {
+        warn!(
+            "MCU '{}': restart_method 'rpi_usb' will not reset this firmware ({}); \
+             switching this MCU to 'command' in memory — the config file is \
+             unchanged",
+            config.name, observed
+        );
+        if let Some(printer) = self.printer.upgrade() {
+            printer.override_config(
+                &self.section.identifier(),
+                "restart_method",
+                ConfigValue::Single(McuRestartMethod::Command.as_str().to_string()),
+            );
+        }
+    }
+
     /// Report a firmware shutdown, restart, or already-stopped state.
     ///
     /// The events carry the reason; the machine is what knows what a stop
@@ -216,22 +251,40 @@ impl PrinterObject for McuObject {
             // of two-phase construction, and upstream parses the section at the
             // same moment (`klippy/mcu.py:1147`). Opening a serial port or
             // dlopen-ing the host library blocks, briefly, on this task.
-            let config = McuConfig::new(&self.section).map_err(KlippyError::Internal)?;
+            let mut config = McuConfig::new(&self.section).map_err(KlippyError::Internal)?;
             // Check at startup, not at the first restart, that an `rpi_usb` reset
             // will be able to switch this port's power (and say which udev rule
-            // to install if it will not).
-            super::restart::check_usb_power(&config);
-            // A `firmware_restart` is the one bring-up that resets the firmware
-            // itself, and it has to happen while the transport is still closed.
+            // to install if it will not). A hub that reports no power switching
+            // cannot switch it at all, so that check is also where `rpi_usb` is
+            // dropped before it ever disconnects a board for nothing.
+            if let Some(reason) = super::restart::check_usb_power(&config) {
+                self.usb_reset_unusable(&config, &reason);
+                config.restart_method = McuRestartMethod::Command;
+            }
+            // This bring-up is the one that resets the firmware itself, and
+            // `rpi_usb` is the only method that does it by switching the port's
+            // power — the one thing that can disconnect a board without
+            // resetting it, and so the one thing worth checking afterwards.
+            let usb_reset =
+                self.is_firmware_restart() && config.restart_method == McuRestartMethod::RpiUsb;
             if self.is_firmware_restart() {
-                super::restart::reset_firmware(&config)
-                    .await
-                    .map_err(KlippyError::Internal)?;
+                if let Err(err) = super::restart::reset_firmware(&config).await {
+                    if usb_reset {
+                        self.usb_reset_unusable(&config, &err);
+                    }
+                    return Err(KlippyError::Internal(err));
+                }
             }
             let interface = config.open().map_err(KlippyError::Internal)?;
-            let mcu = Mcu::connect(config.name, interface)
-                .await
-                .map_err(|err| KlippyError::Connection(err.to_string()))?;
+            let mcu = match Mcu::connect(&config.name, interface).await {
+                Ok(mcu) => mcu,
+                Err(err) => {
+                    if usb_reset {
+                        self.usb_reset_unusable(&config, &err.to_string());
+                    }
+                    return Err(KlippyError::Connection(err.to_string()));
+                }
+            };
             // Make the device reachable by resources before the configuration
             // is built; a resource's runtime methods need it.
             self.chip.attach(Arc::clone(&mcu));
@@ -242,11 +295,21 @@ impl PrinterObject for McuObject {
             // Now the accumulated configuration can be encoded and sent, and the
             // firmware either adopts it or confirms it already has it
             // (`mcu/config.rs`).
-            self.chip
+            let configured = self
+                .chip
                 .config()
                 .configure(&mcu)
                 .await
                 .map_err(|err| KlippyError::Connection(err.to_string()))?;
+            // A board that just rebooted comes up unconfigured and running; one
+            // that was already configured or stopped was only disconnected, and the
+            // port switch did not do its job.
+            if usb_reset && configured.already_running {
+                self.usb_reset_unusable(
+                    &config,
+                    "the firmware was already configured or stopped when it answered",
+                );
+            }
             // Only now does a firmware shutdown mean something the machine
             // should report: the configuration handshake is done, so nothing
             // this host sent is still in flight.
@@ -335,6 +398,52 @@ mod tests {
             .add_object(PINS_OBJECT, Arc::new(PrinterPins::new()))
             .unwrap();
         printer
+    }
+
+    #[test]
+    fn test_a_usb_reset_that_did_not_reset_the_firmware_switches_to_command() {
+        // An `rpi_usb` reset that left the firmware running is worth acting on:
+        // the switch is recorded as `command` for this MCU, in memory. The
+        // section is the serial one, because that is the only transport the
+        // option applies to.
+        let printer = printer();
+        let mut section = section(None);
+        section.parameters.insert(
+            "serial".to_string(),
+            ConfigValue::Single("/dev/not-opened-yet".to_string()),
+        );
+        section.parameters.insert(
+            "restart_method".to_string(),
+            ConfigValue::Single("rpi_usb".to_string()),
+        );
+        let object = McuObject::new(section, &printer).unwrap();
+        let config = McuConfig::new(&object.section).unwrap();
+        assert_eq!(config.restart_method, McuRestartMethod::RpiUsb);
+        assert!(printer.overrides_for("mcu").is_empty());
+
+        object.usb_reset_unusable(
+            &config,
+            "the firmware answered from an older session (timeout: no response)",
+        );
+
+        assert_eq!(
+            printer.overrides_for("mcu"),
+            vec![(
+                "restart_method".to_string(),
+                ConfigValue::Single("command".to_string())
+            )]
+        );
+        // Which is what the loader will hand back the next time this section is
+        // read: the in-memory config now says `command`.
+        let next = printer.overrides_for(&object.section.identifier());
+        let mut section = object.section.clone();
+        for (option, value) in next {
+            section.parameters.insert(option, value);
+        }
+        assert_eq!(
+            McuConfig::new(&section).unwrap().restart_method,
+            McuRestartMethod::Command
+        );
     }
 
     /// An MCU object for `sub`, over such a printer.

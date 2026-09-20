@@ -214,6 +214,14 @@ pub struct Configured {
     /// True when the firmware already had this configuration and only the
     /// restart/init commands were sent.
     pub reused: bool,
+    /// True when the firmware was already configured, or already stopped, at the
+    /// first `get_config` of this handshake — before any reset it performs
+    /// itself.
+    ///
+    /// A board that just booted is neither: its configuration lives in RAM, and a
+    /// fresh boot is not stopped. So this is the answer to "did the board actually
+    /// reboot?", which is what an `rpi_usb` reset has to check (`mcu/object.rs`).
+    pub already_running: bool,
 }
 
 impl ConfigBuilder {
@@ -453,6 +461,10 @@ impl ConfigBuilder {
         } = self.build(mcu)?;
 
         let mut before = get_config(mcu).await?;
+        // Read before anything below resets the firmware: what the board reports
+        // here is what the connection found, which is how a caller tells a board
+        // that just came up from one that kept running.
+        let already_running = before.is_config || before.is_shutdown;
 
         // A stopped firmware, or one carrying a different configuration, has to
         // be cleared before this one can be sent: `finalize_config` locks the
@@ -518,6 +530,7 @@ impl ConfigBuilder {
             crc,
             move_count: after.move_count,
             reused,
+            already_running,
         })
     }
 
@@ -1127,6 +1140,8 @@ mod tests {
 
         assert!(!configured.reused, "the firmware was reset, not reused");
         assert_eq!(configured.crc, crc);
+        // It answered as stopped, though: it was already running.
+        assert!(configured.already_running);
     }
 
     /// The same dictionary without `config_reset`: a firmware that cannot clear
@@ -1368,6 +1383,9 @@ mod tests {
         assert_eq!(configured.crc, crc);
         assert_eq!(configured.move_count, 500);
         assert_eq!(ran.load(Ordering::SeqCst), 1);
+        // `reused` says the same thing here, from the other side: a board
+        // that just booted has no configuration to reuse.
+        assert!(configured.already_running);
     }
 
     #[tokio::test]
@@ -1444,5 +1462,7 @@ mod tests {
         assert_eq!(configured.crc, expected.crc);
         assert_eq!(configured.move_count, 500);
         assert!(builder.is_finalized());
+        // Unconfigured and running: what a board that just rebooted reports.
+        assert!(!configured.already_running);
     }
 }

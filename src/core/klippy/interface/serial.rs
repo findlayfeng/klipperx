@@ -133,7 +133,7 @@ impl Device for SerialDevice {
             if self.stopped.load(Ordering::Relaxed) {
                 return None;
             }
-            if let Some(frame) = self.stream.lock().unwrap().next() {
+            if let Some(frame) = self.stream.lock().unwrap().next_frame() {
                 return Some(frame);
             }
 

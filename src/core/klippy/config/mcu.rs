@@ -105,7 +105,7 @@ impl McuConfig {
 
         let restart_method = section
             .get_str("restart_method")
-            .and_then(McuRestartMethod::from_str)
+            .and_then(McuRestartMethod::parse)
             .unwrap_or(McuRestartMethod::Arduino);
 
         (name, restart_method)
@@ -252,7 +252,7 @@ impl McuConfig {
     /// Decode a hex string to bytes (test helper).
     #[cfg(test)]
     fn hex_decode_bytes(s: &str) -> Result<Vec<u8>, String> {
-        if s.len() % 2 != 0 {
+        if !s.len().is_multiple_of(2) {
             return Err("Hex string length must be even".to_string());
         }
         (0..s.len())

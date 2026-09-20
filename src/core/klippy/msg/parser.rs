@@ -43,6 +43,12 @@ pub struct Parser {
     msgs: Arc<Mutex<MsgMap>>,
 }
 
+impl Default for Parser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Parser {
     /// Create a new parser and register default message formats.
     pub fn new() -> Self {
@@ -188,7 +194,7 @@ impl Parser {
         // Message ids use the same signed VLQ encoding as `%i`.
         payload.push_i16(msg.id)?;
         for (value, (param_name, arg_type)) in values.iter().zip(param_types) {
-            let converted = value.try_convert_to(*arg_type).map_err(|_| {
+            let converted = value.try_convert_to(*arg_type).ok_or_else(|| {
                 MsgError::new(format!(
                     "parameter '{}' expects {}, got {}",
                     param_name,

@@ -190,7 +190,7 @@ mod tests {
 
     /// Parse a config from its text, as the host does from a file.
     fn config(text: &str) -> Config {
-        Config::from_str(text).expect("the test config parses").0
+        Config::from_text(text).expect("the test config parses").0
     }
 
     fn load(text: &str) -> (Arc<Printer>, Result<(), KlippyError>) {

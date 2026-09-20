@@ -90,7 +90,7 @@ impl Msg {
             let param_name = part[..eq].to_string();
             let typ = &part[eq + 1..];
             let arg_type = ArgType::parse_format(typ)
-                .map_err(|_| MsgError::new(format!("unknown type specifier: {}", typ)))?;
+                .ok_or_else(|| MsgError::new(format!("unknown type specifier: {}", typ)))?;
             params.push((param_name, arg_type));
         }
         Ok(Self {
@@ -214,6 +214,9 @@ mod tests {
     // Msg Hash (for use in collections)
     // -----------------------------------------------------------------------
 
+    // `Msg`'s only interior mutability is the callback, which the manual
+    // `Eq`/`Hash` ignore, so using it as a key is well defined.
+    #[allow(clippy::mutable_key_type)]
     #[test]
     fn test_command_hash() {
         use std::collections::HashSet;

@@ -94,7 +94,10 @@ impl Config {
     }
 
     /// Parse a config from a string.
-    pub fn from_str(content: &str) -> Result<(Self, Vec<ConfigSource>), String> {
+    ///
+    /// Named `from_text` rather than `from_str` because it also returns the
+    /// sources it read, which `std::str::FromStr`'s signature cannot carry.
+    pub fn from_text(content: &str) -> Result<(Self, Vec<ConfigSource>), String> {
         let source = ConfigSource::None(content.to_string());
         Self::parse(source)
     }
@@ -173,7 +176,7 @@ impl Config {
                         let (included_config, mut included_sources) =
                             Self::parse_with_includes(&included_content, &include_source, visited)?;
                         sources.push(include_source.clone());
-                        sources.extend(included_sources.drain(..));
+                        sources.append(&mut included_sources);
 
                         for section in included_config.sections_vec() {
                             config.add_section(section.clone());
@@ -250,7 +253,7 @@ impl Config {
                 let (included_config, mut included_sources) =
                     Self::parse_with_includes(&included_content, &include_source, visited)?;
                 sources.push(include_source.clone());
-                sources.extend(included_sources.drain(..));
+                sources.append(&mut included_sources);
                 for section in included_config.sections_vec() {
                     config.add_section(section.clone());
                 }

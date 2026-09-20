@@ -48,22 +48,22 @@ impl ArgValue {
     /// - `Str` ↔ `Bytes`, which share the same wire encoding (Bytes → Str also
     ///   requires valid UTF-8).
     ///
-    /// Everything else (numbers ↔ strings/buffers) is rejected with `Err(())`.
-    pub fn try_convert_to(&self, target: ArgType) -> Result<ArgValue, ()> {
+    /// Everything else (numbers ↔ strings/buffers) is rejected with `None`.
+    pub fn try_convert_to(&self, target: ArgType) -> Option<ArgValue> {
         // Same type — no conversion needed
         if self.arg_type() == target {
-            return Ok(self.clone());
+            return Some(self.clone());
         }
 
         // `%s` and `%.*s`/`%*s` share the same length-prefixed wire encoding.
         match (self, target) {
             (ArgValue::Str(s), ArgType::Bytes) => {
-                return Ok(ArgValue::Bytes(s.as_bytes().to_vec()));
+                return Some(ArgValue::Bytes(s.as_bytes().to_vec()));
             }
             (ArgValue::Bytes(b), ArgType::Str) => {
                 return std::str::from_utf8(b)
-                    .map(|s| ArgValue::Str(s.to_string()))
-                    .map_err(|_| ());
+                    .ok()
+                    .map(|s| ArgValue::Str(s.to_string()));
             }
             _ => {}
         }
@@ -75,19 +75,23 @@ impl ArgValue {
             ArgValue::Int16(v) => i64::from(*v),
             ArgValue::UInt32(v) => i64::from(*v),
             ArgValue::Int32(v) => i64::from(*v),
-            _ => return Err(()),
+            _ => return None,
         };
         match target {
-            ArgType::UInt8 if (0..=u8::MAX as i64).contains(&n) => Ok(ArgValue::UInt8(n as u8)),
-            ArgType::UInt16 if (0..=u16::MAX as i64).contains(&n) => Ok(ArgValue::UInt16(n as u16)),
+            ArgType::UInt8 if (0..=u8::MAX as i64).contains(&n) => Some(ArgValue::UInt8(n as u8)),
+            ArgType::UInt16 if (0..=u16::MAX as i64).contains(&n) => {
+                Some(ArgValue::UInt16(n as u16))
+            }
             ArgType::Int16 if (i16::MIN as i64..=i16::MAX as i64).contains(&n) => {
-                Ok(ArgValue::Int16(n as i16))
+                Some(ArgValue::Int16(n as i16))
             }
-            ArgType::UInt32 if (0..=u32::MAX as i64).contains(&n) => Ok(ArgValue::UInt32(n as u32)),
+            ArgType::UInt32 if (0..=u32::MAX as i64).contains(&n) => {
+                Some(ArgValue::UInt32(n as u32))
+            }
             ArgType::Int32 if (i32::MIN as i64..=i32::MAX as i64).contains(&n) => {
-                Ok(ArgValue::Int32(n as i32))
+                Some(ArgValue::Int32(n as i32))
             }
-            _ => Err(()),
+            _ => None,
         }
     }
 }
@@ -97,17 +101,17 @@ impl ArgValue {
 impl ArgType {
     /// Parse a format string specifier into an [`ArgType`].
     ///
-    /// Returns `Err(())` if the specifier is not recognized.
-    pub fn parse_format(specifier: &str) -> Result<Self, ()> {
+    /// Returns `None` if the specifier is not recognized.
+    pub fn parse_format(specifier: &str) -> Option<Self> {
         match specifier {
-            "%u" => Ok(ArgType::UInt32),
-            "%i" => Ok(ArgType::Int32),
-            "%hu" => Ok(ArgType::UInt16),
-            "%hi" => Ok(ArgType::Int16),
-            "%c" => Ok(ArgType::UInt8),
-            "%.*s" => Ok(ArgType::Bytes),
-            "%s" | "%*s" => Ok(ArgType::Str),
-            _ => Err(()),
+            "%u" => Some(ArgType::UInt32),
+            "%i" => Some(ArgType::Int32),
+            "%hu" => Some(ArgType::UInt16),
+            "%hi" => Some(ArgType::Int16),
+            "%c" => Some(ArgType::UInt8),
+            "%.*s" => Some(ArgType::Bytes),
+            "%s" | "%*s" => Some(ArgType::Str),
+            _ => None,
         }
     }
 
@@ -791,17 +795,21 @@ mod tests {
 
         // Sign-losing or truncating conversions are rejected instead of
         // wrapping.
-        assert!(ArgValue::Int16(-1).try_convert_to(ArgType::UInt16).is_err());
+        assert!(ArgValue::Int16(-1)
+            .try_convert_to(ArgType::UInt16)
+            .is_none());
         assert!(ArgValue::UInt16(40000)
             .try_convert_to(ArgType::Int16)
-            .is_err());
-        assert!(ArgValue::Int32(-1).try_convert_to(ArgType::UInt32).is_err());
+            .is_none());
+        assert!(ArgValue::Int32(-1)
+            .try_convert_to(ArgType::UInt32)
+            .is_none());
         assert!(ArgValue::UInt32(i32::MAX as u32 + 1)
             .try_convert_to(ArgType::Int32)
-            .is_err());
+            .is_none());
         assert!(ArgValue::Int32(0x1_0000)
             .try_convert_to(ArgType::UInt16)
-            .is_err());
+            .is_none());
 
         // `%s` and `%.*s` share a wire format and may be converted, but
         // numbers never convert to or from strings/buffers.
@@ -819,11 +827,11 @@ mod tests {
         );
         assert!(ArgValue::Bytes(vec![0xFF, 0xFE])
             .try_convert_to(ArgType::Str)
-            .is_err());
+            .is_none());
         assert!(ArgValue::Str("x".to_string())
             .try_convert_to(ArgType::UInt32)
-            .is_err());
-        assert!(ArgValue::UInt32(1).try_convert_to(ArgType::Str).is_err());
+            .is_none());
+        assert!(ArgValue::UInt32(1).try_convert_to(ArgType::Str).is_none());
     }
 
     #[test]

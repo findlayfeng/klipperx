@@ -31,6 +31,7 @@
 
 | # | 事项 | 依赖 |
 |---|---|---|
+| G1b | gcode 调度器与上游的行为差异（ack / cmd_default / ECHO / mux 缺省…） | Q2、C1 |
 | G4 | 运动命令（G0/G1/G28…） | G1、C1 |
 | A1b | reactor 串行调度器与延迟度量 | A1 |
 | A2 | 错误词汇（`CommandError` / `ConfigError`） | — |
@@ -108,6 +109,75 @@
 - [ ] **reset 期间没有本地 shutdown 标志**：现在靠「`configure` 完成后才 `bind_shutdown`」的
       时序规避；隐式、无测试，recv 一旦改成缓冲/异步就会把自发的 `emergency_stop` 误报成
       `MCU … restarted`。上游有 `_is_shutdown`（`klippy/mcu.py:893-895`）。
+
+### G1b gcode 调度器与上游的行为差异
+
+**为什么单列一条**：G1 的骨架（命令表 / `run_script` / 输出处理器 / 内置命令 / mux）已按
+`klippy/gcode.py` 落地，逐行对照后还剩一批**行为差异**。一部分只能随前置模块（GCodeIO /
+toolhead / 开放事件）一起补，一部分是现在就独立可补的小行为。命令表本身够通用，G4 运动
+命令不必等这条。上游行号以 `third_party/klipper/klippy/gcode.py` 为准。
+
+**随前置一起补（GCodeIO / toolhead / 事件）**
+
+- [ ] **`GCodeIO` 未移植**：伪 tty / 文件输入整块缺失——fd 读取与 `partial_input`、
+      `pending_commands` 批量与 20 条阈值、`M112` 乱序检测、`input_log`、debuginput EOF
+      退出、`stats gcodein=`（`:390-494`）。现在输入由 API 层的 `gcode/script` 承担；要么
+      明确不补（纯 API 主机），要么把串口/文件输入做成一个独立对象。
+- [ ] **`ack()` / `need_ack`**：`GcodeCommand` 没有 `ack`（`:54-63`），这是文件输入协议的
+      一部分。受影响的具体行为：`M115` 应该先 `ack(msg)`、失败才 `respond_info`（`:344-350`）。
+- [ ] **事件**：错误分支不发 `gcode:command_error`（`:226`），重启不发
+      `gcode:request_restart`（`:358`），debug 输入不发 `gcode:debuginput_exit`（`:433`）。
+      依赖 Q2 的开放事件总线。
+- [ ] **`request_restart` 的停机前动作**：上游在 ready 时先 `toolhead.dwell(0.500)` +
+      `wait_moves()` 再 `request_exit`（`:352-365`），随 **C1**；当前直接 `request_exit`
+      （`gcode.rs:515-545`）。
+- [ ] **`Coord`**（`:12-17`）：随 toolhead / kinematics（C1）。
+- [ ] **handler 内部异常 → `invoke_shutdown`**：上游用裸 `except:` 兜底，报
+      `Internal error on command:"X"` 并停机（`:230-232`）；Rust 无 panic 捕获。随 Q2 /
+      错误词汇（A2）一起定。
+
+**可独立补的小行为差异**
+
+- [ ] **`default_handler` 缩水**（`:283-316`）：缺 `M105` → `ack("T:0")`、`M21`、
+      `M140/M104` 且 `S=0`、`M107` / `M106`（S 关或 fileinput）这些「没有该模块时安静忽略」
+      的抑制；也缺「命令名里带空格」时按 `realcmd = cmd.split()[0]` 路由到 `M117/M118/M23`
+      的分支。后者是实际差异：`M117 123` 这类数字消息在 Rust 里会整串当命令名而报
+      `Unknown command`（`parse_line` 只做 trim，`gcode.rs:862-917`）。
+- [ ] **`ECHO` 前缀**：上游 `respond_info(commandline, log=False)` → 输出 `// <line>`
+      （`:368-369`）；Rust 用 `respond_raw`，没有 `// ` 前缀、不记日志（`gcode.rs` 的 `ECHO`）。
+- [ ] **`HELP` 未就绪提示**：上游未就绪时首行加
+      `Printer is not ready - not all commands available.`，并遍历当前 active 表（`:379-388`）；
+      Rust 无该提示，遍历 help 表（`gcode.rs:663-678`）。
+- [ ] **`M115` 版本号来源**：上游取 `start_args['software_version']`（`:344-350`），Rust 用
+      `CARGO_PKG_VERSION`。
+- [ ] **`get_status` 的构建口径**：上游返回缓存的 `status_commands`、按 **active 表**构建
+      （未就绪只列 base 的 8 条内置，`:176-184`）；Rust 每次从 `commands.ready` 全量重建
+      （`gcode.rs:578-592`）。未就绪阶段 `objects/query` 看到的命令集合不同。
+- [ ] **未就绪时停机不打印**：上游 `_handle_shutdown` 在 `not is_printer_ready` 时直接
+      return（`:186-193`）；Rust 无条件发 `Klipper state: Shutdown`（`gcode.rs:335-343`）。
+- [ ] **`is_traditional_gcode` 判定**：上游用 `float(cmd[1:])`（`:125-131`），Rust 只看首字母
+      大写 + 次字符数字（`gcode.rs:794`）。`M1ABC` 这类上游拒绝注册、Rust 接受。
+- [ ] **`parse_extended` 的 shlex 保真**：Rust 手写解析只做引号切换 + `#`/`;` 截断，不处理
+      反斜杠转义 / 引号拼接等 `shlex` 语义（`gcode.rs:937-983` 对 `:266-281`）。
+- [ ] **校验和 `*123`**：上游 `get_raw_command_parameters` 会剥掉尾部校验和（`:40-51`），
+      Rust 的 `raw_parameters` 不剥（`gcode.rs:919-935`）。只在文件 / 串口输入路径上有影响，
+      连同 `GCodeIO` 一起看。
+- [ ] **`register_command(cmd, None)` 注销**：上游支持注销并返回旧 handler（`:133-141`），
+      Rust 无注销、重复注册直接报错（`gcode.rs:325-350`）。
+- [ ] **参数访问器缺口**：缺 `above`/`below`、`get_int` 的 `minval/maxval`、通用
+      `get(parser=…)`；缺 `get_command_parameters` / `get_raw_command_parameters`（raw 只在
+      内部 `Parsed`）；也没有 `create_gcode_command`（字段私有，外部无法构造 gcmd，宏类模块
+      会需要）（`:23-91` `:244`）。
+- [ ] **mux 缺省项（`value=None`）不可达**（**优先，含测试**）：`dispatch_mux` 用
+      `contains_key(&None)` 认出缺省项，但键缺席时把请求值取成 `""` 再用 `Some("")` 查表，
+      永远命中不了 `None`，于是走到「值不合法」错误分支（`gcode.rs:680-733` 对 `:317-342`）。
+      实测：注册 `SET_PIN` 的 `PIN=None` 后执行 `SET_PIN VALUE=1`，报
+      `The value '' is not valid for PIN. Options: `。当前库里只用 `Some(name)` 注册，未覆盖。
+- [ ] **mux 错误提示的 `Did you mean`**：上游按 dict 迭代序取「最后一个匹配」（`:317-342`），
+      Rust 对 values 排序后取第一个匹配（`gcode.rs:718-733`）——措辞更稳定，属有意偏离；
+      要么对齐上游，要么在文档里记一句。
+- [ ] **清理 `src/core/parser.rs`**：`parse_gcode` / `parse_gcode_line` 是未被引用的存根
+      （`#[allow(dead_code)]`），真正的解析在 `gcode.rs`；删除或并入 `gcode.rs` 的测试。
 
 ### G4 运动命令（G0/G1/G28/G92/M114…）
 
@@ -527,7 +597,8 @@ open + identify，同样要接上一块没被复位的固件。
       输出并注册 `SET_PIN PIN=… VALUE=…`；无条件 `setup_max_duration(0)`（`extras/output_pin.rs`、
       `load.rs`）。`pwm` 暂拒，`SET_PIN` 先立即生效。
 - **GCODE 调度器（G1）**：`GCodeDispatch` 的命令表 / `register_mux_command` / `run_script` /
-      输出处理器 / 内置命令，`load_config` 里最先注册（`gcode.rs`）。
+      输出处理器 / 内置命令，`load_config` 里最先注册（`gcode.rs`）。与上游的剩余行为差异见
+      **G1b**。
 - **GPIO 数字输出（F3 的 MCU 部分）**：`PinChip` / `DigitalOut`、`config_digital_out` +
       restart 的 `update_digital_out` + 运行期 `queue_digital_out`（`cmd/gpio.rs`、`mcu/pin.rs`）。
 - **pin 解析与 `pins`（F2）**：`PrinterPins` / `PinResolver` 的别名与保留，`RESERVE_PINS_*`
@@ -569,7 +640,8 @@ open + identify，同样要接上一块没被复位的固件。
 | `objects/list`、`query`、`subscribe` | `klippy/webhooks.py:480-560` |
 | `emergency_stop` / `register_remote_method` / mux | `klippy/webhooks.py:319-340` |
 | `gcode/*` 端点 | `klippy/webhooks.py:438-452` |
-| gcode 调度器（命令表 / `run_script` / 输出） | `klippy/gcode.py` |
+| gcode 调度器（命令表 / `run_script` / 输出） | `klippy/gcode.py:105-388` |
+| `GCodeIO`（伪 tty / 文件输入、`ack` 协议） | `klippy/gcode.py:390-494` |
 | `output_pin`（`SET_PIN` / `GCodeRequestQueue`） | `klippy/extras/output_pin.py` |
 | section 校验用注册表 | `klippy/configfile.py:425-445` |
 | mcu 作为 printer object、它的 status | `klippy/mcu.py:1147-1170`、`:1235`、`:938-975` |

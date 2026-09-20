@@ -10,7 +10,7 @@
 //!   }
 //! < {"id": null, "method": "klippy:status", "params": {...}}
 //! klippy> objects/query {"objects": {"toolhead": ["position"]}}
-//! Enter send · ↑↓ history · PgUp/PgDn scroll · .help · ^C quit
+//! Enter send · ↑↓ history · PgUp/PgDn scroll · Home/End · ^G g-code · .help · ^C quit
 //! ```
 //!
 //! The header tracks the printer's state, the log holds everything that
@@ -23,6 +23,18 @@
 //! mode session too, but only a window can show it without fighting the prompt
 //! for the same line.
 //!
+//! ## Scrolling
+//!
+//! The log supports scrolling to review past output:
+//!
+//! - **Mouse wheel**: scroll up/down by 10 lines
+//! - **PgUp/PgDn**: scroll by 10 lines
+//! - **Ctrl+↑/Ctrl+↓**: scroll by 1 line
+//! - **Home**: jump to top (oldest visible entries)
+//! - **End**: jump to bottom (newest entries)
+//! - When scrolled back, new entries do not auto-scroll the view — your place
+//!   is kept until you return to the bottom.
+//!
 //! # Threads and tasks
 //!
 //! One task (the one running [`run`]) draws and owns all the state, one blocking
@@ -34,8 +46,8 @@
 //!
 //! # Not covered
 //!
-//! * No mouse, no text selection, no copy/paste handling beyond what the
-//!   terminal does with the alternate screen.
+//! * No text selection, no copy/paste handling beyond what the terminal does
+//!   with the alternate screen.
 //! * No reconnection: the window closes when the server goes away, after
 //!   printing why. Reconnecting would mean re-establishing every subscription.
 //! * The log keeps everything for the life of the session; a very chatty
@@ -46,7 +58,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
@@ -101,6 +115,9 @@ pub async fn run_session(
     // being dropped, must still give the terminal back.
     let _terminal = TerminalGuard::take();
     let terminal = ratatui::init();
+    // Enable mouse capture for wheel scrolling
+    let _mouse = ratatui::crossterm::event::EnableMouseCapture;
+    ratatui::crossterm::execute!(std::io::stdout(), _mouse).ok();
     let outcome = event_loop(session, terminal, host_log).await;
     outcome
 }
@@ -387,6 +404,9 @@ async fn event_loop(
                     Control::Quit => break Ok(()),
                 }
             }
+            Step::Key(Some(Event::Mouse(mouse))) => {
+                handle_mouse(&mut app, mouse);
+            }
             Step::Key(Some(_)) => (),
             // A closed channel means the host stopped logging; the window keeps
             // working, it just has nothing more to say about itself.
@@ -464,11 +484,31 @@ async fn handle_key(
         // own output would otherwise push everything else away.
         (KeyCode::PageUp, _) => app.scroll = app.scroll.saturating_add(10),
         (KeyCode::PageDown, _) => app.scroll = app.scroll.saturating_sub(10),
+        (KeyCode::Home, _) => app.scroll = 0,
+        (KeyCode::End, _) => {
+            let max_scroll = app.entries.len().saturating_sub(1);
+            app.scroll = max_scroll;
+        }
         (KeyCode::Up, true) => app.scroll = app.scroll.saturating_add(1),
         (KeyCode::Down, true) => app.scroll = app.scroll.saturating_sub(1),
         (code, _) => app.input.edit(code, ctrl),
     }
     Ok(Control::Continue)
+}
+
+/// Handle mouse events (wheel scrolling).
+fn handle_mouse(_app: &mut App, mouse: MouseEvent) {
+    match mouse.kind {
+        MouseEventKind::ScrollUp => {
+            // Scroll up = view older content = increase scroll
+            _app.scroll = _app.scroll.saturating_add(10);
+        }
+        MouseEventKind::ScrollDown => {
+            // Scroll down = view newer content = decrease scroll
+            _app.scroll = _app.scroll.saturating_sub(10);
+        }
+        _ => (),
+    }
 }
 
 /// The panes.
@@ -587,13 +627,14 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         "leaving…".to_string()
     } else if app.scroll > 0 {
         format!(
-            "scrolled back {} lines · PgDn to return · ^C quit",
+            "scrolled back {} lines · Home top · End bottom · PgDn return · ^C quit",
             app.scroll
         )
     } else if app.gcode {
         "g-code mode · Enter send · ^G request mode · .gcode · ^C quit".to_string()
     } else {
-        "Enter send · ↑↓ history · PgUp/PgDn · ^G g-code · .help · ^C quit".to_string()
+        "Enter send · ↑↓ history · PgUp/PgDn scroll · Home/End · ^G g-code · .help · ^C quit"
+            .to_string()
     };
     frame.render_widget(
         Paragraph::new(Line::from(hint)).style(Style::new().add_modifier(Modifier::DIM)),

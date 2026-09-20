@@ -1,6 +1,7 @@
 use super::section::ConfigSection;
 use crate::core::klippy::interface::Interface;
 use crate::core::klippy::mcu::McuRestartMethod;
+use tracing::{info, warn};
 
 /// MCU (Microcontroller Unit) configuration parsed from config file.
 #[derive(Debug)]
@@ -88,8 +89,18 @@ impl McuConfig {
         // `[mcu zboard]` is "zboard". Not an empty string for the main one.
         let name = section.sub.clone().unwrap_or_else(|| section.id.clone());
         let interface = Self::create_interface(section)?;
-        let restart_method =
-            Self::parse_restart_method(section, matches!(interface, Interface::Serial(_)))?;
+        let serial = matches!(interface, Interface::Serial(_));
+
+        // The option only means something on a serial port. Say so rather than
+        // dropping it silently, then report what the MCU will actually use.
+        if !serial && section.has("restart_method") {
+            warn!(
+                "MCU '{name}' sets restart_method, which only applies to a serial MCU; \
+                 resetting with command"
+            );
+        }
+        let restart_method = Self::parse_restart_method(section, serial)?;
+        info!("MCU '{name}' restart method: {}", restart_method.as_str());
 
         Ok(Self {
             name,
@@ -355,6 +366,16 @@ mod tests {
         assert!(err.contains("bogus"), "{err}");
         // The error names the valid choices, so the config can be fixed.
         assert!(err.contains("cheetah"), "{err}");
+    }
+
+    #[test]
+    fn test_restart_method_spellings_round_trip() {
+        // Every advertised choice parses back to a method that spells itself the
+        // same way the config option did.
+        for spelling in McuRestartMethod::CHOICES {
+            let method = McuRestartMethod::parse(spelling).unwrap();
+            assert_eq!(method.as_str(), *spelling);
+        }
     }
 
     #[test]

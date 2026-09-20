@@ -373,7 +373,7 @@ impl Device for HostDevice {
             // Bytes that have already arrived may hold another frame; a release
             // build gets whole frames, so there is never anything left over.
             #[cfg(test)]
-            if let Some(frame) = self.stream.lock().unwrap().next() {
+            if let Some(frame) = self.stream.lock().unwrap().next_frame() {
                 return Some(frame);
             }
             match self.output.recv() {

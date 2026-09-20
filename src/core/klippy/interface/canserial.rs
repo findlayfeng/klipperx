@@ -224,8 +224,8 @@ impl CanSerialLink {
     }
 
     /// The next complete message frame, once its bytes have arrived.
-    pub fn next(&mut self) -> Option<Frame> {
-        self.incoming.next()
+    pub fn next_frame(&mut self) -> Option<Frame> {
+        self.incoming.next_frame()
     }
 }
 
@@ -363,7 +363,7 @@ impl Device for CanSerialDevice {
             }
             // The slices came together: the block is logged the way the serial
             // port logs one — however many CAN frames it took, even one.
-            if let Some(frame) = self.link.lock().unwrap().next() {
+            if let Some(frame) = self.link.lock().unwrap().next_frame() {
                 trace!(
                     "rx frame [{}]: {}",
                     self.id(),
@@ -603,7 +603,7 @@ mod tests {
 
     #[test]
     fn test_incoming_frames_rebuild_the_block_stream() {
-        let mut sender = CanSerialLink::for_node(5);
+        let sender = CanSerialLink::for_node(5);
         let mut receiver = CanSerialLink::for_node(5);
 
         // The MCU answers on the next id, so a frame written to `tx_id` and read
@@ -619,14 +619,14 @@ mod tests {
         // Nothing is complete until the last frame has arrived.
         for (i, frame) in frames.iter().enumerate() {
             assert!(receiver.accept(frame));
-            let decoded = receiver.next();
+            let decoded = receiver.next_frame();
             if i < frames.len() - 1 {
                 assert!(decoded.is_none(), "frame {i} should not complete a block");
             } else {
                 assert_eq!(decoded, Some(message(1, &[0xaa; 30])));
             }
         }
-        assert_eq!(receiver.next(), None);
+        assert_eq!(receiver.next_frame(), None);
     }
 
     #[test]
@@ -635,12 +635,12 @@ mod tests {
         let foreign = CanFrame::new(0x123, &[1, 2, 3]).unwrap();
 
         assert!(!link.accept(&foreign));
-        assert_eq!(link.next(), None);
+        assert_eq!(link.next_frame(), None);
 
         // ... and a frame of ours behind it is still accepted.
         let ours = CanFrame::new(link.rx_id(), &message(2, &[9]).raw_bytes()).unwrap();
         assert!(link.accept(&ours));
-        assert_eq!(link.next(), Some(message(2, &[9])));
+        assert_eq!(link.next_frame(), Some(message(2, &[9])));
     }
 
     #[test]

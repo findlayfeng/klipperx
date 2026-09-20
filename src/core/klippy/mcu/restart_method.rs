@@ -21,8 +21,8 @@ pub enum McuRestartMethod {
 }
 
 impl McuRestartMethod {
-    /// Parse restart method from string
-    pub fn from_str(s: &str) -> Option<Self> {
+    /// Parse a `restart_method` value from the config file.
+    pub fn parse(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "arduino" => Some(Self::Arduino),
             "cheetah" => Some(Self::Cheetah),

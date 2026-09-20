@@ -175,7 +175,7 @@ impl<'a> Params<'a> {
             return Err(self.undeclared(name));
         }
         let value = self.value(name).expect("declared parameter has a value");
-        value.try_convert_to(target).map_err(|_| {
+        value.try_convert_to(target).ok_or_else(|| {
             McuError::Decode(format!(
                 "'{}' parameter '{}' is {} but {} was expected",
                 self.msg.name,
@@ -463,10 +463,6 @@ mod tests {
         }))
         .unwrap()
     }
-
-    /// `get_clock` / `clock clock=%u` — the smallest request/response pair,
-    /// taken from `clock.rs` so the typed calls are exercised against the real
-    /// command definitions rather than a local copy.
 
     /// `get_uptime` / `uptime high=%u clock=%u` — two parameters, so the
     /// round-trip exercises more than a single name lookup.

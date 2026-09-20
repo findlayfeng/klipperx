@@ -93,9 +93,9 @@ pub struct Frame {
     payload: Vec<u8>,
 }
 
-impl Into<Payload> for Frame {
-    fn into(self) -> Payload {
-        Payload::from_raw(self.payload)
+impl From<Frame> for Payload {
+    fn from(frame: Frame) -> Self {
+        Payload::from_raw(frame.payload)
     }
 }
 
@@ -119,7 +119,7 @@ impl Frame {
         let msglen = raw[MESSAGE_POS_LEN] as usize;
 
         // Length must be within valid range
-        if msglen < MESSAGE_MIN || msglen > MESSAGE_MAX {
+        if !(MESSAGE_MIN..=MESSAGE_MAX).contains(&msglen) {
             return Err("invalid frame length");
         }
 
@@ -233,8 +233,8 @@ impl Frame {
 /// # use klipperx::core::klippy::frame::{Frame, FrameStream};
 /// let mut stream = FrameStream::new();
 /// stream.push(&Frame::encode(1, b"hello"));
-/// assert_eq!(stream.next(), Some(Frame::new(1, b"hello".to_vec())));
-/// assert_eq!(stream.next(), None); // nothing buffered, nothing claimed
+/// assert_eq!(stream.next_frame(), Some(Frame::new(1, b"hello".to_vec())));
+/// assert_eq!(stream.next_frame(), None); // nothing buffered, nothing claimed
 /// ```
 #[derive(Debug, Default)]
 pub struct FrameStream {
@@ -260,7 +260,7 @@ impl FrameStream {
     /// Returns `None` both when more bytes are needed and when the buffer is
     /// unusable, so callers keep feeding the stream until a frame appears or the
     /// input ends.
-    pub fn next(&mut self) -> Option<Frame> {
+    pub fn next_frame(&mut self) -> Option<Frame> {
         loop {
             if self.needs_sync {
                 self.skip_to_sync();
@@ -409,7 +409,7 @@ mod tests {
         let mut frames = Vec::new();
         for chunk in chunks {
             stream.push(chunk);
-            while let Some(frame) = stream.next() {
+            while let Some(frame) = stream.next_frame() {
                 frames.push(frame);
             }
         }
@@ -486,23 +486,27 @@ mod tests {
 
         // Too short to judge: nothing is framed and nothing is discarded.
         stream.push(&[0x01, 0x02, 0x03]);
-        assert_eq!(stream.next(), None);
+        assert_eq!(stream.next_frame(), None);
         assert!(!stream.needs_sync);
 
         // A read long enough to hold a frame but with an impossible length byte,
         // and no SYNC to resynchronise on, is dropped whole: the stream stays
         // desynchronised instead of trying to frame the junk.
         stream.push(&[0xff, 0x00, 0x01, 0x02, 0x03]);
-        assert_eq!(stream.next(), None);
+        assert_eq!(stream.next_frame(), None);
         assert!(stream.needs_sync);
 
         // The next SYNC ends the resynchronisation: bytes before it are dropped,
         // and a frame read after it is framed normally.
         stream.push(&good);
-        assert_eq!(stream.next(), None, "expected to skip the first frame");
+        assert_eq!(
+            stream.next_frame(),
+            None,
+            "expected to skip the first frame"
+        );
 
         stream.push(&good);
-        assert_eq!(stream.next(), Some(Frame::new(7, b"later".to_vec())));
+        assert_eq!(stream.next_frame(), Some(Frame::new(7, b"later".to_vec())));
         assert!(!stream.needs_sync);
     }
 }

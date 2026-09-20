@@ -25,6 +25,16 @@ impl McuRestartMethod {
     /// `getchoice` list without its `None` (`klippy/mcu.py:666`).
     pub const CHOICES: &'static [&'static str] = &["arduino", "cheetah", "command", "rpi_usb"];
 
+    /// The config-file spelling of this method, for logs and errors.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Arduino => "arduino",
+            Self::Cheetah => "cheetah",
+            Self::RpiUsb => "rpi_usb",
+            Self::Command => "command",
+        }
+    }
+
     /// Parse a `restart_method` value from the config file.
     pub fn parse(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {

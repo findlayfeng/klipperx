@@ -30,8 +30,9 @@
 //! - **Mouse wheel**: scroll up/down by 3 lines
 //! - **Click/drag the scrollbar**: go to that part of the log
 //! - **^S** (or `.mouse`, or a click on the log's text): hand the mouse back to
-//!   the terminal so text can be selected and copied there, and take it again
-//!   afterwards
+//!   the terminal so text can be selected and copied there; any key takes it
+//!   back. The view freezes while it is released, since a terminal's selection
+//!   is anchored to the screen and a line arriving would slide it off.
 //! - **PgUp/PgDn**: scroll by a page
 //! - **Home**: jump to the top (oldest lines)
 //! - **End**: jump to the bottom (newest line)
@@ -63,8 +64,8 @@
 //!
 //! * Selection and copying are the terminal's, not the window's — but a
 //!   terminal only selects with a mouse it owns, and the window needs the mouse
-//!   for its wheel and its scrollbar. `^S` / `.mouse` gives it back when that
-//!   matters, and takes it again afterwards.
+//!   for its wheel and its scrollbar. `^S` / `.mouse` / a click on the log gives
+//!   it back, and the next key takes it again.
 //! * No reconnection: the window closes when the server goes away, after
 //!   printing why. Reconnecting would mean re-establishing every subscription.
 //! * The log keeps everything for the life of the session; a very chatty
@@ -144,6 +145,11 @@ pub async fn run_session(
 /// restores it when the future is simply dropped — which is what happens when
 /// the host shuts down while the window is up. A guard does, because dropping
 /// the future drops its locals.
+///
+/// Mouse reporting is not part of what `ratatui::restore` puts back — it is a
+/// mode of its own — so it is given back here first. A window that ended while
+/// holding the mouse would otherwise leave the terminal sending mouse escapes to
+/// whatever ran next.
 struct TerminalGuard;
 
 impl TerminalGuard {
@@ -155,6 +161,7 @@ impl TerminalGuard {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
+        set_mouse_capture(false);
         ratatui::restore();
     }
 }
@@ -258,21 +265,38 @@ impl App {
         }
     }
 
-    /// Take the mouse for the window, or hand it back to the terminal.
+    /// Hand the mouse to the terminal, so it can select text.
     ///
-    /// A captured mouse is the window's: the wheel scrolls the log and the
-    /// scrollbar is a target. But a captured mouse also means the terminal never
-    /// sees a drag, so its own selection cannot start — the two gestures cannot
-    /// both be had. Releasing it trades the wheel and the scrollbar for the
-    /// terminal's selection; `^S` or `.mouse` takes it back.
-    fn toggle_mouse(&mut self) {
-        self.mouse = !self.mouse;
-        let text = if self.mouse {
-            "mouse captured: the wheel and the scrollbar are the window's (^S or .mouse to release)"
-        } else {
-            "mouse released: drag to select text, copy it with the terminal (^S or .mouse to capture)"
-        };
-        self.push(Entry::notice(Notice::Info, text));
+    /// The window holds the mouse — the wheel and the scrollbar need it — so
+    /// letting go is the move that has to be asked for, and this is how: `^S`,
+    /// `.mouse`, or a click on the log's text. Holding it again is not asked
+    /// for at all: a key does that (see [`App::mouse_for_key`]), which is just
+    /// as well — a terminal with the mouse no longer sends the window a click
+    /// to go on.
+    ///
+    /// Nothing is written to the log, deliberately: releasing freezes the view
+    /// (`push`), so a line about it would land under the frozen pane where the
+    /// reader cannot see it. The footer says it instead.
+    fn release_mouse(&mut self) {
+        self.mouse = false;
+    }
+
+    /// Take the mouse back for the window, so the wheel and the scrollbar work.
+    fn capture_mouse(&mut self) {
+        self.mouse = true;
+    }
+
+    /// Settle the mouse for a keypress, before the key itself is interpreted.
+    ///
+    /// Any key takes the mouse back: a reader at the keyboard is not selecting,
+    /// so the window's gestures are what they want. `^S` is the one key that
+    /// then hands it straight out again, being the keyboard's own way of asking
+    /// for the terminal's selection.
+    fn mouse_for_key(&mut self, code: KeyCode, ctrl: bool) {
+        self.capture_mouse();
+        if ctrl && code == KeyCode::Char('s') {
+            self.release_mouse();
+        }
     }
 
     /// Flip between request mode and g-code mode.
@@ -307,9 +331,19 @@ impl App {
         // to the bottom: the new entry lands below it, so the offset grows by
         // the lines that entry takes. At the bottom (`scroll == 0`) the view
         // follows the new entry, which is what a log should do.
+        //
+        // A released mouse is the same case with a different reason. The
+        // reader is selecting text with the terminal, whose selection is
+        // anchored to the screen rather than to the text: a line arriving would
+        // slide the selection off what it was drawn around. So the view freezes
+        // — the offset grows, and the same lines stay where they are.
         let width = self.width.get().max(1);
         let height = entry_height(&entry, width, self.format);
-        let added = if self.scroll > 0 { height } else { 0 };
+        let added = if self.scroll > 0 || !self.mouse {
+            height
+        } else {
+            0
+        };
 
         // The heights parallel the entries. A pane resize or a body-format
         // switch re-wraps the whole log; anything that shortened the entries
@@ -479,7 +513,7 @@ impl App {
                 true
             }
             ".mouse" => {
-                self.toggle_mouse();
+                self.release_mouse();
                 true
             }
             ".yaml" | ".json" => {
@@ -682,6 +716,8 @@ async fn handle_key(
     key: KeyEvent,
 ) -> Result<Control, TransportError> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    // The mouse settles first, and this key still does its own job after.
+    app.mouse_for_key(key.code, ctrl);
     match (key.code, ctrl) {
         // Leaving: ^C, ^D and Esc all mean "I am done", and all of them are
         // what a terminal user will try.
@@ -692,8 +728,6 @@ async fn handle_key(
             app.entries.clear();
             app.scroll = 0;
         }
-        // Handing the mouse back so the terminal can select text.
-        (KeyCode::Char('s'), true) => app.toggle_mouse(),
         // Switching what a typed line means: a request, or G-Code.
         (KeyCode::Char('g'), true) => {
             app.toggle_gcode();
@@ -757,7 +791,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
             // terminal only selects with a drag it saw from the beginning.)
             None if app.in_log_body(mouse.column, mouse.row) => {
                 app.dragging = false;
-                app.toggle_mouse();
+                app.release_mouse();
             }
             None => app.dragging = false,
         },
@@ -936,7 +970,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     } else if !app.mouse {
         // A released mouse is a mode the reader has to remember: the gestures
         // they just used no longer do anything, and the terminal's do.
-        "mouse released · drag to select · ^S capture · ^C quit".to_string()
+        "mouse released · drag to select · any key takes it back · ^C quit".to_string()
     } else if back > 0 {
         let lines = if back == 1 { "line" } else { "lines" };
         format!(
@@ -1651,25 +1685,72 @@ mod tests {
         assert!(app.mouse, "the window holds the mouse to begin with");
 
         // A captured mouse is the window's, so the terminal never sees a drag
-        // and cannot select. `.mouse` (and `^S`) hands it back, and says so in
-        // the log.
+        // and cannot select. `.mouse` (and `^S`) hands it over; the footer is
+        // where that is said, since a log line would land under the frozen pane.
         assert!(app.window_command(".mouse"));
         assert!(!app.mouse);
-        let said = app.entries.last().expect("a notice").text();
-        assert!(said.contains("mouse released"), "{said}");
 
-        // The footer keeps saying it too: it is a mode to remember, because the
-        // gestures that worked a moment ago no longer do anything.
         let rows = render(&app, 60, 5);
         assert!(rows.last().unwrap().contains("mouse released"), "{rows:?}");
 
-        // And back again.
+        // Asking again changes nothing: the mouse is already the terminal's.
         assert!(app.window_command(".mouse"));
+        assert!(!app.mouse);
+
+        // A key is what takes it back.
+        app.capture_mouse();
         assert!(app.mouse);
-        let said = app.entries.last().expect("a notice").text();
-        assert!(said.contains("mouse captured"), "{said}");
         let rows = render(&app, 60, 5);
         assert!(!rows.last().unwrap().contains("mouse released"), "{rows:?}");
+    }
+
+    #[test]
+    fn test_a_released_mouse_freezes_the_view() {
+        let entries: Vec<Entry> = (1..=8)
+            .map(|n| Entry::notice(Notice::Info, format!("line {n}")))
+            .collect();
+        let mut app = app_with(entries);
+        // A two-row pane at the bottom: lines 7 and 8.
+        let before = render(&app, 40, 5);
+        assert!(before[1].contains("line 7"), "{before:?}");
+
+        // Selection mode. The terminal's selection is anchored to the screen, so
+        // a line arriving must not move what is on it.
+        app.release_mouse();
+        app.push(Entry::notice(Notice::Info, "line 9"));
+        let after = render(&app, 40, 5);
+        assert_eq!(before[1..3], after[1..3], "the view is frozen");
+        assert_eq!(app.scroll, 1, "frozen means pinned, not following");
+
+        // Taking the mouse back leaves the view where it is; `End` returns to
+        // the newest line.
+        app.capture_mouse();
+        let rows = render(&app, 40, 5);
+        assert_eq!(before[1..3], rows[1..3], "no jump on the way back");
+        app.scroll = 0;
+        let rows = render(&app, 40, 5);
+        assert!(rows[2].contains("line 9"), "{rows:?}");
+    }
+
+    #[test]
+    fn test_any_key_takes_the_mouse_back() {
+        let mut app = app_with(Vec::new());
+        app.release_mouse();
+        assert!(!app.mouse);
+
+        // A reader at the keyboard is not selecting, so the window takes the
+        // mouse back — whatever the key is, and it still does its own job.
+        app.mouse_for_key(KeyCode::PageUp, false);
+        assert!(app.mouse);
+
+        // `^S` is the one key that hands it straight back out.
+        app.release_mouse();
+        app.mouse_for_key(KeyCode::Char('s'), true);
+        assert!(!app.mouse);
+
+        // And any key after that takes it again.
+        app.mouse_for_key(KeyCode::Enter, false);
+        assert!(app.mouse);
     }
 
     #[test]
@@ -2039,12 +2120,10 @@ mod tests {
         handle_mouse(&mut app, down(log.x + 2, log.y));
         assert!(!app.mouse, "the log's text is the terminal's");
         assert!(!app.dragging, "the bar's drag does not survive it");
-        let said = app.entries.last().expect("a notice").text();
-        assert!(said.contains("mouse released"), "{said}");
 
         // And `^S` (the same toggle) takes it back. A click outside the log
         // pane neither scrolls nor hands it over.
-        app.toggle_mouse();
+        app.capture_mouse();
         assert!(app.mouse);
         handle_mouse(&mut app, down(log.x + 2, 0));
         assert!(app.mouse, "the header is not the log");

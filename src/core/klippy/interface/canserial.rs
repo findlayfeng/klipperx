@@ -141,6 +141,17 @@ impl CanFrame {
     }
 }
 
+/// One CAN frame as the bus carries it: its arbitration id, then its eight data
+/// bytes — a *slice* of a message block rather than a block of its own.
+///
+/// The block is described with [`describe_frame`](super::describe_frame) once its
+/// slices are together again; this is the other half of the story, and the two
+/// are logged separately because they are different things. A block small enough
+/// to fit one CAN frame still gets both lines.
+fn describe_can_frame(id: u32, data: &[u8]) -> String {
+    format!("id {id:#x} data {}", super::hex_runs(data))
+}
+
 /// The admin frame that assigns `nodeid` to the MCU with `uuid`: the command byte,
 /// the UUID most significant byte first, then the node id.
 ///
@@ -325,6 +336,12 @@ impl Device for CanSerialDevice {
         trace!("tx frame [{}]: {}", self.id(), describe_frame(&bytes));
         let frames: Vec<CanFrame> = self.link.lock().unwrap().frames(&bytes).collect();
         for can_frame in &frames {
+            // The block's bytes as the bus sees them, one CAN frame at a time.
+            trace!(
+                "tx can frame [{}]: {}",
+                self.id(),
+                describe_can_frame(can_frame.id(), can_frame.data())
+            );
             (&self.socket)
                 .write_all(&can_frame.to_abi())
                 .map_err(|e| InterfaceError::SendError(format!("CAN write failed: {e}")))?;
@@ -344,7 +361,14 @@ impl Device for CanSerialDevice {
             if self.stopped.load(Ordering::Relaxed) {
                 return None;
             }
+            // The slices came together: the block is logged the way the serial
+            // port logs one — however many CAN frames it took, even one.
             if let Some(frame) = self.link.lock().unwrap().next() {
+                trace!(
+                    "rx frame [{}]: {}",
+                    self.id(),
+                    describe_frame(&frame.raw_bytes())
+                );
                 return Some(frame);
             }
 
@@ -359,16 +383,12 @@ impl Device for CanSerialDevice {
                 Ok(read) if read >= CAN_FRAME_SIZE => {
                     let can_frame = CanFrame::from_abi(&raw);
                     if self.link.lock().unwrap().accept(&can_frame) {
-                        // The eight data bytes are a slice of the serial byte
-                        // stream, not a frame of their own: the block's header
-                        // and trailer are the serial format's, and only a whole
-                        // block has parts to split. The same formatter as the
-                        // serial port is therefore the right one — it falls back
-                        // to plain runs when a slice is not a whole frame.
+                        // One CAN frame's worth of the block, as the bus carried
+                        // it; the assembled block is logged above, on its way out.
                         trace!(
-                            "rx frame [{}]: {}",
+                            "rx can frame [{}]: {}",
                             self.id(),
-                            describe_frame(can_frame.data())
+                            describe_can_frame(can_frame.id(), can_frame.data())
                         );
                         debug!("received CAN frame of {} bytes", can_frame.data().len());
                     } else {
@@ -550,6 +570,35 @@ mod tests {
 
         // A block that is an exact multiple of eight does not get an empty tail.
         assert_eq!(link.frames(&bytes[..16]).count(), 2);
+    }
+
+    #[test]
+    fn test_the_bus_and_the_block_are_described_differently() {
+        // A block small enough for one CAN frame: the bus line names the
+        // arbitration id and shows the eight data bytes, while the block line is
+        // the serial frame. Both are logged even though one CAN frame carried it
+        // all, because a slice and a block are not the same thing.
+        let block = message(1, &[0xaa, 0xbb]);
+        let bytes = block.raw_bytes();
+        assert_eq!(bytes.len(), 7);
+
+        let link = CanSerialLink::for_node(5);
+        let slices: Vec<CanFrame> = link.frames(&bytes).collect();
+        assert_eq!(slices.len(), 1, "one CAN frame carries the whole block");
+
+        assert_eq!(
+            describe_can_frame(slices[0].id(), slices[0].data()),
+            format!(
+                "id {:#x} data 0711aabb {:02x}{:02x}7e",
+                link.tx_id(),
+                bytes[4],
+                bytes[5]
+            )
+        );
+        assert_eq!(
+            describe_frame(&bytes),
+            format!("0711 | aabb | {:02x}{:02x}7e", bytes[4], bytes[5])
+        );
     }
 
     #[test]

@@ -67,12 +67,15 @@
 //! # Not here
 //!
 //! * **Pin name rewriting.** Upstream resolves pin aliases and reservations by
-//!   rewriting `pin=…` in the command text before hashing
-//!   (`klippy/pins.py:41`). That belongs to the pin layer (TODO F2); a command
-//!   added here carries its pin as it was given.
-//! * **`get_query_slot`.** It places a periodic query on an absolute print-time
-//!   clock (`klippy/mcu.py:1136`), which needs the clock/motion layer. The
-//!   consumers that need it (ADC, endstop) bring it with them.
+//!   rewriting `pin=…` in the command text before hashing (`klippy/pins.py:41`).
+//!   This host resolves them in the pin layer instead, *before* a resource calls
+//!   [`ConfigBuilder::add_config_cmd`], so a command arriving here already
+//!   carries its numeric pin and the CRC covers numbers rather than names (see
+//!   `docs/klippy/developer-manual/mcu-config.md`).
+//! * **Print-time scheduling.** [`ConfigBuilder::get_query_slot`] places a
+//!   periodic query on the firmware clock estimated from connect time
+//!   (`Mcu::estimated_clock`), not on a print time — that arrives with the
+//!   motion layer (TODO C1).
 
 use std::sync::{Mutex, MutexGuard};
 
@@ -651,8 +654,8 @@ async fn reset_firmware(mcu: &Mcu, state: &ConfigState, crc: u32) -> Result<(), 
             )
         };
         return Err(McuError::Config(format!(
-            "MCU '{}' {reason} and the firmware has no config_reset; power-cycle \
-             the board, or implement the restart path (TODO D2)",
+            "MCU '{}' {reason} and the firmware offers neither config_reset nor \
+             reset; power-cycle the board to clear it",
             mcu.name()
         )));
     }
@@ -1287,7 +1290,8 @@ mod tests {
     #[tokio::test]
     async fn test_configure_refuses_a_different_crc_that_cannot_reset() {
         // Already configured with a CRC the host did not compute, and no way to
-        // clear it: the restart path that would is TODO D2.
+        // clear it: the firmware offers neither `config_reset` nor `reset`, so
+        // only a power cycle helps.
         let mcu = scripted_mcu_without_reset(vec![MappingEntry {
             input: Frame::new(0, get_config_payload()),
             outputs: vec![Frame::new(

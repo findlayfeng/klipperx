@@ -30,7 +30,24 @@ pub trait Device: Send + Sync {
 
 /// Interface for communicating with a Klipper device.
 ///
-/// One variant per transport a `[mcu]` section can ask for:
+/// An open transport plus the runtime that transport does its blocking I/O on.
+/// The handle is captured when the transport is opened and **stored**, rather
+/// than asked for at each spawn (`tokio::task::spawn_blocking` uses the ambient
+/// runtime). The device's `send`/`receive` are blocking, so which runtime they
+/// land on is part of what an interface *is*. It is the machine runtime; a
+/// future split of the machine and API runtimes (TODO A3) changes only where it
+/// is captured.
+///
+/// The transport itself is private: which kind a section asks for is decided by
+/// `[mcu]` parsing, so nothing outside this module needs to match on it.
+#[derive(Debug, Clone)]
+pub struct Interface {
+    handle: tokio::runtime::Handle,
+    transport: Transport,
+}
+
+/// The device behind an [`Interface`], one variant per transport a `[mcu]`
+/// section can ask for:
 /// - `Serial(SerialDevice)` — a real MCU on a tty (`serial:`)
 /// - `CanSerial(CanSerialDevice)` — a real MCU reached over CAN, using Klipper's
 ///   can-serial link (`canbus_uuid:` + `canbus_interface:` + `canbus_nodeid:`)
@@ -42,7 +59,7 @@ pub trait Device: Send + Sync {
 /// transport is reported when it is parsed, rather than turned into an interface
 /// that fails on every call.
 #[derive(Debug, Clone)]
-pub enum Interface {
+enum Transport {
     Serial(Arc<SerialDevice>),
     CanSerial(Arc<CanSerialDevice>),
     Host(Arc<HostDevice>),
@@ -51,10 +68,30 @@ pub enum Interface {
 }
 
 impl Interface {
+    /// Wrap `transport`, picking up the runtime its I/O will run on.
+    ///
+    /// This is the one place the machine's runtime enters a transport, and it
+    /// is called *after* the device is open — so a transport that fails to open
+    /// never needs a runtime at all (the config tests rely on that).
+    fn with_transport(transport: Transport) -> Self {
+        Self {
+            handle: tokio::runtime::Handle::current(),
+            transport,
+        }
+    }
+
+    /// The runtime this interface's blocking I/O runs on.
+    ///
+    /// [`Mcu`](crate::core::klippy::mcu::Mcu) uses it for its transport tasks,
+    /// so both halves of a connection share one runtime.
+    pub fn handle(&self) -> &tokio::runtime::Handle {
+        &self.handle
+    }
+
     /// Create a new `Interface` wrapping the given device.
     #[cfg(test)]
     pub fn new(device: TestDevice) -> Self {
-        Self::Test(Arc::new(device))
+        Self::with_transport(Transport::Test(Arc::new(device)))
     }
 
     /// Create an interface for a real MCU on the serial port `path`.
@@ -63,7 +100,16 @@ impl Interface {
     /// Returns [`InterfaceError`] if the port cannot be opened or put into raw
     /// mode at `baud`.
     pub fn serial(path: impl AsRef<std::path::Path>, baud: u32) -> Result<Self, InterfaceError> {
-        Ok(Self::Serial(Arc::new(SerialDevice::open(path, baud)?)))
+        Ok(Self::from_serial(SerialDevice::open(path, baud)?))
+    }
+
+    /// Wrap an already-open serial device.
+    ///
+    /// For a caller that opened the port itself: `[mcu]` leaves RTS in a state
+    /// that depends on `restart_method`, so it opens the device before handing
+    /// it over (`config/mcu.rs`).
+    pub fn from_serial(device: SerialDevice) -> Self {
+        Self::with_transport(Transport::Serial(Arc::new(device)))
     }
 
     /// Create an interface for the MCU `uuid` on the CAN interface `name`, brought
@@ -73,9 +119,9 @@ impl Interface {
     /// Returns [`InterfaceError`] if the interface does not exist or the socket
     /// cannot be set up.
     pub fn canserial(name: &str, uuid: [u8; 6], nodeid: u32) -> Result<Self, InterfaceError> {
-        Ok(Self::CanSerial(Arc::new(CanSerialDevice::open(
-            name, uuid, nodeid,
-        )?)))
+        Ok(Self::with_transport(Transport::CanSerial(Arc::new(
+            CanSerialDevice::open(name, uuid, nodeid)?,
+        ))))
     }
 
     /// Create an interface running klipper's host library from `path`.
@@ -84,77 +130,78 @@ impl Interface {
     /// Returns [`InterfaceError`] if the library cannot be loaded, does not
     /// export the expected symbols, or fails to initialize.
     pub fn host(path: impl AsRef<Path>) -> Result<Self, InterfaceError> {
-        Ok(Self::Host(Arc::new(HostDevice::load(path)?)))
+        Ok(Self::with_transport(Transport::Host(Arc::new(
+            HostDevice::load(path)?,
+        ))))
+    }
+
+    /// Run one blocking device operation on the interface's own runtime.
+    ///
+    /// The device call blocks, so it goes to the blocking pool of the stored
+    /// handle rather than whatever runtime happens to be ambient.
+    async fn off_runtime<T, F>(&self, op: F) -> T
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
+        self.handle
+            .spawn_blocking(op)
+            .await
+            .expect("Interface device task panicked")
     }
 
     pub async fn send(&self, frame: Frame) -> Result<(), InterfaceError> {
-        match self {
-            Self::Serial(device) => {
+        match &self.transport {
+            Transport::Serial(device) => {
                 let device = Arc::clone(device);
-                tokio::task::spawn_blocking(move || device.send(&frame))
-                    .await
-                    .expect("Interface send task panicked")
+                self.off_runtime(move || device.send(&frame)).await
             }
-            Self::CanSerial(device) => {
+            Transport::CanSerial(device) => {
                 let device = Arc::clone(device);
-                tokio::task::spawn_blocking(move || device.send(&frame))
-                    .await
-                    .expect("Interface send task panicked")
+                self.off_runtime(move || device.send(&frame)).await
             }
-            Self::Host(device) => {
+            Transport::Host(device) => {
                 let device = Arc::clone(device);
-                tokio::task::spawn_blocking(move || device.send(&frame))
-                    .await
-                    .expect("Interface send task panicked")
+                self.off_runtime(move || device.send(&frame)).await
             }
             #[cfg(test)]
-            Self::Test(device) => {
+            Transport::Test(device) => {
                 let device = Arc::clone(device);
-                tokio::task::spawn_blocking(move || device.send(&frame))
-                    .await
-                    .expect("Interface send task panicked")
+                self.off_runtime(move || device.send(&frame)).await
             }
         }
     }
 
     pub async fn receive(&self) -> Option<Frame> {
-        match self {
-            Self::Serial(device) => {
+        match &self.transport {
+            Transport::Serial(device) => {
                 let device = Arc::clone(device);
-                tokio::task::spawn_blocking(move || device.receive())
-                    .await
-                    .expect("Interface receive task panicked")
+                self.off_runtime(move || device.receive()).await
             }
-            Self::CanSerial(device) => {
+            Transport::CanSerial(device) => {
                 let device = Arc::clone(device);
-                tokio::task::spawn_blocking(move || device.receive())
-                    .await
-                    .expect("Interface receive task panicked")
+                self.off_runtime(move || device.receive()).await
             }
-            Self::Host(device) => {
+            Transport::Host(device) => {
                 let device = Arc::clone(device);
-                tokio::task::spawn_blocking(move || device.receive())
-                    .await
-                    .expect("Interface receive task panicked")
+                self.off_runtime(move || device.receive()).await
             }
             #[cfg(test)]
-            Self::Test(device) => {
+            Transport::Test(device) => {
                 let device = Arc::clone(device);
-                tokio::task::spawn_blocking(move || device.receive())
-                    .await
-                    .expect("Interface receive task panicked")
+                self.off_runtime(move || device.receive()).await
             }
         }
     }
 
     /// Shut down the underlying device, unblocking any pending `receive()`.
     pub fn shutdown(&self) {
-        match self {
-            Self::Serial(device) => device.shutdown(),
-            Self::CanSerial(device) => device.shutdown(),
-            Self::Host(device) => device.shutdown(),
+        match &self.transport {
+            Transport::Serial(device) => device.shutdown(),
+            Transport::CanSerial(device) => device.shutdown(),
+            Transport::Host(device) => device.shutdown(),
             #[cfg(test)]
-            Self::Test(device) => device.shutdown(),
+            Transport::Test(device) => device.shutdown(),
         }
     }
 }

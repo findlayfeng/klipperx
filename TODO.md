@@ -34,7 +34,6 @@
 | G2b | 用 GCODE 控制 GPIO：`SET_PIN` 时序（数字与 PWM 均已可驱动） | C1 |
 | G1b | gcode 调度器与上游的行为差异（ack / cmd_default / ECHO / mux 缺省…） | Q2、C1 |
 | G4 | 运动命令（G0/G1/G28…） | G1、C1 |
-| A1b | reactor 串行调度器与延迟度量 | A1 |
 | A2 | 错误词汇（`CommandError` / `ConfigError`） | — |
 | B2 | MCU 剩余：`emergency_stop` 对象/端点、`last_stats`、错误载荷、本地 shutdown 标志、`command` 的固件 `reset` | — |
 | B4 | 其余端点（estop / remote method / pause_resume / …） | G3 等 |
@@ -72,32 +71,6 @@
 - [ ] **`output_pin` 的其余上游选项**：`scale`（PWM 用，`output_pin.py:207-214`）、
       `TEMPLATE` + `template_evaluator`（display 模板，`output_pin.py:88-170`）——与开关
       GPIO 本身无关，按需再补。
-
-### A1b reactor 的串行调度器与延迟度量
-
-**为什么单列一条**：打印的**硬实时在 MCU**（步进脉冲由固件发，主机把 move 提前送进 MCU
-的步进队列），主机只是**软实时**——只要不把队列喂空。但上游主机确定性的前提是
-**单线程、按唤醒时间、一次一个回调、可观测**（`_check_timers`，`klippy/reactor.py:157-172`）。
-现状的 `TokioReactor` 是「一个定时器一个 tokio 任务」+ 多线程 runtime，两个同时到期的回调
-可以被两个 worker **并行**执行且不保证顺序；将来把 toolhead / trapq 这类运动状态放进定时
-回调时，这会重新引入锁与竞态。MCU 队列给了余量，所以这不是「现在会坏」，而是「在把运动
-状态交给定时器之前必须先补」。完整分析见 `docs/klippy/developer-manual/reactor.md`。
-
-- [ ] **串行 dispatcher**：所有定时器进**一个 dispatcher 任务**（最小堆 + 一个
-      `sleep_until`），按唤醒时间顺序出队、**一次跑一个回调**，复刻上游 `_check_timers`。
-      trait 不变、机器代码不动——这正是 A1 把 reactor 做成 trait 的直接收益；可以替换
-      `TokioReactor`，也可以作为它的一个变体。
-- [ ] **机器与 API 分 runtime**：机器跑在专用 runtime（current-thread 或专用线程），API
-      的每连接任务在别处，避免客户端流量影响运动时序。
-- [ ] **延迟度量**：补上游的 `set_latency_notifier`（`klippy/reactor.py:316`）——一轮忙
-      超过阈值就报「忙了多久、哪些回调拖的」（上游 `extras/garbage_collection.py:20` 的
-      `_analyze_callback`）。`_recent_callbacks` 的等价物要在 dispatcher 里维护；我们已有
-      `monotonic` 与定时器，挂得上。
-- [ ] **关键回调不许 await / 阻塞**：上游用 `assert_no_pause`（`klippy/reactor.py:265`）在
-      shutdown / ready 回调里禁止 pause。async 里没有 pause，但「这里不许 await、不许做
-      重活」的语义仍要守（先文档约束，必要时再上机制）。
-- [ ] **验收**：能测出定时器回调的唤醒延迟（`ManualReactor` 给确定性、真 runtime 给抖动
-      数字），并确认并发回调不再可能同时碰同一份打印机状态。
 
 ### A2 错误词汇
 
@@ -459,6 +432,38 @@ ack」settle，并用 `Mcu::took_over_session()` 让 `rpi_usb` 判断“有没�
 - **reactor 抽象与定时器（A1）**：`Reactor` trait（`monotonic` / `register_timer` /
       `unregister_timer` / `call_later`）与 `TokioReactor` / `ManualReactor`；机器持
       `Arc<dyn Reactor>`，不拥有 runtime（`reactor.rs`）。
+- **reactor 串行调度器（A1b 之一）**：`TokioReactor` 改为**一个 dispatcher 任务 + 最小堆**
+      （`reactor.rs` 的 `run_dispatcher` / `Dispatcher` / `TimerEntry`）：睡到最早唤醒时间、
+      按唤醒时间一次跑一个回调，同时到期按注册顺序（`seq`）；注册 / 取消都 `Notify` 唤醒
+      dispatcher，取消的条目在到期时跳过；reactor 析构时置 `closed` 让 dispatcher 退出。
+      有两处回归测试（同一时刻按注册顺序、回调里再注册不死锁）。
+      （`docs/klippy/developer-manual/reactor.md`）。
+- **定时回调不许等待 / 做重活（A1b 之一）**：写进 `reactor.rs` 的模块文档与 `register_timer`
+      契约——回调跑在 dispatcher 上，没有地方 `await`，不许阻塞或做重活；`reactor.md` 单列
+      一节。对应上游 `assert_no_pause`（`klippy/reactor.py:265`），当前只是约定、无机制。
+- **reactor 延迟度量（A1b 之一）**：`Reactor::set_latency_notifier`（对应上游
+      `reactor.py:316`）——一轮分发从最早唤醒时间算起忙过阈值，就把该轮回调的
+      `LatencyReport`（`busy` + 每个回调的 `name` / `duration` / `lateness`）交回。名字在注册时
+      给出（`register_timer_named`；`register_timer` 为无名版），因为 Rust 闭包没有名字可反射。
+      trait 默认空实现，`TokioReactor` 实现（`ManualReactor` 不给抖动）；主机在 `src/klippy.rs`
+      挂 50 ms 阈值的日志回调（上游 `garbage_collection` 用同一阈值）。测试在真时间下验证慢回调
+      被报出、快回调不报、被慢回调挡住的后继定时器 `lateness` 超阈（`reactor.rs`；
+      `docs/klippy/developer-manual/reactor.md`）。
+- **机器侧 spawn 显式化（A3 前置）**：`Interface` 改为「`handle` 字段 + 私有 `Transport` 枚举」，
+      设备 I/O 走 `off_runtime`（用存的 handle）；`Mcu` 从 `interface.handle()` 取 handle 存字段，
+      收发任务用它 spawn；`restart.rs` 的 `spawn_blocking` 改成显式 `&Handle` 参数。机器侧不再有
+      裸 `tokio::spawn` / `spawn_blocking`，唯一 ambient 捕获点是 `Interface::with_transport`
+      （设备打开**之后**，所以打不开的传输不需要 runtime）。行为不变。
+      （`interface/mod.rs`、`mcu/mod.rs`、`mcu/restart.rs`、`mcu/object.rs`、`config/mcu.rs`；
+      `docs/klippy/developer-manual/runtime.md`）
+- **机器与 API 分 runtime（A3）**：机器跑在专用多线程 runtime（`worker_threads(2)`，worker 名
+      `klippy-mcu`）上，由一条专用 OS 线程（`klippy-machine`）驱动 `klippy_process`；API 保留
+      进程本来的多线程 runtime（`klippy-api`）跑 accept / 每连接 / attachment / `ctrl_c`。reactor
+      显式建在机器 handle 上；`load_config` 跑在 `machine_handle.enter()` 下，所以
+      `Interface::with_transport` 捕获到的是机器 handle。跨 runtime 只靠 `Arc<Printer>` 与
+      `request_exit` 的 `Condvar`。停机顺序：`request_exit` → `run()` 返回 → `teardown`（机器
+      runtime 尚在）→ 机器线程 drop runtime → join → abort 监听与 server（`src/klippy.rs`；
+      `docs/klippy/developer-manual/runtime.md`）。
 - **主机层串起来**：`klippy_process`（建机器 → `api::register` → bind → `load_config`，
       失败即 `invoke_shutdown` → `bring_up` → `run`）、`info` 端点、`StartArgs`
       （`src/klippy.rs`、`api/endpoints/info.rs`、`api/start_args.rs`）。
@@ -492,6 +497,7 @@ ack」settle，并用 `Mcu::took_over_session()` 让 `rpi_usb` 判断“有没�
 | 固件停机/重启事件 | `src/sched.c:310` `:318` `:351`、`klippy/mcu.py:813-835` `:880-881` |
 | `config_reset` 与 restart helper | `src/basecmd.c:262-272`、`klippy/mcu.py:756-770` |
 | reactor 定时器 / 回调 / 时钟 | `klippy/reactor.py:111` `:145` `:187` |
+| reactor latency 钩子 | `klippy/reactor.py:316`、`klippy/extras/garbage_collection.py:20` |
 | kinematics 的装载与接缝 | `klippy/toolhead.py:235-252`、`:389` `:400` `:482` `:507` `:522` |
 | 各 kinematics 的差异 | `klippy/kinematics/*.py`（`home` / `check_move` / `calc_position` / `get_status`） |
 | 通用回零驱动 | `klippy/extras/homing.py:165-300` |

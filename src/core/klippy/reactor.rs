@@ -33,10 +33,38 @@
 //! upstream's `NOW` — and one that returns a later time stays registered until
 //! it says `None`. Cancelling is [`Reactor::unregister_timer`].
 //!
+//! # What a callback may do
+//!
+//! A callback runs on the reactor's **one dispatcher thread**, one callback at
+//! a time, so it may touch printer state without coordinating with other
+//! callbacks. That serialization is the whole point — and it comes with a
+//! matching duty: a callback must **not block and must not do heavy work**,
+//! because everything else waits behind it. Upstream enforces the same rule with
+//! `assert_no_pause` in its shutdown / ready callbacks (`klippy/reactor.py:265`);
+//! here there is no `pause` to forbid, but "no waiting, no long work" still
+//! holds — there is nowhere to `await` from a [`TimerCallback`], and a callback
+//! that sleeps, locks across unrelated work, or runs for long delays every
+//! other timer and the rest of the machine behind it. Waiting belongs in
+//! `async` code that `.await`s; a callback is for work that is already ready to
+//! do.
+//!
+//! # Latency
+//!
+//! Because the dispatcher runs callbacks one at a time, a slow one is directly
+//! visible: it makes every later timer late. [`Reactor::set_latency_notifier`]
+//! is how that is seen — a callback can be told whenever a dispatch round takes
+//! longer than a threshold, along with the names and durations of the callbacks
+//! in it ([`LatencyReport`]). It is upstream's `set_latency_notifier`
+//! (`klippy/reactor.py:316`), which `extras/garbage_collection.py` uses to log a
+//! `Reactor busy for …` warning; we have no garbage collector, so here it is
+//! purely a diagnostic. The default does nothing; [`TokioReactor`] implements it.
+//!
 //! [`Printer`]: crate::core::klippy::printer::Printer
 
+use std::cmp::Ordering as CmpOrdering;
+use std::collections::BinaryHeap;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -46,10 +74,49 @@ use std::time::Duration;
 /// is retired. The signature is upstream's
 /// `double callback(double eventtime)` returning `NEVER`
 /// (`klippy/reactor.py:166`), with `Option` in place of the sentinel.
+///
+/// It runs on the reactor's single dispatcher thread, one callback at a time,
+/// and must not block or do heavy work — see the module docs.
 pub type TimerCallback = Box<dyn FnMut(f64) -> Option<f64> + Send>;
 
 /// A one-shot callback handed to [`Reactor::call_later`].
 pub type OneShot = Box<dyn FnOnce(f64) + Send>;
+
+/// One callback's part of a [`LatencyReport`].
+#[derive(Debug, Clone)]
+pub struct CallbackRun {
+    /// The name the callback was registered with.
+    pub name: &'static str,
+    /// How long the callback ran, in seconds.
+    pub duration: f64,
+    /// How late it started: its event time minus the wake time it was due at.
+    /// Non-zero means the dispatcher was already busy when the timer came due.
+    pub lateness: f64,
+}
+
+/// What the reactor was doing when it ran late.
+///
+/// Reported by [`Reactor::set_latency_notifier`] after a dispatch round that
+/// took longer than the threshold: the round's callbacks and how long the round
+/// lasted. This is a diagnostic — the machine is soft real-time, and the point
+/// is to find the callback that made the reactor late, not to act on every
+/// warning.
+#[derive(Debug, Clone)]
+pub struct LatencyReport {
+    /// The event time the report is dated with.
+    pub eventtime: f64,
+    /// How long the round was busy, in seconds — measured from the earliest
+    /// wake time in it, so a late wake counts the same as a slow callback.
+    pub busy: f64,
+    /// The callbacks that ran in the round, in order.
+    pub callbacks: Vec<CallbackRun>,
+}
+
+/// Called when a dispatch round runs past the latency threshold.
+///
+/// Shared (`Arc`) so the dispatcher can clone it out and call it without
+/// holding the lock that holds it.
+pub type LatencyCallback = Arc<dyn Fn(LatencyReport) + Send + Sync>;
 
 /// The machine's clock and its timers.
 ///
@@ -68,7 +135,13 @@ pub trait Reactor: Send + Sync {
     /// it tells one report from the next.
     fn monotonic(&self) -> f64;
 
-    /// Call `callback` no earlier than `waketime` (absolute monotonic seconds).
+    /// Call `callback` no earlier than `waketime`, naming it for latency
+    /// reports.
+    ///
+    /// The name is what [`Reactor::set_latency_notifier`] shows. Upstream reads
+    /// it off the callback (`get_function_owner`,
+    /// `klippy/extras/garbage_collection.py:21`); a Rust closure has no name, so
+    /// a caller gives one.
     ///
     /// The callback may be called again whenever it asks to be, by returning
     /// the next wake time; returning `None` retires it. The returned handle is
@@ -76,7 +149,34 @@ pub trait Reactor: Send + Sync {
     ///
     /// A `waketime` already in the past runs as soon as the implementer gets to
     /// it, which is upstream's `NOW` (`0.`).
-    fn register_timer(&self, callback: TimerCallback, waketime: f64) -> TimerHandle;
+    ///
+    /// The callback runs on the reactor's dispatcher and must not block or do
+    /// heavy work (see the module docs); it must not wait for anything, because
+    /// every other timer waits behind it.
+    fn register_timer_named(
+        &self,
+        name: &'static str,
+        callback: TimerCallback,
+        waketime: f64,
+    ) -> TimerHandle;
+
+    /// Call `callback` no earlier than `waketime`.
+    ///
+    /// The unnamed form of [`Reactor::register_timer_named`]; a latency report
+    /// shows it as `"<timer>"`. Prefer the named form where the report should
+    /// be able to say which timer was slow.
+    fn register_timer(&self, callback: TimerCallback, waketime: f64) -> TimerHandle {
+        self.register_timer_named("<timer>", callback, waketime)
+    }
+
+    /// Ask to be told when a dispatch round runs longer than `latency` seconds.
+    ///
+    /// Upstream's `set_latency_notifier` (`klippy/reactor.py:316`), used there
+    /// by `extras/garbage_collection.py` to log a `Reactor busy for …` warning.
+    /// We have no garbage collector, so this is a diagnostic: the default does
+    /// nothing, and only [`TokioReactor`] implements it. The callback runs on
+    /// the dispatcher, right after the slow round — it must not block either.
+    fn set_latency_notifier(&self, _latency: f64, _callback: LatencyCallback) {}
 
     /// Cancel a timer.
     ///
@@ -96,7 +196,8 @@ pub trait Reactor: Send + Sync {
     /// *waits* is `async`, and this is only for a callback that does not.
     fn call_later(&self, delay: f64, callback: OneShot) -> TimerHandle {
         let mut callback = Some(callback);
-        self.register_timer(
+        self.register_timer_named(
+            "call_later",
             Box::new(move |eventtime| {
                 if let Some(callback) = callback.take() {
                     callback(eventtime);
@@ -156,20 +257,29 @@ impl<F: Fn() + Send + Sync + 'static> TimerCancel for F {
 // TokioReactor
 // ===========================================================================
 
-/// The reactor the host runs on: timers are tokio tasks.
+/// The reactor the host runs on: one dispatcher task over a min-heap of timers.
 ///
 /// Built over the runtime the host already has, so it creates nothing of its
 /// own — no thread, no event loop. `monotonic` is the runtime's clock, which
 /// means a paused test clock (`#[tokio::test(start_paused = true)]`) moves it
 /// too.
 ///
-/// A registered timer is one spawned task that sleeps until its wake time and
-/// runs the callback there. Cancelling sets a flag and wakes the task, so a
-/// timer does not have to wait out a long sleep to notice.
+/// Timers are **not** one task each. They all live in one min-heap behind the
+/// single dispatcher task spawned here, which sleeps until the earliest wake
+/// time, pops every timer that is due, and runs the callbacks **one at a
+/// time**, in wake-time order — upstream `_check_timers`' contract
+/// (`klippy/reactor.py:157-172`). Two timer callbacks can therefore never run
+/// at once, which is what lets one of them touch printer state without
+/// coordinating with the other.
+///
+/// Registering or cancelling a timer wakes the dispatcher so it can shorten or
+/// drop its sleep; a cancelled timer is skipped when it comes due. Dropping a
+/// handle never cancels.
 pub struct TokioReactor {
-    handle: tokio::runtime::Handle,
     /// What `monotonic` counts from.
     origin: tokio::time::Instant,
+    /// The timers, shared with the one dispatcher task that runs them.
+    dispatcher: Arc<Dispatcher>,
 }
 
 impl TokioReactor {
@@ -179,11 +289,23 @@ impl TokioReactor {
     /// timer runs on that runtime, so it must outlive the printer. The caller
     /// is expected to be inside the runtime already (`Handle::current()`), or
     /// to hold a handle from one it built.
+    ///
+    /// The dispatcher task is spawned here and ends when this reactor is
+    /// dropped.
     pub fn new(handle: tokio::runtime::Handle) -> Self {
-        Self {
-            handle,
-            origin: tokio::time::Instant::now(),
-        }
+        let origin = tokio::time::Instant::now();
+        let dispatcher = Arc::new(Dispatcher::new());
+        handle.spawn(run_dispatcher(Arc::clone(&dispatcher), origin));
+        Self { origin, dispatcher }
+    }
+}
+
+impl Drop for TokioReactor {
+    fn drop(&mut self) {
+        // Wake the dispatcher so it sees the reactor is gone and its task can
+        // end, rather than sleeping for a timer nobody can register again.
+        self.dispatcher.closed.store(true, Ordering::Release);
+        self.dispatcher.notify.notify_one();
     }
 }
 
@@ -192,78 +314,255 @@ impl Reactor for TokioReactor {
         self.origin.elapsed().as_secs_f64()
     }
 
-    fn register_timer(&self, callback: TimerCallback, waketime: f64) -> TimerHandle {
-        // Cancellation is a flag the task checks plus a notification to wake it
-        // from a long sleep. A `Notify` rather than a channel, because dropping
-        // a handle must not cancel: the task owns its own copy of the state, so
-        // it stays alive whether or not anyone still holds the handle.
-        let cancel = Arc::new(CancelState {
-            cancelled: AtomicBool::new(false),
-            notify: tokio::sync::Notify::new(),
+    fn register_timer_named(
+        &self,
+        name: &'static str,
+        callback: TimerCallback,
+        waketime: f64,
+    ) -> TimerHandle {
+        // Cancellation is a flag the dispatcher checks when the timer comes
+        // due, plus a notification to wake it early. A `Notify` rather than a
+        // channel, because dropping a handle must not cancel: the dispatcher
+        // owns the entries, so a timer stays registered whether or not anyone
+        // still holds its handle.
+        let cancelled = Arc::new(AtomicBool::new(false));
+        self.dispatcher.push(TimerEntry {
+            waketime,
+            seq: self.dispatcher.next_seq(),
+            name,
+            callback,
+            cancelled: Arc::clone(&cancelled),
         });
-        let origin = self.origin;
-        self.handle
-            .spawn(run_timer(origin, callback, waketime, Arc::clone(&cancel)));
+        // The new timer may be earlier than whatever the dispatcher is sleeping
+        // for, so wake it to re-evaluate. The entry is in the heap before the
+        // notification, and a stale wakeup only costs a re-scan.
+        self.dispatcher.notify.notify_one();
+        let dispatcher = Arc::clone(&self.dispatcher);
         TimerHandle::new(move || {
-            cancel.cancelled.store(true, Ordering::Release);
-            cancel.notify.notify_one();
+            cancelled.store(true, Ordering::Release);
+            dispatcher.notify.notify_one();
         })
+    }
+
+    fn set_latency_notifier(&self, latency: f64, callback: LatencyCallback) {
+        *self
+            .dispatcher
+            .latency
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) =
+            Some(LatencyNotifier { latency, callback });
     }
 }
 
-/// How a running timer is told to stop.
-///
-/// Shared between the handle and the task, so it outlives either.
-struct CancelState {
-    cancelled: AtomicBool,
+/// The timers, shared between the reactor and its one dispatcher task.
+struct Dispatcher {
+    /// A min-heap: the earliest wake time is always on top.
+    timers: Mutex<BinaryHeap<TimerEntry>>,
+    /// Wakes the dispatcher when a timer is added or cancelled, or when the
+    /// reactor is dropped.
     notify: tokio::sync::Notify,
+    /// Tie-breaker so timers due at the same moment run in registration order,
+    /// like upstream's list walk and `ManualReactor`'s stable sort.
+    seq: AtomicU64,
+    /// Set by `TokioReactor::drop`, so the task ends with the reactor.
+    closed: AtomicBool,
+    /// The latency notifier, once [`Reactor::set_latency_notifier`] was called.
+    latency: Mutex<Option<LatencyNotifier>>,
 }
 
-/// The longest a timer task sleeps in one go.
+/// Told when a dispatch round ran past its threshold.
+struct LatencyNotifier {
+    latency: f64,
+    callback: LatencyCallback,
+}
+
+impl Dispatcher {
+    fn new() -> Self {
+        Self {
+            timers: Mutex::new(BinaryHeap::new()),
+            notify: tokio::sync::Notify::new(),
+            seq: AtomicU64::new(0),
+            closed: AtomicBool::new(false),
+            latency: Mutex::new(None),
+        }
+    }
+
+    fn next_seq(&self) -> u64 {
+        self.seq.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn push(&self, entry: TimerEntry) {
+        self.timers
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .push(entry);
+    }
+
+    /// Call the latency notifier if a round ran past its threshold.
+    ///
+    /// The callback is cloned out of the lock first, so it may itself call
+    /// `set_latency_notifier` (or do anything else) without deadlocking.
+    fn report_if_late(&self, busy: f64, eventtime: f64, callbacks: Vec<CallbackRun>) {
+        let callback = {
+            let guard = self
+                .latency
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            match guard.as_ref() {
+                Some(notifier) if busy >= notifier.latency => Some(Arc::clone(&notifier.callback)),
+                _ => None,
+            }
+        };
+        if let Some(callback) = callback {
+            callback(LatencyReport {
+                eventtime,
+                busy,
+                callbacks,
+            });
+        }
+    }
+}
+
+/// One registered timer.
+struct TimerEntry {
+    waketime: f64,
+    /// Registration order, used to order timers due at the same moment.
+    seq: u64,
+    /// Shown in a [`LatencyReport`].
+    name: &'static str,
+    callback: TimerCallback,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl PartialEq for TimerEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.seq == other.seq && self.waketime.total_cmp(&other.waketime) == CmpOrdering::Equal
+    }
+}
+
+impl Eq for TimerEntry {}
+
+impl PartialOrd for TimerEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for TimerEntry {
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        // `BinaryHeap` is a max-heap, so compare in reverse: the earliest wake
+        // time wins, and among equal wake times the lowest `seq` (registered
+        // first) wins.
+        other
+            .waketime
+            .total_cmp(&self.waketime)
+            .then_with(|| other.seq.cmp(&self.seq))
+    }
+}
+
+/// The longest the dispatcher sleeps in one go.
 ///
 /// A wake time is an `f64` and may be arbitrarily far away — upstream's
 /// `NEVER` is `9999999999999999.`. Sleeping that long in one call would
-/// overflow a monotonic instant, so the task sleeps a day at a time and
+/// overflow a monotonic instant, so the dispatcher sleeps a day at a time and
 /// re-checks. Nothing in the host asks for more than a few seconds.
 const MAX_TIMER_SLEEP: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// One spawned timer: sleep until due, run the callback, reschedule or stop.
-async fn run_timer(
-    origin: tokio::time::Instant,
-    mut callback: TimerCallback,
-    mut waketime: f64,
-    cancel: Arc<CancelState>,
-) {
+/// The one task that runs every timer.
+///
+/// Each pass takes every timer that is due now — earliest first — and runs its
+/// callback **before** looking at the next one, so callbacks never overlap.
+/// Between passes it sleeps until the earliest remaining timer or a wakeup.
+async fn run_dispatcher(dispatcher: Arc<Dispatcher>, origin: tokio::time::Instant) {
     loop {
-        if cancel.cancelled.load(Ordering::Acquire) {
+        if dispatcher.closed.load(Ordering::Acquire) {
             return;
         }
-        // Sleep until due, in bounded slices, waking at once if cancelled.
-        loop {
-            let remaining = waketime - origin.elapsed().as_secs_f64();
-            if remaining <= 0.0 {
-                break;
+
+        // Take the due timers out from under the lock: a callback may register
+        // or cancel another timer, and it must not do that while we hold the
+        // heap. The heap pops the earliest wake time first — and, among equal
+        // wake times, the lowest `seq` — so `due` is already in the order the
+        // callbacks should run.
+        let mut due = Vec::new();
+        {
+            let mut timers = dispatcher
+                .timers
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            let now = origin.elapsed().as_secs_f64();
+            loop {
+                let is_due = timers
+                    .peek()
+                    .map(|entry| entry.waketime <= now)
+                    .unwrap_or(false);
+                if !is_due {
+                    break;
+                }
+                let entry = timers.pop().expect("peeked as due");
+                if entry.cancelled.load(Ordering::Acquire) {
+                    continue;
+                }
+                due.push(entry);
             }
-            let slice = Duration::from_secs_f64(remaining).min(MAX_TIMER_SLEEP);
-            // Interest is registered before the flag is read again, so a
-            // cancel in between is seen rather than lost.
-            let notified = cancel.notify.notified();
-            if cancel.cancelled.load(Ordering::Acquire) {
-                return;
-            }
-            tokio::select! {
-                _ = tokio::time::sleep(slice) => {}
-                _ = notified => {
-                    if cancel.cancelled.load(Ordering::Acquire) {
-                        return;
+        }
+
+        if due.is_empty() {
+            // Nothing to run: sleep until the earliest timer, or until a timer
+            // is added or cancelled. The notification is armed before the heap
+            // is read again, so a registration in between is not lost.
+            let notified = dispatcher.notify.notified();
+            let sleep = {
+                let timers = dispatcher
+                    .timers
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                timers.peek().map(|entry| {
+                    let remaining = entry.waketime - origin.elapsed().as_secs_f64();
+                    Duration::from_secs_f64(remaining.max(0.0)).min(MAX_TIMER_SLEEP)
+                })
+            };
+            match sleep {
+                // No timer registered: wait for one, or for the reactor to go.
+                None => notified.await,
+                Some(sleep) => {
+                    tokio::select! {
+                        _ = tokio::time::sleep(sleep) => {}
+                        _ = notified => {}
                     }
                 }
             }
+            continue;
         }
-        let eventtime = origin.elapsed().as_secs_f64();
-        match callback(eventtime) {
-            Some(next) => waketime = next,
-            None => return,
+
+        // Run the round, recording each callback for a latency report. The
+        // round's busy time is measured from the earliest wake time in it, so a
+        // late wake shows up the same way a slow callback does.
+        let first_due = due.first().map(|entry| entry.waketime);
+        let mut runs = Vec::with_capacity(due.len());
+        for mut entry in due {
+            if entry.cancelled.load(Ordering::Acquire) {
+                continue;
+            }
+            let name = entry.name;
+            // The time the callback is woken for, read per callback so a long
+            // one is visible in the next callback's `eventtime`.
+            let started = origin.elapsed().as_secs_f64();
+            let lateness = started - entry.waketime;
+            if let Some(next) = (entry.callback)(started) {
+                entry.waketime = next;
+                entry.seq = dispatcher.next_seq();
+                dispatcher.push(entry);
+            }
+            runs.push(CallbackRun {
+                name,
+                duration: origin.elapsed().as_secs_f64() - started,
+                lateness,
+            });
+        }
+        if let Some(first_due) = first_due {
+            let eventtime = origin.elapsed().as_secs_f64();
+            dispatcher.report_if_late(eventtime - first_due, eventtime, runs);
         }
     }
 }
@@ -424,7 +723,12 @@ impl Reactor for ManualReactor {
         *self.now.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    fn register_timer(&self, callback: TimerCallback, waketime: f64) -> TimerHandle {
+    fn register_timer_named(
+        &self,
+        _name: &'static str,
+        callback: TimerCallback,
+        waketime: f64,
+    ) -> TimerHandle {
         let cancelled = Arc::new(AtomicBool::new(false));
         self.timers
             .lock()
@@ -713,6 +1017,73 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn test_tokio_timers_run_one_at_a_time_in_wake_time_order() {
+        // The property the serial dispatcher exists for: timers due at the same
+        // moment run in registration order, and no two callbacks are ever
+        // active at once. A regression to one-task-per-timer would let them
+        // overlap (and race the shared flag) instead of failing cleanly.
+        let reactor = TokioReactor::new(tokio::runtime::Handle::current());
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let running = Arc::new(AtomicBool::new(false));
+        for name in ["first", "second", "third"] {
+            let log = Arc::clone(&log);
+            let running = Arc::clone(&running);
+            reactor.register_timer(
+                Box::new(move |_| {
+                    assert!(
+                        !running.swap(true, Ordering::SeqCst),
+                        "two callbacks ran at once"
+                    );
+                    log.lock().unwrap().push(name);
+                    running.store(false, Ordering::SeqCst);
+                    None
+                }),
+                1.0,
+            );
+        }
+
+        tokio::time::advance(Duration::from_millis(1000)).await;
+        // The whole due batch runs in one poll of the dispatcher, but yield a
+        // few times so the assertion sees it either way.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(*log.lock().unwrap(), ["first", "second", "third"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_a_tokio_callback_may_register_another_timer() {
+        // The dispatcher must not hold its lock while a callback runs, or a
+        // callback that registers a timer would deadlock. The callback holds an
+        // `Arc` back to the reactor, which is the test's own reference cycle.
+        let reactor = Arc::new(TokioReactor::new(tokio::runtime::Handle::current()));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        {
+            let for_callback = Arc::clone(&reactor);
+            let tx = tx.clone();
+            reactor.register_timer(
+                Box::new(move |_| {
+                    let reactor = Arc::clone(&for_callback);
+                    let tx = tx.clone();
+                    reactor.register_timer(
+                        Box::new(move |_| {
+                            tx.send(()).ok();
+                            None
+                        }),
+                        reactor.monotonic(),
+                    );
+                    None
+                }),
+                0.5,
+            );
+        }
+
+        tokio::time::advance(Duration::from_millis(500)).await;
+        rx.recv().await.expect("the nested timer must run");
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn test_tokio_call_later_runs_once() {
         let reactor = TokioReactor::new(tokio::runtime::Handle::current());
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -728,5 +1099,99 @@ mod tests {
         tokio::time::advance(Duration::from_secs(60)).await;
         tokio::task::yield_now().await;
         assert!(rx.try_recv().is_err(), "call_later ran twice");
+    }
+
+    // ---------------------------------------------------------------------
+    // Latency notifier — real time, since the paused clock cannot see a
+    // callback that blocks the dispatcher
+    // ---------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_a_slow_round_is_reported_by_the_latency_notifier() {
+        let reactor = TokioReactor::new(tokio::runtime::Handle::current());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        reactor.set_latency_notifier(
+            0.05,
+            Arc::new(move |report| {
+                tx.send(report).ok();
+            }),
+        );
+
+        // Registered at NOW: the dispatcher runs it as its first round, and it
+        // holds the dispatcher for 120 ms.
+        reactor.register_timer_named(
+            "slow",
+            Box::new(|_| {
+                std::thread::sleep(Duration::from_millis(120));
+                None
+            }),
+            reactor.monotonic(),
+        );
+
+        let report = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the report must arrive")
+            .expect("the channel must be open");
+        assert!(report.busy >= 0.05, "busy was {}", report.busy);
+        let slow = report
+            .callbacks
+            .iter()
+            .find(|run| run.name == "slow")
+            .expect("the slow callback must be named");
+        assert!(slow.duration >= 0.05, "duration was {}", slow.duration);
+    }
+
+    #[tokio::test]
+    async fn test_a_fast_round_is_not_reported() {
+        let reactor = TokioReactor::new(tokio::runtime::Handle::current());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        reactor.set_latency_notifier(
+            0.05,
+            Arc::new(move |report| {
+                tx.send(report).ok();
+            }),
+        );
+        reactor.register_timer_named("fast", Box::new(|_| None), reactor.monotonic());
+
+        // Long enough for the dispatcher to run the (fast) round and decide not
+        // to report; the channel staying empty is the assertion.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(rx.try_recv().is_err(), "a fast round must not be reported");
+    }
+
+    #[tokio::test]
+    async fn test_a_timer_that_waited_behind_a_slow_callback_is_reported_late() {
+        // The wake latency A1b is about: `late` is due at +20 ms, but the
+        // dispatcher is stuck in `blocker`, so it starts ~100 ms late.
+        let reactor = TokioReactor::new(tokio::runtime::Handle::current());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        reactor.set_latency_notifier(
+            0.05,
+            Arc::new(move |report| {
+                tx.send(report).ok();
+            }),
+        );
+        reactor.register_timer_named(
+            "blocker",
+            Box::new(|_| {
+                std::thread::sleep(Duration::from_millis(120));
+                None
+            }),
+            reactor.monotonic(),
+        );
+        reactor.register_timer_named("late", Box::new(|_| None), reactor.monotonic() + 0.02);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let report = tokio::time::timeout(remaining, rx.recv())
+                .await
+                .expect("a report must arrive")
+                .expect("the channel must be open");
+            if let Some(late) = report.callbacks.iter().find(|run| run.name == "late") {
+                assert!(late.lateness >= 0.05, "lateness was {}", late.lateness);
+                return;
+            }
+        }
     }
 }

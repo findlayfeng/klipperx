@@ -47,6 +47,7 @@
 | C2 | 配置装载收尾（option 校验、第二个住户） | — |
 | D1 | 主机层 start args / rollover / `--logfile` | — |
 | D2 | `restart_method` 分派（重启循环已完成） | — |
+| D3 | `command` 接管一块**还在跑**的板子（序号对齐 + NAK 重传） | — |
 | E1 | 文档 | — |
 | E2 | `python_path` 的取消 | 外部项目 |
 
@@ -364,6 +365,43 @@ DTR”隐式满足，但那是驱动副作用，不算实现。**
         再发出来（`choose_devnum` 是游标式，实测连续 42→43→44→45，复用概率低但非零）；
         而且**每次轮询都重新解析配置路径**，所以设备若以另一个 tty 名回来，by-id 路径也能
         跟上（真机用 by-id 复测过）。
+      - 复查（多层 hub）：规则里的 sysfs glob 少了一层。`$devpath` 是 hub **设备**目录，而端口目录在
+        它的接口目录下（`<hub>:<if>/<hub>-port<N>/disable`），所以 `*port*/disable` 只能匹配到 hub
+        自己的 `port` 符号链接——**上一层** hub 上喂它的那个口；根 hub 目录下更是一个都匹配不到
+        （`chmod -f` 静默失败，sysfs 那条路永远不可写，`auto` 只能回落控制传输）。改成
+        `$sys$devpath/*/*port*/disable`（正是 `disable_path` 查的那些文件）；
+        `usb::recommended_rules` 与脚本同步，并补了多层 hub / 根 hub 端口 / 规则文本的单测，
+        其中一条用 `include_str!` 盯住脚本与告警的 glob 不再跑偏。
+      - 在真机上试（MCU 是 `stm32f103xe`，`1d50:614e`，正好**直插 AMD xHCI 根 hub**，本机 5 层 hub 都在另一条总线上）又抓到一个 bug：
+        `open_hub` 用 `nusb::list_devices()` 找 hub，而它按设计不给根 hub（Linux 后端把 `usbN` 名字
+        滤掉了），所以直插机器 USB 口的 MCU 一律报 `hub 3:1: not found`，`libusb`／`auto` 那条路
+        根本走不通；现在再把 `nusb::list_buses()` 的根 hub 串进搜索。
+      - 同一台机器上的实测结论（真板报告）：根 hub 描述符是 `wHubCharacteristics=0x000a`（lpsm=2，
+        **不支持端口供电切换**），`CLEAR_FEATURE(PORT_POWER)` 收下了（errno 0），设备也确实断开重枚举
+        （`devnum 5→6`、usbfs 节点 `189:260→189:261`，期间 `/dev/ttyACM0` 与 sysfs 链接一直在，
+        与上一条注释一致），但**没有真下电**：固件的 4 位序号接着上一条会话走（下一条会话首个响应
+        是 14 而不是 0），于是重连对不上号（`Seq mismatch` → identify 超时 → `shutdown`），要按板子
+        复位才能恢复。这正是“先不处理”的那种环境：这种根 hub 上 `rpi_usb` 只能断开，达不到复位固件
+        的目的，sysfs 的 `disable` 走的是同一个端口开关，结论相同。
+      - **开机先问 hub 能不能切电**（新增）：`usb::port_power` 读 hub 自己的类描述符
+        （`wHubCharacteristics` 低两位，`GET_DESCRIPTOR`；sysfs 里没有这个信息），
+        `restart::check_usb_power` 在每次 connect 时给结论：`no power switching` 就当场
+        告警 + 通过 `Printer::override_config` 改成 `command`，**不**去切那次没用的电；
+        `ganged` 只告一句（整颗 hub 的口会一起断）；读不到描述符（打不开 hub 节点）就不下结论，
+        回到“试一次再验”。本机实测：根 hub `1d6b:0002` 报 `0x000a`（no power switching），
+        脚本现在也会按 hub 报这件事。
+      - **每次 `rpi_usb` 复位后验一遍**（新增）：板子真重启的话，固件会从新会话开始（序号重新数）
+        而且**不带配置**（配置在 RAM）。所以两条路都能诈出来：握手失败且首帧序号对不上
+        （`Mcu` 接收任务记下“上一条会话”，`Mcu::connect` 报 `McuError::OldSession`）、或握手
+        成功但第一个 `get_config` 就发现固件已配置或已停机（`Configured::already_running`）。
+        任一条命中就告一条警，
+        并通过 `Printer::override_config` 把这个 MCU 的 `restart_method` 在**内存里**改成
+        `command`（重启时重读同一份内存配置，所以覆盖存在机器上；`printer.cfg` 不动）。
+        本机验证：固件停在旧会话时启动错误从一句超时变成
+        “the firmware answered from an older session (timeout: …)”；同一连接的 `Seq mismatch`
+        现在只告警一次（以前一帧一条）。
+      - 它仍接管不了**还在跑**的板子（`command` 的 `config_reset` 得先连上），另开一条：
+        [D3](#d3-command-接管一块还在跑的板子)。
       注：“上电复位前不许 configure”（`:696`）在我们的“先复位、再 open、再 configure”
       顺序下天然成立。
       待真板确认：树莓派 5 的板载 hub 自称 per-port、实为 ganged，只切一个端口切不掉 VBUS，
@@ -378,6 +416,32 @@ DTR”隐式满足，但那是驱动副作用，不算实现。**
       但 `gcode/subscribe_output` 的处理器挂在被重建的 `GCodeDispatch` 上，重启后静默失效，
       要客户端重新订阅。上游靠 socket 重绑让客户端重连、重订阅；我们要么在客户端收到
       `klippy:ready` 后重订阅，要么把输出订阅表移到连接上。
+
+### D3 `command` 接管一块还在跑的板子
+
+**为什么**：`rpi_usb` 切不了 VBUS 的机器（根 hub 报 `no power switching`，或板子自带电源）上，
+klipperx 现在会当场回退到 `command`（`mcu/object.rs`）。但 `command` 目前**接管不了一块还在跑的
+板子**：`config_reset` 要连接上才能发，而重连时对手的序号接着上一条会话走，我们只收
+`seq` / `seq+1`（`mcu/mod.rs` 的接收任务），于是只告警丢弃 → identify 超时。结果是那次回退只是
+不再白切电，板子仍得物理复位。
+
+**上游是怎么做的**（`klippy/chelper/serialqueue.c`，值得照着抄）：
+
+- 序号是**线上共享**的：固件 `src/command.c` 用一个 `next_sequence` 既盖自己发出的帧、也校验收到
+  的帧；对不上的帧回 NAK，而 NAK 帧**带着它自己的 `next_sequence`**。
+- 所以上游主机把收到的序号**当成对齐依据**：`handle_message()` 按前向差值算 `rseq`，且
+  `receive_seq == 1`（首帧）时不走“ack for unsent”那条拒绝 → 首帧一律接受，
+  `update_receive_seq()` 顺手把 `send_seq` 对齐到那条会话；握手请求在下一次重传里用对齐后的
+  序号发出。
+- 重传是前提：`SQPT_RETRANSMIT` 定时器 + 窗口（`MAX_PENDING_BLOCKS`）在 NAK/超时后重发同一块。
+  我们的传输是“一次一块、不重传”，所以这块要先定形状：要么加最小重传（首帧对齐 + 同块重发），
+  要么只给 `Mcu::connect` 的握手加一次“按 NAK 序号重试”。
+
+**验收**：一块停在旧会话的板子（现在报
+`Connection: the firmware answered from an older session …`）应当能在不改 `restart_method` 的情况下
+连上；这样 `firmware_restart` 在那台根 hub 机器上也不再需要手动复位。另注：`command` 现在走的是
+`config_reset`（清配置），上游还会优先用固件的 `reset` 命令（真重启 MCU，`HF_IN_SHUTDOWN`），
+那一条在 B2 的剩余里。
 
 ### E1 文档
 

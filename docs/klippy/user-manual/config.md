@@ -188,7 +188,12 @@ scripts/klipperx-usb-udev.sh --install
 
 脚本从每个设备的 sysfs 拓扑找到背后的 hub，按 hub 的 `idVendor`/`idProduct` 各出两条规则
 （一条管 `/dev/bus/usb` 节点，给控制传输；一条 `RUN+=` chmod，给 sysfs 端口开关），同一颗
-hub 只出一份。
+hub 只出一份。规则上面还会写一段这颗 hub 的**端口供电能力**（就是上面那个
+`wHubCharacteristics`）：`per-port` 是能用的那种，`ganged` 会连带整颗 hub 的口，
+`no power switching` 则直接告诉你这套规则在这颗 hub 上达不到目的——只断开、不下电，请改用
+`restart_method: command` 或给板子真断电（同一句也会打到 stderr）。读不到描述符时（普通用户
+打不开 hub 的 `/dev/bus/usb` 节点，`lsusb` 也读不了）就写“unknown”并给出确认命令：
+`sudo lsusb -v -s <bus>:<dev> | grep -i -A2 wHubCharacteristic`。
 
 装完确认该 hub 节点对运行 klipperx 的用户可写：
 
@@ -200,11 +205,35 @@ ls -l /dev/bus/usb/001/001
 
 规则里的 `idVendor`/`idProduct` 必须是 **USB hub** 的，不是 MCU 的。用 `lsusb` 很容易先看到 MCU 那行——Klipper 固件给它自己的设备 id 是 `1d50:614e`（串口）、`1d50:606f`（CAN）——**把它写进规则没有用**，因为控制传输发给 hub。
 
+多层 hub（扩展坞串扩展坞那种）时取的是**紧邻 MCU 的那一颗**：脚本与 `resolve_tty_port` 都只从设备目录上溯一级（`dirname` / `parent()`）。端口供电开关在父 hub 的端口上，控制传输也发给父 hub，所以只有这一层对；根 hub 与中间层 hub 都不进规则，也不会被授权。反过来，规则只按 `vid:pid` 认 hub，所以串/并挂了几颗**同型号** hub 时一条规则会同时命中它们（授权范围比预期大），也没法只针对其中某一颗。
+
 而 hub 能不能切电，**与 id 无关**：
 
 - 能力写在 hub 描述符的 `wHubCharacteristics` 低两位：`0x0008` = ganged（整组一起）、`0x0009` = per-port（逐口）、`0x000a` = 不支持。用 `lsusb -v` 看 `wHubCharacteristic`，或直接跑 `uhubctl`（它按这个能力筛）。
 - 所以**没有“按 id 判断”的规律**——同一个型号不同批次都可能不同（uhubctl 清单里就有 “rev A,C,F 不支持” 这种注记）。
 - 唯一稳的规律是**根 hub**：`1d6b:0001`(1.1) / `1d6b:0002`(2.0) / `1d6b:0003`(3.0)，那是内核给根 hub 的 id。板载 hub 常在其中的，但同样要看能力，不能只看 id。
+
+MCU **直接插在根 hub 上**（机器面板上的普通 USB 口）也支持：控制传输照样发给根 hub。但根 hub 大多数是 `lpsm=2`（不支持供电切换——实测 AMD xHCI 报 `wHubCharacteristics=0x000a`），`CLEAR_FEATURE(PORT_POWER)` 只会让这个设备**断开并重新枚举**（`devnum` 变了、`/dev/ttyACM*` 与 sysfs 都在，内核在端口关着时不拆设备），VBUS 其实没断：板子固件一路照跑，它的 4 位协议序号接着上一条会话往下走，重连的主机从 0 开始就对不上（`Seq mismatch` → identify 超时 → `state: shutdown`）。这种机器上 `rpi_usb` 达不到目的，只能真的断电重来（拔 USB，或按板子的复位；板子由自己电源供电时拔 USB 连断电都算不上）。sysfs 那条 `disable` 走的是同一个端口开关，结论一样。
+
+**开机时先问 hub 自己**：`rpi_usb` 一被配置上（每次连 MCU 时）klipperx 就读一次这颗 hub 的
+`wHubCharacteristics`（`GET_DESCRIPTOR` 要 hub 自己的类描述符，sysfs 里没有）。低两位说
+`no power switching` 的话，这台的端口开关**只是断开、切不掉 VBUS**，于是当场告警并把这个 MCU
+的 `restart_method` 在内存里改成 `command`——连那一次白断开都不做。脚本也按 hub 报同一件事
+（读不到时给出确认命令，见下），装规则前就能看出来。
+
+**每次 `rpi_usb` 复位之后 klipperx 还会再验一遍**这个前提：重连上来的固件必须是刚开机的
+（它自己报的会话序号从头开始，而且还没有配置——配置在 RAM 里，重启就没了）。如果它从
+上一条会话接着答，或者还带着上次的配置，那就说明这次只断开了、没复位，于是：
+
+- 打**一条**告警，说清看到的是什么，并提示只有真断电才能复位；
+- 把这个 MCU 的 `restart_method` 在**内存里**改成 `command`（重新走固件的 `config_reset`），
+  后续的复位不再去切那个不起作用的端口。`printer.cfg` 不动——改文件是人的事，重启进程也
+  还会按文件来。
+
+  注意 `command` 是把配置清掉重发，**不是**把 MCU 复位；而它得先连上才能发。板子若还连着、
+  还在跑（这次的断电没真断），它自己的协议序号会接着上一条会话，主机对不上就接不回来——
+  也就是说这种情况下仍要先把板子断电复位一次，`firmware_restart` 才能继续。让 `command`
+  直接接管运行中的板子还没做（TODO D3）。
 
 `lsusb` 里常见的 hub 厂商 id：
 
@@ -242,14 +271,16 @@ ls /sys/bus/usb/devices/1-2/1-2:1.0/1-2-port1/disable
 
 **要判断它可不可用，别看内核版本号，直接探这个文件：**
 
-- **路径**：从 hub 的接口目录（`<hub>:<cfg>.<if>`）出发，glob `*port<N>/disable`（uhubctl 的规则也用 `$sys$devpath/*port*/disable`）。注意 `/sys/bus/usb/devices/*` 是**符号链接**，`find` 默认不跟进去，要看真实路径 `/sys/devices/...`。
-- **存在 ≠ 能写**：文件默认是 `-rw-r--r-- root:root`，普通用户写不了。而且 udev 的 `MODE=`/`GROUP=` 只作用于 `/dev` 设备节点，**改不了 sysfs 属性**——要给权限必须在 `RUN+=` 里 `chown`/`chmod`。uhubctl 给 6.0+ 的规则就是这段：
+- **路径**：从 hub 的接口目录（`<hub>:<cfg>.<if>`）出发，glob `<hub>-port<N>/disable`（老内核是 `port<N>`，`disable_path` 两种都认）。注意 `/sys/bus/usb/devices/*` 是**符号链接**，`find` 默认不跟进去，要看真实路径 `/sys/devices/...`。
+- **存在 ≠ 能写**：文件默认是 `-rw-r--r-- root:root`，普通用户写不了。而且 udev 的 `MODE=`/`GROUP=` 只作用于 `/dev` 设备节点，**改不了 sysfs 属性**——要给权限必须在 `RUN+=` 里 `chown`/`chmod`。脚本与告警生成的就是这两条：
 
   ```udev
-  SUBSYSTEM=="usb", DRIVER=="hub|usb", \
-    RUN+="/bin/sh -c \"chown -f root:dialout $sys$devpath/*port*/disable || true\"", \
-    RUN+="/bin/sh -c \"chmod -f 660 $sys$devpath/*port*/disable || true\""
+  SUBSYSTEM=="usb", ATTR{idVendor}=="0424", ATTR{idProduct}=="2137", TAG+="uaccess"
+  SUBSYSTEM=="usb", DRIVER=="hub|usb", ATTR{idVendor}=="0424", ATTR{idProduct}=="2137", \
+    RUN+="/bin/sh -c \"chmod -f 660 $sys$devpath/*/*port*/disable || true\""
   ```
+
+  glob 要比 hub **深一层**：`RUN+=` 只在 hub 的**设备**目录上触发（接口目录没有 `idVendor`，带 id 过滤的规则进不去），而端口目录在它的接口目录下。uhubctl 自己的规则字面上与这条相近，但它**不带 id 过滤**、会落到**每个** USB 设备上，于是在每个设备目录里匹配到的是它自己的 `port` 符号链接（正是该设备所占的端口）；照抄那个 glob 再加上 id 过滤，匹配到的就是 hub **上一层**喂它的那个口，根 hub 目录下更是一个都匹配不到（`chmod -f` 静默失败，sysfs 这条路就永远不可写）。
 
 - **存在 ≠ 真断电**：文件对**所有**端口都存在，是否真断 VBUS 取决于 hub 的能力（`wHubCharacteristics` 低两位，见上）。
 

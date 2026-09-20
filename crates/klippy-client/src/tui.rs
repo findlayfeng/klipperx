@@ -672,6 +672,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
 ///
 /// `scroll` is the index of the first entry to show (0 = top).
 /// Lines are collected forward from `scroll` until the pane is full.
+/// If there are not enough entries, empty lines are added to fill the pane.
 fn visible_lines(app: &App, width: usize, height: usize) -> Vec<Line<'static>> {
     let width = width.max(1);
     let mut lines: Vec<Line<'static>> = Vec::new();
@@ -679,13 +680,6 @@ fn visible_lines(app: &App, width: usize, height: usize) -> Vec<Line<'static>> {
     // Start from the scroll index (clamp to valid range)
     let start = app.scroll.min(app.entries.len().saturating_sub(1));
 
-    // Count total messages in the visible range for alternating colours.
-    // We assign indices so the newest visible message gets the highest index
-    // (matches the original bottom-up iteration behavior).
-    let total_messages = app.entries[start..]
-        .iter()
-        .filter(|entry| is_message(entry))
-        .count();
     let mut message_counter = 0;
 
     for entry in &app.entries[start..] {
@@ -715,6 +709,11 @@ fn visible_lines(app: &App, width: usize, height: usize) -> Vec<Line<'static>> {
                 break;
             }
         }
+    }
+
+    // Fill remaining space with empty lines if not enough entries.
+    while lines.len() < height {
+        lines.push(Line::from(Span::raw("")));
     }
 
     lines
@@ -1414,14 +1413,27 @@ mod tests {
         // collecting the pane bottom-up has to preserve.
         let app = app_with(vec![Entry::notice(Notice::Info, "abcdefghij")]);
 
-        assert_eq!(log_text(&app, 4, 4), ["abcd", "efgh", "ij"]);
+        let lines = log_text(&app, 4, 4);
+        // Filter out empty lines (padding) and check the wrapped content.
+        let non_empty: Vec<&str> = lines
+            .iter()
+            .filter(|l| !l.is_empty())
+            .map(|s| s.as_str())
+            .collect();
+        assert_eq!(non_empty, vec!["abcd", "efgh", "ij"]);
     }
 
     #[test]
     fn test_a_multi_line_entry_keeps_its_line_order() {
         let app = app_with(vec![Entry::notice(Notice::Info, "one\ntwo\nthree")]);
 
-        assert_eq!(log_text(&app, 10, 4), ["one", "two", "three"]);
+        let lines = log_text(&app, 10, 4);
+        let non_empty: Vec<&str> = lines
+            .iter()
+            .filter(|l| !l.is_empty())
+            .map(|s| s.as_str())
+            .collect();
+        assert_eq!(non_empty, vec!["one", "two", "three"]);
     }
 
     #[test]
@@ -1431,7 +1443,13 @@ mod tests {
             Entry::notice(Notice::Info, "second"),
         ]);
 
-        assert_eq!(log_text(&app, 10, 4), ["first", "second"]);
+        let lines = log_text(&app, 10, 4);
+        let non_empty: Vec<&str> = lines
+            .iter()
+            .filter(|l| !l.is_empty())
+            .map(|s| s.as_str())
+            .collect();
+        assert_eq!(non_empty, vec!["first", "second"]);
     }
 
     /// A reply with a known shape.

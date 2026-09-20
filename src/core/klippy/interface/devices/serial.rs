@@ -18,9 +18,9 @@
 //!
 //! [`FrameStream`]: crate::core::klippy::frame::FrameStream
 
-use super::error::InterfaceError;
-use super::{describe_frame, Device};
 use crate::core::klippy::frame::{Frame, FrameStream};
+use crate::core::klippy::interface::error::InterfaceError;
+use crate::core::klippy::interface::{describe_frame, Device};
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};

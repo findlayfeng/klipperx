@@ -26,8 +26,8 @@ use tokio::time::Duration;
 use tracing::{info, warn};
 
 use crate::core::klippy::config::mcu::{McuConfig, Transport};
+use crate::core::klippy::interface::devices::serial::ModemLines;
 use crate::core::klippy::interface::error::InterfaceError;
-use crate::core::klippy::interface::serial::ModemLines;
 use crate::core::klippy::interface::usb;
 use crate::core::klippy::mcu::McuRestartMethod;
 
@@ -77,11 +77,46 @@ pub async fn reset_firmware(config: &McuConfig) -> Result<(), String> {
         McuRestartMethod::RpiUsb => match &config.transport {
             Transport::Serial { path, .. } => {
                 warn_untested(config);
-                rpi_usb_reset(path).await
+                rpi_usb_reset(path, config.usb_power).await
             }
             _ => Ok(()),
         },
     }
+}
+
+/// Check, at connect, that `rpi_usb` will be able to switch this port's power.
+///
+/// Runs on every connect rather than only when a restart is requested, so a
+/// missing udev rule is reported at startup — with the rules to install —
+/// instead of at the first `FIRMWARE_RESTART`.
+pub fn check_usb_power(config: &McuConfig) {
+    if config.restart_method != McuRestartMethod::RpiUsb {
+        return;
+    }
+    let Transport::Serial { path, .. } = &config.transport else {
+        return;
+    };
+
+    let error = match usb::resolve_tty_port(Path::new(path)) {
+        Err(err) => err,
+        Ok(port) => match usb::probe(&port, config.usb_power) {
+            Ok(power) => {
+                tracing::debug!(
+                    "MCU '{}' will switch USB port power via {power:?}",
+                    config.name
+                );
+                return;
+            }
+            Err(err) => format!(
+                "{err}\n  install a udev rule, for example:\n    {}",
+                usb::recommended_rules(&port).replace('\n', "\n    ")
+            ),
+        },
+    };
+    warn!(
+        "MCU '{}' may not be able to switch the USB port power (restart_method 'rpi_usb'): {error}",
+        config.name
+    );
 }
 
 /// Report that a reset path has never run against hardware.
@@ -160,15 +195,18 @@ async fn cheetah_reset(path: &str) -> Result<(), String> {
 /// (`klippy/mcu.py:748`).
 ///
 /// Upstream shells out to a compiled `hub-ctrl` with `sudo`; here the port is
-/// read from sysfs and switched with a control transfer (`interface/usb.rs`).
+/// read from sysfs and switched the way `usb_power` asks (`interface/usb.rs`).
 /// The port must be closed, and the caller opens it afterwards.
-async fn rpi_usb_reset(serial_path: &str) -> Result<(), String> {
+async fn rpi_usb_reset(serial_path: &str, method: usb::UsbPowerMethod) -> Result<(), String> {
     let tty = PathBuf::from(serial_path);
     let port = usb::resolve_tty_port(&tty)?;
+    // Resolve the mechanism per reset, so a hub that was replugged (or a udev
+    // rule that only now applies) is picked up again.
+    let power = usb::probe(&port, method)?;
 
-    usb_power(port, false).await?;
+    usb_set_power(&port, &power, false).await?;
     tokio::time::sleep(USB_POWER_OFF).await;
-    usb_power(port, true).await?;
+    usb_set_power(&port, &power, true).await?;
 
     // The kernel needs a moment to enumerate the board again, and the caller is
     // about to open the port.
@@ -176,8 +214,10 @@ async fn rpi_usb_reset(serial_path: &str) -> Result<(), String> {
 }
 
 /// Switch one hub port, off the runtime: `nusb`'s blocking path does the syscalls.
-async fn usb_power(port: usb::UsbPort, on: bool) -> Result<(), String> {
-    tokio::task::spawn_blocking(move || usb::set_port_power(port, on))
+async fn usb_set_power(port: &usb::UsbPort, power: &usb::UsbPower, on: bool) -> Result<(), String> {
+    let port = port.clone();
+    let power = power.clone();
+    tokio::task::spawn_blocking(move || usb::set_port_power(&port, &power, on))
         .await
         .map_err(|e| format!("usb: {e}"))?
 }
@@ -216,6 +256,7 @@ mod tests {
             name: "mcu".to_string(),
             restart_method: method,
             transport: Transport::Test(ConfigValue::Multi(Vec::new())),
+            usb_power: usb::UsbPowerMethod::default(),
         }
     }
 
@@ -229,6 +270,7 @@ mod tests {
                 path: "/dev/not-a-serial-port".to_string(),
                 baud: 250_000,
             },
+            usb_power: usb::UsbPowerMethod::default(),
         }
     }
 

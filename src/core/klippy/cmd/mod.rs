@@ -433,7 +433,7 @@ fn decode_mismatch(parameter: &str, actual: &str, expected: &str) -> McuError {
 mod tests {
     use super::*;
     use crate::core::klippy::frame::Frame;
-    use crate::core::klippy::interface::test::{MappingEntry, TestDevice};
+    use crate::core::klippy::interface::devices::test::{MappingEntry, TestDevice};
     use crate::core::klippy::interface::Interface;
     use crate::core::klippy::mcu::McuCallError;
     use crate::core::klippy::msg::parser::Parser;

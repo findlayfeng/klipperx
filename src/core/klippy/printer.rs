@@ -227,6 +227,10 @@ struct Inner {
     run_result: Option<String>,
     /// Handlers per event, in registration order.
     handlers: HashMap<PrinterEvent, Vec<Arc<dyn Fn() + Send + Sync>>>,
+    /// How many parts the registry held before the config was loaded — the
+    /// host's own (`webhooks`). [`Printer::reset_for_restart`] keeps these and
+    /// drops everything after them.
+    host_objects: Option<usize>,
 }
 
 impl Printer {
@@ -251,6 +255,7 @@ impl Printer {
                 shutdown: false,
                 run_result: None,
                 handlers: HashMap::new(),
+                host_objects: None,
             }),
             exit_requested: Condvar::new(),
             reactor,
@@ -301,6 +306,20 @@ impl Printer {
         }
         objects.push((name.to_string(), object));
         Ok(())
+    }
+
+    /// Remember how many parts the host registered before the config is loaded.
+    ///
+    /// [`Printer::load_config`] calls this first; everything from that index on
+    /// is the config's, and a restart drops it while keeping the host's parts
+    /// (the API server's `webhooks`). Only the first call counts, so reloading
+    /// the config does not move the boundary.
+    pub(crate) fn mark_host_objects(&self) {
+        let base = self.objects.lock().unwrap_or_else(|p| p.into_inner()).len();
+        let mut inner = self.lock();
+        if inner.host_objects.is_none() {
+            inner.host_objects = Some(base);
+        }
     }
 
     /// The names of the registered objects, in registration order.
@@ -472,6 +491,34 @@ impl Printer {
         self.send_event(&PrinterEvent::Disconnect);
 
         result
+    }
+
+    /// Take the machine down so it can be brought up again on the same printer.
+    ///
+    /// Drops every part the config loaded — which shuts their devices down and
+    /// closes them — and keeps the parts the host registered before the config,
+    /// i.e. the API server's `webhooks`. The state goes back to `Startup`, the
+    /// exit request is cleared, and the event handlers are forgotten (the parts
+    /// that registered them are gone). [`Printer::load_config`] +
+    /// [`Printer::bring_up`] + [`Printer::run`] can then run again on the same
+    /// `Arc<Printer>`, which is what keeps the endpoints and any attachment
+    /// valid across a restart.
+    ///
+    /// The reactor and the host's parts are kept: they belong to the process,
+    /// not to the config.
+    pub fn reset_for_restart(&self) {
+        let keep = self.lock().host_objects.unwrap_or(0);
+        self.objects
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .truncate(keep);
+
+        let mut inner = self.lock();
+        inner.message = MESSAGE_STARTUP.to_string();
+        inner.category = PrinterState::Startup;
+        inner.shutdown = false;
+        inner.run_result = None;
+        inner.handlers.clear();
     }
 
     /// Lock the state.
@@ -717,6 +764,54 @@ mod tests {
         printer.request_exit("error_exit");
 
         assert_eq!(printer.run(), "error_exit");
+    }
+
+    #[tokio::test]
+    async fn test_reset_for_restart_keeps_the_hosts_parts_and_drops_the_configs() {
+        let printer = new_printer();
+        // The host registers `webhooks` before the config; the config's parts
+        // come after `mark_host_objects`.
+        printer
+            .add_object("webhooks", Arc::new(Fixed(serde_json::json!({}))))
+            .unwrap();
+        printer.mark_host_objects();
+        printer
+            .add_object("gcode", Arc::new(Fixed(serde_json::json!({}))))
+            .unwrap();
+        printer.bring_up().await;
+        assert_eq!(printer.get_state_message().category, PrinterState::Ready);
+
+        printer.reset_for_restart();
+
+        // The host's part stays, the config's is gone, and the state is back to
+        // `Startup` so the machine can be brought up again.
+        assert_eq!(printer.objects(), ["webhooks"]);
+        let state = printer.get_state_message();
+        assert_eq!(state.category, PrinterState::Startup);
+        assert_eq!(state.message, MESSAGE_STARTUP);
+    }
+
+    #[test]
+    fn test_reset_for_restart_forgets_handlers_and_the_exit_request() {
+        let printer = new_printer();
+        let fired = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&fired);
+        printer.register_event_handler(
+            PrinterEvent::Ready,
+            Box::new(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        printer.request_exit("exit");
+
+        printer.reset_for_restart();
+
+        // The handler was registered by a part that is gone, and the old exit
+        // must not decide the next run.
+        printer.send_event(&PrinterEvent::Ready);
+        printer.request_exit("firmware_restart");
+        assert_eq!(fired.load(Ordering::SeqCst), 0);
+        assert_eq!(printer.run(), "firmware_restart");
     }
 
     #[test]

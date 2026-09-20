@@ -1020,6 +1020,10 @@ fn entry_style(entry: &Entry, message_index: usize) -> Style {
             Style::new().fg(MESSAGE_COLORS[message_index % MESSAGE_COLORS.len()])
         }
         Entry::Log { level, .. } => match level {
+            // Line-by-line detail is the quietest thing in the pane, but it has
+            // to be told apart from `DEBUG`, so it gets a colour of its own
+            // rather than the same dim grey.
+            LogLevel::Trace => Style::new().fg(Color::Blue),
             LogLevel::Debug => Style::new().add_modifier(Modifier::DIM),
             LogLevel::Info => Style::new().fg(Color::DarkGray),
             LogLevel::Warn => Style::new().fg(Color::Yellow),
@@ -2260,5 +2264,24 @@ mod tests {
             joined,
             "▲ shutdown · Internal: Section 'board_pins arduino-standard' is not valid"
         );
+    }
+
+    #[test]
+    fn test_a_trace_line_looks_like_neither_debug_nor_info() {
+        let style = |level| {
+            entry_style(
+                &Entry::Log {
+                    level,
+                    text: String::new(),
+                },
+                0,
+            )
+        };
+
+        // TRACE has a line-by-line noise of its own, and it has to be told apart
+        // from the `DEBUG` chatter beside it — a colour, not the same dim grey.
+        assert_eq!(style(LogLevel::Trace).fg, Some(Color::Blue));
+        assert_ne!(style(LogLevel::Trace), style(LogLevel::Debug));
+        assert_ne!(style(LogLevel::Trace), style(LogLevel::Info));
     }
 }

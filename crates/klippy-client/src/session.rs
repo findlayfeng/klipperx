@@ -41,6 +41,8 @@ use crate::connection::{Connection, Incoming, Reply};
 /// How loud a line from the host's own log is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogLevel {
+    /// Line-by-line detail: the bytes on the wire, and the like.
+    Trace,
     /// Development detail, shown with `--verbose`.
     Debug,
     /// Something happened.
@@ -55,6 +57,7 @@ impl LogLevel {
     /// The tag a front-end shows in front of the line.
     pub fn tag(&self) -> &'static str {
         match self {
+            LogLevel::Trace => "TRACE",
             LogLevel::Debug => "DEBUG",
             LogLevel::Info => "INFO ",
             LogLevel::Warn => "WARN ",

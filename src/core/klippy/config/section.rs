@@ -98,6 +98,66 @@ impl ConfigSection {
     pub fn has(&self, key: &str) -> bool {
         self.parameters.contains_key(key)
     }
+
+    /// The option's text: a `Single` as written, a `Multi` joined with newlines.
+    ///
+    /// This is what upstream's `configparser` hands `getlist`/`getlists`: one
+    /// string, with the newlines of an indented value still in it (the list
+    /// splitter trims them away).
+    pub fn get_text(&self, key: &str) -> Option<String> {
+        self.parameters.get(key).map(ConfigValue::as_str)
+    }
+
+    /// Upstream's `getlist`: split on `sep`, trim each item, drop the empty ones.
+    ///
+    /// Returns `None` when the option is absent, which is how a caller tells
+    /// "not set" from "set to an empty list".
+    pub fn get_list(&self, option: &str, sep: char) -> Option<Vec<String>> {
+        self.get_text(option).map(|text| split_list(&text, sep))
+    }
+
+    /// Upstream's `getlists` with two separators: groups separated by `outer`,
+    /// each group split by `inner`, with exactly `count` items per group.
+    ///
+    /// This is the shape `[board_pins]` uses (`seps=('=', ',')`): `A=PA0,
+    /// B=PA1` is two groups of two. A missing option yields an empty vector, so
+    /// the caller can treat "not set" and "set to nothing" alike.
+    ///
+    /// # Errors
+    /// Returns a config-error message when a group does not have `count`
+    /// elements, mirroring upstream's `must have N elements`.
+    pub fn get_list_of_lists(
+        &self,
+        option: &str,
+        outer: char,
+        inner: char,
+        count: usize,
+    ) -> Result<Vec<Vec<String>>, String> {
+        let Some(text) = self.get_text(option) else {
+            return Ok(Vec::new());
+        };
+        let mut groups = Vec::new();
+        for group in split_list(&text, outer) {
+            let items = split_list(&group, inner);
+            if items.len() != count {
+                return Err(format!(
+                    "Option '{option}' in section '{}' must have {count} elements",
+                    self.identifier()
+                ));
+            }
+            groups.push(items);
+        }
+        Ok(groups)
+    }
+}
+
+/// Split `text` on `sep` into trimmed, non-empty items.
+fn split_list(text: &str, sep: char) -> Vec<String> {
+    text.split(sep)
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 #[cfg(test)]
@@ -154,5 +214,77 @@ mod tests {
             map.iter_by_id().filter(|s| s.id == "stepper_x").collect();
         assert_eq!(stepper_x.len(), 2);
         assert_eq!(map.iter_by_id().count(), 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // get_list / get_list_of_lists
+    // -----------------------------------------------------------------------
+
+    fn with(mut section: ConfigSection, key: &str, value: &str) -> ConfigSection {
+        section
+            .parameters
+            .insert(key.to_string(), ConfigValue::Single(value.to_string()));
+        section
+    }
+
+    #[test]
+    fn get_list_trims_and_drops_empty_items() {
+        let section = with(section("board_pins", None), "mcu", " mcu , zboard ,");
+
+        assert_eq!(
+            section.get_list("mcu", ','),
+            Some(vec!["mcu".to_string(), "zboard".to_string()])
+        );
+    }
+
+    #[test]
+    fn get_list_joins_multiline_values() {
+        let mut section = section("board_pins", None);
+        section.parameters.insert(
+            "mcu".to_string(),
+            ConfigValue::Multi(vec!["mcu,".to_string(), "zboard".to_string()]),
+        );
+
+        assert_eq!(
+            section.get_list("mcu", ','),
+            Some(vec!["mcu".to_string(), "zboard".to_string()])
+        );
+    }
+
+    #[test]
+    fn get_list_reports_a_missing_option() {
+        assert_eq!(section("board_pins", None).get_list("mcu", ','), None);
+    }
+
+    #[test]
+    fn get_list_of_lists_parses_name_value_pairs() {
+        let section = with(
+            section("board_pins", None),
+            "aliases",
+            "EXP1_1=PA0, EXP1_2=PA1,\n  EXP1_3=<GND>",
+        );
+
+        assert_eq!(
+            section.get_list_of_lists("aliases", ',', '=', 2).unwrap(),
+            vec![
+                vec!["EXP1_1".to_string(), "PA0".to_string()],
+                vec!["EXP1_2".to_string(), "PA1".to_string()],
+                vec!["EXP1_3".to_string(), "<GND>".to_string()],
+            ]
+        );
+    }
+
+    #[test]
+    fn get_list_of_lists_reports_a_wrong_item_count() {
+        let section = with(section("board_pins", None), "aliases", "EXP1_1=PA0=PB0");
+
+        let err = section
+            .get_list_of_lists("aliases", ',', '=', 2)
+            .unwrap_err();
+
+        assert_eq!(
+            err,
+            "Option 'aliases' in section 'board_pins' must have 2 elements"
+        );
     }
 }

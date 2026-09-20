@@ -34,6 +34,9 @@ use std::sync::Arc;
 
 use crate::core::klippy::config::{Config, ConfigSection};
 use crate::core::klippy::error::KlippyError;
+use crate::core::klippy::extras::board_pins::{
+    load_config as load_board_pins, load_config_prefix as load_board_pins_prefix,
+};
 use crate::core::klippy::extras::output_pin::load_config_prefix as load_output_pin;
 use crate::core::klippy::gcode::{GCodeDispatch, GCODE_OBJECT};
 use crate::core::klippy::mcu::{load_config as load_mcu, load_config_prefix as load_mcu_prefix};
@@ -76,6 +79,13 @@ const FACTORIES: &[(&str, Factories)] = &[
         Factories {
             load_config: None,
             load_config_prefix: Some(load_output_pin),
+        },
+    ),
+    (
+        "board_pins",
+        Factories {
+            load_config: Some(load_board_pins),
+            load_config_prefix: Some(load_board_pins_prefix),
         },
     ),
 ];
@@ -324,6 +334,23 @@ mod tests {
         assert_eq!(
             printer.objects(),
             ["gcode", "pins", "mcu", "output_pin fan"]
+        );
+    }
+
+    #[test]
+    fn test_a_board_pins_section_is_claimed_by_its_factory() {
+        // `[board_pins]` is both a main and a prefix section. It registers no
+        // resource, only aliases the pin names used by later sections.
+        let (printer, result) = load(
+            "[mcu]\nserial: /dev/a\n\
+             [board_pins]\naliases:\n    EXP1=PA0, EXP2=PA1\n\
+             [board_pins second]\nmcu: mcu\naliases: EXP3=PA2\n",
+        );
+
+        result.unwrap();
+        assert_eq!(
+            printer.objects(),
+            ["gcode", "pins", "mcu", "board_pins", "board_pins second"]
         );
     }
 }

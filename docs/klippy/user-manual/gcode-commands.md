@@ -187,17 +187,17 @@ STATUS
 ### SET_PIN — 设置引脚状态
 
 ```
-SET_PIN PIN=<name> VALUE=<0|1>
+SET_PIN PIN=<name> VALUE=<0..1>
 ```
 
-设置已配置的 `output_pin` 引脚的输出值。该命令是一个**多路命令**（mux command），每个 `[output_pin <name>]` 配置节会自动注册一个值。
+设置已配置的 `output_pin` 引脚的值。该命令是一个**多路命令**（mux command），每个 `[output_pin <name>]` 配置节会自动注册一个值。
 
 **参数：**
 
 | 参数 | 类型 | 必需 | 说明 |
 |------|------|------|------|
 | `PIN` | 字符串 | 是 | 引脚名称，对应 `[output_pin <name>]` 中的 `<name>` |
-| `VALUE` | 0 或 1 | 是 | 输出电平（0 = 低电平，1 = 高电平） |
+| `VALUE` | 0.0 ~ 1.0 | 是 | 输出值。数字输出：`>= 0.5` 为高电平；PWM（`pwm: true`）：作为占空比 |
 
 **前提条件：** 配置文件中需定义至少一个 `[output_pin <name>]` 节，例如：
 
@@ -206,12 +206,18 @@ SET_PIN PIN=<name> VALUE=<0|1>
 pin: PA0
 value: 0
 shutdown_value: 0
+
+[output_pin pwm_fan]
+pin: PA1
+pwm: true
+cycle_time: 0.02
 ```
 
 **示例：**
 ```
-SET_PIN PIN=my_fan VALUE=1
-SET_PIN PIN=my_fan VALUE=0
+SET_PIN PIN=my_fan VALUE=1      ; 数字输出：打开
+SET_PIN PIN=my_fan VALUE=0      ; 数字输出：关闭
+SET_PIN PIN=pwm_fan VALUE=0.25  ; PWM：25% 占空比
 ```
 
 **错误处理：** 如果指定的 PIN 值未注册，会返回可用选项列表：

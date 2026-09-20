@@ -24,7 +24,7 @@ mod dictionary;
 mod error;
 mod object;
 mod pending;
-mod pin;
+mod resource;
 mod restart;
 mod restart_method;
 
@@ -32,7 +32,7 @@ pub use config::{BuiltConfig, ConfigBuilder, ConfigCallback, Configured, PostIni
 pub use dictionary::{Dictionary, Enumeration, MessageDef, OutputDef};
 pub use error::{McuCallError, McuError};
 pub use object::{load_config, load_config_prefix, McuObject};
-pub use pin::{McuChip, McuDigitalOut};
+pub use resource::{McuAdc, McuChip, McuDigitalOut, McuPwm};
 pub use restart_method::McuRestartMethod;
 
 use crate::core::klippy::frame::{Frame, MESSAGE_PAYLOAD_MAX};
@@ -46,6 +46,7 @@ use crate::core::klippy::msg::Msg;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Instant;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{sleep, Duration};
 use tracing::{debug, error, info, warn};
@@ -103,6 +104,11 @@ pub struct Mcu {
     /// number the next block carries, and whether the connection had to take over a
     /// session that was already running (see [`Wire`]).
     wire: Arc<Wire>,
+    /// A base point for estimating the firmware's free-running clock: the host
+    /// instant the clock was read, paired with the reading. See
+    /// [`Mcu::estimated_clock`]; `None` until something seeds it (the MCU
+    /// object does, right after identify).
+    clock_base: StdMutex<Option<(Instant, u64)>>,
     /// Handle to the receive task, used to abort it on drop.
     recv_handle: Option<tokio::task::JoinHandle<()>>,
 }
@@ -608,6 +614,7 @@ impl Mcu {
             pending_calls,
             interface,
             wire,
+            clock_base: StdMutex::new(None),
             recv_handle: Some(recv_handle),
         }
     }
@@ -745,6 +752,34 @@ impl Mcu {
     pub fn seconds_to_clock(&self, seconds: f64) -> Result<u64, McuError> {
         let freq = self.clock_freq()?;
         Ok((seconds * freq).max(0.0) as u64)
+    }
+
+    /// Record the firmware clock read at this moment, so [`Mcu::estimated_clock`]
+    /// can extrapolate from it.
+    ///
+    /// This is the smallest useful piece of upstream's clock sync: one read at
+    /// connect, then host time. It is enough to answer "what clock is it about
+    /// now", which is what an unclocked resource needs for an immediate update
+    /// and what a periodic query needs for a first sample time. It does not
+    /// track drift, and there is no print time — that is the motion layer's
+    /// (TODO C1).
+    pub fn set_clock_base(&self, clock64: u64) {
+        *self.clock_base.lock().expect("clock base lock poisoned") =
+            Some((Instant::now(), clock64));
+    }
+
+    /// The firmware clock, extrapolated from the last [`Mcu::set_clock_base`].
+    ///
+    /// Returns `None` before a base has been recorded, or if the firmware
+    /// frequency is unknown. The value is 64-bit; a clocked command carries its
+    /// low word. Clocked commands do not advance it (this is not a scheduler), so
+    /// two calls close together agree.
+    pub fn estimated_clock(&self) -> Option<u64> {
+        let (base_instant, base_clock) =
+            (*self.clock_base.lock().expect("clock base lock poisoned"))?;
+        let freq = self.clock_freq().ok()?;
+        let elapsed = base_instant.elapsed().as_secs_f64() * freq;
+        Some(base_clock + elapsed as u64)
     }
 
     /// Encode a command without sending it.

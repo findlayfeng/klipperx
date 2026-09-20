@@ -6,4 +6,5 @@
 //! loader reaches them through its factory table (`load.rs`), so the core never
 //! imports them.
 
+pub mod board_pins;
 pub mod output_pin;

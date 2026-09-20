@@ -60,16 +60,20 @@
 //! [`Mcu::connect`](crate::core::klippy::mcu::Mcu::connect) — so several modules
 //! can use one MCU, and dropping the last handle shuts the device down.
 
+pub mod adc;
 pub mod allocate_oids;
 pub mod clock;
 pub mod config;
 pub mod gpio;
 pub mod identify;
+pub mod pwm;
 pub mod shutdown;
 pub mod uptime;
 
+pub use adc::{AnalogInState, AnalogInStateOld, ConfigAnalogIn, QueryAnalogIn, QueryAnalogInOld};
 pub use clock::{ClockState, ClockSync, GetClock, McuClock};
 pub use gpio::{ConfigDigitalOut, QueueDigitalOut, SetDigitalOutPwmCycle, UpdateDigitalOut};
+pub use pwm::{ConfigPwmOut, QueuePwmOut};
 
 use crate::core::klippy::mcu::{Dictionary, Enumeration, Mcu, McuError};
 use crate::core::klippy::msg::proto::{ArgType, ArgValue};

@@ -227,7 +227,7 @@ MCU 'mcu' is configured with CRC 0x…, the host computed 0x…
 
 没有 `config_reset` 的固件不再只能报错：如果它声明了 `reset`，`handshake` 返回 `McuError::ResetRequired`，`McuObject::connect` 就发 `reset`、重开连接、用同一份 `BuiltConfig` 重跑握手（`mcu/config.rs`、`mcu/object.rs`）。`reset` 重启 MCU（native USB 的板子会重新枚举），所以不能像 `config_reset` 那样就地做完；真板未验，与 arduino / cheetah / rpi_usb 一样只报“未测试”。两者都没有的固件仍然报错，提示断电。上游在没有重启 helper 可用时（如 `start_reason == 'firmware_restart'`）同样是直接 raise。
 
-### 对 F2（pin 解析）的约束
+### 对 pin 解析（F2，已实现）的约束
 
 因为哈希的是**编码后的字节**，pin 的枚举名（`PA1`）必须在编码时解析成编号，所以顺序和上游相反：
 
@@ -236,7 +236,7 @@ MCU 'mcu' is configured with CRC 0x…, the host computed 0x…
 
 后果：
 
-1. F2 的 `PinResolver`（别名、`RESERVE_PINS_*` / `BUS_PINS_*`、重复使用检查）必须在**加入命令之前**作用于参数，而不是像上游那样在 finalize 时改写文本。非法引脚名 / 被保留引脚的错误会在**建配置时**就报出来。
+1. `PinResolver`（别名、`RESERVE_PINS_*` / `BUS_PINS_*`、重复使用检查）必须在**加入命令之前**作用于参数，而不是像上游那样在 finalize 时改写文本。非法引脚名 / 被保留引脚的错误会在**建配置时**就报出来。
 2. 哈希天然覆盖**解析后的编号**，所以「换别名」不触发重配（见上表）。
 
 ### 可选加固
@@ -255,7 +255,7 @@ MCU 'mcu' is configured with CRC 0x…, the host computed 0x…
 | `_connect`（两段式） | `:1047-1085` | `configure` |
 | `seconds_to_clock` | `:1140` | `Mcu::seconds_to_clock` |
 | `request_move_queue_slot` | `:1142` | `ConfigBuilder::request_move_queue_slot` |
-| `get_query_slot` | `:1136` | **未做**（见下） |
+| `get_query_slot` | `:1136` | `ConfigBuilder::get_query_slot`（用 `Mcu::estimated_clock`，见下） |
 | — | `src/basecmd.c:235` | `AllocateOids`（`cmd/allocate_oids.rs`） |
 | — | `src/basecmd.c:250` | `GetConfig` / `ConfigState`（`cmd/config.rs`） |
 | — | `src/basecmd.c:258` | `FinalizeConfig`（`cmd/config.rs`） |
@@ -263,8 +263,8 @@ MCU 'mcu' is configured with CRC 0x…, the host computed 0x…
 
 ## 还没有的
 
-- **pin 名改写**：F2 的 `PinResolver`。见上一节对 F2 的约束。
-- **`get_query_slot`**：它把周期查询排到一个绝对的 print-time 时钟上（`:1136`），需要时钟/运动层；由它的消费者（ADC、endstop）带进来。
+- **pin 名改写**：已完成（F2）。`PinResolver` 在资源**加入命令之前**把别名/保留作用于参数，与上游“finalize 时改写文本”顺序相反，原因见上一节。`[board_pins]` 是它的装载入口（`extras/board_pins.rs`）。
+- **`get_query_slot`**：已完成。`ConfigBuilder::get_query_slot` 返回 `现在的估计时钟 + 1.5 s + oid*0.01 s`；它用 `Mcu::estimated_clock`——connect 时一次 `get_uptime` 加上主机时间外推的最小估计，不跟踪漂移、也没有 print time（那是运动层 C1 的事）。没有 `get_uptime` 的固件拿不到估计，`get_query_slot` 报 `McuError::Config`。
 - **固件复位（`config_reset` / `reset`）**：已完成。`config_reset` 就地清；只有 `reset` 的固件发 `reset` + 重连 + 重试握手；两者都没有才报错。
 - **`rpi_usb` 的两处连接期门控**：串口不在先上电、未配置先断电再配置（`klippy/mcu.py:692-700`），属重启循环（TODO D2）。
 - **CRC 不匹配时的进程重启**：仍属于重启循环（D2）。`McuConfig.restart_method` 已被读取：`McuObject::connect` 用它挑 `command` 的 `reset`，`McuConfig::open` 用它给 cheetah 定 RTS，物理分派在 `mcu/restart.rs`。

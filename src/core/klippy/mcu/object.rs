@@ -30,6 +30,7 @@ use serde_json::{json, Map, Value};
 use tracing::{info, warn};
 
 use crate::core::klippy::cmd::config::Reset;
+use crate::core::klippy::cmd::uptime::{GetUptime, Uptime};
 use crate::core::klippy::cmd::McuCommand;
 use crate::core::klippy::config::mcu::McuConfig;
 use crate::core::klippy::config::value::ConfigValue;
@@ -53,13 +54,19 @@ const RECONNECT_ATTEMPTS: usize = 20;
 /// rebooted board takes the transport with it.
 const RESET_FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// How long the one `get_uptime` that seeds the clock estimate may take.
+///
+/// The same order as the other connect-time reads; a firmware that does not
+/// answer only loses the estimate, not the connection.
+const CLOCK_BASE_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// The printer object for one `[mcu]` / `[mcu <name>]` section.
 pub struct McuObject {
     /// The section as parsed, kept whole so the device is only opened at
     /// connect time.
     section: ConfigSection,
     /// This MCU as a pin chip: its name, its configuration builder, and the
-    /// slot resources use to reach the device once it connects (`mcu/pin.rs`).
+    /// slot resources use to reach the device once it connects (`mcu/resource/pin.rs`).
     ///
     /// Built at construction, not at connect, because resources add their
     /// `config_*` commands while the config file is being loaded — long before
@@ -179,6 +186,8 @@ impl McuObject {
             match Mcu::connect(&config.name, interface).await {
                 Ok(mcu) => {
                     self.chip.attach(Arc::clone(&mcu));
+                    // A fresh connection has a fresh clock; re-seed the estimate.
+                    seed_clock_base(&mcu).await;
                     return Ok(mcu);
                 }
                 Err(err) => last = err.to_string(),
@@ -337,6 +346,10 @@ impl PrinterObject for McuObject {
             // Make the device reachable by resources before the configuration
             // is built; a resource's runtime methods need it.
             self.chip.attach(Arc::clone(&mcu));
+            // One clock read, so an unclocked resource can estimate "now"
+            // (`Mcu::estimated_clock`). A firmware without `get_uptime` simply
+            // has no estimate.
+            seed_clock_base(&mcu).await;
             // Identify installed the dictionary; reserve the pins the firmware
             // owns before anything resolves one.
             self.reserve_pins(&mcu)
@@ -428,6 +441,30 @@ async fn reset_and_flush(mcu: &Mcu) -> Result<(), KlippyError> {
         .map_err(|err| KlippyError::Internal(err.to_string()))?;
     let _ = mcu.flush(RESET_FLUSH_TIMEOUT).await;
     Ok(())
+}
+
+/// Seed the firmware-clock estimate from one `get_uptime`.
+///
+/// Upstream's clock sync reads the clock at connect too
+/// (`MCUConnectHelper._attach` → `clocksync.connect`); this host keeps only the
+/// base point, for resources that need a "now" clock before a print-time layer
+/// exists (TODO C1). The 64-bit `get_uptime` is used rather than `get_clock`
+/// because the 32-bit counter wraps every few minutes at a typical
+/// `CLOCK_FREQ`. A firmware that does not publish it simply has no estimate.
+async fn seed_clock_base(mcu: &Mcu) {
+    if !mcu.has_message(GetUptime::NAME) {
+        return;
+    }
+    match mcu
+        .call_msg::<GetUptime, Uptime>(&GetUptime, CLOCK_BASE_TIMEOUT)
+        .await
+    {
+        Ok(uptime) => mcu.set_clock_base(uptime.clock64()),
+        Err(err) => warn!(
+            "MCU '{}': could not read the clock for a time estimate: {err}",
+            mcu.name()
+        ),
+    }
 }
 
 /// Log a firmware stop and put the machine into its shutdown state.

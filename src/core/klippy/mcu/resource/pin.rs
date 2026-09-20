@@ -21,15 +21,19 @@
 
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
+use super::adc::{AdcRegistry, McuAdc};
+use super::pwm::McuPwm;
 use crate::core::klippy::cmd::gpio::{ConfigDigitalOut, QueueDigitalOut, UpdateDigitalOut};
 use crate::core::klippy::cmd::McuCommand;
 use crate::core::klippy::mcu::{ConfigBuilder, Mcu, McuError};
-use crate::core::klippy::pins::{DigitalOut, PinChip, PinError, PinParams, PrinterPins};
+use crate::core::klippy::pins::{
+    Adc, DigitalOut, PinChip, PinError, PinParams, PrinterPins, PwmOut,
+};
 
 /// The furthest a scheduled change may be from now, in clock ticks. Upstream's
 /// `MAX_SCHEDULE_TICKS` (`klippy/mcu.py:16`), used to reject a `max_duration`
 /// the firmware's scheduler cannot represent.
-const MAX_SCHEDULE_TICKS: u64 = (1 << 31) - 1;
+pub(crate) const MAX_SCHEDULE_TICKS: u64 = (1 << 31) - 1;
 
 /// The default `max_duration`, in seconds (`klippy/mcu.py:415`).
 const DEFAULT_MAX_DURATION: f64 = 2.0;
@@ -52,6 +56,9 @@ pub struct McuChip {
     pins: Weak<PrinterPins>,
     /// The connected transport, once [`McuChip::attach`] has run.
     mcu: Arc<Mutex<Option<Arc<Mcu>>>>,
+    /// Routes `analog_in_state` reports to the input each `oid` belongs to.
+    /// Shared by every ADC on this chip.
+    adc_registry: Arc<AdcRegistry>,
 }
 
 impl McuChip {
@@ -62,6 +69,7 @@ impl McuChip {
             config,
             pins: Arc::downgrade(&pins),
             mcu: Arc::new(Mutex::new(None)),
+            adc_registry: Arc::new(AdcRegistry::new()),
         }
     }
 
@@ -103,6 +111,77 @@ impl McuChip {
         self.pins().resolve_pin(&self.name, name)
     }
 
+    /// Resolve a bus name against the firmware's enumeration and reserve the
+    /// pins the firmware speaks for (`BUS_PINS_<bus>`).
+    ///
+    /// Upstream's `resolve_bus_name` (`klippy/extras/bus.py:9-32`). `param` is
+    /// the enumeration the caller asked for (`spi_bus`, `i2c_bus`); the firmware
+    /// may instead publish a single generic `bus` enumeration. `bus` is what the
+    /// config said, or `None` to use the bus the firmware names `0`.
+    ///
+    /// A firmware with no such enumeration has no bus names to check: the
+    /// config's value is returned unchanged, or `"0"` when it left the option
+    /// out. This is the SPI/I2C layer's helper for F6/F7 — it is here because
+    /// reservations are the pin layer's business.
+    ///
+    /// # Errors
+    /// Returns [`PinError::MustSpecifyBus`] when the bus was left out but the
+    /// firmware does not name bus 0, and [`PinError::UnknownBus`] for a name the
+    /// enumeration does not have.
+    pub fn resolve_bus_name(
+        &self,
+        mcu: &Mcu,
+        param: &str,
+        bus: Option<&str>,
+    ) -> Result<String, PinError> {
+        let dictionary = mcu.dictionary();
+        let enums = dictionary
+            .as_ref()
+            .and_then(|dictionary| dictionary.enumeration(param))
+            .or_else(|| {
+                dictionary
+                    .as_ref()
+                    .and_then(|dictionary| dictionary.enumeration("bus"))
+            });
+        let Some(enums) = enums else {
+            // No bus enumeration: nothing to validate against, so pass the
+            // caller's choice through (upstream returns the value as-is).
+            return Ok(bus.unwrap_or("0").to_string());
+        };
+
+        let bus = match bus {
+            Some(bus) => {
+                if enums.value(bus).is_none() {
+                    return Err(PinError::UnknownBus {
+                        param: param.to_string(),
+                        bus: bus.to_string(),
+                    });
+                }
+                bus.to_string()
+            }
+            None => enums
+                .name(0)
+                .map(str::to_string)
+                .ok_or_else(|| PinError::MustSpecifyBus {
+                    param: param.to_string(),
+                    chip: self.name.clone(),
+                })?,
+        };
+
+        // The firmware marks the pins a bus owns; reserve them so a config that
+        // also drives one fails instead of silently stealing it.
+        if let Some(pins) = dictionary
+            .as_ref()
+            .and_then(|dictionary| dictionary.constant(&format!("BUS_PINS_{bus}")))
+            .and_then(|value| value.as_str())
+        {
+            for pin in pins.split(',') {
+                self.pins().reserve_pin(&self.name, pin, &bus)?;
+            }
+        }
+        Ok(bus)
+    }
+
     fn lock(&self) -> MutexGuard<'_, Option<Arc<Mcu>>> {
         self.mcu.lock().unwrap_or_else(|poison| poison.into_inner())
     }
@@ -115,6 +194,26 @@ impl PinChip for McuChip {
             self.pins(),
             self.name.clone(),
             Arc::clone(&self.mcu),
+            params.clone(),
+        )))
+    }
+
+    fn setup_pwm(&self, params: &PinParams) -> Result<Arc<dyn PwmOut>, PinError> {
+        Ok(Arc::new(McuPwm::new(
+            Arc::clone(&self.config),
+            self.pins(),
+            self.name.clone(),
+            Arc::clone(&self.mcu),
+            params.clone(),
+        )))
+    }
+
+    fn setup_adc(&self, params: &PinParams) -> Result<Arc<dyn Adc>, PinError> {
+        Ok(Arc::new(McuAdc::new(
+            Arc::clone(&self.config),
+            self.pins(),
+            self.name.clone(),
+            Arc::clone(&self.adc_registry),
             params.clone(),
         )))
     }
@@ -311,7 +410,7 @@ impl DigitalOutState {
 ///
 /// Upstream reports this from the message parser and the caller turns it into
 /// `Pin '%s' is not a valid pin name on mcu '%s'` (`klippy/mcu.py:1032-1038`).
-fn pin_number(mcu: &Mcu, name: &str, chip_name: &str) -> Result<u32, PinError> {
+pub(crate) fn pin_number(mcu: &Mcu, name: &str, chip_name: &str) -> Result<u32, PinError> {
     let invalid = || PinError::InvalidName {
         pin: name.to_string(),
         chip: chip_name.to_string(),
@@ -570,5 +669,120 @@ mod tests {
         let err = out.update_digital_out(true).unwrap_err();
 
         assert!(err.to_string().contains("not connected"), "{err}");
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_bus_name
+    // -----------------------------------------------------------------------
+
+    /// A dictionary that publishes bus names and the pins of one bus.
+    fn bus_dictionary() -> Dictionary {
+        Dictionary::from_json(json!({
+            "commands": {
+                "allocate_oids count=%c": 2,
+                "get_config": 7,
+                "finalize_config crc=%u": 6,
+            },
+            "enumerations": {
+                "pin": {"PA0": 0, "PA1": 1, "PB2": 2},
+                "spi_bus": {"spi1": 0, "spi2": 1}
+            },
+            "config": {"CLOCK_FREQ": 20000000, "BUS_PINS_spi1": "PB2"}
+        }))
+        .unwrap()
+    }
+
+    fn mcu_with(dictionary: Dictionary) -> Mcu {
+        let mcu = Mcu::for_test("mcu", Interface::new(TestDevice::new(Vec::new())));
+        mcu.install_dictionary(dictionary).unwrap();
+        mcu
+    }
+
+    #[tokio::test]
+    async fn test_resolve_bus_name_reserves_the_pins_the_firmware_owns() {
+        let (chip, pins) = chip();
+        let mcu = mcu_with(bus_dictionary());
+
+        let bus = chip
+            .resolve_bus_name(&mcu, "spi_bus", Some("spi1"))
+            .unwrap();
+
+        assert_eq!(bus, "spi1");
+        // The firmware's `BUS_PINS_spi1` names PB2, so it cannot be driven.
+        let err = pins.resolve_pin("mcu", "PB2").unwrap_err();
+        assert!(err.to_string().contains("reserved for spi1"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_bus_name_defaults_to_the_bus_named_zero() {
+        let (chip, _pins) = chip();
+        let mcu = mcu_with(bus_dictionary());
+
+        assert_eq!(
+            chip.resolve_bus_name(&mcu, "spi_bus", None).unwrap(),
+            "spi1"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_bus_name_falls_back_to_the_generic_bus_enumeration() {
+        let dictionary = Dictionary::from_json(json!({
+            "commands": {},
+            "enumerations": {"bus": {"i2c1": 0}},
+            "config": {"CLOCK_FREQ": 20000000}
+        }))
+        .unwrap();
+        let (chip, _pins) = chip();
+        let mcu = mcu_with(dictionary);
+
+        assert_eq!(
+            chip.resolve_bus_name(&mcu, "i2c_bus", Some("i2c1"))
+                .unwrap(),
+            "i2c1"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_bus_name_rejects_an_unknown_bus() {
+        let (chip, _pins) = chip();
+        let mcu = mcu_with(bus_dictionary());
+
+        let err = chip
+            .resolve_bus_name(&mcu, "spi_bus", Some("spi9"))
+            .unwrap_err();
+
+        assert!(matches!(&err, PinError::UnknownBus { .. }), "{err:?}");
+        assert_eq!(err.to_string(), "Unknown spi_bus 'spi9'");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_bus_name_requires_a_bus_when_zero_is_unnamed() {
+        let dictionary = Dictionary::from_json(json!({
+            "commands": {},
+            "enumerations": {"spi_bus": {"spi1": 1}},
+            "config": {"CLOCK_FREQ": 20000000}
+        }))
+        .unwrap();
+        let (chip, _pins) = chip();
+        let mcu = mcu_with(dictionary);
+
+        let err = chip.resolve_bus_name(&mcu, "spi_bus", None).unwrap_err();
+
+        assert!(matches!(&err, PinError::MustSpecifyBus { .. }), "{err:?}");
+        assert_eq!(err.to_string(), "Must specify spi_bus on mcu 'mcu'");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_bus_name_without_an_enumeration_passes_the_choice_through() {
+        // The plain dictionary has a `pin` enumeration but no bus one.
+        let (chip, _pins) = chip();
+        let mcu = mcu();
+
+        assert_eq!(
+            chip.resolve_bus_name(&mcu, "spi_bus", Some("spi3"))
+                .unwrap(),
+            "spi3"
+        );
+        assert_eq!(chip.resolve_bus_name(&mcu, "spi_bus", None).unwrap(), "0");
     }
 }

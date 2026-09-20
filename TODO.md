@@ -352,7 +352,14 @@ DTR”隐式满足，但那是驱动副作用，不算实现。**
         `usb::recommended_rules` 在告警里给同样两条。
       - **上线探测**：`restart::check_usb_power` 在每次 connect 按 `usb_power` 探一次（含写权限），
         两条都不可用就告警并附上该 hub 的规则，不必等第一次 `FIRMWARE_RESTART`。
-      - 同样是**未在真板测过**：执行前有 `warn_untested` 告警；两条路本身都无自动化。
+      - **已在真板验证**（`0424:2137` 的 hub）：hub 描述符 `wHubCharacteristics lpsm=1`，
+        `CLEAR_FEATURE(PORT_POWER)` 后端口状态 `0x0103 → 0x0000`、`SET_FEATURE` 后回到
+        `0x0103`，板子确实掉线重连（`rpi_usb_reset` 2 s 断电 + ~0.5 s 等重枚举后返回），
+        所以这条**去掉了** `warn_untested`（`arduino`/`cheetah` 仍保留）。
+      - 验证时发现并修掉两个真 bug：① 判断“设备回来了”不能用 `/dev` 节点（内核在端口断电
+        期间**不拆设备**，节点和 sysfs 链接都还在），要用 USB 设备的 node 号变了
+        （实测 `189:40 → 189:41`）；② `resolve_tty_port` 原来用给定路径的 basename 找
+        sysfs，`/dev/serial/by-id/…` 这种解析不了，现在先 `canonicalize`。
       注：“上电复位前不许 configure”（`:696`）在我们的“先复位、再 open、再 configure”
       顺序下天然成立。
       待真板确认：树莓派 5 的板载 hub 自称 per-port、实为 ganged，只切一个端口切不掉 VBUS，

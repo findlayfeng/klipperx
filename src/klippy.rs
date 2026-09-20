@@ -120,6 +120,14 @@ async fn klippy_process(printer: Arc<Printer>, config: Arc<Config>) {
     }
 
     interrupt.abort();
+
+    // The run loop has ended for good, so the machine comes down here — while
+    // the runtime that built it is still up. A device's transport can have a
+    // blocking read parked on a worker thread (an MCU's receive task runs one),
+    // and only dropping the part releases it; waiting for the `Printer` to drop
+    // would leave that read parked, because the API endpoints keep the printer
+    // alive past the run loop, and the runtime then hangs on shutdown.
+    printer.teardown();
 }
 
 /// Something to run alongside the host, attached to its own API.

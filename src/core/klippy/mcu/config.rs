@@ -330,6 +330,26 @@ impl ConfigBuilder {
         Ok(())
     }
 
+    /// The clock a periodic query on `oid` should first fire at.
+    ///
+    /// Upstream's `MCUConfigHelper.get_query_slot` (`klippy/mcu.py:1136`): the
+    /// current time plus 1.5 s, then `oid * 0.01 s` so a bank of queries does not
+    /// fire at once. Upstream reads the time from its clock sync; this host uses
+    /// [`Mcu::estimated_clock`], the one clock reading taken at connect. The
+    /// 1.5 s is what keeps the first report after the `init` commands that arm
+    /// the query.
+    ///
+    /// # Errors
+    /// Returns [`McuError::Config`] when no clock estimate is available (a
+    /// firmware without `get_uptime`).
+    pub fn get_query_slot(&self, mcu: &Mcu, oid: u8) -> Result<u32, McuError> {
+        let slot = mcu.seconds_to_clock(f64::from(oid) * 0.01)?;
+        let now = mcu
+            .estimated_clock()
+            .ok_or_else(|| McuError::Config("no clock estimate for the query slot".to_string()))?;
+        Ok((now + mcu.seconds_to_clock(1.5)? + slot) as u32)
+    }
+
     /// Whether [`ConfigBuilder::build`] has run.
     pub fn is_finalized(&self) -> bool {
         self.lock().finalized

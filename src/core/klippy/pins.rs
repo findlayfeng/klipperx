@@ -19,6 +19,7 @@
 //! | `PrinterPins.allow_multi_use_pin` | [`PrinterPins::allow_multi_use_pin`] |
 //! | `PrinterPins.get_pin_resolver` | [`PrinterPins::reserve_pin`] / [`PrinterPins::alias_pin`] / [`PrinterPins::resolve_pin`] |
 //! | `PrinterPins.register_chip` | [`PrinterPins::register_chip`] |
+//! | `PrinterPins.setup_pin` | [`PrinterPins::setup_digital_out`] / [`PrinterPins::setup_pwm`] / [`PrinterPins::setup_adc`] |
 //! | `PinResolver.reserve_pin` / `alias_pin` | [`PinResolver::reserve_pin`] / [`PinResolver::alias_pin`] |
 //! | `PinResolver.update_command` | [`PinResolver::resolve`] |
 //!
@@ -43,17 +44,17 @@
 //!
 //! # Not here
 //!
-//! * **The other resource kinds**: upstream's `PrinterPins.setup_pin` dispatches
-//!   on the pin type to `MCU_digital_out` / `MCU_pwm` / `MCU_adc` /
-//!   `MCU_endstop`. Only digital outputs exist so far
-//!   ([`PrinterPins::setup_digital_out`]); the others arrive with their TODO
-//!   items, as more methods on [`PinChip`].
-//! * **`[board_pins]`**: the section that calls [`PrinterPins::alias_pin`] and
-//!   [`PrinterPins::reserve_pin`] (`klippy/extras/board_pins.py`). The resolver
-//!   API is here; the section loader needs config list parsing and comes with
-//!   the config-file work.
-//! * **`BUS_PINS_<bus>`**: reserved by the SPI/I2C layer when a bus is set up
-//!   (F6/F7). `RESERVE_PINS_*` is done, at MCU connect.
+//! * **`MCU_endstop`**: upstream's `PrinterPins.setup_pin` dispatches on the pin
+//!   type to `MCU_digital_out` / `MCU_pwm` / `MCU_adc` / `MCU_endstop`. Digital
+//!   output, PWM and ADC exist ([`PrinterPins::setup_digital_out`] /
+//!   [`PrinterPins::setup_pwm`] / [`PrinterPins::setup_adc`]); the endstop arrives
+//!   with F8/C1, as another method on [`PinChip`].
+//! * **`BUS_PINS_<bus>`** reservation API lives on the chip
+//!   (`McuChip::resolve_bus_name`); the SPI/I2C layer that calls it is F6/F7.
+//!   `RESERVE_PINS_*` is done, at MCU connect.
+//!
+//! `[board_pins]` (the section that calls [`PrinterPins::alias_pin`] and
+//! [`PrinterPins::reserve_pin`]) is `extras/board_pins.rs`.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -132,7 +133,7 @@ impl PinParams {
 /// A digital output resource: a pin that is driven high or low.
 ///
 /// The trait is the seam between "which pin" (`PrinterPins`) and "what the
-/// firmware does with it" (`mcu/pin.rs`). The clocked methods take an absolute
+/// firmware does with it" (`mcu/resource/pin.rs`). The clocked methods take an absolute
 /// firmware clock; turning wall or print time into one is the clock layer's job.
 pub trait DigitalOut: Send + Sync {
     /// The longest a scheduled change may be outstanding, in seconds. `0.0`
@@ -157,6 +158,95 @@ pub trait DigitalOut: Send + Sync {
     fn update_digital_out(&self, value: bool) -> Result<(), McuError>;
 }
 
+/// A PWM output resource: a pin whose duty cycle is set as a fraction.
+///
+/// Upstream's `MCU_pwm` (`klippy/mcu.py:451-553`). Whether the pin is a hardware
+/// PWM or a software one is decided at build time (see
+/// [`setup_cycle_time`](PwmOut::setup_cycle_time)); either way the duty is
+/// `0.0..=1.0` and the resource converts it to the firmware's own scale.
+pub trait PwmOut: Send + Sync {
+    /// The longest a queued duty may be outstanding, in seconds. `0.0` removes
+    /// the firmware's limit.
+    fn setup_max_duration(&self, max_duration: f64);
+
+    /// Set the PWM period and whether to use the firmware's hardware PWM.
+    ///
+    /// Must be called before the configuration is built: it chooses between
+    /// `config_pwm_out` and `config_digital_out` +
+    /// `set_digital_out_pwm_cycle`.
+    fn setup_cycle_time(&self, cycle_time: f64, hardware_pwm: bool);
+
+    /// The duty to drive at startup and the duty to fall back to on shutdown,
+    /// as fractions in `0.0..=1.0`.
+    fn setup_start_value(&self, start_value: f64, shutdown_value: f64);
+
+    /// Change the duty at `clock` (upstream's `set_pwm`).
+    ///
+    /// # Errors
+    /// Returns [`McuError`] if the PWM is not configured yet or the MCU is not
+    /// connected.
+    fn set_pwm(&self, clock: u32, value: f64) -> Result<(), McuError>;
+
+    /// Change the duty as soon as the firmware can.
+    ///
+    /// The PWM counterpart of [`DigitalOut::update_digital_out`]: there is no
+    /// clockless PWM command, so the resource uses
+    /// [`Mcu::estimated_clock`](crate::core::klippy::mcu::Mcu::estimated_clock) and
+    /// aligns a software PWM to its cycle. This is what a `SET_PIN` does when
+    /// there is no print-time scheduler yet (TODO C1).
+    ///
+    /// # Errors
+    /// As [`PwmOut::set_pwm`], plus when the firmware clock cannot be
+    /// estimated.
+    fn update_pwm(&self, value: f64) -> Result<(), McuError>;
+
+    /// The earliest clock at or after `clock` a software-PWM change may take
+    /// effect at.
+    ///
+    /// Upstream's `next_aligned_print_time`: a software PWM can only change duty
+    /// on a cycle boundary, so a caller must round its requested time up. A
+    /// hardware PWM, or one currently fully on/off, needs no alignment and
+    /// returns `clock`. `allow_early` is how far before `clock` the change may
+    /// land, in seconds.
+    ///
+    /// # Errors
+    /// Returns [`McuError`] if the firmware frequency is unknown.
+    fn next_aligned_clock(&self, clock: u32, allow_early: f64) -> Result<u32, McuError>;
+}
+
+/// A batch of ADC samples: `(firmware clock, value)` pairs, oldest first.
+///
+/// Upstream dates samples with print time; this host has no print-time layer
+/// yet (TODO C1), so the firmware clock is what comes through. The value is
+/// already scaled to `0.0..=1.0`.
+pub type AdcCallback = Box<dyn Fn(&[(u64, f64)]) + Send + Sync>;
+
+/// An analog input resource.
+///
+/// Upstream's `MCU_adc` (`klippy/mcu.py:555-655`). A consumer configures the
+/// sampling and installs a callback; the firmware then pushes batches after the
+/// query is armed at init.
+pub trait Adc: Send + Sync {
+    /// Configure the periodic query. A `sample_count` of zero disables the
+    /// input, so the resource builds no query.
+    fn setup_adc_sample(
+        &self,
+        report_time: f64,
+        sample_time: f64,
+        sample_count: u32,
+        batch_num: u32,
+        minval: f64,
+        maxval: f64,
+        range_check_count: u32,
+    );
+
+    /// Install the callback that receives each batch.
+    fn setup_adc_callback(&self, callback: AdcCallback);
+
+    /// The last sample seen, as `(firmware clock, value)`.
+    fn get_last_value(&self) -> Option<(u64, f64)>;
+}
+
 /// The chip (MCU) side of pin setup.
 ///
 /// Upstream's `MCU.setup_pin` dispatches on the pin type to `MCU_digital_out`,
@@ -169,6 +259,28 @@ pub trait PinChip: Send + Sync {
     /// # Errors
     /// Returns a [`PinError`] if the chip cannot build the resource.
     fn setup_digital_out(&self, params: &PinParams) -> Result<Arc<dyn DigitalOut>, PinError>;
+
+    /// Build the PWM output for an already-validated pin.
+    ///
+    /// The default refuses, so a chip that does not implement PWM (a test
+    /// double, or a future non-MCU chip) reports the same message a missing
+    /// resource would.
+    ///
+    /// # Errors
+    /// Returns a [`PinError`] if the chip cannot build the resource.
+    fn setup_pwm(&self, _params: &PinParams) -> Result<Arc<dyn PwmOut>, PinError> {
+        Err(PinError::Unsupported(PinType::Pwm.as_str().to_string()))
+    }
+
+    /// Build the analog input for an already-validated pin.
+    ///
+    /// The default refuses, like [`PinChip::setup_pwm`].
+    ///
+    /// # Errors
+    /// Returns a [`PinError`] if the chip cannot build the resource.
+    fn setup_adc(&self, _params: &PinParams) -> Result<Arc<dyn Adc>, PinError> {
+        Err(PinError::Unsupported(PinType::Adc.as_str().to_string()))
+    }
 }
 
 /// A pin description or pin-sharing mistake.
@@ -212,6 +324,10 @@ pub enum PinError {
     IsAlias { name: String, canonical: String },
     /// The pin name is not in the firmware's `pin` enumeration.
     InvalidName { pin: String, chip: String },
+    /// A bus was left out but the firmware does not name bus 0.
+    MustSpecifyBus { param: String, chip: String },
+    /// A bus name is not in the firmware's bus enumeration.
+    UnknownBus { param: String, bus: String },
     /// The chip does not build this kind of resource (yet).
     Unsupported(String),
     /// A pin with a maximum duration must start and shut down at the same
@@ -219,6 +335,15 @@ pub enum PinError {
     MaxDurationMismatch,
     /// The maximum duration does not fit the firmware's scheduler.
     MaxDurationTooLarge,
+    /// A PWM's maximum duration does not fit the firmware's scheduler.
+    PwmMaxDurationTooLarge,
+    /// A software PWM's cycle does not fit the firmware's scheduler.
+    PwmCycleTimeTooLarge,
+    /// A software PWM can only fall back to fully on or fully off.
+    SoftPwmShutdown,
+    /// `sample_count * ADC_MAX` does not fit the 16-bit average the firmware
+    /// reports.
+    AdcSampleCountTooLarge(u32),
 }
 
 impl fmt::Display for PinError {
@@ -265,6 +390,12 @@ impl fmt::Display for PinError {
             PinError::InvalidName { pin, chip } => {
                 write!(f, "Pin '{pin}' is not a valid pin name on mcu '{chip}'")
             }
+            PinError::MustSpecifyBus { param, chip } => {
+                write!(f, "Must specify {param} on mcu '{chip}'")
+            }
+            PinError::UnknownBus { param, bus } => {
+                write!(f, "Unknown {param} '{bus}'")
+            }
             PinError::Unsupported(kind) => {
                 write!(f, "pin type {kind} not supported on this mcu")
             }
@@ -273,6 +404,14 @@ impl fmt::Display for PinError {
                 "Pin with max duration must have start value equal to shutdown value"
             ),
             PinError::MaxDurationTooLarge => write!(f, "Digital pin max duration too large"),
+            PinError::PwmMaxDurationTooLarge => write!(f, "PWM pin max duration too large"),
+            PinError::PwmCycleTimeTooLarge => write!(f, "PWM pin cycle time too large"),
+            PinError::SoftPwmShutdown => {
+                write!(f, "shutdown value must be 0.0 or 1.0 on soft pwm")
+            }
+            PinError::AdcSampleCountTooLarge(count) => {
+                write!(f, "ADC sample_count={count} too large for MCU")
+            }
         }
     }
 }
@@ -672,6 +811,46 @@ impl PrinterPins {
         )?;
         let chip = self.chip(&params.chip_name)?;
         chip.setup_digital_out(&params)
+    }
+
+    /// Look up a pin and build a PWM output on the chip it names.
+    ///
+    /// # Errors
+    /// Returns whatever validation reports, or the chip's own error.
+    pub fn setup_pwm(
+        &self,
+        description: &str,
+        share_type: Option<&str>,
+    ) -> Result<Arc<dyn PwmOut>, PinError> {
+        let pin_type = PinType::Pwm;
+        let params = self.lookup_pin(
+            description,
+            pin_type.can_invert(),
+            pin_type.can_pullup(),
+            share_type,
+        )?;
+        let chip = self.chip(&params.chip_name)?;
+        chip.setup_pwm(&params)
+    }
+
+    /// Look up a pin and build an analog input on the chip it names.
+    ///
+    /// # Errors
+    /// Returns whatever validation reports, or the chip's own error.
+    pub fn setup_adc(
+        &self,
+        description: &str,
+        share_type: Option<&str>,
+    ) -> Result<Arc<dyn Adc>, PinError> {
+        let pin_type = PinType::Adc;
+        let params = self.lookup_pin(
+            description,
+            pin_type.can_invert(),
+            pin_type.can_pullup(),
+            share_type,
+        )?;
+        let chip = self.chip(&params.chip_name)?;
+        chip.setup_adc(&params)
     }
 
     /// The registered chip under `name`, cloned out so the caller does not hold

@@ -144,19 +144,24 @@ max_accel: 3000
 
 > 详细参数说明见 [MCU 连接方式](mcu-connection.md)。
 
-### `[output_pin <name>]` — 数字输出引脚
+### `[output_pin <name>]` — 输出引脚（数字 / PWM）
 
-定义一个可通过 `SET_PIN` 命令控制的数字输出引脚。该节**必须**带名称（即 `[output_pin <name>]` 格式），名称即为 `SET_PIN PIN=<name>` 中引用的引脚名。
+定义一个可通过 `SET_PIN` 命令控制的输出引脚。该节**必须**带名称（即 `[output_pin <name>]` 格式），名称即为 `SET_PIN PIN=<name>` 中引用的引脚名。默认是数字输出，给 `pwm: true` 后变成 PWM。
 
 | 参数 | 类型 | 必需 | 默认值 | 说明 |
 |------|------|------|--------|------|
-| `pin` | 字符串 | 是 | — | 引脚描述（格式：`<mcu_name>:<pin>`），对应已配置的 MCU |
-| `value` | 0.0 ~ 1.0 | 否 | `0` | 启动时引脚电平（`>= 0.5` 为高） |
-| `shutdown_value` | 0.0 ~ 1.0 | 否 | `0` | 关机时引脚回退电平 |
+| `pin` | 字符串 | 是 | — | 引脚描述（格式：`[!][<mcu_name>:]<pin>`），对应已配置的 MCU |
+| `value` | 0.0 ~ 1.0 | 否 | `0` | 启动时的值（数字输出 `>= 0.5` 为高；PWM 为占空比） |
+| `shutdown_value` | 0.0 ~ 1.0 | 否 | `0` | 关机时回退的值 |
+| `pwm` | 布尔 | 否 | `false` | 使用 PWM 而非数字输出 |
+| `cycle_time` | 秒 | 否 | `0.1` | PWM 周期（仅 `pwm: true`） |
+| `hardware_pwm` | 布尔 | 否 | `false` | 用硬件的 `config_pwm_out`；默认走软件 PWM（数字引脚翻转） |
 
 **注意：**
-- 本端口仅支持**数字输出**，不支持 PWM（`pwm` / `cycle_time` 选项尚未实现）
-- 引脚值变化立即生效，不经过工具头调度
+- 数字输出与 PWM 都支持 `!` 取反前缀。
+- 值变化采用“立即”路径（数字输出 `update_digital_out`、PWM `update_pwm`），**不**经过工具头调度；PWM 的立即变化会对齐到软件 PWM 的周期边界。上游那种随打印时间生效的 `SET_PIN` 要等运动/时钟层（TODO C1）。
+- 软件 PWM 的 `shutdown_value` 只能是 `0.0` 或 `1.0`（固件只能把引脚固定在高或低）。
+- `scale` / `static_value` / `TEMPLATE` 尚未实现。
 
 **示例：**
 
@@ -169,15 +174,46 @@ shutdown_value: 0
 [output_pin my_light]
 pin: mcu:PB5
 value: 0
+
+# 软件 PWM（固件翻转 GP10）
+[output_pin pwm_fan]
+pin: mcu:PA1
+pwm: true
+cycle_time: 0.02
+hardware_pwm: false
 ```
 
 对应 G-Code 命令：
 
 ```gcode
-SET_PIN PIN=my_fan VALUE=1    ; 打开风扇
-SET_PIN PIN=my_fan VALUE=0    ; 关闭风扇
-SET_PIN PIN=my_light VALUE=1  ; 打开灯
+SET_PIN PIN=my_fan VALUE=1      ; 打开风扇
+SET_PIN PIN=my_fan VALUE=0      ; 关闭风扇
+SET_PIN PIN=pwm_fan VALUE=0.25  ; 25% 占空比
 ```
+
+### `[board_pins]` / `[board_pins <name>]` — 板级引脚别名
+
+把主板丝印上的排针名映射到 MCU 的真实引脚名。节可以带名称也可以不带；`mcu` 选项指定别名应用到哪几台 MCU（默认 `mcu`）。
+
+| 参数 | 类型 | 必需 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| `mcu` | 字符串列表 | 否 | `mcu` | 逗号分隔的 MCU 名列表 |
+| `aliases` | `名=引脚` 列表 | 否 | — | 逗号分隔的别名列表；值写成 `<...>` 时表示**保留**该引脚 |
+| `aliases_<name>` | 同上 | 否 | — | 可以拆成多组；`aliases_` 开头的选项都会被读取 |
+
+**示例：**
+
+```ini
+[board_pins]
+aliases:
+    EXP1_1=PA0, EXP1_2=PA1, EXP1_3=PB0,
+    EXP1_9=<GND>, EXP1_10=<5V>
+
+[output_pin fan]
+pin: EXP1_1        ; 等价于 PA0
+```
+
+被 `<...>` 保留的引脚（如 `EXP1_9`）会拒绝后续引用，报 `pin EXP1_9 is reserved for <GND>`。
 
 ---
 

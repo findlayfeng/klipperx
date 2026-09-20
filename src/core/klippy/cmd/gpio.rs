@@ -25,7 +25,7 @@
 //! (`gpiocmds.c:141`).
 //!
 //! The pin name in a config file is resolved to the number here by the resource
-//! that builds the command (`mcu/pin.rs`), because this host's encoder takes
+//! that builds the command (`mcu/resource/pin.rs`), because this host's encoder takes
 //! [`ArgValue`]s rather than command text.
 
 use crate::core::klippy::cmd::McuCommand;

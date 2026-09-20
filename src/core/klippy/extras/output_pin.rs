@@ -1,34 +1,35 @@
 //! `[output_pin <name>]` — a pin a client can set with `SET_PIN`.
 //!
 //! The first *consumer* of the pin stack: it reads a `pin` description, asks
-//! `pins` for a digital output (`mcu/pin.rs`), tells it the start and shutdown
-//! levels, and registers `SET_PIN PIN=<name> VALUE=<0..1>` with the G-Code
-//! dispatcher.
+//! `pins` for a digital output or a PWM (`mcu/resource/pin.rs`, `mcu/resource/pwm.rs`), tells it
+//! the start and shutdown values, and registers `SET_PIN PIN=<name> VALUE=<0..1>`
+//! with the G-Code dispatcher.
 //!
-//! Upstream is `klippy/extras/output_pin.py`. This port covers the **digital
-//! output** subset:
+//! Upstream is `klippy/extras/output_pin.py`. This port covers the **output**
+//! subset:
 //!
 //! | option | meaning |
 //! |---|---|
 //! | `pin` | the pin description, required |
-//! | `value` | level to drive at startup (default 0) |
-//! | `shutdown_value` | level the firmware falls back to (default 0) |
+//! | `value` | value to drive at startup (default 0) |
+//! | `shutdown_value` | value to fall back to on shutdown (default 0) |
+//! | `pwm` | use a PWM rather than a plain digital output (default false) |
+//! | `cycle_time` | PWM period in seconds (default 0.1) |
+//! | `hardware_pwm` | use the firmware's hardware PWM (default false, software PWM) |
 //!
 //! `maximum_mcu_duration` is deliberately **not** an option: upstream's
 //! `PrinterOutputPin` calls `setup_max_duration(0.)` unconditionally
 //! (`klippy/extras/output_pin.py:217`), so the firmware's "return to the
-//! shutdown level" limit is off and `value` and `shutdown_value` may differ.
+//! shutdown value" limit is off and `value` and `shutdown_value` may differ.
 //!
 //! # What is not here
 //!
-//! * **PWM** (`pwm` / `cycle_time`): the pin stack has no PWM resource yet
-//!   (TODO F4). A section that asks for it is refused rather than silently
-//!   driven as a digital output.
 //! * **Scheduling.** Upstream queues `SET_PIN` through the toolhead so the change
 //!   lands at a print time. With no motion or print-time clock, this port calls
-//!   `update_digital_out` — the change happens now. `McuDigitalOut` already
-//!   exposes the clocked `queue_digital_out`, so the scheduled path is a
-//!   drop-in once the clock layer exists.
+//!   the immediate forms (`update_digital_out`, `update_pwm`); the clocked
+//!   `queue_digital_out` / `set_pwm` are used as soon as the clock layer exists
+//!   (TODO C1). For a software PWM that means `update_pwm` aligns the change to
+//!   the PWM cycle using the estimated clock.
 //! * **`scale` / `static_value` / `template`**: the display-template machinery.
 
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -37,7 +38,7 @@ use serde_json::{json, Value};
 
 use crate::core::klippy::config::ConfigSection;
 use crate::core::klippy::gcode::{CommandError, CommandHandler, GCodeDispatch, GCODE_OBJECT};
-use crate::core::klippy::pins::{DigitalOut, PrinterPins, PINS_OBJECT};
+use crate::core::klippy::pins::{DigitalOut, PrinterPins, PwmOut, PINS_OBJECT};
 use crate::core::klippy::printer::{Printer, PrinterObject};
 
 /// One configured `[output_pin <name>]`.
@@ -49,6 +50,15 @@ pub struct OutputPin {
     name: String,
     /// The value last set, for `get_status`; shared with the `SET_PIN` handler.
     value: Arc<Mutex<f64>>,
+}
+
+/// What `SET_PIN` drives: a plain output or a PWM.
+///
+/// The two have different trait objects but the same `0..=1` client interface,
+/// so the section keeps the choice behind one enum and the handler matches on it.
+enum PinHandle {
+    Digital(Arc<dyn DigitalOut>),
+    Pwm(Arc<dyn PwmOut>),
 }
 
 impl OutputPin {
@@ -66,12 +76,6 @@ impl OutputPin {
         let pin_desc = section
             .get_str("pin")
             .ok_or_else(|| format!("Option 'pin' in section '{identifier}' is not specified"))?;
-        if section.get_str("pwm").is_some() {
-            return Err(format!(
-                "Option 'pwm' in section '{identifier}' is not supported yet \
-                 (see TODO F4); this host drives digital outputs only"
-            ));
-        }
 
         let value = get_float(section, "value")?.unwrap_or(0.0);
         let shutdown_value = get_float(section, "shutdown_value")?.unwrap_or(0.0);
@@ -86,23 +90,43 @@ impl OutputPin {
         let pins = printer
             .lookup_object_as::<PrinterPins>(PINS_OBJECT)
             .expect("the loader registers `pins` before any section");
-        let pin = pins
-            .setup_digital_out(pin_desc, None)
-            .map_err(|err| format!("{identifier}: {err}"))?;
+
         // Upstream disables the firmware's max-duration limit for an
         // `output_pin` unconditionally, which is what lets `value` and
         // `shutdown_value` differ.
-        pin.setup_max_duration(0.0);
-        pin.setup_start_value(value >= 0.5, shutdown_value >= 0.5);
+        let handle = if get_bool(section, "pwm")?.unwrap_or(false) {
+            let pwm = pins
+                .setup_pwm(pin_desc, None)
+                .map_err(|err| format!("{identifier}: {err}"))?;
+            let cycle_time = get_float(section, "cycle_time")?.unwrap_or(0.100);
+            if cycle_time <= 0.0 {
+                return Err(format!(
+                    "Option 'cycle_time' in section '{identifier}' must be above 0"
+                ));
+            }
+            let hardware_pwm = get_bool(section, "hardware_pwm")?.unwrap_or(false);
+            pwm.setup_cycle_time(cycle_time, hardware_pwm);
+            pwm.setup_max_duration(0.0);
+            pwm.setup_start_value(value, shutdown_value);
+            PinHandle::Pwm(pwm)
+        } else {
+            let pin = pins
+                .setup_digital_out(pin_desc, None)
+                .map_err(|err| format!("{identifier}: {err}"))?;
+            pin.setup_max_duration(0.0);
+            pin.setup_start_value(value >= 0.5, shutdown_value >= 0.5);
+            PinHandle::Digital(pin)
+        };
 
         let gcode = printer
             .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
             .expect("the loader registers `gcode` before any section");
         let value_slot = Arc::new(Mutex::new(value));
+        let handle = Arc::new(handle);
         let handler: CommandHandler = {
-            let pin = Arc::clone(&pin);
+            let handle = Arc::clone(&handle);
             let value_slot = Arc::clone(&value_slot);
-            Arc::new(move |gcmd| cmd_set_pin(&pin, &value_slot, gcmd))
+            Arc::new(move |gcmd| cmd_set_pin(&handle, &value_slot, gcmd))
         };
         gcode
             .register_mux_command(
@@ -150,22 +174,44 @@ impl std::fmt::Debug for OutputPin {
 /// `SET_PIN PIN=<name> VALUE=<0..1>`: drive the pin.
 ///
 /// Upstream schedules this at a print time; without a clock layer the change
-/// happens immediately. `VALUE >= 0.5` is "on", so a config that writes `0.5`
-/// for a digital output does what upstream does.
+/// happens through the resource's immediate path. A digital output treats
+/// `VALUE >= 0.5` as "on" (so a config that writes `0.5` does what upstream
+/// does); a PWM takes the value as a duty.
 fn cmd_set_pin(
-    pin: &Arc<dyn DigitalOut>,
+    handle: &PinHandle,
     value_slot: &Arc<Mutex<f64>>,
     gcmd: &crate::core::klippy::gcode::GcodeCommand,
 ) -> Result<(), CommandError> {
     let value = gcmd
         .get_float_range("VALUE", 0.0, 1.0)
         .map_err(|err| CommandError::new(err.to_string()))?;
-    pin.update_digital_out(value >= 0.5)
-        .map_err(|err| CommandError::new(err.to_string()))?;
+    let result = match handle {
+        PinHandle::Digital(pin) => pin.update_digital_out(value >= 0.5),
+        PinHandle::Pwm(pin) => pin.update_pwm(value),
+    };
+    result.map_err(|err| CommandError::new(err.to_string()))?;
     *value_slot
         .lock()
         .unwrap_or_else(|poison| poison.into_inner()) = value;
     Ok(())
+}
+
+/// Read a boolean option the way upstream's `getboolean` does.
+///
+/// Upstream's `configparser` accepts `1`/`yes`/`true`/`on` (and the negatives);
+/// this host's config values are strings, so the accepted set is spelled out.
+fn get_bool(section: &ConfigSection, name: &str) -> Result<Option<bool>, String> {
+    let Some(text) = section.get_str(name) else {
+        return Ok(None);
+    };
+    match text.trim().to_ascii_lowercase().as_str() {
+        "1" | "yes" | "true" | "on" => Ok(Some(true)),
+        "0" | "no" | "false" | "off" => Ok(Some(false)),
+        _ => Err(format!(
+            "Unable to parse option '{name}' in section '{}'",
+            section.identifier()
+        )),
+    }
 }
 
 /// Read a float option, reporting upstream's parse error when it is malformed.
@@ -201,7 +247,7 @@ mod tests {
     use super::*;
     use crate::core::klippy::config::ConfigValue;
     use crate::core::klippy::mcu::McuError;
-    use crate::core::klippy::pins::{PinChip, PinError, PinParams};
+    use crate::core::klippy::pins::{PinChip, PinError, PinParams, PwmOut};
     use crate::core::klippy::printer::PrinterEvent;
     use crate::core::klippy::reactor::ManualReactor;
 
@@ -229,10 +275,43 @@ mod tests {
         }
     }
 
-    /// A chip that hands out a [`FakeDigitalOut`] per setup.
+    /// A PWM that records what it was told.
+    #[derive(Default)]
+    struct FakePwm {
+        max_duration: Mutex<f64>,
+        cycle_time: Mutex<(f64, bool)>,
+        start_value: Mutex<(f64, f64)>,
+        updates: Mutex<Vec<f64>>,
+    }
+
+    impl PwmOut for FakePwm {
+        fn setup_max_duration(&self, max_duration: f64) {
+            *self.max_duration.lock().unwrap() = max_duration;
+        }
+        fn setup_cycle_time(&self, cycle_time: f64, hardware_pwm: bool) {
+            *self.cycle_time.lock().unwrap() = (cycle_time, hardware_pwm);
+        }
+        fn setup_start_value(&self, start_value: f64, shutdown_value: f64) {
+            *self.start_value.lock().unwrap() = (start_value, shutdown_value);
+        }
+        fn set_pwm(&self, _clock: u32, value: f64) -> Result<(), McuError> {
+            self.updates.lock().unwrap().push(value);
+            Ok(())
+        }
+        fn update_pwm(&self, value: f64) -> Result<(), McuError> {
+            self.updates.lock().unwrap().push(value);
+            Ok(())
+        }
+        fn next_aligned_clock(&self, clock: u32, _allow_early: f64) -> Result<u32, McuError> {
+            Ok(clock)
+        }
+    }
+
+    /// A chip that hands out a [`FakeDigitalOut`] or [`FakePwm`] per setup.
     #[derive(Default)]
     struct FakeChip {
         created: Mutex<Vec<Arc<FakeDigitalOut>>>,
+        pwms: Mutex<Vec<Arc<FakePwm>>>,
     }
 
     impl PinChip for FakeChip {
@@ -240,6 +319,12 @@ mod tests {
             let out = Arc::new(FakeDigitalOut::default());
             self.created.lock().unwrap().push(Arc::clone(&out));
             Ok(out)
+        }
+
+        fn setup_pwm(&self, _params: &PinParams) -> Result<Arc<dyn PwmOut>, PinError> {
+            let pwm = Arc::new(FakePwm::default());
+            self.pwms.lock().unwrap().push(Arc::clone(&pwm));
+            Ok(pwm)
         }
     }
 
@@ -378,12 +463,61 @@ mod tests {
     }
 
     #[test]
-    fn test_pwm_is_refused_rather_than_driven_as_digital() {
+    fn test_a_pwm_output_is_configured_and_driven() {
+        let (printer, chip) = printer();
+        let section = section(
+            "fan",
+            "PA1",
+            &[("pwm", "true"), ("cycle_time", "0.05"), ("value", "0.5")],
+        );
+
+        OutputPin::new(&section, &printer).unwrap();
+
+        let pwm = chip.pwms.lock().unwrap()[0].clone();
+        assert_eq!(*pwm.max_duration.lock().unwrap(), 0.0);
+        assert_eq!(*pwm.cycle_time.lock().unwrap(), (0.05, false));
+        assert_eq!(*pwm.start_value.lock().unwrap(), (0.5, 0.0));
+
+        gcode(&printer)
+            .run_script("SET_PIN PIN=fan VALUE=0.25")
+            .unwrap();
+        assert_eq!(*pwm.updates.lock().unwrap(), [0.25]);
+    }
+
+    #[test]
+    fn test_a_hardware_pwm_is_selected_by_its_option() {
+        let (printer, chip) = printer();
+        let section = section("fan", "PA1", &[("pwm", "true"), ("hardware_pwm", "true")]);
+
+        OutputPin::new(&section, &printer).unwrap();
+
+        assert_eq!(
+            *chip.pwms.lock().unwrap()[0].cycle_time.lock().unwrap(),
+            (0.1, true)
+        );
+    }
+
+    #[test]
+    fn test_a_non_positive_cycle_time_is_reported() {
+        let (printer, _chip) = printer();
+        let section = section("fan", "PA1", &[("pwm", "true"), ("cycle_time", "0")]);
+
+        let err = OutputPin::new(&section, &printer).unwrap_err();
+
+        assert!(err.contains("cycle_time"), "{err}");
+        assert!(err.contains("above 0"), "{err}");
+    }
+
+    #[test]
+    fn test_an_unparseable_boolean_is_reported() {
         let (printer, _chip) = printer();
 
-        let err = OutputPin::new(&section("fan", "PA1", &[("pwm", "True")]), &printer).unwrap_err();
+        let err =
+            OutputPin::new(&section("fan", "PA1", &[("pwm", "maybe")]), &printer).unwrap_err();
 
-        assert!(err.contains("'pwm'"), "{err}");
-        assert!(err.contains("not supported yet"), "{err}");
+        assert_eq!(
+            err,
+            "Unable to parse option 'pwm' in section 'output_pin fan'"
+        );
     }
 }

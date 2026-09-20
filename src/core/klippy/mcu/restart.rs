@@ -276,9 +276,10 @@ async fn wait_for_new_device(
         tokio::time::sleep(RE_ENUMERATE_SETTLE).await;
         return Ok(());
     };
+    let mut seen = Reenumeration::default();
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        if device_node(name).is_some_and(|now| now != before) {
+        if seen.done(device_node(name).as_deref(), &before) {
             return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
@@ -288,6 +289,33 @@ async fn wait_for_new_device(
             ));
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Tracks whether the device came back, from successive [`device_node`] reads.
+///
+/// A node number that differs is a fresh instance. But the old number can come
+/// back too — the kernel may hand the freed number straight out again — so a
+/// device that was **seen to disappear** and then reappear counts as well. The
+/// wait starts after the port was powered on, so a disappearance can only belong
+/// to this cycle.
+#[derive(Default)]
+struct Reenumeration {
+    /// Whether the device was absent at some point since the wait began.
+    gone: bool,
+}
+
+impl Reenumeration {
+    /// Read `now`, and say whether the device is back.
+    fn done(&mut self, now: Option<&str>, before: &str) -> bool {
+        match now {
+            Some(now) if self.gone || now != before => true,
+            Some(_) => false,
+            None => {
+                self.gone = true;
+                false
+            }
+        }
     }
 }
 
@@ -330,6 +358,27 @@ mod tests {
         reset_firmware(&no_transport(McuRestartMethod::Command))
             .await
             .unwrap();
+    }
+
+    #[test]
+    fn test_the_reenumeration_state_machine() {
+        // The number changed: back, without ever seeing it go.
+        assert!(Reenumeration::default().done(Some("189:41"), "189:40"));
+
+        // Still the old instance: not back.
+        assert!(!Reenumeration::default().done(Some("189:40"), "189:40"));
+
+        // Gone, then back with the *same* number: the kernel handed the freed one
+        // out again, which is a re-enumeration all the same.
+        let mut seen = Reenumeration::default();
+        assert!(!seen.done(None, "189:40"));
+        assert!(seen.done(Some("189:40"), "189:40"));
+
+        // Gone, then back with a new number: also back, and the disappearance was
+        // enough on its own.
+        let mut seen = Reenumeration::default();
+        assert!(!seen.done(None, "189:40"));
+        assert!(seen.done(Some("189:42"), "189:40"));
     }
 
     #[tokio::test]

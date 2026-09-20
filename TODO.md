@@ -360,6 +360,8 @@ DTR”隐式满足，但那是驱动副作用，不算实现。**
         期间**不拆设备**，节点和 sysfs 链接都还在），要用 USB 设备的 node 号变了
         （实测 `189:40 → 189:41`）；② `resolve_tty_port` 原来用给定路径的 basename 找
         sysfs，`/dev/serial/by-id/…` 这种解析不了，现在先 `canonicalize`。
+        等待判定放宽为「node 号变了 **或** 中途见到设备消失过」——内核可能把刚释放的号直接
+        再发出来（`choose_devnum` 是游标式，实测连续 42→43→44→45，复用概率低但非零）。
       注：“上电复位前不许 configure”（`:696`）在我们的“先复位、再 open、再 configure”
       顺序下天然成立。
       待真板确认：树莓派 5 的板载 hub 自称 per-port、实为 ganged，只切一个端口切不掉 VBUS，

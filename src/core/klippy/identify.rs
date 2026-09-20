@@ -45,7 +45,7 @@
 //! zip-bomb style attacks where a tiny compressed payload expands to enormous data.
 
 use super::cmd::identify::{IdentifyChunk, IdentifyRequest};
-use crate::core::klippy::config::mcu::McuConfig;
+use crate::core::klippy::interface::Interface;
 use crate::core::klippy::mcu::{Dictionary, Mcu, McuError};
 use crate::core::klippy::msg::parser::Parser;
 use flate2::read::ZlibDecoder;
@@ -224,8 +224,11 @@ impl Mcu {
     /// Returns [`McuError`] if any step of the handshake fails. The partially
     /// initialized MCU is dropped on the way out, which shuts the interface down
     /// again.
-    pub async fn connect(config: McuConfig) -> Result<Arc<Mcu>, McuError> {
-        let mcu = Arc::new(Mcu::new(config));
+    pub async fn connect(
+        name: impl Into<String>,
+        interface: Interface,
+    ) -> Result<Arc<Mcu>, McuError> {
+        let mcu = Arc::new(Mcu::new(name, interface));
         mcu.identify(IDENTIFY_TIMEOUT).await?;
         Ok(mcu)
     }
@@ -303,11 +306,9 @@ fn describe_dictionary(name: &str, dictionary: &Dictionary) -> String {
 mod tests {
     use super::*;
     use crate::core::klippy::cmd::identify::IDENTIFY_CHUNK_SIZE;
-    use crate::core::klippy::config::mcu::McuConfig;
     use crate::core::klippy::frame::Frame;
     use crate::core::klippy::interface::test::{MappingEntry, TestDevice};
     use crate::core::klippy::interface::Interface;
-    use crate::core::klippy::mcu::McuRestartMethod;
     use crate::core::klippy::msg::proto::Payload;
     use flate2::write::{DeflateEncoder, ZlibEncoder};
     use flate2::Compression;
@@ -384,12 +385,8 @@ mod tests {
         mappings
     }
 
-    fn config(mappings: Vec<MappingEntry>) -> McuConfig {
-        McuConfig {
-            name: "test_mcu".to_string(),
-            restart_method: McuRestartMethod::Command,
-            interface: Interface::new(TestDevice::new(mappings)),
-        }
+    fn interface(mappings: Vec<MappingEntry>) -> Interface {
+        Interface::new(TestDevice::new(mappings))
     }
 
     fn mcu_with(mappings: Vec<MappingEntry>) -> Mcu {
@@ -562,7 +559,7 @@ mod tests {
     async fn test_connect_returns_identified_mcu() {
         let mappings = chunked_mappings(&compress(DICTIONARY_JSON.as_bytes()), 40);
 
-        let mcu: Arc<Mcu> = Mcu::connect(config(mappings)).await.unwrap();
+        let mcu: Arc<Mcu> = Mcu::connect("test_mcu", interface(mappings)).await.unwrap();
 
         assert_eq!(mcu.name(), "test_mcu");
         assert!(mcu.is_identified());

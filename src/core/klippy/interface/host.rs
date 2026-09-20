@@ -479,14 +479,17 @@ mod tests {
     async fn test_identify_against_the_real_library() {
         let config = McuConfig::new(&mcu_section()).expect("the [mcu] section");
         assert_eq!(config.name, "host_test");
-        let interface = config.interface.clone();
+        let interface = config.open().expect("the host library opens");
 
         // The handshake takes milliseconds; this only bounds a hang in a test that
         // would otherwise sit in the transport's own 10 second chunk timeout.
-        let mcu = tokio::time::timeout(Duration::from_secs(20), Mcu::connect(config))
-            .await
-            .expect("identify handshake timed out")
-            .expect("identify handshake failed");
+        let mcu = tokio::time::timeout(
+            Duration::from_secs(20),
+            Mcu::connect(config.name, interface.clone()),
+        )
+        .await
+        .expect("identify handshake timed out")
+        .expect("identify handshake failed");
 
         assert!(mcu.is_identified());
         let dictionary = mcu.dictionary().expect("a dictionary was installed");

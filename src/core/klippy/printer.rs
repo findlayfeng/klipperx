@@ -231,6 +231,11 @@ struct Inner {
     /// host's own (`webhooks`). [`Printer::reset_for_restart`] keeps these and
     /// drops everything after them.
     host_objects: Option<usize>,
+    /// Why the current bring-up is happening: the result `run` returned before a
+    /// restart, or `None` for the first start. Upstream keeps the same fact in
+    /// the printer's start args (`klippy/klippy.py:283`), and the MCU restart
+    /// reads it to decide whether to reset the firmware (`mcu/restart.rs`).
+    start_reason: Option<String>,
 }
 
 impl Printer {
@@ -256,6 +261,7 @@ impl Printer {
                 run_result: None,
                 handlers: HashMap::new(),
                 host_objects: None,
+                start_reason: None,
             }),
             exit_requested: Condvar::new(),
             reactor,
@@ -396,6 +402,12 @@ impl Printer {
         }
     }
 
+    /// Why the machine is being brought up: the result `run` returned before a
+    /// restart, or `None` for the first start.
+    pub fn start_reason(&self) -> Option<String> {
+        self.lock().start_reason.clone()
+    }
+
     /// Register a callback for a specific event.
     ///
     /// Handlers run in registration order, on the thread that fires the event,
@@ -506,7 +518,11 @@ impl Printer {
     ///
     /// The reactor and the host's parts are kept: they belong to the process,
     /// not to the config.
-    pub fn reset_for_restart(&self) {
+    ///
+    /// `reason` is what the next bring-up reports as [`Printer::start_reason`];
+    /// a `firmware_restart` is what makes an MCU reset its firmware rather than
+    /// just reconnect (`mcu/restart.rs`).
+    pub fn reset_for_restart(&self, reason: &str) {
         let keep = self.lock().host_objects.unwrap_or(0);
         self.objects
             .lock()
@@ -519,6 +535,7 @@ impl Printer {
         inner.shutdown = false;
         inner.run_result = None;
         inner.handlers.clear();
+        inner.start_reason = Some(reason.to_string());
     }
 
     /// Lock the state.
@@ -781,7 +798,7 @@ mod tests {
         printer.bring_up().await;
         assert_eq!(printer.get_state_message().category, PrinterState::Ready);
 
-        printer.reset_for_restart();
+        printer.reset_for_restart("firmware_restart");
 
         // The host's part stays, the config's is gone, and the state is back to
         // `Startup` so the machine can be brought up again.
@@ -803,11 +820,13 @@ mod tests {
             }),
         );
         printer.request_exit("exit");
+        assert_eq!(printer.start_reason(), None);
 
-        printer.reset_for_restart();
+        printer.reset_for_restart("firmware_restart");
 
-        // The handler was registered by a part that is gone, and the old exit
-        // must not decide the next run.
+        // The handler was registered by a part that is gone, the old exit must
+        // not decide the next run, and the next bring-up knows what it is for.
+        assert_eq!(printer.start_reason().as_deref(), Some("firmware_restart"));
         printer.send_event(&PrinterEvent::Ready);
         printer.request_exit("firmware_restart");
         assert_eq!(fired.load(Ordering::SeqCst), 0);

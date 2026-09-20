@@ -161,6 +161,94 @@ impl Device for SerialDevice {
     }
 }
 
+/// Modem-line control for a tty, for the firmware-restart sequences.
+///
+/// A reset needs the port to itself: it opens it briefly, at another rate, and
+/// toggles the control lines. It therefore has to run while the device is
+/// **closed**, which is why it is a short-lived handle rather than a device — it
+/// never reads or writes frames (`klippy/serialhdl.py:365-405`).
+pub struct ModemLines {
+    port: File,
+    path: PathBuf,
+}
+
+impl ModemLines {
+    /// Open `path` at `baud` for control only.
+    ///
+    /// # Errors
+    /// As [`SerialDevice::open`]: the port cannot be opened or put into raw
+    /// mode.
+    pub fn open(path: impl AsRef<Path>, baud: u32) -> Result<Self, InterfaceError> {
+        let path = path.as_ref().to_path_buf();
+        let port = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOCTTY | libc::O_NONBLOCK)
+            .open(&path)
+            .map_err(|e| {
+                InterfaceError::Other(format!(
+                    "failed to open serial port {}: {e}",
+                    path.display()
+                ))
+            })?;
+        set_raw_mode(&port, baud)?;
+        Ok(Self { port, path })
+    }
+
+    /// Read and discard one pending byte.
+    ///
+    /// The reset sequence drains the port first, the way upstream does
+    /// (`serialhdl.py:396`): a byte already in flight must not be left to be
+    /// read as the board's answer to the reset.
+    pub fn drain(&self) {
+        let mut scratch = [0u8; 1];
+        let _ = (&self.port).read(&mut scratch);
+    }
+
+    /// Assert or deassert DTR — the line an Arduino-style board resets on.
+    ///
+    /// # Errors
+    /// Returns [`InterfaceError`] if the kernel rejects the ioctl.
+    pub fn set_dtr(&self, asserted: bool) -> Result<(), InterfaceError> {
+        set_modem_line(&self.port, libc::TIOCM_DTR, asserted)
+    }
+
+    /// Assert or deassert RTS.
+    ///
+    /// Cheetah boards need RTS deasserted for the whole connection, or a reset
+    /// triggers the built-in bootloader (`klippy/mcu.py:703-705`).
+    ///
+    /// # Errors
+    /// As [`ModemLines::set_dtr`].
+    pub fn set_rts(&self, asserted: bool) -> Result<(), InterfaceError> {
+        set_modem_line(&self.port, libc::TIOCM_RTS, asserted)
+    }
+}
+
+impl fmt::Debug for ModemLines {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ModemLines")
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Set or clear one modem-control line with `TIOCMBIS`/`TIOCMBIC`.
+fn set_modem_line(port: &File, line: libc::c_int, asserted: bool) -> Result<(), InterfaceError> {
+    let fd = port.as_raw_fd();
+    let mut bits: libc::c_int = line;
+    let (request, call) = if asserted {
+        (libc::TIOCMBIS, "TIOCMBIS")
+    } else {
+        (libc::TIOCMBIC, "TIOCMBIC")
+    };
+    // SAFETY: the ioctl takes a pointer to an `int` holding the modem bits.
+    if unsafe { libc::ioctl(fd, request, &mut bits) } != 0 {
+        return Err(last_error(call));
+    }
+    Ok(())
+}
+
 /// Put the tty into raw mode and set its speed.
 ///
 /// The speed is set through `termios2`/`BOTHER`, which takes an arbitrary rate:
@@ -237,55 +325,26 @@ fn last_error(call: &str) -> InterfaceError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::fd::FromRawFd;
+    use crate::core::klippy::interface::pty::Pty;
     use std::sync::Arc;
     use std::time::Duration;
-
-    /// A pseudo-terminal pair: the tests keep both ends, the device under test
-    /// opens the slave path. Holding the ends open is what keeps the pair alive.
-    struct Pty {
-        master: File,
-        _slave: File,
-        path: PathBuf,
-    }
-
-    impl Pty {
-        fn new() -> Self {
-            let master_fd = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY) };
-            assert!(
-                master_fd >= 0,
-                "posix_openpt: {}",
-                last_error("posix_openpt")
-            );
-            assert_eq!(unsafe { libc::grantpt(master_fd) }, 0);
-            assert_eq!(unsafe { libc::unlockpt(master_fd) }, 0);
-
-            let mut number: libc::c_uint = 0;
-            let rc = unsafe { libc::ioctl(master_fd, libc::TIOCGPTN, &mut number) };
-            assert_eq!(rc, 0, "TIOCGPTN: {}", last_error("TIOCGPTN"));
-            let path = PathBuf::from(format!("/dev/pts/{number}"));
-
-            let slave = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&path)
-                .expect("the pty slave should open");
-
-            Self {
-                // SAFETY: the descriptors come from posix_openpt/open just above and
-                // are owned by these `File`s from here on.
-                master: unsafe { File::from_raw_fd(master_fd) },
-                _slave: slave,
-                path,
-            }
-        }
-    }
 
     #[test]
     fn test_open_reports_a_missing_port() {
         let err = SerialDevice::open("/dev/not-a-serial-port", DEFAULT_BAUD).unwrap_err();
         assert!(matches!(err, InterfaceError::Other(_)), "{err:?}");
         assert!(err.to_string().contains("/dev/not-a-serial-port"), "{err}");
+    }
+
+    #[test]
+    fn test_modem_lines_open_a_tty() {
+        // A pty is a real tty, so opening it and putting it into raw mode is
+        // exercised for real. The DTR/RTS ioctls are not: a pty slave does not
+        // emulate the modem lines (`TIOCMBIS` is `ENOTTY` there), so toggling
+        // them is left to the boards that have them.
+        let pty = Pty::new();
+        let lines = ModemLines::open(&pty.path, 2400).unwrap();
+        lines.drain();
     }
 
     #[test]

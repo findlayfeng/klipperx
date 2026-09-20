@@ -138,6 +138,19 @@ impl McuObject {
         Ok(())
     }
 
+    /// Whether this bring-up follows a `firmware_restart`.
+    ///
+    /// Only then is the firmware itself reset; a first start and a plain
+    /// `restart` reconnect without touching it (upstream keys the same decision
+    /// on `start_reason`, `klippy/mcu.py:678-680`).
+    fn is_firmware_restart(&self) -> bool {
+        self.printer
+            .upgrade()
+            .and_then(|printer| printer.start_reason())
+            .as_deref()
+            == Some("firmware_restart")
+    }
+
     /// Report a firmware shutdown, restart, or already-stopped state.
     ///
     /// The events carry the reason; the machine is what knows what a stop
@@ -204,7 +217,15 @@ impl PrinterObject for McuObject {
             // same moment (`klippy/mcu.py:1147`). Opening a serial port or
             // dlopen-ing the host library blocks, briefly, on this task.
             let config = McuConfig::new(&self.section).map_err(KlippyError::Internal)?;
-            let mcu = Mcu::connect(config)
+            // A `firmware_restart` is the one bring-up that resets the firmware
+            // itself, and it has to happen while the transport is still closed.
+            if self.is_firmware_restart() {
+                super::restart::reset_firmware(&config)
+                    .await
+                    .map_err(KlippyError::Internal)?;
+            }
+            let interface = config.open().map_err(KlippyError::Internal)?;
+            let mcu = Mcu::connect(config.name, interface)
                 .await
                 .map_err(|err| KlippyError::Connection(err.to_string()))?;
             // Make the device reachable by resources before the configuration

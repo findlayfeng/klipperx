@@ -112,7 +112,7 @@ async fn klippy_process(printer: Arc<Printer>, config: Arc<Config>) {
         }
 
         info!("Restarting the printer ({result})");
-        printer.reset_for_restart();
+        printer.reset_for_restart(&result);
         if let Err(err) = printer.load_config(&config) {
             printer.invoke_shutdown(&format!("{err}"));
         }

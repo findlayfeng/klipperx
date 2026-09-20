@@ -207,6 +207,11 @@ pub struct HostDevice {
 }
 
 impl HostDevice {
+    /// Returns a short identifier for logging: `"/path/to/libklipper_host.so"`.
+    fn id(&self) -> String {
+        self.library_path.display().to_string()
+    }
+
     /// Load a klipper host library and start it.
     ///
     /// Klipper's state lives in the library rather than in this struct, so a
@@ -356,7 +361,8 @@ impl Device for HostDevice {
             )));
         }
         trace!(
-            "tx frame to klipper: {}",
+            "tx frame [{}]: {}",
+            self.id(),
             bytes
                 .iter()
                 .map(|b| format!("{b:02x}"))
@@ -381,7 +387,8 @@ impl Device for HostDevice {
             match self.output.recv() {
                 Ok(bytes) => {
                     trace!(
-                        "rx frame from klipper: {}",
+                        "rx frame [{}]: {}",
+                        self.id(),
                         bytes
                             .iter()
                             .map(|b| format!("{b:02x}"))

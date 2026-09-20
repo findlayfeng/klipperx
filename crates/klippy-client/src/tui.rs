@@ -671,10 +671,76 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
 /// The lines the log pane shows, newest last.
 ///
 /// `scroll` is the index of the first entry to show (0 = top).
-/// Lines are collected forward from `scroll` until the pane is full.
-/// If there are not enough entries, empty lines are added to fill the pane.
+/// When `pinned` is false, shows the bottom (newest) screenful.
+/// When `pinned` is true, shows from `scroll` forward.
+/// If entries don't fill the pane, all entries are shown (no padding).
 fn visible_lines(app: &App, width: usize, height: usize) -> Vec<Line<'static>> {
     let width = width.max(1);
+
+    // When not pinned, collect from the bottom (newest entries first).
+    if !app.pinned {
+        return collect_from_bottom(app, width, height);
+    }
+
+    // When pinned, collect forward from scroll index.
+    let mut lines = collect_forward(app, width, height);
+    // When pinned and scrolled back, still show newest entries if available.
+    // Clamp to show at most `height` lines starting from scroll.
+    lines.truncate(height);
+    lines
+}
+
+/// Collect lines from the bottom (newest entries), up to `height` lines.
+fn collect_from_bottom(app: &App, width: usize, height: usize) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    // Count total messages for alternating colours.
+    let total_messages = app.entries.iter().filter(|entry| is_message(entry)).count();
+    let mut message_counter = 0;
+
+    // Iterate backwards from the last entry.
+    for entry in app.entries.iter().rev() {
+        if is_message(entry) {
+            // Assign index: newest gets highest value.
+            let idx = total_messages - message_counter - 1;
+            message_counter += 1;
+            let style = entry_style(entry, idx);
+            for line in wrap(&entry_text(entry, app.format), width)
+                .into_iter()
+                .rev()
+            {
+                lines.push(Line::from(Span::styled(line, style)));
+                if lines.len() >= height {
+                    break;
+                }
+            }
+            if lines.len() >= height {
+                break;
+            }
+        } else {
+            let style = entry_style(entry, 0);
+            for line in wrap(&entry_text(entry, app.format), width)
+                .into_iter()
+                .rev()
+            {
+                lines.push(Line::from(Span::styled(line, style)));
+                if lines.len() >= height {
+                    break;
+                }
+            }
+            if lines.len() >= height {
+                break;
+            }
+        }
+    }
+
+    // Reverse to get oldest-first order.
+    lines.reverse();
+    lines
+}
+
+/// Collect lines forward from the scroll index, up to `height` lines.
+fn collect_forward(app: &App, width: usize, height: usize) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
 
     // Start from the scroll index (clamp to valid range)
@@ -684,7 +750,6 @@ fn visible_lines(app: &App, width: usize, height: usize) -> Vec<Line<'static>> {
 
     for entry in &app.entries[start..] {
         if is_message(entry) {
-            // Assign index sequentially: oldest gets 0, newest gets highest.
             let idx = message_counter;
             message_counter += 1;
             let style = entry_style(entry, idx);
@@ -709,11 +774,6 @@ fn visible_lines(app: &App, width: usize, height: usize) -> Vec<Line<'static>> {
                 break;
             }
         }
-    }
-
-    // Fill remaining space with empty lines if not enough entries.
-    while lines.len() < height {
-        lines.push(Line::from(Span::raw("")));
     }
 
     lines

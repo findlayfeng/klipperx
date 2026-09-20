@@ -1,6 +1,7 @@
 use super::section::ConfigSection;
-use crate::core::klippy::interface::Interface;
+use crate::core::klippy::interface::{Interface, SerialDevice};
 use crate::core::klippy::mcu::McuRestartMethod;
+use std::sync::Arc;
 use tracing::{info, warn};
 
 /// MCU (Microcontroller Unit) configuration parsed from config file.
@@ -142,7 +143,12 @@ impl McuConfig {
     /// Returns the transport's own message (`serial: …`, `canbus: …`,
     /// `host_library: …`) when it cannot be opened.
     pub fn open(&self) -> Result<Interface, String> {
-        self.transport.open()
+        // Cheetah boards need RTS deasserted for the **whole** connection, not
+        // just while resetting, or the board drops into its bootloader
+        // (`klippy/mcu.py:703-705`). Every other method wants the line left as
+        // the driver opened it.
+        let rts = self.restart_method != McuRestartMethod::Cheetah;
+        self.transport.open(rts)
     }
 
     /// Resolve `restart_method` for an MCU whose transport is (or is not) serial.
@@ -340,12 +346,19 @@ impl Transport {
     /// library — and the errors that name them live. Parsing, and every config
     /// check, happened in [`McuConfig::new`].
     ///
+    /// `rts` is the state a serial port is left in after opening; only the
+    /// [`Transport::Serial`] arm looks at it. The other transports ignore it.
+    ///
     /// # Errors
     /// Returns a message prefixed with the transport that failed.
-    pub fn open(&self) -> Result<Interface, String> {
+    pub fn open(&self, rts: bool) -> Result<Interface, String> {
         match self {
             Transport::Serial { path, baud } => {
-                Interface::serial(path, *baud).map_err(|e| format!("serial: {e}"))
+                let device = SerialDevice::open(path, *baud).map_err(|e| format!("serial: {e}"))?;
+                if !rts {
+                    device.set_rts(false).map_err(|e| format!("serial: {e}"))?;
+                }
+                Ok(Interface::Serial(Arc::new(device)))
             }
             Transport::Can {
                 interface,

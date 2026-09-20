@@ -28,6 +28,24 @@
 
 一个 `Mcu` 启动两个 `tokio` 任务：发送任务消费 `mpsc<Payload>`，接收任务在 `interface.receive()` 上循环。`Parser` 的 `clone()` 共享同一份注册表，字典因此可以在任务启动之后再装载。
 
+## 传输层：`Interface` / `Device`
+
+`Mcu` 只认 `send(Frame)` / `receive() -> Frame`（`interface::Device`）；字节怎么走是下面几个实现的事：
+
+| 实现 | 配置键 | 线上是什么 |
+|------|--------|-----------|
+| `SerialDevice` | `serial:` | tty 上的字节流 |
+| `CanSerialDevice` | `canbus_uuid:` + `canbus_interface:`（+ `canbus_nodeid:`） | SocketCAN，**承载的仍是同一份 serial 字节流** |
+| `HostDevice` | `host_library:` | `dlopen` 的 klipper host 库，输入/输出都是协议字节 |
+| `TestDevice` | `test:`（仅测试构建） | 脚本化应答 |
+
+**CAN 目前不是把 Klipper 协议「放在」CAN 上**，而是 Klipper 的 can-serial：固件把本该写到串口的字节流原样每 8 字节一段塞进经典 CAN 帧的 8 个数据字节，仲裁 id 只负责寻址（`0x100 + 2*nodeid`，回包 +1）。这里的「串口字节流」就是 MCU 的帧格式——长度、序号、载荷、CRC、`0x7e` SYNC（`src/core/klippy/frame.rs`）——CAN 在这里只是一根更慢的串口线，**不参与分帧**：消息块的头尾仍由这套 serial 格式决定，重组用的是同一个 `FrameStream`。
+
+两个直接后果：
+
+- 改 CAN 不需要另一套协议代码，只需要那个 `0x100 + 2*nodeid` 的映射（单测覆盖它，socket 层只经过编译，见 [测试](testing.md)）；
+- TRACE 日志里的 CAN 字节也按 serial 帧的结构打印，与串口同一格式；一段 CAN 数据恰好包含完整一帧时能看到 `头 | 载荷 | 尾` 的三段，否则退化为 4 字节一组。
+
 ## 发送侧：合并批处理
 
 `Mcu::send` 只做编码与入队（`try_send`，容量 32），实际出站在发送任务里：

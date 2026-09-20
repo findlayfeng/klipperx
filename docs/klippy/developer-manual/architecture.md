@@ -46,6 +46,16 @@
 - 改 CAN 不需要另一套协议代码，只需要那个 `0x100 + 2*nodeid` 的映射（单测覆盖它，socket 层只经过编译，见 [测试](testing.md)）；
 - TRACE 日志里 CAN 打两种行：**分片行**每个 CAN 帧一行（`rx can frame [can0:0x30a]: id 0x30b data 01020304 05060708`，仲裁 id + 8 个数据字节，就是总线上看到的东西），**整块行**按 serial 帧格式打一次（`rx frame [can0:0x30a]: 0a11 | 01020304 05 | 31d87e`）。`rx` 先逐片打分片行、凑齐后再打整块行；`tx` 先打整块行（拆片之前）、再逐片打分片行。**整块只占一个 CAN 帧时两种行也都会打**——总线上的分片与协议里的块不是一回事。
 
+### 开启 TRACE
+
+帧字节（`tx/rx frame`、`rx/tx can frame`）打在 `TRACE` 上，按模块开就行：
+
+```bash
+RUST_LOG=klipperx=trace klipperx ~/printer.cfg --tui
+```
+
+`--verbose` 不行：它把过滤器固定成 `debug` 并且忽略 `RUST_LOG`，TRACE 会被过滤掉。各级别与各类行的完整例子见用户手册的[日志与调试](../user-manual/logging.md)。
+
 ## 发送侧：合并批处理
 
 `Mcu::send` 只做编码与入队（`try_send`，容量 32），实际出站在发送任务里：

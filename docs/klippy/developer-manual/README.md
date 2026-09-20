@@ -271,7 +271,7 @@ API 本身在 `crates/klippy-api/src/`：
 - [MCU 配置构建（ConfigBuilder）](mcu-config.md) — 配置期的 oid、三张命令表、CRC（与上游的差异）与两段式下发
 - [Identify 机制](identify.md) — 主机与 MCU 间的数据字典协商流程
 - [时钟与定时器（reactor）](reactor.md) — 机器的时钟、定时器契约，以及与上游 reactor/greenlet 的对应
-- [内部架构](architecture.md) — 收发任务、合并发送、路由优先级、性能特性
+- [内部架构](architecture.md) — 传输层与 TRACE 日志的开启方式、收发任务、合并发送、路由优先级、性能特性
 - [测试](testing.md) — 测试覆盖与运行方式
 
 ---

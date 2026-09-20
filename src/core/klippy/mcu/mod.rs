@@ -43,9 +43,10 @@ use crate::core::klippy::msg::error::MsgError;
 use crate::core::klippy::msg::parser::Parser;
 use crate::core::klippy::msg::proto::{ArgValue, Payload};
 use crate::core::klippy::msg::Msg;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{sleep, Duration};
 use tracing::{debug, error, info, warn};
 /// One item on the outbound queue: a message, or a barrier that asks the send
@@ -98,11 +99,10 @@ pub struct Mcu {
     pending_calls: PendingCalls,
     /// Interface clone kept so the device can be shut down on drop.
     interface: Interface,
-    /// Set by the receive task when the firmware answers with a sequence that
-    /// cannot belong to this connection — one from an older session, which only a
-    /// firmware that never rebooted can send. [`Mcu::answered_from_old_session`]
-    /// reads it back.
-    old_session: Arc<AtomicBool>,
+    /// The sequence state of this connection, shared with both of its tasks: the
+    /// number the next block carries, and whether the connection had to take over a
+    /// session that was already running (see [`Wire`]).
+    wire: Arc<Wire>,
     /// Handle to the receive task, used to abort it on drop.
     recv_handle: Option<tokio::task::JoinHandle<()>>,
 }
@@ -198,6 +198,182 @@ fn describe_bytes(bytes: &[u8]) -> String {
     out
 }
 
+/// How many blocks may be on the wire unanswered.
+///
+/// The bound upstream puts on its send window (`third_party/klipper/klippy/chelper/
+/// serialqueue.c:109`, `MAX_PENDING_BLOCKS = 12`): an MCU that has stopped
+/// answering has to back the host up rather than let the queue of unacknowledged
+/// blocks grow without end.
+const MAX_PENDING_BLOCKS: usize = 12;
+
+/// The sequence state one connection shares with the firmware.
+///
+/// Klipper's firmware keeps one `next_sequence` (`third_party/klipper/src/command.c:16`):
+/// every frame it sends is stamped with it, a block is accepted only when it
+/// carries it, and accepting a block advances it **before** the block is
+/// dispatched (`:301-305`). So the two ends share one number, and the firmware's
+/// own frames are what say where it is: **the sequence of an empty (ack/nak) frame
+/// is the number the next block has to carry** — the ack that follows block N
+/// carries N+1, and the nak for a block the firmware would not take carries
+/// whatever it is still waiting for.
+///
+/// The send task owns the number: it is the only writer to the wire. What comes
+/// back is where the firmware is, and when that is not what this connection would
+/// send next, the firmware is in a session this connection did not open — a board
+/// that never rebooted — or a block went missing. Upstream reads the number the
+/// same way, and adopts it for the same reason (`serialqueue.c:196-201`: "Got an
+/// ack for a message not sent; must be connection init").
+#[derive(Debug, Default)]
+struct Wire {
+    /// The sequence the **next** new block will carry: the firmware's
+    /// `next_sequence`, as far as this connection knows.
+    ///
+    /// Unwrapped into a monotonic counter, because the 4-bit value on the wire
+    /// only ever moves forward: a frame that looks behind is really ahead.
+    next: AtomicU64,
+    /// Set when the connection's first frame showed a firmware that was already
+    /// mid-session, i.e. one nothing had reset.
+    took_over: AtomicBool,
+}
+
+/// The send task's side of a connection.
+///
+/// It is the only writer to the wire, so the sequence and the blocks waiting to be
+/// acknowledged live here and nowhere else.
+struct Sender {
+    /// The sequence state, shared with the receive side (see [`Wire`]).
+    wire: Arc<Wire>,
+    /// Blocks that went out and have not been answered, oldest first. Their
+    /// payloads are what a nak — or a number from an earlier session — has to put
+    /// back on the wire.
+    in_flight: VecDeque<(u64, Frame)>,
+    /// The last ack/nak this connection acted on, and the value a retransmit has
+    /// already been done for: the firmware repeats its ack/nak for as long as it
+    /// waits, and one retransmit per value is what upstream allows
+    /// (`serialqueue.c:451-454`, `ignore_nak_seq`).
+    acked: Option<u64>,
+    retransmitted: Option<u64>,
+}
+
+impl Sender {
+    fn new(wire: Arc<Wire>) -> Self {
+        Self {
+            wire,
+            in_flight: VecDeque::new(),
+            acked: None,
+            retransmitted: None,
+        }
+    }
+
+    /// Whether the window is full: the host has to wait for answers before it puts
+    /// another block on the wire.
+    fn is_full(&self) -> bool {
+        self.in_flight.len() >= MAX_PENDING_BLOCKS
+    }
+
+    /// Put one block on the wire, carrying the sequence this connection is at, and
+    /// remember it until the firmware answers it.
+    async fn send_block(&mut self, interface: &Interface, payload: Vec<u8>) {
+        // The counter is unwrapped here and only its low four bits go on the wire
+        // (`Frame` keeps what it is given and masks when encoding), but the frame
+        // this connection remembers has to carry those four bits too: that is what
+        // a frame parsed off the wire carries, and the two are compared.
+        let seq = self.wire.next.load(Ordering::Relaxed);
+        let frame = Frame::new((seq & 0xf) as u8, payload);
+        // Advance **before** writing. The firmware can answer while the write is
+        // still in flight, and the receive side reads this number to tell an answer
+        // to a block this connection sent from one that belongs to an earlier
+        // session: with the number still one behind, a perfectly good response
+        // would look like it answered a block that was never sent. Upstream orders
+        // it the same way (`serialqueue.c`: `build_and_send_command` advances
+        // `send_seq`, its caller writes the block).
+        self.wire.next.store(seq + 1, Ordering::Relaxed);
+        match interface.send(frame.clone()).await {
+            Ok(()) => self.in_flight.push_back((seq, frame)),
+            Err(e) => {
+                // Nothing went out, so the number was not used after all.
+                error!("Send failed (seq={}): {e}", seq & 0xf);
+                self.wire.next.store(seq, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Put one block back on the wire **as it was**, sequence and all.
+    ///
+    /// That is what the firmware's numbering asks for: it is waiting for exactly
+    /// that block, and a block it had already taken would be answered with a nak
+    /// instead of being run twice.
+    async fn resend_block(&mut self, interface: &Interface, seq: u64, frame: Frame) {
+        match interface.send(frame.clone()).await {
+            Ok(()) => {
+                debug!("Block {seq} sent again");
+                self.in_flight.push_back((seq, frame));
+            }
+            Err(e) => error!("Retransmit failed (seq={}): {e}", frame.seq()),
+        }
+    }
+
+    /// Take in what the firmware's counter has been seen at.
+    ///
+    /// `seen` is that number in this connection's unwrapped sequence. Everything
+    /// below it is a block the firmware accepted. What is left is one of two
+    /// things, told apart by which side of `next` the number is on:
+    ///
+    /// * **ahead of `next`** — the number comes from a session that was already
+    ///   running; only the connection's first frame can be (see [`Wire`]). Adopt
+    ///   it, and renumber and resend everything unacknowledged: the nak that
+    ///   carried it is proof the firmware never ran those blocks, while a block it
+    ///   did run would come back as a nak rather than run twice.
+    /// * **not newer than the last one** — the same ack/nak again, i.e. the
+    ///   firmware is still waiting for the block this connection sent and it never
+    ///   arrived. Put the unacknowledged blocks back **as they are**: their
+    ///   sequences are the ones being waited for.
+    async fn settle(&mut self, interface: &Interface, seen: u64) {
+        let next = self.wire.next.load(Ordering::Relaxed);
+        if seen > next {
+            // First, because the numbering is not shared yet: nothing the firmware
+            // has said about its own counter can say anything about the blocks this
+            // connection numbered by itself — in particular it must not be read as
+            // "those blocks were accepted", or the block that has to go out again
+            // would be dropped instead.
+            debug!("Firmware is at {seen}, this connection would send {next}: taking it over");
+            self.wire.next.store(seen, Ordering::Relaxed);
+            self.acked = None;
+            self.retransmitted = None;
+            let again: Vec<(u64, Frame)> = self.in_flight.drain(..).collect();
+            for (_, frame) in again {
+                self.send_block(interface, frame.payload().to_vec()).await;
+            }
+            return;
+        }
+
+        // The numbering is shared, so the firmware's counter says which blocks it
+        // took: everything below it.
+        while self.in_flight.front().is_some_and(|(seq, _)| *seq < seen) {
+            let (seq, _) = self.in_flight.pop_front().expect("checked just above");
+            debug!("Block {seq} acknowledged");
+        }
+
+        match self.acked {
+            Some(previous) if seen <= previous => {
+                // The firmware saying the same thing again is a nak
+                // (`serialqueue.c:291-293`): what it is waiting for never arrived.
+                if self.retransmitted != Some(seen) {
+                    self.retransmitted = Some(seen);
+                    let again: Vec<(u64, Frame)> = self.in_flight.drain(..).collect();
+                    for (seq, frame) in again {
+                        self.resend_block(interface, seq, frame).await;
+                    }
+                }
+            }
+            _ => {
+                self.acked = Some(seen);
+                self.retransmitted = None;
+            }
+        }
+    }
+}
+
 impl Mcu {
     /// Create a new MCU from a name and interface.
     fn from_parts(name: String, interface: Interface) -> Self {
@@ -212,22 +388,40 @@ impl Mcu {
         let pending_calls = PendingCalls::new();
         let pending_calls_for_task = pending_calls.clone();
 
+        let wire = Arc::new(Wire::default());
         let (send_buf_tx, mut send_buf_rx) = mpsc::channel::<SendItem>(32);
+        // Where the firmware's counter has been seen at, one value per ack/nak
+        // frame (see `Wire`). A watch channel: only the newest value matters, the
+        // receive task must never be held up by the send task, and every change
+        // wakes it — including a repeated value, which is a nak (`Sender::settle`).
+        let (acks_tx, mut acks_rx) = watch::channel(0u64);
         let interface_for_send = interface.clone();
+        let wire_for_send = Arc::clone(&wire);
 
         tokio::spawn(async move {
-            let mut seq = 0u8;
+            let mut sender = Sender::new(Arc::clone(&wire_for_send));
 
             loop {
-                // Wait for the first message of a batch. A flush with nothing
-                // queued before it is already satisfied.
-                let mut payload = match send_buf_rx.recv().await {
-                    Some(SendItem::Payload(p)) => p,
-                    Some(SendItem::Flush(done)) => {
-                        let _ = done.send(());
+                // Wait for the first message of a batch — or for the firmware's
+                // counter to move, which is what asks for a block to go out again.
+                // A flush with nothing queued before it is already satisfied.
+                let mut payload = tokio::select! {
+                    item = send_buf_rx.recv() => match item {
+                        Some(SendItem::Payload(p)) => p,
+                        Some(SendItem::Flush(done)) => {
+                            let _ = done.send(());
+                            continue;
+                        }
+                        None => break, // channel closed
+                    },
+                    changed = acks_rx.changed() => {
+                        if changed.is_err() {
+                            break; // receive task gone: the device is shutting down
+                        }
+                        let seen = *acks_rx.borrow_and_update();
+                        sender.settle(&interface_for_send, seen).await;
                         continue;
                     }
-                    None => break, // channel closed
                 };
 
                 // Coalesce more payloads until the batch is full, a flush asks
@@ -239,14 +433,16 @@ impl Mcu {
                         break;
                     }
 
-                    // Wait for more data, a flush, or a short idle timeout.
+                    // Wait for more data, a flush, an ack, or a short idle timeout.
                     tokio::select! {
                         maybe_next = send_buf_rx.recv() => {
                             match maybe_next {
                                 Some(SendItem::Payload(next_payload)) => {
                                     if payload.try_merge(&next_payload).is_err() {
                                         // Merge failed (would exceed max), send current batch first
-                                        Self::send_batch(&interface_for_send, &mut seq, payload).await;
+                                        sender
+                                            .send_block(&interface_for_send, payload.into_raw())
+                                            .await;
                                         // Start new batch with next
                                         payload = next_payload;
                                         continue;
@@ -263,6 +459,13 @@ impl Mcu {
                                 }
                             }
                         }
+                        changed = acks_rx.changed() => {
+                            if changed.is_err() {
+                                break;
+                            }
+                            let seen = *acks_rx.borrow_and_update();
+                            sender.settle(&interface_for_send, seen).await;
+                        }
                         _ = sleep(Duration::from_millis(1)) => {
                             // Timeout, send accumulated batch
                             break;
@@ -270,9 +473,21 @@ impl Mcu {
                     }
                 }
 
+                // An MCU that has stopped answering has to back the host up
+                // instead of growing the queue of unacknowledged blocks.
+                while sender.is_full() {
+                    if acks_rx.changed().await.is_err() {
+                        break; // receive task gone: the device is shutting down
+                    }
+                    let seen = *acks_rx.borrow_and_update();
+                    sender.settle(&interface_for_send, seen).await;
+                }
+
                 // send the batched payload to the MCU
                 debug!("Sending batch: {} bytes", payload.len());
-                Self::send_batch(&interface_for_send, &mut seq, payload).await;
+                sender
+                    .send_block(&interface_for_send, payload.into_raw())
+                    .await;
                 if let Some(done) = flush_done {
                     let _ = done.send(());
                 }
@@ -280,14 +495,13 @@ impl Mcu {
         });
 
         let interface_for_recv = interface.clone();
-        let old_session = Arc::new(AtomicBool::new(false));
-        let old_session_for_task = Arc::clone(&old_session);
+        let wire_for_recv = Arc::clone(&wire);
         let recv_handle = tokio::spawn(async move {
-            let mut seq = 0u8;
-            // A firmware that answers from an older session repeats the same
-            // frame for as long as the handshake waits, so the mismatch is worth
-            // saying once and not once per frame.
-            let mut reported = false;
+            // The firmware's counter in this connection's unwrapped numbering, and
+            // how many frames have been accepted: the first frame is what says
+            // whether the firmware was already running (`Wire::took_over`).
+            let mut seen = 0u64;
+            let mut frames = 0usize;
 
             loop {
                 let frame = match interface_for_recv.receive().await {
@@ -296,48 +510,57 @@ impl Mcu {
                     None => break,
                 };
 
-                // The MCU stamps every frame it sends while handling a block with
-                // that block's sequence, so one request can produce several frames
-                // sharing a sequence: a response per message, plus the ack that
-                // carries no payload. Sequence numbers therefore identify the block
-                // being answered, not the individual frame, and only ever move
-                // forward — a frame is either another answer to the block we are
-                // waiting on (`seq`), or the first answer to the block after it
-                // (`seq + 1`). Klipper's client tracks the same thing with a send
-                // window; this transport sends one block at a time and never
-                // retransmits, so the window collapses to those two values.
-                //
-                // Nothing has been accepted yet (`seq == 0`) and the frame still
-                // does not fit: the firmware is in a session this connection did
-                // not open, i.e. it kept running since it last spoke to a host.
-                if frame.seq() != seq && frame.seq() != (seq + 1) & 0xf {
-                    if seq == 0 {
-                        old_session_for_task.store(true, Ordering::Relaxed);
-                    }
-                    if reported {
-                        debug!(
-                            "Seq mismatch: expected {} or {}, got {}",
-                            seq,
-                            (seq + 1) & 0xf,
-                            frame.seq()
-                        );
-                    } else {
-                        reported = true;
+                // The firmware stamps everything it sends with its one counter, and
+                // that counter only ever moves forward (`src/command.c:16,208,301-305`):
+                // map the 4-bit value onto this connection's unwrapped one, so a
+                // frame that looks behind is read as ahead.
+                let delta = (frame.seq().wrapping_sub(seen as u8) & 0xf) as u64;
+                let rseq = seen + delta;
+                if delta != 0 {
+                    // A new number: it answers a block. The firmware's counter is
+                    // the authority on which blocks those are, so a number past
+                    // anything this connection sent comes from a session that came
+                    // before it — which the *first* frame of a connection always is
+                    // when the board never rebooted. That is how a running firmware
+                    // is taken over (`serialqueue.c:196-201`); the send task adopts
+                    // the number and puts what was not accepted back on the wire.
+                    let next = wire_for_recv.next.load(Ordering::Relaxed);
+                    if frames > 0 && rseq > next {
                         warn!(
-                            "Seq mismatch: expected {} or {}, got {}",
-                            seq,
-                            (seq + 1) & 0xf,
-                            frame.seq()
+                            "Frame with sequence {rseq} answers block {next} or later, which this \
+                             connection never sent; dropping it"
+                        );
+                        continue;
+                    }
+                    seen = rseq;
+                    if frames == 0 && rseq > 1 {
+                        // A firmware that just booted answers this connection's
+                        // first block with 0 or 1 (`src/command.c`, whose counter
+                        // starts at 0). Anything else was already running when the
+                        // port was opened — a board nothing reset.
+                        wire_for_recv.took_over.store(true, Ordering::Relaxed);
+                        info!(
+                            "Firmware is still in an earlier session (sequence {rseq}); \
+                             taking it over"
                         );
                     }
-                    continue;
+                    // A data frame is a response, and the ack that follows it (in
+                    // the normal flow) carries the same number — so a takeover is
+                    // the only thing about a data frame the send task has to know.
+                    if rseq > next {
+                        let _ = acks_tx.send(seen);
+                    }
                 }
-                seq = frame.seq();
+                frames += 1;
 
-                // An empty frame is the MCU's acknowledgement of a block: it exists
-                // to advance the sequence, and carries nothing to decode.
+                // An empty frame is the MCU's ack of the block it took, or its nak
+                // of one it would not take. Either way its number is where the
+                // firmware is — the same number its response carried — and the send
+                // task is the one that acts on it: an ack drops what it proves was
+                // accepted, a nak puts it back on the wire.
                 if frame.payload().is_empty() {
                     debug!("Ack for block {}", frame.seq());
+                    let _ = acks_tx.send(seen);
                     continue;
                 }
 
@@ -384,7 +607,7 @@ impl Mcu {
             send_buf_tx,
             pending_calls,
             interface,
-            old_session,
+            wire,
             recv_handle: Some(recv_handle),
         }
     }
@@ -408,16 +631,21 @@ impl Mcu {
         Self::from_parts(name.into(), interface)
     }
 
-    /// Whether the firmware has answered from a session **older** than this
-    /// connection.
+    /// Whether this connection had to take over a session that was already
+    /// running.
     ///
-    /// A firmware that just rebooted starts its sequence over, so a frame that
-    /// fits neither the block being answered nor the one after it can only come
-    /// from a session that was already running. That is how an `rpi_usb` reset
-    /// learns that its port switch disconnected the board without resetting it:
-    /// [`Mcu::connect`] reports it as [`McuError::OldSession`].
-    pub fn answered_from_old_session(&self) -> bool {
-        self.old_session.load(Ordering::Relaxed)
+    /// A firmware that just booted answers the connection's first block with
+    /// sequence 0 or 1, because its counter starts over (`src/command.c:16`).
+    /// Anything else is a board that was already mid-session, and the transport
+    /// adopts the number the firmware is waiting for and puts the unanswered
+    /// blocks back on the wire (see `Wire`, the transport's shared sequence).
+    ///
+    /// That is the one thing a reconnect can observe to tell "the board rebooted"
+    /// from "the board was only disconnected": an `rpi_usb` port switch that does
+    /// not really switch power leaves the firmware running, and the caller that
+    /// asked for the reset reads this to find out (`mcu/object.rs`).
+    pub fn took_over_session(&self) -> bool {
+        self.wire.took_over.load(Ordering::Relaxed)
     }
 
     /// Install the firmware's data dictionary.
@@ -486,20 +714,6 @@ impl Mcu {
     /// degrade use this instead of [`Mcu::require_message`]'s hard failure.
     pub(crate) fn has_message(&self, name: &str) -> bool {
         self.parser.lookup(name).is_some()
-    }
-
-    /// Send a batched payload to the MCU.
-    ///
-    /// Increments the sequence number on success, logs errors.
-    async fn send_batch(interface: &Interface, seq: &mut u8, payload: Payload) {
-        let seq_num = *seq;
-        match interface
-            .send(Frame::new(seq_num, payload.into_raw()))
-            .await
-        {
-            Ok(()) => *seq = (seq_num + 1) & 0xf,
-            Err(e) => error!("Send failed (seq={seq_num}): {e}"),
-        }
     }
 
     /// Get the MCU name.
@@ -863,7 +1077,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_stale_sequence_is_dropped() {
+    async fn test_a_running_firmware_is_taken_over() {
         let mut parser = Parser::new();
         parser.register(5, "get_clock").unwrap();
         parser.register(18, "clock clock=%u").unwrap();
@@ -871,11 +1085,103 @@ mod tests {
         answer.push_i16(18).unwrap();
         answer.push_u32(1).unwrap();
 
-        // A frame numbered well behind the block being answered is not part of
-        // this exchange, so it is dropped and the call times out.
+        // A board that never rebooted is still at some number from the session
+        // before this one, and naks the block it cannot place — with a frame
+        // carrying that number (`src/command.c:331`, an empty ack/nak frame). The
+        // transport has to adopt it, put the request back on the wire under it, and
+        // carry on: the second mapping is the firmware accepting *that* block.
+        let device = TestDevice::new(vec![
+            MappingEntry {
+                input: make_frame(0, &[5]),
+                outputs: vec![make_frame(9, &[])],
+            },
+            MappingEntry {
+                input: make_frame(9, &[5]),
+                outputs: vec![make_frame(9, &answer.clone().into_raw())],
+            },
+        ]);
+        let recorder = device.recorder();
+        let mcu = Mcu::for_test("test_mcu", Interface::new(device));
+        let dictionary = Dictionary::from_json(serde_json::json!({
+            "commands": {"get_clock": 5},
+            "responses": {"clock clock=%u": 18}
+        }))
+        .unwrap();
+        mcu.install_dictionary(dictionary).unwrap();
+
+        let params = mcu
+            .call("get_clock", &[], "clock", Duration::from_millis(200))
+            .await
+            .expect("the request is answered once the session is taken over");
+        assert_eq!(params.len(), 1);
+        assert!(
+            mcu.took_over_session(),
+            "the firmware was mid-session: the caller has to be able to tell"
+        );
+
+        // The request went out twice: once at the number this connection started
+        // with, and once at the firmware's own.
+        let sent = recorder.frames();
+        let seqs: Vec<u8> = sent.iter().map(|frame| frame.seq()).collect();
+        assert_eq!(seqs, [0, 9], "the block is renumbered, not just repeated");
+    }
+
+    #[tokio::test]
+    async fn test_a_fresh_firmware_needs_no_taking_over() {
+        let mut parser = Parser::new();
+        parser.register(5, "get_clock").unwrap();
+        parser.register(18, "clock clock=%u").unwrap();
+        let mut answer = Payload::new();
+        answer.push_i16(18).unwrap();
+        answer.push_u32(1).unwrap();
+
+        // What a board that just booted does: it answers block 0 with 1 (the number
+        // its counter moved to), and then acks it with the same number. Nothing is
+        // sent a second time, and no takeover is reported.
         let device = TestDevice::new(vec![MappingEntry {
             input: make_frame(0, &[5]),
-            outputs: vec![make_frame(9, &answer.into_raw())],
+            outputs: vec![
+                make_frame(1, &answer.clone().into_raw()),
+                make_frame(1, &[]),
+            ],
+        }]);
+        let recorder = device.recorder();
+        let mcu = Mcu::for_test("test_mcu", Interface::new(device));
+        let dictionary = Dictionary::from_json(serde_json::json!({
+            "commands": {"get_clock": 5},
+            "responses": {"clock clock=%u": 18}
+        }))
+        .unwrap();
+        mcu.install_dictionary(dictionary).unwrap();
+
+        mcu.call("get_clock", &[], "clock", Duration::from_millis(200))
+            .await
+            .expect("the request is answered");
+
+        assert!(!mcu.took_over_session());
+        let sent = recorder.frames();
+        assert_eq!(sent.len(), 1, "an ack is not a nak: nothing goes out again");
+    }
+
+    #[tokio::test]
+    async fn test_a_frame_answering_a_block_we_never_sent_is_dropped() {
+        let mut parser = Parser::new();
+        parser.register(5, "get_clock").unwrap();
+        parser.register(18, "clock clock=%u").unwrap();
+        let mut answer = Payload::new();
+        answer.push_i16(18).unwrap();
+        answer.push_u32(1).unwrap();
+
+        // The answer, and then a frame numbered past anything this connection sent.
+        // Only the *first* frame of a connection may be that (it is a session to
+        // take over); later ones are dropped, and an exchange that follows must not
+        // be disturbed by them.
+        let device = TestDevice::new(vec![MappingEntry {
+            input: make_frame(0, &[5]),
+            outputs: vec![
+                make_frame(1, &answer.clone().into_raw()),
+                make_frame(5, &[]),
+            ],
         }]);
         let mcu = Mcu::for_test("test_mcu", Interface::new(device));
         let dictionary = Dictionary::from_json(serde_json::json!({
@@ -885,18 +1191,14 @@ mod tests {
         .unwrap();
         mcu.install_dictionary(dictionary).unwrap();
 
-        let err = mcu
-            .call("get_clock", &[], "clock", Duration::from_millis(50))
+        mcu.call("get_clock", &[], "clock", Duration::from_millis(200))
             .await
-            .unwrap_err();
+            .expect("the request is answered");
+
         assert!(
-            matches!(err, McuCallError::Timeout(_)),
-            "expected a timeout, got {err:?}"
+            !mcu.took_over_session(),
+            "a stray frame after the first one is not a session to take over"
         );
-        // The frame fitted no session this connection could have opened, which
-        // is what a caller uses to tell a rebooted board from one that kept
-        // running.
-        assert!(mcu.answered_from_old_session());
     }
 
     // -----------------------------------------------------------------------

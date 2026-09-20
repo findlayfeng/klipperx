@@ -47,7 +47,7 @@
 | C2 | 配置装载收尾（option 校验、第二个住户） | — |
 | D1 | 主机层 start args / rollover / `--logfile` | — |
 | D2 | `restart_method` 分派（重启循环已完成） | — |
-| D3 | `command` 接管一块**还在跑**的板子（序号对齐 + NAK 重传） | — |
+| D3 | `command` 接管一块**还在跑**的板子（序号对齐已做；剩 RTO 定时重传、`reset` 命令） | — |
 | E1 | 文档 | — |
 | E2 | `python_path` 的取消 | 外部项目 |
 
@@ -420,28 +420,33 @@ DTR”隐式满足，但那是驱动副作用，不算实现。**
 ### D3 `command` 接管一块还在跑的板子
 
 **为什么**：`rpi_usb` 切不了 VBUS 的机器（根 hub 报 `no power switching`，或板子自带电源）上，
-klipperx 现在会当场回退到 `command`（`mcu/object.rs`）。但 `command` 目前**接管不了一块还在跑的
-板子**：`config_reset` 要连接上才能发，而重连时对手的序号接着上一条会话走，我们只收
-`seq` / `seq+1`（`mcu/mod.rs` 的接收任务），于是只告警丢弃 → identify 超时。结果是那次回退只是
-不再白切电，板子仍得物理复位。
+klipperx 会当场回退到 `command`（`mcu/object.rs`）。而 `command` 的 `config_reset` 要连接上才能发，
+重连时对手的序号接着上一条会话走——**这不是边缘情况**：普通 `RESTART` 也只是重建对象、重新
+open + identify，同样要接上一块没被复位的固件。
 
-**上游是怎么做的**（`klippy/chelper/serialqueue.c`，值得照着抄）：
+**已做（第一版，NAK/旧会话驱动）**：`mcu/mod.rs` 的传输层现在两端共用一个号：
 
-- 序号是**线上共享**的：固件 `src/command.c` 用一个 `next_sequence` 既盖自己发出的帧、也校验收到
-  的帧；对不上的帧回 NAK，而 NAK 帧**带着它自己的 `next_sequence`**。
-- 所以上游主机把收到的序号**当成对齐依据**：`handle_message()` 按前向差值算 `rseq`，且
-  `receive_seq == 1`（首帧）时不走“ack for unsent”那条拒绝 → 首帧一律接受，
-  `update_receive_seq()` 顺手把 `send_seq` 对齐到那条会话；握手请求在下一次重传里用对齐后的
-  序号发出。
-- 重传是前提：`SQPT_RETRANSMIT` 定时器 + 窗口（`MAX_PENDING_BLOCKS`）在 NAK/超时后重发同一块。
-  我们的传输是“一次一块、不重传”，所以这块要先定形状：要么加最小重传（首帧对齐 + 同块重发），
-  要么只给 `Mcu::connect` 的握手加一次“按 NAK 序号重试”。
+- 发送任务独占 `Wire::next`（展开成单调计数，只有低 4 位上线），**写线之前就推进**（固件可能在写
+  没返回时答上来）；已发未确认的块连原始 `Frame` 存在 `in_flight`，窗口 12（对齐上游
+  `MAX_PENDING_BLOCKS`），满了就等 ack（背压）。
+- 接收任务把 4 位号按**前向差值**展开，首帧免检；**空帧的号就是固件此刻在等的号**，一律报给发送
+  任务（`watch` 通道，值相同也会唤醒——重复 ack 就是 NAK）。
+- `Sender::settle` 三条规则：号**大于** `next` → 采纳它的号并**换号重发**未确认的块（NAK 证明那些
+  块没被执行过）；号**不比上次新** → **原号重发**（它在等的那块丢了；已收下的块会被 NAK 而不会
+  重跑）；否则就是 ack，丢掉被证明收下的块。
+- 事实暴露为 `Mcu::took_over_session()`，`rpi_usb` 的“有没有真重启”检查改读它
+  （`mcu/object.rs`）——握手现在会**成功**，所以判据不能再是“握手失败”。
 
-**验收**：一块停在旧会话的板子（现在报
-`Connection: the firmware answered from an older session …`）应当能在不改 `restart_method` 的情况下
-连上；这样 `firmware_restart` 在那台根 hub 机器上也不再需要手动复位。另注：`command` 现在走的是
-`config_reset`（清配置），上游还会优先用固件的 `reset` 命令（真重启 MCU，`HF_IN_SHUTDOWN`），
-那一条在 B2 的剩余里。
+**测试怎么验的**：假设备三条（接管、刚开机不接管、越号帧被丢）；**真固件**那条把
+`test_identify_against_the_real_library` 扩成两幕——同进程第二次连接，库里的序号接着上一次走，
+必须接管才能接上（测试用多一个 `dlopen` 句柄把映射钉住，否则 `dlclose` 会把固件状态一并初始化）。
+测试过程中抓到两个真 bug：① 展开后的 u64 忘了取低位（`16 as u8` 不是 0，第 17 块才暴露）；
+② `next` 推进晚于写线，设备在写返回前就答上来 → 合法响应被判成越号帧丢掉（对上游
+`build_and_send_command` 是先推进再写）。
+
+**还剩**：RTO 定时重传（帧丢了、固件也在静等时，现在只能靠对端再发 ack/NAK 触发）；以及
+`command` 走的是 `config_reset`（清配置），上游还会优先用固件的 `reset` 命令（真重启 MCU，
+`HF_IN_SHUTDOWN`），那一条在 B2 的剩余里。
 
 ### E1 文档
 

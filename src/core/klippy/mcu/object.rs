@@ -301,13 +301,15 @@ impl PrinterObject for McuObject {
                 .configure(&mcu)
                 .await
                 .map_err(|err| KlippyError::Connection(err.to_string()))?;
-            // A board that just rebooted comes up unconfigured and running; one
-            // that was already configured or stopped was only disconnected, and the
-            // port switch did not do its job.
-            if usb_reset && configured.already_running {
+            // A board that just rebooted has a sequence that starts over and no
+            // configuration: the transport had nothing to take over
+            // (`Mcu::took_over_session`), and the firmware was neither configured
+            // nor stopped when it answered. Anything else was only disconnected,
+            // and the port switch did not do its job.
+            if usb_reset && (mcu.took_over_session() || configured.already_running) {
                 self.usb_reset_unusable(
                     &config,
-                    "the firmware was already configured or stopped when it answered",
+                    "the firmware was still in the session that came before this connection",
                 );
             }
             // Only now does a firmware shutdown mean something the machine

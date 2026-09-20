@@ -173,7 +173,7 @@ Enter send · ↑↓ history · PgUp/PgDn · ^G g-code · .help · ^C quit
 | `Ctrl+L` | 清空日志 |
 | `Ctrl+C` / `Ctrl+D` / `Esc` | 退出（欠着的应答会先打完） |
 
-翻看旧日志时，最下面那行会提示 `scrolled back N lines`；按 `End` 或 `PgDn` 回到底部，
+翻看旧日志时，最下面那行会提示 `viewing older entries`；按 `End` 或 `PgDn` 回到底部，
 按 `Home` 回到顶端，或者直接敲下一条命令也会回到最新处。
 
 窗口用的是终端的备用屏幕，所以**退出之后你终端原本的 scrollback 里没有这些

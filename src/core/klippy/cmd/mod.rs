@@ -68,12 +68,16 @@ pub mod gpio;
 pub mod identify;
 pub mod pwm;
 pub mod shutdown;
+pub mod stepper;
 pub mod uptime;
 
 pub use adc::{AnalogInState, AnalogInStateOld, ConfigAnalogIn, QueryAnalogIn, QueryAnalogInOld};
 pub use clock::{ClockState, ClockSync, GetClock, McuClock};
 pub use gpio::{ConfigDigitalOut, QueueDigitalOut, SetDigitalOutPwmCycle, UpdateDigitalOut};
 pub use pwm::{ConfigPwmOut, QueuePwmOut};
+pub use stepper::{
+    ConfigStepper, QueueStep, ResetStepClock, SetNextStepDir, StepperGetPosition, StepperPosition,
+};
 
 use crate::core::klippy::mcu::{Dictionary, Enumeration, Mcu, McuError};
 use crate::core::klippy::msg::proto::{ArgType, ArgValue};

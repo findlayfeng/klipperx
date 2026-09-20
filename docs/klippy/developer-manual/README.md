@@ -278,6 +278,7 @@ API 本身在 `crates/klippy-api/src/`：
 - [时钟与定时器（reactor）](reactor.md) — 机器的时钟、定时器契约，以及与上游 reactor/greenlet 的对应
 - [运行时编排（机器与 API）](runtime.md) — 两个 runtime：机器专用、API 一个，以及边界约定与停机顺序
 - [延迟与抖动（主机侧）](latency.md) — 抖动从哪来，以及要不要绑核（结论：先度量，不急）
+- [压力测试（`klipperx stress`）](stress.md) — 给一块 MCU 逐步加大步进负载，直到它 shutdown
 - [内部架构](architecture.md) — 传输层与 TRACE 日志的开启方式、收发任务、合并发送、路由优先级、性能特性
 - [测试](testing.md) — 测试覆盖与运行方式
 

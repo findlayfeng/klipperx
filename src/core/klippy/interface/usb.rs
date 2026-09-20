@@ -104,11 +104,17 @@ pub enum UsbPower {
 
 /// Resolve the hub port a tty (e.g. `/dev/ttyACM0`) is attached to.
 ///
+/// The path is resolved first: a config may name `/dev/serial/by-id/…`, whose
+/// basename is not the tty's, and `/sys/class/tty` is keyed by the tty's own
+/// name.
+///
 /// # Errors
-/// Returns a message when the tty is not a USB device, or its topology cannot be
-/// read from sysfs.
+/// Returns a message when the tty cannot be resolved, is not a USB device, or its
+/// topology cannot be read from sysfs.
 pub fn resolve_tty_port(tty: &Path) -> Result<UsbPort, String> {
-    resolve_tty_port_in(Path::new("/sys"), tty)
+    let real =
+        fs::canonicalize(tty).map_err(|e| format!("usb: cannot resolve {}: {e}", tty.display()))?;
+    resolve_tty_port_in(Path::new("/sys"), &real)
 }
 
 /// Decide how `port` will be switched, and check that this process may do it.

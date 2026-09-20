@@ -2,137 +2,55 @@
 
 本文件只记**打算做什么**和**还没定的事**，不重复已经定下的设计（那些写在各模块文档和
 `docs/klippy/developer-manual/` 里）。括号里的 `klippy/xxx.py:NN` 指上游参考实现
-（`third_party/klipper/`），用来在动手前核对行为。已完成的条目只在下面留一行索引，
-细节留在各模块自己的文档里。
+（`third_party/klipper/`），用来在动手前核对行为。已完成的条目见文末「已完成（留档）」，
+只留一行索引，细节在各模块自己的文档里。
 
 ## 已定
 
-- **Printer 是一台机器，且只有单实现**：`src/core/klippy/printer.rs` 里就是一个 `Printer`
-  结构体（无 trait、无工厂），一个主机进程只跑一个；机器拥有它的组成部分（config
-  section 对应的 printer object）与生命周期；进程级的东西（命令行、日志、API server、
-  runtime、重启循环）是它上面的一层。
-- **`Kinematics` trait 与 `kinematics/` 已删**（连同 `load_kinematics` 工厂）：kinematics
-  不是 Printer 的分类依据，它是 toolhead 持有的一个对象；**等实现 toolhead 时再加回**。
-  上游证据：`klippy/toolhead.py:242` 是唯一装载点，`Printer` 类不知道 kinematics。
-- **MCU 一侧的分层已定**：`msg → mcu → cmd`，`event` / `identify` 平级
-  （`docs/klippy/developer-manual/architecture.md`、`README.md` 的分层表）。
-- **上线（bring-up）是机器的，executor 是调用方的**：`PrinterObject::connect()` 返回
-  一个 boxed `Future`（`std::future::Future`，不是 tokio 的），`Printer::bring_up()` 是
-  async，同步的 `run()` 只等退出。机器因此不依赖任何 runtime，谁驱动 `bring_up` 谁带
-  executor。上游的 `klippy:connect` handler 在这里被 `connect()` 方法取代，事件留给
-  观察者。
-- **组成部分由配置装载，装载顺序是契约**：`src/core/klippy/load.rs` 的静态工厂表
-  （`load_config` / `load_config_prefix`）是唯一的 section → object 入口；主 section 先于
-  前缀 section，各自按表序（`klippy/klippy.py:90-113`）。对象两段式构造：工厂只建对象并
-  登记（注册键是 section identifier），`PrinterObject::connect()` 才解析 section、开设备。
-  `webhooks` 由 `api::register` 在配置装载**之前**登记，所以 `objects/list` 从一而终以它
-  开头（`klippy/klippy.py:36-40`）。
+- **一台机器，单实现**：`Printer` 是一个结构体（无 trait、无工厂），一个进程只跑一个；机器
+  拥有它的组成部分与生命周期。进程级的东西（命令行、日志、API server、runtime、重启循环）
+  是它上面的一层。
+- **`Kinematics` 不是 Printer 的分类依据**：trait 与 `kinematics/` 已删，实现 toolhead 时再
+  加回、由 toolhead 持有（`klippy/toolhead.py:242` 是唯一装载点）。
+- **分层**：`msg → mcu → cmd`，`event` / `identify` 平级
+  （`docs/klippy/developer-manual/architecture.md`）。
+- **bring-up 是机器的，executor 是调用方的**：`PrinterObject::connect()` 返回 boxed
+  `std::future::Future`，`bring_up()` async、`run()` 同步只等退出；机器不依赖任何 runtime。
+- **配置装载是唯一入口，顺序是契约**：`load.rs` 的静态工厂表是唯一的 section → object 入口，
+  主 section 先于前缀 section；两段式构造（工厂只登记，`connect()` 才解析/开设备）；
+  `webhooks` 由 `api::register` 先装，所以 `objects/list` 从一而终以它开头
+  （`klippy/klippy.py:36-40` `:90-113`）。
 - **客户端 API 的线形状**以 `docs/klippy/third-party-dev/api-reference.md` 为准。
-
-## 已完成（留档）
-
-- **对象表与只读端点**：`add_object` / `objects` / `lookup_object` / `status_of`，
-  `objects/list` 与 `objects/query`（`printer.rs`、`api/endpoints/objects_{list,query}.rs`），
-  以及服务器侧的 `webhooks` 对象（`api/webhooks.rs`）；`api::register` 一次装完
-  （`api/mod.rs`）。
-- **`[mcu]` 住户**：`mcu::object::McuObject`，section 在 connect 时才解析、开设备、跑
-  identify，`get_status` 报 identify 快照（`mcu/object.rs`）。
-- **配置驱动装载**：静态工厂表、两段式构造顺序、section 级合法性校验
-  （`load.rs`，`load_config` 是 `Printer` 的方法）。
-- **主机层串起来**：`klippy_process`（建机器 → `api::register` → bind → `load_config`，
-  失败即 `invoke_shutdown` → `bring_up` → `run`）、`info` 端点与 `StartArgs`
-  （`src/klippy.rs`、`api/endpoints/info.rs`、`api/start_args.rs`）——重启循环除外，见 D2。
-- **`run()` 的形态**：`bring_up()` async、`run()` 同步只等退出、机器只用
-  `std::future::Future`，不起 tokio（`printer.rs`）。
-- **时钟与定时器**：`reactor` trait（`monotonic` / `register_timer` / `unregister_timer` /
-  `call_later`）与两个实现（主机 `TokioReactor`、测试 `ManualReactor`）；`Printer` 持有
-  `Arc<dyn Reactor>`，`eventtime` 走它，机器不拥有 runtime（`reactor.rs`、
-  `docs/klippy/developer-manual/reactor.md`）。
-- **`objects/subscribe`**：请求立即回一份全量快照，随后每 0.25 s（`SUBSCRIPTION_REFRESH_TIME`，
-  上游 `klippy/webhooks.py:467`）把变化的字段用 `response_template` 推给连接；连接关闭即
-  退订、最后一个退订时定时器自停；`objects/query` 与它共用字段选择
-  （`api/endpoints/objects_subscribe.rs`、`objects_query.rs`）。
-- **MCU 配置构建层（F1）**：`ConfigBuilder` 的 oid 发号、`config` / `restart` / `init` 三张命令表、
-  config 回调、CRC 与 `finalize_config`，以及 `configure()` 的 `get_config` 两段式下发；
-  `McuObject` 在 connect 时把累积的配置交给固件（`mcu/config.rs`、`mcu/object.rs`）。
-- **引脚解析与 `pins` 对象（F2）**：`PrinterPins` 的 `parse_pin` / `lookup_pin` / 共享与
-  多用途，`PinResolver` 的别名与保留，`RESERVE_PINS_*` 在 connect 时预留；`pins` 注册但
-  不可查询，为此 `PrinterObject` 加了 `is_queryable` / `queryable_objects`，并加了
-  `lookup_object_as`（`src/core/klippy/pins.rs`、`printer.rs`、`mcu/object.rs`）。
-- **GPIO 数字输出（F3 的 MCU 部分）**：`PinChip` / `DigitalOut` 接口与 `PrinterPins::setup_digital_out`
-  派发；`McuChip` + `McuDigitalOut` 在 config 回调里把 pin 名→编号，发出 `config_digital_out`
-  （含 `max_duration`、start/shutdown 约束）与 restart 的 `update_digital_out`，运行期可
-  `queue_digital_out` / `update_digital_out`（`cmd/gpio.rs`、`mcu/pin.rs`）。`output_pin`
-  消费者与 bus 同步输出等 gcode/运动层。
-- **GCODE 调度器（G1）**：`GCodeDispatch`（命令表 / `register_mux_command` / `run_script` /
-  输出处理器 / `get_status` 报命令表）与 `GcodeCommand`（传统 `S200` 与扩展 `KEY=VALUE`
-  两套参数、`get_*` 的上游文案错误）、内置命令与未 ready 行为（`src/core/klippy/gcode.rs`）。
-  在 `load_config` 里最先注册（`pins` 之前）。
-- **MCU 停机上报与就地复位（B2 大部）**：`shutdown` / `is_shutdown` / `starting` 事件
-  （`event/shutdown.rs`，`static_string_id` 解成原因），`McuObject` 在配置握手后绑成打印机停机；
-  `configure` 在固件停机或 CRC 不一致时用 `emergency_stop` + `config_reset` 就地复位再配置
-  （`mcu/config.rs`）。**真板子不必再先断电**。剩 `emergency_stop` 对象/端点与 `last_stats`。
-- **`output_pin` 的无条件 `setup_max_duration(0)`（修 G2 的 bug）**：此前默认 2 s 会让
-  `value: 1` + `shutdown_value: 0` 在 build 时报错；现与上游一致（`extras/output_pin.rs`）。
-- **`output_pin` 与 `SET_PIN`（G2）**：`[output_pin <name>]`（`pin` / `value` / `shutdown_value`）
-  用 `setup_digital_out` 建输出（无条件 `setup_max_duration(0)`）并注册 `SET_PIN PIN=… VALUE=…`；
-  从 API 发 `gcode/script` 就能点灯（端点属 G3）。`pwm` 暂拒，`SET_PIN` 先立即生效
-  （`extras/output_pin.rs`、`load.rs`）。
-- **`gcode/*` 端点（G3 的四个）**：`gcode/help` / `gcode/script` / `gcode/restart` /
-  `gcode/firmware_restart`；命令错误用新增的 `ApiError::CommandError`（不关停 klippy）；
-  端点按请求从 `printer` 取 `gcode`（`api/endpoints/gcode.rs`、`crates/klippy-api/src/protocol.rs`）。
-  这样**从 API 发 `SET_PIN` 点灯已经通了**。
-- **`gcode/subscribe_output`（G3 剩余）**：连接被包成带 `is_closed` 的 `OutputHandler`，推
-  `{response: line}`；输出处理器从“只增”改成可剪。**TUI 新增 g-code 模式**（`^G` / `.gcode`）：
-  整行走 `gcode/script`，首次进入自动订阅，`// …` 与 `!! …` 都会显示（`gcode.rs`、
-  `crates/klippy-client/src/{session,tui}.rs`）。
+- **重启是就地重建**（Q7 的答案）：`restart` / `firmware_restart` 在同一个 `Arc<Printer>` 上
+  `reset_for_restart()` → 重载配置 → 再 `bring_up`，端点与 `--tui` 的 in-process server 全程
+  有效；不换 printer、不重建 Api/Server。
 
 ## 待办
 
-**当前选择：GCODE 驱动**。G1（调度器）、G2（`output_pin` + `SET_PIN`）与 G3（全部 `gcode/*`，
-含 `subscribe_output`）已完成，**已可从 API 或 TUI 的 g-code 模式点灯并看到输出**；
-剩 G4（运动命令，随 C1）。执行层做不到的地方先用占位：`SET_PIN` 现为立即
-`update_digital_out`（不排程），`gcode/restart` 直接退出进程（无重启循环 D2）。
-
-编号保留旧文件的 T/Q 以便对照，新增项给新号。依赖列的是**工具性前置**，不是自然顺序。
+依赖列的是**工具性前置**，不是自然顺序。
 
 | # | 事项 | 依赖 |
 |---|---|---|
-| G4 | 运动命令（G0/G1/G28…） | G1 ✓、C1 |
-| A1b | reactor 串行调度器与延迟度量 | A1 ✓ |
+| G4 | 运动命令（G0/G1/G28…） | G1、C1 |
+| A1b | reactor 串行调度器与延迟度量 | A1 |
 | A2 | 错误词汇（`CommandError` / `ConfigError`） | — |
-| B2 | MCU 剩余：`emergency_stop` 对象/端点与 `last_stats` | — |
+| B2 | MCU 剩余：`emergency_stop` 对象/端点、`last_stats`、`restart_method` 校验 | — |
 | B4 | 其余端点（estop / remote method / pause_resume / …） | G3 等 |
 | F3 | `MCU_bus_digital_out`（命令队列/运动同步输出） | C1 |
-| F4 | PWM（硬件 / 软件） | F1 ✓、F2 ✓ |
-| F5 | ADC | F1 ✓、F2 ✓ |
-| F6 | SPI 总线 | F1 ✓、F2 ✓ |
-| F7 | I2C 总线 | F1 ✓、F2 ✓ |
-| F8 | endstop / trsync | F1 ✓、F2 ✓、C1 |
+| F4 | PWM（硬件 / 软件） | F1、F2 |
+| F5 | ADC | F1、F2 |
+| F6 | SPI 总线 | F1、F2 |
+| F7 | I2C 总线 | F1、F2 |
+| F8 | endstop / trsync | F1、F2、C1 |
 | F9 | 输入与外设资源（buttons / pulse_counter / …） | F1–F7 |
 | C1 | toolhead 与 kinematics | — |
 | C2 | 配置装载收尾（option 校验、第二个住户） | — |
 | D1 | 主机层 start args / rollover / `--logfile` | — |
-| D2 | 重启循环 | Q7 |
+| D2 | `restart_method` 分派（重启循环已完成） | — |
 | E1 | 文档 | — |
 | E2 | `python_path` 的取消 | 外部项目 |
 
-### A1（旧 T3）reactor 抽象与定时器 —— 已完成
-
-- [x] 最小 trait 与两个实现（`src/core/klippy/reactor.rs`）：`monotonic`、`register_timer`
-      （回调收到事件时刻、返回下次唤醒时间或 `None`，上游 `klippy/reactor.py:145`
-      `:157-172` 的契约）、`unregister_timer`、`call_later`（上游 `register_callback`
-      `:187` 的一次性版）。机器拿 `Arc<dyn Reactor>`，主机传 `TokioReactor`（定时器是
-      建在自己 runtime 上的 tokio 任务），测试传可手动拨表的 `ManualReactor`。
-- [x] `Printer::eventtime` 改为读 reactor 的钟（`printer.rs`），并加 `Printer::reactor()`
-      （上游 `get_reactor()`）；机器不再自己存 `Instant`。
-- [x] 没有把上游的 `pause` / `completion` / greenlet 搬过来：在 async/await 里它们就是
-      Future。未搬的还有 `update_timer`（武装/解除）、idle / latency 钩子、fd 事件 ——
-      其中 **latency 钩子连同串行化排进 A1b**，其余等消费者，理由写在 `reactor.md` 的
-      「还没有的」。
-- 这一条是 B1（`objects/subscribe` 的 0.25 s 定时器）与将来 `idle_timeout` 的前置。
-
-### A1b（A1 的收尾）reactor 的串行调度器与延迟度量
+### A1b reactor 的串行调度器与延迟度量
 
 **为什么单列一条**：打印的**硬实时在 MCU**（步进脉冲由固件发，主机把 move 提前送进 MCU
 的步进队列），主机只是**软实时**——只要不把队列喂空。但上游主机确定性的前提是
@@ -158,7 +76,7 @@
 - [ ] **验收**：能测出定时器回调的唤醒延迟（`ManualReactor` 给确定性、真 runtime 给抖动
       数字），并确认并发回调不再可能同时碰同一份打印机状态。
 
-### A2（旧 T6）错误词汇
+### A2 错误词汇
 
 - [ ] `CommandError` / `ConfigError`（上游 extras 里 94 / 41 处）；`KlippyError` 现在只有
       通信类 5 个变体（`src/core/klippy/error.rs`）。
@@ -166,31 +84,8 @@
       的重复名（`printer.rs` 的 TODO）、`load.rs` 的工厂拒绝与未认领 section（`load.rs`
       的 `TODO`）、`McuObject::connect` 的 section 解析。
 
-### B1（旧 T1 剩余）objects/subscribe —— 已完成
+### B2 MCU 关闭与错误上报（剩余）
 
-- [x] 0.25 s 轮询 + `response_template`（`klippy/webhooks.py:482` 注册、`:561` 实现），
-      推送走 `PushTarget`；`ResponseTemplate` 包住每次推送。端点：
-      `src/core/klippy/api/endpoints/objects_subscribe.rs`，由 `api::register` 安装。
-- [x] 只推变化：每个订阅自己记一份「上次推给它的值」（`Subscription::last`），tick 里与
-      当次 `get_status` 比对；同一 tick 内每个对象只查一次，多个订阅者共用（上游的 `query`
-      缓存）。`null` 字段列表展开为对象当时的字段；连接关闭即退订，定时器在最后一个退订时
-      自停。
-- [x] 两处有意与上游不同，写在模块文档里：回包在**请求时**就发（不等下一个 tick），且
-      变化是相对**该连接上次所见**而非全局快照——本主机没有 pending-query tick，这两点
-      在稳态下与上游一致。
-- 详见 `docs/klippy/developer-manual/testing.md` 的 `objects_subscribe.rs` 一行。
-
-### B2（新）MCU 关闭与错误上报 —— 大体完成，剩 emergency_stop 对象与 stats
-
-- [x] **固件停机上报**：`shutdown` / `is_shutdown` / `starting` 三个事件（`event/shutdown.rs`），
-      `static_string_id` 经字典枚举解成原因文本。`McuObject::connect` 在配置握手**之后**
-      把它们绑成 `printer.invoke_shutdown(...)`——顺序很重要：`configure` 自己可能发
-      `emergency_stop`，绑晚了才不会把自己的复位当成意外停机。上游 `klippy/mcu.py:813-835`
-      `:880-881`。
-- [x] **`config_reset` 的发送**：`configure` 发现固件已停机或 CRC 不一致时就地复位——
-      运行中先 `emergency_stop`、再 `config_reset`（只在停机时可跑），然后重新配置；固件没有
-      `config_reset` 时按「停机」/「CRC 不一致」两种情形报错，提示断电或等 D2（`mcu/config.rs`）。
-      上游在它的 restart helper 里做同一件事（`:756-770`），只是在一个新进程里。
 - [ ] **`emergency_stop` / `clear_shutdown` 的对象与端点**：`cmd/shutdown.rs` 的两个命令现在
       只有 `configure` 的复位路径在用 `emergency_stop`；还缺“主机侧停机时通知 MCU”与
       `emergency_stop` 端点（端点本身见 B4，上游 `klippy/mcu.py:801-802` `:883`）。
@@ -202,76 +97,24 @@
       （`klippy/klippy.py:144` `:151`），shutdown 分析走 `klippy:analyze_shutdown`
       （`klippy/klippy.py:216-220`）。当前 `PrinterEvent` 的 handler 无参，表达不了；
       我们现在的做法是把原因写进状态消息（上游放在 details 里），见 Q2 / Q3。
+- [ ] **`restart_method` 只解析不使用，且非法值被静默吞掉**：`config/mcu.rs:106-109` 的
+      `.and_then(from_str).unwrap_or(Arduino)`，拼错会静默变成 Arduino；上游 `getchoice`
+      直接报配置错误（`klippy/mcu.py:666-671`），且对 CAN（无 baud）强制 `command`、不读
+      配置（`:712-713`）。四种方法里 arduino / cheetah / rpi_usb 都要断开并重开 transport；
+      重载时重开顺带覆盖了 arduino 的 DTR，其余仍靠 `config_reset`（`command`）。
+- [ ] **不认 `reset` 命令**：`mcu/config.rs` 缺 `config_reset` 就报「断电」。上游
+      `_restart_via_command` 优先 `reset`，没有才 `force_local_shutdown` + `config_reset`
+      （`klippy/mcu.py:730-746`）。
+- [ ] **reset 期间没有本地 shutdown 标志**：现在靠「`configure` 完成后才 `bind_shutdown`」的
+      时序规避；隐式、无测试，recv 一旦改成缓冲/异步就会把自发的 `emergency_stop` 误报成
+      `MCU … restarted`。上游有 `_is_shutdown`（`klippy/mcu.py:893-895`）。
 
-### G（新，先做）GCODE 驱动
-
-上游参考：`klippy/gcode.py`（调度器）、`klippy/extras/output_pin.py`（第一个消费者）、
-`klippy/webhooks.py:438-452`（端点）。**不依赖 toolhead**：toolhead 只是注册运动命令的
-一个消费者。
-
-#### G1 gcode 调度器 —— 已完成
-
-实现：`src/core/klippy/gcode.rs`（`GCodeDispatch` / `GcodeCommand` / `CommandError`），
-在 `load_config` 里**最先**注册（在 `pins` 之前）。上游 `klippy/gcode.py`。
-
-- [x] `gcode` 作为 printer object，在 `load_config`、`pins` 之前注册（上游放
-      `Printer.__init__` 早对象；我们 `webhooks` 由 `api::register` 先装，所以
-      `objects/list` 的顺序是 webhooks→gcode）。
-- [x] 命令表 `register_command(name, handler, desc, when_not_ready)`；非传统名做上游的
-      合法性校验；重名报 `gcode command X already registered`。
-- [x] `register_mux_command(cmd, key, value, handler, desc)`：一个 key、按值选处理器，
-      未注册值报上游文案（选项列表排序以保证稳定）。
-- [x] `run_script`：解析（传统 `S200` / 扩展 `KEY=VALUE` 带引号、行号、`;` 注释）、
-      一条出错即停并回 `!!`，返回 `CommandError`。
-- [x] 输出：`register_output_handler` / `respond_info`（`// ` 前缀）/ `respond_raw` /
-      `respond_error`（`!! `）。
-- [x] 未知命令报 `Unknown command:"..."`；未 ready 时报状态消息；内置 `M110` / `M112` /
-      `M115` / `RESTART` / `FIRMWARE_RESTART` / `ECHO` / `STATUS` / `HELP`（`when_not_ready`）。
-- [x] 与上游一致的 `get_status`：`{commands: {名: {help}}}`，所以 `gcode` 是**可查询**对象
-      （早先记成不可查询是错的——上游 `GCodeDispatch.get_status` 就返回命令表）。
-- 未做（不在 G1 范围）：`ok` 应答（文件输出协议）、`gcode:command_error` 事件（Q2）、
-      `run_script` 的 reactor mutex、`M117/M118` 等特殊默认处理。
-
-#### G2 `output_pin` 与 `SET_PIN`（真机点灯的入口）—— 已完成
-
-实现：`src/core/klippy/extras/output_pin.rs`（上游 `klippy/extras/output_pin.py` 的
-数字输出子集），工厂由 `load.rs` 的表接入。
-
-- [x] `load.rs` 工厂表加 `[output_pin <name>]`（`load_config_prefix`）；加载测试证明
-      真实 section 被认领（`[gcode, pins, mcu, output_pin fan]`）。
-- [x] 选项：`pin`（必填）、`value`（默认 0）、`shutdown_value`（默认 0），各自校验并报
-      上游风格的配置错误；**无条件 `setup_max_duration(0)`**，同上游 `PrinterOutputPin`
-      （所以 `value: 1` + 默认 `shutdown_value: 0` 是合法的）。
-- [x] 用 `PrinterPins::setup_digital_out` 建数字输出，把 start/shutdown/max_duration 设进去；
-      以 section 的 sub 注册到 `SET_PIN` 的 mux（`PIN=<name>`）。
-- [x] `SET_PIN PIN=<name> VALUE=<0..1>`：**现为立即 `update_digital_out`**（`>=0.5` 为开），
-      上游的 `GCodeRequestQueue` 排程版留到时钟层与 C1（`queue_digital_out` 已能收绝对时钟）。
-- [x] `get_status` 报 `value`（可查询 / 可订阅）。
-- 未做：`pwm` / `cycle_time`（F4，现在**显式拒绝**而不是当数字输出）、
-      `scale` / `static_value` / `template`（display 模板）。
-
-#### G3 `gcode/*` 端点 —— 已完成
-
-实现：`src/core/klippy/api/endpoints/gcode.rs`，在 `api::register` 里装上。端点**按请求**
-从 `printer` 取 `gcode`（`load_config` 在 `api::register` 之后才建它；取不到时报打印机状态）。
-
-- [x] `gcode/help`（`klippy/webhooks.py:438`）：返回扁平的 `{命令: 帮助}`。
-- [x] `gcode/script`（`:439`）：`run_script`；命令级错误作为 `error` 回（新增
-      `ApiError::CommandError`，**不关停 klippy**），成功回 `{}`。
-- [x] `gcode/restart` / `gcode/firmware_restart`（`:440-442`）：跑内置 `RESTART` /
-      `FIRMWARE_RESTART`（= `request_exit`），主机侧语义接 D2（现在会退出进程）。
-- [x] `gcode/subscribe_output`（`:443-444`）：把请求连接包成一个 `OutputHandler`，推
-      `{response: line}`；连接关闭后由 `GCodeDispatch` 在下次输出时摘掉（`is_closed`）。
-      输出处理器因此从"只增"改成带 `is_closed` 的 trait（`Fn(&str)` 仍有 blanket impl）。
-- 客户端：TUI 的 **g-code 模式**（`^G` / `.gcode`）用 `gcode/script` 发整行，首次进入时
-      自动订阅一次 `gcode/subscribe_output`，所以 `// …` 输出与 `!! …` 错误都看得到。
-
-#### G4 运动命令（G0/G1/G28/G92/M114…）
+### G4 运动命令（G0/G1/G28/G92/M114…）
 
 - [ ] 由 toolhead 注册，随 **C1**；gcode 层不需为它们改什么，只要命令表够通用
       （含 `register_mux_command`，给 `SET_PIN` 这类 `PIN=` 选择用）。
 
-### B4（新）其余端点
+### B4 其余端点
 
 `api-reference.md` 有、`endpoints/mod.rs` 的表里标「not started」的其余部分，各自等它读的
 对象先存在：
@@ -284,93 +127,18 @@
 - [ ] `bed_mesh/dump_mesh` 与 `*/dump_*` 多路复用端点（`klippy/webhooks.py:335`
       `_handle_mux`）：等对应 extras（`bed_mesh`、`adxl345` 等）。
 
-### F（新）MCU 基础资源：GPIO / SPI / I2C / ADC / PWM
+### F MCU 基础资源（F4–F9）
 
 上游把这些叫 printer objects 下面的「资源」：主机用一个 **oid** 和一个 **pin 描述**
 建立资源对象，把 `config_*` 命令攒起来，在 `finalize_config` 之前算一个 CRC 一次性下发，
 之后用 `queue_*` / `set_*` / `*_transfer` 命令驱动。命令层（`allocate_oids` / `get_config` /
-`finalize_config` / `get_uptime` / `emergency_stop` / `get_clock`）已就位，**F1 已把 oid 发号、
-config 命令累积与 CRC、两段式下发补齐**；剩下的缺口是 **pin 解析（F2）与任何一个 `config_*`
-资源（F3–F9）**，所以真实 printer.cfg 里带引脚的东西还接不上。
+`finalize_config` / `get_uptime` / `emergency_stop` / `get_clock`）已就位，配置构建层（F1）
+与 pin 解析（F2）也已完成，剩下的缺口是**任何一个 `config_*` 资源**本身。
 
-F 组的 **F2–F9 都依赖 F1（已完成）**，F3–F9 还需 F2（pin 解析）才能把引脚填进命令。
+#### F3 剩余：`MCU_bus_digital_out`
 
-#### F1 MCU 配置构建层（oid / config 命令 / CRC）—— 已完成
-
-上游 `MCUConfigHelper`（`klippy/mcu.py:979-1143`）。实现在 `src/core/klippy/mcu/config.rs`
-的 `ConfigBuilder`，由 `McuObject` 在**建对象时**持有、在 connect（identify 之后）时
-`configure()`：
-
-- [x] **oid 计数**：`create_oid()` 单调从 0 发号（上游 `:1118`），`build` 把
-      `allocate_oids count=N` 插在最前（`:1004-1020`）；走完 `MAX_OIDS`（255）报错不回绕，
-      定稿后不能再领。
-- [x] **config 命令累积**：`add_config_cmd` / `add_restart_cmd` / `add_init_cmd` 三张表
-      （`:1125`），`register_config_callback`（在 build 时跑，可继续领 oid/加命令，拿到 `&Mcu`
-      故可用 `seconds_to_clock`）与 `register_post_init_callback`。
-- [x] **CRC 与 finalize**：`build` 跑回调 → 插 `allocate_oids` → 对 `config` 列表的**编码字节**
-      算 CRC-32 → 追加 `finalize_config crc=`。**与上游不同**：上游哈希命令文本，我们没有命令
-      文本，改为哈希 wire 字节；固件只存不算，所以只要自洽就行（模块文档里写清楚）。
-      上游的 pin 名改写属于 F2。
-- [x] **两段式下发**：`configure()` 先 `get_config`；未配置则送 `config + init`，已配置且 CRC
-      一致则只送 `restart + init`，CRC 不一致报错（重启路径见 D2）；再问一次，检查
-      `move_count`，跑 post-init 回调（`:1047-1085`）。
-- [x] **`seconds_to_clock`**：`(seconds * CLOCK_FREQ)`，从字典读常量（`:1140`）。`get_query_slot`
-      （`:1136`）需要 print-time 时钟，留给它的消费者（ADC / endstop）一起做。
-- [x] **`request_move_queue_slot`**（`:1142`）：预留运动队列槽位，`configure` 用 `move_count` 对账。
-- [x] **`config_reset`** 命令类型（无参数；`src/basecmd.c:262`，声明在各板子的 `main.c`，如
-      `src/linux/main.c:59`）。发送它的 shutdown 恢复路径仍属于 B2。
-- 详见 `docs/klippy/developer-manual/testing.md` 的 `config.rs` 一行。
-
-#### F2 pin 解析与 `pins` 对象 —— 已完成
-
-主机侧的引脚词汇，独立于任何具体资源：上游 `klippy/pins.py`（`PrinterPins` `:60`、
-`PinResolver` `:18`）。实现在 `src/core/klippy/pins.rs`，`load_config` 在加载任何 section
-之前先注册 `pins`。
-
-- [x] `parse_pin`：`[chip:]pin` 描述，`!` 取反、`^`/`~` 上拉（`:67-95`）；修饰只在
-      `PinType` 允许时生效；未知 chip、畸形描述（带上格式提示）报上游原文。
-- [x] `lookup_pin`：同一 pin 重复使用要同 `share_type` 且极性一致，否则报
-      `pin X used multiple times in config`；`allow_multi_use_pin` / `reset_pin_sharing`
-      是例外口子（`:96-119`）。
-- [x] `PinResolver`：`reserve_pin` / `alias_pin` / `resolve` —— `resolve` 是上游
-      `update_command`（`:41-49`）去掉文本改写后的部分：跟别名、报“pin X is an alias for Y”、
-      拒绝保留引脚。`RESERVE_PINS_*` 在 `McuObject::connect` 里预留
-      （上游 `klippy/mcu.py:1091-1100`）。
-- [x] `pins` 作为 printer object 注册（`pins.py:137`），**但不可查询**：上游
-      `objects/list` 只留带 `get_status` 的对象，为此给 `PrinterObject` 加了
-      `is_queryable`（默认 true）与 `queryable_objects()`，并顺手加了 `lookup_object_as`
-      （按名取回具体类型，上游 `printer.lookup_object('pins')` 的 Rust 写法）。
-      报错文案对齐：`Pin 'X' is not a valid pin name on mcu 'Y'`（`mcu.py:1021-1032`）
-      属于数字解析那一步（见下）。
-
-**本条未做、已拆分出去的**：
-
-- [x] **`setup_pin` 的资源派发**（`pins.py:114-117`）：已在 **F3** 落地（`PrinterPins::setup_digital_out`
-      → `PinChip` → `McuDigitalOut`）；PWM / ADC / endstop 随 F4 / F5 / F8 各自加一个方法。
-- [x] **数字解析**：已在 **F3** 落地——`McuDigitalOut` 在 config 回调（build 时、有字典）里用
-      `pin` 枚举把名字换成编号。
-- [ ] **`[board_pins]`**（`klippy/extras/board_pins.py`）：调用 `alias_pin` / `reserve_pin` 的
-      section，需要 config 的 list 解析与一个新工厂项；解析器 API 已就绪，section 随配置装载
-      （C2）一起接。
-- [ ] **`BUS_PINS_<bus>`**：由 SPI/I2C 在开总线时预留（`klippy/extras/bus.py:9-32`），随 F6/F7。
-
-#### F3 GPIO 数字输出 —— 已完成（bus 同步输出等 C1）
-
-- [x] **接上芯片派发**（F2 留下的）：`PrinterPins::setup_digital_out` 把校验过的 `PinParams`
-      交给 chip；chip 接口是 `PinChip`（每种资源一个方法），`McuChip`（`mcu/pin.rs`）实现它，
-      对应上游 `klippy/mcu.py:1111-1116` 的 `pcs` 表。
-- [x] **pin 名 → 编号**：`McuDigitalOut` 在 config 回调里用字典的 `pin` 枚举把名字换成数字；
-      未知名字报 `Pin 'X' is not a valid pin name on mcu 'Y'`（`klippy/mcu.py:1021-1032`）。
-      别名/保留的解析在同一个回调里、在枚举之前。
-- [x] `MCU_digital_out`（`klippy/mcu.py:408-449`）：`config_digital_out oid=%c pin=%u
-      value=%c default_value=%c max_duration=%u` + 重启时的 `update_digital_out
-      oid=%c value=%c` + 运行期 `queue_digital_out oid=%c clock=%u on_ticks=%u`。
-      命令类型在 `cmd/gpio.rs`，资源在 `mcu/pin.rs`；固件 `src/gpiocmds.c:127` `:174` `:195`。
-      `max_duration` 的 start==shutdown 约束与 `MAX_SCHEDULE_TICKS` 上限已实现。
-- [ ] **`MCU_bus_digital_out`**（`klippy/extras/bus.py:337` 以后）：挂在命令队列上、与运动
+- [ ] `MCU_bus_digital_out`（`klippy/extras/bus.py:337` 以后）：挂在命令队列上、与运动
       同步的输出；需要命令队列/运动层（C1）。
-- [x] 上位消费者 `output_pin` 的**前置**已具备：`PrinterPins::setup_digital_out` 返回
-      `McuDigitalOut`。section 本身移到 **G2**（它是 gcode 驱动的第一个消费者）。
 - 运行期 `queue_digital_out` 收的是**绝对固件时钟**；print_time → clock 的换算属于时钟层
       （`cmd/clock.rs` 的 `ClockSync` 现只有 `get_clock`，偏移跟踪未做）。
 
@@ -453,7 +221,14 @@ F 组的 **F2–F9 都依赖 F1（已完成）**，F3–F9 还需 F2（pin 解�
       （`sensor_adxl345` / `sensor_lis2dw` / …）。
 - 这些是 extras，不阻塞运动；等 F1–F6 完成、真有对应 section 时再逐个接。
 
-### C1（旧 T4）toolhead 与 kinematics
+#### F2 剩余：`[board_pins]` 与 `BUS_PINS_<bus>`
+
+- [ ] **`[board_pins]`**（`klippy/extras/board_pins.py`）：调用 `alias_pin` / `reserve_pin` 的
+      section，需要 config 的 list 解析与一个新工厂项；解析器 API 已就绪，section 随配置装载
+      （C2）一起接。
+- [ ] **`BUS_PINS_<bus>`**：由 SPI/I2C 在开总线时预留（`klippy/extras/bus.py:9-32`），随 F6/F7。
+
+### C1 toolhead 与 kinematics
 
 kinematics 已随 Printer 重构删除，从这里重新开始：
 
@@ -472,7 +247,7 @@ kinematics 已随 Printer 重构删除，从这里重新开始：
 - [ ] step 生成层的运动学（上游 `rail.setup_itersolve('cartesian_stepper_alloc', axis)`、
       `kinematics/kinematic_stepper.py`）在我们这儿还没有对应物，运动规划整个未开始。
 
-### C2（旧 T5 剩余）配置装载收尾
+### C2 配置装载收尾
 
 - [ ] **option 级校验**：上游拿访问追踪当 schema（`klippy/configfile.py:435-441`），
       `ConfigSection` 还没有访问记录，未做。
@@ -480,7 +255,7 @@ kinematics 已随 Printer 重构删除，从这里重新开始：
       `toolhead` 还没有入口，所以任何真实 printer.cfg 现在都会在未认领的 section 上报错；
       第二个住户进来时按同一张表补（C1 的 toolhead 就是下一个）。
 
-### D1（旧 T2 剩余）主机层 start args / rollover / 日志
+### D1 主机层 start args / rollover / 日志
 
 - [ ] `StartArgs` 只有 `info` 需要的四个字段（`api/start_args.rs`）；上游的
       `apiserver`、`start_reason`、debug 输入输出、每个 MCU 的字典路径还没进来。
@@ -489,21 +264,26 @@ kinematics 已随 Printer 重构删除，从这里重新开始：
 - [ ] `--logfile`：现在没有，`log_file` 恒为 `null`（`api/start_args.rs`）；先有写文件的
       日志层，rollover 才有意义。
 
-### D2（旧 Q7 的落地）重启循环
+### D2 重启循环（剩余）
 
-- [ ] 现在 `firmware_restart` / `restart` 只记录并退出：`klippy_process` 拿到 `run()` 的
-      结果只 `debug!`（`src/klippy.rs`），没有任何东西按结果重建机器。上游的主循环在
-      `klippy/klippy.py:355-370` 按 `res` 决定退出还是 `time.sleep(1.)` 后重建。
-- [ ] 前置是 Q7（API 与打印机的关系）；`start_reason`（D1）也要跟着这条进来。
-- [ ] **CRC 不匹配时重启**：上游发现已配置但 CRC 不一致时，先
+循环本身已完成（见文末）：`klippy_process` 是循环，`run()` 返回重启类结果就
+`reset_for_restart()` + `load_config()` + `RESTART_DELAY` 后重来。剩下的是与上游不同的两块：
+
+- [ ] **`restart_method` 的读者**：本地的就地复位只能做 `command`（`config_reset`）；重载时
+      重开 transport 顺带覆盖了 arduino 的 DTR 复位，但 cheetah / rpi_usb 没有显式分派。
+      落地前 `McuConfig.restart_method` 一直是只解析不使用（见 B2）。
+- [ ] **CRC 不匹配仍走就地复位（有意偏离上游）**：上游发现已配置但 CRC 不一致时先
       `request_exit('firmware_restart')`（`check_restart_on_crc_mismatch`，
-      `klippy/mcu.py:678-685`、`:1057-1059`），**不是**重发配置——`finalize_config`
-      已锁住固件（第二次会 `Already finalized`）。重启方法按 `restart_method` 分派
-      （`:756-770`），也就是 `McuConfig.restart_method` 的第一个读者。另有
-      `start_reason == 'firmware_restart'` 却仍已配置时 raise “Failed automated reset”
-      的前置门（`:1053-1056`）。详见 `docs/klippy/developer-manual/mcu-config.md`。
+      `klippy/mcu.py:678-685`、`:1057-1059`），让重启循环做物理复位；我们用 `configure` 里的
+      `emergency_stop` + `config_reset` 就地复位（已在 B2 实现并测试，真板不必断电）。若要
+      贴上游，还有 `start_reason == 'firmware_restart'` 却仍已配置时 raise “Failed automated
+      reset” 的前置门（`:1053-1056`）。详见 `docs/klippy/developer-manual/mcu-config.md`。
+- [ ] **重启后的 g-code 输出订阅**：连接不断，`objects/subscribe` 也自动继续（它按名查新对象），
+      但 `gcode/subscribe_output` 的处理器挂在被重建的 `GCodeDispatch` 上，重启后静默失效，
+      要客户端重新订阅。上游靠 socket 重绑让客户端重连、重订阅；我们要么在客户端收到
+      `klippy:ready` 后重订阅，要么把输出订阅表移到连接上。
 
-### E1（旧 T7）文档
+### E1 文档
 
 - [ ] `docs/klippy/developer-manual/`：补 printer 一节，并在 README 的分层表里加
       `printer` 一行（现在只有 msg / mcu / cmd / event / identify / api）。
@@ -511,7 +291,7 @@ kinematics 已随 Printer 重构删除，从这里重新开始：
       yet … so it still runs empty」，而 `load.rs` 已经装载 `[mcu]`；改了代码就要回头改
       这几句。
 
-### E2（旧 T8）`python_path` 的取消（**远期，依赖外部项目**）
+### E2 `python_path` 的取消（**远期，依赖外部项目**）
 
 - [ ] **现状**：`info` 里这个字段只被 Moonraker 使用，且它把它当 Klipper 的
       virtualenv 解释器（`update_manager/app_deploy.py` 的 `_configure_virtualenv`），
@@ -536,8 +316,6 @@ kinematics 已随 Printer 重构删除，从这里重新开始：
 
 ## 未决问题
 
-（编号沿用上一版，从 Q2 起。）
-
 - [ ] **Q2 事件系统的形状**：封闭枚举（现状 `PrinterEvent`）还是开放总线（上游 30+ 个
       自定义事件名 + 各事件自定参数，`klippy/klippy.py:224-227`）。枚举表达不了
       `idle_timeout:ready` 这类名字，也表达不了 B2 的带载荷事件。
@@ -551,11 +329,68 @@ kinematics 已随 Printer 重构删除，从这里重新开始：
       `pins` 加了 `Printer::lookup_object_as::<T>(name)`（单名取回具体类型）；前缀遍历仍未定。
 - [ ] **Q6 退出结果的语义**：`"exit" / "error_exit" / "firmware_restart"` 由谁解释、
       `run()` 的返回值怎么变成进程退出码（`klippy/klippy.py:355-370`，`error_exit` 退 -1）。
-- [ ] **Q7 重启时 API 与打印机的关系**：`firmware_restart` 要重建机器，但端点与
-      `webhooks` 把 `Arc<Printer>` 烤在了自己身上。要么每次重启重建 Api + Server
-      （上游每次重新 bind socket），要么一个 Api 配一个可换入的 printer 槽
-      （`RwLock<Arc<Printer>>` / ArcSwap）。前者要动 `--tui` 的 in-process server，
-      后者要改 `api::register` 与三个端点/对象的构造。定下来之前不做重启循环（D2）。
+
+## 已完成（留档）
+
+细节在各模块文档里；这里只留索引，最近完成的在前。
+
+- **重启循环（D2）**：`klippy_process` 按 `run()` 的结果决定退出还是重建；重建是**就地**的——
+      `Printer::reset_for_restart` 丢掉 config 装载的部件（关设备）并保留 host 的 `webhooks`，
+      再 `load_config` + `bring_up`，同一个 `Arc<Printer>` 继续服务（Q7）。为此把
+      `pins ↔ McuChip` 的强引用环改成 chip 持 `Weak<PrinterPins>`，否则旧 MCU 不会被释放
+      （`src/klippy.rs`、`printer.rs`、`load.rs`、`mcu/pin.rs`）。
+
+- **identify 后的 DEBUG 摘要**：`describe_dictionary` 在 `Mcu::identify` 里打版本对、
+      消息条数与常量（`identify.rs`）。
+- **客户端的 `firmware_restart`**：`Session::firmware_restart` 与本地命令
+      `.firmware_restart`（行模式与 g-code 模式都认），`usage()` 同步更新
+      （`crates/klippy-client/src/session.rs`）。
+- **`Mcu::flush`**：发送队列的 item 变成 `SendItem::Payload | SendItem::Flush(oneshot)`，
+      发送任务遇到 barrier 就把当前 batch 立即发走并回报；`TestDevice::recorder()` 让
+      block 边界可断言（`mcu/mod.rs`、`interface/test.rs`）。
+- **reset 路径的 P0/P3**：`emergency_stop` 与 `config_reset` 分两个 block，中间用
+      `Mcu::call(EmergencyStop, …, Shutdown, …)` 等固件的 `shutdown` 报告（注册先于发送，
+      是真屏障）；无 `shutdown` 时 15 ms 兜底并告警，固件上线时 `bind_shutdown` 也会告警
+      （`mcu/config.rs`、`mcu/object.rs`）。原 bug：两条命令被合批，固件的 longjmp 掀掉
+      block，`config_reset` 被丢。
+- **`gcode/subscribe_output` 与 TUI g-code 模式**：连接包成带 `is_closed` 的
+      `OutputHandler`，推 `{response: line}`；`^G` / `.gcode` 整行走 `gcode/script` 并自动
+      订阅输出，`// …` 与 `!! …` 都可见（`api/endpoints/gcode.rs`、`gcode.rs`、`klippy-client`）。
+- **`gcode/*` 端点（G3）**：`gcode/help` / `script` / `restart` / `firmware_restart`；
+      命令级错误用 `ApiError::CommandError`，不关停 klippy（`api/endpoints/gcode.rs`）。
+- **`output_pin` 与 `SET_PIN`（G2）**：`[output_pin <name>]` 用 `setup_digital_out` 建数字
+      输出并注册 `SET_PIN PIN=… VALUE=…`；无条件 `setup_max_duration(0)`（`extras/output_pin.rs`、
+      `load.rs`）。`pwm` 暂拒，`SET_PIN` 先立即生效。
+- **GCODE 调度器（G1）**：`GCodeDispatch` 的命令表 / `register_mux_command` / `run_script` /
+      输出处理器 / 内置命令，`load_config` 里最先注册（`gcode.rs`）。
+- **GPIO 数字输出（F3 的 MCU 部分）**：`PinChip` / `DigitalOut`、`config_digital_out` +
+      restart 的 `update_digital_out` + 运行期 `queue_digital_out`（`cmd/gpio.rs`、`mcu/pin.rs`）。
+- **pin 解析与 `pins`（F2）**：`PrinterPins` / `PinResolver` 的别名与保留，`RESERVE_PINS_*`
+      在 connect 预留；`pins` 注册但不可查询（`is_queryable` / `queryable_objects` /
+      `lookup_object_as`）（`pins.rs`、`printer.rs`、`mcu/object.rs`）。
+- **MCU 配置构建层（F1）**：oid 发号、`config` / `restart` / `init` 三张命令表、config 回调、
+      CRC + `finalize_config`，`configure()` 的 `get_config` 两段式下发（`mcu/config.rs`）。
+- **MCU 停机上报与就地复位（B2 大部）**：`shutdown` / `is_shutdown` / `starting` 事件经
+      `static_string_id` 解成原因，配置握手**之后**绑成打印机停机；`configure` 用
+      `emergency_stop` + `config_reset` 就地复位再配置（`event/shutdown.rs`、`mcu/config.rs`、
+      `mcu/object.rs`）。
+- **`objects/subscribe`（B1）**：请求立即回全量快照，随后每 0.25 s（`SUBSCRIPTION_REFRESH_TIME`）
+      推变化字段；连接关闭即退订，最后一个退订时定时器自停；与 `objects/query` 共用字段选择
+      （`api/endpoints/objects_subscribe.rs`、`objects_query.rs`）。
+- **reactor 抽象与定时器（A1）**：`Reactor` trait（`monotonic` / `register_timer` /
+      `unregister_timer` / `call_later`）与 `TokioReactor` / `ManualReactor`；机器持
+      `Arc<dyn Reactor>`，不拥有 runtime（`reactor.rs`、`docs/.../reactor.md`）。
+- **主机层串起来**：`klippy_process`（建机器 → `api::register` → bind → `load_config`，
+      失败即 `invoke_shutdown` → `bring_up` → `run`，重启类结果则就地重建）、`info` 端点、
+      `StartArgs`（`src/klippy.rs`、`api/endpoints/info.rs`、`api/start_args.rs`）。
+- **`run()` 的形态**：`bring_up()` async、`run()` 同步只等退出、机器只用
+      `std::future::Future`，不起 tokio（`printer.rs`）。
+- **配置驱动装载**：静态工厂表、两段式构造顺序、section 级合法性校验（`load.rs`）。
+- **`[mcu]` 住户**：`McuObject`，section 到 connect 才解析、开设备、跑 identify，
+      `get_status` 报 identify 快照（`mcu/object.rs`）。
+- **对象表与只读端点**：`add_object` / `objects` / `lookup_object` / `status_of`、
+      `objects/list`、`objects/query`，以及服务器侧的 `webhooks` 对象
+      （`printer.rs`、`api/endpoints/objects_{list,query}.rs`、`api/webhooks.rs`）。
 
 ## 证据索引（上游，供回头分析时查）
 

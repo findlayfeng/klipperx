@@ -29,8 +29,9 @@
 //!
 //! - **Mouse wheel**: scroll up/down by 3 lines
 //! - **Click/drag the scrollbar**: go to that part of the log
-//! - **^S** (or `.mouse`): hand the mouse back to the terminal so text can be
-//!   selected and copied there, and take it again afterwards
+//! - **^S** (or `.mouse`, or a click on the log's text): hand the mouse back to
+//!   the terminal so text can be selected and copied there, and take it again
+//!   afterwards
 //! - **PgUp/PgDn**: scroll by a page
 //! - **Home**: jump to the top (oldest lines)
 //! - **End**: jump to the bottom (newest line)
@@ -185,6 +186,9 @@ struct App {
     /// The scrollbar's column as last drawn, so a click can find it. Zero-sized
     /// when the log fits and no bar is drawn.
     gutter: Cell<Rect>,
+    /// The log pane as last drawn, scrollbar column included, so a click on the
+    /// text can be told from one on the bar.
+    log: Cell<Rect>,
     /// Whether a scrollbar drag is in progress. The button holds the drag, not
     /// the pointer's column, so this survives the pointer leaving the bar.
     dragging: bool,
@@ -242,6 +246,7 @@ impl App {
             width: Cell::new(0),
             heights: RefCell::new(Heights::default()),
             gutter: Cell::new(Rect::new(0, 0, 0, 0)),
+            log: Cell::new(Rect::new(0, 0, 0, 0)),
             dragging: false,
             mouse: true,
             status: Status::Unknown,
@@ -379,6 +384,17 @@ impl App {
         Some((row - gutter.y) as usize)
     }
 
+    /// Whether a mouse cell is in the log's text rather than its scrollbar.
+    ///
+    /// The bar owns the pane's last column; everything to its left is text.
+    fn in_log_body(&self, column: u16, row: u16) -> bool {
+        let log = self.log.get();
+        if log.width <= 1 || row < log.y || row >= log.y + log.height {
+            return false;
+        }
+        column >= log.x && column < log.x + log.width - 1
+    }
+
     /// The track row a pointer is on while dragging, clamped to the track.
     ///
     /// Once a drag has begun the pointer is allowed to wander off the bar —
@@ -486,7 +502,7 @@ impl App {
                 self.push(Entry::notice(
                     Notice::Info,
                     format!(
-                        "{}\n\nWindow:\n  .yaml / .json   show message bodies as YAML or JSON\n  .gcode          toggle g-code mode (^G): typed lines go to gcode/script\n  .mouse          hand the mouse back to the terminal (^S) so text can be selected",
+                        "{}\n\nWindow:\n  .yaml / .json   show message bodies as YAML or JSON\n  .gcode          toggle g-code mode (^G): typed lines go to gcode/script\n  .mouse          hand the mouse back to the terminal (^S, or click the log) so text can be selected",
                         session::usage()
                     ),
                 ));
@@ -735,6 +751,14 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
                 app.dragging = true;
                 app.scroll_to_track(track);
             }
+            // A click on the text is a request for the text, not for the wheel:
+            // the window lets the terminal have the mouse so it can select, and
+            // `^S` takes it back. (The gesture that follows is a second one — a
+            // terminal only selects with a drag it saw from the beginning.)
+            None if app.in_log_body(mouse.column, mouse.row) => {
+                app.dragging = false;
+                app.toggle_mouse();
+            }
             None => app.dragging = false,
         },
         // The drag follows the pointer's row even when it leaves the bar's
@@ -835,7 +859,10 @@ fn draw_log(frame: &mut Frame, app: &App, area: Rect) {
         Layout::horizontal([Constraint::Min(1), Constraint::Length(1)]).areas(area);
 
     // Remember the pane's shape: PgUp/PgDn move a page, a pinned viewport
-    // counts new lines at this width, and the heights are measured at it.
+    // counts new lines at this width, and the heights are measured at it. The
+    // whole pane is remembered too, so a click can be placed — the bar owns its
+    // last column and the rest is text.
+    app.log.set(area);
     app.viewport.set(text.height as usize);
     app.width.set(text.width as usize);
 
@@ -1982,6 +2009,45 @@ mod tests {
             event(MouseEventKind::Down(MouseButton::Left), 0, gutter.y + 2),
         );
         assert!(!app.dragging, "only the bar starts a drag");
+    }
+
+    #[test]
+    fn test_clicking_the_log_hands_the_mouse_back() {
+        let entries: Vec<Entry> = (1..=20)
+            .map(|n| Entry::notice(Notice::Info, format!("line {n}")))
+            .collect();
+        let mut app = app_with(entries);
+        // The first draw is what puts the log pane (and its bar) on screen.
+        let _ = render(&app, 40, 8);
+        let log = app.log.get();
+
+        let down = |column, row| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::empty(),
+        };
+
+        // A click on the bar is a scroll, and the mouse stays the window's.
+        let bar = app.gutter.get().x;
+        handle_mouse(&mut app, down(bar, log.y));
+        assert!(app.mouse, "the bar is the window's business");
+        assert!(app.dragging);
+
+        // A click on the text is not: it hands the mouse to the terminal, which
+        // is what selection needs.
+        handle_mouse(&mut app, down(log.x + 2, log.y));
+        assert!(!app.mouse, "the log's text is the terminal's");
+        assert!(!app.dragging, "the bar's drag does not survive it");
+        let said = app.entries.last().expect("a notice").text();
+        assert!(said.contains("mouse released"), "{said}");
+
+        // And `^S` (the same toggle) takes it back. A click outside the log
+        // pane neither scrolls nor hands it over.
+        app.toggle_mouse();
+        assert!(app.mouse);
+        handle_mouse(&mut app, down(log.x + 2, 0));
+        assert!(app.mouse, "the header is not the log");
     }
 
     #[test]

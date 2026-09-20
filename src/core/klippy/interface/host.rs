@@ -64,7 +64,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 /// Bytes asked of the library per read.
 ///
@@ -355,6 +355,14 @@ impl Device for HostDevice {
                 bytes.len()
             )));
         }
+        trace!(
+            "tx frame to klipper: {}",
+            bytes
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
         debug!("sent {} bytes to klipper", bytes.len());
         Ok(())
     }
@@ -372,6 +380,14 @@ impl Device for HostDevice {
             }
             match self.output.recv() {
                 Ok(bytes) => {
+                    trace!(
+                        "rx frame from klipper: {}",
+                        bytes
+                            .iter()
+                            .map(|b| format!("{b:02x}"))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    );
                     debug!("received {} bytes from klipper", bytes.len());
 
                     // A test build reassembles the stream; a release build is

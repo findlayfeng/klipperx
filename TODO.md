@@ -3,7 +3,7 @@
 本文件只记**打算做什么**和**还没定的事**，不重复已经定下的设计（那些写在各模块文档和
 `docs/klippy/developer-manual/` 里）。括号里的 `klippy/xxx.py:NN` 指上游参考实现
 （`third_party/klipper/`），用来在动手前核对行为。已完成的条目见文末「已完成（留档）」，
-只留一行索引，细节在各模块自己的文档里。
+**每条只留一行索引**，细节在各模块自己的文档里；做完一件事就把它从正文挪进那张索引。
 
 ## 已定
 
@@ -36,7 +36,7 @@
 | G4 | 运动命令（G0/G1/G28…） | G1、C1 |
 | A1b | reactor 串行调度器与延迟度量 | A1 |
 | A2 | 错误词汇（`CommandError` / `ConfigError`） | — |
-| B2 | MCU 剩余：`emergency_stop` 对象/端点、`last_stats`、`restart_method` 校验 | — |
+| B2 | MCU 剩余：`emergency_stop` 对象/端点、`last_stats`、错误载荷、本地 shutdown 标志、`command` 的固件 `reset` | — |
 | B4 | 其余端点（estop / remote method / pause_resume / …） | G3 等 |
 | F3 | `MCU_bus_digital_out`（命令队列/运动同步输出） | C1 |
 | F6 | SPI 总线 | F1、F2 |
@@ -46,34 +46,29 @@
 | C1 | toolhead 与 kinematics | — |
 | C2 | 配置装载收尾（option 校验、第二个住户） | — |
 | D1 | 主机层 start args / rollover / `--logfile` | — |
-| D2 | `restart_method` 分派（重启循环已完成） | — |
-| D3 | `command` 接管一块**还在跑**的板子（序号对齐已做；剩 RTO 定时重传、`reset` 命令） | — |
+| D2 | 重启循环剩余（`rpi_usb` 连接期门控、CRC 不一致的处理、重启后的输出订阅） | — |
+| D3 | `command` 接管运行中的板子：RTO 定时重传 | B2 |
 | E1 | 文档 | — |
 | E2 | `python_path` 的取消 | 外部项目 |
 
 ### G2b 用 GCODE 控制 GPIO（现状与剩余）
 
-**现状：数字开关这条链已经通了，不需要新实现。** `[output_pin <name>]`
-（`extras/output_pin.rs`）读 `pin` / `value` / `shutdown_value`，经
-`PrinterPins::setup_digital_out`（`pins.rs`）建出 `McuDigitalOut`，在配置阶段发
-`config_digital_out`（`mcu/resource/pin.rs`、`cmd/gpio.rs`），并注册 mux 命令
-`SET_PIN PIN=<name> VALUE=<0..1>`；运行时走 `update_digital_out` 立即改电平，`>=0.5` 为开、
-`!` 前缀翻转（`mcu/resource/pin.rs:207-248`）。单测覆盖 `output_pin` 8 条 + `mcu/pin` 的
-build/编码，真设备路径未上硬件验证。
-
-所以「用 GCODE 控制一个 GPIO」缺的不是数字开关本身，而是下面这些（也是本节的待办）：
+数字与 PWM 两条链都已打通（见文末 F3 / F4 索引）：`[output_pin <name>]`
+（`extras/output_pin.rs`）读 `pin` / `value` / `shutdown_value`（PWM 另加 `pwm` /
+`cycle_time` / `hardware_pwm`），经 `PrinterPins::setup_digital_out` / `setup_pwm`
+（`pins.rs`）建出 `McuDigitalOut` / `McuPwm`，并注册 mux 命令
+`SET_PIN PIN=<name> VALUE=<0..1>`；运行时走立即路径（`update_digital_out` / `update_pwm`，
+软件 PWM 对齐到周期边界）。剩下的是：
 
 - [ ] **真板端到端验证**：`config.cfg` 加一段 `[output_pin <name>]` + `pin: <PAx>`，用
-      `SET_PIN PIN=<name> VALUE=1` 点亮、`VALUE=0` 熄灭，确认 `config_digital_out` 的
-      oid/初始电平与 `update_digital_out` 都真的上了线（现有测试都在假 chip / 假设备上）。
-- [x] **模拟量（亮度 / 转速）：F4 PWM 已完成**。`output_pin` 的 `pwm: true` 走
-      `setup_pwm` 建 `McuPwm`（硬件 `config_pwm_out` / 软件 `set_digital_out_pwm_cycle`），
-      `SET_PIN` 调 `update_pwm` 立即生效（软件 PWM 对齐到周期边界）。
+      `SET_PIN PIN=<name> VALUE=1` 点亮、`VALUE=0` 熄灭，并对 `pwm: true` 的脚改占空比，
+      确认 `config_digital_out` / `config_pwm_out` 的 oid 与初始值、`update_digital_out` /
+      `update_pwm` 都真的上了线（现有测试都在假 chip / 假设备上）。
 - [ ] **与运动 / 打印时间同步的 `SET_PIN`**（上游 `GCodeRequestQueue`，
       `klippy/extras/output_pin.py:13-85` `:249-269`）：上游把请求排进 toolhead 的
       lookahead、在 print time 生效，并对移动中的 pin 变化与 MCU 最小调度间隔做对齐；
-      我们没有 toolhead / print time，只能立即 `update_digital_out`（`output_pin.rs` 头注释）。
-      随 **C1**；对一个独立 GPIO 不紧急，但打印中改 pin 不会与 move 同步。
+      我们没有 toolhead / print time，只能立即改值（`output_pin.rs` 头注释）。随 **C1**；
+      对一个独立 GPIO 不紧急，但打印中改 pin 不会与 move 同步。
 - [ ] **`output_pin` 的其余上游选项**：`scale`（PWM 用，`output_pin.py:207-214`）、
       `TEMPLATE` + `template_evaluator`（display 模板，`output_pin.py:88-170`）——与开关
       GPIO 本身无关，按需再补。
@@ -125,15 +120,9 @@ build/编码，真设备路径未上硬件验证。
       （`klippy/klippy.py:144` `:151`），shutdown 分析走 `klippy:analyze_shutdown`
       （`klippy/klippy.py:216-220`）。当前 `PrinterEvent` 的 handler 无参，表达不了；
       我们现在的做法是把原因写进状态消息（上游放在 details 里），见 Q2 / Q3。
-- [x] **`restart_method` 的校验与默认**：未知值报配置错（不再静默变 Arduino）、非串口
-      （CAN / host）恒为 `command` 且不读该项、串口缺省 `arduino`，与上游 `getchoice` +
-      `if baud` 对齐（`klippy/mcu.py:666-671`）。“是串口”做成参数以便不依赖真串口测试。
-      四种方法的**物理分派**（arduino / cheetah / rpi_usb）见 D2。
-- [x] **`reset` fallback**：`mcu/config.rs` 按上游 `_restart_via_command` 的顺序选复位——有
-      `config_reset` 就地清；只有 `reset` 时 `handshake` 返回 `McuError::ResetRequired`，由
-      `McuObject::connect` 发 `reset`、重开连接、用同一份 `BuiltConfig` 重跑握手（`mcu/config.rs`、
-      `mcu/object.rs`）；两者都没有才报「断电」。`FIRMWARE_RESTART` + `command` 方法也在连接后
-      发 `reset`。真板未验（与 arduino / cheetah 一样）。
+- [ ] **`command` 的固件 `reset`**：复位现在优先 `config_reset`（清配置），上游还会优先用
+      固件的 `reset`（真重启 MCU，`HF_IN_SHUTDOWN`）。`restart_method == command` 的
+      `firmware_restart` 已在连接后发 `reset`，但一般的配置握手路径还没有。
 - [ ] **reset 期间没有本地 shutdown 标志**：现在靠「`configure` 完成后才 `bind_shutdown`」的
       时序规避；隐式、无测试，recv 一旦改成缓冲/异步就会把自发的 `emergency_stop` 误报成
       `MCU … restarted`。上游有 `_is_shutdown`（`klippy/mcu.py:893-895`）。
@@ -232,7 +221,7 @@ toolhead / 开放事件）一起补，一部分是现在就独立可补的小行
 之后用 `queue_*` / `set_*` / `*_transfer` 命令驱动。命令层（`allocate_oids` / `get_config` /
 `finalize_config` / `get_uptime` / `emergency_stop` / `get_clock`）已就位，配置构建层（F1）
 与 pin 解析（F2）也已完成，数字输出、PWM（F4）与 ADC（F5）三个 `config_*` 资源已落地
-（见文末已完成），剩下的缺口是命令队列/运动同步输出（F3）、总线（F6/F7）与 endstop（F8）。
+（见文末索引），剩下的缺口是命令队列/运动同步输出（F3）、总线（F6/F7）与 endstop（F8）。
 
 #### F3 剩余：`MCU_bus_digital_out`
 
@@ -240,16 +229,6 @@ toolhead / 开放事件）一起补，一部分是现在就独立可补的小行
       同步的输出；需要命令队列/运动层（C1）。
 - 运行期 `queue_digital_out` 收的是**绝对固件时钟**；print_time → clock 的换算属于时钟层
       （`cmd/clock.rs` 的 `ClockSync` 现只有 `get_clock`，偏移跟踪未做）。
-
-#### F4 PWM（硬件 / 软件）✅ 已完成
-
-见文末「已完成（留档）」。实现：`cmd/pwm.rs`、`mcu/resource/pwm.rs`、`pins.rs` 的 `PwmOut` /
-`setup_pwm`；消费者是 `[output_pin]` 的 `pwm: true`。
-
-#### F5 ADC ✅ 已完成
-
-见文末「已完成（留档）」。实现：`cmd/adc.rs`、`mcu/resource/adc.rs`、`pins.rs` 的 `Adc` /
-`setup_adc`，以及 `ConfigBuilder::get_query_slot` / `Mcu::estimated_clock`。
 
 #### F6 SPI 总线
 
@@ -260,8 +239,6 @@ toolhead / 开放事件）一起补，一部分是现在就独立可补的小行
       `spi_send oid=%c data=%*s`、`spi_transfer oid=%c data=%*s` /
       `spi_transfer_response oid=%c response=%*s`；还有 `config_spi_shutdown`
       （固件 `src/spicmds.c:37` `:62` `:122` `:157`）。
-- [x] `resolve_bus_name`（`bus.py:9-32`）：已随 F2 实现，见 `McuChip::resolve_bus_name`
-      （`mcu/resource/pin.rs`）。
 - [ ] 软件 SPI（`spi_software_{miso,mosi,sclk}_pin`）：`spi_set_sw_bus`（新）/ 
       `spi_set_software_bus`（旧），固件 `src/spi_software.c`。
 - [ ] `MCU_SPI_from_config`（`bus.py:124`）：从 section 读 `cs_pin` / `spi_speed` /
@@ -302,10 +279,6 @@ toolhead / 开放事件）一起补，一部分是现在就独立可补的小行
       （`sensor_adxl345` / `sensor_lis2dw` / …）。
 - 这些是 extras，不阻塞运动；等 F1–F6 完成、真有对应 section 时再逐个接。
 
-#### F2 `[board_pins]` 与 `BUS_PINS_<bus>` ✅ 已完成
-
-见文末。`[board_pins]`（`extras/board_pins.rs`）+ `McuChip::resolve_bus_name`。
-
 ### C1 toolhead 与 kinematics
 
 kinematics 已随 Printer 重构删除，从这里重新开始：
@@ -344,70 +317,10 @@ kinematics 已随 Printer 重构删除，从这里重新开始：
 
 ### D2 重启循环（剩余）
 
-循环本身已完成（见文末）：`klippy_process` 是循环，`run()` 返回重启类结果就
-`reset_for_restart()` + `load_config()` + `RESTART_DELAY` 后重来。剩下的是与上游不同的几块。
+循环本身与四种 `restart_method`（`command` / `arduino` / `cheetah` / `rpi_usb`）的物理分派
+都已完成（见文末索引；方法与连接期门控见 `docs/klippy/developer-manual/mcu-config.md`）。
+剩下的三块：
 
-#### `restart_method` 分派：分析
-
-上游 `MCURestartHelper` 在 `klippy:firmware_restart` 事件上按方法四选一
-（`klippy/mcu.py:746-770`）：
-
-| 方法 | 动作 | 依赖 |
-|---|---|---|
-| `command` | 有 `reset` 就用它，否则 `force_local_shutdown` + 15 ms + `config_reset`，再 disconnect | 固件命令（B2 已做：`reset` 优先、`config_reset` 兜底） |
-| `arduino`（含未设） | disconnect 后以 2400 打开、`read(1)`、DTR true→false（`serialhdl.py:392`） | tty DTR |
-| `cheetah` | disconnect 后 RTS 拉高、DTR 两轮翻转、RTS 拉低（`serialhdl.py:365`） | tty DTR+RTS |
-| `rpi_usb` | disconnect 后 `hub-ctrl -h 0 -P 2 -p 0` → 2 s → `-p 1`（`chelper/__init__.py:339`） | 外部 `hub-ctrl` + sudo |
-
-外加三处按方法的**连接期门控**：`rpi_usb` 且串口不存在 → 先启动一次去上电（`:696-700`
-`check_restart_on_attach`）；`rpi_usb` → 上电复位前不许 configure（`:692-694`
-`check_restart_on_send_config`）；`cheetah` → 连接时 RTS 必须拉低（`:702-704`，已完成，
-见 `McuConfig::open`）。前两处见下面「`rpi_usb` 的连接期门控」一条。
-方法只在**有 baud（串口）**时从配置读，CAN 恒为 `command`（`:668-671`）；`CANBUS_BRIDGE` 的
-MCU 默认跳过（`:749`）。
-
-**我们已经有的**：`command`（`config_reset` + 事件屏障，见 B2）；以及“关掉再开”的形状
-（`reset_for_restart` 丢对象关设备 → `bring_up` 重开）。**`arduino` 可能被“重开 tty 会拉
-DTR”隐式满足，但那是驱动副作用，不算实现。**
-
-**缺口（按依赖）**：
-
-1. **没有 `start_reason`**（D1）：`connect` 分不清“首次启动”与“firmware_restart 后的重连”，
-   而 attach 期门控全靠它；循环知道原因，`McuObject` 不知道。
-2. **分派点/时序对不上**：`run()` 发 `FirmwareRestart` 时串口还开着，drop 在 `run()` 返回
-   之后；自然的落点是 connect **之前**，但 `McuConfig::new` 把解析与打开耦合了（内部
-   `create_interface` 直接 `SerialDevice::open`），要先拆开才能在打开前复位/上电/定 RTS。
-3. **`serial.rs` 没有 modem 线控制**：要加 DTR/RTS（`TIOCMBIS`/`TIOCMBIC`）并能以 2400 短暂
-   打开再关。
-4. **`rpi_usb` 要外部程序**：`hub-ctrl.c` 在 `third_party/klipper/lib/hub-ctrl/`，但上游现场
-   gcc 编译 + `sudo` 跑；对 Rust 主机是环境/权限问题。
-5. **`restart_method` 没被带到分派点**：`Mcu::new` 只取 name+interface，字段被丢
-   （`mcu/mod.rs:374-376`）。
-6. **校验与默认**（本轮先做）。
-7. **`reset` 命令**（B2 单列）——已完成：`reset` 优先、`config_reset` 兜底。
-
-**推进顺序**：⑥ `restart_method` 校验/默认 ✓ → ② `McuConfig` 解析/打开拆分 ✓ →
-① `start_reason`（最小切片）✓ → ③ `serial.rs` DTR/RTS + `arduino` 显式复位 ✓ →
-⑤ `cheetah`（含 attach RTS）✓ → ④ `rpi_usb`（sysfs 拓扑 + `nusb` + udev）✓。
-
-- [x] **⑥ `restart_method` 校验/默认**
-- [x] **② `McuConfig` 解析/打开拆分**
-- [x] **① `start_reason`（最小切片）**
-- [x] **③ `serial.rs` DTR/RTS + arduino 复位**
-- [x] **⑤ `cheetah`**
-- [x] **④ `rpi_usb`**：见下方。
-- [x] **④ `rpi_usb`**：实质是 USB hub 端口切电（`CLEAR/SET_FEATURE(PORT_POWER)`）。Rust 实现：
-      - **拓扑发现**（`interface/usb.rs::resolve_tty_port`）：sysfs 上溯到 hub 的 `busnum/devnum/端口`，
-        纯 Rust 单测。根 hub 需 `list_buses()` 补充（`list_devices()` 不返回 `usbN`）。
-      - **切电**：`sysfs` 写 `disable` 文件（内核 ≥ 6.0）或 `libusb`（`nusb`）发控制传输；2 s 间隔
-        + tty 回来等待。规则 glob 已修正为 `$sys$devpath/*/*port*/disable`（多层 hub 兼容）。
-      - **权限**：udev 规则（`scripts/klipperx-usb-udev.sh` 安装），不依赖 `sudo`。
-      - **开机探测**（`check_usb_power`）：读 hub `wHubCharacteristics` 判断能否切电；`no power
-        switching` 当场告警 + `override_config` 改 `command`，避免无效切电。
-      - **复位后验证**：检测 `OldSession` 或 `already_running`，命中则 `override_config` 改 `command`。
-      - **真板验证**（`0424:2137` 独立 hub ✅ / 根 hub `1d6b:0002` ❌ no power switching）：根 hub
-        虽能断开重枚举但不断电，固件序号不重置 → 需 `command` fallback。
-      - 遗留：`rpi_usb` 的连接期门控（普通启动未配置的板子）有意后置，见下方未勾选条目。
 - [ ] **`rpi_usb` 的连接期门控（有意后置）**：① 串口不存在 → 先请求一次 firmware_restart
       去上电（`check_restart_on_attach`，`klippy/mcu.py:696-700`）；② 未配置时发配置前也先做
       一次 USB 断电（`check_restart_on_send_config`，`:692-694`），保证配置落在一块**本次会话
@@ -418,8 +331,8 @@ DTR”隐式满足，但那是驱动副作用，不算实现。**
       `request_exit('firmware_restart')`（`check_restart_on_crc_mismatch`，
       `klippy/mcu.py:678-685`、`:1057-1059`），让重启循环做物理复位；我们在 `configure` /
       `handshake` 里就地做：有 `config_reset` 直接清，只有 `reset` 时发 `reset` + 重连 + 重试
-      握手（B2 已做，真板未验）。若要贴上游，还有 `start_reason == 'firmware_restart'` 却仍已
-      配置时 raise “Failed automated reset” 的前置门（`:1053-1056`）。详见
+      握手。若要贴上游，还有 `start_reason == 'firmware_restart'` 却仍已配置时 raise
+      “Failed automated reset” 的前置门（`:1053-1056`）。详见
       `docs/klippy/developer-manual/mcu-config.md`。
 - [ ] **重启后的 g-code 输出订阅**：连接不断，`objects/subscribe` 也自动继续（它按名查新对象），
       但 `gcode/subscribe_output` 的处理器挂在被重建的 `GCodeDispatch` 上，重启后静默失效，
@@ -428,34 +341,20 @@ DTR”隐式满足，但那是驱动副作用，不算实现。**
 
 ### D3 `command` 接管一块还在跑的板子
 
-**为什么**：`rpi_usb` 切不了 VBUS 的机器（根 hub 报 `no power switching`，或板子自带电源）上，
-klipperx 会当场回退到 `command`（`mcu/object.rs`）。而 `command` 的 `config_reset` 要连接上才能发，
-重连时对手的序号接着上一条会话走——**这不是边缘情况**：普通 `RESTART` 也只是重建对象、重新
-open + identify，同样要接上一块没被复位的固件。
+`command` 的 `config_reset` 要连上才能发，而重连时对手的序号接着上一条会话走——这不是边缘
+情况：`rpi_usb` 切不了 VBUS 的机器会当场回退到 `command`（`mcu/object.rs`），普通 `RESTART`
+也只是重建对象、重新 open + identify，同样要接上一块没被复位的固件。
 
-**已做（第一版，NAK/旧会话驱动）**：`mcu/mod.rs` 的传输层现在两端共用一个号：
+**传输层的接管已完成**：收发两端共用一个 4 位序号，接收任务把空帧的号报给发送任务
+（重复 ack 即 NAK），发送端按「更大 → 采纳并换号重发未确认块 / 不更新 → 原号重发 / 否则
+ack」settle，并用 `Mcu::took_over_session()` 让 `rpi_usb` 判断“有没有真重启”
+（`mcu/mod.rs`、`mcu/object.rs`）。测试见 `docs/klippy/developer-manual/testing.md` 的
+`mod.rs` / `host.rs`（含对着真 host 库的同进程二次连接）。
 
-- 发送任务独占 `Wire::next`（展开成单调计数，只有低 4 位上线），**写线之前就推进**（固件可能在写
-  没返回时答上来）；已发未确认的块连原始 `Frame` 存在 `in_flight`，窗口 12（对齐上游
-  `MAX_PENDING_BLOCKS`），满了就等 ack（背压）。
-- 接收任务把 4 位号按**前向差值**展开，首帧免检；**空帧的号就是固件此刻在等的号**，一律报给发送
-  任务（`watch` 通道，值相同也会唤醒——重复 ack 就是 NAK）。
-- `Sender::settle` 三条规则：号**大于** `next` → 采纳它的号并**换号重发**未确认的块（NAK 证明那些
-  块没被执行过）；号**不比上次新** → **原号重发**（它在等的那块丢了；已收下的块会被 NAK 而不会
-  重跑）；否则就是 ack，丢掉被证明收下的块。
-- 事实暴露为 `Mcu::took_over_session()`，`rpi_usb` 的“有没有真重启”检查改读它
-  （`mcu/object.rs`）——握手现在会**成功**，所以判据不能再是“握手失败”。
+**还剩**：
 
-**测试怎么验的**：假设备三条（接管、刚开机不接管、越号帧被丢）；**真固件**那条把
-`test_identify_against_the_real_library` 扩成两幕——同进程第二次连接，库里的序号接着上一次走，
-必须接管才能接上（测试用多一个 `dlopen` 句柄把映射钉住，否则 `dlclose` 会把固件状态一并初始化）。
-测试过程中抓到两个真 bug：① 展开后的 u64 忘了取低位（`16 as u8` 不是 0，第 17 块才暴露）；
-② `next` 推进晚于写线，设备在写返回前就答上来 → 合法响应被判成越号帧丢掉（对上游
-`build_and_send_command` 是先推进再写）。
-
-**还剩**：RTO 定时重传（帧丢了、固件也在静等时，现在只能靠对端再发 ack/NAK 触发）；以及
-`command` 走的是 `config_reset`（清配置），上游还会优先用固件的 `reset` 命令（真重启 MCU，
-`HF_IN_SHUTDOWN`），那一条在 B2 的剩余里。
+- [ ] **RTO 定时重传**：帧丢了、固件也在静等时，现在只能靠对端再发 ack/NAK 触发。
+- [ ] **固件 `reset` 优先**：见 B2 的剩余（现在走 `config_reset`）。
 
 ### E1 文档
 
@@ -506,71 +405,63 @@ open + identify，同样要接上一块没被复位的固件。
 
 ## 已完成（留档）
 
-细节在各模块文档里；这里只留索引，最近完成的在前。
+细节在各模块文档里；这里每条只留一行索引，最近完成的在前。
 
-- **ADC（F5）**：`cmd/adc.rs` 的 `config_analog_in` / `query_analog_in`（新旧两种）与
-      `analog_in_state`（批量 `%*s`），`mcu/resource/adc.rs` 的 `McuAdc` / `AdcRegistry`（按 oid 路由上报）；
-      满量程 `ADC_MAX`、`sample_count * ADC_MAX < 2^16` 上限、按字典格式串选新旧查询、
-      `ConfigBuilder::get_query_slot`（用 `Mcu::estimated_clock`：connect 时一次 `get_uptime`
-      加主机时间外推的最小估计）。消费者（thermistor 等）尚未接。
-- **PWM（F4）**：`cmd/pwm.rs` 的 `config_pwm_out` / `queue_pwm_out`，`mcu/resource/pwm.rs` 的 `McuPwm`
-      （硬件与软件两条路、`set_pwm` / `update_pwm` / `next_aligned_clock`），`pins.rs` 的
-      `PwmOut` / `setup_pwm`；`[output_pin]` 的 `pwm` / `cycle_time` / `hardware_pwm` 已接。
-- **`[board_pins]` 与 `BUS_PINS_<bus>`（F2 剩余）**：`extras/board_pins.rs`（`aliases` /
-      `aliases_*`，`<...>` 保留，`mcu` 列表）与 `ConfigSection` 的 list 解析；
-      `McuChip::resolve_bus_name` 按 `BUS_PINS_<bus>` 预留 SPI/I2C 引脚（F6/F7 会用）。
-
-- **重启循环（D2）**：`klippy_process` 按 `run()` 的结果决定退出还是重建；重建是**就地**的——
-      `Printer::reset_for_restart` 丢掉 config 装载的部件（关设备）并保留 host 的 `webhooks`，
-      再 `load_config` + `bring_up`，同一个 `Arc<Printer>` 继续服务（Q7）。为此把
-      `pins ↔ McuChip` 的强引用环改成 chip 持 `Weak<PrinterPins>`，否则旧 MCU 不会被释放
-      （`src/klippy.rs`、`printer.rs`、`load.rs`、`mcu/resource/pin.rs`）。
-
+- **ADC（F5）**：`cmd/adc.rs` 的 `config_analog_in` / `query_analog_in`（新旧两版）与
+      `analog_in_state`，`mcu/resource/adc.rs` 的 `McuAdc` / `AdcRegistry`，以及
+      `ConfigBuilder::get_query_slot`（`Mcu::estimated_clock`）；消费者（thermistor 等）未接。
+- **PWM（F4）**：`cmd/pwm.rs` 与 `mcu/resource/pwm.rs` 的硬件/软件两条路
+      （`set_pwm` / `update_pwm` / `next_aligned_clock`），`pins.rs` 的 `PwmOut` /
+      `setup_pwm`；`[output_pin]` 的 `pwm` / `cycle_time` / `hardware_pwm` 已接。
+- **`[board_pins]` 与 `BUS_PINS_<bus>`（F2 剩余）**：`extras/board_pins.rs` 与
+      `ConfigSection` 的 `get_list` / `get_list_of_lists`；`McuChip::resolve_bus_name`
+      按 `BUS_PINS_<bus>` 预留 SPI/I2C 引脚（F6/F7 会用）。
+- **重启循环与 `restart_method` 分派（D2 大部）**：`klippy_process` 就地重建
+      （`Printer::reset_for_restart` + `load_config` + `bring_up`，同一个 `Arc<Printer>`），
+      以及 `command` / `arduino` / `cheetah` / `rpi_usb` 四种物理复位与连接期门控
+      （`src/klippy.rs`、`mcu/object.rs`、`mcu/restart.rs`、`interface/usb.rs`）。
 - **identify 后的 DEBUG 摘要**：`describe_dictionary` 在 `Mcu::identify` 里打版本对、
       消息条数与常量（`identify.rs`）。
 - **客户端的 `firmware_restart`**：`Session::firmware_restart` 与本地命令
       `.firmware_restart`（行模式与 g-code 模式都认），`usage()` 同步更新
       （`crates/klippy-client/src/session.rs`）。
-- **`Mcu::flush`**：发送队列的 item 变成 `SendItem::Payload | SendItem::Flush(oneshot)`，
-      发送任务遇到 barrier 就把当前 batch 立即发走并回报；`TestDevice::recorder()` 让
-      block 边界可断言（`mcu/mod.rs`、`interface/test.rs`）。
-- **reset 路径的 P0/P3**：`emergency_stop` 与 `config_reset` 分两个 block，中间用
-      `Mcu::call(EmergencyStop, …, Shutdown, …)` 等固件的 `shutdown` 报告（注册先于发送，
-      是真屏障）；无 `shutdown` 时 15 ms 兜底并告警，固件上线时 `bind_shutdown` 也会告警
-      （`mcu/config.rs`、`mcu/object.rs`）。原 bug：两条命令被合批，固件的 longjmp 掀掉
-      block，`config_reset` 被丢。
+- **`Mcu::flush`**：发送队列的 item 分 `SendItem::Payload | SendItem::Flush(oneshot)`，
+      发送任务遇 barrier 立即发走并回报；`TestDevice::recorder()` 让 block 边界可断言
+      （`mcu/mod.rs`、`interface/test.rs`）。
+- **reset 路径的 P0/P3**：`emergency_stop` 与 `config_reset` 分两个 block，中间用固件的
+      `shutdown` 报告作屏障，无 `shutdown` 时 15 ms 兜底并告警（`mcu/config.rs`、
+      `mcu/object.rs`）。
 - **`gcode/subscribe_output` 与 TUI g-code 模式**：连接包成带 `is_closed` 的
-      `OutputHandler`，推 `{response: line}`；`^G` / `.gcode` 整行走 `gcode/script` 并自动
-      订阅输出，`// …` 与 `!! …` 都可见（`api/endpoints/gcode.rs`、`gcode.rs`、`klippy-client`）。
+      `OutputHandler` 推 `{response: line}`；`^G` / `.gcode` 整行走 `gcode/script` 并自动
+      订阅（`api/endpoints/gcode.rs`、`gcode.rs`、`klippy-client`）。
 - **`gcode/*` 端点（G3）**：`gcode/help` / `script` / `restart` / `firmware_restart`；
       命令级错误用 `ApiError::CommandError`，不关停 klippy（`api/endpoints/gcode.rs`）。
-- **`output_pin` 与 `SET_PIN`（G2）**：`[output_pin <name>]` 用 `setup_digital_out` 或
-      `setup_pwm` 建资源并注册 `SET_PIN PIN=… VALUE=…`；无条件 `setup_max_duration(0)`
-      （`extras/output_pin.rs`、`load.rs`）。`pwm: true` 已接（F4），`SET_PIN` 走立即路径。
-      与上游的剩余差异（打印时间调度 / `scale` / `TEMPLATE`）见 **G2b**。
-- **GCODE 调度器（G1）**：`GCodeDispatch` 的命令表 / `register_mux_command` / `run_script` /
-      输出处理器 / 内置命令，`load_config` 里最先注册（`gcode.rs`）。与上游的剩余行为差异见
-      **G1b**。
+- **`output_pin` 与 `SET_PIN`（G2）**：`setup_digital_out` / `setup_pwm` 建资源并注册
+      `SET_PIN PIN=… VALUE=…`，无条件 `setup_max_duration(0)`（`extras/output_pin.rs`、
+      `load.rs`）；剩余差异见 **G2b**。
+- **GCODE 调度器（G1）**：命令表 / `register_mux_command` / `run_script` / 输出处理器 /
+      内置命令，`load_config` 里最先注册（`gcode.rs`）；剩余行为差异见 **G1b**。
 - **GPIO 数字输出（F3 的 MCU 部分）**：`PinChip` / `DigitalOut`、`config_digital_out` +
-      restart 的 `update_digital_out` + 运行期 `queue_digital_out`（`cmd/gpio.rs`、`mcu/resource/pin.rs`）。
-- **pin 解析与 `pins`（F2）**：`PrinterPins` / `PinResolver` 的别名与保留，`RESERVE_PINS_*`
-      在 connect 预留；`pins` 注册但不可查询（`is_queryable` / `queryable_objects` /
-      `lookup_object_as`）（`pins.rs`、`printer.rs`、`mcu/object.rs`）。
+      restart 的 `update_digital_out` + 运行期 `queue_digital_out`
+      （`cmd/gpio.rs`、`mcu/resource/pin.rs`）。
+- **pin 解析与 `pins`（F2）**：`PrinterPins` / `PinResolver` 的别名与保留，
+      `RESERVE_PINS_*` 在 connect 预留；`pins` 注册但不可查询（`pins.rs`、`printer.rs`、
+      `mcu/object.rs`）。
 - **MCU 配置构建层（F1）**：oid 发号、`config` / `restart` / `init` 三张命令表、config 回调、
       CRC + `finalize_config`，`configure()` 的 `get_config` 两段式下发（`mcu/config.rs`）。
-- **MCU 停机上报与复位（B2 大部）**：`shutdown` / `is_shutdown` / `starting` 事件经
+- **MCU 停机上报与复位（B2 大部）**：`shutdown` / `is_shutdown` / `starting` 经
       `static_string_id` 解成原因，配置握手**之后**绑成打印机停机；`configure` / `handshake`
-      先复位再配置——有 `config_reset` 就地清（`emergency_stop` + `config_reset`），只有 `reset`
-      的固件发 `reset` + 重连 + 重试握手（`event/shutdown.rs`、`mcu/config.rs`、`mcu/object.rs`）。
-- **`objects/subscribe`（B1）**：请求立即回全量快照，随后每 0.25 s（`SUBSCRIPTION_REFRESH_TIME`）
-      推变化字段；连接关闭即退订，最后一个退订时定时器自停；与 `objects/query` 共用字段选择
-      （`api/endpoints/objects_subscribe.rs`、`objects_query.rs`）。
+      先复位再配置——有 `config_reset` 就地清，只有 `reset` 的固件发 `reset` + 重连 + 重试
+      握手（`event/shutdown.rs`、`mcu/config.rs`、`mcu/object.rs`）。
+- **`objects/subscribe`（B1）**：请求立即回全量快照，随后每 0.25 s
+      （`SUBSCRIPTION_REFRESH_TIME`）推变化字段；连接关闭即退订（`api/endpoints/objects_subscribe.rs`、
+      `objects_query.rs`）。
 - **reactor 抽象与定时器（A1）**：`Reactor` trait（`monotonic` / `register_timer` /
       `unregister_timer` / `call_later`）与 `TokioReactor` / `ManualReactor`；机器持
-      `Arc<dyn Reactor>`，不拥有 runtime（`reactor.rs`、`docs/.../reactor.md`）。
+      `Arc<dyn Reactor>`，不拥有 runtime（`reactor.rs`）。
 - **主机层串起来**：`klippy_process`（建机器 → `api::register` → bind → `load_config`，
-      失败即 `invoke_shutdown` → `bring_up` → `run`，重启类结果则就地重建）、`info` 端点、
-      `StartArgs`（`src/klippy.rs`、`api/endpoints/info.rs`、`api/start_args.rs`）。
+      失败即 `invoke_shutdown` → `bring_up` → `run`）、`info` 端点、`StartArgs`
+      （`src/klippy.rs`、`api/endpoints/info.rs`、`api/start_args.rs`）。
 - **`run()` 的形态**：`bring_up()` async、`run()` 同步只等退出、机器只用
       `std::future::Future`，不起 tokio（`printer.rs`）。
 - **配置驱动装载**：静态工厂表、两段式构造顺序、section 级合法性校验（`load.rs`）。
@@ -582,6 +473,8 @@ open + identify，同样要接上一块没被复位的固件。
 
 ## 证据索引（上游，供回头分析时查）
 
+只列**还没做完**的条目要用的位置；已完成项的参考见各模块文档。
+
 | 主题 | 位置 |
 |---|---|
 | Printer 生命周期、状态、事件 | `klippy/klippy.py:25-236` |
@@ -589,9 +482,7 @@ open + identify，同样要接上一块没被复位的固件。
 | notify / analyze shutdown 的载荷 | `klippy/klippy.py:144-151`、`:216-220` |
 | 对象注册表（add / lookup / load） | `klippy/klippy.py:70-113` |
 | 主循环与重启、退出码 | `klippy/klippy.py:355-370` |
-| `objects/list`、`query`、`subscribe` | `klippy/webhooks.py:480-560` |
 | `emergency_stop` / `register_remote_method` / mux | `klippy/webhooks.py:319-340` |
-| `gcode/*` 端点 | `klippy/webhooks.py:438-452` |
 | gcode 调度器（命令表 / `run_script` / 输出） | `klippy/gcode.py:105-388` |
 | `GCodeIO`（伪 tty / 文件输入、`ack` 协议） | `klippy/gcode.py:390-494` |
 | `output_pin`（`SET_PIN` / `GCodeRequestQueue` / 模板） | `klippy/extras/output_pin.py:13-269` |
@@ -600,7 +491,6 @@ open + identify，同样要接上一块没被复位的固件。
 | stats 累计与 shutdown 处理 | `klippy/mcu.py:801-802`、`:883`、`:912`、`:974-975` |
 | 固件停机/重启事件 | `src/sched.c:310` `:318` `:351`、`klippy/mcu.py:813-835` `:880-881` |
 | `config_reset` 与 restart helper | `src/basecmd.c:262-272`、`klippy/mcu.py:756-770` |
-| 工厂装载 `load_config` / `load_config_prefix` | `klippy/klippy.py:90-113` |
 | reactor 定时器 / 回调 / 时钟 | `klippy/reactor.py:111` `:145` `:187` |
 | kinematics 的装载与接缝 | `klippy/toolhead.py:235-252`、`:389` `:400` `:482` `:507` `:522` |
 | 各 kinematics 的差异 | `klippy/kinematics/*.py`（`home` / `check_move` / `calc_position` / `get_status`） |
@@ -608,11 +498,5 @@ open + identify，同样要接上一块没被复位的固件。
 | IDEX / 双滑车 | `klippy/kinematics/idex_modes.py`、`klippy/kinematics/cartesian.py:19-30` |
 | step 生成层的运动学 | `klippy/kinematics/kinematic_stepper.py`、`rail.setup_itersolve(...)` |
 | 惰性装载 | `klippy/extras/adc_temperature.py:51` `load_object(config, 'query_adc')` |
-| MCU 配置构建（oid / config 命令 / CRC / pin 解析） | `klippy/mcu.py:979-1143`、`klippy/pins.py:18-137` |
-| 引脚别名 section（`alias_pin` / `reserve_pin` 的调用方） | `klippy/extras/board_pins.py` |
-| 固件配置区（allocate_oids / get_config / finalize / config_reset） | `src/basecmd.c:235-380` |
-| GPIO 输出 / PWM（软件） | `klippy/mcu.py:408-553`、`src/gpiocmds.c:127-215` |
-| 硬件 PWM | `klippy/mcu.py:451-553`、`src/pwmcmds.c:78-130` |
-| ADC 采样与周期查询 | `klippy/mcu.py:555-655`、`src/adccmds.c:75-115` |
 | SPI / I2C 总线 | `klippy/extras/bus.py:9-336`、`src/spicmds.c`、`src/i2ccmds.c` |
 | endstop / trsync 触发 | `klippy/mcu.py:155-407`、`src/endstop.c:72-120`、`src/trsync.c` |

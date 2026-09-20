@@ -37,7 +37,7 @@
 //! output buffer rather than dropping a response, so a slow host costs latency
 //! and not a desynchronised stream.
 //!
-//! **Two I/O modes, chosen at compile time.** In a test build the library is
+//! **Two I/O modes, chosen at compile time.** In a debug build the library is
 //! read and written one byte per call, so every frame travels the whole
 //! reassembly path ([`FrameStream`](crate::core::klippy::frame::FrameStream))
 //! against real firmware. In a release build the
@@ -52,7 +52,7 @@
 //! explicit teardown in [`Drop`].
 
 use crate::core::klippy::frame::Frame;
-#[cfg(test)]
+#[cfg(debug_assertions)]
 use crate::core::klippy::frame::FrameStream;
 use crate::core::klippy::interface::error::InterfaceError;
 use crate::core::klippy::interface::{describe_frame, Device};
@@ -68,14 +68,14 @@ use tracing::{debug, info, trace, warn};
 
 /// Bytes asked of the library per read.
 ///
-/// A test build reads a byte at a time, which is the hardest case for
+/// A debug build reads a byte at a time, which is the hardest case for
 /// reassembly: no read ever contains a whole frame, so every frame goes through
 /// [`FrameStream`]. A release build asks for one frame at a time, and
 /// [`MESSAGE_MAX`](crate::core::klippy::frame::MESSAGE_MAX) is the largest one
 /// the protocol can produce.
-#[cfg(test)]
+#[cfg(debug_assertions)]
 const OUTPUT_BATCH: usize = 1;
-#[cfg(not(test))]
+#[cfg(not(debug_assertions))]
 const OUTPUT_BATCH: usize = crate::core::klippy::frame::MESSAGE_MAX;
 
 /// How long the output thread blocks in the library when there is nothing to
@@ -104,7 +104,7 @@ type ShutdownFn = unsafe extern "C" fn();
 struct Symbols {
     init: InitFn,
     input: InputFn,
-    /// `klipper_host_output_wait` while testing, `klipper_host_output_frame` in a
+    /// `klipper_host_output_wait` in a debug build, `klipper_host_output_frame` in a
     /// release build — see [`Symbols::resolve`].
     output: OutputFn,
     run: RunFn,
@@ -127,19 +127,19 @@ impl Symbols {
         Ok(Self {
             init: unsafe { get(library, b"klipper_host_init\0")? },
             input: unsafe { get(library, b"klipper_host_input\0")? },
-            // A test build takes the byte stream apart itself; a release build
+            // A debug build takes the byte stream apart itself; a release build
             // wants the library's frame API, which exists only when it was built
             // with CONFIG_HOST_FRAME_API.
-            #[cfg(test)]
+            #[cfg(debug_assertions)]
             output: unsafe { get(library, b"klipper_host_output_wait\0")? },
-            #[cfg(not(test))]
+            #[cfg(not(debug_assertions))]
             output: unsafe {
                 library
                     .get::<OutputFn>(b"klipper_host_output_frame\0")
                     .map_err(|e| {
                         InterfaceError::Other(format!(
                             "klipper host library has no klipper_host_output_frame: rebuild it \
-                             with CONFIG_HOST_FRAME_API=y, or use a test build ({e})"
+                             with CONFIG_HOST_FRAME_API=y, or use a debug build ({e})"
                         ))
                     })
                     .map(|symbol| *symbol)?
@@ -199,7 +199,7 @@ pub struct HostDevice {
     /// Bytes pulled from `output`, reassembled into frames.
     ///
     /// A release build is handed whole frames and never needs this.
-    #[cfg(test)]
+    #[cfg(debug_assertions)]
     stream: Mutex<FrameStream>,
     /// Set by `shutdown`, checked by both worker threads and by `receive`.
     stopped: Arc<AtomicBool>,
@@ -272,7 +272,7 @@ impl HostDevice {
                 while !poller_stopped.load(Ordering::Relaxed) {
                     // Blocks in the library until data arrives or the wait expires,
                     // so no polling interval is needed here. How much arrives is
-                    // the mode's business: a byte while testing, a whole frame in a
+                    // the mode's business: a byte in a debug build, a whole frame in a
                     // release build.
                     let read = unsafe { poller_read(buf.as_mut_ptr(), buf.len(), OUTPUT_WAIT_MS) };
                     if read == 0 {
@@ -306,7 +306,7 @@ impl HostDevice {
             _library: library,
             library_path,
             output,
-            #[cfg(test)]
+            #[cfg(debug_assertions)]
             stream: Mutex::new(FrameStream::new()),
             stopped,
             threads: Mutex::new(threads),
@@ -335,11 +335,12 @@ impl Device for HostDevice {
         }
 
         let bytes = frame.raw_bytes();
+        trace!("tx frame [{}]: {}", self.id(), describe_frame(&bytes));
 
-        // A test build hands the frame over one byte per call, so the library's
+        // A debug build hands the frame over one byte per call, so the library's
         // receive path sees the stream the way a real link would deliver it. A
         // release build gives it the frame in one call.
-        #[cfg(test)]
+        #[cfg(debug_assertions)]
         let written = {
             let mut taken = 0;
             for byte in &bytes {
@@ -351,7 +352,7 @@ impl Device for HostDevice {
             }
             taken
         };
-        #[cfg(not(test))]
+        #[cfg(not(debug_assertions))]
         let written = unsafe { (self.symbols.input)(bytes.as_ptr(), bytes.len()) };
 
         if written != bytes.len() as c_long {
@@ -360,7 +361,6 @@ impl Device for HostDevice {
                 bytes.len()
             )));
         }
-        trace!("tx frame [{}]: {}", self.id(), describe_frame(&bytes));
         debug!("sent {} bytes to klipper", bytes.len());
         Ok(())
     }
@@ -370,25 +370,32 @@ impl Device for HostDevice {
             if self.stopped.load(Ordering::Relaxed) {
                 return None;
             }
-            // Bytes that have already arrived may hold another frame; a release
-            // build gets whole frames, so there is never anything left over.
-            #[cfg(test)]
+            // A debug build is fed a byte stream, so the frame is logged here,
+            // once it has been reassembled, instead of a raw byte at a time on
+            // arrival — the way the serial port logs one whole frame.
+            #[cfg(debug_assertions)]
             if let Some(frame) = self.stream.lock().unwrap().next_frame() {
+                let bytes = frame.raw_bytes();
+                trace!("rx frame [{}]: {}", self.id(), describe_frame(&bytes));
+                debug!("received {} bytes from klipper", bytes.len());
                 return Some(frame);
             }
             match self.output.recv() {
                 Ok(bytes) => {
-                    trace!("rx frame [{}]: {}", self.id(), describe_frame(&bytes));
-                    debug!("received {} bytes from klipper", bytes.len());
-
-                    // A test build reassembles the stream; a release build is
+                    // A debug build reassembles the stream; a release build is
                     // handed whole frames and only has to validate them.
-                    #[cfg(test)]
+                    #[cfg(debug_assertions)]
                     self.stream.lock().unwrap().push(&bytes);
-                    #[cfg(not(test))]
-                    match Frame::parse(&bytes) {
-                        Some(frame) => return Some(frame),
-                        None => warn!("klipper sent {} bytes that are not a frame", bytes.len()),
+                    #[cfg(not(debug_assertions))]
+                    {
+                        trace!("rx frame [{}]: {}", self.id(), describe_frame(&bytes));
+                        debug!("received {} bytes from klipper", bytes.len());
+                        match Frame::parse(&bytes) {
+                            Some(frame) => return Some(frame),
+                            None => {
+                                warn!("klipper sent {} bytes that are not a frame", bytes.len())
+                            }
+                        }
                     }
                 }
                 // The poller stopped: the stream is over.

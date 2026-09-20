@@ -119,6 +119,9 @@ impl Printer {
     /// last is upstream's `Section '%s' is not a valid config section`
     /// (`klippy/configfile.py:431`).
     pub fn load_config(self: &Arc<Self>, config: &Config) -> Result<(), KlippyError> {
+        // Remember where the host's own parts end, so a restart can keep them
+        // and drop only what the config loads (see `reset_for_restart`).
+        self.mark_host_objects();
         self.add_object(GCODE_OBJECT, Arc::new(GCodeDispatch::new(Arc::clone(self))))?;
         self.add_object(PINS_OBJECT, Arc::new(PrinterPins::new()))?;
 
@@ -203,6 +206,21 @@ mod tests {
         result.unwrap();
         // `pins` is registered before the table (upstream loads `pins` and
         // `mcu` up front), then the section's own object.
+        assert_eq!(printer.objects(), ["gcode", "pins", "mcu"]);
+    }
+
+    #[test]
+    fn test_the_config_can_be_loaded_again_after_a_restart() {
+        // A restart drops the config's parts and loads the same file again: the
+        // registry ends up exactly as it started, with nothing left over.
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        let config = config("[mcu]\nserial: /dev/not-opened-yet\n");
+        printer.load_config(&config).unwrap();
+        assert_eq!(printer.objects(), ["gcode", "pins", "mcu"]);
+
+        printer.reset_for_restart();
+        printer.load_config(&config).unwrap();
+
         assert_eq!(printer.objects(), ["gcode", "pins", "mcu"]);
     }
 

@@ -19,7 +19,7 @@
 //! parser (`klippy/msgproto.py`); here it happens in the callback because this
 //! host's encoder takes [`ArgValue`]s.
 
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use crate::core::klippy::cmd::gpio::{ConfigDigitalOut, QueueDigitalOut, UpdateDigitalOut};
 use crate::core::klippy::cmd::McuCommand;
@@ -42,7 +42,14 @@ const DEFAULT_MAX_DURATION: f64 = 2.0;
 pub struct McuChip {
     name: String,
     config: Arc<ConfigBuilder>,
-    pins: Arc<PrinterPins>,
+    /// The shared pin registry, held **weakly**.
+    ///
+    /// The registry owns its chips (`PrinterPins::register_chip` stores an
+    /// `Arc<dyn PinChip>`), so a strong handle back would be a reference cycle
+    /// that keeps the chip — and through it the connected `Mcu` and its device —
+    /// alive after a restart drops the machine's parts. The registry outlives
+    /// every chip it owns, so [`McuChip::pins`] can always upgrade.
+    pins: Weak<PrinterPins>,
     /// The connected transport, once [`McuChip::attach`] has run.
     mcu: Arc<Mutex<Option<Arc<Mcu>>>>,
 }
@@ -53,7 +60,7 @@ impl McuChip {
         Self {
             name,
             config,
-            pins,
+            pins: Arc::downgrade(&pins),
             mcu: Arc::new(Mutex::new(None)),
         }
     }
@@ -69,8 +76,13 @@ impl McuChip {
     }
 
     /// The shared pin registry, so the object can reserve `RESERVE_PINS_*`.
-    pub fn pins(&self) -> &Arc<PrinterPins> {
-        &self.pins
+    ///
+    /// Upgrades the weak handle; the registry outlives the chips it owns, so it
+    /// is only absent while the machine is being torn down.
+    pub fn pins(&self) -> Arc<PrinterPins> {
+        self.pins
+            .upgrade()
+            .expect("the pins registry outlives its chips")
     }
 
     /// Make the connected device reachable by the resources built on this chip.
@@ -88,7 +100,7 @@ impl McuChip {
     /// # Errors
     /// As [`PrinterPins::resolve_pin`].
     pub fn resolve_pin(&self, name: &str) -> Result<String, PinError> {
-        self.pins.resolve_pin(&self.name, name)
+        self.pins().resolve_pin(&self.name, name)
     }
 
     fn lock(&self) -> MutexGuard<'_, Option<Arc<Mcu>>> {
@@ -100,7 +112,7 @@ impl PinChip for McuChip {
     fn setup_digital_out(&self, params: &PinParams) -> Result<Arc<dyn DigitalOut>, PinError> {
         Ok(Arc::new(McuDigitalOut::new(
             Arc::clone(&self.config),
-            Arc::clone(&self.pins),
+            self.pins(),
             self.name.clone(),
             Arc::clone(&self.mcu),
             params.clone(),
@@ -363,6 +375,23 @@ mod tests {
         );
         pins.register_chip("mcu", Arc::new(chip.clone())).unwrap();
         (chip, pins)
+    }
+
+    #[test]
+    fn test_a_chip_does_not_keep_the_pin_registry_alive() {
+        // The registry owns its chips. If a chip reached back strongly, the
+        // pair would outlive a restart — and with the chip, the connected MCU
+        // and its device would stay open.
+        let (chip, pins) = chip();
+
+        let weak = Arc::downgrade(&pins);
+        drop(chip);
+        drop(pins);
+
+        assert!(
+            weak.upgrade().is_none(),
+            "the pin registry was kept alive by its own chip"
+        );
     }
 
     /// The decoded `(name, args)` of every config command the builder produced.

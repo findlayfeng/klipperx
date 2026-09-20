@@ -43,39 +43,83 @@ pub struct AppArgs {
     pub config_file: Option<String>,
 }
 
-/// Run one printer: bring it up, then idle until something asks it to stop.
+/// How long to wait before a rebuilt printer is brought up again.
+///
+/// It gives a device that was just closed (a serial port, a CAN socket) time to
+/// come back, and rate-limits a restart that returns straight away — a config
+/// the loader rejects, an MCU that is gone.
+const RESTART_DELAY: std::time::Duration = std::time::Duration::from_millis(1000);
+
+/// Whether a run result asks for the printer to be built again.
+///
+/// `"exit"` / `"error_exit"` end the process; these two rebuild the machine
+/// (upstream's `klippy/klippy.py:355-370`).
+fn is_restart(result: &str) -> bool {
+    matches!(result, "restart" | "firmware_restart")
+}
+
+/// Run one printer until something asks it to stop, rebuilding it on a restart.
 ///
 /// The machine is built, its config loaded and the API server serving it by the
 /// time this is called. The run loop blocks, so it gets a blocking thread of its
 /// own; the interrupt means "ask the printer to exit", not "kill the process",
 /// so the printer still goes down in order.
-async fn klippy_process(printer: Arc<Printer>) {
-    printer.bring_up().await;
-
+///
+/// A restart reloads the same parsed config rather than re-reading the file, so
+/// an edit on disk takes effect at the next *start*, like upstream. The machine
+/// is reset and reloaded **in place**: the same `Arc<Printer>` keeps serving, so
+/// the endpoints and any attached window survive a restart (this is the answer
+/// to Q7 — no printer slot to swap, because the printer is rebuilt under its
+/// one handle).
+async fn klippy_process(printer: Arc<Printer>, config: Arc<Config>) {
     // The printer's own shutdown conditions (an MCU going away, a client's
     // emergency stop) end the loop on their own; until they exist, the
     // operator's interrupt is the only one. A task rather than a `select!`, so
     // that the blocking loop below is awaited exactly once — and so that an
     // exit requested from somewhere else (an attached window closing) ends it
-    // without waiting for an interrupt.
+    // without waiting for an interrupt. It is a loop because a restart clears
+    // the exit request, so the listener has to be armed again for the next run.
     let interrupt_printer = Arc::clone(&printer);
     let interrupt = tokio::spawn(async move {
-        if let Err(err) = tokio::signal::ctrl_c().await {
-            warn!("cannot listen for an interrupt: {err}");
+        loop {
+            if let Err(err) = tokio::signal::ctrl_c().await {
+                warn!("cannot listen for an interrupt: {err}");
+                return;
+            }
+            interrupt_printer.request_exit("exit");
         }
-        interrupt_printer.request_exit("exit");
     });
 
-    let result = {
-        let printer = Arc::clone(&printer);
-        tokio::task::spawn_blocking(move || printer.run()).await
-    };
-    interrupt.abort();
+    loop {
+        printer.bring_up().await;
 
-    match result {
-        Ok(result) => debug!("printer stopped: {result}"),
-        Err(err) => warn!("the run loop did not finish: {err}"),
+        let result = {
+            let printer = Arc::clone(&printer);
+            tokio::task::spawn_blocking(move || printer.run()).await
+        };
+
+        let result = match result {
+            Ok(result) => result,
+            Err(err) => {
+                warn!("the run loop did not finish: {err}");
+                break;
+            }
+        };
+
+        if !is_restart(&result) {
+            debug!("printer stopped: {result}");
+            break;
+        }
+
+        info!("Restarting the printer ({result})");
+        printer.reset_for_restart();
+        if let Err(err) = printer.load_config(&config) {
+            printer.invoke_shutdown(&format!("{err}"));
+        }
+        tokio::time::sleep(RESTART_DELAY).await;
     }
+
+    interrupt.abort();
 }
 
 /// Something to run alongside the host, attached to its own API.
@@ -121,6 +165,9 @@ pub fn run(
     for section in config.sections() {
         debug!("Section: {}", section.identifier());
     }
+
+    // Shared with the run loop: a restart reloads this same parsed config.
+    let config = Arc::new(config);
 
     // Resolving the target before the runtime starts means a typo is reported
     // like any other bad option, not after the printer has begun to come up.
@@ -201,13 +248,13 @@ pub fn run(
             // return in order, rather than dropping a loop that still holds the
             // machine.
             Some(mut attachment) => {
-                let host = tokio::spawn(klippy_process(Arc::clone(&printer)));
+                let host = tokio::spawn(klippy_process(Arc::clone(&printer), Arc::clone(&config)));
                 let outcome = attachment.run(Arc::clone(&api)).await;
                 printer.request_exit("exit");
                 let _ = host.await;
                 outcome.map_err(|err| -> Box<dyn std::error::Error> { err.into() })?;
             }
-            None => klippy_process(printer).await,
+            None => klippy_process(printer, config).await,
         }
 
         // The printer has stopped, so the API server goes with it. Aborting is
@@ -219,4 +266,81 @@ pub fn run(
 
         Ok::<(), Box<dyn std::error::Error>>(())
     })
+}
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::klippy::config::Config;
+    use crate::core::klippy::printer::{ConnectFuture, PrinterObject, PrinterState};
+    use crate::core::klippy::reactor::ManualReactor;
+    use serde_json::Value;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Weak;
+
+    #[test]
+    fn test_only_a_restart_result_rebuilds_the_printer() {
+        // The two spellings `gcode/restart` and `gcode/firmware_restart` exit
+        // with; everything else stops the process.
+        assert!(is_restart("restart"));
+        assert!(is_restart("firmware_restart"));
+        assert!(!is_restart("exit"));
+        assert!(!is_restart("error_exit"));
+    }
+
+    /// A host part that asks for a restart the first time it connects, and for
+    /// an exit the second — enough to drive one turn of the loop. It is a *host*
+    /// part (registered before `mark_host_objects`), so a reset keeps it and it
+    /// connects again.
+    struct RestartOnce {
+        connects: Arc<AtomicUsize>,
+        printer: Weak<Printer>,
+    }
+
+    impl PrinterObject for RestartOnce {
+        fn get_status(&self, _eventtime: f64) -> Value {
+            serde_json::json!({})
+        }
+
+        fn connect<'a>(&'a self) -> ConnectFuture<'a> {
+            let result = if self.connects.fetch_add(1, Ordering::SeqCst) == 0 {
+                "restart"
+            } else {
+                "exit"
+            };
+            if let Some(printer) = self.printer.upgrade() {
+                printer.request_exit(result);
+            }
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_restart_rebuilds_the_printer_before_the_next_run() {
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        let connects = Arc::new(AtomicUsize::new(0));
+        // Registered before `mark_host_objects`, so it is a host part and a
+        // reset keeps it.
+        printer
+            .add_object(
+                "stub",
+                Arc::new(RestartOnce {
+                    connects: Arc::clone(&connects),
+                    printer: Arc::downgrade(&printer),
+                }),
+            )
+            .unwrap();
+        printer.mark_host_objects();
+
+        klippy_process(Arc::clone(&printer), Arc::new(Config::new())).await;
+
+        // `restart` rebuilt the printer (config reloaded, brought up again)
+        // instead of ending the loop; `exit` then ended it.
+        assert_eq!(connects.load(Ordering::SeqCst), 2);
+        assert_eq!(printer.get_state_message().category, PrinterState::Ready);
+    }
 }

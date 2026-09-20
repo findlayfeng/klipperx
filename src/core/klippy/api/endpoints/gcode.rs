@@ -102,7 +102,7 @@ impl Endpoint for GcodeScript {
 /// `gcode/restart` and `gcode/firmware_restart` — run the restart command.
 ///
 /// The command itself decides what a restart means (`request_exit`); the restart
-/// loop that acts on the result is TODO D2, so today the host exits.
+/// loop (`src/klippy.rs`) rebuilds the machine or exits on the result.
 pub struct GcodeRestart {
     printer: Arc<Printer>,
     path: &'static str,

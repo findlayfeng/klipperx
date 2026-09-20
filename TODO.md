@@ -323,7 +323,8 @@ DTR”隐式满足，但那是驱动副作用，不算实现。**
       `arduino` 以 2400 开、排空、DTR 三拍（`klippy/serialhdl.py:392`）、`cheetah`/`rpi_usb`
       记 warning 后继续（仍靠 `config_reset` 恢复）。在 `McuObject::connect` 的 open **之前**、
       且仅 `firmware_restart` 时调用。注：pty 不模拟 modem 线（`TIOCMBIS` = `ENOTTY`），
-      DTR/RTS 翻转没有端到端测试，只测了 `ModemLines` 能开 tty + 分派到串口复位。
+      DTR/RTS 翻转没有端到端测试，只测了 `ModemLines` 能开 tty + 分派到串口复位；
+      **实际执行时会告警「未在真板上测过」**。
 - [ ] **⑤ `cheetah`**：复用 `ModemLines`（2400 + RTS/DTR 序列，`serialhdl.py:365`），
       再加“attach 时 RTS 拉低”（`lookup_attach_uart_rts`，`klippy/mcu.py:703`）—— 后者要在
       **打开设备时**就把 RTS 置低，可能要给 `Transport::Serial` 或 `SerialDevice::open` 加一个

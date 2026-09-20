@@ -9,7 +9,7 @@
 //! | method | here | elsewhere |
 //! |---|---|---|
 //! | `command` | nothing | `config_reset` after the connection is up (`mcu/config.rs`) |
-//! | `arduino` | toggle DTR at 2400 baud | — |
+//! | `arduino` | toggle DTR at 2400 baud — **untested on hardware**, and reported | — |
 //! | `cheetah` | *(not implemented)* | — |
 //! | `rpi_usb` | *(not implemented)* | — |
 //!
@@ -50,7 +50,17 @@ pub async fn reset_firmware(config: &McuConfig) -> Result<(), String> {
         // it is up (`mcu/config.rs`).
         McuRestartMethod::Command => Ok(()),
         McuRestartMethod::Arduino => match &config.transport {
-            Transport::Serial { path, .. } => arduino_reset(path).await,
+            Transport::Serial { path, .. } => {
+                // Say so out loud: the DTR toggle cannot be exercised without a real
+                // board (a pty does not emulate the modem lines), so this path has
+                // never been run against hardware.
+                warn!(
+                    "MCU '{}' restart_method 'arduino' has not been tested on real hardware; \
+                     resetting by DTR toggle anyway",
+                    config.name
+                );
+                arduino_reset(path).await
+            }
             // `parse_restart_method` only yields `arduino` for a serial MCU.
             _ => Ok(()),
         },

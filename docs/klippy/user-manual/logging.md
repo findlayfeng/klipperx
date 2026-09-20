@@ -16,7 +16,8 @@ KlipperX 的日志系统基于 Rust 的 `tracing` 框架，支持多种级别和
 
 ## 开启详细日志
 
-有三种方式，按优先级从高到低排列：
+级别有两个来源：`--verbose` 命令行参数和 `RUST_LOG` 环境变量。**两者不分优先级**——同时
+给出时取**更详细**的那个，谁也不会静默盖掉另一个。
 
 ### 1. `--verbose` 命令行参数
 
@@ -26,7 +27,7 @@ KlipperX 的日志系统基于 Rust 的 `tracing` 框架，支持多种级别和
 $ klipperx ~/printer.cfg --tui --verbose
 ```
 
-这会强制将所有日志设为 `DEBUG` 级别。**优先级最高**，会忽略 `RUST_LOG` 环境变量。
+这把级别抬到 `DEBUG`，相当于一个下限。
 
 ### 2. `RUST_LOG` 环境变量
 
@@ -46,9 +47,23 @@ RUST_LOG=klipperx=debug,klippy_client=info klipperx ~/printer.cfg
 RUST_LOG=trace klipperx ~/printer.cfg
 ```
 
-> **注意**：`RUST_LOG` 只在没有 `--verbose` 参数时生效。如果传了 `--verbose`，环境变量会被忽略。
+### 3. 两者一起用时取更详细的
 
-### 3. 配置文件（`.env` 或 shell 导出）
+| `--verbose` | `RUST_LOG` | 实际级别 |
+|---|---|---|
+| 给了 | `trace` | `trace` |
+| 给了 | `warn` | `debug` |
+| 给了 | 未设 | `debug` |
+| 没给 | `warn` | `warn` |
+| 没给 | 未设 | `info` |
+
+`--verbose` 因此不会挡掉 `RUST_LOG=trace`，`RUST_LOG=warn` 也不会把 `--verbose` 调低。
+单独用 `RUST_LOG`（不带 `--verbose`）时它按原样生效，所以仍然可以用它把日志**调低**到
+`warn` 或 `error`。
+
+> 解析不了的 `RUST_LOG` 会被忽略（退回默认级别），不会让主机起不来。
+
+### 4. 配置文件（`.env` 或 shell 导出）
 
 如果经常需要调试，可以把 `RUST_LOG` 写到配置文件中：
 
@@ -177,8 +192,8 @@ recv identify_response offset=0 data=b"x\x9c\x01\xff"
 日志行**只有级别那一截染色**（`INFO ` / `WARN ` 这样），后面的正文用终端默认
 前景色（正常是白），和 `tracing` 直接输出到终端时一致。
 
-有一个容易踩的点：`--verbose` 把过滤器设成 `debug`，**TRACE 事件因此被过滤掉**，
-在窗口里看不到帧字节。要看帧字节得用 `RUST_LOG`：
+想看帧字节（`TRACE` 级别）时带上 `RUST_LOG=klipperx=trace`；`--verbose` 不会再把它压回
+`debug`（两者取更详细的那个）：
 
 ```bash
 RUST_LOG=klipperx=trace klipperx ~/printer.cfg --tui
@@ -204,6 +219,6 @@ RUST_LOG=klipperx=debug klipperx ~/printer.cfg
 
 ### `--verbose` 和 `RUST_LOG` 有什么区别？
 
-- `--verbose` 是硬编码的 `debug` 级别，适用于 `--tui` 窗口模式，最简单直接
+- `--verbose` 把级别抬到 `debug`，适用于 `--tui` 窗口模式，最简单直接
 - `RUST_LOG` 更灵活，可以按模块设置不同级别，也适合 systemd 等服务场景
-- 两者冲突时 `--verbose` 优先
+- 同时给出时取更详细的那个：`--verbose` 保底 `debug`，`RUST_LOG` 可以再往上（`trace`）

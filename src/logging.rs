@@ -22,6 +22,7 @@ use std::sync::Mutex;
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::debug;
 use tracing::field::{Field, Visit};
+use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -57,20 +58,55 @@ pub type Record = (Level, String);
 /// records go to stdout only.
 static WINDOW: Mutex<Option<UnboundedSender<Record>>> = Mutex::new(None);
 
+/// The level `--verbose` turns on.
+const VERBOSE_LEVEL: &str = "debug";
+
+/// The level used when neither source asks for one.
+const DEFAULT_LEVEL: &str = "info";
+
+/// The filter the host runs with.
+///
+/// Two sources can ask for a level: `--verbose` and `RUST_LOG`. Neither is
+/// ranked above the other — a flag must not silently discard an environment
+/// setting, and the other way round — so the **more detailed** of the two wins:
+/// `RUST_LOG=trace` survives `--verbose`, and `--verbose` survives
+/// `RUST_LOG=warn`. With the flag absent, `RUST_LOG` is used as it is, including
+/// to quiet the host down; with neither, the host is `info`.
+///
+/// A `RUST_LOG` that does not parse is ignored rather than fatal, the way
+/// `EnvFilter::try_from_default_env`'s fallback treated it.
+fn filter_for(verbose: bool, rust_log: Option<&str>) -> EnvFilter {
+    let rust_log = rust_log.and_then(|spec| EnvFilter::try_new(spec).ok());
+    match (verbose, rust_log) {
+        (false, Some(env)) => env,
+        (false, None) => EnvFilter::new(DEFAULT_LEVEL),
+        (true, env) => {
+            let verbose = EnvFilter::new(VERBOSE_LEVEL);
+            match env {
+                Some(env) if detail(&env) > detail(&verbose) => env,
+                _ => verbose,
+            }
+        }
+    }
+}
+
+/// How detailed a filter is: the loudest level it lets through.
+///
+/// A filter's own `max_level_hint` is the answer, so a per-target `RUST_LOG`
+/// compares by its loudest target rather than by a hand-parsed level name.
+fn detail(filter: &EnvFilter) -> LevelFilter {
+    filter.max_level_hint().unwrap_or(LevelFilter::TRACE)
+}
+
 /// Install the global tracing subscriber.
 ///
-/// `--verbose` wins over `RUST_LOG`, because it is the more explicit of the two.
+/// The level is the more detailed of what `--verbose` asks for and what
+/// `RUST_LOG` asks for; see [`filter_for`].
 ///
 /// Installing twice is not an error: the second attempt is ignored, which is
 /// what a user of the library as a library will do.
 pub fn init(verbose: bool) {
-    let filter = if verbose {
-        EnvFilter::try_new("debug").expect("'debug' is a valid filter")
-    } else {
-        EnvFilter::try_from_default_env()
-            .or_else(|_| EnvFilter::try_new("info"))
-            .expect("'info' is a valid filter")
-    };
+    let filter = filter_for(verbose, std::env::var("RUST_LOG").ok().as_deref());
 
     tracing_subscriber::registry()
         .with(filter)
@@ -248,6 +284,34 @@ mod tests {
         assert!(
             logs.try_recv().is_err(),
             "a closed window still received a record"
+        );
+    }
+
+    /// `--verbose` and `RUST_LOG` are two ways to ask for a level. Neither is
+    /// ranked above the other: the more detailed of the two is used.
+    #[test]
+    fn test_the_more_detailed_of_flag_and_environment_wins() {
+        // `--verbose` is a floor, not a ceiling: a louder RUST_LOG is kept...
+        assert_eq!(detail(&filter_for(true, Some("trace"))), LevelFilter::TRACE);
+        // ...and a quieter one does not silence the flag.
+        assert_eq!(detail(&filter_for(true, Some("warn"))), LevelFilter::DEBUG);
+        assert_eq!(detail(&filter_for(true, Some("error"))), LevelFilter::DEBUG);
+        assert_eq!(detail(&filter_for(true, None)), LevelFilter::DEBUG);
+        // Without the flag, RUST_LOG is used as it is — including to quiet down.
+        assert_eq!(
+            detail(&filter_for(false, Some("trace"))),
+            LevelFilter::TRACE
+        );
+        assert_eq!(detail(&filter_for(false, Some("warn"))), LevelFilter::WARN);
+        assert_eq!(detail(&filter_for(false, None)), LevelFilter::INFO);
+        // A RUST_LOG that does not parse is ignored, not fatal.
+        assert_eq!(
+            detail(&filter_for(true, Some("foo=notalevel"))),
+            LevelFilter::DEBUG
+        );
+        assert_eq!(
+            detail(&filter_for(false, Some("foo=notalevel"))),
+            LevelFilter::INFO
         );
     }
 

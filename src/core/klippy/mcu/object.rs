@@ -24,10 +24,13 @@
 //! It comes back with the statistics consumer.
 
 use std::sync::{Arc, Mutex, Weak};
+use std::time::Duration;
 
 use serde_json::{json, Map, Value};
-use tracing::warn;
+use tracing::{info, warn};
 
+use crate::core::klippy::cmd::config::Reset;
+use crate::core::klippy::cmd::McuCommand;
 use crate::core::klippy::config::mcu::McuConfig;
 use crate::core::klippy::config::value::ConfigValue;
 use crate::core::klippy::config::ConfigSection;
@@ -38,6 +41,17 @@ use crate::core::klippy::mcu::{
 };
 use crate::core::klippy::pins::{PinError, PrinterPins, PINS_OBJECT};
 use crate::core::klippy::printer::{ConnectFuture, Printer, PrinterObject};
+
+/// How long to wait between attempts to reopen a board that was just told to
+/// reboot. A native-USB board re-enumerates, so the port is briefly gone.
+const RECONNECT_DELAY: Duration = Duration::from_millis(250);
+
+/// How many times to try reopening before giving up (a little over 5 s).
+const RECONNECT_ATTEMPTS: usize = 20;
+
+/// How long to wait for the `reset` command to leave the send queue before the
+/// rebooted board takes the transport with it.
+const RESET_FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// The printer object for one `[mcu]` / `[mcu <name>]` section.
 pub struct McuObject {
@@ -139,6 +153,41 @@ impl McuObject {
             }
         }
         Ok(())
+    }
+
+    /// Reopen a firmware that was just told to reboot.
+    ///
+    /// `reset` restarts the MCU: a native-USB board disappears from the bus and
+    /// re-enumerates, so the port may not be openable for a moment. `previous`
+    /// is dropped first so its transport is closed before the port is reopened.
+    async fn reconnect(
+        &self,
+        config: &McuConfig,
+        previous: Arc<Mcu>,
+    ) -> Result<Arc<Mcu>, KlippyError> {
+        drop(previous);
+        let mut last = String::new();
+        for _ in 0..RECONNECT_ATTEMPTS {
+            tokio::time::sleep(RECONNECT_DELAY).await;
+            let interface = match config.open() {
+                Ok(interface) => interface,
+                Err(err) => {
+                    last = err;
+                    continue;
+                }
+            };
+            match Mcu::connect(&config.name, interface).await {
+                Ok(mcu) => {
+                    self.chip.attach(Arc::clone(&mcu));
+                    return Ok(mcu);
+                }
+                Err(err) => last = err.to_string(),
+            }
+        }
+        Err(KlippyError::Connection(format!(
+            "MCU '{}' did not come back after a reset: {last}",
+            config.name
+        )))
     }
 
     /// Whether this bring-up follows a `firmware_restart`.
@@ -276,7 +325,7 @@ impl PrinterObject for McuObject {
                 }
             }
             let interface = config.open().map_err(KlippyError::Internal)?;
-            let mcu = match Mcu::connect(&config.name, interface).await {
+            let mut mcu = match Mcu::connect(&config.name, interface).await {
                 Ok(mcu) => mcu,
                 Err(err) => {
                     if usb_reset {
@@ -292,15 +341,60 @@ impl PrinterObject for McuObject {
             // owns before anything resolves one.
             self.reserve_pins(&mcu)
                 .map_err(|err| KlippyError::Internal(err.to_string()))?;
-            // Now the accumulated configuration can be encoded and sent, and the
-            // firmware either adopts it or confirms it already has it
-            // (`mcu/config.rs`).
-            let configured = self
+
+            // `FIRMWARE_RESTART` asks for the firmware itself to be reset. On
+            // the `command` method that is the firmware's own `reset`, which
+            // reboots the MCU rather than clearing its configuration in place,
+            // so the connection has to be re-established after it
+            // (`klippy/mcu.py:736-745`).
+            let mut reset_sent = false;
+            if self.is_firmware_restart()
+                && config.restart_method == McuRestartMethod::Command
+                && mcu.has_message(Reset::NAME)
+            {
+                info!(
+                    "MCU '{}': resetting the firmware with the 'reset' command",
+                    config.name
+                );
+                reset_and_flush(&mcu).await?;
+                mcu = self.reconnect(&config, mcu).await?;
+                reset_sent = true;
+            }
+
+            // The accumulated configuration is encoded once, and the handshake
+            // can then be retried on a fresh connection if the firmware has to
+            // reboot to accept it (`mcu/config.rs`).
+            let mut built = self
                 .chip
                 .config()
-                .configure(&mcu)
-                .await
-                .map_err(|err| KlippyError::Connection(err.to_string()))?;
+                .build(&mcu)
+                .map_err(|err| KlippyError::Internal(err.to_string()))?;
+            let configured = loop {
+                match self.chip.config().handshake(&mcu, &mut built).await {
+                    Ok(configured) => break configured,
+                    Err(McuError::ResetRequired) if !reset_sent => {
+                        // No `config_reset`, but the firmware can reboot itself:
+                        // send `reset` and re-run the handshake on the
+                        // connection that comes back.
+                        info!(
+                            "MCU '{}': resetting the firmware with the 'reset' command",
+                            config.name
+                        );
+                        reset_and_flush(&mcu).await?;
+                        reset_sent = true;
+                        mcu = self.reconnect(&config, mcu).await?;
+                    }
+                    Err(McuError::ResetRequired) => {
+                        return Err(KlippyError::Connection(format!(
+                            "MCU '{}' still carries a configuration after a 'reset'",
+                            config.name
+                        )));
+                    }
+                    Err(err) => {
+                        return Err(KlippyError::Connection(err.to_string()));
+                    }
+                }
+            };
             // A board that just rebooted has a sequence that starts over and no
             // configuration: the transport had nothing to take over
             // (`Mcu::took_over_session`), and the firmware was neither configured
@@ -321,6 +415,19 @@ impl PrinterObject for McuObject {
             Ok(())
         })
     }
+}
+
+/// Send `reset` and wait for it to leave the send queue.
+///
+/// The firmware reboots on receipt, so the connection is about to die;
+/// flushing first is what keeps the command from being dropped with the
+/// transport. The flush itself often reports the transport closing as the board
+/// goes away — the command was still written first, so that is not an error.
+async fn reset_and_flush(mcu: &Mcu) -> Result<(), KlippyError> {
+    mcu.send_msg(&Reset)
+        .map_err(|err| KlippyError::Internal(err.to_string()))?;
+    let _ = mcu.flush(RESET_FLUSH_TIMEOUT).await;
+    Ok(())
 }
 
 /// Log a firmware stop and put the machine into its shutdown state.

@@ -8,7 +8,7 @@
 //!
 //! | method | here | elsewhere |
 //! |---|---|---|
-//! | `command` | nothing | `config_reset` after the connection is up (`mcu/config.rs`) |
+//! | `command` | nothing | `reset` (preferred), or `config_reset`, after the connection is up (`mcu/config.rs`) |
 //! | `arduino` | toggle DTR at 2400 baud — **untested on hardware**, and reported | — |
 //! | `cheetah` | RTS/DTR sequence at 2400 baud — **untested on hardware**, and reported; the connection itself also needs RTS deasserted (`McuConfig::open`) | — |
 //! | `rpi_usb` | cut and restore the USB port's power — **untested on hardware**, and reported | `interface/usb.rs` |

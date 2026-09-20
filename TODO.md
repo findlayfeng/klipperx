@@ -132,9 +132,11 @@ build/编码，真设备路径未上硬件验证。
       （CAN / host）恒为 `command` 且不读该项、串口缺省 `arduino`，与上游 `getchoice` +
       `if baud` 对齐（`klippy/mcu.py:666-671`）。“是串口”做成参数以便不依赖真串口测试。
       四种方法的**物理分派**（arduino / cheetah / rpi_usb）见 D2。
-- [ ] **不认 `reset` 命令**：`mcu/config.rs` 缺 `config_reset` 就报「断电」。上游
-      `_restart_via_command` 优先 `reset`，没有才 `force_local_shutdown` + `config_reset`
-      （`klippy/mcu.py:730-746`）。
+- [x] **`reset` fallback**：`mcu/config.rs` 按上游 `_restart_via_command` 的顺序选复位——有
+      `config_reset` 就地清；只有 `reset` 时 `handshake` 返回 `McuError::ResetRequired`，由
+      `McuObject::connect` 发 `reset`、重开连接、用同一份 `BuiltConfig` 重跑握手（`mcu/config.rs`、
+      `mcu/object.rs`）；两者都没有才报「断电」。`FIRMWARE_RESTART` + `command` 方法也在连接后
+      发 `reset`。真板未验（与 arduino / cheetah 一样）。
 - [ ] **reset 期间没有本地 shutdown 标志**：现在靠「`configure` 完成后才 `bind_shutdown`」的
       时序规避；隐式、无测试，recv 一旦改成缓冲/异步就会把自发的 `emergency_stop` 误报成
       `MCU … restarted`。上游有 `_is_shutdown`（`klippy/mcu.py:893-895`）。
@@ -375,13 +377,15 @@ kinematics 已随 Printer 重构删除，从这里重新开始：
 
 | 方法 | 动作 | 依赖 |
 |---|---|---|
-| `command` | 有 `reset` 就用它，否则 `force_local_shutdown` + 15 ms + `config_reset`，再 disconnect | 固件命令（B2 已做 `config_reset`，差 `reset`） |
+| `command` | 有 `reset` 就用它，否则 `force_local_shutdown` + 15 ms + `config_reset`，再 disconnect | 固件命令（B2 已做：`reset` 优先、`config_reset` 兜底） |
 | `arduino`（含未设） | disconnect 后以 2400 打开、`read(1)`、DTR true→false（`serialhdl.py:392`） | tty DTR |
 | `cheetah` | disconnect 后 RTS 拉高、DTR 两轮翻转、RTS 拉低（`serialhdl.py:365`） | tty DTR+RTS |
 | `rpi_usb` | disconnect 后 `hub-ctrl -h 0 -P 2 -p 0` → 2 s → `-p 1`（`chelper/__init__.py:339`） | 外部 `hub-ctrl` + sudo |
 
-外加三处按方法的**连接期门控**：`rpi_usb` 且串口不存在 → 先启动一次去上电（`:693`）；
-`rpi_usb` → 上电复位前不许 configure（`:696`）；`cheetah` → 连接时 RTS 必须拉低（`:703`）。
+外加三处按方法的**连接期门控**：`rpi_usb` 且串口不存在 → 先启动一次去上电（`:696-700`
+`check_restart_on_attach`）；`rpi_usb` → 上电复位前不许 configure（`:692-694`
+`check_restart_on_send_config`）；`cheetah` → 连接时 RTS 必须拉低（`:702-704`，已完成，
+见 `McuConfig::open`）。前两处见下面「`rpi_usb` 的连接期门控」一条。
 方法只在**有 baud（串口）**时从配置读，CAN 恒为 `command`（`:668-671`）；`CANBUS_BRIDGE` 的
 MCU 默认跳过（`:749`）。
 
@@ -403,7 +407,7 @@ DTR”隐式满足，但那是驱动副作用，不算实现。**
 5. **`restart_method` 没被带到分派点**：`Mcu::new` 只取 name+interface，字段被丢
    （`mcu/mod.rs:374-376`）。
 6. **校验与默认**（本轮先做）。
-7. **`reset` 命令**（B2 单列）。
+7. **`reset` 命令**（B2 单列）——已完成：`reset` 优先、`config_reset` 兜底。
 
 **推进顺序**：⑥ `restart_method` 校验/默认 ✓ → ② `McuConfig` 解析/打开拆分 ✓ →
 ① `start_reason`（最小切片）✓ → ③ `serial.rs` DTR/RTS + `arduino` 显式复位 ✓ →
@@ -501,16 +505,23 @@ DTR”隐式满足，但那是驱动副作用，不算实现。**
         现在只告警一次（以前一帧一条）。
       - 它仍接管不了**还在跑**的板子（`command` 的 `config_reset` 得先连上），另开一条：
         [D3](#d3-command-接管一块还在跑的板子)。
-      注：“上电复位前不许 configure”（`:696`）在我们的“先复位、再 open、再 configure”
-      顺序下天然成立。
+      注：在 `firmware_restart` 路径上，「上电复位前不许 configure」（`:696`）由「先复位、
+      再 open、再 configure」的顺序天然满足；普通启动时那块未配置的板子没有这一层，见下一条。
       待真板确认：树莓派 5 的板载 hub 自称 per-port、实为 ganged，只切一个端口切不掉 VBUS，
       需按实际硬件验证。
+- [ ] **`rpi_usb` 的连接期门控（有意后置）**：① 串口不存在 → 先请求一次 firmware_restart
+      去上电（`check_restart_on_attach`，`klippy/mcu.py:696-700`）；② 未配置时发配置前也先做
+      一次 USB 断电（`check_restart_on_send_config`，`:692-694`），保证配置落在一块**本次会话
+      断电重启过**的板子上（`Endstop_Phase.md`：rpi_usb 的意义就是断电复位，连未配置的板子
+      也要先断电）。现在只在 `firmware_restart` 路径上「先复位、再 open、再 configure」，普通
+      启动看到未配置的板子会直接发配置，不看 `restart_method`。
 - [ ] **CRC 不匹配仍走就地复位（有意偏离上游）**：上游发现已配置但 CRC 不一致时先
       `request_exit('firmware_restart')`（`check_restart_on_crc_mismatch`，
-      `klippy/mcu.py:678-685`、`:1057-1059`），让重启循环做物理复位；我们用 `configure` 里的
-      `emergency_stop` + `config_reset` 就地复位（已在 B2 实现并测试，真板不必断电）。若要
-      贴上游，还有 `start_reason == 'firmware_restart'` 却仍已配置时 raise “Failed automated
-      reset” 的前置门（`:1053-1056`）。详见 `docs/klippy/developer-manual/mcu-config.md`。
+      `klippy/mcu.py:678-685`、`:1057-1059`），让重启循环做物理复位；我们在 `configure` /
+      `handshake` 里就地做：有 `config_reset` 直接清，只有 `reset` 时发 `reset` + 重连 + 重试
+      握手（B2 已做，真板未验）。若要贴上游，还有 `start_reason == 'firmware_restart'` 却仍已
+      配置时 raise “Failed automated reset” 的前置门（`:1053-1056`）。详见
+      `docs/klippy/developer-manual/mcu-config.md`。
 - [ ] **重启后的 g-code 输出订阅**：连接不断，`objects/subscribe` 也自动继续（它按名查新对象），
       但 `gcode/subscribe_output` 的处理器挂在被重建的 `GCodeDispatch` 上，重启后静默失效，
       要客户端重新订阅。上游靠 socket 重绑让客户端重连、重订阅；我们要么在客户端收到
@@ -636,10 +647,10 @@ open + identify，同样要接上一块没被复位的固件。
       `lookup_object_as`）（`pins.rs`、`printer.rs`、`mcu/object.rs`）。
 - **MCU 配置构建层（F1）**：oid 发号、`config` / `restart` / `init` 三张命令表、config 回调、
       CRC + `finalize_config`，`configure()` 的 `get_config` 两段式下发（`mcu/config.rs`）。
-- **MCU 停机上报与就地复位（B2 大部）**：`shutdown` / `is_shutdown` / `starting` 事件经
-      `static_string_id` 解成原因，配置握手**之后**绑成打印机停机；`configure` 用
-      `emergency_stop` + `config_reset` 就地复位再配置（`event/shutdown.rs`、`mcu/config.rs`、
-      `mcu/object.rs`）。
+- **MCU 停机上报与复位（B2 大部）**：`shutdown` / `is_shutdown` / `starting` 事件经
+      `static_string_id` 解成原因，配置握手**之后**绑成打印机停机；`configure` / `handshake`
+      先复位再配置——有 `config_reset` 就地清（`emergency_stop` + `config_reset`），只有 `reset`
+      的固件发 `reset` + 重连 + 重试握手（`event/shutdown.rs`、`mcu/config.rs`、`mcu/object.rs`）。
 - **`objects/subscribe`（B1）**：请求立即回全量快照，随后每 0.25 s（`SUBSCRIPTION_REFRESH_TIME`）
       推变化字段；连接关闭即退订，最后一个退订时定时器自停；与 `objects/query` 共用字段选择
       （`api/endpoints/objects_subscribe.rs`、`objects_query.rs`）。

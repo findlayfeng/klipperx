@@ -10,7 +10,7 @@
 //!   }
 //! < {"id": null, "method": "klippy:status", "params": {...}}
 //! klippy> objects/query {"objects": {"toolhead": ["position"]}}
-//! Enter send · ↑↓ history · PgUp/PgDn scroll · Home/End · ^G g-code · .help · ^C quit
+//! Enter send · ↑↓ history · PgUp/PgDn scroll · Home/End (log) · ^G g-code · .help · ^C quit
 //! ```
 //!
 //! The header tracks the printer's state, the log holds everything that
@@ -29,7 +29,6 @@
 //!
 //! - **Mouse wheel**: scroll up/down by 10 lines
 //! - **PgUp/PgDn**: scroll by 10 lines
-//! - **Ctrl+↑/Ctrl+↓**: scroll by 1 line
 //! - **Home**: jump to top (oldest visible entries)
 //! - **End**: jump to bottom (newest entries)
 //! - When scrolled back, new entries do not auto-scroll the view — your place
@@ -633,7 +632,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     } else if app.gcode {
         "g-code mode · Enter send · ^G request mode · .gcode · ^C quit".to_string()
     } else {
-        "Enter send · ↑↓ history · PgUp/PgDn scroll · Home/End · ^G g-code · .help · ^C quit"
+        "Enter send · ↑↓ history · PgUp/PgDn · Home/End log · ^G g-code · .help · ^C quit"
             .to_string()
     };
     frame.render_widget(

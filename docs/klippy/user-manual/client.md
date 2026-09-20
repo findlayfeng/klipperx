@@ -165,15 +165,16 @@ Enter send · ↑↓ history · PgUp/PgDn · ^G g-code · .help · ^C quit
 | `Enter` | 发送这一行 |
 | `↑` / `↓` | 翻之前敲过的命令 |
 | `PgUp` / `PgDn` | 日志往上 / 往下翻（`Ctrl+↑` / `Ctrl+↓` 一次一行） |
-| `←` `→` `Home` `End` `Backspace` `Delete` | 行内编辑 |
+| `←` `→` `Backspace` `Delete` | 行内编辑 |
+| `Home` / `End` | 日志顶端 / 底端 |
 | `Ctrl+A` / `Ctrl+E` | 跳到行首 / 行尾 |
 | `Ctrl+U` | 清掉这一行（不记进历史） |
 | `Ctrl+G` | 在请求模式与 g-code 模式之间切换（同 `.gcode`） |
 | `Ctrl+L` | 清空日志 |
 | `Ctrl+C` / `Ctrl+D` / `Esc` | 退出（欠着的应答会先打完） |
 
-翻看旧日志时，最下面那行会提示 `scrolled back N lines`；按 `PgDn` 回到底部，
-或者直接敲下一条命令也会回到最新处。
+翻看旧日志时，最下面那行会提示 `scrolled back N lines`；按 `End` 或 `PgDn` 回到底部，
+按 `Home` 回到顶端，或者直接敲下一条命令也会回到最新处。
 
 窗口用的是终端的备用屏幕，所以**退出之后你终端原本的 scrollback 里没有这些
 内容**。想要能滚回去、能重定向、能 grep 的输出，就用下一节的行模式。

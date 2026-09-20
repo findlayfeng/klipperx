@@ -307,7 +307,7 @@ DTR”隐式满足，但那是驱动副作用，不算实现。**
 
 **推进顺序**：⑥ `restart_method` 校验/默认 ✓ → ② `McuConfig` 解析/打开拆分 ✓ →
 ① `start_reason`（最小切片）✓ → ③ `serial.rs` DTR/RTS + `arduino` 显式复位 ✓ →
-⑤ `cheetah`（含 attach RTS）✓ → ④ `rpi_usb`（外部依赖，最后或明确不支持）。
+⑤ `cheetah`（含 attach RTS）✓ → ④ `rpi_usb`（sysfs 拓扑 + `nusb` + udev）✓。
 
 - [x] **⑥ `restart_method` 校验/默认**：未知值报配置错，非串口（CAN / host）恒为 `command`、
       且配置了该项时告警，串口缺省为 `arduino`（对齐上游 `getchoice` + `if baud`，
@@ -330,32 +330,26 @@ DTR”隐式满足，但那是驱动副作用，不算实现。**
 - 注（③/⑤ 共有）：pty 不模拟 modem 线（`TIOCMBIS` = `ENOTTY`），所以 DTR/RTS 序列
       **没有端到端测试**，只测了 `ModemLines` 能开 tty + 分派到串口复位；两条路径**实际执行
       时都告警「未在真板上测过」**，手工测试确认后把这两条 warn 删掉。
-- [ ] **④ `rpi_usb`（已分析，待实现）**：上游 `_restart_rpi_usb`（`klippy/mcu.py:748`）是
-      `disconnect` → `run_hub_ctrl(0)` → 2 s → `run_hub_ctrl(1)`，而 `run_hub_ctrl`
+- [x] **④ `rpi_usb`**：上游 `_restart_rpi_usb`（`klippy/mcu.py:748`）是 `disconnect` →
+      `run_hub_ctrl(0)` → 2 s → `run_hub_ctrl(1)`，而 `run_hub_ctrl`
       （`chelper/__init__.py:339`）现场 `gcc` 编译 `lib/hub-ctrl/hub-ctrl.c` 再
-      `sudo hub-ctrl -h 0 -P 2 -p {0,1}`。实质只有**一个 USB 控制传输**：
-      `bmRequestType=0x23`（class / recipient=other）、`bRequest=SET_FEATURE(3)` /
-      `CLEAR_FEATURE(1)`、`wValue=USB_PORT_FEAT_POWER(8)`、`wIndex=端口号`，发给“支持端口
-      供电的 hub”（读 hub 描述符的 `wHubCharacteristics` LPSM 位；`hub-ctrl.c:396-403`
-      `:159-208`）。`-h 0 -P 2` 是**硬编码**树莓派板载 hub 的第 2 口。
-
-      Rust 直接做的流程：
-      1. **拓扑发现**（只读 sysfs，无需权限）：`/sys/class/tty/<tty>/device` 上溯到 USB 设备，
-         取 `busnum`/`devnum`，再找父 hub 与端口号。端口（和 hub）也宜做成**可配置项**，
-         不抄上游的魔法数字。
-      2. **控制传输**：`nusb`（纯 Rust，推荐）或手写 `USBDEVFS_CONTROL` ioctl（已有 `libc`），
-         对那个 hub/port 发 `SET_FEATURE` / `CLEAR_FEATURE(PORT_POWER)`。sysfs **没有**端口
-         供电开关（`uhubctl` 用 libusb 正因如此），`authorized` / unbind 只是软复位，
-         语义不同，不能冒充真断电。
-      3. **权限：用 udev，不用 sudo（推荐）**：`nusb`/ioctl 要打开 `/dev/bus/usb/...` 并 claim
-         hub 接口，默认只有 root——上游因此用 `sudo`。改为一条**限定到该 hub 的 udev 规则**
-         （按 hub 的 VID/PID 放行，或 `TAG+="uaccess"`），运行时无需 root，也不把 sudo 权限
-         留在 `os.system` 里。没有规则时报一条清楚的错（现在就是 not implemented）。
-      4. **两处连接期门控**（上游 `:693` `:696`）：`rpi_usb` 且串口**不存在** → 先启动一次去
-         上电；`rpi_usb` → 上电复位之前不许 configure。
-
-      代价：引入一个 USB 依赖（`nusb` 可接受，`rusb` 带 libusb）、拓扑发现最易错，
-      且只有在真有 RPi 类板子要支持时才值得。
+      `sudo hub-ctrl -h 0 -P 2 -p {0,1}`。实质只有**一个 USB 控制传输**
+      （`bmRequestType=0x23`、`SET/CLEAR_FEATURE`、`wValue=USB_PORT_FEAT_POWER(8)`、
+      `wIndex=端口号`；`hub-ctrl.c:396-403`）。Rust 实现：
+      - **拓扑发现**（`interface/usb.rs::resolve_tty_port`）：从 `/sys/class/tty/<tty>/device`
+        上溯到 USB 设备，取父 hub 的 `busnum`/`devnum` 与端口号（`<hub>.<port>` / 根 hub 的
+        `<bus>-<port>`）。纯 sysfs 读取、无需权限，**有单测**（假 sysfs 树）。不抄上游的
+        `-h 0 -P 2`：端口从拓扑得出（将来可加一个配置项作覆盖）。
+      - **切电**（`usb.rs::set_port_power`）：`nusb`（**纯 Rust**，无 libusb）对 hub 发
+        `SET_FEATURE`/`CLEAR_FEATURE(PORT_POWER)`；`restart.rs` 里 `spawn_blocking` 跑，
+        中间夹 2 s（`USB_POWER_OFF`），再等 tty 回来（`USB_PORT_RETURN_TIMEOUT`，顺带满足
+        上游 `check_restart_on_attach`）。
+      - **权限（用 udev，不用 sudo）**：打开 `/dev/bus/usb/...` 需 root，上游因此 `sudo`；
+        改为**限定到该 hub 的 udev 规则**（VID/PID 放行或 `TAG+="uaccess"`），误差文案会
+        提示。
+      - 同样是**未在真板测过**：执行前有 `warn_untested` 告警；`usb` 控制传输本身无自动化。
+      注：“上电复位前不许 configure”（`:696`）在我们的“先复位、再 open、再 configure”
+      顺序下天然成立。
 - [ ] **CRC 不匹配仍走就地复位（有意偏离上游）**：上游发现已配置但 CRC 不一致时先
       `request_exit('firmware_restart')`（`check_restart_on_crc_mismatch`，
       `klippy/mcu.py:678-685`、`:1057-1059`），让重启循环做物理复位；我们用 `configure` 里的

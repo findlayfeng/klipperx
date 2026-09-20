@@ -6,6 +6,7 @@ pub(crate) mod pty;
 pub mod serial;
 #[cfg(test)]
 pub mod test;
+pub mod usb;
 
 pub use canserial::CanSerialDevice;
 pub use error::InterfaceError;

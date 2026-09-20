@@ -11,19 +11,16 @@
 //! | `command` | nothing | `config_reset` after the connection is up (`mcu/config.rs`) |
 //! | `arduino` | toggle DTR at 2400 baud — **untested on hardware**, and reported | — |
 //! | `cheetah` | RTS/DTR sequence at 2400 baud — **untested on hardware**, and reported; the connection itself also needs RTS deasserted (`McuConfig::open`) | — |
-//! | `rpi_usb` | *(not implemented)* | — |
+//! | `rpi_usb` | cut and restore the USB port's power — **untested on hardware**, and reported | `interface/usb.rs` |
 //!
 //! The reset paths cannot be exercised in a test — a pty does not emulate the
-//! modem lines — so each one reports that it is untested when it runs. That
-//! warning comes out once someone has confirmed the sequence on a board.
-//!
-//! `rpi_usb` is reported and the connection proceeds without a physical reset.
-//! That still recovers a board whose firmware restarted or whose configuration
-//! changed, because `configure` clears it with `config_reset` when it has to —
-//! a physical reset only matters for a board that is wedged before the host can
-//! talk to it.
+//! modem lines, and there is no USB port to cut — so each one reports that it is
+//! untested when it runs. That warning comes out once someone has confirmed the
+//! sequence on a board.
 //!
 //! [`McuObject::connect`]: super::object::McuObject::connect
+
+use std::path::{Path, PathBuf};
 
 use tokio::time::Duration;
 use tracing::{info, warn};
@@ -31,6 +28,7 @@ use tracing::{info, warn};
 use crate::core::klippy::config::mcu::{McuConfig, Transport};
 use crate::core::klippy::interface::error::InterfaceError;
 use crate::core::klippy::interface::serial::ModemLines;
+use crate::core::klippy::interface::usb;
 use crate::core::klippy::mcu::McuRestartMethod;
 
 /// How long to leave the board between the steps of a reset. Upstream pauses
@@ -40,6 +38,13 @@ const RESET_SETTLE: Duration = Duration::from_millis(100);
 /// The line speed Klipper opens at for a reset. A different rate is part of what
 /// the board's USB-serial bridge notices (`serialhdl.py:369` `:394`).
 const RESET_BAUD: u32 = 2400;
+
+/// How long the USB port stays unpowered. Upstream pauses two seconds
+/// (`klippy/mcu.py:752`).
+const USB_POWER_OFF: Duration = Duration::from_secs(2);
+
+/// How long to wait for the tty to reappear after the port is powered back on.
+const USB_PORT_RETURN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Reset the firmware on the transport that is about to be opened.
 ///
@@ -69,14 +74,13 @@ pub async fn reset_firmware(config: &McuConfig) -> Result<(), String> {
             }
             _ => Ok(()),
         },
-        McuRestartMethod::RpiUsb => {
-            warn!(
-                "MCU '{}' restart_method 'rpi_usb' is not implemented; reconnecting without a \
-                 physical reset",
-                config.name
-            );
-            Ok(())
-        }
+        McuRestartMethod::RpiUsb => match &config.transport {
+            Transport::Serial { path, .. } => {
+                warn_untested(config);
+                rpi_usb_reset(path).await
+            }
+            _ => Ok(()),
+        },
     }
 }
 
@@ -152,6 +156,51 @@ async fn cheetah_reset(path: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Cut and restore the USB port's power — Klipper's `rpi_usb` restart
+/// (`klippy/mcu.py:748`).
+///
+/// Upstream shells out to a compiled `hub-ctrl` with `sudo`; here the port is
+/// read from sysfs and switched with a control transfer (`interface/usb.rs`).
+/// The port must be closed, and the caller opens it afterwards.
+async fn rpi_usb_reset(serial_path: &str) -> Result<(), String> {
+    let tty = PathBuf::from(serial_path);
+    let port = usb::resolve_tty_port(&tty)?;
+
+    usb_power(port, false).await?;
+    tokio::time::sleep(USB_POWER_OFF).await;
+    usb_power(port, true).await?;
+
+    // The kernel needs a moment to enumerate the board again, and the caller is
+    // about to open the port.
+    wait_for_tty(&tty, USB_PORT_RETURN_TIMEOUT).await
+}
+
+/// Switch one hub port, off the runtime: `nusb`'s blocking path does the syscalls.
+async fn usb_power(port: usb::UsbPort, on: bool) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || usb::set_port_power(port, on))
+        .await
+        .map_err(|e| format!("usb: {e}"))?
+}
+
+/// Wait for a tty to (re)appear after its port was powered back on.
+///
+/// This is what upstream's `check_restart_on_attach` achieves by restarting once
+/// more while the port is missing (`klippy/mcu.py:693`); waiting here keeps it in
+/// one place.
+async fn wait_for_tty(tty: &Path, timeout: Duration) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    while !tty.exists() {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "usb: {} did not come back within {timeout:?}",
+                tty.display()
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Ok(())
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -192,20 +241,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_rpi_usb_is_not_implemented_but_does_not_fail() {
-        // No physical reset, but the connection has to be allowed to go on:
-        // `config_reset` still clears a wedged or re-configured firmware once
-        // the link is up.
-        reset_firmware(&no_transport(McuRestartMethod::RpiUsb))
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
     async fn test_a_serial_reset_method_needs_a_serial_transport() {
-        // Without a serial port there is nothing to toggle, so the dispatch is a
-        // no-op rather than an error.
-        for method in [McuRestartMethod::Arduino, McuRestartMethod::Cheetah] {
+        // Without a serial port there is nothing to toggle or power-cycle, so
+        // the dispatch is a no-op rather than an error.
+        for method in [
+            McuRestartMethod::Arduino,
+            McuRestartMethod::Cheetah,
+            McuRestartMethod::RpiUsb,
+        ] {
             reset_firmware(&no_transport(method)).await.unwrap();
         }
     }
@@ -219,6 +262,16 @@ mod tests {
             .unwrap_err();
         assert!(err.starts_with("serial: "), "{err}");
         assert!(err.contains("/dev/not-a-serial-port"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_rpi_usb_needs_a_usb_tty() {
+        // The port has to be a USB one for its power to be switched; the error
+        // from the sysfs lookup is what comes back.
+        let err = reset_firmware(&serial(McuRestartMethod::RpiUsb))
+            .await
+            .unwrap_err();
+        assert!(err.starts_with("usb: "), "{err}");
     }
 
     #[tokio::test]

@@ -371,9 +371,9 @@ impl Mcu {
     ///
     /// The two background tasks outlive this call and are stopped by [`Drop`].
     ///
-    /// `config.restart_method` is not read here: restarting the firmware is a
-    /// planned feature, and the field is only carried until then (see
-    /// [`McuRestartMethod`]).
+    /// `config.restart_method` is not read here: the transport is built the same
+    /// way whatever the method is, and the physical restart (DTR toggles, USB
+    /// power) is not implemented yet (see [`McuRestartMethod`]).
     pub fn new(config: McuConfig) -> Self {
         Self::from_parts(config.name, config.interface)
     }

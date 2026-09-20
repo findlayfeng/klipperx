@@ -29,7 +29,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 /// Klipper's default line speed, used by a config that does not say otherwise.
 pub const DEFAULT_BAUD: u32 = 250_000;
@@ -111,6 +111,15 @@ impl Device for SerialDevice {
         }
 
         let bytes = frame.raw_bytes();
+        trace!(
+            "tx frame to {}: {}",
+            self.path.display(),
+            bytes
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
         (&self.port).write_all(&bytes).map_err(|e| {
             InterfaceError::SendError(format!(
                 "serial write to {} failed: {e}",
@@ -136,6 +145,15 @@ impl Device for SerialDevice {
             match (&self.port).read(&mut buf) {
                 Ok(0) => continue, // timeout: no bytes were waiting
                 Ok(read) => {
+                    trace!(
+                        "rx from {}: {}",
+                        self.path.display(),
+                        buf[..read]
+                            .iter()
+                            .map(|b| format!("{b:02x}"))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    );
                     debug!("received {} bytes from {}", read, self.path.display());
                     self.stream.lock().unwrap().push(&buf[..read]);
                 }

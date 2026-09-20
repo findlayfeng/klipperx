@@ -38,12 +38,16 @@
 //!   `config_reset` clears the CRC, the oids and the shutdown latch
 //!   (`src/basecmd.c:262`), and an emergency stop comes first when the firmware
 //!   is still running, because `config_reset` only accepts to run while stopped.
-//!   A firmware without `config_reset` (the command is declared per board) is
-//!   refused instead, with a message pointing at a power cycle or the restart
-//!   loop (TODO D2). Upstream resets the same way, one process later, through
-//!   its restart helper — which is why `mcu/object.rs` binds its shutdown events
-//!   only *after* this handshake: a reset this host performs is not a
-//!   spontaneous stop.
+//!   The stop and the clear are kept in **separate message blocks** and the host
+//!   waits for the firmware's own `shutdown` report in between: the shutdown is a
+//!   `longjmp` out of the block being dispatched (`src/sched.c`), so a
+//!   `config_reset` batched behind the stop would never run (see
+//!   [`stop_firmware`]). A firmware without `config_reset` (the command is
+//!   declared per board) is refused instead, with a message pointing at a power
+//!   cycle or the restart loop (TODO D2). Upstream resets the same way, one
+//!   process later, through its restart helper — which is why `mcu/object.rs`
+//!   binds its shutdown events only *after* this handshake: a reset this host
+//!   performs is not a spontaneous stop.
 //!
 //! # The CRC
 //!
@@ -66,10 +70,6 @@
 //! * **`get_query_slot`.** It places a periodic query on an absolute print-time
 //!   clock (`klippy/mcu.py:1136`), which needs the clock/motion layer. The
 //!   consumers that need it (ADC, endstop) bring it with them.
-//! * **Sending `config_reset`.** The command is defined
-//!   ([`ConfigReset`](crate::core::klippy::cmd::config::ConfigReset)) but the
-//!   shutdown-recovery path that sends it is part of MCU shutdown handling
-//!   (TODO B2).
 
 use std::sync::{Mutex, MutexGuard};
 
@@ -77,6 +77,7 @@ use crate::core::klippy::cmd::allocate_oids::AllocateOids;
 use crate::core::klippy::cmd::config::{ConfigReset, ConfigState, FinalizeConfig, GetConfig};
 use crate::core::klippy::cmd::shutdown::EmergencyStop;
 use crate::core::klippy::cmd::McuCommand;
+use crate::core::klippy::event::{McuEvent, Shutdown};
 use crate::core::klippy::mcu::{Mcu, McuError};
 use crate::core::klippy::msg::proto::{ArgValue, Payload};
 use tokio::time::Duration;
@@ -87,6 +88,14 @@ use tracing::{info, warn};
 /// The same order as the other synchronous calls (the firmware answers from the
 /// main loop, so this only has to cover a busy or half-dead link).
 const CONFIG_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long to give a firmware that cannot report `shutdown` to settle after an
+/// emergency stop, before `config_reset` is sent.
+///
+/// Only a fallback: the firmware's own `shutdown` message is the real barrier
+/// (see [`stop_firmware`]). Upstream uses the same fixed 15 ms
+/// (`klippy/mcu.py:739`) for every firmware.
+const RESET_SETTLE_TIME: Duration = Duration::from_millis(15);
 
 /// The largest oid count that fits `allocate_oids count=%c`.
 ///
@@ -568,10 +577,7 @@ async fn get_config(mcu: &Mcu) -> Result<ConfigState, McuError> {
 /// Returns [`McuError::Config`] when the firmware has no `config_reset` (the
 /// command is declared per board, not in `basecmd.c`).
 async fn reset_firmware(mcu: &Mcu, state: &ConfigState, crc: u32) -> Result<(), McuError> {
-    let has_reset = mcu
-        .dictionary()
-        .is_some_and(|dictionary| dictionary.message(ConfigReset::NAME).is_some());
-    if !has_reset {
+    if !mcu.has_message(ConfigReset::NAME) {
         let reason = if state.is_shutdown {
             "is shutdown".to_string()
         } else {
@@ -598,10 +604,44 @@ async fn reset_firmware(mcu: &Mcu, state: &ConfigState, crc: u32) -> Result<(), 
             mcu.name(),
             state.crc
         );
-        // `config_reset` only runs while the firmware is stopped.
-        mcu.send_msg(&EmergencyStop)?;
+        stop_firmware(mcu).await?;
     }
     mcu.send_msg(&ConfigReset)?;
+    Ok(())
+}
+
+/// Stop a running firmware and wait until it has confirmed the stop.
+///
+/// `config_reset` only runs while the firmware is stopped. The stop and the
+/// clear must not travel in the same message block: the firmware's `shutdown`
+/// is a `longjmp` out of the block it is dispatching (`src/sched.c`), so a
+/// `config_reset` batched behind `emergency_stop` would never run. Waiting for
+/// the firmware's own `shutdown` report both separates the two frames and proves
+/// the stop was consumed.
+///
+/// [`Mcu::call`] registers its pending response before sending, so the report
+/// cannot arrive ahead of the registration. A firmware whose dictionary has no
+/// `shutdown` message cannot confirm anything, so it falls back to giving the
+/// stop time to settle.
+async fn stop_firmware(mcu: &Mcu) -> Result<(), McuError> {
+    if mcu.has_message(Shutdown::NAME) {
+        mcu.call(
+            EmergencyStop::NAME,
+            &EmergencyStop.args(),
+            Shutdown::NAME,
+            CONFIG_TIMEOUT,
+        )
+        .await?;
+        return Ok(());
+    }
+    warn!(
+        "MCU '{}' has no `shutdown` message; waiting {} ms for the emergency stop \
+         to settle instead of waiting for a report",
+        mcu.name(),
+        RESET_SETTLE_TIME.as_millis()
+    );
+    mcu.send_msg(&EmergencyStop)?;
+    tokio::time::sleep(RESET_SETTLE_TIME).await;
     Ok(())
 }
 
@@ -673,7 +713,11 @@ mod tests {
                 "emergency_stop": 31
             },
             "responses": {
-                "config is_config=%c crc=%u is_shutdown=%c move_count=%hu": 9
+                "config is_config=%c crc=%u is_shutdown=%c move_count=%hu": 9,
+                "shutdown clock=%u static_string_id=%hu": 20
+            },
+            "enumerations": {
+                "static_string_id": {"Command request": 0}
             },
             "config": {"CLOCK_FREQ": 20000000}
         }))
@@ -1020,6 +1064,16 @@ mod tests {
         payload.into_raw()
     }
 
+    /// `shutdown clock=%u static_string_id=%hu` (id 20), as the firmware sends it
+    /// when it enters shutdown.
+    fn shutdown_event(clock: u32, reason: u16) -> Vec<u8> {
+        let mut payload = Payload::new();
+        payload.push_i16(20).unwrap();
+        payload.push_u32(clock).unwrap();
+        payload.push_u16(reason).unwrap();
+        payload.into_raw()
+    }
+
     /// The CRC an empty configuration builds to: `allocate_oids count=0` and
     /// nothing else is hashed.
     fn empty_config_crc() -> u32 {
@@ -1098,6 +1152,32 @@ mod tests {
         mcu
     }
 
+    /// The dictionary without a `shutdown` response: a firmware that stops on
+    /// `emergency_stop` but never reports the stop.
+    fn dictionary_without_shutdown() -> Dictionary {
+        Dictionary::from_json(json!({
+            "commands": {
+                "allocate_oids count=%c": 2,
+                "get_config": 7,
+                "finalize_config crc=%u": 6,
+                "config_reset": 30,
+                "emergency_stop": 31
+            },
+            "responses": {
+                "config is_config=%c crc=%u is_shutdown=%c move_count=%hu": 9
+            },
+            "config": {"CLOCK_FREQ": 20000000}
+        }))
+        .unwrap()
+    }
+
+    fn scripted_mcu_without_shutdown(mappings: Vec<MappingEntry>) -> Mcu {
+        let mcu = Mcu::for_test("test_mcu", Interface::new(TestDevice::new(mappings)));
+        mcu.install_dictionary(dictionary_without_shutdown())
+            .unwrap();
+        mcu
+    }
+
     #[tokio::test]
     async fn test_configure_refuses_a_shutdown_mcu_that_cannot_reset() {
         let mcu = scripted_mcu_without_reset(vec![MappingEntry {
@@ -1134,23 +1214,28 @@ mod tests {
 
     #[tokio::test]
     async fn test_configure_resets_a_running_mcu_with_a_different_crc() {
-        // A running firmware with another configuration: it has to be stopped
-        // before `config_reset`, so the frame carries the emergency stop too.
+        // A running firmware with another configuration has to be stopped
+        // before `config_reset`. The emergency stop goes out on its own, the
+        // host waits for the firmware's `shutdown` report, and only then sends
+        // the clear. The two must not share a block: the firmware's shutdown is
+        // a longjmp out of the block being dispatched, so a `config_reset`
+        // batched behind the stop would never run.
         let crc = empty_config_crc();
         let proto = identified_mcu();
 
-        let mut reset_frame = proto
+        let stop_frame = proto
             .encode(EmergencyStop::NAME, &EmergencyStop.args())
             .unwrap()
             .into_raw();
-        reset_frame.extend_from_slice(
-            &proto
-                .encode(ConfigReset::NAME, &ConfigReset.args())
-                .unwrap()
-                .into_raw(),
-        );
+
+        // Frame 2: the clear and the follow-up query, merged by the send task.
+        let mut reset_frame = proto
+            .encode(ConfigReset::NAME, &ConfigReset.args())
+            .unwrap()
+            .into_raw();
         reset_frame.extend_from_slice(&get_config_payload());
 
+        // Frame 3: the configuration and the confirmation query.
         let shadow = ConfigBuilder::new();
         let expected = shadow.build(&proto).unwrap();
         let mut configured_frame = Vec::new();
@@ -1168,12 +1253,77 @@ mod tests {
                 )],
             },
             MappingEntry {
-                input: Frame::new(1, reset_frame),
-                outputs: vec![Frame::new(1, config_response(false, 0, false, 100))],
+                // The stop on its own, answered by the firmware's own report.
+                input: Frame::new(1, stop_frame),
+                outputs: vec![Frame::new(1, shutdown_event(100, 0))],
             },
             MappingEntry {
-                input: Frame::new(2, configured_frame),
-                outputs: vec![Frame::new(2, config_response(true, crc, false, 100))],
+                input: Frame::new(2, reset_frame),
+                outputs: vec![Frame::new(2, config_response(false, 0, false, 100))],
+            },
+            MappingEntry {
+                input: Frame::new(3, configured_frame),
+                outputs: vec![Frame::new(3, config_response(true, crc, false, 100))],
+            },
+        ]);
+        let builder = ConfigBuilder::new();
+
+        let configured = builder.configure(&mcu).await.unwrap();
+
+        assert!(!configured.reused);
+        assert_eq!(configured.crc, crc);
+    }
+
+    #[tokio::test]
+    async fn test_configure_resets_when_the_firmware_cannot_report_shutdown() {
+        // No `shutdown` message in the dictionary: the host cannot wait for the
+        // stop to be confirmed, so it falls back to a fixed settle delay and
+        // still sends the clear as its own frame.
+        let crc = empty_config_crc();
+        let proto = identified_mcu();
+
+        let stop_frame = proto
+            .encode(EmergencyStop::NAME, &EmergencyStop.args())
+            .unwrap()
+            .into_raw();
+
+        let mut reset_frame = proto
+            .encode(ConfigReset::NAME, &ConfigReset.args())
+            .unwrap()
+            .into_raw();
+        reset_frame.extend_from_slice(&get_config_payload());
+
+        let shadow = ConfigBuilder::new();
+        let expected = shadow.build(&proto).unwrap();
+        let mut configured_frame = Vec::new();
+        for payload in &expected.config {
+            configured_frame.extend_from_slice(payload.payload());
+        }
+        configured_frame.extend_from_slice(&get_config_payload());
+
+        let mcu = scripted_mcu_without_shutdown(vec![
+            MappingEntry {
+                input: Frame::new(0, get_config_payload()),
+                outputs: vec![Frame::new(
+                    0,
+                    config_response(true, 0xdead_beef, false, 500),
+                )],
+            },
+            MappingEntry {
+                // The stop gets no report the host can decode (this dictionary
+                // has no `shutdown`), so it waits out the settle delay. The
+                // firmware still answers the block; the host reads that as a
+                // bare ack and its sequence stays in step.
+                input: Frame::new(1, stop_frame),
+                outputs: vec![Frame::new(1, Vec::new())],
+            },
+            MappingEntry {
+                input: Frame::new(2, reset_frame),
+                outputs: vec![Frame::new(2, config_response(false, 0, false, 100))],
+            },
+            MappingEntry {
+                input: Frame::new(3, configured_frame),
+                outputs: vec![Frame::new(3, config_response(true, crc, false, 100))],
             },
         ]);
         let builder = ConfigBuilder::new();

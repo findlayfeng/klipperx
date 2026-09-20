@@ -149,7 +149,14 @@ impl McuObject {
     fn bind_shutdown(&self, mcu: &Mcu) -> Result<(), McuError> {
         let name = self.chip.name().to_string();
 
-        if has_message(mcu, Shutdown::NAME) {
+        if !mcu.has_message(Shutdown::NAME) {
+            warn!(
+                "MCU '{name}' does not report `shutdown`; a firmware stop will not be \
+                 noticed, and a configuration reset falls back to a delay"
+            );
+        }
+
+        if mcu.has_message(Shutdown::NAME) {
             let printer = self.printer.clone();
             let name = name.clone();
             mcu.bind_event::<Shutdown, _>(move |event| {
@@ -162,7 +169,7 @@ impl McuObject {
                 report_shutdown(&printer, &msg);
             })?;
         }
-        if has_message(mcu, IsShutdown::NAME) {
+        if mcu.has_message(IsShutdown::NAME) {
             let printer = self.printer.clone();
             let name = name.clone();
             mcu.bind_event::<IsShutdown, _>(move |event| {
@@ -172,7 +179,7 @@ impl McuObject {
                 );
             })?;
         }
-        if has_message(mcu, Starting::NAME) {
+        if mcu.has_message(Starting::NAME) {
             let printer = self.printer.clone();
             mcu.bind_event::<Starting, _>(move |_| {
                 report_shutdown(&printer, &format!("MCU '{name}' restarted"));
@@ -224,15 +231,6 @@ impl PrinterObject for McuObject {
             Ok(())
         })
     }
-}
-
-/// Whether the firmware's dictionary declares `name`.
-///
-/// Older or trimmed firmware may not send every message; binding a missing one
-/// would fail the whole connect for no reason.
-fn has_message(mcu: &Mcu, name: &str) -> bool {
-    mcu.dictionary()
-        .is_some_and(|dictionary| dictionary.message(name).is_some())
 }
 
 /// Log a firmware stop and put the machine into its shutdown state.
@@ -347,7 +345,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_reserve_pins_marks_what_the_firmware_owns() {
-        let object = object(None);
+        // The printer is held for the test: `McuChip` reaches the pin registry
+        // weakly, and the registry is the printer's.
+        let printer = printer();
+        let object = McuObject::new(section(None), &printer).unwrap();
         let mcu = Mcu::for_test("mcu", Interface::new(TestDevice::new(vec![])));
         mcu.install_dictionary(
             Dictionary::from_json(json!({

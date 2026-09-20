@@ -43,6 +43,7 @@ use crate::core::klippy::msg::error::MsgError;
 use crate::core::klippy::msg::parser::Parser;
 use crate::core::klippy::msg::proto::{ArgValue, Payload};
 use crate::core::klippy::msg::Msg;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{sleep, Duration};
@@ -97,6 +98,11 @@ pub struct Mcu {
     pending_calls: PendingCalls,
     /// Interface clone kept so the device can be shut down on drop.
     interface: Interface,
+    /// Set by the receive task when the firmware answers with a sequence that
+    /// cannot belong to this connection — one from an older session, which only a
+    /// firmware that never rebooted can send. [`Mcu::answered_from_old_session`]
+    /// reads it back.
+    old_session: Arc<AtomicBool>,
     /// Handle to the receive task, used to abort it on drop.
     recv_handle: Option<tokio::task::JoinHandle<()>>,
 }
@@ -274,8 +280,14 @@ impl Mcu {
         });
 
         let interface_for_recv = interface.clone();
+        let old_session = Arc::new(AtomicBool::new(false));
+        let old_session_for_task = Arc::clone(&old_session);
         let recv_handle = tokio::spawn(async move {
             let mut seq = 0u8;
+            // A firmware that answers from an older session repeats the same
+            // frame for as long as the handshake waits, so the mismatch is worth
+            // saying once and not once per frame.
+            let mut reported = false;
 
             loop {
                 let frame = match interface_for_recv.receive().await {
@@ -294,13 +306,30 @@ impl Mcu {
                 // (`seq + 1`). Klipper's client tracks the same thing with a send
                 // window; this transport sends one block at a time and never
                 // retransmits, so the window collapses to those two values.
+                //
+                // Nothing has been accepted yet (`seq == 0`) and the frame still
+                // does not fit: the firmware is in a session this connection did
+                // not open, i.e. it kept running since it last spoke to a host.
                 if frame.seq() != seq && frame.seq() != (seq + 1) & 0xf {
-                    warn!(
-                        "Seq mismatch: expected {} or {}, got {}",
-                        seq,
-                        (seq + 1) & 0xf,
-                        frame.seq()
-                    );
+                    if seq == 0 {
+                        old_session_for_task.store(true, Ordering::Relaxed);
+                    }
+                    if reported {
+                        debug!(
+                            "Seq mismatch: expected {} or {}, got {}",
+                            seq,
+                            (seq + 1) & 0xf,
+                            frame.seq()
+                        );
+                    } else {
+                        reported = true;
+                        warn!(
+                            "Seq mismatch: expected {} or {}, got {}",
+                            seq,
+                            (seq + 1) & 0xf,
+                            frame.seq()
+                        );
+                    }
                     continue;
                 }
                 seq = frame.seq();
@@ -355,6 +384,7 @@ impl Mcu {
             send_buf_tx,
             pending_calls,
             interface,
+            old_session,
             recv_handle: Some(recv_handle),
         }
     }
@@ -376,6 +406,18 @@ impl Mcu {
     /// board on its **closed** port in between (`mcu/restart.rs`).
     pub fn new(name: impl Into<String>, interface: Interface) -> Self {
         Self::from_parts(name.into(), interface)
+    }
+
+    /// Whether the firmware has answered from a session **older** than this
+    /// connection.
+    ///
+    /// A firmware that just rebooted starts its sequence over, so a frame that
+    /// fits neither the block being answered nor the one after it can only come
+    /// from a session that was already running. That is how an `rpi_usb` reset
+    /// learns that its port switch disconnected the board without resetting it:
+    /// [`Mcu::connect`] reports it as [`McuError::OldSession`].
+    pub fn answered_from_old_session(&self) -> bool {
+        self.old_session.load(Ordering::Relaxed)
     }
 
     /// Install the firmware's data dictionary.
@@ -851,6 +893,10 @@ mod tests {
             matches!(err, McuCallError::Timeout(_)),
             "expected a timeout, got {err:?}"
         );
+        // The frame fitted no session this connection could have opened, which
+        // is what a caller uses to tell a rebooted board from one that kept
+        // running.
+        assert!(mcu.answered_from_old_session());
     }
 
     // -----------------------------------------------------------------------

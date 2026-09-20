@@ -24,7 +24,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use tokio::time::Duration;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::core::klippy::config::mcu::{McuConfig, Transport};
 use crate::core::klippy::interface::devices::serial::ModemLines;
@@ -94,34 +94,62 @@ pub async fn reset_firmware(config: &McuConfig) -> Result<(), String> {
 /// Runs on every connect rather than only when a restart is requested, so a
 /// missing udev rule is reported at startup — with the rules to install —
 /// instead of at the first `FIRMWARE_RESTART`.
-pub fn check_usb_power(config: &McuConfig) {
+///
+/// # Returns
+/// The reason this port's power **cannot be switched at all**, when the hub says
+/// so itself ([`usb::PortPower::Unsupported`]): switching it would only disconnect
+/// the board, which no mechanism can turn into a firmware reset, so the caller
+/// drops `rpi_usb` for `command` instead of trying (`mcu/object.rs`). `None` when
+/// the mechanism is usable, the method is not `rpi_usb`, or nothing could be found
+/// out about the hub.
+pub fn check_usb_power(config: &McuConfig) -> Option<String> {
     if config.restart_method != McuRestartMethod::RpiUsb {
-        return;
+        return None;
     }
     let Transport::Serial { path, .. } = &config.transport else {
-        return;
+        return None;
     };
 
     let error = match usb::resolve_tty_port(Path::new(path)) {
         Err(err) => err,
-        Ok(port) => match usb::probe(&port, config.usb_power) {
-            Ok(power) => {
-                tracing::debug!(
-                    "MCU '{}' will switch USB port power via {power:?}",
-                    config.name
-                );
-                return;
+        Ok(port) => {
+            // Ask the hub before anything else: a hub without power switching
+            // makes both mechanisms pointless, so neither the rule below nor the
+            // switch is worth reporting or attempting.
+            match usb::port_power(&port) {
+                Some(usb::PortPower::Unsupported) => {
+                    return Some(format!(
+                        "hub {}:{} reports no port power switching (wHubCharacteristics)",
+                        port.bus, port.device
+                    ));
+                }
+                Some(usb::PortPower::Ganged) => warn!(
+                    "MCU '{}': hub {}:{} switches the power of all its ports together \
+                     (ganged), so anything else on that hub goes down with this port",
+                    config.name, port.bus, port.device
+                ),
+                _ => (),
             }
-            Err(err) => format!(
-                "{err}\n  install a udev rule, for example:\n    {}",
-                usb::recommended_rules(&port).replace('\n', "\n    ")
-            ),
-        },
+            match usb::probe(&port, config.usb_power) {
+                Ok(power) => {
+                    debug!(
+                        "MCU '{}' will switch USB port power via {power:?}",
+                        config.name
+                    );
+                    return None;
+                }
+                Err(err) => format!(
+                    "{err}\n  install a udev rule, for example:\n    {}",
+                    usb::recommended_rules(&port).replace('\n', "\n    ")
+                ),
+            }
+        }
     };
     warn!(
         "MCU '{}' may not be able to switch the USB port power (restart_method 'rpi_usb'): {error}",
         config.name
     );
+    None
 }
 
 /// Report that a reset path has never run against hardware.
@@ -409,6 +437,23 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.starts_with("usb: "), "{err}");
+    }
+
+    #[test]
+    fn test_the_startup_check_only_answers_for_rpi_usb_on_a_serial_port() {
+        // Everything else has no port switch to judge, so nothing is reported and
+        // nothing is taken away from the caller.
+        assert_eq!(
+            check_usb_power(&no_transport(McuRestartMethod::Command)),
+            None
+        );
+        assert_eq!(
+            check_usb_power(&no_transport(McuRestartMethod::RpiUsb)),
+            None
+        );
+        // A path that is not a USB tty cannot say anything about a hub either:
+        // the lookup reports itself and the caller keeps `rpi_usb`.
+        assert_eq!(check_usb_power(&serial(McuRestartMethod::RpiUsb)), None);
     }
 
     #[tokio::test]

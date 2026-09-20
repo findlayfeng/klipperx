@@ -166,14 +166,29 @@ impl Printer {
 }
 
 /// Build and register one section, recording it as claimed.
+///
+/// The section handed to the factory has the printer's in-memory overrides
+/// applied on top of the parsed config ([`Printer::override_config`]), so a part
+/// that found an option unworkable is read back with the replacement.
 fn register(
     load: LoadConfig,
     section: &ConfigSection,
     printer: &Arc<Printer>,
     claimed: &mut Vec<String>,
 ) -> Result<(), KlippyError> {
-    let object = load(section, printer).map_err(KlippyError::Internal)?;
     let identifier = section.identifier();
+    let overrides = printer.overrides_for(&identifier);
+    let section = if overrides.is_empty() {
+        section.clone()
+    } else {
+        let mut section = section.clone();
+        for (option, value) in overrides {
+            section.parameters.insert(option, value);
+        }
+        section
+    };
+
+    let object = load(&section, printer).map_err(KlippyError::Internal)?;
     printer.add_object(&identifier, object)?;
     claimed.push(identifier);
     Ok(())
@@ -186,6 +201,7 @@ fn register(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::klippy::config::value::ConfigValue;
     use crate::core::klippy::reactor::ManualReactor;
 
     /// Parse a config from its text, as the host does from a file.
@@ -222,6 +238,27 @@ mod tests {
         printer.load_config(&config).unwrap();
 
         assert_eq!(printer.objects(), ["gcode", "pins", "mcu"]);
+    }
+
+    #[test]
+    fn test_an_override_reaches_the_factory_that_reads_the_section() {
+        // The loader hands the factory the parsed section **plus** what the
+        // printer recorded: a part that found an option unworkable at run time is
+        // read back with the replacement. The pin here resolves against the MCU's
+        // chip, and the override names a chip that does not exist — so the
+        // override is the only reason this section stops loading.
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        let config = config("[mcu]\nserial: /dev/not-opened-yet\n[output_pin fan]\npin: PA0\n");
+        printer.load_config(&config).unwrap();
+        printer.reset_for_restart("restart");
+
+        printer.override_config(
+            "output_pin fan",
+            "pin",
+            ConfigValue::Single("nope:PA0".to_string()),
+        );
+        let err = printer.load_config(&config).unwrap_err();
+        assert!(err.to_string().contains("nope"), "{err}");
     }
 
     #[test]

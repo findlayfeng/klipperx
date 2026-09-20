@@ -234,7 +234,7 @@ gcode> SET_PIN PIN=fan VALUE=1
 
 | 前缀 | 含义 |
 |------|------|
-| `> id: 2` | 客户端**发出去**的请求（灰色），正文是 YAML |
+| `> id: 2` | 客户端**发出去**的请求，正文是 YAML；消息行用青 / 白两色交替，便于逐条分辨（见[日志与调试](logging.md)） |
 | `< id: 2` | 编号为 2 的请求的应答；应答里带 `id`，按它与上面那条对应（`method` 不再重复显示） |
 | `! 3 (objects/query) Missing Argument [objects]` | 请求失败（这里是缺参数），后面是主机的错误说明（红色） |
 | `< method: klippy:status` | 主机主动推来的消息（没有 `id`）—— 订阅之后就会看到 |

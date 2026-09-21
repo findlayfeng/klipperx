@@ -1058,6 +1058,8 @@ impl Mcu {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::klippy::cmd::clock::{ClockSync, McuClock};
+    use crate::core::klippy::interface::devices::serial::DEFAULT_BAUD;
     use crate::core::klippy::interface::devices::test::{MappingEntry, TestDevice};
     use crate::core::klippy::interface::Interface;
 
@@ -1307,6 +1309,109 @@ mod tests {
         mcu.flush(Duration::from_millis(500)).await.unwrap();
 
         assert!(recorder.frames().is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Real board (ignored by default)
+    // -----------------------------------------------------------------------
+
+    /// Frame-sequence synchronisation against a real MCU.
+    ///
+    /// The fake-device tests above pin each rule of the transport; this one asks
+    /// the firmware to behave the way they assume. Run it explicitly, with the
+    /// board's tty in the environment:
+    ///
+    /// ```text
+    /// KLIPPERX_HW_SERIAL=/dev/ttyACM1 \
+    ///   cargo test -p klipperx --lib test_frame_sequence_sync_against_a_real_board \
+    ///   -- --ignored --nocapture
+    /// ```
+    ///
+    /// It is ignored because it needs a board, and it deliberately leaves that
+    /// board running: a firmware is only reset by a power cycle, never by a
+    /// port reopen, so the second connection below is exactly the "board that
+    /// never rebooted" the takeover path exists for.
+    ///
+    /// A plain `cargo test` never runs it. Asking for it explicitly with
+    /// `--ignored` and no `KLIPPERX_HW_SERIAL` fails rather than passing quietly
+    /// — a green run that tested nothing is worse than a red one.
+    #[tokio::test]
+    #[ignore = "needs a real MCU: set KLIPPERX_HW_SERIAL to its tty path"]
+    async fn test_frame_sequence_sync_against_a_real_board() {
+        let serial = std::env::var("KLIPPERX_HW_SERIAL").expect(
+            "this test needs a real MCU: set KLIPPERX_HW_SERIAL to the board's tty path \
+             (a plain `cargo test` does not run it at all)",
+        );
+        let open =
+            || Interface::serial(&serial, DEFAULT_BAUD).expect("the board's serial port must open");
+        let seq = |mcu: &Mcu| mcu.wire.next.load(Ordering::Relaxed) & 0xf;
+
+        // 1. Whichever session the board is in — just booted, or still running
+        //    from a previous host — identify has to complete. A connection that
+        //    could only ever start at sequence 0 would time out here.
+        let mcu = Mcu::connect("mcu", open())
+            .await
+            .expect("identify must complete (fresh firmware, or a session to take over)");
+        println!(
+            "connect #1: took_over={} at sequence {}",
+            mcu.took_over_session(),
+            seq(&mcu),
+        );
+
+        // 2. Round trips across the 4-bit wraparound. Identify alone already
+        //    sent roughly ninety blocks (the dictionary is that long), so a
+        //    counter that never wrapped would have stalled long before this.
+        let clock = McuClock::new(Arc::clone(&mcu));
+        for round in 0..40 {
+            clock
+                .get_clock()
+                .await
+                .unwrap_or_else(|e| panic!("get_clock round {round} failed: {e}"));
+        }
+
+        // 3. Leave the firmware unambiguously past the "just booted" range. The
+        //    takeover check deliberately accepts 0 or 1 (a freshly booted board
+        //    answers the first block with one of them), so a connection can only
+        //    be *guaranteed* to report a takeover once the counter is past that.
+        while seq(&mcu) < 2 {
+            clock
+                .get_clock()
+                .await
+                .expect("get_clock while nudging the counter past the fresh range");
+        }
+        let running_at = seq(&mcu);
+        drop(clock);
+        drop(mcu);
+        // Let the receive task finish and the port close before reopening it.
+        sleep(Duration::from_millis(300)).await;
+
+        // 4. The board was never reset, so its counter carried on from where
+        //    the first connection left it. The new connection numbers its first
+        //    block 0, which the firmware cannot place: it naks with its own
+        //    number, and the transport has to adopt it and put the request back
+        //    on the wire under that number.
+        let mcu = Mcu::connect("mcu", open())
+            .await
+            .expect("the second identify must complete by taking the session over");
+        assert!(
+            mcu.took_over_session(),
+            "the board was still running at sequence {running_at}; \
+             the new connection had to take it over"
+        );
+        println!(
+            "connect #2: took_over={} adopted sequence {}",
+            mcu.took_over_session(),
+            seq(&mcu),
+        );
+
+        // 5. And the taken-over session is genuinely usable, not just identified.
+        let clock = McuClock::new(Arc::clone(&mcu));
+        for round in 0..40 {
+            clock
+                .get_clock()
+                .await
+                .unwrap_or_else(|e| panic!("get_clock after takeover (round {round}) failed: {e}"));
+        }
     }
 
     // -----------------------------------------------------------------------

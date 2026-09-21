@@ -28,9 +28,11 @@ mod i2c;
 mod pin;
 mod pwm;
 mod spi;
+mod stepper;
 
 pub use adc::McuAdc;
 pub use i2c::{I2cMode, McuI2c, DEFAULT_SPEED};
 pub use pin::{McuChip, McuDigitalOut};
 pub use pwm::McuPwm;
 pub use spi::{McuSpi, SpiMode};
+pub use stepper::McuStepper;

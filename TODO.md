@@ -466,7 +466,7 @@ kinematics 已随 Printer 重构删除，从这里重新开始。动工前调查
 | FW5b | ✅ `Move`、`LookAheadQueue`、`trapq` | host 单测（13 个） |
 | FW5c | ✅ `itersolve` + `kin_cartesian`；`stepcompress` 简化 + `warn_and_wait`（策略可注入，测试传 0） | host 单测（12 个，含告警/宽限） |
 | FW5d-1 | ✅ `ToolHead`、`MotionQueuing`、`Stepper`（host 链路） | host 单测（8 个）：`G1` 出正确 `queue_step` |
-| FW5d-2 | `McuStepper` 资源 + `config_stepper`/`queue_step` 下行 | 假 MCU |
+| FW5d-2 | ✅ `McuStepper` 资源 + `setup_stepper` + `StepCommand`→MCU 命令转换 | host 单测（3 个）；`[stepper_*]` section 注册与真板读回留 FW5e |
 | FW5e | `Kinematics` + `kinematics/cartesian`；`[printer]` late 住户；`G1`（G4） | 真板：单轴 → 三轴 + `[extruder]` |
 | FW5f | `stepcompress` 完整压缩（后置） | 与上游向量对拍 |
 

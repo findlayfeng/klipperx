@@ -42,7 +42,7 @@ use crate::core::klippy::event::stats::{register_stats, LastStats};
 use crate::core::klippy::event::{IsShutdown, KlippyEvent, McuEvent, Shutdown, Starting};
 use crate::core::klippy::mcu::{
     ConfigBuilder, Dictionary, I2cMode, Mcu, McuChip, McuError, McuI2c, McuRestartMethod, McuSpi,
-    SpiMode,
+    McuStepper, SpiMode,
 };
 use crate::core::klippy::pins::{PinError, PinParams, PrinterPins, PINS_OBJECT};
 use crate::core::klippy::printer::{ConnectFuture, Printer, PrinterObject, RestartFuture};
@@ -221,6 +221,22 @@ impl McuObject {
         cs_active_high: bool,
     ) -> Arc<McuSpi> {
         self.chip.setup_spi(mode, cs_pin, cs_active_high)
+    }
+
+    /// Build a stepper on this MCU.
+    ///
+    /// The motion counterpart of the pin and bus resources: a `[stepper_*]`
+    /// section asks its MCU for it (FW5e wires the section up). Upstream's
+    /// `MCU_stepper` (`klippy/stepper.py:22`).
+    pub fn setup_stepper(
+        &self,
+        step_pin: PinParams,
+        dir_pin: PinParams,
+        invert_step: i8,
+        step_pulse_ticks: u32,
+    ) -> Arc<McuStepper> {
+        self.chip
+            .setup_stepper(step_pin, dir_pin, invert_step, step_pulse_ticks)
     }
 
     /// Snapshot a connected MCU's identify status for `objects/query`.

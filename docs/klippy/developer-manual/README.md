@@ -1,6 +1,6 @@
 # Klipperx 开发手册
 
-面向贡献者与模块维护者的技术参考。涵盖消息编解码（`msg`）、MCU 传输与数据字典（`mcu`）、MCU 配置构建（`ConfigBuilder`）、引脚解析（`pins`）、G-Code 调度（`gcode`）、命令层（`cmd`）、事件层（`event`）、identify 引导（`identify`）、机器的时钟与定时器（`reactor`）与客户端 API 层（`api`）的内部结构与设计取舍。
+面向贡献者与模块维护者的技术参考。涵盖消息编解码（`msg`）、MCU 传输与数据字典（`mcu`）、MCU 配置构建（`ConfigBuilder`）、引脚解析（`pins`）、G-Code 调度（`gcode`）、命令层（`cmd`）、事件层（`event`）、identify 引导（`identify`）、机器的时钟与定时器（`reactor`）、机器的骨架与装载（`printer` / `load`）与客户端 API 层（`api`）的内部结构与设计取舍。
 
 > **第三方 API 接口**（G-Code 命令、API 端点等）参见 [第三方开发手册](../third-party-dev/README.md)。
 
@@ -8,6 +8,7 @@
 
 | 层 | 路径 | 职责 | 知道哪些具体命令 |
 |----|------|------|------------------|
+| 机器 | `src/core/klippy/printer.rs` + `load.rs` | 对象注册表、事件总线、状态与生命周期；`load.rs` 按 `section!` 生成的工厂表把 config 装成对象 | **不涉及**：只先注册 `pins` / `gcode` |
 | 编解码引擎 | `src/core/klippy/msg/` | 格式串 ↔ 字节 | **不知道**：只认 `%u` / `%.*s` |
 | MCU 传输 | `src/core/klippy/mcu/` | 帧收发、`Parser`、数据字典、裸命名访问（`send` / `call`） | 只知道 `identify` 一对（起始 `Parser`） |
 | 命令层 | `src/core/klippy/cmd/` | 命令词汇（`McuCommand` / `McuResponse` / `Params`）、类型化调用、各命令模块 | 全部 |
@@ -204,6 +205,18 @@ identify 的命令**定义**（名称、参数、解码）与其它命令一样�
 | `TokioReactor` | 主机实现：定时器是 tokio 任务，时钟是 tokio 的 `Instant` |
 | `ManualReactor` | 测试实现：`advance(delta)` 手动拨表并逐个跑定时器，不需要 runtime |
 
+### `printer.rs` — 机器
+
+一台机器一个实例：它持有配置装载出来的 printer objects，并管理自己的生命周期（bring up、状态、停机、空闲直到退出）。对应上游 `klippy/klippy.py` 的 `Printer`，骨架与装载拆在 `printer.rs` 与 `load.rs` 两个文件。
+
+| 项 | 职责 |
+|------|------|
+| `Printer` | 对象注册表（`add_object` / `lookup_object` / `lookup_object_as::<T>`）、事件总线（`register_event_handler` / `send_event`，词汇见 `event/`）、状态（`get_state_message` / `invoke_shutdown`）、生命周期（`bring_up` / `teardown` / `reset_for_restart`） |
+| `load.rs` | 装载入口：按各模块顶层 `section!` 声明生成的工厂表，把 config 的每个 section 变成对象并注册；`pins` / `gcode` 由它最先注册（见 [声明式表生成](codegen.md)） |
+| `reactor` | 不拥有 runtime：时间与定时器来自被交给它的 `Reactor`（`Printer::reactor()`，见 [时钟与定时器](reactor.md)） |
+
+`printer.rs` 不认识任何具体命令或 extras：具体部分由 `cmd/` 与 `extras/` 在装载时接进来，它只定义机器的骨架。
+
 ### `pins.rs` — 引脚解析
 
 与 `printer.rs` 平级的单文件模块：把配置里的引脚描述变成 MCU + 引脚名，并记录谁在用哪个引脚。对应上游 `klippy/pins.py`。
@@ -228,6 +241,8 @@ identify 的命令**定义**（名称、参数、解码）与其它命令一样�
 | 传统 / 扩展命令 | 传统（`M110`、`G1`）参数是 `S200` 这种“字母+值”；扩展（`SET_PIN`）是 `KEY=VALUE`，带 shell 引号——后者在分派时重解析（上游 `_get_extended_params`） |
 
 它在 `load_config` 里**最先**注册（在 `pins` 之前），因为资源与 `[board_pins]` 建对象时要往它注册命令；按上游，它是 `Printer.__init__` 的早对象。不含运动命令（G0/G1/G28 由 toolhead 注册，见 C1/G4），也不含 `ok` 应答与 `gcode:command_error` 事件（无文件输出协议、事件集未开放）。
+
+一处**有意偏离**：mux 命令的“值不合法”提示里，上游按 dict 迭代序取最后一个匹配做 `Did you mean`，这里对候选排序后取第一个（消息要稳定）。默认项（注册 `value=None`）与上游一致：不给 key 时命中。
 
 ### `extras/` — 建立在核心之上的 `[<section>]` 模块
 

@@ -164,23 +164,23 @@ toolhead / 开放事件）一起补，一部分是现在就独立可补的小行
       的抑制；也缺「命令名里带空格」时按 `realcmd = cmd.split()[0]` 路由到 `M117/M118/M23`
       的分支。后者是实际差异：`M117 123` 这类数字消息在 Rust 里会整串当命令名而报
       `Unknown command`（`parse_line` 只做 trim，`gcode.rs:862-917`）。
-- [ ] **`ECHO` 前缀**：上游 `respond_info(commandline, log=False)` → 输出 `// <line>`
+- [x] **`ECHO` 前缀**：上游 `respond_info(commandline, log=False)` → 输出 `// <line>`
       （`:368-369`）；Rust 用 `respond_raw`，没有 `// ` 前缀、不记日志（`gcode.rs` 的 `ECHO`）。
-- [ ] **`HELP` 未就绪提示**：上游未就绪时首行加
+- [x] **`HELP` 未就绪提示**：上游未就绪时首行加
       `Printer is not ready - not all commands available.`，并遍历当前 active 表（`:379-388`）；
       Rust 无该提示，遍历 help 表（`gcode.rs:663-678`）。
 - [ ] **`M115` 版本号来源**：上游取 `start_args['software_version']`（`:344-350`），Rust 用
       `CARGO_PKG_VERSION`。
-- [ ] **`get_status` 的构建口径**：上游返回缓存的 `status_commands`、按 **active 表**构建
+- [x] **`get_status` 的构建口径**：上游返回缓存的 `status_commands`、按 **active 表**构建
       （未就绪只列 base 的 8 条内置，`:176-184`）；Rust 每次从 `commands.ready` 全量重建
       （`gcode.rs:578-592`）。未就绪阶段 `objects/query` 看到的命令集合不同。
-- [ ] **未就绪时停机不打印**：上游 `_handle_shutdown` 在 `not is_printer_ready` 时直接
+- [x] **未就绪时停机不打印**：上游 `_handle_shutdown` 在 `not is_printer_ready` 时直接
       return（`:186-193`）；Rust 无条件发 `Klipper state: Shutdown`（`gcode.rs:335-343`）。
-- [ ] **`is_traditional_gcode` 判定**：上游用 `float(cmd[1:])`（`:125-131`），Rust 只看首字母
+- [x] **`is_traditional_gcode` 判定**：上游用 `float(cmd[1:])`（`:125-131`），Rust 只看首字母
       大写 + 次字符数字（`gcode.rs:794`）。`M1ABC` 这类上游拒绝注册、Rust 接受。
 - [ ] **`parse_extended` 的 shlex 保真**：Rust 手写解析只做引号切换 + `#`/`;` 截断，不处理
       反斜杠转义 / 引号拼接等 `shlex` 语义（`gcode.rs:937-983` 对 `:266-281`）。
-- [ ] **校验和 `*123`**：上游 `get_raw_command_parameters` 会剥掉尾部校验和（`:40-51`），
+- [x] **校验和 `*123`**：上游 `get_raw_command_parameters` 会剥掉尾部校验和（`:40-51`），
       Rust 的 `raw_parameters` 不剥（`gcode.rs:919-935`）。只在文件 / 串口输入路径上有影响，
       连同 `GCodeIO` 一起看。
 - [ ] **`register_command(cmd, None)` 注销**：上游支持注销并返回旧 handler（`:133-141`），
@@ -189,15 +189,15 @@ toolhead / 开放事件）一起补，一部分是现在就独立可补的小行
       `get(parser=…)`；缺 `get_command_parameters` / `get_raw_command_parameters`（raw 只在
       内部 `Parsed`）；也没有 `create_gcode_command`（字段私有，外部无法构造 gcmd，宏类模块
       会需要）（`:23-91` `:244`）。
-- [ ] **mux 缺省项（`value=None`）不可达**（**优先，含测试**）：`dispatch_mux` 用
+- [x] **mux 缺省项（`value=None`）不可达**（**优先，含测试**）：`dispatch_mux` 用
       `contains_key(&None)` 认出缺省项，但键缺席时把请求值取成 `""` 再用 `Some("")` 查表，
       永远命中不了 `None`，于是走到「值不合法」错误分支（`gcode.rs:680-733` 对 `:317-342`）。
       实测：注册 `SET_PIN` 的 `PIN=None` 后执行 `SET_PIN VALUE=1`，报
       `The value '' is not valid for PIN. Options: `。当前库里只用 `Some(name)` 注册，未覆盖。
-- [ ] **mux 错误提示的 `Did you mean`**：上游按 dict 迭代序取「最后一个匹配」（`:317-342`），
+- [x] **mux 错误提示的 `Did you mean`**：上游按 dict 迭代序取「最后一个匹配」（`:317-342`），
       Rust 对 values 排序后取第一个匹配（`gcode.rs:718-733`）——措辞更稳定，属有意偏离；
       要么对齐上游，要么在文档里记一句。
-- [ ] **清理 `src/core/parser.rs`**：`parse_gcode` / `parse_gcode_line` 是未被引用的存根
+- [x] **清理 `src/core/parser.rs`**：`parse_gcode` / `parse_gcode_line` 是未被引用的存根
       （`#[allow(dead_code)]`），真正的解析在 `gcode.rs`；删除或并入 `gcode.rs` 的测试。
 
 ### G4 运动命令（G0/G1/G28/G92/M114…）
@@ -385,9 +385,9 @@ ack」settle，并用 `Mcu::took_over_session()` 让 `rpi_usb` 判断“有没�
 
 ### E1 文档
 
-- [ ] `docs/klippy/developer-manual/`：补 printer 一节，并在 README 的分层表里加
+- [x] `docs/klippy/developer-manual/`：补 printer 一节，并在 README 的分层表里加
       `printer` 一行（现在只有 msg / mcu / cmd / event / identify / api）。
-- [ ] **过期描述**：`printer.rs` 头注释仍写「No part is loaded from the config into it
+- [x] **过期描述**：`printer.rs` 头注释仍写「No part is loaded from the config into it
       yet … so it still runs empty」，而 `load.rs` 已经装载 `[mcu]`；改了代码就要回头改
       这几句。
 
@@ -558,6 +558,10 @@ ack」settle，并用 `Mcu::took_over_session()` 让 `rpi_usb` 判断“有没�
 
 细节在各模块文档里；这里每条只留一行索引，最近完成的在前。
 
+- **G-Code 调度器小行为对齐（G1b）**：`ECHO` 改用 `// ` 前缀且不记日志、`HELP`
+      未就绪提示与按 active 表遍历、`get_status` 按 active 表构建、未就绪时停机不打印、
+      mux 默认项（`value=None`）不再不可达、行号命令行剥尾部 `*<digits>` 校验和；另删掉
+      `src/core/parser.rs` 的未引用存根，developer-manual 补 `printer` 一节与分层表行。
 - **SPI 总线（F6）**：`cmd/spi.rs`、`mcu/resource/spi.rs` 的 `McuSpi`（硬件/软件两条
       路，固件驱动 CS）、`extras/spi_device.rs`（`[spi_device]` 构造器 + `SPI_TRANSFER` /
       `SPI_SEND` 调试命令）；与 `[i2c_device]` 共用 `extras/bus_debug.rs`。

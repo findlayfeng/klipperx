@@ -108,11 +108,12 @@ enum Commands {
     // keeps the attribute because it is genuinely missing its method.
     Console(client::ConsoleArgs),
 
-    /// Stress-test one MCU's step generation until it errors
+    /// Stress-test one MCU until it errors: step generation or command load
     //
     // A bench tool, not part of the host: it takes the named MCU over and ramps
-    // `queue_step` load until the firmware shuts down. `arg_required_else_help`
-    // because both the config file and the MCU name are required.
+    // `queue_step` load (or `get_clock` request rate) until the firmware shuts
+    // down (or the link gives out). `arg_required_else_help` because both the
+    // config file and the MCU name are required.
     #[command(arg_required_else_help = true)]
     Stress(klipperx::stress::StressArgs),
 }

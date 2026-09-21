@@ -126,7 +126,10 @@ MCU 侧另有独立的 `event` 模块，以 `McuEvent` trait 表达固件主动�
 
 ### 2.2 覆盖范围
 
-`klippy:notify_mcu_error` 已声明，但触发点尚未接入 MCU 错误路径，因此暂不会发出。
+`klippy:notify_mcu_error` 已声明并在 `Printer::bring_up` 中接入触发点：当 MCU 对象
+`connect()` 失败时，在 `invoke_shutdown` 之前发出，携带 `msg` 分类（`"Protocol error"`
+或 `"MCU error during connect"`）与 `details`（原始错误信息）。与上游 `_connect` 中的
+`send_event("klippy:notify_mcu_error", msg, {"error": str(e)})` 一致。
 其余命名空间的事件在各自模块就位后触发；事件名与变体已经就绪，处理器可先注册。
 
 ## 3. 设计
@@ -413,7 +416,9 @@ impl Printer {
 - `klippy:analyze_shutdown`：在 `invoke_shutdown` 中 `klippy:shutdown` 之后触发，携带
   停机原因与细节。当前 `invoke_shutdown` 只接收 `msg`，`details` 以空表传入；后续需要
   细节的调用点再扩展签名。
-- `klippy:notify_mcu_error`：由 MCU 通信错误路径触发，依赖该路径先能提供 `details`。
+- `klippy:notify_mcu_error`：在 `Printer::bring_up` 中，MCU 对象 `connect()` 失败时、
+  `invoke_shutdown` 之前触发，携带 `msg`（`"Protocol error"` 或 `"MCU error during connect"`）
+  与 `details`（`{"error": str}`）。上游在 `_connect` 中对应位置触发。
 - `klippy:firmware_restart`、`klippy:disconnect`：位置不变。
 
 ## 5. 实施顺序
@@ -439,7 +444,7 @@ impl Printer {
 | 异常隔离 | `try/except` | `catch_unwind` |
 | 禁止阻塞 | `assert_no_pause()` 强制 | 沿用 `reactor` 回调约定，不强制校验 |
 | 未知事件 | 静默忽略 | 记录警告 |
-| 错误事件 | `klippy:notify_mcu_error` 在 MCU 错误路径发出 | 已声明，尚未接入触发点 |
+| 错误事件 | `klippy:notify_mcu_error` 在 MCU 错误路径发出 | 已接入 `bring_up` 中 MCU 连接失败路径 |
 
 禁止阻塞一项不引入强制机制：`reactor` 已对回调约定「不等待、不做重活」，重复引入运行时
 校验的收益有限，且 `catch_unwind` 已覆盖处理器崩溃这一主要风险。

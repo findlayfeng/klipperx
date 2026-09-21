@@ -26,8 +26,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::core::klippy::cmd::spi::{
-    ConfigSpi, ConfigSpiWithoutCs, SpiSend, SpiSetBus, SpiSetSwBus, SpiTransfer,
-    SpiTransferResponse,
+    add_software_bus, ConfigSpi, ConfigSpiWithoutCs, SoftwareSpiBus, SpiSend, SpiSetBus,
+    SpiTransfer, SpiTransferResponse,
 };
 use crate::core::klippy::mcu::{ConfigBuilder, Mcu, McuError};
 use crate::core::klippy::pins::{PinParams, PrinterPins};
@@ -292,20 +292,22 @@ impl SpiState {
                 let sclk = pin_number(mcu, &sclk, chip_name)
                     .map_err(|e| McuError::Config(format!("spi sclk pin: {e}")))?;
 
-                // `pulse_ticks` is one SPI clock period in ticks, as upstream's
-                // `seconds_to_clock(1./speed)`.
-                let pulse_ticks = mcu.seconds_to_clock(1.0 / speed as f64)? as u32;
-
-                builder
-                    .add_config_cmd(&SpiSetSwBus {
+                // Which command that is — and whether the tick count or the
+                // raw rate goes out — is the command layer's business: newer
+                // firmware gets `spi_set_sw_bus`, older gets
+                // `spi_set_software_bus`.
+                add_software_bus(
+                    builder,
+                    mcu,
+                    &SoftwareSpiBus {
                         oid,
                         miso_pin: miso,
                         mosi_pin: mosi,
                         sclk_pin: sclk,
                         mode,
-                        pulse_ticks,
-                    })
-                    .map_err(|e| McuError::Config(format!("spi_set_sw_bus: {e}")))?;
+                        speed,
+                    },
+                )?;
             }
         }
 

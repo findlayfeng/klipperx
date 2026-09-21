@@ -635,16 +635,21 @@ async fn get_config(mcu: &Mcu) -> Result<ConfigState, McuError> {
 /// is why `mcu/object.rs` binds the shutdown events only *after* this.
 ///
 /// # Errors
-/// Returns [`McuError::Config`] when the firmware has no `config_reset` (the
-/// command is declared per board, not in `basecmd.c`).
+/// Returns [`McuError::ResetRequired`] when the firmware can reboot itself with
+/// `reset` (preferred — a reboot clears timers and the step queue too), and
+/// [`McuError::Config`] when it can clear neither way (the command is declared
+/// per board, not in `basecmd.c`).
 async fn reset_firmware(mcu: &Mcu, state: &ConfigState, crc: u32) -> Result<(), McuError> {
+    // Upstream prefers the firmware's own `reset` when it has one
+    // (`klippy/mcu.py:733-740`: `_reset_cmd` is chosen over `config_reset`). A
+    // reboot clears the timers and the step queue as well as the configuration,
+    // where `config_reset` only clears the configuration. It drops this
+    // connection, so the caller reconnects and re-runs the handshake
+    // (`mcu/object.rs`); nothing may be sent from here.
+    if mcu.has_message(Reset::NAME) {
+        return Err(McuError::ResetRequired);
+    }
     if !mcu.has_message(ConfigReset::NAME) {
-        if mcu.has_message(Reset::NAME) {
-            // `reset` reboots the firmware, which drops this connection; the
-            // caller reconnects and re-runs the handshake (`mcu/object.rs`).
-            // Nothing may be sent from here.
-            return Err(McuError::ResetRequired);
-        }
         let reason = if state.is_shutdown {
             "is shutdown".to_string()
         } else {
@@ -1305,6 +1310,57 @@ mod tests {
 
         assert!(matches!(err, McuError::Config(_)), "{err:?}");
         assert!(err.to_string().contains("CRC"), "{err}");
+    }
+
+    /// The dictionary with both `reset` and `config_reset`: a firmware that
+    /// offers both clear paths. Upstream prefers the reboot.
+    fn dictionary_with_both_resets() -> Dictionary {
+        Dictionary::from_json(json!({
+            "commands": {
+                "reset": 16,
+                "allocate_oids count=%c": 2,
+                "get_config": 7,
+                "finalize_config crc=%u": 6,
+                "config_reset": 30,
+                "emergency_stop": 31
+            },
+            "responses": {
+                "config is_config=%c crc=%u is_shutdown=%c move_count=%hu": 9,
+                "shutdown clock=%u static_string_id=%hu": 20
+            },
+            "enumerations": {
+                "static_string_id": {"Command request": 0}
+            },
+            "config": {"CLOCK_FREQ": 20000000}
+        }))
+        .unwrap()
+    }
+
+    fn scripted_mcu_with_both_resets(mappings: Vec<MappingEntry>) -> Mcu {
+        let mcu = Mcu::for_test("test_mcu", Interface::new(TestDevice::new(mappings)));
+        mcu.install_dictionary(dictionary_with_both_resets())
+            .unwrap();
+        mcu
+    }
+
+    #[tokio::test]
+    async fn test_configure_prefers_reset_over_config_reset() {
+        // A firmware that can reboot itself is rebooted even when it can also
+        // clear its configuration in place (upstream `_reset_cmd` over
+        // `config_reset`, `klippy/mcu.py:733-740`). The handshake asks for the
+        // reconnect instead of sending `config_reset`.
+        let mcu = scripted_mcu_with_both_resets(vec![MappingEntry {
+            input: Frame::new(0, get_config_payload()),
+            outputs: vec![Frame::new(
+                0,
+                config_response(true, 0xdead_beef, false, 500),
+            )],
+        }]);
+        let builder = ConfigBuilder::new();
+
+        let err = builder.configure(&mcu).await.unwrap_err();
+
+        assert!(matches!(err, McuError::ResetRequired), "{err:?}");
     }
 
     #[tokio::test]

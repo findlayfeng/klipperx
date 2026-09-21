@@ -92,6 +92,35 @@ pub async fn reset_firmware(
     }
 }
 
+/// Whether an `rpi_usb` board has to be brought up with a firmware restart
+/// first, and the reason to log.
+///
+/// Upstream gates `rpi_usb` at two points (`klippy/mcu.py:690-700`):
+///
+/// - `check_restart_on_attach` — a port that is not even present is powered on
+///   first;
+/// - `check_restart_on_send_config` — an `rpi_usb` board is only ever
+///   **configured** after a power cycle in this session, so a normal start
+///   restarts it before sending the configuration.
+///
+/// The point of `rpi_usb` is a power cycle, and a board that answers without
+/// having been power-cycled this session may still be running an old
+/// configuration — so the host asks for the restart instead of configuring it.
+///
+/// Returns `None` when the bring-up should just proceed: not `rpi_usb`, already
+/// in the restart the gate asked for (`restarting`), or (per
+/// [`check_usb_power`]) a hub that cannot switch power at all — the caller
+/// downgrades that to `command` before calling this.
+pub fn restart_before_bringup(config: &McuConfig, restarting: bool) -> Option<&'static str> {
+    if restarting || config.restart_method != McuRestartMethod::RpiUsb {
+        return None;
+    }
+    match &config.transport {
+        Transport::Serial { path, .. } if !Path::new(path).exists() => Some("enable power"),
+        _ => Some("full reset before config"),
+    }
+}
+
 /// Check, at connect, that `rpi_usb` will be able to switch this port's power.
 ///
 /// Runs on every connect rather than only when a restart is requested, so a
@@ -385,6 +414,59 @@ mod tests {
                 baud: 250_000,
             },
             usb_power: usb::UsbPowerMethod::default(),
+        }
+    }
+
+    /// A config naming one serial path, for the `rpi_usb` gating test.
+    fn serial_at(path: &str, method: McuRestartMethod) -> McuConfig {
+        McuConfig {
+            name: "mcu".to_string(),
+            restart_method: method,
+            transport: Transport::Serial {
+                path: path.to_string(),
+                baud: 250_000,
+            },
+            usb_power: usb::UsbPowerMethod::default(),
+        }
+    }
+
+    #[test]
+    fn test_rpi_usb_needs_a_restart_before_it_is_configured() {
+        // The port is there, so the board is powered on: it still has to be
+        // power-cycled before this session configures it (upstream's
+        // `check_restart_on_send_config`).
+        assert_eq!(
+            restart_before_bringup(&serial_at("/dev/null", McuRestartMethod::RpiUsb), false),
+            Some("full reset before config")
+        );
+        // A port that is not there at all is powered on first
+        // (`check_restart_on_attach`).
+        assert_eq!(
+            restart_before_bringup(
+                &serial_at("/dev/no-such-tty", McuRestartMethod::RpiUsb),
+                false
+            ),
+            Some("enable power")
+        );
+    }
+
+    #[test]
+    fn test_the_restart_gate_does_not_ask_twice() {
+        // Already in the restart it asked for: configure instead of looping.
+        assert_eq!(
+            restart_before_bringup(&serial_at("/dev/null", McuRestartMethod::RpiUsb), true),
+            None
+        );
+        // Only `rpi_usb` has the gate.
+        for method in [
+            McuRestartMethod::Command,
+            McuRestartMethod::Arduino,
+            McuRestartMethod::Cheetah,
+        ] {
+            assert_eq!(
+                restart_before_bringup(&serial_at("/dev/null", method), false),
+                None
+            );
         }
     }
 

@@ -20,7 +20,7 @@
 //! The reported fields are the three identify ones. `last_stats` is upstream's
 //! fourth (`klippy/mcu.py:975`) and is **not** reported yet: it is accumulated
 //! from the `stats` event, which today is only logged
-//! ([`register_stats_logging`](crate::core::klippy::event::stats::register_stats_logging)).
+//! ([`register_stats`](crate::core::klippy::event::stats::register_stats)).
 //! It comes back with the statistics consumer.
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -38,7 +38,7 @@ use crate::core::klippy::config::mcu::McuConfig;
 use crate::core::klippy::config::value::ConfigValue;
 use crate::core::klippy::config::{AccessTracking, ConfigSection, ConfigWrapper};
 use crate::core::klippy::error::{ConfigError, KlippyError};
-use crate::core::klippy::event::stats::register_stats_logging;
+use crate::core::klippy::event::stats::{register_stats, LastStats};
 use crate::core::klippy::event::{IsShutdown, KlippyEvent, McuEvent, Shutdown, Starting};
 use crate::core::klippy::mcu::{
     ConfigBuilder, Dictionary, I2cMode, Mcu, McuChip, McuError, McuI2c, McuRestartMethod, McuSpi,
@@ -97,6 +97,11 @@ pub struct McuObject {
     /// `Arc` rather than a bare atomic because the `shutdown`/`is_shutdown`
     /// event handlers are `'static` and need their own handle to it.
     is_shutdown: Arc<AtomicBool>,
+    /// The latest scheduler load from the firmware's `stats` reports, for
+    /// `get_status`'s `last_stats` (`klippy/mcu.py:974-975`).
+    ///
+    /// `Arc` because the `'static` event handler owns its handle to it.
+    last_stats: Arc<Mutex<Option<LastStats>>>,
     /// The machine, for reporting a firmware shutdown. `Weak` because the
     /// printer's registry owns this object: a strong handle would be a cycle
     /// that keeps the printer (and its device) alive forever.
@@ -129,6 +134,7 @@ impl McuObject {
             status: Mutex::new(json!({})),
             restart_method: Mutex::new(McuRestartMethod::Command),
             is_shutdown: Arc::new(AtomicBool::new(false)),
+            last_stats: Arc::new(Mutex::new(None)),
             printer: Arc::downgrade(printer),
         })
     }
@@ -405,10 +411,19 @@ impl McuObject {
 
 impl PrinterObject for McuObject {
     fn get_status(&self, _eventtime: f64) -> Value {
-        self.status
+        let mut status = self
+            .status
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .clone()
+            .clone();
+        // `last_stats` appears only once a report has arrived, as upstream's
+        // does (the key is added by its `stats()` collector).
+        if let Some(last) = *self.last_stats.lock().unwrap_or_else(|p| p.into_inner()) {
+            if let Value::Object(fields) = &mut status {
+                fields.insert("last_stats".to_string(), last.to_json());
+            }
+        }
+        status
     }
 
     fn connect<'a>(&'a self) -> ConnectFuture<'a> {
@@ -445,6 +460,25 @@ impl PrinterObject for McuObject {
                 .restart_method
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner()) = config.restart_method.clone();
+            // An `rpi_usb` board is only configured after a power cycle in this
+            // session: ask for the restart instead of configuring a board that
+            // may still be running an old configuration (upstream's
+            // `check_restart_on_attach` / `check_restart_on_send_config`).
+            if let Some(reason) =
+                super::restart::restart_before_bringup(&config, self.is_firmware_restart())
+            {
+                info!(
+                    "Attempting automated MCU '{}' restart: {reason}",
+                    config.name
+                );
+                if let Some(printer) = self.printer.upgrade() {
+                    printer.request_exit("firmware_restart");
+                }
+                return Err(KlippyError::Connection(format!(
+                    "MCU '{}' needs a firmware restart before it can be configured",
+                    config.name
+                )));
+            }
             // This bring-up is the one that resets the firmware itself, and
             // `rpi_usb` is the only method that does it by switching the port's
             // power — the one thing that can disconnect a board without
@@ -566,9 +600,24 @@ impl PrinterObject for McuObject {
             self.bind_shutdown(&mcu)
                 .map_err(|err| KlippyError::Internal(err.to_string()))?;
             // The firmware sends periodic `stats` reports (id=-12) with
-            // scheduler timing; register the handler so they are consumed
-            // rather than discarded as unhandled messages.
-            register_stats_logging(&mcu).map_err(|err| KlippyError::Internal(err.to_string()))?;
+            // scheduler timing; keep the latest as `last_stats` (and log it) so
+            // `objects/query` can report the load.
+            let freq = mcu
+                .dictionary()
+                .and_then(|dictionary| dictionary.constant_f64("CLOCK_FREQ"));
+            let sumsq_base = mcu
+                .dictionary()
+                .and_then(|dictionary| dictionary.constant_f64("STATS_SUMSQ_BASE"));
+            match (freq, sumsq_base) {
+                (Some(freq), Some(sumsq_base)) => {
+                    register_stats(&mcu, freq, sumsq_base, Arc::clone(&self.last_stats))
+                        .map_err(|err| KlippyError::Internal(err.to_string()))?
+                }
+                _ => warn!(
+                    "MCU '{}' has no clock statistics constants; last_stats stays empty",
+                    self.chip.name()
+                ),
+            }
             self.set_status(&mcu);
             Ok(())
         })
@@ -1095,8 +1144,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_config_registers_the_host_shutdown_handler() {
-        // The factory is what wires `klippy:shutdown` to the object, because the
-        // handler is `'static` and the object is `Arc`-owned by the registry.
         let printer = printer();
         let mut section = section(None);
         section.parameters.insert(
@@ -1116,5 +1163,24 @@ mod tests {
         mcu.flush(Duration::from_secs(1)).await.unwrap();
 
         assert_eq!(recorder.frames().len(), 1);
+    }
+
+    #[test]
+    fn test_last_stats_appears_in_the_status_once_reported() {
+        // Upstream's `MCUStatsHelper` puts the running numbers in `last_stats`
+        // (`klippy/mcu.py:974-975`); before any report the key is absent.
+        let printer = printer();
+        let object = McuObject::new(section(None), &printer).unwrap();
+        assert!(object.get_status(0.0).get("last_stats").is_none());
+
+        *object.last_stats.lock().unwrap_or_else(|p| p.into_inner()) = Some(LastStats {
+            mcu_tick_avg: 1.5e-6,
+            mcu_tick_stddev: 2.5e-7,
+            mcu_tick_awake: 0.25,
+        });
+
+        let status = object.get_status(0.0);
+        assert_eq!(status["last_stats"]["mcu_tick_awake"], 0.25);
+        assert_eq!(status["last_stats"]["mcu_tick_avg"], 1.5e-6);
     }
 }

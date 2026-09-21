@@ -208,9 +208,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_register_stats_logging_binds_a_handler() {
+    async fn test_register_stats_binds_a_handler() {
         let mcu = mcu(Vec::new());
 
-        stats::register_stats_logging(&mcu).unwrap();
+        let slot = Arc::new(std::sync::Mutex::new(None));
+        stats::register_stats(&mcu, 72_000_000.0, 4.0, slot).unwrap();
     }
 }

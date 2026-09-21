@@ -129,6 +129,12 @@ pub struct Mcu {
     /// number the next block carries, and whether the connection had to take over a
     /// session that was already running (see [`Wire`]).
     wire: Arc<Wire>,
+    /// Whether the dictionary is installed, shared with the receive task.
+    ///
+    /// The task needs it to tell an expected decode miss during identify — the
+    /// running firmware's unsolicited `stats`/`shutdown`, which carry ids the
+    /// host does not know yet — from a genuinely unknown message afterwards.
+    identified: Arc<AtomicBool>,
     /// A base point for estimating the firmware's free-running clock: the host
     /// instant the clock was read, paired with the reading. See
     /// [`Mcu::estimated_clock`]; `None` until something seeds it (the MCU
@@ -267,6 +273,16 @@ struct Wire {
     took_over: AtomicBool,
 }
 
+/// How long the host waits for an answer before putting the unacknowledged
+/// blocks back on the wire, and the ceiling the wait backs off to.
+///
+/// Upstream computes its retransmit timeout from round-trip samples
+/// (`serialqueue.c:225-240`, clamped to these same 25 ms / 5 s). This host has
+/// no RTT estimate, so it starts at the floor and doubles on every timeout —
+/// which is what upstream does to a timeout as well (`:456-460`).
+const MIN_RTO: Duration = Duration::from_millis(25);
+const MAX_RTO: Duration = Duration::from_secs(5);
+
 /// The send task's side of a connection.
 ///
 /// It is the only writer to the wire, so the sequence and the blocks waiting to be
@@ -284,6 +300,12 @@ struct Sender {
     /// (`serialqueue.c:451-454`, `ignore_nak_seq`).
     acked: Option<u64>,
     retransmitted: Option<u64>,
+    /// How long to wait for an answer before retransmitting.
+    rto: Duration,
+    /// When the unanswered blocks should go out again, `None` when there are
+    /// none. The send task's `select!` arms on it, so a block the firmware never
+    /// answered does not wait for the firmware to speak first.
+    retransmit_at: Option<tokio::time::Instant>,
 }
 
 impl Sender {
@@ -293,7 +315,19 @@ impl Sender {
             in_flight: VecDeque::new(),
             acked: None,
             retransmitted: None,
+            rto: MIN_RTO,
+            retransmit_at: None,
         }
+    }
+
+    /// When the unacknowledged blocks should be sent again, if any are.
+    fn retransmit_deadline(&self) -> Option<tokio::time::Instant> {
+        self.retransmit_at
+    }
+
+    /// Arm the retransmit timer from now with the current wait.
+    fn arm_retransmit(&mut self) {
+        self.retransmit_at = Some(tokio::time::Instant::now() + self.rto);
     }
 
     /// Whether the window is full: the host has to wait for answers before it puts
@@ -320,7 +354,10 @@ impl Sender {
         // `send_seq`, its caller writes the block).
         self.wire.next.store(seq + 1, Ordering::Relaxed);
         match interface.send(frame.clone()).await {
-            Ok(()) => self.in_flight.push_back((seq, frame)),
+            Ok(()) => {
+                self.in_flight.push_back((seq, frame));
+                self.arm_retransmit();
+            }
             Err(e) => {
                 // Nothing went out, so the number was not used after all.
                 error!("Send failed (seq={}): {e}", seq & 0xf);
@@ -339,9 +376,33 @@ impl Sender {
             Ok(()) => {
                 debug!("Block {seq} sent again");
                 self.in_flight.push_back((seq, frame));
+                self.arm_retransmit();
             }
             Err(e) => error!("Retransmit failed (seq={}): {e}", frame.seq()),
         }
+    }
+
+    /// Put every unacknowledged block back on the wire, as the retransmit timer
+    /// asks for.
+    ///
+    /// Upstream resends the whole pending queue on one timeout
+    /// (`serialqueue.c:441-446`) and doubles the wait (`:456-460`); the blocks
+    /// keep their sequences so the firmware, which is waiting for the oldest,
+    /// takes them in order.
+    async fn retransmit(&mut self, interface: &Interface) {
+        let again: Vec<(u64, Frame)> = self.in_flight.drain(..).collect();
+        self.retransmit_at = None;
+        if again.is_empty() {
+            return;
+        }
+        warn!(
+            "No answer for {} in-flight block(s); retransmitting",
+            again.len()
+        );
+        for (seq, frame) in again {
+            self.resend_block(interface, seq, frame).await;
+        }
+        self.rto = (self.rto * 2).min(MAX_RTO);
     }
 
     /// Take in what the firmware's counter has been seen at.
@@ -384,6 +445,12 @@ impl Sender {
             let (seq, _) = self.in_flight.pop_front().expect("checked just above");
             debug!("Block {seq} acknowledged");
         }
+        if self.in_flight.is_empty() {
+            // Everything is answered, so there is nothing to retransmit and the
+            // next block starts the wait over.
+            self.retransmit_at = None;
+            self.rto = MIN_RTO;
+        }
 
         match self.acked {
             Some(previous) if seen <= previous => {
@@ -423,6 +490,8 @@ impl Mcu {
         let handle = interface.handle().clone();
 
         let wire = Arc::new(Wire::default());
+        let identified = Arc::new(AtomicBool::new(false));
+        let identified_for_task = Arc::clone(&identified);
         let (send_buf_tx, mut send_buf_rx) = mpsc::channel::<SendItem>(32);
         // Where the firmware's counter has been seen at, one value per ack/nak
         // frame (see `Wire`). A watch channel: only the newest value matters, the
@@ -439,22 +508,33 @@ impl Mcu {
                 // Wait for the first message of a batch — or for the firmware's
                 // counter to move, which is what asks for a block to go out again.
                 // A flush with nothing queued before it is already satisfied.
-                let mut payload = tokio::select! {
-                    item = send_buf_rx.recv() => match item {
-                        Some(SendItem::Payload(p)) => p,
-                        Some(SendItem::Flush(done)) => {
-                            let _ = done.send(());
+                let mut payload = {
+                    let deadline = sender.retransmit_deadline();
+                    let when = deadline.unwrap_or_else(|| tokio::time::Instant::now() + MAX_RTO);
+                    tokio::select! {
+                        item = send_buf_rx.recv() => match item {
+                            Some(SendItem::Payload(p)) => p,
+                            Some(SendItem::Flush(done)) => {
+                                let _ = done.send(());
+                                continue;
+                            }
+                            None => break, // channel closed
+                        },
+                        changed = acks_rx.changed() => {
+                            if changed.is_err() {
+                                break; // receive task gone: the device is shutting down
+                            }
+                            let seen = *acks_rx.borrow_and_update();
+                            sender.settle(&interface_for_send, seen).await;
                             continue;
                         }
-                        None => break, // channel closed
-                    },
-                    changed = acks_rx.changed() => {
-                        if changed.is_err() {
-                            break; // receive task gone: the device is shutting down
+                        // Unanswered blocks are put back on the wire rather than
+                        // waiting for the firmware to speak: a block that never
+                        // arrived leaves it waiting silently (`serialqueue.c`).
+                        _ = tokio::time::sleep_until(when), if deadline.is_some() => {
+                            sender.retransmit(&interface_for_send).await;
+                            continue;
                         }
-                        let seen = *acks_rx.borrow_and_update();
-                        sender.settle(&interface_for_send, seen).await;
-                        continue;
                     }
                 };
 
@@ -510,11 +590,20 @@ impl Mcu {
                 // An MCU that has stopped answering has to back the host up
                 // instead of growing the queue of unacknowledged blocks.
                 while sender.is_full() {
-                    if acks_rx.changed().await.is_err() {
-                        break; // receive task gone: the device is shutting down
+                    let deadline = sender.retransmit_deadline();
+                    let when = deadline.unwrap_or_else(|| tokio::time::Instant::now() + MAX_RTO);
+                    tokio::select! {
+                        changed = acks_rx.changed() => {
+                            if changed.is_err() {
+                                break; // receive task gone: the device is shutting down
+                            }
+                            let seen = *acks_rx.borrow_and_update();
+                            sender.settle(&interface_for_send, seen).await;
+                        }
+                        _ = tokio::time::sleep_until(when), if deadline.is_some() => {
+                            sender.retransmit(&interface_for_send).await;
+                        }
                     }
-                    let seen = *acks_rx.borrow_and_update();
-                    sender.settle(&interface_for_send, seen).await;
                 }
 
                 // send the batched payload to the MCU
@@ -604,7 +693,16 @@ impl Mcu {
                         msgs
                     }
                     Err(e) => {
-                        error!("Decode error: {e}");
+                        // Before the dictionary is installed, the only ids the
+                        // parser knows are the identify pair; a firmware that
+                        // was already running keeps sending `stats`/`shutdown`,
+                        // whose ids are not known yet. That is expected, not an
+                        // error — see `identified`.
+                        if identified_for_task.load(Ordering::SeqCst) {
+                            error!("Decode error: {e}");
+                        } else {
+                            debug!("Decode error before the dictionary: {e}");
+                        }
                         continue;
                     }
                 };
@@ -643,6 +741,7 @@ impl Mcu {
             interface,
             handle,
             wire,
+            identified: Arc::clone(&identified),
             clock_base: StdMutex::new(None),
             recv_handle: Some(recv_handle),
         }
@@ -719,6 +818,7 @@ impl Mcu {
 
         let mut slot = self.dictionary.lock().expect("dictionary lock poisoned");
         *slot = Some(Arc::new(dictionary));
+        self.identified.store(true, Ordering::SeqCst);
         Ok(installed)
     }
 
@@ -1379,6 +1479,43 @@ mod tests {
         mcu.flush(Duration::from_millis(500)).await.unwrap();
 
         assert!(recorder.frames().is_empty());
+    }
+
+    /// An unanswered block goes out again on the retransmit timer, without
+    /// waiting for the firmware to speak first (`serialqueue.c:422-446`).
+    #[tokio::test]
+    async fn test_an_unanswered_block_is_retransmitted() {
+        // Two mappings for the same frame: the original and the retransmit. A
+        // third attempt would find no mapping and record nothing.
+        let device = TestDevice::new(vec![
+            MappingEntry {
+                input: make_frame(0, &[5]),
+                outputs: vec![],
+            },
+            MappingEntry {
+                input: make_frame(0, &[5]),
+                outputs: vec![],
+            },
+        ]);
+        let recorder = device.recorder();
+        let mcu = Mcu::for_test("test_mcu", Interface::new(device));
+        let dictionary =
+            Dictionary::from_json(serde_json::json!({"commands": {"get_clock": 5}})).unwrap();
+        mcu.install_dictionary(dictionary).unwrap();
+
+        mcu.send("get_clock", &[]).unwrap();
+        // The first send is immediate; the retransmit waits out MIN_RTO (25 ms).
+        tokio::time::sleep(Duration::from_millis(120)).await;
+
+        let frames = recorder.frames();
+        assert!(
+            frames.len() >= 2,
+            "expected the block to be sent again, got {frames:?}"
+        );
+        // A retransmit keeps the sequence: the firmware is waiting for exactly
+        // that block (see `Sender::resend_block`).
+        assert_eq!(frames[0].seq(), 0);
+        assert_eq!(frames[1].seq(), 0);
     }
 
     // -----------------------------------------------------------------------

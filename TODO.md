@@ -24,7 +24,7 @@
 | **FW5** | 运动框架（最重） | C1（框架部分）、H12 | toolhead 骨架、`Kinematics` trait、stepper 句柄、trapq/step 生成（chelper 重写）、`clocksync`、`mathutil`/`Coord` | `cartesian` + `[stepper_x/y/z]` + `[extruder]`，`G28`/`G1` 跑通 | `kinematics/*` 其余、H9、H10 | FW1 |
 | **FW6** | 资源与触发框架 | F3、F8 | 命令队列/print_time 同步输出（`MCU_bus_digital_out`）、`TriggerDispatch`/`MCU_trsync`、endstop 接口 | 一个 endstop + `query_endstops/status` | homing/probe、运动同步 `SET_PIN` | FW5 |
 | **FW7** | MCU 与传输框架收尾 | B2、D3 | `emergency_stop` 对象（`klippy:shutdown` → 固件 `emergency_stop`）、本地 shutdown 标志、`emergency_stop` 端点、带载荷错误上报；RTO 定时重传与固件 `reset` 优先未做 | `emergency_stop` 端点使打印机进 shutdown；主机停机向固件发 `emergency_stop`，固件自报停机不回发 | TMC/传感器等资源 | — |
-| **FW8** | 主机层与重启框架 | D1、D2、Q6 | `--logfile` 日志层 + rollover info + 退出码语义（Q6）已完成；`rpi_usb` 连接期门控/CRC/重启后订阅未做 | `--logfile` 落盘（含 rollover 块）、`info.log_file` 报路径；`error_exit` 退非零 | 日志、Moonraker 兼容 | — |
+| **FW8** | 主机层与重启框架 | D1、D2、Q6 | `--logfile`/rollover/Q6、`rpi_usb` 门控、CRC 物理复位、重启后订阅均已完成（代码）；剩 `StartArgs` 其余字段与 `rpi_usb` 真机验证 | `--logfile` 落盘、`error_exit` 非零、重启后订阅不断；真板 `last_stats` 已验 | 日志、Moonraker 兼容 | — |
 | **FW9** | API 框架收尾 | B4（框架部分） | `register_remote_method` 与推送、mux 端点注册机制、`emergency_stop` 端点 | `register_remote_method` + 推送 | `pause_resume/*`、`*/dump_*` 等消费者 | FW7 |
 
 > **怎么验收**：每个框架都以「最小模块在真机/测试设备上跑通」为准，不以“代码写完”为准。
@@ -202,10 +202,9 @@ H1–H12 是[上游功能覆盖审计](docs/work-log/2026-09-21-upstream-coverag
       处理器共享）+ `force_local_shutdown`；固件自报 `shutdown`/`is_shutdown` 时置位，
       `on_host_shutdown` 据此不回发。`bind_shutdown` 仍在 `configure` 之后绑定（足够安全）；
       要提前到 identify 之后，再靠标志区分自己发的停止——留作可选项。
-- [ ] **`last_stats` 仍未报**：`stats` 事件已在 `McuObject::connect` 中注册 handler
-      （`register_stats_logging`），但只打日志不上报。上游由 `MCUStatsHelper` 累计
-      （`klippy/mcu.py:912` `:974-975`），`get_status` 多一个 `last_stats`
-      （`klippy/mcu.py:1235`）。需要先有 stats 消费者。
+- [x] **`last_stats`**：`event/stats.rs` 的 `LastStats::from_report` 按上游算术（`klippy/mcu.py:931-941`）
+      把每条 `stats` 换算成 `mcu_tick_avg/stddev/awake`；`register_stats` 存进 `McuObject` 的
+      槽，`get_status` 在收到过报告后带上 `last_stats`。真板已确认。
 - [ ] **错误上报带载荷**：上游 `klippy:notify_mcu_error` 带 `msg` 与 details
       （`klippy/klippy.py:144` `:151`），shutdown 分析走 `klippy:analyze_shutdown`
       （`klippy/klippy.py:216-220`）。带载荷的变体已就位
@@ -213,10 +212,9 @@ H1–H12 是[上游功能覆盖审计](docs/work-log/2026-09-21-upstream-coverag
       `analyze_shutdown` 已触发并传 `msg`），`notify_mcu_error` 的触发点已接入
       （`Printer::bring_up` 中 MCU 连接失败路径）；`error_mcu` 模块尚未实现，暂无法
       丰富错误信息。
-- [ ] **`command` 的固件 `reset`**：复位现在优先 `config_reset`（清配置），上游还会优先用
-      固件的 `reset`（真重启 MCU，`HF_IN_SHUTDOWN`）。`restart_method == command` 的
-      `firmware_restart` 已在**拆机之前**用活连接发 `reset`
-      （`McuObject::before_firmware_restart`），但一般的配置握手路径还没有。
+- [x] **`command` 的固件 `reset` 优先**：`reset_firmware` 现在先看固件有没有 `reset`，有就返回
+      `ResetRequired`，由 `connect` 发 `reset` + 重连 + 重试握手（`klippy/mcu.py:733-740`
+      的 `_reset_cmd` 优先）；只有没有 `reset` 时才用 `config_reset` 就地清（`mcu/config.rs`）。
 
 ### G1b gcode 调度器与上游的行为差异（框架部分 FW4）
 
@@ -463,35 +461,30 @@ kinematics 已随 Printer 重构删除，从这里重新开始：
 都已完成（见文末索引；方法与连接期门控见 `docs/klippy/developer-manual/mcu-config.md`）。
 剩下的三块：
 
-- [ ] **`rpi_usb` 的连接期门控（有意后置）**：① 串口不存在 → 先请求一次 firmware_restart
-      去上电（`check_restart_on_attach`，`klippy/mcu.py:696-700`）；② 未配置时发配置前也先做
-      一次 USB 断电（`check_restart_on_send_config`，`:692-694`），保证配置落在一块**本次会话
-      断电重启过**的板子上（`Endstop_Phase.md`：rpi_usb 的意义就是断电复位，连未配置的板子
-      也要先断电）。现在只在 `firmware_restart` 路径上「先复位、再 open、再 configure」，普通
-      启动看到未配置的板子会直接发配置，不看 `restart_method`。
-- [ ] **CRC 不匹配仍走就地复位（有意偏离上游）**：上游发现已配置但 CRC 不一致时先
-      `request_exit('firmware_restart')`（`check_restart_on_crc_mismatch`，
-      `klippy/mcu.py:678-685`、`:1057-1059`），让重启循环做物理复位；我们在 `configure` /
-      `handshake` 里就地做：有 `config_reset` 直接清，只有 `reset` 时发 `reset` + 重连 + 重试
-      握手。若要贴上游，还有 `start_reason == 'firmware_restart'` 却仍已配置时 raise
-      “Failed automated reset” 的前置门（`:1053-1056`）。详见
-      `docs/klippy/developer-manual/mcu-config.md`。
-- [ ] **重启后的 g-code 输出订阅**：连接不断，`objects/subscribe` 也自动继续（它按名查新对象），
-      但 `gcode/subscribe_output` 的处理器挂在被重建的 `GCodeDispatch` 上，重启后静默失效，
-      要客户端重新订阅。上游靠 socket 重绑让客户端重连、重订阅；我们要么在客户端收到
-      `klippy:ready` 后重订阅，要么把输出订阅表移到连接上。
+- [x] **`rpi_usb` 的连接期门控**：`restart::restart_before_bringup` 按上游两个点判断
+      （`check_restart_on_attach` / `check_restart_on_send_config`，`klippy/mcu.py:690-700`）：端口不存在
+      → “enable power”，否则 “full reset before config”；`McuObject::connect` 据此
+      `request_exit("firmware_restart")` 并中止本次 bring-up，重启循环下一轮
+      （`is_firmware_restart()`）才断电、开端口、发配置。**本机没有可控 VBUS 的 hub，
+      只有决策逻辑的单测（`mcu/restart.rs`），没有真机验证。**
+- [x] **CRC 不匹配改走物理复位**：`reset_firmware` 先看固件有没有 `reset`，有就 `ResetRequired`
+      → `reset` + 重连 + 重试握手（真重启，清定时器与步进队列）；只有没有 `reset` 时才
+      `config_reset` 就地清。`rpi_usb` 的 CRC 不匹配则由上一项的门先请求 firmware_restart。
+      上游那一条 `start_reason == 'firmware_restart'` 仍已配置时 raise “Failed automated reset”
+      的前置门还没做（`klippy/mcu.py:1053-1056`）。
+- [x] **重启后的 g-code 输出订阅**：`GcodeSubscribeOutput` 把
+      `(PushTarget, template)` 订阅存在自己（端点在 `Api` 上跨重启存活），并有
+      `watch_restarts` 任务每 250 ms 比对当前 `GCodeDispatch` 是否换了实例，换了就把还活着的
+      订阅重新挂上去（`api/endpoints/gcode.rs`，单测覆盖）。
 - [ ] **真板连续启动的抖动（FW1/FW3 核对时发现，基线同样复现）**：STM32F103 +
       `restart_method: command` 上把主机**紧接着上一次**再启动，偶发到不了 ready：
       ① `MCU 'mcu' shutdown: Rescheduled timer in the past`——上一次 `klipperx stress --task step`
       留在固件里的 `queue_step` 定时器在接管/复位后触发（日志里仍有 `stats count=348`）；
       ② `timeout: no response for config within 5s`。两次启动间隔 ~6 s 则 10/10 成功。
-      基线 `cf920bd` 用同一块板、同一份配置也能复现，属 D2/D3 的复位与接管路径，不是
-      FW1/FW3 引入；目标是能在「刚被上一条会话驱动的板子」上稳定起来（对齐上游先
-      `request_exit('firmware_restart')` 让循环做物理复位）。
-- [ ] **字典装载前的固件输出被记成 `Decode error`**：接管一块还在跑的板子时，`stats`（-12）
-      与 `shutdown`（-13）先于 identify 装上的字典到达，`Parser::decode` 只能打
-      `ERROR Decode error: Unknown message id: -N`。这是预期流量（上游此时也没装上字典），
-      应降为 debug，或在 identify 前先识别/缓存这几个负 id。
+      基线 `cf920bd` 用同一块板、同一份配置也能复现。“`reset` 优先”已让 CRC/停机路径改成真重启
+      （清定时器），可能顺带改善，但还没在真板上重测。
+- [x] **字典装载前的固件输出不再报错**：`Mcu` 加 `identified` 旗标（接收任务共享）；字典装上之前
+      的 decode 失败按预期降到 `debug`，装上之后的未知 id 仍是 `error`（`mcu/mod.rs`）。
 
 ### D3 `command` 接管一块还在跑的板子（框架 FW7）
 
@@ -507,8 +500,10 @@ ack」settle，并用 `Mcu::took_over_session()` 让 `rpi_usb` 判断“有没�
 
 **还剩**：
 
-- [ ] **RTO 定时重传**：帧丢了、固件也在静等时，现在只能靠对端再发 ack/NAK 触发。
-- [ ] **固件 `reset` 优先**：见 B2 的剩余（现在走 `config_reset`）。
+- [x] **RTO 定时重传**：`Sender` 加了 `rto`/`retransmit_at`，发送任务在 `select!` 里等它；
+      到期就把未确认的块原号重发，并像上游一样把等待翻倍（`serialqueue.c:422-460`，
+      `MIN_RTO`=25 ms、`MAX_RTO`=5 s）。单测：不发 ack 的设备能收到重传（`mcu/mod.rs`）。
+- [x] **固件 `reset` 优先**：见 B2（已完成）。
 
 ### E1 文档
 
@@ -818,6 +813,12 @@ ack」settle，并用 `Mcu::took_over_session()` 让 `rpi_usb` 判断“有没�
 ## 已完成（留档）
 
 细节在各模块文档里；这里每条只留一行索引，最近完成的在前。
+
+- **FW7/FW8 收尾（B2/D2/D3）**：`last_stats`（`event/stats.rs` 换算 + `McuObject` 上报，真板已验）；
+      固件 `reset` 优先于 `config_reset`（`mcu/config.rs`）；RTO 定时重传（`mcu/mod.rs` 的
+      `Sender::retransmit`，25 ms → 5 s 退避，单测）；`rpi_usb` 连接期门控
+      （`restart_before_bringup`，仅单测）；重启后 `gcode/subscribe_output` 订阅由端点
+      `watch_restarts` 重挂（`api/endpoints/gcode.rs`）；字典装载前的固件输出不再报 `ERROR`。
 
 - **主机层日志与退出码（FW8 大部）**：`--logfile` 把格式化日志同时写到 stdout 与文件
       （开不了就降级），`info.log_file` 报真实路径；主机层 rollover info（`set/clear/write_rollover`，

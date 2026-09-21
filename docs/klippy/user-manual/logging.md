@@ -76,6 +76,23 @@ export RUST_LOG=debug
 Environment=RUST_LOG=debug
 ```
 
+## `--logfile`：把日志写到文件
+
+`--logfile <PATH>` 把同样的日志行**同时**写到终端与该文件（追加），`info` 的 `log_file`
+报告这个路径；不给该选项时报告 `null`。文件打不开只在 stderr 提示一次并继续用终端，
+不会让主机起不来。
+
+主机每次启动（包括 `RESTART` 重载）会在文件里先写一段 rollover 信息：
+
+```text
+Versions: klipperx 0.1.0
+Config: /home/pi/printer.cfg
+=============== Log rollover at Mon Sep 21 16:11:20 2026 ===============
+```
+
+这是上游 `klippy` 的 `--logfile` + `bglogger` rollover 形状：把日志文件贴进 issue 时，
+它已经自带是哪个版本、哪份配置跑出来的。
+
 ## `--tui` 模式下的日志
 
 当使用 `--tui` 启动时，日志的行为有所不同：

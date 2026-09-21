@@ -11,17 +11,27 @@
 //! * [`itersolve`] — the per-stepper position solver that finds step times.
 //! * [`stepcompress`] — turning those step times into `queue_step` commands
 //!   (the **simplified** one for now; the compressor is FW5f).
+//! * [`stepper`] — one stepper: its solver and compressor.
+//! * [`queuing`] — the trapq plus the steppers reading it.
+//! * [`toolhead`] — the planner's print time and the moves it feeds in.
 //!
-//! The output scheduler (`MotionQueuing`) is FW5d; nothing here talks to an MCU.
+//! The MCU side (the oid's `config_stepper`, sending `queue_step` over the
+//! wire) and the kinematics trait are FW5e; nothing here talks to an MCU.
 
 pub mod itersolve;
 pub mod plan;
+pub mod queuing;
 pub mod stepcompress;
+pub mod stepper;
+pub mod toolhead;
 pub mod trapq;
 
 pub use itersolve::{
     cartesian_active_flags, cartesian_position_fn, Axis, AxisFlags, StepKinematics,
 };
 pub use plan::{LookAheadQueue, Move, MoveLimits};
+pub use queuing::MotionQueuing;
 pub use stepcompress::{GracePolicy, StepCommand, StepCompressor};
+pub use stepper::Stepper;
+pub use toolhead::ToolHead;
 pub use trapq::{MoveSegment, Trapq};

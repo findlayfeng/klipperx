@@ -513,6 +513,44 @@ impl Printer {
         }
     }
 
+    /// Fire `klippy:notify_mcu_error` for an MCU connection failure.
+    ///
+    /// Upstream sends this event during `_connect` when the identify handshake
+    /// or MCU connection fails, giving downstream handlers (e.g. the
+    /// `error_mcu` module) a chance to enrich the error message before
+    /// shutdown. The event carries a short `msg` describing the failure class
+    /// and a `details` map with the raw error text.
+    fn notify_mcu_error(&self, err: &KlippyError) {
+        let (msg, details) = match err {
+            KlippyError::Connection(reason) => {
+                // Distinguish protocol-level failures from plain connect
+                // failures (missing device, permission denied, etc.).
+                let is_protocol = reason.contains("Protocol")
+                    || reason.contains("dictionary")
+                    || reason.contains("identify")
+                    || reason.contains("session");
+                (
+                    if is_protocol {
+                        "Protocol error"
+                    } else {
+                        "MCU error during connect"
+                    }
+                    .to_string(),
+                    HashMap::from([("error".into(), serde_json::json!(reason))]),
+                )
+            }
+            KlippyError::Protocol(reason) => (
+                "Protocol error".to_string(),
+                HashMap::from([("error".into(), serde_json::json!(reason))]),
+            ),
+            _ => (
+                "MCU error during connect".to_string(),
+                HashMap::from([("error".into(), serde_json::json!(err.to_string()))]),
+            ),
+        };
+        self.send_event(&KlippyEvent::KlippyNotifyMcuError { msg, details });
+    }
+
     /// Halt the printer with a message for the user.
     ///
     /// The printer moves to the `shutdown` category and fires
@@ -668,6 +706,13 @@ impl Printer {
 
         for (name, object) in self.registry() {
             if let Err(err) = object.connect().await {
+                // Notify about MCU errors before shutting down, matching
+                // upstream's `klippy:klippy.py:_connect` which sends
+                // `klippy:notify_mcu_error` for protocol or connection
+                // failures before entering shutdown.
+                if name == "mcu" || name.starts_with("mcu ") {
+                    self.notify_mcu_error(&err);
+                }
                 self.invoke_shutdown(&format!("{name}: {err}"));
                 return;
             }

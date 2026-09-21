@@ -8,3 +8,4 @@
 | 2026-09-21 | [上游功能覆盖审计](2026-09-21-upstream-coverage-audit.md) — 逐项盘点上游全部功能点，产出未实现清单（落到 `TODO.md`） |
 | 2026-09-21 | [FW1 / FW3 信息收集与修改建议](2026-09-21-fw1-fw3-notes.md) — 配置装载框架与错误词汇的动工前调查、设计选项与建议 TODO 改法 |
 | 2026-09-21 | [FW4 动工记录](2026-09-21-fw4-notes.md) — G-Code 框架收尾做完了哪些、哪些留给 C1/D1，以及 GCodeIO 的拍板点 |
+| 2026-09-21 | [FW5 动工前调查](2026-09-21-fw5-notes.md) — 运动栈（toolhead/trapq/itersolve/stepcompress/clocksync/kinematics）的层次与契约、差距、FW5a–FW5e 拆分与拍板点 |

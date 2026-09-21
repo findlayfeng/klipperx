@@ -122,7 +122,8 @@
       我们现在的做法是把原因写进状态消息（上游放在 details 里），见 Q2 / Q3。
 - [ ] **`command` 的固件 `reset`**：复位现在优先 `config_reset`（清配置），上游还会优先用
       固件的 `reset`（真重启 MCU，`HF_IN_SHUTDOWN`）。`restart_method == command` 的
-      `firmware_restart` 已在连接后发 `reset`，但一般的配置握手路径还没有。
+      `firmware_restart` 已在**拆机之前**用活连接发 `reset`
+      （`McuObject::before_firmware_restart`），但一般的配置握手路径还没有。
 - [ ] **reset 期间没有本地 shutdown 标志**：现在靠「`configure` 完成后才 `bind_shutdown`」的
       时序规避；隐式、无测试，recv 一旦改成缓冲/异步就会把自发的 `emergency_stop` 误报成
       `MCU … restarted`。上游有 `_is_shutdown`（`klippy/mcu.py:893-895`）。

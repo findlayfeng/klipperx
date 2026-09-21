@@ -148,6 +148,13 @@ const MESSAGE_READY: &str = "Printer is ready";
 /// [`Printer::bring_up`] brings the executor.
 pub type ConnectFuture<'a> = Pin<Box<dyn Future<Output = Result<(), KlippyError>> + Send + 'a>>;
 
+/// A future returned by [`PrinterObject::before_firmware_restart`].
+///
+/// Boxed for the same reason as [`ConnectFuture`], and carrying no result: a
+/// part that cannot get ready is not a reason to abort the restart — the parts
+/// are about to be dropped anyway.
+pub type RestartFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+
 /// A part of the machine.
 ///
 /// One registered object is one printer object as far as `objects/list`,
@@ -192,6 +199,22 @@ pub trait PrinterObject: Any + Send + Sync {
     /// connection uses.
     fn connect<'a>(&'a self) -> ConnectFuture<'a> {
         Box::pin(async { Ok::<(), KlippyError>(()) })
+    }
+
+    /// Prepare for a `FIRMWARE_RESTART` while the parts are still up.
+    ///
+    /// The host calls this on every object when the run loop ended because a
+    /// `FIRMWARE_RESTART` was asked for, **before**
+    /// [`Printer::reset_for_restart`] tears the parts down (`klippy.rs`).
+    /// Upstream spells the same step as the `klippy:firmware_restart` event
+    /// (`klippy/mcu.py:754`), and an MCU uses it to send the firmware's own
+    /// `reset` on the **live** connection: the command has to reach the firmware
+    /// before the restart drops the connection, and sending it here is what lets
+    /// the reconnect after the reboot skip a second identify.
+    ///
+    /// The default is "nothing to do".
+    fn before_firmware_restart<'a>(&'a self) -> RestartFuture<'a> {
+        Box::pin(async {})
     }
 }
 
@@ -481,6 +504,25 @@ impl Printer {
         }
     }
 
+    /// Let every part prepare for a firmware restart, before it is torn down.
+    ///
+    /// See [`PrinterObject::before_firmware_restart`]. The objects are collected
+    /// under the lock and awaited without it, the way [`Printer::send_event`]
+    /// collects its handlers: a part may reach for another object while it
+    /// prepares.
+    pub async fn prepare_firmware_restart(&self) {
+        let objects: Vec<Arc<dyn PrinterObject>> = self
+            .objects
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .iter()
+            .map(|(_, object)| Arc::clone(object))
+            .collect();
+        for object in objects {
+            object.before_firmware_restart().await;
+        }
+    }
+
     /// Halt the printer with a message for the user.
     ///
     /// The printer moves to the `shutdown` category and fires
@@ -712,6 +754,42 @@ mod tests {
             event,
             Box::new(move || log.lock().unwrap_or_else(|p| p.into_inner()).push(name)),
         );
+    }
+
+    /// An object whose firmware-restart hook records that it ran.
+    struct Restarts(Arc<Mutex<Vec<&'static str>>>);
+
+    impl PrinterObject for Restarts {
+        fn get_status(&self, _eventtime: f64) -> Value {
+            serde_json::json!({})
+        }
+        fn before_firmware_restart<'a>(&'a self) -> RestartFuture<'a> {
+            Box::pin(async move {
+                self.0
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .push("ran");
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_prepare_firmware_restart_awaits_every_part() {
+        // The hook runs while the parts are still up — it is where an MCU sends
+        // the firmware's `reset` on the live connection (`mcu/object.rs`) — and
+        // in registration order, like `bring_up`.
+        let printer = new_printer();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        printer
+            .add_object("a", Arc::new(Restarts(Arc::clone(&seen))))
+            .unwrap();
+        printer
+            .add_object("b", Arc::new(Restarts(Arc::clone(&seen))))
+            .unwrap();
+
+        printer.prepare_firmware_restart().await;
+
+        assert_eq!(*seen.lock().unwrap(), vec!["ran", "ran"]);
     }
 
     #[test]

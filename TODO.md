@@ -404,7 +404,135 @@ ack」settle，并用 `Mcu::took_over_session()` 让 `rpi_usb` 判断“有没�
 - [ ] **Q6 退出结果的语义**：`"exit" / "error_exit" / "firmware_restart"` 由谁解释、
       `run()` 的返回值怎么变成进程退出码（`klippy/klippy.py:355-370`，`error_exit` 退 -1）。
 
-## 已完成（留档）
+## 上游事件对照清单（需 Q2 开放事件总线后逐项落地）
+
+上游 `Printer` 维护 `event_handlers` 字典（`klippy/klippy.py:36`），通过
+`register_event_handler(name, cb)` 注册、`send_event(name, *params)` 分发，共 35 个事件
+名，分布为 **klippy 生命周期**、**MCU 生命周期**、**运动/回零**、**idle_timeout**、
+**工具头**、**gcode**、**extras 自定义** 六大类。当前 KlipperX 只有 MCU 层 4 个事件
+（`shutdown`/`is_shutdown`/`starting`/`stats`），且 handler 无参，无法表达
+`klippy:notify_mcu_error(msg, details)` 这类带载荷事件（Q3）。
+
+实现开放事件总线（Q2）后，以下事件可按优先级逐个注册 handler。依赖关系标注在
+`[依赖]` 中；`—` 表示仅依赖 Q2，其他依赖的模块已标记为其他 TODO 条目。
+
+### 生命周期事件（最高优先级）
+
+| 事件名 | 触发时机 | 参数 | 上游位置 | 实现依赖 |
+|---|---|---|---|---|
+| `klippy:mcu_identify` | MCU identify 完成后 | 无 | `klippy/klippy.py:131` | Q2 |
+| `klippy:connect` | 配置装载完成、打印机即将就绪 | 无 | `klippy/klippy.py:132` | Q2 |
+| `klippy:ready` | 打印机进入 ready 状态 | 无 | `klippy/klippy.py:162` | Q2 |
+| `klippy:shutdown` | 进入 shutdown 状态 | 无 | `klippy/klippy.py:211` | Q2 |
+| `klippy:disconnect` | 运行结束/退出时 | 无 | `klippy/klippy.py:195` | Q2 |
+| `klippy:firmware_restart` | firmware restart 前 | 无 | `klippy/klippy.py:194` | Q2 |
+| `klippy:notify_mcu_error` | MCU 通信出错时 | `msg: str, details: dict` | `klippy/klippy.py:144,151` | Q2, Q3 |
+| `klippy:analyze_shutdown` | 进入 shutdown 后分析 | `msg: str, details: dict` | `klippy/klippy.py:216-220` | Q2, Q3 |
+
+> **说明**：`klippy:shutdown` 与 `klippy:analyze_shutdown` 的 handler 接收 `msg` + `details`
+> 载荷，当前 `PrinterEvent` 无参，必须等 Q2/Q3。
+
+### MCU 相关事件
+
+| 事件名 | 触发时机 | 参数 | 上游位置 | 实现依赖 |
+|---|---|---|---|---|
+| `klippy:mcu_identify` | 每个 MCU identify 后 | 无 | `klippy/mcu.py:797,929,1001` | Q2 |
+
+> 已由 MCU 层事件 `Starting` 覆盖部分语义，但上游的 `klippy:mcu_identify` 是
+> Printer 级事件，供 extras（probe、tmc、temperature_mcu 等）做初始化。
+
+### 运动/回零事件
+
+| 事件名 | 触发时机 | 参数 | 上游位置 | 实现依赖 |
+|---|---|---|---|---|
+| `homing:home_rails_begin` | 回零开始 | `homing_state` | `klippy/extras/homing.py:80` | Q2, C1 |
+| `homing:home_rails_end` | 回零结束 | `homing_state` | `klippy/extras/homing.py:148` | Q2, C1 |
+| `homing:homing_move_begin` | 回零移动开始 | `homing_state` | `klippy/extras/homing.py:210` | Q2, C1 |
+| `homing:homing_move_end` | 回零移动结束 | `homing_state` | `klippy/extras/homing.py:234` | Q2, C1 |
+| `stepper:sync_mcu_position` | stepper 位置同步 | `stepper` | `klippy/stepper.py:56` | Q2, C1 |
+| `stepper:set_dir_inverted` | 方向反转设置 | `stepper` | `klippy/stepper.py:153` | Q2, C1 |
+| `dual_carriage:update_kinematics` | IDEx 双滑车运动学更新 | — | `klippy/kinematics/idex_modes.py:383` | Q2, C1 |
+
+> 全部依赖 C1（toolhead + kinematics + homing），回零协议未实现前这些事件无消费者。
+
+### idle_timeout 事件
+
+| 事件名 | 触发时机 | 参数 | 上游位置 | 实现依赖 |
+|---|---|---|---|---|
+| `idle_timeout:ready` | idle_timeout 模块就绪 | 无 | `klippy/extras/idle_timeout.py:44` | Q2 |
+| `idle_timeout:idle` | 进入空闲状态 | 无 | `klippy/extras/idle_timeout.py:57` | Q2 |
+| `idle_timeout:printing` | 开始打印（恢复活动） | 无 | `klippy/extras/idle_timeout.py:95` | Q2 |
+
+> 需 idle_timeout 对象（`[idle_timeout]`），目前未实现。
+
+### 工具头事件
+
+| 事件名 | 触发时机 | 参数 | 上游位置 | 实现依赖 |
+|---|---|---|---|---|
+| `toolhead:manual_move` | 手动移动前 | `positions, speed` | `klippy/toolhead.py:390` | Q2, C1 |
+| `toolhead:set_position` | 设置位置（G92 等） | `positions, e` | `klippy/toolhead.py:416` | Q2, C1 |
+| `toolhead:sync_print_time` | print_time 更新 | `print_time` | `klippy/toolhead.py:446` | Q2, C1 |
+| `toolhead:update_extra_axes` | 额外轴位置更新 | `positions` | `klippy/toolhead.py:455` | Q2, C1 |
+
+> 全部依赖 C1（toolhead），无 toolhead 则无消费者。
+
+### gcode 事件
+
+| 事件名 | 触发时机 | 参数 | 上游位置 | 实现依赖 |
+|---|---|---|---|---|
+| `gcode:command_error` | gcode 命令错误 | `gcode_command` | `klippy/gcode.py:226` | Q2, G1b |
+| `gcode:debuginput_exit` | debuginput EOF | 无 | `klippy/gcode.py:433` | Q2, G1b |
+| `gcode:request_restart` | 请求重启 | 无 | `klippy/gcode.py:358` | Q2, G1b |
+
+> 依赖 G1b（gcode 调度器行为差异修复）和 GCodeIO（文件/伪 tty 输入）。
+
+### 工具/传感器事件
+
+| 事件名 | 触发时机 | 参数 | 上游位置 | 实现依赖 |
+|---|---|---|---|---|
+| `probe:update_results` | probe 测量完成 | `results` | `klippy/extras/probe.py:200` | Q2, endstop |
+| `extruder:activate_extruder` | 切换 active extruder | `extruder` | `klippy/kinematics/extruder.py:25` | Q2, C1 |
+| `stepper_enable:motor_off` | stepper 电机关闭 | `stepper_enable` | `klippy/extras/stepper_enable.py:120` | Q2, C1 |
+| `virtual_sdcard:reset_file` | VSD 文件重置 | 无 | `klippy/extras/virtual_sdcard.py:151` | Q2, sdcard |
+| `load_cell:calibrate` | 称重传感器校准 | 无 | `klippy/extras/load_cell.py:397` | Q2, ADC |
+| `load_cell:tare` | 称重传感器归零 | 无 | `klippy/extras/load_cell.py:404` | Q2, ADC |
+
+> 依赖各自模块（endstop、sdcard、ADC 等），不阻塞运动。
+
+### 显示/菜单事件（menu.py 内部）
+
+| 事件名 | 触发时机 | 参数 | 上游位置 | 实现依赖 |
+|---|---|---|---|---|
+| `menu:`（空名） | 菜单初始化 | `menu` | `klippy/extras/display/menu.py:346` | Q2, display |
+| `menu:populate` | 菜单填充 | `menu` | `klippy/extras/display/menu.py:754` | Q2, display |
+| `menu:init` | 菜单初始化 | `menu` | `klippy/extras/display/menu.py:722` | Q2, display |
+| `menu:begin` | 菜单开始 | `menu` | `klippy/extras/display/menu.py:712` | Q2, display |
+| `menu:exit` | 菜单退出 | `menu` | `klippy/extras/display/menu.py:913` | Q2, display |
+
+> 依赖 display/menu 模块，优先级最低。
+
+### 依赖关系总结
+
+```
+Q2（开放事件总线）
+├── klippy:* 生命周期事件（8个）—— 最高优先级，支撑所有 extras
+├── stepper:* —— 依赖 C1
+├── homing:* —— 依赖 C1
+├── toolhead:* —— 依赖 C1
+├── idle_timeout:* —— 依赖 idle_timeout 对象
+├── gcode:* —— 依赖 G1b
+├── probe:* —— 依赖 endstop
+├── extruder:* —— 依赖 C1
+├── stepper_enable:* —— 依赖 C1
+├── virtual_sdcard:* —— 依赖 sdcard
+├── load_cell:* —— 依赖 ADC
+└── menu:* —— 依赖 display
+
+Q3（带载荷事件）
+├── klippy:notify_mcu_error(msg, details)
+├── klippy:analyze_shutdown(msg, details)
+└── 任何需要传参的 handler
+```
 
 细节在各模块文档里；这里每条只留一行索引，最近完成的在前。
 

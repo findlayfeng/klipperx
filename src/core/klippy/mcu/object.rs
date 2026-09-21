@@ -36,6 +36,7 @@ use crate::core::klippy::config::mcu::McuConfig;
 use crate::core::klippy::config::value::ConfigValue;
 use crate::core::klippy::config::ConfigSection;
 use crate::core::klippy::error::KlippyError;
+use crate::core::klippy::event::stats::register_stats_logging;
 use crate::core::klippy::event::{IsShutdown, McuEvent, Shutdown, Starting};
 use crate::core::klippy::mcu::{
     ConfigBuilder, Dictionary, Mcu, McuChip, McuError, McuRestartMethod,
@@ -461,6 +462,10 @@ impl PrinterObject for McuObject {
             // this host sent is still in flight.
             self.bind_shutdown(&mcu)
                 .map_err(|err| KlippyError::Internal(err.to_string()))?;
+            // The firmware sends periodic `stats` reports (id=-12) with
+            // scheduler timing; register the handler so they are consumed
+            // rather than discarded as unhandled messages.
+            register_stats_logging(&mcu).map_err(|err| KlippyError::Internal(err.to_string()))?;
             self.set_status(&mcu);
             Ok(())
         })

@@ -247,7 +247,9 @@ toolhead / 开放事件）一起补，一部分是现在就独立可补的小行
       `src/spi_software.c`。
 - [x] `MCU_SPI_from_config`（`bus.py:124`）：从 section 读 `cs_pin` / `spi_speed` /
       `spi_bus` / 软件引脚，`cs_pin=None` 时不占用引脚的共享。
-- [ ] 旧式 `spi_set_software_bus`（rate 版）未处理（vendored 固件只有新式）。
+- [x] 旧式 `spi_set_software_bus`（rate 版）回退：`cmd::spi::add_software_bus` 按
+      `try_lookup_command` 二选一（新式传 host 算好的 `pulse_ticks`，旧式传 `rate`），
+      回退时打 deprecation 警告。只能单测——vendored 固件只有新式。
 - [ ] `spi_transfer_with_preface` 与 `setup_shutdown_msg`：`ConfigSpiShutdown` 命令
       已定义，但资源/消费者未接（设备需要在 shutdown 时发消息时才用得上）。
 
@@ -271,6 +273,8 @@ toolhead / 开放事件）一起补，一部分是现在就独立可补的小行
       （`bus.py:295-300`）；本 port 两条传输路径都返回 `McuError::I2cBus`，
       是否改为 shutdown 待定。`i2c_write` 的 retry 与 `async_write_only` 是可选分支。
 - [x] 软件 I2C（`i2c_software_{scl,sda}_pin`）：`i2c_set_sw_bus`，固件 `src/i2c_software.c`。
+- [x] 旧式 `i2c_set_software_bus`（rate 版）回退：`cmd::i2c::add_software_bus` 按
+      `try_lookup_command` 二选一，回退时打 deprecation 警告。只能单测。
 - [x] 通用构造器与 `[i2c_device <name>]` section（G）：读 `i2c_mcu` / `i2c_address` /
       `i2c_speed` / `i2c_bus` / `i2c_software_{scl,sda}_pin`，经 `McuObject::setup_i2c`
       构造 `McuI2c`；并注册 `IIC_WRITE` / `IIC_READ` 两个调试命令（上游无此 section
@@ -281,7 +285,8 @@ toolhead / 开放事件）一起补，一部分是现在就独立可补的小行
 `write=`）、`mcu/resource/i2c.rs`（`McuI2c` 资源 + `I2cMode`，新式组合传输只用 `i2c_read`）、
 `Mcu::try_lookup_command`（按字典原始格式串精确匹配，检测新旧传输风格）、
 `PrinterPins::resolve_bus_name` / `resolve_bus_value`（`i2c_bus=%u` 需 host 先解析枚举值）、
-`extras/i2c_device.rs`（`[i2c_device]` 构造器 + 调试命令）。
+`extras/i2c_device.rs`（`[i2c_device]` 构造器 + 调试命令）。软件总线的新旧命令选择
+（`i2c_set_sw_bus` ↔ `i2c_set_software_bus`）在 `cmd::i2c::add_software_bus`。
 
 #### F8 endstop / trsync（与 C1 共享）
 
@@ -562,6 +567,10 @@ ack」settle，并用 `Mcu::took_over_session()` 让 `rpi_usb` 判断“有没�
       未就绪提示与按 active 表遍历、`get_status` 按 active 表构建、未就绪时停机不打印、
       mux 默认项（`value=None`）不再不可达、行号命令行剥尾部 `*<digits>` 校验和；另删掉
       `src/core/parser.rs` 的未引用存根，developer-manual 补 `printer` 一节与分层表行。
+- **软件总线命令新旧兼容（F6/F7）**：`cmd::spi::add_software_bus` /
+      `cmd::i2c::add_software_bus` 按 `try_lookup_command` 在 `*_set_sw_bus`（host 算好
+      `pulse_ticks`）与 `*_set_software_bus`（固件收 `rate` 自行量化）之间二选一，回退时打
+      deprecation 警告；resource 只给 pins + speed，不感知新旧。
 - **SPI 总线（F6）**：`cmd/spi.rs`、`mcu/resource/spi.rs` 的 `McuSpi`（硬件/软件两条
       路，固件驱动 CS）、`extras/spi_device.rs`（`[spi_device]` 构造器 + `SPI_TRANSFER` /
       `SPI_SEND` 调试命令）；与 `[i2c_device]` 共用 `extras/bus_debug.rs`。

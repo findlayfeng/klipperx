@@ -23,8 +23,10 @@
 //! Newer firmware splits them into `i2c_write` / `i2c_read` + matching
 //! responses. The resource detects which at runtime via `try_lookup_command`.
 
+use tracing::warn;
+
 use crate::core::klippy::cmd::{McuCommand, McuResponse, Params};
-use crate::core::klippy::mcu::McuError;
+use crate::core::klippy::mcu::{ConfigBuilder, Mcu, McuError};
 use crate::core::klippy::msg::proto::ArgValue;
 
 // ===========================================================================
@@ -111,6 +113,118 @@ impl McuCommand for I2cSetSwBus {
             ArgValue::UInt32(self.pulse_ticks),
             ArgValue::UInt32(u32::from(self.address)),
         ]
+    }
+}
+
+// ===========================================================================
+// Software-bus compatibility
+// ===========================================================================
+
+/// The newer software-bus command's full declaration, for
+/// [`Mcu::try_lookup_command`].
+const SET_SW_BUS: &str = "i2c_set_sw_bus oid=%c scl_pin=%u sda_pin=%u pulse_ticks=%u address=%u";
+
+/// The older `i2c_set_software_bus` that `i2c_set_sw_bus` replaced.
+const SET_SOFTWARE_BUS: &str =
+    "i2c_set_software_bus oid=%c scl_pin=%u sda_pin=%u rate=%u address=%u";
+
+/// `i2c_set_software_bus oid=%c scl_pin=%u sda_pin=%u rate=%u address=%u` — the
+/// software-bus command firmware from before upstream commit `a9b04e85`
+/// (2025-04) uses.
+///
+/// It takes the wanted **rate** and quantizes it to a power-of-two delay in the
+/// firmware (base 100 kHz); [`I2cSetSwBus`] replaced it with a host-computed
+/// `pulse_ticks`. [`add_software_bus`] picks between them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct I2cSetSoftwareBus {
+    /// The I2C device oid.
+    pub oid: u8,
+    /// SCL pin number (firmware enumeration).
+    pub scl_pin: u32,
+    /// SDA pin number.
+    pub sda_pin: u32,
+    /// Clock frequency in Hz (the firmware quantizes it).
+    pub rate: u32,
+    /// 7-bit device address (0..=127).
+    pub address: u8,
+}
+
+impl McuCommand for I2cSetSoftwareBus {
+    const NAME: &'static str = "i2c_set_software_bus";
+
+    fn args(&self) -> Vec<ArgValue> {
+        vec![
+            ArgValue::UInt8(self.oid),
+            ArgValue::UInt32(self.scl_pin),
+            ArgValue::UInt32(self.sda_pin),
+            ArgValue::UInt32(self.rate),
+            ArgValue::UInt32(u32::from(self.address)),
+        ]
+    }
+}
+
+/// One software (bit-banged) I2C bus, as [`add_software_bus`] needs it.
+///
+/// The pins are already resolved to firmware numbers; the caller gives the
+/// wanted **speed in Hz** and does not choose a command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SoftwareI2cBus {
+    /// The I2C device oid.
+    pub oid: u8,
+    /// SCL pin number (firmware enumeration).
+    pub scl_pin: u32,
+    /// SDA pin number.
+    pub sda_pin: u32,
+    /// Clock frequency in Hz.
+    pub speed: u32,
+    /// 7-bit device address (0..=127).
+    pub address: u8,
+}
+
+/// Add the software-I2C bus config, in whichever spelling the firmware has.
+///
+/// `i2c_set_sw_bus` is preferred: it carries half the bit period in ticks, which
+/// the host computes from the measured clock ([`Mcu::seconds_to_clock`]), so the
+/// rate is exact. Firmware from before upstream commit `a9b04e85` (2025-04) has
+/// only `i2c_set_software_bus`; that one goes out with a deprecation warning,
+/// matching upstream's `deprecate_mcu_code`.
+///
+/// The caller passes pins and a speed and does not care which command is sent.
+///
+/// # Errors
+/// Returns [`McuError::Config`] when the firmware has neither command (the bus
+/// cannot be configured), or whatever the builder reports.
+pub fn add_software_bus(
+    builder: &ConfigBuilder,
+    mcu: &Mcu,
+    bus: &SoftwareI2cBus,
+) -> Result<(), McuError> {
+    if mcu.try_lookup_command(SET_SW_BUS).is_some() {
+        let pulse_ticks = mcu.seconds_to_clock(1.0 / bus.speed as f64 / 2.0)? as u32;
+        builder.add_config_cmd(&I2cSetSwBus {
+            oid: bus.oid,
+            scl_pin: bus.scl_pin,
+            sda_pin: bus.sda_pin,
+            pulse_ticks,
+            address: bus.address,
+        })
+    } else if mcu.try_lookup_command(SET_SOFTWARE_BUS).is_some() {
+        warn!(
+            "MCU '{}' has deprecated code (it is missing feature 'i2c_set_sw_bus'). \
+             Recompiling and flashing is recommended.",
+            mcu.name()
+        );
+        builder.add_config_cmd(&I2cSetSoftwareBus {
+            oid: bus.oid,
+            scl_pin: bus.scl_pin,
+            sda_pin: bus.sda_pin,
+            rate: bus.speed,
+            address: bus.address,
+        })
+    } else {
+        Err(McuError::Config(
+            "firmware has neither 'i2c_set_sw_bus' nor 'i2c_set_software_bus'".to_string(),
+        ))
     }
 }
 
@@ -292,7 +406,10 @@ impl I2cBusStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::klippy::mcu::Dictionary;
+    use crate::core::klippy::frame::Frame;
+    use crate::core::klippy::interface::devices::test::TestDevice;
+    use crate::core::klippy::interface::Interface;
+    use crate::core::klippy::mcu::{BuiltConfig, Dictionary};
     use crate::core::klippy::msg::parser::Parser;
     use serde_json::json;
     use std::sync::Arc;
@@ -325,6 +442,38 @@ mod tests {
         let mut parser = Parser::new();
         dictionary.install(&mut parser).unwrap();
         parser
+    }
+
+    /// A dictionary with the config-phase messages plus `commands`, so a
+    /// wrapper's choice can be built and inspected.
+    fn config_dictionary(commands: &[(&str, i64)]) -> Dictionary {
+        let mut map = serde_json::Map::new();
+        map.insert("allocate_oids count=%c".to_string(), json!(2));
+        map.insert("finalize_config crc=%u".to_string(), json!(6));
+        for (format, id) in commands {
+            map.insert((*format).to_string(), json!(id));
+        }
+        Dictionary::from_json(json!({
+            "commands": map,
+            "config": {"CLOCK_FREQ": 20000000}
+        }))
+        .unwrap()
+    }
+
+    /// An identified MCU that never talks to anything.
+    fn mcu_with(dictionary: Dictionary) -> Mcu {
+        let mcu = Mcu::for_test("test_mcu", Interface::new(TestDevice::new(Vec::new())));
+        mcu.install_dictionary(dictionary).unwrap();
+        mcu
+    }
+
+    /// The name and arguments of the config command at `index`.
+    fn built_command(mcu: &Mcu, built: &BuiltConfig, index: usize) -> (String, Vec<ArgValue>) {
+        let mut parser = Parser::new();
+        mcu.dictionary().unwrap().install(&mut parser).unwrap();
+        let frame = Frame::new(0, built.config[index].payload().to_vec());
+        let decoded = parser.decode(frame.into()).unwrap();
+        (decoded[0].0.name.clone(), decoded[0].1.clone())
     }
 
     #[test]
@@ -363,6 +512,104 @@ mod tests {
         let decoded = parser().decode(encoded).unwrap();
         assert_eq!(decoded[0].0.name, "i2c_set_sw_bus");
         assert_eq!(decoded[0].1, command.args());
+    }
+
+    #[test]
+    fn test_i2c_set_software_bus_encode() {
+        let command = I2cSetSoftwareBus {
+            oid: 1,
+            scl_pin: 5,
+            sda_pin: 6,
+            rate: 400_000,
+            address: 0x68,
+        };
+        // The old command is declared only by old firmware.
+        let parser = {
+            let dictionary = config_dictionary(&[(SET_SOFTWARE_BUS, 71)]);
+            let mut parser = Parser::new();
+            dictionary.install(&mut parser).unwrap();
+            parser
+        };
+        let encoded = parser
+            .encode(I2cSetSoftwareBus::NAME, &command.args())
+            .unwrap();
+        let decoded = parser.decode(encoded).unwrap();
+        assert_eq!(decoded[0].0.name, "i2c_set_software_bus");
+        assert_eq!(decoded[0].1, command.args());
+    }
+
+    #[tokio::test]
+    async fn test_add_software_bus_prefers_the_new_command() {
+        let mcu = mcu_with(config_dictionary(&[
+            (SET_SW_BUS, 40),
+            (SET_SOFTWARE_BUS, 41),
+        ]));
+        let builder = ConfigBuilder::new();
+
+        add_software_bus(
+            &builder,
+            &mcu,
+            &SoftwareI2cBus {
+                oid: 1,
+                scl_pin: 5,
+                sda_pin: 6,
+                speed: 400_000,
+                address: 0x68,
+            },
+        )
+        .unwrap();
+
+        let built = builder.build(&mcu).unwrap();
+        let (name, args) = built_command(&mcu, &built, 1);
+        assert_eq!(name, "i2c_set_sw_bus");
+        // `pulse_ticks` is `CLOCK_FREQ / speed / 2` = 20_000_000 / 400_000 / 2.
+        assert_eq!(args[3], ArgValue::UInt32(25));
+    }
+
+    #[tokio::test]
+    async fn test_add_software_bus_falls_back_to_the_old_command() {
+        let mcu = mcu_with(config_dictionary(&[(SET_SOFTWARE_BUS, 41)]));
+        let builder = ConfigBuilder::new();
+
+        add_software_bus(
+            &builder,
+            &mcu,
+            &SoftwareI2cBus {
+                oid: 1,
+                scl_pin: 5,
+                sda_pin: 6,
+                speed: 400_000,
+                address: 0x68,
+            },
+        )
+        .unwrap();
+
+        let built = builder.build(&mcu).unwrap();
+        let (name, args) = built_command(&mcu, &built, 1);
+        assert_eq!(name, "i2c_set_software_bus");
+        // The raw rate goes out; the firmware quantizes it.
+        assert_eq!(args[3], ArgValue::UInt32(400_000));
+    }
+
+    #[tokio::test]
+    async fn test_add_software_bus_without_either_command_is_an_error() {
+        let mcu = mcu_with(config_dictionary(&[]));
+        let builder = ConfigBuilder::new();
+
+        let err = add_software_bus(
+            &builder,
+            &mcu,
+            &SoftwareI2cBus {
+                oid: 1,
+                scl_pin: 5,
+                sda_pin: 6,
+                speed: 400_000,
+                address: 0x68,
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("neither"), "{err}");
     }
 
     #[test]

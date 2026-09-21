@@ -77,13 +77,13 @@ pub use adc::{AnalogInState, AnalogInStateOld, ConfigAnalogIn, QueryAnalogIn, Qu
 pub use clock::{ClockState, ClockSync, GetClock, McuClock};
 pub use gpio::{ConfigDigitalOut, QueueDigitalOut, SetDigitalOutPwmCycle, UpdateDigitalOut};
 pub use i2c::{
-    ConfigI2c, I2cBusStatus, I2cRead, I2cReadResponse, I2cResponse, I2cSetBus, I2cSetSwBus,
-    I2cTransfer, I2cWrite,
+    ConfigI2c, I2cBusStatus, I2cRead, I2cReadResponse, I2cResponse, I2cSetBus, I2cSetSoftwareBus,
+    I2cSetSwBus, I2cTransfer, I2cWrite, SoftwareI2cBus,
 };
 pub use pwm::{ConfigPwmOut, QueuePwmOut};
 pub use spi::{
-    ConfigSpi, ConfigSpiShutdown, ConfigSpiWithoutCs, SpiSend, SpiSetBus, SpiSetSwBus, SpiTransfer,
-    SpiTransferResponse,
+    ConfigSpi, ConfigSpiShutdown, ConfigSpiWithoutCs, SoftwareSpiBus, SpiSend, SpiSetBus,
+    SpiSetSoftwareBus, SpiSetSwBus, SpiTransfer, SpiTransferResponse,
 };
 pub use stepper::{
     ConfigStepper, QueueStep, ResetStepClock, SetNextStepDir, StepperGetPosition, StepperPosition,

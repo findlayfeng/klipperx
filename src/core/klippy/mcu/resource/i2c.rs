@@ -19,7 +19,8 @@
 use std::sync::{Arc, Mutex};
 
 use crate::core::klippy::cmd::i2c::{
-    ConfigI2c, I2cBusStatus, I2cRead, I2cSetBus, I2cSetSwBus, I2cTransfer, I2cWrite,
+    add_software_bus, ConfigI2c, I2cBusStatus, I2cRead, I2cSetBus, I2cTransfer, I2cWrite,
+    SoftwareI2cBus,
 };
 use crate::core::klippy::mcu::{ConfigBuilder, Mcu, McuError};
 use crate::core::klippy::pins::PrinterPins;
@@ -319,19 +320,21 @@ impl I2cState {
                 let sda_pin = pin_number(mcu, &sda, chip_name)
                     .map_err(|e| McuError::Config(format!("i2c sda pin: {e}")))?;
 
-                // `pulse_ticks` is half the I2C period in clock ticks, as
-                // upstream's `seconds_to_clock(1./speed/2)`.
-                let pulse_ticks = (mcu.clock_freq()? / speed as f64 / 2.0) as u32;
-
-                builder
-                    .add_config_cmd(&I2cSetSwBus {
+                // Which command that is — and whether the tick count or the
+                // raw rate goes out — is the command layer's business: newer
+                // firmware gets `i2c_set_sw_bus`, older gets
+                // `i2c_set_software_bus`.
+                add_software_bus(
+                    builder,
+                    mcu,
+                    &SoftwareI2cBus {
                         oid,
                         scl_pin,
                         sda_pin,
-                        pulse_ticks,
+                        speed,
                         address,
-                    })
-                    .map_err(|e| McuError::Config(format!("i2c_set_sw_bus: {e}")))?;
+                    },
+                )?;
             }
         }
 

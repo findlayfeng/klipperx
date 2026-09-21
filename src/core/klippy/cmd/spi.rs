@@ -24,8 +24,10 @@
 //! every device on the bus must agree on the mode, and the bit period is half
 //! the SPI clock period in firmware ticks.
 
+use tracing::warn;
+
 use crate::core::klippy::cmd::{McuCommand, McuResponse, Params};
-use crate::core::klippy::mcu::McuError;
+use crate::core::klippy::mcu::{ConfigBuilder, Mcu, McuError};
 use crate::core::klippy::msg::proto::ArgValue;
 
 // ===========================================================================
@@ -139,6 +141,126 @@ impl McuCommand for SpiSetSwBus {
 }
 
 // ===========================================================================
+// Software-bus compatibility
+// ===========================================================================
+
+/// The newer software-bus command's full declaration, for
+/// [`Mcu::try_lookup_command`].
+const SET_SW_BUS: &str =
+    "spi_set_sw_bus oid=%c miso_pin=%u mosi_pin=%u sclk_pin=%u mode=%u pulse_ticks=%u";
+
+/// The older `spi_set_software_bus` that `spi_set_sw_bus` replaced.
+const SET_SOFTWARE_BUS: &str =
+    "spi_set_software_bus oid=%c miso_pin=%u mosi_pin=%u sclk_pin=%u mode=%u rate=%u";
+
+/// `spi_set_software_bus oid=%c miso_pin=%u mosi_pin=%u sclk_pin=%u mode=%u rate=%u`
+/// — the software-bus command firmware from before upstream commit `abc76ee9`
+/// (2025-03) uses.
+///
+/// It takes the wanted **rate** and quantizes it to a power-of-two divider in
+/// the firmware; [`SpiSetSwBus`] replaced it with a host-computed `pulse_ticks`.
+/// [`add_software_bus`] picks between them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpiSetSoftwareBus {
+    /// The SPI device oid.
+    pub oid: u8,
+    /// MISO pin number (firmware enumeration).
+    pub miso_pin: u32,
+    /// MOSI pin number.
+    pub mosi_pin: u32,
+    /// SCLK pin number.
+    pub sclk_pin: u32,
+    /// SPI mode (CPOL/CPHA), 0..=3.
+    pub mode: u8,
+    /// Clock frequency in Hz (the firmware quantizes it).
+    pub rate: u32,
+}
+
+impl McuCommand for SpiSetSoftwareBus {
+    const NAME: &'static str = "spi_set_software_bus";
+
+    fn args(&self) -> Vec<ArgValue> {
+        vec![
+            ArgValue::UInt8(self.oid),
+            ArgValue::UInt32(self.miso_pin),
+            ArgValue::UInt32(self.mosi_pin),
+            ArgValue::UInt32(self.sclk_pin),
+            ArgValue::UInt32(u32::from(self.mode)),
+            ArgValue::UInt32(self.rate),
+        ]
+    }
+}
+
+/// One software (bit-banged) SPI bus, as [`add_software_bus`] needs it.
+///
+/// The pins are already resolved to firmware numbers; the caller gives the
+/// wanted **speed in Hz** and does not choose a command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SoftwareSpiBus {
+    /// The SPI device oid.
+    pub oid: u8,
+    /// MISO pin number (firmware enumeration).
+    pub miso_pin: u32,
+    /// MOSI pin number.
+    pub mosi_pin: u32,
+    /// SCLK pin number.
+    pub sclk_pin: u32,
+    /// SPI mode (CPOL/CPHA), 0..=3.
+    pub mode: u8,
+    /// Clock frequency in Hz.
+    pub speed: u32,
+}
+
+/// Add the software-SPI bus config, in whichever spelling the firmware has.
+///
+/// `spi_set_sw_bus` is preferred: it carries the bit period in ticks, which the
+/// host computes from the measured clock ([`Mcu::seconds_to_clock`]), so the
+/// rate is exact. Firmware from before upstream commit `abc76ee9` (2025-03) has
+/// only `spi_set_software_bus`; that one goes out with a deprecation warning,
+/// matching upstream's `deprecate_mcu_code`.
+///
+/// The caller passes pins and a speed and does not care which command is sent.
+///
+/// # Errors
+/// Returns [`McuError::Config`] when the firmware has neither command (the bus
+/// cannot be configured), or whatever the builder reports.
+pub fn add_software_bus(
+    builder: &ConfigBuilder,
+    mcu: &Mcu,
+    bus: &SoftwareSpiBus,
+) -> Result<(), McuError> {
+    if mcu.try_lookup_command(SET_SW_BUS).is_some() {
+        let pulse_ticks = mcu.seconds_to_clock(1.0 / bus.speed as f64)? as u32;
+        builder.add_config_cmd(&SpiSetSwBus {
+            oid: bus.oid,
+            miso_pin: bus.miso_pin,
+            mosi_pin: bus.mosi_pin,
+            sclk_pin: bus.sclk_pin,
+            mode: bus.mode,
+            pulse_ticks,
+        })
+    } else if mcu.try_lookup_command(SET_SOFTWARE_BUS).is_some() {
+        warn!(
+            "MCU '{}' has deprecated code (it is missing feature 'spi_set_sw_bus'). \
+             Recompiling and flashing is recommended.",
+            mcu.name()
+        );
+        builder.add_config_cmd(&SpiSetSoftwareBus {
+            oid: bus.oid,
+            miso_pin: bus.miso_pin,
+            mosi_pin: bus.mosi_pin,
+            sclk_pin: bus.sclk_pin,
+            mode: bus.mode,
+            rate: bus.speed,
+        })
+    } else {
+        Err(McuError::Config(
+            "firmware has neither 'spi_set_sw_bus' nor 'spi_set_software_bus'".to_string(),
+        ))
+    }
+}
+
+// ===========================================================================
 // Transfer commands
 // ===========================================================================
 
@@ -244,7 +366,10 @@ impl McuCommand for ConfigSpiShutdown {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::klippy::mcu::Dictionary;
+    use crate::core::klippy::frame::Frame;
+    use crate::core::klippy::interface::devices::test::TestDevice;
+    use crate::core::klippy::interface::Interface;
+    use crate::core::klippy::mcu::{BuiltConfig, Dictionary};
     use crate::core::klippy::msg::parser::Parser;
     use serde_json::json;
 
@@ -325,6 +450,140 @@ mod tests {
             pulse_ticks: 720,
         };
         assert_eq!(roundtrip(&command), command.args());
+    }
+
+    #[test]
+    fn test_spi_set_software_bus_encode() {
+        let command = SpiSetSoftwareBus {
+            oid: 1,
+            miso_pin: 4,
+            mosi_pin: 5,
+            sclk_pin: 3,
+            mode: 0,
+            rate: 1_000_000,
+        };
+        // The old command is declared only by old firmware.
+        let parser = {
+            let dictionary = config_dictionary(&[(SET_SOFTWARE_BUS, 70)]);
+            let mut parser = Parser::new();
+            dictionary.install(&mut parser).unwrap();
+            parser
+        };
+        let encoded = parser
+            .encode(SpiSetSoftwareBus::NAME, &command.args())
+            .unwrap();
+        let decoded = parser.decode(encoded).unwrap();
+        assert_eq!(decoded[0].0.name, "spi_set_software_bus");
+        assert_eq!(decoded[0].1, command.args());
+    }
+
+    #[tokio::test]
+    async fn test_add_software_bus_prefers_the_new_command() {
+        let mcu = mcu_with(config_dictionary(&[
+            (SET_SW_BUS, 40),
+            (SET_SOFTWARE_BUS, 41),
+        ]));
+        let builder = ConfigBuilder::new();
+
+        add_software_bus(
+            &builder,
+            &mcu,
+            &SoftwareSpiBus {
+                oid: 1,
+                miso_pin: 4,
+                mosi_pin: 5,
+                sclk_pin: 3,
+                mode: 0,
+                speed: 1_000_000,
+            },
+        )
+        .unwrap();
+
+        let built = builder.build(&mcu).unwrap();
+        let (name, args) = built_command(&mcu, &built, 1);
+        assert_eq!(name, "spi_set_sw_bus");
+        // `pulse_ticks` is `CLOCK_FREQ / speed` = 20_000_000 / 1_000_000.
+        assert_eq!(args.last(), Some(&ArgValue::UInt32(20)));
+    }
+
+    #[tokio::test]
+    async fn test_add_software_bus_falls_back_to_the_old_command() {
+        let mcu = mcu_with(config_dictionary(&[(SET_SOFTWARE_BUS, 41)]));
+        let builder = ConfigBuilder::new();
+
+        add_software_bus(
+            &builder,
+            &mcu,
+            &SoftwareSpiBus {
+                oid: 1,
+                miso_pin: 4,
+                mosi_pin: 5,
+                sclk_pin: 3,
+                mode: 0,
+                speed: 1_000_000,
+            },
+        )
+        .unwrap();
+
+        let built = builder.build(&mcu).unwrap();
+        let (name, args) = built_command(&mcu, &built, 1);
+        assert_eq!(name, "spi_set_software_bus");
+        // The raw rate goes out; the firmware quantizes it.
+        assert_eq!(args.last(), Some(&ArgValue::UInt32(1_000_000)));
+    }
+
+    #[tokio::test]
+    async fn test_add_software_bus_without_either_command_is_an_error() {
+        let mcu = mcu_with(config_dictionary(&[]));
+        let builder = ConfigBuilder::new();
+
+        let err = add_software_bus(
+            &builder,
+            &mcu,
+            &SoftwareSpiBus {
+                oid: 1,
+                miso_pin: 4,
+                mosi_pin: 5,
+                sclk_pin: 3,
+                mode: 0,
+                speed: 1_000_000,
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("neither"), "{err}");
+    }
+
+    /// A dictionary with the config-phase messages plus `commands`, so a
+    /// wrapper's choice can be built and inspected.
+    fn config_dictionary(commands: &[(&str, i64)]) -> Dictionary {
+        let mut map = serde_json::Map::new();
+        map.insert("allocate_oids count=%c".to_string(), json!(2));
+        map.insert("finalize_config crc=%u".to_string(), json!(6));
+        for (format, id) in commands {
+            map.insert((*format).to_string(), json!(id));
+        }
+        Dictionary::from_json(json!({
+            "commands": map,
+            "config": {"CLOCK_FREQ": 20000000}
+        }))
+        .unwrap()
+    }
+
+    /// An identified MCU that never talks to anything.
+    fn mcu_with(dictionary: Dictionary) -> Mcu {
+        let mcu = Mcu::for_test("test_mcu", Interface::new(TestDevice::new(Vec::new())));
+        mcu.install_dictionary(dictionary).unwrap();
+        mcu
+    }
+
+    /// The name and arguments of the config command at `index`.
+    fn built_command(mcu: &Mcu, built: &BuiltConfig, index: usize) -> (String, Vec<ArgValue>) {
+        let mut parser = Parser::new();
+        mcu.dictionary().unwrap().install(&mut parser).unwrap();
+        let frame = Frame::new(0, built.config[index].payload().to_vec());
+        let decoded = parser.decode(frame.into()).unwrap();
+        (decoded[0].0.name.clone(), decoded[0].1.clone())
     }
 
     #[test]

@@ -65,6 +65,7 @@ pub mod allocate_oids;
 pub mod clock;
 pub mod config;
 pub mod gpio;
+pub mod i2c;
 pub mod identify;
 pub mod pwm;
 pub mod shutdown;
@@ -74,6 +75,10 @@ pub mod uptime;
 pub use adc::{AnalogInState, AnalogInStateOld, ConfigAnalogIn, QueryAnalogIn, QueryAnalogInOld};
 pub use clock::{ClockState, ClockSync, GetClock, McuClock};
 pub use gpio::{ConfigDigitalOut, QueueDigitalOut, SetDigitalOutPwmCycle, UpdateDigitalOut};
+pub use i2c::{
+    ConfigI2c, I2cBusStatus, I2cRead, I2cReadResponse, I2cResponse, I2cSetBus, I2cSetSwBus,
+    I2cTransfer, I2cWrite,
+};
 pub use pwm::{ConfigPwmOut, QueuePwmOut};
 pub use stepper::{
     ConfigStepper, QueueStep, ResetStepClock, SetNextStepDir, StepperGetPosition, StepperPosition,

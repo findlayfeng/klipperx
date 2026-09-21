@@ -228,6 +228,54 @@ The value 'unknown' is not valid for PIN. Options: 'my_fan', 'my_light'
 
 ---
 
+### IIC_WRITE — 向 I2C 设备写字节（调试）
+
+```
+IIC_WRITE DEVICE=<name> DATA=<hex>
+```
+
+向已配置的 `[i2c_device <name>]` 发送字节，不读取。这是一个**多路命令**，每个 `[i2c_device <name>]` 会注册一个值。
+
+**参数：**
+
+| 参数 | 类型 | 必需 | 说明 |
+|------|------|------|------|
+| `DEVICE` | 字符串 | 是 | 设备名，对应 `[i2c_device <name>]` 的 `<name>` |
+| `DATA` | 十六进制字符串 | 是 | 要写的字节，两位一字节（如 `6b`、`0102ff`），空白会被忽略 |
+
+**示例：**
+```
+IIC_WRITE DEVICE=accel DATA=6b
+```
+
+---
+
+### IIC_READ — 写后读 I2C 设备（调试）
+
+```
+IIC_READ DEVICE=<name> [WRITE=<hex>] READ_LEN=<n>
+```
+
+先写 `WRITE` 指定的字节（通常是寄存器地址），再读回 `READ_LEN` 个字节，以十六进制输出；省略 `WRITE` 时直接读。
+
+**参数：**
+
+| 参数 | 类型 | 必需 | 说明 |
+|------|------|------|------|
+| `DEVICE` | 字符串 | 是 | 设备名 |
+| `WRITE` | 十六进制字符串 | 否 | 读取前写入的字节（寄存器地址） |
+| `READ_LEN` | 整数 (0..255) | 是 | 要读取的字节数 |
+
+**示例：**
+```
+IIC_READ DEVICE=accel WRITE=75 READ_LEN=1   ; 写 0x75 后读 1 字节
+// i2c read: 68
+```
+
+> `IIC_WRITE` / `IIC_READ` 是 KlipperX 专为真机自测增加的命令，上游没有对应 G-Code。
+
+---
+
 ## 命令注册说明
 
 KlipperX 的命令通过注册机制动态加载：

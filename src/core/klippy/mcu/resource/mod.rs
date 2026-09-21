@@ -24,9 +24,11 @@
 //! [`McuChip::attach`]: pin::McuChip::attach
 
 mod adc;
+mod i2c;
 mod pin;
 mod pwm;
 
 pub use adc::McuAdc;
+pub use i2c::{I2cMode, McuI2c, DEFAULT_SPEED};
 pub use pin::{McuChip, McuDigitalOut};
 pub use pwm::McuPwm;

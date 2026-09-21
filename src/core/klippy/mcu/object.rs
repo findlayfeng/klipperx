@@ -39,7 +39,7 @@ use crate::core::klippy::error::KlippyError;
 use crate::core::klippy::event::stats::register_stats_logging;
 use crate::core::klippy::event::{IsShutdown, McuEvent, Shutdown, Starting};
 use crate::core::klippy::mcu::{
-    ConfigBuilder, Dictionary, Mcu, McuChip, McuError, McuRestartMethod,
+    ConfigBuilder, Dictionary, I2cMode, Mcu, McuChip, McuError, McuI2c, McuRestartMethod,
 };
 use crate::core::klippy::pins::{PinError, PrinterPins, PINS_OBJECT};
 use crate::core::klippy::printer::{ConnectFuture, Printer, PrinterObject, RestartFuture};
@@ -130,6 +130,15 @@ impl McuObject {
     /// point: the config file is loaded before anything connects.
     pub fn config(&self) -> Arc<ConfigBuilder> {
         self.chip.config()
+    }
+
+    /// Build an I2C device on this MCU.
+    ///
+    /// The bus counterpart of the pin resources `pins` builds: a section that
+    /// owns an I2C device asks its MCU for it. Upstream's `MCU_I2C`
+    /// (`klippy/extras/bus.py:161`).
+    pub fn setup_i2c(&self, mode: I2cMode, address: u8) -> Arc<McuI2c> {
+        self.chip.setup_i2c(mode, address)
     }
 
     /// Snapshot a connected MCU's identify status for `objects/query`.

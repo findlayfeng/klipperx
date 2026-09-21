@@ -7,4 +7,5 @@
 //! imports them.
 
 pub mod board_pins;
+pub mod i2c_device;
 pub mod output_pin;

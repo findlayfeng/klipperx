@@ -224,7 +224,7 @@ mod tests {
         // The table is generated from the `section!` declarations; this pins the
         // order those declarations ask for, which the loader depends on.
         let ids: Vec<&str> = FACTORIES.iter().map(|(id, _)| *id).collect();
-        assert_eq!(ids, ["mcu", "output_pin", "board_pins"]);
+        assert_eq!(ids, ["mcu", "output_pin", "board_pins", "i2c_device"]);
     }
 
     #[test]
@@ -353,6 +353,23 @@ mod tests {
         assert_eq!(
             printer.objects(),
             ["gcode", "pins", "mcu", "board_pins", "board_pins second"]
+        );
+    }
+
+    #[test]
+    fn test_an_i2c_device_section_is_claimed_by_its_factory() {
+        // The F7 consumer: `[mcu]` registers the chip while it is built,
+        // `[i2c_device accel]` asks it for a bus and registers the debug
+        // commands.
+        let (printer, result) = load(
+            "[mcu]\nserial: /dev/a\n\
+             [i2c_device accel]\ni2c_address: 104\n",
+        );
+
+        result.unwrap();
+        assert_eq!(
+            printer.objects(),
+            ["gcode", "pins", "mcu", "i2c_device accel"]
         );
     }
 }

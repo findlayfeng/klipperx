@@ -118,9 +118,11 @@ impl Msg {
 
     /// Returns the format string by reconstructing it from name and params.
     ///
-    /// Note: `%*s` normalizes to `%s`, since [`ArgType`] does not distinguish
-    /// between the two string variants. Command names with no parameters are
-    /// returned as just the name.
+    /// Note: `%*s` normalizes to `%.*s`, since [`ArgType`] maps both to the
+    /// same binary buffer. Exact format matching therefore reads the
+    /// dictionary's raw string (`Mcu::try_lookup_command`), never this
+    /// reconstruction. Command names with no parameters are returned as just
+    /// the name.
     pub fn format(&self) -> String {
         let params = self
             .params
@@ -159,8 +161,18 @@ mod tests {
         assert_eq!(msg.params[3].1, ArgType::Int16);
         assert_eq!(msg.params[4].1, ArgType::Str);
         assert_eq!(msg.params[5].1, ArgType::UInt8);
-        assert_eq!(msg.params[6].1, ArgType::Str);
+        assert_eq!(msg.params[6].1, ArgType::Bytes);
         assert_eq!(msg.params[7].1, ArgType::Bytes);
+    }
+
+    #[test]
+    fn test_wildcard_string_is_a_binary_buffer() {
+        // `%*s` is the firmware's binary parameter (`PT_buffer`); only `%s` is
+        // text. `format_str` cannot reproduce `%*s`, so the round trip prints
+        // `%.*s` — exact matching goes through the dictionary instead.
+        let msg = Msg::parse(1, "debug_ping data=%*s").unwrap();
+        assert_eq!(msg.params[0].1, ArgType::Bytes);
+        assert_eq!(msg.format(), "debug_ping data=%.*s");
     }
 
     #[test]

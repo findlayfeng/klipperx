@@ -32,7 +32,7 @@ pub use config::{BuiltConfig, ConfigBuilder, ConfigCallback, Configured, PostIni
 pub use dictionary::{Dictionary, Enumeration, MessageDef, OutputDef};
 pub use error::{McuCallError, McuError};
 pub use object::{load_config, load_config_prefix, McuObject};
-pub use resource::{McuAdc, McuChip, McuDigitalOut, McuPwm};
+pub use resource::{I2cMode, McuAdc, McuChip, McuDigitalOut, McuI2c, McuPwm, DEFAULT_SPEED};
 pub use restart_method::McuRestartMethod;
 
 use crate::core::klippy::load::section;
@@ -755,6 +755,27 @@ impl Mcu {
         self.parser.lookup(name).is_some()
     }
 
+    /// Check whether the firmware implements `format`, without failing.
+    ///
+    /// Upstream's `MCU.try_lookup_command` (`klippy/mcu.py:1197`, wrapping
+    /// `MsgParser.lookup_command`, `klippy/msgproto.py:309`): the format's first
+    /// token names the message, and the **whole** string must then match the
+    /// firmware's declaration byte for byte — parameter names and specifiers
+    /// included (`i2c_transfer oid=%c write=%*s read_len=%u`). The dictionary is
+    /// where that exact wording survives; the parser indexes by bare name, so it
+    /// cannot answer this question.
+    ///
+    /// Returns `Some(())` on an exact match, `None` otherwise. This is how the
+    /// I2C/SPI layers detect legacy vs new command styles at runtime.
+    pub fn try_lookup_command(&self, format: &str) -> Option<()> {
+        let name = format.split_whitespace().next()?;
+        let dictionary = self.dictionary()?;
+        match dictionary.message(name) {
+            Some(def) if def.format == format => Some(()),
+            _ => None,
+        }
+    }
+
     /// Get the MCU name.
     pub fn name(&self) -> &str {
         &self.name
@@ -1093,6 +1114,37 @@ mod tests {
         assert!(!mcu.is_identified());
         assert!(mcu.parser.is_registered("identify"));
         assert!(mcu.parser.is_registered("identify_response"));
+    }
+
+    /// `try_lookup_command` matches the firmware's declaration exactly, which is
+    /// how the I2C layer tells legacy (`i2c_transfer`) from new
+    /// (`i2c_write`/`i2c_read`) transfer styles.
+    #[tokio::test]
+    async fn test_try_lookup_command_requires_the_exact_format() {
+        let mcu = Mcu::for_test("test_mcu", Interface::new(TestDevice::new(vec![])));
+        let dictionary = Dictionary::from_json(serde_json::json!({
+            "commands": {
+                "i2c_transfer oid=%c write=%*s read_len=%u": 43,
+                "i2c_write oid=%c data=%*s": 44
+            }
+        }))
+        .unwrap();
+        mcu.install_dictionary(dictionary).unwrap();
+
+        // The firmware's own wording matches.
+        assert!(mcu
+            .try_lookup_command("i2c_transfer oid=%c write=%*s read_len=%u")
+            .is_some());
+        // A different parameter name, specifier, or unknown message does not.
+        // The parser would still find `i2c_transfer` by its bare name, so these
+        // are exactly the cases a name-only lookup gets wrong.
+        assert!(mcu
+            .try_lookup_command("i2c_transfer oid=%c data=%*s read_len=%u")
+            .is_none());
+        assert!(mcu
+            .try_lookup_command("i2c_transfer oid=%c write=%s read_len=%u")
+            .is_none());
+        assert!(mcu.try_lookup_command("i2c_read oid=%c reg=%*s").is_none());
     }
 
     /// The shapes a real MCU produces for one request: the response, and the ack

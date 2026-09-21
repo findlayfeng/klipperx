@@ -16,8 +16,11 @@
 //! This module is an application concern that lives in the library because the
 //! library is already where this crate's application entry points live.
 
+use std::collections::BTreeMap;
+use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::sync::Mutex;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::debug;
@@ -103,17 +106,23 @@ fn detail(filter: &EnvFilter) -> LevelFilter {
 /// The level is the more detailed of what `--verbose` asks for and what
 /// `RUST_LOG` asks for; see [`filter_for`].
 ///
+/// `log_file` is `--logfile`: the same formatted lines are also appended to that
+/// file (upstream's `--logfile`, `klippy/klippy.py:294-345`). A file that cannot
+/// be opened is reported on stderr and the host keeps logging to the terminal,
+/// rather than refusing to start over a log path.
+///
 /// Installing twice is not an error: the second attempt is ignored, which is
 /// what a user of the library as a library will do.
-pub fn init(verbose: bool) {
+pub fn init(verbose: bool, log_file: Option<&Path>) {
     let filter = filter_for(verbose, std::env::var("RUST_LOG").ok().as_deref());
+    let output = LogOutput::new(log_file);
 
     tracing_subscriber::registry()
         .with(filter)
         .with(
             tracing_subscriber::fmt::layer()
                 .with_target(false)
-                .with_writer(HostOutput),
+                .with_writer(output),
         )
         .with(ToWindow)
         .try_init()
@@ -149,19 +158,73 @@ fn window() -> Option<UnboundedSender<Record>> {
         .clone()
 }
 
-/// Where the formatted output goes: stdout, or nowhere while a window is up.
-#[derive(Clone, Copy)]
-struct HostOutput;
+/// Where the formatted output goes: stdout (unless a window is up) and, when
+/// `--logfile` was given, that file too.
+#[derive(Clone)]
+struct LogOutput {
+    /// The open log file, shared with every writer the layer makes.
+    file: Option<Arc<Mutex<File>>>,
+}
 
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for HostOutput {
-    type Writer = Box<dyn Write + 'a>;
+impl LogOutput {
+    /// Open `path` for appending, or report on stderr and log to stdout only.
+    fn new(path: Option<&Path>) -> Self {
+        let file =
+            path.and_then(
+                |path| match OpenOptions::new().create(true).append(true).open(path) {
+                    Ok(file) => Some(Arc::new(Mutex::new(file))),
+                    Err(err) => {
+                        eprintln!("warning: cannot open log file {}: {err}", path.display());
+                        None
+                    }
+                },
+            );
+        Self { file }
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogOutput {
+    type Writer = Tee;
 
     fn make_writer(&'a self) -> Self::Writer {
-        if window().is_some() {
-            Box::new(std::io::sink())
-        } else {
-            Box::new(std::io::stdout())
+        Tee {
+            file: self.file.clone(),
         }
+    }
+}
+
+/// One formatted record's destination: stdout (or nowhere while a window is up)
+/// plus the log file.
+struct Tee {
+    file: Option<Arc<Mutex<File>>>,
+}
+
+impl Write for Tee {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        // A write to either destination failing must not lose the other, and
+        // must not make the tracing layer panic: a host that cannot write its
+        // log file still runs.
+        if window().is_none() {
+            let _ = std::io::stdout().write_all(buf);
+        }
+        if let Some(file) = &self.file {
+            let _ = file
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .write_all(buf);
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let _ = std::io::stdout().flush();
+        if let Some(file) = &self.file {
+            let _ = file
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .flush();
+        }
+        Ok(())
     }
 }
 
@@ -216,6 +279,90 @@ impl Visit for Message {
         if field.name() == "message" {
             self.0 = format!("{value:?}");
         }
+    }
+}
+
+// ===========================================================================
+// Rollover information
+// ===========================================================================
+
+/// The named blocks the log carries across a rollover.
+///
+/// Upstream's `bglogger.rollover_info` (`klippy/queuelogger.py:31-53`): a few
+/// named texts — the versions, the config, the connected clients — written at
+/// the top of a rotated log so a bug report has them without the whole file.
+/// Sorted by name, as upstream sorts them.
+static ROLLOVER: Mutex<BTreeMap<String, String>> = Mutex::new(BTreeMap::new());
+
+/// Set one named rollover block, or (`info` is `None`) remove it.
+pub fn set_rollover_info(name: &str, info: Option<&str>) {
+    let mut rollover = ROLLOVER.lock().unwrap_or_else(|poison| poison.into_inner());
+    match info {
+        Some(info) => {
+            rollover.insert(name.to_string(), info.to_string());
+        }
+        None => {
+            rollover.remove(name);
+        }
+    }
+}
+
+/// Forget every rollover block.
+///
+/// Upstream clears them at the top of each restart (`klippy/klippy.py:356`), so
+/// a block a previous printer set does not survive into the next one.
+pub fn clear_rollover_info() {
+    ROLLOVER
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clear();
+}
+
+/// Write the rollover blocks and the banner as one log record.
+///
+/// Upstream writes the same text when the log rotates
+/// (`klippy/queuelogger.py:49-53`). A host that rolls its log by restarting (the
+/// only rotation there is today) calls this at each start; the banner is what
+/// makes the seam visible in the file.
+pub fn write_rollover() {
+    let info = ROLLOVER.lock().unwrap_or_else(|poison| poison.into_inner());
+    if info.is_empty() {
+        return;
+    }
+    let mut block: String = info
+        .values()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join("\n");
+    block.push_str(&format!(
+        "\n=============== Log rollover at {} ===============",
+        asctime()
+    ));
+    tracing::info!("{block}");
+}
+
+/// The current local time as `time.asctime()` spells it.
+fn asctime() -> String {
+    // SAFETY: `localtime_r` is given a null-terminated-ish pointer to a `time_t`
+    // and a `tm` it may write; `strftime` writes into `buf` and reports how many
+    // bytes it used, which is bounded by the buffer length. The format string is
+    // a static C string.
+    unsafe {
+        let now = libc::time(std::ptr::null_mut());
+        let mut tm: libc::tm = std::mem::zeroed();
+        if libc::localtime_r(&now, &mut tm).is_null() {
+            return "?".to_string();
+        }
+        let mut buf = [0 as libc::c_char; 64];
+        let format = b"%a %b %e %H:%M:%S %Y\0";
+        let written = libc::strftime(
+            buf.as_mut_ptr(),
+            buf.len(),
+            format.as_ptr() as *const libc::c_char,
+            &tm,
+        );
+        let bytes: Vec<u8> = buf[..written].iter().map(|byte| *byte as u8).collect();
+        String::from_utf8_lossy(&bytes).into_owned()
     }
 }
 
@@ -326,5 +473,64 @@ mod tests {
         assert!(window().is_some());
         drop(guard);
         assert!(window().is_none());
+    }
+
+    #[test]
+    fn test_a_log_file_receives_the_formatted_bytes() {
+        use tracing_subscriber::fmt::MakeWriter;
+
+        let _slot = exclusive();
+        let dir = std::env::temp_dir().join(format!("klipperx-log-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.log");
+        let _ = std::fs::remove_file(&path);
+
+        // A window is up so the tee skips stdout: this test asserts the file
+        // side without echoing a line into the test output.
+        let (entries, _logs) = unbounded_channel();
+        let _guard = to_window(entries);
+        let output = LogOutput::new(Some(&path));
+        {
+            let mut writer = output.make_writer();
+            writer.write_all(b"hello\n").unwrap();
+            writer.flush().unwrap();
+        }
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello\n");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_a_log_file_that_cannot_be_opened_degrades_to_stdout() {
+        // A bad `--logfile` must not stop the host: the writer exists and just
+        // has no file behind it.
+        let output = LogOutput::new(Some(Path::new("/nonexistent/dir/klippy.log")));
+        assert!(output.file.is_none());
+    }
+
+    #[test]
+    fn test_rollover_info_is_sorted_and_cleared() {
+        let _slot = exclusive();
+        clear_rollover_info();
+        set_rollover_info("versions", Some("the versions"));
+        set_rollover_info("config", Some("the config"));
+
+        let (entries, mut logs) = unbounded_channel();
+        let guard = to_window(entries);
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(ToWindow), || {
+            write_rollover();
+            // Nothing to write once cleared: no second record.
+            clear_rollover_info();
+            write_rollover();
+        });
+        drop(guard);
+
+        let received: Vec<Record> = std::iter::from_fn(|| logs.try_recv().ok()).collect();
+        assert_eq!(received.len(), 1, "one rollover record: {received:?}");
+        let (level, text) = &received[0];
+        assert_eq!(*level, Level::Info);
+        // Sorted by name: `config` before `versions`.
+        assert!(text.starts_with("the config\nthe versions\n"), "{text}");
+        assert!(text.contains("Log rollover at"), "{text}");
     }
 }

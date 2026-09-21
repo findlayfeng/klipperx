@@ -24,11 +24,18 @@ struct Cli {
 fn main() {
     let cli = Cli::parse();
 
-    klipperx::logging::init(cli.verbose);
+    klipperx::logging::init(
+        cli.verbose,
+        cli.args.log_file.as_deref().map(std::path::Path::new),
+    );
 
-    if let Err(e) = klippy::run(cli.args, None) {
-        error!("Error: {}", e);
-        std::process::exit(1);
+    match klippy::run(cli.args, None) {
+        // The host decides its own exit code (`error_exit` is non-zero).
+        Ok(code) => std::process::exit(code),
+        Err(e) => {
+            error!("Error: {}", e);
+            std::process::exit(1);
+        }
     }
 }
 

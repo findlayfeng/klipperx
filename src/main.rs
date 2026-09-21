@@ -121,24 +121,40 @@ enum Commands {
 fn main() {
     let cli: Cli = Cli::parse();
 
-    klipperx::logging::init(cli.verbose);
+    klipperx::logging::init(cli.verbose, cli.log_file());
 
-    let result = match (cli.command, cli.host) {
+    let result: Result<i32, Box<dyn std::error::Error>> = match (cli.command, cli.host) {
         (Some(Commands::Klippy(args)), _) => run_host(args),
-        (Some(Commands::Api(args)), _) => client::run_api(args),
-        (Some(Commands::Console(args)), _) => client::run_console(args),
-        (Some(Commands::Stress(args)), _) => klipperx::stress::run(args),
+        (Some(Commands::Api(args)), _) => client::run_api(args).map(|()| 0),
+        (Some(Commands::Console(args)), _) => client::run_console(args).map(|()| 0),
+        (Some(Commands::Stress(args)), _) => klipperx::stress::run(args).map(|()| 0),
         // No subcommand: the arguments were the host's all along.
         (None, host) => run_host(host),
     };
-    if let Err(e) = result {
-        error!("Error: {}", e);
-        std::process::exit(1);
+    match result {
+        // The host decides its own exit code (`error_exit` is non-zero).
+        Ok(code) => std::process::exit(code),
+        Err(e) => {
+            error!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+impl Cli {
+    /// The `--logfile` this invocation was given, whichever spelling of the
+    /// host was used.
+    fn log_file(&self) -> Option<&std::path::Path> {
+        let path = match &self.command {
+            Some(Commands::Klippy(args)) => args.host.log_file.as_deref(),
+            _ => self.host.host.log_file.as_deref(),
+        };
+        path.map(std::path::Path::new)
     }
 }
 
 /// Run the host, with a window on it if one was asked for.
-fn run_host(args: HostArgs) -> Result<(), Box<dyn std::error::Error>> {
+fn run_host(args: HostArgs) -> Result<i32, Box<dyn std::error::Error>> {
     let windowed = args.tui && client::tui::is_available();
     if args.tui && !windowed {
         warn!("--tui needs a terminal on stdin and stdout; running without a window");
@@ -379,6 +395,20 @@ mod tests {
             }
             other => panic!("expected `console`, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_the_log_file_option_is_the_hosts_own_in_both_spellings() {
+        // `--logfile` belongs to the host, and the CLI has to find it whichever
+        // way the host was spelled: the log is opened before the host starts.
+        let host = parse(&["printer.cfg", "--logfile", "/tmp/k.log"]).expect("parses");
+        assert_eq!(host.log_file(), Some(std::path::Path::new("/tmp/k.log")));
+
+        let named = parse(&["klippy", "printer.cfg", "--logfile", "/tmp/k.log"]).expect("parses");
+        assert_eq!(named.log_file(), Some(std::path::Path::new("/tmp/k.log")));
+
+        // Without the option there is no file, which `info` reports as null.
+        assert_eq!(parse(&["printer.cfg"]).unwrap().log_file(), None);
     }
 
     #[test]

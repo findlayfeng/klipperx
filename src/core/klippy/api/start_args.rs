@@ -35,10 +35,13 @@ pub struct StartArgs {
 
 impl StartArgs {
     /// Gather the start arguments a host knows at startup.
-    pub fn collect(config_file: impl Into<String>) -> Self {
+    ///
+    /// `log_file` is the `--logfile` path, or `None` when the host logs to the
+    /// terminal only.
+    pub fn collect(config_file: impl Into<String>, log_file: Option<String>) -> Self {
         Self {
             config_file: config_file.into(),
-            log_file: None,
+            log_file,
             software_version: env!("CARGO_PKG_VERSION").to_string(),
             cpu_info: cpu_info(),
         }
@@ -102,7 +105,7 @@ model name\t: ARMv7 Processor rev 4 (v7l)
 
     #[test]
     fn test_collected_start_args_carry_the_config_file_and_a_version() {
-        let args = StartArgs::collect("/tmp/printer.cfg");
+        let args = StartArgs::collect("/tmp/printer.cfg", None);
 
         assert_eq!(args.config_file, "/tmp/printer.cfg");
         assert_eq!(args.log_file, None);
@@ -110,5 +113,12 @@ model name\t: ARMv7 Processor rev 4 (v7l)
         // The CPU description depends on the machine, so only its shape is
         // pinned here; `parse_cpu_info` above covers the text.
         assert!(args.cpu_info.contains("core"), "{}", args.cpu_info);
+    }
+
+    #[test]
+    fn test_a_log_file_reaches_the_start_args() {
+        let args = StartArgs::collect("/tmp/printer.cfg", Some("/tmp/klippy.log".to_string()));
+
+        assert_eq!(args.log_file.as_deref(), Some("/tmp/klippy.log"));
     }
 }

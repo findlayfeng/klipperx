@@ -17,22 +17,23 @@
 
 | # | 框架 | 对应 TODO | 框架边界（定什么） | 首个模块（验收） | 之后铺开 | 依赖 |
 |---|---|---|---|---|---|---|
-| **FW1** | 配置装载框架收尾 | C2 | option 访问追踪当 schema、多住户（`[printer]`/`pins`/`configfile`/`toolhead`）、未认领 section/option 报错 | `[printer]` + `[stepper_x]` 能装载并过校验 | 各 extras 的 option schema（H1–H12） | — |
-| **FW2** | 对象模型收尾 | Q4、Q5 | `get_status` 的返回形状（`Value` vs typed）、`lookup_objects(module)` 前缀遍历与反射 | `objects/query` 形状定案；反射读到某个对象 | `gcode_macro`、display 菜单、宏变量 | — |
-| **FW3** | 错误词汇框架 | A2 | `CommandError`/`ConfigError` 分层、`Internal` 收敛、handler 异常 → `invoke_shutdown` | 一条 gcode 参数错误报 `CommandError` 且不关停 | 全树的错误分支 | — |
+| **FW1** | 配置装载框架收尾 | C2 | option 访问追踪当 schema（`ConfigWrapper` + `AccessTracking`）、住户与阶段（`phase`/`object`，对象名可≠节名）、未认领 section/option 报 `ConfigError`、`configfile` 对象 | `[output_pin fan]` 多一个选项报选项错、`objects/list` 含 `configfile` 且 `settings`/`config` 形状对；`[printer]`→`toolhead` 的晚阶段住户有装载器单测 | 各 extras 的 option schema（H1–H12）；`[printer]`/toolhead 本体随 C1 接入 | FW3（共用 `ConfigError`） |
+| **FW2** | 对象模型收尾 | Q4、Q5 | Q4 定案 `Value`；Q5 加 `lookup_objects(module)` 前缀遍历与 `statuses()` 快照 | `objects/query` 形状不变；`lookup_objects("mcu")` 前缀遍历与反射读状态有单测 | `gcode_macro` 的 `printer.objects` 模板视图、display 菜单、宏变量 | — |
+| **FW3** | 错误词汇框架 | A2 | `CommandError`/`ConfigError` 分层、`KlippyError::Config`、`Internal` 收敛、handler/endpoint 异常 `catch_unwind` → `invoke_shutdown`、config 错走 `set_error_state`（`PrinterState::Error`） | 参数错报 `CommandError` 且不停机；坏配置 / connect 期 config 错报 `error`（可 RESTART）；panic 的 handler / endpoint 触发 `invoke_shutdown` | 全树的错误分支 | — |
 | **FW4** | G-Code 框架收尾 | G1b（框架部分） | `GCodeIO` 输入抽象（伪 tty/文件/ack/`stats gcodein`）、参数访问器全覆盖、`create_gcode_command`、`gcode:*` 事件触发点 | `gcode_macro` 最小宏 / `M115` 的 ack | 全部 gcode extras（H3、H8…） | FW1、FW3 |
 | **FW5** | 运动框架（最重） | C1（框架部分）、H12 | toolhead 骨架、`Kinematics` trait、stepper 句柄、trapq/step 生成（chelper 重写）、`clocksync`、`mathutil`/`Coord` | `cartesian` + `[stepper_x/y/z]` + `[extruder]`，`G28`/`G1` 跑通 | `kinematics/*` 其余、H9、H10 | FW1 |
 | **FW6** | 资源与触发框架 | F3、F8 | 命令队列/print_time 同步输出（`MCU_bus_digital_out`）、`TriggerDispatch`/`MCU_trsync`、endstop 接口 | 一个 endstop + `query_endstops/status` | homing/probe、运动同步 `SET_PIN` | FW5 |
-| **FW7** | MCU 与传输框架收尾 | B2、D3 | `emergency_stop` 对象、本地 shutdown 标志、带载荷错误上报、固件 `reset` 优先、RTO 定时重传 | `emergency_stop` 对象 + 端点 | TMC/传感器等资源 | — |
+| **FW7** | MCU 与传输框架收尾 | B2、D3 | `emergency_stop` 对象（`klippy:shutdown` → 固件 `emergency_stop`）、本地 shutdown 标志、`emergency_stop` 端点、带载荷错误上报；RTO 定时重传与固件 `reset` 优先未做 | `emergency_stop` 端点使打印机进 shutdown；主机停机向固件发 `emergency_stop`，固件自报停机不回发 | TMC/传感器等资源 | — |
 | **FW8** | 主机层与重启框架 | D1、D2、Q6 | `StartArgs` 全量、rollover info、`--logfile` 日志层、退出码语义、`rpi_usb` 连接期门控/CRC/重启后订阅 | `--logfile` 落盘 + `info` 的 rollover | 日志、Moonraker 兼容 | — |
 | **FW9** | API 框架收尾 | B4（框架部分） | `register_remote_method` 与推送、mux 端点注册机制、`emergency_stop` 端点 | `register_remote_method` + 推送 | `pause_resume/*`、`*/dump_*` 等消费者 | FW7 |
 
 > **怎么验收**：每个框架都以「最小模块在真机/测试设备上跑通」为准，不以“代码写完”为准。
 > 例如 FW5 的验收是 `G28`/`G1` 真的动了步进，而不是 `Kinematics` trait 编译通过。
 
-> **建议顺序**：**FW1/FW3** 打底（配置与错误，最底层）→ **FW2/FW7/FW8** 可并行
+> **建议顺序**：**FW1/FW3**（配置与错误，最底层）✅ 已完成 → **FW2/FW7/FW8** 可并行
 > （对象模型 / MCU / 主机层）→ **FW4**（G-Code，依赖 FW1+FW3）→ **FW5**（运动，最重，
 > 依赖 FW1）→ **FW6** → **FW9**。FW5 与 FW4 都依赖 FW1；FW6 只能等 FW5。
+> FW1 的 `[printer]`/toolhead 住户与 FW3 的剩余收敛点见 C2/A2。
 
 > **未决问题里属于框架决策的**：**Q4**（status 形状，FW2）、**Q5**（反射，FW2）、
 > **Q6**（退出语义，FW8）；其余 Q 已解决或属模块。
@@ -72,8 +73,8 @@ H1–H12 是[上游功能覆盖审计](docs/work-log/2026-09-21-upstream-coverag
 | # | 事项 | 依赖 |
 |---|---|---|
 | C1 | toolhead 与 kinematics | — |
-| C2 | 配置装载收尾（option 校验、第二个住户 / `[printer]`） | C1 |
-| A2 | 错误词汇（`CommandError` / `ConfigError`） | — |
+| C2 | 配置装载剩余（`[printer]`/toolhead 住户、autosave/`SAVE_CONFIG`/`deprecate`、wrapper 的 choice/range 文案） | C1 |
+| A2 | 错误词汇剩余（`lookup_object` config error、`Internal` 剩余收敛点） | — |
 | B2 | MCU 剩余：`emergency_stop` 对象/端点、`last_stats`、错误载荷、本地 shutdown 标志、`command` 的固件 `reset` | — |
 | D1 | 主机层 start args / rollover / `--logfile` | — |
 | D2 | 重启循环剩余（`rpi_usb` 连接期门控、CRC 不一致的处理、重启后的输出订阅） | — |
@@ -176,17 +177,31 @@ H1–H12 是[上游功能覆盖审计](docs/work-log/2026-09-21-upstream-coverag
 
 ### A2 错误词汇（框架 FW3）
 
-- [ ] `CommandError` / `ConfigError`（上游 extras 里 94 / 41 处）；`KlippyError` 现在只有
-      通信类 5 个变体（`src/core/klippy/error.rs`）。
-- [ ] 借 `KlippyError::Internal` 的地方已经出现，是这条的验收点：`Printer::add_object`
-      的重复名（`printer.rs` 的 TODO）、`load.rs` 的工厂拒绝与未认领 section（`load.rs`
-      的 `TODO`）、`McuObject::connect` 的 section 解析。
+- [x] **`ConfigError` 与分层**：`error.rs` 新增 `ConfigError`，`KlippyError` 增 `Config` 变体；
+      工厂、`load.rs`、`Printer::add_object`、`McuConfig::new` 从 `Internal` 改为 `ConfigError`
+      （上游 `add_object` 重复名也报 config error）。
+- [x] **handler 异常 → `invoke_shutdown`**：`gcode.rs` 的 `invoke_handler` 用 `catch_unwind` 包住
+      handler，panic 报 `Internal error on command:"X"` 并 `invoke_shutdown`；API 侧 `Api::dispatch`
+      同样兜底，经 `Api::set_internal_error_hook`（由 `api::register` 指向 `invoke_shutdown`）
+      报 `Internal Error on WebRequest: <method>`。
+- [x] **config 错与 shutdown 分离**：新增 `Printer::set_error_state`（用上此前从未赋值的
+      `PrinterState::Error`）；`load_config` 失败与 `connect` 期的 `KlippyError::Config` 走它，
+      只有真正的内部错才 `invoke_shutdown`。
+- [ ] **`lookup_object` 未命中**：上游 `lookup_object` 未命中报 config error；本仓库仍是 `Option`，
+      按需加 `lookup_object_or_config_error`（消费者出现时）。
+- [ ] **`Internal` 收敛的剩余点**：`mcu/object.rs` 的若干包装（`config.open()` 等）仍按 `Internal`/
+      `Connection` 混用，随 FW7 校对。
 
 ### B2 MCU 关闭与错误上报（剩余，框架 FW7）
 
-- [ ] **`emergency_stop` / `clear_shutdown` 的对象与端点**：`cmd/shutdown.rs` 的两个命令现在
-      只有 `configure` 的复位路径在用 `emergency_stop`；还缺“主机侧停机时通知 MCU”与
-      `emergency_stop` 端点（端点本身见 B4，上游 `klippy/mcu.py:801-802` `:883`）。
+- [x] **`emergency_stop` / `clear_shutdown` 的对象与端点**：`emergency_stop` 端点已加
+      （`api/endpoints/emergency_stop.rs`，进 shutdown 并回 `{}`）；每个 `McuObject` 由工厂在
+      `klippy:shutdown` 上注册处理器，向固件发 `emergency_stop`（`mcu/object.rs` 的
+      `on_host_shutdown`）。`clear_shutdown` 仍只被 `configure` 的复位路径使用。
+- [x] **本地 shutdown 标志**：`McuObject::is_shutdown`（`Arc<AtomicBool>`，供 `'static` 事件
+      处理器共享）+ `force_local_shutdown`；固件自报 `shutdown`/`is_shutdown` 时置位，
+      `on_host_shutdown` 据此不回发。`bind_shutdown` 仍在 `configure` 之后绑定（足够安全）；
+      要提前到 identify 之后，再靠标志区分自己发的停止——留作可选项。
 - [ ] **`last_stats` 仍未报**：`stats` 事件已在 `McuObject::connect` 中注册 handler
       （`register_stats_logging`），但只打日志不上报。上游由 `MCUStatsHelper` 累计
       （`klippy/mcu.py:912` `:974-975`），`get_status` 多一个 `last_stats`
@@ -202,9 +217,6 @@ H1–H12 是[上游功能覆盖审计](docs/work-log/2026-09-21-upstream-coverag
       固件的 `reset`（真重启 MCU，`HF_IN_SHUTDOWN`）。`restart_method == command` 的
       `firmware_restart` 已在**拆机之前**用活连接发 `reset`
       （`McuObject::before_firmware_restart`），但一般的配置握手路径还没有。
-- [ ] **reset 期间没有本地 shutdown 标志**：现在靠「`configure` 完成后才 `bind_shutdown`」的
-      时序规避；隐式、无测试，recv 一旦改成缓冲/异步就会把自发的 `emergency_stop` 误报成
-      `MCU … restarted`。上游有 `_is_shutdown`（`klippy/mcu.py:893-895`）。
 
 ### G1b gcode 调度器与上游的行为差异（框架部分 FW4）
 
@@ -422,11 +434,18 @@ kinematics 已随 Printer 重构删除，从这里重新开始：
 
 ### C2 配置装载收尾（框架 FW1）
 
-- [ ] **option 级校验**：上游拿访问追踪当 schema（`klippy/configfile.py:435-441`），
-      `ConfigSection` 还没有访问记录，未做。
-- [ ] **住户只有 MCU**：上游在 `_read_config` 里显式加载的 `pins` / `configfile` /
-      `toolhead` 还没有入口，所以任何真实 printer.cfg 现在都会在未认领的 section 上报错；
-      第二个住户进来时按同一张表补（C1 的 toolhead 就是下一个）。
+- [x] **option 级校验**：访问追踪当 schema 已落地：`ConfigWrapper`（类型化 getter 一处解析并记帐）、
+      `AccessTracking`（键小写化，值为解析后的 JSON）、`check_unused`（`config/validate.rs`），
+      未认领选项报上游原文 `Option 'x' is not valid in section 'y'`。
+- [x] **住户与阶段**：`section!` 新增 `phase = early|generic|late` 与 `object = "<name>"`，
+      装载器按阶段遍历、按声明名注册；`configfile` 作为无节对象在 `gcode` 之后注册。
+- [x] **`configfile` 对象**：`get_status` 的 `settings`/`config`/`warnings` 已接，`objects/list` 可见。
+- [ ] **`[printer]` / toolhead 本体**：晚阶段住户的机制已就绪，但 `[printer]` 的消费者是 C1 的 toolhead；
+      接入时只需一条 `section!("printer", phase = late, object = "toolhead", load = …)`。
+- [ ] **autosave / `SAVE_CONFIG` / `deprecate`**：`configfile` 的剩余状态与写入路径，
+      属模块而非框架，单列（依赖 FW1）。
+- [ ] **`getchoice` 与范围/列表上限**：wrapper 目前只做类型解析 + 两个自定义范围检查；
+      上游的 `minval/maxval/above/below/count` 统一文案随各 extras 的 option schema 补。
 
 ### D1 主机层 start args / rollover / 日志（框架 FW8）
 
@@ -460,6 +479,18 @@ kinematics 已随 Printer 重构删除，从这里重新开始：
       但 `gcode/subscribe_output` 的处理器挂在被重建的 `GCodeDispatch` 上，重启后静默失效，
       要客户端重新订阅。上游靠 socket 重绑让客户端重连、重订阅；我们要么在客户端收到
       `klippy:ready` 后重订阅，要么把输出订阅表移到连接上。
+- [ ] **真板连续启动的抖动（FW1/FW3 核对时发现，基线同样复现）**：STM32F103 +
+      `restart_method: command` 上把主机**紧接着上一次**再启动，偶发到不了 ready：
+      ① `MCU 'mcu' shutdown: Rescheduled timer in the past`——上一次 `klipperx stress --task step`
+      留在固件里的 `queue_step` 定时器在接管/复位后触发（日志里仍有 `stats count=348`）；
+      ② `timeout: no response for config within 5s`。两次启动间隔 ~6 s 则 10/10 成功。
+      基线 `cf920bd` 用同一块板、同一份配置也能复现，属 D2/D3 的复位与接管路径，不是
+      FW1/FW3 引入；目标是能在「刚被上一条会话驱动的板子」上稳定起来（对齐上游先
+      `request_exit('firmware_restart')` 让循环做物理复位）。
+- [ ] **字典装载前的固件输出被记成 `Decode error`**：接管一块还在跑的板子时，`stats`（-12）
+      与 `shutdown`（-13）先于 identify 装上的字典到达，`Parser::decode` 只能打
+      `ERROR Decode error: Unknown message id: -N`。这是预期流量（上游此时也没装上字典），
+      应降为 debug，或在 identify 前先识别/缓存这几个负 id。
 
 ### D3 `command` 接管一块还在跑的板子（框架 FW7）
 
@@ -645,11 +676,15 @@ ack」settle，并用 `Mcu::took_over_session()` 让 `rpi_usb` 判断“有没�
       随 Q2 一并解决。处理器签名改为 `Fn(&KlippyEvent)`，带载荷事件读变体字段；
       `mcu_identify`、`analyze_shutdown` 与 `notify_mcu_error` 均已触发。原 `PrinterEvent`
       已删除。
-- [ ] **Q4 `get_status` 的返回形状**：`serde_json::Value`（贴上游、客户端零适配）还是
-      typed + serde。
-- [ ] **Q5 要不要反射式能力**：`lookup_objects(module)` 前缀遍历、`gcode_macro` 的
-      `printer.objects`（`klippy/extras/gcode_macro.py:41`）。**部分已做**：F2 为了
-      `pins` 加了 `Printer::lookup_object_as::<T>(name)`（单名取回具体类型）；前缀遍历仍未定。
+- [x] **Q4 `get_status` 的返回形状**：选定 `serde_json::Value`（贴上游、客户端零适配）。
+      typed + serde 会把每个对象的状态变成一套并行类型，而状态本来就是给客户端看的 JSON；
+      typed 只在模块内部需要时用（如 `McuConfig`），不作用于 `get_status`。
+- [x] **Q5 要不要反射式能力**：要，但只做**读**，不做动态属性。已加
+      `Printer::lookup_objects(module)`（前缀遍历，`klippy/klippy.py:81-88`）与
+      `Printer::statuses(eventtime)`（一次取全部可查对象的状态），加上已有的
+      `lookup_object` / `lookup_object_as::<T>` / `status_of`。`gcode_macro` 的
+      `printer.objects` 模板视图（`klippy/extras/gcode_macro.py:13-45`）在其上实现，
+      写能力（模板改对象）不做。
 - [ ] **Q6 退出结果的语义**：`"exit" / "error_exit" / "firmware_restart"` 由谁解释、
       `run()` 的返回值怎么变成进程退出码（`klippy/klippy.py:355-370`，`error_exit` 退 -1）。
 
@@ -781,6 +816,30 @@ ack」settle，并用 `Mcu::took_over_session()` 让 `rpi_usb` 判断“有没�
 ## 已完成（留档）
 
 细节在各模块文档里；这里每条只留一行索引，最近完成的在前。
+
+- **MCU 停机与 `emergency_stop`（FW7）**：新增 `emergency_stop` 端点（进 shutdown 并回 `{}`）；
+      每个 `McuObject` 由工厂在 `klippy:shutdown` 注册处理器，向固件发 `emergency_stop`；
+      新增 `is_shutdown`（`Arc<AtomicBool>`）与 `force_local_shutdown`，固件自报停机时不回发
+      （`api/endpoints/emergency_stop.rs`、`mcu/object.rs`）。
+- **对象模型反射（FW2）**：Q4 定案 `get_status -> serde_json::Value`；新增
+      `Printer::lookup_objects(module)`（前缀遍历）与 `Printer::statuses(eventtime)`（一次取
+      全部可查对象状态），供 `gcode_macro` 的 `printer.objects` 等消费者；Q5 定为只读反射
+      （`printer.rs`）。
+
+- **错误词汇框架（FW3）**：`ConfigError` + `KlippyError::Config`；`Printer::add_object` 重复名、
+      `load.rs` 工厂拒绝/未认领 section、`McuConfig::new` 都改报 config error；`gcode.rs`
+      `invoke_handler` 与 `Api::dispatch` 用 `catch_unwind` 兜底（panic → `invoke_shutdown`）；
+      API 侧新增 `Api::set_internal_error_hook`；新增 `Printer::set_error_state`，坏配置/connect 期
+      config 错报 `error`（可 RESTART）而不是 shutdown（`error.rs`、`printer.rs`、`gcode.rs`、
+      `crates/klippy-api/src/registry.rs`、`klippy.rs`、`config/mcu.rs`、`mcu/object.rs`）。
+- **配置装载框架（FW1）**：`ConfigWrapper`（类型化 getter 同时记账）+ `AccessTracking`（键小写化、
+      值为解析后的 JSON）+ `check_unused`（section/option 未认领报错）；`section!` 增 `phase`/`object`，
+      装载器按 early/generic/late 分阶段并支持对象名≠节名；新增 `configfile` 对象（`settings`/`config`）；
+      `McuObject` 工厂预解析 `[mcu]` 以便在装载期记账，`connect` 仍只开设备
+      （`config/{access,wrapper,validate,object}.rs`、`load.rs`、`build.rs`、`printer.rs`）。
+      真板（STM32F103）核对：正常配置 10/10 `ready`（与基线交替），`objects/list` 含 `configfile` 且
+      `settings` 形状对，拼错选项报 `error`（可 `RESTART`）、`SET_PIN` 仍可用；
+      连续复位抖动的两个新发现记入 D2。
 
 - **I2C 总线错误停机（F7）**：`McuI2c::transfer`/`write` 非 SUCCESS 时按上游
       `invoke_shutdown`；探测用的 `transfer_without_shutdown`/`write_without_shutdown`

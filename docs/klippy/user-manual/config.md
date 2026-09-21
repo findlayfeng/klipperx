@@ -88,6 +88,28 @@ points:
 [exclude_object]
 ```
 
+## 选项校验
+
+装载配置时，**每个 section 与每个选项都必须被某个模块读到**：
+
+- 没有任何对象对应的 section（且没有模块读它）→ `Section 'xxx' is not a valid config section`；
+- 某个 section 里没人读的选项（通常是拼写错误）→ `Option 'xxx' is not valid in section 'yyy'`。
+
+校验**不**在装载时“提前放行”任何选项，所以一个拼错的键不会被默默忽略——这正是它存在的意义。
+有默认值的选项（如 `[output_pin]` 的 `value`）算作已读，不需要写出来。
+
+配置出错时打印机进入 `error` 状态（`info` 的 `state` 为 `error`，不是 `shutdown`）：
+修正文件后用 `RESTART` 重载即可，不必重启进程。这与 G-code 参数错误（`!!` 回复、不停机）
+和真正的内部错误（停机，`state` 为 `shutdown`）是三条不同的路。
+
+`configfile` 是内置的只读对象，`objects/query configfile` 可读到：
+
+| 字段 | 含义 |
+|------|------|
+| `config` | 配置文件的每个 section / 选项原文 |
+| `settings` | 各模块实际读到的选项及其解析后的值 |
+| `warnings` | 弃用等警告（当前恒为空） |
+
 ## MCU 连接方式
 
 `[mcu]` 节的连接参数、固件重启方式、udev 规则等详细说明已移至独立文件，[参见 → MCU 连接方式](mcu-connection.md)。

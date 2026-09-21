@@ -121,6 +121,19 @@ let parser_for_task = parser.clone();   // 同一个 Arc<Mutex<MsgMap>>
 
 `McuError::source()` 会继续向下暴露 `MsgError` / `McuCallError`，便于 `anyhow` 之类的链式错误输出。
 
+网络层之上还有一层**主机错误词汇**，它决定错误把机器带到哪个状态（`core/klippy/error.rs`）：
+
+| 错误 | 谁造成 | 结果 |
+|------|--------|------|
+| `gcode::CommandError` | 客户端的 G-code | 拒绝这一行（`!!`），不停机 |
+| `ConfigError` | 配置文件 | `error` 状态（可 `RESTART`），不触发 shutdown |
+| `KlippyError::{Connection,Protocol,Request,Parse,Config}` | MCU / 链路 / 连接期配置 | `error` 状态（MCU 错误先 `klippy:notify_mcu_error`） |
+| `KlippyError::Internal` | klippy 自身 | `invoke_shutdown`（`shutdown` 状态），状态已不可信 |
+
+两条兵兵底线：G-code handler 的 panic 与 API endpoint 的 panic 都被 `catch_unwind` 兜住，
+前者报 `Internal error on command:"X"`、后者报 `Internal Error on WebRequest: <method>`，两者都
+`invoke_shutdown`（上游 `gcode.py:230-234`、`webhooks.py:271-276`）。
+
 ## 已实现与未实现
 
 已实现：帧收发与校验、合并发送、同步请求/响应、identify 握手与字典安装（`identify`）、类型化消息与按名取参（`cmd`）。`cmd/` 下的基础命令模块已经就位：`allocate_oids`、`get_config` / `finalize_config`、`get_uptime`、`emergency_stop` / `clear_shutdown`（`basecmd.c` 的四个分区），以及引导用的 `identify` 一对。事件消息也走上回调投递：`Mcu::bind_event` 把处理器绑到某条响应上，接收任务在无待配对调用时调用它（`event/stats.rs` 的 `stats` 是第一个）。`cmd/clock.rs`（`ClockSync` / `McuClock`，读固件时钟）已写好但暂未参与编译。

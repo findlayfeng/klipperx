@@ -35,7 +35,7 @@
 //! with `HomingState`. Until then an axis is homed only by
 //! `SET_KINEMATIC_POSITION`.
 
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -90,6 +90,9 @@ pub struct PrinterStepper {
     params: RailParams,
     /// The firmware side: oid, pins and the wire commands.
     mcu_stepper: Arc<McuStepper>,
+    /// The machine, to find this MCU's clock/offset at connect. `Weak` because
+    /// the printer's registry owns this object.
+    printer: Weak<Printer>,
     /// The host solver and compressor, built at connect when the oid and the MCU
     /// frequency exist.
     ///
@@ -105,7 +108,7 @@ impl PrinterStepper {
     /// # Errors
     /// Returns a config error naming the section when an option is missing,
     /// malformed, out of range, or names a pin the `pins` layer refuses.
-    pub fn new(config: &ConfigWrapper, printer: &Printer) -> Result<Self, ConfigError> {
+    pub fn new(config: &ConfigWrapper, printer: &Arc<Printer>) -> Result<Self, ConfigError> {
         let identifier = config.identifier();
         let name = config.section().id.clone();
         let axis = axis_from_name(&identifier)?;
@@ -201,6 +204,7 @@ impl PrinterStepper {
                 position_endstop,
             },
             mcu_stepper,
+            printer: Arc::downgrade(printer),
             inner: Mutex::new(None),
         })
     }
@@ -236,6 +240,23 @@ impl PrinterStepper {
     /// calls this once, in its own connect.
     pub fn take_stepper(&self) -> Option<Stepper> {
         self.lock().take()
+    }
+
+    /// This MCU's print-time-to-clock offset, found through the chip name.
+    ///
+    /// Zero when the MCU object cannot be found (a standalone stepper with no
+    /// `[mcu]` object), which is the primary's offset anyway.
+    fn print_time_offset(&self, mcu: &Arc<crate::core::klippy::mcu::Mcu>) -> f64 {
+        self.printer
+            .upgrade()
+            .and_then(|printer| {
+                printer
+                    .lookup_objects_as::<crate::core::klippy::mcu::McuObject>(Some("mcu"))
+                    .into_iter()
+                    .find(|(_, object)| object.name() == mcu.name())
+                    .map(|(_, object)| object.print_time_offset())
+            })
+            .unwrap_or(0.0)
     }
 
     fn lock(&self) -> MutexGuard<'_, Option<Stepper>> {
@@ -290,11 +311,15 @@ impl PrinterObject for PrinterStepper {
                 .await
                 .map_err(|err| config_error(err.to_string()))?;
             stepper.kinematics_mut().commanded_pos = f64::from(steps) * self.step_dist;
-            // Record where the firmware's counter is. The print-time mapping
-            // itself is set later, once the toolhead knows every MCU: the
-            // primary is `0.0`, a secondary is aligned to the primary
-            // (`SecondarySync`). `set_last_position` only flushes the pending
-            // step (none yet) and records the position, so the order is safe.
+            // Point the compressor at this MCU's clock domain. The `[mcu]`
+            // object already built the estimate and the `SecondarySync` offset at
+            // its own connect (which runs before any stepper); find it by chip
+            // name and use it.
+            stepper
+                .compressor_mut()
+                .set_time(self.print_time_offset(&mcu), freq);
+            // Record where the firmware's counter is (`set_last_position` only
+            // flushes the pending step — none yet — and records the position).
             if let Some(clock) = mcu.estimated_clock() {
                 stepper
                     .compressor_mut()

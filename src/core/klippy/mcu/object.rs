@@ -30,6 +30,7 @@ use std::time::Duration;
 use serde_json::{json, Map, Value};
 use tracing::{info, warn};
 
+use crate::core::klippy::cmd::clock::McuClock;
 use crate::core::klippy::cmd::config::Reset;
 use crate::core::klippy::cmd::shutdown::EmergencyStop;
 use crate::core::klippy::cmd::uptime::{GetUptime, Uptime};
@@ -253,6 +254,36 @@ impl McuObject {
             step_pulse_duration,
             invert_dir,
         )
+    }
+
+    /// The clock estimate for this MCU, once connected.
+    ///
+    /// The endstop/trsync layer uses it to turn print times into this MCU's
+    /// clock and to extend 32-bit readings.
+    pub fn clock(&self) -> Option<Arc<McuClock>> {
+        self.chip.clock()
+    }
+
+    /// The print time this MCU's clock zero corresponds to (`0.0` for the
+    /// primary).
+    pub fn print_time_offset(&self) -> f64 {
+        self.chip.print_time_offset()
+    }
+
+    /// Convert an absolute print time to this MCU's clock, once connected.
+    pub fn print_time_to_clock(&self, print_time: f64) -> Option<u64> {
+        self.chip.print_time_to_clock(print_time)
+    }
+
+    /// Extend a 32-bit clock reading into this MCU's 64-bit domain.
+    pub fn clock32_to_clock64(&self, clock32: u32) -> Option<i64> {
+        self.chip.clock32_to_clock64(clock32)
+    }
+
+    /// The estimated print time at a host instant, once connected.
+    pub fn estimated_print_time(&self, eventtime: f64) -> Option<f64> {
+        self.clock()
+            .map(|clock| clock.estimated_print_time(eventtime))
     }
 
     /// Snapshot a connected MCU's identify status for `objects/query`.
@@ -562,7 +593,37 @@ impl PrinterObject for McuObject {
             // One clock read, so an unclocked resource can estimate "now"
             // (`Mcu::estimated_clock`). A firmware without `get_uptime` simply
             // has no estimate.
-            seed_clock_base(&mcu).await;
+            let reactor = self.printer.upgrade().map(|printer| printer.reactor());
+            let sent_time = reactor
+                .as_ref()
+                .map(|reactor| reactor.monotonic())
+                .unwrap_or(0.0);
+            let uptime = seed_clock_base(&mcu).await;
+            // Build this MCU's clock estimate and its print-time alignment. The
+            // primary (the bare `[mcu]`) defines the print-time origin; a
+            // secondary is shifted so the same print time maps to its own clock
+            // (`SecondarySync`, `klippy/clocksync.py:177-235`). Resources that
+            // convert print time to this MCU's clock read it through the chip.
+            if let Some(reactor) = &reactor {
+                let clock = Arc::new(McuClock::new(Arc::clone(&mcu), Arc::clone(reactor)));
+                if let Some(clock64) = uptime {
+                    clock.seed(sent_time, clock64 as i64);
+                }
+                let now = reactor.monotonic();
+                let offset = if self.name() == "mcu" {
+                    0.0
+                } else {
+                    self.printer
+                        .upgrade()
+                        .and_then(|printer| printer.lookup_object_as::<McuObject>("mcu"))
+                        .and_then(|primary| primary.clock())
+                        .map(|main| {
+                            main.estimated_print_time(now) - clock.estimated_print_time(now)
+                        })
+                        .unwrap_or(0.0)
+                };
+                self.chip.set_clock(clock, offset);
+            }
             // Identify installed the dictionary; reserve the pins the firmware
             // owns before anything resolves one. A conflict here is a
             // configuration problem (upstream's `pins.error`, caught as a
@@ -715,19 +776,25 @@ async fn reset_and_flush(mcu: &Mcu) -> Result<(), KlippyError> {
 /// exists (TODO C1). The 64-bit `get_uptime` is used rather than `get_clock`
 /// because the 32-bit counter wraps every few minutes at a typical
 /// `CLOCK_FREQ`. A firmware that does not publish it simply has no estimate.
-async fn seed_clock_base(mcu: &Mcu) {
+async fn seed_clock_base(mcu: &Mcu) -> Option<u64> {
     if !mcu.has_message(GetUptime::NAME) {
-        return;
+        return None;
     }
     match mcu
         .call_msg::<GetUptime, Uptime>(&GetUptime, CLOCK_BASE_TIMEOUT)
         .await
     {
-        Ok(uptime) => mcu.set_clock_base(uptime.clock64()),
-        Err(err) => warn!(
-            "MCU '{}': could not read the clock for a time estimate: {err}",
-            mcu.name()
-        ),
+        Ok(uptime) => {
+            mcu.set_clock_base(uptime.clock64());
+            Some(uptime.clock64())
+        }
+        Err(err) => {
+            warn!(
+                "MCU '{}': could not read the clock for a time estimate: {err}",
+                mcu.name()
+            );
+            None
+        }
     }
 }
 

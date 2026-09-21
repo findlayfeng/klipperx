@@ -26,6 +26,7 @@ use super::i2c::{I2cMode, McuI2c};
 use super::pwm::McuPwm;
 use super::spi::{McuSpi, SpiMode};
 use super::stepper::McuStepper;
+use crate::core::klippy::cmd::clock::McuClock;
 use crate::core::klippy::cmd::gpio::{ConfigDigitalOut, QueueDigitalOut, UpdateDigitalOut};
 use crate::core::klippy::cmd::McuCommand;
 use crate::core::klippy::mcu::{ConfigBuilder, Mcu, McuError};
@@ -63,6 +64,15 @@ pub struct McuChip {
     /// Routes `analog_in_state` reports to the input each `oid` belongs to.
     /// Shared by every ADC on this chip.
     adc_registry: Arc<AdcRegistry>,
+    /// The clock estimate for this MCU, filled at connect by the `[mcu]` object.
+    ///
+    /// Shared with the resources that convert print time to this MCU's clock
+    /// (the endstop/trsync layer): each MCU has its own frequency and
+    /// `SecondarySync` offset, so a resource cannot assume the primary's.
+    clock: Arc<Mutex<Option<Arc<McuClock>>>>,
+    /// The print time this MCU's clock zero corresponds to
+    /// (`SecondarySync`'s alignment): `0.0` for the primary.
+    print_time_offset: Arc<Mutex<f64>>,
 }
 
 impl McuChip {
@@ -74,6 +84,8 @@ impl McuChip {
             pins: Arc::downgrade(&pins),
             mcu: Arc::new(Mutex::new(None)),
             adc_registry: Arc::new(AdcRegistry::new()),
+            clock: Arc::new(Mutex::new(None)),
+            print_time_offset: Arc::new(Mutex::new(0.0)),
         }
     }
 
@@ -105,6 +117,50 @@ impl McuChip {
     /// The connected device, or `None` before connect.
     pub fn mcu(&self) -> Option<Arc<Mcu>> {
         self.lock().clone()
+    }
+
+    /// Record the clock estimate and print-time offset for this MCU.
+    ///
+    /// Called by the `[mcu]` object at connect, once the device is up and its
+    /// `get_uptime` has been read.
+    pub fn set_clock(&self, clock: Arc<McuClock>, print_time_offset: f64) {
+        *self
+            .clock
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(clock);
+        *self
+            .print_time_offset
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = print_time_offset;
+    }
+
+    /// The clock estimate for this MCU, once connected.
+    pub fn clock(&self) -> Option<Arc<McuClock>> {
+        self.clock
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
+    }
+
+    /// The print time this MCU's clock zero corresponds to.
+    pub fn print_time_offset(&self) -> f64 {
+        *self
+            .print_time_offset
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    /// Convert an absolute print time to this MCU's clock, once connected. This
+    /// is the per-MCU `print_time_to_clock` the endstop/trsync layer uses.
+    pub fn print_time_to_clock(&self, print_time: f64) -> Option<u64> {
+        let clock = self.clock()?;
+        let freq = clock.estimator().mcu_freq();
+        Some(((print_time - self.print_time_offset()) * freq).max(0.0) as u64)
+    }
+
+    /// Extend a 32-bit clock reading into this MCU's 64-bit domain.
+    pub fn clock32_to_clock64(&self, clock32: u32) -> Option<i64> {
+        Some(self.clock()?.clock32_to_clock64(clock32))
     }
 
     /// Resolve a pin alias or reservation on this chip.
@@ -523,6 +579,25 @@ mod tests {
         let mcu = Mcu::for_test("mcu", Interface::new(TestDevice::new(Vec::new())));
         mcu.install_dictionary(dictionary()).unwrap();
         mcu
+    }
+
+    #[tokio::test]
+    async fn test_chip_clock_applies_the_print_time_offset() {
+        // A secondary chip whose clock zero is at print time 3.0.
+        let pins = Arc::new(PrinterPins::new());
+        let chip = McuChip::new("zboard".to_string(), Arc::new(ConfigBuilder::new()), pins);
+        let mcu = Arc::new(mcu());
+        let clock = Arc::new(McuClock::new(
+            Arc::clone(&mcu),
+            crate::core::klippy::reactor::ManualReactor::shared(),
+        ));
+        clock.seed(0.0, 100_000_000); // 5 s at the fixture's 20 MHz
+        chip.set_clock(clock, 3.0);
+
+        assert_eq!(chip.print_time_offset(), 3.0);
+        assert_eq!(chip.print_time_to_clock(4.0), Some(20_000_000));
+        // Before the offset there is no clock.
+        assert_eq!(chip.print_time_to_clock(2.0), Some(0));
     }
 
     /// A chip with the main MCU registered under `mcu`.

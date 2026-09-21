@@ -480,7 +480,7 @@ impl ConfigBuilder {
         // Building first means the CRC is known before the firmware is asked
         // anything — the reset decision below needs it.
         let mut built = self.build(mcu)?;
-        self.handshake(mcu, &mut built).await
+        self.handshake(mcu, &mut built, false).await
     }
 
     /// Ask the firmware what it has, reset it if it must be, and send the
@@ -497,16 +497,31 @@ impl ConfigBuilder {
     /// As [`ConfigBuilder::configure`], plus [`McuError::ResetRequired`] when a
     /// reset is needed and the firmware has neither `config_reset` nor a way to
     /// do it from here (a firmware with only `reset` cannot be reset without
-    /// dropping this connection).
+    /// dropping this connection), and [`McuError::Config`] when
+    /// `expect_unconfigured` is set and the board still carries a configuration
+    /// (a firmware restart that did not reset it).
     pub async fn handshake(
         &self,
         mcu: &Mcu,
         built: &mut BuiltConfig,
+        expect_unconfigured: bool,
     ) -> Result<Configured, McuError> {
         let crc = built.crc;
         let move_slots = built.move_slots;
 
         let mut before = get_config(mcu).await?;
+        // Upstream refuses a board that is still configured after a
+        // `firmware_restart` (`klippy/mcu.py:1053-1056`): the restart was
+        // supposed to leave it unconfigured, so a configuration here means the
+        // reset did not take — reusing or reconfiguring a board whose reset
+        // failed would paper over a broken reset path.
+        if expect_unconfigured && before.is_config {
+            return Err(McuError::Config(format!(
+                "Failed automated reset: MCU '{}' is still configured (CRC {:#010x})",
+                mcu.name(),
+                before.crc
+            )));
+        }
         // Read before anything below resets the firmware: what the board reports
         // here is what the connection found, which is how a caller tells a board
         // that just came up from one that kept running.
@@ -1361,6 +1376,27 @@ mod tests {
         let err = builder.configure(&mcu).await.unwrap_err();
 
         assert!(matches!(err, McuError::ResetRequired), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn test_a_firmware_restart_that_did_not_reset_is_reported() {
+        // A `firmware_restart` bring-up expects an unconfigured board. One that
+        // still carries a configuration means the reset did not take, so say so
+        // instead of reusing it (upstream `klippy/mcu.py:1053-1056`).
+        let mcu = scripted_mcu(vec![MappingEntry {
+            input: Frame::new(0, get_config_payload()),
+            outputs: vec![Frame::new(
+                0,
+                config_response(true, 0x1234_5678, false, 100),
+            )],
+        }]);
+        let builder = ConfigBuilder::new();
+        let mut built = builder.build(&mcu).unwrap();
+
+        let err = builder.handshake(&mcu, &mut built, true).await.unwrap_err();
+
+        assert!(matches!(err, McuError::Config(_)), "{err:?}");
+        assert!(err.to_string().contains("Failed automated reset"), "{err}");
     }
 
     #[tokio::test]

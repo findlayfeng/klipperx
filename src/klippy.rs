@@ -356,13 +356,34 @@ pub fn run(
         // closing) ends it without waiting for an interrupt. It is a loop
         // because a restart clears the exit request, so the listener has to be
         // armed again for the next run.
+        //
+        // Both SIGINT (Ctrl-C) and SIGTERM (`systemctl stop`, `docker stop`) ask
+        // for a clean exit. That matters beyond tidiness: killing the process
+        // while an MCU handshake is outstanding stops the host reading the
+        // port, and the firmware's USB endpoint stays full — the board then
+        // answers nothing until it resets. Asking the run loop to exit lets
+        // bring-up finish (it keeps reading) before the process goes.
         let interrupt = {
             let printer = Arc::clone(&printer);
             tokio::spawn(async move {
+                let mut terminate =
+                    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    {
+                        Ok(signal) => signal,
+                        Err(err) => {
+                            warn!("cannot listen for SIGTERM: {err}");
+                            return;
+                        }
+                    };
                 loop {
-                    if let Err(err) = tokio::signal::ctrl_c().await {
-                        warn!("cannot listen for an interrupt: {err}");
-                        return;
+                    tokio::select! {
+                        result = tokio::signal::ctrl_c() => {
+                            if let Err(err) = result {
+                                warn!("cannot listen for an interrupt: {err}");
+                                return;
+                            }
+                        }
+                        _ = terminate.recv() => {}
                     }
                     printer.request_exit("exit");
                 }

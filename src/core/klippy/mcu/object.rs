@@ -558,7 +558,12 @@ impl PrinterObject for McuObject {
                 .build(&mcu)
                 .map_err(|err| KlippyError::Internal(err.to_string()))?;
             let configured = loop {
-                match self.chip.config().handshake(&mcu, &mut built).await {
+                match self
+                    .chip
+                    .config()
+                    .handshake(&mcu, &mut built, self.is_firmware_restart())
+                    .await
+                {
                     Ok(configured) => break configured,
                     Err(McuError::ResetRequired) if !reset_sent => {
                         // No `config_reset`, but the firmware can reboot itself:

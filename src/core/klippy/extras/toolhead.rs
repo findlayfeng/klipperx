@@ -333,20 +333,14 @@ impl PrinterObject for ToolHeadObject {
                 seed_clock(&clock, mcu, now).await;
                 clocks.insert(mcu.name().to_string(), clock);
             }
-            let main_print_time = clocks[&primary_name].estimated_print_time(now);
+            let offsets = mcu_time_offsets(&primary_name, &clocks, now);
 
             // Point each stepper's compressor at its own MCU's clock domain.
             for (host, mcu) in host_steppers.iter_mut().zip(&axis_mcus) {
                 let freq = mcu
                     .clock_freq()
                     .map_err(|err| config_error(err.to_string()))?;
-                let local_print_time = clocks[mcu.name()].estimated_print_time(now);
-                let offset = if mcu.name() == primary_name {
-                    0.0
-                } else {
-                    main_print_time - local_print_time
-                };
-                host.compressor_mut().set_time(offset, freq);
+                host.compressor_mut().set_time(offsets[mcu.name()], freq);
             }
 
             let mut toolhead = ToolHead::new(self.limits);
@@ -373,7 +367,7 @@ impl PrinterObject for ToolHeadObject {
 
             // The toolhead's print time is the primary MCU's; the secondary
             // offsets above map it onto their own clocks.
-            toolhead.set_estimated_print_time(main_print_time);
+            toolhead.set_estimated_print_time(clocks[&primary_name].estimated_print_time(now));
 
             *self.lock() = Some(Connected {
                 toolhead,
@@ -433,6 +427,31 @@ fn distinct_mcus(mcus: &[Arc<Mcu>]) -> Vec<&Arc<Mcu>> {
         seen.push(mcu);
     }
     seen
+}
+
+/// The print-time-to-clock offset of each MCU, keyed by MCU name
+/// (`SecondarySync`, `klippy/clocksync.py:177-235`).
+///
+/// The primary defines the print-time origin, so its offset is `0.0`; a
+/// secondary is shifted by the difference between the two clocks' print times at
+/// the same host instant.
+fn mcu_time_offsets(
+    primary_name: &str,
+    clocks: &HashMap<String, Arc<McuClock>>,
+    now: f64,
+) -> HashMap<String, f64> {
+    let main_print_time = clocks[primary_name].estimated_print_time(now);
+    clocks
+        .iter()
+        .map(|(name, clock)| {
+            let offset = if name == primary_name {
+                0.0
+            } else {
+                main_print_time - clock.estimated_print_time(now)
+            };
+            (name.clone(), offset)
+        })
+        .collect()
 }
 
 /// The flush task: generate the queued steps and await the transport.
@@ -638,7 +657,38 @@ mod tests {
     use super::*;
     use crate::core::klippy::interface::devices::test::TestDevice;
     use crate::core::klippy::interface::Interface;
-    use crate::core::klippy::mcu::McuError;
+    use crate::core::klippy::mcu::{Dictionary, McuError};
+    use crate::core::klippy::reactor::ManualReactor;
+
+    /// An identified fake MCU with one `CLOCK_FREQ`.
+    fn fake_mcu(name: &str, freq: u64) -> Arc<Mcu> {
+        let mcu = Mcu::for_test(name, Interface::new(TestDevice::new(Vec::new())));
+        mcu.install_dictionary(
+            Dictionary::from_json(json!({"config": {"CLOCK_FREQ": freq}})).unwrap(),
+        )
+        .unwrap();
+        Arc::new(mcu)
+    }
+
+    #[tokio::test]
+    async fn test_mcu_time_offsets_align_a_secondary_to_the_primary() {
+        // The primary has been up 100 s at 1 MHz; the secondary 50 s at 2 MHz.
+        let primary = McuClock::new(fake_mcu("mcu", 1_000_000), ManualReactor::shared());
+        primary.seed(0.0, 100_000_000);
+        let secondary = McuClock::new(fake_mcu("zboard", 2_000_000), ManualReactor::shared());
+        secondary.seed(0.0, 100_000_000);
+        let clocks = HashMap::from([
+            ("mcu".to_string(), Arc::new(primary)),
+            ("zboard".to_string(), Arc::new(secondary)),
+        ]);
+
+        let offsets = mcu_time_offsets("mcu", &clocks, 0.0);
+
+        // The primary defines the origin; the secondary is shifted so the same
+        // print time maps to its own clock.
+        assert_eq!(offsets["mcu"], 0.0);
+        assert_eq!(offsets["zboard"], 50.0);
+    }
 
     #[tokio::test]
     async fn test_distinct_mcus_deduplicates_by_name() {

@@ -426,7 +426,7 @@ endstop/trsync（F8）与其余固件资源（F9）。
       每 MCU 建 `McuClock` 并按 `SecondarySync` 对齐；顺带修 `McuClock::seed` 未取
       `CLOCK_FREQ`（见 [FW6a 记录](docs/work-log/2026-09-21-fw6a-notes.md)）。
 - [ ] **FW6a-2** 测试侧加**响应器式假 MCU**（可多实例），并补 `ToolHeadObject::connect` 的
-      两 MCU 端到端测试。
+      两 MCU 端到端测试。（先做假 MCU，挪到 FW6b 开头；偏移计算已在 FW6a-1 单测）
 - [ ] **FW6b** 命令层与 MCU 触发：`cmd/endstop.rs`、`cmd/trsync.rs`、`StepperStopOnTrigger`；
       `PinChip::setup_endstop` + `PrinterPins::setup_endstop`；`mcu/resource/endstop.rs`
       （`McuEndstop` + `home_start`/`home_wait`/`query_endstop`）；`motion/trsync.rs` 的**多实例**

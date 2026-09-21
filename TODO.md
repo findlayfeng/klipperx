@@ -4,6 +4,41 @@
 `docs/klippy/developer-manual/` 里）。括号里的 `klippy/xxx.py:NN` 指上游参考实现
 （`third_party/klipper/`），用来在动手前核对行为。已完成的条目见文末「已完成（留档）」，
 **每条只留一行索引**，细节在各模块自己的文档里；做完一件事就把它从正文挪进那张索引。
+上游**全部功能点**的逐项对照（含判为「不适用」的 Python 专属项）见
+[上游功能覆盖审计](docs/work-log/2026-09-21-upstream-coverage-audit.md)；本文件只放
+**要动手的事**与**还没定的事**。
+
+## 框架优先（先把框架做完，再铺模块）
+
+本项目的固定做法：**先把框架立住 → 用一个最小模块把它跑通 → 再横向铺模块**。
+下面把 TODO 里属于**框架级**的事单独排队；H1–H12、G2b/G4、S1 等具体模块都排在
+这些之后。判定标准：一项负责**定接口/定生命周期/定数据形状**、被多个 extras 共用，
+就是框架；只消费已有接口、自己就是一个 `[section]` 的，是模块。
+
+| # | 框架 | 对应 TODO | 框架边界（定什么） | 首个模块（验收） | 之后铺开 | 依赖 |
+|---|---|---|---|---|---|---|
+| **FW1** | 配置装载框架收尾 | C2 | option 访问追踪当 schema、多住户（`[printer]`/`pins`/`configfile`/`toolhead`）、未认领 section/option 报错 | `[printer]` + `[stepper_x]` 能装载并过校验 | 各 extras 的 option schema（H1–H12） | — |
+| **FW2** | 对象模型收尾 | Q4、Q5 | `get_status` 的返回形状（`Value` vs typed）、`lookup_objects(module)` 前缀遍历与反射 | `objects/query` 形状定案；反射读到某个对象 | `gcode_macro`、display 菜单、宏变量 | — |
+| **FW3** | 错误词汇框架 | A2 | `CommandError`/`ConfigError` 分层、`Internal` 收敛、handler 异常 → `invoke_shutdown` | 一条 gcode 参数错误报 `CommandError` 且不关停 | 全树的错误分支 | — |
+| **FW4** | G-Code 框架收尾 | G1b（框架部分） | `GCodeIO` 输入抽象（伪 tty/文件/ack/`stats gcodein`）、参数访问器全覆盖、`create_gcode_command`、`gcode:*` 事件触发点 | `gcode_macro` 最小宏 / `M115` 的 ack | 全部 gcode extras（H3、H8…） | FW1、FW3 |
+| **FW5** | 运动框架（最重） | C1（框架部分）、H12 | toolhead 骨架、`Kinematics` trait、stepper 句柄、trapq/step 生成（chelper 重写）、`clocksync`、`mathutil`/`Coord` | `cartesian` + `[stepper_x/y/z]` + `[extruder]`，`G28`/`G1` 跑通 | `kinematics/*` 其余、H9、H10 | FW1 |
+| **FW6** | 资源与触发框架 | F3、F8 | 命令队列/print_time 同步输出（`MCU_bus_digital_out`）、`TriggerDispatch`/`MCU_trsync`、endstop 接口 | 一个 endstop + `query_endstops/status` | homing/probe、运动同步 `SET_PIN` | FW5 |
+| **FW7** | MCU 与传输框架收尾 | B2、D3 | `emergency_stop` 对象、本地 shutdown 标志、带载荷错误上报、固件 `reset` 优先、RTO 定时重传 | `emergency_stop` 对象 + 端点 | TMC/传感器等资源 | — |
+| **FW8** | 主机层与重启框架 | D1、D2、Q6 | `StartArgs` 全量、rollover info、`--logfile` 日志层、退出码语义、`rpi_usb` 连接期门控/CRC/重启后订阅 | `--logfile` 落盘 + `info` 的 rollover | 日志、Moonraker 兼容 | — |
+| **FW9** | API 框架收尾 | B4（框架部分） | `register_remote_method` 与推送、mux 端点注册机制、`emergency_stop` 端点 | `register_remote_method` + 推送 | `pause_resume/*`、`*/dump_*` 等消费者 | FW7 |
+
+> **怎么验收**：每个框架都以「最小模块在真机/测试设备上跑通」为准，不以“代码写完”为准。
+> 例如 FW5 的验收是 `G28`/`G1` 真的动了步进，而不是 `Kinematics` trait 编译通过。
+
+> **建议顺序**：**FW1/FW3** 打底（配置与错误，最底层）→ **FW2/FW7/FW8** 可并行
+> （对象模型 / MCU / 主机层）→ **FW4**（G-Code，依赖 FW1+FW3）→ **FW5**（运动，最重，
+> 依赖 FW1）→ **FW6** → **FW9**。FW5 与 FW4 都依赖 FW1；FW6 只能等 FW5。
+
+> **未决问题里属于框架决策的**：**Q4**（status 形状，FW2）、**Q5**（反射，FW2）、
+> **Q6**（退出语义，FW8）；其余 Q 已解决或属模块。
+
+> **不列入框架、可以直接随模块做的**：G2b（`SET_PIN` 时序）、G4（运动命令本体）、
+> F6 剩余（`spi_transfer_with_preface`）、F9、H1–H11、S1、E1、E2。
 
 ## 已定
 
@@ -27,29 +62,69 @@
 
 ## 待办
 
-依赖列的是**工具性前置**，不是自然顺序。
+依赖列的是**工具性前置**，不是自然顺序。下表是索引，逐条细节在后面的小节里；
+框架级的工作已抽到文首「框架优先」，本表不再区分级别。
+H1–H12 是[上游功能覆盖审计](docs/work-log/2026-09-21-upstream-coverage-audit.md)
+里**未实现**的 extras 消费者，按域归并。
+
+**核心与架构**
 
 | # | 事项 | 依赖 |
 |---|---|---|
-| G2b | 用 GCODE 控制 GPIO：`SET_PIN` 时序（数字与 PWM 均已可驱动） | C1 |
-| G1b | gcode 调度器与上游的行为差异（ack / cmd_default / ECHO / mux 缺省…） | C1 |
-| G4 | 运动命令（G0/G1/G28…） | G1、C1 |
-| S1 | 压力测试工具（`klipperx stress`）剩余：stepper 资源、别名解析、端到端测试 | C1 |
+| C1 | toolhead 与 kinematics | — |
+| C2 | 配置装载收尾（option 校验、第二个住户 / `[printer]`） | C1 |
 | A2 | 错误词汇（`CommandError` / `ConfigError`） | — |
 | B2 | MCU 剩余：`emergency_stop` 对象/端点、`last_stats`、错误载荷、本地 shutdown 标志、`command` 的固件 `reset` | — |
-| B4 | 其余端点（estop / remote method / pause_resume / …） | G3 等 |
-| F3 | `MCU_bus_digital_out`（命令队列/运动同步输出） | C1 |
-| F6 | SPI 总线 | F1、F2 |
-| F7 | I2C 总线 | F1、F2 |
-| F8 | endstop / trsync | F1、F2、C1 |
-| F9 | 输入与外设资源（buttons / pulse_counter / …） | F1–F7 |
-| C1 | toolhead 与 kinematics | — |
-| C2 | 配置装载收尾（option 校验、第二个住户） | — |
 | D1 | 主机层 start args / rollover / `--logfile` | — |
 | D2 | 重启循环剩余（`rpi_usb` 连接期门控、CRC 不一致的处理、重启后的输出订阅） | — |
 | D3 | `command` 接管运行中的板子：RTO 定时重传 | B2 |
+
+**MCU 资源与总线**
+
+| # | 事项 | 依赖 |
+|---|---|---|
+| F3 | `MCU_bus_digital_out`（命令队列/运动同步输出） | C1 |
+| F6 | SPI 总线剩余：`spi_transfer_with_preface` / `setup_shutdown_msg` | F1、F2 |
+| F8 | endstop / trsync | F1、F2、C1 |
+| F9 | 固件资源剩余：buttons / pulse_counter / trigger_analog / initial_pins / sdcard / sensor_bulk / lcd / neopixel / thermocouple / tmcuart 等 | F1–F7 |
+
+**G-Code 与端点**
+
+| # | 事项 | 依赖 |
+|---|---|---|
+| G1b | gcode 调度器与上游的行为差异（`GCodeIO`、参数访问器、事件触发…） | C1 |
+| G2b | 用 GCODE 控制 GPIO：`SET_PIN` 时序（数字与 PWM 均已可驱动） | C1 |
+| G4 | 运动命令（G0/G1/G28…） | G1、C1 |
+| B4 | 其余端点（estop / remote method / pause_resume / `*/dump_*` / …） | G3、H4、H9 |
+
+**上游 extras 消费者**（详见「上游 extras 覆盖盘点」）
+
+| # | 事项 | 依赖 |
+|---|---|---|
+| H1 | 加热与温度（heaters / heater_bed / heater_generic / pid_calibrate / verify_heater / temperature_*） | F4、F5、C1 |
+| H2 | 风扇与通用输出（fan / fan_generic / heater_fan / controller_fan / pwm_tool / static_* / multi_pin / servo / led / neopixel / dotstar / 电位器与 LED 驱动） | F3、F4、F6、F7 |
+| H3 | G-Code 宏与脚本（gcode_macro / save_variables / delayed_gcode / respond） | G1b、Q5 |
+| H4 | 打印流程与 SD 卡（virtual_sdcard / print_stats / display_status / pause_resume / exclude_object / sdcard_loop / firmware_retraction） | F9、C1 |
+| H5 | TMC 步进驱动（tmc / tmc_uart / tmc2130…tmc5160） | F6、F7、F9、C1 |
+| H6 | 传感器与块状数据（bulk_sensor / 加速度计 / angle / ldc1612 / hx71x / ads* / load_cell / input_shaper / resonance） | F5、F6、F7、F9、C1 |
+| H7 | 输入与外设（buttons / gcode_button / pulse_counter / trigger_analog / 断料与线宽传感器 / GPIO 扩展 / DAC） | F3、F5、F9 |
+| H8 | LCD 显示与菜单（display/*） | F9、G1b |
+| H9 | 探测 / 调平 / 校准（probe / bltouch / bed_mesh / z_tilt / quad_gantry_level / bed_screws / …） | C1、F8 |
+| H10 | 运动相关 extras（gcode_move / gcode_arcs / force_move / manual_stepper / stepper_enable / idle_timeout / motion_report / …） | C1 |
+| H11 | 主机运行时与调试（statistics / error_mcu / canbus_ids / canbus_stats） | — |
+| H12 | 核心工具补齐（mathutil / util 反射 / clocksync / pins 消费侧） | C1 |
+
+**工具与文档**
+
+| # | 事项 | 依赖 |
+|---|---|---|
+| S1 | 压力测试工具（`klipperx stress`）剩余：stepper 资源、别名解析、端到端测试 | C1 |
 | E1 | 文档 | — |
 | E2 | `python_path` 的取消 | 外部项目 |
+
+> 判为**不适用**、不进待办的上游模块：`garbage_collection.py`（Python GC 调优）、
+> `aio_executor.py`（Python 线程池）、`parsedump.py`（离线开发工具）、
+> `debugcmds.c`（固件调试口）。理由见审计文档第 18 节。
 
 ### G2b 用 GCODE 控制 GPIO（现状与剩余）
 
@@ -99,7 +174,7 @@
       `queue_step`，用 `TestDevice` 覆盖一次加压（及 `ResetRequired` 路径）；`--task comm` 同理。
       目前只测了段计算、引脚解析与命令编码。
 
-### A2 错误词汇
+### A2 错误词汇（框架 FW3）
 
 - [ ] `CommandError` / `ConfigError`（上游 extras 里 94 / 41 处）；`KlippyError` 现在只有
       通信类 5 个变体（`src/core/klippy/error.rs`）。
@@ -107,7 +182,7 @@
       的重复名（`printer.rs` 的 TODO）、`load.rs` 的工厂拒绝与未认领 section（`load.rs`
       的 `TODO`）、`McuObject::connect` 的 section 解析。
 
-### B2 MCU 关闭与错误上报（剩余）
+### B2 MCU 关闭与错误上报（剩余，框架 FW7）
 
 - [ ] **`emergency_stop` / `clear_shutdown` 的对象与端点**：`cmd/shutdown.rs` 的两个命令现在
       只有 `configure` 的复位路径在用 `emergency_stop`；还缺“主机侧停机时通知 MCU”与
@@ -131,7 +206,7 @@
       时序规避；隐式、无测试，recv 一旦改成缓冲/异步就会把自发的 `emergency_stop` 误报成
       `MCU … restarted`。上游有 `_is_shutdown`（`klippy/mcu.py:893-895`）。
 
-### G1b gcode 调度器与上游的行为差异
+### G1b gcode 调度器与上游的行为差异（框架部分 FW4）
 
 **为什么单列一条**：G1 的骨架（命令表 / `run_script` / 输出处理器 / 内置命令 / mux）已按
 `klippy/gcode.py` 落地，逐行对照后还剩一批**行为差异**。一部分只能随前置模块（GCodeIO /
@@ -210,7 +285,7 @@ toolhead / 开放事件）一起补，一部分是现在就独立可补的小行
 - [ ] 由 toolhead 注册，随 **C1**；gcode 层不需为它们改什么，只要命令表够通用
       （含 `register_mux_command`，给 `SET_PIN` 这类 `PIN=` 选择用）。
 
-### B4 其余端点
+### B4 其余端点（机制部分 FW9）
 
 `api-reference.md` 有、`endpoints/mod.rs` 的表里标「not started」的其余部分，各自等它读的
 对象先存在：
@@ -230,9 +305,10 @@ toolhead / 开放事件）一起补，一部分是现在就独立可补的小行
 之后用 `queue_*` / `set_*` / `*_transfer` 命令驱动。命令层（`allocate_oids` / `get_config` /
 `finalize_config` / `get_uptime` / `emergency_stop` / `get_clock`）已就位，配置构建层（F1）
 与 pin 解析（F2）也已完成，数字输出、PWM（F4）与 ADC（F5）三个 `config_*` 资源已落地
-（见文末索引），剩下的缺口是命令队列/运动同步输出（F3）、总线（F6/F7）与 endstop（F8）。
+（见文末索引），SPI/I2C 总线（F6/F7）也已落地，剩下的缺口是命令队列/运动同步输出（F3）、
+endstop/trsync（F8）与其余固件资源（F9）。
 
-#### F3 剩余：`MCU_bus_digital_out`
+#### F3 剩余：`MCU_bus_digital_out`（框架 FW6）
 
 - [ ] `MCU_bus_digital_out`（`klippy/extras/bus.py:337` 以后）：挂在命令队列上、与运动
       同步的输出；需要命令队列/运动层（C1）。
@@ -296,7 +372,7 @@ toolhead / 开放事件）一起补，一部分是现在就独立可补的小行
 `extras/i2c_device.rs`（`[i2c_device]` 构造器 + 调试命令）。软件总线的新旧命令选择
 （`i2c_set_sw_bus` ↔ `i2c_set_software_bus`）在 `cmd::i2c::add_software_bus`。
 
-#### F8 endstop / trsync（与 C1 共享）
+#### F8 endstop / trsync（与 C1 共享，框架 FW6）
 
 - [ ] `MCU_endstop`（`klippy/mcu.py:340-407`）：`config_endstop oid=%c pin=%c pull_up=%c`、
       回零 `endstop_home oid=%c clock=%u sample_ticks=%u sample_count=%c rest_ticks=%u
@@ -310,16 +386,20 @@ toolhead / 开放事件）一起补，一部分是现在就独立可补的小行
 
 #### F9 其他输入与外设资源
 
-建立在 F1–F6 之上，各自一个 `config_*` + 查询/事件：
+建立在 F1–F6 之上，各自一个 `config_*` + 查询/事件。这一节只列**固件侧资源**；
+在它之上建的**宿主 extras 消费者**（buttons / pulse_counter / neopixel / sdcard / lcd /
+sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 
 - [ ] `buttons`（`src/buttons.c`，`config_buttons` / `buttons_add` / `buttons_query` /
       `buttons_ack`）—— 暂停/恢复按钮、耗材检测。
 - [ ] `pulse_counter`、`neopixel` / `dotstar` / `led`、`tmcuart`、`sdcard` / `sdio`、
       `lcd_hd44780` / `lcd_st7920`、`sensor_bulk`（批量传感器上报）与各类 SPI/I2C 传感器
       （`sensor_adxl345` / `sensor_lis2dw` / …）。
-- 这些是 extras，不阻塞运动；等 F1–F6 完成、真有对应 section 时再逐个接。
+- 这些是 extras，不阻塞运动；等 F1–F6 完成、真有对应 section 时再逐个接。消费者见
+      H5（TMC/tmcuart）、H6（sensor_bulk/加速度计）、H7（buttons/pulse_counter/trigger_analog）、
+      H8（lcd）。
 
-### C1 toolhead 与 kinematics
+### C1 toolhead 与 kinematics（框架 FW5）
 
 kinematics 已随 Printer 重构删除，从这里重新开始：
 
@@ -337,8 +417,10 @@ kinematics 已随 Printer 重构删除，从这里重新开始：
       `setup_itersolve()`；`calc_position` 的输入就从这里来。
 - [ ] step 生成层的运动学（上游 `rail.setup_itersolve('cartesian_stepper_alloc', axis)`、
       `kinematics/kinematic_stepper.py`）在我们这儿还没有对应物，运动规划整个未开始。
+      上游这部分是 C 写的 `klippy/chelper/`（`stepcompress.c`、`itersolve.c`、
+      `kin_*.c`、`trapq.c`、`kin_shaper.c`，见审计文档 §4.1），Rust 侧要整体重写。
 
-### C2 配置装载收尾
+### C2 配置装载收尾（框架 FW1）
 
 - [ ] **option 级校验**：上游拿访问追踪当 schema（`klippy/configfile.py:435-441`），
       `ConfigSection` 还没有访问记录，未做。
@@ -346,7 +428,7 @@ kinematics 已随 Printer 重构删除，从这里重新开始：
       `toolhead` 还没有入口，所以任何真实 printer.cfg 现在都会在未认领的 section 上报错；
       第二个住户进来时按同一张表补（C1 的 toolhead 就是下一个）。
 
-### D1 主机层 start args / rollover / 日志
+### D1 主机层 start args / rollover / 日志（框架 FW8）
 
 - [ ] `StartArgs` 只有 `info` 需要的四个字段（`api/start_args.rs`）；上游的
       `apiserver`、`start_reason`、debug 输入输出、每个 MCU 的字典路径还没进来。
@@ -355,7 +437,7 @@ kinematics 已随 Printer 重构删除，从这里重新开始：
 - [ ] `--logfile`：现在没有，`log_file` 恒为 `null`（`api/start_args.rs`）；先有写文件的
       日志层，rollover 才有意义。
 
-### D2 重启循环（剩余）
+### D2 重启循环（剩余，框架 FW8）
 
 循环本身与四种 `restart_method`（`command` / `arduino` / `cheetah` / `rpi_usb`）的物理分派
 都已完成（见文末索引；方法与连接期门控见 `docs/klippy/developer-manual/mcu-config.md`）。
@@ -379,7 +461,7 @@ kinematics 已随 Printer 重构删除，从这里重新开始：
       要客户端重新订阅。上游靠 socket 重绑让客户端重连、重订阅；我们要么在客户端收到
       `klippy:ready` 后重订阅，要么把输出订阅表移到连接上。
 
-### D3 `command` 接管一块还在跑的板子
+### D3 `command` 接管一块还在跑的板子（框架 FW7）
 
 `command` 的 `config_reset` 要连上才能发，而重连时对手的序号接着上一条会话走——这不是边缘
 情况：`rpi_usb` 切不了 VBUS 的机器会当场回退到 `command`（`mcu/object.rs`），普通 `RESTART`
@@ -426,6 +508,133 @@ ack」settle，并用 `Mcu::took_over_session()` 让 `rpi_usb` 判断“有没�
       comm 未必是 moonraker）—— 更硬但要先把对端身份从 server 层传到
       `EndpointContext`（现在没有）。上游只把 `client_info` 当日志用，故这属于本项目的
       自定义兼容层，要有到期日。
+
+## 上游 extras 覆盖盘点
+
+上游 133 个 extras（不含 `__init__.py`）里，本仓库目前只有 `board_pins` ✅、
+`output_pin` ◐、`bus`（SPI/I2C 框架）✅；其余按域归并成 H1–H12。逐模块的完整对照表
+（含固件命令模块、端点、判为不适用者）见
+[上游功能覆盖审计](docs/work-log/2026-09-21-upstream-coverage-audit.md)。
+
+### H1 加热与温度
+
+- [ ] `heaters.py` 框架：`get_heater`、PWM 定时器、`verify_heater` 调度
+      （`klippy/extras/heaters.py`）。
+- [ ] `heater_bed.py` / `heater_generic.py`：section 住户、`M140`/`M190` /
+      `SET_HEATER_TEMPERATURE`。
+- [ ] `pid_calibrate.py`（`PID_CALIBRATE`）、`verify_heater.py`。
+- [ ] 传感器：`temperature_sensor.py` / `thermistor.py` / `adc_temperature.py` /
+      `adc_scaled.py` / `spi_temperature.py`（MAX31855/56/65）/ `temperature_combined.py` /
+      `temperature_host.py` / `temperature_mcu.py` / `temperature_probe.py` /
+      `temperature_fan.py`。
+- 依赖 F4（PWM）、F5（ADC）、F6（SPI 温度）、C1（`temperature_fan` 随运动）。
+
+### H2 风扇与通用输出
+
+- [ ] `fan.py`（`[fan]`，`M106`/`M107`）、`fan_generic.py`、`heater_fan.py`、
+      `controller_fan.py`。
+- [ ] `pwm_tool.py`（队列化 PWM，随运动）、`pwm_cycle_time.py`、`static_digital_output.py`、
+      `static_pwm_clock.py`。
+- [ ] `multi_pin.py`、`servo.py`、`duplicate_pin_override.py`。
+- [ ] `led.py`、`neopixel.py`、`dotstar.py`（固件 `neopixel.c`）。
+- [ ] I2C/SPI 数字电位器、DAC、LED 驱动：`ad5206.py`、`mcp4018.py`、`mcp4451.py`、
+      `mcp4728.py`、`dac084S085.py`、`pca9533.py`、`pca9632.py`、`sx1509.py`。
+- 与 **G2b** 的分工：G2b 只补 `[output_pin]` 的时序；H2 是其余输出类 extras。
+
+### H3 G-Code 宏与脚本
+
+- [ ] `gcode_macro.py`：`[gcode_macro]`、变量、`rename_existing`，以及读
+      `printer.objects` 的反射式能力（**Q5**）。
+- [ ] `save_variables.py`（`SAVE_VARIABLE` / `[variables]`）。
+- [ ] `delayed_gcode.py`（`[delayed_gcode]`）。
+- [ ] `respond.py`（`RESPOND` / `M118`）。
+- 前置：**G1b** 的 `create_gcode_command` 与参数访问器（宏类模块要构造 gcmd）。
+
+### H4 打印流程与 SD 卡
+
+- [ ] `virtual_sdcard.py`：主机侧文件打印、`M24`/`M25`/`M27`、进度。
+- [ ] `print_stats.py`、`display_status.py`（`M73`/`M117`）。
+- [ ] `pause_resume.py`（`PAUSE`/`RESUME`/`CANCEL_PRINT` + 三个端点，见 **B4**）。
+- [ ] `exclude_object.py`、`sdcard_loop.py`、`firmware_retraction.py`（G10/G11）。
+- 依赖 F9（固件 `sdiocmds.c` 的 sdcard 资源）、C1（`gcode_move` 的位置恢复）。
+
+### H5 TMC 步进驱动
+
+- [ ] `tmc.py` 公共框架（寄存器、StallGuard、`DUMP_TMC`/`SET_TMC_*`）。
+- [ ] `tmc_uart.py`（固件 `src/tmcuart.c`）。
+- [ ] SPI 型：`tmc2130.py`、`tmc5160.py`；UART/SPI 型：`tmc2208.py`、`tmc2209.py`、
+      `tmc2240.py`、`tmc2660.py`。
+- 依赖 F6/F7、F9（tmcuart）、C1（stepper 对象）。
+
+### H6 传感器与块状数据
+
+- [ ] `bulk_sensor.py` 框架 + 固件 `sensor_bulk.c` + 各 `*/dump_*` 端点（**B4**）。
+- [ ] 加速度计：`adxl345.py`、`mpu9250.py`、`icm20948.py`、`lis2dw.py`、`lis3dh.py`、
+      `bmi160.py`（固件 `src/sensor_*.c`、`sos_filter.c`）。
+- [ ] `angle.py`（磁编码）、`ldc1612.py`（涡流）、`hx71x.py`、`ads1220.py`、
+      `ads131m0x.py`、`ads1x1x.py`。
+- [ ] `load_cell.py` / `load_cell_probe.py`（称重，配固件 `trigger_analog.c`）。
+- [ ] `input_shaper.py` / `resonance_tester.py` / `shaper_calibrate.py` / `shaper_defs.py`。
+- 依赖 F5/F6/F7、F9（sensor_bulk）、C1。
+
+### H7 输入与外设
+
+- [ ] `buttons.py` / `gcode_button.py`（固件 `buttons.c`）。
+- [ ] `pulse_counter.py`（固件 `pulse_counter.c`）。
+- [ ] `trigger_analog.py`（固件 `trigger_analog.c`）。
+- [ ] 断料/线宽：`filament_switch_sensor.py`、`filament_motion_sensor.py`、
+      `hall_filament_width_sensor.py`、`tsl1401cl_filament_width_sensor.py`。
+- [ ] 固件 `initial_pins.c` 的初始引脚状态。
+- [ ] 特定板/芯片：`samd_sercom.py`、`replicape.py`、`palette2.py`。
+- 依赖 F3（GPIO）、F5（ADC）、F9。
+
+### H8 LCD 显示与菜单
+
+- [ ] `display/display.py` 框架与 `hd44780.py`、`hd44780_spi.py`、`aip31068_spi.py`、
+      `st7920.py`、`uc1701.py`。
+- [ ] 菜单：`display/menu.py`、`display/menu_keys.py`、`display.cfg`、`menu.cfg`；
+      事件 `menu:*`。
+- [ ] 固件 `lcd_hd44780.c` / `lcd_st7920.c`。
+- 依赖 F9（固件侧 LCD）、G1b（`create_gcode_command`，菜单脚本要构造 gcmd）。
+
+### H9 探测 / 调平 / 校准
+
+- [ ] 探针：`probe.py`、`bltouch.py`、`smart_effector.py`、`manual_probe.py`、
+      `safe_z_home.py`、`endstop_phase.py`。
+- [ ] 调平：`bed_mesh.py`（含 `bed_mesh/dump_mesh` 端点）、`bed_tilt.py`、
+      `quad_gantry_level.py`、`z_tilt.py`。
+- [ ] 螺丝：`bed_screws.py`、`screws_tilt_adjust.py`。
+- [ ] 校准：`delta_calibrate.py`、`axis_twist_compensation.py`、`skew_correction.py`、
+      `z_thermal_adjust.py`、`tuning_tower.py`。
+- [ ] 回零周边：`homing_override.py`、`homing_heaters.py`；事件 `homing:*`、
+      `probe:update_results`。
+- 依赖 C1、F8（endstop/trsync）、H3（宏）、H12（`mathutil`）。
+
+### H10 运动相关 extras
+
+- [ ] `gcode_move.py`（G0/G1/G28/G92/M114…，即 **G4** 的实现体）。
+- [ ] `gcode_arcs.py`（G2/G3）、`force_move.py`、`manual_stepper.py`、
+      `stepper_enable.py`、`extruder_stepper.py`。
+- [ ] `idle_timeout.py`（`idle_timeout:*` 事件）、`motion_queuing.py`、
+      `motion_report.py`（`dump_trapq`/`dump_stepper` 端点，见 **B4**）。
+- 依赖 C1（toolhead/kinematics）；`gcode_move` 同时是 **G4** 的前置。
+
+### H11 主机运行时与调试
+
+- [ ] `statistics.py`：周期上报主机统计（CPU/内存）。
+- [ ] `error_mcu.py`：MCU 错误详情，供 shutdown 分析（接 **B2**）。
+- [ ] `canbus_ids.py` / `canbus_stats.py`：CAN 节点分配与状态（接 `[mcu]` 的 canbus 选项）。
+- 判为不适用：`garbage_collection.py`、`aio_executor.py`、`parsedump.py`（审计文档第 18 节）。
+
+### H12 核心工具补齐
+
+- [ ] `mathutil.py`：kinematics / probe / mesh 用的几何与线性代数（`Coord`、
+      `gaussian_solve` 等）——随 **C1**。
+- [ ] `util.py` 的反射与注册表 helper：`get_heater` / `get_sensor` / 前缀式
+      `lookup_objects`（**Q5**）。
+- [ ] `clocksync.py`：`print_time` ↔ MCU clock 偏移估计（`cmd/clock.rs` 现只有
+      `get_clock`）——随 **C1**/**F3**。
+- [ ] `pins.py` 消费侧接口（`get_pin_type`、重命名等）——随 **H7** 等消费者。
 
 ## 未决问题
 
@@ -568,6 +777,8 @@ ack」settle，并用 `Mcu::took_over_session()` 让 `rpi_usb` 判断“有没�
 ├── load_cell:* —— 依赖 ADC
 └── menu:* —— 依赖 display
 ```
+
+## 已完成（留档）
 
 细节在各模块文档里；这里每条只留一行索引，最近完成的在前。
 
@@ -722,3 +933,11 @@ ack」settle，并用 `Mcu::took_over_session()` 让 `rpi_usb` 判断“有没�
 | 惰性装载 | `klippy/extras/adc_temperature.py:51` `load_object(config, 'query_adc')` |
 | SPI / I2C 总线 | `klippy/extras/bus.py:9-336`、`src/spicmds.c`、`src/i2ccmds.c` |
 | endstop / trsync 触发 | `klippy/mcu.py:155-407`、`src/endstop.c:72-120`、`src/trsync.c` |
+| 加热器框架与温度传感器 | `klippy/extras/heaters.py`、`thermistor.py`、`temperature_sensor.py` |
+| G-Code 宏 / 变量 / 定时 | `klippy/extras/gcode_macro.py:41`、`save_variables.py`、`delayed_gcode.py` |
+| 打印流程与 SD 卡 | `klippy/extras/virtual_sdcard.py`、`print_stats.py`、`pause_resume.py:27-31` |
+| TMC 驱动与 UART | `klippy/extras/tmc.py`、`tmc_uart.py`、`src/tmcuart.c` |
+| 块状传感器与端点 | `klippy/extras/bulk_sensor.py:100`、`load_cell.py:55`、`src/sensor_bulk.c` |
+| LCD 显示与菜单 | `klippy/extras/display/display.py`、`menu.py:346,712,722,754,913` |
+| 主机统计与 MCU 错误详情 | `klippy/extras/statistics.py`、`error_mcu.py` |
+| **全量模块对照** | [`docs/work-log/2026-09-21-upstream-coverage-audit.md`](docs/work-log/2026-09-21-upstream-coverage-audit.md) |

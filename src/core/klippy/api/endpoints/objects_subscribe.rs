@@ -58,8 +58,17 @@ use serde_json::{json, Map, Value};
 use super::objects_query::{select_fields, status_object, ObjectsQueryParams};
 use crate::core::klippy::api::protocol::{ApiError, PushTarget, Request, ResponseTemplate};
 use crate::core::klippy::api::registry::{Endpoint, EndpointContext};
+use crate::core::klippy::api::{Api, ApiWiring, RegistrationError};
 use crate::core::klippy::printer::Printer;
 use crate::core::klippy::reactor::{Reactor, TimerHandle};
+
+endpoint!(install);
+
+/// Install the `objects/subscribe` endpoint.
+pub(crate) fn install(api: &mut Api, wiring: &ApiWiring<'_>) -> Result<(), RegistrationError> {
+    api.register(ObjectsSubscribe::new(Arc::clone(wiring.printer)))
+        .map_err(RegistrationError::Endpoint)
+}
 
 /// Seconds between subscription refreshes: upstream's
 /// `SUBSCRIPTION_REFRESH_TIME` (`klippy/webhooks.py:467`).

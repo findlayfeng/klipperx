@@ -35,6 +35,17 @@ pub use object::{load_config, load_config_prefix, McuObject};
 pub use resource::{McuAdc, McuChip, McuDigitalOut, McuPwm};
 pub use restart_method::McuRestartMethod;
 
+use crate::core::klippy::load::section;
+
+// The `[mcu]` / `[mcu <name>]` sections. The factories are re-exported from
+// `object` above; `build.rs` resolves them to this module's path.
+section!(
+    "mcu",
+    order = 10,
+    load = load_config,
+    prefix = load_config_prefix
+);
+
 use crate::core::klippy::frame::{Frame, MESSAGE_PAYLOAD_MAX};
 use crate::core::klippy::identify;
 use crate::core::klippy::interface::Interface;

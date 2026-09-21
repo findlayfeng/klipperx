@@ -263,7 +263,8 @@ type EventHandler = Arc<dyn Fn(&KlippyEvent) + Send + Sync>;
 ### 3.4 编译期代码生成
 
 事件声明分散在各子模块中，避免所有事件集中在一个文件里维护。声明文件只写事件，
-`build.rs` 扫描这些声明并生成枚举与 `name()`。
+`build.rs` 扫描这些声明并生成枚举与 `name()`。这一机制与配置段落的工厂表、API
+端点安装表共用，见 [声明式表生成（build.rs）](codegen.md)。
 
 #### 目录布局
 

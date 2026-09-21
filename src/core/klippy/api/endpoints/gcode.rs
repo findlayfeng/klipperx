@@ -35,8 +35,30 @@ use serde_json::{json, Value};
 
 use crate::core::klippy::api::protocol::{ApiError, PushTarget, Request, ResponseTemplate};
 use crate::core::klippy::api::registry::{Endpoint, EndpointContext};
+use crate::core::klippy::api::{Api, ApiWiring, RegistrationError};
 use crate::core::klippy::gcode::{GCodeDispatch, OutputHandler, GCODE_OBJECT};
 use crate::core::klippy::printer::Printer;
+
+endpoint!(install);
+
+/// Install every `gcode/*` endpoint.
+///
+/// These resolve `gcode` per request: it is registered while the config is
+/// loaded, after this runs (`api::register` is called before `load_config` so
+/// that `webhooks` is in place before the socket).
+pub(crate) fn install(api: &mut Api, wiring: &ApiWiring<'_>) -> Result<(), RegistrationError> {
+    let printer = Arc::clone(wiring.printer);
+    api.register(GcodeHelp::new(Arc::clone(&printer)))
+        .map_err(RegistrationError::Endpoint)?;
+    api.register(GcodeScript::new(Arc::clone(&printer)))
+        .map_err(RegistrationError::Endpoint)?;
+    api.register(GcodeRestart::restart(Arc::clone(&printer)))
+        .map_err(RegistrationError::Endpoint)?;
+    api.register(GcodeRestart::firmware_restart(Arc::clone(&printer)))
+        .map_err(RegistrationError::Endpoint)?;
+    api.register(GcodeSubscribeOutput::new(Arc::clone(&printer)))
+        .map_err(RegistrationError::Endpoint)
+}
 
 /// Resolve the dispatcher, reporting the printer state if it is not up yet.
 fn gcode(printer: &Printer) -> Result<Arc<GCodeDispatch>, ApiError> {

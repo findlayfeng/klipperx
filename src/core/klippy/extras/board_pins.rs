@@ -38,8 +38,17 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 
 use crate::core::klippy::config::ConfigSection;
+use crate::core::klippy::load::section;
 use crate::core::klippy::pins::{PrinterPins, PINS_OBJECT};
 use crate::core::klippy::printer::{Printer, PrinterObject};
+
+// Both `[board_pins]` and `[board_pins <name>]` are valid.
+section!(
+    "board_pins",
+    order = 30,
+    load = load_config,
+    prefix = load_config_prefix
+);
 
 /// One `[board_pins]` / `[board_pins <name>]` section.
 pub struct BoardPins {

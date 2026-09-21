@@ -23,7 +23,16 @@ use serde_json::{json, Value};
 
 use crate::core::klippy::api::protocol::{ApiError, Request};
 use crate::core::klippy::api::registry::{Endpoint, EndpointContext};
+use crate::core::klippy::api::{Api, ApiWiring, RegistrationError};
 use crate::core::klippy::printer::Printer;
+
+endpoint!(install);
+
+/// Install the `objects/list` endpoint.
+pub(crate) fn install(api: &mut Api, wiring: &ApiWiring<'_>) -> Result<(), RegistrationError> {
+    api.register(ObjectsList::new(Arc::clone(wiring.printer)))
+        .map_err(RegistrationError::Endpoint)
+}
 
 /// The `objects/list` endpoint.
 pub struct ObjectsList {

@@ -68,6 +68,22 @@ pub use klippy_api::{
 // Registering the server's side of the host
 // ===========================================================================
 
+/// What an endpoint installer is handed: the machine it serves and the host's
+/// start arguments.
+pub(crate) struct ApiWiring<'a> {
+    /// The machine every endpoint reads or drives.
+    pub(crate) printer: &'a Arc<Printer>,
+    /// The host's start arguments; `info` reports them, the rest ignore them.
+    pub(crate) start_args: &'a StartArgs,
+}
+
+/// The signature every `endpoint!` declaration names.
+pub(crate) type EndpointInstaller = fn(&mut Api, &ApiWiring<'_>) -> Result<(), RegistrationError>;
+
+// The endpoint table, generated from the `endpoint!` declarations (see
+// `endpoints/mod.rs`).
+include!(concat!(env!("OUT_DIR"), "/endpoint_installers.rs"));
+
 /// Install everything the API server owns onto a machine.
 ///
 /// One call, in one place, because the order it encodes is the contract:
@@ -99,27 +115,13 @@ pub fn register(
             Arc::new(WebhooksStatus::new(Arc::clone(printer))),
         )
         .map_err(RegistrationError::Status)?;
-    api.register(Info::new(Arc::clone(printer), start_args))
-        .map_err(RegistrationError::Endpoint)?;
-    api.register(ObjectsList::new(Arc::clone(printer)))
-        .map_err(RegistrationError::Endpoint)?;
-    api.register(ObjectsQuery::new(Arc::clone(printer)))
-        .map_err(RegistrationError::Endpoint)?;
-    api.register(ObjectsSubscribe::new(Arc::clone(printer)))
-        .map_err(RegistrationError::Endpoint)?;
-    // The G-Code endpoints resolve `gcode` per request: it is registered while
-    // the config is loaded, after this runs (`api::register` is called before
-    // `load_config` so that `webhooks` is in place before the socket).
-    api.register(GcodeHelp::new(Arc::clone(printer)))
-        .map_err(RegistrationError::Endpoint)?;
-    api.register(GcodeScript::new(Arc::clone(printer)))
-        .map_err(RegistrationError::Endpoint)?;
-    api.register(GcodeRestart::restart(Arc::clone(printer)))
-        .map_err(RegistrationError::Endpoint)?;
-    api.register(GcodeRestart::firmware_restart(Arc::clone(printer)))
-        .map_err(RegistrationError::Endpoint)?;
-    api.register(GcodeSubscribeOutput::new(Arc::clone(printer)))
-        .map_err(RegistrationError::Endpoint)?;
+    let wiring = ApiWiring {
+        printer,
+        start_args: &start_args,
+    };
+    for install in ENDPOINT_INSTALLERS {
+        install(api, &wiring)?;
+    }
     Ok(())
 }
 

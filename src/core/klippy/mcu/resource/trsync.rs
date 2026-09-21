@@ -661,4 +661,54 @@ mod tests {
             Some(TriggerReason::HostRequest)
         );
     }
+
+    #[tokio::test]
+    async fn test_two_endstops_on_one_mcu_share_the_registry() {
+        // Two rails whose endstops are on the *same* MCU: each gets its own
+        // dispatch/trsync (distinct oids) but they share the chip's one bound
+        // handler, so the registry must route each report to the right one.
+        let mcu = identified_mcu("mcu");
+        let chip = chip("mcu", Arc::clone(&mcu));
+        let x = TriggerDispatch::new(vec![chip.clone()]).unwrap();
+        let y = TriggerDispatch::new(vec![chip.clone()]).unwrap();
+        let tx = first(&x);
+        let ty = first(&y);
+        assert_ne!(tx.oid, ty.oid, "two endstops must not share an oid");
+        assert!(Arc::ptr_eq(
+            &tx.chip.trsync_registry(),
+            &ty.chip.trsync_registry()
+        ));
+
+        let registry = chip.trsync_registry();
+        registry.register(Arc::clone(&tx), &mcu).unwrap();
+        registry.register(Arc::clone(&ty), &mcu).unwrap();
+        registry.route(TrsyncState {
+            oid: ty.oid,
+            can_trigger: false,
+            trigger_reason: TriggerReason::EndstopHit as u8,
+            clock: 0,
+        });
+
+        // Only Y's group completed.
+        assert_eq!(y.completion().reason(), Some(TriggerReason::EndstopHit));
+        assert_eq!(x.completion().reason(), None);
+    }
+
+    #[tokio::test]
+    async fn test_a_trsync_can_stop_several_steppers() {
+        // A rail with more than one stepper (a shared axis) registers each of
+        // them with the rail's trsync.
+        let dispatch = TriggerDispatch::new(vec![chip("mcu", identified_mcu("mcu"))]).unwrap();
+        dispatch.add_stepper("mcu", 3);
+        dispatch.add_stepper("mcu", 4);
+
+        let trsync = first(&dispatch);
+        assert_eq!(
+            *trsync
+                .stepper_oids
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()),
+            vec![3, 4]
+        );
+    }
 }

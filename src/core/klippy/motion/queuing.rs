@@ -188,4 +188,47 @@ mod tests {
         // The Y stepper produces no commands, so only the trapq had work.
         assert!(queuing.generate(0.2).unwrap().is_empty());
     }
+
+    #[test]
+    fn test_two_steppers_on_one_mcu_both_generate() {
+        // The common case: one MCU drives several motors. The steppers share the
+        // MCU's clock/offset but have independent compressors; a diagonal move
+        // must produce commands for both.
+        let mut queuing = MotionQueuing::new();
+        let mut x = Stepper::cartesian("stepper_x", 0, 1.0, Axis::X, 1_000_000.0);
+        x.compressor_mut().set_time(0.0, 1_000_000.0);
+        let mut y = Stepper::cartesian("stepper_y", 1, 1.0, Axis::Y, 1_000_000.0);
+        y.compressor_mut().set_time(0.0, 1_000_000.0);
+        queuing.add_stepper(x);
+        queuing.add_stepper(y);
+        let mut move_ = Move::new(
+            Coord::default(),
+            Coord::new(10.0, 10.0, 0.0, 0.0),
+            100.0,
+            &limits(),
+        );
+        move_.set_junction(0.0, 10_000.0, 0.0);
+        queuing.append_move(0.0, &move_);
+
+        let batches = queuing.generate(0.2).unwrap();
+
+        let names: Vec<&str> = batches.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names, ["stepper_x", "stepper_y"]);
+        let counts: Vec<u32> = batches
+            .iter()
+            .map(|(_, commands)| {
+                commands
+                    .iter()
+                    .filter_map(|command| match command {
+                        StepCommand::QueueStep { count, .. } => Some(*count),
+                        StepCommand::SetNextStepDir { .. } => None,
+                    })
+                    .sum()
+            })
+            .collect();
+        // The diagonal is symmetric, so both axes take the same number of
+        // steps on the shared clock.
+        assert_eq!(counts[0], counts[1]);
+        assert!(counts[0] >= 9, "{counts:?}");
+    }
 }

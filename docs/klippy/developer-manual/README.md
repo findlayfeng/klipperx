@@ -182,7 +182,8 @@ klipperx（bin，src/main.rs）
 | 文件 | 职责 |
 |------|------|
 | `mod.rs` | 固件事件词汇：`McuEvent`，以及回调注册 `Mcu::bind_event`（底层 `Mcu::bind_callback` 在 `mcu`）；列出 `decl` 与 `printer_bus` |
-| `stats.rs` | `stats` 事件（`basecmd.c` 的 `stats_update` 定时推送）；`register_stats_logging` 为占位订阅（只记日志） |
+| `stats.rs` | `stats` 事件（`basecmd.c` 的 `stats_update` 定时推送，id=-12）；`register_stats_logging` 注册
+|              | 订阅（只记日志），在 `McuObject::connect` 中调用，固件每 5 秒推送一次 |
 | `shutdown.rs` | `shutdown` / `is_shutdown` / `starting`：固件停机/重启事件；`static_string_id` 经字典枚举解成原因文本，由 `McuObject` 绑成打印机停机 |
 | `printer_bus.rs` | `KlippyEvent`：`include!` 由 `build.rs` 写入 `OUT_DIR` 的生成文件 |
 | `decl/` | 打印机事件声明，一个命名空间一个文件，供 `build.rs` 扫描；`mod.rs` 定义空展开的 `event!` 宏 |

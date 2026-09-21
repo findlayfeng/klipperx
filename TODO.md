@@ -112,16 +112,17 @@
 - [ ] **`emergency_stop` / `clear_shutdown` 的对象与端点**：`cmd/shutdown.rs` 的两个命令现在
       只有 `configure` 的复位路径在用 `emergency_stop`；还缺“主机侧停机时通知 MCU”与
       `emergency_stop` 端点（端点本身见 B4，上游 `klippy/mcu.py:801-802` `:883`）。
-- [ ] **`last_stats` 仍未报**：`stats` 事件现在只打日志（`event/stats.rs` 的
-      `register_stats_logging`），所以 `McuObject::get_status` 只报三个 identify 字段。
-      上游由 `MCUStatsHelper` 累计（`klippy/mcu.py:912` `:974-975`），`get_status` 多一个
-      `last_stats`（`klippy/mcu.py:1235`）。需要先有 stats 消费者。
+- [ ] **`last_stats` 仍未报**：`stats` 事件已在 `McuObject::connect` 中注册 handler
+      （`register_stats_logging`），但只打日志不上报。上游由 `MCUStatsHelper` 累计
+      （`klippy/mcu.py:912` `:974-975`），`get_status` 多一个 `last_stats`
+      （`klippy/mcu.py:1235`）。需要先有 stats 消费者。
 - [ ] **错误上报带载荷**：上游 `klippy:notify_mcu_error` 带 `msg` 与 details
       （`klippy/klippy.py:144` `:151`），shutdown 分析走 `klippy:analyze_shutdown`
       （`klippy/klippy.py:216-220`）。带载荷的变体已就位
       （`KlippyEvent::KlippyNotifyMcuError` / `KlippyEvent::KlippyAnalyzeShutdown`；
-      `analyze_shutdown` 已触发并传 `msg`），`notify_mcu_error` 的触发点待接入；当前
-      MCU 错误路径的做法是把原因写进状态消息（上游放在 details 里）。
+      `analyze_shutdown` 已触发并传 `msg`），`notify_mcu_error` 的触发点已接入
+      （`Printer::bring_up` 中 MCU 连接失败路径）；`error_mcu` 模块尚未实现，暂无法
+      丰富错误信息。
 - [ ] **`command` 的固件 `reset`**：复位现在优先 `config_reset`（清配置），上游还会优先用
       固件的 `reset`（真重启 MCU，`HF_IN_SHUTDOWN`）。`restart_method == command` 的
       `firmware_restart` 已在**拆机之前**用活连接发 `reset`
@@ -397,8 +398,8 @@ ack」settle，并用 `Mcu::took_over_session()` 让 `rpi_usb` 判断“有没�
       兜底未声明事件名。设计见 [事件系统](docs/klippy/developer-manual/event-system.md)。
 - [x] **Q3 `PrinterEvent` 是否恢复 `McuIdentify` / `AnalyzeShutdown` / `NotifyMcuError`**：
       随 Q2 一并解决。处理器签名改为 `Fn(&KlippyEvent)`，带载荷事件读变体字段；
-      `mcu_identify` 与 `analyze_shutdown` 已触发，`notify_mcu_error` 待 MCU 错误路径提供
-      `details`。原 `PrinterEvent` 已删除。
+      `mcu_identify`、`analyze_shutdown` 与 `notify_mcu_error` 均已触发。原 `PrinterEvent`
+      已删除。
 - [ ] **Q4 `get_status` 的返回形状**：`serde_json::Value`（贴上游、客户端零适配）还是
       typed + serde。
 - [ ] **Q5 要不要反射式能力**：`lookup_objects(module)` 前缀遍历、`gcode_macro` 的
@@ -427,12 +428,13 @@ ack」settle，并用 `Mcu::took_over_session()` 让 `rpi_usb` 判断“有没�
 | `klippy:shutdown` | 进入 shutdown 状态 | 无 | `klippy/klippy.py:211` | — |
 | `klippy:disconnect` | 运行结束/退出时 | 无 | `klippy/klippy.py:195` | — |
 | `klippy:firmware_restart` | firmware restart 前 | 无 | `klippy/klippy.py:194` | — |
-| `klippy:notify_mcu_error` | MCU 通信出错时 | `msg: str, details: dict` | `klippy/klippy.py:144,151` | — |
+| `klippy:notify_mcu_error` | MCU 通信出错时 | `msg: str, details: dict` | `klippy/klippy.py:144,151` | ✅ 已接入 |
 | `klippy:analyze_shutdown` | 进入 shutdown 后分析 | `msg: str, details: dict` | `klippy/klippy.py:216-220` | — |
 
 > **说明**：两个事件由带载荷的变体承载（`KlippyEvent::KlippyNotifyMcuError` /
 > `KlippyEvent::KlippyAnalyzeShutdown { msg, details }`）。`analyze_shutdown` 已触发并传入
-> `msg`，`details` 暂为空表；`notify_mcu_error` 待 MCU 错误路径提供 `details`。
+> `msg`，`details` 暂为空表；`notify_mcu_error` 已接入 `bring_up` 中 MCU 连接失败路径，
+> `error_mcu` 模块尚未实现。
 
 ### MCU 相关事件
 

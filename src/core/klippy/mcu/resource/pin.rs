@@ -202,7 +202,8 @@ impl McuChip {
         step_pin: PinParams,
         dir_pin: PinParams,
         invert_step: i8,
-        step_pulse_ticks: u32,
+        step_pulse_duration: f64,
+        invert_dir: bool,
     ) -> Arc<McuStepper> {
         Arc::new(McuStepper::new(
             Arc::clone(&self.config),
@@ -212,7 +213,8 @@ impl McuChip {
             step_pin,
             dir_pin,
             invert_step,
-            step_pulse_ticks,
+            step_pulse_duration,
+            invert_dir,
         ))
     }
 
@@ -250,6 +252,23 @@ impl PinChip for McuChip {
             Arc::clone(&self.adc_registry),
             params.clone(),
         )))
+    }
+
+    fn setup_stepper(
+        &self,
+        step_pin: &PinParams,
+        dir_pin: &PinParams,
+        invert_step: i8,
+        step_pulse_duration: f64,
+        invert_dir: bool,
+    ) -> Result<Arc<McuStepper>, PinError> {
+        Ok(self.setup_stepper(
+            step_pin.clone(),
+            dir_pin.clone(),
+            invert_step,
+            step_pulse_duration,
+            invert_dir,
+        ))
     }
 }
 

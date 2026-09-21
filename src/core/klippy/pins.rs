@@ -63,7 +63,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde_json::{json, Value};
 
-use crate::core::klippy::mcu::{Mcu, McuError};
+use crate::core::klippy::mcu::{Mcu, McuError, McuStepper};
 use crate::core::klippy::printer::PrinterObject;
 
 /// The name clients and other modules use to find this object.
@@ -282,6 +282,26 @@ pub trait PinChip: Send + Sync {
     fn setup_adc(&self, _params: &PinParams) -> Result<Arc<dyn Adc>, PinError> {
         Err(PinError::Unsupported(PinType::Adc.as_str().to_string()))
     }
+
+    /// Build a stepper from its already-validated step/dir pins.
+    ///
+    /// A stepper is not quite a pin *type* (upstream's `PrinterStepper` looks
+    /// its two pins up and hands them to `MCU_stepper`), but it is still built
+    /// by the chip the step pin names, so it rides on the same dispatch. The
+    /// default refuses, like [`PinChip::setup_pwm`].
+    ///
+    /// # Errors
+    /// Returns a [`PinError`] if the chip cannot build the resource.
+    fn setup_stepper(
+        &self,
+        _step_pin: &PinParams,
+        _dir_pin: &PinParams,
+        _invert_step: i8,
+        _step_pulse_duration: f64,
+        _invert_dir: bool,
+    ) -> Result<Arc<McuStepper>, PinError> {
+        Err(PinError::Unsupported("stepper".to_string()))
+    }
 }
 
 /// A pin description or pin-sharing mistake.
@@ -331,6 +351,8 @@ pub enum PinError {
     UnknownBus { param: String, bus: String },
     /// The chip does not build this kind of resource (yet).
     Unsupported(String),
+    /// A stepper's step and direction pins name different MCUs.
+    StepperChipMismatch,
     /// A pin with a maximum duration must start and shut down at the same
     /// level, or the firmware would have nothing to fall back to.
     MaxDurationMismatch,
@@ -399,6 +421,9 @@ impl fmt::Display for PinError {
             }
             PinError::Unsupported(kind) => {
                 write!(f, "pin type {kind} not supported on this mcu")
+            }
+            PinError::StepperChipMismatch => {
+                write!(f, "Stepper dir pin must be on same mcu as step pin")
             }
             PinError::MaxDurationMismatch => write!(
                 f,
@@ -960,6 +985,38 @@ impl PrinterPins {
         )?;
         let chip = self.chip(&params.chip_name)?;
         chip.setup_adc(&params)
+    }
+
+    /// Look up a stepper's two pins and build the stepper on their chip.
+    ///
+    /// The step pin's `!` becomes upstream's `invert_step` (`0`/`1`); the
+    /// direction pin's `!` is carried to the wire layer. The two pins must be on
+    /// the same MCU, which upstream checks in `MCU_stepper.__init__`
+    /// (`klippy/stepper.py:41-43`).
+    ///
+    /// # Errors
+    /// Returns whatever validation reports, [`PinError::StepperChipMismatch`]
+    /// when the pins name different chips, or the chip's own error.
+    pub fn setup_stepper(
+        &self,
+        step_pin: &str,
+        dir_pin: &str,
+        step_pulse_duration: f64,
+    ) -> Result<Arc<McuStepper>, PinError> {
+        // A step or direction pin may carry `!`; neither takes a pull-up.
+        let step = self.lookup_pin(step_pin, true, false, None)?;
+        let dir = self.lookup_pin(dir_pin, true, false, None)?;
+        if step.chip_name != dir.chip_name {
+            return Err(PinError::StepperChipMismatch);
+        }
+        let chip = self.chip(&step.chip_name)?;
+        chip.setup_stepper(
+            &step,
+            &dir,
+            i8::from(step.invert),
+            step_pulse_duration,
+            dir.invert,
+        )
     }
 
     /// The registered chip under `name`, cloned out so the caller does not hold

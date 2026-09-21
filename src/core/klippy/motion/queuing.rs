@@ -35,6 +35,22 @@ impl MotionQueuing {
         &self.trapq
     }
 
+    /// The trapezoid queue, to move the current position in it
+    /// ([`Trapq::set_position`]).
+    pub fn trapq_mut(&mut self) -> &mut Trapq {
+        &mut self.trapq
+    }
+
+    /// Drop finished segments from the live queue into the history
+    /// (`trapq_finalize_moves`).
+    ///
+    /// `print_time` is how far the step solvers have generated: anything ending
+    /// before it can never be read again. `clear_history_time` is how old a
+    /// history entry may be before it is dropped.
+    pub fn finalize_moves(&mut self, print_time: f64, clear_history_time: f64) {
+        self.trapq.finalize_moves(print_time, clear_history_time);
+    }
+
     /// Add a stepper to generate for.
     pub fn add_stepper(&mut self, stepper: Stepper) {
         self.steppers.push(stepper);

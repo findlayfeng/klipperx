@@ -233,10 +233,16 @@ impl McuObject {
         step_pin: PinParams,
         dir_pin: PinParams,
         invert_step: i8,
-        step_pulse_ticks: u32,
+        step_pulse_duration: f64,
+        invert_dir: bool,
     ) -> Arc<McuStepper> {
-        self.chip
-            .setup_stepper(step_pin, dir_pin, invert_step, step_pulse_ticks)
+        self.chip.setup_stepper(
+            step_pin,
+            dir_pin,
+            invert_step,
+            step_pulse_duration,
+            invert_dir,
+        )
     }
 
     /// Snapshot a connected MCU's identify status for `objects/query`.

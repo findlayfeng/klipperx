@@ -36,7 +36,7 @@ use crate::core::klippy::cmd::stepper::{
 };
 use crate::core::klippy::cmd::GetClock;
 use crate::core::klippy::config::mcu::McuConfig;
-use crate::core::klippy::config::{Config, ConfigSection};
+use crate::core::klippy::config::{AccessTracking, Config, ConfigSection, ConfigWrapper};
 use crate::core::klippy::mcu::{ConfigBuilder, Mcu, McuError};
 
 /// The first step rate to try, in steps per second.
@@ -176,7 +176,8 @@ async fn stress(args: StressArgs) -> Result<(), Box<dyn std::error::Error>> {
             args.config_file
         )
     })?;
-    let mcu_config = McuConfig::new(section).map_err(std::io::Error::other)?;
+    let mcu_config = McuConfig::new(&ConfigWrapper::new(section, AccessTracking::shared()))
+        .map_err(std::io::Error::other)?;
 
     let mcu = connect(&mcu_config).await?;
     println!(

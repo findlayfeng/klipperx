@@ -36,7 +36,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde_json::{json, Value};
 
-use crate::core::klippy::config::ConfigSection;
+use crate::core::klippy::config::{ConfigError, ConfigWrapper};
 use crate::core::klippy::gcode::{CommandError, CommandHandler, GCodeDispatch, GCODE_OBJECT};
 use crate::core::klippy::load::section;
 use crate::core::klippy::pins::{DigitalOut, PrinterPins, PwmOut, PINS_OBJECT};
@@ -71,23 +71,23 @@ impl OutputPin {
     /// # Errors
     /// Returns a config error (a message naming the section) when an option is
     /// missing, unparseable, or asks for something this port does not do yet.
-    pub fn new(section: &ConfigSection, printer: &Printer) -> Result<Self, String> {
-        let identifier = section.identifier();
-        let name = section.sub.clone().ok_or_else(|| {
-            format!("Section '{identifier}' must be a '[output_pin <name>]' section")
+    pub fn new(config: &ConfigWrapper, printer: &Printer) -> Result<Self, ConfigError> {
+        let identifier = config.identifier();
+        let name = config.section().sub.clone().ok_or_else(|| {
+            ConfigError::new(format!(
+                "Section '{identifier}' must be a '[output_pin <name>]' section"
+            ))
         })?;
 
-        let pin_desc = section
-            .get_str("pin")
-            .ok_or_else(|| format!("Option 'pin' in section '{identifier}' is not specified"))?;
+        let pin_desc = config.get("pin", None)?;
 
-        let value = get_float(section, "value")?.unwrap_or(0.0);
-        let shutdown_value = get_float(section, "shutdown_value")?.unwrap_or(0.0);
+        let value = config.get_float("value", Some(0.0))?;
+        let shutdown_value = config.get_float("shutdown_value", Some(0.0))?;
         for (option, v) in [("value", value), ("shutdown_value", shutdown_value)] {
             if !(0.0..=1.0).contains(&v) {
-                return Err(format!(
+                return Err(ConfigError::new(format!(
                     "Option '{option}' in section '{identifier}' must be between 0 and 1"
-                ));
+                )));
             }
         }
 
@@ -98,25 +98,25 @@ impl OutputPin {
         // Upstream disables the firmware's max-duration limit for an
         // `output_pin` unconditionally, which is what lets `value` and
         // `shutdown_value` differ.
-        let handle = if get_bool(section, "pwm")?.unwrap_or(false) {
+        let handle = if config.get_bool("pwm", Some(false))? {
             let pwm = pins
-                .setup_pwm(pin_desc, None)
-                .map_err(|err| format!("{identifier}: {err}"))?;
-            let cycle_time = get_float(section, "cycle_time")?.unwrap_or(0.100);
+                .setup_pwm(&pin_desc, None)
+                .map_err(|err| ConfigError::new(format!("{identifier}: {err}")))?;
+            let cycle_time = config.get_float("cycle_time", Some(0.100))?;
             if cycle_time <= 0.0 {
-                return Err(format!(
+                return Err(ConfigError::new(format!(
                     "Option 'cycle_time' in section '{identifier}' must be above 0"
-                ));
+                )));
             }
-            let hardware_pwm = get_bool(section, "hardware_pwm")?.unwrap_or(false);
+            let hardware_pwm = config.get_bool("hardware_pwm", Some(false))?;
             pwm.setup_cycle_time(cycle_time, hardware_pwm);
             pwm.setup_max_duration(0.0);
             pwm.setup_start_value(value, shutdown_value);
             PinHandle::Pwm(pwm)
         } else {
             let pin = pins
-                .setup_digital_out(pin_desc, None)
-                .map_err(|err| format!("{identifier}: {err}"))?;
+                .setup_digital_out(&pin_desc, None)
+                .map_err(|err| ConfigError::new(format!("{identifier}: {err}")))?;
             pin.setup_max_duration(0.0);
             pin.setup_start_value(value >= 0.5, shutdown_value >= 0.5);
             PinHandle::Digital(pin)
@@ -140,7 +140,7 @@ impl OutputPin {
                 handler,
                 Some("Set the value of a pin"),
             )
-            .map_err(|err| format!("{identifier}: {err}"))?;
+            .map_err(|err| ConfigError::new(format!("{identifier}: {err}")))?;
 
         Ok(Self {
             name,
@@ -200,46 +200,15 @@ fn cmd_set_pin(
     Ok(())
 }
 
-/// Read a boolean option the way upstream's `getboolean` does.
-///
-/// Upstream's `configparser` accepts `1`/`yes`/`true`/`on` (and the negatives);
-/// this host's config values are strings, so the accepted set is spelled out.
-fn get_bool(section: &ConfigSection, name: &str) -> Result<Option<bool>, String> {
-    let Some(text) = section.get_str(name) else {
-        return Ok(None);
-    };
-    match text.trim().to_ascii_lowercase().as_str() {
-        "1" | "yes" | "true" | "on" => Ok(Some(true)),
-        "0" | "no" | "false" | "off" => Ok(Some(false)),
-        _ => Err(format!(
-            "Unable to parse option '{name}' in section '{}'",
-            section.identifier()
-        )),
-    }
-}
-
-/// Read a float option, reporting upstream's parse error when it is malformed.
-fn get_float(section: &ConfigSection, name: &str) -> Result<Option<f64>, String> {
-    let Some(text) = section.get_str(name) else {
-        return Ok(None);
-    };
-    text.trim().parse::<f64>().map(Some).map_err(|_| {
-        format!(
-            "Unable to parse option '{name}' in section '{}'",
-            section.identifier()
-        )
-    })
-}
-
 /// Upstream's `load_config_prefix` for `[output_pin <name>]`.
 ///
 /// The loader registers the object under the section identifier
 /// (`output_pin fan`); `SET_PIN` addresses it by the sub (`fan`).
 pub fn load_config_prefix(
-    section: &ConfigSection,
+    config: &ConfigWrapper,
     printer: &Arc<Printer>,
-) -> Result<Arc<dyn PrinterObject>, String> {
-    Ok(Arc::new(OutputPin::new(section, printer)?))
+) -> Result<Arc<dyn PrinterObject>, ConfigError> {
+    Ok(Arc::new(OutputPin::new(config, printer)?))
 }
 
 // ===========================================================================
@@ -249,7 +218,7 @@ pub fn load_config_prefix(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::klippy::config::ConfigValue;
+    use crate::core::klippy::config::{ConfigSection, ConfigValue};
     use crate::core::klippy::event::KlippyEvent;
     use crate::core::klippy::mcu::McuError;
     use crate::core::klippy::pins::{PinChip, PinError, PinParams, PwmOut};
@@ -364,6 +333,11 @@ mod tests {
         section
     }
 
+    /// Wrap a hand-built section the way the loader does.
+    fn wrap(section: &ConfigSection) -> ConfigWrapper<'_> {
+        ConfigWrapper::untracked(section)
+    }
+
     fn gcode(printer: &Arc<Printer>) -> Arc<GCodeDispatch> {
         printer
             .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
@@ -379,7 +353,7 @@ mod tests {
         let (printer, chip) = printer();
         let section = section("fan", "PA1", &[("value", "1"), ("shutdown_value", "0")]);
 
-        OutputPin::new(&section, &printer).unwrap();
+        OutputPin::new(&wrap(&section), &printer).unwrap();
 
         let out = created(&chip, 0);
         assert_eq!(*out.max_duration.lock().unwrap(), 0.0);
@@ -389,7 +363,7 @@ mod tests {
     #[test]
     fn test_set_pin_drives_the_output() {
         let (printer, chip) = printer();
-        let pin = OutputPin::new(&section("fan", "PA1", &[]), &printer).unwrap();
+        let pin = OutputPin::new(&wrap(&section("fan", "PA1", &[])), &printer).unwrap();
 
         gcode(&printer)
             .run_script("SET_PIN PIN=fan VALUE=1")
@@ -407,7 +381,7 @@ mod tests {
     #[test]
     fn test_set_pin_treats_a_half_as_on() {
         let (printer, chip) = printer();
-        OutputPin::new(&section("fan", "PA1", &[]), &printer).unwrap();
+        OutputPin::new(&wrap(&section("fan", "PA1", &[])), &printer).unwrap();
 
         gcode(&printer)
             .run_script("SET_PIN PIN=fan VALUE=0.5")
@@ -419,7 +393,7 @@ mod tests {
     #[test]
     fn test_set_pin_requires_a_value() {
         let (printer, _chip) = printer();
-        OutputPin::new(&section("fan", "PA1", &[]), &printer).unwrap();
+        OutputPin::new(&wrap(&section("fan", "PA1", &[])), &printer).unwrap();
 
         let err = gcode(&printer).run_script("SET_PIN PIN=fan").unwrap_err();
 
@@ -429,8 +403,8 @@ mod tests {
     #[test]
     fn test_two_pins_are_driven_independently() {
         let (printer, chip) = printer();
-        OutputPin::new(&section("fan", "PA1", &[]), &printer).unwrap();
-        OutputPin::new(&section("light", "PA2", &[]), &printer).unwrap();
+        OutputPin::new(&wrap(&section("fan", "PA1", &[])), &printer).unwrap();
+        OutputPin::new(&wrap(&section("light", "PA2", &[])), &printer).unwrap();
 
         gcode(&printer)
             .run_script("SET_PIN PIN=light VALUE=1")
@@ -445,11 +419,11 @@ mod tests {
         let (printer, _chip) = printer();
         let section = ConfigSection::new("output_pin", Some("fan"));
 
-        let err = OutputPin::new(&section, &printer).unwrap_err();
+        let err = OutputPin::new(&wrap(&section), &printer).unwrap_err();
 
         assert_eq!(
-            err,
-            "Option 'pin' in section 'output_pin fan' is not specified"
+            err.to_string(),
+            "Option 'pin' in section 'output_pin fan' must be specified"
         );
     }
 
@@ -457,11 +431,11 @@ mod tests {
     fn test_an_unparseable_value_is_reported() {
         let (printer, _chip) = printer();
 
-        let err =
-            OutputPin::new(&section("fan", "PA1", &[("value", "abc")]), &printer).unwrap_err();
+        let err = OutputPin::new(&wrap(&section("fan", "PA1", &[("value", "abc")])), &printer)
+            .unwrap_err();
 
         assert_eq!(
-            err,
+            err.to_string(),
             "Unable to parse option 'value' in section 'output_pin fan'"
         );
     }
@@ -475,7 +449,7 @@ mod tests {
             &[("pwm", "true"), ("cycle_time", "0.05"), ("value", "0.5")],
         );
 
-        OutputPin::new(&section, &printer).unwrap();
+        OutputPin::new(&wrap(&section), &printer).unwrap();
 
         let pwm = chip.pwms.lock().unwrap()[0].clone();
         assert_eq!(*pwm.max_duration.lock().unwrap(), 0.0);
@@ -493,7 +467,7 @@ mod tests {
         let (printer, chip) = printer();
         let section = section("fan", "PA1", &[("pwm", "true"), ("hardware_pwm", "true")]);
 
-        OutputPin::new(&section, &printer).unwrap();
+        OutputPin::new(&wrap(&section), &printer).unwrap();
 
         assert_eq!(
             *chip.pwms.lock().unwrap()[0].cycle_time.lock().unwrap(),
@@ -506,21 +480,21 @@ mod tests {
         let (printer, _chip) = printer();
         let section = section("fan", "PA1", &[("pwm", "true"), ("cycle_time", "0")]);
 
-        let err = OutputPin::new(&section, &printer).unwrap_err();
+        let err = OutputPin::new(&wrap(&section), &printer).unwrap_err();
 
-        assert!(err.contains("cycle_time"), "{err}");
-        assert!(err.contains("above 0"), "{err}");
+        assert!(err.to_string().contains("cycle_time"), "{err}");
+        assert!(err.to_string().contains("above 0"), "{err}");
     }
 
     #[test]
     fn test_an_unparseable_boolean_is_reported() {
         let (printer, _chip) = printer();
 
-        let err =
-            OutputPin::new(&section("fan", "PA1", &[("pwm", "maybe")]), &printer).unwrap_err();
+        let err = OutputPin::new(&wrap(&section("fan", "PA1", &[("pwm", "maybe")])), &printer)
+            .unwrap_err();
 
         assert_eq!(
-            err,
+            err.to_string(),
             "Unable to parse option 'pwm' in section 'output_pin fan'"
         );
     }

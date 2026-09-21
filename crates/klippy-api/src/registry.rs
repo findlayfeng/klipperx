@@ -30,6 +30,7 @@
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::fmt;
+use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, RwLock};
 
 use super::protocol::{ApiError, PushTarget, Request, ResponseTemplate};
@@ -203,6 +204,13 @@ struct RemoteRegistration {
     template: ResponseTemplate,
 }
 
+/// Called when a request handler fails on its own account.
+///
+/// The message is what upstream passes to `invoke_shutdown`
+/// (`Internal Error on WebRequest: <method>`); see
+/// [`Api::set_internal_error_hook`].
+pub type InternalErrorHook = Arc<dyn Fn(&str) + Send + Sync>;
+
 /// The endpoint table, and the entry point for dispatching requests.
 ///
 /// Build it while creating printer objects, then share it with the
@@ -211,6 +219,14 @@ pub struct Api {
     endpoints: BTreeMap<String, Arc<dyn Endpoint>>,
     mux: BTreeMap<String, Mux>,
     remote: RwLock<BTreeMap<String, Vec<RemoteRegistration>>>,
+    /// What to tell the host when a handler fails on its own account.
+    ///
+    /// Upstream shuts klippy down when a `webhooks` callback raises anything
+    /// that is not a command error (`klippy/webhooks.py:271-276`). That is the
+    /// host's decision, not the API crate's, so the crate calls this hook —
+    /// `api::register` points it at `Printer::invoke_shutdown`. `None` means
+    /// "just answer the error", which is what the crate's own tests want.
+    internal_error: Option<InternalErrorHook>,
 }
 
 impl Api {
@@ -225,10 +241,20 @@ impl Api {
             endpoints: BTreeMap::new(),
             mux: BTreeMap::new(),
             remote: RwLock::new(BTreeMap::new()),
+            internal_error: None,
         };
         api.register(ListEndpoints)
             .expect("the built-in path is free in a new registry");
         api
+    }
+
+    /// Install what to call when a handler fails on its own account.
+    ///
+    /// The hook is given the message to report (`Internal Error on WebRequest:
+    /// <method>`), exactly as upstream passes it to `invoke_shutdown`. It must
+    /// not block.
+    pub fn set_internal_error_hook(&mut self, hook: InternalErrorHook) {
+        self.internal_error = Some(hook);
     }
 
     /// Register an endpoint under its own [`Endpoint::path`].
@@ -377,21 +403,51 @@ impl Api {
     /// # Errors
     /// Returns [`ApiError::UnknownEndpoint`] if no endpoint or mux path matches
     /// the method, otherwise whatever the handler returned.
+    ///
+    /// A handler that panics is reported as [`ApiError::Internal`] and the
+    /// internal-error hook is called: upstream catches the same exception, shuts
+    /// the printer down, and still answers the client
+    /// (`klippy/webhooks.py:271-276`). An [`ApiError::Internal`] a handler
+    /// returns deliberately goes the same way.
     pub fn dispatch(
         &self,
         request: &Request,
         client: Arc<dyn PushTarget>,
     ) -> Result<Value, ApiError> {
         let context = EndpointContext { api: self, client };
+        let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            if let Some(mux) = self.mux.get(request.method()) {
+                return mux.dispatch(request, &context);
+            }
+            let endpoint = self
+                .endpoints
+                .get(request.method())
+                .ok_or_else(|| ApiError::UnknownEndpoint(request.method().to_string()))?;
+            endpoint.handle(request, &context)
+        }));
 
-        if let Some(mux) = self.mux.get(request.method()) {
-            return mux.dispatch(request, &context);
+        match outcome {
+            Ok(result) => {
+                if let Err(err) = &result {
+                    if err.is_internal() {
+                        self.report_internal(&err.to_string());
+                    }
+                }
+                result
+            }
+            Err(_) => {
+                let msg = format!("Internal Error on WebRequest: {}", request.method());
+                self.report_internal(&msg);
+                Err(ApiError::Internal(msg))
+            }
         }
-        let endpoint = self
-            .endpoints
-            .get(request.method())
-            .ok_or_else(|| ApiError::UnknownEndpoint(request.method().to_string()))?;
-        endpoint.handle(request, &context)
+    }
+
+    /// Tell the host a handler failed on its own account, if it wants to know.
+    fn report_internal(&self, msg: &str) {
+        if let Some(hook) = &self.internal_error {
+            hook(msg);
+        }
     }
 
     /// Whether `path` is already an endpoint or a mux path.
@@ -502,6 +558,40 @@ mod tests {
             _context: &EndpointContext<'_>,
         ) -> Result<Value, ApiError> {
             Err(ApiError::Internal("boom".to_string()))
+        }
+    }
+
+    /// An endpoint that refuses the request, for the non-shutdown path.
+    struct CommandFailing;
+
+    impl Endpoint for CommandFailing {
+        fn path(&self) -> &'static str {
+            "command_failing"
+        }
+
+        fn handle(
+            &self,
+            _request: &Request,
+            _context: &EndpointContext<'_>,
+        ) -> Result<Value, ApiError> {
+            Err(ApiError::CommandError("bad input".to_string()))
+        }
+    }
+
+    /// An endpoint that panics, for the internal-error path.
+    struct Panicking;
+
+    impl Endpoint for Panicking {
+        fn path(&self) -> &'static str {
+            "panicking"
+        }
+
+        fn handle(
+            &self,
+            _request: &Request,
+            _context: &EndpointContext<'_>,
+        ) -> Result<Value, ApiError> {
+            panic!("handler bug")
         }
     }
 
@@ -670,10 +760,61 @@ mod tests {
     fn test_dispatch_propagates_a_handler_failure() {
         let mut api = Api::new();
         api.register(Failing).unwrap();
+        let hooks = Arc::new(Mutex::new(Vec::new()));
+        {
+            let hooks = Arc::clone(&hooks);
+            api.set_internal_error_hook(Arc::new(move |msg: &str| {
+                hooks.lock().unwrap().push(msg.to_string());
+            }));
+        }
 
         let error = dispatch(&api, r#"{"method":"failing"}"#).unwrap_err();
         assert!(error.is_internal());
         assert_eq!(error.to_string(), "boom");
+        // An internal error is also reported to the host, which shuts the
+        // printer down (upstream `webhooks.py:271-276`).
+        assert_eq!(*hooks.lock().unwrap(), ["boom"]);
+    }
+
+    #[test]
+    fn test_a_panicking_handler_is_an_internal_error_and_calls_the_hook() {
+        let mut api = Api::new();
+        api.register(Panicking).unwrap();
+        let hooks = Arc::new(Mutex::new(Vec::new()));
+        {
+            let hooks = Arc::clone(&hooks);
+            api.set_internal_error_hook(Arc::new(move |msg: &str| {
+                hooks.lock().unwrap().push(msg.to_string());
+            }));
+        }
+
+        let error = dispatch(&api, r#"{"method":"panicking"}"#).unwrap_err();
+        assert_eq!(
+            error,
+            ApiError::Internal("Internal Error on WebRequest: panicking".to_string())
+        );
+        assert_eq!(
+            *hooks.lock().unwrap(),
+            ["Internal Error on WebRequest: panicking"]
+        );
+    }
+
+    #[test]
+    fn test_a_command_error_does_not_call_the_internal_hook() {
+        // The client's own mistake must not take the printer down.
+        let mut api = Api::new();
+        api.register(CommandFailing).unwrap();
+        let hooks = Arc::new(Mutex::new(Vec::new()));
+        {
+            let hooks = Arc::clone(&hooks);
+            api.set_internal_error_hook(Arc::new(move |msg: &str| {
+                hooks.lock().unwrap().push(msg.to_string());
+            }));
+        }
+
+        let error = dispatch(&api, r#"{"method":"command_failing"}"#).unwrap_err();
+        assert_eq!(error, ApiError::CommandError("bad input".to_string()));
+        assert!(hooks.lock().unwrap().is_empty());
     }
 
     #[test]

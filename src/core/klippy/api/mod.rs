@@ -44,7 +44,7 @@ pub(crate) mod test_support;
 use std::fmt;
 use std::sync::Arc;
 
-use crate::core::klippy::error::KlippyError;
+use crate::core::klippy::error::ConfigError;
 use crate::core::klippy::printer::Printer;
 
 pub use endpoints::{
@@ -115,6 +115,13 @@ pub fn register(
             Arc::new(WebhooksStatus::new(Arc::clone(printer))),
         )
         .map_err(RegistrationError::Status)?;
+    // A request handler that fails on its own account takes the printer down,
+    // as upstream's `_process_request` does (`klippy/webhooks.py:271-276`). The
+    // decision belongs to the host, so the API crate only knows the hook.
+    api.set_internal_error_hook({
+        let printer = Arc::clone(printer);
+        Arc::new(move |msg: &str| printer.invoke_shutdown(msg))
+    });
     let wiring = ApiWiring {
         printer,
         start_args: &start_args,
@@ -133,7 +140,7 @@ pub fn register(
 #[derive(Debug)]
 pub enum RegistrationError {
     /// A printer object name was already taken.
-    Status(KlippyError),
+    Status(ConfigError),
     /// An endpoint path was already taken.
     Endpoint(klippy_api::RegistrationError),
 }
@@ -187,6 +194,7 @@ mod tests {
         assert_eq!(
             api.endpoints(),
             [
+                "emergency_stop",
                 "gcode/firmware_restart",
                 "gcode/help",
                 "gcode/restart",

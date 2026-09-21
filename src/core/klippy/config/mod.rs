@@ -7,19 +7,30 @@
 // - Multiline values: indented lines continue previous value
 // - Empty sections: [id] with no parameters
 
+pub mod access;
 pub mod mcu;
+pub mod object;
 pub mod section;
 pub mod source;
+pub mod validate;
 pub mod value;
+pub mod wrapper;
 
 use std::collections::HashSet;
 use std::fs;
 use std::io::Read;
 use std::path::Path;
 
+pub use access::AccessTracking;
+pub use object::PrinterConfig;
 pub use section::ConfigSection;
 pub use source::ConfigSource;
+pub use validate::check_unused;
 pub use value::ConfigValue;
+pub use wrapper::ConfigWrapper;
+
+// Re-exported so a section module imports everything config-related from here.
+pub use crate::core::klippy::error::ConfigError;
 
 /// Represents a complete Klipper configuration file
 #[derive(Debug, Clone)]

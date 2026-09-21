@@ -191,6 +191,8 @@ struct SectionDecl {
     order: i64,
     load: Option<String>,
     prefix: Option<String>,
+    object: Option<String>,
+    phase: String,
 }
 
 fn collect_sections(source: &str, file: &Path, src_dir: &Path, out: &mut Vec<SectionDecl>) {
@@ -211,6 +213,8 @@ fn parse_section(invocation: &Invocation, module: &str) -> SectionDecl {
     let mut order = None;
     let mut load = None;
     let mut prefix = None;
+    let mut object = None;
+    let mut phase = None;
     for part in &parts[1..] {
         let (key, value) = split_once_top_level(part, '=').unwrap_or_else(|| {
             panic!("section! option must be `key = value`, got `{part}` ({where_})")
@@ -223,6 +227,19 @@ fn parse_section(invocation: &Invocation, module: &str) -> SectionDecl {
             }
             "load" => load = Some(resolve_item(value.trim(), module)),
             "prefix" => prefix = Some(resolve_item(value.trim(), module)),
+            "object" => {
+                object = Some(unquote(value.trim()).unwrap_or_else(|| {
+                    panic!("section `{name}` object must be a quoted name ({where_})")
+                }))
+            }
+            "phase" => {
+                let value = value.trim();
+                assert!(
+                    matches!(value, "early" | "generic" | "late"),
+                    "section `{name}` phase must be early|generic|late, got `{value}` ({where_})"
+                );
+                phase = Some(value.to_string());
+            }
             other => panic!("section `{name}` has an unknown option `{other}` ({where_})"),
         }
     }
@@ -236,6 +253,8 @@ fn parse_section(invocation: &Invocation, module: &str) -> SectionDecl {
         order,
         load,
         prefix,
+        object,
+        phase: phase.unwrap_or_else(|| "generic".to_string()),
     }
 }
 
@@ -266,6 +285,14 @@ fn render_sections(sections: &[SectionDecl]) -> String {
             "            load_config_prefix: {},\n",
             option_path(&section.prefix)
         ));
+        out.push_str(&format!(
+            "            object: {},\n",
+            option_string(&section.object)
+        ));
+        out.push_str(&format!(
+            "            phase: Phase::{},\n",
+            capitalize(&section.phase)
+        ));
         out.push_str("        },\n    ),\n");
     }
     out.push_str("];\n");
@@ -275,6 +302,14 @@ fn render_sections(sections: &[SectionDecl]) -> String {
 fn option_path(path: &Option<String>) -> String {
     match path {
         Some(path) => format!("Some({path})"),
+        None => "None".to_string(),
+    }
+}
+
+/// A `Some("name")` for an `object = "name"` declaration.
+fn option_string(value: &Option<String>) -> String {
+    match value {
+        Some(value) => format!("Some({value:?})"),
         None => "None".to_string(),
     }
 }

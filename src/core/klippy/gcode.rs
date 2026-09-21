@@ -38,11 +38,12 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use serde_json::{json, Map, Value};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::core::klippy::event::KlippyEvent;
 use crate::core::klippy::printer::{Printer, PrinterObject};
@@ -698,7 +699,9 @@ fn process_line(inner: &Arc<Inner>, line: &str, need_ack: bool) -> Result<(), Co
     // parameters to `cmd_default` and only a registered extended command goes
     // through `_get_extended_params`.
     let Some(handler) = handler else {
-        return default_handler(inner, &parsed, need_ack);
+        return invoke_handler(inner, &parsed.command, || {
+            default_handler(inner, &parsed, need_ack)
+        });
     };
 
     // An extended command's parameters are `KEY=VALUE`; re-parse the raw text so
@@ -717,7 +720,34 @@ fn process_line(inner: &Arc<Inner>, line: &str, need_ack: bool) -> Result<(), Co
         params,
         need_ack,
     };
-    handler(&gcmd)
+    invoke_handler(inner, &gcmd.command, || handler(&gcmd))
+}
+
+/// Run one command handler, turning a panic into an internal-error shutdown.
+///
+/// Upstream's bare `except:` around `handler(gcmd)`
+/// (`klippy/gcode.py:230-234`): an exception that is not a `CommandError` means
+/// klippy itself is wrong, so the printer is shut down with
+/// `Internal error on command:"X"` and the client is still told what happened.
+/// Rust has no catch-all exception type, so a handler that gives up reports it by
+/// panicking; the panic is caught here, where the command is known.
+///
+/// A [`CommandError`] is the user's problem and passes through untouched — it
+/// does not shut the printer down.
+fn invoke_handler(
+    inner: &Arc<Inner>,
+    command: &str,
+    call: impl FnOnce() -> Result<(), CommandError>,
+) -> Result<(), CommandError> {
+    match std::panic::catch_unwind(AssertUnwindSafe(call)) {
+        Ok(result) => result,
+        Err(_) => {
+            let msg = format!("Internal error on command:\"{command}\"");
+            error!("{msg}");
+            inner.printer.invoke_shutdown(&msg);
+            Err(CommandError::new(msg))
+        }
+    }
 }
 
 /// The handler for an unregistered command (`klippy/gcode.py:283-316`).
@@ -1836,5 +1866,49 @@ mod tests {
 
         assert!(status["commands"]["M110"].is_object());
         assert!(status["commands"]["SET_PIN"].is_null());
+    }
+
+    #[test]
+    fn test_a_handler_that_panics_shuts_the_printer_down() {
+        // Upstream's bare `except:` around a handler (`klippy/gcode.py:230-234`):
+        // anything that is not a `CommandError` is klippy's own bug, so the
+        // printer is halted with the command named.
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        let dispatch = GCodeDispatch::new(Arc::clone(&printer));
+        dispatch.inner.set_ready(true);
+        dispatch
+            .register_command("BOOM", Arc::new(|_| panic!("handler bug")), None, false)
+            .unwrap();
+
+        let err = dispatch.run_script("BOOM").unwrap_err();
+
+        assert_eq!(err.to_string(), "Internal error on command:\"BOOM\"");
+        assert_eq!(
+            printer.get_state_message().category,
+            crate::core::klippy::printer::PrinterState::Shutdown
+        );
+    }
+
+    #[test]
+    fn test_a_command_error_does_not_shut_the_printer_down() {
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        let dispatch = GCodeDispatch::new(Arc::clone(&printer));
+        dispatch.inner.set_ready(true);
+        dispatch
+            .register_command(
+                "BAD",
+                Arc::new(|_| Err(CommandError::new("bad parameter"))),
+                None,
+                false,
+            )
+            .unwrap();
+
+        let err = dispatch.run_script("BAD").unwrap_err();
+
+        assert_eq!(err.to_string(), "bad parameter");
+        assert_ne!(
+            printer.get_state_message().category,
+            crate::core::klippy::printer::PrinterState::Shutdown
+        );
     }
 }

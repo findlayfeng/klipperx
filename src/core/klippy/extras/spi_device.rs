@@ -41,7 +41,7 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 
-use crate::core::klippy::config::ConfigSection;
+use crate::core::klippy::config::{ConfigError, ConfigWrapper};
 use crate::core::klippy::gcode::{
     CommandError, CommandHandler, GCodeDispatch, GcodeCommand, GCODE_OBJECT,
 };
@@ -50,7 +50,7 @@ use crate::core::klippy::mcu::{McuObject, McuSpi, SpiMode};
 use crate::core::klippy::pins::{PrinterPins, PINS_OBJECT};
 use crate::core::klippy::printer::{Printer, PrinterObject};
 
-use super::bus_debug::{block_on, get_bool, hex_decode, hex_encode, parse_int};
+use super::bus_debug::{block_on, hex_decode, hex_encode};
 
 // Loaded after `[board_pins]` (order 30), because a software bus or the CS pin
 // may be named through an alias.
@@ -80,21 +80,24 @@ impl SpiDevice {
     /// # Errors
     /// Returns a config error (a message naming the section) when an option is
     /// missing, unparseable, or names an MCU or pin this machine does not have.
-    pub fn new(section: &ConfigSection, printer: &Printer) -> Result<Self, String> {
-        let identifier = section.identifier();
-        let name = section.sub.clone().ok_or_else(|| {
-            format!("Section '{identifier}' must be a '[spi_device <name>]' section")
+    pub fn new(config: &ConfigWrapper, printer: &Printer) -> Result<Self, ConfigError> {
+        let identifier = config.identifier();
+        let name = config.section().sub.clone().ok_or_else(|| {
+            ConfigError::new(format!(
+                "Section '{identifier}' must be a '[spi_device <name>]' section"
+            ))
         })?;
 
-        let mcu_name = section
+        let mcu_name = config
             .get_str("spi_mcu")
-            .map(str::trim)
-            .unwrap_or("mcu")
-            .to_string();
+            .map(|text| text.trim().to_string())
+            .unwrap_or_else(|| "mcu".to_string());
         let object_name = mcu_object_name(&mcu_name);
         let mcu_object = printer
             .lookup_object_as::<McuObject>(&object_name)
-            .ok_or_else(|| format!("Section '{identifier}': unknown MCU '{mcu_name}'"))?;
+            .ok_or_else(|| {
+                ConfigError::new(format!("Section '{identifier}': unknown MCU '{mcu_name}'"))
+            })?;
 
         let pins = printer
             .lookup_object_as::<PrinterPins>(PINS_OBJECT)
@@ -102,55 +105,56 @@ impl SpiDevice {
 
         // Chip select. `cs_pin: None` (or no `cs_pin`) means the firmware does
         // not drive one: `config_spi_without_cs`.
-        let cs_pin = match section.get_str("cs_pin").map(str::trim) {
-            None | Some("None") => None,
+        let cs_pin = match config.get_str("cs_pin").map(|text| text.trim().to_string()) {
+            None => None,
+            Some(description) if description == "None" => None,
             Some(description) => {
                 let params = pins
-                    .lookup_pin(description, false, false, Some("cs"))
-                    .map_err(|err| format!("{identifier}: {err}"))?;
+                    .lookup_pin(&description, false, false, Some("cs"))
+                    .map_err(|err| ConfigError::new(format!("{identifier}: {err}")))?;
                 if params.chip_name != mcu_name {
-                    return Err(format!(
+                    return Err(ConfigError::new(format!(
                         "Section '{identifier}': cs_pin must be on mcu '{mcu_name}'"
-                    ));
+                    )));
                 }
                 Some(params)
             }
         };
-        let cs_active_high = get_bool(section, "cs_active_high")?.unwrap_or(false);
+        let cs_active_high = config.get_bool("cs_active_high", Some(false))?;
 
-        let speed = parse_int(section, "spi_speed")?.unwrap_or(i64::from(DEFAULT_SPEED));
+        let speed = config.get_int("spi_speed", Some(i64::from(DEFAULT_SPEED)))?;
         if !(i64::from(MIN_SPEED)..=i64::from(u32::MAX)).contains(&speed) {
-            return Err(format!(
+            return Err(ConfigError::new(format!(
                 "Option 'spi_speed' in section '{identifier}' must be at least {MIN_SPEED}"
-            ));
+            )));
         }
         let speed = speed as u32;
 
-        let spi_mode = parse_int(section, "spi_mode")?.unwrap_or(0);
+        let spi_mode = config.get_int("spi_mode", Some(0))?;
         if !(0..=3).contains(&spi_mode) {
-            return Err(format!(
+            return Err(ConfigError::new(format!(
                 "Option 'spi_mode' in section '{identifier}' must be between 0 and 3"
-            ));
+            )));
         }
         let spi_mode = spi_mode as u8;
 
         let mode = match (
-            section.get_str("spi_software_miso_pin"),
-            section.get_str("spi_software_mosi_pin"),
-            section.get_str("spi_software_sclk_pin"),
+            config.get_str("spi_software_miso_pin"),
+            config.get_str("spi_software_mosi_pin"),
+            config.get_str("spi_software_sclk_pin"),
         ) {
             (Some(miso), Some(mosi), Some(sclk)) => {
                 let software = [("miso", miso), ("mosi", mosi), ("sclk", sclk)];
                 let mut pins_out = Vec::with_capacity(3);
                 for (role, description) in software {
                     let params = pins
-                        .lookup_pin(description, false, false, Some(role))
-                        .map_err(|err| format!("{identifier}: {err}"))?;
+                        .lookup_pin(&description, false, false, Some(role))
+                        .map_err(|err| ConfigError::new(format!("{identifier}: {err}")))?;
                     if params.chip_name != mcu_name {
-                        return Err(format!(
+                        return Err(ConfigError::new(format!(
                             "Section '{identifier}': spi_software_{role}_pin must be on mcu \
                              '{mcu_name}'"
-                        ));
+                        )));
                     }
                     pins_out.push(params.pin);
                 }
@@ -163,15 +167,15 @@ impl SpiDevice {
                 }
             }
             (None, None, None) => SpiMode::Hardware {
-                bus: section.get_str("spi_bus").map(str::to_string),
+                bus: config.get_str("spi_bus"),
                 speed,
                 mode: spi_mode,
             },
             _ => {
-                return Err(format!(
+                return Err(ConfigError::new(format!(
                     "Section '{identifier}': all three of 'spi_software_miso_pin', \
                      'spi_software_mosi_pin' and 'spi_software_sclk_pin' must be set"
-                ));
+                )));
             }
         };
 
@@ -192,7 +196,7 @@ impl SpiDevice {
                 transfer_handler,
                 Some("Full-duplex SPI transfer (debug)"),
             )
-            .map_err(|err| format!("{identifier}: {err}"))?;
+            .map_err(|err| ConfigError::new(format!("{identifier}: {err}")))?;
         let send_handler: CommandHandler = {
             let device = Arc::clone(&device);
             Arc::new(move |gcmd| cmd_spi_send(&device, gcmd))
@@ -205,7 +209,7 @@ impl SpiDevice {
                 send_handler,
                 Some("Shift bytes out on an SPI device (debug)"),
             )
-            .map_err(|err| format!("{identifier}: {err}"))?;
+            .map_err(|err| ConfigError::new(format!("{identifier}: {err}")))?;
 
         Ok(Self {
             name,
@@ -274,10 +278,10 @@ fn cmd_spi_send(device: &Arc<McuSpi>, gcmd: &GcodeCommand) -> Result<(), Command
 
 /// Upstream's `load_config_prefix` for `[spi_device <name>]`.
 pub fn load_config_prefix(
-    section: &ConfigSection,
+    config: &ConfigWrapper,
     printer: &Arc<Printer>,
-) -> Result<Arc<dyn PrinterObject>, String> {
-    Ok(Arc::new(SpiDevice::new(section, printer)?))
+) -> Result<Arc<dyn PrinterObject>, ConfigError> {
+    Ok(Arc::new(SpiDevice::new(config, printer)?))
 }
 
 // ===========================================================================
@@ -287,7 +291,7 @@ pub fn load_config_prefix(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::klippy::config::ConfigValue;
+    use crate::core::klippy::config::{AccessTracking, ConfigSection, ConfigValue};
     use crate::core::klippy::event::KlippyEvent;
     use crate::core::klippy::reactor::ManualReactor;
 
@@ -300,6 +304,15 @@ mod tests {
             );
         }
         section
+    }
+
+    /// A section and a tracked wrapper for it, leaked so the borrow outlives
+    /// the call (tests only).
+    fn wrap(name: &str, options: &[(&str, &str)]) -> ConfigWrapper<'static> {
+        ConfigWrapper::new(
+            Box::leak(Box::new(section(name, options))),
+            AccessTracking::shared(),
+        )
     }
 
     /// A ready printer with `gcode`, `pins`, and one registered `[mcu]`.
@@ -330,7 +343,7 @@ mod tests {
     fn test_a_device_registers_both_debug_commands() {
         let printer = printer();
         SpiDevice::new(
-            &section("flash", &[("cs_pin", "PA15"), ("spi_bus", "spi1a")]),
+            &wrap("flash", &[("cs_pin", "PA15"), ("spi_bus", "spi1a")]),
             &printer,
         )
         .unwrap();
@@ -344,7 +357,7 @@ mod tests {
     fn test_a_device_without_cs_is_allowed() {
         let printer = printer();
         let device = SpiDevice::new(
-            &section("flash", &[("cs_pin", "None"), ("spi_bus", "spi1a")]),
+            &wrap("flash", &[("cs_pin", "None"), ("spi_bus", "spi1a")]),
             &printer,
         )
         .unwrap();
@@ -356,7 +369,7 @@ mod tests {
     fn test_an_out_of_range_mode_is_refused() {
         let printer = printer();
         let err = SpiDevice::new(
-            &section(
+            &wrap(
                 "flash",
                 &[("cs_pin", "PA15"), ("spi_bus", "spi1a"), ("spi_mode", "4")],
             ),
@@ -365,7 +378,7 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(
-            err,
+            err.to_string(),
             "Option 'spi_mode' in section 'spi_device flash' must be between 0 and 3"
         );
     }
@@ -374,7 +387,7 @@ mod tests {
     fn test_a_speed_below_the_minimum_is_refused() {
         let printer = printer();
         let err = SpiDevice::new(
-            &section(
+            &wrap(
                 "flash",
                 &[
                     ("cs_pin", "PA15"),
@@ -386,14 +399,14 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(err.contains("must be at least 100000"), "{err}");
+        assert!(err.to_string().contains("must be at least 100000"), "{err}");
     }
 
     #[test]
     fn test_only_some_software_pins_is_refused() {
         let printer = printer();
         let err = SpiDevice::new(
-            &section(
+            &wrap(
                 "flash",
                 &[
                     ("cs_pin", "PA15"),
@@ -405,7 +418,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(err.contains("must be set"), "{err}");
+        assert!(err.to_string().contains("must be set"), "{err}");
     }
 
     #[test]
@@ -415,7 +428,7 @@ mod tests {
         printer.add_object("mcu other", Arc::new(other)).unwrap();
 
         let err = SpiDevice::new(
-            &section(
+            &wrap(
                 "flash",
                 &[
                     ("cs_pin", "other:PA15"),
@@ -427,26 +440,32 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(err.contains("cs_pin must be on mcu 'mcu'"), "{err}");
+        assert!(
+            err.to_string().contains("cs_pin must be on mcu 'mcu'"),
+            "{err}"
+        );
     }
 
     #[test]
     fn test_an_unknown_mcu_names_the_section() {
         let printer = printer();
         let err = SpiDevice::new(
-            &section("flash", &[("cs_pin", "PA15"), ("spi_mcu", "zboard")]),
+            &wrap("flash", &[("cs_pin", "PA15"), ("spi_mcu", "zboard")]),
             &printer,
         )
         .unwrap_err();
 
-        assert_eq!(err, "Section 'spi_device flash': unknown MCU 'zboard'");
+        assert_eq!(
+            err.to_string(),
+            "Section 'spi_device flash': unknown MCU 'zboard'"
+        );
     }
 
     #[test]
     fn test_a_ready_device_reports_its_configuration() {
         let printer = printer();
         let device = SpiDevice::new(
-            &section(
+            &wrap(
                 "flash",
                 &[
                     ("cs_pin", "PA15"),
@@ -468,7 +487,7 @@ mod tests {
     fn test_a_software_device_accepts_pins_on_its_mcu() {
         let printer = printer();
         let device = SpiDevice::new(
-            &section(
+            &wrap(
                 "flash",
                 &[
                     ("cs_pin", "PA15"),

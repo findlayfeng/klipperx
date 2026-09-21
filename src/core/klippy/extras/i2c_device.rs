@@ -44,7 +44,7 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 
-use crate::core::klippy::config::ConfigSection;
+use crate::core::klippy::config::{ConfigError, ConfigWrapper};
 use crate::core::klippy::gcode::{
     CommandError, CommandHandler, GCodeDispatch, GcodeCommand, GCODE_OBJECT,
 };
@@ -53,7 +53,7 @@ use crate::core::klippy::mcu::{I2cMode, McuI2c, McuObject, DEFAULT_SPEED};
 use crate::core::klippy::pins::{PrinterPins, PINS_OBJECT};
 use crate::core::klippy::printer::{Printer, PrinterObject};
 
-use super::bus_debug::{block_on, hex_decode, hex_encode, parse_int};
+use super::bus_debug::{block_on, hex_decode, hex_encode};
 
 // Loaded after `[board_pins]` (order 30), because a software bus may name its
 // pins through an alias.
@@ -80,61 +80,62 @@ impl I2cDevice {
     /// # Errors
     /// Returns a config error (a message naming the section) when an option is
     /// missing, unparseable, or names an MCU or pin this machine does not have.
-    pub fn new(section: &ConfigSection, printer: &Printer) -> Result<Self, String> {
-        let identifier = section.identifier();
-        let name = section.sub.clone().ok_or_else(|| {
-            format!("Section '{identifier}' must be a '[i2c_device <name>]' section")
+    pub fn new(config: &ConfigWrapper, printer: &Printer) -> Result<Self, ConfigError> {
+        let identifier = config.identifier();
+        let name = config.section().sub.clone().ok_or_else(|| {
+            ConfigError::new(format!(
+                "Section '{identifier}' must be a '[i2c_device <name>]' section"
+            ))
         })?;
 
-        let address = parse_int(section, "i2c_address")?.ok_or_else(|| {
-            format!("Option 'i2c_address' in section '{identifier}' is not specified")
-        })?;
+        let address = config.get_int("i2c_address", None)?;
         if !(0..=127).contains(&address) {
-            return Err(format!(
+            return Err(ConfigError::new(format!(
                 "Option 'i2c_address' in section '{identifier}' must be between 0 and 127"
-            ));
+            )));
         }
         let address = address as u8;
 
-        let speed = parse_int(section, "i2c_speed")?.unwrap_or(i64::from(DEFAULT_SPEED));
+        let speed = config.get_int("i2c_speed", Some(i64::from(DEFAULT_SPEED)))?;
         if !(i64::from(MIN_SPEED)..=i64::from(u32::MAX)).contains(&speed) {
-            return Err(format!(
+            return Err(ConfigError::new(format!(
                 "Option 'i2c_speed' in section '{identifier}' must be at least {MIN_SPEED}"
-            ));
+            )));
         }
         let speed = speed as u32;
 
-        let mcu_name = section
+        let mcu_name = config
             .get_str("i2c_mcu")
-            .map(str::trim)
-            .unwrap_or("mcu")
-            .to_string();
+            .map(|text| text.trim().to_string())
+            .unwrap_or_else(|| "mcu".to_string());
         let object_name = mcu_object_name(&mcu_name);
         let mcu_object = printer
             .lookup_object_as::<McuObject>(&object_name)
-            .ok_or_else(|| format!("Section '{identifier}': unknown MCU '{mcu_name}'"))?;
+            .ok_or_else(|| {
+                ConfigError::new(format!("Section '{identifier}': unknown MCU '{mcu_name}'"))
+            })?;
 
         let pins = printer
             .lookup_object_as::<PrinterPins>(PINS_OBJECT)
             .expect("the loader registers `pins` before any section");
 
         let mode = match (
-            section.get_str("i2c_software_scl_pin"),
-            section.get_str("i2c_software_sda_pin"),
+            config.get_str("i2c_software_scl_pin"),
+            config.get_str("i2c_software_sda_pin"),
         ) {
             (Some(scl), Some(sda)) => {
                 // Validate (and reserve) the pins now; the numbers are filled
                 // in at build time, when the firmware dictionary exists.
                 let scl_params = pins
-                    .lookup_pin(scl, false, false, Some("scl"))
-                    .map_err(|err| format!("{identifier}: {err}"))?;
+                    .lookup_pin(&scl, false, false, Some("scl"))
+                    .map_err(|err| ConfigError::new(format!("{identifier}: {err}")))?;
                 let sda_params = pins
-                    .lookup_pin(sda, false, false, Some("sda"))
-                    .map_err(|err| format!("{identifier}: {err}"))?;
+                    .lookup_pin(&sda, false, false, Some("sda"))
+                    .map_err(|err| ConfigError::new(format!("{identifier}: {err}")))?;
                 if scl_params.chip_name != mcu_name || sda_params.chip_name != mcu_name {
-                    return Err(format!(
+                    return Err(ConfigError::new(format!(
                         "Section '{identifier}': i2c pins must be on the same mcu '{mcu_name}'"
-                    ));
+                    )));
                 }
                 I2cMode::Software {
                     scl_pin: scl_params.pin,
@@ -143,14 +144,14 @@ impl I2cDevice {
                 }
             }
             (None, None) => I2cMode::Hardware {
-                bus: section.get_str("i2c_bus").map(str::to_string),
+                bus: config.get_str("i2c_bus"),
                 speed,
             },
             _ => {
-                return Err(format!(
+                return Err(ConfigError::new(format!(
                     "Section '{identifier}': both 'i2c_software_scl_pin' and \
                      'i2c_software_sda_pin' must be set"
-                ));
+                )));
             }
         };
 
@@ -171,7 +172,7 @@ impl I2cDevice {
                 write_handler,
                 Some("Write bytes to an I2C device (debug)"),
             )
-            .map_err(|err| format!("{identifier}: {err}"))?;
+            .map_err(|err| ConfigError::new(format!("{identifier}: {err}")))?;
         let read_handler: CommandHandler = {
             let device = Arc::clone(&device);
             Arc::new(move |gcmd| cmd_i2c_read(&device, gcmd))
@@ -184,7 +185,7 @@ impl I2cDevice {
                 read_handler,
                 Some("Write then read bytes from an I2C device (debug)"),
             )
-            .map_err(|err| format!("{identifier}: {err}"))?;
+            .map_err(|err| ConfigError::new(format!("{identifier}: {err}")))?;
 
         Ok(Self {
             name,
@@ -260,10 +261,10 @@ fn cmd_i2c_read(device: &Arc<McuI2c>, gcmd: &GcodeCommand) -> Result<(), Command
 
 /// Upstream's `load_config_prefix` for `[i2c_device <name>]`.
 pub fn load_config_prefix(
-    section: &ConfigSection,
+    config: &ConfigWrapper,
     printer: &Arc<Printer>,
-) -> Result<Arc<dyn PrinterObject>, String> {
-    Ok(Arc::new(I2cDevice::new(section, printer)?))
+) -> Result<Arc<dyn PrinterObject>, ConfigError> {
+    Ok(Arc::new(I2cDevice::new(config, printer)?))
 }
 
 // ===========================================================================
@@ -273,7 +274,7 @@ pub fn load_config_prefix(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::klippy::config::ConfigValue;
+    use crate::core::klippy::config::{AccessTracking, ConfigSection, ConfigValue};
     use crate::core::klippy::event::KlippyEvent;
     use crate::core::klippy::reactor::ManualReactor;
 
@@ -286,6 +287,15 @@ mod tests {
             );
         }
         section
+    }
+
+    /// A section and a tracked wrapper for it, leaked so the borrow outlives
+    /// the call (tests only).
+    fn wrap(name: &str, options: &[(&str, &str)]) -> ConfigWrapper<'static> {
+        ConfigWrapper::new(
+            Box::leak(Box::new(section(name, options))),
+            AccessTracking::shared(),
+        )
     }
 
     /// A ready printer with `gcode`, `pins`, and one registered `[mcu]`.
@@ -316,11 +326,11 @@ mod tests {
     fn test_a_hardware_device_needs_an_address() {
         let printer = printer();
 
-        let err = I2cDevice::new(&section("accel", &[]), &printer).unwrap_err();
+        let err = I2cDevice::new(&wrap("accel", &[]), &printer).unwrap_err();
 
         assert_eq!(
-            err,
-            "Option 'i2c_address' in section 'i2c_device accel' is not specified"
+            err.to_string(),
+            "Option 'i2c_address' in section 'i2c_device accel' must be specified"
         );
     }
 
@@ -328,11 +338,10 @@ mod tests {
     fn test_an_address_out_of_range_is_refused() {
         let printer = printer();
 
-        let err =
-            I2cDevice::new(&section("accel", &[("i2c_address", "128")]), &printer).unwrap_err();
+        let err = I2cDevice::new(&wrap("accel", &[("i2c_address", "128")]), &printer).unwrap_err();
 
         assert_eq!(
-            err,
+            err.to_string(),
             "Option 'i2c_address' in section 'i2c_device accel' must be between 0 and 127"
         );
     }
@@ -340,12 +349,12 @@ mod tests {
     #[test]
     fn test_a_device_registers_both_debug_commands() {
         let printer = printer();
-        let device = I2cDevice::new(&section("accel", &[("i2c_address", "0x68")]), &printer);
+        let device = I2cDevice::new(&wrap("accel", &[("i2c_address", "0x68")]), &printer);
 
         // `0x68` is not decimal; the option is an integer, like upstream's.
         assert!(device.is_err());
 
-        I2cDevice::new(&section("accel", &[("i2c_address", "104")]), &printer).unwrap();
+        I2cDevice::new(&wrap("accel", &[("i2c_address", "104")]), &printer).unwrap();
         let commands = gcode(&printer).command_help();
         assert!(commands.contains_key("IIC_WRITE"), "{commands:?}");
         assert!(commands.contains_key("IIC_READ"), "{commands:?}");
@@ -356,7 +365,7 @@ mod tests {
         let printer = printer();
 
         let err = I2cDevice::new(
-            &section(
+            &wrap(
                 "accel",
                 &[("i2c_address", "104"), ("i2c_software_scl_pin", "PA0")],
             ),
@@ -364,7 +373,10 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(err.contains("both 'i2c_software_scl_pin'"), "{err}");
+        assert!(
+            err.to_string().contains("both 'i2c_software_scl_pin'"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -372,19 +384,22 @@ mod tests {
         let printer = printer();
 
         let err = I2cDevice::new(
-            &section("accel", &[("i2c_address", "104"), ("i2c_mcu", "zboard")]),
+            &wrap("accel", &[("i2c_address", "104"), ("i2c_mcu", "zboard")]),
             &printer,
         )
         .unwrap_err();
 
-        assert_eq!(err, "Section 'i2c_device accel': unknown MCU 'zboard'");
+        assert_eq!(
+            err.to_string(),
+            "Section 'i2c_device accel': unknown MCU 'zboard'"
+        );
     }
 
     #[test]
     fn test_a_software_device_accepts_pins_on_its_mcu() {
         let printer = printer();
         let device = I2cDevice::new(
-            &section(
+            &wrap(
                 "accel",
                 &[
                     ("i2c_address", "104"),
@@ -407,7 +422,7 @@ mod tests {
         printer.add_object("mcu other", Arc::new(other)).unwrap();
 
         let err = I2cDevice::new(
-            &section(
+            &wrap(
                 "accel",
                 &[
                     ("i2c_address", "104"),
@@ -419,14 +434,17 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(err.contains("must be on the same mcu 'mcu'"), "{err}");
+        assert!(
+            err.to_string().contains("must be on the same mcu 'mcu'"),
+            "{err}"
+        );
     }
 
     #[test]
     fn test_a_ready_device_reports_its_address_and_speed() {
         let printer = printer();
         let device = I2cDevice::new(
-            &section("accel", &[("i2c_address", "104"), ("i2c_speed", "400000")]),
+            &wrap("accel", &[("i2c_address", "104"), ("i2c_speed", "400000")]),
             &printer,
         )
         .unwrap();

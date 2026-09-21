@@ -41,9 +41,14 @@ use crate::core::klippy::load::section;
 
 // The `[mcu]` / `[mcu <name>]` sections. The factories are re-exported from
 // `object` above; `build.rs` resolves them to this module's path.
+//
+// `phase = early`: upstream loads `pins` and `mcu` before the generic section
+// walk (`klippy/klippy.py:120-121`), so an MCU is registered as a chip before
+// any section that names it — including `[board_pins]` with `mcu: zboard`.
 section!(
     "mcu",
     order = 10,
+    phase = early,
     load = load_config,
     prefix = load_config_prefix
 );

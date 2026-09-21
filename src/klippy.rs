@@ -134,7 +134,9 @@ async fn klippy_process(printer: Arc<Printer>, config: Arc<Config>) {
         }
         printer.reset_for_restart(&result);
         if let Err(err) = printer.load_config(&config) {
-            printer.invoke_shutdown(&format!("{err}"));
+            // A config the reload rejects is an `error`, not a shutdown:
+            // upstream's `_connect` sets the state and lets a `RESTART` fix it.
+            printer.set_error_state(&format!("{err}"));
         }
         tokio::time::sleep(RESTART_DELAY).await;
     }
@@ -282,13 +284,14 @@ pub fn run(
 
         // Config-driven objects, run under the machine runtime's context so any
         // machine-side handle the loader picks up is the machine's. A config the
-        // loader rejects halts the printer rather than ending the process:
-        // clients can still connect and read why (upstream's `_read_config`
-        // does the same — it sets the state and lets the reactor keep running).
+        // loader rejects does not end the process: the printer reports an `error`
+        // state, clients can still connect and read why, and a `RESTART` retries
+        // (upstream's `_read_config` does the same — it sets the state and lets
+        // the reactor keep running).
         {
             let _machine = machine_handle.enter();
             if let Err(err) = printer.load_config(&config) {
-                printer.invoke_shutdown(&format!("{err}"));
+                printer.set_error_state(&format!("{err}"));
             }
         }
 

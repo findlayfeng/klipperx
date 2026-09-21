@@ -139,7 +139,7 @@ impl McuObject {
     /// owns an I2C device asks its MCU for it. Upstream's `MCU_I2C`
     /// (`klippy/extras/bus.py:161`).
     pub fn setup_i2c(&self, mode: I2cMode, address: u8) -> Arc<McuI2c> {
-        self.chip.setup_i2c(mode, address)
+        self.chip.setup_i2c(mode, address, self.printer.clone())
     }
 
     /// Build an SPI device on this MCU.

@@ -236,7 +236,9 @@ fn mcu_object_name(mcu_name: &str) -> String {
 /// `IIC_WRITE DEVICE=<name> DATA=<hex>` — send bytes, no read.
 fn cmd_i2c_write(device: &Arc<McuI2c>, gcmd: &GcodeCommand) -> Result<(), CommandError> {
     let data = hex_decode(&gcmd.get_str("DATA")?)?;
-    block_on(device.write(&data))?;
+    // Bring-up probing: a NACK is a result to report, not a reason to stop the
+    // machine (`McuI2c::write` is the driver-facing form).
+    block_on(device.write_without_shutdown(&data))?;
     gcmd.respond_info("i2c write ok");
     Ok(())
 }
@@ -251,7 +253,7 @@ fn cmd_i2c_read(device: &Arc<McuI2c>, gcmd: &GcodeCommand) -> Result<(), Command
     if !(0..=255).contains(&read_len) {
         return Err(CommandError::new("READ_LEN must be between 0 and 255"));
     }
-    let data = block_on(device.transfer(&write, read_len as u32))?;
+    let data = block_on(device.transfer_without_shutdown(&write, read_len as u32))?;
     gcmd.respond_info(&format!("i2c read: {}", hex_encode(&data)));
     Ok(())
 }

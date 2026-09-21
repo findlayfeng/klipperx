@@ -274,9 +274,12 @@ toolhead / 开放事件）一起补，一部分是现在就独立可补的小行
 - [x] 设备侧：`config_i2c oid=%c`，总线侧：`i2c_set_bus` / `i2c_set_sw_bus`；传输：
       `i2c_transfer` + `i2c_response`（旧式）或 `i2c_write` / `i2c_read` +
       `i2c_read_response`（新式）（固件 `src/i2ccmds.c:32` `:48` `:107`）。
-- [ ] `i2c_bus_status` 不是 `SUCCESS` 时上游会 `invoke_shutdown`
-      （`bus.py:295-300`）；本 port 两条传输路径都返回 `McuError::I2cBus`，
-      是否改为 shutdown 待定。`i2c_write` 的 retry 与 `async_write_only` 是可选分支。
+- [x] `i2c_bus_status` 不是 `SUCCESS` 时按上游 `invoke_shutdown`（`bus.py:295-300`）：
+      `McuI2c::transfer` / `write` 在非 SUCCESS 时停机（消息 `MCU 'x' I2C request to
+      addr N reports error S`）并返回 `McuError::I2cBus`；探测用的
+      `transfer_without_shutdown` / `write_without_shutdown` 只返回错误，`IIC_READ` /
+      `IIC_WRITE` 用后者（探不存在的地址不应停机）。`i2c_write` 的 retry 与
+      `async_write_only` 仍是可选分支。
 - [x] 软件 I2C（`i2c_software_{scl,sda}_pin`）：`i2c_set_sw_bus`，固件 `src/i2c_software.c`。
 - [x] 旧式 `i2c_set_software_bus`（rate 版）回退：`cmd::i2c::add_software_bus` 按
       `try_lookup_command` 二选一，回退时打 deprecation 警告。只能单测。
@@ -568,6 +571,9 @@ ack」settle，并用 `Mcu::took_over_session()` 让 `rpi_usb` 判断“有没�
 
 细节在各模块文档里；这里每条只留一行索引，最近完成的在前。
 
+- **I2C 总线错误停机（F7）**：`McuI2c::transfer`/`write` 非 SUCCESS 时按上游
+      `invoke_shutdown`；探测用的 `transfer_without_shutdown`/`write_without_shutdown`
+      只报错。
 - **G-Code 默认处理器与参数解析（G1b）**：`default_handler` 补 `M105`/`M21`/`M140`/`M104`/
       `M107`/`M106` 的“安静忽略”与 `M117`/`M118`/`M23` 的按首 token 路由；`GcodeCommand::ack`
       + `need_ack`（`M115`/`M105` 已用）；`parse_extended` 补反斜杠转义与引号拼接；

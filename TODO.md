@@ -21,18 +21,20 @@
 | **FW2** | 对象模型收尾 | Q4、Q5 | Q4 定案 `Value`；Q5 加 `lookup_objects(module)` 前缀遍历与 `statuses()` 快照 | `objects/query` 形状不变；`lookup_objects("mcu")` 前缀遍历与反射读状态有单测 | `gcode_macro` 的 `printer.objects` 模板视图、display 菜单、宏变量 | — |
 | **FW3** | 错误词汇框架 | A2 | `CommandError`/`ConfigError` 分层、`KlippyError::Config`、`Internal` 收敛、handler/endpoint 异常 `catch_unwind` → `invoke_shutdown`、config 错走 `set_error_state`（`PrinterState::Error`） | 参数错报 `CommandError` 且不停机；坏配置 / connect 期 config 错报 `error`（可 RESTART）；panic 的 handler / endpoint 触发 `invoke_shutdown` | 全树的错误分支 | — |
 | **FW4** | G-Code 框架收尾（**完成**；`GCodeIO` 暂缓 `[~]`） | G1b（框架部分） | ~~参数访问器、`create_gcode_command`、`run_script_from_command`、`gcode:command_error` 触发~~ ✅；`GCodeIO` 输入抽象（伪 tty / 文件 / `stats gcodein` / `debuginput_exit`）**暂缓 `[~]`**（不做 OctoPrint 串口仿真）；`gcode:request_restart` 触发随 C1 | ~~`create_gcode_command` / 参数访问器~~ ✅；`GCodeIO` 暂缓（见 [FW4 笔记](docs/work-log/2026-09-21-fw4-notes.md)） | 全部 gcode extras（H3、H8…） | FW1、FW3（已满足） |
-| **FW5** | 运动框架（最重） | C1（框架部分）、H12 | toolhead 骨架、`Kinematics` trait、stepper 句柄、trapq/step 生成（chelper 重写）、`clocksync`、`mathutil`/`Coord` | `cartesian` + `[stepper_x/y/z]` + `[extruder]`，`G28`/`G1` 跑通 | `kinematics/*` 其余、H9、H10 | FW1 |
+| **FW5** | 运动框架（最重，**拆 FW5a–FW5f**） | C1（框架部分）、H12 | **FW5a** `Coord` + `clocksync` 回归；**FW5b** `Move`/`LookAheadQueue`/`trapq`；**FW5c** `itersolve` + `kin_cartesian` + `stepcompress` **简化**（限流告警）；**FW5d** `MotionQueuing`/`ToolHead`/`McuStepper`；**FW5e** `Kinematics` + `cartesian` + `G1`；**FW5f**（后置）`stepcompress` 完整压缩 | host 单测 → 假 MCU → 真板 `G1`（单轴 → 三轴 + `[extruder]`）→ `G28`（与 FW6/F8 联合） | `kinematics/*` 其余、H9、H10、input shaper | FW1（已满足） |
 | **FW6** | 资源与触发框架 | F3、F8 | 命令队列/print_time 同步输出（`MCU_bus_digital_out`）、`TriggerDispatch`/`MCU_trsync`、endstop 接口 | 一个 endstop + `query_endstops/status` | homing/probe、运动同步 `SET_PIN` | FW5 |
 | **FW7** | MCU 与传输框架收尾 | B2、D3 | `emergency_stop` 对象（`klippy:shutdown` → 固件 `emergency_stop`）、本地 shutdown 标志、`emergency_stop` 端点、带载荷错误上报；RTO 定时重传与固件 `reset` 优先未做 | `emergency_stop` 端点使打印机进 shutdown；主机停机向固件发 `emergency_stop`，固件自报停机不回发 | TMC/传感器等资源 | — |
 | **FW8** | 主机层与重启框架 | D1、D2、Q6 | `--logfile`/rollover/Q6、`rpi_usb` 门控、CRC 物理复位、重启后订阅均已完成（代码）；剩 `StartArgs` 其余字段与 `rpi_usb` 真机验证 | `--logfile` 落盘、`error_exit` 非零、重启后订阅不断；真板 `last_stats` 已验 | 日志、Moonraker 兼容 | — |
 | **FW9** | API 框架收尾 | B4（框架部分） | `register_remote_method` 与推送、mux 端点注册机制、`emergency_stop` 端点 | `register_remote_method` + 推送 | `pause_resume/*`、`*/dump_*` 等消费者 | FW7 |
 
 > **怎么验收**：每个框架都以「最小模块在真机/测试设备上跑通」为准，不以“代码写完”为准。
-> 例如 FW5 的验收是 `G28`/`G1` 真的动了步进，而不是 `Kinematics` trait 编译通过。
+> 例如 FW5 的验收是 `G1` 真的动了步进（`G28` 与 FW6/F8 联合验收），而不是 `Kinematics`
+> trait 编译通过。
 
 > **建议顺序**：**FW1/FW3**（配置与错误，最底层）✅ → **FW2/FW7/FW8** ✅ 大部
 > （对象模型 / MCU / 主机层）→ **FW4**（G-Code，依赖 FW1+FW3）✅（`GCodeIO` 暂缓 `[~]`）→ **FW5**（运动，最重，
-> 依赖 FW1）→ **FW6** → **FW9**。FW5 与 FW4 都依赖 FW1；FW6 只能等 FW5。
+> 依赖 FW1）→ **FW6** → **FW9**。FW5 与 FW4 都依赖 FW1；FW6 等 FW5 的运动层，但 F8
+> （endstop/trsync）的接口与 FW5e 联合定，`G28` 的验收跨两者。
 > FW2/FW7/FW8 的剩余点见 FW8（`rpi_usb`/CRC/输出订阅）、B2（`last_stats`/RTO/固件 `reset`）。
 > D2 的真板启动抖动已归档为**非阻塞观察项**（板/USB 链路层，复现不了），不再单独排期。
 
@@ -442,24 +444,45 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 
 ### C1 toolhead 与 kinematics（框架 FW5）
 
-kinematics 已随 Printer 重构删除，从这里重新开始：
+kinematics 已随 Printer 重构删除，从这里重新开始。动工前调查见
+[FW5 笔记](docs/work-log/2026-09-21-fw5-notes.md)，已定的设计取舍：
+
+- **chelper 用 Rust 分层重写**（不用 FFI）；「FFI 复用 C」记为 `[~]` fallback，待真板出现
+  性能问题再返工（前瞻：热路径每 flush 约 40 µs，预算 5–10 ms，Rust ≈ C，FFI 无性能收益）。
+- **`Coord([f64; 4])`**；`calc_position` 返回 `[Option<f64>; 3]`（`None` 只出现在从 stepper
+  位置反推轴位置这一处，见 `extras/homing.py:245`）。
+- **`motion_quuing` 照搬上游分层**：`MotionQueuing` 持有 trapq 与每 MCU 的输出，flush 调度
+  在它里面。
+- **`stepcompress` 先简化**（每步一条 `queue_step`，使用时限流告警最多三次）让流程能过；
+  **完整压缩独立成 FW5f**（后置）。
+- **`Kinematics::check_move` 用窄 context**，不把 `Move` 暴露给 kinematics。
+- **验收先到 `G1`**；`G28` 需要 endstop/trsync（F8），与 FW6 联合验收。
+
+阶段拆分（详见笔记）：
+
+| 阶段 | 内容 | 验收 |
+|---|---|---|
+| FW5a | `Coord`；`clocksync` 回归（`print_time_to_clock`/`estimated_print_time`/`clock32_to_clock64`） | host 单测；假 MCU |
+| FW5b | `Move`、`LookAheadQueue`、`trapq` | host 单测（与上游公式对拍） |
+| FW5c | `itersolve` + `kin_cartesian`；`stepcompress` 简化 | host 单测；假 MCU 流程能过 |
+| FW5d | `MotionQueuing`、`ToolHead`、`McuStepper`/`Rail` | 假 MCU：`G1` 出正确的 `queue_step` |
+| FW5e | `Kinematics` + `kinematics/cartesian`；`[printer]` late 住户；`G1`（G4） | 真板：单轴 → 三轴 + `[extruder]` |
+| FW5f | `stepcompress` 完整压缩（后置） | 与上游向量对拍 |
+
+细节条目：
 
 - [ ] 先立 **toolhead 对象**：位置记忆（`commanded_pos`）、trapq、速度/加速度上限，
       回零与移动的入口（上游 `klippy/toolhead.py:389` `:400` `:482` `:507` `:522`）。
 - [ ] 再加回 **`Kinematics` trait 与 `kinematics/`**：按上游由 toolhead 读
       `[printer] kinematics` 装载（`klippy/toolhead.py:242`），不是交给 Printer。
-- [ ] `calc_position` 的返回类型：上游允许逐轴为 `None`
-      （`extras/homing.py:245` 判空，`mathutil.py:152` 的 `gaussian_solve` 会返回
-      `None`），`Coord { x: f64, .. }`（已随 kinematics 一起删除）需要重新定形状。
 - [ ] 回零协议：上游 kinematics 调 `homing_state.home_rails(rails, forcepos, movepos)`、
       `set_homed_position(pos)`、`get_trigger_position`、`set_stepper_adjustment`。
       没有这些，任何真实 kinematics 的 `home()` 都写不出来。
 - [ ] stepper 句柄：上游能 `get_commanded_position()` / `get_step_dist()` / `set_trapq()` /
       `setup_itersolve()`；`calc_position` 的输入就从这里来。
-- [ ] step 生成层的运动学（上游 `rail.setup_itersolve('cartesian_stepper_alloc', axis)`、
-      `kinematics/kinematic_stepper.py`）在我们这儿还没有对应物，运动规划整个未开始。
-      上游这部分是 C 写的 `klippy/chelper/`（`stepcompress.c`、`itersolve.c`、
-      `kin_*.c`、`trapq.c`、`kin_shaper.c`，见审计文档 §4.1），Rust 侧要整体重写。
+- [ ] step 生成层的运动学：上游 `rail.setup_itersolve('cartesian_stepper_alloc', axis)`；
+      这部分上游是 C（`klippy/chelper/` 的 `stepcompress.c`、`itersolve.c`、`kin_*.c`、
+      `trapq.c`、`kin_shaper.c`，见审计文档 §4.1），Rust 侧整体重写（决定见上）。
 
 ### C2 配置装载收尾（框架 FW1）
 
@@ -691,12 +714,12 @@ ack」settle，并用 `Mcu::took_over_session()` 让 `rpi_usb` 判断“有没�
 
 ### H12 核心工具补齐
 
-- [ ] `mathutil.py`：kinematics / probe / mesh 用的几何与线性代数（`Coord`、
-      `gaussian_solve` 等）——随 **C1**。
+- [ ] `mathutil.py`：kinematics / probe / mesh 用的几何与线性代数（`trilateration`、
+      `gaussian_solve` 等）——`Coord` 随 **FW5a**，几何算法随 delta/probe（H9）。
 - [ ] `util.py` 的反射与注册表 helper：`get_heater` / `get_sensor` / 前缀式
       `lookup_objects`（**Q5**）。
 - [ ] `clocksync.py`：`print_time` ↔ MCU clock 偏移估计（`cmd/clock.rs` 现只有
-      `get_clock`）——随 **C1**/**F3**。
+      `get_clock`）——随 **FW5a**。
 - [ ] `pins.py` 消费侧接口（`get_pin_type`、重命名等）——随 **H7** 等消费者。
 
 ## 未决问题

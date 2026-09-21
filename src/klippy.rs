@@ -8,6 +8,7 @@ use crate::core::klippy::api::{self, AddressError, Api, ApiTarget, Server, Start
 use crate::core::klippy::config::Config;
 use crate::core::klippy::printer::Printer;
 use crate::core::klippy::reactor::TokioReactor;
+use crate::logging;
 
 /// What the host is, in one line.
 ///
@@ -41,6 +42,15 @@ pub struct AppArgs {
     /// my subcommands is used" for an argument that arrives through a `flatten`.
     /// The check below therefore says the same thing, with the same wording.
     pub config_file: Option<String>,
+
+    /// Write the log to this file as well as to stdout
+    ///
+    /// Upstream's `--logfile` (`klippy/klippy.py:294-345`): the same lines that
+    /// go to the terminal, kept in a file. `info` reports the path as
+    /// `log_file`; leaving the option out reports `null`, which is upstream's
+    /// answer too.
+    #[arg(long = "logfile", value_name = "PATH")]
+    pub log_file: Option<String>,
 }
 
 /// How long to wait before a rebuilt printer is brought up again.
@@ -64,6 +74,30 @@ const LATENCY_WARNING: f64 = 0.05;
 /// (upstream's `klippy/klippy.py:355-370`).
 fn is_restart(result: &str) -> bool {
     matches!(result, "restart" | "firmware_restart")
+}
+
+/// The `versions` rollover block: what a bug report needs first.
+///
+/// Upstream builds the same block from its args and version
+/// (`klippy/klippy.py:345-357`); this host has no git checkout or interpreter to
+/// name, so it reports the two facts that identify the run.
+fn versions_block(config_file: &str) -> String {
+    format!(
+        "Versions: klipperx {}\nConfig: {config_file}",
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
+/// The process exit code a finished run asks for.
+///
+/// `error_exit` is upstream's `sys.exit(-1)` (`klippy/klippy.py:375`); every
+/// other end of the loop — `exit`, or an attachment that finished — exits 0.
+fn exit_code(result: &str) -> i32 {
+    if result == "error_exit" {
+        -1
+    } else {
+        0
+    }
 }
 
 /// Log a reactor that ran a dispatch round past [`LATENCY_WARNING`].
@@ -103,8 +137,8 @@ fn report_reactor_latency(report: crate::core::klippy::LatencyReport) {
 /// the endpoints and any attached window survive a restart (this is the answer
 /// to Q7 — no printer slot to swap, because the printer is rebuilt under its
 /// one handle).
-async fn klippy_process(printer: Arc<Printer>, config: Arc<Config>) {
-    loop {
+async fn klippy_process(printer: Arc<Printer>, config: Arc<Config>) -> String {
+    let result = loop {
         printer.bring_up().await;
 
         let result = {
@@ -116,13 +150,13 @@ async fn klippy_process(printer: Arc<Printer>, config: Arc<Config>) {
             Ok(result) => result,
             Err(err) => {
                 warn!("the run loop did not finish: {err}");
-                break;
+                break "error_exit".to_string();
             }
         };
 
         if !is_restart(&result) {
             debug!("printer stopped: {result}");
-            break;
+            break result;
         }
 
         info!("Restarting the printer ({result})");
@@ -139,7 +173,9 @@ async fn klippy_process(printer: Arc<Printer>, config: Arc<Config>) {
             printer.set_error_state(&format!("{err}"));
         }
         tokio::time::sleep(RESTART_DELAY).await;
-    }
+        // A restart is this host's log rollover: mark the seam again.
+        logging::write_rollover();
+    };
 
     // The run loop has ended for good, so the machine comes down here — while
     // the runtime that built it is still up. A device's transport can have a
@@ -148,6 +184,7 @@ async fn klippy_process(printer: Arc<Printer>, config: Arc<Config>) {
     // would leave that read parked, because the API endpoints keep the printer
     // alive past the run loop, and the runtime then hangs on shutdown.
     printer.teardown();
+    result
 }
 
 /// Something to run alongside the host, attached to its own API.
@@ -174,14 +211,26 @@ pub trait Attachment {
 ///
 /// `attachment` is an optional client to run alongside the host, on the host's
 /// own API; see [`Attachment`].
+///
+/// Returns the process exit code the run asks for: `0` for a normal end, `-1`
+/// when the run ended because the printer asked for `error_exit` — upstream's
+/// `sys.exit(-1)` after `printer.run()` (`klippy/klippy.py:375`). The caller
+/// exits with it.
 pub fn run(
     args: AppArgs,
     attachment: Option<Box<dyn Attachment>>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<i32, Box<dyn std::error::Error>> {
     let config_file = args
         .config_file
         .ok_or("the following required argument was not provided: <CONFIG_FILE>")?;
     debug!("Config file: {config_file}");
+
+    // The log's rollover information goes at the top of the file, so a log a
+    // user attaches already says which build and config produced it (upstream's
+    // `versions` block, `klippy/klippy.py:345-357`).
+    logging::clear_rollover_info();
+    logging::set_rollover_info("versions", Some(&versions_block(&config_file)));
+    logging::write_rollover();
 
     // Parse the config file
     let (config, sources) = Config::from_file(&config_file)?;
@@ -260,7 +309,11 @@ pub fn run(
         // (`klippy/klippy.py:36-40`) and no path is half-built when a request
         // arrives. Everything is registered before the listener is bound.
         let mut api = Api::new();
-        api::register(&mut api, &printer, StartArgs::collect(config_file.clone()))?;
+        api::register(
+            &mut api,
+            &printer,
+            StartArgs::collect(config_file.clone(), args.log_file.clone()),
+        )?;
         let api = Arc::new(api);
 
         let server = match target {
@@ -325,10 +378,10 @@ pub fn run(
         let machine_thread = std::thread::Builder::new()
             .name("klippy-machine".into())
             .spawn(move || {
-                machine_runtime.block_on(klippy_process(machine_printer, machine_config));
+                machine_runtime.block_on(klippy_process(machine_printer, machine_config))
             })?;
 
-        match attachment {
+        let exit_code = match attachment {
             // Whatever is attached to this host is the user interface of the
             // invocation that asked for it, so when it is done the host is too
             // — and the host's own shutdown conditions end the attachment
@@ -338,13 +391,19 @@ pub fn run(
             Some(mut attachment) => {
                 let outcome = attachment.run(Arc::clone(&api)).await;
                 printer.request_exit("exit");
-                let _ = machine_thread.join();
+                let result = machine_thread
+                    .join()
+                    .unwrap_or_else(|_| "error_exit".to_string());
                 outcome.map_err(|err| -> Box<dyn std::error::Error> { err.into() })?;
+                exit_code(&result)
             }
             None => {
-                let _ = machine_thread.join();
+                let result = machine_thread
+                    .join()
+                    .unwrap_or_else(|_| "error_exit".to_string());
+                exit_code(&result)
             }
-        }
+        };
 
         interrupt.abort();
         let _ = interrupt.await;
@@ -356,7 +415,7 @@ pub fn run(
             let _ = handle.await;
         }
 
-        Ok::<(), Box<dyn std::error::Error>>(())
+        Ok::<i32, Box<dyn std::error::Error>>(exit_code)
     })
 }
 
@@ -382,6 +441,15 @@ mod tests {
         assert!(is_restart("firmware_restart"));
         assert!(!is_restart("exit"));
         assert!(!is_restart("error_exit"));
+    }
+
+    #[test]
+    fn test_error_exit_is_the_only_non_zero_exit_code() {
+        // Upstream `sys.exit(-1)` after `printer.run()`
+        // (`klippy/klippy.py:375`); every other result is a normal end.
+        assert_eq!(exit_code("error_exit"), -1);
+        assert_eq!(exit_code("exit"), 0);
+        assert_eq!(exit_code("restart"), 0);
     }
 
     /// A host part that asks for a restart the first time it connects, and for

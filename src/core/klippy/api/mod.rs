@@ -180,7 +180,7 @@ mod tests {
 
     /// The start arguments a host would have gathered.
     fn start_args() -> StartArgs {
-        StartArgs::collect("/tmp/printer.cfg")
+        StartArgs::collect("/tmp/printer.cfg", None)
     }
 
     #[test]

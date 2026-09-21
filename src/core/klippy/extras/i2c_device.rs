@@ -49,9 +49,11 @@ use crate::core::klippy::gcode::{
     CommandError, CommandHandler, GCodeDispatch, GcodeCommand, GCODE_OBJECT,
 };
 use crate::core::klippy::load::section;
-use crate::core::klippy::mcu::{I2cMode, McuError, McuI2c, McuObject, DEFAULT_SPEED};
+use crate::core::klippy::mcu::{I2cMode, McuI2c, McuObject, DEFAULT_SPEED};
 use crate::core::klippy::pins::{PrinterPins, PINS_OBJECT};
 use crate::core::klippy::printer::{Printer, PrinterObject};
+
+use super::bus_debug::{block_on, hex_decode, hex_encode, parse_int};
 
 // Loaded after `[board_pins]` (order 30), because a software bus may name its
 // pins through an alias.
@@ -254,63 +256,6 @@ fn cmd_i2c_read(device: &Arc<McuI2c>, gcmd: &GcodeCommand) -> Result<(), Command
     Ok(())
 }
 
-/// Drive an asynchronous transfer from a synchronous G-Code handler.
-///
-/// The dispatcher's handlers are synchronous and cannot await (`gcode.rs`), and
-/// the I2C transfer is a request/response exchange, so the future is run to
-/// completion on the current runtime. `block_in_place` is what makes that legal
-/// on a runtime worker; the server's runtimes are multi-threaded
-/// (`src/klippy.rs`), and this bridge exists only for the debug commands above —
-/// a real sensor would drive the transfer from its own async task.
-///
-/// # Errors
-/// Returns the transfer's error, or the fact that this thread's runtime cannot
-/// block (a single-threaded runtime).
-fn block_on<T>(
-    future: impl std::future::Future<Output = Result<T, McuError>>,
-) -> Result<T, CommandError> {
-    let handle = tokio::runtime::Handle::try_current()
-        .map_err(|_| CommandError::new("I2C commands need the async runtime"))?;
-    if handle.runtime_flavor() != tokio::runtime::RuntimeFlavor::MultiThread {
-        return Err(CommandError::new(
-            "I2C commands need the multi-threaded runtime",
-        ));
-    }
-    tokio::task::block_in_place(|| handle.block_on(future))
-        .map_err(|err| CommandError::new(err.to_string()))
-}
-
-/// A required-or-default integer option, as upstream's `getint`.
-fn parse_int(section: &ConfigSection, name: &str) -> Result<Option<i64>, String> {
-    let Some(text) = section.get_str(name) else {
-        return Ok(None);
-    };
-    text.trim().parse::<i64>().map(Some).map_err(|_| {
-        format!(
-            "Unable to parse option '{name}' in section '{}'",
-            section.identifier()
-        )
-    })
-}
-
-/// Decode a hex string (`"01af"`, whitespace ignored) into bytes.
-fn hex_decode(text: &str) -> Result<Vec<u8>, CommandError> {
-    let cleaned: String = text.chars().filter(|c| !c.is_whitespace()).collect();
-    if !cleaned.len().is_multiple_of(2) || !cleaned.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(CommandError::new(format!("invalid hex string '{text}'")));
-    }
-    let mut out = Vec::with_capacity(cleaned.len() / 2);
-    for index in (0..cleaned.len()).step_by(2) {
-        out.push(u8::from_str_radix(&cleaned[index..index + 2], 16).expect("validated hex digits"));
-    }
-    Ok(out)
-}
-
-/// Encode bytes as lowercase hex, the form `hex_decode` reads back.
-fn hex_encode(data: &[u8]) -> String {
-    data.iter().map(|b| format!("{b:02x}")).collect()
-}
-
 /// Upstream's `load_config_prefix` for `[i2c_device <name>]`.
 pub fn load_config_prefix(
     section: &ConfigSection,
@@ -488,15 +433,5 @@ mod tests {
         let status = device.get_status(0.0);
         assert_eq!(status["address"], 104);
         assert_eq!(status["speed"], 400_000);
-    }
-
-    #[test]
-    fn test_hex_round_trips() {
-        assert_eq!(hex_decode("01af").unwrap(), vec![0x01, 0xaf]);
-        assert_eq!(hex_decode("00 FF").unwrap(), vec![0x00, 0xff]);
-        assert_eq!(hex_decode("").unwrap(), Vec::<u8>::new());
-        assert!(hex_decode("0").is_err());
-        assert!(hex_decode("zz").is_err());
-        assert_eq!(hex_encode(&[0x00, 0x0f, 0xff]), "000fff");
     }
 }

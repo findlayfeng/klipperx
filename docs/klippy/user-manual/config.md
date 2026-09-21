@@ -260,6 +260,53 @@ IIC_WRITE DEVICE=accel DATA=6b              ; 写 1 字节
 IIC_READ DEVICE=accel WRITE=75 READ_LEN=1   ; 写寄存器 0x75 后读 1 字节
 ```
 
+### `[spi_device <name>]` — 原始 SPI 设备
+
+定义一个 SPI 设备，把它接到某台 MCU 的硬件 SPI 总线，或软件（bit-bang）SPI 引脚上。该节**必须**带名称，名称用于 `SPI_TRANSFER` / `SPI_SEND` 的 `DEVICE=<name>`。
+
+这是 SPI（F6）栈的第一个消费者；上游没有通用 `[spi_device]` 节，各设备各自通过 `MCU_SPI_from_config` 读取同样的选项。
+
+| 参数 | 类型 | 必需 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| `spi_mcu` | 字符串 | 否 | `mcu` | 设备所在的 MCU 名 |
+| `cs_pin` | 引脚描述 | 否 | — | 片选引脚；写 `None`（或不写）表示不用固件驱动 CS |
+| `cs_active_high` | 布尔 | 否 | `false` | 片选是否高电平有效 |
+| `spi_mode` | 整数 (0..3) | 否 | `0` | SPI 模式（CPOL/CPHA） |
+| `spi_speed` | 整数 (Hz) | 否 | `100000` | 时钟频率，最低 `100000` |
+| `spi_bus` | 字符串 | 否 | 固件中编号 0 的总线 | 硬件总线名（如 `spi1a`） |
+| `spi_software_miso_pin` / `spi_software_mosi_pin` / `spi_software_sclk_pin` | 引脚描述 | 三个一起 | — | 软件 SPI 的三个引脚 |
+
+**注意：**
+- 软件 SPI 的三个引脚必须都给出，且都在同一台 `spi_mcu` 上；只给一部分会报错。
+- `spi_bus` 与软件引脚二选一；给了软件引脚就忽略 `spi_bus`。
+- 片选由**固件**驱动：每次传输会拉低 CS、移位、再释放，所以一次 `SPI_TRANSFER` 就是一个完整的片选周期（命令字节和随后的数据要放在同一个 `DATA` 里）。
+- `SPI_TRANSFER` / `SPI_SEND` 是**调试命令**（上游没有），用于在真板上验证总线。
+
+**示例：**
+
+```ini
+# 硬件 SPI（STM32F103 的 SPI1 重映射到 PB3/PB4/PB5，固件总线名 spi1a），CS 用 PA15
+[spi_device flash]
+spi_mcu: mcu
+spi_bus: spi1a
+cs_pin: PA15
+spi_mode: 0
+spi_speed: 1000000
+
+# 软件（bit-bang）SPI，同一组引脚
+[spi_device flash_sw]
+cs_pin: PA15
+spi_software_miso_pin: PB4
+spi_software_mosi_pin: PB5
+spi_software_sclk_pin: PB3
+```
+
+对应 G-Code 命令：
+
+```gcode
+SPI_TRANSFER DEVICE=flash DATA=9f000000    ; W25 flash JEDEC ID → ef 30 13
+```
+
 ---
 
 - [← 用户手册首页](README.md)

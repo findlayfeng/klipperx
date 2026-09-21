@@ -24,6 +24,7 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use super::adc::{AdcRegistry, McuAdc};
 use super::i2c::{I2cMode, McuI2c};
 use super::pwm::McuPwm;
+use super::spi::{McuSpi, SpiMode};
 use crate::core::klippy::cmd::gpio::{ConfigDigitalOut, QueueDigitalOut, UpdateDigitalOut};
 use crate::core::klippy::cmd::McuCommand;
 use crate::core::klippy::mcu::{ConfigBuilder, Mcu, McuError};
@@ -160,6 +161,30 @@ impl McuChip {
             Arc::clone(&self.mcu),
             mode,
             address,
+        ))
+    }
+
+    /// Build an SPI device on this MCU.
+    ///
+    /// Upstream's `MCU_SPI` (`klippy/extras/bus.py:42`), the SPI counterpart of
+    /// [`McuChip::setup_i2c`]. `cs_pin` is the chip-select pin the firmware
+    /// drives, or `None` for a device that has none. The pin names in a software
+    /// mode become numbers in the resource's own config callback
+    /// (`mcu/resource/spi.rs`).
+    pub fn setup_spi(
+        &self,
+        mode: SpiMode,
+        cs_pin: Option<PinParams>,
+        cs_active_high: bool,
+    ) -> Arc<McuSpi> {
+        Arc::new(McuSpi::new(
+            Arc::clone(&self.config),
+            self.pins(),
+            &self.name,
+            Arc::clone(&self.mcu),
+            mode,
+            cs_pin,
+            cs_active_high,
         ))
     }
 

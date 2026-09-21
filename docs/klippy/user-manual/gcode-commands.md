@@ -276,6 +276,55 @@ IIC_READ DEVICE=accel WRITE=75 READ_LEN=1   ; 写 0x75 后读 1 字节
 
 ---
 
+### SPI_TRANSFER — SPI 全双工传输（调试）
+
+```
+SPI_TRANSFER DEVICE=<name> DATA=<hex>
+```
+
+对已配置的 `[spi_device <name>]` 做一次全双工传输：固件拉低片选、把 `DATA` 的字节移出，同时把移入的字节移回，然后释放片选。一次调用就是一个完整的片选周期。多路命令，每个 `[spi_device <name>]` 注册一个值。
+
+**参数：**
+
+| 参数 | 类型 | 必需 | 说明 |
+|------|------|------|------|
+| `DEVICE` | 字符串 | 是 | 设备名，对应 `[spi_device <name>]` 的 `<name>` |
+| `DATA` | 十六进制字符串 | 是 | 要移出的字节；返回长度相同 |
+
+**示例：**
+```
+SPI_TRANSFER DEVICE=flash DATA=9f000000
+// spi transfer: ffef3013
+```
+
+> W25 系列 flash 的 JEDEC ID：发 `9f` + 3 个哑字节，返回的后 3 字节是厂商/类型/容量（如 `ef 30 13`）。
+
+---
+
+### SPI_SEND — SPI 只写（调试）
+
+```
+SPI_SEND DEVICE=<name> DATA=<hex>
+```
+
+拉低片选、移出 `DATA` 的字节、释放片选，不使用返回数据。
+
+**参数：**
+
+| 参数 | 类型 | 必需 | 说明 |
+|------|------|------|------|
+| `DEVICE` | 字符串 | 是 | 设备名 |
+| `DATA` | 十六进制字符串 | 是 | 要移出的字节 |
+
+**示例：**
+```
+SPI_SEND DEVICE=flash DATA=04      ; W25 的 WRDI（写禁止）
+```
+
+> `SPI_TRANSFER` / `SPI_SEND` 是 KlipperX 专为真机自测增加的命令，上游没有对应 G-Code。
+
+---
+
 ## 命令注册说明
 
 KlipperX 的命令通过注册机制动态加载：

@@ -14,9 +14,14 @@
 //! 2. **Config callback**: resolve bus name or pin numbers, pick the transfer
 //!    style (`i2c_transfer` vs `i2c_write`/`i2c_read`), add the bus config
 //!    command.
-//! 3. **Runtime**: `transfer()` sends data and returns the response.
+//! 3. **Runtime**: `transfer()` / `write()` send data. A bus error stops the
+//!    machine with a message naming the MCU, address and status — upstream's
+//!    policy, because a NACK means the device or its wiring is broken. A
+//!    bring-up probe uses `transfer_without_shutdown()` /
+//!    `write_without_shutdown()` instead, which report the status as an error and
+//!    leave the machine running.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use crate::core::klippy::cmd::i2c::{
     add_software_bus, ConfigI2c, I2cBusStatus, I2cRead, I2cSetBus, I2cTransfer, I2cWrite,
@@ -24,6 +29,7 @@ use crate::core::klippy::cmd::i2c::{
 };
 use crate::core::klippy::mcu::{ConfigBuilder, Mcu, McuError};
 use crate::core::klippy::pins::PrinterPins;
+use crate::core::klippy::printer::Printer;
 
 use super::pin::pin_number;
 
@@ -78,6 +84,11 @@ pub struct McuI2c {
     state: Arc<I2cState>,
     /// Shared with the chip, so runtime sends reach the connected device.
     mcu: Arc<Mutex<Option<Arc<Mcu>>>>,
+    /// The MCU's name, for the message a bus error carries.
+    chip_name: String,
+    /// The machine, so a bus error can stop it. `Weak` because the printer owns
+    /// the section that owns this resource.
+    printer: Weak<Printer>,
 }
 
 impl McuI2c {
@@ -93,6 +104,7 @@ impl McuI2c {
         mcu: Arc<Mutex<Option<Arc<Mcu>>>>,
         mode: I2cMode,
         address: u8,
+        printer: Weak<Printer>,
     ) -> Self {
         let state = Arc::new(I2cState {
             oid: Mutex::new(None),
@@ -115,7 +127,12 @@ impl McuI2c {
             }))
             .expect("a resource is always built before the configuration is");
 
-        Self { state, mcu }
+        Self {
+            state,
+            mcu,
+            chip_name: chip_name.to_string(),
+            printer,
+        }
     }
 
     /// The oid the firmware allocated.
@@ -139,7 +156,24 @@ impl McuI2c {
             .ok_or_else(|| McuError::Config("MCU is not connected".to_string()))
     }
 
-    /// Send a read-write transaction.
+    /// Send a read-write transaction, stopping the machine on a bus error.
+    ///
+    /// This is what a device driver uses (upstream's `i2c_transfer`): a NACK or
+    /// timeout means the device or the wiring is broken, so the printer is shut
+    /// down with a message naming the MCU, address and status, and the error is
+    /// returned too. A bring-up probe wants
+    /// [`McuI2c::transfer_without_shutdown`] instead.
+    ///
+    /// # Errors
+    /// As [`McuI2c::transfer_without_shutdown`].
+    pub async fn transfer(&self, write_data: &[u8], read_len: u32) -> Result<Vec<u8>, McuError> {
+        match self.transfer_without_shutdown(write_data, read_len).await {
+            Err(McuError::I2cBus { oid, status }) => Err(self.bus_error(oid, status)),
+            other => other,
+        }
+    }
+
+    /// Send a read-write transaction, reporting a bus error as a value.
     ///
     /// Writes `write_data` then reads `read_len` bytes. Uses the firmware's
     /// preferred transfer style (new split commands if available, legacy
@@ -147,8 +181,12 @@ impl McuI2c {
     ///
     /// # Errors
     /// Returns [`McuError::I2cBus`] if the transfer fails or the response
-    /// indicates a bus error (NACK, timeout, etc.).
-    pub async fn transfer(&self, write_data: &[u8], read_len: u32) -> Result<Vec<u8>, McuError> {
+    /// indicates a bus error (NACK, timeout, etc.), without stopping the machine.
+    pub async fn transfer_without_shutdown(
+        &self,
+        write_data: &[u8],
+        read_len: u32,
+    ) -> Result<Vec<u8>, McuError> {
         let mcu = self.connected_mcu()?;
         let oid = self.oid()?;
 
@@ -201,10 +239,23 @@ impl McuI2c {
 
             Ok(response.response)
         } else {
-            Err(McuError::I2cBus {
-                oid,
-                status: I2cBusStatus::Unknown(0),
-            })
+            Err(McuError::Config(
+                "firmware has neither the combined nor the split I2C transfer commands".to_string(),
+            ))
+        }
+    }
+
+    /// Send a write-only transaction, stopping the machine on a bus error.
+    ///
+    /// The write counterpart of [`McuI2c::transfer`]; use
+    /// [`McuI2c::write_without_shutdown`] to get the error back instead.
+    ///
+    /// # Errors
+    /// As [`McuI2c::write_without_shutdown`].
+    pub async fn write(&self, data: &[u8]) -> Result<(), McuError> {
+        match self.write_without_shutdown(data).await {
+            Err(McuError::I2cBus { oid, status }) => Err(self.bus_error(oid, status)),
+            other => other,
         }
     }
 
@@ -216,8 +267,8 @@ impl McuI2c {
     /// checked rather than left dangling in the receiver.
     ///
     /// # Errors
-    /// As [`McuI2c::transfer`].
-    pub async fn write(&self, data: &[u8]) -> Result<(), McuError> {
+    /// As [`McuI2c::transfer_without_shutdown`].
+    pub async fn write_without_shutdown(&self, data: &[u8]) -> Result<(), McuError> {
         let mcu = self.connected_mcu()?;
         let oid = self.oid()?;
 
@@ -257,6 +308,21 @@ impl McuI2c {
     /// The device address.
     pub fn address(&self) -> u8 {
         *self.state.address.lock().expect("address lock poisoned")
+    }
+
+    /// Report a bad bus status and stop the machine, as upstream's
+    /// `i2c_transfer` does.
+    fn bus_error(&self, oid: u8, status: I2cBusStatus) -> McuError {
+        let message = format!(
+            "MCU '{}' I2C request to addr {} reports error {}",
+            self.chip_name,
+            self.address(),
+            status.name()
+        );
+        if let Some(printer) = self.printer.upgrade() {
+            printer.invoke_shutdown(&message);
+        }
+        McuError::I2cBus { oid, status }
     }
 }
 
@@ -351,5 +417,50 @@ impl I2cState {
         *self.new_transfer.lock().expect("lock poisoned") = has_new;
 
         Ok(())
+    }
+}
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::klippy::reactor::ManualReactor;
+
+    fn resource(printer: &Arc<Printer>) -> McuI2c {
+        McuI2c::new(
+            Arc::new(ConfigBuilder::new()),
+            Arc::new(PrinterPins::new()),
+            "mcu",
+            Arc::new(Mutex::new(None)),
+            I2cMode::Hardware {
+                bus: None,
+                speed: 100_000,
+            },
+            0x50,
+            Arc::downgrade(printer),
+        )
+    }
+
+    #[test]
+    fn test_a_bus_error_stops_the_machine() {
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        let resource = resource(&printer);
+
+        let err = resource.bus_error(3, I2cBusStatus::Nack);
+
+        assert!(matches!(
+            err,
+            McuError::I2cBus {
+                oid: 3,
+                status: I2cBusStatus::Nack
+            }
+        ));
+        assert_eq!(
+            printer.get_state_message().message,
+            "MCU 'mcu' I2C request to addr 80 reports error NACK"
+        );
     }
 }

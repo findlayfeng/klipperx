@@ -31,6 +31,7 @@ use crate::core::klippy::mcu::{ConfigBuilder, Mcu, McuError};
 use crate::core::klippy::pins::{
     Adc, DigitalOut, PinChip, PinError, PinParams, PrinterPins, PwmOut,
 };
+use crate::core::klippy::printer::Printer;
 
 /// The furthest a scheduled change may be from now, in clock ticks. Upstream's
 /// `MAX_SCHEDULE_TICKS` (`klippy/mcu.py:16`), used to reject a `max_duration`
@@ -151,9 +152,10 @@ impl McuChip {
     /// Upstream's `MCU_I2C` (`klippy/extras/bus.py:161`), the bus counterpart
     /// of the pin resources above: it holds the chip's configuration builder
     /// and the connect slot, so the transfers it sends reach the live device.
-    /// The pin names in a software mode become numbers in the resource's own
-    /// config callback (`mcu/resource/i2c.rs`).
-    pub fn setup_i2c(&self, mode: I2cMode, address: u8) -> Arc<McuI2c> {
+    /// `printer` is how a bus error can stop the machine. The pin names in a
+    /// software mode become numbers in the resource's own config callback
+    /// (`mcu/resource/i2c.rs`).
+    pub fn setup_i2c(&self, mode: I2cMode, address: u8, printer: Weak<Printer>) -> Arc<McuI2c> {
         Arc::new(McuI2c::new(
             Arc::clone(&self.config),
             self.pins(),
@@ -161,6 +163,7 @@ impl McuChip {
             Arc::clone(&self.mcu),
             mode,
             address,
+            printer,
         ))
     }
 

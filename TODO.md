@@ -144,8 +144,10 @@ toolhead / 开放事件）一起补，一部分是现在就独立可补的小行
       `pending_commands` 批量与 20 条阈值、`M112` 乱序检测、`input_log`、debuginput EOF
       退出、`stats gcodein=`（`:390-494`）。现在输入由 API 层的 `gcode/script` 承担；要么
       明确不补（纯 API 主机），要么把串口/文件输入做成一个独立对象。
-- [ ] **`ack()` / `need_ack`**：`GcodeCommand` 没有 `ack`（`:54-63`），这是文件输入协议的
+- [x] **`ack()` / `need_ack`**：`GcodeCommand` 没有 `ack`（`:54-63`），这是文件输入协议的
       一部分。受影响的具体行为：`M115` 应该先 `ack(msg)`、失败才 `respond_info`（`:344-350`）。
+      —— 已加 `GcodeCommand::ack`（`M115` / `M105` 已用），`need_ack` 随 `process_line` 传递。
+      但本主机还没有 `need_ack=true` 的生产者（GCodeIO），所以 `ack` 目前恒返回 false。
 - [ ] **事件**：错误分支不发 `gcode:command_error`（`:226`），重启不发
       `gcode:request_restart`（`:358`），debug 输入不发 `gcode:debuginput_exit`（`:433`）。
       事件总线（`KlippyEvent`）已就绪，待接入这些触发点。
@@ -159,7 +161,7 @@ toolhead / 开放事件）一起补，一部分是现在就独立可补的小行
 
 **可独立补的小行为差异**
 
-- [ ] **`default_handler` 缩水**（`:283-316`）：缺 `M105` → `ack("T:0")`、`M21`、
+- [x] **`default_handler` 缩水**（`:283-316`）：缺 `M105` → `ack("T:0")`、`M21`、
       `M140/M104` 且 `S=0`、`M107` / `M106`（S 关或 fileinput）这些「没有该模块时安静忽略」
       的抑制；也缺「命令名里带空格」时按 `realcmd = cmd.split()[0]` 路由到 `M117/M118/M23`
       的分支。后者是实际差异：`M117 123` 这类数字消息在 Rust 里会整串当命令名而报
@@ -178,13 +180,16 @@ toolhead / 开放事件）一起补，一部分是现在就独立可补的小行
       return（`:186-193`）；Rust 无条件发 `Klipper state: Shutdown`（`gcode.rs:335-343`）。
 - [x] **`is_traditional_gcode` 判定**：上游用 `float(cmd[1:])`（`:125-131`），Rust 只看首字母
       大写 + 次字符数字（`gcode.rs:794`）。`M1ABC` 这类上游拒绝注册、Rust 接受。
-- [ ] **`parse_extended` 的 shlex 保真**：Rust 手写解析只做引号切换 + `#`/`;` 截断，不处理
+- [x] **`parse_extended` 的 shlex 保真**：Rust 手写解析只做引号切换 + `#`/`;` 截断，不处理
       反斜杠转义 / 引号拼接等 `shlex` 语义（`gcode.rs:937-983` 对 `:266-281`）。
+      —— 已补：单引号内原样、双引号内只转义 `"`/`\`、引号外退格去反斜杠、相邻引号拼接、
+      尾部悬空反斜杠报错。
 - [x] **校验和 `*123`**：上游 `get_raw_command_parameters` 会剥掉尾部校验和（`:40-51`），
       Rust 的 `raw_parameters` 不剥（`gcode.rs:919-935`）。只在文件 / 串口输入路径上有影响，
       连同 `GCodeIO` 一起看。
-- [ ] **`register_command(cmd, None)` 注销**：上游支持注销并返回旧 handler（`:133-141`），
+- [x] **`register_command(cmd, None)` 注销**：上游支持注销并返回旧 handler（`:133-141`），
       Rust 无注销、重复注册直接报错（`gcode.rs:325-350`）。
+      —— 已加 `GCodeDispatch::unregister_command`（返回旧 handler，未知名字返回 `None`）。
 - [ ] **参数访问器缺口**：缺 `above`/`below`、`get_int` 的 `minval/maxval`、通用
       `get(parser=…)`；缺 `get_command_parameters` / `get_raw_command_parameters`（raw 只在
       内部 `Parsed`）；也没有 `create_gcode_command`（字段私有，外部无法构造 gcmd，宏类模块
@@ -563,6 +568,10 @@ ack」settle，并用 `Mcu::took_over_session()` 让 `rpi_usb` 判断“有没�
 
 细节在各模块文档里；这里每条只留一行索引，最近完成的在前。
 
+- **G-Code 默认处理器与参数解析（G1b）**：`default_handler` 补 `M105`/`M21`/`M140`/`M104`/
+      `M107`/`M106` 的“安静忽略”与 `M117`/`M118`/`M23` 的按首 token 路由；`GcodeCommand::ack`
+      + `need_ack`（`M115`/`M105` 已用）；`parse_extended` 补反斜杠转义与引号拼接；
+      `unregister_command` 注销（对齐上游 `register_command(cmd, None)`）。
 - **G-Code 调度器小行为对齐（G1b）**：`ECHO` 改用 `// ` 前缀且不记日志、`HELP`
       未就绪提示与按 active 表遍历、`get_status` 按 active 表构建、未就绪时停机不打印、
       mux 默认项（`value=None`）不再不可达、行号命令行剥尾部 `*<digits>` 校验和；另删掉

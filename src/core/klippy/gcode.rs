@@ -120,6 +120,12 @@ pub struct GcodeCommand {
     command: String,
     commandline: String,
     params: HashMap<String, String>,
+    /// Whether this line came from an input that wants an `ok` ack.
+    ///
+    /// Upstream's `need_ack` (`klippy/gcode.py:23`): true for the file/serial
+    /// input protocol, false for an API `gcode/script` line. This host has no
+    /// file input yet, so there is no caller that sets it true.
+    need_ack: bool,
 }
 
 impl GcodeCommand {
@@ -228,6 +234,22 @@ impl GcodeCommand {
     /// client sent rather than a host event.
     pub fn respond_info_no_log(&self, msg: &str) {
         self.dispatch.respond_info(msg, false);
+    }
+
+    /// Acknowledge the line, when its input wants acks.
+    ///
+    /// Upstream's `ack` (`klippy/gcode.py:54-63`): `ok`, or `ok <msg>`, and only
+    /// for a `need_ack` line. Returns whether it acknowledged, which is how
+    /// `M115` chooses between `ok <msg>` and an info line.
+    pub fn ack(&self, msg: Option<&str>) -> bool {
+        if !self.need_ack {
+            return false;
+        }
+        match msg {
+            Some(msg) => self.respond_raw(&format!("ok {msg}")),
+            None => self.respond_raw("ok"),
+        }
+        true
     }
 
     fn missing(&self, name: &str) -> CommandError {
@@ -394,6 +416,21 @@ impl GCodeDispatch {
         Ok(())
     }
 
+    /// Remove a registered command, as upstream's `register_command(cmd, None)`.
+    ///
+    /// Returns the handler that was registered, so a module can chain to it (a
+    /// `gcode_macro` alias, a homing override). An unknown name returns `None`,
+    /// which upstream also treats as a no-op rather than an error.
+    ///
+    /// The help text is left behind, as upstream's does: the command is gone
+    /// from the active table, so `HELP` and `get_status` no longer show it.
+    pub fn unregister_command(&self, name: &str) -> Option<CommandHandler> {
+        let mut commands = self.lock();
+        let old = commands.ready.remove(name);
+        commands.base.remove(name);
+        old
+    }
+
     /// Register one value of a mux command — a command whose handler depends on
     /// one parameter (`SET_PIN PIN=<name>`).
     ///
@@ -464,7 +501,9 @@ impl GCodeDispatch {
     /// Returns the first [`CommandError`] the script produced.
     pub fn run_script(&self, script: &str) -> Result<(), CommandError> {
         for line in script.split('\n') {
-            if let Err(err) = process_line(&self.inner, line) {
+            // An API `gcode/script` line is not acknowledged; the file/serial
+            // input protocol is the only `need_ack` producer (`gcode.py:210`).
+            if let Err(err) = process_line(&self.inner, line, false) {
                 self.inner.respond_error(&err.to_string());
                 return Err(err);
             }
@@ -499,10 +538,15 @@ impl GCodeDispatch {
                 "M110" => Arc::new(|_| Ok(())),
                 // Get Firmware Version and Capabilities.
                 "M115" => Arc::new(|gcmd: &GcodeCommand| {
-                    gcmd.respond_info(&format!(
+                    let msg = format!(
                         "FIRMWARE_NAME:Klipper FIRMWARE_VERSION:{}",
                         env!("CARGO_PKG_VERSION")
-                    ));
+                    );
+                    // A file-input line gets `ok <msg>`; an API line gets the
+                    // info line instead (`klippy/gcode.py:344-350`).
+                    if !gcmd.ack(Some(&msg)) {
+                        gcmd.respond_info(&msg);
+                    }
                     Ok(())
                 }),
                 _ => unreachable!(),
@@ -636,7 +680,7 @@ fn upgrade(inner: &Weak<Inner>) -> Arc<Inner> {
 }
 
 /// One line of a script: parse, find the handler, run it.
-fn process_line(inner: &Arc<Inner>, line: &str) -> Result<(), CommandError> {
+fn process_line(inner: &Arc<Inner>, line: &str, need_ack: bool) -> Result<(), CommandError> {
     let Some(parsed) = parse_line(line) else {
         return Ok(()); // blank or comment-only
     };
@@ -650,8 +694,11 @@ fn process_line(inner: &Arc<Inner>, line: &str) -> Result<(), CommandError> {
         commands.active(ready).get(&parsed.command).cloned()
     };
 
+    // An unregistered command is never re-parsed: upstream hands the split
+    // parameters to `cmd_default` and only a registered extended command goes
+    // through `_get_extended_params`.
     let Some(handler) = handler else {
-        return default_handler(inner, &parsed);
+        return default_handler(inner, &parsed, need_ack);
     };
 
     // An extended command's parameters are `KEY=VALUE`; re-parse the raw text so
@@ -668,19 +715,72 @@ fn process_line(inner: &Arc<Inner>, line: &str) -> Result<(), CommandError> {
         command: parsed.command,
         commandline: parsed.commandline,
         params,
+        need_ack,
     };
     handler(&gcmd)
 }
 
 /// The handler for an unregistered command (`klippy/gcode.py:283-316`).
-fn default_handler(inner: &Arc<Inner>, parsed: &Parsed) -> Result<(), CommandError> {
-    if parsed.command.is_empty() {
+///
+/// Most of this is upstream's list of requests a slicer sends for a module this
+/// host may not have: they are answered quietly instead of as unknown commands.
+fn default_handler(
+    inner: &Arc<Inner>,
+    parsed: &Parsed,
+    need_ack: bool,
+) -> Result<(), CommandError> {
+    let mut gcmd = GcodeCommand {
+        dispatch: Arc::clone(inner),
+        command: parsed.command.clone(),
+        commandline: parsed.commandline.clone(),
+        params: parsed.params.clone(),
+        need_ack,
+    };
+    let command = gcmd.command.clone();
+
+    // Temperature and SD-card requests are answered before the ready check, so
+    // a client polling them during startup is not told the printer is not ready.
+    if command == "M105" {
+        gcmd.ack(Some("T:0"));
+        return Ok(());
+    }
+    if command == "M21" {
         return Ok(());
     }
     if !inner.ready.load(Ordering::SeqCst) {
         return Err(CommandError::new(inner.printer.get_state_message().message));
     }
-    inner.respond_info(&format!("Unknown command:\"{}\"", parsed.command), false);
+    if command.is_empty() {
+        return Ok(());
+    }
+
+    if let Some((real, _)) = command.split_once(' ') {
+        // `M117 <message>`: a display message whose text is not a parameter.
+        // If the module registered the command, hand it the line unchanged.
+        if matches!(real, "M117" | "M118" | "M23") {
+            let handler = {
+                let commands = inner
+                    .commands
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                commands.active(true).get(real).cloned()
+            };
+            if let Some(handler) = handler {
+                gcmd.command = real.to_string();
+                return handler(&gcmd);
+            }
+        }
+    } else if matches!(command.as_str(), "M140" | "M104")
+        && gcmd.get_float_default("S", 0.0)? == 0.0
+    {
+        // A request to turn off a heater that is not present.
+        return Ok(());
+    } else if command == "M107" || (command == "M106" && gcmd.get_float_default("S", 1.0)? == 0.0) {
+        // A request to turn off a fan that is not present.
+        return Ok(());
+    }
+
+    inner.respond_info(&format!("Unknown command:\"{}\"", command), false);
     Ok(())
 }
 
@@ -1008,11 +1108,16 @@ fn raw_parameters(without_comment: &str) -> String {
 }
 
 /// Parse extended parameters: whitespace-separated `KEY=VALUE`, with shell
-/// quoting and `#`/`;` comments (`klippy/gcode.py:266-281`).
+/// quoting, backslash escapes, and `#`/`;` comments (`klippy/gcode.py:266-281`,
+/// whose `shlex` does the quoting).
+///
+/// A backslash is dropped outside single quotes; inside double quotes it only
+/// escapes `"` and `\`, so `"a\db"` stays `a\db`. Adjacent quoted and unquoted
+/// pieces join into one token (`a"b"c` is `abc`).
 ///
 /// # Errors
-/// Returns [`CommandError`] when a token has no `=`, or a quote is unterminated
-/// — upstream's "Malformed command".
+/// Returns [`CommandError`] when a token has no `=`, a quote is unterminated, or
+/// the text ends with a dangling backslash — upstream's "Malformed command".
 fn parse_extended(raw: &str, commandline: &str) -> Result<HashMap<String, String>, CommandError> {
     let malformed = || CommandError::new(format!("Malformed command '{commandline}'"));
 
@@ -1020,23 +1125,31 @@ fn parse_extended(raw: &str, commandline: &str) -> Result<HashMap<String, String
     let mut token = String::new();
     let mut in_single = false;
     let mut in_double = false;
+    let mut escaped = false;
     for c in raw.chars() {
-        if in_single {
+        if escaped {
+            if in_double && c != '"' && c != '\\' {
+                token.push('\\');
+            }
+            token.push(c);
+            escaped = false;
+        } else if in_single {
             if c == '\'' {
                 in_single = false;
             } else {
                 token.push(c);
             }
         } else if in_double {
-            if c == '"' {
-                in_double = false;
-            } else {
-                token.push(c);
+            match c {
+                '"' => in_double = false,
+                '\\' => escaped = true,
+                c => token.push(c),
             }
         } else {
             match c {
                 '\'' => in_single = true,
                 '"' => in_double = true,
+                '\\' => escaped = true,
                 '#' | ';' => break,
                 c if c.is_whitespace() => {
                     if !token.is_empty() {
@@ -1047,7 +1160,7 @@ fn parse_extended(raw: &str, commandline: &str) -> Result<HashMap<String, String
             }
         }
     }
-    if in_single || in_double {
+    if in_single || in_double || escaped {
         return Err(malformed());
     }
     if !token.is_empty() {
@@ -1207,6 +1320,31 @@ mod tests {
     }
 
     #[test]
+    fn test_a_backslash_escapes_the_next_character() {
+        let value = |raw: &str| parse_extended(raw, "X").unwrap()["PIN"].clone();
+
+        // Outside quotes the backslash is dropped.
+        assert_eq!(value(r"PIN=a\ b"), "a b");
+        assert_eq!(value(r#"PIN=\"q\""#), "\"q\"");
+        assert_eq!(value(r"PIN=a\\b"), r"a\b");
+
+        // Inside double quotes only `"` and `\` are escaped; anything else keeps
+        // the backslash, as `shlex` does.
+        assert_eq!(value(r#"PIN="a\db""#), r"a\db");
+        assert_eq!(value(r#"PIN="a\"b""#), "a\"b");
+        assert_eq!(value(r#"PIN="a\\b""#), r"a\b");
+
+        // Inside single quotes a backslash is literal.
+        assert_eq!(value(r"PIN='a\db'"), r"a\db");
+
+        // Adjacent quoted and unquoted pieces join into one token.
+        assert_eq!(value(r#"PIN=a"b"c"#), "abc");
+
+        // A dangling backslash is malformed.
+        assert!(parse_extended(r"PIN=a\", "X").is_err());
+    }
+
+    #[test]
     fn test_a_malformed_extended_parameter_is_an_error() {
         let err = parse_extended("PINfan", "SET_PIN PINfan").unwrap_err();
         assert_eq!(err.to_string(), "Malformed command 'SET_PIN PINfan'");
@@ -1287,6 +1425,29 @@ mod tests {
     }
 
     #[test]
+    fn test_a_command_can_be_unregistered() {
+        let (dispatch, output) = dispatch();
+        dispatch.inner.set_ready(true);
+        let (handler, seen) = recorder();
+        dispatch
+            .register_command("MY_CMD", handler, None, false)
+            .unwrap();
+
+        let old = dispatch.unregister_command("MY_CMD");
+
+        assert!(old.is_some());
+        // Gone from the table: the line is unknown now.
+        run(&dispatch, "MY_CMD");
+        assert!(seen.lock().unwrap().is_empty());
+        assert_eq!(
+            emitted(&output).last().map(String::as_str),
+            Some("// Unknown command:\"MY_CMD\"")
+        );
+        // Removing it again is a no-op.
+        assert!(dispatch.unregister_command("MY_CMD").is_none());
+    }
+
+    #[test]
     fn test_an_invalid_extended_name_is_refused() {
         let (dispatch, _output) = dispatch();
         let (handler, _) = recorder();
@@ -1306,6 +1467,56 @@ mod tests {
         assert!(dispatch.run_script("NOPE").is_ok());
 
         assert_eq!(emitted(&output), ["// Unknown command:\"NOPE\""]);
+    }
+
+    #[test]
+    fn test_unknown_requests_for_missing_modules_are_quiet() {
+        let (dispatch, output) = dispatch();
+        dispatch.inner.set_ready(true);
+
+        // A slicer asks for modules this host may not have; upstream answers
+        // these quietly rather than as unknown commands.
+        for line in ["M105", "M21", "M140 S0", "M104 S0", "M107", "M106 S0"] {
+            assert!(dispatch.run_script(line).is_ok(), "{line}");
+        }
+        assert_eq!(emitted(&output), Vec::<String>::new());
+
+        // A request that actually wants heat is still reported.
+        run(&dispatch, "M104 S200");
+        assert!(emitted(&output)
+            .last()
+            .map(|l| l.contains("Unknown command"))
+            .unwrap_or(false));
+    }
+
+    #[test]
+    fn test_a_display_message_routes_to_its_registered_command() {
+        let (dispatch, output) = dispatch();
+        dispatch.inner.set_ready(true);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        {
+            let seen = Arc::clone(&seen);
+            dispatch
+                .register_command(
+                    "M117",
+                    Arc::new(move |gcmd: &GcodeCommand| {
+                        seen.lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .push(gcmd.commandline().to_string());
+                        Ok(())
+                    }),
+                    None,
+                    false,
+                )
+                .unwrap();
+        }
+
+        // `M117 123` is one command name (`M117 123`); the message is not a
+        // parameter, so the line is routed to the registered `M117`.
+        run(&dispatch, "M117 123");
+
+        assert_eq!(*seen.lock().unwrap(), ["M117 123"]);
+        assert_eq!(emitted(&output), Vec::<String>::new());
     }
 
     #[test]
@@ -1547,6 +1758,7 @@ mod tests {
             command: parsed.command,
             commandline: parsed.commandline,
             params,
+            need_ack: false,
         }
     }
 
@@ -1585,6 +1797,16 @@ mod tests {
             err.to_string(),
             "Error on 'MY_CMD A=0.5': A must have minimum of 1"
         );
+    }
+
+    #[test]
+    fn test_ack_does_nothing_for_an_api_line() {
+        let gcmd = command("M115");
+
+        // The only `need_ack` producer is the file/serial input protocol, which
+        // this host does not have, so an API line is never acknowledged.
+        assert!(!gcmd.ack(None));
+        assert!(!gcmd.ack(Some("T:0")));
     }
 
     #[test]

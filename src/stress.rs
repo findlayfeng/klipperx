@@ -612,7 +612,7 @@ async fn configure_stepper(
         .map_err(|err| std::io::Error::other(format!("build: {err}")))?;
     let mut reset_sent = false;
     let configured = loop {
-        match builder.handshake(&mcu, &mut built).await {
+        match builder.handshake(&mcu, &mut built, false).await {
             Ok(configured) => break configured,
             Err(McuError::ResetRequired) if !reset_sent => {
                 println!("firmware has no config_reset; sending 'reset' and reconnecting");

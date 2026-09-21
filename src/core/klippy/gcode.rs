@@ -39,7 +39,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use serde_json::{json, Map, Value};
 use tracing::{info, warn};
@@ -418,10 +418,16 @@ impl GCodeDispatch {
         }
 
         // First value: install the dispatcher itself, then the value.
-        let inner = Arc::clone(&self.inner);
+        //
+        // The dispatcher is stored in the table it belongs to, so it must hold
+        // the dispatcher **weakly**: a strong handle is a self-cycle
+        // (`Inner.commands -> handler -> Arc<Inner>`) that keeps the whole
+        // dispatcher — and every resource its handlers captured, up to a
+        // connected MCU — alive after a restart drops the machine's parts.
+        let inner = Arc::downgrade(&self.inner);
         let command = cmd.to_string();
         let dispatcher: CommandHandler =
-            Arc::new(move |gcmd: &GcodeCommand| dispatch_mux(&inner, &command, gcmd));
+            Arc::new(move |gcmd: &GcodeCommand| dispatch_mux(&upgrade(&inner), &command, gcmd));
         self.register_command(cmd, dispatcher, desc, false)?;
         self.lock().mux.insert(
             cmd.to_string(),
@@ -473,13 +479,11 @@ impl GCodeDispatch {
     fn register_builtins(&self) {
         let simple: [(&str, Option<&str>); 2] = [("M110", None), ("M115", None)];
         for (name, desc) in simple {
-            let inner = Arc::clone(&self.inner);
             let handler: CommandHandler = match name {
                 // Set Current Line Number: accepted and ignored.
                 "M110" => Arc::new(|_| Ok(())),
                 // Get Firmware Version and Capabilities.
-                "M115" => Arc::new(move |gcmd: &GcodeCommand| {
-                    let _ = &inner;
+                "M115" => Arc::new(|gcmd: &GcodeCommand| {
                     gcmd.respond_info(&format!(
                         "FIRMWARE_NAME:Klipper FIRMWARE_VERSION:{}",
                         env!("CARGO_PKG_VERSION")
@@ -492,12 +496,16 @@ impl GCodeDispatch {
                 .expect("the built-in command names are valid and unique");
         }
 
+        // The built-in handlers are stored in the table they call into, so each
+        // one holds the dispatcher **weakly** (`register_mux_command` explains
+        // the cycle). `upgrade` succeeds because a handler only runs while the
+        // dispatcher that owns it is alive.
         {
-            let inner = Arc::clone(&self.inner);
+            let inner = Arc::downgrade(&self.inner);
             self.register_command(
                 "M112",
                 Arc::new(move |_| {
-                    inner
+                    upgrade(&inner)
                         .printer
                         .invoke_shutdown("Shutdown due to M112 command");
                     Ok(())
@@ -519,11 +527,11 @@ impl GCodeDispatch {
                 "Restart firmware, host, and reload config",
             ),
         ] {
-            let inner = Arc::clone(&self.inner);
+            let inner = Arc::downgrade(&self.inner);
             self.register_command(
                 name,
                 Arc::new(move |_| {
-                    inner.printer.request_exit(result);
+                    upgrade(&inner).printer.request_exit(result);
                     Ok(())
                 }),
                 Some(desc),
@@ -532,11 +540,9 @@ impl GCodeDispatch {
             .expect("the restart command names are valid and unique");
         }
         {
-            let inner = Arc::clone(&self.inner);
             self.register_command(
                 "ECHO",
-                Arc::new(move |gcmd: &GcodeCommand| {
-                    let _ = &inner;
+                Arc::new(|gcmd: &GcodeCommand| {
                     gcmd.respond_raw(gcmd.commandline());
                     Ok(())
                 }),
@@ -546,20 +552,20 @@ impl GCodeDispatch {
             .expect("ECHO is a valid, unique command name");
         }
         {
-            let inner = Arc::clone(&self.inner);
+            let inner = Arc::downgrade(&self.inner);
             self.register_command(
                 "STATUS",
-                Arc::new(move |gcmd: &GcodeCommand| cmd_status(&inner, gcmd)),
+                Arc::new(move |gcmd: &GcodeCommand| cmd_status(&upgrade(&inner), gcmd)),
                 Some("Report the printer status"),
                 true,
             )
             .expect("STATUS is a valid, unique command name");
         }
         {
-            let inner = Arc::clone(&self.inner);
+            let inner = Arc::downgrade(&self.inner);
             self.register_command(
                 "HELP",
-                Arc::new(move |gcmd: &GcodeCommand| cmd_help(&inner, gcmd)),
+                Arc::new(move |gcmd: &GcodeCommand| cmd_help(&upgrade(&inner), gcmd)),
                 Some("Report the list of available extended G-Code commands"),
                 true,
             )
@@ -594,6 +600,20 @@ impl PrinterObject for GCodeDispatch {
 // ===========================================================================
 // Dispatch
 // ===========================================================================
+
+/// Upgrade a stored handler's weak handle to the dispatcher it belongs to.
+///
+/// The command handlers in `Inner.commands` hold the dispatcher **weakly**: a
+/// strong handle is a self-cycle (`Inner.commands -> handler -> Arc<Inner>`) that
+/// would keep the dispatcher — and every resource its handlers captured, up to a
+/// connected MCU — alive after a restart drops the machine's parts
+/// (`Printer::teardown`). A handler only runs while the dispatcher that owns it
+/// is alive, so the upgrade always succeeds.
+fn upgrade(inner: &Weak<Inner>) -> Arc<Inner> {
+    inner
+        .upgrade()
+        .expect("the dispatcher outlives the command handlers it stores")
+}
 
 /// One line of a script: parse, find the handler, run it.
 fn process_line(inner: &Arc<Inner>, line: &str) -> Result<(), CommandError> {
@@ -1017,6 +1037,35 @@ mod tests {
 
     fn emitted(output: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
         output.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// Dropping the dispatcher must actually free it.
+    ///
+    /// Its built-in handlers (and the mux dispatcher a resource registers, like
+    /// `SET_PIN`) live in its own command table. Holding them strongly would make
+    /// the dispatcher keep *itself* alive forever — and with it every resource
+    /// those handlers captured, up to an MCU connection whose receive task reads
+    /// the serial port. That is what turned a `firmware_restart` into a frame
+    /// desync: the old connection was never torn down (`Printer::teardown`).
+    #[test]
+    fn test_dropping_the_dispatcher_frees_its_handlers() {
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        let dispatch = GCodeDispatch::new(Arc::clone(&printer));
+        dispatch
+            .register_mux_command("SET_PIN", "PIN", Some("led"), Arc::new(|_| Ok(())), None)
+            .unwrap();
+
+        let inner = Arc::downgrade(&dispatch.inner);
+        drop(dispatch);
+        // The dispatcher also registered printer event handlers that hold it;
+        // a restart clears those (`Printer::teardown`), leaving only the command
+        // table to account for.
+        printer.teardown();
+
+        assert!(
+            inner.upgrade().is_none(),
+            "the command table must not hold the dispatcher alive"
+        );
     }
 
     /// A handler that records the command lines it saw.

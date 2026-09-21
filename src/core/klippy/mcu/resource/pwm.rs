@@ -103,11 +103,16 @@ impl McuPwm {
         });
 
         let callback_state = Arc::clone(&state);
-        let callback_pins = Arc::clone(&pins);
+        // Weak, not Arc: see `McuDigitalOut::new` — a strong handle would cycle
+        // through the chip's `ConfigBuilder` and outlive a restart.
+        let callback_pins = Arc::downgrade(&pins);
         let callback_pin = pin.clone();
         config
             .register_config_callback(Box::new(move |builder, mcu| {
-                callback_state.build(builder, mcu, &callback_pins, &chip_name, &callback_pin)
+                let pins = callback_pins
+                    .upgrade()
+                    .expect("the pins registry outlives the resources it built");
+                callback_state.build(builder, mcu, &pins, &chip_name, &callback_pin)
             }))
             .expect("a resource is always built before the configuration is");
 

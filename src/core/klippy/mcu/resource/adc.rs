@@ -153,15 +153,20 @@ impl McuAdc {
         });
 
         let callback_state = Arc::clone(&state);
-        let callback_pins = Arc::clone(&pins);
+        // Weak, not Arc: see `McuDigitalOut::new` — a strong handle would cycle
+        // through the chip's `ConfigBuilder` and outlive a restart.
+        let callback_pins = Arc::downgrade(&pins);
         let callback_registry = Arc::clone(&registry);
         let callback_pin = pin.clone();
         config
             .register_config_callback(Box::new(move |builder, mcu| {
+                let pins = callback_pins
+                    .upgrade()
+                    .expect("the pins registry outlives the resources it built");
                 callback_state.build(
                     builder,
                     mcu,
-                    &callback_pins,
+                    &pins,
                     &callback_registry,
                     &chip_name,
                     &callback_pin,

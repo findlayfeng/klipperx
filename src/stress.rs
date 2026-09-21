@@ -590,7 +590,7 @@ async fn motion_smoke(
         0.0,
     );
     let flush_time = print_time + duration + 0.01;
-    let commands = stepper.generate(&trapq, flush_time, (flush_time * freq) as u64)?;
+    let commands = stepper.generate(&trapq, flush_time)?;
     let expected = (DISTANCE / STEP_DIST).round() as i32;
     println!(
         "generated {} command(s) for {expected} step(s): {}",

@@ -200,6 +200,16 @@ impl McuObject {
         self.chip.config()
     }
 
+    /// The connected device, or `None` before connect.
+    ///
+    /// The clock/trigger layer asks the MCU for its frequency and clock; a
+    /// resource reaches it through its own [`McuStepper`]/pin handle, but a
+    /// consumer that found this object by name (the toolhead looking for the
+    /// primary) needs the handle here.
+    pub fn mcu(&self) -> Option<Arc<Mcu>> {
+        self.chip.mcu()
+    }
+
     /// Build an I2C device on this MCU.
     ///
     /// The bus counterpart of the pin resources `pins` builds: a section that

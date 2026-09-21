@@ -366,7 +366,14 @@ impl McuClock {
     /// Upstream does this once in `connect` (`klippy/clocksync.py:33-51`),
     /// before the periodic `get_clock` queries take over.
     pub fn seed(&self, sent_time: f64, clock: i64) {
-        self.estimator().seed(sent_time, clock);
+        let mut estimator = self.estimator();
+        // The frequency comes from the firmware's dictionary; without it the
+        // estimator would keep its placeholder 1 Hz and map a clock of millions
+        // of ticks to millions of seconds.
+        if let Ok(freq) = self.mcu.clock_freq() {
+            estimator.set_mcu_freq(freq);
+        }
+        estimator.seed(sent_time, clock);
     }
 
     /// Seconds of print time to firmware clock ticks.
@@ -605,6 +612,21 @@ mod tests {
         let estimator = clock.estimator();
         assert_eq!(estimator.last_clock(), 1234);
         assert_eq!(estimator.mcu_freq(), 20_000_000.0);
+    }
+
+    #[tokio::test]
+    async fn test_seed_takes_the_frequency_from_the_dictionary() {
+        // A board that has been up 10 s at 20 MHz, with no query: the seed alone
+        // must map its clock back to 10 s of print time.
+        let mcu = mcu_answering(Vec::new());
+        let clock = McuClock::new(mcu, ManualReactor::shared());
+
+        clock.seed(7.5, 200_000_000);
+
+        assert_eq!(clock.estimator().mcu_freq(), 20_000_000.0);
+        assert!((clock.estimated_print_time(7.5) - 10.0).abs() < 1e-9);
+        // And it advances with the host clock from there.
+        assert!((clock.estimated_print_time(8.5) - 11.0).abs() < 1e-9);
     }
 
     #[tokio::test]

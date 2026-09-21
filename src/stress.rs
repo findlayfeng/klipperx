@@ -1,9 +1,11 @@
-//! `klipperx stress` — ramp a step-generation load on one MCU until it fails.
+//! `klipperx stress` — bench the MCU: ramp its step or link load until it fails,
+//! or run one full host motion path as a smoke test.
 //!
-//! The workload is upstream's step engine (`src/stepper.c`): the host configures
-//! one stepper (borrowing the pins of a `[stepper_*]` section in the config) and
-//! then queues `queue_step` moves at a rising step rate. The MCU stops being able
-//! to keep up with a firmware shutdown:
+//! `--task step` and `--task comm` are the ramps. `--task step`'s workload is
+//! upstream's step engine (`src/stepper.c`): the host configures one stepper
+//! (borrowing the pins of a `[stepper_*]` section in the config) and then queues
+//! `queue_step` moves at a rising step rate. The MCU stops being able to keep up
+//! with a firmware shutdown:
 //!
 //! * the next step's time has already passed — `Stepper too far in past`
 //!   (`src/stepper.c:108`), the usual one;
@@ -24,6 +26,11 @@
 //! it shut down when it finds the limit. A real `printer.cfg` is not required —
 //! only the `[mcu <name>]` section (for the transport) and one stepper section
 //! (for a step/dir pin pair) are read.
+//!
+//! `--task motion` is the odd one out: a single, bounded move through the real
+//! host stack ([`Trapq`] → [`Stepper`] → the full compressor) with the firmware's
+//! `stepper_get_position` read back, so FW5f's compression can be checked on
+//! hardware without a full `[printer]` config or three known axes.
 
 use clap::Args;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -32,12 +39,15 @@ use std::time::{Duration, Instant};
 
 use crate::core::klippy::cmd::config::{ConfigState, GetConfig, Reset};
 use crate::core::klippy::cmd::stepper::{
-    ConfigStepper, QueueStep, ResetStepClock, StepperGetPosition, StepperPosition,
+    ConfigStepper, QueueStep, ResetStepClock, SetNextStepDir, StepperGetPosition, StepperPosition,
 };
-use crate::core::klippy::cmd::GetClock;
+use crate::core::klippy::cmd::uptime::{GetUptime, Uptime};
+use crate::core::klippy::cmd::{GetClock, McuCommand};
 use crate::core::klippy::config::mcu::McuConfig;
 use crate::core::klippy::config::{AccessTracking, Config, ConfigSection, ConfigWrapper};
+use crate::core::klippy::mathutil::Xyz;
 use crate::core::klippy::mcu::{ConfigBuilder, Mcu, McuError};
+use crate::core::klippy::motion::{Axis, StepCommand, Stepper, Trapq};
 
 /// The first step rate to try, in steps per second.
 ///
@@ -100,6 +110,9 @@ pub enum Task {
     Step,
     /// Command round-trips: the highest request rate the host↔MCU link carries.
     Comm,
+    /// Full-compressor smoke test: drive one stepper through `G1`'s host path
+    /// (`Trapq` → `Stepper` → `stepcompress`) and read the position back.
+    Motion,
 }
 
 /// A `get_config` / `get_clock` round-trip that takes longer than this is
@@ -189,6 +202,7 @@ async fn stress(args: StressArgs) -> Result<(), Box<dyn std::error::Error>> {
     match args.task {
         Task::Step => step_stress(&mcu_config, mcu, &config, &args).await,
         Task::Comm => comm_stress(mcu, &args).await,
+        Task::Motion => motion_smoke(&mcu_config, mcu, &config).await,
     }
 }
 
@@ -512,6 +526,173 @@ fn find_mcu_section<'a>(config: &'a Config, name: &str) -> Option<&'a ConfigSect
     config
         .sections()
         .find(|section| section.id == "mcu" && section.sub.as_deref().unwrap_or("mcu") == name)
+}
+
+/// Drive one stepper through the host's motion path and read its position back.
+///
+/// This is the FW5f real-board smoke test: a [`Trapq`] move is solved by
+/// `itersolve`, compressed by the full `stepcompress`, sent as `queue_step`
+/// commands, and the firmware's own `stepper_get_position` is compared with the
+/// distance the move asked for. It borrows the same step/dir pins as
+/// `--task step`, so it needs no full `[printer]` config (and never touches the
+/// unknown Y/Z pins).
+async fn motion_smoke(
+    mcu_config: &McuConfig,
+    mcu: Arc<Mcu>,
+    config: &Config,
+) -> Result<(), Box<dyn std::error::Error>> {
+    /// Millimetres per step for the smoke move (100 steps/mm, so the firmware's
+    /// step count is easy to read).
+    const STEP_DIST: f64 = 0.01;
+    /// The move is `DISTANCE` mm at `SPEED` mm/s.
+    const DISTANCE: f64 = 5.0;
+    const SPEED: f64 = 10.0;
+    /// How long to wait for the firmware to report the expected position.
+    const SETTLE_TIMEOUT: Duration = Duration::from_secs(5);
+    const SETTLE_POLL: Duration = Duration::from_millis(5);
+
+    let (stepper_section, step_pin, dir_pin) = find_stepper(config, &mcu_config.name, &mcu)?;
+    println!("using [{stepper_section}] -> step_pin={step_pin} dir_pin={dir_pin}");
+    let (oid, mcu) = configure_stepper(mcu_config, mcu, step_pin, dir_pin).await?;
+    let freq = mcu.clock_freq().map_err(std::io::Error::other)?;
+
+    // The host's print time *is* absolute board time (the compressor maps print
+    // time zero to clock zero), so the move has to start from the board's
+    // current clock, not from a fixed number. Seed the estimate from `get_uptime`.
+    if mcu.has_message(GetUptime::NAME) {
+        if let Ok(uptime) = mcu
+            .call_msg::<GetUptime, Uptime>(&GetUptime, CALL_TIMEOUT)
+            .await
+        {
+            mcu.set_clock_base(uptime.clock64());
+        }
+    }
+    let now = mcu
+        .estimated_clock()
+        .map(|clock| clock as f64 / freq)
+        .unwrap_or(1.0);
+
+    let mut stepper = Stepper::cartesian("smoke", u32::from(oid), STEP_DIST, Axis::X, freq);
+    // Start 100 ms after the board's now, so the first step is comfortably in the
+    // future and the whole schedule lands where the firmware expects it.
+    let print_time = now + 0.1;
+    let duration = DISTANCE / SPEED;
+    let mut trapq = Trapq::new();
+    trapq.append(
+        print_time,
+        0.0,
+        duration,
+        0.0,
+        Xyz::default(),
+        Xyz::new(1.0, 0.0, 0.0),
+        SPEED,
+        SPEED,
+        0.0,
+    );
+    let flush_time = print_time + duration + 0.01;
+    let commands = stepper.generate(&trapq, flush_time, (flush_time * freq) as u64)?;
+    let expected = (DISTANCE / STEP_DIST).round() as i32;
+    println!(
+        "generated {} command(s) for {expected} step(s): {}",
+        commands.len(),
+        describe_commands(&commands)
+    );
+
+    send_steps(&mcu, oid, &commands).await?;
+    let position = wait_for_position(&mcu, oid, expected, SETTLE_TIMEOUT, SETTLE_POLL).await?;
+    println!("firmware position: {position} step(s), expected {expected}");
+    if position != expected {
+        return Err(format!("position mismatch: {position} != {expected}").into());
+    }
+    println!("motion smoke OK");
+    Ok(())
+}
+
+/// Send the compressor's commands, in batches small enough for the send queue.
+async fn send_steps(
+    mcu: &Arc<Mcu>,
+    oid: u8,
+    commands: &[StepCommand],
+) -> Result<(), std::io::Error> {
+    // The outbound channel holds 32 items (`mcu/mod.rs`); a flush every 16 keeps
+    // it from filling while a long compressed run goes out.
+    const BATCH: usize = 16;
+    for chunk in commands.chunks(BATCH) {
+        for command in chunk {
+            match *command {
+                StepCommand::SetNextStepDir { direction, .. } => mcu
+                    .send_msg(&SetNextStepDir {
+                        oid,
+                        dir: u8::from(direction),
+                    })
+                    .map_err(|err| std::io::Error::other(format!("set_next_step_dir: {err}")))?,
+                StepCommand::QueueStep {
+                    interval,
+                    count,
+                    add,
+                    ..
+                } => mcu
+                    .send_msg(&QueueStep {
+                        oid,
+                        interval,
+                        count: count as u16,
+                        add: add as i16,
+                    })
+                    .map_err(|err| std::io::Error::other(format!("queue_step: {err}")))?,
+            }
+        }
+        mcu.flush(CALL_TIMEOUT)
+            .await
+            .map_err(|err| std::io::Error::other(format!("flush: {err}")))?;
+    }
+    Ok(())
+}
+
+/// Poll the firmware's step counter until it reaches `expected`.
+async fn wait_for_position(
+    mcu: &Arc<Mcu>,
+    oid: u8,
+    expected: i32,
+    timeout: Duration,
+    poll: Duration,
+) -> Result<i32, std::io::Error> {
+    let deadline = Instant::now() + timeout;
+    let mut last = mcu
+        .call_msg::<_, StepperPosition>(&StepperGetPosition { oid }, CALL_TIMEOUT)
+        .await
+        .map_err(|err| std::io::Error::other(format!("stepper_get_position: {err}")))?
+        .pos;
+    while last != expected && Instant::now() < deadline {
+        tokio::time::sleep(poll).await;
+        last = mcu
+            .call_msg::<_, StepperPosition>(&StepperGetPosition { oid }, CALL_TIMEOUT)
+            .await
+            .map_err(|err| std::io::Error::other(format!("stepper_get_position: {err}")))?
+            .pos;
+    }
+    if last == expected {
+        Ok(last)
+    } else {
+        Err(std::io::Error::other(format!(
+            "the stepper reached {last}, not {expected}"
+        )))
+    }
+}
+
+/// A short summary of a command list, for the smoke test's log line.
+fn describe_commands(commands: &[StepCommand]) -> String {
+    let steps: u32 = commands
+        .iter()
+        .filter_map(|command| match command {
+            StepCommand::QueueStep { count, .. } => Some(*count),
+            StepCommand::SetNextStepDir { .. } => None,
+        })
+        .sum();
+    let dirs = commands
+        .iter()
+        .filter(|command| matches!(command, StepCommand::SetNextStepDir { .. }))
+        .count();
+    format!("{steps} step(s), {dirs} dir command(s)")
 }
 
 /// Pick a stepper to borrow a step/dir pin pair from, and resolve them.

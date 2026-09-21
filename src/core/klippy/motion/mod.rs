@@ -33,7 +33,7 @@ pub use itersolve::{
 pub use kinematics::{CartesianKinematics, Kinematics, MoveContext};
 pub use plan::{LookAheadQueue, Move, MoveLimits};
 pub use queuing::MotionQueuing;
-pub use stepcompress::{GracePolicy, StepCommand, StepCompressor};
+pub use stepcompress::{GracePolicy, StepCommand, StepCompressError, StepCompressor};
 pub use stepper::Stepper;
 pub use toolhead::ToolHead;
 pub use trapq::{MoveSegment, Trapq};

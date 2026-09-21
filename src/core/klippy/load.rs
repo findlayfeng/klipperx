@@ -15,7 +15,14 @@
 //! The table is **generated** from the `section!` declarations in the modules
 //! that own sections (see `build.rs`): a module is one declaration next to the
 //! factory it names, so adding a section never edits a central list. Each
-//! declaration carries an `order`, because load order is part of the contract.
+//! declaration carries an `order`, because load order is part of the contract,
+//! plus two optional fields for the sections that are not a plain extras module:
+//!
+//! - `phase = early|generic|late` (default `generic`) places a section before or
+//!   after the generic walk, the way upstream loads `mcu` up front and
+//!   `toolhead` last (`klippy/klippy.py:120-125`);
+//! - `object = "<name>"` registers the built object under a name other than the
+//!   section's, because `[printer]`'s consumer is the `toolhead` object.
 //!
 //! The step itself is [`Printer::load_config`], defined here rather than in
 //! `printer.rs` so that the machine's core does not import its parts — the same
@@ -23,22 +30,26 @@
 //!
 //! # Order
 //!
-//! Main sections first, in table order, then prefix sections, in table order.
-//! Upstream loads its up-front modules the same way (`mcu` before the generic
-//! prefix walk), and the order matters: an object may look up one an earlier
-//! entry registered.
+//! Phase by phase (early, generic, late), and within a phase main sections
+//! first (table order), then prefix sections (table order). Upstream loads its
+//! up-front modules the same way (`mcu` before the generic prefix walk) and
+//! keeps `toolhead` for last; the order matters because an object may look up
+//! one an earlier entry registered.
 //!
-//! # What is not here
+//! # Validation
 //!
-//! Option-level validation. Upstream records every option each object reads and
-//! rejects anything unread (`klippy/configfile.py:435-441`); that needs access
-//! tracking in [`ConfigSection`], which does not exist yet. Only whole sections
-//! are validated so far.
+//! The undefined-option check runs at the end of [`Printer::load_config`] and
+//! uses the access tracking in [`ConfigWrapper`] as the schema — see
+//! [`check_unused`]. Every option read through a wrapper is recorded; a factory
+//! that must read a section later keeps the printer's tracker
+//! ([`Printer::access_tracking`]).
 
 use std::sync::Arc;
 
-use crate::core::klippy::config::{Config, ConfigSection};
-use crate::core::klippy::error::KlippyError;
+use crate::core::klippy::config::object::{PrinterConfig, CONFIGFILE_OBJECT};
+use crate::core::klippy::config::{
+    check_unused, AccessTracking, Config, ConfigError, ConfigWrapper,
+};
 use crate::core::klippy::gcode::{GCodeDispatch, GCODE_OBJECT};
 use crate::core::klippy::pins::{PrinterPins, PINS_OBJECT};
 use crate::core::klippy::printer::{Printer, PrinterObject};
@@ -46,23 +57,45 @@ use crate::core::klippy::printer::{Printer, PrinterObject};
 /// Builds one printer object from a config section.
 ///
 /// The loader registers what a factory returns under the section's identifier
-/// (`mcu`, `mcu zboard`), so a factory never names its own object, and two
-/// sections cannot silently claim one name. The printer is passed because an
-/// object may wire itself up as it is built.
+/// (`mcu`, `mcu zboard`) — or under the declaration's `object` name when it has
+/// one — so a factory never names its own object, and two sections cannot
+/// silently claim one name. The printer is passed because an object may wire
+/// itself up as it is built.
 ///
 /// `Err` is the factory's own complaint about the section, reported by the
-/// loader as a config error. (A config-error type is still missing — see the
-/// `TODO`.)
-pub type LoadConfig = fn(&ConfigSection, &Arc<Printer>) -> Result<Arc<dyn PrinterObject>, String>;
+/// loader as a config error ([`ConfigError`]).
+pub type LoadConfig =
+    fn(&ConfigWrapper, &Arc<Printer>) -> Result<Arc<dyn PrinterObject>, ConfigError>;
 
-/// One section id's two entry points, as upstream's `load_config` and
-/// `load_config_prefix`.
+/// When a section is loaded relative to the generic walk.
+///
+/// Upstream's `_read_config` loads a few modules explicitly around the generic
+/// prefix walk (`klippy/klippy.py:120-125`); this is that placement, spelled out
+/// on the declaration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Phase {
+    /// Before the generic walk: the modules everything else looks up (`mcu`).
+    Early,
+    /// The generic walk (the default).
+    Generic,
+    /// After the generic walk: modules that consume objects the walk built
+    /// (`toolhead`, which owns `[printer]`).
+    Late,
+}
+
+/// One section id's entry points and placement, as upstream's `load_config` /
+/// `load_config_prefix` plus where the module is loaded.
 #[derive(Clone, Copy)]
 pub struct Factories {
     /// Builds the bare `[<id>]` section.
     pub load_config: Option<LoadConfig>,
     /// Builds each `[<id> <name>]` section.
     pub load_config_prefix: Option<LoadConfig>,
+    /// The name to register the object under, when it differs from the section
+    /// identifier (`[printer]` → `toolhead`).
+    pub object: Option<&'static str>,
+    /// When to load this section relative to the generic walk.
+    pub phase: Phase,
 }
 
 // Every section id this host knows, in load order.
@@ -76,6 +109,10 @@ include!(concat!(env!("OUT_DIR"), "/section_factories.rs"));
 /// bare section (`load = load_config`), a prefix section
 /// (`prefix = load_config_prefix`), or both. `order` decides the load order
 /// among the entries that share a half.
+///
+/// Two optional fields place a section that is not a plain extras module:
+/// `phase = early|generic|late` (default `generic`) and `object = "<name>"`, the
+/// name to register the built object under when it differs from the section id.
 ///
 /// The factories are named as siblings: a bare name resolves to
 /// `<this module>::<name>`, a path is used as written.
@@ -104,98 +141,132 @@ impl Printer {
     /// [`api::register`](crate::core::klippy::api::register)); a host that loads
     /// first and registers it afterwards reorders that list.
     ///
-    /// [`PrinterPins`](crate::core::klippy::pins::PrinterPins) is registered
-    /// next, unconditionally, because every resource and `[board_pins]` reaches
-    /// it while sections are being loaded — and the MCU objects register
-    /// themselves as chips as they are built. Upstream loads the same two
-    /// modules up front (`pins` then `mcu`, `klippy/klippy.py:118-119`).
-    /// `pins` is registered but never queryable, so `objects/list` still starts
-    /// with `webhooks`.
-    ///
     /// [`GCodeDispatch`](crate::core::klippy::gcode::GCodeDispatch) comes first
     /// of all, because `pins` sections and resources register commands with it
     /// as they are built. Upstream registers the same object in
     /// `Printer.__init__` (`klippy/klippy.py:36-40`), before the config is read.
     ///
+    /// [`PrinterConfig`](crate::core::klippy::config::PrinterConfig) comes next:
+    /// it owns the access tracking the whole load records into, and upstream
+    /// registers it before `pins` and `mcu` too (`klippy/klippy.py:115-121`).
+    ///
+    /// [`PrinterPins`](crate::core::klippy::pins::PrinterPins) is registered
+    /// next, unconditionally, because every resource and `[board_pins]` reaches
+    /// it while sections are being loaded — and the MCU objects register
+    /// themselves as chips as they are built. Upstream loads the same objects up
+    /// front (`pins` then `mcu`, `klippy/klippy.py:118-119`). `pins` is
+    /// registered but never queryable, so it is not in `objects/list`.
+    ///
     /// # Errors
-    /// Returns [`KlippyError::Internal`] if a factory rejects a section, if a
-    /// name is already taken, or if a section nothing claims is left over — the
-    /// last is upstream's `Section '%s' is not a valid config section`
-    /// (`klippy/configfile.py:431`).
-    pub fn load_config(self: &Arc<Self>, config: &Config) -> Result<(), KlippyError> {
+    /// Returns [`ConfigError`] if a factory rejects a section, if a name is
+    /// already taken, or if a section or option nothing read is left over — the
+    /// last is upstream's `Section '%s' is not a valid config section` and
+    /// `Option '%s' is not valid in section '%s'` (`klippy/configfile.py:431`,
+    /// `:440`).
+    pub fn load_config(self: &Arc<Self>, config: &Config) -> Result<(), ConfigError> {
         // Remember where the host's own parts end, so a restart can keep them
         // and drop only what the config loads (see `reset_for_restart`).
         self.mark_host_objects();
+
+        // One access record for this load, shared by every wrapper, the
+        // `configfile` object, and any part that reads its section later.
+        let access = AccessTracking::shared();
+        self.set_access_tracking(Arc::clone(&access));
+
         self.add_object(GCODE_OBJECT, Arc::new(GCodeDispatch::new(Arc::clone(self))))?;
+        self.add_object(
+            CONFIGFILE_OBJECT,
+            Arc::new(PrinterConfig::new(
+                Arc::clone(&access),
+                PrinterConfig::raw_config(config),
+            )),
+        )?;
         self.add_object(PINS_OBJECT, Arc::new(PrinterPins::new()))?;
 
-        let mut claimed: Vec<String> = Vec::new();
-
-        for (id, factories) in FACTORIES {
-            let Some(load) = factories.load_config else {
-                continue;
-            };
-            let Some(section) = config.get_section(id) else {
-                continue;
-            };
-            register(load, section, self, &mut claimed)?;
-        }
-
-        for (id, factories) in FACTORIES {
-            let Some(load) = factories.load_config_prefix else {
-                continue;
-            };
-            for section in config.get_sections_by_id(id) {
-                // The bare `[id]` is the main section above; only `[id <name>]`
-                // is a prefix section, which is what upstream's
-                // `get_prefix_sections` returns.
-                if section.sub.is_none() {
-                    continue;
-                }
-                register(load, section, self, &mut claimed)?;
-            }
-        }
-
-        for section in config.sections_vec() {
-            let identifier = section.identifier();
-            if !claimed.iter().any(|name| name == &identifier) {
-                return Err(KlippyError::Internal(format!(
-                    "Section '{identifier}' is not a valid config section"
-                )));
-            }
-        }
-
+        let claimed = self.load_sections(config, &access, FACTORIES)?;
+        check_unused(config, &access, &claimed)?;
         Ok(())
     }
-}
 
-/// Build and register one section, recording it as claimed.
-///
-/// The section handed to the factory has the printer's in-memory overrides
-/// applied on top of the parsed config ([`Printer::override_config`]), so a part
-/// that found an option unworkable is read back with the replacement.
-fn register(
-    load: LoadConfig,
-    section: &ConfigSection,
-    printer: &Arc<Printer>,
-    claimed: &mut Vec<String>,
-) -> Result<(), KlippyError> {
-    let identifier = section.identifier();
-    let overrides = printer.overrides_for(&identifier);
-    let section = if overrides.is_empty() {
-        section.clone()
-    } else {
-        let mut section = section.clone();
-        for (option, value) in overrides {
-            section.parameters.insert(option, value);
+    /// Walk a factory table, registering what it claims.
+    ///
+    /// Split out from [`Printer::load_config`] so a test can drive the loader
+    /// with a synthetic table and exercise the phase/name rules without adding a
+    /// real section.
+    fn load_sections(
+        self: &Arc<Self>,
+        config: &Config,
+        access: &Arc<AccessTracking>,
+        factories: &[(&str, Factories)],
+    ) -> Result<Vec<String>, ConfigError> {
+        let mut claimed: Vec<String> = Vec::new();
+
+        // Early → generic → late; within a phase, main sections then prefixes.
+        for phase in [Phase::Early, Phase::Generic, Phase::Late] {
+            for (id, entry) in factories.iter().filter(|(_, entry)| entry.phase == phase) {
+                let Some(load) = entry.load_config else {
+                    continue;
+                };
+                let Some(section) = config.get_section(id) else {
+                    continue;
+                };
+                self.register(load, entry, section, access, &mut claimed)?;
+            }
+            for (id, entry) in factories.iter().filter(|(_, entry)| entry.phase == phase) {
+                let Some(load) = entry.load_config_prefix else {
+                    continue;
+                };
+                for section in config.get_sections_by_id(id) {
+                    // The bare `[id]` is the main section above; only `[id <name>]`
+                    // is a prefix section, which is what upstream's
+                    // `get_prefix_sections` returns.
+                    if section.sub.is_none() {
+                        continue;
+                    }
+                    self.register(load, entry, section, access, &mut claimed)?;
+                }
+            }
         }
-        section
-    };
 
-    let object = load(&section, printer).map_err(KlippyError::Internal)?;
-    printer.add_object(&identifier, object)?;
-    claimed.push(identifier);
-    Ok(())
+        Ok(claimed)
+    }
+
+    /// Build and register one section, recording it as claimed.
+    ///
+    /// The section handed to the factory has the printer's in-memory overrides
+    /// applied on top of the parsed config ([`Printer::override_config`]), so a
+    /// part that found an option unworkable is read back with the replacement.
+    fn register(
+        self: &Arc<Self>,
+        load: LoadConfig,
+        entry: &Factories,
+        section: &crate::core::klippy::config::ConfigSection,
+        access: &Arc<AccessTracking>,
+        claimed: &mut Vec<String>,
+    ) -> Result<(), ConfigError> {
+        let identifier = section.identifier();
+        let overrides = self.overrides_for(&identifier);
+        let overridden;
+        let section = if overrides.is_empty() {
+            section
+        } else {
+            overridden = {
+                let mut section = section.clone();
+                for (option, value) in overrides {
+                    section.parameters.insert(option, value);
+                }
+                section
+            };
+            &overridden
+        };
+
+        let wrapper = ConfigWrapper::new(section, Arc::clone(access));
+        let object = load(&wrapper, self)?;
+        let name = entry.object.unwrap_or(identifier.as_str());
+        self.add_object(name, object)?;
+        claimed.push(identifier);
+        Ok(())
+    }
 }
 
 // ===========================================================================
@@ -207,16 +278,33 @@ mod tests {
     use super::*;
     use crate::core::klippy::config::value::ConfigValue;
     use crate::core::klippy::reactor::ManualReactor;
+    use serde_json::{json, Value};
 
     /// Parse a config from its text, as the host does from a file.
     fn config(text: &str) -> Config {
         Config::from_text(text).expect("the test config parses").0
     }
 
-    fn load(text: &str) -> (Arc<Printer>, Result<(), KlippyError>) {
+    fn load(text: &str) -> (Arc<Printer>, Result<(), ConfigError>) {
         let printer = Arc::new(Printer::new(ManualReactor::shared()));
         let result = printer.load_config(&config(text));
         (printer, result)
+    }
+
+    /// A printer object that reports nothing, for the synthetic-table test.
+    struct Nothing;
+
+    impl PrinterObject for Nothing {
+        fn get_status(&self, _eventtime: f64) -> Value {
+            json!({})
+        }
+    }
+
+    fn nothing(
+        _config: &ConfigWrapper,
+        _printer: &Arc<Printer>,
+    ) -> Result<Arc<dyn PrinterObject>, ConfigError> {
+        Ok(Arc::new(Nothing))
     }
 
     #[test]
@@ -234,6 +322,85 @@ mod tests {
                 "spi_device"
             ]
         );
+        // `mcu` is the one up-front section (upstream loads `pins` and `mcu`
+        // before the generic walk); the rest are plain generic sections.
+        let by_id = |id: &str| {
+            FACTORIES
+                .iter()
+                .find(|(name, _)| *name == id)
+                .map(|(_, entry)| *entry)
+                .unwrap_or_else(|| panic!("no section '{id}'"))
+        };
+        assert_eq!(by_id("mcu").phase, Phase::Early);
+        assert_eq!(by_id("output_pin").phase, Phase::Generic);
+        assert!(FACTORIES.iter().all(|(_, entry)| entry.object.is_none()));
+    }
+
+    #[test]
+    fn test_a_late_section_loads_after_the_generic_walk() {
+        // The tenant rule: a section declared `phase = late` is loaded after the
+        // generic sections, and `object = "..."` registers it under a name other
+        // than the section id (`[printer]` → `toolhead`).
+        let factories: &[(&str, Factories)] = &[
+            (
+                "first",
+                Factories {
+                    load_config: Some(nothing),
+                    load_config_prefix: None,
+                    object: None,
+                    phase: Phase::Generic,
+                },
+            ),
+            (
+                "printer",
+                Factories {
+                    load_config: Some(nothing),
+                    load_config_prefix: None,
+                    object: Some("toolhead"),
+                    phase: Phase::Late,
+                },
+            ),
+        ];
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        let config = config("[printer]\nmax_velocity: 500\n[first]\nvalue: 1\n");
+        let access = AccessTracking::shared();
+        // The synthetic factories read nothing, so both options are unread; the
+        // loader's own `load_sections` is what this test exercises.
+        let claimed = printer.load_sections(&config, &access, factories).unwrap();
+
+        assert_eq!(printer.objects(), ["first", "toolhead"]);
+        assert_eq!(claimed, ["first", "printer"]);
+    }
+
+    #[test]
+    fn test_an_early_section_loads_before_the_generic_walk() {
+        let factories: &[(&str, Factories)] = &[
+            (
+                "chip",
+                Factories {
+                    load_config: Some(nothing),
+                    load_config_prefix: None,
+                    object: None,
+                    phase: Phase::Early,
+                },
+            ),
+            (
+                "first",
+                Factories {
+                    load_config: Some(nothing),
+                    load_config_prefix: None,
+                    object: None,
+                    phase: Phase::Generic,
+                },
+            ),
+        ];
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        let config = config("[first]\nvalue: 1\n[chip]\nserial: /dev/a\n");
+        let access = AccessTracking::shared();
+
+        printer.load_sections(&config, &access, factories).unwrap();
+
+        assert_eq!(printer.objects(), ["chip", "first"]);
     }
 
     #[test]
@@ -241,9 +408,33 @@ mod tests {
         let (printer, result) = load("[mcu]\nserial: /dev/not-opened-yet\n");
 
         result.unwrap();
-        // `pins` is registered before the table (upstream loads `pins` and
-        // `mcu` up front), then the section's own object.
-        assert_eq!(printer.objects(), ["gcode", "pins", "mcu"]);
+        // `configfile` is registered after `gcode`, `pins` after it (upstream
+        // loads `pins` and `mcu` up front), then the section's own object.
+        assert_eq!(printer.objects(), ["gcode", "configfile", "pins", "mcu"]);
+    }
+
+    #[test]
+    fn test_an_mcu_prefix_loads_before_a_generic_section_that_names_it() {
+        // `mcu` is an early section, so `[mcu zboard]` is a registered chip
+        // before the generic walk reaches `[board_pins]`, which names it.
+        let (printer, result) = load(
+            "[mcu]\nserial: /dev/a\n\
+             [mcu zboard]\nserial: /dev/b\n\
+             [board_pins]\nmcu: zboard\naliases: X=PA0\n",
+        );
+
+        result.unwrap();
+        assert_eq!(
+            printer.objects(),
+            [
+                "gcode",
+                "configfile",
+                "pins",
+                "mcu",
+                "mcu zboard",
+                "board_pins"
+            ]
+        );
     }
 
     #[test]
@@ -253,12 +444,29 @@ mod tests {
         let printer = Arc::new(Printer::new(ManualReactor::shared()));
         let config = config("[mcu]\nserial: /dev/not-opened-yet\n");
         printer.load_config(&config).unwrap();
-        assert_eq!(printer.objects(), ["gcode", "pins", "mcu"]);
+        assert_eq!(printer.objects(), ["gcode", "configfile", "pins", "mcu"]);
 
         printer.reset_for_restart("restart");
         printer.load_config(&config).unwrap();
 
-        assert_eq!(printer.objects(), ["gcode", "pins", "mcu"]);
+        assert_eq!(printer.objects(), ["gcode", "configfile", "pins", "mcu"]);
+    }
+
+    #[test]
+    fn test_the_configfile_object_reports_the_config_and_its_reads() {
+        let (printer, result) = load("[mcu]\nserial: /dev/a\n[output_pin fan]\npin: PA1\n");
+
+        result.unwrap();
+        let configfile = printer
+            .lookup_object_as::<PrinterConfig>(CONFIGFILE_OBJECT)
+            .expect("the loader registers `configfile`");
+        let status = configfile.get_status(0.0);
+        assert_eq!(status["config"]["output_pin fan"]["pin"], json!("PA1"));
+        assert_eq!(status["settings"]["output_pin fan"]["pin"], json!("PA1"));
+        // Queryable, so `objects/list` reports it as upstream's does.
+        assert!(printer
+            .queryable_objects()
+            .contains(&CONFIGFILE_OBJECT.to_string()));
     }
 
     #[test]
@@ -295,7 +503,14 @@ mod tests {
         // upstream's `add_printer_objects` order (`klippy/mcu.py:1239-1246`).
         assert_eq!(
             printer.objects(),
-            ["gcode", "pins", "mcu", "mcu zboard", "mcu toolhead"]
+            [
+                "gcode",
+                "configfile",
+                "pins",
+                "mcu",
+                "mcu zboard",
+                "mcu toolhead"
+            ]
         );
     }
 
@@ -311,24 +526,51 @@ mod tests {
     }
 
     #[test]
+    fn test_an_unknown_option_is_rejected_the_way_upstream_rejects_it() {
+        // The option check is the schema by use: `pin` is read, `pinn` is not.
+        let (_printer, result) =
+            load("[mcu]\nserial: /dev/a\n[output_pin fan]\npin: PA0\npinn: PA1\n");
+
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Option 'pinn' is not valid in section 'output_pin fan'"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_an_unknown_option_in_the_mcu_section_is_rejected() {
+        // The MCU section is parsed at load time so its options are recorded
+        // before the check runs, even though the device opens at connect.
+        let (_printer, result) = load("[mcu]\nserial: /dev/a\nserail: /dev/b\n");
+
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Option 'serail' is not valid in section 'mcu'"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn test_a_config_with_no_objects_loads_only_the_builtins() {
         let (printer, result) = load("");
 
         result.unwrap();
-        // `gcode` and `pins` are unconditional; no section contributed anything else.
-        assert_eq!(printer.objects(), ["gcode", "pins"]);
+        // `gcode`, `configfile` and `pins` are unconditional; no section
+        // contributed anything else.
+        assert_eq!(printer.objects(), ["gcode", "configfile", "pins"]);
     }
 
     #[test]
     fn test_a_bad_interface_is_not_noticed_until_connect() {
-        // Two-phase construction: loading only builds the object. The section is
-        // parsed — and the device opened — by `McuObject::connect`, so a config
-        // that cannot connect still *loads*, and the error is reported when the
-        // printer comes up rather than when the file is read.
+        // Two-phase construction: loading only parses the section. The device is
+        // opened — and the port found missing — by `McuObject::connect`, so a
+        // config whose transport cannot open still *loads*, and the error is
+        // reported when the printer comes up rather than when the file is read.
         let (printer, result) = load("[mcu]\nserial: /dev/not-a-serial-port\n");
 
         result.unwrap();
-        assert_eq!(printer.objects(), ["gcode", "pins", "mcu"]);
+        assert_eq!(printer.objects(), ["gcode", "configfile", "pins", "mcu"]);
     }
 
     #[test]
@@ -344,7 +586,7 @@ mod tests {
         // Main sections first, then the prefix section.
         assert_eq!(
             printer.objects(),
-            ["gcode", "pins", "mcu", "output_pin fan"]
+            ["gcode", "configfile", "pins", "mcu", "output_pin fan"]
         );
     }
 
@@ -361,7 +603,14 @@ mod tests {
         result.unwrap();
         assert_eq!(
             printer.objects(),
-            ["gcode", "pins", "mcu", "board_pins", "board_pins second"]
+            [
+                "gcode",
+                "configfile",
+                "pins",
+                "mcu",
+                "board_pins",
+                "board_pins second"
+            ]
         );
     }
 
@@ -378,7 +627,7 @@ mod tests {
         result.unwrap();
         assert_eq!(
             printer.objects(),
-            ["gcode", "pins", "mcu", "i2c_device accel"]
+            ["gcode", "configfile", "pins", "mcu", "i2c_device accel"]
         );
     }
 
@@ -395,7 +644,7 @@ mod tests {
         result.unwrap();
         assert_eq!(
             printer.objects(),
-            ["gcode", "pins", "mcu", "spi_device flash"]
+            ["gcode", "configfile", "pins", "mcu", "spi_device flash"]
         );
     }
 }

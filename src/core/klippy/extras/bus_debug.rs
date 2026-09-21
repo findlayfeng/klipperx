@@ -3,13 +3,12 @@
 //! `[i2c_device]` and `[spi_device]` both offer a pair of port-only commands
 //! that move bytes on the bus so the interface can be exercised on a real
 //! board. The pieces they have in common live here: the synchronous-to-async
-//! bridge the commands need, hex parsing/formatting for the `DATA=` parameter,
-//! and the config-option readers (`spi_speed`, `cs_active_high`, …).
+//! bridge the commands need, and hex parsing/formatting for the `DATA=`
+//! parameter.
 //!
 //! Nothing here is part of the bus resources themselves; a real driver would
 //! call `McuI2c` / `McuSpi` directly from its own async task.
 
-use crate::core::klippy::config::ConfigSection;
 use crate::core::klippy::gcode::CommandError;
 use crate::core::klippy::mcu::McuError;
 
@@ -37,34 +36,6 @@ pub(super) fn block_on<T>(
     }
     tokio::task::block_in_place(|| handle.block_on(future))
         .map_err(|err| CommandError::new(err.to_string()))
-}
-
-/// A required-or-default integer option, as upstream's `getint`.
-pub(super) fn parse_int(section: &ConfigSection, name: &str) -> Result<Option<i64>, String> {
-    let Some(text) = section.get_str(name) else {
-        return Ok(None);
-    };
-    text.trim().parse::<i64>().map(Some).map_err(|_| {
-        format!(
-            "Unable to parse option '{name}' in section '{}'",
-            section.identifier()
-        )
-    })
-}
-
-/// Read a boolean option the way upstream's `getboolean` does.
-pub(super) fn get_bool(section: &ConfigSection, name: &str) -> Result<Option<bool>, String> {
-    let Some(text) = section.get_str(name) else {
-        return Ok(None);
-    };
-    match text.trim().to_ascii_lowercase().as_str() {
-        "1" | "yes" | "true" | "on" => Ok(Some(true)),
-        "0" | "no" | "false" | "off" => Ok(Some(false)),
-        _ => Err(format!(
-            "Unable to parse option '{name}' in section '{}'",
-            section.identifier()
-        )),
-    }
 }
 
 /// Decode a hex string (`"01af"`, whitespace ignored) into bytes.

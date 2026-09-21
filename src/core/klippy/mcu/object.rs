@@ -23,6 +23,7 @@
 //! ([`register_stats_logging`](crate::core::klippy::event::stats::register_stats_logging)).
 //! It comes back with the statistics consumer.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -30,14 +31,15 @@ use serde_json::{json, Map, Value};
 use tracing::{info, warn};
 
 use crate::core::klippy::cmd::config::Reset;
+use crate::core::klippy::cmd::shutdown::EmergencyStop;
 use crate::core::klippy::cmd::uptime::{GetUptime, Uptime};
 use crate::core::klippy::cmd::McuCommand;
 use crate::core::klippy::config::mcu::McuConfig;
 use crate::core::klippy::config::value::ConfigValue;
-use crate::core::klippy::config::ConfigSection;
-use crate::core::klippy::error::KlippyError;
+use crate::core::klippy::config::{AccessTracking, ConfigSection, ConfigWrapper};
+use crate::core::klippy::error::{ConfigError, KlippyError};
 use crate::core::klippy::event::stats::register_stats_logging;
-use crate::core::klippy::event::{IsShutdown, McuEvent, Shutdown, Starting};
+use crate::core::klippy::event::{IsShutdown, KlippyEvent, McuEvent, Shutdown, Starting};
 use crate::core::klippy::mcu::{
     ConfigBuilder, Dictionary, I2cMode, Mcu, McuChip, McuError, McuI2c, McuRestartMethod, McuSpi,
     SpiMode,
@@ -84,6 +86,17 @@ pub struct McuObject {
     /// or one that needs the port closed (`mcu/restart.rs`). Set by `connect`, so
     /// it describes the connection that is actually open.
     restart_method: Mutex<McuRestartMethod>,
+    /// Whether this firmware is (or has been locally declared) stopped.
+    ///
+    /// Upstream's `_is_shutdown` (`klippy/mcu.py:794`): set when the firmware
+    /// reports a stop, and by [`McuObject::force_local_shutdown`]. A host
+    /// shutdown only sends `emergency_stop` when this is false — echoing the
+    /// stop back to a firmware that just reported it would be pointless, and
+    /// after a config reset the firmware is already stopped.
+    ///
+    /// `Arc` rather than a bare atomic because the `shutdown`/`is_shutdown`
+    /// event handlers are `'static` and need their own handle to it.
+    is_shutdown: Arc<AtomicBool>,
     /// The machine, for reporting a firmware shutdown. `Weak` because the
     /// printer's registry owns this object: a strong handle would be a cycle
     /// that keeps the printer (and its device) alive forever.
@@ -115,6 +128,7 @@ impl McuObject {
             chip,
             status: Mutex::new(json!({})),
             restart_method: Mutex::new(McuRestartMethod::Command),
+            is_shutdown: Arc::new(AtomicBool::new(false)),
             printer: Arc::downgrade(printer),
         })
     }
@@ -122,6 +136,53 @@ impl McuObject {
     /// The MCU's own name, as upstream's `MCU.get_name` reports it.
     pub fn name(&self) -> &str {
         self.chip.name()
+    }
+
+    /// Whether this firmware is stopped (or the host has marked it so).
+    ///
+    /// Upstream's `MCU.is_shutdown()` (`klippy/mcu.py:908`).
+    pub fn is_shutdown(&self) -> bool {
+        self.is_shutdown.load(Ordering::SeqCst)
+    }
+
+    /// Mark the firmware stopped and tell it to stop, whatever it reports.
+    ///
+    /// Upstream's `force_local_shutdown` (`klippy/mcu.py:894-896`): used on a
+    /// path that is about to reset the firmware in place, where the stop must
+    /// not wait for `klippy:shutdown` and the firmware's own report must not be
+    /// taken for a spontaneous stop.
+    pub fn force_local_shutdown(&self) {
+        self.is_shutdown.store(true, Ordering::SeqCst);
+        self.send_emergency_stop();
+    }
+
+    /// Handle a host shutdown: stop the firmware unless it already stopped.
+    ///
+    /// Registered on `klippy:shutdown` by [`load_config`]. The swap makes this
+    /// the first stop, so a second host shutdown (or a firmware report that
+    /// raced it) does not send `emergency_stop` again.
+    fn on_host_shutdown(&self) {
+        if self.is_shutdown.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        self.send_emergency_stop();
+    }
+
+    /// Send `emergency_stop` on the live connection, if there is one.
+    ///
+    /// A part that is not connected has nothing to stop, and a send that fails
+    /// (the queue is closed, the firmware has no such command) only costs a
+    /// warning: the machine is already on its way down.
+    fn send_emergency_stop(&self) {
+        let Some(mcu) = self.chip.mcu() else {
+            return;
+        };
+        if let Err(err) = mcu.send_msg(&EmergencyStop) {
+            warn!(
+                "MCU '{}': could not send emergency_stop: {err}",
+                self.name()
+            );
+        }
     }
 
     /// The configuration builder for this MCU.
@@ -308,6 +369,7 @@ impl McuObject {
         if mcu.has_message(Shutdown::NAME) {
             let printer = self.printer.clone();
             let name = name.clone();
+            let is_shutdown = Arc::clone(&self.is_shutdown);
             mcu.bind_event::<Shutdown, _>(move |event| {
                 let msg = match event.clock {
                     Some(clock) => {
@@ -315,13 +377,16 @@ impl McuObject {
                     }
                     None => format!("MCU '{name}' shutdown: {}", event.reason),
                 };
+                is_shutdown.store(true, Ordering::SeqCst);
                 report_shutdown(&printer, &msg);
             })?;
         }
         if mcu.has_message(IsShutdown::NAME) {
             let printer = self.printer.clone();
             let name = name.clone();
+            let is_shutdown = Arc::clone(&self.is_shutdown);
             mcu.bind_event::<IsShutdown, _>(move |event| {
+                is_shutdown.store(true, Ordering::SeqCst);
                 report_shutdown(
                     &printer,
                     &format!("MCU '{name}' is shutdown: {}", event.reason),
@@ -349,10 +414,22 @@ impl PrinterObject for McuObject {
     fn connect<'a>(&'a self) -> ConnectFuture<'a> {
         Box::pin(async move {
             // The device is opened here, not at construction: that is the point
-            // of two-phase construction, and upstream parses the section at the
-            // same moment (`klippy/mcu.py:1147`). Opening a serial port or
-            // dlopen-ing the host library blocks, briefly, on this task.
-            let mut config = McuConfig::new(&self.section).map_err(KlippyError::Internal)?;
+            // of two-phase construction. The section was already parsed once
+            // (by the loader, which recorded its options for the undefined-option
+            // check); parsing it again here is done on the printer's tracker so
+            // a read that happens now is still recorded.
+            let access = self
+                .printer
+                .upgrade()
+                .map(|printer| printer.access_tracking())
+                .unwrap_or_else(AccessTracking::shared);
+            let wrapper = ConfigWrapper::new(&self.section, access);
+            let mut config = McuConfig::new(&wrapper).map_err(KlippyError::Config)?;
+            info!(
+                "MCU '{}' restart method: {}",
+                config.name,
+                config.restart_method.as_str()
+            );
             // Check at startup, not at the first restart, that an `rpi_usb` reset
             // will be able to switch this port's power (and say which udev rule
             // to install if it will not). A hub that reports no power switching
@@ -421,9 +498,11 @@ impl PrinterObject for McuObject {
             // has no estimate.
             seed_clock_base(&mcu).await;
             // Identify installed the dictionary; reserve the pins the firmware
-            // owns before anything resolves one.
+            // owns before anything resolves one. A conflict here is a
+            // configuration problem (upstream's `pins.error`, caught as a
+            // config error), not an internal failure.
             self.reserve_pins(&mcu)
-                .map_err(|err| KlippyError::Internal(err.to_string()))?;
+                .map_err(|err| KlippyError::Config(ConfigError::new(err.to_string())))?;
 
             // `FIRMWARE_RESTART` on the `command` method sends the firmware's own
             // `reset` on the live connection, before the parts come down: it is
@@ -597,11 +676,32 @@ fn status_from(dictionary: &Dictionary) -> Value {
 /// themselves up as they are built (they register event handlers); an MCU
 /// connects through [`PrinterObject::connect`] instead, so it does not use it.
 pub fn load_config(
-    section: &ConfigSection,
-    _printer: &Arc<Printer>,
-) -> Result<Arc<dyn PrinterObject>, String> {
-    let object = McuObject::new(section.clone(), _printer).map_err(|err| err.to_string())?;
-    Ok(Arc::new(object))
+    config: &ConfigWrapper,
+    printer: &Arc<Printer>,
+) -> Result<Arc<dyn PrinterObject>, ConfigError> {
+    // Parse the section now so its options are recorded for the undefined-option
+    // check: the check runs at the end of the load walk, before anything
+    // connects, and an MCU reads its section at connect time. The parse is pure;
+    // the device is still only opened by `connect`.
+    McuConfig::new(config)?;
+    let object = Arc::new(
+        McuObject::new(config.section().clone(), printer)
+            .map_err(|err| ConfigError::new(err.to_string()))?,
+    );
+    // A host shutdown stops the firmware too (upstream registers the same
+    // handler in `MCU.__init__`, `klippy/mcu.py:798-799`). Registered here
+    // rather than in `connect` because the handler is `'static` and needs a
+    // handle to the object the registry owns; a `Weak` avoids keeping it alive.
+    let weak = Arc::downgrade(&object);
+    printer.register_event_handler(
+        KlippyEvent::KlippyShutdown,
+        Box::new(move |_| {
+            if let Some(object) = weak.upgrade() {
+                object.on_host_shutdown();
+            }
+        }),
+    );
+    Ok(object)
 }
 
 /// Upstream's `load_config_prefix` for `[mcu <name>]`.
@@ -610,10 +710,10 @@ pub fn load_config(
 /// a secondary MCU synchronizes to (`klippy/mcu.py:1245`), which arrives with the
 /// clock layer.
 pub fn load_config_prefix(
-    section: &ConfigSection,
+    config: &ConfigWrapper,
     printer: &Arc<Printer>,
-) -> Result<Arc<dyn PrinterObject>, String> {
-    load_config(section, printer)
+) -> Result<Arc<dyn PrinterObject>, ConfigError> {
+    load_config(config, printer)
 }
 
 // ===========================================================================
@@ -715,7 +815,7 @@ mod tests {
             ConfigValue::Single("rpi_usb".to_string()),
         );
         let object = McuObject::new(section, &printer).unwrap();
-        let config = McuConfig::new(&object.section).unwrap();
+        let config = McuConfig::new(&ConfigWrapper::untracked(&object.section)).unwrap();
         assert_eq!(config.restart_method, McuRestartMethod::RpiUsb);
         assert!(printer.overrides_for("mcu").is_empty());
 
@@ -739,7 +839,9 @@ mod tests {
             section.parameters.insert(option, value);
         }
         assert_eq!(
-            McuConfig::new(&section).unwrap().restart_method,
+            McuConfig::new(&ConfigWrapper::untracked(&section))
+                .unwrap()
+                .restart_method,
             McuRestartMethod::Command
         );
     }
@@ -916,9 +1018,103 @@ mod tests {
     #[test]
     fn test_the_loader_builds_an_object_from_the_section() {
         let printer = printer();
+        // The loader parses the section (to record its options); the device is
+        // still only opened at connect, so a serial path that does not exist is
+        // fine here.
+        let mut section = section(Some("zboard"));
+        section.parameters.insert(
+            "serial".to_string(),
+            ConfigValue::Single("/dev/not-opened-yet".to_string()),
+        );
 
-        let object = load_config(&section(Some("zboard")), &printer).unwrap();
+        let object = load_config(&ConfigWrapper::untracked(&section), &printer).unwrap();
 
         assert_eq!(object.get_status(0.0), json!({}));
+    }
+
+    /// An MCU attached to `object`'s chip whose dictionary has `emergency_stop`.
+    ///
+    /// The device is scripted with `mappings` because [`TestDevice`] only
+    /// records a frame it was told to expect: with no mapping, a sent frame is
+    /// refused and never reaches the recorder.
+    fn attached_with_estop(
+        object: &McuObject,
+        mappings: Vec<MappingEntry>,
+    ) -> (Arc<Mcu>, FrameRecorder) {
+        let device = TestDevice::new(mappings);
+        let recorder = device.recorder();
+        let mcu = Arc::new(Mcu::for_test("mcu", Interface::new(device)));
+        mcu.install_dictionary(
+            Dictionary::from_json(json!({"commands": {"emergency_stop": 3}})).unwrap(),
+        )
+        .unwrap();
+        object.chip.attach(Arc::clone(&mcu));
+        (mcu, recorder)
+    }
+
+    /// The one frame a first `emergency_stop` puts on the wire: seq 0, id 3.
+    fn estop_mapping() -> Vec<MappingEntry> {
+        vec![MappingEntry {
+            input: Frame::new(0, vec![3]),
+            outputs: vec![],
+        }]
+    }
+
+    #[tokio::test]
+    async fn test_a_host_shutdown_sends_emergency_stop_to_the_firmware() {
+        // Upstream's `MCU._shutdown` (`klippy/mcu.py:888-893`): a host shutdown
+        // stops the firmware too, so it cannot keep executing queued work while
+        // the host is gone.
+        let printer = printer();
+        let object = McuObject::new(section(None), &printer).unwrap();
+        let (mcu, recorder) = attached_with_estop(&object, estop_mapping());
+
+        object.on_host_shutdown();
+        mcu.flush(Duration::from_secs(1)).await.unwrap();
+
+        let sent = recorder.frames();
+        assert_eq!(sent.len(), 1, "one emergency_stop, got {sent:?}");
+        assert_eq!(sent[0].payload(), &[3]);
+        assert!(object.is_shutdown(), "the local flag stands after the stop");
+    }
+
+    #[tokio::test]
+    async fn test_a_host_shutdown_after_a_firmware_stop_does_not_echo_it_back() {
+        // The firmware reported the stop itself (or the host already forced
+        // one); sending `emergency_stop` again would be pointless.
+        let printer = printer();
+        let object = McuObject::new(section(None), &printer).unwrap();
+        let (mcu, recorder) = attached_with_estop(&object, estop_mapping());
+        object.is_shutdown.store(true, Ordering::SeqCst);
+
+        object.on_host_shutdown();
+        mcu.flush(Duration::from_secs(1)).await.unwrap();
+
+        assert!(recorder.frames().is_empty(), "nothing to stop");
+    }
+
+    #[tokio::test]
+    async fn test_load_config_registers_the_host_shutdown_handler() {
+        // The factory is what wires `klippy:shutdown` to the object, because the
+        // handler is `'static` and the object is `Arc`-owned by the registry.
+        let printer = printer();
+        let mut section = section(None);
+        section.parameters.insert(
+            "serial".to_string(),
+            ConfigValue::Single("/dev/not-opened-yet".to_string()),
+        );
+        let object = load_config(&ConfigWrapper::untracked(&section), &printer).unwrap();
+        // The loader does this in production; the factory only returns the
+        // object, and the handler's `Weak` needs the registry to hold it.
+        printer.add_object("mcu", Arc::clone(&object)).unwrap();
+        let mcu_object = printer
+            .lookup_object_as::<McuObject>("mcu")
+            .expect("the registered object");
+        let (mcu, recorder) = attached_with_estop(&mcu_object, estop_mapping());
+
+        printer.send_event(&KlippyEvent::KlippyShutdown);
+        mcu.flush(Duration::from_secs(1)).await.unwrap();
+
+        assert_eq!(recorder.frames().len(), 1);
     }
 }

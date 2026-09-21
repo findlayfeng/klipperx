@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use super::value::ConfigValue;
 
@@ -19,7 +19,12 @@ pub struct ConfigSection {
     /// Section sub (optional). Its meaning is defined by the specific section.
     pub sub: Option<String>,
     /// Parameters in this section.
-    pub parameters: HashMap<String, ConfigValue>,
+    ///
+    /// Ordered by name: the parser used to keep a hash map, whose iteration
+    /// order made the option check report a different bad option on each run.
+    /// Upstream iterates the file's order; a sorted map is deterministic and
+    /// close enough until the parser preserves insertion order.
+    pub parameters: BTreeMap<String, ConfigValue>,
 }
 
 /// Map of configuration sections indexed by their unique `(id, sub)` key.
@@ -72,7 +77,7 @@ impl ConfigSection {
             key: (id.to_string(), sub.clone()),
             id: id.to_string(),
             sub,
-            parameters: HashMap::new(),
+            parameters: BTreeMap::new(),
         }
     }
 
@@ -152,7 +157,7 @@ impl ConfigSection {
 }
 
 /// Split `text` on `sep` into trimmed, non-empty items.
-fn split_list(text: &str, sep: char) -> Vec<String> {
+pub(crate) fn split_list(text: &str, sep: char) -> Vec<String> {
     text.split(sep)
         .map(str::trim)
         .filter(|item| !item.is_empty())

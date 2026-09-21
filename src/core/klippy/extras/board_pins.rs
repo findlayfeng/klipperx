@@ -37,7 +37,7 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 
-use crate::core::klippy::config::ConfigSection;
+use crate::core::klippy::config::{ConfigError, ConfigWrapper};
 use crate::core::klippy::load::section;
 use crate::core::klippy::pins::{PrinterPins, PINS_OBJECT};
 use crate::core::klippy::printer::{Printer, PrinterObject};
@@ -67,54 +67,49 @@ impl BoardPins {
     /// Returns a config-error message when the `mcu` list names an unknown
     /// chip, when an option is malformed, or when an alias/reservation
     /// conflicts with one already recorded.
-    pub fn new(section: &ConfigSection, printer: &Printer) -> Result<Self, String> {
-        let identifier = section.identifier();
+    pub fn new(config: &ConfigWrapper, printer: &Printer) -> Result<Self, ConfigError> {
+        let identifier = config.identifier();
         let pins = printer
             .lookup_object_as::<PrinterPins>(PINS_OBJECT)
             .expect("the loader registers `pins` before any section");
 
         // The MCUs this section applies to; a missing option means the main
         // `mcu`, as upstream's `config.getlist('mcu', ('mcu',))` does.
-        let mcu_names = section
+        let mcu_names = config
             .get_list("mcu", ',')
             .unwrap_or_else(|| vec!["mcu".to_string()]);
         for name in &mcu_names {
             if !pins.chips().iter().any(|chip| chip == name) {
-                return Err(format!("Unknown chip name '{name}'"));
+                return Err(ConfigError::new(format!("Unknown chip name '{name}'")));
             }
         }
 
         // `aliases` first, then the `aliases_*` options in a deterministic
         // order (see the module docs).
         let mut options: Vec<String> = Vec::new();
-        if section.has("aliases") {
+        if config.has("aliases") {
             options.push("aliases".to_string());
         }
-        let mut prefixed: Vec<String> = section
-            .parameters
-            .keys()
-            .filter(|key| key.starts_with("aliases_"))
-            .cloned()
-            .collect();
+        let mut prefixed: Vec<String> = config.prefix_options("aliases_");
         prefixed.sort();
         options.extend(prefixed);
 
         let mut aliases = 0;
         let mut reserved = 0;
         for option in options {
-            let groups = section.get_list_of_lists(&option, ',', '=', 2)?;
+            let groups = config.get_list_of_lists(&option, ',', '=', 2)?;
             for group in groups {
                 let (name, value) = (&group[0], &group[1]);
                 if value.starts_with('<') && value.ends_with('>') {
                     for chip in &mcu_names {
                         pins.reserve_pin(chip, name, value)
-                            .map_err(|err| format!("{identifier}: {err}"))?;
+                            .map_err(|err| ConfigError::new(format!("{identifier}: {err}")))?;
                     }
                     reserved += 1;
                 } else {
                     for chip in &mcu_names {
                         pins.alias_pin(chip, name, value)
-                            .map_err(|err| format!("{identifier}: {err}"))?;
+                            .map_err(|err| ConfigError::new(format!("{identifier}: {err}")))?;
                     }
                     aliases += 1;
                 }
@@ -170,18 +165,18 @@ impl std::fmt::Debug for BoardPins {
 /// Both entry points do the same work; the loader calls one for `[board_pins]`
 /// and the other for `[board_pins <name>]`.
 pub fn load_config(
-    section: &ConfigSection,
+    config: &ConfigWrapper,
     printer: &Arc<Printer>,
-) -> Result<Arc<dyn PrinterObject>, String> {
-    Ok(Arc::new(BoardPins::new(section, printer)?))
+) -> Result<Arc<dyn PrinterObject>, ConfigError> {
+    Ok(Arc::new(BoardPins::new(config, printer)?))
 }
 
 /// The prefix (`[board_pins <name>]`) entry point.
 pub fn load_config_prefix(
-    section: &ConfigSection,
+    config: &ConfigWrapper,
     printer: &Arc<Printer>,
-) -> Result<Arc<dyn PrinterObject>, String> {
-    Ok(Arc::new(BoardPins::new(section, printer)?))
+) -> Result<Arc<dyn PrinterObject>, ConfigError> {
+    Ok(Arc::new(BoardPins::new(config, printer)?))
 }
 
 // ===========================================================================
@@ -191,7 +186,7 @@ pub fn load_config_prefix(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::klippy::config::ConfigValue;
+    use crate::core::klippy::config::{ConfigSection, ConfigValue};
     use crate::core::klippy::pins::{
         DigitalOut, PinChip, PinError, PinParams, PrinterPins, PINS_OBJECT,
     };
@@ -228,6 +223,11 @@ mod tests {
         section
     }
 
+    /// Wrap a hand-built section the way the loader does.
+    fn wrap(section: &ConfigSection) -> ConfigWrapper<'_> {
+        ConfigWrapper::untracked(section)
+    }
+
     fn pins(printer: &Arc<Printer>) -> Arc<PrinterPins> {
         printer
             .lookup_object_as::<PrinterPins>(PINS_OBJECT)
@@ -239,7 +239,7 @@ mod tests {
         let printer = printer_with(&["mcu"]);
         let section = section(None, &[("aliases", "EXP1_1=PA0, EXP1_2=PA1")]);
 
-        let object = BoardPins::new(&section, &printer).unwrap();
+        let object = BoardPins::new(&wrap(&section), &printer).unwrap();
 
         assert_eq!(object.aliases(), 2);
         assert_eq!(object.reserved(), 0);
@@ -253,7 +253,7 @@ mod tests {
         let printer = printer_with(&["mcu"]);
         let section = section(None, &[("aliases", "A=PA0"), ("aliases_extra", "B=PA1")]);
 
-        let object = BoardPins::new(&section, &printer).unwrap();
+        let object = BoardPins::new(&wrap(&section), &printer).unwrap();
 
         assert_eq!(object.aliases(), 2);
         let pins = pins(&printer);
@@ -266,7 +266,7 @@ mod tests {
         let printer = printer_with(&["mcu", "zboard"]);
         let section = section(Some("other"), &[("mcu", "zboard"), ("aliases", "X=PA0")]);
 
-        BoardPins::new(&section, &printer).unwrap();
+        BoardPins::new(&wrap(&section), &printer).unwrap();
 
         let pins = pins(&printer);
         assert_eq!(pins.resolve_pin("zboard", "X").unwrap(), "PA0");
@@ -279,7 +279,7 @@ mod tests {
         let printer = printer_with(&["mcu"]);
         let section = section(None, &[("aliases", "GND_PIN=<GND>, A=PA0")]);
 
-        let object = BoardPins::new(&section, &printer).unwrap();
+        let object = BoardPins::new(&wrap(&section), &printer).unwrap();
 
         assert_eq!(object.aliases(), 1);
         assert_eq!(object.reserved(), 1);
@@ -292,9 +292,9 @@ mod tests {
         let printer = printer_with(&["mcu"]);
         let section = section(None, &[("mcu", "nope"), ("aliases", "A=PA0")]);
 
-        let err = BoardPins::new(&section, &printer).unwrap_err();
+        let err = BoardPins::new(&wrap(&section), &printer).unwrap_err();
 
-        assert_eq!(err, "Unknown chip name 'nope'");
+        assert_eq!(err.to_string(), "Unknown chip name 'nope'");
     }
 
     #[test]
@@ -302,10 +302,10 @@ mod tests {
         let printer = printer_with(&["mcu"]);
         let section = section(Some("bad"), &[("aliases", "A=PA0=PB0")]);
 
-        let err = BoardPins::new(&section, &printer).unwrap_err();
+        let err = BoardPins::new(&wrap(&section), &printer).unwrap_err();
 
         assert_eq!(
-            err,
+            err.to_string(),
             "Option 'aliases' in section 'board_pins bad' must have 2 elements"
         );
     }
@@ -316,16 +316,16 @@ mod tests {
         pins(&printer).alias_pin("mcu", "A", "PA9").unwrap();
         let section = section(None, &[("aliases", "A=PA0")]);
 
-        let err = BoardPins::new(&section, &printer).unwrap_err();
+        let err = BoardPins::new(&wrap(&section), &printer).unwrap_err();
 
-        assert!(err.starts_with("board_pins: "), "{err}");
-        assert!(err.contains("Alias A mapped to PA9"), "{err}");
+        assert!(err.to_string().starts_with("board_pins: "), "{err}");
+        assert!(err.to_string().contains("Alias A mapped to PA9"), "{err}");
     }
 
     #[test]
     fn test_a_missing_aliases_option_is_allowed() {
         let printer = printer_with(&["mcu"]);
-        let object = BoardPins::new(&section(None, &[]), &printer).unwrap();
+        let object = BoardPins::new(&wrap(&section(None, &[])), &printer).unwrap();
 
         assert_eq!(object.aliases(), 0);
         assert_eq!(object.reserved(), 0);
@@ -334,7 +334,7 @@ mod tests {
     #[test]
     fn test_the_object_is_not_queryable() {
         let printer = printer_with(&["mcu"]);
-        let object = BoardPins::new(&section(None, &[]), &printer).unwrap();
+        let object = BoardPins::new(&wrap(&section(None, &[])), &printer).unwrap();
 
         assert_eq!(object.get_status(0.0), json!({}));
         assert!(!object.is_queryable());
@@ -346,8 +346,8 @@ mod tests {
         let bare = section(None, &[("aliases", "A=PA0")]);
         let prefixed = section(Some("second"), &[("aliases", "B=PA1")]);
 
-        load_config(&bare, &printer).unwrap();
-        load_config_prefix(&prefixed, &printer).unwrap();
+        load_config(&wrap(&bare), &printer).unwrap();
+        load_config_prefix(&wrap(&prefixed), &printer).unwrap();
 
         let pins = pins(&printer);
         assert_eq!(pins.resolve_pin("mcu", "A").unwrap(), "PA0");

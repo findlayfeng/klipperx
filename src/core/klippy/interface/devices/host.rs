@@ -435,7 +435,7 @@ impl Drop for HostDevice {
 mod tests {
     use super::*;
     use crate::core::klippy::config::mcu::McuConfig;
-    use crate::core::klippy::config::{ConfigSection, ConfigValue};
+    use crate::core::klippy::config::{ConfigSection, ConfigValue, ConfigWrapper};
     use crate::core::klippy::mcu::Mcu;
     use crate::core::klippy::msg::proto::ArgValue;
     use std::time::Duration;
@@ -512,7 +512,8 @@ mod tests {
         // a firmware that was never reset.
         let _pinned = unsafe { Library::new(library_path()) }.expect("the library maps");
 
-        let config = McuConfig::new(&mcu_section()).expect("the [mcu] section");
+        let config =
+            McuConfig::new(&ConfigWrapper::untracked(&mcu_section())).expect("the [mcu] section");
         assert_eq!(config.name, "host_test");
         let interface = config.open().expect("the host library opens");
 

@@ -1,8 +1,9 @@
-use super::section::ConfigSection;
+use super::wrapper::ConfigWrapper;
+use crate::core::klippy::error::ConfigError;
 use crate::core::klippy::interface::usb::UsbPowerMethod;
 use crate::core::klippy::interface::{Interface, SerialDevice};
 use crate::core::klippy::mcu::McuRestartMethod;
-use tracing::{info, warn};
+use tracing::warn;
 
 /// MCU (Microcontroller Unit) configuration parsed from config file.
 ///
@@ -49,7 +50,7 @@ pub enum Transport {
     Host { library: String },
     /// A scripted device, in test builds (`test:`).
     #[cfg(test)]
-    Test(super::value::ConfigValue),
+    Test(String),
 }
 
 /// Parse Klipper's `canbus_uuid`: six bytes as twelve hex digits.
@@ -116,11 +117,15 @@ impl McuConfig {
     /// `Ok(McuConfig)` with the appropriate interface type, or `Err` when the
     /// section names no interface, names several, or names one that cannot be
     /// brought up.
-    pub fn new(section: &ConfigSection) -> Result<Self, String> {
+    pub fn new(section: &ConfigWrapper) -> Result<Self, ConfigError> {
         // Upstream names an MCU by its config section with the `mcu ` prefix
         // stripped (`klippy/mcu.py:1151-1153`): the main `[mcu]` is "mcu", and
         // `[mcu zboard]` is "zboard". Not an empty string for the main one.
-        let name = section.sub.clone().unwrap_or_else(|| section.id.clone());
+        let name = section
+            .section()
+            .sub
+            .clone()
+            .unwrap_or_else(|| section.section().id.clone());
         let transport = Self::transport_for(section)?;
         let serial = matches!(transport, Transport::Serial { .. });
 
@@ -133,7 +138,6 @@ impl McuConfig {
             );
         }
         let restart_method = Self::parse_restart_method(section, serial)?;
-        info!("MCU '{name}' restart method: {}", restart_method.as_str());
         let usb_power = Self::parse_usb_power(section, &restart_method)?;
 
         Ok(Self {
@@ -150,18 +154,18 @@ impl McuConfig {
     /// method is reported and ignored, the way `restart_method` itself is off a
     /// serial MCU.
     fn parse_usb_power(
-        section: &ConfigSection,
+        section: &ConfigWrapper,
         restart_method: &McuRestartMethod,
-    ) -> Result<UsbPowerMethod, String> {
+    ) -> Result<UsbPowerMethod, ConfigError> {
         let Some(text) = section.get_str("usb_power") else {
             return Ok(UsbPowerMethod::default());
         };
-        let method = UsbPowerMethod::parse(text).ok_or_else(|| {
-            format!(
+        let method = UsbPowerMethod::parse(&text).ok_or_else(|| {
+            ConfigError::new(format!(
                 "MCU '{}' has an invalid usb_power: '{text}' (expected one of {})",
                 section.identifier(),
                 UsbPowerMethod::CHOICES.join(", ")
-            )
+            ))
         })?;
         if *restart_method != McuRestartMethod::RpiUsb {
             warn!(
@@ -197,20 +201,20 @@ impl McuConfig {
     /// The `serial` flag is a parameter rather than a look at the interface so
     /// the rule can be exercised without a real serial port.
     fn parse_restart_method(
-        section: &ConfigSection,
+        section: &ConfigWrapper,
         serial: bool,
-    ) -> Result<McuRestartMethod, String> {
+    ) -> Result<McuRestartMethod, ConfigError> {
         if !serial {
             return Ok(McuRestartMethod::Command);
         }
         match section.get_str("restart_method") {
             None => Ok(McuRestartMethod::Arduino),
-            Some(text) => McuRestartMethod::parse(text).ok_or_else(|| {
-                format!(
+            Some(text) => McuRestartMethod::parse(&text).ok_or_else(|| {
+                ConfigError::new(format!(
                     "MCU '{}' has an invalid restart_method: '{text}' (expected one of {})",
                     section.identifier(),
                     McuRestartMethod::CHOICES.join(", ")
-                )
+                ))
             }),
         }
     }
@@ -220,50 +224,49 @@ impl McuConfig {
     /// One connection key selects it. Two of them is a configuration mistake, not
     /// a preference order, so it is reported rather than resolved silently. Every
     /// check lives here; [`Transport::open`] only performs the side effects.
-    fn transport_for(section: &ConfigSection) -> Result<Transport, String> {
+    fn transport_for(section: &ConfigWrapper) -> Result<Transport, ConfigError> {
         let requested: Vec<&str> = interface_keys()
             .iter()
             .copied()
             .filter(|key| section.has(key))
             .collect();
         if requested.len() > 1 {
-            return Err(format!(
+            return Err(ConfigError::new(format!(
                 "MCU '{}' sets more than one interface: {}",
                 section.identifier(),
                 requested.join(", ")
-            ));
+            )));
         }
 
         if let Some(text) = section.get_str("canbus_uuid") {
-            let uuid = parse_canbus_uuid(text).map_err(|e| {
-                format!(
+            let uuid = parse_canbus_uuid(&text).map_err(|e| {
+                ConfigError::new(format!(
                     "MCU '{}' has an invalid canbus_uuid: {e}",
                     section.identifier()
-                )
+                ))
             })?;
             let interface = section
                 .get_str("canbus_interface")
-                .unwrap_or("can0")
-                .to_string();
+                .unwrap_or_else(|| "can0".to_string());
             // Klipper hands out node ids from its `[canbus_ids]` section; klipperx
             // has no such allocator yet, so the section states the id itself.
             let nodeid = match section.get_str("canbus_nodeid") {
                 Some(text) => match text.parse::<u32>() {
                     Ok(nodeid) if (1..=MAX_CANBUS_NODEID).contains(&nodeid) => nodeid,
                     _ => {
-                        return Err(format!(
+                        return Err(ConfigError::new(format!(
                             "MCU '{}' has an invalid canbus_nodeid: '{text}' \
                              (expected 1..={MAX_CANBUS_NODEID})",
                             section.identifier()
-                        ))
+                        )))
                     }
                 },
                 None => {
-                    return Err(format!(
+                    return Err(ConfigError::new(format!(
                         "MCU '{}' is on a CAN bus, so it needs a canbus_nodeid \
                          (klipperx does not allocate one yet)",
                         section.identifier()
-                    ))
+                    )))
                 }
             };
             return Ok(Transport::Can {
@@ -274,16 +277,14 @@ impl McuConfig {
         }
 
         if section.has("canbus_nodeid") || section.has("canbus_interface") {
-            return Err(format!(
+            return Err(ConfigError::new(format!(
                 "MCU '{}' needs a canbus_uuid to go with its CAN settings",
                 section.identifier()
-            ));
+            )));
         }
 
         if let Some(path) = section.get_str("host_library") {
-            return Ok(Transport::Host {
-                library: path.to_string(),
-            });
+            return Ok(Transport::Host { library: path });
         }
 
         if let Some(path) = section.get_str("serial") {
@@ -292,23 +293,20 @@ impl McuConfig {
                 Some(text) => match text.parse::<u32>() {
                     Ok(baud) if baud > 0 => baud,
                     _ => {
-                        return Err(format!(
+                        return Err(ConfigError::new(format!(
                             "MCU '{}' has an invalid baud: '{text}'",
                             section.identifier()
-                        ))
+                        )))
                     }
                 },
                 None => crate::core::klippy::interface::devices::serial::DEFAULT_BAUD,
             };
-            return Ok(Transport::Serial {
-                path: path.to_string(),
-                baud,
-            });
+            return Ok(Transport::Serial { path, baud });
         }
 
         #[cfg(test)]
-        if let Some(test_value) = section.get("test") {
-            return Ok(Transport::Test(test_value.clone()));
+        if let Some(test_value) = section.get_str("test") {
+            return Ok(Transport::Test(test_value));
         }
 
         let how = if cfg!(test) {
@@ -316,18 +314,16 @@ impl McuConfig {
         } else {
             "set host_library: <libklipper_host.so>"
         };
-        Err(format!(
+        Err(ConfigError::new(format!(
             "MCU '{}' needs an interface: {how}",
             section.identifier()
-        ))
+        )))
     }
 
     /// Build a scripted device from a `test:` block of hex frame mappings
     /// (test builds only).
     #[cfg(test)]
-    fn test_device(
-        test_value: &super::value::ConfigValue,
-    ) -> crate::core::klippy::interface::devices::test::TestDevice {
+    fn test_device(test_value: &str) -> crate::core::klippy::interface::devices::test::TestDevice {
         let mut mappings = Vec::new();
         for line in test_value.lines() {
             let trimmed = line.trim();
@@ -440,10 +436,15 @@ mod tests {
         section
     }
 
+    /// Wrap a hand-built section the way the loader does.
+    fn wrap(section: &ConfigSection) -> ConfigWrapper<'_> {
+        ConfigWrapper::untracked(section)
+    }
+
     #[test]
     fn test_parse_mcu_config_with_test_interface() {
         let section = make_section(&["01 02 03"]);
-        let result = McuConfig::new(&section);
+        let result = McuConfig::new(&wrap(&section));
         assert!(result.is_ok());
         let config = result.unwrap();
         assert_eq!(config.name, "mcu");
@@ -456,7 +457,7 @@ mod tests {
     fn test_parse_mcu_config_with_name() {
         let mut section = make_section(&["01 02"]);
         section.sub = Some("mcu0".to_string());
-        let result = McuConfig::new(&section);
+        let result = McuConfig::new(&wrap(&section));
         assert!(result.is_ok());
         assert_eq!(result.unwrap().name, "mcu0");
     }
@@ -469,14 +470,14 @@ mod tests {
             ConfigValue::Single("rpi_usb".to_string()),
         );
         // A serial MCU reads the option; the value is taken as written.
-        let method = McuConfig::parse_restart_method(&section, true).unwrap();
+        let method = McuConfig::parse_restart_method(&wrap(&section), true).unwrap();
         assert_eq!(method, McuRestartMethod::RpiUsb);
     }
 
     #[test]
     fn test_a_serial_mcu_defaults_to_arduino() {
         let section = make_section(&["01 02"]);
-        let method = McuConfig::parse_restart_method(&section, true).unwrap();
+        let method = McuConfig::parse_restart_method(&wrap(&section), true).unwrap();
         assert_eq!(method, McuRestartMethod::Arduino);
     }
 
@@ -487,11 +488,11 @@ mod tests {
             "restart_method".to_string(),
             ConfigValue::Single("bogus".to_string()),
         );
-        let err = McuConfig::parse_restart_method(&section, true).unwrap_err();
-        assert!(err.contains("restart_method"), "{err}");
-        assert!(err.contains("bogus"), "{err}");
+        let err = McuConfig::parse_restart_method(&wrap(&section), true).unwrap_err();
+        assert!(err.to_string().contains("restart_method"), "{err}");
+        assert!(err.to_string().contains("bogus"), "{err}");
         // The error names the valid choices, so the config can be fixed.
-        assert!(err.contains("cheetah"), "{err}");
+        assert!(err.to_string().contains("cheetah"), "{err}");
     }
 
     #[test]
@@ -513,7 +514,7 @@ mod tests {
         );
         // Upstream does not read the option off serial, so a value that is
         // meaningless there is not an error — it simply does not apply.
-        let method = McuConfig::parse_restart_method(&section, false).unwrap();
+        let method = McuConfig::parse_restart_method(&wrap(&section), false).unwrap();
         assert_eq!(method, McuRestartMethod::Command);
     }
 
@@ -522,7 +523,7 @@ mod tests {
         // Unset: `auto`.
         let section = make_section(&["01 02"]);
         assert_eq!(
-            McuConfig::parse_usb_power(&section, &McuRestartMethod::RpiUsb).unwrap(),
+            McuConfig::parse_usb_power(&wrap(&section), &McuRestartMethod::RpiUsb).unwrap(),
             UsbPowerMethod::Auto
         );
 
@@ -536,20 +537,20 @@ mod tests {
             section
         };
         assert_eq!(
-            McuConfig::parse_usb_power(&with("sysfs"), &McuRestartMethod::RpiUsb).unwrap(),
+            McuConfig::parse_usb_power(&wrap(&with("sysfs")), &McuRestartMethod::RpiUsb).unwrap(),
             UsbPowerMethod::Sysfs
         );
 
         // A typo is a config error, not a silent default.
-        let err =
-            McuConfig::parse_usb_power(&with("bogus"), &McuRestartMethod::RpiUsb).unwrap_err();
-        assert!(err.contains("usb_power"), "{err}");
-        assert!(err.contains("bogus"), "{err}");
+        let err = McuConfig::parse_usb_power(&wrap(&with("bogus")), &McuRestartMethod::RpiUsb)
+            .unwrap_err();
+        assert!(err.to_string().contains("usb_power"), "{err}");
+        assert!(err.to_string().contains("bogus"), "{err}");
 
         // With another restart method the option has no effect; it is reported
         // and ignored rather than refused.
         assert_eq!(
-            McuConfig::parse_usb_power(&with("sysfs"), &McuRestartMethod::Arduino).unwrap(),
+            McuConfig::parse_usb_power(&wrap(&with("sysfs")), &McuRestartMethod::Arduino).unwrap(),
             UsbPowerMethod::Sysfs
         );
     }
@@ -557,10 +558,10 @@ mod tests {
     #[test]
     fn test_parse_mcu_config_no_interface() {
         let section = make_section(&[]);
-        let err = McuConfig::new(&section).unwrap_err();
+        let err = McuConfig::new(&wrap(&section)).unwrap_err();
         // The error has to say how to fix the section, not just that it is wrong.
-        assert!(err.contains("needs an interface"), "{err}");
-        assert!(err.contains("host_library"), "{err}");
+        assert!(err.to_string().contains("needs an interface"), "{err}");
+        assert!(err.to_string().contains("host_library"), "{err}");
     }
 
     #[test]
@@ -568,12 +569,15 @@ mod tests {
         // Parsing routes it to the host transport; opening is what touches the
         // library, so the failure is the library's, not "needs an interface".
         let section = section_with("host_library", "/nonexistent/libklipper_host.so");
-        let config = McuConfig::new(&section).unwrap();
+        let config = McuConfig::new(&wrap(&section)).unwrap();
         assert!(matches!(&config.transport, Transport::Host { .. }));
 
         let err = config.open().unwrap_err();
         assert!(err.starts_with("host_library: "), "{err}");
-        assert!(err.contains("/nonexistent/libklipper_host.so"), "{err}");
+        assert!(
+            err.to_string().contains("/nonexistent/libklipper_host.so"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -584,15 +588,15 @@ mod tests {
             ConfigValue::Single("/dev/ttyACM0".to_string()),
         );
 
-        let err = McuConfig::new(&section).unwrap_err();
-        assert!(err.contains("more than one interface"), "{err}");
-        assert!(err.contains("host_library, serial"), "{err}");
+        let err = McuConfig::new(&wrap(&section)).unwrap_err();
+        assert!(err.to_string().contains("more than one interface"), "{err}");
+        assert!(err.to_string().contains("host_library, serial"), "{err}");
     }
 
     #[test]
     fn test_serial_key_becomes_the_serial_transport() {
         let section = section_with("serial", "/dev/not-a-serial-port");
-        let config = McuConfig::new(&section).unwrap();
+        let config = McuConfig::new(&wrap(&section)).unwrap();
         assert!(matches!(
             config.transport,
             Transport::Serial { ref path, .. } if path == "/dev/not-a-serial-port"
@@ -602,7 +606,7 @@ mod tests {
         // port, which only the serial device's own error does.
         let err = config.open().unwrap_err();
         assert!(err.starts_with("serial: "), "{err}");
-        assert!(err.contains("/dev/not-a-serial-port"), "{err}");
+        assert!(err.to_string().contains("/dev/not-a-serial-port"), "{err}");
     }
 
     /// A CAN section, with `overrides` on top of a complete one.
@@ -623,7 +627,7 @@ mod tests {
     #[test]
     fn test_canbus_keys_become_the_can_transport() {
         let section = can_section(&[("canbus_interface", "can99")]);
-        let config = McuConfig::new(&section).unwrap();
+        let config = McuConfig::new(&wrap(&section)).unwrap();
         assert!(matches!(
             config.transport,
             Transport::Can { ref interface, .. } if interface == "can99"
@@ -633,7 +637,7 @@ mod tests {
         // socket's error naming the interface we asked for.
         let err = config.open().unwrap_err();
         assert!(err.starts_with("canbus: "), "{err}");
-        assert!(err.contains("can99"), "{err}");
+        assert!(err.to_string().contains("can99"), "{err}");
     }
 
     #[test]
@@ -644,8 +648,11 @@ mod tests {
         );
         for bad in ["11aa22bb33c", "11aa22bb33ccdd", "11aa22bb33cg", ""] {
             let section = can_section(&[("canbus_uuid", bad)]);
-            let err = McuConfig::new(&section).unwrap_err();
-            assert!(err.contains("invalid canbus_uuid"), "{bad}: {err}");
+            let err = McuConfig::new(&wrap(&section)).unwrap_err();
+            assert!(
+                err.to_string().contains("invalid canbus_uuid"),
+                "{bad}: {err}"
+            );
         }
     }
 
@@ -653,27 +660,33 @@ mod tests {
     fn test_canbus_nodeid_is_validated() {
         for bad in ["0", "fast", "900"] {
             let section = can_section(&[("canbus_nodeid", bad)]);
-            let err = McuConfig::new(&section).unwrap_err();
-            assert!(err.contains("invalid canbus_nodeid"), "{bad}: {err}");
+            let err = McuConfig::new(&wrap(&section)).unwrap_err();
+            assert!(
+                err.to_string().contains("invalid canbus_nodeid"),
+                "{bad}: {err}"
+            );
         }
 
         // A valid node id gets as far as the socket, which is where it fails here.
-        let err = McuConfig::new(&can_section(&[]))
+        let err = McuConfig::new(&wrap(&can_section(&[])))
             .unwrap()
             .open()
             .unwrap_err();
-        assert!(err.contains("no CAN interface named 'can0'"), "{err}");
+        assert!(
+            err.to_string().contains("no CAN interface named 'can0'"),
+            "{err}"
+        );
     }
 
     #[test]
     fn test_canbus_settings_without_a_uuid_are_reported() {
         let section = section_with("canbus_nodeid", "2");
-        let err = McuConfig::new(&section).unwrap_err();
-        assert!(err.contains("needs a canbus_uuid"), "{err}");
+        let err = McuConfig::new(&wrap(&section)).unwrap_err();
+        assert!(err.to_string().contains("needs a canbus_uuid"), "{err}");
 
         let section = section_with("canbus_interface", "can0");
-        let err = McuConfig::new(&section).unwrap_err();
-        assert!(err.contains("needs a canbus_uuid"), "{err}");
+        let err = McuConfig::new(&wrap(&section)).unwrap_err();
+        assert!(err.to_string().contains("needs a canbus_uuid"), "{err}");
     }
 
     #[test]
@@ -682,15 +695,15 @@ mod tests {
         section
             .parameters
             .insert("baud".to_string(), ConfigValue::Single("fast".to_string()));
-        let err = McuConfig::new(&section).unwrap_err();
-        assert!(err.contains("invalid baud"), "{err}");
-        assert!(err.contains("fast"), "{err}");
+        let err = McuConfig::new(&wrap(&section)).unwrap_err();
+        assert!(err.to_string().contains("invalid baud"), "{err}");
+        assert!(err.to_string().contains("fast"), "{err}");
     }
 
     #[test]
     fn test_parse_test_config_skips_comments_and_empty() {
         let section = make_section(&["", "# this is a comment", "01 02", "   ", "03 04 05"]);
-        let result = McuConfig::new(&section);
+        let result = McuConfig::new(&wrap(&section));
         assert!(result.is_ok());
     }
 

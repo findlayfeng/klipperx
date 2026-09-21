@@ -35,8 +35,9 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use serde_json::Value;
 use tracing::error;
 
+use crate::core::klippy::config::access::AccessTracking;
 use crate::core::klippy::config::value::ConfigValue;
-use crate::core::klippy::error::KlippyError;
+use crate::core::klippy::error::{ConfigError, KlippyError};
 use crate::core::klippy::event::KlippyEvent;
 use crate::core::klippy::reactor::Reactor;
 
@@ -207,6 +208,16 @@ pub struct Printer {
     /// to be kept here to reach the next bring-up. The loader applies these as it
     /// hands a section over (`load.rs`); the file on disk is the operator's.
     config_overrides: Mutex<HashMap<String, HashMap<String, ConfigValue>>>,
+    /// The reads recorded by the config load that is currently loaded.
+    ///
+    /// [`Printer::load_config`] replaces it at the start of every load, and the
+    /// `configfile` object, every [`ConfigWrapper`] and any part that reads its
+    /// section later (an MCU at connect time) share the same handle. It is how
+    /// the undefined-option check sees a read that happened after the load walk
+    /// ([`AccessTracking`]).
+    ///
+    /// [`ConfigWrapper`]: crate::core::klippy::config::ConfigWrapper
+    config_access: Mutex<Arc<AccessTracking>>,
 }
 
 /// A registered event handler.
@@ -270,7 +281,25 @@ impl Printer {
             reactor,
             objects: Mutex::new(Vec::new()),
             config_overrides: Mutex::new(HashMap::new()),
+            config_access: Mutex::new(AccessTracking::shared()),
         }
+    }
+
+    /// The reads recorded for the config that is currently loaded.
+    ///
+    /// A part that kept its section and reads it after the load walk (an MCU
+    /// parses `[mcu]` at connect time) wraps the section with this tracker, so
+    /// its options are recorded before the undefined-option check runs.
+    pub fn access_tracking(&self) -> Arc<AccessTracking> {
+        Arc::clone(&self.config_access.lock().unwrap_or_else(|p| p.into_inner()))
+    }
+
+    /// Start recording a fresh config's reads.
+    ///
+    /// `load_config` calls this once per load, before any section is read, and
+    /// hands the same handle to the `configfile` object.
+    pub(crate) fn set_access_tracking(&self, access: Arc<AccessTracking>) {
+        *self.config_access.lock().unwrap_or_else(|p| p.into_inner()) = access;
     }
 
     /// Override `<option> = <value>` in the section named `identifier` — in
@@ -330,19 +359,19 @@ impl Printer {
     /// uses.
     ///
     /// # Errors
-    /// Returns [`KlippyError::Internal`] if `name` is already taken: two parts
-    /// answering to one name is a wiring mistake in klippy that no client can
-    /// provoke. (It deserves an error type of its own; the vocabulary is still
-    /// missing — see the `TODO`.)
+    /// Returns [`ConfigError`] if `name` is already taken: two parts answering
+    /// to one name is a wiring mistake in klippy that no client can provoke.
+    /// Upstream raises its config error here too
+    /// (`klippy/klippy.py:71-73`).
     pub fn add_object(
         &self,
         name: &str,
         object: Arc<dyn PrinterObject>,
-    ) -> Result<(), KlippyError> {
+    ) -> Result<(), ConfigError> {
         let mut objects = self.objects.lock().unwrap_or_else(|p| p.into_inner());
         if objects.iter().any(|(taken, _)| taken == name) {
-            return Err(KlippyError::Internal(format!(
-                "printer object '{name}' already registered"
+            return Err(ConfigError::new(format!(
+                "Printer object '{name}' already created"
             )));
         }
         objects.push((name.to_string(), object));
@@ -412,6 +441,62 @@ impl Printer {
             .iter()
             .find(|(taken, _)| taken == name)
             .map(|(_, object)| Arc::clone(object))
+    }
+
+    /// Every registered object a module name selects, in registration order.
+    ///
+    /// Upstream's `lookup_objects(module)` (`klippy/klippy.py:81-88`): with a
+    /// module name, the object registered under exactly that name comes first
+    /// (when there is one), then every object whose name starts with
+    /// `"<module> "`. With `None`, every object. This is the reflection the
+    /// modules use to find their siblings without naming each one:
+    /// `lookup_objects('mcu')` is `mcu` plus `mcu <name>`; `statistics` walks
+    /// `None` and picks the objects that offer `stats`.
+    ///
+    /// The handles are cloned out and the lock released, so a caller may ask
+    /// each object for status while it holds the list.
+    pub fn lookup_objects(&self, module: Option<&str>) -> Vec<(String, Arc<dyn PrinterObject>)> {
+        let objects = self.objects.lock().unwrap_or_else(|p| p.into_inner());
+        match module {
+            None => objects.clone(),
+            Some(module) => {
+                let prefix = format!("{module} ");
+                let mut found: Vec<(String, Arc<dyn PrinterObject>)> = objects
+                    .iter()
+                    .filter(|(name, _)| name == module)
+                    .cloned()
+                    .collect();
+                found.extend(
+                    objects
+                        .iter()
+                        .filter(|(name, _)| name.starts_with(&prefix))
+                        .cloned(),
+                );
+                found
+            }
+        }
+    }
+
+    /// Every queryable object's status, keyed by name, dated once.
+    ///
+    /// The snapshot a template's `printer.objects` iterates: the names come from
+    /// [`Printer::lookup_objects`] and each status from
+    /// [`PrinterObject::get_status`]. Like [`Printer::status_of`], the calls are
+    /// made without the registry lock — an object may ask the printer something
+    /// of its own — so the object handles are collected first and queried after.
+    ///
+    /// Objects that report nothing (`is_queryable` is false) are left out, which
+    /// is what upstream's `hasattr(o, 'get_status')` filter does too.
+    pub fn statuses(&self, eventtime: f64) -> serde_json::Map<String, Value> {
+        let objects: Vec<(String, Arc<dyn PrinterObject>)> = self
+            .lookup_objects(None)
+            .into_iter()
+            .filter(|(_, object)| object.is_queryable())
+            .collect();
+        objects
+            .into_iter()
+            .map(|(name, object)| (name, object.get_status(eventtime)))
+            .collect()
     }
 
     /// Ask one registered object for its status.
@@ -578,6 +663,26 @@ impl Printer {
         });
     }
 
+    /// Put the printer in the `error` category with a message.
+    ///
+    /// Upstream's `_set_state` (`klippy/klippy.py:57-62`): the message is what
+    /// the user reads and the category is `error`, **not** `shutdown` — the
+    /// printer is halted but can be brought back with `RESTART`. A config the
+    /// loader rejected and an MCU error during connect both land here; only a
+    /// failure of klippy itself is an [`Printer::invoke_shutdown`].
+    ///
+    /// The first state stands: once the printer is ready or already in an error
+    /// state, a later error does not overwrite it, as upstream's `_set_state`
+    /// only writes from `startup`/`ready`.
+    pub fn set_error_state(&self, msg: &str) {
+        let mut inner = self.lock();
+        if matches!(inner.category, PrinterState::Startup | PrinterState::Ready) {
+            inner.message = msg.to_string();
+            inner.category = PrinterState::Error;
+        }
+        error!("Printer error: {msg}");
+    }
+
     /// Ask the printer to leave its run loop.
     ///
     /// The `result` decides what happens once the loop ends:
@@ -706,6 +811,14 @@ impl Printer {
 
         for (name, object) in self.registry() {
             if let Err(err) = object.connect().await {
+                // A config problem found while connecting is not a reason to
+                // shut the machine down: upstream sets the error state and lets
+                // a `RESTART` fix it (`klippy/klippy.py:136-139`). Everything
+                // else halts (an MCU failure is analysed first).
+                if matches!(&err, KlippyError::Config(_)) {
+                    self.set_error_state(&format!("{name}: {err}"));
+                    return;
+                }
                 // Notify about MCU errors before shutting down, matching
                 // upstream's `klippy:klippy.py:_connect` which sends
                 // `klippy:notify_mcu_error` for protocol or connection
@@ -782,6 +895,7 @@ mod tests {
     use crate::core::klippy::reactor::ManualReactor;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
+    use std::sync::Weak;
     use std::thread;
 
     /// A printer on a clock the test controls.
@@ -1143,6 +1257,40 @@ mod tests {
     }
 
     #[test]
+    fn test_set_error_state_reports_error_not_shutdown() {
+        // A bad config is an `error` the operator can fix with `RESTART`, not a
+        // shutdown (upstream `_set_state`, `klippy/klippy.py:57-62`).
+        let printer = new_printer();
+        let halts = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&halts);
+        printer.register_event_handler(
+            KlippyEvent::KlippyShutdown,
+            Box::new(move |_| {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+
+        printer.set_error_state("Option 'pinn' is not valid in section 'output_pin fan'");
+
+        let state = printer.get_state_message();
+        assert_eq!(state.category, PrinterState::Error);
+        assert!(state.message.contains("pinn"), "{}", state.message);
+        assert_eq!(halts.load(Ordering::SeqCst), 0, "no shutdown event");
+    }
+
+    #[test]
+    fn test_set_error_state_does_not_overwrite_a_shutdown() {
+        let printer = new_printer();
+        printer.invoke_shutdown("the MCU died");
+
+        printer.set_error_state("a config problem");
+
+        let state = printer.get_state_message();
+        assert_eq!(state.category, PrinterState::Shutdown);
+        assert_eq!(state.message, "the MCU died");
+    }
+
+    #[test]
     fn test_only_the_first_shutdown_message_is_reported() {
         let printer = new_printer();
         printer.invoke_shutdown("Printer is halted");
@@ -1308,6 +1456,43 @@ mod tests {
         assert!(state.message.contains("broken"), "{}", state.message);
     }
 
+    /// A part whose connect fails with a config error.
+    struct ConfigPart;
+
+    impl PrinterObject for ConfigPart {
+        fn get_status(&self, _eventtime: f64) -> Value {
+            serde_json::json!({})
+        }
+
+        fn connect<'a>(&'a self) -> ConnectFuture<'a> {
+            Box::pin(async { Err(KlippyError::Config(ConfigError::new("bad option"))) })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_config_error_during_connect_is_an_error_state_not_a_shutdown() {
+        // A config problem found while connecting can be fixed with `RESTART`,
+        // so it sets the `error` state and fires no shutdown event (upstream
+        // `_connect`, `klippy/klippy.py:136-139`).
+        let printer = new_printer();
+        let halts = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&halts);
+        printer.register_event_handler(
+            KlippyEvent::KlippyShutdown,
+            Box::new(move |_| {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        printer.add_object("part", Arc::new(ConfigPart)).unwrap();
+
+        printer.bring_up().await;
+
+        let state = printer.get_state_message();
+        assert_eq!(state.category, PrinterState::Error);
+        assert!(state.message.contains("bad option"), "{}", state.message);
+        assert_eq!(halts.load(Ordering::SeqCst), 0);
+    }
+
     #[tokio::test]
     async fn test_a_printer_that_shut_down_does_not_connect_its_objects() {
         let printer = new_printer();
@@ -1405,6 +1590,71 @@ mod tests {
 
         assert_eq!(printer.objects(), ["pins", "toolhead"]);
         assert_eq!(printer.queryable_objects(), ["toolhead"]);
+    }
+
+    #[test]
+    fn test_lookup_objects_selects_a_module_and_its_prefix() {
+        // Upstream's `lookup_objects('mcu')`: the exact name first, then the
+        // `mcu <name>` sections in registration order.
+        let printer = new_printer();
+        for name in ["mcu", "output_pin fan", "mcu zboard", "mcu toolhead"] {
+            printer
+                .add_object(name, Arc::new(Fixed(serde_json::json!({}))))
+                .unwrap();
+        }
+
+        let names = |module: Option<&str>| -> Vec<String> {
+            printer
+                .lookup_objects(module)
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect()
+        };
+
+        assert_eq!(names(Some("mcu")), ["mcu", "mcu zboard", "mcu toolhead"]);
+        // A module with no exact object still finds its prefixed ones.
+        assert_eq!(names(Some("output_pin")), ["output_pin fan"]);
+        // Nothing matches: an empty list, not an error.
+        assert!(names(Some("nope")).is_empty());
+        // `None` is everything, in registration order.
+        assert_eq!(
+            names(None),
+            ["mcu", "output_pin fan", "mcu zboard", "mcu toolhead"]
+        );
+    }
+
+    #[test]
+    fn test_statuses_reads_every_queryable_object_without_the_lock() {
+        // The reflection read a template's `printer.objects` does: one snapshot,
+        // every queryable object's status, and a status that itself asks the
+        // printer something must not deadlock.
+        struct ReadsThePrinter(Weak<Printer>);
+        impl PrinterObject for ReadsThePrinter {
+            fn get_status(&self, _eventtime: f64) -> Value {
+                let ready = self
+                    .0
+                    .upgrade()
+                    .map(|printer| printer.objects().len())
+                    .unwrap_or(0);
+                serde_json::json!({ "objects": ready })
+            }
+        }
+
+        let printer = Arc::new(new_printer());
+        printer
+            .add_object(
+                "chatty",
+                Arc::new(ReadsThePrinter(Arc::downgrade(&printer))),
+            )
+            .unwrap();
+        printer
+            .add_object("quiet", Arc::new(Fixed(serde_json::json!({"a": 1}))))
+            .unwrap();
+
+        let statuses = printer.statuses(0.0);
+
+        assert_eq!(statuses["chatty"], serde_json::json!({"objects": 2}));
+        assert_eq!(statuses["quiet"], serde_json::json!({"a": 1}));
     }
 
     #[test]

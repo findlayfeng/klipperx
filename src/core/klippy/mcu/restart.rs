@@ -363,14 +363,13 @@ impl Reenumeration {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::klippy::config::value::ConfigValue;
 
     /// A config whose transport is never opened by these tests.
     fn no_transport(method: McuRestartMethod) -> McuConfig {
         McuConfig {
             name: "mcu".to_string(),
             restart_method: method,
-            transport: Transport::Test(ConfigValue::Multi(Vec::new())),
+            transport: Transport::Test(String::new()),
             usb_power: usb::UsbPowerMethod::default(),
         }
     }

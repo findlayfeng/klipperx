@@ -33,8 +33,9 @@ pub use dictionary::{Dictionary, Enumeration, MessageDef, OutputDef};
 pub use error::{McuCallError, McuError};
 pub use object::{load_config, load_config_prefix, McuObject};
 pub use resource::{
-    I2cMode, McuAdc, McuChip, McuDigitalOut, McuI2c, McuPwm, McuSpi, McuStepper, SpiMode,
-    DEFAULT_SPEED,
+    Completion, I2cMode, McuAdc, McuChip, McuDigitalOut, McuEndstop, McuI2c, McuPwm, McuSpi,
+    McuStepper, McuTrsync, SpiMode, TriggerDispatch, TrsyncRegistry, DEFAULT_SPEED,
+    TRSYNC_SINGLE_MCU_TIMEOUT, TRSYNC_TIMEOUT,
 };
 pub use restart_method::McuRestartMethod;
 

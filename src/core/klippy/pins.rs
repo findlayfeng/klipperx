@@ -63,7 +63,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde_json::{json, Value};
 
-use crate::core::klippy::mcu::{Mcu, McuError, McuStepper};
+use crate::core::klippy::mcu::{Mcu, McuEndstop, McuError, McuStepper};
 use crate::core::klippy::printer::PrinterObject;
 
 /// The name clients and other modules use to find this object.
@@ -301,6 +301,16 @@ pub trait PinChip: Send + Sync {
         _invert_dir: bool,
     ) -> Result<Arc<McuStepper>, PinError> {
         Err(PinError::Unsupported("stepper".to_string()))
+    }
+
+    /// Build an endstop on this chip.
+    ///
+    /// The default refuses, like [`PinChip::setup_pwm`].
+    ///
+    /// # Errors
+    /// Returns a [`PinError`] if the chip cannot build the resource.
+    fn setup_endstop(&self, _params: &PinParams) -> Result<Arc<McuEndstop>, PinError> {
+        Err(PinError::Unsupported("endstop".to_string()))
     }
 }
 
@@ -987,7 +997,7 @@ impl PrinterPins {
         chip.setup_adc(&params)
     }
 
-    /// Look up a stepper's two pins and build the stepper on their chip.
+    /// Look up a pin and build a stepper's two pins on their chip.
     ///
     /// The step pin's `!` becomes upstream's `invert_step` (`0`/`1`); the
     /// direction pin's `!` is carried to the wire layer. The two pins must be on
@@ -1017,6 +1027,28 @@ impl PrinterPins {
             step_pulse_duration,
             dir.invert,
         )
+    }
+
+    /// Look up an endstop pin and build the resource on its chip.
+    ///
+    /// The pin may carry `!` (invert) and `^`/`~` (pull-up/pull-down).
+    ///
+    /// # Errors
+    /// Returns whatever validation reports, or the chip's own error.
+    pub fn setup_endstop(
+        &self,
+        description: &str,
+        share_type: Option<&str>,
+    ) -> Result<Arc<McuEndstop>, PinError> {
+        let pin_type = PinType::Endstop;
+        let params = self.lookup_pin(
+            description,
+            pin_type.can_invert(),
+            pin_type.can_pullup(),
+            share_type,
+        )?;
+        let chip = self.chip(&params.chip_name)?;
+        chip.setup_endstop(&params)
     }
 
     /// The registered chip under `name`, cloned out so the caller does not hold

@@ -36,6 +36,7 @@
 //!   mutex. Here a script runs to completion on the calling task; a second
 //!   caller would interleave only at awaits, and nothing in a handler awaits.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::fmt;
 use std::panic::AssertUnwindSafe;
@@ -115,18 +116,30 @@ impl std::error::Error for CommandError {}
 // GcodeCommand
 // ===========================================================================
 
+/// Parse an integer parameter; `None` when it is not one.
+fn parse_int(value: &str) -> Option<i64> {
+    value.parse::<i64>().ok()
+}
+
+/// Parse a float parameter; `None` when it is not one.
+fn parse_float(value: &str) -> Option<f64> {
+    value.parse::<f64>().ok()
+}
+
 /// One parsed command, as handed to its handler.
 pub struct GcodeCommand {
     dispatch: Arc<Inner>,
     command: String,
     commandline: String,
     params: HashMap<String, String>,
-    /// Whether this line came from an input that wants an `ok` ack.
+    /// Whether this line still wants an `ok` ack.
     ///
     /// Upstream's `need_ack` (`klippy/gcode.py:23`): true for the file/serial
-    /// input protocol, false for an API `gcode/script` line. This host has no
-    /// file input yet, so there is no caller that sets it true.
-    need_ack: bool,
+    /// input protocol, false for an API `gcode/script` line. [`GcodeCommand::ack`]
+    /// clears it, so a handler that acks itself is not acked again by the
+    /// trailing `gcmd.ack()` of `_process_commands`. Handlers take
+    /// `&GcodeCommand`, so the flag is a `Cell`.
+    need_ack: Cell<bool>,
 }
 
 impl GcodeCommand {
@@ -140,9 +153,50 @@ impl GcodeCommand {
         &self.commandline
     }
 
-    /// Every parameter, by name.
-    pub fn parameters(&self) -> &HashMap<String, String> {
+    /// Every parameter, by name (upstream's `get_command_parameters`).
+    pub fn get_command_parameters(&self) -> &HashMap<String, String> {
         &self.params
+    }
+
+    /// The text after the command name, as the client typed it.
+    ///
+    /// Upstream's `get_raw_command_parameters` (`klippy/gcode.py:40-51`): on a
+    /// line-numbered line the leading `N<digits>` and a trailing
+    /// `*<checksum>` are dropped; otherwise the text is returned as written.
+    pub fn get_raw_command_parameters(&self) -> String {
+        let command = self.command.as_str();
+        let origline = self.commandline.as_str();
+        let mut param_start = command.len();
+        let mut param_end = origline.len();
+        let head = origline.get(..param_start).unwrap_or(origline);
+        if !head.eq_ignore_ascii_case(command) {
+            // A line number (or a differently-cased command) precedes it: find
+            // the command itself and drop a trailing checksum.
+            match origline
+                .to_ascii_uppercase()
+                .find(&command.to_ascii_uppercase())
+            {
+                Some(pos) => param_start += pos,
+                None => return String::new(),
+            }
+            if let Some(star) = origline.rfind('*') {
+                let checksum = &origline[star + 1..];
+                if !checksum.is_empty() && checksum.bytes().all(|b| b.is_ascii_digit()) {
+                    param_end = star;
+                }
+            }
+        }
+        if origline
+            .as_bytes()
+            .get(param_start)
+            .is_some_and(u8::is_ascii_whitespace)
+        {
+            param_start += 1;
+        }
+        origline
+            .get(param_start..param_end)
+            .unwrap_or("")
+            .to_string()
     }
 
     /// A required string parameter.
@@ -164,12 +218,69 @@ impl GcodeCommand {
             .unwrap_or_else(|| default.to_string())
     }
 
+    /// A parameter parsed by `parse`, with optional bounds.
+    ///
+    /// Upstream's `GCodeCommand.get` (`klippy/gcode.py:65-90`): `default` is
+    /// `None` when the parameter is required, and the bound messages keep
+    /// upstream's wording ("must have minimum of …", "must be above …").
+    ///
+    /// # Errors
+    /// [`CommandError`] when the parameter is absent and has no default, cannot
+    /// be parsed, or falls outside a bound.
+    // The bounds mirror upstream's `GCodeCommand.get` one for one; folding them
+    // into a struct would hide the wording the errors keep.
+    #[allow(clippy::too_many_arguments)]
+    pub fn get<T>(
+        &self,
+        name: &str,
+        default: Option<T>,
+        parse: impl FnOnce(&str) -> Option<T>,
+        minval: Option<T>,
+        maxval: Option<T>,
+        above: Option<T>,
+        below: Option<T>,
+    ) -> Result<T, CommandError>
+    where
+        T: PartialOrd + fmt::Display,
+    {
+        let value = match self.params.get(name) {
+            Some(raw) => parse(raw).ok_or_else(|| {
+                CommandError::new(format!(
+                    "Error on '{}': unable to parse {}",
+                    self.commandline, raw
+                ))
+            })?,
+            None => default.ok_or_else(|| self.missing(name))?,
+        };
+        if let Some(min) = minval {
+            if value < min {
+                return Err(self.range_error(name, "minimum", min));
+            }
+        }
+        if let Some(max) = maxval {
+            if value > max {
+                return Err(self.range_error(name, "maximum", max));
+            }
+        }
+        if let Some(above) = above {
+            if value <= above {
+                return Err(self.range_error(name, "above", above));
+            }
+        }
+        if let Some(below) = below {
+            if value >= below {
+                return Err(self.range_error(name, "below", below));
+            }
+        }
+        Ok(value)
+    }
+
     /// A required integer parameter.
     ///
     /// # Errors
     /// Returns [`CommandError`] when it is absent or not an integer.
     pub fn get_int(&self, name: &str) -> Result<i64, CommandError> {
-        self.parse(name, |value| value.parse::<i64>().ok())
+        self.get(name, None, parse_int, None, None, None, None)
     }
 
     /// An integer parameter, or `default` when it is absent.
@@ -177,10 +288,20 @@ impl GcodeCommand {
     /// # Errors
     /// Returns [`CommandError`] when it is present but not an integer.
     pub fn get_int_default(&self, name: &str, default: i64) -> Result<i64, CommandError> {
-        match self.params.get(name) {
-            None => Ok(default),
-            Some(_) => self.parse(name, |value| value.parse::<i64>().ok()),
-        }
+        self.get(name, Some(default), parse_int, None, None, None, None)
+    }
+
+    /// A required integer within `minval`/`maxval` (upstream's `get_int`).
+    ///
+    /// # Errors
+    /// As [`GcodeCommand::get_int`], plus a bound failure.
+    pub fn get_int_bounded(
+        &self,
+        name: &str,
+        minval: Option<i64>,
+        maxval: Option<i64>,
+    ) -> Result<i64, CommandError> {
+        self.get(name, None, parse_int, minval, maxval, None, None)
     }
 
     /// A required float parameter.
@@ -188,7 +309,7 @@ impl GcodeCommand {
     /// # Errors
     /// Returns [`CommandError`] when it is absent or not a number.
     pub fn get_float(&self, name: &str) -> Result<f64, CommandError> {
-        self.parse(name, |value| value.parse::<f64>().ok())
+        self.get(name, None, parse_float, None, None, None, None)
     }
 
     /// A float parameter, or `default` when it is absent.
@@ -196,10 +317,20 @@ impl GcodeCommand {
     /// # Errors
     /// Returns [`CommandError`] when it is present but not a number.
     pub fn get_float_default(&self, name: &str, default: f64) -> Result<f64, CommandError> {
-        match self.params.get(name) {
-            None => Ok(default),
-            Some(_) => self.parse(name, |value| value.parse::<f64>().ok()),
-        }
+        self.get(name, Some(default), parse_float, None, None, None, None)
+    }
+
+    /// A required float strictly above/below a bound (upstream's `get_float`).
+    ///
+    /// # Errors
+    /// As [`GcodeCommand::get_float`], plus a bound failure.
+    pub fn get_float_bounded(
+        &self,
+        name: &str,
+        above: Option<f64>,
+        below: Option<f64>,
+    ) -> Result<f64, CommandError> {
+        self.get(name, None, parse_float, None, None, above, below)
     }
 
     /// A required float parameter that must sit within `min..=max`.
@@ -208,14 +339,7 @@ impl GcodeCommand {
     /// As [`GcodeCommand::get_float`], plus a range failure whose message is
     /// upstream's ("must have minimum of …" / "must have maximum of …").
     pub fn get_float_range(&self, name: &str, min: f64, max: f64) -> Result<f64, CommandError> {
-        let value = self.get_float(name)?;
-        if value < min {
-            return Err(self.range_error(name, "minimum", min));
-        }
-        if value > max {
-            return Err(self.range_error(name, "maximum", max));
-        }
-        Ok(value)
+        self.get(name, None, parse_float, Some(min), Some(max), None, None)
     }
 
     /// Send one line to the client, as-is.
@@ -243,9 +367,10 @@ impl GcodeCommand {
     /// for a `need_ack` line. Returns whether it acknowledged, which is how
     /// `M115` chooses between `ok <msg>` and an info line.
     pub fn ack(&self, msg: Option<&str>) -> bool {
-        if !self.need_ack {
+        if !self.need_ack.get() {
             return false;
         }
+        self.need_ack.set(false);
         match msg {
             Some(msg) => self.respond_raw(&format!("ok {msg}")),
             None => self.respond_raw("ok"),
@@ -257,21 +382,7 @@ impl GcodeCommand {
         CommandError::new(format!("Error on '{}': missing {}", self.commandline, name))
     }
 
-    fn parse<T>(
-        &self,
-        name: &str,
-        parse: impl FnOnce(&str) -> Option<T>,
-    ) -> Result<T, CommandError> {
-        let value = self.params.get(name).ok_or_else(|| self.missing(name))?;
-        parse(value).ok_or_else(|| {
-            CommandError::new(format!(
-                "Error on '{}': unable to parse {}",
-                self.commandline, value
-            ))
-        })
-    }
-
-    fn range_error(&self, name: &str, bound: &str, limit: f64) -> CommandError {
+    fn range_error(&self, name: &str, bound: &str, limit: impl fmt::Display) -> CommandError {
         CommandError::new(format!(
             "Error on '{}': {} must have {} of {}",
             self.commandline, name, bound, limit
@@ -492,24 +603,56 @@ impl GCodeDispatch {
         Ok(())
     }
 
+    /// Run a script from inside a command handler.
+    ///
+    /// Upstream's `run_script_from_command` (`klippy/gcode.py:237-238`): the
+    /// entry point a handler uses so a module such as `gcode_macro` can run
+    /// another script. Upstream holds the dispatcher's mutex only in
+    /// `run_script`; this host serialises scripts on the calling task, so both
+    /// run the same way — the name is kept because the consumers use it.
+    ///
+    /// # Errors
+    /// Returns the first [`CommandError`] the script produced.
+    pub fn run_script_from_command(&self, script: &str) -> Result<(), CommandError> {
+        for line in script.split('\n') {
+            // An API `gcode/script` line is not acknowledged; the file/serial
+            // input protocol is the only `need_ack` producer (`gcode.py:210`).
+            process_line(&self.inner, line, false)?;
+        }
+        Ok(())
+    }
+
     /// Run a script: split on newlines, run each line, stop at the first error.
     ///
-    /// The error is also reported to the output (as `!! …`), as upstream does,
-    /// so a client subscribed to output sees why the script stopped even when it
-    /// ignores the reply.
+    /// The error is reported to the output (as `!! …`) by `process_line`, as
+    /// upstream does, so a client subscribed to output sees why the script
+    /// stopped even when it ignores the reply.
     ///
     /// # Errors
     /// Returns the first [`CommandError`] the script produced.
     pub fn run_script(&self, script: &str) -> Result<(), CommandError> {
-        for line in script.split('\n') {
-            // An API `gcode/script` line is not acknowledged; the file/serial
-            // input protocol is the only `need_ack` producer (`gcode.py:210`).
-            if let Err(err) = process_line(&self.inner, line, false) {
-                self.inner.respond_error(&err.to_string());
-                return Err(err);
-            }
+        self.run_script_from_command(script)
+    }
+
+    /// Build a command for a handler to run, without parsing a line.
+    ///
+    /// Upstream's `create_gcode_command` (`klippy/gcode.py:244-245`): used by
+    /// modules that synthesise a command and hand it to another handler
+    /// (`homing`, `probe`, `safe_z_home`, `bed_mesh`, `gcode_arcs`). The line is
+    /// never acknowledged, as upstream's is not.
+    pub fn create_gcode_command(
+        &self,
+        command: &str,
+        commandline: &str,
+        params: HashMap<String, String>,
+    ) -> GcodeCommand {
+        GcodeCommand {
+            dispatch: Arc::clone(&self.inner),
+            command: command.to_string(),
+            commandline: commandline.to_string(),
+            params,
+            need_ack: Cell::new(false),
         }
-        Ok(())
     }
 
     /// Add an output handler, called for every line the dispatcher emits.
@@ -696,56 +839,97 @@ fn process_line(inner: &Arc<Inner>, line: &str, need_ack: bool) -> Result<(), Co
     };
 
     // An unregistered command is never re-parsed: upstream hands the split
-    // parameters to `cmd_default` and only a registered extended command goes
-    // through `_get_extended_params`.
-    let Some(handler) = handler else {
-        return invoke_handler(inner, &parsed.command, || {
-            default_handler(inner, &parsed, need_ack)
-        });
-    };
-
-    // An extended command's parameters are `KEY=VALUE`; re-parse the raw text so
-    // quoting and comments work, as upstream does when dispatching a registered
-    // extended command.
-    let params = if parsed.traditional {
-        parsed.params
-    } else {
-        parse_extended(&parsed.raw_params, &parsed.commandline)?
-    };
-
-    let gcmd = GcodeCommand {
+    // parameters to `cmd_default`. A registered extended command has them
+    // re-parsed inside the handler (`_get_extended_params`), so a malformed
+    // line is an ordinary command error.
+    let mut gcmd = GcodeCommand {
         dispatch: Arc::clone(inner),
-        command: parsed.command,
-        commandline: parsed.commandline,
-        params,
-        need_ack,
+        command: parsed.command.clone(),
+        commandline: parsed.commandline.clone(),
+        params: parsed.params.clone(),
+        need_ack: Cell::new(need_ack),
     };
-    invoke_handler(inner, &gcmd.command, || handler(&gcmd))
+
+    let outcome = match &handler {
+        Some(handler) => invoke_handler(inner, &parsed.command, &mut gcmd, |gcmd| {
+            if !parsed.traditional {
+                gcmd.params = parse_extended(&parsed.raw_params, &parsed.commandline)?;
+            }
+            handler(gcmd)
+        }),
+        None => invoke_handler(inner, &parsed.command, &mut gcmd, |gcmd| {
+            default_handler(inner, gcmd)
+        }),
+    };
+
+    match outcome {
+        HandlerOutcome::Ok => {
+            gcmd.ack(None);
+            Ok(())
+        }
+        HandlerOutcome::CommandError(err) => {
+            // A command error is the user's problem: report it, tell the parts
+            // that listen, and only stop the script when the line was not
+            // acknowledged (`klippy/gcode.py:223-228`).
+            inner.respond_error(err.message());
+            inner.printer.send_event(&KlippyEvent::GcodeCommandError);
+            if need_ack {
+                gcmd.ack(None);
+                Ok(())
+            } else {
+                Err(err)
+            }
+        }
+        HandlerOutcome::Internal(msg) => {
+            // The printer was already shut down by `invoke_handler`; the client
+            // is still told. No `gcode:command_error`: upstream fires it only
+            // for a `CommandError` (`klippy/gcode.py:229-234`).
+            inner.respond_error(&msg);
+            if need_ack {
+                gcmd.ack(None);
+                Ok(())
+            } else {
+                Err(CommandError::new(msg))
+            }
+        }
+    }
+}
+
+/// What running one command handler produced.
+enum HandlerOutcome {
+    /// The handler succeeded.
+    Ok,
+    /// The handler reported a user error.
+    CommandError(CommandError),
+    /// The handler panicked; the printer was shut down.
+    Internal(String),
 }
 
 /// Run one command handler, turning a panic into an internal-error shutdown.
 ///
 /// Upstream's bare `except:` around `handler(gcmd)`
-/// (`klippy/gcode.py:230-234`): an exception that is not a `CommandError` means
+/// (`klippy/gcode.py:229-234`): an exception that is not a `CommandError` means
 /// klippy itself is wrong, so the printer is shut down with
-/// `Internal error on command:"X"` and the client is still told what happened.
-/// Rust has no catch-all exception type, so a handler that gives up reports it by
-/// panicking; the panic is caught here, where the command is known.
+/// `Internal error on command:"X"`. Rust has no catch-all exception type, so a
+/// handler that gives up reports it by panicking; the panic is caught here,
+/// where the command is known.
 ///
-/// A [`CommandError`] is the user's problem and passes through untouched — it
-/// does not shut the printer down.
+/// A [`CommandError`] is the user's problem and is returned untouched — it does
+/// not shut the printer down.
 fn invoke_handler(
     inner: &Arc<Inner>,
     command: &str,
-    call: impl FnOnce() -> Result<(), CommandError>,
-) -> Result<(), CommandError> {
-    match std::panic::catch_unwind(AssertUnwindSafe(call)) {
-        Ok(result) => result,
+    gcmd: &mut GcodeCommand,
+    call: impl FnOnce(&mut GcodeCommand) -> Result<(), CommandError>,
+) -> HandlerOutcome {
+    match std::panic::catch_unwind(AssertUnwindSafe(|| call(gcmd))) {
+        Ok(Ok(())) => HandlerOutcome::Ok,
+        Ok(Err(err)) => HandlerOutcome::CommandError(err),
         Err(_) => {
             let msg = format!("Internal error on command:\"{command}\"");
             error!("{msg}");
             inner.printer.invoke_shutdown(&msg);
-            Err(CommandError::new(msg))
+            HandlerOutcome::Internal(msg)
         }
     }
 }
@@ -754,18 +938,7 @@ fn invoke_handler(
 ///
 /// Most of this is upstream's list of requests a slicer sends for a module this
 /// host may not have: they are answered quietly instead of as unknown commands.
-fn default_handler(
-    inner: &Arc<Inner>,
-    parsed: &Parsed,
-    need_ack: bool,
-) -> Result<(), CommandError> {
-    let mut gcmd = GcodeCommand {
-        dispatch: Arc::clone(inner),
-        command: parsed.command.clone(),
-        commandline: parsed.commandline.clone(),
-        params: parsed.params.clone(),
-        need_ack,
-    };
+fn default_handler(inner: &Arc<Inner>, gcmd: &mut GcodeCommand) -> Result<(), CommandError> {
     let command = gcmd.command.clone();
 
     // Temperature and SD-card requests are answered before the ready check, so
@@ -797,7 +970,7 @@ fn default_handler(
             };
             if let Some(handler) = handler {
                 gcmd.command = real.to_string();
-                return handler(&gcmd);
+                return handler(gcmd);
             }
         }
     } else if matches!(command.as_str(), "M140" | "M104")
@@ -877,7 +1050,7 @@ fn dispatch_mux(inner: &Arc<Inner>, cmd: &str, gcmd: &GcodeCommand) -> Result<()
     // `Some("")` would never match the default and would report a bogus value
     // (`_cmd_mux`, `klippy/gcode.py:317-342`).
     let requested: Option<String> = if has_default {
-        gcmd.parameters().get(&key).cloned()
+        gcmd.get_command_parameters().get(&key).cloned()
     } else {
         Some(gcmd.get_str(&key)?)
     };
@@ -1788,7 +1961,7 @@ mod tests {
             command: parsed.command,
             commandline: parsed.commandline,
             params,
-            need_ack: false,
+            need_ack: Cell::new(false),
         }
     }
 
@@ -1827,6 +2000,183 @@ mod tests {
             err.to_string(),
             "Error on 'MY_CMD A=0.5': A must have minimum of 1"
         );
+    }
+
+    #[test]
+    fn test_bounds_and_the_generic_getter() {
+        let gcmd = command("MY_CMD A=5 B=0.5 C=-1");
+
+        // Upstream's wording for every bound.
+        assert_eq!(gcmd.get_int_bounded("A", Some(0), Some(10)).unwrap(), 5);
+        assert_eq!(
+            gcmd.get_int_bounded("C", Some(0), None)
+                .unwrap_err()
+                .to_string(),
+            "Error on 'MY_CMD A=5 B=0.5 C=-1': C must have minimum of 0"
+        );
+        assert_eq!(
+            gcmd.get_int_bounded("A", None, Some(4))
+                .unwrap_err()
+                .to_string(),
+            "Error on 'MY_CMD A=5 B=0.5 C=-1': A must have maximum of 4"
+        );
+        // `above`/`below` are strict: equal is already out of bounds.
+        assert!(gcmd.get_float_bounded("B", Some(0.5), None).is_err());
+        assert_eq!(gcmd.get_float_bounded("B", Some(0.4), None).unwrap(), 0.5);
+        assert!(gcmd.get_float_bounded("B", None, Some(0.5)).is_err());
+
+        // The generic getter takes a parser and the same bounds.
+        let parsed = gcmd
+            .get("A", None, |v| v.parse::<u32>().ok(), None, None, None, None)
+            .unwrap();
+        assert_eq!(parsed, 5);
+        // An absent parameter uses the default.
+        assert_eq!(
+            gcmd.get("MISSING", Some(7), parse_int, None, None, None, None)
+                .unwrap(),
+            7
+        );
+    }
+
+    #[test]
+    fn test_raw_command_parameters_skip_a_line_number_and_checksum() {
+        // The command is at the head of the line: the text after it.
+        let gcmd = command("SET_PIN PIN=fan VALUE=1");
+        assert_eq!(gcmd.get_raw_command_parameters(), "PIN=fan VALUE=1");
+
+        // A line-numbered line drops the number and a trailing checksum.
+        let gcmd = command("N5 M110 X1*45");
+        assert_eq!(gcmd.get_raw_command_parameters(), "X1");
+
+        // No parameters: empty.
+        let gcmd = command("M110");
+        assert_eq!(gcmd.get_raw_command_parameters(), "");
+    }
+
+    #[test]
+    fn test_a_command_can_be_created_without_parsing() {
+        let (dispatch, _output) = dispatch();
+        let params = HashMap::from([("PIN".to_string(), "fan".to_string())]);
+
+        let gcmd = dispatch.create_gcode_command("SET_PIN", "SET_PIN PIN=fan", params);
+
+        assert_eq!(gcmd.command(), "SET_PIN");
+        assert_eq!(gcmd.commandline(), "SET_PIN PIN=fan");
+        assert_eq!(gcmd.get_str("PIN").unwrap(), "fan");
+        // A synthesised command is never acknowledged.
+        assert!(!gcmd.ack(None));
+    }
+
+    #[test]
+    fn test_run_script_from_command_runs_a_script() {
+        let (dispatch, _output) = dispatch();
+        dispatch.inner.set_ready(true);
+        let (handler, seen) = recorder();
+        dispatch
+            .register_command("MY_CMD", handler, None, false)
+            .unwrap();
+
+        dispatch.run_script_from_command("MY_CMD A=1").unwrap();
+
+        assert_eq!(*seen.lock().unwrap(), ["MY_CMD A=1"]);
+    }
+
+    #[test]
+    fn test_a_command_error_fires_the_command_error_event() {
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        let dispatch = GCodeDispatch::new(Arc::clone(&printer));
+        dispatch.inner.set_ready(true);
+        let fired = Arc::new(AtomicBool::new(false));
+        {
+            let fired = Arc::clone(&fired);
+            printer.register_event_handler(
+                KlippyEvent::GcodeCommandError,
+                Box::new(move |_| fired.store(true, Ordering::SeqCst)),
+            );
+        }
+        dispatch
+            .register_command(
+                "FAIL",
+                Arc::new(|_| Err(CommandError::new("boom"))),
+                None,
+                false,
+            )
+            .unwrap();
+
+        let err = dispatch.run_script("FAIL").unwrap_err();
+
+        assert_eq!(err.to_string(), "boom");
+        assert!(fired.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_a_panic_does_not_fire_the_command_error_event() {
+        // Upstream fires `gcode:command_error` only for a `CommandError`; a
+        // panic is an internal error and shuts the printer down instead
+        // (`klippy/gcode.py:223-234`).
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        let dispatch = GCodeDispatch::new(Arc::clone(&printer));
+        dispatch.inner.set_ready(true);
+        let fired = Arc::new(AtomicBool::new(false));
+        {
+            let fired = Arc::clone(&fired);
+            printer.register_event_handler(
+                KlippyEvent::GcodeCommandError,
+                Box::new(move |_| fired.store(true, Ordering::SeqCst)),
+            );
+        }
+        dispatch
+            .register_command("BOOM", Arc::new(|_| panic!("handler bug")), None, false)
+            .unwrap();
+
+        let _ = dispatch.run_script("BOOM");
+
+        assert!(!fired.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_an_acknowledged_line_does_not_stop_the_script_on_error() {
+        // The file/serial protocol (`need_ack`) reports the error, fires the
+        // event and acks the line instead of propagating it
+        // (`klippy/gcode.py:223-228`), so the rest of the script still runs.
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        let dispatch = GCodeDispatch::new(Arc::clone(&printer));
+        dispatch.inner.set_ready(true);
+        let calls = Arc::new(AtomicUsize::new(0));
+        {
+            let calls = Arc::clone(&calls);
+            dispatch
+                .register_command(
+                    "FAIL",
+                    Arc::new(move |_| {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Err(CommandError::new("boom"))
+                    }),
+                    None,
+                    false,
+                )
+                .unwrap();
+        }
+        dispatch
+            .register_command("AFTER", Arc::new(|_| Ok(())), None, false)
+            .unwrap();
+        let output = Arc::new(Mutex::new(Vec::new()));
+        {
+            let output = Arc::clone(&output);
+            dispatch.register_output_handler(Arc::new(move |line: &str| {
+                output
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push(line.to_string());
+            }));
+        }
+
+        process_line(&dispatch.inner, "FAIL", true).unwrap();
+        process_line(&dispatch.inner, "AFTER", true).unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let lines = output.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        assert_eq!(lines, ["!! boom", "ok", "ok"]);
     }
 
     #[test]

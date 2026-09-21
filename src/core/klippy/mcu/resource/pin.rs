@@ -268,11 +268,19 @@ impl McuDigitalOut {
         });
 
         let callback_state = Arc::clone(&state);
-        let callback_pins = Arc::clone(&pins);
+        // Weak, not Arc: the registry owns this chip (`PrinterPins::chip_impls`),
+        // and the chip owns the `ConfigBuilder` this callback is stored in. A
+        // strong handle here is a cycle that keeps the registry — and through
+        // `McuChip::mcu`, the connected device and its receive task — alive after
+        // a restart drops the machine's parts (`mcu/restart.rs`, `object.rs`).
+        let callback_pins = Arc::downgrade(&pins);
         let callback_pin = pin.clone();
         config
             .register_config_callback(Box::new(move |builder, mcu| {
-                callback_state.build(builder, mcu, &callback_pins, &chip_name, &callback_pin)
+                let pins = callback_pins
+                    .upgrade()
+                    .expect("the pins registry outlives the resources it built");
+                callback_state.build(builder, mcu, &pins, &chip_name, &callback_pin)
             }))
             .expect("a resource is always built before the configuration is");
 
@@ -490,6 +498,41 @@ mod tests {
         assert!(
             weak.upgrade().is_none(),
             "the pin registry was kept alive by its own chip"
+        );
+    }
+
+    #[test]
+    fn test_a_resource_does_not_keep_the_pin_registry_alive() {
+        // A resource's config callback needs the registry at build time, but it
+        // must hold it weakly: a strong handle cycles through the chip's
+        // `ConfigBuilder` (`registry -> chip -> config -> callback -> registry`)
+        // and keeps the registry — with the connected MCU behind the chip —
+        // alive after a restart drops the machine's parts.
+        let (chip, pins) = chip();
+        let weak = Arc::downgrade(&pins);
+
+        let params = PinParams {
+            chip_name: "mcu".to_string(),
+            pin: "PA0".to_string(),
+            invert: false,
+            pullup: 0,
+            share_type: None,
+        };
+        let resource = McuDigitalOut::new(
+            chip.config(),
+            chip.pins(),
+            "mcu".to_string(),
+            Arc::clone(&chip.mcu),
+            params,
+        );
+
+        drop(resource);
+        drop(chip);
+        drop(pins);
+
+        assert!(
+            weak.upgrade().is_none(),
+            "a resource's config callback kept the pin registry alive"
         );
     }
 

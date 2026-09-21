@@ -468,23 +468,26 @@ kinematics 已随 Printer 重构删除，从这里重新开始。动工前调查
 | FW5d-1 | ✅ `ToolHead`、`MotionQueuing`、`Stepper`（host 链路） | host 单测（8 个）：`G1` 出正确 `queue_step` |
 | FW5d-2 | ✅ `McuStepper` 资源 + `setup_stepper` + `StepCommand`→MCU 命令转换 | host 单测（3 个）；`[stepper_*]` section 注册与真板读回留 FW5e |
 | FW5e-1 | ✅ `Kinematics` trait + `CartesianKinematics` + `MoveContext`（窄接口）+ ToolHead 集成 | host 单测（8 个） |
-| FW5e-2 | `[stepper_*]`/`[printer]` section 注册、`G1`（G4）、真板读回 | 真板（`stepper_get_position`） |
+| FW5e-2 | ✅ `[stepper_*]`/`[printer]` section 注册、`G1`/`G0`（`G4`/`M400`/`SET_KINEMATIC_POSITION`）、连接期 `stepper_get_position` 对齐 | host/装载单测（19 个）；真板读回 `[~]` 等 FW5f 后统一做 |
 | FW5f | `stepcompress` 完整压缩（后置） | 与上游向量对拍 |
 
 细节条目：
 
-- [ ] 先立 **toolhead 对象**：位置记忆（`commanded_pos`）、trapq、速度/加速度上限，
+- [x] 先立 **toolhead 对象**：位置记忆（`commanded_pos`）、trapq、速度/加速度上限，
       回零与移动的入口（上游 `klippy/toolhead.py:389` `:400` `:482` `:507` `:522`）。
-- [ ] 再加回 **`Kinematics` trait 与 `kinematics/`**：按上游由 toolhead 读
-      `[printer] kinematics` 装载（`klippy/toolhead.py:242`），不是交给 Printer。
+      FW5d-1 立骨架，FW5e-2 补 `set_position`/`kinematics` 访问器。
+- [x] 再加回 **`Kinematics` trait 与 `kinematics/`**：按上游由 toolhead 读
+      `[printer] kinematics` 装载（`klippy/toolhead.py:242`），不是交给 Printer。FW5e-1。
 - [ ] 回零协议：上游 kinematics 调 `homing_state.home_rails(rails, forcepos, movepos)`、
       `set_homed_position(pos)`、`get_trigger_position`、`set_stepper_adjustment`。
-      没有这些，任何真实 kinematics 的 `home()` 都写不出来。
-- [ ] stepper 句柄：上游能 `get_commanded_position()` / `get_step_dist()` / `set_trapq()` /
-      `setup_itersolve()`；`calc_position` 的输入就从这里来。
-- [ ] step 生成层的运动学：上游 `rail.setup_itersolve('cartesian_stepper_alloc', axis)`；
+      没有这些，任何真实 kinematics 的 `home()` 都写不出来。（与 FW6/F8 联合定）
+- [x] stepper 句柄：上游能 `get_commanded_position()` / `get_step_dist()` / `set_trapq()` /
+      `setup_itersolve()`；`calc_position` 的输入就从这里来。FW5d/FW5e-2：
+      `motion::Stepper` + `McuStepper`（oid/引脚/`query_position`）。
+- [x] step 生成层的运动学：上游 `rail.setup_itersolve('cartesian_stepper_alloc', axis)`；
       这部分上游是 C（`klippy/chelper/` 的 `stepcompress.c`、`itersolve.c`、`kin_*.c`、
       `trapq.c`、`kin_shaper.c`，见审计文档 §4.1），Rust 侧整体重写（决定见上）。
+      FW5c 已落地（`stepcompress` 简化版，完整压缩见 FW5f）。
 
 ### C2 配置装载收尾（框架 FW1）
 
@@ -494,8 +497,8 @@ kinematics 已随 Printer 重构删除，从这里重新开始。动工前调查
 - [x] **住户与阶段**：`section!` 新增 `phase = early|generic|late` 与 `object = "<name>"`，
       装载器按阶段遍历、按声明名注册；`configfile` 作为无节对象在 `gcode` 之后注册。
 - [x] **`configfile` 对象**：`get_status` 的 `settings`/`config`/`warnings` 已接，`objects/list` 可见。
-- [ ] **`[printer]` / toolhead 本体**：晚阶段住户的机制已就绪，但 `[printer]` 的消费者是 C1 的 toolhead；
-      接入时只需一条 `section!("printer", phase = late, object = "toolhead", load = …)`。
+- [x] **`[printer]` / toolhead 本体**：晚阶段住户已接入（`section!("printer", phase = late,
+      object = "toolhead", …)`），消费者是 C1 的 toolhead（FW5e-2）。
 - [ ] **autosave / `SAVE_CONFIG` / `deprecate`**：`configfile` 的剩余状态与写入路径，
       属模块而非框架，单列（依赖 FW1）。
 - [ ] **`getchoice` 与范围/列表上限**：wrapper 目前只做类型解析 + 两个自定义范围检查；

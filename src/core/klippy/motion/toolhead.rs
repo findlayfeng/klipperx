@@ -12,7 +12,7 @@ use super::stepcompress::StepCommand;
 use super::stepper::Stepper;
 use super::trapq::Trapq;
 use crate::core::klippy::gcode::CommandError;
-use crate::core::klippy::mathutil::Coord;
+use crate::core::klippy::mathutil::{Coord, Xyz};
 
 /// How far ahead of the MCU the planner starts, in seconds
 /// (`BUFFER_TIME_START`, `klippy/toolhead.py:196`).
@@ -56,6 +56,20 @@ impl ToolHead {
     /// Install the kinematics (upstream loads it from `[printer] kinematics`).
     pub fn set_kinematics(&mut self, kinematics: Box<dyn Kinematics>) {
         self.kinematics = Some(kinematics);
+    }
+
+    /// The kinematics, for reporting homing state and limits.
+    pub fn kinematics(&self) -> Option<&dyn Kinematics> {
+        self.kinematics.as_deref()
+    }
+
+    /// The kinematics, to change its state (`SET_KINEMATIC_POSITION`'s
+    /// `CLEAR_HOMED`).
+    pub fn kinematics_mut(&mut self) -> Option<&mut (dyn Kinematics + 'static)> {
+        match &mut self.kinematics {
+            Some(kinematics) => Some(kinematics.as_mut()),
+            None => None,
+        }
     }
 
     /// Where the toolhead has been commanded to.
@@ -162,6 +176,34 @@ impl ToolHead {
     /// Append a move's trapezoid directly, for tests and `drip_move`.
     pub fn append_move(&mut self, print_time: f64, move_: &Move) {
         self.motion_queuing.append_move(print_time, move_);
+    }
+
+    /// Force the toolhead to `newpos`, marking `homing_axes` as homed
+    /// (`ToolHead.set_position`, `klippy/toolhead.py:383-391`).
+    ///
+    /// This is `G92`'s low-level half and `SET_KINEMATIC_POSITION`: the print
+    /// time does not move and no steps are generated, but the solver and the
+    /// kinematics are told where the toolhead is so the next move starts here.
+    /// The trapq's current position is rewritten at the same time, which drops
+    /// or truncates any history the old position recorded.
+    pub fn set_position(&mut self, newpos: Coord, homing_axes: &[usize]) {
+        self.process_lookahead();
+        self.motion_queuing
+            .trapq_mut()
+            .set_position(self.print_time, Xyz::from(newpos));
+        self.commanded_pos = newpos;
+        if let Some(kinematics) = &mut self.kinematics {
+            kinematics.set_position(newpos, homing_axes);
+        }
+        for stepper in self.motion_queuing.steppers_mut() {
+            stepper.set_position(newpos.into());
+        }
+    }
+
+    /// Drop finished moves from the trapq once the solvers are past them.
+    pub fn finalize_moves(&mut self, print_time: f64, clear_history_time: f64) {
+        self.motion_queuing
+            .finalize_moves(print_time, clear_history_time);
     }
 }
 

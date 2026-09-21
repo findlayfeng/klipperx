@@ -317,13 +317,19 @@ mod tests {
             [
                 "mcu",
                 "output_pin",
+                "stepper_x",
+                "stepper_y",
+                "stepper_z",
                 "board_pins",
                 "i2c_device",
-                "spi_device"
+                "spi_device",
+                "printer"
             ]
         );
         // `mcu` is the one up-front section (upstream loads `pins` and `mcu`
-        // before the generic walk); the rest are plain generic sections.
+        // before the generic walk), `[printer]` the one late section (upstream
+        // loads `toolhead` after the walk, as `toolhead`); the rest are plain
+        // generic sections.
         let by_id = |id: &str| {
             FACTORIES
                 .iter()
@@ -333,7 +339,13 @@ mod tests {
         };
         assert_eq!(by_id("mcu").phase, Phase::Early);
         assert_eq!(by_id("output_pin").phase, Phase::Generic);
-        assert!(FACTORIES.iter().all(|(_, entry)| entry.object.is_none()));
+        assert_eq!(by_id("stepper_x").phase, Phase::Generic);
+        assert_eq!(by_id("printer").phase, Phase::Late);
+        assert_eq!(by_id("printer").object, Some("toolhead"));
+        assert!(FACTORIES
+            .iter()
+            .filter(|(id, _)| *id != "printer")
+            .all(|(_, entry)| entry.object.is_none()));
     }
 
     #[test]
@@ -450,6 +462,56 @@ mod tests {
         printer.load_config(&config).unwrap();
 
         assert_eq!(printer.objects(), ["gcode", "configfile", "pins", "mcu"]);
+    }
+
+    #[test]
+    fn test_a_cartesian_printer_loads_its_steppers_and_toolhead() {
+        // The full chain the framework was waiting for: `[stepper_*]` are valid
+        // sections, and `[printer]` is the late tenant that consumes them and
+        // registers the `toolhead` object (`klippy.py:124`).
+        let (printer, result) = load(
+            "[mcu]\nserial: /dev/not-opened-yet\n\
+             [stepper_x]\nstep_pin: PA0\ndir_pin: PA1\nrotation_distance: 40\nmicrosteps: 16\nposition_max: 200\n\
+             [stepper_y]\nstep_pin: PA2\ndir_pin: PA3\nrotation_distance: 40\nmicrosteps: 16\nposition_max: 200\n\
+             [stepper_z]\nstep_pin: PA4\ndir_pin: PA5\nrotation_distance: 8\nmicrosteps: 16\nposition_max: 200\n\
+             [printer]\nkinematics: cartesian\nmax_velocity: 300\nmax_accel: 3000\n",
+        );
+
+        result.unwrap();
+        assert_eq!(
+            printer.objects(),
+            [
+                "gcode",
+                "configfile",
+                "pins",
+                "mcu",
+                "stepper_x",
+                "stepper_y",
+                "stepper_z",
+                "toolhead"
+            ]
+        );
+        // The steppers are registered but not client-visible; the toolhead is.
+        let queryable = printer.queryable_objects();
+        assert!(queryable.contains(&"toolhead".to_string()));
+        assert!(!queryable.contains(&"stepper_x".to_string()));
+        // `[printer]`'s consumer is the `toolhead` object, not `printer`.
+        assert!(printer.lookup_object("printer").is_none());
+        assert_eq!(
+            printer.lookup_object("toolhead").unwrap().get_status(0.0),
+            json!({})
+        );
+    }
+
+    #[test]
+    fn test_a_cartesian_printer_without_a_stepper_is_a_config_error() {
+        let (_, result) = load(
+            "[mcu]\nserial: /dev/not-opened-yet\n\
+             [printer]\nkinematics: cartesian\nmax_velocity: 300\nmax_accel: 3000\n",
+        );
+
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("needs a '[stepper_x]'"), "{err}");
     }
 
     #[test]

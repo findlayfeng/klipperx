@@ -9,7 +9,7 @@
 use super::itersolve::{
     cartesian_active_flags, cartesian_position_fn, Axis, AxisFlags, PositionFn, StepKinematics,
 };
-use super::stepcompress::{StepCommand, StepCompressor};
+use super::stepcompress::{StepCommand, StepCompressError, StepCompressor};
 use super::trapq::Trapq;
 use crate::core::klippy::mathutil::Xyz;
 
@@ -105,16 +105,19 @@ impl Stepper {
     /// `move_clock` is the firmware clock `flush_time` corresponds to; it
     /// releases the step the compressor holds back
     /// (`stepcompress_flush`).
+    ///
+    /// # Errors
+    /// An internal [`StepCompressError`] from the compressor.
     pub fn generate(
         &mut self,
         trapq: &Trapq,
         flush_time: f64,
-        move_clock: i64,
-    ) -> Vec<StepCommand> {
+        move_clock: u64,
+    ) -> Result<Vec<StepCommand>, StepCompressError> {
         self.kinematics
-            .generate_steps(trapq, &mut self.compressor, flush_time);
-        self.compressor.flush(move_clock);
-        self.compressor.take_commands()
+            .generate_steps(trapq, &mut self.compressor, flush_time)?;
+        self.compressor.flush(move_clock)?;
+        Ok(self.compressor.take_commands())
     }
 }
 
@@ -163,12 +166,15 @@ mod tests {
         );
         let mut stepper = Stepper::cartesian("stepper_x", 0, 1.0, Axis::X, 1_000_000.0);
 
-        let commands = stepper.generate(&trapq, 0.1, 100_000);
+        let commands = stepper.generate(&trapq, 0.1, 100_000).unwrap();
 
-        let steps = commands
+        let steps: u32 = commands
             .iter()
-            .filter(|command| matches!(command, StepCommand::QueueStep { .. }))
-            .count();
+            .filter_map(|command| match command {
+                StepCommand::QueueStep { count, .. } => Some(*count),
+                StepCommand::SetNextStepDir { .. } => None,
+            })
+            .sum();
         assert_eq!(steps, 10);
     }
 }

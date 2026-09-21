@@ -7,7 +7,7 @@
 //! device, and the MCU side attaches on top of it.
 
 use super::plan::Move;
-use super::stepcompress::StepCommand;
+use super::stepcompress::{StepCommand, StepCompressError};
 use super::stepper::Stepper;
 use super::trapq::Trapq;
 use crate::core::klippy::mathutil::Xyz;
@@ -90,21 +90,27 @@ impl MotionQueuing {
     ///
     /// Returns one entry per stepper that produced commands, in the order the
     /// steppers were added.
-    pub fn generate(&mut self, flush_time: f64) -> Vec<(String, Vec<StepCommand>)> {
+    ///
+    /// # Errors
+    /// An internal [`StepCompressError`] from a stepper's compressor.
+    pub fn generate(
+        &mut self,
+        flush_time: f64,
+    ) -> Result<Vec<(String, Vec<StepCommand>)>, StepCompressError> {
         let Self {
             trapq,
             steppers,
             mcu_freq,
         } = self;
-        let move_clock = (flush_time * *mcu_freq) as i64;
+        let move_clock = (flush_time.max(0.0) * *mcu_freq) as u64;
         let mut out = Vec::new();
         for stepper in steppers.iter_mut() {
-            let commands = stepper.generate(trapq, flush_time, move_clock);
+            let commands = stepper.generate(trapq, flush_time, move_clock)?;
             if !commands.is_empty() {
                 out.push((stepper.name().to_string(), commands));
             }
         }
-        out
+        Ok(out)
     }
 }
 
@@ -153,15 +159,18 @@ mod tests {
         move_.set_junction(0.0, 10_000.0, 0.0);
         queuing.append_move(0.0, &move_);
 
-        let batches = queuing.generate(0.2);
+        let batches = queuing.generate(0.2).unwrap();
 
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].0, "stepper_x");
-        let steps = batches[0]
+        let steps: u32 = batches[0]
             .1
             .iter()
-            .filter(|command| matches!(command, StepCommand::QueueStep { .. }))
-            .count();
+            .filter_map(|command| match command {
+                StepCommand::QueueStep { count, .. } => Some(*count),
+                StepCommand::SetNextStepDir { .. } => None,
+            })
+            .sum();
         assert_eq!(steps, 10);
     }
 
@@ -180,6 +189,6 @@ mod tests {
         queuing.append_move(0.0, &move_);
 
         // The Y stepper produces no commands, so only the trapq had work.
-        assert!(queuing.generate(0.2).is_empty());
+        assert!(queuing.generate(0.2).unwrap().is_empty());
     }
 }

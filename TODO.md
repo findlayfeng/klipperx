@@ -21,7 +21,7 @@
 | **FW2** | 对象模型收尾 | Q4、Q5 | Q4 定案 `Value`；Q5 加 `lookup_objects(module)` 前缀遍历与 `statuses()` 快照 | `objects/query` 形状不变；`lookup_objects("mcu")` 前缀遍历与反射读状态有单测 | `gcode_macro` 的 `printer.objects` 模板视图、display 菜单、宏变量 | — |
 | **FW3** | 错误词汇框架 | A2 | `CommandError`/`ConfigError` 分层、`KlippyError::Config`、`Internal` 收敛、handler/endpoint 异常 `catch_unwind` → `invoke_shutdown`、config 错走 `set_error_state`（`PrinterState::Error`） | 参数错报 `CommandError` 且不停机；坏配置 / connect 期 config 错报 `error`（可 RESTART）；panic 的 handler / endpoint 触发 `invoke_shutdown` | 全树的错误分支 | — |
 | **FW4** | G-Code 框架收尾（**完成**；`GCodeIO` 暂缓 `[~]`） | G1b（框架部分） | ~~参数访问器、`create_gcode_command`、`run_script_from_command`、`gcode:command_error` 触发~~ ✅；`GCodeIO` 输入抽象（伪 tty / 文件 / `stats gcodein` / `debuginput_exit`）**暂缓 `[~]`**（不做 OctoPrint 串口仿真）；`gcode:request_restart` 触发随 C1 | ~~`create_gcode_command` / 参数访问器~~ ✅；`GCodeIO` 暂缓（见 [FW4 笔记](docs/work-log/2026-09-21-fw4-notes.md)） | 全部 gcode extras（H3、H8…） | FW1、FW3（已满足） |
-| **FW5** | 运动框架（最重，**拆 FW5a–FW5f**） | C1（框架部分）、H12 | **FW5a** `Coord` + `clocksync` 回归；**FW5b** `Move`/`LookAheadQueue`/`trapq`；**FW5c** `itersolve` + `kin_cartesian` + `stepcompress` **简化**（限流告警）；**FW5d** `MotionQueuing`/`ToolHead`/`McuStepper`；**FW5e** `Kinematics` + `cartesian` + `G1`；**FW5f**（后置）`stepcompress` 完整压缩 | host 单测 → 假 MCU → 真板 `G1`（单轴 → 三轴 + `[extruder]`）→ `G28`（与 FW6/F8 联合） | `kinematics/*` 其余、H9、H10、input shaper | FW1（已满足） |
+| **FW5** | 运动框架（最重，**拆 FW5a–FW5f**） | C1（框架部分）、H12 | **FW5a** `Coord` + `clocksync` 回归；**FW5b** `Move`/`LookAheadQueue`/`trapq`；**FW5c** `itersolve` + `kin_cartesian`；**FW5d** `MotionQueuing`/`ToolHead`/`McuStepper`；**FW5e** `Kinematics` + `cartesian` + `[stepper_*]`/`[printer]` + `G1`；**FW5f** `stepcompress` 完整压缩 | host 单测 → 假 MCU → **真板 `G1`（单轴 → 三轴 + `[extruder]`）→ `G28`（与 FW6/F8 联合）** | `kinematics/*` 其余、H9、H10、input shaper | FW1（已满足） |
 | **FW6** | 资源与触发框架 | F3、F8 | 命令队列/print_time 同步输出（`MCU_bus_digital_out`）、`TriggerDispatch`/`MCU_trsync`、endstop 接口 | 一个 endstop + `query_endstops/status` | homing/probe、运动同步 `SET_PIN` | FW5 |
 | **FW7** | MCU 与传输框架收尾 | B2、D3 | `emergency_stop` 对象（`klippy:shutdown` → 固件 `emergency_stop`）、本地 shutdown 标志、`emergency_stop` 端点、带载荷错误上报；RTO 定时重传与固件 `reset` 优先未做 | `emergency_stop` 端点使打印机进 shutdown；主机停机向固件发 `emergency_stop`，固件自报停机不回发 | TMC/传感器等资源 | — |
 | **FW8** | 主机层与重启框架 | D1、D2、Q6 | `--logfile`/rollover/Q6、`rpi_usb` 门控、CRC 物理复位、重启后订阅均已完成（代码）；剩 `StartArgs` 其余字段与 `rpi_usb` 真机验证 | `--logfile` 落盘、`error_exit` 非零、重启后订阅不断；真板 `last_stats` 已验 | 日志、Moonraker 兼容 | — |
@@ -453,8 +453,8 @@ kinematics 已随 Printer 重构删除，从这里重新开始。动工前调查
   位置反推轴位置这一处，见 `extras/homing.py:245`）。
 - **`motion_quuing` 照搬上游分层**：`MotionQueuing` 持有 trapq 与每 MCU 的输出，flush 调度
   在它里面。
-- **`stepcompress` 先简化**（每步一条 `queue_step`，使用时限流告警最多三次）让流程能过；
-  **完整压缩独立成 FW5f**（后置）。
+- **`stepcompress` 先简化、后完整**：FW5c 先简化（每步一条 `queue_step`）让流程能过；
+  **FW5f 已完成完整压缩**（`(interval,count,add)` + `max_error` + `CHECK_LINES`，与上游向量对拍）。
 - **`Kinematics::check_move` 用窄 context**，不把 `Move` 暴露给 kinematics。
 - **验收先到 `G1`**；`G28` 需要 endstop/trsync（F8），与 FW6 联合验收。
 
@@ -468,8 +468,8 @@ kinematics 已随 Printer 重构删除，从这里重新开始。动工前调查
 | FW5d-1 | ✅ `ToolHead`、`MotionQueuing`、`Stepper`（host 链路） | host 单测（8 个）：`G1` 出正确 `queue_step` |
 | FW5d-2 | ✅ `McuStepper` 资源 + `setup_stepper` + `StepCommand`→MCU 命令转换 | host 单测（3 个）；`[stepper_*]` section 注册与真板读回留 FW5e |
 | FW5e-1 | ✅ `Kinematics` trait + `CartesianKinematics` + `MoveContext`（窄接口）+ ToolHead 集成 | host 单测（8 个） |
-| FW5e-2 | ✅ `[stepper_*]`/`[printer]` section 注册、`G1`/`G0`（`G4`/`M400`/`SET_KINEMATIC_POSITION`）、连接期 `stepper_get_position` 对齐 | host/装载单测（19 个）；真板读回 `[~]` 等 FW5f 后统一做 |
-| FW5f | `stepcompress` 完整压缩（后置） | 与上游向量对拍 |
+| FW5e-2 | ✅ `[stepper_*]`/`[printer]` section 注册、`G1`/`G0`（`G4`/`M400`/`SET_KINEMATIC_POSITION`）、连接期 `stepper_get_position` 对齐 | host/装载单测；真板读回与 G1 `[~]`（板只知 X 引脚，见 FW5f 记录） |
+| FW5f | ✅ `stepcompress` 完整压缩（`(interval,count,add)`/`max_error`/`check_line`/方向翻转/远步重锚） | 与上游 C 向量对拍 + 重构性质单测；真板 `--task motion`：500 步 → 3 条命令，读回 500 |
 
 细节条目：
 
@@ -487,7 +487,7 @@ kinematics 已随 Printer 重构删除，从这里重新开始。动工前调查
 - [x] step 生成层的运动学：上游 `rail.setup_itersolve('cartesian_stepper_alloc', axis)`；
       这部分上游是 C（`klippy/chelper/` 的 `stepcompress.c`、`itersolve.c`、`kin_*.c`、
       `trapq.c`、`kin_shaper.c`，见审计文档 §4.1），Rust 侧整体重写（决定见上）。
-      FW5c 已落地（`stepcompress` 简化版，完整压缩见 FW5f）。
+      FW5c 已落地（`itersolve` + `kin_cartesian`），`stepcompress` 在 FW5f 补完整压缩。
 
 ### C2 配置装载收尾（框架 FW1）
 

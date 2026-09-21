@@ -8,7 +8,7 @@
 use super::kinematics::{Kinematics, MoveContext};
 use super::plan::{LookAheadQueue, Move, MoveLimits};
 use super::queuing::MotionQueuing;
-use super::stepcompress::StepCommand;
+use super::stepcompress::{StepCommand, StepCompressError};
 use super::stepper::Stepper;
 use super::trapq::Trapq;
 use crate::core::klippy::gcode::CommandError;
@@ -154,7 +154,13 @@ impl ToolHead {
     /// Flush the look-ahead and generate steps up to `step_gen_time`.
     ///
     /// Returns one entry per stepper that produced commands.
-    pub fn flush_step_generation(&mut self, step_gen_time: f64) -> Vec<(String, Vec<StepCommand>)> {
+    ///
+    /// # Errors
+    /// An internal [`StepCompressError`] from a stepper's compressor.
+    pub fn flush_step_generation(
+        &mut self,
+        step_gen_time: f64,
+    ) -> Result<Vec<(String, Vec<StepCommand>)>, StepCompressError> {
         self.process_lookahead();
         self.motion_queuing.generate(step_gen_time)
     }
@@ -240,13 +246,16 @@ mod tests {
         toolhead
     }
 
-    /// The number of `queue_step` commands across all steppers.
-    fn step_count(batches: &[(String, Vec<StepCommand>)]) -> usize {
+    /// The number of steps across all steppers (the commands are compressed).
+    fn step_count(batches: &[(String, Vec<StepCommand>)]) -> u32 {
         batches
             .iter()
             .flat_map(|(_, commands)| commands)
-            .filter(|command| matches!(command, StepCommand::QueueStep { .. }))
-            .count()
+            .filter_map(|command| match command {
+                StepCommand::QueueStep { count, .. } => Some(*count),
+                StepCommand::SetNextStepDir { .. } => None,
+            })
+            .sum()
     }
 
     #[test]
@@ -256,7 +265,7 @@ mod tests {
         toolhead
             .move_to(Coord::new(10.0, 0.0, 0.0, 0.0), 100.0)
             .unwrap();
-        let batches = toolhead.flush_step_generation(1.0);
+        let batches = toolhead.flush_step_generation(1.0).unwrap();
 
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].0, "stepper_x");
@@ -275,7 +284,7 @@ mod tests {
         toolhead
             .move_to(Coord::new(20.0, 0.0, 0.0, 0.0), 100.0)
             .unwrap();
-        let batches = toolhead.flush_step_generation(1.0);
+        let batches = toolhead.flush_step_generation(1.0).unwrap();
 
         // No stop between the moves: 20 mm at 1 mm per step.
         assert_eq!(step_count(&batches), 20);
@@ -287,7 +296,7 @@ mod tests {
         toolhead
             .move_to(Coord::new(10.0, 0.0, 0.0, 0.0), 100.0)
             .unwrap();
-        toolhead.flush_step_generation(1.0);
+        toolhead.flush_step_generation(1.0).unwrap();
         let before = toolhead.print_time();
 
         toolhead.dwell(0.5);

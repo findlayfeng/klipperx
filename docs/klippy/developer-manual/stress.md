@@ -7,14 +7,16 @@
 klipperx stress [OPTIONS] <CONFIG_FILE> [MCU]
 ```
 
-- `CONFIG_FILE` 用来取 `[mcu …]`（传输方式）；`--task step` 还要一个 stepper 的
-  `step_pin` / `dir_pin`；
+- `CONFIG_FILE` 用来取 `[mcu …]`（传输方式）；`--task step` / `--task motion` 还要一个
+  stepper 的 `step_pin` / `dir_pin`；
 - `MCU` 省略或为空即裸 `[mcu]`；`[mcu zboard]` 要写 `zboard`；
-- `--task`（默认 `step`）选压什么：`step` 压步进生成，`comm` 压主机↔MCU 链路；
+- `--task`（默认 `step`）选做什么：`step` 压步进生成，`comm` 压主机↔MCU 链路，
+  `motion` 跑一遍完整运动链路的真板冒烟；
 - `--rate-step`（默认 `1.25`）是每段相对上一段的倍数，越小包围盒越紧、跑得越久；
 - `--stage-seconds`（默认 `0.5`）是每段持续多久。
 
-两个任务都是**升序 ramp + 遇错即停**，结果是一对包围盒（最后一个撑住的 / 第一个挂掉的）。
+`step` / `comm` 是**升序 ramp + 遇错即停**，结果是一对包围盒（最后一个撑住的 / 第一个挂掉的）；
+`motion` 是单次固定动作，通过即 `motion smoke OK`。
 
 ## 任务一：步进生成（`--task step`，默认）
 
@@ -72,7 +74,26 @@ klipperx stress [OPTIONS] <CONFIG_FILE> [MCU]
 
 即真值落在 **339 623 – 375 000 步/秒**之间（10.4% 的包围盒）；这块板大约 34 万步/秒就能稳定跑。
 
-## 任务二：命令往返（`--task comm`）
+## 任务二：运动链路冒烟（`--task motion`）
+
+把 FW5 的**主机运动链路**在真板上跑一遍：用与 `--task step` 相同的 step/dir 引脚配置一个
+stepper，然后
+
+```
+Trapq（一段匀速 5 mm 移动）
+  → itersolve（stepsolver）
+  → stepcompress（FW5f 完整压缩）
+  → queue_step 下发（分批 + flush）
+  → stepper_get_position 读回
+```
+
+把固件读回的步数与 `距离 / step_dist` 对比，相等则 `motion smoke OK`。它不写 `[printer]`
+也不需要三个轴，因此可以在只知道一个轴引脚的板子上验证压缩器；一次 5 mm/10 mm/s 的小移动。
+
+实测（STM32F103，`step_dist = 0.01`）：500 步被压成 **3 条命令**（1 条 `set_next_step_dir`
++ 2 条 `queue_step`），固件读回正好 `500 step(s)`。
+
+## 任务三：命令往返（`--task comm`）
 
 压的是**主机↔MCU 链路**，不是机器：不用配置固件（`get_clock` 是 `HF_IN_SHUTDOWN` 的基础命令），
 以 `--rate-step` 从 `COMM_START_RATE`（100 req/s）升到 `COMM_MAX_RATE`（200k req/s），每段按目标

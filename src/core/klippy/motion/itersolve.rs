@@ -12,7 +12,7 @@
 
 use crate::core::klippy::mathutil::Xyz;
 
-use super::stepcompress::StepCompressor;
+use super::stepcompress::{StepCompressError, StepCompressor};
 use super::trapq::{MoveSegment, Trapq};
 
 /// How far the solver may look ahead when re-seeking a step time, in seconds
@@ -132,11 +132,19 @@ impl StepKinematics {
     /// keeps a shaper fed before and after a stepper is active) is not
     /// implemented: cartesian needs neither, and they arrive with the input
     /// shaper (H6).
-    pub fn generate_steps(&mut self, trapq: &Trapq, sc: &mut StepCompressor, flush_time: f64) {
+    ///
+    /// # Errors
+    /// An internal [`StepCompressError`] from the compressor.
+    pub fn generate_steps(
+        &mut self,
+        trapq: &Trapq,
+        sc: &mut StepCompressor,
+        flush_time: f64,
+    ) -> Result<(), StepCompressError> {
         let last_flush_time = self.last_flush_time;
         self.last_flush_time = flush_time;
         if self.step_dist == 0.0 {
-            return;
+            return Ok(());
         }
         for segment in trapq.moves() {
             let move_end = segment.end_time();
@@ -146,22 +154,23 @@ impl StepKinematics {
             }
             if !self.is_active(segment) {
                 if segment.print_time >= flush_time {
-                    return;
+                    return Ok(());
                 }
                 continue;
             }
             let start = last_flush_time.max(segment.print_time);
             let end = flush_time.min(move_end);
             if start < end {
-                self.gen_steps_range(sc, segment, start, end);
+                self.gen_steps_range(sc, segment, start, end)?;
             }
             if move_end >= flush_time {
                 self.last_move_time = flush_time;
-                return;
+                return Ok(());
             }
             self.last_move_time = move_end;
         }
         self.last_move_time = flush_time;
+        Ok(())
     }
 
     /// Generate the steps inside one segment's `abs_start..abs_end`
@@ -176,7 +185,7 @@ impl StepKinematics {
         segment: &MoveSegment,
         abs_start: f64,
         abs_end: f64,
-    ) {
+    ) -> Result<(), StepCompressError> {
         let half_step = 0.5 * self.step_dist;
         let start = (abs_start - segment.print_time).max(0.0);
         let end = (abs_end - segment.print_time).min(segment.move_t);
@@ -254,13 +263,13 @@ impl StepKinematics {
                     if !is_dir_change && rel_dist >= -half_step {
                         // The stepper fully reaches the step position, so the
                         // step can no longer be rolled back.
-                        sc.commit();
+                        sc.commit()?;
                     }
                     continue;
                 }
             }
             // Found the next step.
-            sc.append(sdir, segment.print_time, guess.time);
+            sc.append(sdir, segment.print_time, guess.time)?;
             target = if sdir {
                 target + half_step + half_step
             } else {
@@ -281,6 +290,7 @@ impl StepKinematics {
             check_oscillate = false;
         }
         self.commanded_pos = target - if sdir { half_step } else { -half_step };
+        Ok(())
     }
 }
 
@@ -343,15 +353,15 @@ mod tests {
         }
     }
 
-    /// The intervals of the `queue_step` commands, in order.
-    fn intervals(commands: &[StepCommand]) -> Vec<u32> {
+    /// The total number of steps the commands describe.
+    fn total_steps(commands: &[StepCommand]) -> u32 {
         commands
             .iter()
             .filter_map(|command| match command {
-                StepCommand::QueueStep { interval, .. } => Some(*interval),
+                StepCommand::QueueStep { count, .. } => Some(*count),
                 StepCommand::SetNextStepDir { .. } => None,
             })
-            .collect()
+            .sum()
     }
 
     #[test]
@@ -385,22 +395,18 @@ mod tests {
         let mut sk = StepKinematics::new(1.0, cartesian_position_fn(Axis::X), AxisFlags::X);
         let segment = x_move(100.0, 100.0);
 
-        sk.gen_steps_range(&mut sc, &segment, 0.0, segment.move_t);
+        sk.gen_steps_range(&mut sc, &segment, 0.0, segment.move_t)
+            .unwrap();
+        // The compressor holds the steps in its queue until a flush.
+        sc.flush(u64::MAX).unwrap();
 
-        let intervals = intervals(&sc.take_commands());
-        // Steps at 0.5, 1.5, … 99.5 mm — 100 of them.
-        assert_eq!(intervals.len(), 100);
-        // The first gap is from the clock anchor; the rest are 10 ms apart.
+        // Steps at 0.5, 1.5, … 99.5 mm — 100 of them, compressed into a few
+        // `queue_step` commands.
+        let commands = sc.take_commands();
+        assert_eq!(total_steps(&commands), 100);
         assert!(
-            (i64::from(intervals[0]) - 5_000).abs() <= 1,
-            "{}",
-            intervals[0]
-        );
-        assert!(
-            intervals[1..]
-                .iter()
-                .all(|interval| (i64::from(*interval) - 10_000).abs() <= 1),
-            "{intervals:?}"
+            commands.len() <= 8,
+            "the full compressor should compress: {commands:?}"
         );
         // The solver ends having commanded the whole distance.
         assert!((sk.commanded_pos() - 100.0).abs() < 1e-6);
@@ -435,10 +441,11 @@ mod tests {
         let mut sc = StepCompressor::new(0, 1_000_000.0);
         let mut sk = StepKinematics::new(1.0, cartesian_position_fn(Axis::X), AxisFlags::X);
 
-        sk.generate_steps(&trapq, &mut sc, 0.2);
+        sk.generate_steps(&trapq, &mut sc, 0.2).unwrap();
+        sc.flush(u64::MAX).unwrap();
 
         // 20 mm of travel at 1 mm per step.
-        assert_eq!(intervals(&sc.take_commands()).len(), 20);
+        assert_eq!(total_steps(&sc.take_commands()), 20);
     }
 
     #[test]

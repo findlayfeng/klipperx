@@ -38,10 +38,9 @@
 //!
 //! # Flushing
 //!
-//! The step solver is the **simplified** one from FW5c: one `queue_step` per
-//! step. A print will overflow the firmware's move queue, which is why
-//! [`warn_and_wait`](crate::core::klippy::motion::stepcompress::warn_and_wait)
-//! announces it before motion. The full compressor is FW5f.
+//! The step solver is the **full** compressor from FW5f: runs of steps are
+//! compressed into `queue_step` commands (`interval`, `count`, `add`), so a
+//! print does not overflow the firmware's move queue.
 //!
 //! Steps are generated and sent by a task spawned at connect: it wakes every
 //! [`FLUSH_INTERVAL`], generates everything the planner has queued, and awaits
@@ -50,7 +49,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -71,7 +70,7 @@ use crate::core::klippy::mathutil::{Coord, X_AXIS, Y_AXIS, Z_AXIS};
 use crate::core::klippy::mcu::{Mcu, McuStepper};
 use crate::core::klippy::motion::kinematics::CartesianKinematics;
 use crate::core::klippy::motion::plan::MoveLimits;
-use crate::core::klippy::motion::stepcompress::{warn_and_wait, GracePolicy, StepCommand};
+use crate::core::klippy::motion::stepcompress::{StepCommand, StepCompressError};
 use crate::core::klippy::motion::toolhead::ToolHead;
 use crate::core::klippy::printer::{ConnectFuture, Printer, PrinterObject};
 use crate::core::klippy::reactor::Reactor;
@@ -108,8 +107,9 @@ pub struct ToolHeadObject {
     axes: [Arc<PrinterStepper>; 3],
     /// The machine's clock, for seeding the print-time mapping.
     reactor: Arc<dyn Reactor>,
-    /// The simplified-compressor announcement policy.
-    policy: GracePolicy,
+    /// The machine, to shut it down if the compressor hits an internal error.
+    /// `Weak` because the printer's registry owns this object.
+    printer: Weak<Printer>,
     /// The connected motion state; `None` until connect.
     state: Arc<Mutex<Option<Connected>>>,
     /// Set when the object is dropped, to stop the flush task.
@@ -123,6 +123,9 @@ struct Connected {
     /// The print time the solvers have generated up to.
     last_step_gen_time: f64,
 }
+
+/// The step commands to send, paired with the stepper that produced them.
+type StepBatches = Vec<(Arc<McuStepper>, Vec<StepCommand>)>;
 
 impl ToolHeadObject {
     /// Build the object from `[printer]` and the three stepper sections.
@@ -202,7 +205,7 @@ impl ToolHeadObject {
             max_z_accel,
             axes,
             reactor: printer.reactor(),
-            policy: GracePolicy::DEFAULT,
+            printer: Arc::downgrade(printer),
             state,
             shutdown: Arc::new(AtomicBool::new(false)),
         };
@@ -340,10 +343,6 @@ impl PrinterObject for ToolHeadObject {
             seed_clock(&clock, &mcu, self.reactor.monotonic()).await;
             toolhead.set_estimated_print_time(clock.estimated_print_time(self.reactor.monotonic()));
 
-            // The simplified compressor must announce itself before it produces
-            // the first step (FW5c).
-            warn_and_wait(self.policy).await;
-
             *self.lock() = Some(Connected {
                 toolhead,
                 mcu_steppers,
@@ -355,6 +354,7 @@ impl PrinterObject for ToolHeadObject {
             tokio::spawn(run_flush_loop(
                 Arc::clone(&self.state),
                 Arc::clone(&self.shutdown),
+                self.printer.clone(),
             ));
             Ok(())
         })
@@ -392,7 +392,11 @@ async fn seed_clock(clock: &McuClock, mcu: &Mcu, sent_time: f64) {
 }
 
 /// The flush task: generate the queued steps and await the transport.
-async fn run_flush_loop(state: Arc<Mutex<Option<Connected>>>, shutdown: Arc<AtomicBool>) {
+async fn run_flush_loop(
+    state: Arc<Mutex<Option<Connected>>>,
+    shutdown: Arc<AtomicBool>,
+    printer: Weak<Printer>,
+) {
     loop {
         sleep(FLUSH_INTERVAL).await;
         if shutdown.load(Ordering::SeqCst) {
@@ -404,7 +408,20 @@ async fn run_flush_loop(state: Arc<Mutex<Option<Connected>>>, shutdown: Arc<Atom
             let mut guard = state.lock().unwrap_or_else(|poison| poison.into_inner());
             match guard.as_mut() {
                 Some(connected) => connected.generate(),
-                None => Vec::new(),
+                None => Ok(Vec::new()),
+            }
+        };
+        let batches = match batches {
+            Ok(batches) => batches,
+            // `check_line` failed, which upstream treats as an internal error
+            // and shuts the printer down for (`Internal error in stepcompress`).
+            Err(err) => {
+                if let Some(printer) = printer.upgrade() {
+                    printer.invoke_shutdown(&format!("Internal error in stepcompress: {err}"));
+                } else {
+                    warn!("Internal error in stepcompress: {err}");
+                }
+                return;
             }
         };
         for (stepper, commands) in batches {
@@ -420,22 +437,28 @@ async fn run_flush_loop(state: Arc<Mutex<Option<Connected>>>, shutdown: Arc<Atom
 
 impl Connected {
     /// Generate the steps for everything queued, and return them by stepper.
-    fn generate(&mut self) -> Vec<(Arc<McuStepper>, Vec<StepCommand>)> {
+    ///
+    /// # Errors
+    /// An internal [`StepCompressError`] from a stepper's compressor.
+    fn generate(&mut self) -> Result<StepBatches, StepCompressError> {
+        // Move whatever the planner has queued into the trapq first, so the
+        // step generation time below covers it.
+        self.toolhead.wait_moves();
         let step_gen_time = self.toolhead.print_time().max(self.last_step_gen_time);
-        let batches = self.toolhead.flush_step_generation(step_gen_time);
+        let batches = self.toolhead.flush_step_generation(step_gen_time)?;
         self.toolhead.finalize_moves(
             step_gen_time,
             (step_gen_time - MOVE_HISTORY_EXPIRE).max(0.0),
         );
         self.last_step_gen_time = step_gen_time;
-        batches
+        Ok(batches
             .into_iter()
             .filter_map(|(name, commands)| {
                 self.mcu_steppers
                     .get(&name)
                     .map(|stepper| (Arc::clone(stepper), commands))
             })
-            .collect()
+            .collect())
     }
 }
 

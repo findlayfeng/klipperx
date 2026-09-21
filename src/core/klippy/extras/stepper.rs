@@ -290,13 +290,15 @@ impl PrinterObject for PrinterStepper {
                 .await
                 .map_err(|err| config_error(err.to_string()))?;
             stepper.kinematics_mut().commanded_pos = f64::from(steps) * self.step_dist;
-            // Anchor the compressor at the clock the count was read at, so the
-            // first queued step is relative to the board's now rather than to
-            // print time zero.
+            // Anchor the compressor on the board's own clock domain: the print
+            // time this host uses is absolute board time (`estimated_print_time`
+            // is `clock / mcu_freq`), so print-time zero is clock zero.
+            stepper.compressor_mut().set_time(0.0, freq);
             if let Some(clock) = mcu.estimated_clock() {
-                let clock = clock as i64;
-                stepper.compressor_mut().set_time(clock as f64 / freq, freq);
-                stepper.compressor_mut().set_last_position(clock);
+                stepper
+                    .compressor_mut()
+                    .set_last_position(clock, i64::from(steps))
+                    .map_err(|err| config_error(err.to_string()))?;
             }
 
             *self.lock() = Some(stepper);

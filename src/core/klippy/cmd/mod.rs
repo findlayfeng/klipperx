@@ -69,6 +69,7 @@ pub mod i2c;
 pub mod identify;
 pub mod pwm;
 pub mod shutdown;
+pub mod spi;
 pub mod stepper;
 pub mod uptime;
 
@@ -80,6 +81,10 @@ pub use i2c::{
     I2cTransfer, I2cWrite,
 };
 pub use pwm::{ConfigPwmOut, QueuePwmOut};
+pub use spi::{
+    ConfigSpi, ConfigSpiShutdown, ConfigSpiWithoutCs, SpiSend, SpiSetBus, SpiSetSwBus, SpiTransfer,
+    SpiTransferResponse,
+};
 pub use stepper::{
     ConfigStepper, QueueStep, ResetStepClock, SetNextStepDir, StepperGetPosition, StepperPosition,
 };

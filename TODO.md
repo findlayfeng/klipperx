@@ -238,15 +238,27 @@ toolhead / 开放事件）一起补，一部分是现在就独立可补的小行
 
 上游 `MCU_SPI`（`klippy/extras/bus.py:42-155`）：
 
-- [ ] 设备侧：`config_spi oid=%c pin=%u cs_active_high=%c`（或 `config_spi_without_cs`），
+- [x] 设备侧：`config_spi oid=%c pin=%u cs_active_high=%c`（或 `config_spi_without_cs`），
       总线侧：`spi_set_bus oid=%c spi_bus=%u mode=%u rate=%u`，收发：
       `spi_send oid=%c data=%*s`、`spi_transfer oid=%c data=%*s` /
       `spi_transfer_response oid=%c response=%*s`；还有 `config_spi_shutdown`
       （固件 `src/spicmds.c:37` `:62` `:122` `:157`）。
-- [ ] 软件 SPI（`spi_software_{miso,mosi,sclk}_pin`）：`spi_set_sw_bus`（新）/ 
-      `spi_set_software_bus`（旧），固件 `src/spi_software.c`。
-- [ ] `MCU_SPI_from_config`（`bus.py:124`）：从 section 读 `cs_pin` / `spi_speed` /
+- [x] 软件 SPI（`spi_software_{miso,mosi,sclk}_pin`）：`spi_set_sw_bus`（新），固件
+      `src/spi_software.c`。
+- [x] `MCU_SPI_from_config`（`bus.py:124`）：从 section 读 `cs_pin` / `spi_speed` /
       `spi_bus` / 软件引脚，`cs_pin=None` 时不占用引脚的共享。
+- [ ] 旧式 `spi_set_software_bus`（rate 版）未处理（vendored 固件只有新式）。
+- [ ] `spi_transfer_with_preface` 与 `setup_shutdown_msg`：`ConfigSpiShutdown` 命令
+      已定义，但资源/消费者未接（设备需要在 shutdown 时发消息时才用得上）。
+
+已落地：`cmd/spi.rs`（命令层，`%*s` 走二进制 `ArgType::Bytes`）、
+`mcu/resource/spi.rs`（`McuSpi` 资源 + `SpiMode`，片选由固件驱动）、
+`extras/spi_device.rs`（`[spi_device <name>]` 构造器 + `SPI_TRANSFER` / `SPI_SEND`
+调试命令；与 `[i2c_device]` 共用 `extras/bus_debug.rs` 的 hex/异步桥）。
+
+真机验证（STM32F103 + W25 flash，CS=PA15，SPI1 重映射 PB3/PB4/PB5）：硬件 `spi1a`
+与软件 bit-bang 两条路都读出 JEDEC ID `ef 30 13`、状态寄存器 `0x00` 与地址 0x00 的
+数据。
 
 #### F7 I2C 总线
 
@@ -546,6 +558,9 @@ ack」settle，并用 `Mcu::took_over_session()` 让 `rpi_usb` 判断“有没�
 
 细节在各模块文档里；这里每条只留一行索引，最近完成的在前。
 
+- **SPI 总线（F6）**：`cmd/spi.rs`、`mcu/resource/spi.rs` 的 `McuSpi`（硬件/软件两条
+      路，固件驱动 CS）、`extras/spi_device.rs`（`[spi_device]` 构造器 + `SPI_TRANSFER` /
+      `SPI_SEND` 调试命令）；与 `[i2c_device]` 共用 `extras/bus_debug.rs`。
 - **I2C 总线（F7）**：`cmd/i2c.rs`、`mcu/resource/i2c.rs` 的 `McuI2c`（硬件/软件两条
       路，旧式 `i2c_transfer` / 新式 `i2c_read`）、`Mcu::try_lookup_command` 与
       `PrinterPins::resolve_bus_value`；消费者 `extras/i2c_device.rs` 与 `IIC_WRITE` /

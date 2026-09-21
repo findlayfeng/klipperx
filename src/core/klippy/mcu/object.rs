@@ -39,9 +39,10 @@ use crate::core::klippy::error::KlippyError;
 use crate::core::klippy::event::stats::register_stats_logging;
 use crate::core::klippy::event::{IsShutdown, McuEvent, Shutdown, Starting};
 use crate::core::klippy::mcu::{
-    ConfigBuilder, Dictionary, I2cMode, Mcu, McuChip, McuError, McuI2c, McuRestartMethod,
+    ConfigBuilder, Dictionary, I2cMode, Mcu, McuChip, McuError, McuI2c, McuRestartMethod, McuSpi,
+    SpiMode,
 };
-use crate::core::klippy::pins::{PinError, PrinterPins, PINS_OBJECT};
+use crate::core::klippy::pins::{PinError, PinParams, PrinterPins, PINS_OBJECT};
 use crate::core::klippy::printer::{ConnectFuture, Printer, PrinterObject, RestartFuture};
 
 /// How long to wait between attempts to reopen a board that was just told to
@@ -139,6 +140,20 @@ impl McuObject {
     /// (`klippy/extras/bus.py:161`).
     pub fn setup_i2c(&self, mode: I2cMode, address: u8) -> Arc<McuI2c> {
         self.chip.setup_i2c(mode, address)
+    }
+
+    /// Build an SPI device on this MCU.
+    ///
+    /// The SPI counterpart of [`McuObject::setup_i2c`]: a section that owns an
+    /// SPI device asks its MCU for it. Upstream's `MCU_SPI`
+    /// (`klippy/extras/bus.py:42`).
+    pub fn setup_spi(
+        &self,
+        mode: SpiMode,
+        cs_pin: Option<PinParams>,
+        cs_active_high: bool,
+    ) -> Arc<McuSpi> {
+        self.chip.setup_spi(mode, cs_pin, cs_active_high)
     }
 
     /// Snapshot a connected MCU's identify status for `objects/query`.

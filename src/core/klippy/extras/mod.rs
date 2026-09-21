@@ -7,5 +7,7 @@
 //! imports them.
 
 pub mod board_pins;
+pub(crate) mod bus_debug;
 pub mod i2c_device;
 pub mod output_pin;
+pub mod spi_device;

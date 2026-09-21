@@ -32,7 +32,9 @@ pub use config::{BuiltConfig, ConfigBuilder, ConfigCallback, Configured, PostIni
 pub use dictionary::{Dictionary, Enumeration, MessageDef, OutputDef};
 pub use error::{McuCallError, McuError};
 pub use object::{load_config, load_config_prefix, McuObject};
-pub use resource::{I2cMode, McuAdc, McuChip, McuDigitalOut, McuI2c, McuPwm, DEFAULT_SPEED};
+pub use resource::{
+    I2cMode, McuAdc, McuChip, McuDigitalOut, McuI2c, McuPwm, McuSpi, SpiMode, DEFAULT_SPEED,
+};
 pub use restart_method::McuRestartMethod;
 
 use crate::core::klippy::load::section;

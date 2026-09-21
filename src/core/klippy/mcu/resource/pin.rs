@@ -25,6 +25,7 @@ use super::adc::{AdcRegistry, McuAdc};
 use super::i2c::{I2cMode, McuI2c};
 use super::pwm::McuPwm;
 use super::spi::{McuSpi, SpiMode};
+use super::stepper::McuStepper;
 use crate::core::klippy::cmd::gpio::{ConfigDigitalOut, QueueDigitalOut, UpdateDigitalOut};
 use crate::core::klippy::cmd::McuCommand;
 use crate::core::klippy::mcu::{ConfigBuilder, Mcu, McuError};
@@ -188,6 +189,30 @@ impl McuChip {
             mode,
             cs_pin,
             cs_active_high,
+        ))
+    }
+
+    /// Build a stepper on this MCU.
+    ///
+    /// Upstream's `MCU_stepper` (`klippy/stepper.py:22`): it owns the oid and
+    /// the step/dir pins, adds `config_stepper` from its own config callback,
+    /// and carries the runtime `queue_step` sends.
+    pub fn setup_stepper(
+        &self,
+        step_pin: PinParams,
+        dir_pin: PinParams,
+        invert_step: i8,
+        step_pulse_ticks: u32,
+    ) -> Arc<McuStepper> {
+        Arc::new(McuStepper::new(
+            Arc::clone(&self.config),
+            self.pins(),
+            self.name.clone(),
+            Arc::clone(&self.mcu),
+            step_pin,
+            dir_pin,
+            invert_step,
+            step_pulse_ticks,
         ))
     }
 

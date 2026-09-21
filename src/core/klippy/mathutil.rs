@@ -122,6 +122,66 @@ impl From<Coord> for [f64; AXES] {
     }
 }
 
+/// A three-axis position `(x, y, z)`.
+///
+/// Upstream's `struct coord` (`chelper/trapq.h:5-12`) has exactly these three:
+/// the extruder runs its own trapq, so the fourth axis never appears in the
+/// motion queue or in a stepper's position solver. [`Coord`] is the four-axis
+/// type the toolhead and G-code speak in.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Xyz(pub [f64; 3]);
+
+impl Xyz {
+    /// A position from its three axes.
+    pub const fn new(x: f64, y: f64, z: f64) -> Self {
+        Self([x, y, z])
+    }
+
+    /// The X axis.
+    pub const fn x(&self) -> f64 {
+        self.0[0]
+    }
+
+    /// The Y axis.
+    pub const fn y(&self) -> f64 {
+        self.0[1]
+    }
+
+    /// The Z axis.
+    pub const fn z(&self) -> f64 {
+        self.0[2]
+    }
+
+    /// The three axes as an array.
+    pub const fn as_array(&self) -> &[f64; 3] {
+        &self.0
+    }
+}
+
+impl From<[f64; 3]> for Xyz {
+    fn from(axes: [f64; 3]) -> Self {
+        Self(axes)
+    }
+}
+
+impl From<Xyz> for [f64; 3] {
+    fn from(xyz: Xyz) -> Self {
+        xyz.0
+    }
+}
+
+impl From<Coord> for Xyz {
+    fn from(coord: Coord) -> Self {
+        Self([coord.x(), coord.y(), coord.z()])
+    }
+}
+
+impl From<Xyz> for Coord {
+    fn from(xyz: Xyz) -> Self {
+        Coord::new(xyz.x(), xyz.y(), xyz.z(), 0.0)
+    }
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -172,5 +232,22 @@ mod tests {
         coord.set_axis(Z_AXIS, 9.0);
 
         assert_eq!(coord, Coord::new(1.0, 2.0, 9.0, 4.0));
+    }
+
+    #[test]
+    fn test_xyz_converts_to_and_from_coord() {
+        let xyz = Xyz::new(1.0, 2.0, 3.0);
+
+        assert_eq!(xyz.x(), 1.0);
+        assert_eq!(xyz.y(), 2.0);
+        assert_eq!(xyz.z(), 3.0);
+        assert_eq!(xyz.as_array(), &[1.0, 2.0, 3.0]);
+
+        // A four-axis position built from one has a zero extruder axis.
+        let coord: Coord = xyz.into();
+        assert_eq!(coord, Coord::new(1.0, 2.0, 3.0, 0.0));
+        // And the fourth axis is dropped going back.
+        let back: Xyz = Coord::new(1.0, 2.0, 3.0, 9.0).into();
+        assert_eq!(back, xyz);
     }
 }

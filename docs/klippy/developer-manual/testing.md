@@ -26,6 +26,23 @@ cargo test -p klipperx --lib test_install_skips  # 单个用例（按名过滤�
 
 > **注意 `--workspace`**：这是 workspace，而 `cargo test` 在非虚拟 workspace 里只跑**根包**（也就是主机）。`--lib` 后面那些过滤词同理只作用于被选中的包。想覆盖 klippy-api / klippy-client，要么 `--workspace`，要么 `-p <包名>`。
 
+## 真机测试
+
+少数用例需要真实硬件，目前只有 `mcu/mod.rs` 中的 `test_frame_sequence_sync_against_a_real_board`。此类用例遵循两条约定：
+
+1. **默认不执行。** 用例以 `#[ignore]` 标注；设备地址由环境变量给出（该用例为 `KLIPPERX_HW_SERIAL`），不写入仓库中的任何配置文件，也不假定某台机器的固定设备路径。因此 `cargo test` 与 `cargo test --workspace` 在没有硬件的机器上必须全部通过，且不得打开串口或 USB 设备。
+2. **被显式请求时不得静默通过。** 以 `--ignored` 单独请求真机用例而未提供环境变量时，用例必须失败，并在消息中指出缺少的变量。Rust 测试框架没有在运行期将用例标记为 ignored 的接口，测试体开头的提前返回会被记为通过，因此这种情况只能按失败处理。
+
+运行方式：
+
+```bash
+KLIPPERX_HW_SERIAL=/dev/ttyACM1 \
+  cargo test -p klipperx --lib test_frame_sequence_sync_against_a_real_board \
+  -- --ignored --nocapture
+```
+
+以 `--ignored` 运行时若未设置 `KLIPPERX_HW_SERIAL`，用例失败并打印所需变量；普通的 `cargo test` 不执行该用例。
+
 ## 格式化与提交
 
 提交前代码要过 `cargo fmt --all`。仓库自带的 pre-commit 钩子会替你做这件事：它先格式化，再把已暂存的 `.rs` 重新入索引，最后用 `cargo fmt --all -- --check` 兜底；实在格式不了（语法错误之类）就中止提交。
@@ -56,7 +73,7 @@ git config core.hooksPath .githooks
 |------|------|
 | `pending.rs` | 注册/配对/取消、未知名字不消费、先到先得、接收端已关闭、只取消一条 |
 | `dictionary.rs` | 三张消息表的解析（含 `output` 原样保留）、枚举单值与区间展开、常量、各类畸形输入、`install` 的跳过语义与不注册 `output` |
-| `mod.rs` | 构造后未识别（`new` 只注册 identify 一对）、发送错误路径、`Drop` 中止接收任务并释放阻塞读；序号（假设备）：**接管一块还在跑的板子**（首帧是 NAK 号 → 采纳、换号重发同一请求、调用成功、`took_over_session()` 为真、记录器显示发的是 `[0, 9]`）、刚开机的固件不接管也不重发、首帧之后的越号帧被丢且不扰动本次交换 |
+| `mod.rs` | 构造后未识别（`new` 只注册 identify 一对）、发送错误路径、`Drop` 中止接收任务并释放阻塞读；序号（假设备）：**接管一块还在跑的板子**（首帧是 NAK 号 → 采纳、换号重发同一请求、调用成功、`took_over_session()` 为真、记录器显示发的是 `[0, 9]`）、刚开机的固件不接管也不重发、首帧之后的越号帧被丢且不扰动本次交换。另有**要真硬件的**一例（`test_frame_sequence_sync_against_a_real_board`，`#[ignore]` + `KLIPPERX_HW_SERIAL`）：对同一块不停机的板子连两次，第一次完成 identify 并跨过 4 位回绕，第二次必须报告接管、采纳固件当前的号并继续 `get_clock` |
 | `object.rs` | `McuObject`：主/前缀 section 的名字（`[mcu]` → `mcu`，`[mcu zboard]` → `zboard`）、配置构建器在建对象时就可用（可在 connect 前领 oid）、未连接时报 `{}`、连接后报 identify 快照（`mcu_version` / `mcu_build_versions` / `mcu_constants`）、section 没有可用接口时 `connect` 报错、两个对象不能用同一个 chip 名；**固件停机**：收到 `shutdown` 帧后打印机进 shutdown 且状态消息带原因；**`rpi_usb` 没法复位固件时**（`usb_reset_unusable`：hub 报不支持端口供电切换、开关本身失败、固件还在旧会话里、握手后它仍带着配置）把这个 MCU 的 `restart_method` 记成 `command`（内存里，`Printer::override_config`），第一种在真正去切电之前就发生 |
 | `config.rs` | CRC 标准校验值；oid 从 0 单调发号、走完 `MAX_OIDS` 报错不回绕、定稿后不能再领；`build`：空配置只有 `allocate_oids` + `finalize_config`、`allocate_oids` 带最终计数、命令按加入顺序、CRC 确定且对值与 oid 数敏感、`restart`/`init` 不入 CRC、config 回调在 build 时跑且可继续领 oid/加命令、二次 `build` 报错且不重跑回调、定稿后再加命令/回调/队列槽被拒、未 identify 报 `NotIdentified`、移动队列槽计数；`seconds_to_clock` 用 `CLOCK_FREQ`；`configure`：未配置时把整份配置加 `get_config` 一帧发出并确认、停机或 CRC 不一致时先 `config_reset`（运行中的固件先 `emergency_stop`）再配置、无 `config_reset` 时分别报停机 / CRC 两种配置错误；`Configured` 三个字段：`crc` / `move_count` / `reused`，加 `already_running`（首个 `get_config` 就报已配置或已停机 = 板子没重启） |
 | `restart.rs` | 空实现（`command`）与一条不是 USB tty 的串口路径各自的路由与报错；启动探测 `check_usb_power` 只对“串口 + `rpi_usb`”给结论，别的组合一律 `None`（不夺走调用方的 `rpi_usb`）。**要真硬件的没测**：端口开关、`wait_for_new_device` 的重枚举判定、hub 端口的供电能力（`usb::port_power`）都在真机上手工验过 |

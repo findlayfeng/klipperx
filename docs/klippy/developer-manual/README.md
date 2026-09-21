@@ -276,6 +276,7 @@ API 本身在 `crates/klippy-api/src/`：
 - [MCU 配置构建（ConfigBuilder）](mcu-config.md) — 配置期的 oid、三张命令表、设备侧的配置与 CRC 校验（含与上游的差异）、两段式下发
 - [Identify 机制](identify.md) — 主机与 MCU 间的数据字典协商流程
 - [时钟与定时器（reactor）](reactor.md) — 机器的时钟、定时器契约，以及与上游 reactor/greenlet 的对应
+- [事件系统](event-system.md) — 打印机级事件总线：事件清单、触发时序、编译期代码生成与处理器约定
 - [运行时编排（机器与 API）](runtime.md) — 两个 runtime：机器专用、API 一个，以及边界约定与停机顺序
 - [延迟与抖动（主机侧）](latency.md) — 抖动从哪来，以及要不要绑核（结论：先度量，不急）
 - [压力测试（`klipperx stress`）](stress.md) — 给一块 MCU 逐步加大步进或链路负载，直到它出错

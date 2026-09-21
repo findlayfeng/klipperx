@@ -5,6 +5,7 @@
 //! kinematics — which positions are legal, how to home — is FW5e; this is the
 //! skeleton a `G1` drives.
 
+use super::kinematics::{Kinematics, MoveContext};
 use super::plan::{LookAheadQueue, Move, MoveLimits};
 use super::queuing::MotionQueuing;
 use super::stepcompress::StepCommand;
@@ -27,6 +28,7 @@ pub struct ToolHead {
     estimated_print_time: f64,
     special_queuing_state: bool,
     motion_queuing: MotionQueuing,
+    kinematics: Option<Box<dyn Kinematics>>,
 }
 
 impl ToolHead {
@@ -42,12 +44,18 @@ impl ToolHead {
             // first planned move (`klippy/toolhead.py:224`).
             special_queuing_state: true,
             motion_queuing: MotionQueuing::new(mcu_freq),
+            kinematics: None,
         }
     }
 
     /// Add a stepper to drive.
     pub fn add_stepper(&mut self, stepper: Stepper) {
         self.motion_queuing.add_stepper(stepper);
+    }
+
+    /// Install the kinematics (upstream loads it from `[printer] kinematics`).
+    pub fn set_kinematics(&mut self, kinematics: Box<dyn Kinematics>) {
+        self.kinematics = Some(kinematics);
     }
 
     /// Where the toolhead has been commanded to.
@@ -82,9 +90,15 @@ impl ToolHead {
     /// A zero-length move is ignored; the kinematics' own `check_move`
     /// (bounds, per-axis speed limits) is FW5e.
     pub fn move_to(&mut self, newpos: Coord, speed: f64) -> Result<(), CommandError> {
-        let move_ = Move::new(self.commanded_pos, newpos, speed, &self.limits);
+        let mut move_ = Move::new(self.commanded_pos, newpos, speed, &self.limits);
         if move_.move_d == 0.0 {
             return Ok(());
+        }
+        if move_.is_kinematic_move {
+            if let Some(kinematics) = &self.kinematics {
+                let mut ctx = MoveContext::new(&mut move_);
+                kinematics.check_move(&mut ctx)?;
+            }
         }
         self.commanded_pos = move_.end_pos;
         let want_flush = self.lookahead.add_move(move_);
@@ -237,6 +251,26 @@ mod tests {
         toolhead.dwell(0.5);
 
         assert!((toolhead.print_time() - (before + 0.5)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_an_unhomed_axis_refuses_a_move() {
+        use crate::core::klippy::motion::kinematics::CartesianKinematics;
+
+        let mut toolhead = toolhead();
+        toolhead.set_kinematics(Box::new(CartesianKinematics::new(
+            ["stepper_x".into(), "stepper_y".into(), "stepper_z".into()],
+            Coord::new(0.0, 0.0, 0.0, 0.0),
+            Coord::new(200.0, 200.0, 200.0, 0.0),
+            15.0,
+            100.0,
+        )));
+
+        let err = toolhead
+            .move_to(Coord::new(10.0, 0.0, 0.0, 0.0), 100.0)
+            .unwrap_err();
+
+        assert!(err.to_string().contains("Must home axis first"), "{err}");
     }
 
     #[test]

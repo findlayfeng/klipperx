@@ -3,9 +3,9 @@
 本文描述打印机级事件总线的形状：事件如何被声明、注册与分发，以及与上游
 `klippy/klippy.py` 中 `Printer.send_event` / `register_event_handler` 的对应关系。
 
-> **状态**：未实现。当前 `printer.rs` 中的 `PrinterEvent` 是封闭枚举，只有 5 个变体，
-> 处理器签名为 `Fn()`，无法表达上游的 37 个事件名，也无法携带 `klippy:notify_mcu_error`
-> 与 `klippy:analyze_shutdown` 所需的参数。本文给出目标形状与实现方案。
+> **状态**：已实现。事件词汇为 `KlippyEvent`（`event/printer_bus.rs`），由 `build.rs`
+> 从 `event/decl/` 下的声明生成；`Printer` 按事件名注册与分发，未知事件记录警告，
+> 处理器 panic 相互隔离。原先的封闭枚举 `PrinterEvent` 已删除，调用点全部迁移。
 
 ## 1. 上游事件系统
 
@@ -32,7 +32,7 @@ class Printer:
 
 ### 1.2 事件清单
 
-上游共有 37 个事件，按命名空间分为四组。
+上游共有 35 个事件，按命名空间分组如下。
 
 | 命名空间 | 数量 | 事件名 | 载荷 |
 |----------|------|--------|------|
@@ -106,35 +106,28 @@ def invoke_shutdown(self, msg, details={}):
                 logging.exception("Exception in analyze_shutdown handler")
 ```
 
-## 2. 当前实现与缺口
+## 2. 当前实现
 
 ### 2.1 已实现
 
-`printer.rs` 中的 `PrinterEvent` 覆盖 5 个生命周期事件：
+`KlippyEvent` 声明了上游全部 35 个事件名，由 `build.rs` 从 `event/decl/` 下的声明
+生成（见 §3）。事件声明已覆盖 `klippy:`、`idle_timeout:`、`homing:`、`stepper:`、
+`toolhead:`、`gcode:`、`probe:`、`extruder:`、`stepper_enable:`、`virtual_sdcard:`、
+`load_cell:`、`menu:` 与 `dual_carriage:`。
 
-```rust
-pub enum PrinterEvent {
-    Connect,          // klippy:connect
-    Ready,            // klippy:ready
-    Shutdown,         // klippy:shutdown
-    Disconnect,       // klippy:disconnect
-    FirmwareRestart,  // klippy:firmware_restart
-}
-```
-
-处理器保存在 `HashMap<PrinterEvent, Vec<Arc<dyn Fn() + Send + Sync>>>` 中，
-`register_event_handler` 追加，`send_event` 在锁外按注册顺序逐个调用。
+`Printer` 的处理器按事件名索引，注册与分发接口为 `register_event_handler` /
+`send_event`，与上游同名。生命周期事件 `klippy:mcu_identify`、`klippy:connect`、
+`klippy:ready`、`klippy:shutdown`、`klippy:analyze_shutdown`、`klippy:firmware_restart`
+与 `klippy:disconnect` 已在实际时序上触发（见 §4）。
 
 MCU 侧另有独立的 `event` 模块，以 `McuEvent` trait 表达固件主动推送的消息
-（`shutdown` / `is_shutdown` / `starting`、`stats`）。该层与本文描述的打印机级事件总线
-是两套机制：前者由固件推送、经 `Mcu::bind_event` 绑定；后者由主机内部触发。
+（`shutdown` / `is_shutdown` / `starting`、`stats`）。该层与打印机级事件总线是两套
+机制：前者由固件推送、经 `Mcu::bind_event` 绑定；后者由主机内部触发。
 
-### 2.2 缺口
+### 2.2 覆盖范围
 
-1. 缺少 `klippy:mcu_identify`、`klippy:notify_mcu_error`、`klippy:analyze_shutdown`。
-2. 缺少其余命名空间下的 29 个事件。
-3. `PrinterEvent` 是封闭枚举，处理器签名为 `Fn()`，无法携带载荷，也无法表达命名空间化的
-   事件名。
+`klippy:notify_mcu_error` 已声明，但触发点尚未接入 MCU 错误路径，因此暂不会发出。
+其余命名空间的事件在各自模块就位后触发；事件名与变体已经就绪，处理器可先注册。
 
 ## 3. 设计
 
@@ -152,12 +145,12 @@ MCU 侧另有独立的 `event` 模块，以 `McuEvent` trait 表达固件主动�
 | 新增事件 | 需改声明 | 无需改动 |
 | 分发开销 | 按名查表，等价 | 按名查表 |
 
-事件总数为 37，属于封闭且可预期的集合，因此选用大枚举方案：以枚举承载类型信息，
+事件总数为 35，属于封闭且可预期的集合，因此选用大枚举方案：以枚举承载类型信息，
 以 `Unknown` 变体承接未在枚举中声明的事件名，避免因上游新增事件而丢失分发。
 
 ### 3.2 枚举定义
 
-枚举由声明文件在编译期生成。目标形状如下：
+枚举由声明文件在编译期生成，变体按事件名排序。形状如下：
 
 ```rust
 /// 打印机级事件。
@@ -199,7 +192,7 @@ pub enum KlippyEvent {
 
     // gcode:
     GcodeCommandError,
-    GcodeDebugInputExit,
+    GcodeDebuginputExit,
     GcodeRequestRestart,
 
     // probe:
@@ -277,9 +270,10 @@ type EventHandler = Arc<dyn Fn(&KlippyEvent) + Send + Sync>;
 ```
 build.rs                                  # 位于 crate 根
 src/core/klippy/event/
-├── mod.rs                                # 既有 MCU 事件层；转出 printer_bus
+├── mod.rs                                # 既有 MCU 事件层；声明 decl 与 printer_bus
 ├── printer_bus.rs                        # 打印机级事件总线，include! 生成文件
-└── decl/                                 # 声明文件，被 build.rs 扫描
+└── decl/
+    ├── mod.rs                            # 定义空展开的 event! 宏；列出声明模块
     ├── klippy.rs
     ├── idle_timeout.rs
     ├── homing.rs
@@ -303,7 +297,8 @@ include!(concat!(env!("OUT_DIR"), "/klippy_events.rs"));
 ```
 
 声明文件是正常编译的模块，其中 `event!` 是展开为空的声明宏；`build.rs` 读取其源码文本，
-解析每个 `event!` 调用。
+解析每个 `event!` 调用。宏定义在 `decl/mod.rs` 中且位于各声明模块之前，因此子模块
+无需 `use` 即可使用。
 
 #### 声明语法
 
@@ -348,18 +343,25 @@ event!("homing:home_rails_end");
 处理器按事件名索引，`Unknown` 也走同一张表：
 
 ```rust
+/// 已注册的事件处理器。
+type EventHandler = Arc<dyn Fn(&KlippyEvent) + Send + Sync>;
+
 struct Inner {
     // ...
     handlers: HashMap<String, Vec<EventHandler>>,
 }
 
 impl Printer {
-    pub fn register_event_handler(&self, event: KlippyEvent, handler: EventHandler) {
+    pub fn register_event_handler(
+        &self,
+        event: KlippyEvent,
+        handler: Box<dyn Fn(&KlippyEvent) + Send + Sync>,
+    ) {
         self.lock()
             .handlers
             .entry(event.name().to_string())
             .or_default()
-            .push(handler);
+            .push(Arc::from(handler));
     }
 
     pub fn send_event(&self, event: &KlippyEvent) {
@@ -393,27 +395,12 @@ impl Printer {
 `UnwindSafe`；处理器之间通过共享状态 `&self` 互相影响的可能性由调用约定约束，不由类型
 系统约束，与既有 `reactor` 回调的约定一致。
 
-### 3.6 向后兼容
+### 3.6 与既有枚举的关系
 
-现有 `PrinterEvent` 保留，作为子集并提供到 `KlippyEvent` 的转换：
-
-```rust
-impl From<PrinterEvent> for KlippyEvent {
-    fn from(event: PrinterEvent) -> Self {
-        match event {
-            PrinterEvent::Connect => KlippyEvent::KlippyConnect,
-            PrinterEvent::Ready => KlippyEvent::KlippyReady,
-            PrinterEvent::Shutdown => KlippyEvent::KlippyShutdown,
-            PrinterEvent::Disconnect => KlippyEvent::KlippyDisconnect,
-            PrinterEvent::FirmwareRestart => KlippyEvent::KlippyFirmwareRestart,
-        }
-    }
-}
-```
-
-迁移完成后，`PrinterEvent` 的调用点（`gcode.rs`、`extras/output_pin.rs`、
-`api/endpoints/gcode.rs`）改为直接使用 `KlippyEvent`，`PrinterEvent` 及其转换即可删除。
-过渡期内保留转换，避免一次改动波及全部调用点。
+原先的 `PrinterEvent` 只有 5 个无参变体。迁移时把全部调用点（`printer.rs` 的测试、
+`gcode.rs`、`extras/output_pin.rs`、`api/endpoints/gcode.rs`）改为 `KlippyEvent`，
+并直接删除 `PrinterEvent`：它没有对外使用者，保留一层转换只会多出一个需要同步维护
+的类型。`klippy/mod.rs` 的转出改为 `KlippyEvent`。
 
 ## 4. 生命周期事件的触发点
 
@@ -430,16 +417,16 @@ impl From<PrinterEvent> for KlippyEvent {
 
 ## 5. 实施顺序
 
-| 顺序 | 事项 | 依赖 |
-|------|------|------|
-| 1 | `build.rs` 生成器与 `decl/` 声明目录 | 无 |
-| 2 | 生成 `KlippyEvent` 与 `name()` | 1 |
-| 3 | `register_event_handler` / `send_event` 改用 `KlippyEvent`，加入异常隔离与未知事件告警 | 2 |
-| 4 | `bring_up` 触发 `KlippyMcuIdentify` | 3 |
-| 5 | `invoke_shutdown` 触发 `KlippyAnalyzeShutdown` | 3 |
-| 6 | 迁移 `gcode.rs`、`extras/output_pin.rs`、`api/endpoints/gcode.rs` 的调用点 | 3 |
-| 7 | 更新测试并删除过渡用的 `PrinterEvent` 转换 | 6 |
-| 8 | 其余命名空间的事件在各自模块就位后逐步注册处理器 | 3 |
+| 顺序 | 事项 | 依赖 | 状态 |
+|------|------|------|------|
+| 1 | `build.rs` 生成器与 `decl/` 声明目录 | 无 | 已实现 |
+| 2 | 生成 `KlippyEvent` 与 `name()` | 1 | 已实现 |
+| 3 | `register_event_handler` / `send_event` 改用 `KlippyEvent`，加入异常隔离与未知事件告警 | 2 | 已实现 |
+| 4 | `bring_up` 触发 `KlippyMcuIdentify` | 3 | 已实现 |
+| 5 | `invoke_shutdown` 触发 `KlippyAnalyzeShutdown` | 3 | 已实现 |
+| 6 | 迁移 `gcode.rs`、`extras/output_pin.rs`、`api/endpoints/gcode.rs` 的调用点 | 3 | 已实现 |
+| 7 | 更新测试并删除 `PrinterEvent` | 6 | 已实现 |
+| 8 | 其余命名空间的事件在各自模块就位后逐步注册处理器 | 3 | 待各模块实现 |
 
 ## 6. 与上游的差异
 
@@ -451,6 +438,7 @@ impl From<PrinterEvent> for KlippyEvent {
 | 异常隔离 | `try/except` | `catch_unwind` |
 | 禁止阻塞 | `assert_no_pause()` 强制 | 沿用 `reactor` 回调约定，不强制校验 |
 | 未知事件 | 静默忽略 | 记录警告 |
+| 错误事件 | `klippy:notify_mcu_error` 在 MCU 错误路径发出 | 已声明，尚未接入触发点 |
 
 禁止阻塞一项不引入强制机制：`reactor` 已对回调约定「不等待、不做重活」，重复引入运行时
 校验的收益有限，且 `catch_unwind` 已覆盖处理器崩溃这一主要风险。

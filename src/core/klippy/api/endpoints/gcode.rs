@@ -219,7 +219,7 @@ mod tests {
                 Arc::new(GCodeDispatch::new(Arc::clone(&printer))),
             )
             .unwrap();
-        printer.send_event(&crate::core::klippy::printer::PrinterEvent::Ready);
+        printer.send_event(&crate::core::klippy::event::KlippyEvent::KlippyReady);
         printer
     }
 

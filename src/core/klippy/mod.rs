@@ -30,6 +30,7 @@ pub mod interface;
 
 // Re-export common types for convenience
 pub use error::KlippyError;
+pub use event::KlippyEvent;
 pub use gcode::{
     CommandError, CommandHandler, GCodeDispatch, GcodeCommand, OutputHandler, GCODE_OBJECT,
 };
@@ -37,7 +38,7 @@ pub use interface::{HostDevice, Interface, SerialDevice};
 pub use msg::proto::Payload;
 pub use msg::Msg;
 pub use pins::{PinError, PinParams, PinResolver, PinType, PrinterPins, PINS_OBJECT};
-pub use printer::{Printer, PrinterEvent, PrinterState, StateMessage};
+pub use printer::{Printer, PrinterState, StateMessage};
 pub use reactor::{
     CallbackRun, LatencyCallback, LatencyReport, ManualReactor, Reactor, TimerCallback,
     TimerHandle, TokioReactor,

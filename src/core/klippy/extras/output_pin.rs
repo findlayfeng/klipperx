@@ -246,9 +246,9 @@ pub fn load_config_prefix(
 mod tests {
     use super::*;
     use crate::core::klippy::config::ConfigValue;
+    use crate::core::klippy::event::KlippyEvent;
     use crate::core::klippy::mcu::McuError;
     use crate::core::klippy::pins::{PinChip, PinError, PinParams, PwmOut};
-    use crate::core::klippy::printer::PrinterEvent;
     use crate::core::klippy::reactor::ManualReactor;
 
     /// A digital output that records what it was told.
@@ -341,7 +341,7 @@ mod tests {
         let chip = Arc::new(FakeChip::default());
         pins.register_chip("mcu", chip.clone()).unwrap();
         printer.add_object(PINS_OBJECT, pins).unwrap();
-        printer.send_event(&PrinterEvent::Ready);
+        printer.send_event(&KlippyEvent::KlippyReady);
         (printer, chip)
     }
 

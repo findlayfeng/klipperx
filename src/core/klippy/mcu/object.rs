@@ -41,7 +41,7 @@ use crate::core::klippy::mcu::{
     ConfigBuilder, Dictionary, Mcu, McuChip, McuError, McuRestartMethod,
 };
 use crate::core::klippy::pins::{PinError, PrinterPins, PINS_OBJECT};
-use crate::core::klippy::printer::{ConnectFuture, Printer, PrinterObject};
+use crate::core::klippy::printer::{ConnectFuture, Printer, PrinterObject, RestartFuture};
 
 /// How long to wait between attempts to reopen a board that was just told to
 /// reboot. A native-USB board re-enumerates, so the port is briefly gone.
@@ -75,6 +75,13 @@ pub struct McuObject {
     /// What `objects/query` reports; `{}` until the handshake fills it, which is
     /// what upstream's `_get_status_info` starts as.
     status: Mutex<Value>,
+    /// The restart method of the connection currently up.
+    ///
+    /// [`McuObject::before_firmware_restart`] runs on the live connection and has
+    /// to know whether this is one of the methods that resets there (`command`)
+    /// or one that needs the port closed (`mcu/restart.rs`). Set by `connect`, so
+    /// it describes the connection that is actually open.
+    restart_method: Mutex<McuRestartMethod>,
     /// The machine, for reporting a firmware shutdown. `Weak` because the
     /// printer's registry owns this object: a strong handle would be a cycle
     /// that keeps the printer (and its device) alive forever.
@@ -105,6 +112,7 @@ impl McuObject {
             section,
             chip,
             status: Mutex::new(json!({})),
+            restart_method: Mutex::new(McuRestartMethod::Command),
             printer: Arc::downgrade(printer),
         })
     }
@@ -162,17 +170,15 @@ impl McuObject {
         Ok(())
     }
 
-    /// Reopen a firmware that was just told to reboot.
+    /// Open the port and identify the firmware, retrying while a rebooted board
+    /// comes back.
     ///
-    /// `reset` restarts the MCU: a native-USB board disappears from the bus and
-    /// re-enumerates, so the port may not be openable for a moment. `previous`
-    /// is dropped first so its transport is closed before the port is reopened.
-    async fn reconnect(
-        &self,
-        config: &McuConfig,
-        previous: Arc<Mcu>,
-    ) -> Result<Arc<Mcu>, KlippyError> {
-        drop(previous);
+    /// `reset` restarts the MCU, and a native-USB board disappears from the bus
+    /// and re-enumerates, so the port may not be openable for a moment
+    /// (`mcu/restart.rs`). Only a bring-up that follows a reset uses this: a
+    /// plain start opens the port once and reports the error, so a missing
+    /// device is not hidden behind a retry.
+    async fn open_and_connect(&self, config: &McuConfig) -> Result<Arc<Mcu>, KlippyError> {
         let mut last = String::new();
         for _ in 0..RECONNECT_ATTEMPTS {
             tokio::time::sleep(RECONNECT_DELAY).await;
@@ -184,12 +190,7 @@ impl McuObject {
                 }
             };
             match Mcu::connect(&config.name, interface).await {
-                Ok(mcu) => {
-                    self.chip.attach(Arc::clone(&mcu));
-                    // A fresh connection has a fresh clock; re-seed the estimate.
-                    seed_clock_base(&mcu).await;
-                    return Ok(mcu);
-                }
+                Ok(mcu) => return Ok(mcu),
                 Err(err) => last = err.to_string(),
             }
         }
@@ -197,6 +198,23 @@ impl McuObject {
             "MCU '{}' did not come back after a reset: {last}",
             config.name
         )))
+    }
+
+    /// Reopen a firmware that was just told to reboot.
+    ///
+    /// `previous` is dropped first so its transport is closed before the port is
+    /// reopened.
+    async fn reconnect(
+        &self,
+        config: &McuConfig,
+        previous: Arc<Mcu>,
+    ) -> Result<Arc<Mcu>, KlippyError> {
+        drop(previous);
+        let mcu = self.open_and_connect(config).await?;
+        self.chip.attach(Arc::clone(&mcu));
+        // A fresh connection has a fresh clock; re-seed the estimate.
+        seed_clock_base(&mcu).await;
+        Ok(mcu)
     }
 
     /// Whether this bring-up follows a `firmware_restart`.
@@ -319,6 +337,12 @@ impl PrinterObject for McuObject {
                 self.usb_reset_unusable(&config, &reason);
                 config.restart_method = McuRestartMethod::Command;
             }
+            // Remember what this connection resets with: `before_firmware_restart`
+            // runs later, on the live connection, and only `command` resets there.
+            *self
+                .restart_method
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()) = config.restart_method.clone();
             // This bring-up is the one that resets the firmware itself, and
             // `rpi_usb` is the only method that does it by switching the port's
             // power — the one thing that can disconnect a board without
@@ -336,14 +360,32 @@ impl PrinterObject for McuObject {
                     return Err(KlippyError::Internal(err));
                 }
             }
-            let interface = config.open().map_err(KlippyError::Internal)?;
-            let mut mcu = match Mcu::connect(&config.name, interface).await {
-                Ok(mcu) => mcu,
-                Err(err) => {
-                    if usb_reset {
-                        self.usb_reset_unusable(&config, &err.to_string());
+            // A bring-up that follows a firmware restart finds the board
+            // rebooting — `command` sent the reset on the live connection
+            // (`before_firmware_restart`), and the physical methods just switched
+            // it — so the port is retried until it comes back. A plain start
+            // opens it once and reports the error, so a missing device is not
+            // hidden behind a retry.
+            let mut mcu = if self.is_firmware_restart() {
+                match self.open_and_connect(&config).await {
+                    Ok(mcu) => mcu,
+                    Err(err) => {
+                        if usb_reset {
+                            self.usb_reset_unusable(&config, &err.to_string());
+                        }
+                        return Err(err);
                     }
-                    return Err(KlippyError::Connection(err.to_string()));
+                }
+            } else {
+                let interface = config.open().map_err(KlippyError::Internal)?;
+                match Mcu::connect(&config.name, interface).await {
+                    Ok(mcu) => mcu,
+                    Err(err) => {
+                        if usb_reset {
+                            self.usb_reset_unusable(&config, &err.to_string());
+                        }
+                        return Err(KlippyError::Connection(err.to_string()));
+                    }
                 }
             };
             // Make the device reachable by resources before the configuration
@@ -358,24 +400,16 @@ impl PrinterObject for McuObject {
             self.reserve_pins(&mcu)
                 .map_err(|err| KlippyError::Internal(err.to_string()))?;
 
-            // `FIRMWARE_RESTART` asks for the firmware itself to be reset. On
-            // the `command` method that is the firmware's own `reset`, which
-            // reboots the MCU rather than clearing its configuration in place,
-            // so the connection has to be re-established after it
-            // (`klippy/mcu.py:736-745`).
+            // `FIRMWARE_RESTART` on the `command` method sends the firmware's own
+            // `reset` on the live connection, before the parts come down: it is
+            // what lets this connection be the only one, instead of identifying
+            // the running firmware just to tell it to reboot
+            // (`before_firmware_restart`; upstream's `_restart_via_command`,
+            // `klippy/mcu.py:730-746`). What is left for this loop is the
+            // firmware whose *only* reset is `reset` and that still carries a
+            // configuration: no `config_reset` to clear it in place, so it has to
+            // be rebooted and re-identified here.
             let mut reset_sent = false;
-            if self.is_firmware_restart()
-                && config.restart_method == McuRestartMethod::Command
-                && mcu.has_message(Reset::NAME)
-            {
-                info!(
-                    "MCU '{}': resetting the firmware with the 'reset' command",
-                    config.name
-                );
-                reset_and_flush(&mcu).await?;
-                mcu = self.reconnect(&config, mcu).await?;
-                reset_sent = true;
-            }
 
             // The accumulated configuration is encoded once, and the handshake
             // can then be retried on a fresh connection if the firmware has to
@@ -429,6 +463,39 @@ impl PrinterObject for McuObject {
                 .map_err(|err| KlippyError::Internal(err.to_string()))?;
             self.set_status(&mcu);
             Ok(())
+        })
+    }
+
+    fn before_firmware_restart<'a>(&'a self) -> RestartFuture<'a> {
+        Box::pin(async move {
+            // Only `command` resets on the live connection; the physical methods
+            // need the port closed and run from `connect` (`mcu/restart.rs`).
+            let command = {
+                let method = self
+                    .restart_method
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                *method == McuRestartMethod::Command
+            };
+            if !command {
+                return;
+            }
+            let Some(mcu) = self.chip.mcu() else {
+                return;
+            };
+            if !mcu.has_message(Reset::NAME) {
+                return;
+            }
+            info!(
+                "MCU '{}': resetting the firmware with the 'reset' command",
+                self.chip.name()
+            );
+            if let Err(err) = reset_and_flush(&mcu).await {
+                warn!(
+                    "MCU '{}': could not send the 'reset' command ({err})",
+                    self.chip.name()
+                );
+            }
         })
     }
 }
@@ -528,7 +595,7 @@ pub fn load_config_prefix(
 mod tests {
     use super::*;
     use crate::core::klippy::frame::Frame;
-    use crate::core::klippy::interface::devices::test::{MappingEntry, TestDevice};
+    use crate::core::klippy::interface::devices::test::{FrameRecorder, MappingEntry, TestDevice};
     use crate::core::klippy::interface::Interface;
     use crate::core::klippy::msg::proto::Payload;
     use crate::core::klippy::printer::PrinterState;
@@ -547,6 +614,59 @@ mod tests {
             .add_object(PINS_OBJECT, Arc::new(PrinterPins::new()))
             .unwrap();
         printer
+    }
+
+    /// An MCU attached to `object`'s chip, with `reset` in its dictionary.
+    fn attached(object: &McuObject, mappings: Vec<MappingEntry>) -> FrameRecorder {
+        let device = TestDevice::new(mappings);
+        let recorder = device.recorder();
+        let mcu = Arc::new(Mcu::for_test("mcu", Interface::new(device)));
+        mcu.install_dictionary(Dictionary::from_json(json!({"commands": {"reset": 9}})).unwrap())
+            .unwrap();
+        object.chip.attach(Arc::clone(&mcu));
+        recorder
+    }
+
+    #[tokio::test]
+    async fn test_a_firmware_restart_resets_on_the_live_connection() {
+        // The `command` reset has to go out on the connection that is already up:
+        // by the time the parts are torn down there is no transport left to send
+        // it on, and reconnecting only to reset is what made a restart identify
+        // the firmware twice. `before_firmware_restart` is the hook the host calls
+        // while the parts are still up (`klippy.rs`).
+        let printer = printer();
+        let object = McuObject::new(section(None), &printer).unwrap();
+        let recorder = attached(
+            &object,
+            vec![MappingEntry {
+                input: Frame::new(0, vec![9]),
+                outputs: vec![],
+            }],
+        );
+
+        object.before_firmware_restart().await;
+
+        let sent = recorder.frames();
+        assert_eq!(sent.len(), 1, "one reset command, got {sent:?}");
+        assert_eq!(sent[0].payload(), &[9]);
+    }
+
+    #[tokio::test]
+    async fn test_a_physical_restart_method_does_not_reset_on_the_live_connection() {
+        // `arduino` / `cheetah` / `rpi_usb` reset the firmware on the **closed**
+        // port, from `connect` (`mcu/restart.rs`). Sending `reset` here as well
+        // would reboot the board twice.
+        let printer = printer();
+        let object = McuObject::new(section(None), &printer).unwrap();
+        *object
+            .restart_method
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = McuRestartMethod::RpiUsb;
+        let recorder = attached(&object, vec![]);
+
+        object.before_firmware_restart().await;
+
+        assert!(recorder.frames().is_empty());
     }
 
     #[test]

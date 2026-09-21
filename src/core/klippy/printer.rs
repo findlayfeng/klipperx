@@ -429,6 +429,26 @@ impl Printer {
         any.downcast::<T>().ok()
     }
 
+    /// Every registered object a module name selects, as its concrete type.
+    ///
+    /// [`Printer::lookup_objects`] with a downcast, for the callers that need to
+    /// *use* the objects rather than ask them for status. The one that matters
+    /// here is finding an `McuObject` by its chip name: `lookup_objects(Some("mcu"))`
+    /// returns `mcu` and `mcu <name>` (whose registered names differ from their
+    /// chip names), so a resource filters on the chip name it was built for.
+    pub fn lookup_objects_as<T: PrinterObject>(
+        &self,
+        module: Option<&str>,
+    ) -> Vec<(String, Arc<T>)> {
+        self.lookup_objects(module)
+            .into_iter()
+            .filter_map(|(name, object)| {
+                let any: Arc<dyn Any + Send + Sync> = object;
+                any.downcast::<T>().ok().map(|typed| (name, typed))
+            })
+            .collect()
+    }
+
     /// Look up one registered object by name.
     ///
     /// `None` for a name nobody registered. The handle is cloned out and the

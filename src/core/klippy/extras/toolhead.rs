@@ -56,9 +56,6 @@ use serde_json::{json, Value};
 use tokio::time::sleep;
 use tracing::warn;
 
-use crate::core::klippy::cmd::clock::{ClockSync, McuClock};
-use crate::core::klippy::cmd::uptime::{GetUptime, Uptime};
-use crate::core::klippy::cmd::McuCommand;
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
 use crate::core::klippy::error::KlippyError;
 use crate::core::klippy::extras::stepper::PrinterStepper;
@@ -67,7 +64,7 @@ use crate::core::klippy::gcode::{
 };
 use crate::core::klippy::load::section;
 use crate::core::klippy::mathutil::{Coord, X_AXIS, Y_AXIS, Z_AXIS};
-use crate::core::klippy::mcu::{Mcu, McuObject, McuStepper};
+use crate::core::klippy::mcu::{McuObject, McuStepper};
 use crate::core::klippy::motion::kinematics::CartesianKinematics;
 use crate::core::klippy::motion::plan::MoveLimits;
 use crate::core::klippy::motion::stepcompress::{StepCommand, StepCompressError};
@@ -93,9 +90,6 @@ const MOVE_HISTORY_EXPIRE: f64 = 30.0;
 
 /// The speed a `G1` uses before any `F` (`gcode_move`'s initial `self.speed`).
 const DEFAULT_MOVE_SPEED: f64 = 50.0;
-
-/// How long the connect-time clock read may take.
-const CLOCK_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// The `toolhead` object: the planner, its kinematics, and the MCU steppers.
 pub struct ToolHeadObject {
@@ -297,51 +291,28 @@ impl PrinterObject for ToolHeadObject {
             // walk). Take them now, along with the firmware resources and the
             // MCU each axis lives on.
             let mut host_steppers = Vec::with_capacity(3);
-            let mut axis_mcus = Vec::with_capacity(3);
             let mut mcu_steppers = HashMap::new();
             for stepper in &self.axes {
                 let host = stepper
                     .take_stepper()
                     .ok_or_else(|| config_error(format!("{} is not connected", stepper.name())))?;
-                let mcu = stepper
-                    .mcu_stepper()
-                    .mcu()
-                    .ok_or_else(|| config_error("MCU is not connected".to_string()))?;
                 host_steppers.push(host);
-                axis_mcus.push(mcu);
                 mcu_steppers.insert(
                     stepper.name().to_string(),
                     Arc::clone(stepper.mcu_stepper()),
                 );
             }
 
-            // One clock per distinct MCU, and the print-time alignment between
-            // them. The primary MCU (the bare `[mcu]`) defines the print-time
-            // origin; a secondary is shifted so the same print time maps to its
-            // own clock (`SecondarySync`, `klippy/clocksync.py:177-235`).
-            let primary_name = self
+            // The primary MCU (the bare `[mcu]`) defines the print-time origin;
+            // each stepper's compressor was already pointed at its own MCU's
+            // clock domain (`SecondarySync`) during its own connect, which used
+            // this same `[mcu]` object's clock.
+            let main_print_time = self
                 .printer
                 .upgrade()
                 .and_then(|printer| printer.lookup_object_as::<McuObject>("mcu"))
-                .and_then(|object| object.mcu())
-                .map(|mcu| mcu.name().to_string())
-                .unwrap_or_else(|| axis_mcus[0].name().to_string());
-            let now = self.reactor.monotonic();
-            let mut clocks: HashMap<String, Arc<McuClock>> = HashMap::new();
-            for mcu in distinct_mcus(&axis_mcus) {
-                let clock = Arc::new(McuClock::new(Arc::clone(mcu), Arc::clone(&self.reactor)));
-                seed_clock(&clock, mcu, now).await;
-                clocks.insert(mcu.name().to_string(), clock);
-            }
-            let offsets = mcu_time_offsets(&primary_name, &clocks, now);
-
-            // Point each stepper's compressor at its own MCU's clock domain.
-            for (host, mcu) in host_steppers.iter_mut().zip(&axis_mcus) {
-                let freq = mcu
-                    .clock_freq()
-                    .map_err(|err| config_error(err.to_string()))?;
-                host.compressor_mut().set_time(offsets[mcu.name()], freq);
-            }
+                .and_then(|object| object.estimated_print_time(self.reactor.monotonic()))
+                .unwrap_or(0.0);
 
             let mut toolhead = ToolHead::new(self.limits);
             for stepper in host_steppers {
@@ -365,9 +336,8 @@ impl PrinterObject for ToolHeadObject {
                 self.max_z_accel,
             )));
 
-            // The toolhead's print time is the primary MCU's; the secondary
-            // offsets above map it onto their own clocks.
-            toolhead.set_estimated_print_time(clocks[&primary_name].estimated_print_time(now));
+            // The toolhead's print time is the primary MCU's.
+            toolhead.set_estimated_print_time(main_print_time);
 
             *self.lock() = Some(Connected {
                 toolhead,
@@ -399,59 +369,6 @@ impl ToolHeadObject {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
     }
-}
-
-/// Seed the clock estimator from `get_uptime`, falling back to one `get_clock`.
-async fn seed_clock(clock: &McuClock, mcu: &Mcu, sent_time: f64) {
-    if mcu.has_message(GetUptime::NAME) {
-        if let Ok(uptime) = mcu
-            .call_msg::<GetUptime, Uptime>(&GetUptime, CLOCK_TIMEOUT)
-            .await
-        {
-            clock.seed(sent_time, uptime.clock64() as i64);
-            return;
-        }
-    }
-    if let Err(err) = clock.get_clock().await {
-        warn!("could not read the MCU clock for a print-time estimate: {err}");
-    }
-}
-
-/// The distinct MCUs an axis list uses, first-seen order.
-fn distinct_mcus(mcus: &[Arc<Mcu>]) -> Vec<&Arc<Mcu>> {
-    let mut seen: Vec<&Arc<Mcu>> = Vec::new();
-    for mcu in mcus {
-        if seen.iter().any(|other| other.name() == mcu.name()) {
-            continue;
-        }
-        seen.push(mcu);
-    }
-    seen
-}
-
-/// The print-time-to-clock offset of each MCU, keyed by MCU name
-/// (`SecondarySync`, `klippy/clocksync.py:177-235`).
-///
-/// The primary defines the print-time origin, so its offset is `0.0`; a
-/// secondary is shifted by the difference between the two clocks' print times at
-/// the same host instant.
-fn mcu_time_offsets(
-    primary_name: &str,
-    clocks: &HashMap<String, Arc<McuClock>>,
-    now: f64,
-) -> HashMap<String, f64> {
-    let main_print_time = clocks[primary_name].estimated_print_time(now);
-    clocks
-        .iter()
-        .map(|(name, clock)| {
-            let offset = if name == primary_name {
-                0.0
-            } else {
-                main_print_time - clock.estimated_print_time(now)
-            };
-            (name.clone(), offset)
-        })
-        .collect()
 }
 
 /// The flush task: generate the queued steps and await the transport.
@@ -655,59 +572,7 @@ pub(crate) fn load_config(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::klippy::interface::devices::test::TestDevice;
-    use crate::core::klippy::interface::Interface;
-    use crate::core::klippy::mcu::{Dictionary, McuError};
-    use crate::core::klippy::reactor::ManualReactor;
-
-    /// An identified fake MCU with one `CLOCK_FREQ`.
-    fn fake_mcu(name: &str, freq: u64) -> Arc<Mcu> {
-        let mcu = Mcu::for_test(name, Interface::new(TestDevice::new(Vec::new())));
-        mcu.install_dictionary(
-            Dictionary::from_json(json!({"config": {"CLOCK_FREQ": freq}})).unwrap(),
-        )
-        .unwrap();
-        Arc::new(mcu)
-    }
-
-    #[tokio::test]
-    async fn test_mcu_time_offsets_align_a_secondary_to_the_primary() {
-        // The primary has been up 100 s at 1 MHz; the secondary 50 s at 2 MHz.
-        let primary = McuClock::new(fake_mcu("mcu", 1_000_000), ManualReactor::shared());
-        primary.seed(0.0, 100_000_000);
-        let secondary = McuClock::new(fake_mcu("zboard", 2_000_000), ManualReactor::shared());
-        secondary.seed(0.0, 100_000_000);
-        let clocks = HashMap::from([
-            ("mcu".to_string(), Arc::new(primary)),
-            ("zboard".to_string(), Arc::new(secondary)),
-        ]);
-
-        let offsets = mcu_time_offsets("mcu", &clocks, 0.0);
-
-        // The primary defines the origin; the secondary is shifted so the same
-        // print time maps to its own clock.
-        assert_eq!(offsets["mcu"], 0.0);
-        assert_eq!(offsets["zboard"], 50.0);
-    }
-
-    #[tokio::test]
-    async fn test_distinct_mcus_deduplicates_by_name() {
-        let a = Arc::new(Mcu::for_test(
-            "mcu",
-            Interface::new(TestDevice::new(Vec::new())),
-        ));
-        let b = Arc::new(Mcu::for_test(
-            "zboard",
-            Interface::new(TestDevice::new(Vec::new())),
-        ));
-
-        let mcus = vec![Arc::clone(&a), Arc::clone(&b), Arc::clone(&a)];
-        let distinct = distinct_mcus(&mcus);
-
-        assert_eq!(distinct.len(), 2);
-        assert_eq!(distinct[0].name(), "mcu");
-        assert_eq!(distinct[1].name(), "zboard");
-    }
+    use crate::core::klippy::mcu::McuError;
 
     #[test]
     fn test_axis_indices_reads_the_letters() {

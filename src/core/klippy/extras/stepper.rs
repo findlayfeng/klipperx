@@ -44,7 +44,7 @@ use crate::core::klippy::config::{ConfigError, ConfigWrapper};
 use crate::core::klippy::error::KlippyError;
 use crate::core::klippy::load::section;
 use crate::core::klippy::mathutil::{X_AXIS, Y_AXIS, Z_AXIS};
-use crate::core::klippy::mcu::McuStepper;
+use crate::core::klippy::mcu::{McuEndstop, McuStepper};
 use crate::core::klippy::motion::{Axis, Stepper};
 use crate::core::klippy::pins::{PrinterPins, PINS_OBJECT};
 use crate::core::klippy::printer::{ConnectFuture, Printer, PrinterObject};
@@ -80,6 +80,26 @@ pub struct RailParams {
     pub position_endstop: f64,
 }
 
+/// Where an axis' endstop is and how to home it.
+///
+/// Upstream's `GenericPrinterRail.get_homing_info()` (`klippy/stepper.py:475`),
+/// which `homing.py` reads.
+#[derive(Debug, Clone, Copy)]
+pub struct HomingInfo {
+    /// The speed of the first homing move, mm/s.
+    pub speed: f64,
+    /// Where the endstop sits, in axis coordinates.
+    pub position_endstop: f64,
+    /// The speed of the retract move.
+    pub retract_speed: f64,
+    /// How far to retract before the second home.
+    pub retract_dist: f64,
+    /// Whether homing moves toward increasing coordinates.
+    pub positive_dir: bool,
+    /// The speed of the second homing move.
+    pub second_homing_speed: f64,
+}
+
 /// One configured `[stepper_x]` / `[stepper_y]` / `[stepper_z]`.
 pub struct PrinterStepper {
     name: String,
@@ -90,6 +110,10 @@ pub struct PrinterStepper {
     params: RailParams,
     /// The firmware side: oid, pins and the wire commands.
     mcu_stepper: Arc<McuStepper>,
+    /// The endstop this rail homes to, when the section names one.
+    endstop: Option<Arc<McuEndstop>>,
+    /// The homing parameters (`homing.py`'s input).
+    homing: HomingInfo,
     /// The machine, to find this MCU's clock/offset at connect. `Weak` because
     /// the printer's registry owns this object.
     printer: Weak<Printer>,
@@ -185,6 +209,17 @@ impl PrinterStepper {
         // (`parse_step_distance`, `klippy/stepper.py:307-323`).
         let step_dist = rotation_distance / (full_steps as f64 * microsteps as f64 * gear_ratio);
 
+        // Homing parameters and the endstop. `endstop_pin` is optional here:
+        // a `[stepper_*]` with no endstop still loads (upstream requires it for
+        // a cartesian rail; `G28` will report the missing endstop instead).
+        let homing = read_homing_info(
+            config,
+            &identifier,
+            position_min,
+            position_max,
+            position_endstop,
+        )?;
+
         let pins = printer
             .lookup_object_as::<PrinterPins>(PINS_OBJECT)
             .expect("the loader registers `pins` before any section");
@@ -193,6 +228,13 @@ impl PrinterStepper {
         let mcu_stepper = pins
             .setup_stepper(&step_pin, &dir_pin, step_pulse_duration)
             .map_err(|err| ConfigError::new(format!("{identifier}: {err}")))?;
+        let endstop = match config.get_str("endstop_pin") {
+            Some(pin) => Some(
+                pins.setup_endstop(&pin, None)
+                    .map_err(|err| ConfigError::new(format!("{identifier}: {err}")))?,
+            ),
+            None => None,
+        };
 
         Ok(Self {
             name,
@@ -204,6 +246,8 @@ impl PrinterStepper {
                 position_endstop,
             },
             mcu_stepper,
+            endstop,
+            homing,
             printer: Arc::downgrade(printer),
             inner: Mutex::new(None),
         })
@@ -227,6 +271,16 @@ impl PrinterStepper {
     /// The rail range and homing point.
     pub fn params(&self) -> RailParams {
         self.params
+    }
+
+    /// The endstop this rail homes to, if the section named one.
+    pub fn endstop(&self) -> Option<&Arc<McuEndstop>> {
+        self.endstop.as_ref()
+    }
+
+    /// The homing parameters (`homing.py`'s input).
+    pub fn homing_info(&self) -> HomingInfo {
+        self.homing
     }
 
     /// The firmware stepper resource.
@@ -293,6 +347,11 @@ impl PrinterObject for PrinterStepper {
                 .mcu_stepper
                 .oid()
                 .map_err(|err| config_error(err.to_string()))?;
+            // Register this stepper as a signal of the rail's endstop, so a
+            // trigger stops it in the firmware (`stepper_stop_on_trigger`).
+            if let Some(endstop) = &self.endstop {
+                endstop.dispatch().add_stepper(mcu.name(), oid);
+            }
 
             let mut stepper = Stepper::cartesian(
                 self.name.clone(),
@@ -348,6 +407,59 @@ pub(crate) fn load_config(
     printer: &Arc<Printer>,
 ) -> Result<Arc<dyn PrinterObject>, ConfigError> {
     Ok(Arc::new(PrinterStepper::new(config, printer)?))
+}
+
+/// Parse the homing parameters of a `[stepper_*]` rail
+/// (`GenericPrinterRail.__init__`, `klippy/stepper.py:347-390`).
+fn read_homing_info(
+    config: &ConfigWrapper,
+    identifier: &str,
+    position_min: f64,
+    position_max: f64,
+    position_endstop: f64,
+) -> Result<HomingInfo, ConfigError> {
+    let speed = config.get_float("homing_speed", Some(5.0))?;
+    if speed <= 0.0 {
+        return Err(ConfigError::new(format!(
+            "Option 'homing_speed' in section '{identifier}' must be above 0"
+        )));
+    }
+    let second_homing_speed = config.get_float("second_homing_speed", Some(speed / 2.0))?;
+    let retract_speed = config.get_float("homing_retract_speed", Some(speed))?;
+    let retract_dist = config.get_float("homing_retract_dist", Some(5.0))?;
+    let positive_dir = match config.get_optional_bool("homing_positive_dir")? {
+        Some(positive) => positive,
+        None => {
+            // Infer from where the endstop sits: near the low end means homing
+            // moves negative, near the high end positive, and anywhere in the
+            // middle is ambiguous.
+            let axis_len = position_max - position_min;
+            if position_endstop <= position_min + axis_len / 4.0 {
+                false
+            } else if position_endstop >= position_max - axis_len / 4.0 {
+                true
+            } else {
+                return Err(ConfigError::new(format!(
+                    "Unable to infer homing_positive_dir in section '{identifier}'"
+                )));
+            }
+        }
+    };
+    if (positive_dir && position_endstop == position_min)
+        || (!positive_dir && position_endstop == position_max)
+    {
+        return Err(ConfigError::new(format!(
+            "Invalid homing_positive_dir / position_endstop in '{identifier}'"
+        )));
+    }
+    Ok(HomingInfo {
+        speed,
+        position_endstop,
+        retract_speed,
+        retract_dist,
+        positive_dir,
+        second_homing_speed,
+    })
 }
 
 /// The axis a section name selects: `stepper_x` → [`Axis::X`].
@@ -439,6 +551,34 @@ mod tests {
         assert!(!printer
             .queryable_objects()
             .contains(&"stepper_x".to_string()));
+        // No `endstop_pin`: the rail has no endstop yet.
+        assert!(stepper.endstop().is_none());
+    }
+
+    #[test]
+    fn test_an_endstop_pin_builds_the_rail_endstop_and_homing_info() {
+        let (printer, result) = load(&config_with_x("endstop_pin: PA2\n"));
+
+        result.unwrap();
+        let stepper = printer
+            .lookup_object_as::<PrinterStepper>("stepper_x")
+            .unwrap();
+        assert!(stepper.endstop().is_some());
+        let info = stepper.homing_info();
+        assert_eq!(info.position_endstop, 0.0);
+        // The endstop sits at the low end, so homing moves negative.
+        assert!(!info.positive_dir);
+        assert_eq!(info.speed, 5.0);
+        assert_eq!(info.second_homing_speed, 2.5);
+        assert_eq!(info.retract_dist, 5.0);
+    }
+
+    #[test]
+    fn test_an_endstop_in_the_middle_cannot_infer_the_direction() {
+        let (_, result) = load(&config_with_x("endstop_pin: PA2\nposition_endstop: 100\n"));
+
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Unable to infer homing_positive_dir"), "{err}");
     }
 
     #[test]

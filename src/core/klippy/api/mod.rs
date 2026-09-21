@@ -205,6 +205,7 @@ mod tests {
                 "objects/list",
                 "objects/query",
                 "objects/subscribe",
+                "query_endstops/status",
             ]
         );
     }

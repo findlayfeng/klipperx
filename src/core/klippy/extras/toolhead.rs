@@ -58,6 +58,7 @@ use tracing::warn;
 
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
 use crate::core::klippy::error::KlippyError;
+use crate::core::klippy::extras::query_endstops::{QueryEndstops, QUERY_ENDSTOPS_OBJECT};
 use crate::core::klippy::extras::stepper::PrinterStepper;
 use crate::core::klippy::gcode::{
     CommandError, CommandHandler, GCodeDispatch, GcodeCommand, GCODE_OBJECT,
@@ -191,6 +192,17 @@ impl ToolHeadObject {
         }
         let axes: [Arc<PrinterStepper>; 3] =
             axes.try_into().expect("exactly three axes were collected");
+
+        // The object every rail's endstop is queried through. Created here
+        // because this is the first point where all the `[stepper_*]` sections
+        // (and their endstops) exist; registered before `toolhead` itself.
+        let query = QueryEndstops::new(printer)?;
+        for stepper in &axes {
+            if let Some(endstop) = stepper.endstop() {
+                query.register_endstop(Arc::clone(endstop), stepper.name());
+            }
+        }
+        printer.add_object(QUERY_ENDSTOPS_OBJECT, Arc::new(query))?;
 
         let state = Arc::new(Mutex::new(None));
         let object = Self {
@@ -368,6 +380,17 @@ impl ToolHeadObject {
         self.state
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    /// The print time the planner has reached, or `0.0` before connect.
+    ///
+    /// `query_endstops` dates a query from this (upstream's
+    /// `toolhead.get_last_move_time()`).
+    pub fn print_time(&self) -> f64 {
+        self.lock()
+            .as_ref()
+            .map(|connected| connected.toolhead.print_time())
+            .unwrap_or(0.0)
     }
 }
 

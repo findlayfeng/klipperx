@@ -488,6 +488,7 @@ mod tests {
                 "stepper_x",
                 "stepper_y",
                 "stepper_z",
+                "query_endstops",
                 "toolhead"
             ]
         );

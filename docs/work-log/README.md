@@ -14,3 +14,4 @@
 | 2026-09-21 | [FW6 动工前调查](2026-09-21-fw6-notes.md) — endstop/trsync/命令队列三链的层次与契约、差距、FW6a–FW6f 拆分与拍板点（多实例纯 Rust 触发、假 MCU 多实例验证、不引入 host serialqueue、`stepcompress` history 前置） |
 | 2026-09-21 | [FW6a 动工记录](2026-09-21-fw6a-notes.md) — 清 FW5 运动层的单 MCU 假设（每 stepper 自算 flush 时钟、`McuClock`/对齐下放到 `McuChip`），顺带修 `McuClock::seed` 未取 `CLOCK_FREQ` 的 bug |
 | 2026-09-21 | [FW6b 动工记录](2026-09-21-fw6b-notes.md) — endstop/trsync 命令层 + `MCU_endstop` + 多实例 `TriggerDispatch`/`MCU_trsync`（每 MCU 一个 registry 路由、纯 Rust 取最慢者延长超时） |
+| 2026-09-21 | [FW6c 动工记录](2026-09-21-fw6c-notes.md) — `[stepper_*]` 的 `endstop_pin`/`homing_*` → `Rail`、`query_endstops` 对象 + `query_endstops/status` 端点 + `M119`（FW6 框架验收） |

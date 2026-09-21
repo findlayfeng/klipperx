@@ -26,6 +26,7 @@
 //! (for a step/dir pin pair) are read.
 
 use clap::Args;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -80,6 +81,27 @@ const MOVE_SLOTS: u32 = 64;
 /// firmware sees is the same.
 const SEND_BATCH: u32 = 16;
 
+/// The first request rate the comm task tries, in requests per second.
+const COMM_START_RATE: f64 = 100.0;
+
+/// The comm ramp stops here; a link that carries it is reported as such.
+const COMM_MAX_RATE: f64 = 200_000.0;
+
+/// Unanswered requests allowed before the link counts as losing them.
+///
+/// In flight there is the outbound channel (32 items) plus the wire, so this is
+/// well above what a healthy link holds at any moment.
+const COMM_BACKLOG_LIMIT: u64 = 128;
+
+/// What the tool drives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum Task {
+    /// Step generation: the highest step rate the MCU can hold (default).
+    Step,
+    /// Command round-trips: the highest request rate the host↔MCU link carries.
+    Comm,
+}
+
 /// A `get_config` / `get_clock` round-trip that takes longer than this is
 /// treated as the MCU no longer answering.
 const CALL_TIMEOUT: Duration = Duration::from_secs(2);
@@ -117,6 +139,10 @@ pub struct StressArgs {
     /// How long each stage drives the stepper, in seconds
     #[arg(long, default_value_t = STAGE_SECONDS)]
     pub stage_seconds: f64,
+
+    /// What to stress
+    #[arg(long, value_enum, default_value_t = Task::Step)]
+    pub task: Task,
 }
 
 /// Entry point for the `stress` subcommand.
@@ -159,17 +185,30 @@ async fn stress(args: StressArgs) -> Result<(), Box<dyn std::error::Error>> {
         mcu.dictionary().map(|d| d.commands().len()).unwrap_or(0)
     );
 
-    let (stepper_section, step_pin, dir_pin) = find_stepper(&config, &mcu_config.name, &mcu)?;
+    match args.task {
+        Task::Step => step_stress(&mcu_config, mcu, &config, &args).await,
+        Task::Comm => comm_stress(mcu, &args).await,
+    }
+}
+
+/// Ramp the step rate until the MCU's step timer gives out.
+async fn step_stress(
+    mcu_config: &McuConfig,
+    mcu: Arc<Mcu>,
+    config: &Config,
+    args: &StressArgs,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (stepper_section, step_pin, dir_pin) = find_stepper(config, &mcu_config.name, &mcu)?;
     println!("using [{stepper_section}] -> step_pin={step_pin} dir_pin={dir_pin}");
 
-    let (oid, mcu) = configure_stepper(&mcu_config, mcu, step_pin, dir_pin).await?;
-
-    // Record why the firmware stopped, so the report can say more than "it did".
+    // The handshake can reconnect (a firmware with no `config_reset` reboots), so
+    // bind the events only once the connection is final.
+    let (oid, mcu) = configure_stepper(mcu_config, mcu, step_pin, dir_pin).await?;
     let shutdown_reason: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     bind_shutdown(&mcu, &shutdown_reason)?;
 
     let freq = mcu.clock_freq().map_err(std::io::Error::other)?;
-    println!("step clock {freq:.0} Hz; ramping:");
+    println!("step clock {freq:.0} Hz; ramping step rate:");
 
     // The ramp is ascending and stops at the first failure: once the firmware has
     // shut down, only a `reset` clears it, so there is no going back to a lower
@@ -227,12 +266,10 @@ async fn stress(args: StressArgs) -> Result<(), Box<dyn std::error::Error>> {
             .await
         {
             Ok(state) if state.is_shutdown => {
-                let reason = shutdown_reason
-                    .lock()
-                    .unwrap_or_else(|poison| poison.into_inner())
-                    .clone()
-                    .unwrap_or_else(|| "(the firmware did not say why)".to_string());
-                println!("  firmware SHUT DOWN at {actual_rate:.0} steps/s: {reason}");
+                println!(
+                    "  firmware SHUT DOWN at {actual_rate:.0} steps/s: {}",
+                    shutdown_message(&shutdown_reason)
+                );
                 println!(
                     "  last rate it survived: {}",
                     last_good
@@ -259,6 +296,152 @@ async fn stress(args: StressArgs) -> Result<(), Box<dyn std::error::Error>> {
         "no failure up to {MAX_RATE:.0} steps/s (the ramp's top); the MCU survived every stage"
     );
     Ok(())
+}
+
+/// Ramp the request rate on `get_clock` until the host↔MCU link gives out.
+///
+/// `get_clock` is a base command (it works even before `finalize_config`), so
+/// this task does not configure the firmware at all — it measures the transport,
+/// not the machine. The request name is fixed (`clock`), so the host cannot have
+/// several in flight through `call`; the requests are fire-and-forget and the
+/// answers are counted by a bound callback.
+async fn comm_stress(mcu: Arc<Mcu>, args: &StressArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let shutdown_reason: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    bind_shutdown(&mcu, &shutdown_reason)?;
+
+    let answered = Arc::new(AtomicU64::new(0));
+    {
+        let answered = Arc::clone(&answered);
+        mcu.bind_callback("clock", move |_| {
+            answered.fetch_add(1, Ordering::Relaxed);
+        })
+        .map_err(|err| std::io::Error::other(format!("bind clock: {err}")))?;
+    }
+
+    println!("ramping request rate (`get_clock` round-trips):");
+    let mut rate = COMM_START_RATE;
+    let mut last_good: Option<f64> = None;
+    while rate <= COMM_MAX_RATE {
+        // Let anything the last stage left in flight settle first.
+        settle(&mcu).await?;
+        let before = answered.load(Ordering::Relaxed);
+
+        let sent = drive_requests(&mcu, rate, args.stage_seconds, &shutdown_reason).await?;
+        let achieved = sent as f64 / args.stage_seconds;
+
+        // Give the answers a moment to come back before measuring the backlog.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let replied = answered.load(Ordering::Relaxed) - before;
+        let backlog = sent.saturating_sub(replied);
+
+        println!(
+            "  {:>8.0} req/s: sent {sent}, answered {replied}, achieved {achieved:.0} req/s, backlog {backlog}",
+            rate
+        );
+
+        let failure = if shutdown_reason
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .is_some()
+        {
+            Some("the firmware shut down".to_string())
+        } else if backlog > COMM_BACKLOG_LIMIT {
+            Some(format!("{backlog} requests went unanswered"))
+        } else if achieved < rate * 0.95 {
+            Some(format!(
+                "only {achieved:.0} of the {rate:.0} requests/s went out"
+            ))
+        } else {
+            None
+        };
+
+        if let Some(failure) = failure {
+            println!("  link gave out at {rate:.0} req/s: {failure}");
+            println!(
+                "  last rate it carried: {}",
+                last_good
+                    .map(|r| format!("{r:.0} req/s"))
+                    .unwrap_or_else(|| "none".to_string())
+            );
+            return Ok(());
+        }
+        last_good = Some(achieved);
+        rate *= args.rate_step;
+    }
+
+    println!(
+        "no failure up to {COMM_MAX_RATE:.0} req/s (the ramp's top); the link carried every stage"
+    );
+    Ok(())
+}
+
+/// Wait for anything still in flight to come back.
+async fn settle(mcu: &Arc<Mcu>) -> Result<(), std::io::Error> {
+    mcu.flush(CALL_TIMEOUT)
+        .await
+        .map_err(|err| std::io::Error::other(format!("flush: {err}")))?;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    Ok(())
+}
+
+/// Send `get_clock` at `rate` requests per second for `seconds` seconds, and
+/// return how many went out.
+///
+/// Pacing is by wall clock: each pass sends whatever is due by now and sleeps a
+/// little when caught up. When the outbound channel is full (32 items,
+/// `mcu/mod.rs`) the send reports it, so the pass flushes and retries once; if
+/// that cannot keep up, `sent` falls behind `rate` and the caller sees it.
+async fn drive_requests(
+    mcu: &Arc<Mcu>,
+    rate: f64,
+    seconds: f64,
+    shutdown: &Arc<Mutex<Option<String>>>,
+) -> Result<u64, std::io::Error> {
+    let start = Instant::now();
+    let mut sent: u64 = 0;
+    loop {
+        if shutdown
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .is_some()
+        {
+            break;
+        }
+        let elapsed = start.elapsed().as_secs_f64();
+        if elapsed >= seconds {
+            break;
+        }
+        if sent < (rate * elapsed) as u64 {
+            match mcu.send_msg(&GetClock) {
+                Ok(()) => sent += 1,
+                Err(_) => {
+                    // The outbound channel is full: let it drain, then try once
+                    // more. A second failure is the link giving out.
+                    mcu.flush(CALL_TIMEOUT)
+                        .await
+                        .map_err(|err| std::io::Error::other(format!("flush: {err}")))?;
+                    mcu.send_msg(&GetClock).map_err(|err| {
+                        std::io::Error::other(format!("get_clock after a flush: {err}"))
+                    })?;
+                    sent += 1;
+                }
+            }
+        } else {
+            tokio::time::sleep(Duration::from_micros(500)).await;
+        }
+    }
+    mcu.flush(CALL_TIMEOUT)
+        .await
+        .map_err(|err| std::io::Error::other(format!("flush: {err}")))?;
+    Ok(sent)
+}
+
+/// The recorded shutdown reason, or a placeholder when the firmware did not say.
+fn shutdown_message(slot: &Arc<Mutex<Option<String>>>) -> String {
+    slot.lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone()
+        .unwrap_or_else(|| "(the firmware did not say why)".to_string())
 }
 
 /// One rung of the ramp.

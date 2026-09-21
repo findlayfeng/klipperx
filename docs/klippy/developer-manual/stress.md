@@ -1,18 +1,22 @@
 # 压力测试（`klipperx stress`）
 
-一个跑在板子上的台架工具：给**一块指定的 MCU** 逐步加大步进负载，直到它出错。它不属于主机
+一个跑在板子上的台架工具：给**一块指定的 MCU** 逐步加大负载，直到它出错。它不属于主机
 运行时，也不需要一个完整的 `printer.cfg`。
 
 ```
 klipperx stress [OPTIONS] <CONFIG_FILE> [MCU]
 ```
 
-- `CONFIG_FILE` 用来取 `[mcu …]`（传输方式）和一个 stepper 的 `step_pin` / `dir_pin`；
+- `CONFIG_FILE` 用来取 `[mcu …]`（传输方式）；`--task step` 还要一个 stepper 的
+  `step_pin` / `dir_pin`；
 - `MCU` 省略或为空即裸 `[mcu]`；`[mcu zboard]` 要写 `zboard`；
+- `--task`（默认 `step`）选压什么：`step` 压步进生成，`comm` 压主机↔MCU 链路；
 - `--rate-step`（默认 `1.25`）是每段相对上一段的倍数，越小包围盒越紧、跑得越久；
 - `--stage-seconds`（默认 `0.5`）是每段持续多久。
 
-## 负载是什么
+两个任务都是**升序 ramp + 遇错即停**，结果是一对包围盒（最后一个撑住的 / 第一个挂掉的）。
+
+## 任务一：步进生成（`--task step`，默认）
 
 负载选自上游的**步进引擎**（`src/stepper.c`）——MCU 的主要工作就是按 `queue_step` 生成步进脉冲。
 工具借用配置里某个 `[stepper_*]` / `[manual_stepper]` 的 step/dir 引脚，用 `ConfigBuilder`
@@ -43,7 +47,7 @@ klipperx stress [OPTIONS] <CONFIG_FILE> [MCU]
 （`mcu/mod.rs`），一段 50 条命令直接灌会报 `no available capacity`。分批只给发送节奏，不影响固件
 看到的步进时刻。
 
-## 出错长什么样
+### 步进任务的出错形态
 
 三种都由固件 `shutdown`，工具把原因（`shutdown` / `is_shutdown` 事件的 `static_string_id`，经字典
 解出）一并报出：
@@ -55,7 +59,7 @@ klipperx stress [OPTIONS] <CONFIG_FILE> [MCU]
 
 报告形如「在第 X 步频 shut down（原因 …），上一段活到 Y 步频」。
 
-### 实测
+### 实测（步进）
 
 一块 STM32F103（`stm32f103xe`，72 MHz，Klipper 固件，`config_stepper` 可用），`--rate-step 1.1`：
 
@@ -68,6 +72,36 @@ klipperx stress [OPTIONS] <CONFIG_FILE> [MCU]
 
 即真值落在 **339 623 – 375 000 步/秒**之间（10.4% 的包围盒）；这块板大约 34 万步/秒就能稳定跑。
 
+## 任务二：命令往返（`--task comm`）
+
+压的是**主机↔MCU 链路**，不是机器：不用配置固件（`get_clock` 是 `HF_IN_SHUTDOWN` 的基础命令），
+以 `--rate-step` 从 `COMM_START_RATE`（100 req/s）升到 `COMM_MAX_RATE`（200k req/s），每段按目标
+速率发 `--stage-seconds` 秒的 `get_clock`。
+
+- `get_clock` 的响应名是固定的（`clock`），主机不能流水线多个 `call`，所以请求是 fire-and-forget、
+  由一个绑在 `clock` 上的回调计数；
+- 按墙钟配速：一次循环把「到点该发的」都发出去，追上了就睡一下；出站通道（32 格）满时先 `flush`
+  再重试一次，重试还发不出去就是链路给不起这个速率；
+- 每段结束 `flush`，再等 50 ms 收响应，比较发出与收到。
+
+失败判据（任一）：固件 shutdown、**积压**（发出远比收到多，超过 `COMM_BACKLOG_LIMIT`）、或**达不到
+目标速率**（发送被反压拖住）。这些都是通信侧的症状，与 MCU 算力无关。
+
+### 实测（链路）
+
+同一块 F103（USB CDC，名义 250000 baud；实际是 USB 全速）：
+
+```
+      2842 req/s: sent 1420, answered 1410, achieved 2840 req/s, backlog 10
+      3553 req/s: sent 1776, answered 1709, achieved 3552 req/s, backlog 67
+      4441 req/s: sent 2213, answered 1904, achieved 4426 req/s, backlog 309
+  link gave out at 4441 req/s: 309 requests went unanswered
+  last rate it carried: 3552 req/s
+```
+
+即链路能稳定扛住约 **3.5k 往返/秒**，再高响应就开始积压。注意这与“名义 250000 baud”无关——
+USB CDC 走的是 USB 全速，真正的瓶颈在固件的命令处理与响应队列。
+
 ## 它会怎么对待板子
 
 这是一次**接管**：`ConfigBuilder` 的握手会给一块跑着别的配置（或已 shutdown）的板子发
@@ -77,8 +111,8 @@ klipperx stress [OPTIONS] <CONFIG_FILE> [MCU]
 
 ## 要求与缺口
 
-- 配置里必须有 `[mcu …]`（或 `[mcu]`）和一个带 `step_pin`/`dir_pin` 的 stepper section；没有就
-  直接报错。
+- 配置里必须有 `[mcu …]`（或 `[mcu]`）；`--task step` 还要一个带 `step_pin`/`dir_pin` 的 stepper
+  section，没有就直接报错（`--task comm` 不需要）。
 - 引脚名支持 `PA0`、`mcu:PA0`、`<chip>:PA0` 和尾随 `!`（忽略）；**别名（`[board_pins]`）还没
   解析**。
 - 压力 stepper 用 `invert_step = 0`、`step_pulse_ticks = 0`；`[stepper_*]` 的 `invert_step` /

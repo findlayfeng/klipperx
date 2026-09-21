@@ -221,6 +221,15 @@ impl GcodeCommand {
         self.dispatch.respond_info(msg, true);
     }
 
+    /// Send an informational line without logging it.
+    ///
+    /// Upstream's `respond_info(..., log=False)`: the client sees the line, the
+    /// host's log does not. Used by `ECHO` and `HELP`, which report what the
+    /// client sent rather than a host event.
+    pub fn respond_info_no_log(&self, msg: &str) {
+        self.dispatch.respond_info(msg, false);
+    }
+
     fn missing(&self, name: &str) -> CommandError {
         CommandError::new(format!("Error on '{}': missing {}", self.commandline, name))
     }
@@ -328,8 +337,13 @@ impl GCodeDispatch {
             dispatch.inner.printer.register_event_handler(
                 KlippyEvent::KlippyShutdown,
                 Box::new(move |_| {
-                    inner.set_ready(false);
-                    inner.respond_info("Klipper state: Shutdown", false);
+                    // Upstream returns early when the printer was already not
+                    // ready (`_handle_shutdown`, `klippy/gcode.py:186-193`), so
+                    // only the first shutdown prints the state line.
+                    if inner.ready.load(Ordering::SeqCst) {
+                        inner.set_ready(false);
+                        inner.respond_info("Klipper state: Shutdown", false);
+                    }
                 }),
             );
         }
@@ -544,7 +558,7 @@ impl GCodeDispatch {
             self.register_command(
                 "ECHO",
                 Arc::new(|gcmd: &GcodeCommand| {
-                    gcmd.respond_raw(gcmd.commandline());
+                    gcmd.respond_info_no_log(gcmd.commandline());
                     Ok(())
                 }),
                 None,
@@ -584,10 +598,15 @@ impl GCodeDispatch {
 
 impl PrinterObject for GCodeDispatch {
     /// The command table, as upstream's `GCodeDispatch.get_status`.
+    ///
+    /// Built from the **active** table, so before the printer is ready only the
+    /// base commands show up — upstream caches the same thing in
+    /// `_build_status_commands` (`klippy/gcode.py:176-184`).
     fn get_status(&self, _eventtime: f64) -> Value {
+        let ready = self.inner.ready.load(Ordering::SeqCst);
         let commands = self.lock();
         let mut status = Map::new();
-        for name in commands.ready.keys() {
+        for name in commands.active(ready).keys() {
             let mut entry = Map::new();
             if let Some(help) = commands.help.get(name) {
                 entry.insert("help".to_string(), Value::String(help.clone()));
@@ -681,18 +700,30 @@ fn cmd_status(inner: &Arc<Inner>, gcmd: &GcodeCommand) -> Result<(), CommandErro
 
 /// `HELP`: list the extended commands that carry help text
 /// (`klippy/gcode.py:379-389`).
+///
+/// Lists the **active** table, so before the printer is ready it names the base
+/// commands and says so; the line is not logged (`log=False`).
 fn cmd_help(inner: &Arc<Inner>, gcmd: &GcodeCommand) -> Result<(), CommandError> {
+    let ready = inner.ready.load(Ordering::SeqCst);
     let commands = inner
         .commands
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
-    let mut names: Vec<&String> = commands.help.keys().collect();
+    let mut lines = Vec::new();
+    if !ready {
+        lines.push("Printer is not ready - not all commands available.".to_string());
+    }
+    lines.push("Available extended commands:".to_string());
+    let mut names: Vec<&String> = commands
+        .active(ready)
+        .keys()
+        .filter(|name| commands.help.contains_key(*name))
+        .collect();
     names.sort();
-    let mut lines = vec!["Available extended commands:".to_string()];
     for name in names {
         lines.push(format!("{:<10}: {}", name, commands.help[name]));
     }
-    gcmd.respond_info(&lines.join("\n"));
+    gcmd.respond_info_no_log(&lines.join("\n"));
     Ok(())
 }
 
@@ -711,10 +742,14 @@ fn dispatch_mux(inner: &Arc<Inner>, cmd: &str, gcmd: &GcodeCommand) -> Result<()
         (mux.key.clone(), mux.values.contains_key(&None))
     };
 
-    let requested = if has_default {
-        gcmd.get_str_default(&key, "")
+    // With a default registered, a request that omits the key selects it (the
+    // `None` entry); without one the key is required. Looking the request up as
+    // `Some("")` would never match the default and would report a bogus value
+    // (`_cmd_mux`, `klippy/gcode.py:317-342`).
+    let requested: Option<String> = if has_default {
+        gcmd.parameters().get(&key).cloned()
     } else {
-        gcmd.get_str(&key)?
+        Some(gcmd.get_str(&key)?)
     };
 
     let handler = {
@@ -723,11 +758,13 @@ fn dispatch_mux(inner: &Arc<Inner>, cmd: &str, gcmd: &GcodeCommand) -> Result<()
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         let mux = commands.mux.get(cmd).expect("checked above");
-        mux.values.get(&Some(requested.clone())).map(Arc::clone)
+        mux.values.get(&requested).map(Arc::clone)
     };
     if let Some(handler) = handler {
         return handler(gcmd);
     }
+
+    let requested = requested.unwrap_or_default();
 
     // Not a registered value: report what is available (upstream's wording).
     let mut values: Vec<String> = {
@@ -941,9 +978,11 @@ fn parse_line(line: &str) -> Option<Parsed> {
 
 /// The text after the command, for extended re-parsing.
 ///
-/// Upstream walks the original line looking for the command and a trailing
-/// checksum (`get_raw_command_parameters`); here the command is the token after
-/// an optional line number, so the remainder is simply what follows it.
+/// The command is the token after an optional line number, so the remainder is
+/// simply what follows it — plus, on a line-numbered line, upstream's trailing
+/// `*<digits>` checksum handling (`get_raw_command_parameters`,
+/// `klippy/gcode.py:40-51`; without a line number upstream leaves the text
+/// alone).
 fn raw_parameters(without_comment: &str) -> String {
     let mut tokens = without_comment.split_whitespace();
     let first = tokens.next().unwrap_or("");
@@ -953,7 +992,19 @@ fn raw_parameters(without_comment: &str) -> String {
     if line_number {
         let _ = tokens.next();
     }
-    tokens.collect::<Vec<_>>().join(" ")
+    let rest = tokens.collect::<Vec<_>>().join(" ");
+    if !line_number {
+        return rest;
+    }
+    match rest.rfind('*') {
+        Some(pos)
+            if !rest[pos + 1..].is_empty()
+                && rest[pos + 1..].chars().all(|c| c.is_ascii_digit()) =>
+        {
+            rest[..pos].to_string()
+        }
+        _ => rest,
+    }
 }
 
 /// Parse extended parameters: whitespace-separated `KEY=VALUE`, with shell
@@ -1111,6 +1162,18 @@ mod tests {
 
         assert_eq!(parsed.command, "M110");
         assert_eq!(parsed.raw_params, "");
+    }
+
+    #[test]
+    fn test_a_line_number_drops_a_trailing_checksum() {
+        // A line-numbered line may end in `*<digits>`; upstream strips it from
+        // the raw parameters (`get_raw_command_parameters`).
+        let parsed = parse_line("N5 SET_PIN PIN=fan VALUE=1*45").unwrap();
+        assert_eq!(parsed.raw_params, "PIN=fan VALUE=1");
+
+        // Without a line number the text is left as written.
+        let parsed = parse_line("SET_PIN PIN=fan VALUE=1*45").unwrap();
+        assert_eq!(parsed.raw_params, "PIN=fan VALUE=1*45");
     }
 
     #[test]
@@ -1316,8 +1379,9 @@ mod tests {
     }
 
     #[test]
-    fn test_help_lists_the_registered_commands() {
+    fn test_help_lists_the_active_commands() {
         let (dispatch, output) = dispatch();
+        dispatch.inner.set_ready(true);
         let (handler, _) = recorder();
         dispatch
             .register_command("SET_PIN", handler, Some("Set a pin"), false)
@@ -1332,6 +1396,36 @@ mod tests {
                 .any(|l| l.contains("SET_PIN") && l.contains("Set a pin")),
             "{lines:?}"
         );
+    }
+
+    #[test]
+    fn test_help_before_ready_names_the_base_commands() {
+        // Not ready: only the base commands are active, and the list says so.
+        let (dispatch, output) = dispatch();
+        let (handler, _) = recorder();
+        dispatch
+            .register_command("SET_PIN", handler, Some("Set a pin"), false)
+            .unwrap();
+
+        run(&dispatch, "HELP");
+
+        let text = emitted(&output).join("\n");
+        assert!(text.contains("Printer is not ready"), "{text}");
+        assert!(!text.contains("SET_PIN"), "{text}");
+        // `RESTART` is a base command and carries help text.
+        assert!(text.contains("RESTART"), "{text}");
+    }
+
+    #[test]
+    fn test_echo_uses_the_info_prefix() {
+        let (dispatch, output) = dispatch();
+
+        // Extended commands need `KEY=VALUE` parameters, so a bare word is a
+        // malformed command (upstream is the same); the line is echoed with the
+        // `// ` prefix either way once it parses.
+        run(&dispatch, "ECHO MESSAGE=hi");
+
+        assert_eq!(emitted(&output), ["// ECHO MESSAGE=hi"]);
     }
 
     // -----------------------------------------------------------------------
@@ -1389,6 +1483,49 @@ mod tests {
             .unwrap_err();
 
         assert!(err.contains("may have only one key (PIN)"), "{err}");
+    }
+
+    #[test]
+    fn test_a_mux_command_without_the_key_uses_the_default_value() {
+        let (dispatch, _output) = dispatch();
+        dispatch.inner.set_ready(true);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        {
+            let seen = Arc::clone(&seen);
+            let default: CommandHandler = Arc::new(move |_| {
+                seen.lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push("default".to_string());
+                Ok(())
+            });
+            dispatch
+                .register_mux_command("MY_MUX", "PIN", None, default, None)
+                .unwrap();
+        }
+        {
+            let seen = Arc::clone(&seen);
+            let named: CommandHandler = Arc::new(move |_| {
+                seen.lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push("named".to_string());
+                Ok(())
+            });
+            dispatch
+                .register_mux_command("MY_MUX", "PIN", Some("fan"), named, None)
+                .unwrap();
+        }
+
+        // No key: the `None` value handles it.
+        run(&dispatch, "MY_MUX");
+        assert_eq!(*seen.lock().unwrap(), ["default"]);
+
+        // A registered key: the named handler.
+        run(&dispatch, "MY_MUX PIN=fan");
+        assert_eq!(*seen.lock().unwrap(), ["default", "named"]);
+
+        // An unknown key is still reported against the named options.
+        let err = dispatch.run_script("MY_MUX PIN=nope").unwrap_err();
+        assert!(err.to_string().contains("is not valid for PIN"), "{err}");
     }
 
     // -----------------------------------------------------------------------
@@ -1463,5 +1600,19 @@ mod tests {
 
         assert_eq!(status["commands"]["SET_PIN"]["help"], "Set a pin");
         assert!(status["commands"]["M110"].is_object());
+    }
+
+    #[test]
+    fn test_the_status_before_ready_lists_only_the_base_commands() {
+        let (dispatch, _output) = dispatch();
+        let (handler, _) = recorder();
+        dispatch
+            .register_command("SET_PIN", handler, Some("Set a pin"), false)
+            .unwrap();
+
+        let status = dispatch.get_status(0.0);
+
+        assert!(status["commands"]["M110"].is_object());
+        assert!(status["commands"]["SET_PIN"].is_null());
     }
 }

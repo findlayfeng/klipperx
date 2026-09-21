@@ -20,7 +20,7 @@
 | **FW1** | 配置装载框架收尾 | C2 | option 访问追踪当 schema（`ConfigWrapper` + `AccessTracking`）、住户与阶段（`phase`/`object`，对象名可≠节名）、未认领 section/option 报 `ConfigError`、`configfile` 对象 | `[output_pin fan]` 多一个选项报选项错、`objects/list` 含 `configfile` 且 `settings`/`config` 形状对；`[printer]`→`toolhead` 的晚阶段住户有装载器单测 | 各 extras 的 option schema（H1–H12）；`[printer]`/toolhead 本体随 C1 接入 | FW3（共用 `ConfigError`） |
 | **FW2** | 对象模型收尾 | Q4、Q5 | Q4 定案 `Value`；Q5 加 `lookup_objects(module)` 前缀遍历与 `statuses()` 快照 | `objects/query` 形状不变；`lookup_objects("mcu")` 前缀遍历与反射读状态有单测 | `gcode_macro` 的 `printer.objects` 模板视图、display 菜单、宏变量 | — |
 | **FW3** | 错误词汇框架 | A2 | `CommandError`/`ConfigError` 分层、`KlippyError::Config`、`Internal` 收敛、handler/endpoint 异常 `catch_unwind` → `invoke_shutdown`、config 错走 `set_error_state`（`PrinterState::Error`） | 参数错报 `CommandError` 且不停机；坏配置 / connect 期 config 错报 `error`（可 RESTART）；panic 的 handler / endpoint 触发 `invoke_shutdown` | 全树的错误分支 | — |
-| **FW4** | G-Code 框架收尾（**大部完成，剩 GCodeIO**） | G1b（框架部分） | ~~参数访问器、`create_gcode_command`、`run_script_from_command`、`gcode:command_error` 触发~~ ✅；剩 `GCodeIO` 输入抽象（伪 tty / 文件 / `stats gcodein` / `debuginput_exit`）与 `gcode:request_restart` 触发（C1） | ~~`create_gcode_command` / 参数访问器~~ ✅（见 [FW4 笔记](docs/work-log/2026-09-21-fw4-notes.md)）；`GCodeIO` 待拍板 | 全部 gcode extras（H3、H8…） | FW1、FW3（已满足） |
+| **FW4** | G-Code 框架收尾（**完成**；`GCodeIO` 暂缓 `[~]`） | G1b（框架部分） | ~~参数访问器、`create_gcode_command`、`run_script_from_command`、`gcode:command_error` 触发~~ ✅；`GCodeIO` 输入抽象（伪 tty / 文件 / `stats gcodein` / `debuginput_exit`）**暂缓 `[~]`**（不做 OctoPrint 串口仿真）；`gcode:request_restart` 触发随 C1 | ~~`create_gcode_command` / 参数访问器~~ ✅；`GCodeIO` 暂缓（见 [FW4 笔记](docs/work-log/2026-09-21-fw4-notes.md)） | 全部 gcode extras（H3、H8…） | FW1、FW3（已满足） |
 | **FW5** | 运动框架（最重） | C1（框架部分）、H12 | toolhead 骨架、`Kinematics` trait、stepper 句柄、trapq/step 生成（chelper 重写）、`clocksync`、`mathutil`/`Coord` | `cartesian` + `[stepper_x/y/z]` + `[extruder]`，`G28`/`G1` 跑通 | `kinematics/*` 其余、H9、H10 | FW1 |
 | **FW6** | 资源与触发框架 | F3、F8 | 命令队列/print_time 同步输出（`MCU_bus_digital_out`）、`TriggerDispatch`/`MCU_trsync`、endstop 接口 | 一个 endstop + `query_endstops/status` | homing/probe、运动同步 `SET_PIN` | FW5 |
 | **FW7** | MCU 与传输框架收尾 | B2、D3 | `emergency_stop` 对象（`klippy:shutdown` → 固件 `emergency_stop`）、本地 shutdown 标志、`emergency_stop` 端点、带载荷错误上报；RTO 定时重传与固件 `reset` 优先未做 | `emergency_stop` 端点使打印机进 shutdown；主机停机向固件发 `emergency_stop`，固件自报停机不回发 | TMC/传感器等资源 | — |
@@ -31,13 +31,13 @@
 > 例如 FW5 的验收是 `G28`/`G1` 真的动了步进，而不是 `Kinematics` trait 编译通过。
 
 > **建议顺序**：**FW1/FW3**（配置与错误，最底层）✅ → **FW2/FW7/FW8** ✅ 大部
-> （对象模型 / MCU / 主机层）→ **FW4**（G-Code，依赖 FW1+FW3）→ **FW5**（运动，最重，
+> （对象模型 / MCU / 主机层）→ **FW4**（G-Code，依赖 FW1+FW3）✅（`GCodeIO` 暂缓 `[~]`）→ **FW5**（运动，最重，
 > 依赖 FW1）→ **FW6** → **FW9**。FW5 与 FW4 都依赖 FW1；FW6 只能等 FW5。
 > FW2/FW7/FW8 的剩余点见 FW8（`rpi_usb`/CRC/输出订阅）、B2（`last_stats`/RTO/固件 `reset`）。
 > D2 的真板启动抖动已归档为**非阻塞观察项**（板/USB 链路层，复现不了），不再单独排期。
 
 > **未决问题里属于框架决策的**：**Q4**（status 形状，FW2）、**Q5**（反射，FW2）、
-> **Q6**（退出语义，FW8）；其余 Q 已解决或属模块。
+> **Q6**（退出语义，FW8）；其余 Q 已解决或属模块。**Q8**（`GCodeIO`）已定为暂缓 `[~]`。
 
 > **不列入框架、可以直接随模块做的**：G2b（`SET_PIN` 时序）、G4（运动命令本体）、
 > F6 剩余（`spi_transfer_with_preface`）、F9、H1–H11、S1、E1、E2。
@@ -94,7 +94,7 @@ H1–H12 是[上游功能覆盖审计](docs/work-log/2026-09-21-upstream-coverag
 
 | # | 事项 | 依赖 |
 |---|---|---|
-| G1b | gcode 调度器与上游的行为差异（`GCodeIO`、参数访问器、事件触发…） | C1 |
+| G1b | gcode 调度器与上游的行为差异（参数访问器、事件触发…；`GCodeIO` 暂缓 `[~]`） | C1 |
 | G2b | 用 GCODE 控制 GPIO：`SET_PIN` 时序（数字与 PWM 均已可驱动） | C1 |
 | G4 | 运动命令（G0/G1/G28…） | G1、C1 |
 | B4 | 其余端点（estop / remote method / pause_resume / `*/dump_*` / …） | G3、H4、H9 |
@@ -226,14 +226,18 @@ toolhead / 开放事件）一起补，一部分是现在就独立可补的小行
 
 **随前置一起补（GCodeIO / toolhead / 事件）**
 
-- [ ] **`GCodeIO` 未移植**：伪 tty / 文件输入整块缺失——fd 读取与 `partial_input`、
-      `pending_commands` 批量与 20 条阈值、`M112` 乱序检测（`m112_r` =
-      `^(?:[nN][0-9]+)?\s*[mM]112(?:\s|$)`）、`input_log`、debuginput EOF 退出、
-      `stats gcodein=`（`:390-494`）。现在输入由 API 层的 `gcode/script` 承担；**要么明确
-      不补（纯 API 主机），要么把串口/文件输入做成一个独立对象——这是 FW4 里唯一需要拍板
-      的决策**。它另外带出两个前置：`is_fileinput` 决定 `request_restart` / `_handle_shutdown`
-      是否退 `error_exit`（`:355` `:429`），以及 `gcode:debuginput_exit` 需要的 `send_event`
-      返回值。
+- [~] **`GCodeIO` 未移植（已定：暂缓，不做 OctoPrint 串口仿真）**：伪 tty / 文件输入整块
+      缺失——fd 读取与 `partial_input`、`pending_commands` 批量与 20 条阈值、`M112` 乱序检测
+      （`m112_r` = `^(?:[nN][0-9]+)?\s*[mM]112(?:\s|$)`）、`input_log`、debuginput EOF 退出、
+      `stats gcodein=`（`:390-494`）。现在输入由 API 层的 `gcode/script` 承担，客户端契约走
+      Moonraker API；**结论（2026-09-21）：暂不实现**，保留为将来的可选扩展。
+      将来要做时的最小路径与前置：① 先给 reactor 补 **fd 事件层**（本仓库只有定时器，无
+      `register_fd`/`poll` 对应物），这是最贵的一块；② `util.create_pty`（`openpty` +
+      `symlink` 到 `/tmp/printer` + 关 `ECHO` + 非阻塞）与 `GCodeIO` 对象；③ `is_fileinput`
+      决定 `request_restart` / `_handle_shutdown` 是否退 `error_exit`（`:355` `:429`）；
+      ④ `gcode:debuginput_exit` 需要 `send_event` 收集 handler 返回值（上游 `all(...)`）。
+      tty 与 debuginput 共用同一套 `_process_data`，应一起做。详见
+      [FW4 笔记](docs/work-log/2026-09-21-fw4-notes.md) 第 3 节。
 - [x] **`ack()` / `need_ack`**：`GcodeCommand` 没有 `ack`（`:54-63`），这是文件输入协议的
       一部分。受影响的具体行为：`M115` 应该先 `ack(msg)`、失败才 `respond_info`（`:344-350`）。
       —— 已加 `GcodeCommand::ack`（`M115` / `M105` 已用）；本轮补全协议本身：`ack` 清
@@ -245,8 +249,11 @@ toolhead / 开放事件）一起补，一部分是现在就独立可补的小行
       事件总线（`KlippyEvent`）已就绪。
       —— `gcode:command_error` 已在 `process_line` 接上（handler 的 `CommandError` 触发；
       panic 走 `invoke_shutdown`、**不**触发，同上游 `:223-234`）。`gcode:request_restart` 的
-      声明已补 `print_time` 载荷（上游实际带参数），触发随 C1；`gcode:debuginput_exit` 的触发
-      随 GCodeIO，且要先让 `send_event` 收集 handler 返回值（上游 `all(...)`，`:432-435`）。
+      声明已补 `print_time` 载荷（上游实际带参数），触发随 C1。
+- [~] **`gcode:debuginput_exit` 触发（随 `GCodeIO` 暂缓）**：上游 `_do_debuginput_exit`
+      轮询 `all(send_event('gcode:debuginput_exit'))`（`:432-435`），依赖 handler 的返回值；
+      本仓库 `Printer::send_event` 丢弃返回值（上游 `klippy/klippy.py:226-227` 是
+      `return [cb(...)]`）。要与 `GCodeIO` 一起做（见上一条）。
 - [ ] **`request_restart` 的停机前动作**：上游在 ready 时先 `toolhead.dwell(0.500)` +
       `wait_moves()` 再 `request_exit`（`:352-365`），随 **C1**；当前直接 `request_exit`
       （`gcode.rs:515-545`）。
@@ -713,10 +720,10 @@ ack」settle，并用 `Mcu::took_over_session()` 让 `rpi_usb` 判断“有没�
 - [x] **Q6 退出结果的语义**：`klippy::run` 返回进程退出码，`klippy_process` 把最终的 run
       result 带回来；只有 `error_exit` 是非零（`-1`，同上游 `sys.exit(-1)`），`exit` 与
       “附件结束” 都是 0；两个 main 用 `std::process::exit(code)`（`klippy.rs`、`main.rs`）。
-- [ ] **Q7 GCodeIO 补不补**：伪 tty / 文件输入（`klippy/gcode.py:390-494`）是 FW4 剩下的一块，
-      也是唯一需要拍板的：纯 API 主机可以不补，但 `debuginput_exit`、`is_fileinput`/`error_exit`、
-      `stats gcodein=`、`input_log`、`M112` 乱序会一直缺；要做则是一个独立对象 + 先把
-      `Printer::send_event` 改成能收集 handler 返回值（上游 `klippy/klippy.py:226-227`）。
+- [~] **Q8 GCodeIO（伪 tty / OctoPrint 串口仿真）补不补**：**已定（2026-09-21）：暂不实现**，
+      归档为将来可选项，等需要时再操作。纯 API 主机（Moonraker）不需要它；代价是
+      `debuginput_exit`、`is_fileinput`/`error_exit`、`stats gcodein=`、`input_log`、`M112` 乱序
+      一直缺。将来做时的前置见 G1b 的 `GCodeIO` 条目（首要是 reactor 的 fd 事件层）。
 
 ## 上游事件对照清单（事件总线已就绪，逐项注册处理器）
 
@@ -795,12 +802,12 @@ ack」settle，并用 `Mcu::took_over_session()` 让 `rpi_usb` 判断“有没�
 | 事件名 | 触发时机 | 参数 | 上游位置 | 实现依赖 |
 |---|---|---|---|---|
 | `gcode:command_error` | gcode 命令错误 | 无 | `klippy/gcode.py:226` | ✅ 已触发（`process_line`） |
-| `gcode:debuginput_exit` | debuginput EOF | 无 | `klippy/gcode.py:433` | GCodeIO + `send_event` 返回值 |
+| `gcode:debuginput_exit` | debuginput EOF | 无 | `klippy/gcode.py:433` | **暂缓 `[~]`**（随 GCodeIO；需 `send_event` 返回值） |
 | `gcode:request_restart` | 请求重启 | `print_time` | `klippy/gcode.py:358` | C1（需 toolhead 的 print time） |
 
 > `gcode:command_error` 已接（handler 的 `CommandError` 触发，panic 不触发）；`gcode:request_restart`
-> 的声明已带 `print_time` 载荷，触发点等 C1；`gcode:debuginput_exit` 还要先让 `send_event`
-> 收集 handler 返回值（上游 `all(...)` 轮询），随 GCodeIO。
+> 的声明已带 `print_time` 载荷，触发点等 C1；`gcode:debuginput_exit` 随 `GCodeIO` **暂缓 `[~]`**
+> （不做 OctoPrint 串口仿真），将来做时还要先让 `send_event` 收集 handler 返回值（上游 `all(...)`）。
 
 ### 工具/传感器事件
 
@@ -854,7 +861,8 @@ ack」settle，并用 `Mcu::took_over_session()` 让 `rpi_usb` 判断“有没�
       （剥行号与校验和）、`create_gcode_command`、`run_script_from_command`；`gcode:command_error`
       在 `process_line` 接上（panic 不触发）；`ack` 改为一次性（`Cell`）并按 `need_ack` 决定错误
       是否中止脚本；`gcode:request_restart` 声明补 `print_time` 载荷，生成枚举去掉 `Eq`。
-      剩 `GCodeIO`（待拍板）与随 C1/D1 的项，见 [FW4 笔记](docs/work-log/2026-09-21-fw4-notes.md)。
+      `GCodeIO`（伪 tty / OctoPrint 串口仿真）**暂缓 `[~]`**，随 C1 的 `request_restart` 触发
+      另行跟进；见 [FW4 笔记](docs/work-log/2026-09-21-fw4-notes.md)。
 
 - **FW7/FW8 收尾（B2/D2/D3）**：`last_stats`（`event/stats.rs` 换算 + `McuObject` 上报，真板已验）；
       固件 `reset` 优先于 `config_reset`（`mcu/config.rs`）；RTO 定时重传（`mcu/mod.rs` 的

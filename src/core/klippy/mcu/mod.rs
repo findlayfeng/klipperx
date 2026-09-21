@@ -1201,6 +1201,7 @@ mod tests {
     use crate::core::klippy::interface::devices::serial::DEFAULT_BAUD;
     use crate::core::klippy::interface::devices::test::{MappingEntry, TestDevice};
     use crate::core::klippy::interface::Interface;
+    use crate::core::klippy::reactor::ManualReactor;
 
     fn make_frame(seq: u8, payload: &[u8]) -> Frame {
         Frame::new(seq, payload.to_vec())
@@ -1568,7 +1569,7 @@ mod tests {
         // 2. Round trips across the 4-bit wraparound. Identify alone already
         //    sent roughly ninety blocks (the dictionary is that long), so a
         //    counter that never wrapped would have stalled long before this.
-        let clock = McuClock::new(Arc::clone(&mcu));
+        let clock = McuClock::new(Arc::clone(&mcu), ManualReactor::shared());
         for round in 0..40 {
             clock
                 .get_clock()
@@ -1612,7 +1613,7 @@ mod tests {
         );
 
         // 5. And the taken-over session is genuinely usable, not just identified.
-        let clock = McuClock::new(Arc::clone(&mcu));
+        let clock = McuClock::new(Arc::clone(&mcu), ManualReactor::shared());
         for round in 0..40 {
             clock
                 .get_clock()

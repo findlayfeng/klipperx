@@ -19,12 +19,21 @@
 use crate::core::klippy::cmd::{McuCommand, McuResponse, Params};
 use crate::core::klippy::mcu::{Mcu, McuError};
 use crate::core::klippy::msg::proto::ArgValue;
+use crate::core::klippy::reactor::Reactor;
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use tokio::time::Duration;
 
 /// Default timeout for a clock query.
 pub const CLOCK_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// How fast an old minimum round-trip time is allowed to age, in seconds of
+/// "credit" per second since it was seen (`klippy/clocksync.py:8`).
+const RTT_AGE: f64 = 0.000010 / (60. * 60.);
+
+/// EWMA weight of each new sample in the clock/time regression
+/// (`klippy/clocksync.py:9`).
+const DECAY: f64 = 1. / 30.;
 
 /// `get_clock` — ask the MCU for its current clock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +65,234 @@ impl McuResponse for ClockState {
     }
 }
 
+/// The regression that maps host time to the MCU clock.
+///
+/// Upstream's `ClockSync` (`klippy/clocksync.py:12-175`) fits the MCU clock
+/// against the system time at which each `get_clock` was sent, and keeps the
+/// best round-trip time as a lower bound on the latency. This is the part that
+/// carries no transport: it is handed the three numbers a sample produces —
+/// when it was sent, when it came back, and the clock it reported — and exposes
+/// the conversions.
+///
+/// `print_time` and the MCU clock are the same time base:
+/// [`ClockEstimator::print_time_to_clock`] is a plain multiply, exactly as
+/// upstream's (`klippy/clocksync.py:137-138`). What the regression supplies is
+/// the mapping from the **system** clock (the reactor's [`monotonic`]) to that
+/// base, which is how the host learns how much motion the MCU still has
+/// buffered.
+///
+/// [`monotonic`]: Reactor::monotonic
+#[derive(Debug, Clone)]
+pub struct ClockEstimator {
+    mcu_freq: f64,
+    /// 32-bit to 64-bit clock extension; updated on every sample.
+    last_clock: i64,
+    /// EWMA linear regression of the MCU clock against the system sent time.
+    time_avg: f64,
+    time_variance: f64,
+    clock_avg: f64,
+    clock_covariance: f64,
+    prediction_variance: f64,
+    last_prediction_time: f64,
+    /// The best (half) round-trip time seen, and when it was seen.
+    min_half_rtt: f64,
+    min_rtt_time: f64,
+    /// The system-time → clock mapping: `clock_at_sample` at
+    /// `clock_sample_time`, advancing at `clock_freq` ticks per second.
+    clock_sample_time: f64,
+    clock_at_sample: f64,
+    clock_freq: f64,
+    /// Clock queries in flight (`klippy/clocksync.py:22`).
+    queries_pending: u32,
+}
+
+impl ClockEstimator {
+    /// An estimator whose regression has not been seeded yet.
+    ///
+    /// The initial values mirror upstream's `ClockSync.__init__`
+    /// (`klippy/clocksync.py:12-32`): everything zero except the minimum
+    /// round-trip time, which starts at "unseen".
+    pub fn new(mcu_freq: f64) -> Self {
+        Self {
+            mcu_freq,
+            last_clock: 0,
+            time_avg: 0.0,
+            time_variance: 0.0,
+            clock_avg: 0.0,
+            clock_covariance: 0.0,
+            prediction_variance: 0.0,
+            last_prediction_time: 0.0,
+            min_half_rtt: 999_999_999.9,
+            min_rtt_time: 0.0,
+            clock_sample_time: 0.0,
+            clock_at_sample: 0.0,
+            clock_freq: 0.0,
+            queries_pending: 0,
+        }
+    }
+
+    /// The firmware clock frequency this estimator converts with.
+    pub fn mcu_freq(&self) -> f64 {
+        self.mcu_freq
+    }
+
+    /// Set the firmware clock frequency, once identify has read the dictionary.
+    ///
+    /// A value of zero (or less) is ignored so a not-yet-identified MCU cannot
+    /// make the conversions divide by zero.
+    pub fn set_mcu_freq(&mut self, mcu_freq: f64) {
+        if mcu_freq > 0.0 {
+            self.mcu_freq = mcu_freq;
+        }
+    }
+
+    /// The last extended (64-bit) clock value.
+    pub fn last_clock(&self) -> i64 {
+        self.last_clock
+    }
+
+    /// Queries still waiting for a response.
+    pub fn queries_pending(&self) -> u32 {
+        self.queries_pending
+    }
+
+    /// Note that a `get_clock` request went out.
+    pub fn note_query_sent(&mut self) {
+        self.queries_pending += 1;
+    }
+
+    /// Whether the estimate is fresh enough to trust
+    /// (`klippy/clocksync.py:156-157`): upstream stops once more than four
+    /// queries are outstanding.
+    pub fn is_active(&self) -> bool {
+        self.queries_pending <= 4
+    }
+
+    /// Seed the regression from a `get_uptime` sample, as upstream's `connect`
+    /// does (`klippy/clocksync.py:33-51`).
+    ///
+    /// `get_uptime` reports a 64-bit clock with none of `get_clock`'s
+    /// wrap-around, so this fixes `last_clock` *and* gives the regression its
+    /// first point to grow from.
+    pub fn seed(&mut self, sent_time: f64, clock: i64) {
+        self.last_clock = clock;
+        self.clock_avg = clock as f64;
+        self.time_avg = sent_time;
+        self.clock_sample_time = sent_time;
+        self.clock_at_sample = clock as f64;
+        self.clock_freq = self.mcu_freq;
+        self.prediction_variance = (0.001 * self.mcu_freq).powi(2);
+        // Upstream sets this just before its first samples so that none of
+        // them is mistaken for an outlier (`klippy/clocksync.py:46`).
+        self.last_prediction_time = -9999.0;
+    }
+
+    /// Fold one `get_clock` sample in.
+    ///
+    /// Returns whether the sample was used: upstream discards the ones that
+    /// look like an outlier rather than letting them drag the regression
+    /// (`klippy/clocksync.py:68-99`). `clock32` is the firmware's low 32 bits;
+    /// the extension to 64 bits happens here.
+    pub fn update(&mut self, sent_time: f64, receive_time: f64, clock32: u32) -> bool {
+        self.queries_pending = 0;
+        // Extend the clock to 64 bits (`_handle_clock`).
+        self.last_clock += (i64::from(clock32) - self.last_clock) & 0xffff_ffff;
+        let clock = self.last_clock;
+        if !self.update_regression(sent_time, clock) {
+            return false;
+        }
+        let new_freq = if self.time_variance > 0.0 {
+            self.clock_covariance / self.time_variance
+        } else {
+            self.mcu_freq
+        };
+        self.update_best_rtt(sent_time, receive_time);
+        // Upstream also hands the sender a release time here
+        // (`serial.set_clock_est(new_freq, time_avg + TRANSMIT_EXTRA,
+        // clock_avg - 3*stddev)`); with no serial queue to pace, only the
+        // estimate the rest of the host reads is kept.
+        self.clock_sample_time = self.time_avg + self.min_half_rtt;
+        self.clock_at_sample = self.clock_avg;
+        self.clock_freq = new_freq;
+        true
+    }
+
+    /// The EWMA regression step (`klippy/clocksync.py:68-99`).
+    fn update_regression(&mut self, sent_time: f64, clock: i64) -> bool {
+        let clock = clock as f64;
+        let old_freq = self.clock_freq;
+        let exp_clock = (sent_time - self.time_avg) * old_freq + self.clock_avg;
+        let clock_diff2 = (clock - exp_clock).powi(2);
+        if clock_diff2 > 25.0 * self.prediction_variance
+            && clock_diff2 > (0.000_500 * self.mcu_freq).powi(2)
+        {
+            // A sample far from the prediction is either a real disturbance or
+            // a delayed message. A clock *ahead* of the prediction, arriving
+            // soon after the last good sample, is the latter.
+            if clock > exp_clock && sent_time < self.last_prediction_time + 10.0 {
+                return false;
+            }
+            self.prediction_variance = (0.001 * self.mcu_freq).powi(2);
+        } else {
+            self.last_prediction_time = sent_time;
+            self.prediction_variance =
+                (1.0 - DECAY) * (self.prediction_variance + clock_diff2 * DECAY);
+        }
+        let diff_sent_time = sent_time - self.time_avg;
+        self.time_avg += DECAY * diff_sent_time;
+        self.time_variance =
+            (1.0 - DECAY) * (self.time_variance + diff_sent_time * diff_sent_time * DECAY);
+        let diff_clock = clock - self.clock_avg;
+        self.clock_avg += DECAY * diff_clock;
+        self.clock_covariance =
+            (1.0 - DECAY) * (self.clock_covariance + diff_sent_time * diff_clock * DECAY);
+        true
+    }
+
+    /// Track the smallest round-trip time seen, aging the old one
+    /// (`klippy/clocksync.py:101-109`).
+    fn update_best_rtt(&mut self, sent_time: f64, receive_time: f64) {
+        let half_rtt = 0.5 * (receive_time - sent_time);
+        let aged_rtt = (sent_time - self.min_rtt_time) * RTT_AGE;
+        if half_rtt < self.min_half_rtt + aged_rtt {
+            self.min_half_rtt = half_rtt;
+            self.min_rtt_time = sent_time;
+        }
+    }
+
+    /// Seconds of print time to firmware clock ticks
+    /// (`klippy/clocksync.py:137-138`).
+    pub fn print_time_to_clock(&self, print_time: f64) -> i64 {
+        (print_time * self.mcu_freq) as i64
+    }
+
+    /// Firmware clock ticks to seconds of print time
+    /// (`klippy/clocksync.py:139-140`).
+    pub fn clock_to_print_time(&self, clock: i64) -> f64 {
+        clock as f64 / self.mcu_freq
+    }
+
+    /// The estimated clock at a system time (`klippy/clocksync.py:142-144`).
+    pub fn get_clock(&self, eventtime: f64) -> i64 {
+        (self.clock_at_sample + (eventtime - self.clock_sample_time) * self.clock_freq) as i64
+    }
+
+    /// The estimated print time at a system time
+    /// (`klippy/clocksync.py:148-149`).
+    pub fn estimated_print_time(&self, eventtime: f64) -> f64 {
+        self.clock_to_print_time(self.get_clock(eventtime))
+    }
+
+    /// Extend a 32-bit clock reading into the 64-bit domain
+    /// (`klippy/clocksync.py:151-154`).
+    pub fn clock32_to_clock64(&self, clock32: u32) -> i64 {
+        let mut diff = (i64::from(clock32) - self.last_clock) & 0xffff_ffff;
+        // A reading more than 2^31 ahead is really behind (wrap-around).
+        diff -= (diff & 0x8000_0000) << 1;
+        self.last_clock + diff
+    }
+}
+
 /// Reading the firmware clock.
 ///
 /// Implemented for a real MCU by [`McuClock`]. Kept as a trait so callers can
@@ -73,19 +310,36 @@ pub trait ClockSync {
 /// [`ClockSync`] backed by an MCU.
 ///
 /// The handle is shared rather than cloned: the `Mcu` owns the device connection
-/// and shutting it down is tied to dropping the last reference.
-#[derive(Debug)]
+/// and shutting it down is tied to dropping the last reference. Every query
+/// also feeds the [`ClockEstimator`], so this is how the host learns the
+/// mapping from the reactor's clock to the firmware's.
 pub struct McuClock {
     mcu: Arc<Mcu>,
+    reactor: Arc<dyn Reactor>,
     timeout: Duration,
+    estimator: Arc<Mutex<ClockEstimator>>,
+}
+
+impl std::fmt::Debug for McuClock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McuClock")
+            .field("mcu", &self.mcu.name())
+            .field("timeout", &self.timeout)
+            .finish_non_exhaustive()
+    }
 }
 
 impl McuClock {
     /// Create a [`ClockSync`] for `mcu`, using [`CLOCK_TIMEOUT`].
-    pub fn new(mcu: Arc<Mcu>) -> Self {
+    ///
+    /// `reactor` is the host clock each sample is timed against; it is what
+    /// upstream's serial queue would stamp on every message.
+    pub fn new(mcu: Arc<Mcu>, reactor: Arc<dyn Reactor>) -> Self {
         Self {
             mcu,
+            reactor,
             timeout: CLOCK_TIMEOUT,
+            estimator: Arc::new(Mutex::new(ClockEstimator::new(1.0))),
         }
     }
 
@@ -99,15 +353,66 @@ impl McuClock {
     pub fn mcu(&self) -> &Arc<Mcu> {
         &self.mcu
     }
+
+    /// The clock estimate, for reads and for seeding.
+    pub fn estimator(&self) -> MutexGuard<'_, ClockEstimator> {
+        self.estimator
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    /// Seed the estimate from a `get_uptime` sample.
+    ///
+    /// Upstream does this once in `connect` (`klippy/clocksync.py:33-51`),
+    /// before the periodic `get_clock` queries take over.
+    pub fn seed(&self, sent_time: f64, clock: i64) {
+        self.estimator().seed(sent_time, clock);
+    }
+
+    /// Seconds of print time to firmware clock ticks.
+    pub fn print_time_to_clock(&self, print_time: f64) -> i64 {
+        self.estimator().print_time_to_clock(print_time)
+    }
+
+    /// Firmware clock ticks to seconds of print time.
+    pub fn clock_to_print_time(&self, clock: i64) -> f64 {
+        self.estimator().clock_to_print_time(clock)
+    }
+
+    /// The estimated print time at a system time.
+    pub fn estimated_print_time(&self, eventtime: f64) -> f64 {
+        self.estimator().estimated_print_time(eventtime)
+    }
+
+    /// Extend a 32-bit clock reading into the 64-bit domain.
+    pub fn clock32_to_clock64(&self, clock32: u32) -> i64 {
+        self.estimator().clock32_to_clock64(clock32)
+    }
 }
 
 impl ClockSync for McuClock {
     fn get_clock(&self) -> impl Future<Output = Result<ClockState, McuError>> + Send {
         let mcu = Arc::clone(&self.mcu);
+        let reactor = Arc::clone(&self.reactor);
+        let estimator = Arc::clone(&self.estimator);
         let timeout = self.timeout;
         async move {
-            mcu.call_msg::<GetClock, ClockState>(&GetClock, timeout)
-                .await
+            // The send and receive times bracket the exchange, which is what
+            // upstream's serial queue stamps on each message (`#sent_time` /
+            // `#receive_time`).
+            let sent_time = reactor.monotonic();
+            let state = mcu
+                .call_msg::<GetClock, ClockState>(&GetClock, timeout)
+                .await?;
+            let receive_time = reactor.monotonic();
+            let mut estimator = estimator
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            if let Ok(freq) = mcu.clock_freq() {
+                estimator.set_mcu_freq(freq);
+            }
+            estimator.update(sent_time, receive_time, state.clock);
+            Ok(state)
         }
     }
 }
@@ -124,6 +429,7 @@ mod tests {
     use crate::core::klippy::interface::Interface;
     use crate::core::klippy::mcu::Dictionary;
     use crate::core::klippy::msg::proto::Payload;
+    use crate::core::klippy::reactor::ManualReactor;
     use serde_json::json;
 
     /// Only the messages this module needs, as the firmware would publish them.
@@ -166,7 +472,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_clock_reads_firmware_clock() {
         let mcu = mcu_answering(clock_exchange(0x1234_5678));
-        let clock = McuClock::new(Arc::clone(&mcu));
+        let clock = McuClock::new(Arc::clone(&mcu), ManualReactor::shared());
 
         let state = clock.get_clock().await.unwrap();
 
@@ -177,7 +483,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_clock_wraps_around_at_32_bits() {
         let mcu = mcu_answering(clock_exchange(0xffff_ffff));
-        let clock = McuClock::new(mcu);
+        let clock = McuClock::new(mcu, ManualReactor::shared());
 
         assert_eq!(clock.get_clock().await.unwrap().clock, u32::MAX);
     }
@@ -185,7 +491,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_clock_before_identify_fails() {
         let mcu = Mcu::for_test("test_mcu", Interface::new(TestDevice::new(Vec::new())));
-        let clock = McuClock::new(Arc::new(mcu));
+        let clock = McuClock::new(Arc::new(mcu), ManualReactor::shared());
 
         let err = clock.get_clock().await.unwrap_err();
 
@@ -196,7 +502,8 @@ mod tests {
     async fn test_get_clock_times_out_when_mcu_stays_silent() {
         let mcu = Mcu::for_test("test_mcu", Interface::new(TestDevice::new(Vec::new())));
         mcu.install_dictionary(dictionary()).unwrap();
-        let clock = McuClock::new(Arc::new(mcu)).with_timeout(Duration::from_millis(50));
+        let clock = McuClock::new(Arc::new(mcu), ManualReactor::shared())
+            .with_timeout(Duration::from_millis(50));
 
         let err = clock.get_clock().await.unwrap_err();
 
@@ -216,6 +523,88 @@ mod tests {
             let clock = self.0;
             async move { Ok(ClockState { clock }) }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // The clock estimate
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_print_time_and_clock_round_trip() {
+        let estimator = ClockEstimator::new(20_000_000.0);
+
+        assert_eq!(estimator.print_time_to_clock(1.5), 30_000_000);
+        assert_eq!(estimator.clock_to_print_time(30_000_000), 1.5);
+    }
+
+    #[test]
+    fn test_the_regression_converges_on_the_clock_frequency() {
+        let freq = 20_000_000.0;
+        let mut estimator = ClockEstimator::new(freq);
+        estimator.seed(1.0, freq as i64);
+        // Samples of a clock running at exactly `freq`, taken every 0.2 s.
+        for i in 0..300 {
+            let at = 1.0 + i as f64 * 0.2;
+            assert!(
+                estimator.update(at, at + 0.000_5, (at * freq) as u32),
+                "{at}"
+            );
+        }
+
+        // The estimate at a later system time tracks the real clock.
+        let predicted = estimator.estimated_print_time(100.0);
+        assert!((predicted - 100.0).abs() < 0.01, "{predicted}");
+    }
+
+    #[test]
+    fn test_an_outlier_sample_is_discarded() {
+        let freq = 20_000_000.0;
+        let mut estimator = ClockEstimator::new(freq);
+        estimator.seed(1.0, freq as i64);
+        for i in 0..10 {
+            let at = 1.0 + i as f64 * 0.2;
+            assert!(estimator.update(at, at + 0.000_5, (at * freq) as u32));
+        }
+
+        // A clock a full second ahead, arriving immediately, is a queued or
+        // delayed message, not a real jump (`klippy/clocksync.py:74-83`).
+        let at = 1.0 + 10.0 * 0.2;
+        let ahead = ((at + 1.0) * freq) as u32;
+
+        assert!(!estimator.update(at, at + 0.000_5, ahead));
+    }
+
+    #[test]
+    fn test_clock32_extends_around_the_wrap() {
+        let mut estimator = ClockEstimator::new(1.0);
+        estimator.seed(0.0, 0xffff_fff0);
+
+        assert_eq!(estimator.clock32_to_clock64(0x10), 0x1_0000_0010);
+    }
+
+    #[test]
+    fn test_estimated_print_time_advances_with_the_system_clock() {
+        let freq = 20_000_000.0;
+        let mut estimator = ClockEstimator::new(freq);
+        estimator.seed(10.0, (10.0 * freq) as i64);
+
+        // Before any get_clock sample, the seed's frequency is used.
+        assert!((estimator.estimated_print_time(11.0) - 11.0).abs() < 1e-6);
+        assert!((estimator.estimated_print_time(12.0) - 12.0).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn test_a_query_updates_the_estimate() {
+        let mcu = mcu_answering(clock_exchange(1234));
+        let clock = McuClock::new(Arc::clone(&mcu), ManualReactor::shared());
+
+        clock.get_clock().await.unwrap();
+
+        // The sample was folded in: the 64-bit clock advanced to the value the
+        // firmware reported, and the frequency came from the dictionary.
+        let estimator = clock.estimator();
+        assert_eq!(estimator.last_clock(), 1234);
+        assert_eq!(estimator.mcu_freq(), 20_000_000.0);
     }
 
     #[tokio::test]

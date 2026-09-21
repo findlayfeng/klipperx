@@ -462,7 +462,7 @@ kinematics 已随 Printer 重构删除，从这里重新开始。动工前调查
 
 | 阶段 | 内容 | 验收 |
 |---|---|---|
-| FW5a | `Coord`；`clocksync` 回归（`print_time_to_clock`/`estimated_print_time`/`clock32_to_clock64`） | host 单测；假 MCU |
+| FW5a | ✅ `Coord`（`mathutil.rs`）；`clocksync` 回归（`ClockEstimator` + `McuClock`） | host 单测（10 个） |
 | FW5b | `Move`、`LookAheadQueue`、`trapq` | host 单测（与上游公式对拍） |
 | FW5c | `itersolve` + `kin_cartesian`；`stepcompress` 简化 | host 单测；假 MCU 流程能过 |
 | FW5d | `MotionQueuing`、`ToolHead`、`McuStepper`/`Rail` | 假 MCU：`G1` 出正确的 `queue_step` |
@@ -714,12 +714,13 @@ ack」settle，并用 `Mcu::took_over_session()` 让 `rpi_usb` 判断“有没�
 
 ### H12 核心工具补齐
 
-- [ ] `mathutil.py`：kinematics / probe / mesh 用的几何与线性代数（`trilateration`、
-      `gaussian_solve` 等）——`Coord` 随 **FW5a**，几何算法随 delta/probe（H9）。
+- [x] `mathutil.py` 的 `Coord`：`mathutil.rs` 的 `Coord([f64; 4])`（FW5a）；几何算法
+      （`trilateration`/`gaussian_solve`）随 delta/probe（H9）。
 - [ ] `util.py` 的反射与注册表 helper：`get_heater` / `get_sensor` / 前缀式
       `lookup_objects`（**Q5**）。
-- [ ] `clocksync.py`：`print_time` ↔ MCU clock 偏移估计（`cmd/clock.rs` 现只有
-      `get_clock`）——随 **FW5a**。
+- [x] `clocksync.py`：`cmd/clock.rs` 的 `ClockEstimator`（EWMA 回归、最小 RTT、`print_time_to_clock`/
+      `estimated_print_time`/`clock32_to_clock64`）+ `McuClock` 接入（每个 `get_clock` 采样一次，
+      FW5a）。
 - [ ] `pins.py` 消费侧接口（`get_pin_type`、重命名等）——随 **H7** 等消费者。
 
 ## 未决问题

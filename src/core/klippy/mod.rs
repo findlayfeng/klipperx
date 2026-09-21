@@ -15,6 +15,7 @@ pub mod frame;
 pub mod gcode;
 pub mod identify;
 pub mod load;
+pub mod mathutil;
 pub mod mcu;
 pub mod msg;
 pub mod pins;

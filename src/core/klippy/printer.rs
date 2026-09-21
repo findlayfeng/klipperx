@@ -20,8 +20,11 @@
 // This module defines:
 // - `PrinterState`: printer state categories
 // - `StateMessage`: state message returned by `Printer::get_state_message`
-// - `PrinterEvent`: the lifecycle events a printer fires at its handlers
 // - `Printer`: the machine
+//
+// The events a printer fires at its handlers are [`KlippyEvent`]s, defined in
+// `event/printer_bus.rs` and generated from `event/decl/`; the printer only
+// registers and dispatches them.
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -34,6 +37,7 @@ use tracing::error;
 
 use crate::core::klippy::config::value::ConfigValue;
 use crate::core::klippy::error::KlippyError;
+use crate::core::klippy::event::KlippyEvent;
 use crate::core::klippy::reactor::Reactor;
 
 // ===========================================================================
@@ -81,49 +85,6 @@ pub struct StateMessage {
     pub message: String,
     /// The state category (startup/ready/shutdown/error)
     pub category: PrinterState,
-}
-
-// ===========================================================================
-// PrinterEvent
-// ===========================================================================
-
-/// An event a printer fires at its handlers.
-///
-/// Each variant maps to a wire event name (see [`PrinterEvent::as_str`]).
-///
-/// Upstream's event set is larger. Three events are absent here:
-///
-/// * `klippy:mcu_identify` — fired between loading the config and connecting
-///   the MCUs, which is a step a printer with no MCUs does not have;
-/// * `klippy:analyze_shutdown` and `klippy:notify_mcu_error` — upstream calls
-///   their handlers with the message and details being reported, which a
-///   zero-argument handler cannot receive. They come back with the error
-///   reporting that needs them (a payload-carrying event type).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum PrinterEvent {
-    /// Every MCU is connected
-    Connect,
-    /// The printer is ready to accept commands
-    Ready,
-    /// The printer has halted
-    Shutdown,
-    /// The run loop has ended
-    Disconnect,
-    /// The run loop ended because a firmware restart was asked for
-    FirmwareRestart,
-}
-
-impl PrinterEvent {
-    /// Get the event name string (e.g. "klippy:ready")
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            PrinterEvent::Connect => "klippy:connect",
-            PrinterEvent::Ready => "klippy:ready",
-            PrinterEvent::Shutdown => "klippy:shutdown",
-            PrinterEvent::Disconnect => "klippy:disconnect",
-            PrinterEvent::FirmwareRestart => "klippy:firmware_restart",
-        }
-    }
 }
 
 // ===========================================================================
@@ -248,6 +209,12 @@ pub struct Printer {
     config_overrides: Mutex<HashMap<String, HashMap<String, ConfigValue>>>,
 }
 
+/// A registered event handler.
+///
+/// The callback receives the event it was registered for, so one that needs the
+/// payload can read it and one that does not can ignore the argument.
+type EventHandler = Arc<dyn Fn(&KlippyEvent) + Send + Sync>;
+
 struct Inner {
     /// The message the printer reports, for the user.
     message: String,
@@ -257,8 +224,12 @@ struct Inner {
     shutdown: bool,
     /// What `run` returns once the loop ends, set by `request_exit`.
     run_result: Option<String>,
-    /// Handlers per event, in registration order.
-    handlers: HashMap<PrinterEvent, Vec<Arc<dyn Fn() + Send + Sync>>>,
+    /// Handlers per event name, in registration order.
+    ///
+    /// Keyed by [`KlippyEvent::name`] rather than by the enum so that
+    /// [`KlippyEvent::Unknown`] — whose name is not known at compile time —
+    /// shares the same table.
+    handlers: HashMap<String, Vec<EventHandler>>,
     /// How many parts the registry held before the config was loaded — the
     /// host's own (`webhooks`). [`Printer::reset_for_restart`] keeps these and
     /// drops everything after them.
@@ -475,16 +446,18 @@ impl Printer {
     /// Register a callback for a specific event.
     ///
     /// Handlers run in registration order, on the thread that fires the event,
-    /// and take no arguments. Like the printer's own callbacks upstream, they
-    /// must not block. Boxed because a handler list holds many of them.
+    /// and receive the event itself: a handler that needs the payload reads it
+    /// from the variant, and one that does not ignores the argument. Like the
+    /// printer's own callbacks upstream, they must not block. Boxed because a
+    /// handler list holds many of them.
     pub fn register_event_handler(
         &self,
-        event: PrinterEvent,
-        callback: Box<dyn Fn() + Send + Sync>,
+        event: KlippyEvent,
+        callback: Box<dyn Fn(&KlippyEvent) + Send + Sync>,
     ) {
         self.lock()
             .handlers
-            .entry(event)
+            .entry(event.name().to_string())
             .or_default()
             .push(Arc::from(callback));
     }
@@ -494,13 +467,30 @@ impl Printer {
     /// The handlers are collected under the lock and run without it: a handler
     /// may itself ask the printer to exit, and a lock held across callbacks
     /// would deadlock there.
-    pub fn send_event(&self, event: &PrinterEvent) {
-        let handlers = match self.lock().handlers.get(event) {
+    ///
+    /// Each handler is isolated, as upstream's `try`/`except` isolates the
+    /// handlers of `klippy:shutdown` and `klippy:analyze_shutdown`: a panic is
+    /// logged and the remaining handlers still run. An event with no registered
+    /// handlers is ignored, except that an
+    /// [`Unknown`](KlippyEvent::Unknown) event is warned about, since it means
+    /// upstream sent a name this build does not know.
+    pub fn send_event(&self, event: &KlippyEvent) {
+        let handlers = match self.lock().handlers.get(event.name()) {
             Some(handlers) => handlers.clone(),
-            None => return,
+            None => {
+                if matches!(event, KlippyEvent::Unknown { .. }) {
+                    tracing::warn!(event = event.name(), "unhandled unknown event");
+                }
+                return;
+            }
         };
         for handler in handlers {
-            handler();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                handler(event);
+            }));
+            if let Err(panic) = result {
+                error!(event = event.name(), "event handler panicked: {panic:?}");
+            }
         }
     }
 
@@ -526,10 +516,11 @@ impl Printer {
     /// Halt the printer with a message for the user.
     ///
     /// The printer moves to the `shutdown` category and fires
-    /// `klippy:shutdown`. Halting does not end the run loop: the printer stays
-    /// up so that clients can still read why it stopped, until something asks
-    /// it to exit. The first message stands; later ones are ignored, as
-    /// upstream does.
+    /// `klippy:shutdown` and then `klippy:analyze_shutdown`, the latter with
+    /// the message and empty details, as upstream does. Halting does not end
+    /// the run loop: the printer stays up so that clients can still read why it
+    /// stopped, until something asks it to exit. The first message stands;
+    /// later ones are ignored, so the shutdown events fire once.
     pub fn invoke_shutdown(&self, msg: &str) {
         {
             let mut inner = self.lock();
@@ -542,7 +533,11 @@ impl Printer {
         }
 
         error!("Transition to shutdown state: {msg}");
-        self.send_event(&PrinterEvent::Shutdown);
+        self.send_event(&KlippyEvent::KlippyShutdown);
+        self.send_event(&KlippyEvent::KlippyAnalyzeShutdown {
+            msg: msg.to_string(),
+            details: HashMap::new(),
+        });
     }
 
     /// Ask the printer to leave its run loop.
@@ -581,9 +576,9 @@ impl Printer {
         // for a firmware restart says so before everyone is told the printer is
         // gone.
         if result == "firmware_restart" {
-            self.send_event(&PrinterEvent::FirmwareRestart);
+            self.send_event(&KlippyEvent::KlippyFirmwareRestart);
         }
-        self.send_event(&PrinterEvent::Disconnect);
+        self.send_event(&KlippyEvent::KlippyDisconnect);
 
         result
     }
@@ -656,7 +651,8 @@ impl Printer {
     /// connect halts the printer with the reason, as upstream's `_connect`
     /// does. The state is re-checked after every step: a printer that shut down
     /// while connecting never becomes ready, and the `klippy:connect` event is
-    /// only fired once every object is up.
+    /// only fired once every object is up. `klippy:mcu_identify` is fired first,
+    /// before any object connects.
     pub async fn bring_up(&self) {
         // A printer that was already halted — a config the loader rejected, a
         // shutdown that raced this call — has nothing to bring up. Connecting
@@ -664,6 +660,11 @@ impl Printer {
         if self.category() != PrinterState::Startup {
             return;
         }
+
+        // Upstream fires this right after the config is read and before the
+        // objects connect (`klippy/klippy.py`: `_connect`), so an object that
+        // wants to react to the config does so before the MCUs are up.
+        self.send_event(&KlippyEvent::KlippyMcuIdentify);
 
         for (name, object) in self.registry() {
             if let Err(err) = object.connect().await {
@@ -675,7 +676,7 @@ impl Printer {
             }
         }
 
-        self.send_event(&PrinterEvent::Connect);
+        self.send_event(&KlippyEvent::KlippyConnect);
 
         {
             let mut inner = self.lock();
@@ -686,7 +687,7 @@ impl Printer {
             inner.category = PrinterState::Ready;
         }
 
-        self.send_event(&PrinterEvent::Ready);
+        self.send_event(&KlippyEvent::KlippyReady);
     }
 
     /// The registry as a snapshot, so connecting does not hold its lock across
@@ -746,13 +747,17 @@ mod tests {
         Printer::new(Arc::new(ManualReactor::new()))
     }
 
-    /// Register a handler that records the event name it was called for.
-    fn record(printer: &Printer, event: PrinterEvent, log: &Arc<Mutex<Vec<&'static str>>>) {
+    /// Register a handler that records the name it was called for.
+    fn record(
+        printer: &Printer,
+        name: &'static str,
+        event: KlippyEvent,
+        log: &Arc<Mutex<Vec<&'static str>>>,
+    ) {
         let log = Arc::clone(log);
-        let name = event.as_str();
         printer.register_event_handler(
             event,
-            Box::new(move || log.lock().unwrap_or_else(|p| p.into_inner()).push(name)),
+            Box::new(move |_| log.lock().unwrap_or_else(|p| p.into_inner()).push(name)),
         );
     }
 
@@ -802,13 +807,30 @@ mod tests {
 
     #[test]
     fn test_event_names_are_the_wire_names() {
-        assert_eq!(PrinterEvent::Connect.as_str(), "klippy:connect");
-        assert_eq!(PrinterEvent::Ready.as_str(), "klippy:ready");
-        assert_eq!(PrinterEvent::Shutdown.as_str(), "klippy:shutdown");
-        assert_eq!(PrinterEvent::Disconnect.as_str(), "klippy:disconnect");
+        assert_eq!(KlippyEvent::KlippyMcuIdentify.name(), "klippy:mcu_identify");
+        assert_eq!(KlippyEvent::KlippyConnect.name(), "klippy:connect");
+        assert_eq!(KlippyEvent::KlippyReady.name(), "klippy:ready");
+        assert_eq!(KlippyEvent::KlippyShutdown.name(), "klippy:shutdown");
+        assert_eq!(KlippyEvent::KlippyDisconnect.name(), "klippy:disconnect");
         assert_eq!(
-            PrinterEvent::FirmwareRestart.as_str(),
+            KlippyEvent::KlippyFirmwareRestart.name(),
             "klippy:firmware_restart"
+        );
+        assert_eq!(
+            KlippyEvent::KlippyAnalyzeShutdown {
+                msg: String::new(),
+                details: HashMap::new(),
+            }
+            .name(),
+            "klippy:analyze_shutdown"
+        );
+        assert_eq!(
+            KlippyEvent::Unknown {
+                name: "future:event".to_string(),
+                params: HashMap::new(),
+            }
+            .name(),
+            "future:event"
         );
     }
 
@@ -827,8 +849,8 @@ mod tests {
         let ready = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&ready);
         printer.register_event_handler(
-            PrinterEvent::Ready,
-            Box::new(move || {
+            KlippyEvent::KlippyReady,
+            Box::new(move |_| {
                 counter.fetch_add(1, Ordering::SeqCst);
             }),
         );
@@ -845,15 +867,26 @@ mod tests {
     async fn test_the_lifecycle_events_fire_in_order() {
         let printer = new_printer();
         let log = Arc::new(Mutex::new(Vec::new()));
-        for event in [
-            PrinterEvent::Connect,
-            PrinterEvent::Ready,
-            PrinterEvent::Shutdown,
-            PrinterEvent::FirmwareRestart,
-            PrinterEvent::Disconnect,
-        ] {
-            record(&printer, event, &log);
-        }
+        record(
+            &printer,
+            "klippy:mcu_identify",
+            KlippyEvent::KlippyMcuIdentify,
+            &log,
+        );
+        record(&printer, "klippy:connect", KlippyEvent::KlippyConnect, &log);
+        record(&printer, "klippy:ready", KlippyEvent::KlippyReady, &log);
+        record(
+            &printer,
+            "klippy:firmware_restart",
+            KlippyEvent::KlippyFirmwareRestart,
+            &log,
+        );
+        record(
+            &printer,
+            "klippy:disconnect",
+            KlippyEvent::KlippyDisconnect,
+            &log,
+        );
         printer.request_exit("firmware_restart");
 
         printer.bring_up().await;
@@ -861,6 +894,7 @@ mod tests {
         assert_eq!(
             *log.lock().unwrap(),
             [
+                "klippy:mcu_identify",
                 "klippy:connect",
                 "klippy:ready",
                 "klippy:firmware_restart",
@@ -876,12 +910,12 @@ mod tests {
         for name in ["first", "second"] {
             let order = Arc::clone(&order);
             printer.register_event_handler(
-                PrinterEvent::Ready,
-                Box::new(move || order.lock().unwrap().push(name)),
+                KlippyEvent::KlippyReady,
+                Box::new(move |_| order.lock().unwrap().push(name)),
             );
         }
 
-        printer.send_event(&PrinterEvent::Ready);
+        printer.send_event(&KlippyEvent::KlippyReady);
 
         assert_eq!(*order.lock().unwrap(), ["first", "second"]);
     }
@@ -1015,8 +1049,8 @@ mod tests {
         let fired = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&fired);
         printer.register_event_handler(
-            PrinterEvent::Ready,
-            Box::new(move || {
+            KlippyEvent::KlippyReady,
+            Box::new(move |_| {
                 counter.fetch_add(1, Ordering::SeqCst);
             }),
         );
@@ -1028,7 +1062,7 @@ mod tests {
         // The handler was registered by a part that is gone, the old exit must
         // not decide the next run, and the next bring-up knows what it is for.
         assert_eq!(printer.start_reason().as_deref(), Some("firmware_restart"));
-        printer.send_event(&PrinterEvent::Ready);
+        printer.send_event(&KlippyEvent::KlippyReady);
         printer.request_exit("firmware_restart");
         assert_eq!(fired.load(Ordering::SeqCst), 0);
         assert_eq!(printer.run(), "firmware_restart");
@@ -1049,8 +1083,8 @@ mod tests {
         let halts = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&halts);
         printer.register_event_handler(
-            PrinterEvent::Shutdown,
-            Box::new(move || {
+            KlippyEvent::KlippyShutdown,
+            Box::new(move |_| {
                 counter.fetch_add(1, Ordering::SeqCst);
             }),
         );
@@ -1070,6 +1104,79 @@ mod tests {
         printer.invoke_shutdown("something else went wrong");
 
         assert_eq!(printer.get_state_message().message, "Printer is halted");
+    }
+
+    #[test]
+    fn test_analyze_shutdown_carries_the_message() {
+        let printer = new_printer();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&seen);
+        printer.register_event_handler(
+            KlippyEvent::KlippyAnalyzeShutdown {
+                msg: String::new(),
+                details: HashMap::new(),
+            },
+            Box::new(move |event| {
+                if let KlippyEvent::KlippyAnalyzeShutdown { msg, .. } = event {
+                    captured.lock().unwrap().push(msg.clone());
+                }
+            }),
+        );
+
+        printer.invoke_shutdown("Printer is halted");
+
+        assert_eq!(*seen.lock().unwrap(), ["Printer is halted"]);
+    }
+
+    #[test]
+    fn test_a_panicking_handler_does_not_stop_the_others() {
+        let printer = new_printer();
+        let fired = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&fired);
+        printer.register_event_handler(
+            KlippyEvent::KlippyReady,
+            Box::new(|_| panic!("handler failed")),
+        );
+        printer.register_event_handler(
+            KlippyEvent::KlippyReady,
+            Box::new(move |_| {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+
+        printer.send_event(&KlippyEvent::KlippyReady);
+
+        assert_eq!(fired.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_an_unknown_event_is_dispatched_by_name() {
+        // Upstream may send a name this build has no variant for. It reaches a
+        // handler registered under that name, and firing one with no handler
+        // must not panic.
+        let printer = new_printer();
+        let fired = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&fired);
+        printer.register_event_handler(
+            KlippyEvent::Unknown {
+                name: "future:event".to_string(),
+                params: HashMap::new(),
+            },
+            Box::new(move |_| {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+
+        printer.send_event(&KlippyEvent::Unknown {
+            name: "future:event".to_string(),
+            params: HashMap::new(),
+        });
+        printer.send_event(&KlippyEvent::Unknown {
+            name: "never:seen".to_string(),
+            params: HashMap::new(),
+        });
+
+        assert_eq!(fired.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

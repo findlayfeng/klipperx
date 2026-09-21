@@ -11,7 +11,7 @@
 | 编解码引擎 | `src/core/klippy/msg/` | 格式串 ↔ 字节 | **不知道**：只认 `%u` / `%.*s` |
 | MCU 传输 | `src/core/klippy/mcu/` | 帧收发、`Parser`、数据字典、裸命名访问（`send` / `call`） | 只知道 `identify` 一对（起始 `Parser`） |
 | 命令层 | `src/core/klippy/cmd/` | 命令词汇（`McuCommand` / `McuResponse` / `Params`）、类型化调用、各命令模块 | 全部 |
-| 事件层 | `src/core/klippy/event/` | 事件词汇（`McuEvent`）、回调注册（`Mcu::bind_event`）、各事件模块 | 事件消息（当前只有 `stats`） |
+| 事件层 | `src/core/klippy/event/` | 固件事件词汇（`McuEvent`）、回调注册（`Mcu::bind_event`）；打印机级事件词汇（`KlippyEvent`，由 `build.rs` 生成） | 事件消息（当前 `stats` / `shutdown`）、打印机事件声明 |
 | Identify 引导 | `src/core/klippy/identify.rs` | 主机自有格式、分块驱动与解压、`connect` / `identify` 入口 | `identify` 一对 |
 | 客户端 API | `crates/klippy-api/` + `src/core/klippy/api/` | Unix Domain Socket、`0x03` 分帧、请求分发、端点与推送 | **不涉及**：只认客户端端点 |
 
@@ -169,13 +169,23 @@ klipperx（bin，src/main.rs）
 
 ### `event/` — 事件层
 
-与 `cmd` 平级的目录：命令由主机发起，事件由固件发起，两者的注册与投递方式不同，因此分成两层。事件层复用命令层的 `Params`，不引用任何具体命令模块。
+与 `cmd` 平级的目录。这里有两套机制：
+
+- **固件事件**由固件发起，经 `Mcu::bind_event` 绑到响应名上（`McuEvent`）；
+- **打印机事件**由主机自身触发（生命周期、重启、部件状态变化），词汇是 `KlippyEvent`，
+  由 `Printer::register_event_handler` / `send_event` 按事件名注册与分发。
+
+两者分开：固件事件的格式来自字典，打印机事件的名字来自上游 `klippy` 的字符串集合。
+固件事件层复用命令层的 `Params`，不引用具体命令模块；打印机事件层的设计与对应关系见
+[事件系统](event-system.md)。
 
 | 文件 | 职责 |
 |------|------|
-| `mod.rs` | 事件词汇：`McuEvent`，以及回调注册 `Mcu::bind_event`（底层 `Mcu::bind_callback` 在 `mcu`） |
+| `mod.rs` | 固件事件词汇：`McuEvent`，以及回调注册 `Mcu::bind_event`（底层 `Mcu::bind_callback` 在 `mcu`）；列出 `decl` 与 `printer_bus` |
 | `stats.rs` | `stats` 事件（`basecmd.c` 的 `stats_update` 定时推送）；`register_stats_logging` 为占位订阅（只记日志） |
 | `shutdown.rs` | `shutdown` / `is_shutdown` / `starting`：固件停机/重启事件；`static_string_id` 经字典枚举解成原因文本，由 `McuObject` 绑成打印机停机 |
+| `printer_bus.rs` | `KlippyEvent`：`include!` 由 `build.rs` 写入 `OUT_DIR` 的生成文件 |
+| `decl/` | 打印机事件声明，一个命名空间一个文件，供 `build.rs` 扫描；`mod.rs` 定义空展开的 `event!` 宏 |
 
 ### `identify.rs` — Identify 引导
 

@@ -44,7 +44,8 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use serde_json::{json, Map, Value};
 use tracing::{info, warn};
 
-use crate::core::klippy::printer::{Printer, PrinterEvent, PrinterObject};
+use crate::core::klippy::event::KlippyEvent;
+use crate::core::klippy::printer::{Printer, PrinterObject};
 
 /// The name other modules use to find the dispatcher.
 pub const GCODE_OBJECT: &str = "gcode";
@@ -315,8 +316,8 @@ impl GCodeDispatch {
         {
             let inner = Arc::clone(&dispatch.inner);
             dispatch.inner.printer.register_event_handler(
-                PrinterEvent::Ready,
-                Box::new(move || {
+                KlippyEvent::KlippyReady,
+                Box::new(move |_| {
                     inner.set_ready(true);
                     inner.respond_info("Klipper state: Ready", false);
                 }),
@@ -325,8 +326,8 @@ impl GCodeDispatch {
         {
             let inner = Arc::clone(&dispatch.inner);
             dispatch.inner.printer.register_event_handler(
-                PrinterEvent::Shutdown,
-                Box::new(move || {
+                KlippyEvent::KlippyShutdown,
+                Box::new(move |_| {
                     inner.set_ready(false);
                     inner.respond_info("Klipper state: Shutdown", false);
                 }),
@@ -335,8 +336,8 @@ impl GCodeDispatch {
         {
             let inner = Arc::clone(&dispatch.inner);
             dispatch.inner.printer.register_event_handler(
-                PrinterEvent::Disconnect,
-                Box::new(move || inner.respond_info("Klipper state: Disconnect", false)),
+                KlippyEvent::KlippyDisconnect,
+                Box::new(move |_| inner.respond_info("Klipper state: Disconnect", false)),
             );
         }
 

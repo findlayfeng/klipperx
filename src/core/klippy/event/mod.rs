@@ -37,13 +37,17 @@
 //! |---|---|
 //! | [`stats`] | `stats` — periodic scheduler timing from `stats_update` |
 //! | [`shutdown`] | `shutdown` / `is_shutdown` / `starting` — the firmware stopping or restarting |
+//! | [`printer_bus`] | [`KlippyEvent`] — the host's own events, generated from `decl` |
 
+pub(crate) mod decl;
+pub mod printer_bus;
 pub mod shutdown;
 pub mod stats;
 
 #[cfg(test)]
 mod test_support;
 
+pub use printer_bus::KlippyEvent;
 pub use shutdown::{IsShutdown, Shutdown, Starting};
 pub use stats::Stats;
 

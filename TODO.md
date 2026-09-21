@@ -463,7 +463,7 @@ kinematics 已随 Printer 重构删除，从这里重新开始。动工前调查
 | 阶段 | 内容 | 验收 |
 |---|---|---|
 | FW5a | ✅ `Coord`（`mathutil.rs`）；`clocksync` 回归（`ClockEstimator` + `McuClock`） | host 单测（10 个） |
-| FW5b | `Move`、`LookAheadQueue`、`trapq` | host 单测（与上游公式对拍） |
+| FW5b | ✅ `Move`、`LookAheadQueue`、`trapq` | host 单测（13 个） |
 | FW5c | `itersolve` + `kin_cartesian`；`stepcompress` 简化 | host 单测；假 MCU 流程能过 |
 | FW5d | `MotionQueuing`、`ToolHead`、`McuStepper`/`Rail` | 假 MCU：`G1` 出正确的 `queue_step` |
 | FW5e | `Kinematics` + `kinematics/cartesian`；`[printer]` late 住户；`G1`（G4） | 真板：单轴 → 三轴 + `[extruder]` |

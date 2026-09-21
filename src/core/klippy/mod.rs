@@ -17,6 +17,7 @@ pub mod identify;
 pub mod load;
 pub mod mathutil;
 pub mod mcu;
+pub mod motion;
 pub mod msg;
 pub mod pins;
 pub mod printer;

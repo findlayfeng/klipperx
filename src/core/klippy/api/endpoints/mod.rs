@@ -51,6 +51,7 @@ pub mod info;
 pub mod objects_list;
 pub mod objects_query;
 pub mod objects_subscribe;
+pub mod query_endstops;
 
 pub use emergency_stop::EmergencyStop;
 pub use gcode::{GcodeHelp, GcodeRestart, GcodeScript, GcodeSubscribeOutput};

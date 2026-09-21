@@ -38,8 +38,12 @@ use serde_json::{json, Value};
 
 use crate::core::klippy::config::ConfigSection;
 use crate::core::klippy::gcode::{CommandError, CommandHandler, GCodeDispatch, GCODE_OBJECT};
+use crate::core::klippy::load::section;
 use crate::core::klippy::pins::{DigitalOut, PrinterPins, PwmOut, PINS_OBJECT};
 use crate::core::klippy::printer::{Printer, PrinterObject};
+
+// Only the prefix form (`[output_pin <name>]`) exists upstream.
+section!("output_pin", order = 20, prefix = load_config_prefix);
 
 /// One configured `[output_pin <name>]`.
 ///

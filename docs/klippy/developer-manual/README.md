@@ -231,7 +231,8 @@ identify 的命令**定义**（名称、参数、解码）与其它命令一样�
 ### `extras/` — 建立在核心之上的 `[<section>]` 模块
 
 对应上游 `klippy/extras/`：它们是核心（pin 层、G-Code 调度器、MCU 配置）的**使用者**，
-通过 `load.rs` 的工厂表接入，核心不反过来引用它们。
+通过 `load.rs` 的工厂表接入，核心不反过来引用它们。工厂表由各模块顶层的 `section!` 声明
+生成（[声明式表生成](codegen.md)），因此新增段落不必改中心表。
 
 | 文件 | 职责 |
 |------|------|
@@ -246,8 +247,8 @@ identify 的命令**定义**（名称、参数、解码）与其它命令一样�
 
 | 文件 | 职责 |
 |------|------|
-| `mod.rs` | 说明主机侧与 API 的分界，把 `klippy-api` 的四个模块转出，并提供 `register`：一次把服务器这一侧（`webhooks` + 端点）装到机器上 |
-| `endpoints/` | 一个端点一个文件：`info.rs`、`objects_list.rs`、`objects_query.rs`、`objects_subscribe.rs`、`gcode.rs`；参数、响应形状与 handler 都在各文件里。`objects/query` 与 `objects/subscribe` 共用字段选择（`select_fields` / `status_object`），`gcode/*` 按请求从 `printer` 里取 `gcode` |
+| `mod.rs` | 说明主机侧与 API 的分界，把 `klippy-api` 的四个模块转出，并提供 `register`：一次把服务器这一侧（`webhooks` + 端点）装到机器上。端点来自各模块 `endpoint!` 声明生成的安装函数表（[声明式表生成](codegen.md)），`register` 只负责先装 `webhooks` 再遍历该表 |
+| `endpoints/` | 一个端点一个文件：`info.rs`、`objects_list.rs`、`objects_query.rs`、`objects_subscribe.rs`、`gcode.rs`；参数、响应形状、handler 与安装函数都在各文件里。`objects/query` 与 `objects/subscribe` 共用字段选择（`select_fields` / `status_object`），`gcode/*` 按请求从 `printer` 里取 `gcode` |
 | `webhooks.rs` | 服务器自己的打印机对象：名字与字段对齐上游 `webhooks.get_status`，读的是机器状态 |
 | `start_args.rs` | 主机启动参数（`config_file` / `log_file` / `software_version` / `cpu_info`）：上游放在 printer 上（29 处 `get_start_args`），这里归主机侧，`info` 是第一个消费者 |
 
@@ -287,6 +288,7 @@ API 本身在 `crates/klippy-api/src/`：
 - [Identify 机制](identify.md) — 主机与 MCU 间的数据字典协商流程
 - [时钟与定时器（reactor）](reactor.md) — 机器的时钟、定时器契约，以及与上游 reactor/greenlet 的对应
 - [事件系统](event-system.md) — 打印机级事件总线：事件清单、触发时序、编译期代码生成与处理器约定
+- [声明式表生成（build.rs）](codegen.md) — 事件/段落/端点三类「声明在模块、聚合在编译期」的表的机制、语法与约束
 - [运行时编排（机器与 API）](runtime.md) — 两个 runtime：机器专用、API 一个，以及边界约定与停机顺序
 - [延迟与抖动（主机侧）](latency.md) — 抖动从哪来，以及要不要绑核（结论：先度量，不急）
 - [压力测试（`klipperx stress`）](stress.md) — 给一块 MCU 逐步加大步进或链路负载，直到它出错

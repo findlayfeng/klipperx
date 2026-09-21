@@ -12,6 +12,11 @@
 //! `load_config_prefix` — the same two entry points upstream looks up on the
 //! module (`klippy/klippy.py:90-99`).
 //!
+//! The table is **generated** from the `section!` declarations in the modules
+//! that own sections (see `build.rs`): a module is one declaration next to the
+//! factory it names, so adding a section never edits a central list. Each
+//! declaration carries an `order`, because load order is part of the contract.
+//!
 //! The step itself is [`Printer::load_config`], defined here rather than in
 //! `printer.rs` so that the machine's core does not import its parts — the same
 //! split as `Mcu::connect` living in `identify.rs`.
@@ -34,12 +39,7 @@ use std::sync::Arc;
 
 use crate::core::klippy::config::{Config, ConfigSection};
 use crate::core::klippy::error::KlippyError;
-use crate::core::klippy::extras::board_pins::{
-    load_config as load_board_pins, load_config_prefix as load_board_pins_prefix,
-};
-use crate::core::klippy::extras::output_pin::load_config_prefix as load_output_pin;
 use crate::core::klippy::gcode::{GCodeDispatch, GCODE_OBJECT};
-use crate::core::klippy::mcu::{load_config as load_mcu, load_config_prefix as load_mcu_prefix};
 use crate::core::klippy::pins::{PrinterPins, PINS_OBJECT};
 use crate::core::klippy::printer::{Printer, PrinterObject};
 
@@ -65,30 +65,24 @@ pub struct Factories {
     pub load_config_prefix: Option<LoadConfig>,
 }
 
-/// Every section id this host knows, in load order.
-const FACTORIES: &[(&str, Factories)] = &[
-    (
-        "mcu",
-        Factories {
-            load_config: Some(load_mcu),
-            load_config_prefix: Some(load_mcu_prefix),
-        },
-    ),
-    (
-        "output_pin",
-        Factories {
-            load_config: None,
-            load_config_prefix: Some(load_output_pin),
-        },
-    ),
-    (
-        "board_pins",
-        Factories {
-            load_config: Some(load_board_pins),
-            load_config_prefix: Some(load_board_pins_prefix),
-        },
-    ),
-];
+// Every section id this host knows, in load order.
+//
+// Generated from the `section!` declarations (see the module docs).
+include!(concat!(env!("OUT_DIR"), "/section_factories.rs"));
+
+/// Declare one config section. Expands to nothing; `build.rs` scans it.
+///
+/// A declaration names the section, an `order`, and the factories it has: a
+/// bare section (`load = load_config`), a prefix section
+/// (`prefix = load_config_prefix`), or both. `order` decides the load order
+/// among the entries that share a half.
+///
+/// The factories are named as siblings: a bare name resolves to
+/// `<this module>::<name>`, a path is used as written.
+macro_rules! section {
+    ($($tokens:tt)*) => {};
+}
+pub(crate) use section;
 
 impl Printer {
     /// Load every printer object the config describes into this machine.
@@ -223,6 +217,14 @@ mod tests {
         let printer = Arc::new(Printer::new(ManualReactor::shared()));
         let result = printer.load_config(&config(text));
         (printer, result)
+    }
+
+    #[test]
+    fn test_the_factory_table_is_in_load_order() {
+        // The table is generated from the `section!` declarations; this pins the
+        // order those declarations ask for, which the loader depends on.
+        let ids: Vec<&str> = FACTORIES.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, ["mcu", "output_pin", "board_pins"]);
     }
 
     #[test]

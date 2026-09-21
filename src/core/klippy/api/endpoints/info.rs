@@ -50,7 +50,19 @@ use tracing::info;
 use crate::core::klippy::api::protocol::{ApiError, Params, Request};
 use crate::core::klippy::api::registry::{Endpoint, EndpointContext};
 use crate::core::klippy::api::start_args::StartArgs;
+use crate::core::klippy::api::{Api, ApiWiring, RegistrationError};
 use crate::core::klippy::printer::Printer;
+
+endpoint!(install);
+
+/// Install the `info` endpoint.
+pub(crate) fn install(api: &mut Api, wiring: &ApiWiring<'_>) -> Result<(), RegistrationError> {
+    api.register(Info::new(
+        Arc::clone(wiring.printer),
+        wiring.start_args.clone(),
+    ))
+    .map_err(RegistrationError::Endpoint)
+}
 
 /// The Klipper installation this host does not have.
 ///

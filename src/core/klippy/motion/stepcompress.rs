@@ -211,6 +211,26 @@ impl StepCompressor {
         self.mcu_freq
     }
 
+    /// The print-time-to-clock offset this compressor was set to
+    /// (`stepcompress_set_time`'s `time_offset`): the print time that clock 0
+    /// corresponds to.
+    ///
+    /// It is `0.0` for the primary MCU and the `SecondarySync` alignment for a
+    /// secondary one.
+    pub fn time_offset(&self) -> f64 {
+        self.mcu_time_offset
+    }
+
+    /// Convert an absolute print time to this stepper's firmware clock
+    /// (`MCU.print_time_to_clock`).
+    ///
+    /// This is the bound the step compressor flushes up to; each MCU has its
+    /// own offset and frequency, so the caller asks the stepper rather than
+    /// assuming one MCU's clock.
+    pub fn print_time_to_clock(&self, print_time: f64) -> u64 {
+        ((print_time - self.mcu_time_offset) * self.mcu_freq).max(0.0) as u64
+    }
+
     /// The clock of the last scheduled step, 64-bit.
     pub fn last_step_clock(&self) -> u64 {
         self.last_step_clock
@@ -958,6 +978,21 @@ mod tests {
                 (1076, 6, 7),
             ]
         );
+    }
+
+    #[test]
+    fn test_print_time_to_clock_follows_the_offset() {
+        let mut sc = StepCompressor::new(0, 1_000_000.0);
+        // The primary MCU: print-time zero is clock zero.
+        sc.set_time(0.0, 1_000_000.0);
+        assert_eq!(sc.print_time_to_clock(2.0), 2_000_000);
+
+        // A secondary MCU whose clock zero is at print time 1.5.
+        sc.set_time(1.5, 1_000_000.0);
+        assert_eq!(sc.time_offset(), 1.5);
+        assert_eq!(sc.print_time_to_clock(2.0), 500_000);
+        // Before the offset there is no clock: the bound clamps to zero.
+        assert_eq!(sc.print_time_to_clock(1.0), 0);
     }
 
     #[test]

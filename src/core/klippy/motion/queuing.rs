@@ -17,16 +17,18 @@ use crate::core::klippy::mathutil::Xyz;
 pub struct MotionQueuing {
     trapq: Trapq,
     steppers: Vec<Stepper>,
-    mcu_freq: f64,
 }
 
 impl MotionQueuing {
-    /// An empty queue converting with `mcu_freq` ticks per second.
-    pub fn new(mcu_freq: f64) -> Self {
+    /// An empty queue.
+    ///
+    /// The queue holds no clock of its own: each [`Stepper`] carries its MCU's
+    /// frequency and print-time offset, so a stepper on a secondary MCU flushes
+    /// on that MCU's clock.
+    pub fn new() -> Self {
         Self {
             trapq: Trapq::new(),
             steppers: Vec::new(),
-            mcu_freq,
         }
     }
 
@@ -97,15 +99,10 @@ impl MotionQueuing {
         &mut self,
         flush_time: f64,
     ) -> Result<Vec<(String, Vec<StepCommand>)>, StepCompressError> {
-        let Self {
-            trapq,
-            steppers,
-            mcu_freq,
-        } = self;
-        let move_clock = (flush_time.max(0.0) * *mcu_freq) as u64;
+        let Self { trapq, steppers } = self;
         let mut out = Vec::new();
         for stepper in steppers.iter_mut() {
-            let commands = stepper.generate(trapq, flush_time, move_clock)?;
+            let commands = stepper.generate(trapq, flush_time)?;
             if !commands.is_empty() {
                 out.push((stepper.name().to_string(), commands));
             }
@@ -146,7 +143,7 @@ mod tests {
 
     #[test]
     fn test_append_and_generate_use_the_same_trapq() {
-        let mut queuing = MotionQueuing::new(1_000_000.0);
+        let mut queuing = MotionQueuing::new();
         queuing.add_stepper(Stepper::cartesian(
             "stepper_x",
             0,
@@ -176,7 +173,7 @@ mod tests {
 
     #[test]
     fn test_a_stepper_with_nothing_to_do_is_silent() {
-        let mut queuing = MotionQueuing::new(1_000_000.0);
+        let mut queuing = MotionQueuing::new();
         queuing.add_stepper(Stepper::cartesian(
             "stepper_y",
             1,

@@ -11,4 +11,5 @@
 | 2026-09-21 | [FW5 动工前调查](2026-09-21-fw5-notes.md) — 运动栈（toolhead/trapq/itersolve/stepcompress/clocksync/kinematics）的层次与契约、差距、FW5a–FW5e 拆分与拍板点 |
 | 2026-09-21 | [FW5e-2 动工记录](2026-09-21-fw5e-notes.md) — `[stepper_*]`/`[printer]` 装载、`G1`/`G4`、连接期 `stepper_get_position` 对齐；真板验收按决定后置到 FW5f 之后 |
 | 2026-09-21 | [FW5f 动工记录](2026-09-21-fw5f-notes.md) — `stepcompress` 完整压缩（`(interval,count,add)`/`max_error`），与上游 C harness 向量对拍 |
-| 2026-09-21 | [FW6 动工前调查](2026-09-21-fw6-notes.md) — endstop/trsync/命令队列三链的层次与契约、差距、FW6a–FW6f 拆分与拍板点（单 MCU 纯 Rust 触发、不引入 host serialqueue、`stepcompress` history 前置） |
+| 2026-09-21 | [FW6 动工前调查](2026-09-21-fw6-notes.md) — endstop/trsync/命令队列三链的层次与契约、差距、FW6a–FW6f 拆分与拍板点（多实例纯 Rust 触发、假 MCU 多实例验证、不引入 host serialqueue、`stepcompress` history 前置） |
+| 2026-09-21 | [FW6a 动工记录](2026-09-21-fw6a-notes.md) — 清 FW5 运动层的单 MCU 假设（每 stepper 自算 flush 时钟、toolhead 按 MCU 建 `McuClock`/对齐 `SecondarySync`），顺带修 `McuClock::seed` 未取 `CLOCK_FREQ` 的 bug |

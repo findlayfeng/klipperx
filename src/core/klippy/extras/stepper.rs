@@ -290,10 +290,11 @@ impl PrinterObject for PrinterStepper {
                 .await
                 .map_err(|err| config_error(err.to_string()))?;
             stepper.kinematics_mut().commanded_pos = f64::from(steps) * self.step_dist;
-            // Anchor the compressor on the board's own clock domain: the print
-            // time this host uses is absolute board time (`estimated_print_time`
-            // is `clock / mcu_freq`), so print-time zero is clock zero.
-            stepper.compressor_mut().set_time(0.0, freq);
+            // Record where the firmware's counter is. The print-time mapping
+            // itself is set later, once the toolhead knows every MCU: the
+            // primary is `0.0`, a secondary is aligned to the primary
+            // (`SecondarySync`). `set_last_position` only flushes the pending
+            // step (none yet) and records the position, so the order is safe.
             if let Some(clock) = mcu.estimated_clock() {
                 stepper
                     .compressor_mut()

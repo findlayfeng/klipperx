@@ -32,8 +32,8 @@ pub struct ToolHead {
 }
 
 impl ToolHead {
-    /// A toolhead with `limits`, whose MCU ticks at `mcu_freq`.
-    pub fn new(limits: MoveLimits, mcu_freq: f64) -> Self {
+    /// A toolhead with `limits`.
+    pub fn new(limits: MoveLimits) -> Self {
         Self {
             limits,
             lookahead: LookAheadQueue::new(),
@@ -43,7 +43,7 @@ impl ToolHead {
             // Upstream starts in "NeedPrime" and resyncs the print time on the
             // first planned move (`klippy/toolhead.py:224`).
             special_queuing_state: true,
-            motion_queuing: MotionQueuing::new(mcu_freq),
+            motion_queuing: MotionQueuing::new(),
             kinematics: None,
         }
     }
@@ -235,7 +235,7 @@ mod tests {
 
     /// A toolhead with one X stepper, 1 mm per step.
     fn toolhead() -> ToolHead {
-        let mut toolhead = ToolHead::new(limits(), 1_000_000.0);
+        let mut toolhead = ToolHead::new(limits());
         toolhead.add_stepper(Stepper::cartesian(
             "stepper_x",
             0,

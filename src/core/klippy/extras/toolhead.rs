@@ -67,7 +67,7 @@ use crate::core::klippy::gcode::{
 };
 use crate::core::klippy::load::section;
 use crate::core::klippy::mathutil::{Coord, X_AXIS, Y_AXIS, Z_AXIS};
-use crate::core::klippy::mcu::{Mcu, McuStepper};
+use crate::core::klippy::mcu::{Mcu, McuObject, McuStepper};
 use crate::core::klippy::motion::kinematics::CartesianKinematics;
 use crate::core::klippy::motion::plan::MoveLimits;
 use crate::core::klippy::motion::stepcompress::{StepCommand, StepCompressError};
@@ -294,28 +294,62 @@ impl PrinterObject for ToolHeadObject {
 
             // Each `[stepper_*]` built its host solver during its own connect,
             // which runs before this one (generic sections before the late
-            // walk). Take them now, along with the firmware resources.
+            // walk). Take them now, along with the firmware resources and the
+            // MCU each axis lives on.
             let mut host_steppers = Vec::with_capacity(3);
+            let mut axis_mcus = Vec::with_capacity(3);
             let mut mcu_steppers = HashMap::new();
             for stepper in &self.axes {
                 let host = stepper
                     .take_stepper()
                     .ok_or_else(|| config_error(format!("{} is not connected", stepper.name())))?;
+                let mcu = stepper
+                    .mcu_stepper()
+                    .mcu()
+                    .ok_or_else(|| config_error("MCU is not connected".to_string()))?;
                 host_steppers.push(host);
+                axis_mcus.push(mcu);
                 mcu_steppers.insert(
                     stepper.name().to_string(),
                     Arc::clone(stepper.mcu_stepper()),
                 );
             }
-            let mcu = self.axes[0]
-                .mcu_stepper()
-                .mcu()
-                .ok_or_else(|| config_error("MCU is not connected".to_string()))?;
-            let mcu_freq = mcu
-                .clock_freq()
-                .map_err(|err| config_error(err.to_string()))?;
 
-            let mut toolhead = ToolHead::new(self.limits, mcu_freq);
+            // One clock per distinct MCU, and the print-time alignment between
+            // them. The primary MCU (the bare `[mcu]`) defines the print-time
+            // origin; a secondary is shifted so the same print time maps to its
+            // own clock (`SecondarySync`, `klippy/clocksync.py:177-235`).
+            let primary_name = self
+                .printer
+                .upgrade()
+                .and_then(|printer| printer.lookup_object_as::<McuObject>("mcu"))
+                .and_then(|object| object.mcu())
+                .map(|mcu| mcu.name().to_string())
+                .unwrap_or_else(|| axis_mcus[0].name().to_string());
+            let now = self.reactor.monotonic();
+            let mut clocks: HashMap<String, Arc<McuClock>> = HashMap::new();
+            for mcu in distinct_mcus(&axis_mcus) {
+                let clock = Arc::new(McuClock::new(Arc::clone(mcu), Arc::clone(&self.reactor)));
+                seed_clock(&clock, mcu, now).await;
+                clocks.insert(mcu.name().to_string(), clock);
+            }
+            let main_print_time = clocks[&primary_name].estimated_print_time(now);
+
+            // Point each stepper's compressor at its own MCU's clock domain.
+            for (host, mcu) in host_steppers.iter_mut().zip(&axis_mcus) {
+                let freq = mcu
+                    .clock_freq()
+                    .map_err(|err| config_error(err.to_string()))?;
+                let local_print_time = clocks[mcu.name()].estimated_print_time(now);
+                let offset = if mcu.name() == primary_name {
+                    0.0
+                } else {
+                    main_print_time - local_print_time
+                };
+                host.compressor_mut().set_time(offset, freq);
+            }
+
+            let mut toolhead = ToolHead::new(self.limits);
             for stepper in host_steppers {
                 toolhead.add_stepper(stepper);
             }
@@ -337,11 +371,9 @@ impl PrinterObject for ToolHeadObject {
                 self.max_z_accel,
             )));
 
-            // A print-time mapping, so the first move starts a buffer ahead of
-            // the firmware rather than at print time zero.
-            let clock = McuClock::new(Arc::clone(&mcu), Arc::clone(&self.reactor));
-            seed_clock(&clock, &mcu, self.reactor.monotonic()).await;
-            toolhead.set_estimated_print_time(clock.estimated_print_time(self.reactor.monotonic()));
+            // The toolhead's print time is the primary MCU's; the secondary
+            // offsets above map it onto their own clocks.
+            toolhead.set_estimated_print_time(main_print_time);
 
             *self.lock() = Some(Connected {
                 toolhead,
@@ -389,6 +421,18 @@ async fn seed_clock(clock: &McuClock, mcu: &Mcu, sent_time: f64) {
     if let Err(err) = clock.get_clock().await {
         warn!("could not read the MCU clock for a print-time estimate: {err}");
     }
+}
+
+/// The distinct MCUs an axis list uses, first-seen order.
+fn distinct_mcus(mcus: &[Arc<Mcu>]) -> Vec<&Arc<Mcu>> {
+    let mut seen: Vec<&Arc<Mcu>> = Vec::new();
+    for mcu in mcus {
+        if seen.iter().any(|other| other.name() == mcu.name()) {
+            continue;
+        }
+        seen.push(mcu);
+    }
+    seen
 }
 
 /// The flush task: generate the queued steps and await the transport.
@@ -592,7 +636,28 @@ pub(crate) fn load_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::klippy::interface::devices::test::TestDevice;
+    use crate::core::klippy::interface::Interface;
     use crate::core::klippy::mcu::McuError;
+
+    #[tokio::test]
+    async fn test_distinct_mcus_deduplicates_by_name() {
+        let a = Arc::new(Mcu::for_test(
+            "mcu",
+            Interface::new(TestDevice::new(Vec::new())),
+        ));
+        let b = Arc::new(Mcu::for_test(
+            "zboard",
+            Interface::new(TestDevice::new(Vec::new())),
+        ));
+
+        let mcus = vec![Arc::clone(&a), Arc::clone(&b), Arc::clone(&a)];
+        let distinct = distinct_mcus(&mcus);
+
+        assert_eq!(distinct.len(), 2);
+        assert_eq!(distinct[0].name(), "mcu");
+        assert_eq!(distinct[1].name(), "zboard");
+    }
 
     #[test]
     fn test_axis_indices_reads_the_letters() {
@@ -673,7 +738,7 @@ mod tests {
             junction_deviation: 0.01,
             mcr_pseudo_accel: 500.0,
         };
-        let mut toolhead = ToolHead::new(limits, 1_000_000.0);
+        let mut toolhead = ToolHead::new(limits);
         for (name, axis, oid) in [
             ("stepper_x", Axis::X, 0u32),
             ("stepper_y", Axis::Y, 1),

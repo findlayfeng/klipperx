@@ -102,9 +102,9 @@ impl Stepper {
 
     /// Generate the steps up to `flush_time` and return the commands to send.
     ///
-    /// `move_clock` is the firmware clock `flush_time` corresponds to; it
-    /// releases the step the compressor holds back
-    /// (`stepcompress_flush`).
+    /// The flush bound is computed from this stepper's own compressor: each MCU
+    /// has its own clock frequency and print-time offset, so a secondary MCU's
+    /// bound differs from the primary's (`stepcompress_flush`).
     ///
     /// # Errors
     /// An internal [`StepCompressError`] from the compressor.
@@ -112,11 +112,11 @@ impl Stepper {
         &mut self,
         trapq: &Trapq,
         flush_time: f64,
-        move_clock: u64,
     ) -> Result<Vec<StepCommand>, StepCompressError> {
         self.kinematics
             .generate_steps(trapq, &mut self.compressor, flush_time)?;
-        self.compressor.flush(move_clock)?;
+        self.compressor
+            .flush(self.compressor.print_time_to_clock(flush_time))?;
         Ok(self.compressor.take_commands())
     }
 }
@@ -150,6 +150,56 @@ mod tests {
     }
 
     #[test]
+    fn test_each_stepper_generates_in_its_own_mcu_clock() {
+        // A move at print time 10.0..10.1, 10 mm at 100 mm/s (1 mm per step).
+        let mut trapq = Trapq::new();
+        trapq.append(
+            10.0,
+            0.0,
+            0.1,
+            0.0,
+            Xyz::default(),
+            Xyz::new(1.0, 0.0, 0.0),
+            100.0,
+            100.0,
+            0.0,
+        );
+        // A secondary MCU: 2 MHz, its clock zero at print time 10.
+        let mut stepper = Stepper::cartesian("stepper_x", 0, 1.0, Axis::X, 2_000_000.0);
+        stepper.compressor_mut().set_time(10.0, 2_000_000.0);
+
+        let commands = stepper.generate(&trapq, 10.1).unwrap();
+
+        let steps: u32 = commands
+            .iter()
+            .filter_map(|command| match command {
+                StepCommand::QueueStep { count, .. } => Some(*count),
+                StepCommand::SetNextStepDir { .. } => None,
+            })
+            .sum();
+        assert_eq!(steps, 10);
+        // 100 mm/s at 1 mm per step is one step per 10 ms, which is 20 000 ticks
+        // on this 2 MHz MCU — not the ~20 000 000 a missing offset would give.
+        let intervals: Vec<u32> = commands
+            .iter()
+            .filter_map(|command| match command {
+                StepCommand::QueueStep { interval, .. } => Some(*interval),
+                StepCommand::SetNextStepDir { .. } => None,
+            })
+            .collect();
+        assert!(
+            intervals.iter().all(|interval| *interval < 100_000),
+            "{intervals:?}"
+        );
+        assert!(
+            intervals
+                .iter()
+                .any(|interval| (19_000..=21_000).contains(interval)),
+            "{intervals:?}"
+        );
+    }
+
+    #[test]
     fn test_generate_returns_the_steppers_commands() {
         let mut trapq = Trapq::new();
         // 10 mm along X at 100 mm/s.
@@ -166,7 +216,7 @@ mod tests {
         );
         let mut stepper = Stepper::cartesian("stepper_x", 0, 1.0, Axis::X, 1_000_000.0);
 
-        let commands = stepper.generate(&trapq, 0.1, 100_000).unwrap();
+        let commands = stepper.generate(&trapq, 0.1).unwrap();
 
         let steps: u32 = commands
             .iter()

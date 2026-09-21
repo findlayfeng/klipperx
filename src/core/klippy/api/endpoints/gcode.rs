@@ -29,7 +29,8 @@
 //! connection, so the dispatcher drops it at the next line. Upstream keeps the
 //! same map and prunes it on disconnect.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde_json::{json, Value};
 
@@ -56,8 +57,11 @@ pub(crate) fn install(api: &mut Api, wiring: &ApiWiring<'_>) -> Result<(), Regis
         .map_err(RegistrationError::Endpoint)?;
     api.register(GcodeRestart::firmware_restart(Arc::clone(&printer)))
         .map_err(RegistrationError::Endpoint)?;
-    api.register(GcodeSubscribeOutput::new(Arc::clone(&printer)))
-        .map_err(RegistrationError::Endpoint)
+    let output = GcodeSubscribeOutput::new(Arc::clone(&printer));
+    // Keep the subscriptions across a `RESTART`, which rebuilds the dispatcher
+    // they are registered on.
+    output.watch_restarts();
+    api.register(output).map_err(RegistrationError::Endpoint)
 }
 
 /// Resolve the dispatcher, reporting the printer state if it is not up yet.
@@ -191,15 +195,54 @@ impl OutputHandler for Subscription {
     }
 }
 
+/// How often the re-attach task checks whether the dispatcher was rebuilt.
+///
+/// A restart replaces the `gcode` object, and with it the dispatcher the
+/// subscribers were registered on. The task notices the new one and puts the
+/// live subscriptions back, so a client does not have to resubscribe after a
+/// `RESTART` (the connection, and the endpoint, survive it).
+const REATTACH_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Every connection's output subscription, shared with the re-attach task.
+type Subscribers = Arc<Mutex<Vec<Arc<Subscription>>>>;
+
+/// The dispatcher the subscriptions are currently registered on.
+type Attached = Arc<Mutex<Option<Arc<GCodeDispatch>>>>;
+
 /// `gcode/subscribe_output` — push every line the dispatcher emits.
 pub struct GcodeSubscribeOutput {
     printer: Arc<Printer>,
+    subscribers: Subscribers,
+    attached: Attached,
 }
 
 impl GcodeSubscribeOutput {
     /// Build the endpoint over the machine whose output it subscribes to.
     pub fn new(printer: Arc<Printer>) -> Self {
-        Self { printer }
+        Self {
+            printer,
+            subscribers: Arc::new(Mutex::new(Vec::new())),
+            attached: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Start the task that keeps subscriptions across a rebuilt dispatcher.
+    ///
+    /// Does nothing when there is no runtime (the endpoint tests), which is
+    /// also where nothing is restarted.
+    pub fn watch_restarts(&self) {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let printer = Arc::clone(&self.printer);
+        let subscribers = Arc::clone(&self.subscribers);
+        let attached = Arc::clone(&self.attached);
+        handle.spawn(async move {
+            loop {
+                tokio::time::sleep(REATTACH_INTERVAL).await;
+                reattach(&printer, &subscribers, &attached);
+            }
+        });
     }
 }
 
@@ -211,12 +254,47 @@ impl Endpoint for GcodeSubscribeOutput {
     fn handle(&self, request: &Request, context: &EndpointContext<'_>) -> Result<Value, ApiError> {
         let template = ResponseTemplate::from_params(&request.params())?;
         let gcode = gcode(&self.printer)?;
-        gcode.register_output_handler(Arc::new(Subscription {
+        let subscription = Arc::new(Subscription {
             client: context.client.clone(),
             template,
-        }));
+        });
+        self.subscribers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(Arc::clone(&subscription));
+        gcode.register_output_handler(subscription);
+        *self.attached.lock().unwrap_or_else(|p| p.into_inner()) = Some(gcode);
         Ok(json!({}))
     }
+}
+
+/// Put every live subscription on the dispatcher `printer` currently has.
+///
+/// Called when the dispatcher is not the one the subscriptions are on — a
+/// restart built a new one — and when the subscriptions were just created. A
+/// closed connection is dropped first, so a gone client is not reattached.
+fn reattach(printer: &Printer, subscribers: &Subscribers, attached: &Attached) {
+    let Some(gcode) = printer.lookup_object_as::<GCodeDispatch>(GCODE_OBJECT) else {
+        return;
+    };
+    let current = {
+        let attached = attached.lock().unwrap_or_else(|p| p.into_inner());
+        attached
+            .as_ref()
+            .is_some_and(|old| Arc::ptr_eq(old, &gcode))
+    };
+    if current {
+        return;
+    }
+    let live: Vec<Arc<Subscription>> = {
+        let mut subscribers = subscribers.lock().unwrap_or_else(|p| p.into_inner());
+        subscribers.retain(|subscription| !subscription.is_closed());
+        subscribers.clone()
+    };
+    for subscription in live {
+        gcode.register_output_handler(subscription);
+    }
+    *attached.lock().unwrap_or_else(|p| p.into_inner()) = Some(gcode);
 }
 // ===========================================================================
 
@@ -298,6 +376,49 @@ mod tests {
                 .unwrap()
                 .contains("FIRMWARE_NAME"),
             "{pushes:?}"
+        );
+    }
+
+    #[test]
+    fn test_subscriptions_survive_a_rebuilt_dispatcher() {
+        // A `RESTART` replaces the `gcode` object, so the dispatcher a client
+        // subscribed to is gone. The endpoint's re-attach puts the live
+        // subscription on the new one instead of leaving it silent until the
+        // client notices and resubscribes (`TODO` FW8).
+        use crate::core::klippy::api::test_support::RecordingTarget;
+
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        let first = Arc::new(GCodeDispatch::new(Arc::clone(&printer)));
+        printer.add_object(GCODE_OBJECT, first.clone()).unwrap();
+
+        let api = Api::new();
+        let target = RecordingTarget::new();
+        let endpoint = GcodeSubscribeOutput::new(Arc::clone(&printer));
+        let body = r#"{"method":"gcode/subscribe_output","params":{"response_template":{"method":"gcode:output","id":null}}}"#;
+        endpoint
+            .handle(&request(body), &context(&api, target.clone()))
+            .unwrap();
+
+        first.run_script("M115").unwrap();
+        let after_first = target.pushes().len();
+        assert!(
+            after_first > 0,
+            "the first dispatcher reached the subscriber"
+        );
+
+        // What a restart does: the old dispatcher is dropped and a new one is
+        // loaded, then the re-attach task runs.
+        printer.reset_for_restart("restart");
+        let second = Arc::new(GCodeDispatch::new(Arc::clone(&printer)));
+        printer.add_object(GCODE_OBJECT, second.clone()).unwrap();
+
+        reattach(&printer, &endpoint.subscribers, &endpoint.attached);
+        second.run_script("M115").unwrap();
+
+        let pushes = target.pushes();
+        assert!(
+            pushes.len() > after_first,
+            "the rebuilt dispatcher reaches the same subscriber: {pushes:?}"
         );
     }
 

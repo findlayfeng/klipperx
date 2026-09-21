@@ -24,16 +24,16 @@
 | **FW5** | 运动框架（最重） | C1（框架部分）、H12 | toolhead 骨架、`Kinematics` trait、stepper 句柄、trapq/step 生成（chelper 重写）、`clocksync`、`mathutil`/`Coord` | `cartesian` + `[stepper_x/y/z]` + `[extruder]`，`G28`/`G1` 跑通 | `kinematics/*` 其余、H9、H10 | FW1 |
 | **FW6** | 资源与触发框架 | F3、F8 | 命令队列/print_time 同步输出（`MCU_bus_digital_out`）、`TriggerDispatch`/`MCU_trsync`、endstop 接口 | 一个 endstop + `query_endstops/status` | homing/probe、运动同步 `SET_PIN` | FW5 |
 | **FW7** | MCU 与传输框架收尾 | B2、D3 | `emergency_stop` 对象（`klippy:shutdown` → 固件 `emergency_stop`）、本地 shutdown 标志、`emergency_stop` 端点、带载荷错误上报；RTO 定时重传与固件 `reset` 优先未做 | `emergency_stop` 端点使打印机进 shutdown；主机停机向固件发 `emergency_stop`，固件自报停机不回发 | TMC/传感器等资源 | — |
-| **FW8** | 主机层与重启框架 | D1、D2、Q6 | `StartArgs` 全量、rollover info、`--logfile` 日志层、退出码语义、`rpi_usb` 连接期门控/CRC/重启后订阅 | `--logfile` 落盘 + `info` 的 rollover | 日志、Moonraker 兼容 | — |
+| **FW8** | 主机层与重启框架 | D1、D2、Q6 | `--logfile` 日志层 + rollover info + 退出码语义（Q6）已完成；`rpi_usb` 连接期门控/CRC/重启后订阅未做 | `--logfile` 落盘（含 rollover 块）、`info.log_file` 报路径；`error_exit` 退非零 | 日志、Moonraker 兼容 | — |
 | **FW9** | API 框架收尾 | B4（框架部分） | `register_remote_method` 与推送、mux 端点注册机制、`emergency_stop` 端点 | `register_remote_method` + 推送 | `pause_resume/*`、`*/dump_*` 等消费者 | FW7 |
 
 > **怎么验收**：每个框架都以「最小模块在真机/测试设备上跑通」为准，不以“代码写完”为准。
 > 例如 FW5 的验收是 `G28`/`G1` 真的动了步进，而不是 `Kinematics` trait 编译通过。
 
-> **建议顺序**：**FW1/FW3**（配置与错误，最底层）✅ 已完成 → **FW2/FW7/FW8** 可并行
+> **建议顺序**：**FW1/FW3**（配置与错误，最底层）✅ → **FW2/FW7/FW8** ✅ 大部
 > （对象模型 / MCU / 主机层）→ **FW4**（G-Code，依赖 FW1+FW3）→ **FW5**（运动，最重，
 > 依赖 FW1）→ **FW6** → **FW9**。FW5 与 FW4 都依赖 FW1；FW6 只能等 FW5。
-> FW1 的 `[printer]`/toolhead 住户与 FW3 的剩余收敛点见 C2/A2。
+> FW2/FW7/FW8 的剩余点见 FW8（`rpi_usb`/CRC/输出订阅）、B2（`last_stats`/RTO/固件 `reset`）。
 
 > **未决问题里属于框架决策的**：**Q4**（status 形状，FW2）、**Q5**（反射，FW2）、
 > **Q6**（退出语义，FW8）；其余 Q 已解决或属模块。
@@ -449,12 +449,13 @@ kinematics 已随 Printer 重构删除，从这里重新开始：
 
 ### D1 主机层 start args / rollover / 日志（框架 FW8）
 
-- [ ] `StartArgs` 只有 `info` 需要的四个字段（`api/start_args.rs`）；上游的
-      `apiserver`、`start_reason`、debug 输入输出、每个 MCU 的字典路径还没进来。
-- [ ] rollover info：上游 `set_rollover_info` 7 处（`klippy/klippy.py:369` 起），给 `info`
-      与日志用；归主机层，不进机器。
-- [ ] `--logfile`：现在没有，`log_file` 恒为 `null`（`api/start_args.rs`）；先有写文件的
-      日志层，rollover 才有意义。
+- [x] **`--logfile`**：`AppArgs.log_file`（`--logfile`）+ `logging::init(verbose, log_file)`：格式化行同时写 stdout 与文件（开窗时跳过 stdout），开不了文件就降级到 stdout；`StartArgs.log_file` 填上，`info` 报真实路径（`logging.rs`、`klippy.rs`、`main.rs`、`bin/klippy/main.rs`）。
+- [x] **rollover info**：主机层 `logging` 的 `set/clear/write_rollover_info`，启动与每次重启写
+      `versions` 块 + `Log rollover at <asctime>` 横幅（贴 `klippy/queuelogger.py:31-53`）。
+      `Printer::set_rollover_info` 那套上游 API 随需要它的模块（toolhead/webhooks）再加。
+- [ ] **`StartArgs` 仍只 info 需要的字段**：`apiserver`、`start_reason`、debug 输入输出、
+      每个 MCU 的字典路径还没进来（`api/start_args.rs`）；`start_reason` 已在 `Printer` 上，
+      不重复搬进 `StartArgs`。
 
 ### D2 重启循环（剩余，框架 FW8）
 
@@ -685,8 +686,9 @@ ack」settle，并用 `Mcu::took_over_session()` 让 `rpi_usb` 判断“有没�
       `lookup_object` / `lookup_object_as::<T>` / `status_of`。`gcode_macro` 的
       `printer.objects` 模板视图（`klippy/extras/gcode_macro.py:13-45`）在其上实现，
       写能力（模板改对象）不做。
-- [ ] **Q6 退出结果的语义**：`"exit" / "error_exit" / "firmware_restart"` 由谁解释、
-      `run()` 的返回值怎么变成进程退出码（`klippy/klippy.py:355-370`，`error_exit` 退 -1）。
+- [x] **Q6 退出结果的语义**：`klippy::run` 返回进程退出码，`klippy_process` 把最终的 run
+      result 带回来；只有 `error_exit` 是非零（`-1`，同上游 `sys.exit(-1)`），`exit` 与
+      “附件结束” 都是 0；两个 main 用 `std::process::exit(code)`（`klippy.rs`、`main.rs`）。
 
 ## 上游事件对照清单（事件总线已就绪，逐项注册处理器）
 
@@ -816,6 +818,11 @@ ack」settle，并用 `Mcu::took_over_session()` 让 `rpi_usb` 判断“有没�
 ## 已完成（留档）
 
 细节在各模块文档里；这里每条只留一行索引，最近完成的在前。
+
+- **主机层日志与退出码（FW8 大部）**：`--logfile` 把格式化日志同时写到 stdout 与文件
+      （开不了就降级），`info.log_file` 报真实路径；主机层 rollover info（`set/clear/write_rollover`，
+      启动与重启写 `versions` + 横幅）；`klippy::run` 返回退出码，`error_exit` 退 `-1`
+      （`logging.rs`、`klippy.rs`、`main.rs`、`bin/klippy/main.rs`、`api/start_args.rs`）。
 
 - **MCU 停机与 `emergency_stop`（FW7）**：新增 `emergency_stop` 端点（进 shutdown 并回 `{}`）；
       每个 `McuObject` 由工厂在 `klippy:shutdown` 注册处理器，向固件发 `emergency_stop`；

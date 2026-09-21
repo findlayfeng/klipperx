@@ -42,7 +42,8 @@ class Printer:
 | `homing:` | 4 | `homing_move_begin`、`homing_move_end`、`home_rails_begin`、`home_rails_end` | 对象引用（`homing_state`） |
 | `stepper:` | 2 | `sync_mcu_position`、`set_dir_inverted` | 对象引用（`stepper`） |
 | `toolhead:` | 4 | `manual_move`、`set_position`、`sync_print_time`、`update_extra_axes` | 混合 |
-| `gcode:` | 3 | `command_error`、`debuginput_exit`、`request_restart` | 无 |
+| `gcode:` | 3 | `command_error`、`debuginput_exit` | 无 |
+| | | `request_restart` | `print_time: float` |
 | `probe:` | 1 | `update_results` | 无 |
 | `extruder:` | 1 | `activate_extruder` | 无 |
 | `stepper_enable:` | 1 | `motor_off` | 无 |
@@ -51,8 +52,8 @@ class Printer:
 | `menu:` | 4 | `populate`、`init`、`begin`、`exit` | 无 |
 | `dual_carriage:` | 1 | `update_kinematics` | 无 |
 
-除 `klippy:notify_mcu_error` 与 `klippy:analyze_shutdown` 外，其余事件的载荷均为空或
-为对象引用。
+除 `klippy:notify_mcu_error`、`klippy:analyze_shutdown` 与 `gcode:request_restart` 外，
+其余事件的载荷均为空或为对象引用。
 
 ### 1.3 触发时序
 

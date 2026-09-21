@@ -246,7 +246,7 @@ fn cmd_i2c_write(device: &Arc<McuI2c>, gcmd: &GcodeCommand) -> Result<(), Comman
 
 /// `IIC_READ DEVICE=<name> WRITE=<hex> READ_LEN=<n>` — write, then read.
 fn cmd_i2c_read(device: &Arc<McuI2c>, gcmd: &GcodeCommand) -> Result<(), CommandError> {
-    let write = match gcmd.parameters().get("WRITE") {
+    let write = match gcmd.get_command_parameters().get("WRITE") {
         Some(text) => hex_decode(text)?,
         None => Vec::new(),
     };

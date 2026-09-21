@@ -504,7 +504,9 @@ fn render_events(events: &[EventDecl]) -> String {
     out.push_str("/// returns it. Names not declared here arrive as\n");
     out.push_str("/// [`KlippyEvent::Unknown`], so an event added upstream still reaches the\n");
     out.push_str("/// handlers registered for it.\n");
-    out.push_str("#[derive(Debug, Clone, PartialEq, Eq)]\n");
+    // `Eq` is deliberately absent: an event payload may be a float — a print
+    // time — and `f64` is not `Eq`.
+    out.push_str("#[derive(Debug, Clone, PartialEq)]\n");
     out.push_str("pub enum KlippyEvent {\n");
     for event in events {
         out.push_str(&format!("    /// `{}`\n", event.name));

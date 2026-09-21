@@ -22,10 +22,12 @@
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use super::adc::{AdcRegistry, McuAdc};
+use super::endstop::McuEndstop;
 use super::i2c::{I2cMode, McuI2c};
 use super::pwm::McuPwm;
 use super::spi::{McuSpi, SpiMode};
 use super::stepper::McuStepper;
+use super::trsync::TrsyncRegistry;
 use crate::core::klippy::cmd::clock::McuClock;
 use crate::core::klippy::cmd::gpio::{ConfigDigitalOut, QueueDigitalOut, UpdateDigitalOut};
 use crate::core::klippy::cmd::McuCommand;
@@ -73,6 +75,9 @@ pub struct McuChip {
     /// The print time this MCU's clock zero corresponds to
     /// (`SecondarySync`'s alignment): `0.0` for the primary.
     print_time_offset: Arc<Mutex<f64>>,
+    /// Routes `trsync_state` to the trsync that owns the oid; one per MCU
+    /// because `Mcu::bind_event` keeps one handler per message name.
+    trsync_registry: Arc<TrsyncRegistry>,
 }
 
 impl McuChip {
@@ -86,6 +91,7 @@ impl McuChip {
             adc_registry: Arc::new(AdcRegistry::new()),
             clock: Arc::new(Mutex::new(None)),
             print_time_offset: Arc::new(Mutex::new(0.0)),
+            trsync_registry: Arc::new(TrsyncRegistry::new()),
         }
     }
 
@@ -161,6 +167,17 @@ impl McuChip {
     /// Extend a 32-bit clock reading into this MCU's 64-bit domain.
     pub fn clock32_to_clock64(&self, clock32: u32) -> Option<i64> {
         Some(self.clock()?.clock32_to_clock64(clock32))
+    }
+
+    /// Convert this MCU's clock back to an absolute print time.
+    pub fn clock_to_print_time(&self, clock: i64) -> Option<f64> {
+        let freq = self.clock()?.estimator().mcu_freq();
+        Some(clock as f64 / freq + self.print_time_offset())
+    }
+
+    /// The registry that routes this MCU's `trsync_state` reports.
+    pub fn trsync_registry(&self) -> Arc<TrsyncRegistry> {
+        Arc::clone(&self.trsync_registry)
     }
 
     /// Resolve a pin alias or reservation on this chip.
@@ -274,6 +291,21 @@ impl McuChip {
         ))
     }
 
+    /// Build an endstop on this MCU.
+    ///
+    /// Upstream's `MCU_endstop` (`klippy/mcu.py:340`): it owns the oid, adds
+    /// `config_endstop`, and carries the `endstop_home`/`endstop_query_state`
+    /// sends. The pin's `!`/`^` are already in `params`.
+    ///
+    /// # Errors
+    /// Returns [`PinError::Unsupported`] if the resource cannot be built (an
+    /// oid or config callback failure).
+    pub fn setup_endstop(&self, params: &PinParams) -> Result<Arc<McuEndstop>, PinError> {
+        McuEndstop::new(self.clone(), params)
+            .map(Arc::new)
+            .map_err(|err| PinError::Unsupported(format!("endstop: {err}")))
+    }
+
     fn lock(&self) -> MutexGuard<'_, Option<Arc<Mcu>>> {
         self.mcu.lock().unwrap_or_else(|poison| poison.into_inner())
     }
@@ -318,13 +350,18 @@ impl PinChip for McuChip {
         step_pulse_duration: f64,
         invert_dir: bool,
     ) -> Result<Arc<McuStepper>, PinError> {
-        Ok(self.setup_stepper(
+        Ok(McuChip::setup_stepper(
+            self,
             step_pin.clone(),
             dir_pin.clone(),
             invert_step,
             step_pulse_duration,
             invert_dir,
         ))
+    }
+
+    fn setup_endstop(&self, params: &PinParams) -> Result<Arc<McuEndstop>, PinError> {
+        McuChip::setup_endstop(self, params)
     }
 }
 

@@ -24,15 +24,22 @@
 //! [`McuChip::attach`]: pin::McuChip::attach
 
 mod adc;
+mod endstop;
 mod i2c;
 mod pin;
 mod pwm;
 mod spi;
 mod stepper;
+mod trsync;
 
 pub use adc::McuAdc;
+pub use endstop::McuEndstop;
 pub use i2c::{I2cMode, McuI2c, DEFAULT_SPEED};
 pub use pin::{McuChip, McuDigitalOut};
 pub use pwm::McuPwm;
 pub use spi::{McuSpi, SpiMode};
 pub use stepper::McuStepper;
+pub use trsync::{
+    Completion, McuTrsync, TriggerDispatch, TrsyncRegistry, TRSYNC_SINGLE_MCU_TIMEOUT,
+    TRSYNC_TIMEOUT,
+};

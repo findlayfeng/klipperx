@@ -215,6 +215,51 @@ pin: EXP1_1        ; 等价于 PA0
 
 被 `<...>` 保留的引脚（如 `EXP1_9`）会拒绝后续引用，报 `pin EXP1_9 is reserved for <GND>`。
 
+### `[i2c_device <name>]` — 原始 I2C 设备
+
+定义一个 I2C 设备，把它接到某台 MCU 的硬件 I2C 总线，或软件（bit-bang）I2C 引脚上。该节**必须**带名称，名称用于 `IIC_READ` / `IIC_WRITE` 的 `DEVICE=<name>`，也是 `objects/query` 中的对象名。
+
+这是 I2C（F7）栈的第一个消费者；上游没有通用 `[i2c_device]` 节，各传感器各自通过 `MCU_I2C_from_config` 读取同样的选项。
+
+| 参数 | 类型 | 必需 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| `i2c_mcu` | 字符串 | 否 | `mcu` | 设备所在的 MCU 名 |
+| `i2c_address` | 整数 (0..127) | 是 | — | 7 位设备地址 |
+| `i2c_speed` | 整数 (Hz) | 否 | `100000` | 时钟频率，最低 `100000` |
+| `i2c_bus` | 字符串 | 否 | 固件中编号 0 的总线 | 硬件总线名（如 `i2c_1`） |
+| `i2c_software_scl_pin` | 引脚描述 | 二选一 | — | 软件 I2C 的 SCL 引脚 |
+| `i2c_software_sda_pin` | 引脚描述 | 二选一 | — | 软件 I2C 的 SDA 引脚 |
+
+**注意：**
+- 软件 I2C 的两个引脚必须都给出，且都在同一台 `i2c_mcu` 上；只给一个会报错。
+- `i2c_bus` 与软件引脚二选一；给了软件引脚就忽略 `i2c_bus`。
+- `i2c_address` 是十进制整数（写 `0x68` 会报无法解析），`0x68` 应写 `104`。
+- 该节只搬运字节，不含任何设备协议；`IIC_WRITE` / `IIC_READ` 是**调试命令**（上游没有），用于在真板上验证总线。命令前缀用 `IIC_` 而不是 `I2C_`：G-Code 扩展命令名不允许第二个字符是数字（`I2C_READ` 会被判为非法名而拒绝注册）。
+
+**示例：**
+
+```ini
+# 硬件 I2C（mcu 的总线 i2c_1，地址 0x68）
+[i2c_device accel]
+i2c_mcu: mcu
+i2c_bus: i2c_1
+i2c_address: 104
+i2c_speed: 400000
+
+# 软件（bit-bang）I2C
+[i2c_device eeprom]
+i2c_address: 80
+i2c_software_scl_pin: mcu:PA9
+i2c_software_sda_pin: mcu:PA10
+```
+
+对应 G-Code 命令：
+
+```gcode
+IIC_WRITE DEVICE=accel DATA=6b              ; 写 1 字节
+IIC_READ DEVICE=accel WRITE=75 READ_LEN=1   ; 写寄存器 0x75 后读 1 字节
+```
+
 ---
 
 - [← 用户手册首页](README.md)

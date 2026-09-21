@@ -49,8 +49,9 @@
 //!   output, PWM and ADC exist ([`PrinterPins::setup_digital_out`] /
 //!   [`PrinterPins::setup_pwm`] / [`PrinterPins::setup_adc`]); the endstop arrives
 //!   with F8/C1, as another method on [`PinChip`].
-//! * **`BUS_PINS_<bus>`** reservation API lives on the chip
-//!   (`McuChip::resolve_bus_name`); the SPI/I2C layer that calls it is F6/F7.
+//! * **`BUS_PINS_<bus>`** reservation is done by
+//!   [`PrinterPins::resolve_bus_name`] / [`PrinterPins::resolve_bus_value`]
+//!   (`McuChip` delegates to them); the SPI/I2C layer that calls them is F6/F7.
 //!   `RESERVE_PINS_*` is done, at MCU connect.
 //!
 //! `[board_pins]` (the section that calls [`PrinterPins::alias_pin`] and
@@ -62,7 +63,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde_json::{json, Value};
 
-use crate::core::klippy::mcu::McuError;
+use crate::core::klippy::mcu::{Mcu, McuError};
 use crate::core::klippy::printer::PrinterObject;
 
 /// The name clients and other modules use to find this object.
@@ -621,6 +622,114 @@ impl PrinterPins {
     /// The chip names registered so far, in registration order.
     pub fn chips(&self) -> Vec<String> {
         self.lock().chips.clone()
+    }
+
+    /// Resolve a bus name against the firmware's enumeration and reserve the
+    /// pins the firmware speaks for (`BUS_PINS_<bus>`).
+    ///
+    /// Upstream's `resolve_bus_name` (`klippy/extras/bus.py:9-32`). `param` is
+    /// the enumeration the caller asked for (`spi_bus`, `i2c_bus`); the firmware
+    /// may instead publish a single generic `bus` enumeration. `bus` is what the
+    /// config said, or `None` to use the bus the firmware names `0`.
+    ///
+    /// A firmware with no such enumeration has no bus names to check: the
+    /// config's value is returned unchanged, or `"0"` when it left the option
+    /// out. This is the SPI/I2C layer's helper for F6/F7 — it lives here because
+    /// reservations are the pin layer's business.
+    ///
+    /// # Errors
+    /// Returns [`PinError::MustSpecifyBus`] when the bus was left out but the
+    /// firmware does not name bus 0, and [`PinError::UnknownBus`] for a name
+    /// the enumeration does not have.
+    pub fn resolve_bus_name(
+        &self,
+        mcu: &Mcu,
+        param: &str,
+        bus: Option<&str>,
+    ) -> Result<String, PinError> {
+        let dictionary = mcu.dictionary();
+        let enums = dictionary
+            .as_ref()
+            .and_then(|dictionary| dictionary.enumeration(param))
+            .or_else(|| {
+                dictionary
+                    .as_ref()
+                    .and_then(|dictionary| dictionary.enumeration("bus"))
+            });
+        let Some(enums) = enums else {
+            return Ok(bus.unwrap_or("0").to_string());
+        };
+
+        let bus = match bus {
+            Some(bus) => {
+                if enums.value(bus).is_none() {
+                    return Err(PinError::UnknownBus {
+                        param: param.to_string(),
+                        bus: bus.to_string(),
+                    });
+                }
+                bus.to_string()
+            }
+            None => enums
+                .name(0)
+                .map(str::to_string)
+                .ok_or_else(|| PinError::MustSpecifyBus {
+                    param: param.to_string(),
+                    chip: mcu.name().to_string(),
+                })?,
+        };
+
+        // The firmware marks the pins a bus owns; reserve them so a config that
+        // also drives one fails instead of silently stealing it.
+        if let Some(pins) = dictionary
+            .as_ref()
+            .and_then(|dictionary| dictionary.constant(&format!("BUS_PINS_{bus}")))
+            .and_then(|value| value.as_str())
+        {
+            for pin in pins.split(',') {
+                self.reserve_pin(mcu.name(), pin, &bus)?;
+            }
+        }
+        Ok(bus)
+    }
+
+    /// Resolve a bus name to the numeric value the firmware's enumeration
+    /// expects, reserving the bus pins exactly as
+    /// [`PrinterPins::resolve_bus_name`] does.
+    ///
+    /// Upstream leaves the bus **name** in the command text and the firmware
+    /// resolves it against the `%u` enumeration. This port encodes config
+    /// commands instead of sending text, so the number has to be looked up here.
+    /// Parsing the value as a number is the fallback for a firmware that
+    /// publishes no bus enumeration, where the config already wrote a number.
+    ///
+    /// # Errors
+    /// As [`PrinterPins::resolve_bus_name`], plus [`PinError::UnknownBus`] when
+    /// there is no enumeration and the value is not a number.
+    pub fn resolve_bus_value(
+        &self,
+        mcu: &Mcu,
+        param: &str,
+        bus: Option<&str>,
+    ) -> Result<u32, PinError> {
+        let name = self.resolve_bus_name(mcu, param, bus)?;
+        let dictionary = mcu.dictionary();
+        let value = dictionary
+            .as_ref()
+            .and_then(|dictionary| dictionary.enumeration(param))
+            .or_else(|| {
+                dictionary
+                    .as_ref()
+                    .and_then(|dictionary| dictionary.enumeration("bus"))
+            })
+            .and_then(|enums| enums.value(&name));
+        match value {
+            Some(value) => Ok(value as u32),
+            None => name.parse::<u32>().map_err(|_| PinError::UnknownBus {
+                param: param.to_string(),
+                bus: name,
+            }),
+        }
     }
 
     /// Reserve a pin on `chip` (a `[board_pins]` `<>` entry, or an internal

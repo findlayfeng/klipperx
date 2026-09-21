@@ -96,6 +96,13 @@ pub enum McuError {
     /// state that cannot be configured, or the build was asked for at the
     /// wrong time (before identify, or twice).
     Config(String),
+    /// An I2C bus error: the device reported NACK, timeout, etc.
+    I2cBus {
+        /// The I2C device oid.
+        oid: u8,
+        /// The bus status reported by the firmware.
+        status: crate::core::klippy::cmd::i2c::I2cBusStatus,
+    },
 }
 
 impl std::fmt::Display for McuError {
@@ -127,6 +134,9 @@ impl std::fmt::Display for McuError {
                 write!(f, "the firmware must be reset with the 'reset' command")
             }
             McuError::Config(msg) => write!(f, "cannot configure MCU: {}", msg),
+            McuError::I2cBus { oid, status } => {
+                write!(f, "I2C bus error on oid {oid}: {}", status.name())
+            }
         }
     }
 }
@@ -145,7 +155,8 @@ impl std::error::Error for McuError {
             | McuError::IdentifyCompression(_)
             | McuError::IdentifyJson(_)
             | McuError::ResetRequired
-            | McuError::Config(_) => None,
+            | McuError::Config(_)
+            | McuError::I2cBus { .. } => None,
         }
     }
 }

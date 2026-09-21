@@ -60,7 +60,7 @@
 `SET_PIN PIN=<name> VALUE=<0..1>`；运行时走立即路径（`update_digital_out` / `update_pwm`，
 软件 PWM 对齐到周期边界）。剩下的是：
 
-- [ ] **真板端到端验证**：`config.cfg` 加一段 `[output_pin <name>]` + `pin: <PAx>`，用
+- [x] **真板端到端验证**：`config.cfg` 加一段 `[output_pin <name>]` + `pin: <PAx>`，用
       `SET_PIN PIN=<name> VALUE=1` 点亮、`VALUE=0` 熄灭，并对 `pwm: true` 的脚改占空比，
       确认 `config_digital_out` / `config_pwm_out` 的 oid 与初始值、`update_digital_out` /
       `update_pwm` 都真的上了线（现有测试都在假 chip / 假设备上）。
@@ -252,13 +252,24 @@ toolhead / 开放事件）一起补，一部分是现在就独立可补的小行
 
 上游 `MCU_I2C`（`klippy/extras/bus.py:161` 以后）：
 
-- [ ] 设备侧：`config_i2c oid=%c`，总线侧：`i2c_set_bus oid=%c i2c_bus=%u rate=%u
-      address=%u`；传输：`i2c_transfer oid=%c write=%*s read_len=%u` /
-      `i2c_response oid=%c i2c_bus_status=%c response=%*s`，或新式的 `i2c_write` /
-      `i2c_read` + `i2c_read_response`（固件 `src/i2ccmds.c:32` `:48` `:107`）。
+- [x] 设备侧：`config_i2c oid=%c`，总线侧：`i2c_set_bus` / `i2c_set_sw_bus`；传输：
+      `i2c_transfer` + `i2c_response`（旧式）或 `i2c_write` / `i2c_read` +
+      `i2c_read_response`（新式）（固件 `src/i2ccmds.c:32` `:48` `:107`）。
 - [ ] `i2c_bus_status` 不是 `SUCCESS` 时上游会 `invoke_shutdown`
-      （`bus.py:295-300`）；`i2c_write` 的 retry 与 `async_write_only` 是可选分支。
-- [ ] 软件 I2C（`i2c_software_{scl,sda}_pin`）：`i2c_set_sw_bus`，固件 `src/i2c_software.c`。
+      （`bus.py:295-300`）；本 port 两条传输路径都返回 `McuError::I2cBus`，
+      是否改为 shutdown 待定。`i2c_write` 的 retry 与 `async_write_only` 是可选分支。
+- [x] 软件 I2C（`i2c_software_{scl,sda}_pin`）：`i2c_set_sw_bus`，固件 `src/i2c_software.c`。
+- [x] 通用构造器与 `[i2c_device <name>]` section（G）：读 `i2c_mcu` / `i2c_address` /
+      `i2c_speed` / `i2c_bus` / `i2c_software_{scl,sda}_pin`，经 `McuObject::setup_i2c`
+      构造 `McuI2c`；并注册 `IIC_WRITE` / `IIC_READ` 两个调试命令（上游无此 section
+      与命令，为真机自测而加：`IIC_READ DEVICE=<n> WRITE=<hex> READ_LEN=<n>`）。
+      真正的 sensor 消费者仍属 F9。
+
+已落地：`cmd/i2c.rs`（命令层，`%*s` 走二进制 `ArgType::Bytes`，`i2c_transfer` 用固件的
+`write=`）、`mcu/resource/i2c.rs`（`McuI2c` 资源 + `I2cMode`，新式组合传输只用 `i2c_read`）、
+`Mcu::try_lookup_command`（按字典原始格式串精确匹配，检测新旧传输风格）、
+`PrinterPins::resolve_bus_name` / `resolve_bus_value`（`i2c_bus=%u` 需 host 先解析枚举值）、
+`extras/i2c_device.rs`（`[i2c_device]` 构造器 + 调试命令）。
 
 #### F8 endstop / trsync（与 C1 共享）
 
@@ -535,6 +546,13 @@ ack」settle，并用 `Mcu::took_over_session()` 让 `rpi_usb` 判断“有没�
 
 细节在各模块文档里；这里每条只留一行索引，最近完成的在前。
 
+- **I2C 总线（F7）**：`cmd/i2c.rs`、`mcu/resource/i2c.rs` 的 `McuI2c`（硬件/软件两条
+      路，旧式 `i2c_transfer` / 新式 `i2c_read`）、`Mcu::try_lookup_command` 与
+      `PrinterPins::resolve_bus_value`；消费者 `extras/i2c_device.rs` 与 `IIC_WRITE` /
+      `IIC_READ` 调试命令（真机自测用，见 F7）。
+- **真板端到端验证（G2b）**：`config.cfg` 中 `[output_pin]` + `SET_PIN` 点亮/熄灭 + PWM
+      占空比调整，确认 `config_digital_out` / `config_pwm_out` oid 与初始值、
+      `update_digital_out` / `update_pwm` 上线（替代假 chip / 假设备测试）。
 - **ADC（F5）**：`cmd/adc.rs` 的 `config_analog_in` / `query_analog_in`（新旧两版）与
       `analog_in_state`，`mcu/resource/adc.rs` 的 `McuAdc` / `AdcRegistry`，以及
       `ConfigBuilder::get_query_slot`（`Mcu::estimated_clock`）；消费者（thermistor 等）未接。

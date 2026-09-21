@@ -821,7 +821,14 @@ pub fn is_traditional_gcode(cmd: &str) -> bool {
     let Some(digit) = chars.next() else {
         return false;
     };
-    letter.is_ascii_uppercase() && digit.is_ascii_digit()
+    if !letter.is_ascii_uppercase() || !digit.is_ascii_digit() {
+        return false;
+    }
+    // The rest must be a number, not merely start with one. Upstream tries
+    // `float(cmd[1:])` (`klippy/gcode.py:125`), so `M110` is traditional but
+    // `I2C_READ` is not: it is an extended name that happens to begin with a
+    // letter and a digit, and one upstream rejects at registration.
+    name[1..].parse::<f64>().is_ok()
 }
 
 /// Upstream's validity rule for an extended command name
@@ -1159,6 +1166,28 @@ mod tests {
         assert!(!is_valid_extended_name("1PIN"));
         // A letter followed by a digit is traditional, not extended.
         assert!(!is_valid_extended_name("M110"));
+
+        // `I2C_READ` begins with a letter and a digit but is not traditional
+        // (the rest is not a number), so it is neither form and must be
+        // rejected rather than registered as a name nothing can dispatch.
+        assert!(!is_traditional_gcode("I2C_READ"));
+        assert!(!is_valid_extended_name("I2C_READ"));
+        assert!(is_traditional_gcode("M2"));
+        assert!(!is_traditional_gcode("M2A"));
+    }
+
+    #[test]
+    fn test_a_letter_digit_name_that_is_not_traditional_is_refused() {
+        let (dispatch, _output) = dispatch();
+        let (handler, _) = recorder();
+
+        // The parser would read this line as the command `I2`, so accepting the
+        // registration would leave a command that can never run.
+        let err = dispatch
+            .register_command("I2C_READ", handler, None, false)
+            .unwrap_err();
+
+        assert_eq!(err, "Can't register 'I2C_READ' as it is an invalid name");
     }
 
     // -----------------------------------------------------------------------

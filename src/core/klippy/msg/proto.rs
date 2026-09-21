@@ -109,8 +109,14 @@ impl ArgType {
             "%hu" => Some(ArgType::UInt16),
             "%hi" => Some(ArgType::Int16),
             "%c" => Some(ArgType::UInt8),
-            "%.*s" => Some(ArgType::Bytes),
-            "%s" | "%*s" => Some(ArgType::Str),
+            "%s" => Some(ArgType::Str),
+            // `%*s` and `%.*s` both carry a length-prefixed byte buffer upstream
+            // (`PT_buffer` and `PT_progmem_buffer` are empty `PT_string`
+            // subclasses, `klippy/msgproto.py:70-80`), so both stay binary-safe
+            // here. [`ArgType::format_str`] cannot tell them apart and prints
+            // `%.*s`; exact format matching reads the dictionary's raw string
+            // (`Mcu::try_lookup_command`), never this reconstruction.
+            "%*s" | "%.*s" => Some(ArgType::Bytes),
             _ => None,
         }
     }

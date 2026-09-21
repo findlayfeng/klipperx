@@ -22,6 +22,7 @@
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use super::adc::{AdcRegistry, McuAdc};
+use super::i2c::{I2cMode, McuI2c};
 use super::pwm::McuPwm;
 use crate::core::klippy::cmd::gpio::{ConfigDigitalOut, QueueDigitalOut, UpdateDigitalOut};
 use crate::core::klippy::cmd::McuCommand;
@@ -114,72 +115,52 @@ impl McuChip {
     /// Resolve a bus name against the firmware's enumeration and reserve the
     /// pins the firmware speaks for (`BUS_PINS_<bus>`).
     ///
-    /// Upstream's `resolve_bus_name` (`klippy/extras/bus.py:9-32`). `param` is
-    /// the enumeration the caller asked for (`spi_bus`, `i2c_bus`); the firmware
-    /// may instead publish a single generic `bus` enumeration. `bus` is what the
-    /// config said, or `None` to use the bus the firmware names `0`.
-    ///
-    /// A firmware with no such enumeration has no bus names to check: the
-    /// config's value is returned unchanged, or `"0"` when it left the option
-    /// out. This is the SPI/I2C layer's helper for F6/F7 — it is here because
-    /// reservations are the pin layer's business.
+    /// Upstream's `resolve_bus_name` (`klippy/extras/bus.py:9-32`). The logic
+    /// lives on [`PrinterPins`] because reservations are the pin layer's
+    /// business; this is the chip-shaped entry point for a resource that holds
+    /// its own chip.
     ///
     /// # Errors
-    /// Returns [`PinError::MustSpecifyBus`] when the bus was left out but the
-    /// firmware does not name bus 0, and [`PinError::UnknownBus`] for a name the
-    /// enumeration does not have.
+    /// As [`PrinterPins::resolve_bus_name`].
     pub fn resolve_bus_name(
         &self,
         mcu: &Mcu,
         param: &str,
         bus: Option<&str>,
     ) -> Result<String, PinError> {
-        let dictionary = mcu.dictionary();
-        let enums = dictionary
-            .as_ref()
-            .and_then(|dictionary| dictionary.enumeration(param))
-            .or_else(|| {
-                dictionary
-                    .as_ref()
-                    .and_then(|dictionary| dictionary.enumeration("bus"))
-            });
-        let Some(enums) = enums else {
-            // No bus enumeration: nothing to validate against, so pass the
-            // caller's choice through (upstream returns the value as-is).
-            return Ok(bus.unwrap_or("0").to_string());
-        };
+        self.pins().resolve_bus_name(mcu, param, bus)
+    }
 
-        let bus = match bus {
-            Some(bus) => {
-                if enums.value(bus).is_none() {
-                    return Err(PinError::UnknownBus {
-                        param: param.to_string(),
-                        bus: bus.to_string(),
-                    });
-                }
-                bus.to_string()
-            }
-            None => enums
-                .name(0)
-                .map(str::to_string)
-                .ok_or_else(|| PinError::MustSpecifyBus {
-                    param: param.to_string(),
-                    chip: self.name.clone(),
-                })?,
-        };
+    /// Resolve a bus name to the numeric value the firmware's enumeration
+    /// expects, reserving the bus pins.
+    ///
+    /// # Errors
+    /// As [`PrinterPins::resolve_bus_value`].
+    pub fn resolve_bus_value(
+        &self,
+        mcu: &Mcu,
+        param: &str,
+        bus: Option<&str>,
+    ) -> Result<u32, PinError> {
+        self.pins().resolve_bus_value(mcu, param, bus)
+    }
 
-        // The firmware marks the pins a bus owns; reserve them so a config that
-        // also drives one fails instead of silently stealing it.
-        if let Some(pins) = dictionary
-            .as_ref()
-            .and_then(|dictionary| dictionary.constant(&format!("BUS_PINS_{bus}")))
-            .and_then(|value| value.as_str())
-        {
-            for pin in pins.split(',') {
-                self.pins().reserve_pin(&self.name, pin, &bus)?;
-            }
-        }
-        Ok(bus)
+    /// Build an I2C device on this MCU.
+    ///
+    /// Upstream's `MCU_I2C` (`klippy/extras/bus.py:161`), the bus counterpart
+    /// of the pin resources above: it holds the chip's configuration builder
+    /// and the connect slot, so the transfers it sends reach the live device.
+    /// The pin names in a software mode become numbers in the resource's own
+    /// config callback (`mcu/resource/i2c.rs`).
+    pub fn setup_i2c(&self, mode: I2cMode, address: u8) -> Arc<McuI2c> {
+        Arc::new(McuI2c::new(
+            Arc::clone(&self.config),
+            self.pins(),
+            &self.name,
+            Arc::clone(&self.mcu),
+            mode,
+            address,
+        ))
     }
 
     fn lock(&self) -> MutexGuard<'_, Option<Arc<Mcu>>> {
@@ -827,5 +808,38 @@ mod tests {
             "spi3"
         );
         assert_eq!(chip.resolve_bus_name(&mcu, "spi_bus", None).unwrap(), "0");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_bus_value_returns_the_enumeration_number() {
+        let (chip, _pins) = chip();
+        let mcu = mcu_with(bus_dictionary());
+
+        // The `spi_bus` enumeration numbers `spi2` as 1; omitting the bus
+        // picks the one named 0 (`spi1`).
+        assert_eq!(
+            chip.resolve_bus_value(&mcu, "spi_bus", Some("spi2"))
+                .unwrap(),
+            1
+        );
+        assert_eq!(chip.resolve_bus_value(&mcu, "spi_bus", None).unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_bus_value_falls_back_to_a_number_without_an_enumeration() {
+        // The plain dictionary has no bus enumeration, so the config's value is
+        // already the number the command wants.
+        let (chip, _pins) = chip();
+        let mcu = mcu();
+
+        assert_eq!(
+            chip.resolve_bus_value(&mcu, "spi_bus", Some("3")).unwrap(),
+            3
+        );
+        assert_eq!(chip.resolve_bus_value(&mcu, "spi_bus", None).unwrap(), 0);
+        // A name with no enumeration to resolve it cannot become a number.
+        assert!(chip
+            .resolve_bus_value(&mcu, "spi_bus", Some("spi1"))
+            .is_err());
     }
 }

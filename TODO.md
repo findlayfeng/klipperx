@@ -34,6 +34,7 @@
 > （对象模型 / MCU / 主机层）→ **FW4**（G-Code，依赖 FW1+FW3）→ **FW5**（运动，最重，
 > 依赖 FW1）→ **FW6** → **FW9**。FW5 与 FW4 都依赖 FW1；FW6 只能等 FW5。
 > FW2/FW7/FW8 的剩余点见 FW8（`rpi_usb`/CRC/输出订阅）、B2（`last_stats`/RTO/固件 `reset`）。
+> D2 的真板启动抖动已归档为**非阻塞观察项**（板/USB 链路层，复现不了），不再单独排期。
 
 > **未决问题里属于框架决策的**：**Q4**（status 形状，FW2）、**Q5**（反射，FW2）、
 > **Q6**（退出语义，FW8）；其余 Q 已解决或属模块。
@@ -476,13 +477,15 @@ kinematics 已随 Printer 重构删除，从这里重新开始：
       `(PushTarget, template)` 订阅存在自己（端点在 `Api` 上跨重启存活），并有
       `watch_restarts` 任务每 250 ms 比对当前 `GCodeDispatch` 是否换了实例，换了就把还活着的
       订阅重新挂上去（`api/endpoints/gcode.rs`，单测覆盖）。
-- [ ] **真板连续启动的抖动（FW1/FW3 核对时发现，基线同样复现）**：STM32F103 +
-      `restart_method: command` 上把主机**紧接着上一次**再启动，偶发到不了 ready：
-      ① `MCU 'mcu' shutdown: Rescheduled timer in the past`——上一次 `klipperx stress --task step`
-      留在固件里的 `queue_step` 定时器在接管/复位后触发（日志里仍有 `stats count=348`）；
-      ② `timeout: no response for config within 5s`。两次启动间隔 ~6 s 则 10/10 成功。
-      基线 `cf920bd` 用同一块板、同一份配置也能复现。“`reset` 优先”已让 CRC/停机路径改成真重启
-      （清定时器），可能顺带改善，但还没在真板上重测。
+- [~] **真板启动抖动（已归档观察项，不再单独处理）**：复查结论（2026-09-21）：
+      ① 原先的 `MCU 'mcu' shutdown: Rescheduled timer in the past` / `timeout: no response for
+      config` 在当前代码上**复现不出来**（连续启动、stress 种子、留步进队列、杀在 bring-up 中段
+      等场景均 `ready`，基线亦同）；原先那条很可能就是就地 `config_reset` 的窗口，已被「`reset` 优先」
+      消除。② 另有一个**间歇、与主机实现无关**的现象：在 **identify 握手中**强杀 host 后，板端会
+      十几秒不应答（下一个 host 等满 `IDENTIFY_TIMEOUT=10s` 报连接错误，随后板子自行恢复）。
+      软件侧干扰源已排除（无 ModemManager/brltty/autosuspend/残留进程）；`dmesg` 受限看不到 USB 层，
+      硬件/USB 因素未排除。**判定为板/USB 链路层的已知观察项，不阻塞任何框架任务；除非将来做
+      重启相关改动（D2/D3）或用户主动要求，不再为此单独排期/调查。**
 - [x] **字典装载前的固件输出不再报错**：`Mcu` 加 `identified` 旗标（接收任务共享）；字典装上之前
       的 decode 失败按预期降到 `debug`，装上之后的未知 id 仍是 `error`（`mcu/mod.rs`）。
 

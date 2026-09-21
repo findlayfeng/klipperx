@@ -19,6 +19,7 @@
 //! wire) and the kinematics trait are FW5e; nothing here talks to an MCU.
 
 pub mod itersolve;
+pub mod kinematics;
 pub mod plan;
 pub mod queuing;
 pub mod stepcompress;
@@ -29,6 +30,7 @@ pub mod trapq;
 pub use itersolve::{
     cartesian_active_flags, cartesian_position_fn, Axis, AxisFlags, StepKinematics,
 };
+pub use kinematics::{CartesianKinematics, Kinematics, MoveContext};
 pub use plan::{LookAheadQueue, Move, MoveLimits};
 pub use queuing::MotionQueuing;
 pub use stepcompress::{GracePolicy, StepCommand, StepCompressor};

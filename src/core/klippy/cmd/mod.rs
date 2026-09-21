@@ -64,6 +64,7 @@ pub mod adc;
 pub mod allocate_oids;
 pub mod clock;
 pub mod config;
+pub mod endstop;
 pub mod gpio;
 pub mod i2c;
 pub mod identify;
@@ -71,10 +72,12 @@ pub mod pwm;
 pub mod shutdown;
 pub mod spi;
 pub mod stepper;
+pub mod trsync;
 pub mod uptime;
 
 pub use adc::{AnalogInState, AnalogInStateOld, ConfigAnalogIn, QueryAnalogIn, QueryAnalogInOld};
 pub use clock::{ClockState, ClockSync, GetClock, McuClock};
+pub use endstop::{ConfigEndstop, EndstopHome, EndstopQueryState, EndstopState};
 pub use gpio::{ConfigDigitalOut, QueueDigitalOut, SetDigitalOutPwmCycle, UpdateDigitalOut};
 pub use i2c::{
     ConfigI2c, I2cBusStatus, I2cRead, I2cReadResponse, I2cResponse, I2cSetBus, I2cSetSoftwareBus,
@@ -87,6 +90,10 @@ pub use spi::{
 };
 pub use stepper::{
     ConfigStepper, QueueStep, ResetStepClock, SetNextStepDir, StepperGetPosition, StepperPosition,
+    StepperStopOnTrigger,
+};
+pub use trsync::{
+    ConfigTrsync, TriggerReason, TrsyncSetTimeout, TrsyncStart, TrsyncState, TrsyncTrigger,
 };
 
 use crate::core::klippy::mcu::{Dictionary, Enumeration, Mcu, McuError};

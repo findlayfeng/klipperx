@@ -124,6 +124,29 @@ impl McuCommand for ResetStepClock {
     }
 }
 
+/// `stepper_stop_on_trigger oid=%c trsync_oid=%c` — stop this stepper when the
+/// trigger group fires.
+///
+/// The firmware's `src/stepper.c:373` registers the stepper as a `trsync`
+/// signal; when the endstop (or the host, or the deadline) triggers, the stepper
+/// stops within the firmware's step loop rather than waiting for the host to
+/// send anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StepperStopOnTrigger {
+    /// The stepper's oid.
+    pub oid: u8,
+    /// The trigger group to listen to.
+    pub trsync_oid: u8,
+}
+
+impl McuCommand for StepperStopOnTrigger {
+    const NAME: &'static str = "stepper_stop_on_trigger";
+
+    fn args(&self) -> Vec<ArgValue> {
+        vec![ArgValue::UInt8(self.oid), ArgValue::UInt8(self.trsync_oid)]
+    }
+}
+
 /// `stepper_get_position oid=%c` — ask how many steps the stepper has taken.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StepperGetPosition {

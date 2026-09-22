@@ -9,7 +9,6 @@ pub struct Msg {
     pub id: i16,                            // 线上 id（固件字典给出）
     pub name: String,                       // 消息名（格式串首 token）
     pub params: Vec<(String, ArgType)>,     // 参数名与类型，按声明顺序
-    pub callback: Option<MsgCallback>,      // 可选入站回调
 }
 ```
 
@@ -18,7 +17,9 @@ pub struct Msg {
 - `Msg::format()` 由 name + params 反推格式串（`%*s` 会归一化为 `%s`）。
 - `id` 是 `i16`：Klipper 用有符号 VLQ 编码 id，所以部分 id 在字典里表现为负数。
 
-`MsgCallback` 是 `Arc<Mutex<Box<dyn FnMut(&[ArgValue]) + Send>>>`，通过 `Parser::bind` 绑定。
+`Msg` 不含回调：入站回调按 id 存在 `mcu` 层的 `McuEvents` 里（`MsgCallback` 是
+`Arc<Mutex<Box<dyn FnMut(&[ArgValue]) + Send>>>`），见 [Parser API](parser-api.md) 与
+[MCU 协议](mcu-protocol.md)。
 
 ## `ArgType` / `ArgValue` — 参数类型与取值
 

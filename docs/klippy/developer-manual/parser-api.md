@@ -52,9 +52,9 @@ parser.register(15, "shutdown clock=%u static_string_id=%hu")?; // 混合类型
 
 按名取消息定义。返回 `Arc<Msg>`，其中带有固件字典给出的**参数名与类型**——`Params` 就是靠它把响应参数按名字取出。
 
-### `Parser::has_callback(&self, name: &str) -> bool`
-
-该消息是否绑定了入站回调。
+> `Parser` 是**纯编解码器**：它不再保存入站回调（`Msg` 已无 `callback` 字段）。回调按 id
+> 存在 `mcu` 层的 `McuEvents` 里（见 [MCU 协议与数据字典](mcu-protocol.md)），这样编解码表
+> 可以被发/收两侧共享，而不会把回调捕获的资源拖成 `Mcu` 的强引用环（TODO F8b）。
 
 ## 编码（出站）
 
@@ -85,23 +85,32 @@ for (msg, params) in decoded {
 
 ## 回调绑定
 
-### `Parser::bind(&mut self, cmd_name: &str, callback: impl FnMut(&[ArgValue]) + Send + 'static) -> MsgResult<()>`
-
-为已注册消息绑定入站回调，重复绑定会替换旧回调。回调接收**按声明顺序**排开的参数值。
+回调不在 `Parser` 上，而在 `mcu` 层的 `McuEvents`（`src/core/klippy/mcu/events.rs`）：
 
 ```rust
-parser.bind("shutdown", |params| {
-    eprintln!("MCU shutdown: {:?}", params);
-})?;
+// McuEvents：按消息 id 索引的回调表
+pub(crate) fn bind(
+    &self,
+    parser: &Parser,
+    name: &str,
+    callback: impl FnMut(&[ArgValue]) + Send + 'static,
+) -> MsgResult<()>;
+pub(crate) fn callback(&self, id: i16) -> Option<MsgCallback>;
 ```
 
-绑定只是记录在 `Msg::callback` 上；**消息如何被投递由 `mcu` 层决定**：
+`bind` 先用 `Parser::lookup` 把名字解析成 id 再存入表中（因此只能绑到字典里真实存在的
+消息），重复绑定替换旧回调，回调接收**按声明顺序**排开的参数值。`Mcu` 把它们包成
+`Mcu::bind_event` / `Mcu::bind_callback`（见 [事件系统](event-system.md)）。
+
+**消息如何被投递由 `mcu` 层的接收任务决定**：
 
 1. 若有同步调用（`Mcu::call`）正在等待该响应名，投递给该调用，回调**不会**触发；
-2. 否则若有绑定回调，调用回调；
+2. 否则按消息 id 查 `McuEvents`，命中就调用它；
 3. 否则记录 `Unhandled message … discarding` 警告。
 
-注意 `bind` 接收 `&mut self`，但内部是 `Arc::make_mut`，所以即使有 `decode` 调用方仍持有该 `Msg` 的 `Arc` 也不会 panic。
+`McuObject` 在本身被丢弃（机器拆机）时调用 `Mcu::clear_events()` 清空该表：回调可能
+持有会反向引用 `Mcu` 的资源（传输句柄），不清理就形成强引用环，`Mcu::Drop` 不跑、其
+阻塞读驻留，runtime 关停会卡住（TODO F8b）。
 
 ## 错误类型
 

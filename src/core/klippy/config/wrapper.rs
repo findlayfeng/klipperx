@@ -119,6 +119,106 @@ impl<'a> ConfigWrapper<'a> {
         }
     }
 
+    /// A float option with upstream's bounds (`getfloat`'s `minval`/`maxval`/
+    /// `above`/`below`).
+    ///
+    /// # Errors
+    /// As [`ConfigWrapper::get_float`], plus the bound wording upstream uses
+    /// (`klippy/configfile.py:49-59`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn get_float_bounded(
+        &self,
+        option: &str,
+        default: Option<f64>,
+        minval: Option<f64>,
+        maxval: Option<f64>,
+        above: Option<f64>,
+        below: Option<f64>,
+    ) -> Result<f64, ConfigError> {
+        let value = self.get_float(option, default)?;
+        let identifier = self.identifier();
+        if let Some(min) = minval {
+            if value < min {
+                return Err(ConfigError::new(format!(
+                    "Option '{option}' in section '{identifier}' must have minimum of {min}"
+                )));
+            }
+        }
+        if let Some(max) = maxval {
+            if value > max {
+                return Err(ConfigError::new(format!(
+                    "Option '{option}' in section '{identifier}' must have maximum of {max}"
+                )));
+            }
+        }
+        if let Some(above) = above {
+            if value <= above {
+                return Err(ConfigError::new(format!(
+                    "Option '{option}' in section '{identifier}' must be above {above}"
+                )));
+            }
+        }
+        if let Some(below) = below {
+            if value >= below {
+                return Err(ConfigError::new(format!(
+                    "Option '{option}' in section '{identifier}' must be below {below}"
+                )));
+            }
+        }
+        Ok(value)
+    }
+
+    /// An integer option with `minval`/`maxval` (`getint`).
+    ///
+    /// # Errors
+    /// As [`ConfigWrapper::get_int`], plus the bound wording.
+    pub fn get_int_bounded(
+        &self,
+        option: &str,
+        default: Option<i64>,
+        minval: Option<i64>,
+        maxval: Option<i64>,
+    ) -> Result<i64, ConfigError> {
+        let value = self.get_int(option, default)?;
+        let identifier = self.identifier();
+        if let Some(min) = minval {
+            if value < min {
+                return Err(ConfigError::new(format!(
+                    "Option '{option}' in section '{identifier}' must have minimum of {min}"
+                )));
+            }
+        }
+        if let Some(max) = maxval {
+            if value > max {
+                return Err(ConfigError::new(format!(
+                    "Option '{option}' in section '{identifier}' must have maximum of {max}"
+                )));
+            }
+        }
+        Ok(value)
+    }
+
+    /// A string option that must be one of `choices` (`getchoice`).
+    ///
+    /// # Errors
+    /// As [`ConfigWrapper::get`], plus upstream's
+    /// `Choice 'x' for option 'y' in section 'z' is not a valid choice`.
+    pub fn get_choice(
+        &self,
+        option: &str,
+        choices: &[&str],
+        default: Option<&str>,
+    ) -> Result<String, ConfigError> {
+        let value = self.get(option, default)?;
+        if !choices.is_empty() && !choices.contains(&value.as_str()) {
+            return Err(ConfigError::new(format!(
+                "Choice '{value}' for option '{option}' in section '{}' is not a valid choice",
+                self.identifier()
+            )));
+        }
+        Ok(value)
+    }
+
     /// A float option as `Option`, recording only a value that was present.
     pub fn get_optional_float(&self, option: &str) -> Result<Option<f64>, ConfigError> {
         self.parse_float(option)
@@ -327,6 +427,64 @@ mod tests {
             );
         }
         section
+    }
+
+    #[test]
+    fn test_get_choice_keeps_upstream_wording() {
+        let section = section("printer", &[("kinematics", "delta")]);
+        let wrapper = ConfigWrapper::untracked(&section);
+
+        let err = wrapper
+            .get_choice("kinematics", &["cartesian", "none"], None)
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Choice 'delta' for option 'kinematics' in section 'printer' is not a valid choice"
+        );
+        assert_eq!(
+            wrapper
+                .get_choice("kinematics", &["delta", "cartesian"], None)
+                .unwrap(),
+            "delta"
+        );
+    }
+
+    #[test]
+    fn test_bounded_getters_keep_upstream_wording() {
+        let section = section(
+            "stepper_x",
+            &[
+                ("rotation_distance", "0"),
+                ("microsteps", "0"),
+                ("speed", "10"),
+            ],
+        );
+        let wrapper = ConfigWrapper::untracked(&section);
+
+        assert_eq!(
+            wrapper
+                .get_float_bounded("rotation_distance", None, None, None, Some(0.0), None)
+                .unwrap_err()
+                .to_string(),
+            "Option 'rotation_distance' in section 'stepper_x' must be above 0"
+        );
+        assert_eq!(
+            wrapper
+                .get_int_bounded("microsteps", None, Some(1), None)
+                .unwrap_err()
+                .to_string(),
+            "Option 'microsteps' in section 'stepper_x' must have minimum of 1"
+        );
+        assert!(wrapper
+            .get_float_bounded("speed", None, None, None, Some(0.0), Some(100.0))
+            .is_ok());
+        assert_eq!(
+            wrapper
+                .get_float_bounded("speed", None, None, None, None, Some(5.0))
+                .unwrap_err()
+                .to_string(),
+            "Option 'speed' in section 'stepper_x' must be below 5"
+        );
     }
 
     #[test]

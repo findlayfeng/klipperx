@@ -81,15 +81,16 @@ impl OutputPin {
 
         let pin_desc = config.get("pin", None)?;
 
-        let value = config.get_float("value", Some(0.0))?;
-        let shutdown_value = config.get_float("shutdown_value", Some(0.0))?;
-        for (option, v) in [("value", value), ("shutdown_value", shutdown_value)] {
-            if !(0.0..=1.0).contains(&v) {
-                return Err(ConfigError::new(format!(
-                    "Option '{option}' in section '{identifier}' must be between 0 and 1"
-                )));
-            }
-        }
+        let value =
+            config.get_float_bounded("value", Some(0.0), Some(0.0), Some(1.0), None, None)?;
+        let shutdown_value = config.get_float_bounded(
+            "shutdown_value",
+            Some(0.0),
+            Some(0.0),
+            Some(1.0),
+            None,
+            None,
+        )?;
 
         let pins = printer
             .lookup_object_as::<PrinterPins>(PINS_OBJECT)
@@ -102,12 +103,8 @@ impl OutputPin {
             let pwm = pins
                 .setup_pwm(&pin_desc, None)
                 .map_err(|err| ConfigError::new(format!("{identifier}: {err}")))?;
-            let cycle_time = config.get_float("cycle_time", Some(0.100))?;
-            if cycle_time <= 0.0 {
-                return Err(ConfigError::new(format!(
-                    "Option 'cycle_time' in section '{identifier}' must be above 0"
-                )));
-            }
+            let cycle_time =
+                config.get_float_bounded("cycle_time", Some(0.100), None, None, Some(0.0), None)?;
             let hardware_pwm = config.get_bool("hardware_pwm", Some(false))?;
             pwm.setup_cycle_time(cycle_time, hardware_pwm);
             pwm.setup_max_duration(0.0);

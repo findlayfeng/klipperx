@@ -160,15 +160,11 @@ mod tests {
         assert_eq!(result.val, 0x1234_5678);
     }
 
-    // Note: test_debug_result_decode_missing_param is skipped because
-    // Params::get() panics when a declared parameter has no value (it calls
-    // .expect("declared parameter has a value"). This is a known limitation
-    // of the Params API — it assumes all declared parameters have values.
-    // #[test]
-    // fn test_debug_result_decode_missing_param() {
-    //     let msg = Msg::parse(-7, "debug_result val=%u").unwrap();
-    //     let params = Params::new(Arc::new(msg), &[]);
-    //     let result = DebugResult::decode(&params);
-    //     assert!(result.is_err());
-    // }
+    #[test]
+    fn test_debug_result_decode_missing_param() {
+        let msg = Msg::parse(-7, "debug_result val=%u").unwrap();
+        let params = Params::new(Arc::new(msg), &[]);
+        let result = DebugResult::decode(&params);
+        assert!(result.is_err());
+    }
 }

@@ -202,7 +202,12 @@ impl<'a> Params<'a> {
         if !self.has(name) {
             return Err(self.undeclared(name));
         }
-        let value = self.value(name).expect("declared parameter has a value");
+        let value = self.value(name).ok_or_else(|| {
+            McuError::Decode(format!(
+                "'{}' parameter '{}' is missing",
+                self.msg.name, name
+            ))
+        })?;
         value.try_convert_to(target).ok_or_else(|| {
             McuError::Decode(format!(
                 "'{}' parameter '{}' is {} but {} was expected",

@@ -8,6 +8,9 @@
 - **已知接线限制**：`config.cfg` 只（注释）给了 X 的 `PB0/PB1`；Y/Z 与 endstop 引脚未知，
   所以完整 `[printer]` 三轴 `G1`/`G28` 需要先确认接线（或只做单轴）。
 - 纯软件已覆盖的（见下）不需要真板；只有**物理量级/电气/拓扑**才列在这里。
+- 新增的 `debug_read`/`debug_write`/`debug_ping`/`debug_nop` 用**虚拟 MCU**（`FrameMock` + 命令层单测）
+  验证，不需要真板；`spi_temperature`（MAX6675/31855/31856/31865 的换算与 `thermocouple_result`
+  路由）同样用虚拟 MCU 验证，接真实热电偶时才需真板。
 
 ## 0. 快速命令
 
@@ -26,6 +29,7 @@ cargo run --bin klipperx -- stress <config.cfg> mcu --task motion
 | `last_stats`（MCU `stats` 上报） | ✅ 真板确认 |
 | `--logfile`、`error_exit` 非零、重启后订阅不断 | ✅（主机层，代码 + 真板启动路径） |
 | `[output_pin]` 数字/PWM、`SET_PIN` | ✅ 真板端到端（F3/F4 索引） |
+| `temperature_mcu`（MCU 内置温度） | ✅ STM32F103 `[temperature_sensor mcu_temp] sensor_type: temperature_mcu` 读数约 **35.1 °C**（校准 `base=357.558 / slope=-767.442`，`<mcu>:ADC_TEMPERATURE`） |
 
 ## 2. 待真板验证
 

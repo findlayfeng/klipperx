@@ -75,6 +75,10 @@ pub struct McuChip {
     /// The print time this MCU's clock zero corresponds to
     /// (`SecondarySync`'s alignment): `0.0` for the primary.
     print_time_offset: Arc<Mutex<f64>>,
+    /// The frequency the print-time mapping uses. The primary's is its nominal
+    /// `CLOCK_FREQ`; a secondary's is adjusted as its crystal drifts against the
+    /// primary's (`SecondarySync.calibrate`).
+    print_time_freq: Arc<Mutex<f64>>,
     /// Routes `trsync_state` to the trsync that owns the oid; one per MCU
     /// because `Mcu::bind_event` keeps one handler per message name.
     trsync_registry: Arc<TrsyncRegistry>,
@@ -99,6 +103,7 @@ impl McuChip {
             adc_registry: Arc::new(AdcRegistry::new()),
             clock: Arc::new(Mutex::new(None)),
             print_time_offset: Arc::new(Mutex::new(0.0)),
+            print_time_freq: Arc::new(Mutex::new(0.0)),
             trsync_registry: Arc::new(TrsyncRegistry::new()),
         }
     }
@@ -133,11 +138,13 @@ impl McuChip {
         self.lock().clone()
     }
 
-    /// Record the clock estimate and print-time offset for this MCU.
+    /// Record the clock estimate and print-time mapping for this MCU.
     ///
-    /// Called by the `[mcu]` object at connect, once the device is up and its
-    /// `get_uptime` has been read.
+    /// Called by the `[mcu]` object at connect (and by the periodic
+    /// recalibration, for a secondary). The frequency defaults to the
+    /// estimator's nominal one.
     pub fn set_clock(&self, clock: Arc<McuClock>, print_time_offset: f64) {
+        let freq = clock.estimator().mcu_freq();
         *self
             .clock
             .lock()
@@ -146,6 +153,23 @@ impl McuChip {
             .print_time_offset
             .lock()
             .unwrap_or_else(|poison| poison.into_inner()) = print_time_offset;
+        *self
+            .print_time_freq
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = freq;
+    }
+
+    /// Update the print-time mapping only (the periodic `SecondarySync`
+    /// recalibration).
+    pub fn set_mapping(&self, print_time_offset: f64, print_time_freq: f64) {
+        *self
+            .print_time_offset
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = print_time_offset;
+        *self
+            .print_time_freq
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = print_time_freq;
     }
 
     /// The clock estimate for this MCU, once connected.
@@ -164,12 +188,28 @@ impl McuChip {
             .unwrap_or_else(|poison| poison.into_inner())
     }
 
+    /// The `(offset, freq)` the print-time mapping uses.
+    pub fn time_mapping(&self) -> (f64, f64) {
+        let freq = *self
+            .print_time_freq
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let freq = if freq > 0.0 {
+            freq
+        } else {
+            self.clock()
+                .map(|c| c.estimator().mcu_freq())
+                .unwrap_or(1.0)
+        };
+        (self.print_time_offset(), freq)
+    }
+
     /// Convert an absolute print time to this MCU's clock, once connected. This
     /// is the per-MCU `print_time_to_clock` the endstop/trsync layer uses.
     pub fn print_time_to_clock(&self, print_time: f64) -> Option<u64> {
-        let clock = self.clock()?;
-        let freq = clock.estimator().mcu_freq();
-        Some(((print_time - self.print_time_offset()) * freq).max(0.0) as u64)
+        self.clock()?;
+        let (offset, freq) = self.time_mapping();
+        Some(((print_time - offset) * freq).max(0.0) as u64)
     }
 
     /// Extend a 32-bit clock reading into this MCU's 64-bit domain.
@@ -179,8 +219,9 @@ impl McuChip {
 
     /// Convert this MCU's clock back to an absolute print time.
     pub fn clock_to_print_time(&self, clock: i64) -> Option<f64> {
-        let freq = self.clock()?.estimator().mcu_freq();
-        Some(clock as f64 / freq + self.print_time_offset())
+        self.clock()?;
+        let (offset, freq) = self.time_mapping();
+        Some(clock as f64 / freq + offset)
     }
 
     /// The registry that routes this MCU's `trsync_state` reports.
@@ -644,6 +685,29 @@ mod tests {
         assert_eq!(chip.print_time_to_clock(4.0), Some(20_000_000));
         // Before the offset there is no clock.
         assert_eq!(chip.print_time_to_clock(2.0), Some(0));
+    }
+
+    #[tokio::test]
+    async fn test_chip_mapping_can_be_recalibrated() {
+        // A secondary whose alignment is updated later uses the adjusted
+        // frequency, not the nominal one (`SecondarySync` recalibration).
+        let pins = Arc::new(PrinterPins::new());
+        let chip = McuChip::new("zboard".to_string(), Arc::new(ConfigBuilder::new()), pins);
+        let mcu = Arc::new(mcu());
+        let clock = Arc::new(McuClock::new(
+            Arc::clone(&mcu),
+            crate::core::klippy::reactor::ManualReactor::shared(),
+        ));
+        clock.seed(0.0, 0);
+        chip.set_clock(clock, 0.0);
+        assert_eq!(chip.time_mapping(), (0.0, 20_000_000.0));
+
+        // The recalibration folds an offset and a slightly different frequency.
+        chip.set_mapping(0.5, 20_000_100.0);
+
+        assert_eq!(chip.time_mapping(), (0.5, 20_000_100.0));
+        assert_eq!(chip.print_time_to_clock(1.0), Some(10_000_050));
+        assert_eq!(chip.clock_to_print_time(10_000_050), Some(1.0));
     }
 
     /// A chip with the main MCU registered under `mcu`.

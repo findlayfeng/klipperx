@@ -277,6 +277,16 @@ impl ClockEstimator {
         (self.clock_at_sample + (eventtime - self.clock_sample_time) * self.clock_freq) as i64
     }
 
+    /// The regression's anchor: `(sample_time, clock, freq)`
+    /// (`ClockSync.clock_est`), for [`SecondarySync`] to align against.
+    pub fn clock_est(&self) -> (f64, f64, f64) {
+        (
+            self.clock_sample_time,
+            self.clock_at_sample,
+            self.clock_freq,
+        )
+    }
+
     /// The estimated print time at a system time
     /// (`klippy/clocksync.py:148-149`).
     pub fn estimated_print_time(&self, eventtime: f64) -> f64 {
@@ -290,6 +300,77 @@ impl ClockEstimator {
         // A reading more than 2^31 ahead is really behind (wrap-around).
         diff -= (diff & 0x8000_0000) << 1;
         self.last_clock + diff
+    }
+}
+
+/// A secondary MCU's clock mapping (upstream's `SecondarySync`,
+/// `klippy/clocksync.py:177-235`).
+///
+/// The primary MCU *defines* print time (`print_time = clock / mcu_freq`), so its
+/// own crystal drift only rescales it. A secondary has its own crystal, so it is
+/// mapped onto the primary's print time as `print_time = clock / freq + offset`,
+/// and that mapping is recalibrated periodically: the two crystals drift apart,
+/// and without this a secondary's steps would slide by seconds over a long print.
+#[derive(Debug, Clone, Copy)]
+pub struct SecondarySync {
+    /// The print time this MCU's clock zero corresponds to.
+    pub offset: f64,
+    /// The frequency this MCU's clock is mapped with (may differ from nominal).
+    pub freq: f64,
+    /// The print time of the last calibration (spacing the next one).
+    pub last_sync_time: f64,
+}
+
+impl SecondarySync {
+    /// A mapping at `freq` with no offset yet.
+    pub fn new(freq: f64) -> Self {
+        Self {
+            offset: 0.0,
+            freq,
+            last_sync_time: 0.0,
+        }
+    }
+
+    /// An absolute print time to this MCU's clock.
+    pub fn print_time_to_clock(&self, print_time: f64) -> i64 {
+        ((print_time - self.offset) * self.freq) as i64
+    }
+
+    /// This MCU's clock back to an absolute print time.
+    pub fn clock_to_print_time(&self, clock: i64) -> f64 {
+        clock as f64 / self.freq + self.offset
+    }
+
+    /// Re-align to the primary (`SecondarySync.calibrate_clock`).
+    ///
+    /// The new mapping is chosen so the secondary's clock at a future sync time
+    /// (`sync2`) matches the primary's print time there; calibrating periodically
+    /// keeps the two crystals from drifting apart. `print_time` is the caller's
+    /// current print time (upstream passes `last_step_gen_time`).
+    pub fn calibrate(
+        &mut self,
+        primary: &ClockEstimator,
+        secondary: &ClockEstimator,
+        print_time: f64,
+        eventtime: f64,
+    ) {
+        let (ser_time, ser_clock, ser_freq) = primary.clock_est();
+        let main_mcu_freq = primary.mcu_freq();
+        let est_main_clock = (eventtime - ser_time) * ser_freq + ser_clock;
+        let est_print_time = est_main_clock / main_mcu_freq;
+        let sync1_print_time = print_time.max(est_print_time);
+        let sync2_print_time = (sync1_print_time + 4.0)
+            .max(self.last_sync_time)
+            .max(print_time + 2.5 * (print_time - est_print_time));
+        // The system time `sync2_print_time` falls at, per the primary.
+        let sync2_main_clock = sync2_print_time * main_mcu_freq;
+        let sync2_sys_time = ser_time + (sync2_main_clock - ser_clock) / ser_freq;
+        let sync1_clock = self.print_time_to_clock(sync1_print_time) as f64;
+        let sync2_clock = secondary.get_clock(sync2_sys_time) as f64;
+        let adjusted_freq = (sync2_clock - sync1_clock) / (sync2_print_time - sync1_print_time);
+        self.freq = adjusted_freq;
+        self.offset = sync1_print_time - sync1_clock / adjusted_freq;
+        self.last_sync_time = sync2_print_time;
     }
 }
 
@@ -579,6 +660,44 @@ mod tests {
         let ahead = ((at + 1.0) * freq) as u32;
 
         assert!(!estimator.update(at, at + 0.000_5, ahead));
+    }
+
+    #[test]
+    fn test_secondary_sync_compensates_crystal_drift() {
+        // The primary defines print time; the secondary's crystal runs 100 ppm
+        // fast. Sampling `get_clock` and recalibrating once a second must keep
+        // the secondary's clock mapped onto the primary's print time.
+        let nominal = 1_000_000.0;
+        let drifted = 1_000_100.0;
+        let mut primary = ClockEstimator::new(nominal);
+        primary.seed(0.0, 0);
+        let mut secondary = ClockEstimator::new(nominal);
+        secondary.seed(0.0, 0);
+        let mut sync = SecondarySync::new(nominal);
+
+        let steps = 36_000;
+        for step in 0..steps {
+            let t = step as f64 * 0.1;
+            secondary.update(t, t + 0.000_005, (t * drifted) as u32);
+            if step % 10 == 0 {
+                sync.calibrate(&primary, &secondary, t, t);
+            }
+        }
+
+        let t = (steps - 1) as f64 * 0.1;
+        let clock = (t * drifted) as i64;
+        let mapped = sync.clock_to_print_time(clock);
+        assert!((mapped - t).abs() < 0.01, "mapped {mapped} vs {t}");
+        assert!((sync.freq - drifted).abs() < 1.0, "{}", sync.freq);
+
+        // Without recalibration the same run drifts by much more (this is what
+        // the one-shot connect-time offset used to give).
+        let naive = SecondarySync::new(nominal);
+        let naive_mapped = naive.clock_to_print_time(clock);
+        assert!(
+            (naive_mapped - t).abs() > 0.1,
+            "\\n{naive_mapped} should drift"
+        );
     }
 
     #[test]

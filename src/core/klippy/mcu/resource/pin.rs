@@ -634,7 +634,7 @@ pub(crate) fn pin_number(mcu: &Mcu, name: &str, chip_name: &str) -> Result<u32, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::klippy::interface::devices::test::TestDevice;
+    use crate::core::klippy::interface::devices::frame_mock::FrameMock;
     use crate::core::klippy::interface::Interface;
     use crate::core::klippy::mcu::Dictionary;
     use serde_json::json;
@@ -663,7 +663,7 @@ mod tests {
 
     /// An identified MCU that sends nowhere.
     fn mcu() -> Mcu {
-        let mcu = Mcu::for_test("mcu", Interface::new(TestDevice::new(Vec::new())));
+        let mcu = Mcu::for_test("mcu", Interface::new(FrameMock::new(Vec::new())));
         mcu.install_dictionary(dictionary()).unwrap();
         mcu
     }
@@ -974,7 +974,7 @@ mod tests {
     }
 
     fn mcu_with(dictionary: Dictionary) -> Mcu {
-        let mcu = Mcu::for_test("mcu", Interface::new(TestDevice::new(Vec::new())));
+        let mcu = Mcu::for_test("mcu", Interface::new(FrameMock::new(Vec::new())));
         mcu.install_dictionary(dictionary).unwrap();
         mcu
     }

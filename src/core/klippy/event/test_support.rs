@@ -5,7 +5,7 @@
 //! production code never names a format.
 
 use crate::core::klippy::frame::Frame;
-use crate::core::klippy::interface::devices::test::{MappingEntry, TestDevice};
+use crate::core::klippy::interface::devices::frame_mock::{FrameMock, MappingEntry};
 use crate::core::klippy::interface::Interface;
 use crate::core::klippy::mcu::{Dictionary, Mcu};
 use crate::core::klippy::msg::parser::Parser;
@@ -49,7 +49,7 @@ pub(super) fn frame(seq: u8, parts: &[ArgValue]) -> Frame {
 
 /// An identified MCU whose device answers from `mappings`.
 pub(super) fn mcu(mappings: Vec<MappingEntry>) -> Arc<Mcu> {
-    let mcu = Mcu::for_test("test_mcu", Interface::new(TestDevice::new(mappings)));
+    let mcu = Mcu::for_test("test_mcu", Interface::new(FrameMock::new(mappings)));
     mcu.install_dictionary(dictionary()).unwrap();
     Arc::new(mcu)
 }

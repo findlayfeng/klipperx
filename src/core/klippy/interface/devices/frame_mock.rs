@@ -14,11 +14,11 @@ pub struct MappingEntry {
     pub outputs: Vec<Frame>,
 }
 
-/// Records the frames a [`TestDevice`] accepted, in order.
+/// Records the frames a [`FrameMock`] accepted, in order.
 ///
 /// For tests that assert on the wire shape — how many blocks went out and what
 /// is in each — rather than on a scripted exchange. Take one with
-/// [`TestDevice::recorder`] before the device is moved into an interface.
+/// [`FrameMock::recorder`] before the device is moved into an interface.
 #[derive(Debug, Clone, Default)]
 pub struct FrameRecorder {
     frames: Arc<Mutex<Vec<Frame>>>,
@@ -31,18 +31,18 @@ impl FrameRecorder {
     }
 }
 
-/// A deterministic mock device for testing Klipper protocol interactions.
+/// A deterministic frame-level mock for testing Klipper protocol interactions.
 ///
 /// Pre-configured with input→output mappings. Each `send()` consumes one
 /// mapping entry in FIFO order, validates the input frame, and queues the
 /// configured output frame(s) for `receive()`.
 ///
-/// **Thread safety**: `TestDevice` is `Send` but not `Sync` — it must be
-/// shared through an outer `Mutex` (e.g. `Arc<Mutex<TestDevice>>` in
+/// **Thread safety**: `FrameMock` is `Send` but not `Sync` — it must be
+/// shared through an outer `Mutex` (e.g. `Arc<Mutex<FrameMock>>` in
 /// `Interface::run()`). Each field that needs `Sync` is individually protected
 /// (e.g. `mapping` uses its own `Mutex` since `VecDeque` is not `Sync`).
 #[derive(Debug)]
-pub struct TestDevice {
+pub struct FrameMock {
     /// `crossbeam::channel::Sender` wrapped in `Option` — `take()` on the last
     /// mapping closes the channel by dropping the sender.
     buf_tx: Mutex<Option<Sender<Frame>>>,
@@ -55,7 +55,7 @@ pub struct TestDevice {
     recorded: FrameRecorder,
 }
 
-impl TestDevice {
+impl FrameMock {
     pub fn new(mapping: Vec<MappingEntry>) -> Self {
         let (tx, rx) = bounded::<Frame>(100);
         Self {
@@ -75,7 +75,7 @@ impl TestDevice {
     }
 }
 
-impl Device for TestDevice {
+impl Device for FrameMock {
     fn send(&self, frame: &Frame) -> Result<(), InterfaceError> {
         let (entry, tx) = {
             let mut map = self.mapping.lock().unwrap();
@@ -144,7 +144,7 @@ mod tests {
         let input = make_frame(1, b"hello");
         let output = make_frame(2, b"world");
 
-        let device = TestDevice::new(vec![MappingEntry {
+        let device = FrameMock::new(vec![MappingEntry {
             input: input.clone(),
             outputs: vec![output.clone()],
         }]);
@@ -163,7 +163,7 @@ mod tests {
         let input2 = make_frame(3, b"msg2");
         let output2 = make_frame(4, b"resp2");
 
-        let device = TestDevice::new(vec![
+        let device = FrameMock::new(vec![
             MappingEntry {
                 input: input1.clone(),
                 outputs: vec![output1.clone()],
@@ -188,7 +188,7 @@ mod tests {
         let expected = make_frame(1, b"expected");
         let actual = make_frame(2, b"actual");
 
-        let device = TestDevice::new(vec![MappingEntry {
+        let device = FrameMock::new(vec![MappingEntry {
             input: expected.clone(),
             outputs: vec![make_frame(3, b"response")],
         }]);
@@ -206,7 +206,7 @@ mod tests {
     #[test]
     fn test_no_mapping_entry() {
         let frame = make_frame(1, b"extra");
-        let device = TestDevice::new(vec![]);
+        let device = FrameMock::new(vec![]);
 
         let result = device.send(&frame);
         assert!(result.is_err());
@@ -225,7 +225,7 @@ mod tests {
         let output2 = make_frame(3, b"reply2");
         let output3 = make_frame(4, b"reply3");
 
-        let device = TestDevice::new(vec![MappingEntry {
+        let device = FrameMock::new(vec![MappingEntry {
             input: input.clone(),
             outputs: vec![output1.clone(), output2.clone(), output3.clone()],
         }]);
@@ -240,7 +240,7 @@ mod tests {
     fn test_empty_outputs() {
         let input = make_frame(1, b"no_response");
 
-        let device = TestDevice::new(vec![MappingEntry {
+        let device = FrameMock::new(vec![MappingEntry {
             input: input.clone(),
             outputs: vec![],
         }]);
@@ -257,7 +257,7 @@ mod tests {
         let input = make_frame(1, b"data");
         let output = make_frame(2, b"result");
 
-        let device = TestDevice::new(vec![MappingEntry {
+        let device = FrameMock::new(vec![MappingEntry {
             input: input.clone(),
             outputs: vec![output.clone()],
         }]);
@@ -277,7 +277,7 @@ mod tests {
         let input = make_frame(5, &payload);
         let output = make_frame(6, &payload);
 
-        let device = TestDevice::new(vec![MappingEntry {
+        let device = FrameMock::new(vec![MappingEntry {
             input: input.clone(),
             outputs: vec![output.clone()],
         }]);
@@ -297,7 +297,7 @@ mod tests {
         let output2 = make_frame(4, b"resp2");
 
         // Share through Arc<Mutex<>> — mirrors how Interface::run() shares the device.
-        let device = Arc::new(std::sync::Mutex::new(TestDevice::new(vec![
+        let device = Arc::new(std::sync::Mutex::new(FrameMock::new(vec![
             MappingEntry {
                 input: input1.clone(),
                 outputs: vec![output1.clone()],

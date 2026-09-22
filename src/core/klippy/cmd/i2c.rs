@@ -407,7 +407,7 @@ impl I2cBusStatus {
 mod tests {
     use super::*;
     use crate::core::klippy::frame::Frame;
-    use crate::core::klippy::interface::devices::test::TestDevice;
+    use crate::core::klippy::interface::devices::frame_mock::FrameMock;
     use crate::core::klippy::interface::Interface;
     use crate::core::klippy::mcu::{BuiltConfig, Dictionary};
     use crate::core::klippy::msg::parser::Parser;
@@ -462,7 +462,7 @@ mod tests {
 
     /// An identified MCU that never talks to anything.
     fn mcu_with(dictionary: Dictionary) -> Mcu {
-        let mcu = Mcu::for_test("test_mcu", Interface::new(TestDevice::new(Vec::new())));
+        let mcu = Mcu::for_test("test_mcu", Interface::new(FrameMock::new(Vec::new())));
         mcu.install_dictionary(dictionary).unwrap();
         mcu
     }

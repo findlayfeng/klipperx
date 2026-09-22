@@ -211,7 +211,7 @@ mod tests {
     use super::*;
 
     use crate::core::klippy::cmd::clock::McuClock;
-    use crate::core::klippy::interface::devices::test::TestDevice;
+    use crate::core::klippy::interface::devices::frame_mock::FrameMock;
     use crate::core::klippy::interface::Interface;
     use crate::core::klippy::mcu::{ConfigBuilder, Dictionary, Mcu};
     use crate::core::klippy::pins::PrinterPins;
@@ -247,7 +247,7 @@ mod tests {
     fn chip() -> (McuChip, Arc<Mcu>) {
         let mcu = Arc::new(Mcu::for_test(
             "mcu",
-            Interface::new(TestDevice::new(Vec::new())),
+            Interface::new(FrameMock::new(Vec::new())),
         ));
         mcu.install_dictionary(dictionary()).unwrap();
         let chip = McuChip::new(

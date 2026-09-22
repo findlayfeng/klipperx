@@ -587,7 +587,7 @@ impl TriggerDispatch {
 mod tests {
     use super::*;
 
-    use crate::core::klippy::interface::devices::test::TestDevice;
+    use crate::core::klippy::interface::devices::frame_mock::FrameMock;
     use crate::core::klippy::interface::Interface;
     use crate::core::klippy::mcu::{Dictionary, Mcu};
     use crate::core::klippy::pins::{PinParams, PrinterPins};
@@ -617,7 +617,7 @@ mod tests {
     }
 
     fn identified_mcu(name: &str) -> Arc<Mcu> {
-        let mcu = Mcu::for_test(name, Interface::new(TestDevice::new(Vec::new())));
+        let mcu = Mcu::for_test(name, Interface::new(FrameMock::new(Vec::new())));
         mcu.install_dictionary(dictionary()).unwrap();
         Arc::new(mcu)
     }

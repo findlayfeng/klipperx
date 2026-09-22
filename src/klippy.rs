@@ -552,7 +552,7 @@ mod tests {
         // is opened, and the loader opens transports under the *machine* handle
         // (`run` enters it around `load_config`). Opened inside that context, a
         // `test:` interface must carry the machine runtime, not the API one.
-        use crate::core::klippy::interface::devices::test::TestDevice;
+        use crate::core::klippy::interface::devices::frame_mock::FrameMock;
         use crate::core::klippy::interface::Interface;
 
         let machine = tokio::runtime::Builder::new_multi_thread()
@@ -570,7 +570,7 @@ mod tests {
         api.block_on(async {
             let interface = {
                 let _machine = machine_handle.enter();
-                Interface::new(TestDevice::new(vec![]))
+                Interface::new(FrameMock::new(vec![]))
             };
             assert_eq!(interface.handle().id(), machine_handle.id());
             assert_ne!(

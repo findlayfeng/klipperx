@@ -133,7 +133,7 @@ mod tests {
     use super::*;
     use crate::core::klippy::cmd::uptime::GetUptime;
     use crate::core::klippy::event::test_support::{frame, mcu};
-    use crate::core::klippy::interface::devices::test::TestDevice;
+    use crate::core::klippy::interface::devices::frame_mock::FrameMock;
     use crate::core::klippy::interface::Interface;
     use crate::core::klippy::msg::proto::ArgValue;
     use tokio::sync::mpsc;
@@ -144,7 +144,7 @@ mod tests {
         // A `stats` report is unsolicited on the wire; the test device emits one
         // in reply to an unrelated command so there is a frame to receive.
         let mappings = vec![
-            crate::core::klippy::interface::devices::test::MappingEntry {
+            crate::core::klippy::interface::devices::frame_mock::MappingEntry {
                 input: frame(0, &[ArgValue::UInt8(4)]),
                 outputs: vec![frame(
                     0,
@@ -182,7 +182,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_bind_event_before_identify_fails() {
-        let mcu = Mcu::for_test("test_mcu", Interface::new(TestDevice::new(Vec::new())));
+        let mcu = Mcu::for_test("test_mcu", Interface::new(FrameMock::new(Vec::new())));
 
         let err = mcu.bind_event::<Stats, _>(|_| {}).unwrap_err();
 

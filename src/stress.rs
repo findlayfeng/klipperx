@@ -1070,11 +1070,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_pin_resolves_through_the_firmware_enumeration() {
-        use crate::core::klippy::interface::devices::test::TestDevice;
+        use crate::core::klippy::interface::devices::frame_mock::FrameMock;
         use crate::core::klippy::interface::Interface;
         use crate::core::klippy::mcu::{Dictionary, Mcu};
 
-        let mcu = Mcu::for_test("mcu", Interface::new(TestDevice::new(vec![])));
+        let mcu = Mcu::for_test("mcu", Interface::new(FrameMock::new(vec![])));
         mcu.install_dictionary(
             Dictionary::from_json(serde_json::json!({
                 "enumerations": { "pin": { "PA0": 0, "PB1": 7 } }

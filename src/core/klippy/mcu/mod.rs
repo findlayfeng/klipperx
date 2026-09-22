@@ -1185,7 +1185,7 @@ impl Drop for Mcu {
 impl Mcu {
     /// Build a transport over a bare interface, without a config.
     ///
-    /// Tests talk to a [`TestDevice`](crate::core::klippy::interface::devices::test::TestDevice)
+    /// Tests talk to a [`FrameMock`](crate::core::klippy::interface::devices::frame_mock::FrameMock)
     /// rather than a real `McuConfig`, and most of them never identify.
     pub(crate) fn for_test(name: impl Into<String>, interface: Interface) -> Self {
         Self::from_parts(name.into(), interface)
@@ -1200,8 +1200,8 @@ impl Mcu {
 mod tests {
     use super::*;
     use crate::core::klippy::cmd::clock::{ClockSync, McuClock};
+    use crate::core::klippy::interface::devices::frame_mock::{FrameMock, MappingEntry};
     use crate::core::klippy::interface::devices::serial::DEFAULT_BAUD;
-    use crate::core::klippy::interface::devices::test::{MappingEntry, TestDevice};
     use crate::core::klippy::interface::Interface;
     use crate::core::klippy::reactor::ManualReactor;
 
@@ -1215,7 +1215,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_new_starts_unidentified() {
-        let mcu = Mcu::new("test_mcu", Interface::new(TestDevice::new(vec![])));
+        let mcu = Mcu::new("test_mcu", Interface::new(FrameMock::new(vec![])));
 
         assert_eq!(mcu.name(), "test_mcu");
 
@@ -1231,7 +1231,7 @@ mod tests {
     /// (`i2c_write`/`i2c_read`) transfer styles.
     #[tokio::test]
     async fn test_try_lookup_command_requires_the_exact_format() {
-        let mcu = Mcu::for_test("test_mcu", Interface::new(TestDevice::new(vec![])));
+        let mcu = Mcu::for_test("test_mcu", Interface::new(FrameMock::new(vec![])));
         let dictionary = Dictionary::from_json(serde_json::json!({
             "commands": {
                 "i2c_transfer oid=%c write=%*s read_len=%u": 43,
@@ -1274,7 +1274,7 @@ mod tests {
         // block's sequence, so the ack repeats the response's sequence. A transport
         // that expected a new number per frame would drop the ack, advance its
         // counter, and then reject the next exchange's answer.
-        let device = TestDevice::new(vec![
+        let device = FrameMock::new(vec![
             MappingEntry {
                 input: request.clone(),
                 outputs: vec![
@@ -1321,7 +1321,7 @@ mod tests {
         // carrying that number (`src/command.c:331`, an empty ack/nak frame). The
         // transport has to adopt it, put the request back on the wire under it, and
         // carry on: the second mapping is the firmware accepting *that* block.
-        let device = TestDevice::new(vec![
+        let device = FrameMock::new(vec![
             MappingEntry {
                 input: make_frame(0, &[5]),
                 outputs: vec![make_frame(9, &[])],
@@ -1369,7 +1369,7 @@ mod tests {
         // What a board that just booted does: it answers block 0 with 1 (the number
         // its counter moved to), and then acks it with the same number. Nothing is
         // sent a second time, and no takeover is reported.
-        let device = TestDevice::new(vec![MappingEntry {
+        let device = FrameMock::new(vec![MappingEntry {
             input: make_frame(0, &[5]),
             outputs: vec![
                 make_frame(1, &answer.clone().into_raw()),
@@ -1407,7 +1407,7 @@ mod tests {
         // Only the *first* frame of a connection may be that (it is a session to
         // take over); later ones are dropped, and an exchange that follows must not
         // be disturbed by them.
-        let device = TestDevice::new(vec![MappingEntry {
+        let device = FrameMock::new(vec![MappingEntry {
             input: make_frame(0, &[5]),
             outputs: vec![
                 make_frame(1, &answer.clone().into_raw()),
@@ -1440,7 +1440,7 @@ mod tests {
     /// commands reach the wire as two frames instead of one coalesced frame.
     #[tokio::test]
     async fn test_flush_forces_a_block_boundary() {
-        let device = TestDevice::new(vec![
+        let device = FrameMock::new(vec![
             MappingEntry {
                 input: make_frame(0, &[5]),
                 outputs: vec![],
@@ -1475,7 +1475,7 @@ mod tests {
     /// A flush with nothing queued before it is already satisfied.
     #[tokio::test]
     async fn test_flush_with_nothing_queued_completes() {
-        let device = TestDevice::new(vec![]);
+        let device = FrameMock::new(vec![]);
         let recorder = device.recorder();
         let mcu = Mcu::for_test("test_mcu", Interface::new(device));
 
@@ -1490,7 +1490,7 @@ mod tests {
     async fn test_an_unanswered_block_is_retransmitted() {
         // Two mappings for the same frame: the original and the retransmit. A
         // third attempt would find no mapping and record nothing.
-        let device = TestDevice::new(vec![
+        let device = FrameMock::new(vec![
             MappingEntry {
                 input: make_frame(0, &[5]),
                 outputs: vec![],
@@ -1630,7 +1630,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_invalid_command() {
-        let device = TestDevice::new(vec![]);
+        let device = FrameMock::new(vec![]);
         let interface = Interface::new(device);
         let mcu = Mcu::for_test("test_mcu", interface);
 
@@ -1640,7 +1640,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_wrong_param_count() {
-        let device = TestDevice::new(vec![]);
+        let device = FrameMock::new(vec![]);
         let interface = Interface::new(device);
         let mcu = Mcu::for_test("test_mcu", interface);
 
@@ -1651,7 +1651,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_wrong_param_type() {
-        let device = TestDevice::new(vec![]);
+        let device = FrameMock::new(vec![]);
         let interface = Interface::new(device);
         let mcu = Mcu::for_test("test_mcu", interface);
 
@@ -1710,8 +1710,8 @@ mod tests {
     /// Dropping the `Mcu` must shut down cleanly even when the underlying
     /// device keeps its receive channel open forever.
     ///
-    /// The `TestDevice` is filled with extra (unconsumed) mappings on purpose:
-    /// `TestDevice::send` only drops the last `buf_tx` sender once all mappings
+    /// The `FrameMock` is filled with extra (unconsumed) mappings on purpose:
+    /// `FrameMock::send` only drops the last `buf_tx` sender once all mappings
     /// have been consumed, so with mappings still queued the frame channel stays
     /// open and `receive()` blocks indefinitely. This guarantees the receive
     /// task does not end on its own, so the test truly exercises the shutdown
@@ -1731,7 +1731,7 @@ mod tests {
             })
             .collect();
 
-        let device = TestDevice::new(mappings);
+        let device = FrameMock::new(mappings);
         let interface = Interface::new(device);
         let mcu = Mcu::for_test("drop_test", interface);
 

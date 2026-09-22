@@ -325,7 +325,7 @@ mod tests {
     use super::*;
     use crate::core::klippy::cmd::identify::IDENTIFY_CHUNK_SIZE;
     use crate::core::klippy::frame::Frame;
-    use crate::core::klippy::interface::devices::test::{MappingEntry, TestDevice};
+    use crate::core::klippy::interface::devices::frame_mock::{FrameMock, MappingEntry};
     use crate::core::klippy::interface::Interface;
     use crate::core::klippy::msg::proto::Payload;
     use flate2::write::{DeflateEncoder, ZlibEncoder};
@@ -416,11 +416,11 @@ mod tests {
     }
 
     fn interface(mappings: Vec<MappingEntry>) -> Interface {
-        Interface::new(TestDevice::new(mappings))
+        Interface::new(FrameMock::new(mappings))
     }
 
     fn mcu_with(mappings: Vec<MappingEntry>) -> Mcu {
-        Mcu::for_test("test_mcu", Interface::new(TestDevice::new(mappings)))
+        Mcu::for_test("test_mcu", Interface::new(FrameMock::new(mappings)))
     }
 
     /// Fetch with a short timeout — the default is 10 s, too slow for tests that

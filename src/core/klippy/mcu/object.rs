@@ -1005,7 +1005,9 @@ pub fn load_config_prefix(
 mod tests {
     use super::*;
     use crate::core::klippy::frame::Frame;
-    use crate::core::klippy::interface::devices::test::{FrameRecorder, MappingEntry, TestDevice};
+    use crate::core::klippy::interface::devices::frame_mock::{
+        FrameMock, FrameRecorder, MappingEntry,
+    };
     use crate::core::klippy::interface::Interface;
     use crate::core::klippy::msg::proto::Payload;
     use crate::core::klippy::printer::PrinterState;
@@ -1028,7 +1030,7 @@ mod tests {
 
     /// An MCU attached to `object`'s chip, with `reset` in its dictionary.
     fn attached(object: &McuObject, mappings: Vec<MappingEntry>) -> FrameRecorder {
-        let device = TestDevice::new(mappings);
+        let device = FrameMock::new(mappings);
         let recorder = device.recorder();
         let mcu = Arc::new(Mcu::for_test("mcu", Interface::new(device)));
         mcu.install_dictionary(Dictionary::from_json(json!({"commands": {"reset": 9}})).unwrap())
@@ -1164,7 +1166,7 @@ mod tests {
         // weakly, and the registry is the printer's.
         let printer = printer();
         let object = McuObject::new(section(None), &printer).unwrap();
-        let mcu = Mcu::for_test("mcu", Interface::new(TestDevice::new(vec![])));
+        let mcu = Mcu::for_test("mcu", Interface::new(FrameMock::new(vec![])));
         mcu.install_dictionary(
             Dictionary::from_json(json!({
                 "config": {
@@ -1197,7 +1199,7 @@ mod tests {
         shutdown.push_u32(1234).unwrap(); // clock
         shutdown.push_u16(0).unwrap(); // static_string_id 0
 
-        let device = TestDevice::new(vec![MappingEntry {
+        let device = FrameMock::new(vec![MappingEntry {
             input: Frame::new(0, request.into_raw()),
             outputs: vec![Frame::new(0, shutdown.into_raw())],
         }]);
@@ -1265,10 +1267,7 @@ mod tests {
     #[tokio::test]
     async fn test_a_connected_mcu_reports_its_identify_snapshot() {
         let object = object(None);
-        let mcu = Arc::new(Mcu::for_test(
-            "mcu",
-            Interface::new(TestDevice::new(vec![])),
-        ));
+        let mcu = Arc::new(Mcu::for_test("mcu", Interface::new(FrameMock::new(vec![]))));
         mcu.install_dictionary(
             Dictionary::from_json(json!({
                 "version": "v0.12.0-1-g1234567",
@@ -1325,14 +1324,14 @@ mod tests {
 
     /// An MCU attached to `object`'s chip whose dictionary has `emergency_stop`.
     ///
-    /// The device is scripted with `mappings` because [`TestDevice`] only
+    /// The device is scripted with `mappings` because [`FrameMock`] only
     /// records a frame it was told to expect: with no mapping, a sent frame is
     /// refused and never reaches the recorder.
     fn attached_with_estop(
         object: &McuObject,
         mappings: Vec<MappingEntry>,
     ) -> (Arc<Mcu>, FrameRecorder) {
-        let device = TestDevice::new(mappings);
+        let device = FrameMock::new(mappings);
         let recorder = device.recorder();
         let mcu = Arc::new(Mcu::for_test("mcu", Interface::new(device)));
         mcu.install_dictionary(

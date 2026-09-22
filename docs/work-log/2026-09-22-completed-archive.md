@@ -124,7 +124,7 @@
       `.firmware_restart`（行模式与 g-code 模式都认），`usage()` 同步更新
       （`crates/klippy-client/src/session.rs`）。
 - **`Mcu::flush`**：发送队列的 item 分 `SendItem::Payload | SendItem::Flush(oneshot)`，
-      发送任务遇 barrier 立即发走并回报；`TestDevice::recorder()` 让 block 边界可断言
+      发送任务遇 barrier 立即发走并回报；`FrameMock::recorder()` 让 block 边界可断言
       （`mcu/mod.rs`、`interface/test.rs`）。
 - **reset 路径的 P0/P3**：`emergency_stop` 与 `config_reset` 分两个 block，中间用固件的
       `shutdown` 报告作屏障，无 `shutdown` 时 15 ms 兜底并告警（`mcu/config.rs`、

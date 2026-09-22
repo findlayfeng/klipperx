@@ -380,7 +380,7 @@ impl AdcState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::klippy::interface::devices::test::TestDevice;
+    use crate::core::klippy::interface::devices::frame_mock::FrameMock;
     use crate::core::klippy::interface::Interface;
     use crate::core::klippy::mcu::Dictionary;
     use crate::core::klippy::mcu::McuChip;
@@ -421,7 +421,7 @@ mod tests {
     }
 
     fn mcu(batched: bool) -> Mcu {
-        let mcu = Mcu::for_test("mcu", Interface::new(TestDevice::new(Vec::new())));
+        let mcu = Mcu::for_test("mcu", Interface::new(FrameMock::new(Vec::new())));
         mcu.install_dictionary(dictionary(batched)).unwrap();
         // The query slot needs a clock to place the first report in the future.
         mcu.set_clock_base(1_000_000);

@@ -180,11 +180,11 @@ identify 是唯一的例外：它不在这一层，格式由主机自有、且�
 2. **定义消息类型**：在所属 `cmd` 模块里实现 `McuCommand` / `McuResponse`，只写 `NAME` 与 `args()` / `decode()`。
 3. **定义或扩展能力 trait**：在命令层暴露一个语义化方法（如 `get_clock`），并提供一个 `Mcu*` 实现调 `Mcu::call_msg` / `send_msg`。
 4. **不需要手工注册**：[`Mcu::connect`](identify.md) 会把字典里所有命令与响应装进 `Parser`。
-5. **补测试**：用 `TestDevice` 的 `MappingEntry` 构造期望的收发帧（见下）。
+5. **补测试**：用 `FrameMock` 的 `MappingEntry` 构造期望的收发帧（见下）。
 
 ### 测试要点：帧序号
 
-`TestDevice` 逐条比对**完整 `Frame`（含 seq 与 payload）**，而线上的序号是**一条连接一个数**，两端共享：
+`FrameMock` 逐条比对**完整 `Frame`（含 seq 与 payload）**，而线上的序号是**一条连接一个数**，两端共享：
 
 - 固件只有一个 `next_sequence`（`src/command.c:16`）：发的每一帧都盖它、只收带它的块、收下就 +1（**先 +1 再 dispatch**，`:301-305`），所以响应与紧随的空帧（ack）盖的都是**收下之后**的号；
 - 主机这侧由发送任务独占这个号（`Wire::next`，展开成单调计数，只有低 4 位上线）。**写线之前就推进**：固件可能在写还没返回时就答上来，接收侧要拿这个号判断"这帧回答的是我们发过的块"；

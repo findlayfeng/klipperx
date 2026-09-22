@@ -5,12 +5,12 @@ pub(crate) mod pty;
 pub mod usb;
 
 pub use devices::canserial::CanSerialDevice;
+#[cfg(test)]
+pub use devices::frame_mock::{FrameMock, MappingEntry};
 pub use devices::host::HostDevice;
 pub use devices::serial::SerialDevice;
 #[cfg(test)]
 pub use devices::simulator::SimulatorDevice;
-#[cfg(test)]
-pub use devices::test::{MappingEntry, TestDevice};
 pub use error::InterfaceError;
 
 use super::frame::{Frame, MESSAGE_HEADER_SIZE, MESSAGE_MAX, MESSAGE_MIN, MESSAGE_TRAILER_SIZE};
@@ -55,9 +55,9 @@ pub struct Interface {
 ///   can-serial link (`canbus_uuid:` + `canbus_interface:` + `canbus_nodeid:`)
 /// - `Host(HostDevice)` — klipper's host library, loaded from a shared object
 ///   (`host_library:`)
-/// - `Test(TestDevice)` — a scripted device, in test builds (`test:`)
+/// - `FrameMock(FrameMock)` — a frame-level mock for tests (built in code)
 /// - `Simulator(SimulatorDevice)` — a dictionary-driven fake MCU, in test builds
-///   (`test:` with `dict=`)
+///   (`test: dict=`)
 ///
 /// There is no "configured nothing" variant on purpose: a section that names no
 /// transport is reported when it is parsed, rather than turned into an interface
@@ -68,7 +68,7 @@ enum Transport {
     CanSerial(Arc<CanSerialDevice>),
     Host(Arc<HostDevice>),
     #[cfg(test)]
-    Test(Arc<TestDevice>),
+    FrameMock(Arc<FrameMock>),
     #[cfg(test)]
     Simulator(Arc<SimulatorDevice>),
 }
@@ -94,10 +94,10 @@ impl Interface {
         &self.handle
     }
 
-    /// Create a new `Interface` wrapping the given device.
+    /// Create a new `Interface` wrapping a frame-level mock.
     #[cfg(test)]
-    pub fn new(device: TestDevice) -> Self {
-        Self::with_transport(Transport::Test(Arc::new(device)))
+    pub fn new(device: FrameMock) -> Self {
+        Self::with_transport(Transport::FrameMock(Arc::new(device)))
     }
 
     /// Create an interface over a dictionary-driven fake MCU.
@@ -177,7 +177,7 @@ impl Interface {
                 self.off_runtime(move || device.send(&frame)).await
             }
             #[cfg(test)]
-            Transport::Test(device) => {
+            Transport::FrameMock(device) => {
                 let device = Arc::clone(device);
                 self.off_runtime(move || device.send(&frame)).await
             }
@@ -204,7 +204,7 @@ impl Interface {
                 self.off_runtime(move || device.receive()).await
             }
             #[cfg(test)]
-            Transport::Test(device) => {
+            Transport::FrameMock(device) => {
                 let device = Arc::clone(device);
                 self.off_runtime(move || device.receive()).await
             }
@@ -223,7 +223,7 @@ impl Interface {
             Transport::CanSerial(device) => device.shutdown(),
             Transport::Host(device) => device.shutdown(),
             #[cfg(test)]
-            Transport::Test(device) => device.shutdown(),
+            Transport::FrameMock(device) => device.shutdown(),
             #[cfg(test)]
             Transport::Simulator(device) => device.shutdown(),
         }
@@ -358,7 +358,7 @@ mod trace_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::klippy::interface::devices::test::TestDevice;
+    use crate::core::klippy::interface::devices::frame_mock::FrameMock;
 
     fn make_frame(seq: u8, payload: &[u8]) -> Frame {
         Frame::new(seq, payload.to_vec())
@@ -369,7 +369,7 @@ mod tests {
         let input = make_frame(1, b"hello");
         let expected_output = make_frame(2, b"world");
 
-        let device = TestDevice::new(vec![MappingEntry {
+        let device = FrameMock::new(vec![MappingEntry {
             input: input.clone(),
             outputs: vec![expected_output.clone()],
         }]);
@@ -400,7 +400,7 @@ mod tests {
             })
             .collect();
 
-        let device = TestDevice::new(mappings);
+        let device = FrameMock::new(mappings);
         let interface = Interface::new(device);
 
         for (i, (input, expected_output)) in pairs.iter().enumerate() {
@@ -418,7 +418,7 @@ mod tests {
         let expected = make_frame(1, b"expected");
         let actual = make_frame(2, b"actual");
 
-        let device = TestDevice::new(vec![MappingEntry {
+        let device = FrameMock::new(vec![MappingEntry {
             input: expected.clone(),
             outputs: vec![make_frame(3, b"response")],
         }]);
@@ -436,7 +436,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_interface_send_without_mapping() {
-        let device = TestDevice::new(vec![]);
+        let device = FrameMock::new(vec![]);
         let interface = Interface::new(device);
 
         let result = interface.send(make_frame(1, b"extra")).await;
@@ -455,7 +455,7 @@ mod tests {
         let output1 = make_frame(2, b"reply1");
         let output2 = make_frame(3, b"reply2");
 
-        let device = TestDevice::new(vec![
+        let device = FrameMock::new(vec![
             MappingEntry {
                 input: input.clone(),
                 outputs: vec![output1.clone()],
@@ -487,7 +487,7 @@ mod tests {
             make_frame(4, b"reply3"),
         ];
 
-        let device = TestDevice::new(vec![MappingEntry {
+        let device = FrameMock::new(vec![MappingEntry {
             input: input.clone(),
             outputs: outputs.clone(),
         }]);
@@ -514,7 +514,7 @@ mod tests {
         let input = make_frame(10, &payload);
         let expected_output = make_frame(20, &payload);
 
-        let device = TestDevice::new(vec![MappingEntry {
+        let device = FrameMock::new(vec![MappingEntry {
             input: input.clone(),
             outputs: vec![expected_output.clone()],
         }]);
@@ -528,7 +528,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_interface_send_error_preserves_message() {
-        let device = TestDevice::new(vec![]);
+        let device = FrameMock::new(vec![]);
         let interface = Interface::new(device);
 
         let result = interface.send(make_frame(1, b"no_mapping")).await;

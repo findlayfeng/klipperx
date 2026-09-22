@@ -43,7 +43,7 @@
 //! against real firmware. In a release build the
 //! library is asked for whole frames (`klipper_host_output_frame`, which it only
 //! has when built with `CONFIG_HOST_FRAME_API`), and reassembly is skipped
-//! entirely — the same thing `TestDevice` does, for the
+//! entirely — the same thing `FrameMock` does, for the
 //! same reason: there is nothing to reassemble when the boundary is already known.
 //!
 //! **Its state is process-global.** Klipper's globals live inside the shared

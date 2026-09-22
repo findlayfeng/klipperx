@@ -513,7 +513,7 @@ impl ClockSync for McuClock {
 mod tests {
     use super::*;
     use crate::core::klippy::frame::Frame;
-    use crate::core::klippy::interface::devices::test::{MappingEntry, TestDevice};
+    use crate::core::klippy::interface::devices::frame_mock::{FrameMock, MappingEntry};
     use crate::core::klippy::interface::Interface;
     use crate::core::klippy::mcu::Dictionary;
     use crate::core::klippy::msg::proto::Payload;
@@ -541,7 +541,7 @@ mod tests {
 
     /// An identified MCU whose only exchange is `get_clock` → `clock`.
     fn mcu_answering(mappings: Vec<MappingEntry>) -> Arc<Mcu> {
-        let mcu = Mcu::for_test("test_mcu", Interface::new(TestDevice::new(mappings)));
+        let mcu = Mcu::for_test("test_mcu", Interface::new(FrameMock::new(mappings)));
         mcu.install_dictionary(dictionary()).unwrap();
         Arc::new(mcu)
     }
@@ -578,7 +578,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_clock_before_identify_fails() {
-        let mcu = Mcu::for_test("test_mcu", Interface::new(TestDevice::new(Vec::new())));
+        let mcu = Mcu::for_test("test_mcu", Interface::new(FrameMock::new(Vec::new())));
         let clock = McuClock::new(Arc::new(mcu), ManualReactor::shared());
 
         let err = clock.get_clock().await.unwrap_err();
@@ -588,7 +588,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_clock_times_out_when_mcu_stays_silent() {
-        let mcu = Mcu::for_test("test_mcu", Interface::new(TestDevice::new(Vec::new())));
+        let mcu = Mcu::for_test("test_mcu", Interface::new(FrameMock::new(Vec::new())));
         mcu.install_dictionary(dictionary()).unwrap();
         let clock = McuClock::new(Arc::new(mcu), ManualReactor::shared())
             .with_timeout(Duration::from_millis(50));

@@ -51,7 +51,7 @@
 > 并落地；其余 Q 属模块。**Q8**（`GCodeIO`）已定为暂缓 `[~]`。
 
 > **不列入框架、可以直接随模块做的**：G2b（`SET_PIN` 时序）、G4（运动命令本体）、
-> F6 剩余（`spi_transfer_with_preface`）、F9、H1–H11、S1、E1、E2。
+> F6 剩余（`spi_transfer_with_preface`）、F9、H1–H11、S1、E2。
 
 ## 已定
 
@@ -88,7 +88,7 @@ H1–H12 是[上游功能覆盖审计](docs/work-log/2026-09-21-upstream-coverag
 | C2 | 配置装载：框架部分 ✅（FW1，含 choice/range 文案与 `deprecate` 警告）；autosave/`SAVE_CONFIG` 仍待（属模块） | C1 |
 | A2 | 错误词汇 ✅（FW3） | — |
 | B2 | MCU：`emergency_stop` 对象/端点、`last_stats`、错误载荷 + `error_mcu`、本地 shutdown 标志、固件 `reset` ✅（FW7） | — |
-| D1 | 主机层 start args / rollover / `--logfile` ✅（FW8，`StartArgs` 已补全） | — |
+| D1 | 主机层 start args / rollover / `--logfile` ✅（FW8）；`StartArgs` 剩余字段与 `M115` 接线仍待 | — |
 | D2 | 重启循环 ✅（FW8；`rpi_usb` 真机见 T5） | — |
 | D3 | `command` 接管运行中的板子：RTO 定时重传 ✅（FW7） | B2 |
 
@@ -96,7 +96,6 @@ H1–H12 是[上游功能覆盖审计](docs/work-log/2026-09-21-upstream-coverag
 
 | # | 事项 | 依赖 |
 |---|---|---|
-| F3 | `MCU_bus_digital_out`（命令队列/运动同步输出） | C1 |
 | F6 | SPI 总线剩余：`spi_transfer_with_preface` / `setup_shutdown_msg` | F1、F2 |
 | F8 | endstop / trsync ✅（FW6） | F1、F2、C1 |
 | F9 | 固件资源剩余：buttons / pulse_counter / trigger_analog / initial_pins / sdcard / sensor_bulk / lcd / neopixel / thermocouple / tmcuart 等 | F1–F7 |
@@ -132,7 +131,6 @@ H1–H12 是[上游功能覆盖审计](docs/work-log/2026-09-21-upstream-coverag
 | # | 事项 | 依赖 |
 |---|---|---|
 | S1 | 压力测试工具（`klipperx stress`）剩余：stepper 资源、别名解析、端到端测试 | C1 |
-| E1 | 文档 | — |
 | E2 | `python_path` 的取消 | 外部项目 |
 
 > 判为**不适用**、不进待办的上游模块：`garbage_collection.py`（Python GC 调优）、
@@ -141,17 +139,13 @@ H1–H12 是[上游功能覆盖审计](docs/work-log/2026-09-21-upstream-coverag
 
 ### G2b 用 GCODE 控制 GPIO（现状与剩余）
 
-数字与 PWM 两条链都已打通（见文末 F3 / F4 索引）：`[output_pin <name>]`
+数字与 PWM 两条链都已打通（见文末索引）：`[output_pin <name>]`
 （`extras/output_pin.rs`）读 `pin` / `value` / `shutdown_value`（PWM 另加 `pwm` /
 `cycle_time` / `hardware_pwm`），经 `PrinterPins::setup_digital_out` / `setup_pwm`
 （`pins.rs`）建出 `McuDigitalOut` / `McuPwm`，并注册 mux 命令
 `SET_PIN PIN=<name> VALUE=<0..1>`；运行时走立即路径（`update_digital_out` / `update_pwm`，
 软件 PWM 对齐到周期边界）。剩下的是：
 
-- [x] **真板端到端验证**：`config.cfg` 加一段 `[output_pin <name>]` + `pin: <PAx>`，用
-      `SET_PIN PIN=<name> VALUE=1` 点亮、`VALUE=0` 熄灭，并对 `pwm: true` 的脚改占空比，
-      确认 `config_digital_out` / `config_pwm_out` 的 oid 与初始值、`update_digital_out` /
-      `update_pwm` 都真的上了线（现有测试都在假 chip / 假设备上）。
 - [ ] **与运动 / 打印时间同步的 `SET_PIN`**（上游 `GCodeRequestQueue`，
       `klippy/extras/output_pin.py:13-85` `:249-269`）：上游把请求排进 toolhead 的
       lookahead、在 print time 生效，并对移动中的 pin 变化与 MCU 最小调度间隔做对齐；
@@ -187,49 +181,7 @@ H1–H12 是[上游功能覆盖审计](docs/work-log/2026-09-21-upstream-coverag
       `queue_step`，用 `TestDevice` 覆盖一次加压（及 `ResetRequired` 路径）；`--task comm` 同理。
       目前只测了段计算、引脚解析与命令编码。
 
-### A2 错误词汇（框架 FW3）
 
-- [x] **`ConfigError` 与分层**：`error.rs` 新增 `ConfigError`，`KlippyError` 增 `Config` 变体；
-      工厂、`load.rs`、`Printer::add_object`、`McuConfig::new` 从 `Internal` 改为 `ConfigError`
-      （上游 `add_object` 重复名也报 config error）。
-- [x] **handler 异常 → `invoke_shutdown`**：`gcode.rs` 的 `invoke_handler` 用 `catch_unwind` 包住
-      handler，panic 报 `Internal error on command:"X"` 并 `invoke_shutdown`；API 侧 `Api::dispatch`
-      同样兜底，经 `Api::set_internal_error_hook`（由 `api::register` 指向 `invoke_shutdown`）
-      报 `Internal Error on WebRequest: <method>`。
-- [x] **config 错与 shutdown 分离**：新增 `Printer::set_error_state`（用上此前从未赋值的
-      `PrinterState::Error`）；`load_config` 失败与 `connect` 期的 `KlippyError::Config` 走它，
-      只有真正的内部错才 `invoke_shutdown`。
-- [x] **`lookup_object` 未命中**：上游 `lookup_object` 未命中报 config error；已加
-      `Printer::require_object` / `require_object_as::<T>`（报 `Unknown config object 'x'`），
-      现有 `Option` 版本仍供按需判存的调用点。
-- [x] **`Internal` 收敛的剩余点**：`mcu/object.rs` 的 `config.open()` 失败映射
-      `KlippyError::Connection`，`builder.build()` 的 `McuError::Config` 映射 `KlippyError::Config`，
-      其余归 `Internal`；connect 失败由 `classify_mcu_error` 归类（FW3/FW7）。
-
-### B2 MCU 关闭与错误上报（框架 FW7，完成）
-
-- [x] **`emergency_stop` / `clear_shutdown` 的对象与端点**：`emergency_stop` 端点已加
-      （`api/endpoints/emergency_stop.rs`，进 shutdown 并回 `{}`）；每个 `McuObject` 由工厂在
-      `klippy:shutdown` 上注册处理器，向固件发 `emergency_stop`（`mcu/object.rs` 的
-      `on_host_shutdown`）。`clear_shutdown` 仍只被 `configure` 的复位路径使用。
-- [x] **本地 shutdown 标志**：`McuObject::is_shutdown`（`Arc<AtomicBool>`，供 `'static` 事件
-      处理器共享）+ `force_local_shutdown`；固件自报 `shutdown`/`is_shutdown` 时置位，
-      `on_host_shutdown` 据此不回发。`bind_shutdown` 仍在 `configure` 之后绑定（足够安全）；
-      要提前到 identify 之后，再靠标志区分自己发的停止——留作可选项。
-- [x] **`last_stats`**：`event/stats.rs` 的 `LastStats::from_report` 按上游算术（`klippy/mcu.py:931-941`）
-      把每条 `stats` 换算成 `mcu_tick_avg/stddev/awake`；`register_stats` 存进 `McuObject` 的
-      槽，`get_status` 在收到过报告后带上 `last_stats`。真板已确认。
-- [x] **错误上报带载荷**：上游 `klippy:notify_mcu_error` 带 `msg` 与 details
-      （`klippy/klippy.py:144` `:151`），shutdown 分析走 `klippy:analyze_shutdown`
-      （`klippy/klippy.py:216-220`）。变体已就位
-      （`KlippyEvent::KlippyNotifyMcuError` / `KlippyEvent::KlippyAnalyzeShutdown`），
-      `notify_mcu_error` 的触发点已接入（`Printer::bring_up` 中 MCU 连接失败路径），
-      MCU 停止发 `"MCU shutdown"` + `{mcu, reason, event_type}`；`error_mcu` 模块
-      （`extras/error_mcu.rs`）消费两者，展开停机/protocol/connect 文案，
-      `Printer::update_error_msg` 同上游语义。
-- [x] **`command` 的固件 `reset` 优先**：`reset_firmware` 现在先看固件有没有 `reset`，有就返回
-      `ResetRequired`，由 `connect` 发 `reset` + 重连 + 重试握手（`klippy/mcu.py:733-740`
-      的 `_reset_cmd` 优先）；只有没有 `reset` 时才用 `config_reset` 就地清（`mcu/config.rs`）。
 
 ### G1b gcode 调度器与上游的行为差异（框架部分 FW4）
 
@@ -252,18 +204,6 @@ toolhead / 开放事件）一起补，一部分是现在就独立可补的小行
       ④ `gcode:debuginput_exit` 需要 `send_event` 收集 handler 返回值（上游 `all(...)`）。
       tty 与 debuginput 共用同一套 `_process_data`，应一起做。详见
       [FW4 笔记](docs/work-log/2026-09-21-fw4-notes.md) 第 3 节。
-- [x] **`ack()` / `need_ack`**：`GcodeCommand` 没有 `ack`（`:54-63`），这是文件输入协议的
-      一部分。受影响的具体行为：`M115` 应该先 `ack(msg)`、失败才 `respond_info`（`:344-350`）。
-      —— 已加 `GcodeCommand::ack`（`M115` / `M105` 已用）；本轮补全协议本身：`ack` 清
-      `need_ack`（`Cell`）所以只 ack 一次，`process_line` 末尾按上游调用 `gcmd.ack()`，
-      错误传播也按 `need_ack` 分支（`true` 时报告并 ack 而不中止脚本）。仍无 `need_ack=true`
-      的生产者（GCodeIO）。
-- [x] **事件**：错误分支不发 `gcode:command_error`（`:226`），重启不发
-      `gcode:request_restart`（`:358`），debug 输入不发 `gcode:debuginput_exit`（`:433`）。
-      事件总线（`KlippyEvent`）已就绪。
-      —— `gcode:command_error` 已在 `process_line` 接上（handler 的 `CommandError` 触发；
-      panic 走 `invoke_shutdown`、**不**触发，同上游 `:223-234`）。`gcode:request_restart` 的
-      声明已补 `print_time` 载荷（上游实际带参数），触发随 C1。
 - [~] **`gcode:debuginput_exit` 触发（随 `GCodeIO` 暂缓）**：上游 `_do_debuginput_exit`
       轮询 `all(send_event('gcode:debuginput_exit'))`（`:432-435`），依赖 handler 的返回值；
       本仓库 `Printer::send_event` 丢弃返回值（上游 `klippy/klippy.py:226-227` 是
@@ -272,68 +212,16 @@ toolhead / 开放事件）一起补，一部分是现在就独立可补的小行
       `wait_moves()` 再 `request_exit`（`:352-365`），随 **C1**；当前直接 `request_exit`
       （`gcode.rs:515-545`）。
 - [ ] **`Coord`**（`:12-17`）：随 toolhead / kinematics（C1）。
-- [x] **handler 内部异常 → `invoke_shutdown`**：上游用裸 `except:` 兜底，报
-      `Internal error on command:"X"` 并停机（`:229-232`）。已由 `invoke_handler` 的
-      `catch_unwind` 实现（A2）；本轮把 `CommandError` 与 panic 分成 `HandlerOutcome` 两支，
-      好让 `gcode:command_error` 只对前者触发。
 
 **可独立补的小行为差异**
 
-- [x] **`default_handler` 缩水**（`:283-316`）：缺 `M105` → `ack("T:0")`、`M21`、
-      `M140/M104` 且 `S=0`、`M107` / `M106`（S 关或 fileinput）这些「没有该模块时安静忽略」
-      的抑制；也缺「命令名里带空格」时按 `realcmd = cmd.split()[0]` 路由到 `M117/M118/M23`
-      的分支。后者是实际差异：`M117 123` 这类数字消息在 Rust 里会整串当命令名而报
-      `Unknown command`（`parse_line` 只做 trim，`gcode.rs:862-917`）。
-- [x] **`ECHO` 前缀**：上游 `respond_info(commandline, log=False)` → 输出 `// <line>`
-      （`:368-369`）；Rust 用 `respond_raw`，没有 `// ` 前缀、不记日志（`gcode.rs` 的 `ECHO`）。
-- [x] **`HELP` 未就绪提示**：上游未就绪时首行加
-      `Printer is not ready - not all commands available.`，并遍历当前 active 表（`:379-388`）；
-      Rust 无该提示，遍历 help 表（`gcode.rs:663-678`）。
 - [ ] **`M115` 版本号来源**：上游取 `start_args['software_version']`（`:344-350`），Rust 用
       `CARGO_PKG_VERSION`。当前 `StartArgs::collect` 的 `software_version` 本身就填
       `CARGO_PKG_VERSION`，且宿主没把它接到 `GcodeDispatch`（`Printer` 不持有 `StartArgs`），
       所以行为差异要等 **D1** 的 start args wiring 才有意义，一并做。
-- [x] **`get_status` 的构建口径**：上游返回缓存的 `status_commands`、按 **active 表**构建
-      （未就绪只列 base 的 8 条内置，`:176-184`）；Rust 每次从 `commands.ready` 全量重建
-      （`gcode.rs:578-592`）。未就绪阶段 `objects/query` 看到的命令集合不同。
-- [x] **未就绪时停机不打印**：上游 `_handle_shutdown` 在 `not is_printer_ready` 时直接
-      return（`:186-193`）；Rust 无条件发 `Klipper state: Shutdown`（`gcode.rs:335-343`）。
-- [x] **`is_traditional_gcode` 判定**：上游用 `float(cmd[1:])`（`:125-131`），Rust 只看首字母
-      大写 + 次字符数字（`gcode.rs:794`）。`M1ABC` 这类上游拒绝注册、Rust 接受。
-- [x] **`parse_extended` 的 shlex 保真**：Rust 手写解析只做引号切换 + `#`/`;` 截断，不处理
-      反斜杠转义 / 引号拼接等 `shlex` 语义（`gcode.rs:937-983` 对 `:266-281`）。
-      —— 已补：单引号内原样、双引号内只转义 `"`/`\`、引号外退格去反斜杠、相邻引号拼接、
-      尾部悬空反斜杠报错。
-- [x] **校验和 `*123`**：上游 `get_raw_command_parameters` 会剥掉尾部校验和（`:40-51`），
-      Rust 的 `raw_parameters` 不剥（`gcode.rs:919-935`）。只在文件 / 串口输入路径上有影响，
-      连同 `GCodeIO` 一起看。
-- [x] **`register_command(cmd, None)` 注销**：上游支持注销并返回旧 handler（`:133-141`），
-      Rust 无注销、重复注册直接报错（`gcode.rs:325-350`）。
-      —— 已加 `GCodeDispatch::unregister_command`（返回旧 handler，未知名字返回 `None`）。
-- [x] **参数访问器缺口**：缺 `above`/`below`、`get_int` 的 `minval/maxval`、通用
-      `get(parser=…)`；缺 `get_command_parameters` / `get_raw_command_parameters`（raw 只在
-      内部 `Parsed`）；也没有 `create_gcode_command`（字段私有，外部无法构造 gcmd）
-      （`:23-91` `:244`）。
-      —— 已补齐：通用 `get`（parser + `minval`/`maxval`/`above`/`below`）、`get_int_bounded`、
-      `get_float_bounded`、`get_command_parameters`、`get_raw_command_parameters`（剥行号与
-      `*<checksum>`）、`GCodeDispatch::create_gcode_command`。后者的消费者是 `homing` /
-      `probe` / `safe_z_home` / `bed_mesh` / `gcode_arcs`（**不是** `gcode_macro`）。
-- [x] **`run_script_from_command`**（原先未列）：上游 handler 内部入口（`:237-238`），消费者
-      `gcode_macro` / `pause_resume` / `firmware_retraction` / `hall_filament_width_sensor`。
-      已加，与 `run_script` 同实现（本主机无 dispatcher mutex），是 H3 的直接前置。
 - [ ] **`get_mutex` 等价物**（原先未列）：上游 `gcode.get_mutex()`（`:242-243`）被
       `bed_mesh`（`:307`）与 `idle_timeout`（`:70` `:90`）用来判断「是否有脚本在跑」；
       本主机无 reactor mutex，是否需要等价物（脚本占用标志）等 C1 与那两个模块落地再定。
-- [x] **mux 缺省项（`value=None`）不可达**（**优先，含测试**）：`dispatch_mux` 用
-      `contains_key(&None)` 认出缺省项，但键缺席时把请求值取成 `""` 再用 `Some("")` 查表，
-      永远命中不了 `None`，于是走到「值不合法」错误分支（`gcode.rs:680-733` 对 `:317-342`）。
-      实测：注册 `SET_PIN` 的 `PIN=None` 后执行 `SET_PIN VALUE=1`，报
-      `The value '' is not valid for PIN. Options: `。当前库里只用 `Some(name)` 注册，未覆盖。
-- [x] **mux 错误提示的 `Did you mean`**：上游按 dict 迭代序取「最后一个匹配」（`:317-342`），
-      Rust 对 values 排序后取第一个匹配（`gcode.rs:718-733`）——措辞更稳定，属有意偏离；
-      要么对齐上游，要么在文档里记一句。
-- [x] **清理 `src/core/parser.rs`**：`parse_gcode` / `parse_gcode_line` 是未被引用的存根
-      （`#[allow(dead_code)]`），真正的解析在 `gcode.rs`；删除或并入 `gcode.rs` 的测试。
 
 ### G4 运动命令（G0/G1/G28/G92/M114…）
 
@@ -345,55 +233,23 @@ toolhead / 开放事件）一起补，一部分是现在就独立可补的小行
 `api-reference.md` 有、`endpoints/mod.rs` 的表里标「not started」的其余部分，各自等它读的
 对象先存在：
 
-- [x] `emergency_stop`（`klippy/webhooks.py:322` `_handle_estop_request`）：见 B2 / `api/endpoints/emergency_stop.rs`。
-- [x] `register_remote_method`：方法表与推送（`klippy/webhooks.py:319` `:323` `:391`
-      `:412`）。crate 侧机制（`klippy-api` 的 `register_remote_method`/`call_remote_method`）+
-      core 端点 `api/endpoints/register_remote_method.rs`；`webhooks` 对象转发 `call_remote_method`。
 - [ ] `pause_resume/{pause,resume,cancel}`：等 `pause_resume` 对象。
-- [x] `query_endstops/status`：FW6c 已落地（`api/endpoints/query_endstops.rs`）。
-- [x] `bed_mesh/dump_mesh` 与 `*/dump_*` 多路复用端点（`klippy/webhooks.py:335`
-      `_handle_mux`）：机制已接（`klippy-api` 的 `MuxEndpoint` + `webhooks.register_mux_endpoint`
-      → `api::register` 倒入 `Api`）；具体端点等对应 extras（`bed_mesh`、`adxl345` 等）。
 
-### F MCU 基础资源（F3、F6–F9）
+### F MCU 基础资源（F6、F8、F9）
 
 上游把这些叫 printer objects 下面的「资源」：主机用一个 **oid** 和一个 **pin 描述**
 建立资源对象，把 `config_*` 命令攒起来，在 `finalize_config` 之前算一个 CRC 一次性下发，
 之后用 `queue_*` / `set_*` / `*_transfer` 命令驱动。命令层（`allocate_oids` / `get_config` /
 `finalize_config` / `get_uptime` / `emergency_stop` / `get_clock`）已就位，配置构建层（F1）
 与 pin 解析（F2）也已完成，数字输出、PWM（F4）与 ADC（F5）三个 `config_*` 资源已落地
-（见文末索引），SPI/I2C 总线（F6/F7）也已落地，剩下的缺口是命令队列/运动同步输出（F3）、
-endstop/trsync（F8）与其余固件资源（F9）。
+（见文末索引），SPI/I2C 总线（F6/F7）也已落地（细节已归档），剩下的缺口是 endstop/trsync（F8，另有
+一条测试侧待办）与其余固件资源（F9）；`MCU_bus_digital_out`（F3）能力已具备，不另做包装。
 
-#### F3 剩余：`MCU_bus_digital_out`（框架 FW6f，`[~]` 随 H8 显示消费者）
-
-- [x] **能力已具备**：`DigitalOut::queue_digital_out(clock, value)` 走固件的
-      `queue_digital_out oid clock on_ticks`，固件按绝对 clock 翻转，正是
-      `MCU_bus_digital_out` 用 serialqueue `minclock`/`reqclock` 达到的效果
-      （见 [FW6 收口](docs/work-log/2026-09-21-fw6de-notes.md) §3）。
-- [~] 不新增 `MCU_bus_digital_out` 包装：其消费者是 display `uc1701`/`st7920`（H8）；
-      等 H8 接显示时直接用 `pins.setup_digital_out` + `queue_digital_out`。
-- 运行期 `queue_digital_out` 收的是**绝对固件时钟**；print_time → clock 的换算属于时钟层
-      （`cmd/clock.rs` 的 `ClockSync`）。
-- **不引入 host 侧 serialqueue**（上游靠它把命令压到 `req_clock` 再发）：单 MCU 链路里
-      `trsync_start`/`endstop_home`/`queue_digital_out` 都带绝对时钟，固件自己调度。
 
 #### F6 SPI 总线
 
 上游 `MCU_SPI`（`klippy/extras/bus.py:42-155`）：
 
-- [x] 设备侧：`config_spi oid=%c pin=%u cs_active_high=%c`（或 `config_spi_without_cs`），
-      总线侧：`spi_set_bus oid=%c spi_bus=%u mode=%u rate=%u`，收发：
-      `spi_send oid=%c data=%*s`、`spi_transfer oid=%c data=%*s` /
-      `spi_transfer_response oid=%c response=%*s`；还有 `config_spi_shutdown`
-      （固件 `src/spicmds.c:37` `:62` `:122` `:157`）。
-- [x] 软件 SPI（`spi_software_{miso,mosi,sclk}_pin`）：`spi_set_sw_bus`（新），固件
-      `src/spi_software.c`。
-- [x] `MCU_SPI_from_config`（`bus.py:124`）：从 section 读 `cs_pin` / `spi_speed` /
-      `spi_bus` / 软件引脚，`cs_pin=None` 时不占用引脚的共享。
-- [x] 旧式 `spi_set_software_bus`（rate 版）回退：`cmd::spi::add_software_bus` 按
-      `try_lookup_command` 二选一（新式传 host 算好的 `pulse_ticks`，旧式传 `rate`），
-      回退时打 deprecation 警告。只能单测——vendored 固件只有新式。
 - [ ] `spi_transfer_with_preface` 与 `setup_shutdown_msg`：`ConfigSpiShutdown` 命令
       已定义，但资源/消费者未接（设备需要在 shutdown 时发消息时才用得上）。
 
@@ -406,67 +262,11 @@ endstop/trsync（F8）与其余固件资源（F9）。
 与软件 bit-bang 两条路都读出 JEDEC ID `ef 30 13`、状态寄存器 `0x00` 与地址 0x00 的
 数据。
 
-#### F7 I2C 总线
-
-上游 `MCU_I2C`（`klippy/extras/bus.py:161` 以后）：
-
-- [x] 设备侧：`config_i2c oid=%c`，总线侧：`i2c_set_bus` / `i2c_set_sw_bus`；传输：
-      `i2c_transfer` + `i2c_response`（旧式）或 `i2c_write` / `i2c_read` +
-      `i2c_read_response`（新式）（固件 `src/i2ccmds.c:32` `:48` `:107`）。
-- [x] `i2c_bus_status` 不是 `SUCCESS` 时按上游 `invoke_shutdown`（`bus.py:295-300`）：
-      `McuI2c::transfer` / `write` 在非 SUCCESS 时停机（消息 `MCU 'x' I2C request to
-      addr N reports error S`）并返回 `McuError::I2cBus`；探测用的
-      `transfer_without_shutdown` / `write_without_shutdown` 只返回错误，`IIC_READ` /
-      `IIC_WRITE` 用后者（探不存在的地址不应停机）。`i2c_write` 的 retry 与
-      `async_write_only` 仍是可选分支。
-- [x] 软件 I2C（`i2c_software_{scl,sda}_pin`）：`i2c_set_sw_bus`，固件 `src/i2c_software.c`。
-- [x] 旧式 `i2c_set_software_bus`（rate 版）回退：`cmd::i2c::add_software_bus` 按
-      `try_lookup_command` 二选一，回退时打 deprecation 警告。只能单测。
-- [x] 通用构造器与 `[i2c_device <name>]` section（G）：读 `i2c_mcu` / `i2c_address` /
-      `i2c_speed` / `i2c_bus` / `i2c_software_{scl,sda}_pin`，经 `McuObject::setup_i2c`
-      构造 `McuI2c`；并注册 `IIC_WRITE` / `IIC_READ` 两个调试命令（上游无此 section
-      与命令，为真机自测而加：`IIC_READ DEVICE=<n> WRITE=<hex> READ_LEN=<n>`）。
-      真正的 sensor 消费者仍属 F9。
-
-已落地：`cmd/i2c.rs`（命令层，`%*s` 走二进制 `ArgType::Bytes`，`i2c_transfer` 用固件的
-`write=`）、`mcu/resource/i2c.rs`（`McuI2c` 资源 + `I2cMode`，新式组合传输只用 `i2c_read`）、
-`Mcu::try_lookup_command`（按字典原始格式串精确匹配，检测新旧传输风格）、
-`PrinterPins::resolve_bus_name` / `resolve_bus_value`（`i2c_bus=%u` 需 host 先解析枚举值）、
-`extras/i2c_device.rs`（`[i2c_device]` 构造器 + 调试命令）。软件总线的新旧命令选择
-（`i2c_set_sw_bus` ↔ `i2c_set_software_bus`）在 `cmd::i2c::add_software_bus`。
 
 #### F8 endstop / trsync（与 C1 共享，框架 FW6a–FW6e，见 [FW6 调查](docs/work-log/2026-09-21-fw6-notes.md))
 
-- [x] **FW6a-1** 多 MCU 时基与运动输出（FW5 尾巴）：`MotionQueuing` 去掉单一 `mcu_freq`、
-      `Stepper::generate` 按自己 compressor 的 freq/offset 算 flush 时钟；`McuClock`/对齐下放到
-      `McuChip`（`McuObject::connect` 建时钟，主 offset=0、副按 `SecondarySync` 对齐）；
-      顺带修 `McuClock::seed` 未取 `CLOCK_FREQ`（见 [FW6a 记录](docs/work-log/2026-09-21-fw6a-notes.md)）。
 - [ ] **FW6a-2** 测试侧加**响应器式假 MCU**（可多实例），并补 `ToolHeadObject::connect` 的
       两 MCU 端到端测试。（挪到 FW6c 一起做；时钟偏移已有 `McuChip` 单测）
-- [x] **FW6b-1** 命令层：`cmd/endstop.rs`、`cmd/trsync.rs`、`StepperStopOnTrigger`。
-- [x] **FW6b-2** `PinChip::setup_endstop` + `PrinterPins::setup_endstop`；`mcu/resource/endstop.rs`
-      （`McuEndstop` + `home_start`/`home_wait`/`query_endstop`）；`mcu/resource/trsync.rs` 的**多实例**
-      `TriggerDispatch`/`McuTrsync`/`TrsyncRegistry`（每 MCU 一个 handler 按 oid 路由，跨 MCU
-      取最慢者延长超时）。
-- [x] **FW6c** 消费者：`[stepper_*]` 的 `endstop_pin`/`homing_*` → `Rail`；`query_endstops`
-      对象 + `query_endstops/status` 端点 + `M119`/`QUERY_ENDSTOPS`。（**框架验收 ✅**，见
-      [FW6c 记录](docs/work-log/2026-09-21-fw6c-notes.md)）
-- [x] **FW6d** 回零精度前置：`stepcompress` 的 history / `find_past_position` / `extract_old`；
-      `motion::Stepper::mcu_position`/`past_mcu_position`/`note_homing_end`；`McuStepper` 发
-      `reset_step_clock`/`stepper_stop_on_trigger`。
-- [x] **FW6e** `HomingState` + `ToolHead::drip_move` + `extras/homing.rs`（`Homing`/`HomingMove`/
-      `G28`）；`homing:*` 事件触发。**软件**：`Kinematics::home`/`HomingState` + 假 endstop 的
-      `G28` 驱动；真板单轴 `G28` 见 [`TESTING.md`](TESTING.md) T3。（本仓库的驱动写作 `extras/toolhead.rs` 的
-      `home_axes`/`HomingEndstop`，未另开 `extras/homing.rs`）
-- [x] `MCU_endstop`（`klippy/mcu.py:340-407`）：`config_endstop`、`endstop_home`、
-      `endstop_query_state`/`endstop_state` 已在 FW6b-1/2 落地（`cmd/endstop.rs` +
-      `mcu/resource/endstop.rs`）。
-- [x] `MCU_trsync` / `TriggerDispatch`（`mcu.py:155-339`）：**多实例** 已在 FW6b-2 落地
-      （`mcu/resource/trsync.rs`）；多 MCU 逻辑用多实例假 MCU 验证；次级时钟长时漂移已由
-      `SecondarySync` 周期重校准 + 模拟漂移测试覆盖，真板只剩物理时序/实际晶振漂移量。
-- [x] 消费者 `homing`：FW6e 的 `home_axes`/`HomingEndstop` 驱动 + `Kinematics::home`/
-      `HomingState`（`home_rails` 已在协议里，`get_trigger_position`/`set_stepper_adjustment`
-      随 `endstop_phase` 后置）。
 
 #### F9 其他输入与外设资源
 
@@ -514,36 +314,11 @@ kinematics 已随 Printer 重构删除，从这里重新开始。动工前调查
 
 细节条目：
 
-- [x] 先立 **toolhead 对象**：位置记忆（`commanded_pos`）、trapq、速度/加速度上限，
-      回零与移动的入口（上游 `klippy/toolhead.py:389` `:400` `:482` `:507` `:522`）。
-      FW5d-1 立骨架，FW5e-2 补 `set_position`/`kinematics` 访问器。
-- [x] 再加回 **`Kinematics` trait 与 `kinematics/`**：按上游由 toolhead 读
-      `[printer] kinematics` 装载（`klippy/toolhead.py:242`），不是交给 Printer。FW5e-1。
-- [ ] 回零协议：上游 kinematics 调 `homing_state.home_rails(rails, forcepos, movepos)`、
-      `set_homed_position(pos)`、`get_trigger_position`、`set_stepper_adjustment`。
-      没有这些，任何真实 kinematics 的 `home()` 都写不出来。（**FW6e** 与 F8 联合定）
-- [x] stepper 句柄：上游能 `get_commanded_position()` / `get_step_dist()` / `set_trapq()` /
-      `setup_itersolve()`；`calc_position` 的输入就从这里来。FW5d/FW5e-2：
-      `motion::Stepper` + `McuStepper`（oid/引脚/`query_position`）。
-- [x] step 生成层的运动学：上游 `rail.setup_itersolve('cartesian_stepper_alloc', axis)`；
-      这部分上游是 C（`klippy/chelper/` 的 `stepcompress.c`、`itersolve.c`、`kin_*.c`、
-      `trapq.c`、`kin_shaper.c`，见审计文档 §4.1），Rust 侧整体重写（决定见上）。
-      FW5c 已落地（`itersolve` + `kin_cartesian`），`stepcompress` 在 FW5f 补完整压缩。
+- [~] 回零协议：`home_rails` 已随 FW6e 落地（`extras/toolhead.rs` 的 `home_axes`/`HomingEndstop`）；
+      `get_trigger_position` / `set_stepper_adjustment` 随 `endstop_phase` 后置（H9）。
 
 ### C2 配置装载收尾（框架 FW1）
 
-- [x] **option 级校验**：访问追踪当 schema 已落地：`ConfigWrapper`（类型化 getter 一处解析并记帐）、
-      `AccessTracking`（键小写化，值为解析后的 JSON）、`check_unused`（`config/validate.rs`），
-      未认领选项报上游原文 `Option 'x' is not valid in section 'y'`。
-- [x] **住户与阶段**：`section!` 新增 `phase = early|generic|late` 与 `object = "<name>"`，
-      装载器按阶段遍历、按声明名注册；`configfile` 作为无节对象在 `gcode` 之后注册。
-- [x] **`configfile` 对象**：`get_status` 的 `settings`/`config`/`warnings` 已接，`objects/list` 可见。
-- [x] **`[printer]` / toolhead 本体**：晚阶段住户已接入（`section!("printer", phase = late,
-      object = "toolhead", …)`），消费者是 C1 的 toolhead（FW5e-2）。
-- [x] **`deprecate`**：`PrinterConfig` 的 `deprecate` / `deprecate_gcode` / `deprecate_mcu_code` /
-      `runtime_warning` 与按序列化键去重已落地，`configfile` 状态 `warnings` 据此填充；
-      `ConfigWrapper::deprecate` 只对写过的选项生效，装载器把 `configfile` 对象带进 wrapper
-      （`config/object.rs`、`config/wrapper.rs`、`load.rs`）。消费点随各 extras 补。
 - [ ] **autosave / `SAVE_CONFIG`**：`#*#` 自动保存区块的读取（并入配置、与 include 冲突检查、
       损坏检测）与回写（`SAVE_CONFIG` 命令、备份、重启），属模块而非框架；`bed_tilt` / PID /
       `probe_eddy_current` 等消费者都依赖它（上游 `klippy/configfile.py:248`、`:346`）。
@@ -552,10 +327,6 @@ kinematics 已随 Printer 重构删除，从这里重新开始。动工前调查
 
 ### D1 主机层 start args / rollover / 日志（框架 FW8）
 
-- [x] **`--logfile`**：`AppArgs.log_file`（`--logfile`）+ `logging::init(verbose, log_file)`：格式化行同时写 stdout 与文件（开窗时跳过 stdout），开不了文件就降级到 stdout；`StartArgs.log_file` 填上，`info` 报真实路径（`logging.rs`、`klippy.rs`、`main.rs`、`bin/klippy/main.rs`）。
-- [x] **rollover info**：主机层 `logging` 的 `set/clear/write_rollover_info`，启动与每次重启写
-      `versions` 块 + `Log rollover at <asctime>` 横幅（贴 `klippy/queuelogger.py:31-53`）。
-      `Printer::set_rollover_info` 那套上游 API 随需要它的模块（toolhead/webhooks）再加。
 - [ ] **`StartArgs` 仍只 info 需要的字段**：`apiserver`、`start_reason`、debug 输入输出、
       每个 MCU 的字典路径还没进来（`api/start_args.rs`）；`start_reason` 已在 `Printer` 上，
       不重复搬进 `StartArgs`。
@@ -563,65 +334,8 @@ kinematics 已随 Printer 重构删除，从这里重新开始。动工前调查
       读它（`klippy/gcode.py:344-350`），需要把版本串接到 `GcodeDispatch`（随 G1b 的「`M115`
       版本号来源」一并做）。
 
-### D2 重启循环（框架 FW8，完成）
 
-循环本身与四种 `restart_method`（`command` / `arduino` / `cheetah` / `rpi_usb`）的物理分派
-都已完成（见文末索引；方法与连接期门控见 `docs/klippy/developer-manual/mcu-config.md`）。
-剩下的三块：
 
-- [x] **`rpi_usb` 的连接期门控**：`restart::restart_before_bringup` 按上游两个点判断
-      （`check_restart_on_attach` / `check_restart_on_send_config`，`klippy/mcu.py:690-700`）：端口不存在
-      → “enable power”，否则 “full reset before config”；`McuObject::connect` 据此
-      `request_exit("firmware_restart")` 并中止本次 bring-up，重启循环下一轮
-      （`is_firmware_restart()`）才断电、开端口、发配置。**本机没有可控 VBUS 的 hub，
-      只有决策逻辑的单测（`mcu/restart.rs`）；真机验证见 [`TESTING.md`](TESTING.md) T5。**
-- [x] **CRC 不匹配改走物理复位**：`reset_firmware` 先看固件有没有 `reset`，有就 `ResetRequired`
-      → `reset` + 重连 + 重试握手（真重启，清定时器与步进队列）；只有没有 `reset` 时才
-      `config_reset` 就地清。`rpi_usb` 的 CRC 不匹配则由上一项的门先请求 firmware_restart。
-      上游那一条 `start_reason == 'firmware_restart'` 仍已配置时 raise “Failed automated reset”
-      的前置门还没做（`klippy/mcu.py:1053-1056`）。
-- [x] **重启后的 g-code 输出订阅**：`GcodeSubscribeOutput` 把
-      `(PushTarget, template)` 订阅存在自己（端点在 `Api` 上跨重启存活），并有
-      `watch_restarts` 任务每 250 ms 比对当前 `GCodeDispatch` 是否换了实例，换了就把还活着的
-      订阅重新挂上去（`api/endpoints/gcode.rs`，单测覆盖）。
-- [~] **真板启动抖动（已归档观察项，不再单独处理）**：复查结论（2026-09-21）：
-      ① 原先的 `MCU 'mcu' shutdown: Rescheduled timer in the past` / `timeout: no response for
-      config` 在当前代码上**复现不出来**（连续启动、stress 种子、留步进队列、杀在 bring-up 中段
-      等场景均 `ready`，基线亦同）；原先那条很可能就是就地 `config_reset` 的窗口，已被「`reset` 优先」
-      消除。② 另有一个**间歇、与主机实现无关**的现象：在 **identify 握手中**强杀 host 后，板端会
-      十几秒不应答（下一个 host 等满 `IDENTIFY_TIMEOUT=10s` 报连接错误，随后板子自行恢复）。
-      软件侧干扰源已排除（无 ModemManager/brltty/autosuspend/残留进程）；`dmesg` 受限看不到 USB 层，
-      硬件/USB 因素未排除。**判定为板/USB 链路层的已知观察项，不阻塞任何框架任务；除非将来做
-      重启相关改动（D2/D3）或用户主动要求，不再为此单独排期/调查。**
-- [x] **字典装载前的固件输出不再报错**：`Mcu` 加 `identified` 旗标（接收任务共享）；字典装上之前
-      的 decode 失败按预期降到 `debug`，装上之后的未知 id 仍是 `error`（`mcu/mod.rs`）。
-
-### D3 `command` 接管一块还在跑的板子（框架 FW7）
-
-`command` 的 `config_reset` 要连上才能发，而重连时对手的序号接着上一条会话走——这不是边缘
-情况：`rpi_usb` 切不了 VBUS 的机器会当场回退到 `command`（`mcu/object.rs`），普通 `RESTART`
-也只是重建对象、重新 open + identify，同样要接上一块没被复位的固件。
-
-**传输层的接管已完成**：收发两端共用一个 4 位序号，接收任务把空帧的号报给发送任务
-（重复 ack 即 NAK），发送端按「更大 → 采纳并换号重发未确认块 / 不更新 → 原号重发 / 否则
-ack」settle，并用 `Mcu::took_over_session()` 让 `rpi_usb` 判断“有没有真重启”
-（`mcu/mod.rs`、`mcu/object.rs`）。测试见 `docs/klippy/developer-manual/testing.md` 的
-`mod.rs` / `host.rs`（含对着真 host 库的同进程二次连接）。
-
-**还剩**：
-
-- [x] **RTO 定时重传**：`Sender` 加了 `rto`/`retransmit_at`，发送任务在 `select!` 里等它；
-      到期就把未确认的块原号重发，并像上游一样把等待翻倍（`serialqueue.c:422-460`，
-      `MIN_RTO`=25 ms、`MAX_RTO`=5 s）。单测：不发 ack 的设备能收到重传（`mcu/mod.rs`）。
-- [x] **固件 `reset` 优先**：见 B2（已完成）。
-
-### E1 文档
-
-- [x] `docs/klippy/developer-manual/`：补 printer 一节，并在 README 的分层表里加
-      `printer` 一行（现在只有 msg / mcu / cmd / event / identify / api）。
-- [x] **过期描述**：`printer.rs` 头注释仍写「No part is loaded from the config into it
-      yet … so it still runs empty」，而 `load.rs` 已经装载 `[mcu]`；改了代码就要回头改
-      这几句。
 
 ### E2 `python_path` 的取消（**远期，依赖外部项目**）
 
@@ -649,16 +363,12 @@ ack」settle，并用 `Mcu::took_over_session()` 让 `rpi_usb` 判断“有没�
 ### T 上游 `.test` 语料推进（按依赖顺序）
 
 框架已落地：`src/core/klippy/upstream.rs`（字典驱动应答机 + 按 `CONFIG` 拆分的运行）与
-`crates/test-support/build.rs`（按架构编字典）。当前 239 次运行里，默认构建缺 2 条（引用 `pru`），
-`IGNORED` 覆盖全部 37 个文件，实际执行 0 次；忽略列表即本节的工单，每步做完就从 `IGNORED` 移除
-对应文件（手册见 `docs/klippy/developer-manual/regression-tests.md`）。
+`crates/test-support/build.rs`（按架构编字典）；T1（`linuxtest.test`）已完成并转绿。当前 239 次
+运行里，默认构建缺 2 条（引用 `pru`）、忽略列表 36 条、实际执行 1 条（通过）；忽略列表即本节的
+工单，每步做完就从 `IGNORED` 移除对应文件（手册见 `docs/klippy/developer-manual/regression-tests.md`）。
 
-按「闭包最小 → 杠杆最大」推进：
+按「闭包最小 → 杠杆最大」推进（T1 之后）：
 
-- [x] **T1. `linuxtest.test`（最小闭环）**：`[printer] kinematics: none` ✅（`NoneKinematics` +
-      toolhead 的无轴路径）、`heaters` 的传感器注册表 ✅、`temperature_sensor` ✅、`ds18b20` ✅。
-      用例已从 `IGNORED` 移除并端到端通过（首个转绿的上游用例）。顺带解锁同样用 `none` 的
-      `led`/`manual_stepper`/`pwm` 的第一道坎。
 - [ ] **T2. `[stepper_enable]`（`enable_pin`）**：14 个文件的**首个**失败原因（`bed_screws`、
       `commands`、`extruders`、`printers`、`temperature`…）。
 - [ ] **T3. `extruder` + `heater_bed` + `fan`**（复用 T1 的 `heaters`）：`commands` /
@@ -680,8 +390,8 @@ ack」settle，并用 `Mcu::took_over_session()` 让 `rpi_usb` 判断“有没�
 
 ### H1 加热与温度
 
-- [ ] `heaters.py` 框架：`get_heater`、PWM 定时器、`verify_heater` 调度
-      （`klippy/extras/heaters.py`）。
+- [ ] `heaters.py` **剩余**：Heater 控制环（bang-bang/PID）、`verify_heater` 调度、`get_heater`
+      （传感器注册表已在 T1 落地）。
 - [ ] `heater_bed.py` / `heater_generic.py`：section 住户、`M140`/`M190` /
       `SET_HEATER_TEMPERATURE`。
 - [ ] `pid_calibrate.py`（`PID_CALIBRATE`）、`verify_heater.py`。
@@ -784,42 +494,18 @@ ack」settle，并用 `Mcu::took_over_session()` 让 `rpi_usb` 判断“有没�
 ### H11 主机运行时与调试
 
 - [ ] `statistics.py`：周期上报主机统计（CPU/内存）。
-- [ ] `error_mcu.py`：MCU 错误详情，供 shutdown 分析（接 **B2**）。
+- [ ] `error_mcu.py`：MCU 错误详情，供 shutdown 分析（见留档 FW7）。
 - [ ] `canbus_ids.py` / `canbus_stats.py`：CAN 节点分配与状态（接 `[mcu]` 的 canbus 选项）。
 - 判为不适用：`garbage_collection.py`、`aio_executor.py`、`parsedump.py`（审计文档第 18 节）。
 
 ### H12 核心工具补齐
 
-- [x] `mathutil.py` 的 `Coord`：`mathutil.rs` 的 `Coord([f64; 4])`（FW5a）；几何算法
-      （`trilateration`/`gaussian_solve`）随 delta/probe（H9）。
 - [ ] `util.py` 的反射与注册表 helper：`get_heater` / `get_sensor` / 前缀式
       `lookup_objects`（**Q5**）。
-- [x] `clocksync.py`：`cmd/clock.rs` 的 `ClockEstimator`（EWMA 回归、最小 RTT、`print_time_to_clock`/
-      `estimated_print_time`/`clock32_to_clock64`）+ `McuClock` 接入（每个 `get_clock` 采样一次，
-      FW5a）。
 - [ ] `pins.py` 消费侧接口（`get_pin_type`、重命名等）——随 **H7** 等消费者。
 
 ## 未决问题
 
-- [x] **Q2 事件系统的形状**：已选定大枚举：`KlippyEvent`（`src/core/klippy/event/`）
-      覆盖上游全部 35 个事件名，声明分散在 `event/decl/`，由 `build.rs` 生成，`Unknown`
-      兜底未声明事件名。设计见 [事件系统](docs/klippy/developer-manual/event-system.md)。
-- [x] **Q3 `PrinterEvent` 是否恢复 `McuIdentify` / `AnalyzeShutdown` / `NotifyMcuError`**：
-      随 Q2 一并解决。处理器签名改为 `Fn(&KlippyEvent)`，带载荷事件读变体字段；
-      `mcu_identify`、`analyze_shutdown` 与 `notify_mcu_error` 均已触发。原 `PrinterEvent`
-      已删除。
-- [x] **Q4 `get_status` 的返回形状**：选定 `serde_json::Value`（贴上游、客户端零适配）。
-      typed + serde 会把每个对象的状态变成一套并行类型，而状态本来就是给客户端看的 JSON；
-      typed 只在模块内部需要时用（如 `McuConfig`），不作用于 `get_status`。
-- [x] **Q5 要不要反射式能力**：要，但只做**读**，不做动态属性。已加
-      `Printer::lookup_objects(module)`（前缀遍历，`klippy/klippy.py:81-88`）与
-      `Printer::statuses(eventtime)`（一次取全部可查对象的状态），加上已有的
-      `lookup_object` / `lookup_object_as::<T>` / `status_of`。`gcode_macro` 的
-      `printer.objects` 模板视图（`klippy/extras/gcode_macro.py:13-45`）在其上实现，
-      写能力（模板改对象）不做。
-- [x] **Q6 退出结果的语义**：`klippy::run` 返回进程退出码，`klippy_process` 把最终的 run
-      result 带回来；只有 `error_exit` 是非零（`-1`，同上游 `sys.exit(-1)`），`exit` 与
-      “附件结束” 都是 0；两个 main 用 `std::process::exit(code)`（`klippy.rs`、`main.rs`）。
 - [~] **Q8 GCodeIO（伪 tty / OctoPrint 串口仿真）补不补**：**已定（2026-09-21）：暂不实现**，
       归档为将来可选项，等需要时再操作。纯 API 主机（Moonraker）不需要它；代价是
       `debuginput_exit`、`is_fileinput`/`error_exit`、`stats gcodein=`、`input_log`、`M112` 乱序
@@ -955,6 +641,18 @@ ack」settle，并用 `Mcu::took_over_session()` 让 `rpi_usb` 判断“有没�
 ## 已完成（留档）
 
 细节在各模块文档里；这里每条只留一行索引，最近完成的在前。
+
+- **上游 `.test` 语料框架与 T1（首个用例转绿）**：`src/core/klippy/upstream.rs` 的 harness 与
+      runner（按 `CONFIG` 拆运行、字典齐备才启用、`IGNORED` 留档必然失败的用例）；
+      `interface/devices/simulator.rs` 的字典驱动应答机（identify / 配置握手 / 时钟 / ack）；
+      `crates/test-support/build.rs` 按 `KLIPPERX_ARCHES` / `KLIPPERX_ALL_ARCHES` 编字典；
+      并顺带对齐配置解析（多行值 / `=` / 节头与 `;` 注释）、实现 `deprecate`；
+      `linuxtest.test` 端到端通过（`kinematics: none` + `heaters` + `temperature_sensor` +
+      `ds18b20`）。后续推进见正文 **T**。
+- **`MCU_bus_digital_out`（F3 剩余，`[~]`）**：能力已由 `DigitalOut::queue_digital_out` 提供
+      （固件按绝对 clock 翻转），不新增包装；消费者是 display `uc1701`/`st7920`（H8）。
+- **文档补齐（E1）**：`developer-manual` 补 `printer` 一节与分层表行；清掉 `printer.rs` 头注释里
+      「还没有住户」的过期描述。
 
 - **框架队列收尾（FW1/C2、FW3/A2、FW4、FW7、FW8、FW9）**：配置 getter 补 `get_choice`/
       `get_float_bounded`/`get_int_bounded` 并改用上游文案（`config/wrapper.rs`）；`require_object`

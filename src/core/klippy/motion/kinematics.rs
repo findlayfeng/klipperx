@@ -143,6 +143,28 @@ pub trait Kinematics: Send + Sync + std::fmt::Debug {
     fn home(&mut self, homing: &mut dyn HomingState);
 }
 
+/// The homing move endpoints for one axis (`CartKinematics.home_axis`).
+///
+/// `homepos` is the endstop position; `forcepos` is pushed 1.5 axis-lengths past
+/// the far end so the move always starts on the correct side of the endstop and
+/// has room to accelerate.
+pub fn home_move(
+    axis: usize,
+    info: &HomingInfo,
+    position_min: f64,
+    position_max: f64,
+) -> (HomeCoord, HomeCoord) {
+    let mut homepos: HomeCoord = [None; AXES];
+    homepos[axis] = Some(info.position_endstop);
+    let mut forcepos = homepos;
+    forcepos[axis] = Some(if info.positive_dir {
+        info.position_endstop - 1.5 * (info.position_endstop - position_min)
+    } else {
+        info.position_endstop + 1.5 * (position_max - info.position_endstop)
+    });
+    (forcepos, homepos)
+}
+
 /// Cartesian kinematics: one stepper per axis, straight-line limits.
 ///
 /// Upstream's `CartKinematics` (`klippy/kinematics/cartesian.py`), without the
@@ -200,16 +222,7 @@ impl CartesianKinematics {
     /// endstop and has room to accelerate.
     fn home_axis(&self, homing: &mut dyn HomingState, axis: usize) {
         let info = homing.homing_info(axis);
-        let position_min = self.axes_min[axis];
-        let position_max = self.axes_max[axis];
-        let mut homepos: HomeCoord = [None; AXES];
-        homepos[axis] = Some(info.position_endstop);
-        let mut forcepos = homepos;
-        forcepos[axis] = Some(if info.positive_dir {
-            info.position_endstop - 1.5 * (info.position_endstop - position_min)
-        } else {
-            info.position_endstop + 1.5 * (position_max - info.position_endstop)
-        });
+        let (forcepos, homepos) = home_move(axis, &info, self.axes_min[axis], self.axes_max[axis]);
         homing.home_rails(&[axis], forcepos, homepos);
     }
 }

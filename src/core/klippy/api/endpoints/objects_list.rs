@@ -15,7 +15,7 @@
 //!
 //! # Status
 //!
-//! Written, tested and registered by [`register`](super::register).
+//! Written, tested and registered by [`register`](super::super::register).
 
 use std::sync::Arc;
 

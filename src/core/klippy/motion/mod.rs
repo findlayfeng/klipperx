@@ -32,6 +32,7 @@ pub use itersolve::{
 };
 pub use kinematics::{
     CartesianKinematics, HomeCoord, HomingInfo, HomingState, Kinematics, MoveContext,
+    NoneKinematics,
 };
 pub use plan::{LookAheadQueue, Move, MoveLimits};
 pub use queuing::MotionQueuing;

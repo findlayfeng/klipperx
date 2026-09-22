@@ -69,7 +69,7 @@ use crate::core::klippy::gcode::{
 use crate::core::klippy::load::section;
 use crate::core::klippy::mathutil::{Coord, X_AXIS, Y_AXIS, Z_AXIS};
 use crate::core::klippy::mcu::{Completion, McuEndstop, McuError, McuObject, McuStepper};
-use crate::core::klippy::motion::kinematics::{home_move, CartesianKinematics};
+use crate::core::klippy::motion::kinematics::{home_move, CartesianKinematics, NoneKinematics};
 use crate::core::klippy::motion::plan::MoveLimits;
 use crate::core::klippy::motion::stepcompress::{StepCommand, StepCompressError};
 use crate::core::klippy::motion::toolhead::ToolHead;
@@ -101,9 +101,12 @@ pub struct ToolHeadObject {
     limits: MoveLimits,
     max_z_velocity: f64,
     max_z_accel: f64,
-    /// The three cartesian rail sections, `[stepper_x]`, `[stepper_y]`,
-    /// `[stepper_z]`.
-    axes: [Arc<PrinterStepper>; 3],
+    /// The cartesian rail sections, `[stepper_x]`, `[stepper_y]`, `[stepper_z]`.
+    ///
+    /// Empty for `kinematics: none`, which has no steppers.
+    axes: Vec<Arc<PrinterStepper>>,
+    /// Whether `[printer] kinematics` was `none`.
+    none: bool,
     /// The machine's clock, for seeding the print-time mapping.
     reactor: Arc<dyn Reactor>,
     /// The machine, to shut it down if the compressor hits an internal error.
@@ -135,11 +138,15 @@ impl ToolHeadObject {
     pub fn new(config: &ConfigWrapper, printer: &Arc<Printer>) -> Result<Self, ConfigError> {
         let identifier = config.identifier();
         let kinematics = config.get("kinematics", None)?;
-        if kinematics != "cartesian" {
-            return Err(ConfigError::new(format!(
-                "Error loading kinematics '{kinematics}' (only 'cartesian' is implemented)"
-            )));
-        }
+        let none = match kinematics.as_str() {
+            "cartesian" => false,
+            "none" => true,
+            other => {
+                return Err(ConfigError::new(format!(
+                "Error loading kinematics '{other}' (only 'cartesian' and 'none' are implemented)"
+            )))
+            }
+        };
 
         let max_velocity =
             config.get_float_bounded("max_velocity", None, None, None, Some(0.0), None)?;
@@ -189,19 +196,19 @@ impl ToolHeadObject {
             mcr_pseudo_accel: max_accel * (1.0 - min_cruise_ratio),
         };
 
-        let mut axes = Vec::with_capacity(3);
-        for name in ["stepper_x", "stepper_y", "stepper_z"] {
-            let stepper = printer
-                .lookup_object_as::<PrinterStepper>(name)
-                .ok_or_else(|| {
-                    ConfigError::new(format!(
-                        "Section '{identifier}' needs a '[{name}]' section for cartesian kinematics"
-                    ))
-                })?;
-            axes.push(stepper);
+        let mut axes = Vec::new();
+        if !none {
+            for name in ["stepper_x", "stepper_y", "stepper_z"] {
+                let stepper = printer
+                    .lookup_object_as::<PrinterStepper>(name)
+                    .ok_or_else(|| {
+                        ConfigError::new(format!(
+                            "Section '{identifier}' needs a '[{name}]' section for cartesian kinematics"
+                        ))
+                    })?;
+                axes.push(stepper);
+            }
         }
-        let axes: [Arc<PrinterStepper>; 3] =
-            axes.try_into().expect("exactly three axes were collected");
 
         // The object every rail's endstop is queried through. Created here
         // because this is the first point where all the `[stepper_*]` sections
@@ -220,6 +227,7 @@ impl ToolHeadObject {
             max_z_velocity,
             max_z_accel,
             axes,
+            none,
             reactor: printer.reactor(),
             printer: Arc::downgrade(printer),
             state,
@@ -349,23 +357,27 @@ impl PrinterObject for ToolHeadObject {
             for stepper in host_steppers {
                 toolhead.add_stepper(stepper);
             }
-            toolhead.set_kinematics(Box::new(CartesianKinematics::new(
-                self.axis_names(),
-                Coord::new(
-                    self.axes[X_AXIS].params().position_min,
-                    self.axes[Y_AXIS].params().position_min,
-                    self.axes[Z_AXIS].params().position_min,
-                    0.0,
-                ),
-                Coord::new(
-                    self.axes[X_AXIS].params().position_max,
-                    self.axes[Y_AXIS].params().position_max,
-                    self.axes[Z_AXIS].params().position_max,
-                    0.0,
-                ),
-                self.max_z_velocity,
-                self.max_z_accel,
-            )));
+            if self.none {
+                toolhead.set_kinematics(Box::new(NoneKinematics));
+            } else {
+                toolhead.set_kinematics(Box::new(CartesianKinematics::new(
+                    self.axis_names(),
+                    Coord::new(
+                        self.axes[X_AXIS].params().position_min,
+                        self.axes[Y_AXIS].params().position_min,
+                        self.axes[Z_AXIS].params().position_min,
+                        0.0,
+                    ),
+                    Coord::new(
+                        self.axes[X_AXIS].params().position_max,
+                        self.axes[Y_AXIS].params().position_max,
+                        self.axes[Z_AXIS].params().position_max,
+                        0.0,
+                    ),
+                    self.max_z_velocity,
+                    self.max_z_accel,
+                )));
+            }
 
             // The toolhead's print time is the primary MCU's.
             toolhead.set_estimated_print_time(main_print_time);
@@ -642,10 +654,14 @@ fn move_distance(a: Coord, b: Coord) -> f64 {
 /// A missing endstop, a kinematics refusal, or a failed query/send.
 async fn home_axes(
     connected: &mut Connected,
-    axes: &[Arc<PrinterStepper>; 3],
+    axes: &[Arc<PrinterStepper>],
     requested: &[usize],
     printer: &Weak<Printer>,
 ) -> Result<(), CommandError> {
+    // `kinematics: none` has no rails, so there is nothing to home.
+    if axes.is_empty() {
+        return Ok(());
+    }
     for &axis in requested {
         let rail = &axes[axis];
         let endstop = rail.endstop().ok_or_else(|| {
@@ -874,7 +890,7 @@ fn axis_indices(names: &str) -> Vec<usize> {
 /// back afterwards. The background flush task sees an empty slot and stands back.
 fn cmd_g28(
     state: &Arc<Mutex<Option<Connected>>>,
-    axes: &[Arc<PrinterStepper>; 3],
+    axes: &[Arc<PrinterStepper>],
     _printer: &Weak<Printer>,
     gcmd: &GcodeCommand,
 ) -> Result<(), CommandError> {
@@ -969,6 +985,39 @@ mod tests {
             .unwrap_err();
 
         assert!(err.to_string().contains("Error loading kinematics 'delta'"));
+    }
+
+    #[test]
+    fn test_none_kinematics_needs_no_steppers() {
+        use crate::core::klippy::config::section::ConfigSection;
+        use crate::core::klippy::config::value::ConfigValue;
+        use crate::core::klippy::pins::{PrinterPins, PINS_OBJECT};
+        use crate::core::klippy::reactor::ManualReactor;
+
+        let mut section = ConfigSection::new("printer", None);
+        for (key, value) in [
+            ("kinematics", "none"),
+            ("max_velocity", "300"),
+            ("max_accel", "3000"),
+        ] {
+            section
+                .parameters
+                .insert(key.to_string(), ConfigValue::Single(value.to_string()));
+        }
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        printer
+            .add_object(
+                GCODE_OBJECT,
+                Arc::new(GCodeDispatch::new(Arc::clone(&printer))),
+            )
+            .unwrap();
+        printer
+            .add_object(PINS_OBJECT, Arc::new(PrinterPins::new()))
+            .unwrap();
+
+        // `none` has no `[stepper_*]` sections; the object is enough on its own.
+        ToolHeadObject::new(&ConfigWrapper::untracked(&section), &printer)
+            .expect("kinematics: none builds without steppers");
     }
 
     #[test]

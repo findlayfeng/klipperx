@@ -646,6 +646,31 @@ ack」settle，并用 `Mcu::took_over_session()` 让 `rpi_usb` 判断“有没�
       `EndpointContext`（现在没有）。上游只把 `client_info` 当日志用，故这属于本项目的
       自定义兼容层，要有到期日。
 
+### T 上游 `.test` 语料推进（按依赖顺序）
+
+框架已落地：`src/core/klippy/upstream.rs`（字典驱动应答机 + 按 `CONFIG` 拆分的运行）与
+`crates/test-support/build.rs`（按架构编字典）。当前 239 次运行里，默认构建缺 2 条（引用 `pru`），
+`IGNORED` 覆盖全部 37 个文件，实际执行 0 次；忽略列表即本节的工单，每步做完就从 `IGNORED` 移除
+对应文件（手册见 `docs/klippy/developer-manual/regression-tests.md`）。
+
+按「闭包最小 → 杠杆最大」推进：
+
+- [~] **T1. `linuxtest.test`（最小闭环，先做）**：`[printer] kinematics: none` ✅
+      （`NoneKinematics` + toolhead 的无轴路径，补齐 `[stepper_*]` 不再必需）；仍待 `heaters` 的
+      传感器注册表（不做控制环）、`temperature_sensor`、`ds18b20`。用例 g-code 只有 `G4 P1000`，
+      不涉运动/回零/风扇。顺带解锁同样用 `none` 的 `led`/`manual_stepper`/`pwm` 的第一道坎。
+- [ ] **T2. `[stepper_enable]`（`enable_pin`）**：14 个文件的**首个**失败原因（`bed_screws`、
+      `commands`、`extruders`、`printers`、`temperature`…）。
+- [ ] **T3. `extruder` + `heater_bed` + `fan`**（复用 T1 的 `heaters`）：`commands` /
+      `out_of_bounds` / `printers` 族的下一道坎。
+- [ ] **T4. `probe` / `bltouch`**：6 个文件（`bed_mesh`、`bltouch`、`eddy`、`screws_tilt_adjust`、
+      `smart_effector`、`z_virtual_endstop`）。
+- [ ] **T5. 其余运动学**：`generic_cartesian`（4）、`delta`（2）、`hybrid_corexy`、`polar`、
+      `rotary_delta`（`none` 已在 T1）。
+- [ ] **T6. 其余首个失败**：`gcode_arcs`、`virtual_sdcard`（`sdcard_loop`）、TMC pin chip（`tmc`）。
+- 备注：`printers.test` 有 2 条运行声明 `DICTIONARY pru.dict host=linuxprocess.dict`，默认不构建
+      `pru`；要跑需 `KLIPPERX_ARCHES=…,pru`（需 `pru-gcc`）。
+
 ## 上游 extras 覆盖盘点
 
 上游 133 个 extras（不含 `__init__.py`）里，本仓库目前只有 `board_pins` ✅、

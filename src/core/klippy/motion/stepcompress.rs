@@ -140,6 +140,27 @@ fn idiv_down(n: i64, d: i64) -> i64 {
     }
 }
 
+/// One recently sent `queue_step`, for finding a past position
+/// (`struct history_steps`, `chelper/stepcompress.c:57`).
+///
+/// `step_count` is signed by direction; `interval`/`add` are the command's, so a
+/// clock inside the run can be solved for the step offset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HistoryStep {
+    /// The first step's clock.
+    pub first_clock: u64,
+    /// The last step's clock.
+    pub last_clock: u64,
+    /// The step position before this run.
+    pub start_position: i64,
+    /// Steps taken by this run, signed.
+    pub step_count: i64,
+    /// The command's `interval`.
+    pub interval: u32,
+    /// The command's `add`.
+    pub add: i32,
+}
+
 /// The full step compressor for one stepper.
 ///
 /// "One stepper" is upstream's `struct stepcompress`: a `syncemitter` owns one,
@@ -176,6 +197,8 @@ pub struct StepCompressor {
     next_step_dir: bool,
     /// The last step position, for history/future use.
     last_position: i64,
+    /// Recently sent runs, newest first (`history_list`).
+    history: VecDeque<HistoryStep>,
     out: Vec<StepCommand>,
 }
 
@@ -197,6 +220,7 @@ impl StepCompressor {
             next_step_clock: 0,
             next_step_dir: false,
             last_position: 0,
+            history: VecDeque::new(),
             out: Vec::new(),
         }
     }
@@ -273,24 +297,108 @@ impl StepCompressor {
     /// Note where the firmware's step counter is
     /// (`stepcompress_set_last_position`).
     ///
-    /// Upstream also records a history marker so a past position can be found;
-    /// that arrives with the history consumer.
+    /// A history marker is recorded at `clock`, so a position lookup afterwards
+    /// knows the counter was `position` there.
     ///
     /// # Errors
     /// As [`StepCompressor::flush`] for any pending step it has to emit first.
     pub fn set_last_position(
         &mut self,
-        _clock: u64,
+        clock: u64,
         position: i64,
     ) -> Result<(), StepCompressError> {
         self.flush(u64::MAX)?;
         self.last_position = position;
+        self.history.push_front(HistoryStep {
+            first_clock: clock,
+            last_clock: clock,
+            start_position: position,
+            step_count: 0,
+            interval: 0,
+            add: 0,
+        });
         Ok(())
     }
 
     /// The last step position noted by [`StepCompressor::set_last_position`].
     pub fn last_position(&self) -> i64 {
         self.last_position
+    }
+
+    /// The step position at a past clock (`stepcompress_find_past_position`).
+    ///
+    /// The history is walked newest first: before a run the counter is its
+    /// `start_position`, after it the fully-counted position, and inside it the
+    /// offset is solved from the run's `interval`/`add` (a quadratic when `add`
+    /// is non-zero).
+    pub fn find_past_position(&self, clock: u64) -> i64 {
+        let mut last_position = self.last_position;
+        for entry in &self.history {
+            if clock < entry.first_clock {
+                last_position = entry.start_position;
+                continue;
+            }
+            if clock >= entry.last_clock {
+                return entry.start_position + entry.step_count;
+            }
+            let interval = i64::from(entry.interval);
+            let add = i64::from(entry.add);
+            let ticks = (clock.wrapping_sub(entry.first_clock) as u32 as i32) as i64 + interval;
+            let offset = if add == 0 {
+                ticks / interval
+            } else {
+                // Solve `add*count*(count-1)/2 + interval*count = ticks`.
+                let a = 0.5 * add as f64;
+                let b = interval as f64 - 0.5 * add as f64;
+                let c = -(ticks as f64);
+                (((b * b - 4.0 * a * c).sqrt() - b) / (2.0 * a)) as i64
+            };
+            if entry.step_count < 0 {
+                return entry.start_position - offset;
+            }
+            return entry.start_position + offset;
+        }
+        last_position
+    }
+
+    /// The recently sent runs overlapping `start_clock..end_clock`, newest first
+    /// (`stepcompress_extract_old`).
+    pub fn extract_old(&self, max: usize, start_clock: u64, end_clock: u64) -> Vec<HistoryStep> {
+        let mut out = Vec::new();
+        for entry in &self.history {
+            if start_clock >= entry.last_clock || out.len() >= max {
+                break;
+            }
+            if end_clock <= entry.first_clock {
+                continue;
+            }
+            out.push(*entry);
+        }
+        out
+    }
+
+    /// Drop history that ended at or before `end_clock`
+    /// (`stepcompress_history_expire`).
+    pub fn history_expire(&mut self, end_clock: u64) {
+        while let Some(oldest) = self.history.back() {
+            if oldest.last_clock > end_clock {
+                break;
+            }
+            self.history.pop_back();
+        }
+    }
+
+    /// Reset the compressor's clock and direction
+    /// (`stepcompress_reset`, used after homing).
+    ///
+    /// # Errors
+    /// As [`StepCompressor::flush`].
+    pub fn reset(&mut self, last_step_clock: u64) -> Result<(), StepCompressError> {
+        self.flush(u64::MAX)?;
+        self.last_step_clock = last_step_clock;
+        self.sdir = -1;
+        self.calc_last_step_print_time();
+        Ok(())
     }
 
     /// Add the next step time (`stepcompress_append`).
@@ -552,6 +660,21 @@ impl StepCompressor {
             count: u32::from(move_.count),
             add: i32::from(move_.add),
         });
+        // Record the run so a past position can be found later.
+        let step_count = if self.sdir == 1 {
+            i64::from(move_.count)
+        } else {
+            -i64::from(move_.count)
+        };
+        self.history.push_front(HistoryStep {
+            first_clock,
+            last_clock,
+            start_position: self.last_position,
+            step_count,
+            interval: move_.interval,
+            add: i32::from(move_.add),
+        });
+        self.last_position += step_count;
         self.last_step_clock = last_clock;
     }
 
@@ -944,6 +1067,90 @@ mod tests {
         assert_eq!(sc.last_position(), 3);
         // The pending step was flushed by the call.
         assert_eq!(steps(&sc.take_commands()), vec![(500, 1, 0)]);
+    }
+
+    #[test]
+    fn test_find_past_position_matches_the_emitted_schedule() {
+        // An accelerating run; walk the emitted `queue_step` schedule and check
+        // the history's position lookup at every step clock.
+        let mut sc = raw_compressor();
+        let mut clocks = Vec::new();
+        let mut t = 0i64;
+        let mut gap = 3000i64;
+        for _ in 0..12 {
+            t += gap;
+            clocks.push(t as u64);
+            gap -= 200;
+        }
+        append_clocks(&mut sc, true, &clocks);
+        let commands = sc.take_commands();
+
+        let mut schedule = Vec::new();
+        let mut clock: i64 = 0;
+        let mut position: i64 = 0;
+        for command in &commands {
+            if let StepCommand::QueueStep {
+                interval,
+                count,
+                add,
+                ..
+            } = command
+            {
+                let mut interval = *interval as i64;
+                for _ in 0..*count {
+                    clock += interval;
+                    position += 1;
+                    schedule.push((clock, position));
+                    interval += *add as i64;
+                }
+            }
+        }
+        assert_eq!(schedule.len(), clocks.len());
+        assert_eq!(sc.find_past_position(0), 0);
+        for (clock, position) in &schedule {
+            assert_eq!(
+                sc.find_past_position(*clock as u64),
+                *position,
+                "clock {clock}"
+            );
+        }
+        assert_eq!(sc.find_past_position(u64::MAX), 12);
+    }
+
+    #[test]
+    fn test_set_last_position_records_a_history_marker() {
+        let mut sc = raw_compressor();
+        append_clocks(&mut sc, true, &[1000, 2000, 3000]);
+        sc.take_commands();
+
+        sc.set_last_position(50_000, 7).unwrap();
+
+        assert_eq!(sc.find_past_position(50_000), 7);
+        // Before the marker the older run's end still stands (upstream walks the
+        // history newest-first and an older run containing the clock wins).
+        assert_eq!(sc.find_past_position(49_999), 3);
+        // A later run continues from the marker's position.
+        append_clocks(&mut sc, true, &[51_000, 52_000, 53_000]);
+        assert_eq!(sc.find_past_position(51_000), 8);
+        assert_eq!(sc.find_past_position(53_000), 10);
+    }
+
+    #[test]
+    fn test_extract_old_and_history_expire() {
+        let mut sc = raw_compressor();
+        append_clocks(&mut sc, true, &[1000, 2000, 3000]);
+
+        let old = sc.extract_old(10, 0, u64::MAX);
+        assert_eq!(old.len(), 1);
+        assert_eq!(old[0].step_count, 3);
+        assert_eq!(old[0].first_clock, 1000);
+        assert_eq!(old[0].last_clock, 3000);
+
+        // Nothing ended at or before 500, so the run survives an expiry there.
+        sc.history_expire(500);
+        assert_eq!(sc.extract_old(10, 0, u64::MAX).len(), 1);
+        sc.history_expire(3000);
+        assert!(sc.extract_old(10, 0, u64::MAX).is_empty());
     }
 
     #[test]

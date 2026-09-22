@@ -150,17 +150,43 @@ impl Config {
         let mut sources = Vec::new();
         let mut current_section: Option<ConfigSection> = None;
         let mut current_key: Option<String> = None;
-        let mut is_multiline = false;
+        // Indentation of the line that opened the current option. A later line
+        // indented deeper than this continues that option's value, which is
+        // upstream `configparser`'s rule (`klippy/configfile.py:280`).
+        let mut option_indent = 0usize;
 
         for (line_num, line) in content.lines().enumerate() {
             let line_num = line_num + 1;
-            let trimmed = line.trim();
+            let indent = line.len() - line.trim_start().len();
 
-            if trimmed.is_empty() || trimmed.starts_with('#') {
+            // Upstream strips the inline comment before it looks for a section
+            // header, so `[fan]  # cooling fan` still opens `fan`
+            // (`klippy/configfile.py:159-175`). `#` and `;` both start a
+            // comment; `;` only at the start of the line or after whitespace.
+            let code = remove_inline_comment(line).trim();
+            if code.is_empty() {
                 continue;
             }
 
-            if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            // A continuation is checked before a section header: an indented
+            // `[b]` under an option is part of that option's value.
+            if current_section.is_some() && current_key.is_some() && indent > option_indent {
+                if let (Some(section), Some(key)) = (current_section.as_mut(), current_key.as_ref())
+                {
+                    if let Some(slot) = section.parameters.get_mut(key) {
+                        match slot {
+                            ConfigValue::Multi(lines) => lines.push(code.to_string()),
+                            ConfigValue::Single(_) => {
+                                let first = slot.as_str();
+                                *slot = ConfigValue::Multi(vec![first, code.to_string()]);
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+
+            if code.starts_with('[') && code.contains(']') {
                 if let Some(section) = current_section.take() {
                     if section.id == "include" {
                         let include_path_str = section.sub.as_deref()
@@ -196,10 +222,12 @@ impl Config {
                         config.add_section(section);
                     }
                 }
-                is_multiline = false;
                 current_key = None;
+                option_indent = 0;
 
-                let section_content = &trimmed[1..trimmed.len() - 1];
+                // `SECTCRE` matches up to the last `]` and ignores what follows
+                // it, so the header ends at `rfind`.
+                let section_content = &code[1..code.rfind(']').unwrap_or(code.len() - 1)];
                 let parts: Vec<&str> = section_content.splitn(2, ' ').collect();
                 let id = parts[0].trim();
                 let sub = parts.get(1).map(|s| s.trim());
@@ -211,30 +239,19 @@ impl Config {
                 .as_mut()
                 .ok_or_else(|| format!("Line {}: Parameter outside of section", line_num))?;
 
-            if is_multiline && (line.starts_with(' ') || line.starts_with('\t')) {
-                if let Some(key) = &current_key {
-                    if let Some(ConfigValue::Multi(ref mut lines)) = section.parameters.get_mut(key)
-                    {
-                        lines.push(trimmed.to_string());
-                        continue;
-                    }
-                }
-            }
-
-            is_multiline = false;
-
-            let colon_pos = trimmed.find(':').ok_or_else(|| {
+            // `=` and `:` both separate an option from its value, and the first
+            // of either wins (upstream `OPTCRE`, `klippy/configfile.py:173`).
+            let separator = code.find(|c: char| c == ':' || c == '=').ok_or_else(|| {
                 format!("Line {}: Invalid format, expected 'key: value'", line_num)
             })?;
 
-            let key = trimmed[..colon_pos].trim().to_string();
-            let value_str = trimmed[colon_pos + 1..].trim();
-            let value_str = remove_inline_comment(value_str).trim();
+            let key = code[..separator].trim().to_string();
+            let value_str = code[separator + 1..].trim();
 
             current_key = Some(key.clone());
+            option_indent = indent;
 
             if value_str.is_empty() {
-                is_multiline = true;
                 section
                     .parameters
                     .insert(key, ConfigValue::Multi(Vec::new()));
@@ -406,15 +423,142 @@ impl Default for Config {
     }
 }
 
+/// Strip a trailing comment from a line, leaving quoted text alone.
+///
+/// `#` starts a comment anywhere: upstream truncates the line at the first `#`
+/// (`klippy/configfile.py:159-167`). `;` starts one only at the start of the
+/// line or after whitespace, which is `configparser`'s inline-prefix rule
+/// (used via `inline_comment_prefixes`, `klippy/configfile.py:172-175`); a
+/// value such as `foo;bar` is therefore left intact.
 fn remove_inline_comment(value: &str) -> &str {
     let mut in_quote = false;
-    let quote_char = '"';
+    let bytes = value.as_bytes();
     for (i, c) in value.char_indices() {
-        if c == quote_char {
-            in_quote = !in_quote;
-        } else if c == '#' && !in_quote {
-            return &value[..i];
+        match c {
+            '"' => in_quote = !in_quote,
+            '#' if !in_quote => return &value[..i],
+            ';' if !in_quote => {
+                let at_start = i == 0;
+                let after_space = i > 0 && bytes[i - 1].is_ascii_whitespace();
+                if at_start || after_space {
+                    return &value[..i];
+                }
+            }
+            _ => {}
         }
     }
     value
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(text: &str) -> Config {
+        Config::from_text(text).expect("the config parses").0
+    }
+
+    fn value(config: &Config, section: &str, option: &str) -> String {
+        config
+            .get_section(section)
+            .unwrap_or_else(|| panic!("section {section}"))
+            .get(option)
+            .unwrap_or_else(|| panic!("option {option}"))
+            .as_str()
+    }
+
+    #[test]
+    fn a_section_header_may_carry_a_hash_comment() {
+        // config/generic-duet2-duex.cfg:358, config/generic-remram.cfg:106
+        let config = parse("[output_pin GPIO1] # broken out on the duex\npin: PA0\n");
+        assert_eq!(
+            config
+                .get_section("output_pin GPIO1")
+                .unwrap()
+                .get_str("pin"),
+            Some("PA0")
+        );
+    }
+
+    #[test]
+    fn a_section_header_may_carry_a_semicolon_comment() {
+        // test/klippy/macros.cfg:119
+        let config = parse("[gcode_macro TEST_unicode]  ; comment ( ° )\nvariable_ABC: 25\n");
+        assert_eq!(
+            config
+                .get_section("gcode_macro TEST_unicode")
+                .unwrap()
+                .get_str("variable_ABC"),
+            Some("25")
+        );
+    }
+
+    #[test]
+    fn equals_separates_an_option_like_a_colon() {
+        // config/sample-mmu2s-diy.cfg:110, test/klippy/eddy.cfg:84,
+        // test/klippy/extruders.cfg:71
+        let config = parse("[gcode_macro X]\nvariable_colorselector = [71,57]\nswitch_pin: PD4\n");
+        let section = config.get_section("gcode_macro X").unwrap();
+        assert_eq!(section.get_str("variable_colorselector"), Some("[71,57]"));
+        assert_eq!(section.get_str("switch_pin"), Some("PD4"));
+    }
+
+    #[test]
+    fn the_first_separator_of_either_kind_wins() {
+        let config = parse("[s]\na = x:y\nb: x=y\n");
+        let section = config.get_section("s").unwrap();
+        assert_eq!(section.get_str("a"), Some("x:y"));
+        assert_eq!(section.get_str("b"), Some("x=y"));
+    }
+
+    #[test]
+    fn an_indented_line_continues_a_non_empty_value() {
+        // config/printer-lulzbot-*.cfg `[bed_tilt] points:`
+        let config =
+            parse("[bed_tilt]\npoints: -2, -6\n        156, -6\n        156, 158\nspeed: 75\n");
+        assert_eq!(
+            value(&config, "bed_tilt", "points"),
+            "-2, -6\n156, -6\n156, 158"
+        );
+        assert_eq!(
+            config.get_section("bed_tilt").unwrap().get_str("speed"),
+            Some("75")
+        );
+    }
+
+    #[test]
+    fn an_equals_option_may_continue_from_an_empty_value() {
+        let config = parse(
+            "[probe_eddy_current eddy]\ncalibrate =\n    0.05:3300,0.10:3200,\n    0.20:2900\nspeed: 1\n",
+        );
+        let section = config.get_section("probe_eddy_current eddy").unwrap();
+        assert_eq!(
+            section.get("calibrate").unwrap().lines(),
+            vec!["0.05:3300,0.10:3200,", "0.20:2900"]
+        );
+        assert_eq!(section.get_str("speed"), Some("1"));
+    }
+
+    #[test]
+    fn an_indented_bracket_is_a_continuation_not_a_section() {
+        // Continuations are checked before section headers, as upstream does.
+        let config = parse("[s]\nkey: a\n  [b]\n");
+        assert_eq!(value(&config, "s", "key"), "a\n[b]");
+        assert!(config.get_section("b").is_none());
+    }
+
+    #[test]
+    fn a_semicolon_comment_needs_leading_whitespace() {
+        let config = parse("[s]\na: x;y\nb: x ; y\nc: x\t; y\n");
+        let section = config.get_section("s").unwrap();
+        assert_eq!(section.get_str("a"), Some("x;y"));
+        assert_eq!(section.get_str("b"), Some("x"));
+        assert_eq!(section.get_str("c"), Some("x"));
+    }
+
+    #[test]
+    fn a_hash_inside_quotes_is_not_a_comment() {
+        let config = parse("[s]\nkey: \"a#b\"\n");
+        assert_eq!(value(&config, "s", "key"), "\"a#b\"");
+    }
 }

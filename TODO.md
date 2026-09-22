@@ -22,7 +22,7 @@
 | **FW3** | 错误词汇框架 | A2 | `CommandError`/`ConfigError` 分层、`KlippyError::Config`、`Internal` 收敛、handler/endpoint 异常 `catch_unwind` → `invoke_shutdown`、config 错走 `set_error_state`（`PrinterState::Error`） | 参数错报 `CommandError` 且不停机；坏配置 / connect 期 config 错报 `error`（可 RESTART）；panic 的 handler / endpoint 触发 `invoke_shutdown` | 全树的错误分支 | — |
 | **FW4** | G-Code 框架收尾（**完成**；`GCodeIO` 暂缓 `[~]`） | G1b（框架部分） | ~~参数访问器、`create_gcode_command`、`run_script_from_command`、`gcode:command_error` 触发~~ ✅；`GCodeIO` 输入抽象（伪 tty / 文件 / `stats gcodein` / `debuginput_exit`）**暂缓 `[~]`**（不做 OctoPrint 串口仿真）；`gcode:request_restart` 触发随 C1 | ~~`create_gcode_command` / 参数访问器~~ ✅；`GCodeIO` 暂缓（见 [FW4 笔记](docs/work-log/2026-09-21-fw4-notes.md)） | 全部 gcode extras（H3、H8…） | FW1、FW3（已满足） |
 | **FW5** | 运动框架（最重，**拆 FW5a–FW5f**） | C1（框架部分）、H12 | **FW5a** `Coord` + `clocksync` 回归；**FW5b** `Move`/`LookAheadQueue`/`trapq`；**FW5c** `itersolve` + `kin_cartesian`；**FW5d** `MotionQueuing`/`ToolHead`/`McuStepper`；**FW5e** `Kinematics` + `cartesian` + `[stepper_*]`/`[printer]` + `G1`；**FW5f** `stepcompress` 完整压缩 | host 单测 → 假 MCU → **真板 `G1`（单轴 → 三轴 + `[extruder]`）→ `G28`（与 FW6/F8 联合）** | `kinematics/*` 其余、H9、H10、input shaper | FW1（已满足） |
-| **FW6** | 资源与触发框架（**FW6a–FW6c ✅**，拆 FW6a–FW6f） | F3、F8 | **FW6a-1** ✅ 多 MCU 时基与运动输出（FW5 尾巴，`McuClock`/对齐下放到 `McuChip`）；**FW6b-1** ✅ endstop/trsync/`stepper_stop_on_trigger` 命令层；**FW6b-2** ✅ `MCU_endstop` + 多实例 `TriggerDispatch`/`MCU_trsync`；**FW6c** ✅ `Rail`/`endstop_pin`/`homing_*` + `query_endstops` + `query_endstops/status` + `M119`；**FW6d** `stepcompress` history + stepper 回零句柄；**FW6e** `HomingState` + `drip_move` + `G28`；**FW6f**（小）`MCU_bus_digital_out` | ✅ FW6c（软件）：一个 endstop + `query_endstops/status`；FW6e：多假 MCU 的 `G28`；**真板 `M119`/`G28`/双板同步 `[~]` 待条件** | homing/probe、运动同步 `SET_PIN` | FW5 |
+| **FW6** | 资源与触发框架（**FW6a–FW6e ✅（软件）**，FW6f `[~]`） | F3、F8 | **FW6a-1** ✅ 多 MCU 时基与运动输出（`McuClock`/对齐下放到 `McuChip`）；**FW6b** ✅ endstop/trsync/`stepper_stop_on_trigger` 命令层 + `MCU_endstop` + 多实例 `TriggerDispatch`/`MCU_trsync`；**FW6c** ✅ `Rail`/`endstop_pin`/`homing_*` + `query_endstops` + `query_endstops/status` + `M119`；**FW6d** ✅ `stepcompress` history/`find_past_position` + stepper 回零句柄；**FW6e** ✅ `Kinematics::home`/`HomingState` + `ToolHead::drip_move` + `G28`（软件）；**FW6f** `[~]` `MCU_bus_digital_out`（能力已由 `queue_digital_out` 提供，包装随 H8 显示） | ✅ FW6c（软件）：一个 endstop + `query_endstops/status`；FW6e（软件）：假 endstop 的 `G28`；**真板 `M119`/`G28`/双板同步 `[~]` 待条件** | homing/probe、运动同步 `SET_PIN` | FW5 |
 | **FW7** | MCU 与传输框架收尾 | B2、D3 | `emergency_stop` 对象（`klippy:shutdown` → 固件 `emergency_stop`）、本地 shutdown 标志、`emergency_stop` 端点、带载荷错误上报；RTO 定时重传与固件 `reset` 优先未做 | `emergency_stop` 端点使打印机进 shutdown；主机停机向固件发 `emergency_stop`，固件自报停机不回发 | TMC/传感器等资源 | — |
 | **FW8** | 主机层与重启框架 | D1、D2、Q6 | `--logfile`/rollover/Q6、`rpi_usb` 门控、CRC 物理复位、重启后订阅均已完成（代码）；剩 `StartArgs` 其余字段与 `rpi_usb` 真机验证 | `--logfile` 落盘、`error_exit` 非零、重启后订阅不断；真板 `last_stats` 已验 | 日志、Moonraker 兼容 | — |
 | **FW9** | API 框架收尾 | B4（框架部分） | `register_remote_method` 与推送、mux 端点注册机制、`emergency_stop` 端点 | `register_remote_method` + 推送 | `pause_resume/*`、`*/dump_*` 等消费者 | FW7 |
@@ -351,16 +351,18 @@ toolhead / 开放事件）一起补，一部分是现在就独立可补的小行
 （见文末索引），SPI/I2C 总线（F6/F7）也已落地，剩下的缺口是命令队列/运动同步输出（F3）、
 endstop/trsync（F8）与其余固件资源（F9）。
 
-#### F3 剩余：`MCU_bus_digital_out`（框架 FW6f，见 [FW6 调查](docs/work-log/2026-09-21-fw6-notes.md)）
+#### F3 剩余：`MCU_bus_digital_out`（框架 FW6f，`[~]` 随 H8 显示消费者）
 
-- [ ] `MCU_bus_digital_out`（`klippy/extras/bus.py:337` 以后）：挂在命令队列上、与运动
-      同步的输出；需要命令队列/运动层（C1）。
+- [x] **能力已具备**：`DigitalOut::queue_digital_out(clock, value)` 走固件的
+      `queue_digital_out oid clock on_ticks`，固件按绝对 clock 翻转，正是
+      `MCU_bus_digital_out` 用 serialqueue `minclock`/`reqclock` 达到的效果
+      （见 [FW6 收口](docs/work-log/2026-09-21-fw6de-notes.md) §3）。
+- [~] 不新增 `MCU_bus_digital_out` 包装：其消费者是 display `uc1701`/`st7920`（H8）；
+      等 H8 接显示时直接用 `pins.setup_digital_out` + `queue_digital_out`。
 - 运行期 `queue_digital_out` 收的是**绝对固件时钟**；print_time → clock 的换算属于时钟层
-      （`cmd/clock.rs` 的 `ClockSync` 现只有 `get_clock`，偏移跟踪未做）。
-- **不引入 host 侧 serialqueue**（上游靠它把命令压到 `req_clock` 再发）：FW6 的单 MCU
-      链路里 `trsync_start`/`endstop_home`/`queue_digital_out` 都带绝对时钟，固件自己调度；
-      `MCU_bus_digital_out.update_digital_out(minclock, reqclock)` 改为发
-      `queue_digital_out(reqclock, value)`。多 MCU 时再评估。
+      （`cmd/clock.rs` 的 `ClockSync`）。
+- **不引入 host 侧 serialqueue**（上游靠它把命令压到 `req_clock` 再发）：单 MCU 链路里
+      `trsync_start`/`endstop_home`/`queue_digital_out` 都带绝对时钟，固件自己调度。
 
 #### F6 SPI 总线
 
@@ -435,22 +437,21 @@ endstop/trsync（F8）与其余固件资源（F9）。
 - [x] **FW6c** 消费者：`[stepper_*]` 的 `endstop_pin`/`homing_*` → `Rail`；`query_endstops`
       对象 + `query_endstops/status` 端点 + `M119`/`QUERY_ENDSTOPS`。（**框架验收 ✅**，见
       [FW6c 记录](docs/work-log/2026-09-21-fw6c-notes.md)）
-- [ ] **FW6d** 回零精度前置：`stepcompress` 的 history / `find_past_position` / `extract_old`；
+- [x] **FW6d** 回零精度前置：`stepcompress` 的 history / `find_past_position` / `extract_old`；
       `motion::Stepper::mcu_position`/`past_mcu_position`/`note_homing_end`；`McuStepper` 发
       `reset_step_clock`/`stepper_stop_on_trigger`。
-- [ ] **FW6e** `HomingState` + `ToolHead::drip_move` + `extras/homing.rs`（`Homing`/`HomingMove`/
-      `G28`）；`homing:*` 事件触发。先用**多实例假 MCU/纯软件**验收回零序列、触发停轴与位置
-      回填；真板单轴 `G28` `[~]` 待条件。
-- [ ] `MCU_endstop`（`klippy/mcu.py:340-407`）：`config_endstop oid=%c pin=%c pull_up=%c`、
-      回零 `endstop_home oid=%c clock=%u sample_ticks=%u sample_count=%c rest_ticks=%u
-      pin_value=%c trsync_oid=%c trigger_reason=%c`、查询 `endstop_query_state oid=%c` /
-      `endstop_state oid=%c homing=%c next_clock=%u pin_value=%c`（固件 `src/endstop.c:72`
-      `:97` `:115`）。
-- [ ] `MCU_trsync` / `TriggerDispatch`（`mcu.py:155-339`）：多 MCU 同步触发
-      （`src/trsync.c`），回零结束时用来同时停各个轴。这是 C1 回零的直接前置。
-      **多 MCU 逻辑在 FW6b 内做、用多实例假 MCU 验证**；只有物理时序/长时漂移需真板。
-- [ ] 消费者是 `homing`（`klippy/extras/homing.py`），所以这条要等 toolhead 的接口
-      （`home_rails` / `get_trigger_position`，见 C1）一起定。
+- [x] **FW6e** `HomingState` + `ToolHead::drip_move` + `extras/homing.rs`（`Homing`/`HomingMove`/
+      `G28`）；`homing:*` 事件触发。**软件**：`Kinematics::home`/`HomingState` + 假 endstop 的
+      `G28` 驱动；真板单轴 `G28` `[~]` 待条件。（本仓库的驱动写作 `extras/toolhead.rs` 的
+      `home_axes`/`HomingEndstop`，未另开 `extras/homing.rs`）
+- [x] `MCU_endstop`（`klippy/mcu.py:340-407`）：`config_endstop`、`endstop_home`、
+      `endstop_query_state`/`endstop_state` 已在 FW6b-1/2 落地（`cmd/endstop.rs` +
+      `mcu/resource/endstop.rs`）。
+- [x] `MCU_trsync` / `TriggerDispatch`（`mcu.py:155-339`）：**多实例** 已在 FW6b-2 落地
+      （`mcu/resource/trsync.rs`）；多 MCU 逻辑用多实例假 MCU 验证，只有物理时序/长时漂移需真板。
+- [x] 消费者 `homing`：FW6e 的 `home_axes`/`HomingEndstop` 驱动 + `Kinematics::home`/
+      `HomingState`（`home_rails` 已在协议里，`get_trigger_position`/`set_stepper_adjustment`
+      随 `endstop_phase` 后置）。
 
 #### F9 其他输入与外设资源
 

@@ -251,6 +251,31 @@ harness 把每个 `[mcu]` / `[mcu <name>]` 的传输键换成 `test: dict=<字�
 `KLIPPERX_UPSTREAM_ALL=1` **只作用于这张列表**：它让字典齐备的运行无视忽略判定并报出失败，
 **不会**让因字典未构建而跳过的运行跑起来（那是构建阶段的事，见上一节）。
 
+当前 37 条（= 全部 `.test` 文件），按首次失败原因分组（第一次失败修好后可能露出下一个）：
+
+| 首次失败 | 条数 | `.test` |
+|----------|------|---------|
+| `Option 'enable_pin' is not valid in section 'stepper_x'`（`[stepper_*]` 尚无 `enable_pin`） | 14 | `bed_screws`、`commands`、`dual_carriage`、`exclude_object`、`extruders`、`input_shaper`、`load_cell`、`macros`、`multi_z`、`pressure_advance`、`printers`、`quad_gantry_level`、`temperature`、`z_tilt` |
+| `Unknown pin chip name 'probe'`（缺 probe/端停 pin chip） | 6 | `bed_mesh`、`bltouch`、`eddy`、`screws_tilt_adjust`、`smart_effector`、`z_virtual_endstop` |
+| 运动学未实现 | 13 | 见下表 |
+| `Section 'gcode_arcs' is not a valid config section` | 1 | `gcode_arcs` |
+| `Section 'virtual_sdcard' is not a valid config section` | 1 | `sdcard_loop` |
+| `Unknown pin chip name 'tmc2130_stepper_x'`（缺 TMC pin chip） | 1 | `tmc` |
+| 配置装载即失败，恰好满足 `SHOULD_FAIL`，未验到越界检查 | 1 | `out_of_bounds` |
+
+运动学一组按 `[printer] kinematics` 的取值细分：
+
+| `kinematics` | `.test` |
+|--------------|---------|
+| `none` | `led`、`linuxtest`、`manual_stepper`、`pwm` |
+| `generic_cartesian` | `corexyuv`、`generic_cartesian`、`generic_cartesian_iqex`、`generic_cartesian_itex` |
+| `delta` | `delta`、`delta_calibrate` |
+| `hybrid_corexy` | `hybrid_corexy_dual_carriage` |
+| `polar` | `polar` |
+| `rotary_delta` | `rotary_delta_calibrate` |
+
+（14 + 6 + 13 + 1 + 1 + 1 + 1 = 37。）
+
 ### 运行
 
 用例在 lib 测试目标里，用 `-p klipperx --lib` 加名字过滤运行：

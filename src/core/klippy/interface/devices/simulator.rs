@@ -196,6 +196,23 @@ impl SimulatorDevice {
                         ],
                     );
                 }
+                "stepper_get_position" => {
+                    // `stepper_get_position oid=%c` — the connect-time position
+                    // read. No step model, so report zero.
+                    let oid = match params.first() {
+                        Some(ArgValue::UInt8(v)) => *v,
+                        _ => {
+                            debug!("simulator: stepper_get_position: missing oid");
+                            return;
+                        }
+                    };
+                    Self::respond(
+                        state,
+                        seq,
+                        "stepper_position",
+                        &[ArgValue::UInt8(oid), ArgValue::Int32(0)],
+                    );
+                }
                 "debug_read" => {
                     // `debug_read order=%c addr=%u` — return a simulated value.
                     // For simplicity, we return 0 for all reads (not fully

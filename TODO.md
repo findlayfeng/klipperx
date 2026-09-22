@@ -248,10 +248,13 @@ FW5a–f / FW6a–f 已把「cartesian + 假 MCU 的 `G1`/`G28`」跑通并归�
       cartesian solver。`[stepper_z1]`/`[stepper_z2]` 与 `[stepper_z]` 一起进 Z rail；同级 section
       只读电机选项（`position_*`/`homing_*` 只在主段）。回归里 `Section 'stepper_z1'…` 消失，
       首次失败前移到 `z_tilt`/`quad_gantry_level`（H9）。**不依赖 H1**；为 C1b/C1c/T6/S1 提供落点。
-- [ ] **C1b extruder 运动**：`MotionQueuing` 提为 host 对象 + `allocate_trapq`/per-stepper
-      trapq；`motion` 层的 `trait ExtraAxis` 与 `LookAheadQueue`/`process_lookahead` 接线；
-      `ExtruderStepper` + `extruder_stepper_alloc` 位置函数。heater 做成可注入接口
-      （H1 落地前用桩）。
+- [x] **C1b extruder 运动**：✅ 已完成。`MotionQueuing` 多 trapq（C1b-1）；`heaters::setup_heater`
+      与 `Heater` 桩（C1b-2）；新增 `extras/extruder.rs`（`PrinterExtruder` + `ExtraAxis`）：
+      `[extruder]`/`[extruder1]` 经兄弟 section 读取，自带 trapq 与 `extruder_position_fn`
+      solver，注册 `M104`/`M109`/`ACTIVATE_EXTRUDER`/`SET_PRESSURE_ADVANCE`；toolhead 在 connect
+      时把每个 extruder 挂成 extra axis 并分配 trapq。验收：`an_extruder_move_runs_against_the_fake_firmware`
+      （`G1 E…` 同时驱动运动轴与挤出机）。回归里 `Section 'extruder'…` 消失，首次失败前移到
+      `heater_bed`（H1）/`extruder_stepper`（H10）。**T3 还差 H1 的 `heater_bed`/`fan`。**
 - [x] **C1c-1 corexy 族**：✅ 已完成。`CartesianTransform`（Standard/CoreXy/CoreXz/HybridCoreXy/
       HybridCoreXz）把「rail 位置 → 台面轴」抽成值；`itersolve` 加 `corexy_/corexz_ position_fn`
       （`x±y` / `x±z`，active flags `X|Y` / `X|Z`）；`ToolHeadObject` 的 `KinematicsKind` 分派 solver

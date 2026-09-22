@@ -668,6 +668,34 @@ mod tests {
             .expect("a minimal case runs against the fake firmware");
     }
 
+    /// An extruder move runs end to end: the E axis has its own trapq and its
+    /// stepper, and a `G1` with an `E` word drives both the kinematic axes and
+    /// the extruder.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_extruder_move_runs_against_the_fake_firmware() {
+        let dictionary = dict_dir().join("atmega2560.dict");
+        let text = format!(
+            "[mcu]\ntest: dict={}\n\
+             [stepper_x]\nstep_pin: PA0\ndir_pin: PA1\nrotation_distance: 40\nmicrosteps: 16\nposition_max: 200\n\
+             [stepper_y]\nstep_pin: PA2\ndir_pin: PA3\nrotation_distance: 40\nmicrosteps: 16\nposition_max: 200\n\
+             [stepper_z]\nstep_pin: PA4\ndir_pin: PA5\nrotation_distance: 8\nmicrosteps: 16\nposition_max: 200\n\
+             [extruder]\nstep_pin: PA6\ndir_pin: PA7\nrotation_distance: 33.5\nmicrosteps: 16\n\
+             nozzle_diameter: 0.4\nfilament_diameter: 1.75\nheater_pin: PB0\n\
+             sensor_type: EPCOS 100K B57560G104F\nsensor_pin: PK5\ncontrol: pid\npid_Kp: 1\npid_Ki: 0.1\npid_Kd: 10\n\
+             min_temp: 0\nmax_temp: 250\n\
+             [printer]\nkinematics: cartesian\nmax_velocity: 300\nmax_accel: 3000\n",
+            dictionary.display()
+        );
+        let (config, _) = Config::from_text(&text).expect("the extruder config parses");
+
+        run_script_on(
+            &config,
+            "SET_KINEMATIC_POSITION X=0 Y=0 Z=0\nG1 X10 Y10 F600\nG1 E1 F300\nM400",
+        )
+        .await
+        .expect("the extruder move runs against the fake firmware");
+    }
+
     /// Run the upstream runs that can be run: those whose dictionaries were all
     /// built and that are not on the ignore list.
     ///

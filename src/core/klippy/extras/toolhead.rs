@@ -61,6 +61,7 @@ use tracing::warn;
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
 use crate::core::klippy::error::KlippyError;
 use crate::core::klippy::event::KlippyEvent;
+use crate::core::klippy::extras::extruder::PrinterExtruder;
 use crate::core::klippy::extras::query_endstops::{QueryEndstops, QUERY_ENDSTOPS_OBJECT};
 use crate::core::klippy::extras::stepper::{Rail, RailParams};
 use crate::core::klippy::gcode::{
@@ -69,6 +70,7 @@ use crate::core::klippy::gcode::{
 use crate::core::klippy::load::section;
 use crate::core::klippy::mathutil::{Coord, X_AXIS, Y_AXIS, Z_AXIS};
 use crate::core::klippy::mcu::{Completion, McuEndstop, McuError, McuObject, McuStepper};
+use crate::core::klippy::motion::extra::ExtraAxis;
 use crate::core::klippy::motion::itersolve::{
     cartesian_active_flags, cartesian_position_fn, corexy_active_flags, corexy_position_fn,
     corexz_active_flags, corexz_position_fn, Axis, AxisFlags, PositionFn,
@@ -223,6 +225,8 @@ pub struct ToolHeadObject {
     none: bool,
     /// How the rails' positions map to carriage axes.
     transform: CartesianTransform,
+    /// The active extruder's name (`ACTIVATE_EXTRUDER`), for `M104` without `T`.
+    active_extruder: Mutex<String>,
     /// The machine's clock, for seeding the print-time mapping.
     reactor: Arc<dyn Reactor>,
     /// The machine, to shut it down if the compressor hits an internal error.
@@ -369,6 +373,7 @@ impl ToolHeadObject {
             rails,
             none,
             transform: kind.transform(),
+            active_extruder: Mutex::new("extruder".to_string()),
             reactor: printer.reactor(),
             printer: Arc::downgrade(printer),
             state,
@@ -436,6 +441,32 @@ impl ToolHeadObject {
             self.rails[1].name().to_string(),
             self.rails[2].name().to_string(),
         ]
+    }
+
+    /// The machine's maximum velocity, for `[extruder]`'s speed defaults.
+    pub fn max_velocity(&self) -> f64 {
+        self.limits.max_velocity
+    }
+
+    /// The machine's maximum acceleration, for `[extruder]`'s speed defaults.
+    pub fn max_accel(&self) -> f64 {
+        self.limits.max_accel
+    }
+
+    /// Record the active extruder (`ACTIVATE_EXTRUDER`).
+    pub fn set_active_extruder(&self, name: &str) {
+        *self
+            .active_extruder
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = name.to_string();
+    }
+
+    /// The active extruder's name.
+    pub fn active_extruder(&self) -> String {
+        self.active_extruder
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 }
 
@@ -526,6 +557,27 @@ impl PrinterObject for ToolHeadObject {
             // The toolhead's print time is the primary MCU's.
             toolhead.set_estimated_print_time(main_print_time);
 
+            // The extruders are the toolhead's `extra_axes`: each has its own
+            // trapq, and the extruder queues the extrusion into it
+            // (`kinematics/extruder.py:140-190`).
+            if let Some(printer) = self.printer.upgrade() {
+                for name in extruder_names(&printer) {
+                    let Some(extruder) = printer.lookup_object_as::<PrinterExtruder>(&name) else {
+                        continue;
+                    };
+                    if let (Some(mut stepper), Some(mcu_stepper)) =
+                        (extruder.take_stepper(), extruder.mcu_stepper())
+                    {
+                        let trapq = toolhead.allocate_trapq();
+                        stepper.set_trapq(trapq);
+                        mcu_steppers.insert(stepper.name().to_string(), mcu_stepper);
+                        toolhead.add_stepper(stepper);
+                        extruder.set_trapq(trapq);
+                    }
+                    toolhead.add_extra_axis(Arc::clone(&extruder) as Arc<dyn ExtraAxis>);
+                }
+            }
+
             *self.lock() = Some(Connected {
                 toolhead,
                 mcu_steppers,
@@ -551,6 +603,22 @@ impl PrinterObject for ToolHeadObject {
             Ok(())
         })
     }
+}
+
+/// The registered extruders, in `[extruder]`, `[extruder1]`… order.
+fn extruder_names(printer: &Printer) -> Vec<String> {
+    let mut names = Vec::new();
+    if printer.lookup_object("extruder").is_some() {
+        names.push("extruder".to_string());
+        for index in 1..99 {
+            let name = format!("extruder{index}");
+            if printer.lookup_object(&name).is_none() {
+                break;
+            }
+            names.push(name);
+        }
+    }
+    names
 }
 
 impl Drop for ToolHeadObject {

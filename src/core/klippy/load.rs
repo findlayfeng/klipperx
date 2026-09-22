@@ -333,6 +333,7 @@ mod tests {
             [
                 "mcu",
                 "stepper_enable",
+                "extruder",
                 "output_pin",
                 "stepper_x",
                 "stepper_y",

@@ -48,6 +48,8 @@
 //! [`ToolHeadObject::shutdown`] each wake, so a restart stops it with the object.
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
@@ -59,17 +61,18 @@ use tracing::warn;
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
 use crate::core::klippy::error::KlippyError;
 use crate::core::klippy::extras::query_endstops::{QueryEndstops, QUERY_ENDSTOPS_OBJECT};
-use crate::core::klippy::extras::stepper::PrinterStepper;
+use crate::core::klippy::extras::stepper::{PrinterStepper, RailParams};
 use crate::core::klippy::gcode::{
     CommandError, CommandHandler, GCodeDispatch, GcodeCommand, GCODE_OBJECT,
 };
 use crate::core::klippy::load::section;
 use crate::core::klippy::mathutil::{Coord, X_AXIS, Y_AXIS, Z_AXIS};
-use crate::core::klippy::mcu::{McuObject, McuStepper};
-use crate::core::klippy::motion::kinematics::CartesianKinematics;
+use crate::core::klippy::mcu::{Completion, McuEndstop, McuError, McuObject, McuStepper};
+use crate::core::klippy::motion::kinematics::{home_move, CartesianKinematics};
 use crate::core::klippy::motion::plan::MoveLimits;
 use crate::core::klippy::motion::stepcompress::{StepCommand, StepCompressError};
 use crate::core::klippy::motion::toolhead::ToolHead;
+use crate::core::klippy::motion::{HomeCoord, HomingInfo};
 use crate::core::klippy::printer::{ConnectFuture, Printer, PrinterObject};
 use crate::core::klippy::reactor::Reactor;
 
@@ -257,6 +260,15 @@ impl ToolHeadObject {
                 Some("Force a low-level kinematic position"),
                 false,
             )
+            .map_err(ConfigError::new)?;
+        let home_handler: CommandHandler = {
+            let state = Arc::clone(&self.state);
+            let axes = self.axes.clone();
+            let printer = Arc::downgrade(printer);
+            Arc::new(move |gcmd| cmd_g28(&state, &axes, &printer, gcmd))
+        };
+        gcode
+            .register_command("G28", home_handler, Some("Home one or more axes"), false)
             .map_err(ConfigError::new)?;
         Ok(())
     }
@@ -466,6 +478,203 @@ impl Connected {
 }
 
 // ===========================================================================
+// Homing
+// ===========================================================================
+
+/// How long to wait after arming the endstop before moving
+/// (`HOMING_START_DELAY`, `klippy/extras/homing.py:9`).
+const HOMING_START_DELAY: f64 = 0.001;
+
+/// How long the endstop confirms a trigger over
+/// (`ENDSTOP_SAMPLE_TIME`/`ENDSTOP_SAMPLE_COUNT`).
+const ENDSTOP_SAMPLE_TIME: f64 = 0.000_015;
+const ENDSTOP_SAMPLE_COUNT: u8 = 4;
+
+/// How much of a homing move's steps the drip loop queues at a time
+/// (`DRIP_SEGMENT_TIME`, `klippy/extras/motion_queuing.py:20`).
+const DRIP_SEGMENT_TIME: f64 = 0.050;
+
+/// The most steps the homing driver may look ahead, so a trigger stops the
+/// firmware with little queued behind it.
+const DRIP_LOOKAHEAD: f64 = 0.010;
+
+/// A future returned by [`HomingEndstop::home_wait`].
+pub type EndstopFuture<'a> = Pin<Box<dyn Future<Output = Result<f64, McuError>> + Send + 'a>>;
+
+/// What the homing driver needs from an endstop (upstream's `MCU_endstop`).
+///
+/// A trait so the driver can be tested with a fake trigger, without an MCU.
+pub trait HomingEndstop: Send + Sync {
+    /// Arm the endstop for a move starting at `print_time`.
+    ///
+    /// # Errors
+    /// As [`McuEndstop::home_start`].
+    fn home_start(
+        &self,
+        print_time: f64,
+        sample_time: f64,
+        sample_count: u8,
+        rest_time: f64,
+        triggered: bool,
+    ) -> Result<Arc<Completion>, McuError>;
+
+    /// Wait for the endstop trigger; returns its print time, or `0.0` when the
+    /// move ended without one.
+    ///
+    /// # Errors
+    /// As [`McuEndstop::home_wait`].
+    fn home_wait(&self, home_end_time: f64) -> EndstopFuture<'_>;
+}
+
+impl HomingEndstop for McuEndstop {
+    fn home_start(
+        &self,
+        print_time: f64,
+        sample_time: f64,
+        sample_count: u8,
+        rest_time: f64,
+        triggered: bool,
+    ) -> Result<Arc<Completion>, McuError> {
+        McuEndstop::home_start(
+            self,
+            print_time,
+            sample_time,
+            sample_count,
+            rest_time,
+            triggered,
+        )
+    }
+
+    fn home_wait(&self, home_end_time: f64) -> EndstopFuture<'_> {
+        Box::pin(McuEndstop::home_wait(self, home_end_time))
+    }
+}
+
+/// Fill `None` entries from `current` (`Homing._fill_coord`).
+fn fill_coord(home: HomeCoord, current: Coord) -> Coord {
+    let mut out = current;
+    for (axis, value) in home.iter().enumerate() {
+        if let Some(value) = value {
+            out.set_axis(axis, *value);
+        }
+    }
+    out
+}
+
+/// The XYZ distance between two positions.
+fn move_distance(a: Coord, b: Coord) -> f64 {
+    let mut sum = 0.0;
+    for axis in [X_AXIS, Y_AXIS, Z_AXIS] {
+        sum += (b.axis(axis) - a.axis(axis)).powi(2);
+    }
+    sum.sqrt()
+}
+
+/// Home the requested axes, one at a time (`Homing.home_rails` driven per axis).
+///
+/// The caller has taken the toolhead out of its shared slot and runs this on one
+/// `block_in_place` task, so the background flush task sees no toolhead and
+/// stands back while the drip loop here owns step generation.
+///
+/// # Errors
+/// A missing endstop, a kinematics refusal, or a failed query/send.
+async fn home_axes(
+    connected: &mut Connected,
+    axes: &[Arc<PrinterStepper>; 3],
+    requested: &[usize],
+) -> Result<(), CommandError> {
+    for &axis in requested {
+        let rail = &axes[axis];
+        let endstop = rail.endstop().ok_or_else(|| {
+            CommandError::new(format!("No endstop configured for {}", rail.name()))
+        })?;
+        home_axis(
+            connected,
+            axis,
+            rail.homing_info(),
+            rail.params(),
+            rail.step_dist(),
+            endstop.as_ref(),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Home one axis: pretend to be at `forcepos`, move to the endstop, then place
+/// the axis at its `position_endstop` (`CartKinematics.home_axis` +
+/// `Homing._do_home_rails` + `HomingMove.homing_move`).
+#[allow(clippy::too_many_arguments)]
+async fn home_axis(
+    connected: &mut Connected,
+    axis: usize,
+    info: HomingInfo,
+    params: RailParams,
+    step_dist: f64,
+    endstop: &dyn HomingEndstop,
+) -> Result<(), CommandError> {
+    // Start 1.5 axis-lengths past the far end so the move always approaches the
+    // endstop from the correct side.
+    let (forcepos, movepos) = home_move(axis, &info, params.position_min, params.position_max);
+    let current = connected.toolhead.commanded_pos();
+    let force = fill_coord(forcepos, current);
+    let home = fill_coord(movepos, current);
+    connected.toolhead.set_position(force, &[axis]);
+
+    // Poll the endstop about once per step so a trigger is seen promptly.
+    let move_t = move_distance(force, home) / info.speed;
+    let steps = ((home.axis(axis) - force.axis(axis)).abs() / step_dist).max(1.0);
+    let rest_time = (move_t / steps).max(0.001);
+
+    let print_time = connected.toolhead.get_last_move_time();
+    let completion = endstop
+        .home_start(
+            print_time,
+            ENDSTOP_SAMPLE_TIME,
+            ENDSTOP_SAMPLE_COUNT,
+            rest_time,
+            true,
+        )
+        .map_err(command_error)?;
+    connected.toolhead.dwell(HOMING_START_DELAY);
+    let (start, end) = connected
+        .toolhead
+        .drip_move(home, info.speed)
+        .map_err(|err| CommandError::new(err.to_string()))?;
+
+    // Drip the move out in small windows; stop as soon as the trigger fires.
+    let mut flush_time = start;
+    while flush_time < end && completion.reason().is_none() {
+        flush_time = (flush_time + DRIP_SEGMENT_TIME).min(end);
+        let batches = connected
+            .toolhead
+            .flush_step_generation(flush_time)
+            .map_err(|err| CommandError::new(err.to_string()))?;
+        for (name, commands) in batches {
+            if let Some(stepper) = connected.mcu_steppers.get(&name) {
+                stepper
+                    .send_steps_async(&commands)
+                    .await
+                    .map_err(command_error)?;
+            }
+        }
+        if completion.reason().is_none() {
+            sleep(Duration::from_secs_f64(DRIP_LOOKAHEAD)).await;
+        }
+    }
+
+    endstop.home_wait(end).await.map_err(command_error)?;
+    // The axis is now known at its endstop position.
+    connected.toolhead.set_position(home, &[axis]);
+    connected.toolhead.wipe_trapq();
+    Ok(())
+}
+
+fn command_error(err: McuError) -> CommandError {
+    CommandError::new(err.to_string())
+}
+
+// ===========================================================================
 // G-code commands
 // ===========================================================================
 
@@ -578,6 +787,44 @@ fn axis_indices(names: &str) -> Vec<usize> {
         .filter(|(_, name)| names.contains(*name))
         .map(|(axis, _)| axis)
         .collect()
+}
+
+/// `G28`: home the named axes (all three when none is named).
+///
+/// The homing run is asynchronous (it drives the drip flush loop and awaits the
+/// endstop trigger), so the toolhead is taken out of its shared slot, the run is
+/// driven on the current worker via `block_in_place`, and the toolhead is put
+/// back afterwards. The background flush task sees an empty slot and stands back.
+fn cmd_g28(
+    state: &Arc<Mutex<Option<Connected>>>,
+    axes: &[Arc<PrinterStepper>; 3],
+    _printer: &Weak<Printer>,
+    gcmd: &GcodeCommand,
+) -> Result<(), CommandError> {
+    let params = gcmd.get_command_parameters();
+    let mut requested: Vec<usize> = Vec::new();
+    for (name, axis) in [("X", X_AXIS), ("Y", Y_AXIS), ("Z", Z_AXIS)] {
+        if params.contains_key(name) {
+            requested.push(axis);
+        }
+    }
+    let requested = if requested.is_empty() {
+        vec![X_AXIS, Y_AXIS, Z_AXIS]
+    } else {
+        requested
+    };
+
+    let mut guard = state.lock().unwrap_or_else(|poison| poison.into_inner());
+    let Some(mut connected) = guard.take() else {
+        return Err(CommandError::new("Printer is not ready"));
+    };
+    let handle = tokio::runtime::Handle::try_current()
+        .map_err(|_| CommandError::new("G28 needs the async runtime"))?;
+    let result = tokio::task::block_in_place(|| {
+        handle.block_on(home_axes(&mut connected, axes, &requested))
+    });
+    *guard = Some(connected);
+    result
 }
 
 /// The factory the `[printer]` declaration names.
@@ -863,5 +1110,85 @@ mod tests {
             connected_ref.toolhead.kinematics().unwrap().get_status()["homed_axes"],
             "xyz"
         );
+    }
+
+    /// An endstop that completes as soon as it is armed.
+    struct FakeEndstop {
+        completion: Arc<Completion>,
+    }
+
+    impl HomingEndstop for FakeEndstop {
+        fn home_start(
+            &self,
+            _print_time: f64,
+            _sample_time: f64,
+            _sample_count: u8,
+            _rest_time: f64,
+            _triggered: bool,
+        ) -> Result<Arc<Completion>, McuError> {
+            Ok(Arc::clone(&self.completion))
+        }
+
+        fn home_wait(&self, home_end_time: f64) -> EndstopFuture<'_> {
+            Box::pin(async move {
+                self.completion.wait().await;
+                Ok(home_end_time)
+            })
+        }
+    }
+
+    fn test_homing_info() -> HomingInfo {
+        HomingInfo {
+            speed: 5.0,
+            position_endstop: 0.0,
+            retract_speed: 5.0,
+            retract_dist: 5.0,
+            positive_dir: false,
+            second_homing_speed: 2.5,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_home_axis_places_the_axis_at_the_endstop() {
+        // An unhomed machine; its endstop completes at once.
+        let mut toolhead = homed_toolhead();
+        toolhead.set_position(Coord::default(), &[]);
+        if let Some(kinematics) = toolhead.kinematics_mut() {
+            kinematics.clear_homing_state(&[X_AXIS, Y_AXIS, Z_AXIS]);
+        }
+        let (state, _gcode) = connected(toolhead);
+        let mut connected = state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+            .unwrap();
+        let completion = Completion::new();
+        completion.complete(crate::core::klippy::cmd::trsync::TriggerReason::EndstopHit);
+        let endstop = FakeEndstop { completion };
+        let params = RailParams {
+            position_min: 0.0,
+            position_max: 200.0,
+            position_endstop: 0.0,
+        };
+
+        home_axis(
+            &mut connected,
+            X_AXIS,
+            test_homing_info(),
+            params,
+            1.0,
+            &endstop,
+        )
+        .await
+        .unwrap();
+
+        // The axis is placed at its endstop and marked homed; the trapq is wiped.
+        assert_eq!(connected.toolhead.commanded_pos().x(), 0.0);
+        assert_eq!(
+            connected.toolhead.kinematics().unwrap().get_status()["homed_axes"],
+            "x"
+        );
+        assert!(connected.toolhead.trapq().moves().is_empty());
+        *state.lock().unwrap_or_else(|p| p.into_inner()) = Some(connected);
     }
 }

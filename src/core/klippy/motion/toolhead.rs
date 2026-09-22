@@ -172,6 +172,56 @@ impl ToolHead {
         self.process_lookahead();
     }
 
+    /// The print time the planner has reached (`ToolHead.get_last_move_time`):
+    /// flush the look-ahead into the trapq first, then report. Updates based on
+    /// this value are what the MCU is executing.
+    pub fn get_last_move_time(&mut self) -> f64 {
+        self.process_lookahead();
+        self.print_time
+    }
+
+    /// Drop every queued move table entry (`motion_quuing.wipe_trapq`), as a
+    /// homing move does once it has stopped.
+    pub fn wipe_trapq(&mut self) {
+        self.motion_queuing
+            .trapq_mut()
+            .finalize_moves(f64::MAX, 0.0);
+    }
+
+    /// Load one move straight into the trapq, bypassing the look-ahead
+    /// (`ToolHead.drip_move` / `_drip_load_trapq`, `klippy/toolhead.py:459-493`).
+    ///
+    /// A homing move must not be joined to a previous move — it has to stop on
+    /// its own endstop — so this sets its junction speeds to zero (start and end
+    /// at rest), appends its trapezoid at the current print time, and advances
+    /// the print time. The caller runs the step generation while the firmware
+    /// moves (the drip loop), so only a small window is ever queued.
+    ///
+    /// Returns the move's start and end print times.
+    ///
+    /// # Errors
+    /// The kinematics' `check_move` refusal.
+    pub fn drip_move(&mut self, newpos: Coord, speed: f64) -> Result<(f64, f64), CommandError> {
+        let mut move_ = Move::new(self.commanded_pos, newpos, speed, &self.limits);
+        if move_.move_d == 0.0 {
+            self.process_lookahead();
+            return Ok((self.print_time, self.print_time));
+        }
+        if move_.is_kinematic_move {
+            if let Some(kinematics) = &self.kinematics {
+                let mut ctx = MoveContext::new(&mut move_);
+                kinematics.check_move(&mut ctx)?;
+            }
+        }
+        self.process_lookahead();
+        move_.set_junction(0.0, move_.max_cruise_v2, 0.0);
+        let start_time = self.print_time;
+        self.motion_queuing.append_move(start_time, &move_);
+        self.print_time = start_time + move_.accel_t + move_.cruise_t + move_.decel_t;
+        self.commanded_pos = move_.end_pos;
+        Ok((start_time, self.print_time))
+    }
+
     /// Wait `delay` seconds without moving (`ToolHead.dwell`,
     /// `klippy/toolhead.py:417-420`).
     pub fn dwell(&mut self, delay: f64) {
@@ -302,6 +352,35 @@ mod tests {
         toolhead.dwell(0.5);
 
         assert!((toolhead.print_time() - (before + 0.5)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_drip_move_loads_the_trapq_directly() {
+        let mut toolhead = toolhead();
+
+        let (start, end) = toolhead
+            .drip_move(Coord::new(10.0, 0.0, 0.0, 0.0), 100.0)
+            .unwrap();
+
+        assert!(end > start);
+        assert_eq!(toolhead.commanded_pos().x(), 10.0);
+        assert_eq!(toolhead.get_last_move_time(), end);
+        // The move is in the trapq and generates its steps.
+        let batches = toolhead.flush_step_generation(end).unwrap();
+        assert_eq!(step_count(&batches), 10);
+        // Wiping the trapq leaves nothing queued.
+        toolhead.wipe_trapq();
+        assert!(toolhead.trapq().moves().is_empty());
+    }
+
+    #[test]
+    fn test_a_zero_length_drip_move_does_nothing() {
+        let mut toolhead = toolhead();
+
+        let (start, end) = toolhead.drip_move(Coord::default(), 100.0).unwrap();
+
+        assert_eq!(start, end);
+        assert!(toolhead.trapq().moves().is_empty());
     }
 
     #[test]

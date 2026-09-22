@@ -232,80 +232,42 @@ mod tests {
     ///
     /// `KLIPPERX_UPSTREAM_ALL=1` runs every case and reports every failure, so
     /// the list stays honest rather than hiding regressions.
-    ///
-    /// **Current failure breakdown** (214 failures total, 22 ignored files):
-    /// - `extruder` not implemented: 99 failures (T3)
-    /// - `probe` pin chip unknown: 36 failures (T4)
-    /// - kinematics not implemented: 31 failures (T5)
-    /// - TMC pin chip unknown: 19 failures (T6)
-    /// - `output_pin value` option: 5 failures (T8)
-    /// - `temperature_mcu` sensor: 5 failures (T7)
-    /// - `stepper_z1` multi-axis: 5 failures (T9)
-    /// - others: 14 failures (T9)
     const IGNORED: &[&str] = &[
-        // T2 removed (enable_pin): bed_screws, commands, dual_carriage,
-        // exclude_object, extruders, input_shaper, load_cell, macros, multi_z,
-        // pressure_advance, printers, quad_gantry_level, temperature, z_tilt
-        // T3 (extruder): commands, exclude_object, extruders, input_shaper,
-        //   load_cell, macros, out_of_bounds, pressure_advance, printers,
-        //   generic-fysetc-f6, generic-gt2560, generic-mini-rambo,
-        //   generic-rambo, generic-rumba, printer-adimlab-2018,
-        //   printer-anycubic-4max-2018, printer-anycubic-4maxpro-2.0-2021,
-        //   generic-bigtreetech-octopus-v1.1, generic-bigtreetech-octopus-pro-v1.0,
-        //   generic-fysetc-s6, generic-fysetc-s6-v2, generic-fysetc-spider,
-        //   generic-mks-rumba32-v1.0, generic-bigtreetech-octopus-max-ez,
-        //   generic-bigtreetech-octopus-pro-v1.1, generic-bigtreetech-skr-3,
-        //   generic-bigtreetech-manta-m4p, generic-bigtreetech-manta-m5p,
-        //   generic-bigtreetech-manta-m8p-v1.0, generic-bigtreetech-manta-m8p-v1.1,
-        //   generic-bigtreetech-manta-e3ez, printer-anycubic-kobra-go-2022,
-        //   printer-anycubic-kobra-plus-2022, sample-multi-mcu
-        // T4 (probe pin chip): bed_mesh, bltouch, eddy, screws_tilt_adjust,
-        //   smart_effector, z_virtual_endstop, generic-einsy-rambo,
-        //   kit-zav3d-2019, printer-biqu-b1-se-plus-2022, printer-ratrig-v-minion-2021
-        // T5 (kinematics): corexyuv, delta, delta_calibrate,
-        //   generic_cartesian, generic_cartesian_iqex, generic_cartesian_itex,
-        //   hybrid_corexy_dual_carriage, polar, printers (corexy/corexz/hybrid-corexy/
-        //   hybrid-corexz/delta/deltesian/rotary-delta/winch),
-        //   kit-voron2-250mm, printer-anycubic-kossel-2016, printer-anycubic-kossel-plus-2017
-        // T6 (TMC pin chip): tmc (tmc2130_stepper_x, tmc2209_stepper_x,
-        //   tmc2209 stepper_x, tmc2208 stepper_x, tmc5160 stepper_x, tmc2660 stepper_x)
-        // T7 (temperature_mcu): printers (generic-bigtreetech-skr-pico-v1.0,
-        //   generic-mellow-fly-e3-v2)
-        // T8 (output_pin value): printers (generic-mini-rambo, generic-ultimaker-ultimainboard-v2,
-        //   printer-adimlab-2018)
-        // T9 (others): bed_mesh, bltouch, eddy, screws_tilt_adjust, smart_effector,
-        //   z_virtual_endstop (probe pin chip), gcode_arcs, virtual_sdcard,
-        //   dual_carriage, safe_z_home, endstop_phase, adc_scaled,
-        //   static_digital_output, pwm_cycle_time, led, manual_stepper,
-        //   display, replicape, stepper_z1, tmc2209 stepper_x, tmc2208 stepper_x,
-        //   tmc5160 stepper_x, tmc2660 stepper_x, printer-prusa-mini-plus-2020,
-        //   generic-th3d-ezboard-v2.0, generic-ldo-leviathan-v1.2,
-        //   generic-bigtreetech-skr-mini-e3-v3.0, printer-biqu-bx-2021,
-        //   printer-biqu-b1-se-plus-2022, printer-ratrig-v-minion-2021,
-        //   printer-tronxy-crux1-2022, printer-anycubic-kossel-2016,
-        //   printer-anycubic-kossel-plus-2017, printer-bq-hephestos-2014,
-        //   generic-replicape, sample-multi-mcu
         "bed_mesh.test",
+        "bed_screws.test",
         "bltouch.test",
+        "commands.test",
         "corexyuv.test",
         "delta.test",
         "delta_calibrate.test",
+        "dual_carriage.test",
         "eddy.test",
+        "exclude_object.test",
+        "extruders.test",
         "gcode_arcs.test",
         "generic_cartesian.test",
         "generic_cartesian_iqex.test",
         "generic_cartesian_itex.test",
         "hybrid_corexy_dual_carriage.test",
+        "input_shaper.test",
         "led.test",
+        "load_cell.test",
+        "macros.test",
         "manual_stepper.test",
+        "multi_z.test",
         "out_of_bounds.test",
         "polar.test",
+        "pressure_advance.test",
+        "printers.test",
         "pwm.test",
+        "quad_gantry_level.test",
         "rotary_delta_calibrate.test",
         "screws_tilt_adjust.test",
         "sdcard_loop.test",
         "smart_effector.test",
+        "temperature.test",
         "tmc.test",
+        "z_tilt.test",
         "z_virtual_endstop.test",
     ];
 

@@ -309,11 +309,14 @@ pub fn run(
         // (`klippy/klippy.py:36-40`) and no path is half-built when a request
         // arrives. Everything is registered before the listener is bound.
         let mut api = Api::new();
-        api::register(
-            &mut api,
-            &printer,
-            StartArgs::collect(config_file.clone(), args.log_file.clone()),
-        )?;
+        // The start arguments are host data: the printer keeps a copy (upstream
+        // `printer.start_args`, `klippy/klippy.py:30`) so that modules such as
+        // `M115` and `error_mcu` can read them, and the API reports the same
+        // dictionary.
+        let mut start_args = StartArgs::collect(config_file.clone(), args.log_file.clone());
+        start_args.apiserver = Some(args.api_server.clone());
+        printer.set_start_args(Arc::new(start_args.clone()));
+        api::register(&mut api, &printer, start_args)?;
         let api = Arc::new(api);
 
         let server = match target {

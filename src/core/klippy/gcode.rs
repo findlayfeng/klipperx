@@ -681,18 +681,25 @@ impl GCodeDispatch {
                 // Set Current Line Number: accepted and ignored.
                 "M110" => Arc::new(|_| Ok(())),
                 // Get Firmware Version and Capabilities.
-                "M115" => Arc::new(|gcmd: &GcodeCommand| {
-                    let msg = format!(
-                        "FIRMWARE_NAME:Klipper FIRMWARE_VERSION:{}",
-                        env!("CARGO_PKG_VERSION")
-                    );
-                    // A file-input line gets `ok <msg>`; an API line gets the
-                    // info line instead (`klippy/gcode.py:344-350`).
-                    if !gcmd.ack(Some(&msg)) {
-                        gcmd.respond_info(&msg);
-                    }
-                    Ok(())
-                }),
+                "M115" => {
+                    let printer = Arc::downgrade(&self.inner.printer);
+                    Arc::new(move |gcmd: &GcodeCommand| {
+                        // The host's own version, from the start arguments
+                        // (`start_args['software_version']`); the crate version
+                        // is the fallback before the host sets them.
+                        let version = printer
+                            .upgrade()
+                            .map(|printer| printer.software_version())
+                            .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
+                        let msg = format!("FIRMWARE_NAME:Klipper FIRMWARE_VERSION:{version}");
+                        // A file-input line gets `ok <msg>`; an API line gets the
+                        // info line instead (`klippy/gcode.py:344-350`).
+                        if !gcmd.ack(Some(&msg)) {
+                            gcmd.respond_info(&msg);
+                        }
+                        Ok(())
+                    })
+                }
                 _ => unreachable!(),
             };
             self.register_command(name, handler, desc, true)
@@ -1795,6 +1802,38 @@ mod tests {
         let lines = emitted(&output);
         assert!(
             lines.iter().any(|l| l.contains("FIRMWARE_NAME:Klipper")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn test_m115_reports_the_host_software_version() {
+        // The version comes from the start arguments (upstream's
+        // `start_args['software_version']`), so a host that sets them gets its
+        // own version in the reply.
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        let mut args = crate::core::klippy::api::StartArgs::collect("/tmp/printer.cfg", None);
+        args.software_version = "v9.9.9-test".to_string();
+        printer.set_start_args(Arc::new(args));
+        let dispatch = GCodeDispatch::new(Arc::clone(&printer));
+        let output = Arc::new(Mutex::new(Vec::new()));
+        {
+            let output = Arc::clone(&output);
+            dispatch.register_output_handler(Arc::new(move |line: &str| {
+                output
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push(line.to_string());
+            }));
+        }
+
+        dispatch.run_script("M115").unwrap();
+
+        let lines = emitted(&output);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("FIRMWARE_VERSION:v9.9.9-test")),
             "{lines:?}"
         );
     }

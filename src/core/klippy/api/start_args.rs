@@ -18,6 +18,9 @@
 /// `info` reports `log_file`, `config_file`, `software_version` and `cpu_info`
 /// straight from here — the four fields upstream reads out of `start_args`
 /// rather than gathering in the request handler (`klippy/webhooks.py:395-397`).
+/// The rest mirror the dictionary upstream's `main()` builds
+/// (`klippy/klippy.py:288-338`), so that a module can ask the printer for the
+/// start arguments instead of taking them as parameters.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StartArgs {
     /// The config file the host was started with.
@@ -31,19 +34,42 @@ pub struct StartArgs {
     pub software_version: String,
     /// CPU description, e.g. `"4 core ARMv7 Processor rev 4 (v7l)"`.
     pub cpu_info: String,
+    /// The `--api-server` value (upstream's `apiserver`).
+    pub apiserver: Option<String>,
+    /// Why this run started: `"startup"` for the first one, then the result
+    /// the previous run ended with (upstream's `start_args['start_reason']`).
+    pub start_reason: String,
+    /// The `--debuginput` file, when the host reads G-Code from a file instead
+    /// of a pty (`debuginput`).
+    pub debug_input: Option<String>,
+    /// The `--debugoutput` file, when the host writes the MCU protocol to a
+    /// file instead of the serial port (`debugoutput`).
+    pub debug_output: Option<String>,
+    /// The board description (upstream's `device`, `util.get_device_info`).
+    pub device: String,
+    /// The kernel version (upstream's `linux_version`, `util.get_linux_version`).
+    pub linux_version: String,
 }
 
 impl StartArgs {
     /// Gather the start arguments a host knows at startup.
     ///
     /// `log_file` is the `--logfile` path, or `None` when the host logs to the
-    /// terminal only.
+    /// terminal only. The fields the parser does not carry yet
+    /// (`debuginput`/`debugoutput`) stay `None`, and the API address is filled
+    /// in by the host, which is where the option lives.
     pub fn collect(config_file: impl Into<String>, log_file: Option<String>) -> Self {
         Self {
             config_file: config_file.into(),
             log_file,
             software_version: env!("CARGO_PKG_VERSION").to_string(),
             cpu_info: cpu_info(),
+            apiserver: None,
+            start_reason: "startup".to_string(),
+            debug_input: None,
+            debug_output: None,
+            device: device_info(),
+            linux_version: linux_version(),
         }
     }
 }
@@ -58,6 +84,29 @@ fn cpu_info() -> String {
         Ok(data) => parse_cpu_info(&data),
         Err(_) => "?".to_string(),
     }
+}
+
+/// The board description, as upstream's `util.get_device_info` writes it
+/// (`klippy/util.py:126-132`): the device tree model, else the DMI product
+/// name, else `"?"`.
+fn device_info() -> String {
+    for path in ["/proc/device-tree/model", "/sys/class/dmi/id/product_name"] {
+        if let Ok(data) = std::fs::read_to_string(path) {
+            return data
+                .trim_matches(|c: char| c == ' ' || c == '\0')
+                .trim()
+                .to_string();
+        }
+    }
+    "?".to_string()
+}
+
+/// The kernel version, as upstream's `util.get_linux_version` writes it
+/// (`klippy/util.py:134-138`): `/proc/version` verbatim, else `"?"`.
+fn linux_version() -> String {
+    std::fs::read_to_string("/proc/version")
+        .map(|data| data.trim().to_string())
+        .unwrap_or_else(|_| "?".to_string())
 }
 
 /// The part of [`cpu_info`] that can be tested without a `/proc`.
@@ -120,5 +169,22 @@ model name\t: ARMv7 Processor rev 4 (v7l)
         let args = StartArgs::collect("/tmp/printer.cfg", Some("/tmp/klippy.log".to_string()));
 
         assert_eq!(args.log_file.as_deref(), Some("/tmp/klippy.log"));
+    }
+
+    #[test]
+    fn test_a_fresh_run_starts_for_the_first_reason() {
+        // Upstream's `main()`: `start_args = {..., 'start_reason': 'startup'}`
+        // (`klippy/klippy.py:288`).
+        let args = StartArgs::collect("/tmp/printer.cfg", None);
+
+        assert_eq!(args.start_reason, "startup");
+        assert_eq!(args.apiserver, None);
+        // No `--debuginput` / `--debugoutput` yet: the host reads G-Code from
+        // its pty and writes the protocol to the serial port.
+        assert_eq!(args.debug_input, None);
+        assert_eq!(args.debug_output, None);
+        // Both are read from the running kernel, so only their shape is pinned.
+        assert!(!args.device.is_empty());
+        assert!(!args.linux_version.is_empty());
     }
 }

@@ -20,10 +20,10 @@
 | **FW1** | 配置装载框架收尾 | C2 | option 访问追踪当 schema（`ConfigWrapper` + `AccessTracking`）、住户与阶段（`phase`/`object`，对象名可≠节名）、未认领 section/option 报 `ConfigError`、`configfile` 对象 | `[output_pin fan]` 多一个选项报选项错、`objects/list` 含 `configfile` 且 `settings`/`config` 形状对；`[printer]`→`toolhead` 的晚阶段住户有装载器单测 | 各 extras 的 option schema（H1–H12）；`[printer]`/toolhead 本体随 C1 接入 | FW3（共用 `ConfigError`） |
 | **FW2** | 对象模型收尾 | Q4、Q5 | Q4 定案 `Value`；Q5 加 `lookup_objects(module)` 前缀遍历与 `statuses()` 快照 | `objects/query` 形状不变；`lookup_objects("mcu")` 前缀遍历与反射读状态有单测 | `gcode_macro` 的 `printer.objects` 模板视图、display 菜单、宏变量 | — |
 | **FW3** | 错误词汇框架 | A2 | `CommandError`/`ConfigError` 分层、`KlippyError::Config`、`Internal` 收敛、handler/endpoint 异常 `catch_unwind` → `invoke_shutdown`、config 错走 `set_error_state`（`PrinterState::Error`） | 参数错报 `CommandError` 且不停机；坏配置 / connect 期 config 错报 `error`（可 RESTART）；panic 的 handler / endpoint 触发 `invoke_shutdown` | 全树的错误分支 | — |
-| **FW4** | G-Code 框架收尾（**完成**；`GCodeIO` 暂缓 `[~]`） | G1b（框架部分） | ~~参数访问器、`create_gcode_command`、`run_script_from_command`、`gcode:command_error` 触发~~ ✅；`GCodeIO` 输入抽象（伪 tty / 文件 / `stats gcodein` / `debuginput_exit`）**暂缓 `[~]`**（不做 OctoPrint 串口仿真）；`gcode:request_restart` 触发随 C1 | ~~`create_gcode_command` / 参数访问器~~ ✅；`GCodeIO` 暂缓（见 [FW4 笔记](docs/work-log/2026-09-21-fw4-notes.md)） | 全部 gcode extras（H3、H8…） | FW1、FW3（已满足） |
+| **FW4** | G-Code 框架收尾（**完成**；`GCodeIO` 暂缓 `[~]`） | G1b（框架部分） | ~~参数访问器、`create_gcode_command`、`run_script_from_command`、`gcode:command_error` 触发~~ ✅；`gcode:request_restart`（随 C1，现已可触发）仍待；`GCodeIO` 输入抽象（伪 tty / 文件 / `stats gcodein` / `debuginput_exit`）**暂缓 `[~]`**（不做 OctoPrint 串口仿真） | ~~`create_gcode_command` / 参数访问器~~ ✅；`GCodeIO` 暂缓（见 [FW4 笔记](docs/work-log/2026-09-21-fw4-notes.md)） | 全部 gcode extras（H3、H8…） | FW1、FW3（已满足） |
 | **FW5** | 运动框架（最重，**拆 FW5a–FW5f**） | C1（框架部分）、H12 | **FW5a** `Coord` + `clocksync` 回归；**FW5b** `Move`/`LookAheadQueue`/`trapq`；**FW5c** `itersolve` + `kin_cartesian`；**FW5d** `MotionQueuing`/`ToolHead`/`McuStepper`；**FW5e** `Kinematics` + `cartesian` + `[stepper_*]`/`[printer]` + `G1`；**FW5f** `stepcompress` 完整压缩 | host 单测 → 假 MCU（验收）；真板三轴 `G1`/`G28` 见 [`TESTING.md`](TESTING.md) T1/T3 | `kinematics/*` 其余、H9、H10、input shaper | FW1（已满足） |
 | **FW6** | 资源与触发框架（**FW6a–FW6e ✅（软件）**，FW6f `[~]`） | F3、F8 | **FW6a-1** ✅ 多 MCU 时基与运动输出（`McuClock`/对齐下放到 `McuChip`）；**FW6b** ✅ endstop/trsync/`stepper_stop_on_trigger` 命令层 + `MCU_endstop` + 多实例 `TriggerDispatch`/`MCU_trsync`（含跨 MCU 停轴与共享轴报错）；**FW6c** ✅ `Rail`/`endstop_pin`/`homing_*` + `query_endstops` + `query_endstops/status` + `M119`；**FW6d** ✅ `stepcompress` history/`find_past_position` + stepper 回零句柄；**FW6e** ✅ `Kinematics::home`/`HomingState` + `ToolHead::drip_move` + `G28`（软件）；**FW6f** `[~]` `MCU_bus_digital_out`（能力已由 `queue_digital_out` 提供，包装随 H8 显示） | ✅ FW6c（软件）：一个 endstop + `query_endstops/status`；FW6e（软件）：假 endstop 的 `G28`；次级时钟漂移：模拟 ±100 ppm/1h 已测（误差 <10 ms）；真板 `M119`/`G28`/实际晶振漂移见 [`TESTING.md`](TESTING.md) T2–T4 | homing/probe、运动同步 `SET_PIN` | FW5 |
-| **FW7** | MCU 与传输框架收尾 | B2、D3 | `emergency_stop` 对象（`klippy:shutdown` → 固件 `emergency_stop`）、本地 shutdown 标志、`emergency_stop` 端点、带载荷错误上报；RTO 定时重传与固件 `reset` 优先未做 | `emergency_stop` 端点使打印机进 shutdown；主机停机向固件发 `emergency_stop`，固件自报停机不回发 | TMC/传感器等资源 | — |
+| **FW7** | MCU 与传输框架收尾 | B2、D3 | `emergency_stop` 对象（`klippy:shutdown` → 固件 `emergency_stop`）、本地 shutdown 标志、`emergency_stop` 端点、`last_stats`、RTO 定时重传、固件 `reset` 优先均已落地；剩**带载荷错误上报的消费者**（`error_mcu`；事件已就位） | `emergency_stop` 端点使打印机进 shutdown；主机停机向固件发 `emergency_stop`，固件自报停机不回发 | TMC/传感器等资源 | — |
 | **FW8** | 主机层与重启框架 | D1、D2、Q6 | `--logfile`/rollover/Q6、`rpi_usb` 门控、CRC 物理复位、重启后订阅均已完成（代码）；剩 `StartArgs` 其余字段（`rpi_usb` 真机见 [`TESTING.md`](TESTING.md) T5） | `--logfile` 落盘、`error_exit` 非零、重启后订阅不断；真板 `last_stats` 已验 | 日志、Moonraker 兼容 | — |
 | **FW9** | API 框架收尾 | B4（框架部分） | `register_remote_method` 与推送、mux 端点注册机制、`emergency_stop` 端点 | `register_remote_method` + 推送 | `pause_resume/*`、`*/dump_*` 等消费者 | FW7 |
 
@@ -35,7 +35,8 @@
 > （对象模型 / MCU / 主机层）→ **FW4**（G-Code，依赖 FW1+FW3）✅（`GCodeIO` 暂缓 `[~]`）→ **FW5**（运动，最重，
 > 依赖 FW1）→ **FW6** → **FW9**。FW5 与 FW4 都依赖 FW1；FW6 等 FW5 的运动层，但 F8
 > （endstop/trsync）的接口与 FW5e 联合定，`G28` 的验收跨两者。
-> FW2/FW7/FW8 的剩余点见 FW8（`rpi_usb`/CRC/输出订阅）、B2（`last_stats`/RTO/固件 `reset`）。
+> FW2/FW7/FW8 的剩余点：FW7 只剩 `error_mcu` 消费者（错误上报的载荷事件已就位）；
+> FW8 只剩 `StartArgs` 其余字段/消费方（`rpi_usb` 真机见 `TESTING.md`）。
 > D2 的真板启动抖动已归档为**非阻塞观察项**（板/USB 链路层，复现不了），不再单独排期。
 
 > **真板验证已单列（不阻塞开发）**：需要真实 MCU / 外设才能做的验证都在
@@ -337,13 +338,14 @@ toolhead / 开放事件）一起补，一部分是现在就独立可补的小行
 `api-reference.md` 有、`endpoints/mod.rs` 的表里标「not started」的其余部分，各自等它读的
 对象先存在：
 
-- [ ] `emergency_stop`（`klippy/webhooks.py:322` `_handle_estop_request`）。
+- [x] `emergency_stop`（`klippy/webhooks.py:322` `_handle_estop_request`）：见 B2 / `api/endpoints/emergency_stop.rs`。
 - [ ] `register_remote_method`：方法表与推送（`klippy/webhooks.py:319` `:323` `:391`
-      `:412`）。
+      `:412`）。crate 侧机制已在（`klippy-api` 的 `register_remote_method`/`call_remote_method`），
+      core 的端点与「打印机事件 → 推送」还未接。
 - [ ] `pause_resume/{pause,resume,cancel}`：等 `pause_resume` 对象。
-- [ ] `query_endstops/status`：等 endstop / homing。
+- [x] `query_endstops/status`：FW6c 已落地（`api/endpoints/query_endstops.rs`）。
 - [ ] `bed_mesh/dump_mesh` 与 `*/dump_*` 多路复用端点（`klippy/webhooks.py:335`
-      `_handle_mux`）：等对应 extras（`bed_mesh`、`adxl345` 等）。
+      `_handle_mux`）：机制在 `klippy-api`（`MuxEndpoint`），core 未接；等对应 extras（`bed_mesh`、`adxl345` 等）。
 
 ### F MCU 基础资源（F3、F6–F9）
 

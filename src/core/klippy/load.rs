@@ -220,7 +220,7 @@ impl Printer {
                 let Some(section) = config.get_section(id) else {
                     continue;
                 };
-                self.register(load, entry, section, access, &mut claimed)?;
+                self.register(load, entry, section, config, access, &mut claimed)?;
             }
             for (id, entry) in factories.iter().filter(|(_, entry)| entry.phase == phase) {
                 let Some(load) = entry.load_config_prefix else {
@@ -233,7 +233,7 @@ impl Printer {
                     if section.sub.is_none() {
                         continue;
                     }
-                    self.register(load, entry, section, access, &mut claimed)?;
+                    self.register(load, entry, section, config, access, &mut claimed)?;
                 }
             }
         }
@@ -251,6 +251,7 @@ impl Printer {
         load: LoadConfig,
         entry: &Factories,
         section: &crate::core::klippy::config::ConfigSection,
+        config: &Config,
         access: &Arc<AccessTracking>,
         claimed: &mut Vec<String>,
     ) -> Result<(), ConfigError> {
@@ -272,9 +273,9 @@ impl Printer {
 
         let wrapper = match self.lookup_object_as::<PrinterConfig>(CONFIGFILE_OBJECT) {
             Some(configfile) => {
-                ConfigWrapper::with_configfile(section, Arc::clone(access), configfile)
+                ConfigWrapper::with_config(section, Arc::clone(access), Some(configfile), config)
             }
-            None => ConfigWrapper::new(section, Arc::clone(access)),
+            None => ConfigWrapper::with_config(section, Arc::clone(access), None, config),
         };
         let object = load(&wrapper, self)?;
         let name = entry.object.unwrap_or(identifier.as_str());

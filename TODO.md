@@ -241,11 +241,13 @@ FW5a–f / FW6a–f 已把「cartesian + 假 MCU 的 `G1`/`G28`」跑通并归�
 链**推广成通用运动层**。逐项证据、拍板点与上游对照见
 [C1 动工前调查](docs/work-log/2026-09-22-c1-notes.md)；这里只记要做的事。
 
-- [ ] **C1a 轴/stepper 抽象 + 多轴**：`Printer` 在 load 期暴露 `Config`/兄弟 section；
-      `PrinterStepper::setup_itersolve(position, active_flags)`（solver 由拥有者装）；
-      `Rail`（多 stepper 一轴 + homing info）与 `LookupMultiRail` 等价物；toolhead 按
-      kinematics 给的 rail 建轴。验收：`[stepper_z1]` 与 `[stepper_z]` 一起生成
-      `queue_step`。**不依赖 H1**；为 C1b/C1c/T6/S1 提供落点。
+- [x] **C1a 轴/stepper 抽象 + 多轴**：✅ 已完成。`ConfigWrapper::sibling`（`Printer` 的 loader
+      把整个 `Config` 传给工厂，兄弟 section 的 option 读取即认领）；`PrinterStepper::setup_itersolve`
+      （solver 由拥有者装，缺省回退到名字对应的 cartesian 轴）；`Rail`（`extras/stepper.rs`，
+      多 stepper 一轴 + `LookupMultiRail` 等价物）；toolhead 从 rail 建轴、为每个 stepper 装
+      cartesian solver。`[stepper_z1]`/`[stepper_z2]` 与 `[stepper_z]` 一起进 Z rail；同级 section
+      只读电机选项（`position_*`/`homing_*` 只在主段）。回归里 `Section 'stepper_z1'…` 消失，
+      首次失败前移到 `z_tilt`/`quad_gantry_level`（H9）。**不依赖 H1**；为 C1b/C1c/T6/S1 提供落点。
 - [ ] **C1b extruder 运动**：`MotionQueuing` 提为 host 对象 + `allocate_trapq`/per-stepper
       trapq；`motion` 层的 `trait ExtraAxis` 与 `LookAheadQueue`/`process_lookahead` 接线；
       `ExtruderStepper` + `extruder_stepper_alloc` 位置函数。heater 做成可注入接口
@@ -383,9 +385,10 @@ FW5a–f / FW6a–f 已把「cartesian + 假 MCU 的 `G1`/`G28`」跑通并归�
 - [x] **T8. `output_pin` 的 `value` 选项**（6 次失败）：✅ 已完成（阶段 0）。`value` 上界改为
       `scale`（PWM 才有 `scale`，默认 1），`scale` 不识别的问题随之消失。
 - [ ] **T9. 其余 extras 段**（20 次）：`bed_screws`、`dual_carriage`、`safe_z_home`、
-      `endstop_phase`、`adc_scaled`、`pwm_cycle_time`（随 C1）、`led`、`manual_stepper`、
-      `display`、`replicape`、`gcode_arcs`、`virtual_sdcard`、`stepper_z1`（多轴）。
-      按域归入 H1–H10。`static_digital_output` 已在阶段 0 落地（仍因后续缺节留在忽略列表）。
+      `endstop_phase`、`adc_scaled`、`pwm_cycle_time`（随 C1d）、`led`、`manual_stepper`、
+      `display`、`replicape`、`gcode_arcs`、`virtual_sdcard`。
+      按域归入 H1–H10。`static_digital_output` 已在阶段 0 落地，`stepper_z1`（多轴）已由
+      **C1a** 打开（相关运行的首次失败前移到 `z_tilt`/`quad_gantry_level`，属 H9）。
 - 备注：`printers.test` 有 2 条运行声明 `DICTIONARY pru.dict host=linuxprocess.dict`，默认不构建
       `pru`；要跑需 `KLIPPERX_ARCHES=…,pru`（需 `pru-gcc`）。
 

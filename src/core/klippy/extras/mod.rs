@@ -16,5 +16,6 @@ pub mod output_pin;
 pub mod query_endstops;
 pub mod spi_device;
 pub mod stepper;
+pub mod stepper_enable;
 pub mod temperature_sensor;
 pub mod toolhead;

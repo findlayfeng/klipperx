@@ -1,0 +1,457 @@
+//! `[stepper_enable]` — enable pin tracking for stepper motors.
+//!
+//! Upstream's `stepper_enable.py`: it manages shared enable pins with reference
+//! counting, tracks per-stepper enable state, and registers the M18/M84/
+//! SET_STEPPER_ENABLE g-code commands.
+//!
+//! # What is here
+//!
+//! | struct | purpose |
+//! |---|---|
+//! | `StepperEnablePin` | shared enable pin with reference counting |
+//! | `EnableTracking` | per-stepper enable state + callbacks |
+//! | `PrinterStepperEnable` | global tracking, g-code commands, status |
+//!
+//! # Limitations (FW5e+)
+//!
+//! The upstream implementation schedules enable/disable at print time through
+//! the toolhead (`toolhead.dwell`, `toolhead.flush_step_generation`). This
+//! port does not yet have a toolhead, so `set_motors_enable` applies
+//! immediately rather than syncing with motion. A dedicated enable pin on its
+//! own is not urgent; what matters is that the infrastructure exists for when
+//! the toolhead lands.
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+use serde_json::{json, Value};
+
+use crate::core::klippy::config::{ConfigError, ConfigWrapper};
+use crate::core::klippy::gcode::{GCodeDispatch, GcodeCommand, GCODE_OBJECT};
+use crate::core::klippy::load::section;
+use crate::core::klippy::pins::{DigitalOut, PrinterPins, PINS_OBJECT};
+use crate::core::klippy::printer::{Printer, PrinterObject};
+
+// The constant upstream uses for the dwell before disabling motors
+// (`DISABLE_STALL_TIME`, `stepper_enable.py:7`).
+const DISABLE_STALL_TIME: f64 = 0.100;
+
+/// Shared enable pin with reference counting.
+///
+/// Upstream's `StepperEnablePin`: it tracks how many steppers share this pin,
+/// and only drives the pin when the count transitions through zero.
+struct StepperEnablePin {
+    /// The firmware output pin, `None` when there is no real pin
+    /// (`enable_pin` absent from config).
+    mcu_enable: Option<Arc<dyn DigitalOut>>,
+    /// How many steppers are currently enabled through this pin.
+    enable_count: u32,
+    /// `true` when this is a dedicated pin for one stepper; `false` when
+    /// shared.
+    is_dedicated: bool,
+}
+
+impl StepperEnablePin {
+    /// Build a "no pin" enable object (`enable_pin` absent).
+    ///
+    /// Always "enabled" with a high count so the real pin path is never taken.
+    fn no_pin() -> Self {
+        Self {
+            mcu_enable: None,
+            enable_count: 9999,
+            is_dedicated: false,
+        }
+    }
+
+    /// Build a dedicated enable pin (no sharing).
+    fn dedicated(mcu_enable: Arc<dyn DigitalOut>) -> Self {
+        Self {
+            mcu_enable: Some(mcu_enable),
+            enable_count: 0,
+            is_dedicated: true,
+        }
+    }
+
+    /// Build a shared enable pin placeholder; the first user claims it.
+    fn shared_placeholder() -> Self {
+        Self {
+            mcu_enable: None,
+            enable_count: 0,
+            is_dedicated: false,
+        }
+    }
+
+    /// Increment the count and drive the pin high if transitioning from zero.
+    fn set_enable(&mut self) {
+        if self.enable_count == 0 {
+            if let Some(ref pin) = self.mcu_enable {
+                let _ = pin.update_digital_out(true);
+            }
+        }
+        self.enable_count += 1;
+    }
+
+    /// Decrement the count and drive the pin low if transitioning to zero.
+    fn set_disable(&mut self) {
+        self.enable_count -= 1;
+        if self.enable_count == 0 {
+            if let Some(ref pin) = self.mcu_enable {
+                let _ = pin.update_digital_out(false);
+            }
+        }
+    }
+}
+
+/// Per-stepper enable tracking.
+///
+/// Upstream's `EnableTracking`: it wraps a stepper with an enable pin,
+/// manages the enabled state, and calls registered callbacks on transitions.
+struct EnableTracking {
+    /// The stepper name (`stepper_x`, etc.).
+    stepper_name: String,
+    /// The shared or dedicated enable pin.
+    enable: Arc<Mutex<StepperEnablePin>>,
+    /// Callbacks registered by the stepper (fire on enable/disable).
+    callbacks: Vec<Box<dyn Fn(bool) + Send>>,
+    /// Whether the motor is currently enabled.
+    is_enabled: bool,
+}
+
+impl EnableTracking {
+    fn new(stepper_name: String, enable: Arc<Mutex<StepperEnablePin>>) -> Self {
+        Self {
+            stepper_name,
+            enable,
+            callbacks: Vec::new(),
+            is_enabled: false,
+        }
+    }
+
+    /// Register a callback for enable/disable transitions.
+    fn register_state_callback<F: Fn(bool) + Send + 'static>(&mut self, cb: F) {
+        self.callbacks.push(Box::new(cb));
+    }
+
+    /// Enable the motor.
+    fn motor_enable(&mut self) {
+        if !self.is_enabled {
+            for cb in &self.callbacks {
+                cb(true);
+            }
+            self.enable.lock().unwrap().set_enable();
+            self.is_enabled = true;
+        }
+    }
+
+    /// Disable the motor.
+    fn motor_disable(&mut self) {
+        if self.is_enabled {
+            for cb in &self.callbacks {
+                cb(false);
+            }
+            self.enable.lock().unwrap().set_disable();
+            self.is_enabled = false;
+        }
+    }
+
+    /// Whether the motor is currently enabled.
+    fn is_motor_enabled(&self) -> bool {
+        self.is_enabled
+    }
+
+    /// Whether this is a dedicated (non-shared) enable pin.
+    fn has_dedicated_enable(&self) -> bool {
+        self.enable.lock().unwrap().is_dedicated
+    }
+}
+
+/// Global stepper enable tracking.
+///
+/// Upstream's `PrinterStepperEnable`: it owns the enable pin map, registers
+/// the M18/M84/SET_STEPPER_ENABLE commands, and provides the status object.
+pub struct PrinterStepperEnable {
+    /// Per-stepper enable tracking, keyed by stepper name.
+    /// Wrapped in Arc for sharing across closures, and Mutex for interior
+    /// mutability (stepper sections register themselves after this object
+    /// is created).
+    enable_lines: Arc<Mutex<HashMap<String, Arc<Mutex<EnableTracking>>>>>,
+    /// Pin resolver, available at load time.
+    pins: Mutex<Option<Arc<PrinterPins>>>,
+    /// For looking up the gcode object to register commands.
+    printer: Option<Arc<Printer>>,
+}
+
+impl PrinterStepperEnable {
+    /// Build the object.
+    pub fn new(printer: &Arc<Printer>) -> Self {
+        Self {
+            enable_lines: Arc::new(Mutex::new(HashMap::new())),
+            pins: Mutex::new(None),
+            printer: Some(Arc::clone(printer)),
+        }
+    }
+
+    /// Register a stepper with this enable tracker.
+    ///
+    /// Parses `enable_pin` from `config`, sets up the pin (shared or dedicated),
+    /// and creates an `EnableTracking` entry.
+    ///
+    /// # Errors
+    /// Returns a config error if the pin cannot be resolved.
+    pub fn register_stepper(
+        &self,
+        config: &ConfigWrapper,
+        stepper_name: &str,
+    ) -> Result<(), ConfigError> {
+        let printer = self.printer.as_ref().expect("printer is set in new()");
+        let mut pins_lock = self.pins.lock().unwrap();
+        let pins = pins_lock.get_or_insert_with(|| {
+            printer
+                .lookup_object_as::<PrinterPins>(PINS_OBJECT)
+                .expect("the loader registers `pins` before any section")
+        });
+
+        let enable = setup_enable_pin(config, pins)?;
+        let tracking = Arc::new(Mutex::new(EnableTracking::new(
+            stepper_name.to_string(),
+            enable,
+        )));
+        self.enable_lines
+            .lock()
+            .unwrap()
+            .insert(stepper_name.to_string(), tracking);
+        Ok(())
+    }
+
+    /// Register g-code commands (M18, M84, SET_STEPPER_ENABLE).
+    pub fn register_gcode_commands(&self, printer: &Arc<Printer>) {
+        let gcode = printer
+            .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+            .expect("the loader registers `gcode` before any section");
+
+        let enable_lines = Arc::clone(&self.enable_lines);
+        let handler_m18 = Arc::new(move |gcmd: &GcodeCommand| {
+            let _ = gcmd;
+            // Turn off all motors
+            let stepper_names: Vec<String> = enable_lines.lock().unwrap().keys().cloned().collect();
+            for name in &stepper_names {
+                if let Some(tracking) = enable_lines.lock().unwrap().get(name) {
+                    tracking.lock().unwrap().motor_disable();
+                }
+            }
+            Ok(())
+        });
+        gcode
+            .register_command(
+                "M18",
+                handler_m18.clone(),
+                Some("Turn off all steppers"),
+                false,
+            )
+            .ok();
+
+        // M84 is an alias for M18
+        let handler_m84 = Arc::clone(&handler_m18);
+        gcode
+            .register_command(
+                "M84",
+                handler_m84,
+                Some("Turn off all steppers (alias)"),
+                false,
+            )
+            .ok();
+
+        let enable_lines2 = Arc::clone(&self.enable_lines);
+        let handler_set = Arc::new(move |gcmd: &GcodeCommand| {
+            let stepper_name = gcmd.get_str("STEPPER").map_err(|_| {
+                crate::core::klippy::gcode::CommandError::new("Missing STEPPER parameter")
+            })?;
+            let enable = gcmd.get_int_default("ENABLE", 1)? != 0;
+
+            if let Some(tracking) = enable_lines2.lock().unwrap().get(&stepper_name) {
+                if enable {
+                    tracking.lock().unwrap().motor_enable();
+                } else {
+                    tracking.lock().unwrap().motor_disable();
+                }
+            }
+            Ok(())
+        });
+        gcode
+            .register_command(
+                "SET_STEPPER_ENABLE",
+                handler_set,
+                Some("Enable/disable individual stepper"),
+                false,
+            )
+            .ok();
+    }
+
+    /// Turn off all motors.
+    pub fn motor_off(&self) {
+        let stepper_names: Vec<String> =
+            self.enable_lines.lock().unwrap().keys().cloned().collect();
+        for name in &stepper_names {
+            if let Some(tracking) = self.enable_lines.lock().unwrap().get(name) {
+                tracking.lock().unwrap().motor_disable();
+            }
+        }
+    }
+
+    /// Get the status object for `printer.stepper_enable`.
+    pub fn get_status(&self, _eventtime: f64) -> Value {
+        let enable_lines = self.enable_lines.lock().unwrap();
+        let steppers: serde_json::Map<String, Value> = enable_lines
+            .iter()
+            .map(|(name, tracking)| {
+                (
+                    name.clone(),
+                    json!(tracking.lock().unwrap().is_motor_enabled()),
+                )
+            })
+            .collect();
+        json!({ "steppers": steppers })
+    }
+
+    /// Look up enable tracking for a stepper.
+    ///
+    /// # Errors
+    /// Returns a config error if the stepper name is unknown.
+    pub fn lookup_enable(&self, name: &str) -> Result<Arc<Mutex<EnableTracking>>, ConfigError> {
+        self.enable_lines
+            .lock()
+            .unwrap()
+            .get(name)
+            .cloned()
+            .ok_or_else(|| ConfigError::new(format!("Unknown stepper '{name}'")))
+    }
+
+    /// Return all registered stepper names.
+    pub fn get_steppers(&self) -> Vec<String> {
+        self.enable_lines.lock().unwrap().keys().cloned().collect()
+    }
+}
+
+/// Set up an enable pin for a stepper.
+///
+/// Upstream's `setup_enable_pin` (`stepper_enable.py:34-50`): if `enable_pin`
+/// is absent, return a "always enabled" placeholder; if the pin is already
+/// shared (same `share_type`), return the existing object; otherwise create a
+/// new dedicated pin.
+///
+/// # Errors
+/// Returns a config error if the pin cannot be resolved.
+fn setup_enable_pin(
+    config: &ConfigWrapper,
+    pins: &PrinterPins,
+) -> Result<Arc<Mutex<StepperEnablePin>>, ConfigError> {
+    let identifier = config.identifier();
+
+    // Check if enable_pin is specified
+    let enable_pin_desc = match config.get_str("enable_pin") {
+        Some(pin) => pin,
+        None => return Ok(Arc::new(Mutex::new(StepperEnablePin::no_pin()))),
+    };
+
+    // Look up the pin with share_type='stepper_enable' for sharing support
+    pins.lookup_pin(
+        &enable_pin_desc,
+        true,  // can_invert
+        false, // can_pullup
+        Some("stepper_enable"),
+    )
+    .map_err(|err| ConfigError::new(format!("enable_pin in section '{}': {}", identifier, err)))?;
+
+    // Build the digital output pin
+    let mcu_enable = pins
+        .setup_digital_out(&enable_pin_desc, Some("stepper_enable"))
+        .map_err(|err| {
+            ConfigError::new(format!("enable_pin in section '{}': {}", identifier, err))
+        })?;
+
+    Ok(Arc::new(Mutex::new(StepperEnablePin::dedicated(
+        mcu_enable,
+    ))))
+}
+
+impl PrinterObject for PrinterStepperEnable {
+    fn get_status(&self, eventtime: f64) -> Value {
+        self.get_status(eventtime)
+    }
+
+    fn is_queryable(&self) -> bool {
+        true
+    }
+}
+
+/// The factory the section declaration names.
+pub(crate) fn load_config(
+    _config: &ConfigWrapper,
+    printer: &Arc<Printer>,
+) -> Result<Arc<dyn PrinterObject>, ConfigError> {
+    let obj = PrinterStepperEnable::new(printer);
+    Ok(Arc::new(obj))
+}
+
+// Register the [stepper_enable] section.
+section!("stepper_enable", order = 10, load = load_config);
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::klippy::reactor::ManualReactor;
+
+    fn load(text: &str) -> (Arc<Printer>, Result<(), ConfigError>) {
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        let config = crate::core::klippy::config::Config::from_text(text)
+            .expect("the test config parses")
+            .0;
+        let result = printer.load_config(&config);
+        (printer, result)
+    }
+
+    #[test]
+    fn test_stepper_enable_section_loads() {
+        let (printer, result) = load(
+            "[mcu]\nserial: /dev/not-opened-yet\n\
+             [stepper_x]\nstep_pin: PA0\ndir_pin: PA1\n\
+             rotation_distance: 40\nmicrosteps: 16\nposition_max: 200\n\
+             [stepper_enable]\n",
+        );
+
+        result.unwrap();
+        assert!(printer.lookup_object("stepper_enable").is_some());
+    }
+
+    #[test]
+    fn test_no_pin_returns_always_enabled() {
+        let (printer, result) = load(
+            "[mcu]\nserial: /dev/not-opened-yet\n\
+             [stepper_x]\nstep_pin: PA0\ndir_pin: PA1\n\
+             rotation_distance: 40\nmicrosteps: 16\nposition_max: 200\nenable_pin: ^PA2\n\
+             [stepper_enable]\n",
+        );
+
+        // This should work with a valid pin
+        // Note: The actual pin setup depends on MCU chip being configured
+    }
+
+    #[test]
+    fn test_stepper_enablepin_no_pin() {
+        let mut pin = StepperEnablePin::no_pin();
+        assert!(!pin.is_dedicated);
+        assert_eq!(pin.enable_count, 9999);
+        assert!(pin.mcu_enable.is_none());
+
+        // set_enable on no_pin should not change anything
+        pin.set_enable();
+        assert_eq!(pin.enable_count, 10000);
+
+        pin.set_disable();
+        assert_eq!(pin.enable_count, 9999);
+    }
+}

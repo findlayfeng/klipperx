@@ -321,6 +321,7 @@ mod tests {
             ids,
             [
                 "mcu",
+                "stepper_enable",
                 "output_pin",
                 "stepper_x",
                 "stepper_y",

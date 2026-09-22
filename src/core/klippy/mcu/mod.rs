@@ -1161,6 +1161,15 @@ impl Mcu {
     ///
     /// # Errors
     /// Returns [`McuError::Msg`] if no message called `name` is registered.
+    /// Drop every inbound callback (see [`McuEvents::clear`]).
+    ///
+    /// The machine's parts call this as they are torn down, so the callbacks
+    /// stop keeping their resources — and, through the resources' transport
+    /// handle, the `Mcu` itself — alive after the machine is gone.
+    pub(crate) fn clear_events(&self) {
+        self.events.clear();
+    }
+
     pub(crate) fn bind_callback(
         &self,
         name: &str,
@@ -1185,6 +1194,7 @@ impl Drop for Mcu {
     /// [`Interface::shutdown`] first unblocks that read; the abort then
     /// guarantees the task itself is torn down promptly.
     fn drop(&mut self) {
+        eprintln!("MCU DROP {}", self.name);
         self.interface.shutdown();
         if let Some(handle) = self.recv_handle.take() {
             handle.abort();

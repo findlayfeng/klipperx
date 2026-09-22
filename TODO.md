@@ -221,19 +221,21 @@ toolhead / 开放事件）一起补，一部分是现在就独立可补的小行
 
 ##### F8b `Mcu` ↔ 资源的强引用环（阻塞回归）
 
-- [ ] **现状（2026-09-22 查实）**：`Mcu` → `Parser` 的事件回调 → `TrsyncRegistry` →
-      `McuTrsync` → `McuChip`（**值拷贝**，内含 `mcu: Arc<Mutex<Option<Arc<Mcu>>>>` 与
-      `clock → McuClock{mcu: Arc<Mcu>}`）→ `Arc<Mcu>`，形成强引用环。所以任何**带 endstop**
-      的配置在配置构建期注册 `ConfigTrsync` 之后，`Mcu::Drop` 永不运行；`Mcu` 的阻塞
-      device read（`spawn_blocking`，不可 abort）驻留 → **runtime 关停卡死**。
-      默认套件不受影响（`linuxtest` 无 endstop），但 `KLIPPERX_UPSTREAM_ALL=1` 必卡：
-      实测 `G28`（假 MCU 已能回 `trsync_state`/`endstop_state`）后进程不退出。
-- [ ] **修法**：照 `McuChip.pins: Weak` 的既有做法，把资源对 `Mcu` 的反向引用改弱：
-      `McuChip.mcu` 与 `McuClock.mcu` 改 `Weak<Mcu>`（由 `McuObject` 持强引用）；
-      `McuTrsync` 不再持整份 `McuChip`（只需 name + mcu + clock）；
-      `TrsyncRegistry` 的 `bind_event` 回调改持 `Weak<TrsyncRegistry>`。
-- [ ] **验收**：假 MCU 上一个带 endstop 的 `G28` 端到端跑通且进程干净退出；
-      `KLIPPERX_UPSTREAM_ALL=1` 不再卡。估时 1–2 天（连同假 MCU 回零一起验收）。
+- [x] **环已断（2026-09-22）**：
+      - `McuTrsync` 不再持整份 `McuChip`（后者含 `Arc<TrsyncRegistry>`，与 registry 互为强
+        引用），改持 `TrsyncChip`（name + mcu 槽 + clock 槽 + print-time mapping）；注册用的
+        registry 只在 config 回调里捕获。
+      - `McuEvents::clear` + `Mcu::clear_events`，`McuObject::Drop` 在落下前清空回调表，断开
+        `Mcu → events → resource → Arc<Mcu>`。
+      - 回零 drip 的 `sleep` 与 `completion.wait()` 用 `select!` 竞赛，避免丢唤醒。
+      - 验收：`a_homing_move_runs_against_the_fake_firmware`（带 endstop 的 `G28` 跑通且
+        进程干净退出，释放后 `Mcu::Drop` 运行）；默认套件绿。
+- [ ] **剩余（另一个时序问题，与环无关）**：`KLIPPERX_UPSTREAM_ALL=1` 在 `commands.test`
+      （`QUERY_ENDSTOPS` → `M18` → `G28`）仍**间歇**卡住（约一半）；已复现：只要 `G28` 前
+      有 `QUERY_ENDSTOPS` 就更容易卡。两个处理器都用
+      `block_in_place + Handle::block_on`，怀疑与「同步 g-code 处理器内嵌 block_on」
+      及假 MCU 即时响应有关。要么改用专用 runtime/任务 + 通道驱动这两个异步动作，
+      要么在回归里暂时跳过回零。
 
 #### F9 其他输入与外设资源
 

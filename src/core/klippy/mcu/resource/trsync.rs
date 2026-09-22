@@ -29,7 +29,7 @@ use std::sync::{Arc, Mutex, Weak};
 
 use tokio::sync::Notify;
 
-use super::pin::McuChip;
+use super::pin::{McuChip, TrsyncChip};
 use super::stepper::McuStepper;
 use crate::core::klippy::cmd::stepper::StepperStopOnTrigger;
 use crate::core::klippy::cmd::trsync::{
@@ -156,7 +156,7 @@ impl TriggerGroup {
 pub struct McuTrsync {
     /// The oid `config_trsync` assigned.
     oid: u8,
-    chip: McuChip,
+    chip: TrsyncChip,
     group: Weak<TriggerGroup>,
     /// The steps that stop when the group fires, with the name their rail uses
     /// (for the multi-MCU shared-axis check).
@@ -180,9 +180,15 @@ impl McuTrsync {
     fn new(chip: McuChip, group: Weak<TriggerGroup>) -> Result<Arc<Self>, McuError> {
         let builder: Arc<ConfigBuilder> = chip.config();
         let oid = builder.create_oid()?;
+        // The registry is captured for the config callback only. Storing it —
+        // or the whole chip that owns it — in the trsync would make
+        // `registry ↔ trsync` a strong cycle and keep the connected `Mcu`
+        // alive forever (TODO F8b).
+        let registry = chip.trsync_registry();
+        let trsync_chip = chip.trsync_chip();
         let trsync = Arc::new(Self {
             oid,
-            chip: chip.clone(),
+            chip: trsync_chip,
             group,
             steppers: Mutex::new(Vec::new()),
             expire_clock: Mutex::new(0),
@@ -194,7 +200,6 @@ impl McuTrsync {
         let registered = Arc::clone(&trsync);
         builder.register_config_callback(Box::new(move |builder, mcu| {
             builder.add_config_cmd(&ConfigTrsync { oid })?;
-            let registry = registered.chip.trsync_registry();
             registry.register(Arc::clone(&registered), mcu)
         }))?;
         Ok(trsync)
@@ -718,9 +723,10 @@ mod tests {
         // A report with an unknown oid is dropped; the registered one reaches
         // its trsync.
         let mcu = identified_mcu("mcu");
-        let dispatch = TriggerDispatch::new(vec![chip("mcu", Arc::clone(&mcu))]).unwrap();
+        let chip = chip("mcu", Arc::clone(&mcu));
+        let dispatch = TriggerDispatch::new(vec![chip.clone()]).unwrap();
         let trsync = first(&dispatch);
-        let registry = trsync.chip.trsync_registry();
+        let registry = chip.trsync_registry();
         registry.register(Arc::clone(&trsync), &mcu).unwrap();
 
         registry.route(TrsyncState {
@@ -748,10 +754,8 @@ mod tests {
         let tx = first(&x);
         let ty = first(&y);
         assert_ne!(tx.oid, ty.oid, "two endstops must not share an oid");
-        assert!(Arc::ptr_eq(
-            &tx.chip.trsync_registry(),
-            &ty.chip.trsync_registry()
-        ));
+        // Both trsyncs belong to the same MCU, so they share its one registry.
+        assert_eq!(tx.chip.name(), ty.chip.name());
 
         let registry = chip.trsync_registry();
         registry.register(Arc::clone(&tx), &mcu).unwrap();

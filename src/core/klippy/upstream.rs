@@ -293,11 +293,19 @@ mod tests {
     /// gets fixed leaves a stale entry (and a green run that the suite hides).
     /// This runs every ignored case — its dictionaries permitting — and fails
     /// when **all** of a file's runs pass, which is the point at which the entry
-    /// should be dropped. `KLIPPERX_UPSTREAM_ALL=1` runs everything and reports
-    /// failures instead, so the guard stands down then.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn ignored_cases_still_fail() {
-        if std::env::var_os("KLIPPERX_UPSTREAM_ALL").is_some() {
+    /// should be dropped.
+    ///
+    /// **Opt-in**: set `KLIPPERX_UPSTREAM_GUARD=1`. It is **load-only** (no
+    /// connect, no g-code): a fake MCU never trips a homing endstop, so running
+    /// a case's `G28` would block the synchronous dispatcher and leak the
+    /// machine; and a case that loads may still fail at run time. It therefore
+    /// reports candidates to verify, not proven-green cases.
+    #[test]
+    fn ignored_cases_still_fail() {
+        use crate::core::klippy::printer::Printer;
+        use crate::core::klippy::reactor::ManualReactor;
+
+        if std::env::var_os("KLIPPERX_UPSTREAM_GUARD").is_none() {
             return;
         }
         let mut by_file: std::collections::BTreeMap<String, Vec<UpstreamRun>> =
@@ -317,28 +325,43 @@ mod tests {
                 continue;
             }
             let mut any_runnable = false;
-            let mut all_pass = true;
+            let mut all_load = true;
             for run in runs {
                 let dictionaries = run_dictionaries(run);
                 if dictionaries.iter().any(|(_, path)| path.is_none()) {
                     // A run without its dictionary cannot be judged either way.
-                    all_pass = false;
+                    all_load = false;
                     continue;
                 }
                 any_runnable = true;
-                if run_case(run, &dictionaries).await.is_err() {
-                    all_pass = false;
+                let mut resolved = Vec::with_capacity(dictionaries.len());
+                for (mcu, path) in &dictionaries {
+                    if let Some(path) = path {
+                        resolved.push((mcu.clone(), path.clone()));
+                    }
+                }
+                let loaded = match injected_config(&run.config, &resolved) {
+                    Ok(config) => {
+                        // `ManualReactor` runs no tasks: `load_config` alone
+                        // opens nothing and spawns nothing.
+                        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+                        printer.load_config(&config).is_ok()
+                    }
+                    Err(_) => false,
+                };
+                if !loaded {
+                    all_load = false;
                     break;
                 }
             }
-            if any_runnable && all_pass {
+            if any_runnable && all_load {
                 stale.push(file.clone());
             }
         }
 
         assert!(
             stale.is_empty(),
-            "{} IGNORED case(s) now pass; remove them from IGNORED: {stale:?}",
+            "{} IGNORED case(s) now load; verify their g-code and remove them from IGNORED: {stale:?}",
             stale.len()
         );
     }

@@ -25,10 +25,12 @@
 //!
 //! [`register`] installs the server's own object and every endpoint that is
 //! written: `webhooks`, `info`, `objects/list`, `objects/query`,
-//! `objects/subscribe`, and the five `gcode/*` endpoints. The rest of the
-//! documented surface — `emergency_stop`, `register_remote_method`,
-//! `pause_resume/*` and the `*/dump_*` mux endpoints — is not written, so
-//! `list_endpoints` reports ten paths besides the built-in.
+//! `objects/subscribe`, the five `gcode/*` endpoints, `emergency_stop`,
+//! `query_endstops/status` and `register_remote_method`. The `*/dump_*` mux
+//! endpoints are installed through the `webhooks` object —
+//! [`WebhooksStatus::register_mux_endpoint`] — once an extras module registers
+//! one. What is left of the documented surface is `pause_resume/*`, which waits
+//! for the `pause_resume` object.
 //!
 //! The public reference for the endpoints themselves (paths, parameters,
 //! response fields) is `docs/klippy/third-party-dev/api-reference.md`; keep the
@@ -109,12 +111,7 @@ pub fn register(
     printer: &Arc<Printer>,
     start_args: StartArgs,
 ) -> Result<(), RegistrationError> {
-    printer
-        .add_object(
-            WEBHOOKS_OBJECT,
-            Arc::new(WebhooksStatus::new(Arc::clone(printer))),
-        )
-        .map_err(RegistrationError::Status)?;
+    let webhooks = webhooks::install(printer).map_err(RegistrationError::Status)?;
     // A request handler that fails on its own account takes the printer down,
     // as upstream's `_process_request` does (`klippy/webhooks.py:271-276`). The
     // decision belongs to the host, so the API crate only knows the hook.
@@ -128,6 +125,19 @@ pub fn register(
     };
     for install in ENDPOINT_INSTALLERS {
         install(api, &wiring)?;
+    }
+    // Mux endpoints are registered by modules on the `webhooks` object while
+    // the config is read, and the host builds this table afterwards, so what
+    // they collected goes in here. Upstream registers the path on the first
+    // instance (`klippy/webhooks.py:330-334`).
+    for registration in webhooks.take_mux_endpoints() {
+        api.register_mux(
+            &registration.path,
+            &registration.key,
+            registration.value.as_deref(),
+            registration.handler,
+        )
+        .map_err(RegistrationError::Endpoint)?;
     }
     Ok(())
 }
@@ -206,6 +216,7 @@ mod tests {
                 "objects/query",
                 "objects/subscribe",
                 "query_endstops/status",
+                "register_remote_method",
             ]
         );
     }
@@ -222,6 +233,62 @@ mod tests {
 
         assert_eq!(response["state"], "startup");
         assert_eq!(response["config_file"], "/tmp/printer.cfg");
+    }
+
+    #[test]
+    fn test_a_mux_endpoint_registered_on_webhooks_reaches_the_table() {
+        // The core integration: an extras module registers a mux endpoint on the
+        // `webhooks` object while the config is read, and `register` installs it
+        // into the API table afterwards.
+        struct Dump(&'static str);
+
+        impl crate::core::klippy::api::registry::MuxEndpoint for Dump {
+            fn handle(
+                &self,
+                _request: &klippy_api::Request,
+                _context: &EndpointContext<'_>,
+            ) -> Result<serde_json::Value, crate::core::klippy::api::protocol::ApiError>
+            {
+                Ok(json!({"instance": self.0}))
+            }
+        }
+
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        // Installed before the config, as the host does.
+        let webhooks = crate::core::klippy::api::webhooks::install(&printer).unwrap();
+        webhooks
+            .register_mux_endpoint(
+                "adxl345/dump_adxl345",
+                "sensor",
+                Some("adxl345"),
+                Arc::new(Dump("adxl345")),
+            )
+            .unwrap();
+        webhooks
+            .register_mux_endpoint(
+                "adxl345/dump_adxl345",
+                "sensor",
+                Some("second"),
+                Arc::new(Dump("second")),
+            )
+            .unwrap();
+        let mut api = Api::new();
+        register(&mut api, &printer, start_args()).unwrap();
+
+        let response = api
+            .dispatch(
+                &request(
+                    r#"{"method":"adxl345/dump_adxl345",
+                       "params":{"sensor":"second"}}"#,
+                ),
+                silent_target(),
+            )
+            .unwrap();
+
+        assert_eq!(response, json!({"instance": "second"}));
+        assert!(api
+            .endpoints()
+            .contains(&"adxl345/dump_adxl345".to_string()));
     }
 
     #[test]
@@ -261,12 +328,14 @@ mod tests {
         let mut api = Api::new();
         register(&mut api, &printer, start_args()).unwrap();
 
+        // `webhooks` is idempotent (a host may install it before the config),
+        // so the second pass trips on the endpoint paths a first pass took.
         let err = register(&mut api, &printer, start_args()).unwrap_err();
 
         assert!(
-            matches!(err, RegistrationError::Status(_)),
-            "the object is registered before the endpoints: {err}"
+            matches!(err, RegistrationError::Endpoint(_)),
+            "the endpoints are registered after the object: {err}"
         );
-        assert!(err.to_string().contains("webhooks"), "{err}");
+        assert!(err.to_string().contains("emergency_stop"), "{err}");
     }
 }

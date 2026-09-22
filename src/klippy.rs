@@ -4,7 +4,10 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
-use crate::core::klippy::api::{self, AddressError, Api, ApiTarget, Server, StartArgs};
+use crate::core::klippy::api::{
+    self, AddressError, Api, ApiTarget, RegistrationError, Server, StartArgs, WebhooksStatus,
+    WEBHOOKS_OBJECT,
+};
 use crate::core::klippy::config::Config;
 use crate::core::klippy::printer::Printer;
 use crate::core::klippy::reactor::TokioReactor;
@@ -304,11 +307,14 @@ pub fn run(
         .build()?;
 
     api_runtime.block_on(async move {
-        // The server's own object (`webhooks`) and the endpoints come first, so
-        // that `objects/list` starts with `webhooks` as upstream's does
-        // (`klippy/klippy.py:36-40`) and no path is half-built when a request
-        // arrives. Everything is registered before the listener is bound.
-        let mut api = Api::new();
+        // The server's own object (`webhooks`) is registered before the config
+        // is read, because that is how an extras module reaches the server
+        // while it loads: `[adxl345]` registers `adxl345/dump_adxl345` on it
+        // (upstream adds the object in `Printer.__init__`,
+        // `klippy/klippy.py:36-40`). The endpoint table itself is built after
+        // the read, so the mux endpoints it collected can go into it.
+        api::webhooks::install(&printer).map_err(RegistrationError::Status)?;
+
         // The start arguments are host data: the printer keeps a copy (upstream
         // `printer.start_args`, `klippy/klippy.py:30`) so that modules such as
         // `M115` and `error_mcu` can read them, and the API reports the same
@@ -316,22 +322,6 @@ pub fn run(
         let mut start_args = StartArgs::collect(config_file.clone(), args.log_file.clone());
         start_args.apiserver = Some(args.api_server.clone());
         printer.set_start_args(Arc::new(start_args.clone()));
-        api::register(&mut api, &printer, start_args)?;
-        let api = Arc::new(api);
-
-        let server = match target {
-            None => {
-                info!("Empty --api-server: not starting the API server");
-                None
-            }
-            Some(target) => {
-                let server = Server::bind(target, Arc::clone(&api)).await?;
-                // `target` is resolved by the bind, so a `tcp:…:0` port is
-                // reported as the one the kernel chose.
-                info!("API server listening on {}", server.target());
-                Some(tokio::spawn(server.run()))
-            }
-        };
 
         debug!(
             "Klippy process started with {} sections",
@@ -350,6 +340,34 @@ pub fn run(
                 printer.set_error_state(&format!("{err}"));
             }
         }
+
+        // The API table comes after the config, so that the mux endpoints the
+        // modules registered on `webhooks` are part of it before any client can
+        // send a request. Everything is registered before the listener is
+        // bound.
+        let mut api = Api::new();
+        api::register(&mut api, &printer, start_args)?;
+        let api = Arc::new(api);
+        // Hand the table to the `webhooks` object, which is how a module pushes
+        // to a connection that registered a remote method
+        // (`call_remote_method`).
+        if let Some(webhooks) = printer.lookup_object_as::<WebhooksStatus>(WEBHOOKS_OBJECT) {
+            webhooks.set_api(Arc::clone(&api));
+        }
+
+        let server = match target {
+            None => {
+                info!("Empty --api-server: not starting the API server");
+                None
+            }
+            Some(target) => {
+                let server = Server::bind(target, Arc::clone(&api)).await?;
+                // `target` is resolved by the bind, so a `tcp:…:0` port is
+                // reported as the one the kernel chose.
+                info!("API server listening on {}", server.target());
+                Some(tokio::spawn(server.run()))
+            }
+        };
 
         // The operator's interrupt is a host concern, so it runs on the API
         // runtime; it only asks the printer to exit, and `request_exit` is a

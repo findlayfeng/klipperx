@@ -85,7 +85,7 @@ H1–H12 是[上游功能覆盖审计](docs/work-log/2026-09-21-upstream-coverag
 | # | 事项 | 依赖 |
 |---|---|---|
 | C1 | toolhead 与 kinematics ✅（FW5） | — |
-| C2 | 配置装载：框架部分 ✅（FW1，含 choice/range 文案）；autosave/`SAVE_CONFIG`/`deprecate` 仍待（属模块） | C1 |
+| C2 | 配置装载：框架部分 ✅（FW1，含 choice/range 文案与 `deprecate` 警告）；autosave/`SAVE_CONFIG` 仍待（属模块） | C1 |
 | A2 | 错误词汇 ✅（FW3） | — |
 | B2 | MCU：`emergency_stop` 对象/端点、`last_stats`、错误载荷 + `error_mcu`、本地 shutdown 标志、固件 `reset` ✅（FW7） | — |
 | D1 | 主机层 start args / rollover / `--logfile` ✅（FW8，`StartArgs` 已补全） | — |
@@ -540,8 +540,13 @@ kinematics 已随 Printer 重构删除，从这里重新开始。动工前调查
 - [x] **`configfile` 对象**：`get_status` 的 `settings`/`config`/`warnings` 已接，`objects/list` 可见。
 - [x] **`[printer]` / toolhead 本体**：晚阶段住户已接入（`section!("printer", phase = late,
       object = "toolhead", …)`），消费者是 C1 的 toolhead（FW5e-2）。
-- [ ] **autosave / `SAVE_CONFIG` / `deprecate`**：`configfile` 的剩余状态与写入路径，
-      属模块而非框架，单列（依赖 FW1）。
+- [x] **`deprecate`**：`PrinterConfig` 的 `deprecate` / `deprecate_gcode` / `deprecate_mcu_code` /
+      `runtime_warning` 与按序列化键去重已落地，`configfile` 状态 `warnings` 据此填充；
+      `ConfigWrapper::deprecate` 只对写过的选项生效，装载器把 `configfile` 对象带进 wrapper
+      （`config/object.rs`、`config/wrapper.rs`、`load.rs`）。消费点随各 extras 补。
+- [ ] **autosave / `SAVE_CONFIG`**：`#*#` 自动保存区块的读取（并入配置、与 include 冲突检查、
+      损坏检测）与回写（`SAVE_CONFIG` 命令、备份、重启），属模块而非框架；`bed_tilt` / PID /
+      `probe_eddy_current` 等消费者都依赖它（上游 `klippy/configfile.py:248`、`:346`）。
 - [ ] **`getchoice` 与范围/列表上限**：wrapper 目前只做类型解析 + 两个自定义范围检查；
       上游的 `minval/maxval/above/below/count` 统一文案随各 extras 的 option schema 补。
 

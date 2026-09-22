@@ -310,6 +310,8 @@ API 本身在 `crates/klippy-api/src/`：
 - [压力测试（`klipperx stress`）](stress.md) — 给一块 MCU 逐步加大步进或链路负载，直到它出错
 - [内部架构](architecture.md) — 传输层与 TRACE 日志的开启方式、收发任务、合并发送、路由优先级、性能特性
 - [测试](testing.md) — 测试覆盖与运行方式
+- [klippy 运行机制](klippy-runtime.md) — 对象图、状态机、reactor 回调模型、事件与数据流
+- [回归测试（`.test` 与数据字典）](regression-tests.md) — 上游主机回归测试的「文件输出 + 数据字典」模式、语料结构与复用分层
 
 ---
 

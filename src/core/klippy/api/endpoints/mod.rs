@@ -29,9 +29,9 @@
 //! | `gcode/help`, `gcode/script`, `gcode/restart`, `gcode/firmware_restart` | done ([`gcode`]) |
 //! | `gcode/subscribe_output` | done ([`gcode`]) |
 //! | `emergency_stop` | done ([`emergency_stop`]) |
+//! | `query_endstops/status` | done ([`query_endstops`]) |
 //! | `register_remote_method` | not started |
 //! | `pause_resume/{pause,resume,cancel}` | not started |
-//! | `query_endstops/status` | not started |
 //! | `bed_mesh/dump_mesh` | not started |
 //! | the `*/dump_*` mux endpoints | not started |
 

@@ -16,7 +16,8 @@
 //!
 //! [`info`](info), [`objects/list`](objects_list), [`objects/query`](objects_query),
 //! [`objects/subscribe`](objects_subscribe), the five [`gcode`](gcode)
-//! endpoints and [`emergency_stop`](emergency_stop) are written and registered
+//! endpoints, [`emergency_stop`](emergency_stop) and
+//! [`register_remote_method`](register_remote_method) are written and registered
 //! by [`register`](super::register); the rest of the documented surface is not
 //! written yet, so the table below is the checklist.
 //!
@@ -30,10 +31,10 @@
 //! | `gcode/subscribe_output` | done ([`gcode`]) |
 //! | `emergency_stop` | done ([`emergency_stop`]) |
 //! | `query_endstops/status` | done ([`query_endstops`]) |
-//! | `register_remote_method` | not started |
+//! | `register_remote_method` | done ([`register_remote_method`]) |
 //! | `pause_resume/{pause,resume,cancel}` | not started |
 //! | `bed_mesh/dump_mesh` | not started |
-//! | the `*/dump_*` mux endpoints | not started |
+//! | the `*/dump_*` mux endpoints | mechanism ready ([`WebhooksStatus::register_mux_endpoint`](super::webhooks::WebhooksStatus::register_mux_endpoint)); consumers arrive with their extras |
 
 /// Declare that this module installs its endpoints. Expands to nothing;
 /// `build.rs` scans it and lists the named function in the generated table.
@@ -52,6 +53,7 @@ pub mod objects_list;
 pub mod objects_query;
 pub mod objects_subscribe;
 pub mod query_endstops;
+pub mod register_remote_method;
 
 pub use emergency_stop::EmergencyStop;
 pub use gcode::{GcodeHelp, GcodeRestart, GcodeScript, GcodeSubscribeOutput};

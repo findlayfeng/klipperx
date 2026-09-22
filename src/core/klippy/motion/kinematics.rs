@@ -165,6 +165,42 @@ pub fn home_move(
     (forcepos, homepos)
 }
 
+/// The `none` kinematics: no steppers, no limits.
+///
+/// Upstream's `kinematics/none.py`, the developer/testing machine from
+/// `[printer] kinematics: none`. It accepts every move and reports a fixed
+/// position, so a config that only needs the toolhead's plumbing (dwells, output
+/// scheduling) can run without axes.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoneKinematics;
+
+impl Kinematics for NoneKinematics {
+    fn calc_position(&self, _stepper_positions: &HashMap<String, f64>) -> [Option<f64>; 3] {
+        [Some(0.0), Some(0.0), Some(0.0)]
+    }
+
+    fn check_move(&self, _ctx: &mut MoveContext<'_>) -> Result<(), CommandError> {
+        Ok(())
+    }
+
+    fn set_position(&mut self, _newpos: Coord, _homing_axes: &[usize]) {}
+
+    fn update_limits(&mut self, _axis: usize, _range: Option<(f64, f64)>) {}
+
+    fn clear_homing_state(&mut self, _axes: &[usize]) {}
+
+    fn get_status(&self) -> Value {
+        let zero = Coord::new(0.0, 0.0, 0.0, 0.0);
+        json!({
+            "homed_axes": "",
+            "axis_minimum": zero.as_array(),
+            "axis_maximum": zero.as_array(),
+        })
+    }
+
+    fn home(&mut self, _homing: &mut dyn HomingState) {}
+}
+
 /// Cartesian kinematics: one stepper per axis, straight-line limits.
 ///
 /// Upstream's `CartKinematics` (`klippy/kinematics/cartesian.py`), without the
@@ -439,6 +475,17 @@ mod tests {
         let out = kin.calc_position(&positions);
 
         assert_eq!(out, [Some(1.0), Some(2.0), None]);
+    }
+
+    #[test]
+    fn test_none_kinematics_accepts_every_move() {
+        let kin = NoneKinematics;
+        let mut move_ = move_(Coord::default(), Coord::new(10.0, 10.0, 10.0, 5.0));
+
+        let mut ctx = MoveContext::new(&mut move_);
+        kin.check_move(&mut ctx).unwrap();
+        assert_eq!(kin.get_status()["homed_axes"], "");
+        assert_eq!(kin.calc_position(&HashMap::new()), [Some(0.0); 3]);
     }
 
     /// A `HomingState` that records the calls a kinematics makes.

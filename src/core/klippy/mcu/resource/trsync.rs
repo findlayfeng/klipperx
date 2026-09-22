@@ -30,10 +30,12 @@ use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::Notify;
 
 use super::pin::McuChip;
+use super::stepper::McuStepper;
 use crate::core::klippy::cmd::stepper::StepperStopOnTrigger;
 use crate::core::klippy::cmd::trsync::{
     ConfigTrsync, TriggerReason, TrsyncSetTimeout, TrsyncStart, TrsyncState, TrsyncTrigger,
 };
+use crate::core::klippy::error::ConfigError;
 use crate::core::klippy::mcu::{ConfigBuilder, Mcu, McuError};
 
 /// The deadline for a multi-MCU dispatch (`TRSYNC_TIMEOUT`, `klippy/mcu.py:259`).
@@ -156,8 +158,9 @@ pub struct McuTrsync {
     oid: u8,
     chip: McuChip,
     group: Weak<TriggerGroup>,
-    /// Steps that stop when the group fires.
-    stepper_oids: Mutex<Vec<u8>>,
+    /// The steps that stop when the group fires, with the name their rail uses
+    /// (for the multi-MCU shared-axis check).
+    steppers: Mutex<Vec<(Weak<McuStepper>, String)>>,
     /// The current deadline and how far it may be extended.
     expire_clock: Mutex<u64>,
     expire_ticks: Mutex<u64>,
@@ -181,7 +184,7 @@ impl McuTrsync {
             oid,
             chip: chip.clone(),
             group,
-            stepper_oids: Mutex::new(Vec::new()),
+            steppers: Mutex::new(Vec::new()),
             expire_clock: Mutex::new(0),
             expire_ticks: Mutex::new(0),
             min_extend_ticks: Mutex::new(0),
@@ -203,11 +206,25 @@ impl McuTrsync {
     }
 
     /// Register a stepper to stop when the group fires.
-    pub fn add_stepper(&self, oid: u8) {
-        self.stepper_oids
+    ///
+    /// The handle is weak: the oid is read when the group is armed, not now,
+    /// because this happens at config-load time and the oid is only assigned
+    /// when the configuration is built.
+    pub fn add_stepper(&self, stepper: Weak<McuStepper>, name: &str) {
+        self.steppers
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .push(oid);
+            .push((stepper, name.to_string()));
+    }
+
+    /// The `(name, is the stepper alive)` pairs registered on this trsync.
+    fn stepper_names(&self) -> Vec<String> {
+        self.steppers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .map(|(_, name)| name.clone())
+            .collect()
     }
 
     /// The last acknowledged print time for this MCU.
@@ -250,14 +267,18 @@ impl McuTrsync {
             report_ticks: report_ticks as u32,
             expire_reason: TriggerReason::CommsTimeout as u8,
         })?;
-        for stepper_oid in self
-            .stepper_oids
+        for (stepper, _) in self
+            .steppers
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .iter()
         {
+            let Some(stepper) = stepper.upgrade() else {
+                continue;
+            };
+            let oid = stepper.oid()?;
             mcu.send_msg(&StepperStopOnTrigger {
-                oid: *stepper_oid,
+                oid,
                 trsync_oid: self.oid,
             })?;
         }
@@ -436,19 +457,68 @@ impl TriggerDispatch {
     }
 
     /// Register a stepper on `mcu_name` to stop when the group fires.
-    pub fn add_stepper(&self, mcu_name: &str, stepper_oid: u8) {
-        for trsync in self
+    /// Register a rail's stepper with the dispatch.
+    ///
+    /// The trsync for the stepper's MCU is created when it is missing, so a rail
+    /// whose stepper is on a different MCU than its endstop still stops on a
+    /// trigger. The handle is weak: the oid is read when the group is armed,
+    /// because this runs at config-load time.
+    ///
+    /// # Errors
+    /// Returns a config error for a multi-MCU shared axis — two steppers of one
+    /// axis on different MCUs — which upstream rejects too
+    /// (`TriggerDispatch.add_stepper`, `klippy/mcu.py:294-307`).
+    pub fn add_stepper(
+        &self,
+        chip: McuChip,
+        stepper: Weak<McuStepper>,
+        name: &str,
+    ) -> Result<(), ConfigError> {
+        let trsyncs: Vec<Arc<McuTrsync>> = self
             .group
             .trsyncs
             .lock()
             .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let trsync = match trsyncs
             .iter()
+            .find(|trsync| trsync.chip.name() == chip.name())
+            .cloned()
         {
-            if trsync.chip.name() == mcu_name {
-                trsync.add_stepper(stepper_oid);
-                return;
+            Some(trsync) => trsync,
+            None => {
+                let trsync = McuTrsync::new(chip, Arc::downgrade(&self.group))
+                    .map_err(|err| ConfigError::new(err.to_string()))?;
+                self.group
+                    .trsyncs
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push(Arc::clone(&trsync));
+                trsync
+            }
+        };
+        // A shared axis (several steppers whose names share a prefix) must not
+        // span MCUs: the firmware stop is per trsync, so the axis would stop on
+        // whichever MCU triggered first.
+        if name.starts_with("stepper_") {
+            let prefix = &name[..name.len().min(9)];
+            for other in &trsyncs {
+                if Arc::ptr_eq(other, &trsync) {
+                    continue;
+                }
+                if other
+                    .stepper_names()
+                    .iter()
+                    .any(|other_name| other_name.starts_with(prefix))
+                {
+                    return Err(ConfigError::new(
+                        "Multi-mcu homing not supported on multi-mcu shared axis",
+                    ));
+                }
             }
         }
+        trsync.add_stepper(stepper, name);
+        Ok(())
     }
 
     /// Arm every trsync; the completion fires when one of them triggers.
@@ -520,7 +590,7 @@ mod tests {
     use crate::core::klippy::interface::devices::test::TestDevice;
     use crate::core::klippy::interface::Interface;
     use crate::core::klippy::mcu::{Dictionary, Mcu};
-    use crate::core::klippy::pins::PrinterPins;
+    use crate::core::klippy::pins::{PinParams, PrinterPins};
     use crate::core::klippy::reactor::ManualReactor;
     use serde_json::json;
 
@@ -553,11 +623,15 @@ mod tests {
     }
 
     fn chip(name: &str, mcu: Arc<Mcu>) -> McuChip {
+        let pins = Arc::new(PrinterPins::new());
         let chip = McuChip::new(
             name.to_string(),
             Arc::new(ConfigBuilder::new()),
-            Arc::new(PrinterPins::new()),
+            Arc::clone(&pins),
         );
+        // The chip holds the registry weakly (the printer owns it in
+        // production); keep it alive for the test process.
+        std::mem::forget(pins);
         // Production sets this in `McuObject::connect`; the test builds the
         // chip directly, so seed the clock from the fixture dictionary (1 MHz).
         let clock = Arc::new(crate::core::klippy::cmd::clock::McuClock::new(
@@ -694,21 +768,70 @@ mod tests {
         assert_eq!(x.completion().reason(), None);
     }
 
+    /// An `McuStepper` on `chip`, for the registration tests.
+    fn stepper(chip: &McuChip, pin: &str) -> Arc<McuStepper> {
+        let params = |pin: &str| PinParams {
+            chip_name: chip.name().to_string(),
+            pin: pin.to_string(),
+            invert: false,
+            pullup: 0,
+            share_type: None,
+        };
+        chip.setup_stepper(params(pin), params(&format!("{pin}b")), 0, 0.000_002, false)
+    }
+
     #[tokio::test]
     async fn test_a_trsync_can_stop_several_steppers() {
         // A rail with more than one stepper (a shared axis) registers each of
         // them with the rail's trsync.
-        let dispatch = TriggerDispatch::new(vec![chip("mcu", identified_mcu("mcu"))]).unwrap();
-        dispatch.add_stepper("mcu", 3);
-        dispatch.add_stepper("mcu", 4);
+        let chip = chip("mcu", identified_mcu("mcu"));
+        let dispatch = TriggerDispatch::new(vec![chip.clone()]).unwrap();
+        let a = stepper(&chip, "PA1");
+        let b = stepper(&chip, "PA2");
+
+        dispatch
+            .add_stepper(chip.clone(), Arc::downgrade(&a), "stepper_x")
+            .unwrap();
+        dispatch
+            .add_stepper(chip.clone(), Arc::downgrade(&b), "stepper_x1")
+            .unwrap();
 
         let trsync = first(&dispatch);
+        assert_eq!(trsync.stepper_names(), vec!["stepper_x", "stepper_x1"]);
+    }
+
+    #[tokio::test]
+    async fn test_a_shared_axis_spanning_mcus_is_refused() {
+        // A rail's stepper on a different MCU than its endstop is allowed: the
+        // dispatch creates a trsync for that MCU. But two steppers of the same
+        // axis on different MCUs is the multi-MCU shared axis upstream rejects.
+        let primary = chip("mcu", identified_mcu("mcu"));
+        let secondary = chip("zboard", identified_mcu("zboard"));
+        let dispatch = TriggerDispatch::new(vec![primary.clone()]).unwrap();
+        let x = stepper(&primary, "PA1");
+        let x1 = stepper(&secondary, "PA3");
+        let y = stepper(&secondary, "PA5");
+
+        dispatch
+            .add_stepper(primary.clone(), Arc::downgrade(&x), "stepper_x")
+            .unwrap();
+        let err = dispatch
+            .add_stepper(secondary.clone(), Arc::downgrade(&x1), "stepper_x1")
+            .unwrap_err();
+        assert!(err.to_string().contains("Multi-mcu homing"), "{err}");
+
+        // A different axis on the secondary is fine, and gets its own trsync.
+        dispatch
+            .add_stepper(secondary.clone(), Arc::downgrade(&y), "stepper_y")
+            .unwrap();
         assert_eq!(
-            *trsync
-                .stepper_oids
+            dispatch
+                .group
+                .trsyncs
                 .lock()
-                .unwrap_or_else(|p| p.into_inner()),
-            vec![3, 4]
+                .unwrap_or_else(|p| p.into_inner())
+                .len(),
+            2
         );
     }
 }

@@ -215,6 +215,21 @@ impl PrinterStepper {
             ),
             None => None,
         };
+        // Register the stepper with the endstop's trigger dispatch now, at load:
+        // the dispatch creates a per-MCU trsync (and the config callback that
+        // reserves its oid) before the configuration is built. This is also
+        // where upstream rejects a shared axis whose steppers are on different
+        // MCUs (`TriggerDispatch.add_stepper`).
+        if let Some(endstop) = &endstop {
+            endstop
+                .dispatch()
+                .add_stepper(
+                    mcu_stepper.chip().clone(),
+                    Arc::downgrade(&mcu_stepper),
+                    &name,
+                )
+                .map_err(|err| ConfigError::new(format!("{identifier}: {err}")))?;
+        }
 
         Ok(Self {
             name,
@@ -327,11 +342,6 @@ impl PrinterObject for PrinterStepper {
                 .mcu_stepper
                 .oid()
                 .map_err(|err| config_error(err.to_string()))?;
-            // Register this stepper as a signal of the rail's endstop, so a
-            // trigger stops it in the firmware (`stepper_stop_on_trigger`).
-            if let Some(endstop) = &self.endstop {
-                endstop.dispatch().add_stepper(mcu.name(), oid);
-            }
 
             let mut stepper = Stepper::cartesian(
                 self.name.clone(),

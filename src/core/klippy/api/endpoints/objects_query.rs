@@ -26,7 +26,7 @@
 //!
 //! # Status
 //!
-//! Written, tested and registered by [`register`](super::register).
+//! Written, tested and registered by [`register`](super::super::register).
 //! `objects/subscribe` is the same query on a repeated timer; the field
 //! selection both use lives in [`select_fields`].
 

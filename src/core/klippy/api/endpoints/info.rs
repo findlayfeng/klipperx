@@ -11,7 +11,7 @@
 //!
 //! # Status
 //!
-//! Written and registered (see [`super::register`]). The values come from two
+//! Written and registered (see [`super::super::register`]). The values come from two
 //! places:
 //!
 //! * `state` / `state_message` from the printer's state message;

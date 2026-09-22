@@ -260,7 +260,12 @@ impl Printer {
             &overridden
         };
 
-        let wrapper = ConfigWrapper::new(section, Arc::clone(access));
+        let wrapper = match self.lookup_object_as::<PrinterConfig>(CONFIGFILE_OBJECT) {
+            Some(configfile) => {
+                ConfigWrapper::with_configfile(section, Arc::clone(access), configfile)
+            }
+            None => ConfigWrapper::new(section, Arc::clone(access)),
+        };
         let object = load(&wrapper, self)?;
         let name = entry.object.unwrap_or(identifier.as_str());
         self.add_object(name, object)?;
@@ -382,6 +387,48 @@ mod tests {
 
         assert_eq!(printer.objects(), ["first", "toolhead"]);
         assert_eq!(claimed, ["first", "printer"]);
+    }
+
+    #[test]
+    fn test_a_factory_deprecate_reaches_the_configfile_object() {
+        fn deprecating(
+            config: &ConfigWrapper,
+            printer: &Arc<Printer>,
+        ) -> Result<Arc<dyn PrinterObject>, ConfigError> {
+            config.deprecate("pin", None);
+            nothing(config, printer)
+        }
+
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        let config = config("[legacy]\npin: PA0\n");
+        printer
+            .add_object(
+                CONFIGFILE_OBJECT,
+                Arc::new(PrinterConfig::new(
+                    AccessTracking::shared(),
+                    PrinterConfig::raw_config(&config),
+                )),
+            )
+            .unwrap();
+        let factories: &[(&str, Factories)] = &[(
+            "legacy",
+            Factories {
+                load_config: Some(deprecating),
+                load_config_prefix: None,
+                object: None,
+                phase: Phase::Generic,
+            },
+        )];
+        printer
+            .load_sections(&config, &AccessTracking::shared(), factories)
+            .unwrap();
+
+        let configfile = printer
+            .lookup_object_as::<PrinterConfig>(CONFIGFILE_OBJECT)
+            .unwrap();
+        let warnings = configfile.get_status(0.0)["warnings"].clone();
+        assert_eq!(warnings.as_array().unwrap().len(), 1);
+        assert_eq!(warnings[0]["option"], json!("pin"));
     }
 
     #[test]

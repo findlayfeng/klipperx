@@ -457,6 +457,15 @@ impl Connected {
     /// # Errors
     /// An internal [`StepCompressError`] from a stepper's compressor.
     fn generate(&mut self) -> Result<StepBatches, StepCompressError> {
+        // A secondary MCU's print-time mapping is recalibrated periodically as
+        // its crystal drifts against the primary's; pick up the current mapping
+        // on every stepper before generating.
+        for stepper in self.toolhead.motion_queuing_mut().steppers_mut() {
+            if let Some(mcu_stepper) = self.mcu_steppers.get(stepper.name()) {
+                let (offset, freq) = mcu_stepper.chip().time_mapping();
+                stepper.compressor_mut().set_time(offset, freq);
+            }
+        }
         // Move whatever the planner has queued into the trapq first, so the
         // step generation time below covers it.
         self.toolhead.wait_moves();

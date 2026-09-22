@@ -295,17 +295,19 @@ impl PrinterStepper {
     ///
     /// Zero when the MCU object cannot be found (a standalone stepper with no
     /// `[mcu]` object), which is the primary's offset anyway.
-    fn print_time_offset(&self, mcu: &Arc<crate::core::klippy::mcu::Mcu>) -> f64 {
-        self.printer
-            .upgrade()
-            .and_then(|printer| {
-                printer
-                    .lookup_objects_as::<crate::core::klippy::mcu::McuObject>(Some("mcu"))
-                    .into_iter()
-                    .find(|(_, object)| object.name() == mcu.name())
-                    .map(|(_, object)| object.print_time_offset())
-            })
-            .unwrap_or(0.0)
+    /// This MCU's print-time `(offset, frequency)` mapping, found through the
+    /// chip name.
+    ///
+    /// `None` when the MCU object cannot be found (a standalone stepper with no
+    /// `[mcu]` object); the caller then uses `(0.0, mcu_freq)`.
+    fn time_mapping(&self, mcu: &Arc<crate::core::klippy::mcu::Mcu>) -> Option<(f64, f64)> {
+        self.printer.upgrade().and_then(|printer| {
+            printer
+                .lookup_objects_as::<crate::core::klippy::mcu::McuObject>(Some("mcu"))
+                .into_iter()
+                .find(|(_, object)| object.name() == mcu.name())
+                .map(|(_, object)| object.time_mapping())
+        })
     }
 
     fn lock(&self) -> MutexGuard<'_, Option<Stepper>> {
@@ -363,10 +365,10 @@ impl PrinterObject for PrinterStepper {
             // Point the compressor at this MCU's clock domain. The `[mcu]`
             // object already built the estimate and the `SecondarySync` offset at
             // its own connect (which runs before any stepper); find it by chip
-            // name and use it.
-            stepper
-                .compressor_mut()
-                .set_time(self.print_time_offset(&mcu), freq);
+            // name and use it. A secondary's mapping is recalibrated later, and
+            // the toolhead's flush loop re-reads it before generating.
+            let (offset, mapping_freq) = self.time_mapping(&mcu).unwrap_or((0.0, freq));
+            stepper.compressor_mut().set_time(offset, mapping_freq);
             // Record where the firmware's counter is (`set_last_position` only
             // flushes the pending step — none yet — and records the position).
             if let Some(clock) = mcu.estimated_clock() {

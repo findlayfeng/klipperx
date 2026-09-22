@@ -76,7 +76,7 @@ pub mod trsync;
 pub mod uptime;
 
 pub use adc::{AnalogInState, AnalogInStateOld, ConfigAnalogIn, QueryAnalogIn, QueryAnalogInOld};
-pub use clock::{ClockState, ClockSync, GetClock, McuClock};
+pub use clock::{ClockState, ClockSync, GetClock, McuClock, SecondarySync};
 pub use endstop::{ConfigEndstop, EndstopHome, EndstopQueryState, EndstopState};
 pub use gpio::{ConfigDigitalOut, QueueDigitalOut, SetDigitalOutPwmCycle, UpdateDigitalOut};
 pub use i2c::{

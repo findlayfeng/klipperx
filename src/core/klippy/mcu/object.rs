@@ -30,7 +30,7 @@ use std::time::Duration;
 use serde_json::{json, Map, Value};
 use tracing::{info, warn};
 
-use crate::core::klippy::cmd::clock::McuClock;
+use crate::core::klippy::cmd::clock::{McuClock, SecondarySync};
 use crate::core::klippy::cmd::config::Reset;
 use crate::core::klippy::cmd::shutdown::EmergencyStop;
 use crate::core::klippy::cmd::uptime::{GetUptime, Uptime};
@@ -47,6 +47,7 @@ use crate::core::klippy::mcu::{
 };
 use crate::core::klippy::pins::{PinError, PinParams, PrinterPins, PINS_OBJECT};
 use crate::core::klippy::printer::{ConnectFuture, Printer, PrinterObject, RestartFuture};
+use crate::core::klippy::reactor::TimerHandle;
 
 /// How long to wait between attempts to reopen a board that was just told to
 /// reboot. A native-USB board re-enumerates, so the port is briefly gone.
@@ -64,6 +65,10 @@ const RESET_FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
 /// The same order as the other connect-time reads; a firmware that does not
 /// answer only loses the estimate, not the connection.
 const CLOCK_BASE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// How often a secondary MCU's clock alignment is recalibrated, in seconds
+/// (upstream does it in the periodic `stats`, `klippy/extras/motion_quuing.py:100`).
+const RECALIBRATE_INTERVAL: f64 = 1.0;
 
 /// The printer object for one `[mcu]` / `[mcu <name>]` section.
 pub struct McuObject {
@@ -103,6 +108,11 @@ pub struct McuObject {
     ///
     /// `Arc` because the `'static` event handler owns its handle to it.
     last_stats: Arc<Mutex<Option<LastStats>>>,
+    /// The secondary clock alignment, when this is not the primary MCU
+    /// (`SecondarySync`); `None` for the primary.
+    secondary_sync: Mutex<Option<SecondarySync>>,
+    /// The periodic recalibration timer, cancelled on drop.
+    recalibrate_timer: Mutex<Option<TimerHandle>>,
     /// The machine, for reporting a firmware shutdown. `Weak` because the
     /// printer's registry owns this object: a strong handle would be a cycle
     /// that keeps the printer (and its device) alive forever.
@@ -136,6 +146,8 @@ impl McuObject {
             restart_method: Mutex::new(McuRestartMethod::Command),
             is_shutdown: Arc::new(AtomicBool::new(false)),
             last_stats: Arc::new(Mutex::new(None)),
+            secondary_sync: Mutex::new(None),
+            recalibrate_timer: Mutex::new(None),
             printer: Arc::downgrade(printer),
         })
     }
@@ -284,6 +296,43 @@ impl McuObject {
     pub fn estimated_print_time(&self, eventtime: f64) -> Option<f64> {
         self.clock()
             .map(|clock| clock.estimated_print_time(eventtime))
+    }
+
+    /// The `(print-time offset, frequency)` this MCU's clock is mapped with.
+    pub fn time_mapping(&self) -> (f64, f64) {
+        self.chip.time_mapping()
+    }
+
+    /// Realign a secondary MCU's clock to the primary's (`SecondarySync`).
+    ///
+    /// Called by this MCU's recalibration timer. Nothing happens when this is
+    /// the primary, or before both clocks are known.
+    pub fn recalibrate(&self) {
+        let mut guard = self
+            .secondary_sync
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let Some(sync) = guard.as_mut() else {
+            return;
+        };
+        let Some(printer) = self.printer.upgrade() else {
+            return;
+        };
+        let Some(primary) = printer.lookup_object_as::<McuObject>("mcu") else {
+            return;
+        };
+        let (Some(primary_clock), Some(local_clock)) = (primary.clock(), self.clock()) else {
+            return;
+        };
+        let now = printer.reactor().monotonic();
+        let print_time = primary_clock.estimated_print_time(now);
+        sync.calibrate(
+            &primary_clock.estimator(),
+            &local_clock.estimator(),
+            print_time,
+            now,
+        );
+        self.chip.set_mapping(sync.offset, sync.freq);
     }
 
     /// Snapshot a connected MCU's identify status for `objects/query`.
@@ -472,6 +521,21 @@ impl McuObject {
     }
 }
 
+impl Drop for McuObject {
+    fn drop(&mut self) {
+        // Stop the secondary recalibration timer with the object; the reactor
+        // outlives the parts it was handed.
+        if let Some(handle) = self
+            .recalibrate_timer
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .take()
+        {
+            handle.cancel();
+        }
+    }
+}
+
 impl PrinterObject for McuObject {
     fn get_status(&self, _eventtime: f64) -> Value {
         let mut status = self
@@ -622,7 +686,35 @@ impl PrinterObject for McuObject {
                         })
                         .unwrap_or(0.0)
                 };
-                self.chip.set_clock(clock, offset);
+                self.chip.set_clock(Arc::clone(&clock), offset);
+                // A secondary's crystals drift against the primary's; upstream
+                // realigns it every `stats` (`SecondarySync.calibrate_clock`),
+                // so a timer does it here.
+                if self.name() != "mcu" {
+                    *self
+                        .secondary_sync
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner()) =
+                        Some(SecondarySync::new(clock.estimator().mcu_freq()));
+                    let printer = self.printer.clone();
+                    let identifier = self.section.identifier();
+                    let handle = reactor.register_timer_named(
+                        "mcu_recalibrate",
+                        Box::new(move |eventtime| {
+                            let printer = printer.upgrade()?;
+                            if let Some(object) = printer.lookup_object_as::<McuObject>(&identifier)
+                            {
+                                object.recalibrate();
+                            }
+                            Some(eventtime + RECALIBRATE_INTERVAL)
+                        }),
+                        reactor.monotonic() + RECALIBRATE_INTERVAL,
+                    );
+                    *self
+                        .recalibrate_timer
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner()) = Some(handle);
+                }
             }
             // Identify installed the dictionary; reserve the pins the firmware
             // owns before anything resolves one. A conflict here is a

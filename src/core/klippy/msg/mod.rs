@@ -17,7 +17,7 @@ pub use proto::{ArgType, ArgValue};
 /// Callback type for message handlers.
 pub type MsgCallback = Arc<Mutex<Box<dyn FnMut(&[ArgValue]) + Send>>>;
 
-/// A complete message definition with id, name, parameters, and optional callback.
+/// A complete message definition with id, name, and parameters.
 #[derive(Clone)]
 pub struct Msg {
     /// Message ID (host-side id from the firmware identify response).
@@ -30,8 +30,6 @@ pub struct Msg {
     pub name: String,
     /// Parameter list in declaration order: (parameter_name, parameter_type).
     pub params: Vec<(String, ArgType)>,
-    /// Optional callback invoked when this command is matched.
-    pub callback: Option<MsgCallback>,
 }
 
 impl std::fmt::Debug for Msg {
@@ -40,7 +38,6 @@ impl std::fmt::Debug for Msg {
             .field("id", &self.id)
             .field("name", &self.name)
             .field("params", &self.params)
-            .field("callback", &self.callback.is_some())
             .finish()
     }
 }
@@ -69,7 +66,7 @@ impl Msg {
     ///
     /// Format strings are space-separated tokens where the first token is the
     /// command name and remaining tokens are `name=type` pairs.
-    /// The `id` defaults to 0 and `callback` is `None`.
+    /// The `id` defaults to 0.
     ///
     /// Returns `MsgError` if the format string is empty or malformed.
     pub fn parse(id: i16, fmt: &str) -> MsgResult<Self> {
@@ -93,12 +90,7 @@ impl Msg {
                 .ok_or_else(|| MsgError::new(format!("unknown type specifier: {}", typ)))?;
             params.push((param_name, arg_type));
         }
-        Ok(Self {
-            id,
-            name,
-            params,
-            callback: None,
-        })
+        Ok(Self { id, name, params })
     }
 
     /// Create a `Msg` from components.
@@ -107,7 +99,6 @@ impl Msg {
             id,
             name: name.into(),
             params,
-            callback: None,
         }
     }
 
@@ -226,8 +217,7 @@ mod tests {
     // Msg Hash (for use in collections)
     // -----------------------------------------------------------------------
 
-    // `Msg`'s only interior mutability is the callback, which the manual
-    // `Eq`/`Hash` ignore, so using it as a key is well defined.
+    // `Msg` has no interior mutability, so using it as a key is well defined.
     #[allow(clippy::mutable_key_type)]
     #[test]
     fn test_command_hash() {

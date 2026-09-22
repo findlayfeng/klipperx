@@ -104,17 +104,6 @@ impl Parser {
         map.get_by_name(name).is_some()
     }
 
-    /// Check whether a registered command has a callback bound.
-    pub fn has_callback(&self, name: &str) -> bool {
-        let map = match self.msgs.lock() {
-            Ok(guard) => guard,
-            Err(_) => return false,
-        };
-        map.get_by_name(name)
-            .map(|msg| msg.callback.is_some())
-            .unwrap_or(false)
-    }
-
     /// Look up a registered message by name.
     ///
     /// Returns a shared handle to the message definition, which carries the
@@ -124,40 +113,6 @@ impl Parser {
     pub fn lookup(&self, name: &str) -> Option<Arc<Msg>> {
         let map = self.msgs.lock().ok()?;
         map.get_by_name(name).cloned()
-    }
-
-    /// Bind a callback to a registered command.
-    ///
-    /// If the command already has a callback, the new callback replaces it.
-    /// The callback receives a slice of `ArgValue` containing all decoded
-    /// parameter values in command definition order.
-    ///
-    /// Returns an error if the command is not found.
-    pub fn bind(
-        &mut self,
-        cmd_name: &str,
-        callback: impl FnMut(&[ArgValue]) + Send + 'static,
-    ) -> MsgResult<()> {
-        let mut map = self
-            .msgs
-            .lock()
-            .map_err(|_| MsgError::new("msgs lock poisoned"))?;
-
-        let id = *map
-            .by_name
-            .get(cmd_name)
-            .ok_or_else(|| MsgError::new(format!("Unknown command: {}", cmd_name)))?;
-
-        // `Arc::make_mut` clones the message if a `decode` caller still holds
-        // an `Arc` to it, so binding never panics and needs no remove/reinsert.
-        let arc_msg = map
-            .by_id
-            .get_mut(&id)
-            .ok_or_else(|| MsgError::new(format!("Msg not found: {}", cmd_name)))?;
-        let callback: super::MsgCallback = Arc::new(Mutex::new(Box::new(callback)));
-        Arc::make_mut(arc_msg).callback = Some(callback);
-
-        Ok(())
     }
 
     /// Encode a single command by message name.
@@ -445,77 +400,6 @@ mod tests {
     // Parser::bind
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_bind_success() {
-        let mut parser = Parser::new();
-        parser.register(1, "CMD_A x=%u").unwrap();
-
-        parser.bind("CMD_A", |_| {}).unwrap();
-
-        // Encode should still work after binding
-        let payload = parser.encode("CMD_A", &[ArgValue::UInt32(10)]).unwrap();
-        assert_eq!(payload.payload()[0], 1);
-
-        // Decode should work and return correct values
-        let result = parser.decode(payload).unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].0.name, "CMD_A");
-        assert_eq!(result[0].1[0], ArgValue::UInt32(10));
-    }
-
-    #[test]
-    fn test_bind_unknown_command_fails() {
-        let mut parser = Parser::new();
-        parser.register(1, "CMD_A x=%u").unwrap();
-        let result = parser.bind("NONEXISTENT", |_| {});
-        assert!(result.is_err());
-        assert!(result.unwrap_err().msg.contains("Unknown command"));
-    }
-
-    #[test]
-    fn test_bind_replaces_callback() {
-        let mut parser = Parser::new();
-        parser.register(1, "CMD_A x=%u").unwrap();
-
-        // First bind
-        parser.bind("CMD_A", |_| {}).unwrap();
-
-        // Second bind replaces the callback
-        parser.bind("CMD_A", |_| {}).unwrap();
-
-        // Encode/decode should still work
-        let payload = parser.encode("CMD_A", &[ArgValue::UInt32(1)]).unwrap();
-        let result = parser.decode(payload).unwrap();
-        assert_eq!(result[0].1[0], ArgValue::UInt32(1));
-    }
-
-    #[test]
-    fn test_bind_still_decodes_correctly() {
-        let mut parser = Parser::new();
-        parser.register(1, "CMD_MULTI a=%u b=%s c=%c").unwrap();
-
-        // Bind a callback (callback not invoked during decode)
-        parser.bind("CMD_MULTI", |_| {}).unwrap();
-
-        let payload = parser
-            .encode(
-                "CMD_MULTI",
-                &[
-                    ArgValue::UInt32(42),
-                    ArgValue::Str("hello".to_string()),
-                    ArgValue::UInt8(99),
-                ],
-            )
-            .unwrap();
-
-        let result = parser.decode(payload).unwrap();
-        assert_eq!(result[0].0.name, "CMD_MULTI");
-        assert_eq!(result[0].1.len(), 3);
-        assert_eq!(result[0].1[0], ArgValue::UInt32(42));
-        assert_eq!(result[0].1[1], ArgValue::Str("hello".to_string()));
-        assert_eq!(result[0].1[2], ArgValue::UInt8(99));
-    }
-
     // -----------------------------------------------------------------------
     // Parser::encode
     // -----------------------------------------------------------------------
@@ -592,17 +476,6 @@ mod tests {
     }
 
     #[test]
-    fn test_encode_handler_still_works() {
-        // After binding, encode should still work (Handler also has params)
-        let mut parser = Parser::new();
-        parser.register(1, "CMD_A x=%u").unwrap();
-        parser.bind("CMD_A", |_| {}).unwrap();
-
-        let payload = parser.encode("CMD_A", &[ArgValue::UInt32(99)]).unwrap();
-        assert_eq!(payload.payload()[0], 1);
-    }
-
-    #[test]
     fn test_encode_validates_param_types() {
         let mut parser = Parser::new();
         parser.register(1, "CMD_A x=%u b=%s").unwrap();
@@ -643,23 +516,6 @@ mod tests {
             assert_eq!(decoded[0].0.id, id);
             assert_eq!(decoded[0].1[0], ArgValue::UInt32(7));
         }
-    }
-
-    #[test]
-    fn test_bind_after_decode_does_not_panic() {
-        let mut parser = Parser::new();
-        parser.register(1, "CMD_A x=%u").unwrap();
-
-        // A decode caller still holds an `Arc<Msg>` when `bind` is called.
-        let payload = parser.encode("CMD_A", &[ArgValue::UInt32(1)]).unwrap();
-        let decoded = parser.decode(payload).unwrap();
-        let held = decoded[0].0.clone();
-
-        parser.bind("CMD_A", |_| {}).unwrap();
-
-        // The decoded snapshot keeps its old callback (None); the registry is
-        // updated without panicking.
-        assert!(held.callback.is_none());
     }
 
     // -----------------------------------------------------------------------
@@ -846,121 +702,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Integration: register → bind → decode → callback
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_bind_decode_lifecycle() {
-        let mut parser = Parser::new();
-        parser.register(1, "TEST_CMD a=%u b=%s").unwrap();
-
-        // Bind a callback
-        parser.bind("TEST_CMD", |_| {}).unwrap();
-
-        // Encode with the bound command
-        let payload = parser
-            .encode(
-                "TEST_CMD",
-                &[ArgValue::UInt32(42), ArgValue::Str("hello".to_string())],
-            )
-            .unwrap();
-
-        // Decode should return correct values
-        let result = parser.decode(payload).unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].0.name, "TEST_CMD");
-        assert_eq!(result[0].1.len(), 2);
-        assert_eq!(result[0].1[0], ArgValue::UInt32(42));
-        assert_eq!(result[0].1[1], ArgValue::Str("hello".to_string()));
-    }
-
-    #[test]
-    fn test_bind_decode_multiple_batch() {
-        let mut parser = Parser::new();
-        parser.register(1, "CMD_A x=%u").unwrap();
-        parser.register(2, "CMD_B y=%s").unwrap();
-
-        // Bind callbacks to both commands
-        parser.bind("CMD_A", |_| {}).unwrap();
-        parser.bind("CMD_B", |_| {}).unwrap();
-
-        let mut payload = parser.encode("CMD_A", &[ArgValue::UInt32(1)]).unwrap();
-        let payload_b = parser
-            .encode("CMD_B", &[ArgValue::Str("b".to_string())])
-            .unwrap();
-        payload.try_merge(&payload_b).unwrap();
-
-        let result = parser.decode(payload).unwrap();
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0].0.name, "CMD_A");
-        assert_eq!(result[0].1[0], ArgValue::UInt32(1));
-        assert_eq!(result[1].0.name, "CMD_B");
-        assert_eq!(result[1].1[0], ArgValue::Str("b".to_string()));
-    }
-
-    // -----------------------------------------------------------------------
     // Edge cases
     // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_parser_arc_sharing() {
-        // Parser uses Arc<Mutex<...>>, so cloning should share state
-        let mut parser = Parser::new();
-        parser.register(1, "SHARED x=%u").unwrap();
-
-        let shared = std::sync::Arc::new(std::sync::Mutex::new(parser));
-        {
-            let p = shared.lock().unwrap();
-            let payload = p.encode("SHARED", &[ArgValue::UInt32(77)]).unwrap();
-            let decoded = p.decode(payload).unwrap();
-            assert_eq!(decoded[0].1[0], ArgValue::UInt32(77));
-        }
-        // State persists after unlock
-        {
-            let p = shared.lock().unwrap();
-            assert!(p.encode("SHARED", &[ArgValue::UInt32(1)]).is_ok());
-        }
-    }
-
-    #[test]
-    fn test_register_then_bind_then_encode() {
-        // Full lifecycle: register → bind → encode (still works)
-        let mut parser = Parser::new();
-        parser.register(1, "LIFECYCLE a=%u b=%s c=%c").unwrap();
-        parser.bind("LIFECYCLE", |_| {}).unwrap();
-
-        let payload = parser
-            .encode(
-                "LIFECYCLE",
-                &[
-                    ArgValue::UInt32(1),
-                    ArgValue::Str("test".to_string()),
-                    ArgValue::UInt8(2),
-                ],
-            )
-            .unwrap();
-
-        let decoded = parser.decode(payload).unwrap();
-        assert_eq!(decoded.len(), 1);
-        assert_eq!(decoded[0].0.name, "LIFECYCLE");
-        assert_eq!(decoded[0].1.len(), 3);
-    }
-
-    #[test]
-    fn test_bind_on_handler_still_works() {
-        // bind on a command that's already a Handler should replace the callback
-        let mut parser = Parser::new();
-        parser.register(1, "REBIND x=%u").unwrap();
-
-        // First bind
-        parser.bind("REBIND", |_| {}).unwrap();
-
-        // Re-bind should replace the callback
-        parser.bind("REBIND", |_| {}).unwrap();
-
-        // Encode/decode should still work
-        let payload = parser.encode("REBIND", &[ArgValue::UInt32(1)]).unwrap();
-        let result = parser.decode(payload).unwrap();
-        assert_eq!(result[0].1[0], ArgValue::UInt32(1));
-    }
 }

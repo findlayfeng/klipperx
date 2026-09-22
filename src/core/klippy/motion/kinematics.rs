@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 
 use super::plan::Move;
 use crate::core::klippy::gcode::CommandError;
-use crate::core::klippy::mathutil::{Coord, X_AXIS, Y_AXIS, Z_AXIS};
+use crate::core::klippy::mathutil::{Coord, AXES, X_AXIS, Y_AXIS, Z_AXIS};
 
 /// What a kinematics may inspect and change about one move.
 ///
@@ -61,6 +61,53 @@ impl<'a> MoveContext<'a> {
     }
 }
 
+/// Where an axis' endstop is and how to home it.
+///
+/// Upstream's `GenericPrinterRail.get_homing_info()` (`klippy/stepper.py:475`),
+/// which the kinematics reads to compute a homing move's endpoints. It lives
+/// here rather than beside the rail so the homing protocol below does not have
+/// to reach up into the extras.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HomingInfo {
+    /// The speed of the first homing move, mm/s.
+    pub speed: f64,
+    /// Where the endstop sits, in axis coordinates.
+    pub position_endstop: f64,
+    /// The speed of the retract move.
+    pub retract_speed: f64,
+    /// How far to retract before the second home.
+    pub retract_dist: f64,
+    /// Whether homing moves toward increasing coordinates.
+    pub positive_dir: bool,
+    /// The speed of the second homing move.
+    pub second_homing_speed: f64,
+}
+
+/// A homing endpoint: `None` means "keep the current value", as upstream's
+/// `Coord`-of-`None` does (`Homing._fill_coord`).
+pub type HomeCoord = [Option<f64>; AXES];
+
+/// What a kinematics may ask the homing driver to do.
+///
+/// Upstream's `Homing` (`klippy/extras/homing.py`); the narrow version a
+/// kinematics needs: which axes to home, where each axis' endstop is, and the
+/// call that actually drives a rail's endstop.
+pub trait HomingState {
+    /// The axes to home, as `mathutil` indices.
+    fn axes(&self) -> Vec<usize>;
+
+    /// The homing parameters of an axis' rail.
+    fn homing_info(&self, axis: usize) -> HomingInfo;
+
+    /// Home `rails` (axis indices): move from `forcepos` to `movepos`, stopping
+    /// on the rails' endstops.
+    ///
+    /// `forcepos` is where the toolhead is *pretended* to be before the move
+    /// (it can be outside the travel); `movepos` is where the axis is being
+    /// homed to.
+    fn home_rails(&mut self, rails: &[usize], forcepos: HomeCoord, movepos: HomeCoord);
+}
+
 /// What the toolhead needs from its kinematics.
 pub trait Kinematics: Send + Sync + std::fmt::Debug {
     /// The toolhead position from the stepper positions.
@@ -87,6 +134,13 @@ pub trait Kinematics: Send + Sync + std::fmt::Debug {
 
     /// The kinematics' `get_status`.
     fn get_status(&self) -> Value;
+
+    /// Home the requested axes (`CartKinematics.home`).
+    ///
+    /// Each axis is homed independently and in order; the kinematics computes
+    /// the homing move's endpoints from the rail's range and `HomingInfo` and
+    /// hands them to the driver.
+    fn home(&mut self, homing: &mut dyn HomingState);
 }
 
 /// Cartesian kinematics: one stepper per axis, straight-line limits.
@@ -137,6 +191,26 @@ impl CartesianKinematics {
     /// The error for a move past the end of a homed axis.
     fn endstop_error(&self, ctx: &MoveContext<'_>) -> CommandError {
         ctx.out_of_range()
+    }
+
+    /// Home one axis (`CartKinematics.home_axis`).
+    ///
+    /// `homepos` is the endstop position; `forcepos` is pushed 1.5 axis-lengths
+    /// past the far end so the move always starts on the correct side of the
+    /// endstop and has room to accelerate.
+    fn home_axis(&self, homing: &mut dyn HomingState, axis: usize) {
+        let info = homing.homing_info(axis);
+        let position_min = self.axes_min[axis];
+        let position_max = self.axes_max[axis];
+        let mut homepos: HomeCoord = [None; AXES];
+        homepos[axis] = Some(info.position_endstop);
+        let mut forcepos = homepos;
+        forcepos[axis] = Some(if info.positive_dir {
+            info.position_endstop - 1.5 * (info.position_endstop - position_min)
+        } else {
+            info.position_endstop + 1.5 * (position_max - info.position_endstop)
+        });
+        homing.home_rails(&[axis], forcepos, homepos);
     }
 }
 
@@ -219,6 +293,13 @@ impl Kinematics for CartesianKinematics {
             "axis_minimum": self.axes_min.as_array(),
             "axis_maximum": self.axes_max.as_array(),
         })
+    }
+
+    fn home(&mut self, homing: &mut dyn HomingState) {
+        // Each axis independently, in the order the driver asks for.
+        for axis in homing.axes() {
+            self.home_axis(homing, axis);
+        }
     }
 }
 
@@ -345,5 +426,67 @@ mod tests {
         let out = kin.calc_position(&positions);
 
         assert_eq!(out, [Some(1.0), Some(2.0), None]);
+    }
+
+    /// A `HomingState` that records the calls a kinematics makes.
+    struct FakeHoming {
+        axes: Vec<usize>,
+        info: [HomingInfo; 3],
+        calls: Vec<(Vec<usize>, HomeCoord, HomeCoord)>,
+    }
+
+    impl HomingState for FakeHoming {
+        fn axes(&self) -> Vec<usize> {
+            self.axes.clone()
+        }
+        fn homing_info(&self, axis: usize) -> HomingInfo {
+            self.info[axis]
+        }
+        fn home_rails(&mut self, rails: &[usize], forcepos: HomeCoord, movepos: HomeCoord) {
+            self.calls.push((rails.to_vec(), forcepos, movepos));
+        }
+    }
+
+    fn homing_info(position_endstop: f64, positive_dir: bool) -> HomingInfo {
+        HomingInfo {
+            speed: 5.0,
+            position_endstop,
+            retract_speed: 5.0,
+            retract_dist: 5.0,
+            positive_dir,
+            second_homing_speed: 2.5,
+        }
+    }
+
+    #[test]
+    fn test_home_computes_the_force_and_move_positions() {
+        let mut kin = kinematics();
+        let mut homing = FakeHoming {
+            // Home X then Y.
+            axes: vec![X_AXIS, Y_AXIS],
+            info: [
+                homing_info(0.0, false),
+                homing_info(200.0, true),
+                homing_info(0.0, false),
+            ],
+            calls: Vec::new(),
+        };
+
+        kin.home(&mut homing);
+
+        assert_eq!(homing.calls.len(), 2, "one call per axis");
+        // X homes negative to 0; forcepos is pushed 1.5 axis-lengths past 200.
+        let (rails, forcepos, movepos) = &homing.calls[0];
+        assert_eq!(rails, &[X_AXIS]);
+        assert_eq!(forcepos[X_AXIS], Some(300.0));
+        assert_eq!(movepos[X_AXIS], Some(0.0));
+        // Y homes positive to 200; forcepos is pushed below 0.
+        let (rails, forcepos, movepos) = &homing.calls[1];
+        assert_eq!(rails, &[Y_AXIS]);
+        assert_eq!(forcepos[Y_AXIS], Some(-100.0));
+        assert_eq!(movepos[Y_AXIS], Some(200.0));
+        // The other axes are left `None` for the driver to fill in.
+        assert_eq!(forcepos[X_AXIS], None);
+        assert_eq!(movepos[X_AXIS], None);
     }
 }

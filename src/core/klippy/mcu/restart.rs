@@ -398,7 +398,9 @@ mod tests {
         McuConfig {
             name: "mcu".to_string(),
             restart_method: method,
-            transport: Transport::Test(String::new()),
+            transport: Transport::Host {
+                library: String::new(),
+            },
             usb_power: usb::UsbPowerMethod::default(),
         }
     }

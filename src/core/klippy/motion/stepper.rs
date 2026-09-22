@@ -21,6 +21,9 @@ pub struct Stepper {
     step_dist: f64,
     kinematics: StepKinematics,
     compressor: StepCompressor,
+    /// Which trapq this stepper reads, as a [`MotionQueuing`](super::queuing::MotionQueuing)
+    /// id. The extruder has its own (`MCU_stepper.set_trapq`).
+    trapq: usize,
 }
 
 impl Stepper {
@@ -39,6 +42,7 @@ impl Stepper {
             step_dist,
             kinematics: StepKinematics::new(step_dist, position, active_flags),
             compressor: StepCompressor::new(oid, mcu_freq),
+            trapq: 0,
         }
     }
 
@@ -68,6 +72,16 @@ impl Stepper {
     /// The oid the firmware assigned it.
     pub fn oid(&self) -> u32 {
         self.oid
+    }
+
+    /// Point this stepper at a trapq (`MCU_stepper.set_trapq`).
+    pub fn set_trapq(&mut self, trapq: usize) {
+        self.trapq = trapq;
+    }
+
+    /// The trapq this stepper reads.
+    pub fn trapq_id(&self) -> usize {
+        self.trapq
     }
 
     /// Millimetres per step.

@@ -5,6 +5,9 @@
 //! kinematics — which positions are legal, how to home — is FW5e; this is the
 //! skeleton a `G1` drives.
 
+use std::sync::Arc;
+
+use super::extra::ExtraAxis;
 use super::kinematics::{Kinematics, MoveContext};
 use super::plan::{LookAheadQueue, Move, MoveLimits};
 use super::queuing::MotionQueuing;
@@ -12,7 +15,7 @@ use super::stepcompress::{StepCommand, StepCompressError};
 use super::stepper::Stepper;
 use super::trapq::Trapq;
 use crate::core::klippy::gcode::CommandError;
-use crate::core::klippy::mathutil::{Coord, Xyz};
+use crate::core::klippy::mathutil::{Coord, Xyz, E_AXIS};
 
 /// How far ahead of the MCU the planner starts, in seconds
 /// (`BUFFER_TIME_START`, `klippy/toolhead.py:196`).
@@ -29,11 +32,18 @@ pub struct ToolHead {
     special_queuing_state: bool,
     motion_queuing: MotionQueuing,
     kinematics: Option<Box<dyn Kinematics>>,
+    /// The trapq the kinematic move is appended to; each extra axis has its
+    /// own (`MotionQueuing::allocate_trapq`).
+    main_trapq: usize,
+    /// The non-kinematic axes (extruders), on position index 3 and up.
+    extra_axes: Vec<Arc<dyn ExtraAxis>>,
 }
 
 impl ToolHead {
     /// A toolhead with `limits`.
     pub fn new(limits: MoveLimits) -> Self {
+        let mut motion_queuing = MotionQueuing::new();
+        let main_trapq = motion_queuing.allocate_trapq();
         Self {
             limits,
             lookahead: LookAheadQueue::new(),
@@ -43,14 +53,40 @@ impl ToolHead {
             // Upstream starts in "NeedPrime" and resyncs the print time on the
             // first planned move (`klippy/toolhead.py:224`).
             special_queuing_state: true,
-            motion_queuing: MotionQueuing::new(),
+            motion_queuing,
             kinematics: None,
+            main_trapq,
+            extra_axes: Vec::new(),
         }
     }
 
-    /// Add a stepper to drive.
-    pub fn add_stepper(&mut self, stepper: Stepper) {
+    /// Add a stepper to drive. It reads the main trapq.
+    pub fn add_stepper(&mut self, mut stepper: Stepper) {
+        stepper.set_trapq(self.main_trapq);
         self.motion_queuing.add_stepper(stepper);
+    }
+
+    /// Add a non-kinematic axis (the extruder).
+    ///
+    /// The caller owns the axis' trapq and has already pointed its stepper at
+    /// it (`PrinterExtruder.stepper.set_trapq`).
+    pub fn add_extra_axis(&mut self, axis: Arc<dyn ExtraAxis>) {
+        self.extra_axes.push(axis);
+    }
+
+    /// The non-kinematic axes.
+    pub fn extra_axes(&self) -> &[Arc<dyn ExtraAxis>] {
+        &self.extra_axes
+    }
+
+    /// The id of the main trapq, for an extra axis that needs one of its own.
+    pub fn main_trapq(&self) -> usize {
+        self.main_trapq
+    }
+
+    /// Allocate a trapq for an extra axis.
+    pub fn allocate_trapq(&mut self) -> usize {
+        self.motion_queuing.allocate_trapq()
     }
 
     /// Install the kinematics (upstream loads it from `[printer] kinematics`).
@@ -82,9 +118,9 @@ impl ToolHead {
         self.print_time
     }
 
-    /// The trapezoid queue.
+    /// The trapezoid queue the kinematic move is appended to.
     pub fn trapq(&self) -> &Trapq {
-        self.motion_queuing.trapq()
+        self.motion_queuing.trapq(self.main_trapq)
     }
 
     /// The motion queue, for setting stepper positions.
@@ -114,8 +150,15 @@ impl ToolHead {
                 kinematics.check_move(&mut ctx)?;
             }
         }
+        for (index, axis) in self.extra_axes.iter().enumerate() {
+            let ea_index = index + E_AXIS;
+            if move_.axes_d[ea_index] != 0.0 {
+                let mut ctx = MoveContext::new(&mut move_);
+                axis.check_move(&mut ctx, ea_index)?;
+            }
+        }
         self.commanded_pos = move_.end_pos;
-        let want_flush = self.lookahead.add_move(move_);
+        let want_flush = self.lookahead.add_move(move_, &self.extra_axes);
         if want_flush {
             self.process_lookahead();
         }
@@ -141,7 +184,19 @@ impl ToolHead {
         let mut next_move_time = self.print_time;
         for mut move_ in moves {
             if move_.is_kinematic_move {
-                self.motion_queuing.append_move(next_move_time, &move_);
+                append_move(
+                    self.motion_queuing.trapq_mut(self.main_trapq),
+                    next_move_time,
+                    &move_,
+                );
+            }
+            // The extra axes queue their own trapezoid, on their own trapq
+            // (`klippy/toolhead.py:288-291`).
+            for (index, axis) in self.extra_axes.iter().enumerate() {
+                let ea_index = index + E_AXIS;
+                if move_.axes_d[ea_index] != 0.0 {
+                    axis.process_move(&mut self.motion_queuing, next_move_time, &move_, ea_index);
+                }
             }
             next_move_time += move_.accel_t + move_.cruise_t + move_.decel_t;
             for callback in move_.timing_callbacks.drain(..) {
@@ -184,7 +239,7 @@ impl ToolHead {
     /// homing move does once it has stopped.
     pub fn wipe_trapq(&mut self) {
         self.motion_queuing
-            .trapq_mut()
+            .trapq_mut(self.main_trapq)
             .finalize_moves(f64::MAX, 0.0);
     }
 
@@ -216,7 +271,11 @@ impl ToolHead {
         self.process_lookahead();
         move_.set_junction(0.0, move_.max_cruise_v2, 0.0);
         let start_time = self.print_time;
-        self.motion_queuing.append_move(start_time, &move_);
+        append_move(
+            self.motion_queuing.trapq_mut(self.main_trapq),
+            start_time,
+            &move_,
+        );
         self.print_time = start_time + move_.accel_t + move_.cruise_t + move_.decel_t;
         self.commanded_pos = move_.end_pos;
         Ok((start_time, self.print_time))
@@ -231,7 +290,11 @@ impl ToolHead {
 
     /// Append a move's trapezoid directly, for tests and `drip_move`.
     pub fn append_move(&mut self, print_time: f64, move_: &Move) {
-        self.motion_queuing.append_move(print_time, move_);
+        append_move(
+            self.motion_queuing.trapq_mut(self.main_trapq),
+            print_time,
+            move_,
+        );
     }
 
     /// Force the toolhead to `newpos`, marking `homing_axes` as homed
@@ -245,7 +308,7 @@ impl ToolHead {
     pub fn set_position(&mut self, newpos: Coord, homing_axes: &[usize]) {
         self.process_lookahead();
         self.motion_queuing
-            .trapq_mut()
+            .trapq_mut(self.main_trapq)
             .set_position(self.print_time, Xyz::from(newpos));
         self.commanded_pos = newpos;
         if let Some(kinematics) = &mut self.kinematics {
@@ -263,6 +326,26 @@ impl ToolHead {
     }
 }
 
+/// Append one planned move's trapezoid to `trapq`
+/// (`trapq_append` via `ToolHead._process_lookahead`).
+fn append_move(trapq: &mut Trapq, print_time: f64, move_: &Move) {
+    trapq.append(
+        print_time,
+        move_.accel_t,
+        move_.cruise_t,
+        move_.decel_t,
+        Xyz::new(
+            move_.start_pos.x(),
+            move_.start_pos.y(),
+            move_.start_pos.z(),
+        ),
+        Xyz::new(move_.axes_r[0], move_.axes_r[1], move_.axes_r[2]),
+        move_.start_v,
+        move_.cruise_v,
+        move_.accel,
+    );
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -273,6 +356,7 @@ mod tests {
     use crate::core::klippy::motion::itersolve::Axis;
     use crate::core::klippy::motion::stepcompress::StepCommand;
     use crate::core::klippy::motion::stepper::Stepper;
+    use std::sync::Mutex;
 
     fn limits() -> MoveLimits {
         MoveLimits {
@@ -306,6 +390,126 @@ mod tests {
                 StepCommand::SetNextStepDir { .. } => None,
             })
             .sum()
+    }
+
+    /// A fake extra axis: records its calls and queues into its own trapq.
+    #[derive(Debug)]
+    struct FakeExtraAxis {
+        name: String,
+        trapq: usize,
+        checked: Mutex<Vec<usize>>,
+        junction_calls: Mutex<usize>,
+        queued: Mutex<Vec<f64>>,
+    }
+
+    impl FakeExtraAxis {
+        fn new(trapq: usize) -> Self {
+            Self {
+                name: "extruder".to_string(),
+                trapq,
+                checked: Mutex::new(Vec::new()),
+                junction_calls: Mutex::new(0),
+                queued: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl ExtraAxis for FakeExtraAxis {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn check_move(
+            &self,
+            _ctx: &mut MoveContext<'_>,
+            ea_index: usize,
+        ) -> Result<(), CommandError> {
+            self.checked.lock().unwrap().push(ea_index);
+            Ok(())
+        }
+
+        fn calc_junction(&self, _prev: &Move, _cur: &Move, _ea_index: usize) -> f64 {
+            *self.junction_calls.lock().unwrap() += 1;
+            1234.0
+        }
+
+        fn process_move(
+            &self,
+            queuing: &mut MotionQueuing,
+            print_time: f64,
+            move_: &Move,
+            ea_index: usize,
+        ) {
+            self.queued
+                .lock()
+                .unwrap()
+                .push(move_.end_pos.axis(ea_index));
+            queuing.trapq_mut(self.trapq).append(
+                print_time,
+                move_.accel_t,
+                move_.cruise_t,
+                move_.decel_t,
+                Xyz::new(move_.start_pos.axis(ea_index), 0.0, 0.0),
+                Xyz::new(1.0, 0.0, 0.0),
+                move_.start_v,
+                move_.cruise_v,
+                move_.accel,
+            );
+        }
+
+        fn find_past_position(&self, _print_time: f64) -> f64 {
+            0.0
+        }
+
+        fn get_status(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+    }
+
+    #[test]
+    fn test_an_extra_axis_is_checked_and_queued_in_its_own_trapq() {
+        let mut toolhead = toolhead();
+        let trapq = toolhead.allocate_trapq();
+        let axis = Arc::new(FakeExtraAxis::new(trapq));
+        toolhead.add_extra_axis(axis.clone());
+
+        // A pure extrusion: the kinematic steppers stay still, the extra axis
+        // is checked and queued.
+        toolhead
+            .move_to(Coord::new(0.0, 0.0, 0.0, 5.0), 10.0)
+            .unwrap();
+        let batches = toolhead.flush_step_generation(1.0).unwrap();
+
+        assert_eq!(*axis.checked.lock().unwrap(), [3]);
+        assert_eq!(*axis.queued.lock().unwrap(), [5.0]);
+        // The trapezoid lands in the extra axis' trapq (three phases).
+        assert!(!toolhead
+            .motion_queuing_mut()
+            .trapq(trapq)
+            .moves()
+            .is_empty());
+        // The X stepper did not move, and the fake axis is not a `Stepper`.
+        assert!(batches.is_empty());
+    }
+
+    #[test]
+    fn test_an_extra_axis_limits_the_junction() {
+        let mut toolhead = toolhead();
+        let trapq = toolhead.allocate_trapq();
+        let axis = Arc::new(FakeExtraAxis::new(trapq));
+        toolhead.add_extra_axis(axis.clone());
+
+        toolhead
+            .move_to(Coord::new(10.0, 0.0, 0.0, 0.0), 100.0)
+            .unwrap();
+        toolhead
+            .move_to(Coord::new(20.0, 0.0, 0.0, 1.0), 100.0)
+            .unwrap();
+
+        // The second move's junction folds in the extra axis' limit.
+        assert_eq!(*axis.junction_calls.lock().unwrap(), 1);
+        let last = toolhead.lookahead.last().unwrap();
+        assert_eq!(last.max_start_v2, 1234.0);
     }
 
     #[test]

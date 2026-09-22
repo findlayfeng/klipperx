@@ -6,16 +6,19 @@
 //! is driven explicitly (`generate`) so the host logic can be tested without a
 //! device, and the MCU side attaches on top of it.
 
-use super::plan::Move;
 use super::stepcompress::{StepCommand, StepCompressError};
 use super::stepper::Stepper;
 use super::trapq::Trapq;
-use crate::core::klippy::mathutil::Xyz;
 
-/// The trapq and the steppers reading it.
+/// The trapqs and the steppers reading them.
+///
+/// Upstream's `MotionQueuing` owns a list of trapqs (`allocate_trapq`,
+/// `motion_queuing.py:63-67`): the toolhead has one, each extruder its own. A
+/// stepper is bound to one of them (`MCU_stepper.set_trapq`), and only reads
+/// that one when generating steps.
 #[derive(Debug, Default)]
 pub struct MotionQueuing {
-    trapq: Trapq,
+    trapqs: Vec<Trapq>,
     steppers: Vec<Stepper>,
 }
 
@@ -27,33 +30,41 @@ impl MotionQueuing {
     /// on that MCU's clock.
     pub fn new() -> Self {
         Self {
-            trapq: Trapq::new(),
+            trapqs: Vec::new(),
             steppers: Vec::new(),
         }
     }
 
-    /// The trapezoid queue.
-    pub fn trapq(&self) -> &Trapq {
-        &self.trapq
+    /// Create a trapq and return its id (`MotionQueuing.allocate_trapq`).
+    pub fn allocate_trapq(&mut self) -> usize {
+        self.trapqs.push(Trapq::new());
+        self.trapqs.len() - 1
     }
 
-    /// The trapezoid queue, to move the current position in it
-    /// ([`Trapq::set_position`]).
-    pub fn trapq_mut(&mut self) -> &mut Trapq {
-        &mut self.trapq
+    /// A trapq by id.
+    pub fn trapq(&self, id: usize) -> &Trapq {
+        &self.trapqs[id]
     }
 
-    /// Drop finished segments from the live queue into the history
+    /// A trapq by id, to append to or move the current position in it.
+    pub fn trapq_mut(&mut self, id: usize) -> &mut Trapq {
+        &mut self.trapqs[id]
+    }
+
+    /// Drop finished segments from every live queue into its history
     /// (`trapq_finalize_moves`).
     ///
     /// `print_time` is how far the step solvers have generated: anything ending
     /// before it can never be read again. `clear_history_time` is how old a
     /// history entry may be before it is dropped.
     pub fn finalize_moves(&mut self, print_time: f64, clear_history_time: f64) {
-        self.trapq.finalize_moves(print_time, clear_history_time);
+        for trapq in &mut self.trapqs {
+            trapq.finalize_moves(print_time, clear_history_time);
+        }
     }
 
-    /// Add a stepper to generate for.
+    /// Add a stepper to generate for. Its trapq id defaults to 0 (the main
+    /// trapq); use [`Stepper::set_trapq`] before adding when it differs.
     pub fn add_stepper(&mut self, stepper: Stepper) {
         self.steppers.push(stepper);
     }
@@ -68,27 +79,10 @@ impl MotionQueuing {
         &mut self.steppers
     }
 
-    /// Append one planned move's trapezoid
-    /// (`trapq_append` via `ToolHead._process_lookahead`).
-    pub fn append_move(&mut self, print_time: f64, move_: &Move) {
-        self.trapq.append(
-            print_time,
-            move_.accel_t,
-            move_.cruise_t,
-            move_.decel_t,
-            Xyz::new(
-                move_.start_pos.x(),
-                move_.start_pos.y(),
-                move_.start_pos.z(),
-            ),
-            Xyz::new(move_.axes_r[0], move_.axes_r[1], move_.axes_r[2]),
-            move_.start_v,
-            move_.cruise_v,
-            move_.accel,
-        );
-    }
-
     /// Generate steps for every stepper up to `flush_time`.
+    ///
+    /// Each stepper reads its own trapq, so the toolhead's steppers and an
+    /// extruder's generate from different queues.
     ///
     /// Returns one entry per stepper that produced commands, in the order the
     /// steppers were added.
@@ -99,9 +93,10 @@ impl MotionQueuing {
         &mut self,
         flush_time: f64,
     ) -> Result<Vec<(String, Vec<StepCommand>)>, StepCompressError> {
-        let Self { trapq, steppers } = self;
+        let Self { trapqs, steppers } = self;
         let mut out = Vec::new();
         for stepper in steppers.iter_mut() {
+            let trapq = &trapqs[stepper.trapq_id()];
             let commands = stepper.generate(trapq, flush_time)?;
             if !commands.is_empty() {
                 out.push((stepper.name().to_string(), commands));
@@ -118,9 +113,9 @@ impl MotionQueuing {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::klippy::mathutil::Coord;
+    use crate::core::klippy::mathutil::{Coord, Xyz};
     use crate::core::klippy::motion::itersolve::Axis;
-    use crate::core::klippy::motion::plan::MoveLimits;
+    use crate::core::klippy::motion::plan::{Move, MoveLimits};
 
     fn limits() -> MoveLimits {
         MoveLimits {
@@ -141,9 +136,29 @@ mod tests {
         )
     }
 
+    /// Append a move's kinematic (xyz) trapezoid, as the toolhead does.
+    fn append(queuing: &mut MotionQueuing, trapq: usize, move_: &Move) {
+        queuing.trapq_mut(trapq).append(
+            0.0,
+            move_.accel_t,
+            move_.cruise_t,
+            move_.decel_t,
+            Xyz::new(
+                move_.start_pos.x(),
+                move_.start_pos.y(),
+                move_.start_pos.z(),
+            ),
+            Xyz::new(move_.axes_r[0], move_.axes_r[1], move_.axes_r[2]),
+            move_.start_v,
+            move_.cruise_v,
+            move_.accel,
+        );
+    }
+
     #[test]
     fn test_append_and_generate_use_the_same_trapq() {
         let mut queuing = MotionQueuing::new();
+        let trapq = queuing.allocate_trapq();
         queuing.add_stepper(Stepper::cartesian(
             "stepper_x",
             0,
@@ -154,7 +169,7 @@ mod tests {
         let mut move_ = move_(0.0, 10.0);
         // Give it a profile: accelerate and decelerate over 10 mm.
         move_.set_junction(0.0, 10_000.0, 0.0);
-        queuing.append_move(0.0, &move_);
+        append(&mut queuing, trapq, &move_);
 
         let batches = queuing.generate(0.2).unwrap();
 
@@ -174,6 +189,7 @@ mod tests {
     #[test]
     fn test_a_stepper_with_nothing_to_do_is_silent() {
         let mut queuing = MotionQueuing::new();
+        let trapq = queuing.allocate_trapq();
         queuing.add_stepper(Stepper::cartesian(
             "stepper_y",
             1,
@@ -183,7 +199,7 @@ mod tests {
         ));
         let mut move_ = move_(0.0, 10.0); // X only
         move_.set_junction(0.0, 10_000.0, 0.0);
-        queuing.append_move(0.0, &move_);
+        append(&mut queuing, trapq, &move_);
 
         // The Y stepper produces no commands, so only the trapq had work.
         assert!(queuing.generate(0.2).unwrap().is_empty());
@@ -195,6 +211,7 @@ mod tests {
         // MCU's clock/offset but have independent compressors; a diagonal move
         // must produce commands for both.
         let mut queuing = MotionQueuing::new();
+        let trapq = queuing.allocate_trapq();
         let mut x = Stepper::cartesian("stepper_x", 0, 1.0, Axis::X, 1_000_000.0);
         x.compressor_mut().set_time(0.0, 1_000_000.0);
         let mut y = Stepper::cartesian("stepper_y", 1, 1.0, Axis::Y, 1_000_000.0);
@@ -208,7 +225,7 @@ mod tests {
             &limits(),
         );
         move_.set_junction(0.0, 10_000.0, 0.0);
-        queuing.append_move(0.0, &move_);
+        append(&mut queuing, trapq, &move_);
 
         let batches = queuing.generate(0.2).unwrap();
 

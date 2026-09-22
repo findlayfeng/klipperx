@@ -30,7 +30,9 @@ pub mod trapq;
 pub use itersolve::{
     cartesian_active_flags, cartesian_position_fn, Axis, AxisFlags, StepKinematics,
 };
-pub use kinematics::{CartesianKinematics, Kinematics, MoveContext};
+pub use kinematics::{
+    CartesianKinematics, HomeCoord, HomingInfo, HomingState, Kinematics, MoveContext,
+};
 pub use plan::{LookAheadQueue, Move, MoveLimits};
 pub use queuing::MotionQueuing;
 pub use stepcompress::{GracePolicy, HistoryStep, StepCommand, StepCompressError, StepCompressor};

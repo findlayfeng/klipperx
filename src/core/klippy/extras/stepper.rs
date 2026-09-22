@@ -45,7 +45,7 @@ use crate::core::klippy::error::KlippyError;
 use crate::core::klippy::load::section;
 use crate::core::klippy::mathutil::{X_AXIS, Y_AXIS, Z_AXIS};
 use crate::core::klippy::mcu::{McuEndstop, McuStepper};
-use crate::core::klippy::motion::{Axis, Stepper};
+use crate::core::klippy::motion::{Axis, HomingInfo, Stepper};
 use crate::core::klippy::pins::{PrinterPins, PINS_OBJECT};
 use crate::core::klippy::printer::{ConnectFuture, Printer, PrinterObject};
 
@@ -78,26 +78,6 @@ pub struct RailParams {
     pub position_max: f64,
     /// Where the endstop trips, used by homing (FW6).
     pub position_endstop: f64,
-}
-
-/// Where an axis' endstop is and how to home it.
-///
-/// Upstream's `GenericPrinterRail.get_homing_info()` (`klippy/stepper.py:475`),
-/// which `homing.py` reads.
-#[derive(Debug, Clone, Copy)]
-pub struct HomingInfo {
-    /// The speed of the first homing move, mm/s.
-    pub speed: f64,
-    /// Where the endstop sits, in axis coordinates.
-    pub position_endstop: f64,
-    /// The speed of the retract move.
-    pub retract_speed: f64,
-    /// How far to retract before the second home.
-    pub retract_dist: f64,
-    /// Whether homing moves toward increasing coordinates.
-    pub positive_dir: bool,
-    /// The speed of the second homing move.
-    pub second_homing_speed: f64,
 }
 
 /// One configured `[stepper_x]` / `[stepper_y]` / `[stepper_z]`.

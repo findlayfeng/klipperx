@@ -11,7 +11,7 @@
 //! `temperature_sensors.cfg` for that).
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde_json::{json, Value};
 
@@ -24,11 +24,25 @@ use crate::core::klippy::extras::temperature_mcu;
 use crate::core::klippy::gcode::{
     CommandError, CommandHandler, GCodeDispatch, GcodeCommand, GCODE_OBJECT,
 };
-use crate::core::klippy::pins::{PrinterPins, PINS_OBJECT};
+use crate::core::klippy::pins::{PrinterPins, PwmOut, PINS_OBJECT};
 use crate::core::klippy::printer::{Printer, PrinterObject};
 
 /// The name other modules look the registry up by.
 pub const HEATERS_OBJECT: &str = "heaters";
+
+/// The longest a heater PWM change may sit before the firmware falls back
+/// (upstream `MAX_HEAT_TIME`, `heaters.py:15`).
+#[allow(dead_code)]
+const MAX_HEAT_TIME: f64 = 3.0;
+/// The temperature the PID's first derivative is measured against
+/// (upstream `AMBIENT_TEMP`, `heaters.py:17`).
+const AMBIENT_TEMP: f64 = 25.0;
+/// The divisor upstream stores PID constants over (`PID_PARAM_BASE`).
+const PID_PARAM_BASE: f64 = 255.0;
+/// How close a PID must settle before `TEMPERATURE_WAIT` returns
+/// (`PID_SETTLE_DELTA`/`PID_SETTLE_SLOPE`).
+const PID_SETTLE_DELTA: f64 = 1.0;
+const PID_SETTLE_SLOPE: f64 = 0.1;
 
 /// Called with `(read_time, temperature)` for every reading.
 pub type SensorCallback = Box<dyn Fn(f64, f64) + Send + Sync>;
@@ -48,26 +62,121 @@ pub type SensorFactory = Arc<
     dyn Fn(&ConfigWrapper, &Arc<Printer>) -> Result<Arc<dyn Sensor>, ConfigError> + Send + Sync,
 >;
 
+/// The heater control algorithms (upstream's `ControlBangBang` / `ControlPID`).
+#[derive(Debug)]
+enum Control {
+    /// `control: watermark`.
+    BangBang { max_delta: f64, heating: bool },
+    /// `control: pid`.
+    Pid {
+        kp: f64,
+        ki: f64,
+        kd: f64,
+        min_deriv_time: f64,
+        temp_integ_max: f64,
+        prev_temp: f64,
+        prev_temp_time: f64,
+        prev_temp_deriv: f64,
+        prev_temp_integ: f64,
+    },
+}
+
+impl Control {
+    /// Compute the PWM value for one reading (`temperature_update`).
+    fn update(&mut self, read_time: f64, temp: f64, target: f64, max_power: f64) -> f64 {
+        match self {
+            Control::BangBang { max_delta, heating } => {
+                if *heating && temp >= target + *max_delta {
+                    *heating = false;
+                } else if !*heating && temp <= target - *max_delta {
+                    *heating = true;
+                }
+                if *heating {
+                    max_power
+                } else {
+                    0.0
+                }
+            }
+            Control::Pid {
+                kp,
+                ki,
+                kd,
+                min_deriv_time,
+                temp_integ_max,
+                prev_temp,
+                prev_temp_time,
+                prev_temp_deriv,
+                prev_temp_integ,
+            } => {
+                let time_diff = read_time - *prev_temp_time;
+                let temp_diff = temp - *prev_temp;
+                let temp_deriv = if time_diff >= *min_deriv_time {
+                    temp_diff / time_diff
+                } else {
+                    (*prev_temp_deriv * (*min_deriv_time - time_diff) + temp_diff) / *min_deriv_time
+                };
+                let temp_err = target - temp;
+                let temp_integ =
+                    (*prev_temp_integ + temp_err * time_diff).clamp(0.0, *temp_integ_max);
+                let co = *kp * temp_err + *ki * temp_integ - *kd * temp_deriv;
+                let bounded = co.clamp(0.0, max_power);
+                *prev_temp = temp;
+                *prev_temp_time = read_time;
+                *prev_temp_deriv = temp_deriv;
+                if co == bounded {
+                    *prev_temp_integ = temp_integ;
+                }
+                bounded
+            }
+        }
+    }
+
+    /// Whether a requested temperature has not been reached yet
+    /// (`check_busy`).
+    fn check_busy(&self, smoothed_temp: f64, target: f64) -> bool {
+        match self {
+            Control::BangBang { max_delta, .. } => smoothed_temp < target - *max_delta,
+            Control::Pid {
+                prev_temp_deriv, ..
+            } => {
+                (target - smoothed_temp).abs() > PID_SETTLE_DELTA
+                    || prev_temp_deriv.abs() > PID_SETTLE_SLOPE
+            }
+        }
+    }
+}
+
 /// One configured heater (an extruder hotend, a bed, a generic heater).
 ///
-/// Upstream's `Heater` (`klippy/extras/heaters.py:14-160`). This is the **stub**
-/// C1b needs: it reads and claims every heater option, sets up the sensor, and
-/// reports `can_extrude = true` so motion is not blocked. The control loop —
-/// PID/bang-bang, the PWM output and the periodic timer — is H1; until then a
-/// `M104`/`SET_HEATER_TEMPERATURE` records the target and no heat is applied.
+/// Upstream's `Heater` (`klippy/extras/heaters.py:14-160`): it owns the sensor
+/// callback, the bang-bang/PID control loop and the PWM output. The periodic
+/// `verify_heater` check is H1-3.
 pub struct Heater {
     /// The section's short name (`extruder`, `heater_bed`).
     name: String,
     /// The sensor built from the heater's section.
     sensor: Arc<dyn Sensor>,
+    /// The heater's PWM output, when the pin was set up.
+    pwm: Option<Arc<dyn PwmOut>>,
     min_temp: f64,
     max_temp: f64,
-    /// Whether extrusion is allowed. Stubbed to `true` (see the type docs).
-    can_extrude: bool,
     /// `min_extrude_temp`: the reading below which extrusion is refused.
     min_extrude_temp: f64,
-    target_temp: Mutex<f64>,
-    last_temp: Mutex<f64>,
+    max_power: f64,
+    /// `1 / smooth_time`, for the smoothed temperature.
+    inv_smooth_time: f64,
+    state: Mutex<HeaterState>,
+}
+
+/// The mutable half of a [`Heater`].
+struct HeaterState {
+    target_temp: f64,
+    last_temp: f64,
+    smoothed_temp: f64,
+    last_temp_time: f64,
+    can_extrude: bool,
+    last_pwm_value: f64,
+    control: Control,
 }
 
 impl Heater {
@@ -83,7 +192,7 @@ impl Heater {
 
     /// Whether a move may extrude (`PrinterExtruder.check_move`).
     pub fn can_extrude(&self) -> bool {
-        self.can_extrude
+        self.lock().can_extrude
     }
 
     /// The configured temperature range.
@@ -103,18 +212,52 @@ impl Heater {
                 degrees, self.min_temp, self.max_temp
             )));
         }
-        *self.target_temp.lock().unwrap_or_else(|p| p.into_inner()) = degrees;
+        self.lock().target_temp = degrees;
         Ok(())
+    }
+
+    /// One sensor reading: run the control loop and update the smoothed
+    /// temperature (`Heater.temperature_callback`).
+    pub fn temperature_callback(&self, read_time: f64, temp: f64) {
+        let mut state = self.lock();
+        let time_diff = read_time - state.last_temp_time;
+        state.last_temp = temp;
+        state.last_temp_time = read_time;
+        let target = state.target_temp;
+        let value = state
+            .control
+            .update(read_time, temp, target, self.max_power);
+        // Upstream schedules the change at `read_time + pwm_delay`; print-time
+        // scheduling is C1d, so the output goes out immediately.
+        if let Some(pwm) = &self.pwm {
+            let _ = pwm.update_pwm(value);
+        }
+        let temp_diff = temp - state.smoothed_temp;
+        let adj_time = (time_diff * self.inv_smooth_time).min(1.0);
+        state.smoothed_temp += temp_diff * adj_time;
+        state.can_extrude = state.smoothed_temp >= self.min_extrude_temp;
+        state.last_pwm_value = value;
+    }
+
+    /// Whether a `TEMPERATURE_WAIT` for `target` must keep waiting
+    /// (`Heater.check_busy`).
+    pub fn check_busy(&self, target: f64) -> bool {
+        let state = self.lock();
+        state.control.check_busy(state.smoothed_temp, target)
     }
 
     /// `Heater.get_status`.
     pub fn get_status(&self) -> Value {
+        let state = self.lock();
         json!({
-            "temperature": *self.last_temp.lock().unwrap_or_else(|p| p.into_inner()),
-            "target": *self.target_temp.lock().unwrap_or_else(|p| p.into_inner()),
-            // No control loop yet, so no PWM output is ever applied.
-            "power": 0.0,
+            "temperature": (state.smoothed_temp * 100.0).round() / 100.0,
+            "target": state.target_temp,
+            "power": state.last_pwm_value,
         })
+    }
+
+    fn lock(&self) -> MutexGuard<'_, HeaterState> {
+        self.state.lock().unwrap_or_else(|p| p.into_inner())
     }
 }
 
@@ -248,41 +391,60 @@ impl PrinterHeaters {
             }
             None => 170.0,
         };
-        let _ =
+        let max_power =
             config.get_float_bounded("max_power", Some(1.0), None, Some(1.0), Some(0.0), None)?;
-        let _ = config.get_float_bounded("smooth_time", Some(1.0), None, None, Some(0.0), None)?;
-        let _ =
+        let smooth_time =
+            config.get_float_bounded("smooth_time", Some(1.0), None, None, Some(0.0), None)?;
+        let pwm_cycle_time =
             config.get_float_bounded("pwm_cycle_time", Some(0.100), None, None, Some(0.0), None)?;
 
-        // Reserve the heater pin. Upstream builds a PWM here; H1 switches to
-        // `setup_pwm` and drives it, so the pin is only claimed for now.
+        // Set up the heater pin as a PWM output, as upstream does
+        // (`heaters.py:56-61`). The `max_duration` limit is off: the host
+        // drives the pin immediately, not on a print-time schedule (C1d).
         let heater_pin = config.get("heater_pin", None)?;
         let pins = printer
             .lookup_object_as::<PrinterPins>(PINS_OBJECT)
             .expect("the loader registers `pins` before any section");
-        pins.lookup_pin(&heater_pin, true, false, None)
+        let pwm = pins
+            .setup_pwm(&heater_pin, None)
             .map_err(|err| ConfigError::new(format!("{identifier}: {err}")))?;
+        pwm.setup_cycle_time(pwm_cycle_time, false);
+        pwm.setup_max_duration(0.0);
+        pwm.setup_start_value(0.0, 0.0);
 
-        match config
+        // Build the control algorithm.
+        let control = match config
             .get_choice("control", &["watermark", "pid"], None)?
             .as_str()
         {
-            "watermark" => {
-                let _ = config.get_float_bounded(
+            "watermark" => Control::BangBang {
+                max_delta: config.get_float_bounded(
                     "max_delta",
                     Some(2.0),
                     None,
                     None,
                     Some(0.0),
                     None,
-                )?;
-            }
+                )?,
+                heating: false,
+            },
             _ => {
-                let _ = config.get_float("pid_Kp", None)?;
-                let _ = config.get_float("pid_Ki", None)?;
-                let _ = config.get_float("pid_Kd", None)?;
+                let kp = config.get_float("pid_Kp", None)? / PID_PARAM_BASE;
+                let ki = config.get_float("pid_Ki", None)? / PID_PARAM_BASE;
+                let kd = config.get_float("pid_Kd", None)? / PID_PARAM_BASE;
+                Control::Pid {
+                    kp,
+                    ki,
+                    kd,
+                    min_deriv_time: smooth_time,
+                    temp_integ_max: if ki != 0.0 { max_power / ki } else { 0.0 },
+                    prev_temp: AMBIENT_TEMP,
+                    prev_temp_time: 0.0,
+                    prev_temp_deriv: 0.0,
+                    prev_temp_integ: 0.0,
+                }
             }
-        }
+        };
 
         sensor.setup_minmax(min_temp, max_temp);
         self.register_sensor(config)?;
@@ -291,16 +453,34 @@ impl PrinterHeaters {
         let heater = Arc::new(Heater {
             name: short_name.clone(),
             sensor,
+            pwm: Some(pwm),
             min_temp,
             max_temp,
-            // No control loop: allow extrusion until H1 decides from the
-            // reading. Upstream allows it when `min_extrude_temp <= 0` or in
-            // file-output mode; the fake-MCU harness is the latter in spirit.
-            can_extrude: true,
             min_extrude_temp,
-            target_temp: Mutex::new(0.0),
-            last_temp: Mutex::new(0.0),
+            max_power,
+            inv_smooth_time: 1.0 / smooth_time,
+            state: Mutex::new(HeaterState {
+                target_temp: 0.0,
+                last_temp: 0.0,
+                smoothed_temp: 0.0,
+                last_temp_time: 0.0,
+                // Upstream: allowed when `min_extrude_temp <= 0`. A reading at
+                // or above it flips this on (see `temperature_callback`).
+                can_extrude: min_extrude_temp <= 0.0,
+                last_pwm_value: 0.0,
+                control,
+            }),
         });
+        // The sensor delivers each reading to the control loop through a weak
+        // handle, so the sensor does not keep the heater alive.
+        let weak = Arc::downgrade(&heater);
+        heater
+            .sensor
+            .setup_callback(Box::new(move |read_time, temp| {
+                if let Some(heater) = weak.upgrade() {
+                    heater.temperature_callback(read_time, temp);
+                }
+            }));
         self.heaters
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -405,8 +585,9 @@ mod tests {
     use super::*;
     use crate::core::klippy::config::{ConfigSection, ConfigValue};
     use crate::core::klippy::gcode::{GCodeDispatch, GCODE_OBJECT};
+    use crate::core::klippy::mcu::McuError;
     use crate::core::klippy::pins::{
-        DigitalOut, PinChip, PinError, PinParams, PrinterPins, PINS_OBJECT,
+        DigitalOut, PinChip, PinError, PinParams, PrinterPins, PwmOut, PINS_OBJECT,
     };
     use crate::core::klippy::reactor::ManualReactor;
 
@@ -419,6 +600,25 @@ mod tests {
         fn setup_callback(&self, _callback: SensorCallback) {}
     }
 
+    /// A PWM that accepts everything.
+    #[derive(Debug)]
+    struct FakePwm;
+
+    impl PwmOut for FakePwm {
+        fn setup_max_duration(&self, _max_duration: f64) {}
+        fn setup_cycle_time(&self, _cycle_time: f64, _hardware: bool) {}
+        fn setup_start_value(&self, _start: f64, _shutdown: f64) {}
+        fn set_pwm(&self, _clock: u32, _value: f64) -> Result<(), McuError> {
+            Ok(())
+        }
+        fn update_pwm(&self, _value: f64) -> Result<(), McuError> {
+            Ok(())
+        }
+        fn next_aligned_clock(&self, clock: u32, _allow_early: f64) -> Result<u32, McuError> {
+            Ok(clock)
+        }
+    }
+
     /// A chip that only exists so a pin description resolves.
     #[derive(Debug)]
     struct NoopChip;
@@ -426,6 +626,10 @@ mod tests {
     impl PinChip for NoopChip {
         fn setup_digital_out(&self, _params: &PinParams) -> Result<Arc<dyn DigitalOut>, PinError> {
             Err(PinError::Unsupported("digital_out".to_string()))
+        }
+
+        fn setup_pwm(&self, _params: &PinParams) -> Result<Arc<dyn PwmOut>, PinError> {
+            Ok(Arc::new(FakePwm))
         }
     }
 
@@ -522,5 +726,83 @@ mod tests {
             heaters.get_status(0.0)["available_heaters"],
             json!(["extruder"])
         );
+    }
+
+    /// A `[extruder]`-style heater section with `options`.
+    fn heater_section(options: &[(&str, &str)]) -> ConfigSection {
+        let mut section = ConfigSection::new("extruder", None);
+        for (key, value) in options {
+            section.parameters.insert(
+                (*key).to_string(),
+                ConfigValue::Single((*value).to_string()),
+            );
+        }
+        section
+    }
+
+    #[test]
+    fn test_the_bang_bang_control_toggles_the_output() {
+        let printer = ready_printer();
+        let heaters = ensure(&printer).unwrap();
+        heaters.add_sensor_factory(
+            "Fake",
+            Arc::new(|_config, _printer| Ok(Arc::new(FakeSensor) as Arc<dyn Sensor>)),
+        );
+        let section = heater_section(&[
+            ("sensor_type", "Fake"),
+            ("heater_pin", "PA0"),
+            ("min_temp", "0"),
+            ("max_temp", "250"),
+            ("min_extrude_temp", "50"),
+            ("control", "watermark"),
+            ("max_delta", "2"),
+        ]);
+        let heater = heaters
+            .setup_heater(&ConfigWrapper::untracked(&section), &printer, None)
+            .unwrap();
+
+        // Below `min_extrude_temp`: no extrusion.
+        heater.temperature_callback(0.0, 25.0);
+        assert!(!heater.can_extrude());
+
+        heater.set_temp(100.0).unwrap();
+        // 90 is below target - max_delta, so the heater turns on.
+        heater.temperature_callback(1.0, 90.0);
+        assert_eq!(heater.get_status()["power"], 1.0);
+        assert!(heater.can_extrude());
+        // 103 is above target + max_delta, so it turns off.
+        heater.temperature_callback(2.0, 103.0);
+        assert_eq!(heater.get_status()["power"], 0.0);
+    }
+
+    #[test]
+    fn test_the_pid_control_output_is_bounded() {
+        let printer = ready_printer();
+        let heaters = ensure(&printer).unwrap();
+        heaters.add_sensor_factory(
+            "Fake",
+            Arc::new(|_config, _printer| Ok(Arc::new(FakeSensor) as Arc<dyn Sensor>)),
+        );
+        let section = heater_section(&[
+            ("sensor_type", "Fake"),
+            ("heater_pin", "PA0"),
+            ("min_temp", "0"),
+            ("max_temp", "250"),
+            ("min_extrude_temp", "0"),
+            ("control", "pid"),
+            ("pid_Kp", "64"),
+            ("pid_Ki", "1.4"),
+            ("pid_Kd", "128"),
+        ]);
+        let heater = heaters
+            .setup_heater(&ConfigWrapper::untracked(&section), &printer, None)
+            .unwrap();
+        heater.set_temp(200.0).unwrap();
+
+        heater.temperature_callback(0.0, 25.0);
+        let power = heater.get_status()["power"].as_f64().unwrap();
+        assert!((0.0..=1.0).contains(&power), "{power}");
+        // Far below target, the PID output should be saturated high.
+        assert!(power > 0.5, "{power}");
     }
 }

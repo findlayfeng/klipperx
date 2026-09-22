@@ -525,7 +525,7 @@ mod tests {
              [extruder]\nstep_pin: PA6\ndir_pin: PA7\nrotation_distance: 33.5\nmicrosteps: 16\n\
              nozzle_diameter: 0.4\nfilament_diameter: 1.75\nheater_pin: PB0\n\
              sensor_type: temperature_mcu\ncontrol: pid\npid_Kp: 1\npid_Ki: 0.1\npid_Kd: 10\n\
-             min_temp: 0\nmax_temp: 250\n{extra}\
+             min_temp: 0\nmax_temp: 250\nmin_extrude_temp: 0\n{extra}\
              [printer]\nkinematics: cartesian\nmax_velocity: 300\nmax_accel: 3000\n"
         )
     }

@@ -10,6 +10,7 @@
 //! | host → MCU | `update_digital_out oid=%c value=%c` |
 //! | host → MCU | `queue_digital_out oid=%c clock=%u on_ticks=%u` |
 //! | host → MCU | `set_digital_out_pwm_cycle oid=%c cycle_ticks=%u` |
+//! | host → MCU | `set_digital_out pin=%u value=%c` |
 //!
 //! `config_digital_out` allocates the oid; `pin` is the firmware's numeric pin
 //! (the `pin` enumeration), `value` the level to drive now, `default_value` the
@@ -131,6 +132,27 @@ impl McuCommand for SetDigitalOutPwmCycle {
     }
 }
 
+/// `set_digital_out pin=%u value=%c` — set a pin's level once, at config time.
+///
+/// Unlike [`ConfigDigitalOut`] this allocates no oid and cannot be changed
+/// later; it is what `[static_digital_output]` uses to hold a pin at a fixed
+/// level for the whole session (`gpiocmds.c:211`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SetDigitalOut {
+    /// Numeric pin (the `pin` enumeration value).
+    pub pin: u32,
+    /// Level to drive.
+    pub value: u8,
+}
+
+impl McuCommand for SetDigitalOut {
+    const NAME: &'static str = "set_digital_out";
+
+    fn args(&self) -> Vec<ArgValue> {
+        vec![ArgValue::UInt32(self.pin), ArgValue::UInt8(self.value)]
+    }
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -149,7 +171,8 @@ mod tests {
                 "config_digital_out oid=%c pin=%u value=%c default_value=%c max_duration=%u": 10,
                 "update_digital_out oid=%c value=%c": 11,
                 "queue_digital_out oid=%c clock=%u on_ticks=%u": 12,
-                "set_digital_out_pwm_cycle oid=%c cycle_ticks=%u": 13
+                "set_digital_out_pwm_cycle oid=%c cycle_ticks=%u": 13,
+                "set_digital_out pin=%u value=%c": 14
             }
         }))
         .unwrap()
@@ -205,6 +228,10 @@ mod tests {
                     cycle_ticks: 2_000_000,
                 }
                 .args(),
+            ),
+            (
+                SetDigitalOut::NAME,
+                SetDigitalOut { pin: 7, value: 1 }.args(),
             ),
         ] {
             let encoded = parser.encode(name, &args).unwrap();

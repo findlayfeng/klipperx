@@ -29,7 +29,9 @@ use super::spi::{McuSpi, SpiMode};
 use super::stepper::McuStepper;
 use super::trsync::TrsyncRegistry;
 use crate::core::klippy::cmd::clock::McuClock;
-use crate::core::klippy::cmd::gpio::{ConfigDigitalOut, QueueDigitalOut, UpdateDigitalOut};
+use crate::core::klippy::cmd::gpio::{
+    ConfigDigitalOut, QueueDigitalOut, SetDigitalOut, UpdateDigitalOut,
+};
 use crate::core::klippy::cmd::McuCommand;
 use crate::core::klippy::mcu::{ConfigBuilder, Mcu, McuError};
 use crate::core::klippy::pins::{
@@ -370,6 +372,29 @@ impl PinChip for McuChip {
             Arc::clone(&self.mcu),
             params.clone(),
         )))
+    }
+
+    fn setup_static_digital_out(&self, params: &PinParams) -> Result<(), PinError> {
+        // Like the other resources, the pin name becomes a number only once the
+        // firmware dictionary exists (the config callback), because the encoder
+        // takes `ArgValue`s and the name lives in the `pin` enumeration.
+        let builder = self.config();
+        let pins = self.pins();
+        let chip_name = self.name.clone();
+        let pin = params.pin.clone();
+        let invert = params.invert;
+        builder
+            .register_config_callback(Box::new(move |builder, mcu| {
+                let canonical = pins.resolve_pin(&chip_name, &pin)?;
+                let number = pin_number(mcu, &canonical, &chip_name)?;
+                builder.add_config_cmd(&SetDigitalOut {
+                    pin: number,
+                    value: u8::from(!invert),
+                })?;
+                Ok(())
+            }))
+            .expect("a static digital output is configured before finalize_config");
+        Ok(())
     }
 
     fn setup_pwm(&self, params: &PinParams) -> Result<Arc<dyn PwmOut>, PinError> {

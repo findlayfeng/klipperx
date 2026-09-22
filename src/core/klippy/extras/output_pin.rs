@@ -14,6 +14,8 @@
 //! | `value` | value to drive at startup (default 0) |
 //! | `shutdown_value` | value to fall back to on shutdown (default 0) |
 //! | `pwm` | use a PWM rather than a plain digital output (default false) |
+//! | `scale` | PWM full-scale figure (default 1, `above=0`); `value` / `shutdown_value`
+//!   are bounded by it |
 //! | `cycle_time` | PWM period in seconds (default 0.1) |
 //! | `hardware_pwm` | use the firmware's hardware PWM (default false, software PWM) |
 //!
@@ -30,7 +32,7 @@
 //!   `queue_digital_out` / `set_pwm` are used as soon as the clock layer exists
 //!   (TODO C1). For a software PWM that means `update_pwm` aligns the change to
 //!   the PWM cycle using the estimated clock.
-//! * **`scale` / `static_value` / `template`**: the display-template machinery.
+//! * **`static_value` / `template`**: the display-template machinery.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -81,16 +83,27 @@ impl OutputPin {
 
         let pin_desc = config.get("pin", None)?;
 
+        // Upstream reads `scale` only on the PWM path (`output_pin.py:207-214`);
+        // a digital output has an implicit scale of 1. `value` and
+        // `shutdown_value` are bounded by `scale` and stored divided by it, so
+        // only a PWM accepts values above 1.
+        let is_pwm = config.get_bool("pwm", Some(false))?;
+        let scale = if is_pwm {
+            config.get_float_bounded("scale", Some(1.0), None, None, Some(0.0), None)?
+        } else {
+            1.0
+        };
         let value =
-            config.get_float_bounded("value", Some(0.0), Some(0.0), Some(1.0), None, None)?;
+            config.get_float_bounded("value", Some(0.0), Some(0.0), Some(scale), None, None)?
+                / scale;
         let shutdown_value = config.get_float_bounded(
             "shutdown_value",
             Some(0.0),
             Some(0.0),
-            Some(1.0),
+            Some(scale),
             None,
             None,
-        )?;
+        )? / scale;
 
         let pins = printer
             .lookup_object_as::<PrinterPins>(PINS_OBJECT)
@@ -99,7 +112,7 @@ impl OutputPin {
         // Upstream disables the firmware's max-duration limit for an
         // `output_pin` unconditionally, which is what lets `value` and
         // `shutdown_value` differ.
-        let handle = if config.get_bool("pwm", Some(false))? {
+        let handle = if is_pwm {
             let pwm = pins
                 .setup_pwm(&pin_desc, None)
                 .map_err(|err| ConfigError::new(format!("{identifier}: {err}")))?;
@@ -127,7 +140,7 @@ impl OutputPin {
         let handler: CommandHandler = {
             let handle = Arc::clone(&handle);
             let value_slot = Arc::clone(&value_slot);
-            Arc::new(move |gcmd| cmd_set_pin(&handle, &value_slot, gcmd))
+            Arc::new(move |gcmd| cmd_set_pin(&handle, &value_slot, scale, gcmd))
         };
         gcode
             .register_mux_command(
@@ -172,20 +185,22 @@ impl std::fmt::Debug for OutputPin {
     }
 }
 
-/// `SET_PIN PIN=<name> VALUE=<0..1>`: drive the pin.
+/// `SET_PIN PIN=<name> VALUE=<0..scale>`: drive the pin.
 ///
 /// Upstream schedules this at a print time; without a clock layer the change
-/// happens through the resource's immediate path. A digital output treats
-/// `VALUE >= 0.5` as "on" (so a config that writes `0.5` does what upstream
-/// does); a PWM takes the value as a duty.
+/// happens through the resource's immediate path. `VALUE` is bounded by the
+/// pin's `scale` and divided by it before driving (`output_pin.py:249-269`); a
+/// digital output treats the result `>= 0.5` as "on", a PWM takes it as a duty.
 fn cmd_set_pin(
     handle: &PinHandle,
     value_slot: &Arc<Mutex<f64>>,
+    scale: f64,
     gcmd: &crate::core::klippy::gcode::GcodeCommand,
 ) -> Result<(), CommandError> {
     let value = gcmd
-        .get_float_range("VALUE", 0.0, 1.0)
-        .map_err(|err| CommandError::new(err.to_string()))?;
+        .get_float_range("VALUE", 0.0, scale)
+        .map_err(|err| CommandError::new(err.to_string()))?
+        / scale;
     let result = match handle {
         PinHandle::Digital(pin) => pin.update_digital_out(value >= 0.5),
         PinHandle::Pwm(pin) => pin.update_pwm(value),
@@ -470,6 +485,55 @@ mod tests {
             *chip.pwms.lock().unwrap()[0].cycle_time.lock().unwrap(),
             (0.1, true)
         );
+    }
+
+    #[test]
+    fn test_a_pwm_scale_raises_the_value_bound_and_divides_it() {
+        let (printer, chip) = printer();
+        let section = section(
+            "current",
+            "PA1",
+            &[
+                ("pwm", "true"),
+                ("scale", "2.0"),
+                ("value", "1.3"),
+                ("shutdown_value", "0.4"),
+            ],
+        );
+
+        let pin = OutputPin::new(&wrap(&section), &printer).unwrap();
+
+        let pwm = chip.pwms.lock().unwrap()[0].clone();
+        assert_eq!(*pwm.start_value.lock().unwrap(), (0.65, 0.2));
+
+        gcode(&printer)
+            .run_script("SET_PIN PIN=current VALUE=1.0")
+            .unwrap();
+        assert_eq!(*pwm.updates.lock().unwrap(), [0.5]);
+        assert_eq!(pin.get_status(0.0)["value"], 0.5);
+    }
+
+    #[test]
+    fn test_a_digital_output_value_is_still_bounded_by_one() {
+        let (printer, _chip) = printer();
+        let section = section("fan", "PA1", &[("value", "1.3")]);
+
+        let err = OutputPin::new(&wrap(&section), &printer).unwrap_err();
+
+        assert!(err.to_string().contains("must have maximum of 1"), "{err}");
+    }
+
+    #[test]
+    fn test_set_pin_is_bounded_by_the_scale() {
+        let (printer, _chip) = printer();
+        let section = section("current", "PA1", &[("pwm", "true"), ("scale", "2.0")]);
+        OutputPin::new(&wrap(&section), &printer).unwrap();
+
+        let err = gcode(&printer)
+            .run_script("SET_PIN PIN=current VALUE=3")
+            .unwrap_err();
+
+        assert!(err.to_string().contains("maximum"), "{err}");
     }
 
     #[test]

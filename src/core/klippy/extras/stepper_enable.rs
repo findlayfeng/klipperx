@@ -27,6 +27,7 @@ use std::sync::{Arc, Mutex};
 use serde_json::{json, Value};
 
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
+use crate::core::klippy::event::KlippyEvent;
 use crate::core::klippy::gcode::{GCodeDispatch, GcodeCommand, GCODE_OBJECT};
 use crate::core::klippy::load::section;
 use crate::core::klippy::pins::{DigitalOut, PrinterPins, PINS_OBJECT};
@@ -197,6 +198,25 @@ impl PrinterStepperEnable {
         }
     }
 
+    /// The `stepper_enable` object, creating it if the config named no section.
+    ///
+    /// Upstream's `PrinterStepper` calls `load_object(config, 'stepper_enable')`
+    /// for every stepper (`klippy/stepper.py:282-285`), so a config that only
+    /// writes `enable_pin` still gets the object, its enable tracking, and the
+    /// `M18`/`M84` commands. The created object registers itself in the printer
+    /// registry, exactly as an explicit `[stepper_enable]` factory would.
+    pub fn ensure(printer: &Arc<Printer>) -> Arc<Self> {
+        if let Some(existing) = printer.lookup_object_as::<Self>("stepper_enable") {
+            return existing;
+        }
+        let object = Arc::new(Self::new(printer));
+        object.register_gcode_commands(printer);
+        printer
+            .add_object("stepper_enable", object.clone())
+            .expect("`stepper_enable` is registered once per machine");
+        object
+    }
+
     /// Register a stepper with this enable tracker.
     ///
     /// Parses `enable_pin` from `config`, sets up the pin (shared or dedicated),
@@ -229,39 +249,39 @@ impl PrinterStepperEnable {
         Ok(())
     }
 
-    /// Register g-code commands (M18, M84, SET_STEPPER_ENABLE).
-    pub fn register_gcode_commands(&self, printer: &Arc<Printer>) {
+    /// Register g-code commands (M18, M84, SET_STEPPER_ENABLE) and the
+    /// `gcode:request_restart` handler that stops the motors.
+    pub fn register_gcode_commands(self: &Arc<Self>, printer: &Arc<Printer>) {
         let gcode = printer
             .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
             .expect("the loader registers `gcode` before any section");
 
-        let enable_lines = Arc::clone(&self.enable_lines);
-        let handler_m18 = Arc::new(move |gcmd: &GcodeCommand| {
-            let _ = gcmd;
-            // Turn off all motors
-            let stepper_names: Vec<String> = enable_lines.lock().unwrap().keys().cloned().collect();
-            for name in &stepper_names {
-                if let Some(tracking) = enable_lines.lock().unwrap().get(name) {
-                    tracking.lock().unwrap().motor_disable();
+        // M18/M84 turn every stepper off, which is `motor_off` (it also tells
+        // the rest of the machine via `stepper_enable:motor_off`).
+        let handler_m18: crate::core::klippy::gcode::CommandHandler = {
+            let weak = Arc::downgrade(self);
+            Arc::new(move |gcmd: &GcodeCommand| {
+                let _ = gcmd;
+                if let Some(object) = weak.upgrade() {
+                    object.motor_off();
                 }
-            }
-            Ok(())
-        });
+                Ok(())
+            })
+        };
         gcode
             .register_command(
                 "M18",
-                handler_m18.clone(),
+                Arc::clone(&handler_m18),
                 Some("Turn off all steppers"),
                 false,
             )
             .ok();
 
         // M84 is an alias for M18
-        let handler_m84 = Arc::clone(&handler_m18);
         gcode
             .register_command(
                 "M84",
-                handler_m84,
+                handler_m18,
                 Some("Turn off all steppers (alias)"),
                 false,
             )
@@ -291,9 +311,21 @@ impl PrinterStepperEnable {
                 false,
             )
             .ok();
+
+        // Upstream stops the motors on every restart
+        // (`stepper_enable.py:97-98`), before the new object graph is built.
+        let weak = Arc::downgrade(self);
+        printer.register_event_handler(
+            KlippyEvent::GcodeRequestRestart { print_time: 0.0 },
+            Box::new(move |_| {
+                if let Some(object) = weak.upgrade() {
+                    object.motor_off();
+                }
+            }),
+        );
     }
 
-    /// Turn off all motors.
+    /// Turn off all motors and notify the rest of the machine.
     pub fn motor_off(&self) {
         let stepper_names: Vec<String> =
             self.enable_lines.lock().unwrap().keys().cloned().collect();
@@ -301,6 +333,9 @@ impl PrinterStepperEnable {
             if let Some(tracking) = self.enable_lines.lock().unwrap().get(name) {
                 tracking.lock().unwrap().motor_disable();
             }
+        }
+        if let Some(printer) = &self.printer {
+            printer.send_event(&KlippyEvent::StepperEnableMotorOff);
         }
     }
 
@@ -399,8 +434,9 @@ pub(crate) fn load_config(
     _config: &ConfigWrapper,
     printer: &Arc<Printer>,
 ) -> Result<Arc<dyn PrinterObject>, ConfigError> {
-    let obj = PrinterStepperEnable::new(printer);
-    Ok(Arc::new(obj))
+    let obj = Arc::new(PrinterStepperEnable::new(printer));
+    obj.register_gcode_commands(printer);
+    Ok(obj)
 }
 
 // Register the [stepper_enable] section.

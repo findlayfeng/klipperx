@@ -216,8 +216,10 @@ connect_file(输出文件, 字典):
   各组收益不可加。
 - 进度以**转绿运行数 / `IGNORED` 条目数**衡量（当前 1 / 36）；先产出「**运行 × 缺口**」矩阵
   （列出每条运行的**全部**缺口，而非第一个），据此找「只差一个缺口」的用例与公共前缀。
-- **验收标准**：对应 `.test` 从 `IGNORED` 移除后通过。建议加 `IGNORED` **守卫测试**——某条已能
-  通过却仍在列表里时失败并提示移除，防止条目漂移。
+- **验收标准**：对应 `.test` 从 `IGNORED` 移除后通过。`ignored_cases_still_fail` 是守卫——
+  某个忽略文件的全部可跑运行都通过时报失败并提示移除。
+- 看全部缺口（而不只是首次失败）：
+  `cargo test -p klipperx --lib upstream_gap_report -- --nocapture`。
 - `out_of_bounds.test` 是唯一的 `SHOULD_FAIL`，必须等配置能装载后再移出，否则越界检查会被配置
   错误「喂饱」。
 
@@ -231,6 +233,8 @@ connect_file(输出文件, 字典):
 |------|------|------|
 | 语料结构完整、引用可解析 | 无 | `upstream_test_cases_are_well_formed`、`upstream_test_inputs_resolve` |
 | 每份 `.cfg` 由本仓库解析器读取 | 无 | `every_upstream_printer_config_parses` |
+| 全部缺口扫描（**报告**，不失败） | 无 | `upstream_gap_report`（`-- --nocapture` 查看缺口矩阵） |
+| `IGNORED` 条目守卫 | 运行声明的全部字典 + 所用配置节 | `ignored_cases_still_fail`（某个忽略文件全跑通了就报失败） |
 | 运行内联 g-code 可解析 | 运行所用配置节 | `#[ignore] upstream_inline_gcode_parses` |
 | 运行端到端执行 | 运行声明的全部字典 + 所用配置节 | `upstream_test_cases_run`（按运行的可用性过滤 + 忽略列表） |
 

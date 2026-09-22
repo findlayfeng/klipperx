@@ -64,6 +64,7 @@ pub mod adc;
 pub mod allocate_oids;
 pub mod clock;
 pub mod config;
+pub mod debug;
 pub mod ds18b20;
 pub mod endstop;
 pub mod gpio;
@@ -78,6 +79,7 @@ pub mod uptime;
 
 pub use adc::{AnalogInState, AnalogInStateOld, ConfigAnalogIn, QueryAnalogIn, QueryAnalogInOld};
 pub use clock::{ClockState, ClockSync, GetClock, McuClock, SecondarySync};
+pub use debug::{DebugRead, DebugResult, DebugWrite};
 pub use endstop::{ConfigEndstop, EndstopHome, EndstopQueryState, EndstopState};
 pub use gpio::{ConfigDigitalOut, QueueDigitalOut, SetDigitalOutPwmCycle, UpdateDigitalOut};
 pub use i2c::{

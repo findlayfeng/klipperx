@@ -196,6 +196,53 @@ impl SimulatorDevice {
                         ],
                     );
                 }
+                "debug_read" => {
+                    // `debug_read order=%c addr=%u` — return a simulated value.
+                    // For simplicity, we return 0 for all reads (not fully
+                    // simulated memory model).
+                    let order = match params.first() {
+                        Some(ArgValue::UInt8(v)) => *v,
+                        _ => {
+                            debug!("simulator: debug_read: missing order");
+                            return;
+                        }
+                    };
+                    let _addr = match params.get(1) {
+                        Some(ArgValue::UInt32(v)) => *v,
+                        _ => {
+                            debug!("simulator: debug_read: missing addr");
+                            return;
+                        }
+                    };
+                    // Return 0 for all reads (simplified simulation).
+                    Self::respond(state, seq, "debug_result", &[ArgValue::UInt32(0)]);
+                }
+                "debug_write" => {
+                    // `debug_write order=%c addr=%u val=%u` — accept but ignore.
+                    // No memory model to update.
+                    let _order = match params.first() {
+                        Some(ArgValue::UInt8(v)) => *v,
+                        _ => {
+                            debug!("simulator: debug_write: missing order");
+                            return;
+                        }
+                    };
+                    let _addr = match params.get(1) {
+                        Some(ArgValue::UInt32(v)) => *v,
+                        _ => {
+                            debug!("simulator: debug_write: missing addr");
+                            return;
+                        }
+                    };
+                    let _val = match params.get(2) {
+                        Some(ArgValue::UInt32(v)) => *v,
+                        _ => {
+                            debug!("simulator: debug_write: missing val");
+                            return;
+                        }
+                    };
+                    // No response expected for debug_write.
+                }
                 // Everything else is accepted and ignored: `allocate_oids`,
                 // `config_*`, `queue_step`, `emergency_stop`, and any command
                 // this fake firmware does not model yet.

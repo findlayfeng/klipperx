@@ -1,6 +1,8 @@
 use super::wrapper::ConfigWrapper;
 use crate::core::klippy::error::ConfigError;
 use crate::core::klippy::interface::usb::UsbPowerMethod;
+#[cfg(test)]
+use crate::core::klippy::interface::SimulatorDevice;
 use crate::core::klippy::interface::{Interface, SerialDevice};
 use crate::core::klippy::mcu::McuRestartMethod;
 use tracing::warn;
@@ -51,6 +53,9 @@ pub enum Transport {
     /// A scripted device, in test builds (`test:`).
     #[cfg(test)]
     Test(String),
+    /// A dictionary-driven fake MCU, in test builds (`test: dict=<path>`).
+    #[cfg(test)]
+    Simulator(String),
 }
 
 /// Parse Klipper's `canbus_uuid`: six bytes as twelve hex digits.
@@ -306,6 +311,9 @@ impl McuConfig {
 
         #[cfg(test)]
         if let Some(test_value) = section.get_str("test") {
+            if let Some(path) = test_value.trim().strip_prefix("dict=") {
+                return Ok(Transport::Simulator(path.trim().to_string()));
+            }
             return Ok(Transport::Test(test_value));
         }
 
@@ -406,6 +414,10 @@ impl Transport {
             }
             #[cfg(test)]
             Transport::Test(value) => Ok(Interface::new(McuConfig::test_device(value))),
+            #[cfg(test)]
+            Transport::Simulator(path) => SimulatorDevice::new(path)
+                .map(Interface::simulator)
+                .map_err(|e| format!("test: {e}")),
         }
     }
 }

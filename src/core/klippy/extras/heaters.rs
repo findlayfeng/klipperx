@@ -64,6 +64,8 @@ pub struct Heater {
     max_temp: f64,
     /// Whether extrusion is allowed. Stubbed to `true` (see the type docs).
     can_extrude: bool,
+    /// `min_extrude_temp`: the reading below which extrusion is refused.
+    min_extrude_temp: f64,
     target_temp: Mutex<f64>,
     last_temp: Mutex<f64>,
 }
@@ -227,14 +229,25 @@ impl PrinterHeaters {
         let min_temp = config.get_float("min_temp", None)?;
         let max_temp =
             config.get_float_bounded("max_temp", None, None, None, Some(min_temp), None)?;
-        let _ = config.get_float_bounded(
-            "min_extrude_temp",
-            Some(170.0),
-            Some(min_temp),
-            Some(max_temp),
-            None,
-            None,
-        )?;
+        // Upstream returns the default without range-checking it
+        // (`configfile._get_wrapper`), which matters here: a bed's
+        // `max_temp` (e.g. 130) is below the default `min_extrude_temp` (170).
+        let min_extrude_temp = match config.get_optional_float("min_extrude_temp")? {
+            Some(value) => {
+                if value < min_temp {
+                    return Err(ConfigError::new(format!(
+                        "Option 'min_extrude_temp' in section '{identifier}' must have minimum of {min_temp}"
+                    )));
+                }
+                if value > max_temp {
+                    return Err(ConfigError::new(format!(
+                        "Option 'min_extrude_temp' in section '{identifier}' must have maximum of {max_temp}"
+                    )));
+                }
+                value
+            }
+            None => 170.0,
+        };
         let _ =
             config.get_float_bounded("max_power", Some(1.0), None, Some(1.0), Some(0.0), None)?;
         let _ = config.get_float_bounded("smooth_time", Some(1.0), None, None, Some(0.0), None)?;
@@ -284,6 +297,7 @@ impl PrinterHeaters {
             // reading. Upstream allows it when `min_extrude_temp <= 0` or in
             // file-output mode; the fake-MCU harness is the latter in spirit.
             can_extrude: true,
+            min_extrude_temp,
             target_temp: Mutex::new(0.0),
             last_temp: Mutex::new(0.0),
         });

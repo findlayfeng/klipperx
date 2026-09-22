@@ -17,7 +17,7 @@
 | `CONFIG <path>` | 用例使用的配置文件，相对 `.test` 文件解析 |
 | `DICTIONARY <file> [<mcu>=<file> …]` | 固件数据字典；首项为主 MCU，其余为次级 MCU |
 | `GCODE <path>` | 以文件提供 g-code，与内联 g-code 二选一 |
-| `SHOULD_FAIL` | 反转期望：期望 `klippy.py` 以错误退出 |
+| `SHOULD_FAIL` | 反转**运行期**期望：期望 `klippy.py` 在跑 g-code 时报错（配置装载失败不算，见「忽略列表」） |
 | 其他非空行 | 内联 g-code，按出现顺序执行 |
 
 `#` 起始注释。一份 `.test` 定义的是一**串运行**：每个 `CONFIG` 块是一次 `klippy.py` 调用，在
@@ -275,6 +275,15 @@ harness 把每个 `[mcu]` / `[mcu <name>]` 的传输键换成 `test: dict=<字�
 | `rotary_delta` | `rotary_delta_calibrate` |
 
 （14 + 6 + 13 + 1 + 1 + 1 + 1 = 37。）
+
+`out_of_bounds.test` 是唯一声明 `SHOULD_FAIL` 的用例，它期望的是**运行期**错误（`G1 Y9999` 越界），
+不是配置错误。上游可以把任何非零退出都当成功，是因为它什么都不缺；本仓库因此把结果分两段：
+
+- `load_config` + `bring_up` 失败 = 「这台主机还跑不了这个用例」，报为**失败**，不算满足 `SHOULD_FAIL`；
+- 只有 g-code 阶段的错误才反转成成功（`run_phases` 的两段返回值）。
+
+所以把它留在忽略列表里是正确的：等 `example-cartesian.cfg` 所需的节/运动学落地、把它移出忽略列表后，
+反转才会真的去验越界检查，而不是被一个配置装载错误“喂饱”。
 
 ### 运行
 

@@ -344,10 +344,16 @@ mod tests {
     /// Load `config`, bring the machine up, and run `script` through the
     /// ordinary g-code dispatcher.
     ///
+    /// The two phases are reported separately, because a `SHOULD_FAIL` run may
+    /// only be satisfied by the second: an outer `Err` means the machine could
+    /// not be brought up at all — a gap in this host (a missing section, say),
+    /// never the failure the run is about — while `Ok(Err(..))` means it ran and
+    /// the g-code failed, which is what such a run expects.
+    ///
     /// The printer is torn down before returning: the config's parts hold the
     /// device open, and a receive task parked on it would keep the test runtime
     /// from shutting down.
-    async fn run_script_on(config: &Config, script: &str) -> Result<(), String> {
+    async fn run_phases(config: &Config, script: &str) -> Result<Result<(), String>, String> {
         use crate::core::klippy::gcode::{GCodeDispatch, GCODE_OBJECT};
         use crate::core::klippy::printer::{Printer, PrinterState};
         use crate::core::klippy::reactor::TokioReactor;
@@ -355,7 +361,7 @@ mod tests {
         let reactor = Arc::new(TokioReactor::new(tokio::runtime::Handle::current()));
         let printer = Arc::new(Printer::new(reactor));
 
-        let result = async {
+        let setup = async {
             printer.load_config(config).map_err(|e| e.to_string())?;
             // A fake firmware answers at once, so a wait here means the
             // exchange is stuck; give up instead of hanging the test run.
@@ -369,22 +375,41 @@ mod tests {
             if state.category != PrinterState::Ready {
                 return Err(format!("not ready: {}", state.message));
             }
-
-            let gcode = printer
-                .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
-                .ok_or_else(|| "the g-code dispatcher is not registered".to_string())?;
-            gcode.run_script(script).map_err(|e| e.to_string())?;
-
-            let state = printer.get_state_message();
-            if state.category != PrinterState::Ready {
-                return Err(format!("left ready: {}", state.message));
-            }
             Ok(())
         }
         .await;
 
+        let gcode = if setup.is_ok() {
+            match printer.lookup_object_as::<GCodeDispatch>(GCODE_OBJECT) {
+                Some(dispatcher) => match dispatcher.run_script(script) {
+                    Ok(()) => {
+                        let state = printer.get_state_message();
+                        if state.category == PrinterState::Ready {
+                            Ok(())
+                        } else {
+                            Err(format!("left ready: {}", state.message))
+                        }
+                    }
+                    Err(e) => Err(e.to_string()),
+                },
+                None => Err("the g-code dispatcher is not registered".to_string()),
+            }
+        } else {
+            // Unused: `setup` decides the result below.
+            Ok(())
+        };
+
         printer.teardown();
-        result
+        match setup {
+            Err(e) => Err(e),
+            Ok(()) => Ok(gcode),
+        }
+    }
+
+    /// Both phases have to succeed; for the minimal case, which asserts a clean
+    /// run rather than an inverted expectation.
+    async fn run_script_on(config: &Config, script: &str) -> Result<(), String> {
+        run_phases(config, script).await?
     }
 
     /// Every dictionary a run names, and whether it was built.
@@ -400,6 +425,11 @@ mod tests {
     /// `dictionaries` pairs each named MCU with the dictionary to serve it; a
     /// missing one is an error — running the run with a different target's
     /// dictionary would not be the run upstream wrote.
+    ///
+    /// `SHOULD_FAIL` inverts the result of the **g-code phase only**: a config
+    /// that cannot be loaded is a gap in this host, so it is reported as a
+    /// failure rather than quietly satisfying the expectation. Upstream can
+    /// treat every non-zero exit as success because it implements everything.
     async fn run_case(
         run: &UpstreamRun,
         dictionaries: &[(Option<String>, Option<PathBuf>)],
@@ -422,14 +452,13 @@ mod tests {
             None => run.gcode_lines.join("\n"),
         };
 
-        let outcome = match injected_config(&run.config, &resolved) {
-            Ok(parsed) => run_script_on(&parsed, &script)
-                .await
-                .map_err(|e| format!("{}: {e}", relative(&run.config))),
-            Err(e) => Err(e),
+        let parsed = injected_config(&run.config, &resolved)?;
+        let gcode = match run_phases(&parsed, &script).await {
+            Err(setup) => return Err(format!("{}: {setup}", relative(&run.config))),
+            Ok(gcode) => gcode,
         };
 
-        match (run.should_fail, outcome) {
+        match (run.should_fail, gcode) {
             (false, outcome) => outcome,
             (true, Err(_)) => Ok(()),
             (true, Ok(())) => Err("the run was expected to fail".to_string()),
@@ -448,6 +477,30 @@ mod tests {
         // Only the enabled architectures' dictionaries exist, so a target that
         // was not built has none: the case cannot run rather than borrow one.
         assert_eq!(dictionary_path("atmega2560.dict"), None);
+    }
+
+    /// A `SHOULD_FAIL` run is only satisfied by the g-code phase: a config this
+    /// host cannot load is a gap in the host, reported as a failure rather than
+    /// as the expected one (see [`run_case`]).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_should_fail_run_is_not_satisfied_by_a_config_that_does_not_load() {
+        let run = UpstreamRun {
+            path: klippy_test_dir().join("linuxtest.test"),
+            config: klippy_test_dir().join("linuxtest.cfg"),
+            dictionaries: vec![Dictionary {
+                mcu: None,
+                file: "linuxprocess.dict".to_string(),
+            }],
+            gcode_file: None,
+            gcode_lines: vec!["G4 P1000".to_string()],
+            should_fail: true,
+        };
+
+        let result = run_case(&run, &run_dictionaries(&run)).await;
+        assert!(
+            result.is_err(),
+            "a config that does not load must not satisfy SHOULD_FAIL"
+        );
     }
 
     /// The minimal case that needs only `[mcu]`: it exercises identify, the

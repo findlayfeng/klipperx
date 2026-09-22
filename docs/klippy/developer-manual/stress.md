@@ -76,13 +76,13 @@ klipperx stress [OPTIONS] <CONFIG_FILE> [MCU]
 
 ## 任务二：运动链路冒烟（`--task motion`）
 
-把 FW5 的**主机运动链路**在真板上跑一遍：用与 `--task step` 相同的 step/dir 引脚配置一个
+把**主机运动链路**在真板上跑一遍：用与 `--task step` 相同的 step/dir 引脚配置一个
 stepper，然后
 
 ```
 Trapq（一段匀速 5 mm 移动）
   → itersolve（stepsolver）
-  → stepcompress（FW5f 完整压缩）
+  → stepcompress（完整压缩）
   → queue_step 下发（分批 + flush）
   → stepper_get_position 读回
 ```

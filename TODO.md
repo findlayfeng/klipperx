@@ -320,8 +320,27 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 - [ ] **T6. TMC pin chip**（19 次失败）：`tmc2209_stepper_x`（6）、`tmc2130_stepper_x`（3）、
       `tmc2209 stepper_x`（12）、`tmc2208 stepper_x`（3）、`tmc5160 stepper_x`（2）、
       `tmc2660 stepper_x`（1）。依赖 H5（TMC）。
-- [ ] **T7. 温度传感器**（7 次失败）：`temperature_mcu`（5）、`TDK NTCG104LH104JT1`、
-      `my_custom_resistance_adc`。依赖 H1（温度传感器）。
+- [x] **T7. 温度传感器**（7 次失败）：已完成 Phase 1
+  - [x] **T7-P1**：ADC 转换核心（`adc_temperature.rs`，833 行）
+    - `LinearInterpolate` — 线性插值表
+    - `LinearVoltage` — 电压传感器（AD595/AD597/AD8494-7）
+    - `LinearResistance` — 电阻传感器（PT100/PT1000）
+    - `Thermistor` — Steinhart-Hart 3 参数 + Beta 回退
+    - 默认传感器表：AD595/AD597/AD8494/AD8495/AD8496/AD8497/PT1000/PT100 INA826
+  - [x] **T7-P2**：ADC 桥接层（`AdcTemperatureBridge<C: Convert>`）
+    - 泛型桥接，`Convert` trait 统一接口
+    - `Sensor` trait 实现，可注册到 heaters
+    - 自定义传感器：`CustomThermistor`、`CustomLinearVoltage`、`CustomLinearResistance`
+  - [x] **T7-P3**：MCU 温度传感器（`temperature_mcu.rs`，392 行）
+    - `LinearMCUConverter` — MCU 线性转换 `temp = base + adc * slope`
+    - `TemperatureMCUSensor` — Sensor 实现
+    - MCU 校准数据库：STM32/SAMD21/RP2040/ESP32 等 10 款
+    - `CustomCalibration` — 自定义校准参数
+  - [x] **T7-P4**：注册集成
+    - `heaters::ensure` 注册 `thermistor`/`adc_temperature`/`temperature_mcu` 工厂
+    - 前缀工厂：`[thermistor <name>]`、`[adc_temperature <name>]`
+    - 直接工厂：`temperature_mcu`
+  - 覆盖 7 次失败：`temperature_mcu`（5）、`TDK NTCG104LH104JT1`、`my_custom_resistance_adc`
 - [ ] **T8. `output_pin` 的 `value` 选项**（5 次失败）：`output_pin stepper_xy_current` 的
       `value` 超过最大值 1。依赖 H2（风扇与通用输出）。
 - [ ] **T9. 其余 extras 段**：`bed_screws`、`dual_carriage`、`safe_z_home`、`endstop_phase`、

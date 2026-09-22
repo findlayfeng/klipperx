@@ -745,6 +745,19 @@ impl PrinterObject for McuObject {
             // The accumulated configuration is encoded once, and the handshake
             // can then be retried on a fresh connection if the firmware has to
             // reboot to accept it (`mcu/config.rs`).
+            // Work that needs the dictionary *and* a round-trip to the firmware
+            // before the configuration is frozen (the `debug_read` calibration
+            // reads in `temperature_mcu`). The dictionary is installed and the
+            // device is attached by now, and this call is awaited, so the
+            // callbacks may `call_msg` on the live connection.
+            self.chip
+                .config()
+                .run_pre_build(&mcu)
+                .await
+                .map_err(|err| match err {
+                    McuError::Config(message) => KlippyError::Config(ConfigError::new(message)),
+                    other => KlippyError::Internal(other.to_string()),
+                })?;
             let mut built = self.chip.config().build(&mcu).map_err(|err| match err {
                 // A config callback resolves pins/buses against the
                 // dictionary; a bad pin is a config problem, not klippy's.

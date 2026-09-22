@@ -22,6 +22,7 @@
 mod config;
 mod dictionary;
 mod error;
+mod events;
 mod object;
 mod pending;
 mod resource;
@@ -41,6 +42,8 @@ pub use resource::{
     TRSYNC_SINGLE_MCU_TIMEOUT, TRSYNC_TIMEOUT,
 };
 pub use restart_method::McuRestartMethod;
+
+use events::McuEvents;
 
 use crate::core::klippy::load::section;
 
@@ -109,6 +112,9 @@ enum SendItem {
 pub struct Mcu {
     /// MCU name
     name: String,
+    /// Inbound callbacks, keyed by message id. Kept out of the parser so the
+    /// codec can be shared without the callbacks owning the binding resources.
+    events: Arc<McuEvents>,
     /// Message parser for communication
     parser: Parser,
     /// The firmware's data dictionary, installed after the identify handshake.
@@ -488,6 +494,8 @@ impl Mcu {
         // [`Mcu::install_dictionary`]).
         let parser = identify::new_parser();
         let parser_for_task = parser.clone();
+        let events = Arc::new(McuEvents::new());
+        let events_for_task = Arc::clone(&events);
         let pending_calls = PendingCalls::new();
         let pending_calls_for_task = pending_calls.clone();
         // Both transport tasks run on the interface's runtime, not the ambient
@@ -724,8 +732,9 @@ impl Mcu {
                         );
                         continue;
                     }
-                    // No pending call — fall back to callback.
-                    if let Some(callback) = &msg.callback {
+                    // No pending call — fall back to the callback bound to
+                    // this message id.
+                    if let Some(callback) = events_for_task.callback(msg.id) {
                         debug!("Invoking callback for {} (id={})", msg.name, msg.id);
                         let mut cb = callback.lock().unwrap();
                         cb(params.as_slice());
@@ -740,6 +749,7 @@ impl Mcu {
         Self {
             name,
             parser,
+            events,
             dictionary: StdMutex::new(None),
             send_buf_tx,
             pending_calls,
@@ -1091,7 +1101,7 @@ impl Mcu {
         if !self.parser.is_registered(command) {
             return Err(McuCallError::CommandNotFound(command.to_string()));
         }
-        if self.parser.has_callback(command) {
+        if self.events.has_callback(&self.parser, command) {
             warn!(
                 "Command '{}' already has a callback, call may not work as expected",
                 command
@@ -1156,13 +1166,11 @@ impl Mcu {
         name: &str,
         callback: impl FnMut(&[ArgValue]) + Send + 'static,
     ) -> Result<(), McuError> {
-        // `Parser` is a thin handle over shared state, and `bind` only needs
-        // `&mut` on the handle, so cloning it is enough to bind while `&self`
-        // is borrowed. The clone shares the registry the receive task reads, so
-        // the callback is live immediately.
-        let mut parser = self.parser.clone();
-        parser.bind(name, callback)?;
-        Ok(())
+        // The table is separate from the parser, so binding needs no `&mut` on
+        // the shared registry; the receive task sees it immediately.
+        self.events
+            .bind(&self.parser, name, callback)
+            .map_err(McuError::Msg)
     }
 }
 

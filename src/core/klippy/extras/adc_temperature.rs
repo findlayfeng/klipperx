@@ -8,11 +8,15 @@
 //! This module registers the built-in sensor factories with `heaters`
 //! (the `[adc_temperature]` section exists only to be loaded).
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+use serde_json::{json, Value};
 
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
-use crate::core::klippy::extras::heaters::{PrinterHeaters, Sensor, SensorCallback};
-use crate::core::klippy::printer::Printer;
+use crate::core::klippy::extras::heaters::{self, PrinterHeaters, Sensor, SensorCallback};
+use crate::core::klippy::load::section;
+use crate::core::klippy::pins::{Adc, PrinterPins, PINS_OBJECT};
+use crate::core::klippy::printer::{Printer, PrinterObject};
 
 // ===========================================================================
 // Linear interpolation
@@ -621,10 +625,7 @@ const DEFAULT_VOLTAGE_SENSORS: &[(&str, &[(f64, f64)])] = &[
     ("AD8497", AD8497),
 ];
 
-// Default resistance-based sensors: (name, calibration_data)
-// Note: PT1000 and PT100 INA826 are computed at runtime via functions
-#[allow(dead_code)]
-const DEFAULT_RESISTANCE_SENSORS: &[(&str, Vec<(f64, f64)>)] = &[];
+// Default resistance-based sensors: PT1000 is computed at runtime.
 
 /// Get the computed PT100 INA826 calibration data.
 pub fn get_pt100_ina826_data() -> Vec<(f64, f64)> {
@@ -660,41 +661,66 @@ const SAMPLE_COUNT: u32 = 8;
 const REPORT_TIME: f64 = 0.300;
 const RANGE_CHECK_COUNT: u32 = 4;
 
-/// Bridge between MCU ADC and heater temperature callback.
-///
-/// Implements `Sensor` so it can be registered in the heaters factory table.
-pub struct AdcTemperatureBridge<C: Convert> {
-    convert: C,
-    min_temp: std::sync::Mutex<f64>,
-    max_temp: std::sync::Mutex<f64>,
-    callback: std::sync::Mutex<Option<SensorCallback>>,
+/// Build the ADC resource a sensor section names with `sensor_pin`.
+fn sensor_adc(config: &ConfigWrapper, printer: &Arc<Printer>) -> Result<Arc<dyn Adc>, ConfigError> {
+    let pin = config.get("sensor_pin", None)?;
+    let pins = printer
+        .lookup_object_as::<PrinterPins>(PINS_OBJECT)
+        .ok_or_else(|| ConfigError::new("sensor_pin: the pins object is not registered"))?;
+    pins.setup_adc(&pin, None)
+        .map_err(|err| ConfigError::new(format!("sensor_pin: {err}")))
 }
 
-impl<C: Convert> AdcTemperatureBridge<C> {
-    /// Create a new bridge.
-    pub fn new(convert: C) -> Self {
-        Self {
+/// Bridge between MCU ADC and heater temperature callback.
+///
+/// Upstream's `PrinterADCtoTemperature` (`klippy/extras/adc_temperature.py:17`):
+/// it owns the ADC resource for the section's `sensor_pin`, converts each report
+/// with the [`Convert`] it was given, and forwards the temperature to the
+/// heater's callback.
+pub struct AdcTemperatureBridge<C: Convert> {
+    convert: C,
+    adc: Arc<dyn Adc>,
+    callback: Mutex<Option<SensorCallback>>,
+}
+
+impl<C: Convert + 'static> AdcTemperatureBridge<C> {
+    /// Create a bridge on `adc` and install its report callback.
+    pub fn new(convert: C, adc: Arc<dyn Adc>) -> Arc<Self> {
+        let bridge = Arc::new(Self {
             convert,
-            min_temp: std::sync::Mutex::new(f64::MIN),
-            max_temp: std::sync::Mutex::new(f64::MAX),
-            callback: std::sync::Mutex::new(None),
-        }
+            adc: Arc::clone(&adc),
+            callback: Mutex::new(None),
+        });
+        // Weak, not Arc: the resource owns the callback and the bridge owns the
+        // resource, so a strong handle would close that cycle. The printer object
+        // holding the bridge is what keeps it alive.
+        let weak = Arc::downgrade(&bridge);
+        adc.setup_adc_callback(Box::new(move |samples| {
+            if let Some(bridge) = weak.upgrade() {
+                bridge.handle_adc_report(samples);
+            }
+        }));
+        bridge
     }
 
     /// Handle one ADC report and forward the temperature via the stored callback.
     pub fn handle_adc_report(&self, samples: &[(u64, f64)]) {
         let (read_time, read_value) = samples[samples.len() - 1];
         let temp = self.convert.calc_temp(read_value);
-        let time = (read_time as f64) + SAMPLE_COUNT as f64 * SAMPLE_TIME;
-        // Invoke the callback while holding the lock
-        let mut cb_guard = self.callback.lock().unwrap();
-        if let Some(cb) = cb_guard.as_mut() {
+        let time = (read_time as f64) + f64::from(SAMPLE_COUNT) * SAMPLE_TIME;
+        if let Some(cb) = self
+            .callback
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_mut()
+        {
             cb(time, temp);
         }
     }
+}
 
-    /// Setup ADC sampling with min/max range derived from temperature bounds.
-    pub fn setup_adc_sample(&self, min_temp: f64, max_temp: f64) -> (f64, f64, u32, f64, f64, u32) {
+impl<C: Convert + 'static> Sensor for AdcTemperatureBridge<C> {
+    fn setup_minmax(&self, min_temp: f64, max_temp: f64) {
         let arange = [
             self.convert.calc_adc(min_temp),
             self.convert.calc_adc(max_temp),
@@ -704,25 +730,19 @@ impl<C: Convert> AdcTemperatureBridge<C> {
         } else {
             (arange[1], arange[0])
         };
-        (
+        self.adc.setup_adc_sample(
             REPORT_TIME,
             SAMPLE_TIME,
             SAMPLE_COUNT,
+            1,
             min_adc,
             max_adc,
             RANGE_CHECK_COUNT,
-        )
-    }
-}
-
-impl<C: Convert> Sensor for AdcTemperatureBridge<C> {
-    fn setup_minmax(&self, min_temp: f64, max_temp: f64) {
-        *self.min_temp.lock().unwrap() = min_temp;
-        *self.max_temp.lock().unwrap() = max_temp;
+        );
     }
 
     fn setup_callback(&self, callback: SensorCallback) {
-        *self.callback.lock().unwrap() = Some(callback);
+        *self.callback.lock().unwrap_or_else(|p| p.into_inner()) = Some(callback);
     }
 }
 
@@ -741,10 +761,10 @@ pub fn voltage_sensor_factory(
     params: &[(f64, f64)],
 ) -> impl Fn(&ConfigWrapper, &Arc<Printer>) -> Result<Arc<dyn Sensor>, ConfigError> {
     let params = params.to_vec();
-    move |config: &ConfigWrapper, _printer: &Arc<Printer>| {
+    move |config: &ConfigWrapper, printer: &Arc<Printer>| {
+        let adc = sensor_adc(config, printer)?;
         let lv = LinearVoltage::new(config, &params)?;
-        let bridge = Arc::new(AdcTemperatureBridge::new(lv));
-        Ok(bridge as Arc<dyn Sensor>)
+        Ok(AdcTemperatureBridge::new(lv, adc) as Arc<dyn Sensor>)
     }
 }
 
@@ -753,10 +773,10 @@ pub fn resistance_sensor_factory(
     samples: Vec<(f64, f64)>,
 ) -> impl Fn(&ConfigWrapper, &Arc<Printer>) -> Result<Arc<dyn Sensor>, ConfigError> {
     let samples = samples.clone();
-    move |config: &ConfigWrapper, _printer: &Arc<Printer>| {
+    move |config: &ConfigWrapper, printer: &Arc<Printer>| {
+        let adc = sensor_adc(config, printer)?;
         let lr = LinearResistance::new(config, &samples)?;
-        let bridge = Arc::new(AdcTemperatureBridge::new(lr));
-        Ok(bridge as Arc<dyn Sensor>)
+        Ok(AdcTemperatureBridge::new(lr, adc) as Arc<dyn Sensor>)
     }
 }
 
@@ -877,8 +897,10 @@ impl Convert for LinearResistance {
 /// Create a thermistor sensor from params.
 pub fn thermistor_sensor(
     config: &ConfigWrapper,
+    printer: &Arc<Printer>,
     params: &[(f64, f64, f64)], // (t, r, beta_or_0)
 ) -> Result<Arc<dyn Sensor>, ConfigError> {
+    let adc = sensor_adc(config, printer)?;
     let pullup =
         config.get_float_bounded("pullup_resistor", Some(4700.0), Some(0.0), None, None, None)?;
     let inline_resistor =
@@ -886,19 +908,24 @@ pub fn thermistor_sensor(
 
     let mut thermistor = Thermistor::new(pullup, inline_resistor);
 
-    if params.len() == 3 && params[0].2 > 0.0 {
+    if params.len() == 1 && params[0].2 > 0.0 {
         // Beta parameter form: (t1, r1, beta)
         thermistor.setup_coefficients_beta(params[0].0, params[0].1, params[0].2);
-    } else {
+    } else if params.len() >= 3 {
         // Three-point Steinhart-Hart: (t1, r1), (t2, r2), (t3, r3)
         let (t1, r1, _) = params[0];
         let (t2, r2, _) = params[1];
         let (t3, r3, _) = params[2];
         thermistor.setup_coefficients(t1, r1, t2, r2, t3, r3);
+    } else {
+        return Err(ConfigError::new(format!(
+            "adc_temperature {} in heater {}: need at least two samples",
+            config.section().sub.clone().unwrap_or_default(),
+            config.identifier()
+        )));
     }
 
-    let bridge = Arc::new(AdcTemperatureBridge::new(thermistor));
-    Ok(bridge as Arc<dyn Sensor>)
+    Ok(AdcTemperatureBridge::new(thermistor, adc) as Arc<dyn Sensor>)
 }
 
 // ===========================================================================
@@ -916,12 +943,9 @@ pub struct CustomThermistor {
 impl CustomThermistor {
     /// Read temperature/resistance points from config.
     pub fn new(config: &ConfigWrapper) -> Result<Self, ConfigError> {
-        // Build name from section id + optional sub (e.g., "thermistor MyName")
-        let mut name = config.section().id.clone();
-        if let Some(sub) = &config.section().sub {
-            name.push(' ');
-            name.push_str(sub);
-        }
+        // The sensor name is the section's sub-name (`[thermistor MyName]` →
+        // `MyName`), which is what a consumer writes as `sensor_type`.
+        let name = config.section().sub.clone().unwrap_or_default();
 
         let mut params: Vec<(f64, f64, f64)> = Vec::new();
         let mut i = 1;
@@ -950,8 +974,12 @@ impl CustomThermistor {
     }
 
     /// Create a sensor from this custom thermistor's config.
-    pub fn create(&self, config: &ConfigWrapper) -> Result<Arc<dyn Sensor>, ConfigError> {
-        thermistor_sensor(config, &self.params)
+    pub fn create(
+        &self,
+        config: &ConfigWrapper,
+        printer: &Arc<Printer>,
+    ) -> Result<Arc<dyn Sensor>, ConfigError> {
+        thermistor_sensor(config, printer, &self.params)
     }
 }
 
@@ -969,11 +997,7 @@ pub struct CustomLinearVoltage {
 
 impl CustomLinearVoltage {
     pub fn new(config: &ConfigWrapper) -> Result<Self, ConfigError> {
-        let mut name = config.section().id.clone();
-        if let Some(sub) = &config.section().sub {
-            name.push(' ');
-            name.push_str(sub);
-        }
+        let name = config.section().sub.clone().unwrap_or_default();
 
         let mut params: Vec<(f64, f64)> = Vec::new();
         let mut i = 1;
@@ -994,10 +1018,14 @@ impl CustomLinearVoltage {
         Ok(Self { name, params })
     }
 
-    pub fn create(&self, config: &ConfigWrapper) -> Result<Arc<dyn Sensor>, ConfigError> {
+    pub fn create(
+        &self,
+        config: &ConfigWrapper,
+        printer: &Arc<Printer>,
+    ) -> Result<Arc<dyn Sensor>, ConfigError> {
+        let adc = sensor_adc(config, printer)?;
         let lv = LinearVoltage::new(config, &self.params)?;
-        let bridge = Arc::new(AdcTemperatureBridge::new(lv));
-        Ok(bridge as Arc<dyn Sensor>)
+        Ok(AdcTemperatureBridge::new(lv, adc) as Arc<dyn Sensor>)
     }
 }
 
@@ -1011,11 +1039,7 @@ pub struct CustomLinearResistance {
 
 impl CustomLinearResistance {
     pub fn new(config: &ConfigWrapper) -> Result<Self, ConfigError> {
-        let mut name = config.section().id.clone();
-        if let Some(sub) = &config.section().sub {
-            name.push(' ');
-            name.push_str(sub);
-        }
+        let name = config.section().sub.clone().unwrap_or_default();
 
         let mut samples: Vec<(f64, f64)> = Vec::new();
         let mut i = 1;
@@ -1037,10 +1061,14 @@ impl CustomLinearResistance {
         Ok(Self { name, samples })
     }
 
-    pub fn create(&self, config: &ConfigWrapper) -> Result<Arc<dyn Sensor>, ConfigError> {
+    pub fn create(
+        &self,
+        config: &ConfigWrapper,
+        printer: &Arc<Printer>,
+    ) -> Result<Arc<dyn Sensor>, ConfigError> {
+        let adc = sensor_adc(config, printer)?;
         let lr = LinearResistance::new(config, &self.samples)?;
-        let bridge = Arc::new(AdcTemperatureBridge::new(lr));
-        Ok(bridge as Arc<dyn Sensor>)
+        Ok(AdcTemperatureBridge::new(lr, adc) as Arc<dyn Sensor>)
     }
 }
 
@@ -1048,57 +1076,168 @@ impl CustomLinearResistance {
 // Register built-in sensors with heaters
 // ===========================================================================
 
+/// The named thermistors upstream ships in `temperature_sensors.cfg`.
+///
+/// Each `[thermistor <name>]` section there registers a sensor factory under its
+/// sub-name; we have no config file to read at runtime, so the table is here.
+/// The tuples are `(temperature, resistance, beta_or_0)`; a lone entry with a
+/// non-zero beta is the beta form, three entries are Steinhart-Hart.
+const BUILTIN_THERMISTORS: &[(&str, &[(f64, f64, f64)])] = &[
+    (
+        "ATC Semitec 104GT-2",
+        &[
+            (20.0, 126800.0, 0.0),
+            (150.0, 1360.0, 0.0),
+            (300.0, 80.65, 0.0),
+        ],
+    ),
+    (
+        "ATC Semitec 104NT-4-R025H42G",
+        &[
+            (25.0, 100000.0, 0.0),
+            (160.0, 1074.0, 0.0),
+            (300.0, 82.78, 0.0),
+        ],
+    ),
+    (
+        "EPCOS 100K B57560G104F",
+        &[
+            (25.0, 100000.0, 0.0),
+            (150.0, 1641.9, 0.0),
+            (250.0, 226.15, 0.0),
+        ],
+    ),
+    (
+        "Generic 3950",
+        &[
+            (25.0, 100000.0, 0.0),
+            (150.0, 1770.0, 0.0),
+            (250.0, 230.0, 0.0),
+        ],
+    ),
+    (
+        "SliceEngineering 450",
+        &[
+            (25.0, 500000.0, 0.0),
+            (200.0, 3734.0, 0.0),
+            (400.0, 240.0, 0.0),
+        ],
+    ),
+    (
+        "TDK NTCG104LH104JT1",
+        &[
+            (25.0, 100000.0, 0.0),
+            (50.0, 31230.0, 0.0),
+            (125.0, 2066.0, 0.0),
+        ],
+    ),
+    ("Honeywell 100K 135-104LAG-J01", &[(25.0, 100000.0, 3974.0)]),
+    ("NTC 100K MGB18-104F39050L32", &[(25.0, 100000.0, 4100.0)]),
+];
+
 /// Register all built-in ADC temperature sensors with the heaters registry.
 ///
-/// Upstream's `adc_temperature.load_config`: registers default voltage and
-/// resistance sensors, and the `thermistor` + `adc_temperature` prefix factories.
+/// Upstream's `adc_temperature.load_config`: registers the default voltage and
+/// resistance sensors. The named thermistors come from `temperature_sensors.cfg`
+/// upstream; here they are [`BUILTIN_THERMISTORS`].
 pub fn ensure(heaters: &Arc<PrinterHeaters>) -> Result<(), ConfigError> {
-    // Register default voltage sensors
     for &(name, params) in DEFAULT_VOLTAGE_SENSORS {
-        let factory = voltage_sensor_factory(params);
-        heaters.add_sensor_factory(name, Arc::new(factory));
+        heaters.add_sensor_factory(name, Arc::new(voltage_sensor_factory(params)));
     }
-
-    // Register default resistance sensors (computed at runtime)
-    // PT1000
-    let pt1000_data = get_pt1000_data();
-    let pt1000_factory = resistance_sensor_factory(pt1000_data);
-    heaters.add_sensor_factory("PT1000", Arc::new(pt1000_factory));
-
-    // PT100 INA826
-    let ina826_data = get_pt100_ina826_data();
-    let ina826_factory = resistance_sensor_factory(ina826_data);
-    heaters.add_sensor_factory("PT100 INA826", Arc::new(ina826_factory));
-
-    // Register thermistor prefix factory
-    let thermistor_factory = Arc::new(move |config: &ConfigWrapper, _printer: &Arc<Printer>| {
-        let custom = CustomThermistor::new(config)?;
-        let sensor = custom.create(config)?;
-        Ok(sensor)
-    });
-    heaters.add_sensor_factory("thermistor", thermistor_factory);
-
-    // Register adc_temperature prefix factory
-    // Checks for resistance1 to determine if it's a voltage or resistance sensor
-    let adc_temperature_factory =
-        Arc::new(move |config: &ConfigWrapper, _printer: &Arc<Printer>| {
-            // Check if this is a resistance sensor (has resistance1 parameter)
-            let has_resistance = config.get_optional_float("resistance1")?.is_some();
-
-            if has_resistance {
-                let custom = CustomLinearResistance::new(config)?;
-                let sensor = custom.create(config)?;
-                Ok(sensor)
-            } else {
-                let custom = CustomLinearVoltage::new(config)?;
-                let sensor = custom.create(config)?;
-                Ok(sensor)
-            }
+    heaters.add_sensor_factory(
+        "PT1000",
+        Arc::new(resistance_sensor_factory(get_pt1000_data())),
+    );
+    heaters.add_sensor_factory(
+        "PT100 INA826",
+        Arc::new(resistance_sensor_factory(get_pt100_ina826_data())),
+    );
+    for &(name, params) in BUILTIN_THERMISTORS {
+        let params = params.to_vec();
+        let factory = Arc::new(move |config: &ConfigWrapper, printer: &Arc<Printer>| {
+            thermistor_sensor(config, printer, &params)
         });
-    heaters.add_sensor_factory("adc_temperature", adc_temperature_factory);
-
+        heaters.add_sensor_factory(name, factory);
+    }
     Ok(())
 }
+
+/// A sensor-definition section's printer object.
+///
+/// `[thermistor <name>]` and `[adc_temperature <name>]` produce a **sensor
+/// factory**, not a queryable object (upstream's `load_config_prefix` returns
+/// `None`). This placeholder claims the section so the loader is satisfied and
+/// keeps it out of `objects/list`.
+struct SensorSection;
+
+impl PrinterObject for SensorSection {
+    fn get_status(&self, _eventtime: f64) -> Value {
+        json!({})
+    }
+
+    fn is_queryable(&self) -> bool {
+        false
+    }
+}
+
+/// `[thermistor <name>]`: register a sensor factory under the sub-name.
+pub fn load_thermistor_prefix(
+    config: &ConfigWrapper,
+    printer: &Arc<Printer>,
+) -> Result<Arc<dyn PrinterObject>, ConfigError> {
+    let heaters = heaters::ensure(printer)?;
+    let custom = CustomThermistor::new(config)?;
+    let name = custom.name.clone();
+    let factory = Arc::new(move |config: &ConfigWrapper, printer: &Arc<Printer>| {
+        custom.create(config, printer)
+    });
+    heaters.add_sensor_factory(&name, factory);
+    Ok(Arc::new(SensorSection))
+}
+
+/// Bare `[adc_temperature]`: upstream loads the module's defaults here.
+pub fn load_config(
+    _config: &ConfigWrapper,
+    printer: &Arc<Printer>,
+) -> Result<Arc<dyn PrinterObject>, ConfigError> {
+    heaters::ensure(printer)?;
+    Ok(Arc::new(SensorSection))
+}
+
+/// `[adc_temperature <name>]`: a custom linear voltage or resistance sensor.
+pub fn load_adc_temperature_prefix(
+    config: &ConfigWrapper,
+    printer: &Arc<Printer>,
+) -> Result<Arc<dyn PrinterObject>, ConfigError> {
+    let heaters = heaters::ensure(printer)?;
+    // Upstream chooses by whether `resistance1` is present.
+    if config.get_optional_float("resistance1")?.is_some() {
+        let custom = CustomLinearResistance::new(config)?;
+        let name = custom.name.clone();
+        let factory = Arc::new(move |config: &ConfigWrapper, printer: &Arc<Printer>| {
+            custom.create(config, printer)
+        });
+        heaters.add_sensor_factory(&name, factory);
+    } else {
+        let custom = CustomLinearVoltage::new(config)?;
+        let name = custom.name.clone();
+        let factory = Arc::new(move |config: &ConfigWrapper, printer: &Arc<Printer>| {
+            custom.create(config, printer)
+        });
+        heaters.add_sensor_factory(&name, factory);
+    }
+    Ok(Arc::new(SensorSection))
+}
+
+// The sections the loader must know about. `thermistor` is prefix-only; the bare
+// `[adc_temperature]` is upstream's "load the defaults" switch.
+section!("thermistor", order = 25, prefix = load_thermistor_prefix);
+section!(
+    "adc_temperature",
+    order = 25,
+    load = load_config,
+    prefix = load_adc_temperature_prefix
+);
 
 // ===========================================================================
 // Tests

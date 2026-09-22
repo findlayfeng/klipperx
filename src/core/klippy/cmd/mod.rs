@@ -74,6 +74,7 @@ pub mod pwm;
 pub mod shutdown;
 pub mod spi;
 pub mod stepper;
+pub mod thermocouple;
 pub mod trsync;
 pub mod uptime;
 
@@ -94,6 +95,9 @@ pub use spi::{
 pub use stepper::{
     ConfigStepper, QueueStep, ResetStepClock, SetNextStepDir, StepperGetPosition, StepperPosition,
     StepperStopOnTrigger,
+};
+pub use thermocouple::{
+    ConfigThermocouple, QueryThermocouple, ThermocoupleResult, ThermocoupleType,
 };
 pub use trsync::{
     ConfigTrsync, TriggerReason, TrsyncSetTimeout, TrsyncStart, TrsyncState, TrsyncTrigger,

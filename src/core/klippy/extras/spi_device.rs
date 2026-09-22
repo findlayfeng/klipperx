@@ -62,6 +62,135 @@ const DEFAULT_SPEED: u32 = 100_000;
 /// The lowest clock upstream accepts (its `minval` for `spi_speed`).
 const MIN_SPEED: u32 = 100_000;
 
+/// Default SPI mode when a section does not set `spi_mode`.
+const DEFAULT_SPI_MODE: u8 = 0;
+
+/// An [`McuSpi`] plus the options a `[spi_device]` reports in its status.
+pub(crate) struct SpiSetup {
+    /// The configured bus resource.
+    pub device: Arc<McuSpi>,
+    /// The configured clock, in Hz.
+    pub speed: u32,
+    /// Whether chip select is active high.
+    pub cs_active_high: bool,
+}
+
+/// Build an [`McuSpi`] from the `spi_*` options in `config`.
+///
+/// Upstream's `MCU_SPI_from_config` (`klippy/extras/bus.py:124`): `pin_option`
+/// names the chip-select option (`cs_pin` for `[spi_device]`, `sensor_pin` for
+/// the SPI temperature chips), and `default_mode` / `default_speed` apply when
+/// `spi_mode` / `spi_speed` are absent.
+pub(crate) fn mcu_spi_from_config(
+    config: &ConfigWrapper,
+    printer: &Printer,
+    default_mode: u8,
+    pin_option: &str,
+    default_speed: u32,
+) -> Result<SpiSetup, ConfigError> {
+    let identifier = config.identifier();
+    let mcu_name = config
+        .get_str("spi_mcu")
+        .map(|text| text.trim().to_string())
+        .unwrap_or_else(|| "mcu".to_string());
+    let object_name = mcu_object_name(&mcu_name);
+    let mcu_object = printer
+        .lookup_object_as::<McuObject>(&object_name)
+        .ok_or_else(|| {
+            ConfigError::new(format!("Section '{identifier}': unknown MCU '{mcu_name}'"))
+        })?;
+
+    let pins = printer
+        .lookup_object_as::<PrinterPins>(PINS_OBJECT)
+        .expect("the loader registers `pins` before any section");
+
+    // Chip select. `None` means the firmware does not drive one:
+    // `config_spi_without_cs`.
+    let cs_pin = match config
+        .get_str(pin_option)
+        .map(|text| text.trim().to_string())
+    {
+        None => None,
+        Some(description) if description == "None" => None,
+        Some(description) => {
+            let params = pins
+                .lookup_pin(&description, false, false, Some("cs"))
+                .map_err(|err| ConfigError::new(format!("{identifier}: {err}")))?;
+            if params.chip_name != mcu_name {
+                return Err(ConfigError::new(format!(
+                    "Section '{identifier}': {pin_option} must be on mcu '{mcu_name}'"
+                )));
+            }
+            Some(params)
+        }
+    };
+    let cs_active_high = config.get_bool("cs_active_high", Some(false))?;
+
+    let speed = config.get_int("spi_speed", Some(i64::from(default_speed)))?;
+    if !(i64::from(MIN_SPEED)..=i64::from(u32::MAX)).contains(&speed) {
+        return Err(ConfigError::new(format!(
+            "Option 'spi_speed' in section '{identifier}' must be at least {MIN_SPEED}"
+        )));
+    }
+    let speed = speed as u32;
+
+    let spi_mode = config.get_int("spi_mode", Some(i64::from(default_mode)))?;
+    if !(0..=3).contains(&spi_mode) {
+        return Err(ConfigError::new(format!(
+            "Option 'spi_mode' in section '{identifier}' must be between 0 and 3"
+        )));
+    }
+    let spi_mode = spi_mode as u8;
+
+    let mode = match (
+        config.get_str("spi_software_miso_pin"),
+        config.get_str("spi_software_mosi_pin"),
+        config.get_str("spi_software_sclk_pin"),
+    ) {
+        (Some(miso), Some(mosi), Some(sclk)) => {
+            let software = [("miso", miso), ("mosi", mosi), ("sclk", sclk)];
+            let mut pins_out = Vec::with_capacity(3);
+            for (role, description) in software {
+                let params = pins
+                    .lookup_pin(&description, false, false, Some(role))
+                    .map_err(|err| ConfigError::new(format!("{identifier}: {err}")))?;
+                if params.chip_name != mcu_name {
+                    return Err(ConfigError::new(format!(
+                        "Section '{identifier}': spi_software_{role}_pin must be on mcu \
+                         '{mcu_name}'"
+                    )));
+                }
+                pins_out.push(params.pin);
+            }
+            SpiMode::Software {
+                miso_pin: pins_out[0].clone(),
+                mosi_pin: pins_out[1].clone(),
+                sclk_pin: pins_out[2].clone(),
+                speed,
+                mode: spi_mode,
+            }
+        }
+        (None, None, None) => SpiMode::Hardware {
+            bus: config.get_str("spi_bus"),
+            speed,
+            mode: spi_mode,
+        },
+        _ => {
+            return Err(ConfigError::new(format!(
+                "Section '{identifier}': all three of 'spi_software_miso_pin', \
+                 'spi_software_mosi_pin' and 'spi_software_sclk_pin' must be set"
+            )));
+        }
+    };
+
+    let device = mcu_object.setup_spi(mode, cs_pin, cs_active_high);
+    Ok(SpiSetup {
+        device,
+        speed,
+        cs_active_high,
+    })
+}
+
 /// One configured `[spi_device <name>]`.
 pub struct SpiDevice {
     /// The name `SPI_*` addresses this device by: the section's sub.
@@ -88,98 +217,11 @@ impl SpiDevice {
             ))
         })?;
 
-        let mcu_name = config
-            .get_str("spi_mcu")
-            .map(|text| text.trim().to_string())
-            .unwrap_or_else(|| "mcu".to_string());
-        let object_name = mcu_object_name(&mcu_name);
-        let mcu_object = printer
-            .lookup_object_as::<McuObject>(&object_name)
-            .ok_or_else(|| {
-                ConfigError::new(format!("Section '{identifier}': unknown MCU '{mcu_name}'"))
-            })?;
-
-        let pins = printer
-            .lookup_object_as::<PrinterPins>(PINS_OBJECT)
-            .expect("the loader registers `pins` before any section");
-
-        // Chip select. `cs_pin: None` (or no `cs_pin`) means the firmware does
-        // not drive one: `config_spi_without_cs`.
-        let cs_pin = match config.get_str("cs_pin").map(|text| text.trim().to_string()) {
-            None => None,
-            Some(description) if description == "None" => None,
-            Some(description) => {
-                let params = pins
-                    .lookup_pin(&description, false, false, Some("cs"))
-                    .map_err(|err| ConfigError::new(format!("{identifier}: {err}")))?;
-                if params.chip_name != mcu_name {
-                    return Err(ConfigError::new(format!(
-                        "Section '{identifier}': cs_pin must be on mcu '{mcu_name}'"
-                    )));
-                }
-                Some(params)
-            }
-        };
-        let cs_active_high = config.get_bool("cs_active_high", Some(false))?;
-
-        let speed = config.get_int("spi_speed", Some(i64::from(DEFAULT_SPEED)))?;
-        if !(i64::from(MIN_SPEED)..=i64::from(u32::MAX)).contains(&speed) {
-            return Err(ConfigError::new(format!(
-                "Option 'spi_speed' in section '{identifier}' must be at least {MIN_SPEED}"
-            )));
-        }
-        let speed = speed as u32;
-
-        let spi_mode = config.get_int("spi_mode", Some(0))?;
-        if !(0..=3).contains(&spi_mode) {
-            return Err(ConfigError::new(format!(
-                "Option 'spi_mode' in section '{identifier}' must be between 0 and 3"
-            )));
-        }
-        let spi_mode = spi_mode as u8;
-
-        let mode = match (
-            config.get_str("spi_software_miso_pin"),
-            config.get_str("spi_software_mosi_pin"),
-            config.get_str("spi_software_sclk_pin"),
-        ) {
-            (Some(miso), Some(mosi), Some(sclk)) => {
-                let software = [("miso", miso), ("mosi", mosi), ("sclk", sclk)];
-                let mut pins_out = Vec::with_capacity(3);
-                for (role, description) in software {
-                    let params = pins
-                        .lookup_pin(&description, false, false, Some(role))
-                        .map_err(|err| ConfigError::new(format!("{identifier}: {err}")))?;
-                    if params.chip_name != mcu_name {
-                        return Err(ConfigError::new(format!(
-                            "Section '{identifier}': spi_software_{role}_pin must be on mcu \
-                             '{mcu_name}'"
-                        )));
-                    }
-                    pins_out.push(params.pin);
-                }
-                SpiMode::Software {
-                    miso_pin: pins_out[0].clone(),
-                    mosi_pin: pins_out[1].clone(),
-                    sclk_pin: pins_out[2].clone(),
-                    speed,
-                    mode: spi_mode,
-                }
-            }
-            (None, None, None) => SpiMode::Hardware {
-                bus: config.get_str("spi_bus"),
-                speed,
-                mode: spi_mode,
-            },
-            _ => {
-                return Err(ConfigError::new(format!(
-                    "Section '{identifier}': all three of 'spi_software_miso_pin', \
-                     'spi_software_mosi_pin' and 'spi_software_sclk_pin' must be set"
-                )));
-            }
-        };
-
-        let device = mcu_object.setup_spi(mode, cs_pin, cs_active_high);
+        let setup =
+            mcu_spi_from_config(config, printer, DEFAULT_SPI_MODE, "cs_pin", DEFAULT_SPEED)?;
+        let device = setup.device;
+        let cs_active_high = setup.cs_active_high;
+        let speed = setup.speed;
 
         let gcode = printer
             .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
@@ -250,7 +292,7 @@ impl std::fmt::Debug for SpiDevice {
 ///
 /// Upstream's `get_printer_mcu` (`klippy/mcu.py:1251`), which is how every
 /// `*_from_config` finds its bus.
-fn mcu_object_name(mcu_name: &str) -> String {
+pub(crate) fn mcu_object_name(mcu_name: &str) -> String {
     if mcu_name == "mcu" {
         "mcu".to_string()
     } else {

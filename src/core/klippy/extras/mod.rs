@@ -8,6 +8,7 @@
 
 pub mod board_pins;
 pub(crate) mod bus_debug;
+pub mod error_mcu;
 pub mod i2c_device;
 pub mod output_pin;
 pub mod query_endstops;

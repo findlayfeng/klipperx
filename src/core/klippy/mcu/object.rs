@@ -23,6 +23,7 @@
 //! ([`register_stats`](crate::core::klippy::event::stats::register_stats)).
 //! It comes back with the statistics consumer.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
@@ -489,14 +490,16 @@ impl McuObject {
             let name = name.clone();
             let is_shutdown = Arc::clone(&self.is_shutdown);
             mcu.bind_event::<Shutdown, _>(move |event| {
-                let msg = match event.clock {
+                if is_shutdown.swap(true, Ordering::SeqCst) {
+                    return;
+                }
+                let human = match event.clock {
                     Some(clock) => {
                         format!("MCU '{name}' shutdown: {} (clock {clock})", event.reason)
                     }
                     None => format!("MCU '{name}' shutdown: {}", event.reason),
                 };
-                is_shutdown.store(true, Ordering::SeqCst);
-                report_shutdown(&printer, &msg);
+                report_mcu_shutdown(&printer, &name, &event.reason, "shutdown", &human);
             })?;
         }
         if mcu.has_message(IsShutdown::NAME) {
@@ -505,16 +508,21 @@ impl McuObject {
             let is_shutdown = Arc::clone(&self.is_shutdown);
             mcu.bind_event::<IsShutdown, _>(move |event| {
                 is_shutdown.store(true, Ordering::SeqCst);
-                report_shutdown(
-                    &printer,
-                    &format!("MCU '{name}' is shutdown: {}", event.reason),
-                );
+                let human = format!("MCU '{name}' is shutdown: {}", event.reason);
+                report_mcu_shutdown(&printer, &name, &event.reason, "is_shutdown", &human);
             })?;
         }
         if mcu.has_message(Starting::NAME) {
             let printer = self.printer.clone();
+            let name = name.clone();
+            let is_shutdown = Arc::clone(&self.is_shutdown);
             mcu.bind_event::<Starting, _>(move |_| {
-                report_shutdown(&printer, &format!("MCU '{name}' restarted"));
+                // Upstream only treats a restart as fatal when the MCU was not
+                // already stopped (`klippy/mcu.py:826-829`).
+                if is_shutdown.load(Ordering::SeqCst) {
+                    return;
+                }
+                report_shutdown(&printer, &format!("MCU '{name}' spontaneous restart"));
             })?;
         }
         Ok(())
@@ -899,6 +907,29 @@ fn report_shutdown(printer: &Weak<Printer>, msg: &str) {
     }
 }
 
+/// Report an MCU-halted stop the way upstream's `_handle_shutdown` does
+/// (`klippy/mcu.py:813-825`): the generic message `"MCU shutdown"` plus the
+/// details `error_mcu` needs to build the user-facing text.
+fn report_mcu_shutdown(
+    printer: &Weak<Printer>,
+    name: &str,
+    reason: &str,
+    event_type: &str,
+    human: &str,
+) {
+    warn!("{human}");
+    if let Some(printer) = printer.upgrade() {
+        printer.invoke_shutdown_with(
+            "MCU shutdown",
+            HashMap::from([
+                ("reason".to_string(), json!(reason)),
+                ("mcu".to_string(), json!(name)),
+                ("event_type".to_string(), json!(event_type)),
+            ]),
+        );
+    }
+}
+
 /// The status upstream's `MCUStatsHelper._mcu_identify` fills
 /// (`klippy/mcu.py:938-948`).
 fn status_from(dictionary: &Dictionary) -> Value {
@@ -930,6 +961,10 @@ pub fn load_config(
     // connects, and an MCU reads its section at connect time. The parse is pure;
     // the device is still only opened by `connect`.
     McuConfig::new(config)?;
+    // The first `[mcu]` section brings the `error_mcu` module with it, as
+    // upstream's `MCU.__init__` does (`klippy/mcu.py:1159`); the rest find it
+    // already there. It has to exist before any MCU can fail.
+    crate::core::klippy::extras::error_mcu::ensure(printer)?;
     let object = Arc::new(
         McuObject::new(config.section().clone(), printer)
             .map_err(|err| ConfigError::new(err.to_string()))?,
@@ -1178,6 +1213,9 @@ mod tests {
         .unwrap();
 
         object.bind_shutdown(&mcu).unwrap();
+        // The `error_mcu` module enriches the terse "MCU shutdown" message; the
+        // MCU factory brings it in, and this test does too.
+        crate::core::klippy::extras::error_mcu::ensure(&printer).unwrap();
         mcu.send("get_uptime", &[]).unwrap();
         // Let the receive task decode and dispatch the shutdown frame.
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1185,7 +1223,14 @@ mod tests {
         let state = printer.get_state_message();
         assert_eq!(state.category, PrinterState::Shutdown);
         assert!(
-            state.message.contains("Move queue overflow"),
+            state
+                .message
+                .starts_with("MCU 'mcu' shutdown: Move queue overflow"),
+            "{}",
+            state.message
+        );
+        assert!(
+            state.message.contains("Printer is shutdown"),
             "{}",
             state.message
         );

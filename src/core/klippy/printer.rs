@@ -271,6 +271,42 @@ struct Inner {
     start_reason: Option<String>,
     /// The toolhead's restart handle, registered by it at connect.
     restart_hooks: Option<Arc<dyn RestartHooks>>,
+    /// The host software version, as `M115` and `error_mcu` report it
+    /// (upstream's `start_args['software_version']`).
+    software_version: String,
+}
+
+/// Classify an MCU connect failure the way upstream's `_connect` except
+/// clauses do (`klippy/klippy.py:143-155`): the short state message and the
+/// details for `klippy:notify_mcu_error`.
+fn classify_mcu_error(err: &KlippyError) -> (String, HashMap<String, Value>) {
+    match err {
+        KlippyError::Connection(reason) => {
+            // Distinguish protocol-level failures from plain connect
+            // failures (missing device, permission denied, etc.).
+            let is_protocol = reason.contains("Protocol")
+                || reason.contains("dictionary")
+                || reason.contains("identify")
+                || reason.contains("session");
+            (
+                if is_protocol {
+                    "Protocol error"
+                } else {
+                    "MCU error during connect"
+                }
+                .to_string(),
+                HashMap::from([("error".into(), serde_json::json!(reason))]),
+            )
+        }
+        KlippyError::Protocol(reason) => (
+            "Protocol error".to_string(),
+            HashMap::from([("error".into(), serde_json::json!(reason))]),
+        ),
+        _ => (
+            "MCU error during connect".to_string(),
+            HashMap::from([("error".into(), serde_json::json!(err.to_string()))]),
+        ),
+    }
 }
 
 impl Printer {
@@ -298,6 +334,7 @@ impl Printer {
                 host_objects: None,
                 start_reason: None,
                 restart_hooks: None,
+                software_version: env!("CARGO_PKG_VERSION").to_string(),
             }),
             exit_requested: Condvar::new(),
             reactor,
@@ -362,6 +399,20 @@ impl Printer {
     /// status.
     pub fn register_restart_hooks(&self, hooks: Arc<dyn RestartHooks>) {
         self.lock().restart_hooks = Some(hooks);
+    }
+
+    /// The host software version.
+    ///
+    /// Upstream reads `start_args['software_version']`; the host sets it from
+    /// its [`crate::core::klippy::api::StartArgs`] at startup, and it defaults
+    /// to this crate's version so tests and the `M115` reply agree.
+    pub fn software_version(&self) -> String {
+        self.lock().software_version.clone()
+    }
+
+    /// Set the host software version (called once by the host at startup).
+    pub fn set_software_version(&self, version: impl Into<String>) {
+        self.lock().software_version = version.into();
     }
 
     /// The toolhead's restart handle, if one registered itself.
@@ -682,33 +733,7 @@ impl Printer {
     /// shutdown. The event carries a short `msg` describing the failure class
     /// and a `details` map with the raw error text.
     fn notify_mcu_error(&self, err: &KlippyError) {
-        let (msg, details) = match err {
-            KlippyError::Connection(reason) => {
-                // Distinguish protocol-level failures from plain connect
-                // failures (missing device, permission denied, etc.).
-                let is_protocol = reason.contains("Protocol")
-                    || reason.contains("dictionary")
-                    || reason.contains("identify")
-                    || reason.contains("session");
-                (
-                    if is_protocol {
-                        "Protocol error"
-                    } else {
-                        "MCU error during connect"
-                    }
-                    .to_string(),
-                    HashMap::from([("error".into(), serde_json::json!(reason))]),
-                )
-            }
-            KlippyError::Protocol(reason) => (
-                "Protocol error".to_string(),
-                HashMap::from([("error".into(), serde_json::json!(reason))]),
-            ),
-            _ => (
-                "MCU error during connect".to_string(),
-                HashMap::from([("error".into(), serde_json::json!(err.to_string()))]),
-            ),
-        };
+        let (msg, details) = classify_mcu_error(err);
         self.send_event(&KlippyEvent::KlippyNotifyMcuError { msg, details });
     }
 
@@ -721,6 +746,16 @@ impl Printer {
     /// stopped, until something asks it to exit. The first message stands;
     /// later ones are ignored, so the shutdown events fire once.
     pub fn invoke_shutdown(&self, msg: &str) {
+        self.invoke_shutdown_with(msg, HashMap::new());
+    }
+
+    /// [`Printer::invoke_shutdown`] with the structured details upstream
+    /// passes to `klippy:analyze_shutdown` (`klippy/klippy.py:204-220`).
+    ///
+    /// The MCU shutdown path uses this: it reports the generic message
+    /// `"MCU shutdown"` and puts the MCU name, reason and event type in the
+    /// details, so that `error_mcu` can build the user-facing text.
+    pub fn invoke_shutdown_with(&self, msg: &str, details: HashMap<String, Value>) {
         {
             let mut inner = self.lock();
             if inner.shutdown {
@@ -735,8 +770,25 @@ impl Printer {
         self.send_event(&KlippyEvent::KlippyShutdown);
         self.send_event(&KlippyEvent::KlippyAnalyzeShutdown {
             msg: msg.to_string(),
-            details: HashMap::new(),
+            details,
         });
+    }
+
+    /// Replace the state message, for handlers that enrich a shutdown.
+    ///
+    /// Upstream's `Printer.update_error_msg` (`klippy/klippy.py:63-69`): only
+    /// the message the shutdown was reported with is replaced, and only while
+    /// the printer is neither ready nor starting up. The `error_mcu` module
+    /// uses it to append its hints.
+    pub fn update_error_msg(&self, oldmsg: &str, newmsg: &str) {
+        let mut inner = self.lock();
+        if inner.message != oldmsg
+            || matches!(inner.category, PrinterState::Ready | PrinterState::Startup)
+        {
+            return;
+        }
+        inner.message = newmsg.to_string();
+        error!("{newmsg}");
     }
 
     /// Put the printer in the `error` category with a message.
@@ -893,12 +945,20 @@ impl Printer {
                 // Every connect failure puts the printer in the `error` state,
                 // which a `RESTART` can fix; none of them halts the host. Upstream
                 // classifies them in `_connect`'s except clauses
-                // (`klippy/klippy.py:136-158`): a config error, a protocol error, an
-                // MCU connect error, or an internal error — all `_set_state`.
-                if name == "mcu" || name.starts_with("mcu ") {
+                // (`klippy/klippy.py:136-158`): a protocol error and an MCU
+                // connect error are reported with their own short state message
+                // (which `error_mcu` then expands), a config error with its text.
+                if (name == "mcu" || name.starts_with("mcu "))
+                    && !matches!(err, KlippyError::Config(_))
+                {
+                    // The state is set before the event, as upstream's
+                    // `_set_state(msg)` runs before `send_event` — the
+                    // `error_mcu` handler reads the state message.
+                    self.set_error_state(&classify_mcu_error(&err).0);
                     self.notify_mcu_error(&err);
+                } else {
+                    self.set_error_state(&format!("{name}: {err}"));
                 }
-                self.set_error_state(&format!("{name}: {err}"));
                 return;
             }
             if self.category() != PrinterState::Startup {
@@ -1578,6 +1638,53 @@ mod tests {
         assert_eq!(state.category, PrinterState::Error);
         assert!(state.message.contains("bad option"), "{}", state.message);
         assert_eq!(halts.load(Ordering::SeqCst), 0);
+    }
+
+    /// A part named `mcu` whose connect fails with a protocol error.
+    struct BrokenMcu;
+
+    impl PrinterObject for BrokenMcu {
+        fn get_status(&self, _eventtime: f64) -> Value {
+            serde_json::json!({})
+        }
+
+        fn connect<'a>(&'a self) -> ConnectFuture<'a> {
+            Box::pin(async {
+                Err(KlippyError::Connection(
+                    "Protocol error: bad message".to_string(),
+                ))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_an_mcu_protocol_failure_is_expanded_by_error_mcu() {
+        // `bring_up` sets the short state message the `klippy:notify_mcu_error`
+        // event carries; the `error_mcu` module turns it into the text the user
+        // reads (upstream `_connect` -> `_set_state` -> `error_mcu`).
+        let printer = Arc::new(new_printer());
+        crate::core::klippy::extras::error_mcu::ensure(&printer).unwrap();
+        printer.add_object("mcu", Arc::new(BrokenMcu)).unwrap();
+
+        printer.bring_up().await;
+
+        let state = printer.get_state_message();
+        assert_eq!(state.category, PrinterState::Error);
+        assert!(
+            state.message.starts_with("MCU Protocol error"),
+            "{}",
+            state.message
+        );
+        assert!(
+            state.message.contains("Protocol error: bad message"),
+            "{}",
+            state.message
+        );
+        assert!(
+            state.message.contains("Your Klipper version is:"),
+            "{}",
+            state.message
+        );
     }
 
     #[tokio::test]

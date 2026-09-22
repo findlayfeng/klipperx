@@ -214,10 +214,26 @@ toolhead / 开放事件）一起补，一部分是现在就独立可补的小行
 数据。
 
 
-#### F8 endstop / trsync（与 C1 共享，框架 FW6a–FW6e，见 [FW6 调查](docs/work-log/2026-09-21-fw6-notes.md))
+#### F8 endstop / trsync（与 C1 共享，框架 FW6a–FW6e，见 [FW6 调查](docs/work-log/2026-09-21-fw6-notes.md)）
 
 - [ ] **FW6a-2** 测试侧加**响应器式假 MCU**（可多实例），并补 `ToolHeadObject::connect` 的
       两 MCU 端到端测试。（挪到 FW6c 一起做；时钟偏移已有 `McuChip` 单测）
+
+##### F8b `Mcu` ↔ 资源的强引用环（阻塞回归）
+
+- [ ] **现状（2026-09-22 查实）**：`Mcu` → `Parser` 的事件回调 → `TrsyncRegistry` →
+      `McuTrsync` → `McuChip`（**值拷贝**，内含 `mcu: Arc<Mutex<Option<Arc<Mcu>>>>` 与
+      `clock → McuClock{mcu: Arc<Mcu>}`）→ `Arc<Mcu>`，形成强引用环。所以任何**带 endstop**
+      的配置在配置构建期注册 `ConfigTrsync` 之后，`Mcu::Drop` 永不运行；`Mcu` 的阻塞
+      device read（`spawn_blocking`，不可 abort）驻留 → **runtime 关停卡死**。
+      默认套件不受影响（`linuxtest` 无 endstop），但 `KLIPPERX_UPSTREAM_ALL=1` 必卡：
+      实测 `G28`（假 MCU 已能回 `trsync_state`/`endstop_state`）后进程不退出。
+- [ ] **修法**：照 `McuChip.pins: Weak` 的既有做法，把资源对 `Mcu` 的反向引用改弱：
+      `McuChip.mcu` 与 `McuClock.mcu` 改 `Weak<Mcu>`（由 `McuObject` 持强引用）；
+      `McuTrsync` 不再持整份 `McuChip`（只需 name + mcu + clock）；
+      `TrsyncRegistry` 的 `bind_event` 回调改持 `Weak<TrsyncRegistry>`。
+- [ ] **验收**：假 MCU 上一个带 endstop 的 `G28` 端到端跑通且进程干净退出；
+      `KLIPPERX_UPSTREAM_ALL=1` 不再卡。估时 1–2 天（连同假 MCU 回零一起验收）。
 
 #### F9 其他输入与外设资源
 

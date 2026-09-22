@@ -78,6 +78,10 @@ struct State {
     out: VecDeque<Frame>,
     /// Set by `shutdown()`: `receive()` returns `None` from then on.
     shutdown: bool,
+    /// The clock/pin level of the last armed `endstop_home`, for
+    /// `endstop_query_state`.
+    endstop_clock: u32,
+    endstop_pin_value: u8,
 }
 
 /// A fake MCU built from a `.dict` file. See the module docs.
@@ -116,6 +120,8 @@ impl SimulatorDevice {
                 started: Instant::now(),
                 out: VecDeque::new(),
                 shutdown: false,
+                endstop_clock: 0,
+                endstop_pin_value: 0,
             }),
             signal: Condvar::new(),
         })
@@ -211,6 +217,65 @@ impl SimulatorDevice {
                         seq,
                         "stepper_position",
                         &[ArgValue::UInt8(oid), ArgValue::Int32(0)],
+                    );
+                }
+                "endstop_home" => {
+                    // `endstop_home oid=%c clock=%u sample_ticks=%u
+                    // sample_count=%c rest_ticks=%u pin_value=%c
+                    // trsync_oid=%c trigger_reason=%c`. A nonzero
+                    // `sample_count` arms the check; the fake endstop is always
+                    // hit, so fire its trsync at once. Without this a `G28`
+                    // would drip a full homing move before the timeout.
+                    let sample_count = match params.get(3) {
+                        Some(ArgValue::UInt8(v)) => *v,
+                        _ => 0,
+                    };
+                    // Do not `return`: a block may batch the all-zero disable
+                    // with a following command (e.g. `endstop_query_state`),
+                    // and skipping the block's tail would drop it.
+                    if sample_count != 0 {
+                        let clock = match params.get(1) {
+                            Some(ArgValue::UInt32(v)) => *v,
+                            _ => 0,
+                        };
+                        let pin_value = match params.get(5) {
+                            Some(ArgValue::UInt8(v)) => *v,
+                            _ => 0,
+                        };
+                        let trsync_oid = match params.get(6) {
+                            Some(ArgValue::UInt8(v)) => *v,
+                            _ => 0,
+                        };
+                        state.endstop_clock = clock;
+                        state.endstop_pin_value = pin_value;
+                        Self::respond(
+                            state,
+                            seq,
+                            "trsync_state",
+                            &[
+                                ArgValue::UInt8(trsync_oid),
+                                ArgValue::UInt8(0), // can_trigger
+                                ArgValue::UInt8(1), // trigger_reason = EndstopHit
+                                ArgValue::UInt32(clock),
+                            ],
+                        );
+                    }
+                }
+                "endstop_query_state" => {
+                    let oid = match params.first() {
+                        Some(ArgValue::UInt8(v)) => *v,
+                        _ => 0,
+                    };
+                    Self::respond(
+                        state,
+                        seq,
+                        "endstop_state",
+                        &[
+                            ArgValue::UInt8(oid),
+                            ArgValue::UInt8(0), // homing
+                            ArgValue::UInt32(state.endstop_clock),
+                            ArgValue::UInt8(state.endstop_pin_value),
+                        ],
                     );
                 }
                 "debug_read" => {

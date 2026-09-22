@@ -38,6 +38,10 @@ pub struct McuConfig {
 /// the host reset a firmware on its **closed** port — a reset needs the port
 /// path, and the device must not be open — between parsing the section and
 /// opening the device (see [`McuConfig::open`]).
+///
+/// `TestDevice` is **not** constructed from config — tests build it directly in
+/// code and pass it through `Interface::new()`.  `SimulatorDevice` is
+/// constructed from `test: dict=<path>` in the `upstream` harness.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Transport {
     /// A tty at a line speed.
@@ -50,9 +54,6 @@ pub enum Transport {
     },
     /// Klipper's host library, loaded from a shared object.
     Host { library: String },
-    /// A scripted device, in test builds (`test:`).
-    #[cfg(test)]
-    Test(String),
     /// A dictionary-driven fake MCU, in test builds (`test: dict=<path>`).
     #[cfg(test)]
     Simulator(String),
@@ -76,7 +77,8 @@ fn parse_canbus_uuid(text: &str) -> Result<[u8; 6], String> {
 /// them. Exactly one of them names the transport, the way Klipper's own `[mcu]`
 /// works (`serial` or `canbus_uuid`): see [`McuConfig::create_interface`].
 ///
-/// `test` exists in test builds only — it is how the unit tests script a device.
+/// `test` exists in test builds only — the `upstream` harness uses
+/// `test: dict=<path>` to inject a dictionary-driven fake MCU.
 fn interface_keys() -> &'static [&'static str] {
     #[cfg(test)]
     return &["host_library", "serial", "canbus_uuid", "test"];
@@ -314,70 +316,18 @@ impl McuConfig {
             if let Some(path) = test_value.trim().strip_prefix("dict=") {
                 return Ok(Transport::Simulator(path.trim().to_string()));
             }
-            return Ok(Transport::Test(test_value));
         }
 
         let how = if cfg!(test) {
-            "set host_library: <libklipper_host.so> (or test: <frame mappings>)"
+            "set host_library: <libklipper_host.so>, serial: <tty>, canbus_uuid: <hex>, \
+             or test: dict=<dictionary>"
         } else {
-            "set host_library: <libklipper_host.so>"
+            "set host_library: <libklipper_host.so>, serial: <tty>, or canbus_uuid: <hex>"
         };
         Err(ConfigError::new(format!(
             "MCU '{}' needs an interface: {how}",
             section.identifier()
         )))
-    }
-
-    /// Build a scripted device from a `test:` block of hex frame mappings
-    /// (test builds only).
-    #[cfg(test)]
-    fn test_device(test_value: &str) -> crate::core::klippy::interface::devices::test::TestDevice {
-        let mut mappings = Vec::new();
-        for line in test_value.lines() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() || trimmed.starts_with('#') {
-                continue;
-            }
-
-            let hex_bytes: Vec<&str> = trimmed.split_whitespace().collect();
-            if hex_bytes.is_empty() {
-                continue;
-            }
-
-            let input = Self::hex_decode_bytes(hex_bytes[0]).unwrap_or_default();
-            let output_bytes: Vec<Vec<u8>> = hex_bytes[1..]
-                .iter()
-                .map(|h| Self::hex_decode_bytes(h).unwrap_or_default())
-                .collect();
-
-            if !output_bytes.is_empty() {
-                let input_frame = super::super::frame::Frame::new(0, input);
-                let output_frames: Vec<super::super::frame::Frame> = output_bytes
-                    .into_iter()
-                    .map(|payload| super::super::frame::Frame::new(0, payload))
-                    .collect();
-                mappings.push(
-                    crate::core::klippy::interface::devices::test::MappingEntry {
-                        input: input_frame,
-                        outputs: output_frames,
-                    },
-                );
-            }
-        }
-
-        crate::core::klippy::interface::devices::test::TestDevice::new(mappings)
-    }
-
-    /// Decode a hex string to bytes (test helper).
-    #[cfg(test)]
-    fn hex_decode_bytes(s: &str) -> Result<Vec<u8>, String> {
-        if !s.len().is_multiple_of(2) {
-            return Err("Hex string length must be even".to_string());
-        }
-        (0..s.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| e.to_string()))
-            .collect()
     }
 }
 
@@ -413,8 +363,6 @@ impl Transport {
                 Interface::host(library).map_err(|e| format!("host_library: {e}"))
             }
             #[cfg(test)]
-            Transport::Test(value) => Ok(Interface::new(McuConfig::test_device(value))),
-            #[cfg(test)]
             Transport::Simulator(path) => SimulatorDevice::new(path)
                 .map(Interface::simulator)
                 .map_err(|e| format!("test: {e}")),
@@ -428,14 +376,13 @@ mod tests {
     use crate::core::klippy::config::section::ConfigSection;
     use crate::core::klippy::config::value::ConfigValue;
 
-    fn make_section(test_lines: &[&str]) -> ConfigSection {
+    /// Helper that creates a `[mcu]` section with `serial: /fake/tty`.
+    fn make_section(_test_lines: &[&str]) -> ConfigSection {
         let mut section = ConfigSection::new("mcu", None);
-        if !test_lines.is_empty() {
-            section.parameters.insert(
-                "test".to_string(),
-                ConfigValue::Multi(test_lines.iter().map(|s| s.to_string()).collect()),
-            );
-        }
+        section.parameters.insert(
+            "serial".to_string(),
+            ConfigValue::Single("/fake/tty".to_string()),
+        );
         section
     }
 
@@ -451,18 +398,6 @@ mod tests {
     /// Wrap a hand-built section the way the loader does.
     fn wrap(section: &ConfigSection) -> ConfigWrapper<'_> {
         ConfigWrapper::untracked(section)
-    }
-
-    #[test]
-    fn test_parse_mcu_config_with_test_interface() {
-        let section = make_section(&["01 02 03"]);
-        let result = McuConfig::new(&wrap(&section));
-        assert!(result.is_ok());
-        let config = result.unwrap();
-        assert_eq!(config.name, "mcu");
-        // A `test:` MCU is not serial, so it resets with `command` like every
-        // non-serial transport.
-        assert_eq!(config.restart_method, McuRestartMethod::Command);
     }
 
     #[test]
@@ -569,7 +504,7 @@ mod tests {
 
     #[test]
     fn test_parse_mcu_config_no_interface() {
-        let section = make_section(&[]);
+        let section = ConfigSection::new("mcu", None);
         let err = McuConfig::new(&wrap(&section)).unwrap_err();
         // The error has to say how to fix the section, not just that it is wrong.
         assert!(err.to_string().contains("needs an interface"), "{err}");
@@ -713,24 +648,19 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_test_config_skips_comments_and_empty() {
-        let section = make_section(&["", "# this is a comment", "01 02", "   ", "03 04 05"]);
+    fn test_parse_mcu_config_with_dict_interface() {
+        let mut section = ConfigSection::new("mcu", None);
+        section.parameters.insert(
+            "test".to_string(),
+            ConfigValue::Single("dict=/fake/path.dict".to_string()),
+        );
         let result = McuConfig::new(&wrap(&section));
         assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_hex_decode_bytes() {
-        assert_eq!(McuConfig::hex_decode_bytes("01").unwrap(), vec![0x01]);
-        assert_eq!(
-            McuConfig::hex_decode_bytes("DEAD").unwrap(),
-            vec![0xDE, 0xAD]
-        );
-        assert_eq!(
-            McuConfig::hex_decode_bytes("BEEF00").unwrap(),
-            vec![0xBE, 0xEF, 0x00]
-        );
-        assert!(McuConfig::hex_decode_bytes("ABC").is_err()); // odd length
-        assert!(McuConfig::hex_decode_bytes("ZZ").is_err()); // invalid hex
+        let config = result.unwrap();
+        assert_eq!(config.name, "mcu");
+        assert!(matches!(config.transport, Transport::Simulator(_)));
+        // A `test: dict=` MCU is not serial, so it resets with `command` like
+        // every non-serial transport.
+        assert_eq!(config.restart_method, McuRestartMethod::Command);
     }
 }

@@ -8,7 +8,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use super::pin::pin_number;
+use super::pin::{pin_number, McuChip};
 use crate::core::klippy::cmd::stepper::{ConfigStepper, QueueStep, ResetStepClock, SetNextStepDir};
 use crate::core::klippy::cmd::McuCommand;
 use crate::core::klippy::mcu::{ConfigBuilder, Mcu, McuError};
@@ -25,6 +25,9 @@ struct StepperState {
 #[derive(Debug)]
 pub struct McuStepper {
     state: Arc<StepperState>,
+    /// The chip this stepper was built on, so a rail can register it with an
+    /// endstop's trigger dispatch (which may be on another MCU).
+    chip: McuChip,
     /// `dir_pin` was written with `!`: the direction bit on the wire is the
     /// opposite of the solver's.
     ///
@@ -54,6 +57,7 @@ impl McuStepper {
         invert_step: i8,
         step_pulse_duration: f64,
         invert_dir: bool,
+        chip: McuChip,
     ) -> Self {
         let state = Arc::new(StepperState::default());
         let callback_state = Arc::clone(&state);
@@ -79,9 +83,15 @@ impl McuStepper {
             .expect("a resource is always built before the configuration is");
         Self {
             state,
+            chip,
             invert_dir,
             mcu,
         }
+    }
+
+    /// The chip this stepper was built on.
+    pub fn chip(&self) -> &McuChip {
+        &self.chip
     }
 
     /// The oid the config callback assigned.

@@ -80,6 +80,14 @@ pub struct McuChip {
     trsync_registry: Arc<TrsyncRegistry>,
 }
 
+impl std::fmt::Debug for McuChip {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McuChip")
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
+}
+
 impl McuChip {
     /// A chip for `name`, not yet connected.
     pub fn new(name: String, config: Arc<ConfigBuilder>, pins: Arc<PrinterPins>) -> Self {
@@ -288,6 +296,7 @@ impl McuChip {
             invert_step,
             step_pulse_duration,
             invert_dir,
+            self.clone(),
         ))
     }
 

@@ -332,6 +332,49 @@ pub fn cartesian_active_flags(axis: Axis) -> AxisFlags {
     }
 }
 
+/// The position function for one CoreXY motor (`corexy_stepper_alloc`,
+/// `chelper/kin_corexy.c`): `+` follows `x + y`, `-` follows `x - y`.
+pub fn corexy_position_fn(plus: bool) -> PositionFn {
+    if plus {
+        |segment, move_time| {
+            let c = segment.coord(move_time);
+            c.x() + c.y()
+        }
+    } else {
+        |segment, move_time| {
+            let c = segment.coord(move_time);
+            c.x() - c.y()
+        }
+    }
+}
+
+/// The active flags for a CoreXY motor: it moves when X or Y does
+/// (`corexy_stepper_alloc`'s `AF_X | AF_Y`).
+pub fn corexy_active_flags() -> AxisFlags {
+    AxisFlags::X.union(AxisFlags::Y)
+}
+
+/// The position function for one CoreXZ motor (`corexz_stepper_alloc`,
+/// `chelper/kin_corexz.c`): `+` follows `x + z`, `-` follows `x - z`.
+pub fn corexz_position_fn(plus: bool) -> PositionFn {
+    if plus {
+        |segment, move_time| {
+            let c = segment.coord(move_time);
+            c.x() + c.z()
+        }
+    } else {
+        |segment, move_time| {
+            let c = segment.coord(move_time);
+            c.x() - c.z()
+        }
+    }
+}
+
+/// The active flags for a CoreXZ motor (`AF_X | AF_Z`).
+pub fn corexz_active_flags() -> AxisFlags {
+    AxisFlags::X.union(AxisFlags::Z)
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -379,6 +422,38 @@ mod tests {
         assert_eq!(cartesian_position_fn(Axis::X)(&segment, 0.5), 6.0);
         assert_eq!(cartesian_position_fn(Axis::Y)(&segment, 0.5), 2.0);
         assert_eq!(cartesian_position_fn(Axis::Z)(&segment, 0.5), 3.0);
+    }
+
+    #[test]
+    fn test_corexy_reads_the_x_y_sum_and_difference() {
+        let segment = MoveSegment {
+            print_time: 0.0,
+            move_t: 1.0,
+            start_v: 10.0,
+            half_accel: 0.0,
+            start_pos: Xyz::new(1.0, 2.0, 3.0),
+            axes_r: Xyz::new(1.0, 0.0, 0.0),
+        };
+        // x is 6 and y is 2 at 0.5 s, so the two motors read 8 and 4.
+        assert_eq!(corexy_position_fn(true)(&segment, 0.5), 8.0);
+        assert_eq!(corexy_position_fn(false)(&segment, 0.5), 4.0);
+        assert_eq!(corexy_active_flags(), AxisFlags::X.union(AxisFlags::Y));
+    }
+
+    #[test]
+    fn test_corexz_reads_the_x_z_sum_and_difference() {
+        let segment = MoveSegment {
+            print_time: 0.0,
+            move_t: 1.0,
+            start_v: 10.0,
+            half_accel: 0.0,
+            start_pos: Xyz::new(1.0, 2.0, 3.0),
+            axes_r: Xyz::new(0.0, 0.0, 1.0),
+        };
+        // x is 1 and z is 8 at 0.5 s, so the two motors read 9 and -7.
+        assert_eq!(corexz_position_fn(true)(&segment, 0.5), 9.0);
+        assert_eq!(corexz_position_fn(false)(&segment, 0.5), -7.0);
+        assert_eq!(corexz_active_flags(), AxisFlags::X.union(AxisFlags::Z));
     }
 
     #[test]

@@ -252,9 +252,15 @@ FW5a–f / FW6a–f 已把「cartesian + 假 MCU 的 `G1`/`G28`」跑通并归�
       trapq；`motion` 层的 `trait ExtraAxis` 与 `LookAheadQueue`/`process_lookahead` 接线；
       `ExtruderStepper` + `extruder_stepper_alloc` 位置函数。heater 做成可注入接口
       （H1 落地前用桩）。
-- [ ] **C1c 运动学族**：C1c-1 corexy/hybrid_corexy/corexz/hybrid_corexz（矩阵）→
-      C1c-2 delta/rotary_delta/deltesian/winch（迭代求解 + `mathutil`）→
-      C1c-3 generic_cartesian → C1c-4 polar。
+- [x] **C1c-1 corexy 族**：✅ 已完成。`CartesianTransform`（Standard/CoreXy/CoreXz/HybridCoreXy/
+      HybridCoreXz）把「rail 位置 → 台面轴」抽成值；`itersolve` 加 `corexy_/corexz_ position_fn`
+      （`x±y` / `x±z`，active flags `X|Y` / `X|Z`）；`ToolHeadObject` 的 `KinematicsKind` 分派 solver
+      与 endstop 互挂（corexy 双向、hybrid 单向，同上游）。回归里 corexy/corexz/hybrid_* 的首
+      次失败由 kinematics 前移到 `extruder`（T3）/`dual_carriage`（T9）。
+- [ ] **C1c-2 delta 族**：`delta`/`rotary_delta`/`deltesian`/`winch`（迭代求解 + `mathutil` 的
+      `trilateration`/`gaussian_solve`）。
+- [ ] **C1c-3 generic_cartesian**。
+- [ ] **C1c-4 polar**。
 - [ ] **C1d `gcode_move` + print-time 回调**：`[gcode_move]`（G92/M114/G90/G91/M82/M83/
       `SET_GCODE_OFFSET`/状态保存）与 `ToolHead::register_lookahead_callback`。
 

@@ -69,8 +69,13 @@ use crate::core::klippy::gcode::{
 use crate::core::klippy::load::section;
 use crate::core::klippy::mathutil::{Coord, X_AXIS, Y_AXIS, Z_AXIS};
 use crate::core::klippy::mcu::{Completion, McuEndstop, McuError, McuObject, McuStepper};
-use crate::core::klippy::motion::itersolve::{cartesian_active_flags, cartesian_position_fn, Axis};
-use crate::core::klippy::motion::kinematics::{home_move, CartesianKinematics, NoneKinematics};
+use crate::core::klippy::motion::itersolve::{
+    cartesian_active_flags, cartesian_position_fn, corexy_active_flags, corexy_position_fn,
+    corexz_active_flags, corexz_position_fn, Axis, AxisFlags, PositionFn,
+};
+use crate::core::klippy::motion::kinematics::{
+    home_move, CartesianKinematics, CartesianTransform, NoneKinematics,
+};
 use crate::core::klippy::motion::plan::MoveLimits;
 use crate::core::klippy::motion::stepcompress::{StepCommand, StepCompressError};
 use crate::core::klippy::motion::toolhead::ToolHead;
@@ -97,6 +102,113 @@ const MOVE_HISTORY_EXPIRE: f64 = 30.0;
 /// The speed a `G1` uses before any `F` (`gcode_move`'s initial `self.speed`).
 const DEFAULT_MOVE_SPEED: f64 = 50.0;
 
+/// The cartesian-family kinematics `[printer] kinematics` may name.
+///
+/// They share one `CartesianKinematics` (limits, homing, `check_move`) and
+/// differ in which solver each rail runs, how carriage axes map to rail
+/// positions (`CartesianTransform`), and which endstops watch which motors
+/// (`kinematics/corexy.py`, `corexz.py`, `hybrid_corexy.py`, `hybrid_corexz.py`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KinematicsKind {
+    /// `kinematics: none`
+    None,
+    /// `kinematics: cartesian`
+    Cartesian,
+    /// `kinematics: corexy`
+    CoreXy,
+    /// `kinematics: corexz`
+    CoreXz,
+    /// `kinematics: hybrid_corexy`
+    HybridCoreXy,
+    /// `kinematics: hybrid_corexz`
+    HybridCoreXz,
+}
+
+impl KinematicsKind {
+    /// The names this host implements. Kept as a list so the error names them.
+    const NAMES: &'static [&'static str] = &[
+        "none",
+        "cartesian",
+        "corexy",
+        "corexz",
+        "hybrid_corexy",
+        "hybrid_corexz",
+    ];
+
+    /// Parse a `[printer] kinematics` value.
+    fn parse(name: &str) -> Option<Self> {
+        Some(match name {
+            "none" => Self::None,
+            "cartesian" => Self::Cartesian,
+            "corexy" => Self::CoreXy,
+            "corexz" => Self::CoreXz,
+            "hybrid_corexy" => Self::HybridCoreXy,
+            "hybrid_corexz" => Self::HybridCoreXz,
+            _ => return None,
+        })
+    }
+
+    /// The rail-position-to-carriage mapping for the kinematics.
+    fn transform(self) -> CartesianTransform {
+        match self {
+            Self::None | Self::Cartesian => CartesianTransform::Standard,
+            Self::CoreXy => CartesianTransform::CoreXy,
+            Self::CoreXz => CartesianTransform::CoreXz,
+            Self::HybridCoreXy => CartesianTransform::HybridCoreXy,
+            Self::HybridCoreXz => CartesianTransform::HybridCoreXz,
+        }
+    }
+
+    /// The solver each rail's steppers run (`X`, `Y`, `Z` order).
+    fn solvers(self) -> [(PositionFn, AxisFlags); 3] {
+        let cart = |axis: Axis| (cartesian_position_fn(axis), cartesian_active_flags(axis));
+        match self {
+            Self::None | Self::Cartesian => [cart(Axis::X), cart(Axis::Y), cart(Axis::Z)],
+            // CoreXY: both motors carry the X/Y coupling, so each moves when
+            // either axis does (`corexy_stepper_alloc`).
+            Self::CoreXy => [
+                (corexy_position_fn(true), corexy_active_flags()),
+                (corexy_position_fn(false), corexy_active_flags()),
+                cart(Axis::Z),
+            ],
+            // CoreXZ: the X/Z pairing is on the X and Z rails.
+            Self::CoreXz => [
+                (corexz_position_fn(true), corexz_active_flags()),
+                cart(Axis::Y),
+                (corexz_position_fn(false), corexz_active_flags()),
+            ],
+            // Hybrid CoreXY: only the X motor is coupled (`x - y`).
+            Self::HybridCoreXy => [
+                (corexy_position_fn(false), corexy_active_flags()),
+                cart(Axis::Y),
+                cart(Axis::Z),
+            ],
+            // Hybrid CoreXZ: only the X motor is coupled (`x - z`).
+            Self::HybridCoreXz => [
+                (corexz_position_fn(false), corexz_active_flags()),
+                cart(Axis::Y),
+                cart(Axis::Z),
+            ],
+        }
+    }
+
+    /// Endstops that must also stop the other rail's motors: `(target, source)`
+    /// means the target rail's endstop watches `source`'s steppers.
+    ///
+    /// Upstream registers these in each kinematics' `__init__`
+    /// (`corexy.py:14-17` is the two-way case; `hybrid_corexy.py:17-18` the
+    /// one-way one).
+    fn endstop_pairs(self) -> &'static [(usize, usize)] {
+        match self {
+            Self::CoreXy => &[(0, 1), (1, 0)],
+            Self::CoreXz => &[(0, 2), (2, 0)],
+            Self::HybridCoreXy => &[(1, 0)],
+            Self::HybridCoreXz => &[(2, 0)],
+            _ => &[],
+        }
+    }
+}
+
 /// The `toolhead` object: the planner, its kinematics, and the MCU steppers.
 pub struct ToolHeadObject {
     limits: MoveLimits,
@@ -109,6 +221,8 @@ pub struct ToolHeadObject {
     rails: Vec<Arc<Rail>>,
     /// Whether `[printer] kinematics` was `none`.
     none: bool,
+    /// How the rails' positions map to carriage axes.
+    transform: CartesianTransform,
     /// The machine's clock, for seeding the print-time mapping.
     reactor: Arc<dyn Reactor>,
     /// The machine, to shut it down if the compressor hits an internal error.
@@ -139,15 +253,13 @@ impl ToolHeadObject {
     /// missing velocity limit, or a missing `[stepper_x/y/z]`.
     pub fn new(config: &ConfigWrapper, printer: &Arc<Printer>) -> Result<Self, ConfigError> {
         let kinematics = config.get("kinematics", None)?;
-        let none = match kinematics.as_str() {
-            "cartesian" => false,
-            "none" => true,
-            other => {
-                return Err(ConfigError::new(format!(
-                "Error loading kinematics '{other}' (only 'cartesian' and 'none' are implemented)"
-            )))
-            }
-        };
+        let kind = KinematicsKind::parse(&kinematics).ok_or_else(|| {
+            ConfigError::new(format!(
+                "Error loading kinematics '{kinematics}' (only {} are implemented)",
+                KinematicsKind::NAMES.join(", ")
+            ))
+        })?;
+        let none = matches!(kind, KinematicsKind::None);
 
         let max_velocity =
             config.get_float_bounded("max_velocity", None, None, None, Some(0.0), None)?;
@@ -207,14 +319,31 @@ impl ToolHeadObject {
                 rails.push(Rail::lookup(config, printer, name, axis)?);
             }
             // The owning kinematics installs each stepper's solver
-            // (`MCU_stepper.setup_itersolve`); cartesian passes the matching
-            // axis function, so a `[stepper_z1]` on the Z rail reads Z too.
-            for (axis, rail) in [Axis::X, Axis::Y, Axis::Z].iter().zip(&rails) {
+            // (`MCU_stepper.setup_itersolve`); the family decides the position
+            // function, so a corexy motor follows `x ± y`.
+            let solvers = kind.solvers();
+            for (rail, (position, flags)) in rails.iter().zip(solvers) {
                 for stepper in rail.steppers() {
-                    stepper.setup_itersolve(
-                        cartesian_position_fn(*axis),
-                        cartesian_active_flags(*axis),
-                    );
+                    stepper.setup_itersolve(position, flags);
+                }
+            }
+            // A paired rail's endstop has to stop the other rail's motors too
+            // (`corexy.py:14-17` and friends).
+            for (target, source) in kind.endstop_pairs() {
+                let Some(endstop) = rails[*target].endstop().cloned() else {
+                    continue;
+                };
+                for stepper in rails[*source].steppers() {
+                    endstop
+                        .dispatch()
+                        .add_stepper(
+                            stepper.mcu_stepper().chip().clone(),
+                            Arc::downgrade(stepper.mcu_stepper()),
+                            stepper.name(),
+                        )
+                        .map_err(|err| {
+                            ConfigError::new(format!("{}: {err}", config.identifier()))
+                        })?;
                 }
             }
         }
@@ -239,6 +368,7 @@ impl ToolHeadObject {
             max_z_accel,
             rails,
             none,
+            transform: kind.transform(),
             reactor: printer.reactor(),
             printer: Arc::downgrade(printer),
             state,
@@ -389,6 +519,7 @@ impl PrinterObject for ToolHeadObject {
                     ),
                     self.max_z_velocity,
                     self.max_z_accel,
+                    self.transform,
                 )));
             }
 
@@ -1064,6 +1195,37 @@ mod tests {
     }
 
     #[test]
+    fn test_the_corexy_family_loads_and_builds_its_rails() {
+        use crate::core::klippy::config::Config;
+        use crate::core::klippy::reactor::ManualReactor;
+
+        for (name, transform) in [
+            ("corexy", CartesianTransform::CoreXy),
+            ("corexz", CartesianTransform::CoreXz),
+            ("hybrid_corexy", CartesianTransform::HybridCoreXy),
+            ("hybrid_corexz", CartesianTransform::HybridCoreXz),
+        ] {
+            let printer = Arc::new(Printer::new(ManualReactor::shared()));
+            let text = format!(
+                "[mcu]\nserial: /dev/not-opened-yet\n\
+                 [stepper_x]\nstep_pin: PA0\ndir_pin: PA1\nrotation_distance: 40\nmicrosteps: 16\nposition_max: 200\nendstop_pin: ^PA2\n\
+                 [stepper_y]\nstep_pin: PA3\ndir_pin: PA4\nrotation_distance: 40\nmicrosteps: 16\nposition_max: 200\nendstop_pin: ^PA5\n\
+                 [stepper_z]\nstep_pin: PA6\ndir_pin: PA7\nrotation_distance: 8\nmicrosteps: 16\nposition_max: 200\nendstop_pin: ^PB0\n\
+                 [printer]\nkinematics: {name}\nmax_velocity: 300\nmax_accel: 3000\n"
+            );
+            let (config, _) = Config::from_text(&text).expect("the config parses");
+            printer
+                .load_config(&config)
+                .unwrap_or_else(|err| panic!("{name}: {err}"));
+            let object = printer
+                .lookup_object_as::<ToolHeadObject>("toolhead")
+                .expect("the toolhead is registered");
+            assert_eq!(object.transform, transform, "{name}");
+            assert_eq!(object.rails.len(), 3, "{name}");
+        }
+    }
+
+    #[test]
     fn test_mcu_errors_are_reported_with_the_section_name() {
         // `McuError::Config` is what a missing connection reports; the test just
         // pins that the helper keeps the `[printer]` prefix.
@@ -1106,6 +1268,7 @@ mod tests {
             Coord::new(200.0, 200.0, 200.0, 0.0),
             15.0,
             100.0,
+            CartesianTransform::Standard,
         )));
         // Pretend a `SET_KINEMATIC_POSITION` homed the axes at the origin.
         toolhead.set_position(Coord::default(), &[X_AXIS, Y_AXIS, Z_AXIS]);

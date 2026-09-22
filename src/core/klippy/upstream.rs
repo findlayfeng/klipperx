@@ -215,7 +215,14 @@ mod tests {
             .into_iter()
             .map(str::to_string)
             .collect();
-        let supported_kinematics = ["cartesian", "none"];
+        let supported_kinematics = [
+            "none",
+            "cartesian",
+            "corexy",
+            "corexz",
+            "hybrid_corexy",
+            "hybrid_corexz",
+        ];
 
         let mut gap_frequency: BTreeMap<String, usize> = BTreeMap::new();
         let mut one_gap: Vec<String> = Vec::new();

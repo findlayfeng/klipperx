@@ -201,10 +201,32 @@ impl Kinematics for NoneKinematics {
     fn home(&mut self, _homing: &mut dyn HomingState) {}
 }
 
+/// How a cartesian-family kinematics maps its three rail positions to the
+/// carriage axes.
+///
+/// The families differ only in this mapping (plus how the motors are driven,
+/// which the rails' solvers carry). Upstream writes each as its own class
+/// (`kinematics/corexy.py`, `corexz.py`, `hybrid_corexy.py`, `hybrid_corexz.py`)
+/// around the same limits/homing code; here the mapping is a value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CartesianTransform {
+    /// `stepper_x` = x, `stepper_y` = y, `stepper_z` = z.
+    Standard,
+    /// CoreXY: `x = (ax + ay) / 2`, `y = (ax - ay) / 2`.
+    CoreXy,
+    /// CoreXZ: `x = (ax + az) / 2`, `z = (ax - az) / 2`.
+    CoreXz,
+    /// Hybrid CoreXY (Markforged): `x = ax + ay`, `y = ay`.
+    HybridCoreXy,
+    /// Hybrid CoreXZ: `x = ax + az`, `z = az`.
+    HybridCoreXz,
+}
+
 /// Cartesian kinematics: one stepper per axis, straight-line limits.
 ///
-/// Upstream's `CartKinematics` (`klippy/kinematics/cartesian.py`), without the
-/// dual-carriage extension.
+/// Upstream's `CartKinematics` (`klippy/kinematics/cartesian.py`) and the
+/// corexy/corexz/hybrid variants, which share its limits, homing and check
+/// code and differ only by [`CartesianTransform`].
 #[derive(Debug, Clone)]
 pub struct CartesianKinematics {
     /// The stepper name of each of the three axes.
@@ -216,18 +238,21 @@ pub struct CartesianKinematics {
     limits: [Option<(f64, f64)>; 3],
     max_z_velocity: f64,
     max_z_accel: f64,
+    /// How rail positions map to the carriage's x/y/z.
+    transform: CartesianTransform,
 }
 
 impl CartesianKinematics {
     /// A cartesian kinematics over `axes` (`stepper_x` …), travelling between
     /// `axes_min` and `axes_max`, with the Z axis limited to `max_z_velocity`
-    /// and `max_z_accel`.
+    /// and `max_z_accel`, and the given rail→carriage mapping.
     pub fn new(
         axes: [String; 3],
         axes_min: Coord,
         axes_max: Coord,
         max_z_velocity: f64,
         max_z_accel: f64,
+        transform: CartesianTransform,
     ) -> Self {
         Self {
             axes,
@@ -238,6 +263,7 @@ impl CartesianKinematics {
             limits: [None; 3],
             max_z_velocity,
             max_z_accel,
+            transform,
         }
     }
 
@@ -265,11 +291,19 @@ impl CartesianKinematics {
 
 impl Kinematics for CartesianKinematics {
     fn calc_position(&self, stepper_positions: &HashMap<String, f64>) -> [Option<f64>; 3] {
-        let mut out = [None; 3];
-        for (axis, name) in self.axes.iter().enumerate() {
-            out[axis] = stepper_positions.get(name).copied();
+        let rail = |axis: usize| stepper_positions.get(&self.axes[axis]).copied();
+        let (Some(ax), Some(ay), Some(az)) = (rail(X_AXIS), rail(Y_AXIS), rail(Z_AXIS)) else {
+            // At least one rail position is unknown, so the carriage cannot be
+            // located; keep the per-axis `None` shape the caller expects.
+            return [rail(X_AXIS), rail(Y_AXIS), rail(Z_AXIS)];
+        };
+        match self.transform {
+            CartesianTransform::Standard => [Some(ax), Some(ay), Some(az)],
+            CartesianTransform::CoreXy => [Some(0.5 * (ax + ay)), Some(0.5 * (ax - ay)), Some(az)],
+            CartesianTransform::CoreXz => [Some(0.5 * (ax + az)), Some(ay), Some(0.5 * (ax - az))],
+            CartesianTransform::HybridCoreXy => [Some(ax + ay), Some(ay), Some(az)],
+            CartesianTransform::HybridCoreXz => [Some(ax + az), Some(ay), Some(az)],
         }
-        out
     }
 
     fn check_move(&self, ctx: &mut MoveContext<'_>) -> Result<(), CommandError> {
@@ -382,6 +416,7 @@ mod tests {
             Coord::new(200.0, 200.0, 200.0, 0.0),
             15.0,
             100.0,
+            CartesianTransform::Standard,
         )
     }
 
@@ -438,6 +473,106 @@ mod tests {
             (move_.max_cruise_v2 - expected * expected).abs() < 1e-6,
             "{}",
             move_.max_cruise_v2
+        );
+    }
+
+    #[test]
+    fn test_corexy_maps_rail_positions_to_the_carriage() {
+        let kin = CartesianKinematics::new(
+            [
+                "stepper_x".to_string(),
+                "stepper_y".to_string(),
+                "stepper_z".to_string(),
+            ],
+            Coord::new(0.0, 0.0, 0.0, 0.0),
+            Coord::new(200.0, 200.0, 200.0, 0.0),
+            15.0,
+            100.0,
+            CartesianTransform::CoreXy,
+        );
+        let positions: HashMap<String, f64> = [
+            ("stepper_x".to_string(), 12.0),
+            ("stepper_y".to_string(), 4.0),
+            ("stepper_z".to_string(), 3.0),
+        ]
+        .into_iter()
+        .collect();
+
+        assert_eq!(
+            kin.calc_position(&positions),
+            [Some(8.0), Some(4.0), Some(3.0)]
+        );
+    }
+
+    #[test]
+    fn test_corexz_maps_rail_positions_to_the_carriage() {
+        let kin = CartesianKinematics::new(
+            [
+                "stepper_x".to_string(),
+                "stepper_y".to_string(),
+                "stepper_z".to_string(),
+            ],
+            Coord::new(0.0, 0.0, 0.0, 0.0),
+            Coord::new(200.0, 200.0, 200.0, 0.0),
+            15.0,
+            100.0,
+            CartesianTransform::CoreXz,
+        );
+        let positions: HashMap<String, f64> = [
+            ("stepper_x".to_string(), 12.0),
+            ("stepper_y".to_string(), 7.0),
+            ("stepper_z".to_string(), 4.0),
+        ]
+        .into_iter()
+        .collect();
+
+        assert_eq!(
+            kin.calc_position(&positions),
+            [Some(8.0), Some(7.0), Some(4.0)]
+        );
+    }
+
+    #[test]
+    fn test_the_hybrid_families_map_only_x() {
+        let positions: HashMap<String, f64> = [
+            ("stepper_x".to_string(), 12.0),
+            ("stepper_y".to_string(), 4.0),
+            ("stepper_z".to_string(), 3.0),
+        ]
+        .into_iter()
+        .collect();
+        let axes = [
+            "stepper_x".to_string(),
+            "stepper_y".to_string(),
+            "stepper_z".to_string(),
+        ];
+
+        // Hybrid CoreXY: x = ax + ay, y = ay.
+        let kin = CartesianKinematics::new(
+            axes.clone(),
+            Coord::default(),
+            Coord::new(200.0, 200.0, 200.0, 0.0),
+            15.0,
+            100.0,
+            CartesianTransform::HybridCoreXy,
+        );
+        assert_eq!(
+            kin.calc_position(&positions),
+            [Some(16.0), Some(4.0), Some(3.0)]
+        );
+
+        // Hybrid CoreXZ: x = ax + az, z = az.
+        let kin = CartesianKinematics::new(
+            axes,
+            Coord::default(),
+            Coord::new(200.0, 200.0, 200.0, 0.0),
+            15.0,
+            100.0,
+            CartesianTransform::HybridCoreXz,
+        );
+        assert_eq!(
+            kin.calc_position(&positions),
+            [Some(15.0), Some(4.0), Some(3.0)]
         );
     }
 

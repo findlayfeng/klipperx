@@ -394,6 +394,7 @@ mod tests {
             Coord::new(200.0, 200.0, 200.0, 0.0),
             15.0,
             100.0,
+            crate::core::klippy::motion::kinematics::CartesianTransform::Standard,
         )));
 
         let err = toolhead

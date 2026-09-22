@@ -285,6 +285,25 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 实际执行 1 条（通过）；忽略列表即本节的工单，每步做完就从 `IGNORED` 移除对应文件
 （手册见 `docs/klippy/developer-manual/regression-tests.md`）。
 
+**推进口径**：下文的「首次失败原因」分组只用于定位，不是工作队列——`load_config` 遇到第一个
+未知 section 就停，修好一个缺口只会让运行前进到下一个缺口，总数可能不变（T7 后的 236 就是
+例子），各组收益不可加。进度以**转绿运行数 / `IGNORED` 条目数**衡量（当前 1 / 36）。**验收标准
+是「对应 `.test` 从 `IGNORED` 移除后通过」**，不是「某个错误不再出现」。详见
+[失败原因分析复盘](docs/work-log/2026-09-22-upstream-regression-failures.md#复盘计数口径与重排后补)。
+
+**阶段 0（都不依赖 C1，先做）**：
+
+- [ ] **运行 × 缺口扫描**：`upstream.rs` 测试模块加非致命静态扫描，列出每条运行引用的全部
+      section / `kinematics:` / pin chip 与已实现集合的差集，输出缺口矩阵（找「只差一个缺口」
+      的用例）。
+- [ ] **`IGNORED` 守卫测试**：某条已能通过却仍在 `IGNORED` 里时测试失败并提示移除，防止条目
+      漂移。
+- [ ] **T8** `output_pin` 的 `value` 上界与 `scale` 选项（6 次失败）。
+- [ ] **T9 小段**：`restart_method` 加进 `[mcu]` 的选项白名单、`static_digital_output` /
+      `pwm_cycle_time` 段工厂。
+- [ ] **T2 收尾**：自动装载 `stepper_enable`（上游 `stepper.py` 对每个 stepper 调
+      `load_object('stepper_enable')`）+ 注册 `M18`/`M84`/`SET_STEPPER_ENABLE`。
+
 按「闭包最小 → 杠杆最大」推进（T1 之后）：
 
 - [x] **T2. `[stepper_enable]`（`enable_pin`）**：`enable_pin` 选项已读取（因此不再报

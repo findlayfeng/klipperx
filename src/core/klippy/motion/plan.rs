@@ -12,6 +12,9 @@
 //! extra-axes hooks (`Move.calc_junction`'s `extra_axes`, the extruder) are not
 //! wired in yet — they arrive with `[extruder]` in FW5e.
 
+use std::sync::Arc;
+
+use super::extra::ExtraAxis;
 use crate::core::klippy::gcode::CommandError;
 use crate::core::klippy::mathutil::{Coord, E_AXIS};
 
@@ -189,8 +192,10 @@ impl Move {
     /// `prev` is the move immediately before it (`klippy/toolhead.py:66-98`).
     /// The junction speed is limited by both moves' cruise caps, by how much
     /// squared velocity the previous move can add, and by the "approximated
-    /// centripetal velocity" the corner deviation allows.
-    pub fn calc_junction(&mut self, prev: &Move) {
+    /// centripetal velocity" the corner deviation allows. `extra_v2` is the
+    /// extra axes' own limits (the extruder's `calc_junction`), each already
+    /// squared.
+    pub fn calc_junction(&mut self, prev: &Move, extra_v2: &[f64]) {
         if !self.is_kinematic_move || !prev.is_kinematic_move {
             return;
         }
@@ -202,7 +207,9 @@ impl Move {
         ]
         .into_iter()
         .fold(f64::INFINITY, f64::min);
-        // (Extra axes would fold their own junction limit in here.)
+        for v2 in extra_v2 {
+            max_start_v2 = max_start_v2.min(*v2);
+        }
         let axes_r = &self.axes_r;
         let prev_axes_r = &prev.axes_r;
         let junction_cos_theta =
@@ -322,17 +329,32 @@ impl LookAheadQueue {
 
     /// Add a move; returns whether the queue wants flushing now
     /// (`klippy/toolhead.py:186-198`).
-    pub fn add_move(&mut self, move_: Move) -> bool {
+    ///
+    /// `extra_axes` are the non-kinematic axes (the extruder); each contributes
+    /// a junction limit, as upstream's `Move.calc_junction` folds in
+    /// (`klippy/toolhead.py:66-98`).
+    pub fn add_move(&mut self, move_: Move, extra_axes: &[Arc<dyn ExtraAxis>]) -> bool {
         let len = self.queue.len();
         self.queue.push(move_);
         if len == 0 {
             return false;
         }
+        // The extra axes' junction limits need both moves borrowed at once.
+        let extra_v2: Vec<f64> = {
+            let (front, back) = self.queue.split_at(len);
+            let prev = &front[len - 1];
+            let cur = &back[0];
+            extra_axes
+                .iter()
+                .enumerate()
+                .map(|(index, axis)| axis.calc_junction(prev, cur, index + 3))
+                .collect()
+        };
         // The move just pushed and the one before it, without borrowing the
         // whole queue twice.
         let (front, back) = self.queue.split_at_mut(len);
         let last = &mut back[0];
-        last.calc_junction(&front[len - 1]);
+        last.calc_junction(&front[len - 1], &extra_v2);
         self.junction_flush -= last.min_move_t;
         self.junction_flush <= 0.0
     }
@@ -498,7 +520,7 @@ mod tests {
             &limits,
         );
 
-        next.calc_junction(&prev);
+        next.calc_junction(&prev, &[]);
 
         // A 90-degree corner is slower than the 100 mm/s cruise, and still
         // faster than a stop.
@@ -522,7 +544,7 @@ mod tests {
             &limits,
         );
 
-        next.calc_junction(&prev);
+        next.calc_junction(&prev, &[]);
 
         // No corner to slow down for: only the cruise cap applies.
         assert_eq!(next.max_start_v2, 10_000.0);
@@ -533,11 +555,11 @@ mod tests {
         let mut queue = LookAheadQueue::new();
 
         // The first move never flushes on its own.
-        assert!(!queue.add_move(planar_move(10.0, 0.0, 100.0)));
+        assert!(!queue.add_move(planar_move(10.0, 0.0, 100.0), &[]));
 
         // Each move takes 0.1 s; the 0.15 s budget is passed on the second.
-        assert!(!queue.add_move(planar_move(10.0, 0.0, 100.0)));
-        assert!(queue.add_move(planar_move(10.0, 0.0, 100.0)));
+        assert!(!queue.add_move(planar_move(10.0, 0.0, 100.0), &[]));
+        assert!(queue.add_move(planar_move(10.0, 0.0, 100.0), &[]));
 
         let moves = queue.flush(false);
         assert_eq!(moves.len(), 3);
@@ -549,7 +571,7 @@ mod tests {
     fn test_a_lazy_flush_keeps_short_queues_intact() {
         let mut queue = LookAheadQueue::new();
         for _ in 0..3 {
-            queue.add_move(planar_move(10.0, 0.0, 100.0));
+            queue.add_move(planar_move(10.0, 0.0, 100.0), &[]);
         }
 
         // Too few moves to know the peak cruise speed: a lazy flush returns

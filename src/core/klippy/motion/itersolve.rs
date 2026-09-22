@@ -375,6 +375,18 @@ pub fn corexz_active_flags() -> AxisFlags {
     AxisFlags::X.union(AxisFlags::Z)
 }
 
+/// The position function for an extruder motor (`extruder_stepper_alloc`,
+/// `chelper/kin_extruder.c`): read the trapq's x, which the extruder's trapq
+/// holds the extrusion amount in.
+pub fn extruder_position_fn() -> PositionFn {
+    |segment, move_time| segment.coord(move_time).x()
+}
+
+/// The active flags for an extruder motor (`AF_X`, because it reads x).
+pub fn extruder_active_flags() -> AxisFlags {
+    AxisFlags::X
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================

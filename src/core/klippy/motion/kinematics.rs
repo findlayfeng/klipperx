@@ -40,6 +40,14 @@ impl<'a> MoveContext<'a> {
         &self.move_.axes_d
     }
 
+    /// The per-axis distance over the total distance (the direction cosines).
+    ///
+    /// The extruder's `check_move` reads the E direction cosine
+    /// (`kinematics/extruder.py:180-205`).
+    pub fn axes_r(&self) -> &[f64; 4] {
+        &self.move_.axes_r
+    }
+
     /// The total distance.
     pub fn move_d(&self) -> f64 {
         self.move_.move_d
@@ -53,6 +61,12 @@ impl<'a> MoveContext<'a> {
     /// The error for a move outside the printable area.
     pub fn out_of_range(&self) -> CommandError {
         self.move_.move_error("Move out of range")
+    }
+
+    /// A move error carrying `msg`, with the move's end position
+    /// (`Move.move_error`).
+    pub fn move_error(&self, msg: &str) -> CommandError {
+        self.move_.move_error(msg)
     }
 
     /// The error for a move before the axis is homed.

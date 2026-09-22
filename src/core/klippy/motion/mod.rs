@@ -18,6 +18,7 @@
 //! The MCU side (the oid's `config_stepper`, sending `queue_step` over the
 //! wire) and the kinematics trait are FW5e; nothing here talks to an MCU.
 
+pub mod extra;
 pub mod itersolve;
 pub mod kinematics;
 pub mod plan;
@@ -27,12 +28,14 @@ pub mod stepper;
 pub mod toolhead;
 pub mod trapq;
 
+pub use extra::ExtraAxis;
 pub use itersolve::{
-    cartesian_active_flags, cartesian_position_fn, Axis, AxisFlags, StepKinematics,
+    cartesian_active_flags, cartesian_position_fn, corexy_active_flags, corexy_position_fn,
+    corexz_active_flags, corexz_position_fn, extruder_position_fn, Axis, AxisFlags, StepKinematics,
 };
 pub use kinematics::{
-    CartesianKinematics, HomeCoord, HomingInfo, HomingState, Kinematics, MoveContext,
-    NoneKinematics,
+    CartesianKinematics, CartesianTransform, HomeCoord, HomingInfo, HomingState, Kinematics,
+    MoveContext, NoneKinematics,
 };
 pub use plan::{LookAheadQueue, Move, MoveLimits};
 pub use queuing::MotionQueuing;

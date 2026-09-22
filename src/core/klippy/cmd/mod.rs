@@ -64,6 +64,7 @@ pub mod adc;
 pub mod allocate_oids;
 pub mod clock;
 pub mod config;
+pub mod ds18b20;
 pub mod endstop;
 pub mod gpio;
 pub mod i2c;

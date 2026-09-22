@@ -188,17 +188,16 @@ connect_file(输出文件, 字典):
 | 判定 | 次数 | 原因 |
 |------|------|------|
 | 因字典未构建跳过 | 2 | `printers.test` 中引用 `pru` 的两条运行（默认不编 `pru`） |
-| 因忽略列表跳过 | 237 | `IGNORED` 覆盖全部 37 个 `.test`；它们缺配置节/运动学 |
-| 实际执行 | 0 | — |
+| 因忽略列表跳过 | 236 | 尚未落地的配置节/运动学 |
+| 实际执行 | **1** | `linuxtest.test`（T1），**通过** |
 
-- 忽略列表 `IGNORED` 现在覆盖全部 37 个 `.test`，所以即使字典已基本齐备（237 条可用），也没有运行
-  会真正执行；`upstream_test_cases_run` 因此恒通过——它跑的是 0 次运行。这是「先立框架、暂不追平
-  用例」的预期状态。
-- `KLIPPERX_UPSTREAM_ALL=1` 只去掉忽略列表这一层：默认构建下它会跑 237 条可用运行，全部在配置装载
-  阶段失败（缺 `stepper_x` 的 `enable_pin`、probe pin chip、各运动学等），另外 2 条仍以「字典未构建」
-  计入统计，不算失败。它还依赖 `pru`（如要全跑，用 `KLIPPERX_ALL_ARCHES=1` 或 `KLIPPERX_ARCHES` 补上）。
-- 要让实际执行数上升：从 `IGNORED` 移除已落地节/运动学的文件；已构建的字典已覆盖除 `pru` 外的
-  全部被引用目标，因此大多数文件一旦移出忽略列表就能直接开始跑。
+- `linuxtest.test` 是第一个转绿的用例：它只需要 `kinematics: none`、`heaters` 的传感器注册表、
+  `temperature_sensor` 与 `ds18b20`，g-code 只是一次 `G4 P1000`。
+- `KLIPPERX_UPSTREAM_ALL=1` 只去掉忽略列表这一层：默认构建下它会跑 237 条可用运行，其中 1 条
+  （`linuxtest`）通过、236 条在配置装载阶段失败（缺 `stepper_x` 的 `enable_pin`、probe pin chip、
+  各运动学等），另外 2 条以「字典未构建」计入统计，不算失败。
+- 要让实际执行数继续上升：从 `IGNORED` 移除已落地节/运动学的文件。按 T2（`[stepper_enable]`）
+  与 T3（`extruder`/`heater_bed`/`fan`，复用 `heaters`）推进。
 
 ## 本仓库的复用
 
@@ -254,13 +253,14 @@ harness 把每个 `[mcu]` / `[mcu <name>]` 的传输键换成 `test: dict=<字�
 `KLIPPERX_UPSTREAM_ALL=1` **只作用于这张列表**：它让字典齐备的运行无视忽略判定并报出失败，
 **不会**让因字典未构建而跳过的运行跑起来（那是构建阶段的事，见上一节）。
 
-当前 37 条（= 全部 `.test` 文件），按首次失败原因分组（第一次失败修好后可能露出下一个）：
+当前 36 条（`linuxtest.test` 已在 T1 修好并转绿，不再是忽略项），按首次失败原因分组
+（第一次失败修好后可能露出下一个）：
 
 | 首次失败 | 条数 | `.test` |
 |----------|------|---------|
 | `Option 'enable_pin' is not valid in section 'stepper_x'`（`[stepper_*]` 尚无 `enable_pin`） | 14 | `bed_screws`、`commands`、`dual_carriage`、`exclude_object`、`extruders`、`input_shaper`、`load_cell`、`macros`、`multi_z`、`pressure_advance`、`printers`、`quad_gantry_level`、`temperature`、`z_tilt` |
 | `Unknown pin chip name 'probe'`（缺 probe/端停 pin chip） | 6 | `bed_mesh`、`bltouch`、`eddy`、`screws_tilt_adjust`、`smart_effector`、`z_virtual_endstop` |
-| 运动学未实现 | 13 | 见下表 |
+| 运动学未实现 | 12 | 见下表 |
 | `Section 'gcode_arcs' is not a valid config section` | 1 | `gcode_arcs` |
 | `Section 'virtual_sdcard' is not a valid config section` | 1 | `sdcard_loop` |
 | `Unknown pin chip name 'tmc2130_stepper_x'`（缺 TMC pin chip） | 1 | `tmc` |
@@ -270,14 +270,14 @@ harness 把每个 `[mcu]` / `[mcu <name>]` 的传输键换成 `test: dict=<字�
 
 | `kinematics` | `.test` |
 |--------------|---------|
-| `none` | `led`、`linuxtest`、`manual_stepper`、`pwm` |
+| `none` | `led`、`manual_stepper`、`pwm` |
 | `generic_cartesian` | `corexyuv`、`generic_cartesian`、`generic_cartesian_iqex`、`generic_cartesian_itex` |
 | `delta` | `delta`、`delta_calibrate` |
 | `hybrid_corexy` | `hybrid_corexy_dual_carriage` |
 | `polar` | `polar` |
 | `rotary_delta` | `rotary_delta_calibrate` |
 
-（14 + 6 + 13 + 1 + 1 + 1 + 1 = 37。）
+（14 + 6 + 12 + 1 + 1 + 1 + 1 = 36。）
 
 `out_of_bounds.test` 是唯一声明 `SHOULD_FAIL` 的用例，它期望的是**运行期**错误（`G1 Y9999` 越界），
 不是配置错误。上游可以把任何非零退出都当成功，是因为它什么都不缺；本仓库因此把结果分两段：

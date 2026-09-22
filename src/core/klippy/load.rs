@@ -326,6 +326,7 @@ mod tests {
                 "stepper_y",
                 "stepper_z",
                 "board_pins",
+                "temperature_sensor",
                 "i2c_device",
                 "spi_device",
                 "printer"

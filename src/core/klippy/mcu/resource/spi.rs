@@ -130,7 +130,7 @@ impl McuSpi {
     ///
     /// # Errors
     /// Returns [`McuError::Config`] before the configuration has been built.
-    fn oid(&self) -> Result<u8, McuError> {
+    pub(crate) fn oid(&self) -> Result<u8, McuError> {
         self.state
             .oid
             .lock()
@@ -139,7 +139,7 @@ impl McuSpi {
     }
 
     /// The connected MCU, or an error if not connected.
-    fn connected_mcu(&self) -> Result<Arc<Mcu>, McuError> {
+    pub(crate) fn connected_mcu(&self) -> Result<Arc<Mcu>, McuError> {
         self.mcu
             .lock()
             .expect("mcu lock poisoned")

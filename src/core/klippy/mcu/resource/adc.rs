@@ -29,7 +29,7 @@ use crate::core::klippy::cmd::adc::{
     AnalogInState, ConfigAnalogIn, QueryAnalogIn, QueryAnalogInOld,
 };
 use crate::core::klippy::cmd::McuResponse;
-use crate::core::klippy::mcu::{ConfigBuilder, Mcu, McuError};
+use crate::core::klippy::mcu::{query_slot, ConfigBuilder, Mcu, McuError};
 use crate::core::klippy::msg::proto::ArgValue;
 use crate::core::klippy::pins::{Adc, AdcCallback, PinError, PinParams, PrinterPins};
 use tracing::warn;
@@ -104,6 +104,10 @@ struct AdcState {
     minval: Mutex<f64>,
     maxval: Mutex<f64>,
     range_check_count: Mutex<u32>,
+    // Sampling parameters as they reach the wire, filled by `build`.
+    sample_ticks: Mutex<u32>,
+    min_sample: Mutex<u16>,
+    max_sample: Mutex<u16>,
     // Built state.
     oid: Mutex<Option<u8>>,
     /// `1.0 / (sample_count * ADC_MAX)`, the scale from a raw average to
@@ -144,6 +148,9 @@ impl McuAdc {
             minval: Mutex::new(0.0),
             maxval: Mutex::new(1.0),
             range_check_count: Mutex::new(0),
+            sample_ticks: Mutex::new(0),
+            min_sample: Mutex::new(0),
+            max_sample: Mutex::new(0),
             oid: Mutex::new(None),
             inv_max_adc: Mutex::new(0.0),
             report_clock: Mutex::new(0),
@@ -204,6 +211,12 @@ impl Adc for McuAdc {
     fn get_last_value(&self) -> Option<(u64, f64)> {
         *self.state.lock(|state| &state.last_value)
     }
+}
+
+/// The query form an input arms: the old one-sample message or the batched one.
+pub(crate) enum AdcQuery {
+    Old(QueryAnalogInOld),
+    New(QueryAnalogIn),
 }
 
 impl AdcState {
@@ -287,10 +300,8 @@ impl AdcState {
         let number = pin_number(mcu, &canonical, chip_name)?;
         builder.add_config_cmd(&ConfigAnalogIn { oid, pin: number })?;
 
-        // The first report is placed a little in the future and staggered by
-        // oid, so a bank of inputs does not report at once.
-        let clock = builder.get_query_slot(mcu, oid)?;
         let sample_ticks = mcu.seconds_to_clock(*self.lock(|state| &state.sample_time))? as u32;
+        *self.lock(|state| &state.sample_ticks) = sample_ticks;
         let report_clock = mcu.seconds_to_clock(*self.lock(|state| &state.report_time))? as u32;
         *self.lock(|state| &state.report_clock) = report_clock;
 
@@ -309,13 +320,13 @@ impl AdcState {
         let max_sample = (*self.lock(|state| &state.maxval) * max_adc)
             .ceil()
             .clamp(0.0, 65535.0) as u16;
-        let range_check_count = *self.lock(|state| &state.range_check_count) as u8;
+        *self.lock(|state| &state.min_sample) = min_sample;
+        *self.lock(|state| &state.max_sample) = max_sample;
 
         // The old one-sample form is used only when the firmware declares it
         // and one sample per report was asked for; otherwise the batched form
         // carries the count (`klippy/mcu.py:626-628`). The two forms share the
         // message name, so the format string is what tells them apart.
-        let batch_num = *self.lock(|state| &state.batch_num);
         let old_declared = mcu
             .dictionary()
             .map(|dictionary| {
@@ -325,45 +336,77 @@ impl AdcState {
                     .any(|message| message.format == OLD_QUERY)
             })
             .unwrap_or(false);
-        let use_old = batch_num == 1 && old_declared;
+        let use_old = *self.lock(|state| &state.batch_num) == 1 && old_declared;
         *self.lock(|state| &state.old_format) = use_old;
 
-        if use_old {
-            builder.add_init_cmd(&QueryAnalogInOld {
-                oid,
-                clock,
-                sample_ticks,
-                sample_count,
-                rest_ticks: report_clock,
-                min_value: min_sample,
-                max_value: max_sample,
-                range_check_count,
-            })?;
-        } else {
-            builder.add_init_cmd(&QueryAnalogIn {
-                oid,
-                clock,
-                sample_ticks,
-                sample_count,
-                rest_ticks: report_clock,
-                bytes_per_report: (batch_num * 2) as u8,
-                min_value: min_sample,
-                max_value: max_sample,
-                range_check_count,
-            })?;
-        }
-
-        // Bind on post-init: the response callback can only be installed once
-        // the firmware has accepted the configuration, and post-init runs on the
-        // connection that will actually report.
+        // The query carries an **absolute** clock. It is sent from the post-init
+        // callback — once the firmware has accepted the configuration and on the
+        // connection that will report — so the clock is read fresh there rather
+        // than baked into the config. That matters when a firmware is reset and
+        // re-identified mid-connect: a waketime from before the reboot is tens of
+        // seconds off the new clock, and the firmware's signed timer comparison
+        // reads it as "in the past" (`sched.c:94`).
         let registry = Arc::clone(registry);
         let state = Arc::clone(self);
         builder.register_post_init_callback(Box::new(move |mcu| {
+            if let Err(err) = state.arm_query(mcu, oid) {
+                warn!("MCU '{}': could not arm the ADC query: {err}", mcu.name());
+                return;
+            }
             if let Err(err) = registry.register(mcu, oid, Arc::clone(&state)) {
                 warn!("MCU '{}': could not bind ADC response: {err}", mcu.name());
             }
         }))?;
         Ok(())
+    }
+
+    /// Send this input's `query_analog_in`, with a clock read from `mcu` now.
+    fn arm_query(&self, mcu: &Mcu, oid: u8) -> Result<(), McuError> {
+        let clock = query_slot(mcu, oid)?;
+        match self.query_for(oid, clock)? {
+            AdcQuery::Old(query) => mcu.send_msg(&query),
+            AdcQuery::New(query) => mcu.send_msg(&query),
+        }
+    }
+
+    /// The `query_analog_in` this input arms, for `clock`.
+    ///
+    /// Split out from [`AdcState::arm_query`] so the message shape can be
+    /// checked without a live connection.
+    fn query_for(&self, oid: u8, clock: u32) -> Result<AdcQuery, McuError> {
+        let sample_count = u8::try_from(*self.lock(|state| &state.sample_count))
+            .map_err(|_| McuError::Config("ADC sample_count does not fit a byte".to_string()))?;
+        let range_check_count =
+            u8::try_from(*self.lock(|state| &state.range_check_count)).unwrap_or(u8::MAX);
+        let sample_ticks = *self.lock(|state| &state.sample_ticks);
+        let rest_ticks = *self.lock(|state| &state.report_clock);
+        let min_value = *self.lock(|state| &state.min_sample);
+        let max_value = *self.lock(|state| &state.max_sample);
+        if *self.lock(|state| &state.old_format) {
+            Ok(AdcQuery::Old(QueryAnalogInOld {
+                oid,
+                clock,
+                sample_ticks,
+                sample_count,
+                rest_ticks,
+                min_value,
+                max_value,
+                range_check_count,
+            }))
+        } else {
+            let batch_num = *self.lock(|state| &state.batch_num);
+            Ok(AdcQuery::New(QueryAnalogIn {
+                oid,
+                clock,
+                sample_ticks,
+                sample_count,
+                rest_ticks,
+                bytes_per_report: (batch_num * 2) as u8,
+                min_value,
+                max_value,
+                range_check_count,
+            }))
+        }
     }
 
     fn lock<T>(&self, field: impl Fn(&Self) -> &Mutex<T>) -> MutexGuard<'_, T> {
@@ -380,6 +423,7 @@ impl AdcState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::klippy::cmd::McuCommand;
     use crate::core::klippy::interface::devices::frame_mock::FrameMock;
     use crate::core::klippy::interface::Interface;
     use crate::core::klippy::mcu::Dictionary;
@@ -472,7 +516,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_a_batched_adc_builds_config_and_query() {
+    async fn test_a_batched_adc_builds_the_config_and_defers_the_query() {
         let (chip, pins) = chip();
         configure(&pins, 8, 4);
         let mcu = mcu(true);
@@ -481,43 +525,47 @@ mod tests {
 
         assert_eq!(config[1].0, "config_analog_in");
         assert_eq!(config[1].1, vec![ArgValue::UInt8(0), ArgValue::UInt32(1)]);
-        assert_eq!(init[0].0, "query_analog_in");
-        // oid 0, clock 0 (no estimate), sample_ticks 0.01 s, count 8, rest 0.1 s,
-        // bytes 8, min 0, max ADC_MAX * 8 (clamped to 0xffff).
-        assert_eq!(init[0].1[0], ArgValue::UInt8(0));
-        assert_eq!(init[0].1[2], ArgValue::UInt32(200_000));
-        assert_eq!(init[0].1[3], ArgValue::UInt8(8));
-        assert_eq!(init[0].1[4], ArgValue::UInt32(2_000_000));
-        assert_eq!(init[0].1[5], ArgValue::UInt8(8));
-        assert_eq!(init[0].1[7], ArgValue::UInt16(32760));
+        // The query carries an absolute clock, so it is sent from the post-init
+        // callback rather than baked into `init` (a waketime from before a
+        // firmware reset is off the new clock).
+        assert!(init.is_empty());
     }
 
-    #[tokio::test]
-    async fn test_an_old_firmware_gets_the_old_query() {
-        let (chip, pins) = chip();
-        configure(&pins, 8, 1);
-        let mcu = mcu(false);
-
-        let (_config, init) = build_lists(&chip, &mcu);
-
-        // No `bytes_per_report`, and the sample count is the average size.
-        assert_eq!(init[0].0, "query_analog_in");
-        assert_eq!(init[0].1.len(), 8);
-        assert_eq!(init[0].1[3], ArgValue::UInt8(8));
+    #[test]
+    fn test_the_batched_query_carries_the_sampling_parameters() {
+        let state = armed_state(false, 4);
+        let query = state.query_for(0, 123).unwrap();
+        let AdcQuery::New(query) = query else {
+            panic!("the batched form was declared");
+        };
+        let args = query.args();
+        assert_eq!(args[0], ArgValue::UInt8(0));
+        assert_eq!(args[1], ArgValue::UInt32(123));
+        assert_eq!(args[2], ArgValue::UInt32(200_000));
+        assert_eq!(args[3], ArgValue::UInt8(8));
+        assert_eq!(args[4], ArgValue::UInt32(2_000_000));
+        // `bytes_per_report` = batch_num * 2.
+        assert_eq!(args[5], ArgValue::UInt8(8));
+        assert_eq!(args[7], ArgValue::UInt16(32760));
     }
 
-    #[tokio::test]
-    async fn test_a_batch_of_one_on_new_firmware_still_uses_the_batched_query() {
-        let (chip, pins) = chip();
-        configure(&pins, 8, 1);
-        let mcu = mcu(true);
+    #[test]
+    fn test_an_old_firmware_gets_the_old_query() {
+        let state = armed_state(true, 1);
+        let query = state.query_for(0, 123).unwrap();
+        // The old form has no `bytes_per_report`.
+        assert!(matches!(query, AdcQuery::Old(_)));
+    }
 
-        let (_config, init) = build_lists(&chip, &mcu);
-
-        // The old form is not declared, so the batched one carries one sample
-        // per report (`bytes_per_report=2`).
-        assert_eq!(init[0].1.len(), 9);
-        assert_eq!(init[0].1[5], ArgValue::UInt8(2));
+    #[test]
+    fn test_a_batch_of_one_on_new_firmware_still_uses_the_batched_query() {
+        let state = armed_state(false, 1);
+        let query = state.query_for(0, 123).unwrap();
+        let AdcQuery::New(query) = query else {
+            panic!("the batched form was declared");
+        };
+        // One sample per report is still two bytes.
+        assert_eq!(query.args()[5], ArgValue::UInt8(2));
     }
 
     #[tokio::test]
@@ -550,20 +598,32 @@ mod tests {
 
     #[tokio::test]
     async fn test_the_query_slot_places_the_first_report_in_the_future() {
-        let (chip, pins) = chip();
-        configure(&pins, 8, 1);
+        let (_chip, _pins) = chip();
         let mcu = mcu(true);
         mcu.set_clock_base(1_000_000);
         let before = mcu.estimated_clock().unwrap();
-        let (_config, init) = build_lists(&chip, &mcu);
 
-        let clock = match init[0].1[1] {
-            ArgValue::UInt32(clock) => u64::from(clock),
-            ref other => panic!("unexpected clock {other:?}"),
-        };
+        let clock = query_slot(&mcu, 0).unwrap();
+
         let expected = before + 30_000_000; // 1.5 s at 20 MHz
-        assert!(clock >= expected, "{clock} < {expected}");
-        assert!(clock < expected + 2_000_000, "{clock} is too far out");
+        assert!(u64::from(clock) >= expected, "{clock} < {expected}");
+        assert!(
+            u64::from(clock) < expected + 2_000_000,
+            "{clock} is too far out"
+        );
+    }
+
+    /// A state with the sampling parameters `build` would have stored.
+    fn armed_state(old_format: bool, batch_num: u32) -> Arc<AdcState> {
+        let state = state(old_format, 1.0 / 32760.0, 2_000_000);
+        *state.lock(|s| &s.sample_ticks) = 200_000;
+        *state.lock(|s| &s.sample_count) = 8;
+        *state.lock(|s| &s.report_clock) = 2_000_000;
+        *state.lock(|s| &s.min_sample) = 0;
+        *state.lock(|s| &s.max_sample) = 32760;
+        *state.lock(|s| &s.range_check_count) = 4;
+        *state.lock(|s| &s.batch_num) = batch_num;
+        state
     }
 
     // -----------------------------------------------------------------------
@@ -579,6 +639,9 @@ mod tests {
             minval: Mutex::new(0.0),
             maxval: Mutex::new(1.0),
             range_check_count: Mutex::new(0),
+            sample_ticks: Mutex::new(0),
+            min_sample: Mutex::new(0),
+            max_sample: Mutex::new(0),
             oid: Mutex::new(Some(0)),
             inv_max_adc: Mutex::new(inv_max_adc),
             report_clock: Mutex::new(report_clock),

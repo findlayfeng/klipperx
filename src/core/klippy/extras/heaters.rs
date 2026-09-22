@@ -18,6 +18,8 @@ use serde_json::{json, Value};
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
 use crate::core::klippy::extras::adc_temperature;
 use crate::core::klippy::extras::ds18b20;
+use crate::core::klippy::extras::spi_temperature;
+use crate::core::klippy::extras::temperature_combined;
 use crate::core::klippy::extras::temperature_mcu;
 use crate::core::klippy::printer::{Printer, PrinterObject};
 
@@ -158,6 +160,8 @@ pub fn ensure(printer: &Arc<Printer>) -> Result<Arc<PrinterHeaters>, ConfigError
     ds18b20::ensure(&heaters)?;
     adc_temperature::ensure(&heaters)?;
     temperature_mcu::ensure(&heaters)?;
+    spi_temperature::ensure(&heaters)?;
+    temperature_combined::ensure(&heaters)?;
     Ok(heaters)
 }
 

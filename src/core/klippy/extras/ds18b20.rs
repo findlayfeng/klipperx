@@ -17,7 +17,7 @@ use crate::core::klippy::cmd::ds18b20::{ConfigDs18b20, Ds18b20Result, QueryDs18b
 use crate::core::klippy::cmd::McuResponse;
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
 use crate::core::klippy::extras::heaters::{PrinterHeaters, Sensor, SensorCallback};
-use crate::core::klippy::mcu::{ConfigBuilder, Mcu, McuError, McuObject};
+use crate::core::klippy::mcu::{query_slot, ConfigBuilder, Mcu, McuError, McuObject};
 use crate::core::klippy::msg::proto::ArgValue;
 use crate::core::klippy::printer::{Printer, PrinterObject};
 
@@ -119,6 +119,12 @@ impl Ds18b20 {
                 let Some(state) = bind_state.upgrade() else {
                     return;
                 };
+                // Arm the periodic query first, with a clock from this
+                // connection; then bind so the first report has a handler.
+                if let Err(err) = state.arm_query(mcu) {
+                    warn!("MCU '{}': could not arm DS18B20 query: {err}", mcu.name());
+                    return;
+                }
                 let registry = registry_for(mcu.name());
                 if let Err(err) = registry.bind(mcu, state.oid, Arc::downgrade(&state)) {
                     warn!(
@@ -172,9 +178,12 @@ impl std::fmt::Debug for Ds18b20 {
 }
 
 impl Ds18b20State {
-    /// The build-time half: add the configuration and arm the query.
+    /// The build-time half: add the configuration.
     ///
-    /// Upstream's `DS18B20._build_config`.
+    /// Upstream's `DS18B20._build_config`. The query is **not** added here: it
+    /// carries an absolute clock, and `built` is reused if the firmware is reset
+    /// mid-connect, so arming it is left to the post-init callback
+    /// ([`Ds18b20State::arm_query`]).
     fn build(&self, builder: &ConfigBuilder, mcu: &Mcu) -> Result<(), McuError> {
         builder.add_config_cmd(&ConfigDs18b20 {
             oid: self.oid,
@@ -182,14 +191,19 @@ impl Ds18b20State {
             max_error_count: MAX_CONSECUTIVE_ERRORS,
         })?;
 
-        let clock = builder.get_query_slot(mcu, self.oid)?;
         let rest_ticks = mcu.seconds_to_clock(self.report_time)? as u32;
         *self.report_clock.lock().unwrap_or_else(|p| p.into_inner()) = rest_ticks;
+        Ok(())
+    }
 
+    /// Send this sensor's `query_ds18b20`, with a clock read from `mcu` now.
+    fn arm_query(&self, mcu: &Mcu) -> Result<(), McuError> {
+        let clock = query_slot(mcu, self.oid)?;
+        let rest_ticks = *self.report_clock.lock().unwrap_or_else(|p| p.into_inner());
         // The range is in millidegrees on the wire.
         let min_value = (self.lock_min_temp() * 1000.0) as i32;
         let max_value = (self.lock_max_temp() * 1000.0) as i32;
-        builder.add_init_cmd(&QueryDs18b20 {
+        mcu.send_msg(&QueryDs18b20 {
             oid: self.oid,
             clock,
             rest_ticks,

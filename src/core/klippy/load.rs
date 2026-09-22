@@ -326,6 +326,8 @@ mod tests {
                 "stepper_x",
                 "stepper_y",
                 "stepper_z",
+                "adc_temperature",
+                "thermistor",
                 "board_pins",
                 "temperature_sensor",
                 "i2c_device",

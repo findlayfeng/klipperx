@@ -31,6 +31,11 @@ struct Reading {
 /// A `[temperature_sensor <name>]`.
 pub struct TemperatureSensor {
     reading: Arc<Mutex<Reading>>,
+    /// The sensor the readings come from. Held (not just a weak handle) so the
+    /// ADC/report callback that drives it keeps upgrading: upstream's
+    /// `PrinterSensorGeneric` stores `self.sensor` for the same reason.
+    #[allow(dead_code)]
+    sensor: Arc<dyn heaters::Sensor>,
 }
 
 impl TemperatureSensor {
@@ -96,7 +101,7 @@ pub fn load_config_prefix(
     }));
 
     heaters.register_sensor(config)?;
-    Ok(Arc::new(TemperatureSensor { reading }))
+    Ok(Arc::new(TemperatureSensor { reading, sensor }))
 }
 
 /// Upstream's `round(value, 2)`.

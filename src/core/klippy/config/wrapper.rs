@@ -20,6 +20,7 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 
 use crate::core::klippy::config::access::AccessTracking;
+use crate::core::klippy::config::object::PrinterConfig;
 use crate::core::klippy::config::section::{split_list, ConfigSection};
 use crate::core::klippy::error::ConfigError;
 
@@ -35,12 +36,34 @@ pub struct ConfigWrapper<'a> {
     section: &'a ConfigSection,
     /// Where reads are recorded (shared with the loader and `configfile`).
     access: Arc<AccessTracking>,
+    /// The `configfile` object, so [`ConfigWrapper::deprecate`] can record a
+    /// warning on it. Absent for a wrapper built outside the loader (tests, and
+    /// parts that read a stored section without recording warnings).
+    configfile: Option<Arc<PrinterConfig>>,
 }
 
 impl<'a> ConfigWrapper<'a> {
     /// Wrap `section`, recording every read in `access`.
     pub fn new(section: &'a ConfigSection, access: Arc<AccessTracking>) -> Self {
-        Self { section, access }
+        Self {
+            section,
+            access,
+            configfile: None,
+        }
+    }
+
+    /// Wrap `section` with the `configfile` object the loader registered, so a
+    /// module can call [`ConfigWrapper::deprecate`].
+    pub fn with_configfile(
+        section: &'a ConfigSection,
+        access: Arc<AccessTracking>,
+        configfile: Arc<PrinterConfig>,
+    ) -> Self {
+        Self {
+            section,
+            access,
+            configfile: Some(configfile),
+        }
     }
 
     /// Wrap `section` without recording anything.
@@ -65,6 +88,23 @@ impl<'a> ConfigWrapper<'a> {
     /// The shared access record, for a part that wants to keep reading later.
     pub fn access(&self) -> Arc<AccessTracking> {
         Arc::clone(&self.access)
+    }
+
+    /// Record a deprecation warning for `option`, if it was written.
+    ///
+    /// Upstream `ConfigWrapper.deprecate` (`klippy/configfile.py:130`): an
+    /// option that is absent is not deprecated, and the warning goes on the
+    /// `configfile` object (`warnings` in its status). `value` is the deprecated
+    /// value for a `deprecated_value` warning, or `None` for a whole option.
+    pub fn deprecate(&self, option: &str, value: Option<Value>) {
+        let Some(configfile) = &self.configfile else {
+            return;
+        };
+        let section = self.identifier();
+        if !configfile.has_option(&section, option) {
+            return;
+        }
+        configfile.deprecate(&section, option, value, None);
     }
 
     // -----------------------------------------------------------------------
@@ -580,5 +620,29 @@ mod tests {
         let wrapper = ConfigWrapper::new(section, AccessTracking::shared());
 
         assert_eq!(wrapper.get("pin", None).unwrap(), "PA1");
+    }
+
+    #[test]
+    fn deprecate_records_a_written_option_and_ignores_an_absent_one() {
+        use crate::core::klippy::printer::PrinterObject;
+
+        let (config, _) = Config::from_text("[output_pin fan]\npin: PA0\n").unwrap();
+        let section = config.get_section("output_pin fan").unwrap();
+        let configfile = Arc::new(PrinterConfig::new(
+            AccessTracking::shared(),
+            PrinterConfig::raw_config(&config),
+        ));
+        let wrapper = ConfigWrapper::with_configfile(
+            section,
+            AccessTracking::shared(),
+            Arc::clone(&configfile),
+        );
+
+        wrapper.deprecate("pin", None);
+        wrapper.deprecate("not_written", None);
+
+        let status = configfile.get_status(0.0);
+        assert_eq!(status["warnings"].as_array().unwrap().len(), 1);
+        assert_eq!(status["warnings"][0]["option"], json!("pin"));
     }
 }

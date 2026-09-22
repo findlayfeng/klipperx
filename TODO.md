@@ -655,10 +655,10 @@ ack」settle，并用 `Mcu::took_over_session()` 让 `rpi_usb` 判断“有没�
 
 按「闭包最小 → 杠杆最大」推进：
 
-- [~] **T1. `linuxtest.test`（最小闭环，先做）**：`[printer] kinematics: none` ✅
-      （`NoneKinematics` + toolhead 的无轴路径，补齐 `[stepper_*]` 不再必需）；仍待 `heaters` 的
-      传感器注册表（不做控制环）、`temperature_sensor`、`ds18b20`。用例 g-code 只有 `G4 P1000`，
-      不涉运动/回零/风扇。顺带解锁同样用 `none` 的 `led`/`manual_stepper`/`pwm` 的第一道坎。
+- [x] **T1. `linuxtest.test`（最小闭环）**：`[printer] kinematics: none` ✅（`NoneKinematics` +
+      toolhead 的无轴路径）、`heaters` 的传感器注册表 ✅、`temperature_sensor` ✅、`ds18b20` ✅。
+      用例已从 `IGNORED` 移除并端到端通过（首个转绿的上游用例）。顺带解锁同样用 `none` 的
+      `led`/`manual_stepper`/`pwm` 的第一道坎。
 - [ ] **T2. `[stepper_enable]`（`enable_pin`）**：14 个文件的**首个**失败原因（`bed_screws`、
       `commands`、`extruders`、`printers`、`temperature`…）。
 - [ ] **T3. `extruder` + `heater_bed` + `fan`**（复用 T1 的 `heaters`）：`commands` /

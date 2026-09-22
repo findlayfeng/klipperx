@@ -105,6 +105,7 @@ git config core.hooksPath .githooks
 | `gpio.rs` | `config_digital_out` / `update_digital_out` / `queue_digital_out` / `set_digital_out_pwm_cycle` 的 `args()` 与固件格式一致（编码后解码回到同一组值） |
 | `pwm.rs` | `config_pwm_out` / `queue_pwm_out` 的 `args()` 与固件格式一致 |
 | `adc.rs` | `config_analog_in` / `query_analog_in`（新旧两种）的 `args()` 与固件格式一致；`analog_in_state`（批量 `%*s`）解出 oid / next_clock / LE `u16` 样本；用旧格式问批量声明报 `Decode` |
+| `ds18b20.rs` | `config_ds18b20` / `query_ds18b20`（含 `%s` 序列号与 `%i` 毫度范围）的编解码往返与固件格式一致；`ds18b20_result` 解出 oid / next_clock / value / fault |
 | `allocate_oids.rs` | `allocate_oids` 的线上形状（id 2 的 VLQ + `%c` 计数）、`u8::MAX` 往返编码一致 |
 | `config.rs` | `get_config` / `finalize_config` 的编码形状；`config` 响应按名解码（已配置 / 未配置且已停机两态）、参数类型不符报 `Decode` |
 | `uptime.rs` | `get_uptime` 的编码形状；`uptime` 两段重组为 64 位时钟、跨 32 位回绕时排序正确、参数类型不符报 `Decode` |
@@ -205,6 +206,9 @@ git config core.hooksPath .githooks
 |------|------|
 | `output_pin.rs` | `value` / `shutdown_value` 落到 `setup_start_value`，且无条件 `setup_max_duration(0)`（所以 `value: 1` + 默认 `shutdown_value: 0` 合法）；`SET_PIN PIN=… VALUE=…` 驱动输出（`>=0.5` 为开）并更新 `get_status`；缺 `VALUE` 报错；两个 pin 各自独立；缺 `pin` / 非数字 `value` / 非布尔 `pwm` 各自报配置错误；`pwm: true` 走 `setup_pwm` 并把 `cycle_time` / `hardware_pwm` / `value` 落到资源，`SET_PIN` 调 `update_pwm`；`cycle_time <= 0` 报错 |
 | `board_pins.rs` | `aliases` 与 `aliases_*` 都注册；`mcu` 列表指定目标 chip；`<...>` 值走保留；未知 chip、缺元素、别名冲突各自报错（冲突带 section 前缀）；对象不可查询 |
+| `heaters.rs` | 传感器工厂表：未知 `sensor_type` 报上游文案 `Unknown temperature sensor 'x'`；`register_sensor` 把 section 名计入 `available_sensors`；`ensure` 幂等，并把 `DS18B20` 工厂带进来（对应上游 `temperature_sensors.cfg`）；`get_status` 的三个列表 |
+| `temperature_sensor.rs` | `min_temp`（默认 `KELVIN_TO_CELSIUS`）与 `max_temp`（必须高于 min）的校验、`sensor_type` 交给 `heaters`、`setup_minmax`/`setup_callback` 落到传感器；`get_status` 报 `temperature` / `measured_min_temp` / `measured_max_temp`（`round(…, 2)`，读数为 0 不计入 min/max） |
+| `ds18b20.rs` | `serial_no` → 小写 hex、`ds18_report_time`（≥ `DS18_MIN_REPORT_TIME`）、`sensor_mcu` 找 MCU 并领 oid；build 加 `config_ds18b20` 与 `query_ds18b20`（init）；post-init 按 oid 绑定 `ds18b20_result`（每 MCU 一个 registry），fault 丢弃，`next_clock - report_clock` 映射回 print time |
 
 ### `interface`
 
@@ -235,7 +239,7 @@ git config core.hooksPath .githooks
 阶段仍以 `#[ignore]` 保留（需要同一批缺失的节）。
 
 全语料 37 份文件共 **239 次运行**；默认构建下只有 2 条（引用 `pru`）因字典未构建跳过，其余 237 条
-全部可用，但都命中忽略列表，**实际执行 0 次**——所以 `upstream_test_cases_run` 现在恒通过。
+全部可用；其中 **`linuxtest.test` 已转绿**（T1），其余 236 条在忽略列表里。
 
 ```bash
 cargo test -p klipperx --lib upstream                 # 语料相关的全部用例

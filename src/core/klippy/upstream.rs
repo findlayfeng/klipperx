@@ -251,7 +251,6 @@ mod tests {
         "hybrid_corexy_dual_carriage.test",
         "input_shaper.test",
         "led.test",
-        "linuxtest.test",
         "load_cell.test",
         "macros.test",
         "manual_stepper.test",

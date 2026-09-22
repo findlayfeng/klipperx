@@ -16,7 +16,9 @@ use std::sync::{Arc, Mutex};
 use serde_json::{json, Value};
 
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
+use crate::core::klippy::extras::adc_temperature;
 use crate::core::klippy::extras::ds18b20;
+use crate::core::klippy::extras::temperature_mcu;
 use crate::core::klippy::printer::{Printer, PrinterObject};
 
 /// The name other modules look the registry up by.
@@ -154,6 +156,8 @@ pub fn ensure(printer: &Arc<Printer>) -> Result<Arc<PrinterHeaters>, ConfigError
         Arc::clone(&heaters) as Arc<dyn PrinterObject>,
     )?;
     ds18b20::ensure(&heaters)?;
+    adc_temperature::ensure(&heaters)?;
+    temperature_mcu::ensure(&heaters)?;
     Ok(heaters)
 }
 

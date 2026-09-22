@@ -320,7 +320,7 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 - [ ] **T6. TMC pin chip**（19 次失败）：`tmc2209_stepper_x`（6）、`tmc2130_stepper_x`（3）、
       `tmc2209 stepper_x`（12）、`tmc2208 stepper_x`（3）、`tmc5160 stepper_x`（2）、
       `tmc2660 stepper_x`（1）。依赖 H5（TMC）。
-- [ ] **T7. 温度传感器**（7 次失败）：`temperature_mcu`（5）、`TDK NTCG104LH104JT1`、
+- [x] **T7. 温度传感器**（7 次失败）：`temperature_mcu`（5）、`TDK NTCG104LH104JT1`、
       `my_custom_resistance_adc`。依赖 H1（温度传感器）。
 - [ ] **T8. `output_pin` 的 `value` 选项**（5 次失败）：`output_pin stepper_xy_current` 的
       `value` 超过最大值 1。依赖 H2（风扇与通用输出）。

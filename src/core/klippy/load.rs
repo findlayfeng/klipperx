@@ -421,8 +421,13 @@ mod tests {
 
         result.unwrap();
         // `configfile` is registered after `gcode`, `pins` after it (upstream
-        // loads `pins` and `mcu` up front), then the section's own object.
-        assert_eq!(printer.objects(), ["gcode", "configfile", "pins", "mcu"]);
+        // loads `pins` and `mcu` up front), then `error_mcu` — which the first
+        // `[mcu]` section brings with it (`klippy/mcu.py:1159`) — and the
+        // section's own object.
+        assert_eq!(
+            printer.objects(),
+            ["gcode", "configfile", "pins", "error_mcu", "mcu"]
+        );
     }
 
     #[test]
@@ -442,6 +447,7 @@ mod tests {
                 "gcode",
                 "configfile",
                 "pins",
+                "error_mcu",
                 "mcu",
                 "mcu zboard",
                 "board_pins"
@@ -456,12 +462,18 @@ mod tests {
         let printer = Arc::new(Printer::new(ManualReactor::shared()));
         let config = config("[mcu]\nserial: /dev/not-opened-yet\n");
         printer.load_config(&config).unwrap();
-        assert_eq!(printer.objects(), ["gcode", "configfile", "pins", "mcu"]);
+        assert_eq!(
+            printer.objects(),
+            ["gcode", "configfile", "pins", "error_mcu", "mcu"]
+        );
 
         printer.reset_for_restart("restart");
         printer.load_config(&config).unwrap();
 
-        assert_eq!(printer.objects(), ["gcode", "configfile", "pins", "mcu"]);
+        assert_eq!(
+            printer.objects(),
+            ["gcode", "configfile", "pins", "error_mcu", "mcu"]
+        );
     }
 
     #[test]
@@ -484,6 +496,7 @@ mod tests {
                 "gcode",
                 "configfile",
                 "pins",
+                "error_mcu",
                 "mcu",
                 "stepper_x",
                 "stepper_y",
@@ -570,6 +583,7 @@ mod tests {
                 "gcode",
                 "configfile",
                 "pins",
+                "error_mcu",
                 "mcu",
                 "mcu zboard",
                 "mcu toolhead"
@@ -633,7 +647,10 @@ mod tests {
         let (printer, result) = load("[mcu]\nserial: /dev/not-a-serial-port\n");
 
         result.unwrap();
-        assert_eq!(printer.objects(), ["gcode", "configfile", "pins", "mcu"]);
+        assert_eq!(
+            printer.objects(),
+            ["gcode", "configfile", "pins", "error_mcu", "mcu"]
+        );
     }
 
     #[test]
@@ -649,7 +666,14 @@ mod tests {
         // Main sections first, then the prefix section.
         assert_eq!(
             printer.objects(),
-            ["gcode", "configfile", "pins", "mcu", "output_pin fan"]
+            [
+                "gcode",
+                "configfile",
+                "pins",
+                "error_mcu",
+                "mcu",
+                "output_pin fan"
+            ]
         );
     }
 
@@ -670,6 +694,7 @@ mod tests {
                 "gcode",
                 "configfile",
                 "pins",
+                "error_mcu",
                 "mcu",
                 "board_pins",
                 "board_pins second"
@@ -690,7 +715,14 @@ mod tests {
         result.unwrap();
         assert_eq!(
             printer.objects(),
-            ["gcode", "configfile", "pins", "mcu", "i2c_device accel"]
+            [
+                "gcode",
+                "configfile",
+                "pins",
+                "error_mcu",
+                "mcu",
+                "i2c_device accel"
+            ]
         );
     }
 
@@ -707,7 +739,14 @@ mod tests {
         result.unwrap();
         assert_eq!(
             printer.objects(),
-            ["gcode", "configfile", "pins", "mcu", "spi_device flash"]
+            [
+                "gcode",
+                "configfile",
+                "pins",
+                "error_mcu",
+                "mcu",
+                "spi_device flash"
+            ]
         );
     }
 }

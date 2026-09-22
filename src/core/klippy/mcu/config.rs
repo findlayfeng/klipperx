@@ -77,6 +77,9 @@
 //!   (`Mcu::estimated_clock`), not on a print time — that arrives with the
 //!   motion layer (TODO C1).
 
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::{Mutex, MutexGuard};
 
 use crate::core::klippy::cmd::allocate_oids::AllocateOids;
@@ -146,6 +149,21 @@ pub type ConfigCallback = Box<dyn Fn(&ConfigBuilder, &Mcu) -> Result<(), McuErro
 /// connected MCU so it can start periodic queries or send startup commands.
 pub type PostInitCallback = Box<dyn Fn(&Mcu) + Send + Sync>;
 
+/// An **async** callback run after identify and before [`ConfigBuilder::build`].
+///
+/// This is the seam for work that needs the dictionary *and* a round-trip to the
+/// firmware before the configuration is frozen — most importantly the
+/// `debug_read` calibration reads upstream does in `_mcu_identify`
+/// (`klippy/extras/temperature_mcu.py:58-89`). Neither existing callback can do
+/// it: [`ConfigCallback`] is synchronous and runs inside `build`, and the
+/// `klippy:mcu_identify` printer event fires before any MCU has been identified.
+///
+/// It receives the connected `Mcu` by value (an `Arc`) so the returned future
+/// has no lifetime attached to the builder.
+pub type PreBuildCallback = Box<
+    dyn Fn(Arc<Mcu>) -> Pin<Box<dyn Future<Output = Result<(), McuError>> + Send>> + Send + Sync,
+>;
+
 struct State {
     /// The next id [`ConfigBuilder::create_oid`] will hand out; also the final
     /// object count.
@@ -154,6 +172,7 @@ struct State {
     restart: Vec<Command>,
     init: Vec<Command>,
     callbacks: Vec<ConfigCallback>,
+    pre_build: Vec<PreBuildCallback>,
     post_init: Vec<PostInitCallback>,
     /// Move-queue slots the motion layer wants reserved (`request_move_queue_slot`).
     reserved_move_slots: u16,
@@ -232,6 +251,31 @@ pub struct Configured {
     pub already_running: bool,
 }
 
+/// The clock a periodic query on `oid` should first fire at.
+///
+/// Upstream's `MCUConfigHelper.get_query_slot` (`klippy/mcu.py:1136`): the
+/// current time plus 1.5 s, then `oid * 0.01 s` so a bank of queries does not
+/// fire at once. The 1.5 s is what keeps the first report after the `init`
+/// commands that arm the query.
+///
+/// This is a free function because the value is only valid against the clock of
+/// the **current** connection: a caller that arms a query does so from a
+/// post-init callback with the live `Mcu`, so the clock is fresh even when the
+/// firmware was reset and re-identified mid-connect (a waketime carried across
+/// a reboot is tens of seconds off the new clock, which the firmware's signed
+/// timer comparison reads as "in the past" — `sched.c:94` "Timer too close").
+///
+/// # Errors
+/// [`McuError::Config`] when no clock estimate is available (a firmware without
+/// `get_uptime`).
+pub fn query_slot(mcu: &Mcu, oid: u8) -> Result<u32, McuError> {
+    let slot = mcu.seconds_to_clock(f64::from(oid) * 0.01)?;
+    let now = mcu
+        .estimated_clock()
+        .ok_or_else(|| McuError::Config("no clock estimate for the query slot".to_string()))?;
+    Ok((now + mcu.seconds_to_clock(1.5)? + slot) as u32)
+}
+
 impl ConfigBuilder {
     /// A builder with no commands, no ids, and no callbacks.
     pub fn new() -> Self {
@@ -242,6 +286,7 @@ impl ConfigBuilder {
                 restart: Vec::new(),
                 init: Vec::new(),
                 callbacks: Vec::new(),
+                pre_build: Vec::new(),
                 post_init: Vec::new(),
                 reserved_move_slots: 0,
                 finalized: false,
@@ -306,6 +351,36 @@ impl ConfigBuilder {
         Ok(())
     }
 
+    /// Register an async callback to run after identify and before
+    /// [`ConfigBuilder::build`].
+    ///
+    /// See [`PreBuildCallback`] for why this seam exists and why it is async.
+    ///
+    /// # Errors
+    /// Returns [`McuError::Config`] if the configuration is already built.
+    pub fn register_pre_build_callback(&self, callback: PreBuildCallback) -> Result<(), McuError> {
+        let mut state = self.lock();
+        self.verify_not_finalized(&state)?;
+        state.pre_build.push(callback);
+        Ok(())
+    }
+
+    /// Run the pre-build callbacks, in registration order.
+    ///
+    /// Called by the MCU's connect path once the dictionary is installed and
+    /// before [`ConfigBuilder::build`]; they may talk to the firmware (a
+    /// request/response round-trip) because the caller awaits here.
+    ///
+    /// # Errors
+    /// The first callback's error.
+    pub async fn run_pre_build(&self, mcu: &Arc<Mcu>) -> Result<(), McuError> {
+        let callbacks = std::mem::take(&mut self.lock().pre_build);
+        for callback in callbacks {
+            callback(Arc::clone(mcu)).await?;
+        }
+        Ok(())
+    }
+
     /// Register a callback to run once the firmware has accepted the
     /// configuration.
     ///
@@ -346,11 +421,7 @@ impl ConfigBuilder {
     /// Returns [`McuError::Config`] when no clock estimate is available (a
     /// firmware without `get_uptime`).
     pub fn get_query_slot(&self, mcu: &Mcu, oid: u8) -> Result<u32, McuError> {
-        let slot = mcu.seconds_to_clock(f64::from(oid) * 0.01)?;
-        let now = mcu
-            .estimated_clock()
-            .ok_or_else(|| McuError::Config("no clock estimate for the query slot".to_string()))?;
-        Ok((now + mcu.seconds_to_clock(1.5)? + slot) as u32)
+        query_slot(mcu, oid)
     }
 
     /// Whether [`ConfigBuilder::build`] has run.

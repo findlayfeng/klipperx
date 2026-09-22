@@ -28,7 +28,10 @@ mod resource;
 mod restart;
 mod restart_method;
 
-pub use config::{BuiltConfig, ConfigBuilder, ConfigCallback, Configured, PostInitCallback};
+pub use config::{
+    query_slot, BuiltConfig, ConfigBuilder, ConfigCallback, Configured, PostInitCallback,
+    PreBuildCallback,
+};
 pub use dictionary::{Dictionary, Enumeration, MessageDef, OutputDef};
 pub use error::{McuCallError, McuError};
 pub use object::{load_config, load_config_prefix, McuObject};

@@ -9,7 +9,7 @@
 use super::itersolve::{
     cartesian_active_flags, cartesian_position_fn, Axis, AxisFlags, PositionFn, StepKinematics,
 };
-use super::stepcompress::{StepCommand, StepCompressError, StepCompressor};
+use super::stepcompress::{HistoryStep, StepCommand, StepCompressError, StepCompressor};
 use super::trapq::Trapq;
 use crate::core::klippy::mathutil::Xyz;
 
@@ -88,6 +88,32 @@ impl Stepper {
     /// The stepper position the solver has reached.
     pub fn commanded_position(&self) -> f64 {
         self.kinematics.commanded_pos()
+    }
+
+    /// The firmware step counter the solver's position corresponds to
+    /// (`MCU_stepper.get_mcu_position`).
+    pub fn mcu_position(&self) -> i64 {
+        (self.kinematics.commanded_pos() / self.step_dist).round() as i64
+    }
+
+    /// The step position at a past print time
+    /// (`MCU_stepper.get_past_mcu_position`).
+    pub fn past_mcu_position(&self, print_time: f64) -> i64 {
+        self.compressor
+            .find_past_position(self.compressor.print_time_to_clock(print_time))
+    }
+
+    /// The recently sent runs, newest first, for a motion-report consumer.
+    pub fn history(&self, max: usize, start_clock: u64, end_clock: u64) -> Vec<HistoryStep> {
+        self.compressor.extract_old(max, start_clock, end_clock)
+    }
+
+    /// Reset the compressor's clock, as homing does (`stepcompress_reset`).
+    ///
+    /// # Errors
+    /// As [`StepCompressor::reset`].
+    pub fn reset_compressor(&mut self, last_step_clock: u64) -> Result<(), StepCompressError> {
+        self.compressor.reset(last_step_clock)
     }
 
     /// Set the stepper position from a toolhead position.
@@ -197,6 +223,36 @@ mod tests {
                 .any(|interval| (19_000..=21_000).contains(interval)),
             "{intervals:?}"
         );
+    }
+
+    #[test]
+    fn test_mcu_position_and_past_position() {
+        let mut trapq = Trapq::new();
+        // 10 mm along X at 100 mm/s.
+        trapq.append(
+            0.0,
+            0.0,
+            0.1,
+            0.0,
+            Xyz::default(),
+            Xyz::new(1.0, 0.0, 0.0),
+            100.0,
+            100.0,
+            0.0,
+        );
+        let mut stepper = Stepper::cartesian("stepper_x", 0, 1.0, Axis::X, 1_000_000.0);
+
+        stepper.generate(&trapq, 0.1).unwrap();
+
+        // The solver has commanded the whole 10 mm, so the firmware counter's
+        // equivalent is 10.
+        assert_eq!(stepper.mcu_position(), 10);
+        // Halfway into the move the history says roughly five steps.
+        let past = stepper.past_mcu_position(0.05);
+        assert!((4..=6).contains(&past), "{past}");
+        // The emitted history is available for a motion report.
+        assert!(!stepper.history(10, 0, u64::MAX).is_empty());
+        stepper.reset_compressor(0).unwrap();
     }
 
     #[test]

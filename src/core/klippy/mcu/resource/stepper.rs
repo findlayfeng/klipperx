@@ -9,7 +9,7 @@
 use std::sync::{Arc, Mutex};
 
 use super::pin::pin_number;
-use crate::core::klippy::cmd::stepper::{ConfigStepper, QueueStep, SetNextStepDir};
+use crate::core::klippy::cmd::stepper::{ConfigStepper, QueueStep, ResetStepClock, SetNextStepDir};
 use crate::core::klippy::cmd::McuCommand;
 use crate::core::klippy::mcu::{ConfigBuilder, Mcu, McuError};
 use crate::core::klippy::motion::stepcompress::StepCommand;
@@ -141,6 +141,21 @@ impl McuStepper {
         self.send(&SetNextStepDir {
             oid: self.oid()?,
             dir: u8::from(direction ^ self.invert_dir),
+        })
+    }
+
+    /// Reset the stepper's time base (`reset_step_clock`).
+    ///
+    /// The stepper must be idle. Upstream sends `clock=0` after homing
+    /// (`MCU_stepper.note_homing_end`), so the next move's schedule is relative
+    /// to a known point.
+    ///
+    /// # Errors
+    /// As [`McuStepper::send`].
+    pub fn reset_step_clock(&self, clock: u32) -> Result<(), McuError> {
+        self.send(&ResetStepClock {
+            oid: self.oid()?,
+            clock,
         })
     }
 

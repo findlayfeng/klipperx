@@ -160,7 +160,7 @@ ls ../../src/*.c
 | `endstop_phase.py` | 用步进相位提高 endstop 精度 | C1、F8 |
 | `force_move.py` | `FORCE_MOVE` 等诊断移动 | C1 |
 | `manual_stepper.py` | `[manual_stepper]` | C1 |
-| `stepper_enable.py` | enable 引脚管理、`M18/M84` | C1 |
+| `stepper_enable.py` | enable 引脚管理、`M18/M84` | ✅ 已实现（T2） |
 | `extruder_stepper.py` | 多 stepper 共用挤出机 | C1 |
 | `input_shaper.py` | 输入整形 | C1、H6 |
 | `motion_queuing.py` | 低级运动排队/刷新辅助 | C1 |

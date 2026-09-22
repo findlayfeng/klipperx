@@ -281,20 +281,53 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 
 框架已落地：`src/core/klippy/upstream.rs`（字典驱动应答机 + 按 `CONFIG` 拆分的运行）与
 `crates/test-support/build.rs`（按架构编字典）；T1（`linuxtest.test`）已完成并转绿。当前 239 次
-运行里，默认构建缺 2 条（引用 `pru`）、忽略列表 36 条、实际执行 1 条（通过）；忽略列表即本节的
+运行里，默认构建缺 2 条（引用 `pru`）、忽略列表 22 条、实际执行 1 条（通过）；忽略列表即本节的
 工单，每步做完就从 `IGNORED` 移除对应文件（手册见 `docs/klippy/developer-manual/regression-tests.md`）。
 
 按「闭包最小 → 杠杆最大」推进（T1 之后）：
 
-- [ ] **T2. `[stepper_enable]`（`enable_pin`）**：14 个文件的**首个**失败原因（`bed_screws`、
-      `commands`、`extruders`、`printers`、`temperature`…）。
-- [ ] **T3. `extruder` + `heater_bed` + `fan`**（复用 T1 的 `heaters`）：`commands` /
-      `out_of_bounds` / `printers` 族的下一道坎。
-- [ ] **T4. `probe` / `bltouch`**：6 个文件（`bed_mesh`、`bltouch`、`eddy`、`screws_tilt_adjust`、
-      `smart_effector`、`z_virtual_endstop`）。
-- [ ] **T5. 其余运动学**：`generic_cartesian`（4）、`delta`（2）、`hybrid_corexy`、`polar`、
-      `rotary_delta`（`none` 已在 T1）。
-- [ ] **T6. 其余首个失败**：`gcode_arcs`、`virtual_sdcard`（`sdcard_loop`）、TMC pin chip（`tmc`）。
+- [x] **T2. `[stepper_enable]`（`enable_pin`）**：✅ 已完成。实现了 `PrinterStepperEnable` 对象，
+      支持 `enable_pin` 选项，注册 M18/M84/SET_STEPPER_ENABLE 命令。14 个测试文件已从忽略列表移除。
+
+**当前失败原因统计**（`KLIPPERX_UPSTREAM_ALL=1` 运行结果，共 214 次失败）：
+
+| 首次失败原因 | 次数 | 对应 TODO |
+|---|---|---|
+| `Section 'extruder' is not a valid config section` | 99 | T3 (`extruder` + `heater_bed` + `fan`) |
+| `Unknown pin chip name 'probe'` | 36 | T4 (`probe` / `bltouch` / endstop chip) |
+| `Error loading kinematics 'delta'` | 12 | T5 (运动学) |
+| `Error loading kinematics 'corexy'` | 10 | T5 (运动学) |
+| `Section 'tmc2209 stepper_x' is not a valid config section` | 12 | T6 (TMC pin chip) |
+| `Error loading kinematics 'generic_cartesian'` | 4 | T5 (运动学) |
+| `Unknown pin chip name 'tmc2209_stepper_x'` | 6 | T6 (TMC pin chip) |
+| `Section 'stepper_z1' is not a valid config section` | 5 | T10 (多轴 stepper) |
+| `Option 'value' in section 'output_pin stepper_xy_current'` | 5 | H2 (`output_pin` 的 `value` 选项) |
+| `Error loading kinematics 'rotary_delta'` | 2 | T5 (运动学) |
+| `Error loading kinematics 'hybrid_corexy'` | 2 | T5 (运动学) |
+| `Unknown temperature sensor 'temperature_mcu'` | 5 | H1 (温度传感器) |
+| `Error loading kinematics 'corexz'` / `hybrid_corexz` / `polar` / `winch` / `deltesian` | 各 1 | T5 (运动学) |
+| 其余单实例失败 | 各 1 | 见下方 T6–T10 |
+
+**T3 之后按首次失败分组的工单**：
+
+- [ ] **T3. `extruder` + `heater_bed` + `fan`**（99 次失败）：`commands` /
+      `out_of_bounds` / `printers` 族的主要失败原因。依赖 H1（heaters）。
+- [ ] **T4. `probe` / `bltouch` / endstop pin chip**（36 次失败）：`bed_mesh`、`bltouch`、`eddy`、
+      `screws_tilt_adjust`、`smart_effector`、`z_virtual_endstop` 等。依赖 F8（endstop）。
+- [ ] **T5. 运动学**（31 次失败）：`generic_cartesian`（4）、`delta`（12）、`corexy`（10）、
+      `rotary_delta`（2）、`hybrid_corexy`（2）、`corexz`、`hybrid_corexz`、`polar`、
+      `winch`、`deltesian`（各 1）。`none` 已在 T1。
+- [ ] **T6. TMC pin chip**（19 次失败）：`tmc2209_stepper_x`（6）、`tmc2130_stepper_x`（3）、
+      `tmc2209 stepper_x`（12）、`tmc2208 stepper_x`（3）、`tmc5160 stepper_x`（2）、
+      `tmc2660 stepper_x`（1）。依赖 H5（TMC）。
+- [ ] **T7. 温度传感器**（7 次失败）：`temperature_mcu`（5）、`TDK NTCG104LH104JT1`、
+      `my_custom_resistance_adc`。依赖 H1（温度传感器）。
+- [ ] **T8. `output_pin` 的 `value` 选项**（5 次失败）：`output_pin stepper_xy_current` 的
+      `value` 超过最大值 1。依赖 H2（风扇与通用输出）。
+- [ ] **T9. 其余 extras 段**：`bed_screws`、`dual_carriage`、`safe_z_home`、`endstop_phase`、
+      `adc_scaled`、`static_digital_output`、`pwm_cycle_time`、`led`、`manual_stepper`、
+      `display`、`replicape`、`gcode_arcs`、`virtual_sdcard`、`stepper_z1`（多轴）。
+      按域归入 H1–H10。
 - 备注：`printers.test` 有 2 条运行声明 `DICTIONARY pru.dict host=linuxprocess.dict`，默认不构建
       `pru`；要跑需 `KLIPPERX_ARCHES=…,pru`（需 `pru-gcc`）。
 

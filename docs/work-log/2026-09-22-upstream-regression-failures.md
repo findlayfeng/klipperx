@@ -405,6 +405,47 @@ z_virtual_endstop.test (test/klippy/z_virtual_endstop.cfg): test/klippy/z_virtua
 
 ---
 
+## 复盘：计数口径与重排（后补）
+
+> 本节是对上面快照的**读法修正**，不改写原始统计——那些数字是按「首次失败原因」数出来的，
+> 保留原样以便对照。
+
+### 计数不是工作量：别按 102 / 36 / 37 排期
+
+上面的分组只统计**每条运行的第一个**错误，而 `load_config` 遇到第一个未知 section 就停。
+因此：
+
+- 修好一个缺口只会让该运行的首次失败点**后移**，总失败数可以纹丝不动。T7 就是例子：4 条
+  运行前进到 `[extruder]`，236 → 236。
+- 各组的收益**不可加**：T4（`probe` pin chip）的 36 条修完后多半前移到 `[extruder]`（T3）
+  或 `bed_mesh` / `z_tilt`（H9），T4 本身拿不到 36。
+
+### 该用的两个指标
+
+1. **运行 × 缺口矩阵**：对每条运行列出**全部**缺口（引用的 section / `kinematics:` / pin chip
+   与已实现集合的差集），而不只是第一个。据此才能看出「只差 1 个缺口」的用例与公共前缀。
+   落点：`src/core/klippy/upstream.rs` 的测试模块（非致命的静态扫描，不动生产加载器）。
+2. **转绿运行数 / `IGNORED` 条目数**：只降不升，每完成一个闭环必然变化。当前 1 / 36。
+
+### 重排后的顺序
+
+| 阶段 | 事项 | 说明 |
+|------|------|------|
+| 0 | 运行×缺口扫描；`IGNORED` 守卫测试；T8（`output_pin value`/`scale`）；T9 小段（`restart_method`、`static_digital_output`、`pwm_cycle_time`）；T2 收尾（自动装载 + M18/M84/SET_STEPPER_ENABLE） | 都不依赖 C1 |
+| 1 | T4 `probe` 虚拟 pin chip | F8 已 ✅，toolhead/homing 已在 |
+| 2 | C1 的**轴 / stepper 资源**重构（上游 `extras/stepper.py` 的 `PrinterStepper` + toolhead rails/axes） | T3/T5/T10/T6 的公共前置，避免同一处改四遍 |
+| 3 | T3（extruder/heater_bed/fan，先做 H1 加热控制环）；T5（corexy 族 → delta 族 → generic_cartesian → polar）；T10 | 主战场 |
+| 4 | T6（TMC，另需 F9 tmcuart）；T9 剩余 | 明确后置 |
+
+### 收尾纪律
+
+- **验收标准是「`.test` 从 `IGNORED` 移除后通过」**，不是「某个错误不再出现」。
+- 加 **`IGNORED` 守卫测试**：某条已能通过却仍在 `IGNORED` 里时测试失败，提示移除，防止条目漂移。
+- `out_of_bounds.test`（唯一 `SHOULD_FAIL`）必须在配置能装载后才能移出，否则越界检查会被配置
+  错误「喂饱」；建议在该条目旁固化这个条件。
+
+---
+
 ## 备注
 
 - 忽略列表（`upstream.rs` 的 `IGNORED`）当前按**文件**登记，共 36 条，即除 `linuxtest.test`

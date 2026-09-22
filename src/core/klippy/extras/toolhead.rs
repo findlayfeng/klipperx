@@ -963,7 +963,13 @@ async fn home_axis(
             }
         }
         if completion.reason().is_none() {
-            sleep(Duration::from_secs_f64(DRIP_LOOKAHEAD)).await;
+            // Wake on the trigger as well as on the drip interval: the
+            // completion can fire between the check above and here, in which
+            // case waiting out the whole `sleep` would stall the loop.
+            tokio::select! {
+                _ = sleep(Duration::from_secs_f64(DRIP_LOOKAHEAD)) => {}
+                _ = completion.wait() => {}
+            }
         }
     }
 

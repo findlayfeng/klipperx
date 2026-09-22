@@ -94,6 +94,85 @@ impl std::fmt::Debug for McuChip {
     }
 }
 
+/// The chip facts a trsync needs: how to reach the MCU and how to convert
+/// between print time and its clock.
+///
+/// Deliberately **not** a whole [`McuChip`]: the chip owns the
+/// [`TrsyncRegistry`] that owns the trsync, so storing a chip here would make
+/// `registry ↔ trsync` a strong cycle, and through the chip's `mcu` slot it
+/// would keep the connected `Mcu` alive after the machine's parts are dropped
+/// (its blocking device read would then park runtime shutdown — `TODO.md` F8b).
+#[derive(Clone)]
+pub struct TrsyncChip {
+    name: String,
+    mcu: Arc<Mutex<Option<Arc<Mcu>>>>,
+    clock: Arc<Mutex<Option<Arc<McuClock>>>>,
+    print_time_offset: Arc<Mutex<f64>>,
+    print_time_freq: Arc<Mutex<f64>>,
+}
+
+impl TrsyncChip {
+    /// The MCU's own name (`mcu`, or the sub of `[mcu <name>]`).
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The connected transport, once it is attached.
+    pub fn mcu(&self) -> Option<Arc<Mcu>> {
+        self.mcu
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
+    }
+
+    /// The clock estimate, once it is set.
+    pub fn clock(&self) -> Option<Arc<McuClock>> {
+        self.clock
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
+    }
+
+    /// The `(offset, freq)` the print-time mapping uses.
+    pub fn time_mapping(&self) -> (f64, f64) {
+        let freq = *self
+            .print_time_freq
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let freq = if freq > 0.0 {
+            freq
+        } else {
+            self.clock()
+                .map(|clock| clock.estimator().mcu_freq())
+                .unwrap_or(1.0)
+        };
+        let offset = *self
+            .print_time_offset
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        (offset, freq)
+    }
+
+    /// Convert an absolute print time to this MCU's clock, once connected.
+    pub fn print_time_to_clock(&self, print_time: f64) -> Option<u64> {
+        self.clock()?;
+        let (offset, freq) = self.time_mapping();
+        Some(((print_time - offset) * freq).max(0.0) as u64)
+    }
+
+    /// Extend a 32-bit clock reading into this MCU's 64-bit domain.
+    pub fn clock32_to_clock64(&self, clock32: u32) -> Option<i64> {
+        Some(self.clock()?.clock32_to_clock64(clock32))
+    }
+
+    /// Convert this MCU's clock back to an absolute print time.
+    pub fn clock_to_print_time(&self, clock: i64) -> Option<f64> {
+        self.clock()?;
+        let (offset, freq) = self.time_mapping();
+        Some(clock as f64 / freq + offset)
+    }
+}
+
 impl McuChip {
     /// A chip for `name`, not yet connected.
     pub fn new(name: String, config: Arc<ConfigBuilder>, pins: Arc<PrinterPins>) -> Self {
@@ -229,6 +308,18 @@ impl McuChip {
     /// The registry that routes this MCU's `trsync_state` reports.
     pub fn trsync_registry(&self) -> Arc<TrsyncRegistry> {
         Arc::clone(&self.trsync_registry)
+    }
+
+    /// The [`TrsyncChip`] view of this chip: the send/clock facts a trsync
+    /// needs, **without** the registry that owns the trsync.
+    pub fn trsync_chip(&self) -> TrsyncChip {
+        TrsyncChip {
+            name: self.name.clone(),
+            mcu: Arc::clone(&self.mcu),
+            clock: Arc::clone(&self.clock),
+            print_time_offset: Arc::clone(&self.print_time_offset),
+            print_time_freq: Arc::clone(&self.print_time_freq),
+        }
     }
 
     /// Resolve a pin alias or reservation on this chip.

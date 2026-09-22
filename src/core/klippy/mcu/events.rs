@@ -72,6 +72,20 @@ impl McuEvents {
             })
             .unwrap_or(false)
     }
+
+    /// Drop every callback.
+    ///
+    /// Called when the machine's parts are torn down. A callback can hold a
+    /// resource that itself holds the `Mcu` (for the transport), so leaving the
+    /// table populated makes `Mcu → events → resource → Mcu` a strong cycle:
+    /// `Mcu::Drop` never runs and its blocking device read parks forever,
+    /// hanging runtime shutdown. Clearing here breaks that cycle.
+    pub(crate) fn clear(&self) {
+        self.callbacks
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clear();
+    }
 }
 
 // ===========================================================================

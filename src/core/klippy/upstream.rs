@@ -719,6 +719,29 @@ mod tests {
         .expect("the extruder move runs against the fake firmware");
     }
 
+    /// A homing move runs end to end and the process exits cleanly.
+    ///
+    /// Regression for the `Mcu → events → resource → Mcu` strong cycle: before
+    /// `McuObject` cleared its callbacks on drop, `Mcu::Drop` never ran, its
+    /// blocking device read parked, and the test runtime hung at shutdown.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_homing_move_runs_against_the_fake_firmware() {
+        let dictionary = dict_dir().join("atmega2560.dict");
+        let text = format!(
+            "[mcu]\ntest: dict={}\n\
+             [stepper_x]\nstep_pin: PA0\ndir_pin: PA1\nrotation_distance: 40\nmicrosteps: 16\nposition_max: 200\nendstop_pin: ^PA2\n\
+             [stepper_y]\nstep_pin: PA3\ndir_pin: PA4\nrotation_distance: 40\nmicrosteps: 16\nposition_max: 200\nendstop_pin: ^PA5\n\
+             [stepper_z]\nstep_pin: PA6\ndir_pin: PA7\nrotation_distance: 8\nmicrosteps: 16\nposition_max: 200\nendstop_pin: ^PB0\n\
+             [printer]\nkinematics: cartesian\nmax_velocity: 300\nmax_accel: 3000\n",
+            dictionary.display()
+        );
+        let (config, _) = Config::from_text(&text).expect("the homing config parses");
+
+        run_script_on(&config, "G28")
+            .await
+            .expect("G28 runs against the fake firmware");
+    }
+
     /// Run the upstream runs that can be run: those whose dictionaries were all
     /// built and that are not on the ignore list.
     ///

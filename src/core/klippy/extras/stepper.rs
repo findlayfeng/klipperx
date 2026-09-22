@@ -42,6 +42,7 @@ use serde_json::{json, Value};
 
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
 use crate::core::klippy::error::KlippyError;
+use crate::core::klippy::extras::stepper_enable::PrinterStepperEnable;
 use crate::core::klippy::load::section;
 use crate::core::klippy::mathutil::{X_AXIS, Y_AXIS, Z_AXIS};
 use crate::core::klippy::mcu::{McuEndstop, McuStepper};
@@ -217,6 +218,17 @@ impl PrinterStepper {
                     &name,
                 )
                 .map_err(|err| ConfigError::new(format!("{identifier}: {err}")))?;
+        }
+
+        // Register with stepper_enable if enable_pin is specified and the
+        // stepper_enable object exists (it may not be present if the config
+        // doesn't include [stepper_enable]).
+        if config.get_str("enable_pin").is_some() {
+            if let Some(stepper_enable) =
+                printer.lookup_object_as::<PrinterStepperEnable>("stepper_enable")
+            {
+                stepper_enable.register_stepper(config, &name)?;
+            }
         }
 
         Ok(Self {

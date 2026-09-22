@@ -39,7 +39,7 @@ pub struct McuConfig {
 /// path, and the device must not be open — between parsing the section and
 /// opening the device (see [`McuConfig::open`]).
 ///
-/// `TestDevice` is **not** constructed from config — tests build it directly in
+/// `FrameMock` is **not** constructed from config — tests build it directly in
 /// code and pass it through `Interface::new()`.  `SimulatorDevice` is
 /// constructed from `test: dict=<path>` in the `upstream` harness.
 #[derive(Debug, Clone, PartialEq)]

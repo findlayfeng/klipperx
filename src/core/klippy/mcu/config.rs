@@ -777,7 +777,7 @@ fn crc32(bytes: &[u8]) -> u32 {
 mod tests {
     use super::*;
     use crate::core::klippy::frame::Frame;
-    use crate::core::klippy::interface::devices::test::{MappingEntry, TestDevice};
+    use crate::core::klippy::interface::devices::frame_mock::{FrameMock, MappingEntry};
     use crate::core::klippy::interface::Interface;
     use crate::core::klippy::mcu::Dictionary;
     use serde_json::json;
@@ -816,7 +816,7 @@ mod tests {
     /// `build` only encodes, so it needs the dictionary and nothing else; the
     /// empty device is never sent to.
     fn identified_mcu() -> Mcu {
-        let mcu = Mcu::for_test("test_mcu", Interface::new(TestDevice::new(Vec::new())));
+        let mcu = Mcu::for_test("test_mcu", Interface::new(FrameMock::new(Vec::new())));
         mcu.install_dictionary(dictionary()).unwrap();
         mcu
     }
@@ -1096,7 +1096,7 @@ mod tests {
         // A fresh transport with no dictionary: encoding cannot work, and the
         // error says so.
         let builder = ConfigBuilder::new();
-        let mcu = Mcu::for_test("test_mcu", Interface::new(TestDevice::new(Vec::new())));
+        let mcu = Mcu::for_test("test_mcu", Interface::new(FrameMock::new(Vec::new())));
 
         let err = builder.build(&mcu).unwrap_err();
 
@@ -1128,7 +1128,7 @@ mod tests {
 
     /// An identified MCU over a device scripted with `mappings`.
     fn scripted_mcu(mappings: Vec<MappingEntry>) -> Mcu {
-        let mcu = Mcu::for_test("test_mcu", Interface::new(TestDevice::new(mappings)));
+        let mcu = Mcu::for_test("test_mcu", Interface::new(FrameMock::new(mappings)));
         mcu.install_dictionary(dictionary()).unwrap();
         mcu
     }
@@ -1236,7 +1236,7 @@ mod tests {
     }
 
     fn scripted_mcu_without_reset(mappings: Vec<MappingEntry>) -> Mcu {
-        let mcu = Mcu::for_test("test_mcu", Interface::new(TestDevice::new(mappings)));
+        let mcu = Mcu::for_test("test_mcu", Interface::new(FrameMock::new(mappings)));
         mcu.install_dictionary(dictionary_without_reset()).unwrap();
         mcu
     }
@@ -1260,7 +1260,7 @@ mod tests {
     }
 
     fn scripted_mcu_with_reset_only(mappings: Vec<MappingEntry>) -> Mcu {
-        let mcu = Mcu::for_test("test_mcu", Interface::new(TestDevice::new(mappings)));
+        let mcu = Mcu::for_test("test_mcu", Interface::new(FrameMock::new(mappings)));
         mcu.install_dictionary(dictionary_with_reset_only())
             .unwrap();
         mcu
@@ -1286,7 +1286,7 @@ mod tests {
     }
 
     fn scripted_mcu_without_shutdown(mappings: Vec<MappingEntry>) -> Mcu {
-        let mcu = Mcu::for_test("test_mcu", Interface::new(TestDevice::new(mappings)));
+        let mcu = Mcu::for_test("test_mcu", Interface::new(FrameMock::new(mappings)));
         mcu.install_dictionary(dictionary_without_shutdown())
             .unwrap();
         mcu
@@ -1352,7 +1352,7 @@ mod tests {
     }
 
     fn scripted_mcu_with_both_resets(mappings: Vec<MappingEntry>) -> Mcu {
-        let mcu = Mcu::for_test("test_mcu", Interface::new(TestDevice::new(mappings)));
+        let mcu = Mcu::for_test("test_mcu", Interface::new(FrameMock::new(mappings)));
         mcu.install_dictionary(dictionary_with_both_resets())
             .unwrap();
         mcu

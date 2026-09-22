@@ -179,7 +179,7 @@ mod tests {
     use crate::core::klippy::cmd::clock::McuClock;
     use crate::core::klippy::event::KlippyEvent;
     use crate::core::klippy::frame::Frame;
-    use crate::core::klippy::interface::devices::test::{MappingEntry, TestDevice};
+    use crate::core::klippy::interface::devices::frame_mock::{FrameMock, MappingEntry};
     use crate::core::klippy::interface::Interface;
     use crate::core::klippy::mcu::{ConfigBuilder, Dictionary, Mcu, McuChip};
     use crate::core::klippy::msg::proto::{ArgValue, Payload};
@@ -218,7 +218,7 @@ mod tests {
     /// A chip over a test MCU, with the endstop query scripted to answer
     /// `pin_value`.
     fn endstop(pin_value: u8) -> Arc<McuEndstop> {
-        let device = TestDevice::new(vec![MappingEntry {
+        let device = FrameMock::new(vec![MappingEntry {
             input: frame(&[ArgValue::UInt8(42), ArgValue::UInt8(0)]),
             outputs: vec![frame(&[
                 ArgValue::UInt8(43),
@@ -285,7 +285,7 @@ mod tests {
             share_type: None,
         };
         // Rebuild the endstop with `!` on the pin; the fake still reports 1.
-        let device = TestDevice::new(vec![MappingEntry {
+        let device = FrameMock::new(vec![MappingEntry {
             input: frame(&[ArgValue::UInt8(42), ArgValue::UInt8(0)]),
             outputs: vec![frame(&[
                 ArgValue::UInt8(43),

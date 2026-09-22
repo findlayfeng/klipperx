@@ -466,7 +466,7 @@ fn decode_mismatch(parameter: &str, actual: &str, expected: &str) -> McuError {
 mod tests {
     use super::*;
     use crate::core::klippy::frame::Frame;
-    use crate::core::klippy::interface::devices::test::{MappingEntry, TestDevice};
+    use crate::core::klippy::interface::devices::frame_mock::{FrameMock, MappingEntry};
     use crate::core::klippy::interface::Interface;
     use crate::core::klippy::mcu::McuCallError;
     use crate::core::klippy::msg::parser::Parser;
@@ -554,7 +554,7 @@ mod tests {
     }
 
     fn mcu_with(dictionary: Dictionary, mappings: Vec<MappingEntry>) -> Mcu {
-        let mcu = Mcu::for_test("test_mcu", Interface::new(TestDevice::new(mappings)));
+        let mcu = Mcu::for_test("test_mcu", Interface::new(FrameMock::new(mappings)));
         // A fresh `Mcu` registers the identify pair, so the dictionary entries
         // install cleanly on top.
         mcu.install_dictionary(dictionary).unwrap();
@@ -745,7 +745,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_msg_before_identify_fails() {
-        let mcu = Mcu::for_test("test_mcu", Interface::new(TestDevice::new(Vec::new())));
+        let mcu = Mcu::for_test("test_mcu", Interface::new(FrameMock::new(Vec::new())));
 
         assert!(!mcu.is_identified());
         let err = mcu.send_msg(&GetClock).unwrap_err();

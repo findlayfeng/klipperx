@@ -74,7 +74,7 @@ use crate::core::klippy::motion::plan::MoveLimits;
 use crate::core::klippy::motion::stepcompress::{StepCommand, StepCompressError};
 use crate::core::klippy::motion::toolhead::ToolHead;
 use crate::core::klippy::motion::{HomeCoord, HomingInfo};
-use crate::core::klippy::printer::{ConnectFuture, Printer, PrinterObject};
+use crate::core::klippy::printer::{ConnectFuture, Printer, PrinterObject, RestartHooks};
 use crate::core::klippy::reactor::Reactor;
 
 // Loaded after the generic walk (upstream loads `toolhead` last), registered as
@@ -141,37 +141,43 @@ impl ToolHeadObject {
             )));
         }
 
-        let max_velocity = config.get_float("max_velocity", None)?;
-        if max_velocity <= 0.0 {
-            return Err(ConfigError::new(format!(
-                "Option 'max_velocity' in section '{identifier}' must be above 0"
-            )));
-        }
-        let max_accel = config.get_float("max_accel", None)?;
-        if max_accel <= 0.0 {
-            return Err(ConfigError::new(format!(
-                "Option 'max_accel' in section '{identifier}' must be above 0"
-            )));
-        }
-        let min_cruise_ratio = config.get_float("minimum_cruise_ratio", Some(0.5))?;
-        if !(0.0..1.0).contains(&min_cruise_ratio) {
-            return Err(ConfigError::new(format!(
-                "Option 'minimum_cruise_ratio' in section '{identifier}' must be between 0 and 1"
-            )));
-        }
-        let square_corner_velocity = config.get_float("square_corner_velocity", Some(5.0))?;
-        if square_corner_velocity < 0.0 {
-            return Err(ConfigError::new(format!(
-                "Option 'square_corner_velocity' in section '{identifier}' must not be negative"
-            )));
-        }
-        let max_z_velocity = config.get_float("max_z_velocity", Some(15.0))?;
-        let max_z_accel = config.get_float("max_z_accel", Some(100.0))?;
-        if max_z_velocity <= 0.0 || max_z_accel <= 0.0 {
-            return Err(ConfigError::new(format!(
-                "Option 'max_z_velocity' / 'max_z_accel' in section '{identifier}' must be above 0"
-            )));
-        }
+        let max_velocity =
+            config.get_float_bounded("max_velocity", None, None, None, Some(0.0), None)?;
+        let max_accel = config.get_float_bounded("max_accel", None, None, None, Some(0.0), None)?;
+        let min_cruise_ratio = config.get_float_bounded(
+            "minimum_cruise_ratio",
+            Some(0.5),
+            Some(0.0),
+            None,
+            None,
+            Some(1.0),
+        )?;
+        let square_corner_velocity = config.get_float_bounded(
+            "square_corner_velocity",
+            Some(5.0),
+            Some(0.0),
+            None,
+            None,
+            None,
+        )?;
+        // `CartKinematics` defaults Z to the full limits and caps it there
+        // (`klippy/kinematics/cartesian.py:53-56`).
+        let max_z_velocity = config.get_float_bounded(
+            "max_z_velocity",
+            Some(max_velocity),
+            None,
+            Some(max_velocity),
+            Some(0.0),
+            None,
+        )?;
+        let max_z_accel = config.get_float_bounded(
+            "max_z_accel",
+            Some(max_accel),
+            None,
+            Some(max_accel),
+            Some(0.0),
+            None,
+        )?;
 
         // The junction geometry (`ToolHead._calc_junction_deviation`).
         let junction_deviation =
@@ -370,6 +376,15 @@ impl PrinterObject for ToolHeadObject {
                 last_step_gen_time: 0.0,
             });
 
+            // Let the G-code dispatcher reach the planner before a restart
+            // (`GCodeDispatch.request_restart` needs the last print time, a
+            // dwell and a wait).
+            if let Some(printer) = self.printer.upgrade() {
+                printer.register_restart_hooks(Arc::new(ToolHeadRestartHooks(Arc::clone(
+                    &self.state,
+                ))));
+            }
+
             // The flush task owns nothing the object does not share; it stops
             // when the object is dropped, by reading `shutdown`.
             tokio::spawn(run_flush_loop(
@@ -484,6 +499,43 @@ impl Connected {
                     .map(|stepper| (Arc::clone(stepper), commands))
             })
             .collect())
+    }
+}
+
+/// The toolhead's restart handle (`RestartHooks`): the planner operations the
+/// G-code dispatcher needs before a restart.
+struct ToolHeadRestartHooks(Arc<Mutex<Option<Connected>>>);
+
+impl RestartHooks for ToolHeadRestartHooks {
+    fn get_last_move_time(&self) -> f64 {
+        self.0
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .as_mut()
+            .map(|connected| connected.toolhead.get_last_move_time())
+            .unwrap_or(0.0)
+    }
+
+    fn dwell(&self, delay: f64) {
+        if let Some(connected) = self
+            .0
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .as_mut()
+        {
+            connected.toolhead.dwell(delay);
+        }
+    }
+
+    fn wait_moves(&self) {
+        if let Some(connected) = self
+            .0
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .as_mut()
+        {
+            connected.toolhead.wait_moves();
+        }
     }
 }
 

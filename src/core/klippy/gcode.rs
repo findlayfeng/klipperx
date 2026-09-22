@@ -734,7 +734,7 @@ impl GCodeDispatch {
             self.register_command(
                 name,
                 Arc::new(move |_| {
-                    upgrade(&inner).printer.request_exit(result);
+                    upgrade(&inner).request_restart(result);
                     Ok(())
                 }),
                 Some(desc),
@@ -1096,6 +1096,25 @@ fn dispatch_mux(inner: &Arc<Inner>, cmd: &str, gcmd: &GcodeCommand) -> Result<()
 impl Inner {
     fn set_ready(&self, ready: bool) {
         self.ready.store(ready, Ordering::SeqCst);
+    }
+
+    /// `GCodeDispatch.request_restart` (`klippy/gcode.py:352-362`): with the
+    /// printer ready, note the last print time, fire `gcode:request_restart`,
+    /// dwell, and wait for the queued moves; then ask the printer to exit.
+    fn request_restart(&self, result: &str) {
+        if self.ready.load(Ordering::SeqCst) {
+            if let Some(hooks) = self.printer.restart_hooks() {
+                let print_time = hooks.get_last_move_time();
+                if result == "exit" {
+                    info!("Exiting (print time {print_time:.3}s)");
+                }
+                self.printer
+                    .send_event(&KlippyEvent::GcodeRequestRestart { print_time });
+                hooks.dwell(0.500);
+                hooks.wait_moves();
+            }
+        }
+        self.printer.request_exit(result);
     }
 
     fn respond_raw(&self, msg: &str) {
@@ -1828,6 +1847,68 @@ mod tests {
         assert!(!text.contains("SET_PIN"), "{text}");
         // `RESTART` is a base command and carries help text.
         assert!(text.contains("RESTART"), "{text}");
+    }
+
+    #[test]
+    fn test_restart_prepares_the_toolhead_and_fires_the_event() {
+        struct TestHooks {
+            log: Arc<Mutex<Vec<String>>>,
+            print_time: f64,
+        }
+        impl crate::core::klippy::printer::RestartHooks for TestHooks {
+            fn get_last_move_time(&self) -> f64 {
+                self.log
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push("get_last_move_time".to_string());
+                self.print_time
+            }
+            fn dwell(&self, _delay: f64) {
+                self.log
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push("dwell".to_string());
+            }
+            fn wait_moves(&self) {
+                self.log
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push("wait_moves".to_string());
+            }
+        }
+
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        let dispatch = GCodeDispatch::new(Arc::clone(&printer));
+        let log = Arc::new(Mutex::new(Vec::new()));
+        printer.register_restart_hooks(Arc::new(TestHooks {
+            log: Arc::clone(&log),
+            print_time: 1.5,
+        }));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        {
+            let seen = Arc::clone(&seen);
+            printer.register_event_handler(
+                KlippyEvent::GcodeRequestRestart { print_time: 0.0 },
+                Box::new(move |event| {
+                    if let KlippyEvent::GcodeRequestRestart { print_time } = event {
+                        seen.lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .push(*print_time);
+                    }
+                }),
+            );
+        }
+        // Only a ready printer reaches the toolhead.
+        printer.send_event(&KlippyEvent::KlippyReady);
+
+        dispatch.run_script("RESTART").unwrap();
+
+        assert_eq!(printer.run(), "restart");
+        assert_eq!(
+            *log.lock().unwrap_or_else(|p| p.into_inner()),
+            ["get_last_move_time", "dwell", "wait_moves"]
+        );
+        assert_eq!(*seen.lock().unwrap_or_else(|p| p.into_inner()), [1.5]);
     }
 
     #[test]

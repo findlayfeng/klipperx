@@ -640,7 +640,7 @@ impl PrinterObject for McuObject {
                     }
                 }
             } else {
-                let interface = config.open().map_err(KlippyError::Internal)?;
+                let interface = config.open().map_err(KlippyError::Connection)?;
                 match Mcu::connect(&config.name, interface).await {
                     Ok(mcu) => mcu,
                     Err(err) => {
@@ -737,11 +737,12 @@ impl PrinterObject for McuObject {
             // The accumulated configuration is encoded once, and the handshake
             // can then be retried on a fresh connection if the firmware has to
             // reboot to accept it (`mcu/config.rs`).
-            let mut built = self
-                .chip
-                .config()
-                .build(&mcu)
-                .map_err(|err| KlippyError::Internal(err.to_string()))?;
+            let mut built = self.chip.config().build(&mcu).map_err(|err| match err {
+                // A config callback resolves pins/buses against the
+                // dictionary; a bad pin is a config problem, not klippy's.
+                McuError::Config(message) => KlippyError::Config(ConfigError::new(message)),
+                other => KlippyError::Internal(other.to_string()),
+            })?;
             let configured = loop {
                 match self
                     .chip

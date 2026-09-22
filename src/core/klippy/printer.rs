@@ -117,6 +117,25 @@ pub type ConnectFuture<'a> = Pin<Box<dyn Future<Output = Result<(), KlippyError>
 /// are about to be dropped anyway.
 pub type RestartFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 
+/// The toolhead's part in a restart.
+///
+/// `GCodeDispatch.request_restart` (`klippy/gcode.py:352-362`) reaches the
+/// toolhead by name to read the last print time, dwell, and wait for the queued
+/// moves before the host exits. The dispatcher is core and the toolhead is an
+/// extra, so the machine holds this small handle instead: the toolhead registers
+/// it at connect and the dispatcher uses it if it is there.
+pub trait RestartHooks: Send + Sync {
+    /// The print time the planner has reached (`toolhead.get_last_move_time`).
+    fn get_last_move_time(&self) -> f64;
+
+    /// Advance the planner by `delay` seconds without moving
+    /// (`toolhead.dwell`).
+    fn dwell(&self, delay: f64);
+
+    /// Wait for the queued moves to be planned (`toolhead.wait_moves`).
+    fn wait_moves(&self);
+}
+
 /// A part of the machine.
 ///
 /// One registered object is one printer object as far as `objects/list`,
@@ -250,6 +269,8 @@ struct Inner {
     /// the printer's start args (`klippy/klippy.py:283`), and the MCU restart
     /// reads it to decide whether to reset the firmware (`mcu/restart.rs`).
     start_reason: Option<String>,
+    /// The toolhead's restart handle, registered by it at connect.
+    restart_hooks: Option<Arc<dyn RestartHooks>>,
 }
 
 impl Printer {
@@ -276,6 +297,7 @@ impl Printer {
                 handlers: HashMap::new(),
                 host_objects: None,
                 start_reason: None,
+                restart_hooks: None,
             }),
             exit_requested: Condvar::new(),
             reactor,
@@ -331,6 +353,20 @@ impl Printer {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Register the toolhead's restart handle (`RestartHooks`).
+    ///
+    /// Called by the toolhead at connect; replaced by the next bring-up's
+    /// toolhead. Kept out of [`PrinterObject`] because it is not a client-facing
+    /// status.
+    pub fn register_restart_hooks(&self, hooks: Arc<dyn RestartHooks>) {
+        self.lock().restart_hooks = Some(hooks);
+    }
+
+    /// The toolhead's restart handle, if one registered itself.
+    pub fn restart_hooks(&self) -> Option<Arc<dyn RestartHooks>> {
+        self.lock().restart_hooks.clone()
     }
 
     /// The reactor this printer was built with.
@@ -461,6 +497,26 @@ impl Printer {
             .iter()
             .find(|(taken, _)| taken == name)
             .map(|(_, object)| Arc::clone(object))
+    }
+
+    /// Look up one registered object, reporting a config error when absent
+    /// (upstream's `lookup_object` with no default: `Unknown config object
+    /// 'x'`, `klippy/klippy.py:79-82`).
+    ///
+    /// # Errors
+    /// Returns [`ConfigError`] naming the object when nothing registered it.
+    pub fn require_object(&self, name: &str) -> Result<Arc<dyn PrinterObject>, ConfigError> {
+        self.lookup_object(name)
+            .ok_or_else(|| ConfigError::new(format!("Unknown config object '{name}'")))
+    }
+
+    /// [`Printer::require_object`] with the concrete type.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError`] when the name is absent or is a different type.
+    pub fn require_object_as<T: PrinterObject>(&self, name: &str) -> Result<Arc<T>, ConfigError> {
+        self.lookup_object_as::<T>(name)
+            .ok_or_else(|| ConfigError::new(format!("Unknown config object '{name}'")))
     }
 
     /// Every registered object a module name selects, in registration order.
@@ -793,6 +849,9 @@ impl Printer {
         inner.shutdown = false;
         inner.run_result = None;
         inner.start_reason = Some(reason.to_string());
+        // The handle points at the toolhead being dropped; the next toolhead
+        // registers its own at connect.
+        inner.restart_hooks = None;
     }
 
     /// Lock the state.
@@ -831,22 +890,15 @@ impl Printer {
 
         for (name, object) in self.registry() {
             if let Err(err) = object.connect().await {
-                // A config problem found while connecting is not a reason to
-                // shut the machine down: upstream sets the error state and lets
-                // a `RESTART` fix it (`klippy/klippy.py:136-139`). Everything
-                // else halts (an MCU failure is analysed first).
-                if matches!(&err, KlippyError::Config(_)) {
-                    self.set_error_state(&format!("{name}: {err}"));
-                    return;
-                }
-                // Notify about MCU errors before shutting down, matching
-                // upstream's `klippy:klippy.py:_connect` which sends
-                // `klippy:notify_mcu_error` for protocol or connection
-                // failures before entering shutdown.
+                // Every connect failure puts the printer in the `error` state,
+                // which a `RESTART` can fix; none of them halts the host. Upstream
+                // classifies them in `_connect`'s except clauses
+                // (`klippy/klippy.py:136-158`): a config error, a protocol error, an
+                // MCU connect error, or an internal error — all `_set_state`.
                 if name == "mcu" || name.starts_with("mcu ") {
                     self.notify_mcu_error(&err);
                 }
-                self.invoke_shutdown(&format!("{name}: {err}"));
+                self.set_error_state(&format!("{name}: {err}"));
                 return;
             }
             if self.category() != PrinterState::Startup {
@@ -1455,8 +1507,21 @@ mod tests {
         assert_eq!(printer.get_state_message().category, PrinterState::Ready);
     }
 
+    #[test]
+    fn test_require_object_reports_upstream_wording() {
+        let printer = new_printer();
+
+        let err = printer
+            .require_object("nope")
+            .map(|_| ())
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(err, "Unknown config object 'nope'");
+    }
+
     #[tokio::test]
-    async fn test_an_object_that_fails_to_connect_halts_the_printer() {
+    async fn test_an_object_that_fails_to_connect_puts_the_printer_in_error() {
         let printer = new_printer();
         printer
             .add_object(
@@ -1471,8 +1536,10 @@ mod tests {
 
         printer.bring_up().await;
 
+        // A connect failure is the `error` state, which `RESTART` can fix; it
+        // does not halt the host (upstream `_connect` -> `_set_state`).
         let state = printer.get_state_message();
-        assert_eq!(state.category, PrinterState::Shutdown);
+        assert_eq!(state.category, PrinterState::Error);
         assert!(state.message.contains("broken"), "{}", state.message);
     }
 

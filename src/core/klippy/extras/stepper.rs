@@ -119,18 +119,9 @@ impl PrinterStepper {
 
         let step_pin = config.get("step_pin", None)?;
         let dir_pin = config.get("dir_pin", None)?;
-        let rotation_distance = config.get_float("rotation_distance", None)?;
-        if rotation_distance <= 0.0 {
-            return Err(ConfigError::new(format!(
-                "Option 'rotation_distance' in section '{identifier}' must be above 0"
-            )));
-        }
-        let microsteps = config.get_int("microsteps", None)?;
-        if microsteps < 1 {
-            return Err(ConfigError::new(format!(
-                "Option 'microsteps' in section '{identifier}' must have minimum of 1"
-            )));
-        }
+        let rotation_distance =
+            config.get_float_bounded("rotation_distance", None, None, None, Some(0.0), None)?;
+        let microsteps = config.get_int_bounded("microsteps", None, Some(1), None)?;
         let full_steps = config.get_int("full_steps_per_rotation", Some(200))?;
         if full_steps < 1 || full_steps % 4 != 0 {
             return Err(ConfigError::new(format!(
@@ -162,21 +153,18 @@ impl PrinterStepper {
             .into_iter()
             .product::<f64>()
             .max(f64::MIN_POSITIVE);
-        let step_pulse_duration =
-            config.get_float("step_pulse_duration", Some(DEFAULT_STEP_PULSE_DURATION))?;
-        if !(0.0..=0.001).contains(&step_pulse_duration) {
-            return Err(ConfigError::new(format!(
-                "Option 'step_pulse_duration' in section '{identifier}' must be between 0 and 0.001"
-            )));
-        }
+        let step_pulse_duration = config.get_float_bounded(
+            "step_pulse_duration",
+            Some(DEFAULT_STEP_PULSE_DURATION),
+            Some(0.0),
+            Some(0.001),
+            None,
+            None,
+        )?;
 
         let position_min = config.get_float("position_min", Some(0.0))?;
-        let position_max = config.get_float("position_max", None)?;
-        if position_max <= position_min {
-            return Err(ConfigError::new(format!(
-                "Option 'position_max' in section '{identifier}' must be above minimum of {position_min}"
-            )));
-        }
+        let position_max =
+            config.get_float_bounded("position_max", None, None, None, Some(position_min), None)?;
         let position_endstop = config.get_float("position_endstop", Some(position_min))?;
         if position_endstop < position_min || position_endstop > position_max {
             return Err(ConfigError::new(format!(
@@ -410,12 +398,7 @@ fn read_homing_info(
     position_max: f64,
     position_endstop: f64,
 ) -> Result<HomingInfo, ConfigError> {
-    let speed = config.get_float("homing_speed", Some(5.0))?;
-    if speed <= 0.0 {
-        return Err(ConfigError::new(format!(
-            "Option 'homing_speed' in section '{identifier}' must be above 0"
-        )));
-    }
+    let speed = config.get_float_bounded("homing_speed", Some(5.0), None, None, Some(0.0), None)?;
     let second_homing_speed = config.get_float("second_homing_speed", Some(speed / 2.0))?;
     let retract_speed = config.get_float("homing_retract_speed", Some(speed))?;
     let retract_dist = config.get_float("homing_retract_dist", Some(5.0))?;

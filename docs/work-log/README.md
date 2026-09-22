@@ -18,3 +18,4 @@
 | 2026-09-21 | [FW6d–FW6f 记录与收口](2026-09-21-fw6de-notes.md) — `stepcompress` history/回零句柄、`Kinematics::home`/`HomingState`、`drip_move`+`G28`、F3 结论与 FW6 状态 |
 | 2026-09-22 | [框架队列收尾记录](2026-09-22-framework-leftovers-notes.md) — FW1/C2 getter 与文案、FW3/A2 connect 失败分类、FW4 `request_restart`、FW7 `error_mcu`、FW8 `StartArgs`/`M115`、FW9 `register_remote_method`+推送+mux 核心集成，以及 `webhooks` 对象与 `klippy-api` 的分层说明 |
 | 2026-09-22 | [已完成条目归档](2026-09-22-completed-archive.md) — 从 `TODO.md` 拆出的「已完成（留档）」全文，让 TODO 只剩未决项 |
+| 2026-09-22 | [上游回归测试失败原因分析](2026-09-22-upstream-regression-failures.md) — 239 次运行按首次失败归类的工单（T3–T10）与完整失败日志（`KLIPPERX_UPSTREAM_ALL=1` 实跑快照） |

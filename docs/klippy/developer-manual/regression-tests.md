@@ -188,23 +188,24 @@ connect_file(输出文件, 字典):
 | 判定 | 次数 | 原因 |
 |------|------|------|
 | 因字典未构建跳过 | 2 | `printers.test` 中引用 `pru` 的两条运行（默认不编 `pru`） |
-| 因忽略列表跳过 | 214 | 尚未落地的配置节/运动学 |
+| 因忽略列表跳过 | 236 | 尚未落地的配置节/运动学（除 `linuxtest.test` 外全部文件） |
 | 实际执行 | **1** | `linuxtest.test`（T1），**通过** |
 
 - `linuxtest.test` 是第一个转绿的用例：它只需要 `kinematics: none`、`heaters` 的传感器注册表、
   `temperature_sensor` 与 `ds18b20`，g-code 只是一次 `G4 P1000`。
 - `KLIPPERX_UPSTREAM_ALL=1` 只去掉忽略列表这一层：默认构建下它会跑 237 条可用运行，其中 1 条
-  （`linuxtest`）通过、214 条在配置装载阶段失败（见下方失败原因统计），另外 2 条以「字典未构建」
+  （`linuxtest`）通过、**236 条**在配置装载阶段失败（见下方失败原因统计），另外 2 条以「字典未构建」
   计入统计，不算失败。
-- `stepper_enable`（T2）已完成，14 个测试文件已从忽略列表移除。当前失败原因按首次失败分组：
-  - `extruder` 未实现：99 次失败（T3）
+- T7 温度传感器已完成（真板与虚拟 MCU 验证），回归里**不再有 `Unknown temperature sensor`**。
+  当前 236 次失败按首次失败分组：
+  - `extruder` 未实现：102 次失败（T3）
   - `probe` pin chip 未知：36 次失败（T4）
-  - 运动学未实现：31 次失败（T5）
-  - TMC pin chip 未知：19 次失败（T6）
-  - `output_pin value` 选项：5 次失败（T8）
-  - `temperature_mcu` 传感器：5 次失败（T7）
-  - `stepper_z1` 多轴：5 次失败（T9）
-  - 其余单实例：14 次失败（T9）
+  - 运动学未实现：37 次失败（T5）
+  - TMC 段/pin chip 未实现：30 次失败（T6）
+  - `output_pin value`/`scale` 选项：6 次失败（T8）
+  - `stepper_z1` 多轴：5 次失败（T10）
+  - 温度传感器：**0** 次失败（T7 ✅）
+  - 其余单实例：20 次失败（T9）
 - 要让实际执行数继续上升：从 `IGNORED` 移除已落地节/运动学的文件。按 T3（`extruder`/`heater_bed`/`fan`）
   与 T4（`probe`/`bltouch`/endstop pin chip）推进。
 
@@ -262,34 +263,34 @@ harness 把每个 `[mcu]` / `[mcu <name>]` 的传输键换成 `test: dict=<字�
 `KLIPPERX_UPSTREAM_ALL=1` **只作用于这张列表**：它让字典齐备的运行无视忽略判定并报出失败，
 **不会**让因字典未构建而跳过的运行跑起来（那是构建阶段的事，见上一节）。
 
-当前 22 条（`linuxtest.test` 已在 T1 修好并转绿，不再是忽略项；`stepper_enable` 已在 T2 完成，
-14 条已移除），按首次失败原因分组（第一次失败修好后可能露出下一个）：
+当前 36 条（`linuxtest.test` 已在 T1 修好并转绿，不再是忽略项；T2 `stepper_enable` 与 T7 温度
+传感器的相关文件仍因后续缺节留在列表里），按首次失败原因分组（第一次失败修好后可能露出下一个）：
 
 #### 失败原因分析
 
 | 失败原因 | 条数 | 根本原因 | 对应 TODO |
 |----------|------|----------|----------|
-| `extruder` 段未实现 | 99 | 配置引用了 `[extruder]` 段，但本主机尚未实现挤出机控制 | T3 |
+| `extruder` 段未实现 | 102 | 配置引用了 `[extruder]` 段，但本主机尚未实现挤出机控制 | T3 |
 | `probe` pin chip 未知 | 36 | 配置使用 `probe` 作为 pin 标识，但本主机尚未实现端停 pin chip | T4 |
-| `delta` 运动学未实现 | 12 | 配置声明 `kinematics: delta`，本主机仅支持 `cartesian` 和 `none` | T5 |
-| `corexy` 运动学未实现 | 10 | 配置声明 `kinematics: corexy`，本主机仅支持 `cartesian` 和 `none` | T5 |
-| `tmc2209 stepper_x` 段未实现 | 12 | 配置引用了 `[tmc2209 stepper_x]` 段，但本主机尚未实现 TMC 驱动 | T6 |
+| `delta` 运动学未实现 | 13 | 配置声明 `kinematics: delta`，本主机仅支持 `cartesian` 和 `none` | T5 |
+| `corexy` 运动学未实现 | 11 | 配置声明 `kinematics: corexy`，本主机仅支持 `cartesian` 和 `none` | T5 |
+| `tmc2209 stepper_x` 段未实现 | 13 | 配置引用了 `[tmc2209 stepper_x]` 段，但本主机尚未实现 TMC 驱动 | T6 |
 | `tmc2209_stepper_x` pin chip 未知 | 6 | 配置使用 `tmc2209_stepper_x` 作为 pin 标识，但本主机尚未实现 TMC pin chip | T6 |
-| `stepper_z1` 段未实现 | 5 | 配置引用了多轴 stepper（`stepper_z1`），但本主机尚未实现多轴支持 | T9 |
+| `stepper_z1` 段未实现 | 5 | 配置引用了多轴 stepper（`stepper_z1`），但本主机尚未实现多轴支持 | T10 |
 | `output_pin value` 选项超限 | 5 | 配置使用 `output_pin stepper_xy_current` 且 `value` 超过最大值 1 | T8 |
-| `temperature_mcu` 传感器未知 | 5 | 配置引用了 MCU 温度传感器，但本主机尚未实现 | T7 |
 | `generic_cartesian` 运动学未实现 | 4 | 配置声明 `kinematics: generic_cartesian`，本主机仅支持 `cartesian` 和 `none` | T5 |
 | `tmc2130_stepper_x` pin chip 未知 | 3 | 配置使用 `tmc2130_stepper_x` 作为 pin 标识，但本主机尚未实现 TMC pin chip | T6 |
 | `tmc2208 stepper_x` 段未实现 | 3 | 配置引用了 `[tmc2208 stepper_x]` 段，但本主机尚未实现 TMC 驱动 | T6 |
 | `safe_z_home` 段未实现 | 3 | 配置引用了 `[safe_z_home]` 段，但本主机尚未实现安全 Z 回零 | T9 |
-| `mcu restart_method` 选项无效 | 3 | 配置使用 `restart_method` 选项，但本主机尚未实现该选项 | T9 |
-| `tmc5160 stepper_x` 段未实现 | 2 | 配置引用了 `[tmc5160 stepper_x]` 段，但本主机尚未实现 TMC 驱动 | T6 |
+| `mcu restart_method` 选项无效 | 3 | 配置使用 `restart_method` 选项，但装载期的未定义选项检查仍会拦下它 | T9 |
+| `tmc5160 stepper_x` / `tmc2130 stepper_x` 段未实现 | 各 2 | 配置引用了 TMC 段，但本主机尚未实现 TMC 驱动 | T6 |
 | `static_digital_output` 段未实现 | 2 | 配置引用了 `[static_digital_output]` 段，但本主机尚未实现 | T9 |
 | `rotary_delta` 运动学未实现 | 2 | 配置声明 `kinematics: rotary_delta`，本主机仅支持 `cartesian` 和 `none` | T5 |
 | `hybrid_corexy` 运动学未实现 | 2 | 配置声明 `kinematics: hybrid_corexy`，本主机仅支持 `cartesian` 和 `none` | T5 |
-| 其余单实例失败 | 14 | 各 1 条，涉及 `gcode_arcs`、`virtual_sdcard`、`led`、`manual_stepper`、`pwm_cycle_time`、`display`、`replicape`、`adc_scaled`、`endstop_phase`、`dual_carriage`、`bed_screws`、`tmc2660`、`tmc2130`、`sx1509_duex`、`temperature` 等 | T9 |
+| 温度传感器 | **0** | T7 已落地（`temperature_mcu`、内置热敏电阻、`MAX31855`、`temperature_combined` 等） | T7 ✅ |
+| 其余单实例失败 | 20 | 各 1–2 条，涉及 `gcode_arcs`、`virtual_sdcard`、`led`、`manual_stepper`、`pwm_cycle_time`、`display`、`replicape`、`adc_scaled`、`endstop_phase`、`dual_carriage`、`bed_screws`、`tmc2660`、`sx1509_duex` 等 | T9 |
 
-（99 + 36 + 12 + 10 + 12 + 6 + 5 + 5 + 5 + 4 + 3 + 3 + 3 + 2 + 2 + 2 + 2 + 14 = 214。）
+（102 + 36 + 13 + 11 + 13 + 6 + 5 + 5 + 4 + 3 + 3 + 3 + 3 + 2 + 2 + 2 + 2 + 20 = 236。）
 
 #### 运动学细分
 
@@ -297,8 +298,8 @@ harness 把每个 `[mcu]` / `[mcu <name>]` 的传输键换成 `test: dict=<字�
 
 | `kinematics` | `.test` | 条数 |
 |--------------|---------|------|
-| `delta` | `delta`、`delta_calibrate`、`printers`（6 条） | 12 |
-| `corexy` | `corexyuv`、`printers`（4 条） | 10 |
+| `delta` | `delta`、`delta_calibrate`、`printers`（7 条） | 13 |
+| `corexy` | `corexyuv`、`printers`（5 条） | 11 |
 | `generic_cartesian` | `generic_cartesian`、`generic_cartesian_iqex`、`generic_cartesian_itex` | 4 |
 | `rotary_delta` | `rotary_delta_calibrate`、`printers` | 2 |
 | `hybrid_corexy` | `hybrid_corexy_dual_carriage`、`printers` | 2 |
@@ -345,11 +346,12 @@ printers.test (test/klippy/../../config/example-delta.cfg): test/klippy/../../co
 printers.test (test/klippy/../../config/example-deltesian.cfg): test/klippy/../../config/example-deltesian.cfg: Error loading kinematics 'deltesian' (only 'cartesian' and 'none' are implemented)
 printers.test (test/klippy/../../config/example-rotary-delta.cfg): test/klippy/../../config/example-rotary-delta.cfg: Error loading kinematics 'rotary_delta' (only 'cartesian' and 'none' are implemented)
 printers.test (test/klippy/../../config/example-winch.cfg): test/klippy/../../config/example-winch.cfg: Error loading kinematics 'winch' (only 'cartesian' and 'none' are implemented)
-printers.test (test/klippy/../../config/generic-einsy-rambo.cfg): test/klippy/../../config/generic-einsy-rambo.cfg: Unknown temperature sensor 'TDK NTCG104LH104JT1'
+printers.test (test/klippy/../../config/generic-einsy-rambo.cfg): test/klippy/../../config/generic-einsy-rambo.cfg: Section 'tmc2130 stepper_x' is not a valid config section
 printers.test (test/klippy/../../config/generic-fysetc-f6.cfg): test/klippy/../../config/generic-fysetc-f6.cfg: Section 'extruder' is not a valid config section
 printers.test (test/klippy/../../config/generic-gt2560.cfg): test/klippy/../../config/generic-gt2560.cfg: Section 'extruder' is not a valid config section
 printers.test (test/klippy/../../config/generic-mini-rambo.cfg): test/klippy/../../config/generic-mini-rambo.cfg: Option 'value' in section 'output_pin stepper_xy_current' must have maximum of 1
 printers.test (test/klippy/../../config/generic-rambo.cfg): test/klippy/../../config/generic-rambo.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/generic-ramps.cfg): test/klippy/../../config/generic-ramps.cfg: Section 'extruder' is not a valid config section
 printers.test (test/klippy/../../config/generic-rumba.cfg): test/klippy/../../config/generic-rumba.cfg: Section 'extruder' is not a valid config section
 printers.test (test/klippy/../../config/generic-ultimaker-ultimainboard-v2.cfg): test/klippy/../../config/generic-ultimaker-ultimainboard-v2.cfg: Option 'value' in section 'output_pin stepper_xy_current' must have maximum of 1
 printers.test (test/klippy/../../config/kit-zav3d-2019.cfg): test/klippy/../../config/kit-zav3d-2019.cfg: stepper_z: Unknown pin chip name 'probe'
@@ -360,48 +362,192 @@ printers.test (test/klippy/../../config/printer-anycubic-i3-mega-2017.cfg): test
 printers.test (test/klippy/../../config/printer-anycubic-kossel-2016.cfg): test/klippy/../../config/printer-anycubic-kossel-2016.cfg: Error loading kinematics 'delta' (only 'cartesian' and 'none' are implemented)
 printers.test (test/klippy/../../config/printer-anycubic-kossel-plus-2017.cfg): test/klippy/../../config/printer-anycubic-kossel-plus-2017.cfg: Error loading kinematics 'delta' (only 'cartesian' and 'none' are implemented)
 printers.test (test/klippy/../../config/printer-bq-hephestos-2014.cfg): test/klippy/../../config/printer-bq-hephestos-2014.cfg: Section 'display' is not a valid config section
-printers.test (test/klippy/../../config/printer-biqu-b1-se-plus-2022.cfg): test/klippy/../../config/printer-biqu-b1-se-plus-2022.cfg: stepper_z: Unknown pin chip name 'probe'
-printers.test (test/klippy/../../config/printer-biqu-bx-2021.cfg): test/klippy/../../config/printer-biqu-bx-2021.cfg: stepper_x: Unknown pin chip name 'tmc2209_stepper_x'
-printers.test (test/klippy/../../config/printer-prusa-mini-plus-2020.cfg): test/klippy/../../config/printer-prusa-mini-plus-2020.cfg: stepper_x: Unknown pin chip name 'tmc2209_stepper_x'
-printers.test (test/klippy/../../config/printer-ratrig-v-minion-2021.cfg): test/klippy/../../config/printer-ratrig-v-minion-2021.cfg: stepper_z: Unknown pin chip name 'probe'
-printers.test (test/klippy/../../config/printer-tronxy-crux1-2022.cfg): test/klippy/../../config/printer-tronxy-crux1-2022.cfg: Option 'restart_method' is not valid in section 'mcu'
-printers.test (test/klippy/../../config/generic-bigtreetech-gtr.cfg): test/klippy/../../config/generic-bigtreetech-gtr.cfg: Unknown temperature sensor 'temperature_mcu'
-printers.test (test/klippy/../../config/generic-bigtreetech-octopus-v1.1.cfg): test/klippy/../../config/generic-bigtreetech-octopus-v1.1.cfg: Section 'extruder' is not a valid config section
-printers.test (test/klippy/../../config/generic-bigtreetech-octopus-pro-v1.0.cfg): test/klippy/../../config/generic-bigtreetech-octopus-pro-v1.0.cfg: Section 'extruder' is not a valid config section
-printers.test (test/klippy/../../config/generic-bigtreetech-octopus-pro-v1.1.cfg): test/klippy/../../config/generic-bigtreetech-octopus-pro-v1.1.cfg: Section 'extruder' is not a valid config section
-printers.test (test/klippy/../../config/generic-bigtreetech-octopus-max-ez.cfg): test/klippy/../../config/generic-bigtreetech-octopus-max-ez.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/printer-creality-cr5pro-ht-2022.cfg): test/klippy/../../config/printer-creality-cr5pro-ht-2022.cfg: stepper_z: Unknown pin chip name 'probe'
+printers.test (test/klippy/../../config/printer-creality-cr10-v3-2020.cfg): test/klippy/../../config/printer-creality-cr10-v3-2020.cfg: Section 'safe_z_home' is not a valid config section
+printers.test (test/klippy/../../config/printer-creality-cr10s-2017.cfg): test/klippy/../../config/printer-creality-cr10s-2017.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/printer-creality-cr10s-pro-v2-2020.cfg): test/klippy/../../config/printer-creality-cr10s-pro-v2-2020.cfg: stepper_z: Unknown pin chip name 'probe'
+printers.test (test/klippy/../../config/printer-creality-cr20-2018.cfg): test/klippy/../../config/printer-creality-cr20-2018.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/printer-creality-cr20-pro-2019.cfg): test/klippy/../../config/printer-creality-cr20-pro-2019.cfg: stepper_z: Unknown pin chip name 'probe'
+printers.test (test/klippy/../../config/printer-creality-ender5plus-2019.cfg): test/klippy/../../config/printer-creality-ender5plus-2019.cfg: stepper_z: Unknown pin chip name 'probe'
+printers.test (test/klippy/../../config/printer-eryone-thinker-series-v2-2020.cfg): test/klippy/../../config/printer-eryone-thinker-series-v2-2020.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/printer-flashforge-creator-pro-2018.cfg): test/klippy/../../config/printer-flashforge-creator-pro-2018.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/printer-geeetech-A10T-A20T-2021.cfg): test/klippy/../../config/printer-geeetech-A10T-A20T-2021.cfg: Section 'safe_z_home' is not a valid config section
+printers.test (test/klippy/../../config/printer-hiprecy-leo-2019.cfg): test/klippy/../../config/printer-hiprecy-leo-2019.cfg: stepper_x: Unknown pin chip name 'tmc2130_stepper_x'
+printers.test (test/klippy/../../config/printer-longer-lk4-pro-2019.cfg): test/klippy/../../config/printer-longer-lk4-pro-2019.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/printer-lulzbot-mini1-2016.cfg): test/klippy/../../config/printer-lulzbot-mini1-2016.cfg: Option 'value' in section 'output_pin stepper_xy_current' must have maximum of 1
+printers.test (test/klippy/../../config/printer-lulzbot-mini2-2018.cfg): test/klippy/../../config/printer-lulzbot-mini2-2018.cfg: stepper_x: Unknown pin chip name 'tmc2130_stepper_x'
+printers.test (test/klippy/../../config/printer-lulzbot-taz6-2017.cfg): test/klippy/../../config/printer-lulzbot-taz6-2017.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/printer-lulzbot-taz6-dual-v3-2017.cfg): test/klippy/../../config/printer-lulzbot-taz6-dual-v3-2017.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/printer-makergear-m2-2012.cfg): test/klippy/../../config/printer-makergear-m2-2012.cfg: Section 'endstop_phase stepper_x' is not a valid config section
+printers.test (test/klippy/../../config/printer-makergear-m2-2016.cfg): test/klippy/../../config/printer-makergear-m2-2016.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/printer-micromake-d1-2016.cfg): test/klippy/../../config/printer-micromake-d1-2016.cfg: Error loading kinematics 'delta' (only 'cartesian' and 'none' are implemented)
+printers.test (test/klippy/../../config/printer-mtw-create-2015.cfg): test/klippy/../../config/printer-mtw-create-2015.cfg: stepper_z: Unknown pin chip name 'probe'
+printers.test (test/klippy/../../config/printer-robo3d-r2-2017.cfg): test/klippy/../../config/printer-robo3d-r2-2017.cfg: stepper_z: Unknown pin chip name 'probe'
+printers.test (test/klippy/../../config/printer-seemecnc-rostock-max-v2-2015.cfg): test/klippy/../../config/printer-seemecnc-rostock-max-v2-2015.cfg: Error loading kinematics 'delta' (only 'cartesian' and 'none' are implemented)
+printers.test (test/klippy/../../config/printer-sovol-sv01-2020.cfg): test/klippy/../../config/printer-sovol-sv01-2020.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/printer-sunlu-s8-2020.cfg): test/klippy/../../config/printer-sunlu-s8-2020.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/printer-tevo-flash-2018.cfg): test/klippy/../../config/printer-tevo-flash-2018.cfg: stepper_z: Unknown pin chip name 'probe'
+printers.test (test/klippy/../../config/printer-tevo-tarantula-pro-2020.cfg): test/klippy/../../config/printer-tevo-tarantula-pro-2020.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/printer-velleman-k8200-2013.cfg): test/klippy/../../config/printer-velleman-k8200-2013.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/printer-velleman-k8800-2017.cfg): test/klippy/../../config/printer-velleman-k8800-2017.cfg: Error loading kinematics 'delta' (only 'cartesian' and 'none' are implemented)
+printers.test (test/klippy/../../config/printer-wanhao-duplicator-i3-mini-2017.cfg): test/klippy/../../config/printer-wanhao-duplicator-i3-mini-2017.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/printer-wanhao-duplicator-i3-plus-2017.cfg): test/klippy/../../config/printer-wanhao-duplicator-i3-plus-2017.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/printer-wanhao-duplicator-i3-plus-mark2-2019.cfg): test/klippy/../../config/printer-wanhao-duplicator-i3-plus-mark2-2019.cfg: stepper_z: Unknown pin chip name 'probe'
+printers.test (test/klippy/../../config/printer-wanhao-duplicator-6-2016.cfg): test/klippy/../../config/printer-wanhao-duplicator-6-2016.cfg: Option 'value' in section 'output_pin stepper_xy_current' must have maximum of 1
+printers.test (test/klippy/../../config/printer-wanhao-duplicator-9-2018.cfg): test/klippy/../../config/printer-wanhao-duplicator-9-2018.cfg: stepper_z: Unknown pin chip name 'probe'
+printers.test (test/klippy/../../config/generic-mightyboard.cfg): test/klippy/../../config/generic-mightyboard.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/generic-minitronics1.cfg): test/klippy/../../config/generic-minitronics1.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/generic-melzi.cfg): test/klippy/../../config/generic-melzi.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/printer-anet-a4-2018.cfg): test/klippy/../../config/printer-anet-a4-2018.cfg: Error loading kinematics 'delta' (only 'cartesian' and 'none' are implemented)
+printers.test (test/klippy/../../config/printer-anet-a8-2017.cfg): test/klippy/../../config/printer-anet-a8-2017.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/printer-anet-a8-2019.cfg): test/klippy/../../config/printer-anet-a8-2019.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/printer-anet-e10-2018.cfg): test/klippy/../../config/printer-anet-e10-2018.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/printer-anet-e16-2019.cfg): test/klippy/../../config/printer-anet-e16-2019.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/printer-creality-cr10-2017.cfg): test/klippy/../../config/printer-creality-cr10-2017.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/printer-creality-cr10mini-2017.cfg): test/klippy/../../config/printer-creality-cr10mini-2017.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/printer-creality-ender2-2017.cfg): test/klippy/../../config/printer-creality-ender2-2017.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/printer-creality-ender3-2018.cfg): test/klippy/../../config/printer-creality-ender3-2018.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/printer-creality-ender5-2019.cfg): test/klippy/../../config/printer-creality-ender5-2019.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/printer-tronxy-p802e-2020.cfg): test/klippy/../../config/printer-tronxy-p802e-2020.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/printer-tronxy-p802m-2020.cfg): test/klippy/../../config/printer-tronxy-p802m-2020.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/printer-tronxy-x5s-2018.cfg): test/klippy/../../config/printer-tronxy-x5s-2018.cfg: Error loading kinematics 'corexy' (only 'cartesian' and 'none' are implemented)
+printers.test (test/klippy/../../config/printer-tronxy-x8-2018.cfg): test/klippy/../../config/printer-tronxy-x8-2018.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/printer-wanhao-duplicator-i3-v2.1-2017.cfg): test/klippy/../../config/printer-wanhao-duplicator-i3-v2.1-2017.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/generic-simulavr.cfg): test/klippy/../../config/generic-simulavr.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/generic-printrboard.cfg): test/klippy/../../config/generic-printrboard.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/generic-printrboard-g2.cfg): test/klippy/../../config/generic-printrboard-g2.cfg: Option 'scale' is not valid in section 'output_pin motor_x_pwm'
+printers.test (test/klippy/../../config/generic-alligator-r2.cfg): test/klippy/../../config/generic-alligator-r2.cfg: Section 'static_digital_output drv8825_microstepping' is not a valid config section
+printers.test (test/klippy/../../config/generic-alligator-r3.cfg): test/klippy/../../config/generic-alligator-r3.cfg: Section 'static_digital_output drv8825_microstepping' is not a valid config section
+printers.test (test/klippy/../../config/generic-archim2.cfg): test/klippy/../../config/generic-archim2.cfg: Section 'tmc2130 stepper_x' is not a valid config section
+printers.test (test/klippy/../../config/generic-radds.cfg): test/klippy/../../config/generic-radds.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/generic-ruramps-v1.3.cfg): test/klippy/../../config/generic-ruramps-v1.3.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/generic-duet2-maestro.cfg): test/klippy/../../config/generic-duet2-maestro.cfg: Section 'tmc2208 stepper_x' is not a valid config section
+printers.test (test/klippy/../../config/generic-duet2.cfg): test/klippy/../../config/generic-duet2.cfg: Section 'tmc2660 stepper_x' is not a valid config section
+printers.test (test/klippy/../../config/generic-duet2-duex.cfg): test/klippy/../../config/generic-duet2-duex.cfg: output_pin FAN3: Unknown pin chip name 'sx1509_duex'
+printers.test (test/klippy/../../config/printer-modix-big60-2020.cfg): test/klippy/../../config/printer-modix-big60-2020.cfg: stepper_z: Unknown pin chip name 'probe'
+printers.test (test/klippy/../../config/generic-duet3-mini.cfg): test/klippy/../../config/generic-duet3-mini.cfg: Section 'tmc2209 stepper_x' is not a valid config section
+printers.test (test/klippy/../../config/generic-duet3-6hc.cfg): test/klippy/../../config/generic-duet3-6hc.cfg: Section 'tmc5160 stepper_x' is not a valid config section
+printers.test (test/klippy/../../config/generic-duet3-6xd.cfg): test/klippy/../../config/generic-duet3-6xd.cfg: Section 'adc_scaled vref_scaled' is not a valid config section
+printers.test (test/klippy/../../config/generic-azteeg-x5-mini-v3.cfg): test/klippy/../../config/generic-azteeg-x5-mini-v3.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/generic-bigtreetech-skr-e3-turbo.cfg): test/klippy/../../config/generic-bigtreetech-skr-e3-turbo.cfg: Section 'tmc2209 stepper_x' is not a valid config section
+printers.test (test/klippy/../../config/generic-bigtreetech-skr-v1.1.cfg): test/klippy/../../config/generic-bigtreetech-skr-v1.1.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/generic-bigtreetech-skr-v1.3.cfg): test/klippy/../../config/generic-bigtreetech-skr-v1.3.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/generic-bigtreetech-skr-v1.4.cfg): test/klippy/../../config/generic-bigtreetech-skr-v1.4.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/generic-mks-sgenl.cfg): test/klippy/../../config/generic-mks-sgenl.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/generic-re-arm.cfg): test/klippy/../../config/generic-re-arm.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/generic-smoothieboard.cfg): test/klippy/../../config/generic-smoothieboard.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/generic-th3d-ezboard-lite-v1.2.cfg): test/klippy/../../config/generic-th3d-ezboard-lite-v1.2.cfg: Section 'tmc2208 stepper_x' is not a valid config section
+printers.test (test/klippy/../../config/printer-monoprice-mini-delta-2017.cfg): test/klippy/../../config/printer-monoprice-mini-delta-2017.cfg: Error loading kinematics 'delta' (only 'cartesian' and 'none' are implemented)
+printers.test (test/klippy/../../config/printer-monoprice-select-mini-v2-2018.cfg): test/klippy/../../config/printer-monoprice-select-mini-v2-2018.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/generic-bigtreetech-skr-cr6-v1.0.cfg): test/klippy/../../config/generic-bigtreetech-skr-cr6-v1.0.cfg: Section 'tmc2209 stepper_x' is not a valid config section
+printers.test (test/klippy/../../config/generic-bigtreetech-skr-e3-dip.cfg): test/klippy/../../config/generic-bigtreetech-skr-e3-dip.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/generic-bigtreetech-skr-mini.cfg): test/klippy/../../config/generic-bigtreetech-skr-mini.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/generic-bigtreetech-skr-mini-e3-v1.0.cfg): test/klippy/../../config/generic-bigtreetech-skr-mini-e3-v1.0.cfg: Section 'tmc2209 stepper_x' is not a valid config section
+printers.test (test/klippy/../../config/generic-bigtreetech-skr-mini-e3-v1.2.cfg): test/klippy/../../config/generic-bigtreetech-skr-mini-e3-v1.2.cfg: Section 'tmc2209 stepper_x' is not a valid config section
+printers.test (test/klippy/../../config/generic-bigtreetech-skr-mini-e3-v2.0.cfg): test/klippy/../../config/generic-bigtreetech-skr-mini-e3-v2.0.cfg: Section 'tmc2209 stepper_x' is not a valid config section
+printers.test (test/klippy/../../config/generic-bigtreetech-skr-mini-mz.cfg): test/klippy/../../config/generic-bigtreetech-skr-mini-mz.cfg: Section 'tmc2209 stepper_x' is not a valid config section
+printers.test (test/klippy/../../config/printer-anycubic-vyper-2021.cfg): test/klippy/../../config/printer-anycubic-vyper-2021.cfg: Section 'stepper_z1' is not a valid config section
+printers.test (test/klippy/../../config/printer-monoprice-select-mini-v1-2016.cfg): test/klippy/../../config/printer-monoprice-select-mini-v1-2016.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/printer-sovol-sv05-2022.cfg): test/klippy/../../config/printer-sovol-sv05-2022.cfg: stepper_z: Unknown pin chip name 'probe'
+printers.test (test/klippy/../../config/printer-sovol-sv06-2022.cfg): test/klippy/../../config/printer-sovol-sv06-2022.cfg: stepper_x: Unknown pin chip name 'tmc2209_stepper_x'
+printers.test (test/klippy/../../config/printer-sovol-sv06-plus-2023.cfg): test/klippy/../../config/printer-sovol-sv06-plus-2023.cfg: stepper_x: Unknown pin chip name 'tmc2209_stepper_x'
+printers.test (test/klippy/../../config/printer-sunlu-t3-2022.cfg): test/klippy/../../config/printer-sunlu-t3-2022.cfg: stepper_z: Unknown pin chip name 'probe'
+printers.test (test/klippy/../../config/generic-creality-v4.2.7.cfg): test/klippy/../../config/generic-creality-v4.2.7.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/generic-creality-v4.2.10.cfg): test/klippy/../../config/generic-creality-v4.2.10.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/generic-fysetc-cheetah-v1.1.cfg): test/klippy/../../config/generic-fysetc-cheetah-v1.1.cfg: Section 'tmc2209 stepper_x' is not a valid config section
+printers.test (test/klippy/../../config/generic-fysetc-cheetah-v1.2.cfg): test/klippy/../../config/generic-fysetc-cheetah-v1.2.cfg: Section 'tmc2208 stepper_x' is not a valid config section
+printers.test (test/klippy/../../config/generic-mks-robin-e3.cfg): test/klippy/../../config/generic-mks-robin-e3.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/generic-mks-robin-nano-v1.cfg): test/klippy/../../config/generic-mks-robin-nano-v1.cfg: Error loading kinematics 'corexy' (only 'cartesian' and 'none' are implemented)
+printers.test (test/klippy/../../config/generic-mks-robin-nano-v2.cfg): test/klippy/../../config/generic-mks-robin-nano-v2.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/printer-alfawise-u30-2018.cfg): test/klippy/../../config/printer-alfawise-u30-2018.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/printer-creality-cr10-smart-pro-2022.cfg): test/klippy/../../config/printer-creality-cr10-smart-pro-2022.cfg: stepper_z: Unknown pin chip name 'probe'
+printers.test (test/klippy/../../config/printer-creality-cr30-2021.cfg): test/klippy/../../config/printer-creality-cr30-2021.cfg: Error loading kinematics 'corexy' (only 'cartesian' and 'none' are implemented)
+printers.test (test/klippy/../../config/printer-creality-cr6se-2020.cfg): test/klippy/../../config/printer-creality-cr6se-2020.cfg: stepper_z: Unknown pin chip name 'probe'
+printers.test (test/klippy/../../config/printer-creality-cr6se-2021.cfg): test/klippy/../../config/printer-creality-cr6se-2021.cfg: stepper_z: Unknown pin chip name 'probe'
+printers.test (test/klippy/../../config/printer-creality-ender2pro-2021.cfg): test/klippy/../../config/printer-creality-ender2pro-2021.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/printer-creality-ender3-s1-2021.cfg): test/klippy/../../config/printer-creality-ender3-s1-2021.cfg: stepper_z: Unknown pin chip name 'probe'
+printers.test (test/klippy/../../config/printer-creality-ender3-s1plus-2022.cfg): test/klippy/../../config/printer-creality-ender3-s1plus-2022.cfg: stepper_z: Unknown pin chip name 'probe'
+printers.test (test/klippy/../../config/printer-creality-ender3-v2-2020.cfg): test/klippy/../../config/printer-creality-ender3-v2-2020.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/printer-creality-ender3-v2-neo-2022.cfg): test/klippy/../../config/printer-creality-ender3-v2-neo-2022.cfg: stepper_z: Unknown pin chip name 'probe'
+printers.test (test/klippy/../../config/printer-creality-ender3max-2021.cfg): test/klippy/../../config/printer-creality-ender3max-2021.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/printer-creality-ender3pro-2020.cfg): test/klippy/../../config/printer-creality-ender3pro-2020.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/printer-creality-ender5pro-2020.cfg): test/klippy/../../config/printer-creality-ender5pro-2020.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/printer-creality-ender6-2020.cfg): test/klippy/../../config/printer-creality-ender6-2020.cfg: Error loading kinematics 'corexy' (only 'cartesian' and 'none' are implemented)
+printers.test (test/klippy/../../config/printer-creality-sermoonD1-2021.cfg): test/klippy/../../config/printer-creality-sermoonD1-2021.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/printer-creality-sermoonV1-2022.cfg): test/klippy/../../config/printer-creality-sermoonV1-2022.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/printer-elegoo-neptune2-2021.cfg): test/klippy/../../config/printer-elegoo-neptune2-2021.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/printer-eryone-er20-2021.cfg): test/klippy/../../config/printer-eryone-er20-2021.cfg: stepper_x: Unknown pin chip name 'tmc2209_stepper_x'
+printers.test (test/klippy/../../config/printer-flsun-q5-2020.cfg): test/klippy/../../config/printer-flsun-q5-2020.cfg: Error loading kinematics 'delta' (only 'cartesian' and 'none' are implemented)
+printers.test (test/klippy/../../config/printer-flsun-qqs-2020.cfg): test/klippy/../../config/printer-flsun-qqs-2020.cfg: Error loading kinematics 'delta' (only 'cartesian' and 'none' are implemented)
+printers.test (test/klippy/../../config/printer-fokoos-odin5-f3-2021.cfg): test/klippy/../../config/printer-fokoos-odin5-f3-2021.cfg: Option 'restart_method' is not valid in section 'mcu'
+printers.test (test/klippy/../../config/printer-geeetech-301-2019.cfg): test/klippy/../../config/printer-geeetech-301-2019.cfg: Error loading kinematics 'delta' (only 'cartesian' and 'none' are implemented)
+printers.test (test/klippy/../../config/printer-kingroon-kp3s-2020.cfg): test/klippy/../../config/printer-kingroon-kp3s-2020.cfg: Section 'safe_z_home' is not a valid config section
+printers.test (test/klippy/../../config/printer-longer-lk4x-2022.cfg): test/klippy/../../config/printer-longer-lk4x-2022.cfg: stepper_z: Unknown pin chip name 'probe'
+printers.test (test/klippy/../../config/printer-tronxy-x5sa-v6-2019.cfg): test/klippy/../../config/printer-tronxy-x5sa-v6-2019.cfg: stepper_z: Unknown pin chip name 'probe'
+printers.test (test/klippy/../../config/printer-tronxy-x5sa-pro-2020.cfg): test/klippy/../../config/printer-tronxy-x5sa-pro-2020.cfg: stepper_z: Unknown pin chip name 'probe'
+printers.test (test/klippy/../../config/printer-tronxy-xy-2-Pro-2020.cfg): test/klippy/../../config/printer-tronxy-xy-2-Pro-2020.cfg: stepper_z: Unknown pin chip name 'probe'
+printers.test (test/klippy/../../config/printer-twotrees-sapphire-plus-sp-5-v1-2020.cfg): test/klippy/../../config/printer-twotrees-sapphire-plus-sp-5-v1-2020.cfg: Error loading kinematics 'corexy' (only 'cartesian' and 'none' are implemented)
+printers.test (test/klippy/../../config/printer-twotrees-sapphire-plus-sp-5-v1.1-2021.cfg): test/klippy/../../config/printer-twotrees-sapphire-plus-sp-5-v1.1-2021.cfg: Error loading kinematics 'corexy' (only 'cartesian' and 'none' are implemented)
+printers.test (test/klippy/../../config/printer-twotrees-sapphire-pro-sp-3-2020.cfg): test/klippy/../../config/printer-twotrees-sapphire-pro-sp-3-2020.cfg: Error loading kinematics 'corexy' (only 'cartesian' and 'none' are implemented)
+printers.test (test/klippy/../../config/printer-voxelab-aquila-2021.cfg): test/klippy/../../config/printer-voxelab-aquila-2021.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/generic-fysetc-cheetah-v2.0.cfg): test/klippy/../../config/generic-fysetc-cheetah-v2.0.cfg: Section 'tmc2209 stepper_x' is not a valid config section
+printers.test (test/klippy/../../config/printer-artillery-genius-pro-2022.cfg): test/klippy/../../config/printer-artillery-genius-pro-2022.cfg: stepper_z: Unknown pin chip name 'probe'
+printers.test (test/klippy/../../config/printer-artillery-sidewinder-x2-2022.cfg): test/klippy/../../config/printer-artillery-sidewinder-x2-2022.cfg: stepper_z: Unknown pin chip name 'probe'
+printers.test (test/klippy/../../config/printer-artillery-sidewinder-x3-plus-2024.cfg): test/klippy/../../config/printer-artillery-sidewinder-x3-plus-2024.cfg: stepper_z: Unknown pin chip name 'probe'
+printers.test (test/klippy/../../config/printer-creality-ender5-s1-2023.cfg): test/klippy/../../config/printer-creality-ender5-s1-2023.cfg: stepper_z: Unknown pin chip name 'probe'
+printers.test (test/klippy/../../config/printer-elegoo-neptune3-pro-2023.cfg): test/klippy/../../config/printer-elegoo-neptune3-pro-2023.cfg: stepper_z: Unknown pin chip name 'probe'
+printers.test (test/klippy/../../config/generic-mellow-fly-gemini-v1.cfg): test/klippy/../../config/generic-mellow-fly-gemini-v1.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/generic-mellow-fly-gemini-v2.cfg): test/klippy/../../config/generic-mellow-fly-gemini-v2.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/generic-bigtreetech-e3-rrf-v1.1.cfg): test/klippy/../../config/generic-bigtreetech-e3-rrf-v1.1.cfg: Section 'tmc2209 stepper_x' is not a valid config section
+printers.test (test/klippy/../../config/generic-bigtreetech-gtr.cfg): test/klippy/../../config/generic-bigtreetech-gtr.cfg: Section 'extruder' is not a valid config section
 printers.test (test/klippy/../../config/generic-bigtreetech-skr-pro.cfg): test/klippy/../../config/generic-bigtreetech-skr-pro.cfg: Section 'extruder' is not a valid config section
 printers.test (test/klippy/../../config/generic-bigtreetech-skr-2.cfg): test/klippy/../../config/generic-bigtreetech-skr-2.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/generic-flyboard.cfg): test/klippy/../../config/generic-flyboard.cfg: Error loading kinematics 'corexy' (only 'cartesian' and 'none' are implemented)
+printers.test (test/klippy/../../config/generic-I3DBEEZ9.cfg): test/klippy/../../config/generic-I3DBEEZ9.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/generic-mellow-fly-cdy-v3.cfg): test/klippy/../../config/generic-mellow-fly-cdy-v3.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/generic-mellow-fly-e3-v2.cfg): test/klippy/../../config/generic-mellow-fly-e3-v2.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/generic-mellow-super-infinty-hv.cfg): test/klippy/../../config/generic-mellow-super-infinty-hv.cfg: Error loading kinematics 'corexy' (only 'cartesian' and 'none' are implemented)
+printers.test (test/klippy/../../config/generic-mks-monster8.cfg): test/klippy/../../config/generic-mks-monster8.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/generic-mks-robin-nano-v3.cfg): test/klippy/../../config/generic-mks-robin-nano-v3.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/generic-prusa-buddy.cfg): test/klippy/../../config/generic-prusa-buddy.cfg: stepper_x: Unknown pin chip name 'tmc2209_stepper_x'
+printers.test (test/klippy/../../config/generic-th3d-ezboard-v2.0.cfg): test/klippy/../../config/generic-th3d-ezboard-v2.0.cfg: Section 'tmc2209 stepper_x' is not a valid config section
+printers.test (test/klippy/../../config/printer-biqu-b1-se-plus-2022.cfg): test/klippy/../../config/printer-biqu-b1-se-plus-2022.cfg: stepper_z: Unknown pin chip name 'probe'
+printers.test (test/klippy/../../config/printer-prusa-mini-plus-2020.cfg): test/klippy/../../config/printer-prusa-mini-plus-2020.cfg: stepper_x: Unknown pin chip name 'tmc2209_stepper_x'
+printers.test (test/klippy/../../config/generic-bigtreetech-octopus-v1.1.cfg): test/klippy/../../config/generic-bigtreetech-octopus-v1.1.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/generic-bigtreetech-octopus-pro-v1.0.cfg): test/klippy/../../config/generic-bigtreetech-octopus-pro-v1.0.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/generic-fysetc-s6.cfg): test/klippy/../../config/generic-fysetc-s6.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/generic-fysetc-s6-v2.cfg): test/klippy/../../config/generic-fysetc-s6-v2.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/generic-fysetc-spider.cfg): test/klippy/../../config/generic-fysetc-spider.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/generic-ldo-leviathan-v1.2.cfg): test/klippy/../../config/generic-ldo-leviathan-v1.2.cfg: Section 'tmc5160 stepper_x' is not a valid config section
+printers.test (test/klippy/../../config/generic-mks-rumba32-v1.0.cfg): test/klippy/../../config/generic-mks-rumba32-v1.0.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/printer-ratrig-v-minion-2021.cfg): test/klippy/../../config/printer-ratrig-v-minion-2021.cfg: stepper_z: Unknown pin chip name 'probe'
+printers.test (test/klippy/../../config/printer-tronxy-crux1-2022.cfg): test/klippy/../../config/printer-tronxy-crux1-2022.cfg: Option 'restart_method' is not valid in section 'mcu'
+printers.test (test/klippy/../../config/generic-bigtreetech-octopus-max-ez.cfg): test/klippy/../../config/generic-bigtreetech-octopus-max-ez.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/generic-bigtreetech-octopus-pro-v1.1.cfg): test/klippy/../../config/generic-bigtreetech-octopus-pro-v1.1.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/printer-biqu-bx-2021.cfg): test/klippy/../../config/printer-biqu-bx-2021.cfg: stepper_x: Unknown pin chip name 'tmc2209_stepper_x'
 printers.test (test/klippy/../../config/generic-bigtreetech-skr-3.cfg): test/klippy/../../config/generic-bigtreetech-skr-3.cfg: Section 'extruder' is not a valid config section
-printers.test (test/klippy/../../config/generic-bigtreetech-skr-pico-v1.0.cfg): test/klippy/../../config/generic-bigtreetech-skr-pico-v1.0.cfg: Unknown temperature sensor 'temperature_mcu'
-printers.test (test/klippy/../../config/generic-bigtreetech-skr-mini-e3-v3.0.cfg): test/klippy/../../config/generic-bigtreetech-skr-mini-e3-v3.0.cfg: Section 'tmc2209 stepper_x' is not a valid config section
 printers.test (test/klippy/../../config/generic-bigtreetech-manta-m4p.cfg): test/klippy/../../config/generic-bigtreetech-manta-m4p.cfg: Section 'extruder' is not a valid config section
 printers.test (test/klippy/../../config/generic-bigtreetech-manta-m5p.cfg): test/klippy/../../config/generic-bigtreetech-manta-m5p.cfg: Section 'extruder' is not a valid config section
 printers.test (test/klippy/../../config/generic-bigtreetech-manta-m8p-v1.0.cfg): test/klippy/../../config/generic-bigtreetech-manta-m8p-v1.0.cfg: Section 'extruder' is not a valid config section
 printers.test (test/klippy/../../config/generic-bigtreetech-manta-m8p-v1.1.cfg): test/klippy/../../config/generic-bigtreetech-manta-m8p-v1.1.cfg: Section 'extruder' is not a valid config section
 printers.test (test/klippy/../../config/generic-bigtreetech-manta-e3ez.cfg): test/klippy/../../config/generic-bigtreetech-manta-e3ez.cfg: Section 'extruder' is not a valid config section
-printers.test (test/klippy/../../config/generic-flyboard.cfg): test/klippy/../../config/generic-flyboard.cfg: Error loading kinematics 'corexy' (only 'cartesian' and 'none' are implemented)
-printers.test (test/klippy/../../config/generic-I3DBEEZ9.cfg): test/klippy/../../config/generic-I3DBEEZ9.cfg: Section 'extruder' is not a valid config section
-printers.test (test/klippy/../../config/generic-mellow-fly-cdy-v3.cfg): test/klippy/../../config/generic-mellow-fly-cdy-v3.cfg: Section 'extruder' is not a valid config section
-printers.test (test/klippy/../../config/generic-mellow-fly-e3-v2.cfg): test/klippy/../../config/generic-mellow-fly-e3-v2.cfg: Unknown temperature sensor 'temperature_mcu'
-printers.test (test/klippy/../../config/generic-mellow-super-infinty-hv.cfg): test/klippy/../../config/generic-mellow-super-infinty-hv.cfg: Error loading kinematics 'corexy' (only 'cartesian' and 'none' are implemented)
-printers.test (test/klippy/../../config/generic-mks-monster8.cfg): test/klippy/../../config/generic-mks-monster8.cfg: Section 'extruder' is not a valid config section
-printers.test (test/klippy/../../config/generic-mks-robin-nano-v3.cfg): test/klippy/../../config/generic-mks-robin-nano-v3.cfg: Section 'extruder' is not a valid config section
-printers.test (test/klippy/../../config/generic-replicape.cfg): test/klippy/../../config/generic-replicape.cfg: Section 'replicape' is not a valid config section
-printers.test (test/klippy/../../config/generic-th3d-ezboard-v2.0.cfg): test/klippy/../../config/generic-th3d-ezboard-v2.0.cfg: Section 'tmc2209 stepper_x' is not a valid config section
-printers.test (test/klippy/../../config/generic-ldo-leviathan-v1.2.cfg): test/klippy/../../config/generic-ldo-leviathan-v1.2.cfg: Section 'tmc5160 stepper_x' is not a valid config section
-printers.test (test/klippy/../../config/generic-mks-rumba32-v1.0.cfg): test/klippy/../../config/generic-mks-rumba32-v1.0.cfg: Section 'extruder' is not a valid config section
+printers.test (test/klippy/../../config/generic-bigtreetech-skr-mini-e3-v3.0.cfg): test/klippy/../../config/generic-bigtreetech-skr-mini-e3-v3.0.cfg: Section 'tmc2209 stepper_x' is not a valid config section
+printers.test (test/klippy/../../config/generic-bigtreetech-skr-pico-v1.0.cfg): test/klippy/../../config/generic-bigtreetech-skr-pico-v1.0.cfg: Section 'tmc2209 stepper_x' is not a valid config section
 printers.test (test/klippy/../../config/printer-anycubic-kobra-go-2022.cfg): test/klippy/../../config/printer-anycubic-kobra-go-2022.cfg: Section 'extruder' is not a valid config section
 printers.test (test/klippy/../../config/printer-anycubic-kobra-plus-2022.cfg): test/klippy/../../config/printer-anycubic-kobra-plus-2022.cfg: Option 'restart_method' is not valid in section 'mcu'
+printers.test (test/klippy/../../config/generic-replicape.cfg): test/klippy/../../config/generic-replicape.cfg: Section 'replicape' is not a valid config section
 printers.test (test/klippy/../../config/sample-multi-mcu.cfg): test/klippy/../../config/sample-multi-mcu.cfg: Section 'extruder' is not a valid config section
 printers.test (test/klippy/../../config/kit-voron2-250mm.cfg): test/klippy/../../config/kit-voron2-250mm.cfg: Error loading kinematics 'corexy' (only 'cartesian' and 'none' are implemented)
+pwm.test (test/klippy/pwm.cfg): test/klippy/pwm.cfg: Section 'pwm_cycle_time cycle_pwm_pin' is not a valid config section
 quad_gantry_level.test (test/klippy/z_tilt.cfg): test/klippy/z_tilt.cfg: Section 'stepper_z1' is not a valid config section
-temperature.test (test/klippy/temperature.cfg): test/klippy/temperature.cfg: Unknown temperature sensor 'my_custom_resistance_adc'
-z_tilt.test (test/klippy/z_tilt.cfg): test/klippy/z_tilt.cfg: Section 'stepper_z1' is not a valid config section
+rotary_delta_calibrate.test (test/klippy/rotary_delta_calibrate.cfg): test/klippy/rotary_delta_calibrate.cfg: Error loading kinematics 'rotary_delta' (only 'cartesian' and 'none' are implemented)
 screws_tilt_adjust.test (test/klippy/screws_tilt_adjust.cfg): test/klippy/screws_tilt_adjust.cfg: stepper_z: Unknown pin chip name 'probe'
+sdcard_loop.test (test/klippy/sdcard_loop.cfg): test/klippy/sdcard_loop.cfg: Section 'virtual_sdcard' is not a valid config section
 smart_effector.test (test/klippy/smart_effector.cfg): test/klippy/smart_effector.cfg: stepper_z: Unknown pin chip name 'probe'
+temperature.test (test/klippy/temperature.cfg): test/klippy/temperature.cfg: Section 'extruder' is not a valid config section
+tmc.test (test/klippy/tmc.cfg): test/klippy/tmc.cfg: stepper_x: Unknown pin chip name 'tmc2130_stepper_x'
+z_tilt.test (test/klippy/z_tilt.cfg): test/klippy/z_tilt.cfg: Section 'stepper_z1' is not a valid config section
 z_virtual_endstop.test (test/klippy/z_virtual_endstop.cfg): test/klippy/z_virtual_endstop.cfg: stepper_z: Unknown pin chip name 'probe'
-tmc.test (test/klippy/tmc.cfg): test/klippy/tmc.cfg: Section 'tmc2209 stepper_x' is not a valid config section
 ```
 
 `out_of_bounds.test` 是唯一声明 `SHOULD_FAIL` 的用例，它期望的是**运行期**错误（`G1 Y9999` 越界），

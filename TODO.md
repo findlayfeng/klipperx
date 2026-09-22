@@ -21,10 +21,10 @@
 | **FW2** | 对象模型收尾 | Q4、Q5 | Q4 定案 `Value`；Q5 加 `lookup_objects(module)` 前缀遍历与 `statuses()` 快照 | `objects/query` 形状不变；`lookup_objects("mcu")` 前缀遍历与反射读状态有单测 | `gcode_macro` 的 `printer.objects` 模板视图、display 菜单、宏变量 | — |
 | **FW3** | 错误词汇框架 | A2 | `CommandError`/`ConfigError` 分层、`KlippyError::Config`、`Internal` 收敛、handler/endpoint 异常 `catch_unwind` → `invoke_shutdown`、config 错走 `set_error_state`（`PrinterState::Error`） | 参数错报 `CommandError` 且不停机；坏配置 / connect 期 config 错报 `error`（可 RESTART）；panic 的 handler / endpoint 触发 `invoke_shutdown` | 全树的错误分支 | — |
 | **FW4** | G-Code 框架收尾（**完成**；`GCodeIO` 暂缓 `[~]`） | G1b（框架部分） | ~~参数访问器、`create_gcode_command`、`run_script_from_command`、`gcode:command_error` 触发~~ ✅；`GCodeIO` 输入抽象（伪 tty / 文件 / `stats gcodein` / `debuginput_exit`）**暂缓 `[~]`**（不做 OctoPrint 串口仿真）；`gcode:request_restart` 触发随 C1 | ~~`create_gcode_command` / 参数访问器~~ ✅；`GCodeIO` 暂缓（见 [FW4 笔记](docs/work-log/2026-09-21-fw4-notes.md)） | 全部 gcode extras（H3、H8…） | FW1、FW3（已满足） |
-| **FW5** | 运动框架（最重，**拆 FW5a–FW5f**） | C1（框架部分）、H12 | **FW5a** `Coord` + `clocksync` 回归；**FW5b** `Move`/`LookAheadQueue`/`trapq`；**FW5c** `itersolve` + `kin_cartesian`；**FW5d** `MotionQueuing`/`ToolHead`/`McuStepper`；**FW5e** `Kinematics` + `cartesian` + `[stepper_*]`/`[printer]` + `G1`；**FW5f** `stepcompress` 完整压缩 | host 单测 → 假 MCU → **真板 `G1`（单轴 → 三轴 + `[extruder]`）→ `G28`（与 FW6/F8 联合）** | `kinematics/*` 其余、H9、H10、input shaper | FW1（已满足） |
-| **FW6** | 资源与触发框架（**FW6a–FW6e ✅（软件）**，FW6f `[~]`） | F3、F8 | **FW6a-1** ✅ 多 MCU 时基与运动输出（`McuClock`/对齐下放到 `McuChip`）；**FW6b** ✅ endstop/trsync/`stepper_stop_on_trigger` 命令层 + `MCU_endstop` + 多实例 `TriggerDispatch`/`MCU_trsync`（含跨 MCU 停轴与共享轴报错）；**FW6c** ✅ `Rail`/`endstop_pin`/`homing_*` + `query_endstops` + `query_endstops/status` + `M119`；**FW6d** ✅ `stepcompress` history/`find_past_position` + stepper 回零句柄；**FW6e** ✅ `Kinematics::home`/`HomingState` + `ToolHead::drip_move` + `G28`（软件）；**FW6f** `[~]` `MCU_bus_digital_out`（能力已由 `queue_digital_out` 提供，包装随 H8 显示） | ✅ FW6c（软件）：一个 endstop + `query_endstops/status`；FW6e（软件）：假 endstop 的 `G28`；次级时钟漂移：模拟 ±100 ppm/1h 已测（误差 <10 ms）；**真板 `M119`/`G28`/实际晶振漂移与电气时序 `[~]` 待条件** | homing/probe、运动同步 `SET_PIN` | FW5 |
+| **FW5** | 运动框架（最重，**拆 FW5a–FW5f**） | C1（框架部分）、H12 | **FW5a** `Coord` + `clocksync` 回归；**FW5b** `Move`/`LookAheadQueue`/`trapq`；**FW5c** `itersolve` + `kin_cartesian`；**FW5d** `MotionQueuing`/`ToolHead`/`McuStepper`；**FW5e** `Kinematics` + `cartesian` + `[stepper_*]`/`[printer]` + `G1`；**FW5f** `stepcompress` 完整压缩 | host 单测 → 假 MCU（验收）；真板三轴 `G1`/`G28` 见 [`TESTING.md`](TESTING.md) T1/T3 | `kinematics/*` 其余、H9、H10、input shaper | FW1（已满足） |
+| **FW6** | 资源与触发框架（**FW6a–FW6e ✅（软件）**，FW6f `[~]`） | F3、F8 | **FW6a-1** ✅ 多 MCU 时基与运动输出（`McuClock`/对齐下放到 `McuChip`）；**FW6b** ✅ endstop/trsync/`stepper_stop_on_trigger` 命令层 + `MCU_endstop` + 多实例 `TriggerDispatch`/`MCU_trsync`（含跨 MCU 停轴与共享轴报错）；**FW6c** ✅ `Rail`/`endstop_pin`/`homing_*` + `query_endstops` + `query_endstops/status` + `M119`；**FW6d** ✅ `stepcompress` history/`find_past_position` + stepper 回零句柄；**FW6e** ✅ `Kinematics::home`/`HomingState` + `ToolHead::drip_move` + `G28`（软件）；**FW6f** `[~]` `MCU_bus_digital_out`（能力已由 `queue_digital_out` 提供，包装随 H8 显示） | ✅ FW6c（软件）：一个 endstop + `query_endstops/status`；FW6e（软件）：假 endstop 的 `G28`；次级时钟漂移：模拟 ±100 ppm/1h 已测（误差 <10 ms）；真板 `M119`/`G28`/实际晶振漂移见 [`TESTING.md`](TESTING.md) T2–T4 | homing/probe、运动同步 `SET_PIN` | FW5 |
 | **FW7** | MCU 与传输框架收尾 | B2、D3 | `emergency_stop` 对象（`klippy:shutdown` → 固件 `emergency_stop`）、本地 shutdown 标志、`emergency_stop` 端点、带载荷错误上报；RTO 定时重传与固件 `reset` 优先未做 | `emergency_stop` 端点使打印机进 shutdown；主机停机向固件发 `emergency_stop`，固件自报停机不回发 | TMC/传感器等资源 | — |
-| **FW8** | 主机层与重启框架 | D1、D2、Q6 | `--logfile`/rollover/Q6、`rpi_usb` 门控、CRC 物理复位、重启后订阅均已完成（代码）；剩 `StartArgs` 其余字段与 `rpi_usb` 真机验证 | `--logfile` 落盘、`error_exit` 非零、重启后订阅不断；真板 `last_stats` 已验 | 日志、Moonraker 兼容 | — |
+| **FW8** | 主机层与重启框架 | D1、D2、Q6 | `--logfile`/rollover/Q6、`rpi_usb` 门控、CRC 物理复位、重启后订阅均已完成（代码）；剩 `StartArgs` 其余字段（`rpi_usb` 真机见 [`TESTING.md`](TESTING.md) T5） | `--logfile` 落盘、`error_exit` 非零、重启后订阅不断；真板 `last_stats` 已验 | 日志、Moonraker 兼容 | — |
 | **FW9** | API 框架收尾 | B4（框架部分） | `register_remote_method` 与推送、mux 端点注册机制、`emergency_stop` 端点 | `register_remote_method` + 推送 | `pause_resume/*`、`*/dump_*` 等消费者 | FW7 |
 
 > **怎么验收**：每个框架都以「最小模块在真机/测试设备上跑通」为准，不以“代码写完”为准。
@@ -37,6 +37,10 @@
 > （endstop/trsync）的接口与 FW5e 联合定，`G28` 的验收跨两者。
 > FW2/FW7/FW8 的剩余点见 FW8（`rpi_usb`/CRC/输出订阅）、B2（`last_stats`/RTO/固件 `reset`）。
 > D2 的真板启动抖动已归档为**非阻塞观察项**（板/USB 链路层，复现不了），不再单独排期。
+
+> **真板验证已单列（不阻塞开发）**：需要真实 MCU / 外设才能做的验证都在
+> [`TESTING.md`](TESTING.md)；主线任务以 **host 单测 + 假 MCU** 验收即算完成，
+> 真板项不再挡「待办 → 已完成」。
 
 > **未决问题里属于框架决策的**：**Q4**（status 形状，FW2）、**Q5**（反射，FW2）、
 > **Q6**（退出语义，FW8）；其余 Q 已解决或属模块。**Q8**（`GCodeIO`）已定为暂缓 `[~]`。
@@ -442,7 +446,7 @@ endstop/trsync（F8）与其余固件资源（F9）。
       `reset_step_clock`/`stepper_stop_on_trigger`。
 - [x] **FW6e** `HomingState` + `ToolHead::drip_move` + `extras/homing.rs`（`Homing`/`HomingMove`/
       `G28`）；`homing:*` 事件触发。**软件**：`Kinematics::home`/`HomingState` + 假 endstop 的
-      `G28` 驱动；真板单轴 `G28` `[~]` 待条件。（本仓库的驱动写作 `extras/toolhead.rs` 的
+      `G28` 驱动；真板单轴 `G28` 见 [`TESTING.md`](TESTING.md) T3。（本仓库的驱动写作 `extras/toolhead.rs` 的
       `home_axes`/`HomingEndstop`，未另开 `extras/homing.rs`）
 - [x] `MCU_endstop`（`klippy/mcu.py:340-407`）：`config_endstop`、`endstop_home`、
       `endstop_query_state`/`endstop_state` 已在 FW6b-1/2 落地（`cmd/endstop.rs` +
@@ -495,7 +499,7 @@ kinematics 已随 Printer 重构删除，从这里重新开始。动工前调查
 | FW5d-1 | ✅ `ToolHead`、`MotionQueuing`、`Stepper`（host 链路） | host 单测（8 个）：`G1` 出正确 `queue_step` |
 | FW5d-2 | ✅ `McuStepper` 资源 + `setup_stepper` + `StepCommand`→MCU 命令转换 | host 单测（3 个）；`[stepper_*]` section 注册与真板读回留 FW5e |
 | FW5e-1 | ✅ `Kinematics` trait + `CartesianKinematics` + `MoveContext`（窄接口）+ ToolHead 集成 | host 单测（8 个） |
-| FW5e-2 | ✅ `[stepper_*]`/`[printer]` section 注册、`G1`/`G0`（`G4`/`M400`/`SET_KINEMATIC_POSITION`）、连接期 `stepper_get_position` 对齐 | host/装载单测；真板读回与 G1 `[~]`（板只知 X 引脚，见 FW5f 记录） |
+| FW5e-2 | ✅ `[stepper_*]`/`[printer]` section 注册、`G1`/`G0`（`G4`/`M400`/`SET_KINEMATIC_POSITION`）、连接期 `stepper_get_position` 对齐 | host/装载单测；真板读回与三轴 `G1` 见 [`TESTING.md`](TESTING.md) T1 |
 | FW5f | ✅ `stepcompress` 完整压缩（`(interval,count,add)`/`max_error`/`check_line`/方向翻转/远步重锚） | 与上游 C 向量对拍 + 重构性质单测；真板 `--task motion`：500 步 → 3 条命令，读回 500 |
 
 细节条目：
@@ -555,7 +559,7 @@ kinematics 已随 Printer 重构删除，从这里重新开始。动工前调查
       → “enable power”，否则 “full reset before config”；`McuObject::connect` 据此
       `request_exit("firmware_restart")` 并中止本次 bring-up，重启循环下一轮
       （`is_firmware_restart()`）才断电、开端口、发配置。**本机没有可控 VBUS 的 hub，
-      只有决策逻辑的单测（`mcu/restart.rs`），没有真机验证。**
+      只有决策逻辑的单测（`mcu/restart.rs`）；真机验证见 [`TESTING.md`](TESTING.md) T5。**
 - [x] **CRC 不匹配改走物理复位**：`reset_firmware` 先看固件有没有 `reset`，有就 `ResetRequired`
       → `reset` + 重连 + 重试握手（真重启，清定时器与步进队列）；只有没有 `reset` 时才
       `config_reset` 就地清。`rpi_usb` 的 CRC 不匹配则由上一项的门先请求 firmware_restart。

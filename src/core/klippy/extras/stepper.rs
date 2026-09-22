@@ -220,16 +220,12 @@ impl PrinterStepper {
                 .map_err(|err| ConfigError::new(format!("{identifier}: {err}")))?;
         }
 
-        // Register with stepper_enable if enable_pin is specified and the
-        // stepper_enable object exists (it may not be present if the config
-        // doesn't include [stepper_enable]).
-        if config.get_str("enable_pin").is_some() {
-            if let Some(stepper_enable) =
-                printer.lookup_object_as::<PrinterStepperEnable>("stepper_enable")
-            {
-                stepper_enable.register_stepper(config, &name)?;
-            }
-        }
+        // Register with stepper_enable. Upstream's `PrinterStepper` loads
+        // `stepper_enable` for every stepper (`klippy/stepper.py:282-285`), so a
+        // config that only writes `enable_pin` still gets the object and its
+        // M18/M84 commands; `ensure` creates it on first use.
+        let stepper_enable = PrinterStepperEnable::ensure(printer);
+        stepper_enable.register_stepper(config, &name)?;
 
         Ok(Self {
             name,

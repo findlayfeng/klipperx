@@ -17,6 +17,7 @@ pub mod output_pin;
 pub mod query_endstops;
 pub mod spi_device;
 pub mod spi_temperature;
+pub mod static_digital_output;
 pub mod stepper;
 pub mod stepper_enable;
 pub mod temperature_combined;

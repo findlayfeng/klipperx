@@ -195,6 +195,141 @@ mod tests {
         );
     }
 
+    /// Every run's **full** gap list, not just its first failure.
+    ///
+    /// `load_config` stops at the first unknown section, so
+    /// [`upstream_test_cases_run`] only ever reports the first gap. This scans
+    /// each run's config for *all* section ids this host does not know and all
+    /// `kinematics:` values it does not implement, so the "one gap away" cases
+    /// and the common prefixes are visible. It is a **report**: it prints the
+    /// matrix and fails only if the corpus is empty. Run it with `--nocapture`:
+    ///
+    /// ```text
+    /// cargo test -p klipperx --lib upstream_gap_report -- --nocapture
+    /// ```
+    #[test]
+    fn upstream_gap_report() {
+        use std::collections::{BTreeMap, BTreeSet};
+
+        let known: BTreeSet<String> = crate::core::klippy::load::known_section_ids()
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let supported_kinematics = ["cartesian", "none"];
+
+        let mut gap_frequency: BTreeMap<String, usize> = BTreeMap::new();
+        let mut one_gap: Vec<String> = Vec::new();
+        let mut scanned = 0usize;
+        for run in all_runs() {
+            let Ok((config, _)) = Config::from_file(&run.config) else {
+                continue;
+            };
+            scanned += 1;
+            let mut gaps: BTreeSet<String> = BTreeSet::new();
+            for section in config.sections() {
+                if section.id == "include" {
+                    continue;
+                }
+                if !known.contains(&section.id) {
+                    gaps.insert(section.identifier());
+                }
+                if section.id == "printer" {
+                    if let Some(kinematics) = section.get_text("kinematics") {
+                        let kinematics = kinematics.trim();
+                        if !supported_kinematics.contains(&kinematics) {
+                            gaps.insert(format!("kinematics: {kinematics}"));
+                        }
+                    }
+                }
+            }
+            for gap in &gaps {
+                *gap_frequency.entry(gap.clone()).or_default() += 1;
+            }
+            if gaps.len() == 1 {
+                let gap = gaps.iter().next().expect("one gap");
+                one_gap.push(format!(
+                    "  {} ({}): {gap}",
+                    run.path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default(),
+                    relative(&run.config)
+                ));
+            }
+        }
+        assert!(scanned > 0, "no upstream runs were scanned");
+
+        let mut common: Vec<(String, usize)> = gap_frequency.into_iter().collect();
+        common.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        one_gap.sort();
+
+        eprintln!("upstream gap report: {scanned} run(s) scanned");
+        eprintln!("common gaps (gap: runs referencing it):");
+        for (gap, count) in common.iter().take(20) {
+            eprintln!("  {count:>4}  {gap}");
+        }
+        eprintln!("runs one static gap away ({}):", one_gap.len());
+        for line in &one_gap {
+            eprintln!("{line}");
+        }
+    }
+
+    /// Guard: an `IGNORED` case that now passes must be removed from the list.
+    ///
+    /// The default run skips `IGNORED` before it tries anything, so a gap that
+    /// gets fixed leaves a stale entry (and a green run that the suite hides).
+    /// This runs every ignored case — its dictionaries permitting — and fails
+    /// when **all** of a file's runs pass, which is the point at which the entry
+    /// should be dropped. `KLIPPERX_UPSTREAM_ALL=1` runs everything and reports
+    /// failures instead, so the guard stands down then.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ignored_cases_still_fail() {
+        if std::env::var_os("KLIPPERX_UPSTREAM_ALL").is_some() {
+            return;
+        }
+        let mut by_file: std::collections::BTreeMap<String, Vec<UpstreamRun>> =
+            std::collections::BTreeMap::new();
+        for run in all_runs() {
+            let file = run
+                .path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            by_file.entry(file).or_default().push(run);
+        }
+
+        let mut stale = Vec::new();
+        for (file, runs) in &by_file {
+            if !IGNORED.contains(&file.as_str()) {
+                continue;
+            }
+            let mut any_runnable = false;
+            let mut all_pass = true;
+            for run in runs {
+                let dictionaries = run_dictionaries(run);
+                if dictionaries.iter().any(|(_, path)| path.is_none()) {
+                    // A run without its dictionary cannot be judged either way.
+                    all_pass = false;
+                    continue;
+                }
+                any_runnable = true;
+                if run_case(run, &dictionaries).await.is_err() {
+                    all_pass = false;
+                    break;
+                }
+            }
+            if any_runnable && all_pass {
+                stale.push(file.clone());
+            }
+        }
+
+        assert!(
+            stale.is_empty(),
+            "{} IGNORED case(s) now pass; remove them from IGNORED: {stale:?}",
+            stale.len()
+        );
+    }
+
     /// Parse the inline g-code of every case with our own g-code parser.
     ///
     /// Pending: a case's g-code is written for the config it names, and most

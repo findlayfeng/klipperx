@@ -211,10 +211,17 @@ impl McuConfig {
         section: &ConfigWrapper,
         serial: bool,
     ) -> Result<McuRestartMethod, ConfigError> {
+        // Read the option even when the transport is not serial: the read is
+        // what marks it valid to the undefined-option check, so a
+        // `restart_method` on a non-serial MCU is warned about (in `new`)
+        // rather than rejected as an unused option. Upstream reads it only for
+        // a serial port; a config whose transport was substituted (the
+        // regression harness's `test:` fake) still names it.
+        let text = section.get_str("restart_method");
         if !serial {
             return Ok(McuRestartMethod::Command);
         }
-        match section.get_str("restart_method") {
+        match text {
             None => Ok(McuRestartMethod::Arduino),
             Some(text) => McuRestartMethod::parse(&text).ok_or_else(|| {
                 ConfigError::new(format!(
@@ -373,8 +380,10 @@ impl Transport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::klippy::config::access::AccessTracking;
     use crate::core::klippy::config::section::ConfigSection;
     use crate::core::klippy::config::value::ConfigValue;
+    use std::sync::Arc;
 
     /// Helper that creates a `[mcu]` section with `serial: /fake/tty`.
     fn make_section(_test_lines: &[&str]) -> ConfigSection {
@@ -463,6 +472,26 @@ mod tests {
         // meaningless there is not an error — it simply does not apply.
         let method = McuConfig::parse_restart_method(&wrap(&section), false).unwrap();
         assert_eq!(method, McuRestartMethod::Command);
+    }
+
+    #[test]
+    fn test_a_non_serial_restart_method_is_recorded_as_read() {
+        // The option is read (and so valid to the undefined-option check) even
+        // when the transport is not serial; it is ignored with a warning rather
+        // than rejected. A substituted transport (the regression harness's
+        // `test:` fake) is the case that needs this.
+        let mut section = make_section(&["01 02"]);
+        section.parameters.insert(
+            "restart_method".to_string(),
+            ConfigValue::Single("command".to_string()),
+        );
+        let access = Arc::new(AccessTracking::new());
+        let wrapper = ConfigWrapper::new(&section, Arc::clone(&access));
+
+        let method = McuConfig::parse_restart_method(&wrapper, false).unwrap();
+
+        assert_eq!(method, McuRestartMethod::Command);
+        assert!(access.contains("mcu", "restart_method"));
     }
 
     #[test]

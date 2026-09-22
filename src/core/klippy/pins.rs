@@ -261,6 +261,19 @@ pub trait PinChip: Send + Sync {
     /// Returns a [`PinError`] if the chip cannot build the resource.
     fn setup_digital_out(&self, params: &PinParams) -> Result<Arc<dyn DigitalOut>, PinError>;
 
+    /// Add a config-time `set_digital_out` for an already-validated pin.
+    ///
+    /// Unlike [`PinChip::setup_digital_out`] this allocates no oid and returns
+    /// no resource: `[static_digital_output]` just holds a pin at a fixed level
+    /// for the session (upstream `static_digital_output.py:12-16`). The default
+    /// refuses, like the other optional resource kinds.
+    ///
+    /// # Errors
+    /// Returns a [`PinError`] if the chip cannot add the command.
+    fn setup_static_digital_out(&self, _params: &PinParams) -> Result<(), PinError> {
+        Err(PinError::Unsupported("digital_out".to_string()))
+    }
+
     /// Build the PWM output for an already-validated pin.
     ///
     /// The default refuses, so a chip that does not implement PWM (a test
@@ -955,6 +968,21 @@ impl PrinterPins {
         )?;
         let chip = self.chip(&params.chip_name)?;
         chip.setup_digital_out(&params)
+    }
+
+    /// Reserve a pin and add a config-time `set_digital_out` for it.
+    ///
+    /// No oid and no resource: the pin is held at a fixed level for the session
+    /// (upstream `static_digital_output.py`). `can_invert` is on the way
+    /// upstream looks the pin up; the level written is the logical 1, so an
+    /// inverted pin gets `0`.
+    ///
+    /// # Errors
+    /// Returns whatever validation reports, or the chip's own error.
+    pub fn setup_static_digital_out(&self, description: &str) -> Result<(), PinError> {
+        let params = self.lookup_pin(description, true, false, None)?;
+        let chip = self.chip(&params.chip_name)?;
+        chip.setup_static_digital_out(&params)
     }
 
     /// Look up a pin and build a PWM output on the chip it names.

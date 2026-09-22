@@ -103,6 +103,16 @@ pub struct Factories {
 // Generated from the `section!` declarations (see the module docs).
 include!(concat!(env!("OUT_DIR"), "/section_factories.rs"));
 
+/// Every section id this host knows, in load order.
+///
+/// For tooling that has to tell "known section" from "gap" without loading a
+/// config (the upstream regression gap report). The list is the generated
+/// [`FACTORIES`] table, so it moves with the `section!` declarations.
+#[cfg(test)]
+pub(crate) fn known_section_ids() -> Vec<&'static str> {
+    FACTORIES.iter().map(|(id, _)| *id).collect()
+}
+
 /// Declare one config section. Expands to nothing; `build.rs` scans it.
 ///
 /// A declaration names the section, an `order`, and the factories it has: a
@@ -330,6 +340,7 @@ mod tests {
                 "thermistor",
                 "board_pins",
                 "temperature_sensor",
+                "static_digital_output",
                 "i2c_device",
                 "spi_device",
                 "printer"
@@ -549,6 +560,7 @@ mod tests {
                 "pins",
                 "error_mcu",
                 "mcu",
+                "stepper_enable",
                 "stepper_x",
                 "stepper_y",
                 "stepper_z",

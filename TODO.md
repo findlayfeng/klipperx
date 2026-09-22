@@ -291,25 +291,32 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 是「对应 `.test` 从 `IGNORED` 移除后通过」**，不是「某个错误不再出现」。详见
 [失败原因分析复盘](docs/work-log/2026-09-22-upstream-regression-failures.md#复盘计数口径与重排后补)。
 
-**阶段 0（都不依赖 C1，先做）**：
+**阶段 0（都不依赖 C1）**：
 
-- [ ] **运行 × 缺口扫描**：`upstream.rs` 测试模块加非致命静态扫描，列出每条运行引用的全部
-      section / `kinematics:` / pin chip 与已实现集合的差集，输出缺口矩阵（找「只差一个缺口」
-      的用例）。
-- [ ] **`IGNORED` 守卫测试**：某条已能通过却仍在 `IGNORED` 里时测试失败并提示移除，防止条目
-      漂移。
-- [ ] **T8** `output_pin` 的 `value` 上界与 `scale` 选项（6 次失败）。
-- [ ] **T9 小段**：`restart_method` 加进 `[mcu]` 的选项白名单、`static_digital_output` /
-      `pwm_cycle_time` 段工厂。
-- [ ] **T2 收尾**：自动装载 `stepper_enable`（上游 `stepper.py` 对每个 stepper 调
-      `load_object('stepper_enable')`）+ 注册 `M18`/`M84`/`SET_STEPPER_ENABLE`。
+- [x] **运行 × 缺口扫描**：`upstream_gap_report`（`upstream.rs`）静态扫描每条运行引用的全部
+      section 与 `kinematics:`，打印缺口矩阵。实跑显示真正的公共前缀是 `extruder`（**231** 条
+      运行引用它，而非「首次失败」的 102），印证了按工作队列排期的误导性。用
+      `cargo test -p klipperx --lib upstream_gap_report -- --nocapture` 查看。
+- [x] **`IGNORED` 守卫测试**：`ignored_cases_still_fail`——某个 `IGNORED` 文件的全部可跑运行都
+      通过时报失败并提示移除；`KLIPPERX_UPSTREAM_ALL=1` 时不生效（那时本就是要跑全部）。
+- [x] **T8** `output_pin` 的 `value` 上界与 `scale` 选项（6 次失败）：`scale` 只在 PWM 路径读
+      （`output_pin.py:207-214`），`value`/`shutdown_value` 上界改为 `scale` 并存成除以
+      `scale` 的值；`SET_PIN VALUE` 同样按 `scale` 检查。
+- [x] **T9 小段**：`restart_method` 在非串口 MCU 上也读一次（记录为已用，只警告不拒绝，修掉
+      `Option 'restart_method' is not valid in section 'mcu'`）；新增 `static_digital_output`
+      段（`set_digital_out` 命令 + `PinChip::setup_static_digital_out`）。
+      **`pwm_cycle_time` 移出**：它需要 `toolhead.register_lookahead_callback` 的 print-time 调度
+      与 `[pwm_tool]`，`pwm.test` 靠它无法转绿，随 **C1**。
+- [x] **T2 收尾**：自动装载 `stepper_enable`（`PrinterStepperEnable::ensure`，上游
+      `stepper.py:282-285` 对每个 stepper 调 `load_object('stepper_enable')`）+ 注册
+      `M18`/`M84`/`SET_STEPPER_ENABLE`，M18/M84 与 `gcode:request_restart` 都走 `motor_off`
+      并发 `stepper_enable:motor_off`。
 
 按「闭包最小 → 杠杆最大」推进（T1 之后）：
 
-- [x] **T2. `[stepper_enable]`（`enable_pin`）**：`enable_pin` 选项已读取（因此不再报
-      `Option 'enable_pin' is not valid`），但**落地不完整**：没有自动装载 `stepper_enable`
-      （上游 `stepper.py` 对每个 stepper 调 `load_object('stepper_enable')`），也没有注册
-      M18/M84/SET_STEPPER_ENABLE。相关配置的首次失败因此前移到了 extruder/probe，仍留在忽略列表。
+- [x] **T2. `[stepper_enable]`（`enable_pin`）**：✅ 已完成（阶段 0）。`enable_pin` 选项已读取，
+      自动装载、`M18`/`M84`/`SET_STEPPER_ENABLE` 与 `stepper_enable:motor_off` 事件均已就位；
+      相关配置的首次失败因此前移到了 extruder/probe，仍留在忽略列表（要它转绿还需那些段）。
 - [x] **T7. 温度传感器**：✅ 已完成。`temperature_mcu` 真正读 ADC（真板 STM32F103 ~35 °C），
       `AdcTemperatureBridge` 接上 `Arc<dyn Adc>`，`[thermistor <name>]` / `[adc_temperature <name>]`
       段与 8 个内置热敏电阻就位，新增 `spi_temperature`（MAX6675/31855/31856/31865）与
@@ -348,13 +355,12 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
       `tmc2209 stepper_x`（13）、`tmc2208 stepper_x`（3）、`tmc5160 stepper_x`（2）、
       `tmc2130 stepper_x`（2）、`tmc2660 stepper_x`（1）。依赖 H5（TMC）。
 - [x] **T7. 温度传感器**（0 次失败）：✅ 已完成（见上）。
-- [ ] **T8. `output_pin` 的 `value` 选项**（6 次失败）：`output_pin stepper_xy_current` 的
-      `value` 超过最大值 1（5），以及 `output_pin motor_x_pwm` 的 `scale` 不识别（1）。
-      依赖 H2（风扇与通用输出）。
+- [x] **T8. `output_pin` 的 `value` 选项**（6 次失败）：✅ 已完成（阶段 0）。`value` 上界改为
+      `scale`（PWM 才有 `scale`，默认 1），`scale` 不识别的问题随之消失。
 - [ ] **T9. 其余 extras 段**（20 次）：`bed_screws`、`dual_carriage`、`safe_z_home`、
-      `endstop_phase`、`adc_scaled`、`static_digital_output`、`pwm_cycle_time`、`led`、
-      `manual_stepper`、`display`、`replicape`、`gcode_arcs`、`virtual_sdcard`、`stepper_z1`（多轴）。
-      按域归入 H1–H10。
+      `endstop_phase`、`adc_scaled`、`pwm_cycle_time`（随 C1）、`led`、`manual_stepper`、
+      `display`、`replicape`、`gcode_arcs`、`virtual_sdcard`、`stepper_z1`（多轴）。
+      按域归入 H1–H10。`static_digital_output` 已在阶段 0 落地（仍因后续缺节留在忽略列表）。
 - 备注：`printers.test` 有 2 条运行声明 `DICTIONARY pru.dict host=linuxprocess.dict`，默认不构建
       `pru`；要跑需 `KLIPPERX_ARCHES=…,pru`（需 `pru-gcc`）。
 

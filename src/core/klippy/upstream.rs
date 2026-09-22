@@ -231,7 +231,13 @@ mod tests {
                     continue;
                 }
                 if !known.contains(&section.id) {
-                    gaps.insert(section.identifier());
+                    // A numbered sibling (`[stepper_z1]`) is read by its base
+                    // section's owner, not by a factory of its own
+                    // (`LookupMultiRail`); treat `<known><digits>` as known.
+                    let base = section.id.trim_end_matches(|c: char| c.is_ascii_digit());
+                    if base == section.id || !known.contains(base) {
+                        gaps.insert(section.identifier());
+                    }
                 }
                 if section.id == "printer" {
                     if let Some(kinematics) = section.get_text("kinematics") {

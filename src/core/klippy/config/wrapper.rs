@@ -22,6 +22,7 @@ use serde_json::{json, Value};
 use crate::core::klippy::config::access::AccessTracking;
 use crate::core::klippy::config::object::PrinterConfig;
 use crate::core::klippy::config::section::{split_list, ConfigSection};
+use crate::core::klippy::config::Config;
 use crate::core::klippy::error::ConfigError;
 
 /// A config section, read through the tracking that validates it.
@@ -40,6 +41,10 @@ pub struct ConfigWrapper<'a> {
     /// warning on it. Absent for a wrapper built outside the loader (tests, and
     /// parts that read a stored section without recording warnings).
     configfile: Option<Arc<PrinterConfig>>,
+    /// The whole config, for [`ConfigWrapper::sibling`]. Only the loader sets
+    /// it: a part that stored its section reads it later through
+    /// [`ConfigWrapper::with_configfile`], which has no config to offer.
+    config: Option<&'a Config>,
 }
 
 impl<'a> ConfigWrapper<'a> {
@@ -49,6 +54,24 @@ impl<'a> ConfigWrapper<'a> {
             section,
             access,
             configfile: None,
+            config: None,
+        }
+    }
+
+    /// Wrap `section` with the whole `config`, so [`ConfigWrapper::sibling`]
+    /// can read a section that has no factory of its own (a `[stepper_z1]` read
+    /// by the rail that owns `[stepper_z]`).
+    pub fn with_config(
+        section: &'a ConfigSection,
+        access: Arc<AccessTracking>,
+        configfile: Option<Arc<PrinterConfig>>,
+        config: &'a Config,
+    ) -> Self {
+        Self {
+            section,
+            access,
+            configfile,
+            config: Some(config),
         }
     }
 
@@ -63,6 +86,7 @@ impl<'a> ConfigWrapper<'a> {
             section,
             access,
             configfile: Some(configfile),
+            config: None,
         }
     }
 
@@ -83,6 +107,35 @@ impl<'a> ConfigWrapper<'a> {
     /// The section's identifier, e.g. `mcu zboard` or `output_pin fan`.
     pub fn identifier(&self) -> String {
         self.section.identifier()
+    }
+
+    /// A sibling section, read through the same access tracker.
+    ///
+    /// The loader hands a factory its own section only; a part that owns other
+    /// sections (`[stepper_z]` owning `[stepper_z1]`, `[printer]` reading the
+    /// rails) reaches them here, as upstream's `ConfigWrapper.getsection` does.
+    /// The sibling's options are recorded when they are read, which is what
+    /// makes a section with no factory of its own valid to `check_unused`.
+    ///
+    /// `None` when the section does not exist, or when this wrapper was built
+    /// without the whole config (an untracked test wrapper, or a part reading a
+    /// stored section back).
+    pub fn sibling(&self, identifier: &str) -> Option<ConfigWrapper<'a>> {
+        let config = self.config?;
+        let section = config.get_section(identifier)?;
+        Some(ConfigWrapper {
+            section,
+            access: Arc::clone(&self.access),
+            configfile: self.configfile.clone(),
+            config: self.config,
+        })
+    }
+
+    /// Whether a sibling section exists. Reads nothing, records nothing.
+    pub fn has_sibling(&self, identifier: &str) -> bool {
+        self.config
+            .map(|config| config.has_section(identifier))
+            .unwrap_or(false)
     }
 
     /// The shared access record, for a part that wants to keep reading later.

@@ -62,13 +62,14 @@ use crate::core::klippy::config::{ConfigError, ConfigWrapper};
 use crate::core::klippy::error::KlippyError;
 use crate::core::klippy::event::KlippyEvent;
 use crate::core::klippy::extras::query_endstops::{QueryEndstops, QUERY_ENDSTOPS_OBJECT};
-use crate::core::klippy::extras::stepper::{PrinterStepper, RailParams};
+use crate::core::klippy::extras::stepper::{Rail, RailParams};
 use crate::core::klippy::gcode::{
     CommandError, CommandHandler, GCodeDispatch, GcodeCommand, GCODE_OBJECT,
 };
 use crate::core::klippy::load::section;
 use crate::core::klippy::mathutil::{Coord, X_AXIS, Y_AXIS, Z_AXIS};
 use crate::core::klippy::mcu::{Completion, McuEndstop, McuError, McuObject, McuStepper};
+use crate::core::klippy::motion::itersolve::{cartesian_active_flags, cartesian_position_fn, Axis};
 use crate::core::klippy::motion::kinematics::{home_move, CartesianKinematics, NoneKinematics};
 use crate::core::klippy::motion::plan::MoveLimits;
 use crate::core::klippy::motion::stepcompress::{StepCommand, StepCompressError};
@@ -101,10 +102,11 @@ pub struct ToolHeadObject {
     limits: MoveLimits,
     max_z_velocity: f64,
     max_z_accel: f64,
-    /// The cartesian rail sections, `[stepper_x]`, `[stepper_y]`, `[stepper_z]`.
+    /// The cartesian rails, `[stepper_x]`, `[stepper_y]`, `[stepper_z]` (each
+    /// with its `…1`, `…2` siblings).
     ///
     /// Empty for `kinematics: none`, which has no steppers.
-    axes: Vec<Arc<PrinterStepper>>,
+    rails: Vec<Arc<Rail>>,
     /// Whether `[printer] kinematics` was `none`.
     none: bool,
     /// The machine's clock, for seeding the print-time mapping.
@@ -136,7 +138,6 @@ impl ToolHeadObject {
     /// Returns a config error for a missing or unsupported `kinematics`, a
     /// missing velocity limit, or a missing `[stepper_x/y/z]`.
     pub fn new(config: &ConfigWrapper, printer: &Arc<Printer>) -> Result<Self, ConfigError> {
-        let identifier = config.identifier();
         let kinematics = config.get("kinematics", None)?;
         let none = match kinematics.as_str() {
             "cartesian" => false,
@@ -196,17 +197,25 @@ impl ToolHeadObject {
             mcr_pseudo_accel: max_accel * (1.0 - min_cruise_ratio),
         };
 
-        let mut axes = Vec::new();
+        let mut rails = Vec::new();
         if !none {
-            for name in ["stepper_x", "stepper_y", "stepper_z"] {
-                let stepper = printer
-                    .lookup_object_as::<PrinterStepper>(name)
-                    .ok_or_else(|| {
-                        ConfigError::new(format!(
-                            "Section '{identifier}' needs a '[{name}]' section for cartesian kinematics"
-                        ))
-                    })?;
-                axes.push(stepper);
+            for (name, axis) in [
+                ("stepper_x", Axis::X),
+                ("stepper_y", Axis::Y),
+                ("stepper_z", Axis::Z),
+            ] {
+                rails.push(Rail::lookup(config, printer, name, axis)?);
+            }
+            // The owning kinematics installs each stepper's solver
+            // (`MCU_stepper.setup_itersolve`); cartesian passes the matching
+            // axis function, so a `[stepper_z1]` on the Z rail reads Z too.
+            for (axis, rail) in [Axis::X, Axis::Y, Axis::Z].iter().zip(&rails) {
+                for stepper in rail.steppers() {
+                    stepper.setup_itersolve(
+                        cartesian_position_fn(*axis),
+                        cartesian_active_flags(*axis),
+                    );
+                }
             }
         }
 
@@ -214,9 +223,11 @@ impl ToolHeadObject {
         // because this is the first point where all the `[stepper_*]` sections
         // (and their endstops) exist; registered before `toolhead` itself.
         let query = QueryEndstops::new(printer)?;
-        for stepper in &axes {
-            if let Some(endstop) = stepper.endstop() {
-                query.register_endstop(Arc::clone(endstop), stepper.name());
+        for rail in &rails {
+            for stepper in rail.steppers() {
+                if let Some(endstop) = stepper.endstop() {
+                    query.register_endstop(Arc::clone(endstop), stepper.name());
+                }
             }
         }
         printer.add_object(QUERY_ENDSTOPS_OBJECT, Arc::new(query))?;
@@ -226,7 +237,7 @@ impl ToolHeadObject {
             limits,
             max_z_velocity,
             max_z_accel,
-            axes,
+            rails,
             none,
             reactor: printer.reactor(),
             printer: Arc::downgrade(printer),
@@ -278,9 +289,9 @@ impl ToolHeadObject {
             .map_err(ConfigError::new)?;
         let home_handler: CommandHandler = {
             let state = Arc::clone(&self.state);
-            let axes = self.axes.clone();
+            let rails = self.rails.clone();
             let printer = Arc::downgrade(printer);
-            Arc::new(move |gcmd| cmd_g28(&state, &axes, &printer, gcmd))
+            Arc::new(move |gcmd| cmd_g28(&state, &rails, &printer, gcmd))
         };
         gcode
             .register_command("G28", home_handler, Some("Home one or more axes"), false)
@@ -291,9 +302,9 @@ impl ToolHeadObject {
     /// The names of the three rails, in axis order.
     fn axis_names(&self) -> [String; 3] {
         [
-            self.axes[0].name().to_string(),
-            self.axes[1].name().to_string(),
-            self.axes[2].name().to_string(),
+            self.rails[0].name().to_string(),
+            self.rails[1].name().to_string(),
+            self.rails[2].name().to_string(),
         ]
     }
 }
@@ -329,17 +340,19 @@ impl PrinterObject for ToolHeadObject {
             // which runs before this one (generic sections before the late
             // walk). Take them now, along with the firmware resources and the
             // MCU each axis lives on.
-            let mut host_steppers = Vec::with_capacity(3);
+            let mut host_steppers = Vec::new();
             let mut mcu_steppers = HashMap::new();
-            for stepper in &self.axes {
-                let host = stepper
-                    .take_stepper()
-                    .ok_or_else(|| config_error(format!("{} is not connected", stepper.name())))?;
-                host_steppers.push(host);
-                mcu_steppers.insert(
-                    stepper.name().to_string(),
-                    Arc::clone(stepper.mcu_stepper()),
-                );
+            for rail in &self.rails {
+                for stepper in rail.steppers() {
+                    let host = stepper.take_stepper().ok_or_else(|| {
+                        config_error(format!("{} is not connected", stepper.name()))
+                    })?;
+                    host_steppers.push(host);
+                    mcu_steppers.insert(
+                        stepper.name().to_string(),
+                        Arc::clone(stepper.mcu_stepper()),
+                    );
+                }
             }
 
             // The primary MCU (the bare `[mcu]`) defines the print-time origin;
@@ -363,15 +376,15 @@ impl PrinterObject for ToolHeadObject {
                 toolhead.set_kinematics(Box::new(CartesianKinematics::new(
                     self.axis_names(),
                     Coord::new(
-                        self.axes[X_AXIS].params().position_min,
-                        self.axes[Y_AXIS].params().position_min,
-                        self.axes[Z_AXIS].params().position_min,
+                        self.rails[X_AXIS].params().position_min,
+                        self.rails[Y_AXIS].params().position_min,
+                        self.rails[Z_AXIS].params().position_min,
                         0.0,
                     ),
                     Coord::new(
-                        self.axes[X_AXIS].params().position_max,
-                        self.axes[Y_AXIS].params().position_max,
-                        self.axes[Z_AXIS].params().position_max,
+                        self.rails[X_AXIS].params().position_max,
+                        self.rails[Y_AXIS].params().position_max,
+                        self.rails[Z_AXIS].params().position_max,
                         0.0,
                     ),
                     self.max_z_velocity,
@@ -654,16 +667,16 @@ fn move_distance(a: Coord, b: Coord) -> f64 {
 /// A missing endstop, a kinematics refusal, or a failed query/send.
 async fn home_axes(
     connected: &mut Connected,
-    axes: &[Arc<PrinterStepper>],
+    rails: &[Arc<Rail>],
     requested: &[usize],
     printer: &Weak<Printer>,
 ) -> Result<(), CommandError> {
     // `kinematics: none` has no rails, so there is nothing to home.
-    if axes.is_empty() {
+    if rails.is_empty() {
         return Ok(());
     }
     for &axis in requested {
-        let rail = &axes[axis];
+        let rail = &rails[axis];
         let endstop = rail.endstop().ok_or_else(|| {
             CommandError::new(format!("No endstop configured for {}", rail.name()))
         })?;
@@ -890,7 +903,7 @@ fn axis_indices(names: &str) -> Vec<usize> {
 /// back afterwards. The background flush task sees an empty slot and stands back.
 fn cmd_g28(
     state: &Arc<Mutex<Option<Connected>>>,
-    axes: &[Arc<PrinterStepper>],
+    rails: &[Arc<Rail>],
     _printer: &Weak<Printer>,
     gcmd: &GcodeCommand,
 ) -> Result<(), CommandError> {
@@ -914,7 +927,7 @@ fn cmd_g28(
     let handle = tokio::runtime::Handle::try_current()
         .map_err(|_| CommandError::new("G28 needs the async runtime"))?;
     let result = tokio::task::block_in_place(|| {
-        handle.block_on(home_axes(&mut connected, axes, &requested, _printer))
+        handle.block_on(home_axes(&mut connected, rails, &requested, _printer))
     });
     *guard = Some(connected);
     result
@@ -1018,6 +1031,36 @@ mod tests {
         // `none` has no `[stepper_*]` sections; the object is enough on its own.
         ToolHeadObject::new(&ConfigWrapper::untracked(&section), &printer)
             .expect("kinematics: none builds without steppers");
+    }
+
+    #[test]
+    fn test_a_stepper_z1_joins_the_z_rail() {
+        // `[stepper_z1]` has no factory of its own; the Z rail reads it through
+        // `[stepper_z]`'s wrapper (upstream's `LookupMultiRail`).
+        use crate::core::klippy::config::Config;
+        use crate::core::klippy::reactor::ManualReactor;
+
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        let (config, _) = Config::from_text(
+            "[mcu]\nserial: /dev/not-opened-yet\n\
+             [stepper_x]\nstep_pin: PA0\ndir_pin: PA1\nrotation_distance: 40\nmicrosteps: 16\nposition_max: 200\n\
+             [stepper_y]\nstep_pin: PA2\ndir_pin: PA3\nrotation_distance: 40\nmicrosteps: 16\nposition_max: 200\n\
+             [stepper_z]\nstep_pin: PA4\ndir_pin: PA5\nrotation_distance: 8\nmicrosteps: 16\nposition_max: 200\n\
+             [stepper_z1]\nstep_pin: PA6\ndir_pin: PA7\nrotation_distance: 8\nmicrosteps: 16\n\
+             [printer]\nkinematics: cartesian\nmax_velocity: 300\nmax_accel: 3000\n",
+        )
+        .expect("the config parses");
+        printer.load_config(&config).expect("the config loads");
+
+        let object = printer
+            .lookup_object_as::<ToolHeadObject>("toolhead")
+            .expect("the toolhead is registered");
+        assert_eq!(object.rails.len(), 3);
+        assert_eq!(object.rails[Z_AXIS].steppers().len(), 2);
+        assert_eq!(object.rails[Z_AXIS].steppers()[1].name(), "stepper_z1");
+        // The sibling is registered (so its connect runs) and its options were
+        // read, which is what makes the factory-less section valid.
+        assert!(printer.lookup_object("stepper_z1").is_some());
     }
 
     #[test]

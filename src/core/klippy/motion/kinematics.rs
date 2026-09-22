@@ -67,7 +67,7 @@ impl<'a> MoveContext<'a> {
 /// which the kinematics reads to compute a homing move's endpoints. It lives
 /// here rather than beside the rail so the homing protocol below does not have
 /// to reach up into the extras.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct HomingInfo {
     /// The speed of the first homing move, mm/s.
     pub speed: f64,

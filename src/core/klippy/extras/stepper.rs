@@ -46,6 +46,9 @@ use crate::core::klippy::extras::stepper_enable::PrinterStepperEnable;
 use crate::core::klippy::load::section;
 use crate::core::klippy::mathutil::{X_AXIS, Y_AXIS, Z_AXIS};
 use crate::core::klippy::mcu::{McuEndstop, McuStepper};
+use crate::core::klippy::motion::itersolve::{
+    cartesian_active_flags, cartesian_position_fn, AxisFlags, PositionFn,
+};
 use crate::core::klippy::motion::{Axis, HomingInfo, Stepper};
 use crate::core::klippy::pins::{PrinterPins, PINS_OBJECT};
 use crate::core::klippy::printer::{ConnectFuture, Printer, PrinterObject};
@@ -71,7 +74,7 @@ const POSITION_TIMEOUT: Duration = Duration::from_secs(1);
 /// The subset of upstream's `GenericPrinterRail` the cartesian kinematics needs
 /// today: the travel limits. The homing fields (`position_endstop` and the
 /// speeds) are parsed and kept for FW6.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct RailParams {
     /// Minimum axis position.
     pub position_min: f64,
@@ -79,6 +82,17 @@ pub struct RailParams {
     pub position_max: f64,
     /// Where the endstop trips, used by homing (FW6).
     pub position_endstop: f64,
+}
+
+/// The solver a stepper's owning rail installs
+/// (`MCU_stepper.setup_itersolve`, `klippy/stepper.py:74`): the position
+/// function the solver evaluates and the axes it moves.
+#[derive(Debug, Clone, Copy)]
+pub struct SolverSpec {
+    /// Where the stepper is `t` seconds into a segment, in millimetres.
+    pub position: PositionFn,
+    /// Which of the trapq's axes this stepper follows.
+    pub active_flags: AxisFlags,
 }
 
 /// One configured `[stepper_x]` / `[stepper_y]` / `[stepper_z]`.
@@ -104,6 +118,10 @@ pub struct PrinterStepper {
     /// The toolhead's connect takes it out and owns it from then on, so this is
     /// `None` after the machine is up.
     inner: Mutex<Option<Stepper>>,
+    /// The solver function the owning rail installed at load
+    /// (`setup_itersolve`). The stepper no longer decides this from its name:
+    /// an extruder or a delta stepper reads the same trapq differently.
+    solver: Mutex<Option<SolverSpec>>,
 }
 
 impl PrinterStepper {
@@ -113,10 +131,14 @@ impl PrinterStepper {
     /// # Errors
     /// Returns a config error naming the section when an option is missing,
     /// malformed, out of range, or names a pin the `pins` layer refuses.
-    pub fn new(config: &ConfigWrapper, printer: &Arc<Printer>) -> Result<Self, ConfigError> {
+    pub fn new(
+        config: &ConfigWrapper,
+        printer: &Arc<Printer>,
+        axis: Axis,
+        geometry: bool,
+    ) -> Result<Self, ConfigError> {
         let identifier = config.identifier();
         let name = config.section().id.clone();
-        let axis = axis_from_name(&identifier)?;
 
         let step_pin = config.get("step_pin", None)?;
         let dir_pin = config.get("dir_pin", None)?;
@@ -163,31 +185,50 @@ impl PrinterStepper {
             None,
         )?;
 
-        let position_min = config.get_float("position_min", Some(0.0))?;
-        let position_max =
-            config.get_float_bounded("position_max", None, None, None, Some(position_min), None)?;
-        let position_endstop = config.get_float("position_endstop", Some(position_min))?;
-        if position_endstop < position_min || position_endstop > position_max {
-            return Err(ConfigError::new(format!(
-                "position_endstop in section '{identifier}' must be between position_min and position_max"
-            )));
-        }
-
         // `rotation_distance` is millimetres per full rotation; the divisor is
         // full steps times microsteps times any gearing
         // (`parse_step_distance`, `klippy/stepper.py:307-323`).
         let step_dist = rotation_distance / (full_steps as f64 * microsteps as f64 * gear_ratio);
 
-        // Homing parameters and the endstop. `endstop_pin` is optional here:
-        // a `[stepper_*]` with no endstop still loads (upstream requires it for
-        // a cartesian rail; `G28` will report the missing endstop instead).
-        let homing = read_homing_info(
-            config,
-            &identifier,
-            position_min,
-            position_max,
-            position_endstop,
-        )?;
+        // The rail geometry (`position_min/max`, `position_endstop`, the homing
+        // speeds) belongs to the rail's **primary** section. A numbered sibling
+        // (`[stepper_z1]`) is a bare motor: `LookupMultiRail` adds it to the
+        // primary's rail without reading any of this
+        // (`klippy/stepper.py:327-360`, `:455-462`).
+        let (params, homing) = if geometry {
+            let position_min = config.get_float("position_min", Some(0.0))?;
+            let position_max = config.get_float_bounded(
+                "position_max",
+                None,
+                None,
+                None,
+                Some(position_min),
+                None,
+            )?;
+            let position_endstop = config.get_float("position_endstop", Some(position_min))?;
+            if position_endstop < position_min || position_endstop > position_max {
+                return Err(ConfigError::new(format!(
+                    "position_endstop in section '{identifier}' must be between position_min and position_max"
+                )));
+            }
+            let homing = read_homing_info(
+                config,
+                &identifier,
+                position_min,
+                position_max,
+                position_endstop,
+            )?;
+            (
+                RailParams {
+                    position_min,
+                    position_max,
+                    position_endstop,
+                },
+                homing,
+            )
+        } else {
+            (RailParams::default(), HomingInfo::default())
+        };
 
         let pins = printer
             .lookup_object_as::<PrinterPins>(PINS_OBJECT)
@@ -231,16 +272,13 @@ impl PrinterStepper {
             name,
             axis,
             step_dist,
-            params: RailParams {
-                position_min,
-                position_max,
-                position_endstop,
-            },
+            params,
             mcu_stepper,
             endstop,
             homing,
             printer: Arc::downgrade(printer),
             inner: Mutex::new(None),
+            solver: Mutex::new(None),
         })
     }
 
@@ -252,6 +290,22 @@ impl PrinterStepper {
     /// The axis this stepper drives.
     pub fn axis(&self) -> Axis {
         self.axis
+    }
+
+    /// Install the solver the owning rail wants this stepper to run
+    /// (`MCU_stepper.setup_itersolve`, `klippy/stepper.py:74`).
+    ///
+    /// Called at load by the rail / kinematics that owns the stepper. Without
+    /// it [`PrinterStepper::connect`] falls back to the cartesian axis its name
+    /// implies, which keeps a standalone `[stepper_x]` working.
+    pub fn setup_itersolve(&self, position: PositionFn, active_flags: AxisFlags) {
+        *self
+            .solver
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(SolverSpec {
+            position,
+            active_flags,
+        });
     }
 
     /// Millimetres per step.
@@ -341,11 +395,21 @@ impl PrinterObject for PrinterStepper {
                 .oid()
                 .map_err(|err| config_error(err.to_string()))?;
 
-            let mut stepper = Stepper::cartesian(
+            let solver = *self
+                .solver
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .as_ref()
+                .unwrap_or(&SolverSpec {
+                    position: cartesian_position_fn(self.axis),
+                    active_flags: cartesian_active_flags(self.axis),
+                });
+            let mut stepper = Stepper::new(
                 self.name.clone(),
                 u32::from(oid),
                 self.step_dist,
-                self.axis,
+                solver.position,
+                solver.active_flags,
                 freq,
             );
             // Read the board's step counter and align the solver with it, as
@@ -389,12 +453,120 @@ impl std::fmt::Debug for PrinterStepper {
     }
 }
 
+/// One axis' rail: its steppers, and the range/homing info the kinematics
+/// reads.
+///
+/// Upstream's `GenericPrinterRail` (`klippy/stepper.py:326`) as a multi-stepper
+/// group (`LookupMultiRail`, `:455`). The primary section (`[stepper_z]`) has a
+/// factory of its own; its numbered siblings (`[stepper_z1]`, `[stepper_z2]`…)
+/// do not, so they are read here through the primary's wrapper and registered as
+/// steppers too — their options are recorded as they are read, which is what
+/// makes a section with no factory valid to the undefined-option check, exactly
+/// as upstream's `config.getsection` does.
+///
+/// The range and homing info come from the **primary** stepper, as upstream's
+/// `get_range`/`get_homing_info` read the rail's own (`[stepper_z]`) values.
+/// Homing all steppers of a multi-stepper rail from one endstop is the
+/// `endstop_phase`/trsync refinement (H9); this group only drives them.
+pub struct Rail {
+    /// The base section name (`stepper_z`).
+    name: String,
+    /// The primary first, then `stepper_z1`, `stepper_z2`… in order.
+    steppers: Vec<Arc<PrinterStepper>>,
+}
+
+impl Rail {
+    /// Build the rail named by `base_id`, reading numbered siblings until one is
+    /// missing (`LookupMultiRail`).
+    ///
+    /// `config` is the primary section's wrapper; it carries the whole config,
+    /// so the siblings can be read. Each sibling is built with the same `axis`
+    /// as the primary (`stepper_z1` is still the Z axis).
+    ///
+    /// # Errors
+    /// Returns the primary's config error, or the first sibling's.
+    pub fn lookup(
+        config: &ConfigWrapper,
+        printer: &Arc<Printer>,
+        base_id: &str,
+        axis: Axis,
+    ) -> Result<Arc<Self>, ConfigError> {
+        let primary = printer
+            .lookup_object_as::<PrinterStepper>(base_id)
+            .ok_or_else(|| {
+                ConfigError::new(format!(
+                    "Section '{}' needs a '[{base_id}]' section",
+                    config.identifier()
+                ))
+            })?;
+        let mut steppers = vec![primary];
+        for index in 1..99 {
+            let identifier = format!("{base_id}{index}");
+            let Some(sibling) = config.sibling(&identifier) else {
+                break;
+            };
+            let stepper = Arc::new(PrinterStepper::new(&sibling, printer, axis, false)?);
+            printer.add_object(&identifier, stepper.clone())?;
+            steppers.push(stepper);
+        }
+        Ok(Arc::new(Self {
+            name: base_id.to_string(),
+            steppers,
+        }))
+    }
+
+    /// The base section name (`stepper_z`).
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The first (primary) stepper; its values are the rail's.
+    pub fn primary(&self) -> &Arc<PrinterStepper> {
+        &self.steppers[0]
+    }
+
+    /// Every stepper on the rail, primary first.
+    pub fn steppers(&self) -> &[Arc<PrinterStepper>] {
+        &self.steppers
+    }
+
+    /// The primary's travel range.
+    pub fn params(&self) -> RailParams {
+        self.primary().params()
+    }
+
+    /// The primary's homing parameters.
+    pub fn homing_info(&self) -> HomingInfo {
+        self.primary().homing_info()
+    }
+
+    /// The primary's endstop.
+    pub fn endstop(&self) -> Option<&Arc<McuEndstop>> {
+        self.primary().endstop()
+    }
+
+    /// The primary's millimetres per step.
+    pub fn step_dist(&self) -> f64 {
+        self.primary().step_dist()
+    }
+}
+
+impl std::fmt::Debug for Rail {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Rail")
+            .field("name", &self.name)
+            .field("steppers", &self.steppers.len())
+            .finish()
+    }
+}
+
 /// The factory the three section declarations name.
 pub(crate) fn load_config(
     config: &ConfigWrapper,
     printer: &Arc<Printer>,
 ) -> Result<Arc<dyn PrinterObject>, ConfigError> {
-    Ok(Arc::new(PrinterStepper::new(config, printer)?))
+    let axis = axis_from_name(&config.identifier())?;
+    Ok(Arc::new(PrinterStepper::new(config, printer, axis, true)?))
 }
 
 /// Parse the homing parameters of a `[stepper_*]` rail

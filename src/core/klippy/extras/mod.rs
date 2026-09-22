@@ -11,6 +11,7 @@ pub mod board_pins;
 pub(crate) mod bus_debug;
 pub mod ds18b20;
 pub mod error_mcu;
+pub mod extruder;
 pub mod heaters;
 pub mod i2c_device;
 pub mod output_pin;

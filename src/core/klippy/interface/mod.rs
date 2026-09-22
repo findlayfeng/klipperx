@@ -8,6 +8,8 @@ pub use devices::canserial::CanSerialDevice;
 pub use devices::host::HostDevice;
 pub use devices::serial::SerialDevice;
 #[cfg(test)]
+pub use devices::simulator::SimulatorDevice;
+#[cfg(test)]
 pub use devices::test::{MappingEntry, TestDevice};
 pub use error::InterfaceError;
 
@@ -54,6 +56,8 @@ pub struct Interface {
 /// - `Host(HostDevice)` — klipper's host library, loaded from a shared object
 ///   (`host_library:`)
 /// - `Test(TestDevice)` — a scripted device, in test builds (`test:`)
+/// - `Simulator(SimulatorDevice)` — a dictionary-driven fake MCU, in test builds
+///   (`test:` with `dict=`)
 ///
 /// There is no "configured nothing" variant on purpose: a section that names no
 /// transport is reported when it is parsed, rather than turned into an interface
@@ -65,6 +69,8 @@ enum Transport {
     Host(Arc<HostDevice>),
     #[cfg(test)]
     Test(Arc<TestDevice>),
+    #[cfg(test)]
+    Simulator(Arc<SimulatorDevice>),
 }
 
 impl Interface {
@@ -92,6 +98,12 @@ impl Interface {
     #[cfg(test)]
     pub fn new(device: TestDevice) -> Self {
         Self::with_transport(Transport::Test(Arc::new(device)))
+    }
+
+    /// Create an interface over a dictionary-driven fake MCU.
+    #[cfg(test)]
+    pub fn simulator(device: SimulatorDevice) -> Self {
+        Self::with_transport(Transport::Simulator(Arc::new(device)))
     }
 
     /// Create an interface for a real MCU on the serial port `path`.
@@ -169,6 +181,11 @@ impl Interface {
                 let device = Arc::clone(device);
                 self.off_runtime(move || device.send(&frame)).await
             }
+            #[cfg(test)]
+            Transport::Simulator(device) => {
+                let device = Arc::clone(device);
+                self.off_runtime(move || device.send(&frame)).await
+            }
         }
     }
 
@@ -191,6 +208,11 @@ impl Interface {
                 let device = Arc::clone(device);
                 self.off_runtime(move || device.receive()).await
             }
+            #[cfg(test)]
+            Transport::Simulator(device) => {
+                let device = Arc::clone(device);
+                self.off_runtime(move || device.receive()).await
+            }
         }
     }
 
@@ -202,6 +224,8 @@ impl Interface {
             Transport::Host(device) => device.shutdown(),
             #[cfg(test)]
             Transport::Test(device) => device.shutdown(),
+            #[cfg(test)]
+            Transport::Simulator(device) => device.shutdown(),
         }
     }
 }

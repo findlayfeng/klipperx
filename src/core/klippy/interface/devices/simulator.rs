@@ -1,0 +1,321 @@
+//! A dictionary-driven fake MCU: the "responder" the upstream corpus runs
+//! against (test builds only).
+//!
+//! Upstream's own regression tests run klippy with no firmware at all: `-d`
+//! injects a data dictionary and `-o` points the "serial port" at a file, and
+//! every call that would wait for a reply is short-circuited. This device takes
+//! the other road — it *answers* — so the host runs its ordinary path (identify,
+//! configuration handshake, clock reads, message sequencing) instead of a branch
+//! that production never takes.
+//!
+//! The dictionary is the whole program. It tells the device how to decode what
+//! the host sends and how to encode what it sends back, so one implementation
+//! serves every `.test` case:
+//!
+//! * **identify**: request `offset`/`count`, answer with the zlib-compressed
+//!   dictionary in chunks, then an empty chunk — the same exchange the firmware
+//!   performs (`klippy/identify.py`), so the host installs the dictionary it was
+//!   given.
+//! * **configuration**: answer `get_config`, remember the CRC from
+//!   `finalize_config`, and report the configuration as current afterwards.
+//! * **clock**: answer `get_clock`/`get_uptime` from a monotonic counter.
+//! * **sequencing**: every received block is acknowledged by echoing its sequence
+//!   with an empty payload, which is how the host's send window advances.
+//!
+//! What it does not do is simulate hardware: endstop triggers, stepper motion and
+//! shutdown reporting are added per case as the corpus needs them.
+
+use std::collections::VecDeque;
+use std::io::Write;
+use std::path::Path;
+use std::sync::{Condvar, Mutex};
+use std::time::Instant;
+
+use flate2::write::ZlibEncoder;
+use flate2::Compression;
+use serde_json::Value;
+use tracing::debug;
+
+use crate::core::klippy::frame::Frame;
+use crate::core::klippy::identify;
+use crate::core::klippy::interface::error::InterfaceError;
+use crate::core::klippy::interface::Device;
+use crate::core::klippy::mcu::Dictionary;
+use crate::core::klippy::msg::parser::Parser;
+use crate::core::klippy::msg::proto::{ArgValue, Payload};
+
+/// How many bytes one `identify` answer may carry. The host asks for a window of
+/// its own size (`cmd::identify::IDENTIFY_CHUNK_SIZE`, `count=40`); this is the
+/// fallback when the request's `count` cannot be read.
+const IDENTIFY_CHUNK: usize = 40;
+
+/// The move count a fresh fake firmware reports, as upstream's file mode does
+/// (`klippy/mcu.py:1037`).
+const MOVE_COUNT: u16 = 500;
+
+/// Everything the device remembers between frames.
+struct State {
+    /// Decodes what the host sends and encodes what it is sent back. Starts with
+    /// only the identify pair, gets the full dictionary after identify.
+    parser: Parser,
+    /// The dictionary, kept for the identify phase.
+    dictionary: Option<Dictionary>,
+    /// The dictionary file, for `identify_response` to serve.
+    raw: Vec<u8>,
+    /// `raw`, zlib-compressed, which is what the identify protocol carries.
+    compressed: Vec<u8>,
+    /// Whether the dictionary has been installed into `parser`.
+    installed: bool,
+    /// Whether `finalize_config` has been seen since the last reset.
+    configured: bool,
+    /// The CRC `finalize_config` carried.
+    crc: u32,
+    /// Ticks per second, from the dictionary's `CLOCK_FREQ`.
+    freq: f64,
+    /// When this device was created: `clock()` counts from here.
+    started: Instant,
+    /// Frames waiting for `receive()`.
+    out: VecDeque<Frame>,
+    /// Set by `shutdown()`: `receive()` returns `None` from then on.
+    shutdown: bool,
+}
+
+/// A fake MCU built from a `.dict` file. See the module docs.
+pub struct SimulatorDevice {
+    state: Mutex<State>,
+    signal: Condvar,
+}
+
+impl SimulatorDevice {
+    /// Build a fake firmware from the data dictionary at `path`.
+    ///
+    /// # Errors
+    /// A message when the file cannot be read, is not JSON, or is not a valid
+    /// data dictionary.
+    pub fn new(path: impl AsRef<Path>) -> Result<Self, String> {
+        let path = path.as_ref();
+        let raw = std::fs::read(path)
+            .map_err(|e| format!("failed to read data dictionary {}: {e}", path.display()))?;
+        let value: Value = serde_json::from_slice(&raw)
+            .map_err(|e| format!("{} is not a JSON data dictionary: {e}", path.display()))?;
+        let dictionary = Dictionary::from_json(value).map_err(|e| e.to_string())?;
+        let freq = dictionary.constant_f64("CLOCK_FREQ").unwrap_or(1_000_000.0);
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&raw).map_err(|e| format!("zlib: {e}"))?;
+        let compressed = encoder.finish().map_err(|e| format!("zlib: {e}"))?;
+        Ok(Self {
+            state: Mutex::new(State {
+                parser: identify::new_parser(),
+                dictionary: Some(dictionary),
+                raw,
+                compressed,
+                installed: false,
+                configured: false,
+                crc: 0,
+                freq,
+                started: Instant::now(),
+                out: VecDeque::new(),
+                shutdown: false,
+            }),
+            signal: Condvar::new(),
+        })
+    }
+
+    /// The dictionary this device serves, for a test that wants to inspect it.
+    pub fn dictionary_len(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .raw
+            .len()
+    }
+
+    /// The synthetic clock, in firmware ticks since construction.
+    fn clock(state: &State) -> u64 {
+        (state.started.elapsed().as_secs_f64() * state.freq) as u64
+    }
+
+    /// Encode a response and queue it.
+    fn respond(state: &mut State, seq: u8, name: &str, values: &[ArgValue]) {
+        match state.parser.encode(name, values) {
+            Ok(payload) => state.out.push_back(Frame::new(seq, payload.into_raw())),
+            Err(e) => debug!("simulator: cannot encode '{name}': {e}"),
+        }
+    }
+
+    /// Handle the messages of one block.
+    fn dispatch(state: &mut State, seq: u8, payload: Vec<u8>) {
+        let decoded = match state.parser.decode(Payload::from_raw(payload)) {
+            Ok(messages) => messages,
+            Err(e) => {
+                debug!("simulator: cannot decode a block: {e}");
+                return;
+            }
+        };
+
+        for (message, params) in decoded {
+            match message.name.as_str() {
+                "identify" => Self::identify(state, seq, &params),
+                "get_config" => {
+                    let is_config = u8::from(state.configured);
+                    Self::respond(
+                        state,
+                        seq,
+                        "config",
+                        &[
+                            ArgValue::UInt8(is_config),
+                            ArgValue::UInt32(state.crc),
+                            ArgValue::UInt8(0),
+                            ArgValue::UInt16(MOVE_COUNT),
+                        ],
+                    );
+                }
+                "finalize_config" => {
+                    if let Some(ArgValue::UInt32(crc)) = params.first() {
+                        state.crc = *crc;
+                        state.configured = true;
+                    }
+                }
+                "config_reset" | "reset" => {
+                    state.configured = false;
+                    state.crc = 0;
+                }
+                "get_clock" => {
+                    let clock = Self::clock(state) as u32;
+                    Self::respond(state, seq, "clock", &[ArgValue::UInt32(clock)]);
+                }
+                "get_uptime" => {
+                    let clock = Self::clock(state);
+                    Self::respond(
+                        state,
+                        seq,
+                        "uptime",
+                        &[
+                            ArgValue::UInt32((clock >> 32) as u32),
+                            ArgValue::UInt32(clock as u32),
+                        ],
+                    );
+                }
+                // Everything else is accepted and ignored: `allocate_oids`,
+                // `config_*`, `queue_step`, `emergency_stop`, and any command
+                // this fake firmware does not model yet.
+                _ => {}
+            }
+        }
+    }
+
+    /// Answer one chunk of the identify exchange.
+    fn identify(state: &mut State, seq: u8, params: &[ArgValue]) {
+        let offset = match params.first() {
+            Some(ArgValue::UInt32(offset)) => *offset as usize,
+            _ => 0,
+        };
+        let count = match params.get(1) {
+            Some(ArgValue::UInt8(count)) => *count as usize,
+            _ => IDENTIFY_CHUNK,
+        };
+
+        let length = state.compressed.len();
+        let (data, last) = if offset >= length {
+            (Vec::new(), true)
+        } else {
+            let end = (offset + count).min(length);
+            (state.compressed[offset..end].to_vec(), false)
+        };
+
+        Self::respond(
+            state,
+            seq,
+            "identify_response",
+            &[ArgValue::UInt32(offset as u32), ArgValue::Bytes(data)],
+        );
+
+        if last && !state.installed {
+            if let Some(dictionary) = state.dictionary.as_ref() {
+                if let Err(e) = dictionary.install(&mut state.parser) {
+                    debug!("simulator: cannot install the dictionary: {e}");
+                }
+            }
+            state.installed = true;
+        }
+    }
+}
+
+impl std::fmt::Debug for SimulatorDevice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SimulatorDevice")
+            .field("dictionary_len", &self.dictionary_len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Device for SimulatorDevice {
+    fn send(&self, frame: &Frame) -> Result<(), InterfaceError> {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let seq = frame.seq();
+        let payload = frame.payload().to_vec();
+        if !payload.is_empty() {
+            Self::dispatch(&mut state, seq, payload);
+        }
+        // Every accepted block is acknowledged by echoing its sequence with an
+        // empty payload; that is what advances the host's send window.
+        state.out.push_back(Frame::new(seq, Vec::new()));
+        self.signal.notify_all();
+        Ok(())
+    }
+
+    fn receive(&self) -> Option<Frame> {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        loop {
+            if let Some(frame) = state.out.pop_front() {
+                return Some(frame);
+            }
+            if state.shutdown {
+                return None;
+            }
+            state = self.signal.wait(state).unwrap_or_else(|p| p.into_inner());
+        }
+    }
+
+    fn shutdown(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.shutdown = true;
+        self.signal.notify_all();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::klippy::cmd::clock::{ClockState, GetClock};
+    use crate::core::klippy::interface::Interface;
+    use crate::core::klippy::mcu::Mcu;
+    use std::time::Duration;
+
+    #[test]
+    fn a_bad_dictionary_path_is_reported() {
+        let err = SimulatorDevice::new("/nonexistent/klipper.dict").unwrap_err();
+        assert!(err.contains("failed to read data dictionary"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn it_serves_identify_and_answers_a_clock_read() {
+        let device =
+            SimulatorDevice::new(klipperx_test_support::test_dicts_dir().join("linuxprocess.dict"))
+                .expect("the linux-process dictionary");
+        let mcu = Mcu::connect("mcu", Interface::simulator(device))
+            .await
+            .expect("identify against the fake firmware");
+
+        assert!(mcu.is_identified());
+        assert!(mcu.dictionary().unwrap().message("get_clock").is_some());
+
+        // The reply must come back through the ordinary call path, which needs
+        // the responder to have acknowledged the block it arrived in.
+        let state = mcu
+            .call_msg::<GetClock, ClockState>(&GetClock, Duration::from_secs(2))
+            .await
+            .expect("a clock read");
+        let _ = state.clock;
+    }
+}

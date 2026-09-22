@@ -24,6 +24,12 @@ pub mod printer;
 pub mod reactor;
 // pub mod toolhead;
 
+// Upstream's host test corpus, used as fixtures. Test-only: it reads
+// third_party/klipper and exists to check our behavior against upstream's
+// shipped configs and test cases.
+#[cfg(test)]
+mod upstream;
+
 // Client-facing API over the Unix Domain Socket
 pub mod api;
 

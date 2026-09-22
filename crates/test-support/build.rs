@@ -1,21 +1,28 @@
 // crates/test-support/build.rs
 //
-// Build the Klipper host shared library (libklipper_host.so) that the host
-// interface tests load at runtime.
+// Build what the tests need, in output directories of this build script's own
+// inside OUT_DIR:
+//
+//   * the host shared library (`libklipper_host.so`) its interface tests load;
+//   * a data dictionary for every `test/configs/*.config` whose architecture is
+//     enabled, named after that config (`<name>.config` -> `<name>.dict`).
+//
+// The architectures to build come from `KLIPPERX_ARCHES` (comma separated,
+// `linux` by default), or `KLIPPERX_ALL_ARCHES` for every target. Filtering
+// happens here rather than at test time so that a target that cannot be built
+// fails the build with make's own error, instead of turning into a silent skip.
+// Setting either variable again triggers a rebuild (`rerun-if-env-changed`).
 //
 // The klipper tree is a submodule that a developer may also be building for real
 // hardware, so it has a `.config` and an `out/` of its own. This script uses
-// neither: it keeps a configuration and an output directory of its own inside the
-// build script's OUT_DIR, and passes both to make, so the test build is
-// reproducible from a clean checkout and leaves the developer's build alone.
-//
-// The configuration is written rather than derived, because kconfig's defaults do
-// not describe what these tests need (see HOST_CONFIG below).
+// neither: it copies each configuration into its own output directory and passes
+// that to make, so the test build is reproducible from a clean checkout, leaves
+// the developer's build alone, and never writes into the submodule.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// What the tests need, stated explicitly.
+/// The host target, which the interface tests load as a shared library.
 ///
 /// kconfig has no default for the machine choice, so an empty configuration
 /// selects the first entry (AVR) and builds firmware into a `klipper.elf` the
@@ -38,55 +45,136 @@ fn main() {
     let klipper_dir = workspace_root.join("third_party/klipper");
 
     // OUT_DIR is stable across runs of the same build, which is what keeps the
-    // klipper build incremental: only the first `cargo test` compiles it.
+    // klipper builds incremental: only the first `cargo test` compiles them.
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("cargo sets OUT_DIR"));
-    let build_dir = out_dir.join("klipper-host");
-    let config = build_dir.join("host.config");
-    let klipper_out = build_dir.join("out");
+    let build_dir = out_dir.join("klipper-targets");
 
-    std::fs::create_dir_all(&build_dir).expect("failed to create the klipper build directory");
-    if std::fs::read_to_string(&config).ok().as_deref() != Some(HOST_CONFIG) {
-        std::fs::write(&config, HOST_CONFIG).expect("failed to write the host configuration");
+    // Watch what these builds depend on, so a change in the submodule or in the
+    // selected architectures triggers a rebuild instead of a stale artifact.
+    for changed in [
+        "src",
+        "Makefile",
+        "scripts/buildcommands.py",
+        "test/configs",
+    ] {
+        println!(
+            "cargo:rerun-if-changed={}",
+            klipper_dir.join(changed).display()
+        );
     }
+    println!("cargo:rerun-if-env-changed=KLIPPERX_ARCHES");
+    println!("cargo:rerun-if-env-changed=KLIPPERX_ALL_ARCHES");
 
-    // Watch the sources this build depends on, so a change in the submodule
-    // triggers a rebuild instead of a stale library.
-    println!(
-        "cargo:rerun-if-changed={}",
-        klipper_dir.join("src").display()
-    );
-    println!(
-        "cargo:rerun-if-changed={}",
-        klipper_dir.join("Makefile").display()
-    );
-    println!(
-        "cargo:rerun-if-changed={}",
-        klipper_dir.join("scripts/buildcommands.py").display()
-    );
-
-    println!(
-        "cargo:warning=KlipperX test-support: building {}...",
-        library(&klipper_out).display()
-    );
-    // Complete the fragment with every default the current klipper defines, then
-    // build. Both are run every time; make decides what is actually stale.
-    make(&klipper_dir, &config, &klipper_out, &["olddefconfig"]);
-    make(&klipper_dir, &config, &klipper_out, &[]);
-
-    let library = library(&klipper_out);
+    // The host target: a shared library the interface tests load.
+    let host_out = build(&klipper_dir, &build_dir.join("host"), HOST_CONFIG);
+    let library = host_out.join("libklipper_host.so");
     assert!(
         library.exists(),
         "make did not produce {}: check that {HOST_CONFIG:?} still selects the shared host library",
         library.display()
     );
-
-    // The tests ask for this path at runtime and cannot derive it: OUT_DIR
-    // contains a hash. Hand it over as a compile-time environment variable.
     println!("cargo:rustc-env=KLIPPER_HOST_LIB={}", library.display());
+
+    // One dictionary per enabled target, named after the config it was built
+    // from. A target that fails to build fails the build here.
+    let all_architectures = std::env::var_os("KLIPPERX_ALL_ARCHES").is_some();
+    let architectures = enabled_architectures();
+    let dicts = build_dir.join("dicts");
+    std::fs::create_dir_all(&dicts).expect("failed to create the dictionary directory");
+    let mut built = 0usize;
+    for config in
+        std::fs::read_dir(klipper_dir.join("test/configs")).expect("test/configs is readable")
+    {
+        let config = config.expect("a directory entry").path();
+        if config.extension().and_then(|e| e.to_str()) != Some("config") {
+            continue;
+        }
+        let Some(name) = config.file_stem().map(|s| s.to_string_lossy().to_string()) else {
+            continue;
+        };
+        let text = std::fs::read_to_string(&config).expect("a readable config");
+        let Some(architecture) = architecture(&text) else {
+            continue;
+        };
+        if !all_architectures && !architectures.contains(&architecture) {
+            continue;
+        }
+
+        let target_out = build(&klipper_dir, &build_dir.join("mcu").join(&name), &text);
+        let dictionary = require_dict(&target_out);
+        std::fs::copy(&dictionary, dicts.join(format!("{name}.dict")))
+            .unwrap_or_else(|e| panic!("failed to collect {}: {e}", dictionary.display()));
+        built += 1;
+    }
+    assert!(
+        built > 0,
+        "no test/configs target matched KLIPPERX_ARCHES={architectures:?} \
+         (KLIPPERX_ALL_ARCHES builds every target)"
+    );
+    println!("cargo:rustc-env=KLIPPERX_TEST_DICTS={}", dicts.display());
 }
 
-fn library(klipper_out: &Path) -> PathBuf {
-    klipper_out.join("libklipper_host.so")
+/// The architectures to build, from `KLIPPERX_ARCHES`; `linux` by default.
+///
+/// `KLIPPERX_ALL_ARCHES` (any value) overrides this and builds every target.
+fn enabled_architectures() -> Vec<String> {
+    match std::env::var("KLIPPERX_ARCHES") {
+        Ok(value) => value
+            .split(',')
+            .map(|entry| entry.trim().to_ascii_lowercase())
+            .filter(|entry| !entry.is_empty())
+            .collect(),
+        Err(_) => vec!["linux".to_string()],
+    }
+}
+
+/// The architecture a kconfig fragment selects.
+///
+/// Klipper names the family with an all-uppercase `CONFIG_MACH_<FAMILY>` (`AVR`,
+/// `STM32`, `LINUX`, …); the board key has lowercase letters. A fragment without
+/// one is not a machine choice and is skipped.
+fn architecture(config: &str) -> Option<String> {
+    for line in config.lines() {
+        let Some(key) = line.trim().strip_prefix("CONFIG_MACH_") else {
+            continue;
+        };
+        let Some(family) = key.strip_suffix("=y") else {
+            continue;
+        };
+        if family.chars().all(|c| !c.is_ascii_lowercase()) {
+            return Some(family.to_ascii_lowercase());
+        }
+    }
+    None
+}
+
+/// Write `config_text` into `target_dir` and build it, returning the output
+/// directory.
+fn build(klipper_dir: &Path, target_dir: &Path, config_text: &str) -> PathBuf {
+    let config = target_dir.join("klipper.config");
+    let klipper_out = target_dir.join("out");
+
+    std::fs::create_dir_all(target_dir).expect("failed to create a klipper build directory");
+    if std::fs::read_to_string(&config).ok().as_deref() != Some(config_text) {
+        std::fs::write(&config, config_text).expect("failed to write a klipper configuration");
+    }
+
+    // Complete the fragment with every default the current klipper defines, then
+    // build. Both are run every time; make decides what is actually stale.
+    make(klipper_dir, &config, &klipper_out, &["olddefconfig"]);
+    make(klipper_dir, &config, &klipper_out, &[]);
+    klipper_out
+}
+
+/// The data dictionary a build produced, which every target emits.
+fn require_dict(klipper_out: &Path) -> PathBuf {
+    let dictionary = klipper_out.join("klipper.dict");
+    assert!(
+        dictionary.exists(),
+        "make did not produce {}",
+        dictionary.display()
+    );
+    dictionary
 }
 
 fn make(klipper_dir: &Path, config: &Path, klipper_out: &Path, targets: &[&str]) {
@@ -101,13 +189,15 @@ fn make(klipper_dir: &Path, config: &Path, klipper_out: &Path, targets: &[&str])
         .unwrap_or_else(|e| {
             panic!(
                 "failed to run make in {}: {e}\n\
-                 the host interface tests need make and a C toolchain",
+                 the tests need make and a C toolchain",
                 klipper_dir.display()
             )
         });
     assert!(
         status.success(),
-        "make {} failed in {}",
+        "make {} failed in {}\n\
+         (a target that needs a cross compiler must have that toolchain, or its \
+         architecture must not be in KLIPPERX_ARCHES)",
         targets.join(" "),
         klipper_dir.display()
     );

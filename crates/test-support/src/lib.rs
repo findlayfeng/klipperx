@@ -1,8 +1,8 @@
 // KlipperX Test Support Library
 //
 // This crate provides test utilities for KlipperX. Its build.rs builds the
-// klipper host shared library (libklipper_host.so) so that tests can load it at
-// runtime.
+// klipper host shared library (libklipper_host.so) the interface tests load, and
+// one data dictionary per enabled MCU target.
 
 /// Absolute path to the built klipper host shared library.
 ///
@@ -15,4 +15,14 @@
 /// `build.rs` builds it as part of the test build and fails if it is missing.
 pub fn klipper_host_lib_path() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("KLIPPER_HOST_LIB"))
+}
+
+/// Absolute path to the directory of built data dictionaries.
+///
+/// `build.rs` builds one `test/configs/*.config` per architecture named in
+/// `KLIPPERX_ARCHES` (default `linux`) and collects each as `<name>.dict`, the
+/// same name as the config it came from. A target that cannot be built fails the
+/// build, so every file here exists and is complete.
+pub fn test_dicts_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("KLIPPERX_TEST_DICTS"))
 }

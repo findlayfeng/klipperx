@@ -14,7 +14,7 @@
 
 use crate::core::klippy::cmd::{McuCommand, McuResponse};
 use crate::core::klippy::mcu::McuError;
-use crate::core::klippy::msg::proto::{ArgType, ArgValue};
+use crate::core::klippy::msg::proto::ArgValue;
 
 /// `debug_read order=%c addr=%u` — read a value from MCU memory.
 ///

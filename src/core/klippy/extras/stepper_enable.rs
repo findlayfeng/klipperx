@@ -34,6 +34,7 @@ use crate::core::klippy::printer::{Printer, PrinterObject};
 
 // The constant upstream uses for the dwell before disabling motors
 // (`DISABLE_STALL_TIME`, `stepper_enable.py:7`).
+#[allow(dead_code)]
 const DISABLE_STALL_TIME: f64 = 0.100;
 
 /// Shared enable pin with reference counting.
@@ -48,6 +49,7 @@ struct StepperEnablePin {
     enable_count: u32,
     /// `true` when this is a dedicated pin for one stepper; `false` when
     /// shared.
+    #[allow(dead_code)]
     is_dedicated: bool,
 }
 
@@ -73,6 +75,7 @@ impl StepperEnablePin {
     }
 
     /// Build a shared enable pin placeholder; the first user claims it.
+    #[allow(dead_code)]
     fn shared_placeholder() -> Self {
         Self {
             mcu_enable: None,
@@ -106,8 +109,9 @@ impl StepperEnablePin {
 ///
 /// Upstream's `EnableTracking`: it wraps a stepper with an enable pin,
 /// manages the enabled state, and calls registered callbacks on transitions.
-struct EnableTracking {
+pub(crate) struct EnableTracking {
     /// The stepper name (`stepper_x`, etc.).
+    #[allow(dead_code)]
     stepper_name: String,
     /// The shared or dedicated enable pin.
     enable: Arc<Mutex<StepperEnablePin>>,
@@ -128,6 +132,7 @@ impl EnableTracking {
     }
 
     /// Register a callback for enable/disable transitions.
+    #[allow(dead_code)]
     fn register_state_callback<F: Fn(bool) + Send + 'static>(&mut self, cb: F) {
         self.callbacks.push(Box::new(cb));
     }
@@ -160,6 +165,7 @@ impl EnableTracking {
     }
 
     /// Whether this is a dedicated (non-shared) enable pin.
+    #[allow(dead_code)]
     fn has_dedicated_enable(&self) -> bool {
         self.enable.lock().unwrap().is_dedicated
     }
@@ -317,7 +323,11 @@ impl PrinterStepperEnable {
     ///
     /// # Errors
     /// Returns a config error if the stepper name is unknown.
-    pub fn lookup_enable(&self, name: &str) -> Result<Arc<Mutex<EnableTracking>>, ConfigError> {
+    #[allow(dead_code)]
+    pub(crate) fn lookup_enable(
+        &self,
+        name: &str,
+    ) -> Result<Arc<Mutex<EnableTracking>>, ConfigError> {
         self.enable_lines
             .lock()
             .unwrap()

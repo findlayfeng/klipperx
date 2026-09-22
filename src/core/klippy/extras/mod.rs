@@ -6,6 +6,7 @@
 //! loader reaches them through its factory table (`load.rs`), so the core never
 //! imports them.
 
+pub mod adc_temperature;
 pub mod board_pins;
 pub(crate) mod bus_debug;
 pub mod ds18b20;
@@ -17,5 +18,6 @@ pub mod query_endstops;
 pub mod spi_device;
 pub mod stepper;
 pub mod stepper_enable;
+pub mod temperature_mcu;
 pub mod temperature_sensor;
 pub mod toolhead;

@@ -60,6 +60,7 @@ use tracing::warn;
 
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
 use crate::core::klippy::error::KlippyError;
+use crate::core::klippy::event::KlippyEvent;
 use crate::core::klippy::extras::query_endstops::{QueryEndstops, QUERY_ENDSTOPS_OBJECT};
 use crate::core::klippy::extras::stepper::{PrinterStepper, RailParams};
 use crate::core::klippy::gcode::{
@@ -582,23 +583,35 @@ async fn home_axes(
     connected: &mut Connected,
     axes: &[Arc<PrinterStepper>; 3],
     requested: &[usize],
+    printer: &Weak<Printer>,
 ) -> Result<(), CommandError> {
     for &axis in requested {
         let rail = &axes[axis];
         let endstop = rail.endstop().ok_or_else(|| {
             CommandError::new(format!("No endstop configured for {}", rail.name()))
         })?;
-        home_axis(
+        send(printer, &KlippyEvent::HomingHomeRailsBegin);
+        let result = home_axis(
             connected,
             axis,
             rail.homing_info(),
             rail.params(),
             rail.step_dist(),
             endstop.as_ref(),
+            printer,
         )
-        .await?;
+        .await;
+        send(printer, &KlippyEvent::HomingHomeRailsEnd);
+        result?;
     }
     Ok(())
+}
+
+/// Fire a printer event, when the machine is still there.
+fn send(printer: &Weak<Printer>, event: &KlippyEvent) {
+    if let Some(printer) = printer.upgrade() {
+        printer.send_event(event);
+    }
 }
 
 /// Home one axis: pretend to be at `forcepos`, move to the endstop, then place
@@ -612,6 +625,7 @@ async fn home_axis(
     params: RailParams,
     step_dist: f64,
     endstop: &dyn HomingEndstop,
+    printer: &Weak<Printer>,
 ) -> Result<(), CommandError> {
     // Start 1.5 axis-lengths past the far end so the move always approaches the
     // endstop from the correct side.
@@ -637,6 +651,7 @@ async fn home_axis(
         )
         .map_err(command_error)?;
     connected.toolhead.dwell(HOMING_START_DELAY);
+    send(printer, &KlippyEvent::HomingHomingMoveBegin);
     let (start, end) = connected
         .toolhead
         .drip_move(home, info.speed)
@@ -664,6 +679,7 @@ async fn home_axis(
     }
 
     endstop.home_wait(end).await.map_err(command_error)?;
+    send(printer, &KlippyEvent::HomingHomingMoveEnd);
     // The axis is now known at its endstop position.
     connected.toolhead.set_position(home, &[axis]);
     connected.toolhead.wipe_trapq();
@@ -821,7 +837,7 @@ fn cmd_g28(
     let handle = tokio::runtime::Handle::try_current()
         .map_err(|_| CommandError::new("G28 needs the async runtime"))?;
     let result = tokio::task::block_in_place(|| {
-        handle.block_on(home_axes(&mut connected, axes, &requested))
+        handle.block_on(home_axes(&mut connected, axes, &requested, _printer))
     });
     *guard = Some(connected);
     result
@@ -1170,6 +1186,10 @@ mod tests {
             position_max: 200.0,
             position_endstop: 0.0,
         };
+        let printer = Arc::new(Printer::new(
+            crate::core::klippy::reactor::ManualReactor::shared(),
+        ));
+        let printer = Arc::downgrade(&printer);
 
         home_axis(
             &mut connected,
@@ -1178,6 +1198,7 @@ mod tests {
             params,
             1.0,
             &endstop,
+            &printer,
         )
         .await
         .unwrap();

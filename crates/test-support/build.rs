@@ -7,11 +7,14 @@
 //   * a data dictionary for every `test/configs/*.config` whose architecture is
 //     enabled, named after that config (`<name>.config` -> `<name>.dict`).
 //
-// The architectures to build come from `KLIPPERX_ARCHES` (comma separated,
-// `linux` by default), or `KLIPPERX_ALL_ARCHES` for every target. Filtering
-// happens here rather than at test time so that a target that cannot be built
-// fails the build with make's own error, instead of turning into a silent skip.
-// Setting either variable again triggers a rebuild (`rerun-if-env-changed`).
+// The architectures to build come from `KLIPPERX_ARCHES` (comma separated), or
+// `KLIPPERX_ALL_ARCHES` for every target. The default is the set with widely
+// available toolchains — `linux` (host), `avr` (gcc-avr) and every ARM family
+// (arm-none-eabi); `pru`, `ar100` and `simu` are not built unless asked for.
+// Filtering happens here rather than at test time so that a target that cannot
+// be built fails the build with make's own error, instead of turning into a
+// silent skip. Setting any of these variables triggers a rebuild
+// (`rerun-if-env-changed`).
 //
 // The klipper tree is a submodule that a developer may also be building for real
 // hardware, so it has a `.config` and an `out/` of its own. This script uses
@@ -114,7 +117,19 @@ fn main() {
     println!("cargo:rustc-env=KLIPPERX_TEST_DICTS={}", dicts.display());
 }
 
-/// The architectures to build, from `KLIPPERX_ARCHES`; `linux` by default.
+/// The architectures built by default: the ones whose toolchains are easy to
+/// come by.
+///
+/// `linux` builds with the host compiler and `avr` with `avr-gcc`; the rest are
+/// the ARM families, all of which build with `arm-none-eabi-gcc`. The remaining
+/// families are left out: `pru` needs a PRU toolchain and `ar100` an or1k one
+/// (both less common), and no `.test` uses `simu` at all.
+const DEFAULT_ARCHITECTURES: &[&str] = &[
+    "linux", "avr", "stm32", "atsam", "atsamd", "lpc176x", "rpxxxx", "hc32f460",
+];
+
+/// The architectures to build, from `KLIPPERX_ARCHES`; [`DEFAULT_ARCHITECTURES`]
+/// when it is not set.
 ///
 /// `KLIPPERX_ALL_ARCHES` (any value) overrides this and builds every target.
 fn enabled_architectures() -> Vec<String> {
@@ -124,7 +139,10 @@ fn enabled_architectures() -> Vec<String> {
             .map(|entry| entry.trim().to_ascii_lowercase())
             .filter(|entry| !entry.is_empty())
             .collect(),
-        Err(_) => vec!["linux".to_string()],
+        Err(_) => DEFAULT_ARCHITECTURES
+            .iter()
+            .map(|entry| (*entry).to_string())
+            .collect(),
     }
 }
 

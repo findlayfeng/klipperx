@@ -28,10 +28,10 @@
 //! The tests follow the pipeline the corpus implies:
 //!
 //! 1. **Build the dictionaries.** `build.rs` reads `KLIPPERX_ARCHES` (comma
-//!    separated; `linux` by default) — or every target when
-//!    `KLIPPERX_ALL_ARCHES` is set — builds each matching
-//!    `test/configs/*.config`, and collects it as the same-named `<name>.dict`.
-//!    A target that cannot be built fails the build.
+//!    separated; by default `linux`, `avr` and every ARM family — the toolchains
+//!    that are easy to come by) — or every target when `KLIPPERX_ALL_ARCHES` is
+//!    set — builds each matching `test/configs/*.config`, and collects it as the
+//!    same-named `<name>.dict`. A target that cannot be built fails the build.
 //! 2. **Drop cases without a `DICTIONARY`.** Upstream refuses to start one
 //!    (`scripts/test_klippy.py:88`).
 //! 3. **Drop cases whose dictionaries were not built.** There is no substitute:
@@ -465,18 +465,22 @@ mod tests {
         }
     }
 
-    /// The dictionaries the default architecture builds are present, and a
-    /// target outside it is not.
+    /// A name resolves exactly when its dictionary was built; nothing resolves
+    /// by borrowing another target's dictionary.
+    ///
+    /// Which names exist depends on `KLIPPERX_ARCHES`, so the test reads the
+    /// directory rather than naming a target.
     #[test]
-    fn the_default_build_provides_the_linux_dictionary() {
-        assert!(dict_dir().join("linuxprocess.dict").is_file());
-        assert_eq!(
-            dictionary_path("linuxprocess.dict"),
-            Some(dict_dir().join("linuxprocess.dict"))
-        );
-        // Only the enabled architectures' dictionaries exist, so a target that
-        // was not built has none: the case cannot run rather than borrow one.
-        assert_eq!(dictionary_path("atmega2560.dict"), None);
+    fn a_dictionary_resolves_exactly_when_it_was_built() {
+        let entry = std::fs::read_dir(dict_dir())
+            .expect("the dictionary directory")
+            .next()
+            .expect("at least one dictionary is built")
+            .expect("a directory entry");
+        let name = entry.file_name().to_string_lossy().to_string();
+
+        assert_eq!(dictionary_path(&name), Some(dict_dir().join(&name)));
+        assert_eq!(dictionary_path("definitely-not-a-built-target.dict"), None);
     }
 
     /// A `SHOULD_FAIL` run is only satisfied by the g-code phase: a config this

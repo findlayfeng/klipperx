@@ -8,51 +8,6 @@
 [上游功能覆盖审计](docs/work-log/2026-09-21-upstream-coverage-audit.md)；本文件只放
 **要动手的事**与**还没定的事**。
 
-## 框架优先（先把框架做完，再铺模块）
-
-本项目的固定做法：**先把框架立住 → 用一个最小模块把它跑通 → 再横向铺模块**。
-下面把 TODO 里属于**框架级**的事单独排队；H1–H12、G2b/G4、S1 等具体模块都排在
-这些之后。判定标准：一项负责**定接口/定生命周期/定数据形状**、被多个 extras 共用，
-就是框架；只消费已有接口、自己就是一个 `[section]` 的，是模块。
-
-| # | 框架 | 对应 TODO | 框架边界（定什么） | 首个模块（验收） | 之后铺开 | 依赖 |
-|---|---|---|---|---|---|---|
-| **FW1** ✅ | 配置装载框架收尾 | C2 | option 访问追踪当 schema（`ConfigWrapper` + `AccessTracking`）、住户与阶段（`phase`/`object`，对象名可≠节名）、未认领 section/option 报 `ConfigError`、`configfile` 对象 | `[output_pin fan]` 多一个选项报选项错、`objects/list` 含 `configfile` 且 `settings`/`config` 形状对；`[printer]`→`toolhead` 的晚阶段住户有装载器单测 | 各 extras 的 option schema（H1–H12）；`[printer]`/toolhead 本体随 C1 接入 | FW3（共用 `ConfigError`） |
-| **FW2** ✅ | 对象模型收尾 | Q4、Q5 | Q4 定案 `Value`；Q5 加 `lookup_objects(module)` 前缀遍历与 `statuses()` 快照 | `objects/query` 形状不变；`lookup_objects("mcu")` 前缀遍历与反射读状态有单测 | `gcode_macro` 的 `printer.objects` 模板视图、display 菜单、宏变量 | — |
-| **FW3** ✅ | 错误词汇框架 | A2 | `CommandError`/`ConfigError` 分层、`KlippyError::Config`、`Internal` 收敛、handler/endpoint 异常 `catch_unwind` → `invoke_shutdown`、config 错走 `set_error_state`（`PrinterState::Error`） | 参数错报 `CommandError` 且不停机；坏配置 / connect 期 config 错报 `error`（可 RESTART）；panic 的 handler / endpoint 触发 `invoke_shutdown` | 全树的错误分支 | — |
-| **FW4** ✅ | G-Code 框架收尾（`GCodeIO` 暂缓 `[~]`） | G1b（框架部分） | 参数访问器、`create_gcode_command`、`run_script_from_command`、`gcode:command_error` 触发、`gcode:request_restart`（`GCodeDispatch::request_restart` → `RestartHooks`）；`GCodeIO` 输入抽象（伪 tty / 文件 / `stats gcodein` / `debuginput_exit`）**暂缓 `[~]`**（不做 OctoPrint 串口仿真） | `create_gcode_command` / 参数访问器 / `request_restart` 均有单测；`GCodeIO` 暂缓（见 [FW4 笔记](docs/work-log/2026-09-21-fw4-notes.md)） | 全部 gcode extras（H3、H8…） | FW1、FW3（已满足） |
-| **FW5** ✅ | 运动框架（最重，拆 FW5a–FW5f） | C1（框架部分）、H12 | **FW5a** `Coord` + `clocksync` 回归；**FW5b** `Move`/`LookAheadQueue`/`trapq`；**FW5c** `itersolve` + `kin_cartesian`；**FW5d** `MotionQueuing`/`ToolHead`/`McuStepper`；**FW5e** `Kinematics` + `cartesian` + `[stepper_*]`/`[printer]` + `G1`；**FW5f** `stepcompress` 完整压缩 | host 单测 → 假 MCU（验收）；真板三轴 `G1`/`G28` 见 [`TESTING.md`](TESTING.md) T1/T3 | `kinematics/*` 其余、H9、H10、input shaper | FW1（已满足） |
-| **FW6** ✅ | 资源与触发框架（FW6f 暂缓 `[~]`） | F3、F8 | **FW6a-1** 多 MCU 时基与运动输出（`McuClock`/对齐下放到 `McuChip`）；**FW6b** endstop/trsync/`stepper_stop_on_trigger` 命令层 + `MCU_endstop` + 多实例 `TriggerDispatch`/`MCU_trsync`（含跨 MCU 停轴与共享轴报错）；**FW6c** `Rail`/`endstop_pin`/`homing_*` + `query_endstops` + `query_endstops/status` + `M119`；**FW6d** `stepcompress` history/`find_past_position` + stepper 回零句柄；**FW6e** `Kinematics::home`/`HomingState` + `ToolHead::drip_move` + `G28`（软件）；**FW6f** `[~]` `MCU_bus_digital_out`（能力已由 `queue_digital_out` 提供，包装随 H8 显示） | FW6c（软件）：一个 endstop + `query_endstops/status`；FW6e（软件）：假 endstop 的 `G28`；次级时钟漂移：模拟 ±100 ppm/1h 已测（误差 <10 ms）；真板 `M119`/`G28`/实际晶振漂移见 [`TESTING.md`](TESTING.md) T2–T4 | homing/probe、运动同步 `SET_PIN` | FW5 |
-| **FW7** ✅ | MCU 与传输框架收尾 | B2、D3 | `emergency_stop` 对象（`klippy:shutdown` → 固件 `emergency_stop`）、本地 shutdown 标志、`emergency_stop` 端点、`last_stats`、RTO 定时重传、固件 `reset` 优先均已落地；`error_mcu` 消费者（`invoke_shutdown_with` 载荷 + `update_error_msg`） | `emergency_stop` 端点使打印机进 shutdown；主机停机向固件发 `emergency_stop`，固件自报停机不回发 | TMC/传感器等资源 | — |
-| **FW8** ✅ | 主机层与重启框架 | D1、D2、Q6 | `--logfile`/rollover/Q6、`rpi_usb` 门控、CRC 物理复位、重启后订阅均已完成（代码）；`StartArgs` 其余字段 + `software_version`→`M115`（`rpi_usb` 真机见 [`TESTING.md`](TESTING.md) T5） | `--logfile` 落盘、`error_exit` 非零、重启后订阅不断；真板 `last_stats` 已验 | 日志、Moonraker 兼容 | — |
-| **FW9** ✅ | API 框架收尾 | B4（框架部分） | `register_remote_method` + 推送（`webhooks` 对象转发 `Api::call_remote_method`）、mux 端点注册机制（`register_mux_endpoint` → `api::register` 倒入）、`emergency_stop` 端点 | `register_remote_method` + 推送 | `pause_resume/*`、`*/dump_*` 等消费者 | FW7 |
-
-> **表中标识**：`#` 列的 `✅` = 该框架已完成（标 `[~]` 的子项除外）；`[~]` = 等成熟后再做。
-
-> **框架队列已完成**：FW1–FW9 均已落地（软件判据：host 单测 + 假 MCU）；
-> 标 `[~]` 的两项（`GCodeIO`、`MCU_bus_digital_out`）等成熟再做。
-
-> **怎么验收**：每个框架都以「最小模块在真机/测试设备上跑通」为准，不以“代码写完”为准。
-> 例如 FW5 的验收是 `G1` 真的动了步进（`G28` 与 FW6/F8 联合验收），而不是 `Kinematics`
-> trait 编译通过。
-
-> **执行顺序与状态**：**FW1/FW3**（配置与错误，最底层）→ **FW2/FW7/FW8**（对象模型 / MCU /
-> 主机层）→ **FW4**（G-Code，依赖 FW1+FW3）→ **FW5**（运动，最重，拆 a–f）→ **FW6**（资源与
-> 触发）→ **FW9**（API）——现已全部完成；仅 `GCodeIO`、`MCU_bus_digital_out` 标 `[~]` 暂缓。
-> FW5 与 FW4 都依赖 FW1；FW6 等 FW5 的运动层，但 F8（endstop/trsync）的接口与 FW5e 联合定，
-> `G28` 的验收跨两者。
-> D2 的真板启动抖动已归档为**非阻塞观察项**（板/USB 链路层，复现不了），不再单独排期。
-
-> **真板验证已单列（不阻塞开发）**：需要真实 MCU / 外设才能做的验证都在
-> [`TESTING.md`](TESTING.md)；主线任务以 **host 单测 + 假 MCU** 验收即算完成，
-> 真板项不再挡「待办 → 已完成」。
-
-> **未决问题**：框架阶段的 **Q4**（status 形状）、**Q5**（反射）、**Q6**（退出语义）均已定案
-> 并落地；其余 Q 属模块。**Q8**（`GCodeIO`）已定为暂缓 `[~]`。
-
-> **不列入框架、可以直接随模块做的**：G2b（`SET_PIN` 时序）、G4（运动命令本体）、
-> F6 剩余（`spi_transfer_with_preface`）、F9、H1–H11、S1、E2。
-
 ## 已定
 
 - **一台机器，单实现**：`Printer` 是一个结构体（无 trait、无工厂），一个进程只跑一个；机器
@@ -76,7 +31,7 @@
 ## 待办
 
 依赖列的是**工具性前置**，不是自然顺序。下表是索引，逐条细节在后面的小节里；
-框架级的工作已抽到文首「框架优先」，本表不再区分级别。
+框架队列（FW1–FW9）已完成，索引见文末「已完成（留档）」；本表不再区分级别。
 H1–H12 是[上游功能覆盖审计](docs/work-log/2026-09-21-upstream-coverage-audit.md)
 里**未实现**的 extras 消费者，按域归并。
 
@@ -84,20 +39,15 @@ H1–H12 是[上游功能覆盖审计](docs/work-log/2026-09-21-upstream-coverag
 
 | # | 事项 | 依赖 |
 |---|---|---|
-| C1 | toolhead 与 kinematics ✅（FW5） | — |
-| C2 | 配置装载：框架部分 ✅（FW1，含 choice/range 文案与 `deprecate` 警告）；autosave/`SAVE_CONFIG` 仍待（属模块） | C1 |
-| A2 | 错误词汇 ✅（FW3） | — |
-| B2 | MCU：`emergency_stop` 对象/端点、`last_stats`、错误载荷 + `error_mcu`、本地 shutdown 标志、固件 `reset` ✅（FW7） | — |
+| C2 | 配置装载：框架部分 ✅（FW1，含 choice/range 文案与 `deprecate` 警告）；autosave/`SAVE_CONFIG` 仍待（属模块） | — |
 | D1 | 主机层 start args / rollover / `--logfile` ✅（FW8）；`StartArgs` 剩余字段与 `M115` 接线仍待 | — |
-| D2 | 重启循环 ✅（FW8；`rpi_usb` 真机见 T5） | — |
-| D3 | `command` 接管运行中的板子：RTO 定时重传 ✅（FW7） | B2 |
 
 **MCU 资源与总线**
 
 | # | 事项 | 依赖 |
 |---|---|---|
 | F6 | SPI 总线剩余：`spi_transfer_with_preface` / `setup_shutdown_msg` | F1、F2 |
-| F8 | endstop / trsync ✅（FW6） | F1、F2、C1 |
+| F8 | endstop / trsync ✅（FW6）；测试侧「响应器式多实例假 MCU」待办（可用 `SimulatorDevice`） | F1、F2、C1 |
 | F9 | 固件资源剩余：buttons / pulse_counter / trigger_analog / initial_pins / sdcard / sensor_bulk / lcd / neopixel / thermocouple / tmcuart 等 | F1–F7 |
 
 **G-Code 与端点**
@@ -283,39 +233,6 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
       H5（TMC/tmcuart）、H6（sensor_bulk/加速度计）、H7（buttons/pulse_counter/trigger_analog）、
       H8（lcd）。
 
-### C1 toolhead 与 kinematics（框架 FW5）
-
-kinematics 已随 Printer 重构删除，从这里重新开始。动工前调查见
-[FW5 笔记](docs/work-log/2026-09-21-fw5-notes.md)，已定的设计取舍：
-
-- **chelper 用 Rust 分层重写**（不用 FFI）；「FFI 复用 C」记为 `[~]` fallback，待真板出现
-  性能问题再返工（前瞻：热路径每 flush 约 40 µs，预算 5–10 ms，Rust ≈ C，FFI 无性能收益）。
-- **`Coord([f64; 4])`**；`calc_position` 返回 `[Option<f64>; 3]`（`None` 只出现在从 stepper
-  位置反推轴位置这一处，见 `extras/homing.py:245`）。
-- **`motion_quuing` 照搬上游分层**：`MotionQueuing` 持有 trapq 与每 MCU 的输出，flush 调度
-  在它里面。
-- **`stepcompress` 先简化、后完整**：FW5c 先简化（每步一条 `queue_step`）让流程能过；
-  **FW5f 已完成完整压缩**（`(interval,count,add)` + `max_error` + `CHECK_LINES`，与上游向量对拍）。
-- **`Kinematics::check_move` 用窄 context**，不把 `Move` 暴露给 kinematics。
-- **验收先到 `G1`**；`G28` 需要 endstop/trsync（F8），与 FW6 联合验收。
-
-阶段拆分（详见笔记）：
-
-| 阶段 | 内容 | 验收 |
-|---|---|---|
-| FW5a | ✅ `Coord`（`mathutil.rs`）；`clocksync` 回归（`ClockEstimator` + `McuClock`） | host 单测（10 个） |
-| FW5b | ✅ `Move`、`LookAheadQueue`、`trapq` | host 单测（13 个） |
-| FW5c | ✅ `itersolve` + `kin_cartesian`；`stepcompress` 简化 + `warn_and_wait`（策略可注入，测试传 0） | host 单测（12 个，含告警/宽限） |
-| FW5d-1 | ✅ `ToolHead`、`MotionQueuing`、`Stepper`（host 链路） | host 单测（8 个）：`G1` 出正确 `queue_step` |
-| FW5d-2 | ✅ `McuStepper` 资源 + `setup_stepper` + `StepCommand`→MCU 命令转换 | host 单测（3 个）；`[stepper_*]` section 注册与真板读回留 FW5e |
-| FW5e-1 | ✅ `Kinematics` trait + `CartesianKinematics` + `MoveContext`（窄接口）+ ToolHead 集成 | host 单测（8 个） |
-| FW5e-2 | ✅ `[stepper_*]`/`[printer]` section 注册、`G1`/`G0`（`G4`/`M400`/`SET_KINEMATIC_POSITION`）、连接期 `stepper_get_position` 对齐 | host/装载单测；真板读回与三轴 `G1` 见 [`TESTING.md`](TESTING.md) T1 |
-| FW5f | ✅ `stepcompress` 完整压缩（`(interval,count,add)`/`max_error`/`check_line`/方向翻转/远步重锚） | 与上游 C 向量对拍 + 重构性质单测；真板 `--task motion`：500 步 → 3 条命令，读回 500 |
-
-细节条目：
-
-- [~] 回零协议：`home_rails` 已随 FW6e 落地（`extras/toolhead.rs` 的 `home_axes`/`HomingEndstop`）；
-      `get_trigger_position` / `set_stepper_adjustment` 随 `endstop_phase` 后置（H9）。
 
 ### C2 配置装载收尾（框架 FW1）
 
@@ -649,11 +566,23 @@ kinematics 已随 Printer 重构删除，从这里重新开始。动工前调查
       并顺带对齐配置解析（多行值 / `=` / 节头与 `;` 注释）、实现 `deprecate`；
       `linuxtest.test` 端到端通过（`kinematics: none` + `heaters` + `temperature_sensor` +
       `ds18b20`）。后续推进见正文 **T**。
-- **`MCU_bus_digital_out`（F3 剩余，`[~]`）**：能力已由 `DigitalOut::queue_digital_out` 提供
-      （固件按绝对 clock 翻转），不新增包装；消费者是 display `uc1701`/`st7920`（H8）。
 - **文档补齐（E1）**：`developer-manual` 补 `printer` 一节与分层表行；清掉 `printer.rs` 头注释里
       「还没有住户」的过期描述。
 
+- **框架队列 FW1–FW9（全部完成）**：FW1 配置装载、FW2 对象模型、FW3 错误词汇、FW4 G-Code、
+      FW5 运动（a–f）、FW6 资源与触发、FW7 MCU 与传输、FW8 主机层与重启、FW9 API；验收以
+      「最小模块在 host 单测 + 假 MCU 上跑通」为准，真板项见 [`TESTING.md`](TESTING.md)。
+      两个子项 `[~]` 暂缓：`GCodeIO`（不做 OctoPrint 串口仿真，见正文 G1b）、
+      `MCU_bus_digital_out` 包装（能力已由 `DigitalOut::queue_digital_out` 提供，随 H8 显示接）。
+      分阶段细节见各 FW 的工作记录
+      （`docs/work-log/2026-09-21-fw*-notes.md` 与
+      [`2026-09-22-framework-leftovers-notes.md`](docs/work-log/2026-09-22-framework-leftovers-notes.md)）。
+- **toolhead 与 kinematics（C1 / FW5a–f）**：Rust 分层重写（不引 FFI）——`Coord` 与
+      `clocksync` 回归、`Move`/`LookAheadQueue`/`trapq`、`itersolve`+`kin_cartesian`、
+      `MotionQueuing`/`ToolHead`/`McuStepper`、`Kinematics`+`cartesian`+`[stepper_*]`/`[printer]`+`G1`、
+      `stepcompress` 完整压缩；`kinematics: none` 随 T1 补上。设计取舍与逐阶段验收见
+      [FW5 笔记](docs/work-log/2026-09-21-fw5-notes.md)；回零协议的 `get_trigger_position` /
+      `set_stepper_adjustment` 随 `endstop_phase` 后置（H9）。
 - **框架队列收尾（FW1/C2、FW3/A2、FW4、FW7、FW8、FW9）**：配置 getter 补 `get_choice`/
       `get_float_bounded`/`get_int_bounded` 并改用上游文案（`config/wrapper.rs`）；`require_object`
       与 connect 失败统一 `set_error_state`（可 RESTART）；`GCodeDispatch::request_restart` +

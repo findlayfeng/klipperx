@@ -39,6 +39,7 @@ H1–H12 是[上游功能覆盖审计](docs/work-log/2026-09-21-upstream-coverag
 
 | # | 事项 | 依赖 |
 |---|---|---|
+| C1 | 运动层收尾：轴/stepper 抽象 + 多轴（C1a）、extruder 运动（C1b）、运动学族（C1c）、`gcode_move`/print-time 回调（C1d）；详见下方 C1 小节与 [C1 调查](docs/work-log/2026-09-22-c1-notes.md) | — |
 | C2 | 配置装载：框架部分 ✅（FW1，含 choice/range 文案与 `deprecate` 警告）；autosave/`SAVE_CONFIG` 仍待（属模块） | — |
 | D1 | 主机层 start args / rollover / `--logfile` ✅（FW8）；`StartArgs` 剩余字段与 `M115` 接线仍待 | — |
 
@@ -233,6 +234,30 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
       H5（TMC/tmcuart）、H6（sensor_bulk/加速度计）、H7（buttons/pulse_counter/trigger_analog）、
       H8（lcd）。
 
+
+### C1 运动层收尾
+
+FW5a–f / FW6a–f 已把「cartesian + 假 MCU 的 `G1`/`G28`」跑通并归档；C1 现在是把那条单轴
+链**推广成通用运动层**。逐项证据、拍板点与上游对照见
+[C1 动工前调查](docs/work-log/2026-09-22-c1-notes.md)；这里只记要做的事。
+
+- [ ] **C1a 轴/stepper 抽象 + 多轴**：`Printer` 在 load 期暴露 `Config`/兄弟 section；
+      `PrinterStepper::setup_itersolve(position, active_flags)`（solver 由拥有者装）；
+      `Rail`（多 stepper 一轴 + homing info）与 `LookupMultiRail` 等价物；toolhead 按
+      kinematics 给的 rail 建轴。验收：`[stepper_z1]` 与 `[stepper_z]` 一起生成
+      `queue_step`。**不依赖 H1**；为 C1b/C1c/T6/S1 提供落点。
+- [ ] **C1b extruder 运动**：`MotionQueuing` 提为 host 对象 + `allocate_trapq`/per-stepper
+      trapq；`motion` 层的 `trait ExtraAxis` 与 `LookAheadQueue`/`process_lookahead` 接线；
+      `ExtruderStepper` + `extruder_stepper_alloc` 位置函数。heater 做成可注入接口
+      （H1 落地前用桩）。
+- [ ] **C1c 运动学族**：C1c-1 corexy/hybrid_corexy/corexz/hybrid_corexz（矩阵）→
+      C1c-2 delta/rotary_delta/deltesian/winch（迭代求解 + `mathutil`）→
+      C1c-3 generic_cartesian → C1c-4 polar。
+- [ ] **C1d `gcode_move` + print-time 回调**：`[gcode_move]`（G92/M114/G90/G91/M82/M83/
+      `SET_GCODE_OFFSET`/状态保存）与 `ToolHead::register_lookahead_callback`。
+
+> **T3 的边界**：`[extruder]` 段依赖 H1 的 `heaters::setup_heater`，因此 **T3 = C1b + H1**，
+> 不是 C1 单独可解。T5 按 C1c 的族顺序推进；T10 指向 C1a。
 
 ### C2 配置装载收尾（框架 FW1）
 

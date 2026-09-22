@@ -291,6 +291,12 @@ mod tests {
             log_file: None,
             software_version: "0.1.0".to_string(),
             cpu_info: "4 core ARMv7 Processor rev 4 (v7l)".to_string(),
+            apiserver: None,
+            start_reason: "startup".to_string(),
+            debug_input: None,
+            debug_output: None,
+            device: "Raspberry Pi 4 Model B".to_string(),
+            linux_version: "Linux version 6.1.0".to_string(),
         }
     }
 

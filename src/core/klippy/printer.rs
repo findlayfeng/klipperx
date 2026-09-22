@@ -35,6 +35,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use serde_json::Value;
 use tracing::error;
 
+use crate::core::klippy::api::StartArgs;
 use crate::core::klippy::config::access::AccessTracking;
 use crate::core::klippy::config::value::ConfigValue;
 use crate::core::klippy::error::{ConfigError, KlippyError};
@@ -274,6 +275,8 @@ struct Inner {
     /// The host software version, as `M115` and `error_mcu` report it
     /// (upstream's `start_args['software_version']`).
     software_version: String,
+    /// The host's start arguments, once the host has set them.
+    start_args: Option<Arc<StartArgs>>,
 }
 
 /// Classify an MCU connect failure the way upstream's `_connect` except
@@ -335,6 +338,7 @@ impl Printer {
                 start_reason: None,
                 restart_hooks: None,
                 software_version: env!("CARGO_PKG_VERSION").to_string(),
+                start_args: None,
             }),
             exit_requested: Condvar::new(),
             reactor,
@@ -413,6 +417,22 @@ impl Printer {
     /// Set the host software version (called once by the host at startup).
     pub fn set_software_version(&self, version: impl Into<String>) {
         self.lock().software_version = version.into();
+    }
+
+    /// Store the host's start arguments.
+    ///
+    /// Upstream keeps them on the printer (`klippy/klippy.py:30,41-42`) so that
+    /// any module can read them; the `software_version` inside is what `M115`
+    /// and `error_mcu` report, so it is copied into the field those read.
+    pub fn set_start_args(&self, start_args: Arc<StartArgs>) {
+        let mut inner = self.lock();
+        inner.software_version = start_args.software_version.clone();
+        inner.start_args = Some(start_args);
+    }
+
+    /// The host's start arguments, if the host set them.
+    pub fn start_args(&self) -> Option<Arc<StartArgs>> {
+        self.lock().start_args.clone()
     }
 
     /// The toolhead's restart handle, if one registered itself.
@@ -1408,6 +1428,26 @@ mod tests {
         assert_eq!(state.category, PrinterState::Error);
         assert!(state.message.contains("pinn"), "{}", state.message);
         assert_eq!(halts.load(Ordering::SeqCst), 0, "no shutdown event");
+    }
+
+    #[test]
+    fn test_start_args_are_kept_on_the_printer() {
+        // Upstream keeps the host's start arguments on the printer
+        // (`klippy/klippy.py:30`), where modules read them; the software version
+        // inside is the one `M115` and `error_mcu` report.
+        let printer = new_printer();
+        assert_eq!(printer.software_version(), env!("CARGO_PKG_VERSION"));
+        assert!(printer.start_args().is_none());
+
+        let mut args = crate::core::klippy::api::StartArgs::collect("/tmp/printer.cfg", None);
+        args.software_version = "v1.2.3".to_string();
+        printer.set_start_args(Arc::new(args));
+
+        assert_eq!(printer.software_version(), "v1.2.3");
+        assert_eq!(
+            printer.start_args().unwrap().config_file,
+            "/tmp/printer.cfg"
+        );
     }
 
     #[test]

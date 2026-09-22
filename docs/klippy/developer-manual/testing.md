@@ -228,19 +228,20 @@ git config core.hooksPath .githooks
 端到端执行（`upstream_test_cases_run`）把每个 `[mcu]` 换成 `test: dict=<字典>`，由
 `interface/devices/simulator.rs` 的字典驱动应答机跑真实协议路径（identify、配置握手、时钟、ack）。
 激活单位是「按 `CONFIG` 拆出的**运行**」，启用条件是**该运行声明的全部字典都已构建**：架构列表
-`KLIPPERX_ARCHES`（默认 `linux`）与 `KLIPPERX_ALL_ARCHES`（全开）在**构建阶段**过滤
-`test/configs/*.config` 并产出同名 `.dict`（构建失败即报错）；未构建字典的运行直接跳过，不拿别的
-目标顶替。另有忽略列表登记因缺配置节而必然失败的 `.test`；`KLIPPERX_UPSTREAM_ALL=1` 只作用于该
-列表，不能让字典未构建的运行跑起来。内联 g-code 阶段仍以 `#[ignore]` 保留（需要同一批缺失的节）。
+`KLIPPERX_ARCHES`（默认 `linux` + `avr` + 各 ARM 家族，即主机 / `avr-gcc` / `arm-none-eabi` 三类工具链）
+与 `KLIPPERX_ALL_ARCHES`（全开）在**构建阶段**过滤 `test/configs/*.config` 并产出同名 `.dict`
+（构建失败即报错）；未构建字典的运行直接跳过，不拿别的目标顶替。另有忽略列表登记因缺配置节而必然
+失败的 `.test`；`KLIPPERX_UPSTREAM_ALL=1` 只作用于该列表，不能让字典未构建的运行跑起来。内联 g-code
+阶段仍以 `#[ignore]` 保留（需要同一批缺失的节）。
 
-全语料 37 份文件共 **239 次运行**；默认构建（只 `linux`）下 238 次因字典未构建跳过、1 次命中
-忽略列表，**实际执行 0 次**——所以 `upstream_test_cases_run` 现在恒通过。
+全语料 37 份文件共 **239 次运行**；默认构建下只有 2 条（引用 `pru`）因字典未构建跳过，其余 237 条
+全部可用，但都命中忽略列表，**实际执行 0 次**——所以 `upstream_test_cases_run` 现在恒通过。
 
 ```bash
 cargo test -p klipperx --lib upstream                 # 语料相关的全部用例
 cargo test -p klipperx --lib upstream -- --ignored    # 内联 g-code 阶段（未实现，会失败）
-KLIPPERX_ARCHES=linux,avr \
-  cargo test -p klipperx --lib upstream_test_cases_run # 构建更多架构的字典后再跑
+KLIPPERX_ARCHES=linux \
+  cargo test -p klipperx --lib upstream_test_cases_run # 只编 linux 一份（最快）
 KLIPPERX_ALL_ARCHES=1 \
   cargo test -p klipperx --lib upstream_test_cases_run # 构建全部目标（需所有交叉工具链）
 KLIPPERX_UPSTREAM_ALL=1 \

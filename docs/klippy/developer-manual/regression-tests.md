@@ -177,30 +177,28 @@ connect_file(输出文件, 字典):
 | `z_tilt.test` | 1 | `avr` |
 | `z_virtual_endstop.test` | 1 | `avr` |
 
-默认只启用 `linux`，因此默认可构建的字典只有 `linuxprocess.dict`：只有 `linuxtest.test` 与
-`printers.test` 的 linuxprocess 分组可能运行（后者需同时具备那一组声明的全部字典），其余运行
-在可用性过滤阶段被跳过。
+默认列表（`linux` + `avr` + 各 ARM 家族）会构建 37 份字典：28 个被 `.test` 引用的目标里除 `pru` 外
+全部具备（另有 9 份没被引用的目标也一并编出，作为编译覆盖）。引用 `pru` 的运行只有 2 条（`printers.test`
+里 `DICTIONARY pru.dict host=linuxprocess.dict` 那一组），它们因字典未构建被跳过。
 
 ### 当前状态
 
-按默认 `KLIPPERX_ARCHES=linux` 与现有忽略列表，239 次运行的判定：
+按默认 `KLIPPERX_ARCHES`（`linux` + `avr` + 各 ARM 家族）与现有忽略列表，239 次运行的判定：
 
 | 判定 | 次数 | 原因 |
 |------|------|------|
-| 因字典未构建跳过 | 238 | 只构建了 `linuxprocess.dict`；其余运行声明 `atmega2560.dict` 等 |
-| 因忽略列表跳过 | 1 | `linuxtest.test`（唯一字典齐备的运行）——缺 `temperature_sensor` 与 `kinematics: none` |
+| 因字典未构建跳过 | 2 | `printers.test` 中引用 `pru` 的两条运行（默认不编 `pru`） |
+| 因忽略列表跳过 | 237 | `IGNORED` 覆盖全部 37 个 `.test`；它们缺配置节/运动学 |
 | 实际执行 | 0 | — |
 
-- 忽略列表 `IGNORED` 现在覆盖全部 37 个 `.test`，所以即使把字典补齐（例如再构建 `pru`，可用
-  运行变为 3 条），也仍然没有运行会真正执行；`upstream_test_cases_run` 因此恒通过——它跑的是
-  0 次运行。这是「先立框架、暂不追平用例」的预期状态。
-- `KLIPPERX_UPSTREAM_ALL=1` 只去掉忽略列表这一层：默认构建下它会跑那唯一一条可用运行，并报出
-  `linuxtest.cfg: Error loading kinematics 'none' (only 'cartesian' is implemented)`；
-  另外 238 条仍以「字典未构建」计入统计，不算失败。
-- 要让实际执行数上升，有两件事可以分别推进：从 `IGNORED` 移除已落地节/运动学的文件；在构建阶段
-  多启用架构（`KLIPPERX_ARCHES=…`，或 `KLIPPERX_ALL_ARCHES=1` 全开），把对应运行从「字典未构建」
-  转为可执行（需要相应交叉工具链，构建失败会直接报错）。`printers.test` 的 linuxprocess 分组
-  还需要 `pru`（它那一行是 `DICTIONARY pru.dict host=linuxprocess.dict`）。
+- 忽略列表 `IGNORED` 现在覆盖全部 37 个 `.test`，所以即使字典已基本齐备（237 条可用），也没有运行
+  会真正执行；`upstream_test_cases_run` 因此恒通过——它跑的是 0 次运行。这是「先立框架、暂不追平
+  用例」的预期状态。
+- `KLIPPERX_UPSTREAM_ALL=1` 只去掉忽略列表这一层：默认构建下它会跑 237 条可用运行，全部在配置装载
+  阶段失败（缺 `stepper_x` 的 `enable_pin`、probe pin chip、各运动学等），另外 2 条仍以「字典未构建」
+  计入统计，不算失败。它还依赖 `pru`（如要全跑，用 `KLIPPERX_ALL_ARCHES=1` 或 `KLIPPERX_ARCHES` 补上）。
+- 要让实际执行数上升：从 `IGNORED` 移除已落地节/运动学的文件；已构建的字典已覆盖除 `pru` 外的
+  全部被引用目标，因此大多数文件一旦移出忽略列表就能直接开始跑。
 
 ## 本仓库的复用
 
@@ -230,10 +228,15 @@ harness 把每个 `[mcu]` / `[mcu <name>]` 的传输键换成 `test: dict=<字�
 
 ### 架构闸与字典解析
 
-激活的**架构列表**（`KLIPPERX_ARCHES`，逗号分隔，默认 `linux`）只在**构建阶段**生效：
+激活的**架构列表**（`KLIPPERX_ARCHES`，逗号分隔）只在**构建阶段**生效：
 `crates/test-support/build.rs` 据此过滤 `test/configs/*.config`，逐个 `make`，产出同名
 `<name>.dict`；选定目标构建失败即报错（交叉工具链不在列表里的目标不会被选中）。
-`KLIPPERX_ALL_ARCHES=1` 忽略该列表，构建 `test/configs/` 下的**全部**目标（需具备所有交叉工具链）。
+
+默认列表是「工具链好获得」的那一组：`linux`（主机编译器）、`avr`（`avr-gcc`）与**所有 ARM 家族**
+（`arm-none-eabi-gcc`）：`stm32`、`atsam`、`atsamd`、`lpc176x`、`rpxxxx`、`hc32f460`。其余不在默认里：
+`pru`（PRU 工具链）、`ar100`（or1k 工具链），而 `simu` 没有任何 `.test` 用。
+`KLIPPERX_ALL_ARCHES=1` 忽略该列表，构建 `test/configs/` 下的**全部**目标（含 `pru`、`ar100`、`simu`，
+需具备全部交叉工具链）。
 
 架构由 `test/configs/<name>.config` 里的全大写 `CONFIG_MACH_<FAMILY>` 判定（`AVR`、`STM32`、
 `LINUX`、`ATSAM`、`ATSAMD`、`RPXXXX`、`LPC176X`、`HC32F460`、`PRU`、`AR100`、`SIMU`；板型号
@@ -296,8 +299,8 @@ cargo test -p klipperx --lib upstream
 cargo test -p klipperx --lib every_upstream_printer_config_parses
 # 单条：全部上游 .cfg 能否被本仓库解析
 
-KLIPPERX_ARCHES=linux,avr cargo test -p klipperx --lib upstream_test_cases_run
-# 构建更多架构的字典（需相应交叉工具链）后再跑；构建失败即报错
+KLIPPERX_ARCHES=linux cargo test -p klipperx --lib upstream_test_cases_run
+# 只编 linux 一份，构建最快；默认还会编 avr 与各 ARM 家族
 
 KLIPPERX_ALL_ARCHES=1 cargo test -p klipperx --lib upstream_test_cases_run
 # 构建 test/configs 下的全部目标（需要所有交叉工具链）

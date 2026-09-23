@@ -263,21 +263,33 @@ impl PrinterExtruder {
         {
             let pa = Arc::clone(&self.pressure_advance);
             let smooth = Arc::clone(&self.pressure_advance_smooth_time);
-            let handler: CommandHandler = sync(move |gcmd: &GcodeCommand| {
-                let advance = gcmd.get_float_default("ADVANCE", *Self::lock(&pa))?;
-                let smooth_time = gcmd.get_float_default("SMOOTH_TIME", *Self::lock(&smooth))?;
-                *Self::lock(&pa) = advance;
-                *Self::lock(&smooth) = smooth_time;
-                gcmd.respond_info(&format!(
-                    "pressure_advance: {advance:.6}\npressure_advance_smooth_time: {smooth_time:.6}",
-                ));
-                Ok(())
-            });
+            let handler: CommandHandler =
+                sync(move |gcmd: &GcodeCommand| set_pressure_advance(gcmd, &pa, &smooth));
             gcode
                 .register_mux_command(
                     "SET_PRESSURE_ADVANCE",
                     "EXTRUDER",
                     Some(&self.name),
+                    handler,
+                    Some("Set pressure advance parameters"),
+                )
+                .map_err(ConfigError::new)?;
+        }
+
+        // …and an `EXTRUDER` **default** for a line that leaves the word out —
+        // registered only by the extruder literally named `extruder`, and
+        // forwarding to whichever extruder the toolhead says is active
+        // (`kinematics/extruder.py:29-31, 90-97`). Without it a bare
+        // `SET_PRESSURE_ADVANCE ADVANCE=.002` fails on the missing key.
+        if self.name == "extruder" {
+            let printer = Arc::downgrade(printer);
+            let handler: CommandHandler =
+                sync(move |gcmd: &GcodeCommand| forward_pressure_advance(&printer, gcmd));
+            gcode
+                .register_mux_command(
+                    "SET_PRESSURE_ADVANCE",
+                    "EXTRUDER",
+                    None,
                     handler,
                     Some("Set pressure advance parameters"),
                 )
@@ -316,6 +328,50 @@ impl PrinterExtruder {
     fn lock<T>(slot: &Mutex<T>) -> MutexGuard<'_, T> {
         slot.lock().unwrap_or_else(|p| p.into_inner())
     }
+}
+
+/// `SET_PRESSURE_ADVANCE`'s body: record both values and report them
+/// (upstream `extruder_stepper.cmd_SET_PRESSURE_ADVANCE`).
+fn set_pressure_advance(
+    gcmd: &GcodeCommand,
+    advance: &Arc<Mutex<f64>>,
+    smooth_time: &Arc<Mutex<f64>>,
+) -> Result<(), CommandError> {
+    let value = gcmd.get_float_default("ADVANCE", *PrinterExtruder::lock(advance))?;
+    let smooth = gcmd.get_float_default("SMOOTH_TIME", *PrinterExtruder::lock(smooth_time))?;
+    *PrinterExtruder::lock(advance) = value;
+    *PrinterExtruder::lock(smooth_time) = smooth;
+    gcmd.respond_info(&format!(
+        "pressure_advance: {value:.6}\npressure_advance_smooth_time: {smooth:.6}",
+    ));
+    Ok(())
+}
+
+/// The `EXTRUDER` default: apply to the extruder the toolhead says is active
+/// (`kinematics/extruder.py:90-97`, whose stepper checks are ours' one check
+/// — a `[extruder]` here always has its stepper when it has motor options).
+fn forward_pressure_advance(
+    printer: &std::sync::Weak<Printer>,
+    gcmd: &GcodeCommand,
+) -> Result<(), CommandError> {
+    let active = |message: &str| CommandError::new(message.to_string());
+    let printer = printer
+        .upgrade()
+        .ok_or_else(|| active("Active extruder does not have a stepper"))?;
+    let toolhead = printer
+        .lookup_object_as::<ToolHeadObject>("toolhead")
+        .ok_or_else(|| active("Active extruder does not have a stepper"))?;
+    let extruder = printer
+        .lookup_object_as::<PrinterExtruder>(&toolhead.active_extruder())
+        .ok_or_else(|| active("Active extruder does not have a stepper"))?;
+    if extruder.stepper.is_none() {
+        return Err(active("Active extruder does not have a stepper"));
+    }
+    set_pressure_advance(
+        gcmd,
+        &extruder.pressure_advance,
+        &extruder.pressure_advance_smooth_time,
+    )
 }
 
 impl PrinterObject for PrinterExtruder {
@@ -510,6 +566,7 @@ pub(crate) fn load_config(
 mod tests {
     use super::*;
     use crate::core::klippy::config::Config;
+    use crate::core::klippy::event::KlippyEvent;
     use crate::core::klippy::mathutil::{Coord, E_AXIS};
     use crate::core::klippy::motion::plan::MoveLimits;
     use crate::core::klippy::motion::Move;
@@ -535,6 +592,50 @@ mod tests {
         let (config, _) = Config::from_text(text).expect("the config parses");
         printer.load_config(&config).expect("the config loads");
         printer
+    }
+
+    /// `commands.test` sends `SET_PRESSURE_ADVANCE ADVANCE=.002
+    /// SMOOTH_TIME=.001` with **no** `EXTRUDER=` word. Upstream answers that
+    /// through the `EXTRUDER` default — registered only by the extruder
+    /// literally named `extruder` — which forwards to whichever extruder the
+    /// toolhead says is active (`kinematics/extruder.py:29-31, 90-97`).
+    #[test]
+    fn test_set_pressure_advance_without_a_key_reaches_the_active_extruder() {
+        let printer = load_ok(&extruder_config(""));
+        printer.send_event(&KlippyEvent::KlippyReady);
+        let gcode = printer
+            .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+            .expect("the loader registers `gcode`");
+
+        gcode
+            .run_script_sync("SET_PRESSURE_ADVANCE ADVANCE=.002 SMOOTH_TIME=.001")
+            .unwrap();
+
+        let extruder = printer
+            .lookup_object_as::<PrinterExtruder>("extruder")
+            .expect("[extruder] is registered");
+        let status = PrinterObject::get_status(&*extruder, 0.0);
+        assert_eq!(status["pressure_advance"], 0.002);
+        assert_eq!(status["smooth_time"], 0.001);
+    }
+
+    /// With a default registered, a key that names something else still has to
+    /// name a real extruder — the request reports what is available rather
+    /// than falling back to the default (upstream `_cmd_mux`).
+    #[test]
+    fn test_an_unknown_extruder_name_reports_what_is_available() {
+        let printer = load_ok(&extruder_config(""));
+        printer.send_event(&KlippyEvent::KlippyReady);
+        let gcode = printer
+            .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+            .expect("the loader registers `gcode`");
+
+        let err = gcode
+            .run_script_sync("SET_PRESSURE_ADVANCE EXTRUDER=nope ADVANCE=.5")
+            .unwrap_err();
+
+        assert!(err.to_string().contains("extruder"), "{err}");
+        assert!(!err.to_string().contains("missing"), "{err}");
     }
 
     #[test]

@@ -351,13 +351,14 @@ FW5a–f / FW6a–f 已把「cartesian + 假 MCU 的 `G1`/`G28`」跑通并归�
 
 框架已落地：`src/core/klippy/upstream.rs`（字典驱动应答机 + 按 `CONFIG` 拆分的运行）与
 `crates/test-support/build.rs`（按架构编字典）；T1（`linuxtest.test`）已完成并转绿。当前 239 次
-运行里，默认构建缺 2 条（引用 `pru`）、忽略列表 36 条（除 `linuxtest.test` 外的全部 `.test`）、
-实际执行 1 条（通过）；忽略列表即本节的工单，每步做完就从 `IGNORED` 移除对应文件
-（手册见 `docs/klippy/developer-manual/regression-tests.md`）。
+运行里，默认构建缺 2 条（引用 `pru`）、忽略列表 34 条、
+实际执行 3 条（`linuxtest.test`、`out_of_bounds.test`、`commands.test`，均通过）；忽略列表即本节的工单，每步做完
+就从 `IGNORED` 移除对应文件（手册见
+`docs/klippy/developer-manual/regression-tests.md`）。
 
 **推进口径**：下文的「首次失败原因」分组只用于定位，不是工作队列——`load_config` 遇到第一个
 未知 section 就停，修好一个缺口只会让运行前进到下一个缺口，总数可能不变（T7 后的 236 就是
-例子），各组收益不可加。进度以**转绿运行数 / `IGNORED` 条目数**衡量（当前 1 / 36）。**验收标准
+例子），各组收益不可加。进度以**转绿运行数 / `IGNORED` 条目数**衡量（当前 3 / 34）。**验收标准
 是「对应 `.test` 从 `IGNORED` 移除后通过」**，不是「某个错误不再出现」。详见
 [失败原因分析复盘](docs/work-log/2026-09-22-upstream-regression-failures.md#复盘计数口径与重排后补)。
 

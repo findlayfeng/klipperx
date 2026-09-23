@@ -6,8 +6,8 @@
 //! is the object the bed registers with the printer.
 //!
 //! `M190` waits for the target in upstream (`heaters.set_temperature(wait=True)`
-//! through `TEMPERATURE_WAIT`); the wait loop is H1-3, so `M190` currently sets
-//! the target and returns, like `M140`.
+//! through `TEMPERATURE_WAIT`); the wait loop is not wired here yet, so `M190`
+//! currently sets the target and returns, like `M140`.
 
 use std::sync::Arc;
 

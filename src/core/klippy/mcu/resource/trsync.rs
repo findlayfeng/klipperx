@@ -183,7 +183,7 @@ impl McuTrsync {
         // The registry is captured for the config callback only. Storing it —
         // or the whole chip that owns it — in the trsync would make
         // `registry ↔ trsync` a strong cycle and keep the connected `Mcu`
-        // alive forever (TODO F8b).
+        // alive forever (the F8b fix keeps these `Weak`).
         let registry = chip.trsync_registry();
         let trsync_chip = chip.trsync_chip();
         let trsync = Arc::new(Self {

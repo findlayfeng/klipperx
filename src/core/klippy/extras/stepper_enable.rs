@@ -12,14 +12,14 @@
 //! | `EnableTracking` | per-stepper enable state + callbacks |
 //! | `PrinterStepperEnable` | global tracking, g-code commands, status |
 //!
-//! # Limitations (FW5e+)
+//! # Limitations
 //!
 //! The upstream implementation schedules enable/disable at print time through
 //! the toolhead (`toolhead.dwell`, `toolhead.flush_step_generation`). This
-//! port does not yet have a toolhead, so `set_motors_enable` applies
-//! immediately rather than syncing with motion. A dedicated enable pin on its
-//! own is not urgent; what matters is that the infrastructure exists for when
-//! the toolhead lands.
+//! port's toolhead exists but that wiring does not: `motor_off` /
+//! `SET_STEPPER_ENABLE` apply immediately rather than syncing with motion. A
+//! dedicated enable pin on its own is not urgent; what matters is that the
+//! infrastructure exists for when print-time scheduling (C1d) lands.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

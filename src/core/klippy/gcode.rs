@@ -31,7 +31,8 @@
 //! * **The `ok` acknowledgement.** Upstream's `ack()` belongs to the file-output
 //!   and debug-input protocols (`GCodeIO`), which this host does not have yet.
 //! * **`gcode:command_error`.** Upstream fires that event on a handler error;
-//!   the printer's event set is still the closed one (see TODO Q2).
+//!   we do too, on the `KlippyEvent` bus (an open vocabulary with an `Unknown`
+//!   fallback, see the event system doc), not a closed event set.
 //! * **`run_script`'s mutex.** Upstream serialises scripts on the reactor's
 //!   mutex. Here a script runs to completion on the calling task; a second
 //!   caller would interleave only at awaits, and nothing in a handler awaits.

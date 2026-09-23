@@ -199,8 +199,9 @@ connect_file(输出文件, 字典):
 - 按「首次失败原因」的分组（T3–T10 工单）、运动学细分与完整失败日志不在本手册重复维护，
   统一见 [上游回归测试失败原因分析](../../work-log/2026-09-22-upstream-regression-failures.md)
   （2026-09-22 快照，含 T7 完成后的状态与复盘）。
-- 要让实际执行数继续上升：从 `IGNORED` 移除已落地节/运动学的文件。按 T3（`extruder`/`heater_bed`/`fan`）
-  与 T4（`probe`/`bltouch`/endstop pin chip）推进。
+- 要让实际执行数继续上升：从 `IGNORED` 移除已落地节/运动学的文件。T3（`extruder`/`heater_bed`/`fan`）
+  三个段已落地，可先试移 `extruders.test` / `temperature.test` 等文件；剩余缺口中 T4（`probe`/
+  `bltouch`/endstop pin chip）尚未动工，T5 运动学已消掉 corexy 族（C1c-1）剩下 delta 等。
 
 ### 推进口径与验收
 

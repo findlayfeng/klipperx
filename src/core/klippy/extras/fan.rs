@@ -193,7 +193,7 @@ impl Fan {
     /// Choose the speed from a g-code line: upstream's
     /// `Fan.set_speed_from_command`, which waits for the toolhead's lookahead.
     ///
-    /// Both entry points land in [`Fan::apply`] today, for the reason
+    /// Both entry points land in `Fan::apply` today, for the reason
     /// [`set_speed`](Fan::set_speed) gives.
     ///
     /// # Errors

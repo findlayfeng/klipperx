@@ -343,6 +343,7 @@ mod tests {
                 "adc_temperature",
                 "thermistor",
                 "board_pins",
+                "manual_probe",
                 "probe",
                 "temperature_sensor",
                 "static_digital_output",

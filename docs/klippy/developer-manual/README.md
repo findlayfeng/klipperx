@@ -286,6 +286,7 @@ identify 的命令**定义**（名称、参数、解码）与其它命令一样�
 | `fan.rs` | `[fan]`：读 `pin` / `max_power` / `kick_start_time` / `off_below` / `cycle_time` / `hardware_pwm` / `shutdown_speed` / 可选 `enable_pin`（`tachometer_pin` 拒收，需 `pulse_counter`），注册 `M106` / `M107`；`call_later` 做 kick-start |
 | `gcode_move.rs` | G-Code 坐标系（无配置节，由 `[printer]` 的装载拉起）：偏移、G90/G91、M82/M83、速度/挤出系数；注册 `G0`/`G1`/`G92`/`M114`/`SET_GCODE_OFFSET`/`SAVE_GCODE_STATE` 等，并把工具头坐标交给 toolhead |
 | `toolhead.rs` | `[printer]`（`object = "toolhead"`，`phase = late`）：读 `kinematics` / `max_velocity` / `max_accel` / `max_z_velocity` / `max_z_accel` / `square_corner_velocity`，建运动栈与 rail，注册 `G4` / `M400` / `G28` / `SET_KINEMATIC_POSITION`；提供探针式回零 `probing_move`（供 probe 族消费：`homing_move_begin` 先于采样、无触发报 `No trigger on probe after full movement`、移动前已触发报 `Probe triggered prior to movement`）；拉起 `gcode_move` 与 `query_endstops` |
+| `manual_probe.rs` | `[manual_probe]`：交互式 Z 高度探测。`MANUAL_PROBE` / `Z_ENDSTOP_CALIBRATE` 启动助手，动态注册 `ACCEPT`/`NEXT`/`ABORT`/`TESTZ`（结束即注销）、Z 先抬 `Z_BOB_MINIMUM` 再落、`TESTZ` 支持 `+`/`++`/`-`/`--` 二分与数值、状态报 `{is_active, z_position, z_position_lower, z_position_upper}`；`verify_no_manual_probe` 用 `unregister_command` 精确判定。**未做**：`Z_OFFSET_APPLY_ENDSTOP`/`Z_OFFSET_APPLY_DELTA_ENDSTOPS`（需 `gcode_move` 的 `homing_origin` 与 delta 塔段，T5）、z 位置取 kinematics 反算（现取指令位置，cartesian 等价） |
 | `probe.rs` | `[probe]`：探针与虚拟 Z 端停。读 `pin` / `z_offset` / `x_offset` / `y_offset` / `speed` / `lift_speed` / `samples` / `sample_retract_dist` / `samples_result` / `samples_tolerance` / `samples_tolerance_retries` / `deactivate_on_each_sample` / `activate_gcode` / `deactivate_gcode`；用 `setup_endstop` 建物理探针端停，并以 `probe` 之名 `register_chip`，使 `endstop_pin: probe:z_virtual_endstop` 可解析（`setup_pin` 只认该名字、拒 `!`/`^`，文案同上游）。会话 `ProbeSessionHelper` 做 samples 采样、`samples_tolerance` 重试与 median/average 归并，发 `probe:update_results`，并在 `gcode:command_error` 时收尾会话；注册 `QUERY_PROBE` / `PROBE` / `PROBE_ACCURACY`；`get_status` 报 `{name, last_query, last_z_result}`。**未落地**：`PROBE_CALIBRATE` / `Z_OFFSET_APPLY_PROBE`（需 `manual_probe` + `configfile.set`）、`ProbePointsHelper`、endstop wrapper 的 `z_offset`/`query_endstop` 覆盖（需把 `PinChip::setup_endstop` 接口化） |
 | `query_endstops.rs` | `query_endstops` 对象（由 `[printer]` 装载拉起，无配置节）：登记各 rail 的 endstop，注册 `QUERY_ENDSTOPS` / `M119`，`get_status` 报 `last_query` |
 | `i2c_device.rs` | `[i2c_device <name>]`：原始 I2C 设备，经 `McuI2c`；注册 mux `IIC_WRITE` / `IIC_READ`（键 `DEVICE`），十六进制 `DATA=` 经 `bus_debug` |
@@ -293,7 +294,7 @@ identify 的命令**定义**（名称、参数、解码）与其它命令一样�
 | `bus_debug.rs` | `i2c_device` / `spi_device` 共用的调试命令底座：同步→异步桥与 `DATA=` 的十六进制编解码（无配置节） |
 | `error_mcu.rs` | MCU 停机消息的展开（无配置节，第一个 `[mcu]` 拉起）：监听 `klippy:shutdown` / `klippy:analyze_shutdown`，把简短原因扩成原因+提示（上游 `extras/error_mcu.py`） |
 
-`extras/` 的 23 个模块全部在 `extras/mod.rs` 声明；其中 18 个带 `section!`（含 `printer`，声明在 `toolhead.rs`；`mcu` 声明在 `mcu/mod.rs`，共 19 个装载 id）构成工厂表，其余（`heaters` / `gcode_move` / `query_endstops` / `error_mcu` / `bus_debug`）由上述模块按需 `ensure`，不占配置节。
+`extras/` 的 24 个模块全部在 `extras/mod.rs` 声明；其中 19 个带 `section!`（含 `printer`，声明在 `toolhead.rs`；`mcu` 声明在 `mcu/mod.rs`，共 20 个装载 id）构成工厂表，其余（`heaters` / `gcode_move` / `query_endstops` / `error_mcu` / `bus_debug`）由上述模块按需 `ensure`，不占配置节。
 
 ### `api/` — 客户端 API 层
 
@@ -351,7 +352,7 @@ API 本身在 `crates/klippy-api/src/`：
 | `access.rs` | `AccessTracking`：每个节/选项谁读过的账本 |
 | `validate.rs` | `check_unused`：装载末尾拒绝没人读过的节与选项（上游 `ConfigValidate.check_unused`） |
 | `mcu.rs` | `[mcu]` 节的专用解析：传输键二选一（`serial`/`canbus_*`/`host_library`/`test`）、`baud`/`restart_method`/`usb_power` 校验，产出 `McuConfig` |
-| `object.rs` | `configfile` 打印机对象：面向客户端的配置状态与五种 `warnings` 形状 |
+| `object.rs` | `configfile` 打印机对象：面向客户端的配置状态与五种 `warnings` 形状；`set` / `remove_section` 记下待回写的 autosave 值（`save_config_pending` / `save_config_pending_items`，`SAVE_CONFIG` 落盘仍未做） |
 
 ### `interface/` — 传输与设备
 

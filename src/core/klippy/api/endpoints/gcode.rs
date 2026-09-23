@@ -119,7 +119,7 @@ impl Endpoint for GcodeScript {
         let script = request.params().get_str("script")?;
         let gcode = gcode(&self.printer)?;
         gcode
-            .run_script(script)
+            .run_script_blocking(script)
             .map_err(|err| ApiError::CommandError(err.to_string()))?;
         Ok(json!({}))
     }
@@ -167,7 +167,7 @@ impl Endpoint for GcodeRestart {
     ) -> Result<Value, ApiError> {
         let gcode = gcode(&self.printer)?;
         gcode
-            .run_script(self.script)
+            .run_script_blocking(self.script)
             .map_err(|err| ApiError::CommandError(err.to_string()))?;
         Ok(json!({}))
     }
@@ -303,7 +303,7 @@ mod tests {
     use super::*;
     use crate::core::klippy::api::registry::Api;
     use crate::core::klippy::api::test_support::{context, silent_target};
-    use crate::core::klippy::gcode::{CommandError, CommandHandler};
+    use crate::core::klippy::gcode::{sync, CommandError, CommandHandler};
     use crate::core::klippy::reactor::ManualReactor;
 
     fn request(body: &str) -> Request {
@@ -365,7 +365,7 @@ mod tests {
             .unwrap();
 
         // Anything the dispatcher says now reaches the subscriber.
-        gcode(&printer).run_script("M115").unwrap();
+        gcode(&printer).run_script_sync("M115").unwrap();
 
         let pushes = target.pushes();
         assert_eq!(pushes[0]["method"], "gcode:output");
@@ -399,7 +399,7 @@ mod tests {
             .handle(&request(body), &context(&api, target.clone()))
             .unwrap();
 
-        first.run_script("M115").unwrap();
+        first.run_script_sync("M115").unwrap();
         let after_first = target.pushes().len();
         assert!(
             after_first > 0,
@@ -413,7 +413,7 @@ mod tests {
         printer.add_object(GCODE_OBJECT, second.clone()).unwrap();
 
         reattach(&printer, &endpoint.subscribers, &endpoint.attached);
-        second.run_script("M115").unwrap();
+        second.run_script_sync("M115").unwrap();
 
         let pushes = target.pushes();
         assert!(
@@ -425,7 +425,7 @@ mod tests {
     #[test]
     fn test_help_returns_the_flat_command_table() {
         let printer = printer();
-        let handler: CommandHandler = Arc::new(|_| Ok(()));
+        let handler: CommandHandler = sync(|_| Ok(()));
         gcode(&printer)
             .register_command("SET_PIN", handler, Some("Set a pin"), false)
             .unwrap();
@@ -462,7 +462,7 @@ mod tests {
         gcode(&printer)
             .register_command(
                 "FAIL",
-                Arc::new(|_| Err(CommandError::new("boom"))),
+                sync(|_| Err(CommandError::new("boom"))),
                 None,
                 false,
             )

@@ -18,7 +18,6 @@
 //! debug commands use; the machine runtime is multi-threaded, so one worker
 //! blocking on the exchange is fine.
 
-use std::future::Future;
 use std::sync::{Arc, Mutex, Weak};
 
 use serde_json::{json, Value};
@@ -50,10 +49,10 @@ impl QueryEndstops {
             .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
             .expect("the loader registers `gcode` before any section");
         let printer_weak = Arc::downgrade(printer);
-        let handler: CommandHandler = {
+        let handler: CommandHandler = Arc::new(move |gcmd: &GcodeCommand| {
             let printer = printer_weak.clone();
-            Arc::new(move |gcmd| cmd_query_endstops(&printer, gcmd))
-        };
+            Box::pin(async move { cmd_query_endstops(&printer, gcmd).await })
+        });
         for name in ["QUERY_ENDSTOPS", "M119"] {
             gcode
                 .register_command(
@@ -105,12 +104,24 @@ impl QueryEndstops {
         Ok(state)
     }
 
-    /// [`QueryEndstops::query_all`] from a synchronous handler.
+    /// [`QueryEndstops::query_all`] from a synchronous caller.
+    ///
+    /// **Temporary**: the `klippy-api` `Endpoint` trait is still synchronous, so
+    /// `query_endstops/status` cannot `.await` this yet. Remove it once that
+    /// trait is async.
     ///
     /// # Errors
     /// Returns a [`CommandError`] when a query fails or the runtime cannot block.
     pub fn query_all_blocking(&self, print_time: f64) -> Result<Vec<(String, bool)>, CommandError> {
-        block_on(self.query_all(print_time))
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|_| CommandError::new("endstop queries need the async runtime"))?;
+        if handle.runtime_flavor() != tokio::runtime::RuntimeFlavor::MultiThread {
+            return Err(CommandError::new(
+                "endstop queries need the multi-threaded runtime",
+            ));
+        }
+        tokio::task::block_in_place(|| handle.block_on(self.query_all(print_time)))
+            .map_err(|err| CommandError::new(err.to_string()))
     }
 }
 
@@ -140,14 +151,20 @@ pub(crate) fn query_print_time(printer: &Printer) -> f64 {
 }
 
 /// `M119` / `QUERY_ENDSTOPS`: report every endstop's current level.
-fn cmd_query_endstops(printer: &Weak<Printer>, gcmd: &GcodeCommand) -> Result<(), CommandError> {
+async fn cmd_query_endstops(
+    printer: &Weak<Printer>,
+    gcmd: &GcodeCommand,
+) -> Result<(), CommandError> {
     let printer = printer
         .upgrade()
         .ok_or_else(|| CommandError::new("Printer is not available"))?;
     let query = printer
         .lookup_object_as::<QueryEndstops>(QUERY_ENDSTOPS_OBJECT)
         .ok_or_else(|| CommandError::new("query_endstops is not available"))?;
-    let state = query.query_all_blocking(query_print_time(&printer))?;
+    let state = query
+        .query_all(query_print_time(&printer))
+        .await
+        .map_err(|err| CommandError::new(err.to_string()))?;
     let msg = state
         .iter()
         .map(|(name, triggered)| {
@@ -157,19 +174,6 @@ fn cmd_query_endstops(printer: &Weak<Printer>, gcmd: &GcodeCommand) -> Result<()
         .join(" ");
     gcmd.respond_raw(&msg);
     Ok(())
-}
-
-/// Drive an async query from a synchronous handler (the `bus_debug` bridge).
-fn block_on<T>(future: impl Future<Output = Result<T, McuError>>) -> Result<T, CommandError> {
-    let handle = tokio::runtime::Handle::try_current()
-        .map_err(|_| CommandError::new("endstop queries need the async runtime"))?;
-    if handle.runtime_flavor() != tokio::runtime::RuntimeFlavor::MultiThread {
-        return Err(CommandError::new(
-            "endstop queries need the multi-threaded runtime",
-        ));
-    }
-    tokio::task::block_in_place(|| handle.block_on(future))
-        .map_err(|err| CommandError::new(err.to_string()))
 }
 
 #[cfg(test)]
@@ -342,7 +346,7 @@ mod tests {
             }));
         }
 
-        gcode.run_script("M119").unwrap();
+        gcode.run_script("M119").await.unwrap();
 
         // No endstops registered: the report is the empty line.
         assert_eq!(*lines.lock().unwrap(), vec![String::new()]);

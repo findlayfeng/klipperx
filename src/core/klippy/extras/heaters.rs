@@ -22,7 +22,7 @@ use crate::core::klippy::extras::spi_temperature;
 use crate::core::klippy::extras::temperature_combined;
 use crate::core::klippy::extras::temperature_mcu;
 use crate::core::klippy::gcode::{
-    CommandError, CommandHandler, GCodeDispatch, GcodeCommand, GCODE_OBJECT,
+    sync, CommandError, CommandHandler, GCodeDispatch, GcodeCommand, GCODE_OBJECT,
 };
 use crate::core::klippy::pins::{PrinterPins, PwmOut, PINS_OBJECT};
 use crate::core::klippy::printer::{Printer, PrinterObject};
@@ -500,7 +500,7 @@ impl PrinterHeaters {
         let gcode = printer
             .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
             .expect("the loader registers `gcode` before any section");
-        let handler: CommandHandler = Arc::new(move |gcmd: &GcodeCommand| {
+        let handler: CommandHandler = sync(move |gcmd: &GcodeCommand| {
             let target = gcmd.get_float_default("TARGET", 0.0)?;
             heater.set_temp(target)
         });

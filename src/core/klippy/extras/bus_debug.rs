@@ -10,33 +10,6 @@
 //! call `McuI2c` / `McuSpi` directly from its own async task.
 
 use crate::core::klippy::gcode::CommandError;
-use crate::core::klippy::mcu::McuError;
-
-/// Drive an asynchronous bus transfer from a synchronous G-Code handler.
-///
-/// The dispatcher's handlers are synchronous and cannot await (`gcode.rs`), and
-/// a bus transfer is a request/response exchange, so the future is run to
-/// completion on the current runtime. `block_in_place` is what makes that legal
-/// on a runtime worker; the server's runtimes are multi-threaded
-/// (`src/klippy.rs`), and this bridge exists only for the debug commands — a
-/// real driver would drive the transfer from its own async task.
-///
-/// # Errors
-/// Returns the transfer's error, or the fact that this thread's runtime cannot
-/// block (a single-threaded runtime).
-pub(super) fn block_on<T>(
-    future: impl std::future::Future<Output = Result<T, McuError>>,
-) -> Result<T, CommandError> {
-    let handle = tokio::runtime::Handle::try_current()
-        .map_err(|_| CommandError::new("bus commands need the async runtime"))?;
-    if handle.runtime_flavor() != tokio::runtime::RuntimeFlavor::MultiThread {
-        return Err(CommandError::new(
-            "bus commands need the multi-threaded runtime",
-        ));
-    }
-    tokio::task::block_in_place(|| handle.block_on(future))
-        .map_err(|err| CommandError::new(err.to_string()))
-}
 
 /// Decode a hex string (`"01af"`, whitespace ignored) into bytes.
 pub(super) fn hex_decode(text: &str) -> Result<Vec<u8>, CommandError> {

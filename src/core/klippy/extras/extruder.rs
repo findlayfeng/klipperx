@@ -27,7 +27,7 @@ use crate::core::klippy::extras::heaters::{self, Heater};
 use crate::core::klippy::extras::stepper::PrinterStepper;
 use crate::core::klippy::extras::toolhead::ToolHeadObject;
 use crate::core::klippy::gcode::{
-    CommandError, CommandHandler, GCodeDispatch, GcodeCommand, GCODE_OBJECT,
+    sync, CommandError, CommandHandler, GCodeDispatch, GcodeCommand, GCODE_OBJECT,
 };
 use crate::core::klippy::load::section;
 use crate::core::klippy::mcu::McuStepper;
@@ -251,7 +251,7 @@ impl PrinterExtruder {
             for (name, wait) in [("M104", false), ("M109", true)] {
                 let printer = Arc::downgrade(printer);
                 let handler: CommandHandler =
-                    Arc::new(move |gcmd: &GcodeCommand| cmd_set_temperature(&printer, gcmd, wait));
+                    sync(move |gcmd: &GcodeCommand| cmd_set_temperature(&printer, gcmd, wait));
                 gcode
                     .register_command(name, handler, Some("Set extruder temperature"), false)
                     .map_err(ConfigError::new)?;
@@ -263,7 +263,7 @@ impl PrinterExtruder {
         {
             let pa = Arc::clone(&self.pressure_advance);
             let smooth = Arc::clone(&self.pressure_advance_smooth_time);
-            let handler: CommandHandler = Arc::new(move |gcmd: &GcodeCommand| {
+            let handler: CommandHandler = sync(move |gcmd: &GcodeCommand| {
                 let advance = gcmd.get_float_default("ADVANCE", *Self::lock(&pa))?;
                 let smooth_time = gcmd.get_float_default("SMOOTH_TIME", *Self::lock(&smooth))?;
                 *Self::lock(&pa) = advance;
@@ -288,7 +288,7 @@ impl PrinterExtruder {
         {
             let name = self.name.clone();
             let printer = Arc::downgrade(printer);
-            let handler: CommandHandler = Arc::new(move |gcmd: &GcodeCommand| {
+            let handler: CommandHandler = sync(move |gcmd: &GcodeCommand| {
                 let Some(printer) = printer.upgrade() else {
                     return Err(CommandError::new("printer is gone"));
                 };

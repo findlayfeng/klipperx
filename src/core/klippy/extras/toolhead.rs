@@ -65,7 +65,7 @@ use crate::core::klippy::extras::extruder::PrinterExtruder;
 use crate::core::klippy::extras::query_endstops::{QueryEndstops, QUERY_ENDSTOPS_OBJECT};
 use crate::core::klippy::extras::stepper::{Rail, RailParams};
 use crate::core::klippy::gcode::{
-    CommandError, CommandHandler, GCodeDispatch, GcodeCommand, GCODE_OBJECT,
+    sync, CommandError, CommandHandler, GCodeDispatch, GcodeCommand, GCODE_OBJECT,
 };
 use crate::core::klippy::load::section;
 use crate::core::klippy::mathutil::{Coord, X_AXIS, Y_AXIS, Z_AXIS};
@@ -398,21 +398,21 @@ impl ToolHeadObject {
         }
         let dwell_handler: CommandHandler = {
             let state = Arc::clone(&self.state);
-            Arc::new(move |gcmd| cmd_dwell(&state, gcmd))
+            sync(move |gcmd| cmd_dwell(&state, gcmd))
         };
         gcode
             .register_command("G4", dwell_handler, None, false)
             .map_err(ConfigError::new)?;
         let wait_handler: CommandHandler = {
             let state = Arc::clone(&self.state);
-            Arc::new(move |gcmd| cmd_wait_moves(&state, gcmd))
+            sync(move |gcmd| cmd_wait_moves(&state, gcmd))
         };
         gcode
             .register_command("M400", wait_handler, None, false)
             .map_err(ConfigError::new)?;
         let position_handler: CommandHandler = {
             let state = Arc::clone(&self.state);
-            Arc::new(move |gcmd| cmd_set_kinematic_position(&state, gcmd))
+            sync(move |gcmd| cmd_set_kinematic_position(&state, gcmd))
         };
         gcode
             .register_command(
@@ -426,7 +426,12 @@ impl ToolHeadObject {
             let state = Arc::clone(&self.state);
             let rails = self.rails.clone();
             let printer = Arc::downgrade(printer);
-            Arc::new(move |gcmd| cmd_g28(&state, &rails, &printer, gcmd))
+            Arc::new(move |gcmd: &GcodeCommand| {
+                let state = Arc::clone(&state);
+                let rails = rails.clone();
+                let printer = printer.clone();
+                Box::pin(async move { cmd_g28(&state, &rails, &printer, gcmd).await })
+            })
         };
         gcode
             .register_command("G28", home_handler, Some("Home one or more axes"), false)
@@ -991,7 +996,7 @@ fn command_error(err: McuError) -> CommandError {
 
 /// `G0` / `G1`: move the toolhead.
 fn move_command(state: Arc<Mutex<Option<Connected>>>, speed: Arc<Mutex<f64>>) -> CommandHandler {
-    Arc::new(move |gcmd| {
+    sync(move |gcmd| {
         let mut guard = state.lock().unwrap_or_else(|poison| poison.into_inner());
         let Some(connected) = guard.as_mut() else {
             return Err(CommandError::new("Printer is not ready"));
@@ -1106,10 +1111,10 @@ fn axis_indices(names: &str) -> Vec<usize> {
 /// endstop trigger), so the toolhead is taken out of its shared slot, the run is
 /// driven on the current worker via `block_in_place`, and the toolhead is put
 /// back afterwards. The background flush task sees an empty slot and stands back.
-fn cmd_g28(
+async fn cmd_g28(
     state: &Arc<Mutex<Option<Connected>>>,
     rails: &[Arc<Rail>],
-    _printer: &Weak<Printer>,
+    printer: &Weak<Printer>,
     gcmd: &GcodeCommand,
 ) -> Result<(), CommandError> {
     let params = gcmd.get_command_parameters();
@@ -1125,16 +1130,19 @@ fn cmd_g28(
         requested
     };
 
-    let mut guard = state.lock().unwrap_or_else(|poison| poison.into_inner());
-    let Some(mut connected) = guard.take() else {
-        return Err(CommandError::new("Printer is not ready"));
+    // Take the toolhead out of its shared slot, then drop the lock before
+    // awaiting: the homing run is long, and a `MutexGuard` is not `Send`, so it
+    // must not be held across the await. The background flush task sees the
+    // empty slot and stands back, as it did when this used `block_in_place`.
+    let mut connected = {
+        let mut guard = state.lock().unwrap_or_else(|poison| poison.into_inner());
+        let Some(connected) = guard.take() else {
+            return Err(CommandError::new("Printer is not ready"));
+        };
+        connected
     };
-    let handle = tokio::runtime::Handle::try_current()
-        .map_err(|_| CommandError::new("G28 needs the async runtime"))?;
-    let result = tokio::task::block_in_place(|| {
-        handle.block_on(home_axes(&mut connected, rails, &requested, _printer))
-    });
-    *guard = Some(connected);
+    let result = home_axes(&mut connected, rails, &requested, printer).await;
+    *state.lock().unwrap_or_else(|poison| poison.into_inner()) = Some(connected);
     result
 }
 
@@ -1363,8 +1371,8 @@ mod tests {
         (state, GCodeDispatch::new(printer))
     }
 
-    #[test]
-    fn test_g1_parses_axes_and_speed_into_a_move() {
+    #[tokio::test]
+    async fn test_g1_parses_axes_and_speed_into_a_move() {
         let (state, gcode) = connected(homed_toolhead());
         let handler = move_command(Arc::clone(&state), Arc::new(Mutex::new(DEFAULT_MOVE_SPEED)));
         let command = gcode.create_gcode_command(
@@ -1376,7 +1384,7 @@ mod tests {
             ]),
         );
 
-        handler(&command).unwrap();
+        handler(&command).await.unwrap();
         // Flushing moves the look-ahead into the trapq; a single short move does
         // not trigger the flush on its own.
         state
@@ -1396,8 +1404,8 @@ mod tests {
         assert!(!connected.toolhead.trapq().moves().is_empty());
     }
 
-    #[test]
-    fn test_g1_remembers_the_last_speed() {
+    #[tokio::test]
+    async fn test_g1_remembers_the_last_speed() {
         let (state, gcode) = connected(homed_toolhead());
         let handler = move_command(Arc::clone(&state), Arc::new(Mutex::new(DEFAULT_MOVE_SPEED)));
         handler(&gcode.create_gcode_command(
@@ -1408,6 +1416,7 @@ mod tests {
                 ("F".to_string(), "600".to_string()),
             ]),
         ))
+        .await
         .unwrap();
         // The second move has no F and must reuse the first one.
         handler(&gcode.create_gcode_command(
@@ -1415,14 +1424,15 @@ mod tests {
             "G1 X20",
             HashMap::from([("X".to_string(), "20".to_string())]),
         ))
+        .await
         .unwrap();
 
         let guard = state.lock().unwrap();
         assert_eq!(guard.as_ref().unwrap().toolhead.commanded_pos().x(), 20.0);
     }
 
-    #[test]
-    fn test_g1_rejects_a_non_positive_feedrate() {
+    #[tokio::test]
+    async fn test_g1_rejects_a_non_positive_feedrate() {
         let (state, gcode) = connected(homed_toolhead());
         let handler = move_command(Arc::clone(&state), Arc::new(Mutex::new(DEFAULT_MOVE_SPEED)));
         let command = gcode.create_gcode_command(
@@ -1434,13 +1444,13 @@ mod tests {
             ]),
         );
 
-        let err = handler(&command).unwrap_err();
+        let err = handler(&command).await.unwrap_err();
 
         assert!(err.to_string().contains("Invalid speed"), "{err}");
     }
 
-    #[test]
-    fn test_g1_refuses_a_move_on_an_unhomed_axis() {
+    #[tokio::test]
+    async fn test_g1_refuses_a_move_on_an_unhomed_axis() {
         let mut toolhead = homed_toolhead();
         toolhead.set_position(Coord::default(), &[]);
         // Clearing the homed axes is what an unhomed machine looks like.
@@ -1458,7 +1468,7 @@ mod tests {
             ]),
         );
 
-        let err = handler(&command).unwrap_err();
+        let err = handler(&command).await.unwrap_err();
 
         assert!(err.to_string().contains("Must home axis first"), "{err}");
     }

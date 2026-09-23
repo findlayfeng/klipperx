@@ -16,7 +16,7 @@ use serde_json::Value;
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
 use crate::core::klippy::extras::heaters::{self, Heater};
 use crate::core::klippy::gcode::{
-    CommandError, CommandHandler, GCodeDispatch, GcodeCommand, GCODE_OBJECT,
+    sync, CommandError, CommandHandler, GCodeDispatch, GcodeCommand, GCODE_OBJECT,
 };
 use crate::core::klippy::load::section;
 use crate::core::klippy::printer::{Printer, PrinterObject};
@@ -51,7 +51,7 @@ impl PrinterHeaterBed {
             .expect("the loader registers `gcode` before any section");
         for (name, _wait) in [("M140", false), ("M190", true)] {
             let heater = Arc::clone(&self.heater);
-            let handler: CommandHandler = Arc::new(move |gcmd: &GcodeCommand| {
+            let handler: CommandHandler = sync(move |gcmd: &GcodeCommand| {
                 let temp = gcmd.get_float_default("S", 0.0)?;
                 set_bed_temperature(&heater, temp)
             });
@@ -139,9 +139,9 @@ mod tests {
             .lookup_object_as::<PrinterHeaterBed>("heater_bed")
             .unwrap();
 
-        gcode.run_script("M140 S60").unwrap();
+        gcode.run_script_sync("M140 S60").unwrap();
         assert_eq!(bed.heater().get_status()["target"], 60.0);
-        gcode.run_script("M190 S70").unwrap();
+        gcode.run_script_sync("M190 S70").unwrap();
         assert_eq!(bed.heater().get_status()["target"], 70.0);
     }
 }

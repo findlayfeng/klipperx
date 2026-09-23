@@ -19,14 +19,13 @@
       「最小模块在 host 单测 + 假 MCU 上跑通」为准，真板项见 [`TESTING.md`](../../TESTING.md)。
       两个子项 `[~]` 暂缓：`GCodeIO`（不做 OctoPrint 串口仿真，见正文 G1b）、
       `MCU_bus_digital_out` 包装（能力已由 `DigitalOut::queue_digital_out` 提供，随 H8 显示接）。
-      分阶段细节见各 FW 的工作记录
-      （`docs/work-log/2026-09-21-fw*-notes.md` 与
-      [`2026-09-22-framework-leftovers-notes.md`](2026-09-22-framework-leftovers-notes.md)）。
+      分阶段细节见各 FW 的工作记录（`docs/work-log/2026-09-21-fw*-notes.md` 等）；
+      已完结的几篇随收口清理（见目录 README 说明）。
 - **toolhead 与 kinematics（C1 / FW5a–f）**：Rust 分层重写（不引 FFI）——`Coord` 与
       `clocksync` 回归、`Move`/`LookAheadQueue`/`trapq`、`itersolve`+`kin_cartesian`、
       `MotionQueuing`/`ToolHead`/`McuStepper`、`Kinematics`+`cartesian`+`[stepper_*]`/`[printer]`+`G1`、
       `stepcompress` 完整压缩；`kinematics: none` 随 T1 补上。设计取舍与逐阶段验收见
-      [FW5 笔记](2026-09-21-fw5-notes.md)；回零协议的 `get_trigger_position` /
+      FW5 动工前调查（已完结清理）；回零协议的 `get_trigger_position` /
       `set_stepper_adjustment` 随 `endstop_phase` 后置（H9）。
 - **框架队列收尾（FW1/C2、FW3/A2、FW4、FW7、FW8、FW9）**：配置 getter 补 `get_choice`/
       `get_float_bounded`/`get_int_bounded` 并改用上游文案（`config/wrapper.rs`）；`require_object`
@@ -35,7 +34,7 @@
       （`invoke_shutdown_with` 载荷 + `update_error_msg` + 停机/protocol/connect 文案）；
       `StartArgs` 补 `apiserver`/`start_reason`/`device` 等并接入 `M115`；
       `register_remote_method` 端点 + `webhooks` 对象转发 `call_remote_method`、mux 注册倒入
-      `Api`。细节见 [框架收尾笔记](2026-09-22-framework-leftovers-notes.md)。
+      `Api`。细节见框架收尾记录（已完结清理）。
 
 - **G-Code 框架大部（FW4）**：参数访问器补齐（通用 `get` + `minval`/`maxval`/`above`/`below`、
       `get_int_bounded`、`get_float_bounded`）、`get_command_parameters` / `get_raw_command_parameters`

@@ -435,6 +435,23 @@ impl Printer {
         self.lock().start_args.clone()
     }
 
+    /// Whether the host is running in file-output mode (upstream's
+    /// `MCU.is_fileoutput`, `klippy/mcu.py:1169`).
+    ///
+    /// Upstream reads it straight off the start arguments:
+    /// `start_args['debugoutput'] is not None` — the host writes the MCU
+    /// protocol to a file instead of the serial port, so nothing ever answers
+    /// and the machine runs as a test (`klippy.py -i <gcode> -o <output> -d
+    /// <dict>`, which `scripts/test_klippy.py` uses for every case). Modules
+    /// branch on it where a real machine would wait for hardware: a stepper
+    /// position query, the toolhead's pause tracking, and the heater that lets
+    /// a case extrude while its temperature queries stay unanswered
+    /// (`heaters.py:38-39`).
+    pub fn is_fileoutput(&self) -> bool {
+        self.start_args()
+            .is_some_and(|args| args.debug_output.is_some())
+    }
+
     /// The toolhead's restart handle, if one registered itself.
     pub fn restart_hooks(&self) -> Option<Arc<dyn RestartHooks>> {
         self.lock().restart_hooks.clone()
@@ -1438,6 +1455,7 @@ mod tests {
         let printer = new_printer();
         assert_eq!(printer.software_version(), env!("CARGO_PKG_VERSION"));
         assert!(printer.start_args().is_none());
+        assert!(!printer.is_fileoutput(), "no start args, no file output");
 
         let mut args = crate::core::klippy::api::StartArgs::collect("/tmp/printer.cfg", None);
         args.software_version = "v1.2.3".to_string();
@@ -1448,6 +1466,15 @@ mod tests {
             printer.start_args().unwrap().config_file,
             "/tmp/printer.cfg"
         );
+        assert!(
+            !printer.is_fileoutput(),
+            "start args without `--debugoutput` are an ordinary run"
+        );
+
+        let mut args = crate::core::klippy::api::StartArgs::collect("/tmp/printer.cfg", None);
+        args.debug_output = Some("_test_output".to_string());
+        printer.set_start_args(Arc::new(args));
+        assert!(printer.is_fileoutput());
     }
 
     #[test]

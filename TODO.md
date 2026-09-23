@@ -417,24 +417,26 @@ FW5a–f / FW6a–f 已把「cartesian + 假 MCU 的 `G1`/`G28`」跑通并归�
 | 首次失败原因 | 次数 | 对应 TODO |
 |---|---|---|
 | 温度传感器（`temperature_*`） | **0** | T7（已完成） |
-| 选项名大小写（`optionxform`） | **0** | 已对齐上游 `str.lower`（49 → 0） |
-| `Unknown pin chip name 'probe'` | 35 | T4 / H9（probe pin chip） |
-| `Error loading kinematics`（`delta` 12、`generic_cartesian` 4、`rotary_delta` 2、`polar`/`winch`/`deltesian` 各 1） | 21 | T5（C1c-2/3/4） |
-| TMC section/pin chip（段 21：`tmc2209` 15、`tmc2130` 2、`tmc2208` 2、`tmc2660` 1、`tmc5160` 1；pin chip 7：`tmc2209_stepper_x` 4、`tmc2130_stepper_x` 3） | 28 | T6 / H5 |
+| 选项名大小写（`optionxform`） | **0** | 已对齐（49 → 0） |
+| `Unknown pin chip name 'probe'`（余量靠 `[bltouch]`/`[smart_effector]`/eddy 注册 chip） | 22 | T4 / H9（M2/M3/M5） |
+| TMC：段 23 + pin chip 7 | 30 | T6 / H5 |
+| `Error loading kinematics`（delta / generic_cartesian / rotary_delta / polar / winch / deltesian） | 21 | T5（C1c-2/3/4） |
 | `Section 'display'` | 21 | T9 / H8 |
-| `Section 'heater_fan …'` | 22 | H2-3 |
-| `Section 'filament_switch_sensor …'` | 8 | H7 |
-| `sensor_pin: Unknown pin chip name 'vref_scaled'`（`adc_scaled`） | 4 | H1 |
-| H9 其余（`bed_screws` 3、`quad_gantry_level` 2、`bed_mesh` 2、`z_tilt`/`probe`/`endstop_phase` 各 1） | 10 | H9 |
-| 板级扩展 section（`mcp4451` 2、`dac084s085` 2、`ad5206`/`multi_pin`/`sx1509_duex`/`replicape` 各 1） | 8 | H2 / H7 |
-| `Option 'tachometer_pin' … needs the pulse_counter module` | 2 | F9 / H7 |
+| `Section 'heater_fan …'` | 27 | H2-3 |
+| `Section 'filament_switch_sensor …'` 等 | 8 | H7 |
+| `sensor_pin: … 'vref_scaled'`（`adc_scaled`） | 4 | H1 |
+| H9 其余（`bed_mesh` 6、`safe_z_home` 4、`bed_screws` 3、`quad_gantry_level` 2、`z_tilt`/`endstop_phase` 各 1） | 17 | H9 |
+| 板级扩展 section（`mcp4451`/`dac084s085`/`ad5206`/`multi_pin`/`sx1509_duex`/`replicape`） | 8 | H2 / H7 |
+| `Option 'tachometer_pin' … pulse_counter` | 2 | F9 / H7 |
 | `Section 'extruder_stepper …'` | 2 | H10 |
 | `Section 'verify_heater …'` | 2 | H1 |
-| `Unknown temperature sensor`（`G2`、`Kingroon_B3950`、`NTCS0603E3104FXT`） | 3 | H1（热敏电阻型号） |
-| MCU 引脚映射（`Pin 'PF1'` / `'PF7'` / `'PD6' is not a valid pin name`） | 3 | F2（其余 MCU 引脚映射） |
-| 单实例（`dual_carriage` 2、`safe_z_home` 2、`gcode_macro` 2；`virtual_sdcard`/`exclude_object`/`gcode_arcs`/`manual_stepper`/`pwm_cycle_time`/`led`/`input_shaper`/`temperature_fan`/`fan_generic`/`controller_fan` 各 1） | 16 | H3 / H4 / H9 / H10 |
+| `Unknown temperature sensor`（`G2`、`Kingroon_B3950`、`NTCS0603E3104FXT`） | 3 | H1 |
+| MCU 引脚映射（`Pin 'PF1'`/`'PF7'`/`'PD6'`） | 3 | F2 |
+| 单实例（`dual_carriage` 2、`gcode_macro` 2、`led` 2；`virtual_sdcard`/`temperature_fan`/`pwm_cycle_time`/`manual_stepper`/`input_shaper`/`gcode_arcs`/`fan_generic`/`exclude_object`/`controller_fan` 各 1） | 15 | H3 / H4 / H9 / H10 |
 | 运行期失败（`Move out of range`：`generic-simulavr`） | 1 | 运行期（非装载） |
 | `Section 'extruder'`（T3 旧首位） | **0** | T3 已消 |
+
+（本表随每个单元更新：2026-09-23 U3a 后实测。逐单元的前后变化写在各自提交信息里。）
 
 **T3 之后按首次失败分组的工单**：
 
@@ -447,10 +449,11 @@ FW5a–f / FW6a–f 已把「cartesian + 假 MCU 的 `G1`/`G28`」跑通并归�
       依赖 F8（endstop，已 ✅）与 H9（probe 模块）。**施工序列**（scout 静态矩阵测算，每步以「移出
       `IGNORED` 后通过」验收）：
       **U1** 运动底座 `probing_move` ✅（2026-09-23：事件顺序、无触发报错、零位移报错）
-      → **U2** `extras/probe.rs`（`[probe]` 段 + `probe` chip + `PROBE`/`QUERY_PROBE`；chip 单独做是
-      **0 绿**——必要非充分）
-      → **U3** `manual_probe.rs` 命令族 + `configfile.set()` 记账桩
-      → **U4** `bed_mesh.py`（**首批 2 绿**：`bed_mesh.test`、`z_virtual_endstop.test`，随后验证模拟器上
+      → **U2** `[stepper_x/y/z]` 移到 late 阶段 ✅（解 `probe:`/`tmc*_stepper_x:` 的共同根因）
+      → **U3a** `[probe]` 段 + `probe` 虚拟 chip ✅（chip 首因 35 → 22）
+      → **U3b** 会话采样 + `QUERY_PROBE`/`PROBE`/`PROBE_ACCURACY`
+      → **U4** `manual_probe.rs` 命令族 + `configfile.set()` 记账桩
+      → **U5** `bed_mesh.py`（**首批 2 绿**：`bed_mesh.test`、`z_virtual_endstop.test`，随后验证模拟器上
       的 `G28` via `probe:z_virtual_endstop`）
       → **M6** `z_tilt`/`quad_gantry_level`/`bed_tilt`（+2 绿）→ **M7** `STEPPER_BUZZ`（H10，+1）
       → **M2** `bltouch`（+1）→ **M4** `screws_tilt_adjust`（+1）→ **M3** `smart_effector`（+1）
@@ -600,9 +603,16 @@ FW5a–f / FW6a–f 已把「cartesian + 假 MCU 的 `G1`/`G28`」跑通并归�
 
 ### H9 探测 / 调平 / 校准
 
-- [ ] 探针：`probe.py`（**运动底座已落地**：`probing_move` 在 `extras/toolhead.rs`，见 T4 施工序列 U1；
-      `[probe]` 段与 `probe` 虚拟 chip 待 U2）、`bltouch.py`、`smart_effector.py`、`probe_eddy_current.py`、
-      `manual_probe.py`、`safe_z_home.py`、`endstop_phase.py`。
+- [ ] 探针：`probe.py` ◐（**已落地**：`[probe]` 段与 `probe` 虚拟 chip、选项全量认领、`z_virtual_endstop`
+      校验，见 `extras/probe.rs`；**待做**：`ProbeSessionHelper` 采样与 `QUERY_PROBE`/`PROBE`/`PROBE_ACCURACY`、
+      `PROBE_CALIBRATE`/`Z_OFFSET_APPLY_PROBE`（需 `manual_probe` + `configfile.set()`）、`ProbePointsHelper`；
+      另需把 `PinChip::setup_endstop` 的返回类型从具体 `Arc<McuEndstop>` 改成接口，才能让 wrapper 生效）、
+      `bltouch.py`、`smart_effector.py`、`probe_eddy_current.py`、`manual_probe.py`、`safe_z_home.py`、
+      `endstop_phase.py`。
+- **端停位置的缺口（需接口化）**：上游 rail 会优先向 endstop 要位置（`mcu_endstop.get_position_endstop()`，
+      探针 wrapper 返回 `z_offset`）；本仓 `position_endstop` 缺省退到 `position_min`，所以用
+      `probe:z_virtual_endstop` 的配置虽然在解析上能过，但 Z 回零后的位置不等于上游——`z_virtual_endstop.test`
+      的位置断言需要它。
 - **已知偏离（探针精度）**：本仓回零与探针移动返回**指令位置**，未按上游 `StepperPosition.note_home_end`
       + `calc_toolhead_pos` 用触发步数反算；`home_start` 的 `rest_time` 也硬编码（上游 `_calc_endstop_rate`
       按 move 距离与步数计算）。两者都影响真实探针 Z 精度，属后续精度单元；模拟器语料不受影响。

@@ -374,6 +374,12 @@ pub enum PinError {
     UnknownBus { param: String, bus: String },
     /// The chip does not build this kind of resource (yet).
     Unsupported(String),
+    /// A chip's own refusal, shown verbatim.
+    ///
+    /// Upstream chips raise `pins.error("…")` with arbitrary text (the probe
+    /// virtual endstop's two refusals, `multi_pin`, …), so those messages must
+    /// not be wrapped in the `Unsupported` sentence.
+    Message(String),
     /// A stepper's step and direction pins name different MCUs.
     StepperChipMismatch,
     /// A pin with a maximum duration must start and shut down at the same
@@ -445,6 +451,7 @@ impl fmt::Display for PinError {
             PinError::Unsupported(kind) => {
                 write!(f, "pin type {kind} not supported on this mcu")
             }
+            PinError::Message(message) => write!(f, "{message}"),
             PinError::StepperChipMismatch => {
                 write!(f, "Stepper dir pin must be on same mcu as step pin")
             }

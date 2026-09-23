@@ -616,8 +616,14 @@ FW5a–f / FW6a–f 已把「cartesian + 假 MCU 的 `G1`/`G28`」跑通并归�
 - **已知偏离（探针精度）**：本仓回零与探针移动返回**指令位置**，未按上游 `StepperPosition.note_home_end`
       + `calc_toolhead_pos` 用触发步数反算；`home_start` 的 `rest_time` 也硬编码（上游 `_calc_endstop_rate`
       按 move 距离与步数计算）。两者都影响真实探针 Z 精度，属后续精度单元；模拟器语料不受影响。
-- [ ] 调平：`bed_mesh.py`（含 `bed_mesh/dump_mesh` 端点）、`bed_tilt.py`、
-      `quad_gantry_level.py`、`z_tilt.py`。
+- [ ] 调平：`bed_mesh.py` ◐（**已落地**：`[bed_mesh]` 段与全量选项、探测点生成、
+      `BED_MESH_CALIBRATE` 逐点探测存格、`BED_MESH_CLEAR`；**待做**：插值网格
+      （lagrange/bicubic、`mesh_pps`）、faulty 区域替换、fade 与 move 的 z 补偿、profile 命令
+      与 `bed_mesh/dump_mesh` 端点）、`bed_tilt.py`、`quad_gantry_level.py`、`z_tilt.py`。
+- [ ] **探针端到端（下一单元）**：`bed_mesh.test` 与 `z_virtual_endstop.test` 仍在 `IGNORED`，
+      因模拟器上探针回路尚未走通——前者报 `No trigger on probe after full movement`（触发未
+      回到会话），后者报 `Printer is not ready`（疑与 `probing_move` 取出 toolhead 槽位、
+      而标定循环并发 `move_to` 有关）。两个症状都在 2026-09-23 自主时段的 “bed_mesh 半程” 提交后实测。
 - [ ] 螺丝：`bed_screws.py`、`screws_tilt_adjust.py`。
 - [ ] 校准：`delta_calibrate.py`、`axis_twist_compensation.py`、`skew_correction.py`、
       `z_thermal_adjust.py`、`tuning_tower.py`。

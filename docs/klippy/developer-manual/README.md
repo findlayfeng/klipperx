@@ -142,7 +142,7 @@ klipperx（bin，src/main.rs）
 
 | 文件 | 职责 |
 |------|------|
-| `mod.rs` | `Mcu`：构造（`new`）、收发任务、`send` / `call`、字典安装与查询、`seconds_to_clock`、`estimated_clock`（connect 时 `set_clock_base` 的最小时间估计）、`Drop`；构造时向 `identify` 取起始 `Parser`，本身不引用任何命令 |
+| `mod.rs` | `Mcu`：构造（`new`）、收发任务、`send` / `call`、字典安装与查询（出站队列 `SEND_QUEUE_CAPACITY` = 512：同步 `send` 用 `try_send` 不等待容量，主机突发必须放得下；能大量入队的路径走 await 容量的 `send_payload`）、`seconds_to_clock`、`estimated_clock`（connect 时 `set_clock_base` 的最小时间估计）、`Drop`；构造时向 `identify` 取起始 `Parser`，本身不引用任何命令 |
 | `object.rs` | `McuObject`：`[mcu]` / `[mcu <name>]` 作为打印机对象，以及工厂 `load_config` / `load_config_prefix`。section 只在 `PrinterObject::connect` 时才解析、开设备、跑 identify，随后把累积的配置交给固件（需要时先复位），再把固件的 `shutdown`/`is_shutdown`/`starting` 绑成打印机停机；`get_status` 报 identify 快照 |
 | `config.rs` | [`ConfigBuilder`](mcu-config.md)：配置期的 oid 发号器、`config` / `restart` / `init` 三张命令表、config 回调、CRC 与 `finalize_config`，`configure()` / `handshake()` 的 `get_config` 两段式握手，以及“停机或 CRC 不一致时先复位（`config_reset` 就地，或 `reset` + 重连）再配置”的复位路径 |
 | `resource/pin.rs` | `McuChip`（MCU 作为 pin chip，实现 `PinChip`）与 `McuDigitalOut`：数字输出的 oid、`config_digital_out` / `update_digital_out` 与运行期的 `queue_digital_out`；pin 名→编号在 config 回调里完成。另提供 `resolve_bus_name`（`BUS_PINS_<bus>` 预留，供 SPI/I2C 调用）与 `resolve_bus_value` |
@@ -269,6 +269,7 @@ identify 的命令**定义**（名称、参数、解码）与其它命令一样�
 | 文件 | 职责 |
 |------|------|
 | `output_pin.rs` | `[output_pin <name>]`：读 `pin` / `value` / `shutdown_value`，以及 PWM 的 `pwm` / `cycle_time` / `hardware_pwm`；用 `PrinterPins::setup_digital_out` 或 `setup_pwm` 建资源（无条件 `setup_max_duration(0)`，同上游），向 `gcode` 注册 `SET_PIN PIN=<name> VALUE=<0..1>`；`get_status` 报 `value`。`SET_PIN` 走立即路径（`update_digital_out` / `update_pwm`），随打印时间生效的调度等 C1 |
+| `bed_mesh.rs` | `[bed_mesh]`：床网格标定。认领 `mesh_min`/`mesh_max`/`probe_count`/`speed`/`algorithm`/`horizontal_move_z`/`fade_*`/`mesh_pps`/`bicubic_tension`/`round_probe_count`/`mesh_radius`/`mesh_origin`/`move_check_distance` 与 `faulty_region_<N>_min`/`_max` 对；按上游生成矩形（行内 zigzag、间距下取整到百分位）或圆床（按半径过滤）探测点；`BED_MESH_CALIBRATE` 逐点移动 + 经 `probe` 会话探测并存下网格，`BED_MESH_CLEAR` 清空，`get_status` 报 `probed_matrix`/`mesh_matrix`（当前同一份数据）。**未做**：插值网格（lagrange/bicubic、`mesh_pps`）、faulty 区域替换、fade 与 move 的 z 补偿、`BED_MESH_PROFILE`/`OUTPUT`/`MAP`/`OFFSET` 与 `bed_mesh/dump_mesh` 端点 |
 | `board_pins.rs` | `[board_pins]` / `[board_pins <name>]`：读 `mcu` 列表与 `aliases` / `aliases_*`（`名=引脚`，值写成 `<...>` 则保留），调用 `PrinterPins::alias_pin` / `reserve_pin`。对象不可查询 |
 | `static_digital_output.rs` | `[static_digital_output <name>]`：读 `pins`（引脚列表），一次全部拉到固定电平（上游同名节）；`order = 35` 排在 `board_pins` 后，别名可用 |
 | `stepper.rs` | `[stepper_x]` / `[stepper_y]` / `[stepper_z]`（`phase = late`，order 50：`endstop_pin` 可能指向别的段注册的 chip，见 [声明式表生成](codegen.md)）：一个电机在一根轴上。读 `step_pin` / `dir_pin` / `rotation_distance` / `microsteps` / `full_steps_per_rotation` / `gear_ratio` / `step_pulse_duration` 与行程（`position_min` / `position_max` / `position_endstop` / `endstop_pin` / `homing_*`），建 MCU 侧 stepper 资源与 rail |
@@ -294,7 +295,7 @@ identify 的命令**定义**（名称、参数、解码）与其它命令一样�
 | `bus_debug.rs` | `i2c_device` / `spi_device` 共用的调试命令底座：同步→异步桥与 `DATA=` 的十六进制编解码（无配置节） |
 | `error_mcu.rs` | MCU 停机消息的展开（无配置节，第一个 `[mcu]` 拉起）：监听 `klippy:shutdown` / `klippy:analyze_shutdown`，把简短原因扩成原因+提示（上游 `extras/error_mcu.py`） |
 
-`extras/` 的 24 个模块全部在 `extras/mod.rs` 声明；其中 19 个带 `section!`（含 `printer`，声明在 `toolhead.rs`；`mcu` 声明在 `mcu/mod.rs`，共 20 个装载 id）构成工厂表，其余（`heaters` / `gcode_move` / `query_endstops` / `error_mcu` / `bus_debug`）由上述模块按需 `ensure`，不占配置节。
+`extras/` 的 25 个模块全部在 `extras/mod.rs` 声明；其中 20 个带 `section!`（含 `printer`，声明在 `toolhead.rs`；`mcu` 声明在 `mcu/mod.rs`，共 21 个装载 id）构成工厂表，其余（`heaters` / `gcode_move` / `query_endstops` / `error_mcu` / `bus_debug`）由上述模块按需 `ensure`，不占配置节。
 
 ### `api/` — 客户端 API 层
 

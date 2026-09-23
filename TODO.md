@@ -28,6 +28,22 @@
   `reset_for_restart()` → 重载配置 → 再 `bring_up`，端点与 `--tui` 的 in-process server 全程
   有效；不换 printer、不重建 Api/Server。
 
+## 延后决定（2026-09-23 自主时段挂起）
+
+自主时段内不阻塞推进，以下问题只登记、待用户拍板：
+
+- **T4/H9 分支的合并时点**：`agents/feat-probe-h9` 持续累积提交（U1 `probing_move`、
+  U2 `[stepper_*]` 移 late、U3 `probe` 段…），是否/何时合入 `work` 由用户定。
+- **已合并分支清理**：`agents/docs-git-main-constraints`（已由用户并入 `work`）是否删除。
+- **探针精度偏离的处理顺序**：触发步数反算位置与 `rest_time`（`_calc_endstop_rate`）缺失，
+  是否单列精度单元、排在 M5 之前还是之后（见 H9 节）。
+- **`activate_gcode`/`deactivate_gcode` 的处置**：H3 `gcode_macro` 未落地，probe 单元采用
+  「读入选项 + 真正需要渲染时报明确错误」的折中，是否接受。
+- **`temperature_fan` 归组不一致**：H1 节把它算在温度族剩余里，失败统计表与 T9 行把它归
+  H3/H4/H9/H10（未含 H1），待定归哪一组。
+- **自主时段后的推进边界**：H9 闭包（U1–U5 与 M6/M7/M2/M4/M3/M5）之后是否直接进入 T5/T6/T9
+  等下一批。
+
 ## 待办
 
 依赖列的是**工具性前置**，不是自然顺序。下表是索引，逐条细节在后面的小节里；

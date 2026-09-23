@@ -299,7 +299,7 @@ fn answerable_id(message: &Value) -> Option<&Value> {
 mod tests {
     use super::*;
     use klippy_api::protocol::{ApiError, Request};
-    use klippy_api::registry::{Api, Endpoint, EndpointContext};
+    use klippy_api::registry::{Api, Endpoint, EndpointContext, EndpointFuture};
     use klippy_api::server::Server;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -313,12 +313,14 @@ mod tests {
             "echo"
         }
 
-        fn handle(
-            &self,
-            request: &Request,
-            _context: &EndpointContext<'_>,
-        ) -> Result<Value, ApiError> {
-            Ok(json!({ "params": request.params().get_or("value", &Value::Null).clone() }))
+        fn handle<'a>(
+            &'a self,
+            request: &'a Request,
+            _context: &'a EndpointContext<'a>,
+        ) -> EndpointFuture<'a> {
+            Box::pin(async move {
+                Ok(json!({ "params": request.params().get_or("value", &Value::Null).clone() }))
+            })
         }
     }
 
@@ -330,12 +332,12 @@ mod tests {
             "failing"
         }
 
-        fn handle(
-            &self,
-            _request: &Request,
-            _context: &EndpointContext<'_>,
-        ) -> Result<Value, ApiError> {
-            Err(ApiError::InvalidArgument)
+        fn handle<'a>(
+            &'a self,
+            _request: &'a Request,
+            _context: &'a EndpointContext<'a>,
+        ) -> EndpointFuture<'a> {
+            Box::pin(async move { Err(ApiError::InvalidArgument) })
         }
     }
 
@@ -348,17 +350,19 @@ mod tests {
             "push_later"
         }
 
-        fn handle(
-            &self,
-            _request: &Request,
-            context: &EndpointContext<'_>,
-        ) -> Result<Value, ApiError> {
-            let client = Arc::clone(&context.client);
-            tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-                client.push(json!({"method": "klippy:status", "params": {"n": 1}}));
-            });
-            Ok(json!({ "ok": true }))
+        fn handle<'a>(
+            &'a self,
+            _request: &'a Request,
+            context: &'a EndpointContext<'a>,
+        ) -> EndpointFuture<'a> {
+            Box::pin(async move {
+                let client = Arc::clone(&context.client);
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    client.push(json!({"method": "klippy:status", "params": {"n": 1}}));
+                });
+                Ok(json!({ "ok": true }))
+            })
         }
     }
 

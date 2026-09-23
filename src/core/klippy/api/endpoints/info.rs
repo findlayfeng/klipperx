@@ -48,7 +48,7 @@ use serde_json::Value;
 use tracing::info;
 
 use crate::core::klippy::api::protocol::{ApiError, Params, Request};
-use crate::core::klippy::api::registry::{Endpoint, EndpointContext};
+use crate::core::klippy::api::registry::{Endpoint, EndpointContext, EndpointFuture};
 use crate::core::klippy::api::start_args::StartArgs;
 use crate::core::klippy::api::{Api, ApiWiring, RegistrationError};
 use crate::core::klippy::printer::Printer;
@@ -122,18 +122,24 @@ impl Endpoint for Info {
         "info"
     }
 
-    fn handle(&self, request: &Request, _context: &EndpointContext<'_>) -> Result<Value, ApiError> {
-        let params = InfoParams::from_request(request)?;
+    fn handle<'a>(
+        &'a self,
+        request: &'a Request,
+        _context: &'a EndpointContext<'a>,
+    ) -> EndpointFuture<'a> {
+        Box::pin(async move {
+            let params = InfoParams::from_request(request)?;
 
-        // Upstream records `client_info` on the connection so an analysed
-        // shutdown can print who was connected (`WebRequest.set_client_info`);
-        // this host keeps no per-connection record yet, so the identity is
-        // logged and otherwise ignored.
-        if let Some(client_info) = &params.client_info {
-            info!("Client info: {client_info}");
-        }
+            // Upstream records `client_info` on the connection so an analysed
+            // shutdown can print who was connected (`WebRequest.set_client_info`);
+            // this host keeps no per-connection record yet, so the identity is
+            // logged and otherwise ignored.
+            if let Some(client_info) = &params.client_info {
+                info!("Client info: {client_info}");
+            }
 
-        Ok(self.response().into_value())
+            Ok(self.response().into_value())
+        })
     }
 }
 
@@ -306,10 +312,11 @@ mod tests {
     }
 
     /// Run one `info` request through the endpoint.
-    fn ask(endpoint: &Info, body: &str) -> Value {
+    async fn ask(endpoint: &Info, body: &str) -> Value {
         let api = Api::new();
         endpoint
             .handle(&request(body), &context(&api, silent_target()))
+            .await
             .unwrap()
     }
 
@@ -330,32 +337,32 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_the_endpoint_path_is_the_documented_one() {
+    #[tokio::test]
+    async fn test_the_endpoint_path_is_the_documented_one() {
         let (endpoint, _printer) = endpoint();
         assert_eq!(endpoint.path(), "info");
     }
 
-    #[test]
-    fn test_the_handler_reports_the_printers_state() {
+    #[tokio::test]
+    async fn test_the_handler_reports_the_printers_state() {
         let (endpoint, printer) = endpoint();
 
-        let response = ask(&endpoint, r#"{"method":"info"}"#);
+        let response = ask(&endpoint, r#"{"method":"info"}"#).await;
         assert_eq!(response["state"], "startup");
         assert_eq!(response["state_message"], "Starting up");
 
         printer.invoke_shutdown("Printer is halted");
 
-        let response = ask(&endpoint, r#"{"method":"info"}"#);
+        let response = ask(&endpoint, r#"{"method":"info"}"#).await;
         assert_eq!(response["state"], "shutdown");
         assert_eq!(response["state_message"], "Printer is halted");
     }
 
-    #[test]
-    fn test_the_handler_reports_the_host_arguments() {
+    #[tokio::test]
+    async fn test_the_handler_reports_the_host_arguments() {
         let (endpoint, _printer) = endpoint();
 
-        let response = ask(&endpoint, r#"{"method":"info"}"#);
+        let response = ask(&endpoint, r#"{"method":"info"}"#).await;
 
         assert_eq!(response["config_file"], "/home/pi/printer.cfg");
         assert_eq!(response["software_version"], "0.1.0");
@@ -364,14 +371,14 @@ mod tests {
         assert_eq!(response["process_id"], std::process::id());
     }
 
-    #[test]
-    fn test_the_two_klipper_paths_are_present_and_do_not_exist() {
+    #[tokio::test]
+    async fn test_the_two_klipper_paths_are_present_and_do_not_exist() {
         // See `NO_KLIPPER_PATH`: Moonraker indexes both without a default and
         // only enables its Klipper updater when both exist, so "present but
         // nonexistent" is the answer for a host that has neither.
         let (endpoint, _printer) = endpoint();
 
-        let response = ask(&endpoint, r#"{"method":"info"}"#);
+        let response = ask(&endpoint, r#"{"method":"info"}"#).await;
 
         for key in ["klipper_path", "python_path"] {
             let path = response[key].as_str().expect("a string");
@@ -380,20 +387,21 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_client_info_is_logged_but_never_answered() {
+    #[tokio::test]
+    async fn test_client_info_is_logged_but_never_answered() {
         let (endpoint, _printer) = endpoint();
 
         let response = ask(
             &endpoint,
             r#"{"method":"info","params":{"client_info":{"name":"Moonraker"}}}"#,
-        );
+        )
+        .await;
 
         assert!(!response.as_object().unwrap().contains_key("client_info"));
     }
 
-    #[test]
-    fn test_client_info_is_optional() {
+    #[tokio::test]
+    async fn test_client_info_is_optional() {
         assert_eq!(
             InfoParams::from_request(&request(r#"{"method":"info"}"#)).unwrap(),
             InfoParams::default()
@@ -408,8 +416,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_client_info_must_be_an_object() {
+    #[tokio::test]
+    async fn test_client_info_must_be_an_object() {
         let error = InfoParams::from_request(&request(
             r#"{"method":"info","params":{"client_info":"Moonraker"}}"#,
         ))
@@ -420,8 +428,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_the_response_carries_every_documented_field() {
+    #[tokio::test]
+    async fn test_the_response_carries_every_documented_field() {
         assert_eq!(
             sample().into_value(),
             json!({
@@ -441,8 +449,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_a_missing_log_file_is_null_not_absent() {
+    #[tokio::test]
+    async fn test_a_missing_log_file_is_null_not_absent() {
         // Upstream always sends the key; only its value can be null.
         let response = InfoResponse {
             log_file: None,
@@ -453,8 +461,8 @@ mod tests {
         assert_eq!(value["log_file"], Value::Null);
     }
 
-    #[test]
-    fn test_the_response_never_echoes_client_info() {
+    #[tokio::test]
+    async fn test_the_response_never_echoes_client_info() {
         let keys: Vec<String> = sample()
             .into_value()
             .as_object()

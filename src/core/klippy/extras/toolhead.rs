@@ -863,9 +863,9 @@ fn move_distance(a: Coord, b: Coord) -> f64 {
 
 /// Home the requested axes, one at a time (`Homing.home_rails` driven per axis).
 ///
-/// The caller has taken the toolhead out of its shared slot and runs this on one
-/// `block_in_place` task, so the background flush task sees no toolhead and
-/// stands back while the drip loop here owns step generation.
+/// The caller has taken the toolhead out of its shared slot, so the background
+/// flush task sees no toolhead and stands back while the drip loop here owns
+/// step generation.
 ///
 /// # Errors
 /// A missing endstop, a kinematics refusal, or a failed query/send.
@@ -1109,8 +1109,8 @@ fn axis_indices(names: &str) -> Vec<usize> {
 ///
 /// The homing run is asynchronous (it drives the drip flush loop and awaits the
 /// endstop trigger), so the toolhead is taken out of its shared slot, the run is
-/// driven on the current worker via `block_in_place`, and the toolhead is put
-/// back afterwards. The background flush task sees an empty slot and stands back.
+/// awaited, and the toolhead is put back afterwards. The background flush task
+/// sees an empty slot and stands back.
 async fn cmd_g28(
     state: &Arc<Mutex<Option<Connected>>>,
     rails: &[Arc<Rail>],
@@ -1133,7 +1133,7 @@ async fn cmd_g28(
     // Take the toolhead out of its shared slot, then drop the lock before
     // awaiting: the homing run is long, and a `MutexGuard` is not `Send`, so it
     // must not be held across the await. The background flush task sees the
-    // empty slot and stands back, as it did when this used `block_in_place`.
+    // empty slot and stands back.
     let mut connected = {
         let mut guard = state.lock().unwrap_or_else(|poison| poison.into_inner());
         let Some(connected) = guard.take() else {

@@ -30,10 +30,16 @@
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::fmt;
+use std::future::Future;
 use std::panic::AssertUnwindSafe;
+use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 
 use super::protocol::{ApiError, PushTarget, Request, ResponseTemplate};
+
+/// What an endpoint returns: a boxed future, so a handler may `.await`
+/// (`gcode/script` runs homing, which waits on the firmware).
+pub type EndpointFuture<'a> = Pin<Box<dyn Future<Output = Result<Value, ApiError>> + Send + 'a>>;
 
 // ===========================================================================
 // Endpoints
@@ -62,7 +68,11 @@ pub trait Endpoint: Send + Sync {
     /// Any [`ApiError`] becomes an `error` reply. Failures that are not the
     /// client's fault should be [`ApiError::Internal`], which the server also
     /// treats as a reason to shut klippy down.
-    fn handle(&self, request: &Request, context: &EndpointContext<'_>) -> Result<Value, ApiError>;
+    fn handle<'a>(
+        &'a self,
+        request: &'a Request,
+        context: &'a EndpointContext<'a>,
+    ) -> EndpointFuture<'a>;
 }
 
 /// A handler for one instance of a [mux endpoint](self#mux-instances).
@@ -71,7 +81,11 @@ pub trait MuxEndpoint: Send + Sync {
     ///
     /// # Errors
     /// As [`Endpoint::handle`].
-    fn handle(&self, request: &Request, context: &EndpointContext<'_>) -> Result<Value, ApiError>;
+    fn handle<'a>(
+        &'a self,
+        request: &'a Request,
+        context: &'a EndpointContext<'a>,
+    ) -> EndpointFuture<'a>;
 }
 
 /// What a handler is given besides the request itself.
@@ -166,11 +180,11 @@ struct Mux {
 }
 
 impl Mux {
-    fn dispatch(
-        &self,
-        request: &Request,
-        context: &EndpointContext<'_>,
-    ) -> Result<Value, ApiError> {
+    fn dispatch<'a>(
+        &'a self,
+        request: &'a Request,
+        context: &'a EndpointContext<'a>,
+    ) -> EndpointFuture<'a> {
         let params = request.params();
 
         // A non-string value cannot name an instance; a missing one is only
@@ -178,23 +192,31 @@ impl Mux {
         let requested = match params.get_opt(&self.key) {
             Some(Value::String(name)) => Some(name.clone()),
             Some(other) => {
-                return Err(ApiError::UnknownMuxValue {
+                return Box::pin(std::future::ready(Err(ApiError::UnknownMuxValue {
                     key: self.key.clone(),
                     value: other.to_string(),
-                })
+                })))
             }
             None if self.values.contains_key(&None) => None,
-            None => return Err(ApiError::MissingArgument(self.key.clone())),
+            None => {
+                return Box::pin(std::future::ready(Err(ApiError::MissingArgument(
+                    self.key.clone(),
+                ))))
+            }
         };
 
-        let handler = self
-            .values
-            .get(&requested)
-            .ok_or_else(|| ApiError::UnknownMuxValue {
-                key: self.key.clone(),
-                value: requested.clone().unwrap_or_default(),
-            })?;
-        handler.handle(request, context)
+        let handler = match self.values.get(&requested) {
+            Some(handler) => Arc::clone(handler),
+            None => {
+                return Box::pin(std::future::ready(Err(ApiError::UnknownMuxValue {
+                    key: self.key.clone(),
+                    value: requested.unwrap_or_default(),
+                })))
+            }
+        };
+        // The handler is moved into the returned future: the future may not
+        // borrow this stack frame.
+        Box::pin(async move { handler.handle(request, context).await })
     }
 }
 
@@ -409,22 +431,23 @@ impl Api {
     /// the printer down, and still answers the client
     /// (`klippy/webhooks.py:271-276`). An [`ApiError::Internal`] a handler
     /// returns deliberately goes the same way.
-    pub fn dispatch(
+    pub async fn dispatch(
         &self,
         request: &Request,
         client: Arc<dyn PushTarget>,
     ) -> Result<Value, ApiError> {
         let context = EndpointContext { api: self, client };
-        let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            if let Some(mux) = self.mux.get(request.method()) {
-                return mux.dispatch(request, &context);
+        let fut: EndpointFuture<'_> = if let Some(mux) = self.mux.get(request.method()) {
+            mux.dispatch(request, &context)
+        } else {
+            match self.endpoints.get(request.method()) {
+                Some(endpoint) => endpoint.handle(request, &context),
+                None => {
+                    return Err(ApiError::UnknownEndpoint(request.method().to_string()));
+                }
             }
-            let endpoint = self
-                .endpoints
-                .get(request.method())
-                .ok_or_else(|| ApiError::UnknownEndpoint(request.method().to_string()))?;
-            endpoint.handle(request, &context)
-        }));
+        };
+        let outcome = catch_poll(fut).await;
 
         match outcome {
             Ok(result) => {
@@ -474,14 +497,36 @@ impl Endpoint for ListEndpoints {
         "list_endpoints"
     }
 
-    fn handle(&self, _request: &Request, context: &EndpointContext<'_>) -> Result<Value, ApiError> {
-        Ok(json!({ "endpoints": context.api.endpoints() }))
+    fn handle<'a>(
+        &'a self,
+        _request: &'a Request,
+        context: &'a EndpointContext<'a>,
+    ) -> EndpointFuture<'a> {
+        Box::pin(async move { Ok(json!({ "endpoints": context.api.endpoints() })) })
     }
 }
 
 // ===========================================================================
 // Tests
 // ===========================================================================
+
+/// Run an endpoint future, turning a panic in a poll into an `Err` payload.
+///
+/// Replaces the synchronous `catch_unwind` the dispatcher used before handlers
+/// could await: a panic cannot be caught across an `.await`, so it is caught
+/// around each poll instead. This is what keeps
+/// `Internal Error on WebRequest: <method>` working.
+async fn catch_poll<'a>(
+    mut fut: EndpointFuture<'a>,
+) -> Result<Result<Value, ApiError>, Box<dyn std::any::Any + Send>> {
+    std::future::poll_fn(move |cx| {
+        match std::panic::catch_unwind(AssertUnwindSafe(|| fut.as_mut().poll(cx))) {
+            Ok(poll) => poll.map(Ok),
+            Err(payload) => std::task::Poll::Ready(Err(payload)),
+        }
+    })
+    .await
+}
 
 #[cfg(test)]
 mod tests {
@@ -535,12 +580,12 @@ mod tests {
             "echo"
         }
 
-        fn handle(
-            &self,
-            request: &Request,
-            _context: &EndpointContext<'_>,
-        ) -> Result<Value, ApiError> {
-            Ok(json!({ "method": request.method() }))
+        fn handle<'a>(
+            &'a self,
+            request: &'a Request,
+            _context: &'a EndpointContext<'a>,
+        ) -> EndpointFuture<'a> {
+            Box::pin(async move { Ok(json!({ "method": request.method() })) })
         }
     }
 
@@ -552,12 +597,12 @@ mod tests {
             "failing"
         }
 
-        fn handle(
-            &self,
-            _request: &Request,
-            _context: &EndpointContext<'_>,
-        ) -> Result<Value, ApiError> {
-            Err(ApiError::Internal("boom".to_string()))
+        fn handle<'a>(
+            &'a self,
+            _request: &'a Request,
+            _context: &'a EndpointContext<'a>,
+        ) -> EndpointFuture<'a> {
+            Box::pin(async move { Err(ApiError::Internal("boom".to_string())) })
         }
     }
 
@@ -569,12 +614,12 @@ mod tests {
             "command_failing"
         }
 
-        fn handle(
-            &self,
-            _request: &Request,
-            _context: &EndpointContext<'_>,
-        ) -> Result<Value, ApiError> {
-            Err(ApiError::CommandError("bad input".to_string()))
+        fn handle<'a>(
+            &'a self,
+            _request: &'a Request,
+            _context: &'a EndpointContext<'a>,
+        ) -> EndpointFuture<'a> {
+            Box::pin(async move { Err(ApiError::CommandError("bad input".to_string())) })
         }
     }
 
@@ -586,12 +631,12 @@ mod tests {
             "panicking"
         }
 
-        fn handle(
-            &self,
-            _request: &Request,
-            _context: &EndpointContext<'_>,
-        ) -> Result<Value, ApiError> {
-            panic!("handler bug")
+        fn handle<'a>(
+            &'a self,
+            _request: &'a Request,
+            _context: &'a EndpointContext<'a>,
+        ) -> EndpointFuture<'a> {
+            Box::pin(async move { panic!("handler bug") })
         }
     }
 
@@ -599,12 +644,12 @@ mod tests {
     struct Instance(&'static str);
 
     impl MuxEndpoint for Instance {
-        fn handle(
-            &self,
-            _request: &Request,
-            _context: &EndpointContext<'_>,
-        ) -> Result<Value, ApiError> {
-            Ok(json!(self.0))
+        fn handle<'a>(
+            &'a self,
+            _request: &'a Request,
+            _context: &'a EndpointContext<'a>,
+        ) -> EndpointFuture<'a> {
+            Box::pin(async move { Ok(json!(self.0)) })
         }
     }
 
@@ -616,12 +661,12 @@ mod tests {
             "connection"
         }
 
-        fn handle(
-            &self,
-            _request: &Request,
-            context: &EndpointContext<'_>,
-        ) -> Result<Value, ApiError> {
-            Ok(json!({ "closed": context.client.is_closed() }))
+        fn handle<'a>(
+            &'a self,
+            _request: &'a Request,
+            context: &'a EndpointContext<'a>,
+        ) -> EndpointFuture<'a> {
+            Box::pin(async move { Ok(json!({ "closed": context.client.is_closed() })) })
         }
     }
 
@@ -633,10 +678,19 @@ mod tests {
         Request::parse(body.as_bytes()).expect("test body is a valid request")
     }
 
+    /// Block on a future on a fresh current-thread runtime (tests are sync).
+    fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a current-thread runtime")
+            .block_on(fut)
+    }
+
     /// Dispatch `body` against `api` with a throwaway connection.
     fn dispatch(api: &Api, body: &str) -> Result<Value, ApiError> {
         let target: Arc<dyn PushTarget> = RecordingTarget::new();
-        api.dispatch(&request(body), target)
+        block_on(api.dispatch(&request(body), target))
     }
 
     fn template(fields: Value) -> ResponseTemplate {
@@ -823,17 +877,15 @@ mod tests {
         api.register(ConnectionRecorder).unwrap();
         let target = RecordingTarget::new();
 
-        let result = api
-            .dispatch(&request(r#"{"method":"connection"}"#), target.clone())
-            .unwrap();
+        let result =
+            block_on(api.dispatch(&request(r#"{"method":"connection"}"#), target.clone())).unwrap();
         assert_eq!(result, json!({"closed": false}));
 
         // The endpoint is handed the connection itself, not a snapshot: what
         // the target reports changes underneath the same handle.
         target.close();
-        let result = api
-            .dispatch(&request(r#"{"method":"connection"}"#), target.clone())
-            .unwrap();
+        let result =
+            block_on(api.dispatch(&request(r#"{"method":"connection"}"#), target.clone())).unwrap();
         assert_eq!(result, json!({"closed": true}));
     }
 
@@ -1035,13 +1087,15 @@ mod tests {
                 "read_count"
             }
 
-            fn handle(
-                &self,
-                request: &Request,
-                _context: &EndpointContext<'_>,
-            ) -> Result<Value, ApiError> {
-                let params: Params<'_> = request.params();
-                Ok(json!({ "count": params.get_int("count")? }))
+            fn handle<'a>(
+                &'a self,
+                request: &'a Request,
+                _context: &'a EndpointContext<'a>,
+            ) -> EndpointFuture<'a> {
+                Box::pin(async move {
+                    let params: Params<'_> = request.params();
+                    Ok(json!({ "count": params.get_int("count")? }))
+                })
             }
         }
 

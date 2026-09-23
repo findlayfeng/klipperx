@@ -623,7 +623,7 @@ pub fn is_local(line: &str) -> bool {
 mod tests {
     use super::*;
     use klippy_api::protocol::{ApiError, Request};
-    use klippy_api::registry::{Api, Endpoint, EndpointContext};
+    use klippy_api::registry::{Api, Endpoint, EndpointContext, EndpointFuture};
     use klippy_api::server::Server;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -638,12 +638,14 @@ mod tests {
             "echo"
         }
 
-        fn handle(
-            &self,
-            request: &Request,
-            _context: &EndpointContext<'_>,
-        ) -> Result<Value, ApiError> {
-            Ok(json!({ "got": request.params().get_or("value", &Value::Null).clone() }))
+        fn handle<'a>(
+            &'a self,
+            request: &'a Request,
+            _context: &'a EndpointContext<'a>,
+        ) -> EndpointFuture<'a> {
+            Box::pin(async move {
+                Ok(json!({ "got": request.params().get_or("value", &Value::Null).clone() }))
+            })
         }
     }
 
@@ -654,12 +656,12 @@ mod tests {
             "failing"
         }
 
-        fn handle(
-            &self,
-            _request: &Request,
-            _context: &EndpointContext<'_>,
-        ) -> Result<Value, ApiError> {
-            Err(ApiError::InvalidArgumentType("value".to_string()))
+        fn handle<'a>(
+            &'a self,
+            _request: &'a Request,
+            _context: &'a EndpointContext<'a>,
+        ) -> EndpointFuture<'a> {
+            Box::pin(async move { Err(ApiError::InvalidArgumentType("value".to_string())) })
         }
     }
 
@@ -672,14 +674,16 @@ mod tests {
             "gcode/script"
         }
 
-        fn handle(
-            &self,
-            request: &Request,
-            _context: &EndpointContext<'_>,
-        ) -> Result<Value, ApiError> {
-            Ok(json!({
-                "script": request.params().get_or("script", &Value::Null).clone()
-            }))
+        fn handle<'a>(
+            &'a self,
+            request: &'a Request,
+            _context: &'a EndpointContext<'a>,
+        ) -> EndpointFuture<'a> {
+            Box::pin(async move {
+                Ok(json!({
+                    "script": request.params().get_or("script", &Value::Null).clone()
+                }))
+            })
         }
     }
 
@@ -692,12 +696,12 @@ mod tests {
             "gcode/firmware_restart"
         }
 
-        fn handle(
-            &self,
-            _request: &Request,
-            _context: &EndpointContext<'_>,
-        ) -> Result<Value, ApiError> {
-            Ok(json!({}))
+        fn handle<'a>(
+            &'a self,
+            _request: &'a Request,
+            _context: &'a EndpointContext<'a>,
+        ) -> EndpointFuture<'a> {
+            Box::pin(async move { Ok(json!({})) })
         }
     }
 
@@ -709,12 +713,12 @@ mod tests {
             "objects/list"
         }
 
-        fn handle(
-            &self,
-            _request: &Request,
-            _context: &EndpointContext<'_>,
-        ) -> Result<Value, ApiError> {
-            Ok(json!({"objects": ["toolhead", "extruder"]}))
+        fn handle<'a>(
+            &'a self,
+            _request: &'a Request,
+            _context: &'a EndpointContext<'a>,
+        ) -> EndpointFuture<'a> {
+            Box::pin(async move { Ok(json!({"objects": ["toolhead", "extruder"]})) })
         }
     }
 
@@ -726,21 +730,23 @@ mod tests {
             "objects/subscribe"
         }
 
-        fn handle(
-            &self,
-            request: &Request,
-            context: &EndpointContext<'_>,
-        ) -> Result<Value, ApiError> {
-            let objects = request.params().get_opt("objects").cloned();
-            let client = Arc::clone(&context.client);
-            tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-                client.push(json!({
-                    "method": "klippy:status",
-                    "params": {"status": {"toolhead": {"position": [0, 0, 0, 0]}}}
-                }));
-            });
-            Ok(json!({"subscribed": objects}))
+        fn handle<'a>(
+            &'a self,
+            request: &'a Request,
+            context: &'a EndpointContext<'a>,
+        ) -> EndpointFuture<'a> {
+            Box::pin(async move {
+                let objects = request.params().get_opt("objects").cloned();
+                let client = Arc::clone(&context.client);
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    client.push(json!({
+                        "method": "klippy:status",
+                        "params": {"status": {"toolhead": {"position": [0, 0, 0, 0]}}}
+                    }));
+                });
+                Ok(json!({"subscribed": objects}))
+            })
         }
     }
 
@@ -752,12 +758,14 @@ mod tests {
             "info"
         }
 
-        fn handle(
-            &self,
-            _request: &Request,
-            _context: &EndpointContext<'_>,
-        ) -> Result<Value, ApiError> {
-            Ok(json!({"state": "ready", "state_message": "Printer is ready"}))
+        fn handle<'a>(
+            &'a self,
+            _request: &'a Request,
+            _context: &'a EndpointContext<'a>,
+        ) -> EndpointFuture<'a> {
+            Box::pin(
+                async move { Ok(json!({"state": "ready", "state_message": "Printer is ready"})) },
+            )
         }
     }
 

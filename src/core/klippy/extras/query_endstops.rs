@@ -13,10 +13,8 @@
 //!
 //! # Waiting for the query
 //!
-//! `query_endstop` is async (`Mcu::call_msg`), but `M119` and the endpoint
-//! handler are synchronous. They use the same `block_in_place` bridge the bus
-//! debug commands use; the machine runtime is multi-threaded, so one worker
-//! blocking on the exchange is fine.
+//! `query_endstop` is async (`Mcu::call_msg`); `M119` and the endpoint handler
+//! await it directly, on the same task that is handling the request.
 
 use std::sync::{Arc, Mutex, Weak};
 
@@ -102,26 +100,6 @@ impl QueryEndstops {
         }
         *self.last_state.lock().unwrap_or_else(|p| p.into_inner()) = state.clone();
         Ok(state)
-    }
-
-    /// [`QueryEndstops::query_all`] from a synchronous caller.
-    ///
-    /// **Temporary**: the `klippy-api` `Endpoint` trait is still synchronous, so
-    /// `query_endstops/status` cannot `.await` this yet. Remove it once that
-    /// trait is async.
-    ///
-    /// # Errors
-    /// Returns a [`CommandError`] when a query fails or the runtime cannot block.
-    pub fn query_all_blocking(&self, print_time: f64) -> Result<Vec<(String, bool)>, CommandError> {
-        let handle = tokio::runtime::Handle::try_current()
-            .map_err(|_| CommandError::new("endstop queries need the async runtime"))?;
-        if handle.runtime_flavor() != tokio::runtime::RuntimeFlavor::MultiThread {
-            return Err(CommandError::new(
-                "endstop queries need the multi-threaded runtime",
-            ));
-        }
-        tokio::task::block_in_place(|| handle.block_on(self.query_all(print_time)))
-            .map_err(|err| CommandError::new(err.to_string()))
     }
 }
 

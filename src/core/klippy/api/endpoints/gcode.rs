@@ -32,10 +32,10 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use serde_json::{json, Value};
+use serde_json::json;
 
 use crate::core::klippy::api::protocol::{ApiError, PushTarget, Request, ResponseTemplate};
-use crate::core::klippy::api::registry::{Endpoint, EndpointContext};
+use crate::core::klippy::api::registry::{Endpoint, EndpointContext, EndpointFuture};
 use crate::core::klippy::api::{Api, ApiWiring, RegistrationError};
 use crate::core::klippy::gcode::{GCodeDispatch, OutputHandler, GCODE_OBJECT};
 use crate::core::klippy::printer::Printer;
@@ -88,13 +88,15 @@ impl Endpoint for GcodeHelp {
         "gcode/help"
     }
 
-    fn handle(
-        &self,
-        _request: &Request,
-        _context: &EndpointContext<'_>,
-    ) -> Result<Value, ApiError> {
-        let gcode = gcode(&self.printer)?;
-        Ok(json!(gcode.command_help()))
+    fn handle<'a>(
+        &'a self,
+        _request: &'a Request,
+        _context: &'a EndpointContext<'a>,
+    ) -> EndpointFuture<'a> {
+        Box::pin(async move {
+            let gcode = gcode(&self.printer)?;
+            Ok(json!(gcode.command_help()))
+        })
     }
 }
 
@@ -115,13 +117,20 @@ impl Endpoint for GcodeScript {
         "gcode/script"
     }
 
-    fn handle(&self, request: &Request, _context: &EndpointContext<'_>) -> Result<Value, ApiError> {
-        let script = request.params().get_str("script")?;
-        let gcode = gcode(&self.printer)?;
-        gcode
-            .run_script_blocking(script)
-            .map_err(|err| ApiError::CommandError(err.to_string()))?;
-        Ok(json!({}))
+    fn handle<'a>(
+        &'a self,
+        request: &'a Request,
+        _context: &'a EndpointContext<'a>,
+    ) -> EndpointFuture<'a> {
+        Box::pin(async move {
+            let script = request.params().get_str("script")?;
+            let gcode = gcode(&self.printer)?;
+            gcode
+                .run_script(script)
+                .await
+                .map_err(|err| ApiError::CommandError(err.to_string()))?;
+            Ok(json!({}))
+        })
     }
 }
 
@@ -160,16 +169,19 @@ impl Endpoint for GcodeRestart {
         self.path
     }
 
-    fn handle(
-        &self,
-        _request: &Request,
-        _context: &EndpointContext<'_>,
-    ) -> Result<Value, ApiError> {
-        let gcode = gcode(&self.printer)?;
-        gcode
-            .run_script_blocking(self.script)
-            .map_err(|err| ApiError::CommandError(err.to_string()))?;
-        Ok(json!({}))
+    fn handle<'a>(
+        &'a self,
+        _request: &'a Request,
+        _context: &'a EndpointContext<'a>,
+    ) -> EndpointFuture<'a> {
+        Box::pin(async move {
+            let gcode = gcode(&self.printer)?;
+            gcode
+                .run_script(self.script)
+                .await
+                .map_err(|err| ApiError::CommandError(err.to_string()))?;
+            Ok(json!({}))
+        })
     }
 }
 
@@ -251,20 +263,26 @@ impl Endpoint for GcodeSubscribeOutput {
         "gcode/subscribe_output"
     }
 
-    fn handle(&self, request: &Request, context: &EndpointContext<'_>) -> Result<Value, ApiError> {
-        let template = ResponseTemplate::from_params(&request.params())?;
-        let gcode = gcode(&self.printer)?;
-        let subscription = Arc::new(Subscription {
-            client: context.client.clone(),
-            template,
-        });
-        self.subscribers
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .push(Arc::clone(&subscription));
-        gcode.register_output_handler(subscription);
-        *self.attached.lock().unwrap_or_else(|p| p.into_inner()) = Some(gcode);
-        Ok(json!({}))
+    fn handle<'a>(
+        &'a self,
+        request: &'a Request,
+        context: &'a EndpointContext<'a>,
+    ) -> EndpointFuture<'a> {
+        Box::pin(async move {
+            let template = ResponseTemplate::from_params(&request.params())?;
+            let gcode = gcode(&self.printer)?;
+            let subscription = Arc::new(Subscription {
+                client: context.client.clone(),
+                template,
+            });
+            self.subscribers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(Arc::clone(&subscription));
+            gcode.register_output_handler(subscription);
+            *self.attached.lock().unwrap_or_else(|p| p.into_inner()) = Some(gcode);
+            Ok(json!({}))
+        })
     }
 }
 
@@ -305,6 +323,7 @@ mod tests {
     use crate::core::klippy::api::test_support::{context, silent_target};
     use crate::core::klippy::gcode::{sync, CommandError, CommandHandler};
     use crate::core::klippy::reactor::ManualReactor;
+    use serde_json::Value;
 
     fn request(body: &str) -> Request {
         Request::parse(body.as_bytes()).expect("test body is a valid request")
@@ -329,8 +348,8 @@ mod tests {
             .unwrap()
     }
 
-    #[test]
-    fn test_the_paths_are_the_documented_ones() {
+    #[tokio::test]
+    async fn test_the_paths_are_the_documented_ones() {
         let printer = Arc::new(Printer::new(ManualReactor::shared()));
         assert_eq!(GcodeHelp::new(Arc::clone(&printer)).path(), "gcode/help");
         assert_eq!(
@@ -351,8 +370,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_subscribing_pushes_output_lines() {
+    #[tokio::test]
+    async fn test_subscribing_pushes_output_lines() {
         use crate::core::klippy::api::test_support::RecordingTarget;
 
         let printer = printer();
@@ -362,10 +381,11 @@ mod tests {
 
         GcodeSubscribeOutput::new(Arc::clone(&printer))
             .handle(&request(body), &context(&api, target.clone()))
+            .await
             .unwrap();
 
         // Anything the dispatcher says now reaches the subscriber.
-        gcode(&printer).run_script_sync("M115").unwrap();
+        gcode(&printer).run_script("M115").await.unwrap();
 
         let pushes = target.pushes();
         assert_eq!(pushes[0]["method"], "gcode:output");
@@ -379,8 +399,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_subscriptions_survive_a_rebuilt_dispatcher() {
+    #[tokio::test]
+    async fn test_subscriptions_survive_a_rebuilt_dispatcher() {
         // A `RESTART` replaces the `gcode` object, so the dispatcher a client
         // subscribed to is gone. The endpoint's re-attach puts the live
         // subscription on the new one instead of leaving it silent until the
@@ -397,9 +417,10 @@ mod tests {
         let body = r#"{"method":"gcode/subscribe_output","params":{"response_template":{"method":"gcode:output","id":null}}}"#;
         endpoint
             .handle(&request(body), &context(&api, target.clone()))
+            .await
             .unwrap();
 
-        first.run_script_sync("M115").unwrap();
+        first.run_script("M115").await.unwrap();
         let after_first = target.pushes().len();
         assert!(
             after_first > 0,
@@ -413,7 +434,7 @@ mod tests {
         printer.add_object(GCODE_OBJECT, second.clone()).unwrap();
 
         reattach(&printer, &endpoint.subscribers, &endpoint.attached);
-        second.run_script_sync("M115").unwrap();
+        second.run_script("M115").await.unwrap();
 
         let pushes = target.pushes();
         assert!(
@@ -422,8 +443,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_help_returns_the_flat_command_table() {
+    #[tokio::test]
+    async fn test_help_returns_the_flat_command_table() {
         let printer = printer();
         let handler: CommandHandler = sync(|_| Ok(()));
         gcode(&printer)
@@ -436,13 +457,14 @@ mod tests {
                 &request(r#"{"method":"gcode/help"}"#),
                 &context(&api, silent_target()),
             )
+            .await
             .unwrap();
 
         assert_eq!(response["SET_PIN"], "Set a pin");
     }
 
-    #[test]
-    fn test_script_runs_and_answers_empty() {
+    #[tokio::test]
+    async fn test_script_runs_and_answers_empty() {
         let printer = printer();
         let api = Api::new();
 
@@ -451,13 +473,14 @@ mod tests {
                 &request(r#"{"method":"gcode/script","params":{"script":"M115"}}"#),
                 &context(&api, silent_target()),
             )
+            .await
             .unwrap();
 
         assert_eq!(response, json!({}));
     }
 
-    #[test]
-    fn test_a_command_error_becomes_an_error_reply() {
+    #[tokio::test]
+    async fn test_a_command_error_becomes_an_error_reply() {
         let printer = printer();
         gcode(&printer)
             .register_command(
@@ -474,14 +497,15 @@ mod tests {
                 &request(r#"{"method":"gcode/script","params":{"script":"FAIL"}}"#),
                 &context(&api, silent_target()),
             )
+            .await
             .unwrap_err();
 
         assert_eq!(err, ApiError::CommandError("boom".to_string()));
         assert!(!err.is_internal(), "a command error must not stop klippy");
     }
 
-    #[test]
-    fn test_script_is_required() {
+    #[tokio::test]
+    async fn test_script_is_required() {
         let printer = printer();
         let api = Api::new();
 
@@ -490,13 +514,14 @@ mod tests {
                 &request(r#"{"method":"gcode/script"}"#),
                 &context(&api, silent_target()),
             )
+            .await
             .unwrap_err();
 
         assert_eq!(err, ApiError::MissingArgument("script".to_string()));
     }
 
-    #[test]
-    fn test_restart_runs_the_restart_command() {
+    #[tokio::test]
+    async fn test_restart_runs_the_restart_command() {
         let printer = printer();
         let api = Api::new();
 
@@ -505,6 +530,7 @@ mod tests {
                 &request(r#"{"method":"gcode/firmware_restart"}"#),
                 &context(&api, silent_target()),
             )
+            .await
             .unwrap();
 
         // The built-in FIRMWARE_RESTART asks the printer to exit with that
@@ -512,8 +538,8 @@ mod tests {
         assert_eq!(printer.run(), "firmware_restart");
     }
 
-    #[test]
-    fn test_a_request_before_the_dispatcher_exists_reports_the_state() {
+    #[tokio::test]
+    async fn test_a_request_before_the_dispatcher_exists_reports_the_state() {
         // No `gcode` object, as before the config is loaded.
         let printer = Arc::new(Printer::new(ManualReactor::shared()));
         let api = Api::new();
@@ -523,6 +549,7 @@ mod tests {
                 &request(r#"{"method":"gcode/script","params":{"script":"M115"}}"#),
                 &context(&api, silent_target()),
             )
+            .await
             .unwrap_err();
 
         assert!(matches!(err, ApiError::CommandError(_)), "{err:?}");

@@ -99,5 +99,7 @@ pub use protocol::{
     encode, ApiError, ApiErrorBody, Framing, MalformedRequest, Params, PushTarget, Request,
     Response, ResponseTemplate, DELIMITER,
 };
-pub use registry::{Api, Endpoint, EndpointContext, MuxEndpoint, RegistrationError};
+pub use registry::{
+    Api, Endpoint, EndpointContext, EndpointFuture, MuxEndpoint, RegistrationError,
+};
 pub use server::{serve, ClientConnection, Server};

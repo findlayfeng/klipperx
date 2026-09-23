@@ -35,7 +35,7 @@ use std::sync::Arc;
 use serde_json::{json, Map, Value};
 
 use crate::core::klippy::api::protocol::{ApiError, Params, Request};
-use crate::core::klippy::api::registry::{Endpoint, EndpointContext};
+use crate::core::klippy::api::registry::{Endpoint, EndpointContext, EndpointFuture};
 use crate::core::klippy::api::{Api, ApiWiring, RegistrationError};
 use crate::core::klippy::printer::Printer;
 
@@ -64,9 +64,15 @@ impl Endpoint for ObjectsQuery {
         "objects/query"
     }
 
-    fn handle(&self, request: &Request, _context: &EndpointContext<'_>) -> Result<Value, ApiError> {
-        let params = ObjectsQueryParams::from_request(request)?;
-        Ok(params.query(&self.printer))
+    fn handle<'a>(
+        &'a self,
+        request: &'a Request,
+        _context: &'a EndpointContext<'a>,
+    ) -> EndpointFuture<'a> {
+        Box::pin(async move {
+            let params = ObjectsQueryParams::from_request(request)?;
+            Ok(params.query(&self.printer))
+        })
     }
 }
 
@@ -215,20 +221,21 @@ mod tests {
         (ObjectsQuery::new(Arc::clone(&printer)), printer, Api::new())
     }
 
-    #[test]
-    fn test_the_endpoint_path_is_the_documented_one() {
+    #[tokio::test]
+    async fn test_the_endpoint_path_is_the_documented_one() {
         let (endpoint, _printer, _api) = endpoint();
         assert_eq!(endpoint.path(), "objects/query");
     }
 
-    #[test]
-    fn test_a_null_field_list_asks_for_every_field() {
+    #[tokio::test]
+    async fn test_a_null_field_list_asks_for_every_field() {
         let (endpoint, _printer, api) = endpoint();
         let request =
             request(r#"{"method":"objects/query","params":{"objects":{"toolhead":null}}}"#);
 
         let response = endpoint
             .handle(&request, &context(&api, silent_target()))
+            .await
             .unwrap();
 
         assert_eq!(
@@ -237,8 +244,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_only_the_requested_fields_come_back() {
+    #[tokio::test]
+    async fn test_only_the_requested_fields_come_back() {
         let (endpoint, _printer, api) = endpoint();
         let request = request(
             r#"{"method":"objects/query","params":{"objects":{"toolhead":["max_velocity"]}}}"#,
@@ -246,6 +253,7 @@ mod tests {
 
         let response = endpoint
             .handle(&request, &context(&api, silent_target()))
+            .await
             .unwrap();
 
         assert_eq!(
@@ -254,21 +262,22 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_a_field_the_object_does_not_have_is_null() {
+    #[tokio::test]
+    async fn test_a_field_the_object_does_not_have_is_null() {
         let (endpoint, _printer, api) = endpoint();
         let request =
             request(r#"{"method":"objects/query","params":{"objects":{"toolhead":["nope"]}}}"#);
 
         let response = endpoint
             .handle(&request, &context(&api, silent_target()))
+            .await
             .unwrap();
 
         assert_eq!(response["status"]["toolhead"], json!({"nope": null}));
     }
 
-    #[test]
-    fn test_an_unknown_object_answers_empty_not_an_error() {
+    #[tokio::test]
+    async fn test_an_unknown_object_answers_empty_not_an_error() {
         let (endpoint, _printer, api) = endpoint();
         let request = request(
             r#"{"method":"objects/query","params":{"objects":{"nope":null,"also_nope":["a"]}}}"#,
@@ -276,14 +285,15 @@ mod tests {
 
         let response = endpoint
             .handle(&request, &context(&api, silent_target()))
+            .await
             .unwrap();
 
         assert_eq!(response["status"]["nope"], json!({}));
         assert_eq!(response["status"]["also_nope"], json!({"a": null}));
     }
 
-    #[test]
-    fn test_the_answer_carries_the_eventtime_the_sources_were_given() {
+    #[tokio::test]
+    async fn test_the_answer_carries_the_eventtime_the_sources_were_given() {
         let printer = Arc::new(Printer::new(ManualReactor::shared()));
         printer.add_object("echo", Arc::new(EchoEventtime)).unwrap();
         let endpoint = ObjectsQuery::new(Arc::clone(&printer));
@@ -292,6 +302,7 @@ mod tests {
 
         let response = endpoint
             .handle(&request, &context(&api, silent_target()))
+            .await
             .unwrap();
 
         assert_eq!(
@@ -306,40 +317,41 @@ mod tests {
         let (endpoint, printer, api) = endpoint();
         let request =
             request(r#"{"method":"objects/query","params":{"objects":{"webhooks":null}}}"#);
-        let ask = || {
+        let ask = || async {
             endpoint
                 .handle(&request, &context(&api, silent_target()))
+                .await
                 .unwrap()["status"]["webhooks"]
                 .clone()
         };
 
         assert_eq!(
-            ask(),
+            ask().await,
             json!({"state": "startup", "state_message": "Starting up"})
         );
 
         printer.bring_up().await;
         assert_eq!(
-            ask(),
+            ask().await,
             json!({"state": "ready", "state_message": "Printer is ready"})
         );
 
         printer.invoke_shutdown("Printer is halted");
         assert_eq!(
-            ask(),
+            ask().await,
             json!({"state": "shutdown", "state_message": "Printer is halted"})
         );
     }
 
-    #[test]
-    fn test_objects_must_be_present() {
+    #[tokio::test]
+    async fn test_objects_must_be_present() {
         let error = ObjectsQueryParams::from_request(&request(r#"{"method":"objects/query"}"#))
             .unwrap_err();
         assert_eq!(error, ApiError::MissingArgument("objects".to_string()));
     }
 
-    #[test]
-    fn test_objects_must_be_an_object() {
+    #[tokio::test]
+    async fn test_objects_must_be_an_object() {
         let error = ObjectsQueryParams::from_request(&request(
             r#"{"method":"objects/query","params":{"objects":["toolhead"]}}"#,
         ))
@@ -347,8 +359,8 @@ mod tests {
         assert_eq!(error, ApiError::InvalidArgumentType("objects".to_string()));
     }
 
-    #[test]
-    fn test_a_field_list_must_be_null_or_strings() {
+    #[tokio::test]
+    async fn test_a_field_list_must_be_null_or_strings() {
         for body in [
             r#"{"method":"objects/query","params":{"objects":{"toolhead":1}}}"#,
             r#"{"method":"objects/query","params":{"objects":{"toolhead":"position"}}}"#,
@@ -360,20 +372,21 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_an_empty_field_list_asks_for_nothing() {
+    #[tokio::test]
+    async fn test_an_empty_field_list_asks_for_nothing() {
         let (endpoint, _printer, api) = endpoint();
         let request = request(r#"{"method":"objects/query","params":{"objects":{"toolhead":[]}}}"#);
 
         let response = endpoint
             .handle(&request, &context(&api, silent_target()))
+            .await
             .unwrap();
 
         assert_eq!(response["status"]["toolhead"], json!({}));
     }
 
-    #[test]
-    fn test_one_query_may_name_several_objects() {
+    #[tokio::test]
+    async fn test_one_query_may_name_several_objects() {
         let (endpoint, _printer, api) = endpoint();
         let request = request(
             r#"{"method":"objects/query","params":{"objects":{"webhooks":["state"],"toolhead":["max_velocity"]}}}"#,
@@ -381,6 +394,7 @@ mod tests {
 
         let response = endpoint
             .handle(&request, &context(&api, silent_target()))
+            .await
             .unwrap();
 
         assert_eq!(response["status"]["webhooks"], json!({"state": "startup"}));
@@ -390,25 +404,26 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_the_registry_reaches_the_endpoint_by_path() {
+    #[tokio::test]
+    async fn test_the_registry_reaches_the_endpoint_by_path() {
         let (endpoint, _printer, mut api) = endpoint();
         api.register(endpoint).unwrap();
         let request =
             request(r#"{"method":"objects/query","params":{"objects":{"webhooks":["state"]}}}"#);
 
-        let response = api.dispatch(&request, silent_target()).unwrap();
+        let response = api.dispatch(&request, silent_target()).await.unwrap();
 
         assert_eq!(response["status"]["webhooks"], json!({"state": "startup"}));
     }
 
-    #[test]
-    fn test_no_objects_asked_for_is_an_empty_status() {
+    #[tokio::test]
+    async fn test_no_objects_asked_for_is_an_empty_status() {
         let (endpoint, _printer, api) = endpoint();
         let request = request(r#"{"method":"objects/query","params":{"objects":{}}}"#);
 
         let response = endpoint
             .handle(&request, &context(&api, silent_target()))
+            .await
             .unwrap();
 
         assert_eq!(response["status"], json!({}));

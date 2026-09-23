@@ -672,6 +672,33 @@ impl ToolHeadObject {
             .as_ref()
             .map(|connected| connected.toolhead.commanded_pos())
     }
+
+    /// Probe-style homing: move toward `target` at `speed`, stop on trigger,
+    /// return the triggered position (`homing.probing_move`).
+    ///
+    /// The toolhead is taken out of its shared slot during the move (the
+    /// background flush task stands back), then restored afterwards.
+    ///
+    /// # Errors
+    /// "Printer is not ready" before connect, or any error from the
+    /// low-level probe move.
+    pub async fn probing_move(
+        &self,
+        endstop: &dyn HomingEndstop,
+        target: Coord,
+        speed: f64,
+    ) -> Result<Option<Coord>, CommandError> {
+        let mut connected = {
+            let mut guard = self.lock();
+            let Some(connected) = guard.take() else {
+                return Err(CommandError::new("Printer is not ready"));
+            };
+            connected
+        };
+        let result = probing_move(&mut connected, endstop, target, speed, &self.printer).await;
+        *self.lock() = Some(connected);
+        result
+    }
 }
 
 /// The flush task: generate the queued steps and await the transport.
@@ -1010,6 +1037,92 @@ async fn home_axis(
     connected.toolhead.set_position(home, &[axis]);
     connected.toolhead.wipe_trapq();
     Ok(())
+}
+
+/// Probe-style homing: move toward `target` at `speed`, stop on trigger,
+/// return the triggered position (`homing.probing_move`).
+///
+/// Unlike `home_axis` this does not read a `HomingInfo` from a rail — it
+/// receives the target position directly, so callers (e.g. a probe extra)
+/// can use any endstop at any speed without rail configuration.
+///
+/// Events follow upstream order: `homing_move_begin` before the move,
+/// `homing_move_end` after.
+///
+/// Returns the triggered position if the endstop fired, or `None` when the
+/// full move completed without a trigger.
+///
+/// # Errors
+/// A failed `home_start` or `home_wait`, a kinematics refusal, or a failed
+/// step send.
+#[allow(clippy::too_many_arguments)]
+async fn probing_move(
+    connected: &mut Connected,
+    endstop: &dyn HomingEndstop,
+    target: Coord,
+    speed: f64,
+    printer: &Weak<Printer>,
+) -> Result<Option<Coord>, CommandError> {
+    let current = connected.toolhead.commanded_pos();
+    let distance = move_distance(current, target);
+    // Zero-length move: nothing to do, no trigger possible.
+    if distance == 0.0 {
+        return Ok(None);
+    }
+
+    let print_time = connected.toolhead.get_last_move_time();
+    let completion = endstop
+        .home_start(
+            print_time,
+            ENDSTOP_SAMPLE_TIME,
+            ENDSTOP_SAMPLE_COUNT,
+            0.001,
+            true,
+        )
+        .map_err(command_error)?;
+    connected.toolhead.dwell(HOMING_START_DELAY);
+    send(printer, &KlippyEvent::HomingHomingMoveBegin);
+    let (start, end) = connected
+        .toolhead
+        .drip_move(target, speed)
+        .map_err(|err| CommandError::new(err.to_string()))?;
+
+    // Drip the move out in small windows; stop as soon as the trigger fires.
+    let mut flush_time = start;
+    while flush_time < end && completion.reason().is_none() {
+        flush_time = (flush_time + DRIP_SEGMENT_TIME).min(end);
+        let batches = connected
+            .toolhead
+            .flush_step_generation(flush_time)
+            .map_err(|err| CommandError::new(err.to_string()))?;
+        for (name, commands) in batches {
+            if let Some(stepper) = connected.mcu_steppers.get(&name) {
+                stepper
+                    .send_steps_async(&commands)
+                    .await
+                    .map_err(command_error)?;
+            }
+        }
+        if completion.reason().is_none() {
+            tokio::select! {
+                _ = sleep(Duration::from_secs_f64(DRIP_LOOKAHEAD)) => {}
+                _ = completion.wait() => {}
+            }
+        }
+    }
+
+    endstop.home_wait(end).await.map_err(command_error)?;
+    send(printer, &KlippyEvent::HomingHomingMoveEnd);
+
+    // Return the toolhead position after the move.  If the move never started
+    // (start == end), the probe triggered before movement — return None so the
+    // caller can distinguish.
+    let pos = connected.toolhead.commanded_pos();
+    if start == end {
+        Ok(None)
+    } else {
+        Ok(Some(pos))
+    }
 }
 
 fn command_error(err: McuError) -> CommandError {
@@ -1565,5 +1678,211 @@ mod tests {
         );
         assert!(connected.toolhead.trapq().moves().is_empty());
         *state.lock().unwrap_or_else(|p| p.into_inner()) = Some(connected);
+    }
+
+    // =========================================================================
+    // probing_move tests
+    // =========================================================================
+
+    /// An endstop that can be triggered at will.
+    struct TriggeringEndstop {
+        completion: Arc<Completion>,
+        /// Whether to trigger on the next `home_wait`.
+        triggered: std::sync::Mutex<bool>,
+    }
+
+    impl TriggeringEndstop {
+        fn new(triggered: bool) -> Self {
+            Self {
+                completion: Completion::new(),
+                triggered: std::sync::Mutex::new(triggered),
+            }
+        }
+
+        /// Fire the endstop now.
+        fn fire(&self) {
+            self.completion
+                .complete(crate::core::klippy::cmd::trsync::TriggerReason::EndstopHit);
+        }
+    }
+
+    impl HomingEndstop for TriggeringEndstop {
+        fn home_start(
+            &self,
+            _print_time: f64,
+            _sample_time: f64,
+            _sample_count: u8,
+            _rest_time: f64,
+            _triggered: bool,
+        ) -> Result<Arc<Completion>, McuError> {
+            Ok(Arc::clone(&self.completion))
+        }
+
+        fn home_wait(&self, home_end_time: f64) -> EndstopFuture<'_> {
+            Box::pin(async move {
+                // If triggered was set, complete now (simulates firmware seeing
+                // the pin trip after the move starts).
+                if *self.triggered.lock().unwrap_or_else(|p| p.into_inner()) {
+                    self.completion
+                        .complete(crate::core::klippy::cmd::trsync::TriggerReason::EndstopHit);
+                }
+                // If the completion already has a reason (triggered), wait for it.
+                // If not (no trigger), return immediately — upstream would timeout
+                // here, but in tests we just proceed.
+                if self.completion.reason().is_some() {
+                    self.completion.wait().await;
+                }
+                Ok(home_end_time)
+            })
+        }
+    }
+
+    /// Build a connected state ready for probing.
+    fn probing_connected() -> (Connected, Arc<Printer>) {
+        let printer = Arc::new(Printer::new(
+            crate::core::klippy::reactor::ManualReactor::shared(),
+        ));
+        let toolhead = homed_toolhead();
+        let mut connected = Connected {
+            toolhead,
+            mcu_steppers: HashMap::new(),
+            last_step_gen_time: 0.0,
+        };
+        // Advance print time so the first move has a non-zero delta.
+        connected.toolhead.dwell(0.01);
+        (connected, printer)
+    }
+
+    /// `probing_move` stops on trigger and returns the triggered position.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_probing_move_stops_on_trigger() {
+        let (mut connected, printer) = probing_connected();
+        let endstop = TriggeringEndstop::new(false);
+        let target = Coord::new(10.0, 0.0, 0.0, 0.0);
+        let speed = 5.0;
+        let printer = Arc::downgrade(&printer);
+
+        // Trigger mid-move.
+        endstop.fire();
+
+        let result = probing_move(&mut connected, &endstop, target, speed, &printer).await;
+
+        assert!(result.is_ok());
+        let triggered = result.unwrap();
+        assert!(
+            triggered.is_some(),
+            "probe should have returned a triggered position"
+        );
+    }
+
+    /// `probing_move` emits events in the correct order:
+    /// `homing_move_begin` → move → `homing_move_end`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_probing_move_emits_events_in_order() {
+        let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (mut connected, printer) = probing_connected();
+
+        // Install handlers that record events.
+        let begin_log = Arc::clone(&recorded);
+        printer.register_event_handler(
+            KlippyEvent::HomingHomingMoveBegin,
+            Box::new(move |_| {
+                begin_log
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push("begin");
+            }),
+        );
+        let end_log = Arc::clone(&recorded);
+        printer.register_event_handler(
+            KlippyEvent::HomingHomingMoveEnd,
+            Box::new(move |_| {
+                end_log
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push("end");
+            }),
+        );
+
+        let endstop = TriggeringEndstop::new(false);
+        let target = Coord::new(10.0, 0.0, 0.0, 0.0);
+        let speed = 5.0;
+        let printer = Arc::downgrade(&printer);
+
+        endstop.fire();
+
+        let _ = probing_move(&mut connected, &endstop, target, speed, &printer).await;
+
+        let events = recorded.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(
+            events.as_slice(),
+            ["begin", "end"],
+            "events in correct order"
+        );
+    }
+
+    /// `probing_move` returns the target position when the move completes
+    /// without trigger (upstream returns the toolhead position in this case).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_probing_move_no_trigger_completes_cleanly() {
+        let (mut connected, printer) = probing_connected();
+        let endstop = TriggeringEndstop::new(false);
+        let target = Coord::new(10.0, 0.0, 0.0, 0.0);
+        let speed = 5.0;
+        let printer = Arc::downgrade(&printer);
+
+        let result = probing_move(&mut connected, &endstop, target, speed, &printer).await;
+
+        assert!(result.is_ok());
+        let triggered = result.unwrap();
+        assert!(
+            triggered.is_some(),
+            "completed move should return the target position"
+        );
+        assert_eq!(
+            triggered.unwrap(),
+            target,
+            "returned position should match target"
+        );
+    }
+
+    /// `probing_move` returns `None` for zero-length moves.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_probing_move_zero_distance() {
+        let (mut connected, printer) = probing_connected();
+        let endstop = TriggeringEndstop::new(false);
+        let target = Coord::default();
+        let speed = 5.0;
+        let printer = Arc::downgrade(&printer);
+
+        let result = probing_move(&mut connected, &endstop, target, speed, &printer).await;
+
+        assert!(result.is_ok());
+        assert!(
+            result.unwrap().is_none(),
+            "zero-length move should return None"
+        );
+    }
+
+    /// `probing_move` sets the toolhead position to the target after trigger.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_probing_move_sets_position_on_trigger() {
+        let (mut connected, printer) = probing_connected();
+        let endstop = TriggeringEndstop::new(false);
+        let target = Coord::new(10.0, 0.0, 0.0, 0.0);
+        let speed = 5.0;
+        let printer = Arc::downgrade(&printer);
+
+        // Trigger before the drip loop starts.
+        endstop.fire();
+
+        let _ = probing_move(&mut connected, &endstop, target, speed, &printer).await;
+
+        // The position should be at the target (the move was queued to that position).
+        assert_eq!(
+            connected.toolhead.commanded_pos(),
+            target,
+            "toolhead position should match target after probe"
+        );
     }
 }

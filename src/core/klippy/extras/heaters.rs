@@ -464,9 +464,11 @@ impl PrinterHeaters {
                 last_temp: 0.0,
                 smoothed_temp: 0.0,
                 last_temp_time: 0.0,
-                // Upstream: allowed when `min_extrude_temp <= 0`. A reading at
-                // or above it flips this on (see `temperature_callback`).
-                can_extrude: min_extrude_temp <= 0.0,
+                // Upstream: `min_extrude_temp <= 0. or is_fileoutput`
+                // (`heaters.py:38-39`). File-output mode is how upstream runs
+                // its own cases, where the temperature queries are never
+                // answered and so no reading ever flips this on again.
+                can_extrude: min_extrude_temp <= 0.0 || printer.is_fileoutput(),
                 last_pwm_value: 0.0,
                 control,
             }),
@@ -726,6 +728,41 @@ mod tests {
             heaters.get_status(0.0)["available_heaters"],
             json!(["extruder"])
         );
+    }
+
+    /// `heaters.py:38-39`: file-output mode (upstream's `-o`, which
+    /// `test_klippy.py` runs every case with) lets a heater extrude from a cold
+    /// start — such a run never answers its temperature queries, so no reading
+    /// would ever turn the flag on again.
+    #[test]
+    fn test_file_output_may_extrude_without_a_reading() {
+        let printer = ready_printer();
+        let heaters = ensure(&printer).unwrap();
+        heaters.add_sensor_factory(
+            "Fake",
+            Arc::new(|_config, _printer| Ok(Arc::new(FakeSensor) as Arc<dyn Sensor>)),
+        );
+        let mut args = crate::core::klippy::api::StartArgs::collect("/tmp/printer.cfg", None);
+        args.debug_output = Some("_test_output".to_string());
+        printer.set_start_args(Arc::new(args));
+
+        // No `min_extrude_temp`: the 170 default is far above anything this
+        // run will ever read, and it reads nothing at all.
+        let section = heater_section(&[
+            ("sensor_type", "Fake"),
+            ("heater_pin", "PA0"),
+            ("min_temp", "0"),
+            ("max_temp", "250"),
+            ("control", "pid"),
+            ("pid_Kp", "1"),
+            ("pid_Ki", "0.1"),
+            ("pid_Kd", "10"),
+        ]);
+        let heater = heaters
+            .setup_heater(&ConfigWrapper::untracked(&section), &printer, None)
+            .unwrap();
+
+        assert!(heater.can_extrude());
     }
 
     /// A `[extruder]`-style heater section with `options`.

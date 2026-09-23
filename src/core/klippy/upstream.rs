@@ -514,6 +514,9 @@ mod tests {
     /// Load `config`, bring the machine up, and run `script` through the
     /// ordinary g-code dispatcher.
     ///
+    /// `config_file` names the config in the start arguments the case gets —
+    /// upstream's `klippy.py` argument, which is what `info` would report.
+    ///
     /// The two phases are reported separately, because a `SHOULD_FAIL` run may
     /// only be satisfied by the second: an outer `Err` means the machine could
     /// not be brought up at all — a gap in this host (a missing section, say),
@@ -523,13 +526,29 @@ mod tests {
     /// The printer is torn down before returning: the config's parts hold the
     /// device open, and a receive task parked on it would keep the test runtime
     /// from shutting down.
-    async fn run_phases(config: &Config, script: &str) -> Result<Result<(), String>, String> {
+    async fn run_phases(
+        config: &Config,
+        config_file: &str,
+        script: &str,
+    ) -> Result<Result<(), String>, String> {
         use crate::core::klippy::gcode::{GCodeDispatch, GCODE_OBJECT};
         use crate::core::klippy::printer::{Printer, PrinterState};
         use crate::core::klippy::reactor::TokioReactor;
 
         let reactor = Arc::new(TokioReactor::new(tokio::runtime::Handle::current()));
         let printer = Arc::new(Printer::new(reactor));
+
+        // Upstream runs every case as `klippy.py -i <gcode> -o <output> -d
+        // <dict>` (`scripts/test_klippy.py:100-104`). The `-o` lands in
+        // `start_args['debugoutput']`, and `heaters.py:38-39` reads it: a case
+        // never answers its temperature queries, so `can_extrude` starts true
+        // and the `G1 E…` lines of a case's g-code are not rejected as cold.
+        // The host builds the same dictionary at startup (`src/klippy.rs`);
+        // this is that step for a case run, done before the config is loaded,
+        // as the host does.
+        let mut start_args = crate::core::klippy::api::StartArgs::collect(config_file, None);
+        start_args.debug_output = Some("_test_output".to_string());
+        printer.set_start_args(Arc::new(start_args));
 
         let setup = async {
             printer.load_config(config).map_err(|e| e.to_string())?;
@@ -578,8 +597,8 @@ mod tests {
 
     /// Both phases have to succeed; for the minimal case, which asserts a clean
     /// run rather than an inverted expectation.
-    async fn run_script_on(config: &Config, script: &str) -> Result<(), String> {
-        run_phases(config, script).await?
+    async fn run_script_on(config: &Config, config_file: &str, script: &str) -> Result<(), String> {
+        run_phases(config, config_file, script).await?
     }
 
     /// Every dictionary a run names, and whether it was built.
@@ -623,7 +642,8 @@ mod tests {
         };
 
         let parsed = injected_config(&run.config, &resolved)?;
-        let gcode = match run_phases(&parsed, &script).await {
+        let case_file = run.config.display().to_string();
+        let gcode = match run_phases(&parsed, &case_file, &script).await {
             Err(setup) => return Err(format!("{}: {setup}", relative(&run.config))),
             Ok(gcode) => gcode,
         };
@@ -686,7 +706,7 @@ mod tests {
         let text = format!("[mcu]\ntest: dict={}\n", dictionary.display());
         let (config, _) = Config::from_text(&text).expect("the minimal config parses");
 
-        run_script_on(&config, "M115")
+        run_script_on(&config, "<case>", "M115")
             .await
             .expect("a minimal case runs against the fake firmware");
     }
@@ -713,6 +733,7 @@ mod tests {
 
         run_script_on(
             &config,
+            "<case>",
             "SET_KINEMATIC_POSITION X=0 Y=0 Z=0\nG1 X10 Y10 F600\nG1 E1 F300\nM400",
         )
         .await
@@ -737,7 +758,7 @@ mod tests {
         );
         let (config, _) = Config::from_text(&text).expect("the homing config parses");
 
-        run_script_on(&config, "G28")
+        run_script_on(&config, "<case>", "G28")
             .await
             .expect("G28 runs against the fake firmware");
     }

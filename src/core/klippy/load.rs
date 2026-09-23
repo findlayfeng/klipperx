@@ -570,6 +570,14 @@ mod tests {
                 "stepper_y",
                 "stepper_z",
                 "query_endstops",
+                // The toolhead's factory loads the default modules before the
+                // loader registers the toolhead itself (`gcode_move::ensure`),
+                // so `gcode_move` lands one slot earlier than upstream does
+                // (`toolhead.py:610-613` adds the toolhead first). Nothing
+                // resolves objects by position — `gcode_move` looks the
+                // toolhead up by name at ready — so only the list order shows
+                // it.
+                "gcode_move",
                 "toolhead"
             ]
         );

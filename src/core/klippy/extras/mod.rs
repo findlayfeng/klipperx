@@ -13,6 +13,7 @@ pub mod ds18b20;
 pub mod error_mcu;
 pub mod extruder;
 pub mod fan;
+pub mod gcode_move;
 pub mod heater_bed;
 pub mod heater_generic;
 pub mod heaters;

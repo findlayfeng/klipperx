@@ -242,7 +242,8 @@ toolhead / 开放事件）一起补，一部分是现在就独立可补的小行
       三个机器侧 `block_in_place` 桥与两个 API 侧临时桥（`run_script_blocking` /
       `query_all_blocking`）全部删除，见提交 `1782721`、`e05135b`。
       验收：`KLIPPERX_UPSTREAM_ALL=1` 不再卡（~1.06s 跑完），首次失败分布前移到 H2/H1 的真实
-      缺口（`fan` 82、autosave `pid_Kp` 49、`probe` 25 …）。
+      缺口（`fan` 82、`pid_Kp` 必填 49、`probe` 25 …；`pid_Kp` 那项当时误记为 autosave，
+      后证实是选项名大小写，已修复归零）。
 
 #### F9 其他输入与外设资源
 
@@ -279,8 +280,8 @@ FW5a–f / FW6a–f 已把「cartesian + 假 MCU 的 `G1`/`G28`」跑通并归�
       solver，注册 `M104`/`M109`/`ACTIVATE_EXTRUDER`/`SET_PRESSURE_ADVANCE`；toolhead 在 connect
       时把每个 extruder 挂成 extra axis 并分配 trapq。验收：`an_extruder_move_runs_against_the_fake_firmware`
       （`G1 E…` 同时驱动运动轴与挤出机）。回归里 `Section 'extruder'…` 消失，首次失败前移到
-      `pid_Kp` autosave（C2）/`heater_fan`（H2-3）/`extruder_stepper`（H10）（2026-09-23 实跑）；
-      `heater_bed`/`fan` 段均已落地。
+      `pid_Kp` 必填（选项名大小写，已修复归零）/`heater_fan`（H2-3）/`extruder_stepper`
+      （H10）（2026-09-23 实跑）；`heater_bed`/`fan` 段均已落地。
 - [x] **C1c-1 corexy 族**：✅ 已完成。`CartesianTransform`（Standard/CoreXy/CoreXz/HybridCoreXy/
       HybridCoreXz）把「rail 位置 → 台面轴」抽成值；`itersolve` 加 `corexy_/corexz_ position_fn`
       （`x±y` / `x±z`，active flags `X|Y` / `X|Z`）；`ToolHeadObject` 的 `KinematicsKind` 分派 solver
@@ -294,17 +295,21 @@ FW5a–f / FW6a–f 已把「cartesian + 假 MCU 的 `G1`/`G28`」跑通并归�
       `motion_queuing.register_flush_callback`（`output_pin` 的 `GCodeRequestQueue` 与
       `fan`/`servo`/`pwm_cycle_time` 等着它）。`gcode_move` 的坐标系部分已由 **G4-1** 落地。
 
-> **T3 的边界**：`[extruder]`/`heater_bed`/`fan` 三段与 C1b 已落地，T3 现在卡在 C2 的
-> autosave（`pid_Kp` 49 次）、H1 的 `verify_heater`/`pid_calibrate`、H2-3 的 `heater_fan`、
-> H10 的 `extruder_stepper`（未进装载表）与 F9/H7 的 `pulse_counter`（fan `tachometer_pin`）。
+> **T3 的边界**：`[extruder]`/`heater_bed`/`fan` 三段与 C1b 已落地，T3 现在卡在 H2-3 的
+> `heater_fan`、H1 的 `verify_heater`/`pid_calibrate`、H10 的 `extruder_stepper`
+> （未进装载表）与 F9/H7 的 `pulse_counter`（fan `tachometer_pin`）；
+> 原列的 C2 autosave（`pid_Kp` 49 次）是误归因，真因是选项名大小写，已修复归零。
 > T5 按 C1c 的族顺序推进。
 
 ### C2 配置装载收尾（框架 FW1）
 
 - [ ] **autosave / `SAVE_CONFIG`**：`#*#` 自动保存区块的读取（并入配置、与 include 冲突检查、
       损坏检测）与回写（`SAVE_CONFIG` 命令、备份、重启），属模块而非框架；`bed_tilt` / PID /
-      `probe_eddy_current` 等消费者都依赖它（上游 `klippy/configfile.py:248`、`:346`）；
-      当前回归首位失败就是它（`Option 'pid_Kp' …` 40 + `heater_bed` 9 = 49 次，2026-09-23 实跑）。
+      `probe_eddy_current` 等消费者都依赖它（上游 `klippy/configfile.py:248`、`:346`）。
+      语料里 **0 个配置带 `#*#` 区块**，本项对当前回归失败数为零——原先「首位失败是
+      `pid_Kp` 49 次」的归因有误，那实际是选项名大小写问题，已修复归零（见下方失败原因
+      统计）。本项要做的是写回侧：`PID_CALIBRATE` 等调用 `configfile.set()` 后由
+      `SAVE_CONFIG` 落盘（重启）。
       （`getchoice` 与 `minval/maxval/above/below/count` 文案已由框架补齐并归档，见 FW1/C2。）
 
 ### D1 主机层 start args / rollover / 日志（框架 FW8）
@@ -389,35 +394,38 @@ FW5a–f / FW6a–f 已把「cartesian + 假 MCU 的 `G1`/`G28`」跑通并归�
       回归里不再有 `Unknown temperature sensor`。
 
 **当前失败原因统计**（`KLIPPERX_UPSTREAM_ALL=1` 实跑，2026-09-23：**186 次失败**、51 次通过、
-2 条因未构建 `pru` 字典不计，合计 239）：
+2 条因未构建 `pru` 字典不计，合计 239；下表为**选项名大小写修复后**的分布——49 次
+`must be specified` 归零但总数不变、首因整体后移，见[复盘](docs/work-log/2026-09-22-upstream-regression-failures.md#复盘计数口径与重排后补)
+的「收益不可加」）：
 
 | 首次失败原因 | 次数 | 对应 TODO |
 |---|---|---|
-| `Option 'pid_Kp' … 'extruder'` + `'heater_bed'`（autosave） | 40 + 9 = 49 | C2（autosave）、H1 |
-| `Unknown pin chip name 'probe'` | 25 | T4 / H9（probe pin chip） |
-| `Error loading kinematics`（`delta` 9、`generic_cartesian` 4、`rotary_delta` 2、`polar`/`winch`/`deltesian` 各 1） | 18 | T5（C1c-2/3/4） |
-| TMC section/pin chip（`tmc2209 stepper_x` 11、`tmc2130` 2、`tmc2208` 1、`tmc2660` 1、pin chip 2） | 17 | T6 / H5 |
-| `Section 'display'` | 16 | T9 / H8 |
-| `Section 'heater_fan …'` | 14 | H2-3 |
-| `Section 'filament_switch_sensor …'` | 6 | H7 |
+| 温度传感器（`temperature_*`） | **0** | T7（已完成） |
+| 选项名大小写（`optionxform`） | **0** | 已对齐上游 `str.lower`（49 → 0） |
+| `Unknown pin chip name 'probe'` | 35 | T4 / H9（probe pin chip） |
+| `Error loading kinematics`（`delta` 12、`generic_cartesian` 4、`rotary_delta` 2、`polar`/`winch`/`deltesian` 各 1） | 21 | T5（C1c-2/3/4） |
+| TMC section/pin chip（段 21：`tmc2209` 15、`tmc2130` 2、`tmc2208` 2、`tmc2660` 1、`tmc5160` 1；pin chip 7：`tmc2209_stepper_x` 4、`tmc2130_stepper_x` 3） | 28 | T6 / H5 |
+| `Section 'display'` | 21 | T9 / H8 |
+| `Section 'heater_fan …'` | 22 | H2-3 |
+| `Section 'filament_switch_sensor …'` | 8 | H7 |
 | `sensor_pin: Unknown pin chip name 'vref_scaled'`（`adc_scaled`） | 4 | H1 |
-| H9 其余（`quad_gantry_level` 2、`bed_screws` 2、`z_tilt`/`bed_mesh`/`probe`/`endstop_phase` 各 1） | 8 | H9 |
-| 板级扩展 section（`mcp4451` 2、`ad5206`/`multi_pin`/`sx1509`/`replicape` 各 1） | 6 | H2 / H7 |
+| H9 其余（`bed_screws` 3、`quad_gantry_level` 2、`bed_mesh` 2、`z_tilt`/`probe`/`endstop_phase` 各 1） | 10 | H9 |
+| 板级扩展 section（`mcp4451` 2、`dac084s085` 2、`ad5206`/`multi_pin`/`sx1509_duex`/`replicape` 各 1） | 8 | H2 / H7 |
 | `Option 'tachometer_pin' … needs the pulse_counter module` | 2 | F9 / H7 |
 | `Section 'extruder_stepper …'` | 2 | H10 |
 | `Section 'verify_heater …'` | 2 | H1 |
-| `Unknown temperature sensor`（`G2`、`Kingroon_B3950` 型号） | 2 | H1（热敏电阻型号） |
-| `not ready: mcu: Pin 'PF7'/'PF1'` | 2 | F2（其余 MCU 引脚映射） |
-| 单实例（`dual_carriage` 2；`gcode_macro`/`virtual_sdcard`/`exclude_object`/`gcode_arcs`/`manual_stepper`/`pwm_cycle_time`/`led`/`input_shaper`/`temperature_fan`/`fan_generic` 各 1） | 12 | H3 / H4 / H9 / H10 |
+| `Unknown temperature sensor`（`G2`、`Kingroon_B3950`、`NTCS0603E3104FXT`） | 3 | H1（热敏电阻型号） |
+| MCU 引脚映射（`Pin 'PF1'` / `'PF7'` / `'PD6' is not a valid pin name`） | 3 | F2（其余 MCU 引脚映射） |
+| 单实例（`dual_carriage` 2、`safe_z_home` 2、`gcode_macro` 2；`virtual_sdcard`/`exclude_object`/`gcode_arcs`/`manual_stepper`/`pwm_cycle_time`/`led`/`input_shaper`/`temperature_fan`/`fan_generic`/`controller_fan` 各 1） | 16 | H3 / H4 / H9 / H10 |
 | 运行期失败（`Move out of range`：`generic-simulavr`） | 1 | 运行期（非装载） |
 | `Section 'extruder'`（T3 旧首位） | **0** | T3 已消 |
-| 温度传感器（`temperature_*`） | **0** | T7（已完成） |
 
 **T3 之后按首次失败分组的工单**：
 
 - [ ] **T3. `extruder` + `heater_bed` + `fan`**：三段均已落地，`Section 'extruder'` 已 **0 次**
-      （2026-09-23 实跑）；转绿还卡在 C2 autosave（`pid_Kp` 49）、H2-3 `heater_fan`（14）、
-      H10 `extruder_stepper`（2）、H1 `verify_heater`（2）与 F9/H7 `pulse_counter`（2）。
+      （2026-09-23 实跑）；原列的 C2 autosave（`pid_Kp` 49）是误归因——语料 0 个 `#*#` 区块，
+      真因是选项名大小写，已修复归零。现在卡在 H2-3 `heater_fan`（22）、H10 `extruder_stepper`
+      （2）、H1 `verify_heater`（2）与 F9/H7 `pulse_counter`（2）。
 - [ ] **T4. `probe` / `bltouch` / endstop pin chip**（25 次失败，2026-09-23 实跑）：`bed_mesh`、
       `bltouch`、`eddy`、`screws_tilt_adjust`、`smart_effector`、`z_virtual_endstop` 等。
       依赖 F8（endstop）与 H9（probe 模块）。
@@ -492,10 +500,12 @@ FW5a–f / FW6a–f 已把「cartesian + 假 MCU 的 `G1`/`G28`」跑通并归�
       temp` **48 → 0**。
 - [x] **转绿卡点 2（`gcode_move`，G4/H10）**：✅ `Move out of range` **49 → 0**，回归失败运行
       **当时 235 → 187**（一次多转绿 48 次；2026-09-23 实跑现为 186）。
-- [ ] **转绿卡点 3（`pid_Kp` autosave，C2/H1）**：新的首位是
-      `Option 'pid_Kp' in section 'extruder' must be specified`（40）+ `heater_bed`（9）＝49——
-      上游的 `PID_CALIBRATE` 自动保存把这几项写回配置（`configfile` 的 `#*#` 区块），
-      配置里没写就直接报错；本仓库还没读 autosave 区块（**C2 autosave/`SAVE_CONFIG`**）。
+- [x] **转绿卡点 3（`pid_Kp` 选项名大小写，config 解析）**：✅ 已修复归零——原判「autosave 缺
+      `#*#` 读取（C2/H1）」属误归因：语料里 0 个配置带 `#*#` 区块，49 次失败的真因是文件写
+      `pid_kp` 而代码查 `pid_Kp`。已按上游 `optionxform = str.lower` 对齐（`mod.rs` 存储侧
+      小写 + `section.rs` 查询侧小写；`override_config` 的键同样折叠），`must be specified`
+      文案保留调用方大小写，`is not valid` 用存储侧小写。autosave/`SAVE_CONFIG` 仍属 C2，
+      为未来 `PID_CALIBRATE` 的写回服务。
 - [ ] `pwm_tool.py`（队列化 PWM，随运动）、`pwm_cycle_time.py`、`static_pwm_clock.py`
       （`static_digital_output.py` 已随 T9 阶段 0 落地并归档）。
 - [ ] `multi_pin.py`、`servo.py`、`duplicate_pin_override.py`。

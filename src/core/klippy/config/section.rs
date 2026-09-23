@@ -90,27 +90,38 @@ impl ConfigSection {
     }
 
     /// Get a parameter value by name
+    ///
+    /// Option names are compared case-insensitively, matching upstream's
+    /// `optionxform = str.lower` behavior.
     pub fn get(&self, key: &str) -> Option<&ConfigValue> {
-        self.parameters.get(key)
+        self.parameters.get(&key.to_lowercase())
     }
 
     /// Get a parameter value as a string slice
+    ///
+    /// Option names are compared case-insensitively.
     pub fn get_str(&self, key: &str) -> Option<&str> {
-        self.parameters.get(key).and_then(|v| v.as_str_ref())
+        self.parameters
+            .get(&key.to_lowercase())
+            .and_then(|v| v.as_str_ref())
     }
 
     /// Check if section has a parameter
+    ///
+    /// Option names are compared case-insensitively.
     pub fn has(&self, key: &str) -> bool {
-        self.parameters.contains_key(key)
+        self.parameters.contains_key(&key.to_lowercase())
     }
 
     /// The option's text: a `Single` as written, a `Multi` joined with newlines.
     ///
     /// This is what upstream's `configparser` hands `getlist`/`getlists`: one
     /// string, with the newlines of an indented value still in it (the list
-    /// splitter trims them away).
+    /// splitter trims them away). Option names are compared case-insensitively.
     pub fn get_text(&self, key: &str) -> Option<String> {
-        self.parameters.get(key).map(ConfigValue::as_str)
+        self.parameters
+            .get(&key.to_lowercase())
+            .map(ConfigValue::as_str)
     }
 
     /// Upstream's `getlist`: split on `sep`, trim each item, drop the empty ones.
@@ -219,6 +230,45 @@ mod tests {
             map.iter_by_id().filter(|s| s.id == "stepper_x").collect();
         assert_eq!(stepper_x.len(), 2);
         assert_eq!(map.iter_by_id().count(), 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // case folding — upstream's optionxform = str.lower
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn get_looks_up_lowercase_key_when_inserted_lowercase() {
+        // The parser lowercases keys on write, so a lowercase key is always stored.
+        let mut section = section("extruder", None);
+        section
+            .parameters
+            .insert("pid_kp".to_string(), ConfigValue::Single("1.0".to_string()));
+
+        // A query with different casing still finds it.
+        assert_eq!(section.get("pid_Kp"), section.get("pid_kp"));
+        assert_eq!(section.get_str("PID_KP"), Some("1.0"));
+        assert!(section.has("Pid_Kp"));
+    }
+
+    #[test]
+    fn get_looks_up_case_insensitively_regardless_of_query_case() {
+        // The parser lowercases keys at storage, so "pid_kp" is stored.
+        // Lookups with any casing find it.
+        let mut section = section("extruder", None);
+        section
+            .parameters
+            .insert("pid_kp".to_string(), ConfigValue::Single("1.0".to_string()));
+
+        assert_eq!(section.get("pid_kp"), section.get("PID_KP"));
+        assert_eq!(section.get_str("Pid_Kp"), Some("1.0"));
+    }
+
+    #[test]
+    fn section_names_are_not_lowercased() {
+        // Only option names are folded; section ids keep their case.
+        let section = section("Output_Pin Fan", None);
+        assert_eq!(section.id, "Output_Pin Fan");
+        assert_eq!(section.identifier(), "Output_Pin Fan");
     }
 
     // -----------------------------------------------------------------------

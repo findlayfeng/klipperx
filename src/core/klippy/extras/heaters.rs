@@ -711,9 +711,9 @@ mod tests {
             ("min_temp", "0"),
             ("max_temp", "250"),
             ("control", "pid"),
-            ("pid_Kp", "1"),
-            ("pid_Ki", "0.1"),
-            ("pid_Kd", "10"),
+            ("pid_kp", "1"),
+            ("pid_ki", "0.1"),
+            ("pid_kd", "10"),
             ("min_extrude_temp", "0"),
         ] {
             heater_section
@@ -759,9 +759,9 @@ mod tests {
             ("min_temp", "0"),
             ("max_temp", "250"),
             ("control", "pid"),
-            ("pid_Kp", "1"),
-            ("pid_Ki", "0.1"),
-            ("pid_Kd", "10"),
+            ("pid_kp", "1"),
+            ("pid_ki", "0.1"),
+            ("pid_kd", "10"),
         ]);
         let heater = heaters
             .setup_heater(&ConfigWrapper::untracked(&section), &printer, None)
@@ -832,9 +832,9 @@ mod tests {
             ("max_temp", "250"),
             ("min_extrude_temp", "0"),
             ("control", "pid"),
-            ("pid_Kp", "64"),
-            ("pid_Ki", "1.4"),
-            ("pid_Kd", "128"),
+            ("pid_kp", "64"),
+            ("pid_ki", "1.4"),
+            ("pid_kd", "128"),
         ]);
         let heater = heaters
             .setup_heater(&ConfigWrapper::untracked(&section), &printer, None)

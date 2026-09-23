@@ -12,6 +12,7 @@ pub(crate) mod bus_debug;
 pub mod ds18b20;
 pub mod error_mcu;
 pub mod extruder;
+pub mod fan;
 pub mod heater_bed;
 pub mod heater_generic;
 pub mod heaters;

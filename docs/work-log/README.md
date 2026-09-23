@@ -20,3 +20,4 @@
 | 2026-09-22 | [已完成条目归档](2026-09-22-completed-archive.md) — 从 `TODO.md` 拆出的「已完成（留档）」全文，让 TODO 只剩未决项 |
 | 2026-09-22 | [上游回归测试失败原因分析](2026-09-22-upstream-regression-failures.md) — 239 次运行按首次失败归类的工单（T3–T10）与完整失败日志（`KLIPPERX_UPSTREAM_ALL=1` 实跑快照） |
 | 2026-09-22 | [C1（运动层收尾）动工前调查](2026-09-22-c1-notes.md) — 上游的轴/stepper/rail/extruder 模型、本仓库差距、拍板点与 C1a–C1d 拆分（先做 C1a 轴/stepper 抽象 + 多轴） |
+| 2026-09-23 | [H2（风扇与通用输出）动工前调查](2026-09-23-h2-notes.md) — 上游 fan/heater_fan/controller_fan 等 21 个文件的依赖盘点、344 次「运行×缺口」测算、GCodeRequestQueue/heater 注册表/tachometer 三处差距与 H2-1…H2-7 拆分 |

@@ -129,39 +129,76 @@ points: 100, 100
 
 ## 示例配置
 
-以下是一个完整的示例：
+以下是一个可直接装载的最小 cartesian 示例（每项必需选项都给出；各节的完整参数见下文）：
 
 ```ini
 [mcu]
 serial: /dev/serial/by-path/platform-3f980000.usb-usb-0:1.2:1.0-port0
 baud: 250000
 
-[mcu zboard]
-serial: /dev/serial/by-path/platform-3f980000.usb-usb-0:1.3:1.0-port0
+[stepper_x]
+step_pin: PA0
+dir_pin: PA1
+enable_pin: !PA2
+rotation_distance: 40
+microsteps: 16
+position_min: 0
+position_max: 200
+position_endstop: 0
+endstop_pin: PA3
+homing_speed: 5
 
-[mcu auxboard]
-serial: /dev/serial/by-path/platform-3f980000.usb-usb-0:1.4:1.0-port0
+[stepper_y]
+step_pin: PA4
+dir_pin: PA5
+enable_pin: !PA2
+rotation_distance: 40
+microsteps: 16
+position_min: 0
+position_max: 200
+position_endstop: 0
+endstop_pin: PA6
+homing_speed: 5
 
 [stepper_z]
-step_pin: zboard:PL3
-dir_pin: zboard:PL1
-enable_pin: !zboard:PK0
+step_pin: PB0
+dir_pin: PB1
+enable_pin: !PA2
+rotation_distance: 8
+microsteps: 16
+position_min: -5
+position_max: 100
+position_endstop: 0
+endstop_pin: PB2
+homing_speed: 2
 
 [extruder]
-step_pin: auxboard:PA4
-heater_pin: auxboard:PB4
+step_pin: PB3
+dir_pin: PB4
+rotation_distance: 4.233
+microsteps: 16
+nozzle_diameter: 0.400
+filament_diameter: 1.750
+heater_pin: PB5
+sensor_type: EPCOS 100K B57560G104F
+sensor_pin: PC0
 min_temp: 0
 max_temp: 250
+control: pid
+pid_Kp: 21.5
+pid_Ki: 1.54
+pid_Kd: 76.5
 
 [printer]
 kinematics: cartesian
-max_velocity: 500
+max_velocity: 300
 max_accel: 3000
 ```
 
 ## 已支持的配置节
 
-以下为 KlipperX 当前已实现的配置节。
+以下为 KlipperX 当前已实现的配置节（共 18 个装载 id，按装载顺序；`[mcu]` 与 `[printer]`
+分别在最早与最晚装载，其余按各节 `section!` 声明的 `order`）。
 
 ### `[mcu]` / `[mcu <name>]` — MCU 连接
 
@@ -340,6 +377,229 @@ spi_software_sclk_pin: PB3
 
 ```gcode
 SPI_TRANSFER DEVICE=flash DATA=9f000000    ; W25 flash JEDEC ID → ef 30 13
+```
+
+### `[printer]` — 运动与工具头（注册为 `toolhead`）
+
+整机的运动参数与运动学选择。该节在**最后**装载（上游也是最后 load `toolhead`），装载时注册
+`G4` / `M400` / `G28` / `SET_KINEMATIC_POSITION`，并拉起 `gcode_move`（坐标系）与
+`query_endstops`。
+
+| 参数 | 类型 | 必需 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| `kinematics` | 字符串 | 是 | — | `none` / `cartesian` / `corexy` / `corexz` / `hybrid_corexy` / `hybrid_corexz`（delta 族与 `generic_cartesian` 待做） |
+| `max_velocity` | 浮点 (mm/s) | 是 | — | `> 0` |
+| `max_accel` | 浮点 (mm/s²) | 是 | — | `> 0` |
+| `minimum_cruise_ratio` | 浮点 (0..1) | 否 | `0.5` | 巡航段占比下限（上游同名选项） |
+| `square_corner_velocity` | 浮点 (mm/s) | 否 | `5.0` | `≥ 0`，决定拐角允许的速度 |
+| `max_z_velocity` | 浮点 (mm/s) | 否 | `= max_velocity` | `≤ max_velocity` |
+| `max_z_accel` | 浮点 (mm/s²) | 否 | `= max_accel` | `≤ max_accel` |
+
+`kinematics: none` 时不需要任何 `[stepper_*]` 节（开发/测试机）；其余运动学需要
+`stepper_x` / `stepper_y` / `stepper_z` 三根轴都存在。
+
+### `[stepper_x]` / `[stepper_y]` / `[stepper_z]` — 电机与轴
+
+一根轴上的电机。`enable_pin` **在本节读取**（由 `[stepper_enable]` 对象管理、跨节引用计数
+共享）；编号兄弟节 `[stepper_z1]` / `[stepper_z2]` … 没有自己的工厂，由主节
+（`[stepper_z]`）的装载**连带读取**，只写电机选项，不写几何选项。
+
+| 参数 | 类型 | 必需 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| `step_pin` | 引脚 | 是 | — | 步进信号，`!` 取反即上游的 `invert_step` |
+| `dir_pin` | 引脚 | 是 | — | 方向信号，必须与 `step_pin` 同 MCU |
+| `enable_pin` | 引脚 | 否 | — | 使能脚，`!` 取反；多个 stepper 节写同一脚时共享并引用计数 |
+| `rotation_distance` | 浮点 (mm) | 是 | — | 电机每整圈走的毫米数，`> 0` |
+| `microsteps` | 整数 | 是 | — | 每整步的细分数，`≥ 1` |
+| `full_steps_per_rotation` | 整数 | 否 | `200` | 电机整步数 |
+| `gear_ratio` | `g1:g2` 列表 | 否 | 空 | 逗号分隔的多对减速比，乘进步距；每对恰好 2 项 |
+| `step_pulse_duration` | 浮点 (s) | 否 | `0.000002` | 步进脉宽，`0 ≤ … ≤ 0.001` |
+| `position_min` | 浮点 (mm) | 否 | `0` | 轴行程下限（主节几何） |
+| `position_max` | 浮点 (mm) | 是 | — | 轴行程上限，`≥ position_min`（主节几何） |
+| `position_endstop` | 浮点 (mm) | 否 | `= position_min` | 限位开关位置，必须落在 `[min, max]` 内 |
+| `endstop_pin` | 引脚 | 否 | — | 归零用限位；不写则该轴不能 `G28` |
+| `homing_speed` | 浮点 (mm/s) | 否 | `5.0` | 归零速度，`> 0` |
+| `second_homing_speed` | 浮点 (mm/s) | 否 | `= homing_speed / 2` | 第二遍速度（当前回零是单程，选项已读入备用） |
+| `homing_retract_speed` | 浮点 (mm/s) | 否 | `= homing_speed` | 回缩速度（同上，单程未用） |
+| `homing_retract_dist` | 浮点 (mm) | 否 | `5.0` | 触发后的回缩距离（同上，单程未用） |
+| `homing_positive_dir` | 布尔 | 否 | 由 `position_endstop` 推断 | endstop 在低端四分位推为 `false`、高端推为 `true`；居中且未给时报错 |
+
+注意：几何选项（`position_*` / `endstop_pin` / `homing_*`）属于**主节**，编号兄弟只当电机用。
+
+### `[stepper_enable]` — 使能跟踪（无选项）
+
+管理全部 stepper 的使能状态与共享使能脚，注册 `M18` / `M84` /
+`SET_STEPPER_ENABLE STEPPER=… ENABLE=…`，并在 `gcode:request_restart` 时停电机
+（广播 `stepper:motor_off`）。**该节本身不接受任何选项**（`enable_pin` 写在各
+`[stepper_*]` 节里）；装载即生效，配置里写一个空节即可：
+
+```ini
+[stepper_enable]
+```
+
+### 加热器共用选项（`[extruder]` / `[heater_bed]` / `[heater_generic <name>]`）
+
+三个加热节都经 `heaters::setup_heater` 读同一组选项：
+
+| 参数 | 类型 | 必需 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| `sensor_type` | 字符串 | 是 | — | 温度传感器类型，查 `heaters` 注册表（可选值见 `[temperature_sensor]` 的速查表） |
+| `sensor_pin` | 引脚 | 是* | — | 传感器的 ADC 引脚；`DS18B20` / `temperature_mcu` / `temperature_combined` 不用它 |
+| `heater_pin` | 引脚 | 是 | — | 加热输出（按 PWM 接） |
+| `min_temp` | 浮点 (°C) | 是 | — | 报警下限 |
+| `max_temp` | 浮点 (°C) | 是 | — | 报警上限，`> min_temp` |
+| `min_extrude_temp` | 浮点 (°C) | 否 | `170` | 允许挤出的最低温度（须在 `[min_temp, max_temp]` 内） |
+| `max_power` | 浮点 (0..1] | 否 | `1.0` | 占空比上限 |
+| `smooth_time` | 浮点 (s) | 否 | `1.0` | 读数平滑时间，`> 0`（也是 PID 的 `min_deriv_time`） |
+| `pwm_cycle_time` | 浮点 (s) | 否 | `0.100` | 加热器 PWM 周期，`> 0` |
+| `control` | `watermark` / `pid` | 是 | — | 控制算法 |
+| `max_delta` | 浮点 (°C) | 否* | `2.0` | `watermark`（bang-bang）的回差，`≥ 0` |
+| `pid_Kp` / `pid_Ki` / `pid_Kd` | 浮点 | `pid` 时是 | — | PID 三参数（内部除以 1000，与上游同基准） |
+
+*`sensor_pin` 由所选传感器工厂决定是否必需；`max_delta` 只在 `control: watermark` 下读。
+
+### `[extruder]` / `[extruder1]` … — 挤出机
+
+热端加热器 + 挤出运动（E 轴）。编号兄弟 `[extruder1]` … 没有自己的工厂，由
+`[extruder]` 的装载**连带读取**并按节名注册；`gcode_id` 内定为 `T0` / `T1` …。
+选项 = 上表的加热器共用选项 +：
+
+| 参数 | 类型 | 必需 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| `nozzle_diameter` | 浮点 (mm) | 是 | — | `> 0` |
+| `filament_diameter` | 浮点 (mm) | 是 | — | `≥ nozzle_diameter` |
+| `max_extrude_cross_section` | 浮点 (mm²) | 否 | `4 × nozzle_diameter²` | 单次挤出截面上限 |
+| `max_extrude_only_distance` | 浮点 (mm) | 否 | `50` | 纯挤出移动的长度上限 |
+| `max_extrude_only_velocity` | 浮点 (mm/s) | 否 | ready 时由 `max_velocity` 推导 | 纯挤出速度上限 |
+| `max_extrude_only_accel` | 浮点 (mm/s²) | 否 | ready 时由 `max_accel` 推导 | 纯挤出加速度上限 |
+| `instantaneous_corner_velocity` | 浮点 (mm/s) | 否 | `1.0` | 挤出拐角的瞬时速度 |
+| `pressure_advance` | 浮点 | 否 | `0.0` | 压力推进，`≥ 0`（运行期用 `SET_PRESSURE_ADVANCE` 调） |
+| `pressure_advance_smooth_time` | 浮点 (s) | 否 | `0.040` | PA 平滑时间，`≤ 0.200` |
+| `step_pin` / `dir_pin` / `rotation_distance` / `microsteps` … | 同 `[stepper_*]` | 否 | — | **写了任一个**才建 E 轴 stepper（上游同规则）；不写则纯加热 |
+
+命令：`M104` / `M109`（当前不等温）/ `SET_PRESSURE_ADVANCE`（mux `EXTRUDER`）/
+`ACTIVATE_EXTRUDER`。只有名字是 `extruder` 的主挤出机额外注册 `EXTRUDER` 默认项。
+
+### `[heater_bed]` — 热床
+
+选项 = 加热器共用选项（`gcode_id` 内定为 `B`），注册 `M140` / `M190`（当前不等温）。
+
+```ini
+[heater_bed]
+heater_pin: PB5
+sensor_type: EPCOS 100K B57560G104F
+sensor_pin: PC0
+control: watermark
+max_delta: 2.0
+min_temp: 0
+max_temp: 110
+```
+
+### `[heater_generic <name>]` — 任意命名的加热器
+
+选项 = 加热器共用选项 + `gcode_id`（字符串，可选，用于 `M105` 报告）。经
+`SET_HEATER_TEMPERATURE HEATER=<name>` 控制。
+
+### `[fan]` — 风扇（`M106` / `M107`）
+
+| 参数 | 类型 | 必需 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| `pin` | 引脚 | 是 | — | PWM 输出脚 |
+| `max_power` | 浮点 (0..1] | 否 | `1.0` | 占空比上限 |
+| `kick_start_time` | 浮点 (s) | 否 | `0.1` | 静止起步时的满速时间，`≥ 0` |
+| `off_below` | 浮点 [0..1] | 否 | `0.0` | 低于该请求值直接关 |
+| `cycle_time` | 浮点 (s) | 否 | `0.010` | PWM 周期，`> 0` |
+| `hardware_pwm` | 布尔 | 否 | `false` | 用固件 PWM 而非软件翻转 |
+| `shutdown_speed` | 浮点 [0..1] | 否 | `0` | 主机停机时固件回退的占空比（被 `max_power` 再截一次） |
+| `enable_pin` | 引脚 | 否 | — | 驱动使能脚，只在 0 ↔ 非 0 边沿翻转 |
+| `tachometer_pin` | — | 拒收 | — | 需 `pulse_counter`（F9），写了直接报配置错而不是静默 `rpm: null` |
+
+### `[temperature_sensor <name>]` — 可查询的温度传感器
+
+把任意已注册的传感器类型暴露成一个可 `objects/query` 的对象。`get_status` 报
+`temperature` / `measured_min_temp` / `measured_max_temp`（保留 2 位；未上报过的读数 0
+不计入 min/max）。
+
+| 参数 | 类型 | 必需 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| `sensor_type` | 字符串 | 是 | — | 传感器类型，查下表 |
+| `min_temp` | 浮点 (°C) | 否 | `-273.15` | 报警下限 |
+| `max_temp` | 浮点 (°C) | 否 | `999999999.9` | 报警上限，`> min_temp` |
+| 其余 | 视类型 | — | — | 所选传感器工厂的选项（如 DS18B20 的 `serial_no`） |
+
+`sensor_type` 可选值（当前已注册的工厂）：
+
+| 类 | 类型名 |
+|----|--------|
+| ADC 电压型 | `AD595` `AD597` `AD8494` `AD8495` `AD8496` `AD8497` |
+| 电阻/热敏（内建表） | `PT1000`、`PT100 INA826`，以及 8 个内建热敏：`ATC Semitec 104GT-2`、`ATC Semitec 104NT-4-R025H42G`、`EPCOS 100K B57560G104F`、`Generic 3950`、`SliceEngineering 450`、`TDK NTCG104LH104JT1`、`Honeywell 100K 135-104LAG-J01`、`NTC 100K MGB18-104F39050L32` |
+| SPI 热电偶 / RTD | `MAX6675` `MAX31855` `MAX31856` `MAX31865`（选项含 `tc_averaging_count` / `tc_use_50Hz_filter` / `rtd_nominal_r` / `rtd_num_of_wires` / `rtd_use_50Hz_filter`，以及 SPI 共用的 `spi_bus` / `spi_mcu` / `cs_pin` 等） |
+| 1-wire | `DS18B20`（`serial_no` 必需、`sensor_mcu` 必需、`ds18_report_time` 默认 3.0 s ≥ 1.0 s） |
+| MCU 内部 | `temperature_mcu`（可带 `sensor_mcu`，默认 `mcu`） |
+| 组合 | `temperature_combined`（`sensor_list` 必需、`maximum_deviation` ≥ 0、`combination_method` ∈ `min`/`max`/`mean` 必需） |
+| 自定义 | 用 `[thermistor <name>]` / `[adc_temperature <name>]` 定义后按 `<name>` 引用（见下节） |
+
+```ini
+[temperature_sensor mcu_temp]
+sensor_type: temperature_mcu
+min_temp: 0
+max_temp: 85
+
+[temperature_sensor hotend]
+sensor_type: DS18B20
+sensor_mcu: mcu
+serial_no: 28ff00abcdef
+max_temp: 300
+```
+
+### `[thermistor <name>]` / `[adc_temperature <name>]` — 自定义传感器定义
+
+定义一个新的传感器类型供 `sensor_type` 引用；节的 `<name>` 就是注册的类型名。两者的差别
+是标定点的写法（与上游一致，`[adc_temperature]` 按是否给 `resistance1` 区分电阻/电压型）：
+
+| 参数 | 类型 | 说明 |
+|------|------|------|
+| `temperature1..N` | 浮点 (°C) | 标定点温度，从 1 起连续编号，至少 2 组（单点 + `beta` 形式除外） |
+| `resistance1..N` | 浮点 (Ω) | 该点电阻（`[thermistor]` 必需，定义电阻型） |
+| `voltage1..N` | 浮点 (V) | 该点电压（`[adc_temperature]` 用它定义线性电压型） |
+| `beta` | 浮点 | 可选：单点 + Beta 模型（`temperature1`/`resistance1`/`beta`） |
+| `pullup_resistor` | 浮点 (Ω) | 可选，默认 `4700`（在**使用该类型的节**里写，如 `[extruder]`） |
+| `inline_resistor` | 浮点 (Ω) | 可选，默认 `0`（同上） |
+| `adc_voltage` | 浮点 (V) | 可选，默认 `5.0`（电压型，同上） |
+| `voltage_offset` | 浮点 (V) | 可选，默认 `0.0`（电压型，同上） |
+
+使用方（如 `[extruder]`）仍要写 `sensor_type: <name>` 与 `sensor_pin`。
+
+```ini
+[thermistor my_ntc]
+temperature1: 25
+resistance1: 100000
+temperature2: 150
+resistance2: 1641.9
+beta: 3950
+
+[adc_temperature my_volts]
+temperature1: 0
+voltage1: 0.5
+temperature2: 100
+voltage2: 4.5
+```
+
+裸 `[adc_temperature]`（不带名字）是上游“装载本模块默认传感器”的开关，一般不需要手写。
+
+### `[static_digital_output <name>]` — 开机即定的静态输出
+
+把一组引脚在**配置期**一次性拉到固定电平（如跳线选微步），此后不改；无 oid、不占资源。
+
+| 参数 | 类型 | 必需 | 说明 |
+|------|------|------|------|
+| `pins` | 逗号分隔的引脚列表 | 是 | 每个可带 `!` 取反；**重复写多行 `pins:` 只有最后一行生效**（与上游解析器一致），要多个引脚就写一行逗号分隔 |
+
+对象无 `get_status`，不出现在 `objects/list`。`order = 35` 排在 `[board_pins]` 之后，别名可用。
+
+```ini
+[static_digital_output ms_select]
+pins: !PD0, PD1, PD2
 ```
 
 ---

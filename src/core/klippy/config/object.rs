@@ -8,16 +8,17 @@
 //! | `config` | every section/option as written (`status_raw_config`) | the snapshot [`PrinterConfig::new`] was handed |
 //! | `warnings` | deprecated options, runtime warnings | the recorded warnings, deduplicated as upstream does |
 //! | `settings` | every option a module read, parsed (`ConfigValidate`) | the live [`AccessTracking`] |
-//! | `save_config_pending` / `_items` | `SAVE_CONFIG` state | always empty (auto-save is a separate task) |
+//! | `save_config_pending` / `_items` | `SAVE_CONFIG` state | the pending autosave values (`set` / `remove_section`); writing the file back is still to come |
 //!
 //! `settings` is read live rather than snapshotted because parts read their
 //! sections as they connect; `config` is a snapshot because it never changes.
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Map, Value};
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::core::klippy::config::access::AccessTracking;
 use crate::core::klippy::config::Config;
@@ -37,6 +38,12 @@ pub struct PrinterConfig {
     /// Serialized keys of [`PrinterConfig::warnings`], for upstream's dedup
     /// (`_add_deprecated`, `klippy/configfile.py:491-499`).
     seen: Mutex<HashSet<String>>,
+    /// The autosave values waiting for `SAVE_CONFIG`
+    /// (`ConfigAutoSave.status_save_pending`): a section maps to its pending
+    /// options, or to `Null` when the section is to be removed.
+    pending: Mutex<Map<String, Value>>,
+    /// Whether anything is waiting to be written back.
+    save_pending: AtomicBool,
 }
 
 impl PrinterConfig {
@@ -47,7 +54,40 @@ impl PrinterConfig {
             raw_config,
             warnings: Mutex::new(Vec::new()),
             seen: Mutex::new(HashSet::new()),
+            pending: Mutex::new(Map::new()),
+            save_pending: AtomicBool::new(false),
         }
+    }
+
+    /// Record an autosave value (`ConfigAutoSave.set`,
+    /// `klippy/configfile.py:317-330`).
+    ///
+    /// The value is only remembered: upstream writes it back at `SAVE_CONFIG`.
+    pub fn set(&self, section: &str, option: &str, value: &str) {
+        {
+            let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
+            let entry = pending
+                .entry(section.to_string())
+                .or_insert_with(|| Value::Object(Map::new()));
+            if !entry.is_object() {
+                *entry = Value::Object(Map::new());
+            }
+            if let Value::Object(options) = entry {
+                options.insert(option.to_string(), json!(value));
+            }
+        }
+        self.save_pending.store(true, Ordering::SeqCst);
+        info!("save_config: set [{section}] {option} = {value}");
+    }
+
+    /// Drop a section at the next `SAVE_CONFIG` (`ConfigAutoSave.remove_section`,
+    /// `klippy/configfile.py:331-343`).
+    pub fn remove_section(&self, section: &str) {
+        self.pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(section.to_string(), Value::Null);
+        self.save_pending.store(true, Ordering::SeqCst);
     }
 
     /// Build the `config` status snapshot from a parsed config.
@@ -203,8 +243,12 @@ impl PrinterObject for PrinterConfig {
             "config": self.raw_config,
             "warnings": warnings,
             "settings": self.access.settings(),
-            "save_config_pending": false,
-            "save_config_pending_items": Map::<String, Value>::new(),
+            "save_config_pending": self.save_pending.load(Ordering::SeqCst),
+            "save_config_pending_items": self
+                .pending
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone(),
         })
     }
 }
@@ -216,6 +260,28 @@ mod tests {
     fn object(text: &str) -> PrinterConfig {
         let (config, _) = Config::from_text(text).unwrap();
         PrinterConfig::new(AccessTracking::shared(), PrinterConfig::raw_config(&config))
+    }
+
+    #[test]
+    fn set_and_remove_section_record_pending_autosave_values() {
+        let object = object("[probe]\nz_offset: 1.0\n");
+        assert_eq!(object.get_status(0.0)["save_config_pending"], json!(false));
+
+        object.set("probe", "z_offset", "2.000");
+        object.set("probe", "x_offset", "1.000");
+        object.remove_section("gone");
+
+        let status = object.get_status(0.0);
+        assert_eq!(status["save_config_pending"], json!(true));
+        assert_eq!(
+            status["save_config_pending_items"]["probe"]["z_offset"],
+            json!("2.000")
+        );
+        assert_eq!(
+            status["save_config_pending_items"]["probe"]["x_offset"],
+            json!("1.000")
+        );
+        assert_eq!(status["save_config_pending_items"]["gone"], Value::Null);
     }
 
     #[test]

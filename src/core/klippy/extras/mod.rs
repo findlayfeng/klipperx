@@ -18,6 +18,7 @@ pub mod heater_bed;
 pub mod heater_generic;
 pub mod heaters;
 pub mod i2c_device;
+pub mod manual_probe;
 pub mod output_pin;
 pub mod probe;
 pub mod query_endstops;

@@ -27,8 +27,9 @@ use std::sync::{Arc, Mutex, Weak};
 use serde_json::{json, Value};
 use tracing::warn;
 
-use crate::core::klippy::config::{ConfigError, ConfigWrapper};
+use crate::core::klippy::config::{ConfigError, ConfigWrapper, PrinterConfig};
 use crate::core::klippy::event::KlippyEvent;
+use crate::core::klippy::extras::manual_probe::{FinalizeCallback, ManualProbe};
 use crate::core::klippy::extras::toolhead::ToolHeadObject;
 use crate::core::klippy::gcode::{CommandError, GCodeDispatch, GcodeCommand, GCODE_OBJECT};
 use crate::core::klippy::load::section;
@@ -49,6 +50,12 @@ const VIRTUAL_ENDSTOP: &str = "z_virtual_endstop";
 
 /// The toolhead object, as the loader registers `[printer]`.
 const TOOLHEAD_OBJECT: &str = "toolhead";
+
+/// The `manual_probe` object, for `PROBE_CALIBRATE`.
+const MANUAL_PROBE_OBJECT: &str = "manual_probe";
+
+/// The `configfile` object, for the calibration write-back.
+const CONFIGFILE_OBJECT: &str = "configfile";
 
 /// The Z axis index, as [`Coord`] numbers them.
 const Z_AXIS: usize = 2;
@@ -559,7 +566,12 @@ impl PrinterProbe {
             &options,
         )?);
         let state = Arc::new(ProbeCommandState::default());
-        register_commands(printer, &identifier, &session, &state)?;
+        let offsets = ProbeOffsets {
+            x: options.x_offset,
+            y: options.y_offset,
+            z: options.z_offset,
+        };
+        register_commands(printer, &identifier, &session, &state, offsets)?;
 
         Ok(Self {
             identifier,
@@ -633,6 +645,7 @@ fn register_commands(
     identifier: &str,
     session: &Arc<ProbeSessionHelper>,
     state: &Arc<ProbeCommandState>,
+    offsets: ProbeOffsets,
 ) -> Result<(), ConfigError> {
     let gcode = printer
         .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
@@ -729,7 +742,6 @@ fn register_commands(
                 "PROBE_ACCURACY",
                 Arc::new(move |gcmd| {
                     let session = Arc::clone(&session);
-                    let name = name.clone();
                     Box::pin(async move {
                         let params = session.defaults.from_command(gcmd)?;
                         let sample_count = gcmd.get_int_default("SAMPLES", 10)?;
@@ -782,11 +794,90 @@ fn register_commands(
                         gcmd.respond_info(&format!(
                             "probe accuracy results: maximum {max_value:.6}, minimum {min_value:.6}, range {range_value:.6}, average {avg_value:.6}, median {median:.6}, standard deviation {sigma:.6}"
                         ));
-                        let _ = name;
                         Ok(())
                     })
                 }),
                 Some("Probe Z-height accuracy at current XY position"),
+                false,
+            )
+            .map_err(ConfigError::new)?;
+    }
+
+    // PROBE_CALIBRATE: probe once, move the nozzle over the probe, then hand
+    // over to the interactive manual probe (`probe.py:cmd_PROBE_CALIBRATE`).
+    {
+        let session = Arc::clone(session);
+        let name = name.clone();
+        let calibrate_z = Arc::new(Mutex::new(0.0f64));
+        let printer_weak = Arc::downgrade(printer);
+        gcode
+            .register_command(
+                "PROBE_CALIBRATE",
+                Arc::new(move |gcmd| {
+                    let session = Arc::clone(&session);
+                    let name = name.clone();
+                    let calibrate_z = Arc::clone(&calibrate_z);
+                    let printer_weak = printer_weak.clone();
+                    Box::pin(async move {
+                        let printer = printer_weak
+                            .upgrade()
+                            .ok_or_else(|| CommandError::new("Printer is not ready"))?;
+                        let manual_probe = printer
+                            .lookup_object_as::<ManualProbe>(MANUAL_PROBE_OBJECT)
+                            .ok_or_else(|| CommandError::new("Printer is not ready"))?;
+                        manual_probe.verify_no_manual_probe(&printer)?;
+
+                        // Initial probe at the current position.
+                        let params = session.defaults.from_command(gcmd)?;
+                        session.start()?;
+                        session.run(gcmd).await?;
+                        let pos = session
+                            .pull_results()
+                            .into_iter()
+                            .next()
+                            .ok_or_else(ProbeSessionHelper::state_error)?;
+                        session.end()?;
+
+                        // Move away from the bed, then over the probe point.
+                        let toolhead = session.toolhead()?;
+                        let mut curpos = pos;
+                        *calibrate_z.lock().unwrap_or_else(|p| p.into_inner()) = curpos.z();
+                        curpos.set_axis(Z_AXIS, curpos.z() + 5.0);
+                        toolhead.move_to(curpos, params.lift_speed)?;
+                        curpos.set_axis(0, curpos.x() + offsets.x);
+                        curpos.set_axis(1, curpos.y() + offsets.y);
+                        toolhead.move_to(curpos, params.probe_speed)?;
+
+                        // Interactive part; ACCEPT reports the new z_offset.
+                        let cb_printer = Arc::clone(&printer);
+                        let callback: FinalizeCallback =
+                            Arc::new(move |kin_pos: Option<Coord>| {
+                                let Some(kin) = kin_pos else { return };
+                                let z_offset = *calibrate_z.lock().unwrap_or_else(|p| p.into_inner())
+                                    - kin.z();
+                                if let Some(gcode) =
+                                    cb_printer.lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+                                {
+                                    gcode.respond_info(
+                                        &format!(
+                                            "{name}: z_offset: {z_offset:.3}\n\
+                                             The SAVE_CONFIG command will update the printer config file\n\
+                                             with the above and restart the printer."
+                                        ),
+                                        true,
+                                    );
+                                }
+                                if let Some(configfile) =
+                                    cb_printer.lookup_object_as::<PrinterConfig>(CONFIGFILE_OBJECT)
+                                {
+                                    configfile.set(&name, "z_offset", &format!("{z_offset:.3}"));
+                                }
+                            });
+                        manual_probe.start_helper(&printer, gcmd, callback)?;
+                        Ok(())
+                    })
+                }),
+                Some("Calibrate the probe's z_offset"),
                 false,
             )
             .map_err(ConfigError::new)?;

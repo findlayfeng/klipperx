@@ -846,6 +846,13 @@ impl GCodeDispatch {
         }
     }
 
+    /// Send an informational line from a part that holds no command
+    /// (the manual-probe helper's callbacks, a calibration finalizer):
+    /// upstream's `gcode.respond_info(msg, log=True)`.
+    pub fn respond_info(&self, msg: &str, log: bool) {
+        self.inner.respond_info(msg, log);
+    }
+
     fn lock(&self) -> MutexGuard<'_, Commands> {
         self.inner
             .commands

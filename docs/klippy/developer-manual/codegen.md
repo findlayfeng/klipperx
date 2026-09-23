@@ -64,12 +64,17 @@ section!("output_pin", order = 20, prefix = load_config_prefix);
 
 // extras/toolhead.rs
 section!("printer", order = 60, phase = late, object = "toolhead", load = load_config);
+
+// extras/stepper.rs —— late：`endstop_pin` 可能指向别的段注册的 pin chip
+section!("stepper_x", order = 50, phase = late, load = load_config);
 ```
 
 - `load` 对应 `[id]`，`prefix` 对应 `[id <name>]`，至少写一个；
 - `order` 必填，决定同一半（main / prefix）内的装载顺序（`load.rs` 的两次遍历按表序进行）；
 - `phase = early | generic | late`（默认 `generic`）：`early` 排在普通节之前（上游先 `pins`/`mcu`），
-  `late` 排在之后（上游最后才 load `toolhead`）；
+  `late` 排在之后（上游最后才 load `toolhead`）；`[stepper_*]` 也在 `late`（order 50，早于 toolhead）——
+  它的 `endstop_pin` 可能指向其它段注册的 pin chip（如 `probe:`、`tmc*_stepper_x:`），必须等所有
+generic 段装载完再解析；
 - `object = "<name>"`：装载出的对象以别的名字注册（`[printer]` 注册成 `toolhead`）；
 - 声明处需要 `use crate::core::klippy::load::section;` 引入宏。
 

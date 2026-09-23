@@ -1,7 +1,7 @@
 //! The reactor: the machine's clock, and the timers it wakes on.
 //!
 //! A printer is not a runtime. Upstream gives every printer a reactor
-//! (`Printer.get_reactor()`, 121 call sites) and everything asynchronous goes
+//! (`Printer.get_reactor()`, 119 call sites) and everything asynchronous goes
 //! through it: a module schedules a callback for a later moment, or parks the
 //! current greenlet until something completes. That reactor *is* upstream's
 //! event loop — a `select()`/`poll()` around a timer list, with greenlets

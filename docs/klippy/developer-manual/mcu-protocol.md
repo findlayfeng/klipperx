@@ -82,7 +82,7 @@
 三者形状并不一致，这一点很容易踩坑：
 
 - `commands` / `responses` 的键以消息名开头，所以能取出 `MessageDef { name, id, format }`。
-- `output` 的键是自由文本（固件写作 `_DECL_OUTPUT("mpu9240 fifo_max=%u")`），**没有**前导消息名，所以原样保留为 `OutputDef { format, id }`，并且**不注册进 `Parser`** —— 异步输出属于尚未实现的事件层。
+- `output` 的键是自由文本（固件写作 `_DECL_OUTPUT("mpu9240 fifo_max=%u")`），**没有**前导消息名，所以原样保留为 `OutputDef { format, id }`，并且**不注册进 `Parser`** —— 事件层（`event/`）已实现但只接 `responses` 表的 `sendf` 类消息，`output` 表的异步投递仍是待办（见「当前未实现」）。
 - 枚举值可以是单个整数，也可以是 `[start, count]` 区间。区间在解析期就展开（与 Klipper 的 `fill_enumerations` 一致）：`"PL0": [0, 13]` 展开成 `PL0`→0 … `PL12`→12。
 
 ### 安装
@@ -166,7 +166,7 @@ pub trait ClockSync {
 
 - 能力 trait 用 `impl Future + Send` 而不是 `async fn`：`async fn` in trait 已稳定但不是 dyn-safe，且 `Send` 会变成隐式假设（触发 `async_fn_in_trait` lint）。显式写出后，返回值可直接用于 `tokio::spawn`。
 - 命令模块由 `Arc<Mcu>` 构造，多个模块可共用一个 MCU。
-- trait 也是一道测试缝：`cmd/clock.rs` 的测试里就有一个不依赖 MCU 的 `FixedClock` 实现（该文件目前不参与编译，见下）。
+- trait 也是一道测试缝：`cmd/clock.rs` 的测试里就有一个不依赖 MCU 的 `FixedClock` 实现。
 
 上面这段 `ClockSync` 是**已编译**的：`cmd/clock.rs` 通过 `pub mod clock;` 进入编译，`ClockSync` / `McuClock` 把时钟同步与 `Mcu` 解耦，测试里有一个不依赖 MCU 的 `FixedClock` 替身。除此之外**任何**命令都应走上表的模式。
 
@@ -200,7 +200,8 @@ identify 是唯一的例外：它不在这一层，格式由主机自有、且�
 | 并发同名响应 | `PendingCalls` 只按响应名匹配，先到先得；两个并发 `get_clock` 会互相抢答，需要 `oid` 之类的区分参数 |
 | 枚举参与编解码 | `ArgType` 没有枚举变体，枚举只在 `Params::get_enum` 与 `Dictionary` 里手工解析 |
 | 命名参数 | `Param` 类型已定义但未接入 `Parser::encode` |
-| 固件重启 | `McuConfig.restart_method` 已解析并保留在配置里，但**尚无重启路径**读取它（`Mcu::new` 明确忽略）。这是计划中的功能，实现时按该字段分派，不要当死代码删掉 |
+
+固件重启本身**已实现**：`McuConfig.restart_method` 由 `mcu/restart.rs` 读取并分派四种物理复位（`command` / `arduino` / `cheetah` / `rpi_usb`），配置握手在停机或 CRC 不一致时优先真重启（见 [MCU 配置构建](mcu-config.md)）。
 
 ---
 

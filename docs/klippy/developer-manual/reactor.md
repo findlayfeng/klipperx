@@ -1,6 +1,6 @@
 # 时钟与定时器（reactor）
 
-`reactor` 是机器的时间来源与定时器表：模块问它"现在几点"（`monotonic`），或让它"过一会儿叫我"（`register_timer`）。它在 `Printer` 上（`Printer::reactor()`，对应上游的 `get_reactor()`，全树 121 处调用），是每个 `get_status(eventtime)` 的 `eventtime` 与每次延迟动作的共同来源。
+`reactor` 是机器的时间来源与定时器表：模块问它"现在几点"（`monotonic`），或让它"过一会儿叫我"（`register_timer`）。它在 `Printer` 上（`Printer::reactor()`，对应上游的 `get_reactor()`，全树 119 处调用），是每个 `get_status(eventtime)` 的 `eventtime` 与每次延迟动作的共同来源。
 
 本文说明它为什么长这样，以及与上游 `klippy/reactor.py` 的对应关系。上游参考实现：`klippy/reactor.py`（447 行）与 `klippy/chelper/pollreactor.c`。
 

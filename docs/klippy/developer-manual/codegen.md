@@ -52,19 +52,25 @@ event!("klippy:analyze_shutdown", { msg: String, details: HashMap<String, Value>
 
 ### 段落
 
-`section!("id", order = N, load = ..., prefix = ...)`，写在拥有该段落的模块顶层
+`section!("id", order = N, load = ..., prefix = ..., object = ..., phase = ...)`，写在拥有该段落的模块顶层
 （可以跨行：`rustfmt` 会按需拆行，扫描按括号配对读取）：
 
 ```rust
 // mcu/mod.rs
-section!("mcu", order = 10, load = load_config, prefix = load_config_prefix);
+section!("mcu", order = 10, phase = early, load = load_config, prefix = load_config_prefix);
 
 // extras/output_pin.rs
 section!("output_pin", order = 20, prefix = load_config_prefix);
+
+// extras/toolhead.rs
+section!("printer", order = 60, phase = late, object = "toolhead", load = load_config);
 ```
 
 - `load` 对应 `[id]`，`prefix` 对应 `[id <name>]`，至少写一个；
 - `order` 必填，决定同一半（main / prefix）内的装载顺序（`load.rs` 的两次遍历按表序进行）；
+- `phase = early | generic | late`（默认 `generic`）：`early` 排在普通节之前（上游先 `pins`/`mcu`），
+  `late` 排在之后（上游最后才 load `toolhead`）；
+- `object = "<name>"`：装载出的对象以别的名字注册（`[printer]` 注册成 `toolhead`）；
 - 声明处需要 `use crate::core::klippy::load::section;` 引入宏。
 
 ### 端点
@@ -104,6 +110,7 @@ pub(crate) fn install(api: &mut Api, wiring: &ApiWiring<'_>) -> Result<(), Regis
 | 事件名 / 段落 id / 端点安装函数重复 | duplicate |
 | 段落缺 `order`，或 `load`/`prefix` 都没有 | 缺项 |
 | 段落有未知选项、`order` 不是整数 | 格式错误 |
+| `phase` 不是 `early`/`generic`/`late`，或 `object` 不是带引号的名字 | 格式错误 |
 | 事件声明跨行、载荷不是 `{ field: Type }` | 格式错误 |
 
 ## 新增一个条目

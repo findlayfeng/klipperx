@@ -460,7 +460,7 @@ impl Printer {
     /// The reactor this printer was built with.
     ///
     /// Upstream's `get_reactor`: objects ask the printer for it to schedule a
-    /// timer (121 call sites there), and it is the same clock
+    /// timer (119 call sites there), and it is the same clock
     /// [`Printer::eventtime`] reports.
     pub fn reactor(&self) -> Arc<dyn Reactor> {
         Arc::clone(&self.reactor)

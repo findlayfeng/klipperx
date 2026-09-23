@@ -452,7 +452,7 @@ FW5a–f / FW6a–f 已把「cartesian + 假 MCU 的 `G1`/`G28`」跑通并归�
       → **U2** `[stepper_x/y/z]` 移到 late 阶段 ✅（解 `probe:`/`tmc*_stepper_x:` 的共同根因）
       → **U3a** `[probe]` 段 + `probe` 虚拟 chip ✅（chip 首因 35 → 22）
       → **U3b** 会话采样 + `QUERY_PROBE`/`PROBE`/`PROBE_ACCURACY`
-      → **U4** `manual_probe.rs` 命令族 + `configfile.set()` 记账桩
+      → **U4** `manual_probe.rs` 命令族 + `configfile.set()` 记账 ✅（2026-09-23；含 PROBE_CALIBRATE 接线）
       → **U5** `bed_mesh.py`（**首批 2 绿**：`bed_mesh.test`、`z_virtual_endstop.test`，随后验证模拟器上
       的 `G28` via `probe:z_virtual_endstop`）
       → **M6** `z_tilt`/`quad_gantry_level`/`bed_tilt`（+2 绿）→ **M7** `STEPPER_BUZZ`（H10，+1）

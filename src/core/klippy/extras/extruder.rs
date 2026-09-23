@@ -15,8 +15,10 @@
 //!   (`extruder_stepper <name>`) so its `connect` builds the host `Stepper`,
 //!   which the toolhead then takes.
 //!
-//! The heater is the C1b stub (`heaters::setup_heater`): the options are read
-//! and the sensor is set up, but the control loop is H1.
+//! The heater runs through `heaters::setup_heater`: options and sensor are set
+//! up there and the bang-bang/PID control loop is in place. What is still open
+//! is the `M109` wait-for-temperature loop (`_wait` is accepted and ignored)
+//! and `pid_calibrate` / `verify_heater`.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 

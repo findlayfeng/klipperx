@@ -31,9 +31,12 @@
 //! | `position_min` / `position_max` | the axis range (required) |
 //! | `position_endstop` | where the endstop sits (stored for FW6 homing) |
 //!
-//! Homing itself is FW6/F8: `endstop_pin`, `homing_speed` and the rest arrive
-//! with `HomingState`. Until then an axis is homed only by
-//! `SET_KINEMATIC_POSITION`.
+//! Homing is wired: `endstop_pin` arms a firmware endstop through
+//! `trsync`/`stepper_stop_on_trigger`, the options below feed `HomingInfo`, and
+//! `G28` drives the move (see `extras/toolhead.rs`). What is still open is the
+//! **second pass** — `homing_retract_dist` / `second_homing_speed` are read
+//! into `HomingInfo` but the retract + re-approach is not driven yet — and
+//! `endstop_phase` refinement (H9).
 
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;

@@ -543,7 +543,7 @@ impl Drop for McuObject {
         }
         // Break the `Mcu → events → resource → Mcu` strong cycle before the chip
         // (and with it the last `Mcu`) is dropped; otherwise `Mcu::Drop` never
-        // runs and its blocking device read parks runtime shutdown (TODO F8b).
+        // runs and its blocking device read parks runtime shutdown (the F8b fix).
         if let Some(mcu) = self.chip.mcu() {
             mcu.clear_events();
         }

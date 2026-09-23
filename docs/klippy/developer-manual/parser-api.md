@@ -54,7 +54,7 @@ parser.register(15, "shutdown clock=%u static_string_id=%hu")?; // 混合类型
 
 > `Parser` 是**纯编解码器**：它不再保存入站回调（`Msg` 已无 `callback` 字段）。回调按 id
 > 存在 `mcu` 层的 `McuEvents` 里（见 [MCU 协议与数据字典](mcu-protocol.md)），这样编解码表
-> 可以被发/收两侧共享，而不会把回调捕获的资源拖成 `Mcu` 的强引用环（TODO F8b）。
+> 可以被发/收两侧共享，而不会把回调捕获的资源拖成 `Mcu` 的强引用环（F8b 的动机，该重构已落地）。
 
 ## 编码（出站）
 
@@ -110,7 +110,7 @@ pub(crate) fn callback(&self, id: i16) -> Option<MsgCallback>;
 
 `McuObject` 在本身被丢弃（机器拆机）时调用 `Mcu::clear_events()` 清空该表：回调可能
 持有会反向引用 `Mcu` 的资源（传输句柄），不清理就形成强引用环，`Mcu::Drop` 不跑、其
-阻塞读驻留，runtime 关停会卡住（TODO F8b）。
+阻塞读驻留，runtime 关停会卡住（F8b：`clear_events` 与 `Weak` 持有已落地；`Mcu::Drop` 确实会跑由 `test_drop_aborts_receive_task_with_open_interface` 守着）。
 
 ## 错误类型
 

@@ -45,9 +45,10 @@ klipperx stress [OPTIONS] <CONFIG_FILE> [MCU]
    未执行时**拒绝** `reset_step_clock`：`shutdown("Can't reset time when stepper active")`
    （`src/stepper.c:311`）——如果不先等，这个错误会被误当成速率上限。
 
-发送时一段的命令分批发（每批 `SEND_BATCH` 条，之间 `flush`）：主机出站通道只有 32 格
-（`mcu/mod.rs`），一段 50 条命令直接灌会报 `no available capacity`。分批只给发送节奏，不影响固件
-看到的步进时刻。
+发送时一段的命令分批发（每批 `SEND_BATCH` 条，之间 `flush`）：主机出站通道容量是
+`SEND_QUEUE_CAPACITY`（`mcu/mod.rs`，512 格；同步 `send` 用 `try_send` 不等待容量，
+溢出会报 `no available capacity`；能等待的路径走 `send_payload`）。分批仍保留，只给发送节奏，
+不影响固件看到的步进时刻。
 
 ### 步进任务的出错形态
 

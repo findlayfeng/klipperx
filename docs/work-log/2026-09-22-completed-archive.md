@@ -1,8 +1,33 @@
-# 已完成条目归档（截至 2026-09-22）
+# 已完成条目归档（截至 2026-09-23）
 
 本文件是 `TODO.md` 原有「已完成（留档）」一节的全文，为了把 TODO 收窄到**只剩未决项**而
 单独归档。它不是规范，也不必随实现更新：细节在各模块自己的文档与
 `docs/klippy/developer-manual/`，这里每条只留一行索引，最近完成的在前。
+
+- **2026-09-23 完成情况审计移入（逐条对源码复核，证据见括注）**：
+  - **D1 剩余接线与 `M115` 版本号**（原 D1/G1b 条目）：`StartArgs` 结构体已带
+        `apiserver`/`start_reason`/`debug_input`/`debug_output`/`device`/`linux_version`，
+        宿主填 apiserver 并 `set_start_args` 注入（`src/klippy.rs:323-324`）；`M115` 改读
+        `printer.software_version()`（`gcode.rs:747-767`，单测
+        `test_m115_reports_the_host_software_version`）。剩余（CLI `debuginput`/
+        `debugoutput` 解析、每 MCU 字典路径）留在正文 D1。
+  - **G1b 行为差异三项**：`request_restart` 停机前动作（`get_last_move_time` +
+        `gcode:request_restart` 事件 + `dwell(0.500)` + `wait_moves()`，`gcode.rs:1186-1193`，
+        同上游 `gcode.py:352-365`）；`Coord`（`mathutil.rs:36`）；参数访问器（FW4 已记，
+        正文索引同步去重）。
+  - **H1 大部**：`heaters` 控制环 bang-bang/PID 与 `SET_HEATER_TEMPERATURE`
+        （`heaters.rs`，含单测；`:499-516`）；`heater_bed`/`heater_generic` 住户与
+        `M140`/`M190`（`heater_bed.rs:24` `:52`；M190/M109 等待循环仍缺）；温度传感器族
+        6 件（`temperature_sensor`/`thermistor`/`adc_temperature`/`spi_temperature`/
+        `temperature_combined`/`temperature_mcu`，与 T7 重合）。
+  - **H2/H10/H11/H12 零散**：`static_digital_output`（T9 阶段 0，正文已去重）；
+        `stepper_enable`（T2）；`motion_queuing`（`motion/queuing.rs` 对照上游
+        `motion_queuing.py:63-67`）；`error_mcu`（FW3/FW7，`extras/error_mcu.rs`）；
+        前缀式 `lookup_objects`/`statuses`/`status_of`（FW2，`printer.rs:622` `:654` `:676`）。
+  - **事件触发点落地**（正文事件清单同步改「实现依赖」列）：`homing:*` 四个
+        （`extras/toolhead.rs:910` `:923` `:974` `:1008`）、`toolhead:set_position`
+        （`:1091`）、`gcode:request_restart`（`gcode.rs:1191`）、`stepper_enable:motor_off`
+        （`stepper_enable.rs:338`）。
 
 - **上游 `.test` 语料框架与 T1（首个用例转绿）**：`src/core/klippy/upstream.rs` 的 harness 与
       runner（按 `CONFIG` 拆运行、字典齐备才启用、`IGNORED` 留档必然失败的用例）；

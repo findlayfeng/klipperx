@@ -32,8 +32,8 @@
 
 依赖列的是**工具性前置**，不是自然顺序。下表是索引，逐条细节在后面的小节里；
 框架队列（FW1–FW9）已完成，索引见文末「已完成（留档）」；本表不再区分级别。
-H1–H12 是上游 extras 里**未实现**的消费者，按域归并（2026-09-21 全量盘点的结果；
-覆盖审计已完结清理）。
+H1–H12 是上游 extras 里按域归并的消费者（2026-09-21 全量盘点的结果；其中若干已落地，
+逐条见各节；覆盖审计已完结清理）。
 
 **核心与架构**
 
@@ -41,7 +41,7 @@ H1–H12 是上游 extras 里**未实现**的消费者，按域归并（2026-09-
 |---|---|---|
 | C1 | 运动层收尾：轴/stepper 抽象 + 多轴（C1a）、extruder 运动（C1b）、运动学族（C1c）、`gcode_move`/print-time 回调（C1d）；详见下方 C1 小节与 [C1 调查](docs/work-log/2026-09-22-c1-notes.md) | — |
 | C2 | 配置装载：框架部分 ✅（FW1，含 choice/range 文案与 `deprecate` 警告）；autosave/`SAVE_CONFIG` 仍待（属模块） | — |
-| D1 | 主机层 start args / rollover / `--logfile` ✅（FW8）；`StartArgs` 剩余字段与 `M115` 接线仍待 | — |
+| D1 | 主机层 start args / rollover / `--logfile` ✅（FW8）；剩余：`debuginput`/`debugoutput` 的命令行接线与每 MCU 字典路径 | — |
 
 **MCU 资源与总线**
 
@@ -49,16 +49,16 @@ H1–H12 是上游 extras 里**未实现**的消费者，按域归并（2026-09-
 |---|---|---|
 | F6 | SPI 总线剩余：`spi_transfer_with_preface` / `setup_shutdown_msg` | F1、F2 |
 | F8 | endstop / trsync ✅（FW6）；测试侧「响应器式多实例假 MCU」待办（可用 `SimulatorDevice`） | F1、F2、C1 |
-| F9 | 固件资源剩余：buttons / pulse_counter / trigger_analog / initial_pins / sdcard / sensor_bulk / lcd / neopixel / thermocouple / tmcuart 等 | F1–F7 |
+| F9 | 固件资源剩余：buttons / pulse_counter / trigger_analog / initial_pins / sdcard / sensor_bulk / lcd / neopixel / tmcuart 等（thermocouple 已接：`cmd/thermocouple.rs` + `spi_temperature`） | F1–F7 |
 
 **G-Code 与端点**
 
 | # | 事项 | 依赖 |
 |---|---|---|
-| G1b | gcode 调度器与上游的行为差异（参数访问器、事件触发…；`GCodeIO` 暂缓 `[~]`） | C1 |
+| G1b | gcode 调度器与上游的行为差异（`get_mutex` 等价物等；`GCodeIO` 暂缓 `[~]`；参数访问器与 `M115`/`Coord`/`request_restart` 已完成并归档） | C1 |
 | G2b | 用 GCODE 控制 GPIO：`SET_PIN` 时序（数字与 PWM 均已可驱动） | C1 |
 | G4 | 运动命令（G0/G1/G28…） | G1、C1 |
-| B4 | 其余端点（estop / remote method / pause_resume / `*/dump_*` / …） | G3、H4、H9 |
+| B4 | 其余端点（pause_resume / `*/dump_*` / …；estop 与 remote method 已落地） | G3、H4、H9 |
 
 **上游 extras 消费者**（详见「上游 extras 覆盖盘点」）
 
@@ -73,8 +73,8 @@ H1–H12 是上游 extras 里**未实现**的消费者，按域归并（2026-09-
 | H7 | 输入与外设（buttons / gcode_button / pulse_counter / trigger_analog / 断料与线宽传感器 / GPIO 扩展 / DAC） | F3、F5、F9 |
 | H8 | LCD 显示与菜单（display/*） | F9、G1b |
 | H9 | 探测 / 调平 / 校准（probe / bltouch / bed_mesh / z_tilt / quad_gantry_level / bed_screws / …） | C1、F8 |
-| H10 | 运动相关 extras（gcode_move / gcode_arcs / force_move / manual_stepper / stepper_enable / idle_timeout / motion_report / …） | C1 |
-| H11 | 主机运行时与调试（statistics / error_mcu / canbus_ids / canbus_stats） | — |
+| H10 | 运动相关 extras（gcode_arcs / force_move 剩余 / manual_stepper / idle_timeout / motion_report / …；gcode_move、stepper_enable、motion_queuing 已落地） | C1 |
+| H11 | 主机运行时与调试（statistics / canbus_ids / canbus_stats；error_mcu 已落地） | — |
 | H12 | 核心工具补齐（mathutil / util 反射 / clocksync / pins 消费侧） | C1 |
 
 **工具与文档**
@@ -102,9 +102,8 @@ H1–H12 是上游 extras 里**未实现**的消费者，按域归并（2026-09-
       lookahead、在 print time 生效，并对移动中的 pin 变化与 MCU 最小调度间隔做对齐；
       我们没有 toolhead / print time，只能立即改值（`output_pin.rs` 头注释）。随 **C1**；
       对一个独立 GPIO 不紧急，但打印中改 pin 不会与 move 同步。
-- [ ] **`output_pin` 的其余上游选项**：`scale`（PWM 用，`output_pin.py:207-214`）、
-      `TEMPLATE` + `template_evaluator`（display 模板，`output_pin.py:88-170`）——与开关
-      GPIO 本身无关，按需再补。
+- [ ] **`output_pin` 的 `TEMPLATE` + `template_evaluator`**（display 模板，
+      `output_pin.py:88-170`）——与开关 GPIO 本身无关，按需再补（`scale` 已随 T8 落地并归档）。
 
 ### S1 压力测试工具（`klipperx stress`）剩余
 
@@ -159,17 +158,10 @@ toolhead / 开放事件）一起补，一部分是现在就独立可补的小行
       轮询 `all(send_event('gcode:debuginput_exit'))`（`:432-435`），依赖 handler 的返回值；
       本仓库 `Printer::send_event` 丢弃返回值（上游 `klippy/klippy.py:226-227` 是
       `return [cb(...)]`）。要与 `GCodeIO` 一起做（见上一条）。
-- [ ] **`request_restart` 的停机前动作**：上游在 ready 时先 `toolhead.dwell(0.500)` +
-      `wait_moves()` 再 `request_exit`（`:352-365`），随 **C1**；当前直接 `request_exit`
-      （`gcode.rs:515-545`）。
-- [ ] **`Coord`**（`:12-17`）：随 toolhead / kinematics（C1）。
-
 **可独立补的小行为差异**
 
-- [ ] **`M115` 版本号来源**：上游取 `start_args['software_version']`（`:344-350`），Rust 用
-      `CARGO_PKG_VERSION`。当前 `StartArgs::collect` 的 `software_version` 本身就填
-      `CARGO_PKG_VERSION`，且宿主没把它接到 `GcodeDispatch`（`Printer` 不持有 `StartArgs`），
-      所以行为差异要等 **D1** 的 start args wiring 才有意义，一并做。
+（`request_restart` 的停机前动作、`Coord`、`M115` 版本号来源三项已完成并归档，
+分别见 `gcode.rs:1186-1193`、`mathutil.rs:36`、`gcode.rs:747-767`。）
 - [ ] **`get_mutex` 等价物**（原先未列）：上游 `gcode.get_mutex()`（`:242-243`）被
       `bed_mesh`（`:307`）与 `idle_timeout`（`:70` `:90`）用来判断「是否有脚本在跑」；
       本主机无 reactor mutex，是否需要等价物（脚本占用标志）等 C1 与那两个模块落地再定。
@@ -287,7 +279,8 @@ FW5a–f / FW6a–f 已把「cartesian + 假 MCU 的 `G1`/`G28`」跑通并归�
       solver，注册 `M104`/`M109`/`ACTIVATE_EXTRUDER`/`SET_PRESSURE_ADVANCE`；toolhead 在 connect
       时把每个 extruder 挂成 extra axis 并分配 trapq。验收：`an_extruder_move_runs_against_the_fake_firmware`
       （`G1 E…` 同时驱动运动轴与挤出机）。回归里 `Section 'extruder'…` 消失，首次失败前移到
-      `heater_bed`（H1）/`extruder_stepper`（H10）。**T3 还差 H1 的 `heater_bed`/`fan`。**
+      `pid_Kp` autosave（C2）/`heater_fan`（H2-3）/`extruder_stepper`（H10）（2026-09-23 实跑）；
+      `heater_bed`/`fan` 段均已落地。
 - [x] **C1c-1 corexy 族**：✅ 已完成。`CartesianTransform`（Standard/CoreXy/CoreXz/HybridCoreXy/
       HybridCoreXz）把「rail 位置 → 台面轴」抽成值；`itersolve` 加 `corexy_/corexz_ position_fn`
       （`x±y` / `x±z`，active flags `X|Y` / `X|Z`）；`ToolHeadObject` 的 `KinematicsKind` 分派 solver
@@ -301,25 +294,26 @@ FW5a–f / FW6a–f 已把「cartesian + 假 MCU 的 `G1`/`G28`」跑通并归�
       `motion_queuing.register_flush_callback`（`output_pin` 的 `GCodeRequestQueue` 与
       `fan`/`servo`/`pwm_cycle_time` 等着它）。`gcode_move` 的坐标系部分已由 **G4-1** 落地。
 
-> **T3 的边界**：`[extruder]` 段依赖 H1 的 `heaters::setup_heater`，因此 **T3 = C1b + H1**，
-> 不是 C1 单独可解。T5 按 C1c 的族顺序推进；T10 指向 C1a。
+> **T3 的边界**：`[extruder]`/`heater_bed`/`fan` 三段与 C1b 已落地，T3 现在卡在 C2 的
+> autosave（`pid_Kp` 49 次）、H1 的 `verify_heater`/`pid_calibrate`、H2-3 的 `heater_fan`、
+> H10 的 `extruder_stepper`（未进装载表）与 F9/H7 的 `pulse_counter`（fan `tachometer_pin`）。
+> T5 按 C1c 的族顺序推进。
 
 ### C2 配置装载收尾（框架 FW1）
 
 - [ ] **autosave / `SAVE_CONFIG`**：`#*#` 自动保存区块的读取（并入配置、与 include 冲突检查、
       损坏检测）与回写（`SAVE_CONFIG` 命令、备份、重启），属模块而非框架；`bed_tilt` / PID /
-      `probe_eddy_current` 等消费者都依赖它（上游 `klippy/configfile.py:248`、`:346`）。
-- [ ] **`getchoice` 与范围/列表上限**：wrapper 目前只做类型解析 + 两个自定义范围检查；
-      上游的 `minval/maxval/above/below/count` 统一文案随各 extras 的 option schema 补。
+      `probe_eddy_current` 等消费者都依赖它（上游 `klippy/configfile.py:248`、`:346`）；
+      当前回归首位失败就是它（`Option 'pid_Kp' …` 40 + `heater_bed` 9 = 49 次，2026-09-23 实跑）。
+      （`getchoice` 与 `minval/maxval/above/below/count` 文案已由框架补齐并归档，见 FW1/C2。）
 
 ### D1 主机层 start args / rollover / 日志（框架 FW8）
 
-- [ ] **`StartArgs` 仍只 info 需要的字段**：`apiserver`、`start_reason`、debug 输入输出、
-      每个 MCU 的字典路径还没进来（`api/start_args.rs`）；`start_reason` 已在 `Printer` 上，
-      不重复搬进 `StartArgs`。
-- [ ] **`StartArgs` 接到消费方**：`software_version` 目前只被 `info` 端点读；`M115` 要按上游
-      读它（`klippy/gcode.py:344-350`），需要把版本串接到 `GcodeDispatch`（随 G1b 的「`M115`
-      版本号来源」一并做）。
+- [ ] **`StartArgs` 的剩余接线**：结构体已带 `apiserver`（宿主启动时填，`src/klippy.rs:323`）、
+      `start_reason`、`debug_input`/`debug_output`、`device`、`linux_version`；缺的是
+      `--debuginput`/`--debugoutput` 的命令行解析（`StartArgs::collect` 里仍是 `None`）与
+      每个 MCU 的字典路径。`software_version` 已由宿主 `set_start_args` 注入
+      （`src/klippy.rs:324`）并被 `info` 与 `M115` 读取——接线已完成并归档。
 
 
 
@@ -357,8 +351,8 @@ FW5a–f / FW6a–f 已把「cartesian + 假 MCU 的 `G1`/`G28`」跑通并归�
 `docs/klippy/developer-manual/regression-tests.md`）。
 
 **推进口径**：下文的「首次失败原因」分组只用于定位，不是工作队列——`load_config` 遇到第一个
-未知 section 就停，修好一个缺口只会让运行前进到下一个缺口，总数可能不变（T7 后的 236 就是
-例子），各组收益不可加。进度以**转绿运行数 / `IGNORED` 条目数**衡量（当前 3 / 34）。**验收标准
+未知 section 就停，修好一个缺口只会让运行前进到下一个缺口，总数可能不变（T7 前后失败总数
+几乎不变就是例子），各组收益不可加。进度以**转绿运行数 / `IGNORED` 条目数**衡量（当前 3 / 34）。**验收标准
 是「对应 `.test` 从 `IGNORED` 移除后通过」**，不是「某个错误不再出现」。详见
 [失败原因分析复盘](docs/work-log/2026-09-22-upstream-regression-failures.md#复盘计数口径与重排后补)。
 
@@ -366,7 +360,7 @@ FW5a–f / FW6a–f 已把「cartesian + 假 MCU 的 `G1`/`G28`」跑通并归�
 
 - [x] **运行 × 缺口扫描**：`upstream_gap_report`（`upstream.rs`）静态扫描每条运行引用的全部
       section 与 `kinematics:`，打印缺口矩阵。实跑显示真正的公共前缀是 `extruder`（**231** 条
-      运行引用它，而非「首次失败」的 102），印证了按工作队列排期的误导性。用
+      运行引用它，而非「首次失败」的 102；2026-09-21 时点），印证了按工作队列排期的误导性。用
       `cargo test -p klipperx --lib upstream_gap_report -- --nocapture` 查看。
 - [x] **`IGNORED` 守卫测试**：`ignored_cases_still_fail`——某个 `IGNORED` 文件的全部可跑运行都
       通过时报失败并提示移除；`KLIPPERX_UPSTREAM_ALL=1` 时不生效（那时本就是要跑全部）。
@@ -394,66 +388,85 @@ FW5a–f / FW6a–f 已把「cartesian + 假 MCU 的 `G1`/`G28`」跑通并归�
       `temperature_combined`；`debug_read` 系列改用异步 pre-build 钩子并在虚拟 MCU 上验证。
       回归里不再有 `Unknown temperature sensor`。
 
-**当前失败原因统计**（`KLIPPERX_UPSTREAM_ALL=1` 实跑，共 236 次失败）：
+**当前失败原因统计**（`KLIPPERX_UPSTREAM_ALL=1` 实跑，2026-09-23：**186 次失败**、51 次通过、
+2 条因未构建 `pru` 字典不计，合计 239）：
 
 | 首次失败原因 | 次数 | 对应 TODO |
 |---|---|---|
-| `Section 'extruder' is not a valid config section` | 102 | T3 (`extruder` + `heater_bed` + `fan`) |
-| `Unknown pin chip name 'probe'` | 36 | T4 (`probe` / `bltouch` / endstop chip) |
-| `Error loading kinematics 'delta'` | 13 | T5 (运动学) |
-| `Error loading kinematics 'corexy'` | 11 | T5 (运动学) |
-| `Section 'tmc2209 stepper_x' is not a valid config section` | 13 | T6 (TMC pin chip) |
-| `Error loading kinematics 'generic_cartesian'` | 4 | T5 (运动学) |
-| `Unknown pin chip name 'tmc2209_stepper_x'` | 6 | T6 (TMC pin chip) |
-| `Section 'stepper_z1' is not a valid config section` | 5 | T10 (多轴 stepper) |
-| `Option 'value' in section 'output_pin stepper_xy_current'` | 5 | H2 (`output_pin` 的 `value` 选项) |
-| `Error loading kinematics 'rotary_delta'` | 2 | T5 (运动学) |
-| `Error loading kinematics 'hybrid_corexy'` | 2 | T5 (运动学) |
-| 温度传感器（`temperature_mcu`/`TDK`/`EPCOS`/`MAX31855`/`temperature_combined`） | **0** | T7（已完成） |
-| `Error loading kinematics 'corexz'` / `hybrid_corexz` / `polar` / `winch` / `deltesian` | 各 1 | T5 (运动学) |
-| 其余单实例失败 | 各 1 | 见下方 T6–T10 |
+| `Option 'pid_Kp' … 'extruder'` + `'heater_bed'`（autosave） | 40 + 9 = 49 | C2（autosave）、H1 |
+| `Unknown pin chip name 'probe'` | 25 | T4 / H9（probe pin chip） |
+| `Error loading kinematics`（`delta` 9、`generic_cartesian` 4、`rotary_delta` 2、`polar`/`winch`/`deltesian` 各 1） | 18 | T5（C1c-2/3/4） |
+| TMC section/pin chip（`tmc2209 stepper_x` 11、`tmc2130` 2、`tmc2208` 1、`tmc2660` 1、pin chip 2） | 17 | T6 / H5 |
+| `Section 'display'` | 16 | T9 / H8 |
+| `Section 'heater_fan …'` | 14 | H2-3 |
+| `Section 'filament_switch_sensor …'` | 6 | H7 |
+| `sensor_pin: Unknown pin chip name 'vref_scaled'`（`adc_scaled`） | 4 | H1 |
+| H9 其余（`quad_gantry_level` 2、`bed_screws` 2、`z_tilt`/`bed_mesh`/`probe`/`endstop_phase` 各 1） | 8 | H9 |
+| 板级扩展 section（`mcp4451` 2、`ad5206`/`multi_pin`/`sx1509`/`replicape` 各 1） | 6 | H2 / H7 |
+| `Option 'tachometer_pin' … needs the pulse_counter module` | 2 | F9 / H7 |
+| `Section 'extruder_stepper …'` | 2 | H10 |
+| `Section 'verify_heater …'` | 2 | H1 |
+| `Unknown temperature sensor`（`G2`、`Kingroon_B3950` 型号） | 2 | H1（热敏电阻型号） |
+| `not ready: mcu: Pin 'PF7'/'PF1'` | 2 | F2（其余 MCU 引脚映射） |
+| 单实例（`dual_carriage` 2；`gcode_macro`/`virtual_sdcard`/`exclude_object`/`gcode_arcs`/`manual_stepper`/`pwm_cycle_time`/`led`/`input_shaper`/`temperature_fan`/`fan_generic` 各 1） | 12 | H3 / H4 / H9 / H10 |
+| 运行期失败（`Move out of range`：`generic-simulavr`） | 1 | 运行期（非装载） |
+| `Section 'extruder'`（T3 旧首位） | **0** | T3 已消 |
+| 温度传感器（`temperature_*`） | **0** | T7（已完成） |
 
 **T3 之后按首次失败分组的工单**：
 
-- [ ] **T3. `extruder` + `heater_bed` + `fan`**（102 次失败）：`commands` /
-      `out_of_bounds` / `temperature` / `printers` 族的主要失败原因。依赖 H1（heaters）。
-- [ ] **T4. `probe` / `bltouch` / endstop pin chip**（36 次失败）：`bed_mesh`、`bltouch`、`eddy`、
-      `screws_tilt_adjust`、`smart_effector`、`z_virtual_endstop` 等。依赖 F8（endstop）。
-- [ ] **T5. 运动学**（37 次失败）：`generic_cartesian`（4）、`delta`（13）、`corexy`（11）、
-      `rotary_delta`（2）、`hybrid_corexy`（2）、`corexz`、`hybrid_corexz`、`polar`、
-      `winch`、`deltesian`（各 1）。`none` 已在 T1。
-- [ ] **T6. TMC pin chip**（30 次失败）：`tmc2209_stepper_x`（6）、`tmc2130_stepper_x`（3）、
-      `tmc2209 stepper_x`（13）、`tmc2208 stepper_x`（3）、`tmc5160 stepper_x`（2）、
-      `tmc2130 stepper_x`（2）、`tmc2660 stepper_x`（1）。依赖 H5（TMC）。
+- [ ] **T3. `extruder` + `heater_bed` + `fan`**：三段均已落地，`Section 'extruder'` 已 **0 次**
+      （2026-09-23 实跑）；转绿还卡在 C2 autosave（`pid_Kp` 49）、H2-3 `heater_fan`（14）、
+      H10 `extruder_stepper`（2）、H1 `verify_heater`（2）与 F9/H7 `pulse_counter`（2）。
+- [ ] **T4. `probe` / `bltouch` / endstop pin chip**（25 次失败，2026-09-23 实跑）：`bed_mesh`、
+      `bltouch`、`eddy`、`screws_tilt_adjust`、`smart_effector`、`z_virtual_endstop` 等。
+      依赖 F8（endstop）与 H9（probe 模块）。
+- [ ] **T5. 运动学**（18 次失败，2026-09-23 实跑）：`delta`（9）、`generic_cartesian`（4）、
+      `rotary_delta`（2）、`polar` / `winch` / `deltesian`（各 1）。corexy 族已随 **C1c-1** 消失，
+      `none` 已在 T1。
+- [ ] **T6. TMC pin chip**（17 次失败，2026-09-23 实跑）：`Section 'tmc2209 stepper_x'`（11）、
+      `tmc2130`（2）、`tmc2208`（1）、`tmc2660`（1），pin chip `tmc2209_stepper_x` /
+      `tmc2130_stepper_x`（各 1）。依赖 H5（TMC）。
 - [x] **T7. 温度传感器**（0 次失败）：✅ 已完成（见上）。
 - [x] **T8. `output_pin` 的 `value` 选项**（6 次失败）：✅ 已完成（阶段 0）。`value` 上界改为
       `scale`（PWM 才有 `scale`，默认 1），`scale` 不识别的问题随之消失。
-- [ ] **T9. 其余 extras 段**（20 次）：`bed_screws`、`dual_carriage`、`safe_z_home`、
-      `endstop_phase`、`adc_scaled`、`pwm_cycle_time`（随 C1d）、`led`、`manual_stepper`、
-      `display`、`replicape`、`gcode_arcs`、`virtual_sdcard`。
-      按域归入 H1–H10。`static_digital_output` 已在阶段 0 落地，`stepper_z1`（多轴）已由
+- [ ] **T9. 其余 extras 段**（2026-09-23 实跑的散项，按域归入 H1–H10）：`display`（16，H8）、
+      `filament_switch_sensor`（6，H7）、`adc_scaled`/`vref_scaled`（4，H1）、板级扩展
+      （`mcp4451` 2 + `ad5206`/`multi_pin`/`sx1509`/`replicape` 各 1，H2/H7）、`bed_screws`/
+      `dual_carriage`（各 2，H9/H10）、`pwm_cycle_time`（随 C1d），以及 `led`/`manual_stepper`/
+      `gcode_arcs`/`virtual_sdcard`/`exclude_object`/`gcode_macro`/`input_shaper`/`temperature_fan`/
+      `fan_generic`（各 1）。`static_digital_output` 已在阶段 0 落地，`stepper_z1`（多轴）已由
       **C1a** 打开（相关运行的首次失败前移到 `z_tilt`/`quad_gantry_level`，属 H9）。
 - 备注：`printers.test` 有 2 条运行声明 `DICTIONARY pru.dict host=linuxprocess.dict`，默认不构建
       `pru`；要跑需 `KLIPPERX_ARCHES=…,pru`（需 `pru-gcc`）。
 
 ## 上游 extras 覆盖盘点
 
-上游 133 个 extras（不含 `__init__.py`）里，本仓库目前只有 `board_pins` ✅、
-`output_pin` ◐、`bus`（SPI/I2C 框架）✅；其余按域归并成 H1–H12。逐模块的完整对照表
+上游 133 个 extras（顶层 `*.py` 不含 `__init__.py`、不含 `display/` 子目录；2026-09-23 实数复核
+✓）里，本仓库已落地的有：`board_pins` ✅、`output_pin` ◐、`bus`（SPI/I2C 框架）✅、`fan`、
+`gcode_move`、`stepper_enable`、`query_endstops`、`error_mcu`、`static_digital_output`、`ds18b20`、
+温度传感器族（`temperature_sensor` / `thermistor` / `adc_temperature` / `spi_temperature` /
+`temperature_combined` / `temperature_mcu`），以及 `heaters` / `heater_bed` / `heater_generic`
+（控制环与住户已落地，等待 / 校准面仍缺，见 H1）；其余按域归并成 H1–H12。逐模块的完整对照表
 （含固件命令模块、端点、判为不适用者）随覆盖审计收口清理；落点就是下文 H1–H12
 与 F/G/B 各节。
 
 ### H1 加热与温度
 
-- [ ] `heaters.py` **剩余**：Heater 控制环（bang-bang/PID）、`verify_heater` 调度、`get_heater`
-      （传感器注册表已在 T1 落地）。
-- [ ] `heater_bed.py` / `heater_generic.py`：section 住户、`M140`/`M190` /
-      `SET_HEATER_TEMPERATURE`。
-- [ ] `pid_calibrate.py`（`PID_CALIBRATE`）、`verify_heater.py`。
-- [ ] 传感器：`temperature_sensor.py` / `thermistor.py` / `adc_temperature.py` /
-      `adc_scaled.py` / `spi_temperature.py`（MAX31855/56/65）/ `temperature_combined.py` /
-      `temperature_host.py` / `temperature_mcu.py` / `temperature_probe.py` /
-      `temperature_fan.py`。
+- [x] **Heater 控制环**（bang-bang/PID）✅ 已落地（`heaters.rs` 的 `ControlBangBang`/
+      `ControlPID` 与 `update`，含单测）；**剩余**：`get_heater`/`lookup_heater` 注册表与
+      `Heater::get_temp`（同时是 H2-3 的阻塞依赖）、`verify_heater` 周期检查
+      （`heaters.rs:152-153` 留位）。
+- [x] `heater_bed.py` / `heater_generic.py` ✅ 已落地：section 住户、`M140`/`M190`、
+      `SET_HEATER_TEMPERATURE`（`heater_bed.rs:24` `:52`、`heaters.rs:499-516`）；
+      **剩余**：M190/M109 的等待循环未接（`heater_bed.rs:8-10`、`extruder.rs:20`）。
+- [ ] `pid_calibrate.py`（`PID_CALIBRATE`）与 `verify_heater.py`：仍缺
+      （`extruder.rs:21` 明示 still open）。
+- [ ] 传感器**剩余**：`adc_scaled.py`（回归 `vref_scaled` 4 次）、`temperature_host.py` /
+      `temperature_probe.py` / `temperature_fan.py`，以及 `thermistor` 自定义型号
+      （`G2` / `Kingroon_B3950` 2 次）。已落地并归档：`temperature_sensor` / `thermistor` /
+      `adc_temperature` / `spi_temperature`（MAX6675/31855/31856/31865） /
+      `temperature_combined` / `temperature_mcu`（T7）。
 - 依赖 F4（PWM）、F5（ADC）、F6（SPI 温度）、C1（`temperature_fan` 随运动）。
 
 ### H2 风扇与通用输出
@@ -463,7 +476,8 @@ FW5a–f / FW6a–f 已把「cartesian + 假 MCU 的 `G1`/`G28`」跑通并归�
 
 - [x] **H2-1 `fan.py`**：✅ `[fan]` 段 + 共享的 `Fan` 核心 + `M106`/`M107` + `get_status`，
       `gcode:request_restart` 停风、`enable_pin` 只在 0↔非0 翻转、kick start 满速后回落。
-      回归：静态缺口 `fan` **197 → 0**，单缺口运行 55 → 38（转绿还差 `is_fileoutput`，见下）。
+      回归：静态缺口 `fan` **197 → 0**，单缺口运行 55 → 38（`is_fileoutput` 卡点已随下方
+      卡点 1 转绿）。
       拍板（notes §5）：调度先走 immediate（`output_pin` 先例，C1d 后与 `GCodeRequestQueue`
       一起切）；kick start 用 reactor 定时器 + 请求序号；`tachometer_pin` **明确报错**（依赖
       F7 `pulse_counter`，不静默 `rpm: null`）；`TEMPLATE` 不在这一层。
@@ -477,13 +491,13 @@ FW5a–f / FW6a–f 已把「cartesian + 假 MCU 的 `G1`/`G28`」跑通并归�
       `-o`，温度查询永远无人应答，所以 `can_extrude` 必须初值为真。`Extrude below minimum
       temp` **48 → 0**。
 - [x] **转绿卡点 2（`gcode_move`，G4/H10）**：✅ `Move out of range` **49 → 0**，回归失败运行
-      **235 → 187**（一次多转绿 48 次）。
+      **当时 235 → 187**（一次多转绿 48 次；2026-09-23 实跑现为 186）。
 - [ ] **转绿卡点 3（`pid_Kp` autosave，C2/H1）**：新的首位是
       `Option 'pid_Kp' in section 'extruder' must be specified`（40）+ `heater_bed`（9）＝49——
       上游的 `PID_CALIBRATE` 自动保存把这几项写回配置（`configfile` 的 `#*#` 区块），
       配置里没写就直接报错；本仓库还没读 autosave 区块（**C2 autosave/`SAVE_CONFIG`**）。
-- [ ] `pwm_tool.py`（队列化 PWM，随运动）、`pwm_cycle_time.py`、`static_digital_output.py`、
-      `static_pwm_clock.py`。
+- [ ] `pwm_tool.py`（队列化 PWM，随运动）、`pwm_cycle_time.py`、`static_pwm_clock.py`
+      （`static_digital_output.py` 已随 T9 阶段 0 落地并归档）。
 - [ ] `multi_pin.py`、`servo.py`、`duplicate_pin_override.py`。
 - [ ] `led.py`、`neopixel.py`、`dotstar.py`（固件 `neopixel.c`）。
 - [ ] I2C/SPI 数字电位器、DAC、LED 驱动：`ad5206.py`、`mcp4018.py`、`mcp4451.py`、
@@ -555,32 +569,39 @@ FW5a–f / FW6a–f 已把「cartesian + 假 MCU 的 `G1`/`G28`」跑通并归�
 - [ ] 螺丝：`bed_screws.py`、`screws_tilt_adjust.py`。
 - [ ] 校准：`delta_calibrate.py`、`axis_twist_compensation.py`、`skew_correction.py`、
       `z_thermal_adjust.py`、`tuning_tower.py`。
-- [ ] 回零周边：`homing_override.py`、`homing_heaters.py`；事件 `homing:*`、
-      `probe:update_results`。
+- [ ] 回零周边：`homing_override.py`、`homing_heaters.py`；事件 `probe:update_results` 未触发
+      （`homing:*` 四个已随 toolhead 落地产线触发，见事件清单）。
 - 依赖 C1、F8（endstop/trsync）、H3（宏）、H12（`mathutil`）。
 
 ### H10 运动相关 extras
 
 - [x] **`gcode_move.py`（G4-1）**：坐标系核心已落地，见 **G4** 小节；G4-2 外围待做。
-- [ ] `gcode_arcs.py`（G2/G3）、`force_move.py`、`manual_stepper.py`、
-      `stepper_enable.py`、`extruder_stepper.py`。
-- [ ] `idle_timeout.py`（`idle_timeout:*` 事件）、`motion_queuing.py`、
+- [ ] `gcode_arcs.py`（G2/G3）、`manual_stepper.py`；`force_move.py` **部分**（只有
+      `SET_KINEMATIC_POSITION`，`FORCE_MOVE`/`STEPPER_BUZZ` 未接）；`extruder_stepper.py`
+      仍缺（`[extruder_stepper <name>]` 未进装载表，回归 2 次）。
+      （`stepper_enable.py` ✅ 已随 T2 落地并归档。）
+- [ ] `idle_timeout.py`（`idle_timeout:*` 事件已声明未触发）、
       `motion_report.py`（`dump_trapq`/`dump_stepper` 端点，见 **B4**）。
+      （`motion_queuing.py` ✅ 已由 `motion/queuing.rs` 落地并归档。）
 - 依赖 C1（toolhead/kinematics）；`gcode_move` 同时是 **G4** 的前置。
 
 ### H11 主机运行时与调试
 
-- [ ] `statistics.py`：周期上报主机统计（CPU/内存）。
-- [ ] `error_mcu.py`：MCU 错误详情，供 shutdown 分析（见留档 FW7）。
-- [ ] `canbus_ids.py` / `canbus_stats.py`：CAN 节点分配与状态（接 `[mcu]` 的 canbus 选项）。
+- [ ] `statistics.py`：周期上报主机统计（CPU/内存；`event/stats.rs` 是 MCU 调度时序上报，不是它）。
+- （`error_mcu.py` ✅ 已落地并归档：`extras/error_mcu.rs`，消费 `klippy:notify_mcu_error` /
+  `klippy:analyze_shutdown`，由 `[mcu]` 工厂 ensure。）
+- [ ] `canbus_ids.py` / `canbus_stats.py`：CAN 节点分配与状态（接 `[mcu]` 的 canbus 选项；
+      当前 `[mcu]` 直接声明 id，见 `config/mcu.rs:265`）。
 - 判为不适用：`garbage_collection.py`、`aio_executor.py`、`parsedump.py`（Python 侧调优/
   离线工具，与本主机无关；完整清单见「待办」表后的不适用段）。
 
 ### H12 核心工具补齐
 
-- [ ] `util.py` 的反射与注册表 helper：`get_heater` / `get_sensor` / 前缀式
-      `lookup_objects`（**Q5**）。
-- [ ] `pins.py` 消费侧接口（`get_pin_type`、重命名等）——随 **H7** 等消费者。
+- [ ] `util.py` 的反射与注册表 helper **剩余**：`get_heater` / `get_sensor`
+      （前缀式 `lookup_objects`、`statuses`、`get_status -> serde_json::Value` 已随 FW2
+      落地并归档，见 `printer.rs:622` `:654` `:676`；**Q5** 已定为只读反射）。
+- [ ] `pins.py` 消费侧接口（`get_pin_type` 查询面）——重命名/别名与 `PinType` 已有
+      （`pins.rs:78` `:533`），查询入口随 **H7** 等消费者再补。
 
 ## 未决问题
 
@@ -596,8 +617,8 @@ FW5a–f / FW6a–f 已把「cartesian + 假 MCU 的 `G1`/`G28`」跑通并归�
 
 `KlippyEvent` 已声明全部 35 个名字，`Printer::register_event_handler` / `send_event` 按名
 注册与分发，处理器签名为 `Fn(&KlippyEvent)`。以下事件可按优先级逐个注册处理器；依赖
-关系标注在 `[依赖]` 中，`—` 表示仅依赖事件总线，其他依赖的模块已标记为其他 TODO 条目。
-生命周期事件已触发，其余事件的触发点随对应模块落地。
+关系标注在「实现依赖」列中，`—` 表示仅依赖事件总线，其他依赖的模块已标记为其他 TODO 条目。
+生命周期事件已触发，其余事件的触发点随对应模块落地（逐项状态 2026-09-23 复核，见各表）。
 
 ### 生命周期事件（最高优先级）
 
@@ -630,15 +651,18 @@ FW5a–f / FW6a–f 已把「cartesian + 假 MCU 的 `G1`/`G28`」跑通并归�
 
 | 事件名 | 触发时机 | 参数 | 上游位置 | 实现依赖 |
 |---|---|---|---|---|
-| `homing:home_rails_begin` | 回零开始 | `homing_state` | `klippy/extras/homing.py:80` | C1 |
-| `homing:home_rails_end` | 回零结束 | `homing_state` | `klippy/extras/homing.py:148` | C1 |
-| `homing:homing_move_begin` | 回零移动开始 | `homing_state` | `klippy/extras/homing.py:210` | C1 |
-| `homing:homing_move_end` | 回零移动结束 | `homing_state` | `klippy/extras/homing.py:234` | C1 |
+| `homing:home_rails_begin` | 回零开始 | `homing_state` | `klippy/extras/homing.py:80` | ✅ 已触发（`extras/toolhead.rs:910`） |
+| `homing:home_rails_end` | 回零结束 | `homing_state` | `klippy/extras/homing.py:148` | ✅ 已触发（`extras/toolhead.rs:923`，带 `axes` 载荷） |
+| `homing:homing_move_begin` | 回零移动开始 | `homing_state` | `klippy/extras/homing.py:210` | ✅ 已触发（`extras/toolhead.rs:974`） |
+| `homing:homing_move_end` | 回零移动结束 | `homing_state` | `klippy/extras/homing.py:234` | ✅ 已触发（`extras/toolhead.rs:1008`） |
 | `stepper:sync_mcu_position` | stepper 位置同步 | `stepper` | `klippy/stepper.py:56` | C1 |
 | `stepper:set_dir_inverted` | 方向反转设置 | `stepper` | `klippy/stepper.py:153` | C1 |
 | `dual_carriage:update_kinematics` | IDEx 双滑车运动学更新 | — | `klippy/kinematics/idex_modes.py:383` | C1 |
 
-> 全部依赖 C1（toolhead + kinematics + homing），回零协议未实现前这些事件无消费者。
+> `homing:*` 四个已随 toolhead 产线触发（`extras/toolhead.rs:910` `:923` `:974` `:1008`，
+> `G28` 路径）；`stepper:sync_mcu_position`、`stepper:set_dir_inverted`、
+> `dual_carriage:update_kinematics` 仍无触发点，分别随 stepper 位置同步、目录反转变更、
+> C1c 的 IDEX/双滑车落地。
 
 ### idle_timeout 事件
 
@@ -654,12 +678,13 @@ FW5a–f / FW6a–f 已把「cartesian + 假 MCU 的 `G1`/`G28`」跑通并归�
 
 | 事件名 | 触发时机 | 参数 | 上游位置 | 实现依赖 |
 |---|---|---|---|---|
-| `toolhead:manual_move` | 手动移动前 | `positions, speed` | `klippy/toolhead.py:390` | C1 |
-| `toolhead:set_position` | 设置位置（G92 等） | `positions, e` | `klippy/toolhead.py:416` | C1 |
-| `toolhead:sync_print_time` | print_time 更新 | `print_time` | `klippy/toolhead.py:446` | C1 |
-| `toolhead:update_extra_axes` | 额外轴位置更新 | `positions` | `klippy/toolhead.py:455` | C1 |
+| `toolhead:manual_move` | 手动移动前 | `positions, speed` | `klippy/toolhead.py:390` | 尚无触发点（handler 已备，G4-2） |
+| `toolhead:set_position` | 设置位置（G92 等） | `positions, e` | `klippy/toolhead.py:416` | ✅ 已触发（`extras/toolhead.rs:1091`，`SET_KINEMATIC_POSITION`） |
+| `toolhead:sync_print_time` | print_time 更新 | `print_time` | `klippy/toolhead.py:446` | 尚无触发点（随 C1d） |
+| `toolhead:update_extra_axes` | 额外轴位置更新 | `positions` | `klippy/toolhead.py:455` | 尚无触发点（handler 已备，G4-2） |
 
-> 全部依赖 C1（toolhead），无 toolhead 则无消费者。
+> `toolhead:set_position` 已产线触发（`gcode_move` 重置链之一）；其余三个尚无触发点：
+> `manual_move`/`update_extra_axes` 等 G4-2 的 API，`sync_print_time` 随 C1d。
 
 ### gcode 事件
 
@@ -667,19 +692,20 @@ FW5a–f / FW6a–f 已把「cartesian + 假 MCU 的 `G1`/`G28`」跑通并归�
 |---|---|---|---|---|
 | `gcode:command_error` | gcode 命令错误 | 无 | `klippy/gcode.py:226` | ✅ 已触发（`process_line`） |
 | `gcode:debuginput_exit` | debuginput EOF | 无 | `klippy/gcode.py:433` | **暂缓 `[~]`**（随 GCodeIO；需 `send_event` 返回值） |
-| `gcode:request_restart` | 请求重启 | `print_time` | `klippy/gcode.py:358` | C1（需 toolhead 的 print time） |
+| `gcode:request_restart` | 请求重启 | `print_time` | `klippy/gcode.py:358` | ✅ 已触发（`gcode.rs:1191`，`get_last_move_time` 取 print time） |
 
 > `gcode:command_error` 已接（handler 的 `CommandError` 触发，panic 不触发）；`gcode:request_restart`
-> 的声明已带 `print_time` 载荷，触发点等 C1；`gcode:debuginput_exit` 随 `GCodeIO` **暂缓 `[~]`**
-> （不做 OctoPrint 串口仿真），将来做时还要先让 `send_event` 收集 handler 返回值（上游 `all(...)`）。
+> 已在 `request_restart` 处理器里产线触发（`gcode.rs:1191`，先 `get_last_move_time` 再
+> dwell/wait）；`gcode:debuginput_exit` 随 `GCodeIO` **暂缓 `[~]`**（不做 OctoPrint 串口仿真），
+> 将来做时还要先让 `send_event` 收集 handler 返回值（上游 `all(...)`）。
 
 ### 工具/传感器事件
 
 | 事件名 | 触发时机 | 参数 | 上游位置 | 实现依赖 |
 |---|---|---|---|---|
 | `probe:update_results` | probe 测量完成 | `results` | `klippy/extras/probe.py:200` | endstop |
-| `extruder:activate_extruder` | 切换 active extruder | `extruder` | `klippy/kinematics/extruder.py:25` | C1 |
-| `stepper_enable:motor_off` | stepper 电机关闭 | `stepper_enable` | `klippy/extras/stepper_enable.py:120` | C1 |
+| `extruder:activate_extruder` | 切换 active extruder | `extruder` | `klippy/kinematics/extruder.py:25` | 尚无发送方（handler 已备，`gcode_move.rs:357`） |
+| `stepper_enable:motor_off` | stepper 电机关闭 | `stepper_enable` | `klippy/extras/stepper_enable.py:120` | ✅ 已触发（`stepper_enable.rs:338`） |
 | `virtual_sdcard:reset_file` | VSD 文件重置 | 无 | `klippy/extras/virtual_sdcard.py:151` | sdcard |
 | `load_cell:calibrate` | 称重传感器校准 | 无 | `klippy/extras/load_cell.py:397` | ADC |
 | `load_cell:tare` | 称重传感器归零 | 无 | `klippy/extras/load_cell.py:404` | ADC |
@@ -690,27 +716,28 @@ FW5a–f / FW6a–f 已把「cartesian + 假 MCU 的 `G1`/`G28`」跑通并归�
 
 | 事件名 | 触发时机 | 参数 | 上游位置 | 实现依赖 |
 |---|---|---|---|---|
-| `menu:`（空名） | 菜单初始化 | `menu` | `klippy/extras/display/menu.py:346` | display |
-| `menu:populate` | 菜单填充 | `menu` | `klippy/extras/display/menu.py:754` | display |
+| `menu:populate` | 菜单填充 | `menu` | `klippy/extras/display/menu.py:346` | display |
 | `menu:init` | 菜单初始化 | `menu` | `klippy/extras/display/menu.py:722` | display |
-| `menu:begin` | 菜单开始 | `menu` | `klippy/extras/display/menu.py:712` | display |
+| `menu:begin` | 菜单开始 | `menu` | `klippy/extras/display/menu.py:754` | display |
 | `menu:exit` | 菜单退出 | `menu` | `klippy/extras/display/menu.py:913` | display |
 
-> 依赖 display/menu 模块，优先级最低。
+> 依赖 display/menu 模块，优先级最低。上游 `menu.send_event` 实际发 `"menu:" + <名>`，
+> 共四个（2026-09-23 复核行号：populate 346 / init 722 / begin 754 / exit 913）；曾列出的
+> 「`menu:`（空名）」行是前缀构造的误拆，已删除，事件总数仍为 35（本仓库 decl 恰好 35 个）。
 
 ### 依赖关系总结
 
 ```
 事件总线（KlippyEvent，已就绪）
-├── klippy:* 生命周期事件（8个）—— 已触发（notify_mcu_error 待接入）
-├── stepper:* —— 依赖 C1
-├── homing:* —— 依赖 C1
-├── toolhead:* —— 依赖 C1
+├── klippy:* 生命周期事件（8个）—— 已触发（notify_mcu_error / analyze_shutdown 也已接入）
+├── stepper:* —— 依赖 C1（位置同步/目录反转，尚无触发点）
+├── homing:* —— 已触发（toolhead 回零路径）
+├── toolhead:* —— set_position 已触发；其余随 G4-2 / C1d
 ├── idle_timeout:* —— 依赖 idle_timeout 对象
-├── gcode:* —— 依赖 G1b
+├── gcode:* —— command_error / request_restart 已触发；debuginput_exit 随 GCodeIO 暂缓
 ├── probe:* —— 依赖 endstop
-├── extruder:* —— 依赖 C1
-├── stepper_enable:* —— 依赖 C1
+├── extruder:* —— 依赖 C1（activate_extruder 尚无发送方）
+├── stepper_enable:* —— 已触发（motor_off）
 ├── virtual_sdcard:* —— 依赖 sdcard
 ├── load_cell:* —— 依赖 ADC
 └── menu:* —— 依赖 display
@@ -756,5 +783,5 @@ FW5a–f / FW6a–f 已把「cartesian + 假 MCU 的 `G1`/`G28`」跑通并归�
 | 打印流程与 SD 卡 | `klippy/extras/virtual_sdcard.py`、`print_stats.py`、`pause_resume.py:27-31` |
 | TMC 驱动与 UART | `klippy/extras/tmc.py`、`tmc_uart.py`、`src/tmcuart.c` |
 | 块状传感器与端点 | `klippy/extras/bulk_sensor.py:100`、`load_cell.py:55`、`src/sensor_bulk.c` |
-| LCD 显示与菜单 | `klippy/extras/display/display.py`、`menu.py:346,712,722,754,913` |
+| LCD 显示与菜单 | `klippy/extras/display/display.py`、`menu.py:346,722,754,913` |
 | 主机统计与 MCU 错误详情 | `klippy/extras/statistics.py`、`error_mcu.py` |

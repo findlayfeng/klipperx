@@ -264,7 +264,9 @@ impl Printer {
             overridden = {
                 let mut section = section.clone();
                 for (option, value) in overrides {
-                    section.parameters.insert(option, value);
+                    // Keys are folded at `override_config`, and again here so
+                    // any future writer of this map is covered too.
+                    section.parameters.insert(option.to_lowercase(), value);
                 }
                 section
             };
@@ -636,6 +638,25 @@ mod tests {
         printer.override_config(
             "output_pin fan",
             "pin",
+            ConfigValue::Single("nope:PA0".to_string()),
+        );
+        let err = printer.load_config(&config).unwrap_err();
+        assert!(err.to_string().contains("nope"), "{err}");
+    }
+
+    #[test]
+    fn test_an_override_name_is_folded_like_every_other_option() {
+        // `override_config` goes through the same option-name folding as the
+        // parser: the replacement lands under the lowercase name, so the
+        // factory's case-folding read finds it instead of the parsed value.
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        let config = config("[mcu]\nserial: /dev/not-opened-yet\n[output_pin fan]\npin: PA0\n");
+        printer.load_config(&config).unwrap();
+        printer.reset_for_restart("restart");
+
+        printer.override_config(
+            "output_pin fan",
+            "PIN",
             ConfigValue::Single("nope:PA0".to_string()),
         );
         let err = printer.load_config(&config).unwrap_err();

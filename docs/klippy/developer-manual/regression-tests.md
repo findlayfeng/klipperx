@@ -191,6 +191,8 @@ connect_file(输出文件, 字典):
 | 因忽略列表跳过 | 234 | 尚未落地的配置节/运动学（34 个 `.test` 文件） |
 | 实际执行 | **3** | `linuxtest.test`（T1）、`commands.test`、`out_of_bounds.test`（b39750f），**全部通过** |
 
+上游 `configparser` 的 `optionxform = str.lower` 已对齐（`mod.rs` 存储侧小写 + `section.rs` 查询侧小写），`Option 'pid_Kp' … must be specified` 类的 49 次回归失败已归零；`must be specified` 错误文案保留调用方传入的大小写，`is not valid` 与 `Section '…' is not valid` 使用存储侧小写。
+
 - 头两个转绿的用例：`linuxtest.test`（只需 `kinematics: none`、`heaters` 的传感器注册表、
   `temperature_sensor` 与 `ds18b20`，g-code 只是一次 `G4 P1000`）；随后 `gcode_move`（G4-1）与
   `EXTRUDER` 默认项（e8bf2b7）让 `commands.test` 与 `out_of_bounds.test` 也过了守卫，移出忽略列表。

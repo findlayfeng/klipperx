@@ -378,7 +378,10 @@ impl Printer {
             .unwrap_or_else(|p| p.into_inner())
             .entry(identifier.to_string())
             .or_default()
-            .insert(option.to_string(), value);
+            // Folded like every other option name (`optionxform = str.lower`):
+            // the read side lowercases, so an unfolded key here would be
+            // silently ignored by the factory.
+            .insert(option.to_lowercase(), value);
     }
 
     /// The overrides recorded for `identifier`, for the loader to apply.

@@ -342,8 +342,8 @@ API 本身在 `crates/klippy-api/src/`：
 
 | 文件 | 职责 |
 |------|------|
-| `mod.rs` | INI 风格解析器：节/参数/注释/多行值/空节，与上游 `configparser` 行为对齐（节头行内注释、`:`/`=` 等价、缩进续行等四处曾分歧、已修） |
-| `section.rs` | `ConfigSection`：一个节（id + sub + 参数）的存储与遍历（按插入序、按 id 过滤） |
+| `mod.rs` | INI 风格解析器：节/参数/注释/多行值/空节，与上游 `configparser` 行为对齐（节头行内注释、`:`/`=` 等价、缩进续行等四处曾分歧、已修）；选项名统一小写（`optionxform = str.lower`），节名与值保留原样 |
+| `section.rs` | `ConfigSection`：一个节（id + sub + 参数）的存储与遍历（按插入序、按 id 过滤）；`get` / `get_str` / `get_text` / `has` 按小写查询，与存储侧对齐 |
 | `value.rs` | `ConfigValue`：单行 / 多行值 |
 | `source.rs` | 配置来源（文件路径）的表示 |
 | `wrapper.rs` | `ConfigWrapper`：带**读取记录**的类型化视图（`get_*` 家族、`sibling` / `has_sibling`），读取记录就是 schema |

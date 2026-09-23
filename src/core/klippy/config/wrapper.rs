@@ -698,4 +698,91 @@ mod tests {
         assert_eq!(status["warnings"].as_array().unwrap().len(), 1);
         assert_eq!(status["warnings"][0]["option"], json!("pin"));
     }
+
+    // -----------------------------------------------------------------------
+    // case folding — upstream's optionxform = str.lower
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn lowercase_storage_uppercase_query_is_readable() {
+        // The parser lowercases keys, so "pid_kp" is stored.
+        let access = AccessTracking::shared();
+        let section = section("extruder", &[("pid_kp", "1.0")]);
+        let wrapper = ConfigWrapper::new(&section, Arc::clone(&access));
+
+        // A query with different casing still finds it.
+        assert_eq!(wrapper.get_str("pid_Kp"), Some("1.0".to_string()));
+        assert_eq!(wrapper.get_str("PID_KP"), Some("1.0".to_string()));
+    }
+
+    #[test]
+    fn must_be_specified_keeps_caller_casing() {
+        // The error message must use the caller's original casing.
+        let access = AccessTracking::shared();
+        let section = section("extruder", &[]);
+        let wrapper = ConfigWrapper::new(&section, Arc::clone(&access));
+
+        let err = wrapper.get_float("pid_Kp", None).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Option 'pid_Kp' in section 'extruder' must be specified"
+        );
+
+        let err2 = wrapper.get_float("PID_KI", None).unwrap_err();
+        assert_eq!(
+            err2.to_string(),
+            "Option 'PID_KI' in section 'extruder' must be specified"
+        );
+    }
+
+    #[test]
+    fn duplicate_options_same_section_last_write_wins() {
+        // The parser lowercases keys, so a duplicate key overwrites the previous one.
+        let (config, _) = Config::from_text("[s]\na: first\nA: second\n").unwrap();
+        let section = config.get_section("s").unwrap();
+        let wrapper = ConfigWrapper::untracked(section);
+
+        assert_eq!(wrapper.get_str("a"), Some("second".to_string()));
+        assert_eq!(wrapper.get_str("A"), Some("second".to_string()));
+    }
+
+    #[test]
+    fn prefix_options_returns_lowercase_names() {
+        // The parser lowercases keys, so prefix_options returns lowercase names.
+        let (config, _) =
+            Config::from_text("[board_pins]\nmcu: main\naliases: A=PA0\naliases_extra: B=PB0\n")
+                .unwrap();
+        let section = config.get_section("board_pins").unwrap();
+        let wrapper = ConfigWrapper::untracked(section);
+
+        let prefixed = wrapper.prefix_options("aliases");
+        assert_eq!(
+            prefixed,
+            vec!["aliases".to_string(), "aliases_extra".to_string()]
+        );
+    }
+
+    #[test]
+    fn access_tracking_keys_are_lowercase() {
+        // Access tracking keys are lowercase regardless of the caller's casing.
+        let access = AccessTracking::shared();
+        let section = section("extruder", &[("pid_kp", "1.0")]);
+        let wrapper = ConfigWrapper::new(&section, Arc::clone(&access));
+
+        wrapper.get_float("pid_Kp", None).unwrap();
+
+        // The key in settings is lowercase.
+        assert_eq!(access.settings()["extruder"]["pid_kp"], json!(1.0));
+    }
+
+    #[test]
+    fn section_id_and_multiline_value_keep_case() {
+        // Section names and values are NOT lowercased.
+        let (config, _) =
+            Config::from_text("[gcode_macro TEST_unicode]\nvariable_ABC: 25\n").unwrap();
+        let section = config.get_section("gcode_macro TEST_unicode").unwrap();
+        // `id` is the first part only; `identifier()` is the full name.
+        assert_eq!(section.identifier(), "gcode_macro TEST_unicode");
+        assert_eq!(section.get_str("variable_abc"), Some("25"));
+    }
 }

@@ -32,6 +32,19 @@ pub use wrapper::ConfigWrapper;
 // Re-exported so a section module imports everything config-related from here.
 pub use crate::core::klippy::error::ConfigError;
 
+/// Lowercase an option name, mirroring upstream's `optionxform = str.lower`.
+///
+/// Upstream's `configparser` normalizes every option name to lowercase at storage
+/// time and also lowercases lookups, so `[extruder] pid_kp: 1.0` and a query for
+/// `pid_Kp` always resolve to the same entry. Section names and values are **not**
+/// folded — only option names.
+fn lower_option_name(name: &str) -> String {
+    // Unicode-aware, matching Python's `str.lower` (which is what upstream's
+    // default `optionxform` applies) — `AccessTracking` and `check_unused`
+    // already fold with `to_lowercase`.
+    name.to_lowercase()
+}
+
 /// Represents a complete Klipper configuration file
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -248,13 +261,14 @@ impl Config {
             let key = code[..separator].trim().to_string();
             let value_str = code[separator + 1..].trim();
 
+            // Upstream's `optionxform = str.lower`: store option names in lowercase.
+            let key = lower_option_name(&key);
             current_key = Some(key.clone());
             option_indent = indent;
-
             if value_str.is_empty() {
                 section
                     .parameters
-                    .insert(key, ConfigValue::Multi(Vec::new()));
+                    .insert(key.clone(), ConfigValue::Multi(Vec::new()));
             } else {
                 section
                     .parameters

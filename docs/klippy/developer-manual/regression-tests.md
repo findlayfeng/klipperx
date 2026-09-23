@@ -188,14 +188,14 @@ connect_file(输出文件, 字典):
 | 判定 | 次数 | 原因 |
 |------|------|------|
 | 因字典未构建跳过 | 2 | `printers.test` 中引用 `pru` 的两条运行（默认不编 `pru`） |
-| 因忽略列表跳过 | 236 | 尚未落地的配置节/运动学（除 `linuxtest.test` 外全部文件） |
-| 实际执行 | **1** | `linuxtest.test`（T1），**通过** |
+| 因忽略列表跳过 | 234 | 尚未落地的配置节/运动学（34 个 `.test` 文件） |
+| 实际执行 | **3** | `linuxtest.test`（T1）、`commands.test`、`out_of_bounds.test`（b39750f），**全部通过** |
 
-- `linuxtest.test` 是第一个转绿的用例：它只需要 `kinematics: none`、`heaters` 的传感器注册表、
-  `temperature_sensor` 与 `ds18b20`，g-code 只是一次 `G4 P1000`。
-- `KLIPPERX_UPSTREAM_ALL=1` 只去掉忽略列表这一层：默认构建下它会跑 237 条可用运行，其中 1 条
-  （`linuxtest`）通过、**236 条**在配置装载阶段失败，另外 2 条以「字典未构建」
-  计入统计，不算失败。
+- 头两个转绿的用例：`linuxtest.test`（只需 `kinematics: none`、`heaters` 的传感器注册表、
+  `temperature_sensor` 与 `ds18b20`，g-code 只是一次 `G4 P1000`）；随后 `gcode_move`（G4-1）与
+  `EXTRUDER` 默认项（e8bf2b7）让 `commands.test` 与 `out_of_bounds.test` 也过了守卫，移出忽略列表。
+- `KLIPPERX_UPSTREAM_ALL=1` 只去掉忽略列表这一层：默认构建下它会跑 237 条可用运行，其中 3 条
+  通过、**234 条**在配置装载阶段失败，另外 2 条以「字典未构建」计入统计，不算失败。
 - 按「首次失败原因」的分组（T3–T10 工单）、运动学细分与完整失败日志不在本手册重复维护，
   统一见 [上游回归测试失败原因分析](../../work-log/2026-09-22-upstream-regression-failures.md)
   （2026-09-22 快照，含 T7 完成后的状态与复盘）。
@@ -205,16 +205,16 @@ connect_file(输出文件, 字典):
 ### 推进口径与验收
 
 - 上面按「**首次失败原因**」的分组只用于**定位**，不是工作队列：`load_config` 遇到第一个未知
-  section 就停，修好一个缺口只会让运行前进到下一个缺口，总数可能不变（T7 后的 236 就是例子），
+  section 就停，修好一个缺口只会让运行前进到下一个缺口，总数可能不变（T7 后的 234 就是例子），
   各组收益不可加。
-- 进度以**转绿运行数 / `IGNORED` 条目数**衡量（当前 1 / 36）；先产出「**运行 × 缺口**」矩阵
+- 进度以**转绿运行数 / `IGNORED` 条目数**衡量（当前 3 / 34）；先产出「**运行 × 缺口**」矩阵
   （列出每条运行的**全部**缺口，而非第一个），据此找「只差一个缺口」的用例与公共前缀。
 - **验收标准**：对应 `.test` 从 `IGNORED` 移除后通过。`ignored_cases_still_fail` 是守卫——
   某个忽略文件的全部可跑运行都通过时报失败并提示移除。
 - 看全部缺口（而不只是首次失败）：
   `cargo test -p klipperx --lib upstream_gap_report -- --nocapture`。
-- `out_of_bounds.test` 是唯一的 `SHOULD_FAIL`，必须等配置能装载后再移出，否则越界检查会被配置
-  错误「喂饱」。
+- `out_of_bounds.test` 是唯一的 `SHOULD_FAIL`：验收时必须确认反转真的验的是**越界检查**，
+  而不是被一个配置装载错误「喂饱」（它已在 b39750f 移出并验证过一次）。
 
 ## 本仓库的复用
 
@@ -272,8 +272,8 @@ harness 把每个 `[mcu]` / `[mcu <name>]` 的传输键换成 `test: dict=<字�
 `KLIPPERX_UPSTREAM_ALL=1` **只作用于这张列表**：它让字典齐备的运行无视忽略判定并报出失败，
 **不会**让因字典未构建而跳过的运行跑起来（那是构建阶段的事，见上一节）。
 
-当前 36 条（`linuxtest.test` 已在 T1 修好并转绿，不再是忽略项；T2 `stepper_enable` 与 T7 温度
-传感器的相关文件仍因后续缺节留在列表里）。
+当前 34 条（`linuxtest.test` 已在 T1 转绿；`commands.test`、`out_of_bounds.test` 随 `gcode_move` 
+与 `EXTRUDER` 默认项在 b39750f 转绿；其余文件仍因缺节留在列表里）。
 
 失败原因的分组、运动学细分与 `KLIPPERX_UPSTREAM_ALL=1` 的完整失败日志，统一记在
 [上游回归测试失败原因分析](../../work-log/2026-09-22-upstream-regression-failures.md)；
@@ -285,8 +285,9 @@ harness 把每个 `[mcu]` / `[mcu <name>]` 的传输键换成 `test: dict=<字�
 - `load_config` + `bring_up` 失败 = 「这台主机还跑不了这个用例」，报为**失败**，不算满足 `SHOULD_FAIL`；
 - 只有 g-code 阶段的错误才反转成成功（`run_phases` 的两段返回值）。
 
-所以把它留在忽略列表里是正确的：等 `example-cartesian.cfg` 所需的节/运动学落地、把它移出忽略列表后，
-反转才会真的去验越界检查，而不是被一个配置装载错误“喂饱”。
+所以它的验收要点是：移出忽略列表前，配置必须先能装载——否则非零退出来自配置错误，反转就会被
+「喂饱」。这一条在 b39750f 移出时已满足（`gcode_move` 落地后 `example-cartesian.cfg` 可装载，
+反转验的正是 `G1 Y9999` 越界）。
 
 ### 运行
 

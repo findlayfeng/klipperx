@@ -73,7 +73,7 @@ WARN  api: dropping malformed request (invalid JSON …): not json
 - 没有终端（比如 systemd 里）时 `--tui` 只打印一行警告，主机照常无窗口运行。
 - 这个选项属于 `klipperx`，**独立二进制 `klippy` 没有它**：窗口是客户端，会带进
   一整套终端界面库，而只负责提供 API 的 `klippy` 用不到 —— 不装它的 `klippy`
-  因此小一号（release 6.3 MB，带窗口的 `klipperx` 是 7.6 MB）。要在独立主机上加
+  因此小一号（release 9.1 MB，带窗口的 `klipperx` 是 11.2 MB，2026-09-23 实测）。要在独立主机上加
   窗口，另开一个终端跑 `klippy-client console -a …` 即可。
 
 > **安全提醒**：API 没有任何认证，能连上的人就能操作打印机。TCP 监听只应开在
@@ -111,7 +111,19 @@ $ cargo run --release -- console -a /tmp/klippy_uds
 $ klippy-client api -a /tmp/klippy_uds list_endpoints
 {
   "endpoints": [
-    "list_endpoints"
+    "emergency_stop",
+    "gcode/firmware_restart",
+    "gcode/help",
+    "gcode/restart",
+    "gcode/script",
+    "gcode/subscribe_output",
+    "info",
+    "list_endpoints",
+    "objects/list",
+    "objects/query",
+    "objects/subscribe",
+    "query_endstops/status",
+    "register_remote_method"
   ]
 }
 ```
@@ -142,10 +154,9 @@ Connected to unix:/tmp/klippy_uds.
 < id: 2
   result:
     endpoints:
-    - list_endpoints
-    - info
-    - objects/list
-    - objects/query
+    - emergency_stop
+    - gcode/firmware_restart
+    - …（完整清单随实现变化，以 `list_endpoints` 实际应答为准）
 klippy> objects/query {objects: {toolhead: [position]}}
 Enter send · ↑↓ history · PgUp/PgDn · ^G g-code · .help · ^C quit
 ```
@@ -261,7 +272,7 @@ gcode> SET_PIN PIN=fan VALUE=1
 $ printf 'list_endpoints\n' | klippy-client console -a /tmp/klippy_uds
 Connected to unix:/tmp/klippy_uds.
 info: webhooks: No registered callback for path 'info'
-2 (list_endpoints) {"endpoints":["list_endpoints"]}
+2 (list_endpoints) {"endpoints":["emergency_stop","gcode/firmware_restart",…]}
 Disconnected from unix:/tmp/klippy_uds.
 $ klippy-client console --plain -a /tmp/klippy_uds
 ```

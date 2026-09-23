@@ -131,7 +131,21 @@ MCU 侧另有独立的 `event` 模块，以 `McuEvent` trait 表达固件主动�
 `connect()` 失败时，在 `invoke_shutdown` 之前发出，携带 `msg` 分类（`"Protocol error"`
 或 `"MCU error during connect"`）与 `details`（原始错误信息）。与上游 `_connect` 中的
 `send_event("klippy:notify_mcu_error", msg, {"error": str(e)})` 一致。
-其余命名空间的事件在各自模块就位后触发；事件名与变体已经就绪，处理器可先注册。
+
+截至 2026-09-23，生产路径上**实际发出**的事件（按命名空间）：
+
+| 命名空间 | 已发出 | 尚未发出（模块/发送方未就位） |
+|----------|--------|------------------------------|
+| `klippy:` | 全部 8 个 | — |
+| `homing:` | 全部 4 个（`toolhead` 的回零循环发 begin/end） | — |
+| `gcode:` | `command_error`、`request_restart` | `debuginput_exit`（依赖 `GCodeIO`，暂缓） |
+| `toolhead:` | `set_position` | `manual_move`（已注册处理器，发送方是 G4-2）、`sync_print_time`、`update_extra_axes` |
+| `stepper_enable:` | `motor_off` | — |
+| `extruder:` | — | `activate_extruder`（已注册处理器，发送方是 G4-2） |
+| `stepper:` | — | `sync_mcu_position`、`set_dir_inverted`（依赖 stepper 资源的同步路径） |
+| `idle_timeout:` / `probe:` / `virtual_sdcard:` / `load_cell:` / `menu:` / `dual_carriage:` | — | 对应 extras 模块尚未实现（H3/H4/H6/H8/H9） |
+
+事件名与变体已经就绪，处理器可先注册；上表右列的事件一旦模块落地，发送点直接用现成变体。
 
 ## 3. 设计
 
@@ -161,7 +175,7 @@ MCU 侧另有独立的 `event` 模块，以 `McuEvent` trait 表达固件主动�
 ///
 /// 每个变体对应上游 `send_event` 的一个事件名，`name()` 给出该名字。
 /// `Unknown` 承接未声明的事件名。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum KlippyEvent {
     // klippy:
     KlippyMcuIdentify,
@@ -182,7 +196,7 @@ pub enum KlippyEvent {
     HomingHomingMoveBegin,
     HomingHomingMoveEnd,
     HomingHomeRailsBegin,
-    HomingHomeRailsEnd,
+    HomingHomeRailsEnd { axes: Vec<usize> },
 
     // stepper:
     StepperSyncMcuPosition,
@@ -197,7 +211,7 @@ pub enum KlippyEvent {
     // gcode:
     GcodeCommandError,
     GcodeDebuginputExit,
-    GcodeRequestRestart,
+    GcodeRequestRestart { print_time: f64 },
 
     // probe:
     ProbeUpdateResults,
@@ -243,8 +257,9 @@ impl KlippyEvent {
 }
 ```
 
-该枚举不使用 `Hash`：变体可携带 `HashMap<String, Value>`，二者都不实现 `Hash`；分发按
-事件名进行，不需要枚举自身可哈希。
+该枚举不实现 `Hash`，也不实现 `Eq`：变体可携带 `HashMap<String, Value>`（都不实现 `Hash`）与
+`f64`（`print_time`，不实现 `Eq`），所以生成器只 derive `Debug, Clone, PartialEq`；分发按
+事件名进行，不需要枚举自身可哈希或全序相等。
 
 ### 3.3 处理器签名与载荷传递
 
@@ -261,6 +276,8 @@ type EventHandler = Arc<dyn Fn(&KlippyEvent) + Send + Sync>;
 `stepper:sync_mcu_position` 的 `stepper` 等），载荷不进入枚举：处理器在注册时已能从
 闭包捕获所需对象，或经 `Printer::lookup_object` 取得，无需在分发路径上传递引用。这与
 上游处理器直接接收对象的写法在效果上一致，同时避免在枚举中保存带生命周期的引用。
+少数需要值的载荷例外地进了枚举：`homing:home_rails_end` 的 `axes: Vec<usize>`（
+`gcode_move` 按轴清 homed 状态）与 `gcode:request_restart` 的 `print_time: f64`。
 
 `details` 使用 `HashMap<String, Value>`（`serde_json::Value`），与上游的 `dict` 对应。
 
@@ -415,8 +432,8 @@ impl Printer {
 - `klippy:ready`：状态置为 `Ready` 后触发，位置不变。
 - `klippy:shutdown`：`Printer::invoke_shutdown` 中状态置为 `Shutdown` 后触发，位置不变。
 - `klippy:analyze_shutdown`：在 `invoke_shutdown` 中 `klippy:shutdown` 之后触发，携带
-  停机原因与细节。当前 `invoke_shutdown` 只接收 `msg`，`details` 以空表传入；后续需要
-  细节的调用点再扩展签名。
+  停机原因与细节；细节经 `invoke_shutdown_with(msg, details)` 传入（`invoke_shutdown(msg)`
+  是 details 为空表的便捷入口），`error_mcu` 用前者带上原始错误。
 - `klippy:notify_mcu_error`：在 `Printer::bring_up` 中，MCU 对象 `connect()` 失败时、
   `invoke_shutdown` 之前触发，携带 `msg`（`"Protocol error"` 或 `"MCU error during connect"`）
   与 `details`（`{"error": str}`）。上游在 `_connect` 中对应位置触发。
@@ -433,7 +450,7 @@ impl Printer {
 | 5 | `invoke_shutdown` 触发 `KlippyAnalyzeShutdown` | 3 | 已实现 |
 | 6 | 迁移 `gcode.rs`、`extras/output_pin.rs`、`api/endpoints/gcode.rs` 的调用点 | 3 | 已实现 |
 | 7 | 更新测试并删除 `PrinterEvent` | 6 | 已实现 |
-| 8 | 其余命名空间的事件在各自模块就位后逐步注册处理器 | 3 | 待各模块实现 |
+| 8 | 其余命名空间的事件在各自模块就位后逐步注册处理器 | 3 | 进行中：`homing` / `gcode` / `toolhead:set_position` / `stepper_enable:motor_off` 已发出（见 §2.2 表）；`idle_timeout` / `probe` / `virtual_sdcard` / `load_cell` / `menu` / `dual_carriage` 等模块落地后接入 |
 
 ## 6. 与上游的差异
 

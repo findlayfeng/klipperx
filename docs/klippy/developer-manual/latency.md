@@ -50,8 +50,9 @@ MCU 通信本身的延迟（串口/CAN 往返、重传）不在主机这里，�
 **现在不需要。** 理由：
 
 1. **硬实时在 MCU**，主机晚几毫秒不丢步；MCU 队列的缓冲是设计的一部分。
-2. **当前消费者很轻**：唯一的周期回调是 `objects/subscribe` 的 250 ms 刷新，正常远低于 1 ms；
-   MCU 时钟同步也不要求亚毫秒精度。
+2. **当前消费者很轻**：周期性的 reactor 回调只有几个——`objects/subscribe` 的 250 ms 刷新、
+   次级 MCU 的 `mcu_recalibrate`（1 s）、`temperature_combined` 的阈值守卫，加上 fan 的一次性
+   kick-start `call_later`；每个都正常远低于 1 ms。MCU 时钟同步也不要求亚毫秒精度。
 3. **绑核的代价不小，且做一半比不做更糟**：只把线程 `sched_setaffinity` 到某几个核、却不隔离
    这些核（别的进程、IRQ、内核线程还在上面跑），会把抖动集中到这几核上，可能更差。
 4. **tokio 的任务会在 worker 之间迁移**，所以「给任务绑核」在进程内做不到；能绑的是 worker

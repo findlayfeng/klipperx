@@ -23,7 +23,19 @@
 $ klipperx api -a /tmp/klippy_uds list_endpoints
 {
   "endpoints": [
-    "list_endpoints"
+    "emergency_stop",
+    "gcode/firmware_restart",
+    "gcode/help",
+    "gcode/restart",
+    "gcode/script",
+    "gcode/subscribe_output",
+    "info",
+    "list_endpoints",
+    "objects/list",
+    "objects/query",
+    "objects/subscribe",
+    "query_endstops/status",
+    "register_remote_method"
   ]
 }
 $ klipperx api -a /tmp/klippy_uds 'objects/query' '{"objects": {"toolhead": ["position"]}}'

@@ -31,7 +31,10 @@ main():
 运行；`error_exit` 最终以非零码退出进程。出处：`klippy/klippy.py:354-374`。
 
 > **与上游的差异**：`start_args` 中的 `debuginput`、`debugoutput`、`dictionary` 在上游可组成
-> 「文件输出 + 数据字典」的**无固件运行模式**，本项目尚无等价实现，见 [回归测试](regression-tests.md)。
+> 「文件输出 + 数据字典」的**无固件运行模式**。本项目的等价物分两半：`start_args.debug_output`
+> 字段与 `Printer::is_fileoutput()` 已就位（T3，回归 harness 在装载前填它，`-o`/`-i` 的命令行入口
+> 尚未做），字典则由应答机 `SimulatorDevice` 走真实的 identify 路径下发（不是直接注入），见
+> [回归测试](regression-tests.md)。
 
 ## 机器状态
 
@@ -61,8 +64,10 @@ main():
 - `update_error_msg`（`:63`）允许消费者在消息未被改写的前提下替换为更详细的文本；
 - `request_exit(result)`（`:228`）记录退出结果并结束 reactor，该结果即主循环看到的 `res`。
 
-启动期如果 `start_args` 带 `debuginput`（回归测试的输入文件模式），非 ready 的新状态会直接
-`request_exit('error_exit')`——这是回归测试以进程退出码判定成败的机制。
+启动期如果 `start_args` 带 `debuginput`（回归测试的输入文件模式），上游会在非 ready 的新状态上直接
+`request_exit('error_exit')`——它以进程退出码判定用例成败（`klippy/klippy.py:57-62`）。
+本项目**没有**复刻这条路径：`set_error_state` 只改状态不退进程，回归判定靠 `upstream::run_phases`
+的两段返回值（`load_config`/`bring_up` 失败与 g-code 阶段失败分开），见 [回归测试](regression-tests.md)。
 
 ## reactor 与回调模型
 
@@ -227,9 +232,11 @@ G28 ──▶ Homing.home_rails
 主机：按 stepcompress 的 history 反推触发时刻的位置 → set_position(haltpos)
 ```
 
-> **与上游的差异**：运动数学与步进压缩在本项目以 Rust 重写，上游在 `chelper/` 的 C 里；目前只
-> 有 cartesian 运动学与单次回零（无 `homing_retract_dist` 二次回零、无 `endstop_phase`，一次
-> 只回一轴）。`GCodeIO` 的输入抽象（伪 tty / 文件 / `stats gcodein`）暂缓；mux 命令的
+> **与上游的差异**：运动数学与步进压缩在本项目以 Rust 重写，上游在 `chelper/` 的 C 里；
+> 运动学已有 `none` / `cartesian` / `corexy` / `corexz` / `hybrid_corexy` / `hybrid_corexz`
+> （delta 族与 generic_cartesian 待做，C1c），回零目前是**单程**（`homing_retract_dist` /
+> `second_homing_speed` 已读入 `HomingInfo` 但二次回零未接，`endstop_phase` 未实现），`G28`
+> 按请求的轴**逐个**回（一次一轴，与上游 cartesian 一致）。`GCodeIO` 的输入抽象（伪 tty / 文件 / `stats gcodein`）暂缓；mux 命令的
 > 「取值不合法」提示取排序后的第一个候选，上游取字典序最后一个。见
 > [延迟与抖动](latency.md)与 `TODO.md`。
 

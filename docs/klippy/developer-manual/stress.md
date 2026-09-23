@@ -137,7 +137,8 @@ USB CDC 走的是 USB 全速，真正的瓶颈在固件的命令处理与响应�
 - 引脚名支持 `PA0`、`mcu:PA0`、`<chip>:PA0` 和尾随 `!`（忽略）；**别名（`[board_pins]`）还没
   解析**。
 - 压力 stepper 用 `invert_step = 0`、`step_pulse_ticks = 0`；`[stepper_*]` 的 `invert_step` /
-  `microsteps` / `enable_pin` 等还没有读取（那是 C1 的 stepper 资源）。
+  `microsteps` / `enable_pin` 等**不读**——这些选项现在由 `extras/stepper.rs` 的正式 stepper
+  资源消费，压力工具只借 step/dir 引脚，自己造一个固定的 stepper（剩余项见 S1）。
 - 夹具每次 reset + reconnect（无 `config_reset` 的固件）约 0.5 s。
 - 端到端只在真板上手工跑过；单测覆盖的是段计算、引脚解析与命令编码。
 

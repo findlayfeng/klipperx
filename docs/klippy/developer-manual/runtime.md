@@ -26,7 +26,7 @@ dispatcher 前面——那只是把抖动从 API 换成了机器内部。
 | 形态 | `new_multi_thread`，`worker_threads(2)` | `new_multi_thread`，默认 worker 数 |
 | 线程名 | `klippy-mcu`（worker），`klippy-machine`（驱动线程） | `klippy-api` |
 | 驱动 | 一条专用 OS 线程 `block_on(klippy_process(...))` | 主线程 `block_on(…)` |
-| 建在哪 | `src/klippy.rs:191` | `src/klippy.rs:209` |
+| 建在哪 | `src/klippy.rs` 的 `machine_runtime` | `src/klippy.rs` 的 `api_runtime` |
 
 **机器侧**（全在机器 runtime 上）：reactor 的 dispatcher、MCU 发送/接收任务、设备的阻塞 I/O
 （机器 runtime 的 blocking pool）、`bring_up` / `load_config` / `reset_for_restart` / `teardown`、
@@ -36,19 +36,19 @@ restart 循环、以及同步阻塞的 `printer.run()`（机器 runtime 的 `spa
 `Attachment`（`--tui` 的 in-process server）、以及 `ctrl_c` 监听。
 
 `block_on` 不能嵌套，所以机器 runtime 不能由 API runtime 驱动，必须有自己的驱动线程
-（`src/klippy.rs:281`）。驱动线程全程停在 `block_on`，这没问题——机器的任务跑在那个 runtime
+（`src/klippy.rs` 的 `machine_runtime.block_on(klippy_process(…))`）。驱动线程全程停在 `block_on`，这没问题——机器的任务跑在那个 runtime
 的 worker 上，不在驱动线程上。
 
 ## 边界上的约定
 
-- **reactor 显式建在机器 handle 上**：`TokioReactor::new(machine_handle)`（`src/klippy.rs:202`），
-  reactor 不再问 ambient runtime。
+- **reactor 显式建在机器 handle 上**：`TokioReactor::new(machine_handle)`（`src/klippy.rs`，
+  在 `machine_runtime` 之后），reactor 不再问 ambient runtime。
 - **机器侧的 spawn 一律走存下来的 handle**：`Interface` 存 `handle`（设备 I/O 走 `off_runtime`），
   `Mcu` 从 `interface.handle()` 取一份存字段（收发任务走它），`restart.rs` 的 `spawn_blocking`
   显式收 `&Handle`。机器侧没有裸 `tokio::spawn` / `spawn_blocking`。
 - **唯一的 ambient 捕获点**：`Interface::with_transport`（`interface/mod.rs`）的
   `Handle::current()`。它在设备**打开之后**捕获，所以打不开的传输根本不需要 runtime；而
-  `load_config` 跑在 `machine_handle.enter()` 之下（`src/klippy.rs:248`），所以连它捕获到的也是
+  `load_config` 跑在 `machine_handle.enter()` 之下（`src/klippy.rs`，在 `run()` 内），所以连它捕获到的也是
   机器 handle。这条约定由单测守着（`klippy.rs` 的
   `test_a_transport_captures_the_machine_runtime_not_the_ambient_one`）。
 - **跨 runtime 只靠 `Arc<Printer>` 与 `request_exit`**：退出信号是 `Mutex` + `Condvar`
@@ -61,7 +61,7 @@ restart 循环、以及同步阻塞的 `printer.run()`（机器 runtime 的 `spa
 
 1. `request_exit`（来自 API 侧的 `ctrl_c` 监听、attachment 结束，或机器自身的停机条件）；
 2. `printer.run()` 从 `Condvar` 醒来、返回，`klippy_process` 的循环结束；
-3. `printer.teardown()`（`src/klippy.rs:116`）——它会丢掉配置装载的部件、关掉设备，释放停在
+3. `printer.teardown()`（`src/klippy.rs`，`klippy_process` 返回后的第一句）——它会丢掉配置装载的部件、关掉设备，释放停在
    blocking read 上的设备线程；这一步必须在建它的机器 runtime 还活着时做；
 4. 机器线程的 `block_on` 返回，`machine_runtime` 被 drop；
 5. API 侧 `machine_thread.join()` 返回，abort `ctrl_c` 监听与 API server，`run()` 返回。

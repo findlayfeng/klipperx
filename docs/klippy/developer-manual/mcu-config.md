@@ -48,12 +48,14 @@ oid_count = count;
 | `create_oid()` | 领下一个 oid（从 0 单调，不复用） |
 | `add_config_cmd` / `add_restart_cmd` / `add_init_cmd` | 往三张表加命令 |
 | `register_config_callback` | 注册 `build` 时要跑的回调（可继续领 oid / 加命令，拿到 `&Mcu`） |
+| `register_pre_build_callback` / `run_pre_build` | **async 预建回调**：在 `build` 之前、字典已装且连接已活时跑（需要 `call_msg` 的钩子，如 `temperature_mcu` 的 `debug_read` 标定） |
 | `register_post_init_callback` | 注册固件接受配置后要跑的回调 |
 | `request_move_queue_slot()` | 预留运动队列槽位 |
-| `build(&Mcu)` | 跑回调、插 `allocate_oids`、算 CRC、追加 `finalize_config`；返回编码好的三张表 |
-| `configure(&Mcu)` | 与固件的握手：`get_config` → 判断复用还是下发 → 再 `get_config` → 跑 post-init |
+| `build(&Mcu)` | 跑 config 回调、插 `allocate_oids`、算 CRC、追加 `finalize_config`；返回编码好的三张表（`BuiltConfig`） |
+| `handshake(&Mcu, &mut BuiltConfig, expect_unconfigured)` | 与固件的单轮握手：`get_config` → 停机/CRC 判断（必要时复位）→ 发表 → 再 `get_config` 确认 → 跑 post-init。单独暴露是因为 `reset` 路径会断开连接：调用方用**同一份** `BuiltConfig` 重连重跑（`mcu/object.rs` 的循环） |
+| `configure(&Mcu)` | `build` + 一次 `handshake(…, false)` 的便捷入口（不需要重试循环的调用方用它） |
 
-生命周期挂在 `McuObject` 上（`mcu/object.rs`）：**`ConfigBuilder` 在 `McuObject::new` 时就建好**（配置装载期资源就要往里加命令），`PrinterObject::connect` 里先 `Mcu::connect`（identify 装字典），再 `builder.configure(&mcu)`：
+生命周期挂在 `McuObject` 上（`mcu/object.rs`）：**`ConfigBuilder` 在 `McuObject::new` 时就建好**（配置装载期资源就要往里加命令），`PrinterObject::connect` 里先 `Mcu::connect`（identify 装字典），再跑 `run_pre_build` → `build` → `handshake` 循环：
 
 ```
 load_config                      connect
@@ -62,12 +64,15 @@ McuObject::new
   └─ ConfigBuilder::new
 资源: create_oid / add_config_cmd
                                  Mcu::connect  → identify 装字典
-                                 configure:
+                                 run_pre_build（async 预建回调）
+                                 build（跑 config 回调、编码、算 CRC）
+                                 handshake 循环:
                                    get_config
-                                   build（跑回调、编码、算 CRC）
-                                   未配置 ? config+init : restart+init
-                                   get_config（确认）
+                                   停机/CRC 不一致 ? 先复位 : 直接发
+                                   发表（未配置 ? config+init : restart+init）
+                                   get_config（确认 + move_count 校验）
                                    post-init 回调
+                                   ResetRequired ? 重连重跑同一份 BuiltConfig
 ```
 
 失败统一是 `McuError::Config`：固件停机且无法复位、CRC 不一致且无法复位、固件拒绝配置、运动队列槽位不够。`McuObject::connect` 把它转成 `KlippyError::Connection`。另有 `McuError::ResetRequired`：复位需要重连（固件有 `reset`）时由它把控制权交回 `connect`。（停机与 CRC 不一致**能复位时**不会报错：先 `reset` + 重连，或 `config_reset` 就地清，见下。）
@@ -202,10 +207,10 @@ void command_finalize_config(uint32_t *args) {
 
 | 上游步骤 | 位置 | 我们的现状 |
 |---|---|---|
-| `_send_get_config` 先查**连接层**的 shutdown 标志（`conn_helper.is_shutdown()`），再查 `get_config` 的 `is_shutdown` 字段，两者都 raise | `:1039-1046` | 只查 `is_shutdown` 字段（连接层 shutdown 属 B2） |
-| 未配置时先 `check_restart_on_send_config()`：`restart_method == 'rpi_usb'` 要先做一次 USB 断电重启才发配置 | `:686-689`、`:1052` | 已做：`restart::restart_before_bringup` 在 `connect` 里据此 `request_exit('firmware_restart')`（D2） |
-| 已配置时先看 `start_reason == 'firmware_restart'`，是则 raise “Failed automated reset”（说明复位没生效），**再**算 CRC | `:1053-1056` | 不做（这个前置门仍未加，D2） |
-| **CRC 不匹配时先 `check_restart_on_crc_mismatch()`：请求一次 `request_exit('firmware_restart')`、pause 2 s、然后才 raise** | `:678-685`、`:1057-1059` | 改成**优先真重启**：固件有 `reset` 就发 `reset` + 重连 + 重试握手；只有没有 `reset` 时才 `emergency_stop` + `config_reset` 就地清；`rpi_usb` 的 CRC 不匹配由上一行的门先请求 firmware_restart |
+| `_send_get_config` 先查**连接层**的 shutdown 标志（`conn_helper.is_shutdown()`），再查 `get_config` 的 `is_shutdown` 字段，两者都 raise | `:1039-1046` | 只查 `get_config` 回的 `is_shutdown` 字段；连接层标志（`McuObject::is_shutdown`）由握手**之后**绑的固件事件维护，握手时还不成立 |
+| 未配置时先 `check_restart_on_send_config()`：`restart_method == 'rpi_usb'` 要先做一次 USB 断电重启才发配置 | `:686-689`、`:1052` | 已做：`restart::restart_before_bringup` 在 `connect` 里据此 `request_exit('firmware_restart')` |
+| 已配置时先看 `start_reason == 'firmware_restart'`，是则 raise “Failed automated reset”（说明复位没生效），**再**算 CRC | `:1053-1056` | 已做：`handshake(…, expect_unconfigured)` 在 `McuObject::connect` 传入 `is_firmware_restart()`，命中就报 `Failed automated reset` |
+| **CRC 不匹配时先 `check_restart_on_crc_mismatch()`：请求一次 `request_exit('firmware_restart')`、pause 2 s、然后才 raise** | `:678-685`、`:1057-1059` | 改成**优先真重启**：固件有 `reset` 就发 `reset` + 重连 + 重试握手（`McuObject::connect` 的循环）；只有没有 `reset` 时才 `emergency_stop` + `config_reset` 就地清；`rpi_usb` 的 CRC 不匹配由上一行的门先请求 firmware_restart |
 | pin 名在 `_finalize_config` 里改写；非法 pin 的错误到**发送时**才被 `_send_cfg_init_commands` 捕获并转成 config error | `:1009-1013`、`:1021-1032` | F2 会在**加入命令时**就改写/报错，编码在 build 时，错误也在 build 暴露 |
 | 发送后第二次 `get_config`：`fileoutput` 模式下跳过 `is_config` 断言 | `:1066-1068` | 总是断言 |
 | `move_count` 与预留槽：把 `move_count - reserved` 交给 `steppersync` | `:1070-1078` | 只校验 `move_count >= reserved`（无运动层，C1） |
@@ -215,7 +220,7 @@ void command_finalize_config(uint32_t *args) {
 
 ### 唯一的实际代价
 
-把一个「上游 Klipper 刚用同一份 printer.cfg 配好」的 MCU 交给我们时，上游存的 CRC 和我们算的对不上。现在的 `configure` 遇到「已配置且 CRC 不一致」时先尝试复位（见下），不能复位才报错：
+把一个「上游 Klipper 刚用同一份 printer.cfg 配好」的 MCU 交给我们时，上游存的 CRC 和我们算的对不上。`handshake`（`configure` 的握手部分）遇到「已配置且 CRC 不一致」时先尝试复位（见下），不能复位才报错：
 
 ```
 MCU 'mcu' is configured with CRC 0x…, the host computed 0x…
@@ -223,7 +228,7 @@ MCU 'mcu' is configured with CRC 0x…, the host computed 0x…
 
 **CRC 不匹配不能靠重发配置来修**：固件一旦 `finalize_config` 就把配置锁住——之后 `oid_alloc` 报 `Can't assign oid`（`src/basecmd.c:204`），再发一次 `finalize_config` 报 `Already finalized`（`src/basecmd.c:173`）。所以重发不只是无效，还会把 MCU 直接打进 shutdown。要换配置只能**复位**：停机时用 `config_reset`（`src/basecmd.c:262`，清 CRC/oid/运动队列），或者重启固件。这正是不匹配时上游**先请求 firmware_restart 再 raise** 的原因——它不重发，它重启。
 
-我们现在也复位，而且**优先真重启**：`configure` 发现固件已停机或 CRC 不一致时，`reset_firmware`
+我们现在也复位，而且**优先真重启**：`handshake` 发现固件已停机或 CRC 不一致时，`reset_firmware`
 先看固件有没有 `reset`（`basecmd.c` 之外的板级命令）——有就返回 `McuError::ResetRequired`，
 `McuObject::connect` 发 `reset`、重开连接、用同一份 `BuiltConfig` 重跑握手（得到一次真正的重启，
 把定时器与步进队列也清掉，同上游 `_reset_cmd` 优先，`klippy/mcu.py:733-740`）。只有没有 `reset`
@@ -259,22 +264,24 @@ MCU 'mcu' is configured with CRC 0x…, the host computed 0x…
 | `register_config_callback` | `:1122` | `register_config_callback` |
 | `register_post_init_callback` | `:1130` | `register_post_init_callback` |
 | `_finalize_config` | `:1004-1020` | `build` |
-| `_connect`（两段式） | `:1047-1085` | `configure` |
+| `_connect`（两段式） | `:1047-1085` | `build` + `handshake`（`configure` 是二者的便捷组合） |
 | `seconds_to_clock` | `:1140` | `Mcu::seconds_to_clock` |
 | `request_move_queue_slot` | `:1142` | `ConfigBuilder::request_move_queue_slot` |
 | `get_query_slot` | `:1136` | `ConfigBuilder::get_query_slot`（用 `Mcu::estimated_clock`，见下） |
 | — | `src/basecmd.c:235` | `AllocateOids`（`cmd/allocate_oids.rs`） |
 | — | `src/basecmd.c:250` | `GetConfig` / `ConfigState`（`cmd/config.rs`） |
 | — | `src/basecmd.c:258` | `FinalizeConfig`（`cmd/config.rs`） |
-| — | `src/basecmd.c:262` | `ConfigReset`（命令类型已有，发送路径属 B2） |
+| — | `src/basecmd.c:262` | `ConfigReset`（`cmd/config.rs`；发送在 `reset_firmware`，`mcu/config.rs`） |
 
-## 还没有的
+## 状态清单（均已完成）
+
+> 本节原为「还没有的」，所列各项均已落地，保留为逐项说明与上游的对应关系。
 
 - **pin 名改写**：已完成（F2）。`PinResolver` 在资源**加入命令之前**把别名/保留作用于参数，与上游“finalize 时改写文本”顺序相反，原因见上一节。`[board_pins]` 是它的装载入口（`extras/board_pins.rs`）。
-- **`get_query_slot`**：已完成。`ConfigBuilder::get_query_slot` 返回 `现在的估计时钟 + 1.5 s + oid*0.01 s`；它用 `Mcu::estimated_clock`——connect 时一次 `get_uptime` 加上主机时间外推的最小估计，不跟踪漂移、也没有 print time（那是运动层 C1 的事）。没有 `get_uptime` 的固件拿不到估计，`get_query_slot` 报 `McuError::Config`。
+- **`get_query_slot`**：已完成。`ConfigBuilder::get_query_slot` 返回 `现在的估计时钟 + 1.5 s + oid*0.01 s`；它用 `Mcu::estimated_clock`——connect 时一次 `get_uptime` 加上主机时间外推的最小估计，不跟踪漂移、也没有 print time。没有 `get_uptime` 的固件拿不到估计，`get_query_slot` 报 `McuError::Config`。
 - **固件复位（`config_reset` / `reset`）**：已完成。`firmware_restart` 且 `restart_method: command` 时，`reset` 在**拆机之前**由 `McuObject::before_firmware_restart` 在**活连接**上发出（上游把它放在 `klippy:firmware_restart` 事件里，`klippy/mcu.py:754`），所以重连后只需 identify + 配置一次，而不用先连上去告诉它重启。配置握手路径上，`config_reset` 就地清；只有 `reset` 的固件发 `reset` + 重连 + 重试握手；两者都没有才报错。
-- **`rpi_usb` 的两处连接期门控**：串口不在先上电、未配置先断电再配置（`klippy/mcu.py:692-700`），属重启循环（TODO D2）。
-- **CRC 不匹配时的进程重启**：仍属于重启循环（D2）。`McuConfig.restart_method` 已被读取：`McuObject::connect` 用它挑 `command` 的 `reset`，`McuConfig::open` 用它给 cheetah 定 RTS，物理分派在 `mcu/restart.rs`。
+- **`rpi_usb` 的连接期门控**：已完成。`restart::restart_before_bringup` 对应上游 `check_restart_on_attach` / `check_restart_on_send_config`（串口不在先上电、未配置先断电再配置），`check_usb_power` 在每次 connect 探测 hub 能否切电（不能则降级 `command`）。
+- **`restart_method` 分派**：已完成。`McuConfig.restart_method` 被三处读取：`McuObject::connect` 挑 `command` 的 `reset`、`McuConfig::open` 给 `cheetah` 定 RTS、物理分派在 `mcu/restart.rs`（`command` / `arduino` / `cheetah` / `rpi_usb`）。
 
 ---
 

@@ -32,7 +32,8 @@
 //! * `output` keys are free-form, printf-like strings with **no** leading name
 //!   — the firmware declares them as `_DECL_OUTPUT("mpu9240 fifo_max=%u")` —
 //!   so they are kept verbatim and are *not* registered with the parser.
-//!   Asynchronous output belongs to the event layer, which does not exist yet.
+//!   The event layer exists but only consumes `responses` (`sendf`) messages;
+//!   delivering `output()` messages is still open (see `event/mod.rs`).
 //!
 //! # Ranges
 //!

@@ -19,10 +19,10 @@
 
 use std::sync::Arc;
 
-use serde_json::{json, Value};
+use serde_json::json;
 
-use crate::core::klippy::api::protocol::{ApiError, Request};
-use crate::core::klippy::api::registry::{Endpoint, EndpointContext};
+use crate::core::klippy::api::protocol::Request;
+use crate::core::klippy::api::registry::{Endpoint, EndpointContext, EndpointFuture};
 use crate::core::klippy::api::{Api, ApiWiring, RegistrationError};
 use crate::core::klippy::printer::Printer;
 
@@ -51,12 +51,12 @@ impl Endpoint for ObjectsList {
         "objects/list"
     }
 
-    fn handle(
-        &self,
-        _request: &Request,
-        _context: &EndpointContext<'_>,
-    ) -> Result<Value, ApiError> {
-        Ok(json!({ "objects": self.printer.queryable_objects() }))
+    fn handle<'a>(
+        &'a self,
+        _request: &'a Request,
+        _context: &'a EndpointContext<'a>,
+    ) -> EndpointFuture<'a> {
+        Box::pin(async move { Ok(json!({ "objects": self.printer.queryable_objects() })) })
     }
 }
 
@@ -73,20 +73,21 @@ mod tests {
     use crate::core::klippy::reactor::ManualReactor;
     use serde_json::json;
 
-    #[test]
-    fn test_the_endpoint_path_is_the_documented_one() {
+    #[tokio::test]
+    async fn test_the_endpoint_path_is_the_documented_one() {
         let printer = Arc::new(Printer::new(ManualReactor::shared()));
         assert_eq!(ObjectsList::new(printer).path(), "objects/list");
     }
 
-    #[test]
-    fn test_a_printer_with_no_parts_lists_nothing() {
+    #[tokio::test]
+    async fn test_a_printer_with_no_parts_lists_nothing() {
         let printer = Arc::new(Printer::new(ManualReactor::shared()));
         let request = Request::parse(br#"{"method":"objects/list"}"#).unwrap();
         let api = Api::new();
 
         let response = ObjectsList::new(printer)
             .handle(&request, &context(&api, silent_target()))
+            .await
             .unwrap();
 
         // A host's list is never empty in practice: it registers the API
@@ -94,8 +95,8 @@ mod tests {
         assert_eq!(response, json!({ "objects": [] }));
     }
 
-    #[test]
-    fn test_the_list_is_in_registration_order() {
+    #[tokio::test]
+    async fn test_the_list_is_in_registration_order() {
         let printer = Arc::new(Printer::new(ManualReactor::shared()));
         for name in ["webhooks", "extruder", "heater_bed", "toolhead"] {
             printer
@@ -107,6 +108,7 @@ mod tests {
 
         let response = ObjectsList::new(printer)
             .handle(&request, &context(&api, silent_target()))
+            .await
             .unwrap();
 
         assert_eq!(
@@ -115,8 +117,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_the_endpoint_takes_no_parameters() {
+    #[tokio::test]
+    async fn test_the_endpoint_takes_no_parameters() {
         let printer = Arc::new(Printer::new(ManualReactor::shared()));
         // A client sending junk is not rejected: upstream's handler reads no
         // parameter, so there is nothing to validate.
@@ -125,11 +127,12 @@ mod tests {
 
         assert!(ObjectsList::new(printer)
             .handle(&request, &context(&api, silent_target()))
+            .await
             .is_ok());
     }
 
-    #[test]
-    fn test_a_registered_but_unqueryable_object_is_not_listed() {
+    #[tokio::test]
+    async fn test_a_registered_but_unqueryable_object_is_not_listed() {
         // `pins` is a printer object but has no status, so upstream's
         // `objects/list` leaves it out — the registry and the queryable set
         // differ.
@@ -145,13 +148,14 @@ mod tests {
 
         let response = ObjectsList::new(printer)
             .handle(&request, &context(&api, silent_target()))
+            .await
             .unwrap();
 
         assert_eq!(response, json!({ "objects": ["toolhead"] }));
     }
 
-    #[test]
-    fn test_the_registry_reaches_the_endpoint_by_path() {
+    #[tokio::test]
+    async fn test_the_registry_reaches_the_endpoint_by_path() {
         let printer = Arc::new(Printer::new(ManualReactor::shared()));
         printer
             .add_object("extruder", Arc::new(FixedStatus(json!({}))))
@@ -161,7 +165,7 @@ mod tests {
         let request = Request::parse(br#"{"method":"objects/list"}"#).unwrap();
 
         assert_eq!(
-            api.dispatch(&request, silent_target()).unwrap(),
+            api.dispatch(&request, silent_target()).await.unwrap(),
             json!({"objects": ["extruder"]})
         );
     }

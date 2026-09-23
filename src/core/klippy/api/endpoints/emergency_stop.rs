@@ -19,10 +19,10 @@
 
 use std::sync::Arc;
 
-use serde_json::{json, Value};
+use serde_json::json;
 
-use crate::core::klippy::api::protocol::{ApiError, Request};
-use crate::core::klippy::api::registry::{Endpoint, EndpointContext};
+use crate::core::klippy::api::protocol::Request;
+use crate::core::klippy::api::registry::{Endpoint, EndpointContext, EndpointFuture};
 use crate::core::klippy::api::{Api, ApiWiring, RegistrationError};
 use crate::core::klippy::printer::Printer;
 
@@ -51,16 +51,18 @@ impl Endpoint for EmergencyStop {
         "emergency_stop"
     }
 
-    fn handle(
-        &self,
-        _request: &Request,
-        _context: &EndpointContext<'_>,
-    ) -> Result<Value, ApiError> {
-        // Upstream's exact wording: it is what a client that only sees the log
-        // greps for, and what `info`'s `state_message` then reports.
-        self.printer
-            .invoke_shutdown("Shutdown due to webhooks request");
-        Ok(json!({}))
+    fn handle<'a>(
+        &'a self,
+        _request: &'a Request,
+        _context: &'a EndpointContext<'a>,
+    ) -> EndpointFuture<'a> {
+        Box::pin(async move {
+            // Upstream's exact wording: it is what a client that only sees the log
+            // greps for, and what `info`'s `state_message` then reports.
+            self.printer
+                .invoke_shutdown("Shutdown due to webhooks request");
+            Ok(json!({}))
+        })
     }
 }
 
@@ -79,8 +81,8 @@ mod tests {
         Request::parse(br#"{"id":1,"method":"emergency_stop"}"#).expect("a valid request")
     }
 
-    #[test]
-    fn test_the_request_halts_the_printer_and_answers_ok() {
+    #[tokio::test]
+    async fn test_the_request_halts_the_printer_and_answers_ok() {
         let printer = Arc::new(Printer::new(ManualReactor::shared()));
         let api = Api::new();
         let endpoint = EmergencyStop::new(Arc::clone(&printer));
@@ -89,7 +91,7 @@ mod tests {
             client: silent_target(),
         };
 
-        let reply = endpoint.handle(&request(), &context).unwrap();
+        let reply = endpoint.handle(&request(), &context).await.unwrap();
 
         assert_eq!(reply, json!({}));
         let state = printer.get_state_message();

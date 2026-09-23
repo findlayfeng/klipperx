@@ -199,7 +199,7 @@ impl PrinterObject for WebhooksStatus {
 mod tests {
     use super::*;
     use crate::core::klippy::api::protocol::{PushTarget, Request};
-    use crate::core::klippy::api::registry::EndpointContext;
+    use crate::core::klippy::api::registry::{EndpointContext, EndpointFuture};
     use crate::core::klippy::api::test_support::RecordingTarget;
     use crate::core::klippy::reactor::ManualReactor;
 
@@ -207,12 +207,12 @@ mod tests {
     struct Echo(&'static str);
 
     impl MuxEndpoint for Echo {
-        fn handle(
-            &self,
-            _request: &Request,
-            _context: &EndpointContext<'_>,
-        ) -> Result<Value, ApiError> {
-            Ok(json!(self.0))
+        fn handle<'a>(
+            &'a self,
+            _request: &'a Request,
+            _context: &'a EndpointContext<'a>,
+        ) -> EndpointFuture<'a> {
+            Box::pin(async move { Ok(json!(self.0)) })
         }
     }
 
@@ -220,13 +220,13 @@ mod tests {
         WebhooksStatus::new(Arc::new(Printer::new(ManualReactor::shared())))
     }
 
-    #[test]
-    fn test_the_object_name_is_the_documented_one() {
+    #[tokio::test]
+    async fn test_the_object_name_is_the_documented_one() {
         assert_eq!(WEBHOOKS_OBJECT, "webhooks");
     }
 
-    #[test]
-    fn test_the_object_reports_the_printers_state() {
+    #[tokio::test]
+    async fn test_the_object_reports_the_printers_state() {
         let printer = Arc::new(Printer::new(ManualReactor::shared()));
         let status = WebhooksStatus::new(Arc::clone(&printer));
 
@@ -243,8 +243,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_mux_instances_share_a_path_and_a_key() {
+    #[tokio::test]
+    async fn test_mux_instances_share_a_path_and_a_key() {
         let object = status();
         object
             .register_mux_endpoint(
@@ -269,8 +269,8 @@ mod tests {
         assert_eq!(object.take_mux_endpoints().len(), 3);
     }
 
-    #[test]
-    fn test_a_mux_path_may_have_only_one_key() {
+    #[tokio::test]
+    async fn test_a_mux_path_may_have_only_one_key() {
         let object = status();
         object
             .register_mux_endpoint("path", "sensor", Some("one"), Arc::new(Echo("a")))
@@ -286,8 +286,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_a_mux_instance_cannot_be_registered_twice() {
+    #[tokio::test]
+    async fn test_a_mux_instance_cannot_be_registered_twice() {
         let object = status();
         object
             .register_mux_endpoint("path", "sensor", Some("one"), Arc::new(Echo("a")))
@@ -303,8 +303,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_a_remote_method_needs_a_registered_connection() {
+    #[tokio::test]
+    async fn test_a_remote_method_needs_a_registered_connection() {
         let object = status();
         assert_eq!(
             object.call_remote_method("notify", json!({})).unwrap_err(),
@@ -312,8 +312,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_a_called_remote_method_reaches_its_connection() {
+    #[tokio::test]
+    async fn test_a_called_remote_method_reaches_its_connection() {
         let object = status();
         let api = Arc::new(Api::new());
         let recording = RecordingTarget::new();

@@ -685,31 +685,6 @@ impl GCodeDispatch {
             .block_on(self.run_script_from_command(script))
     }
 
-    /// Run a script from a synchronous caller.
-    ///
-    /// **Temporary.** The `klippy-api` [`Endpoint`] trait is still synchronous,
-    /// so `gcode/script` cannot `.await` this yet; it uses the same
-    /// `block_in_place` bridge the handlers used before. Once the endpoint trait
-    /// is async this goes away, and no new caller should use it.
-    ///
-    /// [`Endpoint`]: https://docs.rs/klippy-api
-    pub fn run_script_blocking(&self, script: &str) -> Result<(), CommandError> {
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
-                tokio::task::block_in_place(|| handle.block_on(self.run_script(script)))
-            }
-            Ok(_) => Err(CommandError::new(
-                "run_script_blocking needs the multi-threaded runtime",
-            )),
-            // A synchronous caller with no runtime (a test): give it one.
-            Err(_) => tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|err| CommandError::new(err.to_string()))?
-                .block_on(self.run_script(script)),
-        }
-    }
-
     /// Build a command for a handler to run, without parsing a line.
     ///
     /// Upstream's `create_gcode_command` (`klippy/gcode.py:244-245`): used by

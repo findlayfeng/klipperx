@@ -56,8 +56,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use serde_json::{json, Map, Value};
 
 use super::objects_query::{select_fields, status_object, ObjectsQueryParams};
-use crate::core::klippy::api::protocol::{ApiError, PushTarget, Request, ResponseTemplate};
-use crate::core::klippy::api::registry::{Endpoint, EndpointContext};
+use crate::core::klippy::api::protocol::{PushTarget, Request, ResponseTemplate};
+use crate::core::klippy::api::registry::{Endpoint, EndpointContext, EndpointFuture};
 use crate::core::klippy::api::{Api, ApiWiring, RegistrationError};
 use crate::core::klippy::printer::Printer;
 use crate::core::klippy::reactor::{Reactor, TimerHandle};
@@ -178,15 +178,21 @@ impl Endpoint for ObjectsSubscribe {
         "objects/subscribe"
     }
 
-    fn handle(&self, request: &Request, context: &EndpointContext<'_>) -> Result<Value, ApiError> {
-        let params = ObjectsQueryParams::from_request(request)?;
-        let template = ResponseTemplate::from_params(&request.params())?;
+    fn handle<'a>(
+        &'a self,
+        request: &'a Request,
+        context: &'a EndpointContext<'a>,
+    ) -> EndpointFuture<'a> {
+        Box::pin(async move {
+            let params = ObjectsQueryParams::from_request(request)?;
+            let template = ResponseTemplate::from_params(&request.params())?;
 
-        let (reply, fields, last) = snapshot(&self.inner.printer, &params);
-        self.subscribe(context.client.clone(), fields, last, template);
-        self.ensure_timer();
+            let (reply, fields, last) = snapshot(&self.inner.printer, &params);
+            self.subscribe(context.client.clone(), fields, last, template);
+            self.ensure_timer();
 
-        Ok(reply)
+            Ok(reply)
+        })
     }
 }
 
@@ -346,6 +352,7 @@ fn snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::klippy::api::protocol::ApiError;
     use crate::core::klippy::api::registry::Api;
     use crate::core::klippy::api::test_support::{context, MutableStatus, RecordingTarget};
     use crate::core::klippy::reactor::ManualReactor;
@@ -370,7 +377,7 @@ mod tests {
     }
 
     /// Subscribe `objects` on `target` and return the immediate reply.
-    fn subscribe(
+    async fn subscribe(
         endpoint: &ObjectsSubscribe,
         api: &Api,
         target: Arc<RecordingTarget>,
@@ -379,6 +386,7 @@ mod tests {
         let body = format!(r#"{{"method":"objects/subscribe","params":{{"objects":{objects}}}}}"#);
         endpoint
             .handle(&request(&body), &context(api, target))
+            .await
             .unwrap()
     }
 
@@ -387,14 +395,14 @@ mod tests {
         target.pushes()[0]["params"]["status"].clone()
     }
 
-    #[test]
-    fn test_the_endpoint_path_is_the_documented_one() {
+    #[tokio::test]
+    async fn test_the_endpoint_path_is_the_documented_one() {
         let (endpoint, _reactor, _toolhead) = endpoint();
         assert_eq!(endpoint.path(), "objects/subscribe");
     }
 
-    #[test]
-    fn test_the_request_is_answered_with_a_full_snapshot() {
+    #[tokio::test]
+    async fn test_the_request_is_answered_with_a_full_snapshot() {
         let (endpoint, _reactor, _toolhead) = endpoint();
         let api = Api::new();
         let target = RecordingTarget::new();
@@ -404,7 +412,8 @@ mod tests {
             &api,
             target.clone(),
             r#"{"toolhead":["position","max_velocity"]}"#,
-        );
+        )
+        .await;
 
         assert_eq!(
             reply["status"]["toolhead"],
@@ -415,8 +424,8 @@ mod tests {
         assert!(target.pushes().is_empty());
     }
 
-    #[test]
-    fn test_a_change_is_pushed_after_a_period() {
+    #[tokio::test]
+    async fn test_a_change_is_pushed_after_a_period() {
         let (endpoint, reactor, toolhead) = endpoint();
         let api = Api::new();
         let target = RecordingTarget::new();
@@ -425,7 +434,8 @@ mod tests {
             &api,
             target.clone(),
             r#"{"toolhead":["position"]}"#,
-        );
+        )
+        .await;
 
         toolhead.set(json!({
             "position": [21.0, 30.0, 5.0, 0.0],
@@ -444,8 +454,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_only_changed_fields_are_pushed() {
+    #[tokio::test]
+    async fn test_only_changed_fields_are_pushed() {
         let (endpoint, reactor, toolhead) = endpoint();
         let api = Api::new();
         let target = RecordingTarget::new();
@@ -454,7 +464,8 @@ mod tests {
             &api,
             target.clone(),
             r#"{"toolhead":["position","max_velocity"]}"#,
-        );
+        )
+        .await;
 
         toolhead.set(json!({
             "position": [1.0, 2.0, 3.0, 4.0],
@@ -468,8 +479,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_an_unchanged_tick_pushes_nothing() {
+    #[tokio::test]
+    async fn test_an_unchanged_tick_pushes_nothing() {
         let (endpoint, reactor, _toolhead) = endpoint();
         let api = Api::new();
         let target = RecordingTarget::new();
@@ -478,7 +489,8 @@ mod tests {
             &api,
             target.clone(),
             r#"{"toolhead":["position"]}"#,
-        );
+        )
+        .await;
 
         reactor.advance(SUBSCRIPTION_REFRESH_TIME);
         reactor.advance(SUBSCRIPTION_REFRESH_TIME);
@@ -486,14 +498,15 @@ mod tests {
         assert!(target.pushes().is_empty());
     }
 
-    #[test]
-    fn test_the_response_template_wraps_every_push() {
+    #[tokio::test]
+    async fn test_the_response_template_wraps_every_push() {
         let (endpoint, reactor, toolhead) = endpoint();
         let api = Api::new();
         let target = RecordingTarget::new();
         let body = r#"{"method":"objects/subscribe","params":{"objects":{"toolhead":["position"]},"response_template":{"method":"printer:status","id":null}}}"#;
         endpoint
             .handle(&request(body), &context(&api, target.clone()))
+            .await
             .unwrap();
 
         toolhead.set(json!({"position": [1.0, 2.0, 3.0, 4.0], "max_velocity": 300.0}));
@@ -504,12 +517,12 @@ mod tests {
         assert!(target.pushes()[0]["params"]["status"].is_object());
     }
 
-    #[test]
-    fn test_a_null_field_list_tracks_the_fields_that_are_there() {
+    #[tokio::test]
+    async fn test_a_null_field_list_tracks_the_fields_that_are_there() {
         let (endpoint, reactor, toolhead) = endpoint();
         let api = Api::new();
         let target = RecordingTarget::new();
-        subscribe(&endpoint, &api, target.clone(), r#"{"toolhead":null}"#);
+        subscribe(&endpoint, &api, target.clone(), r#"{"toolhead":null}"#).await;
 
         toolhead.set(json!({
             "position": [9.0, 9.0, 9.0, 9.0],
@@ -524,12 +537,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_a_field_that_appears_is_pushed_and_one_that_stays_absent_is_not() {
+    #[tokio::test]
+    async fn test_a_field_that_appears_is_pushed_and_one_that_stays_absent_is_not() {
         let (endpoint, reactor, toolhead) = endpoint();
         let api = Api::new();
         let target = RecordingTarget::new();
-        subscribe(&endpoint, &api, target.clone(), r#"{"toolhead":["nope"]}"#);
+        subscribe(&endpoint, &api, target.clone(), r#"{"toolhead":["nope"]}"#).await;
 
         // Still absent: `null` to `null` is not a change.
         reactor.advance(SUBSCRIPTION_REFRESH_TIME);
@@ -541,21 +554,21 @@ mod tests {
         assert_eq!(pushed_status(&target)["toolhead"], json!({"nope": 5}));
     }
 
-    #[test]
-    fn test_an_unknown_object_answers_empty_and_pushes_nothing() {
+    #[tokio::test]
+    async fn test_an_unknown_object_answers_empty_and_pushes_nothing() {
         let (endpoint, reactor, _toolhead) = endpoint();
         let api = Api::new();
         let target = RecordingTarget::new();
 
-        let reply = subscribe(&endpoint, &api, target.clone(), r#"{"nope":["a"]}"#);
+        let reply = subscribe(&endpoint, &api, target.clone(), r#"{"nope":["a"]}"#).await;
         assert_eq!(reply["status"]["nope"], json!({"a": null}));
 
         reactor.advance(SUBSCRIPTION_REFRESH_TIME);
         assert!(target.pushes().is_empty());
     }
 
-    #[test]
-    fn test_a_closed_connection_is_dropped_and_the_timer_retires() {
+    #[tokio::test]
+    async fn test_a_closed_connection_is_dropped_and_the_timer_retires() {
         let (endpoint, reactor, toolhead) = endpoint();
         let api = Api::new();
         let target = RecordingTarget::new();
@@ -564,7 +577,8 @@ mod tests {
             &api,
             target.clone(),
             r#"{"toolhead":["position"]}"#,
-        );
+        )
+        .await;
 
         target.close();
         toolhead.set(json!({"position": [1.0, 2.0, 3.0, 4.0]}));
@@ -574,8 +588,8 @@ mod tests {
         assert_eq!(reactor.advance(SUBSCRIPTION_REFRESH_TIME), 0);
     }
 
-    #[test]
-    fn test_re_subscribing_replaces_the_subscription() {
+    #[tokio::test]
+    async fn test_re_subscribing_replaces_the_subscription() {
         let (endpoint, reactor, toolhead) = endpoint();
         let api = Api::new();
         let target = RecordingTarget::new();
@@ -584,13 +598,15 @@ mod tests {
             &api,
             target.clone(),
             r#"{"toolhead":["position"]}"#,
-        );
+        )
+        .await;
         subscribe(
             &endpoint,
             &api,
             target.clone(),
             r#"{"toolhead":["max_velocity"]}"#,
-        );
+        )
+        .await;
 
         toolhead.set(json!({
             "position": [1.0, 2.0, 3.0, 4.0],
@@ -606,8 +622,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_one_timer_serves_every_subscriber() {
+    #[tokio::test]
+    async fn test_one_timer_serves_every_subscriber() {
         let (endpoint, reactor, toolhead) = endpoint();
         let api = Api::new();
         let first = RecordingTarget::new();
@@ -617,13 +633,15 @@ mod tests {
             &api,
             first.clone(),
             r#"{"toolhead":["position"]}"#,
-        );
+        )
+        .await;
         subscribe(
             &endpoint,
             &api,
             second.clone(),
             r#"{"toolhead":["position"]}"#,
-        );
+        )
+        .await;
 
         toolhead.set(json!({"position": [1.0, 2.0, 3.0, 4.0]}));
         // A single tick, shared by both.
@@ -633,8 +651,8 @@ mod tests {
         assert_eq!(second.pushes().len(), 1);
     }
 
-    #[test]
-    fn test_the_registry_reaches_the_endpoint_by_path() {
+    #[tokio::test]
+    async fn test_the_registry_reaches_the_endpoint_by_path() {
         let (endpoint, reactor, toolhead) = endpoint();
         let mut api = Api::new();
         api.register(endpoint).unwrap();
@@ -642,7 +660,7 @@ mod tests {
         let body =
             r#"{"method":"objects/subscribe","params":{"objects":{"toolhead":["position"]}}}"#;
 
-        let reply = api.dispatch(&request(body), target.clone()).unwrap();
+        let reply = api.dispatch(&request(body), target.clone()).await.unwrap();
 
         assert!(reply["status"]["toolhead"].is_object());
         toolhead.set(json!({"position": [1.0, 2.0, 3.0, 4.0]}));
@@ -650,8 +668,8 @@ mod tests {
         assert_eq!(target.pushes().len(), 1);
     }
 
-    #[test]
-    fn test_objects_is_required_and_validated_like_a_query() {
+    #[tokio::test]
+    async fn test_objects_is_required_and_validated_like_a_query() {
         let (endpoint, _reactor, _toolhead) = endpoint();
         let api = Api::new();
         let target = RecordingTarget::new();
@@ -676,13 +694,14 @@ mod tests {
         ] {
             let error = endpoint
                 .handle(&request(body), &context(&api, target.clone()))
+                .await
                 .unwrap_err();
             assert_eq!(error, expected, "{body}");
         }
     }
 
-    #[test]
-    fn test_a_response_template_that_is_not_an_object_is_rejected() {
+    #[tokio::test]
+    async fn test_a_response_template_that_is_not_an_object_is_rejected() {
         let (endpoint, _reactor, _toolhead) = endpoint();
         let api = Api::new();
         let target = RecordingTarget::new();
@@ -690,6 +709,7 @@ mod tests {
 
         let error = endpoint
             .handle(&request(body), &context(&api, target))
+            .await
             .unwrap_err();
 
         assert_eq!(

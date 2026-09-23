@@ -62,8 +62,8 @@ pub use webhooks::{WebhooksStatus, WEBHOOKS_OBJECT};
 // crate's stays reachable as [`registry::RegistrationError`].
 pub use klippy_api::{address, protocol, registry, server};
 pub use klippy_api::{
-    AddressError, Api, ApiTarget, ClientConnection, Endpoint, EndpointContext, MuxEndpoint, Server,
-    Transport, TransportError,
+    AddressError, Api, ApiTarget, ClientConnection, Endpoint, EndpointContext, EndpointFuture,
+    MuxEndpoint, Server, Transport, TransportError,
 };
 
 // ===========================================================================
@@ -193,8 +193,8 @@ mod tests {
         StartArgs::collect("/tmp/printer.cfg", None)
     }
 
-    #[test]
-    fn test_registering_installs_the_servers_object_and_its_endpoints() {
+    #[tokio::test]
+    async fn test_registering_installs_the_servers_object_and_its_endpoints() {
         let printer = Arc::new(Printer::new(ManualReactor::shared()));
         let mut api = Api::new();
 
@@ -221,35 +221,35 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_a_client_can_reach_info_through_the_registry() {
+    #[tokio::test]
+    async fn test_a_client_can_reach_info_through_the_registry() {
         let printer = Arc::new(Printer::new(ManualReactor::shared()));
         let mut api = Api::new();
         register(&mut api, &printer, start_args()).unwrap();
 
         let response = api
             .dispatch(&request(r#"{"method":"info"}"#), silent_target())
+            .await
             .unwrap();
 
         assert_eq!(response["state"], "startup");
         assert_eq!(response["config_file"], "/tmp/printer.cfg");
     }
 
-    #[test]
-    fn test_a_mux_endpoint_registered_on_webhooks_reaches_the_table() {
+    #[tokio::test]
+    async fn test_a_mux_endpoint_registered_on_webhooks_reaches_the_table() {
         // The core integration: an extras module registers a mux endpoint on the
         // `webhooks` object while the config is read, and `register` installs it
         // into the API table afterwards.
         struct Dump(&'static str);
 
         impl crate::core::klippy::api::registry::MuxEndpoint for Dump {
-            fn handle(
-                &self,
-                _request: &klippy_api::Request,
-                _context: &EndpointContext<'_>,
-            ) -> Result<serde_json::Value, crate::core::klippy::api::protocol::ApiError>
-            {
-                Ok(json!({"instance": self.0}))
+            fn handle<'a>(
+                &'a self,
+                _request: &'a klippy_api::Request,
+                _context: &'a EndpointContext<'a>,
+            ) -> EndpointFuture<'a> {
+                Box::pin(async move { Ok(json!({"instance": self.0})) })
             }
         }
 
@@ -283,6 +283,7 @@ mod tests {
                 ),
                 silent_target(),
             )
+            .await
             .unwrap();
 
         assert_eq!(response, json!({"instance": "second"}));
@@ -291,8 +292,8 @@ mod tests {
             .contains(&"adxl345/dump_adxl345".to_string()));
     }
 
-    #[test]
-    fn test_a_client_can_follow_the_state_through_the_registered_object() {
+    #[tokio::test]
+    async fn test_a_client_can_follow_the_state_through_the_registered_object() {
         let printer = Arc::new(Printer::new(ManualReactor::shared()));
         let mut api = Api::new();
         register(&mut api, &printer, start_args()).unwrap();
@@ -302,6 +303,7 @@ mod tests {
                 &request(r#"{"method":"objects/query","params":{"objects":{"webhooks":null}}}"#),
                 silent_target(),
             )
+            .await
             .unwrap();
         assert_eq!(
             response["status"]["webhooks"],
@@ -315,6 +317,7 @@ mod tests {
                 &request(r#"{"method":"objects/query","params":{"objects":{"webhooks":null}}}"#),
                 silent_target(),
             )
+            .await
             .unwrap();
         assert_eq!(
             response["status"]["webhooks"],
@@ -322,8 +325,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_registering_twice_is_a_wiring_mistake_not_a_client_error() {
+    #[tokio::test]
+    async fn test_registering_twice_is_a_wiring_mistake_not_a_client_error() {
         let printer = Arc::new(Printer::new(ManualReactor::shared()));
         let mut api = Api::new();
         register(&mut api, &printer, start_args()).unwrap();

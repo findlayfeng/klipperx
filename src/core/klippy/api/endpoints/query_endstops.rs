@@ -20,7 +20,7 @@ use std::sync::Arc;
 use serde_json::{Map, Value};
 
 use crate::core::klippy::api::protocol::{ApiError, Request};
-use crate::core::klippy::api::registry::{Endpoint, EndpointContext};
+use crate::core::klippy::api::registry::{Endpoint, EndpointContext, EndpointFuture};
 use crate::core::klippy::api::{Api, ApiWiring, RegistrationError};
 use crate::core::klippy::extras::query_endstops::{
     query_print_time, QueryEndstops, QUERY_ENDSTOPS_OBJECT,
@@ -52,26 +52,29 @@ impl Endpoint for QueryEndstopsStatus {
         "query_endstops/status"
     }
 
-    fn handle(
-        &self,
-        _request: &Request,
-        _context: &EndpointContext<'_>,
-    ) -> Result<Value, ApiError> {
-        let query = self
-            .printer
-            .lookup_object_as::<QueryEndstops>(QUERY_ENDSTOPS_OBJECT)
-            .ok_or_else(|| ApiError::Internal("query_endstops is not available".to_string()))?;
-        let state = query
-            .query_all_blocking(query_print_time(&self.printer))
-            .map_err(|err| ApiError::Internal(err.to_string()))?;
-        let mut map = Map::with_capacity(state.len());
-        for (name, triggered) in state {
-            map.insert(
-                name,
-                Value::String(if triggered { "TRIGGERED" } else { "open" }.to_string()),
-            );
-        }
-        Ok(Value::Object(map))
+    fn handle<'a>(
+        &'a self,
+        _request: &'a Request,
+        _context: &'a EndpointContext<'a>,
+    ) -> EndpointFuture<'a> {
+        Box::pin(async move {
+            let query = self
+                .printer
+                .lookup_object_as::<QueryEndstops>(QUERY_ENDSTOPS_OBJECT)
+                .ok_or_else(|| ApiError::Internal("query_endstops is not available".to_string()))?;
+            let state = query
+                .query_all(query_print_time(&self.printer))
+                .await
+                .map_err(|err| ApiError::Internal(err.to_string()))?;
+            let mut map = Map::with_capacity(state.len());
+            for (name, triggered) in state {
+                map.insert(
+                    name,
+                    Value::String(if triggered { "TRIGGERED" } else { "open" }.to_string()),
+                );
+            }
+            Ok(Value::Object(map))
+        })
     }
 }
 
@@ -117,13 +120,13 @@ mod tests {
             client: silent_target(),
         };
 
-        let value = endpoint.handle(&request(), &context).unwrap();
+        let value = endpoint.handle(&request(), &context).await.unwrap();
 
         assert_eq!(value, serde_json::json!({}));
     }
 
-    #[test]
-    fn test_the_path_is_the_upstream_one() {
+    #[tokio::test]
+    async fn test_the_path_is_the_upstream_one() {
         let printer = Arc::new(Printer::new(ManualReactor::shared()));
         let endpoint = QueryEndstopsStatus::new(printer);
         assert_eq!(endpoint.path(), "query_endstops/status");

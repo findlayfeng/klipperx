@@ -292,7 +292,7 @@ pub async fn serve(connection: Arc<ClientConnection>, stream: Box<dyn Transport>
                 // anything still queued for it.
                 Ok(0) | Err(_) => break,
                 Ok(count) => {
-                    connection.receive(&buf[..count]);
+                    connection.receive(&buf[..count]).await;
                 }
             },
             () = &mut notified => {}
@@ -352,10 +352,10 @@ impl ClientConnection {
     /// Requests without an `id` are dispatched but answered with silence, which
     /// is [`Request::respond`]'s decision, not this one's.
     ///
-    /// Synchronous on purpose: everything here is a short critical section that
-    /// never waits on the socket, so the caller can invoke it straight from the
-    /// connection task without risking a lock held across an `await`.
-    pub fn receive(self: &Arc<Self>, chunk: &[u8]) -> usize {
+    /// Async because a handler may await (`gcode/script` runs homing): the
+    /// framing lock is released before the first `.await`, and `queue` only
+    /// takes a short lock, so nothing is held across a suspension point.
+    pub async fn receive(self: &Arc<Self>, chunk: &[u8]) -> usize {
         let bodies = self
             .framing
             .lock()
@@ -376,7 +376,7 @@ impl ClientConnection {
             // The handler gets the connection as a `PushTarget`, so an endpoint
             // that subscribes can hold on to it and keep pushing later.
             let client: Arc<dyn PushTarget> = self.clone();
-            let outcome = self.api.dispatch(&request, client);
+            let outcome = self.api.dispatch(&request, client).await;
             if let Some(response) = request.respond(outcome) {
                 self.queue(&response);
             }
@@ -496,6 +496,7 @@ fn report_malformed(error: &MalformedRequest, body: &[u8]) {
 mod tests {
     use super::*;
     use crate::protocol::{ApiError, DELIMITER};
+    use crate::registry::EndpointFuture;
     use crate::registry::{Endpoint, EndpointContext};
     use serde_json::json;
     use std::io::Write as _;
@@ -509,6 +510,15 @@ mod tests {
     // Test doubles
     // -----------------------------------------------------------------------
 
+    /// Block on a future on a fresh current-thread runtime (tests are sync).
+    fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a current-thread runtime")
+            .block_on(fut)
+    }
+
     /// An endpoint that echoes what it was asked, for round-trip tests.
     struct Echo;
 
@@ -517,12 +527,12 @@ mod tests {
             "echo"
         }
 
-        fn handle(
-            &self,
-            request: &Request,
-            _context: &EndpointContext<'_>,
-        ) -> Result<Value, ApiError> {
-            Ok(json!({ "method": request.method() }))
+        fn handle<'a>(
+            &'a self,
+            request: &'a Request,
+            _context: &'a EndpointContext<'a>,
+        ) -> EndpointFuture<'a> {
+            Box::pin(async move { Ok(json!({ "method": request.method() })) })
         }
     }
 
@@ -534,12 +544,12 @@ mod tests {
             "failing"
         }
 
-        fn handle(
-            &self,
-            _request: &Request,
-            _context: &EndpointContext<'_>,
-        ) -> Result<Value, ApiError> {
-            Err(ApiError::Internal("boom".to_string()))
+        fn handle<'a>(
+            &'a self,
+            _request: &'a Request,
+            _context: &'a EndpointContext<'a>,
+        ) -> EndpointFuture<'a> {
+            Box::pin(async move { Err(ApiError::Internal("boom".to_string())) })
         }
     }
 
@@ -555,21 +565,23 @@ mod tests {
             "push_later"
         }
 
-        fn handle(
-            &self,
-            _request: &Request,
-            context: &EndpointContext<'_>,
-        ) -> Result<Value, ApiError> {
-            let client = Arc::clone(&context.client);
-            let delay = self.0;
-            tokio::spawn(async move {
-                tokio::time::sleep(delay).await;
-                client.push(json!({
-                    "method": "printer:status",
-                    "params": {"pushed": true}
-                }));
-            });
-            Ok(json!({ "registered": true }))
+        fn handle<'a>(
+            &'a self,
+            _request: &'a Request,
+            context: &'a EndpointContext<'a>,
+        ) -> EndpointFuture<'a> {
+            Box::pin(async move {
+                let client = Arc::clone(&context.client);
+                let delay = self.0;
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    client.push(json!({
+                        "method": "printer:status",
+                        "params": {"pushed": true}
+                    }));
+                });
+                Ok(json!({ "registered": true }))
+            })
         }
     }
 
@@ -872,7 +884,10 @@ mod tests {
     #[test]
     fn test_a_request_produces_a_reply() {
         let connection = ClientConnection::new(api());
-        assert_eq!(connection.receive(b"{\"id\":1,\"method\":\"echo\"}\x03"), 0);
+        assert_eq!(
+            block_on(connection.receive(b"{\"id\":1,\"method\":\"echo\"}\x03")),
+            0
+        );
 
         let bytes = connection.take_outbox();
         assert_eq!(bytes.last(), Some(&DELIMITER));
@@ -893,12 +908,15 @@ mod tests {
     #[test]
     fn test_no_id_means_no_reply_and_a_bad_body_means_no_crash() {
         let connection = ClientConnection::new(api());
-        assert_eq!(connection.receive(b"{\"method\":\"echo\"}\x03"), 0);
+        assert_eq!(
+            block_on(connection.receive(b"{\"method\":\"echo\"}\x03")),
+            0
+        );
         assert!(!connection.has_pending_output());
 
         // A malformed body is counted and skipped; the connection lives on.
         assert_eq!(
-            connection.receive(b"not json\x03{\"id\":1,\"method\":\"echo\"}\x03"),
+            block_on(connection.receive(b"not json\x03{\"id\":1,\"method\":\"echo\"}\x03")),
             1
         );
         assert_eq!(
@@ -943,14 +961,18 @@ mod tests {
     #[tokio::test]
     async fn test_a_closed_connection_takes_no_more_output() {
         let connection = ClientConnection::new(api());
-        connection.receive(b"{\"id\":1,\"method\":\"echo\"}\x03");
+        connection
+            .receive(b"{\"id\":1,\"method\":\"echo\"}\x03")
+            .await;
         assert!(!connection.take_outbox().is_empty());
 
         connection.close();
         assert!(connection.is_closed());
         // Replies and pushes are both dropped once the client is gone, so a
         // subscription cannot resurrect a closed connection.
-        connection.receive(b"{\"id\":2,\"method\":\"echo\"}\x03");
+        connection
+            .receive(b"{\"id\":2,\"method\":\"echo\"}\x03")
+            .await;
         connection.push(json!({"method": "printer:status"}));
         assert!(!connection.has_pending_output());
     }

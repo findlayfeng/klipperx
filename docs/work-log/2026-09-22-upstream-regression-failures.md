@@ -1,7 +1,9 @@
 # 上游回归测试失败原因分析
 
 > **来源**：从 `docs/klippy/developer-manual/regression-tests.md` 的「忽略列表 → 失败原因分析」、
-> `TODO.md` 的「当前失败原因统计」与 `KLIPPERX_UPSTREAM_ALL=1` 的实跑结果整理去重。
+> `TODO.md` 的「当前失败原因统计」与 `KLIPPERX_UPSTREAM_ALL=1` 的实跑结果整理去重；手册侧的
+> 「失败原因分析 / 运动学细分 / 完整失败日志」三节已删除，**本文件是这三项内容的唯一权威**
+> （运动学细分的文件列与尾注已移入本文件，按下方日志校正）。
 >
 > **运行方式**：`KLIPPERX_UPSTREAM_ALL=1 cargo test -p klipperx --lib upstream_test_cases_run`
 >
@@ -42,16 +44,23 @@ T6 由两类错误组成：
 | `Unknown pin chip name 'tmc2130_stepper_x'` | 3 |
 | `Section 'tmc5160 stepper_x'` / `tmc2130 stepper_x` / `tmc2660 stepper_x` 段未实现 | 2 / 2 / 1 |
 
-T5 按 `[printer] kinematics` 取值细分（`cartesian` / `none` 已实现）：
+T5 按 `[printer] kinematics` 取值细分（`cartesian` / `none` 已实现）。文件列由下方
+[完整失败日志](#完整失败日志) 逐条统计得出（自手册的「运动学细分」移入时已校正，见表后注）：
 
-| `kinematics` | 条数 |
-|--------------|------|
-| `delta` | 13 |
-| `corexy` | 11 |
-| `generic_cartesian` | 4 |
-| `rotary_delta` | 2 |
-| `hybrid_corexy` | 2 |
-| `polar` / `corexz` / `hybrid_corexz` / `deltesian` / `winch` | 各 1 |
+| `kinematics` | `.test`（条数） | 条数 |
+|--------------|----------------|------|
+| `delta` | `delta.test` 1、`delta_calibrate.test` 1、`printers.test` 11 | 13 |
+| `corexy` | `printers.test` 11 | 11 |
+| `generic_cartesian` | `corexyuv.test`、`generic_cartesian.test`、`generic_cartesian_iqex.test`、`generic_cartesian_itex.test` 各 1 | 4 |
+| `rotary_delta` | `rotary_delta_calibrate.test`、`printers.test` 各 1 | 2 |
+| `hybrid_corexy` | `hybrid_corexy_dual_carriage.test`、`printers.test` 各 1 | 2 |
+| `polar` | `polar.test` 1 | 1 |
+| `corexz` / `hybrid_corexz` / `deltesian` / `winch` | `printers.test` 各 1 | 各 1 |
+
+（`none` 已在 T1 通过，不再出现；`led`、`manual_stepper`、`pwm` 三个文件的失败原因是同名段 /
+`pwm_cycle_time` 段未实现，归入 T9「其余单实例」。两处与原手册表不一致、以日志为准：
+`corexyuv.test` 用的是 `kinematics: generic_cartesian`，不计入 corexy；`printers.test` 贡献的
+`delta` 是 11 条而非 7 条。）
 
 ---
 

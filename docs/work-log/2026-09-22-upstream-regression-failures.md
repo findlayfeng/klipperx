@@ -472,5 +472,4 @@ z_virtual_endstop.test (test/klippy/z_virtual_endstop.cfg): test/klippy/z_virtua
 ---
 
 - [← work-log 首页](README.md)
-- [上游功能覆盖审计 →](2026-09-21-upstream-coverage-audit.md)
 - [已完成条目归档 →](2026-09-22-completed-archive.md)

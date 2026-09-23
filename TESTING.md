@@ -39,14 +39,16 @@ cargo run --bin klipperx -- stress <config.cfg> mcu --task motion
 - **步骤**：`SET_KINEMATIC_POSITION` 标定 → `G1 X10`、`G1 X0 Y10`、`G1 Z1`（三轴 + `[extruder]` 若有）。
 - **判定**：电机按预期方向/距离动；`objects/query toolhead` 的 `position`/`homed_axes` 正确；
   `M400` 后固件步数与命令距离一致（`stepper_get_position`）。
-- **依据**：`TODO.md` FW5 行；`docs/work-log/2026-09-21-fw5e-notes.md`。
+- **依据**：[已完成条目归档](docs/work-log/2026-09-22-completed-archive.md)（FW5）；
+  `docs/work-log/2026-09-21-fw5e-notes.md`。
 
 ### T2. FW6：`M119` / `query_endstops/status`（需要接一个 endstop）
 
 - **前置**：一个 endstop 接到已知引脚（例如 X 的 `endstop_pin`），配 `[stepper_x] endstop_pin`。
 - **步骤**：`M119`（或 `query_endstops/status`）在断开/闭合（手动短接）两种状态各读一次。
 - **判定**：`open` ↔ `TRIGGERED` 随电平翻转；`!`/`^` 极性/上拉符合配置。
-- **依据**：`TODO.md` FW6c；`docs/work-log/2026-09-21-fw6c-notes.md`。
+- **依据**：`TODO.md` F8（FW6 框架 ✅）；`src/core/klippy/extras/query_endstops.rs`、
+  `src/core/klippy/api/endpoints/query_endstops.rs`。
 
 ### T3. FW6：单轴 `G28`（硬件回零，需要 endstop + 电机）
 

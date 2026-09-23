@@ -4,8 +4,8 @@
 `docs/klippy/developer-manual/` 里）。括号里的 `klippy/xxx.py:NN` 指上游参考实现
 （`third_party/klipper/`），用来在动手前核对行为。已完成的条目单独归档在
 [已完成条目归档](docs/work-log/2026-09-22-completed-archive.md)，做完一件事就把它从正文挪过去。
-上游**全部功能点**的逐项对照（含判为「不适用」的 Python 专属项）见
-[上游功能覆盖审计](docs/work-log/2026-09-21-upstream-coverage-audit.md)；本文件只放
+上游**全部功能点**的逐项对照（含判为「不适用」的 Python 专属项）已于 2026-09-21
+盘点完毕、结论并入本文件（覆盖审计已完结清理）；本文件只放
 **要动手的事**与**还没定的事**。
 
 ## 已定
@@ -32,8 +32,8 @@
 
 依赖列的是**工具性前置**，不是自然顺序。下表是索引，逐条细节在后面的小节里；
 框架队列（FW1–FW9）已完成，索引见文末「已完成（留档）」；本表不再区分级别。
-H1–H12 是[上游功能覆盖审计](docs/work-log/2026-09-21-upstream-coverage-audit.md)
-里**未实现**的 extras 消费者，按域归并。
+H1–H12 是上游 extras 里**未实现**的消费者，按域归并（2026-09-21 全量盘点的结果；
+覆盖审计已完结清理）。
 
 **核心与架构**
 
@@ -86,7 +86,7 @@ H1–H12 是[上游功能覆盖审计](docs/work-log/2026-09-21-upstream-coverag
 
 > 判为**不适用**、不进待办的上游模块：`garbage_collection.py`（Python GC 调优）、
 > `aio_executor.py`（Python 线程池）、`parsedump.py`（离线开发工具）、
-> `debugcmds.c`（固件调试口）。理由见审计文档第 18 节。
+> `debugcmds.c`（固件调试口）。理由见括注：都是 Python 侧调优或离线/调试工具，与本主机无关。
 
 ### G2b 用 GCODE 控制 GPIO（现状与剩余）
 
@@ -226,7 +226,7 @@ toolhead / 开放事件）一起补，一部分是现在就独立可补的小行
 数据。
 
 
-#### F8 endstop / trsync（与 C1 共享，框架 FW6a–FW6e，见 [FW6 调查](docs/work-log/2026-09-21-fw6-notes.md)）
+#### F8 endstop / trsync（与 C1 共享，框架 FW6a–FW6e 已落地）
 
 - [ ] **FW6a-2** 测试侧加**响应器式假 MCU**（可多实例），并补 `ToolHeadObject::connect` 的
       两 MCU 端到端测试。（挪到 FW6c 一起做；时钟偏移已有 `McuChip` 单测）
@@ -440,8 +440,8 @@ FW5a–f / FW6a–f 已把「cartesian + 假 MCU 的 `G1`/`G28`」跑通并归�
 
 上游 133 个 extras（不含 `__init__.py`）里，本仓库目前只有 `board_pins` ✅、
 `output_pin` ◐、`bus`（SPI/I2C 框架）✅；其余按域归并成 H1–H12。逐模块的完整对照表
-（含固件命令模块、端点、判为不适用者）见
-[上游功能覆盖审计](docs/work-log/2026-09-21-upstream-coverage-audit.md)。
+（含固件命令模块、端点、判为不适用者）随覆盖审计收口清理；落点就是下文 H1–H12
+与 F/G/B 各节。
 
 ### H1 加热与温度
 
@@ -573,7 +573,8 @@ FW5a–f / FW6a–f 已把「cartesian + 假 MCU 的 `G1`/`G28`」跑通并归�
 - [ ] `statistics.py`：周期上报主机统计（CPU/内存）。
 - [ ] `error_mcu.py`：MCU 错误详情，供 shutdown 分析（见留档 FW7）。
 - [ ] `canbus_ids.py` / `canbus_stats.py`：CAN 节点分配与状态（接 `[mcu]` 的 canbus 选项）。
-- 判为不适用：`garbage_collection.py`、`aio_executor.py`、`parsedump.py`（审计文档第 18 节）。
+- 判为不适用：`garbage_collection.py`、`aio_executor.py`、`parsedump.py`（Python 侧调优/
+  离线工具，与本主机无关；完整清单见「待办」表后的不适用段）。
 
 ### H12 核心工具补齐
 
@@ -757,4 +758,3 @@ FW5a–f / FW6a–f 已把「cartesian + 假 MCU 的 `G1`/`G28`」跑通并归�
 | 块状传感器与端点 | `klippy/extras/bulk_sensor.py:100`、`load_cell.py:55`、`src/sensor_bulk.c` |
 | LCD 显示与菜单 | `klippy/extras/display/display.py`、`menu.py:346,712,722,754,913` |
 | 主机统计与 MCU 错误详情 | `klippy/extras/statistics.py`、`error_mcu.py` |
-| **全量模块对照** | [`docs/work-log/2026-09-21-upstream-coverage-audit.md`](docs/work-log/2026-09-21-upstream-coverage-audit.md) |

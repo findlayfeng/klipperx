@@ -31,7 +31,7 @@ pub const AXES: usize = 4;
 /// It deliberately holds no `Option`: a position is always four numbers. The
 /// one place a coordinate can be *unknown* is the reverse mapping in
 /// `Kinematics::calc_position`, which returns `[Option<f64>; 3]` instead (a
-/// delta that cannot be solved, a rail that is not homed) — see the FW5 notes.
+/// delta that cannot be solved, a rail that is not homed).
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Coord([f64; AXES]);
 

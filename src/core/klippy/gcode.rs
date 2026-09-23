@@ -36,10 +36,11 @@
 //!   mutex. Here a script runs to completion on the calling task; a second
 //!   caller would interleave only at awaits, and nothing in a handler awaits.
 
-use std::cell::Cell;
 use std::collections::HashMap;
 use std::fmt;
+use std::future::Future;
 use std::panic::AssertUnwindSafe;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
@@ -52,12 +53,36 @@ use crate::core::klippy::printer::{Printer, PrinterObject};
 /// The name other modules use to find the dispatcher.
 pub const GCODE_OBJECT: &str = "gcode";
 
+/// What a command handler returns: a boxed future, so handlers may `.await`
+/// (homing, temperature waits, probes) without parking a runtime worker.
+pub type CommandFuture<'a> = Pin<Box<dyn Future<Output = Result<(), CommandError>> + Send + 'a>>;
+
 /// A command handler: it reads its parameters from the command and either
 /// succeeds or reports why it could not.
 ///
+/// The future borrows the [`GcodeCommand`], which is `Sync` (its ack flag is an
+/// `AtomicBool`), so the returned future is `Send` and can run on any task.
+///
 /// `Arc` rather than `Box` because a mux command's per-value handlers are stored
 /// beside the dispatcher's own table and looked up again.
-pub type CommandHandler = Arc<dyn Fn(&GcodeCommand) -> Result<(), CommandError> + Send + Sync>;
+pub type CommandHandler = Arc<dyn for<'a> Fn(&'a GcodeCommand) -> CommandFuture<'a> + Send + Sync>;
+
+/// Wrap a synchronous body as a [`CommandHandler`].
+///
+/// Most handlers never await; they use this so their bodies stay ordinary
+/// `Fn(&GcodeCommand) -> Result<…>` functions.
+pub fn sync<F>(body: F) -> CommandHandler
+where
+    F: Fn(&GcodeCommand) -> Result<(), CommandError> + Send + Sync + 'static,
+{
+    // The body runs on the **first poll**, not when the future is built, so a
+    // panic is caught by `catch_unwind_future` like an async handler's would be.
+    let body = Arc::new(body);
+    Arc::new(move |gcmd| {
+        let body = Arc::clone(&body);
+        Box::pin(async move { body(gcmd) })
+    })
+}
 
 /// A sink for the lines the dispatcher emits.
 ///
@@ -137,9 +162,9 @@ pub struct GcodeCommand {
     /// Upstream's `need_ack` (`klippy/gcode.py:23`): true for the file/serial
     /// input protocol, false for an API `gcode/script` line. [`GcodeCommand::ack`]
     /// clears it, so a handler that acks itself is not acked again by the
-    /// trailing `gcmd.ack()` of `_process_commands`. Handlers take
-    /// `&GcodeCommand`, so the flag is a `Cell`.
-    need_ack: Cell<bool>,
+    /// trailing `gcmd.ack()` of `_process_commands`. An `AtomicBool` rather than
+    /// a `Cell` so `&GcodeCommand` is `Send` and a handler's future can await.
+    need_ack: AtomicBool,
 }
 
 impl GcodeCommand {
@@ -367,10 +392,9 @@ impl GcodeCommand {
     /// for a `need_ack` line. Returns whether it acknowledged, which is how
     /// `M115` chooses between `ok <msg>` and an info line.
     pub fn ack(&self, msg: Option<&str>) -> bool {
-        if !self.need_ack.get() {
+        if !self.need_ack.swap(false, Ordering::SeqCst) {
             return false;
         }
-        self.need_ack.set(false);
         match msg {
             Some(msg) => self.respond_raw(&format!("ok {msg}")),
             None => self.respond_raw("ok"),
@@ -590,8 +614,11 @@ impl GCodeDispatch {
         // connected MCU — alive after a restart drops the machine's parts.
         let inner = Arc::downgrade(&self.inner);
         let command = cmd.to_string();
-        let dispatcher: CommandHandler =
-            Arc::new(move |gcmd: &GcodeCommand| dispatch_mux(&upgrade(&inner), &command, gcmd));
+        let dispatcher: CommandHandler = Arc::new(move |gcmd: &GcodeCommand| {
+            let inner = upgrade(&inner);
+            let command = command.clone();
+            Box::pin(async move { dispatch_mux(&inner, &command, gcmd).await })
+        });
         self.register_command(cmd, dispatcher, desc, false)?;
         self.lock().mux.insert(
             cmd.to_string(),
@@ -613,11 +640,11 @@ impl GCodeDispatch {
     ///
     /// # Errors
     /// Returns the first [`CommandError`] the script produced.
-    pub fn run_script_from_command(&self, script: &str) -> Result<(), CommandError> {
+    pub async fn run_script_from_command(&self, script: &str) -> Result<(), CommandError> {
         for line in script.split('\n') {
             // An API `gcode/script` line is not acknowledged; the file/serial
             // input protocol is the only `need_ack` producer (`gcode.py:210`).
-            process_line(&self.inner, line, false)?;
+            process_line(&self.inner, line, false).await?;
         }
         Ok(())
     }
@@ -630,8 +657,57 @@ impl GCodeDispatch {
     ///
     /// # Errors
     /// Returns the first [`CommandError`] the script produced.
-    pub fn run_script(&self, script: &str) -> Result<(), CommandError> {
-        self.run_script_from_command(script)
+    pub async fn run_script(&self, script: &str) -> Result<(), CommandError> {
+        self.run_script_from_command(script).await
+    }
+
+    /// Run a script from a synchronous context (tests and simple callers).
+    ///
+    /// A thin `block_on` over [`GCodeDispatch::run_script`]: production code
+    /// awaits the async form; a test that has no runtime gets one here rather
+    /// than duplicating the `#[tokio::test]` attribute on every case.
+    #[cfg(test)]
+    pub fn run_script_sync(&self, script: &str) -> Result<(), CommandError> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a current-thread runtime")
+            .block_on(self.run_script(script))
+    }
+
+    /// [`GCodeDispatch::run_script_from_command`] from a synchronous context.
+    #[cfg(test)]
+    pub fn run_script_from_command_sync(&self, script: &str) -> Result<(), CommandError> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a current-thread runtime")
+            .block_on(self.run_script_from_command(script))
+    }
+
+    /// Run a script from a synchronous caller.
+    ///
+    /// **Temporary.** The `klippy-api` [`Endpoint`] trait is still synchronous,
+    /// so `gcode/script` cannot `.await` this yet; it uses the same
+    /// `block_in_place` bridge the handlers used before. Once the endpoint trait
+    /// is async this goes away, and no new caller should use it.
+    ///
+    /// [`Endpoint`]: https://docs.rs/klippy-api
+    pub fn run_script_blocking(&self, script: &str) -> Result<(), CommandError> {
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(|| handle.block_on(self.run_script(script)))
+            }
+            Ok(_) => Err(CommandError::new(
+                "run_script_blocking needs the multi-threaded runtime",
+            )),
+            // A synchronous caller with no runtime (a test): give it one.
+            Err(_) => tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|err| CommandError::new(err.to_string()))?
+                .block_on(self.run_script(script)),
+        }
     }
 
     /// Build a command for a handler to run, without parsing a line.
@@ -651,7 +727,7 @@ impl GCodeDispatch {
             command: command.to_string(),
             commandline: commandline.to_string(),
             params,
-            need_ack: Cell::new(false),
+            need_ack: AtomicBool::new(false),
         }
     }
 
@@ -679,11 +755,11 @@ impl GCodeDispatch {
         for (name, desc) in simple {
             let handler: CommandHandler = match name {
                 // Set Current Line Number: accepted and ignored.
-                "M110" => Arc::new(|_| Ok(())),
+                "M110" => sync(|_| Ok(())),
                 // Get Firmware Version and Capabilities.
                 "M115" => {
                     let printer = Arc::downgrade(&self.inner.printer);
-                    Arc::new(move |gcmd: &GcodeCommand| {
+                    sync(move |gcmd: &GcodeCommand| {
                         // The host's own version, from the start arguments
                         // (`start_args['software_version']`); the crate version
                         // is the fallback before the host sets them.
@@ -714,7 +790,7 @@ impl GCodeDispatch {
             let inner = Arc::downgrade(&self.inner);
             self.register_command(
                 "M112",
-                Arc::new(move |_| {
+                sync(move |_| {
                     upgrade(&inner)
                         .printer
                         .invoke_shutdown("Shutdown due to M112 command");
@@ -740,7 +816,7 @@ impl GCodeDispatch {
             let inner = Arc::downgrade(&self.inner);
             self.register_command(
                 name,
-                Arc::new(move |_| {
+                sync(move |_| {
                     upgrade(&inner).request_restart(result);
                     Ok(())
                 }),
@@ -752,7 +828,7 @@ impl GCodeDispatch {
         {
             self.register_command(
                 "ECHO",
-                Arc::new(|gcmd: &GcodeCommand| {
+                sync(|gcmd: &GcodeCommand| {
                     gcmd.respond_info_no_log(gcmd.commandline());
                     Ok(())
                 }),
@@ -765,7 +841,7 @@ impl GCodeDispatch {
             let inner = Arc::downgrade(&self.inner);
             self.register_command(
                 "STATUS",
-                Arc::new(move |gcmd: &GcodeCommand| cmd_status(&upgrade(&inner), gcmd)),
+                sync(move |gcmd: &GcodeCommand| cmd_status(&upgrade(&inner), gcmd)),
                 Some("Report the printer status"),
                 true,
             )
@@ -775,7 +851,7 @@ impl GCodeDispatch {
             let inner = Arc::downgrade(&self.inner);
             self.register_command(
                 "HELP",
-                Arc::new(move |gcmd: &GcodeCommand| cmd_help(&upgrade(&inner), gcmd)),
+                sync(move |gcmd: &GcodeCommand| cmd_help(&upgrade(&inner), gcmd)),
                 Some("Report the list of available extended G-Code commands"),
                 true,
             )
@@ -831,7 +907,7 @@ fn upgrade(inner: &Weak<Inner>) -> Arc<Inner> {
 }
 
 /// One line of a script: parse, find the handler, run it.
-fn process_line(inner: &Arc<Inner>, line: &str, need_ack: bool) -> Result<(), CommandError> {
+async fn process_line(inner: &Arc<Inner>, line: &str, need_ack: bool) -> Result<(), CommandError> {
     let Some(parsed) = parse_line(line) else {
         return Ok(()); // blank or comment-only
     };
@@ -854,19 +930,36 @@ fn process_line(inner: &Arc<Inner>, line: &str, need_ack: bool) -> Result<(), Co
         command: parsed.command.clone(),
         commandline: parsed.commandline.clone(),
         params: parsed.params.clone(),
-        need_ack: Cell::new(need_ack),
+        need_ack: AtomicBool::new(need_ack),
     };
 
-    let outcome = match &handler {
-        Some(handler) => invoke_handler(inner, &parsed.command, &mut gcmd, |gcmd| {
-            if !parsed.traditional {
-                gcmd.params = parse_extended(&parsed.raw_params, &parsed.commandline)?;
+    let outcome = {
+        let fut: CommandFuture<'_> = match &handler {
+            Some(handler) => {
+                if parsed.traditional {
+                    handler(&gcmd)
+                } else {
+                    match parse_extended(&parsed.raw_params, &parsed.commandline) {
+                        Ok(params) => {
+                            gcmd.params = params;
+                            handler(&gcmd)
+                        }
+                        Err(err) => Box::pin(std::future::ready(Err(err))),
+                    }
+                }
             }
-            handler(gcmd)
-        }),
-        None => invoke_handler(inner, &parsed.command, &mut gcmd, |gcmd| {
-            default_handler(inner, gcmd)
-        }),
+            None => Box::pin(async { default_handler(inner, &mut gcmd).await }),
+        };
+        match catch_unwind_future(fut).await {
+            Ok(Ok(())) => HandlerOutcome::Ok,
+            Ok(Err(err)) => HandlerOutcome::CommandError(err),
+            Err(_) => {
+                let msg = format!("Internal error on command:\"{}\"", parsed.command);
+                error!("{msg}");
+                inner.printer.invoke_shutdown(&msg);
+                HandlerOutcome::Internal(msg)
+            }
+        }
     };
 
     match outcome {
@@ -888,9 +981,9 @@ fn process_line(inner: &Arc<Inner>, line: &str, need_ack: bool) -> Result<(), Co
             }
         }
         HandlerOutcome::Internal(msg) => {
-            // The printer was already shut down by `invoke_handler`; the client
-            // is still told. No `gcode:command_error`: upstream fires it only
-            // for a `CommandError` (`klippy/gcode.py:229-234`).
+            // The printer was already shut down above; the client is still told.
+            // No `gcode:command_error`: upstream fires it only for a
+            // `CommandError` (`klippy/gcode.py:229-234`).
             inner.respond_error(&msg);
             if need_ack {
                 gcmd.ack(None);
@@ -900,6 +993,23 @@ fn process_line(inner: &Arc<Inner>, line: &str, need_ack: bool) -> Result<(), Co
             }
         }
     }
+}
+
+/// Run a boxed handler future, turning a panic into an `Err` payload.
+///
+/// `catch_unwind` cannot cross an `.await`, so the panic is caught around each
+/// **poll** of the future. This is what replaces the synchronous
+/// `catch_unwind` the dispatcher used before handlers could await.
+async fn catch_unwind_future<'a>(
+    mut fut: CommandFuture<'a>,
+) -> Result<Result<(), CommandError>, Box<dyn std::any::Any + Send>> {
+    std::future::poll_fn(move |cx| {
+        match std::panic::catch_unwind(AssertUnwindSafe(|| fut.as_mut().poll(cx))) {
+            Ok(poll) => poll.map(Ok),
+            Err(payload) => std::task::Poll::Ready(Err(payload)),
+        }
+    })
+    .await
 }
 
 /// What running one command handler produced.
@@ -912,40 +1022,11 @@ enum HandlerOutcome {
     Internal(String),
 }
 
-/// Run one command handler, turning a panic into an internal-error shutdown.
-///
-/// Upstream's bare `except:` around `handler(gcmd)`
-/// (`klippy/gcode.py:229-234`): an exception that is not a `CommandError` means
-/// klippy itself is wrong, so the printer is shut down with
-/// `Internal error on command:"X"`. Rust has no catch-all exception type, so a
-/// handler that gives up reports it by panicking; the panic is caught here,
-/// where the command is known.
-///
-/// A [`CommandError`] is the user's problem and is returned untouched — it does
-/// not shut the printer down.
-fn invoke_handler(
-    inner: &Arc<Inner>,
-    command: &str,
-    gcmd: &mut GcodeCommand,
-    call: impl FnOnce(&mut GcodeCommand) -> Result<(), CommandError>,
-) -> HandlerOutcome {
-    match std::panic::catch_unwind(AssertUnwindSafe(|| call(gcmd))) {
-        Ok(Ok(())) => HandlerOutcome::Ok,
-        Ok(Err(err)) => HandlerOutcome::CommandError(err),
-        Err(_) => {
-            let msg = format!("Internal error on command:\"{command}\"");
-            error!("{msg}");
-            inner.printer.invoke_shutdown(&msg);
-            HandlerOutcome::Internal(msg)
-        }
-    }
-}
-
 /// The handler for an unregistered command (`klippy/gcode.py:283-316`).
 ///
 /// Most of this is upstream's list of requests a slicer sends for a module this
 /// host may not have: they are answered quietly instead of as unknown commands.
-fn default_handler(inner: &Arc<Inner>, gcmd: &mut GcodeCommand) -> Result<(), CommandError> {
+async fn default_handler(inner: &Arc<Inner>, gcmd: &mut GcodeCommand) -> Result<(), CommandError> {
     let command = gcmd.command.clone();
 
     // Temperature and SD-card requests are answered before the ready check, so
@@ -977,7 +1058,7 @@ fn default_handler(inner: &Arc<Inner>, gcmd: &mut GcodeCommand) -> Result<(), Co
             };
             if let Some(handler) = handler {
                 gcmd.command = real.to_string();
-                return handler(gcmd);
+                return handler(gcmd).await;
             }
         }
     } else if matches!(command.as_str(), "M140" | "M104")
@@ -1039,7 +1120,11 @@ fn cmd_help(inner: &Arc<Inner>, gcmd: &GcodeCommand) -> Result<(), CommandError>
 
 /// Dispatch a mux command to the handler registered for its key value
 /// (`klippy/gcode.py:317-337`).
-fn dispatch_mux(inner: &Arc<Inner>, cmd: &str, gcmd: &GcodeCommand) -> Result<(), CommandError> {
+async fn dispatch_mux(
+    inner: &Arc<Inner>,
+    cmd: &str,
+    gcmd: &GcodeCommand,
+) -> Result<(), CommandError> {
     let (key, has_default) = {
         let commands = inner
             .commands
@@ -1071,7 +1156,7 @@ fn dispatch_mux(inner: &Arc<Inner>, cmd: &str, gcmd: &GcodeCommand) -> Result<()
         mux.values.get(&requested).map(Arc::clone)
     };
     if let Some(handler) = handler {
-        return handler(gcmd);
+        return handler(gcmd).await;
     }
 
     let requested = requested.unwrap_or_default();
@@ -1433,7 +1518,7 @@ mod tests {
 
     /// Run a script, ignoring the result.
     fn run(dispatch: &GCodeDispatch, script: &str) {
-        let _ = dispatch.run_script(script);
+        let _ = dispatch.run_script_sync(script);
     }
 
     fn emitted(output: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
@@ -1453,7 +1538,7 @@ mod tests {
         let printer = Arc::new(Printer::new(ManualReactor::shared()));
         let dispatch = GCodeDispatch::new(Arc::clone(&printer));
         dispatch
-            .register_mux_command("SET_PIN", "PIN", Some("led"), Arc::new(|_| Ok(())), None)
+            .register_mux_command("SET_PIN", "PIN", Some("led"), sync(|_| Ok(())), None)
             .unwrap();
 
         let inner = Arc::downgrade(&dispatch.inner);
@@ -1474,7 +1559,7 @@ mod tests {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let handler: CommandHandler = {
             let seen = Arc::clone(&seen);
-            Arc::new(move |gcmd: &GcodeCommand| {
+            sync(move |gcmd: &GcodeCommand| {
                 seen.lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .push(gcmd.commandline().to_string());
@@ -1693,7 +1778,7 @@ mod tests {
         let (dispatch, output) = dispatch();
         dispatch.inner.set_ready(true);
 
-        assert!(dispatch.run_script("NOPE").is_ok());
+        assert!(dispatch.run_script_sync("NOPE").is_ok());
 
         assert_eq!(emitted(&output), ["// Unknown command:\"NOPE\""]);
     }
@@ -1706,7 +1791,7 @@ mod tests {
         // A slicer asks for modules this host may not have; upstream answers
         // these quietly rather than as unknown commands.
         for line in ["M105", "M21", "M140 S0", "M104 S0", "M107", "M106 S0"] {
-            assert!(dispatch.run_script(line).is_ok(), "{line}");
+            assert!(dispatch.run_script_sync(line).is_ok(), "{line}");
         }
         assert_eq!(emitted(&output), Vec::<String>::new());
 
@@ -1728,7 +1813,7 @@ mod tests {
             dispatch
                 .register_command(
                     "M117",
-                    Arc::new(move |gcmd: &GcodeCommand| {
+                    sync(move |gcmd: &GcodeCommand| {
                         seen.lock()
                             .unwrap_or_else(|p| p.into_inner())
                             .push(gcmd.commandline().to_string());
@@ -1758,7 +1843,7 @@ mod tests {
             dispatch
                 .register_command(
                     "FAIL",
-                    Arc::new(move |_| {
+                    sync(move |_| {
                         calls.fetch_add(1, Ordering::SeqCst);
                         Err(CommandError::new("boom"))
                     }),
@@ -1768,7 +1853,7 @@ mod tests {
                 .unwrap();
         }
 
-        let err = dispatch.run_script("FAIL\nNOPE").unwrap_err();
+        let err = dispatch.run_script_sync("FAIL\nNOPE").unwrap_err();
 
         assert_eq!(err.to_string(), "boom");
         assert_eq!(calls.load(Ordering::SeqCst), 1, "the script must stop");
@@ -1786,7 +1871,7 @@ mod tests {
 
         // Not ready: a ready-only command is not in the active table, and the
         // default reports the state message instead of running it.
-        let err = dispatch.run_script("MY_CMD").unwrap_err();
+        let err = dispatch.run_script_sync("MY_CMD").unwrap_err();
 
         assert!(err.to_string().contains("Starting up"), "{err}");
         assert!(seen.lock().unwrap().is_empty());
@@ -1797,7 +1882,7 @@ mod tests {
         let (dispatch, output) = dispatch();
 
         // M115 is registered when_not_ready, so it runs even in startup.
-        assert!(dispatch.run_script("M115").is_ok());
+        assert!(dispatch.run_script_sync("M115").is_ok());
 
         let lines = emitted(&output);
         assert!(
@@ -1827,7 +1912,7 @@ mod tests {
             }));
         }
 
-        dispatch.run_script("M115").unwrap();
+        dispatch.run_script_sync("M115").unwrap();
 
         let lines = emitted(&output);
         assert!(
@@ -1940,7 +2025,7 @@ mod tests {
         // Only a ready printer reaches the toolhead.
         printer.send_event(&KlippyEvent::KlippyReady);
 
-        dispatch.run_script("RESTART").unwrap();
+        dispatch.run_script_sync("RESTART").unwrap();
 
         assert_eq!(printer.run(), "restart");
         assert_eq!(
@@ -1973,7 +2058,7 @@ mod tests {
         let seen = Arc::new(Mutex::new(Vec::new()));
         for value in ["fan", "light"] {
             let seen = Arc::clone(&seen);
-            let handler: CommandHandler = Arc::new(move |gcmd: &GcodeCommand| {
+            let handler: CommandHandler = sync(move |gcmd: &GcodeCommand| {
                 seen.lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .push(format!("{value}={}", gcmd.get_float("VALUE")?));
@@ -1999,7 +2084,9 @@ mod tests {
     fn test_a_mux_value_that_is_not_registered_names_the_options() {
         let (dispatch, _seen) = mux_dispatch();
 
-        let err = dispatch.run_script("SET_PIN PIN=nope VALUE=1").unwrap_err();
+        let err = dispatch
+            .run_script_sync("SET_PIN PIN=nope VALUE=1")
+            .unwrap_err();
 
         assert_eq!(
             err.to_string(),
@@ -2026,7 +2113,7 @@ mod tests {
         let seen = Arc::new(Mutex::new(Vec::new()));
         {
             let seen = Arc::clone(&seen);
-            let default: CommandHandler = Arc::new(move |_| {
+            let default: CommandHandler = sync(move |_| {
                 seen.lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .push("default".to_string());
@@ -2038,7 +2125,7 @@ mod tests {
         }
         {
             let seen = Arc::clone(&seen);
-            let named: CommandHandler = Arc::new(move |_| {
+            let named: CommandHandler = sync(move |_| {
                 seen.lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .push("named".to_string());
@@ -2058,7 +2145,7 @@ mod tests {
         assert_eq!(*seen.lock().unwrap(), ["default", "named"]);
 
         // An unknown key is still reported against the named options.
-        let err = dispatch.run_script("MY_MUX PIN=nope").unwrap_err();
+        let err = dispatch.run_script_sync("MY_MUX PIN=nope").unwrap_err();
         assert!(err.to_string().contains("is not valid for PIN"), "{err}");
     }
 
@@ -2081,7 +2168,7 @@ mod tests {
             command: parsed.command,
             commandline: parsed.commandline,
             params,
-            need_ack: Cell::new(false),
+            need_ack: AtomicBool::new(false),
         }
     }
 
@@ -2196,7 +2283,7 @@ mod tests {
             .register_command("MY_CMD", handler, None, false)
             .unwrap();
 
-        dispatch.run_script_from_command("MY_CMD A=1").unwrap();
+        dispatch.run_script_from_command_sync("MY_CMD A=1").unwrap();
 
         assert_eq!(*seen.lock().unwrap(), ["MY_CMD A=1"]);
     }
@@ -2217,13 +2304,13 @@ mod tests {
         dispatch
             .register_command(
                 "FAIL",
-                Arc::new(|_| Err(CommandError::new("boom"))),
+                sync(|_| Err(CommandError::new("boom"))),
                 None,
                 false,
             )
             .unwrap();
 
-        let err = dispatch.run_script("FAIL").unwrap_err();
+        let err = dispatch.run_script_sync("FAIL").unwrap_err();
 
         assert_eq!(err.to_string(), "boom");
         assert!(fired.load(Ordering::SeqCst));
@@ -2246,16 +2333,16 @@ mod tests {
             );
         }
         dispatch
-            .register_command("BOOM", Arc::new(|_| panic!("handler bug")), None, false)
+            .register_command("BOOM", sync(|_| panic!("handler bug")), None, false)
             .unwrap();
 
-        let _ = dispatch.run_script("BOOM");
+        let _ = dispatch.run_script_sync("BOOM");
 
         assert!(!fired.load(Ordering::SeqCst));
     }
 
-    #[test]
-    fn test_an_acknowledged_line_does_not_stop_the_script_on_error() {
+    #[tokio::test]
+    async fn test_an_acknowledged_line_does_not_stop_the_script_on_error() {
         // The file/serial protocol (`need_ack`) reports the error, fires the
         // event and acks the line instead of propagating it
         // (`klippy/gcode.py:223-228`), so the rest of the script still runs.
@@ -2268,7 +2355,7 @@ mod tests {
             dispatch
                 .register_command(
                     "FAIL",
-                    Arc::new(move |_| {
+                    sync(move |_| {
                         calls.fetch_add(1, Ordering::SeqCst);
                         Err(CommandError::new("boom"))
                     }),
@@ -2278,7 +2365,7 @@ mod tests {
                 .unwrap();
         }
         dispatch
-            .register_command("AFTER", Arc::new(|_| Ok(())), None, false)
+            .register_command("AFTER", sync(|_| Ok(())), None, false)
             .unwrap();
         let output = Arc::new(Mutex::new(Vec::new()));
         {
@@ -2291,8 +2378,8 @@ mod tests {
             }));
         }
 
-        process_line(&dispatch.inner, "FAIL", true).unwrap();
-        process_line(&dispatch.inner, "AFTER", true).unwrap();
+        process_line(&dispatch.inner, "FAIL", true).await.unwrap();
+        process_line(&dispatch.inner, "AFTER", true).await.unwrap();
 
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         let lines = output.lock().unwrap_or_else(|p| p.into_inner()).clone();
@@ -2347,10 +2434,10 @@ mod tests {
         let dispatch = GCodeDispatch::new(Arc::clone(&printer));
         dispatch.inner.set_ready(true);
         dispatch
-            .register_command("BOOM", Arc::new(|_| panic!("handler bug")), None, false)
+            .register_command("BOOM", sync(|_| panic!("handler bug")), None, false)
             .unwrap();
 
-        let err = dispatch.run_script("BOOM").unwrap_err();
+        let err = dispatch.run_script_sync("BOOM").unwrap_err();
 
         assert_eq!(err.to_string(), "Internal error on command:\"BOOM\"");
         assert_eq!(
@@ -2367,13 +2454,13 @@ mod tests {
         dispatch
             .register_command(
                 "BAD",
-                Arc::new(|_| Err(CommandError::new("bad parameter"))),
+                sync(|_| Err(CommandError::new("bad parameter"))),
                 None,
                 false,
             )
             .unwrap();
 
-        let err = dispatch.run_script("BAD").unwrap_err();
+        let err = dispatch.run_script_sync("BAD").unwrap_err();
 
         assert_eq!(err.to_string(), "bad parameter");
         assert_ne!(

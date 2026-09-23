@@ -50,7 +50,7 @@ use crate::core::klippy::mcu::{McuObject, McuSpi, SpiMode};
 use crate::core::klippy::pins::{PrinterPins, PINS_OBJECT};
 use crate::core::klippy::printer::{Printer, PrinterObject};
 
-use super::bus_debug::{block_on, hex_decode, hex_encode};
+use super::bus_debug::{hex_decode, hex_encode};
 
 // Loaded after `[board_pins]` (order 30), because a software bus or the CS pin
 // may be named through an alias.
@@ -228,7 +228,10 @@ impl SpiDevice {
             .expect("the loader registers `gcode` before any section");
         let transfer_handler: CommandHandler = {
             let device = Arc::clone(&device);
-            Arc::new(move |gcmd| cmd_spi_transfer(&device, gcmd))
+            Arc::new(move |gcmd: &GcodeCommand| {
+                let device = Arc::clone(&device);
+                Box::pin(async move { cmd_spi_transfer(&device, gcmd).await })
+            })
         };
         gcode
             .register_mux_command(
@@ -241,7 +244,10 @@ impl SpiDevice {
             .map_err(|err| ConfigError::new(format!("{identifier}: {err}")))?;
         let send_handler: CommandHandler = {
             let device = Arc::clone(&device);
-            Arc::new(move |gcmd| cmd_spi_send(&device, gcmd))
+            Arc::new(move |gcmd: &GcodeCommand| {
+                let device = Arc::clone(&device);
+                Box::pin(async move { cmd_spi_send(&device, gcmd).await })
+            })
         };
         gcode
             .register_mux_command(
@@ -301,15 +307,18 @@ pub(crate) fn mcu_object_name(mcu_name: &str) -> String {
 }
 
 /// `SPI_TRANSFER DEVICE=<name> DATA=<hex>` — full duplex; reply is what came in.
-fn cmd_spi_transfer(device: &Arc<McuSpi>, gcmd: &GcodeCommand) -> Result<(), CommandError> {
+async fn cmd_spi_transfer(device: &Arc<McuSpi>, gcmd: &GcodeCommand) -> Result<(), CommandError> {
     let data = hex_decode(&gcmd.get_str("DATA")?)?;
-    let response = block_on(device.transfer(&data))?;
+    let response = device
+        .transfer(&data)
+        .await
+        .map_err(|err| CommandError::new(err.to_string()))?;
     gcmd.respond_info(&format!("spi transfer: {}", hex_encode(&response)));
     Ok(())
 }
 
 /// `SPI_SEND DEVICE=<name> DATA=<hex>` — shift bytes out, no read.
-fn cmd_spi_send(device: &Arc<McuSpi>, gcmd: &GcodeCommand) -> Result<(), CommandError> {
+async fn cmd_spi_send(device: &Arc<McuSpi>, gcmd: &GcodeCommand) -> Result<(), CommandError> {
     let data = hex_decode(&gcmd.get_str("DATA")?)?;
     device
         .send(&data)

@@ -28,7 +28,7 @@ use serde_json::{json, Value};
 
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
 use crate::core::klippy::event::KlippyEvent;
-use crate::core::klippy::gcode::{GCodeDispatch, GcodeCommand, GCODE_OBJECT};
+use crate::core::klippy::gcode::{sync, GCodeDispatch, GcodeCommand, GCODE_OBJECT};
 use crate::core::klippy::load::section;
 use crate::core::klippy::pins::{DigitalOut, PrinterPins, PINS_OBJECT};
 use crate::core::klippy::printer::{Printer, PrinterObject};
@@ -260,7 +260,7 @@ impl PrinterStepperEnable {
         // the rest of the machine via `stepper_enable:motor_off`).
         let handler_m18: crate::core::klippy::gcode::CommandHandler = {
             let weak = Arc::downgrade(self);
-            Arc::new(move |gcmd: &GcodeCommand| {
+            sync(move |gcmd: &GcodeCommand| {
                 let _ = gcmd;
                 if let Some(object) = weak.upgrade() {
                     object.motor_off();
@@ -288,7 +288,7 @@ impl PrinterStepperEnable {
             .ok();
 
         let enable_lines2 = Arc::clone(&self.enable_lines);
-        let handler_set = Arc::new(move |gcmd: &GcodeCommand| {
+        let handler_set = sync(move |gcmd: &GcodeCommand| {
             let stepper_name = gcmd.get_str("STEPPER").map_err(|_| {
                 crate::core::klippy::gcode::CommandError::new("Missing STEPPER parameter")
             })?;

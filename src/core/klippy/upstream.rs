@@ -551,7 +551,7 @@ mod tests {
 
         let gcode = if setup.is_ok() {
             match printer.lookup_object_as::<GCodeDispatch>(GCODE_OBJECT) {
-                Some(dispatcher) => match dispatcher.run_script(script) {
+                Some(dispatcher) => match dispatcher.run_script(script).await {
                     Ok(()) => {
                         let state = printer.get_state_message();
                         if state.category == PrinterState::Ready {

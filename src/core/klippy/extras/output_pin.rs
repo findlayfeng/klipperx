@@ -39,7 +39,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use serde_json::{json, Value};
 
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
-use crate::core::klippy::gcode::{CommandError, CommandHandler, GCodeDispatch, GCODE_OBJECT};
+use crate::core::klippy::gcode::{sync, CommandError, CommandHandler, GCodeDispatch, GCODE_OBJECT};
 use crate::core::klippy::load::section;
 use crate::core::klippy::pins::{DigitalOut, PrinterPins, PwmOut, PINS_OBJECT};
 use crate::core::klippy::printer::{Printer, PrinterObject};
@@ -140,7 +140,7 @@ impl OutputPin {
         let handler: CommandHandler = {
             let handle = Arc::clone(&handle);
             let value_slot = Arc::clone(&value_slot);
-            Arc::new(move |gcmd| cmd_set_pin(&handle, &value_slot, scale, gcmd))
+            sync(move |gcmd| cmd_set_pin(&handle, &value_slot, scale, gcmd))
         };
         gcode
             .register_mux_command(
@@ -378,13 +378,13 @@ mod tests {
         let pin = OutputPin::new(&wrap(&section("fan", "PA1", &[])), &printer).unwrap();
 
         gcode(&printer)
-            .run_script("SET_PIN PIN=fan VALUE=1")
+            .run_script_sync("SET_PIN PIN=fan VALUE=1")
             .unwrap();
         assert_eq!(*created(&chip, 0).updates.lock().unwrap(), [true]);
         assert_eq!(pin.get_status(0.0)["value"], 1.0);
 
         gcode(&printer)
-            .run_script("SET_PIN PIN=fan VALUE=0")
+            .run_script_sync("SET_PIN PIN=fan VALUE=0")
             .unwrap();
         assert_eq!(*created(&chip, 0).updates.lock().unwrap(), [true, false]);
         assert_eq!(pin.get_status(0.0)["value"], 0.0);
@@ -396,7 +396,7 @@ mod tests {
         OutputPin::new(&wrap(&section("fan", "PA1", &[])), &printer).unwrap();
 
         gcode(&printer)
-            .run_script("SET_PIN PIN=fan VALUE=0.5")
+            .run_script_sync("SET_PIN PIN=fan VALUE=0.5")
             .unwrap();
 
         assert_eq!(*created(&chip, 0).updates.lock().unwrap(), [true]);
@@ -407,7 +407,9 @@ mod tests {
         let (printer, _chip) = printer();
         OutputPin::new(&wrap(&section("fan", "PA1", &[])), &printer).unwrap();
 
-        let err = gcode(&printer).run_script("SET_PIN PIN=fan").unwrap_err();
+        let err = gcode(&printer)
+            .run_script_sync("SET_PIN PIN=fan")
+            .unwrap_err();
 
         assert!(err.to_string().contains("missing VALUE"), "{err}");
     }
@@ -419,7 +421,7 @@ mod tests {
         OutputPin::new(&wrap(&section("light", "PA2", &[])), &printer).unwrap();
 
         gcode(&printer)
-            .run_script("SET_PIN PIN=light VALUE=1")
+            .run_script_sync("SET_PIN PIN=light VALUE=1")
             .unwrap();
 
         assert!(created(&chip, 0).updates.lock().unwrap().is_empty());
@@ -469,7 +471,7 @@ mod tests {
         assert_eq!(*pwm.start_value.lock().unwrap(), (0.5, 0.0));
 
         gcode(&printer)
-            .run_script("SET_PIN PIN=fan VALUE=0.25")
+            .run_script_sync("SET_PIN PIN=fan VALUE=0.25")
             .unwrap();
         assert_eq!(*pwm.updates.lock().unwrap(), [0.25]);
     }
@@ -507,7 +509,7 @@ mod tests {
         assert_eq!(*pwm.start_value.lock().unwrap(), (0.65, 0.2));
 
         gcode(&printer)
-            .run_script("SET_PIN PIN=current VALUE=1.0")
+            .run_script_sync("SET_PIN PIN=current VALUE=1.0")
             .unwrap();
         assert_eq!(*pwm.updates.lock().unwrap(), [0.5]);
         assert_eq!(pin.get_status(0.0)["value"], 0.5);
@@ -530,7 +532,7 @@ mod tests {
         OutputPin::new(&wrap(&section), &printer).unwrap();
 
         let err = gcode(&printer)
-            .run_script("SET_PIN PIN=current VALUE=3")
+            .run_script_sync("SET_PIN PIN=current VALUE=3")
             .unwrap_err();
 
         assert!(err.to_string().contains("maximum"), "{err}");

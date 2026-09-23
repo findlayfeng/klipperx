@@ -607,31 +607,26 @@ impl PrinterProbe {
     }
 
     /// The session's parameters for `gcmd` (`get_probe_params`).
-    #[allow(dead_code)] // `bed_mesh` (U5) and `z_tilt` (M6) consume these.
     pub(crate) fn probe_params(&self, gcmd: &GcodeCommand) -> Result<ProbeParams, CommandError> {
         self.session.defaults.from_command(gcmd)
     }
 
     /// Open a probe session (`start_probe_session`).
-    #[allow(dead_code)] // consumed by the point-probing helpers (U5/M6).
     pub(crate) fn start_probe_session(&self) -> Result<(), CommandError> {
         self.session.start()
     }
 
     /// Run one sample set in the open session (`run_probe`).
-    #[allow(dead_code)] // consumed by the point-probing helpers (U5/M6).
     pub(crate) async fn run_probe(&self, gcmd: &GcodeCommand) -> Result<(), CommandError> {
         self.session.run(gcmd).await
     }
 
     /// Take the completed sample sets (`pull_probed_results`).
-    #[allow(dead_code)] // consumed by the point-probing helpers (U5/M6).
     pub(crate) fn pull_probed_results(&self) -> Vec<Coord> {
         self.session.pull_results()
     }
 
     /// Close the session (`end_probe_session`).
-    #[allow(dead_code)] // consumed by the point-probing helpers (U5/M6).
     pub(crate) fn end_probe_session(&self) -> Result<(), CommandError> {
         self.session.end()
     }

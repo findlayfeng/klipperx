@@ -404,9 +404,15 @@ mod tests {
     /// `KLIPPERX_UPSTREAM_ALL=1` runs every case and reports every failure, so
     /// the list stays honest rather than hiding regressions.
     const IGNORED: &[&str] = &[
-        "bed_mesh.test",
         "bed_screws.test",
         "bltouch.test",
+        // The `[bed_mesh]` / `[probe]` configs now load and their commands run,
+        // but the probe endstop never reports a trigger through the fake MCU yet
+        // ("No trigger on probe after full movement") and the interactive path
+        // reports "Printer is not ready" — TODO H9, next unit (probe/homing
+        // end-to-end on the simulator, and the toolhead slot during probing).
+        "bed_mesh.test",
+        "z_virtual_endstop.test",
         "corexyuv.test",
         "delta.test",
         "delta_calibrate.test",
@@ -437,7 +443,6 @@ mod tests {
         "temperature.test",
         "tmc.test",
         "z_tilt.test",
-        "z_virtual_endstop.test",
     ];
 
     // -----------------------------------------------------------------------

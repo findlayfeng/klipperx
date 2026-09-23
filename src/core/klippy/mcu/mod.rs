@@ -45,6 +45,17 @@ pub use restart_method::McuRestartMethod;
 
 use events::McuEvents;
 
+/// How many outbound commands may be queued before [`Mcu::send`] refuses.
+///
+/// The synchronous [`Mcu::send`] does not wait for room, so a host-side burst
+/// must fit: a bed-mesh calibration probes a 7x7 grid (49 points), each with an
+/// endstop/trsync arm plus its step blocks, and upstream never refuses at all —
+/// its msgparser buffers and only flow-controls via the receive window. The
+/// value is a runaway guard, not a flow-control mechanism; paths that can queue
+/// a lot (step batches, the configuration phase) use the awaiting
+/// [`Mcu::send_payload`] instead.
+const SEND_QUEUE_CAPACITY: usize = 512;
+
 use crate::core::klippy::load::section;
 
 // The `[mcu]` / `[mcu <name>]` sections. The factories are re-exported from
@@ -505,7 +516,7 @@ impl Mcu {
         let wire = Arc::new(Wire::default());
         let identified = Arc::new(AtomicBool::new(false));
         let identified_for_task = Arc::clone(&identified);
-        let (send_buf_tx, mut send_buf_rx) = mpsc::channel::<SendItem>(32);
+        let (send_buf_tx, mut send_buf_rx) = mpsc::channel::<SendItem>(SEND_QUEUE_CAPACITY);
         // Where the firmware's counter has been seen at, one value per ack/nak
         // frame (see `Wire`). A watch channel: only the newest value matters, the
         // receive task must never be held up by the send task, and every change

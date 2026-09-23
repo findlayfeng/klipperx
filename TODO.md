@@ -603,12 +603,12 @@ FW5a–f / FW6a–f 已把「cartesian + 假 MCU 的 `G1`/`G28`」跑通并归�
 
 ### H9 探测 / 调平 / 校准
 
-- [ ] 探针：`probe.py` ◐（**已落地**：`[probe]` 段与 `probe` 虚拟 chip、选项全量认领、`z_virtual_endstop`
-      校验，见 `extras/probe.rs`；**待做**：`ProbeSessionHelper` 采样与 `QUERY_PROBE`/`PROBE`/`PROBE_ACCURACY`、
-      `PROBE_CALIBRATE`/`Z_OFFSET_APPLY_PROBE`（需 `manual_probe` + `configfile.set()`）、`ProbePointsHelper`；
-      另需把 `PinChip::setup_endstop` 的返回类型从具体 `Arc<McuEndstop>` 改成接口，才能让 wrapper 生效）、
-      `bltouch.py`、`smart_effector.py`、`probe_eddy_current.py`、`manual_probe.py`、`safe_z_home.py`、
-      `endstop_phase.py`。
+- [ ] 探针：`probe.py` ◐（**已落地**：`[probe]` 段、`probe` 虚拟 chip、选项与偏移、会话采样、
+      `QUERY_PROBE`/`PROBE`/`PROBE_ACCURACY`、`probe:update_results` 发送；**待做**：
+      `PROBE_CALIBRATE`/`Z_OFFSET_APPLY_PROBE`（需 `manual_probe` + `configfile.set()`）、
+      `ProbePointsHelper`（消费者 z_tilt/screws）、endstop wrapper 的 `z_offset`/`query_endstop` 覆盖——
+      需先把 `PinChip::setup_endstop` 的返回类型接口化）、`bltouch.py`、`smart_effector.py`、
+      `probe_eddy_current.py`、`manual_probe.py`、`safe_z_home.py`、`endstop_phase.py`。
 - **端停位置的缺口（需接口化）**：上游 rail 会优先向 endstop 要位置（`mcu_endstop.get_position_endstop()`，
       探针 wrapper 返回 `z_offset`）；本仓 `position_endstop` 缺省退到 `position_min`，所以用
       `probe:z_virtual_endstop` 的配置虽然在解析上能过，但 Z 回零后的位置不等于上游——`z_virtual_endstop.test`

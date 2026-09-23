@@ -56,11 +56,12 @@ use crate::core::klippy::motion::{Axis, HomingInfo, Stepper};
 use crate::core::klippy::pins::{PrinterPins, PINS_OBJECT};
 use crate::core::klippy::printer::{ConnectFuture, Printer, PrinterObject};
 
-// The three cartesian axes. `[printer]` is a late section, so these are
-// registered before it and it can look them up as it is built.
-section!("stepper_x", order = 20, load = load_config);
-section!("stepper_y", order = 20, load = load_config);
-section!("stepper_z", order = 20, load = load_config);
+// The three cartesian axes. Aligned with upstream: these are **not** standalone
+// printer objects — the toolhead (late, order=60) builds Rail + endstop from
+// the config via `Rail::lookup`, which reads `PrinterStepper` registered here.
+section!("stepper_x", order = 50, phase = late, load = load_config);
+section!("stepper_y", order = 50, phase = late, load = load_config);
+section!("stepper_z", order = 50, phase = late, load = load_config);
 
 /// The default pulse width upstream uses when the option is absent
 /// (`klippy/stepper.py:80`).

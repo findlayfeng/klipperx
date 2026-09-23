@@ -340,9 +340,6 @@ mod tests {
                 "heater_bed",
                 "heater_generic",
                 "output_pin",
-                "stepper_x",
-                "stepper_y",
-                "stepper_z",
                 "adc_temperature",
                 "thermistor",
                 "board_pins",
@@ -350,13 +347,16 @@ mod tests {
                 "static_digital_output",
                 "i2c_device",
                 "spi_device",
+                "stepper_x",
+                "stepper_y",
+                "stepper_z",
                 "printer"
             ]
         );
         // `mcu` is the one up-front section (upstream loads `pins` and `mcu`
-        // before the generic walk), `[printer]` the one late section (upstream
-        // loads `toolhead` after the walk, as `toolhead`); the rest are plain
-        // generic sections.
+        // before the generic walk); `[stepper_*]` and `[printer]` are late
+        // (upstream builds `toolhead` last, and `Rail::lookup` reads stepper
+        // config at that point); the rest are plain generic sections.
         let by_id = |id: &str| {
             FACTORIES
                 .iter()
@@ -366,7 +366,7 @@ mod tests {
         };
         assert_eq!(by_id("mcu").phase, Phase::Early);
         assert_eq!(by_id("output_pin").phase, Phase::Generic);
-        assert_eq!(by_id("stepper_x").phase, Phase::Generic);
+        assert_eq!(by_id("stepper_x").phase, Phase::Late);
         assert_eq!(by_id("printer").phase, Phase::Late);
         assert_eq!(by_id("printer").object, Some("toolhead"));
         assert!(FACTORIES
@@ -845,5 +845,171 @@ mod tests {
                 "spi_device flash"
             ]
         );
+    }
+
+    // =========================================================================
+    // Late-section chip resolution test
+    // =========================================================================
+
+    /// Prove that a late section can use a chip registered by a generic section.
+    ///
+    /// This is the regression guard for the stepper_x/y/z → late migration:
+    /// when `[stepper_*]` was generic, `endstop_pin` resolution failed for chips
+    /// registered by later sections (probe, TMC). Moving stepper to late means
+    /// all generic sections (including probe/TMC) load **before** stepper's
+    /// `setup_endstop` call, so the chip is already registered.
+    ///
+    /// The test uses `PrinterPins::chips()` (public) to verify the chip was
+    /// registered by the time the late section runs. This mirrors the internal
+    /// `PrinterPins::chip()` lookup that `setup_endstop` uses.
+    #[test]
+    fn test_a_late_section_can_use_chips_registered_by_generic_sections() {
+        use crate::core::klippy::pins::{PinChip, PinParams, PrinterPins};
+        use crate::core::klippy::printer::PrinterObject;
+
+        // A minimal PinChip that satisfies the trait but does nothing.
+        struct NoopChip;
+        impl PinChip for NoopChip {
+            fn setup_digital_out(
+                &self,
+                _params: &PinParams,
+            ) -> Result<
+                Arc<dyn crate::core::klippy::pins::DigitalOut>,
+                crate::core::klippy::pins::PinError,
+            > {
+                Err(crate::core::klippy::pins::PinError::Unsupported(
+                    "digital_out".into(),
+                ))
+            }
+            fn setup_pwm(
+                &self,
+                _params: &PinParams,
+            ) -> Result<
+                Arc<dyn crate::core::klippy::pins::PwmOut>,
+                crate::core::klippy::pins::PinError,
+            > {
+                Err(crate::core::klippy::pins::PinError::Unsupported(
+                    "pwm".into(),
+                ))
+            }
+            fn setup_adc(
+                &self,
+                _params: &PinParams,
+            ) -> Result<Arc<dyn crate::core::klippy::pins::Adc>, crate::core::klippy::pins::PinError>
+            {
+                Err(crate::core::klippy::pins::PinError::Unsupported(
+                    "adc".into(),
+                ))
+            }
+            fn setup_stepper(
+                &self,
+                _step: &PinParams,
+                _dir: &PinParams,
+                _inv_step: i8,
+                _spd: f64,
+                _inv_dir: bool,
+            ) -> Result<
+                Arc<crate::core::klippy::mcu::McuStepper>,
+                crate::core::klippy::pins::PinError,
+            > {
+                Err(crate::core::klippy::pins::PinError::Unsupported(
+                    "stepper".into(),
+                ))
+            }
+        }
+
+        // A synthetic section that registers a chip in PrinterPins.
+        fn register_test_chip(
+            config: &ConfigWrapper,
+            printer: &Arc<Printer>,
+        ) -> Result<Arc<dyn PrinterObject>, ConfigError> {
+            let chip_name = config.get("chip_name", Some("test_chip"))?;
+            let pins = printer
+                .lookup_object_as::<PrinterPins>(PINS_OBJECT)
+                .expect("pins object must be registered");
+            pins.register_chip(&chip_name, Arc::new(NoopChip))
+                .map_err(|e| ConfigError::new(format!("register_chip: {e}")))?;
+            Ok(Arc::new(Nothing))
+        }
+
+        // A synthetic late section that verifies the chip is registered.
+        fn check_chip_resolved(
+            config: &ConfigWrapper,
+            printer: &Arc<Printer>,
+        ) -> Result<Arc<dyn PrinterObject>, ConfigError> {
+            let chip_name = config.get("chip_name", Some("test_chip"))?;
+            let pins = printer
+                .lookup_object_as::<PrinterPins>(PINS_OBJECT)
+                .expect("pins object must be registered");
+            // `chips()` returns the list of registered chip names. If the chip
+            // isn't there, the late section loaded before the generic one —
+            // which would be the bug we're guarding against.
+            let registered = pins.chips();
+            if !registered.iter().any(|n| *n == chip_name) {
+                return Err(ConfigError::new(format!(
+                    "chip '{chip_name}' not registered yet (registered: {registered:?})"
+                )));
+            }
+            Ok(Arc::new(Nothing))
+        }
+
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        // Set up the builtin objects that real sections depend on.
+        use crate::core::klippy::config::PrinterConfig;
+        use crate::core::klippy::pins::PINS_OBJECT;
+
+        printer
+            .add_object(
+                CONFIGFILE_OBJECT,
+                Arc::new(PrinterConfig::new(
+                    AccessTracking::shared(),
+                    PrinterConfig::raw_config(&config("")),
+                )),
+            )
+            .unwrap();
+        printer
+            .add_object(PINS_OBJECT, Arc::new(PrinterPins::default()))
+            .unwrap();
+
+        // Factory table: generic `chip_provider` registers a chip, then late
+        // `late_consumer` looks it up.
+        let factories: &[(&str, Factories)] = &[
+            (
+                "chip_provider",
+                Factories {
+                    load_config: Some(register_test_chip),
+                    load_config_prefix: None,
+                    object: None,
+                    phase: Phase::Generic,
+                },
+            ),
+            (
+                "late_consumer",
+                Factories {
+                    load_config: Some(check_chip_resolved),
+                    load_config_prefix: None,
+                    object: None,
+                    phase: Phase::Late,
+                },
+            ),
+        ];
+
+        let config_text = "\
+            [chip_provider]
+            chip_name: my_probe_chip
+            [late_consumer]
+            chip_name: my_probe_chip
+        ";
+        let config = config(config_text);
+        let access = AccessTracking::shared();
+
+        // If the late section loads before the generic section, `chips()`
+        // would not contain the chip and this call would error.
+        // Because generic → late, the chip is registered first.
+        let claimed = printer
+            .load_sections(&config, &access, factories)
+            .expect("late section should resolve the chip registered by generic");
+
+        assert_eq!(claimed, ["chip_provider", "late_consumer"]);
     }
 }

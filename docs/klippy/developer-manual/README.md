@@ -285,7 +285,7 @@ identify 的命令**定义**（名称、参数、解码）与其它命令一样�
 | `ds18b20.rs` | 传感器工厂 `DS18B20`：1-wire 温度传感器，读 `serial_no` / `sensor_mcu` / `ds18_report_time`，周期查询经 `cmd/ds18b20.rs` |
 | `fan.rs` | `[fan]`：读 `pin` / `max_power` / `kick_start_time` / `off_below` / `cycle_time` / `hardware_pwm` / `shutdown_speed` / 可选 `enable_pin`（`tachometer_pin` 拒收，需 `pulse_counter`），注册 `M106` / `M107`；`call_later` 做 kick-start |
 | `gcode_move.rs` | G-Code 坐标系（无配置节，由 `[printer]` 的装载拉起）：偏移、G90/G91、M82/M83、速度/挤出系数；注册 `G0`/`G1`/`G92`/`M114`/`SET_GCODE_OFFSET`/`SAVE_GCODE_STATE` 等，并把工具头坐标交给 toolhead |
-| `toolhead.rs` | `[printer]`（`object = "toolhead"`，`phase = late`）：读 `kinematics` / `max_velocity` / `max_accel` / `max_z_velocity` / `max_z_accel` / `square_corner_velocity`，建运动栈与 rail，注册 `G4` / `M400` / `G28` / `SET_KINEMATIC_POSITION`；拉起 `gcode_move` 与 `query_endstops` |
+| `toolhead.rs` | `[printer]`（`object = "toolhead"`，`phase = late`）：读 `kinematics` / `max_velocity` / `max_accel` / `max_z_velocity` / `max_z_accel` / `square_corner_velocity`，建运动栈与 rail，注册 `G4` / `M400` / `G28` / `SET_KINEMATIC_POSITION`；提供探针式回零 `probing_move`（供 probe 族消费：`homing_move_begin` 先于采样、无触发报 `No trigger on probe after full movement`、移动前已触发报 `Probe triggered prior to movement`）；拉起 `gcode_move` 与 `query_endstops` |
 | `query_endstops.rs` | `query_endstops` 对象（由 `[printer]` 装载拉起，无配置节）：登记各 rail 的 endstop，注册 `QUERY_ENDSTOPS` / `M119`，`get_status` 报 `last_query` |
 | `i2c_device.rs` | `[i2c_device <name>]`：原始 I2C 设备，经 `McuI2c`；注册 mux `IIC_WRITE` / `IIC_READ`（键 `DEVICE`），十六进制 `DATA=` 经 `bus_debug` |
 | `spi_device.rs` | `[spi_device <name>]`：原始 SPI 设备，经 `McuSpi`；注册 mux `SPI_TRANSFER` / `SPI_SEND`（键 `DEVICE`） |

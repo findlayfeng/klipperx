@@ -426,24 +426,36 @@ FW5a–f / FW6a–f 已把「cartesian + 假 MCU 的 `G1`/`G28`」跑通并归�
       （2026-09-23 实跑）；原列的 C2 autosave（`pid_Kp` 49）是误归因——语料 0 个 `#*#` 区块，
       真因是选项名大小写，已修复归零。现在卡在 H2-3 `heater_fan`（22）、H10 `extruder_stepper`
       （2）、H1 `verify_heater`（2）与 F9/H7 `pulse_counter`（2）。
-- [ ] **T4. `probe` / `bltouch` / endstop pin chip**（25 次失败，2026-09-23 实跑）：`bed_mesh`、
-      `bltouch`、`eddy`、`screws_tilt_adjust`、`smart_effector`、`z_virtual_endstop` 等。
-      依赖 F8（endstop）与 H9（probe 模块）。
-- [ ] **T5. 运动学**（18 次失败，2026-09-23 实跑）：`delta`（9）、`generic_cartesian`（4）、
-      `rotary_delta`（2）、`polar` / `winch` / `deltesian`（各 1）。corexy 族已随 **C1c-1** 消失，
-      `none` 已在 T1。
-- [ ] **T6. TMC pin chip**（17 次失败，2026-09-23 实跑）：`Section 'tmc2209 stepper_x'`（11）、
-      `tmc2130`（2）、`tmc2208`（1）、`tmc2660`（1），pin chip `tmc2209_stepper_x` /
-      `tmc2130_stepper_x`（各 1）。依赖 H5（TMC）。
+- [ ] **T4. `probe` / `bltouch` / endstop pin chip**（35 次失败，2026-09-23 选项大小写修复后实测）：
+      `bed_mesh`、`bltouch`、`eddy`、`screws_tilt_adjust`、`smart_effector`、`z_virtual_endstop` 等。
+      依赖 F8（endstop，已 ✅）与 H9（probe 模块）。**施工序列**（scout 静态矩阵测算，每步以「移出
+      `IGNORED` 后通过」验收）：
+      **U1** 运动底座 `probing_move` ✅（2026-09-23：事件顺序、无触发报错、零位移报错）
+      → **U2** `extras/probe.rs`（`[probe]` 段 + `probe` chip + `PROBE`/`QUERY_PROBE`；chip 单独做是
+      **0 绿**——必要非充分）
+      → **U3** `manual_probe.rs` 命令族 + `configfile.set()` 记账桩
+      → **U4** `bed_mesh.py`（**首批 2 绿**：`bed_mesh.test`、`z_virtual_endstop.test`，随后验证模拟器上
+      的 `G28` via `probe:z_virtual_endstop`）
+      → **M6** `z_tilt`/`quad_gantry_level`/`bed_tilt`（+2 绿）→ **M7** `STEPPER_BUZZ`（H10，+1）
+      → **M2** `bltouch`（+1）→ **M4** `screws_tilt_adjust`（+1）→ **M3** `smart_effector`（+1）
+      → **M5** `probe_eddy_current`（+1，另需 `trigger_analog`，F9/H7）。
+      其余 37 条 printers 命中 probe 的配置另压跨域长尾（H2/H3/H4/H5/H7/H8 与 H9 兄弟段），不在本闭包内。
+      语料里 **0 个配置带 `#*#`**，autosave 不阻塞本批。
+- [ ] **T5. 运动学**（21 次失败，2026-09-23 选项大小写修复后实测）：`delta`（12）、
+      `generic_cartesian`（4）、`rotary_delta`（2）、`polar` / `winch` / `deltesian`（各 1）。
+      corexy 族已随 **C1c-1** 消失，`none` 已在 T1。
+- [ ] **T6. TMC pin chip**（28 次失败，2026-09-23 选项大小写修复后实测）：段 21（`tmc2209 stepper_x` 15、
+      `tmc2130` 2、`tmc2208` 2、`tmc2660` 1、`tmc5160` 1）+ pin chip 7（`tmc2209_stepper_x` 4、
+      `tmc2130_stepper_x` 3）。依赖 H5（TMC）。
 - [x] **T7. 温度传感器**（0 次失败）：✅ 已完成（见上）。
 - [x] **T8. `output_pin` 的 `value` 选项**（6 次失败）：✅ 已完成（阶段 0）。`value` 上界改为
       `scale`（PWM 才有 `scale`，默认 1），`scale` 不识别的问题随之消失。
-- [ ] **T9. 其余 extras 段**（2026-09-23 实跑的散项，按域归入 H1–H10）：`display`（16，H8）、
-      `filament_switch_sensor`（6，H7）、`adc_scaled`/`vref_scaled`（4，H1）、板级扩展
-      （`mcp4451` 2 + `ad5206`/`multi_pin`/`sx1509`/`replicape` 各 1，H2/H7）、`bed_screws`/
-      `dual_carriage`（各 2，H9/H10）、`pwm_cycle_time`（随 C1d），以及 `led`/`manual_stepper`/
-      `gcode_arcs`/`virtual_sdcard`/`exclude_object`/`gcode_macro`/`input_shaper`/`temperature_fan`/
-      `fan_generic`（各 1）。`static_digital_output` 已在阶段 0 落地，`stepper_z1`（多轴）已由
+- [ ] **T9. 其余 extras 段**（2026-09-23 选项大小写修复后实跑的散项，按域归入 H1–H10）：`display`（21，H8）、
+      `filament_switch_sensor`（8，H7）、`adc_scaled`/`vref_scaled`（4，H1）、板级扩展
+      （`mcp4451` 2 + `dac084s085` 2 + `ad5206`/`multi_pin`/`sx1509_duex`/`replicape` 各 1，H2/H7）、
+      `bed_screws`（3，H9）、`dual_carriage`/`safe_z_home`/`gcode_macro`（各 2），以及 `virtual_sdcard`/
+      `exclude_object`/`gcode_arcs`/`manual_stepper`/`pwm_cycle_time`/`led`/`input_shaper`/`temperature_fan`/
+      `fan_generic`/`controller_fan`（各 1）。`static_digital_output` 已在阶段 0 落地，`stepper_z1`（多轴）已由
       **C1a** 打开（相关运行的首次失败前移到 `z_tilt`/`quad_gantry_level`，属 H9）。
 - 备注：`printers.test` 有 2 条运行声明 `DICTIONARY pru.dict host=linuxprocess.dict`，默认不构建
       `pru`；要跑需 `KLIPPERX_ARCHES=…,pru`（需 `pru-gcc`）。
@@ -572,8 +584,12 @@ FW5a–f / FW6a–f 已把「cartesian + 假 MCU 的 `G1`/`G28`」跑通并归�
 
 ### H9 探测 / 调平 / 校准
 
-- [ ] 探针：`probe.py`、`bltouch.py`、`smart_effector.py`、`manual_probe.py`、
-      `safe_z_home.py`、`endstop_phase.py`。
+- [ ] 探针：`probe.py`（**运动底座已落地**：`probing_move` 在 `extras/toolhead.rs`，见 T4 施工序列 U1；
+      `[probe]` 段与 `probe` 虚拟 chip 待 U2）、`bltouch.py`、`smart_effector.py`、`probe_eddy_current.py`、
+      `manual_probe.py`、`safe_z_home.py`、`endstop_phase.py`。
+- **已知偏离（探针精度）**：本仓回零与探针移动返回**指令位置**，未按上游 `StepperPosition.note_home_end`
+      + `calc_toolhead_pos` 用触发步数反算；`home_start` 的 `rest_time` 也硬编码（上游 `_calc_endstop_rate`
+      按 move 距离与步数计算）。两者都影响真实探针 Z 精度，属后续精度单元；模拟器语料不受影响。
 - [ ] 调平：`bed_mesh.py`（含 `bed_mesh/dump_mesh` 端点）、`bed_tilt.py`、
       `quad_gantry_level.py`、`z_tilt.py`。
 - [ ] 螺丝：`bed_screws.py`、`screws_tilt_adjust.py`。

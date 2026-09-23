@@ -47,6 +47,33 @@ pre-commit 钩子会自动跑 `cargo fmt --all` 并重新暂存 `.rs`（新检�
 git config core.hooksPath .githooks
 ```
 
+## 改完必须同步手册
+
+**每次修改完成后，必须在同一批改动里完成受影响的手册修改**，与代码一起提交——
+手册不是“以后再补”的尾巴。手册滞后就是上次全面审计发现 16 类过时断言的根因，
+不要制造下一批。
+
+改什么，就同步哪本：
+
+| 改动 | 同步到 |
+|------|--------|
+| `src/core/klippy/` 的行为、结构、模块增删 | [开发手册](docs/klippy/developer-manual/README.md)对应页（模块表 + 专题页） |
+| G-Code 命令增删改、配置节/选项增删改 | [G-Code 命令参考](docs/klippy/user-manual/gcode-commands.md) / [配置文件参考](docs/klippy/user-manual/config.md) |
+| 客户端交互、日志行为 | [客户端使用](docs/klippy/user-manual/client.md) / [日志与调试](docs/klippy/user-manual/logging.md) |
+| `klippy-api` / `klippy-client`、线上形状、端点 | [第三方开发手册](docs/klippy/third-party-dev/README.md)（`api-reference.md` 与端点状态表要一起改） |
+| 新增模块或测试、覆盖变化 | [测试](docs/klippy/developer-manual/testing.md)的覆盖清单 |
+| 回归数字、忽略列表、转绿状态 | [回归测试](docs/klippy/developer-manual/regression-tests.md) |
+
+两条硬要求：
+
+1. **写死的数字与名字必须重核**：测试名、端点条数、计数、二进制大小、工单号——
+   提交前逐个对回源码/实测（悬空的工单号与“已完成当待办”的引用同样是过时）。
+2. **旧断言随实现一起改**：功能落地、工单完成、行为变更时，把手册与源码注释里
+   对应的“尚未实现 / 待办 / 属某工单”一并改成现状，不要留下新旧两种说法。
+
+提交前自查：手册里关于被改对象的每句话，现在还能对着源码成立吗？细则见
+[测试 → 文档同步](docs/klippy/developer-manual/testing.md#文档同步)。
+
 ## 读什么
 
 | 任务类型 | 先读 |
@@ -59,8 +86,7 @@ git config core.hooksPath .githooks
 | 查看当前待办与工单 | [`TODO.md`](TODO.md) |
 | 一次性分析/盘点背景 | [工作记录](docs/work-log/README.md)（非规范） |
 
-改动 `msg` / `mcu` / `cmd` / `event` / `identify` / `api` 的公开 API 或分层职责时，
-**同一批改动里**同步开发手册对应页面（细则见[测试 → 文档同步](docs/klippy/developer-manual/testing.md#文档同步)）。
+改动后的同步义务见上一节[改完必须同步手册](#改完必须同步手册)。
 
 ## 常用命令
 

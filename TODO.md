@@ -230,12 +230,15 @@ toolhead / 开放事件）一起补，一部分是现在就独立可补的小行
       - 回零 drip 的 `sleep` 与 `completion.wait()` 用 `select!` 竞赛，避免丢唤醒。
       - 验收：`a_homing_move_runs_against_the_fake_firmware`（带 endstop 的 `G28` 跑通且
         进程干净退出，释放后 `Mcu::Drop` 运行）；默认套件绿。
-- [ ] **剩余（另一个时序问题，与环无关）**：`KLIPPERX_UPSTREAM_ALL=1` 在 `commands.test`
-      （`QUERY_ENDSTOPS` → `M18` → `G28`）仍**间歇**卡住（约一半）；已复现：只要 `G28` 前
-      有 `QUERY_ENDSTOPS` 就更容易卡。两个处理器都用
-      `block_in_place + Handle::block_on`，怀疑与「同步 g-code 处理器内嵌 block_on」
-      及假 MCU 即时响应有关。要么改用专用 runtime/任务 + 通道驱动这两个异步动作，
-      要么在回归里暂时跳过回零。
+- [x] **剩余时序问题（2026-09-23，已解决）**：`KLIPPERX_UPSTREAM_ALL=1` 在 `commands.test`
+      （`QUERY_ENDSTOPS` → `M18` → `G28`）间歇卡住，根因是「同步 g-code 处理器用
+      `block_in_place + Handle::block_on` 驱动异步动作」导致 runtime 的定时器被饿住（连
+      `call_msg` 的 1s 超时都不触发）。修法：g-code 处理链与客户端 API 边界**全面 async**
+      （`CommandHandler` 返回 boxed future、`Endpoint::handle` 返回 `EndpointFuture`），
+      三个机器侧 `block_in_place` 桥与两个 API 侧临时桥（`run_script_blocking` /
+      `query_all_blocking`）全部删除，见提交 `1782721`、`e05135b`。
+      验收：`KLIPPERX_UPSTREAM_ALL=1` 不再卡（~1.06s 跑完），首次失败分布前移到 H2/H1 的真实
+      缺口（`fan` 82、autosave `pid_Kp` 49、`probe` 25 …）。
 
 #### F9 其他输入与外设资源
 

@@ -29,12 +29,22 @@
    ```
 
    现有布局：主检出 `…/klipperx` → `work`；并行任务在 `…/klipperx.worktrees/<短名>`。
+   此命令只由 main 执行，见规则 5。
 3. **开工前先看状态**：`git status` 确认工作区干净再切分支；发现已有未提交改动先报告，
    不要替用户 stash 或丢弃。
 4. **任务完成后**：提交到自己的分支（提交信息遵循仓库现有风格，见下），**不自动合入 `work`**；
-   合并由用户决定，或用户明确授权时再合。
-5. **worktree 用完要收拾**：任务合并或放弃后，`git worktree remove <路径>` 清掉，
-   避免 `.worktrees/` 下堆积僵尸目录。
+   是否合并由用户决定（或用户明确授权时再合），**合并操作本身也由 main 执行**——
+   worker/子代理不得自行 `git merge`/`rebase`/`cherry-pick` 到其他分支，只负责在自己的
+   分支上提交。
+5. **worktree 生命周期只归 main**：git 工作空间的**开辟**（`git worktree add`）
+   与**验收后的销毁**（任务合并或放弃、验收通过后执行 `git worktree remove <路径>`，
+   避免 `.worktrees/` 下堆积僵尸目录）都由 main（主代理）统一完成；**worker/子代理
+   不得自行开辟、销毁或清理 git 工作空间**（含 `worktree add/remove/prune`），只在
+   main 分配好的 worktree 内编辑、构建、提交。
+6. **不操作任何远程仓库**：所有工作只在本地进行，**禁止对远程仓库做任何操作**——
+   含 `git push` / `pull` / `fetch` / `clone`、`git remote add/remove/set-url`、
+   子模块与镜像同步等一切远程交互；也不要把 worktree/分支推到远端。需要远端操作时
+   先报告用户，由用户自己执行。
 
 ### 提交信息风格
 

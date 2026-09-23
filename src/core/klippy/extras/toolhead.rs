@@ -101,9 +101,6 @@ const FLUSH_INTERVAL: Duration = Duration::from_millis(10);
 /// How old a finished move may stay in the trapq history before it is dropped.
 const MOVE_HISTORY_EXPIRE: f64 = 30.0;
 
-/// The speed a `G1` uses before any `F` (`gcode_move`'s initial `self.speed`).
-const DEFAULT_MOVE_SPEED: f64 = 50.0;
-
 /// The cartesian-family kinematics `[printer] kinematics` may name.
 ///
 /// They share one `CartesianKinematics` (limits, homing, `check_move`) and
@@ -388,14 +385,9 @@ impl ToolHeadObject {
         let gcode = printer
             .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
             .expect("the loader registers `gcode` before any section");
-        let speed = Arc::new(Mutex::new(DEFAULT_MOVE_SPEED));
-
-        let move_handler = move_command(Arc::clone(&self.state), Arc::clone(&speed));
-        for name in ["G0", "G1"] {
-            gcode
-                .register_command(name, Arc::clone(&move_handler), None, false)
-                .map_err(ConfigError::new)?;
-        }
+        // `G0`/`G1` are `gcode_move`'s: they interpret g-code coordinates
+        // before the toolhead sees them (upstream `ToolHeadCommandHelper` has
+        // no move commands for the same reason).
         let dwell_handler: CommandHandler = {
             let state = Arc::clone(&self.state);
             sync(move |gcmd| cmd_dwell(&state, gcmd))
@@ -412,7 +404,8 @@ impl ToolHeadObject {
             .map_err(ConfigError::new)?;
         let position_handler: CommandHandler = {
             let state = Arc::clone(&self.state);
-            sync(move |gcmd| cmd_set_kinematic_position(&state, gcmd))
+            let printer = Arc::downgrade(printer);
+            sync(move |gcmd| cmd_set_kinematic_position(&state, &printer, gcmd))
         };
         gcode
             .register_command(
@@ -648,6 +641,33 @@ impl ToolHeadObject {
             .as_ref()
             .map(|connected| connected.toolhead.print_time())
             .unwrap_or(0.0)
+    }
+
+    /// Queue a move to `position` at `speed` mm/s (upstream's `toolhead.move`).
+    ///
+    /// The toolhead plans it; deciding *what* the coordinates mean — absolute
+    /// or relative, against which `G92` anchor, at what extrude factor — is
+    /// `gcode_move`'s job, and it is what calls this.
+    ///
+    /// # Errors
+    /// "Printer is not ready" before connect, or whatever the planner refuses:
+    /// an unhomed axis, a move out of range.
+    pub fn move_to(&self, position: Coord, speed: f64) -> Result<(), CommandError> {
+        let mut guard = self.lock();
+        let Some(connected) = guard.as_mut() else {
+            return Err(CommandError::new("Printer is not ready"));
+        };
+        connected.toolhead.move_to(position, speed)
+    }
+
+    /// The commanded position (upstream's `toolhead.get_position`).
+    ///
+    /// `None` before connect: there is no planner to ask yet, and
+    /// `gcode_move` only anchors itself at ready.
+    pub fn position(&self) -> Option<Coord> {
+        self.lock()
+            .as_ref()
+            .map(|connected| connected.toolhead.commanded_pos())
     }
 }
 
@@ -895,7 +915,10 @@ async fn home_axes(
             printer,
         )
         .await;
-        send(printer, &KlippyEvent::HomingHomeRailsEnd);
+        send(
+            printer,
+            &KlippyEvent::HomingHomeRailsEnd { axes: vec![axis] },
+        );
         result?;
     }
     Ok(())
@@ -995,43 +1018,6 @@ fn command_error(err: McuError) -> CommandError {
 // ===========================================================================
 
 /// `G0` / `G1`: move the toolhead.
-fn move_command(state: Arc<Mutex<Option<Connected>>>, speed: Arc<Mutex<f64>>) -> CommandHandler {
-    sync(move |gcmd| {
-        let mut guard = state.lock().unwrap_or_else(|poison| poison.into_inner());
-        let Some(connected) = guard.as_mut() else {
-            return Err(CommandError::new("Printer is not ready"));
-        };
-        let current = connected.toolhead.commanded_pos();
-        let mut newpos = current;
-        for (axis, name) in [
-            (X_AXIS, "X"),
-            (Y_AXIS, "Y"),
-            (Z_AXIS, "Z"),
-            (crate::core::klippy::mathutil::E_AXIS, "E"),
-        ] {
-            // An absent axis keeps the current value, which is what upstream's
-            // `gcode_move` does before it applies base offsets (H3).
-            let value = gcmd.get_float_default(name, current.axis(axis))?;
-            newpos.set_axis(axis, value);
-        }
-        if gcmd.get_command_parameters().contains_key("F") {
-            let feed = gcmd.get_float("F")?;
-            if feed <= 0.0 {
-                return Err(CommandError::new(format!(
-                    "Invalid speed in '{}'",
-                    gcmd.commandline()
-                )));
-            }
-            *speed.lock().unwrap_or_else(|poison| poison.into_inner()) = feed / 60.0;
-        }
-        let speed = *speed.lock().unwrap_or_else(|poison| poison.into_inner());
-        connected
-            .toolhead
-            .move_to(newpos, speed)
-            .map_err(|err| CommandError::new(err.to_string()))
-    })
-}
-
 /// `G4`: dwell. `P` is milliseconds, `S` is seconds (`S` wins when both are
 /// given, as a config that writes both probably means the longer one).
 fn cmd_dwell(
@@ -1068,6 +1054,7 @@ fn cmd_wait_moves(
 /// `SET_KINEMATIC_POSITION`: force the low-level position (`force_move.py:118`).
 fn cmd_set_kinematic_position(
     state: &Arc<Mutex<Option<Connected>>>,
+    printer: &Weak<Printer>,
     gcmd: &GcodeCommand,
 ) -> Result<(), CommandError> {
     let mut guard = state.lock().unwrap_or_else(|poison| poison.into_inner());
@@ -1092,6 +1079,13 @@ fn cmd_set_kinematic_position(
     if let Some(kinematics) = connected.toolhead.kinematics_mut() {
         kinematics.clear_homing_state(&clear_axes);
     }
+    drop(guard);
+    // Upstream's `ToolHead.set_position` fires this (`toolhead.py:390`) and
+    // `force_move.cmd_SET_KINEMATIC_POSITION` reaches it through there; the
+    // low-level `motion::ToolHead` has no printer, so the command does.
+    // `gcode_move` re-anchors `last_position` to the toolhead on it — what
+    // keeps a `G1` that omits an axis from dragging a stale one along.
+    send(printer, &KlippyEvent::ToolheadSetPosition);
     Ok(())
 }
 
@@ -1151,7 +1145,12 @@ pub(crate) fn load_config(
     config: &ConfigWrapper,
     printer: &Arc<Printer>,
 ) -> Result<Arc<dyn PrinterObject>, ConfigError> {
-    Ok(Arc::new(ToolHeadObject::new(config, printer)?))
+    let object = ToolHeadObject::new(config, printer)?;
+    // Upstream's `add_printer_objects` loads the default modules right after
+    // the toolhead (`toolhead.py:610-613`), and `gcode_move` is the first of
+    // them: it is what turns g-code coordinates into the toolhead's.
+    crate::core::klippy::extras::gcode_move::ensure(printer)?;
+    Ok(Arc::new(object))
 }
 
 // ===========================================================================
@@ -1371,20 +1370,21 @@ mod tests {
         (state, GCodeDispatch::new(printer))
     }
 
-    #[tokio::test]
-    async fn test_g1_parses_axes_and_speed_into_a_move() {
-        let (state, gcode) = connected(homed_toolhead());
-        let handler = move_command(Arc::clone(&state), Arc::new(Mutex::new(DEFAULT_MOVE_SPEED)));
-        let command = gcode.create_gcode_command(
-            "G1",
-            "G1 X10 F600",
-            HashMap::from([
-                ("X".to_string(), "10".to_string()),
-                ("F".to_string(), "600".to_string()),
-            ]),
-        );
+    /// A move goes through the planner to the trapq — the half of `G1` that
+    /// was always the toolhead's. Parsing the words into a coordinate is
+    /// `gcode_move`'s now; see its tests.
+    #[test]
+    fn test_a_move_reaches_the_planner() {
+        let (state, _gcode) = connected(homed_toolhead());
 
-        handler(&command).await.unwrap();
+        state
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .toolhead
+            .move_to(Coord::new(10.0, 0.0, 0.0, 0.0), 10.0)
+            .unwrap();
         // Flushing moves the look-ahead into the trapq; a single short move does
         // not trigger the flush on its own.
         state
@@ -1398,77 +1398,28 @@ mod tests {
         let guard = state.lock().unwrap();
         let connected = guard.as_ref().unwrap();
         assert_eq!(connected.toolhead.commanded_pos().x(), 10.0);
-        // Y and Z kept their previous values.
-        assert_eq!(connected.toolhead.commanded_pos().y(), 0.0);
         // The move reached the trapq and can generate steps.
         assert!(!connected.toolhead.trapq().moves().is_empty());
     }
 
-    #[tokio::test]
-    async fn test_g1_remembers_the_last_speed() {
-        let (state, gcode) = connected(homed_toolhead());
-        let handler = move_command(Arc::clone(&state), Arc::new(Mutex::new(DEFAULT_MOVE_SPEED)));
-        handler(&gcode.create_gcode_command(
-            "G1",
-            "G1 X10 F600",
-            HashMap::from([
-                ("X".to_string(), "10".to_string()),
-                ("F".to_string(), "600".to_string()),
-            ]),
-        ))
-        .await
-        .unwrap();
-        // The second move has no F and must reuse the first one.
-        handler(&gcode.create_gcode_command(
-            "G1",
-            "G1 X20",
-            HashMap::from([("X".to_string(), "20".to_string())]),
-        ))
-        .await
-        .unwrap();
-
-        let guard = state.lock().unwrap();
-        assert_eq!(guard.as_ref().unwrap().toolhead.commanded_pos().x(), 20.0);
-    }
-
-    #[tokio::test]
-    async fn test_g1_rejects_a_non_positive_feedrate() {
-        let (state, gcode) = connected(homed_toolhead());
-        let handler = move_command(Arc::clone(&state), Arc::new(Mutex::new(DEFAULT_MOVE_SPEED)));
-        let command = gcode.create_gcode_command(
-            "G1",
-            "G1 X10 F0",
-            HashMap::from([
-                ("X".to_string(), "10".to_string()),
-                ("F".to_string(), "0".to_string()),
-            ]),
-        );
-
-        let err = handler(&command).await.unwrap_err();
-
-        assert!(err.to_string().contains("Invalid speed"), "{err}");
-    }
-
-    #[tokio::test]
-    async fn test_g1_refuses_a_move_on_an_unhomed_axis() {
+    #[test]
+    fn test_a_move_on_an_unhomed_axis_is_refused() {
         let mut toolhead = homed_toolhead();
         toolhead.set_position(Coord::default(), &[]);
         // Clearing the homed axes is what an unhomed machine looks like.
         if let Some(kinematics) = toolhead.kinematics_mut() {
             kinematics.clear_homing_state(&[X_AXIS, Y_AXIS, Z_AXIS]);
         }
-        let (state, gcode) = connected(toolhead);
-        let handler = move_command(Arc::clone(&state), Arc::new(Mutex::new(DEFAULT_MOVE_SPEED)));
-        let command = gcode.create_gcode_command(
-            "G1",
-            "G1 X10 F600",
-            HashMap::from([
-                ("X".to_string(), "10".to_string()),
-                ("F".to_string(), "600".to_string()),
-            ]),
-        );
+        let (state, _gcode) = connected(toolhead);
 
-        let err = handler(&command).await.unwrap_err();
+        let err = state
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .toolhead
+            .move_to(Coord::new(10.0, 0.0, 0.0, 0.0), 10.0)
+            .unwrap_err();
 
         assert!(err.to_string().contains("Must home axis first"), "{err}");
     }
@@ -1514,7 +1465,7 @@ mod tests {
             ]),
         );
 
-        cmd_set_kinematic_position(&state, &command).unwrap();
+        cmd_set_kinematic_position(&state, &Arc::downgrade(&gcode.printer()), &command).unwrap();
 
         let guard = state.lock().unwrap();
         let connected_ref = guard.as_ref().unwrap();

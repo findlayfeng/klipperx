@@ -176,8 +176,20 @@ toolhead / 开放事件）一起补，一部分是现在就独立可补的小行
 
 ### G4 运动命令（G0/G1/G28/G92/M114…）
 
-- [ ] 由 toolhead 注册，随 **C1**；gcode 层不需为它们改什么，只要命令表够通用
-      （含 `register_mux_command`，给 `SET_PIN` 这类 `PIN=` 选择用）。
+- [x] **G4-1 `gcode_move`（坐标系核心）**：✅ 新 `extras/gcode_move.rs`（按名字加载，同
+      `toolhead.py:610-613` 的 default modules 列表）；`G0`/`G1` 从 toolhead **搬家**到这一层，
+      `toolhead` 只留 `move_to`/`position`（上游 `toolhead.move`/`get_position`）。
+      命令：`G0/G1`、`G20/G21`、`G90/G91`、`M82/M83`、`G92`、`M220/M221`、
+      `SET_GCODE_OFFSET`、`SAVE`/`RESTORE_GCODE_STATE`、`M114`；`get_status`。
+      重置链四条：`klippy:ready`（解析 move target）、`homing:home_rails_end`（**新** `axes`
+      载荷，只给回零过的轴重新锚定）、`toolhead:set_position`（**新**发送方：
+      `SET_KINEMATIC_POSITION`）、`gcode:command_error`。
+      调查与拍板见 [G4 notes](docs/work-log/2026-09-23-gcode-move-notes.md)。
+- [ ] **G4-2 外围**：`GET_POSITION`（要 `kin.get_steppers()` + `calc_position` + MCU 位置）、
+      extra-axes 的 `axis_map`（`Coord` 目前固定 4 轴）、`toolhead:manual_move` /
+      `toolhead:update_extra_axes` / `extruder:activate_extruder` 的发送方（等它们的 API）、
+      `move_transform`（等 `bed_mesh`）。
+- [x] 命令表够用：由 toolhead/gcode_move 注册，`register_mux_command`（`SET_PIN` 这类）可用。
 
 ### B4 其余端点（机制部分 FW9）
 
@@ -285,8 +297,9 @@ FW5a–f / FW6a–f 已把「cartesian + 假 MCU 的 `G1`/`G28`」跑通并归�
       `trilateration`/`gaussian_solve`）。
 - [ ] **C1c-3 generic_cartesian**。
 - [ ] **C1c-4 polar**。
-- [ ] **C1d `gcode_move` + print-time 回调**：`[gcode_move]`（G92/M114/G90/G91/M82/M83/
-      `SET_GCODE_OFFSET`/状态保存）与 `ToolHead::register_lookahead_callback`。
+- [ ] **C1d print-time 回调**：`ToolHead::register_lookahead_callback` +
+      `motion_queuing.register_flush_callback`（`output_pin` 的 `GCodeRequestQueue` 与
+      `fan`/`servo`/`pwm_cycle_time` 等着它）。`gcode_move` 的坐标系部分已由 **G4-1** 落地。
 
 > **T3 的边界**：`[extruder]` 段依赖 H1 的 `heaters::setup_heater`，因此 **T3 = C1b + H1**，
 > 不是 C1 单独可解。T5 按 C1c 的族顺序推进；T10 指向 C1a。
@@ -457,10 +470,17 @@ FW5a–f / FW6a–f 已把「cartesian + 假 MCU 的 `G1`/`G28`」跑通并归�
 - [ ] **H2-3 `heater_fan.py`**：需要 `heaters::{add_heater,lookup_heater}` + `Heater::get_temp`
       （H1 面），`klippy:ready` 起每秒 timer。
 - [ ] **H2-4 `controller_fan.py`**：`stepper_enable::get_steppers`/`lookup_enable` 已有。
-- [ ] **转绿卡点（T3/H1 共用，不是 H2 的 section）**：`printers.test` 那 52 次运行现在能加载，
-      却卡在 `Extrude below minimum temp`（48）。上游不卡是因为 `test_klippy.py` 带 `-o` →
-      `MCU.is_fileoutput()` → `heaters.py:39` 的 `can_extrude` 初值为真；本仓库还没有
-      `debugoutput`/`is_fileoutput` 这条路径（FW4 notes §191 已列）。
+- [x] **转绿卡点 1（`is_fileoutput`，T3/H1 共用）**：✅ `Printer::is_fileoutput()`
+      （= `start_args['debugoutput']`，`mcu.py:1169`）+ `heaters.py:38-39` 的
+      `can_extrude` 初值 + 回归 harness 模拟 `test_klippy.py` 的 `-o`。上游每个用例都带
+      `-o`，温度查询永远无人应答，所以 `can_extrude` 必须初值为真。`Extrude below minimum
+      temp` **48 → 0**。
+- [x] **转绿卡点 2（`gcode_move`，G4/H10）**：✅ `Move out of range` **49 → 0**，回归失败运行
+      **235 → 187**（一次多转绿 48 次）。
+- [ ] **转绿卡点 3（`pid_Kp` autosave，C2/H1）**：新的首位是
+      `Option 'pid_Kp' in section 'extruder' must be specified`（40）+ `heater_bed`（9）＝49——
+      上游的 `PID_CALIBRATE` 自动保存把这几项写回配置（`configfile` 的 `#*#` 区块），
+      配置里没写就直接报错；本仓库还没读 autosave 区块（**C2 autosave/`SAVE_CONFIG`**）。
 - [ ] `pwm_tool.py`（队列化 PWM，随运动）、`pwm_cycle_time.py`、`static_digital_output.py`、
       `static_pwm_clock.py`。
 - [ ] `multi_pin.py`、`servo.py`、`duplicate_pin_override.py`。
@@ -540,7 +560,7 @@ FW5a–f / FW6a–f 已把「cartesian + 假 MCU 的 `G1`/`G28`」跑通并归�
 
 ### H10 运动相关 extras
 
-- [ ] `gcode_move.py`（G0/G1/G28/G92/M114…，即 **G4** 的实现体）。
+- [x] **`gcode_move.py`（G4-1）**：坐标系核心已落地，见 **G4** 小节；G4-2 外围待做。
 - [ ] `gcode_arcs.py`（G2/G3）、`force_move.py`、`manual_stepper.py`、
       `stepper_enable.py`、`extruder_stepper.py`。
 - [ ] `idle_timeout.py`（`idle_timeout:*` 事件）、`motion_queuing.py`、

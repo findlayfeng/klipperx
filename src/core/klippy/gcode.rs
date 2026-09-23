@@ -522,6 +522,12 @@ impl GCodeDispatch {
         dispatch
     }
 
+    /// The printer this dispatcher reports to (`gcode:request_restart` and
+    /// friends are sent there).
+    pub fn printer(&self) -> Arc<Printer> {
+        Arc::clone(&self.inner.printer)
+    }
+
     /// Register a command handler.
     ///
     /// `when_not_ready` keeps it available before the printer is ready, which is

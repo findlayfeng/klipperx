@@ -67,8 +67,6 @@ fn bisect_left(values: &[f64], value: f64) -> usize {
 
 /// The `[manual_probe]` section (`manual_probe.py:ManualProbe`).
 pub struct ManualProbe {
-    /// The machine, for the helper's toolhead and the autosave write-back.
-    printer: Weak<Printer>,
     /// `[stepper_z] position_endstop`, when there is one: it is what
     /// `Z_ENDSTOP_CALIBRATE` writes back, and its absence is why that command
     /// is not registered on a printer without a Z endstop.
@@ -181,7 +179,6 @@ impl ManualProbe {
 
         let _ = identifier;
         Ok(Self {
-            printer: Arc::downgrade(printer),
             z_position_endstop,
             status,
         })

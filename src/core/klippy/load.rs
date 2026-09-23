@@ -342,6 +342,7 @@ mod tests {
                 "output_pin",
                 "adc_temperature",
                 "thermistor",
+                "bed_mesh",
                 "board_pins",
                 "manual_probe",
                 "probe",

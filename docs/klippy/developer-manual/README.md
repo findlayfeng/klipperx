@@ -320,6 +320,63 @@ API 本身在 `crates/klippy-api/src/`：
 
 端点自己不拼应答信封：它只返回 payload 或 `ApiError`，`id` 的回显与「无 `id` 就不应答」由 `protocol.rs` 一处决定，端点无从弄错。
 
+### `motion/` — 运动栈
+
+规划、梯形队列与步进生成：上游摊在 `toolhead.py` + C `chelper/` + `motion_quuing.py` 三处，
+这里是按层拆开的一个模块。只被 `extras/toolhead.rs`（`[printer]`）与 `gcode_move` 消费。
+
+| 文件 | 职责 |
+|------|------|
+| `plan.rs` | `Move` 与 `LookAheadQueue`：主机侧规划器，决定每个 move 的速度（前瞻、拐角、Z 限速） |
+| `trapq.rs` | 梯形速度队列：步进生成器读它的段（含相续填补、过期提取） |
+| `itersolve.rs` | 每个 stepper 的位置求解器：把轨迹变成步进时刻（含 cartesian/corexy/corexz 族的位置函数） |
+| `stepcompress.rs` | 把步进时刻压成 `queue_step(interval, count, add)` 批（SDS 过滤、方向切换、history 回溯，与上游 C 实现对拍） |
+| `stepper.rs` | 运动层眼中的 stepper：一个 stepper 的位置/历史/生成接口，与 MCU 侧资源对接 |
+| `toolhead.rs` | `ToolHead`：print time 跟踪、move 入队、dwell、`drip_move`（回零直灌）与 flush 调度 |
+| `queuing.rs` | `MotionQueuing`：多个 trapq 的输出队列（当前是同步 flush；上游的定时器节奏属 C1d） |
+| `kinematics.rs` | `Kinematics` / `HomingState` trait、`MoveContext`，以及 cartesian 族（`CartesianTransform`：Standard/CoreXy/CoreXz/Hybrid*）与 `NoneKinematics`（`kinematics: none`） |
+| `extra.rs` | 额外轴（挤出机 E 轴）：不属于运动学、有自己 trapq 的轴 |
+| `mod.rs` | 模块出口与公共类型 |
+
+### `config/` — 配置解析、记录与校验
+
+| 文件 | 职责 |
+|------|------|
+| `mod.rs` | INI 风格解析器：节/参数/注释/多行值/空节，与上游 `configparser` 行为对齐（节头行内注释、`:`/`=` 等价、缩进续行等四处曾分歧、已修） |
+| `section.rs` | `ConfigSection`：一个节（id + sub + 参数）的存储与遍历（按插入序、按 id 过滤） |
+| `value.rs` | `ConfigValue`：单行 / 多行值 |
+| `source.rs` | 配置来源（文件路径）的表示 |
+| `wrapper.rs` | `ConfigWrapper`：带**读取记录**的类型化视图（`get_*` 家族、`sibling` / `has_sibling`），读取记录就是 schema |
+| `access.rs` | `AccessTracking`：每个节/选项谁读过的账本 |
+| `validate.rs` | `check_unused`：装载末尾拒绝没人读过的节与选项（上游 `ConfigValidate.check_unused`） |
+| `mcu.rs` | `[mcu]` 节的专用解析：传输键二选一（`serial`/`canbus_*`/`host_library`/`test`）、`baud`/`restart_method`/`usb_power` 校验，产出 `McuConfig` |
+| `object.rs` | `configfile` 打印机对象：面向客户端的配置状态与五种 `warnings` 形状 |
+
+### `interface/` — 传输与设备
+
+`Mcu` 只见 `Device` trait（`send` / 阻塞 `receive` / `shutdown`）；字节怎么走是下面各实现的事。
+
+| 文件 | 职责 |
+|------|------|
+| `mod.rs` | `Interface`：在 `spawn_blocking` 里跑设备 I/O、持有机器 runtime handle（`with_transport` 是唯一的 ambient 捕获点）、`off_runtime`；`Interface` 可克隆共享设备 |
+| `devices/serial.rs` | `SerialDevice`：tty 字节流（raw 模式、`termios2`、阻塞读） |
+| `devices/canserial.rs` | `CanSerialDevice`：SocketCAN——承载的仍是同一份 serial 字节流（8 字节切 CAN 帧、`0x100+2n` 寻址、admin 报文指派节点号） |
+| `devices/host.rs` | `HostDevice`：`dlopen` klipper host 库，输入输出都是协议字节（测试逐字节、发布走整帧接口） |
+| `devices/simulator.rs` | `SimulatorDevice`（`test: dict=…`）：字典驱动的应答机——分块回 zlib 字典、记 `finalize_config` 的 CRC、回 ack、回答时钟，回归语料的端到端就跑在它上面 |
+| `devices/frame_mock.rs` | `FrameMock`：测试夹具——FIFO 精确帧比对 + 预设输出帧 |
+| `pty.rs` | `posix_openpt` 开的 pty 对（仅 `cfg(test)`）：串口测试需要真内核 tty 时用 |
+| `usb.rs` | `restart_method: rpi_usb` 的 USB 端口切电：sysfs 拓扑发现（tty→hub→端口号）与两种机制（sysfs `disable` / `nusb` 控制传输） |
+| `error.rs` | `InterfaceError`：打开失败 / 关闭等传输层错误 |
+
+### 零散顶层文件
+
+| 文件 | 职责 |
+|------|------|
+| `frame.rs` | `Frame` 与 `FrameStream`：Klipper 的帧格式（长度、序号、载荷、CRC、`0x7e` SYNC）与分包重组——**所有字节流设备共用**，新设备不要自己再实现一遍 |
+| `error.rs` | 主机错误词汇：`KlippyError`（Connection/Protocol/Request/Parse/Config/Internal）与 `ConfigError`——决定错误把机器带到哪个状态 |
+| `mathutil.rs` | 运动栈共用的数值帮助（`Coord` 等，上游散在 `gcode.py`） |
+| `upstream.rs` | 上游 `.test` 语料的 harness（`#[cfg(test)]`）：语料解析、缺口报告、`IGNORED` 守卫、端到端运行，见[回归测试](regression-tests.md) |
+
 ## 二进制
 
 | 二进制 | 入口 | 是什么 |

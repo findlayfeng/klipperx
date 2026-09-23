@@ -150,7 +150,7 @@ impl Control {
 ///
 /// Upstream's `Heater` (`klippy/extras/heaters.py:14-160`): it owns the sensor
 /// callback, the bang-bang/PID control loop and the PWM output. The periodic
-/// `verify_heater` check is H1-3.
+/// `verify_heater` check is not wired yet (upstream `verify_heater.py`).
 pub struct Heater {
     /// The section's short name (`extruder`, `heater_bed`).
     name: String,

@@ -194,14 +194,19 @@ connect_file(输出文件, 字典):
 - 头两个转绿的用例：`linuxtest.test`（只需 `kinematics: none`、`heaters` 的传感器注册表、
   `temperature_sensor` 与 `ds18b20`，g-code 只是一次 `G4 P1000`）；随后 `gcode_move`（G4-1）与
   `EXTRUDER` 默认项（e8bf2b7）让 `commands.test` 与 `out_of_bounds.test` 也过了守卫，移出忽略列表。
-- `KLIPPERX_UPSTREAM_ALL=1` 只去掉忽略列表这一层：默认构建下它会跑 237 条可用运行，其中 3 条
-  通过、**234 条**在配置装载阶段失败，另外 2 条以「字典未构建」计入统计，不算失败。
+- `KLIPPERX_UPSTREAM_ALL=1` 只去掉忽略列表这一层：默认构建下它会跑 237 条可用运行，其中 **51 条
+  通过、186 条失败**（2026-09-23 实跑），另外 2 条以「字典未构建」计入统计，不算失败。失败大多
+  在配置装载阶段，个别在 g-code / 就绪阶段（`Move out of range`、`not ready: Pin …`）。失败原因的
+  逐项分布记在 [上游回归测试失败原因分析](../../work-log/2026-09-22-upstream-regression-failures.md)
+  的最新快照与 `TODO.md` 的 T 节，本页不重复维护。
 - 按「首次失败原因」的分组（T3–T10 工单）、运动学细分与完整失败日志不在本手册重复维护，
   统一见 [上游回归测试失败原因分析](../../work-log/2026-09-22-upstream-regression-failures.md)
   （2026-09-22 快照，含 T7 完成后的状态与复盘）。
-- 要让实际执行数继续上升：从 `IGNORED` 移除已落地节/运动学的文件。T3（`extruder`/`heater_bed`/`fan`）
-  三个段已落地，可先试移 `extruders.test` / `temperature.test` 等文件；剩余缺口中 T4（`probe`/
-  `bltouch`/endstop pin chip）尚未动工，T5 运动学已消掉 corexy 族（C1c-1）剩下 delta 等。
+- 要让实际执行数继续上升：把「移出 `IGNORED` 后全部可跑运行都通过」的文件移除（守卫
+  `ignored_cases_still_fail` 会逐个提示）。T3（`extruder`/`heater_bed`/`fan`）三个段已落地，但
+  `extruders.test` / `temperature.test` 的首败已前移到 `extruder_stepper` / `temperature_fan`
+  （2026-09-23 实跑），仍要留在列表；T4（`probe`/`bltouch`/endstop pin chip）尚未动工，T5
+  运动学已消掉 corexy 族（C1c-1）剩下 delta 等。
 
 ### 推进口径与验收
 

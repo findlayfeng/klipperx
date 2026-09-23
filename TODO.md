@@ -444,8 +444,23 @@ FW5a–f / FW6a–f 已把「cartesian + 假 MCU 的 `G1`/`G28`」跑通并归�
 
 ### H2 风扇与通用输出
 
-- [ ] `fan.py`（`[fan]`，`M106`/`M107`）、`fan_generic.py`、`heater_fan.py`、
-      `controller_fan.py`。
+动工前调查见 [H2 notes](docs/work-log/2026-09-23-h2-notes.md)（上游 21 个文件的依赖盘点、
+344 次「运行×缺口」测算、H2-1…H2-7 拆分与四个拍板点）。
+
+- [x] **H2-1 `fan.py`**：✅ `[fan]` 段 + 共享的 `Fan` 核心 + `M106`/`M107` + `get_status`，
+      `gcode:request_restart` 停风、`enable_pin` 只在 0↔非0 翻转、kick start 满速后回落。
+      回归：静态缺口 `fan` **197 → 0**，单缺口运行 55 → 38（转绿还差 `is_fileoutput`，见下）。
+      拍板（notes §5）：调度先走 immediate（`output_pin` 先例，C1d 后与 `GCodeRequestQueue`
+      一起切）；kick start 用 reactor 定时器 + 请求序号；`tachometer_pin` **明确报错**（依赖
+      F7 `pulse_counter`，不静默 `rpm: null`）；`TEMPLATE` 不在这一层。
+- [ ] **H2-2 `fan_generic.py`**（`SET_FAN_SPEED`，复用 `Fan`；`TEMPLATE` 报错）。
+- [ ] **H2-3 `heater_fan.py`**：需要 `heaters::{add_heater,lookup_heater}` + `Heater::get_temp`
+      （H1 面），`klippy:ready` 起每秒 timer。
+- [ ] **H2-4 `controller_fan.py`**：`stepper_enable::get_steppers`/`lookup_enable` 已有。
+- [ ] **转绿卡点（T3/H1 共用，不是 H2 的 section）**：`printers.test` 那 52 次运行现在能加载，
+      却卡在 `Extrude below minimum temp`（48）。上游不卡是因为 `test_klippy.py` 带 `-o` →
+      `MCU.is_fileoutput()` → `heaters.py:39` 的 `can_extrude` 初值为真；本仓库还没有
+      `debugoutput`/`is_fileoutput` 这条路径（FW4 notes §191 已列）。
 - [ ] `pwm_tool.py`（队列化 PWM，随运动）、`pwm_cycle_time.py`、`static_digital_output.py`、
       `static_pwm_clock.py`。
 - [ ] `multi_pin.py`、`servo.py`、`duplicate_pin_override.py`。

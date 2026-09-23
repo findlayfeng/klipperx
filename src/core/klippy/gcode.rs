@@ -147,7 +147,12 @@ fn parse_int(value: &str) -> Option<i64> {
 }
 
 /// Parse a float parameter; `None` when it is not one.
-fn parse_float(value: &str) -> Option<f64> {
+///
+/// `pub(crate)` so an extra that needs a combination the shorthand getters do
+/// not spell (a default *and* a `minval`, say — upstream's
+/// `get_float('S', 255., minval=0.)`) can pass it to
+/// [`GcodeCommand::get`], which is what those shorthands wrap.
+pub(crate) fn parse_float(value: &str) -> Option<f64> {
     value.parse::<f64>().ok()
 }
 

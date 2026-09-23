@@ -26,15 +26,18 @@
 //!
 //! | command | meaning |
 //! |---|---|
-//! | `G0` / `G1` | linear move, absolute coordinates and `F` in mm/min |
 //! | `G4` | dwell, `P` in milliseconds or `S` in seconds |
 //! | `M400` | flush the planner |
+//! | `G28` | home the named axes (all three when none is named) |
 //! | `SET_KINEMATIC_POSITION` | force the low-level position, homing the named axes |
 //!
-//! There is no `gcode_move` layer yet: coordinates are the toolhead's, with none
-//! of the offsets, relative mode or extruder factors that module adds (H3). Pure
-//! extruder moves are parsed and recorded but do not generate steps, because
-//! there is no `[extruder]` rail.
+//! `G0` / `G1` are **not** here: they belong to
+//! [`gcode_move`](crate::core::klippy::extras::gcode_move), which reads them off
+//! the command line in g-code coordinates — offsets, relative mode, extrude
+//! factor — and calls [`ToolHeadObject::move_to`] with a toolhead coordinate.
+//! The toolhead plans moves; it does not interpret a `G` word. Loading that
+//! module from here is upstream's `add_printer_objects` loading its default
+//! modules (`toolhead.py:610-613`).
 //!
 //! # Flushing
 //!

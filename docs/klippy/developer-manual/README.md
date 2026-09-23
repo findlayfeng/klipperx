@@ -240,7 +240,7 @@ identify 的命令**定义**（名称、参数、解码）与其它命令一样�
 | `GcodeCommand` | 交给处理器的已解析命令：通用 `get`（parser + `minval`/`maxval`/`above`/`below`）与 `get_str` / `get_int` / `get_int_bounded` / `get_float` / `get_float_bounded` / `get_float_range`（缺参 / 解析失败 / 超范围都报上游文案的 `CommandError`），`get_command_parameters` / `get_raw_command_parameters`，以及 `respond_info` / `respond_raw` / `ack` |
 | 传统 / 扩展命令 | 传统（`M110`、`G1`）参数是 `S200` 这种“字母+值”；扩展（`SET_PIN`）是 `KEY=VALUE`，带 shell 引号——后者在分派时重解析（上游 `_get_extended_params`） |
 
-它在 `load_config` 里**最先**注册（在 `pins` 之前），因为资源与 `[board_pins]` 建对象时要往它注册命令；按上游，它是 `Printer.__init__` 的早对象。不含运动命令（G0/G1/G28 由 toolhead 注册，见 C1/G4）。`ok` 应答协议（`need_ack` / `ack`：处理器自 ack 后不再重复，错误在 `need_ack=true` 时报告并 ack 而不中止脚本）与 `gcode:command_error` 事件（处理器报 `CommandError` 时触发；panic 走停机、不发）已就位，但本主机还没有 `need_ack=true` 的生产者：文件 / 伪 tty 输入（`GCodeIO`）已定为**暂缓 `[~]`**，不做 OctoPrint 串口仿真。
+它在 `load_config` 里**最先**注册（在 `pins` 之前），因为资源与 `[board_pins]` 建对象时要往它注册命令；按上游，它是 `Printer.__init__` 的早对象。**运动命令不在这里**：`G0`/`G1` 由 `gcode_move` 注册（坐标系那一层读它们，再把工具头坐标交给 toolhead），`G4`/`M400`/`G28`/`SET_KINEMATIC_POSITION` 由 toolhead 注册（见 C1/G4）。`ok` 应答协议（`need_ack` / `ack`：处理器自 ack 后不再重复，错误在 `need_ack=true` 时报告并 ack 而不中止脚本）与 `gcode:command_error` 事件（处理器报 `CommandError` 时触发；panic 走停机、不发）已就位，但本主机还没有 `need_ack=true` 的生产者：文件 / 伪 tty 输入（`GCodeIO`）已定为**暂缓 `[~]`**，不做 OctoPrint 串口仿真。
 
 一处**有意偏离**：mux 命令的“值不合法”提示里，上游按 dict 迭代序取最后一个匹配做 `Did you mean`，这里对候选排序后取第一个（消息要稳定）。默认项（注册 `value=None`）与上游一致：不给 key 时命中。
 

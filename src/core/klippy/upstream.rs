@@ -397,9 +397,9 @@ mod tests {
     /// Cases that cannot pass yet, skipped unless `KLIPPERX_UPSTREAM_ALL` is set.
     ///
     /// Nearly every upstream config names sections this host does not implement
-    /// (`extruder`, `heater_bed`, `fan`, `gcode_macro`, `tmc*`, …), so
-    /// `load_config` rejects them before any g-code runs. The list shrinks as
-    /// those sections land.
+    /// (`gcode_macro`, `probe`, `tmc*`, `display`, …), so `load_config`
+    /// rejects them before any g-code runs. The list shrinks as those sections
+    /// land.
     ///
     /// `KLIPPERX_UPSTREAM_ALL=1` runs every case and reports every failure, so
     /// the list stays honest rather than hiding regressions.

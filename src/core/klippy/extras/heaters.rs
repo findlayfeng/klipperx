@@ -338,10 +338,15 @@ impl PrinterHeaters {
 
     /// Build a heater from its section (`PrinterHeaters.setup_heater`).
     ///
-    /// Reads and claims the heater options and builds the sensor, but does not
-    /// start a control loop (H1). `can_extrude` is stubbed to `true` so an
-    /// `[extruder]` can move before H1 lands; the PWM output is reserved but
-    /// not driven.
+    /// Reads and claims the heater options, builds the sensor and wires each of
+    /// its readings into the control loop (`Heater::temperature_callback`),
+    /// which is what drives the PWM: there is no timer of its own, so a heater
+    /// with no readings never changes its output.
+    ///
+    /// `can_extrude` starts as upstream's `min_extrude_temp <= 0. or
+    /// is_fileoutput` (`heaters.py:38-39`) and every reading recomputes it.
+    /// File-output mode is how upstream runs its own test cases, where nothing
+    /// answers the temperature queries — see [`Printer::is_fileoutput`].
     ///
     /// # Errors
     /// A duplicate heater name, an unknown sensor, or an invalid option.

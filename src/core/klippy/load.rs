@@ -351,6 +351,7 @@ mod tests {
                 "manual_probe",
                 "probe",
                 "quad_gantry_level",
+                "screws_tilt_adjust",
                 "smart_effector",
                 "temperature_sensor",
                 "z_tilt",

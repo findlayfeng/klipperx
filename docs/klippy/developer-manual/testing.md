@@ -105,7 +105,7 @@ git config core.hooksPath .githooks
 | `resource/stepper.rs` | 方向变化变 `set_next_step_dir`、连续步变 `queue_step`；`!` 翻转方向线上的方向位；负 `add` 窄化后仍正确 |
 | `resource/endstop.rs` | `home_start` 同时武装 endstop 与 trsync（async）；`home_wait` 对主机请求（无固件触发）回 0 |
 | `resource/trsync.rs` | 状态报告完成触发组、次级 MCU 报文把组超时拉到最慢那颗；registry 按 oid 路由、同一 MCU 上两个 endstop 共享 registry；一个 trsync 停住多个 stepper；共享轴跨 MCU 被拒（上游 `TriggerDispatch` 同规则）；raw reason 贯通：未知 raw 照样完成 completion、typed 视图折叠、reason 0 不完成（1-4 行为零变化的守卫） |
-| `resource/trigger_analog.rs` | 5 命令 + state 响应对字典编解码、错误码四类字典文案与 `SENSOR_SPECIFIC` 走传感器回调、SOS 去重缓存（仅变更才发、state+active 每次发）、超量段/状态数不匹配报错、range/trigger 去重、双 trigger_analog 的 oid 互异且各恰一次 config、非正采样率拒绝；e2e：`set_trigger→home` 首条 move 在监控窗内完成、无样本时 MONITOR 到期回 `Trigger analog error: MONITOR` 不挂起 |
+| `resource/trigger_analog.rs` | 5 命令 + state 响应对字典编解码、错误码四类字典文案与 `SENSOR_SPECIFIC` 走传感器回调、SOS 去重缓存（仅变更才发、state+active 每次发）、超量段/状态数不匹配报错、range/trigger 去重、双 trigger_analog 的 oid 互异且各恰一次 config、非正采样率拒绝；e2e：`set_trigger→home` 首条 move 在监控窗内完成、无样本时 MONITOR 到期回 `Trigger analog error: MONITOR` 不挂起；M5b：`&dyn HomingEndstop` 端到端 arm/wait、stub 生产者投样与错误码回调消费（低于 `SENSOR_SPECIFIC` 走字典） |
 | `resource/i2c.rs` | 总线错误（非 SUCCESS）按上游把机器停机 |
 | `resource/spi.rs` | **无独立测试**：编码路径由 `cmd/spi.rs` 覆盖，`McuSpi::transfer`/`send` 的线上行为靠 `spi_device` 的节测试与真板手工验证 |
 | `events.rs` | 按 id 查回调、绑未注册消息报错、后绑替换旧绑（`McuEvents` 的三条语义） |
@@ -145,6 +145,7 @@ git config core.hooksPath .githooks
 | `endstop.rs` | `config_endstop` / `endstop_home` 的参数序与固件一致；`pull_up` 负值按字节编码；disable 全零；`home_wait` 的 32 位触发时钟以**本次 move 的 arm clock** 为纪元参考（打印时间远超 MCU 自报时钟时会差一整圈：2³²/16 MHz = 268.44 s） |
 | `trsync.rs` | `trsync_start` 参数序与固件一致；`trigger_reason` 枚举号与固件对齐；`raw_failure_classification` 覆盖 typed 与 trigger_analog 码（1-3 非失败、4 与 5-8 失败且 5-8 无 typed 变体） |
 | `trigger_analog.rs` | 5 命令逐字段对 `atmega2560.dict`、`trigger_analog_type` 枚举逐值一致（`abs_ge`/`gt`/`diff_peak_gt`）、home 载荷字节序与全零 disable、state 响应经字典格式串编解码往返 |
+| `trigger_analog.rs`（主机侧 design，M5b） | `to_fixed_32` 缩放与舍入（ties-to-even 同 Python）及上游溢出文案、`calc_frac_bits`（整数→0/最宽适配/舍入回退 31→29）、SOS 表命中与三路 miss、tap 设计→表段→导数序、scipy 表外错误不改设计、定点系数 29 位精确值、col3≠1/超宽拒绝、静止态按起始值换算 |
 | `sos_filter.rs` | 5 条 SOS 命令逐字段对字典（含 `%i` 负数有符号）、`set_section` 5 系数顺序与负值编码 |
 | `ldc1612.rs` | 5 条命令与 `sensor_bulk_status`/`sensor_bulk_data` 响应逐字段对照语料字典；按名解码 6 个 bulk 状态字段 |
 
@@ -291,7 +292,7 @@ git config core.hooksPath .githooks
 | `bulk_sensor.rs` | 51 字节/4 = 12 样本每块与固件消息尺寸一致；时钟回归一次 update 斜率精确恢复采样率并外推；切片与时间戳公式；16 位序号回绕与符号扩展；`apply_status` 跨回绕计数与 msg_count→chip 映射；超长 query 时长滤波只跳样本不污染时钟；批循环首客户端启动恰好一次、末客户端注销停循环（start_paused 异步） |
 | `ldc1612.rs` | `sensor_div`/`freq_conv` 换算（含 raw↔Hz 往返）；`convert_samples` 各错误分支（固件编码错误丢样、under-range/watchdog 保留）与计数；`reg_drive_current` 提取含高位掩蔽；attach 钩子 init 命令绑定 M5a trigger_analog oid；`dump_ldc1612` 端点注册不重名、按 sensor 路由与客户端注销 |
 | `manual_probe.rs` | 二分插入点（`bisect_left`）、空闲状态形状；交互路径（`TESTZ` 移动、`ACCEPT` 校验、`ABORT` 收尾、命令注销）由上游语料端到端覆盖 |
-| `probe.rs` | `ProbePointsHelper`：`points` 的换行/逗号行解析、`move_target`（`use_xy_offsets` 减探针偏移）、越界点报错、`minimum_points`/`update_probe_points` 的上游文案；选项全量认领与默认值（`speed` 5.0、`samples` 1、`sample_retract_dist` 2.0、`samples_result` median、`samples_tolerance` 0.100、`deactivate_on_each_sample` true）；`lift_speed` 缺省回退 `speed`；`samples_result` 非法值报上游文案；虚拟端停校验：`z_virtual_endstop` 通过、其它 pin 名报 `Probe virtual endstop only useful as endstop pin`、`!`/`^` 报 `Can not pullup/invert probe virtual endstop`；归并算法：`average` 逐轴平均、`median` 按 Z 取中位（偶数样本取中间两者均值）；命令与会话路径由上游语料端到端覆盖 |
+| `probe.rs` | `ProbePointsHelper`：`points` 的换行/逗号行解析、`move_target`（`use_xy_offsets` 减探针偏移）、越界点报错、`minimum_points`/`update_probe_points` 的上游文案；选项全量认领与默认值（`speed` 5.0、`samples` 1、`sample_retract_dist` 2.0、`samples_result` median、`samples_tolerance` 0.100、`deactivate_on_each_sample` true）；`lift_speed` 缺省回退 `speed`；`samples_result` 非法值报上游文案；虚拟端停校验：`z_virtual_endstop` 通过、其它 pin 名报 `Probe virtual endstop only useful as endstop pin`、`!`/`^` 报 `Can not pullup/invert probe virtual endstop`；归并算法：`average` 逐轴平均、`median` 按 Z 取中位（偶数样本取中间两者均值）；命令与会话路径由上游语料端到端覆盖；trait 化（M5b）：同一 `LiveRound` 分发点驱动真 z 实现与 stub 第二实现（调用序与互不串扰、session-mismatch、`Printer is not ready` 口径）、`SampleDelivery` 投递→会话收样 |
 | `upstream.rs` | 语料驱动（字典、CONFIG/文件输出、SHOULD_FAIL）之外，另有 **5 条聚焦 E2E**：普通端停 `G28 Z`、`probe:z_virtual_endstop` 的 `G28 Z`、`G28 + PROBE`、`G28 + PROBE_CALIBRATE/TESTZ/ACCEPT`、`G28 + BED_MESH_CALIBRATE`（3×3）——把「端停/探针真的能驱动一次回零」钉在假 MCU 上 |
 | `query_endstops.rs` | 全部限位读一遍并记住、取反的限位翻转电平、`M119` 逐个报（经虚拟字典帧解码） |
 | `i2c_device.rs` | 硬件设备要地址、地址越界拒；注册两条调试命令；只给一个软件引脚报错、未知 MCU 点名节、软件引脚须同 MCU、就绪后 `get_status` 报地址与速度 |

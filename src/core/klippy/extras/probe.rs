@@ -33,7 +33,9 @@ use crate::core::klippy::extras::manual_probe::{
     FinalizeCallback, ManualProbe, MANUAL_PROBE_OBJECT,
 };
 use crate::core::klippy::extras::toolhead::ToolHeadObject;
-use crate::core::klippy::gcode::{CommandError, GCodeDispatch, GcodeCommand, GCODE_OBJECT};
+use crate::core::klippy::gcode::{
+    CommandError, CommandFuture, GCodeDispatch, GcodeCommand, GCODE_OBJECT,
+};
 use crate::core::klippy::load::section;
 use crate::core::klippy::mathutil::Coord;
 use crate::core::klippy::mcu::McuEndstop;
@@ -625,6 +627,12 @@ impl PrinterProbe {
         self.session.run(gcmd).await
     }
 
+    /// The probe parameters a command asks for
+    /// (`ProbeSessionHelper.get_probe_params`).
+    pub(crate) fn probe_params(&self, gcmd: &GcodeCommand) -> Result<ProbeParams, CommandError> {
+        self.session.defaults.from_command(gcmd)
+    }
+
     /// Take the completed sample sets (`pull_probed_results`).
     pub(crate) fn pull_probed_results(&self) -> Vec<Coord> {
         self.session.pull_results()
@@ -1079,5 +1087,906 @@ mod tests {
         let median = calc_probe_z_average(&positions, "median");
 
         assert_eq!(median.z(), 4.0);
+    }
+}
+
+// ===========================================================================
+// ProbePointsHelper (upstream klippy/extras/probe.py:425-530)
+// ===========================================================================
+
+/// The object the `probe` session is looked up under (the `[probe]` section
+/// registers itself under this name).
+const PROBE_OBJECT: &str = "probe";
+
+/// Upstream's `ProbePointsHelper.finalize_callback` result: it receives the
+/// probe offsets and the position probed at each point, and answers
+/// `Some(`[`RETRY`]`)` to start the whole round over (`res != "retry"`),
+/// anything else to end it.
+pub type ProbePointsFinalize =
+    Arc<dyn Fn(ProbeOffsets, &[Coord]) -> Option<&'static str> + Send + Sync>;
+
+/// The callback answer that restarts a probing round (upstream `"retry"`).
+pub const RETRY: &str = "retry";
+
+/// Helper code that can probe a series of points and report the position at
+/// each point (`probe.py:ProbePointsHelper`).
+pub struct ProbePointsHelper {
+    /// The machine, to find `toolhead`/`probe`/`manual_probe` at run time.
+    printer: Weak<Printer>,
+    /// The consumer section's name, for the `minimum_points` error.
+    name: String,
+    /// What does the work once every point has a position.
+    finalize: ProbePointsFinalize,
+    /// The configured `points` rows (`x, y`).
+    probe_points: Mutex<Vec<(f64, f64)>>,
+    /// `horizontal_move_z` as configured (a command may override it).
+    default_horizontal_move_z: f64,
+    /// The travel speed between points (`speed`, `above=0.`).
+    speed: f64,
+    /// Whether moves subtract the probe's XY offsets (`use_xy_offsets`).
+    use_offsets: AtomicBool,
+    /// The Z retract speed: the probe's `lift_speed` when automatic, `speed`
+    /// when manual (`get_lift_speed`).
+    lift_speed: Mutex<f64>,
+    /// The Z the toolhead travels between points; the command's
+    /// `HORIZONTAL_MOVE_Z` wins over the configured value.
+    horizontal_move_z: Mutex<f64>,
+    /// The probe's offsets for the running round (zeros when manual).
+    probe_offsets: Mutex<ProbeOffsets>,
+}
+
+/// The `points` option: rows of `x, y` split on newlines, each row on commas
+/// (`probe.py:437-439`, `getlists('points', seps=(',', '\n'), parser=float,
+/// count=2)` — newlines split first, every row must hold exactly two values).
+///
+/// # Errors
+/// "must have 2 elements" for a malformed row, "Unable to parse" for a value
+/// that is not a number.
+fn read_points(config: &ConfigWrapper) -> Result<Vec<(f64, f64)>, ConfigError> {
+    let groups = config.get_list_of_lists("points", '\n', ',', 2)?;
+    let identifier = config.identifier();
+    groups
+        .into_iter()
+        .map(|pair| {
+            let mut parsed = pair.iter().map(|item| {
+                item.trim().parse::<f64>().map_err(|_| {
+                    ConfigError::new(format!(
+                        "Unable to parse option 'points' in section '{identifier}'"
+                    ))
+                })
+            });
+            let x = parsed.next().expect("get_list_of_lists checked count=2")?;
+            let y = parsed.next().expect("get_list_of_lists checked count=2")?;
+            Ok((x, y))
+        })
+        .collect()
+}
+
+impl ProbePointsHelper {
+    /// Read the consumer section and its `points` (`probe.py:430-447`).
+    ///
+    /// # Errors
+    /// When `points` is missing and no default points were handed in, or an
+    /// option is malformed or out of range.
+    pub fn new(
+        config: &ConfigWrapper,
+        printer: &Arc<Printer>,
+        finalize: ProbePointsFinalize,
+    ) -> Result<Arc<Self>, ConfigError> {
+        Self::with_default_points(config, printer, finalize, None)
+    }
+
+    /// [`ProbePointsHelper::new`] with fallback points, as the consumers that
+    /// synthesise their grid pass (`bed_mesh` passes `[]` upstream).
+    ///
+    /// # Errors
+    /// As [`ProbePointsHelper::new`].
+    pub fn with_default_points(
+        config: &ConfigWrapper,
+        printer: &Arc<Printer>,
+        finalize: ProbePointsFinalize,
+        default_points: Option<Vec<(f64, f64)>>,
+    ) -> Result<Arc<Self>, ConfigError> {
+        let name = config.identifier();
+        // Configured points win; otherwise the caller's defaults apply; with
+        // neither, upstream's `getlists` refuses the missing option.
+        let probe_points = if config.has("points") {
+            read_points(config)?
+        } else if let Some(points) = default_points {
+            points
+        } else {
+            return Err(ConfigError::new(format!(
+                "Option 'points' in section '{name}' is not defined"
+            )));
+        };
+        let default_horizontal_move_z = config.get_float("horizontal_move_z", Some(5.0))?;
+        let speed = config.get_float_bounded("speed", Some(50.0), None, None, Some(0.0), None)?;
+        Ok(Arc::new(Self {
+            printer: Arc::downgrade(printer),
+            name,
+            finalize,
+            probe_points: Mutex::new(probe_points),
+            default_horizontal_move_z,
+            speed,
+            use_offsets: AtomicBool::new(false),
+            lift_speed: Mutex::new(speed),
+            horizontal_move_z: Mutex::new(default_horizontal_move_z),
+            probe_offsets: Mutex::new(ProbeOffsets {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            }),
+        }))
+    }
+
+    /// Refuse fewer points than the consumer needs
+    /// (`probe.py:minimum_points`).
+    ///
+    /// # Errors
+    /// "Need at least \<n\> probe points for \<section\>".
+    pub fn minimum_points(&self, n: usize) -> Result<(), ConfigError> {
+        let count = self
+            .probe_points
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .len();
+        if count < n {
+            return Err(ConfigError::new(format!(
+                "Need at least {n} probe points for {}",
+                self.name
+            )));
+        }
+        Ok(())
+    }
+
+    /// Replace the points and re-check the minimum (`probe.py:update_probe_points`).
+    ///
+    /// # Errors
+    /// As [`ProbePointsHelper::minimum_points`].
+    pub fn update_probe_points(
+        &self,
+        points: Vec<(f64, f64)>,
+        min_points: usize,
+    ) -> Result<(), ConfigError> {
+        *self.probe_points.lock().unwrap_or_else(|p| p.into_inner()) = points;
+        self.minimum_points(min_points)
+    }
+
+    /// Subtract the probe's XY offsets from every move target
+    /// (`probe.py:use_xy_offsets`).
+    pub fn use_xy_offsets(&self, use_offsets: bool) {
+        self.use_offsets.store(use_offsets, Ordering::SeqCst);
+    }
+
+    /// The Z retract speed of the next round (`probe.py:get_lift_speed`).
+    pub fn get_lift_speed(&self) -> f64 {
+        *self.lift_speed.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// The XY to move to for point `probe_num`, net of the probe offsets when
+    /// `use_xy_offsets` is on (`probe.py:_move_next`).
+    fn move_target(&self, probe_num: usize) -> Result<(f64, f64), CommandError> {
+        let point = self
+            .probe_points
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(probe_num)
+            .copied()
+            .ok_or_else(|| {
+                CommandError::new(format!(
+                    "Internal probe error - no probe point {probe_num} for {}",
+                    self.name
+                ))
+            })?;
+        if !self.use_offsets.load(Ordering::SeqCst) {
+            return Ok(point);
+        }
+        let offsets = *self.probe_offsets.lock().unwrap_or_else(|p| p.into_inner());
+        Ok((point.0 - offsets.x, point.1 - offsets.y))
+    }
+
+    /// Probe every point and hand `(offsets, positions)` to the finalize
+    /// callback (`probe.py:start_probe`).
+    ///
+    /// `METHOD=manual` (or a printer with no `probe` object) drives the
+    /// interactive manual-probe helper point by point instead.
+    ///
+    /// # Errors
+    /// "Already in a manual Z probe…" when one is running, a bad command
+    /// parameter, or whatever the toolhead/probe report mid-round.
+    pub async fn start_probe(self: &Arc<Self>, gcmd: &GcodeCommand) -> Result<(), CommandError> {
+        let printer = self
+            .printer
+            .upgrade()
+            .ok_or_else(|| CommandError::new("Printer is not ready"))?;
+        let manual = printer
+            .lookup_object_as::<ManualProbe>(MANUAL_PROBE_OBJECT)
+            .ok_or_else(|| CommandError::new("Printer is not ready"))?;
+        manual.verify_no_manual_probe(&printer)?;
+
+        let method = gcmd.get_str_default("METHOD", "automatic").to_lowercase();
+        let def_move_z = self.default_horizontal_move_z;
+        let horizontal_move_z = gcmd.get_float_default("HORIZONTAL_MOVE_Z", def_move_z)?;
+        *self
+            .horizontal_move_z
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = horizontal_move_z;
+
+        let probe = printer.lookup_object_as::<PrinterProbe>(PROBE_OBJECT);
+        if method == "manual" || probe.is_none() {
+            // Manual probing: no offsets, the travel speed is the lift speed,
+            // and each point waits for the user's `ACCEPT`
+            // (`probe.py:start_probe`'s manual branch).
+            *self.lift_speed.lock().unwrap_or_else(|p| p.into_inner()) = self.speed;
+            *self.probe_offsets.lock().unwrap_or_else(|p| p.into_inner()) = ProbeOffsets {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            };
+            let round = Arc::new(ManualRound {
+                ops: Arc::new(LiveRound {
+                    helper: Arc::clone(self),
+                    printer: Arc::clone(&printer),
+                    probe: None,
+                }),
+                results: Mutex::new(Vec::new()),
+            });
+            return round.start();
+        }
+        let Some(probe) = probe else {
+            return Err(CommandError::new("Printer is not ready"));
+        };
+
+        // Automatic probing through the `probe` object's session.
+        let params = probe.probe_params(gcmd)?;
+        *self.lift_speed.lock().unwrap_or_else(|p| p.into_inner()) = params.lift_speed;
+        let offsets = probe.offsets();
+        *self.probe_offsets.lock().unwrap_or_else(|p| p.into_inner()) = offsets;
+        if horizontal_move_z < offsets.z {
+            return Err(CommandError::new(
+                "horizontal_move_z can't be less than probe's z_offset",
+            ));
+        }
+        probe.start_probe_session()?;
+        let ops = LiveRound {
+            helper: Arc::clone(self),
+            printer,
+            probe: Some(probe),
+        };
+        automatic_round(&ops, gcmd).await
+    }
+}
+
+impl std::fmt::Debug for ProbePointsHelper {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProbePointsHelper")
+            .field("name", &self.name)
+            .field("speed", &self.speed)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The side effects one probing round drives: the toolhead moves and the
+/// probe session. Split out so the round's order is testable without a
+/// machine — the tests drive a recording fake.
+trait RoundOps: Send + Sync {
+    /// How many points the round walks (`probe_points.len()`).
+    fn point_count(&self) -> usize;
+    /// Move Z up to `horizontal_move_z` (`probe.py:_raise_tool`).
+    fn raise_tool(&self, is_first: bool) -> Result<(), CommandError>;
+    /// Move to point `probe_num` (`probe.py:_move_next`).
+    fn move_next(&self, probe_num: usize) -> Result<(), CommandError>;
+    /// One sample set at the current position (`run_probe`).
+    fn run_probe<'a>(&'a self, gcmd: &'a GcodeCommand) -> CommandFuture<'a>;
+    /// Take the session's completed sample sets (`pull_probed_results`).
+    fn pull_results(&self) -> Vec<Coord>;
+    /// Flush the lookahead queue and invoke the finalize callback; `false`
+    /// means "retry" — the round starts over (`probe.py:_invoke_callback`).
+    fn invoke_callback(&self, results: &[Coord]) -> Result<bool, CommandError>;
+    /// Close the probe session (`end_probe_session`).
+    fn end_session(&self) -> Result<(), CommandError>;
+    /// Start one interactive manual point (`ManualProbe::start_helper`).
+    fn start_manual_helper(&self, callback: FinalizeCallback) -> Result<(), CommandError>;
+}
+
+/// The real [`RoundOps`]: a helper, the machine, and (when automatic) the
+/// open probe session.
+struct LiveRound {
+    helper: Arc<ProbePointsHelper>,
+    printer: Arc<Printer>,
+    /// `None` in manual mode.
+    probe: Option<Arc<PrinterProbe>>,
+}
+
+impl LiveRound {
+    /// The toolhead the moves go through.
+    fn toolhead(&self) -> Result<Arc<ToolHeadObject>, CommandError> {
+        self.printer
+            .lookup_object_as::<ToolHeadObject>(TOOLHEAD_OBJECT)
+            .ok_or_else(|| CommandError::new("Printer is not ready"))
+    }
+}
+
+impl RoundOps for LiveRound {
+    fn point_count(&self) -> usize {
+        self.helper
+            .probe_points
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .len()
+    }
+
+    fn raise_tool(&self, is_first: bool) -> Result<(), CommandError> {
+        // The first raise runs at full travel speed, the rest at the lift
+        // speed (`probe.py:_raise_tool`).
+        let speed = if is_first {
+            self.helper.speed
+        } else {
+            *self
+                .helper
+                .lift_speed
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+        };
+        let toolhead = self.toolhead()?;
+        let mut target = toolhead
+            .position()
+            .ok_or_else(|| CommandError::new("Printer is not ready"))?;
+        target.set_axis(
+            Z_AXIS,
+            *self
+                .helper
+                .horizontal_move_z
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()),
+        );
+        toolhead.move_to(target, speed)
+    }
+
+    fn move_next(&self, probe_num: usize) -> Result<(), CommandError> {
+        let (x, y) = self.helper.move_target(probe_num)?;
+        let toolhead = self.toolhead()?;
+        let mut target = toolhead
+            .position()
+            .ok_or_else(|| CommandError::new("Printer is not ready"))?;
+        target.set_axis(0, x);
+        target.set_axis(1, y);
+        toolhead.move_to(target, self.helper.speed)
+    }
+
+    fn run_probe<'a>(&'a self, gcmd: &'a GcodeCommand) -> CommandFuture<'a> {
+        let Some(probe) = self.probe.as_ref() else {
+            return Box::pin(std::future::ready(Err(CommandError::new(
+                "Internal probe error - no probe session",
+            ))));
+        };
+        Box::pin(probe.run_probe(gcmd))
+    }
+
+    fn pull_results(&self) -> Vec<Coord> {
+        self.probe
+            .as_ref()
+            .map(|probe| probe.pull_probed_results())
+            .unwrap_or_default()
+    }
+
+    fn invoke_callback(&self, results: &[Coord]) -> Result<bool, CommandError> {
+        // Flush the lookahead queue: upstream asks `get_last_move_time`,
+        // which both flushes and returns the time; reading it here is this
+        // port's equivalent sync point before the callback runs.
+        let toolhead = self.toolhead()?;
+        let _ = toolhead.print_time();
+        let offsets = *self
+            .helper
+            .probe_offsets
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let answer = (self.helper.finalize)(offsets, results);
+        // Upstream: `res != "retry"`.
+        Ok(answer != Some(RETRY))
+    }
+
+    fn end_session(&self) -> Result<(), CommandError> {
+        match self.probe.as_ref() {
+            Some(probe) => probe.end_probe_session(),
+            None => Ok(()),
+        }
+    }
+
+    fn start_manual_helper(&self, callback: FinalizeCallback) -> Result<(), CommandError> {
+        let manual = self
+            .printer
+            .lookup_object_as::<ManualProbe>(MANUAL_PROBE_OBJECT)
+            .ok_or_else(|| CommandError::new("Printer is not ready"))?;
+        let gcode = self
+            .printer
+            .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+            .expect("the loader registers `gcode` first");
+        // The helper gets its own empty command so the outer command's
+        // parameters (SPEED) do not leak into it, as upstream's
+        // `gcode.create_gcode_command("", "", {})` does.
+        let gcmd = gcode.create_gcode_command("", "", std::collections::HashMap::new());
+        manual.start_helper(&self.printer, &gcmd, callback)
+    }
+}
+
+/// One automatic probing round (`probe.py:start_probe`'s `while 1` loop):
+/// raise, walk every point, pull the results into the callback, restart on
+/// "retry", close the session.
+async fn automatic_round<R: RoundOps + ?Sized>(
+    ops: &R,
+    gcmd: &GcodeCommand,
+) -> Result<(), CommandError> {
+    let mut probe_num = 0usize;
+    loop {
+        ops.raise_tool(probe_num == 0)?;
+        if probe_num >= ops.point_count() {
+            let results = ops.pull_results();
+            if ops.invoke_callback(&results)? {
+                break;
+            }
+            // The caller wants a "retry" — restart probing.
+            probe_num = 0;
+        }
+        ops.move_next(probe_num)?;
+        ops.run_probe(gcmd).await?;
+        probe_num += 1;
+    }
+    ops.end_session()
+}
+
+/// One manual probing round (`probe.py:_manual_probe_start` +
+/// `_manual_probe_finalize`): every point waits for the user's `G1`+`ACCEPT`,
+/// and a finished list goes to the finalize callback like the automatic one.
+struct ManualRound<R: RoundOps> {
+    ops: Arc<R>,
+    /// The kinematics positions the user accepted, in point order.
+    results: Mutex<Vec<Coord>>,
+}
+
+impl<R: RoundOps + 'static> ManualRound<R> {
+    /// Raise, finish-or-clear the list, move to the next point and start its
+    /// helper (`probe.py:_manual_probe_start`).
+    fn start(self: &Arc<Self>) -> Result<(), CommandError> {
+        let is_first = self
+            .results
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_empty();
+        self.ops.raise_tool(is_first)?;
+        {
+            let results = self.results.lock().unwrap_or_else(|p| p.into_inner());
+            if results.len() >= self.ops.point_count() {
+                let snapshot = results.clone();
+                drop(results);
+                if self.ops.invoke_callback(&snapshot)? {
+                    return Ok(());
+                }
+                // The caller wants a "retry" — clear results and restart.
+                *self.results.lock().unwrap_or_else(|p| p.into_inner()) = Vec::new();
+            }
+        }
+        let next = self.results.lock().unwrap_or_else(|p| p.into_inner()).len();
+        self.ops.move_next(next)?;
+        let this = Arc::clone(self);
+        self.ops.start_manual_helper(Arc::new(move |kin_pos| {
+            if let Err(err) = this.manual_finalize(kin_pos) {
+                warn!("manual probe point failed: {err}");
+            }
+        }))
+    }
+
+    /// `_manual_probe_finalize`: keep an accepted point and drive the next,
+    /// or stop when the user aborted.
+    fn manual_finalize(self: &Arc<Self>, kin_pos: Option<Coord>) -> Result<(), CommandError> {
+        let Some(pos) = kin_pos else {
+            return Ok(());
+        };
+        self.results
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(pos);
+        self.start()
+    }
+}
+
+// ===========================================================================
+// ProbePointsHelper tests
+// ===========================================================================
+
+#[cfg(test)]
+mod probe_points_tests {
+    use super::*;
+    use crate::core::klippy::config::{ConfigSection, ConfigValue};
+    use crate::core::klippy::reactor::ManualReactor;
+    use std::sync::atomic::AtomicUsize;
+
+    /// A `[z_tilt]`-style section with the given `points` value.
+    fn section(points: Option<ConfigValue>) -> ConfigSection {
+        let mut section = ConfigSection::new("z_tilt", None);
+        if let Some(value) = points {
+            section.parameters.insert("points".to_string(), value);
+        }
+        section
+    }
+
+    /// A helper over a throwaway printer; the machine is only needed once
+    /// [`ProbePointsHelper::start_probe`] runs, which these tests never do.
+    fn helper(points: Option<ConfigValue>) -> Result<Arc<ProbePointsHelper>, ConfigError> {
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        let section = section(points);
+        let config = ConfigWrapper::untracked(&section);
+        ProbePointsHelper::new(&config, &printer, Arc::new(|_, _| None))
+    }
+
+    fn rows(rows: &[&str]) -> ConfigValue {
+        ConfigValue::Multi(rows.iter().map(|row| row.to_string()).collect())
+    }
+
+    /// One recorded step of a fake round.
+    #[derive(Debug, Clone, PartialEq)]
+    enum Step {
+        Raise(bool),
+        MoveNext(usize),
+        Probe,
+        Pull,
+        Callback(usize),
+        ManualStart,
+        End,
+    }
+
+    /// A recording [`RoundOps`]: no machine, just the call order.
+    struct FakeRound {
+        points: usize,
+        /// How many callbacks still answer "retry".
+        retries: AtomicUsize,
+        log: Mutex<Vec<Step>>,
+        manual_callback: Mutex<Option<FinalizeCallback>>,
+    }
+
+    impl FakeRound {
+        fn new(points: usize, retries: usize) -> Self {
+            Self {
+                points,
+                retries: AtomicUsize::new(retries),
+                log: Mutex::new(Vec::new()),
+                manual_callback: Mutex::new(None),
+            }
+        }
+
+        fn record(&self, step: Step) {
+            self.log
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(step);
+        }
+
+        fn steps(&self) -> Vec<Step> {
+            self.log.lock().unwrap_or_else(|p| p.into_inner()).clone()
+        }
+
+        /// Take the helper callback the round registered for the next point.
+        fn take_manual_callback(&self) -> FinalizeCallback {
+            self.manual_callback
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take()
+                .expect("a manual helper was started")
+        }
+    }
+
+    impl RoundOps for FakeRound {
+        fn point_count(&self) -> usize {
+            self.points
+        }
+
+        fn raise_tool(&self, is_first: bool) -> Result<(), CommandError> {
+            self.record(Step::Raise(is_first));
+            Ok(())
+        }
+
+        fn move_next(&self, probe_num: usize) -> Result<(), CommandError> {
+            self.record(Step::MoveNext(probe_num));
+            Ok(())
+        }
+
+        fn run_probe<'a>(&'a self, _gcmd: &'a GcodeCommand) -> CommandFuture<'a> {
+            self.record(Step::Probe);
+            Box::pin(std::future::ready(Ok(())))
+        }
+
+        fn pull_results(&self) -> Vec<Coord> {
+            self.record(Step::Pull);
+            Vec::new()
+        }
+
+        fn invoke_callback(&self, results: &[Coord]) -> Result<bool, CommandError> {
+            self.record(Step::Callback(results.len()));
+            if self.retries.load(Ordering::SeqCst) > 0 {
+                self.retries.fetch_sub(1, Ordering::SeqCst);
+                return Ok(false);
+            }
+            Ok(true)
+        }
+
+        fn end_session(&self) -> Result<(), CommandError> {
+            self.record(Step::End);
+            Ok(())
+        }
+
+        fn start_manual_helper(&self, callback: FinalizeCallback) -> Result<(), CommandError> {
+            self.record(Step::ManualStart);
+            *self
+                .manual_callback
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = Some(callback);
+            Ok(())
+        }
+    }
+
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("a current-thread runtime")
+            .block_on(future)
+    }
+
+    fn dummy_gcmd() -> (Arc<Printer>, GCodeDispatch, GcodeCommand) {
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        let gcode = GCodeDispatch::new(Arc::clone(&printer));
+        let gcmd = gcode.create_gcode_command("TEST", "", std::collections::HashMap::new());
+        (printer, gcode, gcmd)
+    }
+
+    #[test]
+    fn points_rows_parse_from_newlines_and_commas() {
+        // The corpus format: one `x,y` row per line.
+        let grid = helper(Some(rows(&["50,50", "50,195", "195,195"]))).unwrap();
+        let points = grid
+            .probe_points
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        assert_eq!(points, vec![(50.0, 50.0), (50.0, 195.0), (195.0, 195.0)]);
+
+        // A single-line value works the same way.
+        let single = helper(Some(ConfigValue::Single("10, 20".to_string()))).unwrap();
+        let points = single
+            .probe_points
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        assert_eq!(points, vec![(10.0, 20.0)]);
+    }
+
+    #[test]
+    fn a_row_without_two_elements_is_refused() {
+        // An odd point count leaves a row with one value: upstream's
+        // `getlists(..., count=2)` error.
+        let err = helper(Some(rows(&["50,50", "195"]))).unwrap_err();
+
+        assert!(err.to_string().contains("must have 2 elements"), "{err}");
+    }
+
+    #[test]
+    fn missing_points_reports_upstream_wording() {
+        let err = helper(None).unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "Option 'points' in section 'z_tilt' is not defined"
+        );
+    }
+
+    #[test]
+    fn minimum_points_and_update_probe_points_follow_upstream_wording() {
+        let helper = helper(Some(rows(&["50,50", "50,195"]))).unwrap();
+
+        helper.minimum_points(2).unwrap();
+        let err = helper.minimum_points(3).unwrap_err();
+        assert_eq!(err.to_string(), "Need at least 3 probe points for z_tilt");
+
+        // update_probe_points swaps the list and re-checks.
+        helper
+            .update_probe_points(vec![(0.0, 0.0), (1.0, 1.0), (2.0, 2.0)], 3)
+            .unwrap();
+        helper.minimum_points(3).unwrap();
+        let err = helper.update_probe_points(vec![(0.0, 0.0)], 3).unwrap_err();
+        assert_eq!(err.to_string(), "Need at least 3 probe points for z_tilt");
+    }
+
+    #[test]
+    fn the_options_carry_upstream_defaults() {
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        let mut section = ConfigSection::new("z_tilt", None);
+        section
+            .parameters
+            .insert("points".to_string(), ConfigValue::Single("50,50".into()));
+        let config = ConfigWrapper::untracked(&section);
+        let helper = ProbePointsHelper::new(&config, &printer, Arc::new(|_, _| None)).unwrap();
+
+        assert_eq!(helper.default_horizontal_move_z, 5.0);
+        assert_eq!(helper.speed, 50.0);
+        assert!(!helper.use_offsets.load(Ordering::SeqCst));
+        assert_eq!(helper.get_lift_speed(), 50.0);
+
+        // `speed` is `above=0.` (`probe.py:441`).
+        section
+            .parameters
+            .insert("speed".to_string(), ConfigValue::Single("0".into()));
+        let config = ConfigWrapper::untracked(&section);
+        let err = ProbePointsHelper::new(&config, &printer, Arc::new(|_, _| None)).unwrap_err();
+        assert!(err.to_string().contains("must be above 0"), "{err}");
+    }
+
+    #[test]
+    fn move_target_subtracts_offsets_only_when_asked() {
+        let helper = helper(Some(rows(&["50,50", "195,100"]))).unwrap();
+        *helper
+            .probe_offsets
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = ProbeOffsets {
+            x: 23.0,
+            y: 5.0,
+            z: 2.0,
+        };
+
+        // Without `use_xy_offsets` the raw point is the target.
+        assert_eq!(helper.move_target(0).unwrap(), (50.0, 50.0));
+
+        helper.use_xy_offsets(true);
+        assert_eq!(helper.move_target(0).unwrap(), (50.0 - 23.0, 50.0 - 5.0));
+        assert_eq!(helper.move_target(1).unwrap(), (195.0 - 23.0, 100.0 - 5.0));
+
+        // One past the end is an internal error, not a panic.
+        assert!(helper.move_target(2).is_err());
+    }
+
+    #[test]
+    fn the_automatic_round_walks_every_point_then_finishes() {
+        let (_printer, _gcode, gcmd) = dummy_gcmd();
+        let fake = FakeRound::new(2, 0);
+
+        block_on(automatic_round(&fake, &gcmd)).unwrap();
+
+        assert_eq!(
+            fake.steps(),
+            vec![
+                // Raise at full speed first, then move/probe point 0.
+                Step::Raise(true),
+                Step::MoveNext(0),
+                Step::Probe,
+                Step::Raise(false),
+                Step::MoveNext(1),
+                Step::Probe,
+                // A last raise, then the results go to the callback.
+                Step::Raise(false),
+                Step::Pull,
+                Step::Callback(0),
+                Step::End,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_retry_answer_restarts_the_walk() {
+        let (_printer, _gcode, gcmd) = dummy_gcmd();
+        let fake = FakeRound::new(2, 1);
+
+        block_on(automatic_round(&fake, &gcmd)).unwrap();
+
+        let steps = fake.steps();
+        // First attempt, the retry (`Pull`, `Callback` without `End`), then
+        // the second attempt from point 0 again.
+        assert_eq!(
+            steps,
+            vec![
+                Step::Raise(true),
+                Step::MoveNext(0),
+                Step::Probe,
+                Step::Raise(false),
+                Step::MoveNext(1),
+                Step::Probe,
+                Step::Raise(false),
+                Step::Pull,
+                Step::Callback(0),
+                Step::MoveNext(0),
+                Step::Probe,
+                Step::Raise(false),
+                Step::MoveNext(1),
+                Step::Probe,
+                Step::Raise(false),
+                Step::Pull,
+                Step::Callback(0),
+                Step::End,
+            ]
+        );
+    }
+
+    #[test]
+    fn the_manual_round_starts_one_helper_per_point() {
+        let fake = Arc::new(FakeRound::new(2, 0));
+        let round = Arc::new(ManualRound {
+            ops: Arc::clone(&fake),
+            results: Mutex::new(Vec::new()),
+        });
+
+        round.start().unwrap();
+        assert_eq!(
+            fake.steps(),
+            vec![Step::Raise(true), Step::MoveNext(0), Step::ManualStart]
+        );
+
+        // The user accepts point 0: raise, move to point 1, next helper.
+        fake.take_manual_callback()(Some(Coord::new(0.0, 0.0, 1.0, 0.0)));
+        assert_eq!(
+            fake.steps(),
+            vec![
+                Step::Raise(true),
+                Step::MoveNext(0),
+                Step::ManualStart,
+                Step::Raise(false),
+                Step::MoveNext(1),
+                Step::ManualStart,
+            ]
+        );
+
+        // The last point finishes the round: the callback gets every result
+        // and no further helper starts.
+        fake.take_manual_callback()(Some(Coord::new(1.0, 1.0, 2.0, 0.0)));
+        let steps = fake.steps();
+        assert_eq!(
+            steps[steps.len() - 2..],
+            [Step::Raise(false), Step::Callback(2)]
+        );
+        assert_eq!(
+            steps
+                .iter()
+                .filter(|step| **step == Step::ManualStart)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn an_aborted_manual_point_stops_the_round() {
+        let fake = Arc::new(FakeRound::new(2, 0));
+        let round = Arc::new(ManualRound {
+            ops: Arc::clone(&fake),
+            results: Mutex::new(Vec::new()),
+        });
+
+        round.start().unwrap();
+        let before = fake.steps().len();
+        // ABORT reports `None`: nothing further runs.
+        fake.take_manual_callback()(None);
+        assert_eq!(fake.steps().len(), before);
+    }
+
+    #[test]
+    fn a_manual_retry_clears_the_results_and_walks_again() {
+        let fake = Arc::new(FakeRound::new(1, 1));
+        let round = Arc::new(ManualRound {
+            ops: Arc::clone(&fake),
+            results: Mutex::new(Vec::new()),
+        });
+
+        round.start().unwrap();
+        // One point, one accept — but the callback answers "retry", so the
+        // list clears and point 0 is probed again.
+        fake.take_manual_callback()(Some(Coord::new(0.0, 0.0, 1.0, 0.0)));
+        let steps = fake.steps();
+        assert_eq!(
+            steps,
+            vec![
+                Step::Raise(true),
+                Step::MoveNext(0),
+                Step::ManualStart,
+                Step::Raise(false),
+                Step::Callback(1),
+                Step::MoveNext(0),
+                Step::ManualStart,
+            ]
+        );
     }
 }

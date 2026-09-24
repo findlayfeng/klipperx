@@ -747,7 +747,7 @@ pins: !PD0, PD1, PD2
 | `rename_existing` | — | 被改名的命令（仅 load 期同型检查，连接期换名未做） |
 | `variable_<名>` | — | 字面量，`get_status` 可见（只读） |
 
-宏即命令（大写注册）；**宏体暂不展开**（被调用时 `respond_info` 明示未实现，不静默）；`SET_GCODE_VARIABLE` 未注册；裸 `[gcode_macro]` 为共享模板持有者（零选项）。完整模板/表达式引擎属 H3。
+宏即命令（大写注册）；**宏体已渲染执行**（批 #4：受控子集引擎，渲染后经 gcode 派发）；`SET_GCODE_VARIABLE` 已注册（变量可写）；裸 `[gcode_macro]` 为共享模板持有者（零选项）。模板子集外构（`{% set %}`、过滤器等）显式报错（缺口见 `extras/template.rs` 模块文档），完整 Jinja 保真仍属 H3。
 
 ### [led <name>] / [neopixel <name>] / [dotstar <name>] / [pca9533 <name>] / [pca9632 <name>] / [display_template <name>]
 
@@ -774,7 +774,7 @@ pins: !PD0, PD1, PD2
 
 ### [exclude_object]
 
-零选项段（上游 `exclude_object.py:16-46`）。装载时注册 `EXCLUDE_OBJECT_START`/`_END`/`EXCLUDE_OBJECT`/`EXCLUDE_OBJECT_DEFINE` 四命令并持有对象状态；排除区内移动被 `MoveTarget` 变换丢弃。**转绿前置=U-A7b 宏体渲染**（状态变更藏在 `[gcode_macro M486]` 宏体内）。
+零选项段（上游 `exclude_object.py:16-46`）。装载时注册 `EXCLUDE_OBJECT_START`/`_END`/`EXCLUDE_OBJECT`/`EXCLUDE_OBJECT_DEFINE` 四命令并持有对象状态；排除区内移动被 `MoveTarget` 变换丢弃，**离区时按上游扣被丢弃 prime 段的 E**（`offset[3]`/`extruder_adj`，批 #4）。已随 U-A7b 宏体渲染转绿（2026-09-24）。
 
 ### [virtual_sdcard] / [display_status] / [homing_override] / [sdcard_loop]
 
@@ -792,7 +792,7 @@ pins: !PD0, PD1, PD2
 | `axis`（X/Y/Z）、`safe_distance`（毫米） | 第二滑架轴与最近距，按上游读取（`idex_modes.py`/`cartesian.py:24-34`） |
 | 电机组 | 经 `PrinterStepper`（同上游 `LookupMultiRail`） |
 
-cartesian 在 late 阶段认领；注册 `dual_carriage` 对象与 `SET_DUAL_CARRIAGE`/`SAVE_…_STATE`/`RESTORE_…_STATE`。步进**不驱动**（C1，仅记账）；**转绿前置=U-A7b**（T0/T1 宏体不执行则滑架不切）。
+cartesian 在 late 阶段认领；注册 `dual_carriage` 对象与 `SET_DUAL_CARRIAGE`/`SAVE_…_STATE`/`RESTORE_…_STATE`。**轨间坐标交接已实现**（批 #4，`toggle_active_dc_rail` 语义：切换/恢复携带 gcode 坐标）；步进仍仅主轨（`updateLimits` 未移植，C1）。已随 U-A7b 转绿（2026-09-24）。
 
 ### [servo <name>]
 
@@ -806,4 +806,16 @@ cartesian 在 late 阶段认领；注册 `dual_carriage` 对象与 `SET_DUAL_CAR
 | `initial_pulse_width` | `0` | 0..=maximum_pulse_width |
 
 `SET_SERVO`（mux 键 `SERVO=`，ANGLE/WIDTH）已注册；无打印时序排程（同 pwm_tool 既有口径）。
+
+### [probe_eddy_current <名>]
+
+| 选项 | 说明 |
+|------|------|
+| `i2c_mcu` / `i2c_bus` / `i2c_address` | I2C 组（`setup_i2c` 共享读取） |
+| `sensor_type` | 传感器类型（语料 `eddy`） |
+| `z_offset` | 探针 Z 偏移 |
+| `calibrate` | 静态标定开关（`enable`/`enable_with_touch`；**实现未接——调用显式报错**，见模块残差注记） |
+| 采样组（`samples`/`sample_retract_dist`/`samples_tolerance`/`lift_speed`…） | 由 probe/`ProbePointsHelper` 读取 |
+
+段与对象已落地（2026-09-24 批 #3，`eddy.test` 转绿）；**同名 section 按上游 `strict=False` 后写覆盖合并**（本仓自 2026-09-24 起，eddy.cfg 双段即其用例）。静态标定与 `PROBE_EDDY_CURRENT_CALIBRATE`/`Z_OFFSET_APPLY_PROBE` 未实现（模块残差注记）。
 

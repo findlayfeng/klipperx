@@ -436,7 +436,7 @@ SET_PIN PIN=pwm_fan VALUE=0.25  ; PWM：25% 占空比
 
 ### G-Code 宏命令（由 `[gcode_macro <名>]` 注册）
 
-每个 `[gcode_macro <名>]` 段在装载时以**大写宏名**注册为一条命令（help = `description`）。**当前宏体不展开**：被调用时返回 `respond_info`（明示模板渲染未实现）而非静默；`SET_GCODE_VARIABLE` 未注册；完整模板/表达式引擎属 H3。
+每个 `[gcode_macro <名>]` 段在装载时以**大写宏名**注册为一条命令（help = `description`）。**宏体已渲染执行**（批 #4 受控子集引擎 `extras/template.rs`，渲染后经 gcode 派发）；`SET_GCODE_VARIABLE` 已注册；子集外构（`{% set %}`、过滤器）显式报错，完整 Jinja 属 H3。
 
 ### QUERY_ENDSTOPS / M119
 
@@ -602,6 +602,20 @@ SPI_SEND     DEVICE=flash DATA=04          // spi send ok
 
 ## 命令解析细节
 
+### PROBE / QUERY_PROBE / PROBE_ACCURACY — 探针命令（由 probe 对象注册）
+
+| 命令 | 参数 | 说明 |
+|------|------|------|
+| `PROBE` | 采样组参数；`METHOD=`（`scan`/`rapid_scan`/`tap`，eddy 对象分派；其余对上游 `probe.py`） | 触发一次探测并记录位置 |
+| `QUERY_PROBE` | 无 | 回显上次触发状态 |
+| `PROBE_ACCURACY` | 采样组（对上游） | 采样精度统计 |
+
+### PROBE_EDDY_CURRENT_TAP_CALIBRATE — eddy tap 标定（由 `[probe_eddy_current]` 注册，批 #3）
+
+| 命令 | 参数 | 说明 |
+|------|------|------|
+| `PROBE_EDDY_CURRENT_TAP_CALIBRATE` | `TAP=` 子模式（信息分支/试打/拒绝文案对上游 `probe_eddy_current.py`） | eddy tap 标定流程；**静态标定 `CALIBRATE=enable` 与 `Z_OFFSET_APPLY_PROBE` 未实现**（显式报错，模块残差注记） |
+
 ### SET_SERVO — 舵机控制（由 `[servo <名>]` 注册，mux 键 `SERVO=`）
 
 | 命令 | 参数 | 说明 |
@@ -627,7 +641,7 @@ SPI_SEND     DEVICE=flash DATA=04          // spi send ok
 | `EXCLUDE_OBJECT` | 按名/当前排除、RESET 或列表（:215-238） |
 | `EXCLUDE_OBJECT_DEFINE` | 定义对象（CENTER/POLYGON）或重置文件（:240-267） |
 
-参数与错误文案对上游；`[gcode_macro M486]` 的宏体驱动用例转绿前置=U-A7b。
+参数与错误文案对上游；`[gcode_macro M486]` 的宏体驱动用例已随 U-A7b 引擎转绿（批 #4，含排除区 E 补偿）。
 
 ### 传统命令
 

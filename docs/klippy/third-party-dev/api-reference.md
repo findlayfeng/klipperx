@@ -820,9 +820,10 @@
 | `Z_TILT_ADJUST` | Z 轴倾斜调整（`z_tilt`） |
 | `BED_SCREWS_ADJUST` | 床面螺丝调整（`bed_screws`）——**段已落地、命令未注册**（2026-09-24 批 #1，调用会收到未知命令响应） |
 | `SET_SERVO` | 舵机控制（mux 键 `SERVO=`，由 `[servo <名>]` 注册，2026-09-24 批 #2） |
-| `SET_DUAL_CARRIAGE` | IDEX 滑架切换（由 `[dual_carriage]` 注册，2026-09-24 批 #2；现为记账级，C1 缺口入档） |
+| `SET_DUAL_CARRIAGE` | IDEX 滑架切换（由 `[dual_carriage]` 注册，2026-09-24；轨间坐标交接已实现于批 #4，步进仍仅主轨=C1 缺口入档） |
 | `SAVE_DUAL_CARRIAGE_STATE` / `RESTORE_DUAL_CARRIAGE_STATE` | 滑架状态保存/恢复（同上；恢复移动语义未完全移植） |
-| `EXCLUDE_OBJECT` / `EXCLUDE_OBJECT_START` / `EXCLUDE_OBJECT_END` / `EXCLUDE_OBJECT_DEFINE` | 打印对象排除四命令（由 `[exclude_object]` 注册，2026-09-24 批 #2；`M486` 宏体驱动的用例转绿待 U-A7b） |
+| `EXCLUDE_OBJECT` / `EXCLUDE_OBJECT_START` / `EXCLUDE_OBJECT_END` / `EXCLUDE_OBJECT_DEFINE` | 打印对象排除四命令（由 `[exclude_object]` 注册，2026-09-24 批 #2；`M486` 宏体用例已随批 #4 引擎转绿，含排除区 E 补偿） |
+| `PROBE_EDDY_CURRENT_TAP_CALIBRATE` | eddy tap 标定（由 `[probe_eddy_current]` 注册，批 #3；`TAP=` 子模式对上游；静态 `CALIBRATE=enable` 与 `Z_OFFSET_APPLY_PROBE` 未实现） |
 | `SCREWS_TILT_CALCULATE` | 螺丝倾斜计算（`screws_tilt_adjust`） |
 | `SHAPER_CALIBRATE` | 输入整形校准（`resonance_tester`） |
 | `QUERY_ENDSTOPS` | 查询限位开关 |

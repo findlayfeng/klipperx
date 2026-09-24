@@ -1834,3 +1834,194 @@ fn compare(op: Cmp, left: &Rt, right: &Rt) -> Result<Rt, String> {
         )),
     }
 }
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// A context with the corpus' `params` / `rawparams` and one macro
+    /// variable, the way `MacroState::context` builds them
+    /// (`gcode_macro.rs`), minus the printer.
+    fn context(params: &[(&str, &str)], rawparams: &str) -> Context {
+        let mut context = Context::new();
+        let map: serde_json::Map<String, Value> = params
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), json!(value)))
+            .collect();
+        context.insert("params", Rt::Json(Value::Object(map)));
+        context.insert("rawparams", Rt::Json(Value::String(rawparams.to_string())));
+        context.insert("t", Rt::Json(json!(12.0)));
+        // The production context binds this (`MacroState::context`).
+        context.insert("range", Rt::Builtin(Builtin::Range));
+        context
+    }
+
+    fn render(source: &str, context: &mut Context) -> Result<String, TemplateError> {
+        Template::parse("gcode_macro TEST:gcode", source)?.render(context)
+    }
+
+    fn ok(source: &str) -> String {
+        render(source, &mut context(&[], "")).unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// The scalar spellings are Python's `str`, because Jinja renders through
+    /// it — `3.0`, not `3`; `True`, not `true`.
+    #[test]
+    fn expressions_render_python_spelling() {
+        assert_eq!(ok("PARK_{3}"), "PARK_3");
+        assert_eq!(ok("{3.0}"), "3.0");
+        assert_eq!(ok("{12.0 - 12.0}"), "0.0");
+        assert_eq!(ok("{1 + 2}"), "3");
+        assert_eq!(ok("{True}/{False}/{None}"), "True/False/None");
+        assert_eq!(ok("{ 17 * 2 + 1 % 4 }"), "35");
+        assert_eq!(ok("{-3.5}"), "-3.5");
+    }
+
+    /// `if` / `elif` / `else` and `for` over `range(… | int)`, the shapes
+    /// `exclude_object.cfg:85-113` uses.
+    #[test]
+    fn branches_and_loops_follow_the_corpus_shapes() {
+        let source = "{% if 'T' in params %}RESET{% for i in range(params.T | int) %}NAME={i} \
+                      {% endfor %}{% elif 'C' in params %}CANCEL{% else %}none{% endif %}";
+        assert_eq!(
+            render(source, &mut context(&[("T", "3")], "")).expect("renders"),
+            "RESETNAME=0 NAME=1 NAME=2 "
+        );
+        assert_eq!(
+            render(source, &mut context(&[("C", "1")], "")).expect("renders"),
+            "CANCEL"
+        );
+        assert_eq!(
+            render(source, &mut context(&[], "")).expect("renders"),
+            "none"
+        );
+        // One tag line per line, as the corpus writes them: the text between
+        // tags survives verbatim, tags themselves vanish.
+        let multiline = "{% if params.S == '-1' %}\n  EXCLUDE_OBJECT_END\n{% else %}\n  \
+                         EXCLUDE_OBJECT_START NAME={params.S}\n{% endif %}";
+        assert_eq!(
+            render(multiline, &mut context(&[("S", "0")], "")).expect("renders"),
+            "\n  EXCLUDE_OBJECT_START NAME=0\n"
+        );
+    }
+
+    /// `in` / `not in` / `or`, and the `is defined` tests `sdcard_loop.cfg:90`
+    /// leans on — undefined is *false*, never an error.
+    #[test]
+    fn membership_and_defined_tests_behave_like_jinja() {
+        let source = "{% if 'abc' in params or 'nope' not in params %}M112{% endif %}";
+        // Absent keys: `'abc' in params` is false, `'nope' not in params` true.
+        assert_eq!(
+            render(source, &mut context(&[], "")).expect("renders"),
+            "M112"
+        );
+        let present = "{% if 'abc' in params %}M112{% endif %}";
+        assert_eq!(
+            render(present, &mut context(&[("T", "3")], "")).expect("renders"),
+            ""
+        );
+
+        let sdcard = "{% if params.K is not defined and params.L is defined %}\
+                      SDCARD_LOOP_BEGIN COUNT={params.L|int}{% endif %}";
+        assert_eq!(
+            render(sdcard, &mut context(&[("L", "5")], "")).expect("renders"),
+            "SDCARD_LOOP_BEGIN COUNT=5"
+        );
+        assert_eq!(
+            render(sdcard, &mut context(&[("K", "1")], "")).expect("renders"),
+            ""
+        );
+    }
+
+    /// Status coordinates are JSON arrays, but klippy's `Coord` namedtuple
+    /// exposes `.x`/`.y`/`.z`/`.e` (`mathutil.rs`) — the bridge the corpus
+    /// needs (`macros.cfg:34`).
+    #[test]
+    fn coordinate_attributes_map_onto_json_arrays() {
+        let mut context = context(&[], "");
+        context.insert("position", Rt::Json(json!([1.5, 2.5, 3.5, 4.5])));
+        assert_eq!(
+            render(
+                "{position.x} {position.y} {position.z} {position.e}",
+                &mut context
+            )
+            .expect("renders"),
+            "1.5 2.5 3.5 4.5"
+        );
+        // Outside the four Coord fields an array attribute is an error.
+        let error = render("{position.w}", &mut context).expect_err("no such field");
+        assert!(
+            error.to_string().contains("position has no attribute 'w'"),
+            "{error}"
+        );
+    }
+
+    /// `rawparams` is the line's tail, verbatim (`gcode_macro.py:189`).
+    #[test]
+    fn rawparams_renders_the_command_tail() {
+        assert_eq!(ok("{rawparams}"), "");
+        assert_eq!(
+            render("{rawparams}", &mut context(&[], "T=3 EXCLUDE=1")).expect("renders"),
+            "T=3 EXCLUDE=1"
+        );
+    }
+
+    /// A construct outside the subset fails the **load** with upstream's frame
+    /// (`gcode_macro.py:61-66`), naming the line and the statement.
+    #[test]
+    fn an_unknown_statement_is_a_load_error_with_upstream_frame() {
+        let error = Template::parse("gcode_macro SETTY:gcode", "{% set x = 1 %}")
+            .expect_err("set is not implemented");
+        assert_eq!(
+            error.to_string(),
+            "Error loading template 'gcode_macro SETTY:gcode'\n\
+             line 1: unsupported statement 'set' \
+             (this port implements if/elif/else/endif/for/endfor)"
+        );
+
+        // An unbalanced block reads the same way.
+        let error = Template::parse("gcode_macro BAD:gcode", "{% if 1 %}").expect_err("no endif");
+        assert!(error.to_string().contains("endif' expected"), "{error}");
+    }
+
+    /// A name or filter outside the subset fails the **render**, with the
+    /// expression's source in the message.
+    #[test]
+    fn an_unknown_name_or_filter_is_a_render_error() {
+        let error = render("{nope}", &mut context(&[], "")).expect_err("undefined");
+        assert_eq!(
+            error.to_string(),
+            "Error evaluating 'gcode_macro TEST:gcode': line 1: 'nope' is undefined"
+        );
+
+        let error =
+            render("{params.L | min}", &mut context(&[("L", "1")], "")).expect_err("no filter");
+        assert!(
+            error
+                .to_string()
+                .contains("unknown filter 'min' (this port implements 'int')"),
+            "{error}"
+        );
+
+        // `action_raise_error` is the corpus's own escape hatch
+        // (`exclude_object.cfg:86`) and fails the render with its message.
+        let mut context = context(&[], "");
+        context.insert("action_raise_error", Rt::Builtin(Builtin::RaiseError));
+        let error = render(
+            "{action_raise_error(\"[exclude_object] is not enabled\")}",
+            &mut context,
+        )
+        .expect_err("raises");
+        assert!(
+            error
+                .to_string()
+                .contains("[exclude_object] is not enabled"),
+            "{error}"
+        );
+    }
+}

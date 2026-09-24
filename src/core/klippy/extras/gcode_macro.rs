@@ -363,6 +363,7 @@ pub fn load_config_prefix(
 mod tests {
     use super::*;
     use crate::core::klippy::config::{AccessTracking, Config, ConfigSection, ConfigValue};
+    use crate::core::klippy::event::KlippyEvent;
     use crate::core::klippy::reactor::ManualReactor;
 
     /// One `[gcode_macro <name>]` section with the given options, as the
@@ -379,6 +380,9 @@ mod tests {
     }
 
     /// A printer with `gcode` registered, as the loader builds it.
+    ///
+    /// The dispatcher refuses scripts before ready (`gcode.rs` state check);
+    /// `exclude_object.rs`'s machine lights the ready lamp the same way.
     fn printer() -> Arc<Printer> {
         let printer = Arc::new(Printer::new(ManualReactor::shared()));
         printer
@@ -387,6 +391,7 @@ mod tests {
                 Arc::new(GCodeDispatch::new(Arc::clone(&printer))),
             )
             .expect("gcode registers");
+        printer.send_event(&KlippyEvent::KlippyReady);
         printer
     }
 
@@ -576,5 +581,172 @@ mod tests {
         let object = load_config(&config, &printer).expect("the section loads");
         assert_eq!(object.get_status(0.0), json!({}));
         assert!(access.sections().is_empty(), "no option to read");
+    }
+
+    /// The seam upstream calls `run_gcode_from_command`: a macro renders its
+    /// body against `params` / `rawparams` / its own `variable_*` status and
+    /// the rendered lines reach the dispatcher (`gcode_macro.py:186-190` +
+    /// `:79-80`). The receiving command is a fake this test registers.
+    #[test]
+    fn a_macro_body_renders_and_dispatches_its_lines() {
+        let printer = printer();
+        let dispatch = gcode(&printer);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        {
+            let seen = Arc::clone(&seen);
+            let handler: CommandHandler = sync(move |gcmd: &GcodeCommand| {
+                seen.lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .push(gcmd.get_str("VALUE").unwrap_or_default());
+                Ok(())
+            });
+            dispatch
+                .register_command("ECHO_LINE", handler, None, false)
+                .expect("the fake receiver registers");
+        }
+
+        let sect = section(
+            "probe",
+            &[
+                (
+                    "gcode",
+                    "ECHO_LINE VALUE={params.N}\nECHO_LINE VALUE={rawparams}\n\
+                     ECHO_LINE VALUE={t}\nECHO_LINE VALUE={printer[\"gcode_macro probe\"].t}",
+                ),
+                ("variable_t", "12.0"),
+            ],
+        );
+        let access = AccessTracking::shared();
+        let config = ConfigWrapper::new(&sect, Arc::clone(&access));
+        let object = load_config_prefix(&config, &printer).expect("the macro loads");
+        // The loader registers the object under its section name, which is
+        // what `printer["…"]` then reads (`load.rs`).
+        printer
+            .add_object(&sect.identifier(), object)
+            .expect("the object registers");
+
+        dispatch
+            .run_script_sync("PROBE N=7")
+            .expect("the run is clean");
+        assert_eq!(
+            *seen.lock().unwrap_or_else(|poison| poison.into_inner()),
+            vec!["7", "N=7", "12.0", "12.0"],
+            "params, rawparams, the bare variable and its get_status read back"
+        );
+    }
+
+    /// Upstream's `in_script` guard (`gcode_macro.py:183-184`): a macro whose
+    /// body reaches itself is refused instead of recursing, and the refusal
+    /// leaves the macro usable — the flag clears with the run.
+    #[test]
+    fn a_macro_that_calls_itself_is_refused() {
+        let printer = printer();
+        let sect = section("loop_", &[("gcode", "LOOP_")]);
+        let access = AccessTracking::shared();
+        let config = ConfigWrapper::new(&sect, Arc::clone(&access));
+        load_config_prefix(&config, &printer).expect("the macro loads");
+
+        let dispatch = gcode(&printer);
+        let error = dispatch
+            .run_script_sync("LOOP_")
+            .expect_err("the recursion is refused");
+        assert!(
+            error.to_string().contains("Macro LOOP_ called recursively"),
+            "{error}"
+        );
+
+        // The flag was cleared on the way out: a macro that stops recursing
+        // runs its body to the end.
+        let sect = section("oncemap", &[("gcode", "ECHO_")]);
+        let config = ConfigWrapper::untracked(&sect);
+        load_config_prefix(&config, &printer).expect("the macro loads");
+        let seen = Arc::new(Mutex::new(0usize));
+        {
+            let seen = Arc::clone(&seen);
+            let handler: CommandHandler = sync(move |_| {
+                *seen.lock().unwrap_or_else(|poison| poison.into_inner()) += 1;
+                Ok(())
+            });
+            dispatch
+                .register_command("ECHO_", handler, None, false)
+                .expect("the fake receiver registers");
+        }
+        dispatch.run_script_sync("ONCEMAP").expect("a clean run");
+        dispatch.run_script_sync("ONCEMAP").expect("still clean");
+        assert_eq!(
+            *seen.lock().unwrap_or_else(|poison| poison.into_inner()),
+            2,
+            "both runs reached the receiver"
+        );
+    }
+
+    /// `SET_GCODE_VARIABLE` is mux-keyed by the section's name and writes the
+    /// value `get_status` then reports (`gcode_macro.py:148-150, :164-173`);
+    /// an unknown variable and a non-literal value are refused with upstream's
+    /// wording (the parse tail is this port's JSON parser).
+    #[test]
+    fn set_gcode_variable_writes_the_macro_status() {
+        let printer = printer();
+        let sect = section(
+            "TEST_variable",
+            &[
+                ("gcode", "{ action_respond_info(\"x\") }"),
+                ("variable_t", "12.0"),
+            ],
+        );
+        let access = AccessTracking::shared();
+        let config = ConfigWrapper::new(&sect, Arc::clone(&access));
+        let object = load_config_prefix(&config, &printer).expect("the macro loads");
+
+        let dispatch = gcode(&printer);
+        assert_eq!(
+            dispatch.command_help().get("SET_GCODE_VARIABLE"),
+            Some(&"Set the value of a G-Code macro variable".to_string())
+        );
+
+        dispatch
+            .run_script_sync("SET_GCODE_VARIABLE MACRO=TEST_variable VARIABLE=t VALUE=17")
+            .expect("the write succeeds");
+        assert_eq!(object.get_status(0.0), json!({ "t": 17 }));
+
+        let error = dispatch
+            .run_script_sync("SET_GCODE_VARIABLE MACRO=TEST_variable VARIABLE=nope VALUE=1")
+            .expect_err("unknown variable");
+        assert!(
+            error
+                .to_string()
+                .contains("Unknown gcode_macro variable 'nope'"),
+            "{error}"
+        );
+
+        let error = dispatch
+            .run_script_sync("SET_GCODE_VARIABLE MACRO=TEST_variable VARIABLE=t VALUE=oops")
+            .expect_err("not a literal");
+        assert!(
+            error
+                .to_string()
+                .contains("Unable to parse 'oops' as a literal: "),
+            "{error}"
+        );
+    }
+
+    /// A body outside [`template`]'s subset is refused when the section
+    /// loads, with upstream's `Error loading template` frame
+    /// (`gcode_macro.py:61-66`).
+    #[test]
+    fn an_unsupported_template_construct_is_a_load_error() {
+        let printer = printer();
+        let sect = section("SETTY", &[("gcode", "{% set x = 1 %}")]);
+        let config = ConfigWrapper::untracked(&sect);
+        let error = GCodeMacro::new(&config, &printer)
+            .expect_err("the subset does not carry `set`")
+            .to_string();
+        assert!(
+            error.starts_with(
+                "Error loading template 'gcode_macro SETTY:gcode'\nline 1: \
+                 unsupported statement 'set'"
+            ),
+            "{error}"
+        );
     }
 }

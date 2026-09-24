@@ -24,8 +24,20 @@
 //!
 //! What it does not do is simulate hardware: endstop triggers, stepper motion and
 //! shutdown reporting are added per case as the corpus needs them.
+//!
+//! # Endstop 口径 (fake)
+//!
+//! An armed check trips at the **first step of the move it was armed for**
+//! (`reset_step_clock`/`queue_step`), which is what keeps a "triggered prior to
+//! movement" probe honest. When several endstops are armed for the same move —
+//! delta homes all three towers in one move
+//! (`kinematics/delta.py:104-110`) — **every** armed check trips at that first
+//! step, each reporting its own trsync. The fake deliberately does not tell
+//! their trigger times apart (upstream's file mode likewise completes every
+//! armed trsync at the drip move's end); revisit only if a case starts caring
+//! about per-endstop trigger instants.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::Write;
 use std::path::Path;
 use std::sync::{Condvar, Mutex};
@@ -78,20 +90,23 @@ struct State {
     out: VecDeque<Frame>,
     /// Set by `shutdown()`: `receive()` returns `None` from then on.
     shutdown: bool,
-    /// The clock/pin level of the last armed `endstop_home`, for
-    /// `endstop_query_state`.
+    /// The clock/pin level of the most recent `endstop_home` activity: the
+    /// move-clock floor `reset_step_clock` falls back to, and the answer for
+    /// an oid with no [`State::endstop_reports`] entry.
     endstop_clock: u32,
-    /// The pin level `endstop_query_state` reports right now.
+    /// The pin level for that fallback answer.
     endstop_pin_value: u8,
-    /// The trsync armed by `endstop_home`, with the level it stops on, the
-    /// clock it was armed at, and whether it has fired yet.
+    /// The `endstop_home` checks still armed, by endstop oid, with the
+    /// trsync to report each trigger on.
     ///
-    /// A real endstop is *open* until the carriage reaches it, so the fake one
-    /// must not fire at arming time either: it fires when the move it was armed
-    /// for actually starts (the first `reset_step_clock`/`queue_step` after
-    /// arming). A probe that triggered before moving is a real firmware error,
-    /// and the corpus's probing moves depend on the distinction.
-    armed: Option<ArmedEndstop>,
+    /// One slot per endstop: delta arms its three tower endstops together
+    /// before one move (`kinematics/delta.py:104-110`), and each has to keep
+    /// its own trsync (see the module docs' Endstop 口径 note).
+    armed: HashMap<u32, ArmedEndstop>,
+    /// What `endstop_query_state` answers per endstop oid: the clock the
+    /// check was armed (then fired) at, and the level it stops on. Kept after
+    /// the disable removes the check — the host queries after disabling.
+    endstop_reports: HashMap<u32, (u32, u8)>,
     /// The `trigger_analog_home` armed for, with the monitor window that
     /// cancels it when the sensor goes quiet (see [`ArmedTriggerAnalog`]).
     trigger_analog: Option<ArmedTriggerAnalog>,
@@ -180,7 +195,8 @@ impl SimulatorDevice {
                 shutdown: false,
                 endstop_clock: 0,
                 endstop_pin_value: 0,
-                armed: None,
+                armed: HashMap::new(),
+                endstop_reports: HashMap::new(),
                 trigger_analog: None,
                 ta_homing_clock: 0,
                 last_host_seq: 0,
@@ -312,6 +328,10 @@ impl SimulatorDevice {
                     // with a following command (e.g. `endstop_query_state`),
                     // and skipping the block's tail would drop it.
                     if sample_count != 0 {
+                        let oid = match params.first() {
+                            Some(ArgValue::UInt8(v)) => u32::from(*v),
+                            _ => 0,
+                        };
                         let clock = match params.get(1) {
                             Some(ArgValue::UInt32(v)) => *v,
                             _ => 0,
@@ -326,36 +346,58 @@ impl SimulatorDevice {
                         };
                         state.endstop_clock = clock;
                         state.endstop_pin_value = 1 - pin_value;
-                        state.armed = Some(ArmedEndstop {
-                            trsync_oid,
-                            level: pin_value,
-                            arm_clock: clock,
-                            fired: false,
-                        });
+                        // A real endstop is *open* until the carriage reaches
+                        // it, so the check must not fire at arming: it fires
+                        // when the move it was armed for starts.
+                        state.endstop_reports.insert(oid, (clock, 1 - pin_value));
+                        state.armed.insert(
+                            oid,
+                            ArmedEndstop {
+                                trsync_oid,
+                                level: pin_value,
+                                arm_clock: clock,
+                                fired: false,
+                            },
+                        );
                         eprintln!(
                             "SIM-DIAG: arm trsync={trsync_oid} clock={clock} level={pin_value}"
                         );
                     } else {
-                        if state.armed.is_some() {
+                        // The disable the host sends after waiting: remove
+                        // just this endstop's check (a following
+                        // `endstop_query_state` still answers from
+                        // `endstop_reports`).
+                        let oid = match params.first() {
+                            Some(ArgValue::UInt8(v)) => u32::from(*v),
+                            _ => 0,
+                        };
+                        if state.armed.contains_key(&oid) {
                             eprintln!("SIM-DIAG: disarm (query follows)");
                         }
-                        state.armed = None;
+                        state.armed.remove(&oid);
                     }
                 }
                 "endstop_query_state" => {
                     let oid = match params.first() {
-                        Some(ArgValue::UInt8(v)) => *v,
+                        Some(ArgValue::UInt8(v)) => u32::from(*v),
                         _ => 0,
                     };
+                    // The answer is this endstop's own arm/fire record, so
+                    // three towers homing together each read their own clock.
+                    let (clock, pin) = state
+                        .endstop_reports
+                        .get(&oid)
+                        .copied()
+                        .unwrap_or((state.endstop_clock, state.endstop_pin_value));
                     Self::respond(
                         state,
                         seq,
                         "endstop_state",
                         &[
-                            ArgValue::UInt8(oid),
+                            ArgValue::UInt8(oid as u8),
                             ArgValue::UInt8(0), // homing
-                            ArgValue::UInt32(state.endstop_clock),
-                            ArgValue::UInt8(state.endstop_pin_value),
+                            ArgValue::UInt32(clock),
+                            ArgValue::UInt8(pin),
                         ],
                     );
                 }
@@ -585,39 +627,43 @@ impl SimulatorDevice {
         }
     }
 
-    /// Report an armed endstop's trigger once the move it was armed for has
-    /// started (`reset_step_clock` / `queue_step`), exactly once.
+    /// Report every armed endstop's trigger once the move it was armed for has
+    /// started (`reset_step_clock` / `queue_step`), each exactly once.
     ///
     /// The clock is the arming clock until the move gives a later one, so the
-    /// trigger time is never in the past and never zero.
+    /// trigger time is never in the past and never zero. Several endstops may
+    /// be armed for one move (delta's simultaneous tower homing): all of them
+    /// trip at this first step, each on its own trsync (module docs' Endstop
+    /// 口径 note).
     fn trigger_if_armed(state: &mut State, seq: u8, clock: u32) {
-        let Some(armed) = state.armed.as_mut() else {
-            return;
-        };
-        if armed.fired {
-            return;
+        // First mark every armed check fired and collect what to report —
+        // `respond` needs the whole state, so nothing may borrow `armed`.
+        let mut fired = Vec::new();
+        for (oid, armed) in state.armed.iter_mut() {
+            if armed.fired {
+                continue;
+            }
+            armed.fired = true;
+            fired.push((*oid, armed.trsync_oid, armed.arm_clock, armed.level));
         }
-        armed.fired = true;
-        eprintln!(
-            "SIM-DIAG: fire at clock={clock} arm_clock={}",
-            armed.arm_clock
-        );
-        let trigger_clock = clock.max(armed.arm_clock + 1);
-        let trsync_oid = armed.trsync_oid;
-        let level = armed.level;
-        state.endstop_clock = trigger_clock;
-        state.endstop_pin_value = level;
-        Self::respond(
-            state,
-            seq,
-            "trsync_state",
-            &[
-                ArgValue::UInt8(trsync_oid),
-                ArgValue::UInt8(0), // can_trigger
-                ArgValue::UInt8(1), // trigger_reason = EndstopHit
-                ArgValue::UInt32(trigger_clock),
-            ],
-        );
+        for (oid, trsync_oid, arm_clock, level) in fired {
+            let trigger_clock = clock.max(arm_clock + 1);
+            state.endstop_reports.insert(oid, (trigger_clock, level));
+            state.endstop_clock = trigger_clock;
+            state.endstop_pin_value = level;
+            eprintln!("SIM-DIAG: fire at clock={clock} arm_clock={arm_clock}");
+            Self::respond(
+                state,
+                seq,
+                "trsync_state",
+                &[
+                    ArgValue::UInt8(trsync_oid),
+                    ArgValue::UInt8(0), // can_trigger
+                    ArgValue::UInt8(1), // trigger_reason = EndstopHit
+                    ArgValue::UInt32(trigger_clock),
+                ],
+            );
+        }
     }
 
     /// Report an armed `trigger_analog` once the move it was armed for starts
@@ -1113,5 +1159,173 @@ mod tests {
             &[ArgValue::UInt8(0), ArgValue::UInt32(2000)],
         );
         assert!(queued(&device).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Multiple armed endstops (delta's simultaneous tower homing)
+    // -----------------------------------------------------------------------
+
+    /// Arm one endstop check: `endstop_home oid clock sample_ticks
+    /// sample_count rest_ticks pin_value trsync_oid trigger_reason`
+    /// (`pin_value` 1: reads open until the move, then stops on 1).
+    fn arm_endstop(device: &SimulatorDevice, oid: u8, trsync: u8, clock: u32) {
+        issue(
+            device,
+            "endstop_home",
+            &[
+                ArgValue::UInt8(oid),
+                ArgValue::UInt32(clock),
+                ArgValue::UInt32(40_000),
+                ArgValue::UInt8(4),
+                ArgValue::UInt32(0),
+                ArgValue::UInt8(1),
+                ArgValue::UInt8(trsync),
+                ArgValue::UInt8(1),
+            ],
+        );
+    }
+
+    /// Disable the endstop's check (the all-zero-count disable).
+    fn disarm_endstop(device: &SimulatorDevice, oid: u8) {
+        issue(
+            device,
+            "endstop_home",
+            &[
+                ArgValue::UInt8(oid),
+                ArgValue::UInt32(0),
+                ArgValue::UInt32(0),
+                ArgValue::UInt8(0),
+                ArgValue::UInt32(0),
+                ArgValue::UInt8(0),
+                ArgValue::UInt8(0),
+                ArgValue::UInt8(0),
+            ],
+        );
+    }
+
+    #[test]
+    fn three_endstops_armed_together_all_fire_at_the_first_move() {
+        let device = armed_device();
+        arm_endstop(&device, 1, 10, 1000);
+        arm_endstop(&device, 3, 11, 1001);
+        arm_endstop(&device, 5, 12, 1002);
+
+        // The move's first step trips every armed check, each on its own
+        // trsync (delta homes all three towers in one move).
+        issue(
+            &device,
+            "reset_step_clock",
+            &[ArgValue::UInt8(0), ArgValue::UInt32(2000)],
+        );
+        let mut triggers = Vec::new();
+        while let Some((name, args)) = queued(&device) {
+            assert_eq!(name, "trsync_state");
+            triggers.push(args);
+        }
+        triggers.sort_by_key(|args| match &args[0] {
+            ArgValue::UInt8(trsync) => *trsync,
+            _ => u8::MAX,
+        });
+        assert_eq!(triggers.len(), 3, "every armed check reports");
+        let expected: [u8; 3] = [10, 11, 12];
+        for (index, args) in triggers.iter().enumerate() {
+            assert_eq!(args[0], ArgValue::UInt8(expected[index]));
+            assert_eq!(args[1], ArgValue::UInt8(0));
+            assert_eq!(args[2], ArgValue::UInt8(1), "EndstopHit");
+            assert_eq!(args[3], ArgValue::UInt32(2000));
+        }
+
+        // Each query answers its own record: armed at its own clock, fired at
+        // the move's.
+        for (oid, arm_clock) in [(1, 1000), (3, 1001), (5, 1002)] {
+            assert!(arm_clock < 2000);
+            issue(&device, "endstop_query_state", &[ArgValue::UInt8(oid)]);
+            let (name, args) = queued(&device).expect("an answer");
+            assert_eq!(name, "endstop_state");
+            assert_eq!(args[0], ArgValue::UInt8(oid));
+            assert_eq!(args[2], ArgValue::UInt32(2000));
+            assert_eq!(args[3], ArgValue::UInt8(1), "tripped level");
+        }
+
+        // A later move does not re-fire any of them.
+        issue(
+            &device,
+            "reset_step_clock",
+            &[ArgValue::UInt8(0), ArgValue::UInt32(3000)],
+        );
+        assert!(queued(&device).is_none(), "one report per check");
+    }
+
+    #[test]
+    fn a_single_endstop_still_arms_fires_and_answers_as_before() {
+        let device = armed_device();
+        arm_endstop(&device, 1, 2, 1000);
+
+        // While armed the check reads open at its arm clock.
+        issue(&device, "endstop_query_state", &[ArgValue::UInt8(1)]);
+        let (name, args) = queued(&device).expect("an answer");
+        assert_eq!(name, "endstop_state");
+        assert_eq!(args[2], ArgValue::UInt32(1000));
+        assert_eq!(args[3], ArgValue::UInt8(0), "open");
+
+        // The move trips it exactly once.
+        issue(
+            &device,
+            "reset_step_clock",
+            &[ArgValue::UInt8(0), ArgValue::UInt32(2000)],
+        );
+        let (name, args) = queued(&device).expect("a trigger");
+        assert_eq!(name, "trsync_state");
+        assert_eq!(
+            args,
+            vec![
+                ArgValue::UInt8(2),
+                ArgValue::UInt8(0),
+                ArgValue::UInt8(1),
+                ArgValue::UInt32(2000)
+            ]
+        );
+
+        // The disable clears the check but not its record: the query that
+        // follows still reports the trigger.
+        disarm_endstop(&device, 1);
+        issue(&device, "endstop_query_state", &[ArgValue::UInt8(1)]);
+        let (_, args) = queued(&device).expect("an answer");
+        assert_eq!(args[2], ArgValue::UInt32(2000));
+        assert_eq!(args[3], ArgValue::UInt8(1), "tripped level");
+
+        // And a move after the disable does not fire.
+        issue(
+            &device,
+            "reset_step_clock",
+            &[ArgValue::UInt8(0), ArgValue::UInt32(3000)],
+        );
+        assert!(queued(&device).is_none());
+    }
+
+    #[test]
+    fn disabling_one_endstop_leaves_the_others_armed() {
+        let device = armed_device();
+        arm_endstop(&device, 1, 10, 1000);
+        arm_endstop(&device, 3, 11, 1001);
+
+        // Only oid 1 is disabled; oid 3 keeps waiting for its move.
+        disarm_endstop(&device, 1);
+        issue(
+            &device,
+            "reset_step_clock",
+            &[ArgValue::UInt8(0), ArgValue::UInt32(2000)],
+        );
+        let (name, args) = queued(&device).expect("oid 3's trigger");
+        assert_eq!(name, "trsync_state");
+        assert_eq!(args[0], ArgValue::UInt8(11));
+        assert_eq!(args[3], ArgValue::UInt32(2000));
+        assert!(queued(&device).is_none(), "the disabled check stays silent");
+
+        // The disabled check still answers its own (never-firing) record.
+        issue(&device, "endstop_query_state", &[ArgValue::UInt8(1)]);
+        let (_, args) = queued(&device).expect("an answer");
+        assert_eq!(args[2], ArgValue::UInt32(1000));
+        assert_eq!(args[3], ArgValue::UInt8(0), "still open");
     }
 }

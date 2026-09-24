@@ -183,6 +183,59 @@ impl From<Xyz> for Coord {
 }
 
 // ===========================================================================
+// Coordinate descent
+// ===========================================================================
+
+/// Minimize an error function over `params` by coordinate descent — upstream's
+/// `coordinate_descent(adj_params, params, error_func)`
+/// (`klippy/mathutil.py:16-49`).
+///
+/// Upstream takes the adjustable parameters by name (`adj_params`) out of a
+/// `params` dict; here the adjustable set *is* `params`, adjusted in index
+/// order. That is the shape the H9 leveling family wants: `z_tilt` and
+/// `bed_tilt` fit the plane `z = c + a*x + b*y` by adjusting all three
+/// coefficients, so every entry is adjustable and the caller's slice order is
+/// upstream's `adj_params` order. Indices avoid `f64` map keys entirely.
+///
+/// The search mirrors upstream step for step: every parameter starts with a
+/// step `dp` of 1.0; each round tries `+dp` (on improvement keep the value and
+/// grow `dp` by `* 1.1`), else `-dp` (same rules), else reverts and shrinks
+/// `dp` by `* 0.9`. It stops once the steps sum to at most `1e-5` or after
+/// 10 000 rounds — the same threshold and cap as upstream's
+/// `while sum(dp.values()) > threshold and rounds < 10000`.
+///
+/// The best parameters are left in `params` (the output is in-place, since
+/// `f64` slices cannot be hash-keyed the way upstream returns a dict).
+pub fn coordinate_descent(params: &mut [f64], mut error: impl FnMut(&[f64]) -> f64) {
+    let mut dp = vec![1.0_f64; params.len()];
+    let mut best_err = error(params);
+    let mut rounds = 0usize;
+
+    while dp.iter().sum::<f64>() > 1e-5 && rounds < 10_000 {
+        rounds += 1;
+        for i in 0..params.len() {
+            let orig = params[i];
+            params[i] = orig + dp[i];
+            let err = error(params);
+            if err < best_err {
+                best_err = err;
+                dp[i] *= 1.1;
+                continue;
+            }
+            params[i] = orig - dp[i];
+            let err = error(params);
+            if err < best_err {
+                best_err = err;
+                dp[i] *= 1.1;
+                continue;
+            }
+            params[i] = orig;
+            dp[i] *= 0.9;
+        }
+    }
+}
+
+// ===========================================================================
 // Tests
 // ===========================================================================
 
@@ -232,6 +285,18 @@ mod tests {
         coord.set_axis(Z_AXIS, 9.0);
 
         assert_eq!(coord, Coord::new(1.0, 2.0, 9.0, 4.0));
+    }
+
+    #[test]
+    fn test_coordinate_descent_converges_on_a_quadratic() {
+        // f(a, b) = (a - 1)^2 + (b + 2)^2 has its analytic minimum at
+        // (1, -2); coordinate descent must walk there from the origin.
+        let mut params = [0.0, 0.0];
+
+        coordinate_descent(&mut params, |p| (p[0] - 1.0).powi(2) + (p[1] + 2.0).powi(2));
+
+        assert!((params[0] - 1.0).abs() < 1e-4, "a = {}", params[0]);
+        assert!((params[1] + 2.0).abs() < 1e-4, "b = {}", params[1]);
     }
 
     #[test]

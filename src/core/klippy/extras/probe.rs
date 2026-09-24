@@ -722,12 +722,6 @@ impl PrinterProbe {
         self.session.run(gcmd).await
     }
 
-    /// The probe parameters a command asks for
-    /// (`ProbeSessionHelper.get_probe_params`).
-    pub(crate) fn probe_params(&self, gcmd: &GcodeCommand) -> Result<ProbeParams, CommandError> {
-        self.session.defaults.from_command(gcmd)
-    }
-
     /// Take the completed sample sets (`pull_probed_results`).
     pub(crate) fn pull_probed_results(&self) -> Vec<Coord> {
         self.session.pull_results()
@@ -737,6 +731,89 @@ impl PrinterProbe {
     pub(crate) fn end_probe_session(&self) -> Result<(), CommandError> {
         self.session.end()
     }
+}
+
+/// What every consumer of the `probe` object drives: the session surface of
+/// one configured probe section (`probe.py:PrinterProbe`'s
+/// `start_probe_session` / `run_probe` / `pull_probed_results` /
+/// `end_probe_session` / `get_probe_params` / `get_offsets`).
+///
+/// The points round dispatches through this trait ([`lookup_probe_session`]),
+/// so a second probe section registering the same `probe` object plugs into
+/// the same round. `PrinterProbe` — `[probe]`, and through it `[bltouch]` /
+/// `[smart_effector]` — is the first implementation; the round's tests drive
+/// a second one.
+pub trait ProbeSession: Send + Sync {
+    /// Open a session (`start_probe_session`).
+    fn start_probe_session(&self) -> Result<(), CommandError>;
+    /// Run one sample set in the open session (`run_probe`).
+    fn run_probe<'a>(&'a self, gcmd: &'a GcodeCommand) -> CommandFuture<'a>;
+    /// The parameters a command asks for (`ProbeSessionHelper.get_probe_params`).
+    fn probe_params(&self, gcmd: &GcodeCommand) -> Result<ProbeParams, CommandError>;
+    /// Take the completed sample sets (`pull_probed_results`).
+    fn pull_probed_results(&self) -> Vec<Coord>;
+    /// Close the session (`end_probe_session`).
+    fn end_probe_session(&self) -> Result<(), CommandError>;
+    /// The probe's offsets (`get_offsets`).
+    fn offsets(&self) -> ProbeOffsets;
+}
+
+impl ProbeSession for PrinterProbe {
+    fn start_probe_session(&self) -> Result<(), CommandError> {
+        self.session.start()
+    }
+
+    fn run_probe<'a>(&'a self, gcmd: &'a GcodeCommand) -> CommandFuture<'a> {
+        Box::pin(self.session.run(gcmd))
+    }
+
+    fn probe_params(&self, gcmd: &GcodeCommand) -> Result<ProbeParams, CommandError> {
+        self.session.defaults.from_command(gcmd)
+    }
+
+    fn pull_probed_results(&self) -> Vec<Coord> {
+        self.session.pull_results()
+    }
+
+    fn end_probe_session(&self) -> Result<(), CommandError> {
+        self.session.end()
+    }
+
+    fn offsets(&self) -> ProbeOffsets {
+        // The same answer as the inherent accessor, which stays for the
+        // callers outside this module (bed_mesh drives it concretely today).
+        ProbeOffsets {
+            x: self.options.x_offset,
+            y: self.options.y_offset,
+            z: self.options.z_offset,
+        }
+    }
+}
+
+/// How sensor samples reach an open probe session — the delivery seam this
+/// port fixes ahead of the eddy probe. Upstream, the sensor's client stream
+/// feeds the probing session while it runs (`probe_eddy_current.py`'s
+/// gather/scan loops read batches and turn them into results); the real
+/// ldc1612 producer lands with that probe, and its tests stub it here — a
+/// producer holds an `Arc<dyn SampleDelivery>` pointing into the open
+/// session.
+pub trait SampleDelivery: Send + Sync {
+    /// Deliver one sample read at `time` (print seconds) whose sensor value
+    /// is `value`.
+    fn deliver_sample(&self, time: f64, value: f64);
+}
+
+/// The registered `probe` object as its session trait: the lookup every
+/// points round starts from (`probe.py:start_probe_session`'s object lookup
+/// by name).
+///
+/// The object is built by the probe family today — `[probe]`, `[bltouch]`,
+/// `[smart_effector]`, all `PrinterProbe`; a further section joins by
+/// registering under the same name and extending this downcast.
+pub(crate) fn lookup_probe_session(printer: &Printer) -> Option<Arc<dyn ProbeSession>> {
+    printer
+        .lookup_object_as::<PrinterProbe>(PROBE_OBJECT)
+        .map(|probe| probe as Arc<dyn ProbeSession>)
 }
 
 /// Register `QUERY_PROBE`, `PROBE` and `PROBE_ACCURACY`
@@ -1399,7 +1476,7 @@ impl ProbePointsHelper {
             .lock()
             .unwrap_or_else(|p| p.into_inner()) = horizontal_move_z;
 
-        let probe = printer.lookup_object_as::<PrinterProbe>(PROBE_OBJECT);
+        let probe = lookup_probe_session(&printer);
         if method == "manual" || probe.is_none() {
             // Manual probing: no offsets, the travel speed is the lift speed,
             // and each point waits for the user's `ACCEPT`
@@ -1482,7 +1559,7 @@ struct LiveRound {
     helper: Arc<ProbePointsHelper>,
     printer: Arc<Printer>,
     /// `None` in manual mode.
-    probe: Option<Arc<PrinterProbe>>,
+    probe: Option<Arc<dyn ProbeSession>>,
 }
 
 impl LiveRound {
@@ -1547,7 +1624,7 @@ impl RoundOps for LiveRound {
                 "Internal probe error - no probe session",
             ))));
         };
-        Box::pin(probe.run_probe(gcmd))
+        probe.run_probe(gcmd)
     }
 
     fn pull_results(&self) -> Vec<Coord> {
@@ -2074,6 +2151,240 @@ mod probe_points_tests {
                 Step::MoveNext(0),
                 Step::ManualStart,
             ]
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The probe session trait seam (M5b): one dispatch, two implementations,
+    // plus the sample delivery seam
+    // -----------------------------------------------------------------------
+
+    /// A second probe section's session — the shape an eddy probe lands
+    /// later: not a `ProbeSessionHelper`, but the same trait surface. It also
+    /// receives samples through [`SampleDelivery`].
+    struct StubProbe {
+        /// What the round drove, in order.
+        log: Mutex<Vec<&'static str>>,
+        /// The results `pull_probed_results` hands out (taken, as the real
+        /// session takes them).
+        results: Mutex<Vec<Coord>>,
+        /// The samples delivered through the seam.
+        samples: Mutex<Vec<(f64, f64)>>,
+    }
+
+    impl StubProbe {
+        fn new(results: Vec<Coord>) -> Self {
+            Self {
+                log: Mutex::new(Vec::new()),
+                results: Mutex::new(results),
+                samples: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn record(&self, call: &'static str) {
+            self.log
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(call);
+        }
+
+        fn calls(&self) -> Vec<&'static str> {
+            self.log.lock().unwrap_or_else(|p| p.into_inner()).clone()
+        }
+
+        fn delivered(&self) -> Vec<(f64, f64)> {
+            self.samples
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone()
+        }
+    }
+
+    impl ProbeSession for StubProbe {
+        fn start_probe_session(&self) -> Result<(), CommandError> {
+            self.record("start");
+            Ok(())
+        }
+
+        fn run_probe<'a>(&'a self, _gcmd: &'a GcodeCommand) -> CommandFuture<'a> {
+            self.record("run");
+            Box::pin(std::future::ready(Ok(())))
+        }
+
+        fn probe_params(&self, _gcmd: &GcodeCommand) -> Result<ProbeParams, CommandError> {
+            self.record("params");
+            Ok(ProbeParams {
+                probe_speed: 5.0,
+                lift_speed: 5.0,
+                samples: 1,
+                sample_retract_dist: 2.0,
+                samples_tolerance: 0.100,
+                samples_tolerance_retries: 0,
+                samples_result: "median".to_string(),
+            })
+        }
+
+        fn pull_probed_results(&self) -> Vec<Coord> {
+            self.record("pull");
+            std::mem::take(&mut *self.results.lock().unwrap_or_else(|p| p.into_inner()))
+        }
+
+        fn end_probe_session(&self) -> Result<(), CommandError> {
+            self.record("end");
+            Ok(())
+        }
+
+        fn offsets(&self) -> ProbeOffsets {
+            self.record("offsets");
+            ProbeOffsets {
+                x: 1.0,
+                y: 2.0,
+                z: 3.0,
+            }
+        }
+    }
+
+    impl SampleDelivery for StubProbe {
+        fn deliver_sample(&self, time: f64, value: f64) {
+            self.samples
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push((time, value));
+        }
+    }
+
+    /// The real z implementation, assembled from its parts the way
+    /// `PrinterProbe::new` does once the pin layer built the endstop — no
+    /// machine needed for the session's command surface.
+    fn real_z_probe(printer: &Arc<Printer>, probe_options: &[(&str, &str)]) -> Arc<PrinterProbe> {
+        use crate::core::klippy::mcu::{ConfigBuilder, McuChip};
+
+        let mut section = ConfigSection::new("probe", None);
+        for (option, value) in probe_options {
+            section.parameters.insert(
+                (*option).to_string(),
+                ConfigValue::Single((*value).to_string()),
+            );
+        }
+        let config = ConfigWrapper::untracked(&section);
+        let options = ProbeOptions::read(&config).unwrap();
+        let chip = McuChip::new(
+            "mcu".to_string(),
+            Arc::new(ConfigBuilder::new()),
+            Arc::new(PrinterPins::new()),
+        );
+        let params = PinParams {
+            chip_name: "mcu".to_string(),
+            pin: "PA0".to_string(),
+            invert: false,
+            pullup: 0,
+            share_type: None,
+        };
+        let endstop = Arc::new(McuEndstop::new(chip, &params).unwrap());
+        let session = Arc::new(
+            ProbeSessionHelper::new(
+                &config,
+                printer,
+                Arc::clone(&endstop) as Arc<dyn HomingEndstop>,
+                Arc::clone(&endstop),
+                &options,
+                None,
+            )
+            .unwrap(),
+        );
+        Arc::new(PrinterProbe::from_parts(
+            "probe".to_string(),
+            options,
+            Arc::clone(&endstop),
+            session,
+            Arc::new(ProbeCommandState::default()),
+        ))
+    }
+
+    #[test]
+    fn the_round_drives_both_probe_implementations_through_one_dispatch() {
+        let (_printer, _gcode, gcmd) = dummy_gcmd();
+        let helper = helper(Some(rows(&["50,50"]))).unwrap();
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+
+        // The lookup the round starts from finds nothing without a `probe`
+        // object (the round's manual branch).
+        assert!(lookup_probe_session(&printer).is_none());
+
+        // First implementation: the real z probe, registered as `probe`.
+        // Every call the round makes runs its actual session logic.
+        let z = real_z_probe(&printer, &[("pin", "PA0"), ("z_offset", "1.5")]);
+        printer
+            .add_object(PROBE_OBJECT, Arc::clone(&z) as Arc<dyn PrinterObject>)
+            .unwrap();
+        let session: Arc<dyn ProbeSession> =
+            lookup_probe_session(&printer).expect("the registered probe answers the lookup");
+        session.start_probe_session().unwrap();
+        // A second open is still the session-mismatch refusal.
+        let err = session.start_probe_session().unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Internal probe error - start/end probe session mismatch"
+        );
+
+        // Through the round's dispatch point, with no machine behind it, the
+        // real path stops at the toolhead lookup — its pre-trait error.
+        let round = LiveRound {
+            helper: Arc::clone(&helper),
+            printer: Arc::clone(&printer),
+            probe: Some(Arc::clone(&session)),
+        };
+        let err = block_on(round.run_probe(&gcmd)).unwrap_err();
+        assert_eq!(err.to_string(), "Printer is not ready");
+        assert!(round.pull_results().is_empty());
+        round.end_session().unwrap();
+        assert_eq!(
+            session.offsets(),
+            ProbeOffsets {
+                x: 0.0,
+                y: 0.0,
+                z: 1.5
+            }
+        );
+        assert_eq!(session.probe_params(&gcmd).unwrap().probe_speed, 5.0);
+
+        // Second implementation: the same dispatch, another session — and
+        // the stub saw nothing of the z half above.
+        let stub = Arc::new(StubProbe::new(vec![Coord::new(0.0, 0.0, 1.0, 0.0)]));
+        assert!(stub.calls().is_empty());
+        let stub_session: Arc<dyn ProbeSession> = Arc::clone(&stub) as Arc<dyn ProbeSession>;
+        let stub_round = LiveRound {
+            helper: Arc::clone(&helper),
+            printer: Arc::clone(&printer),
+            probe: Some(stub_session),
+        };
+        stub_round
+            .probe
+            .as_ref()
+            .expect("the stub round carries a session")
+            .start_probe_session()
+            .unwrap();
+        block_on(stub_round.run_probe(&gcmd)).unwrap();
+        assert_eq!(
+            stub_round.pull_results(),
+            vec![Coord::new(0.0, 0.0, 1.0, 0.0)]
+        );
+        stub_round.end_session().unwrap();
+        assert_eq!(stub.calls(), vec!["start", "run", "pull", "end"]);
+        assert_eq!(stub_round.point_count(), 1);
+    }
+
+    #[test]
+    fn samples_delivered_through_the_seam_reach_the_session() {
+        let stub = Arc::new(StubProbe::new(Vec::new()));
+        let delivery: Arc<dyn SampleDelivery> = Arc::clone(&stub) as Arc<dyn SampleDelivery>;
+
+        delivery.deliver_sample(12.5, 654_321.0);
+        delivery.deliver_sample(12.5025, 654_000.0);
+
+        assert_eq!(
+            stub.delivered(),
+            vec![(12.5, 654_321.0), (12.5025, 654_000.0)]
         );
     }
 }

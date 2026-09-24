@@ -37,6 +37,7 @@ use crate::core::klippy::cmd::trigger_analog::{
 };
 use crate::core::klippy::cmd::trsync::{raw_is_failure, TriggerReason};
 use crate::core::klippy::cmd::McuCommand;
+use crate::core::klippy::extras::toolhead::{EndstopFuture, HomingEndstop};
 use crate::core::klippy::mcu::{Mcu, McuError};
 
 /// How long a `trigger_analog_query_state` exchange may take.
@@ -588,6 +589,35 @@ impl McuTriggerAnalog {
     }
 }
 
+/// The second implementation of the homing channel: upstream drives
+/// `MCU_trigger_analog` through the same `homing.probing_move` endstop
+/// interface as `MCU_endstop` (`probe_eddy_current.py:752, 902`), so an
+/// eddy-class probe's endstop reaches the very same probing move a `[probe]`
+/// switch does.
+impl HomingEndstop for McuTriggerAnalog {
+    fn home_start(
+        &self,
+        print_time: f64,
+        sample_time: f64,
+        sample_count: u8,
+        rest_time: f64,
+        triggered: bool,
+    ) -> Result<Arc<Completion>, McuError> {
+        McuTriggerAnalog::home_start(
+            self,
+            print_time,
+            sample_time,
+            sample_count,
+            rest_time,
+            triggered,
+        )
+    }
+
+    fn home_wait(&self, home_end_time: f64) -> EndstopFuture<'_> {
+        Box::pin(McuTriggerAnalog::home_wait(self, home_end_time))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -992,5 +1022,64 @@ mod tests {
             err.to_string().contains("Trigger analog error: MONITOR"),
             "{err}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_it_arms_and_waits_through_the_homing_endstop_trait() {
+        let (mcu, _chip, ta) = resource_harness(400.0).await;
+        ta.set_raw_range(-2_000_000, 2_000_000);
+        ta.set_trigger(TriggerAnalogType::Gt, 42);
+
+        // The very channel `probing_move` drives `McuEndstop` over — the
+        // second implementation now reaches it too.
+        let endstop: &dyn HomingEndstop = &ta;
+        let completion = endstop.home_start(1.0, 0.0, 0, 0.0, true).unwrap();
+        mcu.send_msg(&ResetStepClock { oid: 0, clock: 0 }).unwrap();
+
+        let time = tokio::time::timeout(Duration::from_secs(5), endstop.home_wait(2.0))
+            .await
+            .expect("fires within the monitor window")
+            .expect("a hit is not an error");
+        assert!(time > 0.9 && time < 1.1, "trigger print time: {time}");
+        assert_eq!(completion.reason(), Some(TriggerReason::EndstopHit));
+    }
+
+    #[tokio::test]
+    async fn test_the_stub_sensor_feeds_a_session_and_decodes_its_error_codes() {
+        use crate::core::klippy::extras::probe::SampleDelivery;
+
+        let (chip, mcu) = chip();
+        let ta = McuTriggerAnalog::new(chip, 400.0, None).unwrap();
+
+        // The stub stands in for the sensor half of the seam (the ldc1612
+        // producer lands with the eddy probe): its samples reach an open
+        // probe session…
+        struct StubSession {
+            samples: Mutex<Vec<(f64, f64)>>,
+        }
+        impl SampleDelivery for StubSession {
+            fn deliver_sample(&self, time: f64, value: f64) {
+                self.samples.lock().unwrap().push((time, value));
+            }
+        }
+        let session = Arc::new(StubSession {
+            samples: Mutex::new(Vec::new()),
+        });
+        let delivery: Arc<dyn SampleDelivery> = Arc::clone(&session) as Arc<dyn SampleDelivery>;
+        delivery.deliver_sample(1.5, 654_321.0);
+        delivery.deliver_sample(1.5025, 654_000.0);
+        assert_eq!(
+            *session.samples.lock().unwrap(),
+            vec![(1.5, 654_321.0), (1.5025, 654_000.0)]
+        );
+
+        // …and its error-code decoder is what `set_sensor_error_lookup`
+        // hands the firmware's sensor-specific codes (`SENSOR_SPECIFIC` = 3
+        // in the dictionary below).
+        ta.set_sensor_error_lookup(|code| format!("stub sensor error {code}"));
+        assert_eq!(ta.error_text(&mcu, 3), "stub sensor error 0");
+        assert_eq!(ta.error_text(&mcu, 5), "stub sensor error 2");
+        // Codes below `SENSOR_SPECIFIC` still name the dictionary's own.
+        assert_eq!(ta.error_text(&mcu, 2), "MONITOR");
     }
 }

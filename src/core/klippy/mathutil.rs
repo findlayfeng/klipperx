@@ -300,6 +300,34 @@ mod tests {
     }
 
     #[test]
+    fn test_coordinate_descent_recovers_a_plane_from_coupled_residuals() {
+        // Plane fit as z_tilt / bed_tilt use it: minimize
+        // sum((z_i - x_i*a - y_i*b - c)^2) over a grid whose points were
+        // built from a known plane. The grid is off-center, so the slope
+        // and intercept columns are genuinely coupled.
+        let (true_a, true_b, true_c) = (0.5, -0.3, 2.0);
+        let mut samples = Vec::new();
+        for &x in &[10.0, 20.0, 30.0] {
+            for &y in &[5.0, 15.0, 25.0] {
+                samples.push((x, y, true_a * x + true_b * y + true_c));
+            }
+        }
+        let mut params = [0.0, 0.0, 0.0];
+
+        coordinate_descent(&mut params, |p| {
+            let (a, b, c) = (p[0], p[1], p[2]);
+            samples
+                .iter()
+                .map(|&(x, y, z)| (z - x * a - y * b - c).powi(2))
+                .sum::<f64>()
+        });
+
+        assert!((params[0] - true_a).abs() < 1e-3, "a = {}", params[0]);
+        assert!((params[1] - true_b).abs() < 1e-3, "b = {}", params[1]);
+        assert!((params[2] - true_c).abs() < 1e-3, "c = {}", params[2]);
+    }
+
+    #[test]
     fn test_xyz_converts_to_and_from_coord() {
         let xyz = Xyz::new(1.0, 2.0, 3.0);
 

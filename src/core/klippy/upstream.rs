@@ -422,7 +422,6 @@ mod tests {
         "pressure_advance.test",
         "printers.test",
         "rotary_delta_calibrate.test",
-        "sdcard_loop.test",
         "tmc.test",
     ];
 

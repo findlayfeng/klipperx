@@ -139,7 +139,12 @@ impl McuI2c {
     ///
     /// # Errors
     /// Returns [`McuError::Config`] before the configuration has been built.
-    fn oid(&self) -> Result<u8, McuError> {
+    /// The oid the firmware allocated for this device.
+    ///
+    /// A sensor built on the bus needs it for its own config command
+    /// (`config_ldc1612 oid i2c_oid`), the same way upstream reads
+    /// `MCU_I2C.get_oid()`.
+    pub fn oid(&self) -> Result<u8, McuError> {
         self.state
             .oid
             .lock()

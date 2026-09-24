@@ -395,3 +395,171 @@ pub fn load_config(
     let object = QuadGantryLevel::new(config, printer)?;
     Ok(object as Arc<dyn PrinterObject>)
 }
+
+// ===========================================================================
+// quad_gantry_level tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::klippy::config::{ConfigSection, ConfigValue};
+    use crate::core::klippy::reactor::ManualReactor;
+
+    /// A section with the given options, as the parser would build it.
+    fn section(options: &[(&str, &str)]) -> ConfigSection {
+        let mut section = ConfigSection::new("quad_gantry_level", None);
+        for (option, value) in options {
+            section.parameters.insert(
+                (*option).to_string(),
+                ConfigValue::Single((*value).to_string()),
+            );
+        }
+        section
+    }
+
+    /// The corpus' probe layout (`test/klippy/z_tilt.cfg`): probes 0/3 at
+    /// y = 0, probes 1/2 at y = 200, gantry corners left and right.
+    const GANTRY_CORNERS: &[(f64, f64)] = &[(-55.0, -7.0), (305.0, 320.0)];
+    const PROBES: [(f64, f64); 4] = [(25.0, 0.0), (25.0, 200.0), (225.0, 200.0), (225.0, 0.0)];
+
+    /// Toolhead positions for a known probe-frame plane, as the probe
+    /// reports them: XY the toolhead's, Z the bed height under the probe
+    /// (toolhead + probe offsets).
+    fn probed(
+        positions: &[(f64, f64)],
+        offsets: &ProbeOffsets,
+        plane: impl Fn(f64, f64) -> f64,
+    ) -> Vec<Coord> {
+        positions
+            .iter()
+            .map(|(x, y)| Coord::new(*x, *y, plane(x + offsets.x, y + offsets.y), 0.0))
+            .collect()
+    }
+
+    /// The two-point fit: equal Y is upstream's straight-line shortcut,
+    /// anything else is slope + intercept (`quad_gantry_level.py:126-135`).
+    #[test]
+    fn linefit_handles_the_straight_line_and_a_slope() {
+        assert_eq!(linefit((3.0, 2.5), (17.0, 2.5)), (0.0, 2.5));
+        assert_eq!(linefit((1.0, 2.0), (3.0, 6.0)), (2.0, 0.0));
+        assert!((plot((2.0, 1.0), 4.0) - 9.0).abs() < 1e-12);
+    }
+
+    /// The four corners come back as the gantry-relative heights of a known
+    /// plane — probe offsets fully absorbed (`quad_gantry_level.py:58-92`).
+    /// Heights 0/1 are read at corner 0's abscissa, heights 2/3 at corner
+    /// 1's, exactly as upstream's two Y slopes are built.
+    #[test]
+    fn gantry_heights_recover_the_known_four_corners() {
+        let (a, b, c) = (0.001, -0.002, 1.5);
+        let plane = |x: f64, y: f64| c + a * x + b * y;
+        let offsets = ProbeOffsets {
+            x: 0.5,
+            y: -0.25,
+            z: 1.15,
+        };
+        let horizontal_move_z = 5.0;
+        let positions = probed(&PROBES, &offsets, plane);
+
+        let heights = gantry_heights(&offsets, &positions, GANTRY_CORNERS, horizontal_move_z);
+
+        let (left, right) = (GANTRY_CORNERS[0], GANTRY_CORNERS[1]);
+        let expected = [
+            horizontal_move_z - plane(left.0, left.1),
+            horizontal_move_z - plane(left.0, right.1),
+            horizontal_move_z - plane(right.0, right.1),
+            horizontal_move_z - plane(right.0, left.1),
+        ];
+        for (index, (height, expected)) in heights.iter().zip(&expected).enumerate() {
+            assert!(
+                (height - expected).abs() < 1e-9,
+                "corner {index}: {height} vs {expected}"
+            );
+        }
+    }
+
+    /// Each actuator moves by `average - height`, and a corner that would
+    /// move further than `max_adjust` aborts with upstream's message
+    /// (`quad_gantry_level.py:94-103`).
+    #[test]
+    fn fit_gantry_aborts_past_max_adjust() {
+        // A steep Y tilt: heights land at hz-c+0.35 and hz-c-16, so the
+        // largest adjustment is 8.175 — past the default max_adjust of 4.
+        let plane = |x: f64, y: f64| 1.5 + 0.05 * y + 0.0 * x;
+        let offsets = ProbeOffsets {
+            x: 0.0,
+            y: 0.0,
+            z: 1.15,
+        };
+        let positions = probed(&PROBES, &offsets, plane);
+
+        let Err(err) = fit_gantry(&offsets, &positions, GANTRY_CORNERS, 5.0, 4.0) else {
+            panic!("an 8.175 adjustment must abort at max_adjust 4");
+        };
+        assert_eq!(
+            err.to_string(),
+            "Aborting quad_gantry_level required adjustment 8.175000 \
+             is greater than max_adjust 4.000000"
+        );
+
+        // The same fit with a raised limit reports the adjustments around
+        // the average: +8.175 for the high corners, -8.175 for the low.
+        let fit = fit_gantry(&offsets, &positions, GANTRY_CORNERS, 5.0, 9.0)
+            .expect("a limit past 8.175 accepts the fit");
+        assert!((fit.adjustments[0] + 8.175).abs() < 1e-9);
+        assert!((fit.adjustments[1] - 8.175).abs() < 1e-9);
+        assert!((fit.adjustments[0] + fit.adjustments[1]).abs() < 1e-9);
+    }
+
+    /// Fewer (or more) than four probe points is a load error
+    /// (`quad_gantry_level.py:35-37`), raised before any command registers.
+    #[test]
+    fn qgl_requires_exactly_four_probe_points() {
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        let section = section(&[
+            ("points", "25,0\n25,200\n225,200"),
+            ("gantry_corners", "-55,-7\n305,320"),
+        ]);
+        let config = ConfigWrapper::untracked(&section);
+        let Err(err) = QuadGantryLevel::new(&config, &printer) else {
+            panic!("bad points must not load");
+        };
+        assert_eq!(
+            err.to_string(),
+            "Need exactly 4 probe points for quad_gantry_level"
+        );
+    }
+
+    /// Fewer than two gantry corners is a load error
+    /// (`quad_gantry_level.py:40-42`).
+    #[test]
+    fn qgl_requires_two_gantry_corners() {
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        let section = section(&[
+            ("points", "25,0\n25,200\n225,200\n225,0"),
+            ("gantry_corners", "-55,-7"),
+        ]);
+        let config = ConfigWrapper::untracked(&section);
+        let Err(err) = QuadGantryLevel::new(&config, &printer) else {
+            panic!("one gantry corner must not load");
+        };
+        assert_eq!(
+            err.to_string(),
+            "quad_gantry_level requires at least two gantry_corners"
+        );
+    }
+
+    /// A missing `gantry_corners` is reported the way upstream's `getlists`
+    /// reports a missing option.
+    #[test]
+    fn missing_gantry_corners_reports_upstream_wording() {
+        let bare = section(&[("points", "25,0\n25,200\n225,200\n225,0")]);
+        let config = ConfigWrapper::untracked(&bare);
+        let err = read_xy_option(&config, "gantry_corners").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Option 'gantry_corners' in section 'quad_gantry_level' is not defined"
+        );
+    }
+}

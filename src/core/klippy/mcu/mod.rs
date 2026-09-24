@@ -990,6 +990,13 @@ impl Mcu {
     /// # Errors
     /// Returns [`McuError::Msg`] if the send task has gone away.
     pub(crate) async fn send_payload(&self, payload: Payload) -> Result<(), McuError> {
+        #[cfg(debug_assertions)]
+        if std::env::var_os("MULTI_Z").is_some() && self.send_buf_tx.capacity() <= 8 {
+            eprintln!(
+                "CAP-DIAG await-payload ({} left)",
+                self.send_buf_tx.capacity()
+            ); // TEMP-DIAG
+        }
         self.send_buf_tx
             .send(SendItem::Payload(payload))
             .await
@@ -1029,7 +1036,13 @@ impl Mcu {
         }
         self.send_buf_tx
             .try_send(SendItem::Payload(payload))
-            .map_err(|e| MsgError::new(e.to_string()))?;
+            .map_err(|e| {
+                #[cfg(debug_assertions)]
+                if std::env::var_os("MULTI_Z").is_some() {
+                    eprintln!("CAP-DIAG enqueue full: {name}"); // TEMP-DIAG
+                }
+                MsgError::new(e.to_string())
+            })?;
         Ok(())
     }
 

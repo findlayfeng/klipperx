@@ -521,6 +521,12 @@ SPI_SEND     DEVICE=flash DATA=04          // spi send ok
 `RETRIES`/`RETRY_TOLERANCE` + 探针透传组）。注意两个与上游一致的细节：段内 `horizontal_move_z`
 **不**被命令行 `HORIZONTAL_MOVE_Z` 覆盖；重试用的是**机架相对高度**而非原始探测 Z。
 
+### SCREWS_TILT_CALCULATE — 螺丝调平计算（由 `[screws_tilt_adjust]` 注册）
+
+| 命令 | 参数 | 说明 |
+|------|------|------|
+| `SCREWS_TILT_CALCULATE` | `MAX_DEVIATION`（可选，毫米）、`DIRECTION`（可选，`CW` / `CCW`） | **须先配置 `[screws_tilt_adjust]`**（节内选项见 config.md）。依次探测各螺丝上方床面，逐颗输出拧账单：`HH:MM` 是时钟记法——整数位 = 整圈，分 = 60 进制小数圈（**一整圈 = 60 分钟 = 螺距**，由 `screw_thread` 表换算；例 `01:20` 即 1 又 1/3 圈）。基准螺丝默认取第 1 颗；`DIRECTION=CW/CCW` 时按螺纹方向取 Z 极值（最高或最低）螺丝作基准。`MAX_DEVIATION` 是本轮的**延迟错误**：探测全部完成后才比较报错；`DIRECTION` 取值非法报 `DIRECTION must be either CW or CCW`。help：*Tool to help adjust bed leveling screws by calculating the number of turns to level it.* |
+
 ### BLTOUCH_DEBUG / BLTOUCH_STORE — BLTouch 诊断与模式（由 `[bltouch]` 注册）
 
 | 命令 | 参数 | 说明 |

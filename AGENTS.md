@@ -31,6 +31,19 @@
 
    现有布局：主检出 `…/klipperx` → `work`；并行任务在 `…/klipperx.worktrees/<短名>`。
    此命令只由 main 执行，见规则 5。
+
+   **不拷子模组**：worktree 里 `third_party/klipper` 保持空目录即可——既不 `git submodule
+   update`（属规则 6 禁止的远程交互），也不拷贝主检出的子模组（拷贝会让子模组的相对 gitfile
+   失效，worktree 里任何 `git status` 都会报「不是 Git 仓库」）。需要语料/构建时用环境变量
+   指向主检出：
+
+   ```bash
+   KLIPPERX_KLIPPER_DIR=<主检出>/third_party/klipper cargo test …
+   ```
+
+   共享同一份检出是安全的：构建只写各自 `OUT_DIR`（`KCONFIG_CONFIG`/`OUT` 显式外移），
+   不碰子模组自己的文件。该变量由 `crates/test-support`（`build.rs` 与 `klipper_dir()`）
+   与 `src/core/klippy/upstream.rs` 统一解析。
 3. **开工前先看状态**：`git status` 确认工作区干净再切分支；发现已有未提交改动先报告，
    不要替用户 stash 或丢弃。
 4. **任务完成后**：提交到自己的分支（提交信息遵循仓库现有风格，见下），**不自动合入 `work`**；

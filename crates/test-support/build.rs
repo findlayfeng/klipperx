@@ -45,7 +45,18 @@ fn main() {
         .and_then(Path::parent)
         .expect("test-support must live at crates/test-support")
         .to_path_buf();
-    let klipper_dir = workspace_root.join("third_party/klipper");
+    // `KLIPPERX_KLIPPER_DIR` points at a klipper checkout outside this worktree.
+    // A git worktree does not populate submodules, so pointing at the main
+    // checkout's `third_party/klipper` is how a worktree gets a corpus without
+    // copying it — which also avoids the dangling relative gitfile a copied
+    // submodule leaves behind (`git status` then fails inside the worktree).
+    // Sharing one checkout is safe: every build here writes only into this
+    // build script's `OUT_DIR` (`KCONFIG_CONFIG` and `OUT` are set explicitly in
+    // `make()`), so concurrent worktrees never touch the submodule's own files.
+    let klipper_dir = std::env::var_os("KLIPPERX_KLIPPER_DIR")
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| workspace_root.join("third_party/klipper"));
 
     // OUT_DIR is stable across runs of the same build, which is what keeps the
     // klipper builds incremental: only the first `cargo test` compiles them.
@@ -65,6 +76,7 @@ fn main() {
             klipper_dir.join(changed).display()
         );
     }
+    println!("cargo:rerun-if-env-changed=KLIPPERX_KLIPPER_DIR");
     println!("cargo:rerun-if-env-changed=KLIPPERX_ARCHES");
     println!("cargo:rerun-if-env-changed=KLIPPERX_ALL_ARCHES");
 

@@ -142,7 +142,7 @@ klipperx（bin，src/main.rs）
 
 | 文件 | 职责 |
 |------|------|
-| `mod.rs` | `Mcu`：构造（`new`）、收发任务、`send` / `call`、字典安装与查询（出站队列 `SEND_QUEUE_CAPACITY` = 512：同步 `send` 用 `try_send` 不等待容量，主机突发必须放得下；能大量入队的路径走 await 容量的 `send_payload`）、`seconds_to_clock`、`estimated_clock`（connect 时 `set_clock_base` 的最小时间估计）、`Drop`；构造时向 `identify` 取起始 `Parser`，本身不引用任何命令 |
+| `mod.rs` | `Mcu`：构造（`new`）、收发任务、`send` / `call`、字典安装与查询（出站队列 `SEND_QUEUE_CAPACITY` = 512：同步 `send` 用 `try_send` 不等待容量，主机突发必须放得下；能大量入队的路径走 await 容量的 `send_payload`——剩余 ≤16 格（`SYNC_SEND_HEADROOM`）时暂停入队等排空，给同步 `send` 常备余量）、`seconds_to_clock`、`estimated_clock`（connect 时 `set_clock_base` 的最小时间估计）、`Drop`；构造时向 `identify` 取起始 `Parser`，本身不引用任何命令 |
 | `object.rs` | `McuObject`：`[mcu]` / `[mcu <name>]` 作为打印机对象，以及工厂 `load_config` / `load_config_prefix`。section 只在 `PrinterObject::connect` 时才解析、开设备、跑 identify，随后把累积的配置交给固件（需要时先复位），再把固件的 `shutdown`/`is_shutdown`/`starting` 绑成打印机停机；`get_status` 报 identify 快照 |
 | `config.rs` | [`ConfigBuilder`](mcu-config.md)：配置期的 oid 发号器、`config` / `restart` / `init` 三张命令表、config 回调、CRC 与 `finalize_config`，`configure()` / `handshake()` 的 `get_config` 两段式握手，以及“停机或 CRC 不一致时先复位（`config_reset` 就地，或 `reset` + 重连）再配置”的复位路径 |
 | `resource/pin.rs` | `McuChip`（MCU 作为 pin chip，实现 `PinChip`）与 `McuDigitalOut`：数字输出的 oid、`config_digital_out` / `update_digital_out` 与运行期的 `queue_digital_out`；pin 名→编号在 config 回调里完成。另提供 `resolve_bus_name`（`BUS_PINS_<bus>` 预留，供 SPI/I2C 调用）与 `resolve_bus_value` |

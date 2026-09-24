@@ -682,11 +682,70 @@ pins: !PD0, PD1, PD2
 
 | 选项 | 默认 | 说明 |
 |------|------|------|
-| `screw1` … `screw99` | — | 每项两个浮点（X Y）；**数到第一个缺失编号即停**，少于 3 颗拒绝装载（`Need at least 3 probe points for screws_tilt_adjust`，上游文案） |
+| `screw1` … `screw99` | — | 每项两个浮点（X Y）；**数到第一个缺失编号即停**，少于 3 颗拒绝装载（`screws_tilt_adjust: Must have at least three screws`，上游文案；`Need at least 3 probe points …` 仅在显式 `points` 少于 3 时由 probe 侧报出） |
 | `screwN_name` | `screw at %.3f,%.3f` | 报告行中的螺丝名 |
 | `screw_thread` | `CW-M3` | 螺距/旋向选择表：`CW-M3` `CCW-M3` `CW-M4` `CCW-M4` `CW-M5` `CCW-M5` `CW-M6` `CCW-M6`（8 项，表外值报错） |
 | `points` | 全部螺丝坐标 | 探测点（`ProbePointsHelper`，缺省即螺丝位置） |
 | `horizontal_move_z` / `speed` | `5.` / `50.` | 采样间抬升高度 / 移动速度（同上） |
 
 命令参数（`MAX_DEVIATION`、`DIRECTION`）、输出格式与状态形状见命令参考的 `SCREWS_TILT_CALCULATE` 条目。`get_status` 暴露三键：`error`、`max_deviation`、`results`（按 `screwN` 分键）。
+
+### [gcode_arcs]
+
+| 选项 | 默认 | 说明 |
+|------|------|------|
+| `resolution` | `1.` | 每弧段毫米数（above 0） |
+
+段已落地（2026-09-24 集成批 #1）；`G2`/`G3` 与 `G17-G19` 平面命令**未注册**（H10），未知命令经静默放行。
+
+### [bed_screws]
+
+| 选项 | 默认 | 说明 |
+|------|------|------|
+| `screw1` … `screw99` | — | 每项两浮点（X Y）；**数到第一个缺失编号即停**，少于 3 颗报 `bed_screws: Must have at least three screws` |
+| `screwN_name` | `screw at %.3f,%.3f` | 螺丝显示名 |
+| `screwN_fine_adjust` | — | 该螺丝精调坐标（记在粗调名下） |
+| `speed` / `probe_speed` | `50.` / `5.` | 行进/探入速度（均 above 0） |
+| `horizontal_move_z` / `probe_height` | `5.` / `0.` | 抬升/下探 |
+
+段已落地；`BED_SCREWS_ADJUST`/`ACCEPT`/`ADJUSTED`/`ABORT` 命令族**未移植**（H9，语料经未知命令放行）。
+
+### [pwm_cycle_time <name>] / [pwm_tool <name>]
+
+| 选项 | `pwm_cycle_time` | `pwm_tool` |
+|------|------|------|
+| `pin` | 必填 | 必填 |
+| `cycle_time` | `0.1`（above 0） | `0.1`（above 0） |
+| `scale` | `1`（>0） | `1`（>0） |
+| `value` / `shutdown_value` | `0`（0..=scale，除以 scale） | `0`（同左；设了 `maximum_mcu_duration` 时两者须相等，build 期拒绝） |
+| `hardware_pwm` | —（恒软件 PWM） | `false` |
+| `maximum_mcu_duration` | — | `0`=永不兕底；写则 ≥0.5 秒 |
+
+`pwm_cycle_time` 节的 `SET_PIN` 可带 `CYCLE_TIME=`（秒）：运行期只更新主机记账，固件周期 build 期固定。
+
+### [temperature_fan <name>] / [controller_fan <name>]
+
+| 选项 | `temperature_fan` | `controller_fan` |
+|------|------|------|
+| `pin` | 必填 | 必填 |
+| `min_temp` / `max_temp` | 必填（> -273.15 / > min） | — |
+| `control` | 必填：`watermark` 或 `pid` | — |
+| `max_delta` / `pid_Kp·Ki·Kd` / `pid_deriv_time` | watermark：`2.0`；pid：三项必填（除以 255）、导数窗 `2.0` | — |
+| `max_speed` / `min_speed` / `target_temp` | `1` / `0.3` / `40`（max_temp<40 时取之） | — |
+| `sensor_type` / `sensor_pin` | 由 heaters 传感器工厂读取 | — |
+| `stepper` / `heater` | — | 默认全部步进 / 默认 `extruder`（按对象名，H1 无短名注册表） |
+| `fan_speed` / `idle_speed` / `idle_timeout` | — | `1` / 默认=fan_speed / `30`（≥0） |
+
+命令：`SET_TEMPERATURE_FAN_TARGET`（mux 键 `TEMPERATURE_FAN=`，见命令参考）；`controller_fan` 的 per-second tick 自 `klippy:ready` 起，stepper/heater 引用在 connect 期解析（上游文案）。
+
+### [gcode_macro <名>]
+
+| 选项 | 默认 | 说明 |
+|------|------|------|
+| `gcode` | 必填 | 宏体 |
+| `description` | `G-Code macro` | 命令 help 文本 |
+| `rename_existing` | — | 被改名的命令（仅 load 期同型检查，连接期换名未做） |
+| `variable_<名>` | — | 字面量，`get_status` 可见（只读） |
+
+宏即命令（大写注册）；**宏体暂不展开**（被调用时 `respond_info` 明示未实现，不静默）；`SET_GCODE_VARIABLE` 未注册；裸 `[gcode_macro]` 为共享模板持有者（零选项）。完整模板/表达式引擎属 H3。
 

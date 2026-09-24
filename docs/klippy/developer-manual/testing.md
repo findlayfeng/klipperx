@@ -145,7 +145,7 @@ git config core.hooksPath .githooks
 | `endstop.rs` | `config_endstop` / `endstop_home` 的参数序与固件一致；`pull_up` 负值按字节编码；disable 全零；`home_wait` 的 32 位触发时钟以**本次 move 的 arm clock** 为纪元参考（打印时间远超 MCU 自报时钟时会差一整圈：2³²/16 MHz = 268.44 s） |
 | `trsync.rs` | `trsync_start` 参数序与固件一致；`trigger_reason` 枚举号与固件对齐；`raw_failure_classification` 覆盖 typed 与 trigger_analog 码（1-3 非失败、4 与 5-8 失败且 5-8 无 typed 变体） |
 | `trigger_analog.rs` | 5 命令逐字段对 `atmega2560.dict`、`trigger_analog_type` 枚举逐值一致（`abs_ge`/`gt`/`diff_peak_gt`）、home 载荷字节序与全零 disable、state 响应经字典格式串编解码往返 |
-| `trigger_analog.rs`（主机侧 design，M5b） | `to_fixed_32` 缩放与舍入（ties-to-even 同 Python）及上游溢出文案、`calc_frac_bits`（整数→0/最宽适配/舍入回退 31→29）、SOS 表命中与三路 miss、tap 设计→表段→导数序、scipy 表外错误不改设计、定点系数 29 位精确值、col3≠1/超宽拒绝、静止态按起始值换算 |
+| `trigger_analog.rs`（主机侧 design，M5b） | `to_fixed_32` 缩放与舍入（ties-to-even 同 Python）及上游溢出文案、`calc_frac_bits`（整数→0、|x|<1→31、按 bit_length 收窄（表 2.0→29）、舍入溢出回退一位 30→29）、SOS 表命中与三路 miss、tap 设计→表段→导数序、scipy 表外错误不改设计、定点系数 29 位精确值、col3≠1/超宽拒绝、静止态按起始值换算 |
 | `sos_filter.rs` | 5 条 SOS 命令逐字段对字典（含 `%i` 负数有符号）、`set_section` 5 系数顺序与负值编码 |
 | `ldc1612.rs` | 5 条命令与 `sensor_bulk_status`/`sensor_bulk_data` 响应逐字段对照语料字典；按名解码 6 个 bulk 状态字段 |
 
@@ -281,7 +281,7 @@ git config core.hooksPath .githooks
 | `heater_generic.rs` | **无独立测试**：工厂在装载表中（`load.rs`），加热器选项与控制环由 `heaters.rs` 的测试覆盖 |
 | `fan.rs` | 上游默认值装载、`shutdown_speed` 被 `max_power` 截顶；`M106` 设速 / `M107` 关、负值拒绝；kick-start 满速后回落、新请求覆盖挂起的 kick；`off_below` 把小请求归零；`max_power` 截顶；`enable_pin` 只在 0→非 0 翻转；`gcode:request_restart` 停风；**`tachometer_pin` 拒收**（而非静默 `rpm: null`）；缺 `pin` 点名、越界报哪一边、坏数字报原文 |
 | `gcode_move.rs` | `G1` 解析轴与速度、未点名的轴不动、记住上一笔速度、非正进给拒绝；G90/G91 切换、G92 锚定后下一笔在界内、裸 `G92` 全零；M83 的 E 相对而轴绝对；M220/M221 缩放速度与挤出；锚定只重挂 homed 的轴；SAVE/RESTORE 状态（未存的名字报错）；`M114` 报 G-Code 位置；`get_status` 对齐上游；第二个坐标系不能默默夺槽；英寸制拒绝 |
-| `toolhead.rs` | `[printer]` 的轴索引与 move 上下文；不支持的 `kinematics` 报配置错、`none` 不要 stepper；`stepper_z1` 并入 Z rail；corexy 族装载建 rail；MCU 错误带节名；限值来自 `[printer]`；move 到规划器、未 homed 轴拒绝；`G4` 推进 print time；`SET_KINEMATIC_POSITION` 回零并清状态；探针式回零 `probing_move`：滴满整段（事件顺序 `homing_move_begin` 先于 `home_start`）、无触发报 `No trigger on probe after full movement`、零位移与亚纳米（<1e-9，与 `Move::new` 同口径）返回当前位置且不 arm endstop（`test_probing_move_zero_distance…`、`…sub_nanometer_distance_returns_without_arming`）；`flush_step_generation`：入队的 move 冲刷后 commanded/history/print_time 可见、`set_position` 先冲刷再改位并标 homing 轴与恰发一次 `toolhead:set_position` 事件、`z_stepper_names` 按 Z 轨配置序（`kinematics: none` 为空）；停止后把指令位置设到**移动终点**并返回它——滴满整段模拟上游 file-output 的 `wait_end` 后 complete（同上游 `trigpos = home_end_time`） |
+| `toolhead.rs` | `[printer]` 的轴索引与 move 上下文；不支持的 `kinematics` 报配置错、`none` 不要 stepper；`stepper_z1` 并入 Z rail；corexy 族装载建 rail；MCU 错误带节名；限值来自 `[printer]`；move 到规划器、未 homed 轴拒绝；`G4` 推进 print time；`SET_KINEMATIC_POSITION` 回零并清状态；探针式回零 `probing_move`：滴满整段（事件顺序 `homing_move_begin` 先于 `home_start`）、无触发报 `No trigger on probe after full movement`、零位移与亚纳米（<1e-9，与 `Move::new` 同口径）返回当前位置且不 arm endstop（`test_probing_move_zero_distance…`、`…sub_nanometer_distance_returns_without_arming`）；`flush_step_generation`：入队的 move 冲刷后 commanded/history/print_time 可见、`set_position` 先冲刷再改位并标 homing 轴与恰发一次 `toolhead:set_position` 事件、`z_stepper_names` 按 Z 轨配置序（`kinematics: none` 为空）；停止后把指令位置设到**移动终点**并返回它——滴满整段模拟上游 file-output 的 `wait_end` 后 complete（同上游 file-output 口径：`trigger_analog.py:409` 的 `trigger_time = home_end_time` / `mcu.py:325 wait_end(end_time)`） |
 | `stepper.rs` | 节名→轴、轴索引与 mathutil 一致；步距按几何算；节装成 stepper 对象；`endstop_pin` 建 rail 的 endstop 与 `HomingInfo`；endstop 居中推不出方向时报错；`gear_ratio` 除进步距；缺 pin 点名节、不同 MCU 的同轴引脚被拒、`position_endstop` 越界被拒 |
 | `stepper_enable.rs` | 节装载；无 `enable_pin` 时是“永远使能”；写了则建使能脚（共享/取反路径） |
 | `bed_mesh.rs` | 语料选项全量认领（含 `faulty_region_*` 对）；矩形网格按行 zigzag、间距下取整到百分位；圆床按 `mesh_radius` 过滤且用 `round_probe_count`；过近点报 `bed_mesh: min/max points too close together` |
@@ -289,6 +289,13 @@ git config core.hooksPath .githooks
 | `z_tilt.rs` | `z_positions` 项数/缺项/坏项的上游文案、至少 2 点；`RetryHelper` 范围文案与上限、上升即中止、`error_msg_extra` 追加、无重试则静默；`applied` 标志与 motor_off 复位；平面拟合恢复已知平面；`adjust_steppers` 按 `-a` 排序逐步挂回的顺序录音 + 失败后全部挂回 |
 | `quad_gantry_level.rs` | `linefit` 直线与斜率（含退化）；四角高度恢复已知点；超 `max_adjust` 中止文案；恰好 4 点、`gantry_corners` >=2、缺项上游文案 |
 | `screws_tilt_adjust.rs` | screwN 数到首个缺失即停与默认名 `screw at %.3f,%.3f`、螺丝<3 报错、`screw_thread` 8 项选择表与默认 `CW-M3`、`threads_factor` 换算、方向表与 `HH:MM`（含 0.001 阈值）、基准螺丝（第 1 颗 / `DIRECTION` 极值）、`MAX_DEVIATION` 延迟报错与 `DIRECTION` 非法文案、`get_status` 的 error/max_deviation/results 形状 |
+| `gcode_arcs.rs` | `resolution` 默认 `1.` 记账、显式值解析、`0`/`-1`/非数拒绝文案对上游、经 loader 认领并注册（4 测） |
+| `bed_screws.rs` | 全选项 `check_unused` 直证、行进默认 50/5/5/0 与默认名、螺丝缺失即停（access 无残留）、<3 与两元素/解析/fine_adjust 上游文案、above 0 边界、静止态 status（6 测） |
+| `pwm_cycle_time.rs` | 选项矩阵与默认、`SET_PIN` 值域与 `CYCLE_TIME`、重复值丢弃、无 `hardware_pwm` 恒软件路径（11 测） |
+| `pwm_tool.rs` | 选项矩阵与默认、prefix 命名错误、`cycle_time` 值域、`maximum_mcu_duration` minval 0.5、配对约束 build 期拒绝（11 测） |
+| `temperature_fan.rs` | 6 实例选项矩阵、`max_temp<40` 取目标、pid 选项与上下界、bang-bang 驱动、`SET_TEMPERATURE_FAN_TARGET` 命令与三段错误文案、未知 sensor/非法 control、缺 pin 前缀名（11 测） |
+| `controller_fan.rs` | 默认值、全选项+覆盖+跟踪器矩阵、缺 pin 前缀名、未知 stepper/heater 上游文案（connect 解析）、运行→怠速→停 tick 状态机（6 测） |
+| `gcode_macro.rs` | 真语料八实例全选项入 access、八个大写命令+帮助、变量 status、畸形节上游文案、`rename_existing` 类型检查与延迟注册、裸节认领（5 测） |
 | `bulk_sensor.rs` | 51 字节/4 = 12 样本每块与固件消息尺寸一致；时钟回归一次 update 斜率精确恢复采样率并外推；切片与时间戳公式；16 位序号回绕与符号扩展；`apply_status` 跨回绕计数与 msg_count→chip 映射；超长 query 时长滤波只跳样本不污染时钟；批循环首客户端启动恰好一次、末客户端注销停循环（start_paused 异步） |
 | `ldc1612.rs` | `sensor_div`/`freq_conv` 换算（含 raw↔Hz 往返）；`convert_samples` 各错误分支（固件编码错误丢样、under-range/watchdog 保留）与计数；`reg_drive_current` 提取含高位掩蔽；attach 钩子 init 命令绑定 M5a trigger_analog oid；`dump_ldc1612` 端点注册不重名、按 sensor 路由与客户端注销 |
 | `manual_probe.rs` | 二分插入点（`bisect_left`）、空闲状态形状；交互路径（`TESTZ` 移动、`ACCEPT` 校验、`ABORT` 收尾、命令注销）由上游语料端到端覆盖 |

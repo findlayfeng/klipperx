@@ -393,6 +393,7 @@ SET_PIN PIN=<name> VALUE=<0..scale>
 |------|------|------|------|
 | `PIN` | 字符串 | 是 | 对应 `[output_pin <name>]` 里的 `<name>` |
 | `VALUE` | `0.0 ~ scale` | 是 | 数字输出：`>= 0.5` 为高电平；PWM：除以 `scale` 后作为占空比 |
+| `CYCLE_TIME` | 秒（>0） | 否 | 仅 `pwm_cycle_time` 节的引脚可用：改写该脚 PWM 周期（运行期只改主机记账，固件周期 build 期固定） |
 
 `scale` 是 PWM 路径的选项（默认 `1`，数字输出恒为 1）：`VALUE` 先按 `scale` 归一，
 再交给资源。
@@ -426,6 +427,16 @@ SET_PIN PIN=pwm_fan VALUE=0.25  ; PWM：25% 占空比
 ---
 
 ## 端停查询
+
+### SET_TEMPERATURE_FAN_TARGET — 设定温度风扇目标（由 `[temperature_fan]` 注册，mux 键 `TEMPERATURE_FAN=`）
+
+| 命令 | 参数 | 说明 |
+|------|------|------|
+| `SET_TEMPERATURE_FAN_TARGET` | `TEMPERATURE_FAN`（风扇名）、`TARGET`（目标温度，须在 `min_temp..=max_temp`） | 重设 `[temperature_fan <名>]` 的目标；缺省打印当前目标；错误文案对上游（`temperature_fan.py`） |
+
+### G-Code 宏命令（由 `[gcode_macro <名>]` 注册）
+
+每个 `[gcode_macro <名>]` 段在装载时以**大写宏名**注册为一条命令（help = `description`）。**当前宏体不展开**：被调用时返回 `respond_info`（明示模板渲染未实现）而非静默；`SET_GCODE_VARIABLE` 未注册；完整模板/表达式引擎属 H3。
 
 ### QUERY_ENDSTOPS / M119
 
@@ -545,7 +556,7 @@ SPI_SEND     DEVICE=flash DATA=04          // spi send ok
 
 | 命令 | 参数 | 说明 |
 |------|------|------|
-| `LDC_CALIBRATE_DRIVE_CURRENT` | `CHIP`（传感器名） | 对目标 LDC1612 做驱动电流标定，回显 `reg_drive_current` 提取值并给出 `SAVE_CONFIG` 提示（细节见 `extras/ldc1612.rs`）；`ldc1612` 对象由 probe_eddy_current 构造，该命令随对象装载注册 |
+| `LDC_CALIBRATE_DRIVE_CURRENT` | `CHIP`（传感器名） | 对目标 LDC1612 做驱动电流标定，回显 `reg_drive_current` 提取值并给出 `SAVE_CONFIG` 提示（细节见 `extras/ldc1612.rs`）；`ldc1612` 对象由 probe_eddy_current 构造（接线随 M5d 落地生效），该命令随对象装载注册 |
 
 ## 未注册命令的处理
 

@@ -356,7 +356,7 @@ mod tests {
         dict.install(&mut parser).unwrap();
         let msg = parser.lookup("sensor_bulk_status").unwrap().clone();
         let params = Params::new(
-            std::sync::Arc::new(msg),
+            msg,
             &[
                 ArgValue::UInt8(3),
                 ArgValue::UInt32(1_000_000),

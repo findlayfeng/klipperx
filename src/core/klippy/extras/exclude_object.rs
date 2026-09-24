@@ -19,17 +19,18 @@
 //!
 //! # Gaps this port does not close yet (H4)
 //!
-//! - **The corpus cannot turn green on this file alone.** `exclude_object.test`
-//!   drives everything through the `M486` macro body, and `gcode_macro` does
-//!   not render bodies yet (`gcode_macro.rs`, module docs): the `EXCLUDE_*`
-//!   lines never run, so nothing is excluded and the out-of-range moves reach
-//!   the toolhead. The section, commands and transform landed here are the
-//!   other half; template rendering is the remaining gate.
-//! - **Move bookkeeping is simplified.** Upstream tracks extrusion offsets,
-//!   `initial_extrusion_moves` priming and `extruder_adj` compensation across
-//!   the region boundaries (`exclude_object.py:60-172`); here a move is
-//!   dropped while the current object is excluded and forwarded otherwise,
-//!   with no offset compensation on the way out.
+//! - ~~The corpus could not turn green on this file alone.~~ `gcode_macro`
+//!   renders the `M486` body now (`gcode_macro.rs`), so the `EXCLUDE_*` lines
+//!   run; the extrusion-offset compensation above is what keeps the moves
+//!   after an excluded region inside the extrusion limits.
+//! - **Extrusion offsets are keyed once, not per extruder.** The excluded
+//!   region's E compensation — `offset[3]`, `extruder_adj`,
+//!   `last_position_extruded` / `last_position_excluded`,
+//!   `initial_extrusion_moves` and the XY catch-up on the way out
+//!   (`exclude_object.py:60-172`) — is ported in full; upstream stores the
+//!   offsets in a map keyed by the active extruder's name
+//!   (`_get_extrusion_offsets`, `:94-101`) and this port keeps one array,
+//!   which is the same value while one extruder prints.
 //! - **The transform does not chain over other transforms.** Upstream keeps
 //!   the previous slot occupant (`next_transform`, `exclude_object.py:47-59`)
 //!   because Python's `set_move_transform` returns it; this port's
@@ -55,7 +56,7 @@ use crate::core::klippy::gcode::{
     sync, CommandError, CommandHandler, GCodeDispatch, GcodeCommand, GCODE_OBJECT,
 };
 use crate::core::klippy::load::section;
-use crate::core::klippy::mathutil::Coord;
+use crate::core::klippy::mathutil::{Coord, E_AXIS};
 use crate::core::klippy::printer::{Printer, PrinterObject};
 
 /// The toolhead's object name (`[printer]` is registered as `toolhead`).
@@ -76,6 +77,47 @@ struct State {
     /// Whether the transform has taken `gcode_move`'s slot
     /// (`exclude_object.py:_register_transform`).
     transform_registered: bool,
+    /// The excluded-region move bookkeeping, armed when the transform
+    /// registers (`exclude_object.py:_register_transform:47-64`); `None`
+    /// while no exclusion has claimed the slot, when the transform forwards
+    /// raw positions as before.
+    motion: Option<ExcludedMotion>,
+}
+
+/// The transform's position bookkeeping (`exclude_object.py:_register_transform`
+/// and `_normal_move`/`_ignore_move`, `:103-146`).
+///
+/// While an object is excluded its moves are dropped, but their **E** still
+/// accumulates in `offset[3]`, so the first move out of the region subtracts
+/// it again — the toolhead never extrudes the cancelled filament, and the
+/// gcode coordinate keeps counting it. `offset[0..2]` carry the transient XY
+/// correction so the first XY move away from the excluded end starts from the
+/// last *extruded* position; `extruder_adj` compensates a retraction
+/// difference across the boundary.
+#[derive(Debug, Default)]
+struct ExcludedMotion {
+    /// The gcode-side position the transform reports (`get_position`).
+    last_position: Coord,
+    /// The last position that actually extruded (`_normal_move`).
+    last_position_extruded: Coord,
+    /// The last position inside an excluded region (`_ignore_move`).
+    last_position_excluded: Coord,
+    /// The furthest E reached printed / excluded (`max_position_*`).
+    max_position_extruded: f64,
+    max_position_excluded: f64,
+    /// Retraction compensation carried across a region boundary
+    /// (`_move_from_excluded_region`).
+    extruder_adj: f64,
+    /// The per-axis offsets subtracted from every forwarded position
+    /// (`_get_extrusion_offsets`; upstream keys these per extruder — module
+    /// docs).
+    offset: [f64; 4],
+    /// Upstream arms the transform with five tracked extrusion moves before
+    /// exclusions apply (`_register_transform`, `initial_extrusion_moves = 5`).
+    initial_extrusion_moves: i32,
+    /// Whether the last move was inside the excluded region
+    /// (`move()`, `exclude_object.py:161-172`).
+    in_excluded_region: bool,
 }
 
 /// The `[exclude_object]` section (`exclude_object.py:ExcludeObject`).
@@ -169,7 +211,21 @@ impl ExcludeObject {
         gcode_move
             .set_move_transform(Arc::clone(object) as Arc<dyn MoveTarget>, true)
             .map_err(|error| CommandError::new(error.to_string()))?;
-        object.lock().transform_registered = true;
+        // `_register_transform` (`exclude_object.py:52-64`): the offsets start
+        // empty and the three tracked positions start at the toolhead's.
+        let pos = object
+            .target()
+            .map(|target| target.position())
+            .unwrap_or_default();
+        let mut state = object.lock();
+        state.transform_registered = true;
+        state.motion = Some(ExcludedMotion {
+            last_position: pos,
+            last_position_extruded: pos,
+            last_position_excluded: pos,
+            initial_extrusion_moves: 5,
+            ..Default::default()
+        });
         Ok(())
     }
 
@@ -186,7 +242,9 @@ impl ExcludeObject {
             // Restoring the toolhead rather than the previous occupant is the
             // chaining gap in the module docs; `force` keeps the write exact.
             let _ = gcode_move.set_move_transform(target, true);
-            self.lock().transform_registered = false;
+            let mut state = self.lock();
+            state.transform_registered = false;
+            state.motion = None;
         }
     }
 
@@ -310,37 +368,147 @@ impl MoveTarget for ToolheadMove {
     }
 }
 
+/// `_ignore_move` (`exclude_object.py:128-136`): record the move without
+/// forwarding it — the XY/Z drift lands in the offsets, the extrusion in
+/// `offset[3]`, so the compensation on the way out subtracts it again.
+fn ignore_move(motion: &mut ExcludedMotion, newpos: Coord) {
+    for axis in 0..4 {
+        if axis != E_AXIS {
+            motion.offset[axis] = newpos.axis(axis) - motion.last_position_extruded.axis(axis);
+        }
+    }
+    motion.offset[E_AXIS] += newpos.axis(E_AXIS) - motion.last_position.axis(E_AXIS);
+    motion.last_position = newpos;
+    motion.last_position_excluded = newpos;
+    motion.max_position_excluded = motion.max_position_excluded.max(newpos.axis(E_AXIS));
+}
+
+/// `_normal_move` (`exclude_object.py:104-127`): track the move, settle the
+/// boundary corrections, and return the position to forward — `newpos` minus
+/// the standing offsets.
+fn normal_move(motion: &mut ExcludedMotion, newpos: Coord) -> Coord {
+    if motion.initial_extrusion_moves > 0
+        && motion.last_position.axis(E_AXIS) != newpos.axis(E_AXIS)
+    {
+        motion.initial_extrusion_moves -= 1;
+    }
+    motion.last_position = newpos;
+    motion.last_position_extruded = newpos;
+    motion.max_position_extruded = motion.max_position_extruded.max(newpos.axis(E_AXIS));
+
+    // The first XY move away from an excluded end settles the transient
+    // catch-up and folds the pending `extruder_adj` into the E offset.
+    if (motion.offset[0] != 0.0 || motion.offset[1] != 0.0)
+        && (newpos.axis(0) != motion.last_position_excluded.axis(0)
+            || newpos.axis(1) != motion.last_position_excluded.axis(1))
+    {
+        for axis in 0..4 {
+            if axis != E_AXIS {
+                motion.offset[axis] = 0.0;
+            }
+        }
+        motion.offset[E_AXIS] += motion.extruder_adj;
+        motion.extruder_adj = 0.0;
+    }
+    if motion.offset[2] != 0.0 && newpos.axis(2) != motion.last_position_excluded.axis(2) {
+        motion.offset[2] = 0.0;
+    }
+    if motion.extruder_adj != 0.0
+        && newpos.axis(E_AXIS) != motion.last_position_excluded.axis(E_AXIS)
+    {
+        motion.offset[E_AXIS] += motion.extruder_adj;
+        motion.extruder_adj = 0.0;
+    }
+
+    let mut forwarded = newpos;
+    for axis in 0..4 {
+        forwarded.set_axis(axis, newpos.axis(axis) - motion.offset[axis]);
+    }
+    forwarded
+}
+
 impl MoveTarget for ExcludeObject {
     /// Upstream's `move` (`exclude_object.py:161-172`): a move inside an
-    /// excluded object is dropped, anything else passes on. The region
-    /// bookkeeping is simplified — see the module docs.
+    /// excluded object is dropped, anything else passes on — with the
+    /// extrusion offsets applied, so the cancelled filament is never
+    /// forwarded (`_normal_move`/`_ignore_move`, `:117-146`).
+    ///
+    /// Before the transform is armed (no exclusion registered it) the raw
+    /// drop-or-forward of the first port stands; the corpus arms it through
+    /// `register_transform` the moment anything is excluded.
     fn move_to(&self, position: Coord, speed: f64) -> Result<(), CommandError> {
-        let excluded_now = {
-            let state = self.lock();
-            state.current_object.as_deref().is_some_and(|current| {
+        let forward = {
+            let mut state = self.lock();
+            let current_excluded = state.current_object.as_deref().is_some_and(|current| {
                 state
                     .excluded_objects
                     .iter()
                     .any(|excluded| excluded == current)
-            })
+            });
+            match state.motion.as_mut() {
+                // Not armed: drop or forward raw, as the first port did.
+                None => {
+                    if current_excluded {
+                        None
+                    } else {
+                        Some(position)
+                    }
+                }
+                Some(motion) => {
+                    // `_test_in_excluded_region`: the first five tracked
+                    // extrusion moves after registration still pass
+                    // (`initial_extrusion_moves`).
+                    if current_excluded && motion.initial_extrusion_moves == 0 {
+                        if !motion.in_excluded_region {
+                            // `_move_into_excluded_region`.
+                            motion.in_excluded_region = true;
+                        }
+                        ignore_move(motion, position);
+                        None
+                    } else if motion.in_excluded_region {
+                        // `_move_from_excluded_region`: carry the retraction
+                        // difference into the compensation, then move normally.
+                        motion.in_excluded_region = false;
+                        motion.extruder_adj = motion.max_position_excluded
+                            - motion.last_position_excluded[E_AXIS]
+                            - (motion.max_position_extruded
+                                - motion.last_position_extruded[E_AXIS]);
+                        Some(normal_move(motion, position))
+                    } else {
+                        Some(normal_move(motion, position))
+                    }
+                }
+            }
         };
-        if excluded_now {
+        let Some(forward) = forward else {
             return Ok(());
-        }
+        };
         match self.target() {
-            Some(target) => target.move_to(position, speed),
+            Some(target) => target.move_to(forward, speed),
             // No toolhead yet (`klippy:connect` has not run): no move runs
             // before ready, so there is nothing to forward to.
             None => Ok(()),
         }
     }
 
-    /// Upstream's `get_position` (`exclude_object.py:88-93`), without the
-    /// extrusion offsets the module docs list as a gap.
+    /// Upstream's `get_position` (`exclude_object.py:88-93`): the toolhead's
+    /// position plus the standing extrusion offset, so the gcode coordinate
+    /// keeps counting filament the toolhead never extruded.
     fn position(&self) -> Coord {
-        self.target()
-            .map(|target| target.position())
-            .unwrap_or_default()
+        let Some(target) = self.target() else {
+            return Coord::default();
+        };
+        let position = target.position();
+        let mut state = self.lock();
+        let Some(motion) = state.motion.as_mut() else {
+            return position;
+        };
+        let mut gcode = position;
+        for axis in 0..4 {
+            gcode.set_axis(axis, position.axis(axis) + motion.offset[axis]);
+        }
+        motion.last_position = gcode;
+        gcode
     }
 }
 
@@ -787,6 +955,111 @@ mod tests {
             .unwrap();
         assert_eq!(fake.moves().len(), 2);
         assert_eq!(fake.moves()[1].0, Coord::new(13.0, 0.0, 0.0, 0.0));
+    }
+
+    /// The compensation math, against the corpus' own shape: a prime block
+    /// printed *inside* the cancelled object is dropped, and the first move
+    /// out subtracts the whole cancelled extrusion — the forwarded `ΔE` is
+    /// zero, which is what keeps `G0 X0` after the prime block inside
+    /// `max_extrude_cross_section` (`exclude_object.py:104-146`).
+    #[test]
+    fn excluded_extrusion_is_never_forwarded_after_leaving_the_region() {
+        let (_printer, _gcode, object) = machine();
+        let fake = Arc::new(FakeTarget::new());
+        *object.target.lock().unwrap() = Some(Arc::clone(&fake) as Arc<dyn MoveTarget>);
+
+        // Armed as `register_transform` arms it, at the toolhead's position.
+        let start = Coord::new(11.0, 0.0, 0.0, 0.0);
+        {
+            let mut state = object.lock();
+            state.current_object = Some("1".to_string());
+            state.excluded_objects = vec!["1".to_string()];
+            state.motion = Some(ExcludedMotion {
+                last_position: start,
+                last_position_extruded: start,
+                last_position_excluded: start,
+                initial_extrusion_moves: 0,
+                ..Default::default()
+            });
+        }
+
+        // Two prime moves inside the cancelled object: dropped, but tracked.
+        object
+            .move_to(Coord::new(140.0, 0.0, 0.0, 0.5), 50.0)
+            .unwrap();
+        object
+            .move_to(Coord::new(160.0, 0.0, 0.0, 1.0), 50.0)
+            .unwrap();
+        assert!(fake.moves().is_empty(), "excluded moves are dropped");
+
+        // Leave the region: the forwarded E carries no cancelled filament.
+        object.lock().current_object = Some("2".to_string());
+        object
+            .move_to(Coord::new(0.0, 0.0, 0.0, 1.0), 50.0)
+            .unwrap();
+        let moves = fake.moves();
+        assert_eq!(moves.len(), 1, "the first move out is forwarded");
+        assert_eq!(
+            moves[0].0.axis(E_AXIS),
+            0.0,
+            "ΔE=0: the 1.0mm cancelled extrusion is compensated out"
+        );
+        assert_eq!(moves[0].0.axis(0), 0.0, "the XY catch-up settles too");
+
+        // The offset stands for the rest of the run: only new filament goes.
+        object
+            .move_to(Coord::new(10.0, 0.0, 0.0, 1.5), 50.0)
+            .unwrap();
+        assert_eq!(fake.moves()[1].0.axis(E_AXIS), 0.5, "new extrusion only");
+
+        // `get_position` reports the gcode side: toolhead + standing offset.
+        let gcode = object.position();
+        assert_eq!(
+            gcode.axis(E_AXIS),
+            fake.moves()[1].0.axis(E_AXIS) + 1.0,
+            "the gcode coordinate keeps counting the cancelled filament"
+        );
+    }
+
+    /// The zero-exclusion path: an armed transform that never cancels
+    /// anything forwards every position byte-for-byte (`offset` stays empty),
+    /// and the initial five tracked extrusions pass like upstream's
+    /// `initial_extrusion_moves` window.
+    #[test]
+    fn without_an_exclusion_positions_forward_untouched() {
+        let (_printer, _gcode, object) = machine();
+        let fake = Arc::new(FakeTarget::new());
+        *object.target.lock().unwrap() = Some(Arc::clone(&fake) as Arc<dyn MoveTarget>);
+        let start = Coord::new(0.0, 0.0, 0.0, 0.0);
+        {
+            let mut state = object.lock();
+            state.motion = Some(ExcludedMotion {
+                last_position: start,
+                last_position_extruded: start,
+                last_position_excluded: start,
+                initial_extrusion_moves: 5,
+                ..Default::default()
+            });
+        }
+
+        for (index, position) in [
+            Coord::new(140.0, 0.0, 0.0, 0.5),
+            Coord::new(160.0, 0.0, 0.0, 1.0),
+            Coord::new(140.0, 0.0, 0.0, 1.5),
+            Coord::new(10.0, 0.0, 0.0, 1.5),
+            Coord::new(0.0, 0.0, 0.0, 0.0),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            object.move_to(position, 50.0).unwrap();
+            assert_eq!(
+                fake.moves()[index].0,
+                position,
+                "move {index} forwarded untouched"
+            );
+            assert_eq!(object.position(), position, "get_position tracks it");
+        }
     }
 
     /// The four commands register with upstream's help text — a duplicate or

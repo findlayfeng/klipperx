@@ -300,18 +300,20 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 
 框架已落地：`src/core/klippy/upstream.rs`（字典驱动应答机 + 按 `CONFIG` 拆分的运行）与
 `crates/test-support/build.rs`（按架构编字典）；T1（`linuxtest.test`）已完成并转绿。当前 239 次
-运行里，默认构建缺 2 条（引用 `pru`）、忽略列表 34 条、
-实际执行 3 条（`linuxtest.test`、`out_of_bounds.test`、`commands.test`，均通过）；忽略列表即本节的工单，每步做完
+运行里，默认构建缺 2 条（引用 `pru`）、忽略列表 27 条、
+实际执行 10 条（`linuxtest.test`、`commands.test`、`out_of_bounds.test`、`bed_mesh.test`、
+`z_virtual_endstop.test`、`z_tilt.test`、`quad_gantry_level.test`、`bltouch.test`、
+`smart_effector.test`、`multi_z.test`，均通过）；忽略列表即本节的工单，每步做完
 就从 `IGNORED` 移除对应文件（手册见
 `docs/klippy/developer-manual/regression-tests.md`）。
 
 **推进口径**：下文的「首次失败原因」分组只用于定位，不是工作队列——`load_config` 遇到第一个
 未知 section 就停，修好一个缺口只会让运行前进到下一个缺口，总数可能不变（T7 前后失败总数
-几乎不变就是例子），各组收益不可加。进度以**转绿运行数 / `IGNORED` 条目数**衡量（当前 3 / 34）。**验收标准
+几乎不变就是例子），各组收益不可加。进度以**转绿运行数 / `IGNORED` 条目数**衡量（当前 10 / 27）。**验收标准
 是「对应 `.test` 从 `IGNORED` 移除后通过」**，不是「某个错误不再出现」。详见
 [失败原因分析复盘](docs/work-log/2026-09-22-upstream-regression-failures.md#复盘计数口径与重排后补)。
 
-**当前失败原因统计**（`KLIPPERX_UPSTREAM_ALL=1` 实跑，2026-09-24：**179 次失败**、58 次通过、
+**当前失败原因统计**（`KLIPPERX_UPSTREAM_ALL=1` 实跑，2026-09-24（M7 合入后）：**178 次失败**、59 次通过、
 2 条因未构建 `pru` 字典不计，合计 239；下表为**选项名大小写修复后**的分布——49 次
 `must be specified` 归零但总数不变、首因整体后移，见[复盘](docs/work-log/2026-09-22-upstream-regression-failures.md#复盘计数口径与重排后补)
 的「收益不可加」）：
@@ -341,7 +343,7 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 （本表随每个单元更新：2026-09-23 探针链路单元后实测；除 probe 行外其余各行的拆分仍取 U3a 时点，
 后续单元只会把首因往后推、总数不变，逐单元变化见各自提交信息。已转绿的语料：`linuxtest.test`、
 `commands.test`、`out_of_bounds.test`、`bed_mesh.test`、`z_virtual_endstop.test` 与
-`printers.test → printer-wanhao-duplicator-i3-plus-mark2-2019`、`z_tilt.test`、`quad_gantry_level.test`、`bltouch.test`、`smart_effector.test`。）
+`printers.test → printer-wanhao-duplicator-i3-plus-mark2-2019`、`z_tilt.test`、`quad_gantry_level.test`、`bltouch.test`、`smart_effector.test`、`multi_z.test`。）
 
 **T3 之后按首次失败分组的工单**：
 
@@ -360,8 +362,9 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
       → **U4** `manual_probe.rs` 命令族 + `configfile.set()` 记账 ✅（2026-09-23；含 PROBE_CALIBRATE 接线）
       → **U5** `bed_mesh.py`（**首批 2 绿**：`bed_mesh.test`、`z_virtual_endstop.test`，随后验证模拟器上
       的 `G28` via `probe:z_virtual_endstop`）
-      → **M6** `z_tilt`/`quad_gantry_level`/`bed_tilt`（+2 绿）→ **M7** `STEPPER_BUZZ`（H10，+1）
-      → **M2** `bltouch`（+1）→ **M4** `screws_tilt_adjust`（+1）→ **M3** `smart_effector`（+1）
+      → **M6** `z_tilt`/`quad_gantry_level`/`bed_tilt`（+2 绿）→ **M7** 发送队列水位让 `multi_z.test` 转绿 ✅
+      （2026-09-24；不依赖 `STEPPER_BUZZ`——未知命令静默 `Ok` 放行，该命令实现仍属 H10，+1 提前兑现）
+      → **M2** `bltouch`（+1）✅（2026-09-24）→ **M4** `screws_tilt_adjust`（+1）→ **M3** `smart_effector`（+1）✅（2026-09-24）
       → **M5** `probe_eddy_current`（+1，另需 `trigger_analog`，F9/H7）。
       其余 37 条 printers 命中 probe 的配置另压跨域长尾（H2/H3/H4/H5/H7/H8 与 H9 兄弟段），不在本闭包内。
       语料里 **0 个配置带 `#*#`**，autosave 不阻塞本批。

@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use serde_json::{json, Value};
 
 use super::plan::Move;
+use super::trapq::MoveSegment;
 use crate::core::klippy::gcode::CommandError;
 use crate::core::klippy::mathutil::{Coord, AXES, X_AXIS, Y_AXIS, Z_AXIS};
 
@@ -33,6 +34,19 @@ impl<'a> MoveContext<'a> {
     /// Where the move ends.
     pub fn end_pos(&self) -> &Coord {
         &self.move_.end_pos
+    }
+
+    /// Where the move starts (polar's near-center slowdown measures the
+    /// segment's closest approach to the bed center from both ends).
+    pub fn start_pos(&self) -> &Coord {
+        &self.move_.start_pos
+    }
+
+    /// The highest speed this move may cruise at, squared
+    /// (`move.max_cruise_v2`; polar takes `sqrt` of it as the move's angular
+    /// speed at a given radius).
+    pub fn max_cruise_v2(&self) -> f64 {
+        self.move_.max_cruise_v2
     }
 
     /// The per-axis distance.
@@ -396,6 +410,315 @@ impl Kinematics for CartesianKinematics {
         // Each axis independently, in the order the driver asks for.
         for axis in homing.axes() {
             self.home_axis(homing, axis);
+        }
+    }
+}
+
+// ===========================================================================
+// Polar (`kinematics/polar.py`, `chelper/kin_polar.c`)
+// ===========================================================================
+
+/// The radius solver for one arm stepper (`polar_stepper_alloc('r')`,
+/// `kin_polar.c:9-15`): the toolhead's distance from the bed center.
+pub fn polar_radius_position(segment: &MoveSegment, move_time: f64) -> f64 {
+    let c = segment.coord(move_time);
+    (c.x() * c.x() + c.y() * c.y()).sqrt()
+}
+
+/// The angle solver for the bed stepper (`polar_stepper_alloc('a')`,
+/// `kin_polar.c:17-24`): the toolhead's bearing, **raw** `atan2` — the ±2π
+/// unwrap against `commanded_pos` happens through the solver's `unwrap`
+/// hook (upstream's callback reads `sk->commanded_pos` itself).
+pub fn polar_angle_position(segment: &MoveSegment, move_time: f64) -> f64 {
+    let c = segment.coord(move_time);
+    c.y().atan2(c.x())
+}
+
+/// Both polar steppers follow X and Y (`kin_polar.c:46` sets `AF_X | AF_Y`
+/// for the angle **and** the radius solver).
+pub const fn polar_active_flags() -> crate::core::klippy::motion::itersolve::AxisFlags {
+    crate::core::klippy::motion::itersolve::AxisFlags::X
+        .union(crate::core::klippy::motion::itersolve::AxisFlags::Y)
+}
+
+/// The bed angle unwrap (`polar_stepper_angle_calc_position`,
+/// `kin_polar.c:17-24`): shift the wrapped `atan2` result by ±2π so it stays
+/// continuous with the commanded position — this is the solver's `unwrap`
+/// hook (`StepKinematics::set_hooks`), evaluated against `commanded_pos`
+/// exactly as upstream's callback reads `sk->commanded_pos`.
+pub fn polar_angle_unwrap(raw: f64, commanded: f64) -> f64 {
+    if raw - commanded > std::f64::consts::PI {
+        raw - 2.0 * std::f64::consts::PI
+    } else if raw - commanded < -std::f64::consts::PI {
+        raw + 2.0 * std::f64::consts::PI
+    } else {
+        raw
+    }
+}
+
+/// Renormalize the commanded bed angle into [-π, π] after each generated
+/// range (`polar_stepper_angle_post_fixup` called as `post_cb` from
+/// `itersolve.c:124-126`): the solver's `post` hook. Without it the
+/// commanded position would grow past ±3π over several rotations and a
+/// single ±2π unwrap would no longer reach it.
+pub fn polar_angle_normalize(commanded: &mut f64) {
+    if *commanded < -std::f64::consts::PI {
+        *commanded += 2.0 * std::f64::consts::PI;
+    } else if *commanded > std::f64::consts::PI {
+        *commanded -= 2.0 * std::f64::consts::PI;
+    }
+}
+
+/// The closest distance from the bed center (origin) to the segment
+/// `p1 → p2` (`distance_to_center`, `kinematics/polar.py:5-21`): which part
+/// of the segment a slowdown applies to — the segment start, its end, or
+/// the perpendicular foot.
+pub fn distance_to_center(p1: (f64, f64), p2: (f64, f64)) -> f64 {
+    let ab_x = p2.0 - p1.0;
+    let ab_y = p2.1 - p1.1;
+    let ap_x = -p1.0;
+    let ap_y = -p1.1;
+    let dot = ab_x * ap_x + ab_y * ap_y;
+    let ab_length_sq = ab_x * ab_x + ab_y * ab_y;
+    if dot <= 0.0 {
+        // The projection of the center falls before `p1`: closest is `p1`.
+        (ap_x * ap_x + ap_y * ap_y).sqrt()
+    } else if dot >= ab_length_sq {
+        // …or beyond `p2`: closest is `p2` itself.
+        (p2.0 * p2.0 + p2.1 * p2.1).sqrt()
+    } else {
+        // Otherwise the perpendicular foot lies on the segment.
+        (ab_x * ap_y - ab_y * ap_x).abs() / ab_length_sq.sqrt()
+    }
+}
+
+/// The homing endpoints for one polar axis (`_home_axis`,
+/// `kinematics/polar.py:64-79`): 1.0× push (not the cartesian 1.5× —
+/// overshooting the arm's `position_min` would put the toolhead *behind*
+/// the center, where the angle flips), and when homing the arm (axis 0)
+/// **Y is pinned to 0** so the drip move stays on the +X radius.
+pub fn polar_home_move(
+    axis: usize,
+    info: &HomingInfo,
+    position_min: f64,
+    position_max: f64,
+) -> (HomeCoord, HomeCoord) {
+    let mut homepos: HomeCoord = [None; AXES];
+    homepos[axis] = Some(info.position_endstop);
+    if axis == X_AXIS {
+        homepos[Y_AXIS] = Some(0.0);
+    }
+    let mut forcepos = homepos;
+    forcepos[axis] = Some(if info.positive_dir {
+        info.position_endstop - (info.position_endstop - position_min)
+    } else {
+        info.position_endstop + (position_max - info.position_endstop)
+    });
+    (forcepos, homepos)
+}
+
+/// The polar kinematics: a rotating bed (angle stepper), a sliding arm
+/// (radius stepper) and a cartesian Z rail.
+///
+/// Upstream's `PolarKinematics` (`klippy/kinematics/polar.py`). The carriage
+/// position is `(cos(bed) · arm, sin(bed) · arm, z)`; X/Y travel is the
+/// square `[-max_xy, max_xy]²` gated through `limit_xy2` (one squared
+/// radius, set only once **both** axes are homed — X and Y cannot be
+/// homed or cleared separately), and the Z range through `limit_z`.
+#[derive(Debug, Clone)]
+pub struct PolarKinematics {
+    /// The stepper names `calc_position` reads: bed angle, arm radius, z.
+    bed: String,
+    arm: String,
+    z: String,
+    /// The arm rail's radius range and the Z rail's range.
+    arm_range: (f64, f64),
+    z_range: (f64, f64),
+    /// The printable square and height, for `get_status`.
+    axes_min: Coord,
+    axes_max: Coord,
+    /// The machine's velocity limits; the near-center slowdown scales both.
+    limits: super::plan::MoveLimits,
+    max_z_velocity: f64,
+    max_z_accel: f64,
+    /// `[printer] max_angular_velocity`: the cap near the bed center
+    /// (`0` = uncapped, upstream's default).
+    v_rad_max: f64,
+    /// The homed Z range, or an inverted range while unhomed
+    /// (upstream's `(1.0, -1.0)` sentinel).
+    limit_z: (f64, f64),
+    /// The squared radius X/Y may reach, or `-1.0` while unhomed.
+    limit_xy2: f64,
+}
+
+impl PolarKinematics {
+    /// The polar kinematics over its two rails and the bed stepper
+    /// (`PolarKinematics.__init__`, `kinematics/polar.py:14-59`).
+    ///
+    /// `names` are the stepper names for [`calc_position`](Self::calc_position)
+    /// (bed, arm, z), `arm_range`/`z_range` the rail ranges.
+    pub fn new(
+        names: [String; 3],
+        arm_range: (f64, f64),
+        z_range: (f64, f64),
+        limits: super::plan::MoveLimits,
+        max_z_velocity: f64,
+        max_z_accel: f64,
+        v_rad_max: f64,
+    ) -> Self {
+        let max_xy = arm_range.1;
+        let [bed, arm, z] = names;
+        Self {
+            bed,
+            arm,
+            z,
+            arm_range,
+            z_range,
+            axes_min: Coord::new(-max_xy, -max_xy, z_range.0, 0.0),
+            axes_max: Coord::new(max_xy, max_xy, z_range.1, 0.0),
+            limits,
+            max_z_velocity,
+            max_z_accel,
+            v_rad_max,
+            // Upstream starts every limit unhomed: an inverted z range and a
+            // negative squared radius that no move can pass
+            // (`kinematics/polar.py:57-58`).
+            limit_z: (1.0, -1.0),
+            limit_xy2: -1.0,
+        }
+    }
+}
+
+impl Kinematics for PolarKinematics {
+    fn calc_position(&self, stepper_positions: &HashMap<String, f64>) -> [Option<f64>; 3] {
+        // `calc_position` of `kinematics/polar.py:61-65`: the carriage is
+        // the bed angle and arm radius in polar coordinates. An axis is
+        // `None` when a stepper it needs is missing (the port's convention;
+        // upstream would raise a `KeyError`).
+        let (Some(bed), Some(arm)) = (
+            stepper_positions.get(&self.bed).copied(),
+            stepper_positions.get(&self.arm).copied(),
+        ) else {
+            return [None, None, stepper_positions.get(&self.z).copied()];
+        };
+        [
+            Some(bed.cos() * arm),
+            Some(bed.sin() * arm),
+            stepper_positions.get(&self.z).copied(),
+        ]
+    }
+
+    fn check_move(&self, ctx: &mut MoveContext<'_>) -> Result<(), CommandError> {
+        // `check_move` of `kinematics/polar.py:104-139`, in upstream order:
+        // the gated XY radius, then Z's range and speed, then the
+        // near-center angular slowdown.
+        let end = *ctx.end_pos();
+        let axes_d = *ctx.axes_d();
+        let xy2 = end.x() * end.x() + end.y() * end.y();
+        if xy2 > self.limit_xy2 {
+            if self.limit_xy2 < 0.0 {
+                return Err(ctx.must_home());
+            }
+            return Err(ctx.out_of_range());
+        }
+        if axes_d[Z_AXIS] != 0.0 {
+            if end.z() < self.limit_z.0 || end.z() > self.limit_z.1 {
+                if self.limit_z.0 > self.limit_z.1 {
+                    return Err(ctx.must_home());
+                }
+                return Err(ctx.out_of_range());
+            }
+            // A move with Z is slowed so Z itself stays within its own
+            // speed, by the share of the move it covers.
+            let z_ratio = ctx.move_d() / axes_d[Z_AXIS].abs();
+            ctx.limit_speed(self.max_z_velocity * z_ratio, self.max_z_accel * z_ratio);
+        }
+        if axes_d[X_AXIS] != 0.0 || axes_d[Y_AXIS] != 0.0 {
+            if self.v_rad_max == 0.0 {
+                return Ok(());
+            }
+            let min_dist = distance_to_center(
+                (ctx.start_pos().x(), ctx.start_pos().y()),
+                (end.x(), end.y()),
+            );
+            if min_dist == 0.0 {
+                return Ok(());
+            }
+            // Angular speed at the closest point: linear speed over radius.
+            let v_angular = ctx.max_cruise_v2().sqrt() / min_dist;
+            if self.v_rad_max < v_angular {
+                let scale_radius = self.v_rad_max / v_angular;
+                ctx.limit_speed(
+                    self.limits.max_velocity * scale_radius,
+                    self.limits.max_accel * scale_radius,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn set_position(&mut self, _newpos: Coord, homing_axes: &[usize]) {
+        // `set_position` of `kinematics/polar.py:81-86`: the stepper
+        // positions are set centrally by the toolhead; only the homed
+        // limits live here. X **and** Y together open the whole square
+        // (a single axis would leave `limit_xy2` untouched).
+        if homing_axes.contains(&Z_AXIS) {
+            self.limit_z = self.z_range;
+        }
+        if homing_axes.contains(&X_AXIS) && homing_axes.contains(&Y_AXIS) {
+            self.limit_xy2 = self.arm_range.1 * self.arm_range.1;
+        }
+    }
+
+    fn update_limits(&mut self, _axis: usize, _range: Option<(f64, f64)>) {
+        // Upstream's polar kinematics defines no `update_limits` — only the
+        // cartesian dual-carriage swap calls it, and polar has no dual
+        // carriage.
+    }
+
+    fn clear_homing_state(&mut self, axes: &[usize]) {
+        // `clear_homing_state` of `kinematics/polar.py:88-93`: "X and Y
+        // cannot be cleared separately", so either clears both.
+        if axes.contains(&X_AXIS) || axes.contains(&Y_AXIS) {
+            self.limit_xy2 = -1.0;
+        }
+        if axes.contains(&Z_AXIS) {
+            self.limit_z = (1.0, -1.0);
+        }
+    }
+
+    fn get_status(&self) -> Value {
+        // `get_status` of `kinematics/polar.py:141-151`.
+        let xy_home = if self.limit_xy2 >= 0.0 { "xy" } else { "" };
+        let z_home = if self.limit_z.0 <= self.limit_z.1 {
+            "z"
+        } else {
+            ""
+        };
+        json!({
+            "homed_axes": format!("{xy_home}{z_home}"),
+            "axis_minimum": self.axes_min.as_array(),
+            "axis_maximum": self.axes_max.as_array(),
+        })
+    }
+
+    fn home(&mut self, homing: &mut dyn HomingState) {
+        // `home` of `kinematics/polar.py:95-108`: X and Y are always homed
+        // together on the arm rail (axis 0, Y pinned to 0 by
+        // [`polar_home_move`]), then Z on its own rail.
+        let requested = homing.axes();
+        let home_xy = requested.contains(&X_AXIS) || requested.contains(&Y_AXIS);
+        if home_xy {
+            let info = homing.homing_info(X_AXIS);
+            let (forcepos, movepos) =
+                polar_home_move(X_AXIS, &info, self.arm_range.0, self.arm_range.1);
+            homing.home_rails(&[X_AXIS], forcepos, movepos);
+        }
+        if requested.contains(&Z_AXIS) {
+            let info = homing.homing_info(Z_AXIS);
+            let (forcepos, movepos) =
+                polar_home_move(Z_AXIS, &info, self.z_range.0, self.z_range.1);
+            homing.home_rails(&[Z_AXIS], forcepos, movepos);
         }
     }
 }

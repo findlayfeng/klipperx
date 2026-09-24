@@ -336,6 +336,7 @@ mod tests {
                 "mcu",
                 "stepper_enable",
                 "extruder",
+                "extruder_stepper",
                 "fan",
                 "heater_bed",
                 "heater_generic",

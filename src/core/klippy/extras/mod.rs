@@ -19,6 +19,7 @@ pub mod display_status;
 pub mod ds18b20;
 pub mod error_mcu;
 pub mod extruder;
+pub mod extruder_stepper;
 pub mod fan;
 pub mod gcode_arcs;
 pub mod gcode_macro;

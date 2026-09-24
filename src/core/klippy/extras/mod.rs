@@ -8,6 +8,7 @@
 
 pub mod adc_temperature;
 pub mod bed_mesh;
+pub mod bed_screws;
 pub mod bed_tilt;
 pub mod bltouch;
 pub mod board_pins;

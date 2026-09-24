@@ -343,6 +343,7 @@ mod tests {
                 "adc_temperature",
                 "thermistor",
                 "bed_mesh",
+                "bed_screws",
                 "bed_tilt",
                 // Sorted within its `order` group by section id; the bytes put
                 // `bltouch` before `board_pins` (`l` < `o`).

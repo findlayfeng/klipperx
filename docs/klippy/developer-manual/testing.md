@@ -280,6 +280,8 @@ git config core.hooksPath .githooks
 | `stepper_enable.rs` | 节装载；无 `enable_pin` 时是“永远使能”；写了则建使能脚（共享/取反路径） |
 | `bed_mesh.rs` | 语料选项全量认领（含 `faulty_region_*` 对）；矩形网格按行 zigzag、间距下取整到百分位；圆床按 `mesh_radius` 过滤且用 `round_probe_count`；过近点报 `bed_mesh: min/max points too close together` |
 | `bed_tilt.rs` | 选项默认 0；无 `points` 不注册命令、`points` <3 点报上游 `Need at least 3 probe points`；平面拟合恢复已知平面（含探针偏移修正）且 configfile pending 为 `%.6f`；`get_position` 减 / `move_to` 加回的往返一致；`update_adjust` 重锚坐标并记三项 pending |
+| `z_tilt.rs` | `z_positions` 项数/缺项/坏项的上游文案、至少 2 点；`RetryHelper` 范围文案与上限、上升即中止、`error_msg_extra` 追加、无重试则静默；`applied` 标志与 motor_off 复位；平面拟合恢复已知平面；`adjust_steppers` 按 `-a` 排序逐步挂回的顺序录音 + 失败后全部挂回 |
+| `quad_gantry_level.rs` | `linefit` 直线与斜率（含退化）；四角高度恢复已知点；超 `max_adjust` 中止文案；恰好 4 点、`gantry_corners` >=2、缺项上游文案 |
 | `manual_probe.rs` | 二分插入点（`bisect_left`）、空闲状态形状；交互路径（`TESTZ` 移动、`ACCEPT` 校验、`ABORT` 收尾、命令注销）由上游语料端到端覆盖 |
 | `probe.rs` | `ProbePointsHelper`：`points` 的换行/逗号行解析、`move_target`（`use_xy_offsets` 减探针偏移）、越界点报错、`minimum_points`/`update_probe_points` 的上游文案；选项全量认领与默认值（`speed` 5.0、`samples` 1、`sample_retract_dist` 2.0、`samples_result` median、`samples_tolerance` 0.100、`deactivate_on_each_sample` true）；`lift_speed` 缺省回退 `speed`；`samples_result` 非法值报上游文案；虚拟端停校验：`z_virtual_endstop` 通过、其它 pin 名报 `Probe virtual endstop only useful as endstop pin`、`!`/`^` 报 `Can not pullup/invert probe virtual endstop`；归并算法：`average` 逐轴平均、`median` 按 Z 取中位（偶数样本取中间两者均值）；命令与会话路径由上游语料端到端覆盖 |
 | `upstream.rs` | 语料驱动（字典、CONFIG/文件输出、SHOULD_FAIL）之外，另有 **5 条聚焦 E2E**：普通端停 `G28 Z`、`probe:z_virtual_endstop` 的 `G28 Z`、`G28 + PROBE`、`G28 + PROBE_CALIBRATE/TESTZ/ACCEPT`、`G28 + BED_MESH_CALIBRATE`（3×3）——把「端停/探针真的能驱动一次回零」钉在假 MCU 上 |

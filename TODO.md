@@ -393,7 +393,7 @@ FW5a–f / FW6a–f 已把「cartesian + 假 MCU 的 `G1`/`G28`」跑通并归�
       `temperature_combined`；`debug_read` 系列改用异步 pre-build 钩子并在虚拟 MCU 上验证。
       回归里不再有 `Unknown temperature sensor`。
 
-**当前失败原因统计**（`KLIPPERX_UPSTREAM_ALL=1` 实跑，2026-09-23：**183 次失败**、54 次通过、
+**当前失败原因统计**（`KLIPPERX_UPSTREAM_ALL=1` 实跑，2026-09-23：**181 次失败**、56 次通过、
 2 条因未构建 `pru` 字典不计，合计 239；下表为**选项名大小写修复后**的分布——49 次
 `must be specified` 归零但总数不变、首因整体后移，见[复盘](docs/work-log/2026-09-22-upstream-regression-failures.md#复盘计数口径与重排后补)
 的「收益不可加」）：
@@ -423,7 +423,7 @@ FW5a–f / FW6a–f 已把「cartesian + 假 MCU 的 `G1`/`G28`」跑通并归�
 （本表随每个单元更新：2026-09-23 探针链路单元后实测；除 probe 行外其余各行的拆分仍取 U3a 时点，
 后续单元只会把首因往后推、总数不变，逐单元变化见各自提交信息。已转绿的语料：`linuxtest.test`、
 `commands.test`、`out_of_bounds.test`、`bed_mesh.test`、`z_virtual_endstop.test` 与
-`printers.test → printer-wanhao-duplicator-i3-plus-mark2-2019`。）
+`printers.test → printer-wanhao-duplicator-i3-plus-mark2-2019`、`z_tilt.test`、`quad_gantry_level.test`。）
 
 **T3 之后按首次失败分组的工单**：
 
@@ -613,7 +613,8 @@ FW5a–f / FW6a–f 已把「cartesian + 假 MCU 的 `G1`/`G28`」跑通并归�
 - [ ] 调平：`bed_mesh.py` ◐（**已落地**：`[bed_mesh]` 段与全量选项、探测点生成、
       `BED_MESH_CALIBRATE` 逐点探测存格、`BED_MESH_CLEAR`；**待做**：插值网格
       （lagrange/bicubic、`mesh_pps`）、faulty 区域替换、fade 与 move 的 z 补偿、profile 命令
-      与 `bed_mesh/dump_mesh` 端点）、`quad_gantry_level.py`、`z_tilt.py`。
+      与 `bed_mesh/dump_mesh` 端点）。
+- [x] **`z_tilt.py` / `quad_gantry_level.py`** ✅ 已落地：`RetryHelper`/`ZAdjustStatus`/`ZAdjustHelper`（脱挂→按 `-a` 排序逐步挂回）、平面拟合（`coordinate_descent`）、四点龙门 `linefit` 与 `max_adjust` 中止、`METHOD=manual` 走 `ACCEPT` 链；`z_tilt.test` 与 `quad_gantry_level.test` 转绿。
 - [x] **`bed_tilt.py`** ✅ 已落地：`[bed_tilt]` 段 + `gcode_move::set_move_transform` 占槽的
       平面补偿 + `BED_TILT_CALIBRATE`（`coordinate_descent` 拟合、`update_adjust` 重锚并记
       `SAVE_CONFIG` pending）；`multi_z.test` 因此只剩 `z_tilt` 一个缺口。

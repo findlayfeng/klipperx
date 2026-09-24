@@ -423,6 +423,9 @@ mod tests {
         "load_cell.test",
         "macros.test",
         "manual_stepper.test",
+        // Stays ignored (main's ruling): its config loads, but the g-code phase
+        // fails (`no available capacity` while stepping, and it needs
+        // `STEPPER_BUZZ` — M7). Removing it would turn the default run red.
         "multi_z.test",
         "polar.test",
         "pressure_advance.test",

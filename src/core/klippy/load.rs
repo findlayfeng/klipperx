@@ -353,6 +353,7 @@ mod tests {
                 "board_pins",
                 "controller_fan",
                 "gcode_arcs",
+                "gcode_macro",
                 "manual_probe",
                 "probe",
                 "quad_gantry_level",

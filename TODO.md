@@ -300,21 +300,22 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 
 框架已落地：`src/core/klippy/upstream.rs`（字典驱动应答机 + 按 `CONFIG` 拆分的运行）与
 `crates/test-support/build.rs`（按架构编字典）；T1（`linuxtest.test`）已完成并转绿。当前 239 次
-运行里，默认构建缺 2 条（引用 `pru`）、忽略列表 21 条、
-实际执行 16 条（`linuxtest.test`、`commands.test`、`out_of_bounds.test`、`bed_mesh.test`、
+运行里，默认构建缺 2 条（引用 `pru`）、忽略列表 18 条、
+实际执行 19 条（`linuxtest.test`、`commands.test`、`out_of_bounds.test`、`bed_mesh.test`、
 `z_virtual_endstop.test`、`z_tilt.test`、`quad_gantry_level.test`、`bltouch.test`、
 `smart_effector.test`、`multi_z.test`、`screws_tilt_adjust.test`、`gcode_arcs.test`、
-`bed_screws.test`、`pwm.test`、`temperature.test`、`macros.test`，均通过）；忽略列表即本节的工单，每步做完
+`bed_screws.test`、`pwm.test`、`temperature.test`、`macros.test`、`led.test`、
+`sdcard_loop.test`、`pressure_advance.test`，均通过）；忽略列表即本节的工单，每步做完
 就从 `IGNORED` 移除对应文件（手册见
 `docs/klippy/developer-manual/regression-tests.md`）。
 
 **推进口径**：下文的「首次失败原因」分组只用于定位，不是工作队列——`load_config` 遇到第一个
 未知 section 就停，修好一个缺口只会让运行前进到下一个缺口，总数可能不变（T7 前后失败总数
-几乎不变就是例子），各组收益不可加。进度以**转绿运行数 / `IGNORED` 条目数**衡量（当前 16 / 21）。**验收标准
+几乎不变就是例子），各组收益不可加。进度以**转绿运行数 / `IGNORED` 条目数**衡量（当前 19 / 18）。**验收标准
 是「对应 `.test` 从 `IGNORED` 移除后通过」**，不是「某个错误不再出现」。详见
 [失败原因分析复盘](docs/work-log/2026-09-22-upstream-regression-failures.md#复盘计数口径与重排后补)。
 
-**当前失败原因统计**（`KLIPPERX_UPSTREAM_ALL=1` 实跑，2026-09-24（集成批 #1 合入后）：**171 次失败**、66 次通过、
+**当前失败原因统计**（`KLIPPERX_UPSTREAM_ALL=1` 实跑，2026-09-24（集成批 #2 合入后）：**167 次失败**、70 次通过、
 2 条因未构建 `pru` 字典不计，合计 239；下表为**选项名大小写修复后**的分布——49 次
 `must be specified` 归零但总数不变、首因整体后移，见[复盘](docs/work-log/2026-09-22-upstream-regression-failures.md#复盘计数口径与重排后补)
 的「收益不可加」）：
@@ -341,10 +342,10 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 | 运行期失败（`Move out of range`：`generic-simulavr`） | 1 | 运行期（非装载） |
 | `Section 'extruder'`（T3 旧首位） | **0** | T3 已消 |
 
-（本表随每个单元更新：2026-09-24 集成批 #1 后 `bed_screws`/`gcode_arcs`/`pwm_cycle_time`/`temperature_fan`/`controller_fan`/`gcode_macro` 六节落地，相关首因后移（行内计数为 U3a 快照未重排）；2026-09-23 探针链路单元后实测；除 probe 行外其余各行的拆分仍取 U3a 时点，
+（本表随每个单元更新：2026-09-24 集成批 #2 后 `led`/`virtual_sdcard`/`display_status`/`homing_override`/`sdcard_loop`/`extruder_stepper`/`exclude_object`(段)/`dual_carriage`(段)/`servo` 九模块落地，相关首因再后移；批 #1 后 `bed_screws`/`gcode_arcs`/`pwm_cycle_time`/`temperature_fan`/`controller_fan`/`gcode_macro` 六节同理（行内计数为 U3a 快照未重排）；2026-09-23 探针链路单元后实测；除 probe 行外其余各行的拆分仍取 U3a 时点，
 后续单元只会把首因往后推、总数不变，逐单元变化见各自提交信息。已转绿的语料：`linuxtest.test`、
 `commands.test`、`out_of_bounds.test`、`bed_mesh.test`、`z_virtual_endstop.test` 与
-`printers.test → printer-wanhao-duplicator-i3-plus-mark2-2019`、`z_tilt.test`、`quad_gantry_level.test`、`bltouch.test`、`smart_effector.test`、`multi_z.test`、`screws_tilt_adjust.test`、`gcode_arcs.test`、`bed_screws.test`、`pwm.test`、`temperature.test`、`macros.test`。）
+`printers.test → printer-wanhao-duplicator-i3-plus-mark2-2019`、`z_tilt.test`、`quad_gantry_level.test`、`bltouch.test`、`smart_effector.test`、`multi_z.test`、`screws_tilt_adjust.test`、`gcode_arcs.test`、`bed_screws.test`、`pwm.test`、`temperature.test`、`macros.test`、`led.test`、`sdcard_loop.test`、`pressure_advance.test`。）
 
 **T3 之后按首次失败分组的工单**：
 
@@ -418,7 +419,7 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 ### H3 G-Code 宏与脚本
 
 - [ ] `gcode_macro.py`：段与宏注册**已落地**（2026-09-24 集成批 #1，语料绿）；剩余 = 宏体模板/表达式引擎、`SET_GCODE_VARIABLE`、`rename_existing` 连接期换名，以及读
-      `printer.objects` 的反射式能力（**Q5**）。
+      `printer.objects` 的反射式能力（**Q5**）。**U-A7b 单元（已排）**：引擎验收含 `exclude_object.test` + `dual_carriage.test` 双翻转（=A10b/B1b 尾巴），落地同时清零 guard 已知态两点名。
 - [ ] `save_variables.py`（`SAVE_VARIABLE` / `[variables]`）。
 - [ ] `delayed_gcode.py`（`[delayed_gcode]`）。
 - [ ] `respond.py`（`RESPOND` / `M118`）。
@@ -429,7 +430,7 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 - [ ] `virtual_sdcard.py`：主机侧文件打印、`M24`/`M25`/`M27`、进度。
 - [ ] `print_stats.py`、`display_status.py`（`M73`/`M117`）。
 - [ ] `pause_resume.py`（`PAUSE`/`RESUME`/`CANCEL_PRINT` + 三个端点，见 **B4**）。
-- [ ] `exclude_object.py`、`sdcard_loop.py`、`firmware_retraction.py`（G10/G11）。
+- [ ] `exclude_object.py`（段+四命令已落地 2026-09-24 批 #2，**转绿待 U-A7b 宏体渲染**）、`sdcard_loop.py`（段已落地，`SDCARD_LOOP_*` 命令与文件回放未接）、`firmware_retraction.py`（G10/G11）。
 - 依赖 F9（固件 `sdiocmds.c` 的 sdcard 资源）、C1（`gcode_move` 的位置恢复）。
 
 ### H5 TMC 步进驱动
@@ -506,8 +507,7 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 ### H10 运动相关 extras
 
 - [ ] `gcode_arcs.py`：**段已落地**（2026-09-24 批 #1），G2/G3 弧规划与平面命令仍未接；`manual_stepper.py`；`force_move.py` **部分**（只有
-      `SET_KINEMATIC_POSITION`，`FORCE_MOVE`/`STEPPER_BUZZ` 未接）；`extruder_stepper.py`
-      仍缺（`[extruder_stepper <name>]` 未进装载表，回归 2 次）。
+      `SET_KINEMATIC_POSITION`，`FORCE_MOVE`/`STEPPER_BUZZ` 未接）；`extruder_stepper.py` 段已落地（2026-09-24 批 #2，宿主 step 同步的 toolhead 缝仍缺）。
       （`stepper_enable.py` ✅ 已随 T2 落地并归档。）
 - [ ] `idle_timeout.py`（`idle_timeout:*` 事件已声明未触发）、
       `motion_report.py`（`dump_trapq`/`dump_stepper` 端点，见 **B4**）。

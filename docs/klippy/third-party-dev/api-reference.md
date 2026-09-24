@@ -819,6 +819,10 @@
 | `QUAD_GANTRY_LEVEL` | 四梁水平校准（`quad_gantry_level`） |
 | `Z_TILT_ADJUST` | Z 轴倾斜调整（`z_tilt`） |
 | `BED_SCREWS_ADJUST` | 床面螺丝调整（`bed_screws`）——**段已落地、命令未注册**（2026-09-24 批 #1，调用会收到未知命令响应） |
+| `SET_SERVO` | 舵机控制（mux 键 `SERVO=`，由 `[servo <名>]` 注册，2026-09-24 批 #2） |
+| `SET_DUAL_CARRIAGE` | IDEX 滑架切换（由 `[dual_carriage]` 注册，2026-09-24 批 #2；现为记账级，C1 缺口入档） |
+| `SAVE_DUAL_CARRIAGE_STATE` / `RESTORE_DUAL_CARRIAGE_STATE` | 滑架状态保存/恢复（同上；恢复移动语义未完全移植） |
+| `EXCLUDE_OBJECT` / `EXCLUDE_OBJECT_START` / `EXCLUDE_OBJECT_END` / `EXCLUDE_OBJECT_DEFINE` | 打印对象排除四命令（由 `[exclude_object]` 注册，2026-09-24 批 #2；`M486` 宏体驱动的用例转绿待 U-A7b） |
 | `SCREWS_TILT_CALCULATE` | 螺丝倾斜计算（`screws_tilt_adjust`） |
 | `SHAPER_CALIBRATE` | 输入整形校准（`resonance_tester`） |
 | `QUERY_ENDSTOPS` | 查询限位开关 |

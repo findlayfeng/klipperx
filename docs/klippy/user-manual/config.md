@@ -749,3 +749,61 @@ pins: !PD0, PD1, PD2
 
 宏即命令（大写注册）；**宏体暂不展开**（被调用时 `respond_info` 明示未实现，不静默）；`SET_GCODE_VARIABLE` 未注册；裸 `[gcode_macro]` 为共享模板持有者（零选项）。完整模板/表达式引擎属 H3。
 
+### [led <name>] / [neopixel <name>] / [dotstar <name>] / [pca9533 <name>] / [pca9632 <name>] / [display_template <name>]
+
+| 选项 | 适用 | 说明 |
+|------|------|------|
+| `initial_RED`/`initial_GREEN`/`initial_BLUE`/`initial_WHITE` | 各灯段 | 0..=1 初值（驱动无该色时忽略） |
+| `cycle_time`/`hardware_pwm`/`red_pin`…`white_pin` | `led` | PWM/引脚组（`led.py:150`） |
+| `pin`/`chain_count`/`color_order` | `neopixel` | 链长与色序（`neopixel.py:106`） |
+| `data_pin`/`clock_pin`/`chain_count` | `dotstar` | 双线链（`dotstar.py:55`） |
+| `i2c_*`（bus 选项组） | `pca9533`/`pca9632` | I2C 地址/速率等（`bus.py:302`）；`pca9632` 另有 `color_order` |
+| `text`、`param_*` | `display_template` | 模板文本与参数（惰性对象，`is_queryable=false`） |
+
+六段已落地（2026-09-24 批 #2）；`SET_LED`/`SET_LED_TEMPLATE` 未注册（H3/H8），模板 `text` 不渲染（随 U-A7b）。
+
+### [extruder_stepper <name>]
+
+| 选项 | 默认 | 说明 |
+|------|------|------|
+| 电机组 | — | 经 `PrinterStepper` 读取（步距等同上游） |
+| `extruder` | `extruder` | 绑定的挤出机名（connect 期校验，上游文案 `'<名>' is not a valid extruder.`） |
+| `pressure_advance` / `smooth_time` | `0.` / `0.040` | 本步进独立压力推进 |
+
+段已落地（批 #2）；`SET_PRESSURE_ADVANCE [EXTRUDER=<段名>]` 按名挂值 ✓；宿主 step 同步待 toolhead 缝（H10），`SYNC_EXTRUDER_MOTION`/`SET_EXTRUDER_ROTATION_DISTANCE` 未注册。
+
+### [exclude_object]
+
+零选项段（上游 `exclude_object.py:16-46`）。装载时注册 `EXCLUDE_OBJECT_START`/`_END`/`EXCLUDE_OBJECT`/`EXCLUDE_OBJECT_DEFINE` 四命令并持有对象状态；排除区内移动被 `MoveTarget` 变换丢弃。**转绿前置=U-A7b 宏体渲染**（状态变更藏在 `[gcode_macro M486]` 宏体内）。
+
+### [virtual_sdcard] / [display_status] / [homing_override] / [sdcard_loop]
+
+| 节 | 选项 | 说明 |
+|---|------|------|
+| `virtual_sdcard` | `path`（必）、`on_error_gcode`（默认=上游 `DEFAULT_ERROR_GCODE`） | 文件回放命令族（M20-M27、`SDCARD_RESET_FILE` 等）未注册（H4） |
+| `display_status` | 无 | `M73`/`M117`/`SET_DISPLAY_TEXT` 未注册，状态恒为静止 |
+| `homing_override` | `axes`（默认 `XYZ`）、`set_position_x/y/z`（无）、`gcode`（必） | G28 包装未装——脚本体是宏模板、暂不渲染（H9 共担） |
+| `sdcard_loop` | 无 | `SDCARD_LOOP_BEGIN/_END/_DESIST` 未注册；栈/索引语义已单测钉住 |
+
+### [dual_carriage]
+
+| 选项 | 说明 |
+|------|------|
+| `axis`（X/Y/Z）、`safe_distance`（毫米） | 第二滑架轴与最近距，按上游读取（`idex_modes.py`/`cartesian.py:24-34`） |
+| 电机组 | 经 `PrinterStepper`（同上游 `LookupMultiRail`） |
+
+cartesian 在 late 阶段认领；注册 `dual_carriage` 对象与 `SET_DUAL_CARRIAGE`/`SAVE_…_STATE`/`RESTORE_…_STATE`。步进**不驱动**（C1，仅记账）；**转绿前置=U-A7b**（T0/T1 宏体不执行则滑架不切）。
+
+### [servo <name>]
+
+| 选项 | 默认 | 约束 |
+|------|------|------|
+| `pin` | 必填 | PWM 引脚 |
+| `minimum_pulse_width` | `0.001` s | >0 且 <0.020 |
+| `maximum_pulse_width` | `0.002` s | >minimum 且 <0.020 |
+| `maximum_servo_angle` | `180` | 最大脉宽对应角 |
+| `initial_angle` | — | 0..=360；缺省用 `initial_pulse_width` |
+| `initial_pulse_width` | `0` | 0..=maximum_pulse_width |
+
+`SET_SERVO`（mux 键 `SERVO=`，ANGLE/WIDTH）已注册；无打印时序排程（同 pwm_tool 既有口径）。
+

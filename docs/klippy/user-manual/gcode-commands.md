@@ -362,7 +362,7 @@ M107
 SET_PRESSURE_ADVANCE [EXTRUDER=<name>] [ADVANCE=<mm>] [SMOOTH_TIME=<s>]
 ```
 
-两个参数都缺省为该挤出机的当前值，回显两行：
+两个参数都缺省为该挤出机的当前值；`EXTRUDER=<name>` 亦可指向 `[extruder_stepper <名>]` 段注册的同名步进（按名挂值，批 #2）。回显两行：
 
 ```
 // pressure_advance: 0.050000
@@ -601,6 +601,33 @@ SPI_SEND     DEVICE=flash DATA=04          // spi send ok
 ---
 
 ## 命令解析细节
+
+### SET_SERVO — 舵机控制（由 `[servo <名>]` 注册，mux 键 `SERVO=`）
+
+| 命令 | 参数 | 说明 |
+|------|------|------|
+| `SET_SERVO` | `SERVO`（名）、`ANGLE=<0..maximum_servo_angle>` 或 `WIDTH=<秒>` | 按角/脉宽驱动舵机；缺参与越界文案对上游（`servo.py`） |
+
+### SET_DUAL_CARRIAGE / SAVE_DUAL_CARRIAGE_STATE / RESTORE_DUAL_CARRIAGE_STATE — IDEX 双滑架（由 `[dual_carriage]` 注册）
+
+| 命令 | 参数 | 说明 |
+|------|------|------|
+| `SET_DUAL_CARRIAGE` | `CARRIAGE=<0..1>`、`MODE=...` | 切换主/副滑架；**现状=记账级**（未接 trapq 切换与限位，C1 缺口入档 idex 模块） |
+| `SAVE_DUAL_CARRIAGE_STATE` | `NAME=<名>` | 保存当前滑架状态 |
+| `RESTORE_DUAL_CARRIAGE_STATE` | `NAME=<名>`、`MOVE=<0..1>` | 恢复（含恢复移动的完整语义未移植） |
+
+错误措辞对上游 `idex_modes.py:240/283/295`；`T0`/`T1` 宏驱动的切换用例转绿前置=U-A7b 宏体渲染。
+
+### EXCLUDE_OBJECT 族 — 打印对象排除（由 `[exclude_object]` 注册）
+
+| 命令 | 作用（上游 `exclude_object.py`） |
+|------|------|
+| `EXCLUDE_OBJECT_START` | 标记当前对象开始（:190-198） |
+| `EXCLUDE_OBJECT_END` | 清除当前对象（:200-213） |
+| `EXCLUDE_OBJECT` | 按名/当前排除、RESET 或列表（:215-238） |
+| `EXCLUDE_OBJECT_DEFINE` | 定义对象（CENTER/POLYGON）或重置文件（:240-267） |
+
+参数与错误文案对上游；`[gcode_macro M486]` 的宏体驱动用例转绿前置=U-A7b。
 
 ### 传统命令
 

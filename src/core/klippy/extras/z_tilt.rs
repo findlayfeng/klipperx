@@ -142,8 +142,16 @@ impl RetryHelper {
         error_msg_extra: &str,
     ) -> Result<Self, ConfigError> {
         let default_max_retries = config.get_int_bounded("retries", Some(0), Some(0), None)?;
-        let default_retry_tolerance =
-            config.get_float_bounded("retry_tolerance", Some(0.), None, None, Some(0.), None)?;
+        // Upstream's `above=0.` bounds the configured value only — and the
+        // default `0.` sits exactly on that bound, so a bounds check that
+        // also sees defaults would reject every section that does not set
+        // `retry_tolerance` (upstream's `_get_wrapper` returns the default
+        // before the parser's bounds run).
+        let default_retry_tolerance = if config.has("retry_tolerance") {
+            config.get_float_bounded("retry_tolerance", Some(0.), None, None, Some(0.), None)?
+        } else {
+            0.
+        };
         Ok(Self {
             printer: Arc::downgrade(printer),
             default_max_retries,
@@ -749,4 +757,491 @@ pub fn load_config(
 ) -> Result<Arc<dyn PrinterObject>, ConfigError> {
     let object = ZTilt::new(config, printer)?;
     Ok(object as Arc<dyn PrinterObject>)
+}
+
+// ===========================================================================
+// z_tilt tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::klippy::config::{ConfigSection, ConfigValue};
+    use crate::core::klippy::reactor::ManualReactor;
+    use std::collections::BTreeSet;
+
+    /// Stepper names as the helper holds them.
+    fn names(items: &[&str]) -> Vec<String> {
+        items.iter().map(|name| name.to_string()).collect()
+    }
+
+    /// A section with the given options, as the parser would build it.
+    fn section(id: &str, options: &[(&str, &str)]) -> ConfigSection {
+        let mut section = ConfigSection::new(id, None);
+        for (option, value) in options {
+            section.parameters.insert(
+                (*option).to_string(),
+                ConfigValue::Single((*value).to_string()),
+            );
+        }
+        section
+    }
+
+    /// A printer with `gcode` registered, so `RetryHelper` can report.
+    fn gcode_printer() -> Arc<Printer> {
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        printer
+            .add_object(
+                GCODE_OBJECT,
+                Arc::new(GCodeDispatch::new(Arc::clone(&printer))),
+            )
+            .expect("gcode registers");
+        printer
+    }
+
+    /// Everything `gcode` reported through `respond_info`, one entry per
+    /// line (`// …` prefixes included, as a client sees them).
+    fn captured_lines(printer: &Arc<Printer>) -> Arc<Mutex<Vec<String>>> {
+        let gcode = printer
+            .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+            .expect("gcode is registered");
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&lines);
+        gcode.register_output_handler(Arc::new(move |line: &str| {
+            sink.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(line.to_string());
+        }));
+        lines
+    }
+
+    fn retry_helper(
+        printer: &Arc<Printer>,
+        id: &str,
+        options: &[(&str, &str)],
+        error_msg_extra: &str,
+    ) -> RetryHelper {
+        let section = section(id, options);
+        let config = ConfigWrapper::untracked(&section);
+        RetryHelper::new(&config, printer, error_msg_extra).expect("the options read")
+    }
+
+    fn gcmd(printer: &Arc<Printer>) -> GcodeCommand {
+        let gcode = printer
+            .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+            .expect("gcode is registered");
+        gcode.create_gcode_command(
+            "Z_TILT_ADJUST",
+            "Z_TILT_ADJUST",
+            std::collections::HashMap::new(),
+        )
+    }
+
+    /// `z_positions` item count vs. the machine (`z_tilt.py:22-27`): the
+    /// message names the section and the *machine's* stepper count, and a
+    /// single stepper is refused even when the counts match.
+    #[test]
+    fn z_positions_item_count_messages_match_upstream() {
+        let three = ["stepper_z", "stepper_z1", "stepper_z2"];
+        let three: Vec<String> = three.iter().map(|name| name.to_string()).collect();
+        let err = check_z_steppers("z_tilt", 2, &three).unwrap_err();
+        assert_eq!(err.to_string(), "z_tilt z_positions needs exactly 3 items");
+        let err = check_z_steppers("quad_gantry_level", 4, &three).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "quad_gantry_level z_positions needs exactly 3 items"
+        );
+
+        let one = ["stepper_z".to_string()];
+        let err = check_z_steppers("z_tilt", 1, &one).unwrap_err();
+        assert_eq!(err.to_string(), "z_tilt requires multiple z steppers");
+
+        assert!(check_z_steppers("z_tilt", 3, &three).is_ok());
+    }
+
+    /// A missing `z_positions` is reported the way upstream's `getlists`
+    /// reports a missing option, and a row that is not two numbers keeps
+    /// `get_list_of_lists`' wording.
+    #[test]
+    fn missing_or_malformed_z_positions_reports_upstream_wording() {
+        let bare = section("z_tilt", &[]);
+        let config = ConfigWrapper::untracked(&bare);
+        let err = read_xy_option(&config, "z_positions").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Option 'z_positions' in section 'z_tilt' is not defined"
+        );
+
+        let bad = section("z_tilt", &[("z_positions", "1, 2, 3")]);
+        let config = ConfigWrapper::untracked(&bad);
+        let err = read_xy_option(&config, "z_positions").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Option 'z_positions' in section 'z_tilt' must have 2 elements"
+        );
+    }
+
+    /// `ZTilt::new` refuses a section with fewer than two probe points,
+    /// before any command is registered (`z_tilt.py:134`).
+    #[test]
+    fn z_tilt_needs_at_least_two_probe_points() {
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        let section = section(
+            "z_tilt",
+            &[("z_positions", "-55,-7\n305,320"), ("points", "50,50")],
+        );
+        let config = ConfigWrapper::untracked(&section);
+        let Err(err) = ZTilt::new(&config, &printer) else {
+            panic!("one probe point must not load");
+        };
+        assert_eq!(err.to_string(), "Need at least 2 probe points for z_tilt");
+    }
+
+    /// `check_retry` reports the round's range before judging it, and a
+    /// range inside the tolerance ends the retries (`z_tilt.py:113-121`).
+    #[test]
+    fn retry_helper_reports_the_range_and_finishes_within_tolerance() {
+        let printer = gcode_printer();
+        let lines = captured_lines(&printer);
+        let retry = retry_helper(
+            &printer,
+            "z_tilt",
+            &[("retries", "3"), ("retry_tolerance", "0.01")],
+            "",
+        );
+        let gcmd = gcmd(&printer);
+        retry.start(&gcmd).expect("the defaults arm");
+
+        let result = retry
+            .check_retry(&[1.0, 1.02, 1.01])
+            .expect("a range this wide retries");
+        assert_eq!(result, "retry");
+        let lines = lines.lock().unwrap_or_else(|p| p.into_inner());
+        assert!(
+            lines.iter().any(|line| line
+                .contains("Retries: 0/3 Probed points range: 0.020000 tolerance: 0.010000")),
+            "the range report is missing: {lines:?}"
+        );
+        drop(lines);
+
+        let result = retry
+            .check_retry(&[1.0, 1.005, 1.004])
+            .expect("a range this narrow is done");
+        assert_eq!(result, "done");
+    }
+
+    /// One round past `RETRIES` aborts with upstream's message
+    /// (`z_tilt.py:123-124`).
+    #[test]
+    fn retry_helper_stops_after_the_retry_limit() {
+        let printer = gcode_printer();
+        let retry = retry_helper(&printer, "z_tilt", &[("retries", "1")], "");
+        let gcmd = gcmd(&printer);
+        retry.start(&gcmd).expect("the defaults arm");
+
+        assert_eq!(
+            retry.check_retry(&[0.0, 0.02]).expect("first round"),
+            "retry"
+        );
+        let err = retry.check_retry(&[0.0, 0.02]).unwrap_err();
+        assert_eq!(err.to_string(), "Too many retries");
+    }
+
+    /// A range that rises twice without relief aborts with upstream's
+    /// message (`z_tilt.py:104-112, 121-122`) — trailing space included,
+    /// because upstream's `error_msg_extra` for `z_tilt` is empty.
+    #[test]
+    fn retry_helper_aborts_a_rising_range() {
+        let printer = gcode_printer();
+        let retry = retry_helper(
+            &printer,
+            "z_tilt",
+            &[("retries", "5"), ("retry_tolerance", "0.001")],
+            "",
+        );
+        let gcmd = gcmd(&printer);
+        retry.start(&gcmd).expect("the defaults arm");
+
+        assert_eq!(
+            retry.check_retry(&[0.0, 0.01]).expect("first round"),
+            "retry"
+        );
+        assert_eq!(
+            retry.check_retry(&[0.0, 0.02]).expect("second round"),
+            "retry"
+        );
+        let err = retry.check_retry(&[0.0, 0.03]).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Retries aborting: Probed points range is increasing. "
+        );
+    }
+
+    /// The same abort from QGL's helper appends its `error_msg_extra`
+    /// (`quad_gantry_level.py:30-31`).
+    #[test]
+    fn retry_helper_appends_the_error_msg_extra() {
+        let printer = gcode_printer();
+        let retry = retry_helper(
+            &printer,
+            "quad_gantry_level",
+            &[("retries", "5")],
+            "Possibly Z motor numbering is wrong",
+        );
+        let gcmd = gcmd(&printer);
+        retry.start(&gcmd).expect("the defaults arm");
+
+        assert_eq!(
+            retry.check_retry(&[0.0, 0.01]).expect("first round"),
+            "retry"
+        );
+        assert_eq!(
+            retry.check_retry(&[0.0, 0.02]).expect("second round"),
+            "retry"
+        );
+        let err = retry.check_retry(&[0.0, 0.03]).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Retries aborting: Probed points range is increasing. \
+             Possibly Z motor numbering is wrong"
+        );
+    }
+
+    /// `retries: 0` answers `"done"` without a report and without touching
+    /// the counters (`z_tilt.py:113-115`).
+    #[test]
+    fn retry_helper_without_retries_is_silent() {
+        let printer = gcode_printer();
+        let lines = captured_lines(&printer);
+        let retry = retry_helper(&printer, "z_tilt", &[], "");
+        let gcmd = gcmd(&printer);
+        retry.start(&gcmd).expect("the defaults arm");
+
+        assert_eq!(
+            retry
+                .check_retry(&[0.0, 10.0])
+                .expect("no retries means done"),
+            "done"
+        );
+        assert!(lines.lock().unwrap_or_else(|p| p.into_inner()).is_empty());
+    }
+
+    /// `applied` follows the round and clears when the motors go off
+    /// (`z_tilt.py:69-83`).
+    #[test]
+    fn z_adjust_status_tracks_applied_and_motor_off() {
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        let status = ZAdjustStatus::new(&printer);
+        assert_eq!(status.get_status(0.0), json!({ "applied": false }));
+
+        assert_eq!(status.check_retry_result("done"), "done");
+        assert_eq!(status.get_status(0.0), json!({ "applied": true }));
+        assert_eq!(status.check_retry_result("retry"), "retry");
+        assert_eq!(status.get_status(0.0), json!({ "applied": true }));
+
+        printer.send_event(&KlippyEvent::StepperEnableMotorOff);
+        assert_eq!(status.get_status(0.0), json!({ "applied": false }));
+    }
+
+    /// The plane fit recovers a known plane from probed points and maps it
+    /// onto the motors (`z_tilt.py:146-173`): the probe's own offsets net
+    /// out of the intercept, each motor gets the plane's height at its
+    /// `z_positions` coordinate, shifted by the probe z_offset.
+    #[test]
+    fn compute_adjustments_recovers_the_known_plane() {
+        let (a, b, c) = (0.01, -0.02, 2.0);
+        let offsets = ProbeOffsets {
+            x: 0.5,
+            y: -0.25,
+            z: 1.5,
+        };
+        // Probed points as the toolhead reports them: its position at the
+        // trigger, with Z the bed height under the probe (nozzle + offsets).
+        let nozzle = [
+            (0.0, 0.0),
+            (0.0, 20.0),
+            (20.0, 0.0),
+            (20.0, 20.0),
+            (10.0, 10.0),
+        ];
+        let positions: Vec<Coord> = nozzle
+            .iter()
+            .map(|(x, y)| Coord::new(*x, *y, c + a * (x + offsets.x) + b * (y + offsets.y), 0.0))
+            .collect();
+        let z_positions = [(0.0, 0.0), (0.0, 20.0), (20.0, 0.0), (20.0, 20.0)];
+
+        let adjustments = compute_adjustments(&offsets, &positions, &z_positions);
+
+        for (motor, adjustment) in z_positions.iter().zip(&adjustments) {
+            // The fit absorbs the probe offsets into its intercept;
+            // netting them back out (z_tilt.py:165-168) leaves the plane's
+            // height at the motor, shifted by the probe's z_offset.
+            let expected = c + a * motor.0 + b * motor.1 - offsets.z;
+            assert!(
+                (adjustment - expected).abs() < 1e-4,
+                "motor at {motor:?}: {adjustment} vs {expected}"
+            );
+        }
+    }
+
+    /// A recording [`Adjust`] fake: every effect lands in `log`, and
+    /// `attached` is the set of motors currently on a trapq.
+    #[derive(Default)]
+    struct RecordingAdjust {
+        position: Mutex<Coord>,
+        attached: Mutex<BTreeSet<String>>,
+        log: Mutex<Vec<String>>,
+        /// Fail the first `move_to`, to walk the recovery path.
+        fail_move: std::sync::atomic::AtomicBool,
+    }
+
+    impl RecordingAdjust {
+        fn new(steppers: &[&str], z: f64) -> Self {
+            Self {
+                position: Mutex::new(Coord::new(10.0, 10.0, z, 0.0)),
+                attached: Mutex::new(
+                    steppers
+                        .iter()
+                        .map(|name| name.to_string())
+                        .collect::<BTreeSet<_>>(),
+                ),
+                log: Mutex::new(Vec::new()),
+                fail_move: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+
+        fn log(&self) -> Vec<String> {
+            self.log.lock().unwrap_or_else(|p| p.into_inner()).clone()
+        }
+
+        fn attached(&self) -> Vec<String> {
+            self.attached
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .iter()
+                .cloned()
+                .collect()
+        }
+
+        fn push(&self, entry: String) {
+            self.log
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(entry);
+        }
+    }
+
+    impl Adjust for RecordingAdjust {
+        fn position(&self) -> Result<Coord, CommandError> {
+            Ok(*self.position.lock().unwrap_or_else(|p| p.into_inner()))
+        }
+
+        fn respond_info(&self, message: &str) {
+            self.push(format!("respond {message}"));
+        }
+
+        async fn flush(&self) -> Result<(), CommandError> {
+            self.push("flush".to_string());
+            Ok(())
+        }
+
+        fn detach(&self, stepper: &str) -> Result<(), CommandError> {
+            self.push(format!("detach {stepper}"));
+            self.attached
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(stepper);
+            Ok(())
+        }
+
+        fn attach(&self, stepper: &str) -> Result<(), CommandError> {
+            self.push(format!("attach {stepper}"));
+            self.attached
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(stepper.to_string());
+            Ok(())
+        }
+
+        fn move_to(&self, position: Coord, _speed: f64) -> Result<(), CommandError> {
+            if self.fail_move.load(Ordering::SeqCst) {
+                return Err(CommandError::new("move refused"));
+            }
+            self.push(format!("move z={:.6}", position.z()));
+            *self.position.lock().unwrap_or_else(|p| p.into_inner()) = position;
+            Ok(())
+        }
+
+        async fn set_position(&self, position: Coord) -> Result<(), CommandError> {
+            self.push(format!("set z={:.6}", position.z()));
+            *self.position.lock().unwrap_or_else(|p| p.into_inner()) = position;
+            Ok(())
+        }
+    }
+
+    /// The walk reports the moves, takes every motor off, then reattaches
+    /// them in `-adjustment` order — flushing before each step — and ends
+    /// with every motor back on the trapq (`z_tilt.py:29-67`).
+    #[tokio::test]
+    async fn adjust_steppers_walks_the_sorted_offsets_and_reattaches() {
+        let steppers = ["stepper_z", "stepper_z1", "stepper_z2"];
+        let ops = RecordingAdjust::new(&steppers, 1.0);
+        // -adjustments sort to: stepper_z2 (-0.06), stepper_z (-0.04),
+        // stepper_z1 (0.02); first offset -0.06, so z_low = 1.06.
+        let adjustments = [0.04, -0.02, 0.06];
+
+        run_adjust(&ops, &names(&steppers), &adjustments, 50.0)
+            .await
+            .expect("the walk succeeds");
+
+        let expected: Vec<String> = [
+            "respond Making the following Z adjustments:\n\
+             stepper_z = 0.040000\n\
+             stepper_z1 = -0.020000\n\
+             stepper_z2 = 0.060000",
+            "flush",
+            "detach stepper_z",
+            "detach stepper_z1",
+            "detach stepper_z2",
+            "flush",
+            "attach stepper_z2",
+            "move z=1.020000",
+            "set z=1.020000",
+            "flush",
+            "attach stepper_z",
+            "move z=1.080000",
+            "set z=1.080000",
+            "flush",
+            "attach stepper_z1",
+            "set z=1.020000",
+        ]
+        .iter()
+        .map(|entry| entry.to_string())
+        .collect();
+        assert_eq!(ops.log(), expected);
+
+        // Every motor is back on the trapq, and the toolhead sits at
+        // z_low + last offset + first offset.
+        assert_eq!(
+            ops.attached(),
+            names(&["stepper_z", "stepper_z1", "stepper_z2"])
+        );
+        let position = ops.position().expect("a position");
+        assert!((position.z() - 1.02).abs() < 1e-9, "z = {}", position.z());
+    }
+
+    /// A failed move reattaches every motor before the error escapes
+    /// (`z_tilt.py:54-61`).
+    #[tokio::test]
+    async fn adjust_steppers_reattaches_every_motor_after_a_failure() {
+        let steppers = ["stepper_z", "stepper_z1"];
+        let ops = RecordingAdjust::new(&steppers, 1.0);
+        ops.fail_move.store(true, Ordering::SeqCst);
+
+        let err = run_adjust(&ops, &names(&steppers), &[0.02, 0.01], 50.0)
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "move refused");
+        assert_eq!(ops.attached(), names(&["stepper_z", "stepper_z1"]));
+    }
 }

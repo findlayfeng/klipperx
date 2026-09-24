@@ -428,14 +428,12 @@ mod tests {
         "pressure_advance.test",
         "printers.test",
         "pwm.test",
-        "quad_gantry_level.test",
         "rotary_delta_calibrate.test",
         "screws_tilt_adjust.test",
         "sdcard_loop.test",
         "smart_effector.test",
         "temperature.test",
         "tmc.test",
-        "z_tilt.test",
     ];
 
     // -----------------------------------------------------------------------

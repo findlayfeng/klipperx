@@ -669,6 +669,31 @@ impl ToolHeadObject {
             .unwrap_or(0.0)
     }
 
+    /// Flush the look-ahead into the trapq and return the print time it reached
+    /// (`toolhead.get_last_move_time()`). Before connect this is `0.0`.
+    ///
+    /// Unlike [`ToolHeadObject::flush_step_generation`] this only moves the
+    /// planner's queue; the steps behind it are generated and sent by the
+    /// background task. It is the read half of
+    /// [`ToolHeadObject::dwell`]'s pair, as upstream's is.
+    pub fn get_last_move_time(&self) -> f64 {
+        self.lock()
+            .as_mut()
+            .map(|connected| connected.toolhead.get_last_move_time())
+            .unwrap_or(0.0)
+    }
+
+    /// Advance the planner's timeline by `delay` seconds (`toolhead.dwell`).
+    ///
+    /// A timed protocol — BLTouch's single-wire pulses — uses this to keep its
+    /// next command past the moves already queued
+    /// (`bltouch.py:_sync_print_time`). Before connect this does nothing.
+    pub fn dwell(&self, delay: f64) {
+        if let Some(connected) = self.lock().as_mut() {
+            connected.toolhead.dwell(delay);
+        }
+    }
+
     /// Flush the look-ahead and generate **and send** every step queued so far,
     /// from inside a command (`toolhead.flush_step_generation`).
     ///

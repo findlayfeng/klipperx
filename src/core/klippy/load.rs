@@ -344,6 +344,9 @@ mod tests {
                 "thermistor",
                 "bed_mesh",
                 "bed_tilt",
+                // Sorted within its `order` group by section id; the bytes put
+                // `bltouch` before `board_pins` (`l` < `o`).
+                "bltouch",
                 "board_pins",
                 "manual_probe",
                 "probe",

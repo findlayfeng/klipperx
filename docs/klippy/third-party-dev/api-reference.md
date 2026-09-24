@@ -824,6 +824,7 @@
 | `SAVE_DUAL_CARRIAGE_STATE` / `RESTORE_DUAL_CARRIAGE_STATE` | 滑架状态保存/恢复（同上；恢复移动语义未完全移植） |
 | `EXCLUDE_OBJECT` / `EXCLUDE_OBJECT_START` / `EXCLUDE_OBJECT_END` / `EXCLUDE_OBJECT_DEFINE` | 打印对象排除四命令（由 `[exclude_object]` 注册，2026-09-24 批 #2；`M486` 宏体用例已随批 #4 引擎转绿，含排除区 E 补偿） |
 | `PROBE_EDDY_CURRENT_TAP_CALIBRATE` | eddy tap 标定（由 `[probe_eddy_current]` 注册，批 #3；`TAP=` 子模式对上游；静态 `CALIBRATE=enable` 与 `Z_OFFSET_APPLY_PROBE` 未实现） |
+| `DELTA_CALIBRATE` / `DELTA_ANALYZE` | delta 校准（由 `[delta_calibrate]` 注册，批 #5；结果以 SAVE_CONFIG 待写行交回写侧，回写命令未做） |
 | `SCREWS_TILT_CALCULATE` | 螺丝倾斜计算（`screws_tilt_adjust`） |
 | `SHAPER_CALIBRATE` | 输入整形校准（`resonance_tester`） |
 | `QUERY_ENDSTOPS` | 查询限位开关 |

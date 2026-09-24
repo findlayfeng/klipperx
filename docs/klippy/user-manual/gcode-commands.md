@@ -512,6 +512,13 @@ SPI_SEND     DEVICE=flash DATA=04          // spi send ok
 
 与 `Z_TILT_ADJUST`/`QUAD_GANTRY_LEVEL` 不同，它**没有** `RETRIES`/`RETRY_TOLERANCE`，也不调整电机。
 
+### DELTA_CALIBRATE / DELTA_ANALYZE — delta 校准（由 `[delta_calibrate]` 注册，批 #5）
+
+| 命令 | 参数 | 说明 |
+|------|------|------|
+| `DELTA_CALIBRATE` | 对上游（手动探测循环驱动，复用 `manual_probe`） | 多点测量 + coordinate descent 拟合 tower 几何（arm_length/delta_radius/angle_trim 等），结果以 SAVE_CONFIG 待写行交回写侧 |
+| `DELTA_ANALYZE` | 对上游 | 用已有 `height0..` 数据重算；缺 basic 校验报上游原文 `Must run basic calibration with DELTA_CALIBRATE first` |
+
 ### Z_TILT_ADJUST — 多 Z 电机调平（`[z_tilt]`）
 
 探测若干点，按平面拟合算出每个 Z 电机的调整量，逐个脱挂/挂回依次移动电机使床面（相对喷嘴）水平。

@@ -245,9 +245,8 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 ### C1 运动层收尾
 
 - [ ] **引用（细节以笔记为准）**：[C1 动工前调查](docs/work-log/2026-09-22-c1-notes.md)——架构取舍、
-  单轴链推广方案与已落地项的证据都在那边。余项：**C1c-2 `delta` 族**（`delta`/`rotary_delta`/
-  `deltesian`/`winch`，需 `mathutil` 的 `trilateration`/`gaussian_solve`）、**C1c-3
-  `generic_cartesian`**、**C1c-4 `polar`**、**C1d print-time 回调**
+  单轴链推广方案与已落地项的证据都在那边。余项：**C1c-2 `delta` 族**余 `rotary_delta`/`deltesian`/`winch`（`delta` 本体 ✅ 2026-09-24 批 #5，`mathutil` 的 `trilateration`/`gaussian_solve` 已到位）、**C1c-3
+  `generic_cartesian`**、**C1c-4 `polar`** ✅（2026-09-24 批 #5）、**C1d print-time 回调**
   （`ToolHead::register_lookahead_callback` + `motion_queuing.register_flush_callback`）。
 
 > **T3 的边界**：`[extruder]`/`heater_bed`/`fan` 三段与 C1b 已落地；T3 现卡在 H2-3 的
@@ -256,8 +255,7 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 
 ### C2 配置装载收尾（框架 FW1）
 
-- [ ] **autosave / `SAVE_CONFIG`**：`#*#` 自动保存区块的读取（并入配置、与 include 冲突检查、
-      损坏检测）与回写（`SAVE_CONFIG` 命令、备份、重启），属模块而非框架；`bed_tilt` / PID /
+- [ ] **autosave / `SAVE_CONFIG`**：`#*#` 自动保存区块的**读取侧已落地**（2026-09-24 批 #5，忠实移植 `_find_autosave_data`——语料 `delta_calibrate.cfg` 的双段+高度数据即其验收，`delta_calibrate.test` 转绿；修正：此前「语料 0 个 `#*#`」的统计口径是 `config/` 示例目录、非 `test/klippy` 语料）。余下是回写侧：`SAVE_CONFIG` 命令、备份、重启，属模块而非框架；`bed_tilt` / PID /
       `probe_eddy_current` 等消费者都依赖它（上游 `klippy/configfile.py:248`、`:346`）。
       语料里 **0 个配置带 `#*#` 区块**，本项对当前回归失败数为零——原先「首位失败是
       `pid_Kp` 49 次」的归因有误，那实际是选项名大小写问题，已修复归零（见下方失败原因
@@ -300,23 +298,23 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 
 框架已落地：`src/core/klippy/upstream.rs`（字典驱动应答机 + 按 `CONFIG` 拆分的运行）与
 `crates/test-support/build.rs`（按架构编字典）；T1（`linuxtest.test`）已完成并转绿。当前 239 次
-运行里，默认构建缺 2 条（引用 `pru`）、忽略列表 15 条、
-实际执行 22 条（`linuxtest.test`、`commands.test`、`out_of_bounds.test`、`bed_mesh.test`、
+运行里，默认构建缺 2 条（引用 `pru`）、忽略列表 12 条、
+实际执行 25 条（`linuxtest.test`、`commands.test`、`out_of_bounds.test`、`bed_mesh.test`、
 `z_virtual_endstop.test`、`z_tilt.test`、`quad_gantry_level.test`、`bltouch.test`、
 `smart_effector.test`、`multi_z.test`、`screws_tilt_adjust.test`、`gcode_arcs.test`、
 `bed_screws.test`、`pwm.test`、`temperature.test`、`macros.test`、`led.test`、
 `sdcard_loop.test`、`pressure_advance.test`、`eddy.test`、`dual_carriage.test`、
-`exclude_object.test`，均通过）；忽略列表即本节的工单，每步做完
+`exclude_object.test`、`polar.test`、`delta.test`、`delta_calibrate.test`，均通过）；忽略列表即本节的工单，每步做完
 就从 `IGNORED` 移除对应文件（手册见
 `docs/klippy/developer-manual/regression-tests.md`）。
 
 **推进口径**：下文的「首次失败原因」分组只用于定位，不是工作队列——`load_config` 遇到第一个
 未知 section 就停，修好一个缺口只会让运行前进到下一个缺口，总数可能不变（T7 前后失败总数
-几乎不变就是例子），各组收益不可加。进度以**转绿运行数 / `IGNORED` 条目数**衡量（当前 22 / 15）。**验收标准
+几乎不变就是例子），各组收益不可加。进度以**转绿运行数 / `IGNORED` 条目数**衡量（当前 25 / 12）。**验收标准
 是「对应 `.test` 从 `IGNORED` 移除后通过」**，不是「某个错误不再出现」。详见
 [失败原因分析复盘](docs/work-log/2026-09-22-upstream-regression-failures.md#复盘计数口径与重排后补)。
 
-**当前失败原因统计**（`KLIPPERX_UPSTREAM_ALL=1` 实跑，2026-09-24（集成批 #3+#4 合入后）：**164 次失败**、73 次通过、
+**当前失败原因统计**（`KLIPPERX_UPSTREAM_ALL=1` 实跑，2026-09-24（集成批 #5 合入后）：**158 次失败**、79 次通过、
 2 条因未构建 `pru` 字典不计，合计 239；下表为**选项名大小写修复后**的分布——49 次
 `must be specified` 归零但总数不变、首因整体后移，见[复盘](docs/work-log/2026-09-22-upstream-regression-failures.md#复盘计数口径与重排后补)
 的「收益不可加」）：
@@ -343,10 +341,10 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 | 运行期失败（`Move out of range`：`generic-simulavr`） | 1 | 运行期（非装载） |
 | `Section 'extruder'`（T3 旧首位） | **0** | T3 已消 |
 
-（本表随每个单元更新：2026-09-24 集成批 #3+#4 后 `probe_eddy_current`/`gcode_macro`(引擎)/`exclude_object`/`dual_carriage` 收官、相关首因再后移；集成批 #2 后 `led`/`virtual_sdcard`/`display_status`/`homing_override`/`sdcard_loop`/`extruder_stepper`/`exclude_object`(段)/`dual_carriage`(段)/`servo` 九模块落地；批 #1 后六节同理（行内计数为 U3a 快照未重排）；2026-09-23 探针链路单元后实测；除 probe 行外其余各行的拆分仍取 U3a 时点，
+（本表随每个单元更新：2026-09-24 集成批 #5 后 `delta`/`polar` 运动学+`delta_calibrate` 收官、相关首因再后移；集成批 #3+#4 后 `probe_eddy_current`/`gcode_macro`(引擎)/`exclude_object`/`dual_carriage` 收官、相关首因再后移；集成批 #2 后 `led`/`virtual_sdcard`/`display_status`/`homing_override`/`sdcard_loop`/`extruder_stepper`/`exclude_object`(段)/`dual_carriage`(段)/`servo` 九模块落地；批 #1 后六节同理（行内计数为 U3a 快照未重排）；2026-09-23 探针链路单元后实测；除 probe 行外其余各行的拆分仍取 U3a 时点，
 后续单元只会把首因往后推、总数不变，逐单元变化见各自提交信息。已转绿的语料：`linuxtest.test`、
 `commands.test`、`out_of_bounds.test`、`bed_mesh.test`、`z_virtual_endstop.test` 与
-`printers.test → printer-wanhao-duplicator-i3-plus-mark2-2019`、`z_tilt.test`、`quad_gantry_level.test`、`bltouch.test`、`smart_effector.test`、`multi_z.test`、`screws_tilt_adjust.test`、`gcode_arcs.test`、`bed_screws.test`、`pwm.test`、`temperature.test`、`macros.test`、`led.test`、`sdcard_loop.test`、`pressure_advance.test`、`eddy.test`、`dual_carriage.test`、`exclude_object.test`。）
+`printers.test → printer-wanhao-duplicator-i3-plus-mark2-2019`、`z_tilt.test`、`quad_gantry_level.test`、`bltouch.test`、`smart_effector.test`、`multi_z.test`、`screws_tilt_adjust.test`、`gcode_arcs.test`、`bed_screws.test`、`pwm.test`、`temperature.test`、`macros.test`、`led.test`、`sdcard_loop.test`、`pressure_advance.test`、`eddy.test`、`dual_carriage.test`、`exclude_object.test`、`polar.test`、`delta.test`、`delta_calibrate.test`。）
 
 **T3 之后按首次失败分组的工单**：
 
@@ -371,9 +369,7 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
       → **M5** `probe_eddy_current` ✅（2026-09-24 批 #3 收官；`trigger_analog` 已随 M5a 落地，固件侧 F9/H7 另账）。
       其余 37 条 printers 命中 probe 的配置另压跨域长尾（H2/H3/H4/H5/H7/H8 与 H9 兄弟段），不在本闭包内。
       语料里 **0 个配置带 `#*#`**，autosave 不阻塞本批。
-- [ ] **T5. 运动学**（21 次失败，2026-09-23 选项大小写修复后实测）：`delta`（12）、
-      `generic_cartesian`（4）、`rotary_delta`（2）、`polar` / `winch` / `deltesian`（各 1）。
-      corexy 族已随 **C1c-1** 消失，`none` 已在 T1。
+- [ ] **T5. 运动学**：`delta`（含 `stepper_a/b/c`）与 `polar`（含 `stepper_arm/bed`）**已落地转绿**（2026-09-24 批 #5：`delta.test`+`delta_calibrate.test`+`polar.test` 三绿；含 `itersolve` 携参、假 MCU 多端停多槽、config 层 `SAVE_CONFIG` 读取、弧度 gear_ratio 推断）；余 `generic_cartesian`（4）、`rotary_delta`（2）、`winch`/`deltesian`（各 1，2026-09-23 实测口径）。corexy 族已随 **C1c-1** 消失，`none` 已在 T1。
 - [ ] **T6. TMC pin chip**（28 次失败，2026-09-23 选项大小写修复后实测）：段 21（`tmc2209 stepper_x` 15、
       `tmc2130` 2、`tmc2208` 2、`tmc2660` 1、`tmc5160` 1）+ pin chip 7（`tmc2209_stepper_x` 4、
       `tmc2130_stepper_x` 3）。依赖 H5（TMC）。
@@ -499,7 +495,7 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
       （lagrange/bicubic、`mesh_pps`）、faulty 区域替换、fade 与 move 的 z 补偿、profile 命令
       与 `bed_mesh/dump_mesh` 端点）。
 - [ ] 螺丝：`screws_tilt_adjust.py` ✅；`bed_screws.py` **段已落地**（2026-09-24 批 #1），`BED_SCREWS_ADJUST`/`ACCEPT`/`ADJUSTED`/`ABORT` 命令族未移植。
-- [ ] 校准：`delta_calibrate.py`、`axis_twist_compensation.py`、`skew_correction.py`、
+- [ ] 校准：`delta_calibrate.py` ✅（段+`DELTA_CALIBRATE`/`DELTA_ANALYZE` 落地 2026-09-24 批 #5，`delta_calibrate.test` 转绿）、`axis_twist_compensation.py`、`skew_correction.py`、
       `z_thermal_adjust.py`、`tuning_tower.py`。
 - [ ] 回零周边：`homing_override.py`、`homing_heaters.py`；事件 `probe:update_results` 未触发
       （`homing:*` 四个已随 toolhead 落地产线触发，见事件清单）。

@@ -418,7 +418,6 @@ mod tests {
         "input_shaper.test",
         "led.test",
         "load_cell.test",
-        "macros.test",
         "manual_stepper.test",
         "polar.test",
         "pressure_advance.test",

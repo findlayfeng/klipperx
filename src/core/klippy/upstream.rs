@@ -433,7 +433,6 @@ mod tests {
         "rotary_delta_calibrate.test",
         "screws_tilt_adjust.test",
         "sdcard_loop.test",
-        "smart_effector.test",
         "temperature.test",
         "tmc.test",
     ];

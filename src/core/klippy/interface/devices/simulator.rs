@@ -311,7 +311,7 @@ impl SimulatorDevice {
                     // `debug_read order=%c addr=%u` — return a simulated value.
                     // For simplicity, we return 0 for all reads (not fully
                     // simulated memory model).
-                    let order = match params.first() {
+                    let _order = match params.first() {
                         Some(ArgValue::UInt8(v)) => *v,
                         _ => {
                             debug!("simulator: debug_read: missing order");

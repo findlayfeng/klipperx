@@ -26,6 +26,7 @@ pub mod output_pin;
 pub mod probe;
 pub mod quad_gantry_level;
 pub mod query_endstops;
+pub mod smart_effector;
 pub mod spi_device;
 pub mod spi_temperature;
 pub mod static_digital_output;

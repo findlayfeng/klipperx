@@ -87,8 +87,8 @@ use crate::core::klippy::motion::itersolve::{
 };
 use crate::core::klippy::motion::kinematics::{
     home_move, polar_active_flags, polar_angle_normalize, polar_angle_solver, polar_angle_unwrap,
-    polar_home_move, polar_radius_solver, CartesianKinematics, CartesianTransform,
-    NoneKinematics, PolarKinematics, UnifiedHome,
+    polar_home_move, polar_radius_solver, CartesianKinematics, CartesianTransform, NoneKinematics,
+    PolarKinematics, UnifiedHome,
 };
 use crate::core::klippy::motion::plan::MoveLimits;
 use crate::core::klippy::motion::stepcompress::{StepCommand, StepCompressError};
@@ -803,17 +803,17 @@ impl PrinterObject for ToolHeadObject {
                         self.max_angular_velocity,
                     )));
                 }
-            KinematicsKind::Delta => {
-                let delta = self
-                    .delta
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .take()
-                    .ok_or_else(|| {
-                        config_error("delta kinematics is not connected".to_string())
-                    })?;
-                toolhead.set_kinematics(Box::new(delta));
-            }
+                KinematicsKind::Delta => {
+                    let delta = self
+                        .delta
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .take()
+                        .ok_or_else(|| {
+                            config_error("delta kinematics is not connected".to_string())
+                        })?;
+                    toolhead.set_kinematics(Box::new(delta));
+                }
                 _ => {
                     toolhead.set_kinematics(Box::new(CartesianKinematics::new(
                         self.axis_names(),
@@ -2200,7 +2200,7 @@ mod tests {
         let mut section = ConfigSection::new("printer", None);
         section.parameters.insert(
             "kinematics".to_string(),
-            ConfigValue::Single("polar".to_string()),
+            ConfigValue::Single("deltesian".to_string()),
         );
         section.parameters.insert(
             "max_velocity".to_string(),
@@ -2217,7 +2217,9 @@ mod tests {
             .map(|_| ())
             .unwrap_err();
 
-        assert!(err.to_string().contains("Error loading kinematics 'polar'"));
+        assert!(err
+            .to_string()
+            .contains("Error loading kinematics 'deltesian'"));
         // The message also names what *is* implemented, including delta now.
         assert!(err.to_string().contains("delta"));
     }
@@ -2517,7 +2519,6 @@ mod tests {
             max_z_accel: 100.0,
             rails: Vec::new(),
             bed: None,
-            kind: KinematicsKind::Cartesian,
             kind: KinematicsKind::Cartesian,
             delta: Mutex::new(None),
             transform: CartesianTransform::Standard,

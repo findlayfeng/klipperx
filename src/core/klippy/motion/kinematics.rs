@@ -11,8 +11,8 @@ use std::collections::HashMap;
 use serde_json::{json, Value};
 
 use super::delta::DeltaCalibration;
-use super::plan::Move;
 use super::itersolve::PositionFn;
+use super::plan::Move;
 use super::trapq::MoveSegment;
 use crate::core::klippy::gcode::CommandError;
 use crate::core::klippy::mathutil::{Coord, AXES, X_AXIS, Y_AXIS, Z_AXIS};
@@ -478,11 +478,17 @@ pub fn polar_angle_position(segment: &MoveSegment, move_time: f64) -> f64 {
 /// `PositionFn`-typed wrappers for `setup_itersolve` (the position-fn struct
 /// carries no parameters for either polar solver).
 pub fn polar_radius_solver() -> PositionFn {
-    PositionFn::bind(|segment, move_time, _| polar_radius_position(segment, move_time), [0.0; 3])
+    PositionFn::bind(
+        |segment, move_time, _| polar_radius_position(segment, move_time),
+        [0.0; 3],
+    )
 }
 
 pub fn polar_angle_solver() -> PositionFn {
-    PositionFn::bind(|segment, move_time, _| polar_angle_position(segment, move_time), [0.0; 3])
+    PositionFn::bind(
+        |segment, move_time, _| polar_angle_position(segment, move_time),
+        [0.0; 3],
+    )
 }
 
 /// Both polar steppers follow X and Y (`kin_polar.c:46` sets `AF_X | AF_Y`

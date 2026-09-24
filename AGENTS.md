@@ -17,6 +17,7 @@
 | `agents/fix-<模块>-<问题>` | 修复 | `agents/fix-mcu-identify-timeout` |
 | `agents/feat-<功能>` | 新功能 | `agents/feat-heater-bed` |
 | `agents/test-<范围>` | 测试 | `agents/test-upstream-gcode` |
+| `abandoned/<主题>` | **被放弃/搁置的改动**（只保存，不合入） | `abandoned/wip-main-leftovers` |
 
 ### 规则
 
@@ -49,6 +50,12 @@
    在产出中列出「受影响的文档 + 需同步的要点」，由 main 在同一分支上补齐文档并随
    代码一起提交（可追加提交或在验收前修入原提交）；worker 只负责代码与报告清单，
    「改完必须同步手册」的义务不变，只是执行人换成 main。
+8. **放弃/搁置的改动进 `abandoned/` 分支集合**：被放弃、被替代、来源可疑或中断而未完成的
+   改动（包括子代理写错检出、超时中断、方向被否的实现），**不得直接删除**——由 main 迁到
+   `abandoned/<短名>` 分支保存，并在 [`docs/abandoned.md`](docs/abandoned.md) 登记来源、
+   放弃原因、可挖掘点与日期。`abandoned/*` **不参与主线**：不合并、不在其上继续开发、
+   不作为验收依据，只作素材来源；删除条目或从中取料继续做都要用户点头，执行仍由 main 完成。
+   取料进主线时按正常流程重做新分支（可编译、带测试、手册同步），提交信息里注明来源分支。
 
 ### 提交信息风格
 

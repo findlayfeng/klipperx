@@ -140,6 +140,10 @@ git config core.hooksPath .githooks
 | 查看当前待办与工单 | [`TODO.md`](TODO.md) |
 | 一次性分析/盘点背景 | [工作记录](docs/work-log/README.md)（非规范） |
 
+- **上游对照只读仓库内 `third_party/klipper/`**：机器上另有 klipper 检出（例如 `/opt/klipper`）时，
+  **不要**拿它当参照——它可能是**旧树**（实测缺 `trigger_analog` 等新特性、个别文件签名与语料不同源），
+  与本仓语料/字典不一致；一切对照读 `third_party/klipper/`，**语料测试是最终仲裁**。
+
 改动后的同步义务见上一节[改完必须同步手册](#改完必须同步手册)。
 
 ## 常用命令

@@ -340,6 +340,8 @@ mod tests {
                 "heater_bed",
                 "heater_generic",
                 "output_pin",
+                "pwm_cycle_time",
+                "pwm_tool",
                 "adc_temperature",
                 "thermistor",
                 "bed_mesh",

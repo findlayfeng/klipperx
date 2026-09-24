@@ -1325,6 +1325,24 @@ async fn probing_move(
     }
 
     let print_time = connected.toolhead.get_last_move_time();
+    // Drain the planner's backlog before arming. The background flush task
+    // stands back while this move owns the connected state, so everything
+    // queued since its last round (upstream's flush thread drains the same
+    // queue continuously) is still un-generated here. Compressing that
+    // backlog after `home_start` spends the firmware's monitor window —
+    // 16 ms of wall time at `monitor=40000x4` — on CPU work: eddy.test
+    // planned +40.4 s of scan + rapid_scan print time, its first generate
+    // took 41 ms, and `monitor_event` reported `Trigger analog error:
+    // MONITOR` before a single step frame left the host.
+    let backlog = connected
+        .generate()
+        .map_err(|err| CommandError::new(err.to_string()))?;
+    for (stepper, commands) in backlog {
+        stepper
+            .send_steps_async(&commands)
+            .await
+            .map_err(command_error)?;
+    }
     // Kept only for its side effect (arming the endstop); `home_wait` awaits
     // the same completion through the dispatch that owns it, and the drip
     // loop below deliberately does not poll it.

@@ -18,6 +18,7 @@ pub mod controller_fan;
 pub mod display_status;
 pub mod ds18b20;
 pub mod error_mcu;
+pub mod exclude_object;
 pub mod extruder;
 pub mod extruder_stepper;
 pub mod fan;

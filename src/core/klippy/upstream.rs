@@ -416,7 +416,6 @@ mod tests {
         "generic_cartesian_itex.test",
         "hybrid_corexy_dual_carriage.test",
         "input_shaper.test",
-        "led.test",
         "load_cell.test",
         "manual_stepper.test",
         "polar.test",

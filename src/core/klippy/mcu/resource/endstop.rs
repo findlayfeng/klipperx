@@ -44,6 +44,18 @@ pub struct McuEndstop {
     dispatch: TriggerDispatch,
     /// Ticks between poll attempts, kept for `home_wait`'s trigger-clock math.
     rest_ticks: Mutex<u32>,
+    /// The 64-bit clock this endstop was armed at, kept so `home_wait` can map
+    /// the firmware's 32-bit trigger clock relative to **this move** instead of
+    /// the synchronized estimate.
+    ///
+    /// A real MCU's clock and the host's print time share one base, so the
+    /// estimate is fine and upstream maps against it. Ours must not: print time
+    /// can run far ahead of what the MCU reports (49 bed-mesh points take
+    /// milliseconds of wall time and ~136 s of print time), and past 2^31 ticks
+    /// — 134 s at 16 MHz — a 32-bit value is read a whole revolution off. The
+    /// trigger cannot be outside this move, so the arm clock is the right
+    /// reference and the 2^31 window is never approached.
+    arm_clock: Mutex<Option<u64>>,
 }
 
 impl McuEndstop {
@@ -83,10 +95,16 @@ impl McuEndstop {
             chip,
             dispatch,
             rest_ticks: Mutex::new(0),
+            arm_clock: Mutex::new(None),
         })
     }
 
     /// The oid the firmware assigned.
+    /// The MCU this endstop's pin lives on.
+    pub fn chip_name(&self) -> &str {
+        self.chip.name()
+    }
+
     pub fn oid(&self) -> u8 {
         self.oid
     }
@@ -146,6 +164,7 @@ impl McuEndstop {
             .map(|end| end.saturating_sub(clock))
             .unwrap_or(0);
         *self.rest_ticks.lock().unwrap_or_else(|p| p.into_inner()) = rest_ticks as u32;
+        *self.arm_clock.lock().unwrap_or_else(|p| p.into_inner()) = Some(clock);
         let sample_ticks = mcu.seconds_to_clock(sample_time)? as u32;
 
         let completion = self.dispatch.start(print_time)?;
@@ -160,6 +179,20 @@ impl McuEndstop {
             trigger_reason: TriggerReason::EndstopHit as u8,
         })?;
         Ok(completion)
+    }
+
+    /// Map the firmware's 32-bit trigger clock onto the 64-bit clock of the
+    /// move that was armed: the arm clock plus the signed 32-bit difference,
+    /// falling back to the synchronized estimate when nothing is armed.
+    fn trigger_clock(&self, clock32: u32) -> Option<i64> {
+        let arm = *self.arm_clock.lock().unwrap_or_else(|p| p.into_inner());
+        match arm {
+            Some(arm) => {
+                let diff = i64::from(clock32.wrapping_sub(arm as u32) as i32);
+                Some(arm as i64 + diff)
+            }
+            None => self.chip.clock32_to_clock64(clock32),
+        }
     }
 
     /// Wait for the move's endstop (`MCU_endstop.home_wait`).
@@ -195,8 +228,7 @@ impl McuEndstop {
             )
             .await?;
         let next_clock = self
-            .chip
-            .clock32_to_clock64(state.next_clock)
+            .trigger_clock(state.next_clock)
             .ok_or_else(|| McuError::Config("endstop has no clock estimate".to_string()))?;
         let rest_ticks = i64::from(*self.rest_ticks.lock().unwrap_or_else(|p| p.into_inner()));
         Ok(self

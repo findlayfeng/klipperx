@@ -246,6 +246,10 @@ impl ProbeParams {
 struct ProbeChip {
     /// The physical probe endstop the virtual name resolves to.
     endstop: Arc<McuEndstop>,
+    /// The probe's trigger offset: what a `probe:z_virtual_endstop` rail uses
+    /// as its `position_endstop` (`ProbeEndstopWrapper.get_position_endstop`,
+    /// `probe.py:551-552`).
+    z_offset: f64,
 }
 
 impl PinChip for ProbeChip {
@@ -256,6 +260,11 @@ impl PinChip for ProbeChip {
     fn setup_endstop(&self, params: &PinParams) -> Result<Arc<McuEndstop>, PinError> {
         check_virtual_endstop(params)?;
         Ok(Arc::clone(&self.endstop))
+    }
+
+    fn virtual_endstop_position(&self, params: &PinParams) -> Option<f64> {
+        check_virtual_endstop(params).ok()?;
+        Some(self.z_offset)
     }
 }
 
@@ -554,6 +563,7 @@ impl PrinterProbe {
             CHIP_NAME,
             Arc::new(ProbeChip {
                 endstop: Arc::clone(&endstop),
+                z_offset: options.z_offset,
             }),
         )
         .map_err(|err| ConfigError::new(format!("{identifier}: {err}")))?;

@@ -141,7 +141,7 @@ git config core.hooksPath .githooks
 | `i2c.rs` | `config_i2c` / `i2c_set_bus` / `i2c_set_software_bus` 编码；新旧软件总线命令选择（async 真调）；`i2c_transfer` / `i2c_write` / `i2c_read` 的编码与响应解码（`i2c_response` / `i2c_read_response` / `i2c_bus_status`） |
 | `thermocouple.rs` | 命令与固件格式一致；芯片类型号与固件枚举对齐；`thermocouple_result` 解码；整条经虚拟 MCU 的往返 |
 | `stepper.rs` | `config_stepper` / `queue_step` 的 `args()` 与固件参数序一致（编码后解码回同一组值） |
-| `endstop.rs` | `config_endstop` / `endstop_home` 的参数序与固件一致；`pull_up` 负值按字节编码；disable 全零 |
+| `endstop.rs` | `config_endstop` / `endstop_home` 的参数序与固件一致；`pull_up` 负值按字节编码；disable 全零；`home_wait` 的 32 位触发时钟以**本次 move 的 arm clock** 为纪元参考（打印时间远超 MCU 自报时钟时会差一整圈：2³²/16 MHz = 268.44 s） |
 | `trsync.rs` | `trsync_start` 参数序与固件一致；`trigger_reason` 枚举号与固件对齐 |
 
 ### `event`
@@ -274,7 +274,7 @@ git config core.hooksPath .githooks
 | `heater_generic.rs` | **无独立测试**：工厂在装载表中（`load.rs`），加热器选项与控制环由 `heaters.rs` 的测试覆盖 |
 | `fan.rs` | 上游默认值装载、`shutdown_speed` 被 `max_power` 截顶；`M106` 设速 / `M107` 关、负值拒绝；kick-start 满速后回落、新请求覆盖挂起的 kick；`off_below` 把小请求归零；`max_power` 截顶；`enable_pin` 只在 0→非 0 翻转；`gcode:request_restart` 停风；**`tachometer_pin` 拒收**（而非静默 `rpm: null`）；缺 `pin` 点名、越界报哪一边、坏数字报原文 |
 | `gcode_move.rs` | `G1` 解析轴与速度、未点名的轴不动、记住上一笔速度、非正进给拒绝；G90/G91 切换、G92 锚定后下一笔在界内、裸 `G92` 全零；M83 的 E 相对而轴绝对；M220/M221 缩放速度与挤出；锚定只重挂 homed 的轴；SAVE/RESTORE 状态（未存的名字报错）；`M114` 报 G-Code 位置；`get_status` 对齐上游；第二个坐标系不能默默夺槽；英寸制拒绝 |
-| `toolhead.rs` | `[printer]` 的轴索引与 move 上下文；不支持的 `kinematics` 报配置错、`none` 不要 stepper；`stepper_z1` 并入 Z rail；corexy 族装载建 rail；MCU 错误带节名；限值来自 `[printer]`；move 到规划器、未 homed 轴拒绝；`G4` 推进 print time；`SET_KINEMATIC_POSITION` 回零并清状态；探针式回零 `probing_move`：触发即停、事件顺序（`homing_move_begin` 先于 `home_start`）、无触发报 `No trigger on probe after full movement`、零位移报 `Probe triggered prior to movement` |
+| `toolhead.rs` | `[printer]` 的轴索引与 move 上下文；不支持的 `kinematics` 报配置错、`none` 不要 stepper；`stepper_z1` 并入 Z rail；corexy 族装载建 rail；MCU 错误带节名；限值来自 `[printer]`；move 到规划器、未 homed 轴拒绝；`G4` 推进 print time；`SET_KINEMATIC_POSITION` 回零并清状态；探针式回零 `probing_move`：触发即停、事件顺序（`homing_move_begin` 先于 `home_start`）、无触发报 `No trigger on probe after full movement`、零位移报 `Probe triggered prior to movement`；停止后把指令位置设到**停止点**（drip 循环停下那一刻的 trapq 位置）并返回它——上游按触发时钟读固件步数，语料假 MCU 无步数模型，故以此为替身 |
 | `stepper.rs` | 节名→轴、轴索引与 mathutil 一致；步距按几何算；节装成 stepper 对象；`endstop_pin` 建 rail 的 endstop 与 `HomingInfo`；endstop 居中推不出方向时报错；`gear_ratio` 除进步距；缺 pin 点名节、不同 MCU 的同轴引脚被拒、`position_endstop` 越界被拒 |
 | `stepper_enable.rs` | 节装载；无 `enable_pin` 时是“永远使能”；写了则建使能脚（共享/取反路径） |
 | `bed_mesh.rs` | 语料选项全量认领（含 `faulty_region_*` 对）；矩形网格按行 zigzag、间距下取整到百分位；圆床按 `mesh_radius` 过滤且用 `round_probe_count`；过近点报 `bed_mesh: min/max points too close together` |

@@ -325,6 +325,15 @@ pub trait PinChip: Send + Sync {
     fn setup_endstop(&self, _params: &PinParams) -> Result<Arc<McuEndstop>, PinError> {
         Err(PinError::Unsupported("endstop".to_string()))
     }
+
+    /// The `position_endstop` this endstop stands for, when it is a virtual one
+    /// (upstream's `MCU_endstop.get_position_endstop`: the probe wrapper returns
+    /// its `z_offset`, and `PrinterRail` prefers it over the config option).
+    ///
+    /// `None` for a physical endstop, whose position comes from the section.
+    fn virtual_endstop_position(&self, _params: &PinParams) -> Option<f64> {
+        None
+    }
 }
 
 /// A pin description or pin-sharing mistake.
@@ -628,6 +637,9 @@ struct PinsState {
     active_pins: HashMap<String, PinParams>,
     /// Pins that may be used by more than one owner, keyed `chip:pin`.
     allow_multi_use: HashSet<String>,
+    /// `position_endstop` values a virtual endstop supplies, keyed
+    /// `(chip, oid)` (`MCU_endstop.get_position_endstop`).
+    virtual_positions: HashMap<(String, u8), f64>,
 }
 
 /// The `pins` printer object: the pin vocabulary shared by every MCU.
@@ -649,6 +661,7 @@ impl PrinterPins {
                 chip_impls: HashMap::new(),
                 active_pins: HashMap::new(),
                 allow_multi_use: HashSet::new(),
+                virtual_positions: HashMap::new(),
             }),
         }
     }
@@ -1083,7 +1096,22 @@ impl PrinterPins {
             share_type,
         )?;
         let chip = self.chip(&params.chip_name)?;
-        chip.setup_endstop(&params)
+        let endstop = chip.setup_endstop(&params)?;
+        if let Some(position) = chip.virtual_endstop_position(&params) {
+            self.lock()
+                .virtual_positions
+                .insert((params.chip_name.clone(), endstop.oid()), position);
+        }
+        Ok(endstop)
+    }
+
+    /// The position a virtual endstop stands for, if it is one
+    /// (`MCU_endstop.get_position_endstop`).
+    pub fn virtual_endstop_position(&self, endstop: &McuEndstop) -> Option<f64> {
+        self.lock()
+            .virtual_positions
+            .get(&(endstop.chip_name().to_string(), endstop.oid()))
+            .copied()
     }
 
     /// The registered chip under `name`, cloned out so the caller does not hold

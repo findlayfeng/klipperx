@@ -406,18 +406,6 @@ mod tests {
     const IGNORED: &[&str] = &[
         "bed_screws.test",
         "bltouch.test",
-        // The probe path itself works end-to-end on the fake MCU — the focused
-        // tests below home on a plain endstop, home through
-        // `probe:z_virtual_endstop`, run `PROBE`, `PROBE_CALIBRATE`/`TESTZ`/
-        // `ACCEPT` and a 3x3 `BED_MESH_CALIBRATE`. What these two runs still hit
-        // is the fake MCU's endstop *timing*: it fires the trsync the moment
-        // `endstop_home` is armed, so a probing move never travels before the
-        // trigger ("No trigger on probe after full movement" on the 7x7 mesh,
-        // "Probe triggered prior to movement" on the probe endstop). Modeling
-        // that trigger (open before the move, hit during it) is the "responder
-        // fake MCU" item in TODO F8.
-        "bed_mesh.test",
-        "z_virtual_endstop.test",
         "corexyuv.test",
         "delta.test",
         "delta_calibrate.test",
@@ -898,6 +886,51 @@ mod tests {
             &config,
             "focused-probe-calibrate.cfg",
             "G28\nPROBE_CALIBRATE\nTESTZ Z=-1\nACCEPT\n",
+        )
+        .await
+        .expect("the machine comes up");
+        assert!(gcode.is_ok(), "{gcode:?}");
+    }
+
+    /// The corpus's own `bed_mesh.cfg` end to end: 49 probe points, which is
+    /// where the 32-bit trigger clock used to be mapped a whole revolution
+    /// away (the arm clock is print time, far ahead of the fake MCU's wall
+    /// clock, and the mapping's reference had to be this move's arming time).
+    /// The corpus's `z_virtual_endstop.cfg` end to end, for bisecting the
+    /// "probe triggered prior to movement" it reported.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_corpus_z_virtual_endstop_config_runs() {
+        let Some(dict) = dictionary_path("atmega2560.dict") else {
+            return;
+        };
+        let config = injected_config(
+            &klippy_test_dir().join("z_virtual_endstop.cfg"),
+            &[(None, dict)],
+        )
+        .expect("the corpus config parses");
+
+        let gcode = run_phases(
+            &config,
+            "focused-corpus-z-virtual.cfg",
+            "G28\nBED_MESH_CALIBRATE\nG1 Z5 X0 Y0\nPROBE\n",
+        )
+        .await
+        .expect("the machine comes up");
+        assert!(gcode.is_ok(), "{gcode:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_corpus_bed_mesh_config_calibrates() {
+        let Some(dict) = dictionary_path("atmega2560.dict") else {
+            return;
+        };
+        let config = injected_config(&klippy_test_dir().join("bed_mesh.cfg"), &[(None, dict)])
+            .expect("the corpus config parses");
+
+        let gcode = run_phases(
+            &config,
+            "focused-corpus-bed-mesh.cfg",
+            "G28\nG1 F6000\nG1 X60 Y60 Z10\nBED_MESH_CALIBRATE\nG1 Z10\n",
         )
         .await
         .expect("the machine comes up");

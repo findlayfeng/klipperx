@@ -150,7 +150,8 @@ klipperx（bin，src/main.rs）
 | `resource/adc.rs` | `McuAdc` 与 `AdcRegistry`：`config_analog_in` + 周期 `query_analog_in`（新旧两种格式按字典格式串选择），按 oid 路由 `analog_in_state` 上报 |
 | `resource/stepper.rs` | MCU 侧的步进器（上游 `MCU_stepper`）：oid、`config_stepper`、运行期发步进批与 `stepper_get_position`；运动层只认它 |
 | `resource/endstop.rs` | `McuEndstop`（上游 `MCU_endstop`）：归零时的固件侧限位，持有 `endstop_home` 的触发窗口与查询 |
-| `resource/trsync.rs` | `McuTrsync`（上游 `MCU_trsync` / `TriggerDispatch`）：触发组——`trsync_start` 后多个步进器在触发时一起停，并把触发时刻的位置报回 |
+| `resource/trsync.rs` | `McuTrsync`（上游 `MCU_trsync` / `TriggerDispatch`）：触发组——`trsync_start` 后多个步进器在触发时一起停，并把触发时刻的位置报回；`Completion` 存原始 reason：`wait()` 保持 1-4 的 typed 语义（未知码折叠 `CommsTimeout`），`wait_raw` 供 trigger_analog 的 5+ 原因贯通，`raw_is_failure`（≥4）判失败 |
+| `resource/trigger_analog.rs` | `McuTriggerAnalog`（上游 `MCU_trigger_analog`）：`set_raw_range` / `set_trigger` 去重后下发、`home` 挂 trsync 归零、`query_state` 回报 homing/时钟；错误码四类解码（`RAW_RANGE` / `OVERFLOW` / `MONITOR` / `SENSOR_SPECIFIC`，≥`SENSOR_SPECIFIC` 走传感器回调）；含 `MCU_SosFilter`：SOS 段/状态/offset_scale 去重缓存 |
 | `resource/spi.rs` | `McuSpi`（上游 `MCU_SPI`）：`config_spi`（连片选一起装）与传输 |
 | `resource/i2c.rs` | `McuI2c`（上游 `MCU_I2C`）：`config_i2c` 后配置为硬件或软件（bit-bang）总线，读写字节 |
 | `dictionary.rs` | `Dictionary`：解析固件字典、枚举展开、安装进 `Parser` |
@@ -176,6 +177,8 @@ klipperx（bin，src/main.rs）
 | `stepper.rs` | `config_stepper` / `queue_step` / `reset_step_clock` / `set_next_step_dir` / `stepper_get_position` / `stepper_stop_on_trigger`：步进生成（固件 `stepper.c`） |
 | `endstop.rs` | `config_endstop` / `endstop_home` / `endstop_query_state`：归零期的固件侧限位（固件 `endstop.c`） |
 | `trsync.rs` | `config_trsync` / `trsync_start` / `trsync_set_timeout` / `trsync_trigger`：触发组——多个步进器同时停（固件 `trsync.c`，回零的停止机制） |
+| `trigger_analog.rs` | `config_trigger_analog` / `trigger_analog_set_raw_range` / `trigger_analog_set_trigger` / `trigger_analog_home` / `trigger_analog_query_state` 与响应 `trigger_analog_state`：探针式触发（固件 `trigger_analog.c`，配合 `sos_filter.c`） |
+| `sos_filter.rs` | `config_sos_filter` / `sos_filter_set_section` / `sos_filter_set_state` / `sos_filter_set_offset_scale` / `sos_filter_set_active`：SOS 滤波器的段与状态设置（固件 `sos_filter.c`） |
 | `spi.rs` | `config_spi` / `spi_set_bus` / `spi_set_sw_bus` / `spi_transfer` / `spi_send`：SPI 总线（固件 `spicmds.c`） |
 | `i2c.rs` | `config_i2c` / `i2c_set_bus` / `i2c_set_software_bus` / `i2c_write` / `i2c_read` / `i2c_transfer`：I2C 总线（固件 `i2ccmds.c`） |
 | `thermocouple.rs` | `config_thermocouple` / `query_thermocouple` 等：SPI 热电偶/RTD 测温（固件 `thermocouple.c`） |

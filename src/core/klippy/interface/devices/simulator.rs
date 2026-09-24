@@ -119,8 +119,12 @@ struct ArmedTriggerAnalog {
     /// The clock the monitor window expires at, on the fake's own time base:
     /// now + (monitor_max + 1) missed windows, as `monitor_event` counts them
     /// (`trigger_analog.c:59-75`). The host's arm clock lives in a different
-    /// epoch, so the window must not be derived from it.
+    /// epoch, so the window must not be derived from it. Sample activity
+    /// (`i2c_transfer` / `query_status_ldc1612`) pushes it out again — the
+    /// firmware's monitor counts *missed* samples, not silence since arming.
     deadline: u32,
+    /// The span one window represents, for pushing the deadline out.
+    window: u32,
     /// Whether either report has been made; one report ends the check.
     fired: bool,
 }
@@ -218,6 +222,20 @@ impl SimulatorDevice {
         };
 
         for (message, params) in decoded {
+            // Sample activity feeds the monitor: the firmware's window
+            // counts missed samples, so an i2c read or bulk-status query
+            // while the check is armed starts a fresh window.
+            if matches!(
+                message.name.as_str(),
+                "i2c_transfer" | "query_status_ldc1612"
+            ) {
+                let now = Self::clock(state) as u32;
+                if let Some(armed) = state.trigger_analog.as_mut() {
+                    if !armed.fired {
+                        armed.deadline = now.wrapping_add(armed.window);
+                    }
+                }
+            }
             match message.name.as_str() {
                 "identify" => Self::identify(state, seq, &params),
                 "get_config" => {
@@ -392,6 +410,7 @@ impl SimulatorDevice {
                                 error_reason,
                                 arm_clock: clock,
                                 deadline,
+                                window,
                                 fired: false,
                             });
                             eprintln!(
@@ -993,6 +1012,73 @@ mod tests {
         // Exactly one report: after a shutdown, nothing more comes out.
         device.shutdown();
         assert!(device.receive().is_none(), "the check does not re-fire");
+    }
+
+    #[test]
+    fn trigger_analog_sample_activity_pushes_the_monitor_deadline() {
+        let device = armed_device();
+        // One sample period of window (40 000 ticks), like the corpus' arm.
+        issue(
+            &device,
+            "trigger_analog_home",
+            &[
+                ArgValue::UInt8(1),
+                ArgValue::UInt8(2),
+                ArgValue::UInt8(1),
+                ArgValue::UInt8(5),
+                ArgValue::UInt32(0),
+                ArgValue::UInt32(40_000),
+                ArgValue::UInt32(0),
+            ],
+        );
+        let window = {
+            let state = device.state.lock().unwrap_or_else(|p| p.into_inner());
+            Duration::from_secs_f64(40_000.0 / state.freq)
+        };
+
+        // Silence: once the window passes, the monitor is due immediately.
+        std::thread::sleep(window * 4);
+        {
+            let state = device.state.lock().unwrap_or_else(|p| p.into_inner());
+            assert_eq!(
+                SimulatorDevice::monitor_wait(&state),
+                Some(Duration::ZERO),
+                "an idle window expires the check"
+            );
+        }
+
+        // A sample read is activity: the firmware counts *missed* samples,
+        // so the read starts a fresh window (`monitor_event`).
+        issue(
+            &device,
+            "i2c_transfer",
+            &[
+                ArgValue::UInt8(0),
+                ArgValue::Bytes(vec![0x2e]),
+                ArgValue::UInt32(2),
+            ],
+        );
+        {
+            let state = device.state.lock().unwrap_or_else(|p| p.into_inner());
+            let wait = SimulatorDevice::monitor_wait(&state).expect("still armed");
+            assert!(
+                wait > Duration::ZERO,
+                "i2c activity pushed the deadline out ({wait:?})"
+            );
+        }
+
+        // An ordinary query is not sample activity: it leaves the fresh
+        // window alone, and the check expires again once that window passes.
+        std::thread::sleep(window * 4);
+        issue(&device, "trigger_analog_query_state", &[ArgValue::UInt8(1)]);
+        {
+            let state = device.state.lock().unwrap_or_else(|p| p.into_inner());
+            assert_eq!(
+                SimulatorDevice::monitor_wait(&state),
+                Some(Duration::ZERO),
+                "a query does not feed the deadline"
+            );
+        }
     }
 
     #[test]

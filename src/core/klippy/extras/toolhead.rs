@@ -522,6 +522,10 @@ impl PrinterObject for ToolHeadObject {
             "position": position.as_array(),
             "homed_axes": homed_axes,
             "print_time": connected.toolhead.print_time(),
+            // The active extruder's name, as upstream reports it
+            // (`toolhead.py:511`); `PARK_{printer.toolhead.extruder}` and
+            // friends read it through the macro template.
+            "extruder": self.active_extruder(),
             "max_velocity": self.limits.max_velocity,
             "max_accel": self.limits.max_accel,
         })

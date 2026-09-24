@@ -67,7 +67,7 @@ use crate::core::klippy::event::KlippyEvent;
 use crate::core::klippy::extras::extruder::PrinterExtruder;
 use crate::core::klippy::extras::idex_modes;
 use crate::core::klippy::extras::query_endstops::{QueryEndstops, QUERY_ENDSTOPS_OBJECT};
-use crate::core::klippy::extras::stepper::{Rail, RailParams};
+use crate::core::klippy::extras::stepper::{PrinterStepper, Rail};
 use crate::core::klippy::gcode::{
     sync, CommandError, CommandHandler, GCodeDispatch, GcodeCommand, GCODE_OBJECT,
 };
@@ -82,7 +82,9 @@ use crate::core::klippy::motion::itersolve::{
     corexz_active_flags, corexz_position_fn, Axis, AxisFlags, PositionFn,
 };
 use crate::core::klippy::motion::kinematics::{
-    home_move, CartesianKinematics, CartesianTransform, NoneKinematics,
+    home_move, polar_active_flags, polar_angle_normalize, polar_angle_position, polar_angle_unwrap,
+    polar_home_move, polar_radius_position, CartesianKinematics, CartesianTransform,
+    NoneKinematics, PolarKinematics,
 };
 use crate::core::klippy::motion::plan::MoveLimits;
 use crate::core::klippy::motion::stepcompress::{StepCommand, StepCompressError};
@@ -107,12 +109,16 @@ const FLUSH_INTERVAL: Duration = Duration::from_millis(10);
 /// How old a finished move may stay in the trapq history before it is dropped.
 const MOVE_HISTORY_EXPIRE: f64 = 30.0;
 
-/// The cartesian-family kinematics `[printer] kinematics` may name.
+/// The kinematics `[printer] kinematics` may name.
 ///
-/// They share one `CartesianKinematics` (limits, homing, `check_move`) and
-/// differ in which solver each rail runs, how carriage axes map to rail
-/// positions (`CartesianTransform`), and which endstops watch which motors
-/// (`kinematics/corexy.py`, `corexz.py`, `hybrid_corexy.py`, `hybrid_corexz.py`).
+/// The cartesian family shares one `CartesianKinematics` (limits, homing,
+/// `check_move`) and differs in which solver each rail runs, how carriage
+/// axes map to rail positions (`CartesianTransform`), and which endstops
+/// watch which motors (`kinematics/corexy.py`, `corexz.py`,
+/// `hybrid_corexy.py`, `hybrid_corexz.py`). `polar` builds its own
+/// [`PolarKinematics`](crate::core::klippy::motion::kinematics::PolarKinematics)
+/// over `[stepper_arm]`/`[stepper_z]` plus the bare `[stepper_bed]` stepper
+/// (`kinematics/polar.py`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KinematicsKind {
     /// `kinematics: none`
@@ -127,6 +133,8 @@ enum KinematicsKind {
     HybridCoreXy,
     /// `kinematics: hybrid_corexz`
     HybridCoreXz,
+    /// `kinematics: polar`
+    Polar,
 }
 
 impl KinematicsKind {
@@ -138,6 +146,7 @@ impl KinematicsKind {
         "corexz",
         "hybrid_corexy",
         "hybrid_corexz",
+        "polar",
     ];
 
     /// Parse a `[printer] kinematics` value.
@@ -149,6 +158,7 @@ impl KinematicsKind {
             "corexz" => Self::CoreXz,
             "hybrid_corexy" => Self::HybridCoreXy,
             "hybrid_corexz" => Self::HybridCoreXz,
+            "polar" => Self::Polar,
             _ => return None,
         })
     }
@@ -161,14 +171,25 @@ impl KinematicsKind {
             Self::CoreXz => CartesianTransform::CoreXz,
             Self::HybridCoreXy => CartesianTransform::HybridCoreXy,
             Self::HybridCoreXz => CartesianTransform::HybridCoreXz,
+            // Polar has no rail→carriage transform: `connect` builds a
+            // `PolarKinematics` from `kind` and never reads this arm (the
+            // same way `none` never reads its `Standard`).
+            Self::Polar => CartesianTransform::Standard,
         }
     }
 
     /// The solver each rail's steppers run (`X`, `Y`, `Z` order).
+    ///
+    /// Only the cartesian family's rails are zipped with this —
+    /// `ToolHeadObject::new` installs `polar`'s per-stepper solvers (bed
+    /// angle, arm radius, cartesian Z) in its own branch before this is
+    /// consulted, and `none` has no rails.
     fn solvers(self) -> [(PositionFn, AxisFlags); 3] {
         let cart = |axis: Axis| (cartesian_position_fn(axis), cartesian_active_flags(axis));
         match self {
-            Self::None | Self::Cartesian => [cart(Axis::X), cart(Axis::Y), cart(Axis::Z)],
+            Self::None | Self::Polar | Self::Cartesian => {
+                [cart(Axis::X), cart(Axis::Y), cart(Axis::Z)]
+            }
             // CoreXY: both motors carry the X/Y coupling, so each moves when
             // either axis does (`corexy_stepper_alloc`).
             Self::CoreXy => [
@@ -219,15 +240,26 @@ pub struct ToolHeadObject {
     limits: MoveLimits,
     max_z_velocity: f64,
     max_z_accel: f64,
-    /// The cartesian rails, `[stepper_x]`, `[stepper_y]`, `[stepper_z]` (each
-    /// with its `…1`, `…2` siblings).
+    /// The rails: `[stepper_x, stepper_y, stepper_z]` for the cartesian
+    /// family, `[stepper_arm, stepper_z]` for polar (each with its `…1`,
+    /// `…2` siblings).
     ///
     /// Empty for `kinematics: none`, which has no steppers.
     rails: Vec<Arc<Rail>>,
-    /// Whether `[printer] kinematics` was `none`.
-    none: bool,
-    /// How the rails' positions map to carriage axes.
+    /// The bare `[stepper_bed]` stepper of a polar printer — it belongs to
+    /// no rail (`kinematics/polar.py:26` builds it standalone), but its
+    /// host solver must still be taken at connect like the rails'.
+    ///
+    /// `None` unless `kind` is [`KinematicsKind::Polar`].
+    bed: Option<Arc<PrinterStepper>>,
+    /// What `[printer] kinematics` named.
+    kind: KinematicsKind,
+    /// How the cartesian rails' positions map to carriage axes.
     transform: CartesianTransform,
+    /// `[printer] max_angular_velocity`: polar's near-center angular cap
+    /// (`0` = uncapped). Read only for polar, as upstream reads it only in
+    /// `PolarKinematics.__init__` (`kinematics/polar.py:51-52`).
+    max_angular_velocity: f64,
     /// The active extruder's name (`ACTIVATE_EXTRUDER`), for `M104` without `T`.
     active_extruder: Mutex<String>,
     /// The machine's clock, for seeding the print-time mapping.
@@ -266,7 +298,29 @@ impl ToolHeadObject {
                 KinematicsKind::NAMES.join(", ")
             ))
         })?;
-        let none = matches!(kind, KinematicsKind::None);
+
+        // `PolarKinematics.__init__` reads the angular cap; no other
+        // kinematics does (`kinematics/polar.py:51-52`), so a
+        // `max_angular_velocity` in a cartesian config stays unread and is
+        // rejected by `check_unused`, as upstream does. Upstream's default
+        // (0 = uncapped) is not bounds-checked, so an absent option is not
+        // either — only a present value must be above 0.
+        let max_angular_velocity = if kind == KinematicsKind::Polar {
+            if config.has("max_angular_velocity") {
+                config.get_float_bounded(
+                    "max_angular_velocity",
+                    None,
+                    None,
+                    None,
+                    Some(0.0),
+                    None,
+                )?
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
 
         let max_velocity =
             config.get_float_bounded("max_velocity", None, None, None, Some(0.0), None)?;
@@ -317,55 +371,92 @@ impl ToolHeadObject {
         };
 
         let mut rails = Vec::new();
-        if !none {
-            for (name, axis) in [
-                ("stepper_x", Axis::X),
-                ("stepper_y", Axis::Y),
-                ("stepper_z", Axis::Z),
-            ] {
-                rails.push(Rail::lookup(config, printer, name, axis)?);
-            }
-            // The owning kinematics installs each stepper's solver
-            // (`MCU_stepper.setup_itersolve`); the family decides the position
-            // function, so a corexy motor follows `x ± y`.
-            let solvers = kind.solvers();
-            for (rail, (position, flags)) in rails.iter().zip(solvers) {
-                for stepper in rail.steppers() {
-                    stepper.setup_itersolve(position, flags);
+        let mut bed = None;
+        match kind {
+            KinematicsKind::None => {}
+            KinematicsKind::Polar => {
+                // `kinematics/polar.py:25-31`: the arm is a rail
+                // (`LookupRail`), Z is a (multi) rail, and the bed is a bare
+                // stepper with no rail geometry of its own.
+                let arm = Rail::lookup(config, printer, "stepper_arm", Axis::X)?;
+                let z = Rail::lookup(config, printer, "stepper_z", Axis::Z)?;
+                // The owning kinematics installs each stepper's solver
+                // (`MCU_stepper.setup_itersolve`): arm radius and bed angle
+                // both follow X and Y (`kin_polar.c:46`), Z stays cartesian.
+                for stepper in arm.steppers() {
+                    stepper.setup_itersolve(polar_radius_position, polar_active_flags());
                 }
-            }
-            // A paired rail's endstop has to stop the other rail's motors too
-            // (`corexy.py:14-17` and friends).
-            for (target, source) in kind.endstop_pairs() {
-                let Some(endstop) = rails[*target].endstop().cloned() else {
-                    continue;
-                };
-                for stepper in rails[*source].steppers() {
-                    // Every endstop a rail can name drives a dispatch; the
-                    // default-`None` answer belongs to endstops that never
-                    // ride a rail.
-                    let dispatch = endstop.dispatch().ok_or_else(|| {
+                for stepper in z.steppers() {
+                    stepper.setup_itersolve(
+                        cartesian_position_fn(Axis::Z),
+                        cartesian_active_flags(Axis::Z),
+                    );
+                }
+                let bed_stepper = printer
+                    .lookup_object_as::<PrinterStepper>("stepper_bed")
+                    .ok_or_else(|| {
                         ConfigError::new(format!(
-                            "{}: a paired rail's endstop must drive a trigger dispatch",
+                            "Section '{}' needs a '[stepper_bed]' section",
                             config.identifier()
                         ))
                     })?;
-                    dispatch
-                        .add_stepper(
-                            stepper.mcu_stepper().chip().clone(),
-                            Arc::downgrade(stepper.mcu_stepper()),
-                            stepper.name(),
-                        )
-                        .map_err(|err| {
-                            ConfigError::new(format!("{}: {err}", config.identifier()))
-                        })?;
-                }
+                bed_stepper.setup_itersolve(polar_angle_position, polar_active_flags());
+                // The angle solver unwraps ±2π against `commanded_pos` and
+                // renormalizes after each range (`kin_polar.c`).
+                bed_stepper.setup_hooks(polar_angle_unwrap, polar_angle_normalize);
+                rails = vec![arm, z];
+                bed = Some(bed_stepper);
             }
-            // IDEX: the cartesian kinematics claims `[dual_carriage]` and
-            // hands the module this axis' primary rail
-            // (`kinematics/cartesian.py:24-34`).
-            if kind == KinematicsKind::Cartesian {
-                idex_modes::claim(&rails, printer);
+            _ => {
+                for (name, axis) in [
+                    ("stepper_x", Axis::X),
+                    ("stepper_y", Axis::Y),
+                    ("stepper_z", Axis::Z),
+                ] {
+                    rails.push(Rail::lookup(config, printer, name, axis)?);
+                }
+                // The owning kinematics installs each stepper's solver
+                // (`MCU_stepper.setup_itersolve`); the family decides the position
+                // function, so a corexy motor follows `x ± y`.
+                let solvers = kind.solvers();
+                for (rail, (position, flags)) in rails.iter().zip(solvers) {
+                    for stepper in rail.steppers() {
+                        stepper.setup_itersolve(position, flags);
+                    }
+                }
+                // A paired rail's endstop has to stop the other rail's motors too
+                // (`corexy.py:14-17` and friends).
+                for (target, source) in kind.endstop_pairs() {
+                    let Some(endstop) = rails[*target].endstop().cloned() else {
+                        continue;
+                    };
+                    for stepper in rails[*source].steppers() {
+                        // Every endstop a rail can name drives a dispatch; the
+                        // default-`None` answer belongs to endstops that never
+                        // ride a rail.
+                        let dispatch = endstop.dispatch().ok_or_else(|| {
+                            ConfigError::new(format!(
+                                "{}: a paired rail's endstop must drive a trigger dispatch",
+                                config.identifier()
+                            ))
+                        })?;
+                        dispatch
+                            .add_stepper(
+                                stepper.mcu_stepper().chip().clone(),
+                                Arc::downgrade(stepper.mcu_stepper()),
+                                stepper.name(),
+                            )
+                            .map_err(|err| {
+                                ConfigError::new(format!("{}: {err}", config.identifier()))
+                            })?;
+                    }
+                }
+                // IDEX: the cartesian kinematics claims `[dual_carriage]` and
+                // hands the module this axis' primary rail
+                // (`kinematics/cartesian.py:24-34`).
+                if kind == KinematicsKind::Cartesian {
+                    idex_modes::claim(&rails, printer);
+                }
             }
         }
 
@@ -388,8 +479,10 @@ impl ToolHeadObject {
             max_z_velocity,
             max_z_accel,
             rails,
-            none,
+            bed,
+            kind,
             transform: kind.transform(),
+            max_angular_velocity,
             active_extruder: Mutex::new("extruder".to_string()),
             reactor: printer.reactor(),
             printer: Arc::downgrade(printer),
@@ -438,12 +531,13 @@ impl ToolHeadObject {
         let home_handler: CommandHandler = {
             let state = Arc::clone(&self.state);
             let rails = self.rails.clone();
+            let kind = self.kind;
             let printer = Arc::downgrade(printer);
             Arc::new(move |gcmd: &GcodeCommand| {
                 let state = Arc::clone(&state);
                 let rails = rails.clone();
                 let printer = printer.clone();
-                Box::pin(async move { cmd_g28(&state, &rails, &printer, gcmd).await })
+                Box::pin(async move { cmd_g28(&state, &rails, kind, &printer, gcmd).await })
             })
         };
         gcode
@@ -466,10 +560,13 @@ impl ToolHeadObject {
     /// `z_positions` count against (`ZAdjustHelper.handle_connect` counts the
     /// toolhead's z-active steppers the same way).
     ///
-    /// Empty for `kinematics: none`, which has no rails.
+    /// Empty for `kinematics: none`, which has no rails, and for polar
+    /// (whose Z rail is found by name below — polar's rails are
+    /// `[stepper_arm, stepper_z]`, so a fixed index would be wrong).
     pub fn z_stepper_names(&self) -> Vec<String> {
         self.rails
-            .get(Z_AXIS)
+            .iter()
+            .find(|rail| rail.name() == "stepper_z")
             .map(|rail| {
                 rail.steppers()
                     .iter()
@@ -555,6 +652,16 @@ impl PrinterObject for ToolHeadObject {
                     );
                 }
             }
+            // Polar's bare bed stepper: it belongs to no rail, but its host
+            // solver drives it from the main trapq like the rails' — upstream
+            // lists it first (`kinematics/polar.py:31-34`).
+            if let Some(bed) = &self.bed {
+                let host = bed
+                    .take_stepper()
+                    .ok_or_else(|| config_error(format!("{} is not connected", bed.name())))?;
+                host_steppers.push(host);
+                mcu_steppers.insert(bed.name().to_string(), Arc::clone(bed.mcu_stepper()));
+            }
 
             // The primary MCU (the bare `[mcu]`) defines the print-time origin;
             // each stepper's compressor was already pointed at its own MCU's
@@ -571,27 +678,52 @@ impl PrinterObject for ToolHeadObject {
             for stepper in host_steppers {
                 toolhead.add_stepper(stepper);
             }
-            if self.none {
-                toolhead.set_kinematics(Box::new(NoneKinematics));
-            } else {
-                toolhead.set_kinematics(Box::new(CartesianKinematics::new(
-                    self.axis_names(),
-                    Coord::new(
-                        self.rails[X_AXIS].params().position_min,
-                        self.rails[Y_AXIS].params().position_min,
-                        self.rails[Z_AXIS].params().position_min,
-                        0.0,
-                    ),
-                    Coord::new(
-                        self.rails[X_AXIS].params().position_max,
-                        self.rails[Y_AXIS].params().position_max,
-                        self.rails[Z_AXIS].params().position_max,
-                        0.0,
-                    ),
-                    self.max_z_velocity,
-                    self.max_z_accel,
-                    self.transform,
-                )));
+            match self.kind {
+                KinematicsKind::None => toolhead.set_kinematics(Box::new(NoneKinematics)),
+                KinematicsKind::Polar => {
+                    // rails = [arm, z] (installed in `new`); ranges feed the
+                    // gated square and the Z limit, as upstream derives them
+                    // from `rails[0]`/`rails[1]` (`kinematics/polar.py:42-51`).
+                    let bed = self
+                        .bed
+                        .as_ref()
+                        .ok_or_else(|| config_error("stepper_bed is not connected".to_string()))?;
+                    let arm = &self.rails[0];
+                    let z = &self.rails[1];
+                    toolhead.set_kinematics(Box::new(PolarKinematics::new(
+                        [
+                            bed.name().to_string(),
+                            arm.name().to_string(),
+                            z.name().to_string(),
+                        ],
+                        (arm.params().position_min, arm.params().position_max),
+                        (z.params().position_min, z.params().position_max),
+                        self.limits,
+                        self.max_z_velocity,
+                        self.max_z_accel,
+                        self.max_angular_velocity,
+                    )));
+                }
+                _ => {
+                    toolhead.set_kinematics(Box::new(CartesianKinematics::new(
+                        self.axis_names(),
+                        Coord::new(
+                            self.rails[X_AXIS].params().position_min,
+                            self.rails[Y_AXIS].params().position_min,
+                            self.rails[Z_AXIS].params().position_min,
+                            0.0,
+                        ),
+                        Coord::new(
+                            self.rails[X_AXIS].params().position_max,
+                            self.rails[Y_AXIS].params().position_max,
+                            self.rails[Z_AXIS].params().position_max,
+                            0.0,
+                        ),
+                        self.max_z_velocity,
+                        self.max_z_accel,
+                        self.transform,
+                    )));
+                }
             }
 
             // The toolhead's print time is the primary MCU's.
@@ -1150,6 +1282,7 @@ fn move_distance(a: Coord, b: Coord) -> f64 {
 async fn home_axes(
     connected: &mut Connected,
     rails: &[Arc<Rail>],
+    kind: KinematicsKind,
     requested: &[usize],
     printer: &Weak<Printer>,
 ) -> Result<(), CommandError> {
@@ -1157,17 +1290,97 @@ async fn home_axes(
     if rails.is_empty() {
         return Ok(());
     }
+    if kind == KinematicsKind::Polar {
+        // `home` of `kinematics/polar.py:95-108`: X and Y always home
+        // **together** on the arm rail (`rails[0]`, Y pinned to 0 by
+        // [`polar_home_move`]) — whichever of them was requested — and Z
+        // homes on its own rail (`rails[1]`), after.
+        let home_xy = requested
+            .iter()
+            .any(|&axis| axis == X_AXIS || axis == Y_AXIS);
+        if home_xy {
+            let rail = &rails[0];
+            let endstop = rail.endstop().ok_or_else(|| {
+                CommandError::new(format!("No endstop configured for {}", rail.name()))
+            })?;
+            let params = rail.params();
+            let info = rail.homing_info();
+            let (forcepos, movepos) =
+                polar_home_move(X_AXIS, &info, params.position_min, params.position_max);
+            // Upstream marks every axis the force position sets as homed
+            // (`homing.py:178-184`): x **and** y — which is what opens
+            // `limit_xy2` before the drip move is checked.
+            let homing_axes = homing_axes_of(&forcepos);
+            send(printer, &KlippyEvent::HomingHomeRailsBegin);
+            let result = home_axis(
+                connected,
+                X_AXIS,
+                forcepos,
+                movepos,
+                &homing_axes,
+                info,
+                rail.step_dist(),
+                endstop.as_ref(),
+                printer,
+            )
+            .await;
+            send(
+                printer,
+                &KlippyEvent::HomingHomeRailsEnd {
+                    axes: homing_axes.clone(),
+                },
+            );
+            result?;
+        }
+        if requested.contains(&Z_AXIS) {
+            let rail = &rails[1];
+            let endstop = rail.endstop().ok_or_else(|| {
+                CommandError::new(format!("No endstop configured for {}", rail.name()))
+            })?;
+            let params = rail.params();
+            let info = rail.homing_info();
+            let (forcepos, movepos) =
+                polar_home_move(Z_AXIS, &info, params.position_min, params.position_max);
+            let homing_axes = homing_axes_of(&forcepos);
+            send(printer, &KlippyEvent::HomingHomeRailsBegin);
+            let result = home_axis(
+                connected,
+                Z_AXIS,
+                forcepos,
+                movepos,
+                &homing_axes,
+                info,
+                rail.step_dist(),
+                endstop.as_ref(),
+                printer,
+            )
+            .await;
+            send(
+                printer,
+                &KlippyEvent::HomingHomeRailsEnd {
+                    axes: homing_axes.clone(),
+                },
+            );
+            result?;
+        }
+        return Ok(());
+    }
     for &axis in requested {
         let rail = &rails[axis];
         let endstop = rail.endstop().ok_or_else(|| {
             CommandError::new(format!("No endstop configured for {}", rail.name()))
         })?;
+        let params = rail.params();
+        let info = rail.homing_info();
+        let (forcepos, movepos) = home_move(axis, &info, params.position_min, params.position_max);
         send(printer, &KlippyEvent::HomingHomeRailsBegin);
         let result = home_axis(
             connected,
             axis,
-            rail.homing_info(),
-            rail.params(),
+            forcepos,
+            movepos,
+            &[axis],
+            info,
             rail.step_dist(),
             endstop.as_ref(),
             printer,
@@ -1180,6 +1393,20 @@ async fn home_axes(
         result?;
     }
     Ok(())
+}
+
+/// The axes a homing force position marks as homed: every axis whose
+/// `forcepos` entry is set (`Homing._set_start_position`,
+/// `klippy/extras/homing.py:178-184`). For polar's arm home that is x **and**
+/// y — both must be marked to open `limit_xy2`.
+fn homing_axes_of(forcepos: &HomeCoord) -> Vec<usize> {
+    forcepos
+        .iter()
+        .take(Z_AXIS + 1)
+        .enumerate()
+        .filter(|(_, value)| value.is_some())
+        .map(|(axis, _)| axis)
+        .collect()
 }
 
 /// Fire a printer event, when the machine is still there.
@@ -1196,19 +1423,21 @@ fn send(printer: &Weak<Printer>, event: &KlippyEvent) {
 async fn home_axis(
     connected: &mut Connected,
     axis: usize,
+    forcepos: HomeCoord,
+    movepos: HomeCoord,
+    homing_axes: &[usize],
     info: HomingInfo,
-    params: RailParams,
     step_dist: f64,
     endstop: &dyn HomingEndstop,
     printer: &Weak<Printer>,
 ) -> Result<(), CommandError> {
-    // Start 1.5 axis-lengths past the far end so the move always approaches the
-    // endstop from the correct side.
-    let (forcepos, movepos) = home_move(axis, &info, params.position_min, params.position_max);
+    // The caller computed the endpoints: `home_move`'s 1.5× overshoot for
+    // the cartesian family, `polar_home_move`'s 1.0× push (and Y pin) for
+    // polar. `homing_axes` is which axes the force position marks homed.
     let current = connected.toolhead.commanded_pos();
     let force = fill_coord(forcepos, current);
     let home = fill_coord(movepos, current);
-    connected.toolhead.set_position(force, &[axis]);
+    connected.toolhead.set_position(force, homing_axes);
 
     // Poll the endstop about once per step so a trigger is seen promptly.
     let move_t = move_distance(force, home) / info.speed;
@@ -1262,7 +1491,7 @@ async fn home_axis(
     endstop.home_wait(end).await.map_err(command_error)?;
     send(printer, &KlippyEvent::HomingHomingMoveEnd);
     // The axis is now known at its endstop position.
-    connected.toolhead.set_position(home, &[axis]);
+    connected.toolhead.set_position(home, homing_axes);
     connected.toolhead.wipe_trapq();
     Ok(())
 }
@@ -1546,6 +1775,7 @@ fn axis_indices(names: &str) -> Vec<usize> {
 async fn cmd_g28(
     state: &Arc<Mutex<Option<Connected>>>,
     rails: &[Arc<Rail>],
+    kind: KinematicsKind,
     printer: &Weak<Printer>,
     gcmd: &GcodeCommand,
 ) -> Result<(), CommandError> {
@@ -1573,7 +1803,7 @@ async fn cmd_g28(
         };
         connected
     };
-    let result = home_axes(&mut connected, rails, &requested, printer).await;
+    let result = home_axes(&mut connected, rails, kind, &requested, printer).await;
     *state.lock().unwrap_or_else(|poison| poison.into_inner()) = Some(connected);
     result
 }
@@ -1831,8 +2061,10 @@ mod tests {
             max_z_velocity: 15.0,
             max_z_accel: 100.0,
             rails: Vec::new(),
-            none: false,
+            bed: None,
+            kind: KinematicsKind::Cartesian,
             transform: CartesianTransform::Standard,
+            max_angular_velocity: 0.0,
             active_extruder: Mutex::new("extruder".to_string()),
             reactor: printer.reactor(),
             printer: Arc::downgrade(&printer),
@@ -2004,11 +2236,15 @@ mod tests {
         let completion = Completion::new();
         completion.complete(crate::core::klippy::cmd::trsync::TriggerReason::EndstopHit);
         let endstop = FakeEndstop { completion };
+        use crate::core::klippy::extras::stepper::RailParams;
         let params = RailParams {
             position_min: 0.0,
             position_max: 200.0,
             position_endstop: 0.0,
         };
+        let info = test_homing_info();
+        let (forcepos, movepos) =
+            home_move(X_AXIS, &info, params.position_min, params.position_max);
         let printer = Arc::new(Printer::new(
             crate::core::klippy::reactor::ManualReactor::shared(),
         ));
@@ -2017,8 +2253,10 @@ mod tests {
         home_axis(
             &mut connected,
             X_AXIS,
-            test_homing_info(),
-            params,
+            forcepos,
+            movepos,
+            &[X_AXIS],
+            info,
             1.0,
             &endstop,
             &printer,

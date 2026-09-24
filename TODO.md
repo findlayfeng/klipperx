@@ -21,7 +21,6 @@
 3. 数字与状态的纪律沿用 AGENTS 硬要求：本节不重复，见仓库根 `AGENTS.md`；现行失败统计以本文件
    「当前失败原因统计」与 `regression-tests.md` 为唯一来源（快照归档不更新）。
 
-
 ## 已定
 
 - **一台机器，单实现**：`Printer` 是一个结构体（无 trait、无工厂），一个进程只跑一个；机器
@@ -145,8 +144,6 @@ H1–H12 是上游 extras 里按域归并的消费者（2026-09-21 全量盘点�
       `queue_step`，用 `TestDevice` 覆盖一次加压（及 `ResetRequired` 路径）；`--task comm` 同理。
       目前只测了段计算、引脚解析与命令编码。
 
-
-
 ### G1b gcode 调度器与上游的行为差异（框架部分 FW4）
 
 **为什么单列一条**：G1 的骨架（命令表 / `run_script` / 输出处理器 / 内置命令 / mux）已按
@@ -204,7 +201,6 @@ toolhead / 开放事件）一起补，一部分是现在就独立可补的小行
 （见文末索引），SPI/I2C 总线（F6/F7）也已落地（细节已归档），剩下的缺口是 endstop/trsync（F8，另有
 一条测试侧待办）与其余固件资源（F9）；`MCU_bus_digital_out`（F3）能力已具备，不另做包装。
 
-
 #### F6 SPI 总线
 
 上游 `MCU_SPI`（`klippy/extras/bus.py:42-155`）：
@@ -221,14 +217,12 @@ toolhead / 开放事件）一起补，一部分是现在就独立可补的小行
 与软件 bit-bang 两条路都读出 JEDEC ID `ef 30 13`、状态寄存器 `0x00` 与地址 0x00 的
 数据。
 
-
 #### F8 endstop / trsync（与 C1 共享，框架 FW6a–FW6e 已落地）
 
 - [ ] **FW6a-2** 测试侧加**响应器式假 MCU**（可多实例），并补 `ToolHeadObject::connect` 的
       两 MCU 端到端测试。（挪到 FW6c 一起做；时钟偏移已有 `McuChip` 单测）
 
 ##### F8b `Mcu` ↔ 资源的强引用环（阻塞回归）
-
 
 #### F9 其他输入与外设资源
 
@@ -244,7 +238,6 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 - 这些是 extras，不阻塞运动；等 F1–F6 完成、真有对应 section 时再逐个接。消费者见
       H5（TMC/tmcuart）、H6（sensor_bulk/加速度计）、H7（buttons/pulse_counter/trigger_analog）、
       H8（lcd）。
-
 
 ### C1 运动层收尾
 
@@ -276,9 +269,6 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
       `--debuginput`/`--debugoutput` 的命令行解析（`StartArgs::collect` 里仍是 `None`）与
       每个 MCU 的字典路径。`software_version` 已由宿主 `set_start_args` 注入
       （`src/klippy.rs:324`）并被 `info` 与 `M115` 读取——接线已完成并归档。
-
-
-
 
 ### E2 `python_path` 的取消（**远期，依赖外部项目**）
 
@@ -317,11 +307,6 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 几乎不变就是例子），各组收益不可加。进度以**转绿运行数 / `IGNORED` 条目数**衡量（当前 3 / 34）。**验收标准
 是「对应 `.test` 从 `IGNORED` 移除后通过」**，不是「某个错误不再出现」。详见
 [失败原因分析复盘](docs/work-log/2026-09-22-upstream-regression-failures.md#复盘计数口径与重排后补)。
-
-**阶段 0（都不依赖 C1）**：
-
-
-
 
 **当前失败原因统计**（`KLIPPERX_UPSTREAM_ALL=1` 实跑，2026-09-23：**181 次失败**、56 次通过、
 2 条因未构建 `pru` 字典不计，合计 239；下表为**选项名大小写修复后**的分布——49 次

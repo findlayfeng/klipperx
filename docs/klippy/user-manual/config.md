@@ -387,7 +387,7 @@ SPI_TRANSFER DEVICE=flash DATA=9f000000    ; W25 flash JEDEC ID → ef 30 13
 
 | 参数 | 类型 | 必需 | 默认值 | 说明 |
 |------|------|------|--------|------|
-| `kinematics` | 字符串 | 是 | — | `none` / `cartesian` / `corexy` / `corexz` / `hybrid_corexy` / `hybrid_corexz`（delta 族与 `generic_cartesian` 待做） |
+| `kinematics` | 字符串 | 是 | — | `none` / `cartesian` / `corexy` / `corexz` / `hybrid_corexy` / `hybrid_corexz` / `polar` / `delta`（`rotary_delta`/`deltesian`/`winch`/`generic_cartesian` 待做） |
 | `max_velocity` | 浮点 (mm/s) | 是 | — | `> 0` |
 | `max_accel` | 浮点 (mm/s²) | 是 | — | `> 0` |
 | `minimum_cruise_ratio` | 浮点 (0..1) | 否 | `0.5` | 巡航段占比下限（上游同名选项） |
@@ -818,4 +818,6 @@ cartesian 在 late 阶段认领；注册 `dual_carriage` 对象与 `SET_DUAL_CAR
 | 采样组（`samples`/`sample_retract_dist`/`samples_tolerance`/`lift_speed`…） | 由 probe/`ProbePointsHelper` 读取 |
 
 段与对象已落地（2026-09-24 批 #3，`eddy.test` 转绿）；**同名 section 按上游 `strict=False` 后写覆盖合并**（本仓自 2026-09-24 起，eddy.cfg 双段即其用例）。静态标定与 `PROBE_EDDY_CURRENT_CALIBRATE`/`Z_OFFSET_APPLY_PROBE` 未实现（模块残差注记）。
+
+> 配置解析补充（批 #5）：除同名 section 合并外，`#*# SAVE_CONFIG` 自动保存块按上游 `_find_autosave_data` **读取合并**（header 逐字节识别、`#*# ` 前缀剥离、正文优先/块只补新、损坏行告警）——语料 `delta_calibrate.cfg` 的双段与高度数据即其用例（回写侧 `SAVE_CONFIG` 命令未做）。
 

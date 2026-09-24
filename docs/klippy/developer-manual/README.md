@@ -298,6 +298,7 @@ identify 的命令**定义**（名称、参数、解码）与其它命令一样�
 | `servo.rs` | `[servo <name>]` 舵机段（脉宽几何全选项）+ `SET_SERVO`（mux 键 `SERVO=`，`servo.py`）；无打印时序排程（同 pwm_tool 口径） |
 | `idex_modes.rs` | `[dual_carriage]` 段（late/order=55）：`axis`/`safe_distance` + 第二滑架 stepper + `dual_carriage` 对象 + `SET_DUAL_CARRIAGE`/`SAVE_…_STATE`/`RESTORE_…_STATE`（`idex_modes.py`，cartesian 认领接缝在 toolhead 3 行）；转绿前置=U-A7b；步进不驱动（C1） |
 | `probe_eddy_current.rs` | eddy 探针对象（约1600行，`[probe_eddy_current <名>]` 工厂，批 #3）：`load_config_prefix` + `PROBE`/`QUERY_PROBE`/`PROBE_ACCURACY` 复用 + `PROBE_EDDY_CURRENT_TAP_CALIBRATE` tap 标定 + 采样点/虚拟端停接 `McuTriggerAnalog`（样本流=ldc1612+bulk_sensor）；静态标定与 `Z_OFFSET_APPLY_PROBE` 未实现（残差注记显式报错），tap 分析依赖 `mcu_to_commanded_position`（fileoutput 路径同上游走哑数据） |
+| `delta_calibrate.rs` | `[delta_calibrate]` 与 `DELTA_CALIBRATE`/`DELTA_ANALYZE`：测量几何 + coordinate descent 拟合（`delta_calibrate.py`，批 #5）；`manual_probe` 消费、SAVE_CONFIG 待写行 |
 | `board_pins.rs` | `[board_pins]` / `[board_pins <name>]`：读 `mcu` 列表与 `aliases` / `aliases_*`（`名=引脚`，值写成 `<...>` 则保留），调用 `PrinterPins::alias_pin` / `reserve_pin`。对象不可查询 |
 | `static_digital_output.rs` | `[static_digital_output <name>]`：读 `pins`（引脚列表），一次全部拉到固定电平（上游同名节）；`order = 35` 排在 `board_pins` 后，别名可用 |
 | `stepper.rs` | `[stepper_x]` / `[stepper_y]` / `[stepper_z]`（`phase = late`，order 50：`endstop_pin` 为虚拟端停时，`position_endstop` 取端停提供的位置——`PinChip::virtual_endstop_position`，上游 `MCU_endstop.get_position_endstop`，探针返回 `z_offset`；`endstop_pin` 可能指向别的段注册的 chip，见 [声明式表生成](codegen.md)）：一个电机在一根轴上。读 `step_pin` / `dir_pin` / `rotation_distance` / `microsteps` / `full_steps_per_rotation` / `gear_ratio` / `step_pulse_duration` 与行程（`position_min` / `position_max` / `position_endstop` / `endstop_pin` / `homing_*`），建 MCU 侧 stepper 资源与 rail |
@@ -324,7 +325,7 @@ identify 的命令**定义**（名称、参数、解码）与其它命令一样�
 | `bus_debug.rs` | `i2c_device` / `spi_device` 共用的调试命令底座：同步→异步桥与 `DATA=` 的十六进制编解码（无配置节） |
 | `error_mcu.rs` | MCU 停机消息的展开（无配置节，第一个 `[mcu]` 拉起）：监听 `klippy:shutdown` / `klippy:analyze_shutdown`，把简短原因扩成原因+提示（上游 `extras/error_mcu.py`） |
 
-`extras/` 的 53 个模块（52 `pub mod` + `pub(crate) bus_debug`）全部在 `extras/mod.rs` 声明；其中 40 个文件注册了 48 个 `section!`（含 `printer`，声明在 `toolhead.rs`；`mcu` 声明在 `mcu/mod.rs`，共 49 个装载 id）构成工厂表；`heaters` / `gcode_move` / `query_endstops` / `error_mcu` / `bus_debug` 等非节模块由上述模块按需 `ensure`，不占配置节。
+`extras/` 的 54 个模块（53 `pub mod` + `pub(crate) bus_debug`）全部在 `extras/mod.rs` 声明；其中 41 个文件注册了 54 个 `section!`（含 `printer`，声明在 `toolhead.rs`；`mcu` 声明在 `mcu/mod.rs`，共 55 个装载 id）构成工厂表；`heaters` / `gcode_move` / `query_endstops` / `error_mcu` / `bus_debug` 等非节模块由上述模块按需 `ensure`，不占配置节。
 
 ### `api/` — 客户端 API 层
 

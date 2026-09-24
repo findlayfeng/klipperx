@@ -309,6 +309,8 @@ git config core.hooksPath .githooks
 | `interface/devices/simulator.rs`（M5d 策略 b） | `trigger_analog_sample_activity_pushes_the_monitor_deadline`：活动顺延 + 非活动不顺延双向断言 |
 | `mathutil.rs`（M5d 校准数学） | `gaussian_solve_recovers_known_values`、`gaussian_solve_refuses_a_singular_system`、`solve_linear_equations_fits_a_quadratic_and_substitutes_back`、`mat_mul_transp_matches_the_reference_product`（4 测；另修 `mat_mul_transp` 参照积笔误 a·aᵀ） |
 | `template.rs` + `gcode_macro.rs`（批 #4 引擎） | 模板子集逐构 7、宏体渲染→gcode 派发 e2e/递归检测/`SET_GCODE_VARIABLE` 4、排除区 E 补偿 2、`get_status.extruder`/idex 帧交接 1（共 14 测） |
+| `motion/kinematics.rs`（polar）+ `extras/stepper.rs`（两轨段）+ `toolhead.rs` polar 分支（批 #5，17 测） | 已知构型正/逆回代、±π 解卷与单次移位边界、`check_move` 门与中心减速、两轨段认领与选项矩阵、G28 联合回零（XY 后 Z）、`Error loading kinematics` 文案 |
+| `motion/delta.rs` + `extras/delta_calibrate.rs` + delta 段/工具头分支（批 #5，24 测） | 三角测量已知构型回代、同步 home、三塔段认领（无 position_max、b/c 继承 a 的 endstop）、SAVE_CONFIG 块解析（header 逐字节/剥前缀/正文优先/无块零变化）、假 MCU 多端停 per-oid 多槽（同 arm 同触发/单端停回归/按 oid 摘除）、弧度 gear_ratio 推断 |
 | `bulk_sensor.rs` | 51 字节/4 = 12 样本每块与固件消息尺寸一致；时钟回归一次 update 斜率精确恢复采样率并外推；切片与时间戳公式；16 位序号回绕与符号扩展；`apply_status` 跨回绕计数与 msg_count→chip 映射；超长 query 时长滤波只跳样本不污染时钟；批循环首客户端启动恰好一次、末客户端注销停循环（start_paused 异步） |
 | `ldc1612.rs` | `sensor_div`/`freq_conv` 换算（含 raw↔Hz 往返）；`convert_samples` 各错误分支（固件编码错误丢样、under-range/watchdog 保留）与计数；`reg_drive_current` 提取含高位掩蔽；attach 钩子 init 命令绑定 M5a trigger_analog oid；`dump_ldc1612` 端点注册不重名、按 sensor 路由与客户端注销 |
 | `manual_probe.rs` | 二分插入点（`bisect_left`）、空闲状态形状；交互路径（`TESTZ` 移动、`ACCEPT` 校验、`ABORT` 收尾、命令注销）由上游语料端到端覆盖 |

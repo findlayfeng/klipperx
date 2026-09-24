@@ -1275,6 +1275,10 @@ pub(crate) fn load_config(
     // the toolhead (`toolhead.py:610-613`), and `gcode_move` is the first of
     // them: it is what turns g-code coordinates into the toolhead's.
     crate::core::klippy::extras::gcode_move::ensure(printer)?;
+    // `manual_probe` is on the same upstream list (`toolhead.py:293`), which is
+    // why `PROBE_CALIBRATE` works on a config that never writes
+    // `[manual_probe]`: the object is always there.
+    crate::core::klippy::extras::manual_probe::ensure(printer, config)?;
     Ok(Arc::new(object))
 }
 

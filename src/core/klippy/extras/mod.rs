@@ -39,4 +39,5 @@ pub mod temperature_combined;
 pub mod temperature_mcu;
 pub mod temperature_sensor;
 pub mod toolhead;
+pub mod trigger_analog;
 pub mod z_tilt;

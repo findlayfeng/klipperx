@@ -188,8 +188,8 @@ connect_file(输出文件, 字典):
 | 判定 | 次数 | 原因 |
 |------|------|------|
 | 因字典未构建跳过 | 2 | `printers.test` 中引用 `pru` 的两条运行（默认不编 `pru`） |
-| 因忽略列表跳过 | 218 | 尚未落地的配置节/运动学（18 个 `.test` 文件） |
-| 实际执行 | **19** | `linuxtest.test`（T1）、`commands.test`、`out_of_bounds.test`（b39750f）、`bed_mesh.test`、`z_virtual_endstop.test`（探针链路单元）、`z_tilt.test`、`quad_gantry_level.test`（H9 调平族）、`bltouch.test`、`smart_effector.test`（H9 探针族）、`multi_z.test`（M7 发送队列水位）、`screws_tilt_adjust.test`（M4 探测语义与亚纳米守卫）、`gcode_arcs.test`、`bed_screws.test`、`pwm.test`、`temperature.test`、`macros.test`（集成批 #1 段落地）、`led.test`、`sdcard_loop.test`、`pressure_advance.test`（集成批 #2 段落地），**全部通过** |
+| 因忽略列表跳过 | 215 | 尚未落地的配置节/运动学（15 个 `.test` 文件） |
+| 实际执行 | **22** | `linuxtest.test`（T1）、`commands.test`、`out_of_bounds.test`（b39750f）、`bed_mesh.test`、`z_virtual_endstop.test`（探针链路单元）、`z_tilt.test`、`quad_gantry_level.test`（H9 调平族）、`bltouch.test`、`smart_effector.test`（H9 探针族）、`multi_z.test`（M7 发送队列水位）、`screws_tilt_adjust.test`（M4 探测语义与亚纳米守卫）、`gcode_arcs.test`、`bed_screws.test`、`pwm.test`、`temperature.test`、`macros.test`（集成批 #1 段落地）、`led.test`、`sdcard_loop.test`、`pressure_advance.test`（集成批 #2 段落地）、`eddy.test`（批 #3，M5 收官）、`dual_carriage.test`、`exclude_object.test`（批 #4 宏体渲染），**全部通过** |
 
 上游 `configparser` 的 `optionxform = str.lower` 已对齐（`mod.rs` 存储侧小写 + `section.rs` 查询侧小写），`Option 'pid_Kp' … must be specified` 类的 49 次回归失败已归零；`must be specified` 错误文案保留调用方传入的大小写，`is not valid` 与 `Section '…' is not valid` 使用存储侧小写。
 
@@ -199,7 +199,7 @@ M3 `smart_effector` 落地后，仅剩 `eddy.test`——`probe_eddy_current` 属
 - 头两个转绿的用例：`linuxtest.test`（只需 `kinematics: none`、`heaters` 的传感器注册表、
   `temperature_sensor` 与 `ds18b20`，g-code 只是一次 `G4 P1000`）；随后 `gcode_move`（G4-1）与
   `EXTRUDER` 默认项（e8bf2b7）让 `commands.test` 与 `out_of_bounds.test` 也过了守卫，移出忽略列表。
-- `KLIPPERX_UPSTREAM_ALL=1` 只去掉忽略列表这一层：默认构建下它会跑 237 条可用运行，其中 **70 条通过、167 条失败**（2026-09-24 实跑，集成批 #2 合入后），另外 2 条以「字典未构建」计入统计，不算失败。失败大多
+- `KLIPPERX_UPSTREAM_ALL=1` 只去掉忽略列表这一层：默认构建下它会跑 237 条可用运行，其中 **73 条通过、164 条失败**（2026-09-24 实跑，集成批 #3+#4 合入后），另外 2 条以「字典未构建」计入统计，不算失败。失败大多
   在配置装载阶段，个别在 g-code / 就绪阶段（`Move out of range`、`not ready: Pin …`）。失败原因的
   逐项分布记在 [上游回归测试失败原因分析](../../work-log/2026-09-22-upstream-regression-failures.md)
   的最新快照与 `TODO.md` 的 T 节，本页不重复维护。
@@ -217,9 +217,9 @@ M3 `smart_effector` 落地后，仅剩 `eddy.test`——`probe_eddy_current` 属
 - 上面按「**首次失败原因**」的分组只用于**定位**，不是工作队列：`load_config` 遇到第一个未知
   section 就停，修好一个缺口只会让运行前进到下一个缺口，总数可能不变（T7 后的 234 就是例子），
   各组收益不可加。
-- 进度以**转绿运行数 / `IGNORED` 条目数**衡量（当前 19 / 18）；先产出「**运行 × 缺口**」矩阵
+- 进度以**转绿运行数 / `IGNORED` 条目数**衡量（当前 22 / 15）；先产出「**运行 × 缺口**」矩阵
   （列出每条运行的**全部**缺口，而非第一个），据此找「只差一个缺口」的用例与公共前缀。
-- **验收标准**：对应 `.test` 从 `IGNORED` 移除后通过。`ignored_cases_still_fail` 是守卫（opt-in 亦点名「能装载但 g-code 未绿」的候选：当前已知态 = `dual_carriage.test` + `exclude_object.test`，前置=宏体渲染单元 U-A7b，落地即清零）——
+- **验收标准**：对应 `.test` 从 `IGNORED` 移除后通过。`ignored_cases_still_fail` 是守卫（opt-in 亦点名「能装载但 g-code 未绿」的候选；历史上曾有 `dual_carriage.test`+`exclude_object.test` 两点名，已随 U-A7b 宏体渲染于 2026-09-24 清零，现 0 点名）——
   某个忽略文件的全部可跑运行都通过时报失败并提示移除。
 - 看全部缺口（而不只是首次失败）：
   `cargo test -p klipperx --lib upstream_gap_report -- --nocapture`。
@@ -282,9 +282,9 @@ harness 把每个 `[mcu]` / `[mcu <name>]` 的传输键换成 `test: dict=<字�
 `KLIPPERX_UPSTREAM_ALL=1` **只作用于这张列表**：它让字典齐备的运行无视忽略判定并报出失败，
 **不会**让因字典未构建而跳过的运行跑起来（那是构建阶段的事，见上一节）。
 
-当前 18 条（`linuxtest.test` 已在 T1 转绿；`commands.test`、`out_of_bounds.test` 随 `gcode_move`
+当前 15 条（`linuxtest.test` 已在 T1 转绿；`commands.test`、`out_of_bounds.test` 随 `gcode_move`
 与 `EXTRUDER` 默认项在 b39750f 转绿；`bed_mesh.test`、`z_virtual_endstop.test` 在探针链路单元转绿；
-`z_tilt.test`、`quad_gantry_level.test` 在 H9 调平族转绿；`bltouch.test`、`smart_effector.test` 在 H9 探针族转绿；`multi_z.test` 在 M7 发送队列水位修复后转绿（2026-09-24）；`screws_tilt_adjust.test` 在 M4 探测语义修复后转绿（2026-09-24）；`gcode_arcs.test`、`bed_screws.test`、`pwm.test`、`temperature.test`、`macros.test` 在集成批 #1 段落地后转绿（2026-09-24）；`led.test`、`sdcard_loop.test`、`pressure_advance.test` 在集成批 #2 段落地后转绿（2026-09-24）；其余文件仍因缺节留在列表里）。
+`z_tilt.test`、`quad_gantry_level.test` 在 H9 调平族转绿；`bltouch.test`、`smart_effector.test` 在 H9 探针族转绿；`multi_z.test` 在 M7 发送队列水位修复后转绿（2026-09-24）；`screws_tilt_adjust.test` 在 M4 探测语义修复后转绿（2026-09-24）；`gcode_arcs.test`、`bed_screws.test`、`pwm.test`、`temperature.test`、`macros.test` 在集成批 #1 段落地后转绿（2026-09-24）；`led.test`、`sdcard_loop.test`、`pressure_advance.test` 在集成批 #2 段落地后转绿（2026-09-24）；`eddy.test` 在集成批 #3（M5 收官）转绿（2026-09-24）、`dual_carriage.test` 与 `exclude_object.test` 在集成批 #4（宏体渲染）转绿（2026-09-24）；其余文件仍因缺节留在列表里）。
 
 `multi_z.test` 已转绿并移出忽略列表（2026-09-24）：首因是同步 `Mcu::send` 的 `try_send` 被异步生产者
 灌满报 `no available capacity`（插桩定位到 `endstop_home` 武装撞上瞬时满载），修复为 `send_payload`

@@ -676,3 +676,17 @@ pins: !PD0, PD1, PD2
 的 `probe_accel`/`recovery_time` 在探针移动时的往返钩子（上游 `probe_prepare/finish`）尚未接线
 （语料不触发，见 developer-manual 的缺口说明）。
 
+### [screws_tilt_adjust]
+
+探针依次测每个调平螺丝上方的床面高度，`SCREWS_TILT_CALCULATE` 据此输出每颗螺丝该拧多少、往哪拧（时钟记法）。
+
+| 选项 | 默认 | 说明 |
+|------|------|------|
+| `screw1` … `screw99` | — | 每项两个浮点（X Y）；**数到第一个缺失编号即停**，少于 3 颗拒绝装载（`Need at least 3 probe points for screws_tilt_adjust`，上游文案） |
+| `screwN_name` | `screw at %.3f,%.3f` | 报告行中的螺丝名 |
+| `screw_thread` | `CW-M3` | 螺距/旋向选择表：`CW-M3` `CCW-M3` `CW-M4` `CCW-M4` `CW-M5` `CCW-M5` `CW-M6` `CCW-M6`（8 项，表外值报错） |
+| `points` | 全部螺丝坐标 | 探测点（`ProbePointsHelper`，缺省即螺丝位置） |
+| `horizontal_move_z` / `speed` | `5.` / `50.` | 采样间抬升高度 / 移动速度（同上） |
+
+命令参数（`MAX_DEVIATION`、`DIRECTION`）、输出格式与状态形状见命令参考的 `SCREWS_TILT_CALCULATE` 条目。`get_status` 暴露三键：`error`、`max_deviation`、`results`（按 `screwN` 分键）。
+

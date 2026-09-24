@@ -405,7 +405,6 @@ mod tests {
     /// the list stays honest rather than hiding regressions.
     const IGNORED: &[&str] = &[
         "bed_screws.test",
-        "bltouch.test",
         "corexyuv.test",
         "delta.test",
         "delta_calibrate.test",

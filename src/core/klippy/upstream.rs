@@ -412,7 +412,6 @@ mod tests {
         "eddy.test",
         "exclude_object.test",
         "extruders.test",
-        "gcode_arcs.test",
         "generic_cartesian.test",
         "generic_cartesian_iqex.test",
         "generic_cartesian_itex.test",

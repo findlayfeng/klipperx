@@ -348,6 +348,7 @@ mod tests {
                 // `bltouch` before `board_pins` (`l` < `o`).
                 "bltouch",
                 "board_pins",
+                "gcode_arcs",
                 "manual_probe",
                 "probe",
                 "quad_gantry_level",

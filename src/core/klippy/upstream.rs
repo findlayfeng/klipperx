@@ -957,9 +957,14 @@ fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-/// The upstream Klipper submodule.
+/// The klipper checkout the corpus is read from.
+///
+/// [`klipperx_test_support::klipper_dir`] resolves it once for the whole
+/// test-support crate (and `build.rs`), including the `KLIPPERX_KLIPPER_DIR`
+/// override that lets a git worktree point at the main checkout instead of
+/// carrying its own copy of the submodule.
 fn klipper_dir() -> PathBuf {
-    repo_root().join("third_party/klipper")
+    klipperx_test_support::klipper_dir()
 }
 
 /// Upstream's `<klipper>/test/klippy` — the `.test` cases and their configs.

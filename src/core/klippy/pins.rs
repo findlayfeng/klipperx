@@ -57,12 +57,14 @@
 //! `[board_pins]` (the section that calls [`PrinterPins::alias_pin`] and
 //! [`PrinterPins::reserve_pin`]) is `extras/board_pins.rs`.
 
+use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde_json::{json, Value};
 
+use crate::core::klippy::extras::toolhead::HomingEndstop;
 use crate::core::klippy::mcu::{Mcu, McuEndstop, McuError, McuStepper};
 use crate::core::klippy::printer::PrinterObject;
 
@@ -254,7 +256,7 @@ pub trait Adc: Send + Sync {
 /// `MCU_pwm`, `MCU_adc` or `MCU_endstop` (`klippy/mcu.py:1111-1116`). Here the
 /// dispatch is one method per resource kind, added with the kinds; only
 /// `digital_out` exists so far.
-pub trait PinChip: Send + Sync {
+pub trait PinChip: Send + Sync + Any {
     /// Build the digital output for an already-validated pin.
     ///
     /// # Errors
@@ -326,6 +328,22 @@ pub trait PinChip: Send + Sync {
         Err(PinError::Unsupported("endstop".to_string()))
     }
 
+    /// The endstop as the homing driver's trait object — what
+    /// [`PrinterPins::setup_endstop`] returns.
+    ///
+    /// [`PinChip::setup_endstop`] stays the concrete MCU form for chips that
+    /// build one; a virtual probe chip whose endstop is not a pin `McuEndstop`
+    /// (the eddy probe's `McuTriggerAnalog`) overrides *this* method instead,
+    /// so the MCU chip's impl and its callers keep their concrete type. The
+    /// default wraps the concrete result.
+    ///
+    /// # Errors
+    /// Returns a [`PinError`] if the chip cannot build the resource.
+    fn setup_endstop_dyn(&self, params: &PinParams) -> Result<Arc<dyn HomingEndstop>, PinError> {
+        let endstop = self.setup_endstop(params)?;
+        Ok(endstop)
+    }
+
     /// The `position_endstop` this endstop stands for, when it is a virtual one
     /// (upstream's `MCU_endstop.get_position_endstop`: the probe wrapper returns
     /// its `z_offset`, and `PrinterRail` prefers it over the config option).
@@ -334,6 +352,13 @@ pub trait PinChip: Send + Sync {
     fn virtual_endstop_position(&self, _params: &PinParams) -> Option<f64> {
         None
     }
+}
+
+/// The stable identity of an endstop allocation, as [`PinsState::virtual_positions`]
+/// sees it: the data address behind the trait object, which the same `Arc`
+/// (and every clone sharing its allocation) reproduces.
+fn address_key(endstop: &Arc<dyn HomingEndstop>) -> usize {
+    Arc::as_ptr(endstop).cast::<()>() as usize
 }
 
 /// A pin description or pin-sharing mistake.
@@ -637,9 +662,17 @@ struct PinsState {
     active_pins: HashMap<String, PinParams>,
     /// Pins that may be used by more than one owner, keyed `chip:pin`.
     allow_multi_use: HashSet<String>,
-    /// `position_endstop` values a virtual endstop supplies, keyed
-    /// `(chip, oid)` (`MCU_endstop.get_position_endstop`).
-    virtual_positions: HashMap<(String, u8), f64>,
+    /// `position_endstop` values a virtual endstop supplies, keyed by the
+    /// address of the returned endstop allocation (`MCU_endstop
+    /// .get_position_endstop`).
+    ///
+    /// The key is the `Arc`'s data address: the endstop objects are built once
+    /// while the config loads and live in the rails that hold them for the
+    /// whole run, so an entry is read back through the very `Arc` that created
+    /// it and is never stale; the table grows by at most one row per configured
+    /// virtual endstop (same lifecycle as the previous `(chip, oid)` key —
+    /// entries are never removed).
+    virtual_positions: HashMap<usize, f64>,
 }
 
 /// The `pins` printer object: the pin vocabulary shared by every MCU.
@@ -1098,20 +1131,65 @@ impl PrinterPins {
         let chip = self.chip(&params.chip_name)?;
         let endstop = chip.setup_endstop(&params)?;
         if let Some(position) = chip.virtual_endstop_position(&params) {
+            let as_dyn: Arc<dyn HomingEndstop> = endstop.clone();
             self.lock()
                 .virtual_positions
-                .insert((params.chip_name.clone(), endstop.oid()), position);
+                .insert(address_key(&as_dyn), position);
+        }
+        Ok(endstop)
+    }
+
+    /// The endstop as the homing driver's trait object — what a rail builds
+    /// (`stepper.py:GenericPrinterRail.lookup_endstop` returning the virtual
+    /// probe's `McuTriggerAnalog` as readily as a pin `McuEndstop`).
+    ///
+    /// [`Self::setup_endstop`] stays the concrete form for the callers that
+    /// need an `McuEndstop` (`[probe]`'s QUERY_PROBE, the bltouch tests).
+    ///
+    /// # Errors
+    /// Whatever validation or the chip reports.
+    pub fn setup_endstop_dyn(
+        &self,
+        description: &str,
+        share_type: Option<&str>,
+    ) -> Result<Arc<dyn HomingEndstop>, PinError> {
+        let pin_type = PinType::Endstop;
+        let params = self.lookup_pin(
+            description,
+            pin_type.can_invert(),
+            pin_type.can_pullup(),
+            share_type,
+        )?;
+        let chip = self.chip(&params.chip_name)?;
+        let endstop = chip.setup_endstop_dyn(&params)?;
+        if let Some(position) = chip.virtual_endstop_position(&params) {
+            self.lock()
+                .virtual_positions
+                .insert(address_key(&endstop), position);
         }
         Ok(endstop)
     }
 
     /// The position a virtual endstop stands for, if it is one
     /// (`MCU_endstop.get_position_endstop`).
-    pub fn virtual_endstop_position(&self, endstop: &McuEndstop) -> Option<f64> {
+    pub fn virtual_endstop_position(&self, endstop: &Arc<dyn HomingEndstop>) -> Option<f64> {
         self.lock()
             .virtual_positions
-            .get(&(endstop.chip_name().to_string(), endstop.oid()))
+            .get(&address_key(endstop))
             .copied()
+    }
+
+    /// The registered chip under `name` as its concrete type, when it is one
+    /// (`PinChip: Any` lets the registry answer a typed question without every
+    /// caller naming its type up front — the eddy probe reaching its
+    /// `McuChip` this way).
+    ///
+    /// # Errors
+    /// None; `None` means "no chip by that name, or not that type".
+    pub fn chip_as<T: PinChip + 'static>(&self, name: &str) -> Option<Arc<T>> {
+        let chip = self.lock().chip_impls.get(name)?.clone();
+        let any: Arc<dyn Any + Send + Sync> = chip;
+        any.downcast::<T>().ok()
     }
 
     /// The registered chip under `name`, cloned out so the caller does not hold

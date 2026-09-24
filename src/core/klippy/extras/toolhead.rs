@@ -73,7 +73,9 @@ use crate::core::klippy::gcode::{
 };
 use crate::core::klippy::load::section;
 use crate::core::klippy::mathutil::{Coord, X_AXIS, Y_AXIS, Z_AXIS};
-use crate::core::klippy::mcu::{Completion, McuEndstop, McuError, McuObject, McuStepper};
+use crate::core::klippy::mcu::{
+    Completion, McuEndstop, McuError, McuObject, McuStepper, TriggerDispatch,
+};
 use crate::core::klippy::motion::extra::ExtraAxis;
 use crate::core::klippy::motion::itersolve::{
     cartesian_active_flags, cartesian_position_fn, corexy_active_flags, corexy_position_fn,
@@ -339,8 +341,16 @@ impl ToolHeadObject {
                     continue;
                 };
                 for stepper in rails[*source].steppers() {
-                    endstop
-                        .dispatch()
+                    // Every endstop a rail can name drives a dispatch; the
+                    // default-`None` answer belongs to endstops that never
+                    // ride a rail.
+                    let dispatch = endstop.dispatch().ok_or_else(|| {
+                        ConfigError::new(format!(
+                            "{}: a paired rail's endstop must drive a trigger dispatch",
+                            config.identifier()
+                        ))
+                    })?;
+                    dispatch
                         .add_stepper(
                             stepper.mcu_stepper().chip().clone(),
                             Arc::downgrade(stepper.mcu_stepper()),
@@ -1029,6 +1039,9 @@ const DRIP_LOOKAHEAD: f64 = 0.010;
 /// A future returned by [`HomingEndstop::home_wait`].
 pub type EndstopFuture<'a> = Pin<Box<dyn Future<Output = Result<f64, McuError>> + Send + 'a>>;
 
+/// A future returned by [`HomingEndstop::query_endstop`].
+pub type QueryEndstopFuture<'a> = Pin<Box<dyn Future<Output = Result<bool, McuError>> + Send + 'a>>;
+
 /// What the homing driver needs from an endstop (upstream's `MCU_endstop`).
 ///
 /// A trait so the driver can be tested with a fake trigger, without an MCU.
@@ -1052,6 +1065,22 @@ pub trait HomingEndstop: Send + Sync {
     /// # Errors
     /// As [`McuEndstop::home_wait`].
     fn home_wait(&self, home_end_time: f64) -> EndstopFuture<'_>;
+
+    /// The trigger dispatch this endstop stops the steppers through (the
+    /// pairing lookup in the kinematics setup uses it). `None` for an endstop
+    /// that does not drive one — every endstop a rail can name (a pin
+    /// `McuEndstop`, the eddy probe's `McuTriggerAnalog`) answers `Some`.
+    fn dispatch(&self) -> Option<&TriggerDispatch> {
+        None
+    }
+
+    /// Whether the pin reads triggered now (`M119` / `QUERY_ENDSTOPS`). The
+    /// default reports "open", which is what upstream's virtual probe helper
+    /// answers without a query callback
+    /// (`probe.py:HomingViaProbeHelper.query_endstop` → `False`).
+    fn query_endstop(&self, _print_time: f64) -> QueryEndstopFuture<'_> {
+        Box::pin(async { Ok(false) })
+    }
 }
 
 impl HomingEndstop for McuEndstop {
@@ -1075,6 +1104,14 @@ impl HomingEndstop for McuEndstop {
 
     fn home_wait(&self, home_end_time: f64) -> EndstopFuture<'_> {
         Box::pin(McuEndstop::home_wait(self, home_end_time))
+    }
+
+    fn dispatch(&self) -> Option<&TriggerDispatch> {
+        Some(McuEndstop::dispatch(self))
+    }
+
+    fn query_endstop(&self, print_time: f64) -> QueryEndstopFuture<'_> {
+        Box::pin(McuEndstop::query_endstop(self, print_time))
     }
 }
 

@@ -46,9 +46,10 @@ use serde_json::{json, Value};
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
 use crate::core::klippy::error::KlippyError;
 use crate::core::klippy::extras::stepper_enable::PrinterStepperEnable;
+use crate::core::klippy::extras::toolhead::HomingEndstop;
 use crate::core::klippy::load::section;
 use crate::core::klippy::mathutil::{X_AXIS, Y_AXIS, Z_AXIS};
-use crate::core::klippy::mcu::{McuEndstop, McuStepper};
+use crate::core::klippy::mcu::McuStepper;
 use crate::core::klippy::motion::itersolve::{
     cartesian_active_flags, cartesian_position_fn, AxisFlags, PositionFn,
 };
@@ -109,8 +110,10 @@ pub struct PrinterStepper {
     params: RailParams,
     /// The firmware side: oid, pins and the wire commands.
     mcu_stepper: Arc<McuStepper>,
-    /// The endstop this rail homes to, when the section names one.
-    endstop: Option<Arc<McuEndstop>>,
+    /// The endstop this rail homes to, when the section names one (a pin
+    /// `McuEndstop` or the eddy probe's `McuTriggerAnalog`, both as
+    /// [`HomingEndstop`]).
+    endstop: Option<Arc<dyn HomingEndstop>>,
     /// The homing parameters (`homing.py`'s input).
     homing: HomingInfo,
     /// The machine, to find this MCU's clock/offset at connect. `Weak` because
@@ -203,7 +206,7 @@ impl PrinterStepper {
         // (`klippy/stepper.py:336-343`, `MCU_endstop.get_position_endstop`).
         let endstop = match config.get_str("endstop_pin") {
             Some(pin) => Some(
-                pins.setup_endstop(&pin, None)
+                pins.setup_endstop_dyn(&pin, None)
                     .map_err(|err| ConfigError::new(format!("{identifier}: {err}")))?,
             ),
             None => None,
@@ -266,8 +269,12 @@ impl PrinterStepper {
         // where upstream rejects a shared axis whose steppers are on different
         // MCUs (`TriggerDispatch.add_stepper`).
         if let Some(endstop) = &endstop {
-            endstop
-                .dispatch()
+            let dispatch = endstop.dispatch().ok_or_else(|| {
+                ConfigError::new(format!(
+                    "{identifier}: the rail's endstop must drive a trigger dispatch"
+                ))
+            })?;
+            dispatch
                 .add_stepper(
                     mcu_stepper.chip().clone(),
                     Arc::downgrade(&mcu_stepper),
@@ -334,7 +341,7 @@ impl PrinterStepper {
     }
 
     /// The endstop this rail homes to, if the section named one.
-    pub fn endstop(&self) -> Option<&Arc<McuEndstop>> {
+    pub fn endstop(&self) -> Option<&Arc<dyn HomingEndstop>> {
         self.endstop.as_ref()
     }
 
@@ -555,8 +562,8 @@ impl Rail {
         self.primary().homing_info()
     }
 
-    /// The primary's endstop.
-    pub fn endstop(&self) -> Option<&Arc<McuEndstop>> {
+    /// The endstop this rail homes to, when the section names one.
+    pub fn endstop(&self) -> Option<&Arc<dyn HomingEndstop>> {
         self.primary().endstop()
     }
 

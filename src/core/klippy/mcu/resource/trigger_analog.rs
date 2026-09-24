@@ -37,7 +37,7 @@ use crate::core::klippy::cmd::trigger_analog::{
 };
 use crate::core::klippy::cmd::trsync::{raw_is_failure, TriggerReason};
 use crate::core::klippy::cmd::McuCommand;
-use crate::core::klippy::extras::toolhead::{EndstopFuture, HomingEndstop};
+use crate::core::klippy::extras::toolhead::{EndstopFuture, HomingEndstop, QueryEndstopFuture};
 use crate::core::klippy::mcu::{Mcu, McuError};
 
 /// How long a `trigger_analog_query_state` exchange may take.
@@ -615,6 +615,18 @@ impl HomingEndstop for McuTriggerAnalog {
 
     fn home_wait(&self, home_end_time: f64) -> EndstopFuture<'_> {
         Box::pin(McuTriggerAnalog::home_wait(self, home_end_time))
+    }
+
+    fn dispatch(&self) -> Option<&TriggerDispatch> {
+        Some(McuTriggerAnalog::dispatch(self))
+    }
+
+    /// Whether the probe reads triggered now: an analog trigger has no pin to
+    /// sample, so — exactly as upstream's virtual probe helper without a
+    /// query callback (`probe.py:HomingViaProbeHelper.query_endstop` →
+    /// `False`) — it reports "open".
+    fn query_endstop(&self, _print_time: f64) -> QueryEndstopFuture<'_> {
+        Box::pin(async { Ok(false) })
     }
 }
 

@@ -449,6 +449,12 @@ impl Ldc1612 {
         DATA_RATE
     }
 
+    /// The sensor MCU's clock estimate, in print seconds
+    /// (`MCU.estimated_print_time` — the eddy gather loop's outage check).
+    pub fn estimated_print_time(&self, eventtime: f64) -> Option<f64> {
+        self.state.mcu_object.estimated_print_time(eventtime)
+    }
+
     /// Register a batch client (the consumer's `add_client`).
     pub fn add_client(&self, client: impl Fn(&Value) -> bool + Send + Sync + 'static) {
         let bulk = self

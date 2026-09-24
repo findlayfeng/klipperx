@@ -814,8 +814,20 @@ impl PrinterEddyProbe {
             .setup_trigger_analog(trigger.oid())
             .map_err(|err| ConfigError::new(err.to_string()))?;
         trigger.set_sensor_error_lookup({
-            let sensor = Arc::clone(&sensor);
-            move |code| sensor.lookup_sensor_error(u16::from(code))
+            // The decoder must not pin the sensor: `Ldc1612State` keeps
+            // `pins`, whose `probe` chip holds this trigger, so a strong
+            // `sensor` here closes a cycle (trigger → sensor → state → pins →
+            // chip → trigger) that outlives the machine — its `Mcu` never drops,
+            // its blocking device read stays parked, and the process hangs at
+            // shutdown. A gone sensor means a gone machine: the same fallback
+            // `error_text` uses.
+            let sensor = Arc::downgrade(&sensor);
+            move |code| {
+                sensor
+                    .upgrade()
+                    .map(|sensor| sensor.lookup_sensor_error(u16::from(code)))
+                    .unwrap_or_else(|| "Unknown ldc1612 error".to_string())
+            }
         });
 
         // `probe.lookup_minimum_z`: `[stepper_z] position_min`, else

@@ -23,7 +23,7 @@
 //! |---|---|
 //! | `step_pin` | the step pin (required) |
 //! | `dir_pin` | the direction pin, same MCU as the step pin (required) |
-//! | `rotation_distance` | millimetres per full motor rotation (required) |
+//! | `rotation_distance` | millimetres per full motor rotation (required unless `gear_ratio` implies radians, see below) |
 //! | `microsteps` | microsteps per full step (required) |
 //! | `full_steps_per_rotation` | full steps per rotation (default 200) |
 //! | `gear_ratio` | `g1:g2` pairs multiplied into the step distance |
@@ -37,6 +37,16 @@
 //! **second pass** — `homing_retract_dist` / `second_homing_speed` are read
 //! into `HomingInfo` but the retract + re-approach is not driven yet — and
 //! `endstop_phase` refinement (H9).
+//!
+//! # Polar's two sections
+//!
+//! `kinematics: polar` (`klippy/kinematics/polar.py`) reads two sections of
+//! its own: `[stepper_arm]` is a normal rail (the arm homes toolhead X with Y
+//! pinned to 0) and `[stepper_bed]` is a **bare** stepper — no rail geometry
+//! (`PrinterStepper(config, units_in_radians=True)`, `polar.py:26-27`): no
+//! `position_*` options, and its step distance is in **radians** when
+//! `rotation_distance` is absent but `gear_ratio` is present (upstream's own
+//! inference in `parse_step_distance`, `stepper.py:302-304`).
 
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
@@ -51,7 +61,8 @@ use crate::core::klippy::load::section;
 use crate::core::klippy::mathutil::{X_AXIS, Y_AXIS, Z_AXIS};
 use crate::core::klippy::mcu::McuStepper;
 use crate::core::klippy::motion::itersolve::{
-    cartesian_active_flags, cartesian_position_fn, AxisFlags, PositionFn,
+    cartesian_active_flags, cartesian_position_fn, AxisFlags, PositionFn, PositionPost,
+    PositionUnwrap,
 };
 use crate::core::klippy::motion::{Axis, HomingInfo, Stepper};
 use crate::core::klippy::pins::{PrinterPins, PINS_OBJECT};
@@ -63,6 +74,22 @@ use crate::core::klippy::printer::{ConnectFuture, Printer, PrinterObject};
 section!("stepper_x", order = 50, phase = late, load = load_config);
 section!("stepper_y", order = 50, phase = late, load = load_config);
 section!("stepper_z", order = 50, phase = late, load = load_config);
+// The polar sections (`kinematics/polar.py:26-28`): the arm is a rail that
+// homes toolhead X (so it carries the rail geometry), the bed is a bare
+// radians-mode stepper with no geometry. Same phase/order as the cartesian
+// steppers: both must exist before `[printer]` (order=60) claims them.
+section!(
+    "stepper_arm",
+    order = 50,
+    phase = late,
+    load = load_config_arm
+);
+section!(
+    "stepper_bed",
+    order = 50,
+    phase = late,
+    load = load_config_bed
+);
 
 /// The default pulse width upstream uses when the option is absent
 /// (`klippy/stepper.py:80`).
@@ -100,6 +127,17 @@ pub struct SolverSpec {
     pub active_flags: AxisFlags,
 }
 
+/// The solver hooks a stepper's position function needs beyond the raw
+/// evaluation (`StepKinematics::set_hooks`): only polar's bed angle solver
+/// has them (`kin_polar.c`'s `post_cb` + the `commanded_pos` unwrap).
+#[derive(Debug, Clone, Copy)]
+pub struct SolverHooks {
+    /// Correct a raw position-fn result against `commanded_pos`.
+    pub unwrap: PositionUnwrap,
+    /// Renormalize `commanded_pos` after each generated range.
+    pub post: PositionPost,
+}
+
 /// One configured `[stepper_x]` / `[stepper_y]` / `[stepper_z]`.
 pub struct PrinterStepper {
     name: String,
@@ -129,6 +167,10 @@ pub struct PrinterStepper {
     /// (`setup_itersolve`). The stepper no longer decides this from its name:
     /// an extruder or a delta stepper reads the same trapq differently.
     solver: Mutex<Option<SolverSpec>>,
+    /// The solver hooks the owner installed at load (`setup_hooks`); applied
+    /// to the host solver at connect. `None` for every solver upstream runs
+    /// without a `post_cb` (cartesian, corexy, extruder, polar's arm/z).
+    hooks: Mutex<Option<SolverHooks>>,
 }
 
 impl PrinterStepper {
@@ -149,8 +191,8 @@ impl PrinterStepper {
 
         let step_pin = config.get("step_pin", None)?;
         let dir_pin = config.get("dir_pin", None)?;
-        let rotation_distance =
-            config.get_float_bounded("rotation_distance", None, None, None, Some(0.0), None)?;
+        // `rotation_distance` is parsed below, next to the step-distance
+        // math: it is optional when `gear_ratio` implies radians mode.
         let microsteps = config.get_int_bounded("microsteps", None, Some(1), None)?;
         let full_steps = config.get_int("full_steps_per_rotation", Some(200))?;
         if full_steps < 1 || full_steps % 4 != 0 {
@@ -195,6 +237,18 @@ impl PrinterStepper {
         // `rotation_distance` is millimetres per full rotation; the divisor is
         // full steps times microsteps times any gearing
         // (`parse_step_distance`, `klippy/stepper.py:307-323`).
+        //
+        // Radians mode (upstream's own inference when the caller does not say,
+        // `stepper.py:302-304`: no `rotation_distance` but a `gear_ratio`):
+        // the rotation is one turn in radians, so the step distance comes out
+        // in radians — `[stepper_bed]` of a polar printer is exactly this
+        // (`polar.py:26` passes `units_in_radians=True`). A section with
+        // neither option still fails on `rotation_distance`, as upstream does.
+        let rotation_distance = if !config.has("rotation_distance") && config.has("gear_ratio") {
+            std::f64::consts::TAU
+        } else {
+            config.get_float_bounded("rotation_distance", None, None, None, Some(0.0), None)?
+        };
         let step_dist = rotation_distance / (full_steps as f64 * microsteps as f64 * gear_ratio);
 
         let pins = printer
@@ -301,6 +355,7 @@ impl PrinterStepper {
             printer: Arc::downgrade(printer),
             inner: Mutex::new(None),
             solver: Mutex::new(None),
+            hooks: Mutex::new(None),
         })
     }
 
@@ -328,6 +383,19 @@ impl PrinterStepper {
             position,
             active_flags,
         });
+    }
+
+    /// Install the solver's position hooks (`StepKinematics::set_hooks`), to
+    /// be applied to the host solver at connect.
+    ///
+    /// Only `kin_polar.c`'s angle solver has hooks: the ±2π unwrap against
+    /// `commanded_pos` and the renormalization after each generated range
+    /// (upstream's callback reads `sk->commanded_pos` and its `post_cb`).
+    pub fn setup_hooks(&self, unwrap: PositionUnwrap, post: PositionPost) {
+        *self
+            .hooks
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(SolverHooks { unwrap, post });
     }
 
     /// Millimetres per step.
@@ -434,6 +502,18 @@ impl PrinterObject for PrinterStepper {
                 solver.active_flags,
                 freq,
             );
+            // Apply the owner's hooks (polar's bed angle solver) to the host
+            // solver, mirroring upstream where `setup_itersolve` and the
+            // callback/`post_cb` are installed together.
+            if let Some(hooks) = *self
+                .hooks
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+            {
+                stepper
+                    .kinematics_mut()
+                    .set_hooks(Some(hooks.unwrap), Some(hooks.post));
+            }
             // Read the board's step counter and align the solver with it, as
             // upstream's `_query_mcu_position` does at connect
             // (`klippy/stepper.py:212-228`). This is what makes the host's
@@ -589,6 +669,42 @@ pub(crate) fn load_config(
 ) -> Result<Arc<dyn PrinterObject>, ConfigError> {
     let axis = axis_from_name(&config.identifier())?;
     Ok(Arc::new(PrinterStepper::new(config, printer, axis, true)?))
+}
+
+/// The factory `[stepper_arm]` names (`kinematics/polar.py:27`'s
+/// `stepper.LookupRail`): a rail with geometry. Its stepper homes toolhead X
+/// (upstream homes axis 0 on this rail, with Y pinned to 0), so it carries
+/// [`Axis::X`].
+pub(crate) fn load_config_arm(
+    config: &ConfigWrapper,
+    printer: &Arc<Printer>,
+) -> Result<Arc<dyn PrinterObject>, ConfigError> {
+    Ok(Arc::new(PrinterStepper::new(
+        config,
+        printer,
+        Axis::X,
+        true,
+    )?))
+}
+
+/// The factory `[stepper_bed]` names (`kinematics/polar.py:26`'s
+/// `stepper.PrinterStepper(config, units_in_radians=True)`): a **bare** motor
+/// — no rail geometry (no `position_*` options), step distance in radians
+/// (inferred from `gear_ratio` without `rotation_distance`).
+///
+/// The axis is inert: the polar toolhead installs the angle solver at load
+/// (`setup_itersolve`), so the cartesian fallback this value would select
+/// never runs.
+pub(crate) fn load_config_bed(
+    config: &ConfigWrapper,
+    printer: &Arc<Printer>,
+) -> Result<Arc<dyn PrinterObject>, ConfigError> {
+    Ok(Arc::new(PrinterStepper::new(
+        config,
+        printer,
+        Axis::X,
+        false,
+    )?))
 }
 
 /// Parse the homing parameters of a `[stepper_*]` rail

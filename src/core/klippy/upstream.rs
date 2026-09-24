@@ -407,8 +407,12 @@ mod tests {
         "corexyuv.test",
         "delta.test",
         "delta_calibrate.test",
+<<<<<<< HEAD
         "dual_carriage.test",
         "exclude_object.test",
+=======
+        "eddy.test",
+>>>>>>> ed696df (test(U-A7b): IGNORED 删 exclude_object/dual_carriage 两行（宏体渲染落地，guard 归空）)
         "extruders.test",
         "generic_cartesian.test",
         "generic_cartesian_iqex.test",

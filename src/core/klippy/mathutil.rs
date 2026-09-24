@@ -242,6 +242,7 @@ pub fn coordinate_descent(params: &mut [f64], mut error: impl FnMut(&[f64]) -> f
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
 
     #[test]
     fn test_named_accessors_and_indexing_agree() {
@@ -325,6 +326,51 @@ mod tests {
         assert!((params[0] - true_a).abs() < 1e-3, "a = {}", params[0]);
         assert!((params[1] - true_b).abs() < 1e-3, "b = {}", params[1]);
         assert!((params[2] - true_c).abs() < 1e-3, "c = {}", params[2]);
+    }
+
+    #[test]
+    fn test_coordinate_descent_stops_when_the_error_never_improves() {
+        // A flat error: every +dp and -dp trial fails, so a round only ever
+        // shrinks the steps (dp *= 0.9). The sum(dp) <= 1e-5 condition must
+        // end the search instead of looping forever, leaving params reverted.
+        let calls = Cell::new(0usize);
+        let mut params = [0.5, -1.5];
+
+        coordinate_descent(&mut params, |_p| {
+            calls.set(calls.get() + 1);
+            42.0
+        });
+
+        assert_eq!(params, [0.5, -1.5]);
+        // One evaluation up front, then two per parameter per round. Exiting
+        // via the shrinking steps takes far fewer calls than the ceiling of
+        // 1 + 10000 rounds * 2 trials * 2 parameters.
+        assert!(
+            calls.get() >= 1 && calls.get() < 10_000,
+            "calls = {}",
+            calls.get()
+        );
+        assert!(calls.get() <= 1 + 10_000 * 2 * 2, "calls = {}", calls.get());
+    }
+
+    #[test]
+    fn test_coordinate_descent_stops_at_the_round_cap() {
+        // An error that improves on *every* evaluation: the +dp trial always
+        // wins, the steps only grow (dp *= 1.1), and sum(dp) never reaches
+        // the threshold — only the 10000-round cap can end the search. One
+        // evaluation per parameter per round makes the cap observable.
+        let calls = Cell::new(0usize);
+        let mut params = [0.5, -1.5];
+
+        coordinate_descent(&mut params, |_| {
+            let seen = calls.get();
+            calls.set(seen + 1);
+            -(seen as f64)
+        });
+
+        // 1 initial evaluation + 10000 rounds * 2 parameters, one +dp trial
+        // each; without the cap this loop would never terminate.
+        assert_eq!(calls.get(), 1 + 10_000 * 2);
     }
 
     #[test]

@@ -39,6 +39,15 @@
 //! * **The second carriage's endstop is not in `query_endstops`**, and
 //!   `STEPPER_BUZZ STEPPER=dual_carriage` is not registered (both are silent
 //!   unknown-command answers, so the corpus does not care).
+//! * **A config with two extruders ([`dual_carriage.cfg`](crate and its T0/T1
+//!   macros) runs with the second extruder **out of the motion path**: this
+//!   port's `Move.axes_d` has four slots (X/Y/Z/E), so an extra axis past the
+//!   first is skipped by guarded no-ops in the planner instead of receiving
+//!   its own slot — a defensive downgrade of the pre-existing multi-extruder
+//!   port gap (it used to panic on the first `G1`). Full dynamic multi-extruder
+//!   positions (`Coord`/`axes_d` growing per axis, as upstream's
+//!   `gcode_move.py:118-131` does) is a separate unit and a prerequisite of
+//!   upstream's `extruders.test`.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -318,13 +327,25 @@ fn cmd_restore_dual_carriage_state(
 mod tests {
     use super::*;
     use crate::core::klippy::config::Config;
+    use crate::core::klippy::event::KlippyEvent;
+    use crate::core::klippy::mathutil::Coord;
+    use crate::core::klippy::motion::extra::ExtraAxis;
+    use crate::core::klippy::motion::kinematics::MoveContext;
+    use crate::core::klippy::motion::plan::{Move, MoveLimits};
+    use crate::core::klippy::motion::queuing::MotionQueuing;
+    use crate::core::klippy::motion::toolhead::ToolHead;
     use crate::core::klippy::reactor::ManualReactor;
 
     /// A printer with the given sections loaded (load only, no connect).
+    /// A successful load fires `klippy:ready` so the dispatcher runs scripts,
+    /// as temperature_fan's tests do.
     fn load(text: &str) -> (Arc<Printer>, Result<(), ConfigError>) {
         let printer = Arc::new(Printer::new(ManualReactor::shared()));
         let config = Config::from_text(text).expect("the test config parses").0;
         let result = printer.load_config(&config);
+        if result.is_ok() {
+            printer.send_event(&KlippyEvent::KlippyReady);
+        }
         (printer, result)
     }
 
@@ -490,5 +511,112 @@ mod tests {
             load(&cartesian_config("cartesian").replace("safe_distance: 50", "safe_distance: -1"));
         let err = result.unwrap_err().to_string();
         assert!(err.contains("must have minimum of 0"), "{err}");
+    }
+
+    // -----------------------------------------------------------------------
+    // The multi-extruder guard (module docs): the corpus config carries two
+    // extruders, and a move has four slots — the second extra axis must be
+    // skipped, not indexed. The recording axis reads `axes_d[ea_index]` like
+    // the real extruder does, so an unguarded planner panics here exactly as
+    // `dual_carriage.test` did on its first `G1`.
+    // -----------------------------------------------------------------------
+
+    #[derive(Debug)]
+    struct RecordingAxis {
+        name: &'static str,
+        checked: Mutex<Vec<usize>>,
+        junctions: Mutex<Vec<usize>>,
+        queued: Mutex<Vec<usize>>,
+    }
+
+    impl RecordingAxis {
+        fn new(name: &'static str) -> Self {
+            Self {
+                name,
+                checked: Mutex::new(Vec::new()),
+                junctions: Mutex::new(Vec::new()),
+                queued: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl ExtraAxis for RecordingAxis {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn check_move(
+            &self,
+            ctx: &mut MoveContext<'_>,
+            ea_index: usize,
+        ) -> Result<(), CommandError> {
+            let _ = ctx.axes_d()[ea_index];
+            self.checked.lock().unwrap().push(ea_index);
+            Ok(())
+        }
+
+        fn calc_junction(&self, prev: &Move, cur: &Move, ea_index: usize) -> f64 {
+            let _ = prev.axes_d[ea_index];
+            let _ = cur.axes_d[ea_index];
+            self.junctions.lock().unwrap().push(ea_index);
+            1234.0
+        }
+
+        fn process_move(
+            &self,
+            _queuing: &mut MotionQueuing,
+            _print_time: f64,
+            move_: &Move,
+            ea_index: usize,
+        ) {
+            let _ = move_.axes_d[ea_index];
+            self.queued.lock().unwrap().push(ea_index);
+        }
+
+        fn find_past_position(&self, _print_time: f64) -> f64 {
+            0.0
+        }
+
+        fn get_status(&self) -> Value {
+            json!({})
+        }
+    }
+
+    /// The guard's two sides, pinned: with two extra axes the planner skips
+    /// the out-of-slot second one in **all three** paths (per-move check,
+    /// junction fold-in, trapq queueing) without panicking, while the first
+    /// extra axis keeps its slot-3 behaviour unchanged.
+    #[test]
+    fn a_second_extra_axis_is_skipped_and_the_first_keeps_its_slot() {
+        let mut toolhead = ToolHead::new(MoveLimits {
+            max_velocity: 300.0,
+            max_accel: 3000.0,
+            junction_deviation: 0.05,
+            mcr_pseudo_accel: 1500.0,
+        });
+        let first = Arc::new(RecordingAxis::new("extruder"));
+        let second = Arc::new(RecordingAxis::new("extruder1"));
+        toolhead.add_extra_axis(Arc::clone(&first) as Arc<dyn ExtraAxis>);
+        toolhead.add_extra_axis(Arc::clone(&second) as Arc<dyn ExtraAxis>);
+
+        // Two extrude-only moves: the check path runs for both moves, the
+        // junction path pairs the second move with the first.
+        toolhead
+            .move_to(Coord::new(0.0, 0.0, 0.0, 5.0), 10.0)
+            .unwrap();
+        toolhead
+            .move_to(Coord::new(0.0, 0.0, 0.0, 6.0), 10.0)
+            .unwrap();
+        toolhead.flush_step_generation(1.0).unwrap();
+
+        // Slot 3 (the first extra axis) is checked once per move, queued once
+        // per move, and folds one junction limit in — as before the guard.
+        assert_eq!(*first.checked.lock().unwrap(), [3, 3]);
+        assert_eq!(*first.junctions.lock().unwrap(), [3]);
+        assert_eq!(*first.queued.lock().unwrap(), [3, 3]);
+        // Slot 4 does not exist: the second extra axis never runs a hook.
+        assert!(second.checked.lock().unwrap().is_empty());
+        assert!(second.junctions.lock().unwrap().is_empty());
+        assert!(second.queued.lock().unwrap().is_empty());
     }
 }

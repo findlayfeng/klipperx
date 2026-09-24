@@ -347,7 +347,10 @@ impl LookAheadQueue {
             extra_axes
                 .iter()
                 .enumerate()
-                .map(|(index, axis)| axis.calc_junction(prev, cur, index + 3))
+                // Slots past the move's four are skipped, as `ToolHead::move_to`
+                // skips the axis itself: no slot, no junction limit to fold in.
+                .filter(|(index, _)| *index + E_AXIS < cur.axes_d.len())
+                .map(|(index, axis)| axis.calc_junction(prev, cur, index + E_AXIS))
                 .collect()
         };
         // The move just pushed and the one before it, without borrowing the

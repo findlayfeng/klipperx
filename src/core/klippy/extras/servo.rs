@@ -271,14 +271,22 @@ pub fn load_config_prefix(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::klippy::config::Config;
+    use crate::core::klippy::config::{Config, ConfigSection, ConfigValue};
+    use crate::core::klippy::event::KlippyEvent;
+    use crate::core::klippy::mcu::McuError;
+    use crate::core::klippy::pins::{DigitalOut, PinChip, PinError, PinParams};
     use crate::core::klippy::reactor::ManualReactor;
 
     /// A printer with the given sections loaded (load only, no connect).
+    /// A successful load fires `klippy:ready` so the dispatcher runs scripts,
+    /// as temperature_fan's tests do.
     fn load(text: &str) -> (Arc<Printer>, Result<(), ConfigError>) {
         let printer = Arc::new(Printer::new(ManualReactor::shared()));
         let config = Config::from_text(text).expect("the test config parses").0;
         let result = printer.load_config(&config);
+        if result.is_ok() {
+            printer.send_event(&KlippyEvent::KlippyReady);
+        }
         (printer, result)
     }
 
@@ -293,6 +301,87 @@ mod tests {
 
     fn servo_config(extra: &str) -> String {
         format!("[mcu]\nserial: /dev/not-opened-yet\n[servo my_servo]\npin: PH4\n{extra}")
+    }
+
+    // -----------------------------------------------------------------------
+    // A ready printer over a fake PWM chip, as pwm_tool's tests use: the real
+    // MCU's PWM cannot be driven before a connect, the fake records the duty.
+    // -----------------------------------------------------------------------
+
+    /// A PWM that records what it was told.
+    #[derive(Default)]
+    struct FakePwm {
+        max_duration: Mutex<f64>,
+        cycle_time: Mutex<(f64, bool)>,
+        start_value: Mutex<(f64, f64)>,
+        updates: Mutex<Vec<f64>>,
+    }
+
+    impl PwmOut for FakePwm {
+        fn setup_max_duration(&self, max_duration: f64) {
+            *self.max_duration.lock().unwrap() = max_duration;
+        }
+        fn setup_cycle_time(&self, cycle_time: f64, hardware_pwm: bool) {
+            *self.cycle_time.lock().unwrap() = (cycle_time, hardware_pwm);
+        }
+        fn setup_start_value(&self, start_value: f64, shutdown_value: f64) {
+            *self.start_value.lock().unwrap() = (start_value, shutdown_value);
+        }
+        fn set_pwm(&self, _clock: u32, value: f64) -> Result<(), McuError> {
+            self.updates.lock().unwrap().push(value);
+            Ok(())
+        }
+        fn update_pwm(&self, value: f64) -> Result<(), McuError> {
+            self.updates.lock().unwrap().push(value);
+            Ok(())
+        }
+        fn next_aligned_clock(&self, clock: u32, _allow_early: f64) -> Result<u32, McuError> {
+            Ok(clock)
+        }
+    }
+
+    /// A chip that hands out a [`FakePwm`] per setup.
+    #[derive(Default)]
+    struct FakeChip {
+        pwms: Mutex<Vec<Arc<FakePwm>>>,
+    }
+
+    impl PinChip for FakeChip {
+        fn setup_digital_out(&self, _params: &PinParams) -> Result<Arc<dyn DigitalOut>, PinError> {
+            Err(PinError::Unsupported("digital_out".to_string()))
+        }
+
+        fn setup_pwm(&self, _params: &PinParams) -> Result<Arc<dyn PwmOut>, PinError> {
+            let pwm = Arc::new(FakePwm::default());
+            self.pwms.lock().unwrap().push(Arc::clone(&pwm));
+            Ok(pwm)
+        }
+    }
+
+    /// A ready printer with `gcode` and `pins` over the fake chip, plus the
+    /// corpus servo built on it.
+    fn servo_printer() -> (Arc<Printer>, PrinterServo, Arc<FakeChip>) {
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        printer
+            .add_object(
+                GCODE_OBJECT,
+                Arc::new(GCodeDispatch::new(Arc::clone(&printer))),
+            )
+            .unwrap();
+        let pins = Arc::new(PrinterPins::new());
+        let chip = Arc::new(FakeChip::default());
+        pins.register_chip("mcu", chip.clone()).unwrap();
+        printer.add_object(PINS_OBJECT, pins).unwrap();
+        printer.send_event(&KlippyEvent::KlippyReady);
+
+        let mut section = ConfigSection::new("servo", Some("my_servo"));
+        section
+            .parameters
+            .insert("pin".to_string(), ConfigValue::Single("PA4".to_string()));
+        let access = crate::core::klippy::config::AccessTracking::shared();
+        let wrapper = ConfigWrapper::new(&section, access);
+        let servo = PrinterServo::new(&wrapper, &printer).unwrap();
+        (printer, servo, chip)
     }
 
     /// The section loads: every option it carries (and the defaults it omits)
@@ -357,27 +446,35 @@ mod tests {
     /// (`servo.py:64-71`), and refuses a line with neither parameter.
     #[test]
     fn set_servo_drives_the_pin_through_the_mux() {
-        let (printer, result) = load(&servo_config(""));
-        result.unwrap();
+        let (printer, servo, chip) = servo_printer();
         let gcode = printer
             .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
-            .unwrap();
-        let servo = printer
-            .lookup_object_as::<PrinterServo>("servo my_servo")
             .unwrap();
 
         gcode
             .run_script_sync("SET_SERVO SERVO=my_servo angle=160")
             .unwrap();
-        let expected = geometry().pwm_from_angle(160.);
-        assert_eq!(servo.get_status(0.0), json!({ "value": expected }));
+        let first = geometry().pwm_from_angle(160.);
+        assert_eq!(servo.get_status(0.0), json!({ "value": first }));
+        let pwm = Arc::clone(&chip.pwms.lock().unwrap()[0]);
+        assert_eq!(*pwm.updates.lock().unwrap(), [first]);
+        // The pin starts at duty 0 (no initial option) and runs at the
+        // servo's fixed period, software PWM (`servo.py:33-37`).
+        assert_eq!(
+            *pwm.cycle_time.lock().unwrap(),
+            (SERVO_SIGNAL_PERIOD, false)
+        );
+        assert_eq!(*pwm.max_duration.lock().unwrap(), 0.0);
 
         gcode
             .run_script_sync("SET_SERVO SERVO=my_servo WIDTH=0.0015")
             .unwrap();
+        let second = geometry().pwm_from_pulse_width(0.0015);
+        assert_eq!(servo.get_status(0.0), json!({ "value": second }));
         assert_eq!(
-            servo.get_status(0.0),
-            json!({ "value": geometry().pwm_from_pulse_width(0.0015) })
+            *pwm.updates.lock().unwrap(),
+            [first, second],
+            "each changed duty reaches the pin"
         );
 
         let err = gcode

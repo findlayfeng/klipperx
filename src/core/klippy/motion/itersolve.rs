@@ -59,6 +59,20 @@ impl AxisFlags {
     }
 }
 
+/// A position unwrap: correct one raw position-fn result against the
+/// commanded position (`kin_polar.c`'s angle callback reads
+/// `sk->commanded_pos` and shifts the wrapped `atan2` result by ±2π).
+///
+/// Both hooks are `None` for every solver upstream runs without a
+/// `post_cb`/stateful callback (cartesian, corexy, extruder): no behaviour
+/// changes for them.
+pub type PositionUnwrap = fn(raw: f64, commanded: f64) -> f64;
+
+/// A commanded-position fixup run after each generated range
+/// (`kin_polar.c`'s `polar_stepper_angle_post_fixup`, called from
+/// `itersolve_gen_steps_range` as `sk->post_cb`).
+pub type PositionPost = fn(commanded: &mut f64);
+
 /// One stepper's position function and solver state.
 ///
 /// Upstream's `struct stepper_kinematics` (`chelper/itersolve.h:10-22`).
@@ -75,6 +89,13 @@ pub struct StepKinematics {
     /// Which axes this stepper moves.
     pub active_flags: AxisFlags,
     position: PositionFn,
+    /// The unwrap applied to each raw position-fn result, against
+    /// `commanded_pos` at evaluation time (`itersolve.h`'s stateful callback:
+    /// polar's angle solver reads `sk->commanded_pos` while evaluating).
+    unwrap: Option<PositionUnwrap>,
+    /// The fixup applied to `commanded_pos` after each generated range
+    /// (`itersolve.c:124-126`'s `post_cb`).
+    post: Option<PositionPost>,
 }
 
 impl StepKinematics {
@@ -87,6 +108,26 @@ impl StepKinematics {
             last_move_time: 0.0,
             active_flags,
             position,
+            unwrap: None,
+            post: None,
+        }
+    }
+
+    /// Install the solver's position hooks (upstream: the `calc_position_cb`
+    /// that reads `sk->commanded_pos` and the `post_cb`; `kin_polar.c` is the
+    /// only solver in the corpus that has them).
+    pub fn set_hooks(&mut self, unwrap: Option<PositionUnwrap>, post: Option<PositionPost>) {
+        self.unwrap = unwrap;
+        self.post = post;
+    }
+
+    /// One position-fn evaluation: the raw result, unwrapped against the
+    /// commanded position (`polar_stepper_angle_calc_position`).
+    fn eval(&self, segment: &MoveSegment, move_time: f64) -> f64 {
+        let raw = (self.position)(segment, move_time);
+        match self.unwrap {
+            Some(unwrap) => unwrap(raw, self.commanded_pos),
+            None => raw,
         }
     }
 
@@ -110,7 +151,10 @@ impl StepKinematics {
             start_pos: pos,
             axes_r: Xyz::default(),
         };
-        (self.position)(&segment, 500.0)
+        // `itersolve_calc_position_from_coord` calls the same callback, so it
+        // unwraps against `commanded_pos` the same way (no `post_cb` there,
+        // as upstream).
+        self.eval(&segment, 500.0)
     }
 
     /// Set the stepper position from a toolhead position
@@ -226,7 +270,7 @@ impl StepKinematics {
             old_guess = guess;
             guess = TimePosition {
                 time: next_time,
-                position: (self.position)(segment, next_time),
+                position: self.eval(segment, next_time),
             };
             let guess_dist = guess.position - target;
             if guess_dist.abs() > 0.000_000_001 {
@@ -290,6 +334,12 @@ impl StepKinematics {
             check_oscillate = false;
         }
         self.commanded_pos = target - if sdir { half_step } else { -half_step };
+        // Upstream calls `sk->post_cb` right after this assignment
+        // (`itersolve.c:124-126`): polar renormalizes the bed angle into
+        // [-π, π] so the next range's single ±2π unwrap stays sufficient.
+        if let Some(post) = self.post {
+            post(&mut self.commanded_pos);
+        }
         Ok(())
     }
 }

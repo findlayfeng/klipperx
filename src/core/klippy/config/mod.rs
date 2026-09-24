@@ -80,7 +80,21 @@ impl Config {
     }
 
     pub fn add_section(&mut self, section: ConfigSection) {
-        self.sections.insert(section);
+        // Upstream parses with `RawConfigParser(strict=False)`: a repeated
+        // section header joins the section already read — the option sets are
+        // unioned, a later duplicate of the same option wins, and the section
+        // keeps its first position (`klippy/configfile.py:172`). Merge here so
+        // the factory sees one merged section and loads it exactly once.
+        let Some(existing) = self.sections.get_by_key(&section.key) else {
+            self.sections.insert(section);
+            return;
+        };
+        let mut merged = existing.clone();
+        // `BTreeMap::extend`: a key present in both halves takes the incoming
+        // (later) value — the same last-write-wins an in-file duplicate
+        // option has.
+        merged.parameters.extend(section.parameters);
+        self.sections.insert(merged);
     }
 
     /// Get all sections matching the given id
@@ -574,5 +588,69 @@ mod tests {
     fn a_hash_inside_quotes_is_not_a_comment() {
         let config = parse("[s]\nkey: \"a#b\"\n");
         assert_eq!(value(&config, "s", "key"), "\"a#b\"");
+    }
+
+    #[test]
+    fn a_repeated_section_header_merges_the_option_sets() {
+        // test/klippy/eddy.cfg has two `[probe_eddy_current eddy]` sections;
+        // upstream's RawConfigParser(strict=False) joins them into one.
+        let config = parse(
+            "[probe_eddy_current eddy]\ni2c_mcu: mcu\ni2c_address: 35\n\
+             [probe_eddy_current eddy]\nsensor_type: ldc1612\nspeed: 5\n",
+        );
+        let section = config.get_section("probe_eddy_current eddy").unwrap();
+        assert_eq!(section.get_str("i2c_mcu"), Some("mcu"));
+        assert_eq!(section.get_str("i2c_address"), Some("35"));
+        assert_eq!(section.get_str("sensor_type"), Some("ldc1612"));
+        assert_eq!(section.get_str("speed"), Some("5"));
+        // One merged section, not two entries.
+        assert_eq!(config.get_sections_by_id("probe_eddy_current").len(), 1);
+    }
+
+    #[test]
+    fn a_duplicate_option_in_a_repeated_section_takes_the_later_value() {
+        let config = parse("[s]\na: first\nb: keep\n[s]\na: second\nc: new\n");
+        let section = config.get_section("s").unwrap();
+        assert_eq!(section.get_str("a"), Some("second"));
+        assert_eq!(section.get_str("b"), Some("keep"));
+        assert_eq!(section.get_str("c"), Some("new"));
+    }
+
+    #[test]
+    fn a_merged_section_stays_at_its_first_position() {
+        // ConfigSectionMap::insert only pushes the key when it is new, so
+        // re-inserting the merged section must keep it at the first slot.
+        let config = parse("[a]\nx: 1\n[sdup]\np: 1\n[b]\ny: 2\n[sdup]\nq: 2\n");
+        let order: Vec<String> = config
+            .sections_vec()
+            .iter()
+            .map(|s| s.identifier())
+            .collect();
+        assert_eq!(order, ["a", "sdup", "b"]);
+        // ...and the merged options are all present there.
+        let section = config.get_section("sdup").unwrap();
+        assert_eq!(section.get_str("p"), Some("1"));
+        assert_eq!(section.get_str("q"), Some("2"));
+    }
+
+    #[test]
+    fn distinct_sections_are_unaffected_by_merging() {
+        let config = parse("[mcu]\nserial: /dev/ttyUSB0\n[stepper_x]\nstep_pin: PA1\n[mcu secondary]\nserial: /dev/ttyUSB1\n");
+        assert_eq!(config.sections_vec().len(), 3);
+        assert_eq!(
+            config.get_section("mcu").unwrap().get_str("serial"),
+            Some("/dev/ttyUSB0")
+        );
+        assert_eq!(
+            config.get_section("stepper_x").unwrap().get_str("step_pin"),
+            Some("PA1")
+        );
+        assert_eq!(
+            config
+                .get_section("mcu secondary")
+                .unwrap()
+                .get_str("serial"),
+            Some("/dev/ttyUSB1")
+        );
     }
 }

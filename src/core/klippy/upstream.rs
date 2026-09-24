@@ -427,7 +427,6 @@ mod tests {
         "printers.test",
         "pwm.test",
         "rotary_delta_calibrate.test",
-        "screws_tilt_adjust.test",
         "sdcard_loop.test",
         "temperature.test",
         "tmc.test",

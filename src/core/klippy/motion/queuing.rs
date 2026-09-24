@@ -193,6 +193,56 @@ mod tests {
     }
 
     #[test]
+    fn test_a_detached_stepper_generates_no_steps_until_reattached() {
+        // `ZAdjustHelper.adjust_steppers` takes every Z motor off the trapq,
+        // moves with them detached, and attaches them one by one; a detached
+        // stepper must produce no commands until it is attached again.
+        let mut queuing = MotionQueuing::new();
+        let trapq = queuing.allocate_trapq();
+        queuing.add_stepper(Stepper::cartesian(
+            "stepper_z",
+            0,
+            1.0,
+            Axis::Z,
+            1_000_000.0,
+        ));
+        let mut move_ = move_(0.0, 10.0);
+        move_.set_junction(0.0, 10_000.0, 0.0);
+        // The same 10 mm, queued along Z (the `append` helper is X-only).
+        queuing.trapq_mut(trapq).append(
+            0.0,
+            move_.accel_t,
+            move_.cruise_t,
+            move_.decel_t,
+            Xyz::new(0.0, 0.0, move_.start_pos.x()),
+            Xyz::new(0.0, 0.0, 1.0),
+            move_.start_v,
+            move_.cruise_v,
+            move_.accel,
+        );
+        // Detach (`set_trapq(None)`): the queued move generates nothing.
+        queuing.steppers_mut()[0].set_trapq(None);
+        assert_eq!(queuing.steppers()[0].trapq_id(), None);
+        assert!(queuing.generate(0.2).unwrap().is_empty());
+
+        // Reattach: the same move now generates its steps.
+        queuing.steppers_mut()[0].set_trapq(trapq);
+        let batches = queuing.generate(0.2).unwrap();
+
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].0, "stepper_z");
+        let steps: u32 = batches[0]
+            .1
+            .iter()
+            .filter_map(|command| match command {
+                StepCommand::QueueStep { count, .. } => Some(*count),
+                StepCommand::SetNextStepDir { .. } => None,
+            })
+            .sum();
+        assert_eq!(steps, 10);
+    }
+
+    #[test]
     fn test_a_stepper_with_nothing_to_do_is_silent() {
         let mut queuing = MotionQueuing::new();
         let trapq = queuing.allocate_trapq();

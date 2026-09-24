@@ -27,6 +27,7 @@ pub mod heater_generic;
 pub mod heaters;
 pub mod i2c_device;
 pub mod ldc1612;
+pub mod led;
 pub mod manual_probe;
 pub mod output_pin;
 pub mod probe;

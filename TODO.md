@@ -613,7 +613,10 @@ FW5a–f / FW6a–f 已把「cartesian + 假 MCU 的 `G1`/`G28`」跑通并归�
 - [ ] 调平：`bed_mesh.py` ◐（**已落地**：`[bed_mesh]` 段与全量选项、探测点生成、
       `BED_MESH_CALIBRATE` 逐点探测存格、`BED_MESH_CLEAR`；**待做**：插值网格
       （lagrange/bicubic、`mesh_pps`）、faulty 区域替换、fade 与 move 的 z 补偿、profile 命令
-      与 `bed_mesh/dump_mesh` 端点）、`bed_tilt.py`、`quad_gantry_level.py`、`z_tilt.py`。
+      与 `bed_mesh/dump_mesh` 端点）、`quad_gantry_level.py`、`z_tilt.py`。
+- [x] **`bed_tilt.py`** ✅ 已落地：`[bed_tilt]` 段 + `gcode_move::set_move_transform` 占槽的
+      平面补偿 + `BED_TILT_CALIBRATE`（`coordinate_descent` 拟合、`update_adjust` 重锚并记
+      `SAVE_CONFIG` pending）；`multi_z.test` 因此只剩 `z_tilt` 一个缺口。
 - [x] **探针端到端：时钟纪元**：✅ 已完成（2026-09-24）。探针链路本身已在假 MCU 上验收（`upstream.rs` 的 5 条聚焦
       E2E：普通端停 `G28 Z`、`probe:z_virtual_endstop` 的 `G28 Z`、`G28 + PROBE`、
       `G28 + PROBE_CALIBRATE/TESTZ/ACCEPT`、`G28 + BED_MESH_CALIBRATE`（3×3）），假 MCU 的端停时序也已建模

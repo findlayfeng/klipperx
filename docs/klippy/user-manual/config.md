@@ -605,3 +605,17 @@ pins: !PD0, PD1, PD2
 ---
 
 - [← 用户手册首页](README.md)
+
+### `[bed_tilt]` — 床面倾斜补偿（`BED_TILT_CALIBRATE`）
+
+| 选项 | 默认 | 说明 |
+|------|------|------|
+| `x_adjust` / `y_adjust` / `z_adjust` | `0.0` | 补偿平面；也是 `SAVE_CONFIG` 的回写项 |
+| `points` | 无 | 校准探测点，每项 `x,y`，**至少 3 点**；**只有写了它才会注册 `BED_TILT_CALIBRATE`** |
+| `horizontal_move_z` | `5.0` | 点间抬升高度 |
+| `speed` | `50.0` | 点间移动速度 |
+
+补偿方式是把自己装成 `gcode_move` 的移动变换：G-Code 空间的 Z 按平面加/减，喷嘴相对床面的
+实际 Z 保持平整；`M114`/`GET_POSITION` 看到的是补偿后的值。`BED_TILT_CALIBRATE` 逐点探测后
+用 `coordinate_descent` 拟合平面并立即应用，同时把三项以 `%.6f` 记入 `SAVE_CONFIG` 待写区
+（**落盘仍需 `SAVE_CONFIG`，该回写见 TODO C2，本仓尚未实现**）。

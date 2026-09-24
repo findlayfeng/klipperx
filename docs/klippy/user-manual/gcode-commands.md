@@ -488,6 +488,19 @@ SPI_SEND     DEVICE=flash DATA=04          // spi send ok
 
 ---
 
+### BED_TILT_CALIBRATE — 床面倾斜校准（`[bed_tilt]` 且写了 `points` 时才注册）
+
+逐点探测（或手动测点）拟合床面倾斜平面并应用到当前会话：更新 `x_adjust`/`y_adjust`/`z_adjust`
+并重锚 G-Code 坐标，同时把新值记入 `SAVE_CONFIG` 待写区。
+
+| 参数 | 说明 |
+|------|------|
+| `METHOD` | `automatic`（默认）或 `manual`（配合 `G1` + `ACCEPT` 手动测点） |
+| `HORIZONTAL_MOVE_Z` | 覆盖段内的 `horizontal_move_z` |
+| `PROBE_SPEED` / `LIFT_SPEED` / `SAMPLES` / `SAMPLE_RETRACT_DIST` / `SAMPLES_TOLERANCE` / `SAMPLES_TOLERANCE_RETRIES` / `SAMPLES_RESULT` | 自动模式下透传给探针 |
+
+与 `Z_TILT_ADJUST`/`QUAD_GANTRY_LEVEL` 不同，它**没有** `RETRIES`/`RETRY_TOLERANCE`，也不调整电机。
+
 ## 未注册命令的处理
 
 没有命中处理器的命令走默认处理器（对应上游 `klippy/gcode.py` 的 `cmd_default`）：

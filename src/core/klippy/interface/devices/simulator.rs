@@ -116,8 +116,10 @@ struct ArmedTriggerAnalog {
     error_reason: u8,
     /// The clock the check was armed at.
     arm_clock: u32,
-    /// The clock the monitor window expires at: arm + (monitor_max + 1)
-    /// missed windows, as `monitor_event` counts them (`trigger_analog.c:59-75`).
+    /// The clock the monitor window expires at, on the fake's own time base:
+    /// now + (monitor_max + 1) missed windows, as `monitor_event` counts them
+    /// (`trigger_analog.c:59-75`). The host's arm clock lives in a different
+    /// epoch, so the window must not be derived from it.
     deadline: u32,
     /// Whether either report has been made; one report ends the check.
     fired: bool,
@@ -375,19 +377,26 @@ impl SimulatorDevice {
                                 _ => 3,
                             };
                             let window = monitor_max.wrapping_add(1).wrapping_mul(*monitor_ticks);
+                            // The monitor is a firmware timer: it runs on the
+                            // fake's own clock (`Self::clock`), not on the
+                            // host's arm clock — the two epochs differ by
+                            // more than `i32::MAX` once the host's print time
+                            // runs ahead, and comparing across them reports a
+                            // false `error_reason + MONITOR` in the arming
+                            // frame before the move can ever trip.
+                            let deadline = (Self::clock(state) as u32).wrapping_add(window);
                             state.ta_homing_clock = clock;
                             state.trigger_analog = Some(ArmedTriggerAnalog {
                                 trsync_oid: *trsync_oid,
                                 trigger_reason,
                                 error_reason,
                                 arm_clock: clock,
-                                deadline: clock.wrapping_add(window),
+                                deadline,
                                 fired: false,
                             });
                             eprintln!(
                                 "SIM-DIAG: trigger_analog arm trsync={trsync_oid} clock={clock} \
-                                 deadline={} monitor={monitor_ticks}x{monitor_max}",
-                                clock.wrapping_add(window)
+                                 deadline={deadline} monitor={monitor_ticks}x{monitor_max}"
                             );
                         }
                     }

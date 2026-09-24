@@ -354,6 +354,7 @@ mod tests {
                 "board_pins",
                 "controller_fan",
                 "display_status",
+                "exclude_object",
                 "gcode_arcs",
                 "gcode_macro",
                 "homing_override",

@@ -1521,8 +1521,10 @@ mod tests {
             .unwrap();
 
         // `none` has no `[stepper_*]` sections; the object is enough on its own.
-        ToolHeadObject::new(&ConfigWrapper::untracked(&section), &printer)
+        let object = ToolHeadObject::new(&ConfigWrapper::untracked(&section), &printer)
             .expect("kinematics: none builds without steppers");
+        // No rails, so there are no Z motors to name.
+        assert!(object.z_stepper_names().is_empty());
     }
 
     #[test]
@@ -1648,6 +1650,34 @@ mod tests {
             crate::core::klippy::reactor::ManualReactor::shared(),
         ));
         (state, GCodeDispatch::new(printer))
+    }
+
+    /// A `ToolHeadObject` around an already-connected `state`, for the seams
+    /// that only need the shared slot (and a printer to fire events on). The
+    /// rails are not involved in them, so none are built.
+    fn object_over(state: Arc<Mutex<Option<Connected>>>) -> (Arc<Printer>, ToolHeadObject) {
+        let printer = Arc::new(Printer::new(
+            crate::core::klippy::reactor::ManualReactor::shared(),
+        ));
+        let object = ToolHeadObject {
+            limits: MoveLimits {
+                max_velocity: 200.0,
+                max_accel: 1000.0,
+                junction_deviation: 0.01,
+                mcr_pseudo_accel: 500.0,
+            },
+            max_z_velocity: 15.0,
+            max_z_accel: 100.0,
+            rails: Vec::new(),
+            none: false,
+            transform: CartesianTransform::Standard,
+            active_extruder: Mutex::new("extruder".to_string()),
+            reactor: printer.reactor(),
+            printer: Arc::downgrade(&printer),
+            state,
+            shutdown: Arc::new(AtomicBool::new(false)),
+        };
+        (printer, object)
     }
 
     /// A move goes through the planner to the trapq — the half of `G1` that
@@ -2084,6 +2114,134 @@ mod tests {
         assert!(
             result.x() < target.x(),
             "the toolhead stops short of the target, got {result:?}"
+        );
+    }
+
+    // =========================================================================
+    // z_tilt seam tests: flush_step_generation, set_position, z_stepper_names
+    // =========================================================================
+
+    /// `flush_step_generation` means upstream's flush: when it returns, the
+    /// moves queued **before** the call have been generated (and, here, handed
+    /// to the transport — this `mcu_steppers` map is empty, so the send set is
+    /// empty but the generation is fully observable).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_flush_step_generation_generates_the_moves_queued_before_it() {
+        let (state, _gcode) = connected(homed_toolhead());
+        {
+            let mut guard = state.lock().unwrap_or_else(|p| p.into_inner());
+            let connected_ref = guard.as_mut().unwrap();
+            connected_ref
+                .toolhead
+                .move_to(Coord::new(10.0, 0.0, 0.0, 0.0), 100.0)
+                .unwrap();
+            // A single short move waits in the look-ahead: nothing generated.
+            let steppers = connected_ref.toolhead.motion_queuing_mut().steppers_mut();
+            assert_eq!(steppers[0].commanded_position(), 0.0);
+            assert!(steppers[0].history(10, 0, u64::MAX).is_empty());
+        }
+        let (_printer, object) = object_over(state);
+
+        object.flush_step_generation().await.unwrap();
+
+        let mut guard = object.lock();
+        let connected_ref = guard.as_mut().unwrap();
+        let steppers = connected_ref.toolhead.motion_queuing_mut().steppers_mut();
+        // The solver ran the queued 10 mm move to its end, and the commands
+        // reached the compressor's history — the steps exist, not just the
+        // look-ahead entry.
+        assert!((steppers[0].commanded_position() - 10.0).abs() < 1e-9);
+        assert_eq!(steppers[0].mcu_position(), 10);
+        assert!(!steppers[0].history(10, 0, u64::MAX).is_empty());
+        // The look-ahead was flushed into the trapq: the planner's time moved,
+        // which is what `get_last_move_time()` reports upstream.
+        assert!(connected_ref.toolhead.print_time() > 0.0);
+    }
+
+    /// Upstream's `ToolHead.set_position` flushes step generation first, then
+    /// sets position and homing flags and fires `toolhead:set_position` — the
+    /// extras-level seam must do all three for `ZAdjustHelper.adjust_steppers`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_set_position_flushes_marks_homing_axes_and_fires_the_event() {
+        let (state, _gcode) = connected(homed_toolhead());
+        {
+            let mut guard = state.lock().unwrap_or_else(|p| p.into_inner());
+            let connected_ref = guard.as_mut().unwrap();
+            // Queue a move while homed, then unhome: the flush inside
+            // `set_position` must still generate the queued move's steps, and
+            // the homing flags must come back for the named axes only.
+            connected_ref
+                .toolhead
+                .move_to(Coord::new(10.0, 0.0, 0.0, 0.0), 100.0)
+                .unwrap();
+            if let Some(kinematics) = connected_ref.toolhead.kinematics_mut() {
+                kinematics.clear_homing_state(&[X_AXIS, Y_AXIS, Z_AXIS]);
+            }
+            let steppers = connected_ref.toolhead.motion_queuing_mut().steppers_mut();
+            assert!(steppers[0].history(10, 0, u64::MAX).is_empty());
+        }
+        let (printer, object) = object_over(state);
+        let fired = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = Arc::clone(&fired);
+        printer.register_event_handler(
+            KlippyEvent::ToolheadSetPosition,
+            Box::new(move |_| {
+                count.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+
+        object
+            .set_position(Coord::new(1.0, 2.0, 3.0, 0.0), &[X_AXIS, Z_AXIS])
+            .await
+            .unwrap();
+
+        assert_eq!(fired.load(Ordering::SeqCst), 1, "the event fired once");
+        let mut guard = object.lock();
+        let connected_ref = guard.as_mut().unwrap();
+        assert_eq!(
+            connected_ref.toolhead.commanded_pos(),
+            Coord::new(1.0, 2.0, 3.0, 0.0)
+        );
+        assert_eq!(
+            connected_ref.toolhead.kinematics().unwrap().get_status()["homed_axes"],
+            "xz"
+        );
+        // The queued move's steps were generated before the position rewrite:
+        // `set_position` would otherwise silently discard them.
+        let steppers = connected_ref.toolhead.motion_queuing_mut().steppers_mut();
+        assert!(!steppers[0].history(10, 0, u64::MAX).is_empty());
+    }
+
+    /// `z_stepper_names` reads the Z rail in config order — primary first,
+    /// then `stepper_z1`, `stepper_z2` — which is the order `z_positions` and
+    /// `adjustments` list the motors in.
+    #[test]
+    fn test_z_stepper_names_follow_the_z_rail_in_config_order() {
+        use crate::core::klippy::config::Config;
+
+        let printer = Arc::new(Printer::new(
+            crate::core::klippy::reactor::ManualReactor::shared(),
+        ));
+        // A `z_tilt.cfg`-style config: three Z motors on one rail.
+        let (config, _) = Config::from_text(
+            "[mcu]\nserial: /dev/not-opened-yet\n\
+             [stepper_x]\nstep_pin: PA0\ndir_pin: PA1\nrotation_distance: 40\nmicrosteps: 16\nposition_max: 200\n\
+             [stepper_y]\nstep_pin: PA2\ndir_pin: PA3\nrotation_distance: 40\nmicrosteps: 16\nposition_max: 200\n\
+             [stepper_z]\nstep_pin: PA4\ndir_pin: PA5\nrotation_distance: 8\nmicrosteps: 16\nposition_max: 200\n\
+             [stepper_z1]\nstep_pin: PA6\ndir_pin: PA7\nrotation_distance: 8\nmicrosteps: 16\n\
+             [stepper_z2]\nstep_pin: PB2\ndir_pin: PB3\nrotation_distance: 8\nmicrosteps: 16\n\
+             [printer]\nkinematics: cartesian\nmax_velocity: 300\nmax_accel: 3000\n",
+        )
+        .expect("the config parses");
+        printer.load_config(&config).expect("the config loads");
+
+        let object = printer
+            .lookup_object_as::<ToolHeadObject>("toolhead")
+            .expect("the toolhead is registered");
+
+        assert_eq!(
+            object.z_stepper_names(),
+            ["stepper_z", "stepper_z1", "stepper_z2"]
         );
     }
 }

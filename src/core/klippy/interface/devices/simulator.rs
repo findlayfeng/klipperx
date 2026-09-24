@@ -81,7 +81,30 @@ struct State {
     /// The clock/pin level of the last armed `endstop_home`, for
     /// `endstop_query_state`.
     endstop_clock: u32,
+    /// The pin level `endstop_query_state` reports right now.
     endstop_pin_value: u8,
+    /// The trsync armed by `endstop_home`, with the level it stops on, the
+    /// clock it was armed at, and whether it has fired yet.
+    ///
+    /// A real endstop is *open* until the carriage reaches it, so the fake one
+    /// must not fire at arming time either: it fires when the move it was armed
+    /// for actually starts (the first `reset_step_clock`/`queue_step` after
+    /// arming). A probe that triggered before moving is a real firmware error,
+    /// and the corpus's probing moves depend on the distinction.
+    armed: Option<ArmedEndstop>,
+}
+
+/// An armed `endstop_home` the fake firmware has not triggered yet.
+#[derive(Debug, Clone, Copy)]
+struct ArmedEndstop {
+    /// The trsync to report the trigger on.
+    trsync_oid: u8,
+    /// The pin level the host stops on.
+    level: u8,
+    /// The clock the endstop was armed at.
+    arm_clock: u32,
+    /// Whether the trigger has been reported.
+    fired: bool,
 }
 
 /// A fake MCU built from a `.dict` file. See the module docs.
@@ -122,6 +145,7 @@ impl SimulatorDevice {
                 shutdown: false,
                 endstop_clock: 0,
                 endstop_pin_value: 0,
+                armed: None,
             }),
             signal: Condvar::new(),
         })
@@ -223,9 +247,11 @@ impl SimulatorDevice {
                     // `endstop_home oid=%c clock=%u sample_ticks=%u
                     // sample_count=%c rest_ticks=%u pin_value=%c
                     // trsync_oid=%c trigger_reason=%c`. A nonzero
-                    // `sample_count` arms the check; the fake endstop is always
-                    // hit, so fire its trsync at once. Without this a `G28`
-                    // would drip a full homing move before the timeout.
+                    // `sample_count` arms the check and the pin reads *open*
+                    // (`1 - pin_value`) until the move starts; see
+                    // [`ArmedEndstop`]. A zero count is the disable the host
+                    // sends after waiting, which leaves the reported level
+                    // alone — the query that follows it wants the trigger.
                     let sample_count = match params.get(3) {
                         Some(ArgValue::UInt8(v)) => *v,
                         _ => 0,
@@ -247,18 +273,21 @@ impl SimulatorDevice {
                             _ => 0,
                         };
                         state.endstop_clock = clock;
-                        state.endstop_pin_value = pin_value;
-                        Self::respond(
-                            state,
-                            seq,
-                            "trsync_state",
-                            &[
-                                ArgValue::UInt8(trsync_oid),
-                                ArgValue::UInt8(0), // can_trigger
-                                ArgValue::UInt8(1), // trigger_reason = EndstopHit
-                                ArgValue::UInt32(clock),
-                            ],
+                        state.endstop_pin_value = 1 - pin_value;
+                        state.armed = Some(ArmedEndstop {
+                            trsync_oid,
+                            level: pin_value,
+                            arm_clock: clock,
+                            fired: false,
+                        });
+                        eprintln!(
+                            "SIM-DIAG: arm trsync={trsync_oid} clock={clock} level={pin_value}"
                         );
+                    } else {
+                        if state.armed.is_some() {
+                            eprintln!("SIM-DIAG: disarm (query follows)");
+                        }
+                        state.armed = None;
                     }
                 }
                 "endstop_query_state" => {
@@ -325,12 +354,63 @@ impl SimulatorDevice {
                     };
                     // No response expected for debug_write.
                 }
+                // A stepper time base reset is the first command of a move:
+                // the carriage has started, so an armed endstop now trips. The
+                // clock it carries is what the trigger is reported at.
+                "reset_step_clock" => {
+                    let clock = match params.get(1) {
+                        Some(ArgValue::UInt32(v)) => *v,
+                        _ => state.endstop_clock,
+                    };
+                    state.endstop_clock = state.endstop_clock.max(clock);
+                    Self::trigger_if_armed(state, seq, clock);
+                }
+                // `queue_step` is the move itself: also a trigger point.
+                "queue_step" => {
+                    let clock = state.endstop_clock;
+                    Self::trigger_if_armed(state, seq, clock);
+                }
                 // Everything else is accepted and ignored: `allocate_oids`,
-                // `config_*`, `queue_step`, `emergency_stop`, and any command
-                // this fake firmware does not model yet.
+                // `config_*`, `emergency_stop`, and any command this fake
+                // firmware does not model yet.
                 _ => {}
             }
         }
+    }
+
+    /// Report an armed endstop's trigger once the move it was armed for has
+    /// started (`reset_step_clock` / `queue_step`), exactly once.
+    ///
+    /// The clock is the arming clock until the move gives a later one, so the
+    /// trigger time is never in the past and never zero.
+    fn trigger_if_armed(state: &mut State, seq: u8, clock: u32) {
+        let Some(armed) = state.armed.as_mut() else {
+            return;
+        };
+        if armed.fired {
+            return;
+        }
+        armed.fired = true;
+        eprintln!(
+            "SIM-DIAG: fire at clock={clock} arm_clock={}",
+            armed.arm_clock
+        );
+        let trigger_clock = clock.max(armed.arm_clock + 1);
+        let trsync_oid = armed.trsync_oid;
+        let level = armed.level;
+        state.endstop_clock = trigger_clock;
+        state.endstop_pin_value = level;
+        Self::respond(
+            state,
+            seq,
+            "trsync_state",
+            &[
+                ArgValue::UInt8(trsync_oid),
+                ArgValue::UInt8(0), // can_trigger
+                ArgValue::UInt8(1), // trigger_reason = EndstopHit
+                ArgValue::UInt32(trigger_clock),
+            ],
+        );
     }
 
     /// Answer one chunk of the identify exchange.

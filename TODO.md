@@ -311,7 +311,7 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 是「对应 `.test` 从 `IGNORED` 移除后通过」**，不是「某个错误不再出现」。详见
 [失败原因分析复盘](docs/work-log/2026-09-22-upstream-regression-failures.md#复盘计数口径与重排后补)。
 
-**当前失败原因统计**（`KLIPPERX_UPSTREAM_ALL=1` 实跑，2026-09-23：**181 次失败**、56 次通过、
+**当前失败原因统计**（`KLIPPERX_UPSTREAM_ALL=1` 实跑，2026-09-24：**179 次失败**、58 次通过、
 2 条因未构建 `pru` 字典不计，合计 239；下表为**选项名大小写修复后**的分布——49 次
 `must be specified` 归零但总数不变、首因整体后移，见[复盘](docs/work-log/2026-09-22-upstream-regression-failures.md#复盘计数口径与重排后补)
 的「收益不可加」）：
@@ -320,7 +320,7 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 |---|---|---|
 | 温度传感器（`temperature_*`） | **0** | T7（已完成） |
 | 选项名大小写（`optionxform`） | **0** | 已对齐（49 → 0） |
-| `Unknown pin chip name 'probe'`（余量靠 `[bltouch]`/`[smart_effector]`/eddy 注册 chip） | 20 | T4 / H9（M2/M3/M5） |
+| `Unknown pin chip name 'probe'`（仅剩 `eddy`——`probe_eddy_current` 属 M5） | 1 | T4 / H9（M5） |
 | TMC：段 23 + pin chip 7 | 30 | T6 / H5 |
 | `Error loading kinematics`（delta / generic_cartesian / rotary_delta / polar / winch / deltesian） | 21 | T5（C1c-2/3/4） |
 | `Section 'display'` | 21 | T9 / H8 |
@@ -341,7 +341,7 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 （本表随每个单元更新：2026-09-23 探针链路单元后实测；除 probe 行外其余各行的拆分仍取 U3a 时点，
 后续单元只会把首因往后推、总数不变，逐单元变化见各自提交信息。已转绿的语料：`linuxtest.test`、
 `commands.test`、`out_of_bounds.test`、`bed_mesh.test`、`z_virtual_endstop.test` 与
-`printers.test → printer-wanhao-duplicator-i3-plus-mark2-2019`、`z_tilt.test`、`quad_gantry_level.test`。）
+`printers.test → printer-wanhao-duplicator-i3-plus-mark2-2019`、`z_tilt.test`、`quad_gantry_level.test`、`bltouch.test`、`smart_effector.test`。）
 
 **T3 之后按首次失败分组的工单**：
 
@@ -473,8 +473,7 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
       `QUERY_PROBE`/`PROBE`/`PROBE_ACCURACY`、`probe:update_results` 发送；**待做**：
       `PROBE_CALIBRATE`/`Z_OFFSET_APPLY_PROBE`（需 `manual_probe` + `configfile.set()`）、
       `ProbePointsHelper`（消费者 z_tilt/screws）、endstop wrapper 的 `z_offset`/`query_endstop` 覆盖——
-      需先把 `PinChip::setup_endstop` 的返回类型接口化）、`bltouch.py`、`smart_effector.py`、
-      `probe_eddy_current.py`、`manual_probe.py`、`safe_z_home.py`、`endstop_phase.py`。
+      需先把 `PinChip::setup_endstop` 的返回类型接口化）、`probe_eddy_current.py`、`manual_probe.py`、`safe_z_home.py`、`endstop_phase.py`。
 - [ ] **保真单元：bed_mesh 插值 + 调平应用**（排在 H9 模块闭包之后）：`LagrangeMesh`/`BicubicMesh` +
       `mesh_pps` → `mesh_matrix`、`get_z(x, y)`，以及把网格作用到 move（`gcode_move` 的 move-transform
       seam + `MoveSplitter` + `fade_*`）。素材：`abandoned/wip-main-leftovers` 的 `bed_mesh.rs`

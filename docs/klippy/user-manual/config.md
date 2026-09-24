@@ -642,3 +642,37 @@ pins: !PD0, PD1, PD2
 | `retries` / `retry_tolerance` | `0` / `0.0` | 重试（错误信息附 `Possibly Z motor numbering is wrong`） |
 | `max_adjust` | `4.0` | 单电机调整量上限（`>0`），超过即中止 |
 
+### `[bltouch]` — BLTouch 探针（替代 `[probe]` 的物理实现）
+
+| 选项 | 默认 | 说明 |
+|------|------|------|
+| `control_pin` | **必需** | 传感器控制脚；占空比即单线协议（按上游 `Commands` 表发命令） |
+| `sensor_pin` | **必需** | 触发检测脚（endstop） |
+| `z_offset` | **必需** | 探针相对喷嘴的 Z 偏移 |
+| `x_offset` / `y_offset` | `0.0` | XY 偏移 |
+| `stow_on_each_sample` | `true` | 每次采样后收针 |
+| `pin_up_reports_not_triggered` | `true` | 抬针到位即视为未触发 |
+| `pin_up_touch_mode_reports_triggered` | `true` | 触摸模式语义 |
+| `probe_with_touch_mode` | `false` | 用触摸模式探测 |
+| `set_output_mode` | 上游默认 | 输出模式（5V/OD 等） |
+| `pin_move_time` | 上游默认 | 抬/落针时序 |
+
+探针族共用选项（`speed`/`lift_speed`/`samples`/`sample_retract_dist`/`samples_result`（默认 `average`）/
+`samples_tolerance`/`samples_tolerance_retries`/`horizontal_move_z` 等）由 `probe` 模块在本节上读取。
+装载时把自己注册为 `probe` 对象与 `probe` 虚拟 chip（`probe:z_virtual_endstop`），命令见
+`BLTOUCH_DEBUG`/`BLTOUCH_STORE` 与探针族三条。
+
+### `[smart_effector]` — Smart Effector 探针
+
+| 选项 | 默认 | 说明 |
+|------|------|------|
+| `pin` | **必需** | 触发脚（endstop） |
+| `control_pin` | 可选 | 控制脚（数字输出）；**只有配置它才注册 `RESET_SMART_EFFECTOR`** |
+| `z_offset` | **必需** | 触发偏移 |
+| `probe_accel` | 上游默认 | 探测时允许的加速度（`SET_SMART_EFFECTER` 可运行期改） |
+
+同 BLTouch：把自己注册为 `probe` 对象与 `probe` 虚拟 chip，探针族共用选项由 `probe` 模块读取。
+`SET_SMART_EFFECTER` 可改 `SENSITIVITY`(0..255)/`ACCEL`(≥0)/`RECOVERY_TIME`(≥0)；注意本模块
+的 `probe_accel`/`recovery_time` 在探针移动时的往返钩子（上游 `probe_prepare/finish`）尚未接线
+（语料不触发，见 developer-manual 的缺口说明）。
+

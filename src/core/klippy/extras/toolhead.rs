@@ -65,6 +65,7 @@ use crate::core::klippy::config::{ConfigError, ConfigWrapper};
 use crate::core::klippy::error::KlippyError;
 use crate::core::klippy::event::KlippyEvent;
 use crate::core::klippy::extras::extruder::PrinterExtruder;
+use crate::core::klippy::extras::idex_modes;
 use crate::core::klippy::extras::query_endstops::{QueryEndstops, QUERY_ENDSTOPS_OBJECT};
 use crate::core::klippy::extras::stepper::{Rail, RailParams};
 use crate::core::klippy::gcode::{
@@ -349,6 +350,12 @@ impl ToolHeadObject {
                             ConfigError::new(format!("{}: {err}", config.identifier()))
                         })?;
                 }
+            }
+            // IDEX: the cartesian kinematics claims `[dual_carriage]` and
+            // hands the module this axis' primary rail
+            // (`kinematics/cartesian.py:24-34`).
+            if kind == KinematicsKind::Cartesian {
+                idex_modes::claim(&rails, printer);
             }
         }
 

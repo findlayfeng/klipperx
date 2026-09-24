@@ -343,6 +343,7 @@ mod tests {
                 "output_pin",
                 "pwm_cycle_time",
                 "pwm_tool",
+                "servo",
                 "adc_temperature",
                 "thermistor",
                 "bed_mesh",
@@ -380,6 +381,7 @@ mod tests {
                 "stepper_x",
                 "stepper_y",
                 "stepper_z",
+                "dual_carriage",
                 "printer"
             ]
         );

@@ -781,11 +781,11 @@ mod tests {
         let mut sync = ClockSyncRegression::new(80.);
         sync.reset(1_000_000., 1.);
         sync.update(1_000_000. + 40_000., 2.);
-        let (base_mcu, base_chip, inv_cfreq) = sync.get_clock_translation();
+        let (_base_mcu, base_chip, inv_cfreq) = sync.get_clock_translation();
         // One update from a zero-variance reset: the translation is exactly
-        // the observation's slope.
+        // the observation's slope, and the centre moves 5% toward it.
         assert!((inv_cfreq - 40_000.).abs() < 1e-9);
-        assert_eq!(base_chip, 1.);
+        assert_eq!(base_chip, 1.05);
 
         sync.set_last_chip_clock(13.);
         let (base_mcu, base_chip, inv_cfreq) = sync.get_clock_translation();
@@ -860,6 +860,10 @@ mod tests {
     #[test]
     fn test_apply_status_accumulates_sequences_across_wraps() {
         let reader = FixedFreqReader::new(80.);
+        // A fresh reader's duration filter is 0 (upstream clears it in
+        // `note_start`, which needs a connected MCU); seed it so the first
+        // status is not skipped.
+        reader.force_max_query_duration(1_000);
         // 65534 messages reported: msg_count = 65534*12 + 24/4, chip +1.
         reader.apply_status(1_000_000, 5, &status(65_534, 1_000, 24), true);
         assert_eq!(reader.last_sequence(), 65_534);

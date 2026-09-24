@@ -784,7 +784,7 @@ fn map_command(error: McuError) -> CommandError {
 mod tests {
     use super::*;
     use crate::core::klippy::api::protocol::{PushTarget, Request};
-    use crate::core::klippy::api::registry::{Api, EndpointContext, MuxEndpoint};
+    use crate::core::klippy::api::registry::{Api, EndpointContext};
     use crate::core::klippy::api::webhooks;
     use crate::core::klippy::interface::devices::frame_mock::FrameMock;
     use crate::core::klippy::interface::Interface;
@@ -835,15 +835,16 @@ mod tests {
             (1.000_000_4, 0x00ab_cdef),
             (2.0, 0xffff_0003),
             (3.0, 0x8000_0042),
+            (3.5, 0x2000_0042),
             (4.0, 0),
         ];
         let converted = convert_samples(conv, &named, &raw);
 
         // Only the encoded error drops its sample.
-        assert_eq!(converted.data.len(), 3);
+        assert_eq!(converted.data.len(), 4);
         assert_eq!(
-            converted.error_count, 3,
-            "three values took the error branch"
+            converted.error_count, 4,
+            "four values took the error branch"
         );
         assert_eq!(converted.data[0][0], 1.000_000, "time rounded to 6 digits");
         assert_eq!(
@@ -858,9 +859,12 @@ mod tests {
             .map(|(message, count)| (message.as_str(), *count))
             .collect();
         assert_eq!(errors.get("FW_ERROR_3"), Some(&1));
+        // Error bit 0x8 (sample 3.0) and a zero value (sample 4.0) both read
+        // as under-range; the 0x2 bit is the watchdog.
         assert_eq!(errors.get("Frequency under valid range"), Some(&2));
-        assert!(
-            errors.contains_key("Conversion Watchdog timeout"),
+        assert_eq!(
+            errors.get("Conversion Watchdog timeout"),
+            Some(&1),
             "{errors:?}"
         );
     }
@@ -871,7 +875,9 @@ mod tests {
         assert_eq!(drive_current_from_register(0), 0);
         assert_eq!(drive_current_from_register(15 << 6), 15);
         assert_eq!(drive_current_from_register(31 << 6), 31);
-        assert_eq!(drive_current_from_register(0b1010_1100_0000), 0b10101);
+        // Bits[10:6] carry the value: 0b1010_1100_0000 >> 6 = 0b101011,
+        // & 0x1f = 0b01011 = 11.
+        assert_eq!(drive_current_from_register(0b1010_1100_0000), 11);
         // Bits above the 5-bit field are ignored.
         assert_eq!(drive_current_from_register(0xffff << 6), 31);
     }
@@ -894,7 +900,7 @@ mod tests {
     /// `trigger_analog` tests do for the config list).
     fn decoded(
         mcu: &Mcu,
-        payloads: &[crate::core::klippy::msg::Payload],
+        payloads: &[crate::core::klippy::Payload],
     ) -> Vec<(String, Vec<crate::core::klippy::msg::proto::ArgValue>)> {
         let mut parser = Parser::new();
         mcu.dictionary().unwrap().install(&mut parser).unwrap();
@@ -908,8 +914,8 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn test_attach_trigger_analog_is_an_init_command_binding_the_trigger_oid() {
+    #[tokio::test]
+    async fn test_attach_trigger_analog_is_an_init_command_binding_the_trigger_oid() {
         let mcu = test_mcu();
         let builder = ConfigBuilder::new();
         let ld_oid = builder.create_oid().unwrap();
@@ -948,7 +954,8 @@ mod tests {
     fn no_op_helper(printer: &Arc<Printer>) -> Arc<BatchBulkHelper> {
         let batch_cb: BatchCb = Arc::new(|_| Box::pin(async { Ok(None) }));
         let cb: LifecycleCb = Arc::new(|| Box::pin(async { Ok(()) }));
-        BatchBulkHelper::new(printer, batch_cb, cb, cb, BATCH_INTERVAL)
+        let cb_stop: LifecycleCb = Arc::new(|| Box::pin(async { Ok(()) }));
+        BatchBulkHelper::new(printer, batch_cb, cb, cb_stop, BATCH_INTERVAL)
     }
 
     #[tokio::test]

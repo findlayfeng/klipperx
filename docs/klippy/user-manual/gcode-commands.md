@@ -535,6 +535,12 @@ SPI_SEND     DEVICE=flash DATA=04          // spi send ok
 | `SET_SMART_EFFECTER` | `SENSITIVITY`(0..255)、`ACCEL`(≥0)、`RECOVERY_TIME`(≥0) | 缺省取当前值；错误文案含上游的 `accelartion` 拼写 |
 | `RESET_SMART_EFFECTOR` | 无 | **仅当配置了 `control_pin` 才注册**；按 1000 bits/s 向控制脚发 `[131,131]` 帧复位 |
 
+### LDC_CALIBRATE_DRIVE_CURRENT — LDC1612 驱动电流标定（由 `ldc1612` 对象注册，mux 键 `CHIP=`）
+
+| 命令 | 参数 | 说明 |
+|------|------|------|
+| `LDC_CALIBRATE_DRIVE_CURRENT` | `CHIP`（传感器名） | 对目标 LDC1612 做驱动电流标定，回显 `reg_drive_current` 提取值并给出 `SAVE_CONFIG` 提示（细节见 `extras/ldc1612.rs`）；`ldc1612` 对象由 probe_eddy_current 构造，该命令随对象装载注册 |
+
 ## 未注册命令的处理
 
 没有命中处理器的命令走默认处理器（对应上游 `klippy/gcode.py` 的 `cmd_default`）：

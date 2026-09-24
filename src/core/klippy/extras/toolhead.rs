@@ -1981,6 +1981,80 @@ mod tests {
     }
 
     #[test]
+    fn test_the_polar_kinematics_claims_its_sections_and_bed() {
+        use crate::core::klippy::config::Config;
+        use crate::core::klippy::reactor::ManualReactor;
+
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        let text = "[mcu]\nserial: /dev/not-opened-yet\n\
+             [stepper_bed]\nstep_pin: PA0\ndir_pin: PA1\n\
+             microsteps: 16\ngear_ratio: 80:16\n\
+             [stepper_arm]\nstep_pin: PA2\ndir_pin: PA3\n\
+             rotation_distance: 40\nmicrosteps: 16\n\
+             endstop_pin: ^PA4\nposition_endstop: 300\n\
+             position_max: 300\nhoming_speed: 50\n\
+             [stepper_z]\nstep_pin: PA5\ndir_pin: PA6\n\
+             rotation_distance: 8\nmicrosteps: 16\n\
+             endstop_pin: ^PA7\nposition_endstop: 0.5\n\
+             position_max: 200\n\
+             [printer]\nkinematics: polar\nmax_velocity: 300\n\
+             max_accel: 3000\nmax_angular_velocity: 5\n";
+        let (config, _) = Config::from_text(text).expect("the config parses");
+        printer
+            .load_config(&config)
+            .unwrap_or_else(|err| panic!("polar: {err}"));
+
+        let object = printer
+            .lookup_object_as::<ToolHeadObject>("toolhead")
+            .expect("the toolhead is registered");
+        // `kinematics/polar.py:34-35`: rails = [arm, z] — two, not three.
+        assert_eq!(object.kind, KinematicsKind::Polar);
+        assert_eq!(object.rails.len(), 2);
+        assert_eq!(object.rails[0].name(), "stepper_arm");
+        assert_eq!(object.rails[1].name(), "stepper_z");
+        // The bed is claimed but belongs to no rail.
+        assert!(object.bed.is_some(), "the bed stepper is held");
+        assert!(printer.lookup_object("stepper_bed").is_some());
+        assert!(printer.lookup_object("stepper_arm").is_some());
+        // The angular cap was read from `[printer]` (upstream reads it in
+        // `PolarKinematics.__init__`).
+        assert_eq!(object.max_angular_velocity, 5.0);
+        // The Z rail is found by name, not by cartesian index.
+        assert_eq!(object.z_stepper_names(), ["stepper_z"]);
+    }
+
+    #[test]
+    fn test_polar_without_a_stepper_bed_section_is_refused() {
+        use crate::core::klippy::config::Config;
+        use crate::core::klippy::reactor::ManualReactor;
+
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        let text = "[mcu]\nserial: /dev/not-opened-yet\n\
+             [stepper_arm]\nstep_pin: PA2\ndir_pin: PA3\n\
+             rotation_distance: 40\nmicrosteps: 16\n\
+             endstop_pin: ^PA4\nposition_endstop: 300\n\
+             position_max: 300\nhoming_speed: 50\n\
+             [stepper_z]\nstep_pin: PA5\ndir_pin: PA6\n\
+             rotation_distance: 8\nmicrosteps: 16\n\
+             endstop_pin: ^PA7\nposition_endstop: 0.5\n\
+             position_max: 200\n\
+             [printer]\nkinematics: polar\nmax_velocity: 300\nmax_accel: 3000\n";
+        let (config, _) = Config::from_text(text).expect("the config parses");
+
+        let err = printer.load_config(&config).unwrap_err().to_string();
+        assert!(err.contains("stepper_bed"), "{err}");
+    }
+
+    #[test]
+    fn test_polar_is_a_known_kinematics_name() {
+        assert_eq!(KinematicsKind::parse("polar"), Some(KinematicsKind::Polar));
+        assert!(KinematicsKind::NAMES.contains(&"polar"));
+        // The unsupported-name error lists it (the message the corpus sees).
+        let names = KinematicsKind::NAMES.join(", ");
+        assert!(names.contains("polar"), "{names}");
+    }
+
+    #[test]
     fn test_mcu_errors_are_reported_with_the_section_name() {
         // `McuError::Config` is what a missing connection reports; the test just
         // pins that the helper keeps the `[printer]` prefix.

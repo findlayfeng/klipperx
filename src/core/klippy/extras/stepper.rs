@@ -923,4 +923,126 @@ mod tests {
             "{err}"
         );
     }
+
+    // ----------------------------------------------------------------------
+    // Polar's sections (`kinematics/polar.py:26-28`)
+    // ----------------------------------------------------------------------
+
+    /// An `[mcu]` plus `[stepper_bed]` with the given extra options: the
+    /// bare radians-mode motor (no `rotation_distance`, no `position_*`).
+    fn config_with_bed(extra: &str) -> String {
+        format!(
+            "[mcu]\nserial: /dev/not-opened-yet\n\
+             [stepper_bed]\nstep_pin: PA0\ndir_pin: PA1\n\
+             microsteps: 16\ngear_ratio: 80:16\n{extra}"
+        )
+    }
+
+    /// An `[mcu]` plus `[stepper_arm]` (the polar rail) with extras.
+    fn config_with_arm(extra: &str) -> String {
+        format!(
+            "[mcu]\nserial: /dev/not-opened-yet\n\
+             [stepper_arm]\nstep_pin: PA0\ndir_pin: PA1\n\
+             rotation_distance: 40\nmicrosteps: 16\n\
+             endstop_pin: ^PA2\nposition_endstop: 300\n\
+             position_max: 300\nhoming_speed: 50\n{extra}"
+        )
+    }
+
+    #[test]
+    fn test_stepper_bed_claims_in_radians_mode_without_geometry() {
+        let (printer, result) = load(&config_with_bed(""));
+        result.unwrap();
+
+        // The section is claimed: the object is registered (and, like every
+        // stepper, stays out of `objects/list`).
+        let stepper = printer
+            .lookup_object_as::<PrinterStepper>("stepper_bed")
+            .expect("stepper_bed registered");
+        assert_eq!(stepper.name(), "stepper_bed");
+        assert!(!printer
+            .queryable_objects()
+            .contains(&"stepper_bed".to_string()));
+
+        // Radians mode: no `rotation_distance`, a `gear_ratio` → the step
+        // distance is 2π / (full_steps · microsteps · gearing)
+        // = 2π / (200 · 16 · 5) (`parse_step_distance`'s inference).
+        let expected = std::f64::consts::TAU / (200.0 * 16.0 * 5.0);
+        assert!(
+            (stepper.step_dist() - expected).abs() < 1e-12,
+            "{}",
+            stepper.step_dist()
+        );
+        // Bare motor: no rail geometry was read, so no range or homing
+        // info exists (`polar.py:26` passes no rail).
+        assert_eq!(stepper.params().position_min, 0.0);
+        assert_eq!(stepper.params().position_max, 0.0);
+        assert!(stepper.endstop().is_none());
+    }
+
+    #[test]
+    fn test_a_bed_with_rotation_distance_stays_in_millimetres() {
+        // The inference only fires without `rotation_distance`; with one,
+        // gearing multiplies as on any other stepper.
+        let (printer, result) = load(&config_with_bed("rotation_distance: 40\n"));
+        result.unwrap();
+
+        let stepper = printer
+            .lookup_object_as::<PrinterStepper>("stepper_bed")
+            .unwrap();
+        let expected = 40.0 / (200.0 * 16.0 * 5.0);
+        assert!((stepper.step_dist() - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_a_stepper_with_neither_rotation_distance_nor_gearing_is_refused() {
+        // No `rotation_distance` and no `gear_ratio` is not radians mode —
+        // upstream fails on the missing `rotation_distance` too.
+        let (_, result) = load(
+            "[mcu]\nserial: /dev/not-opened-yet\n\
+             [stepper_bed]\nstep_pin: PA0\ndir_pin: PA1\nmicrosteps: 16\n",
+        );
+
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("rotation_distance"), "{err}");
+    }
+
+    #[test]
+    fn test_stepper_arm_claims_as_a_rail_with_homing_info() {
+        let (printer, result) = load(&config_with_arm(""));
+        result.unwrap();
+
+        let stepper = printer
+            .lookup_object_as::<PrinterStepper>("stepper_arm")
+            .expect("stepper_arm registered");
+        // Rail geometry: range 0..300 mm, endstop at the max.
+        assert_eq!(stepper.params().position_min, 0.0);
+        assert_eq!(stepper.params().position_max, 300.0);
+        assert_eq!(stepper.params().position_endstop, 300.0);
+        // The endstop built from `endstop_pin`…
+        assert!(stepper.endstop().is_some());
+        // …and homing inferred toward the max (endstop in the top quarter).
+        let info = stepper.homing_info();
+        assert!(info.positive_dir, "{}", info.positive_dir);
+        assert_eq!(info.position_endstop, 300.0);
+        assert_eq!(info.speed, 50.0);
+        // Millimetre mode: 40 mm / (200 · 16) per step.
+        let expected = 40.0 / (200.0 * 16.0);
+        assert!((stepper.step_dist() - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_an_arm_without_position_max_is_refused() {
+        // The arm is a rail, so `position_max` is as required as it is for
+        // `[stepper_x]`.
+        let (_, result) = load(
+            "[mcu]\nserial: /dev/not-opened-yet\n\
+             [stepper_arm]\nstep_pin: PA0\ndir_pin: PA1\n\
+             rotation_distance: 40\nmicrosteps: 16\n\
+             position_endstop: 300\n",
+        );
+
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("position_max"), "{err}");
+    }
 }

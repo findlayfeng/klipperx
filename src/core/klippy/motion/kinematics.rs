@@ -1021,4 +1021,319 @@ mod tests {
         assert_eq!(forcepos[X_AXIS], None);
         assert_eq!(movepos[X_AXIS], None);
     }
+
+    // ----------------------------------------------------------------------
+    // Polar (`kinematics/polar.py`, `chelper/kin_polar.c`)
+    // ----------------------------------------------------------------------
+
+    /// A polar kinematics shaped like `config/example-polar.cfg`: arm
+    /// radius 0..300, Z 0..200, angular cap off (tests turn it on
+    /// explicitly).
+    fn polar(v_rad_max: f64) -> PolarKinematics {
+        PolarKinematics::new(
+            [
+                "stepper_bed".to_string(),
+                "stepper_arm".to_string(),
+                "stepper_z".to_string(),
+            ],
+            (0.0, 300.0),
+            (0.0, 200.0),
+            limits(),
+            15.0,
+            10.0,
+            v_rad_max,
+        )
+    }
+
+    #[test]
+    fn test_polar_stepper_fns_map_radius_angle_and_z() {
+        use crate::core::klippy::mathutil::Xyz;
+        use crate::core::klippy::motion::itersolve::AxisFlags;
+        use crate::core::klippy::motion::trapq::MoveSegment;
+
+        // A standing segment: evaluating it anywhere yields its start, so
+        // the fns read the known toolhead position (30, 40, 5).
+        let segment = MoveSegment {
+            print_time: 0.0,
+            move_t: 1.0,
+            start_v: 0.0,
+            half_accel: 0.0,
+            start_pos: Xyz::new(30.0, 40.0, 5.0),
+            axes_r: Xyz::default(),
+        };
+        // Arm: radius = distance to center (`kin_polar.c:9-15`).
+        assert_eq!(polar_radius_position(&segment, 0.5), 50.0);
+        // Bed: raw atan2 — the unwrap is the solver's hook, not the fn's
+        // (`kin_polar.c:17-24`).
+        assert_eq!(polar_angle_position(&segment, 0.5), 40.0f64.atan2(30.0));
+        // Both steppers follow X and Y (`kin_polar.c:46`).
+        assert_eq!(polar_active_flags(), AxisFlags::X.union(AxisFlags::Y));
+        // Radius at the center singularity is 0 (upstream's XXX case).
+        let at_origin = MoveSegment {
+            start_pos: Xyz::new(0.0, 0.0, 0.0),
+            ..segment
+        };
+        assert_eq!(polar_radius_position(&at_origin, 0.5), 0.0);
+        assert_eq!(polar_angle_position(&at_origin, 0.5), 0.0);
+    }
+
+    #[test]
+    fn test_polar_angle_unwrap_and_normalize_boundaries() {
+        use std::f64::consts::{PI, TAU};
+
+        // Inside the branch: no correction.
+        assert_eq!(polar_angle_unwrap(0.5, 0.4), 0.5);
+        // Wrapped raw against a commanded on the other side of ±π: one ∓2π
+        // shift, exactly as `polar_stepper_angle_calc_position`.
+        assert_eq!(polar_angle_unwrap(-3.0, 3.0), -3.0 + TAU);
+        assert_eq!(polar_angle_unwrap(3.0, -3.0), 3.0 - TAU);
+        // Exactly ±π away: upstream compares strictly, so no shift.
+        assert_eq!(polar_angle_unwrap(3.0 + PI, 3.0), 3.0 + PI);
+        assert_eq!(polar_angle_unwrap(3.0 - PI, 3.0), 3.0 - PI);
+
+        // The post-range fixup shifts back into [-π, π] — once, as
+        // `polar_stepper_angle_post_fixup` does (7π → 5π, not into range:
+        // upstream's single ±2π, not a loop).
+        let mut commanded = 3.5;
+        polar_angle_normalize(&mut commanded);
+        assert_eq!(commanded, 3.5 - TAU);
+        let mut commanded = -3.5;
+        polar_angle_normalize(&mut commanded);
+        assert_eq!(commanded, -3.5 + TAU);
+        let mut commanded = PI;
+        polar_angle_normalize(&mut commanded);
+        assert_eq!(commanded, PI, "strict comparison: π stays");
+        let mut commanded = 7.0 * PI;
+        polar_angle_normalize(&mut commanded);
+        assert_eq!(commanded, 7.0 * PI - TAU, "single shift, as upstream");
+        let mut commanded = 0.5;
+        polar_angle_normalize(&mut commanded);
+        assert_eq!(commanded, 0.5, "inside the range: untouched");
+    }
+
+    #[test]
+    fn test_polar_calc_position_round_trips_a_known_configuration() {
+        let kin = polar(0.0);
+
+        // Forward: a known stepper configuration (θ = 60°, r = 150,
+        // z = 25) maps to the carriage: x = 75, y = 75√3, z = 25.
+        let known = HashMap::from([
+            ("stepper_bed".to_string(), std::f64::consts::FRAC_PI_3),
+            ("stepper_arm".to_string(), 150.0),
+            ("stepper_z".to_string(), 25.0),
+        ]);
+        let out = kin.calc_position(&known);
+        assert!((out[0].unwrap() - 75.0).abs() < 1e-9, "{}", out[0].unwrap());
+        assert!((out[1].unwrap() - 75.0 * 3.0f64.sqrt()).abs() < 1e-9);
+        assert_eq!(out[2], Some(25.0));
+
+        // Inverse: a carriage point through the angle/radius solvers comes
+        // back to itself (the round trip `polar.test` exercises).
+        let (x, y, z): (f64, f64, f64) = (100.0, -50.0, 7.0);
+        let bed = y.atan2(x);
+        let arm = (x * x + y * y).sqrt();
+        let round_trip = kin.calc_position(&HashMap::from([
+            ("stepper_bed".to_string(), bed),
+            ("stepper_arm".to_string(), arm),
+            ("stepper_z".to_string(), z),
+        ]));
+        assert!((round_trip[0].unwrap() - x).abs() < 1e-9);
+        assert!((round_trip[1].unwrap() - y).abs() < 1e-9);
+        assert_eq!(round_trip[2], Some(z));
+
+        // Missing steppers: the axes they feed are undeterminable.
+        assert_eq!(kin.calc_position(&HashMap::new()), [None, None, None]);
+    }
+
+    #[test]
+    fn test_polar_home_move_pins_y_and_pushes_to_the_far_limit() {
+        use std::f64::consts::PI;
+        let _ = PI;
+
+        // Arm (axis 0, endstop at the max): force sits exactly at the min
+        // (1.0× push — no overshoot behind the center) and Y is pinned to 0
+        // so the drip move stays on the +X radius (`polar.py:70-74`).
+        let info = homing_info(300.0, true);
+        let (forcepos, movepos) = polar_home_move(X_AXIS, &info, 0.0, 300.0);
+        assert_eq!(forcepos, [Some(0.0), Some(0.0), None, None]);
+        assert_eq!(movepos, [Some(300.0), Some(0.0), None, None]);
+
+        // Z (endstop at the bottom): force at the max, endstop as target.
+        let info = homing_info(0.5, false);
+        let (forcepos, movepos) = polar_home_move(Z_AXIS, &info, 0.0, 200.0);
+        assert_eq!(forcepos, [None, None, Some(200.0), None]);
+        assert_eq!(movepos, [None, None, Some(0.5), None]);
+    }
+
+    #[test]
+    fn test_polar_check_move_gates_the_square_and_the_z_axis() {
+        let mut kin = polar(0.0);
+
+        // Unhomed: any XY move must be refused (limit_xy2 = -1).
+        let mut m1 = move_(Coord::default(), Coord::new(10.0, 0.0, 0.0, 0.0));
+        let err = kin.check_move(&mut MoveContext::new(&mut m1)).unwrap_err();
+        assert!(err.to_string().contains("Must home axis first"), "{err}");
+
+        // Homed XY opens the 300² square; past it is out of range.
+        kin.set_position(Coord::default(), &[X_AXIS, Y_AXIS]);
+        let mut m2 = move_(Coord::default(), Coord::new(400.0, 0.0, 0.0, 0.0));
+        let err = kin.check_move(&mut MoveContext::new(&mut m2)).unwrap_err();
+        assert!(err.to_string().contains("Move out of range"), "{err}");
+        let mut m3 = move_(Coord::default(), Coord::new(100.0, 0.0, 0.0, 0.0));
+        kin.check_move(&mut MoveContext::new(&mut m3)).unwrap();
+
+        // Z unhomed: a Z move is refused; homed and past the range:
+        // out of range; homed and inside: the Z speed share is applied.
+        let mut m4 = move_(
+            Coord::new(100.0, 0.0, 0.0, 0.0),
+            Coord::new(100.0, 0.0, 5.0, 0.0),
+        );
+        let err = kin.check_move(&mut MoveContext::new(&mut m4)).unwrap_err();
+        assert!(err.to_string().contains("Must home axis first"), "{err}");
+
+        kin.set_position(Coord::default(), &[Z_AXIS]);
+        let mut m5 = move_(
+            Coord::new(100.0, 0.0, 0.0, 0.0),
+            Coord::new(100.0, 0.0, 300.0, 0.0),
+        );
+        let err = kin.check_move(&mut MoveContext::new(&mut m5)).unwrap_err();
+        assert!(err.to_string().contains("Move out of range"), "{err}");
+
+        let mut m6 = move_(
+            Coord::new(100.0, 0.0, 0.0, 0.0),
+            Coord::new(100.0, 0.0, 5.0, 0.0),
+        );
+        kin.check_move(&mut MoveContext::new(&mut m6)).unwrap();
+        // A pure-Z move: z_ratio = 1, so the Z caps apply directly.
+        assert_eq!(m6.max_cruise_v2, 15.0 * 15.0, "15 mm/s Z cap");
+        assert_eq!(m6.accel, 10.0, "10 mm/s² Z accel cap");
+    }
+
+    #[test]
+    fn test_polar_check_move_slows_down_near_the_center() {
+        // v_rad_max = 5 rad/s, as in example-polar.cfg.
+        let mut kin = polar(5.0);
+        kin.set_position(Coord::default(), &[X_AXIS, Y_AXIS]);
+
+        // (10, 0) → (1, 0): closest approach is 1 mm, so the linear cap is
+        // max_velocity · (v_rad_max / v_angular) = 200 · 5/100 = 10 mm/s.
+        let mut m1 = move_(
+            Coord::new(10.0, 0.0, 0.0, 0.0),
+            Coord::new(1.0, 0.0, 0.0, 0.0),
+        );
+        kin.check_move(&mut MoveContext::new(&mut m1)).unwrap();
+        assert_eq!(m1.max_cruise_v2, 10.0 * 10.0, "{}", m1.max_cruise_v2);
+        assert_eq!(m1.accel, 50.0, "accel scaled with it");
+
+        // Far from the center (radius 100 → 5 mm/s at 100 mm/s cruise
+        // exceeds the cap, but the closest approach here is 100 mm, giving
+        // v_angular = 1 mm/s < 5: no slowdown).
+        let mut m2 = move_(
+            Coord::new(100.0, 0.0, 0.0, 0.0),
+            Coord::new(200.0, 0.0, 0.0, 0.0),
+        );
+        kin.check_move(&mut MoveContext::new(&mut m2)).unwrap();
+        assert_eq!(m2.max_cruise_v2, 100.0 * 100.0, "untouched");
+
+        // Starting exactly at the center: distance 0, nothing to scale by
+        // (upstream's early return).
+        let mut m3 = move_(Coord::default(), Coord::new(10.0, 0.0, 0.0, 0.0));
+        kin.check_move(&mut MoveContext::new(&mut m3)).unwrap();
+        assert_eq!(m3.max_cruise_v2, 100.0 * 100.0, "untouched");
+
+        // v_rad_max = 0 disables the whole branch (upstream default).
+        let mut kin = polar(0.0);
+        kin.set_position(Coord::default(), &[X_AXIS, Y_AXIS]);
+        let mut m4 = move_(
+            Coord::new(10.0, 0.0, 0.0, 0.0),
+            Coord::new(1.0, 0.0, 0.0, 0.0),
+        );
+        kin.check_move(&mut MoveContext::new(&mut m4)).unwrap();
+        assert_eq!(m4.max_cruise_v2, 100.0 * 100.0, "untouched");
+    }
+
+    #[test]
+    fn test_distance_to_center_picks_the_closest_part() {
+        // Before the segment start: the start itself.
+        assert_eq!(distance_to_center((5.0, 0.0), (10.0, 0.0)), 5.0);
+        // Beyond the segment end: the end itself.
+        assert_eq!(distance_to_center((-10.0, 0.0), (-5.0, 0.0)), 5.0);
+        // The perpendicular foot lies on the segment.
+        assert_eq!(distance_to_center((10.0, -5.0), (10.0, 5.0)), 10.0);
+        // A segment through the center: 0 (the homing move's case).
+        assert_eq!(distance_to_center((0.0, 0.0), (300.0, 0.0)), 0.0);
+    }
+
+    #[test]
+    fn test_polar_status_reports_the_homed_axes() {
+        let mut kin = polar(0.0);
+        assert_eq!(kin.get_status()["homed_axes"], "");
+        // X and Y are marked together — the square opens as one.
+        kin.set_position(Coord::default(), &[X_AXIS, Y_AXIS]);
+        assert_eq!(kin.get_status()["homed_axes"], "xy");
+        kin.set_position(Coord::default(), &[Z_AXIS]);
+        assert_eq!(kin.get_status()["homed_axes"], "xyz");
+        // Clearing either X or Y closes the whole square.
+        kin.clear_homing_state(&[X_AXIS]);
+        assert_eq!(kin.get_status()["homed_axes"], "z");
+        kin.clear_homing_state(&[Z_AXIS]);
+        assert_eq!(kin.get_status()["homed_axes"], "");
+    }
+
+    #[test]
+    fn test_polar_home_homes_xy_together_then_z() {
+        let mut kin = polar(0.0);
+        let mut homing = FakeHoming {
+            // `G28` requested everything.
+            axes: vec![X_AXIS, Y_AXIS, Z_AXIS],
+            info: [
+                homing_info(300.0, true),
+                homing_info(0.0, false),
+                homing_info(0.5, false),
+            ],
+            calls: Vec::new(),
+        };
+
+        kin.home(&mut homing);
+
+        // Two homes: XY together on the arm rail (Y pinned), then Z.
+        assert_eq!(homing.calls.len(), 2);
+        let (rails, forcepos, movepos) = &homing.calls[0];
+        assert_eq!(rails, &[X_AXIS], "arm rail homes X (with Y)");
+        assert_eq!(*forcepos, [Some(0.0), Some(0.0), None, None]);
+        assert_eq!(*movepos, [Some(300.0), Some(0.0), None, None]);
+        let (rails, forcepos, movepos) = &homing.calls[1];
+        assert_eq!(rails, &[Z_AXIS]);
+        assert_eq!(*forcepos, [None, None, Some(200.0), None]);
+        assert_eq!(*movepos, [None, None, Some(0.5), None]);
+
+        // Only Z requested: XY stay put.
+        let mut homing = FakeHoming {
+            axes: vec![Z_AXIS],
+            info: [
+                homing_info(300.0, true),
+                homing_info(0.0, false),
+                homing_info(0.5, false),
+            ],
+            calls: Vec::new(),
+        };
+        kin.home(&mut homing);
+        assert_eq!(homing.calls.len(), 1);
+        assert_eq!(homing.calls[0].0, &[Z_AXIS]);
+
+        // Y requested alone still homes the arm rail (polar homes XY
+        // together whenever either is asked for).
+        let mut homing = FakeHoming {
+            axes: vec![Y_AXIS],
+            info: [
+                homing_info(300.0, true),
+                homing_info(0.0, false),
+                homing_info(0.5, false),
+            ],
+            calls: Vec::new(),
+        };
+        kin.home(&mut homing);
+        assert_eq!(homing.calls.len(), 1);
+        assert_eq!(homing.calls[0].0, &[X_AXIS]);
+    }
 }

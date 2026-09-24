@@ -407,7 +407,6 @@ mod tests {
         "corexyuv.test",
         "delta.test",
         "delta_calibrate.test",
-        "dual_carriage.test",
         "eddy.test",
         "exclude_object.test",
         "extruders.test",

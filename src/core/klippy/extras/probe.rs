@@ -32,7 +32,7 @@ use crate::core::klippy::event::KlippyEvent;
 use crate::core::klippy::extras::manual_probe::{
     FinalizeCallback, ManualProbe, MANUAL_PROBE_OBJECT,
 };
-use crate::core::klippy::extras::toolhead::ToolHeadObject;
+use crate::core::klippy::extras::toolhead::{HomingEndstop, ToolHeadObject};
 use crate::core::klippy::gcode::{
     CommandError, CommandFuture, GCodeDispatch, GcodeCommand, GCODE_OBJECT,
 };
@@ -245,13 +245,16 @@ impl ProbeParams {
 }
 
 /// The chip behind `endstop_pin: probe:…`.
-struct ProbeChip {
+///
+/// Shared with `[bltouch]`, which registers the same virtual name for its
+/// sensor endstop (`bltouch.py:HomingViaProbeHelper`).
+pub(crate) struct ProbeChip {
     /// The physical probe endstop the virtual name resolves to.
-    endstop: Arc<McuEndstop>,
+    pub(crate) endstop: Arc<McuEndstop>,
     /// The probe's trigger offset: what a `probe:z_virtual_endstop` rail uses
     /// as its `position_endstop` (`ProbeEndstopWrapper.get_position_endstop`,
     /// `probe.py:551-552`).
-    z_offset: f64,
+    pub(crate) z_offset: f64,
 }
 
 impl PinChip for ProbeChip {
@@ -273,7 +276,7 @@ impl PinChip for ProbeChip {
 /// Upstream's two refusals for the virtual endstop (`probe.py:223-229`).
 ///
 /// Split out so the checks are testable without an MCU.
-fn check_virtual_endstop(params: &PinParams) -> Result<(), PinError> {
+pub(crate) fn check_virtual_endstop(params: &PinParams) -> Result<(), PinError> {
     if params.pin != VIRTUAL_ENDSTOP {
         return Err(PinError::Message(
             "Probe virtual endstop only useful as endstop pin".to_string(),
@@ -312,21 +315,57 @@ fn calc_probe_z_average(positions: &[Coord], method: &str) -> Coord {
 }
 
 /// The state `PROBE`/`QUERY_PROBE` report (`ProbeCommandHelper.get_status`).
+///
+/// Shared with `[bltouch]`, whose section registers both the `bltouch` and the
+/// `probe` object and reports this state from either (`bltouch.py:load_config`).
 #[derive(Debug, Default)]
-struct ProbeCommandState {
+pub(crate) struct ProbeCommandState {
     /// The last `QUERY_PROBE` result.
     last_query: AtomicBool,
     /// The last `PROBE` result.
     last_z_result: Mutex<f64>,
 }
 
+/// What `get_status` reports for either probe section
+/// (`ProbeCommandHelper.get_status`), keyed by the section's identifier.
+pub(crate) fn command_status(name: &str, state: &ProbeCommandState) -> Value {
+    json!({
+        "name": name,
+        "last_query": state.last_query.load(Ordering::SeqCst),
+        "last_z_result": *state
+            .last_z_result
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()),
+    })
+}
+
+/// The callbacks a probe with its own hardware runs around one probing move
+/// (`bltouch.py:BLTouchProbe.start_probe_session`, `_probe_prepare`,
+/// `_probe_finish`, `end_probe_session`). `[probe]` passes no hooks.
+pub(crate) struct ProbeHooks {
+    /// A session opened (`BLTouchProbe.start_probe_session`).
+    pub(crate) start: Arc<dyn Fn() -> Result<(), CommandError> + Send + Sync>,
+    /// A session closed (`BLTouchProbe.end_probe_session`).
+    pub(crate) end: Arc<dyn Fn() -> Result<(), CommandError> + Send + Sync>,
+    /// Before the probing move: lower the probe (`_probe_prepare`).
+    pub(crate) prepare: Arc<dyn Fn() -> CommandFuture<'static> + Send + Sync>,
+    /// After it, success **or** failure (`_probe_finish`).
+    pub(crate) finish: Arc<dyn Fn() -> CommandFuture<'static> + Send + Sync>,
+}
+
 /// Tracks a series of probe attempts within one command
 /// (`probe.py:ProbeSessionHelper`).
-struct ProbeSessionHelper {
+pub(crate) struct ProbeSessionHelper {
     /// The machine, for the toolhead and the results event.
     printer: Weak<Printer>,
-    /// The physical probe endstop every probing move drives.
-    endstop: Arc<McuEndstop>,
+    /// What every probing move drives: the physical endstop for `[probe]`, the
+    /// BLTouch wrapper (which raises the pin once the sensor trips) for
+    /// `[bltouch]` (`BLTouchProbe.home_start`).
+    endstop: Arc<dyn HomingEndstop>,
+    /// The endstop `QUERY_PROBE` reads. Upstream asks the probe's own
+    /// `query_endstop`, which for a BLTouch is the bare sensor endstop
+    /// (`bltouch.py:BLTouchProbe.query_endstop`).
+    query_endstop: Arc<McuEndstop>,
     /// The Z to move down to while probing: `[stepper_z] position_min`, or
     /// `[printer] minimum_z_position` when there is no Z stepper
     /// (`probe.py:238-245`).
@@ -337,6 +376,8 @@ struct ProbeSessionHelper {
     pending: AtomicBool,
     /// The sample sets run in this session.
     results: Mutex<Vec<Coord>>,
+    /// The hardware's session callbacks, when the probe has its own (`[bltouch]`).
+    hooks: Option<ProbeHooks>,
 }
 
 impl ProbeSessionHelper {
@@ -345,11 +386,13 @@ impl ProbeSessionHelper {
     /// # Errors
     /// When `[stepper_z] position_min` / `[printer] minimum_z_position` is
     /// present but not a number.
-    fn new(
+    pub(crate) fn new(
         config: &ConfigWrapper,
         printer: &Arc<Printer>,
-        endstop: Arc<McuEndstop>,
+        endstop: Arc<dyn HomingEndstop>,
+        query_endstop: Arc<McuEndstop>,
         options: &ProbeOptions,
+        hooks: Option<ProbeHooks>,
     ) -> Result<Self, ConfigError> {
         // Upstream reads this with `note_valid=False`, so the option stays
         // "unused" for the undefined-option check; reading it through the
@@ -364,10 +407,12 @@ impl ProbeSessionHelper {
         Ok(Self {
             printer: Arc::downgrade(printer),
             endstop,
+            query_endstop,
             z_position,
             defaults: ProbeParams::from_options(options),
             pending: AtomicBool::new(false),
             results: Mutex::new(Vec::new()),
+            hooks,
         })
     }
 
@@ -396,13 +441,17 @@ impl ProbeSessionHelper {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clear();
+        if let Some(hooks) = &self.hooks {
+            (hooks.start)()?;
+        }
         Ok(())
     }
 
     /// Close a session (`probe.py:end_probe_session`).
     ///
     /// # Errors
-    /// When no session is open.
+    /// When no session is open, or the hardware's own close step fails
+    /// (`BLTouchProbe.end_probe_session`).
     fn end(&self) -> Result<(), CommandError> {
         if !self.pending.swap(false, Ordering::SeqCst) {
             return Err(Self::state_error());
@@ -411,6 +460,9 @@ impl ProbeSessionHelper {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clear();
+        if let Some(hooks) = &self.hooks {
+            (hooks.end)()?;
+        }
         Ok(())
     }
 
@@ -437,7 +489,29 @@ impl ProbeSessionHelper {
             .position()
             .ok_or_else(|| CommandError::new("Printer is not ready"))?;
         target.set_axis(Z_AXIS, self.z_position);
-        let epos = toolhead.probing_move(&*self.endstop, target, speed).await?;
+
+        // The probe's own prepare step runs before the move
+        // (`BLTouchProbe.run_probe` lowers the pin first).
+        if let Some(hooks) = &self.hooks {
+            (hooks.prepare)().await?;
+        }
+        let moved = toolhead.probing_move(&*self.endstop, target, speed).await;
+        // …and its finish step runs whether or not the move got its trigger
+        // (`BLTouchProbe.run_probe`'s `except: _probe_finish(); raise`).
+        let epos = match moved {
+            Ok(epos) => {
+                if let Some(hooks) = &self.hooks {
+                    (hooks.finish)().await?;
+                }
+                epos
+            }
+            Err(err) => {
+                if let Some(hooks) = &self.hooks {
+                    (hooks.finish)().await?;
+                }
+                return Err(err);
+            }
+        };
         // `axis_twist_compensation` updates its results from this event
         // (`probe.py:329`); this port's event carries no payload yet.
         if let Some(printer) = self.printer.upgrade() {
@@ -573,8 +647,10 @@ impl PrinterProbe {
         let session = Arc::new(ProbeSessionHelper::new(
             config,
             printer,
+            Arc::clone(&endstop) as Arc<dyn HomingEndstop>,
             Arc::clone(&endstop),
             &options,
+            None,
         )?);
         let state = Arc::new(ProbeCommandState::default());
         let offsets = ProbeOffsets {
@@ -591,6 +667,25 @@ impl PrinterProbe {
             session,
             state,
         })
+    }
+
+    /// Assemble the section from parts a sibling probe section already built
+    /// (`[bltouch]`, which owns the hardware but reports through this type,
+    /// `bltouch.py:PrinterBLTouch`).
+    pub(crate) fn from_parts(
+        identifier: String,
+        options: ProbeOptions,
+        endstop: Arc<McuEndstop>,
+        session: Arc<ProbeSessionHelper>,
+        state: Arc<ProbeCommandState>,
+    ) -> Self {
+        Self {
+            identifier,
+            options,
+            endstop,
+            session,
+            state,
+        }
     }
 
     /// The section identifier.
@@ -647,7 +742,7 @@ impl PrinterProbe {
 /// Register `QUERY_PROBE`, `PROBE` and `PROBE_ACCURACY`
 /// (`probe.py:ProbeCommandHelper`), plus the session cleanup on a command
 /// error.
-fn register_commands(
+pub(crate) fn register_commands(
     printer: &Arc<Printer>,
     identifier: &str,
     session: &Arc<ProbeSessionHelper>,
@@ -689,7 +784,7 @@ fn register_commands(
                         let toolhead = session.toolhead()?;
                         let print_time = toolhead.print_time();
                         let triggered = session
-                            .endstop
+                            .query_endstop
                             .query_endstop(print_time)
                             .await
                             .map_err(|err| CommandError::new(err.to_string()))?;
@@ -895,15 +990,7 @@ fn register_commands(
 
 impl PrinterObject for PrinterProbe {
     fn get_status(&self, _eventtime: f64) -> Value {
-        json!({
-            "name": self.identifier,
-            "last_query": self.state.last_query.load(Ordering::SeqCst),
-            "last_z_result": *self
-                .state
-                .last_z_result
-                .lock()
-                .unwrap_or_else(|p| p.into_inner()),
-        })
+        command_status(&self.identifier, &self.state)
     }
 }
 

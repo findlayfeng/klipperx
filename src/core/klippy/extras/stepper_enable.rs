@@ -475,7 +475,7 @@ mod tests {
 
     #[test]
     fn test_no_pin_returns_always_enabled() {
-        let (printer, result) = load(
+        let (_printer, _result) = load(
             "[mcu]\nserial: /dev/not-opened-yet\n\
              [stepper_x]\nstep_pin: PA0\ndir_pin: PA1\n\
              rotation_distance: 40\nmicrosteps: 16\nposition_max: 200\nenable_pin: ^PA2\n\

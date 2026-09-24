@@ -62,6 +62,19 @@ impl TriggerReason {
     }
 }
 
+/// Whether a **raw** trsync reason means the homing attempt failed.
+///
+/// The typed [`TriggerReason`] only covers 1-4; `trigger_analog` failures ride
+/// higher codes (`REASON_TRIGGER_ANALOG` and up, see
+/// [`trigger_analog`](crate::core::klippy::cmd::trigger_analog)), and upstream
+/// classifies by number: `res >= REASON_COMMS_TIMEOUT` is an error
+/// (`trigger_analog.py:377`). Codes this host does not know still compare
+/// correctly here, which is why callers that may see them use this instead of
+/// [`TriggerReason::is_failure`].
+pub fn raw_is_failure(raw: u8) -> bool {
+    raw >= TriggerReason::CommsTimeout as u8
+}
+
 /// `config_trsync oid=%c` — allocate a trigger group.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConfigTrsync {
@@ -214,5 +227,20 @@ mod tests {
         assert!(TriggerReason::CommsTimeout.is_failure());
         assert!(!TriggerReason::EndstopHit.is_failure());
         assert!(!TriggerReason::HostRequest.is_failure());
+    }
+
+    #[test]
+    fn raw_failure_classification_covers_the_typed_and_trigger_analog_codes() {
+        // 1-4 agree with the typed view: only a comms timeout is a failure.
+        for raw in 1..=3u8 {
+            assert!(!raw_is_failure(raw), "{raw}");
+        }
+        assert!(raw_is_failure(TriggerReason::CommsTimeout as u8));
+        // `trigger_analog` error codes 5-8 are failures too, though the typed
+        // enum does not name them.
+        for raw in 5..=8u8 {
+            assert!(raw_is_failure(raw), "{raw}");
+            assert!(TriggerReason::from_u8(raw).is_none(), "{raw}");
+        }
     }
 }

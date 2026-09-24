@@ -1229,15 +1229,17 @@ async fn home_axis(
 /// Events follow upstream order: `homing_move_begin` **before** any
 /// sampling or movement, `homing_move_end` after.
 ///
-/// Returns the position the move stopped at: the drip loop stops queueing when
-/// the trigger is seen, and the queued move's position at that time is what it
-/// reports (and what the toolhead's commanded position is set to). Upstream
-/// reads the firmware's stepper positions at the trigger clock instead; the
-/// corpus's fake MCUs have no step model, so this stands in for that.
+/// Returns the position the move stopped at: the move is always dripped to
+/// its end, and that end position is what it reports (and what the
+/// toolhead's commanded position is set to). This matches upstream's
+/// file-output mode, which completes the trigger only after the drip move
+/// ended (`mcu.py:TriggerDispatch.wait_end`) and takes `trigpos` at
+/// `home_end_time` (`homing.py`). This host's fake firmware fires the armed
+/// endstop at the move's first queued step, so ending the drip on that early
+/// clock would walk each repeated probe up by its retract distance and fail
+/// `samples_tolerance`.
 ///
 /// # Errors
-/// - `"Probe triggered prior to movement"` when the endstop was already
-///   triggered before any motion started.
 /// - `"No trigger on probe after full movement"` when the move completed
 ///   without an endstop hit.
 /// - A failed `home_start`, `home_wait`, kinematics refusal, or step send.
@@ -1255,13 +1257,26 @@ async fn probing_move(
     // Emit begin event **before** any sampling or movement (upstream order).
     send(printer, &KlippyEvent::HomingHomingMoveBegin);
 
-    // Zero-length move: nothing to move, probe triggered before movement.
+    // Zero-length probe: a successful no-op that reports the current
+    // position, as upstream's test mode answers it — `check_no_movement` is
+    // disabled under `debuginput` (homing.py), and `MCU_trsync.stop` reports
+    // `REASON_ENDSTOP_HIT` unconditionally in fileoutput (mcu.py), so
+    // `home_wait` reports the trigger at `home_end_time`: where a move that
+    // never moved already is. The endstop is deliberately not armed here:
+    // the fake firmware only fires on queued steps, and an empty move queues
+    // none. (Upstream's "Probe triggered prior to movement" is
+    // `check_no_movement` — an endstop that triggered before a **non-zero**
+    // move started — not this.)
     if distance == 0.0 {
-        return Err(CommandError::new("Probe triggered prior to movement"));
+        send(printer, &KlippyEvent::HomingHomingMoveEnd);
+        return Ok(current);
     }
 
     let print_time = connected.toolhead.get_last_move_time();
-    let completion = endstop
+    // Kept only for its side effect (arming the endstop); `home_wait` awaits
+    // the same completion through the dispatch that owns it, and the drip
+    // loop below deliberately does not poll it.
+    let _completion = endstop
         .home_start(
             print_time,
             ENDSTOP_SAMPLE_TIME,
@@ -1276,9 +1291,17 @@ async fn probing_move(
         .drip_move(target, speed)
         .map_err(|err| CommandError::new(err.to_string()))?;
 
-    // Drip the move out in small windows; stop as soon as the trigger fires.
+    // Drip the move out in small windows until the move is fully queued. The
+    // completion is deliberately not polled: the fake firmware this host runs
+    // against fires the armed endstop at the move's first queued step, while
+    // upstream's file-output mode completes the trigger only after the drip
+    // move ended (`mcu.py:TriggerDispatch.wait_end`) and takes `trigpos` at
+    // `home_end_time` (`homing.py`) — the move's end. Ending the drip on the
+    // fake's early fire clock walks each repeated probe up by its retract
+    // distance and fails `samples_tolerance` (the corpus's only
+    // `samples: 3` config, `screws_tilt_adjust.cfg`).
     let mut flush_time = start;
-    while flush_time < end && completion.reason().is_none() {
+    while flush_time < end {
         flush_time = (flush_time + DRIP_SEGMENT_TIME).min(end);
         let batches = connected
             .toolhead
@@ -1292,12 +1315,12 @@ async fn probing_move(
                     .map_err(command_error)?;
             }
         }
-        if completion.reason().is_none() {
-            tokio::select! {
-                _ = sleep(Duration::from_secs_f64(DRIP_LOOKAHEAD)) => {}
-                _ = completion.wait() => {}
-            }
-        }
+        // No wall-clock pacing between segments: the transport is
+        // in-process, the fake firmware consumes each batch as it is
+        // written, and the trigger is awaited in `home_wait` — pacing would
+        // only serialize the corpus's probes in real time (dripping every
+        // probe out at `DRIP_LOOKAHEAD` pushed the all-cases regression
+        // run past 30 minutes).
     }
 
     let trigger_time = endstop.home_wait(end).await.map_err(command_error)?;
@@ -1309,15 +1332,17 @@ async fn probing_move(
         return Err(CommandError::new("No trigger on probe after full movement"));
     }
 
-    // Where the move actually stopped: the trigger is what ends the drip loop,
-    // so the queued move's position at the last flushed time is where the
-    // carriage was when the endstop fired. Upstream asks the firmware for the
-    // stepper positions at the trigger clock (`homing.py:122-141`); the corpus's
-    // fake MCUs have no step model (`stepper_get_position` answers zero), so
-    // this is the honest stand-in. It matters beyond accuracy: leaving the
-    // commanded position at the probe *target* made a following probe start
-    // there, i.e. a zero-length move, which is upstream's "Probe triggered
-    // prior to movement" error.
+    // Where the move stopped: the drip loop above just ran to
+    // `flush_time = end`, so the newest queued segment's position there is
+    // the move's end — the target. That is upstream's file-output `trigpos`
+    // (the stepper position at `home_end_time`); on real hardware upstream
+    // would read the firmware's trigger clock instead, which the corpus's
+    // fake MCUs cannot model (no step model: `stepper_get_position` answers
+    // zero). A following probe still has room to move down because every
+    // consumer lifts first — each sample retracts (`run_with`) and each
+    // point is preceded by a raise (`ProbePointsHelper`) — so the corpus
+    // never probes twice from the target into "Probe triggered prior to
+    // movement".
     let stopped = {
         let trapq = connected.toolhead.trapq();
         let moves = trapq.moves();
@@ -2036,12 +2061,18 @@ mod tests {
         (connected, printer)
     }
 
-    /// `probing_move` stops on trigger and returns where it stopped: past the
-    /// start and at or before the target, because the drip loop stops queueing
-    /// the moment the trigger is seen (upstream reads the firmware's trigger
-    /// clock instead; see the function's note).
+    /// `probing_move` reports the move's end, matching upstream's
+    /// file-output mode: upstream completes the trigger only in
+    /// `TriggerDispatch.wait_end` — after the drip move ended — and takes
+    /// `trigpos` at `home_end_time` (`klippy/mcu.py`,
+    /// `klippy/extras/homing.py`). **Old assertion rewritten**: this test
+    /// used to pin the drip loop's early stop ("short of the target … this
+    /// fake endstop fires before the loop queues anything"), which walked
+    /// every repeated probe up by its retract distance and failed the
+    /// corpus's only `samples: 3` case
+    /// (`screws_tilt_adjust.test`: Probe samples exceed samples_tolerance).
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_probing_move_stops_on_trigger() {
+    async fn test_probing_move_reports_the_move_end() {
         let (mut connected, printer) = probing_connected();
         let endstop = TriggeringEndstop::new(true);
         let target = Coord::new(10.0, 0.0, 0.0, 0.0);
@@ -2053,10 +2084,9 @@ mod tests {
         let result = probing_move(&mut connected, &endstop, target, speed, &printer).await;
 
         let result = result.expect("the probing move completes");
-        assert!(
-            result.x() >= 0.0 && result.x() < target.x(),
-            "the stop position is short of the target (here: the start, because \
-             this fake endstop fires before the loop queues anything), got {result:?}"
+        assert_eq!(
+            result, target,
+            "the drip ran the whole move; the stop position is its end"
         );
     }
 
@@ -2133,10 +2163,21 @@ mod tests {
         );
     }
 
-    /// `probing_move` raises error when distance is zero (probe triggered
-    /// before any movement).
+    /// A zero-length probe is a successful no-op reporting the current
+    /// position: upstream's test mode answers it with the trigger at
+    /// `home_end_time` — where a move that never moved already is
+    /// (`check_no_movement` is disabled under `debuginput`;
+    /// `MCU_trsync.stop` reports `REASON_ENDSTOP_HIT` unconditionally in
+    /// fileoutput). **Old assertion rewritten**: the old mapping raised
+    /// "Probe triggered prior to movement" for a zero-length move — but
+    /// that upstream error is `check_no_movement` (an endstop that
+    /// triggered before a **non-zero** move started), and with every probe
+    /// now dripping to its file-output end, a probe started at the target
+    /// (`z_virtual_endstop.test` runs `PROBE_CALIBRATE` straight after
+    /// `PROBE`, both ending at `z_position`) hit the bogus error. The
+    /// endstop is not armed: the fake firmware fires only on queued steps.
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_probing_move_zero_distance_raises_error() {
+    async fn test_probing_move_zero_distance_returns_the_current_position() {
         let (mut connected, printer) = probing_connected();
         let endstop = TriggeringEndstop::new(true);
         let target = Coord::default(); // same as current position
@@ -2145,17 +2186,24 @@ mod tests {
 
         let result = probing_move(&mut connected, &endstop, target, speed, &printer).await;
 
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("Probe triggered prior to movement"),
-            "zero distance should raise prior-movement error, got: {err}"
+        let result = result.expect("a probe from the target succeeds");
+        assert_eq!(
+            result,
+            Coord::default(),
+            "the probe reports where it already stood"
+        );
+        assert_eq!(
+            connected.toolhead.commanded_pos(),
+            result,
+            "the commanded position is left untouched"
         );
     }
 
-    /// `probing_move` leaves the toolhead at the position it stopped at, so a
-    /// following probe still has room to move down.
+    /// `probing_move` leaves the toolhead at the position it reports — here
+    /// the move's end (file-output parity, see
+    /// `test_probing_move_reports_the_move_end`); the next probe still has
+    /// room to move down because every consumer lifts first (sample
+    /// retract, point raise).
     #[tokio::test(flavor = "multi_thread")]
     async fn test_probing_move_sets_position_on_trigger() {
         let (mut connected, printer) = probing_connected();
@@ -2174,10 +2222,7 @@ mod tests {
             result,
             "the commanded position follows the stop position"
         );
-        assert!(
-            result.x() < target.x(),
-            "the toolhead stops short of the target, got {result:?}"
-        );
+        assert_eq!(result, target, "the stop position is the move's end");
     }
 
     // =========================================================================

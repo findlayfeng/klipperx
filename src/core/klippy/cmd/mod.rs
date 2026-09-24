@@ -70,6 +70,7 @@ pub mod endstop;
 pub mod gpio;
 pub mod i2c;
 pub mod identify;
+pub mod ldc1612;
 pub mod pwm;
 pub mod shutdown;
 pub mod sos_filter;
@@ -88,6 +89,10 @@ pub use gpio::{ConfigDigitalOut, QueueDigitalOut, SetDigitalOutPwmCycle, UpdateD
 pub use i2c::{
     ConfigI2c, I2cBusStatus, I2cRead, I2cReadResponse, I2cResponse, I2cSetBus, I2cSetSoftwareBus,
     I2cSetSwBus, I2cTransfer, I2cWrite, SoftwareI2cBus,
+};
+pub use ldc1612::{
+    ConfigLdc1612, ConfigLdc1612WithIntb, Ldc1612AttachTriggerAnalog, QueryLdc1612,
+    QueryStatusLdc1612, SensorBulkData, SensorBulkStatus,
 };
 pub use pwm::{ConfigPwmOut, QueuePwmOut};
 pub use sos_filter::{

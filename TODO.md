@@ -28,22 +28,6 @@
   `reset_for_restart()` → 重载配置 → 再 `bring_up`，端点与 `--tui` 的 in-process server 全程
   有效；不换 printer、不重建 Api/Server。
 
-## 延后决定（2026-09-23 自主时段挂起）
-
-自主时段内不阻塞推进，以下问题只登记、待用户拍板：
-
-- **T4/H9 分支的合并时点**：`agents/feat-probe-h9` 持续累积提交（U1 `probing_move`、
-  U2 `[stepper_*]` 移 late、U3 `probe` 段…），是否/何时合入 `work` 由用户定。
-- **已合并分支清理**：`agents/docs-git-main-constraints`（已由用户并入 `work`）是否删除。
-- **探针精度偏离的处理顺序**：触发步数反算位置与 `rest_time`（`_calc_endstop_rate`）缺失，
-  是否单列精度单元、排在 M5 之前还是之后（见 H9 节）。
-- **`activate_gcode`/`deactivate_gcode` 的处置**：H3 `gcode_macro` 未落地，probe 单元采用
-  「读入选项 + 真正需要渲染时报明确错误」的折中，是否接受。
-- **`temperature_fan` 归组不一致**：H1 节把它算在温度族剩余里，失败统计表与 T9 行把它归
-  H3/H4/H9/H10（未含 H1），待定归哪一组。
-- **自主时段后的推进边界**：H9 闭包（U1–U5 与 M6/M7/M2/M4/M3/M5）之后是否直接进入 T5/T6/T9
-  等下一批。
-
 ## 待办
 
 依赖列的是**工具性前置**，不是自然顺序。下表是索引，逐条细节在后面的小节里；
@@ -432,7 +416,7 @@ FW5a–f / FW6a–f 已把「cartesian + 假 MCU 的 `G1`/`G28`」跑通并归�
 | `Section 'verify_heater …'` | 2 | H1 |
 | `Unknown temperature sensor`（`G2`、`Kingroon_B3950`、`NTCS0603E3104FXT`） | 3 | H1 |
 | MCU 引脚映射（`Pin 'PF1'`/`'PF7'`/`'PD6'`） | 3 | F2 |
-| 单实例（`dual_carriage` 2、`gcode_macro` 2、`led` 2；`virtual_sdcard`/`temperature_fan`/`pwm_cycle_time`/`manual_stepper`/`input_shaper`/`gcode_arcs`/`fan_generic`/`exclude_object`/`controller_fan` 各 1） | 15 | H3 / H4 / H9 / H10 |
+| 单实例（`dual_carriage` 2、`gcode_macro` 2、`led` 2；`virtual_sdcard`/`temperature_fan`/`pwm_cycle_time`/`manual_stepper`/`input_shaper`/`gcode_arcs`/`fan_generic`/`exclude_object`/`controller_fan` 各 1） | 15 | H1 / H3 / H4 / H9 / H10 |
 | 运行期失败（`Move out of range`：`generic-simulavr`） | 1 | 运行期（非装载） |
 | `Section 'extruder'`（T3 旧首位） | **0** | T3 已消 |
 
@@ -612,6 +596,13 @@ FW5a–f / FW6a–f 已把「cartesian + 假 MCU 的 `G1`/`G28`」跑通并归�
       `ProbePointsHelper`（消费者 z_tilt/screws）、endstop wrapper 的 `z_offset`/`query_endstop` 覆盖——
       需先把 `PinChip::setup_endstop` 的返回类型接口化）、`bltouch.py`、`smart_effector.py`、
       `probe_eddy_current.py`、`manual_probe.py`、`safe_z_home.py`、`endstop_phase.py`。
+- [ ] **保真单元：bed_mesh 插值 + 调平应用**（排在 H9 模块闭包之后）：`LagrangeMesh`/`BicubicMesh` +
+      `mesh_pps` → `mesh_matrix`、`get_z(x, y)`，以及把网格作用到 move（`gcode_move` 的 move-transform
+      seam + `MoveSplitter` + `fade_*`）。素材：`abandoned/wip-main-leftovers` 的 `bed_mesh.rs`
+      （含 `ZMesh`/lagrange/bicubic 与两个测试），按主线结构重做并补手册。
+- [ ] **保真单元：探针精度**（排在 H9 模块闭包之后）：按触发步数反算位置与 `rest_time`
+      （上游 `_calc_endstop_rate`）。前置：模拟器步数模型（否则 `stepper_get_position` 恒 0，无法验收），
+      见 F8 的「响应器式假 MCU」。
 - **端停位置的缺口（需接口化）**：上游 rail 会优先向 endstop 要位置（`mcu_endstop.get_position_endstop()`，
       探针 wrapper 返回 `z_offset`）；本仓 `position_endstop` 缺省退到 `position_min`，所以用
       `probe:z_virtual_endstop` 的配置虽然在解析上能过，但 Z 回零后的位置不等于上游——`z_virtual_endstop.test`

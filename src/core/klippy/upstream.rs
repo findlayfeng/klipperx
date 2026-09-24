@@ -425,7 +425,6 @@ mod tests {
         "printers.test",
         "rotary_delta_calibrate.test",
         "sdcard_loop.test",
-        "temperature.test",
         "tmc.test",
     ];
 

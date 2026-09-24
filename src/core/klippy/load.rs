@@ -361,6 +361,7 @@ mod tests {
                 "homing_override",
                 "manual_probe",
                 "probe",
+                "probe_eddy_current",
                 "quad_gantry_level",
                 "screws_tilt_adjust",
                 "sdcard_loop",

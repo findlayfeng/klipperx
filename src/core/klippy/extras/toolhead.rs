@@ -747,6 +747,44 @@ impl ToolHeadObject {
             .map(|connected| connected.toolhead.commanded_pos())
     }
 
+    /// The main trapq's id — upstream's `toolhead.get_trapq()`, the queue
+    /// `ZAdjustHelper.adjust_steppers` reattaches a Z motor to after moving it
+    /// on its own.
+    ///
+    /// `None` before connect: there is no planner to ask yet.
+    pub fn main_trapq(&self) -> Option<usize> {
+        self.lock()
+            .as_ref()
+            .map(|connected| connected.toolhead.main_trapq())
+    }
+
+    /// Point a motion stepper at a trapq by name, or take it off one with
+    /// `None` (`MCU_stepper.set_trapq`, the per-motor detach/reattach
+    /// `ZAdjustHelper.adjust_steppers` walks through).
+    ///
+    /// A detached stepper generates no steps until it is attached again
+    /// (`MotionQueuing::generate` skips it), which is how one Z motor moves
+    /// while the others hold still.
+    ///
+    /// # Errors
+    /// "Printer is not ready" before connect, or "Unknown stepper '<name>'"
+    /// when no motion stepper answers to `name`.
+    pub fn set_stepper_trapq(&self, name: &str, trapq: Option<usize>) -> Result<(), CommandError> {
+        let mut guard = self.lock();
+        let connected = guard
+            .as_mut()
+            .ok_or_else(|| CommandError::new("Printer is not ready"))?;
+        let stepper = connected
+            .toolhead
+            .motion_queuing_mut()
+            .steppers_mut()
+            .iter_mut()
+            .find(|stepper| stepper.name() == name)
+            .ok_or_else(|| CommandError::new(format!("Unknown stepper '{name}'")))?;
+        stepper.set_trapq(trapq);
+        Ok(())
+    }
+
     /// Probe-style homing: move toward `target` at `speed`, stop on trigger
     /// (`homing.probing_move`).
     ///

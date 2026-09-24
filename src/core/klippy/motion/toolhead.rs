@@ -152,6 +152,13 @@ impl ToolHead {
         }
         for (index, axis) in self.extra_axes.iter().enumerate() {
             let ea_index = index + E_AXIS;
+            // A second and later extra axis would need a position slot past
+            // the move's four; those slots are not modelled yet (the guarded
+            // downgrade for multi-extruder configs), so skip rather than
+            // index out of bounds.
+            if ea_index >= move_.axes_d.len() {
+                continue;
+            }
             if move_.axes_d[ea_index] != 0.0 {
                 let mut ctx = MoveContext::new(&mut move_);
                 axis.check_move(&mut ctx, ea_index)?;
@@ -194,6 +201,10 @@ impl ToolHead {
             // (`klippy/toolhead.py:288-291`).
             for (index, axis) in self.extra_axes.iter().enumerate() {
                 let ea_index = index + E_AXIS;
+                // Slots past the move's four are skipped, as in `move_to`.
+                if ea_index >= move_.axes_d.len() {
+                    continue;
+                }
                 if move_.axes_d[ea_index] != 0.0 {
                     axis.process_move(&mut self.motion_queuing, next_move_time, &move_, ea_index);
                 }

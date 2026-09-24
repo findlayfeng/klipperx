@@ -404,7 +404,6 @@ mod tests {
     /// `KLIPPERX_UPSTREAM_ALL=1` runs every case and reports every failure, so
     /// the list stays honest rather than hiding regressions.
     const IGNORED: &[&str] = &[
-        "bed_mesh.test",
         "bed_screws.test",
         "bltouch.test",
         "corexyuv.test",
@@ -437,7 +436,6 @@ mod tests {
         "temperature.test",
         "tmc.test",
         "z_tilt.test",
-        "z_virtual_endstop.test",
     ];
 
     // -----------------------------------------------------------------------

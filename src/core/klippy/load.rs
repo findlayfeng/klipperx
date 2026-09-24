@@ -345,6 +345,8 @@ mod tests {
                 "stepper_z",
                 "adc_temperature",
                 "thermistor",
+                "probe",
+                "bed_mesh",
                 "board_pins",
                 "temperature_sensor",
                 "static_digital_output",

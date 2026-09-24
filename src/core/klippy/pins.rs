@@ -869,10 +869,10 @@ impl PrinterPins {
             Some((chip, pin)) => (chip.trim().to_string(), pin.trim().to_string()),
             None => ("mcu".to_string(), desc.to_string()),
         };
-        let state = self.lock();
-        if !state.resolvers.contains_key(&chip_name) {
-            return Err(PinError::UnknownChip(chip_name));
-        }
+        // Note: We don't check for the chip's existence here because pin chips
+        // may be registered later (e.g., [probe] registers 'probe' chip after
+        // [stepper_z] parses its endstop_pin). The check happens when the pin
+        // is actually used in setup_* methods.
         // The remaining name must be bare: no decorations and no whitespace
         // inside (a name like "PA 1" is a typo, not a pin).
         if pin.contains(['^', '~', '!', ':']) || pin.split_whitespace().count() != 1 {

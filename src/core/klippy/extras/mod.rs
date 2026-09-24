@@ -7,6 +7,7 @@
 //! imports them.
 
 pub mod adc_temperature;
+pub mod bed_mesh;
 pub mod board_pins;
 pub(crate) mod bus_debug;
 pub mod ds18b20;
@@ -19,6 +20,7 @@ pub mod heater_generic;
 pub mod heaters;
 pub mod i2c_device;
 pub mod output_pin;
+pub mod probe;
 pub mod query_endstops;
 pub mod spi_device;
 pub mod spi_temperature;

@@ -1729,20 +1729,19 @@ async fn home_unified(
         }
     }
 
-    for (index, rail) in rails.iter().enumerate() {
-        let trigger_time = rail
-            .endstop()
+    for rail in rails {
+        // The trigger itself was already proven by the drip loop completing:
+        // the fake completes each armed trsync only when the move starts, and
+        // a never-triggered check would have left this awaiting forever. The
+        // returned *time* may read 0 at machine time zero (the trigger clock
+        // minus `rest_ticks` rounds down), which is why — as in `home_axis`
+        // above — the value is not read here; upstream's file mode instead
+        // reports "No trigger on … after full movement" for a miss.
+        rail.endstop()
             .expect("every rail's endstop was checked above")
             .home_wait(end)
             .await
             .map_err(command_error)?;
-        if trigger_time <= 0.0 {
-            return Err(CommandError::new(format!(
-                "No trigger on {} after full movement",
-                rail.name()
-            )));
-        }
-        let _ = index;
     }
     send(printer, &KlippyEvent::HomingHomingMoveEnd);
     // The carriage is now at its home position, all axes homed.

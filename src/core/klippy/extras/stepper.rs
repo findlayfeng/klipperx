@@ -90,6 +90,13 @@ section!(
     phase = late,
     load = load_config_bed
 );
+// The three delta towers. Upstream claims them the same way — delta's
+// `__init__` reads `config.getsection('stepper_' + a) for a in 'abc'`
+// (`kinematics/delta.py:15`) — and here they need factories of their own so
+// the undefined-option check accepts the sections.
+section!("stepper_a", order = 50, phase = late, load = load_config);
+section!("stepper_b", order = 50, phase = late, load = load_config);
+section!("stepper_c", order = 50, phase = late, load = load_config);
 
 /// The default pulse width upstream uses when the option is absent
 /// (`klippy/stepper.py:80`).
@@ -100,6 +107,28 @@ const DEFAULT_STEP_PULSE_DURATION: f64 = 0.000_002;
 /// The same order as the other connect-time reads; a board that does not answer
 /// only loses the alignment, not the connection.
 const POSITION_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Which rail geometry a section carries — upstream's
+/// `GenericPrinterRail(config, need_position_minmax, default_position_endstop)`
+/// arguments (`klippy/stepper.py:327-354`).
+#[derive(Debug, Clone, Copy)]
+pub enum RailGeometry {
+    /// `[stepper_x/y/z]`: a full axis — `position_min`/`position_max` are
+    /// read, and `position_endstop` defaults to the minimum
+    /// (`need_position_minmax=True`).
+    Axis,
+    /// `[stepper_a/b/c]`: a delta tower — there is no `position_max` option;
+    /// the range runs `0..position_endstop` (`stepper.py:352-354`) and
+    /// `position_endstop` falls back to `default_position_endstop`
+    /// (`stepper_b/c` inherit `stepper_a`'s, `delta.py:16-22`).
+    DeltaTower {
+        /// The endstop to fall back on when the section omits its own.
+        default_position_endstop: Option<f64>,
+    },
+    /// A numbered sibling (`[stepper_z1]`): a bare motor with no rail
+    /// geometry (`LookupMultiRail`'s extra stepper).
+    BareMotor,
+}
 
 /// One `[stepper_*]` section's rail parameters.
 ///
@@ -177,6 +206,10 @@ impl PrinterStepper {
     /// Build the section: parse the motor geometry and register the firmware
     /// stepper.
     ///
+    /// `geometry` is the [`RailGeometry`] shorthand the cartesian sections and
+    /// bare siblings use; delta towers are built through
+    /// [`PrinterStepper::with_geometry`].
+    ///
     /// # Errors
     /// Returns a config error naming the section when an option is missing,
     /// malformed, out of range, or names a pin the `pins` layer refuses.
@@ -185,6 +218,24 @@ impl PrinterStepper {
         printer: &Arc<Printer>,
         axis: Axis,
         geometry: bool,
+    ) -> Result<Self, ConfigError> {
+        let geometry = if geometry {
+            RailGeometry::Axis
+        } else {
+            RailGeometry::BareMotor
+        };
+        Self::with_geometry(config, printer, axis, geometry)
+    }
+
+    /// [`PrinterStepper::new`] with the section's explicit [`RailGeometry`].
+    ///
+    /// # Errors
+    /// As [`PrinterStepper::new`].
+    pub fn with_geometry(
+        config: &ConfigWrapper,
+        printer: &Arc<Printer>,
+        axis: Axis,
+        geometry: RailGeometry,
     ) -> Result<Self, ConfigError> {
         let identifier = config.identifier();
         let name = config.section().id.clone();
@@ -271,45 +322,83 @@ impl PrinterStepper {
         // (`[stepper_z1]`) is a bare motor: `LookupMultiRail` adds it to the
         // primary's rail without reading any of this
         // (`klippy/stepper.py:327-360`, `:455-462`).
-        let (params, homing) = if geometry {
-            let position_min = config.get_float("position_min", Some(0.0))?;
-            let position_max = config.get_float_bounded(
-                "position_max",
-                None,
-                None,
-                None,
-                Some(position_min),
-                None,
-            )?;
-            let position_endstop = match endstop
-                .as_ref()
-                .and_then(|endstop| pins.virtual_endstop_position(endstop))
-            {
-                Some(virtual_position) => virtual_position,
-                None => config.get_float("position_endstop", Some(position_min))?,
-            };
-            if position_endstop < position_min || position_endstop > position_max {
-                return Err(ConfigError::new(format!(
-                    "position_endstop in section '{identifier}' must be between position_min and position_max"
-                )));
-            }
-            let homing = read_homing_info(
-                config,
-                &identifier,
-                position_min,
-                position_max,
-                position_endstop,
-            )?;
-            (
-                RailParams {
+        let (params, homing) = match geometry {
+            RailGeometry::Axis => {
+                let position_min = config.get_float("position_min", Some(0.0))?;
+                let position_max = config.get_float_bounded(
+                    "position_max",
+                    None,
+                    None,
+                    None,
+                    Some(position_min),
+                    None,
+                )?;
+                let position_endstop = match endstop
+                    .as_ref()
+                    .and_then(|endstop| pins.virtual_endstop_position(endstop))
+                {
+                    Some(virtual_position) => virtual_position,
+                    None => config.get_float("position_endstop", Some(position_min))?,
+                };
+                if position_endstop < position_min || position_endstop > position_max {
+                    return Err(ConfigError::new(format!(
+                        "position_endstop in section '{identifier}' must be between position_min and position_max"
+                    )));
+                }
+                let homing = read_homing_info(
+                    config,
+                    &identifier,
                     position_min,
                     position_max,
                     position_endstop,
-                },
-                homing,
-            )
-        } else {
-            (RailParams::default(), HomingInfo::default())
+                )?;
+                (
+                    RailParams {
+                        position_min,
+                        position_max,
+                        position_endstop,
+                    },
+                    homing,
+                )
+            }
+            RailGeometry::DeltaTower {
+                default_position_endstop,
+            } => {
+                // A delta tower has no `position_max` option: the range runs
+                // from zero to the endstop (`stepper.py:348-354`), which is
+                // also what leaves `homing_positive_dir` inferable (the
+                // endstop sits at the top of that range).
+                let position_min = 0.0;
+                let position_endstop = match endstop
+                    .as_ref()
+                    .and_then(|endstop| pins.virtual_endstop_position(endstop))
+                {
+                    Some(virtual_position) => virtual_position,
+                    None => config.get_float("position_endstop", default_position_endstop)?,
+                };
+                let position_max = position_endstop;
+                if position_endstop < position_min || position_endstop > position_max {
+                    return Err(ConfigError::new(format!(
+                        "position_endstop in section '{identifier}' must be between position_min and position_max"
+                    )));
+                }
+                let homing = read_homing_info(
+                    config,
+                    &identifier,
+                    position_min,
+                    position_max,
+                    position_endstop,
+                )?;
+                (
+                    RailParams {
+                        position_min,
+                        position_max,
+                        position_endstop,
+                    },
+                    homing,
+                )
+            }
+            RailGeometry::BareMotor => (RailParams::default(), HomingInfo::default()),
         };
 
         // The step pin's `!` is upstream's `invert_step` (`0`/`1`); the direction
@@ -662,13 +751,46 @@ impl std::fmt::Debug for Rail {
     }
 }
 
-/// The factory the three section declarations name.
+/// The factory the section declarations name: the geometry follows the name
+/// (`stepper_a/b/c` are delta towers, `stepper_x/y/z` full axes).
 pub(crate) fn load_config(
     config: &ConfigWrapper,
     printer: &Arc<Printer>,
 ) -> Result<Arc<dyn PrinterObject>, ConfigError> {
-    let axis = axis_from_name(&config.identifier())?;
-    Ok(Arc::new(PrinterStepper::new(config, printer, axis, true)?))
+    let identifier = config.identifier();
+    let axis = axis_from_name(&identifier)?;
+    let geometry = match identifier.strip_prefix("stepper_") {
+        Some("a" | "b" | "c") => RailGeometry::DeltaTower {
+            default_position_endstop: tower_default_endstop(config)?,
+        },
+        _ => RailGeometry::Axis,
+    };
+    Ok(Arc::new(PrinterStepper::with_geometry(
+        config, printer, axis, geometry,
+    )?))
+}
+
+/// The endstop a delta tower falls back on when its section omits one:
+/// `stepper_b` and `stepper_c` take `stepper_a`'s `position_endstop`, as
+/// `LookupMultiRail(..., default_position_endstop=a_endstop)` does
+/// (`kinematics/delta.py:16-22`); `stepper_a` itself has no fallback
+/// (`stepper.py:342-343` requires its own).
+///
+/// # Errors
+/// When `stepper_a`'s endstop is missing (or unreadable) while a sibling
+/// needs the default — the same config error `stepper_a`'s own load raises
+/// first.
+fn tower_default_endstop(config: &ConfigWrapper) -> Result<Option<f64>, ConfigError> {
+    if config.section().id == "stepper_a" {
+        return Ok(None);
+    }
+    let primary = config.sibling("stepper_a").ok_or_else(|| {
+        ConfigError::new(format!(
+            "Section '{}' needs a '[stepper_a]' section",
+            config.identifier()
+        ))
+    })?;
+    primary.get_float("position_endstop", None).map(Some)
 }
 
 /// The factory `[stepper_arm]` names (`kinematics/polar.py:27`'s
@@ -755,12 +877,15 @@ fn read_homing_info(
     })
 }
 
-/// The axis a section name selects: `stepper_x` → [`Axis::X`].
+/// The axis a section name selects: `stepper_x` → [`Axis::X`], and a delta
+/// tower → its rail-order slot (`stepper_a` → X, …), which is an index into
+/// the toolhead's rails, not a cartesian meaning: the tower's real solver is
+/// the delta one the kinematics installs.
 fn axis_from_name(identifier: &str) -> Result<Axis, ConfigError> {
     match identifier.strip_prefix("stepper_") {
-        Some("x") => Ok(Axis::X),
-        Some("y") => Ok(Axis::Y),
-        Some("z") => Ok(Axis::Z),
+        Some("x" | "a") => Ok(Axis::X),
+        Some("y" | "b") => Ok(Axis::Y),
+        Some("z" | "c") => Ok(Axis::Z),
         _ => Err(ConfigError::new(format!(
             "Unable to map section '{identifier}' to a cartesian axis"
         ))),
@@ -809,6 +934,10 @@ mod tests {
         assert_eq!(axis_from_name("stepper_x").unwrap(), Axis::X);
         assert_eq!(axis_from_name("stepper_y").unwrap(), Axis::Y);
         assert_eq!(axis_from_name("stepper_z").unwrap(), Axis::Z);
+        // Delta towers take their rail-order slots (see `axis_from_name`).
+        assert_eq!(axis_from_name("stepper_a").unwrap(), Axis::X);
+        assert_eq!(axis_from_name("stepper_b").unwrap(), Axis::Y);
+        assert_eq!(axis_from_name("stepper_c").unwrap(), Axis::Z);
         assert!(axis_from_name("stepper_e").is_err());
     }
 
@@ -948,6 +1077,24 @@ mod tests {
              position_max: 300\nhoming_speed: 50\n{extra}"
         )
     }
+    // -----------------------------------------------------------------------
+    // Delta towers: the option matrix `kinematics/delta.py:15-22` implies
+    // -----------------------------------------------------------------------
+
+    /// The three delta-tower sections of `config/example-delta.cfg` (minus
+    /// `arm_length`, which the delta kinematics reads, not the stepper).
+    fn delta_towers(extra_a: &str) -> String {
+        format!(
+            "[mcu]\nserial: /dev/not-opened-yet\n\
+             [stepper_a]\nstep_pin: PA0\ndir_pin: PA1\nenable_pin: !PA2\n\
+             rotation_distance: 40\nmicrosteps: 16\nendstop_pin: ^PA3\n\
+             homing_speed: 50\n{extra_a}\
+             [stepper_b]\nstep_pin: PB0\ndir_pin: PB1\nenable_pin: !PB2\n\
+             rotation_distance: 40\nmicrosteps: 16\nendstop_pin: ^PB3\n\
+             [stepper_c]\nstep_pin: PC0\ndir_pin: PC1\nenable_pin: !PC2\n\
+             rotation_distance: 40\nmicrosteps: 16\nendstop_pin: ^PC3\n"
+        )
+    }
 
     #[test]
     fn test_stepper_bed_claims_in_radians_mode_without_geometry() {
@@ -1044,5 +1191,62 @@ mod tests {
 
         let err = result.unwrap_err().to_string();
         assert!(err.contains("position_max"), "{err}");
+    }
+
+    #[test]
+    fn test_delta_towers_need_no_position_max_and_claim_the_sections() {
+        // `example-delta.cfg` writes no `position_max`: the range is
+        // `0..position_endstop` (`stepper.py:352-354`).
+        let (printer, result) = load(&delta_towers("position_endstop: 297.05\n"));
+        result.unwrap();
+        for name in ["stepper_a", "stepper_b", "stepper_c"] {
+            let stepper = printer
+                .lookup_object_as::<PrinterStepper>(name)
+                .unwrap_or_else(|| panic!("{name} registered"));
+            assert_eq!(stepper.params().position_min, 0.0);
+            assert_eq!(stepper.params().position_max, 297.05);
+            assert!(stepper.endstop().is_some());
+            // The endstop sits at the top of the range: homing moves up.
+            assert!(stepper.homing_info().positive_dir);
+        }
+        // `stepper_a`'s homing speed is its own (`delta.py` homes with
+        // `rails[0]`'s); `stepper_b/c` fall back to the default.
+        assert_eq!(
+            printer
+                .lookup_object_as::<PrinterStepper>("stepper_a")
+                .unwrap()
+                .homing_info()
+                .speed,
+            50.0
+        );
+        assert_eq!(
+            printer
+                .lookup_object_as::<PrinterStepper>("stepper_b")
+                .unwrap()
+                .homing_info()
+                .speed,
+            5.0
+        );
+    }
+
+    #[test]
+    fn test_delta_tower_b_and_c_inherit_stepper_a_endstop() {
+        // `LookupMultiRail(…, default_position_endstop=a_endstop)`:
+        // only `stepper_a` carries its own `position_endstop`.
+        let (printer, result) = load(&delta_towers("position_endstop: 297.05\n"));
+        result.unwrap();
+        for name in ["stepper_b", "stepper_c"] {
+            let stepper = printer.lookup_object_as::<PrinterStepper>(name).unwrap();
+            assert_eq!(stepper.params().position_endstop, 297.05, "{name}");
+        }
+    }
+
+    #[test]
+    fn test_a_delta_tower_without_any_endstop_is_refused() {
+        // `stepper_a` has no fallback (`stepper.py:342-343`).
+        let text = delta_towers("");
+        let (_, result) = load(&text);
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("position_endstop"), "{err}");
     }
 }

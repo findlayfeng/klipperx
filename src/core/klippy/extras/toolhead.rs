@@ -76,15 +76,19 @@ use crate::core::klippy::mathutil::{Coord, X_AXIS, Y_AXIS, Z_AXIS};
 use crate::core::klippy::mcu::{
     Completion, McuEndstop, McuError, McuObject, McuStepper, TriggerDispatch,
 };
+use crate::core::klippy::motion::delta::{
+    delta_active_flags, delta_position_fn, DeltaCalibration, DeltaConfig, DeltaKinematics,
+    DELTA_RAIL_NAMES,
+};
 use crate::core::klippy::motion::extra::ExtraAxis;
 use crate::core::klippy::motion::itersolve::{
     cartesian_active_flags, cartesian_position_fn, corexy_active_flags, corexy_position_fn,
     corexz_active_flags, corexz_position_fn, Axis, AxisFlags, PositionFn,
 };
 use crate::core::klippy::motion::kinematics::{
-    home_move, polar_active_flags, polar_angle_normalize, polar_angle_position, polar_angle_unwrap,
-    polar_home_move, polar_radius_position, CartesianKinematics, CartesianTransform,
-    NoneKinematics, PolarKinematics,
+    home_move, polar_active_flags, polar_angle_normalize, polar_angle_solver, polar_angle_unwrap,
+    polar_home_move, polar_radius_solver, CartesianKinematics, CartesianTransform,
+    NoneKinematics, PolarKinematics, UnifiedHome,
 };
 use crate::core::klippy::motion::plan::MoveLimits;
 use crate::core::klippy::motion::stepcompress::{StepCommand, StepCompressError};
@@ -135,6 +139,10 @@ enum KinematicsKind {
     HybridCoreXz,
     /// `kinematics: polar`
     Polar,
+    /// `kinematics: delta` — the linear-delta family
+    /// (`kinematics/delta.py`), whose kinematics and calibration math live in
+    /// [`motion::delta`](crate::core::klippy::motion::delta).
+    Delta,
 }
 
 impl KinematicsKind {
@@ -147,6 +155,7 @@ impl KinematicsKind {
         "hybrid_corexy",
         "hybrid_corexz",
         "polar",
+        "delta",
     ];
 
     /// Parse a `[printer] kinematics` value.
@@ -159,6 +168,7 @@ impl KinematicsKind {
             "hybrid_corexy" => Self::HybridCoreXy,
             "hybrid_corexz" => Self::HybridCoreXz,
             "polar" => Self::Polar,
+            "delta" => Self::Delta,
             _ => return None,
         })
     }
@@ -175,6 +185,18 @@ impl KinematicsKind {
             // `PolarKinematics` from `kind` and never reads this arm (the
             // same way `none` never reads its `Standard`).
             Self::Polar => CartesianTransform::Standard,
+            // Delta has no rail→carriage mapping of this kind: its towers' solvers
+            // are bound to their geometry in the delta branch below, and this
+            // value is only consulted by the cartesian build.
+            Self::Delta => CartesianTransform::Standard,
+        }
+    }
+
+    /// The rail names `Delta` claims and the cartesian default (`delta.py:15`).
+    fn rail_names(self) -> [&'static str; 3] {
+        match self {
+            Self::Delta => DELTA_RAIL_NAMES,
+            _ => ["stepper_x", "stepper_y", "stepper_z"],
         }
     }
 
@@ -215,6 +237,9 @@ impl KinematicsKind {
                 cart(Axis::Y),
                 cart(Axis::Z),
             ],
+            // Delta never reaches here: its branch below binds each tower to
+            // `delta_stepper_alloc` instead (`delta.py:50-52`).
+            Self::Delta => [cart(Axis::X), cart(Axis::Y), cart(Axis::Z)],
         }
     }
 
@@ -240,21 +265,26 @@ pub struct ToolHeadObject {
     limits: MoveLimits,
     max_z_velocity: f64,
     max_z_accel: f64,
-    /// The rails: `[stepper_x, stepper_y, stepper_z]` for the cartesian
-    /// family, `[stepper_arm, stepper_z]` for polar (each with its `…1`,
-    /// `…2` siblings).
+    /// The cartesian rails, `[stepper_x]`, `[stepper_y]`, and `[stepper_z]`;
+    /// for polar, `[stepper_arm, stepper_z]` (each with its `…1`, `…2`
+    /// siblings); for delta, `[stepper_a/b/c]`.
     ///
     /// Empty for `kinematics: none`, which has no steppers.
     rails: Vec<Arc<Rail>>,
-    /// The bare `[stepper_bed]` stepper of a polar printer — it belongs to
-    /// no rail (`kinematics/polar.py:26` builds it standalone), but its
-    /// host solver must still be taken at connect like the rails'.
-    ///
-    /// `None` unless `kind` is [`KinematicsKind::Polar`].
+    /// The bed rail of a polar printer — the bare `[stepper_bed]` stepper.
+    /// It belongs to no rail (`kinematics/polar.py:26` builds it standalone),
+    /// but its host solver still runs through the usual stepper setup; **its
+    /// solvers are only installed by `KinematicsKind::Polar`**.
     bed: Option<Arc<PrinterStepper>>,
-    /// What `[printer] kinematics` named.
+    /// Whether `[printer] kinematics` was `none`.
+    /// What `[printer] kinematics` named, for consumers that need to know
+    /// which one loaded before the toolhead itself connects
+    /// (`[delta_calibrate]`'s `hasattr(kin, "get_calibration")` check).
     kind: KinematicsKind,
-    /// How the cartesian rails' positions map to carriage axes.
+    /// The delta kinematics, parked here at load until connect installs it —
+    /// the rails' delta solvers are already bound in `new`.
+    delta: Mutex<Option<DeltaKinematics>>,
+    /// How the rails' positions map to carriage axes (`corexy.py:12-15`).
     transform: CartesianTransform,
     /// `[printer] max_angular_velocity`: polar's near-center angular cap
     /// (`0` = uncapped). Read only for polar, as upstream reads it only in
@@ -370,8 +400,9 @@ impl ToolHeadObject {
             mcr_pseudo_accel: max_accel * (1.0 - min_cruise_ratio),
         };
 
-        let mut rails = Vec::new();
+        let mut rails: Vec<Arc<Rail>> = Vec::new();
         let mut bed = None;
+        let mut delta_kinematics = None;
         match kind {
             KinematicsKind::None => {}
             KinematicsKind::Polar => {
@@ -384,7 +415,7 @@ impl ToolHeadObject {
                 // (`MCU_stepper.setup_itersolve`): arm radius and bed angle
                 // both follow X and Y (`kin_polar.c:46`), Z stays cartesian.
                 for stepper in arm.steppers() {
-                    stepper.setup_itersolve(polar_radius_position, polar_active_flags());
+                    stepper.setup_itersolve(polar_radius_solver(), polar_active_flags());
                 }
                 for stepper in z.steppers() {
                     stepper.setup_itersolve(
@@ -400,12 +431,41 @@ impl ToolHeadObject {
                             config.identifier()
                         ))
                     })?;
-                bed_stepper.setup_itersolve(polar_angle_position, polar_active_flags());
+                bed_stepper.setup_itersolve(polar_angle_solver(), polar_active_flags());
                 // The angle solver unwraps ±2π against `commanded_pos` and
                 // renormalizes after each range (`kin_polar.c`).
                 bed_stepper.setup_hooks(polar_angle_unwrap, polar_angle_normalize);
                 rails = vec![arm, z];
                 bed = Some(bed_stepper);
+            }
+            KinematicsKind::Delta => {
+                // Delta claims `stepper_a/b/c`, the cartesian family
+                // `stepper_x/y/z` (`delta.py:15`); the axis is the rail's slot in
+                // this list.
+                let axes = [Axis::X, Axis::Y, Axis::Z];
+                for (name, axis) in kind.rail_names().into_iter().zip(axes) {
+                    rails.push(Rail::lookup(config, printer, name, axis)?);
+                }
+                // The delta kinematics reads its options here (the config
+                // reads are part of loading it) and binds each tower to
+                // `delta_stepper_alloc` (`setup_itersolve`, `delta.py:50-52`).
+                let delta = build_delta(
+                    config,
+                    &rails,
+                    max_velocity,
+                    max_accel,
+                    max_z_velocity,
+                    max_z_accel,
+                )?;
+                for (rail, (arm2, tower_x, tower_y)) in rails.iter().zip(delta.tower_geometry()) {
+                    for stepper in rail.steppers() {
+                        stepper.setup_itersolve(
+                            delta_position_fn(arm2, tower_x, tower_y),
+                            delta_active_flags(),
+                        );
+                    }
+                }
+                delta_kinematics = Some(delta);
             }
             _ => {
                 for (name, axis) in [
@@ -481,6 +541,7 @@ impl ToolHeadObject {
             rails,
             bed,
             kind,
+            delta: Mutex::new(delta_kinematics),
             transform: kind.transform(),
             max_angular_velocity,
             active_extruder: Mutex::new("extruder".to_string()),
@@ -579,6 +640,44 @@ impl ToolHeadObject {
     /// The machine's maximum velocity, for `[extruder]`'s speed defaults.
     pub fn max_velocity(&self) -> f64 {
         self.limits.max_velocity
+    }
+
+    /// Whether the loaded `[printer]` kinematics carries a delta calibration
+    /// (`delta_calibrate.py:handle_connect`'s `hasattr(kin,
+    /// "get_calibration")`).
+    ///
+    /// Answerable from the load-time kind, so `[delta_calibrate]` can check at
+    /// its own connect — which runs before this object's, since upstream loads
+    /// `toolhead` last (`toolhead.py:604-615`).
+    pub fn has_delta_calibration(&self) -> bool {
+        matches!(self.kind, KinematicsKind::Delta)
+    }
+
+    /// The delta calibration parameters the kinematics carries
+    /// (`get_calibration`, `delta.py:153-160`), or `None` for any other
+    /// kinematics.
+    ///
+    /// Read from the connected kinematics when the machine is up, and from
+    /// the parameters parked here at load otherwise — they are the same
+    /// object; connect hands it over.
+    pub fn delta_calibration(&self) -> Option<DeltaCalibration> {
+        {
+            let guard = self.lock();
+            if let Some(connected) = guard.as_ref() {
+                if let Some(calibration) = connected
+                    .toolhead
+                    .kinematics()
+                    .and_then(|kinematics| kinematics.delta_calibration())
+                {
+                    return Some(calibration);
+                }
+            }
+        }
+        self.delta
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .as_ref()
+            .map(DeltaKinematics::calibration)
     }
 
     /// The machine's maximum acceleration, for `[extruder]`'s speed defaults.
@@ -704,6 +803,17 @@ impl PrinterObject for ToolHeadObject {
                         self.max_angular_velocity,
                     )));
                 }
+            KinematicsKind::Delta => {
+                let delta = self
+                    .delta
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .take()
+                    .ok_or_else(|| {
+                        config_error("delta kinematics is not connected".to_string())
+                    })?;
+                toolhead.set_kinematics(Box::new(delta));
+            }
                 _ => {
                     toolhead.set_kinematics(Box::new(CartesianKinematics::new(
                         self.axis_names(),
@@ -775,6 +885,89 @@ impl PrinterObject for ToolHeadObject {
             Ok(())
         })
     }
+}
+
+/// Read the delta options and build the kinematics
+/// (`kinematics/delta.py:11-77`, whose reads these mirror one for one): the
+/// `[printer]` options here, the tower options from each `[stepper_a/b/c]`
+/// section.
+///
+/// # Errors
+/// A missing or out-of-bounds option, reported with the config reader's
+/// upstream wording; or a geometry whose home position does not exist (see
+/// [`DeltaKinematics::new`]).
+#[allow(clippy::too_many_arguments)]
+fn build_delta(
+    config: &ConfigWrapper,
+    rails: &[Arc<Rail>],
+    max_velocity: f64,
+    max_accel: f64,
+    max_z_velocity: f64,
+    max_z_accel: f64,
+) -> Result<DeltaKinematics, ConfigError> {
+    let radius = config.get_float_bounded("delta_radius", None, None, None, Some(0.0), None)?;
+    let print_radius =
+        config.get_float_bounded("print_radius", Some(radius), None, None, Some(0.0), None)?;
+    let mut endstops = [0.0; 3];
+    for (index, rail) in rails.iter().enumerate() {
+        endstops[index] = rail.homing_info().position_endstop;
+    }
+    let max_z = endstops.iter().copied().fold(f64::INFINITY, f64::min);
+    let minimum_z_position = config.get_float_bounded(
+        "minimum_z_position",
+        Some(0.0),
+        None,
+        Some(max_z),
+        None,
+        None,
+    )?;
+
+    // Tower geometry: `stepper_a`'s `arm_length` is required and sets the
+    // default for `stepper_b/c`; the angles default to 210/330/90
+    // (`delta.py:34-42`).
+    let mut arm_lengths = [0.0; 3];
+    let mut angles = [0.0; 3];
+    let default_angles = [210.0, 330.0, 90.0];
+    for (index, name) in DELTA_RAIL_NAMES.iter().enumerate() {
+        let tower = config.sibling(name).ok_or_else(|| {
+            ConfigError::new(format!(
+                "Section '{}' needs a '[{name}]' section",
+                config.identifier()
+            ))
+        })?;
+        let arm_length = if index == 0 {
+            tower.get_float_bounded("arm_length", None, None, None, Some(radius), None)?
+        } else {
+            tower.get_float_bounded(
+                "arm_length",
+                Some(arm_lengths[0]),
+                None,
+                None,
+                Some(radius),
+                None,
+            )?
+        };
+        arm_lengths[index] = arm_length;
+        angles[index] = tower.get_float("angle", Some(default_angles[index]))?;
+    }
+    let mut step_dists = [0.0; 3];
+    for (index, rail) in rails.iter().enumerate() {
+        step_dists[index] = rail.step_dist();
+    }
+
+    DeltaKinematics::new(DeltaConfig {
+        radius,
+        print_radius,
+        minimum_z_position,
+        angles,
+        arm_lengths,
+        endstops,
+        step_dists,
+        max_velocity,
+        max_accel,
+        max_z_velocity,
+        max_z_accel,
+    })
 }
 
 /// The registered extruders, in `[extruder]`, `[extruder1]`… order.
@@ -1365,6 +1558,24 @@ async fn home_axes(
         }
         return Ok(());
     }
+    // Delta homes every tower in one move and ignores which axes `G28` named
+    // (`kinematics/delta.py:104-110` always takes all three rails), so its
+    // homing is one multi-endstop move rather than one per axis.
+    if let Some(home) = connected
+        .toolhead
+        .kinematics()
+        .and_then(|kinematics| kinematics.unified_home())
+    {
+        send(printer, &KlippyEvent::HomingHomeRailsBegin);
+        let result = home_unified(connected, rails, &home, printer).await;
+        send(
+            printer,
+            &KlippyEvent::HomingHomeRailsEnd {
+                axes: vec![X_AXIS, Y_AXIS, Z_AXIS],
+            },
+        );
+        return result;
+    }
     for &axis in requested {
         let rail = &rails[axis];
         let endstop = rail.endstop().ok_or_else(|| {
@@ -1414,6 +1625,132 @@ fn send(printer: &Weak<Printer>, event: &KlippyEvent) {
     if let Some(printer) = printer.upgrade() {
         printer.send_event(event);
     }
+}
+
+/// Home every rail in one multi-endstop move, as delta does
+/// (`Homing._do_home_rails` + `HomingMove.homing_move` with all three
+/// endstops armed; upstream's retract + second pass is the gap
+/// [`PrinterStepper`](crate::core::klippy::extras::stepper::PrinterStepper)'s
+/// module docs record for the cartesian family too).
+///
+/// # Errors
+/// A missing endstop, a kinematics refusal, a failed query/send, or a tower
+/// whose endstop never triggered ("No trigger on … after full movement",
+/// `extras/homing.py:104-107`).
+async fn home_unified(
+    connected: &mut Connected,
+    rails: &[Arc<Rail>],
+    home: &UnifiedHome,
+    printer: &Weak<Printer>,
+) -> Result<(), CommandError> {
+    for rail in rails {
+        if rail.endstop().is_none() {
+            return Err(CommandError::new(format!(
+                "No endstop configured for {}",
+                rail.name()
+            )));
+        }
+    }
+
+    // Pretend to be at the force position with every axis marked homed, which
+    // is what lets the homing move through delta's `check_move`
+    // (`Homing._set_start_position` sets `homing_axes="xyz"`).
+    let current = connected.toolhead.commanded_pos();
+    let force = Coord::new(home.force[0], home.force[1], home.force[2], current.e());
+    let target = Coord::new(home.target[0], home.target[1], home.target[2], current.e());
+    connected
+        .toolhead
+        .set_position(force, &[X_AXIS, Y_AXIS, Z_AXIS]);
+
+    // The endstops all start sampling before the move and each is paced by
+    // its own tower's travel (`HomingMove._calc_endstop_rate`).
+    let speed = rails[0].homing_info().speed;
+    let move_t = move_distance(force, target) / speed;
+    let print_time = connected.toolhead.get_last_move_time();
+    let mut completions = Vec::with_capacity(rails.len());
+    for (index, rail) in rails.iter().enumerate() {
+        let endstop = rail
+            .endstop()
+            .expect("every rail's endstop was checked above");
+        let steps = home.actuator_travel[index] / rail.step_dist();
+        let rest_time = if steps <= 0. {
+            0.001
+        } else {
+            (move_t / steps).max(0.001)
+        };
+        let completion = endstop
+            .home_start(
+                print_time,
+                ENDSTOP_SAMPLE_TIME,
+                ENDSTOP_SAMPLE_COUNT,
+                rest_time,
+                true,
+            )
+            .map_err(command_error)?;
+        completions.push(completion);
+    }
+    connected.toolhead.dwell(HOMING_START_DELAY);
+    send(printer, &KlippyEvent::HomingHomingMoveBegin);
+    let (start, end) = connected
+        .toolhead
+        .drip_move(target, speed)
+        .map_err(|err| CommandError::new(err.to_string()))?;
+
+    // Drip the move out in small windows until every endstop has fired (or
+    // the move ran out). Each wake waits on one still-pending endstop, so a
+    // trigger between checks is seen promptly.
+    let mut flush_time = start;
+    while flush_time < end
+        && completions
+            .iter()
+            .any(|completion| completion.reason().is_none())
+    {
+        flush_time = (flush_time + DRIP_SEGMENT_TIME).min(end);
+        let batches = connected
+            .toolhead
+            .flush_step_generation(flush_time)
+            .map_err(|err| CommandError::new(err.to_string()))?;
+        for (name, commands) in batches {
+            if let Some(stepper) = connected.mcu_steppers.get(&name) {
+                stepper
+                    .send_steps_async(&commands)
+                    .await
+                    .map_err(command_error)?;
+            }
+        }
+        if let Some(pending) = completions
+            .iter()
+            .find(|completion| completion.reason().is_none())
+        {
+            tokio::select! {
+                _ = sleep(Duration::from_secs_f64(DRIP_LOOKAHEAD)) => {}
+                _ = pending.wait() => {}
+            }
+        }
+    }
+
+    for (index, rail) in rails.iter().enumerate() {
+        let trigger_time = rail
+            .endstop()
+            .expect("every rail's endstop was checked above")
+            .home_wait(end)
+            .await
+            .map_err(command_error)?;
+        if trigger_time <= 0.0 {
+            return Err(CommandError::new(format!(
+                "No trigger on {} after full movement",
+                rail.name()
+            )));
+        }
+        let _ = index;
+    }
+    send(printer, &KlippyEvent::HomingHomingMoveEnd);
+    // The carriage is now at its home position, all axes homed.
+    connected
+        .toolhead
+        .set_position(target, &[X_AXIS, Y_AXIS, Z_AXIS]);
+    connected.toolhead.wipe_trapq();
+    Ok(())
 }
 
 /// Home one axis: pretend to be at `forcepos`, move to the endstop, then place
@@ -1864,7 +2201,7 @@ mod tests {
         let mut section = ConfigSection::new("printer", None);
         section.parameters.insert(
             "kinematics".to_string(),
-            ConfigValue::Single("delta".to_string()),
+            ConfigValue::Single("polar".to_string()),
         );
         section.parameters.insert(
             "max_velocity".to_string(),
@@ -1881,7 +2218,9 @@ mod tests {
             .map(|_| ())
             .unwrap_err();
 
-        assert!(err.to_string().contains("Error loading kinematics 'delta'"));
+        assert!(err.to_string().contains("Error loading kinematics 'polar'"));
+        // The message also names what *is* implemented, including delta now.
+        assert!(err.to_string().contains("delta"));
     }
 
     #[test]
@@ -2054,6 +2393,49 @@ mod tests {
         assert!(names.contains("polar"), "{names}");
     }
 
+    fn test_the_delta_kinematics_loads_its_three_towers() {
+        // `config/example-delta.cfg`'s shape: three towers (no `position_max`
+        // option), `arm_length` on `stepper_a`, `delta_radius` on `[printer]`.
+        use crate::core::klippy::config::Config;
+        use crate::core::klippy::reactor::ManualReactor;
+
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        let (config, _) = Config::from_text(
+            "[mcu]\nserial: /dev/not-opened-yet\n\
+             [stepper_a]\nstep_pin: PA0\ndir_pin: PA1\nenable_pin: !PA2\n\
+             rotation_distance: 40\nmicrosteps: 16\nendstop_pin: ^PA3\n\
+             homing_speed: 50\nposition_endstop: 297.05\narm_length: 333.0\n\
+             [stepper_b]\nstep_pin: PB0\ndir_pin: PB1\nenable_pin: !PB2\n\
+             rotation_distance: 40\nmicrosteps: 16\nendstop_pin: ^PB3\n\
+             [stepper_c]\nstep_pin: PC0\ndir_pin: PC1\nenable_pin: !PC2\n\
+             rotation_distance: 40\nmicrosteps: 16\nendstop_pin: ^PC3\n\
+             [printer]\nkinematics: delta\nmax_velocity: 300\nmax_accel: 3000\n\
+             max_z_velocity: 150\ndelta_radius: 174.75\n",
+        )
+        .expect("the config parses");
+        printer
+            .load_config(&config)
+            .unwrap_or_else(|err| panic!("delta: {err}"));
+
+        let object = printer
+            .lookup_object_as::<ToolHeadObject>("toolhead")
+            .expect("the toolhead is registered");
+        assert!(object.has_delta_calibration());
+        assert_eq!(object.rails.len(), 3);
+        assert_eq!(object.axis_names(), ["stepper_a", "stepper_b", "stepper_c"]);
+        // The calibration view carries the loaded parameters.
+        let calibration = object
+            .delta_calibration()
+            .expect("`kinematics: delta` has a calibration");
+        assert_eq!(calibration.radius, 174.75);
+        assert_eq!(calibration.arms, [333.0, 333.0, 333.0]);
+        assert_eq!(calibration.endstops, [297.05, 297.05, 297.05]);
+        // `stepper_b/c` inherited `stepper_a`'s endstop.
+        for rail in &object.rails {
+            assert_eq!(rail.homing_info().position_endstop, 297.05);
+        }
+    }
+
     #[test]
     fn test_mcu_errors_are_reported_with_the_section_name() {
         // `McuError::Config` is what a missing connection reports; the test just
@@ -2137,6 +2519,8 @@ mod tests {
             rails: Vec::new(),
             bed: None,
             kind: KinematicsKind::Cartesian,
+            kind: KinematicsKind::Cartesian,
+            delta: Mutex::new(None),
             transform: CartesianTransform::Standard,
             max_angular_velocity: 0.0,
             active_extruder: Mutex::new("extruder".to_string()),

@@ -18,6 +18,7 @@
 //! The MCU side (the oid's `config_stepper`, sending `queue_step` over the
 //! wire) and the kinematics trait are FW5e; nothing here talks to an MCU.
 
+pub mod delta;
 pub mod extra;
 pub mod itersolve;
 pub mod kinematics;

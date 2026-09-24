@@ -20,13 +20,37 @@ use super::trapq::{MoveSegment, Trapq};
 const SEEK_TIME_RESET: f64 = 0.000_100;
 
 /// The position function of one stepper: where it is `move_time` seconds into a
-/// segment, in millimetres.
+/// segment, in millimetres, with the function's parameters bound.
 ///
-/// A plain function rather than a closure over the stepper, because upstream's
-/// cartesian callback reads only the move (`cart_stepper_x_calc_position`,
-/// `chelper/kin_cartesian.c:14-20`). A stepper that needs its own state (an
-/// input shaper) is a later extension.
-pub type PositionFn = fn(&MoveSegment, f64) -> f64;
+/// Upstream's cartesian callback reads only the move
+/// (`cart_stepper_x_calc_position`, `chelper/kin_cartesian.c:14-20`), but
+/// `delta_stepper_alloc` (`chelper/kin_delta.c:16-41`) allocates its solver
+/// with `arm2`, `tower_x` and `tower_y` from the config. A plain function
+/// pointer cannot carry those, so the bound function keeps a three-float
+/// parameter block beside it. The value stays `Copy`, so `SolverSpec` and
+/// `StepKinematics` are unchanged; the stateless solvers bind zeros.
+#[derive(Debug, Clone, Copy)]
+pub struct PositionFn {
+    /// The solver, reading its parameters as `params` (`[arm2, tower_x,
+    /// tower_y]` for delta, unused for the stateless ones).
+    f: fn(&MoveSegment, f64, &[f64; 3]) -> f64,
+    /// The parameters bound into `f`.
+    params: [f64; 3],
+}
+
+impl PositionFn {
+    /// Bind a solver to its parameters (`delta_stepper_alloc(arm2, tower_x,
+    /// tower_y)`).
+    pub fn bind(f: fn(&MoveSegment, f64, &[f64; 3]) -> f64, params: [f64; 3]) -> Self {
+        Self { f, params }
+    }
+
+    /// Where the stepper is `move_time` seconds into `segment`.
+    #[inline]
+    pub fn call(&self, segment: &MoveSegment, move_time: f64) -> f64 {
+        (self.f)(segment, move_time, &self.params)
+    }
+}
 
 /// The axes a stepper moves (upstream's `AF_X`/`AF_Y`/`AF_Z`,
 /// `chelper/itersolve.h:6-9`).
@@ -124,7 +148,7 @@ impl StepKinematics {
     /// One position-fn evaluation: the raw result, unwrapped against the
     /// commanded position (`polar_stepper_angle_calc_position`).
     fn eval(&self, segment: &MoveSegment, move_time: f64) -> f64 {
-        let raw = (self.position)(segment, move_time);
+        let raw = self.position.call(segment, move_time);
         match self.unwrap {
             Some(unwrap) => unwrap(raw, self.commanded_pos),
             None => raw,
@@ -366,10 +390,20 @@ pub enum Axis {
 /// (`cartesian_stepper_alloc`, `chelper/kin_cartesian.c:39-56`): read that
 /// axis' coordinate.
 pub fn cartesian_position_fn(axis: Axis) -> PositionFn {
+    const NO_PARAMS: [f64; 3] = [0.0; 3];
     match axis {
-        Axis::X => |segment, move_time| segment.coord(move_time).x(),
-        Axis::Y => |segment, move_time| segment.coord(move_time).y(),
-        Axis::Z => |segment, move_time| segment.coord(move_time).z(),
+        Axis::X => PositionFn::bind(
+            |segment, move_time, _| segment.coord(move_time).x(),
+            NO_PARAMS,
+        ),
+        Axis::Y => PositionFn::bind(
+            |segment, move_time, _| segment.coord(move_time).y(),
+            NO_PARAMS,
+        ),
+        Axis::Z => PositionFn::bind(
+            |segment, move_time, _| segment.coord(move_time).z(),
+            NO_PARAMS,
+        ),
     }
 }
 
@@ -385,16 +419,23 @@ pub fn cartesian_active_flags(axis: Axis) -> AxisFlags {
 /// The position function for one CoreXY motor (`corexy_stepper_alloc`,
 /// `chelper/kin_corexy.c`): `+` follows `x + y`, `-` follows `x - y`.
 pub fn corexy_position_fn(plus: bool) -> PositionFn {
+    const NO_PARAMS: [f64; 3] = [0.0; 3];
     if plus {
-        |segment, move_time| {
-            let c = segment.coord(move_time);
-            c.x() + c.y()
-        }
+        PositionFn::bind(
+            |segment, move_time, _| {
+                let c = segment.coord(move_time);
+                c.x() + c.y()
+            },
+            NO_PARAMS,
+        )
     } else {
-        |segment, move_time| {
-            let c = segment.coord(move_time);
-            c.x() - c.y()
-        }
+        PositionFn::bind(
+            |segment, move_time, _| {
+                let c = segment.coord(move_time);
+                c.x() - c.y()
+            },
+            NO_PARAMS,
+        )
     }
 }
 
@@ -407,16 +448,23 @@ pub fn corexy_active_flags() -> AxisFlags {
 /// The position function for one CoreXZ motor (`corexz_stepper_alloc`,
 /// `chelper/kin_corexz.c`): `+` follows `x + z`, `-` follows `x - z`.
 pub fn corexz_position_fn(plus: bool) -> PositionFn {
+    const NO_PARAMS: [f64; 3] = [0.0; 3];
     if plus {
-        |segment, move_time| {
-            let c = segment.coord(move_time);
-            c.x() + c.z()
-        }
+        PositionFn::bind(
+            |segment, move_time, _| {
+                let c = segment.coord(move_time);
+                c.x() + c.z()
+            },
+            NO_PARAMS,
+        )
     } else {
-        |segment, move_time| {
-            let c = segment.coord(move_time);
-            c.x() - c.z()
-        }
+        PositionFn::bind(
+            |segment, move_time, _| {
+                let c = segment.coord(move_time);
+                c.x() - c.z()
+            },
+            NO_PARAMS,
+        )
     }
 }
 
@@ -429,7 +477,10 @@ pub fn corexz_active_flags() -> AxisFlags {
 /// `chelper/kin_extruder.c`): read the trapq's x, which the extruder's trapq
 /// holds the extrusion amount in.
 pub fn extruder_position_fn() -> PositionFn {
-    |segment, move_time| segment.coord(move_time).x()
+    PositionFn::bind(
+        |segment, move_time, _| segment.coord(move_time).x(),
+        [0.0; 3],
+    )
 }
 
 /// The active flags for an extruder motor (`AF_X`, because it reads x).
@@ -481,9 +532,9 @@ mod tests {
         };
 
         // 0.5 s at 10 mm/s along X, starting at (1, 2, 3).
-        assert_eq!(cartesian_position_fn(Axis::X)(&segment, 0.5), 6.0);
-        assert_eq!(cartesian_position_fn(Axis::Y)(&segment, 0.5), 2.0);
-        assert_eq!(cartesian_position_fn(Axis::Z)(&segment, 0.5), 3.0);
+        assert_eq!(cartesian_position_fn(Axis::X).call(&segment, 0.5), 6.0);
+        assert_eq!(cartesian_position_fn(Axis::Y).call(&segment, 0.5), 2.0);
+        assert_eq!(cartesian_position_fn(Axis::Z).call(&segment, 0.5), 3.0);
     }
 
     #[test]
@@ -497,8 +548,8 @@ mod tests {
             axes_r: Xyz::new(1.0, 0.0, 0.0),
         };
         // x is 6 and y is 2 at 0.5 s, so the two motors read 8 and 4.
-        assert_eq!(corexy_position_fn(true)(&segment, 0.5), 8.0);
-        assert_eq!(corexy_position_fn(false)(&segment, 0.5), 4.0);
+        assert_eq!(corexy_position_fn(true).call(&segment, 0.5), 8.0);
+        assert_eq!(corexy_position_fn(false).call(&segment, 0.5), 4.0);
         assert_eq!(corexy_active_flags(), AxisFlags::X.union(AxisFlags::Y));
     }
 
@@ -513,8 +564,8 @@ mod tests {
             axes_r: Xyz::new(0.0, 0.0, 1.0),
         };
         // x is 1 and z is 8 at 0.5 s, so the two motors read 9 and -7.
-        assert_eq!(corexz_position_fn(true)(&segment, 0.5), 9.0);
-        assert_eq!(corexz_position_fn(false)(&segment, 0.5), -7.0);
+        assert_eq!(corexz_position_fn(true).call(&segment, 0.5), 9.0);
+        assert_eq!(corexz_position_fn(false).call(&segment, 0.5), -7.0);
         assert_eq!(corexz_active_flags(), AxisFlags::X.union(AxisFlags::Z));
     }
 

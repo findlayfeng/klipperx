@@ -10,7 +10,9 @@ use std::collections::HashMap;
 
 use serde_json::{json, Value};
 
+use super::delta::DeltaCalibration;
 use super::plan::Move;
+use super::itersolve::PositionFn;
 use super::trapq::MoveSegment;
 use crate::core::klippy::gcode::CommandError;
 use crate::core::klippy::mathutil::{Coord, AXES, X_AXIS, Y_AXIS, Z_AXIS};
@@ -36,8 +38,12 @@ impl<'a> MoveContext<'a> {
         &self.move_.end_pos
     }
 
-    /// Where the move starts (polar's near-center slowdown measures the
-    /// segment's closest approach to the bed center from both ends).
+    /// Where the move starts.
+    ///
+    /// Polar's near-center slowdown measures the segment's closest approach
+    /// to the bed center from both ends; Delta's `check_move` compares it
+    /// with the home position to recognize the homing move finishing outside
+    /// the envelope (`kinematics/delta.py:137-146`).
     pub fn start_pos(&self) -> &Coord {
         &self.move_.start_pos
     }
@@ -169,6 +175,41 @@ pub trait Kinematics: Send + Sync + std::fmt::Debug {
     /// the homing move's endpoints from the rail's range and `HomingInfo` and
     /// hands them to the driver.
     fn home(&mut self, homing: &mut dyn HomingState);
+
+    /// A homing move the kinematics takes as one piece instead of axis by axis
+    /// (`kinematics/delta.py:104-110`: all three towers home in one move).
+    ///
+    /// `None` — the default — means the driver homes each rail independently
+    /// as it does for the cartesian family.
+    fn unified_home(&self) -> Option<UnifiedHome> {
+        None
+    }
+
+    /// The delta calibration parameters this kinematics carries
+    /// (`kinematics/delta.py:153-160`, `get_calibration`).
+    ///
+    /// `None` — the default — for every non-delta kinematics, which is what
+    /// `[delta_calibrate]` checks for (`delta_calibrate.py:127-131`).
+    fn delta_calibration(&self) -> Option<DeltaCalibration> {
+        None
+    }
+}
+
+/// A homing move the kinematics takes in one piece (`DeltaKinematics.home`).
+///
+/// Upstream's `Homing._do_home_rails` drives all of a rail set's endstops in a
+/// single move; delta is the only kinematics whose `home` asks for that today.
+#[derive(Debug, Clone, Copy)]
+pub struct UnifiedHome {
+    /// Where the toolhead is pretended to be before the move
+    /// (`forcepos`: below every arm sphere, at the home XY).
+    pub force: [f64; 3],
+    /// Where the move ends: the kinematics' home position (`movepos`).
+    pub target: [f64; 3],
+    /// Each rail's actuator travel over the move, millimetres — the endstop
+    /// sample pacing derives from it (`HomingMove._calc_endstop_rate`,
+    /// `extras/homing.py:60-70`).
+    pub actuator_travel: [f64; 3],
 }
 
 /// The homing move endpoints for one axis (`CartKinematics.home_axis`).
@@ -432,6 +473,16 @@ pub fn polar_radius_position(segment: &MoveSegment, move_time: f64) -> f64 {
 pub fn polar_angle_position(segment: &MoveSegment, move_time: f64) -> f64 {
     let c = segment.coord(move_time);
     c.y().atan2(c.x())
+}
+
+/// `PositionFn`-typed wrappers for `setup_itersolve` (the position-fn struct
+/// carries no parameters for either polar solver).
+pub fn polar_radius_solver() -> PositionFn {
+    PositionFn::bind(|segment, move_time, _| polar_radius_position(segment, move_time), [0.0; 3])
+}
+
+pub fn polar_angle_solver() -> PositionFn {
+    PositionFn::bind(|segment, move_time, _| polar_angle_position(segment, move_time), [0.0; 3])
 }
 
 /// Both polar steppers follow X and Y (`kin_polar.c:46` sets `AF_X | AF_Y`

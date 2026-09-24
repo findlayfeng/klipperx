@@ -656,13 +656,7 @@ impl GCodeDispatch {
         for line in script.split('\n') {
             // An API `gcode/script` line is not acknowledged; the file/serial
             // input protocol is the only `need_ack` producer (`gcode.py:210`).
-            process_line(&self.inner, line, false).await.map_err(|e| {
-                #[cfg(debug_assertions)]
-                if std::env::var_os("MULTI_Z").is_some() {
-                    eprintln!("CAP-DIAG error at gcode line {line:?}: {e}"); // TEMP-DIAG
-                }
-                e
-            })?;
+            process_line(&self.inner, line, false).await?;
         }
         Ok(())
     }

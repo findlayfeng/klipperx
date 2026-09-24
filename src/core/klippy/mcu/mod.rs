@@ -56,6 +56,17 @@ use events::McuEvents;
 /// [`Mcu::send_payload`] instead.
 const SEND_QUEUE_CAPACITY: usize = 512;
 
+/// Slots the awaiting producers ([`Mcu::send_payload`]) leave free for the
+/// synchronous [`Mcu::send`].
+///
+/// `Mcu::send` cannot wait for room — its `try_send` reports
+/// "no available capacity" — so a burst of step batches that saturates the
+/// queue would starve every sync sender behind it (an endstop arm during
+/// `PROBE` is the observed case: `endstop_home` found the queue full and the
+/// g-code line failed). The awaiting path therefore stops at this watermark
+/// and lets the wire drain; the sync path gets the reserved slots.
+const SYNC_SEND_HEADROOM: usize = 16;
+
 use crate::core::klippy::load::section;
 
 // The `[mcu]` / `[mcu <name>]` sections. The factories are re-exported from
@@ -990,12 +1001,11 @@ impl Mcu {
     /// # Errors
     /// Returns [`McuError::Msg`] if the send task has gone away.
     pub(crate) async fn send_payload(&self, payload: Payload) -> Result<(), McuError> {
-        #[cfg(debug_assertions)]
-        if std::env::var_os("MULTI_Z").is_some() && self.send_buf_tx.capacity() <= 8 {
-            eprintln!(
-                "CAP-DIAG await-payload ({} left)",
-                self.send_buf_tx.capacity()
-            ); // TEMP-DIAG
+        // Hold back at the headroom so the sync `Mcu::send` keeps slots to
+        // land in (see `SYNC_SEND_HEADROOM`); give up waiting only if the
+        // channel closed, so the error below still surfaces.
+        while self.send_buf_tx.capacity() <= SYNC_SEND_HEADROOM && !self.send_buf_tx.is_closed() {
+            sleep(Duration::from_micros(100)).await;
         }
         self.send_buf_tx
             .send(SendItem::Payload(payload))
@@ -1036,13 +1046,7 @@ impl Mcu {
         }
         self.send_buf_tx
             .try_send(SendItem::Payload(payload))
-            .map_err(|e| {
-                #[cfg(debug_assertions)]
-                if std::env::var_os("MULTI_Z").is_some() {
-                    eprintln!("CAP-DIAG enqueue full: {name}"); // TEMP-DIAG
-                }
-                MsgError::new(e.to_string())
-            })?;
+            .map_err(|e| MsgError::new(e.to_string()))?;
         Ok(())
     }
 

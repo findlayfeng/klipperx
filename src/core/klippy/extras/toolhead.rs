@@ -1267,7 +1267,15 @@ async fn probing_move(
     // none. (Upstream's "Probe triggered prior to movement" is
     // `check_no_movement` — an endstop that triggered before a **non-zero**
     // move started — not this.)
-    if distance == 0.0 {
+    //
+    // The guard shares the epsilon of `motion::plan::Move::new`
+    // (`move_d < 0.000_000_001` collapses XYZ to a non-kinematic zero-length
+    // move): a sub-nanometer fp residue (e.g. `4.7e-16` left by
+    // `set_position`/`G1` arithmetic) must take this branch too — otherwise
+    // `home_start` arms the endstop while the planner queues zero batches,
+    // the fake never fires and `home_wait` deadlocks (seen as 111 re-arms of
+    // one frozen clock in multi_z's third probe).
+    if distance < 0.000_000_001 {
         send(printer, &KlippyEvent::HomingHomingMoveEnd);
         return Ok(current);
     }
@@ -2196,6 +2204,35 @@ mod tests {
             connected.toolhead.commanded_pos(),
             result,
             "the commanded position is left untouched"
+        );
+    }
+
+    /// A probe whose XYZ distance is **sub-nanometer** — an fp residue below
+    /// the `motion::plan::Move::new` collapse threshold (`< 1e-9`, e.g.
+    /// `4.7e-16` left by `set_position`/`G1` arithmetic) — is the same
+    /// no-op: the planner would drop the move to zero kinematic steps, so
+    /// arming would deadlock `home_wait` (no step batch, no fire). The
+    /// guard must share that epsilon rather than compare `== 0.0`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_probing_move_sub_nanometer_distance_returns_without_arming() {
+        let (mut connected, printer) = probing_connected();
+        let endstop = TriggeringEndstop::new(true);
+        let target = Coord::new(0.0, 0.0, 4.7e-16, 0.0); // below 1e-9, above 0
+        let speed = 5.0;
+        let printer = Arc::downgrade(&printer);
+
+        let result = probing_move(&mut connected, &endstop, target, speed, &printer)
+            .await
+            .expect("a sub-nanometer probe succeeds as a no-op");
+        assert_eq!(
+            result,
+            Coord::default(),
+            "the probe reports where it already stood"
+        );
+        let ops = endstop.ops.lock().unwrap_or_else(|p| p.into_inner());
+        assert!(
+            !ops.iter().any(|op| *op == "home_start"),
+            "the endstop is never armed: no steps would ever fire it"
         );
     }
 

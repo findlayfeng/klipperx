@@ -163,6 +163,7 @@ mod tests {
     use crate::core::klippy::frame::Frame;
     use crate::core::klippy::interface::devices::frame_mock::{FrameMock, MappingEntry};
     use crate::core::klippy::interface::Interface;
+    use crate::core::klippy::mcu::McuEndstop;
     use crate::core::klippy::mcu::{ConfigBuilder, Dictionary, Mcu, McuChip};
     use crate::core::klippy::msg::proto::{ArgValue, Payload};
     use crate::core::klippy::pins::{PinParams, PrinterPins};

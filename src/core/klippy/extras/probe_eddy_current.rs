@@ -43,8 +43,8 @@ use crate::core::klippy::config::{ConfigError, ConfigWrapper};
 use crate::core::klippy::event::KlippyEvent;
 use crate::core::klippy::extras::ldc1612::{self, Calibration, Ldc1612};
 use crate::core::klippy::extras::probe::{
-    calc_probe_z_average, check_virtual_endstop, command_status, ProbeCommandState, ProbeOffsets,
-    ProbeParams, ProbeSession, SampleDelivery,
+    calc_probe_z_average, check_virtual_endstop, command_status, lookup_probe_session,
+    ProbeCommandState, ProbeOffsets, ProbeParams, ProbeSession, SampleDelivery,
 };
 use crate::core::klippy::extras::toolhead::{HomingEndstop, ToolHeadObject};
 use crate::core::klippy::extras::trigger_analog::{calc_frac_bits, to_fixed_32, DigitalFilter};
@@ -52,7 +52,7 @@ use crate::core::klippy::gcode::{
     CommandError, CommandHandler, GCodeDispatch, GcodeCommand, GCODE_OBJECT,
 };
 use crate::core::klippy::load::section;
-use crate::core::klippy::mathutil::Coord;
+use crate::core::klippy::mathutil::{solve_linear_equations, Coord};
 use crate::core::klippy::mcu::{McuChip, McuTriggerAnalog, SosFilter, SosFilterDesign};
 use crate::core::klippy::pins::{
     DigitalOut, PinChip, PinError, PinParams, PrinterPins, PINS_OBJECT,
@@ -78,6 +78,7 @@ pub fn load_config_prefix(
 ) -> Result<Arc<dyn PrinterObject>, ConfigError> {
     let probe = Arc::new(PrinterEddyProbe::new(config, printer)?);
     probe.register_commands()?;
+    EddyTapCalibration::register(printer, Arc::clone(&probe.calibration))?;
     printer.add_object(PROBE_OBJECT, Arc::clone(&probe) as Arc<dyn PrinterObject>)?;
     Ok(probe)
 }
@@ -270,8 +271,6 @@ struct EddyOptions {
     offsets: ProbeOffsets,
     /// The `probe.ProbeParameterHelper` defaults.
     params: ProbeParams,
-    /// The stored tap Z offset (`tap_z_offset`, default 0).
-    tap_z_offset: f64,
     /// The stored tap threshold (`tap_threshold`, above 0 when present;
     /// absent is 0 = "tap not configured").
     tap_threshold: f64,
@@ -346,7 +345,11 @@ impl EddyOptions {
             )? as i64,
         };
 
-        let tap_z_offset = config.get_float("tap_z_offset", Some(0.0))?;
+        // `tap_z_offset` adjusts the tap contact height (`adj_z_contact`),
+        // which the tap analysis — not yet ported (module header) — would
+        // consume; read here so the option stays accounted for
+        // (`check_unused`).
+        let _tap_z_offset = config.get_float("tap_z_offset", Some(0.0))?;
         // Upstream reads `tap_threshold` with `above=0.` but a default of 0:
         // the bound applies to a written value, not to an absent one, so the
         // presence of the option decides how it is read here too.
@@ -365,7 +368,6 @@ impl EddyOptions {
             descend_z,
             offsets,
             params,
-            tap_z_offset,
             tap_threshold,
             mcu_name,
         })
@@ -724,8 +726,6 @@ pub struct PrinterEddyProbe {
     offsets: ProbeOffsets,
     /// The `probe.ProbeParameterHelper` defaults.
     params: ProbeParams,
-    /// The stored tap Z offset (`tap_z_offset`).
-    tap_z_offset: f64,
     /// The stored tap threshold (`tap_threshold`; 0 = not configured).
     tap_threshold: f64,
     /// The Z a probing move descends to (`probe.lookup_minimum_z`).
@@ -733,7 +733,9 @@ pub struct PrinterEddyProbe {
     /// What `get_status` reports (`ProbeCommandHelper.get_status`).
     state: Arc<ProbeCommandState>,
     /// The open session: its kind and the gather collecting its samples.
-    active: Mutex<Option<(ActiveSession, Arc<EddyGatherSamples>)>>,
+    /// Shared (`Arc`) so the sensor-side forwarding client — which cannot
+    /// hold the probe itself — reaches the open session by clone.
+    active: Arc<Mutex<Option<(ActiveSession, Arc<EddyGatherSamples>)>>>,
     /// Completed sample sets (`SampleAveragingHelper.results`).
     results: Mutex<Vec<Coord>>,
     /// Whether the ldc1612 forwarding client was installed (once, at the
@@ -848,11 +850,10 @@ impl PrinterEddyProbe {
             descend_z: options.descend_z,
             offsets: options.offsets,
             params: options.params,
-            tap_z_offset: options.tap_z_offset,
             tap_threshold: options.tap_threshold,
             z_min_position,
             state: Arc::new(ProbeCommandState::default()),
-            active: Mutex::new(None),
+            active: Arc::new(Mutex::new(None)),
             results: Mutex::new(Vec::new()),
             client_installed: AtomicBool::new(false),
         })
@@ -1046,26 +1047,24 @@ impl PrinterEddyProbe {
     /// reaches while the machine runs). The client stays registered for the
     /// machine's lifetime and forwards rows only into an *open* session's
     /// gather — no accumulation between sessions.
-    fn ensure_forwarding_client(self: &Arc<Self>) {
+    fn ensure_forwarding_client(&self) {
         if self.client_installed.swap(true, Ordering::SeqCst) {
             return;
         }
-        let weak = Arc::downgrade(self);
+        let active = Arc::clone(&self.active);
         self.sensor.add_client(move |message| {
-            if let Some(probe) = weak.upgrade() {
-                let gather = {
-                    let active = probe.active.lock().unwrap_or_else(|p| p.into_inner());
-                    active.as_ref().map(|(_, gather)| Arc::clone(gather))
-                };
-                if let Some(gather) = gather {
-                    if let Some(rows) = message.get("data").and_then(Value::as_array) {
-                        for row in rows {
-                            if let (Some(time), Some(freq)) = (
-                                row.get(0).and_then(Value::as_f64),
-                                row.get(1).and_then(Value::as_f64),
-                            ) {
-                                gather.deliver_sample(time, freq);
-                            }
+            let gather = {
+                let active = active.lock().unwrap_or_else(|p| p.into_inner());
+                active.as_ref().map(|(_, gather)| Arc::clone(gather))
+            };
+            if let Some(gather) = gather {
+                if let Some(rows) = message.get("data").and_then(Value::as_array) {
+                    for row in rows {
+                        if let (Some(time), Some(freq)) = (
+                            row.get(0).and_then(Value::as_f64),
+                            row.get(1).and_then(Value::as_f64),
+                        ) {
+                            gather.deliver_sample(time, freq);
                         }
                     }
                 }
@@ -1357,6 +1356,9 @@ impl ProbeSession for PrinterEddyProbe {
                 ActiveSession::Descend
             }
         };
+        // The producer side installs once, at the first session — the MCU is
+        // connected by then (the client must not start the batch loop before).
+        self.ensure_forwarding_client();
         let gather = Arc::new(EddyGatherSamples::new(
             &self.printer,
             Arc::clone(&self.sensor),
@@ -1466,54 +1468,134 @@ impl PrinterEddyProbe {
 // TAP_CALIBRATE
 // ===========================================================================
 
-/// `PROBE_EDDY_CURRENT_TAP_CALIBRATE` (`probe_eddy_current.EddyTapCalibration`).
-struct EddyTapCalibration {
-    /// The section name SAVE_CONFIG would write.
-    name: String,
-    /// The main calibration the `guess` branch fits.
-    calibration: Arc<EddyCalibration>,
-    /// The probe object that runs the trial taps.
-    probe: Weak<PrinterEddyProbe>,
-    /// The dispatcher, to synthesize the trial `gcmd`.
-    printer: Weak<Printer>,
-}
+/// `PROBE_EDDY_CURRENT_TAP_CALIBRATE` (`probe_eddy_current.EddyTapCalibration`):
+/// the technical readout over the main calibration, and the `TAP=` trial runs
+/// that drive a `METHOD=tap` session through the registered `probe` object.
+struct EddyTapCalibration;
 
 impl EddyTapCalibration {
     /// Register the command (`__init__`).
+    ///
+    /// # Errors
+    /// A g-code registration clash.
     fn register(
-        config: &ConfigWrapper,
         printer: &Arc<Printer>,
         calibration: Arc<EddyCalibration>,
-        probe: &Arc<PrinterEddyProbe>,
     ) -> Result<(), ConfigError> {
-        let this = Self {
-            name: config.identifier(),
-            calibration,
-            probe: Arc::downgrade(probe),
-            printer: Arc::downgrade(printer),
-        };
         let gcode = printer
             .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
             .expect("the loader registers `gcode` before any section");
         let handler: CommandHandler = {
+            let calibration = Arc::clone(&calibration);
             let this_printer = Arc::downgrade(printer);
             Arc::new(move |gcmd| {
-                let printer = this_printer.clone();
+                let calibration = Arc::clone(&calibration);
+                let this_printer = this_printer.clone();
                 Box::pin(async move {
-                    // Re-enter through the printer registry: the tool state
-                    // lives in the registered `probe` object.
-                    let printer = printer
+                    let printer = this_printer
                         .upgrade()
                         .ok_or_else(|| CommandError::new("Printer is not ready"))?;
-                    let probe = crate::core::klippy::extras::probe::lookup_probe_session(&printer)
-                        .ok_or_else(|| CommandError::new("Printer is not ready"))?;
-                    drop(probe);
-                    let _ = gcmd;
-                    Ok(())
+
+                    // `_analyze_main_calibration`: the best-fit quadratic
+                    // through the calibration points at or below 0.750.
+                    let (freqs, zpos) = calibration.get_calibration();
+                    let coeffs = if freqs.len() < 2 {
+                        None
+                    } else {
+                        let mut eqs: Vec<Vec<f64>> = Vec::new();
+                        let mut ans: Vec<Vec<f64>> = Vec::new();
+                        for (freq, z) in freqs.iter().zip(zpos.iter()) {
+                            if *z <= 0.750 {
+                                ans.push(vec![*freq]);
+                                eqs.push(vec![1.0, *z, z * z]);
+                            }
+                        }
+                        solve_linear_equations(&eqs, &ans)
+                    };
+
+                    match gcmd.get_str_default("TAP", "").as_str() {
+                        // No `TAP`: the technical readout — the calibration
+                        // fit, then the last-tap line.
+                        "" => {
+                            let fit_line = match &coeffs {
+                                Some(c) => format!(
+                                    "Calibration: f={:.3} s={:.3} q={:.3}",
+                                    c[0][0], c[1][0], c[2][0]
+                                ),
+                                None => "Main calibration data not available.".to_string(),
+                            };
+                            // The last-tap analysis (`_analyze_pullback`)
+                            // has not been ported (module header), so there
+                            // is none to report — exactly what upstream
+                            // answers under file-output mode, where that
+                            // analysis never runs either.
+                            gcmd.respond_info(&format!(
+                                "{fit_line}\n\nRun tap probe for last tap analysis."
+                            ));
+                            Ok(())
+                        }
+                        // `TAP=guess`: the trial tap at a threshold derived
+                        // from the calibration slope (`_try_tap`).
+                        "guess" => {
+                            let coeffs = coeffs.ok_or_else(|| {
+                                CommandError::new(
+                                    "Must complete PROBE_EDDY_CURRENT_CALIBRATE first",
+                                )
+                            })?;
+                            Self::try_tap(&printer, gcmd, coeffs[1][0] * -0.10, 1).await
+                        }
+                        // `TAP=refine` / `TAP=verify` gate on tap-analysis
+                        // state this port has not shipped; while it is unset
+                        // — as under upstream's file-output runs, where the
+                        // analysis never runs — the upstream refusals stand.
+                        "refine" => Err(CommandError::new("Must complete valid 'tap' probe first")),
+                        "verify" => {
+                            Err(CommandError::new("Must complete valid 'refine' step first"))
+                        }
+                        _ => Err(CommandError::new("Please provide a valid TAP parameter")),
+                    }
                 })
             })
         };
-        let _ = (this, gcode, handler);
-        unreachable!()
+        gcode
+            .register_command(
+                "PROBE_EDDY_CURRENT_TAP_CALIBRATE",
+                handler,
+                Some("Calibrate tap_threshold for 'tap' probing"),
+                false,
+            )
+            .map_err(ConfigError::new)?;
+        Ok(())
+    }
+
+    /// One `_try_tap` round: a `METHOD=tap` session through the `probe` object
+    /// the section registered (upstream re-enters through `lookup_object`).
+    async fn try_tap(
+        printer: &Arc<Printer>,
+        gcmd: &GcodeCommand,
+        tap_threshold: f64,
+        samples: i64,
+    ) -> Result<(), CommandError> {
+        let session = lookup_probe_session(printer)
+            .ok_or_else(|| CommandError::new("Printer is not ready"))?;
+        let threshold = format!("{tap_threshold:.3}");
+        let mut fo_params = gcmd.get_command_parameters().clone();
+        fo_params.insert("METHOD".to_string(), "tap".to_string());
+        fo_params.insert("TAP_THRESHOLD".to_string(), threshold.clone());
+        fo_params.insert("SAMPLES".to_string(), samples.to_string());
+        let gcode = printer
+            .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+            .ok_or_else(|| CommandError::new("Printer is not ready"))?;
+        let fo_gcmd = gcode.create_gcode_command("", "", fo_params);
+        gcmd.respond_info(&format!(
+            "Tap probing with TAP_THRESHOLD={threshold} SAMPLES={samples}"
+        ));
+        session.start_probe_session(&fo_gcmd)?;
+        session.run_probe(&fo_gcmd).await?;
+        let positions = session.pull_probed_results();
+        session.end_probe_session()?;
+        let z = positions.first().map(Coord::z).ok_or_else(state_error)?;
+        gcmd.respond_info(&format!("Tap probing reports z={z:.6}"));
+        Ok(())
     }
 }

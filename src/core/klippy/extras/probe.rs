@@ -712,26 +712,6 @@ impl PrinterProbe {
             z: self.options.z_offset,
         }
     }
-
-    /// Open a probe session (`start_probe_session`).
-    pub(crate) fn start_probe_session(&self) -> Result<(), CommandError> {
-        self.session.start()
-    }
-
-    /// Run one sample set in the open session (`run_probe`).
-    pub(crate) async fn run_probe(&self, gcmd: &GcodeCommand) -> Result<(), CommandError> {
-        self.session.run(gcmd).await
-    }
-
-    /// Take the completed sample sets (`pull_probed_results`).
-    pub(crate) fn pull_probed_results(&self) -> Vec<Coord> {
-        self.session.pull_results()
-    }
-
-    /// Close the session (`end_probe_session`).
-    pub(crate) fn end_probe_session(&self) -> Result<(), CommandError> {
-        self.session.end()
-    }
 }
 
 /// What every consumer of the `probe` object drives: the session surface of

@@ -483,9 +483,75 @@ impl SimulatorDevice {
                     Self::trigger_if_armed(state, seq, clock);
                     Self::trigger_analog_if_armed(state, seq, clock);
                 }
+                // The ldc1612's register access over the shared I2C bus:
+                // `i2c_transfer oid=%c write=%*s read_len=%u`. The chip answers
+                // its two identification registers and reads back zero
+                // elsewhere; a write (`read_len = 0`) is an empty success.
+                "i2c_transfer" => {
+                    let oid = match params.first() {
+                        Some(ArgValue::UInt8(v)) => *v,
+                        _ => 0,
+                    };
+                    let reg = match params.get(1) {
+                        Some(ArgValue::Bytes(data)) => data.first().copied().unwrap_or(0),
+                        _ => 0,
+                    };
+                    let read_len = match params.get(2) {
+                        Some(ArgValue::UInt32(v)) => *v,
+                        _ => 0,
+                    };
+                    // `REG_MANUFACTURER_ID` (0x7e) → `LDC1612_MANUF_ID`,
+                    // `REG_DEVICE_ID` (0x7f) → `LDC1612_DEV_ID`; every other
+                    // register reads as zero on this fake chip.
+                    let value: u16 = match reg {
+                        0x7e => 0x5449,
+                        0x7f => 0x3055,
+                        _ => 0x0000,
+                    };
+                    let mut response = value.to_be_bytes().to_vec();
+                    response.truncate(read_len as usize);
+                    Self::respond(
+                        state,
+                        seq,
+                        "i2c_response",
+                        &[
+                            ArgValue::UInt8(oid),
+                            // `i2c_bus_status`: `SUCCESS = 0`.
+                            ArgValue::UInt8(0),
+                            ArgValue::Bytes(response),
+                        ],
+                    );
+                }
+                // The bulk channel's clock status (`query_status_ldc1612`).
+                // The stream never carries samples under file-output mode —
+                // the host discards them there — so sequence and buffer stay
+                // at zero: a deterministic answer every query agrees with,
+                // beside whatever the armed `trigger_analog` does (this reply
+                // never touches the arm/fire/monitor state).
+                "query_status_ldc1612" => {
+                    let oid = match params.first() {
+                        Some(ArgValue::UInt8(v)) => *v,
+                        _ => 0,
+                    };
+                    let clock = Self::clock(state) as u32;
+                    Self::respond(
+                        state,
+                        seq,
+                        "sensor_bulk_status",
+                        &[
+                            ArgValue::UInt8(oid),
+                            ArgValue::UInt32(clock),
+                            ArgValue::UInt32(0), // query_ticks
+                            ArgValue::UInt16(0), // next_sequence
+                            ArgValue::UInt32(0), // buffered
+                            ArgValue::UInt16(0), // possible_overflows
+                        ],
+                    );
+                }
                 // Everything else is accepted and ignored: `allocate_oids`,
-                // `config_*`, `emergency_stop`, and any command this fake
-                // firmware does not model yet.
+                // `config_*` (`config_ldc1612*`, `ldc1612_attach_trigger_analog`,
+                // `query_ldc1612`'s arm), `emergency_stop`, and any command this
+                // fake firmware does not model yet.
                 _ => {}
             }
         }

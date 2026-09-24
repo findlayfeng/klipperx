@@ -22,8 +22,11 @@ pub struct Stepper {
     kinematics: StepKinematics,
     compressor: StepCompressor,
     /// Which trapq this stepper reads, as a [`MotionQueuing`](super::queuing::MotionQueuing)
-    /// id. The extruder has its own (`MCU_stepper.set_trapq`).
-    trapq: usize,
+    /// id. The extruder has its own (`MCU_stepper.set_trapq`). `None` means
+    /// detached: no steps are generated for it until it is attached again
+    /// (`set_trapq(None)`, what `ZAdjustHelper.adjust_steppers` does to a Z
+    /// motor while adjusting it by hand).
+    trapq: Option<usize>,
 }
 
 impl Stepper {
@@ -42,7 +45,7 @@ impl Stepper {
             step_dist,
             kinematics: StepKinematics::new(step_dist, position, active_flags),
             compressor: StepCompressor::new(oid, mcu_freq),
-            trapq: 0,
+            trapq: Some(0),
         }
     }
 
@@ -74,13 +77,20 @@ impl Stepper {
         self.oid
     }
 
-    /// Point this stepper at a trapq (`MCU_stepper.set_trapq`).
-    pub fn set_trapq(&mut self, trapq: usize) {
-        self.trapq = trapq;
+    /// Point this stepper at a trapq, or take it off one
+    /// (`MCU_stepper.set_trapq`).
+    ///
+    /// Accepts a bare id (`set_trapq(id)`), `Some(id)`, or `None` to detach.
+    /// A detached stepper is skipped by
+    /// [`MotionQueuing::generate`](super::queuing::MotionQueuing::generate):
+    /// no steps are produced for it until it is attached again.
+    pub fn set_trapq(&mut self, trapq: impl Into<Option<usize>>) {
+        self.trapq = trapq.into();
     }
 
-    /// The trapq this stepper reads.
-    pub fn trapq_id(&self) -> usize {
+    /// The trapq this stepper reads, or `None` when it is detached
+    /// (`MCU_stepper.set_trapq(None)`).
+    pub fn trapq_id(&self) -> Option<usize> {
         self.trapq
     }
 

@@ -28,6 +28,8 @@ pub mod ldc1612;
 pub mod manual_probe;
 pub mod output_pin;
 pub mod probe;
+pub mod pwm_cycle_time;
+pub mod pwm_tool;
 pub mod quad_gantry_level;
 pub mod query_endstops;
 pub mod screws_tilt_adjust;

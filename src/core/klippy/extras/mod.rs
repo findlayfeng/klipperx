@@ -8,6 +8,7 @@
 
 pub mod adc_temperature;
 pub mod bed_mesh;
+pub mod bed_tilt;
 pub mod board_pins;
 pub(crate) mod bus_debug;
 pub mod ds18b20;

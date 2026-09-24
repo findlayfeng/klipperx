@@ -21,11 +21,11 @@ use std::sync::{Arc, Mutex, Weak};
 use serde_json::{json, Value};
 
 use crate::core::klippy::config::ConfigError;
-use crate::core::klippy::extras::toolhead::ToolHeadObject;
+use crate::core::klippy::extras::toolhead::{HomingEndstop, ToolHeadObject};
 use crate::core::klippy::gcode::{
     CommandError, CommandHandler, GCodeDispatch, GcodeCommand, GCODE_OBJECT,
 };
-use crate::core::klippy::mcu::{McuEndstop, McuError};
+use crate::core::klippy::mcu::McuError;
 use crate::core::klippy::printer::{Printer, PrinterObject};
 
 /// The name the toolhead registers this object under.
@@ -33,7 +33,7 @@ pub const QUERY_ENDSTOPS_OBJECT: &str = "query_endstops";
 
 /// The object that answers `M119` and `query_endstops/status`.
 pub struct QueryEndstops {
-    endstops: Mutex<Vec<(Arc<McuEndstop>, String)>>,
+    endstops: Mutex<Vec<(Arc<dyn HomingEndstop>, String)>>,
     last_state: Mutex<Vec<(String, bool)>>,
 }
 
@@ -69,7 +69,7 @@ impl QueryEndstops {
 
     /// Register one endstop under `name` (`GenericPrinterRail`,
     /// `klippy/stepper.py:423`).
-    pub fn register_endstop(&self, endstop: Arc<McuEndstop>, name: &str) {
+    pub fn register_endstop(&self, endstop: Arc<dyn HomingEndstop>, name: &str) {
         self.endstops
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -89,7 +89,7 @@ impl QueryEndstops {
     /// # Errors
     /// Returns the first [`McuError`] a query reports.
     pub async fn query_all(&self, print_time: f64) -> Result<Vec<(String, bool)>, McuError> {
-        let endstops: Vec<(Arc<McuEndstop>, String)> = self
+        let endstops: Vec<(Arc<dyn HomingEndstop>, String)> = self
             .endstops
             .lock()
             .unwrap_or_else(|p| p.into_inner())

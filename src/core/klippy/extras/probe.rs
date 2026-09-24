@@ -32,6 +32,7 @@ use crate::core::klippy::event::KlippyEvent;
 use crate::core::klippy::extras::manual_probe::{
     FinalizeCallback, ManualProbe, MANUAL_PROBE_OBJECT,
 };
+use crate::core::klippy::extras::probe_eddy_current;
 use crate::core::klippy::extras::toolhead::{HomingEndstop, ToolHeadObject};
 use crate::core::klippy::gcode::{
     CommandError, CommandFuture, GCodeDispatch, GcodeCommand, GCODE_OBJECT,
@@ -177,7 +178,7 @@ pub struct ProbeParams {
 impl ProbeParams {
     /// The section's defaults: `lift_speed` falls back to `speed`, as upstream
     /// does (`probe.py:250`).
-    fn from_options(options: &ProbeOptions) -> Self {
+    pub(crate) fn from_options(options: &ProbeOptions) -> Self {
         Self {
             probe_speed: options.speed,
             lift_speed: options.lift_speed.unwrap_or(options.speed),
@@ -195,7 +196,7 @@ impl ProbeParams {
     /// # Errors
     /// When a parameter is present but not a number, or is out of the range
     /// upstream enforces (`above=0.` / `minval=1` / `minval=0`).
-    fn from_command(&self, gcmd: &GcodeCommand) -> Result<Self, CommandError> {
+    pub(crate) fn from_command(&self, gcmd: &GcodeCommand) -> Result<Self, CommandError> {
         let probe_speed = gcmd.get_float_default("PROBE_SPEED", self.probe_speed)?;
         let lift_speed = gcmd.get_float_default("LIFT_SPEED", self.lift_speed)?;
         let samples = gcmd.get_int_default("SAMPLES", self.samples)?;
@@ -294,7 +295,7 @@ pub(crate) fn check_virtual_endstop(params: &PinParams) -> Result<(), PinError> 
 ///
 /// `average` averages every axis; `median` sorts by Z and takes the middle
 /// sample (the mean of the two middle ones for an even count).
-fn calc_probe_z_average(positions: &[Coord], method: &str) -> Coord {
+pub(crate) fn calc_probe_z_average(positions: &[Coord], method: &str) -> Coord {
     if method != "median" {
         let count = positions.len() as f64;
         let mut out = Coord::new(0.0, 0.0, 0.0, 0.0);
@@ -321,9 +322,9 @@ fn calc_probe_z_average(positions: &[Coord], method: &str) -> Coord {
 #[derive(Debug, Default)]
 pub(crate) struct ProbeCommandState {
     /// The last `QUERY_PROBE` result.
-    last_query: AtomicBool,
+    pub(crate) last_query: AtomicBool,
     /// The last `PROBE` result.
-    last_z_result: Mutex<f64>,
+    pub(crate) last_z_result: Mutex<f64>,
 }
 
 /// What `get_status` reports for either probe section
@@ -744,8 +745,10 @@ impl PrinterProbe {
 /// `[smart_effector]` — is the first implementation; the round's tests drive
 /// a second one.
 pub trait ProbeSession: Send + Sync {
-    /// Open a session (`start_probe_session`).
-    fn start_probe_session(&self) -> Result<(), CommandError>;
+    /// Open a session (`start_probe_session`). The command that opens it
+    /// comes along so a probe whose methods differ per command can dispatch
+    /// on `METHOD` (upstream passes `gcmd` here too).
+    fn start_probe_session(&self, gcmd: &GcodeCommand) -> Result<(), CommandError>;
     /// Run one sample set in the open session (`run_probe`).
     fn run_probe<'a>(&'a self, gcmd: &'a GcodeCommand) -> CommandFuture<'a>;
     /// The parameters a command asks for (`ProbeSessionHelper.get_probe_params`).
@@ -759,7 +762,7 @@ pub trait ProbeSession: Send + Sync {
 }
 
 impl ProbeSession for PrinterProbe {
-    fn start_probe_session(&self) -> Result<(), CommandError> {
+    fn start_probe_session(&self, _gcmd: &GcodeCommand) -> Result<(), CommandError> {
         self.session.start()
     }
 
@@ -807,12 +810,16 @@ pub trait SampleDelivery: Send + Sync {
 /// points round starts from (`probe.py:start_probe_session`'s object lookup
 /// by name).
 ///
-/// The object is built by the probe family today — `[probe]`, `[bltouch]`,
-/// `[smart_effector]`, all `PrinterProbe`; a further section joins by
-/// registering under the same name and extending this downcast.
+/// The object is built by the probe family — `[probe]`, `[bltouch]`,
+/// `[smart_effector]` (all `PrinterProbe`), and the eddy probe
+/// (`probe_eddy_current::PrinterEddyProbe`), which registers the same `probe`
+/// name and answers this downcast in turn.
 pub(crate) fn lookup_probe_session(printer: &Printer) -> Option<Arc<dyn ProbeSession>> {
+    if let Some(probe) = printer.lookup_object_as::<PrinterProbe>(PROBE_OBJECT) {
+        return Some(probe as Arc<dyn ProbeSession>);
+    }
     printer
-        .lookup_object_as::<PrinterProbe>(PROBE_OBJECT)
+        .lookup_object_as::<probe_eddy_current::PrinterEddyProbe>(PROBE_OBJECT)
         .map(|probe| probe as Arc<dyn ProbeSession>)
 }
 
@@ -1511,7 +1518,7 @@ impl ProbePointsHelper {
                 "horizontal_move_z can't be less than probe's z_offset",
             ));
         }
-        probe.start_probe_session()?;
+        probe.start_probe_session(gcmd)?;
         let ops = LiveRound {
             helper: Arc::clone(self),
             printer,
@@ -2201,7 +2208,7 @@ mod probe_points_tests {
     }
 
     impl ProbeSession for StubProbe {
-        fn start_probe_session(&self) -> Result<(), CommandError> {
+        fn start_probe_session(&self, _gcmd: &GcodeCommand) -> Result<(), CommandError> {
             self.record("start");
             Ok(())
         }
@@ -2319,9 +2326,9 @@ mod probe_points_tests {
             .unwrap();
         let session: Arc<dyn ProbeSession> =
             lookup_probe_session(&printer).expect("the registered probe answers the lookup");
-        session.start_probe_session().unwrap();
+        session.start_probe_session(&gcmd).unwrap();
         // A second open is still the session-mismatch refusal.
-        let err = session.start_probe_session().unwrap_err();
+        let err = session.start_probe_session(&gcmd).unwrap_err();
         assert_eq!(
             err.to_string(),
             "Internal probe error - start/end probe session mismatch"
@@ -2362,7 +2369,7 @@ mod probe_points_tests {
             .probe
             .as_ref()
             .expect("the stub round carries a session")
-            .start_probe_session()
+            .start_probe_session(&gcmd)
             .unwrap();
         block_on(stub_round.run_probe(&gcmd)).unwrap();
         assert_eq!(

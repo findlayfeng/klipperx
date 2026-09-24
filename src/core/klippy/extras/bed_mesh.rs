@@ -32,7 +32,7 @@ use std::sync::{Arc, Mutex};
 use serde_json::{json, Value};
 
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
-use crate::core::klippy::extras::probe::PrinterProbe;
+use crate::core::klippy::extras::probe::lookup_probe_session;
 use crate::core::klippy::extras::toolhead::ToolHeadObject;
 use crate::core::klippy::gcode::{CommandError, GCodeDispatch, GCODE_OBJECT};
 use crate::core::klippy::load::section;
@@ -45,7 +45,8 @@ section!("bed_mesh", order = 30, load = load_config);
 const TOOLHEAD_OBJECT: &str = "toolhead";
 
 /// The probe object the calibration drives.
-const PROBE_OBJECT: &str = "probe";
+/// What `get_status` reports (`ProbeCommandHelper.get_status`) — the eddy
+/// probe reports through probe.rs's own helper with this section id.
 
 /// The Z axis index, as [`Coord`] numbers them.
 const Z_AXIS: usize = 2;
@@ -359,11 +360,9 @@ impl BedMesh {
                             let toolhead = printer
                                 .lookup_object_as::<ToolHeadObject>(TOOLHEAD_OBJECT)
                                 .ok_or_else(|| CommandError::new("Printer is not ready"))?;
-                            let probe = printer
-                                .lookup_object_as::<PrinterProbe>(PROBE_OBJECT)
-                                .ok_or_else(|| {
-                                    CommandError::new("bed_mesh: a [probe] section is required")
-                                })?;
+                            let probe = lookup_probe_session(&printer).ok_or_else(|| {
+                                CommandError::new("bed_mesh: a [probe] section is required")
+                            })?;
 
                             // Every axis the mesh moves along must be homed
                             // (`bed_mesh.py:update_config`).
@@ -393,7 +392,7 @@ impl BedMesh {
 
                             // Probe every point in one session
                             // (`bed_mesh.py:ProbeManager.start_probe`).
-                            probe.start_probe_session()?;
+                            probe.start_probe_session(gcmd)?;
                             let mut probed = Vec::with_capacity(points.len());
                             for (x, y) in &points {
                                 let mut target =

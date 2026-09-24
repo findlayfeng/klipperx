@@ -236,6 +236,156 @@ pub fn coordinate_descent(params: &mut [f64], mut error: impl FnMut(&[f64]) -> f
 }
 
 // ===========================================================================
+// NxM matrix helpers (upstream `klippy/mathutil.py` — `solve_linear_equations`
+// and friends, which the eddy probe's `PROBE_EDDY_CURRENT_TAP_CALIBRATE` info
+// path runs on the main calibration points)
+// ===========================================================================
+
+/// Transpose a matrix (`mathutil.mat_transp`).
+///
+/// # Panics
+/// Panics on an empty matrix (upstream indexes `a[0]` the same way).
+pub fn mat_transp(a: &[Vec<f64>]) -> Vec<Vec<f64>> {
+    (0..a[0].len())
+        .map(|i| a.iter().map(|row| row[i]).collect())
+        .collect()
+}
+
+/// Matrix product (`mathutil.mat_mat_mul`); `None` when the shapes do not
+/// line up (upstream returns `None` for `len(a[0]) != len(b)`).
+pub fn mat_mat_mul(a: &[Vec<f64>], b: &[Vec<f64>]) -> Option<Vec<Vec<f64>>> {
+    if a[0].len() != b.len() {
+        return None;
+    }
+    let bt = mat_transp(b);
+    Some(
+        a.iter()
+            .map(|a_i| {
+                bt.iter()
+                    .map(|bt_j| a_i.iter().zip(bt_j).map(|(x, y)| x * y).sum())
+                    .collect()
+            })
+            .collect(),
+    )
+}
+
+/// `mat_mat_mul(a, mat_transp(a))` computed the cheap symmetric way
+/// (`mathutil.mat_mul_transp`).
+///
+/// # Panics
+/// Panics on an empty matrix, as upstream's indexing does.
+pub fn mat_mul_transp(a: &[Vec<f64>]) -> Vec<Vec<f64>> {
+    // Resulting matrix is symmetric - compute lower-left.
+    let mut res: Vec<Vec<f64>> = a
+        .iter()
+        .enumerate()
+        .map(|(i, a_i)| {
+            a[..=i]
+                .iter()
+                .map(|a_j| a_i.iter().zip(a_j).map(|(x, y)| x * y).sum())
+                .collect()
+        })
+        .collect();
+    // Fill in upper right of matrix.
+    for i in 0..res.len() {
+        let tail: Vec<f64> = res[i + 1..].iter().map(|res_j| res_j[i]).collect();
+        res[i].extend(tail);
+    }
+    res
+}
+
+/// Solve `a · x = rhs` by Gaussian elimination with partial pivoting
+/// (`mathutil.gaussian_solve`). `rhs` rows may carry several columns.
+///
+/// `None` when a pivot is (near) zero, unless `allow_underdetermined` takes
+/// the degenerate pivot as a zero reciprocal — upstream's answer for a
+/// rank-deficient system.
+pub fn gaussian_solve(
+    a: &[Vec<f64>],
+    rhs: &[Vec<f64>],
+    allow_underdetermined: bool,
+) -> Option<Vec<Vec<f64>>> {
+    let mut res = rhs.to_vec();
+    let mut m = a.to_vec();
+    let rows_m = m.len();
+    // Perform the LU-decomposition through Gaussian elimination, bottom row up.
+    for i in (0..rows_m).rev() {
+        // Find a pivot and swap the corresponding rows (first max wins, as
+        // upstream's `list.index(max(...))` does).
+        let mut j = 0;
+        let mut best = m[0][i].abs();
+        for row in 1..=i {
+            let mag = m[row][i].abs();
+            if mag > best {
+                best = mag;
+                j = row;
+            }
+        }
+        if i != j {
+            m.swap(i, j);
+            res.swap(i, j);
+        }
+
+        // Scale the i-th row (and drop its pivot column).
+        let pivot = m[i][i];
+        let recipr = if pivot.abs() < 1e-10 {
+            if !allow_underdetermined {
+                return None;
+            }
+            0.0
+        } else {
+            1.0 / pivot
+        };
+        let m_i: Vec<f64> = m[i].iter().take(i).map(|v| v * recipr).collect();
+        let res_i: Vec<f64> = res[i].iter().map(|v| v * recipr).collect();
+        m[i] = m_i.clone();
+        res[i] = res_i.clone();
+
+        // Zero out the pivot column in the rows above it, keeping the
+        // multiplier in place (the compact-L form the back pass reads).
+        for j in 0..i {
+            let c = m[j][i];
+            m[j] = m[j]
+                .iter()
+                .zip(m_i.iter())
+                .map(|(m_j_k, m_i_k)| m_j_k - c * m_i_k)
+                .collect();
+            res[j] = res[j]
+                .iter()
+                .zip(res_i.iter())
+                .map(|(res_j_k, res_i_k)| res_j_k - c * res_i_k)
+                .collect();
+        }
+    }
+
+    // Forward substitution against the unit-lower-triangular factor.
+    let mut rest = mat_transp(&res);
+    if rest.is_empty() {
+        return Some(res);
+    }
+    for rest_k in &mut rest {
+        for i in 1..rows_m {
+            let sub: f64 = m[i].iter().zip(rest_k.iter()).map(|(x, y)| x * y).sum();
+            rest_k[i] -= sub;
+        }
+    }
+    Some(mat_transp(&rest))
+}
+
+/// Least-squares solve of an over-determined system
+/// (`mathutil.solve_linear_equations`): the normal equations
+/// `(AᵀA) x = Aᵀ·ans` through [`gaussian_solve`].
+///
+/// # Panics
+/// Panics on empty input, as upstream's transposes do.
+pub fn solve_linear_equations(eqs: &[Vec<f64>], ans: &[Vec<f64>]) -> Option<Vec<Vec<f64>>> {
+    let eqst = mat_transp(eqs);
+    let eqst_eqs = mat_mul_transp(&eqst);
+    let eqst_ans = mat_mat_mul(&eqst, ans)?;
+    gaussian_solve(&eqst_eqs, &eqst_ans, false)
+}
+
+// ===========================================================================
 // Tests
 // ===========================================================================
 
@@ -388,5 +538,70 @@ mod tests {
         // And the fourth axis is dropped going back.
         let back: Xyz = Coord::new(1.0, 2.0, 3.0, 9.0).into();
         assert_eq!(back, xyz);
+    }
+}
+
+#[cfg(test)]
+mod linalg_tests {
+    use super::*;
+
+    /// A square system solved exactly, then put back through `a · x`.
+    #[test]
+    fn gaussian_solve_recovers_known_values() {
+        // 2x + y = 5; x + 3y = 10  →  x = 1, y = 3.
+        let a = vec![vec![2.0, 1.0], vec![1.0, 3.0]];
+        let rhs = vec![vec![5.0], vec![10.0]];
+        let x = gaussian_solve(&a, &rhs, false).expect("a unique solution");
+        assert!((x[0][0] - 1.0).abs() < 1e-9, "{x:?}");
+        assert!((x[1][0] - 3.0).abs() < 1e-9, "{x:?}");
+        // Substitution reproduces the right-hand side.
+        let back = mat_mat_mul(&a, &x).expect("shapes line up");
+        for (row, want) in back.iter().zip(&rhs) {
+            assert!((row[0] - want[0]).abs() < 1e-9);
+        }
+    }
+
+    /// A singular system has no answer (upstream returns `None`).
+    #[test]
+    fn gaussian_solve_refuses_a_singular_system() {
+        let a = vec![vec![1.0, 2.0], vec![2.0, 4.0]];
+        let rhs = vec![vec![1.0], vec![2.0]];
+        assert!(gaussian_solve(&a, &rhs, false).is_none());
+    }
+
+    /// The over-determined fit the eddy `PROBE_EDDY_CURRENT_TAP_CALIBRATE`
+    /// info path runs (`_analyze_main_calibration`): a quadratic through four
+    /// (z, freq) pairs, put back through the fitted curve.
+    #[test]
+    fn solve_linear_equations_fits_a_quadratic_and_substitutes_back() {
+        // Exact on f(z) = 3_400_000 - 500_000 z + 100_000 z².
+        let points = [(0.05_f64,), (0.15,), (0.40,), (0.70,)];
+        let f = |z: f64| 3_400_000.0 - 500_000.0 * z + 100_000.0 * z * z;
+        let eqs: Vec<Vec<f64>> = points.iter().map(|&(z,)| vec![1.0, z, z * z]).collect();
+        let ans: Vec<Vec<f64>> = points.iter().map(|&(z,)| vec![f(z)]).collect();
+        let coeffs = solve_linear_equations(&eqs, &ans).expect("full-rank fit");
+        assert!((coeffs[0][0] - 3_400_000.0).abs() < 1e-3, "{coeffs:?}");
+        assert!((coeffs[1][0] + 500_000.0).abs() < 1e-3, "{coeffs:?}");
+        assert!((coeffs[2][0] - 100_000.0).abs() < 1e-3, "{coeffs:?}");
+        // 回代: every point sits on the fitted curve.
+        let back = mat_mat_mul(&eqs, &coeffs).expect("shapes line up");
+        for (row, &(z,)) in back.iter().zip(points.iter()) {
+            assert!((row[0] - f(z)).abs() < 1e-3);
+        }
+    }
+
+    /// `mat_mul_transp` agrees with the straightforward product.
+    #[test]
+    fn mat_mul_transp_matches_the_reference_product() {
+        let a = vec![vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 6.0]];
+        let fast = mat_mul_transp(&a);
+        let at = mat_transp(&a);
+        let slow = mat_mat_mul(&at, &a).expect("shapes line up");
+        assert_eq!(fast.len(), slow.len());
+        for (row_f, row_s) in fast.iter().zip(&slow) {
+            for (f, s) in row_f.iter().zip(row_s) {
+                assert!((f - s).abs() < 1e-12);
+            }
+        }
     }
 }

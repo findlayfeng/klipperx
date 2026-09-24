@@ -419,7 +419,6 @@ mod tests {
         "load_cell.test",
         "manual_stepper.test",
         "polar.test",
-        "pressure_advance.test",
         "printers.test",
         "rotary_delta_calibrate.test",
         "tmc.test",

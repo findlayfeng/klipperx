@@ -30,6 +30,7 @@ mod pin;
 mod pwm;
 mod spi;
 mod stepper;
+mod trigger_analog;
 mod trsync;
 
 pub use adc::McuAdc;
@@ -39,6 +40,7 @@ pub use pin::{McuChip, McuDigitalOut};
 pub use pwm::McuPwm;
 pub use spi::{McuSpi, SpiMode};
 pub use stepper::McuStepper;
+pub use trigger_analog::{McuTriggerAnalog, SosFilter, SosFilterDesign, MONITOR_MAX};
 pub use trsync::{
     Completion, McuTrsync, TriggerDispatch, TrsyncRegistry, TRSYNC_SINGLE_MCU_TIMEOUT,
     TRSYNC_TIMEOUT,

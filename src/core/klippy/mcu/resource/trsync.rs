@@ -50,9 +50,14 @@ pub const TRSYNC_SINGLE_MCU_TIMEOUT: f64 = 0.250;
 /// The `McuTrsync` that sees `can_trigger=0` completes it; `home_wait` awaits.
 /// `Notify` plus the stored reason, so a completion that already happened is
 /// seen by a waiter that arrives afterwards.
+///
+/// The stored value is the **raw** wire reason. Most callers read the typed
+/// [`wait`](Completion::wait), which maps 1-4 through [`TriggerReason`];
+/// consumers of higher codes (`trigger_analog`'s error reasons) read
+/// [`wait_raw`](Completion::wait_raw) instead.
 #[derive(Debug, Default)]
 pub struct Completion {
-    reason: Mutex<Option<TriggerReason>>,
+    raw: Mutex<Option<u8>>,
     notify: Notify,
 }
 
@@ -64,33 +69,61 @@ impl Completion {
 
     /// Clear it for a new dispatch.
     pub fn reset(&self) {
-        *self.reason.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        *self.raw.lock().unwrap_or_else(|p| p.into_inner()) = None;
     }
 
     /// Complete it with `reason`; the first reason stands.
     pub fn complete(&self, reason: TriggerReason) {
-        let mut guard = self.reason.lock().unwrap_or_else(|p| p.into_inner());
+        self.complete_raw(reason as u8);
+    }
+
+    /// Complete it with a raw wire reason; the first reason stands.
+    ///
+    /// Reasons 5 and above (`trigger_analog` errors) have no typed variant but
+    /// still complete the dispatch — dropping them would leave `home_wait`
+    /// waiting forever.
+    pub fn complete_raw(&self, raw: u8) {
+        let mut guard = self.raw.lock().unwrap_or_else(|p| p.into_inner());
         if guard.is_none() {
-            *guard = Some(reason);
+            *guard = Some(raw);
             drop(guard);
             self.notify.notify_waiters();
         }
     }
 
-    /// The reason, once completed.
-    pub fn reason(&self) -> Option<TriggerReason> {
-        *self.reason.lock().unwrap_or_else(|p| p.into_inner())
+    /// The raw reason, once completed.
+    pub fn raw(&self) -> Option<u8> {
+        *self.raw.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// Wait for the completion.
-    pub async fn wait(&self) -> TriggerReason {
+    /// The reason, once completed and only when it is one this host types.
+    ///
+    /// A raw reason outside 1-4 reads as `None` here even though the
+    /// completion has fired; use [`raw`](Completion::raw) or
+    /// [`wait_raw`](Completion::wait_raw) when higher codes are possible.
+    pub fn reason(&self) -> Option<TriggerReason> {
+        self.raw().and_then(TriggerReason::from_u8)
+    }
+
+    /// Wait for the completion and return its raw reason.
+    pub async fn wait_raw(&self) -> u8 {
         loop {
             let notified = self.notify.notified();
-            if let Some(reason) = self.reason() {
-                return reason;
+            if let Some(raw) = self.raw() {
+                return raw;
             }
             notified.await;
         }
+    }
+
+    /// Wait for the completion and return its typed reason.
+    ///
+    /// A raw reason outside 1-4 collapses onto [`TriggerReason::CommsTimeout`]
+    /// — both mean the attempt failed; callers that must name the failure
+    /// (e.g. `trigger_analog`'s four error codes) wait on
+    /// [`wait_raw`](Completion::wait_raw) instead.
+    pub async fn wait(&self) -> TriggerReason {
+        TriggerReason::from_u8(self.wait_raw().await).unwrap_or(TriggerReason::CommsTimeout)
     }
 }
 
@@ -330,9 +363,13 @@ impl McuTrsync {
     /// Handle one `trsync_state` (`MCU_trsync._handle_trsync_state`).
     fn handle_state(&self, state: TrsyncState) {
         if !state.can_trigger {
-            if let Some(reason) = state.reason() {
+            // Record every real reason, including codes the typed enum does
+            // not name (5+, `trigger_analog`'s errors): a completion that
+            // stays silent would hang `home_wait`. Zero is not a reason the
+            // firmware reports, so it completes nothing, as before.
+            if state.trigger_reason != 0 {
                 if let Some(group) = self.group.upgrade() {
-                    group.completion.complete(reason);
+                    group.completion.complete_raw(state.trigger_reason);
                 }
             }
             return;
@@ -676,6 +713,48 @@ mod tests {
         });
 
         assert_eq!(completion.wait().await, TriggerReason::EndstopHit);
+    }
+
+    #[tokio::test]
+    async fn test_a_completion_records_reasons_the_typed_enum_does_not_name() {
+        // A `trigger_analog` monitor failure arrives as raw reason 7 — higher
+        // than `TriggerReason` covers. It must still complete the dispatch so
+        // `home_wait` can wake and decode it, while the typed view collapses
+        // it onto the failure reason.
+        let dispatch = TriggerDispatch::new(vec![chip("mcu", identified_mcu("mcu"))]).unwrap();
+        let completion = dispatch.start(0.0).unwrap();
+        let trsync = first(&dispatch);
+
+        trsync.handle_state(TrsyncState {
+            oid: trsync.oid(),
+            can_trigger: false,
+            trigger_reason: 7,
+            clock: 0,
+        });
+
+        assert_eq!(completion.wait_raw().await, 7);
+        assert_eq!(completion.raw(), Some(7));
+        assert_eq!(completion.reason(), None);
+        assert_eq!(completion.wait().await, TriggerReason::CommsTimeout);
+    }
+
+    #[tokio::test]
+    async fn test_a_zero_reason_does_not_complete() {
+        // The firmware never reports reason 0; a stray zero must not wake a
+        // waiter with a meaningless value.
+        let dispatch = TriggerDispatch::new(vec![chip("mcu", identified_mcu("mcu"))]).unwrap();
+        let completion = dispatch.start(0.0).unwrap();
+        let trsync = first(&dispatch);
+
+        trsync.handle_state(TrsyncState {
+            oid: trsync.oid(),
+            can_trigger: false,
+            trigger_reason: 0,
+            clock: 0,
+        });
+
+        assert_eq!(completion.raw(), None);
+        assert_eq!(completion.reason(), None);
     }
 
     #[tokio::test]

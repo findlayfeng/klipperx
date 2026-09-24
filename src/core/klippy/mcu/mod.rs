@@ -38,8 +38,8 @@ pub use error::{McuCallError, McuError};
 pub use object::{load_config, load_config_prefix, McuObject};
 pub use resource::{
     Completion, I2cMode, McuAdc, McuChip, McuDigitalOut, McuEndstop, McuI2c, McuPwm, McuSpi,
-    McuStepper, McuTrsync, SpiMode, TriggerDispatch, TrsyncRegistry, DEFAULT_SPEED,
-    TRSYNC_SINGLE_MCU_TIMEOUT, TRSYNC_TIMEOUT,
+    McuStepper, McuTriggerAnalog, McuTrsync, SosFilter, SosFilterDesign, SpiMode, TriggerDispatch,
+    TrsyncRegistry, DEFAULT_SPEED, MONITOR_MAX, TRSYNC_SINGLE_MCU_TIMEOUT, TRSYNC_TIMEOUT,
 };
 pub use restart_method::McuRestartMethod;
 

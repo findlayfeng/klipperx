@@ -72,9 +72,11 @@ pub mod i2c;
 pub mod identify;
 pub mod pwm;
 pub mod shutdown;
+pub mod sos_filter;
 pub mod spi;
 pub mod stepper;
 pub mod thermocouple;
+pub mod trigger_analog;
 pub mod trsync;
 pub mod uptime;
 
@@ -88,6 +90,10 @@ pub use i2c::{
     I2cSetSwBus, I2cTransfer, I2cWrite, SoftwareI2cBus,
 };
 pub use pwm::{ConfigPwmOut, QueuePwmOut};
+pub use sos_filter::{
+    ConfigSosFilter, SosFilterSetActive, SosFilterSetOffsetScale, SosFilterSetSection,
+    SosFilterSetState,
+};
 pub use spi::{
     ConfigSpi, ConfigSpiShutdown, ConfigSpiWithoutCs, SoftwareSpiBus, SpiSend, SpiSetBus,
     SpiSetSoftwareBus, SpiSetSwBus, SpiTransfer, SpiTransferResponse,
@@ -98,6 +104,10 @@ pub use stepper::{
 };
 pub use thermocouple::{
     ConfigThermocouple, QueryThermocouple, ThermocoupleResult, ThermocoupleType,
+};
+pub use trigger_analog::{
+    ConfigTriggerAnalog, TriggerAnalogHome, TriggerAnalogQueryState, TriggerAnalogSetRawRange,
+    TriggerAnalogSetTrigger, TriggerAnalogState, TriggerAnalogType, REASON_TRIGGER_ANALOG,
 };
 pub use trsync::{
     ConfigTrsync, TriggerReason, TrsyncSetTimeout, TrsyncStart, TrsyncState, TrsyncTrigger,

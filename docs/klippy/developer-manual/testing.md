@@ -266,6 +266,7 @@ git config core.hooksPath .githooks
 | 模块 | 覆盖 |
 |------|------|
 | `output_pin.rs` | `value` / `shutdown_value` 落到 `setup_start_value`，且无条件 `setup_max_duration(0)`（所以 `value: 1` + 默认 `shutdown_value: 0` 合法）；`SET_PIN PIN=… VALUE=…` 驱动输出（`>=0.5` 为开）并更新 `get_status`；缺 `VALUE` 报错；两个 pin 各自独立；缺 `pin` / 非数字 `value` / 非布尔 `pwm` 各自报配置错误；`pwm: true` 走 `setup_pwm` 并把 `cycle_time` / `hardware_pwm` / `value` 落到资源，`SET_PIN` 调 `update_pwm`；`cycle_time <= 0` 报错 |
+| `bltouch.rs` | 选项默认与语料全量认领；缺 `sensor_pin`/坏 `set_output_mode`/未知 chip/控制脚带上拉的上游文案；占空比=命令宽/信号周期；`Commands` 序列与 `BLTOUCH_STORE` 下发序列逐字节断言；装载注册 `probe` chip 与 `probe` 对象；虚拟 chip 的其它 pin 名与 `!`/`^` 拒绝；同步更新工厂表顺序断言 |
 | `board_pins.rs` | `aliases` 与 `aliases_*` 都注册；`mcu` 列表指定目标 chip；`<...>` 值走保留；未知 chip、缺元素、别名冲突各自报错（冲突带 section 前缀）；对象不可查询 |
 | `heaters.rs` | 传感器工厂表：未知 `sensor_type` 报上游文案 `Unknown temperature sensor 'x'`；`register_sensor` 把 section 名计入 `available_sensors`；`ensure` 幂等，并把 `DS18B20` 工厂带进来（对应上游 `temperature_sensors.cfg`）；`get_status` 的三个列表 |
 | `temperature_sensor.rs` | **本文件无独立测试**：其行为（`min_temp` 默认 `KELVIN_TO_CELSIUS`、`max_temp` 须高于 min、`sensor_type` 交给 `heaters`、`get_status` 的 `round(…, 2)` 与读数 0 不计入 min/max）目前只经 `load.rs` 的工厂表与上游语料的端到端用例间接碰到；`setup_minmax`/`setup_callback` 的落点由 `heaters.rs` 与各传感器工厂的测试覆盖 |
@@ -287,6 +288,7 @@ git config core.hooksPath .githooks
 | `upstream.rs` | 语料驱动（字典、CONFIG/文件输出、SHOULD_FAIL）之外，另有 **5 条聚焦 E2E**：普通端停 `G28 Z`、`probe:z_virtual_endstop` 的 `G28 Z`、`G28 + PROBE`、`G28 + PROBE_CALIBRATE/TESTZ/ACCEPT`、`G28 + BED_MESH_CALIBRATE`（3×3）——把「端停/探针真的能驱动一次回零」钉在假 MCU 上 |
 | `query_endstops.rs` | 全部限位读一遍并记住、取反的限位翻转电平、`M119` 逐个报（经虚拟字典帧解码） |
 | `i2c_device.rs` | 硬件设备要地址、地址越界拒；注册两条调试命令；只给一个软件引脚报错、未知 MCU 点名节、软件引脚须同 MCU、就绪后 `get_status` 报地址与速度 |
+| `smart_effector.rs` | 选项默认与语料认领；`ACCEL`/`RECOVERY_TIME` 负值拒绝、`SENSITIVITY`/`ACCEL` 越界拒绝（含上游文案）；`SET` 参数解析与默认、无 `control_pin` 时拒绝 `SENSITIVITY`；位流逐字节成帧；`control_pin` 预留与二次使用拒绝；装载注册 chip/对象（async：加载+bring_up+`G28`+两命令端到端）；无 `control_pin` 时 `RESET` 不注册 |
 | `spi_device.rs` | 注册两条调试命令；无片选允许；`spi_mode`/`spi_speed` 越界拒、部分软件引脚报错、片选须在指定 MCU、未知 MCU 点名节；就绪后 `get_status` 报配置；软件设备接受本 MCU 引脚 |
 | `static_digital_output.rs` | 每个引脚都被预留、取反的引脚有记录、缺 `pins` 报错 |
 | `adc_temperature.rs` | 线性插值正反向、热敏电阻 Steinhart-Hart 与 Beta 模型（与上游公式对拍） |

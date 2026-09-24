@@ -521,6 +521,20 @@ SPI_SEND     DEVICE=flash DATA=04          // spi send ok
 `RETRIES`/`RETRY_TOLERANCE` + 探针透传组）。注意两个与上游一致的细节：段内 `horizontal_move_z`
 **不**被命令行 `HORIZONTAL_MOVE_Z` 覆盖；重试用的是**机架相对高度**而非原始探测 Z。
 
+### BLTOUCH_DEBUG / BLTOUCH_STORE — BLTouch 诊断与模式（由 `[bltouch]` 注册）
+
+| 命令 | 参数 | 说明 |
+|------|------|------|
+| `BLTOUCH_DEBUG` | `COMMAND`（可选） | 按上游语义下发命令并回显探针状态（细节见 `extras/bltouch.rs` 的 `cmd_BLTOUCH_DEBUG`） |
+| `BLTOUCH_STORE` | `MODE`（可选） | 按上游语义存储/回读模式（`cmd_BLTOUCH_STORE`） |
+
+### SET_SMART_EFFECTER / RESET_SMART_EFFECTOR — Smart Effector 调参（由 `[smart_effector]` 注册）
+
+| 命令 | 参数 | 说明 |
+|------|------|------|
+| `SET_SMART_EFFECTER` | `SENSITIVITY`(0..255)、`ACCEL`(≥0)、`RECOVERY_TIME`(≥0) | 缺省取当前值；错误文案含上游的 `accelartion` 拼写 |
+| `RESET_SMART_EFFECTOR` | 无 | **仅当配置了 `control_pin` 才注册**；按 1000 bits/s 向控制脚发 `[131,131]` 帧复位 |
+
 ## 未注册命令的处理
 
 没有命中处理器的命令走默认处理器（对应上游 `klippy/gcode.py` 的 `cmd_default`）：

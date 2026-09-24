@@ -444,6 +444,24 @@ impl ToolHeadObject {
         ]
     }
 
+    /// The names of the Z rail's steppers, in config order (`stepper_z`,
+    /// `stepper_z1`, `stepper_z2`…), for a Z-tilt/QGL helper to check its
+    /// `z_positions` count against (`ZAdjustHelper.handle_connect` counts the
+    /// toolhead's z-active steppers the same way).
+    ///
+    /// Empty for `kinematics: none`, which has no rails.
+    pub fn z_stepper_names(&self) -> Vec<String> {
+        self.rails
+            .get(Z_AXIS)
+            .map(|rail| {
+                rail.steppers()
+                    .iter()
+                    .map(|stepper| stepper.name().to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// The machine's maximum velocity, for `[extruder]`'s speed defaults.
     pub fn max_velocity(&self) -> f64 {
         self.limits.max_velocity
@@ -639,11 +657,67 @@ impl ToolHeadObject {
     ///
     /// `query_endstops` dates a query from this (upstream's
     /// `toolhead.get_last_move_time()`).
+    ///
+    /// This only *reads* the time; upstream's `get_last_move_time()` first
+    /// flushes the look-ahead into the trapq. Get that flush — and the steps
+    /// generated and sent for it — from
+    /// [`ToolHeadObject::flush_step_generation`], then read this.
     pub fn print_time(&self) -> f64 {
         self.lock()
             .as_ref()
             .map(|connected| connected.toolhead.print_time())
             .unwrap_or(0.0)
+    }
+
+    /// Flush the look-ahead and generate **and send** every step queued so far,
+    /// from inside a command (`toolhead.flush_step_generation`).
+    ///
+    /// Steps are normally generated and sent by the background flush task
+    /// ([`run_flush_loop`]); this takes the connected state out of the shared
+    /// slot for the duration (as `probing_move` and `G28` do), so the
+    /// generation and the awaited transport writes happen here alone — the
+    /// background task sees the empty slot and stands back. When this returns,
+    /// every move queued **before the call** has been generated and handed to
+    /// the transport, and [`ToolHeadObject::print_time`] is upstream's
+    /// `get_last_move_time()` — that pair is the flush entry
+    /// `ProbePointsHelper._invoke_callback` needs before its callback
+    /// (`probe.py:419-424`).
+    ///
+    /// # Errors
+    /// "Printer is not ready" before connect (or while a homing/probe run
+    /// holds the state), a step-generation failure, or a failed step send.
+    pub async fn flush_step_generation(&self) -> Result<(), CommandError> {
+        flush_step_generation(&self.state).await
+    }
+
+    /// Force the toolhead to `newpos`, marking `homing_axes` as homed
+    /// (`ToolHead.set_position`, `toolhead.py:383-391`).
+    ///
+    /// Upstream's `set_position` starts by flushing step generation (the
+    /// queued moves' steps must be generated before the trapq's position is
+    /// rewritten), then sets the position, the homing flags, and fires
+    /// `toolhead:set_position` ([`KlippyEvent::ToolheadSetPosition`]) so
+    /// `gcode_move` re-anchors — this does the same, which makes it safe for a
+    /// Z-tilt `adjust_steppers` loop to `move_to` and then `set_position`.
+    ///
+    /// # Errors
+    /// "Printer is not ready" before connect, or a failure from the flush
+    /// (generation or send).
+    pub async fn set_position(
+        &self,
+        newpos: Coord,
+        homing_axes: &[usize],
+    ) -> Result<(), CommandError> {
+        flush_step_generation(&self.state).await?;
+        {
+            let mut guard = self.lock();
+            let Some(connected) = guard.as_mut() else {
+                return Err(CommandError::new("Printer is not ready"));
+            };
+            connected.toolhead.set_position(newpos, homing_axes);
+        }
+        send(&self.printer, &KlippyEvent::ToolheadSetPosition);
+        Ok(())
     }
 
     /// Queue a move to `position` at `speed` mm/s (upstream's `toolhead.move`).
@@ -704,6 +778,11 @@ impl ToolHeadObject {
 }
 
 /// The flush task: generate the queued steps and await the transport.
+///
+/// A command that must not return until the steps it queued are generated and
+/// sent awaits [`flush_step_generation`] instead; the two never own the
+/// connected state at the same time, because each takes it out of the shared
+/// slot first.
 async fn run_flush_loop(
     state: Arc<Mutex<Option<Connected>>>,
     shutdown: Arc<AtomicBool>,
@@ -745,6 +824,42 @@ async fn run_flush_loop(
             }
         }
     }
+}
+
+/// Generate the steps for everything queued so far and await sending them,
+/// taking the connected state out of the shared slot for the duration
+/// (`toolhead.flush_step_generation`).
+///
+/// The caller must not hold `state`'s lock: the background flush task and this
+/// alternate through the slot, so only one of them generates and sends at a
+/// time.
+///
+/// # Errors
+/// "Printer is not ready" when the slot is empty (not connected, or a homing
+/// run owns it), a step-generation failure, or a failed step send.
+async fn flush_step_generation(state: &Arc<Mutex<Option<Connected>>>) -> Result<(), CommandError> {
+    let mut connected = {
+        let mut guard = state.lock().unwrap_or_else(|poison| poison.into_inner());
+        guard
+            .take()
+            .ok_or_else(|| CommandError::new("Printer is not ready"))?
+    };
+    let result = async {
+        let batches = connected
+            .generate()
+            .map_err(|err| CommandError::new(err.to_string()))?;
+        for (stepper, commands) in batches {
+            stepper
+                .send_steps_async(&commands)
+                .await
+                .map_err(command_error)?;
+        }
+        Ok(())
+    }
+    .await;
+    // Restore the state whether the flush succeeded or failed.
+    *state.lock().unwrap_or_else(|poison| poison.into_inner()) = Some(connected);
+    result
 }
 
 impl Connected {

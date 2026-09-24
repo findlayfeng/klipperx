@@ -82,7 +82,9 @@ impl MotionQueuing {
     /// Generate steps for every stepper up to `flush_time`.
     ///
     /// Each stepper reads its own trapq, so the toolhead's steppers and an
-    /// extruder's generate from different queues.
+    /// extruder's generate from different queues. A detached stepper
+    /// (`Stepper::set_trapq(None)`) is skipped: no steps are generated for
+    /// it until it is attached again (`MCU_stepper.set_trapq`).
     ///
     /// Returns one entry per stepper that produced commands, in the order the
     /// steppers were added.
@@ -96,7 +98,11 @@ impl MotionQueuing {
         let Self { trapqs, steppers } = self;
         let mut out = Vec::new();
         for stepper in steppers.iter_mut() {
-            let trapq = &trapqs[stepper.trapq_id()];
+            // Detached (`set_trapq(None)`): generate nothing for it.
+            let Some(trapq_id) = stepper.trapq_id() else {
+                continue;
+            };
+            let trapq = &trapqs[trapq_id];
             let commands = stepper.generate(trapq, flush_time)?;
             if !commands.is_empty() {
                 out.push((stepper.name().to_string(), commands));

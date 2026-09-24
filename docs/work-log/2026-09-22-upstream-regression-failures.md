@@ -2,8 +2,10 @@
 
 > **来源**：从 `docs/klippy/developer-manual/regression-tests.md` 的「忽略列表 → 失败原因分析」、
 > `TODO.md` 的「当前失败原因统计」与 `KLIPPERX_UPSTREAM_ALL=1` 的实跑结果整理去重；手册侧的
-> 「失败原因分析 / 运动学细分 / 完整失败日志」三节已删除，**本文件是这三项内容的唯一权威**
-> （运动学细分的文件列与尾注已移入本文件，按下方日志校正）。
+> 「失败原因分析 / 运动学细分 / 完整失败日志」三节已删除，**本文件保留这三项内容（截至该日期的形态）**；
+> 其中的失败次数、工单状态等**均为快照口径，不反映现状**——现行数字以 `TODO.md` 的
+> 「当前失败原因统计」与 [`regression-tests.md`](../klippy/developer-manual/regression-tests.md)
+> 为准，两处每次转绿都会更新（运动学细分的文件列与尾注已移入本文件，按下方日志校正）。
 >
 > **运行方式**：`KLIPPERX_UPSTREAM_ALL=1 cargo test -p klipperx --lib upstream_test_cases_run`
 >
@@ -403,14 +405,16 @@ z_virtual_endstop.test (test/klippy/z_virtual_endstop.cfg): test/klippy/z_virtua
 |------|------|----------|------|------|
 | T1 | `linuxtest.test` | — | 无 | ✅ 已通过 |
 | T2 | `[stepper_enable]`（`enable_pin`） | — | 无 | ✅ 已实现；相关文件仍因后续缺节留在忽略列表 |
-| T3 | `extruder` + `heater_bed` + `fan` | 102 | H1 | 待做 |
-| T4 | `probe` / `bltouch` / endstop pin chip | 36 | F8 | 待做 |
-| T5 | 运动学（delta / corexy / …） | 37 | C1 | 待做 |
+| T3 | `extruder` + `heater_bed` + `fan` | 102 | H1 | ✅ 已消（C1b 后 `Section 'extruder'` 归零） |
+| T4 | `probe` / `bltouch` / endstop pin chip | 36 | F8 | ◐ 部分（`[probe]` 段与 `probe` chip 已落地；bltouch/smart_effector/eddy 族待做） |
+| T5 | 运动学（delta / corexy / …） | 37 | C1 | ◐ 部分（corexy 族随 C1c-1 消失；余 delta/generic_cartesian/polar/winch/deltesian） |
 | T6 | TMC 段与 pin chip | 30 | H5 | 待做 |
 | T7 | 温度传感器 | 0 | H1 | ✅ 已完成（含真板与虚拟 MCU 验证） |
-| T8 | `output_pin` 的 `value` / `scale` | 6 | H2 | 待做 |
-| T9 | 其余 extras 段 | 20 | 各域 | 待做 |
-| T10 | 多轴 stepper | 5 | C1 | 待做 |
+| T8 | `output_pin` 的 `value` / `scale` | 6 | H2 | ✅ 已完成（阶段 0） |
+| T9 | 其余 extras 段 | 20 | 各域 | ◐ 部分（见 `TODO.md` 的 T9 条目与当前失败统计） |
+| T10 | 多轴 stepper | 5 | C1 | ✅ 已完成（C1a：`stepper_z1` 并入 Z rail） |
+
+（表内「失败次数」为 2026-09-22 快照口径；状态列已按 2026-09-24 现状核对，后续变更见 `TODO.md`）
 
 ---
 

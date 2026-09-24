@@ -15,6 +15,7 @@ pub mod board_pins;
 pub mod bulk_sensor;
 pub(crate) mod bus_debug;
 pub mod controller_fan;
+pub mod delta_calibrate;
 pub mod display_status;
 pub mod ds18b20;
 pub mod error_mcu;

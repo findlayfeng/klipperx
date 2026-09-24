@@ -223,6 +223,7 @@ mod tests {
             "hybrid_corexy",
             "hybrid_corexz",
             "polar",
+            "delta",
         ];
 
         let mut gap_frequency: BTreeMap<String, usize> = BTreeMap::new();
@@ -406,7 +407,6 @@ mod tests {
     /// the list stays honest rather than hiding regressions.
     const IGNORED: &[&str] = &[
         "corexyuv.test",
-        "delta.test",
         "delta_calibrate.test",
         "extruders.test",
         "generic_cartesian.test",

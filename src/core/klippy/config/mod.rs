@@ -103,12 +103,30 @@ impl Config {
     }
 
     /// Unified parsing entry point.
+    ///
+    /// A config file may carry a `SAVE_CONFIG` block below the header; it is
+    /// split off here and merged back the way upstream does
+    /// (`load_main_config`, `klippy/configfile.py:296-306`): the block is
+    /// parsed on its own and its options are appended, minus every option the
+    /// regular text already defines — **the body wins, the block only adds**.
+    /// **A file without the header takes exactly the old path over exactly
+    /// the same bytes** — no block, no change.
     pub fn parse(source: ConfigSource) -> Result<(Self, Vec<ConfigSource>), String> {
         let content = Self::read_source(&source)?;
+        let (regular, autosave) = split_autosave(&content);
         let mut visited = HashSet::new();
         visited.insert(source.clone());
-        let (included_config, sources_list) =
-            Self::parse_with_includes(&content, &source, &mut visited)?;
+        let (mut included_config, sources_list) =
+            Self::parse_with_includes(regular, &source, &mut visited, true)?;
+        if let Some(block) = autosave {
+            // `_strip_duplicates` needs the body (with its includes) parsed
+            // first; the block itself never resolves includes (upstream
+            // appends it as plain text).
+            let stripped = strip_autosave_duplicates(&block, &included_config);
+            let (saved, _) =
+                Self::parse_with_includes(&stripped, &source, &mut HashSet::new(), false)?;
+            merge_autosave(&mut included_config, &saved);
+        }
         let mut all_sources = Vec::new();
         all_sources.push(source);
         all_sources.extend(sources_list);
@@ -168,10 +186,15 @@ impl Config {
     }
 
     /// Internal parse logic with include support.
+    ///
+    /// `resolve_includes` is `false` for the `SAVE_CONFIG` block: upstream
+    /// appends those lines as text (`append_fileconfig`), so an
+    /// `[include …]` header inside one is an ordinary section, not a splice.
     fn parse_with_includes(
         content: &str,
         source: &ConfigSource,
         visited: &mut HashSet<ConfigSource>,
+        resolve_includes: bool,
     ) -> Result<(Self, Vec<ConfigSource>), String> {
         let mut config = Self::new();
         let mut sources = Vec::new();
@@ -215,7 +238,7 @@ impl Config {
 
             if code.starts_with('[') && code.contains(']') {
                 if let Some(section) = current_section.take() {
-                    if section.id == "include" {
+                    if section.id == "include" && resolve_includes {
                         let include_path_str = section.sub.as_deref()
                             .or_else(|| section.get_str("path"))
                             .ok_or_else(|| {
@@ -237,8 +260,12 @@ impl Config {
 
                         visited.insert(include_source.clone());
                         let included_content = Self::read_source(&include_source)?;
-                        let (included_config, mut included_sources) =
-                            Self::parse_with_includes(&included_content, &include_source, visited)?;
+                        let (included_config, mut included_sources) = Self::parse_with_includes(
+                            &included_content,
+                            &include_source,
+                            visited,
+                            resolve_includes,
+                        )?;
                         sources.push(include_source.clone());
                         sources.append(&mut included_sources);
 
@@ -291,7 +318,7 @@ impl Config {
         }
 
         if let Some(section) = current_section {
-            if section.id == "include" {
+            if section.id == "include" && resolve_includes {
                 let include_path_str = section
                     .sub
                     .as_deref()
@@ -306,8 +333,12 @@ impl Config {
                 }
                 visited.insert(include_source.clone());
                 let included_content = Self::read_source(&include_source)?;
-                let (included_config, mut included_sources) =
-                    Self::parse_with_includes(&included_content, &include_source, visited)?;
+                let (included_config, mut included_sources) = Self::parse_with_includes(
+                    &included_content,
+                    &include_source,
+                    visited,
+                    resolve_includes,
+                )?;
                 sources.push(include_source.clone());
                 sources.append(&mut included_sources);
                 for section in included_config.sections_vec() {
@@ -476,6 +507,135 @@ fn remove_inline_comment(value: &str) -> &str {
         }
     }
     value
+}
+
+// ---------------------------------------------------------------------------
+// The SAVE_CONFIG block (`klippy/configfile.py:233-294`)
+// ---------------------------------------------------------------------------
+
+/// The block header, byte for byte (`AUTOSAVE_HEADER`, `configfile.py:233-237`).
+const AUTOSAVE_HEADER: &str = concat!(
+    "\n#*# <---------------------- SAVE_CONFIG ---------------------->\n",
+    "#*# DO NOT EDIT THIS BLOCK OR BELOW. The contents are auto-generated.\n",
+    "#*#\n",
+);
+
+/// Split the `SAVE_CONFIG` block off a config file's raw text
+/// (`_find_autosave_data`, `configfile.py:248-272`).
+///
+/// Returns the regular text and the block's lines with each `#*# ` prefix
+/// removed. A corrupted block is a warning and **no split**: the whole text
+/// stays regular, which is exactly what a file without the block always was
+/// (its `#*#` lines are comments). The upstream warnings keep their wording.
+fn split_autosave(data: &str) -> (&str, Option<String>) {
+    let Some(pos) = data.find(AUTOSAVE_HEADER) else {
+        return (data, None);
+    };
+    let regular = &data[..pos];
+    let autosave = data[pos + AUTOSAVE_HEADER.len()..].trim();
+    if regular.contains("\n#*# ") {
+        tracing::warn!("Can't read autosave from config file - autosave state corrupted");
+        return (data, None);
+    }
+    let mut lines = Vec::new();
+    for line in autosave.split('\n') {
+        // Upstream refuses a line that is not `#*# `-prefixed — once there is
+        // a block at all (an empty block has no lines to check).
+        let malformed = (!line.starts_with("#*#")
+            || (line.len() >= 4 && !line.starts_with("#*# ")))
+            && !autosave.is_empty();
+        if malformed {
+            tracing::warn!("Can't read autosave from config file - modifications after header");
+            return (data, None);
+        }
+        // `line[4:]`: `#*# ` is four bytes; a bare `#*#` has no tail.
+        lines.push(if line.len() >= 4 { &line[4..] } else { "" });
+    }
+    (regular, Some(lines.join("\n")))
+}
+
+/// Comment out every block line whose option the regular text already defines
+/// (`_strip_duplicates`, `configfile.py:273-294`): the body wins, the block
+/// only contributes new options. Continuation lines of a commented field go
+/// with it.
+fn strip_autosave_duplicates(block: &str, regular: &Config) -> String {
+    // Upstream's naive comment cut for this text (the block's lines carry no
+    // quoted `#`/`;`); the main parser keeps its own quote-aware rule.
+    fn cut_comment(line: &str) -> &str {
+        match line.find(['#', ';']) {
+            Some(index) => &line[..index],
+            None => line,
+        }
+    }
+    let mut section: Option<String> = None;
+    let mut is_dup_field = false;
+    let mut out = Vec::new();
+    for line in block.split('\n') {
+        let pruned = cut_comment(line).trim_end();
+        if pruned.is_empty() {
+            out.push(line.to_string());
+            continue;
+        }
+        if pruned.starts_with(char::is_whitespace) {
+            out.push(if is_dup_field {
+                format!("#{line}")
+            } else {
+                line.to_string()
+            });
+            continue;
+        }
+        is_dup_field = false;
+        if pruned.starts_with('[') {
+            section = pruned
+                .strip_prefix('[')
+                .and_then(|rest| rest.strip_suffix(']'))
+                .map(str::trim)
+                .map(str::to_string);
+            out.push(line.to_string());
+            continue;
+        }
+        // The field: the leading `[A-Za-z0-9_]` run (`value_r`).
+        let field: String = pruned
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        let defined = section
+            .as_deref()
+            .and_then(|name| regular.get_section(name))
+            .is_some_and(|section| section.has(&field));
+        if defined {
+            is_dup_field = true;
+            out.push(format!("#{line}"));
+        } else {
+            out.push(line.to_string());
+        }
+    }
+    out.join("\n")
+}
+
+/// Append the parsed block onto the body's config, option by option —
+/// upstream's `append_fileconfig(regular_fileconfig, autosave_data, …)`
+/// (`configfile.py:305`): a body-defined option stays (its block twin was
+/// already stripped), a new one is added to its section (created if the body
+/// lacks it), and insertion order keeps the body's sections in place.
+fn merge_autosave(body: &mut Config, saved: &Config) {
+    for section in saved.sections_vec() {
+        let key = (section.id.clone(), section.sub.clone());
+        match body.sections.get_by_key(&key).cloned() {
+            None => body.add_section(section.clone()),
+            Some(mut existing) => {
+                for (option, value) in &section.parameters {
+                    existing
+                        .parameters
+                        .entry(option.clone())
+                        .or_insert_with(|| value.clone());
+                }
+                // Replacing under the same key keeps the body's position in
+                // the iteration order (`insert` only appends unknown keys).
+                body.add_section(existing);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -652,5 +812,116 @@ mod tests {
                 .get_str("serial"),
             Some("/dev/ttyUSB1")
         );
+    }
+    // -----------------------------------------------------------------------
+    // The SAVE_CONFIG block (`_find_autosave_data` + `_strip_duplicates`)
+    // -----------------------------------------------------------------------
+
+    /// The header as upstream writes it — pinned so a byte of drift fails.
+    #[test]
+    fn the_save_config_header_matches_upstream_bytes() {
+        assert_eq!(
+            AUTOSAVE_HEADER,
+            "\n#*# <---------------------- SAVE_CONFIG ---------------------->\n\
+             #*# DO NOT EDIT THIS BLOCK OR BELOW. The contents are auto-generated.\n\
+             #*#\n"
+        );
+    }
+
+    /// The exact delta_calibrate.cfg shape: body, header, prefixed lines.
+    fn with_block(body: &str, block: &str) -> String {
+        format!(
+            "{body}\n#*# <---------------------- SAVE_CONFIG ---------------------->\n\
+             #*# DO NOT EDIT THIS BLOCK OR BELOW. The contents are auto-generated.\n\
+             #*#\n{block}"
+        )
+    }
+
+    #[test]
+    fn a_config_without_a_block_parses_exactly_as_before() {
+        // No header anywhere: the parse input is byte-for-byte the old one —
+        // a `#*#`-looking line stays an ordinary comment.
+        let text = "[s]\na: 1\n#*# not a block = 2\nb: 3\n";
+        let config = parse(text);
+        let section = config.get_section("s").unwrap();
+        assert_eq!(section.get_str("a"), Some("1"));
+        assert_eq!(section.get_str("b"), Some("3"));
+        assert!(!section.has("not"));
+        assert!(!section.has("not a block"));
+        // And the split helper declines the file outright.
+        assert_eq!(split_autosave(text), (text, None));
+    }
+
+    #[test]
+    fn the_block_is_split_and_its_prefixes_stripped() {
+        let text = with_block(
+            "[printer]\nkinematics: delta\n",
+            "#*# [printer]\n#*# delta_radius = 174.750004\n",
+        );
+        let (regular, block) = split_autosave(&text);
+        assert_eq!(regular, "[printer]\nkinematics: delta\n");
+        let block = block.expect("the block splits");
+        assert_eq!(block, "[printer]\ndelta_radius = 174.750004");
+
+        let config = parse(&text);
+        // The prefixed lines parse as ordinary options: `#*#` never reaches a
+        // value.
+        let printer = config.get_section("printer").unwrap();
+        assert_eq!(printer.get_str("delta_radius"), Some("174.750004"));
+        assert_eq!(printer.get_str("kinematics"), Some("delta"));
+    }
+
+    #[test]
+    fn the_block_adds_new_options_but_never_overrides_the_body() {
+        // `_strip_duplicates`: the body wins, the block appends what the body
+        // does not define.
+        let text = with_block(
+            "[delta_calibrate]\nradius: 50\n",
+            "#*# [delta_calibrate]\n#*# radius = 99\n#*# height0 = 0.0\n",
+        );
+        let config = parse(&text);
+        let section = config.get_section("delta_calibrate").unwrap();
+        assert_eq!(section.get_str("radius"), Some("50"), "the body wins");
+        assert_eq!(section.get_str("height0"), Some("0.0"), "the block adds");
+    }
+
+    #[test]
+    fn the_block_may_open_sections_the_body_lacks() {
+        let text = with_block(
+            "[printer]\nkinematics: delta\n",
+            "#*# [stepper_a]\n#*# angle = 210.0\n",
+        );
+        let config = parse(&text);
+        assert_eq!(
+            config.get_section("stepper_a").unwrap().get_str("angle"),
+            Some("210.0")
+        );
+    }
+
+    #[test]
+    fn a_corrupted_block_leaves_the_file_untouched() {
+        // A `#*# `-prefixed line *above* the header corrupts the split
+        // (`configfile.py:256-258`): nothing splits, every `#*#` line is the
+        // comment it would have been without the feature.
+        let text = with_block(
+            "[printer]\n#*# ghost = 1\nkinematics: delta\n",
+            "#*# [printer]\n#*# delta_radius = 174.750004\n",
+        );
+        let (regular, block) = split_autosave(&text);
+        assert_eq!(regular, text, "no split");
+        assert_eq!(block, None);
+
+        // A line inside the block without the prefix corrupts it too
+        // (`modifications after header`).
+        let text = with_block("[printer]\n", "#*# [printer]\ntampered = 1\n");
+        let (regular, block) = split_autosave(&text);
+        assert_eq!(regular, text, "no split");
+        assert_eq!(block, None);
+        // The tampered line is ordinary text in that case, and the block's
+        // options stay comments.
+        let config = parse(&text);
+        let printer = config.get_section("printer").unwrap();
+        assert_eq!(printer.get_str("tampered"), Some("1"));
+        assert!(printer.get("delta_radius").is_none());
     }
 }

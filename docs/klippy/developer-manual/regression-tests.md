@@ -209,7 +209,7 @@ M3 `smart_effector` 落地后，仅剩 `eddy.test`——`probe_eddy_current` 属
 - 要让实际执行数继续上升：把「移出 `IGNORED` 后全部可跑运行都通过」的文件移除（守卫
   `ignored_cases_still_fail` 会逐个提示）。T3（`extruder`/`heater_bed`/`fan`）三个段已落地，但
   `extruders.test` / `temperature.test` 的首败已前移到 `extruder_stepper` / `temperature_fan`
-  （2026-09-23 实跑），仍要留在列表；T4（`probe`/`bltouch`/endstop pin chip）尚未动工，T5
+  （2026-09-23 实跑），仍要留在列表；T4（`probe`/`bltouch`/endstop pin chip）已消至仅剩 `eddy.test`（属 M5，进行中），T5
   运动学已消掉 corexy 族（C1c-1）剩下 delta 等。
 
 ### 推进口径与验收

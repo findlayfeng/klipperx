@@ -19,23 +19,32 @@
 //! axis to the module, the seam upstream wires in `cartesian.py:31-34`.
 //!
 //! The stepper is built but **not driven**: it never joins the toolhead's
-//! rails, so no steps are generated for it, and `SET_DUAL_CARRIAGE` only
-//! updates the bookkeeping. The upstream behaviour still missing is listed
-//! below; the idex family's next units (hybrid dual carriage, generic
-//! cartesian) build on this seam.
+//! rails, so no steps are generated for it. What the three commands *do*
+//! carry across is the **gcode coordinate**: switching or restoring parks the
+//! departing carriage's axis coordinate and re-anchors the toolhead on the
+//! arriving carriage's frame, the way upstream's `toggle_active_dc_rail`
+//! calls `toolhead.set_position(newpos)` (`idex_modes.py:101-114`) — the
+//! `toolhead:set_position` event re-anchors `gcode_move` with it, so the next
+//! move lands in the new carriage's frame and its range. The upstream
+//! behaviour still missing is listed below; the idex family's next units
+//! (hybrid dual carriage, generic cartesian) build on this seam.
 //!
 //! # Gaps this port does not close yet
 //!
 //! * **No carriage switching on the motion layer**: the active rail's trapq
-//!   swap, position tracking and `update_limits` (`idex_modes.py:224-231`,
-//!   `DualCarriagesRail.activate/inactivate`) are not implemented — the
-//!   recorded carriage index only feeds `get_status` and the saved states.
+//!   swap, the scale/offset transform and `update_limits`
+//!   (`idex_modes.py:224-231`, `DualCarriagesRail.activate/inactivate`) are
+//!   not implemented — the coordinate handover teleports the toolhead onto
+//!   the new frame, but the steps still go to the primary rail, and the
+//!   active carriage's **range** stays the primary rail's (identical in the
+//!   corpus, where both carriages ride `[0, 200]`).
 //! * **`COPY` / `MIRROR` / `INACTIVE` modes are validated, not applied**
 //!   (`idex_modes.py:15-17`); upstream's homing/`PRIMARY`-first checks are
 //!   not enforced either.
-//! * **Saved states store the active index only**: upstream saves carriage
-//!   modes, axis positions and the toolhead position, and the restore moves
-//!   the carriages (`idex_modes.py:285-310`).
+//! * **Saved states store the active index and the axis frames**: carriage
+//!   modes (`PRIMARY`/`COPY`/`MIRROR`) are not modelled, the restore
+//!   re-anchors the coordinate instead of physically moving the carriages,
+//!   and `MOVE_SPEED` is read but unused (`idex_modes.py:285-310`).
 //! * **The second carriage's endstop is not in `query_endstops`**, and
 //!   `STEPPER_BUZZ STEPPER=dual_carriage` is not registered (both are silent
 //!   unknown-command answers, so the corpus does not care).
@@ -56,10 +65,12 @@ use serde_json::{json, Value};
 
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
 use crate::core::klippy::extras::stepper::{axis_index, PrinterStepper, Rail};
+use crate::core::klippy::extras::toolhead::ToolHeadObject;
 use crate::core::klippy::gcode::{
     sync, CommandError, CommandHandler, GCodeDispatch, GcodeCommand, GCODE_OBJECT,
 };
 use crate::core::klippy::load::section;
+use crate::core::klippy::mathutil::Coord;
 use crate::core::klippy::motion::Axis;
 use crate::core::klippy::printer::{Printer, PrinterObject};
 
@@ -76,18 +87,40 @@ section!(
 /// (`idex_modes.py:46 add_object('dual_carriage', self)`).
 pub const DUAL_CARRIAGE_OBJECT: &str = "dual_carriage";
 
+/// The toolhead's object name (`[printer]` registers it), where
+/// `toggle_active_dc_rail` re-anchors the coordinate
+/// (`idex_modes.py:102`).
+const TOOLHEAD_OBJECT: &str = "toolhead";
+
 /// The `MODE` values `SET_DUAL_CARRIAGE` accepts (`idex_modes.py:16`).
 const VALID_MODES: [&str; 4] = ["INACTIVE", "PRIMARY", "COPY", "MIRROR"];
 
-/// What the three commands share: the carriage index that is active, and the
-/// states `SAVE_DUAL_CARRIAGE_STATE` wrote.
+/// What the three commands share: the carriage index that is active, each
+/// carriage's axis frame, and the states `SAVE_DUAL_CARRIAGE_STATE` wrote.
 #[derive(Default)]
 struct Shared {
     /// The active carriage: 0 is the primary rail, 1 the second carriage.
     active: usize,
-    /// `SAVE_DUAL_CARRIAGE_STATE NAME=…` states, each the saved index for now
-    /// (upstream saves modes and positions too; see the module docs).
-    saved: HashMap<String, usize>,
+    /// The carriage-axis coordinate each carriage's frame holds. A frame is
+    /// recorded when its carriage is left and carried to when it is
+    /// re-entered — the coordinate half of upstream's
+    /// `toggle_active_dc_rail` (`idex_modes.py:101-114`), where upstream
+    /// instead reads it off the scale/offset transform of a second rail that
+    /// this port does not drive (module docs).
+    axis_position: [f64; 2],
+    /// `SAVE_DUAL_CARRIAGE_STATE NAME=…` states: the active index and both
+    /// axis frames (`idex_modes.py:285-293`; modes are not modelled — module
+    /// docs).
+    saved: HashMap<String, SavedState>,
+}
+
+/// One `SAVE_DUAL_CARRIAGE_STATE` snapshot.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SavedState {
+    /// The carriage that was active.
+    active: usize,
+    /// Both carriages' axis frames at the save.
+    axis_position: [f64; 2],
 }
 
 /// The `dual_carriage` object: the second carriage's section and state.
@@ -125,6 +158,12 @@ impl DualCarriageModule {
     /// The active carriage index: 0 until a `SET_DUAL_CARRIAGE` says otherwise.
     pub fn active_carriage(&self) -> usize {
         self.shared_lock().active
+    }
+
+    /// Both carriages' axis frames, in carriage order — what the handover
+    /// carries across switches and restores.
+    pub fn axis_frames(&self) -> [f64; 2] {
+        self.shared_lock().axis_position
     }
 
     /// The primary rail the cartesian kinematics claimed, by name — `None`
@@ -213,30 +252,59 @@ pub fn load_config(
     let gcode = printer
         .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
         .expect("the loader registers `gcode` before any section");
-    let commands: [(
-        &str,
-        &str,
-        fn(&Arc<Mutex<Shared>>, &GcodeCommand) -> Result<(), CommandError>,
-    ); 3] = [
+    let axis_usize = axis_index(axis);
+
+    // `SAVE_DUAL_CARRIAGE_STATE`: snapshot the frames — synchronous, it only
+    // reads the toolhead's position if there is one.
+    {
+        let shared = Arc::clone(&shared);
+        let weak = Arc::downgrade(printer);
+        let handler: CommandHandler = sync(move |gcmd: &GcodeCommand| {
+            let printer = weak.upgrade();
+            cmd_save_dual_carriage_state(&shared, gcmd, printer.as_ref(), axis_usize)
+        });
+        gcode
+            .register_command(
+                "SAVE_DUAL_CARRIAGE_STATE",
+                handler,
+                Some("Save dual carriages modes and positions"),
+                false,
+            )
+            .map_err(ConfigError::new)?;
+    }
+
+    // `SET_DUAL_CARRIAGE` / `RESTORE_DUAL_CARRIAGE_STATE` re-anchor the
+    // toolhead, so they are async handlers — upstream's
+    // `toolhead.set_position` (`idex_modes.py:114,348`) has the same job.
+    for (name, desc, restoring) in [
         (
             "SET_DUAL_CARRIAGE",
             "Configure the dual carriages mode",
-            cmd_set_dual_carriage,
-        ),
-        (
-            "SAVE_DUAL_CARRIAGE_STATE",
-            "Save dual carriages modes and positions",
-            cmd_save_dual_carriage_state,
+            false,
         ),
         (
             "RESTORE_DUAL_CARRIAGE_STATE",
             "Restore dual carriages modes and positions",
-            cmd_restore_dual_carriage_state,
+            true,
         ),
-    ];
-    for (name, desc, body) in commands {
+    ] {
         let shared = Arc::clone(&shared);
-        let handler: CommandHandler = sync(move |gcmd| body(&shared, gcmd));
+        let weak = Arc::downgrade(printer);
+        let handler: CommandHandler = Arc::new(move |gcmd: &GcodeCommand| {
+            let shared = Arc::clone(&shared);
+            let weak = weak.clone();
+            Box::pin(async move {
+                let printer = weak
+                    .upgrade()
+                    .ok_or_else(|| CommandError::new("printer is gone"))?;
+                let plan = if restoring {
+                    Plan::Restore(cmd_restore_dual_carriage_state(&shared, gcmd)?)
+                } else {
+                    Plan::Switch(select_carriage(gcmd)?)
+                };
+                apply(&shared, &printer, axis_usize, plan).await
+            })
+        });
         gcode
             .register_command(name, handler, Some(desc), false)
             .map_err(ConfigError::new)?;
@@ -251,15 +319,86 @@ pub fn load_config(
     }))
 }
 
-/// `SET_DUAL_CARRIAGE CARRIAGE=<0|1> [MODE=…]`: pick the active carriage.
+/// What one command asks the frames to do: a switch carries the coordinates
+/// across, a restore applies a snapshot wholesale.
+enum Plan {
+    /// `SET_DUAL_CARRIAGE CARRIAGE=<index>`.
+    Switch(usize),
+    /// `RESTORE_DUAL_CARRIAGE_STATE`.
+    Restore(SavedState),
+}
+
+/// The arriving carriage's axis frame — the bookkeeping half of upstream's
+/// `toggle_active_dc_rail` (`idex_modes.py:101-114`): record the departing
+/// frame from `current` (when there is a position to record), select the
+/// arriving carriage, and hand back the coordinate the toolhead should be
+/// re-anchored on. A restore overwrites both frames first
+/// (`idex_modes.py:303-348`); without a position only the active index moves,
+/// which is the whole of what the commands did before this seam existed.
+fn carry_frame(state: &mut Shared, axis: usize, plan: &Plan, current: Option<Coord>) -> f64 {
+    match plan {
+        Plan::Switch(to) => {
+            if let Some(current) = current {
+                let departing = state.active;
+                state.axis_position[departing] = current.axis(axis);
+            }
+            state.active = *to;
+            state.axis_position[*to]
+        }
+        Plan::Restore(saved) => {
+            state.axis_position = saved.axis_position;
+            state.active = saved.active;
+            state.axis_position[saved.active]
+        }
+    }
+}
+
+/// The toolhead's current position, when a toolhead exists and is connected
+/// (`ToolHeadObject::position`).
+fn current_position(printer: &Arc<Printer>) -> Option<Coord> {
+    printer
+        .lookup_object_as::<ToolHeadObject>(TOOLHEAD_OBJECT)?
+        .position()
+}
+
+/// Re-anchor the gcode coordinate on the arriving frame: bookkeeping first,
+/// then `toolhead.set_position(newpos)` — upstream calls it right after the
+/// rail swap (`idex_modes.py:113-114`), and the `toolhead:set_position` event
+/// re-anchors `gcode_move` behind it. A machine with no connected toolhead
+/// keeps the frames only; there is no coordinate to move.
 ///
-/// `CARRIAGE` accepts the numeric index (upstream also accepts a rail name;
-/// see the module docs) and `MODE` is validated then only recorded — applying
-/// it is the motion-layer gap above (`idex_modes.py:240-262`).
-fn cmd_set_dual_carriage(
+/// # Errors
+/// A failure from the toolhead's flush (`set_position`).
+async fn apply(
     shared: &Arc<Mutex<Shared>>,
-    gcmd: &GcodeCommand,
+    printer: &Arc<Printer>,
+    axis: usize,
+    plan: Plan,
 ) -> Result<(), CommandError> {
+    let toolhead = printer.lookup_object_as::<ToolHeadObject>(TOOLHEAD_OBJECT);
+    let current = toolhead.as_ref().and_then(|toolhead| toolhead.position());
+    let arriving = {
+        let mut state = shared.lock().unwrap_or_else(|poison| poison.into_inner());
+        carry_frame(&mut state, axis, &plan, current)
+    };
+    let (Some(toolhead), Some(current)) = (toolhead, current) else {
+        return Ok(());
+    };
+    let mut newpos = current;
+    newpos.set_axis(axis, arriving);
+    toolhead.set_position(newpos, &[]).await
+}
+
+/// `SET_DUAL_CARRIAGE CARRIAGE=<0|1> [MODE=…]`: validate and pick the active
+/// carriage — the coordinate handover happens in `apply`
+/// (`idex_modes.py:240-262`).
+///
+/// `MODE` is validated then only recorded — applying it is the motion-layer
+/// gap above (`idex_modes.py:240-262`).
+///
+/// # Errors
+/// Upstream's argument wordings for a missing/invalid `CARRIAGE` or `MODE`.
+fn select_carriage(gcmd: &GcodeCommand) -> Result<usize, CommandError> {
     let carriage = match gcmd.get_command_parameters().get("CARRIAGE") {
         Some(raw) => raw.clone(),
         None => return Err(CommandError::new("CARRIAGE must be specified")),
@@ -280,43 +419,57 @@ fn cmd_set_dual_carriage(
     if !VALID_MODES.contains(&mode.as_str()) {
         return Err(CommandError::new(format!("Invalid mode={mode} specified")));
     }
-    let mut state = shared.lock().unwrap_or_else(|poison| poison.into_inner());
-    state.active = index;
-    Ok(())
+    Ok(index)
 }
 
-/// `SAVE_DUAL_CARRIAGE_STATE [NAME=…]`: remember the active carriage under
-/// `NAME` (default `default`) (`idex_modes.py:283-284`).
+/// `SAVE_DUAL_CARRIAGE_STATE [NAME=…]`: remember the active carriage and
+/// both frames under `NAME` (default `default`) — upstream saves the axis
+/// positions too (`idex_modes.py:283-293`), so the active frame is refreshed
+/// from the toolhead first.
 fn cmd_save_dual_carriage_state(
     shared: &Arc<Mutex<Shared>>,
     gcmd: &GcodeCommand,
+    printer: Option<&Arc<Printer>>,
+    axis: usize,
 ) -> Result<(), CommandError> {
     let name = gcmd.get_str_default("NAME", "default");
     let mut state = shared.lock().unwrap_or_else(|poison| poison.into_inner());
-    let active = state.active;
-    state.saved.insert(name, active);
+    if let Some(current) = printer.and_then(current_position) {
+        let active = state.active;
+        state.axis_position[active] = current.axis(axis);
+    }
+    let saved = SavedState {
+        active: state.active,
+        axis_position: state.axis_position,
+    };
+    state.saved.insert(name, saved);
     Ok(())
 }
 
-/// `RESTORE_DUAL_CARRIAGE_STATE [NAME=…]`: re-activate the carriage saved
-/// under `NAME`, refusing an unknown state with upstream's wording
-/// (`idex_modes.py:295-302`).
+/// `RESTORE_DUAL_CARRIAGE_STATE [NAME=…]`: fetch the snapshot to apply,
+/// refusing an unknown state with upstream's wording
+/// (`idex_modes.py:295-302`). `MOVE_SPEED` and `MOVE` are still read — the
+/// option check demands it — but physically moving the carriages is the
+/// motion-layer gap in the module docs, so the coordinate is re-anchored
+/// instead (`apply`).
+///
+/// # Errors
+/// Upstream's unknown-state wording, or an unparsable option.
 fn cmd_restore_dual_carriage_state(
     shared: &Arc<Mutex<Shared>>,
     gcmd: &GcodeCommand,
-) -> Result<(), CommandError> {
+) -> Result<SavedState, CommandError> {
     let name = gcmd.get_str_default("NAME", "default");
     // Upstream moves the carriages with these (`idex_modes.py:300-301`);
     // here they are read and validated, not acted on (module docs).
     let _move_speed = gcmd.get_float_default("MOVE_SPEED", 0.)?;
     let _move = gcmd.get_int_default("MOVE", 1)?;
-    let mut state = shared.lock().unwrap_or_else(|poison| poison.into_inner());
-    let saved = state
+    let state = shared.lock().unwrap_or_else(|poison| poison.into_inner());
+    state
         .saved
         .get(&name)
-        .ok_or_else(|| CommandError::new(format!("Unknown DUAL_CARRIAGE state: {name}")))?;
-    state.active = *saved;
-    Ok(())
+        .copied()
+        .ok_or_else(|| CommandError::new(format!("Unknown DUAL_CARRIAGE state: {name}")))
 }
 
 // ===========================================================================
@@ -467,6 +620,55 @@ mod tests {
             .run_script_sync("RESTORE_DUAL_CARRIAGE_STATE")
             .unwrap();
         assert_eq!(module.active_carriage(), 0, "the saved index is restored");
+    }
+
+    /// The handover bookkeeping (`toggle_active_dc_rail`,
+    /// `idex_modes.py:101-114`): a switch records the departing frame and
+    /// arrives on the other carriage's; a restore applies the snapshot
+    /// wholesale; without a toolhead position only the active index moves —
+    /// the pre-handover behaviour the load-only tests see.
+    #[test]
+    fn the_frames_carry_across_switches_and_restores() {
+        let axis = axis_index(Axis::X);
+        let mut state = Shared::default();
+
+        // On carriage 0 at X=50: switch to 1, whose frame is still 0.
+        let arriving = carry_frame(
+            &mut state,
+            axis,
+            &Plan::Switch(1),
+            Some(Coord::new(50.0, 0.0, 0.0, 1.5)),
+        );
+        assert_eq!(state.active, 1);
+        assert_eq!(state.axis_position, [50.0, 0.0]);
+        assert_eq!(arriving, 0.0, "the arriving frame's coordinate");
+
+        // On carriage 1 at X=190: switch back, c0's 50 is carried over.
+        let arriving = carry_frame(
+            &mut state,
+            axis,
+            &Plan::Switch(0),
+            Some(Coord::new(190.0, 0.0, 0.0, 1.5)),
+        );
+        assert_eq!(state.axis_position, [50.0, 190.0]);
+        assert_eq!(arriving, 50.0, "the gcode coordinate lands on c0's frame");
+
+        // A snapshot applies wholesale on restore, whatever the toolhead says.
+        let saved = SavedState {
+            active: 1,
+            axis_position: [10.0, 170.0],
+        };
+        let arriving = carry_frame(&mut state, axis, &Plan::Restore(saved), None);
+        assert_eq!(state.axis_position, [10.0, 170.0]);
+        assert_eq!(state.active, 1);
+        assert_eq!(arriving, 170.0);
+
+        // No toolhead to read: the frames stay put, the index still moves.
+        state.axis_position = [7.0, 9.0];
+        let arriving = carry_frame(&mut state, axis, &Plan::Switch(0), None);
+        assert_eq!(state.active, 0);
+        assert_eq!(state.axis_position, [7.0, 9.0]);
+        assert_eq!(arriving, 7.0);
     }
 
     /// The command errors the corpus' neighbourhood can reach, in upstream's

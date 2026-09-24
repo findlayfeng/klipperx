@@ -195,7 +195,7 @@ impl ManualProbe {
     /// Create the object when the config never wrote `[manual_probe]`.
     ///
     /// Upstream's toolhead loads `manual_probe` unconditionally
-    /// (`klippy/toolhead.py:293`), which is why `PROBE_CALIBRATE` and
+    /// (`klippy/toolhead.py:611`), which is why `PROBE_CALIBRATE` and
     /// `Z_ENDSTOP_CALIBRATE` work without the section; `config` is the
     /// `[printer]` wrapper the toolhead was built from, and the target's
     /// `position_endstop` is still reachable as its sibling.

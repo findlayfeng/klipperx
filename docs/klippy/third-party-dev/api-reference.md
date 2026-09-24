@@ -818,7 +818,7 @@
 | `PROBE_CALIBRATE` | 探针校准（`probe`） |
 | `QUAD_GANTRY_LEVEL` | 四梁水平校准（`quad_gantry_level`） |
 | `Z_TILT_ADJUST` | Z 轴倾斜调整（`z_tilt`） |
-| `BED_SCREWS_ADJUST` | 床面螺丝调整（`bed_screws`） |
+| `BED_SCREWS_ADJUST` | 床面螺丝调整（`bed_screws`）——**段已落地、命令未注册**（2026-09-24 批 #1，调用会收到未知命令响应） |
 | `SCREWS_TILT_CALCULATE` | 螺丝倾斜计算（`screws_tilt_adjust`） |
 | `SHAPER_CALIBRATE` | 输入整形校准（`resonance_tester`） |
 | `QUERY_ENDSTOPS` | 查询限位开关 |

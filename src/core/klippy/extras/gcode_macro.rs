@@ -15,34 +15,48 @@
 //! | `rename_existing` | — | the command this one renames (`:135-142`) |
 //! | `variable_<name>` | — | a literal reported in `get_status` (`:153-162`) |
 //!
+//! # How the body runs
+//!
+//! The section's `gcode` body is compiled into a [`Template`] when the macro
+//! loads — the point upstream's `load_template` compiles it (`gcode_macro.py:
+//! 132`) — and the registered command renders it per invocation: the macro's
+//! `variable_*` values, the template context (`printer`, `action_*`,
+//! `range`), then `params` and `rawparams` make up upstream's `kwparams`
+//! (`:186-190`); the rendered text is fed back through
+//! `run_script_from_command`, exactly `TemplateWrapper.run_gcode_from_command`
+//! (`:79-80`). The supported template subset — and every construct refused
+//! explicitly outside it — is listed in [`template`]'s module docs.
+//!
+//! `SET_GCODE_VARIABLE` is a mux command keyed by the section's own name, one
+//! value per macro (`gcode_macro.py:148-150`). Its `VALUE` parses as JSON,
+//! the literal rule this port's `variable_*` reader already applies
+//! (`:158-162`), where upstream uses Python's `ast.literal_eval`.
+//!
 //! # Gaps this port does not close yet
 //!
-//! - **The body is not rendered.** Running the command answers with a
-//!   `respond_info` line and returns: expanding the template
-//!   ([`TemplateWrapper`-style, `gcode_macro.py:46`]) and evaluating its
-//!   expressions against `printer` / `params` (`GetStatusWrapper`, `:15`) is a
-//!   later unit. Upstream's regression needs only the section to load and the
-//!   command to exist — an invoked macro must simply not fail the run.
-//! - **`SET_GCODE_VARIABLE` is not registered** (`gcode_macro.py:148-150`).
-//!   The `variable_*` options are read (so the option check accepts them) and
-//!   reported by `get_status`, but nothing writes them yet.
 //! - **`rename_existing` stops at the load-time checks** (`:135-142`): the
 //!   option is read and the same-type rule enforced, but upstream's swap at
 //!   `klippy:connect` (`handle_connect`, `:163-171`) is not implemented, so a
 //!   renaming macro does not register at all — matching upstream's *load-time*
 //!   behaviour, minus the deferred half.
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
 
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
+use crate::core::klippy::extras::template::{Builtin, Context, PrinterView, Rt, Template};
 use crate::core::klippy::gcode::{
-    is_traditional_gcode, CommandHandler, GCodeDispatch, GCODE_OBJECT,
+    is_traditional_gcode, sync, CommandError, CommandHandler, GCodeDispatch, GcodeCommand,
+    GCODE_OBJECT,
 };
 use crate::core::klippy::load::section;
 use crate::core::klippy::printer::{Printer, PrinterObject};
+
+/// `cmd_SET_GCODE_VARIABLE_help` (`gcode_macro.py:163`).
+const SET_GCODE_VARIABLE_HELP: &str = "Set the value of a G-Code macro variable";
 
 // Both `[gcode_macro]` (the shared template holder) and every
 // `[gcode_macro <name>]` (a command) are valid.
@@ -66,26 +80,110 @@ impl PrinterObject for PrinterGCodeMacro {
     }
 }
 
-/// One `[gcode_macro <name>]`: the `variable_*` values its `get_status`
-/// reports (`gcode_macro.py:172-173`). The uppercased section name lives on
-/// the registered command, not here — the dispatcher already holds it.
+/// One `[gcode_macro <name>]`: the compiled body, the `variable_*` values its
+/// `get_status` reports (`gcode_macro.py:172-173`), and the recursion flag
+/// the command holds while it runs. The uppercased section name lives on the
+/// state as well, so both registered commands share it.
 #[derive(Debug)]
 pub struct GCodeMacro {
-    /// The `variable_*` options, keyed without the prefix and lowercased like
-    /// the parser's own option names (`gcode_macro.py:153-158`).
-    variables: BTreeMap<String, Value>,
+    /// Shared with the `SET_GCODE_VARIABLE` handler and the macro's own
+    /// command, which are registered before this object is returned.
+    state: Arc<MacroState>,
+}
+
+/// What a macro *is*, shared by its command, its variable setter and its
+/// `get_status` (`gcode_macro.py:124-173`).
+#[derive(Debug)]
+struct MacroState {
+    /// The command's uppercased name (`gcode_macro.py:130`).
+    alias: String,
+    /// The compiled `gcode` body.
+    template: Template,
+    /// The `variable_*` values, keyed without the prefix
+    /// (`gcode_macro.py:153-158`); `SET_GCODE_VARIABLE` writes them.
+    variables: Mutex<BTreeMap<String, Value>>,
+    /// Upstream's `in_script` flag (`gcode_macro.py:183`): set while this
+    /// macro runs, so reaching itself is refused instead of recursing.
+    in_script: AtomicBool,
+}
+
+impl MacroState {
+    /// Claim the run, or report the recursion upstream reports
+    /// (`gcode_macro.py:183-184`).
+    fn enter(&self) -> Result<MacroGuard<'_>, CommandError> {
+        if self.in_script.swap(true, Ordering::SeqCst) {
+            return Err(CommandError::new(format!(
+                "Macro {} called recursively",
+                self.alias
+            )));
+        }
+        Ok(MacroGuard(&self.in_script))
+    }
+
+    /// The render context upstream's `cmd` builds (`gcode_macro.py:186-190`):
+    /// the macro's variables first, then the globals that override them, then
+    /// `params` / `rawparams`.
+    fn context(
+        &self,
+        printer: &Arc<Printer>,
+        params: &HashMap<String, String>,
+        rawparams: &str,
+    ) -> Context {
+        let mut context = Context::new();
+        {
+            let variables = self
+                .variables
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            for (name, value) in variables.iter() {
+                context.insert(name.clone(), Rt::Json(value.clone()));
+            }
+        }
+        // `create_template_context` (`gcode_macro.py:101-108`): the `printer`
+        // status view, the two actions the corpus' bodies call, and `range`
+        // behind `{% for %}` (`exclude_object.cfg:92`).
+        context.insert(
+            "printer",
+            Rt::Printer(PrinterView::new(Arc::clone(printer))),
+        );
+        context.insert(
+            "action_respond_info",
+            Rt::Builtin(Builtin::RespondInfo(Arc::clone(printer))),
+        );
+        context.insert("action_raise_error", Rt::Builtin(Builtin::RaiseError));
+        context.insert("range", Rt::Builtin(Builtin::Range));
+        let map: serde_json::Map<String, Value> = params
+            .iter()
+            .map(|(key, value)| (key.clone(), json!(value)))
+            .collect();
+        context.insert("params", Rt::Json(Value::Object(map)));
+        context.insert("rawparams", Rt::Json(Value::String(rawparams.to_string())));
+        context
+    }
+}
+
+/// A macro run in progress: clears `in_script` however the run ends, the way
+/// upstream's `try/finally` does (`gcode_macro.py:186-190`).
+struct MacroGuard<'a>(&'a AtomicBool);
+
+impl Drop for MacroGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
 }
 
 impl GCodeMacro {
-    /// Read the section, enforce `rename_existing`'s load-time rules, and
-    /// register the macro as its command (`gcode_macro.py:124-162`).
+    /// Read the section, enforce `rename_existing`'s load-time rules, compile
+    /// the body, and register the macro as its command plus
+    /// `SET_GCODE_VARIABLE` (`gcode_macro.py:124-162`).
     ///
     /// # Errors
     /// A section name with more than one name token, a missing `gcode` body, a
-    /// `rename_existing` that names another command type, a `variable_*` value
-    /// that is not a literal, or a command name that is taken — upstream's
-    /// wordings, except the literal error, whose tail is this port's JSON
-    /// parser rather than Python's `ast.literal_eval`.
+    /// template outside [`template`]'s subset, a `rename_existing` that names
+    /// another command type, a `variable_*` value that is not a literal, or a
+    /// command name that is taken — upstream's wordings, except the two
+    /// literal errors, whose tail is this port's JSON parser rather than
+    /// Python's `ast.literal_eval`.
     fn new(config: &ConfigWrapper, printer: &Arc<Printer>) -> Result<Arc<Self>, ConfigError> {
         let identifier = config.identifier();
         let tokens: Vec<&str> = identifier.split_whitespace().collect();
@@ -101,11 +199,12 @@ impl GCodeMacro {
         let name = tokens[1];
         let alias = name.to_uppercase();
 
-        // The body: upstream compiles it into a template here
-        // (`load_template(config, 'gcode')`, `gcode_macro.py:132`); this port
-        // reads it for the option check and does not render it (see the module
-        // docs).
-        config.get("gcode", None)?;
+        // The body, compiled here the way `load_template` compiles it
+        // upstream (`gcode_macro.py:132`), before the options below are read.
+        let body = config.get("gcode", None)?;
+        let template = Template::parse(&format!("{identifier}:gcode"), &body)
+            .map_err(|error| ConfigError::new(error.to_string()))?;
+
         let rename_existing = config.get_str("rename_existing");
         let description = config.get("description", Some("G-Code macro"))?;
 
@@ -118,39 +217,6 @@ impl GCodeMacro {
                     "G-Code macro rename of different types ('{alias}' vs '{rename}')"
                 )));
             }
-        } else {
-            let gcode = printer
-                .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
-                .expect("the loader registers `gcode` first");
-            let weak = Arc::downgrade(printer);
-            let handler: CommandHandler = Arc::new({
-                let alias = alias.clone();
-                move |_gcmd| {
-                    let weak = weak.clone();
-                    let alias = alias.clone();
-                    Box::pin(async move {
-                        // The body is not rendered yet (module docs): say so
-                        // where users look instead of silently doing nothing.
-                        if let Some(printer) = weak.upgrade() {
-                            if let Some(gcode) =
-                                printer.lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
-                            {
-                                gcode.respond_info(
-                                    &format!(
-                                        "gcode_macro {alias}: the macro body was not run; \
-                                         template rendering is not implemented"
-                                    ),
-                                    true,
-                                );
-                            }
-                        }
-                        Ok(())
-                    })
-                }
-            });
-            gcode
-                .register_command(&alias, handler, Some(&description), false)
-                .map_err(ConfigError::new)?;
         }
 
         // `variable_*`: read every prefixed option, keep its literal
@@ -167,13 +233,96 @@ impl GCodeMacro {
             variables.insert(name, value);
         }
 
-        Ok(Arc::new(Self { variables }))
+        let state = Arc::new(MacroState {
+            alias: alias.clone(),
+            template,
+            variables: Mutex::new(variables),
+            in_script: AtomicBool::new(false),
+        });
+
+        let gcode = printer
+            .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+            .expect("the loader registers `gcode` first");
+
+        if rename_existing.is_none() {
+            // The macro is its command (`gcode_macro.py:143-147`): render the
+            // body and hand the text back to the dispatcher
+            // (`TemplateWrapper.run_gcode_from_command`, `:79-80`).
+            let weak = Arc::downgrade(printer);
+            let state = Arc::clone(&state);
+            let handler: CommandHandler = Arc::new(move |gcmd: &GcodeCommand| {
+                let weak = weak.clone();
+                let state = Arc::clone(&state);
+                let params = gcmd.get_command_parameters().clone();
+                let rawparams = gcmd.get_raw_command_parameters();
+                Box::pin(async move {
+                    let _guard = state.enter()?;
+                    let printer = weak
+                        .upgrade()
+                        .ok_or_else(|| CommandError::new("printer is gone"))?;
+                    let mut context = state.context(&printer, &params, &rawparams);
+                    let script = state
+                        .template
+                        .render(&mut context)
+                        .map_err(|error| CommandError::new(error.to_string()))?;
+                    let gcode = printer
+                        .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+                        .ok_or_else(|| CommandError::new("the gcode dispatcher is gone"))?;
+                    gcode.run_script_from_command(&script).await
+                })
+            });
+            gcode
+                .register_command(&alias, handler, Some(&description), false)
+                .map_err(ConfigError::new)?;
+        }
+
+        // `SET_GCODE_VARIABLE MACRO=<this section's name>` — a mux value per
+        // macro, registered whether or not the macro renames (`:148-150`).
+        let setter_state = Arc::clone(&state);
+        let section_name = name.to_string();
+        let setter: CommandHandler = sync(move |gcmd: &GcodeCommand| {
+            let variable = gcmd.get_str("VARIABLE")?;
+            let value = gcmd.get_str("VALUE")?;
+            let mut variables = setter_state
+                .variables
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            if !variables.contains_key(&variable) {
+                return Err(CommandError::new(format!(
+                    "Unknown gcode_macro variable '{variable}'"
+                )));
+            }
+            let literal: Value = serde_json::from_str(&value).map_err(|error| {
+                CommandError::new(format!(
+                    "Unable to parse '{value}' as a literal: {error} in '{}'",
+                    gcmd.commandline()
+                ))
+            })?;
+            variables.insert(variable, literal);
+            Ok(())
+        });
+        gcode
+            .register_mux_command(
+                "SET_GCODE_VARIABLE",
+                "MACRO",
+                Some(&section_name),
+                setter,
+                Some(SET_GCODE_VARIABLE_HELP),
+            )
+            .map_err(ConfigError::new)?;
+
+        Ok(Arc::new(Self { state }))
     }
 
     /// The `variable_*` values (`gcode_macro.py:172-173`).
     fn variables_status(&self) -> Value {
+        let variables = self
+            .state
+            .variables
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         Value::Object(
-            self.variables
+            variables
                 .iter()
                 .map(|(name, value)| (name.clone(), value.clone()))
                 .collect(),

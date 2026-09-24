@@ -594,9 +594,11 @@ mod linalg_tests {
     #[test]
     fn mat_mul_transp_matches_the_reference_product() {
         let a = vec![vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 6.0]];
+        // `mat_mul_transp(a)` is `a · aᵀ` (upstream dots each pair of rows), so
+        // the reference product is `mat_mat_mul(a, mat_transp(a))`, not `aᵀ · a`.
         let fast = mat_mul_transp(&a);
         let at = mat_transp(&a);
-        let slow = mat_mat_mul(&at, &a).expect("shapes line up");
+        let slow = mat_mat_mul(&a, &at).expect("shapes line up");
         assert_eq!(fast.len(), slow.len());
         for (row_f, row_s) in fast.iter().zip(&slow) {
             for (f, s) in row_f.iter().zip(row_s) {

@@ -37,6 +37,9 @@ const TOOLHEAD_OBJECT: &str = "toolhead";
 /// The `configfile` object, for the autosave write-back.
 const CONFIGFILE_OBJECT: &str = "configfile";
 
+/// The object name the probe family looks the manual probe up under.
+pub(crate) const MANUAL_PROBE_OBJECT: &str = "manual_probe";
+
 /// The Z axis index, as [`Coord`] numbers them.
 const Z_AXIS: usize = 2;
 
@@ -187,6 +190,28 @@ impl ManualProbe {
     /// The `[stepper_z] position_endstop` this printer calibrates, if any.
     pub fn z_position_endstop(&self) -> Option<f64> {
         self.z_position_endstop
+    }
+
+    /// Create the object when the config never wrote `[manual_probe]`.
+    ///
+    /// Upstream's toolhead loads `manual_probe` unconditionally
+    /// (`klippy/toolhead.py:293`), which is why `PROBE_CALIBRATE` and
+    /// `Z_ENDSTOP_CALIBRATE` work without the section; `config` is the
+    /// `[printer]` wrapper the toolhead was built from, and the target's
+    /// `position_endstop` is still reachable as its sibling.
+    ///
+    /// # Errors
+    /// As [`ManualProbe::new`], or when the object name is taken.
+    pub fn ensure(
+        printer: &Arc<Printer>,
+        config: &ConfigWrapper,
+    ) -> Result<Arc<ManualProbe>, ConfigError> {
+        if let Some(existing) = printer.lookup_object_as::<ManualProbe>(MANUAL_PROBE_OBJECT) {
+            return Ok(existing);
+        }
+        let object = Arc::new(ManualProbe::new(config, printer)?);
+        printer.add_object(MANUAL_PROBE_OBJECT, object.clone())?;
+        Ok(object)
     }
 
     /// Start the interactive helper with a caller's finalizer
@@ -583,6 +608,18 @@ impl std::fmt::Debug for ManualProbe {
             .field("z_position_endstop", &self.z_position_endstop)
             .finish()
     }
+}
+
+/// Load the object when the config has no `[manual_probe]` section (the
+/// toolhead does this unconditionally, see [`ManualProbe::ensure`]).
+///
+/// # Errors
+/// As [`ManualProbe::ensure`].
+pub(crate) fn ensure(
+    printer: &Arc<Printer>,
+    config: &ConfigWrapper,
+) -> Result<Arc<ManualProbe>, ConfigError> {
+    ManualProbe::ensure(printer, config)
 }
 
 /// Upstream's `load_config` for `[manual_probe]`.

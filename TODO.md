@@ -621,9 +621,12 @@ FW5a–f / FW6a–f 已把「cartesian + 假 MCU 的 `G1`/`G28`」跑通并归�
       （lagrange/bicubic、`mesh_pps`）、faulty 区域替换、fade 与 move 的 z 补偿、profile 命令
       与 `bed_mesh/dump_mesh` 端点）、`bed_tilt.py`、`quad_gantry_level.py`、`z_tilt.py`。
 - [ ] **探针端到端（下一单元）**：`bed_mesh.test` 与 `z_virtual_endstop.test` 仍在 `IGNORED`，
-      因模拟器上探针回路尚未走通——前者报 `No trigger on probe after full movement`（触发未
-      回到会话），后者报 `Printer is not ready`（疑与 `probing_move` 取出 toolhead 槽位、
-      而标定循环并发 `move_to` 有关）。两个症状都在 2026-09-23 自主时段的 “bed_mesh 半程” 提交后实测。
+      但**探针链路本身已在假 MCU 上验收**——`upstream.rs` 新增的 5 条聚焦测试覆盖：普通端停 `G28 Z`、
+      `probe:z_virtual_endstop` 的 `G28 Z`（即本批的检查点）、`G28 + PROBE`、
+      `G28 + PROBE_CALIBRATE/TESTZ/ACCEPT`、`G28 + BED_MESH_CALIBRATE`（3×3）。两条语料仍失败的原因是
+      **假 MCU 的端停时序**：它在 `endstop_home` 就绪的瞬间就触发 trsync，探针移动因此从未真正走过
+      （7×7 网格报 `No trigger on probe after full movement`，探针端停报 `Probe triggered prior to
+      movement`）。要修的是：探针初始为未触发、触发落在移动过程中——即 TODO F8 的「响应器式假 MCU」。
 - [ ] 螺丝：`bed_screws.py`、`screws_tilt_adjust.py`。
 - [ ] 校准：`delta_calibrate.py`、`axis_twist_compensation.py`、`skew_correction.py`、
       `z_thermal_adjust.py`、`tuning_tower.py`。

@@ -406,11 +406,16 @@ mod tests {
     const IGNORED: &[&str] = &[
         "bed_screws.test",
         "bltouch.test",
-        // The `[bed_mesh]` / `[probe]` configs now load and their commands run,
-        // but the probe endstop never reports a trigger through the fake MCU yet
-        // ("No trigger on probe after full movement") and the interactive path
-        // reports "Printer is not ready" — TODO H9, next unit (probe/homing
-        // end-to-end on the simulator, and the toolhead slot during probing).
+        // The probe path itself works end-to-end on the fake MCU — the focused
+        // tests below home on a plain endstop, home through
+        // `probe:z_virtual_endstop`, run `PROBE`, `PROBE_CALIBRATE`/`TESTZ`/
+        // `ACCEPT` and a 3x3 `BED_MESH_CALIBRATE`. What these two runs still hit
+        // is the fake MCU's endstop *timing*: it fires the trsync the moment
+        // `endstop_home` is armed, so a probing move never travels before the
+        // trigger ("No trigger on probe after full movement" on the 7x7 mesh,
+        // "Probe triggered prior to movement" on the probe endstop). Modeling
+        // that trigger (open before the move, hit during it) is the "responder
+        // fake MCU" item in TODO F8.
         "bed_mesh.test",
         "z_virtual_endstop.test",
         "corexyuv.test",
@@ -833,6 +838,114 @@ mod tests {
             ignored,
             failures.join("\n  ")
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // Focused end-to-end checks: does an endstop actually reach a homing move
+    // on the fake MCU? The corpus never exercises this on its own (every config
+    // that homes fails earlier on a missing section), so `G28` is pinned here —
+    // first on a plain MCU endstop, then through `probe:z_virtual_endstop`.
+    // ---------------------------------------------------------------------
+
+    /// A minimal cartesian printer whose `[stepper_z]` uses `z_endstop_pin`.
+    fn homing_config(dict: &Path, z_endstop_pin: &str, probe: bool, extra: &str) -> Config {
+        let probe_section = if probe {
+            "[probe]\npin: ^PC3\nz_offset: 1.0\n"
+        } else {
+            ""
+        };
+        let text = format!(
+            "[mcu]\ntest: dict={dict}\n\
+             [printer]\nkinematics: cartesian\nmax_velocity: 300\nmax_accel: 3000\n\
+             max_z_velocity: 15\nmax_z_accel: 100\n\
+             {probe_section}\
+             [stepper_x]\nstep_pin: PA0\ndir_pin: PA1\nrotation_distance: 40\nmicrosteps: 16\n\
+             endstop_pin: ^PA2\nposition_endstop: 0\nposition_min: 0\nposition_max: 200\nhoming_speed: 50\n\
+             [stepper_y]\nstep_pin: PB0\ndir_pin: PB1\nrotation_distance: 40\nmicrosteps: 16\n\
+             endstop_pin: ^PB2\nposition_endstop: 0\nposition_min: 0\nposition_max: 200\nhoming_speed: 50\n\
+             [stepper_z]\nstep_pin: PC0\ndir_pin: PC1\nrotation_distance: 40\nmicrosteps: 16\n\
+             endstop_pin: {z_endstop_pin}\nposition_endstop: 0.5\nposition_min: 0\nposition_max: 200\nhoming_speed: 10\n\
+             {extra}",
+            dict = dict.display(),
+            extra = extra,
+        );
+        Config::from_text(&text)
+            .expect("the focused config parses")
+            .0
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_plain_endstop_reaches_the_homing_move() {
+        let Some(dict) = dictionary_path("atmega2560.dict") else {
+            return;
+        };
+        let config = homing_config(&dict, "^PC2", false, "");
+
+        let gcode = run_phases(&config, "focused-plain-home.cfg", "G28 Z\n")
+            .await
+            .expect("the machine comes up");
+        assert!(gcode.is_ok(), "{gcode:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn probe_calibrate_and_accept_complete_on_the_fake_mcu() {
+        let Some(dict) = dictionary_path("atmega2560.dict") else {
+            return;
+        };
+        let config = homing_config(&dict, "probe:z_virtual_endstop", true, "");
+
+        let gcode = run_phases(
+            &config,
+            "focused-probe-calibrate.cfg",
+            "G28\nPROBE_CALIBRATE\nTESTZ Z=-1\nACCEPT\n",
+        )
+        .await
+        .expect("the machine comes up");
+        assert!(gcode.is_ok(), "{gcode:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_bed_mesh_calibration_completes_on_the_fake_mcu() {
+        let Some(dict) = dictionary_path("atmega2560.dict") else {
+            return;
+        };
+        let config = homing_config(
+            &dict,
+            "probe:z_virtual_endstop",
+            true,
+            "[bed_mesh]\nmesh_min: 10,10\nmesh_max: 60,60\nprobe_count: 3,3\n",
+        );
+
+        let gcode = run_phases(&config, "focused-bed-mesh.cfg", "G28\nBED_MESH_CALIBRATE\n")
+            .await
+            .expect("the machine comes up");
+        assert!(gcode.is_ok(), "{gcode:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_probe_command_completes_on_the_fake_mcu() {
+        let Some(dict) = dictionary_path("atmega2560.dict") else {
+            return;
+        };
+        let config = homing_config(&dict, "probe:z_virtual_endstop", true, "");
+
+        let gcode = run_phases(&config, "focused-probe-command.cfg", "G28\nPROBE\n")
+            .await
+            .expect("the machine comes up");
+        assert!(gcode.is_ok(), "{gcode:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_probe_virtual_endstop_reaches_the_homing_move() {
+        let Some(dict) = dictionary_path("atmega2560.dict") else {
+            return;
+        };
+        let config = homing_config(&dict, "probe:z_virtual_endstop", true, "");
+
+        let gcode = run_phases(&config, "focused-probe-home.cfg", "G28 Z\n")
+            .await
+            .expect("the machine comes up");
+        assert!(gcode.is_ok(), "{gcode:?}");
     }
 }
 

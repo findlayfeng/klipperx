@@ -29,7 +29,9 @@ use tracing::warn;
 
 use crate::core::klippy::config::{ConfigError, ConfigWrapper, PrinterConfig};
 use crate::core::klippy::event::KlippyEvent;
-use crate::core::klippy::extras::manual_probe::{FinalizeCallback, ManualProbe};
+use crate::core::klippy::extras::manual_probe::{
+    FinalizeCallback, ManualProbe, MANUAL_PROBE_OBJECT,
+};
 use crate::core::klippy::extras::toolhead::ToolHeadObject;
 use crate::core::klippy::gcode::{CommandError, GCodeDispatch, GcodeCommand, GCODE_OBJECT};
 use crate::core::klippy::load::section;
@@ -50,9 +52,6 @@ const VIRTUAL_ENDSTOP: &str = "z_virtual_endstop";
 
 /// The toolhead object, as the loader registers `[printer]`.
 const TOOLHEAD_OBJECT: &str = "toolhead";
-
-/// The `manual_probe` object, for `PROBE_CALIBRATE`.
-const MANUAL_PROBE_OBJECT: &str = "manual_probe";
 
 /// The `configfile` object, for the calibration write-back.
 const CONFIGFILE_OBJECT: &str = "configfile";
@@ -604,11 +603,6 @@ impl PrinterProbe {
             y: self.options.y_offset,
             z: self.options.z_offset,
         }
-    }
-
-    /// The session's parameters for `gcmd` (`get_probe_params`).
-    pub(crate) fn probe_params(&self, gcmd: &GcodeCommand) -> Result<ProbeParams, CommandError> {
-        self.session.defaults.from_command(gcmd)
     }
 
     /// Open a probe session (`start_probe_session`).

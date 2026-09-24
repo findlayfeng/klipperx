@@ -583,6 +583,11 @@ mod tests {
                 // toolhead up by name at ready — so only the list order shows
                 // it.
                 "gcode_move",
+                // `manual_probe` is on the same "default modules" list
+                // (`toolhead.py:293`), so it lands here too — which is what
+                // makes `PROBE_CALIBRATE` work without a `[manual_probe]`
+                // section.
+                "manual_probe",
                 "toolhead"
             ]
         );

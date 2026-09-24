@@ -409,7 +409,7 @@ FW5a–f / FW6a–f 已把「cartesian + 假 MCU 的 `G1`/`G28`」跑通并归�
       `temperature_combined`；`debug_read` 系列改用异步 pre-build 钩子并在虚拟 MCU 上验证。
       回归里不再有 `Unknown temperature sensor`。
 
-**当前失败原因统计**（`KLIPPERX_UPSTREAM_ALL=1` 实跑，2026-09-23：**186 次失败**、51 次通过、
+**当前失败原因统计**（`KLIPPERX_UPSTREAM_ALL=1` 实跑，2026-09-23：**185 次失败**、52 次通过、
 2 条因未构建 `pru` 字典不计，合计 239；下表为**选项名大小写修复后**的分布——49 次
 `must be specified` 归零但总数不变、首因整体后移，见[复盘](docs/work-log/2026-09-22-upstream-regression-failures.md#复盘计数口径与重排后补)
 的「收益不可加」）：
@@ -418,7 +418,7 @@ FW5a–f / FW6a–f 已把「cartesian + 假 MCU 的 `G1`/`G28`」跑通并归�
 |---|---|---|
 | 温度传感器（`temperature_*`） | **0** | T7（已完成） |
 | 选项名大小写（`optionxform`） | **0** | 已对齐（49 → 0） |
-| `Unknown pin chip name 'probe'`（余量靠 `[bltouch]`/`[smart_effector]`/eddy 注册 chip） | 22 | T4 / H9（M2/M3/M5） |
+| `Unknown pin chip name 'probe'`（余量靠 `[bltouch]`/`[smart_effector]`/eddy 注册 chip） | 20 | T4 / H9（M2/M3/M5） |
 | TMC：段 23 + pin chip 7 | 30 | T6 / H5 |
 | `Error loading kinematics`（delta / generic_cartesian / rotary_delta / polar / winch / deltesian） | 21 | T5（C1c-2/3/4） |
 | `Section 'display'` | 21 | T9 / H8 |
@@ -436,7 +436,10 @@ FW5a–f / FW6a–f 已把「cartesian + 假 MCU 的 `G1`/`G28`」跑通并归�
 | 运行期失败（`Move out of range`：`generic-simulavr`） | 1 | 运行期（非装载） |
 | `Section 'extruder'`（T3 旧首位） | **0** | T3 已消 |
 
-（本表随每个单元更新：2026-09-23 U3a 后实测。逐单元的前后变化写在各自提交信息里。）
+（本表随每个单元更新：2026-09-23 探针链路单元后实测；除 probe 行外其余各行的拆分仍取 U3a 时点，
+后续单元只会把首因往后推、总数不变，逐单元变化见各自提交信息。已转绿的语料：`linuxtest.test`、
+`commands.test`、`out_of_bounds.test`、`bed_mesh.test`/`z_virtual_endstop.test` 之外的
+`printers.test → printer-wanhao-duplicator-i3-plus-mark2-2019`。）
 
 **T3 之后按首次失败分组的工单**：
 

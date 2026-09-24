@@ -379,6 +379,8 @@ mod tests {
                 "pca9533",
                 "pca9632",
                 "spi_device",
+                "stepper_arm",
+                "stepper_bed",
                 "stepper_x",
                 "stepper_y",
                 "stepper_z",
@@ -400,6 +402,8 @@ mod tests {
         assert_eq!(by_id("mcu").phase, Phase::Early);
         assert_eq!(by_id("output_pin").phase, Phase::Generic);
         assert_eq!(by_id("stepper_x").phase, Phase::Late);
+        assert_eq!(by_id("stepper_arm").phase, Phase::Late);
+        assert_eq!(by_id("stepper_bed").phase, Phase::Late);
         assert_eq!(by_id("printer").phase, Phase::Late);
         assert_eq!(by_id("printer").object, Some("toolhead"));
         assert!(FACTORIES

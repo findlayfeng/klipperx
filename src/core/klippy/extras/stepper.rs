@@ -194,6 +194,21 @@ impl PrinterStepper {
         // (`parse_step_distance`, `klippy/stepper.py:307-323`).
         let step_dist = rotation_distance / (full_steps as f64 * microsteps as f64 * gear_ratio);
 
+        let pins = printer
+            .lookup_object_as::<PrinterPins>(PINS_OBJECT)
+            .expect("the loader registers `pins` before any section");
+        // The endstop is built first: when it is a virtual one (the probe's
+        // `z_virtual_endstop`), it supplies `position_endstop`, and upstream
+        // prefers that over the section's option
+        // (`klippy/stepper.py:336-343`, `MCU_endstop.get_position_endstop`).
+        let endstop = match config.get_str("endstop_pin") {
+            Some(pin) => Some(
+                pins.setup_endstop(&pin, None)
+                    .map_err(|err| ConfigError::new(format!("{identifier}: {err}")))?,
+            ),
+            None => None,
+        };
+
         // The rail geometry (`position_min/max`, `position_endstop`, the homing
         // speeds) belongs to the rail's **primary** section. A numbered sibling
         // (`[stepper_z1]`) is a bare motor: `LookupMultiRail` adds it to the
@@ -209,7 +224,13 @@ impl PrinterStepper {
                 Some(position_min),
                 None,
             )?;
-            let position_endstop = config.get_float("position_endstop", Some(position_min))?;
+            let position_endstop = match endstop
+                .as_ref()
+                .and_then(|endstop| pins.virtual_endstop_position(endstop))
+            {
+                Some(virtual_position) => virtual_position,
+                None => config.get_float("position_endstop", Some(position_min))?,
+            };
             if position_endstop < position_min || position_endstop > position_max {
                 return Err(ConfigError::new(format!(
                     "position_endstop in section '{identifier}' must be between position_min and position_max"
@@ -234,21 +255,11 @@ impl PrinterStepper {
             (RailParams::default(), HomingInfo::default())
         };
 
-        let pins = printer
-            .lookup_object_as::<PrinterPins>(PINS_OBJECT)
-            .expect("the loader registers `pins` before any section");
         // The step pin's `!` is upstream's `invert_step` (`0`/`1`); the direction
         // pin's `!` is applied on the wire by the resource.
         let mcu_stepper = pins
             .setup_stepper(&step_pin, &dir_pin, step_pulse_duration)
             .map_err(|err| ConfigError::new(format!("{identifier}: {err}")))?;
-        let endstop = match config.get_str("endstop_pin") {
-            Some(pin) => Some(
-                pins.setup_endstop(&pin, None)
-                    .map_err(|err| ConfigError::new(format!("{identifier}: {err}")))?,
-            ),
-            None => None,
-        };
         // Register the stepper with the endstop's trigger dispatch now, at load:
         // the dispatch creates a per-MCU trsync (and the config callback that
         // reserves its oid) before the configuration is built. This is also

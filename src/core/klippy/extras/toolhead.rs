@@ -1051,10 +1051,11 @@ async fn home_axis(
 /// Events follow upstream order: `homing_move_begin` **before** any
 /// sampling or movement, `homing_move_end` after.
 ///
-/// Returns the toolhead's commanded position at the end of the move.  This
-/// is the position the planner computed for `target` — not a position
-/// derived from trigger-step counting (that infrastructure does not exist
-/// in this port yet).
+/// Returns the position the move stopped at: the drip loop stops queueing when
+/// the trigger is seen, and the queued move's position at that time is what it
+/// reports (and what the toolhead's commanded position is set to). Upstream
+/// reads the firmware's stepper positions at the trigger clock instead; the
+/// corpus's fake MCUs have no step model, so this stands in for that.
 ///
 /// # Errors
 /// - `"Probe triggered prior to movement"` when the endstop was already
@@ -1130,8 +1131,43 @@ async fn probing_move(
         return Err(CommandError::new("No trigger on probe after full movement"));
     }
 
-    // Return the commanded position after the move.
-    Ok(connected.toolhead.commanded_pos())
+    // Where the move actually stopped: the trigger is what ends the drip loop,
+    // so the queued move's position at the last flushed time is where the
+    // carriage was when the endstop fired. Upstream asks the firmware for the
+    // stepper positions at the trigger clock (`homing.py:122-141`); the corpus's
+    // fake MCUs have no step model (`stepper_get_position` answers zero), so
+    // this is the honest stand-in. It matters beyond accuracy: leaving the
+    // commanded position at the probe *target* made a following probe start
+    // there, i.e. a zero-length move, which is upstream's "Probe triggered
+    // prior to movement" error.
+    let stopped = {
+        let trapq = connected.toolhead.trapq();
+        let moves = trapq.moves();
+        // The newest segment that has started by `flush_time` is the one the
+        // carriage is in; a plain forward scan stops at the position marker
+        // `set_position` left behind, which sits at the origin.
+        let mut found = None;
+        for segment in moves.iter().rev() {
+            if segment.print_time <= flush_time {
+                let into = if flush_time <= segment.end_time() {
+                    flush_time - segment.print_time
+                } else {
+                    segment.move_t
+                };
+                found = Some(segment.coord(into));
+                break;
+            }
+        }
+        found
+    };
+    let mut result = connected.toolhead.commanded_pos();
+    if let Some(stopped) = stopped {
+        result.set_axis(0, stopped.x());
+        result.set_axis(1, stopped.y());
+        result.set_axis(Z_AXIS, stopped.z());
+        connected.toolhead.set_position(result, &[Z_AXIS]);
+    }
+    Ok(result)
 }
 
 fn command_error(err: McuError) -> CommandError {
@@ -1792,7 +1828,10 @@ mod tests {
         (connected, printer)
     }
 
-    /// `probing_move` stops on trigger and returns the commanded position.
+    /// `probing_move` stops on trigger and returns where it stopped: past the
+    /// start and at or before the target, because the drip loop stops queueing
+    /// the moment the trigger is seen (upstream reads the firmware's trigger
+    /// clock instead; see the function's note).
     #[tokio::test(flavor = "multi_thread")]
     async fn test_probing_move_stops_on_trigger() {
         let (mut connected, printer) = probing_connected();
@@ -1805,11 +1844,11 @@ mod tests {
 
         let result = probing_move(&mut connected, &endstop, target, speed, &printer).await;
 
-        assert!(result.is_ok());
-        assert_eq!(
-            result.unwrap(),
-            target,
-            "returned position should match target"
+        let result = result.expect("the probing move completes");
+        assert!(
+            result.x() >= 0.0 && result.x() < target.x(),
+            "the stop position is short of the target (here: the start, because \
+             this fake endstop fires before the loop queues anything), got {result:?}"
         );
     }
 
@@ -1907,7 +1946,8 @@ mod tests {
         );
     }
 
-    /// `probing_move` sets the toolhead position to the target after trigger.
+    /// `probing_move` leaves the toolhead at the position it stopped at, so a
+    /// following probe still has room to move down.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_probing_move_sets_position_on_trigger() {
         let (mut connected, printer) = probing_connected();
@@ -1917,12 +1957,18 @@ mod tests {
         let printer = Arc::downgrade(&printer);
 
         endstop.fire();
-        let _ = probing_move(&mut connected, &endstop, target, speed, &printer).await;
+        let result = probing_move(&mut connected, &endstop, target, speed, &printer)
+            .await
+            .expect("the probing move completes");
 
         assert_eq!(
             connected.toolhead.commanded_pos(),
-            target,
-            "toolhead position should match target after probe"
+            result,
+            "the commanded position follows the stop position"
+        );
+        assert!(
+            result.x() < target.x(),
+            "the toolhead stops short of the target, got {result:?}"
         );
     }
 }

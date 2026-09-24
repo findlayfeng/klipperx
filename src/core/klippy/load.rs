@@ -343,6 +343,7 @@ mod tests {
                 "adc_temperature",
                 "thermistor",
                 "bed_mesh",
+                "bed_tilt",
                 "board_pins",
                 "manual_probe",
                 "probe",

@@ -54,3 +54,40 @@ pub fn load_config(
     let object = DisplayStatus::default();
     Ok(Arc::new(object))
 }
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::klippy::config::access::AccessTracking;
+    use crate::core::klippy::config::{check_unused, Config};
+    use crate::core::klippy::reactor::ManualReactor;
+
+    /// The bare `[display_status]` section loads with no options to read —
+    /// upstream's class reads none of its own either
+    /// (`display_status.py:12-16`), so `check_unused` has nothing to flag.
+    #[test]
+    fn the_bare_section_loads_and_leaves_no_option_unread() {
+        let text = "[display_status]\n";
+        let (config, _) = Config::from_text(text).expect("the section parses");
+        let sect = config.get_section("display_status").expect("the section");
+        let access = AccessTracking::shared();
+        let wrapper = ConfigWrapper::new(sect, Arc::clone(&access));
+
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        let object = load_config(&wrapper, &printer).expect("the section loads");
+        check_unused(&config, &access, &["display_status".to_string()])
+            .expect("no option is left unread");
+
+        // No `M73` has run and no `virtual_sdcard` progress exists yet, so
+        // the fallback progress is `0.` and the message is unset
+        // (`display_status.py:27-41`).
+        assert_eq!(
+            object.get_status(0.0),
+            json!({ "progress": 0., "message": Value::Null })
+        );
+    }
+}

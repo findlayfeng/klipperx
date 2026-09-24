@@ -377,7 +377,7 @@ API 本身在 `crates/klippy-api/src/`：
 |------|------|
 | `frame.rs` | `Frame` 与 `FrameStream`：Klipper 的帧格式（长度、序号、载荷、CRC、`0x7e` SYNC）与分包重组——**所有字节流设备共用**，新设备不要自己再实现一遍 |
 | `error.rs` | 主机错误词汇：`KlippyError`（Connection/Protocol/Request/Parse/Config/Internal）与 `ConfigError`——决定错误把机器带到哪个状态 |
-| `mathutil.rs` | 运动栈共用的数值帮助（`Coord` 等，上游散在 `gcode.py`） |
+| `mathutil.rs` | 运动栈共用的数值帮助（`Coord` 等，上游散在 `gcode.py`），以及 `coordinate_descent`（上游 `mathutil.py:16-49` 的近似最小二乘：步长 `1.0` 起、`>1e-5` 与万轮上限、改善 `*1.1`/不改善 `*0.9`）——H9 调平族 `z_tilt`/`bed_tilt` 平面拟合的依赖 |
 | `upstream.rs` | 上游 `.test` 语料的 harness（`#[cfg(test)]`）：语料解析、缺口报告、`IGNORED` 守卫、端到端运行，见[回归测试](regression-tests.md) |
 
 ## 二进制

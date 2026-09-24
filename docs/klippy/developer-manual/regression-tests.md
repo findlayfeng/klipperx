@@ -188,8 +188,8 @@ connect_file(输出文件, 字典):
 | 判定 | 次数 | 原因 |
 |------|------|------|
 | 因字典未构建跳过 | 2 | `printers.test` 中引用 `pru` 的两条运行（默认不编 `pru`） |
-| 因忽略列表跳过 | 232 | 尚未落地的配置节/运动学（32 个 `.test` 文件） |
-| 实际执行 | **5** | `linuxtest.test`（T1）、`commands.test`、`out_of_bounds.test`（b39750f）、`bed_mesh.test` 与 `z_virtual_endstop.test`（探针链路单元），**全部通过** |
+| 因忽略列表跳过 | 230 | 尚未落地的配置节/运动学（30 个 `.test` 文件） |
+| 实际执行 | **7** | `linuxtest.test`（T1）、`commands.test`、`out_of_bounds.test`（b39750f）、`bed_mesh.test`、`z_virtual_endstop.test`（探针链路单元）、`z_tilt.test`、`quad_gantry_level.test`（H9 调平族），**全部通过** |
 
 上游 `configparser` 的 `optionxform = str.lower` 已对齐（`mod.rs` 存储侧小写 + `section.rs` 查询侧小写），`Option 'pid_Kp' … must be specified` 类的 49 次回归失败已归零；`must be specified` 错误文案保留调用方传入的大小写，`is not valid` 与 `Section '…' is not valid` 使用存储侧小写。
 
@@ -280,9 +280,12 @@ harness 把每个 `[mcu]` / `[mcu <name>]` 的传输键换成 `test: dict=<字�
 `KLIPPERX_UPSTREAM_ALL=1` **只作用于这张列表**：它让字典齐备的运行无视忽略判定并报出失败，
 **不会**让因字典未构建而跳过的运行跑起来（那是构建阶段的事，见上一节）。
 
-当前 32 条（`linuxtest.test` 已在 T1 转绿；`commands.test`、`out_of_bounds.test` 随 `gcode_move`
+当前 30 条（`linuxtest.test` 已在 T1 转绿；`commands.test`、`out_of_bounds.test` 随 `gcode_move`
 与 `EXTRUDER` 默认项在 b39750f 转绿；`bed_mesh.test`、`z_virtual_endstop.test` 在探针链路单元转绿；
-其余文件仍因缺节留在列表里）。
+`z_tilt.test`、`quad_gantry_level.test` 在 H9 调平族转绿；其余文件仍因缺节留在列表里）。
+
+`multi_z.test` 有裁决记录：配置已能装载，但 g-code 阶段仍失败（`no available capacity`，且它需要
+`STEPPER_BUZZ`——M7），**保留在忽略列表**，移除会让默认回归转红。
 
 失败原因的分组、运动学细分与 `KLIPPERX_UPSTREAM_ALL=1` 的完整失败日志，统一记在
 [上游回归测试失败原因分析](../../work-log/2026-09-22-upstream-regression-failures.md)；

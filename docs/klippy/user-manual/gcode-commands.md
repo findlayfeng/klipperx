@@ -501,6 +501,26 @@ SPI_SEND     DEVICE=flash DATA=04          // spi send ok
 
 与 `Z_TILT_ADJUST`/`QUAD_GANTRY_LEVEL` 不同，它**没有** `RETRIES`/`RETRY_TOLERANCE`，也不调整电机。
 
+### Z_TILT_ADJUST — 多 Z 电机调平（`[z_tilt]`）
+
+探测若干点，按平面拟合算出每个 Z 电机的调整量，逐个脱挂/挂回依次移动电机使床面（相对喷嘴）水平。
+
+| 参数 | 说明 |
+|------|------|
+| `METHOD` | `automatic`（默认）或 `manual`（`G1` + `ACCEPT` 手动测点） |
+| `HORIZONTAL_MOVE_Z` | 覆盖段内 `horizontal_move_z` |
+| `RETRIES` / `RETRY_TOLERANCE` | 覆盖段内 `retries` / `retry_tolerance`（范围 0..30 / 0..1） |
+| `PROBE_SPEED` / `LIFT_SPEED` / `SAMPLES` / `SAMPLE_RETRACT_DIST` / `SAMPLES_TOLERANCE` / `SAMPLES_TOLERANCE_RETRIES` / `SAMPLES_RESULT` | 自动模式透传给探针 |
+
+`get_status` 报 `applied`（本轮是否调整过；`stepper_enable:motor_off` 会复位）。
+
+### QUAD_GANTRY_LEVEL — 四点龙门调平（`[quad_gantry_level]`）
+
+4 个探测点 + 2 个 `gantry_corners`，用精确两点直线拟合求四角高度，按差值逐电机调整；调整量超过
+`max_adjust`（默认 4.0）会中止并报错。参数与 `Z_TILT_ADJUST` 相同（`METHOD`/`HORIZONTAL_MOVE_Z`/
+`RETRIES`/`RETRY_TOLERANCE` + 探针透传组）。注意两个与上游一致的细节：段内 `horizontal_move_z`
+**不**被命令行 `HORIZONTAL_MOVE_Z` 覆盖；重试用的是**机架相对高度**而非原始探测 Z。
+
 ## 未注册命令的处理
 
 没有命中处理器的命令走默认处理器（对应上游 `klippy/gcode.py` 的 `cmd_default`）：

@@ -619,3 +619,26 @@ pins: !PD0, PD1, PD2
 实际 Z 保持平整；`M114`/`GET_POSITION` 看到的是补偿后的值。`BED_TILT_CALIBRATE` 逐点探测后
 用 `coordinate_descent` 拟合平面并立即应用，同时把三项以 `%.6f` 记入 `SAVE_CONFIG` 待写区
 （**落盘仍需 `SAVE_CONFIG`，该回写见 TODO C2，本仓尚未实现**）。
+
+### `[z_tilt]` — 多 Z 电机调平（`Z_TILT_ADJUST`）
+
+| 选项 | 默认 | 说明 |
+|------|------|------|
+| `z_positions` | **必需** | 每个 Z 电机在床面坐标系的 `x,y`，**项数必须等于 Z 电机数**（如 2 个电机 2 项） |
+| `points` | **必需** | 校准探测点 `x,y`，**至少 2 点** |
+| `horizontal_move_z` | `5.0` | 点间抬升 |
+| `speed` | `50.0` | 点间移动（`>0`） |
+| `retries` | `0` | 点高差超容差时的重试次数（`>=0`） |
+| `retry_tolerance` | `0.0` | 判定收敛的点高差范围（`>0`） |
+
+### `[quad_gantry_level]` — 四点龙门调平（`QUAD_GANTRY_LEVEL`）
+
+| 选项 | 默认 | 说明 |
+|------|------|------|
+| `gantry_corners` | **必需** | 龙门两侧角点 `x,y`，**至少 2 项** |
+| `points` | **必需** | 校准探测点，**恰好 4 点** |
+| `horizontal_move_z` | `5.0` | 点间抬升（注意：命令行 `HORIZONTAL_MOVE_Z` 不覆盖它，与上游一致） |
+| `speed` | `50.0` | 点间移动 |
+| `retries` / `retry_tolerance` | `0` / `0.0` | 重试（错误信息附 `Possibly Z motor numbering is wrong`） |
+| `max_adjust` | `4.0` | 单电机调整量上限（`>0`），超过即中止 |
+

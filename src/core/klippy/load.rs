@@ -372,6 +372,7 @@ mod tests {
                 "virtual_sdcard",
                 "z_tilt",
                 "static_digital_output",
+                "adxl345",
                 "display_template",
                 "dotstar",
                 "i2c_device",

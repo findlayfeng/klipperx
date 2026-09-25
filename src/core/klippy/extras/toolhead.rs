@@ -64,6 +64,7 @@ use tracing::warn;
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
 use crate::core::klippy::error::KlippyError;
 use crate::core::klippy::event::KlippyEvent;
+use crate::core::klippy::extras::carriage::{self, KinematicStepper};
 use crate::core::klippy::extras::extruder::PrinterExtruder;
 use crate::core::klippy::extras::idex_modes;
 use crate::core::klippy::extras::query_endstops::{QueryEndstops, QUERY_ENDSTOPS_OBJECT};
@@ -81,6 +82,7 @@ use crate::core::klippy::motion::delta::{
     DELTA_RAIL_NAMES,
 };
 use crate::core::klippy::motion::extra::ExtraAxis;
+use crate::core::klippy::motion::generic_cartesian::GenericCartesianKinematics;
 use crate::core::klippy::motion::itersolve::{
     cartesian_active_flags, cartesian_position_fn, corexy_active_flags, corexy_position_fn,
     corexz_active_flags, corexz_position_fn, Axis, AxisFlags, PositionFn,
@@ -143,6 +145,10 @@ enum KinematicsKind {
     /// (`kinematics/delta.py`), whose kinematics and calibration math live in
     /// [`motion::delta`](crate::core::klippy::motion::delta).
     Delta,
+    /// `kinematics: generic_cartesian` — the carriage/stepper description
+    /// (`kinematics/generic_cartesian.py`), where a motor drives a linear
+    /// combination of carriage axes instead of one axis.
+    GenericCartesian,
 }
 
 impl KinematicsKind {
@@ -156,6 +162,7 @@ impl KinematicsKind {
         "hybrid_corexz",
         "polar",
         "delta",
+        "generic_cartesian",
     ];
 
     /// Parse a `[printer] kinematics` value.
@@ -169,6 +176,7 @@ impl KinematicsKind {
             "hybrid_corexz" => Self::HybridCoreXz,
             "polar" => Self::Polar,
             "delta" => Self::Delta,
+            "generic_cartesian" => Self::GenericCartesian,
             _ => return None,
         })
     }
@@ -189,6 +197,10 @@ impl KinematicsKind {
             // are bound to their geometry in the delta branch below, and this
             // value is only consulted by the cartesian build.
             Self::Delta => CartesianTransform::Standard,
+            // Generic cartesian's motors run the linear combinations their
+            // `[stepper <name>]` sections declare (`extras::carriage` installs
+            // those solvers); this arm is never read.
+            Self::GenericCartesian => CartesianTransform::Standard,
         }
     }
 
@@ -240,6 +252,10 @@ impl KinematicsKind {
             // Delta never reaches here: its branch below binds each tower to
             // `delta_stepper_alloc` instead (`delta.py:50-52`).
             Self::Delta => [cart(Axis::X), cart(Axis::Y), cart(Axis::Z)],
+            // Generic cartesian never reaches here either: `extras::carriage`
+            // installs each motor's solver from its `carriages` expression as
+            // the section loads.
+            Self::GenericCartesian => [cart(Axis::X), cart(Axis::Y), cart(Axis::Z)],
         }
     }
 
@@ -284,6 +300,14 @@ pub struct ToolHeadObject {
     /// The delta kinematics, parked here at load until connect installs it —
     /// the rails' delta solvers are already bound in `new`.
     delta: Mutex<Option<DeltaKinematics>>,
+    /// The generic-cartesian kinematics, parked here at load until connect
+    /// installs it (`generic_cartesian.py:118-127` builds it in `__init__`;
+    /// only the toolhead's install waits for connect).
+    generic: Mutex<Option<GenericCartesianKinematics>>,
+    /// The `[stepper <name>]` motors of a generic-cartesian printer. They
+    /// belong to no rail — each drives a combination of carriages — so they are
+    /// kept apart from `rails` and taken at connect like the bed stepper.
+    generic_steppers: Vec<Arc<KinematicStepper>>,
     /// How the rails' positions map to carriage axes (`corexy.py:12-15`).
     transform: CartesianTransform,
     /// `[printer] max_angular_velocity`: polar's near-center angular cap
@@ -403,8 +427,20 @@ impl ToolHeadObject {
         let mut rails: Vec<Arc<Rail>> = Vec::new();
         let mut bed = None;
         let mut delta_kinematics = None;
+        let mut generic_kinematics = None;
+        let mut generic_steppers: Vec<Arc<KinematicStepper>> = Vec::new();
         match kind {
             KinematicsKind::None => {}
+            KinematicsKind::GenericCartesian => {
+                // `GenericCartesianKinematics.__init__` reads every `[carriage
+                // <name>]` / `[stepper <name>]` section here
+                // (`generic_cartesian.py:118-172`) and installs each motor's
+                // solver as it reads it; the built kinematics waits for
+                // connect, like delta's.
+                let built = carriage::build(printer)?;
+                generic_kinematics = Some(built.kinematics);
+                generic_steppers = built.steppers;
+            }
             KinematicsKind::Polar => {
                 // `kinematics/polar.py:25-31`: the arm is a rail
                 // (`LookupRail`), Z is a (multi) rail, and the bed is a bare
@@ -542,6 +578,8 @@ impl ToolHeadObject {
             bed,
             kind,
             delta: Mutex::new(delta_kinematics),
+            generic: Mutex::new(generic_kinematics),
+            generic_steppers,
             transform: kind.transform(),
             max_angular_velocity,
             active_extruder: Mutex::new("extruder".to_string()),
@@ -751,6 +789,19 @@ impl PrinterObject for ToolHeadObject {
                     );
                 }
             }
+            // Generic cartesian's motors: each belongs to the carriages its
+            // `carriages` expression names, not to a rail.
+            for kinematic in &self.generic_steppers {
+                let stepper = kinematic.stepper();
+                let host = stepper
+                    .take_stepper()
+                    .ok_or_else(|| config_error(format!("{} is not connected", stepper.name())))?;
+                host_steppers.push(host);
+                mcu_steppers.insert(
+                    stepper.name().to_string(),
+                    Arc::clone(stepper.mcu_stepper()),
+                );
+            }
             // Polar's bare bed stepper: it belongs to no rail, but its host
             // solver drives it from the main trapq like the rails' — upstream
             // lists it first (`kinematics/polar.py:31-34`).
@@ -813,6 +864,19 @@ impl PrinterObject for ToolHeadObject {
                             config_error("delta kinematics is not connected".to_string())
                         })?;
                     toolhead.set_kinematics(Box::new(delta));
+                }
+                KinematicsKind::GenericCartesian => {
+                    let kinematics = self
+                        .generic
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .take()
+                        .ok_or_else(|| {
+                            config_error(
+                                "generic_cartesian kinematics is not connected".to_string(),
+                            )
+                        })?;
+                    toolhead.set_kinematics(Box::new(kinematics));
                 }
                 _ => {
                     toolhead.set_kinematics(Box::new(CartesianKinematics::new(
@@ -2521,6 +2585,8 @@ mod tests {
             bed: None,
             kind: KinematicsKind::Cartesian,
             delta: Mutex::new(None),
+            generic: Mutex::new(None),
+            generic_steppers: Vec::new(),
             transform: CartesianTransform::Standard,
             max_angular_velocity: 0.0,
             active_extruder: Mutex::new("extruder".to_string()),

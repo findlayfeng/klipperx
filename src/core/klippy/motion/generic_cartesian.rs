@@ -33,11 +33,7 @@ use crate::core::klippy::mathutil::{mat_transp, pseudo_inverse, Coord, X_AXIS, Y
 /// One stepper's position function for `generic_cartesian_stepper_alloc`
 /// (`kin_generic.c:24-31`): the dot product of its coefficient vector and the
 /// move's carriage coordinate.
-pub fn generic_cartesian_position(
-    segment: &MoveSegment,
-    move_time: f64,
-    coeffs: &[f64; 3],
-) -> f64 {
+pub fn generic_cartesian_position(segment: &MoveSegment, move_time: f64, coeffs: &[f64; 3]) -> f64 {
     let c = segment.coord(move_time);
     coeffs[0] * c.x() + coeffs[1] * c.y() + coeffs[2] * c.z()
 }
@@ -128,10 +124,8 @@ impl GenericCartesianKinematics {
         if matrix.is_empty() {
             return false;
         }
-        let Some(mtm) = crate::core::klippy::mathutil::mat_mat_mul(
-            &mat_transp(&matrix),
-            &matrix,
-        ) else {
+        let Some(mtm) = crate::core::klippy::mathutil::mat_mat_mul(&mat_transp(&matrix), &matrix)
+        else {
             return false;
         };
         // Upstream passes an empty right-hand side: it only wants the pivots
@@ -325,7 +319,10 @@ mod tests {
             axes_r: Xyz::default(),
         };
         // `c0·x + c1·y + c2·z`.
-        assert_eq!(generic_cartesian_position(&segment, 0.5, &[1.0, 1.0, 0.0]), 7.0);
+        assert_eq!(
+            generic_cartesian_position(&segment, 0.5, &[1.0, 1.0, 0.0]),
+            7.0
+        );
         assert_eq!(
             generic_cartesian_position(&segment, 0.5, &[1.0, -1.0, 0.0]),
             -1.0
@@ -338,8 +335,14 @@ mod tests {
 
     #[test]
     fn test_active_flags_follow_the_nonzero_coefficients() {
-        assert_eq!(generic_active_flags([1.0, 1.0, 0.0]), AxisFlags::X.union(AxisFlags::Y));
-        assert_eq!(generic_active_flags([1.0, -1.0, 0.0]), AxisFlags::X.union(AxisFlags::Y));
+        assert_eq!(
+            generic_active_flags([1.0, 1.0, 0.0]),
+            AxisFlags::X.union(AxisFlags::Y)
+        );
+        assert_eq!(
+            generic_active_flags([1.0, -1.0, 0.0]),
+            AxisFlags::X.union(AxisFlags::Y)
+        );
         assert_eq!(generic_active_flags([0.0, 0.0, 1.0]), AxisFlags::Z);
         assert_eq!(generic_active_flags([0.0, 0.0, 0.0]), AxisFlags::NONE);
     }
@@ -390,8 +393,10 @@ mod tests {
     #[test]
     fn test_a_move_before_homing_is_refused() {
         let kin = corexyuv_kinematics();
-        let mut move_ = move_(Coord::default(), Coord::new(10.0, 0.0, 0.0, 0.0));
-        let err = kin.check_move(&mut MoveContext::new(&mut move_)).unwrap_err();
+        let mut before = move_(Coord::default(), Coord::new(10.0, 0.0, 0.0, 0.0));
+        let err = kin
+            .check_move(&mut MoveContext::new(&mut before))
+            .unwrap_err();
         assert!(err.to_string().contains("Must home axis first"), "{err}");
     }
 
@@ -401,16 +406,21 @@ mod tests {
         kin.set_position(Coord::default(), &[X_AXIS, Y_AXIS, Z_AXIS]);
 
         // `G1 X170 Y190 F6000` from `corexyuv.test`: inside `[0,300]×[0,200]`.
-        let mut move_ = move_(Coord::default(), Coord::new(170.0, 190.0, 0.0, 0.0));
-        assert!(kin.check_move(&mut MoveContext::new(&mut move_)).is_ok());
+        let mut inside = move_(Coord::default(), Coord::new(170.0, 190.0, 0.0, 0.0));
+        assert!(kin.check_move(&mut MoveContext::new(&mut inside)).is_ok());
 
         // The T1 park's exact corner `X300 Y200` is inclusive.
-        let mut corner = move_(Coord::new(170.0, 190.0, 0.0, 0.0), Coord::new(300.0, 200.0, 0.0, 0.0));
+        let mut corner = move_(
+            Coord::new(170.0, 190.0, 0.0, 0.0),
+            Coord::new(300.0, 200.0, 0.0, 0.0),
+        );
         assert!(kin.check_move(&mut MoveContext::new(&mut corner)).is_ok());
 
         // One millimetre past the far corner is refused.
         let mut past = move_(Coord::default(), Coord::new(301.0, 0.0, 0.0, 0.0));
-        let err = kin.check_move(&mut MoveContext::new(&mut past)).unwrap_err();
+        let err = kin
+            .check_move(&mut MoveContext::new(&mut past))
+            .unwrap_err();
         assert!(err.to_string().contains("Move out of range"), "{err}");
     }
 
@@ -420,8 +430,14 @@ mod tests {
         assert_eq!(kin.get_status()["homed_axes"], "");
         kin.set_position(Coord::default(), &[X_AXIS, Y_AXIS, Z_AXIS]);
         assert_eq!(kin.get_status()["homed_axes"], "xyz");
-        assert_eq!(kin.get_status()["axis_minimum"], json!([0.0, 0.0, 0.0, 0.0]));
-        assert_eq!(kin.get_status()["axis_maximum"], json!([300.0, 200.0, 100.0, 0.0]));
+        assert_eq!(
+            kin.get_status()["axis_minimum"],
+            json!([0.0, 0.0, 0.0, 0.0])
+        );
+        assert_eq!(
+            kin.get_status()["axis_maximum"],
+            json!([300.0, 200.0, 100.0, 0.0])
+        );
         kin.clear_homing_state(&[Y_AXIS]);
         assert_eq!(kin.get_status()["homed_axes"], "xz");
     }

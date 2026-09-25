@@ -27,6 +27,7 @@ pub mod gcode_arcs;
 pub mod gcode_macro;
 pub mod gcode_move;
 pub mod heater_bed;
+pub mod heater_fan;
 pub mod heater_generic;
 pub mod heaters;
 pub mod homing_override;

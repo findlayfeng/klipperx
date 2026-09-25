@@ -20,8 +20,9 @@
 //!
 //! * **Rendering.** Templates, layouts and glyphs are parsed and stored, but no
 //!   template is evaluated and nothing is drawn onto a panel: `display.cfg`
-//!   needs `{% set %}`, `|abs`, `"%3.0f" % …` and `.format`, which the template
-//!   engine (`super::template`) does not have. A refresh clears the panel and
+//!   needs `{% set %}` (supported since template batch #9), plus `|abs`,
+//!   `"%3.0f" % …` and `.format`, which the template engine
+//!   (`super::template`) does not have yet. A refresh clears the panel and
 //!   flushes the framebuffer differences, exactly as upstream does around its
 //!   own (swallowed) render step (`display/display.py:236-240`), so the screen
 //!   stays blank rather than the printer failing to come up.

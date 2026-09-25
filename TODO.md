@@ -415,7 +415,7 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 ### H3 G-Code 宏与脚本
 
 - [ ] `gcode_macro.py`：段与宏注册**已落地**（2026-09-24 集成批 #1，语料绿）；剩余 = 宏体模板/表达式引擎、`SET_GCODE_VARIABLE`、`rename_existing` 连接期换名，以及读
-      `printer.objects` 的反射式能力（**Q5**）。**U-A7b 已完成（2026-09-24 批 #4）**：受控子集引擎落地，`exclude_object.test`+`dual_carriage.test` 双翻转、guard 归零；子集外（`{% set %}`、过滤器）报错缺口入 `template.rs` 文档，完整 Jinja 仍属 H3。
+      `printer.objects` 的反射式能力（**Q5**）。**U-A7b 已完成（2026-09-24 批 #4）**：受控子集引擎落地，`exclude_object.test`+`dual_carriage.test` 双翻转、guard 归零；子集外（过滤器等）报错缺口入 `template.rs` 文档（`{% set %}` 批 #9 已落地，B–F 单元：过滤器参数/default/float、列表字面量、三元、`%` 格式化、方法白名单），完整 Jinja 仍属 H3。
 - [ ] `save_variables.py`（`SAVE_VARIABLE` / `[variables]`）。
 - [ ] `delayed_gcode.py`（`[delayed_gcode]`）。
 - [ ] `respond.py`（`RESPOND` / `M118`）。

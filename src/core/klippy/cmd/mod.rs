@@ -69,6 +69,7 @@ pub mod debug;
 pub mod ds18b20;
 pub mod endstop;
 pub mod gpio;
+pub mod hx71x;
 pub mod i2c;
 pub mod identify;
 pub mod ldc1612;

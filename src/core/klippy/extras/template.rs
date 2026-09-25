@@ -20,6 +20,7 @@
 //! | `{ … }` expressions | `{action_raise_error("…")}` (`exclude_object.cfg:86`) |
 //! | `{% if %}` / `elif` / `else` / `endif` | `exclude_object.cfg:85-113` |
 //! | `{% for x in … %}` / `endfor` | `exclude_object.cfg:92` |
+//! | `{% set name = expr %}` | `{% set x_center = 0.5 * (x_max + x_min) %}` (`generic_cartesian_iqex.cfg:288`) |
 //! | `{# … #}` comments | (none in the corpus; parsed and skipped) |
 //! | literals | `0.0`, `'-1'`, `"abc"`, `True`/`False`/`None` |
 //! | names, `a.b`, `a["k"]`, `a[0]`, calls | `printer["gcode_macro T"].t` |
@@ -33,9 +34,9 @@
 //!
 //! # Deliberate gaps (explicit errors, not silent blanks)
 //!
-//! - Statements outside `if/elif/else/endif/for/endfor` — notably
-//!   `{% set %}`, which `generic_cartesian_iqex.cfg` uses — are refused at
-//!   load (`unsupported statement 'set'`).
+//! - Statements outside `if/elif/else/endif/for/endfor/set` — Jinja also has
+//!   `{% block %}`, `{% include %}`, … — are refused at load
+//!   (`unsupported statement 'block'`).
 //! - Filters outside `int` (`min`/`max` in the same file) are refused at
 //!   render.
 //! - `range(n)` takes one argument; `action_emergency_stop` and
@@ -453,9 +454,20 @@ impl Template {
 
     /// Render against `context`, or report the first failing expression with
     /// upstream's `Error evaluating` frame (`gcode_macro.py:70-79`).
+    ///
+    /// The body runs inside one frame: [`Context::bind`] writes the innermost
+    /// frame, so a top-level `{% set %}` needs somewhere to land (an empty
+    /// `frames` would drop it silently). The frame is popped with the render,
+    /// so an assignment never survives into the next render, while `{% for %}`
+    /// still pushes its own frame on top — a loop-body `set` dies with the
+    /// iteration, and an `if` at the top level shares the body frame, exactly
+    /// where Jinja2 scopes those assignments.
     pub fn render(&self, context: &mut Context) -> Result<String, TemplateError> {
         let mut out = String::new();
-        render_nodes(&self.nodes, context, &self.name, &mut out)?;
+        context.push_frame();
+        let rendered = render_nodes(&self.nodes, context, &self.name, &mut out);
+        context.pop_frame();
+        rendered?;
         Ok(out)
     }
 }
@@ -479,6 +491,11 @@ enum Node {
         body: Vec<Node>,
         line: usize,
     },
+    /// `{% set name = expr %}` — bound where Jinja2 scopes it: into the
+    /// body frame at the top level (so a later node, or an `if` body, sees
+    /// it), into the loop frame inside `{% for %}` (so it dies with the
+    /// iteration).
+    Set { name: String, value: Expr },
 }
 
 struct Parser<'a> {
@@ -531,6 +548,7 @@ impl<'a> Parser<'a> {
                 let node = match keyword.as_str() {
                     "if" => self.parse_if(&stmt, line)?,
                     "for" => self.parse_for(&stmt, line)?,
+                    "set" => self.parse_set(&stmt, line)?,
                     "elif" | "else" | "endif" | "endfor" => {
                         return Err(self.load_error(
                             open,
@@ -542,7 +560,7 @@ impl<'a> Parser<'a> {
                             open,
                             format!(
                                 "unsupported statement '{other}' \
-                                 (this port implements if/elif/else/endif/for/endfor)"
+                                 (this port implements if/elif/else/endif/for/endfor/set)"
                             ),
                         ));
                     }
@@ -671,6 +689,39 @@ impl<'a> Parser<'a> {
             iter: expr,
             body,
             line,
+        })
+    }
+
+    /// `{% set name = expr %}` — one name and one expression; tuple targets
+    /// and `set` without `=` are refused the way a malformed loop is.
+    fn parse_set(&mut self, stmt: &str, line: usize) -> Result<Node, TemplateError> {
+        let rest = stmt
+            .trim_start()
+            .strip_prefix("set")
+            .map(str::trim)
+            .ok_or_else(|| {
+                self.load_error(self.pos, format!("malformed assignment in '{stmt}'"))
+            })?;
+        let name_end = rest
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or_else(|| rest.len());
+        let name = &rest[..name_end];
+        if name.is_empty() || name.starts_with(|c: char| c.is_ascii_digit()) {
+            return Err(
+                self.load_error(self.pos, format!("malformed assignment target in '{stmt}'"))
+            );
+        }
+        let after = rest[name_end..].trim_start();
+        let Some(expr_text) = after.strip_prefix('=').map(str::trim) else {
+            return Err(self.load_error(self.pos, format!("expected '=' in assignment '{stmt}'")));
+        };
+        if expr_text.is_empty() {
+            return Err(self.load_error(self.pos, format!("missing value in assignment '{stmt}'")));
+        }
+        let value = parse_expr(self.name, line, expr_text)?;
+        Ok(Node::Set {
+            name: name.to_string(),
+            value,
         })
     }
 }
@@ -1432,6 +1483,13 @@ fn render_nodes(
                     context.pop_frame();
                 }
             }
+            Node::Set {
+                name: target,
+                value,
+            } => {
+                let value = eval(value, context, name)?;
+                context.bind(target, value);
+            }
         }
     }
     Ok(())
@@ -1972,21 +2030,58 @@ mod tests {
     }
 
     /// A construct outside the subset fails the **load** with upstream's frame
-    /// (`gcode_macro.py:61-66`), naming the line and the statement.
+    /// (`gcode_macro.py:61-66`), naming the line and the statement. `{% set %}`
+    /// used to be refused here; it is inside the subset now.
     #[test]
     fn an_unknown_statement_is_a_load_error_with_upstream_frame() {
-        let error = Template::parse("gcode_macro SETTY:gcode", "{% set x = 1 %}")
-            .expect_err("set is not implemented");
+        assert_eq!(ok("{% set x = 1 %}{ x }"), "1");
+
+        let error = Template::parse("gcode_macro SETTY:gcode", "{% block body %}")
+            .expect_err("block is not implemented");
         assert_eq!(
             error.to_string(),
             "Error loading template 'gcode_macro SETTY:gcode'\n\
-             line 1: unsupported statement 'set' \
-             (this port implements if/elif/else/endif/for/endfor)"
+             line 1: unsupported statement 'block' \
+             (this port implements if/elif/else/endif/for/endfor/set)"
         );
 
         // An unbalanced block reads the same way.
         let error = Template::parse("gcode_macro BAD:gcode", "{% if 1 %}").expect_err("no endif");
         assert!(error.to_string().contains("endif' expected"), "{error}");
+    }
+
+    /// `{% set %}` scoping, checked against jinja2 3.1.6 with upstream's
+    /// delimiters: at the top level a later node sees the binding, an `if`
+    /// body leaks outward, a `for` body does not (its frame dies with the
+    /// iteration) but the same iteration and nested bodies do.
+    #[test]
+    fn set_statements_scope_like_jinja2() {
+        // Top level, and a chain of top-level assignments.
+        assert_eq!(ok("{% set x = 12 %}{ x }"), "12");
+        assert_eq!(ok("{% set a = 2 %}{% set b = a + 1 %}{ b }"), "3");
+
+        // `if` does not scope: the binding is visible after `endif`.
+        assert_eq!(ok("{% if 1 %}{% set y = 5 %}{% endif %}{ y }"), "5");
+
+        // `for` scopes: `z` reads inside the body and dies with the iteration.
+        assert_eq!(
+            ok(
+                "{% for i in range(2) %}{% set z = i %}{ z }{% endfor %}{% if z is defined %}\
+                LEAK{% endif %}"
+            ),
+            "01"
+        );
+
+        // The corpus sentence (`generic_cartesian_iqex.cfg:288`), rendered
+        // after a later expression reads it back. Its `x_max`/`x_min` come
+        // from the context here: the lines that set them (286-287) need list
+        // literals and `|min`/`|max`, which are unit C's work, as is line 285
+        // (it reads `printer.*`).
+        let mut context = context(&[], "");
+        context.insert("x_max", Rt::Json(json!(300.0)));
+        context.insert("x_min", Rt::Json(json!(0.0)));
+        let source = "{% set x_center = 0.5 * (x_max + x_min) %}{ x_center }";
+        assert_eq!(render(source, &mut context).expect("renders"), "150.0");
     }
 
     /// A name or filter outside the subset fails the **render**, with the

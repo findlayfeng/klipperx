@@ -669,16 +669,24 @@ fn stepper_step_dist(config: &ConfigWrapper) -> Result<f64, ConfigError> {
     let microsteps = sibling.get_int("microsteps", None)? as f64;
     let full_steps = sibling.get_int("full_steps_per_rotation", Some(200))? as f64;
     let gear_ratio = sibling
-        .get_list("gear_ratio", ',')
-        .map(|parts| {
-            parts
-                .iter()
-                .filter_map(|part| part.parse::<f64>().ok())
-                .product::<f64>()
+        .get_list_of_lists("gear_ratio", ',', ':', 2)?
+        .into_iter()
+        .map(|pair| {
+            let first = pair[0].trim().parse::<f64>().unwrap_or(1.0);
+            let second = pair[1].trim().parse::<f64>().unwrap_or(0.0);
+            if second == 0.0 {
+                1.0
+            } else {
+                first / second
+            }
         })
-        .unwrap_or(1.0);
-    let rotation_distance =
-        sibling.get_float_bounded("rotation_distance", None, None, None, Some(0.), None)?;
+        .product::<f64>();
+    // Radians mode, as the stepper itself infers it (`stepper.py:302-304`).
+    let rotation_distance = if !sibling.has("rotation_distance") && sibling.has("gear_ratio") {
+        std::f64::consts::TAU
+    } else {
+        sibling.get_float_bounded("rotation_distance", None, None, None, Some(0.), None)?
+    };
     Ok(rotation_distance / (full_steps * microsteps * gear_ratio))
 }
 

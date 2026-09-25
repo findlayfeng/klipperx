@@ -957,29 +957,6 @@ mod tests {
             .expect("the machine comes up");
         assert!(gcode.is_ok(), "{gcode:?}");
     }
-
-    // TEMPORARY scratch acceptance test (removed before commit).
-    #[tokio::test(flavor = "multi_thread")]
-    async fn scratch_sovol_sv06_plus_loads() {
-        let runs: Vec<_> = all_runs()
-            .into_iter()
-            .filter(|run| {
-                run.config
-                    .file_name()
-                    .is_some_and(|n| n == "printer-sovol-sv06-plus-2023.cfg")
-            })
-            .collect();
-        assert_eq!(runs.len(), 1, "the sovol run is seen once");
-        let run = &runs[0];
-        let dictionaries = run_dictionaries(run);
-        match run_case(run, &dictionaries).await {
-            Ok(()) => println!("SCRATCH sovol-sv06-plus: Ok"),
-            Err(err) => {
-                println!("SCRATCH sovol-sv06-plus: Err({err})");
-                panic!("{err}");
-            }
-        }
-    }
 }
 
 use std::fs;

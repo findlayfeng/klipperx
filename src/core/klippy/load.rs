@@ -376,6 +376,7 @@ mod tests {
                 "dotstar",
                 "i2c_device",
                 "led",
+                "mpu9250",
                 "neopixel",
                 "pca9533",
                 "pca9632",

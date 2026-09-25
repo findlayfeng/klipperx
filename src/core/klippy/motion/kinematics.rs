@@ -73,6 +73,14 @@ impl<'a> MoveContext<'a> {
         self.move_.move_d
     }
 
+    /// Whether this move moves the toolhead (an extrude-only move does not).
+    ///
+    /// A manual stepper's `check_move` lowers the acceleration of an
+    /// extrude-only move (`manual_stepper.py:158-160`).
+    pub fn is_kinematic_move(&self) -> bool {
+        self.move_.is_kinematic_move
+    }
+
     /// Lower the speed and/or acceleration of this move.
     pub fn limit_speed(&mut self, speed: f64, accel: f64) {
         self.move_.limit_speed(speed, accel);

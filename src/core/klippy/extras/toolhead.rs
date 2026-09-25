@@ -1156,6 +1156,57 @@ impl ToolHeadObject {
         Ok(())
     }
 
+    /// Add a non-kinematic axis (`ToolHead.add_extra_axis`) and tell the
+    /// machine (`toolhead:update_extra_axes`).
+    ///
+    /// The manual stepper is the extra axis that arrives after connect; the
+    /// extruders are added by [`ToolHeadObject::connect`] itself. Upstream
+    /// also appends `axis_pos` to `commanded_pos`; this port's [`Coord`] is a
+    /// fixed four axes, so that step is the documented gap in
+    /// [`manual_stepper`](crate::core::klippy::extras::manual_stepper).
+    ///
+    /// # Errors
+    /// "Printer is not ready" before connect.
+    pub fn add_extra_axis(&self, axis: Arc<dyn ExtraAxis>) -> Result<(), CommandError> {
+        let mut guard = self.lock();
+        let connected = guard
+            .as_mut()
+            .ok_or_else(|| CommandError::new("Printer is not ready"))?;
+        connected.toolhead.add_extra_axis(axis);
+        drop(guard);
+        send(&self.printer, &KlippyEvent::ToolheadUpdateExtraAxes);
+        Ok(())
+    }
+
+    /// Take a non-kinematic axis back off the toolhead (`ToolHead.remove_extra_axis`)
+    /// and tell the machine (`toolhead:update_extra_axes`).
+    ///
+    /// # Errors
+    /// "Printer is not ready" before connect.
+    pub fn remove_extra_axis(&self, axis: &Arc<dyn ExtraAxis>) -> Result<(), CommandError> {
+        let mut guard = self.lock();
+        let connected = guard
+            .as_mut()
+            .ok_or_else(|| CommandError::new("Printer is not ready"))?;
+        connected.toolhead.remove_extra_axis(axis);
+        drop(guard);
+        send(&self.printer, &KlippyEvent::ToolheadUpdateExtraAxes);
+        Ok(())
+    }
+
+    /// The non-kinematic axes currently registered, for the `GCODE_AXIS`
+    /// collision check (`ToolHead.get_extra_axes`).
+    ///
+    /// Upstream pads the list with three `None`s for X/Y/Z; here the position
+    /// index is always `index + E_AXIS`, so only real axes are returned. Before
+    /// connect the list is empty.
+    pub fn get_extra_axes(&self) -> Vec<Arc<dyn ExtraAxis>> {
+        self.lock()
+            .as_ref()
+            .map(|connected| connected.toolhead.extra_axes().to_vec())
+            .unwrap_or_default()
+    }
+
     /// Probe-style homing: move toward `target` at `speed`, stop on trigger
     /// (`homing.probing_move`).
     ///

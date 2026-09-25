@@ -390,14 +390,21 @@ impl SafeZHoming {
         let prev_g28 = Arc::new(Mutex::new(Some(prev)));
         let handler: CommandHandler = {
             let options = options;
-            let gcode = Arc::clone(&gcode);
+            // Weak: this handler lives in the dispatcher's command table, so a
+            // strong handle would be a reference cycle — `gcode` could never be
+            // dropped and neither could the machine's parts its table keeps
+            // registered (the teardown hang of a corpus run).
+            let gcode = Arc::downgrade(&gcode);
             let prev_g28 = Arc::clone(&prev_g28);
             let printer = Arc::downgrade(printer);
             Arc::new(move |gcmd: &GcodeCommand| {
-                let gcode = Arc::clone(&gcode);
+                let gcode = gcode.clone();
                 let prev_g28 = Arc::clone(&prev_g28);
                 let printer = printer.clone();
                 Box::pin(async move {
+                    let gcode = gcode
+                        .upgrade()
+                        .ok_or_else(|| CommandError::new("Printer is not ready"))?;
                     let printer = printer
                         .upgrade()
                         .ok_or_else(|| CommandError::new("Printer is not ready"))?;

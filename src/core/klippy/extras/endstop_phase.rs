@@ -355,7 +355,12 @@ pub struct EndstopPhases {
     /// The machine, to find `<driver> <stepper>` objects and the `configfile`.
     printer: Weak<Printer>,
     /// The G-code dispatcher, for `ENDSTOP_PHASE_CALIBRATE`.
-    gcode: Arc<GCodeDispatch>,
+    ///
+    /// Weak: the dispatcher's command table holds this object (the
+    /// `ENDSTOP_PHASE_CALIBRATE` closure captures it), so a strong handle back
+    /// would be a reference cycle — `gcode` could never be dropped, and with it
+    /// the machine's parts it keeps registered.
+    gcode: Weak<GCodeDispatch>,
     /// The per-stepper trackers (`EndstopPhases.tracking`).
     tracking: Mutex<HashMap<String, Arc<Mutex<PhaseCalc>>>>,
 }
@@ -368,7 +373,7 @@ impl EndstopPhases {
             .expect("the loader registers `gcode` first");
         Ok(Self {
             printer: Arc::downgrade(printer),
-            gcode,
+            gcode: Arc::downgrade(&gcode),
             tracking: Mutex::new(HashMap::new()),
         })
     }
@@ -385,7 +390,11 @@ impl EndstopPhases {
                 Box::pin(async move { object.cmd_endstop_phase_calibrate(gcmd) })
             }
         });
-        self.gcode
+        let gcode = self
+            .gcode
+            .upgrade()
+            .ok_or_else(|| ConfigError::new("the g-code dispatcher is gone"))?;
+        gcode
             .register_command(
                 "ENDSTOP_PHASE_CALIBRATE",
                 handler,
@@ -529,11 +538,13 @@ impl EndstopPhases {
                 );
             }
         }
-        self.gcode.respond_info(
-            "The SAVE_CONFIG command will update the printer config\n\
-             file with these parameters and restart the printer.",
-            true,
-        );
+        if let Some(gcode) = self.gcode.upgrade() {
+            gcode.respond_info(
+                "The SAVE_CONFIG command will update the printer config\n\
+                 file with these parameters and restart the printer.",
+                true,
+            );
+        }
         Ok(())
     }
 
@@ -578,10 +589,14 @@ impl EndstopPhases {
             (Some(first), Some(last)) => (first % phases, last % phases),
             _ => (best_phase, best_phase),
         };
-        self.gcode.respond_info(
-            &format!("{stepper_name}: trigger_phase={best_phase}/{phases} (range {lo} to {hi})"),
-            true,
-        );
+        if let Some(gcode) = self.gcode.upgrade() {
+            gcode.respond_info(
+                &format!(
+                    "{stepper_name}: trigger_phase={best_phase}/{phases} (range {lo} to {hi})"
+                ),
+                true,
+            );
+        }
         (best_phase, phases)
     }
 
@@ -593,8 +608,9 @@ impl EndstopPhases {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         if tracking.is_empty() {
-            self.gcode
-                .respond_info("No steppers found. (Be sure to home at least once.)", true);
+            if let Some(gcode) = self.gcode.upgrade() {
+                gcode.respond_info("No steppers found. (Be sure to home at least once.)", true);
+            }
             return;
         }
         let mut names: Vec<String> = tracking.keys().cloned().collect();

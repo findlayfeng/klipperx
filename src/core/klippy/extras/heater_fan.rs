@@ -579,4 +579,24 @@ mod tests {
         hf.tick(2.0);
         assert_eq!(updates(&pwm(&chip, 0)), [0.5, 0.0]);
     }
+
+    #[test]
+    fn test_the_section_loads_from_a_full_config() {
+        // What the corpus configs do — an `[mcu]` with `[heater_fan]` — must
+        // survive the real loader, which also runs the undefined-option check
+        // over this section (the unit tests above use a bare wrapper).
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        let text = "[mcu]\nserial: /dev/not-opened-yet\n\
+                    [heater_fan hotend_fan]\npin: PH0\n\
+                    heater: extruder\nheater_temp: 60\nfan_speed: 0.5\n";
+        let (config, _) = Config::from_text(text).expect("the config parses");
+        printer.load_config(&config).expect("the config loads");
+
+        let hf = printer
+            .lookup_object_as::<HeaterFan>("heater_fan hotend_fan")
+            .expect("the prefixed section is registered");
+        assert_eq!(hf.heater_names, ["extruder"]);
+        assert_eq!(hf.heater_temp, 60.0);
+        assert_eq!(hf.fan_speed, 0.5);
+    }
 }

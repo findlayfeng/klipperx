@@ -775,21 +775,53 @@ mod tests {
         );
     }
 
-    /// A body outside [`template`]'s subset is refused when the section
-    /// loads, with upstream's `Error loading template` frame
+    /// A `{% set %}` body loads and renders — this pin used to refuse `set`
+    /// at load; a statement outside [`template`]'s subset is still refused
+    /// when the section loads, with upstream's `Error loading template` frame
     /// (`gcode_macro.py:61-66`).
     #[test]
-    fn an_unsupported_template_construct_is_a_load_error() {
+    fn a_set_body_loads_and_renders_but_an_unknown_statement_fails() {
         let printer = printer();
-        let sect = section("SETTY", &[("gcode", "{% set x = 1 %}")]);
+        let dispatch = gcode(&printer);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        {
+            let seen = Arc::clone(&seen);
+            let handler: CommandHandler = sync(move |gcmd: &GcodeCommand| {
+                seen.lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .push(gcmd.get_str("VALUE").unwrap_or_default());
+                Ok(())
+            });
+            dispatch
+                .register_command("ECHO_LINE", handler, None, false)
+                .expect("the fake receiver registers");
+        }
+
+        // `set` is inside the subset: the section loads and the body uses the
+        // binding on the next line.
+        let sect = section(
+            "SETTY",
+            &[("gcode", "{% set x = 41 %}ECHO_LINE VALUE={x + 1}")],
+        );
+        let config = ConfigWrapper::untracked(&sect);
+        load_config_prefix(&config, &printer).expect("the macro loads");
+        dispatch.run_script_sync("SETTY").expect("the run is clean");
+        assert_eq!(
+            *seen.lock().unwrap_or_else(|poison| poison.into_inner()),
+            vec!["42"],
+            "the rendered body reached the receiver"
+        );
+
+        // A statement outside it is refused at load.
+        let sect = section("BADSTMT", &[("gcode", "{% block body %}")]);
         let config = ConfigWrapper::untracked(&sect);
         let error = GCodeMacro::new(&config, &printer)
-            .expect_err("the subset does not carry `set`")
+            .expect_err("the subset does not carry `block`")
             .to_string();
         assert!(
             error.starts_with(
-                "Error loading template 'gcode_macro SETTY:gcode'\nline 1: \
-                 unsupported statement 'set'"
+                "Error loading template 'gcode_macro BADSTMT:gcode'\nline 1: \
+                 unsupported statement 'block'"
             ),
             "{error}"
         );

@@ -704,11 +704,20 @@ pub struct GenericCartesianConfig {
 /// Turn the loaded carriage/stepper sections into the kinematics, running
 /// upstream's `_load_kinematics` checks (`generic_cartesian.py:173-263`).
 ///
+/// `max_z_velocity`/`max_z_accel` are `[printer]`'s Z caps, which upstream's
+/// `GenericCartesianKinematics.__init__` reads from the same section
+/// (`generic_cartesian.py:162-166`); its `check_move` limits every Z move by
+/// them.
+///
 /// # Errors
 /// Upstream's wording for a duplicated or missing primary carriage, a bad
 /// `primary_carriage`, two duals on one carriage, a carriage no stepper drives,
 /// and a coefficient matrix that cannot move the axes independently.
-pub fn build(printer: &Arc<Printer>) -> Result<GenericCartesianConfig, ConfigError> {
+pub fn build(
+    printer: &Arc<Printer>,
+    max_z_velocity: f64,
+    max_z_accel: f64,
+) -> Result<GenericCartesianConfig, ConfigError> {
     let model = lookup_model(printer).ok_or_else(|| {
         ConfigError::new(
             "kinematics 'generic_cartesian' needs '[carriage <name>]' sections".to_string(),
@@ -921,8 +930,8 @@ pub fn build(printer: &Arc<Printer>) -> Result<GenericCartesianConfig, ConfigErr
         active_ranges,
         Coord::new(x_min, y_min, z_min, 0.0),
         Coord::new(x_max, y_max, z_max, 0.0),
-        0.0,
-        0.0,
+        max_z_velocity,
+        max_z_accel,
     );
     if !kinematics.check_kinematics() {
         return Err(ConfigError::new(

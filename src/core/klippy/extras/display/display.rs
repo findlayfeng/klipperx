@@ -1126,6 +1126,17 @@ mod tests {
             err.to_string(),
             "lcd_type 'uc1701' is not implemented in this host"
         );
+
+        // The SPI sibling of the panel that does have a driver: `hd44780` is
+        // implemented, `hd44780_spi` is not.
+        let err = machine()
+            .load_config(&display_config("lcd_type: hd44780_spi\n"))
+            .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "lcd_type 'hd44780_spi' is not implemented in this host"
+        );
     }
 
     #[test]

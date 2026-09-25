@@ -23,15 +23,21 @@
 //! the MCU phase offset stays zero (`PhaseCalc.calc_phase`); `phases` comes from
 //! the section's own `microsteps` instead. This does not stop the bare section
 //! working, and upstream runs without a Traminic driver the same way.
+//!
+//! Upstream widens `endstop_phase_accuracy` to `phases` under `debugoutput`
+//! (its test mode); this host has no such start argument, so the computed
+//! accuracy always stands.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};
 
 use serde_json::{json, Value};
+use tracing::info;
 
 use crate::core::klippy::config::object::CONFIGFILE_OBJECT;
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
 use crate::core::klippy::event::KlippyEvent;
+use crate::core::klippy::extras::stepper::PrinterStepper;
 use crate::core::klippy::gcode::{
     CommandError, CommandHandler, GCodeDispatch, GcodeCommand, GCODE_OBJECT,
 };
@@ -39,7 +45,17 @@ use crate::core::klippy::load::section;
 use crate::core::klippy::motion::HomingHandle;
 use crate::core::klippy::printer::{Printer, PrinterObject};
 
-section!("endstop_phase", order = 30, load = load_config);
+section!(
+    "endstop_phase",
+    order = 55,
+    phase = late,
+    load = load_config,
+    prefix = load_config_prefix
+);
+
+/// The object name the bare section registers under, and the prefix of each
+/// `[endstop_phase <stepper>]` object's name (`endstop_phase.py:73`).
+const ENDSTOP_PHASE_OBJECT: &str = "endstop_phase";
 
 /// The Traminic drivers whose `get_phase_offset()` a `PhaseCalc` looks for
 /// (`endstop_phase.py:9-10`).
@@ -115,6 +131,217 @@ impl PhaseCalc {
         self.last_phase = Some(phase);
         self.last_mcu_position = Some(trig_mcu_pos);
         phase
+    }
+
+    /// Convert a driver's phase count to this tracker's
+    /// (`PhaseCalc.convert_phase`): `round(driver_phase / driver_phases ×
+    /// phases)`, taken modulo `phases`.
+    fn convert_phase(&self, driver_phase: f64, driver_phases: f64) -> usize {
+        let phases = self
+            .phases
+            .expect("convert_phase is only called with phases known");
+        ((driver_phase / driver_phases * phases as f64 + 0.5) as usize) % phases
+    }
+}
+
+/// One `[endstop_phase <stepper>]` section (`EndstopPhase`).
+///
+/// It tracks the phase its stepper triggers at and, once the phase is known,
+/// asks the driver to move the axis' post-home position to it.
+/// `endstop_align_zero` additionally moves 0.0 onto a full microstep.
+pub struct EndstopPhase {
+    /// The stepper's name (`stepper_x`).
+    name: String,
+    /// The tracker the bare section also reads (upstream shares the object
+    /// through `printer.load_object`).
+    phase_calc: Arc<Mutex<PhaseCalc>>,
+    /// Millimetres per step (`step_dist = rotation_dist / steps_per_rotation`).
+    step_dist: f64,
+    /// The phase count (`microsteps × 4`).
+    phases: usize,
+    /// The axis' endstop position, for `align_endstop`
+    /// (`rail.get_homing_info().position_endstop`).
+    position_endstop: f64,
+    /// The phase the axis is aligned to (`endstop_phase`): config's
+    /// `trigger_phase`, or the first home's phase when it is unset.
+    endstop_phase: Mutex<Option<usize>>,
+    /// `endstop_align_zero`: put 0.0 on a full microstep.
+    endstop_align_zero: bool,
+    /// The largest phase error accepted (`endstop_phase_accuracy`).
+    endstop_phase_accuracy: usize,
+}
+
+impl EndstopPhase {
+    /// Build the section (`EndstopPhase.__init__`).
+    ///
+    /// # Errors
+    /// A missing `[<stepper>]` section, a malformed `trigger_phase`, an
+    /// `endstop_accuracy` too coarse for the phase count, or an option outside
+    /// its bounds.
+    pub fn new(config: &ConfigWrapper, printer: &Arc<Printer>) -> Result<Self, ConfigError> {
+        let name = config.section().sub.clone().ok_or_else(|| {
+            ConfigError::new(format!(
+                "Section '{}' needs a stepper name",
+                config.identifier()
+            ))
+        })?;
+        let stepper = printer
+            .lookup_object_as::<PrinterStepper>(&name)
+            .ok_or_else(|| ConfigError::new(format!("Section '{name}' not found")))?;
+        let step_dist = stepper.step_dist();
+        let phases = (stepper.microsteps() * 4) as usize;
+        let position_endstop = stepper.homing_info().position_endstop;
+        let phase_calc = Arc::new(Mutex::new(PhaseCalc::new(&name, Some(phases))));
+
+        let mut endstop_phase = None;
+        if config.has("trigger_phase") {
+            let text = config.get("trigger_phase", None)?;
+            let items = config.get_list("trigger_phase", '/').unwrap_or_default();
+            let (p, ps) = match items.as_slice() {
+                [p, ps] => {
+                    let parse = |value: &str| -> Result<i64, ConfigError> {
+                        value.trim().parse::<i64>().map_err(|_| {
+                            ConfigError::new(format!(
+                                "Option 'trigger_phase' in section '{}' is not a list of 2 \
+                                 integers",
+                                config.identifier()
+                            ))
+                        })
+                    };
+                    (parse(p)?, parse(ps)?)
+                }
+                _ => {
+                    return Err(ConfigError::new(format!(
+                        "Option 'trigger_phase' in section '{}' is not a list of 2 integers",
+                        config.identifier()
+                    )));
+                }
+            };
+            if p >= ps {
+                return Err(ConfigError::new(format!("Invalid trigger_phase '{text}'")));
+            }
+            endstop_phase = Some(
+                phase_calc
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .convert_phase(p as f64, ps as f64),
+            );
+        }
+        let endstop_align_zero = config.get_bool("endstop_align_zero", Some(false))?;
+        let endstop_accuracy = if config.has("endstop_accuracy") {
+            Some(config.get_float_bounded("endstop_accuracy", None, None, None, Some(0.0), None)?)
+        } else {
+            None
+        };
+        let endstop_phase_accuracy = match (endstop_accuracy, endstop_phase) {
+            (None, _) => phases / 2 - 1,
+            // A trigger phase halves the tolerated error: it pins the phase to
+            // within half a step (`endstop_phase.py:80-93`).
+            (Some(accuracy), Some(_)) => (accuracy * 0.5 / step_dist).ceil() as usize,
+            (Some(accuracy), None) => (accuracy / step_dist).ceil() as usize,
+        };
+        if endstop_phase_accuracy >= phases / 2 {
+            return Err(ConfigError::new(format!(
+                "Endstop for {name} is not accurate enough for stepper phase adjustment"
+            )));
+        }
+        Ok(Self {
+            name,
+            phase_calc,
+            step_dist,
+            phases,
+            position_endstop,
+            endstop_phase: Mutex::new(endstop_phase),
+            endstop_align_zero,
+            endstop_phase_accuracy,
+        })
+    }
+
+    /// The offset that puts 0.0 on a full microstep
+    /// (`EndstopPhase.align_endstop`), or `0.0` when disabled.
+    fn align_endstop(&self) -> f64 {
+        let Some(endstop_phase) = *self
+            .endstop_phase
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+        else {
+            return 0.0;
+        };
+        if !self.endstop_align_zero {
+            return 0.0;
+        }
+        let microsteps = self.phases / 4;
+        let half_microsteps = microsteps / 2;
+        let phase_offset = (((endstop_phase + half_microsteps) % microsteps) as i64
+            - half_microsteps as i64) as f64
+            * self.step_dist;
+        let full_step = microsteps as f64 * self.step_dist;
+        let pe = self.position_endstop;
+        (pe / full_step + 0.5) as i64 as f64 * full_step - pe + phase_offset
+    }
+
+    /// The offset the axis should move by to reach the aligned phase
+    /// (`EndstopPhase.get_homed_offset`).
+    ///
+    /// The first home only records the phase and returns `0.0`; later homes
+    /// compare against it. A phase beyond the accuracy raises.
+    ///
+    /// # Errors
+    /// When the phase differs from the recorded one by more than
+    /// `endstop_phase_accuracy` steps.
+    fn get_homed_offset(&self, trig_mcu_pos: f64) -> Result<f64, CommandError> {
+        let phase = self
+            .phase_calc
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .calc_phase(trig_mcu_pos);
+        let mut endstop_phase = self
+            .endstop_phase
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let Some(reference) = *endstop_phase else {
+            info!("Setting {} endstop phase to {}", self.name, phase);
+            *endstop_phase = Some(phase);
+            return Ok(0.0);
+        };
+        let mut delta = (phase as i64 - reference as i64).rem_euclid(self.phases as i64);
+        if delta >= self.phases as i64 - self.endstop_phase_accuracy as i64 {
+            delta -= self.phases as i64;
+        } else if delta > self.endstop_phase_accuracy as i64 {
+            return Err(CommandError::new(format!(
+                "Endstop {} incorrect phase (got {} vs {})",
+                self.name, phase, reference
+            )));
+        }
+        Ok(delta as f64 * self.step_dist)
+    }
+
+    /// The `homing:home_rails_end` handler: when this section's stepper homed,
+    /// ask the driver to nudge its endstop position
+    /// (`EndstopPhase.handle_home_rails_end`).
+    fn handle_home_rails_end(&self, homing: &HomingHandle) {
+        let mut state = homing.lock();
+        if !state.has_trigger(&self.name) {
+            return;
+        }
+        let trig_mcu_pos = state.get_trigger_position(&self.name);
+        let align = self.align_endstop();
+        match self.get_homed_offset(trig_mcu_pos) {
+            Ok(offset) => state.set_stepper_adjustment(&self.name, align + offset),
+            Err(error) => state.set_error(error.message().to_string()),
+        }
+    }
+}
+
+impl PrinterObject for EndstopPhase {
+    /// Upstream's `EndstopPhase` has no `get_status`. It reports an empty
+    /// object and stays out of `objects/list`.
+    fn get_status(&self, _eventtime: f64) -> Value {
+        json!({})
+    }
+
+    fn is_queryable(&self) -> bool {
+        false
     }
 }
 
@@ -197,14 +424,26 @@ impl EndstopPhases {
             match tracking.get(stepper_name) {
                 Some(phase_calc) => Arc::clone(phase_calc),
                 None => {
-                    // A stepper with no `[endstop_phase <stepper>]` section
-                    // gets a tracker that only counts phases.
-                    let mut phase_calc = PhaseCalc::new(stepper_name, None);
-                    phase_calc.stats_only = true;
-                    if let Some(printer) = self.printer.upgrade() {
-                        phase_calc.lookup_tmc(&printer);
-                    }
-                    let phase_calc = Arc::new(Mutex::new(phase_calc));
+                    // A stepper with an `[endstop_phase <stepper>]` section
+                    // shares that section's tracker (its phases are known);
+                    // one without gets a tracker that only counts phases
+                    // (`EndstopPhases.update_stepper`).
+                    let prefix = self.printer.upgrade().and_then(|printer| {
+                        printer.lookup_object_as::<EndstopPhase>(&format!(
+                            "{ENDSTOP_PHASE_OBJECT} {stepper_name}"
+                        ))
+                    });
+                    let phase_calc = match prefix {
+                        Some(prefix) => Arc::clone(&prefix.phase_calc),
+                        None => {
+                            let mut phase_calc = PhaseCalc::new(stepper_name, None);
+                            phase_calc.stats_only = true;
+                            if let Some(printer) = self.printer.upgrade() {
+                                phase_calc.lookup_tmc(&printer);
+                            }
+                            Arc::new(Mutex::new(phase_calc))
+                        }
+                    };
                     tracking.insert(stepper_name.to_string(), Arc::clone(&phase_calc));
                     phase_calc
                 }
@@ -372,6 +611,29 @@ impl EndstopPhases {
             self.generate_stats(&name, &phase_calc);
         }
     }
+
+    /// The single bare section, created on demand when the config has only
+    /// `[endstop_phase <stepper>]` sections.
+    ///
+    /// Upstream's `EndstopPhase.__init__` calls
+    /// `printer.load_object(config, "endstop_phase")` for exactly this reason;
+    /// a config that also writes `[endstop_phase]` has already registered it
+    /// (main sections load before prefix sections).
+    ///
+    /// # Errors
+    /// A duplicate registration or a g-code name this dispatcher refuses.
+    pub fn ensure(printer: &Arc<Printer>) -> Result<Arc<Self>, ConfigError> {
+        if let Some(existing) = printer.lookup_object_as::<Self>(ENDSTOP_PHASE_OBJECT) {
+            return Ok(existing);
+        }
+        let object = Arc::new(Self::new(printer)?);
+        object.register(printer)?;
+        printer.add_object(
+            ENDSTOP_PHASE_OBJECT,
+            Arc::clone(&object) as Arc<dyn PrinterObject>,
+        )?;
+        Ok(object)
+    }
 }
 
 impl PrinterObject for EndstopPhases {
@@ -409,6 +671,33 @@ pub fn load_config(
 ) -> Result<Arc<dyn PrinterObject>, ConfigError> {
     let object = Arc::new(EndstopPhases::new(printer)?);
     object.register(printer)?;
+    Ok(object)
+}
+
+/// The `[endstop_phase <stepper>]` factory.
+pub fn load_config_prefix(
+    config: &ConfigWrapper,
+    printer: &Arc<Printer>,
+) -> Result<Arc<dyn PrinterObject>, ConfigError> {
+    let object = Arc::new(EndstopPhase::new(config, printer)?);
+    // The prefix node registers its handler before the bare section is created,
+    // so it runs first and the bare section sees the phase it recorded
+    // (`endstop_phase.py:63-67`).
+    printer.register_event_handler(
+        KlippyEvent::HomingHomeRailsEnd {
+            axes: Vec::new(),
+            homing: HomingHandle::new(),
+        },
+        Box::new({
+            let object = Arc::clone(&object);
+            move |event| {
+                if let KlippyEvent::HomingHomeRailsEnd { homing, .. } = event {
+                    object.handle_home_rails_end(homing);
+                }
+            }
+        }),
+    );
+    EndstopPhases::ensure(printer)?;
     Ok(object)
 }
 
@@ -690,5 +979,248 @@ mod tests {
             status["last_home"]["stepper_x"]["mcu_position"],
             json!(11.0)
         );
+    }
+
+    // =======================================================================
+    // `[endstop_phase <stepper>]`
+    // =======================================================================
+
+    /// Load a config text the way the host does.
+    fn load(text: &str) -> (Arc<Printer>, Result<(), ConfigError>) {
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        let config = crate::core::klippy::config::Config::from_text(text)
+            .expect("the test config parses")
+            .0;
+        let result = printer.load_config(&config);
+        (printer, result)
+    }
+
+    /// An `[mcu]`, the makergear `[stepper_x]` geometry (8 microsteps, 36 mm
+    /// per rotation), and `[endstop_phase stepper_x]` with `extra` options.
+    fn config_with_x(extra: &str) -> String {
+        format!(
+            "[mcu]\nserial: /dev/not-opened-yet\n\
+             [stepper_x]\nstep_pin: PA0\ndir_pin: PA1\nenable_pin: !PA7\n\
+             microsteps: 8\nrotation_distance: 36\nposition_endstop: 0.0\n\
+             position_max: 200\n\
+             [endstop_phase stepper_x]\n{extra}"
+        )
+    }
+
+    fn prefix_object(printer: &Arc<Printer>) -> Arc<EndstopPhase> {
+        printer
+            .lookup_object_as::<EndstopPhase>("endstop_phase stepper_x")
+            .expect("the prefix section loads")
+    }
+
+    /// The bare section with zero options loads through the real loader, so
+    /// `check_unused` accepts it (tmc.cfg's `[endstop_phase]`).
+    #[test]
+    fn test_the_bare_section_passes_check_unused() {
+        let (printer, result) = load("[mcu]\nserial: /dev/not-opened-yet\n[endstop_phase]\n");
+
+        result.unwrap();
+        assert!(printer
+            .lookup_object_as::<EndstopPhases>(ENDSTOP_PHASE_OBJECT)
+            .is_some());
+    }
+
+    /// The phase count is `microsteps × 4` (`endstop_phase.py:58`).
+    #[test]
+    fn test_the_prefix_section_uses_microsteps_times_four() {
+        let (printer, result) = load(&config_with_x(""));
+
+        result.unwrap();
+        let object = prefix_object(&printer);
+        assert_eq!(object.phases, 32, "8 microsteps × 4");
+        assert_eq!(object.step_dist, 36.0 / (200.0 * 8.0));
+        // The bare section is created on demand (upstream's `load_object`); it
+        // keeps its `get_status`, while the prefix object is not queryable.
+        let bare = printer
+            .lookup_object_as::<EndstopPhases>(ENDSTOP_PHASE_OBJECT)
+            .expect("the bare section is ensured");
+        assert!(bare.is_queryable());
+        assert!(!object.is_queryable());
+    }
+
+    /// A `trigger_phase` pins the phase and halves the tolerated error
+    /// (`endstop_phase.py:80-93`).
+    #[test]
+    fn test_trigger_phase_selects_the_phase_and_halves_the_accuracy() {
+        let (printer, result) = load(&config_with_x("trigger_phase: 1/4\nendstop_accuracy: .200"));
+
+        result.unwrap();
+        let object = prefix_object(&printer);
+        // round(1/4 × 32) = 8.
+        assert_eq!(
+            *object
+                .endstop_phase
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()),
+            Some(8)
+        );
+        // ceil(0.200 × 0.5 / step_dist) = 5, not the 9 a plain
+        // `endstop_accuracy` would give.
+        assert_eq!(object.endstop_phase_accuracy, 5);
+    }
+
+    /// Without a `trigger_phase` the accuracy is not halved.
+    #[test]
+    fn test_endstop_accuracy_without_a_trigger_phase_is_not_halved() {
+        let (printer, result) = load(&config_with_x("endstop_accuracy: .200"));
+
+        result.unwrap();
+        assert_eq!(prefix_object(&printer).endstop_phase_accuracy, 9);
+    }
+
+    /// `trigger_phase` with `p >= ps` is rejected verbatim.
+    #[test]
+    fn test_an_invalid_trigger_phase_is_rejected() {
+        let (_printer, result) = load(&config_with_x("trigger_phase: 3/3"));
+
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("Invalid trigger_phase '3/3'"),
+            "{err}"
+        );
+    }
+
+    /// An accuracy too coarse for the phase count is rejected.
+    #[test]
+    fn test_a_coarse_endstop_accuracy_is_rejected() {
+        let (_printer, result) = load(&config_with_x("endstop_accuracy: 5.0"));
+
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains(
+                "Endstop for stepper_x is not accurate enough for stepper phase adjustment"
+            ),
+            "{err}"
+        );
+    }
+
+    /// A directly built section with `phases` and a `step_dist` for the
+    /// offset math.
+    fn phase(
+        phases: usize,
+        step_dist: f64,
+        reference: Option<usize>,
+        accuracy: usize,
+    ) -> EndstopPhase {
+        EndstopPhase {
+            name: "stepper_x".to_string(),
+            phase_calc: Arc::new(Mutex::new(PhaseCalc::new("stepper_x", Some(phases)))),
+            step_dist,
+            phases,
+            position_endstop: 0.0,
+            endstop_phase: Mutex::new(reference),
+            endstop_align_zero: false,
+            endstop_phase_accuracy: accuracy,
+        }
+    }
+
+    /// The first home records the phase and returns `0.0`
+    /// (`endstop_phase.py:105-118`).
+    #[test]
+    fn test_the_first_home_records_the_phase_and_returns_zero() {
+        let object = phase(8, 1.0, None, 2);
+
+        assert_eq!(object.get_homed_offset(3.0).unwrap(), 0.0);
+        assert_eq!(
+            *object
+                .endstop_phase
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()),
+            Some(3)
+        );
+    }
+
+    /// A sample within `accuracy` of the reference returns the signed
+    /// distance; the caller applies its own sign.
+    #[test]
+    fn test_a_known_phase_returns_the_step_offset() {
+        let object = phase(8, 0.5, Some(3), 2);
+
+        // One step ahead: +0.5 mm.
+        assert_eq!(object.get_homed_offset(4.0).unwrap(), 0.5);
+        // One step behind wraps to the short way: -0.5 mm.
+        assert_eq!(object.get_homed_offset(2.0).unwrap(), -0.5);
+    }
+
+    /// A phase near the wrap subtracts `phases` instead of taking a modulo
+    /// (`endstop_phase.py:113-114`).
+    #[test]
+    fn test_a_phase_near_the_wrap_subtracts_the_phase_count() {
+        // reference 1, phases 8, accuracy 2: the wrap threshold is 6.
+        let object = phase(8, 1.0, Some(1), 2);
+
+        // (7 - 1) % 8 = 6 >= 8 - 2: 6 - 8 = -2 steps, not +6.
+        assert_eq!(object.get_homed_offset(7.0).unwrap(), -2.0);
+    }
+
+    /// A phase beyond the tolerance raises upstream's message.
+    #[test]
+    fn test_a_phase_beyond_the_tolerance_raises() {
+        let object = phase(8, 1.0, Some(1), 2);
+
+        let err = object.get_homed_offset(5.0).unwrap_err();
+        assert_eq!(
+            err.message(),
+            "Endstop stepper_x incorrect phase (got 5 vs 1)"
+        );
+    }
+
+    /// The homing handler nudges the axis by the offset the phase math gives.
+    #[test]
+    fn test_the_prefix_handler_sets_a_stepper_adjustment() {
+        let object = phase(8, 1.0, Some(3), 2);
+        let homing = HomingHandle::new();
+        homing.lock().set_trigger_position("stepper_x", 4.0);
+
+        object.handle_home_rails_end(&homing);
+
+        assert_eq!(homing.lock().adjustments()["stepper_x"], 1.0);
+    }
+
+    /// A phase mismatch is left in the run state for the driver to raise
+    /// (a port event handler cannot return an error).
+    #[test]
+    fn test_the_prefix_handler_records_a_phase_error() {
+        let object = phase(8, 1.0, Some(1), 1);
+        let homing = HomingHandle::new();
+        homing.lock().set_trigger_position("stepper_x", 5.0);
+
+        object.handle_home_rails_end(&homing);
+
+        let mut state = homing.lock();
+        assert_eq!(
+            state.take_error(),
+            Some("Endstop stepper_x incorrect phase (got 5 vs 1)".to_string())
+        );
+        assert!(state.adjustments().is_empty());
+    }
+
+    /// A stepper with a prefix section shares that section's tracker, so the
+    /// bare section counts the same history (`endstop_phase.py:191-209`).
+    #[test]
+    fn test_the_bare_section_shares_the_prefix_tracker() {
+        let (printer, result) = load(&config_with_x(""));
+        result.unwrap();
+        let bare = printer
+            .lookup_object_as::<EndstopPhases>(ENDSTOP_PHASE_OBJECT)
+            .unwrap();
+        let prefix = prefix_object(&printer);
+
+        bare.update_stepper("stepper_x", 3.0, true);
+
+        let tracked = bare
+            .tracking
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())["stepper_x"]
+            .clone();
+        assert!(Arc::ptr_eq(&tracked, &prefix.phase_calc));
+        let tracked = tracked.lock().unwrap_or_else(|poison| poison.into_inner());
+        assert!(!tracked.stats_only, "the prefix tracker adjusts the axis");
+        assert_eq!(tracked.phase_history.as_ref().unwrap()[3], 0);
     }
 }

@@ -16,7 +16,7 @@
 //! | `hardware_pwm` | the firmware's PWM rather than a software one (default false) |
 //! | `shutdown_speed` | duty the firmware falls back to when klippy dies (default 0, `0 ..= 1`), capped by `max_power` |
 //! | `enable_pin` | optional digital output powering the driver, flipped only on 0 ↔ non-zero |
-//! | `tachometer_pin` | **refused** — see below |
+//! | `tachometer_pin` | optional GPIO the tachometer counts edges on (`tachometer_ppr`, default 2; `tachometer_poll_interval`, default 0.0015) |
 //!
 //! `M106`'s `S` defaults to 255 and has no upper bound (only `minval=0.`), as
 //! upstream's does; `max_power` is what caps the duty that results.
@@ -33,10 +33,11 @@
 //!   [`output_pin`](crate::core::klippy::extras::output_pin) already makes —
 //!   and gives the kick-start tail a reactor timer instead of a queue slot.
 //!   When C1d lands, both switch to the queue in one step.
-//! * **The tachometer.** `tachometer_pin` builds a `pulse_counter` frequency
-//!   counter (F7), which does not exist here. Upstream would report `rpm` from
-//!   it; rather than accept the pin and report `rpm: null` forever, the option
-//!   is refused with the module it needs.
+//!
+//! The tachometer is not one of the gaps: `tachometer_pin` builds a
+//! [`pulse_counter`](crate::core::klippy::extras::pulse_counter) frequency
+//! counter, and `get_status` reports `rpm` from it exactly as upstream's
+//! `FanTachometer` does — `null` for a section that has no tachometer pin.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -44,6 +45,7 @@ use serde_json::{json, Value};
 
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
 use crate::core::klippy::event::KlippyEvent;
+use crate::core::klippy::extras::pulse_counter::FrequencyCounter;
 use crate::core::klippy::gcode::{
     parse_float, sync, CommandError, CommandHandler, GCodeDispatch, GcodeCommand, GCODE_OBJECT,
 };
@@ -72,6 +74,70 @@ struct FanState {
     kick_serial: u64,
 }
 
+/// Seconds between two tachometer samples (upstream's fixed `sample_time`).
+const TACHOMETER_SAMPLE_TIME: f64 = 1.;
+
+/// Upstream's `FanTachometer` (`fan.py:85-106`): the optional pulse counter
+/// behind `tachometer_pin`, and the RPM its frequency becomes.
+struct FanTachometer {
+    /// Pulses per revolution (`tachometer_ppr`), upstream's `self.ppr`.
+    ppr: f64,
+    /// The frequency counter, when the section has a `tachometer_pin`.
+    counter: Option<FrequencyCounter>,
+}
+
+impl FanTachometer {
+    /// Read the tachometer options and build the counter (`FanTachometer.__init__`).
+    ///
+    /// # Errors
+    /// `tachometer_ppr` below 1, `tachometer_poll_interval` at or below 0, or
+    /// any complaint [`FrequencyCounter::new`] makes about the pin.
+    fn new(
+        config: &ConfigWrapper,
+        identifier: &str,
+        pins: &PrinterPins,
+    ) -> Result<Self, ConfigError> {
+        let Some(pin) = config.get_str("tachometer_pin") else {
+            // No tachometer pin: upstream keeps the counter at `None` and
+            // reports no RPM for this section.
+            return Ok(Self {
+                ppr: 2.,
+                counter: None,
+            });
+        };
+        let ppr = config.get_int_bounded("tachometer_ppr", Some(2), Some(1), None)?;
+        let poll_time = config.get_float_bounded(
+            "tachometer_poll_interval",
+            Some(0.0015),
+            None,
+            None,
+            Some(0.),
+            None,
+        )?;
+        let counter = FrequencyCounter::new(pins, &pin, TACHOMETER_SAMPLE_TIME, poll_time)
+            .map_err(|err| ConfigError::new(format!("{identifier}: {err}")))?;
+        Ok(Self {
+            ppr: ppr as f64,
+            counter: Some(counter),
+        })
+    }
+
+    /// Upstream's `FanTachometer.get_status`: no tachometer reads as `null`,
+    /// one reads as the frequency scaled into RPM.
+    fn rpm(&self) -> Value {
+        match &self.counter {
+            Some(counter) => json!(to_rpm(counter.get_frequency(), self.ppr)),
+            None => Value::Null,
+        }
+    }
+}
+
+/// Upstream's `rpm = self._freq_counter.get_frequency() * 30. / self.ppr`
+/// (`fan.py:98`): the frequency of a `tachometer_ppr`-pulse train in RPM.
+fn to_rpm(frequency: f64, ppr: f64) -> f64 {
+    frequency * 30. / ppr
+}
+
 /// The fan core: one PWM pin, its optional enable line, and how to drive them.
 ///
 /// Shared with everything that chooses a speed: the `[fan]` object, its
@@ -84,6 +150,8 @@ pub struct Fan {
     off_below: f64,
     mcu_fan: Arc<dyn PwmOut>,
     enable_pin: Option<Arc<dyn DigitalOut>>,
+    /// The optional tachometer behind `tachometer_pin`.
+    tachometer: FanTachometer,
     state: Arc<Mutex<FanState>>,
 }
 
@@ -95,8 +163,7 @@ impl Fan {
     /// running when klippy dies).
     ///
     /// # Errors
-    /// A missing option, one out of range, a pin that cannot be set up — or
-    /// `tachometer_pin`, which needs `pulse_counter` (F7).
+    /// A missing option, one out of range, or a pin that cannot be set up.
     pub fn new(
         config: &ConfigWrapper,
         printer: &Arc<Printer>,
@@ -123,14 +190,6 @@ impl Fan {
             None,
         )?;
 
-        // The tachometer is the one part of the section this port cannot do.
-        if config.get_str("tachometer_pin").is_some() {
-            return Err(ConfigError::new(format!(
-                "Option 'tachometer_pin' in section '{identifier}' needs the pulse_counter \
-                 module, which is not implemented yet"
-            )));
-        }
-
         let pin_desc = config.get("pin", None)?;
         let pins = printer
             .lookup_object_as::<PrinterPins>(PINS_OBJECT)
@@ -156,6 +215,9 @@ impl Fan {
             None => None,
         };
 
+        // Upstream builds the tachometer after the pins (`fan.py:41`).
+        let tachometer = FanTachometer::new(config, &identifier, pins.as_ref())?;
+
         let fan = Arc::new(Self {
             reactor: printer.reactor(),
             max_power,
@@ -163,6 +225,7 @@ impl Fan {
             off_below,
             mcu_fan,
             enable_pin,
+            tachometer,
             state: Arc::new(Mutex::new(FanState::default())),
         });
 
@@ -271,10 +334,9 @@ impl Fan {
     pub fn get_status(&self, _eventtime: f64) -> Value {
         json!({
             "speed": self.lock().last_req_value,
-            // The tachometer is refused at config time, so there is never an
-            // rpm to report: upstream reports None for a section that has no
-            // `tachometer_pin`, which is every section this port accepts.
-            "rpm": Value::Null,
+            // Upstream reports `None` for a section without `tachometer_pin`
+            // (`fan.py:99-102`); one that has a counter reports its RPM.
+            "rpm": self.tachometer.rpm(),
         })
     }
 
@@ -404,7 +466,7 @@ pub(crate) fn load_config(
 mod tests {
     use super::*;
     use crate::core::klippy::config::{ConfigSection, ConfigValue};
-    use crate::core::klippy::mcu::McuError;
+    use crate::core::klippy::mcu::{ConfigBuilder, McuChip, McuError};
     use crate::core::klippy::pins::{PinChip, PinError, PinParams};
     use crate::core::klippy::reactor::ManualReactor;
 
@@ -496,6 +558,17 @@ mod tests {
         let pins = Arc::new(PrinterPins::new());
         let chip = Arc::new(FakeChip::default());
         pins.register_chip("mcu", chip.clone()).unwrap();
+        // A `tachometer_pin` needs a real MCU chip — the counter takes its oid
+        // there (`pulse_counter`) — while the fan's own pins stay on the fake.
+        pins.register_chip(
+            "counter",
+            Arc::new(McuChip::new(
+                "counter".to_string(),
+                Arc::new(ConfigBuilder::new()),
+                Arc::clone(&pins),
+            )),
+        )
+        .unwrap();
         printer.add_object(PINS_OBJECT, pins).unwrap();
         printer.send_event(&KlippyEvent::KlippyReady);
         (printer, chip, reactor)
@@ -739,17 +812,72 @@ mod tests {
     }
 
     #[test]
-    fn test_the_tachometer_is_refused_rather_than_ignored() {
+    fn test_the_tachometer_pin_builds_a_counter_and_reports_zero_rpm() {
+        let (printer, _chip, _reactor) = printer();
+
+        let fan = PrinterFan::new(
+            &wrap(&section("PA1", &[("tachometer_pin", "counter:PC0")])),
+            &printer,
+        )
+        .unwrap();
+
+        // No edge has been counted yet: 0 Hz scales to 0 RPM, which is a
+        // number — upstream reports `None` only for a section with no
+        // tachometer pin at all.
+        assert_eq!(fan.get_status(0.0)["rpm"], json!(0.0));
+    }
+
+    #[test]
+    fn test_the_tachometer_pin_may_carry_a_pull_up() {
+        let (printer, _chip, _reactor) = printer();
+
+        PrinterFan::new(
+            &wrap(&section("PA1", &[("tachometer_pin", "^counter:PC0")])),
+            &printer,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_a_tachometer_ppr_below_one_is_refused() {
         let (printer, _chip, _reactor) = printer();
 
         let err = PrinterFan::new(
-            &wrap(&section("PA1", &[("tachometer_pin", "PC0")])),
+            &wrap(&section(
+                "PA1",
+                &[("tachometer_pin", "counter:PC0"), ("tachometer_ppr", "0")],
+            )),
             &printer,
         )
         .unwrap_err();
 
-        assert!(err.to_string().contains("tachometer_pin"), "{err}");
-        assert!(err.to_string().contains("pulse_counter"), "{err}");
+        assert!(err.to_string().contains("tachometer_ppr"), "{err}");
+    }
+
+    #[test]
+    fn test_a_tachometer_poll_interval_must_be_above_zero() {
+        let (printer, _chip, _reactor) = printer();
+
+        let err = PrinterFan::new(
+            &wrap(&section(
+                "PA1",
+                &[
+                    ("tachometer_pin", "counter:PC0"),
+                    ("tachometer_poll_interval", "0"),
+                ],
+            )),
+            &printer,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("must be above 0"), "{err}");
+    }
+
+    #[test]
+    fn test_rpm_is_the_frequency_scaled_by_the_ppr() {
+        // 60 Hz over two pulses per revolution is 30 revolutions per second.
+        assert_eq!(to_rpm(60., 2.), 900.);
+        assert_eq!(to_rpm(0., 4.), 0.);
     }
 
     #[test]

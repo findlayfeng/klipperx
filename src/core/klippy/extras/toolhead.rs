@@ -93,7 +93,7 @@ use crate::core::klippy::motion::kinematics::{
 use crate::core::klippy::motion::plan::MoveLimits;
 use crate::core::klippy::motion::stepcompress::{StepCommand, StepCompressError};
 use crate::core::klippy::motion::toolhead::ToolHead;
-use crate::core::klippy::motion::{HomeCoord, HomingInfo};
+use crate::core::klippy::motion::{HomeCoord, Homing, HomingHandle, HomingInfo};
 use crate::core::klippy::printer::{ConnectFuture, Printer, PrinterObject, RestartHooks};
 use crate::core::klippy::reactor::Reactor;
 
@@ -1504,6 +1504,7 @@ async fn home_axes(
             // (`homing.py:178-184`): x **and** y — which is what opens
             // `limit_xy2` before the drip move is checked.
             let homing_axes = homing_axes_of(&forcepos);
+            let homing = HomingHandle::new();
             send(printer, &KlippyEvent::HomingHomeRailsBegin);
             let result = home_axis(
                 connected,
@@ -1513,16 +1514,13 @@ async fn home_axes(
                 &homing_axes,
                 info,
                 rail.step_dist(),
+                &stepper_names(rail),
                 endstop.as_ref(),
+                &homing,
                 printer,
             )
             .await;
-            send(
-                printer,
-                &KlippyEvent::HomingHomeRailsEnd {
-                    axes: homing_axes.clone(),
-                },
-            );
+            finish_home_rails(connected, &homing, homing_axes, printer)?;
             result?;
         }
         if requested.contains(&Z_AXIS) {
@@ -1535,6 +1533,7 @@ async fn home_axes(
             let (forcepos, movepos) =
                 polar_home_move(Z_AXIS, &info, params.position_min, params.position_max);
             let homing_axes = homing_axes_of(&forcepos);
+            let homing = HomingHandle::new();
             send(printer, &KlippyEvent::HomingHomeRailsBegin);
             let result = home_axis(
                 connected,
@@ -1544,16 +1543,13 @@ async fn home_axes(
                 &homing_axes,
                 info,
                 rail.step_dist(),
+                &stepper_names(rail),
                 endstop.as_ref(),
+                &homing,
                 printer,
             )
             .await;
-            send(
-                printer,
-                &KlippyEvent::HomingHomeRailsEnd {
-                    axes: homing_axes.clone(),
-                },
-            );
+            finish_home_rails(connected, &homing, homing_axes, printer)?;
             result?;
         }
         return Ok(());
@@ -1566,14 +1562,10 @@ async fn home_axes(
         .kinematics()
         .and_then(|kinematics| kinematics.unified_home())
     {
+        let homing = HomingHandle::new();
         send(printer, &KlippyEvent::HomingHomeRailsBegin);
-        let result = home_unified(connected, rails, &home, printer).await;
-        send(
-            printer,
-            &KlippyEvent::HomingHomeRailsEnd {
-                axes: vec![X_AXIS, Y_AXIS, Z_AXIS],
-            },
-        );
+        let result = home_unified(connected, rails, &home, &homing, printer).await;
+        finish_home_rails(connected, &homing, vec![X_AXIS, Y_AXIS, Z_AXIS], printer)?;
         return result;
     }
     for &axis in requested {
@@ -1584,6 +1576,7 @@ async fn home_axes(
         let params = rail.params();
         let info = rail.homing_info();
         let (forcepos, movepos) = home_move(axis, &info, params.position_min, params.position_max);
+        let homing = HomingHandle::new();
         send(printer, &KlippyEvent::HomingHomeRailsBegin);
         let result = home_axis(
             connected,
@@ -1593,16 +1586,98 @@ async fn home_axes(
             &[axis],
             info,
             rail.step_dist(),
+            &stepper_names(rail),
             endstop.as_ref(),
+            &homing,
             printer,
         )
         .await;
-        send(
-            printer,
-            &KlippyEvent::HomingHomeRailsEnd { axes: vec![axis] },
-        );
+        finish_home_rails(connected, &homing, vec![axis], printer)?;
         result?;
     }
+    Ok(())
+}
+
+/// The names of a rail's steppers, the keys the homing state records trigger
+/// positions under.
+fn stepper_names(rail: &Rail) -> Vec<String> {
+    rail.steppers()
+        .iter()
+        .map(|stepper| stepper.name().to_string())
+        .collect()
+}
+
+/// End one rail group's home: fire `homing:home_rails_end` with the run state
+/// and apply the offsets the handlers asked for (`Homing._do_home_rails`:
+/// record `trigger_mcu_pos`, send the event, then apply `adjust_pos`).
+fn finish_home_rails(
+    connected: &mut Connected,
+    homing: &HomingHandle,
+    axes: Vec<usize>,
+    printer: &Weak<Printer>,
+) -> Result<(), CommandError> {
+    send(
+        printer,
+        &KlippyEvent::HomingHomeRailsEnd {
+            axes: axes.clone(),
+            homing: homing.clone(),
+        },
+    );
+    let state = homing.lock();
+    apply_stepper_adjustments(connected, &state, &axes)
+}
+
+/// Offset each stepper's commanded position by the adjustment a
+/// `homing:home_rails_end` handler asked for, recompute the toolhead position
+/// from the offset motor positions, and give the homed axes the new value
+/// (`Homing._do_home_rails`'s `adjust_pos` step).
+///
+/// # Errors
+/// A kinematics that cannot invert the offset positions raises, as upstream
+/// does ("Cannot determine position of toolhead on axis … after homing").
+fn apply_stepper_adjustments(
+    connected: &mut Connected,
+    homing: &Homing,
+    homed_axes: &[usize],
+) -> Result<(), CommandError> {
+    if homing.adjustments().values().all(|offset| *offset == 0.0) {
+        return Ok(());
+    }
+    let positions: HashMap<String, f64> = connected
+        .toolhead
+        .motion_queuing_mut()
+        .steppers()
+        .iter()
+        .map(|stepper| {
+            let offset = homing
+                .adjustments()
+                .get(stepper.name())
+                .copied()
+                .unwrap_or(0.0);
+            (
+                stepper.name().to_string(),
+                stepper.commanded_position() + offset,
+            )
+        })
+        .collect();
+    let newpos: [Option<f64>; 3] = connected
+        .toolhead
+        .kinematics()
+        .map(|kinematics| kinematics.calc_position(&positions))
+        .unwrap_or([None; 3]);
+    let mut homepos = connected.toolhead.commanded_pos();
+    for &axis in homed_axes {
+        match newpos[axis] {
+            Some(value) => homepos.set_axis(axis, value),
+            None => {
+                return Err(CommandError::new(format!(
+                    "Cannot determine position of toolhead on axis {} after homing",
+                    ["x", "y", "z"][axis]
+                )));
+            }
+        }
+    }
+    connected.toolhead.set_position(homepos, &[]);
     Ok(())
 }
 
@@ -1641,6 +1716,7 @@ async fn home_unified(
     connected: &mut Connected,
     rails: &[Arc<Rail>],
     home: &UnifiedHome,
+    homing: &HomingHandle,
     printer: &Weak<Printer>,
 ) -> Result<(), CommandError> {
     for rail in rails {
@@ -1737,11 +1813,24 @@ async fn home_unified(
         // minus `rest_ticks` rounds down), which is why — as in `home_axis`
         // above — the value is not read here; upstream's file mode instead
         // reports "No trigger on … after full movement" for a miss.
-        rail.endstop()
+        let trigger_time = rail
+            .endstop()
             .expect("every rail's endstop was checked above")
             .home_wait(end)
             .await
             .map_err(command_error)?;
+        // Note each of the rail's steppers' trigger position
+        // (`StepperPosition.note_home_end`).
+        let steppers = connected.toolhead.motion_queuing_mut().steppers();
+        let mut state = homing.lock();
+        for stepper in rail.steppers() {
+            if let Some(host) = steppers.iter().find(|host| host.name() == stepper.name()) {
+                state.set_trigger_position(
+                    stepper.name(),
+                    host.past_mcu_position(trigger_time) as f64,
+                );
+            }
+        }
     }
     send(printer, &KlippyEvent::HomingHomingMoveEnd);
     // The carriage is now at its home position, all axes homed.
@@ -1764,7 +1853,9 @@ async fn home_axis(
     homing_axes: &[usize],
     info: HomingInfo,
     step_dist: f64,
+    stepper_names: &[String],
     endstop: &dyn HomingEndstop,
+    homing: &HomingHandle,
     printer: &Weak<Printer>,
 ) -> Result<(), CommandError> {
     // The caller computed the endpoints: `home_move`'s 1.5× overshoot for
@@ -1824,7 +1915,18 @@ async fn home_axis(
         }
     }
 
-    endstop.home_wait(end).await.map_err(command_error)?;
+    let trigger_time = endstop.home_wait(end).await.map_err(command_error)?;
+    // Note each stepper's trigger position (`StepperPosition.note_home_end`)
+    // before `set_position` moves the solver to the endstop position.
+    {
+        let steppers = connected.toolhead.motion_queuing_mut().steppers();
+        let mut state = homing.lock();
+        for name in stepper_names {
+            if let Some(stepper) = steppers.iter().find(|stepper| stepper.name() == name) {
+                state.set_trigger_position(name, stepper.past_mcu_position(trigger_time) as f64);
+            }
+        }
+    }
     send(printer, &KlippyEvent::HomingHomingMoveEnd);
     // The axis is now known at its endstop position.
     connected.toolhead.set_position(home, homing_axes);
@@ -2708,6 +2810,7 @@ mod tests {
         ));
         let printer = Arc::downgrade(&printer);
 
+        let homing = HomingHandle::new();
         home_axis(
             &mut connected,
             X_AXIS,
@@ -2716,7 +2819,9 @@ mod tests {
             &[X_AXIS],
             info,
             1.0,
+            &["stepper_x".to_string()],
             &endstop,
+            &homing,
             &printer,
         )
         .await
@@ -2729,6 +2834,72 @@ mod tests {
             "x"
         );
         assert!(connected.toolhead.trapq().moves().is_empty());
+        // The trigger position is the stepper's MCU step position at the
+        // trigger: X homed to its 0.0 endstop at 1 mm/step, so 0 steps.
+        let state_guard = homing.lock();
+        assert_eq!(state_guard.get_trigger_position("stepper_x"), 0.0);
+        drop(state_guard);
+        *state.lock().unwrap_or_else(|p| p.into_inner()) = Some(connected);
+    }
+
+    /// `set_stepper_adjustment` shifts the homed axis' coordinate by the
+    /// requested offset, as `[endstop_phase]` makes it do
+    /// (`Homing._do_home_rails`'s `adjust_pos` step).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_stepper_adjustment_shifts_the_homed_axis() {
+        let mut toolhead = homed_toolhead();
+        toolhead.set_position(Coord::default(), &[]);
+        if let Some(kinematics) = toolhead.kinematics_mut() {
+            kinematics.clear_homing_state(&[X_AXIS, Y_AXIS, Z_AXIS]);
+        }
+        let (state, _gcode) = connected(toolhead);
+        let mut connected = state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+            .unwrap();
+        let completion = Completion::new();
+        completion.complete(crate::core::klippy::cmd::trsync::TriggerReason::EndstopHit);
+        let endstop = FakeEndstop { completion };
+        use crate::core::klippy::extras::stepper::RailParams;
+        let params = RailParams {
+            position_min: 0.0,
+            position_max: 200.0,
+            position_endstop: 0.0,
+        };
+        let info = test_homing_info();
+        let (forcepos, movepos) =
+            home_move(X_AXIS, &info, params.position_min, params.position_max);
+        let printer = Arc::new(Printer::new(
+            crate::core::klippy::reactor::ManualReactor::shared(),
+        ));
+        let printer = Arc::downgrade(&printer);
+
+        let homing = HomingHandle::new();
+        home_axis(
+            &mut connected,
+            X_AXIS,
+            forcepos,
+            movepos,
+            &[X_AXIS],
+            info,
+            1.0,
+            &["stepper_x".to_string()],
+            &endstop,
+            &homing,
+            &printer,
+        )
+        .await
+        .unwrap();
+        assert_eq!(connected.toolhead.commanded_pos().x(), 0.0);
+
+        // A +0.5 mm endstop-phase offset moves the homed X coordinate to 0.5.
+        let adjustments = homing.lock();
+        let mut state_guard = adjustments;
+        state_guard.set_stepper_adjustment("stepper_x", 0.5);
+        apply_stepper_adjustments(&mut connected, &state_guard, &[X_AXIS]).unwrap();
+        assert_eq!(connected.toolhead.commanded_pos().x(), 0.5);
+        drop(state_guard);
         *state.lock().unwrap_or_else(|p| p.into_inner()) = Some(connected);
     }
 

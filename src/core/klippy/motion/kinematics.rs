@@ -7,6 +7,7 @@
 //! in FW6.
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
 
@@ -140,6 +141,98 @@ pub trait HomingState {
     /// (it can be outside the travel); `movepos` is where the axis is being
     /// homed to.
     fn home_rails(&mut self, rails: &[usize], forcepos: HomeCoord, movepos: HomeCoord);
+
+    /// The MCU step position a stepper reached when its endstop triggered
+    /// (`Homing.get_trigger_position`).
+    fn get_trigger_position(&self, stepper_name: &str) -> f64;
+
+    /// Ask for a position offset (mm) to apply after homing
+    /// (`Homing.set_stepper_adjustment`). A `homing:home_rails_end` handler uses
+    /// it to nudge an axis' endstop position to a full stepper phase; the driver
+    /// applies every offset once the handlers have run.
+    fn set_stepper_adjustment(&mut self, stepper_name: &str, adjustment: f64);
+}
+
+/// The state of one homing run — upstream's `Homing`.
+///
+/// Upstream keeps two maps on the object it hands to `homing:home_rails_end`:
+/// `trigger_mcu_pos`, the MCU step position each stepper reached when its
+/// endstop fired, and `adjust_pos`, the position offset (mm) a handler asks for.
+/// The driver records the first as it homes each rail, shares the object with
+/// the handlers, and applies the second once they have run. `[endstop_phase]`
+/// uses both to move an axis' endstop to a full stepper phase.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Homing {
+    trigger_mcu_pos: HashMap<String, f64>,
+    adjust_pos: HashMap<String, f64>,
+}
+
+impl Homing {
+    /// An empty run.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record the MCU step position `stepper_name` triggered at
+    /// (`Homing.trigger_mcu_pos`).
+    pub fn set_trigger_position(&mut self, stepper_name: &str, mcu_pos: f64) {
+        self.trigger_mcu_pos
+            .insert(stepper_name.to_string(), mcu_pos);
+    }
+
+    /// The MCU step position a stepper triggered at, or `0.0` for a stepper
+    /// that never triggered (`Homing.get_trigger_position`).
+    pub fn get_trigger_position(&self, stepper_name: &str) -> f64 {
+        self.trigger_mcu_pos
+            .get(stepper_name)
+            .copied()
+            .unwrap_or(0.0)
+    }
+
+    /// Ask for a position offset (mm) on a stepper
+    /// (`Homing.set_stepper_adjustment`).
+    pub fn set_stepper_adjustment(&mut self, stepper_name: &str, adjustment: f64) {
+        self.adjust_pos.insert(stepper_name.to_string(), adjustment);
+    }
+
+    /// Every offset a handler asked for, keyed by stepper name.
+    pub fn adjustments(&self) -> &HashMap<String, f64> {
+        &self.adjust_pos
+    }
+}
+
+/// A shared handle to one homing run's [`Homing`] state.
+///
+/// The toolhead records trigger positions through it and hands a clone to the
+/// `homing:home_rails_end` payload, so a handler can lock the same state to
+/// read trigger positions and set adjustments. It compares by pointer identity
+/// (the state behind it changes as handlers run), which is what lets the
+/// generated `KlippyEvent` keep deriving `PartialEq`.
+#[derive(Debug, Clone)]
+pub struct HomingHandle(Arc<Mutex<Homing>>);
+
+impl Default for HomingHandle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PartialEq for HomingHandle {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl HomingHandle {
+    /// A handle to an empty run.
+    pub fn new() -> Self {
+        Self(Arc::new(Mutex::new(Homing::new())))
+    }
+
+    /// Lock the run state.
+    pub fn lock(&self) -> std::sync::MutexGuard<'_, Homing> {
+        self.0.lock().unwrap_or_else(|poison| poison.into_inner())
+    }
 }
 
 /// What the toolhead needs from its kinematics.
@@ -1022,6 +1115,8 @@ mod tests {
         axes: Vec<usize>,
         info: [HomingInfo; 3],
         calls: Vec<(Vec<usize>, HomeCoord, HomeCoord)>,
+        triggers: std::collections::HashMap<String, f64>,
+        adjustments: std::collections::HashMap<String, f64>,
     }
 
     impl HomingState for FakeHoming {
@@ -1034,6 +1129,49 @@ mod tests {
         fn home_rails(&mut self, rails: &[usize], forcepos: HomeCoord, movepos: HomeCoord) {
             self.calls.push((rails.to_vec(), forcepos, movepos));
         }
+        fn get_trigger_position(&self, stepper_name: &str) -> f64 {
+            self.triggers.get(stepper_name).copied().unwrap_or(0.0)
+        }
+        fn set_stepper_adjustment(&mut self, stepper_name: &str, adjustment: f64) {
+            self.adjustments
+                .insert(stepper_name.to_string(), adjustment);
+        }
+    }
+
+    /// The run state `homing:home_rails_end` shares records each stepper's
+    /// trigger position and collects a handler's requested offsets (the two
+    /// maps upstream keeps on `Homing`).
+    #[test]
+    fn test_homing_records_trigger_positions_and_adjustments() {
+        let mut homing = Homing::new();
+        // An unknown stepper reads as zero (upstream's dict default).
+        assert_eq!(homing.get_trigger_position("stepper_x"), 0.0);
+
+        homing.set_trigger_position("stepper_x", 27.0);
+        assert_eq!(homing.get_trigger_position("stepper_x"), 27.0);
+
+        homing.set_stepper_adjustment("stepper_x", 0.5);
+        assert_eq!(homing.adjustments().get("stepper_x"), Some(&0.5));
+    }
+
+    #[test]
+    fn test_homing_state_trigger_position_round_trips_through_the_protocol() {
+        let mut homing = FakeHoming {
+            axes: vec![X_AXIS],
+            info: [
+                homing_info(0.0, false),
+                homing_info(200.0, true),
+                homing_info(0.0, false),
+            ],
+            calls: Vec::new(),
+            triggers: std::collections::HashMap::from([("stepper_x".to_string(), 12.0)]),
+            adjustments: std::collections::HashMap::new(),
+        };
+
+        assert_eq!(homing.get_trigger_position("stepper_x"), 12.0);
+        assert_eq!(homing.get_trigger_position("stepper_y"), 0.0);
+        homing.set_stepper_adjustment("stepper_x", -0.25);
+        assert_eq!(homing.adjustments.get("stepper_x"), Some(&-0.25));
     }
 
     fn homing_info(position_endstop: f64, positive_dir: bool) -> HomingInfo {
@@ -1059,6 +1197,8 @@ mod tests {
                 homing_info(0.0, false),
             ],
             calls: Vec::new(),
+            triggers: std::collections::HashMap::new(),
+            adjustments: std::collections::HashMap::new(),
         };
 
         kin.home(&mut homing);
@@ -1349,6 +1489,8 @@ mod tests {
                 homing_info(0.5, false),
             ],
             calls: Vec::new(),
+            triggers: std::collections::HashMap::new(),
+            adjustments: std::collections::HashMap::new(),
         };
 
         kin.home(&mut homing);
@@ -1373,6 +1515,8 @@ mod tests {
                 homing_info(0.5, false),
             ],
             calls: Vec::new(),
+            triggers: std::collections::HashMap::new(),
+            adjustments: std::collections::HashMap::new(),
         };
         kin.home(&mut homing);
         assert_eq!(homing.calls.len(), 1);
@@ -1388,6 +1532,8 @@ mod tests {
                 homing_info(0.5, false),
             ],
             calls: Vec::new(),
+            triggers: std::collections::HashMap::new(),
+            adjustments: std::collections::HashMap::new(),
         };
         kin.home(&mut homing);
         assert_eq!(homing.calls.len(), 1);

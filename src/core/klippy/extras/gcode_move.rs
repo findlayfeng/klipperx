@@ -361,12 +361,15 @@ impl GCodeMove {
             }),
         );
         printer.register_event_handler(
-            KlippyEvent::HomingHomeRailsEnd { axes: Vec::new() },
+            KlippyEvent::HomingHomeRailsEnd {
+                axes: Vec::new(),
+                homing: crate::core::klippy::motion::HomingHandle::new(),
+            },
             Box::new({
                 let object = Arc::clone(self);
                 move |event| {
                     let axes = match event {
-                        KlippyEvent::HomingHomeRailsEnd { axes } => axes.as_slice(),
+                        KlippyEvent::HomingHomeRailsEnd { axes, .. } => axes.as_slice(),
                         _ => &[],
                     };
                     object.handle_home_rails_end(axes);
@@ -998,7 +1001,10 @@ mod tests {
         assert_eq!(read_gcode_position(&object)[2], 0.0);
 
         // Homing puts it back for the axis that homed — and only that axis.
-        printer.send_event(&KlippyEvent::HomingHomeRailsEnd { axes: vec![Z_AXIS] });
+        printer.send_event(&KlippyEvent::HomingHomeRailsEnd {
+            axes: vec![Z_AXIS],
+            homing: crate::core::klippy::motion::HomingHandle::new(),
+        });
 
         assert_eq!(read_gcode_position(&object)[2], 3.0, "5 - homing 2");
         assert_eq!(object.status()["homing_origin"][2], 2.0);

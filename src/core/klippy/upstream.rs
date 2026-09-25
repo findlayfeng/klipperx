@@ -963,29 +963,81 @@ mod tests {
         assert!(gcode.is_ok(), "{gcode:?}");
     }
 
-    /// SCRATCH (U-GC-3): run the corpus's `corexyuv.test` alone, bounded, so
-    /// the fake firmware's SIM-DIAG arm/fire trace can be read.
+    /// The corpus `corexyuv.cfg` homing, bounded: `G28` on the
+    /// generic-cartesian printer must arm and **fire** every axis' trsync and
+    /// the move after it must run (U-GC-3). Before the fix the Z homing move
+    /// was built with a zero-length profile — the kinematics was constructed
+    /// with `max_z_velocity = 0` — so no step was queued, the fake firmware
+    /// never fired the armed trsync, and the host waited forever while
+    /// retransmitting the arm block (the "infinite arm, never fire" log).
+    ///
+    /// Only the homing part of `corexyuv.test`'s script runs here; the rest of
+    /// that case still ends in a dual-carriage `Move out of range`, which is
+    /// not this chain and stays on the ignore list upstream.
     #[tokio::test(flavor = "multi_thread")]
-    async fn scratch_corexyuv_run() {
-        let runs: Vec<_> = all_runs()
+    async fn the_corexyuv_config_homes_against_the_fake_firmware() {
+        let Some(dict) = dictionary_path("atmega2560.dict") else {
+            return;
+        };
+        let run = all_runs()
             .into_iter()
-            .filter(|run| {
+            .find(|run| {
                 run.path
                     .file_name()
-                    .map(|n| n == "corexyuv.test")
+                    .map(|name| name == "corexyuv.test")
                     .unwrap_or(false)
             })
-            .collect();
-        assert_eq!(runs.len(), 1, "one corexyuv run");
-        for run in runs {
-            let dictionaries = run_dictionaries(&run);
-            let outcome = tokio::time::timeout(
-                std::time::Duration::from_secs(60),
-                run_case(&run, &dictionaries),
-            )
-            .await;
-            println!("SCRATCH-RESULT: {outcome:?}");
-        }
+            .expect("the corpus carries corexyuv.test");
+        let config = injected_config(&run.config, &[(None, dict)]).expect("corexyuv.cfg parses");
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            run_phases(&config, "corexyuv.cfg", "G90\nG28\nG1 X10 Y20 F6000\n"),
+        )
+        .await;
+        let gcode = outcome.expect(
+            "generic-cartesian homing finishes instead of waiting on a trsync that never fires",
+        );
+        assert!(gcode.is_ok(), "{gcode:?}");
+    }
+
+    /// The same chain on the smallest printer that can show it: three
+    /// `[carriage]` sections, one motor each, and a `G28 Z` — no corpus
+    /// section other than the Z rail is involved.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_generic_cartesian_z_home_fires_the_trsync() {
+        let Some(dict) = dictionary_path("atmega2560.dict") else {
+            return;
+        };
+        let text = format!(
+            "[mcu]\ntest: dict={}\n\
+             [printer]\nkinematics: generic_cartesian\nmax_velocity: 300\nmax_accel: 3000\n\
+             max_z_velocity: 5\nmax_z_accel: 100\n\
+             [carriage carriage_x]\naxis: x\nposition_endstop: 0\nposition_max: 300\n\
+             homing_speed: 50\nendstop_pin: ^PE5\n\
+             [carriage carriage_y]\naxis: y\nposition_endstop: 0\nposition_max: 200\n\
+             homing_speed: 50\nendstop_pin: ^PJ1\n\
+             [carriage carriage_z]\naxis: z\nposition_endstop: 0.5\nposition_max: 100\n\
+             homing_speed: 5\nendstop_pin: ^PD3\n\
+             [stepper a]\ncarriages: carriage_x\nstep_pin: PF0\ndir_pin: PF1\n\
+             enable_pin: !PD7\nmicrosteps: 16\nrotation_distance: 40\n\
+             [stepper b]\ncarriages: carriage_y\nstep_pin: PH1\ndir_pin: PH0\n\
+             enable_pin: !PA1\nmicrosteps: 16\nrotation_distance: 40\n\
+             [stepper z]\ncarriages: carriage_z\nstep_pin: PL3\ndir_pin: PL1\n\
+             enable_pin: !PK0\nmicrosteps: 16\nrotation_distance: 8\n",
+            dict.display()
+        );
+        let (config, _) = Config::from_text(&text).expect("the generic-cartesian config parses");
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            run_phases(&config, "focused-gc-z.cfg", "G28 Z\n"),
+        )
+        .await;
+        let gcode = outcome.expect(
+            "the Z homing move fires its trsync instead of waiting on one that never fires",
+        );
+        assert!(gcode.is_ok(), "{gcode:?}");
     }
 }
 

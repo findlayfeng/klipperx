@@ -437,7 +437,7 @@ impl ToolHeadObject {
                 // (`generic_cartesian.py:118-172`) and installs each motor's
                 // solver as it reads it; the built kinematics waits for
                 // connect, like delta's.
-                let built = carriage::build(printer)?;
+                let built = carriage::build(printer, max_z_velocity, max_z_accel)?;
                 generic_kinematics = Some(built.kinematics);
                 generic_steppers = built.steppers;
             }
@@ -1568,10 +1568,6 @@ async fn home_axes(
             let info = carriage.homing_info();
             let (forcepos, movepos) =
                 home_move(axis, &info, params.position_min, params.position_max);
-            eprintln!(
-                "HOST-DIAG: GC home axis={axis} carriage={} force={forcepos:?} move={movepos:?}",
-                carriage.name()
-            );
             let step_dist = model.step_dist(carriage.name()).unwrap_or(1.0);
             send(printer, &KlippyEvent::HomingHomeRailsBegin);
             let result = home_axis(
@@ -1888,7 +1884,6 @@ async fn home_axis(
     let current = connected.toolhead.commanded_pos();
     let force = fill_coord(forcepos, current);
     let home = fill_coord(movepos, current);
-    eprintln!("HOST-DIAG: home_axis axis={axis} current={current:?} force={force:?} home={home:?} speed={}", info.speed);
     connected.toolhead.set_position(force, homing_axes);
 
     // Poll the endstop about once per step so a trigger is seen promptly.
@@ -1897,7 +1892,6 @@ async fn home_axis(
     let rest_time = (move_t / steps).max(0.001);
 
     let print_time = connected.toolhead.get_last_move_time();
-    eprintln!("HOST-DIAG: home_axis arm axis={axis} print_time={print_time}");
     let completion = endstop
         .home_start(
             print_time,
@@ -1913,7 +1907,6 @@ async fn home_axis(
         .toolhead
         .drip_move(home, info.speed)
         .map_err(|err| CommandError::new(err.to_string()))?;
-    eprintln!("HOST-DIAG: home_axis axis={axis} drip start={start} end={end}");
 
     // Drip the move out in small windows; stop as soon as the trigger fires.
     let mut flush_time = start;
@@ -1923,24 +1916,15 @@ async fn home_axis(
             .toolhead
             .flush_step_generation(flush_time)
             .map_err(|err| CommandError::new(err.to_string()))?;
-        let batch_names: Vec<String> = batches
-            .iter()
-            .map(|(n, c)| format!("{n}({})", c.len()))
-            .collect();
         for (name, commands) in batches {
             if let Some(stepper) = connected.mcu_steppers.get(&name) {
                 stepper
                     .send_steps_async(&commands)
                     .await
                     .map_err(command_error)?;
-            } else {
-                eprintln!("HOST-DIAG: no mcu stepper for batch {name}");
             }
         }
         if completion.reason().is_none() {
-            eprintln!(
-                "HOST-DIAG: drip axis={axis} flush_time={flush_time} end={end} batches={batch_names:?}"
-            );
             // Wake on the trigger as well as on the drip interval: the
             // completion can fire between the check above and here, in which
             // case waiting out the whole `sleep` would stall the loop.
@@ -1951,9 +1935,7 @@ async fn home_axis(
         }
     }
 
-    eprintln!("HOST-DIAG: home_axis waiting for trigger axis={axis}");
     endstop.home_wait(end).await.map_err(command_error)?;
-    eprintln!("HOST-DIAG: home_axis triggered axis={axis}");
     send(printer, &KlippyEvent::HomingHomingMoveEnd);
     // The axis is now known at its endstop position.
     connected.toolhead.set_position(home, homing_axes);

@@ -1065,8 +1065,14 @@ fn parse_test_file(path: &Path) -> Result<Vec<UpstreamRun>, String> {
     let mut gcode_file = None;
     let mut gcode_lines: Vec<String> = Vec::new();
     let mut should_fail = false;
-    // The `CONFIG` waiting for the next `CONFIG` (or the end of the file).
-    let mut pending: Option<PathBuf> = None;
+    // The `CONFIG` seen most recently with the dictionary state it owns, waiting
+    // for the next `CONFIG` (or the end of the file) to be pushed. Fixtures write
+    // the directive both ways: `printers.test` puts `DICTIONARY` before its
+    // group, while `bed_mesh.test` and friends put `CONFIG` first — a
+    // `DICTIONARY` written after a `CONFIG` belongs to that pending run, one
+    // written before applies to the runs that follow. `None` means "no dictionary
+    // yet, a following `DICTIONARY` may claim this run".
+    let mut pending: Option<(PathBuf, Option<Vec<Dictionary>>)> = None;
 
     for (index, raw) in text.lines().enumerate() {
         let line = match raw.find('#') {
@@ -1083,16 +1089,18 @@ fn parse_test_file(path: &Path) -> Result<Vec<UpstreamRun>, String> {
                 let arg = args
                     .first()
                     .ok_or_else(|| format!("{}:{line_no}: CONFIG needs a path", path.display()))?;
-                if let Some(config) = pending.replace(dir.join(arg)) {
+                if let Some((config, snapshot)) = pending.take() {
                     runs.push(UpstreamRun {
                         path: path.to_path_buf(),
                         config,
-                        dictionaries: dictionaries.clone(),
+                        dictionaries: snapshot.unwrap_or_else(|| dictionaries.clone()),
                         gcode_file: gcode_file.clone(),
                         gcode_lines: gcode_lines.clone(),
                         should_fail,
                     });
                 }
+                let snapshot = (!dictionaries.is_empty()).then(|| dictionaries.clone());
+                pending = Some((dir.join(arg), snapshot));
             }
             "DICTIONARY" => {
                 let main = args.first().ok_or_else(|| {
@@ -1115,6 +1123,13 @@ fn parse_test_file(path: &Path) -> Result<Vec<UpstreamRun>, String> {
                     });
                 }
                 dictionaries = entries;
+                // A `DICTIONARY` written after a `CONFIG` belongs to that pending
+                // run; one written before it belongs to the following runs only.
+                if let Some((_, snapshot)) = pending.as_mut() {
+                    if snapshot.is_none() {
+                        *snapshot = Some(dictionaries.clone());
+                    }
+                }
             }
             "GCODE" => {
                 let arg = args
@@ -1127,11 +1142,11 @@ fn parse_test_file(path: &Path) -> Result<Vec<UpstreamRun>, String> {
         }
     }
 
-    if let Some(config) = pending {
+    if let Some((config, snapshot)) = pending {
         runs.push(UpstreamRun {
             path: path.to_path_buf(),
             config,
-            dictionaries,
+            dictionaries: snapshot.unwrap_or(dictionaries),
             gcode_file,
             gcode_lines,
             should_fail,

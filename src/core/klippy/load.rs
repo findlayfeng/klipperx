@@ -387,6 +387,8 @@ mod tests {
                 "neopixel",
                 "pca9533",
                 "pca9632",
+                "tmc2208",
+                "tmc2209",
                 // The display framework, after the `display_template` registry
                 // it reads (40) and before the bus consumers (50).
                 "display",

@@ -359,6 +359,7 @@ mod tests {
                 "exclude_object",
                 "gcode_arcs",
                 "gcode_macro",
+                "heater_fan",
                 "homing_override",
                 "manual_probe",
                 "probe",

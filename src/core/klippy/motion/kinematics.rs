@@ -165,6 +165,11 @@ pub trait HomingState {
 pub struct Homing {
     trigger_mcu_pos: HashMap<String, f64>,
     adjust_pos: HashMap<String, f64>,
+    /// The steppers that are primary on their rail. Upstream's
+    /// `homing:home_rails_end` handler reads this off the rails it is given
+    /// (the first stepper of each rail); the port's payload does not carry the
+    /// rails, so the driver records it alongside the trigger position.
+    primary: std::collections::HashSet<String>,
 }
 
 impl Homing {
@@ -193,6 +198,26 @@ impl Homing {
     /// (`Homing.set_stepper_adjustment`).
     pub fn set_stepper_adjustment(&mut self, stepper_name: &str, adjustment: f64) {
         self.adjust_pos.insert(stepper_name.to_string(), adjustment);
+    }
+
+    /// Note whether `stepper_name` is its rail's primary stepper.
+    pub fn set_primary(&mut self, stepper_name: &str, primary: bool) {
+        if primary {
+            self.primary.insert(stepper_name.to_string());
+        }
+    }
+
+    /// Whether a stepper is primary on its rail (the one whose phase is worth
+    /// writing back to config).
+    pub fn is_primary(&self, stepper_name: &str) -> bool {
+        self.primary.contains(stepper_name)
+    }
+
+    /// Every stepper that triggered, with its MCU step position.
+    pub fn trigger_positions(&self) -> impl Iterator<Item = (&str, f64)> {
+        self.trigger_mcu_pos
+            .iter()
+            .map(|(name, position)| (name.as_str(), *position))
     }
 
     /// Every offset a handler asked for, keyed by stepper name.

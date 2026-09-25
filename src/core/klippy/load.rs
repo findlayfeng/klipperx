@@ -356,6 +356,7 @@ mod tests {
                 "controller_fan",
                 "delta_calibrate",
                 "display_status",
+                "endstop_phase",
                 "exclude_object",
                 "gcode_arcs",
                 "gcode_macro",

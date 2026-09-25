@@ -60,6 +60,7 @@ use crate::core::klippy::load::section;
 use crate::core::klippy::printer::{Printer, PrinterObject};
 use crate::core::klippy::reactor::{Reactor, TimerHandle};
 
+use super::hd44780::Hd44780;
 use super::st7920::ST7920;
 
 // The framework reads `[display_status]` (created on demand) and the
@@ -76,9 +77,9 @@ const REDRAW_MIN_TIME: f64 = 0.100;
 /// The panel names `lcd_type` accepts — upstream's `LCD_chips` keys
 /// (`display.py:12-19`).
 ///
-/// The whole list is accepted even though only `st7920` has a driver here, so
-/// the choice error is upstream's wording and the names are not silently
-/// rejected.
+/// The whole list is accepted even though only `st7920` and `hd44780` have a
+/// driver here, so the choice error is upstream's wording and the names are
+/// not silently rejected.
 const LCD_TYPES: &[&str] = &[
     "st7920",
     "emulated_st7920",
@@ -234,6 +235,7 @@ impl PrinterLCD {
         let lcd_type = config.get_choice("lcd_type", LCD_TYPES, None)?;
         let lcd_chip: Arc<dyn LcdChip> = match lcd_type.as_str() {
             "st7920" => Arc::new(ST7920::new(config, printer)?),
+            "hd44780" => Arc::new(Hd44780::new(config, printer)?),
             other => {
                 return Err(ConfigError::new(format!(
                     "lcd_type '{other}' is not implemented in this host"
@@ -1115,12 +1117,25 @@ mod tests {
     #[test]
     fn test_a_panel_without_a_driver_is_reported() {
         let err = machine()
-            .load_config(&display_config("lcd_type: hd44780\nrs_pin: PA3\n"))
+            .load_config(&display_config(
+                "lcd_type: uc1701\ncs_pin: PA3\nsclk_pin: PA1\nsid_pin: PC1\n",
+            ))
             .unwrap_err();
 
         assert_eq!(
             err.to_string(),
-            "lcd_type 'hd44780' is not implemented in this host"
+            "lcd_type 'uc1701' is not implemented in this host"
+        );
+
+        // The SPI sibling of the panel that does have a driver: `hd44780` is
+        // implemented, `hd44780_spi` is not.
+        let err = machine()
+            .load_config(&display_config("lcd_type: hd44780_spi\n"))
+            .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "lcd_type 'hd44780_spi' is not implemented in this host"
         );
     }
 

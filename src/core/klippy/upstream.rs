@@ -743,7 +743,9 @@ mod tests {
 
     /// Run the upstream runs that can be run: those whose dictionaries were all
     /// built and that are not on the ignore list.
-    ///
+
+    /// Run the upstream runs that can be run: those whose dictionaries were all
+    /// built and that are not on the ignore list.
     /// Which dictionaries exist is decided at build time by `KLIPPERX_ARCHES`
     /// (default `linux`). `KLIPPERX_UPSTREAM_ALL=1` bypasses the ignore list, so
     /// every run with its dictionaries reports its failures.

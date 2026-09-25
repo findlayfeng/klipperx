@@ -369,6 +369,7 @@ mod tests {
                 "probe",
                 "probe_eddy_current",
                 "quad_gantry_level",
+                "resonance_tester",
                 "screws_tilt_adjust",
                 "sdcard_loop",
                 "smart_effector",

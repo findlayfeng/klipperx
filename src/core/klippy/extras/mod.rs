@@ -52,6 +52,7 @@ pub mod pwm_cycle_time;
 pub mod pwm_tool;
 pub mod quad_gantry_level;
 pub mod query_endstops;
+pub mod resonance_tester;
 pub mod safe_z_home;
 pub mod screws_tilt_adjust;
 pub mod sdcard_loop;

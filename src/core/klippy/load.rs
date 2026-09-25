@@ -360,6 +360,7 @@ mod tests {
                 "gcode_arcs",
                 "gcode_macro",
                 "homing_override",
+                "input_shaper",
                 "manual_probe",
                 "probe",
                 "probe_eddy_current",

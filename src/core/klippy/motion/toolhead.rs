@@ -79,6 +79,21 @@ impl ToolHead {
         &self.extra_axes
     }
 
+    /// Remove a non-kinematic axis by identity (`ToolHead.remove_extra_axis`).
+    ///
+    /// A `GCODE_AXIS=` request takes the manual stepper back off the axis list;
+    /// upstream compares by object identity (`ea not in self.extra_axes`), so
+    /// this matches on the shared allocation.
+    pub fn remove_extra_axis(&mut self, axis: &Arc<dyn ExtraAxis>) {
+        if let Some(index) = self
+            .extra_axes
+            .iter()
+            .position(|candidate| Arc::ptr_eq(candidate, axis))
+        {
+            self.extra_axes.remove(index);
+        }
+    }
+
     /// The id of the main trapq, for an extra axis that needs one of its own.
     pub fn main_trapq(&self) -> usize {
         self.main_trapq

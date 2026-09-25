@@ -1039,6 +1039,66 @@ mod tests {
         );
         assert!(gcode.is_ok(), "{gcode:?}");
     }
+
+    /// SCRATCH (U-GC-4): the whole `corexyuv.test` script, line by line on one
+    /// live machine, printing every command's result.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn scratch_corexyuv_full_script_line_by_line() {
+        use crate::core::klippy::gcode::{GCodeDispatch, GCODE_OBJECT};
+        use crate::core::klippy::printer::{Printer, PrinterState};
+        use crate::core::klippy::reactor::TokioReactor;
+
+        let Some(dict) = dictionary_path("atmega2560.dict") else {
+            return;
+        };
+        let run = all_runs()
+            .into_iter()
+            .find(|run| {
+                run.path
+                    .file_name()
+                    .map(|name| name == "corexyuv.test")
+                    .unwrap_or(false)
+            })
+            .expect("the corpus carries corexyuv.test");
+        let config = injected_config(&run.config, &[(None, dict)]).expect("corexyuv.cfg parses");
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(300), async {
+            let reactor = Arc::new(TokioReactor::new(tokio::runtime::Handle::current()));
+            let printer = Arc::new(Printer::new(reactor));
+            let mut start_args = crate::core::klippy::api::StartArgs::collect("corexyuv.cfg", None);
+            start_args.debug_output = Some("_test_output".to_string());
+            printer.set_start_args(Arc::new(start_args));
+            printer.load_config(&config).expect("corexyuv.cfg loads");
+            tokio::time::timeout(std::time::Duration::from_secs(30), printer.bring_up())
+                .await
+                .expect("bring_up finishes");
+            let state = printer.get_state_message();
+            assert_eq!(state.category, PrinterState::Ready, "{state:?}");
+            let dispatcher = printer
+                .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+                .expect("the g-code dispatcher is registered");
+            let mut failed = None;
+            for line in &run.gcode_lines {
+                match dispatcher.run_script(line).await {
+                    Ok(()) => eprintln!("OK   | {line}"),
+                    Err(e) => {
+                        eprintln!("FAIL | {line} -> {e}");
+                        failed = Some(format!("{line} -> {e}"));
+                        break;
+                    }
+                }
+            }
+            printer.teardown();
+            failed
+        })
+        .await;
+        let failed = outcome.expect("the full script finishes inside the bound");
+        assert!(
+            failed.is_none(),
+            "corexyuv.test failed at: {}",
+            failed.unwrap()
+        );
+    }
 }
 
 use std::fs;

@@ -962,6 +962,31 @@ mod tests {
             .expect("the machine comes up");
         assert!(gcode.is_ok(), "{gcode:?}");
     }
+
+    /// SCRATCH (U-GC-3): run the corpus's `corexyuv.test` alone, bounded, so
+    /// the fake firmware's SIM-DIAG arm/fire trace can be read.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn scratch_corexyuv_run() {
+        let runs: Vec<_> = all_runs()
+            .into_iter()
+            .filter(|run| {
+                run.path
+                    .file_name()
+                    .map(|n| n == "corexyuv.test")
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert_eq!(runs.len(), 1, "one corexyuv run");
+        for run in runs {
+            let dictionaries = run_dictionaries(&run);
+            let outcome = tokio::time::timeout(
+                std::time::Duration::from_secs(60),
+                run_case(&run, &dictionaries),
+            )
+            .await;
+            println!("SCRATCH-RESULT: {outcome:?}");
+        }
+    }
 }
 
 use std::fs;

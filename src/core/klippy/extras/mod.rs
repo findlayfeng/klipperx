@@ -50,6 +50,7 @@ pub mod output_pin;
 pub mod pause_resume;
 pub mod probe;
 pub mod probe_eddy_current;
+pub mod pulse_counter;
 pub mod pwm_cycle_time;
 pub mod pwm_tool;
 pub mod quad_gantry_level;

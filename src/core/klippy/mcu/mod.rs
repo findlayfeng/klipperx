@@ -26,8 +26,6 @@ mod events;
 mod object;
 mod pending;
 mod resource;
-#[cfg(test)]
-pub(crate) use resource::chip_report;
 mod restart;
 mod restart_method;
 
@@ -508,61 +506,10 @@ impl Sender {
     }
 }
 
-/// TEMP instrumentation (U-TH-1A leak hunt): how many `Mcu`s exist right now.
-/// +1 in [`Mcu::from_parts`], -1 in [`Drop for Mcu`]; a count that stays above
-/// zero after `Printer::teardown` names a leaked MCU.
-#[cfg(test)]
-pub(crate) static MCU_LIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-/// TEMP instrumentation (U-TH-1A): the current live-`Mcu` count.
-#[cfg(test)]
-pub(crate) fn mcu_live() -> usize {
-    MCU_LIVE.load(Ordering::SeqCst)
-}
-
-/// TEMP instrumentation (U-TH-1A): the case the corpus harness is running now.
-#[cfg(test)]
-pub(crate) static MCU_CASE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// TEMP instrumentation (U-TH-1A): every `Mcu` handed out as an `Arc`, as
-/// `(serial, case id, weak handle)`. Dead entries stay (upgrade fails); the
-/// report below names the case each surviving MCU was created under.
-#[cfg(test)]
-static MCU_REG: StdMutex<Vec<(u64, u64, std::sync::Weak<Mcu>)>> = StdMutex::new(Vec::new());
-
-/// TEMP instrumentation (U-TH-1A): record `mcu` for the leak report.
-#[cfg(test)]
-pub(crate) fn register_mcu(mcu: &Arc<Mcu>) {
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-    let serial = NEXT.fetch_add(1, Ordering::SeqCst);
-    MCU_REG.lock().unwrap_or_else(|p| p.into_inner()).push((
-        serial,
-        MCU_CASE.load(Ordering::SeqCst),
-        Arc::downgrade(mcu),
-    ));
-}
-
-/// TEMP instrumentation (U-TH-1A): the still-alive MCUs as
-/// `(serial, case that created it, strong count)`.
-#[cfg(test)]
-pub(crate) fn mcu_alive_report() -> Vec<(u64, u64, usize)> {
-    MCU_REG
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .iter()
-        .filter_map(|(serial, case, weak)| {
-            weak.upgrade()
-                .map(|mcu| (*serial, *case, Arc::strong_count(&mcu)))
-        })
-        .collect()
-}
-
 impl Mcu {
     /// Create a new MCU from a name and interface.
     fn from_parts(name: String, interface: Interface) -> Self {
         info!("Creating MCU: {name}");
-        #[cfg(test)]
-        MCU_LIVE.fetch_add(1, Ordering::SeqCst);
         // The parser starts out knowing only the two formats the host owns; every
         // other format arrives with the firmware dictionary. It is built before the
         // receive task starts, and that task gets a clone of the same registry, so
@@ -1277,8 +1224,6 @@ impl Drop for Mcu {
     /// guarantees the task itself is torn down promptly.
     fn drop(&mut self) {
         eprintln!("MCU DROP {}", self.name);
-        #[cfg(test)]
-        MCU_LIVE.fetch_sub(1, Ordering::SeqCst);
         self.interface.shutdown();
         if let Some(handle) = self.recv_handle.take() {
             handle.abort();

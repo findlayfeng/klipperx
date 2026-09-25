@@ -231,8 +231,6 @@ impl Mcu {
         interface: Interface,
     ) -> Result<Arc<Mcu>, McuError> {
         let mcu = Arc::new(Mcu::new(name, interface));
-        #[cfg(test)]
-        crate::core::klippy::mcu::register_mcu(&mcu);
         if let Err(err) = mcu.identify(IDENTIFY_TIMEOUT).await {
             return Err(connect_error(&mcu, err));
         }

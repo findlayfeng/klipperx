@@ -361,6 +361,7 @@ mod tests {
                 "filament_switch_sensor",
                 "gcode_arcs",
                 "gcode_macro",
+                "heater_fan",
                 "homing_override",
                 "input_shaper",
                 "manual_probe",

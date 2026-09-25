@@ -397,6 +397,7 @@ mod tests {
                 "stepper_y",
                 "stepper_z",
                 "dual_carriage",
+                "endstop_phase",
                 "printer",
                 // The G28 wrapper takes the toolhead's handler away, so it has
                 // to load after `[printer]` (`order = 70` against `60`).
@@ -419,6 +420,9 @@ mod tests {
         assert_eq!(by_id("stepper_x").phase, Phase::Late);
         assert_eq!(by_id("stepper_arm").phase, Phase::Late);
         assert_eq!(by_id("stepper_bed").phase, Phase::Late);
+        // `[endstop_phase <stepper>]` reads its stepper section, so it loads
+        // after the steppers and before `[printer]`.
+        assert_eq!(by_id("endstop_phase").phase, Phase::Late);
         assert_eq!(by_id("printer").phase, Phase::Late);
         assert_eq!(by_id("printer").object, Some("toolhead"));
         assert!(FACTORIES

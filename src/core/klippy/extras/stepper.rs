@@ -171,6 +171,8 @@ pub struct SolverHooks {
 pub struct PrinterStepper {
     name: String,
     axis: Axis,
+    /// Microsteps per full step, as configured (`microsteps`).
+    microsteps: i64,
     /// Millimetres per step, after rotation distance, microsteps and gearing.
     step_dist: f64,
     /// The rotation distance the section wrote, and the full steps that make
@@ -449,6 +451,7 @@ impl PrinterStepper {
         Ok(Self {
             name,
             axis,
+            microsteps,
             step_dist,
             rotation_distance: Mutex::new(rotation_distance),
             steps_per_rotation,
@@ -551,6 +554,13 @@ impl PrinterStepper {
             .dir_inverted
             .lock()
             .unwrap_or_else(|poison| poison.into_inner()) = invert_dir;
+    }
+
+    /// Microsteps per full step, as configured (upstream's
+    /// `config.getint("microsteps")`). A phase count is `microsteps × 4`
+    /// (`endstop_phase.py:58`).
+    pub fn microsteps(&self) -> i64 {
+        self.microsteps
     }
 
     /// The rail range and homing point.

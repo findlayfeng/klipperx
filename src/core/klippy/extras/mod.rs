@@ -20,6 +20,7 @@ pub mod controller_fan;
 pub mod delta_calibrate;
 pub mod display_status;
 pub mod ds18b20;
+pub mod endstop_phase;
 pub mod error_mcu;
 pub mod exclude_object;
 pub mod extruder;

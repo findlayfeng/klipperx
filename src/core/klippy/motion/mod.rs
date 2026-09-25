@@ -35,8 +35,8 @@ pub use itersolve::{
     corexz_active_flags, corexz_position_fn, extruder_position_fn, Axis, AxisFlags, StepKinematics,
 };
 pub use kinematics::{
-    CartesianKinematics, CartesianTransform, HomeCoord, HomingInfo, HomingState, Kinematics,
-    MoveContext, NoneKinematics,
+    CartesianKinematics, CartesianTransform, HomeCoord, Homing, HomingHandle, HomingInfo,
+    HomingState, Kinematics, MoveContext, NoneKinematics,
 };
 pub use plan::{LookAheadQueue, Move, MoveLimits};
 pub use queuing::MotionQueuing;

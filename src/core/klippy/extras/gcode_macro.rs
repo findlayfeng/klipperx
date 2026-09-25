@@ -67,12 +67,57 @@ section!(
     prefix = load_config_prefix
 );
 
+/// The name the bare `[gcode_macro]` object registers under, and the name a
+/// module that loads it by hand looks it up by (`load_object(config,
+/// 'gcode_macro')`).
+pub const GCODE_MACRO_OBJECT: &str = "gcode_macro";
+
 /// The bare `[gcode_macro]` section: upstream's `PrinterGCodeMacro`, the
 /// object every macro loads its `gcode` option through (`gcode_macro.py:81`).
 ///
 /// It reads no options — the option check accepts a bare section that carries
 /// none, and rejects one that carries any, as upstream's does.
 pub struct PrinterGCodeMacro;
+
+impl PrinterGCodeMacro {
+    /// The single template holder; the first caller creates it, as upstream's
+    /// `printer.load_object(config, 'gcode_macro')` does when no
+    /// `[gcode_macro]` section exists.
+    ///
+    /// # Errors
+    /// A duplicate registration (a name already taken).
+    pub fn ensure(printer: &Arc<Printer>) -> Result<Arc<PrinterGCodeMacro>, ConfigError> {
+        if let Some(existing) = printer.lookup_object_as::<PrinterGCodeMacro>(GCODE_MACRO_OBJECT) {
+            return Ok(existing);
+        }
+        let object = Arc::new(PrinterGCodeMacro);
+        printer.add_object(
+            GCODE_MACRO_OBJECT,
+            Arc::clone(&object) as Arc<dyn PrinterObject>,
+        )?;
+        Ok(object)
+    }
+
+    /// Upstream's `PrinterGCodeMacro.load_template` (`gcode_macro.py:81-88`):
+    /// read `option` from `config` (or its `default` when given) and compile it.
+    ///
+    /// A module that carries a g-code option of its own (the filament sensors'
+    /// `runout_gcode` / `insert_gcode`) loads it this way instead of running a
+    /// `[gcode_macro]`.
+    ///
+    /// # Errors
+    /// A missing option when no `default` is given, or an unparsable template.
+    pub fn load_template(
+        &self,
+        config: &ConfigWrapper,
+        option: &str,
+        default: Option<&str>,
+    ) -> Result<Template, ConfigError> {
+        let name = format!("{}:{}", config.identifier(), option);
+        let script = config.get(option, default)?;
+        Template::parse(&name, &script).map_err(|error| ConfigError::new(error.to_string()))
+    }
+}
 
 impl PrinterObject for PrinterGCodeMacro {
     fn get_status(&self, _eventtime: f64) -> Value {

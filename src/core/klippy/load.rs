@@ -357,6 +357,8 @@ mod tests {
                 "delta_calibrate",
                 "display_status",
                 "exclude_object",
+                "filament_motion_sensor",
+                "filament_switch_sensor",
                 "gcode_arcs",
                 "gcode_macro",
                 "homing_override",

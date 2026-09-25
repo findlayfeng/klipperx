@@ -1478,11 +1478,17 @@ async fn home_axes(
     kind: KinematicsKind,
     requested: &[usize],
     printer: &Weak<Printer>,
-) -> Result<(), CommandError> {
+) -> Result<Vec<usize>, CommandError> {
     // `kinematics: none` has no rails, so there is nothing to home.
     if rails.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
+    // Which axes were homed. The caller fires `HomingHomeRailsEnd` with them
+    // **after** the toolhead is back in its shared slot, so a handler that reads
+    // the toolhead's position (gcode_move's `_handle_home_rails_end`) sees the
+    // homed position rather than the empty slot's default — which would clobber
+    // the extruder position that homing deliberately preserves.
+    let mut homed: Vec<usize> = Vec::new();
     if kind == KinematicsKind::Polar {
         // `home` of `kinematics/polar.py:95-108`: X and Y always home
         // **together** on the arm rail (`rails[0]`, Y pinned to 0 by
@@ -1517,12 +1523,7 @@ async fn home_axes(
                 printer,
             )
             .await;
-            send(
-                printer,
-                &KlippyEvent::HomingHomeRailsEnd {
-                    axes: homing_axes.clone(),
-                },
-            );
+            homed.extend_from_slice(&homing_axes);
             result?;
         }
         if requested.contains(&Z_AXIS) {
@@ -1548,15 +1549,10 @@ async fn home_axes(
                 printer,
             )
             .await;
-            send(
-                printer,
-                &KlippyEvent::HomingHomeRailsEnd {
-                    axes: homing_axes.clone(),
-                },
-            );
+            homed.extend_from_slice(&homing_axes);
             result?;
         }
-        return Ok(());
+        return Ok(homed);
     }
     // Delta homes every tower in one move and ignores which axes `G28` named
     // (`kinematics/delta.py:104-110` always takes all three rails), so its
@@ -1568,13 +1564,8 @@ async fn home_axes(
     {
         send(printer, &KlippyEvent::HomingHomeRailsBegin);
         let result = home_unified(connected, rails, &home, printer).await;
-        send(
-            printer,
-            &KlippyEvent::HomingHomeRailsEnd {
-                axes: vec![X_AXIS, Y_AXIS, Z_AXIS],
-            },
-        );
-        return result;
+        homed.extend_from_slice(&[X_AXIS, Y_AXIS, Z_AXIS]);
+        return result.map(|_| homed);
     }
     for &axis in requested {
         let rail = &rails[axis];
@@ -1597,13 +1588,10 @@ async fn home_axes(
             printer,
         )
         .await;
-        send(
-            printer,
-            &KlippyEvent::HomingHomeRailsEnd { axes: vec![axis] },
-        );
+        homed.push(axis);
         result?;
     }
-    Ok(())
+    Ok(homed)
 }
 
 /// The axes a homing force position marks as homed: every axis whose
@@ -2141,7 +2129,20 @@ async fn cmd_g28(
     };
     let result = home_axes(&mut connected, rails, kind, &requested, printer).await;
     *state.lock().unwrap_or_else(|poison| poison.into_inner()) = Some(connected);
-    result
+    // Fire the end event now the toolhead is back in the slot: a handler that
+    // reads the toolhead (gcode_move's `_handle_home_rails_end`) must see the
+    // homed position, not the empty slot's default.
+    if let Ok(homed) = &result {
+        if !homed.is_empty() {
+            send(
+                printer,
+                &KlippyEvent::HomingHomeRailsEnd {
+                    axes: homed.clone(),
+                },
+            );
+        }
+    }
+    result.map(|_| ())
 }
 
 /// The factory the `[printer]` declaration names.

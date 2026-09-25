@@ -173,6 +173,18 @@ pub struct PrinterStepper {
     axis: Axis,
     /// Millimetres per step, after rotation distance, microsteps and gearing.
     step_dist: f64,
+    /// The rotation distance the section wrote, and the full steps that make
+    /// one rotation (`get_rotation_distance`, `klippy/stepper.py:136-137`).
+    ///
+    /// `SET_EXTRUDER_ROTATION_DISTANCE` rewrites the distance; the host solver
+    /// is not rebuilt here, so the new value is recorded for reporting (the H10
+    /// motion-sync gap the extruder sections document).
+    rotation_distance: Mutex<f64>,
+    steps_per_rotation: f64,
+    /// Whether the direction pin was written with `!` (`orig_dir_inverted`,
+    /// `klippy/stepper.py:42`), and the runtime flag `set_dir_inverted` flips.
+    orig_dir_inverted: bool,
+    dir_inverted: Mutex<bool>,
     /// The range and homing point the kinematics reads.
     params: RailParams,
     /// The firmware side: oid, pins and the wire commands.
@@ -300,7 +312,8 @@ impl PrinterStepper {
         } else {
             config.get_float_bounded("rotation_distance", None, None, None, Some(0.0), None)?
         };
-        let step_dist = rotation_distance / (full_steps as f64 * microsteps as f64 * gear_ratio);
+        let steps_per_rotation = full_steps as f64 * microsteps as f64 * gear_ratio;
+        let step_dist = rotation_distance / steps_per_rotation;
 
         let pins = printer
             .lookup_object_as::<PrinterPins>(PINS_OBJECT)
@@ -437,6 +450,10 @@ impl PrinterStepper {
             name,
             axis,
             step_dist,
+            rotation_distance: Mutex::new(rotation_distance),
+            steps_per_rotation,
+            orig_dir_inverted: mcu_stepper.invert_dir(),
+            dir_inverted: Mutex::new(mcu_stepper.invert_dir()),
             params,
             mcu_stepper,
             endstop,
@@ -490,6 +507,50 @@ impl PrinterStepper {
     /// Millimetres per step.
     pub fn step_dist(&self) -> f64 {
         self.step_dist
+    }
+
+    /// The rotation distance and the steps that make one rotation
+    /// (upstream `get_rotation_distance`, `klippy/stepper.py:136-137`).
+    pub fn get_rotation_distance(&self) -> (f64, f64) {
+        (
+            *self
+                .rotation_distance
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()),
+            self.steps_per_rotation,
+        )
+    }
+
+    /// Upstream's `set_rotation_distance` (`klippy/stepper.py:138-143`).
+    ///
+    /// The distance is recorded; the host solver and `step_dist` are not
+    /// rebuilt, so motion does not yet follow the change (the H10 gap).
+    pub fn set_rotation_distance(&self, rotation_distance: f64) {
+        *self
+            .rotation_distance
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = rotation_distance;
+    }
+
+    /// `(dir_inverted, orig_dir_inverted)` (upstream `get_dir_inverted`,
+    /// `klippy/stepper.py:144-145`).
+    pub fn get_dir_inverted(&self) -> (bool, bool) {
+        (
+            *self
+                .dir_inverted
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()),
+            self.orig_dir_inverted,
+        )
+    }
+
+    /// Upstream's `set_dir_inverted` (`klippy/stepper.py:146-153`); the runtime
+    /// flag is recorded (the step generator is not rewritten, the H10 gap).
+    pub fn set_dir_inverted(&self, invert_dir: bool) {
+        *self
+            .dir_inverted
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = invert_dir;
     }
 
     /// The rail range and homing point.

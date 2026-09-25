@@ -313,7 +313,7 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 是「对应 `.test` 从 `IGNORED` 移除后通过」**，不是「某个错误不再出现」。详见
 [失败原因分析复盘](docs/work-log/2026-09-22-upstream-regression-failures.md#复盘计数口径与重排后补)。
 
-**当前失败原因统计**（`KLIPPERX_UPSTREAM_ALL=1` 实跑，2026-09-25（批 #12 合入后）：**70 次失败**、167 次通过、
+**当前失败原因统计**（`KLIPPERX_UPSTREAM_ALL=1` 实跑，2026-09-25（批 #13 合入后）：**56 次失败**、181 次通过、
 2 条因未构建 `pru` 字典不计，合计 239；下表为**选项名大小写修复后**的分布——49 次
 `must be specified` 归零但总数不变、首因整体后移，见[复盘](docs/work-log/2026-09-22-upstream-regression-failures.md#复盘计数口径与重排后补)
 的「收益不可加」）：
@@ -461,8 +461,8 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 
 ### H8 LCD 显示与菜单
 
-- [ ] `display/display.py` 框架与 `hd44780.py`、`hd44780_spi.py`、`aip31068_spi.py`、
-      `st7920.py`、`uc1701.py`。
+- [x] `display/display.py` 框架与 `hd44780.py`、`st7920.py`、`uc1701.py`（`ssd1306` 同文件，批 #7/#13 已落地，均 storage-only）。
+- [ ] `hd44780_spi.py`、`aip31068_spi.py`、`sh1106`。
 - [ ] 菜单：`display/menu.py`、`display/menu_keys.py`、`display.cfg`、`menu.cfg`；
       事件 `menu:*`。
 - [ ] 固件 `lcd_hd44780.c` / `lcd_st7920.c`。

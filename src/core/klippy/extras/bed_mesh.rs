@@ -124,6 +124,55 @@ fn two_floats(
     Ok(out)
 }
 
+/// Upstream's `parse_config_pair` (`bed_mesh.py:38-56`): one value makes a
+/// square grid `(n, n)`, two give the counts per axis, and any other length is
+/// refused with upstream's `malformed` wording; `minval` then bounds both
+/// counts — `probe_count` passes `minval=3` (`bed_mesh.py:399`), `mesh_pps`
+/// `minval=0` (`bed_mesh.py:409`).
+///
+/// # Errors
+/// An unparseable value keeps upstream's `Unable to parse` wording
+/// (`configfile.py:44-45`), a wrong length its `malformed` wording
+/// (`bed_mesh.py:42-43`), and a count below `minval` the `minimum of` wording
+/// (`bed_mesh.py:47-49`, whose section name carries no quotes, as upstream
+/// writes it).
+fn parse_config_pair(
+    config: &ConfigWrapper,
+    option: &str,
+    default: i64,
+    minval: i64,
+) -> Result<[i64; 2], ConfigError> {
+    let Some(items) = config.get_list(option, ',') else {
+        return Ok([default, default]);
+    };
+    // `getintlist` parses every value before the length is examined
+    // (`configfile.py:98-101`).
+    let mut parsed = Vec::with_capacity(items.len());
+    for item in &items {
+        parsed.push(item.trim().parse::<i64>().map_err(|_| {
+            ConfigError::new(format!(
+                "Unable to parse option '{option}' in section '{}'",
+                config.identifier()
+            ))
+        })?);
+    }
+    if parsed.len() != 2 {
+        if parsed.len() != 1 {
+            return Err(ConfigError::new(format!(
+                "bed_mesh: malformed '{option}' value: {}",
+                config.get_str(option).unwrap_or_default()
+            )));
+        }
+        parsed.push(parsed[0]);
+    }
+    if parsed[0] < minval || parsed[1] < minval {
+        return Err(ConfigError::new(format!(
+            "Option '{option}' in section bed_mesh must have a minimum of {minval}"
+        )));
+    }
+    Ok([parsed[0], parsed[1]])
+}
+
 /// Two integers from a `x, y` option.
 fn two_ints(
     config: &ConfigWrapper,
@@ -160,13 +209,19 @@ impl BedMeshOptions {
     /// Read every option the corpus writes.
     ///
     /// # Errors
-    /// As the option readers: a missing `mesh_min`/`mesh_max`/`probe_count`, a
-    /// malformed pair, an unknown `algorithm`.
+    /// As the option readers: a missing `mesh_min`/`mesh_max`, a malformed or
+    /// too-small `probe_count`, an unknown `algorithm`.
     pub fn read(config: &ConfigWrapper) -> Result<Self, ConfigError> {
-        let probe_count = two_ints(config, "probe_count", Some([3, 3]))?;
-        let round_probe_count = config.get_int("round_probe_count", Some(5))?;
-        let mesh_pps = two_ints(config, "mesh_pps", Some([2, 2]))?;
         let mesh_radius = config.get_optional_float("mesh_radius")?;
+        let round_probe_count = config.get_int("round_probe_count", Some(5))?;
+        // Upstream reads `probe_count` only for rectangular beds; a round bed
+        // counts from `round_probe_count` (`bed_mesh.py:386`, `bed_mesh.py:399`).
+        let probe_count = if mesh_radius.is_some() {
+            [round_probe_count, round_probe_count]
+        } else {
+            parse_config_pair(config, "probe_count", 3, 3)?
+        };
+        let mesh_pps = two_ints(config, "mesh_pps", Some([2, 2]))?;
         let faulty_regions = read_faulty_regions(config)?;
 
         Ok(Self {
@@ -516,6 +571,65 @@ mod tests {
 
     fn options(options: &[(&str, &str)]) -> BedMeshOptions {
         BedMeshOptions::read(&ConfigWrapper::untracked(&section(options))).unwrap()
+    }
+
+    /// The `BedMeshOptions::read` error for one `probe_count` value, as the
+    /// wording tests below ask for.
+    fn probe_count_error(value: &str) -> String {
+        BedMeshOptions::read(&ConfigWrapper::untracked(&section(&[
+            ("mesh_min", "10,10"),
+            ("mesh_max", "180,180"),
+            ("probe_count", value),
+        ])))
+        .unwrap_err()
+        .to_string()
+    }
+
+    /// One value is a square grid: upstream `parse_config_pair` duplicates it
+    /// (`bed_mesh.py:43-44`), which is what sovol's `probe_count: 5` relies on.
+    #[test]
+    fn a_single_probe_count_value_means_a_square_grid() {
+        let read = options(&[
+            ("mesh_min", "28, 20"),
+            ("mesh_max", "270, 270"),
+            ("probe_count", "5"),
+        ]);
+
+        assert_eq!(read.probe_count, [5, 5]);
+        assert_eq!(generate_points(&read).unwrap().len(), 25);
+    }
+
+    /// Two values keep each axis, either order (`bed_mesh.py:40-41`).
+    #[test]
+    fn a_probe_count_pair_keeps_each_axis() {
+        let read = options(&[
+            ("mesh_min", "10,10"),
+            ("mesh_max", "180,180"),
+            ("probe_count", "5, 3"),
+        ]);
+
+        assert_eq!(read.probe_count, [5, 3]);
+    }
+
+    /// Illegal `probe_count` values keep upstream's wording verbatim: three
+    /// values are `malformed` with the raw text (`bed_mesh.py:42-43`), a
+    /// non-number the parser's (`configfile.py:44-45`), and a count below
+    /// `minval=3` upstream's `minimum of` line, whose section name carries no
+    /// quotes (`bed_mesh.py:47-49`).
+    #[test]
+    fn illegal_probe_counts_keep_upstream_wording() {
+        assert_eq!(
+            probe_count_error("5, 5, 5"),
+            "bed_mesh: malformed 'probe_count' value: 5, 5, 5"
+        );
+        assert_eq!(
+            probe_count_error("left,30"),
+            "Unable to parse option 'probe_count' in section 'bed_mesh'"
+        );
+        assert_eq!(
+            probe_count_error("2, 2"),
+            "Option 'probe_count' in section bed_mesh must have a minimum of 3"
+        );
     }
 
     #[test]

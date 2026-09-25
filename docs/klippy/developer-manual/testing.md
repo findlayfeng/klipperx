@@ -309,7 +309,7 @@ git config core.hooksPath .githooks
 | `config/mod.rs`（同名段合并，M5d） | 重复段选项并集、同段重复选项后者胜、合并保首现位、非重复段零变化（4 测） |
 | `interface/devices/simulator.rs`（M5d 策略 b） | `trigger_analog_sample_activity_pushes_the_monitor_deadline`：活动顺延 + 非活动不顺延双向断言 |
 | `mathutil.rs`（M5d 校准数学） | `gaussian_solve_recovers_known_values`、`gaussian_solve_refuses_a_singular_system`、`solve_linear_equations_fits_a_quadratic_and_substitutes_back`、`mat_mul_transp_matches_the_reference_product`（4 测；另修 `mat_mul_transp` 参照积笔误 a·aᵀ） |
-| `template.rs` + `gcode_macro.rs`（批 #4 引擎） | 模板子集逐构 7、宏体渲染→gcode 派发 e2e/递归检测/`SET_GCODE_VARIABLE` 4、排除区 E 补偿 2、`get_status.extruder`/idex 帧交接 1（共 14 测） |
+| `template.rs` + `gcode_macro.rs`（批 #4 引擎 + 批 #9 `set`） | 模板子集逐构 8（新增 `set` 三态作用域 + 链式可见 + 语料 288 行真句）、宏体渲染→gcode 派发 e2e/递归检测/`SET_GCODE_VARIABLE` 4、排除区 E 补偿 2、`get_status.extruder`/idex 帧交接 1（共 15 测；两处钉子测试已翻转） |
 | `motion/kinematics.rs`（polar）+ `extras/stepper.rs`（两轨段）+ `toolhead.rs` polar 分支（批 #5，17 测） | 已知构型正/逆回代、±π 解卷与单次移位边界、`check_move` 门与中心减速、两轨段认领与选项矩阵、G28 联合回零（XY 后 Z）、`Error loading kinematics` 文案 |
 | `motion/delta.rs` + `extras/delta_calibrate.rs` + delta 段/工具头分支（批 #5，24 测） | 三角测量已知构型回代、同步 home、三塔段认领（无 position_max、b/c 继承 a 的 endstop）、SAVE_CONFIG 块解析（header 逐字节/剥前缀/正文优先/无块零变化）、假 MCU 多端停 per-oid 多槽（同 arm 同触发/单端停回归/按 oid 摘除）、弧度 gear_ratio 推断 |
 | `extras/shaper_defs.rs` + `extras/input_shaper.rs` + `mathutil.rs::pseudo_inverse`（wave-2，13 测） | 整形系数与上游 Python 逐位对齐（`mzv(5,0.6)`/`2hump_ei`/`ei(v_tol=)`/`zv`/`zvd`/`3hump_ei` 金值）、括号参数与 `get_shaper_cfg` 元数据、错误路径（`Too small n=…`/`Too large t=…`/`Unsupported arguments…`）、两条语料行的上报文案（x→y→z）、`dual_carriage` 的 connect 期 config_error 与运行期允许 |

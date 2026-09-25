@@ -497,7 +497,7 @@ SET_PIN PIN=pwm_fan VALUE=0.25  ; PWM：25% 占空比
 
 ### G-Code 宏命令（由 `[gcode_macro <名>]` 注册）
 
-每个 `[gcode_macro <名>]` 段在装载时以**大写宏名**注册为一条命令（help = `description`）。**宏体已渲染执行**（批 #4 受控子集引擎 `extras/template.rs`，渲染后经 gcode 派发）；`SET_GCODE_VARIABLE` 已注册；子集外构（`{% set %}`、过滤器）显式报错，完整 Jinja 属 H3。
+每个 `[gcode_macro <名>]` 段在装载时以**大写宏名**注册为一条命令（help = `description`）。**宏体已渲染执行**（批 #4 受控子集引擎 `extras/template.rs`，渲染后经 gcode 派发）；`SET_GCODE_VARIABLE` 已注册；**`{% set %}` 已支持**（批 #9，作用域对齐 Jinja2）；其余子集外构（过滤器等）显式报错，完整 Jinja 属 H3。
 
 ### QUERY_ENDSTOPS / M119
 

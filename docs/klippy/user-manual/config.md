@@ -749,7 +749,7 @@ pins: !PD0, PD1, PD2
 | `rename_existing` | — | 被改名的命令（仅 load 期同型检查，连接期换名未做） |
 | `variable_<名>` | — | 字面量，`get_status` 可见（只读） |
 
-宏即命令（大写注册）；**宏体已渲染执行**（批 #4：受控子集引擎，渲染后经 gcode 派发）；`SET_GCODE_VARIABLE` 已注册（变量可写）；裸 `[gcode_macro]` 为共享模板持有者（零选项）。模板子集外构（`{% set %}`、过滤器等）显式报错（缺口见 `extras/template.rs` 模块文档），完整 Jinja 保真仍属 H3。
+宏即命令（大写注册）；**宏体已渲染执行**（批 #4：受控子集引擎，渲染后经 gcode 派发）；`SET_GCODE_VARIABLE` 已注册（变量可写）；裸 `[gcode_macro]` 为共享模板持有者（零选项）。**`{% set %}` 已支持**（批 #9：顶层可见、`if` 块外泄、`for` 块不外泄，作用域对齐 Jinja2 3.1.6）；其余子集外构（`float`/`default(x)` 过滤器等）仍显式报错（缺口见 `extras/template.rs` 模块文档），完整 Jinja 保真仍属 H3。
 
 ### [led <name>] / [neopixel <name>] / [dotstar <name>] / [pca9533 <name>] / [pca9632 <name>] / [display_template <name>]
 

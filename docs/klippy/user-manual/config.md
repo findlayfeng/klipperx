@@ -821,3 +821,51 @@ cartesian 在 late 阶段认领；注册 `dual_carriage` 对象与 `SET_DUAL_CAR
 
 > 配置解析补充（批 #5）：除同名 section 合并外，`#*# SAVE_CONFIG` 自动保存块按上游 `_find_autosave_data` **读取合并**（header 逐字节识别、`#*# ` 前缀剥离、正文优先/块只补新、损坏行告警）——语料 `delta_calibrate.cfg` 的双段与高度数据即其用例（回写侧 `SAVE_CONFIG` 命令未做）。
 
+### `[input_shaper]` — 输入整形参数（wave-2）
+
+| 选项 | 默认 | 说明 |
+|------|------|------|
+| `shaper_type` / `shaper_type_<轴>` | `mzv` | 整形器类型（`zv`/`zvd`/`mzv`/`ei`/`2hump_ei`/`3hump_ei`，可带 `(n,t)`、`(v_tol=)` 括号参数） |
+| `shaper_freq_<轴>` | 0（禁用） | 整形频率 Hz |
+| `damping_ratio_<轴>` | `0.1` | 阻尼比；超上限报 `Too high value of damping_ratio=…` |
+
+段与 `SET_INPUT_SHAPER` 已落地（wave-2，`hybrid_corexy_dual_carriage.test` 即其验收）；系数表与上游 `shaper_defs.py` 逐位对齐（`pseudo_inverse` 已在 `mathutil`）。**gap：系数未接到步进生成**（无 chelper `input_shaper_alloc`/`set_sk`/`set_shaper_params` 层，`recompute_scan_windows()` 为显式记账 no-op）；`connect` 期若存在 `[dual_carriage]` 且任一整形器启用，报上游同文 config_error。
+
+### `[adxl345]` / `[adxl345 <name>]` — 加速度计（wave-2）
+
+| 选项 | 默认 | 说明 |
+|------|------|------|
+| `cs_pin` | —（SPI 组，必填） | 片选 |
+| `axes_map` | `x,y,z` | 轴映射（可负，如 `-x,-y,z`） |
+| `rate` | `3200` | 采样率；非法值报 `Invalid rate parameter: %d` |
+
+段/命令层/加速度计接口（`start_internal_client`）与 mux 端点 `adxl345/dump_adxl345`（key `sensor`）已落地。**gap：bulk 数据通路未接**——共享 `FixedFreqReader` 现绑死 LDC1612 的 4 字节样本与 `query_status_ldc1612`，ADXL345 需 `"BBBBB"` 与 `query_adxl345_status`（泛化归 main 的共享基础设施任务）。
+
+### `[mpu9250]` / `[mpu9250 <name>]` — 加速度计（wave-2）
+
+| 选项 | 默认 | 说明 |
+|------|------|------|
+| `i2c_address` | `0x68` | I2C 地址 |
+| `i2c_speed` | `400000` | I2C 速率 |
+| `rate` | `4000` | 采样率 |
+| `axes_map` | `x,y,z` | 轴映射 |
+
+段/命令层/接口与 mux 端点 `mpu9250/dump_mpu9250`（key `sensor`）已落地（带名节按 identifier 注册）。**gap**：同 ADXL345 的 bulk 数据通路（需 `">hhh"` 与 `query_mpu9250_status`），`ACCELEROMETER_*` 命令随之延后。
+
+### `[buttons]` / `[pause_resume]` — filament 传感器的依赖对象（wave-2，最小实现）
+
+`[buttons]`（`register_debounce_button` / `register_buttons`）与 `[pause_resume]` 作为 `[filament_*]` 的 `load_object` 依赖落地；假 MCU 下无按钮事件源，`PAUSE`/`RESUME` 语义与 `pause_resume/*` webhook 端点**未做**。
+
+### `[filament_switch_sensor <name>]` / `[filament_motion_sensor <name>]` — 断料检测（wave-2）
+
+| 选项 | 默认 | 说明 |
+|------|------|------|
+| `switch_pin` | —（必填） | 检测引脚 |
+| `pause_on_runout` | `True` | 断料时暂停（需 `pause_resume` 对象） |
+| `runout_gcode` / `insert_gcode` | 空 | 断料/回插时执行的 g-code |
+| `pause_delay` | `0.5`（>0） | 暂停延时 |
+| `event_delay` | `3.0`（≥0） | 事件确认延时 |
+| `extruder` / `detection_length` | `extruder` / `7.0`（>0） | 仅 `[filament_motion_sensor]` |
+
+两条 mux 命令（key `SENSOR`）：`QUERY_FILAMENT_SENSOR` / `SET_FILAMENT_SENSOR`。段与命令均对上游（`extruders.test` 为其验收）。
+

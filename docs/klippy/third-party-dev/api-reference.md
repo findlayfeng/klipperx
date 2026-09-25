@@ -64,12 +64,13 @@
 
 ## 端点列表
 
-> **实现状态**（截至 2026-09-23，权威清单见主机侧 `api/endpoints/mod.rs` 的状态表）：
+> **实现状态**（截至 2026-09-24，权威清单见主机侧 `api/endpoints/mod.rs` 的状态表）：
 > 下文第 1–12、16 节（`info` / `emergency_stop` / `list_endpoints` / `register_remote_method` /
 > `objects/*` / 五个 `gcode/*` / `query_endstops/status`）**已实现**；第 13–15 节
-> （`pause_resume/*`）与第 17–18 节（`bed_mesh/dump_mesh`、`*/dump_*`）**尚未实现**——
-> 前者等 `pause_resume` 对象，后者的 mux 机制（`register_mux_endpoint`）已就绪、消费者随
-> 各自的 extras 落地。调用未实现的端点会得到 `unknown method` 错误。本文描述的是目标形状，
+> （`pause_resume/*`）与第 17–18 节（`bed_mesh/dump_mesh`、`*/dump_*`）**部分落地**——截至
+> 2026-09-24（wave-2）：`pause_resume` 对象与 `[buttons]` 最小实现已落地，但 `pause_resume/*`
+> 端点仍未注册；`*/dump_*` 的 mux 机制与 `ldc1612` / `adxl345` / `mpu9250` 三个消费者已落地，
+> `bed_mesh/dump_mesh` 与其余 dump 端点随各自的 extras 落地。调用未实现的端点会得到 `unknown method` 错误。本文描述的是目标形状，
 > 实现随模块推进。
 
 ### 1. `info` — 获取打印机状态信息

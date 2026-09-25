@@ -434,6 +434,26 @@ SET_PIN PIN=pwm_fan VALUE=0.25  ; PWM：25% 占空比
 |------|------|------|
 | `SET_TEMPERATURE_FAN_TARGET` | `TEMPERATURE_FAN`（风扇名）、`TARGET`（目标温度，须在 `min_temp..=max_temp`） | 重设 `[temperature_fan <名>]` 的目标；缺省打印当前目标；错误文案对上游（`temperature_fan.py`） |
 
+### SET_INPUT_SHAPER — 输入整形参数（由 `[input_shaper]` 注册，wave-2）
+
+| 命令 | 参数 | 说明 |
+|------|------|------|
+| `SET_INPUT_SHAPER` | `SHAPER_TYPE_X/Y/Z`、`SHAPER_FREQ_X/Y/Z`、`DAMPING_RATIO_X/Y/Z`（均可选） | 缺省参数则报告当前值，如 `shaper_type_x:mzv(5,0.6) shaper_freq_x:22.200 damping_ratio_x:0.100000`（顺序 x→y→z）；错误文案对上游：`Unsupported shaper type: %s`、`Too high value of damping_ratio=%.3f for shaper %s on axis %c`。参数只改上报值（系数未接到步进生成，见 `[input_shaper]` 的 gap） |
+
+### SET_EXTRUDER_ROTATION_DISTANCE / SYNC_EXTRUDER_MOTION — 挤出机（mux 键 `EXTRUDER`，wave-2）
+
+| 命令 | 参数 | 说明 |
+|------|------|------|
+| `SET_EXTRUDER_ROTATION_DISTANCE` | `EXTRUDER`（名）、`DISTANCE`（可省） | 缺省 `DISTANCE` 则报告当前值；`0` 报 `Rotation distance can not be zero`；负值翻转方向 |
+| `SYNC_EXTRUDER_MOTION` | `EXTRUDER`、`MOTION_QUEUE`（可空） | 空值解绑；非挤出机名报 `'%s' is not a valid extruder.` |
+
+### QUERY_FILAMENT_SENSOR / SET_FILAMENT_SENSOR — 断料传感器（由 `[filament_*]` 注册，mux 键 `SENSOR`，wave-2）
+
+| 命令 | 参数 | 说明 |
+|------|------|------|
+| `QUERY_FILAMENT_SENSOR` | `SENSOR`（传感器名） | 报告断料状态 |
+| `SET_FILAMENT_SENSOR` | `SENSOR`、`ENABLE` | 开关传感器 |
+
 ### G-Code 宏命令（由 `[gcode_macro <名>]` 注册）
 
 每个 `[gcode_macro <名>]` 段在装载时以**大写宏名**注册为一条命令（help = `description`）。**宏体已渲染执行**（批 #4 受控子集引擎 `extras/template.rs`，渲染后经 gcode 派发）；`SET_GCODE_VARIABLE` 已注册；子集外构（`{% set %}`、过滤器）显式报错，完整 Jinja 属 H3。

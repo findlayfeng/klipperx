@@ -1623,7 +1623,12 @@ fn finish_home_rails(
             homing: homing.clone(),
         },
     );
-    let state = homing.lock();
+    let mut state = homing.lock();
+    // A handler that refused the home (an `[endstop_phase]` phase mismatch)
+    // leaves the error here, as upstream's raise out of `_do_home_rails` does.
+    if let Some(message) = state.take_error() {
+        return Err(CommandError::new(message));
+    }
     apply_stepper_adjustments(connected, &state, &axes)
 }
 

@@ -170,6 +170,11 @@ pub struct Homing {
     /// (the first stepper of each rail); the port's payload does not carry the
     /// rails, so the driver records it alongside the trigger position.
     primary: std::collections::HashSet<String>,
+    /// A command error a `homing:home_rails_end` handler recorded. Upstream
+    /// raises straight out of `_do_home_rails`; a port handler cannot return an
+    /// error, so it leaves one here for the driver to raise once the handlers
+    /// have run (`[endstop_phase]`'s "incorrect phase").
+    error: Option<String>,
 }
 
 impl Homing {
@@ -198,6 +203,21 @@ impl Homing {
     /// (`Homing.set_stepper_adjustment`).
     pub fn set_stepper_adjustment(&mut self, stepper_name: &str, adjustment: f64) {
         self.adjust_pos.insert(stepper_name.to_string(), adjustment);
+    }
+
+    /// Whether a stepper triggered during this run.
+    pub fn has_trigger(&self, stepper_name: &str) -> bool {
+        self.trigger_mcu_pos.contains_key(stepper_name)
+    }
+
+    /// Record a command error for the driver to raise after the handlers run.
+    pub fn set_error(&mut self, message: impl Into<String>) {
+        self.error = Some(message.into());
+    }
+
+    /// Take the recorded error, if any.
+    pub fn take_error(&mut self) -> Option<String> {
+        self.error.take()
     }
 
     /// Note whether `stepper_name` is its rail's primary stepper.

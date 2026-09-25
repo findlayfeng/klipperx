@@ -298,8 +298,8 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 
 框架已落地：`src/core/klippy/upstream.rs`（字典驱动应答机 + 按 `CONFIG` 拆分的运行）与
 `crates/test-support/build.rs`（按架构编字典）；T1（`linuxtest.test`）已完成并转绿。当前 239 次
-运行里，默认构建缺 2 条（引用 `pru`）、忽略列表 10 条、
-实际执行 27 条（`linuxtest.test`、`commands.test`、`out_of_bounds.test`、`bed_mesh.test`、
+运行里，默认构建缺 2 条（引用 `pru`）、忽略列表 9 条、
+实际执行 28 条（`linuxtest.test`、`commands.test`、`out_of_bounds.test`、`bed_mesh.test`、
 `z_virtual_endstop.test`、`z_tilt.test`、`quad_gantry_level.test`、`bltouch.test`、
 `smart_effector.test`、`multi_z.test`、`screws_tilt_adjust.test`、`gcode_arcs.test`、
 `bed_screws.test`、`pwm.test`、`temperature.test`、`macros.test`、`led.test`、
@@ -310,11 +310,11 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 
 **推进口径**：下文的「首次失败原因」分组只用于定位，不是工作队列——`load_config` 遇到第一个
 未知 section 就停，修好一个缺口只会让运行前进到下一个缺口，总数可能不变（T7 前后失败总数
-几乎不变就是例子），各组收益不可加。进度以**转绿运行数 / `IGNORED` 条目数**衡量（当前 27 / 10）。**验收标准
+几乎不变就是例子），各组收益不可加。进度以**转绿运行数 / `IGNORED` 条目数**衡量（当前 28 / 9）。**验收标准
 是「对应 `.test` 从 `IGNORED` 移除后通过」**，不是「某个错误不再出现」。详见
 [失败原因分析复盘](docs/work-log/2026-09-22-upstream-regression-failures.md#复盘计数口径与重排后补)。
 
-**当前失败原因统计**（`KLIPPERX_UPSTREAM_ALL=1` 实跑，2026-09-24（wave-2 合入后）：**151 次失败**、86 次通过、
+**当前失败原因统计**（`KLIPPERX_UPSTREAM_ALL=1` 实跑，2026-09-24（批 #6 合入后）：**125 次失败**、112 次通过、
 2 条因未构建 `pru` 字典不计，合计 239；下表为**选项名大小写修复后**的分布——49 次
 `must be specified` 归零但总数不变、首因整体后移，见[复盘](docs/work-log/2026-09-22-upstream-regression-failures.md#复盘计数口径与重排后补)
 的「收益不可加」）：
@@ -344,7 +344,7 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 （本表随每个单元更新：2026-09-24 集成批 #5 后 `delta`/`polar` 运动学+`delta_calibrate` 收官、相关首因再后移；集成批 #3+#4 后 `probe_eddy_current`/`gcode_macro`(引擎)/`exclude_object`/`dual_carriage` 收官、相关首因再后移；集成批 #2 后 `led`/`virtual_sdcard`/`display_status`/`homing_override`/`sdcard_loop`/`extruder_stepper`/`exclude_object`(段)/`dual_carriage`(段)/`servo` 九模块落地；批 #1 后六节同理（行内计数为 U3a 快照未重排）；2026-09-23 探针链路单元后实测；除 probe 行外其余各行的拆分仍取 U3a 时点，
 后续单元只会把首因往后推、总数不变，逐单元变化见各自提交信息。已转绿的语料：`linuxtest.test`、
 `commands.test`、`out_of_bounds.test`、`bed_mesh.test`、`z_virtual_endstop.test` 与
-`printers.test → printer-wanhao-duplicator-i3-plus-mark2-2019`、`z_tilt.test`、`quad_gantry_level.test`、`bltouch.test`、`smart_effector.test`、`multi_z.test`、`screws_tilt_adjust.test`、`gcode_arcs.test`、`bed_screws.test`、`pwm.test`、`temperature.test`、`macros.test`、`led.test`、`sdcard_loop.test`、`pressure_advance.test`、`eddy.test`、`dual_carriage.test`、`exclude_object.test`、`polar.test`、`delta.test`、`delta_calibrate.test`、`hybrid_corexy_dual_carriage.test`、`extruders.test`。）
+`printers.test → printer-wanhao-duplicator-i3-plus-mark2-2019`、`z_tilt.test`、`quad_gantry_level.test`、`bltouch.test`、`smart_effector.test`、`multi_z.test`、`screws_tilt_adjust.test`、`gcode_arcs.test`、`bed_screws.test`、`pwm.test`、`temperature.test`、`macros.test`、`led.test`、`sdcard_loop.test`、`pressure_advance.test`、`eddy.test`、`dual_carriage.test`、`exclude_object.test`、`polar.test`、`delta.test`、`delta_calibrate.test`、`hybrid_corexy_dual_carriage.test`、`extruders.test`、`manual_stepper.test`。）
 
 **T3 之后按首次失败分组的工单**：
 

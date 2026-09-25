@@ -454,6 +454,26 @@ SET_PIN PIN=pwm_fan VALUE=0.25  ; PWM：25% 占空比
 | `QUERY_FILAMENT_SENSOR` | `SENSOR`（传感器名） | 报告断料状态 |
 | `SET_FILAMENT_SENSOR` | `SENSOR`、`ENABLE` | 开关传感器 |
 
+### MANUAL_STEPPER — 手动驱动单个步进电机（由 `[manual_stepper <名>]` 注册，mux 键 `STEPPER`，批 #6）
+
+| 参数 | 缺省 | 说明 |
+|------|------|------|
+| `ENABLE` | — | 0/1 |
+| `SET_POSITION` | — | 设定当前位置 |
+| `SPEED` | 节的 `velocity` | 本次速度 |
+| `ACCEL` | 节的 `accel` | 本次加速度 |
+| `MOVE` | — | 相对移动量；带 `MOVE` 时 `SYNC` 缺省 1 |
+| `SYNC` | 0 | 是否等到运动结束 |
+| `STOP_ON_ENDSTOP` | — | `1`/`-1`/`2`/`-2`（home/inverted/try 变体） |
+| `GCODE_AXIS` | — | 单字母（**先转大写再校验**：小写可接受；`X/Y/Z/E/F/N`、多字符与数字被拒）；空值注销 |
+| `INSTANTANEOUS_CORNER_VELOCITY`/`LIMIT_VELOCITY`/`LIMIT_ACCEL` | 1.0 / 999999.9 / 999999.9 | 与 `GCODE_AXIS` 同用 |
+
+错误文案对上游：`Move out of range`、`Not a valid GCODE_AXIS`、`Must unregister axis first`、`Axis 'A' already registered`、`No endstop for this manual stepper`。
+
+### G28 与 `[safe_z_home]`（批 #6）
+
+有 `[safe_z_home]` 时 `G28` 被接管：按需先执行 `G28 X0 Y0` → 抬到安全位 → `G28 Z0`（`move_to_previous` 为真时最后回原位）；`G28 Z` 而 X/Y 未归零报 `Must home X and Y axes first`。
+
 ### G-Code 宏命令（由 `[gcode_macro <名>]` 注册）
 
 每个 `[gcode_macro <名>]` 段在装载时以**大写宏名**注册为一条命令（help = `description`）。**宏体已渲染执行**（批 #4 受控子集引擎 `extras/template.rs`，渲染后经 gcode 派发）；`SET_GCODE_VARIABLE` 已注册；子集外构（`{% set %}`、过滤器）显式报错，完整 Jinja 属 H3。

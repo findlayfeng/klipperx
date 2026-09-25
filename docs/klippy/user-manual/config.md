@@ -869,3 +869,38 @@ cartesian 在 late 阶段认领；注册 `dual_carriage` 对象与 `SET_DUAL_CAR
 
 两条 mux 命令（key `SENSOR`）：`QUERY_FILAMENT_SENSOR` / `SET_FILAMENT_SENSOR`。段与命令均对上游（`extruders.test` 为其验收）。
 
+### `[heater_fan <name>]` — 加热器联动风扇（批 #6）
+
+| 选项 | 默认 | 说明 |
+|------|------|------|
+| `heater` | `extruder`（列表） | 触发风扇的加热器名 |
+| `heater_temp` | `50.0` | 温度阈值 |
+| `fan_speed` | `1.0`（0..=1） | 触发时的风扇速度 |
+
+`pin`/`kick_start_time`/`max_power`/`shutdown_speed`/`off_below`/`cycle_time`/`hardware_pwm` 由 `[fan]` 核心读取。语义：每秒 tick；**任一 heater 有 target 或温度 > `heater_temp` 即为 `fan_speed`**；仅速度变化时写 PWM；掉线关机速度默认 **1.0**（与 `[controller_fan]` 的 0.0 不同）。无 G-Code 命令，`get_status` 转发 fan 状态。
+gap：本仓无 heater 注册表（H1），`heater` 名按 printer 对象名解析；语料中 2 个 run 的 `tachometer_pin` 被 `Fan` 核心拒收（需 `pulse_counter`，未做）。
+
+### `[safe_z_home]` — 归零前安全 Z 抬升（批 #6）
+
+| 选项 | 默认 | 说明 |
+|------|------|------|
+| `home_xy_position` | —（必填，两个数） | Z 归零前先移动到的 XY |
+| `z_hop` | `0.0` | 抬升高度（0 表示整段跳过） |
+| `z_hop_speed` | `15.0`（>0） | 抬升速度 |
+| `speed` | `50.0`（>0） | 移动速度 |
+| `move_to_previous` | `false` | 归零后回到原 XY |
+
+Z 端停来源：`[stepper_z]`，否则 `[carriage <名>]` 中 axis 为 z 者；取不到报 `Missing Z endstop config for safe_z_homing`。**接管 G28**：按需先 `X0 Y0` → 安全位 → `Z0`；`G28 Z` 而 X/Y 未归零报 `Must home X and Y axes first`。与 `[homing_override]` **互斥**（`homing_override and safe_z_homing cannot be used simultaneously`）。装载必须为 `order = 70, phase = late`（晚于 toolhead 的 G28 注册）。
+
+### `[manual_stepper <name>]` — 独立步进电机（批 #6）
+
+| 选项 | 默认 | 说明 |
+|------|------|------|
+| `step_pin`/`dir_pin`/`enable_pin`/`microsteps`/`rotation_distance` | — | 步进电机核心选项 |
+| `endstop_pin` | 无 | 有则可做端停运动 |
+| `velocity` | `5.0`（>0） | 默认速度 |
+| `accel` | `0.0`（≥0） | 默认加速度 |
+| `position_min`/`position_max` | 无 | 可选软限位 |
+
+命令见 G-Code 参考的 `MANUAL_STEPPER`。gap（如实登记）：本仓只推进时间线与 `commanded_pos`，**不 append trapq、不产生 steps**；`G1 A<..>` 的 extra axis 词被 `gcode_move` 静默忽略；有 endstop 时的 `STOP_ON_ENDSTOP` 报 `Manual stepper homing is not implemented in this host`。
+

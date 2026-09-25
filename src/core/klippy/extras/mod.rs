@@ -35,6 +35,7 @@ pub mod idex_modes;
 pub mod ldc1612;
 pub mod led;
 pub mod manual_probe;
+pub mod mpu9250;
 pub mod output_pin;
 pub mod probe;
 pub mod probe_eddy_current;

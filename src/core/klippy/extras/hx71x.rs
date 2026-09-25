@@ -761,6 +761,32 @@ mod tests {
     }
 
     #[test]
+    fn test_the_reader_format_is_little_endian_4_byte_samples() {
+        use crate::core::klippy::extras::bulk_sensor::SampleFormat;
+
+        // Upstream's `FixedFreqReader(mcu, chip_clock_smooth, "<i")`: four
+        // little-endian bytes a sample, hence `51 // 4 == 12` samples a
+        // `sensor_bulk_data` message (LC-1's `with_format` seam).
+        let format = SampleFormat::parse("<i").expect("\"<i\" parses");
+        assert_eq!(format.bytes_per_sample(), 4);
+        assert_eq!(format.samples_per_block(), 12);
+        // Little-endian: the low address is the least significant byte.
+        assert_eq!(
+            format.decode(&[0x34, 0x12, 0x00, 0x00]).unwrap(),
+            0x0000_1234
+        );
+        // …and the reader the sensor builds takes the format plus this
+        // chip's status query (`query_hx71x_status oid=%c`).
+        let reader = FixedFreqReader::with_format(
+            80. * BATCH_INTERVAL * 2.,
+            "<i",
+            QUERY_HX71X_STATUS_MSGFORMAT,
+        )
+        .expect("the hx71x reader parameterization");
+        drop(reader);
+    }
+
+    #[test]
     fn test_convert_samples_decodes_little_endian_counts() {
         let (rows, hit_error) = convert_samples(&[(1.25, 0x00FF_FFFF), (2.5, 1)]);
         assert!(!hit_error);

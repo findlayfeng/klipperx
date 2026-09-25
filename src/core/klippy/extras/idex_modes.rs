@@ -78,6 +78,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use serde_json::{json, Value};
 
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
+use crate::core::klippy::event::KlippyEvent;
 use crate::core::klippy::extras::stepper::{axis_index, PrinterStepper, Rail};
 use crate::core::klippy::extras::toolhead::ToolHeadObject;
 use crate::core::klippy::gcode::{
@@ -126,7 +127,8 @@ struct Shared {
     /// re-entered — the coordinate half of upstream's
     /// `toggle_active_dc_rail` (`idex_modes.py:101-114`), where upstream
     /// instead reads it off the scale/offset transform of a second rail that
-    /// this port does not drive (module docs).
+    /// this port does not drive (module docs) — and set to the carriage's own
+    /// `position_endstop` when its axis homes ([`Shared::homed`]).
     axis_position: Vec<f64>,
     /// The names `CARRIAGE=` takes, in carriage order — upstream's `dc_rails`
     /// keys, each carriage's `rail.get_name(short=True)`
@@ -139,6 +141,14 @@ struct Shared {
     /// The axis each carriage rides on (`self.axes` upstream), so a switch
     /// re-anchors exactly the arriving carriage's axis.
     axes: Vec<usize>,
+    /// Where each carriage sits once its axis homes: its own
+    /// `position_endstop`. Upstream homes every carriage of the axis there
+    /// (`DualCarriages.home`, `idex_modes.py:116-131`, which toggles each
+    /// rail and homes it) and the frames follow the physical carriages;
+    /// [`Shared::homed`] is this port's copy of that bookkeeping, and the
+    /// bare `[dual_carriage]` section never calls it (its entries stay `0.0`,
+    /// like its frames before any homing).
+    endstops: Vec<f64>,
     /// `SAVE_DUAL_CARRIAGE_STATE NAME=…` states: the active index and the
     /// axis frames (`idex_modes.py:285-293`; modes are not modelled — module
     /// docs).
@@ -155,6 +165,7 @@ impl Shared {
             axis_position: vec![0.0; 2],
             names: vec![None, Some(own_name)],
             axes: vec![axis; 2],
+            endstops: vec![0.0; 2],
             saved: HashMap::new(),
         }
     }
@@ -162,21 +173,52 @@ impl Shared {
     /// A `kinematics: generic_cartesian` machine's carriages, in upstream's
     /// `dc_rails` order (`generic_cartesian.py:137-142`): the primary carriage
     /// of every dual axis, then the dual carriages themselves.
-    fn for_carriages(carriages: &[(String, Axis)]) -> Self {
+    fn for_carriages(carriages: &[GenericCarriage]) -> Self {
         Self {
             active: 0,
             axis_position: vec![0.0; carriages.len()],
             names: carriages
                 .iter()
-                .map(|(name, _)| Some(name.clone()))
+                .map(|carriage| Some(carriage.name.clone()))
                 .collect(),
             axes: carriages
                 .iter()
-                .map(|(_, axis)| axis_index(*axis))
+                .map(|carriage| axis_index(carriage.axis))
+                .collect(),
+            endstops: carriages
+                .iter()
+                .map(|carriage| carriage.position_endstop)
                 .collect(),
             saved: HashMap::new(),
         }
     }
+
+    /// An axis finished homing (`HomingHomeRailsEnd`): every carriage of that
+    /// axis now sits at its own `position_endstop`, as upstream's
+    /// `DualCarriages.home` leaves them (`idex_modes.py:116-131`) — without
+    /// this a dual carriage's frame stays at `0.0` forever, and the first
+    /// switch onto it teleports the toolhead to a coordinate it never earned
+    /// (`Move out of range` on the corpus' first `G1 X-10`).
+    fn homed(&mut self, axes: &[usize]) {
+        for (index, axis) in self.axes.iter().enumerate() {
+            if axes.contains(axis) {
+                self.axis_position[index] = self.endstops[index];
+            }
+        }
+    }
+}
+
+/// One carriage of a generic-cartesian dual axis, as [`register_generic`]
+/// takes it: the name `SET_DUAL_CARRIAGE CARRIAGE=` matches, the axis it
+/// rides, and the coordinate it sits at once that axis homes (its section's
+/// `position_endstop`).
+pub struct GenericCarriage {
+    /// The carriage's short name (`carriage_u`).
+    pub name: String,
+    /// The axis it rides on.
+    pub axis: Axis,
+    /// Its `position_endstop`, the coordinate homing leaves it at.
+    pub position_endstop: f64,
 }
 
 /// One `SAVE_DUAL_CARRIAGE_STATE` snapshot.
@@ -402,8 +444,9 @@ impl PrinterObject for GenericDualCarriages {
     }
 }
 
-/// Build the generic-cartesian `dual_carriage` module and register its three
-/// commands (`generic_cartesian.py:137-146`, `idex_modes.py:46-59`).
+/// Build the generic-cartesian `dual_carriage` module, register its three
+/// commands, and let the frames follow homing (`generic_cartesian.py:137-146`,
+/// `idex_modes.py:46-59,116-131`).
 ///
 /// `carriages` is every carriage upstream's `dc_rails` carries, in its order:
 /// the primary carriage of each dual axis, then the dual carriages. Called by
@@ -415,7 +458,7 @@ impl PrinterObject for GenericDualCarriages {
 /// registered — a config that also carries a bare `[dual_carriage]`.
 pub fn register_generic(
     printer: &Arc<Printer>,
-    carriages: &[(String, Axis)],
+    carriages: &[GenericCarriage],
 ) -> Result<(), ConfigError> {
     let shared = Arc::new(Mutex::new(Shared::for_carriages(carriages)));
     printer.add_object(
@@ -424,7 +467,27 @@ pub fn register_generic(
             shared: Arc::clone(&shared),
         }),
     )?;
-    register_commands(&shared, printer)
+    register_commands(&shared, printer)?;
+
+    // Upstream's `DualCarriages.home` (`idex_modes.py:116-131`) homes every
+    // carriage of the axis to its own endstop and the frames follow the
+    // physical carriages there; this port homes the axis through the
+    // kinematics instead, so the same refresh hangs off the homing event.
+    printer.register_event_handler(
+        KlippyEvent::HomingHomeRailsEnd { axes: Vec::new() },
+        Box::new({
+            let shared = Arc::clone(&shared);
+            move |event| {
+                if let KlippyEvent::HomingHomeRailsEnd { axes } = event {
+                    shared
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .homed(axes);
+                }
+            }
+        }),
+    );
+    Ok(())
 }
 
 /// Register `SET_DUAL_CARRIAGE` / `SAVE_DUAL_CARRIAGE_STATE` /
@@ -914,6 +977,44 @@ mod tests {
         assert_eq!(state.active, 0);
         assert_eq!(state.axis_position, [7.0, 9.0]);
         assert_eq!(arriving, 7.0);
+    }
+
+    /// A homed axis carries every carriage of it to its own
+    /// `position_endstop`: upstream's `DualCarriages.home` homes each carriage
+    /// there and the scale/offset transform records where it stopped
+    /// (`idex_modes.py:116-131`). Without this refresh a dual carriage's
+    /// frame stays `0.0` forever, and the first switch onto it re-anchors the
+    /// toolhead at the origin — `corexyuv.test`'s `G1 X-10` then ends at
+    /// X=-10 (`Move out of range`).
+    #[test]
+    fn the_frames_follow_the_homed_carriages_to_their_endstops() {
+        let carriages = [
+            GenericCarriage {
+                name: "carriage_x".to_string(),
+                axis: Axis::X,
+                position_endstop: 0.0,
+            },
+            GenericCarriage {
+                name: "carriage_u".to_string(),
+                axis: Axis::X,
+                position_endstop: 300.0,
+            },
+            GenericCarriage {
+                name: "carriage_v".to_string(),
+                axis: Axis::Y,
+                position_endstop: 200.0,
+            },
+        ];
+        let mut state = Shared::for_carriages(&carriages);
+        assert_eq!(state.axis_position, [0.0, 0.0, 0.0]);
+
+        // `G28 X`: both X carriages sit at their endstops; Y is untouched.
+        state.homed(&[0]);
+        assert_eq!(state.axis_position, [0.0, 300.0, 0.0]);
+
+        // `G28 Y`: the Y carriage follows, the homed X frames stay put.
+        state.homed(&[1]);
+        assert_eq!(state.axis_position, [0.0, 300.0, 200.0]);
     }
 
     /// The command errors the corpus' neighbourhood can reach, in upstream's

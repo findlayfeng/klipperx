@@ -949,19 +949,25 @@ pub fn build(
     // `SAVE_DUAL_CARRIAGE_STATE` / `RESTORE_DUAL_CARRIAGE_STATE` commands
     // (`generic_cartesian.py:137-146`). The carriage order is upstream's
     // `dc_rails` (`idex_modes.py:37-45`): the primary carriage of every dual
-    // axis first, then the dual carriages themselves.
+    // axis first, then the dual carriages themselves. Each carriage carries
+    // its `position_endstop`, where the frames follow it once the axis homes
+    // (`idex_modes.py:116-131`).
     if !duals.is_empty() {
         let dc_axes: Vec<Axis> = duals.iter().map(|dual| dual.axis()).collect();
-        let mut idex_carriages: Vec<(String, Axis)> = mains
+        let mut idex_carriages: Vec<idex_modes::GenericCarriage> = mains
             .iter()
             .filter(|main| dc_axes.contains(&main.axis()))
-            .map(|main| (main.name().to_string(), main.axis()))
+            .map(|main| idex_modes::GenericCarriage {
+                name: main.name().to_string(),
+                axis: main.axis(),
+                position_endstop: main.homing_info().position_endstop,
+            })
             .collect();
-        idex_carriages.extend(
-            duals
-                .iter()
-                .map(|dual| (dual.name().to_string(), dual.axis())),
-        );
+        idex_carriages.extend(duals.iter().map(|dual| idex_modes::GenericCarriage {
+            name: dual.name().to_string(),
+            axis: dual.axis(),
+            position_endstop: dual.homing_info().position_endstop,
+        }));
         idex_modes::register_generic(printer, &idex_carriages)?;
     }
 

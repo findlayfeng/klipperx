@@ -199,7 +199,7 @@ M3 `smart_effector` 落地后，仅剩 `eddy.test`——`probe_eddy_current` 属
 - 头两个转绿的用例：`linuxtest.test`（只需 `kinematics: none`、`heaters` 的传感器注册表、
   `temperature_sensor` 与 `ds18b20`，g-code 只是一次 `G4 P1000`）；随后 `gcode_move`（G4-1）与
   `EXTRUDER` 默认项（e8bf2b7）让 `commands.test` 与 `out_of_bounds.test` 也过了守卫，移出忽略列表。
-- `KLIPPERX_UPSTREAM_ALL=1` 只去掉忽略列表这一层：默认构建下它会跑 237 条可用运行，其中 **158 条通过、79 条失败**（2026-09-25 实跑，批 #10 合入后；批 #8 转绿 tachometer 两 run，批 #10 修掉测试收尾挂死后本口径 40s 自然退出 rc=101，不再需 timeout 兕底），另外 2 条以「字典未构建」计入统计，不算失败。失败大多
+- `KLIPPERX_UPSTREAM_ALL=1` 只去掉忽略列表这一层：默认构建下它会跑 237 条可用运行，其中 **165 条通过、72 条失败**（2026-09-25 实跑，批 #11 合入后；批 #8 转绿 tachometer 两 run、批 #11 转绿 bed_mesh 七 run；批 #10 修掉收尾挂死后本口径自然退出 rc=101，不再需 timeout 兕底；**`printers.test` 子进度 138/203**（失败 65）），另外 2 条以「字典未构建」计入统计，不算失败。失败大多
   在配置装载阶段，个别在 g-code / 就绪阶段（`Move out of range`、`not ready: Pin …`）。失败原因的
   逐项分布记在 [上游回归测试失败原因分析](../../work-log/2026-09-22-upstream-regression-failures.md)
   的最新快照与 `TODO.md` 的 T 节，本页不重复维护。

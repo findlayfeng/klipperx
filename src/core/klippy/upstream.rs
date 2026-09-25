@@ -412,7 +412,6 @@ mod tests {
         "generic_cartesian_itex.test",
         "input_shaper.test",
         "load_cell.test",
-        "manual_stepper.test",
         "printers.test",
         "rotary_delta_calibrate.test",
         "tmc.test",

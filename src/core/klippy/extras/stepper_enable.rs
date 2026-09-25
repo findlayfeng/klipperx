@@ -294,13 +294,7 @@ impl PrinterStepperEnable {
             })?;
             let enable = gcmd.get_int_default("ENABLE", 1)? != 0;
 
-            if let Some(tracking) = enable_lines2.lock().unwrap().get(&stepper_name) {
-                if enable {
-                    tracking.lock().unwrap().motor_enable();
-                } else {
-                    tracking.lock().unwrap().motor_disable();
-                }
-            }
+            set_motors_enable_inner(&enable_lines2, std::slice::from_ref(&stepper_name), enable);
             Ok(())
         });
         gcode
@@ -323,6 +317,21 @@ impl PrinterStepperEnable {
                 }
             }),
         );
+    }
+
+    /// Enable or disable several steppers by name, returning whether any
+    /// changed (`PrinterStepperEnable.set_motors_enable`,
+    /// `stepper_enable.py:92-108`).
+    ///
+    /// A name with no tracking is skipped, as the `SET_STEPPER_ENABLE` handler
+    /// has always done; that keeps the manual stepper's `ENABLE` able to name a
+    /// stepper this object does not manage without failing the command.
+    ///
+    /// Unlike upstream, this does not flush step generation or dwell on the
+    /// toolhead — this port's enable/disable apply immediately (see the module
+    /// docs on print-time scheduling).
+    pub fn set_motors_enable(&self, names: &[String], enable: bool) -> bool {
+        set_motors_enable_inner(&self.enable_lines, names, enable)
     }
 
     /// Turn off all motors and notify the rest of the machine.
@@ -375,6 +384,37 @@ impl PrinterStepperEnable {
     pub fn get_steppers(&self) -> Vec<String> {
         self.enable_lines.lock().unwrap().keys().cloned().collect()
     }
+}
+
+/// Set the enable state of every named stepper, reporting whether anything
+/// changed.
+///
+/// Split out so the `SET_STEPPER_ENABLE` handler (one name) and the manual
+/// stepper's `ENABLE` (a list) share one loop, with the same ignore-unknown
+/// behavior the handler has always had.
+fn set_motors_enable_inner(
+    enable_lines: &Mutex<HashMap<String, Arc<Mutex<EnableTracking>>>>,
+    names: &[String],
+    enable: bool,
+) -> bool {
+    let mut did_change = false;
+    let lines = enable_lines.lock().unwrap();
+    for name in names {
+        let Some(tracking) = lines.get(name) else {
+            continue;
+        };
+        let mut tracking = tracking.lock().unwrap();
+        let was_enabled = tracking.is_motor_enabled();
+        if enable {
+            tracking.motor_enable();
+        } else {
+            tracking.motor_disable();
+        }
+        if tracking.is_motor_enabled() != was_enabled {
+            did_change = true;
+        }
+    }
+    did_change
 }
 
 /// Set up an enable pin for a stepper.

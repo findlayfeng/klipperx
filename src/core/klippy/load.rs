@@ -340,6 +340,7 @@ mod tests {
                 "fan",
                 "heater_bed",
                 "heater_generic",
+                "manual_stepper",
                 "output_pin",
                 "pwm_cycle_time",
                 "pwm_tool",

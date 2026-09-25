@@ -67,7 +67,10 @@ section!("pca9632", order = 40, prefix = load_pca9632);
 
 /// The printer object name upstream's lazy lookup registers
 /// (`display/display.py:172`).
-const DISPLAY_TEMPLATES_OBJECT: &str = "display_template";
+///
+/// Public because the `display` module reads the registry back by name: it is
+/// the one consumer that merges the shipped `display.cfg` templates in.
+pub const DISPLAY_TEMPLATES_OBJECT: &str = "display_template";
 
 /// Firmware limit on one neopixel chain's colour channels
 /// (`neopixel.py:24`, `MAX_MCU_SIZE`).
@@ -195,6 +198,24 @@ impl DisplayTemplates {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .insert(name, DisplayTemplate { text, params });
+    }
+
+    /// A template's declared `param_*` option names, or `None` when there is no
+    /// such template.
+    ///
+    /// What the `display` module needs from the registry: upstream's
+    /// `DisplayTemplate.render` compares the call's keyword arguments against
+    /// the template's own parameters by count (`display/display.py:43-46`), and
+    /// the check lives in
+    /// [`display::check_render_params`](super::display::check_render_params).
+    pub fn param_names(&self, name: &str) -> Option<Vec<String>> {
+        let templates = self
+            .templates
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        templates
+            .get(name)
+            .map(|template| template.params.keys().cloned().collect())
     }
 }
 

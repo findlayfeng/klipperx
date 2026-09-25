@@ -237,3 +237,346 @@ pub fn load_config_prefix(
     on_ready(printer, &fan);
     Ok(fan)
 }
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::klippy::config::{AccessTracking, Config, ConfigSection, ConfigValue};
+    use crate::core::klippy::gcode::{GCodeDispatch, GCODE_OBJECT};
+    use crate::core::klippy::mcu::McuError;
+    use crate::core::klippy::pins::{
+        DigitalOut, PinChip, PinError, PinParams, PrinterPins, PwmOut, PINS_OBJECT,
+    };
+    use crate::core::klippy::reactor::ManualReactor;
+    use serde_json::json;
+
+    /// Drive a `connect` future on a private single-thread runtime.
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("a runtime for the test")
+            .block_on(future)
+    }
+
+    /// A PWM that records what it was told.
+    #[derive(Default)]
+    struct FakePwm {
+        start_value: Mutex<(f64, f64)>,
+        updates: Mutex<Vec<f64>>,
+    }
+
+    impl PwmOut for FakePwm {
+        fn setup_max_duration(&self, _max_duration: f64) {}
+        fn setup_cycle_time(&self, _cycle_time: f64, _hardware_pwm: bool) {}
+        fn setup_start_value(&self, start_value: f64, shutdown_value: f64) {
+            *self.start_value.lock().unwrap() = (start_value, shutdown_value);
+        }
+        fn set_pwm(&self, _clock: u32, value: f64) -> Result<(), McuError> {
+            self.updates.lock().unwrap().push(value);
+            Ok(())
+        }
+        fn update_pwm(&self, value: f64) -> Result<(), McuError> {
+            self.updates.lock().unwrap().push(value);
+            Ok(())
+        }
+        fn next_aligned_clock(&self, clock: u32, _allow_early: f64) -> Result<u32, McuError> {
+            Ok(clock)
+        }
+    }
+
+    /// A chip that hands out a [`FakePwm`] per setup.
+    #[derive(Default)]
+    struct FakeChip {
+        pwms: Mutex<Vec<Arc<FakePwm>>>,
+    }
+
+    impl PinChip for FakeChip {
+        fn setup_digital_out(&self, _params: &PinParams) -> Result<Arc<dyn DigitalOut>, PinError> {
+            Err(PinError::Unsupported("digital_out".to_string()))
+        }
+        fn setup_pwm(&self, _params: &PinParams) -> Result<Arc<dyn PwmOut>, PinError> {
+            let pwm = Arc::new(FakePwm::default());
+            self.pwms.lock().unwrap().push(Arc::clone(&pwm));
+            Ok(pwm)
+        }
+    }
+
+    /// A printer with `gcode` and `pins` over a fake chip.
+    fn printer() -> (Arc<Printer>, Arc<FakeChip>) {
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        printer
+            .add_object(
+                GCODE_OBJECT,
+                Arc::new(GCodeDispatch::new(Arc::clone(&printer))),
+            )
+            .unwrap();
+        let pins = Arc::new(PrinterPins::new());
+        let chip = Arc::new(FakeChip::default());
+        pins.register_chip("mcu", chip.clone()).unwrap();
+        printer.add_object(PINS_OBJECT, pins).unwrap();
+        (printer, chip)
+    }
+
+    /// An object whose status reports `temperature`/`target`, standing in for a
+    /// heater.
+    struct FakeHeater {
+        temperature: Mutex<f64>,
+        target: Mutex<f64>,
+    }
+
+    impl FakeHeater {
+        fn new(temperature: f64, target: f64) -> Self {
+            Self {
+                temperature: Mutex::new(temperature),
+                target: Mutex::new(target),
+            }
+        }
+
+        fn set(&self, temperature: f64, target: f64) {
+            *self.temperature.lock().unwrap() = temperature;
+            *self.target.lock().unwrap() = target;
+        }
+    }
+
+    impl PrinterObject for FakeHeater {
+        fn get_status(&self, _eventtime: f64) -> Value {
+            json!({
+                "temperature": *self.temperature.lock().unwrap(),
+                "target": *self.target.lock().unwrap(),
+            })
+        }
+    }
+
+    /// A `[heater_fan <name>]` section with `options`.
+    fn section(name: &str, options: &[(&str, &str)]) -> ConfigSection {
+        let mut section = ConfigSection::new("heater_fan", Some(name));
+        for (key, value) in options {
+            section.parameters.insert(
+                (*key).to_string(),
+                ConfigValue::Single((*value).to_string()),
+            );
+        }
+        section
+    }
+
+    fn wrap(section: &ConfigSection) -> ConfigWrapper<'_> {
+        ConfigWrapper::untracked(section)
+    }
+
+    fn load(
+        printer: &Arc<Printer>,
+        section: &ConfigSection,
+    ) -> Result<Arc<HeaterFan>, ConfigError> {
+        let identifier = section.identifier();
+        let object = load_config_prefix(&wrap(section), printer)?;
+        printer
+            .add_object(identifier.as_str(), object)
+            .expect("one object per section in a fresh printer");
+        Ok(printer
+            .lookup_object_as::<HeaterFan>(&identifier)
+            .expect("the factory builds a HeaterFan"))
+    }
+
+    /// Register a heater under `name`.
+    fn add_heater(printer: &Arc<Printer>, name: &str, heater: &Arc<FakeHeater>) {
+        printer
+            .add_object(name, Arc::clone(heater) as Arc<dyn PrinterObject>)
+            .unwrap();
+    }
+
+    fn pwm(chip: &FakeChip, index: usize) -> Arc<FakePwm> {
+        chip.pwms.lock().unwrap()[index].clone()
+    }
+
+    fn updates(pwm: &FakePwm) -> Vec<f64> {
+        pwm.updates.lock().unwrap().clone()
+    }
+
+    #[test]
+    fn test_upstream_defaults_are_what_the_bare_section_gets() {
+        let (printer, chip) = printer();
+        let hf = load(&printer, &section("test_heater_fan", &[("pin", "PH0")])).unwrap();
+
+        assert_eq!(hf.heater_names, ["extruder"]);
+        assert_eq!(hf.heater_temp, 50.0);
+        assert_eq!(hf.fan_speed, 1.0);
+        assert_eq!(*hf.last_speed.lock().unwrap(), 0.0);
+        // The fan starts at 0 and the firmware's shutdown duty is 1
+        // (`heater_fan.py:18`), so a hotend fan keeps running when klippy dies.
+        assert_eq!(*pwm(&chip, 0).start_value.lock().unwrap(), (0.0, 1.0));
+    }
+
+    #[test]
+    fn test_every_option_is_read_and_overrides_reach_the_object() {
+        let (printer, _chip) = printer();
+        let text = "[heater_fan test_heater_fan]\n\
+                    pin: PH0\n\
+                    heater: extruder, heater_bed\n\
+                    heater_temp: 60\n\
+                    fan_speed: 0.5\n";
+        let config = Config::from_text(text).expect("parses").0;
+        let section = config
+            .get_section("heater_fan test_heater_fan")
+            .expect("the section parses");
+        let access = AccessTracking::shared();
+        let wrapper = ConfigWrapper::with_config(section, Arc::clone(&access), None, &config);
+
+        let object = load_config_prefix(&wrapper, &printer).expect("the option set loads");
+        printer
+            .add_object("heater_fan test_heater_fan", object)
+            .unwrap();
+        let hf = printer
+            .lookup_object_as::<HeaterFan>("heater_fan test_heater_fan")
+            .unwrap();
+
+        // No option is left unread (`check_unused`).
+        for option in section.parameters.keys() {
+            assert!(
+                access.contains("heater_fan test_heater_fan", option),
+                "option '{option}' was not read"
+            );
+        }
+        assert_eq!(hf.heater_temp, 60.0);
+        assert_eq!(hf.fan_speed, 0.5);
+        assert_eq!(
+            hf.heater_names,
+            ["extruder".to_string(), "heater_bed".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_a_missing_pin_names_the_prefixed_section() {
+        let (printer, _chip) = printer();
+
+        let err = load(&printer, &section("test_heater_fan", &[])).unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "Option 'pin' in section 'heater_fan test_heater_fan' must be specified"
+        );
+    }
+
+    #[test]
+    fn test_fan_speed_out_of_range_is_rejected() {
+        for bad in ["-0.1", "1.1"] {
+            // A fresh printer per case: the pin is claimed once per printer.
+            let (printer, _chip) = printer();
+            let err = load(
+                &printer,
+                &section("test_heater_fan", &[("pin", "PH0"), ("fan_speed", bad)]),
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("Option 'fan_speed' in section 'heater_fan test_heater_fan'"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_connect_rejects_an_unknown_heater_the_way_upstream_does() {
+        let (printer, _chip) = printer();
+        let hf = load(
+            &printer,
+            &section(
+                "test_heater_fan",
+                &[("pin", "PH0"), ("heater", "no_such_heater")],
+            ),
+        )
+        .unwrap();
+
+        let err = block_on(hf.connect()).unwrap_err();
+
+        // `heaters.py:288` — `Unknown heater '%s'`.
+        assert!(
+            err.to_string().contains("Unknown heater 'no_such_heater'"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_a_target_or_a_hot_heater_runs_the_fan_and_a_write_only_on_change() {
+        let (printer, chip) = printer();
+        let extruder = Arc::new(FakeHeater::new(25.0, 0.0));
+        add_heater(&printer, "extruder", &extruder);
+        let hf = load(
+            &printer,
+            &section(
+                "test_heater_fan",
+                &[("pin", "PH0"), ("kick_start_time", "0")],
+            ),
+        )
+        .unwrap();
+        block_on(hf.connect()).unwrap();
+
+        // Cold and no target: the fan stays off; `0` is `last_speed` already,
+        // so nothing is written.
+        hf.tick(0.0);
+        assert_eq!(updates(&pwm(&chip, 0)), Vec::<f64>::new());
+
+        // ① A target below `heater_temp`: heating counts, full speed.
+        extruder.set(25.0, 200.0);
+        hf.tick(1.0);
+        assert_eq!(updates(&pwm(&chip, 0)), [1.0]);
+
+        // ④ The speed does not change: no further write.
+        hf.tick(2.0);
+        assert_eq!(updates(&pwm(&chip, 0)), [1.0]);
+
+        // ② No target any more, but hotter than `heater_temp` (50): still on,
+        // and still no write.
+        extruder.set(80.0, 0.0);
+        hf.tick(3.0);
+        assert_eq!(updates(&pwm(&chip, 0)), [1.0]);
+
+        // ③ Neither: the fan goes off.
+        extruder.set(49.0, 0.0);
+        hf.tick(4.0);
+        assert_eq!(updates(&pwm(&chip, 0)), [1.0, 0.0]);
+
+        // Off and staying off: no repeated write.
+        hf.tick(5.0);
+        assert_eq!(updates(&pwm(&chip, 0)), [1.0, 0.0]);
+    }
+
+    #[test]
+    fn test_heater_temp_is_a_threshold_not_a_hysteresis() {
+        let (printer, chip) = printer();
+        let extruder = Arc::new(FakeHeater::new(51.0, 0.0));
+        add_heater(&printer, "extruder", &extruder);
+        let hf = load(
+            &printer,
+            &section(
+                "test_heater_fan",
+                &[
+                    ("pin", "PH0"),
+                    ("kick_start_time", "0"),
+                    ("heater_temp", "50"),
+                    ("fan_speed", "0.5"),
+                ],
+            ),
+        )
+        .unwrap();
+        block_on(hf.connect()).unwrap();
+
+        // Exactly at the threshold is not above it: off.
+        extruder.set(50.0, 0.0);
+        hf.tick(0.0);
+        assert_eq!(updates(&pwm(&chip, 0)), Vec::<f64>::new());
+
+        // One tenth above: on at the configured speed.
+        extruder.set(50.1, 0.0);
+        hf.tick(1.0);
+        assert_eq!(updates(&pwm(&chip, 0)), [0.5]);
+
+        // Back to the threshold: off again, with no damping in between.
+        extruder.set(50.0, 0.0);
+        hf.tick(2.0);
+        assert_eq!(updates(&pwm(&chip, 0)), [0.5, 0.0]);
+    }
+}

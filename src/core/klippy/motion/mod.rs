@@ -20,6 +20,7 @@
 
 pub mod delta;
 pub mod extra;
+pub mod generic_cartesian;
 pub mod itersolve;
 pub mod kinematics;
 pub mod plan;

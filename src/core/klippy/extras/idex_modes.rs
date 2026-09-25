@@ -74,13 +74,18 @@ use crate::core::klippy::mathutil::Coord;
 use crate::core::klippy::motion::Axis;
 use crate::core::klippy::printer::{Printer, PrinterObject};
 
-// Read during the late walk, after the `[stepper_*]` sections and before
-// `[printer]` builds the kinematics that claims it.
+// Both forms load in the generic walk, in the order upstream's
+// `_load_kinematics` walks them (`generic_cartesian.py:173-212`): the bare
+// `[dual_carriage]` is the cartesian IDEX module below, and the prefix form
+// (`[dual_carriage <name>]`) belongs to `kinematics: generic_cartesian`, which
+// `extras::carriage` builds. The prefix form has to load before the
+// `[stepper <name>]` sections that name it, hence the order here.
 section!(
     "dual_carriage",
-    order = 55,
-    phase = late,
-    load = load_config
+    order = 53,
+    phase = generic,
+    load = load_config,
+    prefix = crate::core::klippy::extras::carriage::load_dual_carriage
 );
 
 /// The name the object (and the section) go by upstream

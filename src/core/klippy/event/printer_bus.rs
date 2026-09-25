@@ -12,4 +12,10 @@
 //! `build.rs` writes the definition to `$OUT_DIR/klippy_events.rs` and this
 //! module includes it.
 
+// The generated enum names the payload types bare, so they are imported here:
+// an event with a non-primitive payload (`homing:home_rails_end` carries the
+// run's [`HomingHandle`](crate::core::klippy::motion::HomingHandle)) reads it
+// from this scope.
+use crate::core::klippy::motion::HomingHandle;
+
 include!(concat!(env!("OUT_DIR"), "/klippy_events.rs"));

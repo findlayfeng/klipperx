@@ -138,6 +138,31 @@ impl<'a> ConfigWrapper<'a> {
             .unwrap_or(false)
     }
 
+    /// The sibling sections whose id is `prefix`'s, read through the same
+    /// access tracker.
+    ///
+    /// Upstream's `ConfigWrapper.get_prefix_sections`
+    /// (`klippy/configfile.py:124-126`): every `[<id> <name>]` section, in
+    /// config order. The bare `[<id>]` section is not one of them. Empty when
+    /// this wrapper was built without the whole config.
+    pub fn sibling_prefix_sections(&self, prefix: &str) -> Vec<ConfigWrapper<'a>> {
+        let Some(config) = self.config else {
+            return Vec::new();
+        };
+        let id = prefix.split(' ').next().unwrap_or(prefix);
+        config
+            .get_sections_by_id(id)
+            .into_iter()
+            .filter(|section| section.sub.is_some())
+            .map(|section| ConfigWrapper {
+                section,
+                access: Arc::clone(&self.access),
+                configfile: self.configfile.clone(),
+                config: self.config,
+            })
+            .collect()
+    }
+
     /// The shared access record, for a part that wants to keep reading later.
     pub fn access(&self) -> Arc<AccessTracking> {
         Arc::clone(&self.access)

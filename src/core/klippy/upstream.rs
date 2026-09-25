@@ -406,8 +406,6 @@ mod tests {
     /// `KLIPPERX_UPSTREAM_ALL=1` runs every case and reports every failure, so
     /// the list stays honest rather than hiding regressions.
     const IGNORED: &[&str] = &[
-        "corexyuv.test",
-        "generic_cartesian.test",
         "generic_cartesian_iqex.test",
         "generic_cartesian_itex.test",
         "load_cell.test",
@@ -956,6 +954,151 @@ mod tests {
             .await
             .expect("the machine comes up");
         assert!(gcode.is_ok(), "{gcode:?}");
+    }
+
+    /// The corpus `corexyuv.cfg` homing, bounded: `G28` on the
+    /// generic-cartesian printer must arm and **fire** every axis' trsync and
+    /// the move after it must run (U-GC-3). Before the fix the Z homing move
+    /// was built with a zero-length profile — the kinematics was constructed
+    /// with `max_z_velocity = 0` — so no step was queued, the fake firmware
+    /// never fired the armed trsync, and the host waited forever while
+    /// retransmitting the arm block (the "infinite arm, never fire" log).
+    ///
+    /// Only the homing part of `corexyuv.test`'s script runs here; the whole
+    /// case, dual-carriage and extruder segments included, runs in
+    /// [`the_corexyuv_case_runs_every_gcode_line`].
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_corexyuv_config_homes_against_the_fake_firmware() {
+        let Some(dict) = dictionary_path("atmega2560.dict") else {
+            return;
+        };
+        let run = all_runs()
+            .into_iter()
+            .find(|run| {
+                run.path
+                    .file_name()
+                    .map(|name| name == "corexyuv.test")
+                    .unwrap_or(false)
+            })
+            .expect("the corpus carries corexyuv.test");
+        let config = injected_config(&run.config, &[(None, dict)]).expect("corexyuv.cfg parses");
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            run_phases(&config, "corexyuv.cfg", "G90\nG28\nG1 X10 Y20 F6000\n"),
+        )
+        .await;
+        let gcode = outcome.expect(
+            "generic-cartesian homing finishes instead of waiting on a trsync that never fires",
+        );
+        assert!(gcode.is_ok(), "{gcode:?}");
+    }
+
+    /// The same chain on the smallest printer that can show it: three
+    /// `[carriage]` sections, one motor each, and a `G28 Z` — no corpus
+    /// section other than the Z rail is involved.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_generic_cartesian_z_home_fires_the_trsync() {
+        let Some(dict) = dictionary_path("atmega2560.dict") else {
+            return;
+        };
+        let text = format!(
+            "[mcu]\ntest: dict={}\n\
+             [printer]\nkinematics: generic_cartesian\nmax_velocity: 300\nmax_accel: 3000\n\
+             max_z_velocity: 5\nmax_z_accel: 100\n\
+             [carriage carriage_x]\naxis: x\nposition_endstop: 0\nposition_max: 300\n\
+             homing_speed: 50\nendstop_pin: ^PE5\n\
+             [carriage carriage_y]\naxis: y\nposition_endstop: 0\nposition_max: 200\n\
+             homing_speed: 50\nendstop_pin: ^PJ1\n\
+             [carriage carriage_z]\naxis: z\nposition_endstop: 0.5\nposition_max: 100\n\
+             homing_speed: 5\nendstop_pin: ^PD3\n\
+             [stepper a]\ncarriages: carriage_x\nstep_pin: PF0\ndir_pin: PF1\n\
+             enable_pin: !PD7\nmicrosteps: 16\nrotation_distance: 40\n\
+             [stepper b]\ncarriages: carriage_y\nstep_pin: PH1\ndir_pin: PH0\n\
+             enable_pin: !PA1\nmicrosteps: 16\nrotation_distance: 40\n\
+             [stepper z]\ncarriages: carriage_z\nstep_pin: PL3\ndir_pin: PL1\n\
+             enable_pin: !PK0\nmicrosteps: 16\nrotation_distance: 8\n",
+            dict.display()
+        );
+        let (config, _) = Config::from_text(&text).expect("the generic-cartesian config parses");
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            run_phases(&config, "focused-gc-z.cfg", "G28 Z\n"),
+        )
+        .await;
+        let gcode = outcome.expect(
+            "the Z homing move fires its trsync instead of waiting on one that never fires",
+        );
+        assert!(gcode.is_ok(), "{gcode:?}");
+    }
+
+    /// The whole `corexyuv.test` script, line by line on one live machine,
+    /// bounded — the case `IGNORED` still lists only because the guard stays
+    /// load-only.
+    ///
+    /// Every line runs through the ordinary dispatcher against the fake
+    /// firmware and is reported, so a regression names its command rather
+    /// than the case: the U-GC-4 failure stopped at `G91` + `G1 X-10 E.2`
+    /// with `Move out of range: -10.000 …`, because a dual carriage's frame
+    /// never learned where homing left it (`idex_modes::Shared::homed`) and
+    /// the switch onto `carriage_u` re-anchored the toolhead at X=0.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_corexyuv_case_runs_every_gcode_line() {
+        use crate::core::klippy::gcode::{GCodeDispatch, GCODE_OBJECT};
+        use crate::core::klippy::printer::{Printer, PrinterState};
+        use crate::core::klippy::reactor::TokioReactor;
+
+        let Some(dict) = dictionary_path("atmega2560.dict") else {
+            return;
+        };
+        let run = all_runs()
+            .into_iter()
+            .find(|run| {
+                run.path
+                    .file_name()
+                    .map(|name| name == "corexyuv.test")
+                    .unwrap_or(false)
+            })
+            .expect("the corpus carries corexyuv.test");
+        let config = injected_config(&run.config, &[(None, dict)]).expect("corexyuv.cfg parses");
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            let reactor = Arc::new(TokioReactor::new(tokio::runtime::Handle::current()));
+            let printer = Arc::new(Printer::new(reactor));
+            let mut start_args = crate::core::klippy::api::StartArgs::collect("corexyuv.cfg", None);
+            start_args.debug_output = Some("_test_output".to_string());
+            printer.set_start_args(Arc::new(start_args));
+            printer.load_config(&config).expect("corexyuv.cfg loads");
+            tokio::time::timeout(std::time::Duration::from_secs(30), printer.bring_up())
+                .await
+                .expect("bring_up finishes");
+            let state = printer.get_state_message();
+            assert_eq!(state.category, PrinterState::Ready, "{state:?}");
+            let dispatcher = printer
+                .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+                .expect("the g-code dispatcher is registered");
+            let mut failed = None;
+            for line in &run.gcode_lines {
+                match dispatcher.run_script(line).await {
+                    Ok(()) => eprintln!("OK   | {line}"),
+                    Err(e) => {
+                        eprintln!("FAIL | {line} -> {e}");
+                        failed = Some(format!("{line} -> {e}"));
+                        break;
+                    }
+                }
+            }
+            printer.teardown();
+            failed
+        })
+        .await;
+        let failed = outcome.expect("the full script finishes inside the bound");
+        assert!(
+            failed.is_none(),
+            "corexyuv.test failed at: {}",
+            failed.unwrap()
+        );
     }
 }
 

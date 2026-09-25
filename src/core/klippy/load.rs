@@ -401,8 +401,14 @@ mod tests {
                 "stepper_x",
                 "stepper_y",
                 "stepper_z",
+                // The generic-cartesian sections: the carriages first, then what
+                // attaches to them, then the motors that name them
+                // (`generic_cartesian.py:173-212`).
+                "carriage",
                 "dual_carriage",
+                "extra_carriage",
                 "endstop_phase",
+                "stepper",
                 "printer",
                 // The G28 wrapper takes the toolhead's handler away, so it has
                 // to load after `[printer]` (`order = 70` against `60`).
@@ -412,7 +418,9 @@ mod tests {
         // `mcu` is the one up-front section (upstream loads `pins` and `mcu`
         // before the generic walk); `[stepper_*]` and `[printer]` are late
         // (upstream builds `toolhead` last, and `Rail::lookup` reads stepper
-        // config at that point); the rest are plain generic sections.
+        // config at that point); the rest are plain generic sections —
+        // including the generic-cartesian carriage/stepper sections, which
+        // `[printer]` reads and upstream walks in the generic prefix walk.
         let by_id = |id: &str| {
             FACTORIES
                 .iter()
@@ -428,6 +436,10 @@ mod tests {
         // `[endstop_phase <stepper>]` reads its stepper section, so it loads
         // after the steppers and before `[printer]`.
         assert_eq!(by_id("endstop_phase").phase, Phase::Late);
+        assert_eq!(by_id("carriage").phase, Phase::Generic);
+        assert_eq!(by_id("dual_carriage").phase, Phase::Generic);
+        assert_eq!(by_id("extra_carriage").phase, Phase::Generic);
+        assert_eq!(by_id("stepper").phase, Phase::Generic);
         assert_eq!(by_id("printer").phase, Phase::Late);
         assert_eq!(by_id("printer").object, Some("toolhead"));
         assert!(FACTORIES

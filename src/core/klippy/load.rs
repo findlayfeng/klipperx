@@ -387,6 +387,8 @@ mod tests {
                 "neopixel",
                 "pca9533",
                 "pca9632",
+                "tmc2208",
+                "tmc2209",
                 "spi_device",
                 "stepper_a",
                 "stepper_arm",

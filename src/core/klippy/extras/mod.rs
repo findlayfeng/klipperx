@@ -69,6 +69,12 @@ pub mod temperature_fan;
 pub mod temperature_mcu;
 pub mod temperature_sensor;
 pub mod template;
+pub mod tmc;
+pub mod tmc2208;
+pub mod tmc2209;
+#[cfg(test)]
+mod tmc_scratch;
+pub mod tmc_uart;
 pub mod toolhead;
 pub mod trigger_analog;
 pub mod virtual_sdcard;

@@ -16,9 +16,9 @@
 //! extruder's trapq is allocated by the toolhead, which connects **after** this
 //! generic section, and only the toolhead adds a host stepper to the step
 //! generation — so the binding is recorded (status `motion_queue`) but the
-//! stepper does not yet follow the extruder's motion. `SYNC_EXTRUDER_MOTION`
-//! and `SET_EXTRUDER_ROTATION_DISTANCE` are not registered either; the
-//! dispatcher reports them as unknown commands, which the corpus tolerates.
+//! stepper does not yet follow the extruder's motion. `SET_EXTRUDER_ROTATION_DISTANCE`
+//! records its new distance and direction but does not rebuild the solver; the
+//! corpus's fake firmware only needs the commands to run without error.
 
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
@@ -59,7 +59,8 @@ pub struct PrinterExtruderStepper {
     pressure_advance: Arc<Mutex<f64>>,
     pressure_advance_smooth_time: Arc<Mutex<f64>>,
     /// `motion_queue`: the extruder this stepper is bound to once connected.
-    motion_queue: Mutex<Option<String>>,
+    /// `Arc` so the `SYNC_EXTRUDER_MOTION` handler shares the same slot.
+    motion_queue: Arc<Mutex<Option<String>>>,
     /// The machine, to find the extruder at connect.
     printer: Weak<Printer>,
 }
@@ -103,7 +104,7 @@ impl PrinterExtruderStepper {
             config_smooth_time,
             pressure_advance: Arc::new(Mutex::new(0.0)),
             pressure_advance_smooth_time: Arc::new(Mutex::new(0.0)),
-            motion_queue: Mutex::new(None),
+            motion_queue: Arc::new(Mutex::new(None)),
             printer: Arc::downgrade(printer),
         };
         extruder_stepper.register_commands(printer)?;
@@ -143,6 +144,43 @@ impl PrinterExtruderStepper {
                 Some("Set pressure advance parameters"),
             )
             .map_err(ConfigError::new)?;
+
+        // The motion-sync commands every extruder stepper registers
+        // (`kinematics/extruder.py:37-42`): the rotation distance is set on the
+        // wrapped stepper, the motion queue on this object's binding.
+        {
+            let stepper = Arc::clone(&self.stepper);
+            let name = self.name.clone();
+            let handler: CommandHandler = sync(move |gcmd: &GcodeCommand| {
+                cmd_set_extruder_rotation_distance(gcmd, &name, &stepper)
+            });
+            gcode
+                .register_mux_command(
+                    "SET_EXTRUDER_ROTATION_DISTANCE",
+                    "EXTRUDER",
+                    Some(&self.name),
+                    handler,
+                    Some("Set extruder rotation distance"),
+                )
+                .map_err(ConfigError::new)?;
+        }
+        {
+            let queue = Arc::clone(&self.motion_queue);
+            let name = self.name.clone();
+            let printer = Arc::downgrade(printer);
+            let handler: CommandHandler = sync(move |gcmd: &GcodeCommand| {
+                cmd_sync_extruder_motion(gcmd, &name, &printer, &queue)
+            });
+            gcode
+                .register_mux_command(
+                    "SYNC_EXTRUDER_MOTION",
+                    "EXTRUDER",
+                    Some(&self.name),
+                    handler,
+                    Some("Set extruder stepper motion queue"),
+                )
+                .map_err(ConfigError::new)?;
+        }
         Ok(())
     }
 
@@ -245,12 +283,105 @@ fn cmd_set_pressure_advance(
     Ok(())
 }
 
+/// `SET_EXTRUDER_ROTATION_DISTANCE`'s body for one extruder's stepper
+/// (upstream `ExtruderStepper.cmd_SET_E_ROTATION_DISTANCE`,
+/// `kinematics/extruder.py:110-125`).
+///
+/// A missing `DISTANCE` reports the current value; a zero is refused; a
+/// negative value flips the direction and stores the absolute distance. Each
+/// `[extruder]` and `[extruder_stepper <name>]` registers this for its own name.
+///
+/// # Errors
+/// Upstream's wording when `DISTANCE` is zero, plus the parameter errors.
+pub(crate) fn cmd_set_extruder_rotation_distance(
+    gcmd: &GcodeCommand,
+    name: &str,
+    stepper: &PrinterStepper,
+) -> Result<(), CommandError> {
+    let rotation_dist = if gcmd.get_command_parameters().contains_key("DISTANCE") {
+        let distance = gcmd.get_float("DISTANCE")?;
+        if distance == 0.0 {
+            return Err(CommandError::new("Rotation distance can not be zero"));
+        }
+        let (_, orig_invert_dir) = stepper.get_dir_inverted();
+        let mut next_invert_dir = orig_invert_dir;
+        let mut distance = distance;
+        if distance < 0.0 {
+            next_invert_dir = !orig_invert_dir;
+            distance = -distance;
+        }
+        // Upstream flushes step generation before rebuilding the solver
+        // (`kinematics/extruder.py:120-122`); the solver half is the H10 gap.
+        stepper.set_rotation_distance(distance);
+        stepper.set_dir_inverted(next_invert_dir);
+        distance
+    } else {
+        stepper.get_rotation_distance().0
+    };
+    let (invert_dir, orig_invert_dir) = stepper.get_dir_inverted();
+    let rotation_dist = if invert_dir != orig_invert_dir {
+        -rotation_dist
+    } else {
+        rotation_dist
+    };
+    gcmd.respond_info(&format!(
+        "Extruder '{name}' rotation distance set to {rotation_dist:.6}"
+    ));
+    Ok(())
+}
+
+/// `SYNC_EXTRUDER_MOTION`'s body for one extruder stepper (upstream
+/// `cmd_SYNC_EXTRUDER_MOTION`, `kinematics/extruder.py:128-133`).
+///
+/// An empty `MOTION_QUEUE` detaches — upstream's `sync_to_extruder("")` branch,
+/// which must **not** be treated as an invalid name; any other value must name
+/// an `[extruder]`.
+///
+/// # Errors
+/// Upstream's wording when the name does not resolve to an extruder.
+pub(crate) fn cmd_sync_extruder_motion(
+    gcmd: &GcodeCommand,
+    name: &str,
+    printer: &Weak<Printer>,
+    motion_queue: &Mutex<Option<String>>,
+) -> Result<(), CommandError> {
+    let ename = gcmd.get_str_default("MOTION_QUEUE", "");
+    let printer = printer
+        .upgrade()
+        .ok_or_else(|| CommandError::new("printer is gone"))?;
+    if ename.is_empty() {
+        *lock(motion_queue) = None;
+    } else {
+        if printer
+            .lookup_object_as::<PrinterExtruder>(&ename)
+            .is_none()
+        {
+            return Err(CommandError::new(format!(
+                "'{ename}' is not a valid extruder."
+            )));
+        }
+        *lock(motion_queue) = Some(ename.clone());
+    }
+    gcmd.respond_info(&format!("Extruder '{name}' now syncing with '{ename}'"));
+    Ok(())
+}
+
 /// The factory the section declaration names (`extruder_stepper.py:23`).
 pub fn load_config_prefix(
     config: &ConfigWrapper,
     printer: &Arc<Printer>,
 ) -> Result<Arc<dyn PrinterObject>, ConfigError> {
     Ok(Arc::new(PrinterExtruderStepper::new(config, printer)?))
+}
+
+/// The wrapped stepper's position at a past print time (upstream's
+/// `PrinterExtruderStepper.find_past_position`). The host stepper is owned by
+/// the toolhead after connect and exposes no position, so this reports
+/// `0.0` — the same H10 motion-sync gap the module docs describe.
+impl PrinterExtruderStepper {
+    pub fn find_past_position(&self, _print_time: f64) -> f64 {
+        0.0
+    }
 }
 
 fn lock<T>(slot: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -397,6 +528,101 @@ mod tests {
         let stepper = the_stepper(&printer);
         stepper.sync_to_extruder(&printer).expect("empty detaches");
         let status = PrinterObject::get_status(&*stepper, 0.0);
+        assert!(status["motion_queue"].is_null(), "{status}");
+    }
+
+    fn ready_printer(text: &str) -> Arc<Printer> {
+        let printer = load_ok(text);
+        printer.send_event(&KlippyEvent::KlippyReady);
+        printer
+    }
+
+    fn gcode(printer: &Arc<Printer>) -> Arc<GCodeDispatch> {
+        printer
+            .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+            .expect("the loader registers `gcode`")
+    }
+
+    /// `SET_EXTRUDER_ROTATION_DISTANCE` by name: a zero is refused, a negative
+    /// flips the direction, and the value is stored (upstream's wording).
+    #[test]
+    fn test_set_extruder_rotation_distance_by_name() {
+        let printer = ready_printer(&config(EXTRA_STEPPER));
+        let gcode = gcode(&printer);
+
+        gcode
+            .run_script_sync(
+                "SET_EXTRUDER_ROTATION_DISTANCE EXTRUDER=my_extra_stepper DISTANCE=33.2",
+            )
+            .expect("a positive distance is accepted");
+        let stepper = the_stepper(&printer);
+        assert!((stepper.stepper.get_rotation_distance().0 - 33.2).abs() < 1e-9);
+
+        let err = gcode
+            .run_script_sync("SET_EXTRUDER_ROTATION_DISTANCE EXTRUDER=my_extra_stepper DISTANCE=0")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Rotation distance can not be zero"), "{err}");
+
+        // A negative distance is accepted with the direction flipped; the
+        // stored distance is the absolute value, as upstream stores it.
+        let (before_invert, orig) = stepper.stepper.get_dir_inverted();
+        gcode
+            .run_script_sync(
+                "SET_EXTRUDER_ROTATION_DISTANCE EXTRUDER=my_extra_stepper DISTANCE=-33.1",
+            )
+            .expect("a negative distance is accepted");
+        let (after_invert, orig2) = stepper.stepper.get_dir_inverted();
+        assert_eq!(orig, orig2);
+        assert_ne!(after_invert, before_invert);
+        assert!((stepper.stepper.get_rotation_distance().0 - 33.1).abs() < 1e-9);
+    }
+
+    /// `SYNC_EXTRUDER_MOTION` by name: an empty `MOTION_QUEUE` detaches without
+    /// error, a good name binds, a bad one complains with upstream's exact
+    /// wording.
+    #[test]
+    fn test_sync_extruder_motion_by_name() {
+        let printer = ready_printer(&config(EXTRA_STEPPER));
+        let gcode = gcode(&printer);
+
+        gcode
+            .run_script_sync("SYNC_EXTRUDER_MOTION EXTRUDER=my_extra_stepper MOTION_QUEUE=")
+            .expect("an empty motion queue detaches");
+        let status = PrinterObject::get_status(&*the_stepper(&printer), 0.0);
+        assert!(status["motion_queue"].is_null(), "{status}");
+
+        gcode
+            .run_script_sync("SYNC_EXTRUDER_MOTION EXTRUDER=my_extra_stepper MOTION_QUEUE=extruder")
+            .expect("a good name binds");
+        let status = PrinterObject::get_status(&*the_stepper(&printer), 0.0);
+        assert_eq!(status["motion_queue"], "extruder");
+
+        let err = gcode
+            .run_script_sync("SYNC_EXTRUDER_MOTION EXTRUDER=my_extra_stepper MOTION_QUEUE=bogus")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, "'bogus' is not a valid extruder.");
+    }
+
+    /// The primary `[extruder]` registers the same two commands for its own
+    /// name, so the corpus's `EXTRUDER=extruder` lines reach a handler.
+    #[test]
+    fn test_the_primary_extruder_registers_the_motion_commands() {
+        let printer = ready_printer(&config(EXTRA_STEPPER));
+        let gcode = gcode(&printer);
+
+        gcode
+            .run_script_sync("SET_EXTRUDER_ROTATION_DISTANCE EXTRUDER=extruder DISTANCE=33.2")
+            .expect("the primary registers the command");
+        gcode
+            .run_script_sync("SYNC_EXTRUDER_MOTION EXTRUDER=extruder MOTION_QUEUE=")
+            .expect("the primary registers the command");
+
+        let extruder = printer
+            .lookup_object_as::<PrinterExtruder>("extruder")
+            .expect("[extruder] is registered");
+        let status = PrinterObject::get_status(&*extruder, 0.0);
         assert!(status["motion_queue"].is_null(), "{status}");
     }
 

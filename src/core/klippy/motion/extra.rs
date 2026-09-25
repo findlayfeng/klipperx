@@ -55,4 +55,15 @@ pub trait ExtraAxis: Send + Sync + std::fmt::Debug {
 
     /// The axis' `get_status` fields, folded into the toolhead's status.
     fn get_status(&self) -> Value;
+
+    /// The G-Code letter this extra axis is registered under, if any
+    /// (`ManualStepper.get_axis_gcode_id`).
+    ///
+    /// Upstream only the manual stepper binds an axis this way; an extruder
+    /// returns `None` here. The default is what keeps the `GCODE_AXIS`
+    /// collision check the manual stepper runs from having to special-case
+    /// the other extra axes.
+    fn axis_gcode_id(&self) -> Option<String> {
+        None
+    }
 }

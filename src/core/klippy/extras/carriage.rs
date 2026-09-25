@@ -278,6 +278,28 @@ impl CarriageModel {
             .clone()
     }
 
+    /// The carriage that is active for `axis`: the primary carriage, which is
+    /// what [`build`] activates (`idex_modes.py:27-34`). The homing driver
+    /// homes this one carriage per axis.
+    pub fn active_carriage(&self, axis: usize) -> Option<Arc<Carriage>> {
+        self.carriages().into_iter().find(|carriage| {
+            carriage.kind() == CarriageKind::Main && axis_index(carriage.axis()) == axis
+        })
+    }
+
+    /// The step distance of the first motor driving `carriage_name` — the step
+    /// size the homing driver polls the endstop at (`home_axis`).
+    pub fn step_dist(&self, carriage_name: &str) -> Option<f64> {
+        self.steppers()
+            .iter()
+            .find(|stepper| {
+                [X_AXIS, Y_AXIS, Z_AXIS]
+                    .iter()
+                    .any(|axis| stepper.carriage_for_axis(*axis) == Some(carriage_name))
+            })
+            .map(|stepper| stepper.stepper().step_dist())
+    }
+
     fn push_carriage(&self, carriage: Arc<Carriage>) {
         self.carriages
             .lock()
@@ -972,5 +994,98 @@ mod tests {
         let (config, _) = Config::from_text(&text).expect("corexyuv.cfg parses");
         let printer = Arc::new(Printer::new(ManualReactor::shared()));
         printer.load_config(&config).expect("corexyuv.cfg loads");
+    }
+
+    /// A three-axis carriage printer, and nothing else — the tests below vary
+    /// the carriage/stepper sections to reach the load-time checks.
+    fn load_error(carriages: &str, steppers: &str) -> String {
+        use crate::core::klippy::config::Config;
+        use crate::core::klippy::printer::Printer;
+        use crate::core::klippy::reactor::ManualReactor;
+
+        let dict = klipperx_test_support::test_dicts_dir().join("atmega2560.dict");
+        let text = format!(
+            "[mcu]\ntest: dict={}\n{carriages}{steppers}\n\
+             [printer]\nkinematics: generic_cartesian\nmax_velocity: 300\nmax_accel: 3000\n",
+            dict.display()
+        );
+        let (config, _) = Config::from_text(&text).expect("the test config parses");
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        match printer.load_config(&config) {
+            Ok(()) => panic!("the config loads, but a load error was expected"),
+            Err(error) => error.to_string(),
+        }
+    }
+
+    /// The three primary carriages the tests below share, and a stepper for
+    /// each axis: `x+y`/`x-y` drive x and y independently, so the matrix is
+    /// only singular when a test makes it so.
+    const CARRIAGES: &str = "[carriage x]\naxis: x\nposition_endstop: 0\nposition_max: 300\n\
+         endstop_pin: ^PE5\n\
+         [carriage y]\naxis: y\nposition_endstop: 0\nposition_max: 200\nendstop_pin: ^PJ1\n\
+         [carriage z]\naxis: z\nposition_endstop: 0\nposition_max: 100\nendstop_pin: ^PD3\n";
+    const STEPPERS: &str =
+        "[stepper a]\ncarriages: x+y\nstep_pin: PF0\ndir_pin: PF1\nmicrosteps: 16\n\
+         rotation_distance: 40\n\
+         [stepper c]\ncarriages: x-y\nstep_pin: PF6\ndir_pin: !PF7\nmicrosteps: 16\n\
+         rotation_distance: 40\n\
+         [stepper z]\ncarriages: z\nstep_pin: PL3\ndir_pin: PL1\nmicrosteps: 16\n\
+         rotation_distance: 8\n";
+
+    #[test]
+    fn a_second_primary_carriage_on_an_axis_is_refused() {
+        let carriages = format!(
+            "{CARRIAGES}[carriage x2]\naxis: x\nposition_endstop: 0\nposition_max: 300\n\
+             endstop_pin: ^PE6\n"
+        );
+        assert_eq!(
+            load_error(&carriages, STEPPERS),
+            "Axis 'x' is set for multiple primary carriages (x, x2)"
+        );
+    }
+
+    #[test]
+    fn an_axis_without_a_primary_carriage_is_refused() {
+        let carriages = "[carriage x]\naxis: x\nposition_endstop: 0\nposition_max: 300\n\
+             endstop_pin: ^PE5\n\
+             [carriage y]\naxis: y\nposition_endstop: 0\nposition_max: 200\nendstop_pin: ^PJ1\n";
+        assert_eq!(
+            load_error(
+                carriages,
+                "[stepper a]\ncarriages: x+y\nstep_pin: PF0\ndir_pin: PF1\nmicrosteps: 16\n\
+                 rotation_distance: 40\n\
+                 [stepper c]\ncarriages: x-y\nstep_pin: PF6\ndir_pin: !PF7\nmicrosteps: 16\n\
+                 rotation_distance: 40\n"
+            ),
+            "No carriage defined for axis 'z'"
+        );
+    }
+
+    #[test]
+    fn a_singular_coefficient_matrix_is_refused() {
+        // Both motors drive the same combination, so x and y cannot move
+        // independently.
+        let steppers = "[stepper a]\ncarriages: x+y\nstep_pin: PF0\ndir_pin: PF1\nmicrosteps: 16\n\
+             rotation_distance: 40\n\
+             [stepper c]\ncarriages: x+y\nstep_pin: PF6\ndir_pin: !PF7\nmicrosteps: 16\n\
+             rotation_distance: 40\n\
+             [stepper z]\ncarriages: z\nstep_pin: PL3\ndir_pin: PL1\nmicrosteps: 16\n\
+             rotation_distance: 8\n";
+        assert_eq!(
+            load_error(CARRIAGES, steppers),
+            "Verify configured stepper(s) and their 'carriages' specifications, the current \
+             configuration does not allow independent movements of all printer axes."
+        );
+    }
+
+    #[test]
+    fn a_carriage_no_stepper_drives_is_refused() {
+        // A fourth carriage nothing references (`_check_carriages_references`).
+        let carriages =
+            format!("{CARRIAGES}[extra_carriage z1]\nprimary_carriage: z\nendstop_pin: ^PD2\n");
+        assert_eq!(
+            load_error(&carriages, STEPPERS),
+            "Carriage(s) z1 must be referenced by some stepper(s)"
+        );
     }
 }

@@ -1543,6 +1543,53 @@ async fn home_axes(
     requested: &[usize],
     printer: &Weak<Printer>,
 ) -> Result<(), CommandError> {
+    if kind == KinematicsKind::GenericCartesian {
+        // Generic cartesian homes one carriage per axis, in order
+        // (`GenericCartesianKinematics.home`, `generic_cartesian.py:306-315`),
+        // through the carriage that is active for that axis. Its motors live
+        // in the carriage registry, not in `rails`.
+        let model = printer
+            .upgrade()
+            .and_then(|printer| carriage::lookup_model(&printer))
+            .ok_or_else(|| {
+                CommandError::new(
+                    "kinematics 'generic_cartesian' needs '[carriage <name>]' sections".to_string(),
+                )
+            })?;
+        for &axis in requested {
+            let carriage = model.active_carriage(axis).ok_or_else(|| {
+                CommandError::new(format!(
+                    "No carriage defined for axis '{}'",
+                    ["x", "y", "z"][axis]
+                ))
+            })?;
+            let endstop = carriage.endstop().clone();
+            let params = carriage.params();
+            let info = carriage.homing_info();
+            let (forcepos, movepos) =
+                home_move(axis, &info, params.position_min, params.position_max);
+            let step_dist = model.step_dist(carriage.name()).unwrap_or(1.0);
+            send(printer, &KlippyEvent::HomingHomeRailsBegin);
+            let result = home_axis(
+                connected,
+                axis,
+                forcepos,
+                movepos,
+                &[axis],
+                info,
+                step_dist,
+                endstop.as_ref(),
+                printer,
+            )
+            .await;
+            send(
+                printer,
+                &KlippyEvent::HomingHomeRailsEnd { axes: vec![axis] },
+            );
+            result?;
+        }
+        return Ok(());
+    }
     // `kinematics: none` has no rails, so there is nothing to home.
     if rails.is_empty() {
         return Ok(());

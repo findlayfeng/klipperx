@@ -907,6 +907,12 @@ impl TmcDriver {
         self.fields.register_values()
     }
 
+    /// The driver's transport, so a test can pin the file-output short-circuit
+    /// and the register-name table.
+    pub fn transport(&self) -> &Arc<dyn TmcTransport> {
+        &self.transport
+    }
+
     /// Send every cached register (`_init_registers`).
     ///
     /// # Errors
@@ -1340,7 +1346,7 @@ impl PinChip for TmcVirtualPin {
         let inner = ppins.setup_endstop_dyn(diag_pin, None)?;
         Ok(Arc::new(TmcVirtualEndstop {
             inner,
-            driver: Arc::clone(&self.driver),
+            driver: Arc::downgrade(&self.driver),
             diag_pin_field: self.diag_pin_field,
         }))
     }
@@ -1353,9 +1359,14 @@ impl PinChip for TmcVirtualPin {
 /// `homing:homing_move_begin/end` events upstream uses, because this host's
 /// homing driver calls the endstop it is handed directly; no toolhead or event
 /// plumbing is touched.
+///
+/// The driver is held **weakly**: the rail's `PrinterStepper` owns this
+/// endstop, and the driver strongly owns the stepper, so a strong reference
+/// back would be a cycle that keeps the MCU (and its receive task) alive past
+/// teardown.
 pub struct TmcVirtualEndstop {
     inner: Arc<dyn HomingEndstop>,
-    driver: Arc<TmcDriver>,
+    driver: Weak<TmcDriver>,
     diag_pin_field: Option<&'static str>,
 }
 
@@ -1368,17 +1379,21 @@ impl HomingEndstop for TmcVirtualEndstop {
         rest_time: f64,
         triggered: bool,
     ) -> Result<Arc<Completion>, McuError> {
-        self.driver.virtual_homing_begin(self.diag_pin_field)?;
+        if let Some(driver) = self.driver.upgrade() {
+            driver.virtual_homing_begin(self.diag_pin_field)?;
+        }
         self.inner
             .home_start(print_time, sample_time, sample_count, rest_time, triggered)
     }
 
     fn home_wait(&self, home_end_time: f64) -> EndstopFuture<'_> {
         let inner = Arc::clone(&self.inner);
-        let driver = Arc::clone(&self.driver);
+        let driver = self.driver.clone();
         Box::pin(async move {
             let result = inner.home_wait(home_end_time).await;
-            let _ = driver.virtual_homing_end();
+            if let Some(driver) = driver.upgrade() {
+                let _ = driver.virtual_homing_end();
+            }
             result
         })
     }

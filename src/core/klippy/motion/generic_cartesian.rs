@@ -454,4 +454,107 @@ mod tests {
         kin.update_limits(X_AXIS, Some((5.0, 50.0)));
         assert_eq!(kin.limits[X_AXIS], Some((5.0, 50.0)));
     }
+
+    // -----------------------------------------------------------------------
+    // SCRATCH (deleted before commit): the corpus' `corexyuv` run brought up
+    // against the fake firmware, to see the idex commands past `load_config`.
+    // -----------------------------------------------------------------------
+
+    /// The corpus machine, loaded and connected, plus the g-code of
+    /// `corexyuv.test` with comments and `CONFIG`/`DICTIONARY` dropped.
+    async fn scratch_corexyuv() -> (
+        std::sync::Arc<crate::core::klippy::printer::Printer>,
+        String,
+    ) {
+        use crate::core::klippy::config::Config;
+        use crate::core::klippy::printer::Printer;
+        use crate::core::klippy::reactor::TokioReactor;
+        use std::sync::Arc;
+
+        let dir = klipperx_test_support::klipper_dir().join("test/klippy");
+        let dict = klipperx_test_support::test_dicts_dir().join("atmega2560.dict");
+        let text = std::fs::read_to_string(dir.join("corexyuv.cfg")).expect("the config");
+        let text = text.replace(
+            "[mcu]\nserial: /dev/ttyACM0",
+            &format!("[mcu]\ntest: dict={}", dict.display()),
+        );
+        let (config, _) = Config::from_text(&text).expect("corexyuv.cfg parses");
+
+        let corpus = std::fs::read_to_string(dir.join("corexyuv.test")).expect("the .test file");
+        let script: String = corpus
+            .lines()
+            .map(|raw| match raw.find('#') {
+                Some(pos) => &raw[..pos],
+                None => raw,
+            })
+            .filter(|line| {
+                !matches!(
+                    line.split_whitespace().next().unwrap_or(""),
+                    "CONFIG" | "DICTIONARY" | ""
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let reactor = Arc::new(TokioReactor::new(tokio::runtime::Handle::current()));
+        let printer = Arc::new(Printer::new(reactor));
+        let mut start_args = crate::core::klippy::api::StartArgs::collect("corexyuv.cfg", None);
+        start_args.debug_output = Some("_scratch_output".to_string());
+        printer.set_start_args(Arc::new(start_args));
+        printer.load_config(&config).expect("corexyuv.cfg loads");
+        tokio::time::timeout(std::time::Duration::from_secs(10), printer.bring_up())
+            .await
+            .expect("bring_up timed out");
+        let state = printer.get_state_message();
+        eprintln!("scratch: after bring_up: {}", state.message);
+        (printer, script)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn scratch_the_idex_commands_run_past_load() {
+        use crate::core::klippy::gcode::{GCodeDispatch, GCODE_OBJECT};
+
+        let (printer, _) = scratch_corexyuv().await;
+        let gcode = printer
+            .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+            .expect("gcode is registered");
+        for line in [
+            "SET_DUAL_CARRIAGE CARRIAGE=carriage_u",
+            "SET_DUAL_CARRIAGE CARRIAGE=carriage_v",
+            "SAVE_DUAL_CARRIAGE_STATE",
+            "SET_DUAL_CARRIAGE CARRIAGE=carriage_x",
+            "RESTORE_DUAL_CARRIAGE_STATE",
+            "SET_DUAL_CARRIAGE CARRIAGE=nope",
+            "SET_DUAL_CARRIAGE CARRIAGE=0",
+        ] {
+            match gcode.run_script(line).await {
+                Ok(()) => eprintln!("scratch: {line} -> ok"),
+                Err(error) => eprintln!("scratch: {line} -> Err({error})"),
+            }
+        }
+        printer.teardown();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn scratch_the_corpus_corexyuv_run() {
+        use crate::core::klippy::gcode::{GCodeDispatch, GCODE_OBJECT};
+
+        let (printer, script) = scratch_corexyuv().await;
+        let gcode = printer
+            .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+            .expect("gcode is registered");
+        for line in script.lines().filter(|line| !line.trim().is_empty()) {
+            eprintln!("scratch: running `{line}`");
+            match gcode.run_script(line).await {
+                Ok(()) => eprintln!("scratch: `{line}` -> ok"),
+                Err(error) => {
+                    eprintln!("scratch: the corpus run stopped at `{line}`: {error}");
+                    break;
+                }
+            }
+        }
+        let state = printer.get_state_message();
+        eprintln!("scratch: final state: {}", state.message);
+        printer.teardown();
+    }
 }

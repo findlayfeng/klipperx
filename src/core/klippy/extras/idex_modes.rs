@@ -26,8 +26,18 @@
 //! calls `toolhead.set_position(newpos)` (`idex_modes.py:101-114`) — the
 //! `toolhead:set_position` event re-anchors `gcode_move` with it, so the next
 //! move lands in the new carriage's frame and its range. The upstream
-//! behaviour still missing is listed below; the idex family's next units
-//! (hybrid dual carriage, generic cartesian) build on this seam.
+//! behaviour still missing is listed below; the hybrid dual carriage unit
+//! builds on this seam.
+//!
+//! The generic-cartesian family reaches the same module from the other side:
+//! upstream builds `idex_modes.DualCarriages` inside
+//! `GenericCartesianKinematics.__init__` when the config carries
+//! `[dual_carriage <name>]` sections (`generic_cartesian.py:137-146`), so
+//! there the object and the three commands come from the kinematics, not from
+//! a section. Here that constructor is [`register_generic`], called by
+//! [`build`](crate::core::klippy::extras::carriage::build) with the primary
+//! and dual carriages it collected: the same command state, holding every
+//! carriage of the machine instead of the section's two.
 //!
 //! # Gaps this port does not close yet
 //!
@@ -57,6 +67,10 @@
 //!   positions (`Coord`/`axes_d` growing per axis, as upstream's
 //!   `gcode_move.py:118-131` does) is a separate unit and a prerequisite of
 //!   upstream's `extruders.test`.
+//! * **The generic-cartesian module tracks one active carriage**, the last
+//!   `SET_DUAL_CARRIAGE` picked, while upstream keeps a mode per rail
+//!   (`idex_modes.py:37-45,133-139`): selecting the dual carriage of a
+//!   second axis leaves the first axis' carriage where it was.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -102,9 +116,10 @@ const VALID_MODES: [&str; 4] = ["INACTIVE", "PRIMARY", "COPY", "MIRROR"];
 
 /// What the three commands share: the carriage index that is active, each
 /// carriage's axis frame, and the states `SAVE_DUAL_CARRIAGE_STATE` wrote.
-#[derive(Default)]
 struct Shared {
-    /// The active carriage: 0 is the primary rail, 1 the second carriage.
+    /// The active carriage: for the bare `[dual_carriage]` 0 is the primary
+    /// rail, 1 the second carriage; for `kinematics: generic_cartesian` the
+    /// index of the carriage `SET_DUAL_CARRIAGE` last picked.
     active: usize,
     /// The carriage-axis coordinate each carriage's frame holds. A frame is
     /// recorded when its carriage is left and carried to when it is
@@ -112,26 +127,65 @@ struct Shared {
     /// `toggle_active_dc_rail` (`idex_modes.py:101-114`), where upstream
     /// instead reads it off the scale/offset transform of a second rail that
     /// this port does not drive (module docs).
-    axis_position: [f64; 2],
+    axis_position: Vec<f64>,
     /// The names `CARRIAGE=` takes, in carriage order — upstream's `dc_rails`
     /// keys, each carriage's `rail.get_name(short=True)`
     /// (`idex_modes.py:37-39`). This module's own name is known when the
     /// section loads; the primary rail's short name is filled in by [`claim`],
-    /// which is when the cartesian kinematics hands the rail over.
-    names: [Option<String>; 2],
-    /// `SAVE_DUAL_CARRIAGE_STATE NAME=…` states: the active index and both
+    /// which is when the cartesian kinematics hands the rail over. A generic
+    /// cartesian machine knows all of them when the kinematics builds the
+    /// module ([`register_generic`]).
+    names: Vec<Option<String>>,
+    /// The axis each carriage rides on (`self.axes` upstream), so a switch
+    /// re-anchors exactly the arriving carriage's axis.
+    axes: Vec<usize>,
+    /// `SAVE_DUAL_CARRIAGE_STATE NAME=…` states: the active index and the
     /// axis frames (`idex_modes.py:285-293`; modes are not modelled — module
     /// docs).
     saved: HashMap<String, SavedState>,
 }
 
+impl Shared {
+    /// The bare `[dual_carriage]` section's two carriages on one `axis`: index
+    /// 0 is the primary rail the kinematics claims (name filled by [`claim`]),
+    /// index 1 this section's own carriage `own_name`.
+    fn for_section(axis: usize, own_name: String) -> Self {
+        Self {
+            active: 0,
+            axis_position: vec![0.0; 2],
+            names: vec![None, Some(own_name)],
+            axes: vec![axis; 2],
+            saved: HashMap::new(),
+        }
+    }
+
+    /// A `kinematics: generic_cartesian` machine's carriages, in upstream's
+    /// `dc_rails` order (`generic_cartesian.py:137-142`): the primary carriage
+    /// of every dual axis, then the dual carriages themselves.
+    fn for_carriages(carriages: &[(String, Axis)]) -> Self {
+        Self {
+            active: 0,
+            axis_position: vec![0.0; carriages.len()],
+            names: carriages
+                .iter()
+                .map(|(name, _)| Some(name.clone()))
+                .collect(),
+            axes: carriages
+                .iter()
+                .map(|(_, axis)| axis_index(*axis))
+                .collect(),
+            saved: HashMap::new(),
+        }
+    }
+}
+
 /// One `SAVE_DUAL_CARRIAGE_STATE` snapshot.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 struct SavedState {
     /// The carriage that was active.
     active: usize,
-    /// Both carriages' axis frames at the save.
-    axis_position: [f64; 2],
+    /// Every carriage's axis frame at the save.
+    axis_position: Vec<f64>,
 }
 
 /// The `dual_carriage` object: the second carriage's section and state.
@@ -171,10 +225,10 @@ impl DualCarriageModule {
         self.shared_lock().active
     }
 
-    /// Both carriages' axis frames, in carriage order — what the handover
+    /// The carriages' axis frames, in carriage order — what the handover
     /// carries across switches and restores.
-    pub fn axis_frames(&self) -> [f64; 2] {
-        self.shared_lock().axis_position
+    pub fn axis_frames(&self) -> Vec<f64> {
+        self.shared_lock().axis_position.clone()
     }
 
     /// The primary rail the cartesian kinematics claimed, by name — `None`
@@ -275,28 +329,124 @@ pub fn load_config(
     // exactly what building the primary stepper here reads.
     let stepper = PrinterStepper::new(config, printer, axis, true)?;
 
-    let shared = Arc::new(Mutex::new(Shared::default()));
-    // This module's own carriage name is the section's short name
-    // (`rail.get_name(short=True)`, `stepper.py:388-393`), the key upstream's
-    // `dc_rails` uses for `CARRIAGE=` (`idex_modes.py:37-39`); the bare
-    // `[dual_carriage]` section's short name is its identifier.
-    shared
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner())
-        .names[1] = Some(identifier.clone());
+    let shared = Arc::new(Mutex::new(Shared::for_section(
+        axis_index(axis),
+        // This module's own carriage name is the section's short name
+        // (`rail.get_name(short=True)`, `stepper.py:388-393`), the key upstream's
+        // `dc_rails` uses for `CARRIAGE=` (`idex_modes.py:37-39`); the bare
+        // `[dual_carriage]` section's short name is its identifier.
+        identifier.clone(),
+    )));
+    register_commands(&shared, printer)?;
+
+    Ok(Arc::new(DualCarriageModule {
+        axis,
+        safe_distance,
+        stepper,
+        primary_rail: Mutex::new(None),
+        shared,
+    }))
+}
+
+/// The `dual_carriage` object of `kinematics: generic_cartesian`.
+///
+/// Upstream builds `idex_modes.DualCarriages` inside
+/// `GenericCartesianKinematics.__init__` whenever the config carries
+/// `[dual_carriage <name>]` sections (`generic_cartesian.py:137-146`), and
+/// that constructor registers the object and the three commands — for this
+/// family there is no bare `[dual_carriage]` section to hang them on. This is
+/// that module, built once by [`register_generic`] with every carriage pair
+/// of the machine.
+pub struct GenericDualCarriages {
+    /// The command state, shared with the three handlers.
+    shared: Arc<Mutex<Shared>>,
+}
+
+impl GenericDualCarriages {
+    /// The active carriage's index into the registered carriages: the last
+    /// `SET_DUAL_CARRIAGE` pick (module docs — modes are not modelled).
+    pub fn active_carriage(&self) -> usize {
+        self.shared
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .active
+    }
+
+    /// The carriage names `CARRIAGE=` accepts, in upstream's `dc_rails` order
+    /// (`generic_cartesian.py:138-142`).
+    pub fn carriage_names(&self) -> Vec<String> {
+        self.shared
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .names
+            .iter()
+            .flatten()
+            .cloned()
+            .collect()
+    }
+}
+
+impl PrinterObject for GenericDualCarriages {
+    /// The active carriage and the carriages themselves; upstream reports a
+    /// mode per carriage instead (`idex_modes.py:133-139`), modes are not
+    /// modelled yet (module docs).
+    fn get_status(&self, _eventtime: f64) -> Value {
+        let state = self
+            .shared
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        json!({
+            "active_carriage": state.active,
+            "carriages": state.names.iter().flatten().cloned().collect::<Vec<_>>(),
+        })
+    }
+}
+
+/// Build the generic-cartesian `dual_carriage` module and register its three
+/// commands (`generic_cartesian.py:137-146`, `idex_modes.py:46-59`).
+///
+/// `carriages` is every carriage upstream's `dc_rails` carries, in its order:
+/// the primary carriage of each dual axis, then the dual carriages. Called by
+/// [`build`](crate::core::klippy::extras::carriage::build) once, when the
+/// kinematics sees at least one `[dual_carriage <name>]` section.
+///
+/// # Errors
+/// When the `dual_carriage` object or one of the three commands is already
+/// registered — a config that also carries a bare `[dual_carriage]`.
+pub fn register_generic(
+    printer: &Arc<Printer>,
+    carriages: &[(String, Axis)],
+) -> Result<(), ConfigError> {
+    let shared = Arc::new(Mutex::new(Shared::for_carriages(carriages)));
+    printer.add_object(
+        DUAL_CARRIAGE_OBJECT,
+        Arc::new(GenericDualCarriages {
+            shared: Arc::clone(&shared),
+        }),
+    )?;
+    register_commands(&shared, printer)
+}
+
+/// Register `SET_DUAL_CARRIAGE` / `SAVE_DUAL_CARRIAGE_STATE` /
+/// `RESTORE_DUAL_CARRIAGE_STATE` on `shared` (`idex_modes.py:46-59`): the
+/// same three handlers whether the module came from the bare section or from
+/// the generic-cartesian kinematics.
+fn register_commands(
+    shared: &Arc<Mutex<Shared>>,
+    printer: &Arc<Printer>,
+) -> Result<(), ConfigError> {
     let gcode = printer
         .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
         .expect("the loader registers `gcode` before any section");
-    let axis_usize = axis_index(axis);
 
     // `SAVE_DUAL_CARRIAGE_STATE`: snapshot the frames — synchronous, it only
     // reads the toolhead's position if there is one.
     {
-        let shared = Arc::clone(&shared);
+        let shared = Arc::clone(shared);
         let weak = Arc::downgrade(printer);
         let handler: CommandHandler = sync(move |gcmd: &GcodeCommand| {
             let printer = weak.upgrade();
-            cmd_save_dual_carriage_state(&shared, gcmd, printer.as_ref(), axis_usize)
+            cmd_save_dual_carriage_state(&shared, gcmd, printer.as_ref())
         });
         gcode
             .register_command(
@@ -323,7 +473,7 @@ pub fn load_config(
             true,
         ),
     ] {
-        let shared = Arc::clone(&shared);
+        let shared = Arc::clone(shared);
         let weak = Arc::downgrade(printer);
         let handler: CommandHandler = Arc::new(move |gcmd: &GcodeCommand| {
             let shared = Arc::clone(&shared);
@@ -337,21 +487,14 @@ pub fn load_config(
                 } else {
                     Plan::Switch(select_carriage(&shared, gcmd)?)
                 };
-                apply(&shared, &printer, axis_usize, plan).await
+                apply(&shared, &printer, plan).await
             })
         });
         gcode
             .register_command(name, handler, Some(desc), false)
             .map_err(ConfigError::new)?;
     }
-
-    Ok(Arc::new(DualCarriageModule {
-        axis,
-        safe_distance,
-        stepper,
-        primary_rail: Mutex::new(None),
-        shared,
-    }))
+    Ok(())
 }
 
 /// What one command asks the frames to do: a switch carries the coordinates
@@ -365,23 +508,25 @@ enum Plan {
 
 /// The arriving carriage's axis frame — the bookkeeping half of upstream's
 /// `toggle_active_dc_rail` (`idex_modes.py:101-114`): record the departing
-/// frame from `current` (when there is a position to record), select the
-/// arriving carriage, and hand back the coordinate the toolhead should be
-/// re-anchored on. A restore overwrites both frames first
-/// (`idex_modes.py:303-348`); without a position only the active index moves,
-/// which is the whole of what the commands did before this seam existed.
-fn carry_frame(state: &mut Shared, axis: usize, plan: &Plan, current: Option<Coord>) -> f64 {
+/// frame from `current` along the departing carriage's own axis (when there
+/// is a position to record), select the arriving carriage, and hand back the
+/// coordinate the toolhead should be re-anchored on. A restore overwrites
+/// all frames first (`idex_modes.py:303-348`); without a position only the
+/// active index moves, which is the whole of what the commands did before
+/// this seam existed.
+fn carry_frame(state: &mut Shared, plan: &Plan, current: Option<Coord>) -> f64 {
     match plan {
         Plan::Switch(to) => {
             if let Some(current) = current {
                 let departing = state.active;
+                let axis = state.axes[departing];
                 state.axis_position[departing] = current.axis(axis);
             }
             state.active = *to;
             state.axis_position[*to]
         }
         Plan::Restore(saved) => {
-            state.axis_position = saved.axis_position;
+            state.axis_position = saved.axis_position.clone();
             state.active = saved.active;
             state.axis_position[saved.active]
         }
@@ -407,14 +552,17 @@ fn current_position(printer: &Arc<Printer>) -> Option<Coord> {
 async fn apply(
     shared: &Arc<Mutex<Shared>>,
     printer: &Arc<Printer>,
-    axis: usize,
     plan: Plan,
 ) -> Result<(), CommandError> {
     let toolhead = printer.lookup_object_as::<ToolHeadObject>(TOOLHEAD_OBJECT);
     let current = toolhead.as_ref().and_then(|toolhead| toolhead.position());
-    let arriving = {
+    let (axis, arriving) = {
         let mut state = shared.lock().unwrap_or_else(|poison| poison.into_inner());
-        carry_frame(&mut state, axis, &plan, current)
+        let arriving = carry_frame(&mut state, &plan, current);
+        // The arriving carriage rides its own axis — for a machine whose dual
+        // carriages span two axes (`SET_DUAL_CARRIAGE CARRIAGE=carriage_v`)
+        // that is not the departing one's.
+        (state.axes[state.active], arriving)
     };
     let (Some(toolhead), Some(current)) = (toolhead, current) else {
         return Ok(());
@@ -431,9 +579,10 @@ async fn apply(
 /// The carriage **name** is looked up first; the `0`/`1` index form is only a
 /// fallback when the name does not match. Upstream keys `self.dc_rails` by
 /// each carriage's short name and only tries `int()` when there are exactly
-/// two carriages (`idex_modes.py:243-254`); this module always carries two
-/// (the claimed primary rail and the second carriage), so the fallback is
-/// always available.
+/// two carriages (`idex_modes.py:243-254`); the bare `[dual_carriage]` module
+/// always carries two (the claimed primary rail and the second carriage), so
+/// the fallback is available there, while a generic-cartesian machine's
+/// carriage pairs leave it off exactly as upstream does.
 ///
 /// `MODE` is validated then only recorded — applying it is the motion-layer
 /// gap above (`idex_modes.py:240-262`).
@@ -459,14 +608,17 @@ fn select_carriage(
         .position(|name| name.as_deref() == Some(carriage.trim()))
     {
         Some(index) => index,
-        // The index fallback: the corpus passes `CARRIAGE=0` / `CARRIAGE=1`;
-        // anything outside `0..=1` keeps upstream's index wording
-        // (`idex_modes.py:250-252`) and a name that matched nothing is the
-        // `specified` wording.
+        // The index fallback: the corpus passes `CARRIAGE=0` / `CARRIAGE=1`,
+        // and upstream offers it only for a machine with exactly two carriages
+        // (`idex_modes.py:247-254`). Anything outside `0..=1` keeps upstream's
+        // index wording; a name that matched nothing is the `specified`
+        // wording.
         None => match carriage.trim().parse::<i64>() {
-            Ok(index) if (0..=1).contains(&index) => index as usize,
-            Ok(index) => return Err(CommandError::new(format!("Invalid CARRIAGE={index} index"))),
-            Err(_) => {
+            Ok(index) if names.len() == 2 && (0..=1).contains(&index) => index as usize,
+            Ok(index) if names.len() == 2 => {
+                return Err(CommandError::new(format!("Invalid CARRIAGE={index} index")))
+            }
+            _ => {
                 return Err(CommandError::new(format!(
                     "Invalid CARRIAGE={carriage} specified"
                 )))
@@ -488,17 +640,17 @@ fn cmd_save_dual_carriage_state(
     shared: &Arc<Mutex<Shared>>,
     gcmd: &GcodeCommand,
     printer: Option<&Arc<Printer>>,
-    axis: usize,
 ) -> Result<(), CommandError> {
     let name = gcmd.get_str_default("NAME", "default");
     let mut state = shared.lock().unwrap_or_else(|poison| poison.into_inner());
     if let Some(current) = printer.and_then(current_position) {
         let active = state.active;
+        let axis = state.axes[active];
         state.axis_position[active] = current.axis(axis);
     }
     let saved = SavedState {
         active: state.active,
-        axis_position: state.axis_position,
+        axis_position: state.axis_position.clone(),
     };
     state.saved.insert(name, saved);
     Ok(())
@@ -526,7 +678,7 @@ fn cmd_restore_dual_carriage_state(
     state
         .saved
         .get(&name)
-        .copied()
+        .cloned()
         .ok_or_else(|| CommandError::new(format!("Unknown DUAL_CARRIAGE state: {name}")))
 }
 
@@ -725,13 +877,11 @@ mod tests {
     /// the pre-handover behaviour the load-only tests see.
     #[test]
     fn the_frames_carry_across_switches_and_restores() {
-        let axis = axis_index(Axis::X);
-        let mut state = Shared::default();
+        let mut state = Shared::for_section(axis_index(Axis::X), "dual_carriage".to_string());
 
         // On carriage 0 at X=50: switch to 1, whose frame is still 0.
         let arriving = carry_frame(
             &mut state,
-            axis,
             &Plan::Switch(1),
             Some(Coord::new(50.0, 0.0, 0.0, 1.5)),
         );
@@ -742,7 +892,6 @@ mod tests {
         // On carriage 1 at X=190: switch back, c0's 50 is carried over.
         let arriving = carry_frame(
             &mut state,
-            axis,
             &Plan::Switch(0),
             Some(Coord::new(190.0, 0.0, 0.0, 1.5)),
         );
@@ -752,16 +901,16 @@ mod tests {
         // A snapshot applies wholesale on restore, whatever the toolhead says.
         let saved = SavedState {
             active: 1,
-            axis_position: [10.0, 170.0],
+            axis_position: vec![10.0, 170.0],
         };
-        let arriving = carry_frame(&mut state, axis, &Plan::Restore(saved), None);
+        let arriving = carry_frame(&mut state, &Plan::Restore(saved), None);
         assert_eq!(state.axis_position, [10.0, 170.0]);
         assert_eq!(state.active, 1);
         assert_eq!(arriving, 170.0);
 
         // No toolhead to read: the frames stay put, the index still moves.
-        state.axis_position = [7.0, 9.0];
-        let arriving = carry_frame(&mut state, axis, &Plan::Switch(0), None);
+        state.axis_position = vec![7.0, 9.0];
+        let arriving = carry_frame(&mut state, &Plan::Switch(0), None);
         assert_eq!(state.active, 0);
         assert_eq!(state.axis_position, [7.0, 9.0]);
         assert_eq!(arriving, 7.0);

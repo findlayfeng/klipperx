@@ -37,6 +37,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use serde_json::{json, Value};
 
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
+use crate::core::klippy::extras::idex_modes;
 use crate::core::klippy::extras::stepper::{
     axis_index, read_homing_info, PrinterStepper, RailGeometry, RailParams,
 };
@@ -930,6 +931,31 @@ pub fn build(printer: &Arc<Printer>) -> Result<GenericCartesianConfig, ConfigErr
                 .to_string(),
         ));
     }
+
+    // A machine with dual carriages builds the idex module the way upstream's
+    // kinematics does: `GenericCartesianKinematics.__init__` constructs
+    // `idex_modes.DualCarriages` when the config carries
+    // `[dual_carriage <name>]` sections, and that constructor registers the
+    // `dual_carriage` object and the three `SET_DUAL_CARRIAGE` /
+    // `SAVE_DUAL_CARRIAGE_STATE` / `RESTORE_DUAL_CARRIAGE_STATE` commands
+    // (`generic_cartesian.py:137-146`). The carriage order is upstream's
+    // `dc_rails` (`idex_modes.py:37-45`): the primary carriage of every dual
+    // axis first, then the dual carriages themselves.
+    if !duals.is_empty() {
+        let dc_axes: Vec<Axis> = duals.iter().map(|dual| dual.axis()).collect();
+        let mut idex_carriages: Vec<(String, Axis)> = mains
+            .iter()
+            .filter(|main| dc_axes.contains(&main.axis()))
+            .map(|main| (main.name().to_string(), main.axis()))
+            .collect();
+        idex_carriages.extend(
+            duals
+                .iter()
+                .map(|dual| (dual.name().to_string(), dual.axis())),
+        );
+        idex_modes::register_generic(printer, &idex_carriages)?;
+    }
+
     Ok(GenericCartesianConfig {
         kinematics,
         steppers,
@@ -983,11 +1009,12 @@ mod tests {
         assert_eq!(err, "Invalid float '1.0.0'");
     }
 
-    /// The corpus config loads through the real loader — every section
-    /// (`[carriage]`, `[extra_carriage]`, `[dual_carriage]`, `[stepper a]`…)
-    /// claimed, every option read (`check_unused`).
-    #[test]
-    fn the_corexyuv_config_loads_and_passes_check_unused() {
+    /// The corpus' generic-cartesian machine (`corexyuv.cfg`) loaded through
+    /// the real loader — every section (`[carriage]`, `[extra_carriage]`,
+    /// `[dual_carriage]`, `[stepper a]`…) claimed, every option read
+    /// (`check_unused`), with the MCU transport swapped for the fake
+    /// firmware's dictionary.
+    fn load_corexyuv() -> Arc<Printer> {
         use crate::core::klippy::config::Config;
         use crate::core::klippy::printer::Printer;
         use crate::core::klippy::reactor::ManualReactor;
@@ -1003,6 +1030,85 @@ mod tests {
         let (config, _) = Config::from_text(&text).expect("corexyuv.cfg parses");
         let printer = Arc::new(Printer::new(ManualReactor::shared()));
         printer.load_config(&config).expect("corexyuv.cfg loads");
+        printer
+    }
+
+    #[test]
+    fn the_corexyuv_config_loads_and_passes_check_unused() {
+        load_corexyuv();
+    }
+
+    /// The three idex commands are known commands on a generic-cartesian
+    /// machine: upstream builds `idex_modes.DualCarriages` inside
+    /// `GenericCartesianKinematics.__init__` (`generic_cartesian.py:137-146`)
+    /// instead of loading a `[dual_carriage]` section, and that constructor
+    /// registers them. The corpus drives them by carriage **name**
+    /// (`corexyuv.test:14-30`), which is what lands here.
+    #[test]
+    fn the_generic_cartesian_kinematics_registers_the_idex_commands() {
+        use crate::core::klippy::event::KlippyEvent;
+        use crate::core::klippy::extras::idex_modes::{GenericDualCarriages, DUAL_CARRIAGE_OBJECT};
+        use crate::core::klippy::gcode::{GCodeDispatch, GCODE_OBJECT};
+
+        let printer = load_corexyuv();
+        // A successful load fires `klippy:ready`, so the dispatcher runs
+        // scripts (`gcode.rs:492-496`, as idex_modes' tests do).
+        printer.send_event(&KlippyEvent::KlippyReady);
+        let gcode = printer
+            .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+            .expect("gcode is registered");
+        let help = gcode.command_help();
+        for (name, desc) in [
+            ("SET_DUAL_CARRIAGE", "Configure the dual carriages mode"),
+            (
+                "SAVE_DUAL_CARRIAGE_STATE",
+                "Save dual carriages modes and positions",
+            ),
+            (
+                "RESTORE_DUAL_CARRIAGE_STATE",
+                "Restore dual carriages modes and positions",
+            ),
+        ] {
+            assert_eq!(help.get(name).map(String::as_str), Some(desc), "{name}");
+        }
+
+        // `dc_rails` order (`generic_cartesian.py:138-142`): the primary
+        // carriage of each dual axis, then the dual carriages.
+        let module = printer
+            .lookup_object_as::<GenericDualCarriages>(DUAL_CARRIAGE_OBJECT)
+            .expect("the dual_carriage object is registered");
+        assert_eq!(
+            module.carriage_names(),
+            ["carriage_x", "carriage_y", "carriage_u", "carriage_v"]
+        );
+
+        // The names the corpus passes pick their carriage
+        // (`corexyuv.test:14-26`), and a four-carriage machine has no `0`/`1`
+        // index fallback (`idex_modes.py:247-254`).
+        gcode
+            .run_script_sync("SET_DUAL_CARRIAGE CARRIAGE=carriage_u")
+            .unwrap();
+        assert_eq!(module.active_carriage(), 2);
+        gcode
+            .run_script_sync("SET_DUAL_CARRIAGE CARRIAGE=carriage_x")
+            .unwrap();
+        assert_eq!(module.active_carriage(), 0);
+        let err = gcode
+            .run_script_sync("SET_DUAL_CARRIAGE CARRIAGE=0")
+            .unwrap_err();
+        assert_eq!(err.to_string(), "Invalid CARRIAGE=0 specified");
+
+        // A save carries the active carriage across a switch
+        // (`corexyuv.test:28-38`).
+        gcode.run_script_sync("SAVE_DUAL_CARRIAGE_STATE").unwrap();
+        gcode
+            .run_script_sync("SET_DUAL_CARRIAGE CARRIAGE=carriage_v")
+            .unwrap();
+        assert_eq!(module.active_carriage(), 3);
+        gcode
+            .run_script_sync("RESTORE_DUAL_CARRIAGE_STATE")
+            .unwrap();
+        assert_eq!(module.active_carriage(), 0, "the saved index is restored");
     }
 
     /// A three-axis carriage printer, and nothing else — the tests below vary

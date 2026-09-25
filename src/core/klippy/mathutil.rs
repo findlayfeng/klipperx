@@ -372,6 +372,22 @@ pub fn gaussian_solve(
     Some(mat_transp(&rest))
 }
 
+/// The Moore-Penrose pseudo-inverse of `m` (`mathutil.pseudo_inverse`): the
+/// normal-equations solve `m⁺ = (mᵀm)⁻¹ mᵀ`, which `generic_cartesian`'s
+/// `calc_position` uses to turn stepper positions back into carriage axes.
+///
+/// `None` for a singular `mᵀm` (the same rank-deficient case
+/// [`gaussian_solve`](crate::core::klippy::mathutil::gaussian_solve) reports),
+/// which the caller treats as "axis undeterminable".
+///
+/// # Panics
+/// Panics on empty input, as upstream's transposes do.
+pub fn pseudo_inverse(m: &[Vec<f64>]) -> Option<Vec<Vec<f64>>> {
+    let mt = mat_transp(m);
+    let mtm = mat_mul_transp(&mt);
+    gaussian_solve(&mtm, &mt, false)
+}
+
 /// Least-squares solve of an over-determined system
 /// (`mathutil.solve_linear_equations`): the normal equations
 /// `(AᵀA) x = Aᵀ·ans` through [`gaussian_solve`].

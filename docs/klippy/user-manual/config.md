@@ -794,7 +794,7 @@ pins: !PD0, PD1, PD2
 | `axis`（X/Y/Z）、`safe_distance`（毫米） | 第二滑架轴与最近距，按上游读取（`idex_modes.py`/`cartesian.py:24-34`） |
 | 电机组 | 经 `PrinterStepper`（同上游 `LookupMultiRail`） |
 
-cartesian 在 late 阶段认领；注册 `dual_carriage` 对象与 `SET_DUAL_CARRIAGE`/`SAVE_…_STATE`/`RESTORE_…_STATE`。**轨间坐标交接已实现**（批 #4，`toggle_active_dc_rail` 语义：切换/恢复携带 gcode 坐标）；步进仍仅主轨（`updateLimits` 未移植，C1）。已随 U-A7b 转绿（2026-09-24）。
+cartesian 在 late 阶段认领；注册 `dual_carriage` 对象与 `SET_DUAL_CARRIAGE`/`SAVE_…_STATE`/`RESTORE_…_STATE`。**轨间坐标交接已实现**（批 #4，`toggle_active_dc_rail` 语义：切换/恢复携带 gcode 坐标）；步进仍仅主轨（`updateLimits` 未移植，C1）。已随 U-A7b 转绿（2026-09-24）。**generic 形态**（批 #12）：`[carriage <name>]`/`[dual_carriage <name>]`/`[extra_carriage <name>]`/`[stepper <name>]` 由运动学注册同一对象与三命令（`dual_carriage` status 报 `active_carriage` + `carriages`），`[printer]` 的 `max_z_velocity/max_z_accel` 经 `carriage::build` 进入 generic 归零（原写死 0 为首因）。
 
 ### [servo <name>]
 

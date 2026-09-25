@@ -188,8 +188,8 @@ connect_file(输出文件, 字典):
 | 判定 | 次数 | 原因 |
 |------|------|------|
 | 因字典未构建跳过 | 2 | `printers.test` 中引用 `pru` 的两条运行（默认不编 `pru`） |
-| 因忽略列表跳过 | 210 | 尚未落地的配置节/运动学（8 个 `.test` 文件） |
-| 实际执行 | **29** | `linuxtest.test`（T1）、`commands.test`、`out_of_bounds.test`（b39750f）、`bed_mesh.test`、`z_virtual_endstop.test`（探针链路单元）、`z_tilt.test`、`quad_gantry_level.test`（H9 调平族）、`bltouch.test`、`smart_effector.test`（H9 探针族）、`multi_z.test`（M7 发送队列水位）、`screws_tilt_adjust.test`（M4 探测语义与亚纳米守卫）、`gcode_arcs.test`、`bed_screws.test`、`pwm.test`、`temperature.test`、`macros.test`（集成批 #1 段落地）、`led.test`、`sdcard_loop.test`、`pressure_advance.test`（集成批 #2 段落地）、`eddy.test`（批 #3，M5 收官）、`dual_carriage.test`、`exclude_object.test`（批 #4 宏体渲染）、`polar.test`、`delta.test`、`delta_calibrate.test`（批 #5 运动学）、`hybrid_corexy_dual_carriage.test`（wave-2：`[input_shaper]` 段）、`extruders.test`（wave-2：filament 传感器段）、`manual_stepper.test`（批 #6）、**全部通过** |
+| 因忽略列表跳过 | 208 | 尚未落地的配置节/运动学（6 个 `.test` 文件） |
+| 实际执行 | **31** | `linuxtest.test`（T1）、`commands.test`、`out_of_bounds.test`（b39750f）、`bed_mesh.test`、`z_virtual_endstop.test`（探针链路单元）、`z_tilt.test`、`quad_gantry_level.test`（H9 调平族）、`bltouch.test`、`smart_effector.test`（H9 探针族）、`multi_z.test`（M7 发送队列水位）、`screws_tilt_adjust.test`（M4 探测语义与亚纳米守卫）、`gcode_arcs.test`、`bed_screws.test`、`pwm.test`、`temperature.test`、`macros.test`（集成批 #1 段落地）、`led.test`、`sdcard_loop.test`、`pressure_advance.test`（集成批 #2 段落地）、`eddy.test`（批 #3，M5 收官）、`dual_carriage.test`、`exclude_object.test`（批 #4 宏体渲染）、`polar.test`、`delta.test`、`delta_calibrate.test`（批 #5 运动学）、`hybrid_corexy_dual_carriage.test`（wave-2：`[input_shaper]` 段）、`extruders.test`（wave-2：filament 传感器段）、`manual_stepper.test`（批 #6）、**全部通过** |
 
 上游 `configparser` 的 `optionxform = str.lower` 已对齐（`mod.rs` 存储侧小写 + `section.rs` 查询侧小写），`Option 'pid_Kp' … must be specified` 类的 49 次回归失败已归零；`must be specified` 错误文案保留调用方传入的大小写，`is not valid` 与 `Section '…' is not valid` 使用存储侧小写。
 
@@ -199,7 +199,7 @@ M3 `smart_effector` 落地后，仅剩 `eddy.test`——`probe_eddy_current` 属
 - 头两个转绿的用例：`linuxtest.test`（只需 `kinematics: none`、`heaters` 的传感器注册表、
   `temperature_sensor` 与 `ds18b20`，g-code 只是一次 `G4 P1000`）；随后 `gcode_move`（G4-1）与
   `EXTRUDER` 默认项（e8bf2b7）让 `commands.test` 与 `out_of_bounds.test` 也过了守卫，移出忽略列表。
-- `KLIPPERX_UPSTREAM_ALL=1` 只去掉忽略列表这一层：默认构建下它会跑 237 条可用运行，其中 **165 条通过、72 条失败**（2026-09-25 实跑，批 #11 合入后；批 #8 转绿 tachometer 两 run、批 #11 转绿 bed_mesh 七 run；批 #10 修掉收尾挂死后本口径自然退出 rc=101，不再需 timeout 兕底；**`printers.test` 子进度 138/203**（失败 65）），另外 2 条以「字典未构建」计入统计，不算失败。失败大多
+- `KLIPPERX_UPSTREAM_ALL=1` 只去掉忽略列表这一层：默认构建下它会跑 237 条可用运行，其中 **167 条通过、70 条失败**（2026-09-25 实跑，批 #12 合入后；批 #8/#11 转绿 tachometer 与 bed_mesh，批 #12 摘除 `corexyuv.test` 与 `generic_cartesian.test`（IGNORED 8→6）并修掉收尾挂死后本口径自然退出 rc=101；**`printers.test` 子进度 138/203**（失败 65）），另外 2 条以「字典未构建」计入统计，不算失败。失败大多
   在配置装载阶段，个别在 g-code / 就绪阶段（`Move out of range`、`not ready: Pin …`）。失败原因的
   逐项分布记在 [上游回归测试失败原因分析](../../work-log/2026-09-22-upstream-regression-failures.md)
   的最新快照与 `TODO.md` 的 T 节，本页不重复维护。

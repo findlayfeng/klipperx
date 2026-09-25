@@ -113,6 +113,12 @@ struct Shared {
     /// instead reads it off the scale/offset transform of a second rail that
     /// this port does not drive (module docs).
     axis_position: [f64; 2],
+    /// The names `CARRIAGE=` takes, in carriage order — upstream's `dc_rails`
+    /// keys, each carriage's `rail.get_name(short=True)`
+    /// (`idex_modes.py:37-39`). This module's own name is known when the
+    /// section loads; the primary rail's short name is filled in by [`claim`],
+    /// which is when the cartesian kinematics hands the rail over.
+    names: [Option<String>; 2],
     /// `SAVE_DUAL_CARRIAGE_STATE NAME=…` states: the active index and both
     /// axis frames (`idex_modes.py:285-293`; modes are not modelled — module
     /// docs).
@@ -220,6 +226,22 @@ pub fn claim(rails: &[Arc<Rail>], printer: &Arc<Printer>) {
         .primary_rail
         .lock()
         .unwrap_or_else(|poison| poison.into_inner()) = Some(Arc::clone(rail));
+    // The primary carriage's name is the rail's short name
+    // (`rail.get_name(short=True)`, `stepper.py:388-393`), the key upstream's
+    // `dc_rails` uses for `CARRIAGE=` (`idex_modes.py:37-39`).
+    module.shared_lock().names[0] = Some(short_rail_name(rail.name()).to_string());
+}
+
+/// A rail's short name (`GenericPrinterRail.get_name(short=True)`,
+/// `stepper.py:388-393`): a `stepper_x` rail is `x`, `stepper_z1` is `z1`,
+/// and anything else is its last whitespace-separated word.
+fn short_rail_name(name: &str) -> &str {
+    if let Some(rest) = name.strip_prefix("stepper") {
+        // `get_name(short=True)` skips the `stepper` prefix and the symbol
+        // after it.
+        return rest.strip_prefix('_').unwrap_or(rest);
+    }
+    name.rsplit(' ').next().unwrap_or(name)
 }
 
 /// The factory `section!` names for the bare `[dual_carriage]` section: the
@@ -254,6 +276,14 @@ pub fn load_config(
     let stepper = PrinterStepper::new(config, printer, axis, true)?;
 
     let shared = Arc::new(Mutex::new(Shared::default()));
+    // This module's own carriage name is the section's short name
+    // (`rail.get_name(short=True)`, `stepper.py:388-393`), the key upstream's
+    // `dc_rails` uses for `CARRIAGE=` (`idex_modes.py:37-39`); the bare
+    // `[dual_carriage]` section's short name is its identifier.
+    shared
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .names[1] = Some(identifier.clone());
     let gcode = printer
         .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
         .expect("the loader registers `gcode` before any section");
@@ -305,7 +335,7 @@ pub fn load_config(
                 let plan = if restoring {
                     Plan::Restore(cmd_restore_dual_carriage_state(&shared, gcmd)?)
                 } else {
-                    Plan::Switch(select_carriage(gcmd)?)
+                    Plan::Switch(select_carriage(&shared, gcmd)?)
                 };
                 apply(&shared, &printer, axis_usize, plan).await
             })
@@ -327,7 +357,7 @@ pub fn load_config(
 /// What one command asks the frames to do: a switch carries the coordinates
 /// across, a restore applies a snapshot wholesale.
 enum Plan {
-    /// `SET_DUAL_CARRIAGE CARRIAGE=<index>`.
+    /// `SET_DUAL_CARRIAGE CARRIAGE=<name|index>`.
     Switch(usize),
     /// `RESTORE_DUAL_CARRIAGE_STATE`.
     Restore(SavedState),
@@ -394,31 +424,54 @@ async fn apply(
     toolhead.set_position(newpos, &[]).await
 }
 
-/// `SET_DUAL_CARRIAGE CARRIAGE=<0|1> [MODE=…]`: validate and pick the active
-/// carriage — the coordinate handover happens in `apply`
+/// `SET_DUAL_CARRIAGE CARRIAGE=<name|0|1> [MODE=…]`: validate and pick the
+/// active carriage — the coordinate handover happens in `apply`
 /// (`idex_modes.py:240-262`).
+///
+/// The carriage **name** is looked up first; the `0`/`1` index form is only a
+/// fallback when the name does not match. Upstream keys `self.dc_rails` by
+/// each carriage's short name and only tries `int()` when there are exactly
+/// two carriages (`idex_modes.py:243-254`); this module always carries two
+/// (the claimed primary rail and the second carriage), so the fallback is
+/// always available.
 ///
 /// `MODE` is validated then only recorded — applying it is the motion-layer
 /// gap above (`idex_modes.py:240-262`).
 ///
 /// # Errors
 /// Upstream's argument wordings for a missing/invalid `CARRIAGE` or `MODE`.
-fn select_carriage(gcmd: &GcodeCommand) -> Result<usize, CommandError> {
+fn select_carriage(
+    shared: &Arc<Mutex<Shared>>,
+    gcmd: &GcodeCommand,
+) -> Result<usize, CommandError> {
     let carriage = match gcmd.get_command_parameters().get("CARRIAGE") {
         Some(raw) => raw.clone(),
         None => return Err(CommandError::new("CARRIAGE must be specified")),
     };
-    let index = match carriage.trim().parse::<i64>() {
-        // The corpus passes `CARRIAGE=0` / `CARRIAGE=1`; upstream rejects
-        // anything outside `0..=1` with the index wording
-        // (`idex_modes.py:250-252`).
-        Ok(index) if (0..=1).contains(&index) => index as usize,
-        Ok(index) => return Err(CommandError::new(format!("Invalid CARRIAGE={index} index"))),
-        Err(_) => {
-            return Err(CommandError::new(format!(
-                "Invalid CARRIAGE={carriage} specified"
-            )))
-        }
+    // A carriage by name wins; the key is the carriage's short name.
+    let names = shared
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .names
+        .clone();
+    let index = match names
+        .iter()
+        .position(|name| name.as_deref() == Some(carriage.trim()))
+    {
+        Some(index) => index,
+        // The index fallback: the corpus passes `CARRIAGE=0` / `CARRIAGE=1`;
+        // anything outside `0..=1` keeps upstream's index wording
+        // (`idex_modes.py:250-252`) and a name that matched nothing is the
+        // `specified` wording.
+        None => match carriage.trim().parse::<i64>() {
+            Ok(index) if (0..=1).contains(&index) => index as usize,
+            Ok(index) => return Err(CommandError::new(format!("Invalid CARRIAGE={index} index"))),
+            Err(_) => {
+                return Err(CommandError::new(format!(
+                    "Invalid CARRIAGE={carriage} specified"
+                )))
+            }
+        },
     };
     let mode = gcmd.get_str_default("MODE", "PRIMARY").to_uppercase();
     if !VALID_MODES.contains(&mode.as_str()) {
@@ -625,6 +678,44 @@ mod tests {
             .run_script_sync("RESTORE_DUAL_CARRIAGE_STATE")
             .unwrap();
         assert_eq!(module.active_carriage(), 0, "the saved index is restored");
+    }
+
+    /// `CARRIAGE=` takes a carriage **name** first (`idex_modes.py:243-254`):
+    /// the primary rail's short name and this module's own short name, while
+    /// the `0`/`1` index form stays usable as the fallback the corpus passes.
+    /// A name that matches nothing is the `specified` wording, never the
+    /// index one.
+    #[test]
+    fn the_carriage_name_selects_the_carriage_before_the_index() {
+        let (printer, result) = load(&cartesian_config("cartesian"));
+        result.unwrap();
+        let gcode = printer
+            .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+            .unwrap();
+        let module = module(&printer);
+
+        // `dual_carriage` is this module's own short name; `x` is the claimed
+        // primary rail's (`stepper_x` → `x`).
+        gcode
+            .run_script_sync("SET_DUAL_CARRIAGE CARRIAGE=dual_carriage")
+            .unwrap();
+        assert_eq!(module.active_carriage(), 1);
+        gcode
+            .run_script_sync("SET_DUAL_CARRIAGE CARRIAGE=x")
+            .unwrap();
+        assert_eq!(module.active_carriage(), 0);
+
+        // The name the caller wanted is not one this machine carries.
+        let err = gcode
+            .run_script_sync("SET_DUAL_CARRIAGE CARRIAGE=carriage_u")
+            .unwrap_err();
+        assert_eq!(err.to_string(), "Invalid CARRIAGE=carriage_u specified");
+
+        // The index fallback still works alongside the names.
+        gcode
+            .run_script_sync("SET_DUAL_CARRIAGE CARRIAGE=1")
+            .unwrap();
+        assert_eq!(module.active_carriage(), 1);
     }
 
     /// The handover bookkeeping (`toggle_active_dc_rail`,

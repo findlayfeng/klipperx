@@ -57,9 +57,10 @@ type FaultyRegion = (f64, f64, f64, f64);
 /// The `[bed_mesh]` options this unit reads (`bed_mesh.py:88-133`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct BedMeshOptions {
-    /// The mesh area's lower corner.
+    /// The mesh area's lower corner — `(-radius, -radius)` on a round bed,
+    /// which never reads `mesh_min` (`bed_mesh.py:393-396`).
     pub mesh_min: [f64; 2],
-    /// The mesh area's upper corner.
+    /// The mesh area's upper corner — `(radius, radius)` on a round bed.
     pub mesh_max: [f64; 2],
     /// Probing points along X and Y (`probe_count`).
     pub probe_count: [i64; 2],
@@ -92,7 +93,11 @@ pub struct BedMeshOptions {
     pub faulty_regions: Vec<FaultyRegion>,
 }
 
-/// Two floats from a `x, y` option.
+/// Two floats from a `x, y` option — upstream's `getfloatlist(…, count=2)`
+/// (`configfile.py:87-107`): every value is parsed *before* the count is
+/// checked, a missing option is `must be specified` (`configfile.py:37-38`),
+/// a wrong count `must have 2 elements` (`configfile.py:100-101`), and an
+/// unparseable value keeps the parser's wording (`configfile.py:44-45`).
 fn two_floats(
     config: &ConfigWrapper,
     option: &str,
@@ -106,22 +111,22 @@ fn two_floats(
             ))
         });
     };
-    if items.len() != 2 {
-        return Err(ConfigError::new(format!(
-            "Option '{option}' in section '{}' must have 2 values",
-            config.identifier()
-        )));
-    }
-    let mut out = [0.0f64; 2];
-    for (slot, item) in out.iter_mut().zip(&items) {
-        *slot = item.trim().parse::<f64>().map_err(|_| {
+    let mut out = Vec::with_capacity(items.len());
+    for item in &items {
+        out.push(item.trim().parse::<f64>().map_err(|_| {
             ConfigError::new(format!(
                 "Unable to parse option '{option}' in section '{}'",
                 config.identifier()
             ))
-        })?;
+        })?);
     }
-    Ok(out)
+    if out.len() != 2 {
+        return Err(ConfigError::new(format!(
+            "Option '{option}' in section '{}' must have 2 elements",
+            config.identifier()
+        )));
+    }
+    Ok([out[0], out[1]])
 }
 
 /// Upstream's `parse_config_pair` (`bed_mesh.py:38-56`): one value makes a
@@ -173,44 +178,13 @@ fn parse_config_pair(
     Ok([parsed[0], parsed[1]])
 }
 
-/// Two integers from a `x, y` option.
-fn two_ints(
-    config: &ConfigWrapper,
-    option: &str,
-    default: Option<[i64; 2]>,
-) -> Result<[i64; 2], ConfigError> {
-    let Some(items) = config.get_list(option, ',') else {
-        return default.ok_or_else(|| {
-            ConfigError::new(format!(
-                "Option '{option}' in section '{}' must be specified",
-                config.identifier()
-            ))
-        });
-    };
-    if items.len() != 2 {
-        return Err(ConfigError::new(format!(
-            "Option '{option}' in section '{}' must have 2 values",
-            config.identifier()
-        )));
-    }
-    let mut out = [0i64; 2];
-    for (slot, item) in out.iter_mut().zip(&items) {
-        *slot = item.trim().parse::<i64>().map_err(|_| {
-            ConfigError::new(format!(
-                "Unable to parse option '{option}' in section '{}'",
-                config.identifier()
-            ))
-        })?;
-    }
-    Ok(out)
-}
-
 impl BedMeshOptions {
     /// Read every option the corpus writes.
     ///
     /// # Errors
-    /// As the option readers: a missing `mesh_min`/`mesh_max`, a malformed or
-    /// too-small `probe_count`, an unknown `algorithm`.
+    /// As the option readers: a missing `mesh_min`/`mesh_max` on a
+    /// rectangular bed, an inverted min/max pair, a malformed or too-small
+    /// `probe_count`, an unknown `algorithm`.
     pub fn read(config: &ConfigWrapper) -> Result<Self, ConfigError> {
         let mesh_radius = config.get_optional_float("mesh_radius")?;
         let round_probe_count = config.get_int("round_probe_count", Some(5))?;
@@ -221,12 +195,29 @@ impl BedMeshOptions {
         } else {
             parse_config_pair(config, "probe_count", 3, 3)?
         };
-        let mesh_pps = two_ints(config, "mesh_pps", Some([2, 2]))?;
+        // A round bed takes its bounds from the radius — floored to 0.1mm as
+        // upstream derives them — and never reads `mesh_min`/`mesh_max`
+        // (`bed_mesh.py:382-396`); a rectangular bed requires both pairs and
+        // refuses an inverted one (`bed_mesh.py:400-403`).
+        let (mesh_min, mesh_max) = if let Some(radius) = mesh_radius {
+            let radius = (radius * 10.0).floor() / 10.0;
+            ([-radius, -radius], [radius, radius])
+        } else {
+            let min = two_floats(config, "mesh_min", None)?;
+            let max = two_floats(config, "mesh_max", None)?;
+            if max[0] <= min[0] || max[1] <= min[1] {
+                return Err(ConfigError::new(
+                    "bed_mesh: invalid min/max points".to_string(),
+                ));
+            }
+            (min, max)
+        };
+        let mesh_pps = parse_config_pair(config, "mesh_pps", 2, 0)?;
         let faulty_regions = read_faulty_regions(config)?;
 
         Ok(Self {
-            mesh_min: two_floats(config, "mesh_min", None)?,
-            mesh_max: two_floats(config, "mesh_max", None)?,
+            mesh_min,
+            mesh_max,
             probe_count,
             speed: config.get_float("speed", Some(50.0))?,
             horizontal_move_z: config.get_float("horizontal_move_z", Some(5.0))?,
@@ -715,19 +706,21 @@ mod tests {
 
     #[test]
     fn a_round_bed_keeps_only_points_inside_the_radius() {
+        // A round bed never reads `mesh_min`/`mesh_max` — the bounds come from
+        // `mesh_radius` (`bed_mesh.py:393-396`).
         let mut read = options(&[
-            ("mesh_min", "-50,-50"),
-            ("mesh_max", "50,50"),
-            ("probe_count", "5, 5"),
             ("mesh_radius", "42"),
             ("mesh_origin", "0, 0"),
+            ("probe_count", "5, 5"),
         ]);
+        assert_eq!(read.mesh_min, [-42.0, -42.0]);
+        assert_eq!(read.mesh_max, [42.0, 42.0]);
         read.round_probe_count = 5;
         let points = generate_points(&read).unwrap();
 
-        // 5x5 grid with 25mm spacing: the centre, the four axis neighbours and
-        // the four diagonal neighbours are inside 42mm — the axes (±50) are not.
-        assert_eq!(points.len(), 9);
+        // 5×5 grid, 21mm spacing (84mm over 4 gaps): the centre column/row
+        // and the ±42 axis points are inside 42mm, the corners are not.
+        assert_eq!(points.len(), 13);
         for (x, y) in points {
             assert!((x * x + y * y).sqrt() <= 42.0);
         }
@@ -752,13 +745,119 @@ mod tests {
     #[test]
     fn a_round_mesh_uses_the_round_probe_count() {
         let read = options(&[
-            ("mesh_min", "-50,-50"),
-            ("mesh_max", "50,50"),
             ("probe_count", "3, 3"),
             ("round_probe_count", "7"),
             ("mesh_radius", "45"),
         ]);
 
         assert_eq!(read.counts(), [7, 7]);
+    }
+
+    /// One `mesh_pps` value fills both axes, two keep each order
+    /// (`bed_mesh.py:409` → `bed_mesh.py:38-56`); `minval=0` bounds both.
+    #[test]
+    fn a_single_mesh_pps_value_fills_both_axes() {
+        let rectangular = options(&[
+            ("mesh_min", "10,10"),
+            ("mesh_max", "180,180"),
+            ("mesh_pps", "3"),
+        ]);
+        assert_eq!(rectangular.mesh_pps, [3, 3]);
+
+        // The tronxy configs ship `mesh_pps: 0` (interpolation off).
+        let off = options(&[
+            ("mesh_min", "10,10"),
+            ("mesh_max", "180,180"),
+            ("mesh_pps", "0"),
+        ]);
+        assert_eq!(off.mesh_pps, [0, 0]);
+
+        let pair = options(&[
+            ("mesh_min", "10,10"),
+            ("mesh_max", "180,180"),
+            ("mesh_pps", "1, 4"),
+        ]);
+        assert_eq!(pair.mesh_pps, [1, 4]);
+    }
+
+    /// Illegal `mesh_pps` keeps upstream's wording verbatim: a wrong length is
+    /// `malformed` with the raw text (`bed_mesh.py:42-43`), a non-number the
+    /// parser's (`configfile.py:44-45`), and a negative count `minval=0`'s
+    /// line, whose section name carries no quotes (`bed_mesh.py:47-49`).
+    #[test]
+    fn illegal_mesh_pps_keeps_upstream_wording() {
+        let error = |value: &str| {
+            BedMeshOptions::read(&ConfigWrapper::untracked(&section(&[
+                ("mesh_min", "10,10"),
+                ("mesh_max", "180,180"),
+                ("mesh_pps", value),
+            ])))
+            .unwrap_err()
+            .to_string()
+        };
+
+        assert_eq!(
+            error("1, 2, 3"),
+            "bed_mesh: malformed 'mesh_pps' value: 1, 2, 3"
+        );
+        assert_eq!(
+            error("left,30"),
+            "Unable to parse option 'mesh_pps' in section 'bed_mesh'"
+        );
+        assert_eq!(
+            error("-1"),
+            "Option 'mesh_pps' in section bed_mesh must have a minimum of 0"
+        );
+    }
+
+    /// `mesh_min`/`mesh_max` are read only for a rectangular bed, with
+    /// upstream's `getfloatlist(count=2)` wording: missing is `must be
+    /// specified` (`configfile.py:37-38`), a wrong count `must have 2
+    /// elements` (`configfile.py:100-101`), a bad number the parser's, and
+    /// values are parsed *before* the count is checked (`configfile.py:98-101`).
+    /// An inverted pair is refused outright (`bed_mesh.py:402-403`).
+    #[test]
+    fn rectangular_mesh_min_keeps_upstream_wording() {
+        let error = |options: &[(&str, &str)]| {
+            BedMeshOptions::read(&ConfigWrapper::untracked(&section(options)))
+                .unwrap_err()
+                .to_string()
+        };
+
+        assert_eq!(
+            error(&[("mesh_max", "180,180")]),
+            "Option 'mesh_min' in section 'bed_mesh' must be specified"
+        );
+        assert_eq!(
+            error(&[("mesh_min", "10"), ("mesh_max", "180,180")]),
+            "Option 'mesh_min' in section 'bed_mesh' must have 2 elements"
+        );
+        assert_eq!(
+            error(&[("mesh_min", "left,10"), ("mesh_max", "180,180")]),
+            "Unable to parse option 'mesh_min' in section 'bed_mesh'"
+        );
+        assert_eq!(
+            error(&[("mesh_min", "180,180"), ("mesh_max", "10,10")]),
+            "bed_mesh: invalid min/max points"
+        );
+    }
+
+    /// A round bed needs no `mesh_min` at all — its bounds derive from
+    /// `mesh_radius`, floored to 0.1mm as upstream floors the radius before
+    /// it takes `min = -radius`, `max = radius` (`bed_mesh.py:392-396`).
+    #[test]
+    fn a_round_bed_takes_its_bounds_from_the_radius() {
+        let read = options(&[
+            ("mesh_radius", "65"),
+            ("mesh_origin", "0, 0"),
+            ("round_probe_count", "7"),
+            ("algorithm", "bicubic"),
+        ]);
+        assert_eq!(read.mesh_min, [-65.0, -65.0]);
+        assert_eq!(read.mesh_max, [65.0, 65.0]);
+
+        let floored = options(&[("mesh_radius", "65.55")]);
+        assert_eq!(floored.mesh_min, [-65.5, -65.5]);
+        assert_eq!(floored.mesh_max, [65.5, 65.5]);
     }
 }

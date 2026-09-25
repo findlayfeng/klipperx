@@ -372,6 +372,24 @@ pub fn gaussian_solve(
     Some(mat_transp(&rest))
 }
 
+/// The Moore-Penrose pseudo-inverse of `m` (`mathutil.pseudo_inverse`): the
+/// normal-equations solve `m⁺ = (mᵀm)⁻¹ mᵀ`, which `generic_cartesian`'s
+/// `calc_position` uses to turn stepper positions back into carriage axes.
+///
+/// `None` for a singular `mᵀm` (the same rank-deficient case
+/// [`gaussian_solve`](crate::core::klippy::mathutil::gaussian_solve) reports),
+/// which the caller treats as "axis undeterminable".
+/// Upstream's shaper math solves the same form (`shaper_defs.get_mzv_coeffs`
+/// → "Ill-formed shaper"), so this one `pseudo_inverse` serves both callers.
+///
+/// # Panics
+/// Panics on empty input, as upstream's transposes do.
+pub fn pseudo_inverse(m: &[Vec<f64>]) -> Option<Vec<Vec<f64>>> {
+    let mt = mat_transp(m);
+    let mtm = mat_mul_transp(&mt);
+    gaussian_solve(&mtm, &mt, false)
+}
+
 /// Least-squares solve of an over-determined system
 /// (`mathutil.solve_linear_equations`): the normal equations
 /// `(AᵀA) x = Aᵀ·ans` through [`gaussian_solve`].
@@ -383,22 +401,6 @@ pub fn solve_linear_equations(eqs: &[Vec<f64>], ans: &[Vec<f64>]) -> Option<Vec<
     let eqst_eqs = mat_mul_transp(&eqst);
     let eqst_ans = mat_mat_mul(&eqst, ans)?;
     gaussian_solve(&eqst_eqs, &eqst_ans, false)
-}
-
-/// The pseudo inverse upstream's shaper math solves its impulse equations with
-/// (`mathutil.pseudo_inverse`): the normal-equation form `(AᵀA)⁻¹Aᵀ`.
-///
-/// Upstream calls `gaussian_solve(mtm, mt)` with `allow_underdetermined` at its
-/// `False` default (`mathutil.py:210-213`), so a rank-deficient `AᵀA` is `None`
-/// — which `shaper_defs.get_mzv_coeffs` turns into its "Ill-formed shaper"
-/// error.
-///
-/// # Panics
-/// Panics on an empty matrix, as upstream's transposes do.
-pub fn pseudo_inverse(m: &[Vec<f64>]) -> Option<Vec<Vec<f64>>> {
-    let mt = mat_transp(m);
-    let mtm = mat_mul_transp(&mt);
-    gaussian_solve(&mtm, &mt, false)
 }
 
 // ===========================================================================

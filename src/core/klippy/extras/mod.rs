@@ -16,6 +16,7 @@ pub mod board_pins;
 pub mod bulk_sensor;
 pub(crate) mod bus_debug;
 pub mod buttons;
+pub mod carriage;
 pub mod controller_fan;
 pub mod delta_calibrate;
 pub mod display;

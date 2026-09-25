@@ -252,7 +252,10 @@ impl PrinterStepper {
         geometry: RailGeometry,
     ) -> Result<Self, ConfigError> {
         let identifier = config.identifier();
-        let name = config.section().id.clone();
+        // The section identifier, not the bare id: a generic-cartesian motor is
+        // `[stepper <name>]`, so its id alone (`stepper`) names no single
+        // motor (`config.get_name()`, `klippy/stepper.py:60-64`).
+        let name = identifier.clone();
 
         let step_pin = config.get("step_pin", None)?;
         let dir_pin = config.get("dir_pin", None)?;
@@ -902,7 +905,7 @@ pub(crate) fn load_config_bed(
 
 /// Parse the homing parameters of a `[stepper_*]` rail
 /// (`GenericPrinterRail.__init__`, `klippy/stepper.py:347-390`).
-fn read_homing_info(
+pub(crate) fn read_homing_info(
     config: &ConfigWrapper,
     identifier: &str,
     position_min: f64,

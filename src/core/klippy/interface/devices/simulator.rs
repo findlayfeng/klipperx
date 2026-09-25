@@ -220,9 +220,19 @@ impl SimulatorDevice {
     }
 
     /// Encode a response and queue it.
+    ///
+    /// The frame is stamped with the firmware's counter, which advances to
+    /// `seq + 1` the moment it accepts that block (`command.c:300-305`):
+    /// everything the host sent up to that number is taken. Echoing the
+    /// accepted block's own number instead would leave it in the host's
+    /// in-flight queue (the sender drops only what is *below* what the
+    /// firmware reports) and the host would retransmit — and this fake would
+    /// re-run — that block forever whenever the host then falls silent.
     fn respond(state: &mut State, seq: u8, name: &str, values: &[ArgValue]) {
         match state.parser.encode(name, values) {
-            Ok(payload) => state.out.push_back(Frame::new(seq, payload.into_raw())),
+            Ok(payload) => state
+                .out
+                .push_back(Frame::new((seq + 1) & 0xf, payload.into_raw())),
             Err(e) => debug!("simulator: cannot encode '{name}': {e}"),
         }
     }
@@ -810,8 +820,10 @@ impl Device for SimulatorDevice {
             Self::fire_monitor_if_expired(&mut state, seq);
         }
         // Every accepted block is acknowledged by echoing its sequence with an
-        // empty payload; that is what advances the host's send window.
-        state.out.push_back(Frame::new(seq, Vec::new()));
+        // empty payload; that is what advances the host's send window. The
+        // number is the firmware's counter *after* taking the block
+        // (`command.c:305`), i.e. `seq + 1` — see `respond`.
+        state.out.push_back(Frame::new((seq + 1) & 0xf, Vec::new()));
         self.signal.notify_all();
         Ok(())
     }

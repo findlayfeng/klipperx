@@ -66,11 +66,4 @@ pub trait ExtraAxis: Send + Sync + std::fmt::Debug {
     fn axis_gcode_id(&self) -> Option<String> {
         None
     }
-
-    /// Bind or clear this extra axis' G-Code letter.
-    ///
-    /// The default does nothing: only the manual stepper tracks one. The
-    /// manual stepper's handler sets it directly too, so this exists for the
-    /// toolhead's side of the `GCODE_AXIS` bookkeeping.
-    fn set_axis_gcode_id(&self, _id: Option<String>) {}
 }

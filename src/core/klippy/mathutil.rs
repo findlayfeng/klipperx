@@ -385,6 +385,22 @@ pub fn solve_linear_equations(eqs: &[Vec<f64>], ans: &[Vec<f64>]) -> Option<Vec<
     gaussian_solve(&eqst_eqs, &eqst_ans, false)
 }
 
+/// The pseudo inverse upstream's shaper math solves its impulse equations with
+/// (`mathutil.pseudo_inverse`): the normal-equation form `(AᵀA)⁻¹Aᵀ`.
+///
+/// Upstream calls `gaussian_solve(mtm, mt)` with `allow_underdetermined` at its
+/// `False` default (`mathutil.py:210-213`), so a rank-deficient `AᵀA` is `None`
+/// — which `shaper_defs.get_mzv_coeffs` turns into its "Ill-formed shaper"
+/// error.
+///
+/// # Panics
+/// Panics on an empty matrix, as upstream's transposes do.
+pub fn pseudo_inverse(m: &[Vec<f64>]) -> Option<Vec<Vec<f64>>> {
+    let mt = mat_transp(m);
+    let mtm = mat_mul_transp(&mt);
+    gaussian_solve(&mtm, &mt, false)
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -587,6 +603,21 @@ mod linalg_tests {
         let back = mat_mat_mul(&eqs, &coeffs).expect("shapes line up");
         for (row, &(z,)) in back.iter().zip(points.iter()) {
             assert!((row[0] - f(z)).abs() < 1e-3);
+        }
+    }
+
+    /// For a square, well-conditioned matrix the pseudo inverse is the ordinary
+    /// inverse: `A · pinv(A)` is the identity.
+    #[test]
+    fn pseudo_inverse_inverts_a_square_matrix() {
+        let a = vec![vec![2.0, 1.0], vec![1.0, 3.0]];
+        let pinv = pseudo_inverse(&a).expect("a full-rank matrix");
+        let product = mat_mat_mul(&a, &pinv).expect("shapes line up");
+        for (i, row) in product.iter().enumerate() {
+            for (j, value) in row.iter().enumerate() {
+                let want = if i == j { 1.0 } else { 0.0 };
+                assert!((value - want).abs() < 1e-9, "{product:?}");
+            }
         }
     }
 

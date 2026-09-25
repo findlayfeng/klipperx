@@ -510,6 +510,30 @@ mod tests {
         assert!(access.contains("stepper_z", "position_max"));
     }
 
+    /// `z_hop_speed` and `speed` are `above=0` (`safe_z_home.py:14,19`), so a
+    /// value at or below zero is refused with upstream's wording
+    /// (`klippy/configfile.py:54-56`).
+    #[test]
+    fn test_a_non_positive_speed_is_refused() {
+        let text = format!("{Z_ENDSTOP}[safe_z_home]\nhome_xy_position: 160,120\nspeed: 0\n");
+        let config = parse(&text);
+        let (wrapper, _) = tracked(&config, "safe_z_home");
+        assert_eq!(
+            SafeZHomeOptions::read(&wrapper).unwrap_err().to_string(),
+            "Option 'speed' in section 'safe_z_home' must be above 0"
+        );
+
+        let text = format!(
+            "{Z_ENDSTOP}[safe_z_home]\nhome_xy_position: 160,120\nz_hop: 5\nz_hop_speed: -1\n"
+        );
+        let config = parse(&text);
+        let (wrapper, _) = tracked(&config, "safe_z_home");
+        assert_eq!(
+            SafeZHomeOptions::read(&wrapper).unwrap_err().to_string(),
+            "Option 'z_hop_speed' in section 'safe_z_home' must be above 0"
+        );
+    }
+
     /// The corpus's own option set (`config/printer-creality-ender3-v2-neo-2022.cfg`)
     /// is read back through the tracker, so `check_unused` accepts the section.
     #[test]

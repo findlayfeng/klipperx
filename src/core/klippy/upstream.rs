@@ -507,18 +507,10 @@ mod tests {
     ) -> Result<Result<(), String>, String> {
         use crate::core::klippy::gcode::{GCodeDispatch, GCODE_OBJECT};
         use crate::core::klippy::printer::{Printer, PrinterState};
-        use crate::core::klippy::reactor::{Reactor, TokioReactor};
+        use crate::core::klippy::reactor::TokioReactor;
 
-        // TEMP instrumentation (U-TH-1A): live `Mcu` count around this case, so
-        // a case that leaves an MCU alive after teardown is named.
-        let live_before = crate::core::klippy::mcu::mcu_live();
-        // TEMP instrumentation (U-TH-1A): number this case, so the MCUs that
-        // survive it can be attributed to the run that created them.
-        static CASE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-        let case_id = CASE_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        crate::core::klippy::mcu::MCU_CASE.store(case_id, std::sync::atomic::Ordering::SeqCst);
         let reactor = Arc::new(TokioReactor::new(tokio::runtime::Handle::current()));
-        let printer = Arc::new(Printer::new(Arc::clone(&reactor) as Arc<dyn Reactor>));
+        let printer = Arc::new(Printer::new(reactor));
 
         // Upstream runs every case as `klippy.py -i <gcode> -o <output> -d
         // <dict>` (`scripts/test_klippy.py:100-104`). The `-o` lands in
@@ -571,19 +563,6 @@ mod tests {
         };
 
         printer.teardown();
-        // TEMP instrumentation (U-TH-1A): teardown drops the parts synchronously,
-        // so a short settle is enough to see what stayed alive.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        eprintln!(
-            "MCU_LIVE case_id={} case={} before={} after_teardown={} printer_rc={} reactor_rc={} alive={:?}",
-            case_id,
-            config_file,
-            live_before,
-            crate::core::klippy::mcu::mcu_live(),
-            Arc::strong_count(&printer),
-            Arc::strong_count(&reactor),
-            crate::core::klippy::mcu::mcu_alive_report()
-        );
         match setup {
             Err(e) => Err(e),
             Ok(()) => Ok(gcode),
@@ -811,12 +790,6 @@ mod tests {
             }
         }
 
-        eprintln!(
-            "MCU_LIVE end_of_test={} alive={:?}\nCHIP_REPORT={:?}",
-            crate::core::klippy::mcu::mcu_live(),
-            crate::core::klippy::mcu::mcu_alive_report(),
-            crate::core::klippy::mcu::chip_report()
-        );
         assert!(
             failures.is_empty(),
             "{} upstream run(s) failed ({} ran, {} without a dictionary, {} with \

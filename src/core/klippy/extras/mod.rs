@@ -72,8 +72,6 @@ pub mod template;
 pub mod tmc;
 pub mod tmc2208;
 pub mod tmc2209;
-#[cfg(test)]
-mod tmc_scratch;
 pub mod tmc_uart;
 pub mod toolhead;
 pub mod trigger_analog;

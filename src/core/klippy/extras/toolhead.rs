@@ -437,7 +437,7 @@ impl ToolHeadObject {
                 // (`generic_cartesian.py:118-172`) and installs each motor's
                 // solver as it reads it; the built kinematics waits for
                 // connect, like delta's.
-                let built = carriage::build(printer)?;
+                let built = carriage::build(printer, max_z_velocity, max_z_accel)?;
                 generic_kinematics = Some(built.kinematics);
                 generic_steppers = built.steppers;
             }

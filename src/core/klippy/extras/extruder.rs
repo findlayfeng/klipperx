@@ -25,6 +25,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use serde_json::{json, Value};
 
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
+use crate::core::klippy::extras::extruder_stepper::{
+    cmd_set_extruder_rotation_distance, cmd_sync_extruder_motion,
+};
 use crate::core::klippy::extras::heaters::{self, Heater};
 use crate::core::klippy::extras::stepper::PrinterStepper;
 use crate::core::klippy::extras::toolhead::ToolHeadObject;
@@ -79,6 +82,9 @@ pub struct PrinterExtruder {
     trapq: Mutex<Option<usize>>,
     /// The last extruded position, for `last_position`/status.
     last_position: Mutex<f64>,
+    /// `motion_queue`: the extruder this stepper is bound to via
+    /// `SYNC_EXTRUDER_MOTION`. `Arc` so the command handler shares the slot.
+    motion_queue: Arc<Mutex<Option<String>>>,
     /// Pressure advance, for `SET_PRESSURE_ADVANCE` and status (no motion effect
     /// yet: the smooth filter is part of the extruder solver, H6).
     ///
@@ -198,6 +204,7 @@ impl PrinterExtruder {
             max_e_accel: Mutex::new(0.0),
             trapq: Mutex::new(None),
             last_position: Mutex::new(0.0),
+            motion_queue: Arc::new(Mutex::new(None)),
             pressure_advance: Arc::new(Mutex::new(pressure_advance)),
             pressure_advance_smooth_time: Arc::new(Mutex::new(pressure_advance_smooth_time)),
             printer: Arc::downgrade(printer),
@@ -324,6 +331,42 @@ impl PrinterExtruder {
                 .map_err(ConfigError::new)?;
         }
 
+        // The primary extruder's stepper registers the two motion-sync commands
+        // its `[extruder_stepper]` siblings register, for the name `extruder`
+        // (`kinematics/extruder.py:34-50`).
+        if let Some(stepper) = &self.stepper {
+            let stepper = Arc::clone(stepper);
+            let name = self.name.clone();
+            let handler: CommandHandler = sync(move |gcmd: &GcodeCommand| {
+                cmd_set_extruder_rotation_distance(gcmd, &name, &stepper)
+            });
+            gcode
+                .register_mux_command(
+                    "SET_EXTRUDER_ROTATION_DISTANCE",
+                    "EXTRUDER",
+                    Some(&self.name),
+                    handler,
+                    Some("Set extruder rotation distance"),
+                )
+                .map_err(ConfigError::new)?;
+
+            let queue = Arc::clone(&self.motion_queue);
+            let name = self.name.clone();
+            let printer = Arc::downgrade(printer);
+            let handler: CommandHandler = sync(move |gcmd: &GcodeCommand| {
+                cmd_sync_extruder_motion(gcmd, &name, &printer, &queue)
+            });
+            gcode
+                .register_mux_command(
+                    "SYNC_EXTRUDER_MOTION",
+                    "EXTRUDER",
+                    Some(&self.name),
+                    handler,
+                    Some("Set extruder stepper motion queue"),
+                )
+                .map_err(ConfigError::new)?;
+        }
+
         Ok(())
     }
 
@@ -389,7 +432,10 @@ impl PrinterObject for PrinterExtruder {
                 json!(*Self::lock(&self.pressure_advance_smooth_time)),
             );
             map.insert("can_extrude".to_string(), json!(self.heater.can_extrude()));
-            map.insert("motion_queue".to_string(), Value::Null);
+            map.insert(
+                "motion_queue".to_string(),
+                json!(Self::lock(&self.motion_queue).clone()),
+            );
         }
         status
     }

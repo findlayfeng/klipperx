@@ -18,6 +18,7 @@ pub(crate) mod bus_debug;
 pub mod buttons;
 pub mod controller_fan;
 pub mod delta_calibrate;
+pub mod display;
 pub mod display_status;
 pub mod ds18b20;
 pub mod endstop_phase;

@@ -629,6 +629,60 @@ mod tests {
         }
     }
 
+    // TEMPORARY scratch acceptance test (removed before commit).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn scratch_st7920_runs() {
+        const TARGETS: &[&str] = &[
+            "kit-voron2-250mm.cfg",
+            "printer-anet-a8-2019.cfg",
+            "printer-anet-e10-2018.cfg",
+            "printer-anet-e16-2019.cfg",
+            "printer-anycubic-4max-2018.cfg",
+            "printer-creality-cr10-2017.cfg",
+            "printer-creality-cr10mini-2017.cfg",
+            "printer-creality-cr10s-2017.cfg",
+            "printer-creality-ender2pro-2021.cfg",
+            "printer-creality-ender2pro-hc32-2022.cfg",
+            "printer-creality-ender3-2018.cfg",
+            "printer-creality-ender3max-2021.cfg",
+            "printer-creality-ender3pro-2020.cfg",
+            "printer-creality-ender5-2019.cfg",
+            "printer-creality-ender5pro-2020.cfg",
+            "printer-eryone-thinker-series-v2-2020.cfg",
+            "printer-sovol-sv01-2020.cfg",
+            "printer-sovol-sv05-2022.cfg",
+            "printer-sunlu-t3-2022.cfg",
+            "printer-tronxy-x8-2018.cfg",
+            "printer-wanhao-duplicator-i3-v2.1-2017.cfg",
+        ];
+        let mut seen = 0usize;
+        let mut failures = Vec::new();
+        for run in all_runs() {
+            let name = run
+                .config
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            if !TARGETS.contains(&name.as_str()) {
+                continue;
+            }
+            seen += 1;
+            match run_case(&run, &run_dictionaries(&run)).await {
+                Ok(()) => println!("SCRATCH {name}: Ok"),
+                Err(err) => {
+                    println!("SCRATCH {name}: Err({err})");
+                    failures.push(format!("{name}: {err}"));
+                }
+            }
+        }
+        assert_eq!(seen, TARGETS.len(), "every target run was seen");
+        assert!(
+            failures.is_empty(),
+            "st7920 runs:\n  {}",
+            failures.join("\n  ")
+        );
+    }
+
     /// A name resolves exactly when its dictionary was built; nothing resolves
     /// by borrowing another target's dictionary.
     ///

@@ -36,6 +36,7 @@ pub use config::{
 pub use dictionary::{Dictionary, Enumeration, MessageDef, OutputDef};
 pub use error::{McuCallError, McuError};
 pub use object::{load_config, load_config_prefix, McuObject};
+pub(crate) use resource::pin_number;
 pub use resource::{
     Completion, I2cMode, McuAdc, McuChip, McuDigitalOut, McuEndstop, McuI2c, McuPwm, McuSpi,
     McuStepper, McuTriggerAnalog, McuTrsync, SosFilter, SosFilterDesign, SpiMode, TriggerDispatch,

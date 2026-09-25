@@ -474,6 +474,27 @@ SET_PIN PIN=pwm_fan VALUE=0.25  ; PWM：25% 占空比
 
 有 `[safe_z_home]` 时 `G28` 被接管：按需先执行 `G28 X0 Y0` → 抬到安全位 → `G28 Z0`（`move_to_previous` 为真时最后回原位）；`G28 Z` 而 X/Y 未归零报 `Must home X and Y axes first`。
 
+### M117 / M73 / SET_DISPLAY_TEXT — 显示消息与进度（由 `[display_status]` 注册，批 #7）
+
+| 命令 | 参数 | 说明 |
+|------|------|------|
+| `M73` | `P`（0–100）、`R` | 进度百分比 + 剩余时间 |
+| `M117` | 整行原文 | 设置显示消息（无参数则清空） |
+| `SET_DISPLAY_TEXT` | `MSG`（可选） | help = `Set or clear the display message` |
+
+### SET_DISPLAY_GROUP — 切换显示组（由 `[display]` 注册，批 #7）
+
+`GROUP=<名>`（主节另支持无参形式）；help = `Set the active display group`；未知组报 `Unknown display_data group '%s'`。
+
+### INIT_TMC / DUMP_TMC / SET_TMC_FIELD / SET_TMC_CURRENT — TMC 驱动（mux 键 `STEPPER`，批 #7）
+
+| 命令 | 参数 | 说明 |
+|------|------|------|
+| `INIT_TMC` | — | 重写驱动器寄存器 |
+| `DUMP_TMC` | `REGISTER`（可选） | 打印寄存器；未知名报 `Unknown register name '%s'` |
+| `SET_TMC_FIELD` | `FIELD`、`VALUE` 或 `VELOCITY` | 未知字段报 `Unknown field name '%s'` |
+| `SET_TMC_CURRENT` | `CURRENT`、`HOLDCURRENT` | 应答 `Run Current: %.2fA`（带保持电流时两段） |
+
 ### G-Code 宏命令（由 `[gcode_macro <名>]` 注册）
 
 每个 `[gcode_macro <名>]` 段在装载时以**大写宏名**注册为一条命令（help = `description`）。**宏体已渲染执行**（批 #4 受控子集引擎 `extras/template.rs`，渲染后经 gcode 派发）；`SET_GCODE_VARIABLE` 已注册；子集外构（`{% set %}`、过滤器）显式报错，完整 Jinja 属 H3。

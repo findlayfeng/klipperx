@@ -292,7 +292,7 @@ identify 的命令**定义**（名称、参数、解码）与其它命令一样�
 | `extruder_stepper.rs` | `[extruder_stepper <name>]` prefix 段：段全读+绑定校验（上游文案）+`motion_queue` 记账+`SET_PRESSURE_ADVANCE` 按名挂值（`extruder_stepper.py:23`）；宿主 step 同步待 toolhead 缝（H10） |
 | `exclude_object.rs` | `[exclude_object]` 零选项段 + 四命令（`EXCLUDE_OBJECT[_START/_END/_DEFINE]`）+ 排除区移动变换（`exclude_object.py`）；转绿前置=U-A7b 宏体渲染（H4） |
 | `virtual_sdcard.rs` | `[virtual_sdcard]`：`path` 必填 + `on_error_gcode`（`virtual_sdcard.py:322`）；文件回放命令族未注册（H4） |
-| `display_status.rs` | `[display_status]` 裸段（`display_status.py:49`）；`M73`/`M117`/`SET_DISPLAY_TEXT` 未注册 |
+| `display_status.rs` | `[display_status]` 裸段（`display_status.py:49`）；`M73`/`M117`/`SET_DISPLAY_TEXT` 已注册（批 #7，`[display]` 会按需创建它） |
 | `homing_override.rs` | `[homing_override]`：`axes`/`set_position_*`/`gcode`（`homing_override.py:65`）；G28 包装未装（模板未渲染，H9 共担） |
 | `sdcard_loop.rs` | `[sdcard_loop]` 裸段：`SDCARD_LOOP_*` 三命令的栈/索引语义已单测钉住（`sdcard_loop.py:72`），命令本身未注册（H4） |
 | `servo.rs` | `[servo <name>]` 舵机段（脉宽几何全选项）+ `SET_SERVO`（mux 键 `SERVO=`，`servo.py`）；无打印时序排程（同 pwm_tool 口径） |
@@ -306,6 +306,8 @@ identify 的命令**定义**（名称、参数、解码）与其它命令一样�
 | `heater_fan.rs` | `[heater_fan <name>]`：`Fan` 核心 + `klippy:ready` 起的每秒 tick，任一 heater 有 target 或温度 > `heater_temp` 即为 `fan_speed`，**仅速度变化时写 PWM**（批 #6；`printers.test` 的 run 级收益） |
 | `safe_z_home.rs` | `[safe_z_home]`：接管 G28（Z-hop → 按需 `X0 Y0` → 安全位 → `Z0`）；`section!(order = 70, phase = late)` **必须晚于 toolhead（`printer`，order 60 late）**，否则 `unregister_command("G28")` 得 `None`；与 `[homing_override]` 互斥（批 #6） |
 | `manual_stepper.rs` + `force_move.rs` | `[manual_stepper <name>]` 与 `MANUAL_STEPPER`（含 `GCODE_AXIS` 动态注册/注销 extra axis）；`force_move.rs` 目前只含 `calc_move_time`（归属对齐上游）（批 #6） |
+| `display/{mod,display,st7920}.rs` + vendored `display.cfg` | `[display]` 框架与 st7920 驱动（批 #7）；**storage-only**（不渲染、菜单未实现，见 config 手册的 gap）；`display_status` 的 `M73`/`M117`/`SET_DISPLAY_TEXT` 同批落地 |
+| `tmc.rs` + `tmc_uart.rs` + `tmc2208.rs` + `tmc2209.rs` | TMC UART 驱动族（批 #7）：单一 `TmcDriver` + `TmcTransport` trait + 表驱动；虚拟端停用装饰器实现；SPI 驱动与 `tmc2130`/`tmc2660`/`tmc5160`/`tmc2240` 待做 |
 | `board_pins.rs` | `[board_pins]` / `[board_pins <name>]`：读 `mcu` 列表与 `aliases` / `aliases_*`（`名=引脚`，值写成 `<...>` 则保留），调用 `PrinterPins::alias_pin` / `reserve_pin`。对象不可查询 |
 | `static_digital_output.rs` | `[static_digital_output <name>]`：读 `pins`（引脚列表），一次全部拉到固定电平（上游同名节）；`order = 35` 排在 `board_pins` 后，别名可用 |
 | `stepper.rs` | `[stepper_x]` / `[stepper_y]` / `[stepper_z]`（`phase = late`，order 50：`endstop_pin` 为虚拟端停时，`position_endstop` 取端停提供的位置——`PinChip::virtual_endstop_position`，上游 `MCU_endstop.get_position_endstop`，探针返回 `z_offset`；`endstop_pin` 可能指向别的段注册的 chip，见 [声明式表生成](codegen.md)）：一个电机在一根轴上。读 `step_pin` / `dir_pin` / `rotation_distance` / `microsteps` / `full_steps_per_rotation` / `gear_ratio` / `step_pulse_duration` 与行程（`position_min` / `position_max` / `position_endstop` / `endstop_pin` / `homing_*`），建 MCU 侧 stepper 资源与 rail |
@@ -332,7 +334,7 @@ identify 的命令**定义**（名称、参数、解码）与其它命令一样�
 | `bus_debug.rs` | `i2c_device` / `spi_device` 共用的调试命令底座：同步→异步桥与 `DATA=` 的十六进制编解码（无配置节） |
 | `error_mcu.rs` | MCU 停机消息的展开（无配置节，第一个 `[mcu]` 拉起）：监听 `klippy:shutdown` / `klippy:analyze_shutdown`，把简短原因扩成原因+提示（上游 `extras/error_mcu.py`） |
 
-`extras/` 的 66 个模块（65 `pub mod` + `pub(crate) bus_debug`）全部在 `extras/mod.rs` 声明；其中 50 个文件注册了 63 个 `section!`（含 `printer`，声明在 `toolhead.rs`；`mcu` 声明在 `mcu/mod.rs`，共 64 个装载 id）构成工厂表；`heaters` / `gcode_move` / `query_endstops` / `error_mcu` / `bus_debug` 等非节模块由上述模块按需 `ensure`，不占配置节。
+`extras/` 的 73 个模块（72 `pub mod` + `pub(crate) bus_debug`）全部在 `extras/mod.rs` 声明；其中 55 个文件注册了 68 个 `section!`（含 `printer`，声明在 `toolhead.rs`；`mcu` 声明在 `mcu/mod.rs`，共 69 个装载 id）构成工厂表；`heaters` / `gcode_move` / `query_endstops` / `error_mcu` / `bus_debug` 等非节模块由上述模块按需 `ensure`，不占配置节。
 
 ### `api/` — 客户端 API 层
 

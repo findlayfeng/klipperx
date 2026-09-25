@@ -781,7 +781,7 @@ pins: !PD0, PD1, PD2
 | 节 | 选项 | 说明 |
 |---|------|------|
 | `virtual_sdcard` | `path`（必）、`on_error_gcode`（默认=上游 `DEFAULT_ERROR_GCODE`） | 文件回放命令族（M20-M27、`SDCARD_RESET_FILE` 等）未注册（H4） |
-| `display_status` | 无 | `M73`/`M117`/`SET_DISPLAY_TEXT` 未注册，状态恒为静止 |
+| `display_status` | 无 | `M73`/`M117`/`SET_DISPLAY_TEXT` 已注册（批 #7）；进度/消息由这两条命令驱动（无 `[display]` 时也按需创建） |
 | `homing_override` | `axes`（默认 `XYZ`）、`set_position_x/y/z`（无）、`gcode`（必） | G28 包装未装——脚本体是宏模板、暂不渲染（H9 共担） |
 | `sdcard_loop` | 无 | `SDCARD_LOOP_BEGIN/_END/_DESIST` 未注册；栈/索引语义已单测钉住 |
 
@@ -903,4 +903,26 @@ Z 端停来源：`[stepper_z]`，否则 `[carriage <名>]` 中 axis 为 z 者；
 | `position_min`/`position_max` | 无 | 可选软限位 |
 
 命令见 G-Code 参考的 `MANUAL_STEPPER`。gap（如实登记）：本仓只推进时间线与 `commanded_pos`，**不 append trapq、不产生 steps**；`G1 A<..>` 的 extra axis 词被 `gcode_move` 静默忽略；有 endstop 时的 `STOP_ON_ENDSTOP` 报 `Manual stepper homing is not implemented in this host`。
+
+### `[display]` — 液晶与编码器（st7920 已落地，批 #7）
+
+| 选项 | 默认 | 说明 |
+|------|------|------|
+| `lcd_type` | —（必填） | 目前仅 `st7920` 实现；其余（`hd44780`/`uc1701`/`ssd1306`/`sh1106`/…）报 `lcd_type '<x>' is not implemented in this host` |
+| `cs_pin` / `sclk_pin` / `sid_pin` | — | st7920 三线（必须同 MCU，否则 `st7920 all pins must be on same mcu`） |
+| `display_group` | `_default_16x4` | 组来自随模块发布的 `display.cfg`（20 列时默认 `_default_20x4`）；未知组报 `Unknown display_data group '%s'` |
+| 菜单/按键选项 | — | `menu_root`/`menu_timeout`/`menu_reverse_navigation`/`encoder_pins`/`encoder_steps_per_detent`/`encoder_fast_rate`/`click_pin`/`back_pin`/`up_pin`/`down_pin`/`kill_pin`/`analog_range_*`/`analog_pullup_resistor` **只被读取**（菜单未实现） |
+
+gap（如实登记）：**屏幕内容不渲染**（`display_template`/`display_data`/`display_glyph` 只解析+存储；刷新只 clear/flush）；**菜单未实现**（无 `menu` 对象、无 `menu:*` 事件、不装载 `menu.cfg`）；随模块发布的 `display.cfg` 为 **vendored 副本**（有漂移守卫测试）。
+
+### `[tmc2208 <stepper>]` / `[tmc2209 <stepper>]` — TMC 步进驱动（UART，批 #7）
+
+| 选项 | 默认 | 说明 |
+|------|------|------|
+| `uart_pin` | —（必填） | UART 单线（`tx_pin` 缺省复用） |
+| `select_pins` / `uart_address` | — | 模拟多路复用（同 mcu、同 pin、`(id,addr)` 唯一） |
+| `run_current` / `sense_resistor` / `stealthchop_threshold` | — / 0.110 / — | 电流与静音阈值 |
+| `interpolate` / `driver_SGTHRS` / `diag_pin` | True / — / — | 仅 tmc2209 |
+
+命令：`INIT_TMC` / `DUMP_TMC` / `SET_TMC_FIELD` / `SET_TMC_CURRENT`（mux 键 `STEPPER`）；`tmc2209_<stepper>:virtual_endstop` 可用作端停。gap：fileoutput 下总线读短路为 0；`tmc2130`/`tmc2660`/`tmc5160`/`tmc2240` 与 SPI 传输未实现。
 

@@ -919,6 +919,17 @@ Z 端停来源：`[stepper_z]`，否则 `[carriage <名>]` 中 axis 为 z 者；
 
 gap（如实登记）：**屏幕内容不渲染**（`display_template`/`display_data`/`display_glyph` 只解析+存储；刷新只 clear/flush）；**菜单未实现**（无 `menu` 对象、无 `menu:*` 事件、不装载 `menu.cfg`）；随模块发布的 `display.cfg` 为 **vendored 副本**（有漂移守卫测试）。
 
+### `[load_cell]` — 称重传感器（hx711/hx717 可用，批 #14）
+
+| 选项 | 默认 | 说明 |
+|------|------|------|
+| `sensor_type` | —（必填） | `hx711`/`hx717` 已实现；`ads1220`/`ads131m0x` 等报 `sensor_type '<x>' is not implemented in this host` |
+| `dout_pin` / `sclk_pin` | — | 数据与时钟（必须同 MCU，否则 `… config error: All pins must be connected to the same MCU`） |
+| `sample_rate` / `gain` | 按芯片 | HX711：80/10、A-128/B-32/A-64（默认 80、A-128）；HX717：320/80/20/10、A-128/B-64/A-64/B-8（默认 320、A-128） |
+| `reference_tare_counts` / `counts_per_gram` / `sensor_orientation` | — / — / `normal` | 校准三件套（`counts_per_gram` minval 1.0，非法值 `must have minimum of 1.0`） |
+
+端点 `load_cell/dump_force`（mux key `load_cell`，四列 `time, force (g), counts, tare_counts`）。gap：`ads1220`/`ads131m0x`（LC-3）、`[load_cell_probe]` 未做、`hx71x_attach_trigger_analog` 未接。
+
 ### `[tmc2208 <stepper>]` / `[tmc2209 <stepper>]` — TMC 步进驱动（UART，批 #7）
 
 | 选项 | 默认 | 说明 |

@@ -407,11 +407,9 @@ mod tests {
     /// the list stays honest rather than hiding regressions.
     const IGNORED: &[&str] = &[
         "corexyuv.test",
-        "extruders.test",
         "generic_cartesian.test",
         "generic_cartesian_iqex.test",
         "generic_cartesian_itex.test",
-        "hybrid_corexy_dual_carriage.test",
         "input_shaper.test",
         "load_cell.test",
         "manual_stepper.test",
@@ -740,9 +738,6 @@ mod tests {
             .await
             .expect("G28 runs against the fake firmware");
     }
-
-    /// Run the upstream runs that can be run: those whose dictionaries were all
-    /// built and that are not on the ignore list.
 
     /// Run the upstream runs that can be run: those whose dictionaries were all
     /// built and that are not on the ignore list.

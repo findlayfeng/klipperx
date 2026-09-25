@@ -439,11 +439,11 @@ impl ManualStepper {
                 *self.lock_axis_gcode_id() = None;
                 Ok(())
             }
-            GcodeAxisPlan::Register => {
+            GcodeAxisPlan::Register(id) => {
                 *self.lock_instant_corner_v() = instant_corner_v;
                 *self.lock_gaxis_limit_velocity() = limit_velocity;
                 *self.lock_gaxis_limit_accel() = limit_accel;
-                *self.lock_axis_gcode_id() = Some(requested.to_uppercase());
+                *self.lock_axis_gcode_id() = Some(id);
                 let me: Arc<dyn ExtraAxis> = self.clone();
                 self.toolhead()?.add_extra_axis(me)?;
                 Ok(())
@@ -496,8 +496,8 @@ enum GcodeAxisPlan {
     Noop,
     /// An empty value while an axis is registered: take it off the toolhead.
     Unregister,
-    /// A valid, unused letter: register it.
-    Register,
+    /// A valid, unused letter, **already upper-cased**: register it.
+    Register(String),
 }
 
 /// Decide what a `GCODE_AXIS=<requested>` does, given the axis already bound
@@ -505,7 +505,8 @@ enum GcodeAxisPlan {
 ///
 /// The validation runs **after** `requested.to_uppercase()`, matching upstream
 /// (`manual_stepper.py:152`), so `a` registers as `A`; `F`, multi-character
-/// values, and non-letters are refused.
+/// values, and non-letters are refused. [`GcodeAxisPlan::Register`] carries the
+/// upper-cased letter, which is what the caller binds.
 fn plan_gcode_axis(
     current: Option<&str>,
     requested: &str,
@@ -534,7 +535,7 @@ fn plan_gcode_axis(
             "Axis '{gcode_axis}' already registered"
         )));
     }
-    Ok(GcodeAxisPlan::Register)
+    Ok(GcodeAxisPlan::Register(gcode_axis))
 }
 
 impl ExtraAxis for ManualStepper {
@@ -590,10 +591,6 @@ impl ExtraAxis for ManualStepper {
 
     fn axis_gcode_id(&self) -> Option<String> {
         self.lock_axis_gcode_id().clone()
-    }
-
-    fn set_axis_gcode_id(&self, id: Option<String>) {
-        *self.lock_axis_gcode_id() = id;
     }
 }
 
@@ -799,19 +796,19 @@ mod tests {
         );
     }
 
-    /// The four `GCODE_AXIS` transitions the acceptance calls out
-    /// (`manual_stepper.py:141-167`). The validation happens after the value is
-    /// upper-cased (`:152`), so `a` is accepted as `A`.
+    /// The four `GCODE_AXIS` transitions (`manual_stepper.py:141-167`). The
+    /// validation happens after the value is upper-cased (`:152`), so `a` is
+    /// accepted as `A`.
     #[test]
     fn test_the_gcode_axis_transitions_follow_upstream() {
         // Already registered, a non-empty request: "Must unregister axis first".
         let err = plan_gcode_axis(Some("A"), "A", &[]).unwrap_err();
         assert_eq!(err.to_string(), "Must unregister axis first");
 
-        // A lowercase letter is accepted (upper-cased first).
+        // A lowercase letter is accepted, bound as its upper case.
         assert_eq!(
             plan_gcode_axis(None, "a", &[]).unwrap(),
-            GcodeAxisPlan::Register
+            GcodeAxisPlan::Register("A".to_string())
         );
 
         // F, multi-character, and non-letter values are refused.
@@ -837,7 +834,7 @@ mod tests {
         assert_eq!(plan_gcode_axis(None, "", &[]).unwrap(), GcodeAxisPlan::Noop);
         assert_eq!(
             plan_gcode_axis(None, "A", &[]).unwrap(),
-            GcodeAxisPlan::Register
+            GcodeAxisPlan::Register("A".to_string())
         );
     }
 }

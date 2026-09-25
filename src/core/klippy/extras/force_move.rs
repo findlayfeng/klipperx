@@ -85,16 +85,17 @@ mod tests {
     /// The number the manual-stepper corpus move uses (`MOVE=300 SPEED=10
     /// ACCEL=2000`): the distance is long enough to reach `speed`, so the
     /// cruise is 10 mm/s for the bulk of the move.
+    ///
+    /// The expected tuple is CPython's, value for value: running the upstream
+    /// function itself (`force_move.py:15-28` under `python3`) on
+    /// `calc_move_time(300., 10., 2000.)` returns
+    /// `(1.0, 0.005, 29.994999999999997, 10.0)`, and every field here compares
+    /// equal to it bit for bit rather than within a tolerance.
     #[test]
     fn test_the_long_manual_move_is_a_full_trapezoid() {
-        let (axis_r, accel_t, cruise_t, cruise_v) = calc_move_time(300.0, 10.0, 2000.0);
-        assert_eq!(axis_r, 1.0);
-        assert_eq!(cruise_v, 10.0);
-        assert_eq!(accel_t, 0.005);
-        // (300 - accel_decel_d) / speed, as CPython computes it.
-        assert!(
-            (cruise_t - 29.994_999_999_999_997).abs() < 1e-12,
-            "{cruise_t}"
+        assert_eq!(
+            calc_move_time(300.0, 10.0, 2000.0),
+            (1.0, 0.005, 29.994_999_999_999_997, 10.0)
         );
     }
 }

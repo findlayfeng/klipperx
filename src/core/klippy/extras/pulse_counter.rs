@@ -157,7 +157,7 @@ impl CounterCore {
         let Some(next) = self.chip.clock32_to_clock64(next_clock) else {
             return;
         };
-        let poll_ticks = i64::from(lock(&self.poll_ticks));
+        let poll_ticks = i64::from(*lock(&self.poll_ticks));
         let Some(time) = self.chip.clock_to_print_time(next - poll_ticks) else {
             return;
         };
@@ -232,7 +232,7 @@ impl McuCounter {
             .create_oid()
             .map_err(|err| ConfigError::new(err.to_string()))?;
         let core = Arc::new(CounterCore {
-            chip: chip.clone(),
+            chip: (*chip).clone(),
             oid,
             poll_ticks: Mutex::new(0),
             count: Mutex::new(0),
@@ -315,7 +315,7 @@ fn arm_query(core: &CounterCore, mcu: &Mcu, sample_time: f64) -> Result<QueryCou
     Ok(QueryCounter {
         oid: core.oid,
         clock: query_slot(mcu, core.oid)?,
-        poll_ticks: lock(&core.poll_ticks),
+        poll_ticks: *lock(&core.poll_ticks),
         sample_ticks: mcu.seconds_to_clock(sample_time)? as u32,
     })
 }
@@ -328,7 +328,9 @@ fn arm_query(core: &CounterCore, mcu: &Mcu, sample_time: f64) -> Result<QueryCou
 /// nothing to difference against yet — and a report that carries no later time
 /// reads as zero rather than as an infinite rate.
 pub struct FrequencyCounter {
-    /// Kept alive so its registry entry and callbacks outlive the readings.
+    /// Kept alive so its registry entry and callbacks outlive the readings:
+    /// the [`CounterRegistry`] only holds this counter weakly.
+    #[allow(dead_code)]
     counter: McuCounter,
     /// The running `(time, count, frequency)` the callback maintains.
     state: Arc<FrequencyState>,
@@ -539,7 +541,7 @@ mod tests {
     fn decode_list(
         payloads: &[crate::core::klippy::msg::proto::Payload],
     ) -> Vec<(String, Vec<ArgValue>)> {
-        let mut parser = parser();
+        let parser = parser();
         payloads
             .iter()
             .map(|payload| {
@@ -602,10 +604,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_the_config_describes_the_pin_and_leaves_arming_to_post_init() {
+    #[tokio::test]
+    async fn test_the_config_describes_the_pin_and_leaves_arming_to_post_init() {
         let (chip, pins, mcu, name) = chip();
-        McuCounter::new(&pins, &format!("{name}:^PC0"), 1.0, 0.0015).expect("it builds");
+        McuCounter::new(&pins, &format!("^{name}:PC0"), 1.0, 0.0015).expect("it builds");
 
         let built = chip.config().build(&mcu).expect("it builds");
         let config = decode_list(&built.config);
@@ -624,8 +626,8 @@ mod tests {
         assert!(built.init.is_empty(), "{:?}", built.init);
     }
 
-    #[test]
-    fn test_the_query_slot_carries_both_tick_periods() {
+    #[tokio::test]
+    async fn test_the_query_slot_carries_both_tick_periods() {
         let (chip, pins, mcu, name) = chip();
         let counter =
             McuCounter::new(&pins, &format!("{name}:PC0"), 1.0, 0.0015).expect("it builds");
@@ -644,8 +646,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_reports_route_to_the_counter_their_oid_names() {
+    #[tokio::test]
+    async fn test_reports_route_to_the_counter_their_oid_names() {
         let (chip, pins, mcu, name) = chip();
         let first = McuCounter::new(&pins, &format!("{name}:PC0"), 1.0, 0.0015).expect("it builds");
         let second =
@@ -693,8 +695,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_a_wrapped_count_carries_into_the_next_bit() {
+    #[tokio::test]
+    async fn test_a_wrapped_count_carries_into_the_next_bit() {
         let (_chip, pins, _mcu, name) = chip();
         let counter =
             McuCounter::new(&pins, &format!("{name}:PC0"), 1.0, 0.0015).expect("it builds");
@@ -709,8 +711,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_every_report_reaches_the_callback_including_the_first() {
+    #[tokio::test]
+    async fn test_every_report_reaches_the_callback_including_the_first() {
         let (_chip, pins, _mcu, name) = chip();
         let counter =
             McuCounter::new(&pins, &format!("{name}:PC0"), 1.0, 0.0015).expect("it builds");
@@ -732,8 +734,8 @@ mod tests {
         assert_eq!(seen[1].1, 12);
     }
 
-    #[test]
-    fn test_the_first_sample_only_anchors_the_time() {
+    #[tokio::test]
+    async fn test_the_first_sample_only_anchors_the_time() {
         let (_chip, pins, _mcu, name) = chip();
         let counter =
             FrequencyCounter::new(&pins, &format!("{name}:PC0"), 1.0, 0.0015).expect("it builds");
@@ -744,8 +746,8 @@ mod tests {
         assert_eq!(counter.get_frequency(), 0.0, "nothing to difference yet");
     }
 
-    #[test]
-    fn test_the_frequency_is_the_count_delta_over_the_time_delta() {
+    #[tokio::test]
+    async fn test_the_frequency_is_the_count_delta_over_the_time_delta() {
         let (_chip, pins, _mcu, name) = chip();
         let counter =
             FrequencyCounter::new(&pins, &format!("{name}:PC0"), 1.0, 0.0015).expect("it builds");
@@ -757,8 +759,8 @@ mod tests {
         assert_eq!(counter.get_frequency(), 20.0);
     }
 
-    #[test]
-    fn test_a_sample_with_no_new_time_reads_zero() {
+    #[tokio::test]
+    async fn test_a_sample_with_no_new_time_reads_zero() {
         let (_chip, pins, _mcu, name) = chip();
         let counter =
             FrequencyCounter::new(&pins, &format!("{name}:PC0"), 1.0, 0.0015).expect("it builds");
@@ -776,15 +778,17 @@ mod tests {
         assert_eq!(counter.get_frequency(), 19.0);
     }
 
-    #[test]
-    fn test_a_tachometer_pin_may_pull_up_but_may_not_invert() {
+    #[tokio::test]
+    async fn test_a_tachometer_pin_may_pull_up_but_may_not_invert() {
         let (_chip, pins, _mcu, name) = chip();
 
-        FrequencyCounter::new(&pins, &format!("{name}:^PC0"), 1.0, 0.0015)
+        FrequencyCounter::new(&pins, &format!("^{name}:PC0"), 1.0, 0.0015)
             .expect("a pull-up is allowed");
 
-        let err = FrequencyCounter::new(&pins, &format!("{name}:!PC0"), 1.0, 0.0015)
-            .expect_err("upstream's lookup_pin cannot invert");
+        let err = match FrequencyCounter::new(&pins, &format!("{name}:!PC0"), 1.0, 0.0015) {
+            Ok(_) => panic!("upstream's lookup_pin cannot invert"),
+            Err(err) => err,
+        };
         assert!(err.to_string().contains("Invalid pin"), "{err}");
     }
 }

@@ -8,6 +8,7 @@
 //! |---|---|---|
 //! | [`BatchBulkHelper`] | `BatchBulkHelper` | periodic batch processing + client fan-out + mux endpoint |
 //! | [`FixedFreqReader`] | `FixedFreqReader` | clock-synchronized pull of `sensor_bulk_data` blocks |
+//! | [`SampleFormat`] | `struct.Struct(unpack_fmt)` | sample byte order and size (`bytes_per_sample` → `samples_per_block`) |
 //! | [`ClockSyncRegression`] | `ClockSyncRegression` | sample-rate / timestamp estimation by EMA regression |
 //! | `BulkDataQueue` | `BulkDataQueue` | per-oid queue behind the one bound `sensor_bulk_data` callback |
 //!
@@ -63,7 +64,8 @@ pub const BYTES_PER_SAMPLE: usize = 4;
 /// another format computes it as [`SampleFormat::samples_per_block`]).
 pub const SAMPLES_PER_BLOCK: usize = MAX_BULK_MSG_SIZE / BYTES_PER_SAMPLE;
 
-/// How long one `query_status_ldc1612` round-trip may take.
+/// How long one `sensor_bulk_status` query (any chip's `query_*_status`)
+/// round-trip may take.
 const QUERY_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// One raw sample: `(print time, raw value)`.
@@ -487,6 +489,149 @@ fn registry_for(name: &str) -> Arc<BulkDataRegistry> {
 }
 
 // ===========================================================================
+// SampleFormat
+// ===========================================================================
+
+/// One sample's byte layout, parsed from an upstream `struct` format string
+/// (`FixedFreqReader(mcu, chip_clock_smooth, unpack_fmt)`).
+///
+/// The format decides two things the reader needs: how many bytes one sample
+/// occupies — and from it how many samples fit one 51-byte
+/// [`MAX_BULK_MSG_SIZE`] message ([`samples_per_block`](Self::samples_per_block),
+/// upstream's `MAX_BULK_MSG_SIZE // self.bytes_per_sample`) — and which end of
+/// the byte run is the most significant when a sample is unpacked.
+///
+/// Sizes are summed field by field, packed with no alignment padding, which
+/// is what Python's standard (`<`, `>`, `=`) and byte-only formats do; every
+/// format the sensors in this host pass (`">I"`, `"<i"`, `"BBBBB"`, `"<hhh"`,
+/// `">hhh"`) measures the same either way.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SampleFormat {
+    /// The format string as given (for diagnostics).
+    spec: String,
+    /// Bytes one sample occupies (upstream's `unpack.size`).
+    bytes_per_sample: usize,
+    /// Fields the format unpacks (upstream's tuple arity).
+    field_count: usize,
+    /// Whether the sample's bytes are little-endian.
+    little_endian: bool,
+}
+
+impl SampleFormat {
+    /// Parse an upstream `struct` format string such as `">I"`, `"<i"` or
+    /// `"BBBBB"`.
+    ///
+    /// A leading `<` selects little-endian and `>`/`!` big-endian; `=`, `@`
+    /// and a missing prefix mean native order — little-endian on every target
+    /// this host builds for.
+    ///
+    /// # Errors
+    /// [`ConfigError`] for an empty format or a field code outside the integer
+    /// codes (`b B ? h H i I l L q Q`), which is everything the bulk sensors
+    /// pass.
+    pub fn parse(spec: &str) -> Result<Self, ConfigError> {
+        let mut chars = spec.chars();
+        let (little_endian, fields) = match chars.next() {
+            Some('<') => (true, chars.as_str()),
+            Some('>') | Some('!') => (false, chars.as_str()),
+            Some('=') | Some('@') => (cfg!(target_endian = "little"), chars.as_str()),
+            Some(_) => (cfg!(target_endian = "little"), spec),
+            None => {
+                return Err(ConfigError::new(format!(
+                    "sample format \"{spec}\" is empty"
+                )))
+            }
+        };
+        let mut bytes_per_sample = 0usize;
+        let mut field_count = 0usize;
+        for code in fields.chars() {
+            bytes_per_sample += match code {
+                'b' | 'B' | '?' => 1,
+                'h' | 'H' => 2,
+                'i' | 'I' | 'l' | 'L' => 4,
+                'q' | 'Q' => 8,
+                other => {
+                    return Err(ConfigError::new(format!(
+                        "sample format \"{spec}\": unsupported field code '{other}'"
+                    )))
+                }
+            };
+            field_count += 1;
+        }
+        if field_count == 0 {
+            return Err(ConfigError::new(format!(
+                "sample format \"{spec}\" has no fields"
+            )));
+        }
+        Ok(Self {
+            spec: spec.to_string(),
+            bytes_per_sample,
+            field_count,
+            little_endian,
+        })
+    }
+
+    /// Bytes one sample occupies (upstream's `unpack.size`).
+    pub fn bytes_per_sample(&self) -> usize {
+        self.bytes_per_sample
+    }
+
+    /// Samples one full `sensor_bulk_data` message carries
+    /// (`MAX_BULK_MSG_SIZE // bytes_per_sample` upstream).
+    pub fn samples_per_block(&self) -> usize {
+        MAX_BULK_MSG_SIZE / self.bytes_per_sample
+    }
+
+    /// Unpack one sample's bytes as the raw value of a [`Sample`].
+    ///
+    /// # Errors
+    /// The format cannot be carried by `Sample = (f64, u32)` — more than one
+    /// field or wider than four bytes (adxl345's `"BBBBB"`, mpu9250's
+    /// `">hhh"`; wiring those needs a wider sample type) — or `bytes` is not
+    /// exactly one sample long.
+    pub fn decode(&self, bytes: &[u8]) -> Result<u32, McuError> {
+        if self.field_count != 1 || self.bytes_per_sample > 4 {
+            return Err(McuError::Decode(format!(
+                "sample format \"{}\" unpacks {} byte(s) in {} field(s); Sample = (f64, u32) \
+                 cannot carry it",
+                self.spec, self.bytes_per_sample, self.field_count
+            )));
+        }
+        if bytes.len() != self.bytes_per_sample {
+            return Err(McuError::Decode(format!(
+                "sample format \"{}\" needs {} byte(s), got {}",
+                self.spec,
+                self.bytes_per_sample,
+                bytes.len()
+            )));
+        }
+        let mut value = 0_u32;
+        if self.little_endian {
+            for (index, byte) in bytes.iter().enumerate() {
+                value |= u32::from(*byte) << (8 * index);
+            }
+        } else {
+            for byte in bytes {
+                value = (value << 8) | u32::from(*byte);
+            }
+        }
+        Ok(value)
+    }
+}
+
+impl Default for SampleFormat {
+    /// Upstream's ldc1612 default: `">I"` — one big-endian 32-bit value.
+    fn default() -> Self {
+        Self {
+            spec: ">I".to_string(),
+            bytes_per_sample: 4,
+            field_count: 1,
+            little_endian: false,
+        }
+    }
+}
+
+// ===========================================================================
 // FixedFreqReader
 // ===========================================================================
 
@@ -496,6 +641,10 @@ fn registry_for(name: &str) -> Arc<BulkDataRegistry> {
 /// Each pull first queries `sensor_bulk_status` for the firmware's clock and
 /// sequence counters, folds that into a [`ClockSyncRegression`], then decodes
 /// the queued messages into `(print time, raw)` samples.
+///
+/// The sample layout and the status-query command are parameters — upstream's
+/// `unpack_fmt` and the `msgformat` of `setup_query_command` — with
+/// [`new`](Self::new) keeping ldc1612's defaults.
 pub struct FixedFreqReader {
     /// The machine this sensor is on, resolved when it binds.
     mcu_object: Mutex<Weak<McuObject>>,
@@ -510,12 +659,64 @@ pub struct FixedFreqReader {
     max_query_duration: Mutex<u32>,
     /// Messages the firmware could not deliver, accumulated across wraps.
     last_overflows: Mutex<u64>,
+    /// The sample layout this sensor streams (upstream's `unpack_fmt`): byte
+    /// order and [`bytes_per_sample`](SampleFormat::bytes_per_sample).
+    format: SampleFormat,
+    /// This chip's status-query command name — the first token of upstream's
+    /// `setup_query_command(msgformat, …)`; its argument is always the
+    /// sensor's `oid` (`oid=%c`).
+    query_cmd: String,
 }
 
 impl FixedFreqReader {
     /// Track samples expected `chip_clock_smooth` MCU ticks apart — upstream
-    /// passes `data_rate * BATCH_UPDATES * 2`.
+    /// passes `data_rate * BATCH_UPDATES * 2` — with ldc1612's defaults: the
+    /// `">I"` sample format and the `query_status_ldc1612` status query
+    /// (upstream's `FixedFreqReader(mcu, …, ">I")` +
+    /// `setup_query_command("query_status_ldc1612 oid=%c", …)`).
     pub fn new(chip_clock_smooth: f64) -> Self {
+        Self::build(
+            chip_clock_smooth,
+            SampleFormat::default(),
+            QueryStatusLdc1612::NAME.to_string(),
+        )
+    }
+
+    /// The parameterized constructor — upstream's `__init__(mcu,
+    /// chip_clock_smooth, unpack_fmt)` together with the `msgformat` half of
+    /// `setup_query_command(msgformat, oid, cq)`.
+    ///
+    /// `unpack_fmt` is a Python `struct` format (`"<i"`, `">I"`, `"BBBBB"`)
+    /// that fixes the sample's byte order and size — hence
+    /// [`samples_per_block`](SampleFormat::samples_per_block) =
+    /// `51 // bytes_per_sample` — and `query_msgformat` is the chip's status
+    /// query (e.g. `"query_hx71x_status oid=%c"`), whose first token names
+    /// the command.
+    ///
+    /// # Errors
+    /// [`ConfigError`] when either string is unusable (see
+    /// [`SampleFormat::parse`]).
+    pub fn with_format(
+        chip_clock_smooth: f64,
+        unpack_fmt: &str,
+        query_msgformat: &str,
+    ) -> Result<Self, ConfigError> {
+        let format = SampleFormat::parse(unpack_fmt)?;
+        let query_cmd = query_msgformat
+            .split_whitespace()
+            .next()
+            .ok_or_else(|| {
+                ConfigError::new(format!(
+                    "the bulk status query message format \"{query_msgformat}\" names no command"
+                ))
+            })?
+            .to_string();
+        Ok(Self::build(chip_clock_smooth, format, query_cmd))
+    }
+
+    /// The shared constructor behind [`new`](Self::new) and
+    /// [`with_format`](Self::with_format).
+    fn build(chip_clock_smooth: f64, format: SampleFormat, query_cmd: String) -> Self {
         Self {
             mcu_object: Mutex::new(Weak::new()),
             oid: Mutex::new(None),
@@ -524,6 +725,8 @@ impl FixedFreqReader {
             last_sequence: Mutex::new(0),
             max_query_duration: Mutex::new(0),
             last_overflows: Mutex::new(0),
+            format,
+            query_cmd,
         }
     }
 
@@ -592,19 +795,39 @@ impl FixedFreqReader {
             .ok_or_else(|| McuError::Config("the sensor is not configured yet".to_string()))
     }
 
-    /// Query `sensor_bulk_status` and fold it into the clock regression.
+    /// Query `sensor_bulk_status` through this chip's query command and fold
+    /// it into the clock regression.
     async fn query_and_apply(&self, reset: bool) -> Result<(), McuError> {
         let (mcu, object) = self.connected()?;
         let oid = self.oid()?;
-        let status: SensorBulkStatus = mcu
-            .call_msg(&QueryStatusLdc1612 { oid }, QUERY_TIMEOUT)
-            .await?;
+        let status = self.query_status(&mcu, oid).await?;
         let clock64 = object.clock32_to_clock64(status.clock).ok_or_else(|| {
             McuError::Config("the sensor's MCU clock is not synchronized".to_string())
         })?;
         let five_us = mcu.seconds_to_clock(0.000005)?.min(u64::from(u32::MAX)) as u32;
         self.apply_status(clock64, five_us, &status, reset);
         Ok(())
+    }
+
+    /// One status exchange through this chip's query command — upstream's
+    /// `setup_query_command(msgformat, oid, cq)` looks the command up by its
+    /// format string and `_update_clock` sends `[oid]` through it. Both names
+    /// resolve before the command goes out, exactly as [`Mcu::call_msg`] does,
+    /// so a firmware without the message fails fast instead of waiting out
+    /// [`QUERY_TIMEOUT`].
+    async fn query_status(&self, mcu: &Mcu, oid: u8) -> Result<SensorBulkStatus, McuError> {
+        let dictionary = mcu.require_dictionary()?;
+        mcu.require_message(&self.query_cmd)?;
+        let response = mcu.require_message(SensorBulkStatus::NAME)?;
+        let values = mcu
+            .call(
+                &self.query_cmd,
+                &[ArgValue::UInt8(oid)],
+                SensorBulkStatus::NAME,
+                QUERY_TIMEOUT,
+            )
+            .await?;
+        SensorBulkStatus::decode(&Params::new(response, &values).with_dictionary(dictionary))
     }
 
     /// One status observation: advance the counters, apply the duration
@@ -643,8 +866,8 @@ impl FixedFreqReader {
         }
         *max_query_duration = 2_u32.saturating_mul(duration);
 
-        let msg_count = *last_sequence * SAMPLES_PER_BLOCK as u64
-            + u64::from(status.buffered) / BYTES_PER_SAMPLE as u64;
+        let msg_count = *last_sequence * self.format.samples_per_block() as u64
+            + u64::from(status.buffered) / self.format.bytes_per_sample() as u64;
         // +1 for the average query-response offset and assumed hardware
         // processing time (upstream's chip clock).
         let chip_clock = (msg_count + 1) as f64;
@@ -678,8 +901,14 @@ impl FixedFreqReader {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .get_time_translation(|ticks| clock.clock_to_print_time(ticks));
-        let (samples, last_chip_clock) =
-            decode_blocks(&raw, last_sequence as i64, time_base, chip_base, inv_freq);
+        let (samples, last_chip_clock) = decode_blocks(
+            &raw,
+            &self.format,
+            last_sequence as i64,
+            time_base,
+            chip_base,
+            inv_freq,
+        )?;
         self.clock_sync
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -731,32 +960,35 @@ impl FixedFreqReader {
 /// sample (for [`ClockSyncRegression::set_last_chip_clock`]).
 fn decode_blocks(
     raw: &[(u16, Vec<u8>)],
+    format: &SampleFormat,
     start_last_sequence: i64,
     time_base: f64,
     chip_base: f64,
     inv_freq: f64,
-) -> (Vec<Sample>, f64) {
-    let mut samples = Vec::with_capacity(raw.len() * SAMPLES_PER_BLOCK);
+) -> Result<(Vec<Sample>, f64), McuError> {
+    let samples_per_block = format.samples_per_block();
+    let bytes_per_sample = format.bytes_per_sample();
+    let mut samples = Vec::with_capacity(raw.len() * samples_per_block);
     let mut last_sequence = start_last_sequence;
-    let mut last_chip_clock = start_last_sequence as f64 * SAMPLES_PER_BLOCK as f64;
+    let mut last_chip_clock = start_last_sequence as f64 * samples_per_block as f64;
     for (sequence, data) in raw {
         let seq_diff = u16::wrapping_sub(*sequence, last_sequence as u16);
         let signed = i64::from(seq_diff) - i64::from(seq_diff & 0x8000) * 2;
         let seq = last_sequence + signed;
         last_sequence = seq;
-        let msg_cdiff = seq as f64 * SAMPLES_PER_BLOCK as f64 - chip_base;
-        let count = data.len() / BYTES_PER_SAMPLE;
+        let msg_cdiff = seq as f64 * samples_per_block as f64 - chip_base;
+        let count = data.len() / bytes_per_sample;
         for index in 0..count {
             let ptime = time_base + (msg_cdiff + index as f64) * inv_freq;
-            let mut raw_value = [0_u8; BYTES_PER_SAMPLE];
-            raw_value.copy_from_slice(&data[index * BYTES_PER_SAMPLE..][..BYTES_PER_SAMPLE]);
-            samples.push((ptime, u32::from_be_bytes(raw_value)));
+            let start = index * bytes_per_sample;
+            let raw_value = format.decode(&data[start..start + bytes_per_sample])?;
+            samples.push((ptime, raw_value));
         }
         if count > 0 {
-            last_chip_clock = seq as f64 * SAMPLES_PER_BLOCK as f64 + (count - 1) as f64;
+            last_chip_clock = seq as f64 * samples_per_block as f64 + (count - 1) as f64;
         }
     }
-    (samples, last_chip_clock)
+    Ok((samples, last_chip_clock))
 }
 
 // ===========================================================================
@@ -777,6 +1009,127 @@ mod tests {
         assert_eq!(MAX_BULK_MSG_SIZE, 51);
         assert_eq!(BYTES_PER_SAMPLE, 4);
         assert_eq!(SAMPLES_PER_BLOCK, 12);
+        // The default reader carries that same format.
+        let reader = FixedFreqReader::new(80.);
+        assert_eq!(reader.format.bytes_per_sample(), BYTES_PER_SAMPLE);
+        assert_eq!(reader.format.samples_per_block(), SAMPLES_PER_BLOCK);
+        assert_eq!(reader.query_cmd, QueryStatusLdc1612::NAME);
+    }
+
+    #[test]
+    fn test_sample_format_parses_sizes_byte_order_and_rejections() {
+        // "<i": little-endian, four bytes → 51 // 4 = 12 per block.
+        let le = SampleFormat::parse("<i").expect("valid format");
+        assert_eq!(le.bytes_per_sample(), 4);
+        assert_eq!(le.samples_per_block(), 12);
+
+        // "BBBBB": five one-byte fields → 51 // 5 = 10 per block
+        // (upstream adxl345's format; the old constant 12 was wrong here).
+        let five = SampleFormat::parse("BBBBB").expect("valid format");
+        assert_eq!(five.bytes_per_sample(), 5);
+        assert_eq!(five.samples_per_block(), MAX_BULK_MSG_SIZE / 5);
+        assert_eq!(five.samples_per_block(), 10);
+
+        // The ldc1612 default parses to the same layout as `default()`.
+        assert_eq!(
+            SampleFormat::parse(">I").expect("valid"),
+            SampleFormat::default()
+        );
+        // "hhh": three 2-byte fields, both byte orders.
+        assert_eq!(
+            SampleFormat::parse(">hhh")
+                .expect("valid")
+                .bytes_per_sample(),
+            6
+        );
+        assert_eq!(
+            SampleFormat::parse("<hhh")
+                .expect("valid")
+                .bytes_per_sample(),
+            6
+        );
+
+        // Rejected: empty, no fields, unknown code.
+        assert!(SampleFormat::parse("").is_err());
+        assert!(SampleFormat::parse(">").is_err());
+        assert!(SampleFormat::parse(">z").is_err());
+    }
+
+    #[test]
+    fn test_little_endian_i32_block_decodes_correctly() {
+        // "<i": four-byte little-endian i32 samples (upstream hx71x/ads1220).
+        let format = SampleFormat::parse("<i").expect("valid format");
+        let mut block = Vec::new();
+        for value in [0x0010_0000_i32, -1, 0x1234_5678] {
+            block.extend_from_slice(&value.to_le_bytes());
+        }
+        let raw = vec![(1_u16, block)];
+        let (samples, _) = decode_blocks(&raw, &format, 1, 10.0, 13.0, 0.5).expect("decodes");
+        assert_eq!(samples.len(), 3);
+        assert_eq!(samples[0].1, 0x0010_0000);
+        // -1 as i32 is all bits set; little-endian must not byte-swap it.
+        assert_eq!(samples[1].1, 0xFFFF_FFFF);
+        // 0x12345678 LE is bytes 78 56 34 12; big-endian would read 0x78563412.
+        assert_eq!(samples[2].1, 0x1234_5678);
+        assert_ne!(samples[2].1, 0x7856_3412);
+    }
+
+    #[test]
+    fn test_default_reader_decodes_byte_like_the_fixed_be_path() {
+        // Byte equivalence with the pre-parameterization reader: the same
+        // ldc1612 samples decoded by `u32::from_be_bytes` over 4-byte windows.
+        let mut block = Vec::new();
+        for value in 0..12_u32 {
+            block.extend_from_slice(&(0x0010_0000 + value).to_be_bytes());
+        }
+        let expected: Vec<u32> = block
+            .chunks_exact(4)
+            .map(|window| u32::from_be_bytes(window.try_into().expect("4 bytes")))
+            .collect();
+
+        let reader = FixedFreqReader::new(80.);
+        assert_eq!(reader.format, SampleFormat::default());
+        let raw = vec![(1_u16, block)];
+        let (samples, _) =
+            decode_blocks(&raw, &reader.format, 1, 10.0, 13.0, 0.5).expect("decodes");
+        let decoded: Vec<u32> = samples.iter().map(|(_t, value)| *value).collect();
+        assert_eq!(decoded, expected);
+
+        // The default construction still names ldc1612's query command.
+        assert_eq!(reader.query_cmd, "query_status_ldc1612");
+        // …and an injected format reuses the same decode path.
+        let injected = FixedFreqReader::with_format(80., ">I", "query_status_ldc1612 oid=%c")
+            .expect("valid args");
+        assert_eq!(injected.format, reader.format);
+        assert_eq!(injected.query_cmd, reader.query_cmd);
+    }
+
+    #[test]
+    fn test_with_format_injects_query_command_and_rejects_bad_input() {
+        let reader = FixedFreqReader::with_format(80., "<i", "query_hx71x_status oid=%c")
+            .expect("valid args");
+        assert_eq!(reader.query_cmd, "query_hx71x_status");
+        assert_eq!(reader.format.bytes_per_sample(), 4);
+        assert_eq!(reader.format.samples_per_block(), 12);
+        // The msgformat's first token names the command (upstream's
+        // `lookup_query_command` splits it the same way).
+        assert!(FixedFreqReader::with_format(80., "<i", "   ").is_err());
+        assert!(FixedFreqReader::with_format(80., "zzz", "query_x_status oid=%c").is_err());
+    }
+
+    #[test]
+    fn test_sample_format_decode_rejects_what_sample_cannot_carry() {
+        // "BBBBB" sizes the block (10) but its 5-byte tuple cannot be one
+        // (f64, u32) raw value — the honest error instead of a silent pack.
+        let five = SampleFormat::parse("BBBBB").expect("valid format");
+        assert!(five.decode(&[0_u8; 5]).is_err());
+        // Width mismatch is refused too.
+        let be = SampleFormat::default();
+        assert!(be.decode(&[0_u8; 3]).is_err());
+        assert_eq!(
+            be.decode(&[0x12, 0x34, 0x56, 0x78]).expect("4 bytes"),
+            0x1234_5678
+        );
     }
 
     #[test]
@@ -818,7 +1171,8 @@ mod tests {
             second.extend_from_slice(&(0x0010_0000 + value).to_be_bytes());
         }
         let raw = vec![(1_u16, first), (2_u16, second)];
-        let (samples, last_chip_clock) = decode_blocks(&raw, 1, 10.0, 13.0, 0.5);
+        let (samples, last_chip_clock) =
+            decode_blocks(&raw, &SampleFormat::default(), 1, 10.0, 13.0, 0.5).expect("decodes");
         // 24 samples; message 1 is seq 1 (baseline), message 2 follows.
         assert_eq!(samples.len(), 24);
         assert_eq!(samples[0], (10.0 + (12.0 - 13.0) * 0.5, 0x0010_0000));
@@ -829,7 +1183,8 @@ mod tests {
         assert_eq!(last_chip_clock, 35.0);
 
         // An empty pull decodes to nothing.
-        let (empty, _) = decode_blocks(&[], 0, 0., 0., 1.);
+        let (empty, _) =
+            decode_blocks(&[], &SampleFormat::default(), 0, 0., 0., 1.).expect("decodes");
         assert!(empty.is_empty());
     }
 
@@ -838,14 +1193,16 @@ mod tests {
         let block = vec![0_u8; BYTES_PER_SAMPLE * SAMPLES_PER_BLOCK];
         // Forward across the 16-bit wrap: 65534 → 1 is +3 messages.
         let raw = vec![(65534_u16, block.clone()), (1_u16, block.clone())];
-        let (samples, last_chip) = decode_blocks(&raw, 65534, 0., 0., 1.);
+        let (samples, last_chip) =
+            decode_blocks(&raw, &SampleFormat::default(), 65534, 0., 0., 1.).expect("decodes");
         assert_eq!(samples.len(), 2 * SAMPLES_PER_BLOCK);
         // chip positions: 65534*12+12 → 65537*12+11 (baseline arithmetic).
         assert_eq!(last_chip, 65537.0 * 12.0 + 11.0);
 
         // A backwards jump: 0x8000 is -32768 signed (upstream's extension).
         let raw = vec![(0x8000_u16, block)];
-        let (samples, last_chip) = decode_blocks(&raw, 0, 0., 0., 1.);
+        let (samples, last_chip) =
+            decode_blocks(&raw, &SampleFormat::default(), 0, 0., 0., 1.).expect("decodes");
         assert_eq!(last_chip, -32768.0 * 12.0 + 11.0);
         assert_eq!(samples.len(), SAMPLES_PER_BLOCK);
     }

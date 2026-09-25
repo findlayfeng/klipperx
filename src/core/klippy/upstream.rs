@@ -971,9 +971,9 @@ mod tests {
     /// never fired the armed trsync, and the host waited forever while
     /// retransmitting the arm block (the "infinite arm, never fire" log).
     ///
-    /// Only the homing part of `corexyuv.test`'s script runs here; the rest of
-    /// that case still ends in a dual-carriage `Move out of range`, which is
-    /// not this chain and stays on the ignore list upstream.
+    /// Only the homing part of `corexyuv.test`'s script runs here; the whole
+    /// case, dual-carriage and extruder segments included, runs in
+    /// [`the_corexyuv_case_runs_every_gcode_line`].
     #[tokio::test(flavor = "multi_thread")]
     async fn the_corexyuv_config_homes_against_the_fake_firmware() {
         let Some(dict) = dictionary_path("atmega2560.dict") else {
@@ -1040,10 +1040,18 @@ mod tests {
         assert!(gcode.is_ok(), "{gcode:?}");
     }
 
-    /// SCRATCH (U-GC-4): the whole `corexyuv.test` script, line by line on one
-    /// live machine, printing every command's result.
+    /// The whole `corexyuv.test` script, line by line on one live machine,
+    /// bounded — the case `IGNORED` still lists only because the guard stays
+    /// load-only.
+    ///
+    /// Every line runs through the ordinary dispatcher against the fake
+    /// firmware and is reported, so a regression names its command rather
+    /// than the case: the U-GC-4 failure stopped at `G91` + `G1 X-10 E.2`
+    /// with `Move out of range: -10.000 …`, because a dual carriage's frame
+    /// never learned where homing left it (`idex_modes::Shared::homed`) and
+    /// the switch onto `carriage_u` re-anchored the toolhead at X=0.
     #[tokio::test(flavor = "multi_thread")]
-    async fn scratch_corexyuv_full_script_line_by_line() {
+    async fn the_corexyuv_case_runs_every_gcode_line() {
         use crate::core::klippy::gcode::{GCodeDispatch, GCODE_OBJECT};
         use crate::core::klippy::printer::{Printer, PrinterState};
         use crate::core::klippy::reactor::TokioReactor;
@@ -1062,7 +1070,7 @@ mod tests {
             .expect("the corpus carries corexyuv.test");
         let config = injected_config(&run.config, &[(None, dict)]).expect("corexyuv.cfg parses");
 
-        let outcome = tokio::time::timeout(std::time::Duration::from_secs(300), async {
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(60), async {
             let reactor = Arc::new(TokioReactor::new(tokio::runtime::Handle::current()));
             let printer = Arc::new(Printer::new(reactor));
             let mut start_args = crate::core::klippy::api::StartArgs::collect("corexyuv.cfg", None);

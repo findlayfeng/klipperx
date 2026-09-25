@@ -464,7 +464,7 @@ mod tests {
 
     /// A tracked wrapper around `identifier` in `config`, the way the loader
     /// hands a factory its section (`sibling` needs the whole config).
-    fn wrapper<'a>(
+    fn tracked<'a>(
         config: &'a Config,
         identifier: &str,
     ) -> (ConfigWrapper<'a>, Arc<AccessTracking>) {
@@ -492,7 +492,7 @@ mod tests {
     fn test_the_defaults_are_upstreams() {
         let text = format!("{Z_ENDSTOP}[safe_z_home]\nhome_xy_position: 10, 20\n");
         let config = parse(&text);
-        let (wrapper, access) = wrapper(&config, "safe_z_home");
+        let (wrapper, access) = tracked(&config, "safe_z_home");
 
         let options = SafeZHomeOptions::read(&wrapper).expect("the section reads");
         assert_eq!(options.home_xy_position, [10.0, 20.0]);
@@ -502,11 +502,11 @@ mod tests {
         assert!(!options.move_to_previous);
         assert_eq!(options.max_z, 200.0);
 
-        // The defaults are recorded as used, as upstream's `getfloat` does
-        // (`klippy/configfile.py:33-36`).
+        // The defaults are recorded as used, as upstream's `get` does for a
+        // default too (`klippy/configfile.py:33-36`).
         assert!(access.contains("safe_z_home", "z_hop"));
         assert!(access.contains("safe_z_home", "speed"));
-        assert!(!access.contains("safe_z_home", "move_to_previous"));
+        assert!(access.contains("safe_z_home", "move_to_previous"));
         assert!(access.contains("stepper_z", "position_max"));
     }
 
@@ -522,7 +522,7 @@ mod tests {
              z_hop_speed: 10\n"
         );
         let config = parse(&text);
-        let (wrapper, access) = wrapper(&config, "safe_z_home");
+        let (wrapper, access) = tracked(&config, "safe_z_home");
 
         let options = SafeZHomeOptions::read(&wrapper).expect("the section reads");
         check_unused(&config, &access, &[]).expect("no option is left unread");
@@ -540,7 +540,7 @@ mod tests {
     fn test_a_missing_or_single_home_xy_position_is_refused() {
         let text = format!("{Z_ENDSTOP}[safe_z_home]\nspeed: 150\n");
         let config = parse(&text);
-        let (wrapper, _) = wrapper(&config, "safe_z_home");
+        let (wrapper, _) = tracked(&config, "safe_z_home");
         assert_eq!(
             SafeZHomeOptions::read(&wrapper).unwrap_err().to_string(),
             "Option 'home_xy_position' in section 'safe_z_home' must be specified"
@@ -548,7 +548,7 @@ mod tests {
 
         let text = format!("{Z_ENDSTOP}[safe_z_home]\nhome_xy_position: 160\n");
         let config = parse(&text);
-        let (wrapper, _) = wrapper(&config, "safe_z_home");
+        let (wrapper, _) = tracked(&config, "safe_z_home");
         assert_eq!(
             SafeZHomeOptions::read(&wrapper).unwrap_err().to_string(),
             "Option 'home_xy_position' in section 'safe_z_home' must have 2 elements"
@@ -556,7 +556,7 @@ mod tests {
 
         let text = format!("{Z_ENDSTOP}[safe_z_home]\nhome_xy_position: 160,abc\n");
         let config = parse(&text);
-        let (wrapper, _) = wrapper(&config, "safe_z_home");
+        let (wrapper, _) = tracked(&config, "safe_z_home");
         assert_eq!(
             SafeZHomeOptions::read(&wrapper).unwrap_err().to_string(),
             "Unable to parse option 'home_xy_position' in section 'safe_z_home'"
@@ -568,7 +568,7 @@ mod tests {
     #[test]
     fn test_a_missing_z_endstop_section_is_refused() {
         let config = parse("[safe_z_home]\nhome_xy_position: 160,120\n");
-        let (wrapper, _) = wrapper(&config, "safe_z_home");
+        let (wrapper, _) = tracked(&config, "safe_z_home");
         assert_eq!(
             SafeZHomeOptions::read(&wrapper).unwrap_err().to_string(),
             "Missing Z endstop config for safe_z_homing"
@@ -585,7 +585,7 @@ mod tests {
                     [carriage carriage_z]\naxis: z\nposition_max: 100\n\
                     [safe_z_home]\nhome_xy_position: 160,120\n";
         let config = parse(text);
-        let (wrapper, _) = wrapper(&config, "safe_z_home");
+        let (wrapper, _) = tracked(&config, "safe_z_home");
         let options = SafeZHomeOptions::read(&wrapper).expect("the carriage supplies the endstop");
         assert_eq!(options.max_z, 100.0);
 
@@ -594,7 +594,7 @@ mod tests {
         let text = "[carriage z]\nposition_max: 100\n\
                     [safe_z_home]\nhome_xy_position: 160,120\n";
         let config = parse(text);
-        let (wrapper, _) = wrapper(&config, "safe_z_home");
+        let (wrapper, _) = tracked(&config, "safe_z_home");
         let options = SafeZHomeOptions::read(&wrapper).expect("the name supplies the axis");
         assert_eq!(options.max_z, 100.0);
     }
@@ -741,7 +741,7 @@ mod tests {
         }
     }
 
-    fn recorded(recorded: &Recorded) -> Vec<HashMap<String, String>> {
+    fn recorded_commands(recorded: &Recorded) -> Vec<HashMap<String, String>> {
         recorded
             .commands
             .lock()
@@ -771,7 +771,7 @@ mod tests {
         .expect("the homing runs");
 
         assert_eq!(
-            recorded(&recorded),
+            recorded_commands(&recorded),
             [
                 HashMap::from([
                     ("X".to_string(), "0".to_string()),
@@ -808,7 +808,10 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(err.to_string(), "Must home X and Y axes first");
-        assert!(recorded(&recorded).is_empty(), "no statement was passed on");
+        assert!(
+            recorded_commands(&recorded).is_empty(),
+            "no statement was passed on"
+        );
         assert!(ops.log().is_empty(), "no move was made");
     }
 
@@ -961,7 +964,6 @@ mod tests {
         let options = options(10.0, false);
         let gcode = dispatch();
         let ops = RecordingHome::new(Coord::new(5.0, 6.0, 3.0, 0.0), [true; 3]);
-        let recorded = Arc::new(Recorded::default());
         // A pressure probe homes Z down to 0, where the second hop picks it up.
         let prev: CommandHandler = {
             let ops = Arc::clone(&ops);
@@ -1041,7 +1043,7 @@ mod tests {
         .expect("the statement runs");
 
         assert_eq!(
-            recorded(&recorded),
+            recorded_commands(&recorded),
             [HashMap::from([("X".to_string(), "0".to_string())])]
         );
         assert!(ops.log().is_empty());

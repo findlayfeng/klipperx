@@ -474,6 +474,10 @@ SET_PIN PIN=pwm_fan VALUE=0.25  ; PWM：25% 占空比
 
 有 `[safe_z_home]` 时 `G28` 被接管：按需先执行 `G28 X0 Y0` → 抬到安全位 → `G28 Z0`（`move_to_previous` 为真时最后回原位）；`G28 Z` 而 X/Y 未归零报 `Must home X and Y axes first`。
 
+### LOAD_CELL_CALIBRATE / LOAD_CELL_TARE / LOAD_CELL_READ / LOAD_CELL_DIAGNOSTIC — 称重校准（由 `[load_cell]` 注册，批 #14）
+
+四条命令**已注册并带上游 help，当前调用报 `not implemented`**（需 `LoadCellSampleCollector` 与交互式校准，见 TODO）。
+
 ### M117 / M73 / SET_DISPLAY_TEXT — 显示消息与进度（由 `[display_status]` 注册，批 #7）
 
 | 命令 | 参数 | 说明 |

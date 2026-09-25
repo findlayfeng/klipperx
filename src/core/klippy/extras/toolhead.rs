@@ -1823,12 +1823,13 @@ async fn home_unified(
         // (`StepperPosition.note_home_end`).
         let steppers = connected.toolhead.motion_queuing_mut().steppers();
         let mut state = homing.lock();
-        for stepper in rail.steppers() {
+        for (index, stepper) in rail.steppers().iter().enumerate() {
             if let Some(host) = steppers.iter().find(|host| host.name() == stepper.name()) {
                 state.set_trigger_position(
                     stepper.name(),
                     host.past_mcu_position(trigger_time) as f64,
                 );
+                state.set_primary(stepper.name(), index == 0);
             }
         }
     }
@@ -1921,9 +1922,10 @@ async fn home_axis(
     {
         let steppers = connected.toolhead.motion_queuing_mut().steppers();
         let mut state = homing.lock();
-        for name in stepper_names {
+        for (index, name) in stepper_names.iter().enumerate() {
             if let Some(stepper) = steppers.iter().find(|stepper| stepper.name() == name) {
                 state.set_trigger_position(name, stepper.past_mcu_position(trigger_time) as f64);
+                state.set_primary(name, index == 0);
             }
         }
     }

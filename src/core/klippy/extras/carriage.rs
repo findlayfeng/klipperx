@@ -48,7 +48,7 @@ use crate::core::klippy::motion::generic_cartesian::{
 };
 use crate::core::klippy::motion::{Axis, HomingInfo};
 use crate::core::klippy::pins::{PrinterPins, PINS_OBJECT};
-use crate::core::klippy::printer::{Printer, PrinterObject};
+use crate::core::klippy::printer::{ConnectFuture, Printer, PrinterObject};
 
 // Upstream's `_load_kinematics` walks them in this order
 // (`generic_cartesian.py:173-212`): the carriages first, then what attaches to
@@ -247,6 +247,15 @@ impl PrinterObject for KinematicStepper {
 
     fn is_queryable(&self) -> bool {
         false
+    }
+
+    /// The motor connects itself: upstream's `stepper.PrinterStepper(config)`
+    /// registers its own `klippy:connect` handler, and this section's object —
+    /// the only one the loader walks — is the wrapper around it
+    /// (`kinematics/kinematic_stepper.py:44-48`). Without this the host solver
+    /// never exists and the toolhead refuses to bring the machine up.
+    fn connect<'a>(&'a self) -> ConnectFuture<'a> {
+        self.stepper.connect()
     }
 }
 

@@ -65,7 +65,7 @@ H1–H12 是上游 extras 里按域归并的消费者（2026-09-21 全量盘点�
 |---|---|---|
 | F6 | SPI 总线剩余：`spi_transfer_with_preface` / `setup_shutdown_msg` | F1、F2 |
 | F8 | endstop / trsync ✅（FW6）；测试侧「响应器式多实例假 MCU」待办（可用 `SimulatorDevice`） | F1、F2、C1 |
-| F9 | 固件资源剩余：buttons / pulse_counter / trigger_analog / initial_pins / sdcard / sensor_bulk / lcd / neopixel / tmcuart 等（thermocouple 已接：`cmd/thermocouple.rs` + `spi_temperature`） | F1–F7 |
+| F9 | 固件资源剩余：buttons / trigger_analog / initial_pins / sdcard / sensor_bulk / lcd / neopixel / tmcuart 等（已接：`cmd/thermocouple.rs` + `spi_temperature`；pulse_counter 批 #8 落地） | F1–F7 |
 
 **G-Code 与端点**
 
@@ -235,7 +235,7 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 
 - [ ] `buttons`（`src/buttons.c`，`config_buttons` / `buttons_add` / `buttons_query` /
       `buttons_ack`）—— 暂停/恢复按钮、耗材检测。
-- [ ] `pulse_counter`、`neopixel` / `dotstar` / `led`、`tmcuart`、`sdcard` / `sdio`、
+- [ ] `neopixel` / `dotstar` / `led`、`tmcuart`、`sdcard` / `sdio`、
       `lcd_hd44780` / `lcd_st7920`、`sensor_bulk`（批量传感器上报）与各类 SPI/I2C 传感器
       （`sensor_adxl345` / `sensor_lis2dw` / …）。
 - 这些是 extras，不阻塞运动；等 F1–F6 完成、真有对应 section 时再逐个接。消费者见
@@ -250,8 +250,7 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
   （`ToolHead::register_lookahead_callback` + `motion_queuing.register_flush_callback`）。
 
 > **T3 的边界**：`[extruder]`/`heater_bed`/`fan` 三段与 C1b 已落地；T3 现卡在 H2-3 的
-> `heater_fan`、H1 的 `verify_heater`/`pid_calibrate`、H10 的 `extruder_stepper` 与
-> F9/H7 的 `pulse_counter`；T5 按 C1c 的族顺序推进。
+> `heater_fan`、H1 的 `verify_heater`/`pid_calibrate`、H10 的 `extruder_stepper`；T5 按 C1c 的族顺序推进。（pulse_counter 批 #8 已消。）
 
 ### C2 配置装载收尾（框架 FW1）
 
@@ -332,7 +331,7 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 | `sensor_pin: … 'vref_scaled'`（`adc_scaled`） | 4 | H1 |
 | H9 其余（`bed_mesh` 6、`safe_z_home` 4、`bed_screws` 3、`quad_gantry_level` 2、`z_tilt`/`endstop_phase` 各 1） | 17 | H9 |
 | 板级扩展 section（`mcp4451`/`dac084s085`/`ad5206`/`multi_pin`/`sx1509_duex`/`replicape`） | 8 | H2 / H7 |
-| `Option 'tachometer_pin' … pulse_counter` | 2 | F9 / H7 |
+| `Option 'tachometer_pin' … pulse_counter` | **0** | F9 / H7 已消（批 #8，2 run 实测 `run_case OK`） |
 | `Section 'extruder_stepper …'` | 2 | H10 |
 | `Section 'verify_heater …'` | 2 | H1 |
 | `Unknown temperature sensor`（`G2`、`Kingroon_B3950`、`NTCS0603E3104FXT`） | 3 | H1 |
@@ -351,7 +350,7 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 - [ ] **T3. `extruder` + `heater_bed` + `fan`**：三段均已落地，`Section 'extruder'` 已 **0 次**
       （2026-09-23 实跑）；原列的 C2 autosave（`pid_Kp` 49）是误归因——语料 0 个 `#*#` 区块，
       真因是选项名大小写，已修复归零。现在卡在 H2-3 `heater_fan`（22）、H10 `extruder_stepper`
-      （2）、H1 `verify_heater`（2）与 F9/H7 `pulse_counter`（2）。
+      （2）、H1 `verify_heater`（2）。（F9/H7 `pulse_counter` 批 #8 已消。）
 - [ ] **T4. `probe` / `bltouch` / endstop pin chip**（35 次失败，2026-09-23 选项大小写修复后实测）：
       `bed_mesh`、`bltouch`、`eddy`、`screws_tilt_adjust`、`smart_effector`、`z_virtual_endstop` 等。
       依赖 F8（endstop，已 ✅）与 H9（probe 模块）。**施工序列**（scout 静态矩阵测算，每步以「移出
@@ -452,7 +451,7 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 ### H7 输入与外设
 
 - [ ] `buttons.py` / `gcode_button.py`（固件 `buttons.c`）。
-- [ ] `pulse_counter.py`（固件 `pulse_counter.c`）。
+- [x] `pulse_counter.py`（批 #8：host 侧 `pulse_counter.rs` 落地并接通 `tachometer_pin`；`config_counter`/`query_counter` 按字典编码，真机验证仍待 T6）。
 - [ ] `trigger_analog.py`（固件 `trigger_analog.c`）。
 - [ ] 断料/线宽：`filament_switch_sensor.py`、`filament_motion_sensor.py`、
       `hall_filament_width_sensor.py`、`tsl1401cl_filament_width_sensor.py`。

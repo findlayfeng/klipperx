@@ -512,7 +512,9 @@ max_temp: 110
 | `hardware_pwm` | 布尔 | 否 | `false` | 用固件 PWM 而非软件翻转 |
 | `shutdown_speed` | 浮点 [0..1] | 否 | `0` | 主机停机时固件回退的占空比（被 `max_power` 再截一次） |
 | `enable_pin` | 引脚 | 否 | — | 驱动使能脚，只在 0 ↔ 非 0 边沿翻转 |
-| `tachometer_pin` | — | 拒收 | — | 需 `pulse_counter`（F9），写了直接报配置错而不是静默 `rpm: null` |
+| `tachometer_pin` | — | 可选 | — | 批 #8 接通 `pulse_counter` 频率计数：报 `rpm`（无边沿时 `rpm: 0.0`，不再拒收、也不静默 `rpm: null`） |
+| `tachometer_ppr` | 2 | ≥1 | — | 每转脉冲数（需 `tachometer_pin`；`<1` 拒收） |
+| `tachometer_poll_interval` | 0.0015 | >0 | — | 测速轮询间隔秒（需 `tachometer_pin`；`≤0` 拒收） |
 
 ### `[temperature_sensor <name>]` — 可查询的温度传感器
 
@@ -878,7 +880,7 @@ cartesian 在 late 阶段认领；注册 `dual_carriage` 对象与 `SET_DUAL_CAR
 | `fan_speed` | `1.0`（0..=1） | 触发时的风扇速度 |
 
 `pin`/`kick_start_time`/`max_power`/`shutdown_speed`/`off_below`/`cycle_time`/`hardware_pwm` 由 `[fan]` 核心读取。语义：每秒 tick；**任一 heater 有 target 或温度 > `heater_temp` 即为 `fan_speed`**；仅速度变化时写 PWM；掉线关机速度默认 **1.0**（与 `[controller_fan]` 的 0.0 不同）。无 G-Code 命令，`get_status` 转发 fan 状态。
-gap：本仓无 heater 注册表（H1），`heater` 名按 printer 对象名解析；语料中 2 个 run 的 `tachometer_pin` 被 `Fan` 核心拒收（需 `pulse_counter`，未做）。
+gap：本仓无 heater 注册表（H1），`heater` 名按 printer 对象名解析；语料中 2 个 run 的 `tachometer_pin`（`generic-prusa-buddy`、`printer-prusa-mini-plus-2020`）批 #8 已接通，实测两条 `run_case OK`。
 
 ### `[safe_z_home]` — 归零前安全 Z 抬升（批 #6）
 

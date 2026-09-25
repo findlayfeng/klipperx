@@ -690,11 +690,11 @@ SPI_SEND     DEVICE=flash DATA=04          // spi send ok
 |------|------|------|
 | `SET_SERVO` | `SERVO`（名）、`ANGLE=<0..maximum_servo_angle>` 或 `WIDTH=<秒>` | 按角/脉宽驱动舵机；缺参与越界文案对上游（`servo.py`） |
 
-### SET_DUAL_CARRIAGE / SAVE_DUAL_CARRIAGE_STATE / RESTORE_DUAL_CARRIAGE_STATE — IDEX 双滑架（由 `[dual_carriage]` 注册）
+### SET_DUAL_CARRIAGE / SAVE_DUAL_CARRIAGE_STATE / RESTORE_DUAL_CARRIAGE_STATE — IDEX 双滑架（由 `[dual_carriage]` 注册；`kinematics: generic_cartesian` 时由运动学在 `[printer]` 装载时注册，批 #12）
 
 | 命令 | 参数 | 说明 |
 |------|------|------|
-| `SET_DUAL_CARRIAGE` | `CARRIAGE=<0..1>`、`MODE=...` | 切换主/副滑架；**现状=记账级**（未接 trapq 切换与限位，C1 缺口入档 idex 模块） |
+| `SET_DUAL_CARRIAGE` | `CARRIAGE=<名字或 0..1>`、`MODE=...` | 切换主/副滑架（**先按名字**如 `carriage_u`；`0/1` 仅在恰 2 滑架时回退，多滑架报 `Invalid CARRIAGE=…`，批 #12）；**现状=记账级**（未接 trapq 切换与限位，C1 缺口入档 idex 模块） |
 | `SAVE_DUAL_CARRIAGE_STATE` | `NAME=<名>` | 保存当前滑架状态 |
 | `RESTORE_DUAL_CARRIAGE_STATE` | `NAME=<名>`、`MOVE=<0..1>` | 恢复（含恢复移动的完整语义未移植） |
 

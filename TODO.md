@@ -297,8 +297,8 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 
 框架已落地：`src/core/klippy/upstream.rs`（字典驱动应答机 + 按 `CONFIG` 拆分的运行）与
 `crates/test-support/build.rs`（按架构编字典）；T1（`linuxtest.test`）已完成并转绿。当前 239 次
-运行里，默认构建缺 2 条（引用 `pru`）、忽略列表 8 条、
-实际执行 29 条（`linuxtest.test`、`commands.test`、`out_of_bounds.test`、`bed_mesh.test`、
+运行里，默认构建缺 2 条（引用 `pru`）、忽略列表 6 条、
+实际执行 31 条（`linuxtest.test`、`commands.test`、`out_of_bounds.test`、`bed_mesh.test`、
 `z_virtual_endstop.test`、`z_tilt.test`、`quad_gantry_level.test`、`bltouch.test`、
 `smart_effector.test`、`multi_z.test`、`screws_tilt_adjust.test`、`gcode_arcs.test`、
 `bed_screws.test`、`pwm.test`、`temperature.test`、`macros.test`、`led.test`、
@@ -309,11 +309,11 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 
 **推进口径**：下文的「首次失败原因」分组只用于定位，不是工作队列——`load_config` 遇到第一个
 未知 section 就停，修好一个缺口只会让运行前进到下一个缺口，总数可能不变（T7 前后失败总数
-几乎不变就是例子），各组收益不可加。进度以**转绿运行数 / `IGNORED` 条目数**衡量（当前 29 / 8）。**验收标准
+几乎不变就是例子），各组收益不可加。进度以**转绿运行数 / `IGNORED` 条目数**衡量（当前 31 / 6）。**验收标准
 是「对应 `.test` 从 `IGNORED` 移除后通过」**，不是「某个错误不再出现」。详见
 [失败原因分析复盘](docs/work-log/2026-09-22-upstream-regression-failures.md#复盘计数口径与重排后补)。
 
-**当前失败原因统计**（`KLIPPERX_UPSTREAM_ALL=1` 实跑，2026-09-25（批 #11 合入后）：**72 次失败**、165 次通过、
+**当前失败原因统计**（`KLIPPERX_UPSTREAM_ALL=1` 实跑，2026-09-25（批 #12 合入后）：**70 次失败**、167 次通过、
 2 条因未构建 `pru` 字典不计，合计 239；下表为**选项名大小写修复后**的分布——49 次
 `must be specified` 归零但总数不变、首因整体后移，见[复盘](docs/work-log/2026-09-22-upstream-regression-failures.md#复盘计数口径与重排后补)
 的「收益不可加」）：

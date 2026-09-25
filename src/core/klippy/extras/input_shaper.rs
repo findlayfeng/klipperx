@@ -29,6 +29,12 @@
 //! reached, and the motion queue's scan-window accounting it ends with is
 //! [`recompute_scan_windows`] — a documented no-op this host has no mechanism
 //! for. `SET_INPUT_SHAPER` therefore changes the reported parameters only.
+//!
+//! The same layer is what upstream re-points when a dual carriage changes the
+//! kinematics (`_update_kinematics`, `input_shaper.py:148-165`, on
+//! `dual_carriage:update_kinematics`); `idex_modes` fires no such event here
+//! (`KlippyEvent::DualCarriageUpdateKinematics` is declared, but nothing sends
+//! it), so no handler is registered and there is nothing to re-point.
 
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 

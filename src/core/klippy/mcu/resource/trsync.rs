@@ -79,6 +79,10 @@ impl Completion {
 
     /// Complete it with a raw wire reason; the first reason stands.
     ///
+    /// Signals with `notify_waiters()`: only waiters that already registered
+    /// are woken and no permit is stored, so [`wait`](Completion::wait_raw)
+    /// registers **before** it reads the state (the race is noted there).
+    ///
     /// Reasons 5 and above (`trigger_analog` errors) have no typed variant but
     /// still complete the dispatch — dropping them would leave `home_wait`
     /// waiting forever.
@@ -109,6 +113,19 @@ impl Completion {
     pub async fn wait_raw(&self) -> u8 {
         loop {
             let notified = self.notify.notified();
+            tokio::pin!(notified);
+            // Register with the `Notify` **before** reading the state.
+            //
+            // `complete_raw` signals with `notify_waiters()`, which wakes only
+            // the waiters already registered and stores no permit for later
+            // ones; a `Notified` future does not register itself until it is
+            // enabled or first polled. Reading `raw` first and awaiting after
+            // would therefore lose a completion that lands in between: the
+            // reason would be recorded, no waiter would be woken, and this
+            // loop would sleep forever. `enable()` closes that window — the
+            // state read below then either sees the reason (return it) or the
+            // completion is guaranteed to wake us.
+            notified.as_mut().enable();
             if let Some(raw) = self.raw() {
                 return raw;
             }

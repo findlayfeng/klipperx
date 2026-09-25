@@ -267,11 +267,17 @@ impl ResonanceTester {
     fn cmd_test_resonances(&self, gcmd: &GcodeCommand) -> Result<(), CommandError> {
         let axis = gcmd.get_str("AXIS")?.to_lowercase();
         parse_axis(&axis)?;
+        // An empty `CHIPS`/`POINT` is upstream's unset (`if chips_str:`),
+        // not an empty name to resolve (`resonance_tester.py:349-360`).
         if let Ok(chips) = gcmd.get_str("CHIPS") {
-            self.parse_chips(&chips)?;
+            if !chips.is_empty() {
+                self.parse_chips(&chips)?;
+            }
         }
         if let Ok(point) = gcmd.get_str("POINT") {
-            parse_point(&point)?;
+            if !point.is_empty() {
+                parse_point(&point)?;
+            }
         }
         parse_outputs(&gcmd.get_str_default("OUTPUT", "resonances"))?;
         if let Ok(name) = gcmd.get_str("NAME") {
@@ -287,15 +293,17 @@ impl ResonanceTester {
     /// As upstream's parse does, before the run.
     fn cmd_shaper_calibrate(&self, gcmd: &GcodeCommand) -> Result<(), CommandError> {
         if let Ok(axis) = gcmd.get_str("AXIS") {
-            let axis = axis.to_lowercase();
             // Upstream spells this `axis.lower() not in 'xyz'`, a substring
-            // test, so a multi-character `AXIS` (`xy`) is accepted here too.
-            if !"xyz".contains(&axis) {
+            // test, so a multi-character `AXIS` (`xy`) is accepted here too;
+            // the error quotes the raw parameter (`resonance_tester.py:384-389`).
+            if !"xyz".contains(&axis.to_lowercase()) {
                 return Err(CommandError::new(format!("Unsupported axis '{axis}'")));
             }
         }
         if let Ok(chips) = gcmd.get_str("CHIPS") {
-            self.parse_chips(&chips)?;
+            if !chips.is_empty() {
+                self.parse_chips(&chips)?;
+            }
         }
         // `MAX_SMOOTHING` falls back to the section's `max_smoothing`, which may
         // itself be unset; only a *present* value is parsed and bounded here
@@ -563,7 +571,9 @@ fn check_name_suffix(name_suffix: &str) -> Result<(), CommandError> {
         .chars()
         .filter(|c| *c != '-' && *c != '_')
         .collect();
-    if !stripped.chars().all(char::is_alphanumeric) {
+    // `str.isalnum()` is false for the empty string, so an empty `NAME` is
+    // invalid too (`resonance_tester.py:438-439`).
+    if stripped.is_empty() || !stripped.chars().all(char::is_alphanumeric) {
         return Err(CommandError::new("Invalid NAME parameter"));
     }
     Ok(())
@@ -830,7 +840,8 @@ mod tests {
                 "TEST_RESONANCES AXIS=X OUTPUT=bogus",
                 "Unsupported output 'bogus', only 'resonances' and 'raw_data' are supported",
             ),
-            ("SHAPER_CALIBRATE AXIS=q", "Unsupported axis 'q'"),
+            // The axis is quoted as written, as upstream's message does.
+            ("SHAPER_CALIBRATE AXIS=Q", "Unsupported axis 'Q'"),
             (
                 "TEST_RESONANCES AXIS=X NAME=no/good",
                 "Invalid NAME parameter",

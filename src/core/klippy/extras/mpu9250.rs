@@ -37,6 +37,11 @@
 //! infrastructure work and is left to be done once, outside this section. Until
 //! then [`Mpu9250`] configures the chip and offers the interface, but starting a
 //! measurement fails with the reason ([`BULK_GAP`]); see that constant.
+//!
+//! The G-Code commands upstream registers through `adxl345.AccelCommandHelper`
+//! (`ACCELEROMETER_MEASURE` / `ACCELEROMETER_QUERY` / `ACCELEROMETER_DEBUG_READ`
+//! / `ACCELEROMETER_DEBUG_WRITE`) are not registered here either: they drive the
+//! same data path, so they are wired together with it.
 
 use std::sync::{Arc, Mutex, Weak};
 

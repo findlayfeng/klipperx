@@ -60,7 +60,9 @@ use crate::core::klippy::load::section;
 use crate::core::klippy::printer::{Printer, PrinterObject};
 use crate::core::klippy::reactor::{Reactor, TimerHandle};
 
+use super::ssd1306::Ssd1306;
 use super::st7920::ST7920;
+use super::uc1701::Uc1701;
 
 // The framework reads `[display_status]` (created on demand) and the
 // `[display_template]` registry sits at order 40; `[spi_device]`'s resources
@@ -76,9 +78,9 @@ const REDRAW_MIN_TIME: f64 = 0.100;
 /// The panel names `lcd_type` accepts — upstream's `LCD_chips` keys
 /// (`display.py:12-19`).
 ///
-/// The whole list is accepted even though only `st7920` has a driver here, so
-/// the choice error is upstream's wording and the names are not silently
-/// rejected.
+/// The whole list is accepted even though only `st7920`, `uc1701` and
+/// `ssd1306` have drivers here, so the choice error is upstream's wording and
+/// the names are not silently rejected.
 const LCD_TYPES: &[&str] = &[
     "st7920",
     "emulated_st7920",
@@ -234,6 +236,8 @@ impl PrinterLCD {
         let lcd_type = config.get_choice("lcd_type", LCD_TYPES, None)?;
         let lcd_chip: Arc<dyn LcdChip> = match lcd_type.as_str() {
             "st7920" => Arc::new(ST7920::new(config, printer)?),
+            "uc1701" => Arc::new(Uc1701::new(config, printer)?),
+            "ssd1306" => Arc::new(Ssd1306::new(config, printer)?),
             other => {
                 return Err(ConfigError::new(format!(
                     "lcd_type '{other}' is not implemented in this host"
@@ -1122,6 +1126,52 @@ mod tests {
             err.to_string(),
             "lcd_type 'hd44780' is not implemented in this host"
         );
+    }
+
+    #[test]
+    fn test_the_sibling_panels_that_still_have_no_driver_are_reported() {
+        // `sh1106` is the SSD1306's own variant (`uc1701.py:238-242`): the
+        // name is accepted by `lcd_type` and refused with the same sentence
+        // as every other gap.
+        for lcd_type in ["sh1106", "emulated_st7920", "aip31068_spi"] {
+            let err = machine()
+                .load_config(&display_config(&format!("lcd_type: {lcd_type}\n")))
+                .unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!("lcd_type '{lcd_type}' is not implemented in this host")
+            );
+        }
+    }
+
+    /// The corpus's `lcd_type: uc1701` shape (`printer-creality-cr20-2018.cfg`),
+    /// for the load that says every option of the section was read.
+    const UC1701_SECTION: &str = "lcd_type: uc1701\n\
+                                 cs_pin: PA3\n\
+                                 a0_pin: PA5\n\
+                                 encoder_pins: ^PC4, ^PC6\n\
+                                 click_pin: ^!PC2\n";
+
+    /// The corpus's `lcd_type: ssd1306` shape
+    /// (`printer-wanhao-duplicator-6-2016.cfg`): the I2C panel.
+    const SSD1306_SECTION: &str = "lcd_type: ssd1306\n\
+                                  reset_pin: PE3\n\
+                                  encoder_pins: ^PG1, ^PG0\n\
+                                  click_pin: ^!PD2\n";
+
+    #[test]
+    fn test_the_two_new_panels_load_and_leave_no_option_unread() {
+        for section in [UC1701_SECTION, SSD1306_SECTION] {
+            let printer = machine();
+            printer
+                .load_config(&display_config(section))
+                .expect("the section loads and reads every option");
+            let display = printer
+                .lookup_object_as::<PrinterLCD>("display")
+                .expect("the display is registered under its section id");
+            assert_eq!(display.show_data_group(), "_default_16x4");
+            assert_eq!(display.sent_message_count(), 0);
+        }
     }
 
     #[test]

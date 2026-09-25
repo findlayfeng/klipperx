@@ -7,6 +7,7 @@
 //! imports them.
 
 pub mod adc_temperature;
+pub mod adxl345;
 pub mod bed_mesh;
 pub mod bed_screws;
 pub mod bed_tilt;

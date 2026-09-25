@@ -1091,6 +1091,20 @@ impl ToolHeadObject {
         Ok(())
     }
 
+    /// Forget the homing state of `axes` (upstream's
+    /// `kinematics.clear_homing_state`).
+    ///
+    /// `safe_z_home` uses it to undo the fake homing state its z-hop move
+    /// needs (`safe_z_home.py:45`); without it the axis would keep looking
+    /// homed. Before connect this does nothing.
+    pub fn clear_homing_state(&self, axes: &[usize]) {
+        if let Some(connected) = self.lock().as_mut() {
+            if let Some(kinematics) = connected.toolhead.kinematics_mut() {
+                kinematics.clear_homing_state(axes);
+            }
+        }
+    }
+
     /// Queue a move to `position` at `speed` mm/s (upstream's `toolhead.move`).
     ///
     /// The toolhead plans it; deciding *what* the coordinates mean — absolute

@@ -37,7 +37,7 @@ use crate::core::klippy::api::protocol::{PushTarget, Request, ResponseTemplate};
 use crate::core::klippy::api::registry::{EndpointContext, EndpointFuture, MuxEndpoint};
 use crate::core::klippy::api::webhooks;
 use crate::core::klippy::cmd::ldc1612::{QueryStatusLdc1612, SensorBulkData, SensorBulkStatus};
-use crate::core::klippy::cmd::McuResponse;
+use crate::core::klippy::cmd::{McuCommand, McuResponse, Params};
 use crate::core::klippy::config::ConfigError;
 use crate::core::klippy::mcu::{Mcu, McuError, McuObject};
 use crate::core::klippy::msg::proto::ArgValue;
@@ -51,12 +51,16 @@ pub const BATCH_INTERVAL: f64 = 0.500;
 /// (`MAX_BULK_MSG_SIZE`).
 pub const MAX_BULK_MSG_SIZE: usize = 51;
 
-/// Bytes one sample occupies: upstream's `FixedFreqReader(mcu, …, ">I")` —
-/// a big-endian 32-bit value. Every sensor this host ships unpacks that way.
+/// Bytes one sample occupies under the **default** format: upstream's
+/// `FixedFreqReader(mcu, …, ">I")` — a big-endian 32-bit value, which is what
+/// ldc1612 (and [`FixedFreqReader::new`]) unpacks. A reader built with
+/// [`FixedFreqReader::with_format`] derives its own size from the format
+/// string instead of this constant.
 pub const BYTES_PER_SAMPLE: usize = 4;
 
-/// Samples one full `sensor_bulk_data` message carries
-/// (`MAX_BULK_MSG_SIZE // bytes_per_sample` in upstream).
+/// Samples one full `sensor_bulk_data` message carries under the default
+/// format (`MAX_BULK_MSG_SIZE // bytes_per_sample` in upstream; a reader with
+/// another format computes it as [`SampleFormat::samples_per_block`]).
 pub const SAMPLES_PER_BLOCK: usize = MAX_BULK_MSG_SIZE / BYTES_PER_SAMPLE;
 
 /// How long one `query_status_ldc1612` round-trip may take.

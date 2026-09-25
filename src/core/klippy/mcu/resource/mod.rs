@@ -36,6 +36,8 @@ mod trsync;
 pub use adc::McuAdc;
 pub use endstop::McuEndstop;
 pub use i2c::{I2cMode, McuI2c, DEFAULT_SPEED};
+#[cfg(test)]
+pub(crate) use pin::chip_report;
 pub(crate) use pin::pin_number;
 pub use pin::{McuChip, McuDigitalOut};
 pub use pwm::McuPwm;

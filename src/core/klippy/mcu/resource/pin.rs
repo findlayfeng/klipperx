@@ -173,10 +173,75 @@ impl TrsyncChip {
     }
 }
 
+/// TEMP instrumentation (U-TH-1A): one chip's shared parts, kept weak, so the
+/// refcounts of a chip that outlived its machine can be read after the fact.
+#[cfg(test)]
+struct ChipProbe {
+    case: u64,
+    config: Weak<ConfigBuilder>,
+    mcu_slot: Weak<Mutex<Option<Arc<Mcu>>>>,
+    clock_slot: Weak<Mutex<Option<Arc<McuClock>>>>,
+    trsync: Weak<TrsyncRegistry>,
+    adc: Weak<AdcRegistry>,
+    pins: Weak<PrinterPins>,
+}
+
+/// TEMP instrumentation (U-TH-1A): every chip ever built (weak parts only).
+#[cfg(test)]
+static CHIP_REG: Mutex<Vec<ChipProbe>> = Mutex::new(Vec::new());
+
+/// TEMP instrumentation (U-TH-1A): record `chip`'s parts for [`chip_report`].
+#[cfg(test)]
+fn register_chip(chip: &McuChip, pins: &Arc<PrinterPins>) {
+    let case = crate::core::klippy::mcu::MCU_CASE.load(std::sync::atomic::Ordering::SeqCst);
+    CHIP_REG
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .push(ChipProbe {
+            case,
+            config: Arc::downgrade(&chip.config),
+            mcu_slot: Arc::downgrade(&chip.mcu),
+            clock_slot: Arc::downgrade(&chip.clock),
+            trsync: Arc::downgrade(&chip.trsync_registry),
+            adc: Arc::downgrade(&chip.adc_registry),
+            pins: Arc::downgrade(pins),
+        });
+}
+
+/// TEMP instrumentation (U-TH-1A): for every chip still holding any part,
+/// `(case, [config, mcu slot, clock slot, trsync, adc, pins] refcounts)`.
+#[cfg(test)]
+pub(crate) fn chip_report() -> Vec<(u64, [usize; 6])> {
+    fn count<T>(weak: &Weak<T>) -> usize {
+        weak.upgrade()
+            .map(|arc| Arc::strong_count(&arc))
+            .unwrap_or(0)
+    }
+    CHIP_REG
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .map(|probe| {
+            (
+                probe.case,
+                [
+                    count(&probe.config),
+                    count(&probe.mcu_slot),
+                    count(&probe.clock_slot),
+                    count(&probe.trsync),
+                    count(&probe.adc),
+                    count(&probe.pins),
+                ],
+            )
+        })
+        .filter(|(_, counts)| counts.iter().any(|c| *c > 0))
+        .collect()
+}
+
 impl McuChip {
     /// A chip for `name`, not yet connected.
     pub fn new(name: String, config: Arc<ConfigBuilder>, pins: Arc<PrinterPins>) -> Self {
-        Self {
+        let chip = Self {
             name,
             config,
             pins: Arc::downgrade(&pins),
@@ -186,7 +251,10 @@ impl McuChip {
             print_time_offset: Arc::new(Mutex::new(0.0)),
             print_time_freq: Arc::new(Mutex::new(0.0)),
             trsync_registry: Arc::new(TrsyncRegistry::new()),
-        }
+        };
+        #[cfg(test)]
+        register_chip(&chip, &pins);
+        chip
     }
 
     /// The MCU's own name (`mcu`, or the sub of `[mcu <name>]`).

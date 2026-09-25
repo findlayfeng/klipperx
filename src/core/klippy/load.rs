@@ -395,7 +395,10 @@ mod tests {
                 "stepper_y",
                 "stepper_z",
                 "dual_carriage",
-                "printer"
+                "printer",
+                // The G28 wrapper takes the toolhead's handler away, so it has
+                // to load after `[printer]` (`order = 70` against `60`).
+                "safe_z_home"
             ]
         );
         // `mcu` is the one up-front section (upstream loads `pins` and `mcu`

@@ -9,7 +9,6 @@
 | `canbus_interface` | CAN 网络接口名 | 可选，默认 `can0` |
 | `canbus_nodeid` | CAN 节点号（1..895） | klipperx 需要显式给出（Klipper 由 `[canbus_ids]` 分配）；配 `canbus_uuid` 一起用 |
 | `host_library` | klipper host 库（`libklipper_host.so`）的路径 | 在主机进程内运行一份 klipper 固件（模拟与自测用） |
-| `test` | 每行 `输入帧 输出帧...`（十六进制） | 仅测试构建可用，供单元测试脚本化一个假设备 |
 
 ```ini
 [mcu]
@@ -23,9 +22,6 @@ canbus_nodeid: 2
 
 [mcu simulated]
 host_library: /usr/local/lib/libklipper_host.so
-
-[mcu fake]
-test: 06 10 05 00 00 7e
 ```
 
 节名取自节的 sub（`[mcu zboard]` → `zboard`）。串口按 raw 模式打开：不回显、不做 CR/LF 转换、不启用协议没用到的流控。`restart_method` 见下面的[固件重启方式](#固件重启方式restart_method)。

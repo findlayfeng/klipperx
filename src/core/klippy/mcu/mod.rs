@@ -385,11 +385,162 @@ struct Wire {
 /// blocks back on the wire, and the ceiling the wait backs off to.
 ///
 /// Upstream computes its retransmit timeout from round-trip samples
-/// (`serialqueue.c:225-240`, clamped to these same 25 ms / 5 s). This host has
-/// no RTT estimate, so it starts at the floor and doubles on every timeout —
-/// which is what upstream does to a timeout as well (`:456-460`).
+/// (`serialqueue.c:218-237`, clamped to these same 25 ms / 5 s). This host
+/// keeps those same samples — see [`RttEstimator`] — but the wait itself still
+/// starts at the floor and doubles on every timeout, which is what upstream
+/// does to a timeout as well (`:456-460`).
 const MIN_RTO: Duration = Duration::from_millis(25);
 const MAX_RTO: Duration = Duration::from_secs(5);
+
+/// A round trip longer than this gets the log's attention.
+///
+/// 25 ms is [`MIN_RTO`], the floor the retransmit timeout is clamped to
+/// (`serialqueue.c:233-234`): a line whose round trip outlasts that floor
+/// expires the timer before the answer can arrive, so blocks that were never
+/// lost go back on the wire.
+///
+/// One warning at the session's first crossing, then one per doubling of the
+/// value that warned (see [`RttWarnState`]) — a line that sits just over the
+/// threshold would otherwise log every sample.
+const RTT_WARN_THRESHOLD: Duration = MIN_RTO;
+
+/// The least the four deviations may add to the smoothed round trip when the
+/// timeout is derived from the estimate (`serialqueue.c:229-231`,
+/// `rttvar4 < 0.001` → `0.001`): a line that has settled has a near-zero
+/// variance, and the timeout still has to cover the jitter that number cannot
+/// see.
+const RTTVAR_FLOOR: Duration = Duration::from_millis(1);
+
+/// One block that went out and is waiting for its answer.
+#[derive(Debug)]
+struct InFlightBlock {
+    /// The block's sequence number, unwrapped (see [`Wire`]).
+    seq: u64,
+    /// The frame exactly as it went out: a retransmit sends it again as it is,
+    /// sequence and all (see [`Sender::resend_block`]).
+    frame: Frame,
+    /// When the write completed — the start of the round trip an ack covering
+    /// this block closes (see [`RttEstimator`]).
+    sent_at: Instant,
+}
+
+/// The connection's round-trip estimate, fed from the blocks above
+/// (`third_party/klipper/klippy/chelper/serialqueue.c:218-237`).
+///
+/// A **sample** is one round trip: the moment a block finished going out to
+/// the moment an ack covering it came back. Upstream measures exactly that
+/// (`:525` stamps `receive_time` when the block is built, `:209` reads it back
+/// for the ack that answers the block, `:218-219` decides a sample is due),
+/// and throws the sample away if the block had to be retransmitted first
+/// (`:463`, `rtt_sample_seq = 0`) — a resent block measures the line, not the
+/// traffic on it.
+///
+/// The estimator itself is pure: [`rtt_step`] and [`rtt_rto`] do the
+/// arithmetic, [`RttEstimator::record`] only stores what they return. The
+/// retransmit wait ([`Sender::rto`]) does **not** consume it yet; the estimate
+/// is collected here, warned about here, and read through the accessors on
+/// [`Sender`].
+#[derive(Debug)]
+struct RttEstimator {
+    /// The most recent sample, `None` until the first one: the raw
+    /// measurement, as opposed to the smoothed value below.
+    last_sample: Option<Duration>,
+    /// The smoothed round trip (`srtt`), `None` until the first sample.
+    srtt: Option<Duration>,
+    /// The mean deviation (`rttvar`), zero until the first sample.
+    rttvar: Duration,
+    /// What the estimate says a retransmit timeout should be, clamped to
+    /// [`MIN_RTO`]..=[`MAX_RTO`] as upstream clamps its own.
+    rto: Duration,
+}
+
+impl RttEstimator {
+    fn new() -> Self {
+        Self {
+            last_sample: None,
+            srtt: None,
+            rttvar: Duration::ZERO,
+            rto: MIN_RTO,
+        }
+    }
+
+    /// Take one round trip into the estimate.
+    fn record(&mut self, sample: Duration) {
+        let (srtt, rttvar) = rtt_step(self.srtt, self.rttvar, sample);
+        self.last_sample = Some(sample);
+        self.srtt = Some(srtt);
+        self.rttvar = rttvar;
+        self.rto = rtt_rto(srtt, rttvar);
+    }
+}
+
+/// One step of the estimate over a sample, returning the new `(srtt, rttvar)`
+/// (`serialqueue.c:222-227`).
+///
+/// The first sample starts deliberately conservatively — upstream's
+/// `srtt = delta * 10.0`, commented "use a higher start default" — so a single
+/// lucky sample on a fresh connection cannot send the estimate straight to the
+/// floor. Later samples smooth: the deviation keeps three quarters of itself
+/// plus a quarter of the new error, the average seven eighths of itself plus
+/// one eighth of the sample.
+fn rtt_step(srtt: Option<Duration>, rttvar: Duration, sample: Duration) -> (Duration, Duration) {
+    match srtt {
+        None => (sample * 10, sample / 2),
+        Some(srtt) => {
+            // `|srtt − δ|`, without a subtraction that could go negative.
+            let diff = if srtt >= sample {
+                srtt - sample
+            } else {
+                sample - srtt
+            };
+            ((srtt * 7 + sample) / 8, (rttvar * 3 + diff) / 4)
+        }
+    }
+}
+
+/// The retransmit timeout an `(srtt, rttvar)` pair implies
+/// (`serialqueue.c:229-236`): the smoothed round trip plus four deviations —
+/// never less than [`RTTVAR_FLOOR`], never outside [`MIN_RTO`]..=[`MAX_RTO`].
+fn rtt_rto(srtt: Duration, rttvar: Duration) -> Duration {
+    (srtt + (rttvar * 4).max(RTTVAR_FLOOR)).clamp(MIN_RTO, MAX_RTO)
+}
+
+/// Whether a round trip still deserves the log's attention
+/// (see [`RTT_WARN_THRESHOLD`]).
+///
+/// One warning at the first crossing, then one per doubling of the value that
+/// warned: a line that stays just over the threshold logs once, and one that
+/// keeps getting worse logs again only once it has got twice as bad.
+#[derive(Debug, Default)]
+struct RttWarnState {
+    /// The round trip that last warned; twice it is the next bar.
+    warned_at: Option<Duration>,
+}
+
+impl RttWarnState {
+    /// Whether `new_rtt` crosses the bar. The first crossing always does; a
+    /// later one only when it has doubled since the last warning. Dropping
+    /// back under the threshold re-arms nothing, so coming back up short of a
+    /// doubling stays quiet.
+    fn should_warn(&mut self, new_rtt: Duration) -> bool {
+        if new_rtt <= RTT_WARN_THRESHOLD {
+            return false;
+        }
+        match self.warned_at {
+            None => self.warned_at = Some(new_rtt),
+            Some(warned) if new_rtt >= warned * 2 => self.warned_at = Some(new_rtt),
+            Some(_) => return false,
+        }
+        true
+    }
+}
+
+/// The warning text: the measured round trip and where to look first.
+fn rtt_warn_message(sample: Duration) -> String {
+    format!(
+        "RTT {sample:?} 超过 {RTT_WARN_THRESHOLD:?} 阈值：检查串口桥延迟 latency_timer / 波特率 / 线缆"
+    )
+}
 
 /// The send task's side of a connection.
 ///
@@ -400,8 +551,20 @@ struct Sender {
     wire: Arc<Wire>,
     /// Blocks that went out and have not been answered, oldest first. Their
     /// payloads are what a nak — or a number from an earlier session — has to put
-    /// back on the wire.
-    in_flight: VecDeque<(u64, Frame)>,
+    /// back on the wire, and their write times are where a round trip starts
+    /// (see [`RttEstimator`]).
+    in_flight: VecDeque<InFlightBlock>,
+    /// The block whose ack closes the next round-trip sample: set to the first
+    /// block written while no sample is pending, dropped when that ack arrives
+    /// or as soon as anything is retransmitted. Upstream's `rtt_sample_seq`
+    /// (`serialqueue.c:528-529`, consumed at `:237`, dropped at `:463`) — the
+    /// drop is the point: a block that had to be sent again measures the
+    /// retransmit, not the line.
+    sample_seq: Option<u64>,
+    /// The round-trip estimate built from the blocks above, and whether this
+    /// session has warned about it yet (see [`RTT_WARN_THRESHOLD`]).
+    rtt: RttEstimator,
+    rtt_warn: RttWarnState,
     /// The last ack/nak this connection acted on, and the value a retransmit has
     /// already been done for: the firmware repeats its ack/nak for as long as it
     /// waits, and one retransmit per value is what upstream allows
@@ -421,6 +584,9 @@ impl Sender {
         Self {
             wire,
             in_flight: VecDeque::new(),
+            sample_seq: None,
+            rtt: RttEstimator::new(),
+            rtt_warn: RttWarnState::default(),
             acked: None,
             retransmitted: None,
             rto: MIN_RTO,
@@ -444,6 +610,33 @@ impl Sender {
         self.in_flight.len() >= MAX_PENDING_BLOCKS
     }
 
+    /// The most recent round trip measured on this connection, `None` until the
+    /// first one lands.
+    ///
+    /// Read-only: the send task is the only writer. Nothing consumes it yet —
+    /// it is exposed for the units that will wire the estimate into the
+    /// retransmit timer and the send deadline.
+    fn rtt(&self) -> Option<Duration> {
+        self.rtt.last_sample
+    }
+
+    /// The smoothed round trip (`srtt`), `None` until the first sample lands.
+    ///
+    /// Read-only, like [`Sender::rtt`]: upstream derives its retransmit
+    /// timeout from this and the deviation (`serialqueue.c:229-236`).
+    fn srtt(&self) -> Option<Duration> {
+        self.rtt.srtt
+    }
+
+    /// The retransmit timeout the estimate implies, already clamped to
+    /// [`MIN_RTO`]..=[`MAX_RTO`].
+    ///
+    /// Read-only, like [`Sender::rtt`]. It is **not** what [`Sender::rto`]
+    /// waits out today: that wait still starts at the floor and doubles.
+    fn estimated_rto(&self) -> Duration {
+        self.rtt.rto
+    }
+
     /// Put one block on the wire, carrying the sequence this connection is at, and
     /// remember it until the firmware answers it.
     async fn send_block(&mut self, interface: &Interface, payload: Vec<u8>) {
@@ -463,7 +656,19 @@ impl Sender {
         self.wire.next.store(seq + 1, Ordering::Relaxed);
         match interface.send(frame.clone()).await {
             Ok(()) => {
-                self.in_flight.push_back((seq, frame));
+                // The round trip starts when the block is fully out
+                // (`serialqueue.c:525`, `receive_time`).
+                let sent_at = Instant::now();
+                self.in_flight.push_back(InFlightBlock {
+                    seq,
+                    frame,
+                    sent_at,
+                });
+                // The first block written while nothing is pinned is what the
+                // next sample is measured against (`serialqueue.c:528-529`).
+                if self.sample_seq.is_none() {
+                    self.sample_seq = Some(seq);
+                }
                 self.arm_retransmit();
             }
             Err(e) => {
@@ -483,7 +688,16 @@ impl Sender {
         match interface.send(frame.clone()).await {
             Ok(()) => {
                 debug!("Block {seq} sent again");
-                self.in_flight.push_back((seq, frame));
+                self.in_flight.push_back(InFlightBlock {
+                    seq,
+                    frame,
+                    sent_at: Instant::now(),
+                });
+                // Whatever round trip was in progress is over: a block that had
+                // to be put back on the wire measures the retransmit, not the
+                // line, so the pinned sample dies with it
+                // (`serialqueue.c:463`, `rtt_sample_seq = 0`).
+                self.sample_seq = None;
                 self.arm_retransmit();
             }
             Err(e) => error!("Retransmit failed (seq={}): {e}", frame.seq()),
@@ -498,7 +712,7 @@ impl Sender {
     /// keep their sequences so the firmware, which is waiting for the oldest,
     /// takes them in order.
     async fn retransmit(&mut self, interface: &Interface) {
-        let again: Vec<(u64, Frame)> = self.in_flight.drain(..).collect();
+        let again: Vec<InFlightBlock> = self.in_flight.drain(..).collect();
         self.retransmit_at = None;
         if again.is_empty() {
             return;
@@ -507,8 +721,8 @@ impl Sender {
             "No answer for {} in-flight block(s); retransmitting",
             again.len()
         );
-        for (seq, frame) in again {
-            self.resend_block(interface, seq, frame).await;
+        for block in again {
+            self.resend_block(interface, block.seq, block.frame).await;
         }
         self.rto = (self.rto * 2).min(MAX_RTO);
     }
@@ -549,18 +763,27 @@ impl Sender {
             self.wire.next.store(seen, Ordering::Relaxed);
             self.acked = None;
             self.retransmitted = None;
-            let again: Vec<(u64, Frame)> = self.in_flight.drain(..).collect();
-            for (_, frame) in again {
-                self.send_block(interface, frame.payload().to_vec()).await;
+            // The pinned sample belongs to the window being abandoned; the blocks
+            // go out again under the adopted numbers, and the first of those
+            // writes pins the next one.
+            self.sample_seq = None;
+            let again: Vec<InFlightBlock> = self.in_flight.drain(..).collect();
+            for block in again {
+                self.send_block(interface, block.frame.payload().to_vec())
+                    .await;
             }
             return;
         }
 
         // The numbering is shared, so the firmware's counter says which blocks it
-        // took: everything below it.
-        while self.in_flight.front().is_some_and(|(seq, _)| *seq < seen) {
-            let (seq, _) = self.in_flight.pop_front().expect("checked just above");
-            debug!("Block {seq} acknowledged");
+        // took: everything below it. The last of them is the block this ack
+        // directly answers, so its write time is where the round trip it closes
+        // began (`serialqueue.c:209`, `last_receive_sent_time`).
+        let mut acked_tx: Option<Instant> = None;
+        while self.in_flight.front().is_some_and(|block| block.seq < seen) {
+            let block = self.in_flight.pop_front().expect("checked just above");
+            debug!("Block {} acknowledged", block.seq);
+            acked_tx = Some(block.sent_at);
         }
         if self.in_flight.is_empty() {
             // Everything is answered, so there is nothing to retransmit and the
@@ -569,15 +792,35 @@ impl Sender {
             self.rto = MIN_RTO;
         }
 
+        // One sample per pinned block, and only if the ack actually covers it
+        // (`serialqueue.c:218-219`): a sample is a round trip, so it needs both
+        // ends — the write just popped and the ack that came in now.
+        if let (Some(anchor), Some(sent_at)) = (self.sample_seq, acked_tx) {
+            if seen > anchor {
+                self.sample_seq = None;
+                let sample = Instant::now().saturating_duration_since(sent_at);
+                self.rtt.record(sample);
+                if self.rtt_warn.should_warn(sample) {
+                    warn!("{}", rtt_warn_message(sample));
+                }
+                debug!(
+                    "Round trip {:?}: srtt {:?}, estimated rto {:?}",
+                    self.rtt(),
+                    self.srtt(),
+                    self.estimated_rto()
+                );
+            }
+        }
+
         match self.acked {
             Some(previous) if seen <= previous => {
                 // The firmware saying the same thing again is a nak
                 // (`serialqueue.c:291-293`): what it is waiting for never arrived.
                 if self.retransmitted != Some(seen) {
                     self.retransmitted = Some(seen);
-                    let again: Vec<(u64, Frame)> = self.in_flight.drain(..).collect();
-                    for (seq, frame) in again {
-                        self.resend_block(interface, seq, frame).await;
+                    let again: Vec<InFlightBlock> = self.in_flight.drain(..).collect();
+                    for block in again {
+                        self.resend_block(interface, block.seq, block.frame).await;
                     }
                 }
             }
@@ -614,6 +857,8 @@ impl Sender {
         self.retransmit_at = None;
         self.acked = None;
         self.retransmitted = None;
+        // What was pinned belonged to the abandoned window.
+        self.sample_seq = None;
         self.rto = MIN_RTO;
     }
 }
@@ -1452,6 +1697,15 @@ mod tests {
         Frame::new(seq, payload.to_vec())
     }
 
+    /// A block the way [`Sender::in_flight`] keeps it: written out, unanswered.
+    fn in_flight_block(seq: u64, frame: Frame) -> InFlightBlock {
+        InFlightBlock {
+            seq,
+            frame,
+            sent_at: Instant::now(),
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Mcu creation
     // -----------------------------------------------------------------------
@@ -1962,10 +2216,13 @@ mod tests {
         wire.next.store(2, Ordering::Relaxed);
         wire.seen.store(1, Ordering::Relaxed);
         let mut sender = Sender::new(Arc::clone(&wire));
-        sender.in_flight.push_back((0, make_frame(0, &[5])));
+        sender
+            .in_flight
+            .push_back(in_flight_block(0, make_frame(0, &[5])));
         sender.acked = Some(2);
         sender.retransmitted = Some(2);
         sender.rto = Duration::from_secs(1);
+        sender.sample_seq = Some(0);
         sender.arm_retransmit();
 
         sender.renumber_to_firmware();
@@ -1986,6 +2243,251 @@ mod tests {
         assert_eq!(sender.rto, MIN_RTO, "the wait starts over");
         assert!(sender.acked.is_none());
         assert!(sender.retransmitted.is_none());
+        assert!(
+            sender.sample_seq.is_none(),
+            "the pinned sample belonged to the abandoned window"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // RTT estimation and the over-threshold warning
+    //
+    // `serialqueue.c:218-237`: one sample per acknowledged block, an
+    // RFC6298-style smoothing that starts conservatively, and a timeout
+    // derived from both and clamped to [MIN_RTO, MAX_RTO].
+    // -----------------------------------------------------------------------
+
+    /// The first sample starts the way upstream starts it
+    /// (`serialqueue.c:222-224`, "use a higher start default"): `srtt` at ten
+    /// times the sample, `rttvar` at half of it, and a timeout that is the sum
+    /// of the smoothed value and four deviations.
+    #[test]
+    fn test_rtt_first_sample_starts_conservatively() {
+        let (srtt, rttvar) = rtt_step(None, Duration::ZERO, Duration::from_millis(4));
+
+        assert_eq!(srtt, Duration::from_millis(40), "srtt = δ × 10");
+        assert_eq!(rttvar, Duration::from_millis(2), "rttvar = δ / 2");
+        assert_eq!(
+            rtt_rto(srtt, rttvar),
+            Duration::from_millis(48),
+            "rto = 40 ms + 4 × 2 ms"
+        );
+    }
+
+    /// Every later sample smooths (`serialqueue.c:226-227`): the deviation
+    /// keeps three quarters of itself plus a quarter of the new error, the
+    /// smoothed value seven eighths of itself plus one eighth of the sample —
+    /// from either side of it.
+    #[test]
+    fn test_rtt_later_samples_smooth_from_both_sides() {
+        // δ below srtt: rttvar = (3 × 5 ms + 80 ms) / 4, srtt = (7 × 100 ms + 20 ms) / 8.
+        let (srtt, rttvar) = rtt_step(
+            Some(Duration::from_millis(100)),
+            Duration::from_millis(5),
+            Duration::from_millis(20),
+        );
+        assert_eq!(srtt, Duration::from_millis(90));
+        assert_eq!(rttvar, Duration::from_micros(23_750), "23.75 ms");
+        assert_eq!(
+            rtt_rto(srtt, rttvar),
+            Duration::from_millis(185),
+            "90 ms + 4 × 23.75 ms"
+        );
+
+        // δ above srtt: the error is |10 ms − 30 ms|, and srtt rises.
+        let (srtt, rttvar) = rtt_step(
+            Some(Duration::from_millis(10)),
+            Duration::from_millis(4),
+            Duration::from_millis(30),
+        );
+        assert_eq!(srtt, Duration::from_micros(12_500), "12.5 ms");
+        assert_eq!(rttvar, Duration::from_millis(8), "(3 × 4 ms + 20 ms) / 4");
+    }
+
+    /// Four deviations may never add less than a millisecond
+    /// (`serialqueue.c:229-231`), and above that they are counted as they are.
+    #[test]
+    fn test_rtt_rto_keeps_the_1ms_variance_floor() {
+        assert_eq!(
+            rtt_rto(Duration::from_millis(30), Duration::from_micros(100)),
+            Duration::from_millis(31),
+            "4 × 100 µs is under the floor, so the floor applies"
+        );
+        assert_eq!(
+            rtt_rto(Duration::from_millis(30), Duration::from_millis(2)),
+            Duration::from_millis(38),
+            "4 × 2 ms is over the floor, so it counts"
+        );
+    }
+
+    /// The estimate's timeout stays inside the two constants — which are the
+    /// same 25 ms / 5 s upstream clamps to (`serialqueue.c:107-108`), and are
+    /// not moved by any of this.
+    #[test]
+    fn test_rtt_rto_is_clamped_to_the_bounds() {
+        assert_eq!(MIN_RTO, Duration::from_millis(25));
+        assert_eq!(MAX_RTO, Duration::from_secs(5));
+        assert_eq!(
+            rtt_rto(Duration::from_millis(10), Duration::ZERO),
+            MIN_RTO,
+            "an estimate below the floor is raised to it"
+        );
+        assert_eq!(
+            rtt_rto(Duration::from_secs(10), Duration::from_secs(5)),
+            MAX_RTO,
+            "an estimate above the ceiling is lowered to it"
+        );
+    }
+
+    /// Recording keeps the sample as well as the smoothed value, and derives
+    /// the clamped timeout from each pair — what [`Sender::rtt`],
+    /// [`Sender::srtt`] and [`Sender::estimated_rto`] hand out.
+    #[test]
+    fn test_rtt_estimator_records_samples_and_derives_the_timeout() {
+        let mut estimator = RttEstimator::new();
+        assert_eq!(estimator.last_sample, None, "no sample to begin with");
+        assert_eq!(estimator.srtt, None, "no estimate to begin with");
+        assert_eq!(estimator.rto, MIN_RTO, "the wait starts at the floor");
+
+        estimator.record(Duration::from_millis(5));
+        assert_eq!(estimator.last_sample, Some(Duration::from_millis(5)));
+        assert_eq!(estimator.srtt, Some(Duration::from_millis(50)));
+        assert_eq!(estimator.rttvar, Duration::from_micros(2_500));
+
+        estimator.record(Duration::from_millis(7));
+        // srtt = (7 × 50 ms + 7 ms) / 8 = 44.625 ms,
+        // rttvar = (3 × 2.5 ms + |50 ms − 7 ms|) / 4 = 12.625 ms,
+        // rto = 44.625 ms + 50.5 ms = 95.125 ms.
+        assert_eq!(estimator.last_sample, Some(Duration::from_millis(7)));
+        assert_eq!(estimator.srtt, Some(Duration::from_micros(44_625)));
+        assert_eq!(estimator.rttvar, Duration::from_micros(12_625));
+        assert_eq!(estimator.rto, Duration::from_micros(95_125));
+    }
+
+    /// The first round trip over the threshold warns once, and only a doubling
+    /// of the value that warned warns again.
+    #[test]
+    fn test_rtt_warn_fires_once_per_crossing_and_once_per_doubling() {
+        let mut state = RttWarnState::default();
+        assert!(
+            !state.should_warn(Duration::from_millis(25)),
+            "the threshold itself is not over it"
+        );
+        assert!(!state.should_warn(Duration::from_millis(24)), "under it");
+        assert!(
+            state.should_warn(Duration::from_millis(26)),
+            "the first crossing warns"
+        );
+        assert!(
+            !state.should_warn(Duration::from_millis(30)),
+            "the same crossing does not warn again"
+        );
+        assert!(
+            state.should_warn(Duration::from_millis(52)),
+            "twice the value that warned"
+        );
+        assert!(
+            !state.should_warn(Duration::from_millis(53)),
+            "and then quiet again"
+        );
+    }
+
+    /// Falling back under the threshold re-arms nothing: coming back up short
+    /// of a doubling of the value that warned stays quiet.
+    #[test]
+    fn test_rtt_warn_stays_quiet_after_a_drop_below_a_doubling() {
+        let mut state = RttWarnState::default();
+        assert!(state.should_warn(Duration::from_millis(30)));
+        assert!(!state.should_warn(Duration::from_millis(2)), "back under");
+        assert!(
+            !state.should_warn(Duration::from_millis(40)),
+            "40 ms is not twice 30 ms"
+        );
+        assert!(!state.should_warn(Duration::from_millis(59)));
+        assert!(
+            state.should_warn(Duration::from_millis(60)),
+            "60 ms is twice 30 ms"
+        );
+    }
+
+    /// The warning carries what was measured and where to look first.
+    #[test]
+    fn test_rtt_warn_message_carries_the_value_and_the_hint() {
+        let message = rtt_warn_message(Duration::from_millis(31));
+
+        assert!(message.contains("RTT 31ms"), "{message}");
+        assert!(
+            message.contains(&format!("{RTT_WARN_THRESHOLD:?}")),
+            "the threshold itself ({RTT_WARN_THRESHOLD:?}): {message}"
+        );
+        assert!(message.contains("latency_timer"), "{message}");
+    }
+
+    /// An ack that covers a block nobody had to resend closes a round trip:
+    /// the sample lands in the estimate and the accessors hand it out.
+    #[tokio::test]
+    async fn test_an_ack_without_a_retransmit_yields_a_sample() {
+        let device = FrameMock::new(vec![MappingEntry {
+            input: make_frame(0, &[5]),
+            outputs: vec![],
+        }]);
+        let interface = Interface::new(device);
+        let mut sender = Sender::new(Arc::new(Wire::default()));
+
+        sender.send_block(&interface, vec![5]).await;
+        assert_eq!(
+            sender.sample_seq,
+            Some(0),
+            "the block on the wire pins the next sample"
+        );
+        assert_eq!(sender.rtt(), None, "nothing measured yet");
+
+        sender.settle(&interface, 1).await;
+
+        assert!(
+            sender.rtt().is_some(),
+            "the ack closes the round trip the block started"
+        );
+        assert!(sender.srtt().is_some());
+        assert!(
+            sender.sample_seq.is_none(),
+            "one sample per pinned block, as upstream consumes it"
+        );
+    }
+
+    /// A block that had to be retransmitted measures the retransmit, not the
+    /// line: the pin dies with it (`serialqueue.c:463`), so the ack that
+    /// finally arrives yields no sample.
+    #[tokio::test]
+    async fn test_a_retransmit_invalidates_the_pinned_sample() {
+        // Two mappings for the same frame: the original and the retransmit.
+        let device = FrameMock::new(vec![
+            MappingEntry {
+                input: make_frame(0, &[5]),
+                outputs: vec![],
+            },
+            MappingEntry {
+                input: make_frame(0, &[5]),
+                outputs: vec![],
+            },
+        ]);
+        let interface = Interface::new(device);
+        let mut sender = Sender::new(Arc::new(Wire::default()));
+
+        sender.send_block(&interface, vec![5]).await;
+        sender.retransmit(&interface).await;
+        assert!(
+            sender.sample_seq.is_none(),
+            "a retransmit throws the pinned sample away"
+        );
+
+        sender.settle(&interface, 1).await;
+
+        assert!(
+            sender.rtt().is_none(),
+            "no sample from a block that went out twice"
+        );
+        assert!(sender.srtt().is_none());
     }
 
     // -----------------------------------------------------------------------

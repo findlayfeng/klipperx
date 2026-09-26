@@ -16,8 +16,8 @@
 //!
 //! # Known gaps
 //!
-//! * `sensor_type` accepts all five upstream chips, but only `hx711` and
-//!   `hx717` are built here — `ads1220` / `ads131m02` / `ads131m04` report
+//! * `sensor_type` accepts all five upstream chips, but only `hx711`,
+//!   `hx717` and `ads1220` are built here — `ads131m02` / `ads131m04` report
 //!   *not implemented* (LC-3).
 //! * The four `LOAD_CELL_*` commands are registered with upstream's help
 //!   strings but answer *not implemented*: they need the sample collector
@@ -37,6 +37,7 @@ use crate::core::klippy::api::webhooks;
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
 use crate::core::klippy::error::KlippyError;
 use crate::core::klippy::event::KlippyEvent;
+use crate::core::klippy::extras::ads1220::Ads1220;
 use crate::core::klippy::extras::bulk_sensor::ClientCb;
 use crate::core::klippy::extras::hx71x::{params_for, Hx71x};
 use crate::core::klippy::gcode::{
@@ -148,6 +149,62 @@ fn round(value: f64, digits: i32) -> f64 {
 // The load cell
 // ===========================================================================
 
+/// One load cell's chip (`self.sensor` — the `BulkSensorAdc` upstream swaps
+/// per `sensor_type`).
+///
+/// Each variant owns its own stream and implements the same interface:
+/// samples per second, saturated range, status, error naming, and the batch
+/// client registration [`LoadCellState::start_sensor_client`] uses.
+pub enum LoadSensor {
+    /// An HX711 or HX717 ([`hx71x`](crate::core::klippy::extras::hx71x)).
+    Hx71x(Arc<Hx71x>),
+    /// An ADS1220 ([`ads1220`](crate::core::klippy::extras::ads1220)).
+    Ads1220(Arc<Ads1220>),
+}
+
+impl LoadSensor {
+    /// Samples per second the chip streams (`get_samples_per_second`).
+    pub fn samples_per_second(&self) -> i64 {
+        match self {
+            Self::Hx71x(sensor) => sensor.samples_per_second(),
+            Self::Ads1220(sensor) => sensor.samples_per_second(),
+        }
+    }
+
+    /// The saturated bounds of the chip's samples (`get_range`).
+    pub fn range(&self) -> (i64, i64) {
+        match self {
+            Self::Hx71x(sensor) => sensor.range(),
+            Self::Ads1220(sensor) => sensor.range(),
+        }
+    }
+
+    /// The chip's own counters (`get_status`).
+    pub fn status(&self, eventtime: f64) -> Value {
+        match self {
+            Self::Hx71x(sensor) => sensor.status(eventtime),
+            Self::Ads1220(sensor) => sensor.status(eventtime),
+        }
+    }
+
+    /// A firmware error's name (`lookup_sensor_error`).
+    pub fn lookup_sensor_error(&self, error_code: i64) -> String {
+        match self {
+            Self::Hx71x(sensor) => sensor.lookup_sensor_error(error_code),
+            Self::Ads1220(sensor) => sensor.lookup_sensor_error(error_code),
+        }
+    }
+
+    /// Register a converted-batch client with the chip
+    /// (`add_client`, the first one starts the stream).
+    pub fn add_client(&self, client: ClientCb) {
+        match self {
+            Self::Hx71x(sensor) => sensor.add_client(client),
+            Self::Ads1220(sensor) => sensor.add_client(client),
+        }
+    }
+}
+
 /// One load cell: the sensor behind it, the tare/calibration state, the force
 /// buffer, and the `dump_force` fan-out (`LoadCell`).
 pub struct LoadCell {
@@ -161,7 +218,7 @@ struct LoadCellState {
     /// The machine, for the ready handler and the events.
     printer: Weak<Printer>,
     /// The chip (`self.sensor`, the `BulkSensorAdc`).
-    sensor: Arc<Hx71x>,
+    sensor: LoadSensor,
     /// `1.` or `-1.` (`sensor_orientation`).
     invert: f64,
     /// `reference_tare_counts`, before a first tare.
@@ -197,12 +254,19 @@ impl LoadCell {
         // `load_config` reads `sensor_type` first and hands the *same*
         // section to the chip.
         let sensor_type = config.get_choice("sensor_type", &SENSOR_TYPES, None)?;
-        let params = params_for(&sensor_type).ok_or_else(|| {
-            ConfigError::new(format!(
-                "sensor_type '{sensor_type}' is not implemented in this host"
-            ))
-        })?;
-        let sensor = Arc::new(Hx71x::new(config, printer, &params)?);
+        let sensor = match sensor_type.as_str() {
+            "hx711" | "hx717" => {
+                let params = params_for(&sensor_type)
+                    .expect("the hx71x branch covers exactly its own sensor types");
+                LoadSensor::Hx71x(Arc::new(Hx71x::new(config, printer, &params)?))
+            }
+            "ads1220" => LoadSensor::Ads1220(Arc::new(Ads1220::new(config, printer)?)),
+            other => {
+                return Err(ConfigError::new(format!(
+                    "sensor_type '{other}' is not implemented in this host"
+                )));
+            }
+        };
 
         // The cell's own options, in upstream's order.
         let reference_tare_counts = config.get_optional_int("reference_tare_counts")?;
@@ -300,7 +364,7 @@ impl LoadCell {
     }
 
     /// The chip behind this cell (`get_sensor`).
-    pub fn sensor(&self) -> &Arc<Hx71x> {
+    pub fn sensor(&self) -> &LoadSensor {
         &self.state.sensor
     }
 
@@ -361,6 +425,17 @@ impl LoadCell {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .push(client);
+    }
+
+    /// How many converted-batch clients are registered (tests and
+    /// bookkeeping).
+    #[cfg(test)]
+    pub(crate) fn client_count(&self) -> usize {
+        self.state
+            .clients
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .len()
     }
 }
 
@@ -705,21 +780,51 @@ mod tests {
                 Err(err) => refused.push((sect.identifier(), err.to_string())),
             }
         }
-        // Both hx71x cells load; the two ADS chips are the LC-3 gap.
+        // Both hx71x cells and the ADS1220 cell load; the remaining ADS chip
+        // is the LC-3 gap.
         assert_eq!(
             loaded,
-            ["load_cell my_hx711", "load_cell my_hx717"],
-            "the hx71x cells of {path:?}"
+            [
+                "load_cell my_ads1220",
+                "load_cell my_hx711",
+                "load_cell my_hx717"
+            ],
+            "the implemented cells of {path:?}"
         );
         let refused: Vec<&str> = refused.iter().map(|(_, err)| err.as_str()).collect();
         assert_eq!(
             refused,
-            [
-                "sensor_type 'ads1220' is not implemented in this host",
-                "sensor_type 'ads131m02' is not implemented in this host",
-            ],
+            ["sensor_type 'ads131m02' is not implemented in this host"],
             "the ADS cells report the chip gap"
         );
+    }
+
+    #[tokio::test]
+    async fn test_an_ads1220_cell_attaches_its_sensor_to_the_bulk_stream() {
+        // The corpus options for `[load_cell my_ads1220]`.
+        let printer = printer();
+        let cell = LoadCell::new(
+            &wrap(
+                Some("my_ads1220"),
+                &[
+                    ("sensor_type", "ads1220"),
+                    ("cs_pin", "PA0"),
+                    ("data_ready_pin", "PA1"),
+                ],
+            ),
+            &printer,
+        )
+        .unwrap();
+        assert_eq!(cell.sensor().samples_per_second(), 660);
+        // `klippy:ready` → `_handle_do_ready` → `sensor.add_client`, which is
+        // the chip's pass-through to `BatchBulkHelper` (the spawned batch loop
+        // has not been polled yet, so the count is that registration).
+        cell.connect().await.unwrap();
+        let LoadSensor::Ads1220(sensor) = cell.sensor() else {
+            panic!("the cell's chip is not an ads1220");
+        };
+        assert_eq!(sensor.client_count(), 1);
+        assert_eq!(cell.client_count(), 1, "the force tracker is a client too");
     }
 
     #[test]

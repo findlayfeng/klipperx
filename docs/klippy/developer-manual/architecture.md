@@ -58,7 +58,7 @@ RUST_LOG=klipperx=trace klipperx ~/printer.cfg --tui
 
 ## 发送侧：合并批处理
 
-`Mcu::send` 只做编码与入队（`try_send`，出站通道 `SEND_QUEUE_CAPACITY` = 512；`send_payload` 剩余 ≤16 格 `SYNC_SEND_HEADROOM` 时让位等排空，给同步 `send` 常备余量），实际出站在发送任务里：
+`Mcu::send` 只做编码与入队（出站通道 `SEND_QUEUE_CAPACITY` = 512，队列满时**有界退避等待** ≤ `SYNC_SEND_WAIT` 后仍满才报错；`send_payload` 剩余 ≤16 格 `SYNC_SEND_HEADROOM` 时让位等排空，给同步 `send` 常备余量），实际出站在发送任务里：
 
 1. 阻塞等待至少一个 `Payload`；
 2. 若当前 payload 已达到 `MESSAGE_PAYLOAD_MAX * 2 / 3`（约 39 字节），立即发送；

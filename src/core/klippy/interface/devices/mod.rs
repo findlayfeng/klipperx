@@ -6,7 +6,7 @@
 //! | [`serial`] | a tty | `serial:` |
 //! | [`canserial`] | Klipper's can-serial link | `canbus_uuid:` |
 //! | [`host`] | Klipper's host library | `host_library:` |
-//! | [`frame_mock`] | a frame-level mock (test builds only) | — |
+//! | `frame_mock` | a frame-level mock (test builds only) | — |
 //! | `simulator` | a dictionary-driven fake MCU (test builds only) | `test: dict=` |
 //!
 //! The module they share — the [`Device`](super::Device) trait, the
@@ -14,6 +14,7 @@
 //! formatting they log with — stays one level up, in [`super`].
 
 pub mod canserial;
+#[cfg(test)]
 pub mod frame_mock;
 pub mod host;
 pub mod serial;

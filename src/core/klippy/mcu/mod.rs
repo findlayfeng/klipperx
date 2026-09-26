@@ -92,6 +92,7 @@ use crate::core::klippy::msg::error::MsgError;
 use crate::core::klippy::msg::parser::Parser;
 use crate::core::klippy::msg::proto::{ArgValue, Payload};
 use crate::core::klippy::msg::Msg;
+use crate::core::klippy::trace_enabled;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -1223,7 +1224,9 @@ impl Drop for Mcu {
     /// [`Interface::shutdown`] first unblocks that read; the abort then
     /// guarantees the task itself is torn down promptly.
     fn drop(&mut self) {
-        eprintln!("MCU DROP {}", self.name);
+        if trace_enabled() {
+            eprintln!("MCU DROP {}", self.name);
+        }
         self.interface.shutdown();
         if let Some(handle) = self.recv_handle.take() {
             handle.abort();

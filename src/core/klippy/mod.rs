@@ -55,3 +55,17 @@ pub use reactor::{
 // pub use mcu::{MCU, McuError, McuPin, PinParams};
 // pub use mcu::{add_printer_objects, get_printer_mcu};
 // pub use msg::proto::{ArgType, MsgParams, MsgValue, crc32, msg_params};
+
+/// Whether opt-in diagnostic tracing is enabled (`KLIPPERX_TRACE=1`).
+///
+/// The simulator and MCU teardown print trace lines (`SIM-DIAG: …`,
+/// `MCU DROP …`) that are useful when chasing a hang but are pure noise in an
+/// ordinary test run, so they are off unless the environment opts in.
+pub(crate) fn trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("KLIPPERX_TRACE")
+            .map(|value| value != "0")
+            .unwrap_or(false)
+    })
+}

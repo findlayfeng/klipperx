@@ -225,8 +225,16 @@ mod tests {
             "polar",
             "delta",
             "rotary_delta",
+            "winch",
             "deltesian",
+            "generic_cartesian",
         ];
+
+        // Sections a part claims through `ConfigWrapper::sibling` instead of a
+        // factory of its own: they are not in the factory table, but they load
+        // ([`verify_heater <heater>`] is claimed by `PrinterHeaters::setup_heater`,
+        // see `heaters.rs`), so the report must not call them gaps.
+        let sibling_ids: &[&str] = &["verify_heater"];
 
         let mut gap_frequency: BTreeMap<String, usize> = BTreeMap::new();
         let mut one_gap: Vec<String> = Vec::new();
@@ -241,7 +249,7 @@ mod tests {
                 if section.id == "include" {
                     continue;
                 }
-                if !known.contains(&section.id) {
+                if !known.contains(&section.id) && !sibling_ids.contains(&section.id.as_str()) {
                     // A numbered sibling (`[stepper_z1]`) is read by its base
                     // section's owner, not by a factory of its own
                     // (`LookupMultiRail`); treat `<known><digits>` as known.

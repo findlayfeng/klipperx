@@ -228,6 +228,8 @@ identify 的命令**定义**（名称、参数、解码）与其它命令一样�
 
 一台机器一个实例：它持有配置装载出来的 printer objects，并管理自己的生命周期（bring up、状态、停机、空闲直到退出）。对应上游 `klippy/klippy.py` 的 `Printer`，骨架与装载拆在 `printer.rs` 与 `load.rs` 两个文件。
 
+`PrinterObject::release_cycles()`：`teardown()` 在**丢弃部件之前**对每个部件调用它，用来打断「部件相互强引用」的环——环存在时 `Drop` 永远不会跑，被环拴住的 `Mcu` 会让接收任务的阻塞读一直挂着、共享 runtime 收不了尾（`McuObject` 覆写它清事件表；`Drop` 里再调一次兜底）。
+
 | 项 | 职责 |
 |------|------|
 | `Printer` | 对象注册表（`add_object` / `lookup_object` / `lookup_object_as::<T>`）、事件总线（`register_event_handler` / `send_event`，词汇见 `event/`）、状态（`get_state_message` / `invoke_shutdown`）、生命周期（`bring_up` / `teardown` / `reset_for_restart`） |
@@ -252,6 +254,9 @@ identify 的命令**定义**（名称、参数、解码）与其它命令一样�
 ### `gcode.rs` — G-Code 调度器
 
 与 `printer.rs` / `pins.rs` 平级的单文件模块：把一行 g-code 解析成命令名与参数，查命令表，运行处理器。对应上游 `klippy/gcode.py`。
+
+调度器是 `Printer::new` 建的 **host 对象**（`teardown` 特意保留它跨重启），因此它对 printer 只持 **`Weak<Printer>`**：强引用会闭成
+`printer → objects → gcode → printer` 环，整台机器（连同每个 `Mcu`）永不析构。`printer()` 因此返回 `Option<Arc<Printer>>`。
 
 | 项 | 职责 |
 |------|------|

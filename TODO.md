@@ -313,7 +313,7 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 是「对应 `.test` 从 `IGNORED` 移除后通过」**，不是「某个错误不再出现」。详见
 [失败原因分析复盘](docs/work-log/2026-09-22-upstream-regression-failures.md#复盘计数口径与重排后补)。
 
-**当前失败原因统计**（`KLIPPERX_UPSTREAM_ALL=1` 实跑，2026-09-25（批 #16 合入后）：**44 次失败**、193 次通过、
+**当前失败原因统计**（`KLIPPERX_UPSTREAM_ALL=1` 实跑，2026-09-25（批 #18 合入后）：**39 次失败**、198 次通过、
 2 条因未构建 `pru` 字典不计，合计 239；下表为**选项名大小写修复后**的分布——49 次
 `must be specified` 归零但总数不变、首因整体后移，见[复盘](docs/work-log/2026-09-22-upstream-regression-failures.md#复盘计数口径与重排后补)
 的「收益不可加」）：
@@ -336,7 +336,7 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 | `Section 'verify_heater …'` | 2 | H1 |
 | `Unknown temperature sensor`（`G2`、`Kingroon_B3950`、`NTCS0603E3104FXT`） | 3 | H1 |
 | MCU 引脚映射（`Pin 'PF1'`/`'PF7'`/`'PD6'`） | 3 | F2 |
-| 单实例（`dual_carriage` 2、`gcode_macro` 2、`led` 2；`virtual_sdcard`/`temperature_fan`/`pwm_cycle_time`/`manual_stepper`/`input_shaper`/`gcode_arcs`/`fan_generic`/`exclude_object`/`controller_fan` 各 1） | 15 | H1 / H3 / H4 / H9 / H10 |
+| 单实例（`dual_carriage` 2、`gcode_macro` 2、`led` 2；`virtual_sdcard`/`temperature_fan`/`pwm_cycle_time`/`manual_stepper`/`input_shaper`/`gcode_arcs`/`exclude_object`/`controller_fan` 各 1） | 14 | H1 / H3 / H4 / H9 / H10 |
 | 运行期失败（`Move out of range`：`generic-simulavr`） | 1 | 运行期（非装载） |
 | `Section 'extruder'`（T3 旧首位） | **0** | T3 已消 |
 
@@ -377,7 +377,7 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
       （`mcp4451` 2 + `dac084s085` 2 + `multi_pin`/`sx1509_duex`/`replicape` 各 1，H2/H7；`ad5206` 已随批 #16 转绿）、
       `bed_screws`（3，H9）、`dual_carriage`/`safe_z_home`/`gcode_macro`（各 2），以及 `virtual_sdcard`/
       `exclude_object`/`gcode_arcs`/`manual_stepper`/`pwm_cycle_time`/`led`/`input_shaper`/`temperature_fan`/
-      `fan_generic`/`controller_fan`（各 1）。`static_digital_output` 已在阶段 0 落地，`stepper_z1`（多轴）已由
+      `controller_fan`（1）。`static_digital_output` 已在阶段 0 落地，`stepper_z1`（多轴）已由
       **C1a** 打开（相关运行的首次失败前移到 `z_tilt`/`quad_gantry_level`，属 H9）。
 - 备注：`printers.test` 有 2 条运行声明 `DICTIONARY pru.dict host=linuxprocess.dict`，默认不构建
       `pru`；要跑需 `KLIPPERX_ARCHES=…,pru`（需 `pru-gcc`）。
@@ -415,7 +415,7 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 ### H3 G-Code 宏与脚本
 
 - [ ] `gcode_macro.py`：段与宏注册**已落地**（2026-09-24 集成批 #1，语料绿）；剩余 = 宏体模板/表达式引擎、`SET_GCODE_VARIABLE`、`rename_existing` 连接期换名，以及读
-      `printer.objects` 的反射式能力（**Q5**）。**U-A7b 已完成（2026-09-24 批 #4）**：受控子集引擎落地，`exclude_object.test`+`dual_carriage.test` 双翻转、guard 归零；子集外（过滤器等）报错缺口入 `template.rs` 文档（`{% set %}` 批 #9 已落地，B–F 单元：过滤器参数/default/float、列表字面量、三元、`%` 格式化、方法白名单），完整 Jinja 仍属 H3。
+      `printer.objects` 的反射式能力（**Q5**）。**U-A7b 已完成（2026-09-24 批 #4）**：受控子集引擎落地，`exclude_object.test`+`dual_carriage.test` 双翻转、guard 归零；子集外（过滤器等）报错缺口入 `template.rs` 文档（`{% set %}` 批 #9、过滤器参数与 `default`/`float` 批 #17 已落地；C–F 单元：列表字面量（`[a, b]` + `|min`/`|max`）、三元、`%` 格式化、方法白名单待做），完整 Jinja 仍属 H3。
 - [ ] `save_variables.py`（`SAVE_VARIABLE` / `[variables]`）。
 - [ ] `delayed_gcode.py`（`[delayed_gcode]`）。
 - [ ] `respond.py`（`RESPOND` / `M118`）。

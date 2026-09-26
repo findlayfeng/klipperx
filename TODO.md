@@ -139,9 +139,10 @@ H1–H12 是上游 extras 里按域归并的消费者（2026-09-21 全量盘点�
 375 000 步/秒 shutdown（`Stepper too far in past`）；`--task comm` 稳定扛住约 3.5k 往返/秒，
 4441 req/s 时响应积压被判定为链路顶不住。
 
-- [ ] **stepper 资源（C1）**：工具的 `invert_step` / `step_pulse_ticks` 硬编码为 0，也没读
-      `[stepper_*]` 的 `microsteps` / `enable_pin`；真正的 stepper 资源随 C1 做，之后压力工具
-      改成复用它。
+- [ ] **stepper 资源（C1 已收官，本项待改）**：C1 的 `PrinterStepper`/资源层已落地，但压力工具
+      （`src/stress.rs`）仍把 `invert_step` / `step_pulse_ticks` 硬编码为 0，也没读
+      `[stepper_*]` 的 `microsteps` / `enable_pin`（`stress.rs:787-788`）；待改成复用真资源，
+      之后才谈「压力测试与生产同参」。
 - [ ] **`[board_pins]` 别名**：现在只解析引脚名本身，别名未展开（`pins.rs` 已有解析器）。
 - [ ] **端到端测试**：可照 `identify` 的 `chunked_mappings` 脚本化 identify + config +
       `queue_step`，用 `TestDevice` 覆盖一次加压（及 `ResetRequired` 路径）；`--task comm` 同理。

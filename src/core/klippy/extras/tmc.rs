@@ -33,8 +33,10 @@
 //! The UART transport is likewise not wired for a live MCU in this unit: a
 //! non-file-output read or write reports
 //! [`McuError::Config`](crate::core::klippy::mcu::McuError::Config) rather than
-//! silently doing nothing. Only the `tmc2208`/`tmc2209` UART drivers are built
-//! here; the SPI (2130/5160/2240) and 2660 transports are left to a later unit.
+//! silently doing nothing. The SPI transports the `tmc2130`/`tmc5160`/`tmc2240`
+//! drivers share, and the TMC2660's own, are provided by a separate `tmc_spi`
+//! module and short-circuit the same way: under file output a read answers 0
+//! and a write is dropped.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, Weak};
@@ -42,6 +44,7 @@ use std::sync::{Arc, Mutex, Weak};
 use serde_json::{json, Value};
 
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
+use crate::core::klippy::event::KlippyEvent;
 use crate::core::klippy::extras::extruder::PrinterExtruder;
 use crate::core::klippy::extras::stepper::PrinterStepper;
 use crate::core::klippy::extras::toolhead::{
@@ -363,8 +366,40 @@ pub trait TmcTransport: Send + Sync {
 }
 
 // ===========================================================================
-// Current helper (`tmc2130.TMCCurrentHelper`)
+// Current helpers (`TMCCurrentHelper`)
 // ===========================================================================
+
+/// The current model a driver's commands and status go through
+/// (`TMCCurrentHelper`).
+///
+/// Upstream gives each chip its own helper class and `TMCCommandHelper` only
+/// calls these three methods on it; here the driver sees this trait and the
+/// concrete model comes from the chip module.
+pub trait TmcCurrentHelper: Send + Sync {
+    /// `(run_current, hold_current, requested_hold_current, max_current)`
+    /// (`get_current`).
+    ///
+    /// A chip with no hold current (the TMC2660) reports `None` for the hold
+    /// current and for the requested one; `SET_TMC_CURRENT` then prints its
+    /// single-line reply and `get_status` reports a `null` hold current.
+    fn get_current(&self) -> (f64, Option<f64>, Option<f64>, f64);
+
+    /// Set a new current pair (`set_current`).
+    ///
+    /// A chip with no hold current ignores `hold_current`; one with a hold
+    /// current falls back to the requested value it last saw when `None` is
+    /// passed, which is what `SET_TMC_CURRENT` does when `HOLDCURRENT` is
+    /// omitted.
+    ///
+    /// # Errors
+    /// The transport write error (never under file output).
+    fn set_current(
+        &self,
+        run_current: f64,
+        hold_current: Option<f64>,
+        print_time: Option<f64>,
+    ) -> Result<(), McuError>;
+}
 
 /// The TMC current model shared by `tmc2208`/`tmc2209`
 /// (`tmc2130.TMCCurrentHelper`).
@@ -454,31 +489,37 @@ impl TmcCurrent {
         (vsense, irun, ihold)
     }
 
-    /// `(run_current, hold_current, requested_hold_current, max_current)`
-    /// (`get_current`).
-    pub fn get_current(&self) -> (f64, f64, f64, f64) {
+    /// The `hold_current` the config last asked for (`req_hold_current`).
+    fn requested_hold_current(&self) -> f64 {
+        *self
+            .req_hold_current
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+}
+
+impl TmcCurrentHelper for TmcCurrent {
+    fn get_current(&self) -> (f64, Option<f64>, Option<f64>, f64) {
         let irun = self.fields.get_field("irun", None, None);
         let ihold = self.fields.get_field("ihold", None, None);
         let vsense = self.fields.get_field("vsense", None, None);
         let run_current = self.calc_current_from_bits(irun, vsense != 0);
         let hold_current = self.calc_current_from_bits(ihold, vsense != 0);
-        let req = *self
-            .req_hold_current
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        (run_current, hold_current, req, MAX_CURRENT)
+        (
+            run_current,
+            Some(hold_current),
+            Some(self.requested_hold_current()),
+            MAX_CURRENT,
+        )
     }
 
-    /// Set a new current pair (`set_current`).
-    ///
-    /// # Errors
-    /// The transport write error (never under file output).
-    pub fn set_current(
+    fn set_current(
         &self,
         run_current: f64,
-        hold_current: f64,
+        hold_current: Option<f64>,
         print_time: Option<f64>,
     ) -> Result<(), McuError> {
+        let hold_current = hold_current.unwrap_or_else(|| self.requested_hold_current());
         *self
             .req_hold_current
             .lock()
@@ -495,6 +536,527 @@ impl TmcCurrent {
 }
 
 // ===========================================================================
+// Chip current models (`TMC5160CurrentHelper` and friends)
+// ===========================================================================
+
+/// The TMC5160's current model (`tmc5160.TMC5160CurrentHelper`).
+///
+/// The chip scales the current with `GLOBALSCALER`, so the constructor seeds
+/// `globalscaler`/`irun`/`ihold` instead of the 2208/2209's `vsense`.
+/// `run_current` is required; `hold_current` defaults to
+/// [`Tmc5160Current::MAX_CURRENT`] and `sense_resistor` to
+/// [`Tmc5160Current::SENSE_RESISTOR_DEFAULT`].
+pub struct Tmc5160Current {
+    fields: Arc<FieldHelper>,
+    transport: Arc<dyn TmcTransport>,
+    sense_resistor: f64,
+    req_hold_current: Mutex<f64>,
+}
+
+impl Tmc5160Current {
+    /// The chip's reference voltage (`tmc5160.VREF`), in volts.
+    pub const VREF: f64 = 0.325;
+    /// The largest accepted current (`tmc5160.MAX_CURRENT`), in amps.
+    pub const MAX_CURRENT: f64 = 10.000;
+    /// The default `sense_resistor` (`tmc5160`'s), in ohms.
+    pub const SENSE_RESISTOR_DEFAULT: f64 = 0.075;
+
+    /// Read the current options and seed the registers.
+    ///
+    /// # Errors
+    /// A missing/invalid `run_current`, `hold_current` or `sense_resistor`.
+    pub fn new(
+        config: &ConfigWrapper,
+        fields: Arc<FieldHelper>,
+        transport: Arc<dyn TmcTransport>,
+    ) -> Result<Self, ConfigError> {
+        let run_current = config.get_float_bounded(
+            "run_current",
+            None,
+            None,
+            Some(Self::MAX_CURRENT),
+            Some(0.),
+            None,
+        )?;
+        let hold_current = config.get_float_bounded(
+            "hold_current",
+            Some(Self::MAX_CURRENT),
+            None,
+            Some(Self::MAX_CURRENT),
+            Some(0.),
+            None,
+        )?;
+        let sense_resistor = config.get_float_bounded(
+            "sense_resistor",
+            Some(Self::SENSE_RESISTOR_DEFAULT),
+            None,
+            None,
+            Some(0.),
+            None,
+        )?;
+        let helper = Self {
+            fields,
+            transport,
+            sense_resistor,
+            req_hold_current: Mutex::new(hold_current),
+        };
+        let (gscaler, irun, ihold) = helper.calc_current(run_current, hold_current);
+        helper.fields.set_field("globalscaler", gscaler, None, None);
+        helper.fields.set_field("ihold", ihold, None, None);
+        helper.fields.set_field("irun", irun, None, None);
+        Ok(helper)
+    }
+
+    /// `GLOBALSCALER` for `current` (`_calc_globalscaler`).
+    ///
+    /// 0 means full scale (`>= 256` wraps to it) and 32 is the floor.
+    fn calc_globalscaler(&self, current: f64) -> i64 {
+        let globalscaler = (current * 256. * std::f64::consts::SQRT_2 * self.sense_resistor
+            / Self::VREF
+            + 0.5) as i64;
+        let globalscaler = globalscaler.max(32);
+        if globalscaler >= 256 {
+            0
+        } else {
+            globalscaler
+        }
+    }
+
+    /// The `irun`/`ihold` bits for `current` at `globalscaler`
+    /// (`_calc_current_bits`).
+    fn calc_current_bits(&self, current: f64, globalscaler: i64) -> i64 {
+        let globalscaler = if globalscaler == 0 { 256 } else { globalscaler };
+        let cs = (current * 256. * 32. * std::f64::consts::SQRT_2 * self.sense_resistor)
+            / (globalscaler as f64 * Self::VREF)
+            - 1.
+            + 0.5;
+        (cs as i64).clamp(0, 31)
+    }
+
+    fn calc_current(&self, run_current: f64, hold_current: f64) -> (i64, i64, i64) {
+        let gscaler = self.calc_globalscaler(run_current);
+        let irun = self.calc_current_bits(run_current, gscaler);
+        let ihold = self.calc_current_bits(hold_current.min(run_current), gscaler);
+        (gscaler, irun, ihold)
+    }
+
+    /// The current a bits field reads back as (`_calc_current_from_field`).
+    fn calc_current_from_field(&self, field_name: &str) -> f64 {
+        let globalscaler = {
+            let value = self.fields.get_field("globalscaler", None, None);
+            if value == 0 {
+                256
+            } else {
+                value
+            }
+        };
+        let bits = self.fields.get_field(field_name, None, None);
+        (globalscaler as f64 * (bits + 1) as f64 * Self::VREF)
+            / (256. * 32. * std::f64::consts::SQRT_2 * self.sense_resistor)
+    }
+
+    fn requested_hold_current(&self) -> f64 {
+        *self
+            .req_hold_current
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+}
+
+impl TmcCurrentHelper for Tmc5160Current {
+    fn get_current(&self) -> (f64, Option<f64>, Option<f64>, f64) {
+        let run_current = self.calc_current_from_field("irun");
+        let hold_current = self.calc_current_from_field("ihold");
+        (
+            run_current,
+            Some(hold_current),
+            Some(self.requested_hold_current()),
+            Self::MAX_CURRENT,
+        )
+    }
+
+    fn set_current(
+        &self,
+        run_current: f64,
+        hold_current: Option<f64>,
+        print_time: Option<f64>,
+    ) -> Result<(), McuError> {
+        let hold_current = hold_current.unwrap_or_else(|| self.requested_hold_current());
+        *self
+            .req_hold_current
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = hold_current;
+        let (gscaler, irun, ihold) = self.calc_current(run_current, hold_current);
+        let val = self.fields.set_field("globalscaler", gscaler, None, None);
+        self.transport
+            .set_register("GLOBALSCALER", val, print_time)?;
+        self.fields.set_field("ihold", ihold, None, None);
+        let val = self.fields.set_field("irun", irun, None, None);
+        self.transport.set_register("IHOLD_IRUN", val, print_time)
+    }
+}
+
+/// The TMC2240's current model (`tmc2240.TMC2240CurrentHelper`).
+///
+/// The chip has no `sense_resistor` to read: the full-scale current follows
+/// from `rref` and `run_current`'s `current_range`, which the constructor picks
+/// and stores in the `current_range` field. `run_current` is required;
+/// `hold_current` defaults to the full-scale current of `current_range` 3.
+pub struct Tmc2240Current {
+    fields: Arc<FieldHelper>,
+    transport: Arc<dyn TmcTransport>,
+    rref: f64,
+    req_hold_current: Mutex<f64>,
+}
+
+impl Tmc2240Current {
+    /// The default `rref` (`tmc2240`'s), in ohms.
+    pub const RREF_DEFAULT: f64 = 12000.;
+    /// The bounds `rref` is read with (`minval=12000., maxval=60000.`).
+    pub const RREF_MIN: f64 = 12000.;
+    pub const RREF_MAX: f64 = 60000.;
+    /// The full-scale RMS current of each `current_range` (`KIFS`), in mA.
+    pub const KIFS: [f64; 4] = [11750., 24000., 36000., 36000.];
+
+    /// Read the current options and seed the registers.
+    ///
+    /// # Errors
+    /// A missing/invalid `run_current`, `hold_current` or `rref`.
+    pub fn new(
+        config: &ConfigWrapper,
+        fields: Arc<FieldHelper>,
+        transport: Arc<dyn TmcTransport>,
+    ) -> Result<Self, ConfigError> {
+        let rref = config.get_float_bounded(
+            "rref",
+            Some(Self::RREF_DEFAULT),
+            Some(Self::RREF_MIN),
+            Some(Self::RREF_MAX),
+            None,
+            None,
+        )?;
+        let max_cur = Self::ifs_rms_at(rref, 3);
+        let run_current =
+            config.get_float_bounded("run_current", None, None, Some(max_cur), Some(0.), None)?;
+        let hold_current = config.get_float_bounded(
+            "hold_current",
+            Some(max_cur),
+            None,
+            Some(max_cur),
+            Some(0.),
+            None,
+        )?;
+        let helper = Self {
+            fields,
+            transport,
+            rref,
+            req_hold_current: Mutex::new(hold_current),
+        };
+        let current_range = helper.calc_current_range(run_current);
+        helper
+            .fields
+            .set_field("current_range", current_range, None, None);
+        let (gscaler, irun, ihold) = helper.calc_current(run_current, hold_current);
+        helper.fields.set_field("globalscaler", gscaler, None, None);
+        helper.fields.set_field("ihold", ihold, None, None);
+        helper.fields.set_field("irun", irun, None, None);
+        Ok(helper)
+    }
+
+    /// The full-scale RMS current of `current_range` at `rref`
+    /// (`_get_ifs_rms` with an explicit range).
+    fn ifs_rms_at(rref: f64, current_range: i64) -> f64 {
+        (Self::KIFS[current_range as usize] / rref) / std::f64::consts::SQRT_2
+    }
+
+    /// The full-scale RMS current, from the `current_range` field
+    /// (`_get_ifs_rms`).
+    fn ifs_rms(&self, current_range: Option<i64>) -> f64 {
+        let current_range =
+            current_range.unwrap_or_else(|| self.fields.get_field("current_range", None, None));
+        Self::ifs_rms_at(self.rref, current_range)
+    }
+
+    /// The first range `current` fits in (`_calc_current_range`); the last one
+    /// when none does, as upstream's loop leaves its variable.
+    fn calc_current_range(&self, current: f64) -> i64 {
+        for current_range in 0..4 {
+            if current <= self.ifs_rms(Some(current_range)) {
+                return current_range;
+            }
+        }
+        3
+    }
+
+    /// `GLOBALSCALER` for `current` (`_calc_globalscaler`).
+    fn calc_globalscaler(&self, current: f64) -> i64 {
+        let globalscaler = (current * 256. / self.ifs_rms(None) + 0.5) as i64;
+        let globalscaler = globalscaler.max(32);
+        if globalscaler >= 256 {
+            0
+        } else {
+            globalscaler
+        }
+    }
+
+    /// The `irun`/`ihold` bits for `current` at `globalscaler`
+    /// (`_calc_current_bits`).
+    fn calc_current_bits(&self, current: f64, globalscaler: i64) -> i64 {
+        let ifs_rms = self.ifs_rms(None);
+        let globalscaler = if globalscaler == 0 { 256 } else { globalscaler };
+        let cs = (current * 256. * 32.) / (globalscaler as f64 * ifs_rms) - 1. + 0.5;
+        (cs as i64).clamp(0, 31)
+    }
+
+    fn calc_current(&self, run_current: f64, hold_current: f64) -> (i64, i64, i64) {
+        let gscaler = self.calc_globalscaler(run_current);
+        let irun = self.calc_current_bits(run_current, gscaler);
+        let ihold = self.calc_current_bits(hold_current.min(run_current), gscaler);
+        (gscaler, irun, ihold)
+    }
+
+    /// The current a bits field reads back as (`_calc_current_from_field`).
+    fn calc_current_from_field(&self, field_name: &str) -> f64 {
+        let ifs_rms = self.ifs_rms(None);
+        let globalscaler = {
+            let value = self.fields.get_field("globalscaler", None, None);
+            if value == 0 {
+                256
+            } else {
+                value
+            }
+        };
+        let bits = self.fields.get_field(field_name, None, None);
+        globalscaler as f64 * (bits + 1) as f64 * ifs_rms / (256. * 32.)
+    }
+
+    fn requested_hold_current(&self) -> f64 {
+        *self
+            .req_hold_current
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+}
+
+impl TmcCurrentHelper for Tmc2240Current {
+    fn get_current(&self) -> (f64, Option<f64>, Option<f64>, f64) {
+        let ifs_rms = self.ifs_rms(None);
+        let run_current = self.calc_current_from_field("irun");
+        let hold_current = self.calc_current_from_field("ihold");
+        (
+            run_current,
+            Some(hold_current),
+            Some(self.requested_hold_current()),
+            ifs_rms,
+        )
+    }
+
+    fn set_current(
+        &self,
+        run_current: f64,
+        hold_current: Option<f64>,
+        print_time: Option<f64>,
+    ) -> Result<(), McuError> {
+        let hold_current = hold_current.unwrap_or_else(|| self.requested_hold_current());
+        *self
+            .req_hold_current
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = hold_current;
+        let (gscaler, irun, ihold) = self.calc_current(run_current, hold_current);
+        let val = self.fields.set_field("globalscaler", gscaler, None, None);
+        self.transport
+            .set_register("GLOBALSCALER", val, print_time)?;
+        self.fields.set_field("ihold", ihold, None, None);
+        let val = self.fields.set_field("irun", irun, None, None);
+        self.transport.set_register("IHOLD_IRUN", val, print_time)
+    }
+}
+
+/// The TMC2660's current model (`tmc2660.TMC2660CurrentHelper`).
+///
+/// The chip has no hold current at all: `get_current` reports `None` for it, so
+/// `SET_TMC_CURRENT` answers with its single-line reply and `get_status` a
+/// `null`. `run_current` (0.1..=[`Tmc2660Current::MAX_CURRENT`]) and
+/// `sense_resistor` are both required. When `idle_current_percent` is below
+/// 100 the helper registers the `idle_timeout` handlers that lower the current
+/// while the printer is ready and restore it when a print starts.
+pub struct Tmc2660Current {
+    fields: Arc<FieldHelper>,
+    transport: Arc<dyn TmcTransport>,
+    sense_resistor: f64,
+    /// The run current set so far (`self.current` upstream).
+    current: Mutex<f64>,
+    idle_current_percent: i64,
+}
+
+impl Tmc2660Current {
+    /// The largest accepted current (`tmc2660.MAX_CURRENT`), in amps.
+    pub const MAX_CURRENT: f64 = 2.400;
+    /// The smallest accepted `run_current` (`minval=0.1`), in amps.
+    pub const MIN_CURRENT: f64 = 0.1;
+
+    /// Read the current options and seed the registers.
+    ///
+    /// The helper comes back in an `Arc` because the idle handlers hold it
+    /// weakly.
+    ///
+    /// # Errors
+    /// A missing/invalid `run_current`, `sense_resistor` or
+    /// `idle_current_percent`.
+    pub fn new(
+        config: &ConfigWrapper,
+        printer: &Arc<Printer>,
+        fields: Arc<FieldHelper>,
+        transport: Arc<dyn TmcTransport>,
+    ) -> Result<Arc<Self>, ConfigError> {
+        let current = config.get_float_bounded(
+            "run_current",
+            None,
+            Some(Self::MIN_CURRENT),
+            Some(Self::MAX_CURRENT),
+            None,
+            None,
+        )?;
+        let sense_resistor = config.get_float("sense_resistor", None)?;
+        let idle_current_percent =
+            config.get_int_bounded("idle_current_percent", Some(100), Some(0), Some(100))?;
+        let helper = Arc::new(Self {
+            fields,
+            transport,
+            sense_resistor,
+            current: Mutex::new(current),
+            idle_current_percent,
+        });
+        let (vsense, cs) = helper.calc_current(current);
+        helper.fields.set_field("cs", cs, None, None);
+        helper.fields.set_field("vsense", vsense as i64, None, None);
+        if idle_current_percent < 100 {
+            helper.register_idle_timeout(printer);
+        }
+        Ok(helper)
+    }
+
+    /// The `cs` bits for `current` at `vsense` (`_calc_current_bits`).
+    fn calc_current_bits(&self, current: f64, vsense: bool) -> i64 {
+        let vref = if vsense { 0.165 } else { 0.310 };
+        let cs = (32. * self.sense_resistor * current * std::f64::consts::SQRT_2 / vref + 0.5)
+            as i64
+            - 1;
+        cs.clamp(0, 31)
+    }
+
+    /// The current `cs` bits read back as (`_calc_current_from_bits`).
+    fn calc_current_from_bits(&self, cs: i64, vsense: bool) -> f64 {
+        let vref = if vsense { 0.165 } else { 0.310 };
+        (cs + 1) as f64 * vref / (32. * self.sense_resistor * std::f64::consts::SQRT_2)
+    }
+
+    /// `vsense`/`cs` for `current` (`_calc_current`): `vsense` 1 unless the
+    /// range that needs it cannot reach `current`.
+    fn calc_current(&self, current: f64) -> (bool, i64) {
+        let mut vsense = true;
+        let mut cs = self.calc_current_bits(current, true);
+        if cs == 31 {
+            let reached = self.calc_current_from_bits(cs, true);
+            if reached < current {
+                let cs2 = self.calc_current_bits(current, false);
+                let reached2 = self.calc_current_from_bits(cs2, false);
+                if (current - reached2).abs() < (current - reached).abs() {
+                    vsense = false;
+                    cs = cs2;
+                }
+            }
+        }
+        (vsense, cs)
+    }
+
+    /// Store `current`'s `cs`/`vsense` (`_update_current`).
+    ///
+    /// # Errors
+    /// The transport write error.
+    fn update_current(&self, current: f64, print_time: Option<f64>) -> Result<(), McuError> {
+        let (vsense, cs) = self.calc_current(current);
+        let val = self.fields.set_field("cs", cs, None, None);
+        self.transport.set_register("SGCSCONF", val, print_time)?;
+        // Only update `DRVCONF` when `vsense` actually changes.
+        if i64::from(vsense) != self.fields.get_field("vsense", None, None) {
+            let val = self.fields.set_field("vsense", vsense as i64, None, None);
+            self.transport.set_register("DRVCONF", val, print_time)?;
+        }
+        Ok(())
+    }
+
+    /// Lower the current once a print starts and raise it back when the
+    /// printer goes idle (`idle_timeout:printing`/`ready`).
+    ///
+    /// Upstream defers both writes to a reactor callback; the event already
+    /// carries the print time they are dated with, so they run here directly.
+    fn register_idle_timeout(self: &Arc<Self>, printer: &Arc<Printer>) {
+        let printing = Arc::downgrade(self);
+        printer.register_event_handler(
+            KlippyEvent::IdleTimeoutPrinting { print_time: 0. },
+            Box::new(move |event| {
+                let KlippyEvent::IdleTimeoutPrinting { print_time } = event else {
+                    return;
+                };
+                if let Some(helper) = printing.upgrade() {
+                    let current = *helper
+                        .current
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner());
+                    if let Err(err) = helper.update_current(current, Some(*print_time)) {
+                        tracing::info!("TMC2660 idle current failed: {err}");
+                    }
+                }
+            }),
+        );
+        let ready = Arc::downgrade(self);
+        printer.register_event_handler(
+            KlippyEvent::IdleTimeoutReady { print_time: 0. },
+            Box::new(move |event| {
+                let KlippyEvent::IdleTimeoutReady { print_time } = event else {
+                    return;
+                };
+                if let Some(helper) = ready.upgrade() {
+                    let current = *helper
+                        .current
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        * helper.idle_current_percent as f64
+                        / 100.;
+                    if let Err(err) = helper.update_current(current, Some(*print_time)) {
+                        tracing::info!("TMC2660 idle current failed: {err}");
+                    }
+                }
+            }),
+        );
+    }
+}
+
+impl TmcCurrentHelper for Tmc2660Current {
+    fn get_current(&self) -> (f64, Option<f64>, Option<f64>, f64) {
+        let current = *self
+            .current
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        (current, None, None, Self::MAX_CURRENT)
+    }
+
+    fn set_current(
+        &self,
+        run_current: f64,
+        _hold_current: Option<f64>,
+        print_time: Option<f64>,
+    ) -> Result<(), McuError> {
+        *self
+            .current
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = run_current;
+        self.update_current(run_current, print_time)
+    }
+}
+
+// ===========================================================================
 // Periodic error checking (`tmc.TMCErrorCheck`)
 // ===========================================================================
 
@@ -505,6 +1067,10 @@ impl TmcCurrent {
 /// is not started here — nothing calls the enable path that would start it — so
 /// a corpus run never leaves a timer behind. Under file output both reads
 /// answer 0, so a check never reports a fault (and never shuts the printer down).
+///
+/// Which register the fault status is read from depends on the driver
+/// (`TMCErrorCheck.__init__`'s `name_parts[0]` branches): the TMC2660 has no
+/// `DRV_STATUS` and reports through `READRSP@RDSEL2` instead.
 pub struct TmcErrorCheck {
     transport: Arc<dyn TmcTransport>,
     fields: Arc<FieldHelper>,
@@ -512,6 +1078,12 @@ pub struct TmcErrorCheck {
     drv_reg_name: String,
     drv_mask: u32,
     drv_err_mask: u32,
+    /// The field holding the run current (`irun`, `cs` on the TMC2660).
+    irun_field: &'static str,
+    /// The bits of a zero run current that mean a driver reset.
+    cs_actual_mask: u32,
+    /// Whether a GSTAT reset flag may be cleared (`tmc2130` clears its own).
+    clear_gstat: bool,
     gstat_reg: Option<String>,
     last_drv_status: Mutex<Option<u32>>,
     last_gstat: Mutex<Option<u32>>,
@@ -519,7 +1091,11 @@ pub struct TmcErrorCheck {
 
 impl TmcErrorCheck {
     /// Build the register info (`TMCErrorCheck.__init__`).
+    ///
+    /// `driver_name` is the section's driver word (`tmc2209`, `tmc2660`, …),
+    /// which is what upstream's `name_parts[0]` branches read.
     pub fn new(
+        driver_name: &str,
         stepper_name: &str,
         fields: Arc<FieldHelper>,
         transport: Arc<dyn TmcTransport>,
@@ -527,7 +1103,27 @@ impl TmcErrorCheck {
         let gstat_reg = fields
             .lookup_register("drv_err")
             .map(|name| name.to_string());
-        let drv_reg_name = "DRV_STATUS".to_string();
+        let mut irun_field = "irun";
+        let mut cs_actual_mask = 0u32;
+        // TMC2130 driver quirks: the chip clears its own GSTAT reset flag, and
+        // `DRV_STATUS.cs_actual` reads zero after a driver reset.
+        let mut clear_gstat = true;
+        let drv_reg_name = match driver_name {
+            "tmc2130" => {
+                clear_gstat = false;
+                cs_actual_mask = fields.field_mask("DRV_STATUS", "cs_actual").unwrap_or(0);
+                "DRV_STATUS"
+            }
+            // TMC2660 driver quirks: no `DRV_STATUS`; the run current (`cs`) and
+            // the reset flag (`se`) are read back through `READRSP@RDSEL2`.
+            "tmc2660" => {
+                irun_field = "cs";
+                cs_actual_mask = fields.field_mask("READRSP@RDSEL2", "se").unwrap_or(0);
+                "READRSP@RDSEL2"
+            }
+            _ => "DRV_STATUS",
+        }
+        .to_string();
         let mut mask = 0u32;
         let mut err_mask = 0u32;
         let err_fields = ["ot", "s2ga", "s2gb", "s2vsa", "s2vsb"];
@@ -549,10 +1145,40 @@ impl TmcErrorCheck {
             drv_reg_name,
             drv_mask: mask,
             drv_err_mask: err_mask,
+            irun_field,
+            cs_actual_mask,
+            clear_gstat,
             gstat_reg,
             last_drv_status: Mutex::new(None),
             last_gstat: Mutex::new(None),
         }
+    }
+
+    /// The register the fault status is read from (`drv_status_reg_info`).
+    pub fn register_name(&self) -> &str {
+        &self.drv_reg_name
+    }
+
+    /// The bits a fault is reported on (`drv_status_reg_info`'s err mask).
+    pub fn error_mask(&self) -> u32 {
+        self.drv_err_mask
+    }
+
+    /// The bits of a zero run current that mean a driver reset
+    /// (`drv_status_reg_info`'s `cs_actual_mask`).
+    pub fn cs_actual_mask(&self) -> u32 {
+        self.cs_actual_mask
+    }
+
+    /// The field the run current is read back from (upstream's `irun_field`).
+    pub fn irun_field(&self) -> &str {
+        self.irun_field
+    }
+
+    /// Whether a GSTAT reset flag may be cleared (upstream's `clear_gstat`;
+    /// the TMC2130 clears its own).
+    pub fn clears_gstat(&self) -> bool {
+        self.clear_gstat
     }
 
     fn query_register(
@@ -774,6 +1400,68 @@ pub fn vcoolthrs_helper(
     Ok(())
 }
 
+/// Store `high_velocity_threshold`'s `thigh` (`TMCVhighHelper`).
+///
+/// # Errors
+/// A malformed `high_velocity_threshold`, or a malformed stepper section.
+pub fn vhigh_helper(
+    config: &ConfigWrapper,
+    fields: &FieldHelper,
+    transport: &dyn TmcTransport,
+) -> Result<(), ConfigError> {
+    let velocity = if config.has("high_velocity_threshold") {
+        Some(config.get_float_bounded(
+            "high_velocity_threshold",
+            None,
+            Some(0.),
+            None,
+            None,
+            None,
+        )?)
+    } else {
+        None
+    };
+    let thigh = match velocity {
+        Some(velocity) => tstep_helper(fields, transport, velocity, None, Some(config))?,
+        None => 0,
+    };
+    fields.set_field("thigh", thigh, None, None);
+    Ok(())
+}
+
+/// The wave table's default values (`TMCWaveTableHelper`), in field order.
+const WAVE_TABLE_DEFAULTS: [(&str, i64); 17] = [
+    ("mslut0", 0xAAAAB554),
+    ("mslut1", 0x4A9554AA),
+    ("mslut2", 0x24492929),
+    ("mslut3", 0x10104222),
+    ("mslut4", 0xFBFFFFFF),
+    ("mslut5", 0xB5BB777D),
+    ("mslut6", 0x49295556),
+    ("mslut7", 0x00404222),
+    ("w0", 2),
+    ("w1", 1),
+    ("w2", 1),
+    ("w3", 1),
+    ("x1", 128),
+    ("x2", 255),
+    ("x3", 255),
+    ("start_sin", 0),
+    ("start_sin90", 247),
+];
+
+/// Initialize the wave table from config or upstream's defaults
+/// (`TMCWaveTableHelper`).
+///
+/// # Errors
+/// A malformed `driver_mslut*`/`driver_w*`/`driver_x*`/`driver_start_sin*`.
+pub fn wave_table_helper(config: &ConfigWrapper, fields: &FieldHelper) -> Result<(), ConfigError> {
+    for (field, default) in WAVE_TABLE_DEFAULTS {
+        fields.set_config_field(config, field, default)?;
+    }
+    Ok(())
+}
+
 // ===========================================================================
 // G-Code command helpers + the driver object
 // ===========================================================================
@@ -797,7 +1485,7 @@ pub struct TmcDriver {
     stepper_name: String,
     fields: Arc<FieldHelper>,
     transport: Arc<dyn TmcTransport>,
-    current: Arc<TmcCurrent>,
+    current: Arc<dyn TmcCurrentHelper>,
     echeck: Arc<TmcErrorCheck>,
     read_registers: Vec<String>,
     read_translate: Option<ReadTranslate>,
@@ -823,7 +1511,7 @@ impl TmcDriver {
         printer: &Arc<Printer>,
         fields: Arc<FieldHelper>,
         transport: Arc<dyn TmcTransport>,
-        current: Arc<TmcCurrent>,
+        current: Arc<dyn TmcCurrentHelper>,
         read_registers: Vec<String>,
         read_translate: Option<ReadTranslate>,
     ) -> Result<Arc<Self>, ConfigError> {
@@ -835,6 +1523,7 @@ impl TmcDriver {
             .unwrap_or("")
             .to_string();
         let echeck = Arc::new(TmcErrorCheck::new(
+            &section_driver(config),
             &stepper_name,
             Arc::clone(&fields),
             Arc::clone(&transport),
@@ -1019,7 +1708,8 @@ impl TmcDriver {
     }
 
     fn cmd_set_tmc_current(&self, gcmd: &GcodeCommand) -> Result<(), CommandError> {
-        let (mut prev_cur, prev_hold_cur, mut req_hold_cur, max_cur) = self.current.get_current();
+        let (mut prev_cur, mut prev_hold_cur, mut req_hold_cur, max_cur) =
+            self.current.get_current();
         let params = gcmd.get_command_parameters();
         let run_current = if params.contains_key("CURRENT") {
             Some(gcmd.get(
@@ -1049,17 +1739,23 @@ impl TmcDriver {
         };
         if run_current.is_some() || hold_current.is_some() {
             let run_current = run_current.unwrap_or(prev_cur);
-            let hold_current = hold_current.unwrap_or(req_hold_cur);
+            let hold_current = hold_current.or(req_hold_cur);
             let print_time = self.last_move_time();
             self.current
                 .set_current(run_current, hold_current, Some(print_time))
                 .map_err(|err| CommandError::new(err.to_string()))?;
-            (prev_cur, _, req_hold_cur, _) = self.current.get_current();
+            (prev_cur, prev_hold_cur, req_hold_cur, _) = self.current.get_current();
         }
         let _ = req_hold_cur;
-        gcmd.respond_info(&format!(
-            "Run Current: {prev_cur:0.2}A Hold Current: {prev_hold_cur:0.2}A"
-        ));
+        // A chip with no hold current (the TMC2660) reports the run current
+        // alone.
+        let reply = match prev_hold_cur {
+            Some(hold_current) => {
+                format!("Run Current: {prev_cur:0.2}A Hold Current: {hold_current:0.2}A")
+            }
+            None => format!("Run Current: {prev_cur:0.2}A"),
+        };
+        gcmd.respond_info(&reply);
         Ok(())
     }
 
@@ -1233,6 +1929,7 @@ impl TmcDriver {
 
 impl PrinterObject for TmcDriver {
     fn get_status(&self, _eventtime: f64) -> Value {
+        // A chip with no hold current (the TMC2660) reports `null`.
         let (run_current, hold_current, _, _) = self.current.get_current();
         let offset = *self
             .mcu_phase_offset
@@ -1412,5 +2109,584 @@ impl HomingEndstop for TmcVirtualEndstop {
 
     fn query_endstop(&self, print_time: f64) -> QueryEndstopFuture<'_> {
         self.inner.query_endstop(print_time)
+    }
+}
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::klippy::config::{AccessTracking, Config, ConfigSection, ConfigValue};
+    use crate::core::klippy::gcode::{GCodeDispatch, GCODE_OBJECT};
+    use crate::core::klippy::reactor::ManualReactor;
+
+    /// A transport that records what it was asked to read and write, and answers
+    /// every read with 0 like the file-output short-circuit does.
+    #[derive(Default)]
+    struct RecordingTransport {
+        reads: Mutex<Vec<String>>,
+        writes: Mutex<Vec<(String, u32)>>,
+        names: HashMap<String, u8>,
+    }
+
+    impl RecordingTransport {
+        fn reads(&self) -> Vec<String> {
+            self.reads.lock().unwrap().clone()
+        }
+
+        /// The most recent value written to `reg_name`.
+        fn written(&self, reg_name: &str) -> Option<u32> {
+            self.writes
+                .lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .find(|(name, _)| name == reg_name)
+                .map(|(_, value)| *value)
+        }
+    }
+
+    impl TmcTransport for RecordingTransport {
+        fn get_register_raw(&self, reg_name: &str) -> Result<TmcRegister, McuError> {
+            self.reads.lock().unwrap().push(reg_name.to_string());
+            Ok(TmcRegister {
+                data: 0,
+                receive_time: 0.,
+            })
+        }
+
+        fn set_register(
+            &self,
+            reg_name: &str,
+            val: u32,
+            _print_time: Option<f64>,
+        ) -> Result<(), McuError> {
+            self.writes
+                .lock()
+                .unwrap()
+                .push((reg_name.to_string(), val));
+            Ok(())
+        }
+
+        fn get_tmc_frequency(&self) -> Option<f64> {
+            Some(12e6)
+        }
+
+        fn name_to_reg(&self) -> &HashMap<String, u8> {
+            &self.names
+        }
+    }
+
+    /// A section with the given string options.
+    fn section(id: &str, sub: &str, options: &[(&str, &str)]) -> ConfigSection {
+        let mut section = ConfigSection::new(id, Some(sub));
+        for (name, value) in options {
+            section.parameters.insert(
+                (*name).to_string(),
+                ConfigValue::Single((*value).to_string()),
+            );
+        }
+        section
+    }
+
+    /// A printer with a `gcode` dispatcher, and the lines it emits.
+    fn machine() -> (Arc<Printer>, Arc<GCodeDispatch>, Arc<Mutex<Vec<String>>>) {
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        let gcode = Arc::new(GCodeDispatch::new(Arc::clone(&printer)));
+        printer
+            .add_object(GCODE_OBJECT, Arc::clone(&gcode) as Arc<dyn PrinterObject>)
+            .unwrap();
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&lines);
+        gcode.register_output_handler(Arc::new(move |line: &str| {
+            sink.lock().unwrap().push(line.to_string());
+        }));
+        (printer, gcode, lines)
+    }
+
+    fn emitted(lines: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
+        lines.lock().unwrap().clone()
+    }
+
+    /// The registers `TmcCurrent` and the GLOBALSCALER models need.
+    fn current_fields() -> HashMap<String, HashMap<String, u32>> {
+        HashMap::from([
+            (
+                "CHOPCONF".to_string(),
+                HashMap::from([
+                    ("vsense".to_string(), 0x01u32 << 17),
+                    ("mres".to_string(), 0x0fu32 << 24),
+                    ("intpol".to_string(), 0x01u32 << 28),
+                ]),
+            ),
+            (
+                "IHOLD_IRUN".to_string(),
+                HashMap::from([
+                    ("ihold".to_string(), 0x1fu32),
+                    ("irun".to_string(), 0x1fu32 << 8),
+                ]),
+            ),
+            (
+                "GLOBALSCALER".to_string(),
+                HashMap::from([("globalscaler".to_string(), 0xffu32)]),
+            ),
+            (
+                "DRV_CONF".to_string(),
+                HashMap::from([("current_range".to_string(), 0x03u32)]),
+            ),
+            (
+                "DRV_STATUS".to_string(),
+                HashMap::from([("ot".to_string(), 0x01u32 << 1)]),
+            ),
+        ])
+    }
+
+    /// The TMC2660's tables as far as the current helper and the check need them.
+    fn tmc2660_fields() -> HashMap<String, HashMap<String, u32>> {
+        HashMap::from([
+            (
+                "DRVCTRL".to_string(),
+                HashMap::from([
+                    ("mres".to_string(), 0x0fu32),
+                    ("intpol".to_string(), 0x01u32 << 9),
+                ]),
+            ),
+            (
+                "SGCSCONF".to_string(),
+                HashMap::from([("cs".to_string(), 0x1fu32)]),
+            ),
+            (
+                "DRVCONF".to_string(),
+                HashMap::from([("vsense".to_string(), 0x01u32 << 6)]),
+            ),
+            (
+                "READRSP@RDSEL2".to_string(),
+                HashMap::from([
+                    ("ot".to_string(), 0x01u32 << 5),
+                    ("otpw".to_string(), 0x01u32 << 6),
+                    ("s2ga".to_string(), 0x01u32 << 7),
+                    ("s2gb".to_string(), 0x01u32 << 8),
+                    ("se".to_string(), 0x1fu32 << 14),
+                ]),
+            ),
+        ])
+    }
+
+    /// The wave-table and `thigh` fields the 5160/2240 share.
+    fn wave_table_fields() -> HashMap<String, HashMap<String, u32>> {
+        let mut fields = HashMap::new();
+        for index in 0..8 {
+            fields.insert(
+                format!("MSLUT{index}"),
+                HashMap::from([(format!("mslut{index}"), 0xffff_ffffu32)]),
+            );
+        }
+        fields.insert(
+            "MSLUTSEL".to_string(),
+            HashMap::from([
+                ("w0".to_string(), 0x03u32),
+                ("w1".to_string(), 0x03u32 << 2),
+                ("w2".to_string(), 0x03u32 << 4),
+                ("w3".to_string(), 0x03u32 << 6),
+                ("x1".to_string(), 0xffu32 << 8),
+                ("x2".to_string(), 0xffu32 << 16),
+                ("x3".to_string(), 0xffu32 << 24),
+            ]),
+        );
+        fields.insert(
+            "MSLUTSTART".to_string(),
+            HashMap::from([
+                ("start_sin".to_string(), 0xffu32),
+                ("start_sin90".to_string(), 0xffu32 << 16),
+            ]),
+        );
+        fields.insert(
+            "THIGH".to_string(),
+            HashMap::from([("thigh".to_string(), 0xfffffu32)]),
+        );
+        fields.insert(
+            "GCONF".to_string(),
+            HashMap::from([("mres".to_string(), 0x0fu32)]),
+        );
+        fields
+    }
+
+    /// `[stepper_x]` plus a UART and a 2660 driver section on the same stepper.
+    const DRIVER_CONFIG: &str = "\
+[stepper_x]
+microsteps: 16
+rotation_distance: 40
+[tmc2209 stepper_x]
+run_current: 0.5
+[tmc2660 stepper_x]
+run_current: 0.5
+sense_resistor: 0.220
+";
+
+    /// The `[tmc2209 stepper_x]` driver of [`DRIVER_CONFIG`], on `TmcCurrent`.
+    fn tmc2209_driver(printer: &Arc<Printer>, config: &Config) -> Arc<TmcDriver> {
+        let section = config.get_section("tmc2209 stepper_x").unwrap().clone();
+        let wrapper = ConfigWrapper::with_config(&section, AccessTracking::shared(), None, config);
+        let fields = Arc::new(FieldHelper::new(current_fields(), &[], HashMap::new()));
+        let transport: Arc<dyn TmcTransport> = Arc::new(RecordingTransport::default());
+        let current = Arc::new(
+            TmcCurrent::new(&wrapper, Arc::clone(&fields), Arc::clone(&transport)).unwrap(),
+        );
+        TmcDriver::new(
+            &wrapper,
+            printer,
+            fields,
+            transport,
+            current,
+            vec!["DRV_STATUS".to_string()],
+            None,
+        )
+        .unwrap()
+    }
+
+    /// The `[tmc2660 stepper_x]` driver of [`DRIVER_CONFIG`], with the transport
+    /// it writes through.
+    fn tmc2660_driver(
+        printer: &Arc<Printer>,
+        config: &Config,
+    ) -> (Arc<TmcDriver>, Arc<RecordingTransport>) {
+        let section = config.get_section("tmc2660 stepper_x").unwrap().clone();
+        let wrapper = ConfigWrapper::with_config(&section, AccessTracking::shared(), None, config);
+        let fields = Arc::new(FieldHelper::new(tmc2660_fields(), &[], HashMap::new()));
+        let recording = Arc::new(RecordingTransport::default());
+        let transport: Arc<dyn TmcTransport> = recording.clone();
+        let current = Tmc2660Current::new(
+            &wrapper,
+            printer,
+            Arc::clone(&fields),
+            Arc::clone(&transport),
+        )
+        .unwrap();
+        let driver = TmcDriver::new(
+            &wrapper,
+            printer,
+            fields,
+            transport,
+            current,
+            vec![
+                "READRSP@RDSEL0".to_string(),
+                "READRSP@RDSEL1".to_string(),
+                "READRSP@RDSEL2".to_string(),
+            ],
+            None,
+        )
+        .unwrap();
+        (driver, recording)
+    }
+
+    /// tmc5160 `_calc_globalscaler`/`_calc_current_bits` for
+    /// `run_current: 1.0, sense_resistor: 0.05`: `1.0*256*sqrt(2)*0.05/0.325`
+    /// = 55.699 → 56, and `1.0*256*32*sqrt(2)*0.05/(56*0.325)` = 31.827 → 31.
+    #[test]
+    fn test_the_5160_current_helper_matches_the_upstream_formula() {
+        let fields = Arc::new(FieldHelper::new(current_fields(), &[], HashMap::new()));
+        let section = section(
+            "tmc5160",
+            "stepper_x",
+            &[("run_current", "1.0"), ("sense_resistor", "0.05")],
+        );
+        let recording = Arc::new(RecordingTransport::default());
+        let transport: Arc<dyn TmcTransport> = recording.clone();
+        let current = Tmc5160Current::new(
+            &ConfigWrapper::untracked(&section),
+            Arc::clone(&fields),
+            transport,
+        )
+        .unwrap();
+
+        assert_eq!(fields.get_field("globalscaler", None, None), 56);
+        assert_eq!(fields.get_field("irun", None, None), 31);
+        // `hold_current` defaults to MAX_CURRENT, so the hold bits clamp to the
+        // run current.
+        assert_eq!(fields.get_field("ihold", None, None), 31);
+        let (run, hold, req, max) = current.get_current();
+        assert!((run - 1.005417454499622).abs() < 1e-9, "{run}");
+        assert!((hold.unwrap() - 1.005417454499622).abs() < 1e-9, "{hold:?}");
+        assert_eq!(req, Some(10.0));
+        assert_eq!(max, 10.0);
+
+        current.set_current(1.0, Some(1.0), Some(0.5)).unwrap();
+        assert_eq!(recording.written("GLOBALSCALER"), Some(56));
+        assert_eq!(recording.written("IHOLD_IRUN"), Some(31 | 31 << 8));
+    }
+
+    /// tmc2240 `_calc_current_range`/`_calc_globalscaler`/`_calc_current_bits`
+    /// for `run_current: 0.5, rref: 12000`: `ifs_rms(0)` = 0.692375,
+    /// `0.5*256/0.692375` = 184.858 → 185, and
+    /// `0.5*256*32/(185*0.692375)` = 31.975 → 31.
+    #[test]
+    fn test_the_2240_current_helper_matches_the_upstream_formula() {
+        let fields = Arc::new(FieldHelper::new(current_fields(), &[], HashMap::new()));
+        let section = section("tmc2240", "stepper_x", &[("run_current", "0.5")]);
+        let recording = Arc::new(RecordingTransport::default());
+        let transport: Arc<dyn TmcTransport> = recording.clone();
+        let current = Tmc2240Current::new(
+            &ConfigWrapper::untracked(&section),
+            Arc::clone(&fields),
+            transport,
+        )
+        .unwrap();
+
+        assert_eq!(fields.get_field("current_range", None, None), 0);
+        assert_eq!(fields.get_field("globalscaler", None, None), 185);
+        assert_eq!(fields.get_field("irun", None, None), 31);
+        assert_eq!(fields.get_field("ihold", None, None), 31);
+        let (run, hold, req, max) = current.get_current();
+        assert!((run - 0.5003494028659692).abs() < 1e-9, "{run}");
+        assert!(
+            (hold.unwrap() - 0.5003494028659692).abs() < 1e-9,
+            "{hold:?}"
+        );
+        assert!((max - 0.6923753899118277).abs() < 1e-9, "{max}");
+        // `hold_current` defaults to the full-scale current of range 3.
+        assert!((req.unwrap() - 2.1213203435596424).abs() < 1e-9, "{req:?}");
+
+        current.set_current(0.5, Some(0.5), Some(0.5)).unwrap();
+        assert_eq!(recording.written("GLOBALSCALER"), Some(185));
+        assert_eq!(recording.written("IHOLD_IRUN"), Some(31 | 31 << 8));
+    }
+
+    /// tmc2660 `_calc_current` for `run_current: 0.5, sense_resistor: 0.220`:
+    /// `32*0.22*0.5*sqrt(2)/0.165` = 30.167 → 30, `cs` = 29 with `vsense` 1.
+    #[test]
+    fn test_the_2660_current_helper_matches_the_upstream_formula() {
+        let (printer, _gcode, _lines) = machine();
+        let fields = Arc::new(FieldHelper::new(tmc2660_fields(), &[], HashMap::new()));
+        let section = section(
+            "tmc2660",
+            "stepper_x",
+            &[("run_current", "0.5"), ("sense_resistor", "0.220")],
+        );
+        let recording = Arc::new(RecordingTransport::default());
+        let transport: Arc<dyn TmcTransport> = recording.clone();
+        let current = Tmc2660Current::new(
+            &ConfigWrapper::untracked(&section),
+            &printer,
+            Arc::clone(&fields),
+            transport,
+        )
+        .unwrap();
+
+        assert_eq!(fields.get_field("vsense", None, None), 1);
+        assert_eq!(fields.get_field("cs", None, None), 29);
+        assert_eq!(
+            current.get_current(),
+            (0.5, None, None, Tmc2660Current::MAX_CURRENT)
+        );
+        // Nothing is written until the current changes.
+        assert_eq!(recording.written("SGCSCONF"), None);
+
+        current.set_current(0.4, None, Some(0.5)).unwrap();
+        assert_eq!(current.get_current().0, 0.4);
+        // `_update_current` writes `SGCSCONF` and leaves `DRVCONF` alone while
+        // `vsense` stays 1.
+        assert!(recording.written("SGCSCONF").is_some());
+        assert_eq!(recording.written("DRVCONF"), None);
+    }
+
+    /// `idle_current_percent` below 100 registers the `idle_timeout` handlers
+    /// that scale the current by the percentage.
+    #[test]
+    fn test_the_2660_idle_current_percent_lowers_the_current_when_ready() {
+        let (printer, _gcode, _lines) = machine();
+        let fields = Arc::new(FieldHelper::new(tmc2660_fields(), &[], HashMap::new()));
+        let section = section(
+            "tmc2660",
+            "stepper_x",
+            &[
+                ("run_current", "0.5"),
+                ("sense_resistor", "0.220"),
+                ("idle_current_percent", "50"),
+            ],
+        );
+        let recording = Arc::new(RecordingTransport::default());
+        let transport: Arc<dyn TmcTransport> = recording.clone();
+        let current = Tmc2660Current::new(
+            &ConfigWrapper::untracked(&section),
+            &printer,
+            Arc::clone(&fields),
+            transport,
+        )
+        .unwrap();
+
+        printer.send_event(&KlippyEvent::IdleTimeoutReady { print_time: 4. });
+        // 0.25 A: `32*0.22*0.25*sqrt(2)/0.165` = 15.085 → 15, `cs` = 14.
+        assert_eq!(recording.written("SGCSCONF"), Some(14));
+        assert_eq!(fields.get_field("cs", None, None), 14);
+
+        printer.send_event(&KlippyEvent::IdleTimeoutPrinting { print_time: 5. });
+        assert_eq!(recording.written("SGCSCONF"), Some(29));
+        assert_eq!(current.get_current().0, 0.5);
+    }
+
+    /// A driver whose chip has a hold current keeps the two-value reply.
+    #[test]
+    fn test_set_tmc_current_reports_a_hold_current_when_the_chip_has_one() {
+        let (printer, gcode, lines) = machine();
+        let (config, _) = Config::from_text(DRIVER_CONFIG).unwrap();
+        let driver = tmc2209_driver(&printer, &config);
+        let gcmd = gcode.create_gcode_command(
+            "SET_TMC_CURRENT",
+            "SET_TMC_CURRENT STEPPER=stepper_x CURRENT=0.7",
+            HashMap::from([("CURRENT".to_string(), "0.7".to_string())]),
+        );
+        driver.cmd_set_tmc_current(&gcmd).unwrap();
+        assert_eq!(
+            emitted(&lines),
+            vec!["// Run Current: 0.70A Hold Current: 0.70A".to_string()]
+        );
+    }
+
+    /// A chip without a hold current answers with the run current alone, and
+    /// reports a `null` hold current.
+    #[test]
+    fn test_set_tmc_current_replies_with_one_line_without_a_hold_current() {
+        let (printer, gcode, lines) = machine();
+        let (config, _) = Config::from_text(DRIVER_CONFIG).unwrap();
+        let (driver, recording) = tmc2660_driver(&printer, &config);
+        let gcmd = gcode.create_gcode_command(
+            "SET_TMC_CURRENT",
+            "SET_TMC_CURRENT STEPPER=stepper_x CURRENT=0.4",
+            HashMap::from([("CURRENT".to_string(), "0.4".to_string())]),
+        );
+        driver.cmd_set_tmc_current(&gcmd).unwrap();
+
+        assert_eq!(emitted(&lines), vec!["// Run Current: 0.40A".to_string()]);
+        assert!(recording.written("SGCSCONF").is_some());
+        let status = driver.get_status(0.0);
+        assert_eq!(status["run_current"], json!(0.4));
+        assert_eq!(status["hold_current"], Value::Null);
+    }
+
+    /// The error check reads the register and masks the driver's quirks name:
+    /// the TMC2660 reports through `READRSP@RDSEL2`, whose `se` field carries
+    /// the reset flag and whose `cs` field is the run current.
+    #[test]
+    fn test_the_2660_error_check_reads_the_rdsel2_register() {
+        let (printer, _gcode, _lines) = machine();
+        let (config, _) = Config::from_text(DRIVER_CONFIG).unwrap();
+        let (driver, recording) = tmc2660_driver(&printer, &config);
+        let check = driver.error_check();
+
+        assert_eq!(check.register_name(), "READRSP@RDSEL2");
+        assert_eq!(check.irun_field(), "cs");
+        assert_eq!(check.cs_actual_mask(), 0x1f << 14);
+        assert!(check.clears_gstat());
+        assert_ne!(check.error_mask(), 0);
+
+        check.check_once().unwrap();
+        assert_eq!(recording.reads(), vec!["READRSP@RDSEL2".to_string()]);
+    }
+
+    /// The 2130 keeps its own quirks (`clear_gstat = False`, `cs_actual`) and
+    /// every other driver reads `DRV_STATUS` without them.
+    #[test]
+    fn test_the_error_check_picks_the_register_and_masks_by_driver() {
+        let fields = Arc::new(FieldHelper::new(
+            HashMap::from([
+                (
+                    "DRV_STATUS".to_string(),
+                    HashMap::from([
+                        ("ot".to_string(), 0x01u32 << 1),
+                        ("cs_actual".to_string(), 0x1fu32 << 16),
+                    ]),
+                ),
+                (
+                    "GSTAT".to_string(),
+                    HashMap::from([("drv_err".to_string(), 0x01u32 << 2)]),
+                ),
+            ]),
+            &[],
+            HashMap::new(),
+        ));
+        let recording = Arc::new(RecordingTransport::default());
+        let transport: Arc<dyn TmcTransport> = recording.clone();
+
+        let check = TmcErrorCheck::new(
+            "tmc2130",
+            "stepper_x",
+            Arc::clone(&fields),
+            Arc::clone(&transport),
+        );
+        assert_eq!(check.register_name(), "DRV_STATUS");
+        assert_eq!(check.cs_actual_mask(), 0x1f << 16);
+        assert_eq!(check.irun_field(), "irun");
+        assert!(!check.clears_gstat());
+        check.check_once().unwrap();
+        assert_eq!(
+            recording.reads(),
+            vec!["DRV_STATUS".to_string(), "GSTAT".to_string()]
+        );
+
+        let check = TmcErrorCheck::new("tmc2209", "stepper_x", Arc::clone(&fields), transport);
+        assert_eq!(check.register_name(), "DRV_STATUS");
+        assert_eq!(check.cs_actual_mask(), 0);
+        assert_eq!(check.irun_field(), "irun");
+        assert!(check.clears_gstat());
+    }
+
+    /// The wave table's defaults, and a `driver_*` override of one of them.
+    #[test]
+    fn test_the_wave_table_helper_stores_the_upstream_defaults() {
+        let fields = FieldHelper::new(wave_table_fields(), &[], HashMap::new());
+        let section = section(
+            "tmc5160",
+            "stepper_x",
+            &[("driver_mslut0", "0"), ("driver_start_sin90", "10")],
+        );
+        wave_table_helper(&ConfigWrapper::untracked(&section), &fields).unwrap();
+
+        assert_eq!(fields.get_field("mslut0", None, None), 0);
+        assert_eq!(fields.get_field("mslut1", None, None), 0x4A9554AA);
+        assert_eq!(fields.get_field("mslut4", None, None), 0xFBFFFFFF);
+        assert_eq!(fields.get_field("mslut7", None, None), 0x00404222);
+        assert_eq!(fields.get_field("w0", None, None), 2);
+        assert_eq!(fields.get_field("w3", None, None), 1);
+        assert_eq!(fields.get_field("x1", None, None), 128);
+        assert_eq!(fields.get_field("x3", None, None), 255);
+        assert_eq!(fields.get_field("start_sin", None, None), 0);
+        assert_eq!(fields.get_field("start_sin90", None, None), 10);
+    }
+
+    /// `high_velocity_threshold: 50` → `thigh` = `12e6 * (0.0125/16) / 50`
+    /// = 187.5 → 188 (hz from the stepper's step distance), and 0 without it.
+    #[test]
+    fn test_the_vhigh_helper_stores_high_velocity_threshold_as_thigh() {
+        let (config, _) = Config::from_text(
+            "\
+[stepper_x]
+microsteps: 16
+rotation_distance: 40
+[stepper_y]
+microsteps: 16
+rotation_distance: 40
+[tmc5160 stepper_x]
+high_velocity_threshold: 50
+[tmc5160 stepper_y]
+",
+        )
+        .unwrap();
+        let fields = FieldHelper::new(wave_table_fields(), &[], HashMap::new());
+        fields.set_field("mres", 4, None, None);
+        let recording = Arc::new(RecordingTransport::default());
+        let transport: Arc<dyn TmcTransport> = recording;
+
+        let section = config.get_section("tmc5160 stepper_x").unwrap().clone();
+        let wrapper = ConfigWrapper::with_config(&section, AccessTracking::shared(), None, &config);
+        vhigh_helper(&wrapper, &fields, transport.as_ref()).unwrap();
+        assert_eq!(fields.get_field("thigh", None, None), 188);
+
+        let section = config.get_section("tmc5160 stepper_y").unwrap().clone();
+        let wrapper = ConfigWrapper::with_config(&section, AccessTracking::shared(), None, &config);
+        vhigh_helper(&wrapper, &fields, transport.as_ref()).unwrap();
+        assert_eq!(fields.get_field("thigh", None, None), 0);
     }
 }

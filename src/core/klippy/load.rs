@@ -366,6 +366,7 @@ mod tests {
                 "homing_override",
                 "input_shaper",
                 "manual_probe",
+                "pause_resume",
                 "probe",
                 "probe_eddy_current",
                 "quad_gantry_level",

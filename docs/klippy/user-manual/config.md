@@ -980,6 +980,15 @@ gap（如实登记）：**屏幕内容不渲染**（`display_template`/`display_
 
 节名注册为虚拟 pin chip：其他节写 `pin: multi_pin:<name>`（或 `heater_pin: multi_pin:heater`）。装载相位为 **`phase = early`**（`[extruder]` 等主节在装载期就要解析它；prefix-only 降 `order` 无效）。别名不得用于步进电机 pin。
 
+### `[respond]` — 主机回显（批 #29）
+
+| 选项 | 默认 | 说明 |
+|------|------|------|
+| `default_type` | `echo` | `M118`/`RESPOND` 的默认前缀：`echo`→`echo:`、`command`→`//`、`error`→`!!`（choice，大小写敏感） |
+| `default_prefix` | 取自 `default_type` | 覆盖默认前缀 |
+
+注册就绪前可用的两条命令：`M118 <原文>`（前缀 + 原文）与 `RESPOND [TYPE=] [PREFIX=] [MSG=]`（`TYPE` 多了 `echo_no_space`：前缀同为 `echo:` 但**不加空格**）。
+
 ### `[mcp4451 <name>]` — I2C 数字电位器（批 #25）
 
 | 选项 | 默认 | 说明 |

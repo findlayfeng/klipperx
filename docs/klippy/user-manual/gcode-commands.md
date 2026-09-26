@@ -381,6 +381,13 @@ ACTIVATE_EXTRUDER EXTRUDER=<name>
 
 ## 引脚输出
 
+### M118 / RESPOND — 主机回显（由 `[respond]` 注册，就绪前可用，批 #29）
+```
+M118 <原文>
+RESPOND [TYPE=echo|command|error|echo_no_space] [PREFIX=<前缀>] [MSG=<文本>]
+```
+`M118` 直接回 `<默认前缀> <原文>`；`RESPOND` 的 `MSG` = 缺省为空串，`PREFIX` 覆盖 `[respond]` 的默认前缀；非法 `TYPE` 报 `RESPOND TYPE '<t>' is invalid. Must be one of 'echo', 'command', or 'error'`。
+
 ### SET_IDLE_TIMEOUT — 设置空闲超时（由 `[idle_timeout]` 注册，批 #21）
 ```
 SET_IDLE_TIMEOUT [TIMEOUT=<秒>]

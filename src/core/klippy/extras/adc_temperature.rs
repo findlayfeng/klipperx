@@ -1231,7 +1231,21 @@ pub fn load_adc_temperature_prefix(
 
 // The sections the loader must know about. `thermistor` is prefix-only; the bare
 // `[adc_temperature]` is upstream's "load the defaults" switch.
-section!("thermistor", order = 25, prefix = load_thermistor_prefix);
+//
+// `phase = early` is load-bearing: this loader walks a phase's main sections
+// before its prefix sections, so a prefix-only *definition* only precedes the
+// generic `[extruder]`/`[heater_bed]` sections if it sits in an earlier phase.
+// A `[thermistor <name>]` registers a sensor factory that those sections look up
+// through `sensor_type` while they are being loaded, so an `order` below 20
+// would not help — within the generic phase the prefixes still load after every
+// main section. Upstream does not need this because it loads a file's sections
+// in file order. Same reason as `adc_scaled` (see its module docs).
+section!(
+    "thermistor",
+    order = 20,
+    phase = early,
+    prefix = load_thermistor_prefix
+);
 section!(
     "adc_temperature",
     order = 25,
@@ -1288,5 +1302,41 @@ mod tests {
 
         let temp = t.calc_temp(0.5);
         assert!(temp > 25.0 && temp < 150.0, "temp={}", temp);
+    }
+
+    /// A `[thermistor <name>]` registers a factory that `[extruder]`/`[heater_bed]`
+    /// look up through `sensor_type` while *they* are loading, so the definition
+    /// has to precede the consumer. This host orders sections by
+    /// `(phase, order, name)` rather than by file order, so both layouts must
+    /// load — which is what the `phase = early` declaration buys.
+    #[test]
+    fn test_a_custom_thermistor_loads_before_or_after_its_consumer() {
+        use crate::core::klippy::config::Config;
+        use crate::core::klippy::reactor::ManualReactor;
+
+        let head = "[mcu]\nserial: /dev/not-opened-yet\n\
+             [stepper_x]\nstep_pin: PA0\ndir_pin: PA1\nrotation_distance: 40\nmicrosteps: 16\n\
+             position_max: 200\n";
+        let definition =
+            "[thermistor MyThermistor]\ntemperature1: 25\nresistance1: 100000\nbeta: 3950\n";
+        let extruder = "[extruder]\nstep_pin: PA2\ndir_pin: PA3\nrotation_distance: 33.5\n\
+             microsteps: 16\nnozzle_diameter: 0.4\nfilament_diameter: 1.75\nheater_pin: PB0\n\
+             sensor_type: MyThermistor\nsensor_pin: PA4\ncontrol: pid\n\
+             pid_Kp: 1\npid_Ki: 0.1\npid_Kd: 10\nmin_temp: 0\nmax_temp: 250\n\
+             min_extrude_temp: 0\n";
+
+        for text in [
+            format!("{head}{definition}{extruder}"),
+            format!("{head}{extruder}{definition}"),
+        ] {
+            let printer = Arc::new(Printer::new(ManualReactor::shared()));
+            let (config, _) = Config::from_text(&text).expect("the test config parses");
+            printer
+                .load_config(&config)
+                .expect("the custom thermistor resolves in either layout");
+            // The definition was claimed: the loader would otherwise report
+            // `Section 'thermistor MyThermistor' is not a valid config section`.
+            assert!(printer.lookup_object("thermistor MyThermistor").is_some());
+        }
     }
 }

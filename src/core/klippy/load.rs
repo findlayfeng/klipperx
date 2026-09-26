@@ -36,6 +36,13 @@
 //! keeps `toolhead` for last; the order matters because an object may look up
 //! one an earlier entry registered.
 //!
+//! The main-before-prefix rule inside a phase is load-bearing on its own: a
+//! prefix-only section that *registers something another section consumes while
+//! loading* (a pin chip, a sensor factory) cannot precede the generic sections
+//! by `order` — every generic main section still loads first. Such a definition
+//! has to sit in an earlier phase (`phase = early`); `[adc_scaled <name>]` and
+//! `[thermistor <name>]` are the two cases.
+//!
 //! # Validation
 //!
 //! The undefined-option check runs at the end of [`Printer::load_config`] and
@@ -347,8 +354,8 @@ mod tests {
                 "pwm_cycle_time",
                 "pwm_tool",
                 "servo",
-                "adc_temperature",
                 "thermistor",
+                "adc_temperature",
                 "bed_mesh",
                 "bed_screws",
                 "bed_tilt",
@@ -421,10 +428,13 @@ mod tests {
                 "safe_z_home"
             ]
         );
-        // `mcu` and `adc_scaled` are the up-front sections (upstream loads
-        // `pins` and `mcu` before the generic walk, and a `[adc_scaled]`
-        // registers a chip the generic `[extruder]`/`[heater_bed]` sections
-        // resolve their `sensor_pin` against, so it has to precede them);
+        // `mcu`, `adc_scaled` and `thermistor` are the up-front sections
+        // (upstream loads `pins` and `mcu` before the generic walk; a
+        // `[adc_scaled]` registers a chip and a `[thermistor <name>]` a sensor
+        // factory that the generic `[extruder]`/`[heater_bed]` sections resolve
+        // their `sensor_pin`/`sensor_type` against *while they load*, so both
+        // have to precede them — and a phase's main sections load before its
+        // prefixes, so a prefix-only definition needs an earlier phase);
         // `[stepper_*]` and `[printer]` are late (upstream builds `toolhead`
         // last, and `Rail::lookup` reads stepper config at that point); the
         // rest are plain generic sections — including the generic-cartesian
@@ -439,6 +449,10 @@ mod tests {
         };
         assert_eq!(by_id("mcu").phase, Phase::Early);
         assert_eq!(by_id("adc_scaled").phase, Phase::Early);
+        // A `[thermistor <name>]` factory is consumed at load time, and it is a
+        // prefix section, so it must load in an early phase (see the array
+        // comment above).
+        assert_eq!(by_id("thermistor").phase, Phase::Early);
         assert_eq!(by_id("output_pin").phase, Phase::Generic);
         assert_eq!(by_id("stepper_x").phase, Phase::Late);
         assert_eq!(by_id("stepper_arm").phase, Phase::Late);

@@ -663,7 +663,7 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 
 - **框架队列 FW1–FW9（全部完成）**：FW1 配置装载、FW2 对象模型、FW3 错误词汇、FW4 G-Code、
       FW5 运动（a–f）、FW6 资源与触发、FW7 MCU 与传输、FW8 主机层与重启、FW9 API；验收以
-      「最小模块在 host 单测 + 假 MCU 上跑通」为准，真板项见 [`TESTING.md`](../../TESTING.md)。
+      「最小模块在 host 单测 + 假 MCU 上跑通」为准，真板项见 [`TESTING.md`](TESTING.md)。
       两个子项 `[~]` 暂缓：`GCodeIO`（不做 OctoPrint 串口仿真，见正文 G1b）、
       `MCU_bus_digital_out` 包装（能力已由 `DigitalOut::queue_digital_out` 提供，随 H8 显示接）。
       分阶段细节见各 FW 的工作记录（`docs/work-log/2026-09-21-fw*-notes.md` 等）；

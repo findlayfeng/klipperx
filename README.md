@@ -18,7 +18,8 @@ CRC/时钟同步/序号与重传）、运动规划与步进压缩、G-Code 调�
 用例都被当成一次真实运行来跑（字典驱动的假 MCU，走真实的 identify、配置与 g-code 路径），
 而不是拿本项目的实现互相印证。设计取舍、与上游的差异、已知缺口都逐条写进文档，不做静默降级。
 
-- 上游基线：`third_party/klipper/`（子模组；对照只读这一份，**不要**用机器上别的 klipper 检出）
+- 上游基线：`third_party/klipper/`（git 子模组，钉住一份上游版本；上游源码、`config/` 与语料
+  都从这一份读，不拿机器上别的 klipper 检出当参照）
 - 许可：GPL-3.0（派生自 [Klipper](https://github.com/Klipper3d/klipper)，Kevin O'Connor 等）
 
 ## 关于「谁写的」：AI 生成声明
@@ -47,7 +48,7 @@ AI 写实现」：人类负责方向与取舍、任务拆解、验收判定、�
 | 项 | 状态 |
 |---|---|
 | 上游语料（`KLIPPERX_UPSTREAM_ALL=1`） | **239 条声明运行**：其中 **237 条字典齐备、全部通过 / 0 条失败**；另 2 条（`generic-cramps.cfg`、`generic-replicape.cfg`，BeagleBone/PRU 板）因未构建 `pru` 字典而跳过——它们也正是静态缺口报告里**仅剩**的一处（`replicape` 节未实现）。忽略列表**已清空** |
-| 单进程闸门 | `KLIPPERX_UPSTREAM_GUARD=1 cargo test -p klipperx --lib` → **1976 通过 / 0 失败 / 2 忽略**（约 65 s，含全部语料） |
+| 单进程闸门 | `cargo test -p klipperx --lib` → **1976 通过 / 0 失败 / 2 忽略**（约 65 s，含全部语料；忽略列表守卫是 `KLIPPERX_UPSTREAM_GUARD`，见[环境变量](#环境变量开发与测试)） |
 | 真机 | 只有少量冒烟（单轴运动与位置读回、SPI flash、`stats`、`output_pin`、`mcu_temp`）；完整三轴/归零待接线，见 [`TESTING.md`](TESTING.md) |
 | `[extras]` 覆盖 | `src/core/klippy/extras/` 101 个模块文件、115 个 `section!` 声明；覆盖范围与逐模块说明见[开发手册模块表](docs/klippy/developer-manual/README.md) |
 | 输入通道 | API（`-a` unix socket，Moonraker 语义）与终端客户端**可用**；`virtual_sdcard` 的文件回放与 `GCodeIO`（伪 tty）**未实现/暂缓** |
@@ -77,19 +78,20 @@ AI 写实现」：人类负责方向与取舍、任务拆解、验收判定、�
 ## 快速上手
 
 ```sh
+# 取上游子模组（上游源码、`config/` 与回归语料都在里面；克隆时带了 --recurse-submodules 可跳过）
+git submodule update --init third_party/klipper
+
 # 构建（宿主二进制 klipperx 与 klippy）
 cargo build --release
 
-# 默认闸门：单进程跑全部测试 + 上游语料 + 忽略列表守卫（推荐日常用这一条）
-KLIPPERX_KLIPPER_DIR=$PWD/third_party/klipper \
-  KLIPPERX_UPSTREAM_GUARD=1 cargo test -p klipperx --lib
+# 单进程跑全部单测 + 上游语料（推荐日常用这一条）
+cargo test -p klipperx --lib
 
 # 全部 crate
-KLIPPERX_KLIPPER_DIR=$PWD/third_party/klipper cargo test --workspace
+cargo test --workspace
 
-# 完整语料口径（含忽略列表里的文件；耗时约 1 分钟）
-KLIPPERX_KLIPPER_DIR=$PWD/third_party/klipper KLIPPERX_UPSTREAM_ALL=1 \
-  cargo test -p klipperx --lib upstream_test_cases_run -- --nocapture
+# 只看语料：每个用例打一行（约 1 分钟）
+cargo test -p klipperx --lib upstream_test_cases_run -- --nocapture
 
 # 跑宿主：连配置里写的 MCU，并起 API / 开窗口
 cargo run --release -- config.cfg                 # 只起宿主
@@ -97,13 +99,33 @@ cargo run --release -- config.cfg -a /tmp/klippy_uds
 cargo run --release -- config.cfg --tui           # 本进程内开一个终端客户端窗口
 klipperx console -a /tmp/klippy_uds               # 另开终端连上去
 
-# 真机（需要一块板子；见 TESTING.md）
+# 真机（需要一块板子；见 TESTING.md；这个变量没有默认值，必须给出）
 KLIPPERX_HW_SERIAL=/dev/ttyACM0 cargo test -p klipperx --lib \
   test_frame_sequence_sync_against_a_real_board -- --ignored --nocapture
 ```
 
-> 语料测试需要 `third_party/klipper` 子模组（**只读**，本仓库不对它做任何远程操作）。
-> 未初始化时先由用户自行获取，不要在自动化里 `git submodule update`。
+真机 / 外设验证清单见 [`TESTING.md`](TESTING.md)。
+
+## 环境变量（开发与测试）
+
+多数变量只影响构建与测试；跑宿主本身只用到 `RUST_LOG`（可选再加 `KLIPPERX_TRACE`）。
+「默认」一栏就是不设置时的行为。
+
+| 变量 | 默认 | 作用 |
+|---|---|---|
+| `KLIPPERX_KLIPPER_DIR` | `<仓库>/third_party/klipper` | 语料、kconfig 片段与 host 库从哪个 klipper 检出读。**git worktree 里没有子模组，靠它指向主检出的那一份**。构建期与运行期读同一个值，改指向会触发重建。 |
+| `KLIPPERX_ARCHES` | `linux,avr,stm32,atsam,atsamd,lpc176x,rpxxxx,hc32f460` | 逗号分隔的 MCU 家族列表：构建阶段只为这些家族的 `test/configs/*.config` 生成 `.dict`（各需其工具链：主机 `cc`、`avr-gcc`、`arm-none-eabi-gcc`）；其余运行因缺字典跳过。 |
+| `KLIPPERX_ALL_ARCHES` | 未设置 | 设成任意值即忽略上面的列表，构建 `test/configs/` 下的**全部**目标（含 `pru`、`ar100`、`simu`，需要各自的工具链）。 |
+| `KLIPPERX_UPSTREAM_ALL` | 未设置 | 设成任意值即取消语料忽略列表（当前列表为空，故这只是口径上的保险；字典未构建的运行仍然跑不起来）。 |
+| `KLIPPERX_UPSTREAM_GUARD` | 未设置 | 设成任意值则额外跑「忽略列表守卫」：以 load-only（不建连接、不跑 g-code）方式重跑忽略用例，某个文件的所有运行都能装载，守卫就报失败，提示该核实并从忽略列表里删掉。 |
+| `KLIPPERX_UPSTREAM_VERBOSE` | 未设置 | 设成任意值后每个语料用例打一行 `VERBOSE <耗时> ok/fail <用例>`。 |
+| `KLIPPERX_TRACE` | 未设置（关闭） | 非 `0` 值打开诊断 trace：模拟器与 MCU 拆除打的 `SIM-DIAG: …` / `MCU DROP …` 行（追挂起用，平时是噪声）。 |
+| `KLIPPERX_HW_SERIAL` | 未设置 | 真机用例要用的串口路径。以 `--ignored` 显式请求而没设它时用例**失败**；不带 `--ignored` 不执行。 |
+| `KLIPPERX_USB_IDS` | `1d50:614e 1d50:606f` | `scripts/klipperx-usb-udev.sh` 按空格分隔的 `vendor:product` 找 Klipper 设备；自编固件改了 USB id 时用。 |
+| `RUST_LOG` | `info` | 宿主与客户端的日志过滤器；与 `--verbose` 取更详细者（`--verbose` 保底 `debug`），解析不了则忽略。 |
+
+`KLIPPER_HOST_LIB` 与 `KLIPPERX_TEST_DICTS` 不在此列：由 `crates/test-support/build.rs` 通过
+`cargo:rustc-env` 写死给测试读，不是给人设的。
 
 ## 仓库布局
 
@@ -123,7 +145,7 @@ crates/
   klippy-client/         客户端：`api` / `console`（TUI）/ TUI 窗口
   test-support/          测试支撑：按架构构建 MCU 字典、语料目录解析
 docs/                    文档（见下）
-third_party/klipper/     上游 Klipper（只读基线 + 语料 + 固件源码）
+third_party/klipper/     上游 Klipper（git 子模组：语料 + 上游 config + 固件源码）
 ```
 
 ## 文档

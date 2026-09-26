@@ -342,6 +342,7 @@ git config core.hooksPath .githooks
 | `extras/adc_scaled.rs`（批 #19，15 测） | 四个文案逐字（`must be specified`/`must be above 0`/`vref and vssa must be on same mcu`/`adc_scaled only supports adc pins`）、装载顺序（缺节时 `sensor_pin: Unknown pin chip name 'vref_scaled'`，有的则通）、参考采样 `(0.300,0.001,8,1,0.,1.,0)`、每 `sensor_pin` 各建一个内层 ADC、换算方向与 `calc_smooth=min(Δt/smooth_time,1)`、只取末样本、参考未就绪时的 0/0（NaN/±inf，照上游复现） |
 | `spi_temperature.rs` | MAX6675/MAX31855 转换、符号位负温、MAX31856 与 MAX31865 转换 |
 | `extras/ad5206.rs`（批 #16，7 测） | `enable_pin` 作 CS 的 SPI mode 0 / 25 MHz 默认、`scale` 默认 1.0 与 `above=0.` 越界文案、`channel_1..6` 的 `minval=0.`/`maxval=scale` 文案、`int(val*256/scale+.5)` 换算（含 scale 顶值与未给通道跳过）、写入顺序与 bring-up 后经 post-init 回调发出 |
+| `extras/mcp4451.rs`（批 #25，11 测） | smoothieboard/azteeg 两组语料字节序列逐字（含无条件两条 `0xff`）、`int(val*255/scale+.5)` 舍入、寄存器打包 `[(reg<<4)|high, value]`、未给 wiper 不写、`must be specified`/`must be above 0`/wiper `min`/`max`、`i2c_address` 的 0..127 与 44..47 两条文案、装载期写经 post-init 回调 spawn |
 | `temperature_mcu.rs` | 单点直线、两点标定、手动标定读上游选项（`temperature_sensor` 节上的标定点） |
 | `temperature_combined.rs` | 三种合并方式（`min`/`max`/`mean`）与舍入 |
 | `bus_debug.rs` | `DATA=` 十六进制往返（`test_hex_round_trips`） |

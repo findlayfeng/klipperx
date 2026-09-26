@@ -26,7 +26,7 @@
 mod adc;
 mod endstop;
 mod i2c;
-mod pin;
+pub(crate) mod pin;
 mod pwm;
 mod spi;
 mod stepper;

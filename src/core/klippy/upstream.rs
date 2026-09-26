@@ -409,13 +409,9 @@ mod tests {
     /// the list stays honest rather than hiding regressions.
     // Empty: every upstream run's dictionaries are built and every one passes
     // (measured with `KLIPPERX_UPSTREAM_ALL=1`). Keep the list for the next gap.
-    // `printers.test` is back here for one reason: ~200 of its cases leak their
-    // MCU (each case's `printer.teardown()` drops the objects, but some
-    // stepper-path object still holds the MCU), so the shared tokio runtime
-    // never shuts down at the end of the run and the default suite never exits.
-    // `KLIPPERX_UPSTREAM_ALL=1` still runs them all: 203/203 pass. The leak is
-    // the last core defect; this entry goes away with it.
-    const IGNORED: &[&str] = &["printers.test"];
+    // Empty: every run's dictionaries are built and every run passes. The list
+    // stays for the next gap (see the module docs for how a case is isolated).
+    const IGNORED: &[&str] = &[];
 
     // -----------------------------------------------------------------------
     // Which architectures and dictionaries to run
@@ -738,11 +734,60 @@ mod tests {
             .expect("G28 runs against the fake firmware");
     }
 
+    /// A case must not leave the machine's runtime unable to shut down.
+    ///
+    /// A leaked `Mcu` is the failure this guards: its receive task sits in a
+    /// blocking device read that only `Mcu::Drop` releases, so the runtime waits
+    /// for that thread and the suite hangs instead of failing. Upstream avoids
+    /// it by running every case as its own process; this host gives every case
+    /// its own runtime, and this test asserts that the runtime really does come
+    /// back.
+    #[test]
+    fn a_case_runtime_shuts_down() {
+        let run = all_runs()
+            .into_iter()
+            .find(|run| {
+                run.config
+                    .file_name()
+                    .map(|name| name == "example-cartesian.cfg")
+                    .unwrap_or(false)
+            })
+            .expect("the corpus has example-cartesian.cfg");
+        let dictionaries = run_dictionaries(&run);
+        assert!(
+            dictionaries.iter().all(|(_, path)| path.is_some()),
+            "example-cartesian's dictionaries are built"
+        );
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("a case runtime");
+        runtime
+            .block_on(run_case(&run, &dictionaries))
+            .expect("the case runs");
+        let started = std::time::Instant::now();
+        runtime.shutdown_timeout(std::time::Duration::from_secs(CASE_SHUTDOWN_TIMEOUT));
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(CASE_SHUTDOWN_TIMEOUT),
+            "the case's runtime did not shut down within {CASE_SHUTDOWN_TIMEOUT}s ({elapsed:?}): \
+             a part was leaked"
+        );
+    }
+
+    /// How long a case's runtime may take to shut down.
+    ///
+    /// A case that leaks a part whose blocking device read is never released
+    /// makes the runtime wait for that thread; upstream cannot hit this because
+    /// every case is its own process. The bound is generous (the measured
+    /// shutdown is milliseconds) so only a real leak trips it.
+    const CASE_SHUTDOWN_TIMEOUT: u64 = 5;
+
     /// Run the upstream runs whose dictionaries were built and that are not on
     /// the ignore list; `KLIPPERX_UPSTREAM_ALL=1` drops the ignore list (and
     /// `KLIPPERX_UPSTREAM_VERBOSE=1` prints a per-case line with its duration).
-    #[tokio::test(flavor = "multi_thread")]
-    async fn upstream_test_cases_run() {
+    #[test]
+    fn upstream_test_cases_run() {
         let all = std::env::var_os("KLIPPERX_UPSTREAM_ALL").is_some();
 
         let mut ran = 0usize;
@@ -785,7 +830,18 @@ mod tests {
 
             let verbose = std::env::var_os("KLIPPERX_UPSTREAM_VERBOSE").is_some();
             let started = std::time::Instant::now();
-            match run_case(&run, &dictionaries).await {
+            // One runtime per case, as upstream gives every case its own
+            // `klippy.py` process (`scripts/test_klippy.py`). A case that leaks a
+            // part (a reference cycle keeping an `Mcu` alive parks its receive
+            // task's blocking read) must not be able to keep the *next* case's
+            // runtime — or the whole suite — from shutting down.
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("a case runtime");
+            let outcome = runtime.block_on(run_case(&run, &dictionaries));
+            runtime.shutdown_timeout(std::time::Duration::from_secs(CASE_SHUTDOWN_TIMEOUT));
+            match outcome {
                 Ok(()) => {
                     ran += 1;
                     if verbose {

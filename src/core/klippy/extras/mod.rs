@@ -55,6 +55,7 @@ pub mod led;
 pub mod load_cell;
 pub mod manual_probe;
 pub mod manual_stepper;
+pub mod mcp4018;
 pub mod mcp4451;
 pub mod mpu9250;
 pub mod multi_pin;

@@ -401,6 +401,7 @@ mod tests {
                 "i2c_device",
                 "led",
                 "load_cell",
+                "mcp4018",
                 "mcp4451",
                 "mpu9250",
                 "neopixel",

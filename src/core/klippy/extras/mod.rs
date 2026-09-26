@@ -90,6 +90,7 @@ pub mod tmc;
 pub mod tmc2130;
 pub mod tmc2208;
 pub mod tmc2209;
+pub mod tmc2240;
 pub mod tmc2660;
 pub mod tmc_spi;
 pub mod tmc_uart;

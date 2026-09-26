@@ -55,7 +55,7 @@ H1–H12 是上游 extras 里按域归并的消费者（2026-09-21 全量盘点�
 
 | # | 事项 | 依赖 |
 |---|---|---|
-| C1 | 运动层收尾：轴/stepper 抽象 + 多轴（C1a）、extruder 运动（C1b）、运动学族（C1c）、`gcode_move`/print-time 回调（C1d）；详见下方 C1 小节与 [C1 调查](docs/work-log/2026-09-22-c1-notes.md) | — |
+| C1 | 运动层收尾：轴/stepper 抽象 + 多轴（C1a）、extruder 运动（C1b）、运动学族（C1c：delta/polar/generic_cartesian/rotary_delta/winch/deltesian 全落地）、print-time 回调（C1d）——**✅ 收官** | — |
 | C2 | 配置装载：框架部分 ✅（FW1，含 choice/range 文案与 `deprecate` 警告）；autosave/`SAVE_CONFIG` 仍待（属模块） | — |
 | D1 | 主机层 start args / rollover / `--logfile` ✅（FW8）；剩余：`debuginput`/`debugoutput` 的命令行接线与每 MCU 字典路径 | — |
 
@@ -242,15 +242,19 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
       H5（TMC/tmcuart）、H6（sensor_bulk/加速度计）、H7（buttons/pulse_counter/trigger_analog）、
       H8（lcd）。
 
-### C1 运动层收尾
+### C1 运动层收尾 —— ✅ 收官
 
-- [ ] **引用（细节以笔记为准）**：[C1 动工前调查](docs/work-log/2026-09-22-c1-notes.md)——架构取舍、
-  单轴链推广方案与已落地项的证据都在那边。余项：**C1c-2 `delta` 族**余 `deltesian`/`winch`（`delta` 本体 ✅ 批 #5、`rotary_delta` ✅ 批 #40，`mathutil` 的 `trilateration`/`gaussian_solve` 已到位）、**C1c-3
-  `generic_cartesian`**、**C1c-4 `polar`** ✅（2026-09-24 批 #5）、**C1d print-time 回调**
-  （`ToolHead::register_lookahead_callback` + `motion_queuing.register_flush_callback`）。
+- **C1a** 轴/stepper 抽象 + 多轴（`[stepper_z1]`…、`Rail`/`LookupMultiRail`）✅
+- **C1b** extruder 运动（`extra_axes`/junction 接线）✅
+- **C1c** 运动学族：`delta`（批 #5）、`polar`（批 #5）、`generic_cartesian`（批 #12）、
+  `rotary_delta`（批 #40）、`winch`、`deltesian` **全部落地**；`mathutil` 的
+  `trilateration`/`gaussian_solve` 已到位。
+- **C1d** print-time 回调（`ToolHead::register_lookahead_callback` +
+  `motion_queuing.register_flush_callback`）✅（`toolhead:sync_print_time` **事件本身仍无发送点**，
+  它与本项的「回调」是两件事——`idle_timeout` 因此改为观察 `print_time` 前进）。
 
-> **T3 的边界**：`[extruder]`/`heater_bed`/`fan` 三段与 C1b 已落地；T3 现卡在 H2-3 的
-> `heater_fan`、H1 的 `pid_calibrate`、H10 的 `extruder_stepper`；T5 按 C1c 的族顺序推进。（pulse_counter 批 #8、verify_heater 批 #20、idle_timeout 批 #21 已消。）
+**历史归档**：C1 的动工前调查（上游轴/stepper/rail/extruder 模型、七个拍板点、C1a–C1d 拆分）随收官
+从工作记录目录清理；需要时 `git log --diff-filter=D -- docs/work-log/` 找回。
 
 ### C2 配置装载收尾（框架 FW1）
 
@@ -540,11 +544,11 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 |---|---|---|---|---|
 | `toolhead:manual_move` | 手动移动前 | `positions, speed` | `klippy/toolhead.py:390` | 尚无触发点（handler 已备，G4-2） |
 | `toolhead:set_position` | 设置位置（G92 等） | `positions, e` | `klippy/toolhead.py:416` | ✅ 已触发（`extras/toolhead.rs:1091`，`SET_KINEMATIC_POSITION`） |
-| `toolhead:sync_print_time` | print_time 更新 | `print_time` | `klippy/toolhead.py:446` | 尚无触发点（随 C1d） |
+| `toolhead:sync_print_time` | print_time 更新 | `print_time` | `klippy/toolhead.py:446` | **尚无发送点**（C1d 的回调已落地，但该事件没有触发方；`idle_timeout` 改为观察 `print_time` 前进） |
 | `toolhead:update_extra_axes` | 额外轴位置更新 | `positions` | `klippy/toolhead.py:455` | 尚无触发点（handler 已备，G4-2） |
 
 > `toolhead:set_position` 已产线触发（`gcode_move` 重置链之一）；其余三个尚无触发点：
-> `manual_move`/`update_extra_axes` 等 G4-2 的 API，`sync_print_time` 随 C1d。
+> `manual_move`/`update_extra_axes` 等 G4-2 的 API；`sync_print_time` 仍无发送点（C1d 已收官）。
 
 ### gcode 事件
 
@@ -592,7 +596,7 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 ├── klippy:* 生命周期事件（8个）—— 已触发（notify_mcu_error / analyze_shutdown 也已接入）
 ├── stepper:* —— 依赖 C1（位置同步/目录反转，尚无触发点）
 ├── homing:* —— 已触发（toolhead 回零路径）
-├── toolhead:* —— set_position 已触发；其余随 G4-2 / C1d
+├── toolhead:* —— set_position 已触发；其余随 G4-2（C1d 已收官）
 ├── idle_timeout:* —— 依赖 idle_timeout 对象
 ├── gcode:* —— command_error / request_restart 已触发；debuginput_exit 随 GCodeIO 暂缓
 ├── probe:* —— 依赖 endstop

@@ -7,7 +7,7 @@
 
 - 上游基线：`third_party/klipper/`（commit `02e71b9`），`klippy/extras/gcode_move.py`（349 行）
 - 本地基线：`cb50abf`
-- 相关记录：[C1 动工前调查](2026-09-22-c1-notes.md)、[H2 动工前调查](2026-09-23-h2-notes.md)
+- 相关记录：[H2 动工前调查](2026-09-23-h2-notes.md)
 
 ---
 

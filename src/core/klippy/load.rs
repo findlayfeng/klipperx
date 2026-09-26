@@ -411,6 +411,7 @@ mod tests {
                 "tmc2130",
                 "tmc2208",
                 "tmc2209",
+                "tmc2240",
                 "tmc2660",
                 "tmc5160",
                 // The display framework, after the `display_template` registry

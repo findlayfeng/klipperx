@@ -367,6 +367,7 @@ mod tests {
                 "bltouch",
                 "board_pins",
                 "controller_fan",
+                "delayed_gcode",
                 "delta_calibrate",
                 "display_status",
                 "exclude_object",

@@ -927,6 +927,10 @@ Z 端停来源：`[stepper_z]`，否则 `[carriage <名>]` 中 axis 为 z 者；
 
 gap（如实登记）：**屏幕内容不渲染**（`display_template`/`display_data`/`display_glyph` 只解析+存储；刷新只 clear/flush）；**菜单未实现**（无 `menu` 对象、无 `menu:*` 事件、不装载 `menu.cfg`）；随模块发布的 `display.cfg` 为 **vendored 副本**（有漂移守卫测试）。
 
+### `[fan_generic <name>]` — 通用风扇（批 #18）
+
+本身不读选项：整节交给 `[fan]` 的核心（`pin`/`max_power`/`kick_start_time`/`off_below`/`cycle_time`/`hardware_pwm`/`shutdown_speed`/`enable_pin`/`tachometer_*`；**`shutdown_speed` 默认 `0.0`**，与 `[heater_fan]` 的 1.0 不同）；节名即 mux 值，注册 `SET_FAN_SPEED FAN=<name> SPEED=<0..1>`。`TEMPLATE=` 形式**未实现**（模板求值器未落地，调用报明确拒绝）。
+
 ### `[ad5206 <name>]` — 数字电位器（批 #16）
 
 | 选项 | 默认 | 说明 |

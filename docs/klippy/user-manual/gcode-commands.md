@@ -381,6 +381,12 @@ ACTIVATE_EXTRUDER EXTRUDER=<name>
 
 ## 引脚输出
 
+### SET_FAN_SPEED — 设置通用风扇速度（多路键 `FAN`，批 #18）
+```
+SET_FAN_SPEED FAN=<name> SPEED=<0..1>
+```
+每个 `[fan_generic <name>]` 注册一个 `FAN` 值。`SPEED` 与 `TEMPLATE` 必须恰给一个，否则报 `SET_FAN_SPEED must specify SPEED or TEMPLATE`；`TEMPLATE=` 形式未实现（模板求值器未落地）。
+
 ### SET_PIN — 设置引脚值（多路键 `PIN`）
 
 ```

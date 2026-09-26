@@ -306,6 +306,7 @@ identify 的命令**定义**（名称、参数、解码）与其它命令一样�
 | `filament_switch_sensor.rs` + `filament_motion_sensor.rs` + `buttons.rs` | 断料检测两段与 `[buttons]` 依赖对象（wave-2，`extruders.test` 转绿即其验收） |
 | `pause_resume.rs` | `[pause_resume]` 节与 `PAUSE`/`RESUME`/`CLEAR_PAUSE`/`CANCEL_PRINT`（批 #15）；`pause_resume/*` 三个 webhooks 端点未注册，`virtual_sdcard` 的暂停/恢复原语未做 |
 | `heater_fan.rs` | `[heater_fan <name>]`：`Fan` 核心 + `klippy:ready` 起的每秒 tick，任一 heater 有 target 或温度 > `heater_temp` 即为 `fan_speed`，**仅速度变化时写 PWM**（批 #6；`printers.test` 的 run 级收益） |
+| `fan_generic.rs` | `[fan_generic <name>]`：全部选项交给 `Fan` 核心（`shutdown_speed` 默认 **0.0**），注册 mux 命令 `SET_FAN_SPEED FAN=<name>`；`TEMPLATE=` 分支明确拒绝（模板求值器未实现，批 #18） |
 | `safe_z_home.rs` | `[safe_z_home]`：接管 G28（Z-hop → 按需 `X0 Y0` → 安全位 → `Z0`）；`section!(order = 70, phase = late)` **必须晚于 toolhead（`printer`，order 60 late）**，否则 `unregister_command("G28")` 得 `None`；与 `[homing_override]` 互斥（批 #6） |
 | `manual_stepper.rs` + `force_move.rs` | `[manual_stepper <name>]` 与 `MANUAL_STEPPER`（含 `GCODE_AXIS` 动态注册/注销 extra axis）；`force_move.rs` 目前只含 `calc_move_time`（归属对齐上游）（批 #6） |
 | `display/{mod,display,st7920,hd44780,uc1701,ssd1306}.rs` + vendored `display.cfg` | `[display]` 框架与四驱动（批 #7+#13）；**storage-only**（不渲染、菜单未实现，见 config 手册的 gap）；`display_status` 的 `M73`/`M117`/`SET_DISPLAY_TEXT` 批 #7 落地 |
@@ -339,7 +340,7 @@ identify 的命令**定义**（名称、参数、解码）与其它命令一样�
 | `bus_debug.rs` | `i2c_device` / `spi_device` 共用的调试命令底座：同步→异步桥与 `DATA=` 的十六进制编解码（无配置节） |
 | `error_mcu.rs` | MCU 停机消息的展开（无配置节，第一个 `[mcu]` 拉起）：监听 `klippy:shutdown` / `klippy:analyze_shutdown`，把简短原因扩成原因+提示（上游 `extras/error_mcu.py`） |
 
-`extras/` 的 78 个模块（77 `pub mod` + `pub(crate) bus_debug`）全部在 `extras/mod.rs` 声明；其中 59 个文件注册了 74 个 `section!`（含 `printer`，声明在 `toolhead.rs`；`mcu` 声明在 `mcu/mod.rs` 且同时声明普通与 prefix 两种形式，共 75 个装载 id）构成工厂表；`heaters` / `gcode_move` / `query_endstops` / `error_mcu` / `bus_debug` 等非节模块由上述模块按需 `ensure`，不占配置节。
+`extras/` 的 79 个模块（78 `pub mod` + `pub(crate) bus_debug`）全部在 `extras/mod.rs` 声明；其中 60 个文件注册了 75 个 `section!`（含 `printer`，声明在 `toolhead.rs`；`mcu` 声明在 `mcu/mod.rs` 且同时声明普通与 prefix 两种形式，共 76 个装载 id）构成工厂表；`heaters` / `gcode_move` / `query_endstops` / `error_mcu` / `bus_debug` 等非节模块由上述模块按需 `ensure`，不占配置节。
 
 ### `api/` — 客户端 API 层
 

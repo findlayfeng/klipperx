@@ -342,6 +342,7 @@ mod tests {
             [
                 "mcu",
                 "stepper_enable",
+                "multi_pin",
                 "adc_scaled",
                 "extruder",
                 "extruder_stepper",
@@ -450,6 +451,9 @@ mod tests {
                 .unwrap_or_else(|| panic!("no section '{id}'"))
         };
         assert_eq!(by_id("mcu").phase, Phase::Early);
+        // A virtual pin *provider* whose consumers are regular sections: like
+        // `adc_scaled` it must load before the generic walk, see the module docs.
+        assert_eq!(by_id("multi_pin").phase, Phase::Early);
         assert_eq!(by_id("adc_scaled").phase, Phase::Early);
         // A `[thermistor <name>]` factory is consumed at load time, and it is a
         // prefix section, so it must load in an early phase (see the array

@@ -55,6 +55,7 @@ pub mod manual_probe;
 pub mod manual_stepper;
 pub mod mcp4451;
 pub mod mpu9250;
+pub mod multi_pin;
 pub mod output_pin;
 pub mod pause_resume;
 pub mod probe;

@@ -163,6 +163,19 @@ gcode id 的 API 落地）、`move_transform`（等 `bed_mesh`）、`extruder:ac
 
 ---
 
-## 6. 实施记录
+## 6. 实施记录（2026-09-25 回填）
 
-（每步一个提交，做完回填。）
+**G4-1 坐标系核心：已落地** —— `extras/gcode_move.rs`（状态、`G90/G91`、`M82/M83`、`G92`、
+`SET_GCODE_OFFSET`、`M220/M221`、`SAVE/RESTORE`、`M114`、`get_status`）；`commands.test` 与
+`out_of_bounds.test` 随之转绿，语料全绿（批 #41）。
+
+**G4-2 仍未做**（权威口径是 `gcode_move.rs` 头注释的「What is not here」）：
+
+| 余项 | 现状 |
+|---|---|
+| `GET_POSITION` | **未注册**（未知命令静默放行，因此不扣分）；需 `kin.get_steppers()` + `calc_position` + `McuStepper` 的 MCU 位置 |
+| extra 轴的 `axis_map` | 本仓 `Coord` 是 4 轴，映射停在 `E` |
+| `toolhead:manual_move` / `toolhead:update_extra_axes` | 处理器已备，**无发送点**（其 API 属 G4-2） |
+| `set_move_transform` | 已写并占上游 `bed_mesh` 的槽，但无人换 target |
+| `toolhead:sync_print_time` | 仍无发送点（C1d 的回调已落地；`idle_timeout` 改为观察 `print_time` 前进） |
+| `motion_report`（`dump_trapq`/`dump_stepper`） | 未做，跟踪在 `TODO.md` 的 H10 / B4 |

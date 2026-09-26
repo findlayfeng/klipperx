@@ -353,10 +353,12 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 ### H2 风扇与通用输出
 
 - [ ] **引用（拆分、拍板点与依赖以笔记为准）**：[H2 动工前调查](docs/work-log/2026-09-23-h2-notes.md)
-  ——上游 21 个文件的依赖盘点、H2-1…H2-7 拆分与四个拍板点。余项：`pwm_tool.py`（队列化 PWM，随运动）、
-  `pwm_cycle_time.py`、`static_pwm_clock.py`、`multi_pin.py`、`servo.py`、`duplicate_pin_override.py`、
-  板级扩展（`sx1509`/`replicape`）；失败统计里的 `heater_fan`/`controller_fan`
-  归本域。
+  ——上游 21 个文件的依赖盘点、H2-1…H2-7 拆分与四个拍板点。**已落地**：`fan`/`fan_generic`/
+  `heater_fan`/`controller_fan`（含 heater 注册表）、`tachometer_pin`→`pulse_counter`、
+  `pwm_tool`/`pwm_cycle_time`/`servo` 模块本体、`multi_pin`（批 #26）、`sx1509`（批 #41）；
+  **余项**：`GCodeRequestQueue` 队列移植（`pwm_tool` 的队列化 PWM，同 **G2b**）、
+  `static_pwm_clock.py`（语料 1 处）、`replicape.py`（语料 1 处，另见本文件「特定板/芯片」）、
+  `duplicate_pin_override.py`（语料 0 用）。
 
 ### H3 G-Code 宏与脚本
 

@@ -184,13 +184,14 @@ connect_file(输出文件, 字典):
 
 ### 当前状态
 
-按默认 `KLIPPERX_ARCHES`（`linux` + `avr` + 各 ARM 家族）与现有忽略列表，239 次运行的判定：
+按默认 `KLIPPERX_ARCHES`（`linux` + `avr` + 各 ARM 家族），237 次可用运行的判定（2026-09-25 收官）：
 
 | 判定 | 次数 | 原因 |
 |------|------|------|
 | 因字典未构建跳过 | 2 | `printers.test` 中引用 `pru` 的两条运行（默认不编 `pru`） |
-| 因忽略列表跳过 | 208 | 尚未落地的配置节/运动学（6 个 `.test` 文件） |
-| 实际执行 | **33** | `linuxtest.test`（T1）、`commands.test`、`out_of_bounds.test`（b39750f）、`bed_mesh.test`、`z_virtual_endstop.test`（探针链路单元）、`z_tilt.test`、`quad_gantry_level.test`（H9 调平族）、`bltouch.test`、`smart_effector.test`（H9 探针族）、`multi_z.test`（M7 发送队列水位）、`screws_tilt_adjust.test`（M4 探测语义与亚纳米守卫）、`gcode_arcs.test`、`bed_screws.test`、`pwm.test`、`temperature.test`、`macros.test`（集成批 #1 段落地）、`led.test`、`sdcard_loop.test`、`pressure_advance.test`（集成批 #2 段落地）、`eddy.test`（批 #3，M5 收官）、`dual_carriage.test`、`exclude_object.test`（批 #4 宏体渲染）、`polar.test`、`delta.test`、`delta_calibrate.test`（批 #5 运动学）、`hybrid_corexy_dual_carriage.test`（wave-2：`[input_shaper]` 段）、`extruders.test`（wave-2：filament 传感器段）、`manual_stepper.test`（批 #6）、`generic_cartesian_iqex.test`/`generic_cartesian_itex.test`（批 #27 转绿并摘出 IGNORED）、**全部通过** |
+| 因忽略列表跳过 | **0** | `IGNORED` 已清空 |
+| 实际执行 | **236** | 全部通过（下表列出各 `.test`，`printers.test` 一个文件 203 条运行） |
+| 其中早期转绿 | — | `linuxtest.test`（T1）、`commands.test`、`out_of_bounds.test`（b39750f）、`bed_mesh.test`、`z_virtual_endstop.test`（探针链路单元）、`z_tilt.test`、`quad_gantry_level.test`（H9 调平族）、`bltouch.test`、`smart_effector.test`（H9 探针族）、`multi_z.test`（M7 发送队列水位）、`screws_tilt_adjust.test`（M4 探测语义与亚纳米守卫）、`gcode_arcs.test`、`bed_screws.test`、`pwm.test`、`temperature.test`、`macros.test`（集成批 #1 段落地）、`led.test`、`sdcard_loop.test`、`pressure_advance.test`（集成批 #2 段落地）、`eddy.test`（批 #3，M5 收官）、`dual_carriage.test`、`exclude_object.test`（批 #4 宏体渲染）、`polar.test`、`delta.test`、`delta_calibrate.test`（批 #5 运动学）、`hybrid_corexy_dual_carriage.test`（wave-2：`[input_shaper]` 段）、`extruders.test`（wave-2：filament 传感器段）、`manual_stepper.test`（批 #6）、`generic_cartesian_iqex.test`/`generic_cartesian_itex.test`（批 #27 转绿并摘出 IGNORED）、**全部通过** |
 
 上游 `configparser` 的 `optionxform = str.lower` 已对齐（`mod.rs` 存储侧小写 + `section.rs` 查询侧小写），`Option 'pid_Kp' … must be specified` 类的 49 次回归失败已归零；`must be specified` 错误文案保留调用方传入的大小写，`is not valid` 与 `Section '…' is not valid` 使用存储侧小写。
 
@@ -200,31 +201,24 @@ M3 `smart_effector` 落地后，仅剩 `eddy.test`——`probe_eddy_current` 属
 - 头两个转绿的用例：`linuxtest.test`（只需 `kinematics: none`、`heaters` 的传感器注册表、
   `temperature_sensor` 与 `ds18b20`，g-code 只是一次 `G4 P1000`）；随后 `gcode_move`（G4-1）与
   `EXTRUDER` 默认项（e8bf2b7）让 `commands.test` 与 `out_of_bounds.test` 也过了守卫，移出忽略列表。
-- `KLIPPERX_UPSTREAM_ALL=1` 只去掉忽略列表这一层：默认构建下它会跑 237 条可用运行，其中 **236 条通过、0 条失败**（2026-09-25 实跑，批 #41 合入后；批 #8/#11 转绿 tachometer 与 bed_mesh，批 #12 摘除 `corexyuv.test`/`generic_cartesian.test`（IGNORED 8→6），批 #13 面板四驱动使 `lcd_type` 拒收清零，批 #15 `pause_resume` 转 5、批 #16 `ad5206` 转 7、批 #17 模板过滤器转 3、批 #18 `fan_generic` 转 2、批 #19 `adc_scaled` 转 3、批 #20 `verify_heater` 转 3、批 #21 `idle_timeout` 转 2、批 #22 自定义 `thermistor` 装载序转 3、批 #23 `dac084S085` 转 2、批 #25 `mcp4451` 转 2、批 #26 `multi_pin`（修掉 pin-chip 首因，该配置接下来卡 `homing_heaters`）、批 #28 `aip31068_spi`（推进 A10T 到 `respond`）；批 #24 模板列表字面量与批 #27 `dual_carriage` 的 `primary_carriage` 可选共同使 `generic_cartesian_iqex/itex` 转绿并**摘出 IGNORED（6→4）**；批 #29 `respond` 使 `printer-geeetech-A10T-A20T-2021.cfg` 整例转绿、批 #30 `hd44780_spi`、批 #31 `homing_heaters` 使 `printer-geeetech-301-2019.cfg` 转绿、批 #32 `firmware_retraction` 使 `printer-lulzbot-mini1-2016.cfg` 转绿、批 #33 `mcp4018` 转 2（`generic-mightyboard`/`flashforge-creator-pro`）、批 #34 **`tmc2130`（W2）转 4**（两节 + 两 pin-chip；`tmc.test` 前移到 `tmc5160`）；批 #34 之后又转绿：`tmc2660`(W5) 2、`tmc5160`(W3) 3、`sx1509` 1、`mcp4018` 2、`send-queue` 修掉 `no available capacity`（`flashforge-creator-pro`）、`axis_twist_compensation` 1（`ender5-s1`）；`tmc2240`(W4) 使 `tmc.test` 进入「只差 g-code」；批 #39 修掉 `tmc2208::build_read_translate` 的寄存器名转写 bug（`Some("IOIN")` → 上游语义 `None`；该驱动此前**无测试模块**，故漏网）后，**`tmc.test` 整例转绿并摘出 IGNORED（4→3）**；**`printers.test` 子进度 203/203**、`IGNORED` **清空**））。
+- `KLIPPERX_UPSTREAM_ALL=1` 只去掉忽略列表这一层：默认构建下它会跑 237 条可用运行，其中
+  **236 条通过、0 条失败**，`IGNORED` **已清空**（2026-09-25 收官；逐批转绿过程见各批提交信息与
+  `TODO.md`）。另有 2 条运行声明 `DICTIONARY … pru.dict`，默认不构建 `pru`（需 `pru-gcc`），
+  不计入统计。
+- 按「首次失败」归类的历史分布（T3–T10 工单、运动学细分、完整失败日志与「收益不可加」的复盘）
+  曾记在 `docs/work-log/2026-09-22-upstream-regression-failures.md`；该快照**随收官从工作记录目录
+  清理**（`git log --diff-filter=D -- docs/work-log/` 可找回）。本页只保留机制与推进口径，避免两处
+  统计互相漂移。
 
-**为什么"全绿"曾经表现为"很慢"**：摘掉 `printers.test` 后默认套件一度 >9 分钟不退出。逐例计时（`KLIPPERX_UPSTREAM_VERBOSE=1`，每个用例一行）显示**用例本体只有 ~0.25s/例（201 例共 48s）**，慢的是**收尾**：个别用例泄漏了它的 `Mcu`（引用环使 `Mcu::Drop` 不跑，接收任务的阻塞读不释放 → 共享 runtime 关不掉），而多个 lane 并行跑重型套件与残留进程又放大了假象。对策（三条一起）：
-1. **每例一个独立 runtime + 有界收尾**（`upstream_test_cases_run` 改为 `#[test]`，`CASE_SHUTDOWN_TIMEOUT = 5s`）——对齐上游"每个用例一个 `klippy.py` 进程"的隔离，一处泄漏不再累积成整套不退出；回归测试 `a_case_runtime_shuts_down` 专门盯它（泄漏会让 runtime 收尾超时）。
-2. `PrinterObject::release_cycles()`：`Printer::teardown` 在**丢弃部件之前**统一断环（`McuObject` 覆写它、`Drop` 复用），把 F8b 的 `clear_events()` 从"靠 Drop 触发"变成"无条件触发"。
-3. `GCodeDispatch` 改持 `Weak<Printer>`：它是 `Printer::new` 建的 host 对象、`teardown` 特意保留，强引用会闭成 `printer → objects → gcode → printer` 环。
-4. **并发纪律**：lane 只跑过滤测试；重型套件（`--lib` 全量、`ALL=1`）由 main 在合入点单进程跑，跑完按显式 PID 清残留进程（历次轮询超时留下的僵尸进程曾把一次测量从 48s 拖到 >560s）。，另外 2 条以「字典未构建」计入统计，不算失败。失败大多
-  在配置装载阶段，个别在 g-code / 就绪阶段（`Move out of range`、`not ready: Pin …`）。失败原因的
-  逐项分布记在 [上游回归测试失败原因分析](../../work-log/2026-09-22-upstream-regression-failures.md)
-  的最新快照与 `TODO.md` 的 T 节，本页不重复维护。
-- 按「首次失败原因」的分组（T3–T10 工单）、运动学细分与完整失败日志不在本手册重复维护，
-  统一见 [上游回归测试失败原因分析](../../work-log/2026-09-22-upstream-regression-failures.md)
-  （2026-09-22 快照，含 T7 完成后的状态与复盘）。
-- 要让实际执行数继续上升：把「移出 `IGNORED` 后全部可跑运行都通过」的文件移除（守卫
-  `ignored_cases_still_fail` 会逐个提示）。T3（`extruder`/`heater_bed`/`fan`）三个段已落地，但
-  `extruders.test` / `temperature.test` 的首败已前移到 `extruder_stepper` / `temperature_fan`
-  （2026-09-23 实跑），仍要留在列表；T4（`probe`/`bltouch`/endstop pin chip）已消至仅剩 `eddy.test`（属 M5，进行中），T5
-  运动学已消掉 corexy 族（C1c-1）剩下 delta 等。
+- 验收标准是「移出 `IGNORED` 后全部可跑运行都通过」（守卫 `ignored_cases_still_fail` 会提示陈旧
+  条目）；收官时该列表为空——上文「实际执行」表列出的用例与整个 `printers.test`（203 条）全部通过。
 
 ### 推进口径与验收
 
-- 上面按「**首次失败原因**」的分组只用于**定位**，不是工作队列：`load_config` 遇到第一个未知
-  section 就停，修好一个缺口只会让运行前进到下一个缺口，总数可能不变（T7 后的 234 就是例子），
-  各组收益不可加。
-- 进度以**实测口径**衡量：`KLIPPERX_UPSTREAM_ALL=1` 下 **230 通过 / 7 失败**，`IGNORED` **4** 条；先产出「**运行 × 缺口**」矩阵
+- 按「**首次失败原因**」分组只用于**定位**，不是工作队列：`load_config` 遇到第一个未知
+  section 就停，修好一个缺口只会让运行前进到下一个缺口，总数可能不变，各组收益不可加。
+- 进度以**实测口径**衡量：收官时 `KLIPPERX_UPSTREAM_ALL=1` 下 **236 通过 / 0 失败**、`IGNORED` **0** 条；
+  推进期的做法是先产出「**运行 × 缺口**」矩阵
   （列出每条运行的**全部**缺口，而非第一个），据此找「只差一个缺口」的用例与公共前缀。
 - **验收标准**：对应 `.test` 从 `IGNORED` 移除后通过。`ignored_cases_still_fail` 是守卫（opt-in 亦点名「能装载但 g-code 未绿」的候选；历史上曾有 `dual_carriage.test`+`exclude_object.test` 两点名，已随 U-A7b 宏体渲染于 2026-09-24 清零，现 0 点名）——
   某个忽略文件的全部可跑运行都通过时报失败并提示移除。
@@ -303,9 +297,8 @@ harness 把每个 `[mcu]` / `[mcu <name>]` 的传输键换成 `test: dict=<字�
 并把错误串扩成「命令名 + 队列水位」；`SYNC_SEND_HEADROOM` 语义与前一条修复都不变。该用例不依赖 `STEPPER_BUZZ`
 实现即可通过——未知命令当前静默 `Ok` 放行；`STEPPER_BUZZ` 本身仍属 H10 工单。
 
-失败原因的分组、运动学细分与 `KLIPPERX_UPSTREAM_ALL=1` 的完整失败日志，统一记在
-[上游回归测试失败原因分析](../../work-log/2026-09-22-upstream-regression-failures.md)；
-本手册只保留机制与推进口径，避免两处统计互相漂移（第一次失败修好后会露出下一个，分组随落地进度变化）。
+失败原因的历史分组与完整失败日志随收官从工作记录目录清理（见上文的说明）；本手册只保留机制与
+推进口径——第一次失败修好后会露出下一个，分组随落地进度变化。
 
 `out_of_bounds.test` 是唯一声明 `SHOULD_FAIL` 的用例，它期望的是**运行期**错误（`G1 Y9999` 越界），
 不是配置错误。上游可以把任何非零退出都当成功，是因为它什么都不缺；本仓库因此把结果分两段：

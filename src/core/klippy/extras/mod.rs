@@ -82,5 +82,6 @@ pub mod tmc2209;
 pub mod tmc_uart;
 pub mod toolhead;
 pub mod trigger_analog;
+pub mod verify_heater;
 pub mod virtual_sdcard;
 pub mod z_tilt;

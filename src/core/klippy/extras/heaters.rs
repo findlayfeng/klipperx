@@ -2,8 +2,11 @@
 //!
 //! Upstream's `heaters.py` is two things: the registry every
 //! `[temperature_sensor]`, `[extruder]` and `[heater_bed]` sets its sensor up
-//! through, and the heater control loops. Only the registry is here so far; the
-//! control loops arrive with `[extruder]` / `[heater_bed]`.
+//! through, and the heater control loops. Both are here: [`PrinterHeaters`]
+//! holds the sensor factories and the heaters, [`Heater`] is the control loop
+//! `[extruder]` / `[heater_bed]` / `[heater_generic]` build, and
+//! [`PrinterHeaters::setup_heater`] also gives each heater its
+//! `[verify_heater <name>]` check.
 //!
 //! The object has no `[heaters]` section of its own — upstream loads it by name
 //! (`printer.load_object(config, 'heaters')`) and so does [`ensure`], which is
@@ -21,6 +24,7 @@ use crate::core::klippy::extras::ds18b20;
 use crate::core::klippy::extras::spi_temperature;
 use crate::core::klippy::extras::temperature_combined;
 use crate::core::klippy::extras::temperature_mcu;
+use crate::core::klippy::extras::verify_heater;
 use crate::core::klippy::gcode::{
     sync, CommandError, CommandHandler, GCodeDispatch, GcodeCommand, GCODE_OBJECT,
 };
@@ -150,7 +154,8 @@ impl Control {
 ///
 /// Upstream's `Heater` (`klippy/extras/heaters.py:14-160`): it owns the sensor
 /// callback, the bang-bang/PID control loop and the PWM output. The periodic
-/// `verify_heater` check is not wired yet (upstream `verify_heater.py`).
+/// check over it is [`verify_heater::HeaterCheck`], which [`PrinterHeaters::setup_heater`]
+/// gives each heater.
 pub struct Heater {
     /// The section's short name (`extruder`, `heater_bed`).
     name: String,
@@ -246,6 +251,22 @@ impl Heater {
         state.control.check_busy(state.smoothed_temp, target)
     }
 
+    /// What `verify_heater` reads each second (`Heater.get_temp`).
+    ///
+    /// Upstream returns `(0., target)` when the newest reading is older than
+    /// `QUELL_STALE_TIME` (7 s), so a sensor that went quiet counts as a cold
+    /// heater (`heaters.py:18,116-122`). That comparison needs the reading's
+    /// time and `estimated_print_time(eventtime)` on one clock, which this host
+    /// does not have: the ADC sensors pass the raw firmware clock through
+    /// (`pins.rs:220-225`, `adc_temperature.rs:710`) while the serial ones map
+    /// theirs with `clock_to_print_time` (`ds18b20.rs:250`). The smoothed
+    /// temperature is returned as it stands; see the `verify_heater` module
+    /// docs for what that changes.
+    pub fn get_temp(&self) -> (f64, f64) {
+        let state = self.lock();
+        (state.smoothed_temp, state.target_temp)
+    }
+
     /// `Heater.get_status`.
     pub fn get_status(&self) -> Value {
         let state = self.lock();
@@ -268,11 +289,18 @@ impl std::fmt::Debug for Heater {
 }
 
 /// The `heaters` object: the sensor factory table and what is registered.
+///
+/// The heater table is what upstream's `PrinterHeaters.lookup_heater` reads
+/// (`heaters.py:288-292`): a name (the heater section's short name) to the
+/// heater itself. It is what lets a consumer reach a heater by the name it is
+/// configured under — `controller_fan` resolves its `heater` option against
+/// object names instead (`controller_fan.rs:22-30`), because that table did not
+/// exist when it was written.
 pub struct PrinterHeaters {
     factories: Mutex<BTreeMap<String, SensorFactory>>,
     sensors: Mutex<Vec<String>>,
     monitors: Mutex<Vec<String>>,
-    heaters: Mutex<Vec<String>>,
+    heaters: Mutex<BTreeMap<String, Arc<Heater>>>,
 }
 
 impl PrinterHeaters {
@@ -281,8 +309,22 @@ impl PrinterHeaters {
             factories: Mutex::new(BTreeMap::new()),
             sensors: Mutex::new(Vec::new()),
             monitors: Mutex::new(Vec::new()),
-            heaters: Mutex::new(Vec::new()),
+            heaters: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    /// The heater registered under `name` (`PrinterHeaters.lookup_heater`).
+    ///
+    /// # Errors
+    /// No heater has that name, with upstream's wording
+    /// (`heaters.py:288-292`).
+    pub fn lookup_heater(&self, name: &str) -> Result<Arc<Heater>, ConfigError> {
+        self.heaters
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(name)
+            .cloned()
+            .ok_or_else(|| ConfigError::new(format!("Unknown heater '{name}'")))
     }
 
     /// Register a sensor type, upstream's `add_sensor_factory`.
@@ -366,7 +408,7 @@ impl PrinterHeaters {
             .heaters
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .contains(&short_name)
+            .contains_key(&short_name)
         {
             return Err(ConfigError::new(format!(
                 "Heater {short_name} already registered"
@@ -488,10 +530,22 @@ impl PrinterHeaters {
                     heater.temperature_callback(read_time, temp);
                 }
             }));
+        // Upstream's `Heater.__init__` loads its own `verify_heater <name>`
+        // object (`heaters.py:64`); here the heater, which owns the sibling
+        // section's identity, builds it. A config with no such section reads as
+        // all-defaults, and one that has it is claimed by these reads
+        // (`config/wrapper.rs`, `ConfigWrapper::sibling`).
+        let check_identifier = format!("verify_heater {short_name}");
+        let check = verify_heater::HeaterCheck::new(
+            config.sibling(&check_identifier).as_ref(),
+            &short_name,
+            printer,
+        )?;
+        printer.add_object(&check_identifier, check)?;
         self.heaters
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .push(short_name.clone());
+            .insert(short_name.clone(), Arc::clone(&heater));
         self.register_heater_command(printer, &short_name, Arc::clone(&heater))?;
         Ok(heater)
     }
@@ -522,11 +576,15 @@ impl PrinterHeaters {
             .map_err(ConfigError::new)
     }
 
+    /// The registered heaters' names. Upstream reports its dict's insertion
+    /// order; this is the map's name order, which nothing reads positionally.
     fn available_heaters(&self) -> Vec<String> {
         self.heaters
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .clone()
+            .keys()
+            .cloned()
+            .collect()
     }
 
     fn available_sensors(&self) -> Vec<String> {
@@ -590,13 +648,15 @@ pub fn ensure(printer: &Arc<Printer>) -> Result<Arc<PrinterHeaters>, ConfigError
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::klippy::config::{ConfigSection, ConfigValue};
+    use crate::core::klippy::config::{AccessTracking, Config, ConfigSection, ConfigValue};
+    use crate::core::klippy::event::KlippyEvent;
     use crate::core::klippy::gcode::{GCodeDispatch, GCODE_OBJECT};
     use crate::core::klippy::mcu::McuError;
     use crate::core::klippy::pins::{
         DigitalOut, PinChip, PinError, PinParams, PrinterPins, PwmOut, PINS_OBJECT,
     };
-    use crate::core::klippy::reactor::ManualReactor;
+    use crate::core::klippy::printer::PrinterState;
+    use crate::core::klippy::reactor::{ManualReactor, Reactor};
 
     /// A sensor that accepts everything, for `setup_heater` tests.
     #[derive(Debug)]
@@ -605,6 +665,36 @@ mod tests {
     impl Sensor for FakeSensor {
         fn setup_minmax(&self, _min_temp: f64, _max_temp: f64) {}
         fn setup_callback(&self, _callback: SensorCallback) {}
+    }
+
+    /// A sensor whose readings the test delivers by hand.
+    #[derive(Default)]
+    struct ScriptedSensor {
+        callback: Mutex<Option<SensorCallback>>,
+    }
+
+    impl std::fmt::Debug for ScriptedSensor {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("ScriptedSensor").finish_non_exhaustive()
+        }
+    }
+
+    impl ScriptedSensor {
+        /// Deliver one reading, as the sensor layer would.
+        fn read(&self, read_time: f64, temp: f64) {
+            let callback = self.callback.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(callback) = callback.as_ref() {
+                callback(read_time, temp);
+            }
+        }
+    }
+
+    impl Sensor for ScriptedSensor {
+        fn setup_minmax(&self, _min_temp: f64, _max_temp: f64) {}
+
+        fn setup_callback(&self, callback: SensorCallback) {
+            *self.callback.lock().unwrap_or_else(|p| p.into_inner()) = Some(callback);
+        }
     }
 
     /// A PWM that accepts everything.
@@ -651,7 +741,12 @@ mod tests {
 
     /// A printer with `gcode` and `pins` over a no-op chip.
     fn ready_printer() -> Arc<Printer> {
-        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        ready_printer_on(ManualReactor::shared())
+    }
+
+    /// As [`ready_printer`], on a clock the test can step.
+    fn ready_printer_on(reactor: Arc<dyn Reactor>) -> Arc<Printer> {
+        let printer = Arc::new(Printer::new(reactor));
         printer
             .add_object(
                 GCODE_OBJECT,
@@ -846,5 +941,132 @@ mod tests {
         assert!((0.0..=1.0).contains(&power), "{power}");
         // Far below target, the PID output should be saturated high.
         assert!(power > 0.5, "{power}");
+    }
+
+    /// `PrinterHeaters.lookup_heater` (`heaters.py:288-292`).
+    #[test]
+    fn test_lookup_heater_names_the_heater_it_could_not_find() {
+        let printer = ready_printer();
+        let heaters = ensure(&printer).unwrap();
+        heaters.add_sensor_factory(
+            "Fake",
+            Arc::new(|_config, _printer| Ok(Arc::new(FakeSensor) as Arc<dyn Sensor>)),
+        );
+
+        let err = heaters.lookup_heater("nope").unwrap_err();
+        assert_eq!(err.to_string(), "Unknown heater 'nope'");
+
+        let section = heater_section(&[
+            ("sensor_type", "Fake"),
+            ("heater_pin", "PA0"),
+            ("min_temp", "0"),
+            ("max_temp", "250"),
+            ("control", "watermark"),
+        ]);
+        let heater = heaters
+            .setup_heater(&ConfigWrapper::untracked(&section), &printer, None)
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            &heaters.lookup_heater("extruder").unwrap(),
+            &heater
+        ));
+    }
+
+    /// What `verify_heater` reads each second (`Heater.get_temp`).
+    #[test]
+    fn test_get_temp_reports_the_smoothed_temperature_and_the_target() {
+        let printer = ready_printer();
+        let heaters = ensure(&printer).unwrap();
+        heaters.add_sensor_factory(
+            "Fake",
+            Arc::new(|_config, _printer| Ok(Arc::new(FakeSensor) as Arc<dyn Sensor>)),
+        );
+        let section = heater_section(&[
+            ("sensor_type", "Fake"),
+            ("heater_pin", "PA0"),
+            ("min_temp", "0"),
+            ("max_temp", "250"),
+            ("control", "watermark"),
+        ]);
+        let heater = heaters
+            .setup_heater(&ConfigWrapper::untracked(&section), &printer, None)
+            .unwrap();
+
+        // Nothing read yet, nothing asked for.
+        assert_eq!(heater.get_temp(), (0.0, 0.0));
+        // One reading smooths to itself (`smooth_time` 1 s).
+        heater.temperature_callback(1.0, 20.0);
+        heater.set_temp(200.0).unwrap();
+        assert_eq!(heater.get_temp(), (20.0, 200.0));
+    }
+
+    /// A bed plus an option-less `[verify_heater heater_bed]`.
+    const BED_WITH_EMPTY_CHECK: &str = "[mcu]\nserial: /dev/not-opened-yet\n\
+        [heater_bed]\nheater_pin: PB1\nsensor_type: EPCOS 100K B57560G104F\n\
+        sensor_pin: PK6\ncontrol: watermark\nmin_temp: 0\nmax_temp: 130\n\
+        [verify_heater heater_bed]\n";
+
+    /// `[verify_heater heater_bed]` with no options is a valid section: the
+    /// check reads its four options with their defaults, which is what claims
+    /// it (`verify_heater.py:22-29`, `config/validate.rs`).
+    #[test]
+    fn test_an_empty_verify_heater_section_is_claimed_not_rejected() {
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        let (config, _) = Config::from_text(BED_WITH_EMPTY_CHECK).expect("the config parses");
+
+        printer
+            .load_config(&config)
+            .expect("an option-less [verify_heater heater_bed] loads");
+
+        let check = printer
+            .lookup_object("verify_heater heater_bed")
+            .expect("the bed's check is registered");
+        // Upstream's `HeaterCheck` has no `get_status` (`verify_heater.py`).
+        assert!(!check.is_queryable());
+    }
+
+    /// A bed whose sensor never warms up: the check starts at `klippy:connect`
+    /// and shuts the printer down once `check_gain_time` has passed with no
+    /// gain, with upstream's message (`verify_heater.py:34-90`).
+    #[test]
+    fn test_a_stalled_heater_shuts_the_printer_down() {
+        let reactor = Arc::new(ManualReactor::new());
+        let printer = ready_printer_on(Arc::clone(&reactor) as Arc<dyn Reactor>);
+        let heaters = ensure(&printer).unwrap();
+        let sensor = Arc::new(ScriptedSensor::default());
+        let built = Arc::clone(&sensor);
+        heaters.add_sensor_factory(
+            "Fake",
+            Arc::new(move |_config, _printer| Ok(Arc::clone(&built) as Arc<dyn Sensor>)),
+        );
+        let text = "[heater_bed]\n\
+                    sensor_type: Fake\n\
+                    heater_pin: PA0\n\
+                    min_temp: 0\n\
+                    max_temp: 250\n\
+                    control: watermark\n\
+                    [verify_heater heater_bed]\ncheck_gain_time: 5\n";
+        let (config, _) = Config::from_text(text).expect("the config parses");
+        let section = config
+            .get_section("heater_bed")
+            .expect("the bed's section exists");
+        let wrapper = ConfigWrapper::with_config(section, AccessTracking::shared(), None, &config);
+        let heater = heaters.setup_heater(&wrapper, &printer, None).unwrap();
+        heater.set_temp(200.0).unwrap();
+
+        printer.send_event(&KlippyEvent::KlippyConnect);
+        for tick in 1..=10 {
+            // Stuck at 20 °C, 180 °C below the target.
+            sensor.read(f64::from(tick), 20.0);
+            reactor.advance(1.0);
+        }
+
+        assert_eq!(printer.get_state_message().category, PrinterState::Shutdown);
+        assert_eq!(
+            printer.get_state_message().message,
+            "Heater heater_bed not heating at expected rate\n\
+             See the 'verify_heater' section in docs/Config_Reference.md\n\
+             for the parameters that control this check.\n"
+        );
     }
 }

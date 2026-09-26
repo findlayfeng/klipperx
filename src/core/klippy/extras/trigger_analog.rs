@@ -12,10 +12,16 @@
 //! regenerates a entry with
 //! `python -c 'import trigger_analog as m; m.pre_gen_filt("lowpass", 400, 25, 4)'`
 //! (`trigger_analog.py:53-70`), and a design key the table misses raises
-//! "DigitalFilter require the SciPy module". The eddy probe's tap path
-//! (`probe_eddy_current.py:786-792`) only ever asks for
-//! `add_lowpass(25.0, 4)` + `add_derivative()` at 400 samples/s — the entry
-//! below — so the corpus never needs SciPy either.
+//! "DigitalFilter require the SciPy module". Two corpus consumers are covered
+//! from the table: the eddy probe's tap path (`probe_eddy_current.py:786-792`)
+//! asks for `add_lowpass(25.0, 4)` + `add_derivative()` at 400 samples/s, and
+//! `[load_cell_probe]` asks for the ADS1220's 660 SPS highpass/lowpass pair
+//! (`load_cell_probe.py` `ContinuousTareFilterHelper`) — the lowpass is here
+//! because the key is in the table, the highpass likewise.
+//!
+//! Notches have no table key upstream (`GeneratedSOS` keys only `_butter`), so
+//! [`DigitalFilter::add_notch`] carries SciPy's `iirnotch`/`tf2sos` closed
+//! form instead.
 
 use crate::core::klippy::config::ConfigError;
 
@@ -110,22 +116,57 @@ pub fn calc_frac_bits(values: &[f64]) -> u32 {
 ///
 /// The key is upstream's `(btype, float(sps) / frequency, order)` compared
 /// with exact float equality, as the dict's keys are.
-static GENERATED_SOS: &[(&str, f64, u32, &[[f64; 6]])] = &[(
-    "lowpass",
-    400.0 / 25.0,
-    4,
-    &[
-        [
-            0.0009334986129548442,
-            0.0018669972259096883,
-            0.0009334986129548442,
-            1.0,
-            -1.3651172372392975,
-            0.4775922500725171,
+static GENERATED_SOS: &[(&str, f64, u32, &[[f64; 6]])] = &[
+    (
+        "lowpass",
+        400.0 / 25.0,
+        4,
+        &[
+            [
+                0.0009334986129548442,
+                0.0018669972259096883,
+                0.0009334986129548442,
+                1.0,
+                -1.3651172372392975,
+                0.4775922500725171,
+            ],
+            [1.0, 2.0, 1.0, 1.0, -1.6117270964574348, 0.7445208382054344],
         ],
-        [1.0, 2.0, 1.0, 1.0, -1.6117270964574348, 0.7445208382054344],
-    ],
-)];
+    ),
+    // The `[load_cell_probe]` corpus design: an ADS1220's turbo 660 SPS with
+    // the file's `drift_filter_cutoff_frequency: 0.8` and
+    // `buzz_filter_cutoff_frequency: 100.0`. Generated with upstream's own
+    // tool:
+    // `python -c 'import trigger_analog as m; m.pre_gen_filt("highpass", 660, 0.8, 2)'`
+    // (and the same for the lowpass), i.e. `scipy.signal.butter(order, Wn,
+    // btype, fs=sps, output='sos')` — the table is the SciPy-free fast path.
+    (
+        "highpass",
+        825.0,
+        2,
+        &[[
+            0.9946291620443124,
+            -1.9892583240886248,
+            0.9946291620443124,
+            1.0,
+            -1.989229477980254,
+            0.9892871701969954,
+        ]],
+    ),
+    (
+        "lowpass",
+        6.6,
+        2,
+        &[[
+            0.13323133702531725,
+            0.2664626740506345,
+            0.13323133702531725,
+            1.0,
+            -0.736116482202693,
+            0.26904183030396217,
+        ]],
+    ),
+];
 
 /// Look a design up in [`GENERATED_SOS`] (upstream's `GeneratedSOS.get`
 /// through `_butter`, `trigger_analog.py:96-101`).
@@ -175,12 +216,60 @@ impl DigitalFilter {
     /// "DigitalFilter require the SciPy module" when the design is not in
     /// [`GENERATED_SOS`] (`trigger_analog.py:77-80, 96-101`).
     pub fn add_lowpass(&mut self, frequency: f64, order: u32) -> Result<(), ConfigError> {
-        let sections = generated_sos("lowpass", self.sample_frequency / frequency, order)
-            .ok_or_else(|| {
+        self.add_butter("lowpass", frequency, order)
+    }
+
+    /// Add a Butterworth high-pass (`add_highpass` → `_butter`).
+    ///
+    /// # Errors
+    /// As [`Self::add_lowpass`].
+    pub fn add_highpass(&mut self, frequency: f64, order: u32) -> Result<(), ConfigError> {
+        self.add_butter("highpass", frequency, order)
+    }
+
+    /// `_butter`: the table first, SciPy (which this host does not have) for
+    /// anything else (`trigger_analog.py:96-101`).
+    fn add_butter(&mut self, btype: &str, frequency: f64, order: u32) -> Result<(), ConfigError> {
+        let sections =
+            generated_sos(btype, self.sample_frequency / frequency, order).ok_or_else(|| {
                 ConfigError::new("DigitalFilter require the SciPy module".to_string())
             })?;
         self.filter_sections.extend_from_slice(sections);
         Ok(())
+    }
+
+    /// Add a second-order IIR notch (`add_notch`, `trigger_analog.py:88-94`).
+    ///
+    /// Upstream asks SciPy for `iirnotch(notch_freq, Q, fs=sps)` and takes the
+    /// single `tf2sos` section; the closed form here is exactly that pair of
+    /// formulas (`scipy.signal._filter_design._design_notch_peak_filter`,
+    /// Orfanidis eqs. 11.3.4/11.3.6/11.3.7/11.3.21):
+    ///
+    /// ```text
+    /// w0 = 2*pi*f0/sps;  bw = w0/Q;  beta = tan(bw/2);  gain = 1/(1+beta)
+    /// b = gain * [1, -2*cos(w0), 1]
+    /// a = [1, -2*gain*cos(w0), 2*gain - 1]
+    /// ```
+    ///
+    /// `tf2sos(b, a)` of one second-order section is `[[b0, b1, b2, 1, a1, a2]]`
+    /// (a0 is already 1), so no factorization step is needed. Q's default
+    /// `2.0` and the caller's range check keep `0 < 2*f0/sps < 1`; a frequency
+    /// outside it is upstream's SciPy `ValueError`, which this host never tries
+    /// to reproduce (the config readers refuse it first).
+    pub fn add_notch(&mut self, frequency: f64, quality: f64) {
+        let w0 = 2.0 * std::f64::consts::PI * frequency / self.sample_frequency;
+        let bw = w0 / quality;
+        let beta = (bw / 2.0).tan();
+        let gain = 1.0 / (1.0 + beta);
+        let cos_w0 = w0.cos();
+        self.filter_sections.push([
+            gain,
+            -2.0 * gain * cos_w0,
+            gain,
+            1.0,
+            -2.0 * gain * cos_w0,
+            2.0 * gain - 1.0,
+        ]);
     }
 
     /// Append the sample-to-sample difference stage (`add_derivative`,
@@ -347,6 +436,79 @@ mod tests {
         assert!(generated_sos("lowpass", 400.0 / 25.0, 2).is_none());
         assert!(generated_sos("highpass", 400.0 / 25.0, 4).is_none());
         assert!(generated_sos("lowpass", 400.0 / 30.0, 4).is_none());
+    }
+
+    /// The corpus `[load_cell_probe]` design's butter pair (660 SPS ADS1220,
+    /// 0.8 Hz highpass and 100 Hz lowpass, both 2nd order).
+    #[test]
+    fn the_generated_table_carries_the_load_cell_probe_butter_pair() {
+        let highpass = generated_sos("highpass", 660.0 / 0.8, 2).unwrap();
+        assert_eq!(highpass.len(), 1);
+        assert_eq!(highpass[0][0], 0.9946291620443124);
+        assert_eq!(highpass[0][4], -1.989229477980254);
+
+        let lowpass = generated_sos("lowpass", 660.0 / 100.0, 2).unwrap();
+        assert_eq!(lowpass.len(), 1);
+        assert_eq!(lowpass[0][0], 0.13323133702531725);
+        assert_eq!(lowpass[0][5], 0.26904183030396217);
+
+        // `add_highpass` + `add_lowpass` append the table's sections in add
+        // order.
+        let mut filter = DigitalFilter::new(660.0);
+        filter.add_highpass(0.8, 2).unwrap();
+        filter.add_lowpass(100.0, 2).unwrap();
+        assert_eq!(filter.get_size(), 2);
+        assert_eq!(filter.get_filter_sections()[0], highpass[0]);
+        assert_eq!(filter.get_filter_sections()[1], lowpass[0]);
+    }
+
+    /// A key the table does not carry still reaches the SciPy refusal, and
+    /// leaves the design untouched.
+    #[test]
+    fn add_highpass_misses_the_table_like_add_lowpass() {
+        let mut filter = DigitalFilter::new(660.0);
+        let err = filter.add_highpass(0.8, 4).unwrap_err();
+        assert_eq!(err.to_string(), "DigitalFilter require the SciPy module");
+        assert_eq!(filter.get_size(), 0);
+    }
+
+    /// The notch section is SciPy's `iirnotch`, bit for bit (values from
+    /// `scipy.signal.iirnotch(50, Q=2.0, fs=660)`).
+    ///
+    /// Upstream then runs `tf2sos(b, a)` over the pair; for a single
+    /// second-order section `tf2sos` returns the same numbers up to a couple
+    /// of last-bit roundings from its own reconstruction (`a1` reads
+    /// `-1.5878233713947392` there against `iirnotch`'s
+    /// `-1.587823371394739`). Those bits do not change the filter's behaviour
+    /// and cannot be reproduced without reimplementing `tf2sos`'s pairing, so
+    /// the reference here is the exact `iirnotch` polynomial the closed form
+    /// mirrors.
+    #[test]
+    fn add_notch_matches_the_scipy_closed_form() {
+        let mut filter = DigitalFilter::new(660.0);
+        filter.add_notch(50.0, 2.0);
+        filter.add_notch(60.0, 2.0);
+        assert_eq!(
+            filter.get_filter_sections(),
+            &[
+                [
+                    0.8932043460899288,
+                    -1.587823371394739,
+                    0.8932043460899288,
+                    1.0,
+                    -1.587823371394739,
+                    0.7864086921798576
+                ],
+                [
+                    0.8742953116440193,
+                    -1.4710080393165397,
+                    0.8742953116440193,
+                    1.0,
+                    -1.4710080393165397,
+                    0.7485906232880386
+                ],
+            ]
+        );
     }
 
     #[test]

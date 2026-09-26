@@ -58,6 +58,7 @@ pub mod input_shaper;
 pub mod ldc1612;
 pub mod led;
 pub mod load_cell;
+pub mod load_cell_probe;
 pub mod manual_probe;
 pub mod manual_stepper;
 pub mod mcp4018;

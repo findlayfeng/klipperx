@@ -34,6 +34,7 @@ pub mod fan;
 pub mod fan_generic;
 pub mod filament_motion_sensor;
 pub mod filament_switch_sensor;
+pub mod firmware_retraction;
 pub mod force_move;
 pub mod gcode_arcs;
 pub mod gcode_macro;

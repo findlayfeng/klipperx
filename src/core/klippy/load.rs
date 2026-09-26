@@ -370,6 +370,7 @@ mod tests {
                 "exclude_object",
                 "filament_motion_sensor",
                 "filament_switch_sensor",
+                "firmware_retraction",
                 "gcode_arcs",
                 "gcode_macro",
                 "heater_fan",

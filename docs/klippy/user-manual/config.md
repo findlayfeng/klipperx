@@ -387,7 +387,7 @@ SPI_TRANSFER DEVICE=flash DATA=9f000000    ; W25 flash JEDEC ID → ef 30 13
 
 | 参数 | 类型 | 必需 | 默认值 | 说明 |
 |------|------|------|--------|------|
-| `kinematics` | 字符串 | 是 | — | `none` / `cartesian` / `corexy` / `corexz` / `hybrid_corexy` / `hybrid_corexz` / `polar` / `delta`（`rotary_delta`/`deltesian`/`winch`/`generic_cartesian` 待做） |
+| `kinematics` | 字符串 | 是 | — | `none` / `cartesian` / `corexy` / `corexz` / `hybrid_corexy` / `hybrid_corexz` / `polar` / `delta` / `rotary_delta`（批 #40；`rotary_delta`/`deltesian`/`winch`/`generic_cartesian` 待做） |
 | `max_velocity` | 浮点 (mm/s) | 是 | — | `> 0` |
 | `max_accel` | 浮点 (mm/s²) | 是 | — | `> 0` |
 | `minimum_cruise_ratio` | 浮点 (0..1) | 否 | `0.5` | 巡航段占比下限（上游同名选项） |

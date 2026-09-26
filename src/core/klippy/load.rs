@@ -426,6 +426,8 @@ mod tests {
                 "stepper_b",
                 "stepper_bed",
                 "stepper_c",
+                "stepper_left",
+                "stepper_right",
                 "stepper_x",
                 "stepper_y",
                 "stepper_z",

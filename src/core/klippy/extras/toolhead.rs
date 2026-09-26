@@ -80,6 +80,10 @@ use crate::core::klippy::mcu::{
 use crate::core::klippy::motion::delta::{
     delta_active_flags, delta_position_fn, DeltaConfig, DeltaKinematics, DELTA_RAIL_NAMES,
 };
+use crate::core::klippy::motion::deltesian::{
+    arm_abs_endstops, deltesian_active_flags, deltesian_position_fn, pillars_z_max, x_kin_limits,
+    DeltesianConfig, DeltesianKinematics, DELTESIAN_RAIL_NAMES, MIN_ANGLE, SLOW_RATIO,
+};
 use crate::core::klippy::motion::extra::ExtraAxis;
 use crate::core::klippy::motion::generic_cartesian::GenericCartesianKinematics;
 use crate::core::klippy::motion::itersolve::{
@@ -89,7 +93,7 @@ use crate::core::klippy::motion::itersolve::{
 use crate::core::klippy::motion::kinematics::{
     home_move, polar_active_flags, polar_angle_normalize, polar_angle_solver, polar_angle_unwrap,
     polar_home_move, polar_radius_solver, CartesianKinematics, CartesianTransform,
-    KinematicsCalibration, NoneKinematics, PolarKinematics, UnifiedHome,
+    KinematicsCalibration, NoneKinematics, PolarKinematics,
 };
 use crate::core::klippy::motion::plan::MoveLimits;
 use crate::core::klippy::motion::rotary_delta::{
@@ -153,6 +157,10 @@ enum KinematicsKind {
     /// live in
     /// [`motion::rotary_delta`](crate::core::klippy::motion::rotary_delta).
     RotaryDelta,
+    /// `kinematics: deltesian` — the deltesian family
+    /// (`kinematics/deltesian.py`), whose kinematics and solver live in
+    /// [`motion::deltesian`](crate::core::klippy::motion::deltesian).
+    Deltesian,
     /// `kinematics: generic_cartesian` — the carriage/stepper description
     /// (`kinematics/generic_cartesian.py`), where a motor drives a linear
     /// combination of carriage axes instead of one axis.
@@ -171,6 +179,7 @@ impl KinematicsKind {
         "polar",
         "delta",
         "rotary_delta",
+        "deltesian",
         "generic_cartesian",
     ];
 
@@ -186,6 +195,7 @@ impl KinematicsKind {
             "polar" => Self::Polar,
             "delta" => Self::Delta,
             "rotary_delta" => Self::RotaryDelta,
+            "deltesian" => Self::Deltesian,
             "generic_cartesian" => Self::GenericCartesian,
             _ => return None,
         })
@@ -209,6 +219,10 @@ impl KinematicsKind {
             Self::Delta => CartesianTransform::Standard,
             // Rotary delta likewise: its branch binds `rotary_delta_stepper_alloc`.
             Self::RotaryDelta => CartesianTransform::Standard,
+            // Deltesian has no rail→carriage mapping of this kind either: its
+            // branch binds `deltesian_stepper_alloc` on the arms and a plain
+            // cartesian Y solver on the straight rail.
+            Self::Deltesian => CartesianTransform::Standard,
             // Generic cartesian's motors run the linear combinations their
             // `[stepper <name>]` sections declare (`extras::carriage` installs
             // those solvers); this arm is never read.
@@ -216,11 +230,13 @@ impl KinematicsKind {
         }
     }
 
-    /// The rail names `Delta` and `RotaryDelta` claim and the cartesian default
-    /// (`delta.py:15`, `rotary_delta.py:14-15`).
+    /// The rail names `Delta`, `RotaryDelta` and `Deltesian` claim and the
+    /// cartesian default (`delta.py:15`, `rotary_delta.py:14-15`,
+    /// `deltesian.py:15`).
     fn rail_names(self) -> [&'static str; 3] {
         match self {
             Self::Delta | Self::RotaryDelta => DELTA_RAIL_NAMES,
+            Self::Deltesian => DELTESIAN_RAIL_NAMES,
             _ => ["stepper_x", "stepper_y", "stepper_z"],
         }
     }
@@ -267,6 +283,10 @@ impl KinematicsKind {
             Self::Delta => [cart(Axis::X), cart(Axis::Y), cart(Axis::Z)],
             // Rotary delta likewise binds `rotary_delta_stepper_alloc`.
             Self::RotaryDelta => [cart(Axis::X), cart(Axis::Y), cart(Axis::Z)],
+            // Deltesian never reaches here: its branch binds
+            // `deltesian_stepper_alloc` on the arms and a cartesian Y solver on
+            // the straight rail.
+            Self::Deltesian => [cart(Axis::X), cart(Axis::Y), cart(Axis::Z)],
             // Generic cartesian never reaches here either: `extras::carriage`
             // installs each motor's solver from its `carriages` expression as
             // the section loads.
@@ -317,6 +337,8 @@ pub struct ToolHeadObject {
     delta: Mutex<Option<DeltaKinematics>>,
     /// The rotary-delta kinematics, parked the same way as `delta`.
     rotary_delta: Mutex<Option<RotaryDeltaKinematics>>,
+    /// The deltesian kinematics, parked the same way as `delta`.
+    deltesian: Mutex<Option<DeltesianKinematics>>,
     /// The generic-cartesian kinematics, parked here at load until connect
     /// installs it (`generic_cartesian.py:118-127` builds it in `__init__`;
     /// only the toolhead's install waits for connect).
@@ -445,6 +467,7 @@ impl ToolHeadObject {
         let mut bed = None;
         let mut delta_kinematics = None;
         let mut rotary_delta_kinematics = None;
+        let mut deltesian_kinematics = None;
         let mut generic_kinematics = None;
         let mut generic_steppers: Vec<Arc<KinematicStepper>> = Vec::new();
         match kind {
@@ -548,6 +571,43 @@ impl ToolHeadObject {
                 }
                 rotary_delta_kinematics = Some(rotary);
             }
+            KinematicsKind::Deltesian => {
+                // Deltesian claims `stepper_left`, `stepper_right`, `stepper_y`
+                // (`deltesian.py:15-17`); the arms take axes X and Y, the
+                // straight rail Z — the labels are inert (the kinematics
+                // installs the solvers just below).
+                let axes = [Axis::X, Axis::Y, Axis::Z];
+                for (name, axis) in DELTESIAN_RAIL_NAMES.into_iter().zip(axes) {
+                    rails.push(Rail::lookup(config, printer, name, axis)?);
+                }
+                // The kinematics reads its options here (the config reads are
+                // part of loading it); the two arms then bind
+                // `deltesian_stepper_alloc` and the straight rail a cartesian Y
+                // solver (`deltesian.py:30-36`).
+                let deltesian = build_deltesian(
+                    config,
+                    &rails,
+                    max_velocity,
+                    max_accel,
+                    max_z_velocity,
+                    max_z_accel,
+                )?;
+                for (rail, (arm2, arm_x)) in rails[..2].iter().zip(deltesian.arm_geometry()) {
+                    for stepper in rail.steppers() {
+                        stepper.setup_itersolve(
+                            deltesian_position_fn(arm2, arm_x),
+                            deltesian_active_flags(),
+                        );
+                    }
+                }
+                for stepper in rails[2].steppers() {
+                    stepper.setup_itersolve(
+                        cartesian_position_fn(Axis::Y),
+                        cartesian_active_flags(Axis::Y),
+                    );
+                }
+                deltesian_kinematics = Some(deltesian);
+            }
             _ => {
                 for (name, axis) in [
                     ("stepper_x", Axis::X),
@@ -624,6 +684,7 @@ impl ToolHeadObject {
             kind,
             delta: Mutex::new(delta_kinematics),
             rotary_delta: Mutex::new(rotary_delta_kinematics),
+            deltesian: Mutex::new(deltesian_kinematics),
             generic: Mutex::new(generic_kinematics),
             generic_steppers,
             transform: kind.transform(),
@@ -935,6 +996,17 @@ impl PrinterObject for ToolHeadObject {
                         })?;
                     toolhead.set_kinematics(Box::new(rotary));
                 }
+                KinematicsKind::Deltesian => {
+                    let deltesian = self
+                        .deltesian
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .take()
+                        .ok_or_else(|| {
+                            config_error("deltesian kinematics is not connected".to_string())
+                        })?;
+                    toolhead.set_kinematics(Box::new(deltesian));
+                }
                 KinematicsKind::GenericCartesian => {
                     let kinematics = self
                         .generic
@@ -1198,6 +1270,138 @@ fn build_rotary_delta(
         max_z_velocity,
         max_z_accel,
     })
+}
+
+/// Read the deltesian options and build the kinematics
+/// (`kinematics/deltesian.py:11-45`, whose reads these mirror one for one):
+/// the `[printer]` options here, the arm/arm_x options from
+/// `[stepper_left]`/`[stepper_right]`.
+///
+/// # Errors
+/// A missing or out-of-bounds option, reported with the config reader's
+/// upstream wording.
+#[allow(clippy::too_many_arguments)]
+fn build_deltesian(
+    config: &ConfigWrapper,
+    rails: &[Arc<Rail>],
+    max_velocity: f64,
+    max_accel: f64,
+    max_z_velocity: f64,
+    max_z_accel: f64,
+) -> Result<DeltesianKinematics, ConfigError> {
+    let left = config.sibling("stepper_left").ok_or_else(|| {
+        ConfigError::new(format!(
+            "Section '{}' needs a '[stepper_left]' section",
+            config.identifier()
+        ))
+    })?;
+    let right = config.sibling("stepper_right").ok_or_else(|| {
+        ConfigError::new(format!(
+            "Section '{}' needs a '[stepper_right]' section",
+            config.identifier()
+        ))
+    })?;
+    // `arm_x_length` on the left is required and sets the right's default; both
+    // above 0 (`deltesian.py:22-25`).
+    let arm_x_left = left.get_float_bounded("arm_x_length", None, None, None, Some(0.0), None)?;
+    let arm_x_right = right.get_float_bounded(
+        "arm_x_length",
+        Some(arm_x_left),
+        None,
+        None,
+        Some(0.0),
+        None,
+    )?;
+    // `arm_length` likewise, each above its own arm's `arm_x_length`
+    // (`deltesian.py:26-29`).
+    let arm_left =
+        left.get_float_bounded("arm_length", None, None, None, Some(arm_x_left), None)?;
+    let arm_right = right.get_float_bounded(
+        "arm_length",
+        Some(arm_left),
+        None,
+        None,
+        Some(arm_x_right),
+        None,
+    )?;
+    let arm_x = [arm_x_left, arm_x_right];
+    let arm2 = [arm_left * arm_left, arm_right * arm_right];
+    let arm = [arm_left, arm_right];
+    let arm_endstops = [
+        rails[0].homing_info().position_endstop,
+        rails[1].homing_info().position_endstop,
+    ];
+    let y_range = (
+        rails[2].params().position_min,
+        rails[2].params().position_max,
+    );
+
+    // `min_angle` and `print_width` (`deltesian.py:54-67`): the arms' reach at
+    // `min_angle` bounds `print_width`.
+    let min_angle = config.get_float_bounded(
+        "min_angle",
+        Some(MIN_ANGLE),
+        Some(0.0),
+        Some(90.0),
+        None,
+        None,
+    )?;
+    let (x_kin_min, x_kin_max) = x_kin_limits(min_angle, arm_x, arm);
+    let x_kin_range = (x_kin_max - x_kin_min)
+        .min(x_kin_max * 2.0)
+        .min(-x_kin_min * 2.0);
+    let print_width = if config.has("print_width") {
+        Some(config.get_float_bounded(
+            "print_width",
+            None,
+            Some(0.0),
+            Some(x_kin_range),
+            None,
+            None,
+        )?)
+    } else {
+        None
+    };
+
+    // `minimum_z_position` is at most the arms' highest Z over the X range
+    // (`deltesian.py:71-75`).
+    let abs_endstop = arm_abs_endstops(arm_endstops, arm_x, arm2);
+    let (x_lo, x_hi) = match print_width {
+        Some(width) if width != 0.0 => (-width * 0.5, width * 0.5),
+        _ => (x_kin_min, x_kin_max),
+    };
+    let z_max = pillars_z_max(arm_x, arm2, abs_endstop, x_lo).min(pillars_z_max(
+        arm_x,
+        arm2,
+        abs_endstop,
+        x_hi,
+    ));
+    let minimum_z_position = config.get_float_bounded(
+        "minimum_z_position",
+        Some(0.0),
+        None,
+        Some(z_max),
+        None,
+        None,
+    )?;
+
+    let slow_ratio =
+        config.get_float_bounded("slow_ratio", Some(SLOW_RATIO), Some(0.0), None, None, None)?;
+
+    Ok(DeltesianKinematics::new(DeltesianConfig {
+        arm_x,
+        arm2,
+        arm_endstops,
+        y_range,
+        min_angle,
+        print_width,
+        minimum_z_position,
+        slow_ratio,
+        max_velocity,
+        max_accel,
+        max_z_velocity,
+        max_z_accel,
+    }))
 }
 
 /// The registered extruders, in `[extruder]`, `[extruder1]`… order.
@@ -1907,6 +2111,80 @@ async fn home_axes(
         }
         return Ok((homed, homing));
     }
+    // Deltesian homes its two arm rails together, then its Y rail
+    // (`deltesian.py:88-110`): neither the cartesian per-axis walk nor a single
+    // whole-machine group move.
+    if kind == KinematicsKind::Deltesian {
+        let home = connected
+            .toolhead
+            .kinematics()
+            .and_then(|kinematics| kinematics.deltesian_home())
+            .ok_or_else(|| {
+                CommandError::new("deltesian kinematics is not connected".to_string())
+            })?;
+        let current = connected.toolhead.commanded_pos();
+        let home_xz = requested
+            .iter()
+            .any(|&axis| axis == X_AXIS || axis == Z_AXIS);
+        let home_y = requested.contains(&Y_AXIS);
+        if home_xz {
+            // Both arms in one move, X pinned to 0 and Z to `home_z`
+            // (`deltesian.py:96-102`); Y keeps its current value (upstream's
+            // `None` homepos entry).
+            let force = Coord::new(0.0, current.y(), home.arm_force_z, current.e());
+            let target = Coord::new(0.0, current.y(), home.arm_target_z, current.e());
+            send(printer, &KlippyEvent::HomingHomeRailsBegin);
+            let result = home_unified(
+                connected,
+                &rails[..2],
+                force,
+                target,
+                &home.arm_travel,
+                &[X_AXIS, Z_AXIS],
+                &homing,
+                printer,
+            )
+            .await;
+            result?;
+            homed.extend_from_slice(&[X_AXIS, Z_AXIS]);
+        }
+        if home_y {
+            let rail = &rails[2];
+            let endstop = rail.endstop().ok_or_else(|| {
+                CommandError::new(format!("No endstop configured for {}", rail.name()))
+            })?;
+            let params = rail.params();
+            let info = rail.homing_info();
+            let (mut forcepos, mut movepos) =
+                home_move(Y_AXIS, &info, params.position_min, params.position_max);
+            // The arm home already pinned X and Z (`deltesian.py:102-107`).
+            if home_xz {
+                forcepos[X_AXIS] = Some(0.0);
+                forcepos[Z_AXIS] = Some(home.arm_target_z);
+                movepos[X_AXIS] = Some(0.0);
+                movepos[Z_AXIS] = Some(home.arm_target_z);
+            }
+            let homing_axes = homing_axes_of(&forcepos);
+            send(printer, &KlippyEvent::HomingHomeRailsBegin);
+            let result = home_axis(
+                connected,
+                Y_AXIS,
+                forcepos,
+                movepos,
+                &homing_axes,
+                info,
+                rail.step_dist(),
+                &stepper_names(rail),
+                endstop.as_ref(),
+                &homing,
+                printer,
+            )
+            .await;
+            homed.extend_from_slice(&homing_axes);
+            result?;
+        }
+        return Ok((homed, homing));
+    }
     // Delta homes every tower in one move and ignores which axes `G28` named
     // (`kinematics/delta.py:104-110` always takes all three rails), so its
     // homing is one multi-endstop move rather than one per axis.
@@ -1915,8 +2193,21 @@ async fn home_axes(
         .kinematics()
         .and_then(|kinematics| kinematics.unified_home())
     {
+        let current = connected.toolhead.commanded_pos();
+        let force = Coord::new(home.force[0], home.force[1], home.force[2], current.e());
+        let target = Coord::new(home.target[0], home.target[1], home.target[2], current.e());
         send(printer, &KlippyEvent::HomingHomeRailsBegin);
-        let result = home_unified(connected, rails, &home, &homing, printer).await;
+        let result = home_unified(
+            connected,
+            rails,
+            force,
+            target,
+            &home.actuator_travel,
+            &[X_AXIS, Y_AXIS, Z_AXIS],
+            &homing,
+            printer,
+        )
+        .await;
         result?;
         homed.extend_from_slice(&[X_AXIS, Y_AXIS, Z_AXIS]);
         return Ok((homed, homing));
@@ -2057,19 +2348,25 @@ fn send(printer: &Weak<Printer>, event: &KlippyEvent) {
 }
 
 /// Home every rail in one multi-endstop move, as delta does
-/// (`Homing._do_home_rails` + `HomingMove.homing_move` with all three
-/// endstops armed; upstream's retract + second pass is the gap
+/// (`Homing._do_home_rails` + `HomingMove.homing_move` with every endstop
+/// armed; upstream's retract + second pass is the gap
 /// [`PrinterStepper`](crate::core::klippy::extras::stepper::PrinterStepper)'s
 /// module docs record for the cartesian family too).
 ///
+/// Deltesian's arm group uses this too, with the two arm rails and their own
+/// endpoints (`deltesian.py:96-102`).
+///
 /// # Errors
-/// A missing endstop, a kinematics refusal, a failed query/send, or a tower
+/// A missing endstop, a kinematics refusal, a failed query/send, or a rail
 /// whose endstop never triggered ("No trigger on … after full movement",
 /// `extras/homing.py:104-107`).
 async fn home_unified(
     connected: &mut Connected,
     rails: &[Arc<Rail>],
-    home: &UnifiedHome,
+    force: Coord,
+    target: Coord,
+    actuator_travel: &[f64],
+    homing_axes: &[usize],
     homing: &HomingHandle,
     printer: &Weak<Printer>,
 ) -> Result<(), CommandError> {
@@ -2082,18 +2379,13 @@ async fn home_unified(
         }
     }
 
-    // Pretend to be at the force position with every axis marked homed, which
-    // is what lets the homing move through delta's `check_move`
-    // (`Homing._set_start_position` sets `homing_axes="xyz"`).
-    let current = connected.toolhead.commanded_pos();
-    let force = Coord::new(home.force[0], home.force[1], home.force[2], current.e());
-    let target = Coord::new(home.target[0], home.target[1], home.target[2], current.e());
-    connected
-        .toolhead
-        .set_position(force, &[X_AXIS, Y_AXIS, Z_AXIS]);
+    // Pretend to be at the force position with every axis the kinematics marks
+    // homed (`Homing._set_start_position`), which is what lets the homing move
+    // through its `check_move`.
+    connected.toolhead.set_position(force, homing_axes);
 
     // The endstops all start sampling before the move and each is paced by
-    // its own tower's travel (`HomingMove._calc_endstop_rate`).
+    // its own rail's travel (`HomingMove._calc_endstop_rate`).
     let speed = rails[0].homing_info().speed;
     let move_t = move_distance(force, target) / speed;
     let print_time = connected.toolhead.get_last_move_time();
@@ -2102,7 +2394,7 @@ async fn home_unified(
         let endstop = rail
             .endstop()
             .expect("every rail's endstop was checked above");
-        let steps = home.actuator_travel[index] / rail.step_dist();
+        let steps = actuator_travel[index] / rail.step_dist();
         let rest_time = if steps <= 0. {
             0.001
         } else {
@@ -2188,10 +2480,9 @@ async fn home_unified(
         }
     }
     send(printer, &KlippyEvent::HomingHomingMoveEnd);
-    // The carriage is now at its home position, all axes homed.
-    connected
-        .toolhead
-        .set_position(target, &[X_AXIS, Y_AXIS, Z_AXIS]);
+    // The carriage is now at its home position, with the kinematics' homed
+    // flags set.
+    connected.toolhead.set_position(target, homing_axes);
     connected.toolhead.wipe_trapq();
     Ok(())
 }
@@ -2678,7 +2969,7 @@ mod tests {
         let mut section = ConfigSection::new("printer", None);
         section.parameters.insert(
             "kinematics".to_string(),
-            ConfigValue::Single("deltesian".to_string()),
+            ConfigValue::Single("winch".to_string()),
         );
         section.parameters.insert(
             "max_velocity".to_string(),
@@ -2695,9 +2986,7 @@ mod tests {
             .map(|_| ())
             .unwrap_err();
 
-        assert!(err
-            .to_string()
-            .contains("Error loading kinematics 'deltesian'"));
+        assert!(err.to_string().contains("Error loading kinematics 'winch'"));
         // The message also names what *is* implemented, including delta now.
         assert!(err.to_string().contains("delta"));
     }
@@ -2920,6 +3209,61 @@ mod tests {
     }
 
     #[test]
+    fn test_the_deltesian_kinematics_loads_its_arms_and_y() {
+        // `config/example-deltesian.cfg`'s shape: two arm rails (no
+        // `position_max`; `arm_x_length`/`arm_length` on `stepper_left`,
+        // inherited by `stepper_right`) and the straight `[stepper_y]`.
+        use crate::core::klippy::config::Config;
+        use crate::core::klippy::reactor::ManualReactor;
+
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        let (config, _) = Config::from_text(
+            "[mcu]\nserial: /dev/not-opened-yet\n\
+             [stepper_left]\nstep_pin: PF0\ndir_pin: PF1\nenable_pin: !PD7\n\
+             microsteps: 16\nrotation_distance: 40\nendstop_pin: ^PE5\n\
+             homing_speed: 50\nposition_endstop: 268\n\
+             arm_length: 217\narm_x_length: 160\n\
+             [stepper_right]\nstep_pin: PL3\ndir_pin: PL1\nenable_pin: !PK0\n\
+             microsteps: 16\nrotation_distance: 40\nendstop_pin: ^PD3\n\
+             [stepper_y]\nstep_pin: PF6\ndir_pin: !PF7\nenable_pin: !PF2\n\
+             microsteps: 16\nrotation_distance: 40\nendstop_pin: ^PJ1\n\
+             position_endstop: 0\nposition_max: 200\n\
+             [printer]\nkinematics: deltesian\nmax_velocity: 500\nmax_accel: 3000\n\
+             max_z_velocity: 150\n",
+        )
+        .expect("the config parses");
+        printer
+            .load_config(&config)
+            .unwrap_or_else(|err| panic!("deltesian: {err}"));
+
+        let object = printer
+            .lookup_object_as::<ToolHeadObject>("toolhead")
+            .expect("the toolhead is registered");
+        assert_eq!(object.kind, KinematicsKind::Deltesian);
+        assert_eq!(object.rails.len(), 3);
+        assert_eq!(
+            object.axis_names(),
+            ["stepper_left", "stepper_right", "stepper_y"]
+        );
+        // `stepper_right` inherited `stepper_left`'s endstop.
+        assert_eq!(object.rails[1].homing_info().position_endstop, 268.0);
+        // Deltesian carries no delta calibration.
+        assert!(!object.has_delta_calibration());
+        assert!(object.delta_calibration().is_none());
+        // The kinematics parked at load holds the derived arm geometry.
+        let kin = object
+            .deltesian
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+            .expect("the deltesian kinematics is parked");
+        assert_eq!(
+            kin.arm_geometry(),
+            [(217.0 * 217.0, -160.0), (217.0 * 217.0, 160.0)]
+        );
+    }
+
+    #[test]
     fn test_mcu_errors_are_reported_with_the_section_name() {
         // `McuError::Config` is what a missing connection reports; the test just
         // pins that the helper keeps the `[printer]` prefix.
@@ -3004,6 +3348,7 @@ mod tests {
             kind: KinematicsKind::Cartesian,
             delta: Mutex::new(None),
             rotary_delta: Mutex::new(None),
+            deltesian: Mutex::new(None),
             generic: Mutex::new(None),
             generic_steppers: Vec::new(),
             transform: CartesianTransform::Standard,

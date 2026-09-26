@@ -981,6 +981,27 @@ gap（如实登记）：**屏幕内容不渲染**（`display_template`/`display_
 
 节名注册为虚拟 pin chip：其他节写 `pin: multi_pin:<name>`（或 `heater_pin: multi_pin:heater`）。装载相位为 **`phase = early`**（`[extruder]` 等主节在装载期就要解析它；prefix-only 降 `order` 无效）。别名不得用于步进电机 pin。
 
+### `[axis_twist_compensation]` — 轴扭曲 Z 补偿（批 #36）
+
+| 选项 | 默认 | 说明 |
+|------|------|------|
+| `horizontal_move_z` / `speed` | 照上游 | 校准与补偿时的抬升高度与速度 |
+| `calibrate_start_x` / `calibrate_end_x` / `calibrate_y` / `calibrate_start_y` / `calibrate_end_y` | 照上游 | 校准扫描范围 |
+| `z_compensations` / `zy_compensations` | 照上游 | 各采样点的 Z 补偿值（长度必须与采样点数一致） |
+
+在探针测量完成后经 `probe:update_results` **原地修正上报的 Z**（该事件现在带 `ProbeResultsHandle` 载荷），并注册 `AXIS_TWIST_COMPENSATION_CALIBRATE`。
+
+### `[gcode_button <name>]` — 按钮触发宏（批 #37）
+
+| 选项 | 默认 | 说明 |
+|------|------|------|
+| `pin` | —（必填） | 按钮引脚 | 
+| `press_gcode` / `release_gcode` | — / 空 | 按下/释放时渲染并执行的宏体 |
+| `debounce_delay` | `0` | 去抖（秒，`minval=0`） |
+| `analog_range` | — | **本仓不支持**：读取后明确报错（上游走 `query_adc`，本仓无该基建） |
+
+`QUERY_BUTTON BUTTON=<name>` 查询状态；`get_status` 报 `PRESSED`/`RELEASED`。gap：**固件侧按钮查询未接**（回调已登记，假固件不会触发）。
+
 ### `[homing_heaters]` — 归零期间关加热器（批 #31）
 
 | 选项 | 默认 | 说明 |

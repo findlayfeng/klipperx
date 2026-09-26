@@ -293,6 +293,8 @@ git config core.hooksPath .githooks
 | `z_tilt.rs` | `z_positions` 项数/缺项/坏项的上游文案、至少 2 点；`RetryHelper` 范围文案与上限、上升即中止、`error_msg_extra` 追加、无重试则静默；`applied` 标志与 motor_off 复位；平面拟合恢复已知平面；`adjust_steppers` 按 `-a` 排序逐步挂回的顺序录音 + 失败后全部挂回 |
 | `quad_gantry_level.rs` | `linefit` 直线与斜率（含退化）；四角高度恢复已知点；超 `max_adjust` 中止文案；恰好 4 点、`gantry_corners` >=2、缺项上游文案 |
 | `screws_tilt_adjust.rs` | screwN 数到首个缺失即停与默认名 `screw at %.3f,%.3f`、螺丝<3 报错、`screw_thread` 8 项选择表与默认 `CW-M3`、`threads_factor` 换算、方向表与 `HH:MM`（含 0.001 阈值）、基准螺丝（第 1 颗 / `DIRECTION` 极值）、`MAX_DEVIATION` 延迟报错与 `DIRECTION` 非法文案、`get_status` 的 error/max_deviation/results 形状 |
+| `extras/axis_twist_compensation.rs`（批 #36，11 测） | 选项默认值与越界、插值（含端点外推语义）、`z_compensations` 长度校验、`probe:update_results` 载荷原地改 Z（probe/eddy 两处上报读回）、`AXIS_TWIST_COMPENSATION_CALIBRATE` 注册与首点派发 |
+| `extras/gcode_button.rs`（批 #37，8 测） | 语料节选项全读、按下/释放各渲染派发、空 `release_gcode` 不跑、`QUERY_BUTTON` 与 `get_status`、缺 `pin`/`press_gcode` 文案、`debounce_delay` 下界、`analog_range` 读取后的明确拒绝与上游解析/越界文案 |
 | `gcode_arcs.rs` | `resolution` 默认 `1.` 记账、显式值解析、`0`/`-1`/非数拒绝文案对上游、经 loader 认领并注册（4 测） |
 | `bed_screws.rs` | 全选项 `check_unused` 直证、行进默认 50/5/5/0 与默认名、螺丝缺失即停（access 无残留）、<3 与两元素/解析/fine_adjust 上游文案、above 0 边界、静止态 status（6 测） |
 | `pwm_cycle_time.rs` | 选项矩阵与默认、`SET_PIN` 值域与 `CYCLE_TIME`、重复值丢弃、无 `hardware_pwm` 恒软件路径（11 测） |

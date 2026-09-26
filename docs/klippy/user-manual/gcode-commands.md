@@ -474,6 +474,10 @@ SET_PIN PIN=pwm_fan VALUE=0.25  ; PWM：25% 占空比
 
 有 `[safe_z_home]` 时 `G28` 被接管：按需先执行 `G28 X0 Y0` → 抬到安全位 → `G28 Z0`（`move_to_previous` 为真时最后回原位）；`G28 Z` 而 X/Y 未归零报 `Must home X and Y axes first`。
 
+### PAUSE / RESUME / CLEAR_PAUSE / CANCEL_PRINT — 暂停与恢复（由 `[pause_resume]` 注册，批 #15）
+
+`PAUSE` 置暂停并跑 `SAVE_GCODE_STATE NAME=PAUSE_STATE`；`RESUME [VELOCITY=]`（默认取 `recover_velocity`）跑 `RESTORE_GCODE_STATE NAME=PAUSE_STATE MOVE=1 MOVE_SPEED=<v>`；`CLEAR_PAUSE` 只清状态；`CANCEL_PRINT` 取消打印（无 `virtual_sdcard` 时回 `action:cancel`）。重复 `PAUSE` 回 `Print already paused`，未暂停时 `RESUME` 回 `Print is not paused, resume aborted`。
+
 ### LOAD_CELL_CALIBRATE / LOAD_CELL_TARE / LOAD_CELL_READ / LOAD_CELL_DIAGNOSTIC — 称重校准（由 `[load_cell]` 注册，批 #14）
 
 四条命令**已注册并带上游 help，当前调用报 `not implemented`**（需 `LoadCellSampleCollector` 与交互式校准，见 TODO）。

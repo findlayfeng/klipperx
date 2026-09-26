@@ -192,7 +192,7 @@ toolhead / 开放事件）一起补，一部分是现在就独立可补的小行
 `api-reference.md` 有、`endpoints/mod.rs` 的表里标「not started」的其余部分，各自等它读的
 对象先存在：
 
-- [ ] `pause_resume/{pause,resume,cancel}`：等 `pause_resume` 对象。
+- [ ] `pause_resume/{pause,resume,cancel}`：对象与四条命令已落地（批 #15），仍缺 webhook 端点注册层。
 
 ### F MCU 基础资源（F6、F8、F9）
 
@@ -425,7 +425,7 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 
 - [ ] `virtual_sdcard.py`：主机侧文件打印、`M24`/`M25`/`M27`、进度。
 - [ ] `print_stats.py`、`display_status.py`（`M73`/`M117`）。
-- [ ] `pause_resume.py`（`PAUSE`/`RESUME`/`CANCEL_PRINT` + 三个端点，见 **B4**）。
+- [x] `pause_resume.py` 的节与 `PAUSE`/`RESUME`/`CLEAR_PAUSE`/`CANCEL_PRINT`（批 #15）；- [ ] 三个端点（见 **B4**）。
 - [ ] `exclude_object.py`（段+四命令落地，**2026-09-24 批 #4 随引擎转绿**，含排除区 E 补偿）、`sdcard_loop.py`（段已落地，`SDCARD_LOOP_*` 命令与文件回放未接）、`firmware_retraction.py`（G10/G11）。
 - 依赖 F9（固件 `sdiocmds.c` 的 sdcard 资源）、C1（`gcode_move` 的位置恢复）。
 

@@ -970,6 +970,17 @@ gap（如实登记）：**屏幕内容不渲染**（`display_template`/`display_
 
 节名注册为虚拟 pin chip，消费者写作 `sensor_pin: <name>:PA0`，读数按 `(raw - vssa)/(vref - vssa)` 归一。**必须写在 `[extruder]`/`[heater_bed]` 之前**（本仓以 `phase = early` 保证）。gap：`QUERY_ADC` 未实现。
 
+### `[mcp4451 <name>]` — I2C 数字电位器（批 #25）
+
+| 选项 | 默认 | 说明 |
+|------|------|------|
+| `i2c_address` | —（必填） | I2C 地址，**仅 44..47**（其它值报 `mcp4451 address must be between 44 and 47`） |
+| `i2c_mcu` / `i2c_bus` / `i2c_speed` | `mcu` / — / `100000` | 总线选项（与 `[i2c_device]` 同口径；也可用软件 SCL/SDA pin） |
+| `scale` | `1.0` | 满量程参考，`above=0.` |
+| `wiper_0` … `wiper_3` | — | 各路目标值（`minval=0.`、`maxval=scale`）；写值 `int(val*255/scale+.5)`，未给的不写 |
+
+装载时先无条件写 `[0x40,0xff]`、`[0xa0,0xff]`，再按寄存器 `[0x00,0x01,0x06,0x07]` 逐路写；字节为 `[(reg<<4)|((value>>8)&3), value]`。写入在 bring-up 时经 post-init 回调发出。
+
 ### `[ad5206 <name>]` — 数字电位器（批 #16）
 
 | 选项 | 默认 | 说明 |

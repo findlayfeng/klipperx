@@ -31,10 +31,23 @@
 //! host stack ([`Trapq`] → [`Stepper`] → the full compressor) with the firmware's
 //! `stepper_get_position` read back, so FW5f's compression can be checked on
 //! hardware without a full `[printer]` config or three known axes.
+//!
+//! By default a run drives one board: the MCU name argument omitted or empty is
+//! the bare `[mcu]`. The name can be repeated to drive several boards at once,
+//! and `--all-mcus` takes every `[mcu]` section in the config (the bare `[mcu]`
+//! counts as one). Each board gets its own connection and its own ramp, run
+//! concurrently on the same runtime, and every report line carries its board's
+//! `[<name>]` prefix so the interleaved output stays attributable. A board that
+//! fails makes the command fail; a board that reaches its limit counts as a
+//! success, exactly as for a single board.
 
 use clap::Args;
+use std::future::{poll_fn, Future};
+use std::mem::take;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use crate::core::klippy::cmd::config::{ConfigState, GetConfig, Reset};
@@ -170,10 +183,16 @@ pub struct StressArgs {
     /// Klipper config file to read the MCU and a stepper from
     pub config_file: String,
 
-    /// Name of the MCU to stress: the sub of `[mcu <name>]`; empty or omitted
-    /// means the bare `[mcu]` section
-    #[arg(default_value = "mcu")]
-    pub mcu: String,
+    /// Name of the MCU(s) to stress: the sub of `[mcu <name>]`, repeated (or
+    /// given several at once) to drive several boards concurrently; empty or
+    /// omitted means the bare `[mcu]` section — the single default board
+    #[arg(num_args = 1..)]
+    pub mcu: Vec<String>,
+
+    /// Stress every `[mcu]` section in the config instead of naming boards
+    /// (the bare `[mcu]` counts as one); cannot be combined with MCU names
+    #[arg(long)]
+    pub all_mcus: bool,
 
     /// Each stage is this many times the previous one; smaller brackets the
     /// limit more tightly and takes longer
@@ -191,6 +210,13 @@ pub struct StressArgs {
 
 /// Entry point for the `stress` subcommand.
 pub fn run(args: StressArgs) -> Result<(), Box<dyn std::error::Error>> {
+    // Two workers on purpose: one reactor plus the boards' send/receive tasks
+    // fit in two, the number a single-board run has always had, so one- and
+    // multi-board measurements stay comparable. Port I/O itself runs on the
+    // blocking pool, so a second board adds tasks rather than threads — but if
+    // a concurrent run ever shows the ramps competing for these workers
+    // (scheduler latency in the pacing), raise it then; keep the value as it is
+    // while the comparison is what matters.
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -207,34 +233,144 @@ async fn stress(args: StressArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let (config, _sources) = Config::from_file(&args.config_file)?;
-    let mcu_name = mcu_name(&args.mcu);
+    let names = select_mcus(&config, &args.mcu, args.all_mcus)
+        .map_err(|err| format!("{err} in {}", args.config_file))?;
 
-    let section = find_mcu_section(&config, mcu_name).ok_or_else(|| {
-        format!(
-            "no [mcu{}] section in {}",
-            if mcu_name == "mcu" {
-                String::new()
-            } else {
-                format!(" {mcu_name}")
+    // Connect one board at a time: each opens its own port and runs its own
+    // identify, and a board that refuses must not stop the others from being
+    // driven — its failure is reported at the end instead.
+    let mut boards: Vec<(McuConfig, Arc<Mcu>)> = Vec::new();
+    let mut failures: Vec<String> = Vec::new();
+    for name in &names {
+        let connected = match resolve_mcu(&config, name) {
+            Ok(mcu_config) => match connect(&mcu_config).await {
+                Ok(mcu) => Ok((mcu_config, mcu)),
+                Err(err) => Err(err.to_string()),
             },
-            args.config_file
-        )
-    })?;
-    let mcu_config = McuConfig::new(&ConfigWrapper::new(section, AccessTracking::shared()))
-        .map_err(std::io::Error::other)?;
-
-    let mcu = connect(&mcu_config).await?;
-    println!(
-        "connected to MCU '{}' ({} command(s) in its dictionary)",
-        mcu_config.name,
-        mcu.dictionary().map(|d| d.commands().len()).unwrap_or(0)
-    );
-
-    match args.task {
-        Task::Step => step_stress(&mcu_config, mcu, &config, &args).await,
-        Task::Comm => comm_stress(mcu, &args).await,
-        Task::Motion => motion_smoke(&mcu_config, mcu, &config).await,
+            Err(err) => Err(err),
+        };
+        match connected {
+            Ok((mcu_config, mcu)) => {
+                println!(
+                    "{}",
+                    tagged(
+                        name,
+                        format!(
+                            "connected to MCU '{}' ({} command(s) in its dictionary)",
+                            mcu_config.name,
+                            mcu.dictionary().map(|d| d.commands().len()).unwrap_or(0)
+                        )
+                    )
+                );
+                boards.push((mcu_config, mcu));
+            }
+            Err(err) => {
+                println!("{}", tagged(name, format!("connect failed: {err}")));
+                failures.push(format!("{name}: {err}"));
+            }
+        }
     }
+
+    // One future per connected board, polled together: the ramps interleave on
+    // the same runtime, each with its own port, tasks and state.
+    let ramps = boards
+        .iter()
+        .map(|(mcu_config, mcu)| run_board(mcu_config, mcu.clone(), args.task, &config, &args))
+        .collect::<Vec<_>>();
+    for ((mcu_config, _), outcome) in boards.iter().zip(join_all(ramps).await) {
+        if let Err(err) = outcome {
+            let err = err.to_string();
+            println!("{}", tagged(&mcu_config.name, format!("failed: {err}")));
+            failures.push(format!("{}: {err}", mcu_config.name));
+        }
+    }
+
+    // Any board's hard error fails the command (exit code 1); a board that
+    // found its limit reported that as its own result and is a success.
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} of {} board(s) failed: {}",
+            failures.len(),
+            names.len(),
+            failures.join("; ")
+        )
+        .into())
+    }
+}
+
+/// One board's share of a run: the task the command asked for, as its own future.
+///
+/// The task functions keep their single-board signatures — this dispatcher is
+/// what a concurrent run joins, one call per connected board.
+async fn run_board(
+    mcu_config: &McuConfig,
+    mcu: Arc<Mcu>,
+    task: Task,
+    config: &Config,
+    args: &StressArgs,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match task {
+        Task::Step => step_stress(mcu_config, mcu, config, args).await,
+        Task::Comm => comm_stress(mcu, args).await,
+        Task::Motion => motion_smoke(mcu_config, mcu, config).await,
+    }
+}
+
+/// Poll every future in one task and collect their results, in input order.
+///
+/// `tokio::join!` spells this combinator for a number of futures fixed at
+/// compile time; how many MCUs a run has is only known at run time, so the same
+/// shape is written out here with `poll_fn`: each child is polled with the
+/// outer waker, so a board waiting on its port wakes the run exactly once.
+fn join_all<F: Future>(futures: Vec<F>) -> impl Future<Output = Vec<F::Output>> {
+    // Pinned once, here, so every child can be polled in place from the outer
+    // waker without the combinator itself needing to be pinned.
+    let mut pending: Vec<Option<Pin<Box<F>>>> =
+        futures.into_iter().map(|f| Some(Box::pin(f))).collect();
+    let mut done: Vec<Option<F::Output>> = pending.iter().map(|_| None).collect();
+    poll_fn(move |cx| {
+        let mut waiting = 0;
+        for (slot, outcome) in pending.iter_mut().zip(done.iter_mut()) {
+            if let Some(future) = slot.as_mut() {
+                let polled = future.as_mut().poll(cx);
+                if let Poll::Ready(value) = polled {
+                    *slot = None;
+                    *outcome = Some(value);
+                } else {
+                    waiting += 1;
+                }
+            }
+        }
+        if waiting == 0 {
+            Poll::Ready(take(&mut done).into_iter().map(Option::unwrap).collect())
+        } else {
+            Poll::Pending
+        }
+    })
+}
+
+/// Prefix a report line with the board it belongs to.
+///
+/// Concurrent boards print as they go, so a bare line could be any board's:
+/// `[zboard] …` keeps every progress and result line attributable (and greppable
+/// per board).
+fn tagged(mcu: &str, text: impl std::fmt::Display) -> String {
+    format!("[{mcu}] {text}")
+}
+
+/// The board's closing summary: `[<mcu>] last rate it <kind>: <rate>`, or
+/// `none` when the very first stage was already the limit.
+///
+/// This is what every ramp leaves behind on its way out — `survived` for the
+/// step ramp, `carried` for the comm ramp — so a multi-board run's output ends
+/// with one such line per board, each under its own prefix.
+fn summary_line(mcu: &str, kind: &str, last_good: Option<f64>, unit: &str) -> String {
+    let rate = last_good
+        .map(|rate| format!("{rate:.0} {unit}"))
+        .unwrap_or_else(|| "none".to_string());
+    tagged(mcu, format!("last rate it {kind}: {rate}"))
 }
 
 /// Ramp the step rate until the MCU's step timer gives out.
@@ -245,7 +381,13 @@ async fn step_stress(
     args: &StressArgs,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (stepper_section, step_pin, dir_pin) = find_stepper(config, &mcu_config.name, &mcu)?;
-    println!("using [{stepper_section}] -> step_pin={step_pin} dir_pin={dir_pin}");
+    println!(
+        "{}",
+        tagged(
+            &mcu_config.name,
+            format!("using [{stepper_section}] -> step_pin={step_pin} dir_pin={dir_pin}")
+        )
+    );
 
     // The handshake can reconnect (a firmware with no `config_reset` reboots), so
     // bind the events only once the connection is final.
@@ -254,7 +396,13 @@ async fn step_stress(
     bind_shutdown(&mcu, &shutdown_reason)?;
 
     let freq = mcu.clock_freq().map_err(std::io::Error::other)?;
-    println!("step clock {freq:.0} Hz; ramping step rate:");
+    println!(
+        "{}",
+        tagged(
+            &mcu_config.name,
+            format!("step clock {freq:.0} Hz; ramping step rate:")
+        )
+    );
 
     // The ramp is ascending and stops at the first failure: once the firmware has
     // shut down, only a `reset` clears it, so there is no going back to a lower
@@ -296,13 +444,19 @@ async fn step_stress(
             + Duration::from_millis(20)
             + Duration::from_micros(stage.duration_us / 10);
         println!(
-            "  {:>9.0} steps/s (interval {} ticks, {}x{} = {} steps over {:.0} ms): queued",
-            actual_rate,
-            stage.interval,
-            stage.commands,
-            stage.count,
-            stage.steps,
-            stage.duration_us as f64 / 1000.0
+            "{}",
+            tagged(
+                &mcu_config.name,
+                format!(
+                    "  {:>9.0} steps/s (interval {} ticks, {}x{} = {} steps over {:.0} ms): queued",
+                    actual_rate,
+                    stage.interval,
+                    stage.commands,
+                    stage.count,
+                    stage.steps,
+                    stage.duration_us as f64 / 1000.0
+                )
+            )
         );
         // Let the stage run out, waking early if the firmware stops.
         sleep_until(wait, &shutdown_reason).await;
@@ -313,14 +467,18 @@ async fn step_stress(
         {
             Ok(state) if state.is_shutdown => {
                 println!(
-                    "  firmware SHUT DOWN at {actual_rate:.0} steps/s: {}",
-                    shutdown_message(&shutdown_reason)
+                    "{}",
+                    tagged(
+                        &mcu_config.name,
+                        format!(
+                            "  firmware SHUT DOWN at {actual_rate:.0} steps/s: {}",
+                            shutdown_message(&shutdown_reason)
+                        )
+                    )
                 );
                 println!(
-                    "  last rate it survived: {}",
-                    last_good
-                        .map(|r| format!("{r:.0} steps/s"))
-                        .unwrap_or_else(|| "none".to_string())
+                    "{}",
+                    summary_line(&mcu_config.name, "survived", last_good, "steps/s")
                 );
                 return Ok(());
             }
@@ -329,7 +487,18 @@ async fn step_stress(
             }
             Err(err) => {
                 println!(
-                    "  no answer at {actual_rate:.0} steps/s ({err}); treating it as the limit"
+                    "{}",
+                    tagged(
+                        &mcu_config.name,
+                        format!(
+                            "  no answer at {actual_rate:.0} steps/s ({err}); treating it as the limit"
+                        )
+                    )
+                );
+                // Every way the ramp ends leaves one summary line behind.
+                println!(
+                    "{}",
+                    summary_line(&mcu_config.name, "survived", last_good, "steps/s")
                 );
                 return Ok(());
             }
@@ -339,7 +508,13 @@ async fn step_stress(
     }
 
     println!(
-        "no failure up to {MAX_RATE:.0} steps/s (the ramp's top); the MCU survived every stage"
+        "{}",
+        tagged(
+            &mcu_config.name,
+            format!(
+                "no failure up to {MAX_RATE:.0} steps/s (the ramp's top); the MCU survived every stage"
+            )
+        )
     );
     Ok(())
 }
@@ -364,7 +539,13 @@ async fn comm_stress(mcu: Arc<Mcu>, args: &StressArgs) -> Result<(), Box<dyn std
         .map_err(|err| std::io::Error::other(format!("bind clock: {err}")))?;
     }
 
-    println!("ramping request rate (`get_clock` round-trips):");
+    println!(
+        "{}",
+        tagged(
+            mcu.name(),
+            "ramping request rate (`get_clock` round-trips):"
+        )
+    );
     let mut rate = COMM_START_RATE;
     let mut last_good: Option<f64> = None;
     while rate <= COMM_MAX_RATE {
@@ -381,8 +562,14 @@ async fn comm_stress(mcu: Arc<Mcu>, args: &StressArgs) -> Result<(), Box<dyn std
         let backlog = sent.saturating_sub(replied);
 
         println!(
-            "  {:>8.0} req/s: sent {sent}, answered {replied}, achieved {achieved:.0} req/s, backlog {backlog}",
-            rate
+            "{}",
+            tagged(
+                mcu.name(),
+                format!(
+                    "  {:>8.0} req/s: sent {sent}, answered {replied}, achieved {achieved:.0} req/s, backlog {backlog}",
+                    rate
+                )
+            )
         );
 
         let failure = if shutdown_reason
@@ -402,12 +589,16 @@ async fn comm_stress(mcu: Arc<Mcu>, args: &StressArgs) -> Result<(), Box<dyn std
         };
 
         if let Some(failure) = failure {
-            println!("  link gave out at {rate:.0} req/s: {failure}");
             println!(
-                "  last rate it carried: {}",
-                last_good
-                    .map(|r| format!("{r:.0} req/s"))
-                    .unwrap_or_else(|| "none".to_string())
+                "{}",
+                tagged(
+                    mcu.name(),
+                    format!("  link gave out at {rate:.0} req/s: {failure}")
+                )
+            );
+            println!(
+                "{}",
+                summary_line(mcu.name(), "carried", last_good, "req/s")
             );
             return Ok(());
         }
@@ -416,7 +607,13 @@ async fn comm_stress(mcu: Arc<Mcu>, args: &StressArgs) -> Result<(), Box<dyn std
     }
 
     println!(
-        "no failure up to {COMM_MAX_RATE:.0} req/s (the ramp's top); the link carried every stage"
+        "{}",
+        tagged(
+            mcu.name(),
+            format!(
+                "no failure up to {COMM_MAX_RATE:.0} req/s (the ramp's top); the link carried every stage"
+            )
+        )
     );
     Ok(())
 }
@@ -559,6 +756,60 @@ fn find_mcu_section<'a>(config: &'a Config, name: &str) -> Option<&'a ConfigSect
         .find(|section| section.id == "mcu" && section.sub.as_deref().unwrap_or("mcu") == name)
 }
 
+/// The MCU names this run drives: the command line's list, `--all-mcus`'
+/// enumeration, or the single default `mcu`.
+///
+/// An explicit list keeps the old spelling: an empty name means the bare
+/// `[mcu]` (via [`mcu_name`]), and a board named twice is connected once.
+/// `--all-mcus` takes every `[mcu]` section in config order — the bare `[mcu]`
+/// among them, whose name is `mcu` — and does not take names of its own.
+fn select_mcus(config: &Config, requested: &[String], all: bool) -> Result<Vec<String>, String> {
+    if all {
+        if !requested.is_empty() {
+            return Err(
+                "--all-mcus names every [mcu] section itself; it does not take MCU names".into(),
+            );
+        }
+        let names = config
+            .sections()
+            .filter(|section| section.id == "mcu")
+            .map(|section| section.sub.as_deref().unwrap_or("mcu").to_string())
+            .collect::<Vec<_>>();
+        if names.is_empty() {
+            return Err("no [mcu] section".into());
+        }
+        return Ok(names);
+    }
+    if requested.is_empty() {
+        return Ok(vec![mcu_name("").to_string()]);
+    }
+    let mut names: Vec<String> = Vec::new();
+    for name in requested {
+        let name = mcu_name(name).to_string();
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    Ok(names)
+}
+
+/// Build the configuration of the `[mcu]` / `[mcu <name>]` section one name
+/// selects: the lookup [`stress`] used to do inline, plus the transport parse.
+///
+/// The error says which section is missing; the caller adds where it looked
+/// (the config file).
+fn resolve_mcu(config: &Config, name: &str) -> Result<McuConfig, String> {
+    let section = find_mcu_section(config, name).ok_or_else(|| {
+        if name == "mcu" {
+            "no [mcu] section".to_string()
+        } else {
+            format!("no [mcu {name}] section")
+        }
+    })?;
+    McuConfig::new(&ConfigWrapper::new(section, AccessTracking::shared()))
+        .map_err(|err| err.to_string())
+}
+
 /// Drive one stepper through the host's motion path and read its position back.
 ///
 /// This is the FW5f real-board smoke test: a [`Trapq`] move is solved by
@@ -583,7 +834,13 @@ async fn motion_smoke(
     const SETTLE_POLL: Duration = Duration::from_millis(5);
 
     let (stepper_section, step_pin, dir_pin) = find_stepper(config, &mcu_config.name, &mcu)?;
-    println!("using [{stepper_section}] -> step_pin={step_pin} dir_pin={dir_pin}");
+    println!(
+        "{}",
+        tagged(
+            &mcu_config.name,
+            format!("using [{stepper_section}] -> step_pin={step_pin} dir_pin={dir_pin}")
+        )
+    );
     let (oid, mcu) = configure_stepper(mcu_config, mcu, step_pin, dir_pin).await?;
     let freq = mcu.clock_freq().map_err(std::io::Error::other)?;
 
@@ -624,18 +881,30 @@ async fn motion_smoke(
     let commands = stepper.generate(&trapq, flush_time)?;
     let expected = (DISTANCE / STEP_DIST).round() as i32;
     println!(
-        "generated {} command(s) for {expected} step(s): {}",
-        commands.len(),
-        describe_commands(&commands)
+        "{}",
+        tagged(
+            &mcu_config.name,
+            format!(
+                "generated {} command(s) for {expected} step(s): {}",
+                commands.len(),
+                describe_commands(&commands)
+            )
+        )
     );
 
     send_steps(&mcu, oid, &commands).await?;
     let position = wait_for_position(&mcu, oid, expected, SETTLE_TIMEOUT, SETTLE_POLL).await?;
-    println!("firmware position: {position} step(s), expected {expected}");
+    println!(
+        "{}",
+        tagged(
+            &mcu_config.name,
+            format!("firmware position: {position} step(s), expected {expected}")
+        )
+    );
     if position != expected {
         return Err(format!("position mismatch: {position} != {expected}").into());
     }
-    println!("motion smoke OK");
+    println!("{}", tagged(&mcu_config.name, "motion smoke OK"));
     Ok(())
 }
 
@@ -827,7 +1096,13 @@ async fn configure_stepper(
         match builder.handshake(&mcu, &mut built, false).await {
             Ok(configured) => break configured,
             Err(McuError::ResetRequired) if !reset_sent => {
-                println!("firmware has no config_reset; sending 'reset' and reconnecting");
+                println!(
+                    "{}",
+                    tagged(
+                        &mcu_config.name,
+                        "firmware has no config_reset; sending 'reset' and reconnecting"
+                    )
+                );
                 mcu.send_msg(&Reset)
                     .map_err(|err| std::io::Error::other(format!("reset: {err}")))?;
                 let _ = mcu.flush(RESET_FLUSH_TIMEOUT).await;
@@ -856,13 +1131,19 @@ async fn configure_stepper(
         }
     };
     println!(
-        "configured stepper oid {oid} (firmware move queue: {} slots{})",
-        configured.move_count,
-        if configured.reused {
-            ", config reused"
-        } else {
-            ""
-        }
+        "{}",
+        tagged(
+            &mcu_config.name,
+            format!(
+                "configured stepper oid {oid} (firmware move queue: {} slots{})",
+                configured.move_count,
+                if configured.reused {
+                    ", config reused"
+                } else {
+                    ""
+                }
+            )
+        )
     );
     Ok((oid, mcu))
 }
@@ -1173,5 +1454,389 @@ mod tests {
         // A pin on another chip, and a name the firmware does not know.
         assert!(resolve_pin(&mcu, "mcu", "zboard:PB1").is_err());
         assert!(resolve_pin(&mcu, "mcu", "PC9").is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Multi-MCU runs
+    // -----------------------------------------------------------------------
+
+    /// A config with a bare `[mcu]`, a named one, and a section that is not an
+    /// MCU at all (so `--all-mcus` has something to skip).
+    fn two_board_config() -> Config {
+        let mut config = Config::new();
+        config.add_section(section("mcu", None, &[("serial", "/dev/ttyACM0")]));
+        config.add_section(section(
+            "mcu",
+            Some("zboard"),
+            &[("serial", "/dev/ttyACM1")],
+        ));
+        config.add_section(section("printer", None, &[("kinematics", "cartesian")]));
+        config
+    }
+
+    /// Which boards a command line selects, how a name resolves, and how the
+    /// report lines and summaries of concurrent boards stay attributable.
+    #[test]
+    fn mcus_are_selected_by_name_or_all_and_summarised_per_board() {
+        let config = two_board_config();
+
+        // No name given → the single default `mcu`, exactly as before `--all-mcus`.
+        assert_eq!(select_mcus(&config, &[], false).unwrap(), ["mcu"]);
+        // Names on the command line, in order; an empty one is still the bare
+        // `[mcu]` section.
+        assert_eq!(
+            select_mcus(&config, &["zboard".to_string()], false).unwrap(),
+            ["zboard"]
+        );
+        assert_eq!(
+            select_mcus(&config, &["".to_string(), "zboard".to_string()], false).unwrap(),
+            ["mcu", "zboard"]
+        );
+        // A board named twice is driven once.
+        assert_eq!(
+            select_mcus(&config, &["mcu".to_string(), "mcu".to_string()], false).unwrap(),
+            ["mcu"]
+        );
+        // `--all-mcus` enumerates every `[mcu]` section in config order (the
+        // bare one first) and skips sections that are not MCUs …
+        assert_eq!(select_mcus(&config, &[], true).unwrap(), ["mcu", "zboard"]);
+        // … and it does not take names of its own.
+        assert!(select_mcus(&config, &["zboard".to_string()], true).is_err());
+
+        // Each name resolves to its own section; a missing one says so.
+        assert_eq!(resolve_mcu(&config, "mcu").unwrap().name, "mcu");
+        assert_eq!(resolve_mcu(&config, "zboard").unwrap().name, "zboard");
+        assert_eq!(
+            resolve_mcu(&config, "nope").unwrap_err(),
+            "no [mcu nope] section"
+        );
+
+        // Report lines carry their board's prefix, the closing summaries too.
+        assert_eq!(tagged("zboard", "queued"), "[zboard] queued");
+        assert_eq!(
+            summary_line("zboard", "survived", Some(12_500.0), "steps/s"),
+            "[zboard] last rate it survived: 12500 steps/s"
+        );
+        assert_eq!(
+            summary_line("mcu", "carried", None, "req/s"),
+            "[mcu] last rate it carried: none"
+        );
+    }
+
+    /// The `stress` subcommand's arguments, so a test can parse command lines.
+    #[derive(clap::Parser)]
+    struct Cli {
+        #[command(flatten)]
+        stress: StressArgs,
+    }
+
+    /// The old single-board command line still means the default `mcu`, and the
+    /// new spellings add boards without changing what the old ones select.
+    #[test]
+    fn the_old_single_board_command_line_still_selects_the_default_mcu() {
+        use clap::Parser;
+
+        let config = two_board_config();
+
+        // The documented invocation: a config file and no MCU name at all.
+        let cli = Cli::try_parse_from(["stress", "printer.cfg"]).unwrap();
+        assert!(cli.stress.mcu.is_empty(), "no name was given");
+        assert!(!cli.stress.all_mcus);
+        assert_eq!(cli.stress.task, Task::Step);
+        assert_eq!(
+            select_mcus(&config, &cli.stress.mcu, cli.stress.all_mcus).unwrap(),
+            ["mcu"]
+        );
+
+        // One name keeps meaning exactly that board.
+        let cli = Cli::try_parse_from(["stress", "printer.cfg", "zboard"]).unwrap();
+        assert_eq!(cli.stress.mcu, ["zboard"]);
+        assert_eq!(
+            select_mcus(&config, &cli.stress.mcu, cli.stress.all_mcus).unwrap(),
+            ["zboard"]
+        );
+
+        // Several names at once, with a flag after them.
+        let cli = Cli::try_parse_from(["stress", "printer.cfg", "mcu", "zboard", "--task", "comm"])
+            .unwrap();
+        assert_eq!(cli.stress.mcu, ["mcu", "zboard"]);
+        assert_eq!(cli.stress.task, Task::Comm);
+
+        // `--all-mcus` alone enumerates the config's sections.
+        let cli = Cli::try_parse_from(["stress", "printer.cfg", "--all-mcus"]).unwrap();
+        assert!(cli.stress.all_mcus);
+        assert!(cli.stress.mcu.is_empty());
+        assert_eq!(
+            select_mcus(&config, &cli.stress.mcu, cli.stress.all_mcus).unwrap(),
+            ["mcu", "zboard"]
+        );
+    }
+
+    /// Two fake boards on one runtime: each runs the real `identify` handshake
+    /// against its own dictionary-driven device, then is driven with round-trips
+    /// and a batch of fire-and-forget commands at the same time as the other.
+    ///
+    /// What this pins down is that the two sessions never share anything: each
+    /// board ends up with *its own* dictionary (identify never crossed), and
+    /// each batch of `get_clock` requests is answered exactly once, on the board
+    /// that sent it. A full ramp against two fake boards would just measure the
+    /// fake — that is what the real boards are for.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn two_fake_boards_identify_and_drive_concurrently() {
+        let dict_a = klipperx_test_support::test_dicts_dir().join("atmega2560.dict");
+        let dict_b = klipperx_test_support::test_dicts_dir().join("linuxprocess.dict");
+        let text = format!(
+            "[mcu]\ntest: dict={}\n\n[mcu zboard]\ntest: dict={}\n",
+            dict_a.display(),
+            dict_b.display()
+        );
+        let (config, _) = Config::from_text(&text).expect("two fake MCUs parse");
+
+        // What `--all-mcus` selects, then one connection (identify) per board,
+        // running concurrently rather than one after the other.
+        assert_eq!(select_mcus(&config, &[], true).unwrap(), ["mcu", "zboard"]);
+        let connects = ["mcu", "zboard"]
+            .iter()
+            .map(|name| {
+                let mcu_config = resolve_mcu(&config, name).unwrap();
+                async move { connect(&mcu_config).await }
+            })
+            .collect::<Vec<_>>();
+        let mut connected = join_all(connects).await.into_iter();
+        let mcu_a = connected
+            .next()
+            .unwrap()
+            .expect("the bare [mcu] identifies");
+        let mcu_b = connected.next().unwrap().expect("[mcu zboard] identifies");
+
+        // Each board carries its own dictionary: the two files differ in their
+        // command counts, so a crossed identify would be visible here.
+        let command_count = |path: &std::path::Path| {
+            let json: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(path).unwrap_or_else(|e| panic!("{path:?}: {e}")),
+            )
+            .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            json.get("commands")
+                .and_then(|commands| commands.as_object())
+                .map(|commands| commands.len())
+                .unwrap_or(0)
+        };
+        let commands_a = mcu_a
+            .dictionary()
+            .expect("board A identified")
+            .commands()
+            .len();
+        let commands_b = mcu_b
+            .dictionary()
+            .expect("board B identified")
+            .commands()
+            .len();
+        assert_eq!(
+            commands_a,
+            command_count(&dict_a),
+            "board A got its own dictionary"
+        );
+        assert_eq!(
+            commands_b,
+            command_count(&dict_b),
+            "board B got its own dictionary"
+        );
+        assert_ne!(
+            commands_a, commands_b,
+            "the two dictionaries must differ for this to prove which board is which"
+        );
+        assert_eq!(mcu_a.name(), "mcu");
+        assert_eq!(mcu_b.name(), "zboard");
+
+        /// Five round-trips, then a fire-and-forget batch whose answers are
+        /// counted by a bound callback — the shape `comm_stress` runs, cut
+        /// short so a fake board can carry it.
+        async fn drive(mcu: Arc<Mcu>) -> Result<u64, Box<dyn std::error::Error>> {
+            use crate::core::klippy::cmd::ClockState;
+
+            const ROUNDS: usize = 5;
+            const BATCH: u64 = 25;
+
+            let mut clocks = Vec::new();
+            for _ in 0..ROUNDS {
+                clocks.push(
+                    mcu.call_msg::<GetClock, ClockState>(&GetClock, CALL_TIMEOUT)
+                        .await?
+                        .clock,
+                );
+            }
+            assert!(
+                clocks.windows(2).all(|pair| pair[0] <= pair[1]),
+                "board '{}' answers from its own monotonic clock: {clocks:?}",
+                mcu.name()
+            );
+
+            let answered = Arc::new(AtomicU64::new(0));
+            {
+                let answered = Arc::clone(&answered);
+                mcu.bind_callback("clock", move |_| {
+                    answered.fetch_add(1, Ordering::Relaxed);
+                })?;
+            }
+            for _ in 0..BATCH {
+                mcu.send_msg(&GetClock)?;
+            }
+            mcu.flush(CALL_TIMEOUT).await?;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while answered.load(Ordering::Relaxed) < BATCH && Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            Ok(answered.load(Ordering::Relaxed))
+        }
+
+        let drives = join_all(vec![drive(mcu_a.clone()), drive(mcu_b.clone())]).await;
+        for (name, outcome) in ["mcu", "zboard"].iter().zip(&drives) {
+            let answered = outcome
+                .as_ref()
+                .unwrap_or_else(|err| panic!("{name}'s drive failed: {err}"));
+            assert_eq!(
+                *answered, 25,
+                "{name} answered its own batch, not the other's"
+            );
+        }
+    }
+
+    /// Two sessions over their own scripted ports, driven at the same time:
+    /// every frame each sends lands in that session's own recorder, in order,
+    /// and the sequence numbers stay in the session that produced them.
+    ///
+    /// The two boards speak different commands (`get_clock` vs `get_uptime`),
+    /// so a frame on the wrong port would show up as a foreign payload in one
+    /// recorder — and would not match the scripted input, so the session could
+    /// not complete. A full ramp needs a real board; this covers the part a fake
+    /// can prove: the wiring keeps sessions apart while both are busy.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_sessions_send_only_their_own_frames_to_their_own_recorder() {
+        use crate::core::klippy::cmd::ClockState;
+        use crate::core::klippy::frame::Frame;
+        use crate::core::klippy::interface::devices::frame_mock::{
+            FrameMock, FrameRecorder, MappingEntry,
+        };
+        use crate::core::klippy::interface::Interface;
+        use crate::core::klippy::mcu::{Dictionary, Mcu};
+
+        use crate::core::klippy::msg::proto::Payload;
+        const ROUNDS: u8 = 8;
+
+        /// A device scripted for `ROUNDS` blocks carrying `command`: each is
+        /// acknowledged the way the firmware does it (an empty frame numbered
+        /// `seq + 1`), and the last one also carries `response`, so the trailing
+        /// `call` has an answer.
+        fn scripted(command: u8, response: &[u8]) -> (FrameMock, FrameRecorder) {
+            let mut mapping = Vec::new();
+            for seq in 0..ROUNDS {
+                let mut outputs = vec![Frame::new(seq + 1, Vec::new())];
+                if seq + 1 == ROUNDS {
+                    outputs.insert(0, Frame::new(seq + 1, response.to_vec()));
+                }
+                mapping.push(MappingEntry {
+                    input: Frame::new(seq, vec![command]),
+                    outputs,
+                });
+            }
+            let device = FrameMock::new(mapping);
+            let recorder = device.recorder();
+            (device, recorder)
+        }
+
+        // `clock clock=%u` is response 18; `uptime high=%u clock=%u` is 17.
+        // The id and the `%u` values are VLQ-encoded, which is what `Payload`
+        // does — raw little-endian bytes would not decode.
+        let mut clock_answer = Payload::new();
+        clock_answer.push_i16(18).unwrap();
+        clock_answer.push_u32(123_456).unwrap();
+        let clock_answer = clock_answer.into_raw();
+        let mut uptime_answer = Payload::new();
+        uptime_answer.push_i16(17).unwrap();
+        uptime_answer.push_u32(7).unwrap();
+        uptime_answer.push_u32(654_321).unwrap();
+        let uptime_answer = uptime_answer.into_raw();
+
+        let (device_a, recorder_a) = scripted(5, &clock_answer);
+        let (device_b, recorder_b) = scripted(6, &uptime_answer);
+        let mcu_a = Arc::new(Mcu::for_test("board_a", Interface::new(device_a)));
+        let mcu_b = Arc::new(Mcu::for_test("board_b", Interface::new(device_b)));
+        mcu_a
+            .install_dictionary(
+                Dictionary::from_json(serde_json::json!({
+                    "commands": {"get_clock": 5},
+                    "responses": {"clock clock=%u": 18}
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        mcu_b
+            .install_dictionary(
+                Dictionary::from_json(serde_json::json!({
+                    "commands": {"get_uptime": 6},
+                    "responses": {"uptime high=%u clock=%u": 17}
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+        /// Send `ROUNDS - 1` fire-and-forget commands (one flush each, so each
+        /// becomes its own block), then close with one round-trip.
+        async fn drive(mcu: Arc<Mcu>, clock: bool) -> Result<(), Box<dyn std::error::Error>> {
+            for _ in 0..ROUNDS - 1 {
+                if clock {
+                    mcu.send_msg(&GetClock)?;
+                } else {
+                    mcu.send_msg(&GetUptime)?;
+                }
+                mcu.flush(CALL_TIMEOUT).await?;
+            }
+            if clock {
+                let state = mcu
+                    .call_msg::<GetClock, ClockState>(&GetClock, CALL_TIMEOUT)
+                    .await?;
+                assert_eq!(state.clock, 123_456, "answered by its own scripted port");
+            } else {
+                let uptime = mcu
+                    .call_msg::<GetUptime, Uptime>(&GetUptime, CALL_TIMEOUT)
+                    .await?;
+                assert_eq!(
+                    (uptime.high, uptime.clock),
+                    (7, 654_321),
+                    "answered by its own scripted port"
+                );
+            }
+            Ok(())
+        }
+
+        let sent = |recorder: &FrameRecorder| -> Vec<(u8, Vec<u8>)> {
+            recorder
+                .frames()
+                .iter()
+                .map(|frame| (frame.seq(), frame.payload().to_vec()))
+                .collect()
+        };
+        let expected = |command: u8| -> Vec<(u8, Vec<u8>)> {
+            (0..ROUNDS).map(|seq| (seq, vec![command])).collect()
+        };
+
+        let (a, b) = tokio::join!(drive(mcu_a, true), drive(mcu_b, false));
+        a.expect("session A completes without an error");
+        b.expect("session B completes without an error");
+
+        // Every frame stayed where it belongs: A's recorder holds only
+        // `get_clock` blocks and B's only `get_uptime` blocks, each numbered
+        // 0..ROUNDS-1 in order — no foreign payload, no duplicated or skipped
+        // sequence number.
+        assert_eq!(
+            sent(&recorder_a),
+            expected(5),
+            "board A's own frames, in order"
+        );
+        assert_eq!(
+            sent(&recorder_b),
+            expected(6),
+            "board B's own frames, in order"
+        );
     }
 }

@@ -435,6 +435,8 @@ mod tests {
                 "stepper_j",
                 "stepper_k",
                 "stepper_l",
+                "stepper_left",
+                "stepper_right",
                 "stepper_m",
                 "stepper_n",
                 "stepper_o",

@@ -188,14 +188,19 @@ impl EncoderSensor {
         );
         let weak = Arc::downgrade(self);
         printer.register_event_handler(
-            KlippyEvent::IdleTimeoutPrinting,
+            KlippyEvent::IdleTimeoutPrinting { print_time: 0.0 },
             Box::new(move |_| {
                 if let Some(sensor) = weak.upgrade() {
                     sensor.printing.store(true, Ordering::SeqCst);
                 }
             }),
         );
-        for event in [KlippyEvent::IdleTimeoutReady, KlippyEvent::IdleTimeoutIdle] {
+        // The registry keys handlers by the event's name, so the payload a
+        // registration is built with does not matter.
+        for event in [
+            KlippyEvent::IdleTimeoutReady { print_time: 0.0 },
+            KlippyEvent::IdleTimeoutIdle { print_time: 0.0 },
+        ] {
             let weak = Arc::downgrade(self);
             printer.register_event_handler(
                 event,
@@ -415,9 +420,9 @@ mod tests {
         let (printer, result) = load(CONFIG);
         result.expect("the config loads");
         let sensor = the_sensor(&printer);
-        printer.send_event(&KlippyEvent::IdleTimeoutPrinting);
+        printer.send_event(&KlippyEvent::IdleTimeoutPrinting { print_time: 0.0 });
         assert!(sensor.printing.load(Ordering::SeqCst));
-        printer.send_event(&KlippyEvent::IdleTimeoutIdle);
+        printer.send_event(&KlippyEvent::IdleTimeoutIdle { print_time: 0.0 });
         assert!(!sensor.printing.load(Ordering::SeqCst));
     }
 }

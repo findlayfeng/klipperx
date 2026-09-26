@@ -158,7 +158,7 @@ Connected to unix:/tmp/klippy_uds.
     - gcode/firmware_restart
     - …（完整清单随实现变化，以 `list_endpoints` 实际应答为准）
 klippy> objects/query {objects: {toolhead: [position]}}
-Enter send · ↑↓ history · PgUp/PgDn · ^G g-code · .help · ^C quit
+Enter send · ↑↓ history · PgUp/PgDn/Home/End log · ^G g-code · Esc×3 stop · .help · ^C quit
 ```
 
 第一行是状态行（左边那个符号：`●` 就绪、`◌` 启动中或状态未知、`▲` 出错/停机、
@@ -183,7 +183,15 @@ Enter send · ↑↓ history · PgUp/PgDn · ^G g-code · .help · ^C quit
 | `Ctrl+G` | 在请求模式与 g-code 模式之间切换（同 `.gcode`） |
 | `Ctrl+S` | 把鼠标交给终端——可以拖选、复制文字；按任意键收回（同 `.mouse`） |
 | `Ctrl+L` | 清空日志 |
-| `Ctrl+C` / `Ctrl+D` / `Esc` | 退出（欠着的应答会先打完） |
+| `Ctrl+C` / `Ctrl+D` | 立刻退出（欠着的应答会先打完） |
+| `Esc` | 单击（0.8 s 内不再按）= 退出；**连按 3 下 = 急停**（发 `emergency_stop`，打印机停机直到重启） |
+
+`Esc` 是唯一一个两义键：它一直是"退出"的直觉手势，而急停又必须能在键盘上盲打出来。
+所以它按**手势**区分——单击意味着退出，但会等 0.8 s 窗口关掉才真的走；窗口内按下
+第二、第三下则是急停（`Esc` 三下连按），顺带把退出取消了。按 1–2 下时下方提示会数
+`emergency stop 1/3 · Esc again · any other key cancels`；按任意其它键即视为"不
+是急停"，手势作废（此时单击那次仍会在窗口到期后退出）。不想要这个延迟就直接用
+`Ctrl+C` / `Ctrl+D`，它们仍即时退出。
 
 翻看旧日志时，最下面那行会提示 `viewing older entries · N lines back`（回滚了
 多少行）；按 `End` 或 `PgDn` 回到底部，按 `Home` 回到顶端，或者直接敲下一条

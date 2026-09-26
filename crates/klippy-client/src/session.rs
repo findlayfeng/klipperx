@@ -347,6 +347,23 @@ impl Session {
         Ok(())
     }
 
+    /// Emergency stop (`emergency_stop`).
+    ///
+    /// The host sends the firmware's own emergency stop to every MCU and shuts
+    /// the printer down. Unlike [`Self::firmware_restart`] nothing comes back on
+    /// its own: the printer stays in `shutdown` until it is restarted.
+    ///
+    /// # Errors
+    /// Returns [`TransportError`] if the request cannot be sent.
+    pub async fn emergency_stop(&mut self, out: &mut impl Output) -> Result<(), TransportError> {
+        self.request("emergency_stop", Map::new(), out).await?;
+        out.write(Entry::notice(
+            Notice::Problem,
+            "Emergency stop sent; the printer is shut down until it is restarted.",
+        ));
+        Ok(())
+    }
+
     /// Send a line the user wrote as a whole request object.
     ///
     /// The line is YAML, so a request can be written without quoting its keys;

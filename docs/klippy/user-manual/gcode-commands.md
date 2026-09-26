@@ -403,6 +403,12 @@ SET_IDLE_TIMEOUT [TIMEOUT=<秒>]
 ```
 不带参数时保持当前值；成功回 `idle_timeout: Timeout set to <值> s`；`TIMEOUT` 必须大于 0。
 
+### AXIS_TWIST_COMPENSATION_CALIBRATE — 校准轴扭曲补偿（由 `[axis_twist_compensation]` 注册，批 #36）
+```
+AXIS_TWIST_COMPENSATION_CALIBRATE [SAMPLE_COUNT=<n>]
+```
+逐点探测并记录各采样点的 Z 补偿；help 与回复文案照上游。
+
 ### SET_DIGIPOT — 设置数字电位器（多路键 `DIGIPOT`，批 #33）
 ```
 SET_DIGIPOT DIGIPOT=<name> [WIPER=<0..scale>]

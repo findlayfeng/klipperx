@@ -128,12 +128,35 @@ const RECONNECT_ATTEMPTS: usize = 20;
 /// How long to give the `reset` command's flush before reopening.
 const RESET_FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// How far the stepper's clock is put ahead of now on each re-anchor.
+/// Lead time added on top of the measured `get_clock` round trip.
+///
+/// The round trip only shows the wire's latency at one instant: this covers the
+/// host's local handling between taking the sample and handing
+/// `reset_step_clock` to the link, plus jitter the sample did not capture.
+const ANCHOR_SLACK: Duration = Duration::from_millis(1);
+
+/// The anchor always leads by at least this much — exactly the fixed lead the
+/// tool used before it measured the round trip, so a tiny RTT can never make
+/// the margin worse than it was.
+const ANCHOR_MIN_MARGIN: Duration = Duration::from_millis(1);
+
+/// How far the stepper's clock is put ahead of now on each re-anchor, derived
+/// from the measured `get_clock` round trip.
 ///
 /// The reset travels to the firmware after the clock was read, so anchoring at
 /// "now" would already be in the past and could shut the firmware down with
-/// `Timer too close` before the ramp even starts.
-const ANCHOR_MARGIN: f64 = 0.001;
+/// `Timer too close` before the ramp even starts. From the sampling instant to
+/// `reset_step_clock` reaching the firmware is about one round trip, and the
+/// measured RTT itself is one more round trip the lead has to absorb, hence
+/// `2 × rtt`, plus [`ANCHOR_SLACK`] for local handling and jitter. The
+/// [`ANCHOR_MIN_MARGIN`] floor keeps an RTT too small to measure from scoring
+/// worse than the old fixed 1 ms margin.
+fn anchor_margin(rtt: Duration) -> Duration {
+    rtt.checked_mul(2)
+        .unwrap_or(Duration::MAX)
+        .saturating_add(ANCHOR_SLACK)
+        .max(ANCHOR_MIN_MARGIN)
+}
 
 #[derive(Args, Debug)]
 pub struct StressArgs {
@@ -906,13 +929,19 @@ async fn sleep_until(wait: Duration, shutdown: &Arc<Mutex<Option<String>>>) {
 /// Re-anchor the stepper's clock just ahead of now, so the next burst's first
 /// step is in the future.
 async fn anchor_stepper(mcu: &Arc<Mcu>, oid: u8) -> Result<(), std::io::Error> {
+    let sampled_at = Instant::now();
     let clock = mcu
         .call_msg::<_, crate::core::klippy::cmd::ClockState>(&GetClock, CALL_TIMEOUT)
         .await
         .map_err(|err| std::io::Error::other(format!("get_clock: {err}")))?
         .clock;
+    // Time the round trip just made; when it cannot be measured, fall back to
+    // `Duration::ZERO`, which `anchor_margin` turns back into the old 1 ms.
+    let rtt = Instant::now()
+        .checked_duration_since(sampled_at)
+        .unwrap_or(Duration::ZERO);
     let margin = mcu
-        .seconds_to_clock(ANCHOR_MARGIN)
+        .seconds_to_clock(anchor_margin(rtt).as_secs_f64())
         .map_err(|err| std::io::Error::other(format!("seconds_to_clock: {err}")))?
         as u32;
     mcu.send_msg(&ResetStepClock {
@@ -1037,6 +1066,41 @@ mod tests {
         // checks the chip-prefix filter that runs before resolution.
         let config = Config::new();
         assert!(config.sections().next().is_none());
+    }
+
+    #[test]
+    fn the_anchor_margin_covers_the_round_trip_plus_slack() {
+        for rtt in [
+            Duration::ZERO,
+            Duration::from_millis(1),
+            Duration::from_millis(4),
+            Duration::from_millis(50),
+        ] {
+            let margin = anchor_margin(rtt);
+            assert!(
+                margin >= 2 * rtt + ANCHOR_SLACK,
+                "rtt {rtt:?}: {margin:?} is under 2×rtt + slack"
+            );
+            assert!(
+                margin >= Duration::from_millis(1),
+                "rtt {rtt:?}: {margin:?} is under the 1 ms floor"
+            );
+        }
+    }
+
+    #[test]
+    fn the_anchor_margin_keeps_the_old_fixed_lead_at_zero_rtt() {
+        // Unmeasurable round trip → exactly the margin the tool used before.
+        assert_eq!(anchor_margin(Duration::ZERO), Duration::from_millis(1));
+        // Sanity on the formula's exact values on a real link.
+        assert_eq!(
+            anchor_margin(Duration::from_millis(4)),
+            Duration::from_millis(9)
+        );
+        assert_eq!(
+            anchor_margin(Duration::from_millis(50)),
+            Duration::from_millis(101)
+        );
     }
 
     #[test]

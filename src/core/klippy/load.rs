@@ -407,6 +407,7 @@ mod tests {
                 "neopixel",
                 "pca9533",
                 "pca9632",
+                "tmc2130",
                 "tmc2208",
                 "tmc2209",
                 // The display framework, after the `display_template` registry

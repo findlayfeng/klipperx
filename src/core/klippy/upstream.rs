@@ -406,11 +406,7 @@ mod tests {
     ///
     /// `KLIPPERX_UPSTREAM_ALL=1` runs every case and reports every failure, so
     /// the list stays honest rather than hiding regressions.
-    const IGNORED: &[&str] = &[
-        "load_cell.test",
-        "printers.test",
-        "rotary_delta_calibrate.test",
-    ];
+    const IGNORED: &[&str] = &["load_cell.test", "printers.test"];
 
     // -----------------------------------------------------------------------
     // Which architectures and dictionaries to run

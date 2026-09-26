@@ -94,6 +94,9 @@ impl Config {
         // (later) value — the same last-write-wins an in-file duplicate
         // option has.
         merged.parameters.extend(section.parameters);
+        // A repeated section joins option sets, so join their block provenance
+        // too: the exemption must not be lost when two copies merge.
+        merged.autosave_options.extend(section.autosave_options);
         self.sections.insert(merged);
     }
 
@@ -110,7 +113,9 @@ impl Config {
     /// parsed on its own and its options are appended, minus every option the
     /// regular text already defines — **the body wins, the block only adds**.
     /// **A file without the header takes exactly the old path over exactly
-    /// the same bytes** — no block, no change.
+    /// the same bytes** — no block, no change. Each option the block
+    /// contributes is tagged on its section ([`ConfigSection::is_autosave_option`])
+    /// so [`check_unused`] can exempt it, as upstream does.
     pub fn parse(source: ConfigSource) -> Result<(Self, Vec<ConfigSource>), String> {
         let content = Self::read_source(&source)?;
         let (regular, autosave) = split_autosave(&content);
@@ -617,18 +622,28 @@ fn strip_autosave_duplicates(block: &str, regular: &Config) -> String {
 /// upstream's `append_fileconfig(regular_fileconfig, autosave_data, …)`
 /// (`configfile.py:305`): a body-defined option stays (its block twin was
 /// already stripped), a new one is added to its section (created if the body
-/// lacks it), and insertion order keeps the body's sections in place.
+/// lacks it), and insertion order keeps the body's sections in place. Every
+/// option the block contributes is tagged as an autosave option, which is what
+/// `check_unused` exempts.
 fn merge_autosave(body: &mut Config, saved: &Config) {
     for section in saved.sections_vec() {
         let key = (section.id.clone(), section.sub.clone());
         match body.sections.get_by_key(&key).cloned() {
-            None => body.add_section(section.clone()),
+            None => {
+                // The whole section came from the block, so every option in it
+                // is an autosave option.
+                let mut added = section.clone();
+                for option in added.parameters.keys() {
+                    added.autosave_options.insert(option.clone());
+                }
+                body.add_section(added);
+            }
             Some(mut existing) => {
                 for (option, value) in &section.parameters {
-                    existing
-                        .parameters
-                        .entry(option.clone())
-                        .or_insert_with(|| value.clone());
+                    if !existing.parameters.contains_key(option) {
+                        existing.parameters.insert(option.clone(), value.clone());
+                        existing.autosave_options.insert(option.clone());
+                    }
                 }
                 // Replacing under the same key keeps the body's position in
                 // the iteration order (`insert` only appends unknown keys).

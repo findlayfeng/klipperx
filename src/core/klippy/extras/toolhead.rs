@@ -1653,6 +1653,29 @@ impl ToolHeadObject {
             .map(|connected| connected.toolhead.commanded_pos())
     }
 
+    /// The kinematic Z position at a past print time, from the stepper step
+    /// history (`probe.py:_lookup_z_pos`).
+    ///
+    /// Used by the load-cell tap's ascent analysis, which needs the Z the
+    /// carriage was at when each sample was taken rather than the current
+    /// commanded position. `None` before connect or without a kinematics.
+    pub fn kinematic_z_at(&self, print_time: f64) -> Option<f64> {
+        let mut guard = self.lock();
+        let connected = guard.as_mut()?;
+        let positions: HashMap<String, f64> = connected
+            .toolhead
+            .motion_queuing_mut()
+            .steppers()
+            .iter()
+            .map(|stepper| {
+                let pos = stepper.past_mcu_position(print_time) as f64 * stepper.step_dist();
+                (stepper.name().to_string(), pos)
+            })
+            .collect();
+        let kinematics = connected.toolhead.kinematics()?;
+        kinematics.calc_position(&positions)[Z_AXIS]
+    }
+
     /// The main trapq's id — upstream's `toolhead.get_trapq()`, the queue
     /// `ZAdjustHelper.adjust_steppers` reattaches a Z motor to after moving it
     /// on its own.

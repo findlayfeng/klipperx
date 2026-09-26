@@ -38,7 +38,7 @@ class Printer:
 |----------|------|--------|------|
 | `klippy:` | 8 | `mcu_identify`、`connect`、`ready`、`shutdown`、`disconnect`、`firmware_restart` | 无 |
 | | | `notify_mcu_error`、`analyze_shutdown` | `msg: str, details: dict` |
-| `idle_timeout:` | 3 | `idle`、`printing`、`ready` | 无 |
+| `idle_timeout:` | 3 | `idle`、`printing`、`ready` | 有（`{print_time: f64}`，批 #21） |
 | `homing:` | 4 | `homing_move_begin`、`homing_move_end`、`home_rails_begin`、`home_rails_end` | 对象引用（`homing_state`） |
 | `stepper:` | 2 | `sync_mcu_position`、`set_dir_inverted` | 对象引用（`stepper`） |
 | `toolhead:` | 4 | `manual_move`、`set_position`、`sync_print_time`、`update_extra_axes` | 混合 |
@@ -143,7 +143,7 @@ MCU 侧另有独立的 `event` 模块，以 `McuEvent` trait 表达固件主动�
 | `stepper_enable:` | `motor_off` | — |
 | `extruder:` | — | `activate_extruder`（已注册处理器，发送方是 G4-2） |
 | `stepper:` | — | `sync_mcu_position`、`set_dir_inverted`（依赖 stepper 资源的同步路径） |
-| `idle_timeout:` / `probe:` / `virtual_sdcard:` / `menu:` / `dual_carriage:` | — | 对应 extras 模块尚未实现（H3/H4/H6/H8/H9） |
+| `probe:` / `virtual_sdcard:` / `menu:` / `dual_carriage:` | — | 对应 extras 模块尚未实现（H3/H4/H6/H8/H9） |
 
 事件名与变体已经就绪，处理器可先注册；上表右列的事件一旦模块落地，发送点直接用现成变体。`load_cell:` 已有发射者（批 #14：`klippy:ready` 时按状态发 `load_cell:calibrate`/`load_cell:tare`）。
 
@@ -188,9 +188,9 @@ pub enum KlippyEvent {
     KlippyAnalyzeShutdown { msg: String, details: HashMap<String, Value> },
 
     // idle_timeout:
-    IdleTimeoutIdle,
-    IdleTimeoutPrinting,
-    IdleTimeoutReady,
+    IdleTimeoutIdle { print_time: f64 },
+    IdleTimeoutPrinting { print_time: f64 },
+    IdleTimeoutReady { print_time: f64 },
 
     // homing:
     HomingHomingMoveBegin,
@@ -450,7 +450,7 @@ impl Printer {
 | 5 | `invoke_shutdown` 触发 `KlippyAnalyzeShutdown` | 3 | 已实现 |
 | 6 | 迁移 `gcode.rs`、`extras/output_pin.rs`、`api/endpoints/gcode.rs` 的调用点 | 3 | 已实现 |
 | 7 | 更新测试并删除 `PrinterEvent` | 6 | 已实现 |
-| 8 | 其余命名空间的事件在各自模块就位后逐步注册处理器 | 3 | 进行中：`homing` / `gcode` / `toolhead:set_position` / `stepper_enable:motor_off` 已发出（见 §2.2 表）；`idle_timeout` / `probe` / `virtual_sdcard` / `load_cell` / `menu` / `dual_carriage` 等模块落地后接入 |
+| 8 | 其余命名空间的事件在各自模块就位后逐步注册处理器 | 3 | 进行中：`homing` / `gcode` / `toolhead:set_position` / `stepper_enable:motor_off` 已发出（见 §2.2 表）；`idle_timeout`（批 #21）已发出；`probe` / `virtual_sdcard` / `load_cell` / `menu` / `dual_carriage` 等模块落地后接入 |
 
 ## 6. 与上游的差异
 

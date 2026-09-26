@@ -17,8 +17,9 @@
 //!   do not have. The state change itself is recorded, as the fake-firmware
 //!   corpus can never generate the button event that would reach it.
 //! * The `idle_timeout` object: upstream reads its `"Printing"` state to decide
-//!   between a runout and an insert. `idle_timeout` is not implemented here, so
-//!   a state change is treated as "not printing".
+//!   between a runout and an insert. The object exists here (批 #21) but this
+//!   sensor does not read it yet, so a state change is treated as "not
+//!   printing".
 
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
@@ -57,7 +58,7 @@ pub struct RunoutHelper {
     /// The section suffix (`runout_switch`), the mux value of the two commands
     /// (`filament_switch_sensor.py:12`).
     name: String,
-    /// The machine, for its reactor clock and the `idle_timeout` peek.
+    /// The machine, for its reactor clock.
     printer: Weak<Printer>,
     /// `pause_on_runout` (default `True`).
     pause_on_runout: bool,
@@ -182,7 +183,7 @@ impl RunoutHelper {
     /// Upstream's `note_filament_present` (`filament_switch_sensor.py:63-92`):
     /// act only on a change, outside the initialsation and event-delay windows,
     /// and only when the sensor is enabled. The printing/insert split needs
-    /// `idle_timeout`, which is not implemented (see the module docs).
+    /// `idle_timeout`; the object exists (批 #21) but is not read here yet.
     pub fn note_filament_present(&self, eventtime: f64, is_filament_present: bool) {
         {
             let mut present = self.lock(&self.filament_present);
@@ -198,8 +199,9 @@ impl RunoutHelper {
             return;
         }
         let _ = self.pause_delay;
-        // Without `idle_timeout` the state is "not printing", so only the insert
-        // action is reachable; the runout action needs a printing state. Both
+        // `idle_timeout` is not read here yet, so the state is "not printing":
+        // only the insert action is reachable, while the runout action needs a
+        // printing state. Both
         // actions are the g-code run that is documented as not wired, so a
         // detected change just closes the event window here.
         let _ = (self.runout_gcode.is_some(), self.insert_gcode.is_some());

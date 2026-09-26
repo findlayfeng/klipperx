@@ -381,6 +381,12 @@ ACTIVATE_EXTRUDER EXTRUDER=<name>
 
 ## 引脚输出
 
+### SET_IDLE_TIMEOUT — 设置空闲超时（由 `[idle_timeout]` 注册，批 #21）
+```
+SET_IDLE_TIMEOUT [TIMEOUT=<秒>]
+```
+不带参数时保持当前值；成功回 `idle_timeout: Timeout set to <值> s`；`TIMEOUT` 必须大于 0。
+
 ### SET_FAN_SPEED — 设置通用风扇速度（多路键 `FAN`，批 #18）
 ```
 SET_FAN_SPEED FAN=<name> SPEED=<0..1>

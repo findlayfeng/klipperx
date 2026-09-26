@@ -17,8 +17,9 @@
 //!
 //! `idle_timeout`. Upstream clears a progress that is older than `M73_TIMEOUT`
 //! only while `idle_timeout` reports something other than `Printing`
-//! (`display_status.py:28-32`); this host has no `idle_timeout`, so an expired
-//! progress is cleared unconditionally. `virtual_sdcard`'s progress is used as
+//! (`display_status.py:28-32`); this host's `[idle_timeout]` object exists
+//! (批 #21) but is not consulted here yet, so an expired progress is cleared
+//! unconditionally. `virtual_sdcard`'s progress is used as
 //! the fallback, as upstream does, and is `0.` when there is no
 //! `virtual_sdcard`.
 
@@ -118,8 +119,8 @@ impl PrinterObject for DisplayStatus {
                 .unwrap_or_else(|p| p.into_inner());
             if eventtime > expires {
                 // Upstream consults `idle_timeout` here and keeps the progress
-                // while it reports `Printing`; there is no `idle_timeout` in
-                // this host, so the timeout stands on its own (module docs).
+                // while it reports `Printing`; the object exists (批 #21) but is
+                // not read here yet, so the timeout stands on its own.
                 *self.progress.lock().unwrap_or_else(|p| p.into_inner()) = None;
                 progress = None;
             }

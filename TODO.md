@@ -250,7 +250,7 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
   （`ToolHead::register_lookahead_callback` + `motion_queuing.register_flush_callback`）。
 
 > **T3 的边界**：`[extruder]`/`heater_bed`/`fan` 三段与 C1b 已落地；T3 现卡在 H2-3 的
-> `heater_fan`、H1 的 `verify_heater`/`pid_calibrate`、H10 的 `extruder_stepper`；T5 按 C1c 的族顺序推进。（pulse_counter 批 #8 已消。）
+> `heater_fan`、H1 的 `pid_calibrate`、H10 的 `extruder_stepper`；T5 按 C1c 的族顺序推进。（pulse_counter 批 #8、verify_heater 批 #20、idle_timeout 批 #21 已消。）
 
 ### C2 配置装载收尾（框架 FW1）
 
@@ -313,7 +313,7 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 是「对应 `.test` 从 `IGNORED` 移除后通过」**，不是「某个错误不再出现」。详见
 [失败原因分析复盘](docs/work-log/2026-09-22-upstream-regression-failures.md#复盘计数口径与重排后补)。
 
-**当前失败原因统计**（`KLIPPERX_UPSTREAM_ALL=1` 实跑，2026-09-25（批 #19 合入后）：**36 次失败**、201 次通过、
+**当前失败原因统计**（`KLIPPERX_UPSTREAM_ALL=1` 实跑，2026-09-25（批 #21 合入后）：**31 次失败**、206 次通过、
 2 条因未构建 `pru` 字典不计，合计 239；下表为**选项名大小写修复后**的分布——49 次
 `must be specified` 归零但总数不变、首因整体后移，见[复盘](docs/work-log/2026-09-22-upstream-regression-failures.md#复盘计数口径与重排后补)
 的「收益不可加」）：
@@ -333,7 +333,7 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 | 板级扩展 section（`mcp4451`/`dac084s085`/`multi_pin`/`sx1509_duex`/`replicape`） | 7 | H2 / H7（`ad5206` 7 处已随批 #16 转绿） |
 | `Option 'tachometer_pin' … pulse_counter` | **0** | F9 / H7 已消（批 #8，2 run 实测 `run_case OK`） |
 | `Section 'extruder_stepper …'` | 2 | H10 |
-| `Section 'verify_heater …'` | 2 | H1 |
+| `Section 'verify_heater …'` | **0** | H1 已消（批 #20，3 处首因归零） |
 | `Unknown temperature sensor`（`G2`、`Kingroon_B3950`、`NTCS0603E3104FXT`） | 3 | H1 |
 | MCU 引脚映射（`Pin 'PF1'`/`'PF7'`/`'PD6'`） | 3 | F2 |
 | 单实例（`dual_carriage` 2、`gcode_macro` 2、`led` 2；`virtual_sdcard`/`temperature_fan`/`pwm_cycle_time`/`manual_stepper`/`input_shaper`/`gcode_arcs`/`exclude_object`/`controller_fan` 各 1） | 14 | H1 / H3 / H4 / H9 / H10 |
@@ -350,7 +350,7 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 - [ ] **T3. `extruder` + `heater_bed` + `fan`**：三段均已落地，`Section 'extruder'` 已 **0 次**
       （2026-09-23 实跑）；原列的 C2 autosave（`pid_Kp` 49）是误归因——语料 0 个 `#*#` 区块，
       真因是选项名大小写，已修复归零。现在卡在 H2-3 `heater_fan`（22）、H10 `extruder_stepper`
-      （2）、H1 `verify_heater`（2）。（F9/H7 `pulse_counter` 批 #8 已消。）
+      （2）、H1 `verify_heater`（2，批 #20 已消）。（F9/H7 `pulse_counter` 批 #8 已消。）
 - [ ] **T4. `probe` / `bltouch` / endstop pin chip**（35 次失败，2026-09-23 选项大小写修复后实测）：
       `bed_mesh`、`bltouch`、`eddy`、`screws_tilt_adjust`、`smart_effector`、`z_virtual_endstop` 等。
       依赖 F8（endstop，已 ✅）与 H9（probe 模块）。**施工序列**（scout 静态矩阵测算，每步以「移出
@@ -395,7 +395,7 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 
 ### H1 加热与温度
 
-- [ ] `pid_calibrate.py`（`PID_CALIBRATE`）与 `verify_heater.py`：仍缺
+- [ ] `pid_calibrate.py`（`PID_CALIBRATE`）：仍缺（`verify_heater.py` 批 #20 已完成）
       （`extruder.rs:21` 明示 still open）。
 - [ ] 传感器**剩余**：`temperature_host.py` /
       `temperature_probe.py` / `temperature_fan.py`，以及 `thermistor` 自定义型号
@@ -505,7 +505,7 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 - [ ] `gcode_arcs.py`：**段已落地**（2026-09-24 批 #1），G2/G3 弧规划与平面命令仍未接；`manual_stepper.py`；`force_move.py` **部分**（只有
       `SET_KINEMATIC_POSITION`，`FORCE_MOVE`/`STEPPER_BUZZ` 未接）；`extruder_stepper.py` 段已落地（2026-09-24 批 #2，宿主 step 同步的 toolhead 缝仍缺）。
       （`stepper_enable.py` ✅ 已随 T2 落地并归档。）
-- [ ] `idle_timeout.py`（`idle_timeout:*` 事件已声明未触发）、
+- [x] `idle_timeout.py`（批 #21：节 + `SET_IDLE_TIMEOUT` + 三个事件带载荷）、
       `motion_report.py`（`dump_trapq`/`dump_stepper` 端点，见 **B4**）。
       （`motion_queuing.py` ✅ 已由 `motion/queuing.rs` 落地并归档。）
 - 依赖 C1（toolhead/kinematics）；`gcode_move` 同时是 **G4** 的前置。
@@ -593,11 +593,11 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 
 | 事件名 | 触发时机 | 参数 | 上游位置 | 实现依赖 |
 |---|---|---|---|---|
-| `idle_timeout:ready` | idle_timeout 模块就绪 | 无 | `klippy/extras/idle_timeout.py:44` | — |
-| `idle_timeout:idle` | 进入空闲状态 | 无 | `klippy/extras/idle_timeout.py:57` | — |
-| `idle_timeout:printing` | 开始打印（恢复活动） | 无 | `klippy/extras/idle_timeout.py:95` | — |
+| `idle_timeout:ready` | idle_timeout 模块就绪 | `{print_time: f64}` | `klippy/extras/idle_timeout.py:44` | — |
+| `idle_timeout:idle` | 进入空闲状态 | `{print_time: f64}` | `klippy/extras/idle_timeout.py:57` | — |
+| `idle_timeout:printing` | 开始打印（恢复活动） | `{print_time: f64}` | `klippy/extras/idle_timeout.py:95` | — |
 
-> 需 idle_timeout 对象（`[idle_timeout]`），目前未实现。
+> 批 #21 已落地：`[idle_timeout]` 装载即注册，三个事件带 `{print_time: f64}` 载荷发出。
 
 ### 工具头事件
 

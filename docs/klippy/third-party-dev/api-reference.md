@@ -752,6 +752,8 @@
 | `printing_time` | float | 本次打印已持续时长（秒），非 `Printing` 状态为 0 |
 | `idle_timeout` | float | 配置的空闲超时时间（秒） |
 
+批 #21：对象已由 `[idle_timeout]` 节装载（此前为「文档先行」），三个 `idle_timeout:*` 事件带 `{print_time: f64}` 载荷发出；`SET_IDLE_TIMEOUT` 可改超时。
+
 ---
 
 ## G-Code 命令速查

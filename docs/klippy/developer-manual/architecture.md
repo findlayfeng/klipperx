@@ -37,7 +37,8 @@
 | `SerialDevice` | `serial:` | tty 上的字节流 |
 | `CanSerialDevice` | `canbus_uuid:` + `canbus_interface:`（+ `canbus_nodeid:`） | SocketCAN，**承载的仍是同一份 serial 字节流** |
 | `HostDevice` | `host_library:` | `dlopen` 的 klipper host 库，输入/输出都是协议字节 |
-| `FrameMock` | `test:`（仅测试构建） | 脚本化应答 |
+| `FrameMock` | —（仅测试构建，代码里直接建） | 脚本化应答 |
+| `SimulatorDevice` | `test: dict=<path>`（仅测试构建） | 字典驱动应答 |
 
 **CAN 目前不是把 Klipper 协议「放在」CAN 上**，而是 Klipper 的 can-serial：固件把本该写到串口的字节流原样每 8 字节一段塞进经典 CAN 帧的 8 个数据字节，仲裁 id 只负责寻址（`0x100 + 2*nodeid`，回包 +1）。这里的「串口字节流」就是 MCU 的帧格式——长度、序号、载荷、CRC、`0x7e` SYNC（`src/core/klippy/frame.rs`）——CAN 在这里只是一根更慢的串口线，**不参与分帧**：消息块的头尾仍由这套 serial 格式决定，重组用的是同一个 `FrameStream`。
 

@@ -26,12 +26,13 @@
 //!
 //! # What is not here
 //!
-//! * **Scheduling.** Upstream queues `SET_PIN` through the toolhead so the change
-//!   lands at a print time. With no motion or print-time clock, this port calls
-//!   the immediate forms (`update_digital_out`, `update_pwm`); the clocked
-//!   `queue_digital_out` / `set_pwm` are used as soon as the clock layer exists
-//!   (TODO C1). For a software PWM that means `update_pwm` aligns the change to
-//!   the PWM cycle using the estimated clock.
+//! * **Scheduling.** Upstream queues `SET_PIN` through the toolhead
+//!   (`GCodeRequestQueue`, `output_pin.py:15-85`) so the change lands at a print
+//!   time. The print-time layer exists here (C1d: `ToolHead::print_time`,
+//!   `motion_queuing.register_flush_callback`); what is still missing is that
+//!   queue, so this port calls the immediate forms (`update_digital_out`,
+//!   `update_pwm`) and `update_pwm` aligns a software PWM to its cycle using the
+//!   estimated clock. `fan` / `servo` / `pwm_tool` share the same gap.
 //! * **`static_value` / `template`**: the display-template machinery.
 
 use std::sync::{Arc, Mutex, MutexGuard};

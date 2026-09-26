@@ -1021,8 +1021,8 @@ impl Mcu {
     /// connect, then host time. It is enough to answer "what clock is it about
     /// now", which is what an unclocked resource needs for an immediate update
     /// and what a periodic query needs for a first sample time. It does not
-    /// track drift, and there is no print time — that is the motion layer's
-    /// (TODO C1).
+    /// track drift; print time is a separate estimate built on top of it
+    /// (`McuObject::estimated_print_time`).
     pub fn set_clock_base(&self, clock64: u64) {
         *self.clock_base.lock().expect("clock base lock poisoned") =
             Some((Instant::now(), clock64));

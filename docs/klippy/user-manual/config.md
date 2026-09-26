@@ -231,7 +231,7 @@ max_accel: 3000
 
 **注意：**
 - 数字输出与 PWM 都支持 `!` 取反前缀。
-- 值变化采用“立即”路径（数字输出 `update_digital_out`、PWM `update_pwm`），**不**经过工具头调度；PWM 的立即变化会对齐到软件 PWM 的周期边界。上游那种随打印时间生效的 `SET_PIN` 要等运动/时钟层（TODO C1）。
+- 值变化采用“立即”路径（数字输出 `update_digital_out`、PWM `update_pwm`），**不**经过工具头调度；PWM 的立即变化会对齐到软件 PWM 的周期边界。上游那种随打印时间生效的 `SET_PIN` 需要 `GCodeRequestQueue`（**尚未移植**；运动/时钟层本身已随 C1d 落地）。
 - 软件 PWM 的 `shutdown_value` 只能是 `0.0` 或 `1.0`（固件只能把引脚固定在高或低）。
 - `scale` / `static_value` / `TEMPLATE` 尚未实现。
 

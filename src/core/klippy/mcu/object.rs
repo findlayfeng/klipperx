@@ -903,8 +903,8 @@ async fn reset_and_flush(mcu: &Mcu) -> Result<(), KlippyError> {
 ///
 /// Upstream's clock sync reads the clock at connect too
 /// (`MCUConnectHelper._attach` → `clocksync.connect`); this host keeps only the
-/// base point, for resources that need a "now" clock before a print-time layer
-/// exists (TODO C1). The 64-bit `get_uptime` is used rather than `get_clock`
+/// base point, for resources that need a "now" clock without consulting the
+/// print-time estimate. The 64-bit `get_uptime` is used rather than `get_clock`
 /// because the 32-bit counter wraps every few minutes at a typical
 /// `CLOCK_FREQ`. A firmware that does not publish it simply has no estimate.
 async fn seed_clock_base(mcu: &Mcu) -> Option<u64> {

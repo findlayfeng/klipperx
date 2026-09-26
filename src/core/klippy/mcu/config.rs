@@ -74,8 +74,8 @@
 //!   `docs/klippy/developer-manual/mcu-config.md`).
 //! * **Print-time scheduling.** [`ConfigBuilder::get_query_slot`] places a
 //!   periodic query on the firmware clock estimated from connect time
-//!   (`Mcu::estimated_clock`), not on a print time — that arrives with the
-//!   motion layer (TODO C1).
+//!   (`Mcu::estimated_clock`), not on a print time: the print-time layer exists
+//!   (C1d) but the query slot is still placed on the firmware clock.
 
 use std::future::Future;
 use std::pin::Pin;

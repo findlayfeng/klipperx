@@ -309,7 +309,7 @@ identify 的命令**定义**（名称、参数、解码）与其它命令一样�
 | `fan_generic.rs` | `[fan_generic <name>]`：全部选项交给 `Fan` 核心（`shutdown_speed` 默认 **0.0**），注册 mux 命令 `SET_FAN_SPEED FAN=<name>`；`TEMPLATE=` 分支明确拒绝（模板求值器未实现，批 #18） |
 | `safe_z_home.rs` | `[safe_z_home]`：接管 G28（Z-hop → 按需 `X0 Y0` → 安全位 → `Z0`）；`section!(order = 70, phase = late)` **必须晚于 toolhead（`printer`，order 60 late）**，否则 `unregister_command("G28")` 得 `None`；与 `[homing_override]` 互斥（批 #6） |
 | `manual_stepper.rs` + `force_move.rs` | `[manual_stepper <name>]` 与 `MANUAL_STEPPER`（含 `GCODE_AXIS` 动态注册/注销 extra axis）；`force_move.rs` 目前只含 `calc_move_time`（归属对齐上游）（批 #6） |
-| `display/{mod,display,st7920,hd44780,uc1701,ssd1306,aip31068_spi}.rs` + vendored `display.cfg` | `[display]` 框架与五驱动（批 #7+#13+#28）；**storage-only**（不渲染、菜单未实现，见 config 手册的 gap）；`display_status` 的 `M73`/`M117`/`SET_DISPLAY_TEXT` 批 #7 落地 |
+| `display/{mod,display,st7920,hd44780,hd44780_spi,uc1701,ssd1306,aip31068_spi}.rs` + vendored `display.cfg` | `[display]` 框架与六驱动（批 #7+#13+#28+#30）；**storage-only**（不渲染、菜单未实现，见 config 手册的 gap）；`display_status` 的 `M73`/`M117`/`SET_DISPLAY_TEXT` 批 #7 落地 |
 | `hx71x.rs` + `load_cell.rs` + `cmd/hx71x.rs` | `[load_cell]` 节与 HX711/HX717 驱动（批 #14，走 LC-1 的 `with_format("<i",…)` 接缝）；ads1220/ads131m0x、`load_cell_probe`、四条 `LOAD_CELL_*` 实现待后续单元 |
 | `tmc.rs` + `tmc_uart.rs` + `tmc2208.rs` + `tmc2209.rs` | TMC UART 驱动族（批 #7）：单一 `TmcDriver` + `TmcTransport` trait + 表驱动；虚拟端停用装饰器实现；SPI 驱动与 `tmc2130`/`tmc2660`/`tmc5160`/`tmc2240` 待做 |
 | `board_pins.rs` | `[board_pins]` / `[board_pins <name>]`：读 `mcu` 列表与 `aliases` / `aliases_*`（`名=引脚`，值写成 `<...>` 则保留），调用 `PrinterPins::alias_pin` / `reserve_pin`。对象不可查询 |
@@ -319,7 +319,7 @@ identify 的命令**定义**（名称、参数、解码）与其它命令一样�
 | `extruder.rs` | `[extruder]`（并连带读 `extruder1`…`extruder98` 兄弟节）：热端 + 挤出运动的 E 轴。读 `nozzle_diameter` / `filament_diameter` / `pressure_advance` / `pressure_advance_smooth_time` / `max_extrude_*` 等，经 `heaters::setup_heater` 建加热器，注册 `M104` / `M109` / `SET_PRESSURE_ADVANCE`（mux `EXTRUDER`）/ `ACTIVATE_EXTRUDER` |
 | `heater_bed.rs` | `[heater_bed]`：读 heater 选项建床加热器（`setup_heater`，`gcode_id: B`），注册 `M140` / `M190` |
 | `heater_generic.rs` | `[heater_generic <name>]`：任意命名的加热器，读 `gcode_id`，其余走 `setup_heater` |
-| `heaters.rs` | 传感器与加热器的注册表（上游 `[heaters]` 不是配置节）：`add_sensor_factory` / `setup_sensor` / `setup_heater` / `register_sensor`；`get_status` 报 `available_sensors` / `available_heaters` / `available_monitors`。`lookup_heater`（逐字 `Unknown heater '<name>'`）与 `Heater::get_temp` 为 `[verify_heater]` 补（批 #20）。`ensure` 幂等地建出注册表，并拉起五个传感器工厂：`ds18b20` / `adc_temperature` / `temperature_mcu` / `spi_temperature` / `temperature_combined` |
+| `heaters.rs` | 传感器与加热器的注册表（上游 `[heaters]` 不是配置节）：`add_sensor_factory` / `setup_sensor` / `setup_heater` / `register_sensor`；`get_status` 报 `available_sensors` / `available_heaters` / `available_monitors`。`lookup_heater`（逐字 `Unknown heater '<name>'`）与 `Heater::get_temp` 为 `[verify_heater]` 补（批 #20）；`get_all_heaters`（上游同名，批 #31 为 `[homing_heaters]` 开放）。`ensure` 幂等地建出注册表，并拉起五个传感器工厂：`ds18b20` / `adc_temperature` / `temperature_mcu` / `spi_temperature` / `temperature_combined` |
 | `verify_heater.rs` | `[verify_heater <heater_name>]`（prefix）：`hysteresis` 5 / `max_error` 120 / `heating_gain` 2 / `check_gain_time` 60（bed）· 20（其他）；每秒检查 heater 是否按预期升温，失败 `invoke_shutdown("Heater <name> not heating at expected rate" + HINT_THERMAL)`；节由 `setup_heater` 经 `config.sibling` 认领（配置无该节也有默认检查器，批 #20） |
 | `idle_timeout.rs` | `[idle_timeout]`：`timeout`（默认 600、`above 0`）与 `gcode`（默认 `DEFAULT_IDLE_GCODE`）、`SET_IDLE_TIMEOUT`、`get_status` 的 `state`/`printing_time`/`idle_timeout`，发 `idle_timeout:ready\|printing\|idle`（载荷 `{print_time}`，批 #21） |
 | `adc_temperature.rs` | ADC→温度的传感器定义：`[thermistor <name>]`（`resistance1..N` / `temperature1..N` / `beta`）与 `[adc_temperature <name>]`（`voltage1..N`），以及内建的电压/电阻传感器（`PT1000`、`PT100 INA826` 与 `BUILTIN_THERMISTORS`）；裸 `[adc_temperature]` 是上游“装载默认值”的开关。`[thermistor <name>]` 声明为 **`phase = early, order = 20`**：自定义型号要早于 `[extruder]`/`[heater_bed]` 的 `sensor_type` 解析，且它是 prefix-only、降 `order` 无效（批 #22，见 codegen 相位通则） |
@@ -329,6 +329,8 @@ identify 的命令**定义**（名称、参数、解码）与其它命令一样�
 | `temperature_combined.rs` | 传感器工厂 `temperature_combined`：把多个传感器合成一个（上游同名），周期定时器在阈值越界时报警 |
 | `multi_pin.rs` | `[multi_pin <name>]`（**`phase = early`**）：`pins`（必填、逗号分隔）把调用扇出到多个真实 pin；节名注册为虚拟 pin chip（重复注册的 `DuplicateChip` 吞掉），`multi_pin:<name>` 作为 lookup 值；`update_pwm` 等逐子 pin 转发，`next_aligned_clock` 原样返回（批 #26） |
 | `respond.rs` | `[respond]`：`default_type`（`echo`/`command`/`error`，默认 `echo`）与 `default_prefix`；注册就绪前可用的 `M118`（原样透传）与 `RESPOND`（`TYPE`/`PREFIX`/`MSG`，含 `echo_no_space` 不加空格，批 #29） |
+| `homing_heaters.rs` | `[homing_heaters]`：归零期间把选中 heater 目标置 0、结束后恢复（`heaters`/`steppers` 列表，`steppers` 的资格过滤未实现——本仓 homing 事件无载荷）；批 #31 |
+| `firmware_retraction.rs` | `[firmware_retraction]`：`G10`/`G11` 与 `SET_RETRACTION`/`GET_RETRACTION`，经 `gcode_move` 的 `SAVE/RESTORE_GCODE_STATE` + `G1 E…`；`get_status` 报四个参数（批 #32） |
 | `spi_temperature.rs` | 传感器工厂 `MAX6675` / `MAX31855` / `MAX31856` / `MAX31865`：SPI 热电偶/RTD，经 `cmd/thermocouple.rs` |
 | `ad5206.rs` | `[ad5206 <name>]` 数字电位器（6 通道，SPI mode 0 @ 25 MHz，`enable_pin` 作 CS）：`scale`（默认 1.0、`above=0.`）与 `channel_1..6`（`minval=0.`、`maxval=scale`），写值 `int(val*256/scale+.5)`；写入经 MCU post-init 回调在 bring-up 时发出（批 #16） |
 | `mcp4451.rs` | `[mcp4451 <name>]` I2C 数字电位器（4 路）：`i2c_address` 必填且**仅 44..47**（否则 `mcp4451 address must be between 44 and 47`）、`scale`（默认 1.0）、`wiper_0..3`；先无条件写 `[0x40,0xff]`/`[0xa0,0xff]`，再按 `WiperRegisters=[0,1,6,7]` 写 `int(val*255/scale+.5)`；装载期写经 post-init 回调 spawn 异步 `i2c.write`（批 #25） |
@@ -347,7 +349,7 @@ identify 的命令**定义**（名称、参数、解码）与其它命令一样�
 | `bus_debug.rs` | `i2c_device` / `spi_device` 共用的调试命令底座：同步→异步桥与 `DATA=` 的十六进制编解码（无配置节） |
 | `error_mcu.rs` | MCU 停机消息的展开（无配置节，第一个 `[mcu]` 拉起）：监听 `klippy:shutdown` / `klippy:analyze_shutdown`，把简短原因扩成原因+提示（上游 `extras/error_mcu.py`） |
 
-`extras/` 的 87 个模块（86 `pub mod` + `pub(crate) bus_debug`）全部在 `extras/mod.rs` 声明；其中 66 个文件注册了 81 个 `section!`（含 `printer`，声明在 `toolhead.rs`；`mcu` 声明在 `mcu/mod.rs` 且同时声明普通与 prefix 两种形式，共 82 个装载 id）构成工厂表；`heaters` / `gcode_move` / `query_endstops` / `error_mcu` / `bus_debug` 等非节模块由上述模块按需 `ensure`，不占配置节。
+`extras/` 的 89 个模块（88 `pub mod` + `pub(crate) bus_debug`）全部在 `extras/mod.rs` 声明；其中 68 个文件注册了 83 个 `section!`（含 `printer`，声明在 `toolhead.rs`；`mcu` 声明在 `mcu/mod.rs` 且同时声明普通与 prefix 两种形式，共 84 个装载 id）构成工厂表；`heaters` / `gcode_move` / `query_endstops` / `error_mcu` / `bus_debug` 等非节模块由上述模块按需 `ensure`，不占配置节。
 
 ### `api/` — 客户端 API 层
 

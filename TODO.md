@@ -313,7 +313,7 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 是「对应 `.test` 从 `IGNORED` 移除后通过」**，不是「某个错误不再出现」。详见
 [失败原因分析复盘](docs/work-log/2026-09-22-upstream-regression-failures.md#复盘计数口径与重排后补)。
 
-**当前失败原因统计**（`KLIPPERX_UPSTREAM_ALL=1` 实跑，2026-09-25（批 #29 合入后）：**21 次失败**、216 次通过、
+**当前失败原因统计**（`KLIPPERX_UPSTREAM_ALL=1` 实跑，2026-09-25（批 #32 合入后）：**19 次失败**、218 次通过、
 2 条因未构建 `pru` 字典不计，合计 239；下表为**选项名大小写修复后**的分布——49 次
 `must be specified` 归零但总数不变、首因整体后移，见[复盘](docs/work-log/2026-09-22-upstream-regression-failures.md#复盘计数口径与重排后补)
 的「收益不可加」）：
@@ -418,7 +418,7 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
       `printer.objects` 的反射式能力（**Q5**）。**U-A7b 已完成（2026-09-24 批 #4）**：受控子集引擎落地，`exclude_object.test`+`dual_carriage.test` 双翻转、guard 归零；子集外（过滤器等）报错缺口入 `template.rs` 文档（`{% set %}` 批 #9、过滤器参数与 `default`/`float` 批 #17 已落地；列表字面量与 `|min`/`|max` 批 #24 已落地；D–F 单元：三元、`%` 格式化、方法白名单待做。iqex/itex 的模板阻塞已消，首因前移到 `dual_carriage` 的 `primary_carriage`），完整 Jinja 仍属 H3。
 - [ ] `save_variables.py`（`SAVE_VARIABLE` / `[variables]`）。
 - [ ] `delayed_gcode.py`（`[delayed_gcode]`）。
-- [ ] `respond.py`（`RESPOND` / `M118`）。
+- [x] `respond.py`（`RESPOND` / `M118`，批 #29）。
 - 前置：**G1b** 的 `create_gcode_command` 与参数访问器（宏类模块要构造 gcmd）。
 
 ### H4 打印流程与 SD 卡
@@ -426,7 +426,7 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 - [ ] `virtual_sdcard.py`：主机侧文件打印、`M24`/`M25`/`M27`、进度。
 - [ ] `print_stats.py`、`display_status.py`（`M73`/`M117`）。
 - [x] `pause_resume.py` 的节与 `PAUSE`/`RESUME`/`CLEAR_PAUSE`/`CANCEL_PRINT`（批 #15）；- [ ] 三个端点（见 **B4**）。
-- [ ] `exclude_object.py`（段+四命令落地，**2026-09-24 批 #4 随引擎转绿**，含排除区 E 补偿）、`sdcard_loop.py`（段已落地，`SDCARD_LOOP_*` 命令与文件回放未接）、`firmware_retraction.py`（G10/G11）。
+- [ ] `exclude_object.py`（段+四命令落地，**2026-09-24 批 #4 随引擎转绿**，含排除区 E 补偿）、`sdcard_loop.py`（段已落地，`SDCARD_LOOP_*` 命令与文件回放未接）、`firmware_retraction.py`（G10/G11，**批 #32 已落地**）。
 - 依赖 F9（固件 `sdiocmds.c` 的 sdcard 资源）、C1（`gcode_move` 的位置恢复）。
 
 ### H5 TMC 步进驱动
@@ -496,7 +496,7 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 - [ ] 螺丝：`screws_tilt_adjust.py` ✅；`bed_screws.py` **段已落地**（2026-09-24 批 #1），`BED_SCREWS_ADJUST`/`ACCEPT`/`ADJUSTED`/`ABORT` 命令族未移植。
 - [ ] 校准：`delta_calibrate.py` ✅（段+`DELTA_CALIBRATE`/`DELTA_ANALYZE` 落地 2026-09-24 批 #5，`delta_calibrate.test` 转绿）、`axis_twist_compensation.py`、`skew_correction.py`、
       `z_thermal_adjust.py`、`tuning_tower.py`。
-- [ ] 回零周边：`homing_override.py`、`homing_heaters.py`；事件 `probe:update_results` 未触发
+- [ ] 回零周边：`homing_override.py`（`homing_heaters.py` 批 #31 已落地）；事件 `probe:update_results` 未触发
       （`homing:*` 四个已随 toolhead 落地产线触发，见事件清单）。
 - 依赖 C1、F8（endstop/trsync）、H3（宏）、H12（`mathutil`）。
 

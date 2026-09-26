@@ -919,10 +919,11 @@ Z 端停来源：`[stepper_z]`，否则 `[carriage <名>]` 中 axis 为 z 者；
 
 | 选项 | 默认 | 说明 |
 |------|------|------|
-| `lcd_type` | —（必填） | 已实现 `st7920`/`hd44780`/`uc1701`/`ssd1306`/`aip31068_spi`；其余（`sh1106`/`hd44780_spi`/`emulated_st7920`/…）报 `lcd_type '<x>' is not implemented in this host` |
+| `lcd_type` | —（必填） | 已实现 `st7920`/`hd44780`/`hd44780_spi`/`uc1701`/`ssd1306`/`aip31068_spi`；其余（`sh1106`/`emulated_st7920`/…）报 `lcd_type '<x>' is not implemented in this host` |
 | `cs_pin` / `sclk_pin` / `sid_pin` | — | st7920 三线（同 MCU，否则 `st7920 all pins must be on same mcu`） |
 | `rs_pin`/`e_pin`/`d4_pin`…`d7_pin` | — | hd44780 4-bit 并行六线（同 MCU，否则 `hd44780 all pins must be on same mcu`）；`hd44780_protocol_init`（默认 True）、`line_length`（16\|20，默认 20，非法值 choice 文案） |
 | `uc1701`/`ssd1306` 面板选项 | — | `a0_pin`(uc1701 必填)/`dc_pin`、`contrast`/`vcomh`/`invert`(ssd1306)、`rst_pin`/`reset_pin`；SPI 走 `McuSpi::send` 只入队（真传输在假 MCU 不可用，已知约束） |
+| `hd44780_spi` 面板选项 | — | `latch_pin`（必填）、`line_length`（16\|20，默认 20）、`hd44780_protocol_init`（默认 True）、`spi_*`；每位按高/低半字节、每半字节三帧（`data`/`data\|E`/`data`，RS=bit1、E=bit3，批 #30） |
 | `aip31068_spi` 面板选项 | — | `latch_pin`（必填，SPI cs/latch）、`line_length`（16\|20，默认 20）、`spi_speed`（≥100000，默认 100 kHz）、`spi_bus`/`spi_software_*`；传输是 9-bit 字（`encode`/`encoded_groups`，批 #28） |
 | `display_group` | `_default_16x4` | 组来自随模块发布的 `display.cfg`（20 列时默认 `_default_20x4`）；未知组报 `Unknown display_data group '%s'` |
 | 菜单/按键选项 | — | `menu_root`/`menu_timeout`/`menu_reverse_navigation`/`encoder_pins`/`encoder_steps_per_detent`/`encoder_fast_rate`/`click_pin`/`back_pin`/`up_pin`/`down_pin`/`kill_pin`/`analog_range_*`/`analog_pullup_resistor` **只被读取**（菜单未实现） |
@@ -979,6 +980,24 @@ gap（如实登记）：**屏幕内容不渲染**（`display_template`/`display_
 | `pins` | —（必填） | 逗号分隔的真实 pin 列表；调用（`set_pwm`/`update_pwm`/`setup_*`/数字输出）逐个转发 |
 
 节名注册为虚拟 pin chip：其他节写 `pin: multi_pin:<name>`（或 `heater_pin: multi_pin:heater`）。装载相位为 **`phase = early`**（`[extruder]` 等主节在装载期就要解析它；prefix-only 降 `order` 无效）。别名不得用于步进电机 pin。
+
+### `[homing_heaters]` — 归零期间关加热器（批 #31）
+
+| 选项 | 默认 | 说明 |
+|------|------|------|
+| `heaters` | 全部已注册 heater | 逗号分隔的 heater 名列表；未知名报 `One or more of these heaters are unknown: ['x']` |
+| `steppers` | — | 逗号分隔的 stepper 名列表（**资格过滤未实现**：本仓 homing 事件无载荷，所有归零都被视为符合条件） |
+
+### `[firmware_retraction]` — 固件回抽（批 #32）
+
+| 选项 | 默认 | 说明 |
+|------|------|------|
+| `retract_length` | `0` | 回抽长度（mm，`minval=0`） |
+| `retract_speed` | `20` | 回抽速度（mm/s，`minval=1`） |
+| `unretract_extra_length` | `0` | 恢复时的额外长度 |
+| `unretract_speed` | `10` | 恢复速度（mm/s，`minval=1`） |
+
+`G10`/`G11` 经 `gcode_move` 的 `SAVE/RESTORE_GCODE_STATE` + `G1 E…` 实现；`SET_RETRACTION` 可改四项（`GET_RETRACTION` 回读，`%.5f`）。
 
 ### `[respond]` — 主机回显（批 #29）
 

@@ -29,6 +29,7 @@ pub mod exclude_object;
 pub mod extruder;
 pub mod extruder_stepper;
 pub mod fan;
+pub mod fan_generic;
 pub mod filament_motion_sensor;
 pub mod filament_switch_sensor;
 pub mod force_move;

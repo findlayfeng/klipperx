@@ -379,6 +379,7 @@ mod tests {
                 "virtual_sdcard",
                 "z_tilt",
                 "static_digital_output",
+                "ad5206",
                 "adxl345",
                 "display_template",
                 "dotstar",

@@ -6,6 +6,7 @@
 //! loader reaches them through its factory table (`load.rs`), so the core never
 //! imports them.
 
+pub mod adc_scaled;
 pub mod adc_temperature;
 pub mod adxl345;
 pub mod bed_mesh;

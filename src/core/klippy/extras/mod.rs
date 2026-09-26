@@ -85,6 +85,7 @@ pub mod template;
 pub mod tmc;
 pub mod tmc2208;
 pub mod tmc2209;
+pub mod tmc_spi;
 pub mod tmc_uart;
 pub mod toolhead;
 pub mod trigger_analog;

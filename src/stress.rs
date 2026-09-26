@@ -128,6 +128,13 @@ const RECONNECT_ATTEMPTS: usize = 20;
 /// How long to give the `reset` command's flush before reopening.
 const RESET_FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// How long to let the flushed `reset` reach the firmware before the old
+/// session's port is closed — upstream's pause between sending `reset` and
+/// `_disconnect()` (`klippy/mcu.py`). The flush only proves the bytes left the
+/// host; closing immediately could cut a write the tty driver still holds, and
+/// a firmware that never saw `reset` never comes back.
+const RESET_DISCONNECT_DELAY: Duration = Duration::from_millis(15);
+
 /// Lead time added on top of the measured `get_clock` round trip.
 ///
 /// The round trip only shows the wire's latency at one instant: this covers the
@@ -825,6 +832,17 @@ async fn configure_stepper(
                     .map_err(|err| std::io::Error::other(format!("reset: {err}")))?;
                 let _ = mcu.flush(RESET_FLUSH_TIMEOUT).await;
                 reset_sent = true;
+                // The old session's receive task still owns the port: left
+                // alive it would be a second reader on the same tty throughout
+                // `reconnect()`, stealing the new session's frames and dropping
+                // them against its own (stale) sequence state — the new session
+                // then starves until identify times out. Give the reset bytes
+                // the drain pause, then drop the old `Mcu` first (its `Drop`
+                // shuts the interface down and aborts the receive task) and
+                // only then reopen, as upstream does between `reset` and the
+                // reconnect (`klippy/mcu.py`: pause, `_disconnect()`, reopen).
+                tokio::time::sleep(RESET_DISCONNECT_DELAY).await;
+                drop(mcu);
                 mcu = reconnect(mcu_config).await?;
             }
             Err(McuError::ResetRequired) => {

@@ -22,6 +22,7 @@ use crate::core::klippy::msg::proto::ArgValue;
 use crate::core::klippy::reactor::Reactor;
 use std::future::Future;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Instant;
 use tokio::time::Duration;
 
 /// Default timeout for a clock query.
@@ -393,7 +394,9 @@ pub trait ClockSync {
 /// The handle is shared rather than cloned: the `Mcu` owns the device connection
 /// and shutting it down is tied to dropping the last reference. Every query
 /// also feeds the [`ClockEstimator`], so this is how the host learns the
-/// mapping from the reactor's clock to the firmware's.
+/// mapping from the reactor's clock to the firmware's — and, through the same
+/// round trip, the `Mcu`'s own clock estimate (`Mcu::record_clock_sample`,
+/// behind `Mcu::estimated_clock`).
 pub struct McuClock {
     mcu: Arc<Mcu>,
     reactor: Arc<dyn Reactor>,
@@ -487,19 +490,33 @@ impl ClockSync for McuClock {
         async move {
             // The send and receive times bracket the exchange, which is what
             // upstream's serial queue stamps on each message (`#sent_time` /
-            // `#receive_time`).
+            // `#receive_time`). The `Instant` pair brackets the same exchange
+            // on this machine's clock: it is the sample the `Mcu`'s own
+            // estimate is fitted from, and it needs host instants, not the
+            // reactor's seconds-since-arbitrary-epoch.
+            let sent_at = Instant::now();
             let sent_time = reactor.monotonic();
             let state = mcu
                 .call_msg::<GetClock, ClockState>(&GetClock, timeout)
                 .await?;
             let receive_time = reactor.monotonic();
+            let received_at = Instant::now();
             let mut estimator = estimator
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner());
             if let Ok(freq) = mcu.clock_freq() {
                 estimator.set_mcu_freq(freq);
             }
-            estimator.update(sent_time, receive_time, state.clock);
+            // Only a sample the regression kept counts as a clock reading:
+            // `update` discards the ones it reads as delayed messages
+            // (`klippy/clocksync.py:68-99`), and a reading that late is just
+            // as wrong for the MCU's own estimate, which has no outlier logic
+            // of its own.
+            if estimator.update(sent_time, receive_time, state.clock) {
+                // The extended 64-bit reading, so the two views of the clock
+                // never disagree about which wrap-around it is in.
+                mcu.record_clock_sample(sent_at, received_at, estimator.last_clock().max(0) as u64);
+            }
             Ok(state)
         }
     }
@@ -731,6 +748,25 @@ mod tests {
         let estimator = clock.estimator();
         assert_eq!(estimator.last_clock(), 1234);
         assert_eq!(estimator.mcu_freq(), 20_000_000.0);
+    }
+
+    #[tokio::test]
+    async fn test_a_query_feeds_the_mcu_clock_estimate() {
+        // The seed the MCU object would take at connect, then one round trip:
+        // the sample has to pull the estimate off the seed and onto the
+        // reading the firmware reported.
+        let mcu = mcu_answering(clock_exchange(1234));
+        mcu.set_clock_base(0);
+        let clock = McuClock::new(Arc::clone(&mcu), ManualReactor::shared());
+
+        clock.get_clock().await.unwrap();
+
+        let got = mcu.estimated_clock().unwrap();
+        assert!(got >= 1234, "the sample's reading anchors it: {got}");
+        assert!(
+            got < 1234 + 20_000_000,
+            "only half a round trip of extrapolation, not seconds: {got}"
+        );
     }
 
     #[tokio::test]

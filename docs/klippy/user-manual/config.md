@@ -931,6 +931,15 @@ gap（如实登记）：**屏幕内容不渲染**（`display_template`/`display_
 
 本身不读选项：整节交给 `[fan]` 的核心（`pin`/`max_power`/`kick_start_time`/`off_below`/`cycle_time`/`hardware_pwm`/`shutdown_speed`/`enable_pin`/`tachometer_*`；**`shutdown_speed` 默认 `0.0`**，与 `[heater_fan]` 的 1.0 不同）；节名即 mux 值，注册 `SET_FAN_SPEED FAN=<name> SPEED=<0..1>`。`TEMPLATE=` 形式**未实现**（模板求值器未落地，调用报明确拒绝）。
 
+### `[adc_scaled <name>]` — 参考电压缩放 ADC（批 #19）
+
+| 选项 | 默认 | 说明 |
+|------|------|------|
+| `vref_pin` / `vssa_pin` | —（必填） | 两路参考 ADC（同 MCU，否则 `vref and vssa must be on same mcu`） |
+| `smooth_time` | `2.0` | 参考平滑时间常数（秒），`above=0.` |
+
+节名注册为虚拟 pin chip，消费者写作 `sensor_pin: <name>:PA0`，读数按 `(raw - vssa)/(vref - vssa)` 归一。**必须写在 `[extruder]`/`[heater_bed]` 之前**（本仓以 `phase = early` 保证）。gap：`QUERY_ADC` 未实现。
+
 ### `[ad5206 <name>]` — 数字电位器（批 #16）
 
 | 选项 | 默认 | 说明 |

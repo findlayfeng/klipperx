@@ -407,13 +407,15 @@ mod tests {
     ///
     /// `KLIPPERX_UPSTREAM_ALL=1` runs every case and reports every failure, so
     /// the list stays honest rather than hiding regressions.
-    // `printers.test` stays here for now even though all 203 of its runs pass
-    // under `KLIPPERX_UPSTREAM_ALL=1` (measured 2026-09-25): the default
-    // configuration only builds the default architecture set, so several of its
-    // cases wait on dictionaries that are not built and the default suite ran
-    // past 9 minutes. Removing it is a separate unit (make the default suite
-    // carry it cheaply); the ALL=1 evidence is recorded in the manual.
-    const IGNORED: &[&str] = &["load_cell.test", "printers.test"];
+    // Empty: every upstream run's dictionaries are built and every one passes
+    // (measured with `KLIPPERX_UPSTREAM_ALL=1`). Keep the list for the next gap.
+    // `printers.test` is back here for one reason: ~200 of its cases leak their
+    // MCU (each case's `printer.teardown()` drops the objects, but some
+    // stepper-path object still holds the MCU), so the shared tokio runtime
+    // never shuts down at the end of the run and the default suite never exits.
+    // `KLIPPERX_UPSTREAM_ALL=1` still runs them all: 203/203 pass. The leak is
+    // the last core defect; this entry goes away with it.
+    const IGNORED: &[&str] = &["printers.test"];
 
     // -----------------------------------------------------------------------
     // Which architectures and dictionaries to run
@@ -736,11 +738,9 @@ mod tests {
             .expect("G28 runs against the fake firmware");
     }
 
-    /// Run the upstream runs that can be run: those whose dictionaries were all
-    /// built and that are not on the ignore list.
-    /// Which dictionaries exist is decided at build time by `KLIPPERX_ARCHES`
-    /// (default `linux`). `KLIPPERX_UPSTREAM_ALL=1` bypasses the ignore list, so
-    /// every run with its dictionaries reports its failures.
+    /// Run the upstream runs whose dictionaries were built and that are not on
+    /// the ignore list; `KLIPPERX_UPSTREAM_ALL=1` drops the ignore list (and
+    /// `KLIPPERX_UPSTREAM_VERBOSE=1` prints a per-case line with its duration).
     #[tokio::test(flavor = "multi_thread")]
     async fn upstream_test_cases_run() {
         let all = std::env::var_os("KLIPPERX_UPSTREAM_ALL").is_some();
@@ -783,9 +783,27 @@ mod tests {
                 continue;
             }
 
+            let verbose = std::env::var_os("KLIPPERX_UPSTREAM_VERBOSE").is_some();
+            let started = std::time::Instant::now();
             match run_case(&run, &dictionaries).await {
-                Ok(()) => ran += 1,
-                Err(e) => failures.push(format!("{name}: {e}")),
+                Ok(()) => {
+                    ran += 1;
+                    if verbose {
+                        eprintln!(
+                            "VERBOSE {:7.3}s ok   {name}",
+                            started.elapsed().as_secs_f64()
+                        );
+                    }
+                }
+                Err(e) => {
+                    if verbose {
+                        eprintln!(
+                            "VERBOSE {:7.3}s FAIL {name}",
+                            started.elapsed().as_secs_f64()
+                        );
+                    }
+                    failures.push(format!("{name}: {e}"));
+                }
             }
         }
 

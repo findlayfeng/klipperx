@@ -90,13 +90,37 @@ section!(
     phase = late,
     load = load_config_bed
 );
-// The three delta towers. Upstream claims them the same way — delta's
-// `__init__` reads `config.getsection('stepper_' + a) for a in 'abc'`
-// (`kinematics/delta.py:15`) — and here they need factories of their own so
-// the undefined-option check accepts the sections.
+// The letter sections `stepper_a`…`stepper_z`. Upstream claims them two
+// ways and here they need factories of their own either way, so the
+// undefined-option check accepts the sections: the delta towers are
+// `config.getsection('stepper_' + a) for a in 'abc'` (`kinematics/delta.py:15`)
+// and the winch anchors are `config.getsection('stepper_' + chr(a + i))
+// for i in range(26)` (`kinematics/winch.py:14-17`). The winch factory reads
+// them as bare anchor motors (no `position_endstop`) when `[printer]` says
+// `kinematics: winch`; see `load_config`.
 section!("stepper_a", order = 50, phase = late, load = load_config);
 section!("stepper_b", order = 50, phase = late, load = load_config);
 section!("stepper_c", order = 50, phase = late, load = load_config);
+section!("stepper_d", order = 50, phase = late, load = load_config);
+section!("stepper_e", order = 50, phase = late, load = load_config);
+section!("stepper_f", order = 50, phase = late, load = load_config);
+section!("stepper_g", order = 50, phase = late, load = load_config);
+section!("stepper_h", order = 50, phase = late, load = load_config);
+section!("stepper_i", order = 50, phase = late, load = load_config);
+section!("stepper_j", order = 50, phase = late, load = load_config);
+section!("stepper_k", order = 50, phase = late, load = load_config);
+section!("stepper_l", order = 50, phase = late, load = load_config);
+section!("stepper_m", order = 50, phase = late, load = load_config);
+section!("stepper_n", order = 50, phase = late, load = load_config);
+section!("stepper_o", order = 50, phase = late, load = load_config);
+section!("stepper_p", order = 50, phase = late, load = load_config);
+section!("stepper_q", order = 50, phase = late, load = load_config);
+section!("stepper_r", order = 50, phase = late, load = load_config);
+section!("stepper_s", order = 50, phase = late, load = load_config);
+section!("stepper_t", order = 50, phase = late, load = load_config);
+section!("stepper_u", order = 50, phase = late, load = load_config);
+section!("stepper_v", order = 50, phase = late, load = load_config);
+section!("stepper_w", order = 50, phase = late, load = load_config);
 
 /// The default pulse width upstream uses when the option is absent
 /// (`klippy/stepper.py:80`).
@@ -126,7 +150,9 @@ pub enum RailGeometry {
         default_position_endstop: Option<f64>,
     },
     /// A numbered sibling (`[stepper_z1]`): a bare motor with no rail
-    /// geometry (`LookupMultiRail`'s extra stepper).
+    /// geometry (`LookupMultiRail`'s extra stepper). The winch kinematics'
+    /// `[stepper_a]`…`[stepper_z]` anchors use the same geometry
+    /// (`kinematics/winch.py:18`, a bare `PrinterStepper` with no rail range).
     BareMotor,
 }
 
@@ -826,12 +852,26 @@ impl std::fmt::Debug for Rail {
 }
 
 /// The factory the section declarations name: the geometry follows the name
-/// (`stepper_a/b/c` are delta towers, `stepper_x/y/z` full axes).
+/// (`stepper_a/b/c` are delta towers, `stepper_x/y/z` full axes) — except under
+/// `kinematics: winch`, where every letter section is a bare anchor motor.
 pub(crate) fn load_config(
     config: &ConfigWrapper,
     printer: &Arc<Printer>,
 ) -> Result<Arc<dyn PrinterObject>, ConfigError> {
     let identifier = config.identifier();
+    // A winch claims `stepper_a`…`stepper_z` as bare anchor motors
+    // (`kinematics/winch.py:13-24`): each carries `anchor_x/y/z` and a cable
+    // solver, but no rail range and no `position_endstop`. The shared letter
+    // sections cannot tell winch from delta on their own, so the factory reads
+    // the one option that does.
+    if printer_kinematics_is_winch(config) {
+        return Ok(Arc::new(PrinterStepper::with_geometry(
+            config,
+            printer,
+            Axis::X,
+            RailGeometry::BareMotor,
+        )?));
+    }
     let axis = axis_from_name(&identifier)?;
     let geometry = match identifier.strip_prefix("stepper_") {
         Some("a" | "b" | "c") => RailGeometry::DeltaTower {
@@ -842,6 +882,22 @@ pub(crate) fn load_config(
     Ok(Arc::new(PrinterStepper::with_geometry(
         config, printer, axis, geometry,
     )?))
+}
+
+/// Whether `[printer] kinematics` names the cable-winch family.
+///
+/// Read here because the shared letter sections (`stepper_a`…`stepper_z`) are
+/// claimed before `[printer]` loads (order 50 against 60), and each family
+/// reads them differently: delta's `stepper_a/b/c` are towers with a rail range
+/// and a `position_endstop` (`kinematics/delta.py:15`), while winch's are bare
+/// anchor motors (`kinematics/winch.py:13-24`). A wrapper built without the
+/// whole config (or a config with no `[printer]` section) answers `false`, as
+/// upstream would have no kinematics to load in that case.
+fn printer_kinematics_is_winch(config: &ConfigWrapper) -> bool {
+    config
+        .sibling("printer")
+        .and_then(|printer| printer.get_str("kinematics"))
+        .is_some_and(|name| name == "winch")
 }
 
 /// The endstop a delta tower falls back on when its section omits one:

@@ -29,6 +29,7 @@ pub mod stepcompress;
 pub mod stepper;
 pub mod toolhead;
 pub mod trapq;
+pub mod winch;
 
 pub use extra::ExtraAxis;
 pub use itersolve::{
@@ -45,3 +46,4 @@ pub use stepcompress::{GracePolicy, HistoryStep, StepCommand, StepCompressError,
 pub use stepper::Stepper;
 pub use toolhead::ToolHead;
 pub use trapq::{MoveSegment, Trapq};
+pub use winch::{winch_active_flags, winch_position_fn, WinchKinematics};

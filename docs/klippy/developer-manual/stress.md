@@ -131,7 +131,10 @@ USB CDC 走的是 USB 全速，真正的瓶颈在固件的命令处理与响应�
 
 这是一次**接管**：`ConfigBuilder` 的握手会给一块跑着别的配置（或已 shutdown）的板子发
 `config_reset`，**没有 `config_reset` 的固件则发 `reset` 并重连**（`ResetRequired` 路径，与
-`McuObject` 一致），然后配置上这个压力 stepper。测试结束时板子通常停在 shutdown 状态，下一次
+`McuObject` 一致）——重连的顺序是：`reset` 发出并 flush → **15 ms 排空停顿**（`RESET_DISCONNECT_DELAY`，
+对齐上游 `klippy/mcu.py` 的 `_disconnect()` 口径）→ **先 drop 旧会话**（中止接收任务、关闭口）→
+再重开；不先关旧会话的话，重连循环期间两个读端会抢同一 tty，新会话被饿死直到 identify 超时——
+然后配置上这个压力 stepper。测试结束时板子通常停在 shutdown 状态，下一次
 运行（或正常的主机）会重新配置它。
 
 ## 要求与缺口

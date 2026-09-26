@@ -125,6 +125,7 @@ connect_file(输出文件, 字典):
 |------|------|------|------|
 | `avr` | 7 | 34 | 默认字典（几乎所有功能用例） |
 | `stm32` | 17 | 1 | `printers.test` |
+| `avr` | 7 | 33 | 默认字典（`tmc.test` 批 #39 已摘出） |
 | `linux` | 1 | 2 | `linuxtest.test`、`printers.test`；**本地可编，默认启用** |
 | `atsam` | 5 | 1 | `printers.test` |
 | `atsamd` | 2 | 1 | `printers.test` |
@@ -173,7 +174,7 @@ connect_file(输出文件, 字典):
 | `sdcard_loop.test` | 1 | `avr` |
 | `smart_effector.test` | 1 | `avr` |
 | `temperature.test` | 1 | `avr` |
-| `tmc.test` | 1 | `avr` |
+| ~~`tmc.test`~~ | — | 批 #39 已转绿并摘出 IGNORED |
 | `z_tilt.test` | 1 | `avr` |
 | `z_virtual_endstop.test` | 1 | `avr` |
 
@@ -199,7 +200,7 @@ M3 `smart_effector` 落地后，仅剩 `eddy.test`——`probe_eddy_current` 属
 - 头两个转绿的用例：`linuxtest.test`（只需 `kinematics: none`、`heaters` 的传感器注册表、
   `temperature_sensor` 与 `ds18b20`，g-code 只是一次 `G4 P1000`）；随后 `gcode_move`（G4-1）与
   `EXTRUDER` 默认项（e8bf2b7）让 `commands.test` 与 `out_of_bounds.test` 也过了守卫，移出忽略列表。
-- `KLIPPERX_UPSTREAM_ALL=1` 只去掉忽略列表这一层：默认构建下它会跑 237 条可用运行，其中 **230 条通过、7 条失败**（2026-09-25 实跑，批 #38 合入后；批 #8/#11 转绿 tachometer 与 bed_mesh，批 #12 摘除 `corexyuv.test`/`generic_cartesian.test`（IGNORED 8→6），批 #13 面板四驱动使 `lcd_type` 拒收清零，批 #15 `pause_resume` 转 5、批 #16 `ad5206` 转 7、批 #17 模板过滤器转 3、批 #18 `fan_generic` 转 2、批 #19 `adc_scaled` 转 3、批 #20 `verify_heater` 转 3、批 #21 `idle_timeout` 转 2、批 #22 自定义 `thermistor` 装载序转 3、批 #23 `dac084S085` 转 2、批 #25 `mcp4451` 转 2、批 #26 `multi_pin`（修掉 pin-chip 首因，该配置接下来卡 `homing_heaters`）、批 #28 `aip31068_spi`（推进 A10T 到 `respond`）；批 #24 模板列表字面量与批 #27 `dual_carriage` 的 `primary_carriage` 可选共同使 `generic_cartesian_iqex/itex` 转绿并**摘出 IGNORED（6→4）**；批 #29 `respond` 使 `printer-geeetech-A10T-A20T-2021.cfg` 整例转绿、批 #30 `hd44780_spi`、批 #31 `homing_heaters` 使 `printer-geeetech-301-2019.cfg` 转绿、批 #32 `firmware_retraction` 使 `printer-lulzbot-mini1-2016.cfg` 转绿、批 #33 `mcp4018` 转 2（`generic-mightyboard`/`flashforge-creator-pro`）、批 #34 **`tmc2130`（W2）转 4**（两节 + 两 pin-chip；`tmc.test` 前移到 `tmc5160`）；批 #34 之后又转绿：`tmc2660`(W5) 2、`tmc5160`(W3) 3、`sx1509` 1、`mcp4018` 2、`send-queue` 修掉 `no available capacity`（`flashforge-creator-pro`）、`axis_twist_compensation` 1（`ender5-s1`）；`tmc2240`(W4) 使 `tmc.test` 进入「只差 g-code」；**`printers.test` 子进度 199/203**（失败 4）），另外 2 条以「字典未构建」计入统计，不算失败。失败大多
+- `KLIPPERX_UPSTREAM_ALL=1` 只去掉忽略列表这一层：默认构建下它会跑 237 条可用运行，其中 **231 条通过、6 条失败**（2026-09-25 实跑，批 #39 合入后；批 #8/#11 转绿 tachometer 与 bed_mesh，批 #12 摘除 `corexyuv.test`/`generic_cartesian.test`（IGNORED 8→6），批 #13 面板四驱动使 `lcd_type` 拒收清零，批 #15 `pause_resume` 转 5、批 #16 `ad5206` 转 7、批 #17 模板过滤器转 3、批 #18 `fan_generic` 转 2、批 #19 `adc_scaled` 转 3、批 #20 `verify_heater` 转 3、批 #21 `idle_timeout` 转 2、批 #22 自定义 `thermistor` 装载序转 3、批 #23 `dac084S085` 转 2、批 #25 `mcp4451` 转 2、批 #26 `multi_pin`（修掉 pin-chip 首因，该配置接下来卡 `homing_heaters`）、批 #28 `aip31068_spi`（推进 A10T 到 `respond`）；批 #24 模板列表字面量与批 #27 `dual_carriage` 的 `primary_carriage` 可选共同使 `generic_cartesian_iqex/itex` 转绿并**摘出 IGNORED（6→4）**；批 #29 `respond` 使 `printer-geeetech-A10T-A20T-2021.cfg` 整例转绿、批 #30 `hd44780_spi`、批 #31 `homing_heaters` 使 `printer-geeetech-301-2019.cfg` 转绿、批 #32 `firmware_retraction` 使 `printer-lulzbot-mini1-2016.cfg` 转绿、批 #33 `mcp4018` 转 2（`generic-mightyboard`/`flashforge-creator-pro`）、批 #34 **`tmc2130`（W2）转 4**（两节 + 两 pin-chip；`tmc.test` 前移到 `tmc5160`）；批 #34 之后又转绿：`tmc2660`(W5) 2、`tmc5160`(W3) 3、`sx1509` 1、`mcp4018` 2、`send-queue` 修掉 `no available capacity`（`flashforge-creator-pro`）、`axis_twist_compensation` 1（`ender5-s1`）；`tmc2240`(W4) 使 `tmc.test` 进入「只差 g-code」；批 #39 修掉 `tmc2208::build_read_translate` 的寄存器名转写 bug（`Some("IOIN")` → 上游语义 `None`；该驱动此前**无测试模块**，故漏网）后，**`tmc.test` 整例转绿并摘出 IGNORED（4→3）**；**`printers.test` 子进度 199/203**（失败 4）），另外 2 条以「字典未构建」计入统计，不算失败。失败大多
   在配置装载阶段，个别在 g-code / 就绪阶段（`Move out of range`、`not ready: Pin …`）。失败原因的
   逐项分布记在 [上游回归测试失败原因分析](../../work-log/2026-09-22-upstream-regression-failures.md)
   的最新快照与 `TODO.md` 的 T 节，本页不重复维护。

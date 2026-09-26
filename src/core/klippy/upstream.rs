@@ -409,7 +409,6 @@ mod tests {
         "load_cell.test",
         "printers.test",
         "rotary_delta_calibrate.test",
-        "tmc.test",
     ];
 
     // -----------------------------------------------------------------------

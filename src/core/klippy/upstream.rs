@@ -564,6 +564,13 @@ mod tests {
         };
 
         printer.teardown();
+        if crate::core::klippy::trace_enabled() {
+            eprintln!(
+                "AFTER TEARDOWN: printer strong={} mcu_live={}",
+                Arc::strong_count(&printer),
+                crate::core::klippy::mcu::leak_probe::live()
+            );
+        }
         match setup {
             Err(e) => Err(e),
             Ok(()) => Ok(gcode),
@@ -828,6 +835,66 @@ mod tests {
     // that homes fails earlier on a missing section), so `G28` is pinned here —
     // first on a plain MCU endstop, then through `probe:z_virtual_endstop`.
     // ---------------------------------------------------------------------
+
+    /// Scratch: run the real printers.test cases in one runtime, as
+    /// `upstream_test_cases_run` does, to reproduce the accumulation.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn scratch_printers_subset() {
+        let mut n = 0usize;
+        for run in all_runs() {
+            let file = run
+                .path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            if file != "printers.test" {
+                continue;
+            }
+            if run.dictionaries.is_empty() {
+                continue;
+            }
+            let dictionaries = run_dictionaries(&run);
+            if dictionaries.iter().any(|(_, p)| p.is_none()) {
+                continue;
+            }
+            let name = relative(&run.config);
+            let live = crate::core::klippy::mcu::leak_probe::live();
+            match run_case(&run, &dictionaries).await {
+                Ok(()) => eprintln!("OK   {live:3} {name}"),
+                Err(e) => eprintln!("FAIL {live:3} {name}: {e}"),
+            }
+            n += 1;
+        }
+        eprintln!(
+            "SCRATCH-PRINTERS done n={n} mcu_live={}",
+            crate::core::klippy::mcu::leak_probe::live()
+        );
+    }
+
+    /// Scratch: reproduce the printers.test MCU leak with the example-cartesian
+    /// section set (endstop/enable pins and `position_endstop`).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn scratch_leak_probe_example_cartesian() {
+        let dictionary = dict_dir().join("atmega2560.dict");
+        let text = format!(
+            "[mcu]\ntest: dict={dict}\n\
+             [stepper_x]\nstep_pin: PF0\ndir_pin: PF1\nenable_pin: !PD7\nmicrosteps: 16\nrotation_distance: 40\nendstop_pin: ^PE5\nposition_endstop: 0\nposition_max: 200\n\
+             [stepper_y]\nstep_pin: PF6\ndir_pin: !PF7\nenable_pin: !PF2\nmicrosteps: 16\nrotation_distance: 40\nendstop_pin: ^PJ1\nposition_endstop: 0\nposition_max: 200\n\
+             [stepper_z]\nstep_pin: PL3\ndir_pin: PL1\nenable_pin: !PK0\nmicrosteps: 16\nrotation_distance: 8\nendstop_pin: ^PD3\nposition_endstop: 0.5\nposition_max: 200\n\
+             [printer]\nkinematics: cartesian\nmax_velocity: 500\nmax_accel: 3000\nmax_z_velocity: 25\nmax_z_accel: 30\n",
+            dict = dictionary.display()
+        );
+        let (config, _) = Config::from_text(&text).expect("the config parses");
+        for i in 0..5 {
+            run_script_on(&config, "<scratch>", "G28\nG1 X1 Y1 Z1\nM400")
+                .await
+                .expect("the case runs");
+            eprintln!(
+                "SCRATCH {i} mcu_live={}",
+                crate::core::klippy::mcu::leak_probe::live()
+            );
+        }
+    }
 
     /// A minimal cartesian printer whose `[stepper_z]` uses `z_endstop_pin`.
     fn homing_config(dict: &Path, z_endstop_pin: &str, probe: bool, extra: &str) -> Config {

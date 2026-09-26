@@ -46,6 +46,21 @@ pub use restart_method::McuRestartMethod;
 
 use events::McuEvents;
 
+#[cfg(test)]
+pub(crate) mod leak_probe {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    pub(crate) static MCU_LIVE: AtomicUsize = AtomicUsize::new(0);
+    pub(crate) fn live() -> usize {
+        MCU_LIVE.load(Ordering::SeqCst)
+    }
+    pub(crate) fn born() {
+        MCU_LIVE.fetch_add(1, Ordering::SeqCst);
+    }
+    pub(crate) fn died() {
+        MCU_LIVE.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// How many outbound commands the send queue holds.
 ///
 /// Upstream never refuses at all — its writer blocks on the port, so a host
@@ -571,6 +586,8 @@ impl Sender {
 impl Mcu {
     /// Create a new MCU from a name and interface.
     fn from_parts(name: String, interface: Interface) -> Self {
+        #[cfg(test)]
+        leak_probe::born();
         info!("Creating MCU: {name}");
         // The parser starts out knowing only the two formats the host owns; every
         // other format arrives with the firmware dictionary. It is built before the
@@ -1301,6 +1318,8 @@ impl Drop for Mcu {
     /// [`Interface::shutdown`] first unblocks that read; the abort then
     /// guarantees the task itself is torn down promptly.
     fn drop(&mut self) {
+        #[cfg(test)]
+        leak_probe::died();
         if trace_enabled() {
             eprintln!("MCU DROP {}", self.name);
         }

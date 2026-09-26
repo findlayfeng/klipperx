@@ -33,7 +33,8 @@
 //! * **Print-time scheduling.** Upstream queues `SET_PIN` through the toolhead
 //!   and regenerates the duration-limit refreshes
 //!   (`MCU_queued_pwm._gen_intermediate_updates`, `pwm_tool.py:117-146`);
-//!   both need the clock layer (TODO C1). This port drives the pin through the
+//!   both need the print-time request queue (upstream `GCodeRequestQueue`),
+//!   which is not ported (the print-time layer itself is: C1d). This port drives the pin through the
 //!   resource's immediate path, like [`output_pin`](crate::core::klippy::extras::output_pin).
 
 use std::sync::{Arc, Mutex, MutexGuard};

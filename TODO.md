@@ -72,7 +72,7 @@ H1–H12 是上游 extras 里按域归并的消费者（2026-09-21 全量盘点�
 | # | 事项 | 依赖 |
 |---|---|---|
 | G1b | gcode 调度器与上游的行为差异（`get_mutex` 等价物等；`GCodeIO` 暂缓 `[~]`；参数访问器与 `M115`/`Coord`/`request_restart` 已完成并归档） | C1 |
-| G2b | 用 GCODE 控制 GPIO：`SET_PIN` 时序（数字与 PWM 均已可驱动） | C1 |
+| G2b | 用 GCODE 控制 GPIO：数字/PWM 驱动与 `SET_PIN` **已落地**；余项＝「随打印时间生效的请求队列」（上游 `GCodeRequestQueue`，仍未移植）与 `output_pin` 的 `static_value`/`template` | —（C1 已收官，不再是前置） |
 | G4 | 运动命令（G0/G1/G28…） | G1、C1 |
 | B4 | 其余端点（pause_resume / `*/dump_*` / …；estop 与 remote method 已落地） | G3、H4、H9 |
 
@@ -115,11 +115,16 @@ H1–H12 是上游 extras 里按域归并的消费者（2026-09-21 全量盘点�
 
 - [ ] **与运动 / 打印时间同步的 `SET_PIN`**（上游 `GCodeRequestQueue`，
       `klippy/extras/output_pin.py:13-85` `:249-269`）：上游把请求排进 toolhead 的
-      lookahead、在 print time 生效，并对移动中的 pin 变化与 MCU 最小调度间隔做对齐；
-      我们没有 toolhead / print time，只能立即改值（`output_pin.rs` 头注释）。随 **C1**；
-      对一个独立 GPIO 不紧急，但打印中改 pin 不会与 move 同步。
-- [ ] **`output_pin` 的 `TEMPLATE` + `template_evaluator`**（display 模板，
-      `output_pin.py:88-170`）——与开关 GPIO 本身无关，按需再补（`scale` 已随 T8 落地并归档）。
+      lookahead、在 print time 生效，并对移动中的 pin 变化与 MCU 最小调度间隔做对齐。
+      **现状**：print-time 层本身**已随 C1d 落地**（`ToolHead::print_time`/`estimated_print_time`、
+      `motion_queuing.register_flush_callback`），**只差把 `GCodeRequestQueue` 这一个队列移植过来**
+      ——全仓 `grep GCodeRequestQueue` 无实现，只在本模块与 `fan`/`servo`/`pwm_tool` 的「已知偏差」
+      里被引用；今天它们都走立即路径（`update_digital_out`/`update_pwm`，软件 PWM 对齐到周期边界）。
+      对一个独立 GPIO 不紧急，但**打印中改 pin 不会与 move 同步**（同源的 `fan`/`servo`/`heaters` 一并受益）。
+- [ ] **`output_pin` 的 `static_value` / `TEMPLATE` + `template_evaluator`**（display 模板，
+      `output_pin.py:88-170`）——与开关 GPIO 本身无关；`display_template` 机制已在（工厂表里有
+      `display_template`），缺的是把它接到 `SET_PIN TEMPLATE=`。**语料 0 处使用**，可按需再补
+      （`scale` 已随 T8 落地并归档）。
 
 ### S1 压力测试工具（`klipperx stress`）剩余
 
@@ -177,9 +182,11 @@ toolhead / 开放事件）一起补，一部分是现在就独立可补的小行
 
 （`request_restart` 的停机前动作、`Coord`、`M115` 版本号来源三项已完成并归档，
 分别见 `gcode.rs:1186-1193`、`mathutil.rs:36`、`gcode.rs:747-767`。）
-- [ ] **`get_mutex` 等价物**（原先未列）：上游 `gcode.get_mutex()`（`:242-243`）被
-      `bed_mesh`（`:307`）与 `idle_timeout`（`:70` `:90`）用来判断「是否有脚本在跑」；
-      本主机无 reactor mutex，是否需要等价物（脚本占用标志）等 C1 与那两个模块落地再定。
+- [x] **`get_mutex` 等价物**（原先未列）：上游 `gcode.get_mutex()`（`klippy/gcode.py:242-243`）被
+      `bed_mesh`（`:307`）与 `idle_timeout`（`:70` `:90`）用来判断「是否有脚本在跑」。
+      **结论：不做**——C1 与那两个模块都已落地：`bed_mesh` 不需要该判据（仓内无对应代码路径），
+      `idle_timeout` 明示删掉它（模块文档「What is not here」，见 `idle_timeout.rs:57-58`），
+      至今没有消费者需要。
 
 ### G4 运动命令（G0/G1/G28/G92/M114…）
 

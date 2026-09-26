@@ -195,8 +195,9 @@ pub trait PwmOut: Send + Sync {
     /// The PWM counterpart of [`DigitalOut::update_digital_out`]: there is no
     /// clockless PWM command, so the resource uses
     /// [`Mcu::estimated_clock`](crate::core::klippy::mcu::Mcu::estimated_clock) and
-    /// aligns a software PWM to its cycle. This is what a `SET_PIN` does when
-    /// there is no print-time scheduler yet (TODO C1).
+    /// aligns a software PWM to its cycle. This is what a `SET_PIN` does while
+    /// the print-time request queue (upstream `GCodeRequestQueue`) is not
+    /// ported.
     ///
     /// # Errors
     /// As [`PwmOut::set_pwm`], plus when the firmware clock cannot be
@@ -219,9 +220,10 @@ pub trait PwmOut: Send + Sync {
 
 /// A batch of ADC samples: `(firmware clock, value)` pairs, oldest first.
 ///
-/// Upstream dates samples with print time; this host has no print-time layer
-/// yet (TODO C1), so the firmware clock is what comes through. The value is
-/// already scaled to `0.0..=1.0`.
+/// Upstream dates samples with print time; this callback carries the firmware
+/// clock (the print-time layer landed with C1d, and a sensor that needs print
+/// time converts through `McuChip::clock_to_print_time`). The value is already
+/// scaled to `0.0..=1.0`.
 pub type AdcCallback = Box<dyn Fn(&[(u64, f64)]) + Send + Sync>;
 
 /// An analog input resource.

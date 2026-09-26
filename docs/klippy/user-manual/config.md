@@ -854,9 +854,17 @@ cartesian 在 late 阶段认领；注册 `dual_carriage` 对象与 `SET_DUAL_CAR
 
 段/命令层/接口与 mux 端点 `mpu9250/dump_mpu9250`（key `sensor`）已落地（带名节按 identifier 注册）。**gap**：同 ADXL345 的 bulk 数据通路（需 `">hhh"` 与 `query_mpu9250_status`），`ACCELEROMETER_*` 命令随之延后。
 
-### `[buttons]` / `[pause_resume]` — filament 传感器的依赖对象（wave-2，最小实现）
+### `[buttons]` — filament 传感器的依赖对象（wave-2，最小实现）
 
-`[buttons]`（`register_debounce_button` / `register_buttons`）与 `[pause_resume]` 作为 `[filament_*]` 的 `load_object` 依赖落地；假 MCU 下无按钮事件源，`PAUSE`/`RESUME` 语义与 `pause_resume/*` webhook 端点**未做**。
+`[buttons]`（`register_debounce_button` / `register_buttons`）作为 `[filament_*]` 的 `load_object` 依赖落地；假 MCU 下无按钮事件源。
+
+### `[pause_resume]` — 暂停/恢复（批 #15）
+
+| 选项 | 默认 | 说明 |
+|------|------|------|
+| `recover_velocity` | `50.0` | `RESUME` 未给 `VELOCITY=` 时的恢复速度（mm/s） |
+
+四条命令 `PAUSE` / `RESUME`（`VELOCITY=`）/ `CLEAR_PAUSE` / `CANCEL_PRINT` 与 `get_status` 的 `is_paused` 已落地（help 与状态文案逐字照上游）。**gap**：`virtual_sdcard` 无 `is_active`/`do_pause`/`do_resume`/`do_cancel`（SD 分支不可达，命令走 `action:paused`/`action:resumed`/`action:cancel`）；`pause_resume/{pause,resume,cancel}` 三个 webhooks 端点未注册。
 
 ### `[filament_switch_sensor <name>]` / `[filament_motion_sensor <name>]` — 断料检测（wave-2）
 

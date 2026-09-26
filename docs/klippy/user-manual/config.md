@@ -1008,6 +1008,17 @@ gap（如实登记）：**屏幕内容不渲染**（`display_template`/`display_
 
 注册就绪前可用的两条命令：`M118 <原文>`（前缀 + 原文）与 `RESPOND [TYPE=] [PREFIX=] [MSG=]`（`TYPE` 多了 `echo_no_space`：前缀同为 `echo:` 但**不加空格**）。
 
+### `[mcp4018 <name>]` — 单路 I2C 数字电位器（批 #33）
+
+| 选项 | 默认 | 说明 |
+|------|------|------|
+| `i2c_address` | **`0x2f`** | I2C 地址（与 `[mcp4451]` 的必填不同） |
+| `i2c_mcu` / `i2c_bus` / `i2c_speed` / `i2c_software_*_pin` | `mcu` / — / `100000` / — | 总线选项（同 `[i2c_device]`） |
+| `scale` | `1.0` | 满量程参考，`above=0.` |
+| `wiper` | —（必填） | 上电初值（`minval=0.`、`maxval=scale`），写 `int(v*127/scale+.5)` 单字节 |
+
+`klippy:connect` 时写入 `wiper`；运行时用 `SET_DIGIPOT DIGIPOT=<name> [WIPER=]` 改值。
+
 ### `[mcp4451 <name>]` — I2C 数字电位器（批 #25）
 
 | 选项 | 默认 | 说明 |

@@ -311,7 +311,7 @@ identify 的命令**定义**（名称、参数、解码）与其它命令一样�
 | `manual_stepper.rs` + `force_move.rs` | `[manual_stepper <name>]` 与 `MANUAL_STEPPER`（含 `GCODE_AXIS` 动态注册/注销 extra axis）；`force_move.rs` 目前只含 `calc_move_time`（归属对齐上游）（批 #6） |
 | `display/{mod,display,st7920,hd44780,hd44780_spi,uc1701,ssd1306,aip31068_spi}.rs` + vendored `display.cfg` | `[display]` 框架与六驱动（批 #7+#13+#28+#30）；**storage-only**（不渲染、菜单未实现，见 config 手册的 gap）；`display_status` 的 `M73`/`M117`/`SET_DISPLAY_TEXT` 批 #7 落地 |
 | `hx71x.rs` + `load_cell.rs` + `cmd/hx71x.rs` | `[load_cell]` 节与 HX711/HX717 驱动（批 #14，走 LC-1 的 `with_format("<i",…)` 接缝）；ads1220/ads131m0x、`load_cell_probe`、四条 `LOAD_CELL_*` 实现待后续单元 |
-| `tmc.rs` + `tmc_uart.rs` + `tmc2208.rs` + `tmc2209.rs` | TMC UART 驱动族（批 #7）：单一 `TmcDriver` + `TmcTransport` trait + 表驱动；虚拟端停用装饰器实现；SPI 驱动与 `tmc2130`/`tmc2660`/`tmc5160`/`tmc2240` 待做 |
+| `tmc.rs` + `tmc_uart.rs` + `tmc2208.rs` + `tmc2209.rs` | TMC UART 驱动族（批 #7）：单一 `TmcDriver` + `TmcTransport` trait + 表驱动；虚拟端停用装饰器实现；**SPI 族**：`tmc_spi.rs`（W0）+ `tmc2130`（批 #34）已落地，`tmc5160`/`tmc2660`/`tmc2240` 进行中；旧描述里的 `tmc2130`/`tmc2660`/`tmc5160`/`tmc2240` 待做 |
 | `board_pins.rs` | `[board_pins]` / `[board_pins <name>]`：读 `mcu` 列表与 `aliases` / `aliases_*`（`名=引脚`，值写成 `<...>` 则保留），调用 `PrinterPins::alias_pin` / `reserve_pin`。对象不可查询 |
 | `static_digital_output.rs` | `[static_digital_output <name>]`：读 `pins`（引脚列表），一次全部拉到固定电平（上游同名节）；`order = 35` 排在 `board_pins` 后，别名可用 |
 | `stepper.rs` | `[stepper_x]` / `[stepper_y]` / `[stepper_z]`（`phase = late`，order 50：`endstop_pin` 为虚拟端停时，`position_endstop` 取端停提供的位置——`PinChip::virtual_endstop_position`，上游 `MCU_endstop.get_position_endstop`，探针返回 `z_offset`；`endstop_pin` 可能指向别的段注册的 chip，见 [声明式表生成](codegen.md)）：一个电机在一根轴上。读 `step_pin` / `dir_pin` / `rotation_distance` / `microsteps` / `full_steps_per_rotation` / `gear_ratio` / `step_pulse_duration` 与行程（`position_min` / `position_max` / `position_endstop` / `endstop_pin` / `homing_*`），建 MCU 侧 stepper 资源与 rail |
@@ -333,6 +333,7 @@ identify 的命令**定义**（名称、参数、解码）与其它命令一样�
 | `firmware_retraction.rs` | `[firmware_retraction]`：`G10`/`G11` 与 `SET_RETRACTION`/`GET_RETRACTION`，经 `gcode_move` 的 `SAVE/RESTORE_GCODE_STATE` + `G1 E…`；`get_status` 报四个参数（批 #32） |
 | `spi_temperature.rs` | 传感器工厂 `MAX6675` / `MAX31855` / `MAX31856` / `MAX31865`：SPI 热电偶/RTD，经 `cmd/thermocouple.rs` |
 | `ad5206.rs` | `[ad5206 <name>]` 数字电位器（6 通道，SPI mode 0 @ 25 MHz，`enable_pin` 作 CS）：`scale`（默认 1.0、`above=0.`）与 `channel_1..6`（`minval=0.`、`maxval=scale`），写值 `int(val*256/scale+.5)`；写入经 MCU post-init 回调在 bring-up 时发出（批 #16） |
+| `mcp4018.rs` | `[mcp4018 <name>]` 单路 I2C 数字电位器：`i2c_address` **默认 `0x2f`**、`scale` 默认 1、`wiper` 必填（`0..=scale`）；写 `int(v*127/scale+.5)` 单字节，`klippy:connect` 时 spawn 首写；`SET_DIGIPOT DIGIPOT=<name> [WIPER=]`（批 #33） |
 | `mcp4451.rs` | `[mcp4451 <name>]` I2C 数字电位器（4 路）：`i2c_address` 必填且**仅 44..47**（否则 `mcp4451 address must be between 44 and 47`）、`scale`（默认 1.0）、`wiper_0..3`；先无条件写 `[0x40,0xff]`/`[0xa0,0xff]`，再按 `WiperRegisters=[0,1,6,7]` 写 `int(val*255/scale+.5)`；装载期写经 post-init 回调 spawn 异步 `i2c.write`（批 #25） |
 | `dac084s085.rs` | `[dac084S085 <name>]` 四通道 SPI DAC（mode 1 @ 10 MHz，`enable_pin` 作 CS）：`scale`（默认 1.0、`above=0.`）与 `channel_A..D`（`minval=0.`、`maxval=scale`），写值 `int(val*255/scale)`（**截断**，与 ad5206 的 `+0.5` 不同）；`section!` 的 id 逐字 `dac084S085`（节名大小写敏感，批 #23） |
 | `ds18b20.rs` | 传感器工厂 `DS18B20`：1-wire 温度传感器，读 `serial_no` / `sensor_mcu` / `ds18_report_time`，周期查询经 `cmd/ds18b20.rs` |
@@ -349,7 +350,7 @@ identify 的命令**定义**（名称、参数、解码）与其它命令一样�
 | `bus_debug.rs` | `i2c_device` / `spi_device` 共用的调试命令底座：同步→异步桥与 `DATA=` 的十六进制编解码（无配置节） |
 | `error_mcu.rs` | MCU 停机消息的展开（无配置节，第一个 `[mcu]` 拉起）：监听 `klippy:shutdown` / `klippy:analyze_shutdown`，把简短原因扩成原因+提示（上游 `extras/error_mcu.py`） |
 
-`extras/` 的 89 个模块（88 `pub mod` + `pub(crate) bus_debug`）全部在 `extras/mod.rs` 声明；其中 68 个文件注册了 83 个 `section!`（含 `printer`，声明在 `toolhead.rs`；`mcu` 声明在 `mcu/mod.rs` 且同时声明普通与 prefix 两种形式，共 84 个装载 id）构成工厂表；`heaters` / `gcode_move` / `query_endstops` / `error_mcu` / `bus_debug` 等非节模块由上述模块按需 `ensure`，不占配置节。
+`extras/` 的 91 个模块（90 `pub mod` + `pub(crate) bus_debug`）全部在 `extras/mod.rs` 声明；其中 70 个文件注册了 85 个 `section!`（含 `printer`，声明在 `toolhead.rs`；`mcu` 声明在 `mcu/mod.rs` 且同时声明普通与 prefix 两种形式，共 86 个装载 id）构成工厂表；`heaters` / `gcode_move` / `query_endstops` / `error_mcu` / `bus_debug` 等非节模块由上述模块按需 `ensure`，不占配置节。
 
 ### `api/` — 客户端 API 层
 

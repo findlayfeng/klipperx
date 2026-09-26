@@ -18,8 +18,9 @@
 //!
 //! # Gaps
 //!
-//! The Traminic drivers (`tmc2130` … `tmc5160`) are not implemented in this
-//! host, so `PhaseCalc.lookup_tmc` never finds a `<driver> <stepper>` object and
+//! Not every Traminic driver exists here yet (`tmc2130` landed in 批 #34;
+//! `tmc5160`/`tmc2660`/`tmc2240` pending), so for those `PhaseCalc.lookup_tmc`
+//! finds no `<driver> <stepper>` object and
 //! the MCU phase offset stays zero (`PhaseCalc.calc_phase`); `phases` comes from
 //! the section's own `microsteps` instead. This does not stop the bare section
 //! working, and upstream runs without a Traminic driver the same way.

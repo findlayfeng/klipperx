@@ -313,7 +313,7 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 是「对应 `.test` 从 `IGNORED` 移除后通过」**，不是「某个错误不再出现」。详见
 [失败原因分析复盘](docs/work-log/2026-09-22-upstream-regression-failures.md#复盘计数口径与重排后补)。
 
-**当前失败原因统计**（`KLIPPERX_UPSTREAM_ALL=1` 实跑，2026-09-25（批 #32 合入后）：**19 次失败**、218 次通过、
+**当前失败原因统计**（`KLIPPERX_UPSTREAM_ALL=1` 实跑，2026-09-25（批 #34 合入后）：**13 次失败**、224 次通过、
 2 条因未构建 `pru` 字典不计，合计 239；下表为**选项名大小写修复后**的分布——49 次
 `must be specified` 归零但总数不变、首因整体后移，见[复盘](docs/work-log/2026-09-22-upstream-regression-failures.md#复盘计数口径与重排后补)
 的「收益不可加」）：
@@ -369,7 +369,7 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
       其余 37 条 printers 命中 probe 的配置另压跨域长尾（H2/H3/H4/H5/H7/H8 与 H9 兄弟段），不在本闭包内。
       语料里 **0 个配置带 `#*#`**，autosave 不阻塞本批。
 - [ ] **T5. 运动学**：`delta`（含 `stepper_a/b/c`）与 `polar`（含 `stepper_arm/bed`）**已落地转绿**（2026-09-24 批 #5：`delta.test`+`delta_calibrate.test`+`polar.test` 三绿；含 `itersolve` 携参、假 MCU 多端停多槽、config 层 `SAVE_CONFIG` 读取、弧度 gear_ratio 推断）；余 `generic_cartesian`（4）、`rotary_delta`（2）、`winch`/`deltesian`（各 1，2026-09-23 实测口径）。corexy 族已随 **C1c-1** 消失，`none` 已在 T1。
-- [ ] **T6. TMC pin chip**（28 次失败，2026-09-23 选项大小写修复后实测）：段 21（`tmc2209 stepper_x` 15、
+- [x] **T6. TMC pin chip**（原 28 次失败）——**批 #34 `tmc2130` 全部转绿**（段 2 + pin chip 3）；`tmc5160`/`tmc2660` 由 W3/W5 收口，`tmc2240` 只影响 `tmc.test`（原清单：段 21（`tmc2209 stepper_x` 15、
       `tmc2130` 2、`tmc2208` 2、`tmc2660` 1、`tmc5160` 1）+ pin chip 7（`tmc2209_stepper_x` 4、
       `tmc2130_stepper_x` 3）。依赖 H5（TMC）。
 - [ ] **T9. 其余 extras 段**（2026-09-23 选项大小写修复后实跑的散项，按域归入 H1–H10）：`display`（21，H8）、
@@ -433,7 +433,7 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 
 - [ ] `tmc.py` 公共框架（寄存器、StallGuard、`DUMP_TMC`/`SET_TMC_*`）。
 - [ ] `tmc_uart.py`（固件 `src/tmcuart.c`）。
-- [ ] SPI 型：`tmc2130.py`、`tmc5160.py`；UART/SPI 型：`tmc2208.py`、`tmc2209.py`、
+- [ ] SPI 型：`tmc5160.py`、`tmc2240.py`、`tmc2660.py`（`tmc2130.py` 批 #34 已落地）；UART/SPI 型：`tmc2208.py`、`tmc2209.py`、
       `tmc2240.py`、`tmc2660.py`。
 - 依赖 F6/F7、F9（tmcuart）、C1（stepper 对象）。
 

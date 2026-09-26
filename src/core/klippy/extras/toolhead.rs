@@ -95,6 +95,7 @@ use crate::core::klippy::motion::kinematics::{
 use crate::core::klippy::motion::plan::MoveLimits;
 use crate::core::klippy::motion::stepcompress::{StepCommand, StepCompressError};
 use crate::core::klippy::motion::toolhead::ToolHead;
+use crate::core::klippy::motion::winch::{winch_active_flags, winch_position_fn, WinchKinematics};
 use crate::core::klippy::motion::{HomeCoord, Homing, HomingHandle, HomingInfo};
 use crate::core::klippy::printer::{ConnectFuture, Printer, PrinterObject, RestartHooks};
 use crate::core::klippy::reactor::Reactor;
@@ -149,6 +150,10 @@ enum KinematicsKind {
     /// (`kinematics/generic_cartesian.py`), where a motor drives a linear
     /// combination of carriage axes instead of one axis.
     GenericCartesian,
+    /// `kinematics: winch` — the cable-winch family
+    /// (`kinematics/winch.py`), whose anchors and cable solvers live in
+    /// [`motion::winch`](crate::core::klippy::motion::winch).
+    Winch,
 }
 
 impl KinematicsKind {
@@ -163,6 +168,7 @@ impl KinematicsKind {
         "polar",
         "delta",
         "generic_cartesian",
+        "winch",
     ];
 
     /// Parse a `[printer] kinematics` value.
@@ -177,6 +183,7 @@ impl KinematicsKind {
             "polar" => Self::Polar,
             "delta" => Self::Delta,
             "generic_cartesian" => Self::GenericCartesian,
+            "winch" => Self::Winch,
             _ => return None,
         })
     }
@@ -201,6 +208,10 @@ impl KinematicsKind {
             // `[stepper <name>]` sections declare (`extras::carriage` installs
             // those solvers); this arm is never read.
             Self::GenericCartesian => CartesianTransform::Standard,
+            // Winch has no rail→carriage mapping of this kind: each cable's
+            // solver is bound to its anchor in the winch branch below, so this
+            // value is never read.
+            Self::Winch => CartesianTransform::Standard,
         }
     }
 
@@ -256,6 +267,9 @@ impl KinematicsKind {
             // installs each motor's solver from its `carriages` expression as
             // the section loads.
             Self::GenericCartesian => [cart(Axis::X), cart(Axis::Y), cart(Axis::Z)],
+            // Winch never reaches here: each cable's solver is bound to its
+            // anchor (`winch_stepper_alloc`) in the branch below.
+            Self::Winch => [cart(Axis::X), cart(Axis::Y), cart(Axis::Z)],
         }
     }
 
@@ -308,6 +322,13 @@ pub struct ToolHeadObject {
     /// belong to no rail — each drives a combination of carriages — so they are
     /// kept apart from `rails` and taken at connect like the bed stepper.
     generic_steppers: Vec<Arc<KinematicStepper>>,
+    /// The winch kinematics, parked here at load until connect installs it —
+    /// the cables' solvers are already bound in `new` (`winch.py:11-20`).
+    winch: Mutex<Option<WinchKinematics>>,
+    /// The cable `[stepper_a]`…`[stepper_z]` motors of a winch printer. They
+    /// belong to no rail — each pulls its cable to a fixed anchor — so they are
+    /// kept apart from `rails` and taken at connect like the bed stepper.
+    winch_steppers: Vec<Arc<PrinterStepper>>,
     /// How the rails' positions map to carriage axes (`corexy.py:12-15`).
     transform: CartesianTransform,
     /// `[printer] max_angular_velocity`: polar's near-center angular cap
@@ -429,6 +450,8 @@ impl ToolHeadObject {
         let mut delta_kinematics = None;
         let mut generic_kinematics = None;
         let mut generic_steppers: Vec<Arc<KinematicStepper>> = Vec::new();
+        let mut winch_kinematics = None;
+        let mut winch_steppers: Vec<Arc<PrinterStepper>> = Vec::new();
         match kind {
             KinematicsKind::None => {}
             KinematicsKind::GenericCartesian => {
@@ -502,6 +525,44 @@ impl ToolHeadObject {
                     }
                 }
                 delta_kinematics = Some(delta);
+            }
+            KinematicsKind::Winch => {
+                // `WinchKinematics.__init__` (`kinematics/winch.py:13-24`):
+                // walk `stepper_a`…`stepper_z` (26 letters), always taking the
+                // first three and stopping at the first missing section. Each
+                // cable is a bare stepper (no rail range), reads its
+                // `anchor_x/y/z`, and gets the cable solver bound to that
+                // anchor (`setup_itersolve('winch_stepper_alloc', *a)`).
+                let mut cables: Vec<(String, [f64; 3])> = Vec::new();
+                for index in 0..26u8 {
+                    let name = format!("stepper_{}", (b'a' + index) as char);
+                    if index >= 3 && !config.has_sibling(&name) {
+                        break;
+                    }
+                    let stepper = printer
+                        .lookup_object_as::<PrinterStepper>(&name)
+                        .ok_or_else(|| {
+                            ConfigError::new(format!(
+                                "Section '{}' needs a '[{name}]' section",
+                                config.identifier()
+                            ))
+                        })?;
+                    let section = config.sibling(&name).ok_or_else(|| {
+                        ConfigError::new(format!(
+                            "Section '{}' needs a '[{name}]' section",
+                            config.identifier()
+                        ))
+                    })?;
+                    let anchor = [
+                        section.get_float("anchor_x", None)?,
+                        section.get_float("anchor_y", None)?,
+                        section.get_float("anchor_z", None)?,
+                    ];
+                    stepper.setup_itersolve(winch_position_fn(anchor), winch_active_flags());
+                    cables.push((name, anchor));
+                    winch_steppers.push(stepper);
+                }
+                winch_kinematics = Some(WinchKinematics::new(cables));
             }
             _ => {
                 for (name, axis) in [
@@ -580,6 +641,8 @@ impl ToolHeadObject {
             delta: Mutex::new(delta_kinematics),
             generic: Mutex::new(generic_kinematics),
             generic_steppers,
+            winch: Mutex::new(winch_kinematics),
+            winch_steppers,
             transform: kind.transform(),
             max_angular_velocity,
             active_extruder: Mutex::new("extruder".to_string()),
@@ -812,6 +875,19 @@ impl PrinterObject for ToolHeadObject {
                 host_steppers.push(host);
                 mcu_steppers.insert(bed.name().to_string(), Arc::clone(bed.mcu_stepper()));
             }
+            // Winch's cable steppers: they belong to no rail either, and each
+            // drives its own cable length from the main trapq
+            // (`kinematics/winch.py:18-20`).
+            for stepper in &self.winch_steppers {
+                let host = stepper
+                    .take_stepper()
+                    .ok_or_else(|| config_error(format!("{} is not connected", stepper.name())))?;
+                host_steppers.push(host);
+                mcu_steppers.insert(
+                    stepper.name().to_string(),
+                    Arc::clone(stepper.mcu_stepper()),
+                );
+            }
 
             // The primary MCU (the bare `[mcu]`) defines the print-time origin;
             // each stepper's compressor was already pointed at its own MCU's
@@ -877,6 +953,17 @@ impl PrinterObject for ToolHeadObject {
                             )
                         })?;
                     toolhead.set_kinematics(Box::new(kinematics));
+                }
+                KinematicsKind::Winch => {
+                    let winch = self
+                        .winch
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .take()
+                        .ok_or_else(|| {
+                            config_error("winch kinematics is not connected".to_string())
+                        })?;
+                    toolhead.set_kinematics(Box::new(winch));
                 }
                 _ => {
                     toolhead.set_kinematics(Box::new(CartesianKinematics::new(
@@ -1658,6 +1745,18 @@ async fn home_axes(
             homed.push(axis);
         }
         return Ok((homed, homing));
+    }
+    // Winch homing is not implemented (`kinematics/winch.py:31-35`): the
+    // operator jogs to the origin by hand and `G28` only forces the position
+    // to `0, 0, 0` (the extruder is left alone). No endstop is driven, so the
+    // empty homed list fires no `homing:home_rails_end` — as upstream, whose
+    // winch `home` calls no `home_rails`.
+    if kind == KinematicsKind::Winch {
+        let current = connected.toolhead.commanded_pos();
+        connected
+            .toolhead
+            .set_position(Coord::new(0.0, 0.0, 0.0, current.e()), &[]);
+        return Ok((Vec::new(), HomingHandle::new()));
     }
     // `kinematics: none` has no rails, so there is nothing to home.
     if rails.is_empty() {
@@ -2707,6 +2806,75 @@ mod tests {
     }
 
     #[test]
+    fn test_winch_is_a_known_kinematics_name() {
+        assert_eq!(KinematicsKind::parse("winch"), Some(KinematicsKind::Winch));
+        assert!(KinematicsKind::NAMES.contains(&"winch"));
+        let names = KinematicsKind::NAMES.join(", ");
+        assert!(names.contains("winch"), "{names}");
+    }
+
+    #[test]
+    fn test_a_winch_config_loads_without_position_endstop() {
+        use crate::core::klippy::config::Config;
+        use crate::core::klippy::reactor::ManualReactor;
+
+        // `config/example-winch.cfg`'s geometry: four cables and no
+        // `position_endstop` anywhere — a winch homes by hand, not on an
+        // endstop (`kinematics/winch.py:13-24`).
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        let text = "[mcu]\nserial: /dev/not-opened-yet\n\
+             [stepper_a]\nstep_pin: PA0\ndir_pin: PA1\nmicrosteps: 16\nrotation_distance: 40\n\
+             anchor_x: 0\nanchor_y: -2000\nanchor_z: -100\n\
+             [stepper_b]\nstep_pin: PA2\ndir_pin: PA3\nmicrosteps: 16\nrotation_distance: 40\n\
+             anchor_x: 2000\nanchor_y: 1000\nanchor_z: -100\n\
+             [stepper_c]\nstep_pin: PA4\ndir_pin: PA5\nmicrosteps: 16\nrotation_distance: 40\n\
+             anchor_x: -2000\nanchor_y: 1000\nanchor_z: -100\n\
+             [stepper_d]\nstep_pin: PA6\ndir_pin: PA7\nmicrosteps: 16\nrotation_distance: 40\n\
+             anchor_x: 0\nanchor_y: 0\nanchor_z: 3000\n\
+             [printer]\nkinematics: winch\nmax_velocity: 300\nmax_accel: 3000\n";
+        let (config, _) = Config::from_text(text).expect("the config parses");
+        printer
+            .load_config(&config)
+            .unwrap_or_else(|err| panic!("winch: {err}"));
+
+        let object = printer
+            .lookup_object_as::<ToolHeadObject>("toolhead")
+            .expect("the toolhead is registered");
+        assert_eq!(object.kind, KinematicsKind::Winch);
+        // No rails: the cables are held apart, in section order.
+        assert!(object.rails.is_empty());
+        assert_eq!(object.winch_steppers.len(), 4);
+        assert_eq!(object.winch_steppers[0].name(), "stepper_a");
+        assert_eq!(object.winch_steppers[3].name(), "stepper_d");
+    }
+
+    #[test]
+    fn test_a_winch_cable_without_an_anchor_is_refused() {
+        use crate::core::klippy::config::Config;
+        use crate::core::klippy::reactor::ManualReactor;
+
+        // `anchor_x` is the first anchor read, so its absence is the error the
+        // winch load reports (`config.getfloat('anchor_' + n)`,
+        // `kinematics/winch.py:19`).
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        let text = "[mcu]\nserial: /dev/not-opened-yet\n\
+             [stepper_a]\nstep_pin: PA0\ndir_pin: PA1\nmicrosteps: 16\nrotation_distance: 40\n\
+             anchor_y: -2000\nanchor_z: -100\n\
+             [stepper_b]\nstep_pin: PA2\ndir_pin: PA3\nmicrosteps: 16\nrotation_distance: 40\n\
+             anchor_x: 2000\nanchor_y: 1000\nanchor_z: -100\n\
+             [stepper_c]\nstep_pin: PA4\ndir_pin: PA5\nmicrosteps: 16\nrotation_distance: 40\n\
+             anchor_x: -2000\nanchor_y: 1000\nanchor_z: -100\n\
+             [printer]\nkinematics: winch\nmax_velocity: 300\nmax_accel: 3000\n";
+        let (config, _) = Config::from_text(text).expect("the config parses");
+
+        let err = printer.load_config(&config).unwrap_err().to_string();
+        assert!(
+            err.contains("Option 'anchor_x' in section 'stepper_a' must be specified"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn test_the_delta_kinematics_loads_its_three_towers() {
         // `config/example-delta.cfg`'s shape: three towers (no `position_max`
         // option), `arm_length` on `stepper_a`, `delta_radius` on `[printer]`.
@@ -2836,6 +3004,8 @@ mod tests {
             delta: Mutex::new(None),
             generic: Mutex::new(None),
             generic_steppers: Vec::new(),
+            winch: Mutex::new(None),
+            winch_steppers: Vec::new(),
             transform: CartesianTransform::Standard,
             max_angular_velocity: 0.0,
             active_extruder: Mutex::new("extruder".to_string()),

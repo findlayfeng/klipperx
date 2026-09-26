@@ -7,7 +7,7 @@
 //! |---|---|
 //! | `delta_stepper_alloc` (`chelper/kin_delta.c:25-41`) | [`delta_position_fn`] / [`delta_active_flags`] |
 //! | `DeltaKinematics` (`klippy/kinematics/delta.py:11-160`) | [`DeltaKinematics`] |
-//! | `DeltaCalibration` (`delta.py:163-241`) + `mathutil.trilateration` | [`DeltaCalibration`] and the private [`trilateration`] |
+//! | `DeltaCalibration` (`delta.py:163-241`) + `mathutil.trilateration` | [`DeltaCalibration`] and the shared [`trilateration`] (also the winch kinematics' reverse mapping) |
 //!
 //! **Placement.** The cartesian family lives in [`super::kinematics`]; delta is
 //! a separate file so that family's code stays untouched (the task's
@@ -90,7 +90,12 @@ pub fn delta_active_flags() -> AxisFlags {
 /// `None` when the geometry has no real intersection (a square root of a
 /// negative number, where upstream raises `ValueError`); every caller maps
 /// that to its own "cannot compute" answer.
-fn trilateration(sphere_coords: [[f64; 3]; 3], radius2: [f64; 3]) -> Option<[f64; 3]> {
+///
+/// Shared by the two kinematics that invert a trilateration: delta recovers its
+/// carriage from the three towers, and winch from the first three cable
+/// lengths (`kinematics/winch.py:21-24`) — upstream keeps this one routine in
+/// `mathutil.py:93-113` for both.
+pub(crate) fn trilateration(sphere_coords: [[f64; 3]; 3], radius2: [f64; 3]) -> Option<[f64; 3]> {
     let [c1, c2, c3] = sphere_coords;
     let sub = |a: [f64; 3], b: [f64; 3]| [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
     let mul = |a: [f64; 3], k: f64| [a[0] * k, a[1] * k, a[2] * k];

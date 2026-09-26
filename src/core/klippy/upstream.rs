@@ -16,8 +16,8 @@
 //! |---|---|---|
 //! | the corpus is well formed and its inputs resolve | nothing | `upstream_test_cases_are_well_formed`, `upstream_test_inputs_resolve` |
 //! | every shipped `.cfg` parses with our config parser | nothing | `every_upstream_printer_config_parses` |
-//! | the inline g-code parses | the config sections the cases use | `#[ignore]` |
-//! | a case runs end to end | the config sections the cases use | `upstream_test_cases_run`, with an ignore list |
+//! | the inline g-code parses | the case's g-code (already driven end to end below) | `upstream_inline_gcode_parses`, still `#[ignore]` |
+//! | a case runs end to end | the case's dictionaries | `upstream_test_cases_run` (the ignore list is empty) |
 //!
 //! An end-to-end run talks to a real answerer, not to a host-only short circuit:
 //! [`SimulatorDevice`](crate::core::klippy::interface::devices::simulator::SimulatorDevice)
@@ -36,15 +36,18 @@
 //!    (`scripts/test_klippy.py:88`).
 //! 3. **Drop cases whose dictionaries were not built.** There is no substitute:
 //!    the case was written for that target's command set.
-//! 4. **Drop the `IGNORED` cases** — the ones that cannot pass yet (missing
-//!    config sections, kinematics, pin chips).
+//! 4. **Drop the `IGNORED` cases** — the ones that cannot pass yet. The list is
+//!    empty: every case whose dictionaries were built passes, and the list stays
+//!    for the next gap.
 //!
 //! What remains runs against the fake firmware, each `[mcu]` served its own
 //! target's dictionary. `KLIPPERX_UPSTREAM_ALL=1` bypasses step 4 (the ignore
 //! list), so the runs that have their dictionaries report their failures.
 //!
-//! The inline-g-code stage stays an `#[ignore]` test for the same reason: driving
-//! a case's g-code needs the sections it names.
+//! The inline-g-code stage stays an `#[ignore]` test, but no longer because of
+//! missing sections: `upstream_test_cases_run` drives each built case's g-code
+//! through the real dispatcher, so what is left there is an earlier, narrower
+//! check of the g-code parser alone.
 //!
 //! One thing is deliberate here: the corpus is read-only. The submodule is
 //! whatever the developer checked out, and nothing is written. The `.cfg`
@@ -380,10 +383,12 @@ mod tests {
 
     /// Parse the inline g-code of every case with our own g-code parser.
     ///
-    /// Pending: a case's g-code is written for the config it names, and most
-    /// names sections we do not implement (`[printer]`, kinematics, the extras),
-    /// so the parser cannot be driven through the dispatcher until those exist.
-    /// The argument list is kept here so the test is a next step, not lost work.
+    /// Pending: this stage was written when most cases named sections this host
+    /// lacked, and nothing has been built for it since —
+    /// `upstream_test_cases_run` now drives every built case's g-code through the
+    /// real dispatcher end to end, which is stronger than parsing it. The run list
+    /// is computed here so the stage is a next step (or a candidate to drop), not
+    /// lost work.
     #[test]
     #[ignore = "needs the config sections the cases use, to build a dispatcher"]
     fn upstream_inline_gcode_parses() {
@@ -408,17 +413,16 @@ mod tests {
 
     /// Cases that cannot pass yet, skipped unless `KLIPPERX_UPSTREAM_ALL` is set.
     ///
-    /// Nearly every upstream config names sections this host does not implement
-    /// (`gcode_macro`, `probe`, `tmc*`, `display`, …), so `load_config`
-    /// rejects them before any g-code runs. The list shrinks as those sections
-    /// land.
+    /// The list grew because nearly every upstream config named sections this host
+    /// did not implement (`gcode_macro`, `probe`, `tmc*`, `display`, …), so
+    /// `load_config` rejected them before any g-code ran; entries came out as those
+    /// sections landed.
     ///
     /// `KLIPPERX_UPSTREAM_ALL=1` runs every case and reports every failure, so
     /// the list stays honest rather than hiding regressions.
     // Empty: every upstream run's dictionaries are built and every one passes
-    // (measured with `KLIPPERX_UPSTREAM_ALL=1`). Keep the list for the next gap.
-    // Empty: every run's dictionaries are built and every run passes. The list
-    // stays for the next gap (see the module docs for how a case is isolated).
+    // (measured with `KLIPPERX_UPSTREAM_ALL=1`). The list stays for the next gap
+    // (see the module docs for how a case is isolated).
     const IGNORED: &[&str] = &[];
 
     // -----------------------------------------------------------------------

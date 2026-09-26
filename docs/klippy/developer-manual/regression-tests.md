@@ -179,7 +179,7 @@ connect_file(输出文件, 字典):
 | `z_virtual_endstop.test` | 1 | `avr` |
 
 默认列表（`linux` + `avr` + 各 ARM 家族）会构建 37 份字典：28 个被 `.test` 引用的目标里除 `pru` 外
-全部具备（另有 9 份没被引用的目标也一并编出，作为编译覆盖）。引用 `pru` 的运行只有 2 条（`printers.test`
+全部具备（另有 10 份没被引用的目标也一并编出，作为编译覆盖）。引用 `pru` 的运行只有 2 条（`printers.test`
 里 `DICTIONARY pru.dict host=linuxprocess.dict` 那一组），它们因字典未构建被跳过。
 
 ### 当前状态
@@ -190,19 +190,20 @@ connect_file(输出文件, 字典):
 |------|------|------|
 | 因字典未构建跳过 | 2 | `printers.test` 中引用 `pru` 的两条运行（默认不编 `pru`） |
 | 因忽略列表跳过 | **0** | `IGNORED` 已清空 |
-| 实际执行 | **236** | 全部通过（下表列出各 `.test`，`printers.test` 一个文件 203 条运行） |
-| 其中早期转绿 | — | `linuxtest.test`（T1）、`commands.test`、`out_of_bounds.test`（b39750f）、`bed_mesh.test`、`z_virtual_endstop.test`（探针链路单元）、`z_tilt.test`、`quad_gantry_level.test`（H9 调平族）、`bltouch.test`、`smart_effector.test`（H9 探针族）、`multi_z.test`（M7 发送队列水位）、`screws_tilt_adjust.test`（M4 探测语义与亚纳米守卫）、`gcode_arcs.test`、`bed_screws.test`、`pwm.test`、`temperature.test`、`macros.test`（集成批 #1 段落地）、`led.test`、`sdcard_loop.test`、`pressure_advance.test`（集成批 #2 段落地）、`eddy.test`（批 #3，M5 收官）、`dual_carriage.test`、`exclude_object.test`（批 #4 宏体渲染）、`polar.test`、`delta.test`、`delta_calibrate.test`（批 #5 运动学）、`hybrid_corexy_dual_carriage.test`（wave-2：`[input_shaper]` 段）、`extruders.test`（wave-2：filament 传感器段）、`manual_stepper.test`（批 #6）、`generic_cartesian_iqex.test`/`generic_cartesian_itex.test`（批 #27 转绿并摘出 IGNORED）、**全部通过** |
+| 实际执行 | **237** | 全部通过（下表列出各 `.test`，`printers.test` 一个文件 203 条运行） |
+| 其中早期转绿 | — | 逐批转绿的先后顺序（各批提交信息里可查）：`linuxtest.test`、`commands.test`、`out_of_bounds.test`（b39750f 移出）、`bed_mesh.test`、`z_virtual_endstop.test`（探针链路）、`z_tilt.test`、`quad_gantry_level.test`（调平族）、`bltouch.test`、`smart_effector.test`（探针族）、`multi_z.test`（发送队列水位）、`screws_tilt_adjust.test`（探测语义与亚纳米守卫）、`gcode_arcs.test`、`bed_screws.test`、`pwm.test`、`temperature.test`、`macros.test`、`led.test`、`sdcard_loop.test`、`pressure_advance.test`、`eddy.test`、`dual_carriage.test`、`exclude_object.test`（宏体渲染）、`polar.test`、`delta.test`、`delta_calibrate.test`（运动学）、`hybrid_corexy_dual_carriage.test`（`[input_shaper]` 段）、`extruders.test`（filament 传感器段）、`manual_stepper.test`、`generic_cartesian_iqex.test`/`generic_cartesian_itex.test`，**全部通过** |
 
 上游 `configparser` 的 `optionxform = str.lower` 已对齐（`mod.rs` 存储侧小写 + `section.rs` 查询侧小写），`Option 'pid_Kp' … must be specified` 类的 49 次回归失败已归零；`must be specified` 错误文案保留调用方传入的大小写，`is not valid` 与 `Section '…' is not valid` 使用存储侧小写。
 
-`Unknown pin chip name 'probe'` 首因随 probe 族落地持续下降：35 → 20 → **1**（M2 `bltouch`、
-M3 `smart_effector` 落地后，仅剩 `eddy.test`——`probe_eddy_current` 属 M5）。
+`Unknown pin chip name 'probe'` 首因随 probe 族落地持续下降：35 → 20 → 1 → **0**——`bltouch`、
+`smart_effector`、`eddy` 落地后已无运行因它报错。缺口报告里现在只剩静态缺节一处：`replicape`
+（仅 `generic-replicape.cfg` 一条运行「只差一个缺口」，它也是缺 `pru` 字典的那两条之一）。
 
 - 头两个转绿的用例：`linuxtest.test`（只需 `kinematics: none`、`heaters` 的传感器注册表、
   `temperature_sensor` 与 `ds18b20`，g-code 只是一次 `G4 P1000`）；随后 `gcode_move`（G4-1）与
   `EXTRUDER` 默认项（e8bf2b7）让 `commands.test` 与 `out_of_bounds.test` 也过了守卫，移出忽略列表。
 - `KLIPPERX_UPSTREAM_ALL=1` 只去掉忽略列表这一层：默认构建下它会跑 237 条可用运行，其中
-  **236 条通过、0 条失败**，`IGNORED` **已清空**（2026-09-25 收官；逐批转绿过程见各批提交信息与
+  **237 条通过、0 条失败**，`IGNORED` **已清空**（2026-09-25 收官；逐批转绿过程见各批提交信息与
   `TODO.md`）。另有 2 条运行声明 `DICTIONARY … pru.dict`，默认不构建 `pru`（需 `pru-gcc`），
   不计入统计。
 - 按「首次失败」归类的历史分布（分域工单、运动学细分、完整失败日志与「收益不可加」的复盘）
@@ -217,10 +218,11 @@ M3 `smart_effector` 落地后，仅剩 `eddy.test`——`probe_eddy_current` 属
 
 - 按「**首次失败原因**」分组只用于**定位**，不是工作队列：`load_config` 遇到第一个未知
   section 就停，修好一个缺口只会让运行前进到下一个缺口，总数可能不变，各组收益不可加。
-- 进度以**实测口径**衡量：收官时 `KLIPPERX_UPSTREAM_ALL=1` 下 **236 通过 / 0 失败**、`IGNORED` **0** 条；
+- 进度以**实测口径**衡量：`KLIPPERX_UPSTREAM_ALL=1` 下 **237 通过 / 0 失败**、`IGNORED` **0** 条
+  （2026-09-25 收官）；
   推进期的做法是先产出「**运行 × 缺口**」矩阵
   （列出每条运行的**全部**缺口，而非第一个），据此找「只差一个缺口」的用例与公共前缀。
-- **验收标准**：对应 `.test` 从 `IGNORED` 移除后通过。`ignored_cases_still_fail` 是守卫（opt-in 亦点名「能装载但 g-code 未绿」的候选；历史上曾有 `dual_carriage.test`+`exclude_object.test` 两点名，已随 U-A7b 宏体渲染于 2026-09-24 清零，现 0 点名）——
+- **验收标准**：对应 `.test` 从 `IGNORED` 移除后通过。`ignored_cases_still_fail` 是守卫（opt-in 亦点名「能装载但 g-code 未绿」的候选：历史上曾点名 `dual_carriage.test` 与 `exclude_object.test`，已随宏体渲染于 2026-09-24 清零，现 0 点名）——
   某个忽略文件的全部可跑运行都通过时报失败并提示移除。
 - 看全部缺口（而不只是首次失败）：
   `cargo test -p klipperx --lib upstream_gap_report -- --nocapture`。
@@ -238,9 +240,9 @@ M3 `smart_effector` 落地后，仅剩 `eddy.test`——`probe_eddy_current` 属
 | 语料结构完整、引用可解析 | 无 | `upstream_test_cases_are_well_formed`、`upstream_test_inputs_resolve` |
 | 每份 `.cfg` 由本仓库解析器读取 | 无 | `every_upstream_printer_config_parses` |
 | 全部缺口扫描（**报告**，不失败） | 无 | `upstream_gap_report`（`-- --nocapture` 查看缺口矩阵） |
-| `IGNORED` 条目守卫 | 运行声明的全部字典 + 所用配置节 | `ignored_cases_still_fail`（某个忽略文件全跑通了就报失败） |
-| 运行内联 g-code 可解析 | 运行所用配置节 | `#[ignore] upstream_inline_gcode_parses` |
-| 运行端到端执行 | 运行声明的全部字典 + 所用配置节 | `upstream_test_cases_run`（按运行的可用性过滤 + 忽略列表） |
+| `IGNORED` 条目守卫 | 运行声明的全部字典 + 所用配置节 | `ignored_cases_still_fail`（某个忽略文件全跑通了就报失败；现列表为空） |
+| 运行内联 g-code 可解析 | —（用例 g-code 已由端到端运行真送进 dispatcher） | `#[ignore] upstream_inline_gcode_parses`（更早的窄解析阶段，未对接） |
+| 运行端到端执行 | 运行声明的全部字典 + 所用配置节 | `upstream_test_cases_run`（按运行的可用性过滤；忽略列表已空） |
 
 ### 应答机
 
@@ -277,15 +279,14 @@ harness 把每个 `[mcu]` / `[mcu <name>]` 的传输键换成 `test: dict=<字�
 ### 忽略列表
 
 上游绝大多数配置会用到本主机尚未实现的节（`extruder`、`heater_bed`、`fan`、`gcode_macro`、
-`tmc*`…），它们在 `load_config` 阶段就被拒绝，因此先登记在 `IGNORED` 里跳过；随节落地逐条移除。
-列表按 `.test` 文件登记，作用域是该文件的**全部运行**。
+`tmc*`…），它们在 `load_config` 阶段就被拒绝，因此曾逐条登记在 `IGNORED` 里跳过；随节落地逐条移除，
+现已一条不剩。列表按 `.test` 文件登记，作用域是该文件的**全部运行**。
 
 `KLIPPERX_UPSTREAM_ALL=1` **只作用于这张列表**：它让字典齐备的运行无视忽略判定并报出失败，
 **不会**让因字典未构建而跳过的运行跑起来（那是构建阶段的事，见上一节）。
 
-当前 9 条（`linuxtest.test` 已在 T1 转绿；`commands.test`、`out_of_bounds.test` 随 `gcode_move`
-与 `EXTRUDER` 默认项在 b39750f 转绿；`bed_mesh.test`、`z_virtual_endstop.test` 在探针链路单元转绿；
-`z_tilt.test`、`quad_gantry_level.test` 在 H9 调平族转绿；`bltouch.test`、`smart_effector.test` 在 H9 探针族转绿；`multi_z.test` 在 M7 发送队列水位修复后转绿（2026-09-24）；`screws_tilt_adjust.test` 在 M4 探测语义修复后转绿（2026-09-24）；`gcode_arcs.test`、`bed_screws.test`、`pwm.test`、`temperature.test`、`macros.test` 在集成批 #1 段落地后转绿（2026-09-24）；`led.test`、`sdcard_loop.test`、`pressure_advance.test` 在集成批 #2 段落地后转绿（2026-09-24）；`eddy.test` 在集成批 #3（M5 收官）转绿（2026-09-24）、`dual_carriage.test` 与 `exclude_object.test` 在集成批 #4（宏体渲染）转绿（2026-09-24）；`polar.test`、`delta.test`、`delta_calibrate.test` 在集成批 #5（运动学）转绿（2026-09-24）；`hybrid_corexy_dual_carriage.test`、`extruders.test` 随后在 wave-2（`[input_shaper]` 段与 filament 传感器段）转绿（2026-09-24）；`manual_stepper.test` 在批 #6（`[manual_stepper]` 段 + `MANUAL_STEPPER`）转绿（2026-09-25）；其余文件仍因缺节留在列表里）。
+**已清空**（2026-09-25 收官）：最后一条移出后列表为空，保留它是为了下一处缺口有地方登记；
+每个 `.test` 的转绿过程见各批提交信息与 `TODO.md`。
 
 `multi_z.test` 已转绿并移出忽略列表（2026-09-24）：首因是同步 `Mcu::send` 的 `try_send` 被异步生产者
 灌满报 `no available capacity`（插桩定位到 `endstop_home` 武装撞上瞬时满载），修复为 `send_payload`
@@ -334,8 +335,8 @@ KLIPPERX_UPSTREAM_ALL=1 cargo test -p klipperx --lib upstream_test_cases_run
 `--workspace` 与 `--lib` 的取舍、真机用例的约定见[测试](testing.md)。
 
 `CONFIG` 与 `GCODE` 相对 `.test` 文件解析；`DICTIONARY` 是构建产物，因此只校验其对应的
-`test/configs/<name>.config` 存在。内联 g-code 阶段仍以 `#[ignore]` 保留（需要同一批缺失的节），
-补齐后移除属性即可。
+`test/configs/<name>.config` 存在。`upstream_inline_gcode_parses` 仍以 `#[ignore]` 保留，但原因已不是
+缺节：端到端运行会把每条已构建用例的 g-code 真送进 dispatcher，它只是更早、更窄的解析阶段，尚未对接。
 
 `every_upstream_printer_config_parses` 覆盖 259 份 `.cfg`，现已全部通过。这条用例最初暴露了本
 仓库解析器与上游 `configparser` 的四处分歧（多行值、`=` 分隔符、节头行内注释、`;` 行内注释），

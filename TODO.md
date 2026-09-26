@@ -309,8 +309,9 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 框架：`src/core/klippy/upstream.rs`（字典驱动应答机 + 按 `CONFIG` 拆分的运行）与
 `crates/test-support/build.rs`（按架构编字典）。
 
-**结果**：`KLIPPERX_UPSTREAM_ALL=1` **236 条通过 / 0 条失败**，`IGNORED` **清空**；默认套件（含全部
-语料 236 例）约 70s 正常退出。逐批转绿过程见各批提交信息与
+**结果**：`KLIPPERX_UPSTREAM_ALL=1` **237 条通过 / 0 条失败**，`IGNORED` **清空**（默认构建下另有 2 条
+因未编 `pru` 字典跳过，见下方备注）；默认套件（含全部
+语料 237 例）约 65s 正常退出。逐批转绿过程见各批提交信息与
 [回归测试手册](docs/klippy/developer-manual/regression-tests.md)。
 
 **推进口径（留作方法）**：

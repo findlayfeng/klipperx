@@ -384,12 +384,14 @@ git config core.hooksPath .githooks
 激活单位是「按 `CONFIG` 拆出的**运行**」，启用条件是**该运行声明的全部字典都已构建**：架构列表
 `KLIPPERX_ARCHES`（默认 `linux` + `avr` + 各 ARM 家族，即主机 / `avr-gcc` / `arm-none-eabi` 三类工具链）
 与 `KLIPPERX_ALL_ARCHES`（全开）在**构建阶段**过滤 `test/configs/*.config` 并产出同名 `.dict`
-（构建失败即报错）；未构建字典的运行直接跳过，不拿别的目标顶替。另有忽略列表登记因缺配置节而必然
-失败的 `.test`；`KLIPPERX_UPSTREAM_ALL=1` 只作用于该列表，不能让字典未构建的运行跑起来。内联 g-code
-阶段仍以 `#[ignore]` 保留（需要同一批缺失的节）。
+（构建失败即报错）；未构建字典的运行直接跳过，不拿别的目标顶替。忽略列表（`IGNORED`）**已清空**：
+历史上登记过因缺配置节而必然失败的 `.test`，随各节落地逐条移出；`KLIPPERX_UPSTREAM_ALL=1` 只作用于
+这张列表，不能让字典未构建的运行跑起来。
 
-全语料 37 份文件共 **239 次运行**；默认构建下只有 2 条（引用 `pru`）因字典未构建跳过，其余 237 条
-全部可用；其中 **`linuxtest.test`、`commands.test`、`out_of_bounds.test` 已转绿**（T1 与 b39750f），其余 234 条运行在忽略列表里（34 个 `.test` 文件）。上游 `configparser` 的 `optionxform = str.lower` 已对齐（`mod.rs` 存储侧小写 + `section.rs` 查询侧小写），`Option 'pid_Kp' … must be specified` 类的 49 次回归失败已归零。
+全语料 37 份文件共 **239 次运行**；默认构建下只有 2 条（`printers.test` 里 `DICTIONARY pru.dict` 下的
+`generic-cramps.cfg` 与 `generic-replicape.cfg`）因未构建 `pru` 字典跳过，其余 **237 条全部运行并通过
+（0 失败）**；用例的内联 g-code 由端到端运行真送进 dispatcher，更有独立的内联解析阶段
+（`upstream_inline_gcode_parses`，仍 `#[ignore]`）。上游 `configparser` 的 `optionxform = str.lower` 已对齐（`mod.rs` 存储侧小写 + `section.rs` 查询侧小写），`Option 'pid_Kp' … must be specified` 类的 49 次回归失败已归零。
 
 ```bash
 cargo test -p klipperx --lib upstream                 # 语料相关的全部用例

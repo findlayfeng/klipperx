@@ -450,7 +450,7 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 
 ### H7 输入与外设
 
-- [ ] `buttons.py` / `gcode_button.py`（固件 `buttons.c`）。
+- [ ] 固件按钮查询（`buttons.c`）/ `query_adc`——`gcode_button` 的**数字路径**与 `[buttons]` 已落地（批 #37）；`analog_range` 明确拒绝。
 - [x] `pulse_counter.py`（批 #8：host 侧 `pulse_counter.rs` 落地并接通 `tachometer_pin`；`config_counter`/`query_counter` 按字典编码，真机验证仍待 T6）。
 - [ ] `trigger_analog.py`（固件 `trigger_analog.c`）。
 - [ ] 断料/线宽：`filament_switch_sensor.py`、`filament_motion_sensor.py`、
@@ -494,9 +494,9 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
       （lagrange/bicubic、`mesh_pps`）、faulty 区域替换、fade 与 move 的 z 补偿、profile 命令
       与 `bed_mesh/dump_mesh` 端点）。
 - [ ] 螺丝：`screws_tilt_adjust.py` ✅；`bed_screws.py` **段已落地**（2026-09-24 批 #1），`BED_SCREWS_ADJUST`/`ACCEPT`/`ADJUSTED`/`ABORT` 命令族未移植。
-- [ ] 校准：`delta_calibrate.py` ✅（段+`DELTA_CALIBRATE`/`DELTA_ANALYZE` 落地 2026-09-24 批 #5，`delta_calibrate.test` 转绿）、`axis_twist_compensation.py`、`skew_correction.py`、
+- [ ] 校准：`delta_calibrate.py` ✅（段+`DELTA_CALIBRATE`/`DELTA_ANALYZE` 落地 2026-09-24 批 #5，`delta_calibrate.test` 转绿）、`axis_twist_compensation.py` ✅（批 #36）、`skew_correction.py`、
       `z_thermal_adjust.py`、`tuning_tower.py`。
-- [ ] 回零周边：`homing_override.py`（`homing_heaters.py` 批 #31 已落地）；事件 `probe:update_results` 未触发
+- [ ] 回零周边：`homing_override.py`（`homing_heaters.py` 批 #31 已落地）；事件 `probe:update_results` 已带载荷并触发（批 #36）
       （`homing:*` 四个已随 toolhead 落地产线触发，见事件清单）。
 - 依赖 C1、F8（endstop/trsync）、H3（宏）、H12（`mathutil`）。
 
@@ -628,7 +628,7 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 
 | 事件名 | 触发时机 | 参数 | 上游位置 | 实现依赖 |
 |---|---|---|---|---|
-| `probe:update_results` | probe 测量完成 | `results` | `klippy/extras/probe.py:200` | endstop |
+| `probe:update_results` | probe 测量完成 | `ProbeResultsHandle`（可原地改 Z，批 #36） | `klippy/extras/probe.py:200` | endstop |
 | `extruder:activate_extruder` | 切换 active extruder | `extruder` | `klippy/kinematics/extruder.py:25` | 尚无发送方（handler 已备，`gcode_move.rs:357`） |
 | `stepper_enable:motor_off` | stepper 电机关闭 | `stepper_enable` | `klippy/extras/stepper_enable.py:120` | ✅ 已触发（`stepper_enable.rs:338`） |
 | `virtual_sdcard:reset_file` | VSD 文件重置 | 无 | `klippy/extras/virtual_sdcard.py:151` | sdcard |

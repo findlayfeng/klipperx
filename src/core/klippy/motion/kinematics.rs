@@ -452,6 +452,19 @@ pub trait Kinematics: Send + Sync + std::fmt::Debug {
         None
     }
 
+    /// The deltesian home split (`DeltesianKinematics.home`,
+    /// `deltesian.py:88-110`), or `None` for every other kinematics.
+    ///
+    /// Deltesian is neither a whole-machine group home ([`Self::unified_home`])
+    /// nor the cartesian per-axis walk: its two arm rails home together as one
+    /// group and then its Y rail homes on its own, and the two arm rails drive X
+    /// and Z rather than the axis at each rail's slot. The driver needs the
+    /// group's endpoints and pace from here because it holds only the trait
+    /// object.
+    fn deltesian_home(&self) -> Option<DeltesianHome> {
+        None
+    }
+
     /// The delta calibration parameters this kinematics carries
     /// (`kinematics/delta.py:153-160`, `get_calibration`).
     ///
@@ -463,6 +476,24 @@ pub trait Kinematics: Send + Sync + std::fmt::Debug {
     fn delta_calibration(&self) -> Option<KinematicsCalibration> {
         None
     }
+}
+
+/// Deltesian's homing split (`DeltesianKinematics.home`, `deltesian.py:88-110`).
+///
+/// Upstream's `home` makes two `home_rails` calls: the two arm rails together
+/// (`rails[:2]`, forcepos `[0, None, force_z]` → homepos `[0, None, home_z]`),
+/// then the Y rail on its own. The arm group's X is pinned to 0 and only its Z
+/// moves, so this carries those two Z values and each arm's actuator travel —
+/// everything the driver cannot derive without the arm geometry.
+#[derive(Debug, Clone, Copy)]
+pub struct DeltesianHome {
+    /// The arm group's start Z (`forcepos[2] = -1.5·√(max(arm2 − arm_x²))`).
+    pub arm_force_z: f64,
+    /// The arm group's end Z (`home_z`).
+    pub arm_target_z: f64,
+    /// Each arm rail's actuator travel over the group move, in [left, right]
+    /// order (`HomingMove._calc_endstop_rate` paces each endstop by it).
+    pub arm_travel: [f64; 2],
 }
 
 /// A homing move the kinematics takes in one piece (`DeltaKinematics.home`).

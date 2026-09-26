@@ -46,27 +46,51 @@ pub use restart_method::McuRestartMethod;
 
 use events::McuEvents;
 
-/// How many outbound commands may be queued before [`Mcu::send`] refuses.
+/// How many outbound commands the send queue holds.
 ///
-/// The synchronous [`Mcu::send`] does not wait for room, so a host-side burst
-/// must fit: a bed-mesh calibration probes a 7x7 grid (49 points), each with an
-/// endstop/trsync arm plus its step blocks, and upstream never refuses at all —
-/// its msgparser buffers and only flow-controls via the receive window. The
-/// value is a runaway guard, not a flow-control mechanism; paths that can queue
-/// a lot (step batches, the configuration phase) use the awaiting
-/// [`Mcu::send_payload`] instead.
+/// Upstream never refuses at all — its writer blocks on the port, so a host
+/// burst is only ever slowed down. This queue is bounded, so the two kinds of
+/// producer are told apart: paths that can queue a lot (step batches, the
+/// configuration phase) use the awaiting [`Mcu::send_payload`], and the
+/// synchronous [`Mcu::send`] waits out a burst for [`SYNC_SEND_WAIT`]. A
+/// legitimate burst is large: a bed-mesh calibration probes a 7x7 grid (49
+/// points), each with an endstop/trsync arm plus its step blocks, and a 20x4
+/// HD44780 panel's refresh queues one `spi_send` per nibble byte — 480 of them
+/// for one full screen (`extras/display/hd44780_spi.rs`). A sender that is
+/// still without room after the wait is the runaway case this bound reports.
 const SEND_QUEUE_CAPACITY: usize = 512;
 
 /// Slots the awaiting producers ([`Mcu::send_payload`]) leave free for the
 /// synchronous [`Mcu::send`].
 ///
-/// `Mcu::send` cannot wait for room — its `try_send` reports
-/// "no available capacity" — so a burst of step batches that saturates the
-/// queue would starve every sync sender behind it (an endstop arm during
-/// `PROBE` is the observed case: `endstop_home` found the queue full and the
-/// g-code line failed). The awaiting path therefore stops at this watermark
-/// and lets the wire drain; the sync path gets the reserved slots.
+/// `Mcu::send` cannot await room — it waits [`SYNC_SEND_WAIT`] at most — so a
+/// burst of step batches that saturates the queue would starve every sync
+/// sender behind it (an endstop arm during `PROBE` is the observed case:
+/// `endstop_home` found the queue full and the g-code line failed). The
+/// awaiting path therefore stops at this watermark and lets the wire drain;
+/// the sync path gets the reserved slots.
 const SYNC_SEND_HEADROOM: usize = 16;
+
+/// How long a synchronous sender ([`Mcu::send`]) waits for room in the outbound
+/// queue before it reports the queue as full.
+///
+/// The wait is what lets a large legitimate burst through: the panel refresh
+/// above queues ~480 `spi_send`s back to back, which a full queue would refuse
+/// for as long as the send task is behind it. Draining the 512 slots takes tens
+/// of milliseconds on an idle host, so a second is generous; past that the
+/// queue is not keeping up with a burst, which is exactly what the guard is for.
+/// On a single-threaded runtime the wait cannot help (the task that drains the
+/// queue is the one being waited on), but it is bounded, so the wait still ends
+/// in the reported error.
+const SYNC_SEND_WAIT: Duration = Duration::from_secs(1);
+
+/// The first wait between two looks at the queue in [`try_send_bounded`].
+const SYNC_SEND_POLL_START: Duration = Duration::from_micros(50);
+
+/// The longest wait between two such looks: the backoff doubles up to this, so a
+/// queue that is draining takes the sender with it without hammering
+/// `capacity()`.
+const SYNC_SEND_POLL_MAX: Duration = Duration::from_millis(10);
 
 use crate::core::klippy::load::section;
 
@@ -97,6 +121,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Instant;
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{sleep, Duration};
 use tracing::{debug, error, info, warn};
@@ -114,6 +139,42 @@ enum SendItem {
     Payload(Payload),
     /// Send whatever is queued so far, then signal completion.
     Flush(oneshot::Sender<()>),
+}
+
+/// Queue `item` for the send task, waiting a bounded time for room.
+///
+/// This is the synchronous senders' half of the queue's flow control (see
+/// [`SYNC_SEND_WAIT`]): it polls the queue's free slots with a doubling backoff
+/// instead of awaiting, because its callers cannot await. The payload comes
+/// back in the error, which is what the caller reports.
+fn try_send_bounded(
+    send_buf_tx: &mpsc::Sender<SendItem>,
+    mut item: SendItem,
+) -> Result<(), TrySendError<SendItem>> {
+    let deadline = Instant::now() + SYNC_SEND_WAIT;
+    let mut backoff = SYNC_SEND_POLL_START;
+    loop {
+        match send_buf_tx.try_send(item) {
+            Ok(()) => return Ok(()),
+            // A closed queue is final: no wait can open it again.
+            Err(TrySendError::Closed(returned)) => return Err(TrySendError::Closed(returned)),
+            Err(TrySendError::Full(returned)) => {
+                if Instant::now() >= deadline {
+                    return Err(TrySendError::Full(returned));
+                }
+                item = returned;
+            }
+        }
+        std::thread::sleep(backoff);
+        backoff = (backoff * 2).min(SYNC_SEND_POLL_MAX);
+    }
+}
+
+/// Whether an awaiting producer ([`Mcu::send_payload`]) may queue another
+/// payload: at least [`SYNC_SEND_HEADROOM`] slots have to stay free for the
+/// synchronous senders.
+fn payload_has_room(send_buf_tx: &mpsc::Sender<SendItem>) -> bool {
+    send_buf_tx.capacity() > SYNC_SEND_HEADROOM
 }
 
 /// MCU object that represents a physical microcontroller unit.
@@ -997,7 +1058,7 @@ impl Mcu {
     /// Queue an already-encoded payload, waiting for room.
     ///
     /// The send channel is bounded, so a configuration of hundreds of commands
-    /// would overflow [`Mcu::send`]'s non-blocking `try_send`. This is the
+    /// would overflow [`Mcu::send`]'s bounded wait. This is the
     /// blocking-in-the-async-sense counterpart the configuration phase uses.
     ///
     /// # Errors
@@ -1006,7 +1067,7 @@ impl Mcu {
         // Hold back at the headroom so the sync `Mcu::send` keeps slots to
         // land in (see `SYNC_SEND_HEADROOM`); give up waiting only if the
         // channel closed, so the error below still surfaces.
-        while self.send_buf_tx.capacity() <= SYNC_SEND_HEADROOM && !self.send_buf_tx.is_closed() {
+        while !payload_has_room(&self.send_buf_tx) && !self.send_buf_tx.is_closed() {
             sleep(Duration::from_micros(100)).await;
         }
         self.send_buf_tx
@@ -1018,11 +1079,14 @@ impl Mcu {
     /// Encode and send a command to the MCU.
     ///
     /// Converts the command name and arguments to a [`Payload`] using the
-    /// registered message format, then queues it for sending.
+    /// registered message format, then queues it for sending. The queue is
+    /// bounded and this path cannot await, so it waits [`SYNC_SEND_WAIT`] for
+    /// room before it reports the queue as full.
     ///
     /// # Errors
     /// Returns [`MsgError`] if the message name is unknown, the arguments
-    /// don't match the expected parameter count, or the send buffer is full.
+    /// don't match the expected parameter count, the send task has gone away,
+    /// or the send buffer stayed full for the whole wait.
     pub fn send(&self, name: &str, args: &[ArgValue]) -> Result<(), MsgError> {
         self.enqueue(name, args, None)
     }
@@ -1032,6 +1096,10 @@ impl Mcu {
     /// A call is one round trip, so it gets one line: `send identify offset=0
     /// count=40 (waiting for identify_response)` says what went out and what is
     /// expected back, where two lines said half of that each.
+    ///
+    /// A queue that is still full when [`try_send_bounded`] gives up is
+    /// reported with the command and the level it was full at: the bare
+    /// `no available capacity` says nothing about which burst spent the queue.
     fn enqueue(
         &self,
         name: &str,
@@ -1046,9 +1114,18 @@ impl Mcu {
             ),
             None => debug!("send {}", self.describe_command(name, args)),
         }
-        self.send_buf_tx
-            .try_send(SendItem::Payload(payload))
-            .map_err(|e| MsgError::new(e.to_string()))?;
+        try_send_bounded(&self.send_buf_tx, SendItem::Payload(payload)).map_err(|e| {
+            let level = match &e {
+                TrySendError::Full(_) => format!(
+                    " (send queue {} of {SEND_QUEUE_CAPACITY} slots in use)",
+                    SEND_QUEUE_CAPACITY - self.send_buf_tx.capacity()
+                ),
+                // The channel's own words are all there is to say about a gone
+                // send task; a level would read as a full queue.
+                TrySendError::Closed(_) => String::new(),
+            };
+            MsgError::new(format!("{}: {e}{level}", self.describe_command(name, args)))
+        })?;
         Ok(())
     }
 
@@ -1483,6 +1560,171 @@ mod tests {
             !mcu.took_over_session(),
             "a stray frame after the first one is not a session to take over"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // the outbound queue's bounds
+    //
+    // `Mcu::send` cannot await room, so it polls the queue for `SYNC_SEND_WAIT`
+    // and reports what it was sending if the queue is still full. These tests
+    // pin both ends of that: the wait outlasts a drain, and it gives up on a
+    // queue that never drains.
+    // -----------------------------------------------------------------------
+
+    /// A queue that drains within the wait takes the sync sender with it.
+    #[test]
+    fn test_a_sync_send_lands_once_the_queue_drains() {
+        let (tx, mut rx) = mpsc::channel::<SendItem>(2);
+        for _ in 0..2 {
+            tx.try_send(SendItem::Payload(Payload::new()))
+                .expect("the queue starts empty");
+        }
+        assert_eq!(tx.capacity(), 0, "the queue is full to begin with");
+
+        // The sender runs on its own thread, so the test thread is free to
+        // drain the queue under it. `rx` stays here: dropping it would close
+        // the queue, which is a different outcome than the one under test.
+        let sender_tx = tx.clone();
+        let sender = std::thread::spawn(move || {
+            try_send_bounded(&sender_tx, SendItem::Payload(Payload::new()))
+        });
+
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(tx.capacity(), 0, "the sender waits instead of refusing");
+        let _ = rx
+            .try_recv()
+            .expect("the two payloads that filled the queue");
+
+        let result = sender.join().expect("the sender thread");
+        assert!(result.is_ok(), "the payload lands once there is room");
+    }
+
+    /// A queue that never drains is reported after the wait, not waited on
+    /// forever.
+    #[test]
+    fn test_a_full_queue_that_never_drains_is_reported_after_the_wait() {
+        let (tx, _rx) = mpsc::channel::<SendItem>(2);
+        for _ in 0..2 {
+            tx.try_send(SendItem::Payload(Payload::new()))
+                .expect("the queue starts empty");
+        }
+
+        let started = Instant::now();
+        let result = try_send_bounded(&tx, SendItem::Payload(Payload::new()));
+        let waited = started.elapsed();
+
+        assert!(
+            matches!(result, Err(TrySendError::Full(_))),
+            "a full queue with no drain is Full, got {result:?}"
+        );
+        assert!(waited >= SYNC_SEND_WAIT, "it looked for room: {waited:?}");
+        assert!(
+            waited < SYNC_SEND_WAIT + Duration::from_millis(500),
+            "the wait is bounded: {waited:?}"
+        );
+    }
+
+    /// The reserved slots the awaiting producer stops at are what the sync path
+    /// spends first — the two halves share `payload_has_room`.
+    #[test]
+    fn test_the_reserved_slots_reach_the_sync_path_first() {
+        let (tx, _rx) = mpsc::channel::<SendItem>(SEND_QUEUE_CAPACITY);
+        // What `Mcu::send_payload` does: queue until only the headroom is left.
+        while payload_has_room(&tx) {
+            tx.try_send(SendItem::Payload(Payload::new()))
+                .expect("room was just checked");
+        }
+        assert_eq!(tx.capacity(), SYNC_SEND_HEADROOM);
+
+        let started = Instant::now();
+        for slot in 0..SYNC_SEND_HEADROOM {
+            try_send_bounded(&tx, SendItem::Payload(Payload::new()))
+                .unwrap_or_else(|e| panic!("reserved slot {slot} is the sync path's: {e:?}"));
+        }
+        assert_eq!(tx.capacity(), 0, "the reserved slots are gone");
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "the sync path does not wait for its own slots"
+        );
+    }
+
+    /// A sync `Mcu::send` at the watermark still reaches the queue, and reports
+    /// the command and the level once the reserved slots are spent too.
+    ///
+    /// The test's own runtime is single-threaded and never yields while it
+    /// fills the queue, so the send task cannot drain a slot: the queue stays
+    /// exactly as the sync sends left it.
+    #[tokio::test]
+    async fn test_a_full_queue_names_the_command_and_the_level() {
+        let mcu = Mcu::for_test("test_mcu", Interface::new(FrameMock::new(vec![])));
+        let dictionary =
+            Dictionary::from_json(serde_json::json!({"commands": {"get_clock": 5}})).unwrap();
+        mcu.install_dictionary(dictionary).unwrap();
+
+        // The awaits the test makes are what would let the send task run, so
+        // the queue is filled without one.
+        while mcu.send_buf_tx.capacity() > SYNC_SEND_HEADROOM {
+            mcu.send("get_clock", &[]).expect("a free slot");
+        }
+        for slot in 0..SYNC_SEND_HEADROOM {
+            mcu.send("get_clock", &[])
+                .unwrap_or_else(|e| panic!("reserved slot {slot} is the sync path's: {e}"));
+        }
+
+        let error = mcu
+            .send("get_clock", &[])
+            .expect_err("the queue is full and nothing drains it");
+        let message = error.to_string();
+        assert!(
+            message.contains("get_clock"),
+            "names the command: {message}"
+        );
+        assert!(
+            message.contains("no available capacity"),
+            "keeps the queue's own error: {message}"
+        );
+        assert!(
+            message.contains(&format!("{SEND_QUEUE_CAPACITY} of {SEND_QUEUE_CAPACITY}")),
+            "reports the level it was full at: {message}"
+        );
+    }
+
+    /// `send_payload` never spends the slots it reserves for the sync path.
+    #[tokio::test]
+    async fn test_send_payload_leaves_the_sync_headroom_free() {
+        let mcu = Mcu::for_test("test_mcu", Interface::new(FrameMock::new(vec![])));
+        let dictionary =
+            Dictionary::from_json(serde_json::json!({"commands": {"get_clock": 5}})).unwrap();
+        mcu.install_dictionary(dictionary).unwrap();
+
+        let payload = || mcu.encode("get_clock", &[]).expect("a known command");
+        // Fill to the watermark without awaiting: the send task stays parked,
+        // so the level under test is the one left here.
+        while mcu.send_buf_tx.capacity() > SYNC_SEND_HEADROOM {
+            mcu.send("get_clock", &[]).expect("a free slot");
+        }
+
+        // At the watermark the awaiting producer parks instead of taking a
+        // reserved slot. One look at it says so without yielding: a poll that
+        // awaited a timer would let the send task free room first.
+        let mut queued = Box::pin(mcu.send_payload(payload()));
+        let first = std::future::poll_fn(|cx| {
+            use std::future::Future;
+            std::task::Poll::Ready(queued.as_mut().poll(cx))
+        })
+        .await;
+        assert!(
+            first.is_pending(),
+            "it waited for room rather than spending the headroom"
+        );
+        assert_eq!(mcu.send_buf_tx.capacity(), SYNC_SEND_HEADROOM);
+        drop(queued);
+
+        // Once it runs, the payload goes out and the headroom is intact.
+        mcu.send_payload(payload())
+            .await
+            .expect("the send task drains the queue");
+        assert!(mcu.send_buf_tx.capacity() >= SYNC_SEND_HEADROOM);
     }
 
     // -----------------------------------------------------------------------

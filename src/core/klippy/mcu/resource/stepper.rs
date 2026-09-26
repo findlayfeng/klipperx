@@ -191,9 +191,10 @@ impl McuStepper {
     /// waiting for room in the transport's send queue.
     ///
     /// [`McuStepper::send_steps`] uses the non-blocking send, which is right for
-    /// a few commands but drops a long move once the send queue (32 items) is
-    /// full. The motion flush loop uses this one instead: a move can be hundreds
-    /// of `queue_step` commands, and they must all reach the firmware.
+    /// a few commands but gives up on a long move once the send queue stays full
+    /// for its bounded wait (`mcu/mod.rs`). The motion flush loop uses this one
+    /// instead: a move can be hundreds of `queue_step` commands, and they must
+    /// all reach the firmware.
     ///
     /// # Errors
     /// As [`McuStepper::send`], plus any transport error from the awaited send.

@@ -61,6 +61,7 @@
 //! can use one MCU, and dropping the last handle shuts the device down.
 
 pub mod adc;
+pub mod ads131m0x;
 pub mod adxl345;
 pub mod allocate_oids;
 pub mod clock;

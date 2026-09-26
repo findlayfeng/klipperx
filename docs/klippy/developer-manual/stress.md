@@ -39,8 +39,11 @@ klipperx stress [OPTIONS] <CONFIG_FILE> [MCU]
 
 两个正确性前提：
 
-1. **每段前 `reset_step_clock` 重锚到「现在 + 1 ms」**，否则下一段第一步排在“过去”，直接触发
-   下面的错误；
+1. **每段前 `reset_step_clock` 重锚到「现在 + 提前量」**，提前量由 `anchor_margin(rtt)` 按本次
+   `get_clock` **实测往返时延（RTT）**推导：`2×RTT + 1 ms 余量`，下限 `1 ms`（RTT 极小时不比
+   早先写死的 1 ms 差），RTT 测量不可用时回退 1 ms。提前量必须盖住「取样到 `reset_step_clock`
+   送达固件」的整段链路延迟——慢链路（如 UART 桥）上固定 1 ms 会让锚点到达时已过期，第一档
+   就 `Timer too close`；
 2. **重锚前先等步进器真的停下**（轮询 `stepper_get_position` 到两次读数相同）。固件在还有 move
    未执行时**拒绝** `reset_step_clock`：`shutdown("Can't reset time when stepper active")`
    （`src/stepper.c:311`）——如果不先等，这个错误会被误当成速率上限。

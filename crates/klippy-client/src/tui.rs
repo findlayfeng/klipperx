@@ -10,7 +10,7 @@
 //!   }
 //! < {"id": null, "method": "klippy:status", "params": {...}}
 //! klippy> objects/query {"objects": {"toolhead": ["position"]}}
-//! Enter send · ↑↓ history · PgUp/PgDn/Home/End log · ^↑/^↓ line · ^G g-code · .help · ^C quit
+//! Enter send · ↑↓ history · PgUp/PgDn/Home/End log · ^↑/^↓ line · ^G g-code · .help · Esc×3 stop · ^C quit
 //! ```
 //!
 //! The header tracks the printer's state, the log holds everything that
@@ -98,6 +98,19 @@ use crate::session::{self, Control, Entry, LogLevel, Notice, Output, Session};
 /// It cannot be interrupted out of `event::read`, so the thread polls instead;
 /// this is the price of leaving the window instantly.
 const KEY_POLL: Duration = Duration::from_millis(100);
+
+/// How many `Esc` presses in a row stop the printer.
+///
+/// `Esc` still means "leave the window", so the presses have to be part of one
+/// gesture: see [`ESTOP_WINDOW`].
+const ESTOP_PRESSES: u8 = 3;
+
+/// How long one `Esc` press stays part of the emergency-stop gesture.
+///
+/// A press that is not followed by another within this window is a plain "leave
+/// the window" — which is why leaving with `Esc` happens when the window closes
+/// rather than on the keypress (`^C` / `^D` still leave at once).
+const ESTOP_WINDOW: Duration = Duration::from_millis(800);
 
 /// How long to keep reading after the window is closing, so replies already on
 /// their way are not lost.
@@ -207,6 +220,10 @@ struct App {
     status: Status,
     /// Set by a local command that asked to leave.
     quit: bool,
+    /// `Esc` presses seen in the current gesture, and when that gesture stops
+    /// counting (`ESTOP_PRESSES` presses inside `ESTOP_WINDOW` = emergency stop).
+    escape_streak: u8,
+    escape_deadline: Option<tokio::time::Instant>,
     /// Whether typed lines are sent as G-Code (`gcode/script`).
     gcode: bool,
     /// Whether this window has already subscribed to G-Code output; every
@@ -258,6 +275,8 @@ impl App {
             mouse: true,
             status: Status::Unknown,
             quit: false,
+            escape_streak: 0,
+            escape_deadline: None,
             gcode: false,
             gcode_subscribed: false,
             greeted: false,
@@ -536,7 +555,7 @@ impl App {
                 self.push(Entry::notice(
                     Notice::Info,
                     format!(
-                        "{}\n\nWindow:\n  .yaml / .json   show message bodies as YAML or JSON\n  .gcode          toggle g-code mode (^G): typed lines go to gcode/script\n  .mouse          hand the mouse back to the terminal (^S, or click the log) so text can be selected",
+                        "{}\n\nWindow:\n  .yaml / .json   show message bodies as YAML or JSON\n  .gcode          toggle g-code mode (^G): typed lines go to gcode/script\n  .mouse          hand the mouse back to the terminal (^S, or click the log) so text can be selected\n  ^↑ / ^↓         move the caret a line (multi-line input)\n  Esc ×3          emergency stop; a lone Esc leaves the window",
                         session::usage()
                     ),
                 ));
@@ -544,6 +563,62 @@ impl App {
             }
             _ => false,
         }
+    }
+}
+
+/// What a press of `Esc` asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Escape {
+    /// Part of a gesture: nothing happens yet, keep waiting for more presses.
+    Wait,
+    /// Three presses in a row: stop the printer.
+    Stop,
+}
+
+impl App {
+    /// Take one `Esc` press.
+    ///
+    /// The gesture is "three presses in a row": each press within
+    /// [`ESTOP_WINDOW`] of the previous one extends the streak, and a press that
+    /// arrives after the window starts a new one. A streak that never reaches
+    /// [`ESTOP_PRESSES`] is a plain "leave", which the event loop performs when
+    /// the window closes ([`Self::escape_window_closed`]).
+    fn escape(&mut self, now: tokio::time::Instant) -> Escape {
+        self.escape_streak = match self.escape_deadline {
+            Some(deadline) if now < deadline => self.escape_streak.saturating_add(1),
+            _ => 1,
+        };
+        self.escape_deadline = Some(now + ESTOP_WINDOW);
+        if self.escape_streak >= ESTOP_PRESSES {
+            self.escape_streak = 0;
+            self.escape_deadline = None;
+            return Escape::Stop;
+        }
+        Escape::Wait
+    }
+
+    /// Whether the pending `Esc` gesture has timed out — i.e. the user pressed
+    /// `Esc` once or twice and meant to leave.
+    fn escape_window_closed(&mut self, now: tokio::time::Instant) -> bool {
+        match self.escape_deadline {
+            Some(deadline) if now >= deadline => {
+                let leaving = self.escape_streak > 0;
+                self.escape_streak = 0;
+                self.escape_deadline = None;
+                leaving
+            }
+            _ => false,
+        }
+    }
+
+    /// The footer text while an `Esc` gesture is in progress.
+    fn escape_hint(&self) -> Option<String> {
+        (self.escape_streak > 0 && self.escape_streak < ESTOP_PRESSES).then(|| {
+            format!(
+                "emergency stop {}/{} · Esc again · any other key cancels · ^C quit",
+                self.escape_streak, ESTOP_PRESSES
+            )
+        })
     }
 }
 
@@ -654,7 +729,10 @@ async fn event_loop(
             Key(Option<Event>),
             Message(Result<crate::connection::Incoming, TransportError>),
             HostLog(Option<Entry>),
+            /// The `Esc` streak window closed: a lone press means "leave".
+            EscapeWindow,
         }
+        let escape_deadline = app.escape_deadline;
         let step = tokio::select! {
             key = keys.recv() => Step::Key(key),
             message = session.receive() => Step::Message(message),
@@ -663,6 +741,14 @@ async fn event_loop(
             entry = async { host_log.as_mut()?.recv().await }, if host_log.is_some() => {
                 Step::HostLog(entry)
             }
+            // Pending forever when no `Esc` press is being counted, so the arm
+            // costs nothing until one is.
+            _ = async {
+                match escape_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            } => Step::EscapeWindow,
         };
 
         match step {
@@ -671,6 +757,11 @@ async fn event_loop(
             Step::Key(Some(Event::Key(key))) => {
                 if key.kind != KeyEventKind::Press {
                     continue;
+                }
+                // Any other key means the gesture was not an emergency stop.
+                if key.code != KeyCode::Esc {
+                    app.escape_streak = 0;
+                    app.escape_deadline = None;
                 }
                 match handle_key(&mut app, &mut session, key).await? {
                     Control::Continue => (),
@@ -683,6 +774,11 @@ async fn event_loop(
             Step::Key(Some(_)) => (),
             // A closed channel means the host stopped logging; the window keeps
             // working, it just has nothing more to say about itself.
+            Step::EscapeWindow => {
+                if app.escape_window_closed(tokio::time::Instant::now()) {
+                    break Ok(());
+                }
+            }
             Step::HostLog(None) => host_log = None,
             Step::HostLog(Some(entry)) => app.write(entry),
             Step::Message(Ok(message)) => app.write(message.into()),
@@ -719,10 +815,19 @@ async fn handle_key(
     // The mouse settles first, and this key still does its own job after.
     app.mouse_for_key(key.code, ctrl);
     match (key.code, ctrl) {
-        // Leaving: ^C, ^D and Esc all mean "I am done", and all of them are
-        // what a terminal user will try.
-        (KeyCode::Char('c') | KeyCode::Char('d'), true) | (KeyCode::Esc, _) => {
-            return Ok(Control::Quit)
+        // Leaving: ^C and ^D leave at once.
+        (KeyCode::Char('c') | KeyCode::Char('d'), true) => return Ok(Control::Quit),
+        // `Esc` still means "leave", but it is also the emergency-stop gesture:
+        // `Esc` three times in a row stops the printer, so a lone `Esc` leaves
+        // when the streak window closes instead of on the keypress.
+        (KeyCode::Esc, _) => {
+            return match app.escape(tokio::time::Instant::now()) {
+                Escape::Stop => {
+                    session.emergency_stop(app).await?;
+                    Ok(Control::Continue)
+                }
+                Escape::Wait => Ok(Control::Continue),
+            }
         }
         (KeyCode::Char('l'), true) => {
             app.entries.clear();
@@ -967,6 +1072,8 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
 
     let hint = if app.quit {
         "leaving…".to_string()
+    } else if let Some(gesture) = app.escape_hint() {
+        gesture
     } else if !app.mouse {
         // A released mouse is a mode the reader has to remember: the gestures
         // they just used no longer do anything, and the terminal's do.
@@ -977,9 +1084,12 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
             "viewing older entries · {back} {lines} back · ↑↓ scroll · End bottom · Home top · ^C quit"
         )
     } else if app.gcode {
-        "g-code mode · Enter send · ^G request mode · .gcode · ^C quit".to_string()
+        "g-code mode · Enter send · ^G request mode · .gcode · Esc×3 stop · ^C quit".to_string()
     } else {
-        "Enter send · ↑↓ history · PgUp/PgDn/Home/End log · ^↑/^↓ line · ^G g-code · .help · ^C quit"
+        // Kept inside 100 columns (the footer is one line and truncates): the
+        // two gestures that no longer fit here (^↑/^↓ line, and what Esc×3
+        // means next to plain Esc) are spelled out in `.help`.
+        "Enter send · ↑↓ history · PgUp/PgDn/Home/End log · ^G g-code · Esc×3 stop · .help · ^C quit"
             .to_string()
     };
     frame.render_widget(
@@ -1667,6 +1777,65 @@ mod tests {
                 .any(|row| row.contains("! 3 (gcode/script) Printer is halted")),
             "{rows:?}"
         );
+    }
+
+    #[test]
+    fn test_three_escapes_in_a_row_are_the_emergency_stop() {
+        let mut app = App::new();
+        let start = tokio::time::Instant::now();
+        assert_eq!(app.escape(start), Escape::Wait);
+        assert_eq!(app.escape(start + Duration::from_millis(100)), Escape::Wait);
+        assert_eq!(
+            app.escape(start + Duration::from_millis(200)),
+            Escape::Stop,
+            "three presses inside the window stop the printer"
+        );
+        // The gesture is spent: a fourth press starts over rather than stopping
+        // the printer a second time.
+        assert_eq!(app.escape(start + Duration::from_millis(300)), Escape::Wait);
+    }
+
+    #[test]
+    fn test_a_lone_escape_leaves_when_the_window_closes() {
+        let mut app = App::new();
+        let start = tokio::time::Instant::now();
+        assert_eq!(app.escape(start), Escape::Wait);
+        assert!(
+            !app.escape_window_closed(start + Duration::from_millis(100)),
+            "still inside the window: the user may be starting the gesture"
+        );
+        assert!(
+            app.escape_window_closed(start + ESTOP_WINDOW),
+            "a press the gesture never followed up on means leave"
+        );
+        // Nothing is pending afterwards, so a closed window does not keep
+        // asking to leave.
+        assert!(!app.escape_window_closed(start + ESTOP_WINDOW + Duration::from_millis(1)));
+    }
+
+    #[test]
+    fn test_escapes_spread_out_are_not_a_stop() {
+        let mut app = App::new();
+        let start = tokio::time::Instant::now();
+        // Each press is a new gesture: the streak never reaches three.
+        assert_eq!(app.escape(start), Escape::Wait);
+        assert_eq!(app.escape(start + ESTOP_WINDOW), Escape::Wait);
+        assert_eq!(app.escape(start + ESTOP_WINDOW * 2), Escape::Wait);
+    }
+
+    #[test]
+    fn test_the_hint_counts_the_emergency_stop_gesture() {
+        let mut app = App::new();
+        assert_eq!(app.escape_hint(), None, "nothing pending: no hint");
+        let start = tokio::time::Instant::now();
+        assert_eq!(app.escape(start), Escape::Wait);
+        let first = app.escape_hint().expect("a press is pending");
+        assert!(first.contains("1/3"), "{first}");
+        assert_eq!(app.escape(start + Duration::from_millis(50)), Escape::Wait);
+        let second = app.escape_hint().expect("two presses are pending");
+        assert!(second.contains("2/3"), "{second}");
+        assert_eq!(app.escape(start + Duration::from_millis(100)), Escape::Stop);
+        assert_eq!(app.escape_hint(), None, "the stop ends the gesture");
     }
 
     #[test]

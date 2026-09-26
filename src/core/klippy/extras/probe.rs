@@ -804,8 +804,17 @@ pub(crate) fn lookup_probe_session(printer: &Printer) -> Option<Arc<dyn ProbeSes
     if let Some(probe) = printer.lookup_object_as::<PrinterProbe>(PROBE_OBJECT) {
         return Some(probe as Arc<dyn ProbeSession>);
     }
+    if let Some(probe) =
+        printer.lookup_object_as::<probe_eddy_current::PrinterEddyProbe>(PROBE_OBJECT)
+    {
+        return Some(probe as Arc<dyn ProbeSession>);
+    }
+    // `[load_cell_probe]` registers the same `probe` object
+    // (`LoadCellPrinterProbe`).
     printer
-        .lookup_object_as::<probe_eddy_current::PrinterEddyProbe>(PROBE_OBJECT)
+        .lookup_object_as::<crate::core::klippy::extras::load_cell_probe::LoadCellProbe>(
+            PROBE_OBJECT,
+        )
         .map(|probe| probe as Arc<dyn ProbeSession>)
 }
 

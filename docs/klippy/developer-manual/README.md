@@ -297,7 +297,7 @@ identify 的命令**定义**（名称、参数、解码）与其它命令一样�
 | `sdcard_loop.rs` | `[sdcard_loop]` 裸段：`SDCARD_LOOP_*` 三命令的栈/索引语义已单测钉住（`sdcard_loop.py:72`），命令本身未注册（H4） |
 | `servo.rs` | `[servo <name>]` 舵机段（脉宽几何全选项）+ `SET_SERVO`（mux 键 `SERVO=`，`servo.py`）；无打印时序排程（同 pwm_tool 口径） |
 | `idex_modes.rs` | `[dual_carriage]` 段（late/order=55）+ **generic 路径**（批 #12：`register_generic` 收各滑架 `position_endstop`、`GenericDualCarriages` 对象、`Shared` 按滑架记帧；`HomingHomeRailsEnd` 上把该轴各滑架帧记到各自 endstop＝上游 `DualCarriages.home`）+ 三命令两路注册；`CARRIAGE` 先名字、`0/1` 仅恰 2 滑架回退；步进不驱动（C1） |
-| `carriage.rs` | `[carriage <name>]`/`[dual_carriage <name>]`/`[extra_carriage <name>]`/`[stepper <name>]` 装载与 generic_cartesian 运动学接线（批 #12）；`build()` 接收 `[printer]` 的 `max_z_velocity/max_z_accel`（原写死 0 即 Z 归零零长 drip 不 fire 的首因）；`CarriageModel` 管滑架/电机/位姿帧 |
+| `carriage.rs` | `[carriage <name>]`/`[dual_carriage <name>]`/`[extra_carriage <name>]`/`[stepper <name>]` 装载与 generic_cartesian 运动学接线（批 #12）；`build()` 接收 `[printer]` 的 `max_z_velocity/max_z_accel`（原写死 0 即 Z 归零零长 drip 不 fire 的首因）；`CarriageModel` 管滑架/电机/位姿帧；批 #27：`[dual_carriage]` 的 `primary_carriage` 是**可选**（无它即该轴的主动滑架：`axis` 必填、无 `safe_distance`），同主滑架两个 dual 按**主滑架名**（非轴）判重；`idex` 的 `dc_rails` 顺序为「主动滑架 + 从动滑架」 |
 | `probe_eddy_current.rs` | eddy 探针对象（约1600行，`[probe_eddy_current <名>]` 工厂，批 #3）：`load_config_prefix` + `PROBE`/`QUERY_PROBE`/`PROBE_ACCURACY` 复用 + `PROBE_EDDY_CURRENT_TAP_CALIBRATE` tap 标定 + 采样点/虚拟端停接 `McuTriggerAnalog`（样本流=ldc1612+bulk_sensor）；静态标定与 `Z_OFFSET_APPLY_PROBE` 未实现（残差注记显式报错），tap 分析依赖 `mcu_to_commanded_position`（fileoutput 路径同上游走哑数据） |
 | `delta_calibrate.rs` | `[delta_calibrate]` 与 `DELTA_CALIBRATE`/`DELTA_ANALYZE`：测量几何 + coordinate descent 拟合（`delta_calibrate.py`，批 #5）；`manual_probe` 消费、SAVE_CONFIG 待写行 |
 | `input_shaper.rs` + `shaper_defs.rs` | `[input_shaper]` 与 `SET_INPUT_SHAPER`：整形系数表与上游 `shaper_defs.py` 逐位对齐（wave-2）；**系数未接步进生成**（gap，`recompute_scan_windows` 为显式 no-op） |
@@ -309,7 +309,7 @@ identify 的命令**定义**（名称、参数、解码）与其它命令一样�
 | `fan_generic.rs` | `[fan_generic <name>]`：全部选项交给 `Fan` 核心（`shutdown_speed` 默认 **0.0**），注册 mux 命令 `SET_FAN_SPEED FAN=<name>`；`TEMPLATE=` 分支明确拒绝（模板求值器未实现，批 #18） |
 | `safe_z_home.rs` | `[safe_z_home]`：接管 G28（Z-hop → 按需 `X0 Y0` → 安全位 → `Z0`）；`section!(order = 70, phase = late)` **必须晚于 toolhead（`printer`，order 60 late）**，否则 `unregister_command("G28")` 得 `None`；与 `[homing_override]` 互斥（批 #6） |
 | `manual_stepper.rs` + `force_move.rs` | `[manual_stepper <name>]` 与 `MANUAL_STEPPER`（含 `GCODE_AXIS` 动态注册/注销 extra axis）；`force_move.rs` 目前只含 `calc_move_time`（归属对齐上游）（批 #6） |
-| `display/{mod,display,st7920,hd44780,uc1701,ssd1306}.rs` + vendored `display.cfg` | `[display]` 框架与四驱动（批 #7+#13）；**storage-only**（不渲染、菜单未实现，见 config 手册的 gap）；`display_status` 的 `M73`/`M117`/`SET_DISPLAY_TEXT` 批 #7 落地 |
+| `display/{mod,display,st7920,hd44780,uc1701,ssd1306,aip31068_spi}.rs` + vendored `display.cfg` | `[display]` 框架与五驱动（批 #7+#13+#28）；**storage-only**（不渲染、菜单未实现，见 config 手册的 gap）；`display_status` 的 `M73`/`M117`/`SET_DISPLAY_TEXT` 批 #7 落地 |
 | `hx71x.rs` + `load_cell.rs` + `cmd/hx71x.rs` | `[load_cell]` 节与 HX711/HX717 驱动（批 #14，走 LC-1 的 `with_format("<i",…)` 接缝）；ads1220/ads131m0x、`load_cell_probe`、四条 `LOAD_CELL_*` 实现待后续单元 |
 | `tmc.rs` + `tmc_uart.rs` + `tmc2208.rs` + `tmc2209.rs` | TMC UART 驱动族（批 #7）：单一 `TmcDriver` + `TmcTransport` trait + 表驱动；虚拟端停用装饰器实现；SPI 驱动与 `tmc2130`/`tmc2660`/`tmc5160`/`tmc2240` 待做 |
 | `board_pins.rs` | `[board_pins]` / `[board_pins <name>]`：读 `mcu` 列表与 `aliases` / `aliases_*`（`名=引脚`，值写成 `<...>` 则保留），调用 `PrinterPins::alias_pin` / `reserve_pin`。对象不可查询 |
@@ -327,6 +327,7 @@ identify 的命令**定义**（名称、参数、解码）与其它命令一样�
 | `temperature_sensor.rs` | `[temperature_sensor <name>]`：读 `sensor_type`（交给 `heaters` 查工厂）与 `min_temp` / `max_temp`，`get_status` 报 `temperature` / `measured_min_temp` / `measured_max_temp` |
 | `temperature_mcu.rs` | 传感器工厂 `temperature_mcu`：MCU 自带的 ADC 温度通道（`cmd/debug.rs` 的 `debug_read` 读寄存器），标定数据在内 |
 | `temperature_combined.rs` | 传感器工厂 `temperature_combined`：把多个传感器合成一个（上游同名），周期定时器在阈值越界时报警 |
+| `multi_pin.rs` | `[multi_pin <name>]`（**`phase = early`**）：`pins`（必填、逗号分隔）把调用扇出到多个真实 pin；节名注册为虚拟 pin chip（重复注册的 `DuplicateChip` 吞掉），`multi_pin:<name>` 作为 lookup 值；`update_pwm` 等逐子 pin 转发，`next_aligned_clock` 原样返回（批 #26） |
 | `spi_temperature.rs` | 传感器工厂 `MAX6675` / `MAX31855` / `MAX31856` / `MAX31865`：SPI 热电偶/RTD，经 `cmd/thermocouple.rs` |
 | `ad5206.rs` | `[ad5206 <name>]` 数字电位器（6 通道，SPI mode 0 @ 25 MHz，`enable_pin` 作 CS）：`scale`（默认 1.0、`above=0.`）与 `channel_1..6`（`minval=0.`、`maxval=scale`），写值 `int(val*256/scale+.5)`；写入经 MCU post-init 回调在 bring-up 时发出（批 #16） |
 | `mcp4451.rs` | `[mcp4451 <name>]` I2C 数字电位器（4 路）：`i2c_address` 必填且**仅 44..47**（否则 `mcp4451 address must be between 44 and 47`）、`scale`（默认 1.0）、`wiper_0..3`；先无条件写 `[0x40,0xff]`/`[0xa0,0xff]`，再按 `WiperRegisters=[0,1,6,7]` 写 `int(val*255/scale+.5)`；装载期写经 post-init 回调 spawn 异步 `i2c.write`（批 #25） |
@@ -345,7 +346,7 @@ identify 的命令**定义**（名称、参数、解码）与其它命令一样�
 | `bus_debug.rs` | `i2c_device` / `spi_device` 共用的调试命令底座：同步→异步桥与 `DATA=` 的十六进制编解码（无配置节） |
 | `error_mcu.rs` | MCU 停机消息的展开（无配置节，第一个 `[mcu]` 拉起）：监听 `klippy:shutdown` / `klippy:analyze_shutdown`，把简短原因扩成原因+提示（上游 `extras/error_mcu.py`） |
 
-`extras/` 的 84 个模块（83 `pub mod` + `pub(crate) bus_debug`）全部在 `extras/mod.rs` 声明；其中 64 个文件注册了 79 个 `section!`（含 `printer`，声明在 `toolhead.rs`；`mcu` 声明在 `mcu/mod.rs` 且同时声明普通与 prefix 两种形式，共 80 个装载 id）构成工厂表；`heaters` / `gcode_move` / `query_endstops` / `error_mcu` / `bus_debug` 等非节模块由上述模块按需 `ensure`，不占配置节。
+`extras/` 的 85 个模块（84 `pub mod` + `pub(crate) bus_debug`）全部在 `extras/mod.rs` 声明；其中 65 个文件注册了 80 个 `section!`（含 `printer`，声明在 `toolhead.rs`；`mcu` 声明在 `mcu/mod.rs` 且同时声明普通与 prefix 两种形式，共 81 个装载 id）构成工厂表；`heaters` / `gcode_move` / `query_endstops` / `error_mcu` / `bus_debug` 等非节模块由上述模块按需 `ensure`，不占配置节。
 
 ### `api/` — 客户端 API 层
 

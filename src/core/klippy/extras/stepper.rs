@@ -97,6 +97,17 @@ section!(
 section!("stepper_a", order = 50, phase = late, load = load_config);
 section!("stepper_b", order = 50, phase = late, load = load_config);
 section!("stepper_c", order = 50, phase = late, load = load_config);
+// The deltesian sections (`kinematics/deltesian.py:15-17`): two arm rails (no
+// `position_max`; `stepper_right` inherits `stepper_left`'s endstop) and the
+// straight Y rail. Same phase/order as the other steppers: all must exist
+// before `[printer]` (order=60) claims them.
+section!("stepper_left", order = 50, phase = late, load = load_config);
+section!(
+    "stepper_right",
+    order = 50,
+    phase = late,
+    load = load_config
+);
 
 /// The default pulse width upstream uses when the option is absent
 /// (`klippy/stepper.py:80`).
@@ -837,6 +848,14 @@ pub(crate) fn load_config(
         Some("a" | "b" | "c") => RailGeometry::DeltaTower {
             default_position_endstop: tower_default_endstop(config)?,
         },
+        // The deltesian arms are rails too; the right arm falls back on the
+        // left's endstop (`deltesian.py:17-21`).
+        Some("left") => RailGeometry::DeltaTower {
+            default_position_endstop: None,
+        },
+        Some("right") => RailGeometry::DeltaTower {
+            default_position_endstop: deltesian_arm_default_endstop(config)?,
+        },
         _ => RailGeometry::Axis,
     };
     Ok(Arc::new(PrinterStepper::with_geometry(
@@ -861,6 +880,22 @@ fn tower_default_endstop(config: &ConfigWrapper) -> Result<Option<f64>, ConfigEr
     let primary = config.sibling("stepper_a").ok_or_else(|| {
         ConfigError::new(format!(
             "Section '{}' needs a '[stepper_a]' section",
+            config.identifier()
+        ))
+    })?;
+    primary.get_float("position_endstop", None).map(Some)
+}
+
+/// The endstop a deltesian right arm falls back on: `stepper_left`'s
+/// `position_endstop` (`deltesian.py:18-21`, `default_position_endstop=def_pos_es`).
+///
+/// # Errors
+/// When `stepper_left` is missing while `stepper_right` needs the default —
+/// the same config error `stepper_left`'s own load raises first.
+fn deltesian_arm_default_endstop(config: &ConfigWrapper) -> Result<Option<f64>, ConfigError> {
+    let primary = config.sibling("stepper_left").ok_or_else(|| {
+        ConfigError::new(format!(
+            "Section '{}' needs a '[stepper_left]' section",
             config.identifier()
         ))
     })?;
@@ -960,6 +995,10 @@ fn axis_from_name(identifier: &str) -> Result<Axis, ConfigError> {
         Some("x" | "a") => Ok(Axis::X),
         Some("y" | "b") => Ok(Axis::Y),
         Some("z" | "c") => Ok(Axis::Z),
+        // The deltesian arms: the labels are inert (the deltesian kinematics
+        // installs their solvers at load), they only have to map to something.
+        Some("left") => Ok(Axis::X),
+        Some("right") => Ok(Axis::Y),
         _ => Err(ConfigError::new(format!(
             "Unable to map section '{identifier}' to a cartesian axis"
         ))),

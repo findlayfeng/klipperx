@@ -225,6 +225,7 @@ mod tests {
             "polar",
             "delta",
             "rotary_delta",
+            "deltesian",
         ];
 
         let mut gap_frequency: BTreeMap<String, usize> = BTreeMap::new();
@@ -989,6 +990,43 @@ mod tests {
         let gcode = outcome.expect(
             "generic-cartesian homing finishes instead of waiting on a trsync that never fires",
         );
+        assert!(gcode.is_ok(), "{gcode:?}");
+    }
+
+    /// `printers.test`'s deltesian example, bounded end to end: the config must
+    /// load (the `Error loading kinematics 'deltesian'` first cause is gone),
+    /// the machine come up, `G28` split into its arm group + Y move, and the
+    /// whole shared `move.gcode` run.
+    ///
+    /// Skipped when the `atmega2560` dictionary was not built.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_corpus_deltesian_config_homes_and_moves() {
+        let Some(dict) = dictionary_path("atmega2560.dict") else {
+            return;
+        };
+        let run = all_runs()
+            .into_iter()
+            .find(|run| {
+                run.config
+                    .file_name()
+                    .map(|name| name == "example-deltesian.cfg")
+                    .unwrap_or(false)
+            })
+            .expect("the corpus carries example-deltesian.cfg");
+        let script = std::fs::read_to_string(
+            run.gcode_file
+                .as_ref()
+                .expect("the deltesian run uses move.gcode"),
+        )
+        .expect("move.gcode is readable");
+        let config = injected_config(&run.config, &[(None, dict)]).expect("deltesian.cfg parses");
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            run_phases(&config, "example-deltesian.cfg", &script),
+        )
+        .await;
+        let gcode = outcome.expect("deltesian homing and the move script finish inside the bound");
         assert!(gcode.is_ok(), "{gcode:?}");
     }
 

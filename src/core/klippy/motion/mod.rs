@@ -19,6 +19,7 @@
 //! wire) and the kinematics trait are FW5e; nothing here talks to an MCU.
 
 pub mod delta;
+pub mod deltesian;
 pub mod extra;
 pub mod generic_cartesian;
 pub mod itersolve;
@@ -37,8 +38,8 @@ pub use itersolve::{
     corexz_active_flags, corexz_position_fn, extruder_position_fn, Axis, AxisFlags, StepKinematics,
 };
 pub use kinematics::{
-    CartesianKinematics, CartesianTransform, HomeCoord, Homing, HomingHandle, HomingInfo,
-    HomingState, Kinematics, KinematicsCalibration, MoveContext, NoneKinematics,
+    CartesianKinematics, CartesianTransform, DeltesianHome, HomeCoord, Homing, HomingHandle,
+    HomingInfo, HomingState, Kinematics, KinematicsCalibration, MoveContext, NoneKinematics,
 };
 pub use plan::{LookAheadQueue, Move, MoveLimits};
 pub use queuing::MotionQueuing;

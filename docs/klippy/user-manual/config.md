@@ -927,6 +927,16 @@ Z 端停来源：`[stepper_z]`，否则 `[carriage <名>]` 中 axis 为 z 者；
 
 gap（如实登记）：**屏幕内容不渲染**（`display_template`/`display_data`/`display_glyph` 只解析+存储；刷新只 clear/flush）；**菜单未实现**（无 `menu` 对象、无 `menu:*` 事件、不装载 `menu.cfg`）；随模块发布的 `display.cfg` 为 **vendored 副本**（有漂移守卫测试）。
 
+### `[ad5206 <name>]` — 数字电位器（批 #16）
+
+| 选项 | 默认 | 说明 |
+|------|------|------|
+| `enable_pin` | —（必填） | SPI 片选（mode 0、默认速率 25 MHz） |
+| `scale` | `1.0` | 满量程参考，`above=0.` |
+| `channel_1` … `channel_6` | — | 各通道目标值（`minval=0.`、`maxval=scale`）；给出即换算 `int(val*256/scale+.5)` 写入寄存器 `n-1`，未给的通道不写 |
+
+写入在 bring-up 时经 MCU post-init 回调发出（装载期 SPI oid 尚未建立）。语料里写作 `[ad5206 stepper_digipot]`。
+
 ### `[load_cell]` — 称重传感器（hx711/hx717 可用，批 #14）
 
 | 选项 | 默认 | 说明 |

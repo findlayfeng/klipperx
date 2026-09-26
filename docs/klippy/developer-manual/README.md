@@ -324,6 +324,7 @@ identify 的命令**定义**（名称、参数、解码）与其它命令一样�
 | `temperature_mcu.rs` | 传感器工厂 `temperature_mcu`：MCU 自带的 ADC 温度通道（`cmd/debug.rs` 的 `debug_read` 读寄存器），标定数据在内 |
 | `temperature_combined.rs` | 传感器工厂 `temperature_combined`：把多个传感器合成一个（上游同名），周期定时器在阈值越界时报警 |
 | `spi_temperature.rs` | 传感器工厂 `MAX6675` / `MAX31855` / `MAX31856` / `MAX31865`：SPI 热电偶/RTD，经 `cmd/thermocouple.rs` |
+| `ad5206.rs` | `[ad5206 <name>]` 数字电位器（6 通道，SPI mode 0 @ 25 MHz，`enable_pin` 作 CS）：`scale`（默认 1.0、`above=0.`）与 `channel_1..6`（`minval=0.`、`maxval=scale`），写值 `int(val*256/scale+.5)`；写入经 MCU post-init 回调在 bring-up 时发出（批 #16） |
 | `ds18b20.rs` | 传感器工厂 `DS18B20`：1-wire 温度传感器，读 `serial_no` / `sensor_mcu` / `ds18_report_time`，周期查询经 `cmd/ds18b20.rs` |
 | `fan.rs` | `[fan]`：读 `pin` / `max_power` / `kick_start_time` / `off_below` / `cycle_time` / `hardware_pwm` / `shutdown_speed` / 可选 `enable_pin`；`tachometer_pin` 已接通（批 #8：读 `tachometer_ppr`/`tachometer_poll_interval`，报 `rpm`），注册 `M106` / `M107`；`call_later` 做 kick-start |
 | `pulse_counter.rs` | `tachometer_pin` 频率计数（批 #8，上游 `pulse_counter.py` 无 section、不进工厂表）：`config_counter`/`query_counter` 装载、`counter_state` 按 oid 路由，`rpm` = Δcount/Δtime 换算 |
@@ -338,7 +339,7 @@ identify 的命令**定义**（名称、参数、解码）与其它命令一样�
 | `bus_debug.rs` | `i2c_device` / `spi_device` 共用的调试命令底座：同步→异步桥与 `DATA=` 的十六进制编解码（无配置节） |
 | `error_mcu.rs` | MCU 停机消息的展开（无配置节，第一个 `[mcu]` 拉起）：监听 `klippy:shutdown` / `klippy:analyze_shutdown`，把简短原因扩成原因+提示（上游 `extras/error_mcu.py`） |
 
-`extras/` 的 77 个模块（76 `pub mod` + `pub(crate) bus_debug`）全部在 `extras/mod.rs` 声明；其中 58 个文件注册了 73 个 `section!`（含 `printer`，声明在 `toolhead.rs`；`mcu` 声明在 `mcu/mod.rs` 且同时声明普通与 prefix 两种形式，共 74 个装载 id）构成工厂表；`heaters` / `gcode_move` / `query_endstops` / `error_mcu` / `bus_debug` 等非节模块由上述模块按需 `ensure`，不占配置节。
+`extras/` 的 78 个模块（77 `pub mod` + `pub(crate) bus_debug`）全部在 `extras/mod.rs` 声明；其中 59 个文件注册了 74 个 `section!`（含 `printer`，声明在 `toolhead.rs`；`mcu` 声明在 `mcu/mod.rs` 且同时声明普通与 prefix 两种形式，共 75 个装载 id）构成工厂表；`heaters` / `gcode_move` / `query_endstops` / `error_mcu` / `bus_debug` 等非节模块由上述模块按需 `ensure`，不占配置节。
 
 ### `api/` — 客户端 API 层
 

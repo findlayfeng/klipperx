@@ -336,6 +336,7 @@ git config core.hooksPath .githooks
 | `static_digital_output.rs` | 每个引脚都被预留、取反的引脚有记录、缺 `pins` 报错 |
 | `adc_temperature.rs` | 线性插值正反向、热敏电阻 Steinhart-Hart 与 Beta 模型（与上游公式对拍） |
 | `spi_temperature.rs` | MAX6675/MAX31855 转换、符号位负温、MAX31856 与 MAX31865 转换 |
+| `extras/ad5206.rs`（批 #16，7 测） | `enable_pin` 作 CS 的 SPI mode 0 / 25 MHz 默认、`scale` 默认 1.0 与 `above=0.` 越界文案、`channel_1..6` 的 `minval=0.`/`maxval=scale` 文案、`int(val*256/scale+.5)` 换算（含 scale 顶值与未给通道跳过）、写入顺序与 bring-up 后经 post-init 回调发出 |
 | `temperature_mcu.rs` | 单点直线、两点标定、手动标定读上游选项（`temperature_sensor` 节上的标定点） |
 | `temperature_combined.rs` | 三种合并方式（`min`/`max`/`mean`）与舍入 |
 | `bus_debug.rs` | `DATA=` 十六进制往返（`test_hex_round_trips`） |

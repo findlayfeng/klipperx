@@ -313,7 +313,7 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 是「对应 `.test` 从 `IGNORED` 移除后通过」**，不是「某个错误不再出现」。详见
 [失败原因分析复盘](docs/work-log/2026-09-22-upstream-regression-failures.md#复盘计数口径与重排后补)。
 
-**当前失败原因统计**（`KLIPPERX_UPSTREAM_ALL=1` 实跑，2026-09-25（批 #13 合入后）：**56 次失败**、181 次通过、
+**当前失败原因统计**（`KLIPPERX_UPSTREAM_ALL=1` 实跑，2026-09-25（批 #16 合入后）：**44 次失败**、193 次通过、
 2 条因未构建 `pru` 字典不计，合计 239；下表为**选项名大小写修复后**的分布——49 次
 `must be specified` 归零但总数不变、首因整体后移，见[复盘](docs/work-log/2026-09-22-upstream-regression-failures.md#复盘计数口径与重排后补)
 的「收益不可加」）：
@@ -330,7 +330,7 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 | `Section 'filament_switch_sensor …'` 等 | 8 | H7 |
 | `sensor_pin: … 'vref_scaled'`（`adc_scaled`） | 4 | H1 |
 | H9 其余（`bed_mesh` 6、`safe_z_home` 4、`bed_screws` 3、`quad_gantry_level` 2、`z_tilt`/`endstop_phase` 各 1） | 17 | H9 |
-| 板级扩展 section（`mcp4451`/`dac084s085`/`ad5206`/`multi_pin`/`sx1509_duex`/`replicape`） | 8 | H2 / H7 |
+| 板级扩展 section（`mcp4451`/`dac084s085`/`multi_pin`/`sx1509_duex`/`replicape`） | 7 | H2 / H7（`ad5206` 7 处已随批 #16 转绿） |
 | `Option 'tachometer_pin' … pulse_counter` | **0** | F9 / H7 已消（批 #8，2 run 实测 `run_case OK`） |
 | `Section 'extruder_stepper …'` | 2 | H10 |
 | `Section 'verify_heater …'` | 2 | H1 |
@@ -374,7 +374,7 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
       `tmc2130_stepper_x` 3）。依赖 H5（TMC）。
 - [ ] **T9. 其余 extras 段**（2026-09-23 选项大小写修复后实跑的散项，按域归入 H1–H10）：`display`（21，H8）、
       `filament_switch_sensor`（8，H7）、`adc_scaled`/`vref_scaled`（4，H1）、板级扩展
-      （`mcp4451` 2 + `dac084s085` 2 + `ad5206`/`multi_pin`/`sx1509_duex`/`replicape` 各 1，H2/H7）、
+      （`mcp4451` 2 + `dac084s085` 2 + `multi_pin`/`sx1509_duex`/`replicape` 各 1，H2/H7；`ad5206` 已随批 #16 转绿）、
       `bed_screws`（3，H9）、`dual_carriage`/`safe_z_home`/`gcode_macro`（各 2），以及 `virtual_sdcard`/
       `exclude_object`/`gcode_arcs`/`manual_stepper`/`pwm_cycle_time`/`led`/`input_shaper`/`temperature_fan`/
       `fan_generic`/`controller_fan`（各 1）。`static_digital_output` 已在阶段 0 落地，`stepper_z1`（多轴）已由
@@ -409,7 +409,7 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 - [ ] **引用（拆分、拍板点与依赖以笔记为准）**：[H2 动工前调查](docs/work-log/2026-09-23-h2-notes.md)
   ——上游 21 个文件的依赖盘点、H2-1…H2-7 拆分与四个拍板点。余项：`pwm_tool.py`（队列化 PWM，随运动）、
   `pwm_cycle_time.py`、`static_pwm_clock.py`、`multi_pin.py`、`servo.py`、`duplicate_pin_override.py`、
-  板级扩展（`mcp4451`/`dac084s085`/`ad5206`/`sx1509`/`replicape`）；失败统计里的 `heater_fan`/`controller_fan`
+  板级扩展（`mcp4451`/`dac084s085`/`sx1509`/`replicape`）；失败统计里的 `heater_fan`/`controller_fan`
   归本域。
 
 ### H3 G-Code 宏与脚本

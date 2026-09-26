@@ -245,7 +245,7 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 ### C1 运动层收尾
 
 - [ ] **引用（细节以笔记为准）**：[C1 动工前调查](docs/work-log/2026-09-22-c1-notes.md)——架构取舍、
-  单轴链推广方案与已落地项的证据都在那边。余项：**C1c-2 `delta` 族**余 `rotary_delta`/`deltesian`/`winch`（`delta` 本体 ✅ 2026-09-24 批 #5，`mathutil` 的 `trilateration`/`gaussian_solve` 已到位）、**C1c-3
+  单轴链推广方案与已落地项的证据都在那边。余项：**C1c-2 `delta` 族**余 `deltesian`/`winch`（`delta` 本体 ✅ 批 #5、`rotary_delta` ✅ 批 #40，`mathutil` 的 `trilateration`/`gaussian_solve` 已到位）、**C1c-3
   `generic_cartesian`**、**C1c-4 `polar`** ✅（2026-09-24 批 #5）、**C1d print-time 回调**
   （`ToolHead::register_lookahead_callback` + `motion_queuing.register_flush_callback`）。
 
@@ -324,7 +324,7 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 | 选项名大小写（`optionxform`） | **0** | 已对齐（49 → 0） |
 | `Unknown pin chip name 'probe'`（仅剩 `eddy`——`probe_eddy_current` 属 M5） | 1 | T4 / H9（M5） |
 | TMC：段 23 + pin chip 7 | 30 | T6 / H5 |
-| `Error loading kinematics`（delta / generic_cartesian / rotary_delta / polar / winch / deltesian） | 21 | T5（C1c-2/3/4） |
+| `Error loading kinematics`（deltesian / winch 为余项；delta / generic_cartesian / rotary_delta / polar 已落地） | 2 | T5（C1c-2/3/4）（批 #5/#12/#40 已消其余） |
 | `Section 'display'` | 21 | T9 / H8 |
 | `Section 'heater_fan …'` | 27 | H2-3 |
 | `Section 'filament_switch_sensor …'` 等 | 8 | H7 |

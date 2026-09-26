@@ -36,7 +36,7 @@ use serde_json::{json, Value};
 use tracing::info;
 
 use super::itersolve::{AxisFlags, PositionFn};
-use super::kinematics::{HomingState, Kinematics, MoveContext, UnifiedHome};
+use super::kinematics::{HomingState, Kinematics, KinematicsCalibration, MoveContext, UnifiedHome};
 use super::trapq::MoveSegment;
 use crate::core::klippy::config::ConfigError;
 use crate::core::klippy::gcode::CommandError;
@@ -59,7 +59,7 @@ pub const DELTA_RAIL_NAMES: [&str; 3] = ["stepper_a", "stepper_b", "stepper_c"];
 ///
 /// Parameters ride the bound [`PositionFn`]: `[arm2, tower_x, tower_y]`.
 pub fn delta_position_fn(arm2: f64, tower_x: f64, tower_y: f64) -> PositionFn {
-    PositionFn::bind(delta_calc_position, [arm2, tower_x, tower_y])
+    PositionFn::bind(delta_calc_position, [arm2, tower_x, tower_y, 0.0, 0.0, 0.0])
 }
 
 /// The solver body: `sqrt(arm2 - dx² - dy²) + z` (`kin_delta.c:17-24`).
@@ -67,7 +67,7 @@ pub fn delta_position_fn(arm2: f64, tower_x: f64, tower_y: f64) -> PositionFn {
 /// A position outside the arm's reach takes the square root of a negative
 /// number and yields `NaN`, which the step search treats as "no solution";
 /// upstream's `check_move` keeps moves inside the envelope so the two agree.
-fn delta_calc_position(segment: &MoveSegment, move_time: f64, params: &[f64; 3]) -> f64 {
+fn delta_calc_position(segment: &MoveSegment, move_time: f64, params: &[f64; 6]) -> f64 {
     let coord = segment.coord(move_time);
     let dx = params[1] - coord.x();
     let dy = params[2] - coord.y();
@@ -90,7 +90,7 @@ pub fn delta_active_flags() -> AxisFlags {
 /// `None` when the geometry has no real intersection (a square root of a
 /// negative number, where upstream raises `ValueError`); every caller maps
 /// that to its own "cannot compute" answer.
-fn trilateration(sphere_coords: [[f64; 3]; 3], radius2: [f64; 3]) -> Option<[f64; 3]> {
+pub(super) fn trilateration(sphere_coords: [[f64; 3]; 3], radius2: [f64; 3]) -> Option<[f64; 3]> {
     let [c1, c2, c3] = sphere_coords;
     let sub = |a: [f64; 3], b: [f64; 3]| [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
     let mul = |a: [f64; 3], k: f64| [a[0] * k, a[1] * k, a[2] * k];
@@ -635,8 +635,8 @@ impl Kinematics for DeltaKinematics {
         })
     }
 
-    fn delta_calibration(&self) -> Option<DeltaCalibration> {
-        Some(self.cal.clone())
+    fn delta_calibration(&self) -> Option<KinematicsCalibration> {
+        Some(KinematicsCalibration::Linear(self.cal.clone()))
     }
 }
 

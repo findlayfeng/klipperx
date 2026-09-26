@@ -40,7 +40,7 @@ use crate::core::klippy::gcode::{
 };
 use crate::core::klippy::load::section;
 use crate::core::klippy::mathutil::{coordinate_descent, Coord};
-use crate::core::klippy::motion::delta::DeltaCalibration;
+use crate::core::klippy::motion::KinematicsCalibration;
 use crate::core::klippy::printer::{ConnectFuture, Printer, PrinterObject};
 
 section!("delta_calibrate", order = 30, load = load_config);
@@ -281,7 +281,7 @@ impl DeltaCalibrate {
     fn calibration(
         &self,
         toolhead: &Arc<ToolHeadObject>,
-    ) -> Result<DeltaCalibration, CommandError> {
+    ) -> Result<KinematicsCalibration, CommandError> {
         toolhead
             .delta_calibration()
             .ok_or_else(|| CommandError::new("Delta calibrate is only for delta printers"))
@@ -321,7 +321,7 @@ impl DeltaCalibrate {
              Initial delta_calibrate parameters: {params:?}"
         );
         coordinate_descent(&mut params, |values| {
-            let trial = DeltaCalibration::from_descent_params(&original, values, extended);
+            let trial = original.new_calibration(values, extended);
             let mut total_error = 0.0;
             for (z_offset, stable) in &height_positions {
                 let Some(position) = trial.get_position_from_stable(*stable) else {
@@ -349,7 +349,7 @@ impl DeltaCalibrate {
                 FIT_IMPOSSIBLE
             }
         });
-        let new_calibration = DeltaCalibration::from_descent_params(&original, &params, extended);
+        let new_calibration = original.new_calibration(&params, extended);
         info!("Calculated delta_calibrate parameters: {params:?}");
 
         self.save_state(probe_positions, distances, &new_calibration)?;
@@ -366,7 +366,7 @@ impl DeltaCalibrate {
         &self,
         probe_positions: &[HeightPosition],
         distances: &[Distance],
-        calibration: &DeltaCalibration,
+        calibration: &KinematicsCalibration,
     ) -> Result<(), CommandError> {
         let printer = self
             .printer
@@ -376,46 +376,12 @@ impl DeltaCalibrate {
             .lookup_object_as::<PrinterConfig>(CONFIGFILE_OBJECT)
             .ok_or_else(|| CommandError::new("Printer is not ready"))?;
 
-        // The delta parameters (`DeltaCalibration.save_state`).
-        configfile.set(
-            "printer",
-            "delta_radius",
-            &format!("{:.6}", calibration.radius),
-        );
-        for (index, axis) in ['a', 'b', 'c'].into_iter().enumerate() {
-            let section = format!("stepper_{axis}");
-            configfile.set(
-                &section,
-                "angle",
-                &format!("{:.6}", calibration.angles[index]),
-            );
-            configfile.set(
-                &section,
-                "arm_length",
-                &format!("{:.6}", calibration.arms[index]),
-            );
-            configfile.set(
-                &section,
-                "position_endstop",
-                &format!("{:.6}", calibration.endstops[index]),
-            );
+        // The delta parameters (`DeltaCalibration.save_state` /
+        // `RotaryDeltaCalibration.save_state`, whichever family this is).
+        for (section, option, value) in calibration.save_state_values() {
+            configfile.set(&section, &option, &value);
         }
-        self.respond(&format!(
-            "stepper_a: position_endstop: {:.6} angle: {:.6} arm_length: {:.6}\n\
-             stepper_b: position_endstop: {:.6} angle: {:.6} arm_length: {:.6}\n\
-             stepper_c: position_endstop: {:.6} angle: {:.6} arm_length: {:.6}\n\
-             delta_radius: {:.6}",
-            calibration.endstops[0],
-            calibration.angles[0],
-            calibration.arms[0],
-            calibration.endstops[1],
-            calibration.angles[1],
-            calibration.arms[1],
-            calibration.endstops[2],
-            calibration.angles[2],
-            calibration.arms[2],
-            calibration.radius,
-        ));
+        self.respond(&calibration.save_state_report());
 
         // The measurements the next run restores (`save_state`).
         let section = "delta_calibrate";
@@ -721,7 +687,7 @@ fn format_stable_height(height: f64) -> String {
 /// fires for a partial set).
 fn measurements_to_distances(
     measured: &HashMap<&'static str, Vec<f64>>,
-    delta_params: &DeltaCalibration,
+    delta_params: &KinematicsCalibration,
 ) -> Result<Vec<Distance>, CommandError> {
     let required = [
         "CENTER_DISTS",
@@ -827,7 +793,7 @@ mod tests {
     use crate::core::klippy::motion::delta::DeltaConfig;
 
     /// `config/example-delta.cfg`'s machine, as its calibration parameters.
-    fn example_calibration() -> DeltaCalibration {
+    fn example_calibration() -> crate::core::klippy::motion::delta::DeltaCalibration {
         use crate::core::klippy::motion::delta::DeltaKinematics;
         DeltaKinematics::new(DeltaConfig {
             radius: 174.75,
@@ -940,7 +906,7 @@ mod tests {
 
     #[test]
     fn test_measurements_to_distances_builds_twelve_triples() {
-        let calibration = example_calibration();
+        let calibration = KinematicsCalibration::Linear(example_calibration());
         let mut measured: HashMap<&'static str, Vec<f64>> = HashMap::new();
         measured.insert("SCALE", vec![1.]);
         measured.insert("CENTER_DISTS", vec![74.0; 6]);

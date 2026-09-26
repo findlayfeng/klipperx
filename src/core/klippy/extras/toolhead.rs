@@ -78,8 +78,7 @@ use crate::core::klippy::mcu::{
     Completion, McuEndstop, McuError, McuObject, McuStepper, TriggerDispatch,
 };
 use crate::core::klippy::motion::delta::{
-    delta_active_flags, delta_position_fn, DeltaCalibration, DeltaConfig, DeltaKinematics,
-    DELTA_RAIL_NAMES,
+    delta_active_flags, delta_position_fn, DeltaConfig, DeltaKinematics, DELTA_RAIL_NAMES,
 };
 use crate::core::klippy::motion::extra::ExtraAxis;
 use crate::core::klippy::motion::generic_cartesian::GenericCartesianKinematics;
@@ -89,10 +88,14 @@ use crate::core::klippy::motion::itersolve::{
 };
 use crate::core::klippy::motion::kinematics::{
     home_move, polar_active_flags, polar_angle_normalize, polar_angle_solver, polar_angle_unwrap,
-    polar_home_move, polar_radius_solver, CartesianKinematics, CartesianTransform, NoneKinematics,
-    PolarKinematics, UnifiedHome,
+    polar_home_move, polar_radius_solver, CartesianKinematics, CartesianTransform,
+    KinematicsCalibration, NoneKinematics, PolarKinematics, UnifiedHome,
 };
 use crate::core::klippy::motion::plan::MoveLimits;
+use crate::core::klippy::motion::rotary_delta::{
+    rotary_delta_active_flags, rotary_delta_position_fn, RotaryDeltaConfig, RotaryDeltaKinematics,
+    ROTARY_DELTA_DEFAULT_ANGLES, ROTARY_DELTA_RAIL_NAMES,
+};
 use crate::core::klippy::motion::stepcompress::{StepCommand, StepCompressError};
 use crate::core::klippy::motion::toolhead::ToolHead;
 use crate::core::klippy::motion::{HomeCoord, Homing, HomingHandle, HomingInfo};
@@ -145,6 +148,11 @@ enum KinematicsKind {
     /// (`kinematics/delta.py`), whose kinematics and calibration math live in
     /// [`motion::delta`](crate::core::klippy::motion::delta).
     Delta,
+    /// `kinematics: rotary_delta` — the rotary-delta family
+    /// (`kinematics/rotary_delta.py`), whose kinematics and calibration math
+    /// live in
+    /// [`motion::rotary_delta`](crate::core::klippy::motion::rotary_delta).
+    RotaryDelta,
     /// `kinematics: generic_cartesian` — the carriage/stepper description
     /// (`kinematics/generic_cartesian.py`), where a motor drives a linear
     /// combination of carriage axes instead of one axis.
@@ -162,6 +170,7 @@ impl KinematicsKind {
         "hybrid_corexz",
         "polar",
         "delta",
+        "rotary_delta",
         "generic_cartesian",
     ];
 
@@ -176,6 +185,7 @@ impl KinematicsKind {
             "hybrid_corexz" => Self::HybridCoreXz,
             "polar" => Self::Polar,
             "delta" => Self::Delta,
+            "rotary_delta" => Self::RotaryDelta,
             "generic_cartesian" => Self::GenericCartesian,
             _ => return None,
         })
@@ -197,6 +207,8 @@ impl KinematicsKind {
             // are bound to their geometry in the delta branch below, and this
             // value is only consulted by the cartesian build.
             Self::Delta => CartesianTransform::Standard,
+            // Rotary delta likewise: its branch binds `rotary_delta_stepper_alloc`.
+            Self::RotaryDelta => CartesianTransform::Standard,
             // Generic cartesian's motors run the linear combinations their
             // `[stepper <name>]` sections declare (`extras::carriage` installs
             // those solvers); this arm is never read.
@@ -204,10 +216,11 @@ impl KinematicsKind {
         }
     }
 
-    /// The rail names `Delta` claims and the cartesian default (`delta.py:15`).
+    /// The rail names `Delta` and `RotaryDelta` claim and the cartesian default
+    /// (`delta.py:15`, `rotary_delta.py:14-15`).
     fn rail_names(self) -> [&'static str; 3] {
         match self {
-            Self::Delta => DELTA_RAIL_NAMES,
+            Self::Delta | Self::RotaryDelta => DELTA_RAIL_NAMES,
             _ => ["stepper_x", "stepper_y", "stepper_z"],
         }
     }
@@ -252,6 +265,8 @@ impl KinematicsKind {
             // Delta never reaches here: its branch below binds each tower to
             // `delta_stepper_alloc` instead (`delta.py:50-52`).
             Self::Delta => [cart(Axis::X), cart(Axis::Y), cart(Axis::Z)],
+            // Rotary delta likewise binds `rotary_delta_stepper_alloc`.
+            Self::RotaryDelta => [cart(Axis::X), cart(Axis::Y), cart(Axis::Z)],
             // Generic cartesian never reaches here either: `extras::carriage`
             // installs each motor's solver from its `carriages` expression as
             // the section loads.
@@ -300,6 +315,8 @@ pub struct ToolHeadObject {
     /// The delta kinematics, parked here at load until connect installs it —
     /// the rails' delta solvers are already bound in `new`.
     delta: Mutex<Option<DeltaKinematics>>,
+    /// The rotary-delta kinematics, parked the same way as `delta`.
+    rotary_delta: Mutex<Option<RotaryDeltaKinematics>>,
     /// The generic-cartesian kinematics, parked here at load until connect
     /// installs it (`generic_cartesian.py:118-127` builds it in `__init__`;
     /// only the toolhead's install waits for connect).
@@ -427,6 +444,7 @@ impl ToolHeadObject {
         let mut rails: Vec<Arc<Rail>> = Vec::new();
         let mut bed = None;
         let mut delta_kinematics = None;
+        let mut rotary_delta_kinematics = None;
         let mut generic_kinematics = None;
         let mut generic_steppers: Vec<Arc<KinematicStepper>> = Vec::new();
         match kind {
@@ -503,6 +521,33 @@ impl ToolHeadObject {
                 }
                 delta_kinematics = Some(delta);
             }
+            KinematicsKind::RotaryDelta => {
+                // Rotary delta claims `stepper_a/b/c` too (`rotary_delta.py:14`).
+                let axes = [Axis::X, Axis::Y, Axis::Z];
+                for (name, axis) in ROTARY_DELTA_RAIL_NAMES.into_iter().zip(axes) {
+                    rails.push(Rail::lookup(config, printer, name, axis)?);
+                }
+                // The kinematics reads its options here and binds each tower to
+                // `rotary_delta_stepper_alloc` (`setup_itersolve`,
+                // `rotary_delta.py:49-51`).
+                let rotary = build_rotary_delta(
+                    config,
+                    &rails,
+                    max_velocity,
+                    max_accel,
+                    max_z_velocity,
+                    max_z_accel,
+                )?;
+                for (rail, (sr, sh, angle, ua, la)) in rails.iter().zip(rotary.tower_geometry()) {
+                    for stepper in rail.steppers() {
+                        stepper.setup_itersolve(
+                            rotary_delta_position_fn(sr, sh, angle.to_radians(), ua, la),
+                            rotary_delta_active_flags(),
+                        );
+                    }
+                }
+                rotary_delta_kinematics = Some(rotary);
+            }
             _ => {
                 for (name, axis) in [
                     ("stepper_x", Axis::X),
@@ -578,6 +623,7 @@ impl ToolHeadObject {
             bed,
             kind,
             delta: Mutex::new(delta_kinematics),
+            rotary_delta: Mutex::new(rotary_delta_kinematics),
             generic: Mutex::new(generic_kinematics),
             generic_steppers,
             transform: kind.transform(),
@@ -688,17 +734,20 @@ impl ToolHeadObject {
     /// its own connect — which runs before this object's, since upstream loads
     /// `toolhead` last (`toolhead.py:604-615`).
     pub fn has_delta_calibration(&self) -> bool {
-        matches!(self.kind, KinematicsKind::Delta)
+        matches!(
+            self.kind,
+            KinematicsKind::Delta | KinematicsKind::RotaryDelta
+        )
     }
 
     /// The delta calibration parameters the kinematics carries
-    /// (`get_calibration`, `delta.py:153-160`), or `None` for any other
-    /// kinematics.
+    /// (`get_calibration`, `delta.py:153-160` / `rotary_delta.py:131-132`), or
+    /// `None` for any other kinematics.
     ///
     /// Read from the connected kinematics when the machine is up, and from
     /// the parameters parked here at load otherwise — they are the same
     /// object; connect hands it over.
-    pub fn delta_calibration(&self) -> Option<DeltaCalibration> {
+    pub fn delta_calibration(&self) -> Option<KinematicsCalibration> {
         {
             let guard = self.lock();
             if let Some(connected) = guard.as_ref() {
@@ -711,11 +760,21 @@ impl ToolHeadObject {
                 }
             }
         }
-        self.delta
+        if let Some(calibration) = self
+            .delta
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .as_ref()
             .map(DeltaKinematics::calibration)
+        {
+            return Some(KinematicsCalibration::Linear(calibration));
+        }
+        self.rotary_delta
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .as_ref()
+            .map(RotaryDeltaKinematics::calibration)
+            .map(KinematicsCalibration::Rotary)
     }
 
     /// The machine's maximum acceleration, for `[extruder]`'s speed defaults.
@@ -864,6 +923,17 @@ impl PrinterObject for ToolHeadObject {
                             config_error("delta kinematics is not connected".to_string())
                         })?;
                     toolhead.set_kinematics(Box::new(delta));
+                }
+                KinematicsKind::RotaryDelta => {
+                    let rotary = self
+                        .rotary_delta
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .take()
+                        .ok_or_else(|| {
+                            config_error("rotary_delta kinematics is not connected".to_string())
+                        })?;
+                    toolhead.set_kinematics(Box::new(rotary));
                 }
                 KinematicsKind::GenericCartesian => {
                     let kinematics = self
@@ -1027,6 +1097,102 @@ fn build_delta(
         arm_lengths,
         endstops,
         step_dists,
+        max_velocity,
+        max_accel,
+        max_z_velocity,
+        max_z_accel,
+    })
+}
+
+/// Read the rotary-delta options and build the kinematics
+/// (`kinematics/rotary_delta.py:10-48`, whose reads these mirror one for one):
+/// the `[printer]` options here, the arm/angle options from each
+/// `[stepper_a/b/c]` section.
+///
+/// # Errors
+/// A missing or out-of-bounds option, reported with the config reader's
+/// upstream wording; or a geometry whose home position does not exist (see
+/// [`RotaryDeltaKinematics::new`]).
+#[allow(clippy::too_many_arguments)]
+fn build_rotary_delta(
+    config: &ConfigWrapper,
+    rails: &[Arc<Rail>],
+    max_velocity: f64,
+    max_accel: f64,
+    max_z_velocity: f64,
+    max_z_accel: f64,
+) -> Result<RotaryDeltaKinematics, ConfigError> {
+    let shoulder_radius =
+        config.get_float_bounded("shoulder_radius", None, None, None, Some(0.0), None)?;
+    let shoulder_height =
+        config.get_float_bounded("shoulder_height", None, None, None, Some(0.0), None)?;
+    let mut endstops = [0.0; 3];
+    for (index, rail) in rails.iter().enumerate() {
+        endstops[index] = rail.homing_info().position_endstop;
+    }
+    let max_z = endstops.iter().copied().fold(f64::INFINITY, f64::min);
+    let minimum_z_position = config.get_float_bounded(
+        "minimum_z_position",
+        Some(0.0),
+        None,
+        Some(max_z),
+        None,
+        None,
+    )?;
+
+    // Tower geometry: `stepper_a`'s arm lengths are required and set the
+    // defaults for `stepper_b/c`; the angles default to 30/150/270
+    // (`rotary_delta.py:33-40`).
+    let mut upper_arms = [0.0; 3];
+    let mut lower_arms = [0.0; 3];
+    let mut angles = [0.0; 3];
+    for (index, name) in ROTARY_DELTA_RAIL_NAMES.iter().enumerate() {
+        let tower = config.sibling(name).ok_or_else(|| {
+            ConfigError::new(format!(
+                "Section '{}' needs a '[{name}]' section",
+                config.identifier()
+            ))
+        })?;
+        upper_arms[index] = if index == 0 {
+            tower.get_float_bounded("upper_arm_length", None, None, None, Some(0.0), None)?
+        } else {
+            tower.get_float_bounded(
+                "upper_arm_length",
+                Some(upper_arms[0]),
+                None,
+                None,
+                Some(0.0),
+                None,
+            )?
+        };
+        lower_arms[index] = if index == 0 {
+            tower.get_float_bounded("lower_arm_length", None, None, None, Some(0.0), None)?
+        } else {
+            tower.get_float_bounded(
+                "lower_arm_length",
+                Some(lower_arms[0]),
+                None,
+                None,
+                Some(0.0),
+                None,
+            )?
+        };
+        angles[index] = tower.get_float("angle", Some(ROTARY_DELTA_DEFAULT_ANGLES[index]))?;
+    }
+    let mut step_dists = [0.0; 3];
+    for (index, rail) in rails.iter().enumerate() {
+        step_dists[index] = rail.step_dist();
+    }
+
+    RotaryDeltaKinematics::new(RotaryDeltaConfig {
+        shoulder_radius,
+        shoulder_height,
+        angles,
+        upper_arms,
+        lower_arms,
+        endstops,
+        step_dists,
+        minimum_z_position,
         max_velocity,
         max_accel,
         max_z_velocity,
@@ -2741,6 +2907,9 @@ mod tests {
         let calibration = object
             .delta_calibration()
             .expect("`kinematics: delta` has a calibration");
+        let KinematicsCalibration::Linear(calibration) = calibration else {
+            panic!("a linear delta reports a linear delta calibration");
+        };
         assert_eq!(calibration.radius, 174.75);
         assert_eq!(calibration.arms, [333.0, 333.0, 333.0]);
         assert_eq!(calibration.endstops, [297.05, 297.05, 297.05]);
@@ -2834,6 +3003,7 @@ mod tests {
             bed: None,
             kind: KinematicsKind::Cartesian,
             delta: Mutex::new(None),
+            rotary_delta: Mutex::new(None),
             generic: Mutex::new(None),
             generic_steppers: Vec::new(),
             transform: CartesianTransform::Standard,

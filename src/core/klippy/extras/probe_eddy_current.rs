@@ -40,6 +40,7 @@ use serde_json::Value;
 
 use crate::core::klippy::cmd::TriggerAnalogType;
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
+use crate::core::klippy::event::printer_bus::ProbeResultsHandle;
 use crate::core::klippy::event::KlippyEvent;
 use crate::core::klippy::extras::ldc1612::{self, Calibration, Ldc1612};
 use crate::core::klippy::extras::probe::{
@@ -1309,15 +1310,19 @@ impl PrinterEddyProbe {
             }
         }
         let epos = calc_probe_z_average(&positions, &params.samples_result);
+        // A consumer edits the averaged result in place before it is stored; the
+        // stored value is what the handlers left (`probe.py:329`).
+        let results = ProbeResultsHandle::new(vec![epos]);
+        if let Some(printer) = self.printer.upgrade() {
+            printer.send_event(&KlippyEvent::ProbeUpdateResults {
+                results: results.clone(),
+            });
+        }
+        let epos = results.to_vec().first().copied().unwrap_or(epos);
         self.results
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .push(epos);
-        // `axis_twist_compensation` updates its results from this event
-        // (`probe.py:329`); this port's event carries no payload.
-        if let Some(printer) = self.printer.upgrade() {
-            printer.send_event(&KlippyEvent::ProbeUpdateResults);
-        }
         if gcmd.command() != "G28" {
             gcmd.respond_info(&format!(
                 "probe: at {:.3},{:.3} bed will contact at z={:.6}",
@@ -1420,10 +1425,12 @@ impl ProbeSession for PrinterEddyProbe {
 
     /// Take the completed sample sets (`pull_probed_results`).
     fn pull_probed_results(&self) -> Vec<Coord> {
-        let taken = std::mem::take(&mut *self.results.lock().unwrap_or_else(|p| p.into_inner()));
+        let mut taken =
+            std::mem::take(&mut *self.results.lock().unwrap_or_else(|p| p.into_inner()));
         // The scan path reports its results here upstream
         // (`EddyScanningProbe.pull_probed_results`); descend/tap already
-        // sent the event when their set completed.
+        // sent the event when their set completed. A consumer edits every
+        // result in place before they are returned (`probe.py:329`).
         let is_scan = self
             .active
             .lock()
@@ -1431,9 +1438,13 @@ impl ProbeSession for PrinterEddyProbe {
             .as_ref()
             .is_some_and(|(kind, _)| *kind == ActiveSession::Scan);
         if is_scan && !taken.is_empty() {
+            let results = ProbeResultsHandle::new(taken);
             if let Some(printer) = self.printer.upgrade() {
-                printer.send_event(&KlippyEvent::ProbeUpdateResults);
+                printer.send_event(&KlippyEvent::ProbeUpdateResults {
+                    results: results.clone(),
+                });
             }
+            taken = results.to_vec();
         }
         taken
     }

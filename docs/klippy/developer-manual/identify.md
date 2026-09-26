@@ -23,7 +23,7 @@ Identify 是 Klipper 主机端（klippy）与 MCU 端（固件）之间建立通
 与 Klipper 的一个差异：Klipper 在 offset 不匹配时不追加数据、继续用同一 offset 重试（可能无限循环）；本实现直接报 `McuError::IdentifyProtocol`，避免死循环，也避免把错位的数据拼成一份看似合法的字典。
 
 **静默即 nak（改号重发）**：5 字节空帧既是健康块的 ack、也是固件没收下该块的 nak——两者携带
-同一个 `next_sequence`（`command_send_ack` 与 `goto nk` 都走 `encode_acknak`，
+同一个 `next_sequence`（`command_send_ack` 与 `goto nak` 都走 `encode_acknak`，
 `src/command.c:301-306`），单看一帧无法区分。固件停在「领先一号」时，首发请求被 nak 而固件
 永不再回话，交换就死在那里。`Identify::request_chunk` 因此把「本块窗口内没等到响应」读作 nak，
 调 `Mcu::renumber_to_firmware`（connection-init，对齐上游 `serialqueue.c:196-201`）把发送

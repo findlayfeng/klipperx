@@ -10,7 +10,7 @@
 //! |---|---|
 //! | `[carriage <name>]` | one carriage: the rail geometry (range, endstop, homing speeds) of a printhead, with **no motor of its own** |
 //! | `[extra_carriage <name>]` | a second endstop on an existing carriage's rail (the rail-shared twin, like `carriage_z1` under `carriage_z`) |
-//! | `[dual_carriage <name>]` | a second carriage on the same axis as its `primary_carriage`, with a `safe_distance` |
+//! | `[dual_carriage <name>]` | a second carriage on its `primary_carriage`'s axis (with a `safe_distance`), or — naming no primary — that axis' primary carriage itself |
 //! | `[stepper <name>]` | one motor, driving a **linear combination** of the carriage axes (`carriages: carriage_x+carriage_y`) |
 //!
 //! The section ids are split on whitespace (`[stepper a]` is id `stepper`, sub
@@ -93,7 +93,8 @@ const VALID_AXES: [&str; 3] = ["x", "y", "z"];
 pub enum CarriageKind {
     /// `[carriage <name>]`: a primary carriage.
     Main,
-    /// `[dual_carriage <name>]`: a second carriage on its primary's axis.
+    /// `[dual_carriage <name>]`: a carriage on its primary's axis, or — when
+    /// it names no primary — a primary carriage of its own axis.
     Dual,
     /// `[extra_carriage <name>]`: a second endstop on its primary's rail.
     Extra,
@@ -118,7 +119,8 @@ pub struct Carriage {
     /// The carriage's own `endstop_pin`: the endstop a stepper driving this
     /// carriage arms (`GenericPrinterRail.add_stepper`).
     endstop: Arc<dyn HomingEndstop>,
-    /// `primary_carriage` of a dual/extra carriage; `None` for a main one.
+    /// The carriage's `primary_carriage`; `None` for a main carriage, and for
+    /// a dual carriage that names no primary.
     primary: Option<String>,
     /// `safe_distance` of a dual carriage. A written value is kept as read; an
     /// absent one is filled in by [`build`] from both carriages' ranges
@@ -163,7 +165,7 @@ impl Carriage {
         &self.endstop
     }
 
-    /// The primary this carriage attaches to, if it is a dual/extra one.
+    /// The primary this carriage attaches to, when it names one.
     pub fn primary_name(&self) -> Option<&str> {
         self.primary.as_deref()
     }
@@ -412,11 +414,16 @@ fn read_axis(config: &ConfigWrapper, name: &str) -> Result<Axis, ConfigError> {
     } else {
         config.get_choice("axis", &VALID_AXES, None)?
     };
-    Ok(match axis.as_str() {
+    Ok(axis_of(&axis))
+}
+
+/// An `axis` option's value as an [`Axis`] (`ord(axis_name) - ord('x')`).
+fn axis_of(axis: &str) -> Axis {
+    match axis {
         "x" => Axis::X,
         "y" => Axis::Y,
         _ => Axis::Z,
-    })
+    }
 }
 
 /// A section's short carriage name: the sub of `[carriage <name>]`
@@ -456,44 +463,64 @@ pub fn load_main_carriage(
 ///
 /// The bare `[dual_carriage]` is the cartesian IDEX module
 /// ([`extras::idex_modes`](crate::core::klippy::extras::idex_modes)); this is
-/// the generic-cartesian prefix form, which is a rail plus the name of the
-/// primary carriage it shares its axis with.
+/// the generic-cartesian prefix form, which is a rail plus — optionally — the
+/// name of the primary carriage it shares its axis with.
+///
+/// `primary_carriage` is optional (`DualCarriage.__init__`,
+/// `generic_cartesian.py:60-71`): a `[dual_carriage <name>]` without one is
+/// itself the *primary* carriage of its own `axis` — the axis is then
+/// required, and the carriage has no `safe_distance` — while one that names a
+/// primary rides that primary's axis and may carry a `safe_distance` (whose
+/// floor is read here).
 pub fn load_dual_carriage(
     config: &ConfigWrapper,
     printer: &Arc<Printer>,
 ) -> Result<Arc<dyn PrinterObject>, ConfigError> {
     let name = short_name(config)?;
-    // `axis` is optional here: the real axis is the primary's, checked in
-    // `build` (`resolve_primary_carriage`); only `safe_distance`'s floor is
-    // read now (`generic_cartesian.py:66-71`).
-    if config.section().has("axis") {
-        config.get_choice("axis", &VALID_AXES, None)?;
-    }
-    let primary = config.get("primary_carriage", None)?;
-    let (params, homing, endstop) = read_rail(config, printer)?;
-    let safe_distance = if config.section().has("safe_distance") {
-        Some(config.get_float_bounded("safe_distance", None, Some(0.), None, None, None)?)
-    } else {
-        None
+    let primary = config.get_str("primary_carriage");
+    let (axis, safe_distance) = match &primary {
+        Some(primary_name) => {
+            // `axis` is optional here: the real axis is the primary's, looked
+            // up below; the option is only cross-checked (`resolve_primary_carriage`,
+            // `generic_cartesian.py:79-84`).
+            if config.section().has("axis") {
+                config.get_choice("axis", &VALID_AXES, None)?;
+            }
+            let safe_distance = if config.section().has("safe_distance") {
+                Some(config.get_float_bounded("safe_distance", None, Some(0.), None, None, None)?)
+            } else {
+                None
+            };
+            // The primary's axis, when it has already loaded — `[carriage]`
+            // sections load before `[dual_carriage]` ones, and a `[dual_carriage]`
+            // primary precedes the carriage it is named by (config order). One
+            // that never loads leaves the placeholder, which `build` rejects
+            // with upstream's wording (`resolve_primary_carriage`,
+            // `generic_cartesian.py:70-101`).
+            let axis = model(printer)
+                .carriages()
+                .iter()
+                .find(|c| c.name() == primary_name)
+                .map(|c| c.axis())
+                .unwrap_or(Axis::X);
+            (axis, safe_distance)
+        }
+        // No primary: this carriage is its axis' primary one, so `axis` is
+        // required and there is no `safe_distance` (`self.safe_dist = None`).
+        None => (
+            axis_of(&config.get_choice("axis", &VALID_AXES, None)?),
+            None,
+        ),
     };
-    let primary_axis = model(printer)
-        .carriages()
-        .iter()
-        .find(|c| c.name() == primary)
-        .map(|c| c.axis())
-        .unwrap_or(Axis::X);
+    let (params, homing, endstop) = read_rail(config, printer)?;
     let carriage = Arc::new(Carriage {
         name,
         kind: CarriageKind::Dual,
-        // The primary's axis, when it has already loaded (it does: `[carriage]`
-        // sections load first). A primary that never loads leaves the
-        // placeholder, which `build` rejects with upstream's wording
-        // (`resolve_primary_carriage`, `generic_carriages.py:89-116`).
-        axis: primary_axis,
+        axis,
         params,
         homing,
         endstop,
-        primary: Some(primary),
+        primary,
         safe_distance: Mutex::new(safe_distance),
     });
     model(printer).push_carriage(Arc::clone(&carriage));
@@ -763,25 +790,29 @@ pub fn build(
         by_name.push(Arc::clone(carriage));
     }
     // A dual carriage resolves its primary, and its axis is the primary's
-    // (`resolve_primary_carriage`).
+    // (`resolve_primary_carriage`). One *without* a `primary_carriage` is a
+    // primary carriage itself — the loop below has nothing to resolve for it.
     let duals: Vec<Arc<Carriage>> = by_name
         .iter()
         .filter(|c| c.kind() == CarriageKind::Dual)
         .cloned()
         .collect();
-    let mut resolved_axes: Vec<(String, Axis)> = Vec::new();
+    // The primaries a dual carriage has claimed, as `(dual, primary)`: two
+    // duals on one primary carriage are refused, keyed by that carriage
+    // (`if self.primary_carriage.get_dual_carriage()`, not by axis — two
+    // primaries may share an axis).
+    let mut claimed: Vec<(String, String)> = Vec::new();
     for dual in &duals {
-        let primary_name = dual.primary_name().unwrap_or_default();
+        let Some(primary_name) = dual.primary_name() else {
+            continue;
+        };
         let Some(primary) = by_name.iter().find(|c| c.name() == primary_name) else {
             return Err(ConfigError::new(format!(
                 "primary_carriage = '{primary_name}' for '{}' is not a valid choice",
                 dual.name()
             )));
         };
-        if let Some((other, _)) = resolved_axes
-            .iter()
-            .find(|(_, axis)| *axis == primary.axis())
-        {
+        if let Some((other, _)) = claimed.iter().find(|(_, name)| name == primary_name) {
             return Err(ConfigError::new(format!(
                 "Multiple dual carriages ('{other}', '{}') for carriage '{}'",
                 dual.name(),
@@ -795,7 +826,7 @@ pub fn build(
                 dual.name()
             )));
         }
-        resolved_axes.push((dual.name().to_string(), primary.axis()));
+        claimed.push((dual.name().to_string(), primary_name.to_string()));
     }
     // The extras hang off the same map, checked the same way.
     for carriage in carriages.iter().filter(|c| c.kind() == CarriageKind::Extra) {
@@ -948,25 +979,39 @@ pub fn build(
     // `dual_carriage` object and the three `SET_DUAL_CARRIAGE` /
     // `SAVE_DUAL_CARRIAGE_STATE` / `RESTORE_DUAL_CARRIAGE_STATE` commands
     // (`generic_cartesian.py:137-146`). The carriage order is upstream's
-    // `dc_rails` (`idex_modes.py:37-45`): the primary carriage of every dual
-    // axis first, then the dual carriages themselves. Each carriage carries
-    // its `position_endstop`, where the frames follow it once the axis homes
-    // (`idex_modes.py:116-131`).
+    // `dc_rails` (`idex_modes.py:37-45`): the primary carriages of the dual
+    // axes first, then the dual carriages themselves. A `[dual_carriage]`
+    // without a `primary_carriage` counts among the primaries — upstream picks
+    // it as one (`[dc for dc in self.dc_carriages if
+    // dc.get_primary_carriage() is None]`, `generic_cartesian.py:131-133`).
+    // Each carriage carries its `position_endstop`, where the frames follow it
+    // once the axis homes (`idex_modes.py:116-131`).
     if !duals.is_empty() {
         let dc_axes: Vec<Axis> = duals.iter().map(|dual| dual.axis()).collect();
-        let mut idex_carriages: Vec<idex_modes::GenericCarriage> = mains
+        let as_generic = |carriage: &Arc<Carriage>| idex_modes::GenericCarriage {
+            name: carriage.name().to_string(),
+            axis: carriage.axis(),
+            position_endstop: carriage.homing_info().position_endstop,
+        };
+        // The primaries, then the dual carriage attached to each of them, in
+        // that order (`primary_rails + dual_rails`). A `[dual_carriage]`
+        // without a `primary_carriage` is one of the primaries — its axis is
+        // its own, not another carriage's.
+        let primaries: Vec<&Arc<Carriage>> = mains
             .iter()
             .filter(|main| dc_axes.contains(&main.axis()))
-            .map(|main| idex_modes::GenericCarriage {
-                name: main.name().to_string(),
-                axis: main.axis(),
-                position_endstop: main.homing_info().position_endstop,
-            })
+            .copied()
+            .chain(duals.iter().filter(|dual| dual.primary_name().is_none()))
             .collect();
-        idex_carriages.extend(duals.iter().map(|dual| idex_modes::GenericCarriage {
-            name: dual.name().to_string(),
-            axis: dual.axis(),
-            position_endstop: dual.homing_info().position_endstop,
+        let mut idex_carriages: Vec<idex_modes::GenericCarriage> = primaries
+            .iter()
+            .map(|primary| as_generic(primary))
+            .collect();
+        idex_carriages.extend(primaries.iter().filter_map(|primary| {
+            duals
+                .iter()
+                .find(|dual| dual.primary_name() == Some(primary.name()))
+                .map(|dual| as_generic(dual))
         }));
         idex_modes::register_generic(printer, &idex_carriages)?;
     }
@@ -1128,7 +1173,7 @@ mod tests {
 
     /// A three-axis carriage printer, and nothing else — the tests below vary
     /// the carriage/stepper sections to reach the load-time checks.
-    fn load_error(carriages: &str, steppers: &str) -> String {
+    fn load_printer(carriages: &str, steppers: &str) -> Result<Arc<Printer>, String> {
         use crate::core::klippy::config::Config;
         use crate::core::klippy::printer::Printer;
         use crate::core::klippy::reactor::ManualReactor;
@@ -1141,9 +1186,17 @@ mod tests {
         );
         let (config, _) = Config::from_text(&text).expect("the test config parses");
         let printer = Arc::new(Printer::new(ManualReactor::shared()));
-        match printer.load_config(&config) {
-            Ok(()) => panic!("the config loads, but a load error was expected"),
-            Err(error) => error.to_string(),
+        printer
+            .load_config(&config)
+            .map(|()| printer)
+            .map_err(|e| e.to_string())
+    }
+
+    /// [`load_printer`] for a config expected to be refused.
+    fn load_error(carriages: &str, steppers: &str) -> String {
+        match load_printer(carriages, steppers) {
+            Ok(_) => panic!("the config loads, but a load error was expected"),
+            Err(error) => error,
         }
     }
 
@@ -1216,6 +1269,160 @@ mod tests {
         assert_eq!(
             load_error(&carriages, STEPPERS),
             "Carriage(s) z1 must be referenced by some stepper(s)"
+        );
+    }
+
+    /// A `[dual_carriage <name>]` without a `primary_carriage` is the **primary
+    /// carriage of its own axis** — upstream reads `axis` as required and has
+    /// no `safe_distance` for it (`DualCarriage.__init__`,
+    /// `generic_cartesian.py:60-63`) — so it loads and the idex module treats
+    /// it as a carriage to switch between (`generic_cartesian.py:131-133`,
+    /// where it joins `pcs`).
+    #[test]
+    fn a_dual_carriage_without_a_primary_is_a_primary_of_its_axis() {
+        let carriages = format!(
+            "{CARRIAGES}[dual_carriage x2]\naxis: x\nposition_endstop: 0\nposition_max: 300\n\
+             endstop_pin: ^PE6\n"
+        );
+        let steppers = format!(
+            "{STEPPERS}[stepper b]\ncarriages: x2\nstep_pin: PF4\ndir_pin: PF5\nmicrosteps: 16\n\
+             rotation_distance: 40\n"
+        );
+        let printer = load_printer(&carriages, &steppers).expect("the config loads");
+        let model = lookup_model(&printer).expect("the carriage registry is registered");
+        let carriage = model
+            .carriages()
+            .into_iter()
+            .find(|c| c.name() == "x2")
+            .expect("carriage x2 is registered");
+        assert_eq!(carriage.kind(), CarriageKind::Dual);
+        assert_eq!(carriage.primary_name(), None);
+        assert_eq!(carriage.axis(), Axis::X, "its own `axis`, not a primary's");
+        assert_eq!(carriage.range(), (0.0, 300.0));
+        assert_eq!(carriage.safe_distance(), None);
+
+        // It is one of the carriages the module switches between
+        // (`dc_rails`), after the main carriages of the dual axes.
+        let names = printer
+            .lookup_object_as::<crate::core::klippy::extras::idex_modes::GenericDualCarriages>(
+                crate::core::klippy::extras::idex_modes::DUAL_CARRIAGE_OBJECT,
+            )
+            .expect("the dual_carriage object is registered")
+            .carriage_names();
+        assert_eq!(names, ["x", "x2"]);
+    }
+
+    /// The `axis` of a carriage without a `primary_carriage` is required —
+    /// there is no other carriage to take it from (`config.getchoice('axis',
+    /// VALID_AXES)`).
+    #[test]
+    fn a_dual_carriage_with_neither_an_axis_nor_a_primary_is_refused() {
+        let carriages = format!(
+            "{CARRIAGES}[dual_carriage x2]\nposition_endstop: 0\nposition_max: 300\n\
+             endstop_pin: ^PE6\n"
+        );
+        assert_eq!(
+            load_error(&carriages, STEPPERS),
+            "Option 'axis' in section 'dual_carriage x2' must be specified"
+        );
+    }
+
+    /// A `primary_carriage` that names no loaded carriage is refused with
+    /// upstream's wording (`resolve_primary_carriage`,
+    /// `generic_cartesian.py:74-77`).
+    #[test]
+    fn a_dual_carriage_naming_an_unknown_primary_is_refused() {
+        let carriages = format!(
+            "{CARRIAGES}[dual_carriage x2]\nprimary_carriage: nope\nposition_endstop: 0\n\
+             position_max: 300\nendstop_pin: ^PE6\n"
+        );
+        let steppers = format!(
+            "{STEPPERS}[stepper b]\ncarriages: x2\nstep_pin: PF4\ndir_pin: PF5\nmicrosteps: 16\n\
+             rotation_distance: 40\n"
+        );
+        assert_eq!(
+            load_error(&carriages, &steppers),
+            "primary_carriage = 'nope' for 'x2' is not a valid choice"
+        );
+    }
+
+    /// A `safe_distance` on a carriage with a `primary_carriage` is kept as
+    /// written (`resolve_primary_carriage`), and the same carriage is a dual
+    /// carriage of its primary's axis.
+    #[test]
+    fn a_dual_carriage_names_its_primary_and_keeps_its_safe_distance() {
+        let carriages = format!(
+            "{CARRIAGES}[dual_carriage x2]\nprimary_carriage: x\nsafe_distance: 70\n\
+             position_endstop: 300\nposition_max: 300\nendstop_pin: ^PE6\n"
+        );
+        let steppers = format!(
+            "{STEPPERS}[stepper b]\ncarriages: x2\nstep_pin: PF4\ndir_pin: PF5\nmicrosteps: 16\n\
+             rotation_distance: 40\n"
+        );
+        let printer = load_printer(&carriages, &steppers).expect("the config loads");
+        let model = lookup_model(&printer).expect("the carriage registry is registered");
+        let carriage = model
+            .carriages()
+            .into_iter()
+            .find(|c| c.name() == "x2")
+            .expect("carriage x2 is registered");
+        assert_eq!(carriage.primary_name(), Some("x"));
+        assert_eq!(carriage.axis(), Axis::X, "the primary's axis");
+        assert_eq!(carriage.safe_distance(), Some(70.0), "as written");
+    }
+
+    /// Two primaries on one axis each keep their own dual carriage — the
+    /// machine's shape is a pair per primary, not one dual per axis
+    /// (`generic_cartesian.py:131-134` pairs them up). The check for two duals
+    /// on one carriage is keyed by that carriage, so this must load.
+    #[test]
+    fn two_primaries_on_one_axis_each_keep_their_own_dual() {
+        let carriages = format!(
+            "{CARRIAGES}[dual_carriage x2]\naxis: x\nposition_endstop: 0\nposition_max: 300\n\
+             endstop_pin: ^PE6\n\
+             [dual_carriage x3]\nprimary_carriage: x\nposition_endstop: 300\n\
+             position_max: 300\nendstop_pin: ^PE7\n\
+             [dual_carriage x4]\nprimary_carriage: x2\nposition_endstop: 300\n\
+             position_max: 300\nendstop_pin: ^PE4\n"
+        );
+        let steppers = format!(
+            "{STEPPERS}[stepper b]\ncarriages: x2\nstep_pin: PF4\ndir_pin: PF5\nmicrosteps: 16\n\
+             rotation_distance: 40\n\
+             [stepper d]\ncarriages: x3\nstep_pin: PF2\ndir_pin: PF3\nmicrosteps: 16\n\
+             rotation_distance: 40\n\
+             [stepper e]\ncarriages: x4\nstep_pin: PC0\ndir_pin: PC1\nmicrosteps: 16\n\
+             rotation_distance: 40\n"
+        );
+        let printer = load_printer(&carriages, &steppers).expect("the config loads");
+        let names = printer
+            .lookup_object_as::<crate::core::klippy::extras::idex_modes::GenericDualCarriages>(
+                crate::core::klippy::extras::idex_modes::DUAL_CARRIAGE_OBJECT,
+            )
+            .expect("the dual_carriage object is registered")
+            .carriage_names();
+        assert_eq!(names, ["x", "x2", "x3", "x4"]);
+    }
+
+    /// Two dual carriages on one primary carriage are refused, with upstream's
+    /// wording (`if self.primary_carriage.get_dual_carriage()`,
+    /// `generic_cartesian.py:90-94`).
+    #[test]
+    fn two_dual_carriages_on_one_primary_are_refused() {
+        let carriages = format!(
+            "{CARRIAGES}[dual_carriage x2]\nprimary_carriage: x\nposition_endstop: 0\n\
+             position_max: 300\nendstop_pin: ^PE6\n\
+             [dual_carriage x3]\nprimary_carriage: x\nposition_endstop: 300\n\
+             position_max: 300\nendstop_pin: ^PE7\n"
+        );
+        let steppers = format!(
+            "{STEPPERS}[stepper b]\ncarriages: x2\nstep_pin: PF4\ndir_pin: PF5\nmicrosteps: 16\n\
+             rotation_distance: 40\n\
+             [stepper d]\ncarriages: x3\nstep_pin: PF2\ndir_pin: PF3\nmicrosteps: 16\n\
+             rotation_distance: 40\n"
+        );
+        assert_eq!(
+            load_error(&carriages, &steppers),
+            "Multiple dual carriages ('x2', 'x3') for carriage 'x'"
         );
     }
 }

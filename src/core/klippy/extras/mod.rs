@@ -9,6 +9,7 @@
 pub mod ad5206;
 pub mod adc_scaled;
 pub mod adc_temperature;
+pub mod ads1220;
 pub mod adxl345;
 pub mod axis_twist_compensation;
 pub mod bed_mesh;

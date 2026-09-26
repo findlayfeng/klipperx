@@ -407,7 +407,13 @@ mod tests {
     ///
     /// `KLIPPERX_UPSTREAM_ALL=1` runs every case and reports every failure, so
     /// the list stays honest rather than hiding regressions.
-    const IGNORED: &[&str] = &["load_cell.test"];
+    // `printers.test` stays here for now even though all 203 of its runs pass
+    // under `KLIPPERX_UPSTREAM_ALL=1` (measured 2026-09-25): the default
+    // configuration only builds the default architecture set, so several of its
+    // cases wait on dictionaries that are not built and the default suite ran
+    // past 9 minutes. Removing it is a separate unit (make the default suite
+    // carry it cheaply); the ALL=1 evidence is recorded in the manual.
+    const IGNORED: &[&str] = &["load_cell.test", "printers.test"];
 
     // -----------------------------------------------------------------------
     // Which architectures and dictionaries to run

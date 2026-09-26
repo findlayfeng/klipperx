@@ -686,6 +686,81 @@ mod tests {
         );
     }
 
+    /// Payload of the periodic `stats` a running firmware interleaves with the
+    /// identify exchange: message id -12 as a signed VLQ, then 8 parameter
+    /// bytes. The host-owned parser does not know that id before the dictionary
+    /// arrives, so the receive task drops the frame.
+    fn stats_payload() -> Vec<u8> {
+        let mut payload = Payload::new();
+        payload.push_i16(-12).unwrap();
+        payload.extend(&[0; 8]).unwrap();
+        payload.into_raw()
+    }
+
+    /// The noise a real line carries must leave the nak/renumber exchange
+    /// exactly where it is. The firmware answers the first request with a
+    /// `stats` frame whose sequence is **congruent** with what this host has
+    /// seen (`delta == 0`), so it must move no number — the nak behind it is
+    /// still the session's first new sequence, and the window adopts that
+    /// number only once the first attempt's window has run out in silence.
+    /// The frame's id is unknown before the dictionary, so it must not disturb
+    /// the pending call either. Nothing goes out early, and the retry under the
+    /// firmware's number completes the transfer.
+    #[tokio::test]
+    async fn test_a_congruent_stats_frame_does_not_disturb_the_renumber() {
+        let compressed = compress(DICTIONARY_JSON.as_bytes());
+        let mut mappings = vec![MappingEntry {
+            // What the firmware sends instead of an answer: a `stats` frame
+            // stamped with the sequence this host has already seen (delta 0),
+            // then the nak carrying the number the firmware waits for, then
+            // silence for the rest of the first attempt's window.
+            input: Frame::new(0, request_payload(0)),
+            outputs: vec![Frame::new(0, stats_payload()), Frame::new(1, Vec::new())],
+        }];
+        // Only a request numbered 1 is taken, and the transfer runs from there.
+        mappings.extend(chunked_mappings(&compressed, 40, 1));
+
+        let device = FrameMock::new(mappings.clone());
+        let recorder = device.recorder();
+        let mcu = Mcu::for_test("test_mcu", Interface::new(device));
+
+        // A 2.5 s budget makes the first attempt's window the full
+        // IDENTIFY_ATTEMPT_TIMEOUT (the smaller of that and a quarter of the
+        // budget), so the retry's timing is this constant, not the budget.
+        let started = Instant::now();
+        let identify = Identify::fetch(&mcu, Duration::from_millis(2500))
+            .await
+            .expect("the congruent noise neither blocks the answer nor prevents the renumber");
+        let elapsed = started.elapsed();
+
+        assert_eq!(identify.data["app"], "Klipper");
+        assert!(
+            !mcu.took_over_session(),
+            "a congruent noise frame takes over no session"
+        );
+        assert!(
+            elapsed >= IDENTIFY_ATTEMPT_TIMEOUT,
+            "the retry waits out the first window instead of firing on the noise: {elapsed:?}"
+        );
+        let sent = recorder.frames();
+        let expected: Vec<Frame> = mappings.iter().map(|entry| entry.input.clone()).collect();
+        assert_eq!(
+            sent, expected,
+            "the noise disturbs nothing: one request at 0, the renumbered retry at the \
+             firmware's 1, then exactly one per chunk"
+        );
+        assert_eq!(
+            sent[0].seq(),
+            0,
+            "the first try is under this connection's 0"
+        );
+        assert_eq!(
+            sent[1].seq(),
+            1,
+            "the retry carries the number the firmware asked for"
+        );
+    }
+
     /// The healthy path is untouched: the first answer arrives, so the send
     /// window is neither renumbered nor asked to send anything again.
     #[tokio::test]

@@ -1438,10 +1438,15 @@ impl Mcu {
 mod tests {
     use super::*;
     use crate::core::klippy::cmd::clock::{ClockSync, McuClock};
+    use crate::core::klippy::cmd::identify::IDENTIFY_CHUNK_SIZE;
+    use crate::core::klippy::identify::Identify;
     use crate::core::klippy::interface::devices::frame_mock::{FrameMock, MappingEntry};
     use crate::core::klippy::interface::devices::serial::DEFAULT_BAUD;
     use crate::core::klippy::interface::Interface;
     use crate::core::klippy::reactor::ManualReactor;
+    use flate2::write::ZlibEncoder;
+    use flate2::Compression;
+    use std::io::Write;
 
     fn make_frame(seq: u8, payload: &[u8]) -> Frame {
         Frame::new(seq, payload.to_vec())
@@ -1845,6 +1850,105 @@ mod tests {
         let sent = recorder.frames();
         let seqs: Vec<u8> = sent.iter().map(|frame| frame.seq()).collect();
         assert_eq!(seqs, [0, 1], "one block per exchange, at its own number");
+    }
+
+    // -----------------------------------------------------------------------
+    // Decode before the dictionary is installed
+    // -----------------------------------------------------------------------
+
+    /// Payload of the periodic `stats` a running firmware keeps sending while
+    /// the handshake is still transferring the dictionary: message id -12 as a
+    /// signed VLQ, then 8 parameter bytes. Before the dictionary arrives the
+    /// parser knows only the identify pair, so this id cannot decode.
+    fn stats_payload() -> Vec<u8> {
+        let mut payload = Payload::new();
+        payload.push_i16(-12).unwrap();
+        payload.extend(&[0; 8]).unwrap();
+        payload.into_raw()
+    }
+
+    /// Payload of an `identify offset=%u count=%c` request — the bytes the
+    /// handshake puts on the wire for `offset` (the same bytes the fixture in
+    /// `identify.rs` builds for its own exchanges).
+    fn identify_request_payload(offset: u32) -> Vec<u8> {
+        let mut payload = Payload::new();
+        payload.push_i16(1).unwrap();
+        payload.push_u32(offset).unwrap();
+        payload.push_u8(IDENTIFY_CHUNK_SIZE).unwrap();
+        payload.into_raw()
+    }
+
+    /// Payload of an `identify_response offset=%u data=%.*s` answer.
+    fn identify_response_payload(offset: u32, data: &[u8]) -> Vec<u8> {
+        let mut payload = Payload::new();
+        payload.push_i16(0).unwrap();
+        payload.push_u32(offset).unwrap();
+        payload.push_bytes(data).unwrap();
+        payload.into_raw()
+    }
+
+    /// The body handed over by the exchange below, compressed the way the
+    /// firmware stores it (`zlib.compress(...)` output).
+    fn compress(body: &[u8]) -> Vec<u8> {
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(body).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    /// What the receive task owes a frame it cannot decode while identify is
+    /// still running: nothing. A firmware that was already alive keeps sending
+    /// `stats` between the request and its answer, and before the dictionary is
+    /// installed its id is unknown to the host-owned parser. The frame has to
+    /// be dropped without failing the call chain and without touching the
+    /// pending call, so the `identify_response` right behind it still resolves
+    /// and the handshake completes — with no retransmit or renumber on account
+    /// of the noise.
+    #[tokio::test]
+    async fn test_an_unknown_id_frame_before_the_dictionary_is_skipped() {
+        let compressed = compress(br#"{"app": "Klipper"}"#);
+        let device = FrameMock::new(vec![
+            MappingEntry {
+                input: Frame::new(0, identify_request_payload(0)),
+                outputs: vec![
+                    // The noise first, stamped with the sequence the firmware
+                    // took the block under — the same number the answer and
+                    // the ack behind it carry.
+                    Frame::new(1, stats_payload()),
+                    Frame::new(1, identify_response_payload(0, &compressed)),
+                    Frame::new(1, Vec::new()),
+                ],
+            },
+            MappingEntry {
+                // The terminating request: the payload so far, all of it.
+                input: Frame::new(1, identify_request_payload(compressed.len() as u32)),
+                outputs: vec![
+                    Frame::new(2, identify_response_payload(compressed.len() as u32, &[])),
+                    Frame::new(2, Vec::new()),
+                ],
+            },
+        ]);
+        let recorder = device.recorder();
+        let mcu = Mcu::for_test("test_mcu", Interface::new(device));
+
+        let identify = Identify::fetch(&mcu, Duration::from_secs(1))
+            .await
+            .expect("the unknown-id frame is skipped and the identify response still resolves");
+
+        assert_eq!(identify.data["app"], "Klipper");
+        assert!(
+            !mcu.took_over_session(),
+            "the noise frame names no session to take over"
+        );
+        // One request per chunk and nothing else: the frame the parser refused
+        // cost the exchange neither a retransmit nor a renumber, and the
+        // pending call was consumed by the response, not by the noise.
+        let sent = recorder.frames();
+        let seqs: Vec<u8> = sent.iter().map(|frame| frame.seq()).collect();
+        assert_eq!(
+            seqs,
+            [0, 1],
+            "one request per chunk at its own number: the skipped frame adds no send"
+        );
     }
 
     /// The renumber adopts the sequence the firmware reported and abandons what

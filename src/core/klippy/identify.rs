@@ -46,12 +46,12 @@
 
 use super::cmd::identify::{IdentifyChunk, IdentifyRequest};
 use crate::core::klippy::interface::Interface;
-use crate::core::klippy::mcu::{Dictionary, Mcu, McuError};
+use crate::core::klippy::mcu::{Dictionary, Mcu, McuCallError, McuError};
 use crate::core::klippy::msg::parser::Parser;
 use flate2::read::ZlibDecoder;
 use std::io::Read;
 use std::sync::Arc;
-use tokio::time::Duration;
+use tokio::time::{sleep, Duration, Instant};
 use tracing::{debug, info};
 
 /// The identify request/response message formats defined by the host.
@@ -84,9 +84,50 @@ pub(crate) fn new_parser() -> Parser {
 /// [`Mcu::identify`](crate::core::klippy::mcu::Mcu::identify) and
 /// [`Mcu::connect`](crate::core::klippy::mcu::Mcu::connect).
 ///
-/// Each chunk request gets the whole budget: a healthy MCU answers in
-/// microseconds, so a shorter per-chunk timeout would only add tuning knobs.
+/// Each chunk request gets the whole budget, and its attempts share it rather
+/// than stack on top of it (see [`IDENTIFY_ATTEMPT_TIMEOUT`]): a healthy MCU
+/// answers in microseconds, while the bounded attempts inside the budget are
+/// what turn silence into a nak — the chunk still ends exactly where it used
+/// to.
 pub const IDENTIFY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long one identify attempt waits for its response before the silence is
+/// read as a nak and the chunk is renumbered and requested again.
+///
+/// What the retry exists for is the numbering mismatch: a 5-byte empty frame is
+/// both the ack of a healthy block and the nak of one the firmware never took,
+/// and this host starts at 0 where some firmwares wait at 1 — so a firmware
+/// stuck one ahead naks the first request and the exchange would otherwise end
+/// there. That root cause is fixed by renumbering, not by waiting longer, so the
+/// first attempts give up early: a healthy firmware answers a chunk in
+/// milliseconds, out of a buffer it compressed at build time, and a spurious
+/// retry is harmless — the request is idempotent (same offset) and whichever
+/// response arrives first is accepted. Only the **last** attempt waits out the
+/// rest of the chunk's budget, so a board that is merely slow is never cut off
+/// before the `timeout` its caller gave (see [`IDENTIFY_TIMEOUT`]).
+const IDENTIFY_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Retries after the first attempt, each preceded by renumbering the send
+/// window onto the sequence the firmware reported (see
+/// [`Mcu::renumber_to_firmware`](crate::core::klippy::mcu::Mcu::renumber_to_firmware)).
+///
+/// The first renumber is the fix; rounds after it only cover a frame lost on a
+/// line that is already misbehaving, so they are a bounded fallback rather than
+/// a cure: three keeps a dead port failing inside one chunk's budget instead of
+/// stalling every chunk of the transfer, and the attempt that follows them
+/// still runs to the deadline. Retries, windows and pauses all share the one
+/// budget the caller passed, so no retry makes a chunk take longer than the
+/// timeout it has today.
+const IDENTIFY_MAX_RETRIES: u32 = 3;
+
+/// The pause before each fallback retry: 50 ms, doubling (50/100/200 ms, 350 ms
+/// across all retries — a fraction of any budget a caller passes).
+///
+/// Long enough for the firmware to have taken the renumbered request (the
+/// transport's own retransmit floor is 25 ms, `MIN_RTO`, and no retransmit is
+/// pending after a renumber — it cleared the window), and doubling keeps a
+/// broken line from being hammered.
+const IDENTIFY_RETRY_BACKOFF: Duration = Duration::from_millis(50);
 
 /// Maximum allowed payload size (1 MB), applied both to the compressed bytes
 /// received and to the decompressed body.
@@ -148,9 +189,7 @@ impl Identify {
             let request = IdentifyRequest {
                 offset: payload.len() as u32,
             };
-            let chunk = mcu
-                .call_msg_ungated::<IdentifyRequest, IdentifyChunk>(&request, timeout)
-                .await?;
+            let chunk = Self::request_chunk(mcu, &request, timeout).await?;
 
             // The MCU echoes the offset it is answering for. A mismatch means the
             // stream is out of sync; Klipper would silently retry the same offset
@@ -176,6 +215,77 @@ impl Identify {
 
             payload.extend_from_slice(&chunk.data);
         }
+    }
+
+    /// One chunk request, under the rule that silence is a nak.
+    ///
+    /// `timeout` is the whole budget for this chunk — the caller's
+    /// [`IDENTIFY_TIMEOUT`] semantics — and every attempt shares it: windows and
+    /// backoff pauses are carved out of it, so retries never make a chunk take
+    /// longer than it does without them.
+    ///
+    /// A timeout means the line went quiet exactly where the firmware should
+    /// have spoken. The empty frame that may have come back cannot say whether
+    /// the request was taken or refused — both carry the firmware's expected
+    /// sequence — so quiet is taken as the refusal: the send window is
+    /// renumbered onto the sequence the firmware reported (connection init,
+    /// `serialqueue.c:196-201`) and the same chunk is requested again
+    /// ([`Mcu::renumber_to_firmware`](crate::core::klippy::mcu::Mcu::renumber_to_firmware)).
+    /// Any other error is not silence: it is returned as it is.
+    async fn request_chunk(
+        mcu: &Mcu,
+        request: &IdentifyRequest,
+        timeout: Duration,
+    ) -> Result<IdentifyChunk, McuError> {
+        let deadline = Instant::now() + timeout;
+        let mut retries_left = IDENTIFY_MAX_RETRIES;
+        let mut backoff = IDENTIFY_RETRY_BACKOFF;
+        let mut timed_out: Option<McuError> = None;
+
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            // The early attempts get their own window; the last one runs the
+            // budget out, so a slow firmware still gets the whole `timeout`.
+            let window = if retries_left == 0 {
+                remaining
+            } else {
+                IDENTIFY_ATTEMPT_TIMEOUT.min(remaining / (1 + retries_left))
+            };
+            match mcu
+                .call_msg_ungated::<IdentifyRequest, IdentifyChunk>(request, window)
+                .await
+            {
+                Ok(chunk) => return Ok(chunk),
+                Err(err @ McuError::Call(McuCallError::Timeout(_))) => timed_out = Some(err),
+                Err(other) => return Err(other),
+            }
+
+            if retries_left == 0 {
+                break;
+            }
+            retries_left -= 1;
+            debug!(
+                "identify offset={} was silent for {window:?}: read as a nak, renumbering to \
+                 the firmware's sequence and requesting the chunk again",
+                request.offset
+            );
+            mcu.renumber_to_firmware().await?;
+            let pause = backoff.min(deadline.saturating_duration_since(Instant::now()));
+            if pause.is_zero() {
+                break;
+            }
+            sleep(pause).await;
+            backoff = backoff.saturating_mul(2);
+        }
+
+        Err(timed_out.unwrap_or_else(|| {
+            McuError::Call(McuCallError::Timeout(format!(
+                "no response for an identify chunk within {timeout:?}"
+            )))
+        }))
     }
 
     /// Decompress the payload, refusing to expand beyond the size limit.
@@ -377,14 +487,18 @@ mod tests {
     /// Build the full chunked exchange for `compressed` and return the mappings.
     ///
     /// Frame sequence numbers line up on both sides: the send task numbers each
-    /// batch from 0 and the receive loop consumes frames numbered from 0, and a
-    /// synchronous call sends exactly one frame per exchange. Both counters live
-    /// in the low 4 bits of the sequence byte, so they wrap at 16 — relevant as
-    /// soon as a payload needs more than 16 chunks.
-    fn chunked_mappings(compressed: &[u8], chunk_size: usize) -> Vec<MappingEntry> {
+    /// batch from `first_seq` and the receive loop consumes frames numbered the
+    /// same way, and a synchronous call sends exactly one frame per exchange.
+    /// Both counters live in the low 4 bits of the sequence byte, so they wrap at
+    /// 16 — relevant as soon as a payload needs more than 16 chunks.
+    ///
+    /// `first_seq` is the number the firmware is waiting for when the transfer
+    /// starts: `0` for a board that takes this connection's first block, `1` for
+    /// one whose counter is already one ahead of it.
+    fn chunked_mappings(compressed: &[u8], chunk_size: usize, first_seq: u8) -> Vec<MappingEntry> {
         let mut mappings = Vec::new();
         let mut offset = 0usize;
-        let mut seq = 0u8;
+        let mut seq = first_seq;
 
         loop {
             let end = (offset + chunk_size).min(compressed.len());
@@ -438,7 +552,7 @@ mod tests {
     async fn test_fetch_single_chunk() {
         let body = DICTIONARY_JSON.as_bytes();
         let compressed = compress(body);
-        let mappings = chunked_mappings(&compressed, 40);
+        let mappings = chunked_mappings(&compressed, 40, 0);
         // ceil(len / 40) data chunks plus the terminating empty chunk.
         assert_eq!(mappings.len(), compressed.len().div_ceil(40) + 1);
 
@@ -454,7 +568,7 @@ mod tests {
         let compressed = compress(body);
         // Small chunks force several round trips — more than 16, so the 4-bit
         // sequence counter wraps mid-transfer.
-        let mappings = chunked_mappings(&compressed, 8);
+        let mappings = chunked_mappings(&compressed, 8, 0);
         assert_eq!(mappings.len(), compressed.len().div_ceil(8) + 1);
         assert!(mappings.len() > 16, "expected the sequence counter to wrap");
 
@@ -485,7 +599,7 @@ mod tests {
     #[tokio::test]
     async fn test_fetch_rejects_corrupt_compressed_data() {
         let garbage = b"this is not zlib data".to_vec();
-        let mappings = chunked_mappings(&garbage, 40);
+        let mappings = chunked_mappings(&garbage, 40, 0);
 
         let err = fetch(mappings, Duration::from_secs(1)).await.unwrap_err();
 
@@ -494,7 +608,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fetch_rejects_non_json_body() {
-        let mappings = chunked_mappings(&compress(b"not json at all"), 40);
+        let mappings = chunked_mappings(&compress(b"not json at all"), 40, 0);
 
         let err = fetch(mappings, Duration::from_secs(1)).await.unwrap_err();
 
@@ -514,6 +628,146 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, McuError::Call(_)), "{err:?}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Silence is a nak: renumber and request again
+    // -----------------------------------------------------------------------
+
+    /// A firmware whose `next_sequence` sits at 1 naks this connection's first
+    /// request (sequence 0) with an empty frame carrying 1 — byte-for-byte the
+    /// ack an accepted block gets — and then says nothing for the rest of the
+    /// budget. Read as an ack, the exchange dies there and identify never
+    /// completes; the handshake has to take the silence as the nak it cannot be
+    /// proved not to be, adopt the number the firmware reported, and request the
+    /// chunk again under that number.
+    #[tokio::test]
+    async fn test_a_firmware_one_ahead_is_renumbered_and_identifies() {
+        let compressed = compress(DICTIONARY_JSON.as_bytes());
+        let mut mappings = vec![MappingEntry {
+            // The nak: an empty frame stamped with the sequence the firmware is
+            // still waiting for, then silence.
+            input: Frame::new(0, request_payload(0)),
+            outputs: vec![Frame::new(1, Vec::new())],
+        }];
+        // Only a request numbered 1 is taken, and the transfer runs from there.
+        mappings.extend(chunked_mappings(&compressed, 40, 1));
+
+        let device = FrameMock::new(mappings.clone());
+        let recorder = device.recorder();
+        let mcu = Mcu::for_test("test_mcu", Interface::new(device));
+
+        let identify = Identify::fetch(&mcu, Duration::from_secs(1))
+            .await
+            .expect("the nak'd request is renumbered and the transfer completes");
+
+        assert_eq!(identify.data["app"], "Klipper");
+        assert!(
+            !mcu.took_over_session(),
+            "one ahead of our own first block is the ambiguity band, not a session to take over"
+        );
+        // The first request went out at 0, the renumbered one at the firmware's
+        // 1, and every chunk after it exactly once.
+        let sent = recorder.frames();
+        let expected: Vec<Frame> = mappings.iter().map(|entry| entry.input.clone()).collect();
+        assert_eq!(
+            sent, expected,
+            "the retry carries the sequence the firmware asked for, and nothing is sent twice"
+        );
+        assert_eq!(
+            sent[0].seq(),
+            0,
+            "the first try is under this connection's 0"
+        );
+        assert_eq!(
+            sent[1].seq(),
+            1,
+            "the retry is renumbered onto the firmware's 1"
+        );
+    }
+
+    /// The healthy path is untouched: the first answer arrives, so the send
+    /// window is neither renumbered nor asked to send anything again.
+    #[tokio::test]
+    async fn test_a_healthy_first_answer_is_neither_renumbered_nor_repeated() {
+        let compressed = compress(DICTIONARY_JSON.as_bytes());
+        let mappings = chunked_mappings(&compressed, 40, 0);
+
+        let device = FrameMock::new(mappings.clone());
+        let recorder = device.recorder();
+        let mcu = Mcu::for_test("test_mcu", Interface::new(device));
+
+        Identify::fetch(&mcu, Duration::from_secs(1))
+            .await
+            .expect("a firmware that answers on the first try identifies as always");
+
+        let sent = recorder.frames();
+        let expected: Vec<Frame> = mappings.iter().map(|entry| entry.input.clone()).collect();
+        assert_eq!(
+            sent, expected,
+            "one request per chunk at its own number: no renumbering, no retry"
+        );
+    }
+
+    /// Mid-session, an empty frame with the data frame right behind it is the
+    /// normal ack it has always been: the silence rule must not read a nak into
+    /// it, and the transfer goes on one request per chunk.
+    #[tokio::test]
+    async fn test_an_ack_with_the_response_right_behind_it_stays_an_ack() {
+        let compressed = compress(DICTIONARY_JSON.as_bytes());
+        let mut mappings = chunked_mappings(&compressed, 40, 0);
+        assert!(mappings.len() > 2, "the exchange has to run mid-transfer");
+        // The second chunk's answer comes out in the other order: the empty ack
+        // first, its data frame immediately behind it.
+        mappings[1].outputs.swap(0, 1);
+
+        let device = FrameMock::new(mappings.clone());
+        let recorder = device.recorder();
+        let mcu = Mcu::for_test("test_mcu", Interface::new(device));
+
+        Identify::fetch(&mcu, Duration::from_secs(1))
+            .await
+            .expect("an ack whose response follows is answered like any other");
+
+        let sent = recorder.frames();
+        let expected: Vec<Frame> = mappings.iter().map(|entry| entry.input.clone()).collect();
+        assert_eq!(
+            sent, expected,
+            "the empty frame changed nothing: one request per chunk, at its own number"
+        );
+    }
+
+    /// The cap, not the clock, ends a hopeless transfer: a firmware that keeps
+    /// answering with its number but never sends the response gets the renumbered
+    /// request `IDENTIFY_MAX_RETRIES` more times and then the chunk gives up —
+    /// with most of the budget unspent, so it is the cap that stopped it.
+    #[tokio::test]
+    async fn test_identify_gives_up_after_its_retry_cap() {
+        let attempts = 1 + IDENTIFY_MAX_RETRIES as usize;
+        let mappings: Vec<MappingEntry> = (0..attempts)
+            .map(|i| MappingEntry {
+                input: Frame::new(i as u8, request_payload(0)),
+                // Ack-shaped both ways: stamped one past the block, no response.
+                outputs: vec![Frame::new(i as u8 + 1, Vec::new())],
+            })
+            .collect();
+
+        let device = FrameMock::new(mappings.clone());
+        let recorder = device.recorder();
+        let mcu = Mcu::for_test("test_mcu", Interface::new(device));
+
+        let err = Identify::fetch(&mcu, Duration::from_secs(3))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, McuError::Call(_)), "{err:?}");
+
+        let sent = recorder.frames();
+        let expected: Vec<Frame> = mappings.iter().map(|entry| entry.input.clone()).collect();
+        assert_eq!(
+            sent, expected,
+            "exactly one attempt per round, {attempts} in all, each under the number the \
+             firmware reported"
+        );
     }
 
     #[tokio::test]
@@ -598,7 +852,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_identify_installs_dictionary() {
-        let mappings = chunked_mappings(&compress(DICTIONARY_JSON.as_bytes()), 40);
+        let mappings = chunked_mappings(&compress(DICTIONARY_JSON.as_bytes()), 40, 0);
         let mcu = mcu_with(mappings);
 
         let installed = mcu.identify(Duration::from_secs(1)).await.unwrap();
@@ -627,7 +881,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_connect_returns_identified_mcu() {
-        let mappings = chunked_mappings(&compress(DICTIONARY_JSON.as_bytes()), 40);
+        let mappings = chunked_mappings(&compress(DICTIONARY_JSON.as_bytes()), 40, 0);
 
         let mcu: Arc<Mcu> = Mcu::connect("test_mcu", interface(mappings)).await.unwrap();
 

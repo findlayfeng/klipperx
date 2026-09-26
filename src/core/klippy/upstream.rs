@@ -406,8 +406,6 @@ mod tests {
     /// `KLIPPERX_UPSTREAM_ALL=1` runs every case and reports every failure, so
     /// the list stays honest rather than hiding regressions.
     const IGNORED: &[&str] = &[
-        "generic_cartesian_iqex.test",
-        "generic_cartesian_itex.test",
         "load_cell.test",
         "printers.test",
         "rotary_delta_calibrate.test",

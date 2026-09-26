@@ -792,6 +792,7 @@ pins: !PD0, PD1, PD2
 | 选项 | 说明 |
 |------|------|
 | `axis`（X/Y/Z）、`safe_distance`（毫米） | 第二滑架轴与最近距，按上游读取（`idex_modes.py`/`cartesian.py:24-34`） |
+| `primary_carriage`（generic 形态，**可选**） | 无它 = 该轴的**主动滑架**（`axis` 必填、无 `safe_distance`）；有它 = 从动滑架（`axis` 可选、仅作交叉校验，`safe_distance` 生效）。同主滑架的两个 dual 会报重（按**主滑架名**判，非按轴）；`[extra_carriage <name>]` 的 `primary_carriage` **仍必填**（批 #27） |
 | 电机组 | 经 `PrinterStepper`（同上游 `LookupMultiRail`） |
 
 cartesian 在 late 阶段认领；注册 `dual_carriage` 对象与 `SET_DUAL_CARRIAGE`/`SAVE_…_STATE`/`RESTORE_…_STATE`。**轨间坐标交接已实现**（批 #4，`toggle_active_dc_rail` 语义：切换/恢复携带 gcode 坐标）；步进仍仅主轨（`updateLimits` 未移植，C1）。已随 U-A7b 转绿（2026-09-24）。**generic 形态**（批 #12）：`[carriage <name>]`/`[dual_carriage <name>]`/`[extra_carriage <name>]`/`[stepper <name>]` 由运动学注册同一对象与三命令（`dual_carriage` status 报 `active_carriage` + `carriages`），`[printer]` 的 `max_z_velocity/max_z_accel` 经 `carriage::build` 进入 generic 归零（原写死 0 为首因）。
@@ -918,10 +919,11 @@ Z 端停来源：`[stepper_z]`，否则 `[carriage <名>]` 中 axis 为 z 者；
 
 | 选项 | 默认 | 说明 |
 |------|------|------|
-| `lcd_type` | —（必填） | 已实现 `st7920`/`hd44780`/`uc1701`/`ssd1306`；其余（`sh1106`/`hd44780_spi`/`aip31068_spi`/`emulated_st7920`/…）报 `lcd_type '<x>' is not implemented in this host` |
+| `lcd_type` | —（必填） | 已实现 `st7920`/`hd44780`/`uc1701`/`ssd1306`/`aip31068_spi`；其余（`sh1106`/`hd44780_spi`/`emulated_st7920`/…）报 `lcd_type '<x>' is not implemented in this host` |
 | `cs_pin` / `sclk_pin` / `sid_pin` | — | st7920 三线（同 MCU，否则 `st7920 all pins must be on same mcu`） |
 | `rs_pin`/`e_pin`/`d4_pin`…`d7_pin` | — | hd44780 4-bit 并行六线（同 MCU，否则 `hd44780 all pins must be on same mcu`）；`hd44780_protocol_init`（默认 True）、`line_length`（16\|20，默认 20，非法值 choice 文案） |
 | `uc1701`/`ssd1306` 面板选项 | — | `a0_pin`(uc1701 必填)/`dc_pin`、`contrast`/`vcomh`/`invert`(ssd1306)、`rst_pin`/`reset_pin`；SPI 走 `McuSpi::send` 只入队（真传输在假 MCU 不可用，已知约束） |
+| `aip31068_spi` 面板选项 | — | `latch_pin`（必填，SPI cs/latch）、`line_length`（16\|20，默认 20）、`spi_speed`（≥100000，默认 100 kHz）、`spi_bus`/`spi_software_*`；传输是 9-bit 字（`encode`/`encoded_groups`，批 #28） |
 | `display_group` | `_default_16x4` | 组来自随模块发布的 `display.cfg`（20 列时默认 `_default_20x4`）；未知组报 `Unknown display_data group '%s'` |
 | 菜单/按键选项 | — | `menu_root`/`menu_timeout`/`menu_reverse_navigation`/`encoder_pins`/`encoder_steps_per_detent`/`encoder_fast_rate`/`click_pin`/`back_pin`/`up_pin`/`down_pin`/`kill_pin`/`analog_range_*`/`analog_pullup_resistor` **只被读取**（菜单未实现） |
 
@@ -969,6 +971,14 @@ gap（如实登记）：**屏幕内容不渲染**（`display_template`/`display_
 | `smooth_time` | `2.0` | 参考平滑时间常数（秒），`above=0.` |
 
 节名注册为虚拟 pin chip，消费者写作 `sensor_pin: <name>:PA0`，读数按 `(raw - vssa)/(vref - vssa)` 归一。**必须写在 `[extruder]`/`[heater_bed]` 之前**（本仓以 `phase = early` 保证）。gap：`QUERY_ADC` 未实现。
+
+### `[multi_pin <name>]` — 多 pin 扇出（批 #26）
+
+| 选项 | 默认 | 说明 |
+|------|------|------|
+| `pins` | —（必填） | 逗号分隔的真实 pin 列表；调用（`set_pwm`/`update_pwm`/`setup_*`/数字输出）逐个转发 |
+
+节名注册为虚拟 pin chip：其他节写 `pin: multi_pin:<name>`（或 `heater_pin: multi_pin:heater`）。装载相位为 **`phase = early`**（`[extruder]` 等主节在装载期就要解析它；prefix-only 降 `order` 无效）。别名不得用于步进电机 pin。
 
 ### `[mcp4451 <name>]` — I2C 数字电位器（批 #25）
 

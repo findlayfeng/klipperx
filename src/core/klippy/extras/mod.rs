@@ -22,6 +22,7 @@ pub mod buttons;
 pub mod carriage;
 pub mod controller_fan;
 pub mod dac084s085;
+pub mod delayed_gcode;
 pub mod delta_calibrate;
 pub mod display;
 pub mod display_status;

@@ -3068,7 +3068,7 @@ mod tests {
         let mut section = ConfigSection::new("printer", None);
         section.parameters.insert(
             "kinematics".to_string(),
-            ConfigValue::Single("winch".to_string()),
+            ConfigValue::Single("scara".to_string()),
         );
         section.parameters.insert(
             "max_velocity".to_string(),
@@ -3085,7 +3085,7 @@ mod tests {
             .map(|_| ())
             .unwrap_err();
 
-        assert!(err.to_string().contains("Error loading kinematics 'winch'"));
+        assert!(err.to_string().contains("Error loading kinematics 'scara'"));
         // The message also names what *is* implemented, including delta now.
         assert!(err.to_string().contains("delta"));
     }

@@ -395,6 +395,13 @@ impl Hx71x {
         &self.state.name
     }
 
+    /// The MCU chip this sensor lives on (its `dout_pin`'s chip), as the
+    /// `pins` registry keys it (`[load_cell_probe]` looks the `McuChip` up by
+    /// this name for the trigger analog).
+    pub fn mcu_chip_name(&self) -> &str {
+        &self.state.chip
+    }
+
     /// The sensor's object id.
     pub fn oid(&self) -> u8 {
         self.state.oid

@@ -27,7 +27,7 @@
 //! | `and` `or` `not`, `in` `not in`, `==` `!=` `<` `>` `<=` `>=` | `macros.cfg:66` |
 //! | `+ - * / %`, unary `-`, `t - 12.0` | `macros.cfg:37` |
 //! | `x is defined` / `is not defined` | `sdcard_loop.cfg:90` |
-//! | filters `\| int` | `params.T \| int` (`exclude_object.cfg:92`) |
+//! | filters `\| int`, `\| float`, `\| default(x)` | `params.S \| default(1000.0) \| float` (`printer-velleman-k8800-2017.cfg:125`) |
 //! | `range(n)` | `range(params.T \| int)` |
 //! | `action_respond_info`, `action_raise_error` | `macros.cfg`, `exclude_object.cfg` |
 //! | the macro's `variable_*` as bare names, `params`, `rawparams` | `macros.cfg:33` |
@@ -37,8 +37,10 @@
 //! - Statements outside `if/elif/else/endif/for/endfor/set` — Jinja also has
 //!   `{% block %}`, `{% include %}`, … — are refused at load
 //!   (`unsupported statement 'block'`).
-//! - Filters outside `int` (`min`/`max` in the same file) are refused at
-//!   render.
+//! - Filters outside `int`/`float`/`default` (`min`/`max`/`abs`/`replace` in
+//!   the same corpus) are refused at render; a filter's keyword arguments
+//!   (`default(0, boolean=True)`) are outside the subset, so the tokenizer
+//!   refuses the `=`.
 //! - `range(n)` takes one argument; `action_emergency_stop` and
 //!   `action_call_remote_method` are not bound, so a name error says so.
 //! - Python literals in `ast.literal_eval` syntax (`None`, `'str'`, …) are
@@ -47,6 +49,10 @@
 //!   default `Undefined` would render an empty string. Upstream's *corpus*
 //!   always names a key that exists; a port gap that hides behind a blank
 //!   `PARK_` line would be silent, so it fails loudly instead.
+//! - `\| default(x)` is the one construct that expects to miss: it probes its
+//!   base quietly, the way `is defined` does, and falls back to `x`, because
+//!   `params.S \| default(…)` is exactly how the corpus spells an omitted
+//!   parameter. Every other lookup still fails loudly.
 //!
 //! Status coordinates deserve their own note: klippy reports `Coord`
 //! namedtuples (`klippy/gcode.py`), which Jinja reads as `.x`/`.y`/`.z`/`.e`,
@@ -934,7 +940,7 @@ enum ExprKind {
     Attr(Box<Expr>, String),
     Index(Box<Expr>, Box<Expr>),
     Call(Box<Expr>, Vec<Expr>),
-    Filter(Box<Expr>, String),
+    Filter(Box<Expr>, String, Vec<Expr>),
     /// `x is defined` / `x is not defined` (`sdcard_loop.cfg:90`).
     IsDefined {
         negated: bool,
@@ -997,7 +1003,14 @@ impl Expr {
                 let args: Vec<String> = args.iter().map(Expr::describe).collect();
                 format!("{}({})", callee.describe(), args.join(", "))
             }
-            ExprKind::Filter(base, filter) => format!("{} | {}", base.describe(), filter),
+            ExprKind::Filter(base, filter, args) => {
+                if args.is_empty() {
+                    format!("{} | {}", base.describe(), filter)
+                } else {
+                    let args: Vec<String> = args.iter().map(Expr::describe).collect();
+                    format!("{} | {}({})", base.describe(), filter, args.join(", "))
+                }
+            }
             ExprKind::IsDefined { negated, test } => {
                 format!(
                     "{} is {}defined",
@@ -1278,6 +1291,9 @@ impl<'a> ExprParser<'a> {
         self.parse_filter()
     }
 
+    /// `expr | name` with Jinja's optional argument list, `expr | name(a, b)`
+    /// — `params.S | default(1000.0) | float`
+    /// (`printer-velleman-k8800-2017.cfg:125`).
     fn parse_filter(&mut self) -> Result<Expr, TemplateError> {
         let mut left = self.parse_postfix()?;
         while self.is_op("|") {
@@ -1287,8 +1303,23 @@ impl<'a> ExprParser<'a> {
                 return Err(self.error("expected a filter name after '|'"));
             };
             self.bump();
+            let mut args = Vec::new();
+            if self.is_op("(") {
+                self.bump();
+                if !self.is_op(")") {
+                    loop {
+                        args.push(self.parse_or()?);
+                        if self.is_op(",") {
+                            self.bump();
+                            continue;
+                        }
+                        break;
+                    }
+                }
+                self.expect_op(")")?;
+            }
             left = Expr {
-                kind: ExprKind::Filter(Box::new(left), filter),
+                kind: ExprKind::Filter(Box::new(left), filter, args),
                 line,
             };
         }
@@ -1540,13 +1571,31 @@ fn eval(expr: &Expr, context: &Context, name: &str) -> Result<Rt, TemplateError>
             }
             call(callee, &evaluated, context, name).map_err(|detail| error(detail))
         }
-        ExprKind::Filter(base, filter) => {
+        ExprKind::Filter(base, filter, args) => {
+            // Arity is the filter's own property, so it is reported before the
+            // base resolves — a missing `params.S` would mask it.
+            check_filter_arity(filter, args.len()).map_err(error)?;
+            // `default` must know whether its base *resolves*, so it probes it
+            // quietly instead of failing the render the way every other
+            // operand does (`params.S|default(…)` with `S` omitted).
+            if filter == "default" {
+                let fallback = eval(&args[0], context, name)?;
+                return Ok(eval_quiet(base, context).unwrap_or(fallback));
+            }
+            let mut evaluated = Vec::with_capacity(args.len());
+            for arg in args {
+                evaluated.push(eval(arg, context, name)?);
+            }
             let value = eval(base, context, name)?;
             match filter.as_str() {
                 // Jinja's `int` filter: `int(value)`, then `int(float(value))`.
-                "int" => filter_int(&value).map_err(|detail| error(detail)),
+                "int" => filter_int(&value).map_err(error),
+                // Jinja's `float` filter: `float(value)` or the filter's own
+                // default, `0.0` when it has no argument.
+                "float" => filter_float(&value, evaluated.first()).map_err(error),
                 other => Err(error(format!(
-                    "unknown filter '{other}' (this port implements 'int')"
+                    "unknown filter '{other}' \
+                     (this port implements 'int', 'float' and 'default')"
                 ))),
             }
         }
@@ -1763,6 +1812,23 @@ fn call(callee: &Expr, args: &[Rt], context: &Context, name: &str) -> Result<Rt,
     }
 }
 
+/// The argument count each implemented filter accepts; anything else is one of
+/// this port's gaps, named as such.
+fn check_filter_arity(filter: &str, count: usize) -> Result<(), String> {
+    match filter {
+        "int" if count > 0 => Err(format!(
+            "the 'int' filter takes no arguments here, got {count} (this port's gap)"
+        )),
+        "float" if count > 1 => Err(format!(
+            "the 'float' filter takes at most 1 argument here, got {count} (this port's gap)"
+        )),
+        "default" if count != 1 => Err(format!(
+            "the 'default' filter takes 1 argument here, got {count} (this port's gap)"
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// `| int`: `int(value)`, falling back to `int(float(value))` as Jinja's
 /// filter does.
 fn filter_int(value: &Rt) -> Result<Rt, String> {
@@ -1785,6 +1851,28 @@ fn filter_int(value: &Rt) -> Result<Rt, String> {
             ))
         }
         other => Err(format!("cannot convert {} to an integer", type_name(other))),
+    }
+}
+
+/// `| float` (and `| float(d)`): `float(value)`, returning the filter's own
+/// default — `d`, or `0.0` when it has none — for the types Python's `float()`
+/// rejects (`TypeError`) and for strings it cannot parse (`ValueError`).
+fn filter_float(value: &Rt, default: Option<&Rt>) -> Result<Rt, String> {
+    fn fallback(default: Option<&Rt>) -> Result<Rt, String> {
+        Ok(default.cloned().unwrap_or_else(|| Rt::Json(json!(0.0))))
+    }
+    match value {
+        Rt::Json(Value::Number(number)) => match number.as_f64() {
+            Some(float) => Ok(Rt::Json(json!(float))),
+            None => fallback(default),
+        },
+        Rt::Json(Value::Bool(flag)) => Ok(Rt::Json(json!(if *flag { 1.0 } else { 0.0 }))),
+        Rt::Json(Value::String(text)) => match text.trim().parse::<f64>() {
+            Ok(float) => Ok(Rt::Json(json!(float))),
+            Err(_) => fallback(default),
+        },
+        // `None`, a container, `printer`, a builtin: `float()` raises.
+        Rt::Json(_) | Rt::List(_) | Rt::Printer(_) | Rt::Builtin(_) => fallback(default),
     }
 }
 
@@ -2097,9 +2185,9 @@ mod tests {
         let error =
             render("{params.L | min}", &mut context(&[("L", "1")], "")).expect_err("no filter");
         assert!(
-            error
-                .to_string()
-                .contains("unknown filter 'min' (this port implements 'int')"),
+            error.to_string().contains(
+                "unknown filter 'min' (this port implements 'int', 'float' and 'default')"
+            ),
             "{error}"
         );
 
@@ -2117,6 +2205,291 @@ mod tests {
                 .to_string()
                 .contains("[exclude_object] is not enabled"),
             "{error}"
+        );
+    }
+
+    /// The filter shapes the corpus writes, one per literal form: a parameter
+    /// with a fallback (`|default(` appears 31 times, `|float` 29 times across
+    /// `config/*.cfg` + `test/klippy/*.cfg`), always chained into a coercion.
+    #[test]
+    fn filter_arguments_follow_the_corpus_forms() {
+        // `{% set S = params.S|default(1000.0)|float %}` — float literal
+        // fallback (`printer-velleman-k8800-2017.cfg:125`, `sample-pwm-tool.cfg:21`,
+        // `sample-macros.cfg:101-103` with `|default(0)|float`).
+        let float_default = "{% set S = params.S|default(1000.0)|float %}{ S }";
+        assert_eq!(
+            render(float_default, &mut context(&[], "")).expect("S omitted"),
+            "1000.0"
+        );
+        assert_eq!(
+            render(float_default, &mut context(&[("S", "25")], "")).expect("S given"),
+            "25.0"
+        );
+
+        // `{% set P = params.P|default(100)|int %}` — int literal fallback
+        // (`printer-velleman-k8800-2017.cfg:127`, `sample-macros.cfg:79-81`,
+        // `printer-geeetech-A10T-A20T-2021.cfg:175` with `|default(0)| int`).
+        let int_default = "{% set P = params.P|default(100)|int %}{ P }";
+        assert_eq!(
+            render(int_default, &mut context(&[], "")).expect("P omitted"),
+            "100"
+        );
+        assert_eq!(
+            render(int_default, &mut context(&[("P", "300")], "")).expect("P given"),
+            "300"
+        );
+
+        // `{% set X = params['X']|float %}` — a bare `|float` on an index base
+        // (`sample-macros.cfg:285-306`).
+        let bare = "{% set X = params['X']|float %}{ X }";
+        assert_eq!(
+            render(bare, &mut context(&[("X", "1.5")], "")).expect("X given"),
+            "1.5"
+        );
+
+        // A `default` that is not chained (`display/menu.cfg:359`): the
+        // fallback for an absent key, the key's own value whatever its type
+        // when it is present.
+        assert_eq!(
+            render("{params.Q|default(0)}", &mut context(&[], "")).expect("Q omitted"),
+            "0"
+        );
+        assert_eq!(
+            render("{params.Q|default(0)}", &mut context(&[("Q", "x")], "")).expect("Q given"),
+            "x"
+        );
+        // An undefined *name* falls back the same way, and a `None` is a value
+        // `default` passes through (Jinja's `default` only catches undefined).
+        assert_eq!(
+            render("{nope|default(7)}", &mut context(&[], "")).expect("undefined name"),
+            "7"
+        );
+        assert_eq!(
+            render("{None|default(7)}", &mut context(&[], "")).expect("None is defined"),
+            "None"
+        );
+    }
+
+    /// `|float` without an argument is Jinja's `0.0` fallback
+    /// (`sample-macros.cfg:285`), `|float(d)` its own default, and a chained
+    /// `|float|default(d)` tests the value that resolves.
+    #[test]
+    fn float_falls_back_to_zero_or_to_its_argument() {
+        assert_eq!(
+            render("{None|float}", &mut context(&[], "")).expect("None"),
+            "0.0"
+        );
+        assert_eq!(
+            render("{params.S|float}", &mut context(&[("S", "oops")], "")).expect("not a number"),
+            "0.0"
+        );
+        assert_eq!(
+            render("{params.S|float(0.25)}", &mut context(&[("S", "oops")], "")).expect("default"),
+            "0.25"
+        );
+        assert_eq!(
+            render(
+                "{params.S|float|default(0)}",
+                &mut context(&[("S", "2.5")], "")
+            )
+            .expect("chain"),
+            "2.5"
+        );
+        // A string `float()` accepts keeps Python's spellings (`float("1e3")`).
+        assert_eq!(
+            render("{params.S|float}", &mut context(&[("S", "1e3")], "")).expect("exponent"),
+            "1000.0"
+        );
+        // `|float` on an undefined name stays an error: the corpus spells the
+        // fallback as `|default(0.0)|float` when it wants one
+        // (`sample-pwm-tool.cfg:21`).
+        let error = render("{nope|float}", &mut context(&[], "")).expect_err("undefined");
+        assert!(error.to_string().contains("'nope' is undefined"), "{error}");
+    }
+
+    /// The blocks the corpus puts a filter in: an `{% if %}` condition
+    /// (`printer-anycubic-4maxpro-2.0-2021.cfg:171`) and a `{% for %}`
+    /// iterable (`exclude_object.cfg:92`'s shape).
+    #[test]
+    fn filters_work_inside_if_and_for_blocks() {
+        let branch = "{% if params.S|default(0)|int > 0 %}HOT{% else %}COLD{% endif %}";
+        assert_eq!(
+            render(branch, &mut context(&[], "")).expect("S omitted"),
+            "COLD"
+        );
+        assert_eq!(
+            render(branch, &mut context(&[("S", "5")], "")).expect("S given"),
+            "HOT"
+        );
+
+        let loop_source = "{% for i in range(params.T|default(3)|int) %}NAME={i} {% endfor %}";
+        assert_eq!(
+            render(loop_source, &mut context(&[], "")).expect("T omitted"),
+            "NAME=0 NAME=1 NAME=2 "
+        );
+    }
+
+    /// `|float` against the operand shapes the corpus writes it on: a
+    /// parenthesized sum (`printer-geeetech-A10T-A20T-2021.cfg:210`), a bare
+    /// name inside arithmetic (`printer-anycubic-4maxpro-2.0-2021.cfg:159`),
+    /// a binary expression (`…geeetech…:200`, `e0 / (…) | float`), and an
+    /// attribute (`sample-macros.cfg:286`). The filter binds tighter than
+    /// `*`/`/`, as in Jinja, so it takes the name, not the quotient.
+    #[test]
+    fn float_binds_like_jinja_inside_arithmetic() {
+        let mut bound = context(&[], "");
+        bound.insert("e0", Rt::Json(json!(1.0)));
+        assert_eq!(
+            render("{(e0+0.000001)|float}", &mut bound).expect("renders"),
+            "1.000001"
+        );
+        assert_eq!(
+            render("{e0 / (e0 + 1) | float}", &mut bound).expect("renders"),
+            "0.5"
+        );
+        let quotient = "{% set S = params.S|default(2)|float %}{ 1.0 / S | float }";
+        assert_eq!(
+            render(quotient, &mut context(&[], "")).expect("renders"),
+            "0.5"
+        );
+
+        bound.insert("pot", Rt::Json(json!({ "scale": 0.5 })));
+        assert_eq!(
+            render("{pot.scale|float}", &mut bound).expect("renders"),
+            "0.5"
+        );
+    }
+
+    /// The argument counts this port refuses, spelled out rather than
+    /// guessed at.
+    #[test]
+    fn filter_arity_errors_name_the_filter() {
+        let error = render("{params.S|float(1, 2)}", &mut context(&[], "")).expect_err("arity");
+        assert!(
+            error.to_string().contains(
+                "the 'float' filter takes at most 1 argument here, got 2 (this port's gap)"
+            ),
+            "{error}"
+        );
+
+        let error = render("{params.S|int(1)}", &mut context(&[], "")).expect_err("arity");
+        assert!(
+            error
+                .to_string()
+                .contains("the 'int' filter takes no arguments here, got 1 (this port's gap)"),
+            "{error}"
+        );
+
+        let error = render("{params.S|default}", &mut context(&[], "")).expect_err("arity");
+        assert!(
+            error
+                .to_string()
+                .contains("the 'default' filter takes 1 argument here, got 0 (this port's gap)"),
+            "{error}"
+        );
+
+        let error = render("{params.S|default(1, 2)}", &mut context(&[], "")).expect_err("arity");
+        assert!(
+            error
+                .to_string()
+                .contains("the 'default' filter takes 1 argument here, got 2 (this port's gap)"),
+            "{error}"
+        );
+
+        // Jinja's other spelling is a keyword argument (`default(0, boolean=True)`);
+        // the tokenizer has no `=`, so that stays a load error.
+        let error = Template::parse(
+            "gcode_macro TEST:gcode",
+            "{params.S|default(0, boolean=True)}",
+        )
+        .expect_err("keyword argument");
+        assert!(
+            error
+                .to_string()
+                .contains("unexpected character '=' in expression"),
+            "{error}"
+        );
+
+        // `int`'s type refusal is unchanged.
+        let error = render("{params.S|int}", &mut context(&[("S", "oops")], "")).expect_err("type");
+        assert!(
+            error.to_string().contains("invalid literal for int()"),
+            "{error}"
+        );
+    }
+
+    /// The corpus macros these filters come from, loaded cell-for-cell from
+    /// their config files: the `M300` tones of
+    /// `printer-velleman-k8800-2017.cfg:124-130` and
+    /// `printer-sunlu-t3-2022.cfg:185-197`.
+    #[test]
+    fn the_corpus_m300_templates_load_and_render() {
+        let velleman = "    # Use a default 1kHz tone if S is omitted.\n    \
+                        {% set S = params.S|default(1000.0)|float %}\n    \
+                        # Use a 10ms duration is P is omitted.\n    \
+                        {% set P = params.P|default(100)|int %}\n    \
+                        SET_PIN PIN=BEEPER VALUE=50 CYCLE_TIME={ 1.0 / S }\n    \
+                        G4 P{P}\n    SET_PIN PIN=BEEPER VALUE=0\n";
+        let rendered = render(velleman, &mut context(&[], "")).expect("the macro loads");
+        assert!(
+            rendered.contains("SET_PIN PIN=BEEPER VALUE=50 CYCLE_TIME=0.001"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("G4 P100"), "{rendered}");
+
+        let sunlu = "  {% set S = params.S|default(1000)|int %} ; S sets the tone frequency\n  \
+                     {% set P = params.P|default(100)|int %} ; P sets the tone duration\n  \
+                     {% set L = 0.5 %} ; L varies the PWM on time\n  \
+                     {% if S <= 0 %} ; dont divide through zero\n  \
+                     {% set F = 1 %}\n  {% set L = 0 %}\n  \
+                     {% elif S >= 10000 %} ;max frequency set to 10kHz\n  \
+                     {% set F = 0 %}\n  {% else %}\n  \
+                     {% set F = 1/S %} ;convert frequency to seconds\n  {% endif %}\n    \
+                     SET_PIN PIN=beeper VALUE={L} CYCLE_TIME={F} ;Play tone\n  \
+                     G4 P{P} ;tone duration\n";
+        let rendered = render(sunlu, &mut context(&[], "")).expect("the macro loads");
+        assert!(
+            rendered.contains("SET_PIN PIN=beeper VALUE=0.5 CYCLE_TIME=0.001"),
+            "{rendered}"
+        );
+        // `S=1000` takes the `else` branch; a `S` above the cap takes `elif`.
+        let loud = "{% set S = params.S|default(1000)|int %}\
+                    {% if S <= 0 %}zero{% elif S >= 10000 %}capped{% else %}{F}{% endif %}";
+        assert_eq!(
+            render(loud, &mut context(&[("S", "20000")], "")).expect("renders"),
+            "capped"
+        );
+    }
+
+    /// The two `SET_COPY_MODE` templates (`generic_cartesian_iqex.cfg:282-299`,
+    /// `generic_cartesian_itex.cfg:226-256`) carry no `|default`/`|float` at
+    /// all: their first load error is the list literal `[a, b]` that a later
+    /// unit owns. This pin records which side of the boundary they sit on, so
+    /// the template gap is not mistaken for a filter one (when list literals
+    /// land, the assertion flips to `is_ok()`).
+    #[test]
+    fn set_copy_mode_templates_stop_on_list_literals() {
+        let iqex = "    G90\n    \
+                    {% set y_center = 0.5 * (printer.configfile.settings[\"dual_carriage carriage_gantry1_left\"].position_max + printer.configfile.settings[\"carriage carriage_gantry0_left\"].position_min) %}\n    \
+                    {% set x_max = [printer.configfile.settings[\"dual_carriage carriage_t3\"].position_max, printer.configfile.settings[\"dual_carriage carriage_t1\"].position_max]|min %}\n    \
+                    {% set x_min = [printer.configfile.settings[\"dual_carriage carriage_t2\"].position_min, printer.configfile.settings[\"carriage carriage_t0\"].position_min]|max %}\n    \
+                    {% set x_center = 0.5 * (x_max + x_min) %}\n";
+        let error = Template::parse("gcode_macro SET_COPY_MODE:gcode", iqex).expect_err("list");
+        assert_eq!(
+            error.to_string(),
+            "Error loading template 'gcode_macro SET_COPY_MODE:gcode'\n\
+             line 3: unexpected token '[' in expression"
+        );
+
+        let itex = "    G90\n    \
+                    {% set y_center = 0.5 * (printer.configfile.settings[\"dual_carriage carriage_gantry1\"].position_max + printer.configfile.settings[\"carriage carriage_gantry0_left\"].position_min) %}\n    \
+                    {% set x_max = printer.configfile.settings[\"dual_carriage carriage_t1\"].position_max %}\n    \
+                    {% set x_min = [printer.configfile.settings[\"dual_carriage carriage_t2\"].position_min, printer.configfile.settings[\"carriage carriage_t0\"].position_min]|max %}\n";
+        let error = Template::parse("gcode_macro SET_COPY_MODE:gcode", itex).expect_err("list");
+        assert_eq!(
+            error.to_string(),
+            "Error loading template 'gcode_macro SET_COPY_MODE:gcode'\n\
+             line 4: unexpected token '[' in expression"
         );
     }
 }

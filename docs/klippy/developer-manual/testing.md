@@ -213,7 +213,7 @@ git config core.hooksPath .githooks
 |------|------|
 | `klippy.rs` | `is_restart` 只认 `restart` / `firmware_restart`；`klippy_process` 一回合内 `restart` 重建、`exit` 结束（用 `RestartOnce` 替身对象）；**A3 机制**：在 `machine_handle.enter()` 之下建的 `test:` 接口捕获到的是机器 runtime，而不是 ambient 的 API runtime（`Interface::with_transport` 的 `Handle::current()`） |
 
-| `stress.rs` | 段计算与引脚解析：按节名找 MCU（带名的不拿裸 `[mcu]`、空名拿裸的）、引脚名的 chip 副本只在有冒号时出现、别的 MCU 上的 stepper 被跳过；一段填满时长且间隔均匀、时钟变慢拉长间隔而时长不变、间隔不到 0 被截且命令有上界；引脚经字典枚举解析 |
+| `stress.rs` | 段计算与引脚解析：按节名找 MCU（带名的不拿裸 `[mcu]`、空名拿裸的）、引脚名的 chip 副本只在有冒号时出现、别的 MCU 上的 stepper 被跳过；一段填满时长且间隔均匀、时钟变慢拉长间隔而时长不变、间隔不到 0 被截且命令有上界；引脚经字典枚举解析；**多机**：选择与汇总（`mcus_are_selected_by_name_or_all_and_summarised_per_board`：多值/去重/`--all-mcus`/互斥、前缀与收尾文案）、旧单机命令行等价（`the_old_single_board_command_line_still_selects_the_default_mcu`）、双假设备**并发 identify+驱动**不串（`two_fake_boards_identify_and_drive_concurrently`，两字典命令数不同为证、回调各自恰 25 次）、**帧级隔离**（`concurrent_sessions_send_only_their_own_frames_to_their_own_recorder`，两 Recorder 各恰 8 帧、无异板 payload）；完整双板 ramp 并发需真板（待验项见 stress.md） |
 | `main.rs` | CLI 形状：不给子命令时跑主机、选项随默认子命令走、显式拼法同效、单独给子命令回帮助；`--api-server` 每处默认一致、空值=主机不开服务；`--tui` 是 CLI 自己的、客户端子命令不受影响；`--logfile` 两种拼法都是主机的；裸调用打帮助、缺配置文件的旗标后置才报、主机子命令单跑打帮助、主机参数与子命令不可混用 |
 | `logging.rs` | 窗口收到主机记录；`--verbose` 与 `RUST_LOG` 取更详细者；窗口槽在层级查找处；`--logfile` 收到格式化字节、打不开则降级 stdout；rollover info 排序并清空 |
 

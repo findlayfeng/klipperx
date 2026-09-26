@@ -112,8 +112,8 @@ enum Commands {
     //
     // A bench tool, not part of the host: it takes the named MCU over and ramps
     // `queue_step` load (or `get_clock` request rate) until the firmware shuts
-    // down (or the link gives out). `arg_required_else_help` because both the
-    // config file and the MCU name are required.
+    // down (or the link gives out). `arg_required_else_help` because the
+    // config file is required; the MCU names default to the bare `[mcu]`.
     #[command(arg_required_else_help = true)]
     Stress(klipperx::stress::StressArgs),
 }

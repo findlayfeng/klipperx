@@ -127,6 +127,27 @@ Trapq（一段匀速 5 mm 移动）
 即链路能稳定扛住约 **3.5k 往返/秒**，再高响应就开始积压。注意这与“名义 250000 baud”无关——
 USB CDC 走的是 USB 全速，真正的瓶颈在固件的命令处理与响应队列。
 
+## 多机（同时打多块板）
+
+`[MCU]...` 是多值参数：**省略 = 只连裸 `[mcu]`**（与旧单机行为一致），可给一个或多个名字
+（重复自动去重）；`--all-mcus` 枚举配置里全部 `[mcu …]` 节（按配置顺序，裸 `[mcu]` 计一个），
+与显式名单互斥（同给报错）。
+
+```sh
+klipperx stress config.cfg                       # 单板（默认 [mcu]）
+klipperx stress config.cfg mcu2                  # 指定一块
+klipperx stress config.cfg mcu mcu2 --task step  # 两板并发
+klipperx stress config.cfg --all-mcus --task comm
+```
+
+每板一路 future 由 `join_all` 并发轮询（板数运行期才知道，等价于逐 future `join!`；单板连接
+失败不阻断其它板，记入汇总）。**所有输出行带 `[<mcu>] ` 前缀**（含单板运行），收尾按板汇总：
+step 打 `last rate it survived`（两条退出路径都打）、comm 打 `last rate it carried`、到顶打
+`no failure up to …`。退出码：任一板**硬错误**（连接/配置失败）→ 1；各板「找到上限」仍算成功。
+
+运行时仍是 `worker_threads(2)`（`run()` 处有注释）：阻塞 I/O 走 blocking 池，每板只占
+send/recv 两个后台任务——**双路 ramp 的余量未实测**，出现调度延迟再调。
+
 ## 它会怎么对待板子
 
 这是一次**接管**：`ConfigBuilder` 的握手会给一块跑着别的配置（或已 shutdown）的板子发
@@ -147,7 +168,9 @@ USB CDC 走的是 USB 全速，真正的瓶颈在固件的命令处理与响应�
   `microsteps` / `enable_pin` 等**不读**——这些选项现在由 `extras/stepper.rs` 的正式 stepper
   资源消费，压力工具只借 step/dir 引脚，自己造一个固定的 stepper（剩余项见 S1）。
 - 夹具每次 reset + reconnect（无 `config_reset` 的固件）约 0.5 s。
-- 端到端只在真板上手工跑过；单测覆盖的是段计算、引脚解析与命令编码。
+- 端到端只在真板上手工跑过（**双板并发的真板验证项**：双 step ramp、双 comm ramp 的调度余量、
+  `--all-mcus` 真实枚举、单板旧命令行回归、一板连接失败另一板照常+退出码 1）；单测覆盖的是段
+  计算、引脚解析、命令编码与多机选择/双假设备并发的帧隔离（见 [测试](testing.md)）。
 
 TODO 里记着这些剩余项（**S1**）。
 

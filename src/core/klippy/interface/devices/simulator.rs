@@ -55,6 +55,7 @@ use crate::core::klippy::interface::Device;
 use crate::core::klippy::mcu::Dictionary;
 use crate::core::klippy::msg::parser::Parser;
 use crate::core::klippy::msg::proto::{ArgValue, Payload};
+use crate::core::klippy::trace_enabled;
 
 /// How many bytes one `identify` answer may carry. The host asks for a window of
 /// its own size (`cmd::identify::IDENTIFY_CHUNK_SIZE`, `count=40`); this is the
@@ -369,9 +370,11 @@ impl SimulatorDevice {
                                 fired: false,
                             },
                         );
-                        eprintln!(
-                            "SIM-DIAG: arm trsync={trsync_oid} clock={clock} level={pin_value}"
-                        );
+                        if trace_enabled() {
+                            eprintln!(
+                                "SIM-DIAG: arm trsync={trsync_oid} clock={clock} level={pin_value}"
+                            );
+                        }
                     } else {
                         // The disable the host sends after waiting: remove
                         // just this endstop's check (a following
@@ -382,7 +385,9 @@ impl SimulatorDevice {
                             _ => 0,
                         };
                         if state.armed.contains_key(&oid) {
-                            eprintln!("SIM-DIAG: disarm (query follows)");
+                            if trace_enabled() {
+                                eprintln!("SIM-DIAG: disarm (query follows)");
+                            }
                         }
                         state.armed.remove(&oid);
                     }
@@ -428,7 +433,9 @@ impl SimulatorDevice {
                     {
                         if *monitor_ticks == 0 {
                             state.trigger_analog = None;
-                            eprintln!("SIM-DIAG: trigger_analog disarm");
+                            if trace_enabled() {
+                                eprintln!("SIM-DIAG: trigger_analog disarm");
+                            }
                         } else {
                             let trigger_reason = match params.get(2) {
                                 Some(ArgValue::UInt8(v)) => *v,
@@ -465,10 +472,12 @@ impl SimulatorDevice {
                                 window,
                                 fired: false,
                             });
-                            eprintln!(
-                                "SIM-DIAG: trigger_analog arm trsync={trsync_oid} clock={clock} \
-                                 deadline={deadline} monitor={monitor_ticks}x{monitor_max}"
-                            );
+                            if trace_enabled() {
+                                eprintln!(
+                                    "SIM-DIAG: trigger_analog arm trsync={trsync_oid} clock={clock} \
+                                     deadline={deadline} monitor={monitor_ticks}x{monitor_max}"
+                                );
+                            }
                         }
                     }
                 }
@@ -661,7 +670,9 @@ impl SimulatorDevice {
             state.endstop_reports.insert(oid, (trigger_clock, level));
             state.endstop_clock = trigger_clock;
             state.endstop_pin_value = level;
-            eprintln!("SIM-DIAG: fire at clock={clock} arm_clock={arm_clock}");
+            if trace_enabled() {
+                eprintln!("SIM-DIAG: fire at clock={clock} arm_clock={arm_clock}");
+            }
             Self::respond(
                 state,
                 seq,
@@ -692,10 +703,12 @@ impl SimulatorDevice {
         let trsync_oid = armed.trsync_oid;
         let trigger_reason = armed.trigger_reason;
         state.ta_homing_clock = trigger_clock;
-        eprintln!(
-            "SIM-DIAG: trigger_analog fire at clock={trigger_clock} arm_clock={}",
-            armed.arm_clock
-        );
+        if trace_enabled() {
+            eprintln!(
+                "SIM-DIAG: trigger_analog fire at clock={trigger_clock} arm_clock={}",
+                armed.arm_clock
+            );
+        }
         Self::respond(
             state,
             seq,
@@ -728,7 +741,11 @@ impl SimulatorDevice {
         armed.fired = true;
         let trsync_oid = armed.trsync_oid;
         let reason = armed.error_reason.wrapping_add(2); // + TE_MONITOR
-        eprintln!("SIM-DIAG: trigger_analog monitor expiry at clock={now} fires reason={reason}");
+        if trace_enabled() {
+            eprintln!(
+                "SIM-DIAG: trigger_analog monitor expiry at clock={now} fires reason={reason}"
+            );
+        }
         Self::respond(
             state,
             seq,

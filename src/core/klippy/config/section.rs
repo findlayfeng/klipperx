@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use super::value::ConfigValue;
 
@@ -25,6 +25,11 @@ pub struct ConfigSection {
     /// Upstream iterates the file's order; a sorted map is deterministic and
     /// close enough until the parser preserves insertion order.
     pub parameters: BTreeMap<String, ConfigValue>,
+    /// Option names the `SAVE_CONFIG` block contributed to this section, lowercased
+    /// (upstream's `autosave_options`, `klippy/configfile.py:416-422`).
+    /// [`check_unused`](super::check_unused) exempts them: the block wrote them,
+    /// so they are not undefined options even when no section reads them.
+    pub(crate) autosave_options: BTreeSet<String>,
 }
 
 /// Map of configuration sections indexed by their unique `(id, sub)` key.
@@ -78,6 +83,7 @@ impl ConfigSection {
             id: id.to_string(),
             sub,
             parameters: BTreeMap::new(),
+            autosave_options: BTreeSet::new(),
         }
     }
 
@@ -111,6 +117,22 @@ impl ConfigSection {
     /// Option names are compared case-insensitively.
     pub fn has(&self, key: &str) -> bool {
         self.parameters.contains_key(&key.to_lowercase())
+    }
+
+    /// Whether the `SAVE_CONFIG` block wrote `option` into this section.
+    ///
+    /// Such an option is exempt from the undefined-option check
+    /// ([`check_unused`](super::check_unused)) even when nothing read it:
+    /// upstream folds the block's options into the access set
+    /// (`klippy/configfile.py:416-430`). Option names are compared
+    /// case-insensitively, as everywhere else.
+    pub fn is_autosave_option(&self, option: &str) -> bool {
+        self.autosave_options.contains(&option.to_lowercase())
+    }
+
+    /// Whether any option the `SAVE_CONFIG` block wrote lives in this section.
+    pub(crate) fn has_autosave_options(&self) -> bool {
+        !self.autosave_options.is_empty()
     }
 
     /// The option's text: a `Single` as written, a `Multi` joined with newlines.

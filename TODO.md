@@ -293,94 +293,29 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
       `EndpointContext`（现在没有）。上游只把 `client_info` 当日志用，故这属于本项目的
       自定义兼容层，要有到期日。
 
-### T 上游 `.test` 语料推进（按依赖顺序）
+### T 上游 `.test` 语料推进 —— ✅ 收官（2026-09-25）
 
-框架已落地：`src/core/klippy/upstream.rs`（字典驱动应答机 + 按 `CONFIG` 拆分的运行）与
-`crates/test-support/build.rs`（按架构编字典）；T1（`linuxtest.test`）已完成并转绿。当前 239 次
-运行里，默认构建缺 2 条（引用 `pru`）、忽略列表 6 条、
-实际执行 31 条（`linuxtest.test`、`commands.test`、`out_of_bounds.test`、`bed_mesh.test`、
-`z_virtual_endstop.test`、`z_tilt.test`、`quad_gantry_level.test`、`bltouch.test`、
-`smart_effector.test`、`multi_z.test`、`screws_tilt_adjust.test`、`gcode_arcs.test`、
-`bed_screws.test`、`pwm.test`、`temperature.test`、`macros.test`、`led.test`、
-`sdcard_loop.test`、`pressure_advance.test`、`eddy.test`、`dual_carriage.test`、
-`exclude_object.test`、`polar.test`、`delta.test`、`delta_calibrate.test`、`hybrid_corexy_dual_carriage.test`、`extruders.test`，均通过）；忽略列表即本节的工单，每步做完
-就从 `IGNORED` 移除对应文件（手册见
-`docs/klippy/developer-manual/regression-tests.md`）。
+框架：`src/core/klippy/upstream.rs`（字典驱动应答机 + 按 `CONFIG` 拆分的运行）与
+`crates/test-support/build.rs`（按架构编字典）。
 
-**推进口径**：下文的「首次失败原因」分组只用于定位，不是工作队列——`load_config` 遇到第一个
-未知 section 就停，修好一个缺口只会让运行前进到下一个缺口，总数可能不变（T7 前后失败总数
-几乎不变就是例子），各组收益不可加。进度以**转绿运行数 / `IGNORED` 条目数**衡量（当前 **236 / 0**：`KLIPPERX_UPSTREAM_ALL=1` 全绿）。**验收标准
-是「对应 `.test` 从 `IGNORED` 移除后通过」**，不是「某个错误不再出现」。详见
-[失败原因分析复盘](docs/work-log/2026-09-22-upstream-regression-failures.md#复盘计数口径与重排后补)。
+**结果**：`KLIPPERX_UPSTREAM_ALL=1` **236 条通过 / 0 条失败**，`IGNORED` **清空**；默认套件（含全部
+语料 236 例）约 70s 正常退出。逐批转绿过程见各批提交信息与
+[回归测试手册](docs/klippy/developer-manual/regression-tests.md)。
 
-**当前失败原因统计**（`KLIPPERX_UPSTREAM_ALL=1` 实跑，2026-09-25（批 #40 合入后）：**5 次失败**、232 次通过、
-2 条因未构建 `pru` 字典不计，合计 239；下表为**选项名大小写修复后**的分布——49 次
-`must be specified` 归零但总数不变、首因整体后移，见[复盘](docs/work-log/2026-09-22-upstream-regression-failures.md#复盘计数口径与重排后补)
-的「收益不可加」）：
+**推进口径（留作方法）**：
 
-| 首次失败原因 | 次数 | 对应 TODO |
-|---|---|---|
-| 温度传感器（`temperature_*`） | **0** | T7（已完成） |
-| 选项名大小写（`optionxform`） | **0** | 已对齐（49 → 0） |
-| `Unknown pin chip name 'probe'`（仅剩 `eddy`——`probe_eddy_current` 属 M5） | 1 | T4 / H9（M5） |
-| TMC：段 23 + pin chip 7 | 30 | T6 / H5 |
-| `Error loading kinematics`（deltesian / winch 为余项；delta / generic_cartesian / rotary_delta / polar 已落地） | 2 | T5（C1c-2/3/4）（批 #5/#12/#40 已消其余） |
-| `Section 'display'` | 21 | T9 / H8 |
-| `Section 'heater_fan …'` | 27 | H2-3 |
-| `Section 'filament_switch_sensor …'` 等 | 8 | H7 |
-| `sensor_pin: … 'vref_scaled'`（`adc_scaled`） | **0** | H1 已消（批 #19，4 处首因归零） |
-| H9 其余（`bed_mesh` 6、`safe_z_home` 4、`bed_screws` 3、`quad_gantry_level` 2、`z_tilt`/`endstop_phase` 各 1） | 17 | H9 |
-| 板级扩展 section（`sx1509_duex`/`replicape`） | 2 | H2 / H7（`ad5206` 批 #16、`dac084S085` 批 #23、`mcp4451` 批 #25、`multi_pin` 批 #26 已转绿） |
-| `Option 'tachometer_pin' … pulse_counter` | **0** | F9 / H7 已消（批 #8，2 run 实测 `run_case OK`） |
-| `Section 'extruder_stepper …'` | 2 | H10 |
-| `Section 'verify_heater …'` | **0** | H1 已消（批 #20，3 处首因归零） |
-| `Unknown temperature sensor`（`G2`、`Kingroon_B3950`、`NTCS0603E3104FXT`） | 3 | H1 |
-| MCU 引脚映射（`Pin 'PF1'`/`'PF7'`/`'PD6'`） | 3 | F2 |
-| 单实例（`dual_carriage` 2、`gcode_macro` 2、`led` 2；`virtual_sdcard`/`temperature_fan`/`pwm_cycle_time`/`manual_stepper`/`input_shaper`/`gcode_arcs`/`exclude_object`/`controller_fan` 各 1） | 14 | H1 / H3 / H4 / H9 / H10 |
-| 运行期失败（`Move out of range`：`generic-simulavr`） | 1 | 运行期（非装载） |
-| `Section 'extruder'`（T3 旧首位） | **0** | T3 已消 |
+- 「首次失败原因」分组只用于定位，**不是工作队列**：`load_config` 遇首个未知 section 即停，修好一个
+  缺口只会让运行前进到下一个，总数可能不变，**各组收益不可加**。
+- **验收标准**是「对应 `.test` 从 `IGNORED` 移除后通过」，不是「某个错误不再出现」。
+- 每例一个独立 runtime + 有界收尾（对齐上游「每个用例一个 `klippy.py` 进程」的隔离）；重型套件
+  （`--lib` 全量、`ALL=1`）由 main 在合入点单进程跑，跑完按显式 PID 清残留进程。
 
-（本表随每个单元更新：2026-09-24 集成批 #5 后 `delta`/`polar` 运动学+`delta_calibrate` 收官、相关首因再后移；集成批 #3+#4 后 `probe_eddy_current`/`gcode_macro`(引擎)/`exclude_object`/`dual_carriage` 收官、相关首因再后移；集成批 #2 后 `led`/`virtual_sdcard`/`display_status`/`homing_override`/`sdcard_loop`/`extruder_stepper`/`exclude_object`(段)/`dual_carriage`(段)/`servo` 九模块落地；批 #1 后六节同理（行内计数为 U3a 快照未重排）；2026-09-23 探针链路单元后实测；除 probe 行外其余各行的拆分仍取 U3a 时点，
-后续单元只会把首因往后推、总数不变，逐单元变化见各自提交信息。已转绿的语料：`linuxtest.test`、
-`commands.test`、`out_of_bounds.test`、`bed_mesh.test`、`z_virtual_endstop.test` 与
-`printers.test → printer-wanhao-duplicator-i3-plus-mark2-2019`、`z_tilt.test`、`quad_gantry_level.test`、`bltouch.test`、`smart_effector.test`、`multi_z.test`、`screws_tilt_adjust.test`、`gcode_arcs.test`、`bed_screws.test`、`pwm.test`、`temperature.test`、`macros.test`、`led.test`、`sdcard_loop.test`、`pressure_advance.test`、`eddy.test`、`dual_carriage.test`、`exclude_object.test`、`polar.test`、`delta.test`、`delta_calibrate.test`、`hybrid_corexy_dual_carriage.test`、`extruders.test`、`manual_stepper.test`。）
+**历史归档**：2026-09-22 的失败原因分析（239 次运行按首次失败归类的 T3–T10 工单、完整失败日志与
+「计数不是工作量」的复盘）随收官从工作记录目录清理；需要时
+`git log --diff-filter=D -- docs/work-log/` 找回。
 
-**T3 之后按首次失败分组的工单**：
-
-- [ ] **T3. `extruder` + `heater_bed` + `fan`**：三段均已落地，`Section 'extruder'` 已 **0 次**
-      （2026-09-23 实跑）；原列的 C2 autosave（`pid_Kp` 49）是误归因——语料 0 个 `#*#` 区块，
-      真因是选项名大小写，已修复归零。现在卡在 H2-3 `heater_fan`（22）、H10 `extruder_stepper`
-      （2）、H1 `verify_heater`（2，批 #20 已消）。（F9/H7 `pulse_counter` 批 #8 已消。）
-- [ ] **T4. `probe` / `bltouch` / endstop pin chip**（35 次失败，2026-09-23 选项大小写修复后实测）：
-      `bed_mesh`、`bltouch`、`eddy`、`screws_tilt_adjust`、`smart_effector`、`z_virtual_endstop` 等。
-      依赖 F8（endstop，已 ✅）与 H9（probe 模块）。**施工序列**（scout 静态矩阵测算，每步以「移出
-      `IGNORED` 后通过」验收）：
-      **U1** 运动底座 `probing_move` ✅（2026-09-23：事件顺序、无触发报错、零位移报错）
-      → **U2** `[stepper_x/y/z]` 移到 late 阶段 ✅（解 `probe:`/`tmc*_stepper_x:` 的共同根因）
-      → **U3a** `[probe]` 段 + `probe` 虚拟 chip ✅（chip 首因 35 → 22）
-      → **U3b** 会话采样 + `QUERY_PROBE`/`PROBE`/`PROBE_ACCURACY`
-      → **U4** `manual_probe.rs` 命令族 + `configfile.set()` 记账 ✅（2026-09-23；含 PROBE_CALIBRATE 接线）
-      → **U5** `bed_mesh.py`（**首批 2 绿**：`bed_mesh.test`、`z_virtual_endstop.test`，随后验证模拟器上
-      的 `G28` via `probe:z_virtual_endstop`）
-      → **M6** `z_tilt`/`quad_gantry_level`/`bed_tilt`（+2 绿）→ **M7** 发送队列水位让 `multi_z.test` 转绿 ✅
-      （2026-09-24；不依赖 `STEPPER_BUZZ`——未知命令静默 `Ok` 放行，该命令实现仍属 H10，+1 提前兑现）
-      → **M2** `bltouch`（+1）✅（2026-09-24）→ **M4** `screws_tilt_adjust`（+1）✅（2026-09-24，含探测语义与亚纳米守卫修复）→ **M3** `smart_effector`（+1）✅（2026-09-24）
-      → **M5** `probe_eddy_current` ✅（2026-09-24 批 #3 收官；`trigger_analog` 已随 M5a 落地，固件侧 F9/H7 另账）。
-      其余 37 条 printers 命中 probe 的配置另压跨域长尾（H2/H3/H4/H5/H7/H8 与 H9 兄弟段），不在本闭包内。
-      语料里 **0 个配置带 `#*#`**，autosave 不阻塞本批。
-- [ ] **T5. 运动学**：`delta`（含 `stepper_a/b/c`）与 `polar`（含 `stepper_arm/bed`）**已落地转绿**（2026-09-24 批 #5：`delta.test`+`delta_calibrate.test`+`polar.test` 三绿；含 `itersolve` 携参、假 MCU 多端停多槽、config 层 `SAVE_CONFIG` 读取、弧度 gear_ratio 推断）；余 `generic_cartesian`（4）、`rotary_delta`（2）、`winch`/`deltesian`（各 1，2026-09-23 实测口径）。corexy 族已随 **C1c-1** 消失，`none` 已在 T1。
-- [x] **T6. TMC pin chip**（原 28 次失败）——**批 #34 `tmc2130` 全部转绿**（段 2 + pin chip 3）；`tmc5160`/`tmc2660` 由 W3/W5 收口，`tmc2240` 只影响 `tmc.test`（原清单：段 21（`tmc2209 stepper_x` 15、
-      `tmc2130` 2、`tmc2208` 2、`tmc2660` 1、`tmc5160` 1）+ pin chip 7（`tmc2209_stepper_x` 4、
-      `tmc2130_stepper_x` 3）。依赖 H5（TMC）。
-- [ ] **T9. 其余 extras 段**（2026-09-23 选项大小写修复后实跑的散项，按域归入 H1–H10）：`display`（21，H8）、
-      `filament_switch_sensor`（8，H7）、板级扩展
-      （`sx1509_duex`/`replicape` 各 1，H2/H7；`ad5206` 批 #16、`dac084S085` 批 #23、`mcp4451` 批 #25、`multi_pin` 批 #26 已转绿）、
-      `bed_screws`（3，H9）、`dual_carriage`/`safe_z_home`/`gcode_macro`（各 2），以及 `virtual_sdcard`/
-      `exclude_object`/`gcode_arcs`/`manual_stepper`/`pwm_cycle_time`/`led`/`input_shaper`/`temperature_fan`/
-      `controller_fan`（1）。`static_digital_output` 已在阶段 0 落地，`stepper_z1`（多轴）已由
-      **C1a** 打开（相关运行的首次失败前移到 `z_tilt`/`quad_gantry_level`，属 H9）。
 - 备注：`printers.test` 有 2 条运行声明 `DICTIONARY pru.dict host=linuxprocess.dict`，默认不构建
-      `pru`；要跑需 `KLIPPERX_ARCHES=…,pru`（需 `pru-gcc`）。
+  `pru`；要跑需 `KLIPPERX_ARCHES=…,pru`（需 `pru-gcc`）。
 
 ## 上游 extras 覆盖盘点
 

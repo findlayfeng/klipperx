@@ -155,6 +155,15 @@ pub trait PrinterObject: Any + Send + Sync {
     /// connection that is waiting for the reply.
     fn get_status(&self, eventtime: f64) -> Value;
 
+    /// Break any strong reference cycles this part holds onto the machine.
+    ///
+    /// Called by [`Printer::teardown`] **before** the parts are dropped. A part
+    /// whose own `Drop` cannot run — because a cycle keeps it alive — would
+    /// otherwise leak everything the cycle reaches: each `Mcu` (whose `Drop`
+    /// releases its receive task's blocking read, so a leak parks runtime
+    /// shutdown) and its clock.
+    fn release_cycles(&self) {}
+
     /// Whether this part appears in `objects/list` and can be queried.
     ///
     /// Upstream's `objects/list` keeps only objects that define `get_status`,
@@ -908,6 +917,17 @@ impl Printer {
     /// process, not to the config.
     pub fn teardown(&self) {
         let keep = self.lock().host_objects.unwrap_or(0);
+        // Break the cyclic holds first: dropping the parts cannot run a `Drop`
+        // that a cycle keeps unreachable.
+        {
+            let objects = self
+                .objects
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            for (_, object) in objects.iter().take(keep.max(objects.len())) {
+                object.release_cycles();
+            }
+        }
         self.objects
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())

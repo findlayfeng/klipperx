@@ -3506,7 +3506,14 @@ mod tests {
 
     /// A connected state around `toolhead`, with the command table to build
     /// commands.
-    fn connected(toolhead: ToolHead) -> (Arc<Mutex<Option<Connected>>>, GCodeDispatch) {
+    /// A connected state, its dispatcher, and the printer they belong to.
+    ///
+    /// The printer is returned because the dispatcher holds it **weakly** (a
+    /// strong handle would be a `printer -> objects -> gcode -> printer` cycle);
+    /// tests that need the dispatcher to report to a live printer keep it.
+    fn connected_with_printer(
+        toolhead: ToolHead,
+    ) -> (Arc<Mutex<Option<Connected>>>, GCodeDispatch, Arc<Printer>) {
         let state = Arc::new(Mutex::new(Some(Connected {
             toolhead,
             mcu_steppers: HashMap::new(),
@@ -3515,7 +3522,12 @@ mod tests {
         let printer = Arc::new(Printer::new(
             crate::core::klippy::reactor::ManualReactor::shared(),
         ));
-        (state, GCodeDispatch::new(printer))
+        (state, GCodeDispatch::new(Arc::clone(&printer)), printer)
+    }
+
+    fn connected(toolhead: ToolHead) -> (Arc<Mutex<Option<Connected>>>, GCodeDispatch) {
+        let (state, gcode, _printer) = connected_with_printer(toolhead);
+        (state, gcode)
     }
 
     /// A `ToolHeadObject` around an already-connected `state`, for the seams
@@ -3639,7 +3651,7 @@ mod tests {
         if let Some(kinematics) = toolhead.kinematics_mut() {
             kinematics.clear_homing_state(&[X_AXIS, Y_AXIS, Z_AXIS]);
         }
-        let (state, gcode) = connected(toolhead);
+        let (state, gcode, _printer) = connected_with_printer(toolhead);
         let command = gcode.create_gcode_command(
             "SET_KINEMATIC_POSITION",
             "SET_KINEMATIC_POSITION X=5 Y=6 Z=7",
@@ -3650,7 +3662,10 @@ mod tests {
             ]),
         );
 
-        cmd_set_kinematic_position(&state, &Arc::downgrade(&gcode.printer()), &command).unwrap();
+        // The dispatcher holds its printer weakly, so the test keeps it alive
+        // for the duration of the call.
+        let printer = gcode.printer().expect("the printer is alive");
+        cmd_set_kinematic_position(&state, &Arc::downgrade(&printer), &command).unwrap();
 
         let guard = state.lock().unwrap();
         let connected_ref = guard.as_ref().unwrap();

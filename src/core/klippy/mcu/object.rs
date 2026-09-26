@@ -529,10 +529,15 @@ impl McuObject {
     }
 }
 
-impl Drop for McuObject {
-    fn drop(&mut self) {
-        // Stop the secondary recalibration timer with the object; the reactor
-        // outlives the parts it was handed.
+impl McuObject {
+    /// Break the `Mcu → events → resource → Mcu` strong cycle.
+    ///
+    /// `Printer::teardown` calls this for every part *before* dropping them, so
+    /// the cycle is broken even when the parts cannot be dropped (a cycle keeps
+    /// `Drop` from ever running, and the leaked `Mcu` would park runtime
+    /// shutdown); `Drop` calls it again as the backstop for other teardown
+    /// paths.
+    pub(crate) fn release_cycles(&self) {
         if let Some(handle) = self
             .recalibrate_timer
             .lock()
@@ -541,12 +546,18 @@ impl Drop for McuObject {
         {
             handle.cancel();
         }
-        // Break the `Mcu → events → resource → Mcu` strong cycle before the chip
-        // (and with it the last `Mcu`) is dropped; otherwise `Mcu::Drop` never
-        // runs and its blocking device read parks runtime shutdown (the F8b fix).
         if let Some(mcu) = self.chip.mcu() {
             mcu.clear_events();
         }
+    }
+}
+
+impl Drop for McuObject {
+    fn drop(&mut self) {
+        // Recycled with `Drop`: `Printer::teardown` calls it before the parts
+        // are dropped (see `release_cycles`), which is what makes the release
+        // unconditional when a cycle would keep this object alive.
+        self.release_cycles();
     }
 }
 

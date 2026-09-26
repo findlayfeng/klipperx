@@ -452,7 +452,14 @@ impl Commands {
 
 struct Inner {
     /// For the state message, shutdown, and exit requests.
-    printer: Arc<Printer>,
+    ///
+    /// `Weak`: the dispatcher is a *host* object (`Printer::new` creates it and
+    /// `Printer::teardown` deliberately keeps it across restarts), so a strong
+    /// handle here would close the loop `printer -> objects -> gcode -> printer`.
+    /// Nothing would ever drop the printer — and with it every config object,
+    /// including each `Mcu` whose `Drop` releases the receive task's blocking
+    /// read. See `a_case_leaves_no_live_mcu_behind`.
+    printer: Weak<Printer>,
     ready: AtomicBool,
     commands: Mutex<Commands>,
     /// Where output goes. `register_output_handler` adds; `gcode/subscribe_output`
@@ -474,7 +481,7 @@ impl GCodeDispatch {
     pub fn new(printer: Arc<Printer>) -> Self {
         let dispatch = Self {
             inner: Arc::new(Inner {
-                printer,
+                printer: Arc::downgrade(&printer),
                 ready: AtomicBool::new(false),
                 commands: Mutex::new(Commands {
                     ready: HashMap::new(),
@@ -488,7 +495,7 @@ impl GCodeDispatch {
 
         {
             let inner = Arc::clone(&dispatch.inner);
-            dispatch.inner.printer.register_event_handler(
+            printer.register_event_handler(
                 KlippyEvent::KlippyReady,
                 Box::new(move |_| {
                     inner.set_ready(true);
@@ -498,7 +505,7 @@ impl GCodeDispatch {
         }
         {
             let inner = Arc::clone(&dispatch.inner);
-            dispatch.inner.printer.register_event_handler(
+            printer.register_event_handler(
                 KlippyEvent::KlippyShutdown,
                 Box::new(move |_| {
                     // Upstream returns early when the printer was already not
@@ -513,7 +520,7 @@ impl GCodeDispatch {
         }
         {
             let inner = Arc::clone(&dispatch.inner);
-            dispatch.inner.printer.register_event_handler(
+            printer.register_event_handler(
                 KlippyEvent::KlippyDisconnect,
                 Box::new(move |_| inner.respond_info("Klipper state: Disconnect", false)),
             );
@@ -525,8 +532,10 @@ impl GCodeDispatch {
 
     /// The printer this dispatcher reports to (`gcode:request_restart` and
     /// friends are sent there).
-    pub fn printer(&self) -> Arc<Printer> {
-        Arc::clone(&self.inner.printer)
+    ///
+    /// `None` once the printer is gone, which is the end of the process.
+    pub fn printer(&self) -> Option<Arc<Printer>> {
+        self.inner.printer.upgrade()
     }
 
     /// Register a command handler.
@@ -745,7 +754,7 @@ impl GCodeDispatch {
                 "M110" => sync(|_| Ok(())),
                 // Get Firmware Version and Capabilities.
                 "M115" => {
-                    let printer = Arc::downgrade(&self.inner.printer);
+                    let printer = self.inner.printer.clone();
                     sync(move |gcmd: &GcodeCommand| {
                         // The host's own version, from the start arguments
                         // (`start_args['software_version']`); the crate version
@@ -778,9 +787,9 @@ impl GCodeDispatch {
             self.register_command(
                 "M112",
                 sync(move |_| {
-                    upgrade(&inner)
-                        .printer
-                        .invoke_shutdown("Shutdown due to M112 command");
+                    if let Some(printer) = upgrade(&inner).printer.upgrade() {
+                        printer.invoke_shutdown("Shutdown due to M112 command");
+                    }
                     Ok(())
                 }),
                 None,
@@ -950,7 +959,9 @@ async fn process_line(inner: &Arc<Inner>, line: &str, need_ack: bool) -> Result<
             Err(_) => {
                 let msg = format!("Internal error on command:\"{}\"", parsed.command);
                 error!("{msg}");
-                inner.printer.invoke_shutdown(&msg);
+                if let Some(printer) = inner.printer.upgrade() {
+                    printer.invoke_shutdown(&msg);
+                }
                 HandlerOutcome::Internal(msg)
             }
         }
@@ -966,7 +977,9 @@ async fn process_line(inner: &Arc<Inner>, line: &str, need_ack: bool) -> Result<
             // that listen, and only stop the script when the line was not
             // acknowledged (`klippy/gcode.py:223-228`).
             inner.respond_error(err.message());
-            inner.printer.send_event(&KlippyEvent::GcodeCommandError);
+            if let Some(printer) = inner.printer.upgrade() {
+                printer.send_event(&KlippyEvent::GcodeCommandError);
+            }
             if need_ack {
                 gcmd.ack(None);
                 Ok(())
@@ -1033,7 +1046,13 @@ async fn default_handler(inner: &Arc<Inner>, gcmd: &mut GcodeCommand) -> Result<
         return Ok(());
     }
     if !inner.ready.load(Ordering::SeqCst) {
-        return Err(CommandError::new(inner.printer.get_state_message().message));
+        return Err(CommandError::new(
+            inner
+                .printer
+                .upgrade()
+                .map(|printer| printer.get_state_message().message)
+                .unwrap_or_else(|| "Klipper state: Disconnect".to_string()),
+        ));
     }
     if command.is_empty() {
         return Ok(());
@@ -1076,7 +1095,11 @@ fn cmd_status(inner: &Arc<Inner>, gcmd: &GcodeCommand) -> Result<(), CommandErro
         gcmd.respond_info("Klipper state: Ready");
         return Ok(());
     }
-    let msg = inner.printer.get_state_message().message;
+    let msg = inner
+        .printer
+        .upgrade()
+        .map(|printer| printer.get_state_message().message)
+        .unwrap_or_else(|| "Klipper state: Disconnect".to_string());
     Err(CommandError::new(format!(
         "{}\nKlipper state: Not ready",
         msg.trim_end()
@@ -1188,19 +1211,23 @@ impl Inner {
     /// printer ready, note the last print time, fire `gcode:request_restart`,
     /// dwell, and wait for the queued moves; then ask the printer to exit.
     fn request_restart(&self, result: &str) {
+        // No printer left means nothing to restart: the process is already on
+        // its way out (the `Weak` is why this cannot keep it alive).
+        let Some(printer) = self.printer.upgrade() else {
+            return;
+        };
         if self.ready.load(Ordering::SeqCst) {
-            if let Some(hooks) = self.printer.restart_hooks() {
+            if let Some(hooks) = printer.restart_hooks() {
                 let print_time = hooks.get_last_move_time();
                 if result == "exit" {
                     info!("Exiting (print time {print_time:.3}s)");
                 }
-                self.printer
-                    .send_event(&KlippyEvent::GcodeRequestRestart { print_time });
+                printer.send_event(&KlippyEvent::GcodeRequestRestart { print_time });
                 hooks.dwell(0.500);
                 hooks.wait_moves();
             }
         }
-        self.printer.request_exit(result);
+        printer.request_exit(result);
     }
 
     fn respond_raw(&self, msg: &str) {
@@ -1494,9 +1521,15 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     /// A dispatcher over a fresh printer, with an output collector.
-    fn dispatch() -> (Arc<GCodeDispatch>, Arc<Mutex<Vec<String>>>) {
+    /// The dispatcher plus the printer it reports to.
+    ///
+    /// The printer is returned (and must be kept) because the dispatcher holds
+    /// it **weakly**: a strong handle there would close the
+    /// `printer -> objects -> gcode -> printer` cycle and leak the whole machine
+    /// (see `GCodeDispatch`'s `Inner::printer`).
+    fn dispatch_with_printer() -> (Arc<GCodeDispatch>, Arc<Mutex<Vec<String>>>, Arc<Printer>) {
         let printer = Arc::new(Printer::new(ManualReactor::shared()));
-        let dispatch = Arc::new(GCodeDispatch::new(printer));
+        let dispatch = Arc::new(GCodeDispatch::new(Arc::clone(&printer)));
         let output = Arc::new(Mutex::new(Vec::new()));
         {
             let output = Arc::clone(&output);
@@ -1507,7 +1540,18 @@ mod tests {
                     .push(line.to_string());
             }));
         }
+        (dispatch, output, printer)
+    }
+
+    /// The dispatcher alone, for tests that do not need the printer.
+    fn dispatch() -> (Arc<GCodeDispatch>, Arc<Mutex<Vec<String>>>) {
+        let (dispatch, output, _printer) = dispatch_with_printer();
         (dispatch, output)
+    }
+
+    /// The dispatcher with the printer kept alive for the test's duration.
+    fn dispatch_keeping_printer() -> (Arc<GCodeDispatch>, Arc<Mutex<Vec<String>>>, Arc<Printer>) {
+        dispatch_with_printer()
     }
 
     /// Run a script, ignoring the result.
@@ -1857,7 +1901,7 @@ mod tests {
 
     #[test]
     fn test_a_command_before_ready_reports_the_state() {
-        let (dispatch, _output) = dispatch();
+        let (dispatch, _output, _printer) = dispatch_keeping_printer();
         let (handler, seen) = recorder();
         dispatch
             .register_command("MY_CMD", handler, None, false)
@@ -1919,12 +1963,18 @@ mod tests {
 
     #[test]
     fn test_m112_invokes_shutdown() {
-        let (dispatch, _output) = dispatch();
+        let (dispatch, _output, _printer) = dispatch_keeping_printer();
 
         run(&dispatch, "M112");
 
         assert_eq!(
-            dispatch.inner.printer.get_state_message().message,
+            dispatch
+                .inner
+                .printer
+                .upgrade()
+                .expect("the printer is alive")
+                .get_state_message()
+                .message,
             "Shutdown due to M112 command"
         );
     }

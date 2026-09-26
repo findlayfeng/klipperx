@@ -335,6 +335,7 @@ mod tests {
             [
                 "mcu",
                 "stepper_enable",
+                "adc_scaled",
                 "extruder",
                 "extruder_stepper",
                 "fan",
@@ -416,12 +417,15 @@ mod tests {
                 "safe_z_home"
             ]
         );
-        // `mcu` is the one up-front section (upstream loads `pins` and `mcu`
-        // before the generic walk); `[stepper_*]` and `[printer]` are late
-        // (upstream builds `toolhead` last, and `Rail::lookup` reads stepper
-        // config at that point); the rest are plain generic sections —
-        // including the generic-cartesian carriage/stepper sections, which
-        // `[printer]` reads and upstream walks in the generic prefix walk.
+        // `mcu` and `adc_scaled` are the up-front sections (upstream loads
+        // `pins` and `mcu` before the generic walk, and a `[adc_scaled]`
+        // registers a chip the generic `[extruder]`/`[heater_bed]` sections
+        // resolve their `sensor_pin` against, so it has to precede them);
+        // `[stepper_*]` and `[printer]` are late (upstream builds `toolhead`
+        // last, and `Rail::lookup` reads stepper config at that point); the
+        // rest are plain generic sections — including the generic-cartesian
+        // carriage/stepper sections, which `[printer]` reads and upstream
+        // walks in the generic prefix walk.
         let by_id = |id: &str| {
             FACTORIES
                 .iter()
@@ -430,6 +434,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("no section '{id}'"))
         };
         assert_eq!(by_id("mcu").phase, Phase::Early);
+        assert_eq!(by_id("adc_scaled").phase, Phase::Early);
         assert_eq!(by_id("output_pin").phase, Phase::Generic);
         assert_eq!(by_id("stepper_x").phase, Phase::Late);
         assert_eq!(by_id("stepper_arm").phase, Phase::Late);

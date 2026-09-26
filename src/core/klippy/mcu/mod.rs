@@ -234,11 +234,11 @@ pub struct Mcu {
     /// running firmware's unsolicited `stats`/`shutdown`, which carry ids the
     /// host does not know yet — from a genuinely unknown message afterwards.
     identified: Arc<AtomicBool>,
-    /// A base point for estimating the firmware's free-running clock: the host
-    /// instant the clock was read, paired with the reading. See
-    /// [`Mcu::estimated_clock`]; `None` until something seeds it (the MCU
-    /// object does, right after identify).
-    clock_base: StdMutex<Option<(Instant, u64)>>,
+    /// The stateful estimate of the firmware's free-running clock: clock
+    /// round-trip samples folded in, an anchor plus a fitted rate read out.
+    /// See [`Mcu::estimated_clock`] and [`ClockEstimate`]; `None` until
+    /// something seeds it (the MCU object does, right after identify).
+    clock_estimate: StdMutex<Option<ClockEstimate>>,
     /// Handle to the receive task, used to abort it on drop.
     recv_handle: Option<tokio::task::JoinHandle<()>>,
 }
@@ -546,6 +546,165 @@ fn rtt_warn_message(sample: Duration) -> String {
     format!(
         "RTT {sample:?} 超过 {RTT_WARN_THRESHOLD:?} 阈值：检查串口桥延迟 latency_timer / 波特率 / 线缆"
     )
+}
+
+/// How many clock round-trip samples [`ClockEstimate::record`] fits the
+/// frequency over — a plain sliding window where upstream weighs an endless
+/// sample stream with an EWMA (`DECAY = 1/30`, `klippy/clocksync.py:9`, i.e.
+/// about thirty samples of memory). The fit computes the same
+/// covariance-over-variance ratio upstream derives at
+/// `klippy/clocksync.py:128` (`clock_covariance / time_variance`); the window
+/// only changes how the past is forgotten — the oldest sample is pushed out
+/// rather than decayed.
+const CLOCK_FIT_WINDOW: usize = 30;
+
+/// One clock round trip feeding the estimate: when the request went out, when
+/// the answer came back, and the 64-bit firmware clock the answer reported.
+#[derive(Debug, Clone, Copy)]
+struct ClockSample {
+    sent: Instant,
+    received: Instant,
+    clock: u64,
+}
+
+impl ClockSample {
+    /// When the reported reading was taken, in host time: the round trip's
+    /// midpoint (`sent + ½ RTT`).
+    ///
+    /// The firmware stamps its clock while the request is in flight, so
+    /// neither end of the trip is where the reading belongs: anchoring on
+    /// `received` places it a full round trip late, on `sent` a full one
+    /// early. Half is also the shift upstream applies to its anchor
+    /// (`time_avg + min_half_rtt`, `klippy/clocksync.py:134-135`), though it
+    /// takes the *smallest* half trip it has seen rather than this sample's.
+    /// This estimator takes the midpoint of **its own** sample instead of
+    /// borrowing the transport's RTT estimate for two reasons: that estimate
+    /// measures ack round trips of arbitrary blocks — retransmits, coalesced
+    /// batches, a different population from a clock query — and it lives in
+    /// the send task, where the clock paths cannot reach it.
+    fn midpoint(&self) -> Instant {
+        self.sent + self.received.saturating_duration_since(self.sent) / 2
+    }
+}
+
+/// The least-squares slope of `clock` against time over one window of
+/// `(midpoint_seconds, clock)` pairs: upstream's
+/// `clock_covariance / time_variance` (`klippy/clocksync.py:128`) read off a
+/// plain window of samples instead of an EWMA over all of them.
+///
+/// `None` when the window cannot say: fewer than two samples, or every one of
+/// them at the same instant (zero variance in time).
+fn fit_freq(window: &[(f64, f64)]) -> Option<f64> {
+    if window.len() < 2 {
+        return None;
+    }
+    let count = window.len() as f64;
+    let mean_time = window.iter().map(|(time, _)| time).sum::<f64>() / count;
+    let mean_clock = window.iter().map(|(_, clock)| clock).sum::<f64>() / count;
+    let mut covariance = 0.0;
+    let mut variance = 0.0;
+    for (time, clock) in window {
+        let time_diff = time - mean_time;
+        covariance += time_diff * (clock - mean_clock);
+        variance += time_diff * time_diff;
+    }
+    if variance <= 0.0 {
+        return None;
+    }
+    Some(covariance / variance)
+}
+
+/// The stateful host-side estimate of one MCU's free-running clock: round-trip
+/// samples go in, an anchor plus a fitted rate come out, and
+/// [`Mcu::estimated_clock`] extrapolates from those.
+///
+/// This replaces the single `(Instant, u64)` snapshot the estimate used to
+/// be. The snapshot answered "roughly what clock is it now" only while the
+/// firmware ticked at exactly the dictionary's nominal `CLOCK_FREQ`; the
+/// samples let the host measure the crystal's real rate and place each
+/// reading at its round trip's midpoint (see [`ClockSample::midpoint`]).
+///
+/// Not the same estimator as `cmd::clock::ClockEstimator`: that one maps the
+/// reactor's time onto print time for the primary/secondary sync; this one is
+/// the MCU's own 64-bit clock, the number [`Mcu::estimated_clock`] reports.
+#[derive(Debug, Clone)]
+struct ClockEstimate {
+    /// The samples the fit runs over, oldest first, at most
+    /// [`CLOCK_FIT_WINDOW`] of them.
+    samples: VecDeque<ClockSample>,
+    /// The anchor: firmware clock `anchor_clock` belongs to host instant
+    /// `anchor_at`; every read extrapolates from there (upstream's
+    /// `clock_est`, `klippy/clocksync.py:134-135`).
+    anchor_at: Instant,
+    anchor_clock: u64,
+    /// The fitted rate in ticks per second, `None` until the window can say
+    /// (see [`fit_freq`]); readers fall back to the dictionary's nominal
+    /// frequency.
+    freq: Option<f64>,
+}
+
+impl ClockEstimate {
+    /// An estimate anchored by one reading taken at `at`, with no round trip
+    /// of its own to place it by — what a seed (`Mcu::set_clock_base`) is:
+    /// the caller read the clock after the answer came back, so the reading
+    /// is taken exactly at that instant, as the old single-point snapshot
+    /// did. The window starts empty; clock round trips fill it.
+    fn seeded(at: Instant, clock: u64) -> Self {
+        Self {
+            samples: VecDeque::new(),
+            anchor_at: at,
+            anchor_clock: clock,
+            freq: None,
+        }
+    }
+
+    /// An estimate built from one clock round trip, before any seed: the
+    /// sample anchors the estimate at its midpoint and starts the window.
+    fn from_sample(sample: ClockSample) -> Self {
+        let mut estimate = Self::seeded(sample.midpoint(), sample.clock);
+        estimate.record(sample);
+        estimate
+    }
+
+    /// Fold one clock round trip in: it joins the fit window (the oldest
+    /// sample is pushed out past [`CLOCK_FIT_WINDOW`]), and it becomes the
+    /// anchor, at its midpoint.
+    fn record(&mut self, sample: ClockSample) {
+        self.samples.push_back(sample);
+        while self.samples.len() > CLOCK_FIT_WINDOW {
+            self.samples.pop_front();
+        }
+        let origin = self.samples.front().expect("a sample was just pushed").sent;
+        let window: Vec<(f64, f64)> = self
+            .samples
+            .iter()
+            .map(|sample| {
+                (
+                    sample
+                        .midpoint()
+                        .saturating_duration_since(origin)
+                        .as_secs_f64(),
+                    sample.clock as f64,
+                )
+            })
+            .collect();
+        // A window that cannot say (every sample at one instant) keeps the
+        // fit it had rather than dropping back to nominal.
+        if let Some(freq) = fit_freq(&window) {
+            self.freq = Some(freq);
+        }
+        let last = self.samples.back().expect("a sample was just pushed");
+        self.anchor_at = last.midpoint();
+        self.anchor_clock = last.clock;
+    }
+
+    /// The firmware clock at host time `at`: `anchor_clock + elapsed × freq`,
+    /// with `nominal_freq` standing in until the window has fitted a rate.
+    fn clock_at(&self, at: Instant, nominal_freq: f64) -> u64 {
+        let freq = self.freq.unwrap_or(nominal_freq);
+        let elapsed = at.saturating_duration_since(self.anchor_at).as_secs_f64();
+        self.anchor_clock + (elapsed * freq) as u64
+    }
 }
 
 /// The send task's side of a connection.
@@ -1203,7 +1362,7 @@ impl Mcu {
             handle,
             wire,
             identified: Arc::clone(&identified),
-            clock_base: StdMutex::new(None),
+            clock_estimate: StdMutex::new(None),
             recv_handle: Some(recv_handle),
         }
     }
@@ -1378,29 +1537,77 @@ impl Mcu {
     /// Record the firmware clock read at this moment, so [`Mcu::estimated_clock`]
     /// can extrapolate from it.
     ///
-    /// This is the smallest useful piece of upstream's clock sync: one read at
-    /// connect, then host time. It is enough to answer "what clock is it about
-    /// now", which is what an unclocked resource needs for an immediate update
-    /// and what a periodic query needs for a first sample time. It does not
-    /// track drift; print time is a separate estimate built on top of it
+    /// This is the **seed**: one reading at connect, no round trip of its own,
+    /// so the estimate is anchored exactly where the reading was taken — the
+    /// old single-point behaviour, kept as the starting state. From there
+    /// `estimated_clock` extrapolates at the dictionary's nominal frequency
+    /// until clock round trips (`Mcu::record_clock_sample`) let the windowed
+    /// fit measure the crystal's real rate.
+    ///
+    /// A seed starts the estimate over: whatever was folded in before is
+    /// dropped (a reconnect reads the clock again anyway). Print time is a
+    /// separate estimate built on top of this one
     /// (`McuObject::estimated_print_time`).
     pub fn set_clock_base(&self, clock64: u64) {
-        *self.clock_base.lock().expect("clock base lock poisoned") =
-            Some((Instant::now(), clock64));
+        *self
+            .clock_estimate
+            .lock()
+            .expect("clock estimate lock poisoned") =
+            Some(ClockEstimate::seeded(Instant::now(), clock64));
     }
 
-    /// The firmware clock, extrapolated from the last [`Mcu::set_clock_base`].
+    /// Fold one clock round trip into the estimate behind
+    /// [`Mcu::estimated_clock`]: the host instants that bracket the exchange
+    /// and the 64-bit clock the answer reported — the three numbers upstream's
+    /// serial queue stamps on every message and its clock sync consumes
+    /// (`klippy/clocksync.py:68-99`).
+    ///
+    /// The sample joins the fit window (its oldest member is pushed out past
+    /// `CLOCK_FIT_WINDOW`) and becomes the extrapolation anchor, at its round
+    /// trip's midpoint rather than at either end (see `ClockSample::midpoint`).
+    /// A seed carries no round trip and goes through `Mcu::set_clock_base`
+    /// instead; a sample that arrives before any seed simply becomes the
+    /// estimate.
+    ///
+    /// Called by the clock-read path (`McuClock::get_clock` in `cmd::clock`);
+    /// this host has no periodic `get_clock` poller of its own, so nothing
+    /// calls it on a timer.
+    pub(crate) fn record_clock_sample(&self, sent: Instant, received: Instant, clock64: u64) {
+        let mut slot = self
+            .clock_estimate
+            .lock()
+            .expect("clock estimate lock poisoned");
+        let sample = ClockSample {
+            sent,
+            received,
+            clock: clock64,
+        };
+        match slot.as_mut() {
+            Some(estimate) => estimate.record(sample),
+            None => *slot = Some(ClockEstimate::from_sample(sample)),
+        }
+    }
+
+    /// The firmware clock, extrapolated from the estimate's anchor.
     ///
     /// Returns `None` before a base has been recorded, or if the firmware
     /// frequency is unknown. The value is 64-bit; a clocked command carries its
     /// low word. Clocked commands do not advance it (this is not a scheduler), so
     /// two calls close together agree.
+    ///
+    /// The anchor is the last sample's midpoint (`sent + ½ RTT`, see
+    /// `ClockSample::midpoint`), and the rate is the windowed fit when the
+    /// window can produce one — the dictionary's nominal `CLOCK_FREQ` before
+    /// that, which is exactly what the old single-point snapshot answered
+    /// after a seed with no round trips behind it.
     pub fn estimated_clock(&self) -> Option<u64> {
-        let (base_instant, base_clock) =
-            (*self.clock_base.lock().expect("clock base lock poisoned"))?;
-        let freq = self.clock_freq().ok()?;
-        let elapsed = base_instant.elapsed().as_secs_f64() * freq;
-        Some(base_clock + elapsed as u64)
+        let estimate = self
+            .clock_estimate
+            .lock()
+            .expect("clock estimate lock poisoned")
+            .clone()?;
+        let nominal_freq = self.clock_freq().ok()?;
+        Some(estimate.clock_at(Instant::now(), nominal_freq))
     }
 
     /// Encode a command without sending it.
@@ -2970,6 +3177,177 @@ mod tests {
         // that block (see `Sender::resend_block`).
         assert_eq!(frames[0].seq(), 0);
         assert_eq!(frames[1].seq(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // The clock estimate: half-RTT anchoring, the frequency fit, the window
+    // -----------------------------------------------------------------------
+
+    /// The reading a `(sent, received, clock)` triple reports belongs to the
+    /// round trip's **midpoint** — half a trip after `sent`, half before
+    /// `received` — so the anchor, and with it the offset every read
+    /// extrapolates from, counts half the trip rather than the whole one.
+    #[test]
+    fn test_the_offset_counts_half_the_round_trip() {
+        let sent = Instant::now();
+        let received = sent + Duration::from_millis(10);
+        let sample = ClockSample {
+            sent,
+            received,
+            clock: 40_000_000,
+        };
+        let freq = 20_000_000.0;
+
+        assert_eq!(sample.midpoint(), sent + Duration::from_millis(5));
+
+        let estimate = ClockEstimate::from_sample(sample);
+        // Half of the 10 ms trip at 20 MHz is 5 ms × 20 MHz = 100 000 ticks:
+        // by `received` the firmware has ticked that far past the reading.
+        assert_eq!(
+            estimate.clock_at(received, freq),
+            40_100_000,
+            "the second half of the trip is counted forward"
+        );
+        assert_eq!(
+            estimate.clock_at(sample.midpoint() + Duration::from_secs(1), freq),
+            40_000_000 + 20_000_000,
+            "and the anchor then advances at the fitted rate"
+        );
+    }
+
+    /// The frequency comes from a least-squares fit over the sample window —
+    /// upstream's `clock_covariance / time_variance` (`clocksync.py:128`) — so
+    /// a firmware ticking 1000 ppm fast is measured as ticking 1000 ppm fast.
+    #[test]
+    fn test_the_frequency_is_fitted_from_the_sample_window() {
+        let nominal = 20_000_000.0;
+        let actual = nominal * 1.001;
+        let origin = Instant::now();
+        let mut estimate = ClockEstimate::seeded(origin, 0);
+        // One sample every 0.5 s, each reading the true clock at its own
+        // midpoint (2 ms trip) — a perfectly straight line at `actual`.
+        for step in 1..=CLOCK_FIT_WINDOW {
+            let sent = origin + Duration::from_micros(step as u64 * 500_000);
+            let received = sent + Duration::from_millis(2);
+            let midpoint_offset = sent.duration_since(origin).as_secs_f64() + 0.001;
+            let clock = (midpoint_offset * actual) as u64;
+            estimate.record(ClockSample {
+                sent,
+                received,
+                clock,
+            });
+        }
+
+        let freq = estimate.freq.expect("the window fits a rate");
+        assert!(
+            (freq - actual).abs() < 100.0,
+            "fitted {freq}, want {actual}"
+        );
+        assert!((freq - nominal).abs() > 10_000.0, "not the nominal rate");
+    }
+
+    /// The window is a window: once it is full of newer samples the old ones
+    /// are pushed out entirely, and the fit follows the new rate alone.
+    #[test]
+    fn test_old_samples_are_pushed_out_of_the_fit_window() {
+        let nominal = 20_000_000.0;
+        let actual = nominal * 1.001;
+        let origin = Instant::now();
+        let mut estimate = ClockEstimate::seeded(origin, 0);
+        let mut push = |estimate: &mut ClockEstimate, step: usize, rate: f64| {
+            let sent = origin + Duration::from_micros(step as u64 * 500_000);
+            let received = sent + Duration::from_millis(2);
+            let midpoint_offset = sent.duration_since(origin).as_secs_f64() + 0.001;
+            let clock = (midpoint_offset * rate) as u64;
+            estimate.record(ClockSample {
+                sent,
+                received,
+                clock,
+            });
+        };
+
+        // A full window of samples from a firmware at the nominal rate …
+        for step in 1..=CLOCK_FIT_WINDOW {
+            push(&mut estimate, step, nominal);
+        }
+        let before = estimate.freq.expect("the first window fits a rate");
+        assert!((before - nominal).abs() < 100.0, "fitted {before}");
+
+        // … then a full window from one 1000 ppm fast. The window holds
+        // `CLOCK_FIT_WINDOW` samples, so not one of the old ones survives.
+        for step in (CLOCK_FIT_WINDOW + 1)..=(2 * CLOCK_FIT_WINDOW) {
+            push(&mut estimate, step, actual);
+        }
+        assert_eq!(
+            estimate.samples.len(),
+            CLOCK_FIT_WINDOW,
+            "nothing accumulates"
+        );
+        let after = estimate.freq.expect("the second window fits a rate");
+        assert!(
+            (after - actual).abs() < 100.0,
+            "the old samples are gone: fitted {after}, want {actual}"
+        );
+    }
+
+    /// Round trips from a firmware ticking at exactly the nominal rate leave
+    /// the estimate where the single-point snapshot would have put it: the
+    /// midpoint anchor and the fitted rate agree with `seed + elapsed × freq`.
+    #[test]
+    fn test_no_drift_samples_agree_with_the_snapshot_formula() {
+        let freq = 20_000_000.0;
+        let origin = Instant::now();
+        let mut estimate = ClockEstimate::seeded(origin, 1_000_000);
+        // A sample one second in: the reading is the true clock at the round
+        // trip's midpoint (10 ms trip), i.e. on the very timeline the seed
+        // started.
+        let sent = origin + Duration::from_secs(1);
+        let received = sent + Duration::from_millis(10);
+        // The true clock at the midpoint: 1.005 s × 20 MHz = 20 100 000 ticks.
+        let clock = 1_000_000 + 20_100_000;
+        estimate.record(ClockSample {
+            sent,
+            received,
+            clock,
+        });
+
+        let got = estimate.clock_at(received, freq);
+        let snapshot = 1_000_000 + (received.duration_since(origin).as_secs_f64() * freq) as u64;
+        assert_eq!(got, snapshot, "no drift: the sample moves nothing");
+    }
+
+    /// The seed path end to end: no round trips behind it, so
+    /// `estimated_clock` answers the old snapshot's
+    /// `base + elapsed × nominal` — pinned from both sides, because the seed
+    /// instant is only known to sit between the instants around the call.
+    #[tokio::test]
+    async fn test_a_seeded_clock_estimates_like_the_old_snapshot() {
+        let mcu = Mcu::for_test("test_mcu", Interface::new(FrameMock::new(vec![])));
+        mcu.install_dictionary(
+            Dictionary::from_json(serde_json::json!({
+                "commands": {"get_clock": 5},
+                "config": {"CLOCK_FREQ": 20000000}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(mcu.estimated_clock(), None, "nothing seeded yet");
+
+        let before = Instant::now();
+        mcu.set_clock_base(1_000_000);
+        let after = Instant::now();
+        let read_from = Instant::now();
+        let got = mcu.estimated_clock().unwrap();
+        let read_to = Instant::now();
+
+        let freq = 20_000_000.0;
+        let low =
+            1_000_000 + (read_from.saturating_duration_since(after).as_secs_f64() * freq) as u64;
+        let high = 1_000_000 + (read_to.duration_since(before).as_secs_f64() * freq) as u64;
+        assert!(
+            (low..=high).contains(&got),
+            "{got} outside the snapshot's [{low}, {high}]"
+        );
     }
 
     // -----------------------------------------------------------------------

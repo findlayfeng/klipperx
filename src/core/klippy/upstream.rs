@@ -224,6 +224,7 @@ mod tests {
             "hybrid_corexz",
             "polar",
             "delta",
+            "rotary_delta",
         ];
 
         let mut gap_frequency: BTreeMap<String, usize> = BTreeMap::new();

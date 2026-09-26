@@ -22,6 +22,17 @@ Identify 是 Klipper 主机端（klippy）与 MCU 端（固件）之间建立通
 
 与 Klipper 的一个差异：Klipper 在 offset 不匹配时不追加数据、继续用同一 offset 重试（可能无限循环）；本实现直接报 `McuError::IdentifyProtocol`，避免死循环，也避免把错位的数据拼成一份看似合法的字典。
 
+**静默即 nak（改号重发）**：5 字节空帧既是健康块的 ack、也是固件没收下该块的 nak——两者携带
+同一个 `next_sequence`（`command_send_ack` 与 `goto nk` 都走 `encode_acknak`，
+`src/command.c:301-306`），单看一帧无法区分。固件停在「领先一号」时，首发请求被 nak 而固件
+永不再回话，交换就死在那里。`Identify::request_chunk` 因此把「本块窗口内没等到响应」读作 nak，
+调 `Mcu::renumber_to_firmware`（connection-init，对齐上游 `serialqueue.c:196-201`）把发送
+序号改到固件报告的位置再重发。**根因靠改号修，不靠重试遮羞**：重试只是改号失败后的有界兜底
+（`IDENTIFY_ATTEMPT_TIMEOUT=500ms` 早退、`IDENTIFY_MAX_RETRIES=3`、`IDENTIFY_RETRY_BACKOFF`
+50ms 起倍增，**所有尝试共享原 `IDENTIFY_TIMEOUT` 总预算**，单块耗时口径不变；不抄上游 ×5）。
+`Sender::settle` 刻意不对空帧单独改号（二义性只有盯着「请求后静默」的 identify 重试才有权读作
+nak），会话中的正常 ack 不受影响。四条回归测试见 [测试](testing.md)的 `identify.rs` 行。
+
 ### 固件侧行为（源码依据）
 
 主机这边的几个假设都能在 `third_party/klipper` 里找到出处，列出来是为了让它们不被当成巧合：

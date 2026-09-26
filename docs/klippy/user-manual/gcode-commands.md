@@ -381,6 +381,15 @@ ACTIVATE_EXTRUDER EXTRUDER=<name>
 
 ## 引脚输出
 
+### G10 / G11 / SET_RETRACTION / GET_RETRACTION — 固件回抽（由 `[firmware_retraction]` 注册，批 #32）
+```
+G10                 # 回抽（写 gcode 状态：G91 + G1 E-<retract_length> F<retract_speed>*60）
+G11                 # 恢复（含 unretract_extra_length）
+SET_RETRACTION [RETRACT_LENGTH=] [RETRACT_SPEED=] [UNRETRACT_EXTRA_LENGTH=] [UNRETRACT_SPEED=]
+GET_RETRACTION      # 回读四个参数（%.5f）
+```
+重复 `G10` 为 no-op；`retract_length=0` 时 `G10` 不产生移动。
+
 ### M118 / RESPOND — 主机回显（由 `[respond]` 注册，就绪前可用，批 #29）
 ```
 M118 <原文>

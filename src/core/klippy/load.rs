@@ -335,6 +335,7 @@ mod tests {
             [
                 "mcu",
                 "stepper_enable",
+                "multi_pin",
                 "adc_scaled",
                 "extruder",
                 "extruder_stepper",
@@ -438,6 +439,9 @@ mod tests {
                 .unwrap_or_else(|| panic!("no section '{id}'"))
         };
         assert_eq!(by_id("mcu").phase, Phase::Early);
+        // A virtual pin *provider* whose consumers are regular sections: like
+        // `adc_scaled` it must load before the generic walk, see the module docs.
+        assert_eq!(by_id("multi_pin").phase, Phase::Early);
         assert_eq!(by_id("adc_scaled").phase, Phase::Early);
         assert_eq!(by_id("output_pin").phase, Phase::Generic);
         assert_eq!(by_id("stepper_x").phase, Phase::Late);

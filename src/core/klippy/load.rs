@@ -338,6 +338,7 @@ mod tests {
                 "extruder",
                 "extruder_stepper",
                 "fan",
+                "fan_generic",
                 "heater_bed",
                 "heater_generic",
                 "manual_stepper",

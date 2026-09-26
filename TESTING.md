@@ -40,7 +40,7 @@ cargo run --bin klipperx -- stress <config.cfg> mcu --task motion
 - **判定**：电机按预期方向/距离动；`objects/query toolhead` 的 `position`/`homed_axes` 正确；
   `M400` 后固件步数与命令距离一致（`stepper_get_position`）。
 - **依据**：FW5 的完成条目已并入 [`TODO.md` 的「已完成（留档）」](TODO.md#已完成留档)（原独立归档文件已删除，历史见 `git log`）；
-  动工细节见 `docs/work-log/2026-09-21-fw5e-notes.md`。
+  动工细节随记录清理（`git log --diff-filter=D -- docs/work-log/` 可找回）。
 
 ### T2. FW6：`M119` / `query_endstops/status`（需要接一个 endstop）
 
@@ -56,7 +56,8 @@ cargo run --bin klipperx -- stress <config.cfg> mcu --task motion
 - **步骤**：`G28 X`。
 - **判定**：向 `position_endstop` 方向移动、触发即停；`homed_axes` 含 `x`；`position` 落在
   `position_endstop`（在 `max_error` 内）；不撞机、不越界。
-- **依据**：`TODO.md` FW6e；`docs/work-log/2026-09-21-fw6de-notes.md`。
+- **依据**：`TODO.md` FW6e；软件侧由「假 endstop + 假 MCU」单测覆盖（见
+  [开发手册 · 测试](docs/klippy/developer-manual/testing.md)）。
 
 ### T4. FW6：双板时序/漂移（需要两块板或一个副 MCU）
 
@@ -67,7 +68,7 @@ cargo run --bin klipperx -- stress <config.cfg> mcu --task motion
 - **判定**：跨 MCU 停轴同时生效；长时间后次 MCU 的 print-time 映射仍对齐
   （软件侧已用 ±100 ppm/1 h 模拟，误差 <10 ms；真板验**实际晶振漂移量**与
   电气/传输时序、USB/CAN 抖动与重传）。
-- **依据**：`docs/work-log/2026-09-21-fw6de-notes.md`；`SecondarySync` 周期重校准。
+- **依据**：`SecondarySync` 周期重校准（`mcu/object.rs` 的 `mcu_recalibrate` 定时器）。
 
 ### T5. FW7/FW8：`rpi_usb` 与物理复位
 
@@ -89,9 +90,11 @@ cargo run --bin klipperx -- stress <config.cfg> mcu --task motion
 
 - `[extruder]` + `stepper_enable`（`enable_pin`、`M18`/`M84`）真板基本动作。
 - 回零精度细节（`homing_retract_dist` 回抽 + 二次回零、`endstop_phase` 的
-  `get_trigger_position`/`set_stepper_adjustment`）：**这些是未实现的软件功能**，不是纯硬件验证；
-  实现后再谈真板。
-- **依据**：`TODO.md` C1/F8；`docs/work-log/2026-09-21-fw6de-notes.md` §已知限制。
+  `get_trigger_position`/`set_stepper_adjustment`）：**软件已落地**（`stepper.rs` 的
+  `homing_retract_dist`/`second_homing_speed`、`toolhead.rs` 的
+  `get_trigger_position`/`set_stepper_adjustment`、`endstop_phase.rs` 的相位调节）——
+  真板要验的是**实际精度**，不是功能存在性。
+- **依据**：`TODO.md` C1/F8。
 
 ## 3. 什么时候算“真板项清零”
 

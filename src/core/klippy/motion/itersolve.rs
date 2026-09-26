@@ -26,22 +26,27 @@ const SEEK_TIME_RESET: f64 = 0.000_100;
 /// (`cart_stepper_x_calc_position`, `chelper/kin_cartesian.c:14-20`), but
 /// `delta_stepper_alloc` (`chelper/kin_delta.c:16-41`) allocates its solver
 /// with `arm2`, `tower_x` and `tower_y` from the config. A plain function
-/// pointer cannot carry those, so the bound function keeps a three-float
+/// pointer cannot carry those, so the bound function keeps a small
 /// parameter block beside it. The value stays `Copy`, so `SolverSpec` and
 /// `StepKinematics` are unchanged; the stateless solvers bind zeros.
+///
+/// Six floats is what the widest solver needs: `rotary_delta_stepper_alloc`
+/// (`chelper/kin_rotary_delta.c:56-72`) carries shoulder radius, shoulder
+/// height, the tower's `cos`/`sin`, and the squared upper/lower arm lengths.
 #[derive(Debug, Clone, Copy)]
 pub struct PositionFn {
     /// The solver, reading its parameters as `params` (`[arm2, tower_x,
-    /// tower_y]` for delta, unused for the stateless ones).
-    f: fn(&MoveSegment, f64, &[f64; 3]) -> f64,
+    /// tower_y, …]` for delta, the six rotary values for `rotary_delta`,
+    /// unused for the stateless ones).
+    f: fn(&MoveSegment, f64, &[f64; 6]) -> f64,
     /// The parameters bound into `f`.
-    params: [f64; 3],
+    params: [f64; 6],
 }
 
 impl PositionFn {
     /// Bind a solver to its parameters (`delta_stepper_alloc(arm2, tower_x,
     /// tower_y)`).
-    pub fn bind(f: fn(&MoveSegment, f64, &[f64; 3]) -> f64, params: [f64; 3]) -> Self {
+    pub fn bind(f: fn(&MoveSegment, f64, &[f64; 6]) -> f64, params: [f64; 6]) -> Self {
         Self { f, params }
     }
 
@@ -390,7 +395,7 @@ pub enum Axis {
 /// (`cartesian_stepper_alloc`, `chelper/kin_cartesian.c:39-56`): read that
 /// axis' coordinate.
 pub fn cartesian_position_fn(axis: Axis) -> PositionFn {
-    const NO_PARAMS: [f64; 3] = [0.0; 3];
+    const NO_PARAMS: [f64; 6] = [0.0; 6];
     match axis {
         Axis::X => PositionFn::bind(
             |segment, move_time, _| segment.coord(move_time).x(),
@@ -419,7 +424,7 @@ pub fn cartesian_active_flags(axis: Axis) -> AxisFlags {
 /// The position function for one CoreXY motor (`corexy_stepper_alloc`,
 /// `chelper/kin_corexy.c`): `+` follows `x + y`, `-` follows `x - y`.
 pub fn corexy_position_fn(plus: bool) -> PositionFn {
-    const NO_PARAMS: [f64; 3] = [0.0; 3];
+    const NO_PARAMS: [f64; 6] = [0.0; 6];
     if plus {
         PositionFn::bind(
             |segment, move_time, _| {
@@ -448,7 +453,7 @@ pub fn corexy_active_flags() -> AxisFlags {
 /// The position function for one CoreXZ motor (`corexz_stepper_alloc`,
 /// `chelper/kin_corexz.c`): `+` follows `x + z`, `-` follows `x - z`.
 pub fn corexz_position_fn(plus: bool) -> PositionFn {
-    const NO_PARAMS: [f64; 3] = [0.0; 3];
+    const NO_PARAMS: [f64; 6] = [0.0; 6];
     if plus {
         PositionFn::bind(
             |segment, move_time, _| {
@@ -479,7 +484,7 @@ pub fn corexz_active_flags() -> AxisFlags {
 pub fn extruder_position_fn() -> PositionFn {
     PositionFn::bind(
         |segment, move_time, _| segment.coord(move_time).x(),
-        [0.0; 3],
+        [0.0; 6],
     )
 }
 

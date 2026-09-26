@@ -33,14 +33,17 @@ use crate::core::klippy::mathutil::{mat_transp, pseudo_inverse, Coord, X_AXIS, Y
 /// One stepper's position function for `generic_cartesian_stepper_alloc`
 /// (`kin_generic.c:24-31`): the dot product of its coefficient vector and the
 /// move's carriage coordinate.
-pub fn generic_cartesian_position(segment: &MoveSegment, move_time: f64, coeffs: &[f64; 3]) -> f64 {
+pub fn generic_cartesian_position(segment: &MoveSegment, move_time: f64, params: &[f64; 6]) -> f64 {
     let c = segment.coord(move_time);
-    coeffs[0] * c.x() + coeffs[1] * c.y() + coeffs[2] * c.z()
+    params[0] * c.x() + params[1] * c.y() + params[2] * c.z()
 }
 
 /// The bound solver for one `[stepper]` section with coefficients `coeffs`.
 pub fn generic_position_fn(coeffs: [f64; 3]) -> PositionFn {
-    PositionFn::bind(generic_cartesian_position, coeffs)
+    PositionFn::bind(
+        generic_cartesian_position,
+        [coeffs[0], coeffs[1], coeffs[2], 0.0, 0.0, 0.0],
+    )
 }
 
 /// The axes a generic-cartesian stepper follows
@@ -320,15 +323,15 @@ mod tests {
         };
         // `c0·x + c1·y + c2·z`.
         assert_eq!(
-            generic_cartesian_position(&segment, 0.5, &[1.0, 1.0, 0.0]),
+            generic_cartesian_position(&segment, 0.5, &[1.0, 1.0, 0.0, 0.0, 0.0, 0.0]),
             7.0
         );
         assert_eq!(
-            generic_cartesian_position(&segment, 0.5, &[1.0, -1.0, 0.0]),
+            generic_cartesian_position(&segment, 0.5, &[1.0, -1.0, 0.0, 0.0, 0.0, 0.0]),
             -1.0
         );
         assert_eq!(
-            generic_cartesian_position(&segment, 0.5, &[0.0, 0.0, 1.0]),
+            generic_cartesian_position(&segment, 0.5, &[0.0, 0.0, 1.0, 0.0, 0.0, 0.0]),
             5.0
         );
     }

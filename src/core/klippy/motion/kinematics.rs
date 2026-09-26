@@ -288,6 +288,127 @@ impl HomingHandle {
     }
 }
 
+/// The delta family's calibration parameters, as `[delta_calibrate]` sees
+/// them.
+///
+/// Upstream's linear and rotary delta kinematics both expose
+/// `get_calibration()`, and `delta_calibrate.py` drives whichever it gets
+/// through the same four calls — `calc_stable_position`,
+/// `coordinate_descent_params`, `new_calibration`, `get_position_from_stable`
+/// — plus `save_state`. The two parameter sets differ (a linear delta fits
+/// `delta_radius`/arm lengths, a rotary one `shoulder_radius`/`shoulder_height`
+/// and tower angles), so the adjustable set, the rebuilt object and the saved
+/// config options live behind this enum.
+#[derive(Debug, Clone)]
+pub enum KinematicsCalibration {
+    /// A linear delta's `DeltaCalibration` (`delta.py:163-241`).
+    Linear(DeltaCalibration),
+    /// A rotary delta's `RotaryDeltaCalibration` (`rotary_delta.py:135-235`).
+    Rotary(super::rotary_delta::RotaryDeltaCalibration),
+}
+
+impl KinematicsCalibration {
+    /// The stable position (steps since each endstop hit) for a cartesian
+    /// coordinate.
+    pub fn calc_stable_position(&self, coord: [f64; 3]) -> [f64; 3] {
+        match self {
+            Self::Linear(cal) => cal.calc_stable_position(coord),
+            Self::Rotary(cal) => cal.calc_stable_position(coord),
+        }
+    }
+
+    /// The cartesian coordinate a stable position describes.
+    ///
+    /// `None` when the three spheres do not intersect (upstream's `ValueError`
+    /// out of `trilateration`).
+    pub fn get_position_from_stable(&self, stable: [f64; 3]) -> Option<[f64; 3]> {
+        match self {
+            Self::Linear(cal) => cal.get_position_from_stable(stable),
+            Self::Rotary(cal) => cal.get_position_from_stable(stable),
+        }
+    }
+
+    /// The adjustable parameters, in upstream's `adj_params` order.
+    pub fn descent_params(&self, extended: bool) -> Vec<f64> {
+        match self {
+            Self::Linear(cal) => cal.descent_params(extended),
+            Self::Rotary(cal) => cal.descent_params(extended),
+        }
+    }
+
+    /// Rebuild a calibration from [`Self::descent_params`] values, carrying
+    /// over everything the adjustable set does not cover.
+    pub fn new_calibration(&self, values: &[f64], extended: bool) -> Self {
+        match self {
+            Self::Linear(cal) => {
+                Self::Linear(DeltaCalibration::from_descent_params(cal, values, extended))
+            }
+            Self::Rotary(cal) => Self::Rotary(
+                super::rotary_delta::RotaryDeltaCalibration::from_descent_params(
+                    cal, values, extended,
+                ),
+            ),
+        }
+    }
+
+    /// The config options `save_state` writes, as `(section, option, value)`
+    /// triples in upstream's order.
+    pub fn save_state_values(&self) -> Vec<(String, String, String)> {
+        match self {
+            Self::Linear(cal) => {
+                let mut out = vec![(
+                    "printer".to_string(),
+                    "delta_radius".to_string(),
+                    format!("{:.6}", cal.radius),
+                )];
+                for (index, axis) in ['a', 'b', 'c'].into_iter().enumerate() {
+                    let section = format!("stepper_{axis}");
+                    out.push((
+                        section.clone(),
+                        "angle".to_string(),
+                        format!("{:.6}", cal.angles[index]),
+                    ));
+                    out.push((
+                        section.clone(),
+                        "arm_length".to_string(),
+                        format!("{:.6}", cal.arms[index]),
+                    ));
+                    out.push((
+                        section,
+                        "position_endstop".to_string(),
+                        format!("{:.6}", cal.endstops[index]),
+                    ));
+                }
+                out
+            }
+            Self::Rotary(cal) => cal.save_state_values(),
+        }
+    }
+
+    /// The report `save_state` prints.
+    pub fn save_state_report(&self) -> String {
+        match self {
+            Self::Linear(cal) => format!(
+                "stepper_a: position_endstop: {:.6} angle: {:.6} arm_length: {:.6}\n\
+                 stepper_b: position_endstop: {:.6} angle: {:.6} arm_length: {:.6}\n\
+                 stepper_c: position_endstop: {:.6} angle: {:.6} arm_length: {:.6}\n\
+                 delta_radius: {:.6}",
+                cal.endstops[0],
+                cal.angles[0],
+                cal.arms[0],
+                cal.endstops[1],
+                cal.angles[1],
+                cal.arms[1],
+                cal.endstops[2],
+                cal.angles[2],
+                cal.arms[2],
+                cal.radius,
+            ),
+            Self::Rotary(cal) => cal.save_state_report(),
+        }
+    }
+}
+
 /// What the toolhead needs from its kinematics.
 pub trait Kinematics: Send + Sync + std::fmt::Debug {
     /// The toolhead position from the stepper positions.
@@ -335,8 +456,11 @@ pub trait Kinematics: Send + Sync + std::fmt::Debug {
     /// (`kinematics/delta.py:153-160`, `get_calibration`).
     ///
     /// `None` — the default — for every non-delta kinematics, which is what
-    /// `[delta_calibrate]` checks for (`delta_calibrate.py:127-131`).
-    fn delta_calibration(&self) -> Option<DeltaCalibration> {
+    /// `[delta_calibrate]` checks for (`delta_calibrate.py:127-131`). The
+    /// linear and rotary delta families carry different parameter sets, so the
+    /// object is returned as a [`KinematicsCalibration`] that `[delta_calibrate]`
+    /// drives the same way.
+    fn delta_calibration(&self) -> Option<KinematicsCalibration> {
         None
     }
 }
@@ -626,14 +750,14 @@ pub fn polar_angle_position(segment: &MoveSegment, move_time: f64) -> f64 {
 pub fn polar_radius_solver() -> PositionFn {
     PositionFn::bind(
         |segment, move_time, _| polar_radius_position(segment, move_time),
-        [0.0; 3],
+        [0.0; 6],
     )
 }
 
 pub fn polar_angle_solver() -> PositionFn {
     PositionFn::bind(
         |segment, move_time, _| polar_angle_position(segment, move_time),
-        [0.0; 3],
+        [0.0; 6],
     )
 }
 

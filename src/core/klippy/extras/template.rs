@@ -23,11 +23,12 @@
 //! | `{% set name = expr %}` | `{% set x_center = 0.5 * (x_max + x_min) %}` (`generic_cartesian_iqex.cfg:288`) |
 //! | `{# … #}` comments | (none in the corpus; parsed and skipped) |
 //! | literals | `0.0`, `'-1'`, `"abc"`, `True`/`False`/`None` |
+//! | list literals `[a, b]` | `[…settings["dual_carriage carriage_t3"].position_max, …]|min` (`generic_cartesian_iqex.cfg:286`) |
 //! | names, `a.b`, `a["k"]`, `a[0]`, calls | `printer["gcode_macro T"].t` |
 //! | `and` `or` `not`, `in` `not in`, `==` `!=` `<` `>` `<=` `>=` | `macros.cfg:66` |
 //! | `+ - * / %`, unary `-`, `t - 12.0` | `macros.cfg:37` |
 //! | `x is defined` / `is not defined` | `sdcard_loop.cfg:90` |
-//! | filters `\| int`, `\| float`, `\| default(x)` | `params.S \| default(1000.0) \| float` (`printer-velleman-k8800-2017.cfg:125`) |
+//! | filters `\| int`, `\| float`, `\| default(x)`, `\| min`, `\| max` | `params.S \| default(1000.0) \| float` (`printer-velleman-k8800-2017.cfg:125`) |
 //! | `range(n)` | `range(params.T \| int)` |
 //! | `action_respond_info`, `action_raise_error` | `macros.cfg`, `exclude_object.cfg` |
 //! | the macro's `variable_*` as bare names, `params`, `rawparams` | `macros.cfg:33` |
@@ -37,10 +38,11 @@
 //! - Statements outside `if/elif/else/endif/for/endfor/set` — Jinja also has
 //!   `{% block %}`, `{% include %}`, … — are refused at load
 //!   (`unsupported statement 'block'`).
-//! - Filters outside `int`/`float`/`default` (`min`/`max`/`abs`/`replace` in
+//! - Filters outside `int`/`float`/`default`/`min`/`max` (`abs`/`replace` in
 //!   the same corpus) are refused at render; a filter's keyword arguments
-//!   (`default(0, boolean=True)`) are outside the subset, so the tokenizer
-//!   refuses the `=`.
+//!   (`default(0, boolean=True)`, `min(attribute="x")`) are outside the
+//!   subset, so the tokenizer refuses the `=`. `min`/`max` take no argument
+//!   here, while Jinja reads a positional one as `case_sensitive`.
 //! - `range(n)` takes one argument; `action_emergency_stop` and
 //!   `action_call_remote_method` are not bound, so a name error says so.
 //! - Python literals in `ast.literal_eval` syntax (`None`, `'str'`, …) are
@@ -48,7 +50,11 @@
 //! - A missing printer object or status key is an **error**, where Jinja2's
 //!   default `Undefined` would render an empty string. Upstream's *corpus*
 //!   always names a key that exists; a port gap that hides behind a blank
-//!   `PARK_` line would be silent, so it fails loudly instead.
+//!   `PARK_` line would be silent, so it fails loudly instead. The same holds
+//!   for `[]|min` / `[]|max`: Jinja2 3.1.6 returns an `Undefined` there (it
+//!   renders blank and `is defined` is false), and this port has no
+//!   `Undefined` to return, so an empty sequence is the error
+//!   `min() arg is an empty sequence`.
 //! - `\| default(x)` is the one construct that expects to miss: it probes its
 //!   base quietly, the way `is defined` does, and falls back to `x`, because
 //!   `params.S \| default(…)` is exactly how the corpus spells an omitted
@@ -143,7 +149,7 @@ impl std::error::Error for TemplateError {}
 pub enum Rt {
     /// Status data, `params`, a `variable_*` literal — the JSON world.
     Json(Value),
-    /// A literal list (`[a, b]` is *not* supported; `range(n)` builds these).
+    /// A literal list (`[a, b]`, or what `range(n)` builds).
     List(Vec<Rt>),
     /// `printer`: upstream's `GetStatusWrapper` (`gcode_macro.py:15-43`).
     Printer(PrinterView),
@@ -936,6 +942,8 @@ pub struct Expr {
 #[derive(Debug)]
 enum ExprKind {
     Literal(Value),
+    /// `[a, b]` — a list literal (`generic_cartesian_iqex.cfg:286`).
+    List(Vec<Expr>),
     Name(String),
     Attr(Box<Expr>, String),
     Index(Box<Expr>, Box<Expr>),
@@ -995,6 +1003,10 @@ impl Expr {
                 other => other.to_string(),
             },
             ExprKind::Name(name) => name.clone(),
+            ExprKind::List(items) => {
+                let items: Vec<String> = items.iter().map(Expr::describe).collect();
+                format!("[{}]", items.join(", "))
+            }
             ExprKind::Attr(base, key) => format!("{}.{}", base.describe(), key),
             ExprKind::Index(base, index) => {
                 format!("{}[{}]", base.describe(), index.describe())
@@ -1436,6 +1448,28 @@ impl<'a> ExprParser<'a> {
                 self.expect_op(")")?;
                 Ok(inner)
             }
+            // `[a, b]` — the list literal `generic_cartesian_iqex.cfg:286`
+            // reduces with `|min`; elements are whole expressions, so they may
+            // carry filters of their own.
+            (Tok::Op(op), _) if op == "[" => {
+                self.bump();
+                let mut items = Vec::new();
+                if !self.is_op("]") {
+                    loop {
+                        items.push(self.parse_or()?);
+                        if self.is_op(",") {
+                            self.bump();
+                            continue;
+                        }
+                        break;
+                    }
+                }
+                self.expect_op("]")?;
+                Ok(Expr {
+                    kind: ExprKind::List(items),
+                    line,
+                })
+            }
             other => Err(self.error(format!(
                 "unexpected token '{}' in expression",
                 describe_tok(&other.0)
@@ -1544,6 +1578,13 @@ fn eval(expr: &Expr, context: &Context, name: &str) -> Result<Rt, TemplateError>
     let error = |detail: String| TemplateError::evaluate(name, expr.line, detail);
     match &expr.kind {
         ExprKind::Literal(value) => Ok(Rt::Json(value.clone())),
+        ExprKind::List(items) => {
+            let mut evaluated = Vec::with_capacity(items.len());
+            for item in items {
+                evaluated.push(eval(item, context, name)?);
+            }
+            Ok(Rt::List(evaluated))
+        }
         ExprKind::Name(binding) => match binding.as_str() {
             // Python's keywords are literals in Jinja too.
             "True" => Ok(Rt::Json(json!(true))),
@@ -1593,9 +1634,12 @@ fn eval(expr: &Expr, context: &Context, name: &str) -> Result<Rt, TemplateError>
                 // Jinja's `float` filter: `float(value)` or the filter's own
                 // default, `0.0` when it has no argument.
                 "float" => filter_float(&value, evaluated.first()).map_err(error),
+                // Jinja's `min`/`max`: the smallest/largest item of a sequence
+                // (`generic_cartesian_iqex.cfg:286-287`).
+                "min" | "max" => filter_extreme(filter, &value).map_err(error),
                 other => Err(error(format!(
                     "unknown filter '{other}' \
-                     (this port implements 'int', 'float' and 'default')"
+                     (this port implements 'int', 'float', 'default', 'min' and 'max')"
                 ))),
             }
         }
@@ -1825,6 +1869,12 @@ fn check_filter_arity(filter: &str, count: usize) -> Result<(), String> {
         "default" if count != 1 => Err(format!(
             "the 'default' filter takes 1 argument here, got {count} (this port's gap)"
         )),
+        // Jinja reads a positional argument as `case_sensitive` and a keyword
+        // one as `attribute`; the tokenizer has no `=`, so only the bare
+        // spelling is inside the subset (`generic_cartesian_iqex.cfg:286-287`).
+        "min" | "max" if count > 0 => Err(format!(
+            "the '{filter}' filter takes no arguments here, got {count} (this port's gap)"
+        )),
         _ => Ok(()),
     }
 }
@@ -1873,6 +1923,46 @@ fn filter_float(value: &Rt, default: Option<&Rt>) -> Result<Rt, String> {
         },
         // `None`, a container, `printer`, a builtin: `float()` raises.
         Rt::Json(_) | Rt::List(_) | Rt::Printer(_) | Rt::Builtin(_) => fallback(default),
+    }
+}
+
+/// `| min` / `| max` (`generic_cartesian_iqex.cfg:286-287`): the smallest /
+/// largest item of a sequence, as Jinja's `_min_or_max` (`jinja2/filters.py`)
+/// computes it — the environment's default `case_sensitive=False` means the
+/// comparison key folds strings to lower case (`min(["B", "a"])` is `"a"`)
+/// while the *original* item is what comes back, and everything else is its
+/// own key. CPython's `min`/`max` compare with `<`/`>`, which this port's
+/// [`compare`] already spells (numbers numerically, strings by code point,
+/// anything else an explicit `unorderable types` error).
+///
+/// An empty sequence is where this port leaves Jinja2: `_min_or_max` returns
+/// `environment.undefined("No aggregated item, sequence was empty.")` (3.1.6
+/// renders it blank and `is defined` is false), and this port has no
+/// `Undefined` value to hand back — see the module docs' gaps.
+fn filter_extreme(filter: &str, value: &Rt) -> Result<Rt, String> {
+    let mut items = iterate(value.clone())?.into_iter();
+    let Some(mut best) = items.next() else {
+        return Err(format!(
+            "{filter}() arg is an empty sequence \
+             (jinja2 leaves it undefined; this port fails loudly)"
+        ));
+    };
+    let op = if filter == "min" { Cmp::Lt } else { Cmp::Gt };
+    for item in items {
+        let replaces = compare(op, &extreme_key(&item), &extreme_key(&best))?;
+        if truthy(&replaces) {
+            best = item;
+        }
+    }
+    Ok(best)
+}
+
+/// The `ignore_case` key Jinja's `min`/`max` use when `case_sensitive` is
+/// false: strings fold for the comparison, every other type is its own key.
+fn extreme_key(value: &Rt) -> Rt {
+    match value {
+        Rt::Json(Value::String(text)) => Rt::Json(Value::String(text.to_lowercase())),
+        other => other.clone(),
     }
 }
 
@@ -2162,9 +2252,9 @@ mod tests {
 
         // The corpus sentence (`generic_cartesian_iqex.cfg:288`), rendered
         // after a later expression reads it back. Its `x_max`/`x_min` come
-        // from the context here: the lines that set them (286-287) need list
-        // literals and `|min`/`|max`, which are unit C's work, as is line 285
-        // (it reads `printer.*`).
+        // from the context here; the lines that set them (286-287) are the
+        // list literals `set_copy_mode_templates_load_and_render` covers, and
+        // line 285 reads `printer.*`.
         let mut context = context(&[], "");
         context.insert("x_max", Rt::Json(json!(300.0)));
         context.insert("x_min", Rt::Json(json!(0.0)));
@@ -2183,10 +2273,11 @@ mod tests {
         );
 
         let error =
-            render("{params.L | min}", &mut context(&[("L", "1")], "")).expect_err("no filter");
+            render("{params.L | abs}", &mut context(&[("L", "-1")], "")).expect_err("no filter");
         assert!(
             error.to_string().contains(
-                "unknown filter 'min' (this port implements 'int', 'float' and 'default')"
+                "unknown filter 'abs' \
+                 (this port implements 'int', 'float', 'default', 'min' and 'max')"
             ),
             "{error}"
         );
@@ -2461,35 +2552,214 @@ mod tests {
         );
     }
 
-    /// The two `SET_COPY_MODE` templates (`generic_cartesian_iqex.cfg:282-299`,
-    /// `generic_cartesian_itex.cfg:226-256`) carry no `|default`/`|float` at
-    /// all: their first load error is the list literal `[a, b]` that a later
-    /// unit owns. This pin records which side of the boundary they sit on, so
-    /// the template gap is not mistaken for a filter one (when list literals
-    /// land, the assertion flips to `is_ok()`).
+    /// List literals and `|min`/`|max` (`generic_cartesian_iqex.cfg:286-287`,
+    /// `generic_cartesian_itex.cfg:231,257`), in each position the corpus and
+    /// its neighbours put them: the right-hand side of a `{% set %}`, a
+    /// rendered expression, an `in` membership test, a subscript, a `{% for %}`
+    /// iterable, and chains into the filters this port already has.
     #[test]
-    fn set_copy_mode_templates_stop_on_list_literals() {
+    fn list_literals_and_min_max_follow_the_corpus_forms() {
+        // `{% set x_max = [a, b]|min %}` — the corpus sentence, its elements
+        // read from the context.
+        let mut bound = context(&[], "");
+        bound.insert("a", Rt::Json(json!(300.0)));
+        bound.insert("b", Rt::Json(json!(120.0)));
+        assert_eq!(
+            render("{% set x_max = [a, b]|min %}{ x_max }", &mut bound).expect("renders"),
+            "120.0"
+        );
+
+        // A rendered literal reaches `str()` the way Python's list repr does;
+        // filtered, it is the extreme item — floats keep their spelling.
+        assert_eq!(ok("[1, 5, 3]"), "[1, 5, 3]");
+        assert_eq!(ok("{ [1, 5, 3]|max }"), "5");
+        assert_eq!(ok("{ [1.0, 2]|min }"), "1.0");
+        assert_eq!(ok("{ [3, 1]|max }"), "3");
+
+        // Elements are whole expressions — filters included — and an empty
+        // literal is an empty list.
+        assert_eq!(
+            render("{ [params.L|int, 4]|max }", &mut context(&[("L", "7")], "")).expect("renders"),
+            "7"
+        );
+        assert_eq!(ok("{ [] }"), "[]");
+
+        // What this port already had, now taking a list literal: `in`, a
+        // subscript (the postfix chain after `[a, b]`), and `for`.
+        assert_eq!(ok("{% if 3 in [1, 2, 3] %}YES{% endif %}"), "YES");
+        assert_eq!(ok("{ [1, 2, 3][1] }"), "2");
+        assert_eq!(ok("{% for x in [3, 4] %}{ x }{% endfor %}"), "34");
+
+        // Chains: a `|min` value feeds arithmetic and the filters this port
+        // already has, and `is defined` sees a filtered literal.
+        assert_eq!(ok("{ [1, 2]|min + 1 }"), "2");
+        assert_eq!(ok("{ [1, 2]|min|int }"), "1");
+        assert_eq!(ok("{% if [1, 2]|max is defined %}Y{% endif %}"), "Y");
+
+        // Jinja's default `case_sensitive=False`: the comparison folds case,
+        // and the item itself is what comes back.
+        assert_eq!(ok("{ [\"B\", \"a\"]|min }"), "a");
+        assert_eq!(ok("{ [\"B\", \"a\"]|max }"), "B");
+    }
+
+    /// The error paths list literals and `min`/`max` add: an argument count the
+    /// filters do not take, an operand that is not a sequence, a sequence
+    /// CPython cannot order, and the empty sequence.
+    #[test]
+    fn list_and_extreme_errors_name_what_failed() {
+        // `min`/`max` take no argument here — Jinja reads one as
+        // `case_sensitive`, and this port's tokenizer refuses `=` anyway.
+        let error = render("{ [1, 5]|max(1) }", &mut context(&[], "")).expect_err("arity");
+        assert!(
+            error
+                .to_string()
+                .contains("the 'max' filter takes no arguments here, got 1 (this port's gap)"),
+            "{error}"
+        );
+
+        // A non-sequence operand fails the way a `{% for %}` over it does.
+        let error = render("{ 5|min }", &mut context(&[], "")).expect_err("not iterable");
+        assert!(
+            error.to_string().contains("cannot iterate over number"),
+            "{error}"
+        );
+
+        // Mixed element types are unorderable (`min([1, "a"])` in CPython),
+        // and so is a nesting the corpus never writes: this port's ordering is
+        // numbers and strings (`compare`).
+        let error = render("{ [1, \"a\"]|min }", &mut context(&[], "")).expect_err("mixed");
+        assert!(
+            error
+                .to_string()
+                .contains("unorderable types: str and number (<)"),
+            "{error}"
+        );
+        let error = render("{ [[1, 2], [3, 4]]|min }", &mut context(&[], "")).expect_err("nested");
+        assert!(
+            error
+                .to_string()
+                .contains("unorderable types: list and list (<)"),
+            "{error}"
+        );
+
+        // The empty sequence is where this port parts with Jinja2 3.1.6:
+        // `_min_or_max` returns an `Undefined` there (blank, `is defined`
+        // false) and this port has no `Undefined`, so it fails loudly — with
+        // `|default` the escape hatch, probing quietly, exactly as upstream
+        // writes `params.X|default(…)`.
+        let error = render("{ []|min }", &mut context(&[], "")).expect_err("empty");
+        assert!(
+            error.to_string().contains(
+                "min() arg is an empty sequence \
+                 (jinja2 leaves it undefined; this port fails loudly)"
+            ),
+            "{error}"
+        );
+        assert_eq!(
+            render("{ []|max|default(7) }", &mut context(&[], "")).expect("default catches it"),
+            "7"
+        );
+
+        // A literal's own load errors: an unclosed bracket.
+        let error = Template::parse("gcode_macro TEST:gcode", "{ [1, 2 }").expect_err("unclosed");
+        assert!(error.to_string().contains("expected ']'"), "{error}");
+    }
+
+    /// The two `SET_COPY_MODE` templates (`generic_cartesian_iqex.cfg:282-299`,
+    /// `generic_cartesian_itex.cfg:226-256`), whole bodies, cell for cell: the
+    /// list literals their `|min`/`|max` reduce, with the rest of the macro
+    /// rendered off the same bindings (`x_center` feeding both `G1 X…` lines).
+    #[test]
+    fn set_copy_mode_templates_load_and_render() {
         let iqex = "    G90\n    \
                     {% set y_center = 0.5 * (printer.configfile.settings[\"dual_carriage carriage_gantry1_left\"].position_max + printer.configfile.settings[\"carriage carriage_gantry0_left\"].position_min) %}\n    \
                     {% set x_max = [printer.configfile.settings[\"dual_carriage carriage_t3\"].position_max, printer.configfile.settings[\"dual_carriage carriage_t1\"].position_max]|min %}\n    \
                     {% set x_min = [printer.configfile.settings[\"dual_carriage carriage_t2\"].position_min, printer.configfile.settings[\"carriage carriage_t0\"].position_min]|max %}\n    \
-                    {% set x_center = 0.5 * (x_max + x_min) %}\n";
-        let error = Template::parse("gcode_macro SET_COPY_MODE:gcode", iqex).expect_err("list");
-        assert_eq!(
-            error.to_string(),
-            "Error loading template 'gcode_macro SET_COPY_MODE:gcode'\n\
-             line 3: unexpected token '[' in expression"
+                    {% set x_center = 0.5 * (x_max + x_min) %}\n    \
+                    SET_DUAL_CARRIAGE CARRIAGE=carriage_gantry0_left\n    \
+                    G1 Y{printer.configfile.settings[\"carriage carriage_gantry0_left\"].position_min} F12000\n    \
+                    SET_DUAL_CARRIAGE CARRIAGE=carriage_gantry1_left\n    \
+                    G1 Y{y_center} F12000\n    \
+                    SET_DUAL_CARRIAGE CARRIAGE=carriage_t2\n    \
+                    G1 X{printer.configfile.settings[\"dual_carriage carriage_t2\"].position_min} F12000\n    \
+                    SET_DUAL_CARRIAGE CARRIAGE=carriage_t0\n    \
+                    G1 X{printer.configfile.settings[\"carriage carriage_t0\"].position_min} F12000\n    \
+                    SET_DUAL_CARRIAGE CARRIAGE=carriage_t3\n    \
+                    G1 X{x_center} F12000\n    \
+                    SET_DUAL_CARRIAGE CARRIAGE=carriage_t1\n    \
+                    G1 X{x_center} F12000\n    \
+                    SET_DUAL_CARRIAGE CARRIAGE=carriage_t0 MODE=PRIMARY\n    \
+                    SET_DUAL_CARRIAGE CARRIAGE=carriage_t1 MODE=COPY\n    \
+                    SET_DUAL_CARRIAGE CARRIAGE=carriage_t2 MODE=COPY\n    \
+                    SET_DUAL_CARRIAGE CARRIAGE=carriage_t3 MODE=COPY\n    \
+                    SET_DUAL_CARRIAGE CARRIAGE=carriage_gantry0_left MODE=PRIMARY\n    \
+                    SET_DUAL_CARRIAGE CARRIAGE=carriage_gantry1_left MODE=COPY\n    \
+                    ACTIVATE_EXTRUDER EXTRUDER=extruder\n    \
+                    SYNC_EXTRUDER_MOTION EXTRUDER=extruder1 MOTION_QUEUE=extruder\n    \
+                    SYNC_EXTRUDER_MOTION EXTRUDER=extruder2 MOTION_QUEUE=extruder\n    \
+                    SYNC_EXTRUDER_MOTION EXTRUDER=extruder3 MOTION_QUEUE=extruder\n";
+        let rendered = render(iqex, &mut copy_mode_context()).expect("the macro loads");
+        // `y_center` = 0.5*(200 + 0), `x_max` = min(300, 120), `x_min` =
+        // max(10, 5), so `x_center` = 0.5*(120 + 10) on both `G1 X…` lines.
+        assert!(rendered.contains("G1 Y0.0 F12000"), "{rendered}");
+        assert!(rendered.contains("G1 Y100.0 F12000"), "{rendered}");
+        assert!(rendered.contains("G1 X10.0 F12000"), "{rendered}");
+        assert!(rendered.contains("G1 X5.0 F12000"), "{rendered}");
+        assert_eq!(rendered.matches("G1 X65.0 F12000").count(), 2, "{rendered}");
+        assert!(
+            rendered.contains("SYNC_EXTRUDER_MOTION EXTRUDER=extruder3 MOTION_QUEUE=extruder"),
+            "{rendered}"
         );
 
         let itex = "    G90\n    \
                     {% set y_center = 0.5 * (printer.configfile.settings[\"dual_carriage carriage_gantry1\"].position_max + printer.configfile.settings[\"carriage carriage_gantry0_left\"].position_min) %}\n    \
                     {% set x_max = printer.configfile.settings[\"dual_carriage carriage_t1\"].position_max %}\n    \
-                    {% set x_min = [printer.configfile.settings[\"dual_carriage carriage_t2\"].position_min, printer.configfile.settings[\"carriage carriage_t0\"].position_min]|max %}\n";
-        let error = Template::parse("gcode_macro SET_COPY_MODE:gcode", itex).expect_err("list");
-        assert_eq!(
-            error.to_string(),
-            "Error loading template 'gcode_macro SET_COPY_MODE:gcode'\n\
-             line 4: unexpected token '[' in expression"
+                    {% set x_min = [printer.configfile.settings[\"dual_carriage carriage_t2\"].position_min, printer.configfile.settings[\"carriage carriage_t0\"].position_min]|max %}\n    \
+                    {% set x_center = 0.5 * (x_max + x_min) %}\n    \
+                    SET_DUAL_CARRIAGE CARRIAGE=carriage_gantry0_left\n    \
+                    G1 Y{printer.configfile.settings[\"carriage carriage_gantry0_left\"].position_min} F12000\n    \
+                    SET_DUAL_CARRIAGE CARRIAGE=carriage_gantry1\n    \
+                    G1 Y{y_center} F12000\n    \
+                    SET_DUAL_CARRIAGE CARRIAGE=carriage_t2\n    \
+                    G1 X{printer.configfile.settings[\"dual_carriage carriage_t2\"].position_min} F12000\n    \
+                    SET_DUAL_CARRIAGE CARRIAGE=carriage_t0\n    \
+                    G1 X{printer.configfile.settings[\"carriage carriage_t0\"].position_min} F12000\n    \
+                    SET_DUAL_CARRIAGE CARRIAGE=carriage_t1\n    \
+                    G1 X{x_center} F12000\n    \
+                    SET_DUAL_CARRIAGE CARRIAGE=carriage_t0 MODE=PRIMARY\n    \
+                    SET_DUAL_CARRIAGE CARRIAGE=carriage_t1 MODE=COPY\n    \
+                    SET_DUAL_CARRIAGE CARRIAGE=carriage_t2 MODE=COPY\n    \
+                    SET_DUAL_CARRIAGE CARRIAGE=carriage_gantry0_left MODE=PRIMARY\n    \
+                    SET_DUAL_CARRIAGE CARRIAGE=carriage_gantry1 MODE=COPY\n    \
+                    ACTIVATE_EXTRUDER EXTRUDER=extruder\n    \
+                    SYNC_EXTRUDER_MOTION EXTRUDER=extruder1 MOTION_QUEUE=extruder\n    \
+                    SYNC_EXTRUDER_MOTION EXTRUDER=extruder2 MOTION_QUEUE=extruder\n";
+        let rendered = render(itex, &mut copy_mode_context()).expect("the macro loads");
+        assert!(rendered.contains("G1 Y100.0 F12000"), "{rendered}");
+        assert_eq!(rendered.matches("G1 X65.0 F12000").count(), 1, "{rendered}");
+        assert!(
+            rendered.contains("SYNC_EXTRUDER_MOTION EXTRUDER=extruder2 MOTION_QUEUE=extruder"),
+            "{rendered}"
         );
+    }
+
+    /// The `printer.configfile.settings` view both `SET_COPY_MODE` macros read,
+    /// one `position_min`/`position_max` per carriage (floats, as the config
+    /// parser hands them over).
+    fn copy_mode_context() -> Context {
+        let mut context = context(&[], "");
+        context.insert(
+            "printer",
+            Rt::Json(json!({"configfile": {"settings": {
+                "dual_carriage carriage_gantry1_left": {"position_max": 200.0},
+                "dual_carriage carriage_gantry1": {"position_max": 200.0},
+                "carriage carriage_gantry0_left": {"position_min": 0.0},
+                "dual_carriage carriage_t3": {"position_max": 300.0},
+                "dual_carriage carriage_t1": {"position_max": 120.0},
+                "dual_carriage carriage_t2": {"position_min": 10.0},
+                "carriage carriage_t0": {"position_min": 5.0},
+            }}})),
+        );
+        context
     }
 }

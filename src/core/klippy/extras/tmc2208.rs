@@ -291,7 +291,11 @@ pub fn field_formatters() -> HashMap<String, fn(i64) -> String> {
 pub fn build_read_translate(fields: Arc<FieldHelper>) -> ReadTranslate {
     Box::new(move |reg_name: &str, val: u32| {
         if reg_name == "IOIN" {
-            let drv_type = fields.get_field("sel_a", Some(val), Some("IOIN"));
+            // Upstream resolves `sel_a` through the field-to-register map
+            // (`self.fields.get_field("sel_a", val)`, `tmc2208.py:225`):
+            // neither `IOIN@TMC222x` nor `IOIN@TMC220x` is named `IOIN`, so
+            // passing a register name here would panic.
+            let drv_type = fields.get_field("sel_a", Some(val), None);
             let name = if drv_type != 0 {
                 "IOIN@TMC220x"
             } else {
@@ -362,4 +366,123 @@ pub fn load_config_prefix(
     // TPOWERDOWN
     set("tpowerdown", 20)?;
     Ok(driver)
+}
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    use crate::core::klippy::api::StartArgs;
+    use crate::core::klippy::config::Config;
+    use crate::core::klippy::gcode::{GCodeDispatch, GCODE_OBJECT};
+    use crate::core::klippy::printer::PrinterState;
+    use crate::core::klippy::reactor::TokioReactor;
+
+    fn fake_dictionary() -> Option<std::path::PathBuf> {
+        let dict = klipperx_test_support::test_dicts_dir().join("atmega2560.dict");
+        dict.is_file().then_some(dict)
+    }
+
+    /// A cartesian machine with one `[tmc2208 stepper_x]`, shaped like the
+    /// corpus printer configs.
+    fn machine_config(dict: &std::path::Path) -> Config {
+        let text = format!(
+            "[mcu]\ntest: dict={}\n\
+             [printer]\nkinematics: cartesian\nmax_velocity: 300\nmax_accel: 3000\n\
+             max_z_velocity: 5\nmax_z_accel: 100\n\
+             [stepper_x]\nstep_pin: PF0\ndir_pin: PF1\nenable_pin: !PD7\nmicrosteps: 16\n\
+             rotation_distance: 40\nendstop_pin: ^PE5\nposition_endstop: 0\nposition_max: 200\n\
+             homing_speed: 50\n\
+             [stepper_y]\nstep_pin: PF6\ndir_pin: !PF7\nenable_pin: !PF2\nmicrosteps: 16\n\
+             rotation_distance: 40\nendstop_pin: ^PJ1\nposition_endstop: 0\nposition_max: 200\n\
+             homing_speed: 50\n\
+             [stepper_z]\nstep_pin: PL3\ndir_pin: PL1\nenable_pin: !PK0\nmicrosteps: 16\n\
+             rotation_distance: 8\nendstop_pin: ^PJ2\nposition_endstop: 0\nposition_max: 200\n\
+             [tmc2208 stepper_x]\nuart_pin: PC4\nrun_current: 0.5\n",
+            dict.display()
+        );
+        Config::from_text(&text).expect("the config parses").0
+    }
+
+    /// Load the config, and connect the fake firmware so the register init
+    /// runs. The printer is returned for tear-down before asserting, as
+    /// `upstream.rs::run_phases` does.
+    async fn up_machine(dict: &std::path::Path) -> (Arc<Printer>, Result<(), String>) {
+        let config = machine_config(dict);
+        let reactor = Arc::new(TokioReactor::new(tokio::runtime::Handle::current()));
+        let printer = Arc::new(Printer::new(reactor));
+        let mut start_args = StartArgs::collect("tmc2208.cfg", None);
+        start_args.debug_output = Some("_test_output".to_string());
+        printer.set_start_args(Arc::new(start_args));
+        let setup = async {
+            printer
+                .load_config(&config)
+                .map_err(|err| err.to_string())?;
+            if tokio::time::timeout(std::time::Duration::from_secs(10), printer.bring_up())
+                .await
+                .is_err()
+            {
+                return Err("bring_up timed out".to_string());
+            }
+            let state = printer.get_state_message();
+            if state.category != PrinterState::Ready {
+                return Err(format!("not ready: {}", state.message));
+            }
+            Ok(())
+        }
+        .await;
+        (printer, setup)
+    }
+
+    /// A full `DUMP_TMC` translates `IOIN` through the field map, not through a
+    /// register named `IOIN` — that name exists only as `IOIN@TMC222x` /
+    /// `IOIN@TMC220x`, so the queried-register loop used to panic
+    /// (`unknown tmc field 'sel_a' in register 'IOIN'`), surfacing as
+    /// `Internal error on command:"DUMP_TMC"` in the corpus `tmc.cfg`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dump_tmc_translates_ioin_through_the_field_map() {
+        let Some(dict) = fake_dictionary() else {
+            return;
+        };
+        let (printer, setup) = up_machine(&dict).await;
+        let run: Result<Vec<String>, String> = async {
+            setup?;
+            let gcode = printer
+                .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+                .expect("the loader registers `gcode`");
+            let replies = Arc::new(StdMutex::new(Vec::<String>::new()));
+            {
+                let replies = Arc::clone(&replies);
+                gcode.register_output_handler(Arc::new(move |line: &str| {
+                    replies.lock().unwrap().push(line.to_string());
+                }));
+            }
+            gcode
+                .run_script("DUMP_TMC STEPPER=stepper_x")
+                .await
+                .map_err(|err| err.to_string())?;
+            let captured = replies.lock().unwrap().clone();
+            Ok(captured)
+        }
+        .await;
+        printer.teardown();
+        let replies = run.expect("DUMP_TMC runs without a bus");
+        // Every read answers 0 under file output, so `sel_a` is 0 and the
+        // register is the TMC222x mapping.
+        assert!(
+            replies.iter().any(|line| line.contains("IOIN@TMC222x:")),
+            "no translated IOIN line: {replies:?}"
+        );
+        assert!(
+            replies
+                .iter()
+                .any(|line| line.contains("========== Write-only registers ==========")),
+            "DUMP_TMC has no write-only section: {replies:?}"
+        );
+    }
 }

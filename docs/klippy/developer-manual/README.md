@@ -142,7 +142,7 @@ klipperx（bin，src/main.rs）
 
 | 文件 | 职责 |
 |------|------|
-| `mod.rs` | `Mcu`：构造（`new`）、收发任务、`send` / `call`、字典安装与查询（出站队列 `SEND_QUEUE_CAPACITY` = 512：同步 `send` 在队列满时**有界退避等待**（总 ≤ `SYNC_SEND_WAIT` 1s），超时仍报错且带上命令名与水位；能大量入队的路径走 await 容量的 `send_payload`——剩余 ≤16 格（`SYNC_SEND_HEADROOM`）时暂停入队等排空，给同步 `send` 常备余量）、`seconds_to_clock`、`estimated_clock`（connect 时 `set_clock_base` 的最小时间估计）、`Drop`；构造时向 `identify` 取起始 `Parser`，本身不引用任何命令 |
+| `mod.rs` | `Mcu`：构造（`new`）、收发任务、`send` / `call`、字典安装与查询（出站队列 `SEND_QUEUE_CAPACITY` = 512：同步 `send` 在队列满时**有界退避等待**（总 ≤ `SYNC_SEND_WAIT` 1s），超时仍报错且带上命令名与水位；能大量入队的路径走 await 容量的 `send_payload`——剩余 ≤16 格（`SYNC_SEND_HEADROOM`）时暂停入队等排空，给同步 `send` 常备余量）、`seconds_to_clock`、**时钟估计器**（`estimated_clock`：样本 `(sent, received, clock)` 取中点折半程 RTT 作错点，窗口 `CLOCK_FIT_WINDOW=30` 最小二乘拟合频率，无样本时回退字典标称；`get_uptime` 种子无往返则锚在调用瞬间），`Drop`；构造时向 `identify` 取起始 `Parser`，本身不引用任何命令 |
 | `object.rs` | `McuObject`：`[mcu]` / `[mcu <name>]` 作为打印机对象，以及工厂 `load_config` / `load_config_prefix`。section 只在 `PrinterObject::connect` 时才解析、开设备、跑 identify，随后把累积的配置交给固件（需要时先复位），再把固件的 `shutdown`/`is_shutdown`/`starting` 绑成打印机停机；`get_status` 报 identify 快照 |
 | `config.rs` | [`ConfigBuilder`](mcu-config.md)：配置期的 oid 发号器、`config` / `restart` / `init` 三张命令表、config 回调、CRC 与 `finalize_config`，`configure()` / `handshake()` 的 `get_config` 两段式握手，以及“停机或 CRC 不一致时先复位（`config_reset` 就地，或 `reset` + 重连）再配置”的复位路径 |
 | `resource/pin.rs` | `McuChip`（MCU 作为 pin chip，实现 `PinChip`）与 `McuDigitalOut`：数字输出的 oid、`config_digital_out` / `update_digital_out` 与运行期的 `queue_digital_out`；pin 名→编号在 config 回调里完成。另提供 `resolve_bus_name`（`BUS_PINS_<bus>` 预留，供 SPI/I2C 调用）与 `resolve_bus_value` |
@@ -170,7 +170,7 @@ klipperx（bin，src/main.rs）
 | `config.rs` | `get_config` / `finalize_config`：配置 CRC 握手（`basecmd.c` 的 Config CRC） |
 | `uptime.rs` | `get_uptime`：读 64 位固件时钟（`basecmd.c` 的 Timing and load stats） |
 | `shutdown.rs` | `emergency_stop` / `clear_shutdown`：固件停机与解锁（`basecmd.c` 的 Misc commands） |
-| `clock.rs` | `ClockSync` / `McuClock`：`get_clock` ↔ `clock`（用能力 trait 把时钟同步与 `Mcu` 解耦，测试里用不依赖 MCU 的 `FixedClock`） |
+| `clock.rs` | `ClockSync` / `McuClock`：`get_clock` ↔ `clock`（用能力 trait 把时钟同步与 `Mcu` 解耦，测试里用不依赖 MCU 的 `FixedClock`）；每次 `get_clock` 查询同时以三元组喂 `Mcu` 的时钟估计（`test_a_query_feeds_the_mcu_clock_estimate`） |
 | `gpio.rs` | `config_digital_out` / `update_digital_out` / `queue_digital_out` / `set_digital_out_pwm_cycle`：数字输出与软件 PWM 周期（固件 `gpiocmds.c`） |
 | `pwm.rs` | `config_pwm_out` / `queue_pwm_out`：硬件 PWM（固件 `pwmcmds.c`） |
 | `adc.rs` | `config_analog_in` / `query_analog_in`（新旧两种）与 `analog_in_state`（新旧两种）：ADC 周期采样（固件 `adccmds.c`） |

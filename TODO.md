@@ -172,8 +172,7 @@ toolhead / 开放事件）一起补，一部分是现在就独立可补的小行
       `symlink` 到 `/tmp/printer` + 关 `ECHO` + 非阻塞）与 `GCodeIO` 对象；③ `is_fileinput`
       决定 `request_restart` / `_handle_shutdown` 是否退 `error_exit`（`:355` `:429`）；
       ④ `gcode:debuginput_exit` 需要 `send_event` 收集 handler 返回值（上游 `all(...)`）。
-      tty 与 debuginput 共用同一套 `_process_data`，应一起做。详见
-      [FW4 笔记](docs/work-log/2026-09-21-fw4-notes.md) 第 3 节。
+      tty 与 debuginput 共用同一套 `_process_data`，应一起做。
 - [~] **`gcode:debuginput_exit` 触发（随 `GCodeIO` 暂缓）**：上游 `_do_debuginput_exit`
       轮询 `all(send_event('gcode:debuginput_exit'))`（`:432-435`），依赖 handler 的返回值；
       本仓库 `Printer::send_event` 丢弃返回值（上游 `klippy/klippy.py:226-227` 是
@@ -673,7 +672,7 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
       「最小模块在 host 单测 + 假 MCU 上跑通」为准，真板项见 [`TESTING.md`](TESTING.md)。
       两个子项 `[~]` 暂缓：`GCodeIO`（不做 OctoPrint 串口仿真，见正文 G1b）、
       `MCU_bus_digital_out` 包装（能力已由 `DigitalOut::queue_digital_out` 提供，随 H8 显示接）。
-      分阶段细节见各 FW 的工作记录（`docs/work-log/2026-09-21-fw*-notes.md` 等）；
+      分阶段细节见各 FW 的工作记录（已随收官清理，`git log --diff-filter=D -- docs/work-log/` 可找回）；
       已完结的几篇随收口清理（见目录 README 说明）。
 
 - **toolhead 与 kinematics（C1 / FW5a–f）**：Rust 分层重写（不引 FFI）——`Coord` 与

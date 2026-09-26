@@ -6,7 +6,8 @@
 //! (`st7920.py`, `hd44780.py`, `uc1701.py`, …), `menu.py`/`menu_keys.py` (the
 //! on-screen menu), and two shipped layouts (`display.cfg`, `menu.cfg`). Here
 //! the same split is kept: [`display`] is the framework, [`st7920`],
-//! [`hd44780`], [`uc1701`], [`ssd1306`] and [`aip31068_spi`] are the panels that
+//! [`hd44780`], [`hd44780_spi`], [`uc1701`], [`ssd1306`] and [`aip31068_spi`]
+//! are the panels that
 //! have a driver here, and the shipped layout is [`display::DISPLAY_CFG`],
 //! vendored beside them.
 //!
@@ -30,10 +31,10 @@
 //! * **The menu.** `menu.cfg` is not loaded: no `menu` object, no `menu:*`
 //!   events, no menu drawing. The menu options a config writes are still read
 //!   (see [`display::PrinterLCD`]), because `check_unused` requires a reader.
-//! * **The other panels.** `st7920`, `hd44780`, `uc1701`, `ssd1306` and
-//!   `aip31068_spi` have drivers; `sh1106`, `hd44780_spi` and
-//!   `emulated_st7920` are accepted by `lcd_type` (so its error wording stays
-//!   upstream's) and refused with a message naming the gap.
+//! * **The other panels.** `st7920`, `hd44780`, `hd44780_spi`, `uc1701`,
+//!   `ssd1306` and `aip31068_spi` have drivers; `sh1106` and `emulated_st7920`
+//!   are accepted by `lcd_type` (so its error wording stays upstream's) and
+//!   refused with a message naming the gap.
 //! * **`[display_data]`/`[display_glyph]` in the main config.** Only the shipped
 //!   `display.cfg` is read; a main config's own layouts and glyphs are still
 //!   rejected as unknown sections, because the loader claims a section through
@@ -42,6 +43,7 @@
 pub mod aip31068_spi;
 pub mod display;
 pub mod hd44780;
+pub mod hd44780_spi;
 pub mod ssd1306;
 pub mod st7920;
 pub mod uc1701;

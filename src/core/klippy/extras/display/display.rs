@@ -62,6 +62,7 @@ use crate::core::klippy::reactor::{Reactor, TimerHandle};
 
 use super::aip31068_spi::Aip31068Spi;
 use super::hd44780::Hd44780;
+use super::hd44780_spi::Hd44780Spi;
 use super::ssd1306::Ssd1306;
 use super::st7920::ST7920;
 use super::uc1701::Uc1701;
@@ -80,9 +81,10 @@ const REDRAW_MIN_TIME: f64 = 0.100;
 /// The panel names `lcd_type` accepts — upstream's `LCD_chips` keys
 /// (`display.py:12-19`).
 ///
-/// The whole list is accepted even though only `st7920`, `hd44780`, `uc1701`,
-/// `ssd1306` and `aip31068_spi` have drivers here, so the choice error is
-/// upstream's wording and the names are not silently rejected.
+/// The whole list is accepted even though only `st7920`, `hd44780`,
+/// `hd44780_spi`, `uc1701`, `ssd1306` and `aip31068_spi` have drivers here, so
+/// the choice error is upstream's wording and the names are not silently
+/// rejected.
 const LCD_TYPES: &[&str] = &[
     "st7920",
     "emulated_st7920",
@@ -239,6 +241,7 @@ impl PrinterLCD {
         let lcd_chip: Arc<dyn LcdChip> = match lcd_type.as_str() {
             "st7920" => Arc::new(ST7920::new(config, printer)?),
             "hd44780" => Arc::new(Hd44780::new(config, printer)?),
+            "hd44780_spi" => Arc::new(Hd44780Spi::new(config, printer)?),
             "uc1701" => Arc::new(Uc1701::new(config, printer)?),
             "ssd1306" => Arc::new(Ssd1306::new(config, printer)?),
             "aip31068_spi" => Arc::new(Aip31068Spi::new(config, printer)?),
@@ -1121,11 +1124,10 @@ mod tests {
     }
 
     #[test]
-    fn test_a_panel_without_a_driver_is_reported() {
-        // `uc1701` has a driver since U-DISP-3: without its required `a0_pin`
-        // the load stops in option validation instead of the old
-        // "not implemented" sentence — that wording is now covered by the
-        // sibling gaps below.
+    fn test_a_panel_reports_its_missing_required_option() {
+        // The panels that have a driver stop in option validation when a
+        // required option is absent, instead of the old "not implemented"
+        // sentence — that wording now covers only the siblings below.
         let err = machine()
             .load_config(&display_config(
                 "lcd_type: uc1701\ncs_pin: PA3\nsclk_pin: PA1\nsid_pin: PC1\n",
@@ -1137,15 +1139,14 @@ mod tests {
             "Option 'a0_pin' in section 'display' must be specified"
         );
 
-        // The SPI sibling of the panel that does have a driver: `hd44780` is
-        // implemented, `hd44780_spi` is not.
+        // `hd44780_spi`'s required option is the shift register's latch line.
         let err = machine()
             .load_config(&display_config("lcd_type: hd44780_spi\n"))
             .unwrap_err();
 
         assert_eq!(
             err.to_string(),
-            "lcd_type 'hd44780_spi' is not implemented in this host"
+            "Option 'latch_pin' in section 'display' must be specified"
         );
     }
 

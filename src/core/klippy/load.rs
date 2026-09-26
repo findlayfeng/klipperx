@@ -358,6 +358,7 @@ mod tests {
                 "servo",
                 "thermistor",
                 "adc_temperature",
+                "axis_twist_compensation",
                 "bed_mesh",
                 "bed_screws",
                 "bed_tilt",

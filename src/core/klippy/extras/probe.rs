@@ -28,6 +28,7 @@ use serde_json::{json, Value};
 use tracing::warn;
 
 use crate::core::klippy::config::{ConfigError, ConfigWrapper, PrinterConfig};
+use crate::core::klippy::event::printer_bus::ProbeResultsHandle;
 use crate::core::klippy::event::KlippyEvent;
 use crate::core::klippy::extras::manual_probe::{
     FinalizeCallback, ManualProbe, MANUAL_PROBE_OBJECT,
@@ -513,11 +514,16 @@ impl ProbeSessionHelper {
                 return Err(err);
             }
         };
-        // `axis_twist_compensation` updates its results from this event
-        // (`probe.py:329`); this port's event carries no payload yet.
+        // A consumer (`axis_twist_compensation`) edits the result in place; the
+        // reported value is what the handlers left (`probe.py:329`, where
+        // `_probe` reads `results[0]` back after `send_event`).
+        let results = ProbeResultsHandle::new(vec![epos]);
         if let Some(printer) = self.printer.upgrade() {
-            printer.send_event(&KlippyEvent::ProbeUpdateResults);
+            printer.send_event(&KlippyEvent::ProbeUpdateResults {
+                results: results.clone(),
+            });
         }
+        let epos = results.to_vec().first().copied().unwrap_or(epos);
         gcmd.respond_info(&format!(
             "probe at {:.3},{:.3} is z={:.6}",
             epos.x(),

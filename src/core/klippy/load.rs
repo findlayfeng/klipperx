@@ -373,6 +373,7 @@ mod tests {
                 "gcode_arcs",
                 "gcode_macro",
                 "heater_fan",
+                "homing_heaters",
                 "homing_override",
                 "idle_timeout",
                 "input_shaper",

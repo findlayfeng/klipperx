@@ -576,9 +576,10 @@ impl PrinterHeaters {
             .map_err(ConfigError::new)
     }
 
-    /// The registered heaters' names. Upstream reports its dict's insertion
-    /// order; this is the map's name order, which nothing reads positionally.
-    fn available_heaters(&self) -> Vec<String> {
+    /// The registered heaters' names (`PrinterHeaters.get_all_heaters`,
+    /// `heaters.py:286-287`). Upstream reports its dict's insertion order; this
+    /// is the map's name order, which nothing reads positionally.
+    pub fn get_all_heaters(&self) -> Vec<String> {
         self.heaters
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -598,7 +599,7 @@ impl PrinterHeaters {
 impl PrinterObject for PrinterHeaters {
     fn get_status(&self, _eventtime: f64) -> Value {
         json!({
-            "available_heaters": self.available_heaters(),
+            "available_heaters": self.get_all_heaters(),
             "available_sensors": self.available_sensors(),
             "available_monitors": self
                 .monitors

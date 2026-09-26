@@ -16,15 +16,15 @@
 //!
 //! # Known gaps
 //!
-//! * `sensor_type` accepts all five upstream chips, but only `hx711`,
-//!   `hx717`, `ads131m02` and `ads131m04` are built here — `ads1220`
-//!   reports *not implemented* (LC-3).
 //! * The four `LOAD_CELL_*` commands are registered with upstream's help
 //!   strings but answer *not implemented*: they need the sample collector
 //!   (`LoadCellSampleCollector`) and, for `LOAD_CELL_CALIBRATE`, the
 //!   interactive `LoadCellGuidedCalibrationHelper`.
-//! * `[load_cell_probe]`, the guided calibration's `configfile.set` write-back
-//!   and the `trigger_analog` attach are not wired.
+//! * `[load_cell_probe]`, the load cell as a Z probe, now loads its section and
+//!   attaches the `trigger_analog` (see
+//!   [`load_cell_probe`](crate::core::klippy::extras::load_cell_probe)); its
+//!   probe-run path is still unwired. The guided calibration's
+//!   `configfile.set` write-back is not wired either.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, Weak};
@@ -167,12 +167,23 @@ pub enum LoadSensor {
 }
 
 impl LoadSensor {
-    /// Samples per second the chip streams (`get_samples_per_second`).
+    /// Configured samples per second (`get_samples_per_second`).
     pub fn samples_per_second(&self) -> f64 {
         match self {
             Self::Hx71x(sensor) => sensor.samples_per_second() as f64,
             Self::Ads1220(sensor) => sensor.samples_per_second() as f64,
             Self::Ads131M0x(sensor) => sensor.samples_per_second(),
+        }
+    }
+
+    /// The MCU chip's registry name (its `dout_pin`/`spi_mcu` chip), what the
+    /// `pins` object keys the `McuChip` by (`[load_cell_probe]`'s trigger
+    /// analog builds on it).
+    pub fn mcu_chip_name(&self) -> &str {
+        match self {
+            Self::Hx71x(sensor) => sensor.mcu_chip_name(),
+            Self::Ads1220(sensor) => sensor.mcu_chip_name(),
+            Self::Ads131M0x(sensor) => sensor.mcu_chip_name(),
         }
     }
 

@@ -32,7 +32,7 @@ main():
 
 > **与上游的差异**：`start_args` 中的 `debuginput`、`debugoutput`、`dictionary` 在上游可组成
 > 「文件输出 + 数据字典」的**无固件运行模式**。本项目的等价物分两半：`start_args.debug_output`
-> 字段与 `Printer::is_fileoutput()` 已就位（T3，回归 harness 在装载前填它，`-o`/`-i` 的命令行入口
+> 字段与 `Printer::is_fileoutput()` 已就位（回归 harness 在装载前填它，`-o`/`-i` 的命令行入口
 > 尚未做），字典则由应答机 `SimulatorDevice` 走真实的 identify 路径下发（不是直接注入），见
 > [回归测试](regression-tests.md)。
 

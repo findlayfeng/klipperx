@@ -39,8 +39,8 @@ cargo run --bin klipperx -- stress <config.cfg> mcu --task motion
 - **步骤**：`SET_KINEMATIC_POSITION` 标定 → `G1 X10`、`G1 X0 Y10`、`G1 Z1`（三轴 + `[extruder]` 若有）。
 - **判定**：电机按预期方向/距离动；`objects/query toolhead` 的 `position`/`homed_axes` 正确；
   `M400` 后固件步数与命令距离一致（`stepper_get_position`）。
-- **依据**：[已完成条目归档](docs/work-log/2026-09-22-completed-archive.md)（FW5）；
-  `docs/work-log/2026-09-21-fw5e-notes.md`。
+- **依据**：FW5 的完成条目已并入 [`TODO.md` 的「已完成（留档）」](TODO.md#已完成留档)（原独立归档文件已删除，历史见 `git log`）；
+  动工细节见 `docs/work-log/2026-09-21-fw5e-notes.md`。
 
 ### T2. FW6：`M119` / `query_endstops/status`（需要接一个 endstop）
 

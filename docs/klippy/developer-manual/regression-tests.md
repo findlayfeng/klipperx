@@ -205,7 +205,7 @@ M3 `smart_effector` 落地后，仅剩 `eddy.test`——`probe_eddy_current` 属
   **236 条通过、0 条失败**，`IGNORED` **已清空**（2026-09-25 收官；逐批转绿过程见各批提交信息与
   `TODO.md`）。另有 2 条运行声明 `DICTIONARY … pru.dict`，默认不构建 `pru`（需 `pru-gcc`），
   不计入统计。
-- 按「首次失败」归类的历史分布（T3–T10 工单、运动学细分、完整失败日志与「收益不可加」的复盘）
+- 按「首次失败」归类的历史分布（分域工单、运动学细分、完整失败日志与「收益不可加」的复盘）
   曾记在 `docs/work-log/2026-09-22-upstream-regression-failures.md`；该快照**随收官从工作记录目录
   清理**（`git log --diff-filter=D -- docs/work-log/` 可找回）。本页只保留机制与推进口径，避免两处
   统计互相漂移。

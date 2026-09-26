@@ -85,7 +85,8 @@ const MOVE_SLOTS: u32 = 64;
 
 /// How many `queue_step` commands to queue before letting the send task drain.
 ///
-/// The outbound channel holds 32 items (`mcu/mod.rs`), so a stage's commands go
+/// The outbound channel holds 512 items (`SEND_QUEUE_CAPACITY` in `mcu/mod.rs`;
+/// the sync sender waits bounded when full), so a stage's commands go
 /// out in batches that stay under it, with a flush between. The flush paces the
 /// *sending*, not the stepping: the commands still chain, so the schedule the
 /// firmware sees is the same.
@@ -99,7 +100,7 @@ const COMM_MAX_RATE: f64 = 200_000.0;
 
 /// Unanswered requests allowed before the link counts as losing them.
 ///
-/// In flight there is the outbound channel (32 items) plus the wire, so this is
+/// In flight there is the outbound channel (512 items) plus the wire, so this is
 /// well above what a healthy link holds at any moment.
 const COMM_BACKLOG_LIMIT: u64 = 128;
 
@@ -403,7 +404,7 @@ async fn settle(mcu: &Arc<Mcu>) -> Result<(), std::io::Error> {
 /// return how many went out.
 ///
 /// Pacing is by wall clock: each pass sends whatever is due by now and sleeps a
-/// little when caught up. When the outbound channel is full (32 items,
+/// little when caught up. When the outbound channel is full (512 items,
 /// `mcu/mod.rs`) the send reports it, so the pass flushes and retries once; if
 /// that cannot keep up, `sent` falls behind `rate` and the caller sees it.
 async fn drive_requests(
@@ -614,7 +615,7 @@ async fn send_steps(
     oid: u8,
     commands: &[StepCommand],
 ) -> Result<(), std::io::Error> {
-    // The outbound channel holds 32 items (`mcu/mod.rs`); a flush every 16 keeps
+    // The outbound channel holds 512 items (`mcu/mod.rs`); a flush every 16 keeps
     // it from filling while a long compressed run goes out.
     const BATCH: usize = 16;
     for chunk in commands.chunks(BATCH) {

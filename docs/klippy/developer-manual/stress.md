@@ -46,8 +46,8 @@ klipperx stress [OPTIONS] <CONFIG_FILE> [MCU]
    （`src/stepper.c:311`）——如果不先等，这个错误会被误当成速率上限。
 
 发送时一段的命令分批发（每批 `SEND_BATCH` 条，之间 `flush`）：主机出站通道容量是
-`SEND_QUEUE_CAPACITY`（`mcu/mod.rs`，512 格；同步 `send` 用 `try_send` 不等待容量，
-溢出会报 `no available capacity`；能等待的路径走 `send_payload`，且剩余 ≤16 格（`SYNC_SEND_HEADROOM`）时让位等排空，给同步发送常备余量）。分批仍保留，只给发送节奏，
+`SEND_QUEUE_CAPACITY`（`mcu/mod.rs`，512 格；同步 `send` 队列满时**有界退避等待**（总 ≤ `SYNC_SEND_WAIT` 1s），
+超时才报 `no available capacity`（错误现带命令名与水位）；能等待的路径走 `send_payload`，且剩余 ≤16 格（`SYNC_SEND_HEADROOM`）时让位等排空，给同步发送常备余量）。分批仍保留，只给发送节奏，
 不影响固件看到的步进时刻。
 
 ### 步进任务的出错形态

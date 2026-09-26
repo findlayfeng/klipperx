@@ -25,6 +25,7 @@ pub mod itersolve;
 pub mod kinematics;
 pub mod plan;
 pub mod queuing;
+pub mod rotary_delta;
 pub mod stepcompress;
 pub mod stepper;
 pub mod toolhead;
@@ -37,7 +38,7 @@ pub use itersolve::{
 };
 pub use kinematics::{
     CartesianKinematics, CartesianTransform, HomeCoord, Homing, HomingHandle, HomingInfo,
-    HomingState, Kinematics, MoveContext, NoneKinematics,
+    HomingState, Kinematics, KinematicsCalibration, MoveContext, NoneKinematics,
 };
 pub use plan::{LookAheadQueue, Move, MoveLimits};
 pub use queuing::MotionQueuing;

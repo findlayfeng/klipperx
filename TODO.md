@@ -397,7 +397,7 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 
 - [ ] `pid_calibrate.py`（`PID_CALIBRATE`）与 `verify_heater.py`：仍缺
       （`extruder.rs:21` 明示 still open）。
-- [ ] 传感器**剩余**：`adc_scaled.py`（**已完成**，批 #19）、`temperature_host.py` /
+- [ ] 传感器**剩余**：`temperature_host.py` /
       `temperature_probe.py` / `temperature_fan.py`，以及 `thermistor` 自定义型号
       （`G2` / `Kingroon_B3950` 2 次）。已落地并归档：`temperature_sensor` / `thermistor` /
       `adc_temperature` / `spi_temperature`（MAX6675/31855/31856/31865） /

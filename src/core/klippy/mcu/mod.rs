@@ -364,8 +364,8 @@ struct Wire {
     /// Unwrapped into a monotonic counter, because the 4-bit value on the wire
     /// only ever moves forward: a frame that looks behind is really ahead.
     next: AtomicU64,
-    /// Set when the connection's first frame showed a firmware that was already
-    /// mid-session, i.e. one nothing had reset.
+    /// Set when the connection's first new sequence number showed a firmware
+    /// that was already mid-session, i.e. one nothing had reset.
     took_over: AtomicBool,
 }
 
@@ -718,11 +718,14 @@ impl Mcu {
         let interface_for_recv = interface.clone();
         let wire_for_recv = Arc::clone(&wire);
         let recv_handle = handle.spawn(async move {
-            // The firmware's counter in this connection's unwrapped numbering, and
-            // how many frames have been accepted: the first frame is what says
-            // whether the firmware was already running (`Wire::took_over`).
+            // The firmware's counter in this connection's unwrapped numbering:
+            // `0` until a frame carries a new number, and a frame that merely
+            // repeats the number so far leaves it at `0` — the same way
+            // upstream's `receive_seq` only moves on a new sequence
+            // (`serialqueue.c:254-268`). "No new number taken in yet" is this
+            // session's first-frame test: it is what says whether the firmware
+            // was already running (`Wire::took_over`).
             let mut seen = 0u64;
-            let mut frames = 0usize;
 
             loop {
                 let frame = match interface_for_recv.receive().await {
@@ -741,12 +744,21 @@ impl Mcu {
                     // A new number: it answers a block. The firmware's counter is
                     // the authority on which blocks those are, so a number past
                     // anything this connection sent comes from a session that came
-                    // before it — which the *first* frame of a connection always is
-                    // when the board never rebooted. That is how a running firmware
-                    // is taken over (`serialqueue.c:196-201`); the send task adopts
-                    // the number and puts what was not accepted back on the wire.
+                    // before it. Drop it — unless this is still the session's
+                    // **first** new number (`receive_seq == 1` upstream,
+                    // `serialqueue.c:261`; `seen == 0` here): that one is how a
+                    // firmware that never rebooted is taken over, and it may be
+                    // carrying a leftover frame the previous session never
+                    // acknowledged. Dropping it would leave the firmware replaying
+                    // it forever while everything queued behind it — an identify
+                    // answer included — never goes out. It is adopted instead:
+                    // the connection-init case of `serialqueue.c:197-201`, where
+                    // an answer to a block this connection never sent says where
+                    // the firmware is, and the send task renumbers and resends
+                    // what was not accepted.
                     let next = wire_for_recv.next.load(Ordering::Relaxed);
-                    if frames > 0 && rseq > next {
+                    let first_new = seen == 0;
+                    if !first_new && rseq > next {
                         warn!(
                             "Frame with sequence {rseq} answers block {next} or later, which this \
                              connection never sent; dropping it"
@@ -754,7 +766,7 @@ impl Mcu {
                         continue;
                     }
                     seen = rseq;
-                    if frames == 0 && rseq > 1 {
+                    if first_new && rseq > 1 {
                         // A firmware that just booted answers this connection's
                         // first block with 0 or 1 (`src/command.c`, whose counter
                         // starts at 0). Anything else was already running when the
@@ -772,7 +784,6 @@ impl Mcu {
                         let _ = acks_tx.send(seen);
                     }
                 }
-                frames += 1;
 
                 // An empty frame is the MCU's ack of the block it took, or its nak
                 // of one it would not take. Either way its number is where the
@@ -1560,6 +1571,183 @@ mod tests {
             !mcu.took_over_session(),
             "a stray frame after the first one is not a session to take over"
         );
+    }
+
+    /// The session's first **new** sequence number is adopted even when an
+    /// earlier frame repeated the number this connection starts at.
+    ///
+    /// A board that never rebooted may repeat this connection's own initial
+    /// number first — a leftover frame from the session before — and only then
+    /// show the number it is really waiting for. Only the first new number
+    /// belongs to the takeover (`receive_seq == 1` upstream,
+    /// `serialqueue.c:261`): the frame carrying it must not be dropped for
+    /// answering a block this connection never sent, or the firmware replays it
+    /// forever and whatever is queued behind it never goes out.
+    #[tokio::test]
+    async fn test_the_first_new_sequence_is_adopted_after_a_repeated_frame() {
+        let mut parser = Parser::new();
+        parser.register(5, "get_clock").unwrap();
+        parser.register(18, "clock clock=%u").unwrap();
+        let mut answer = Payload::new();
+        answer.push_i16(18).unwrap();
+        answer.push_u32(1).unwrap();
+
+        // Two frames answer the first block: one that repeats the number this
+        // connection starts at, then the first new number — high, and for a
+        // block this connection never sent. The second mapping is the firmware
+        // accepting the request once its number is adopted.
+        let device = FrameMock::new(vec![
+            MappingEntry {
+                input: make_frame(0, &[5]),
+                outputs: vec![make_frame(0, &[]), make_frame(9, &[])],
+            },
+            MappingEntry {
+                input: make_frame(9, &[5]),
+                outputs: vec![make_frame(9, &answer.into_raw())],
+            },
+        ]);
+        let recorder = device.recorder();
+        let mcu = Mcu::for_test("test_mcu", Interface::new(device));
+        let dictionary = Dictionary::from_json(serde_json::json!({
+            "commands": {"get_clock": 5},
+            "responses": {"clock clock=%u": 18}
+        }))
+        .unwrap();
+        mcu.install_dictionary(dictionary).unwrap();
+
+        let params = mcu
+            .call("get_clock", &[], "clock", Duration::from_millis(200))
+            .await
+            .expect("the first new sequence is adopted, so the request is answered");
+        assert_eq!(params.len(), 1);
+        assert!(
+            mcu.took_over_session(),
+            "a firmware waiting past this connection's number never rebooted"
+        );
+
+        // The block went out once at this connection's number and once at the
+        // adopted one: renumbered, not merely repeated.
+        let sent = recorder.frames();
+        let seqs: Vec<u8> = sent.iter().map(|frame| frame.seq()).collect();
+        assert_eq!(
+            seqs,
+            [0, 9],
+            "the block is renumbered onto the adopted sequence"
+        );
+    }
+
+    /// Once the session has taken in a new number, a frame answering past what
+    /// this connection sent is still dropped, not adopted.
+    ///
+    /// Mid-session such a frame cannot be where the firmware is — the firmware
+    /// moves in lockstep with this connection's window — so adopting it would
+    /// rename the session around a stray (`serialqueue.c:261-265` drops it
+    /// there too).
+    #[tokio::test]
+    async fn test_a_mid_session_frame_past_our_next_is_dropped_not_adopted() {
+        let mut parser = Parser::new();
+        parser.register(5, "get_clock").unwrap();
+        parser.register(18, "clock clock=%u").unwrap();
+        let mut answer = Payload::new();
+        answer.push_i16(18).unwrap();
+        answer.push_u32(1).unwrap();
+
+        // First exchange: the normal answer (the session's first new number is
+        // 1, nothing to take over). Second exchange: a stray numbered past
+        // anything this connection sent arrives *before* the real answer.
+        let device = FrameMock::new(vec![
+            MappingEntry {
+                input: make_frame(0, &[5]),
+                outputs: vec![
+                    make_frame(1, &answer.clone().into_raw()),
+                    make_frame(1, &[]),
+                ],
+            },
+            MappingEntry {
+                input: make_frame(1, &[5]),
+                outputs: vec![make_frame(9, &[]), make_frame(2, &answer.into_raw())],
+            },
+        ]);
+        let mcu = Mcu::for_test("test_mcu", Interface::new(device));
+        let dictionary = Dictionary::from_json(serde_json::json!({
+            "commands": {"get_clock": 5},
+            "responses": {"clock clock=%u": 18}
+        }))
+        .unwrap();
+        mcu.install_dictionary(dictionary).unwrap();
+
+        for round in 0..2 {
+            mcu.call("get_clock", &[], "clock", Duration::from_millis(200))
+                .await
+                .unwrap_or_else(|e| panic!("exchange {round} must complete: {e}"));
+        }
+
+        assert!(
+            !mcu.took_over_session(),
+            "a mid-session stray is not a session to take over"
+        );
+        assert_eq!(
+            mcu.wire.next.load(Ordering::Relaxed),
+            2,
+            "the stray never renames the session"
+        );
+    }
+
+    /// A firmware with no leftover frame: the first frame is the normal answer
+    /// to the first block, and two round trips are exactly one block each, at
+    /// their own numbers — no takeover, no renumbering, no second send.
+    #[tokio::test]
+    async fn test_a_normal_first_frame_exchange_is_unchanged() {
+        let mut parser = Parser::new();
+        parser.register(5, "get_clock").unwrap();
+        parser.register(18, "clock clock=%u").unwrap();
+        let mut answer = Payload::new();
+        answer.push_i16(18).unwrap();
+        answer.push_u32(1).unwrap();
+
+        let device = FrameMock::new(vec![
+            MappingEntry {
+                input: make_frame(0, &[5]),
+                outputs: vec![
+                    make_frame(1, &answer.clone().into_raw()),
+                    make_frame(1, &[]),
+                ],
+            },
+            MappingEntry {
+                input: make_frame(1, &[5]),
+                outputs: vec![
+                    make_frame(2, &answer.clone().into_raw()),
+                    make_frame(2, &[]),
+                ],
+            },
+        ]);
+        let recorder = device.recorder();
+        let mcu = Mcu::for_test("test_mcu", Interface::new(device));
+        let dictionary = Dictionary::from_json(serde_json::json!({
+            "commands": {"get_clock": 5},
+            "responses": {"clock clock=%u": 18}
+        }))
+        .unwrap();
+        mcu.install_dictionary(dictionary).unwrap();
+
+        for round in 0..2 {
+            mcu.call("get_clock", &[], "clock", Duration::from_millis(200))
+                .await
+                .unwrap_or_else(|e| panic!("exchange {round} must complete: {e}"));
+        }
+
+        assert!(
+            !mcu.took_over_session(),
+            "a freshly booted firmware has nothing to take over"
+        );
+        assert_eq!(
+            mcu.wire.next.load(Ordering::Relaxed),
+            2,
+            "both blocks accepted, none renumbered"
+        );
+        let sent = recorder.frames();
+        let seqs: Vec<u8> = sent.iter().map(|frame| frame.seq()).collect();
+        assert_eq!(seqs, [0, 1], "one block per exchange, at its own number");
     }
 
     // -----------------------------------------------------------------------

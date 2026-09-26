@@ -386,9 +386,15 @@ struct Wire {
 ///
 /// Upstream computes its retransmit timeout from round-trip samples
 /// (`serialqueue.c:218-237`, clamped to these same 25 ms / 5 s). This host
-/// keeps those same samples — see [`RttEstimator`] — but the wait itself still
-/// starts at the floor and doubles on every timeout, which is what upstream
-/// does to a timeout as well (`:456-460`).
+/// does the same: [`Sender::rto`] starts at this floor and moves to the
+/// estimate from the first sample on (see [`RttEstimator`], kept in step by
+/// [`Sender::record_sample`]).
+///
+/// The two halves divide the work: **the estimate is the normal wait**, and
+/// **doubling off the floor is the lost-packet fallback**. A timeout still
+/// doubles the wait up to the ceiling (`:456-460`) so a line that has gone
+/// quiet does not hammer the wire, and the next sample the line does yield
+/// pulls the wait back to the estimate.
 const MIN_RTO: Duration = Duration::from_millis(25);
 const MAX_RTO: Duration = Duration::from_secs(5);
 
@@ -437,9 +443,9 @@ struct InFlightBlock {
 ///
 /// The estimator itself is pure: [`rtt_step`] and [`rtt_rto`] do the
 /// arithmetic, [`RttEstimator::record`] only stores what they return. The
-/// retransmit wait ([`Sender::rto`]) does **not** consume it yet; the estimate
-/// is collected here, warned about here, and read through the accessors on
-/// [`Sender`].
+/// retransmit wait ([`Sender::rto`]) is driven from it —
+/// [`Sender::record_sample`] folds each sample in and brings the wait along —
+/// while the warning keeps firing off the sample itself.
 #[derive(Debug)]
 struct RttEstimator {
     /// The most recent sample, `None` until the first one: the raw
@@ -571,7 +577,10 @@ struct Sender {
     /// (`serialqueue.c:451-454`, `ignore_nak_seq`).
     acked: Option<u64>,
     retransmitted: Option<u64>,
-    /// How long to wait for an answer before retransmitting.
+    /// How long to wait for an answer before retransmitting: the estimate's
+    /// value once a sample has landed (see [`Sender::record_sample`]), the
+    /// [`MIN_RTO`] floor until then, and a timeout's doubling on top of
+    /// either until the next sample arrives (see [`MIN_RTO`] for the split).
     rto: Duration,
     /// When the unanswered blocks should go out again, `None` when there are
     /// none. The send task's `select!` arms on it, so a block the firmware never
@@ -599,7 +608,9 @@ impl Sender {
         self.retransmit_at
     }
 
-    /// Arm the retransmit timer from now with the current wait.
+    /// Arm the retransmit timer from now with the current wait: the
+    /// estimate's value, or the backed-off one a timeout left behind (see
+    /// [`Sender::rto`]).
     fn arm_retransmit(&mut self) {
         self.retransmit_at = Some(tokio::time::Instant::now() + self.rto);
     }
@@ -613,9 +624,9 @@ impl Sender {
     /// The most recent round trip measured on this connection, `None` until the
     /// first one lands.
     ///
-    /// Read-only: the send task is the only writer. Nothing consumes it yet —
-    /// it is exposed for the units that will wire the estimate into the
-    /// retransmit timer and the send deadline.
+    /// Read-only: the send task is the only writer. What the retransmit timer
+    /// consumes is the *estimate*, brought in step by
+    /// [`Sender::record_sample`]; the raw sample stays an observation.
     fn rtt(&self) -> Option<Duration> {
         self.rtt.last_sample
     }
@@ -631,10 +642,32 @@ impl Sender {
     /// The retransmit timeout the estimate implies, already clamped to
     /// [`MIN_RTO`]..=[`MAX_RTO`].
     ///
-    /// Read-only, like [`Sender::rtt`]. It is **not** what [`Sender::rto`]
-    /// waits out today: that wait still starts at the floor and doubles.
+    /// Read-only, like [`Sender::rtt`]. It is what [`Sender::rto`] waits out
+    /// once a sample has landed; that wait differs from it only where a
+    /// timeout has doubled the value, until the next sample pulls it back.
     fn estimated_rto(&self) -> Duration {
         self.rtt.rto
+    }
+
+    /// Take one round trip into the estimate and bring the retransmit wait
+    /// along with it.
+    ///
+    /// This is the pull-back half of the split described in [`MIN_RTO`]: a
+    /// wait a timeout backed off is the fallback, and the next sample the line
+    /// yields sets it straight to the estimate again.
+    fn record_sample(&mut self, sample: Duration) {
+        self.rtt.record(sample);
+        self.sync_rto_to_estimate();
+    }
+
+    /// Bring the retransmit wait back to what the estimate says: [`MIN_RTO`]
+    /// while no sample has landed, the estimator's clamped value from then on.
+    ///
+    /// A success or a renumber starts the wait over **here**, not at the floor:
+    /// how long the next unanswered block may take is what the line has
+    /// measured, not 25 ms by default.
+    fn sync_rto_to_estimate(&mut self) {
+        self.rto = self.estimated_rto();
     }
 
     /// Put one block on the wire, carrying the sequence this connection is at, and
@@ -711,6 +744,11 @@ impl Sender {
     /// (`serialqueue.c:441-446`) and doubles the wait (`:456-460`); the blocks
     /// keep their sequences so the firmware, which is waiting for the oldest,
     /// takes them in order.
+    ///
+    /// The doubling is the lost-packet fallback of the split in [`MIN_RTO`],
+    /// not the way the wait is normally chosen: it runs off the current value
+    /// — estimate-backed or already backed off — up to [`MAX_RTO`], and the
+    /// next sample ([`Sender::record_sample`]) replaces it with the estimate.
     async fn retransmit(&mut self, interface: &Interface) {
         let again: Vec<InFlightBlock> = self.in_flight.drain(..).collect();
         self.retransmit_at = None;
@@ -786,10 +824,11 @@ impl Sender {
             acked_tx = Some(block.sent_at);
         }
         if self.in_flight.is_empty() {
-            // Everything is answered, so there is nothing to retransmit and the
-            // next block starts the wait over.
+            // Everything is answered, so there is nothing to retransmit, and
+            // the wait starts over at the estimate — the floor only while no
+            // sample has landed, never a reset back to it after a success.
             self.retransmit_at = None;
-            self.rto = MIN_RTO;
+            self.sync_rto_to_estimate();
         }
 
         // One sample per pinned block, and only if the ack actually covers it
@@ -799,7 +838,7 @@ impl Sender {
             if seen > anchor {
                 self.sample_seq = None;
                 let sample = Instant::now().saturating_duration_since(sent_at);
-                self.rtt.record(sample);
+                self.record_sample(sample);
                 if self.rtt_warn.should_warn(sample) {
                     warn!("{}", rtt_warn_message(sample));
                 }
@@ -859,7 +898,7 @@ impl Sender {
         self.retransmitted = None;
         // What was pinned belonged to the abandoned window.
         self.sample_seq = None;
-        self.rto = MIN_RTO;
+        self.sync_rto_to_estimate();
     }
 }
 
@@ -2254,7 +2293,8 @@ mod tests {
     //
     // `serialqueue.c:218-237`: one sample per acknowledged block, an
     // RFC6298-style smoothing that starts conservatively, and a timeout
-    // derived from both and clamped to [MIN_RTO, MAX_RTO].
+    // derived from both and clamped to [MIN_RTO, MAX_RTO] — which is also the
+    // wait the retransmit timer arms itself with (see [`Sender::rto`]).
     // -----------------------------------------------------------------------
 
     /// The first sample starts the way upstream starts it
@@ -2488,6 +2528,194 @@ mod tests {
             "no sample from a block that went out twice"
         );
         assert!(sender.srtt().is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // the retransmit wait the estimate drives (`Sender::rto`)
+    //
+    // The split named in [`MIN_RTO`]: the estimate is the normal wait, a
+    // timeout's doubling off the floor is the lost-packet fallback, and the
+    // next sample pulls the wait back to the estimate.
+    // -----------------------------------------------------------------------
+
+    /// With no sample the wait is the floor it has always been, and a timeout
+    /// doubles it — the fallback path a line nothing has measured yet runs on.
+    #[tokio::test]
+    async fn test_without_a_sample_the_wait_is_the_floor_and_doubles() {
+        // Original send and two retransmits of the same block.
+        let device = FrameMock::new(vec![
+            MappingEntry {
+                input: make_frame(0, &[5]),
+                outputs: vec![],
+            },
+            MappingEntry {
+                input: make_frame(0, &[5]),
+                outputs: vec![],
+            },
+            MappingEntry {
+                input: make_frame(0, &[5]),
+                outputs: vec![],
+            },
+        ]);
+        let interface = Interface::new(device);
+        let mut sender = Sender::new(Arc::new(Wire::default()));
+
+        sender.send_block(&interface, vec![5]).await;
+        assert_eq!(
+            sender.rto, MIN_RTO,
+            "no sample: the wait starts at the floor"
+        );
+        assert_eq!(
+            sender.estimated_rto(),
+            MIN_RTO,
+            "and the estimate says the same"
+        );
+
+        sender.retransmit(&interface).await;
+        assert_eq!(sender.rto, MIN_RTO * 2, "a timeout still doubles the wait");
+        sender.retransmit(&interface).await;
+        assert_eq!(sender.rto, MIN_RTO * 4, "and doubles again");
+    }
+
+    /// The first sample moves the wait off the floor to the estimate, to the
+    /// microsecond — the values the estimator itself derives for the same
+    /// sequence, not a rounded stand-in.
+    #[test]
+    fn test_a_sample_moves_the_wait_to_the_estimate() {
+        let mut sender = Sender::new(Arc::new(Wire::default()));
+        assert_eq!(
+            sender.rto, MIN_RTO,
+            "before any sample the wait is the floor"
+        );
+
+        sender.record_sample(Duration::from_millis(5));
+        assert_eq!(
+            sender.estimated_rto(),
+            Duration::from_millis(60),
+            "srtt 50 ms + 4 × 2.5 ms"
+        );
+        assert_eq!(
+            sender.rto,
+            Duration::from_millis(60),
+            "the wait is the estimate from the first sample on"
+        );
+
+        sender.record_sample(Duration::from_millis(7));
+        assert_eq!(
+            sender.rto,
+            Duration::from_micros(95_125),
+            "44.625 ms + 50.5 ms — the same value the estimator derives"
+        );
+        assert_eq!(
+            sender.rto,
+            sender.estimated_rto(),
+            "the wait and the estimate stay together"
+        );
+    }
+
+    /// A success starts the wait over **at the estimate**, not at the floor:
+    /// what the line measured before still says how long the next unanswered
+    /// block may take.
+    #[tokio::test]
+    async fn test_a_success_returns_the_wait_to_the_estimate_not_the_floor() {
+        // The original send and the retransmit of the same block: the ack that
+        // finally lands closes the window without yielding a new sample (the
+        // retransmit threw the pin away), so only the success line below can
+        // choose the wait.
+        let device = FrameMock::new(vec![
+            MappingEntry {
+                input: make_frame(0, &[5]),
+                outputs: vec![],
+            },
+            MappingEntry {
+                input: make_frame(0, &[5]),
+                outputs: vec![],
+            },
+        ]);
+        let interface = Interface::new(device);
+        let mut sender = Sender::new(Arc::new(Wire::default()));
+        sender.record_sample(Duration::from_millis(5));
+        assert_eq!(
+            sender.rto,
+            Duration::from_millis(60),
+            "the estimate the success should return to"
+        );
+
+        sender.send_block(&interface, vec![5]).await;
+        sender.retransmit(&interface).await;
+        assert_eq!(
+            sender.rto,
+            Duration::from_millis(120),
+            "the timeout backed the wait off the estimate"
+        );
+
+        sender.settle(&interface, 1).await;
+
+        assert_eq!(
+            sender.rto,
+            Duration::from_millis(60),
+            "back to the estimate, not to the 25 ms floor"
+        );
+        assert_eq!(sender.rto, sender.estimated_rto());
+        assert_ne!(sender.rto, MIN_RTO);
+    }
+
+    /// A timeout backs the wait off; the next sample the line actually yields
+    /// pulls it straight back to the estimate.
+    #[tokio::test]
+    async fn test_a_new_sample_pulls_a_doubled_wait_back_to_the_estimate() {
+        // seq 0: original and retransmit; seq 1: the block that yields the
+        // sample pulling the wait back.
+        let device = FrameMock::new(vec![
+            MappingEntry {
+                input: make_frame(0, &[5]),
+                outputs: vec![],
+            },
+            MappingEntry {
+                input: make_frame(0, &[5]),
+                outputs: vec![],
+            },
+            MappingEntry {
+                input: make_frame(1, &[5]),
+                outputs: vec![],
+            },
+        ]);
+        let interface = Interface::new(device);
+        let mut sender = Sender::new(Arc::new(Wire::default()));
+        sender.record_sample(Duration::from_millis(5));
+
+        sender.send_block(&interface, vec![5]).await;
+        sender.retransmit(&interface).await;
+        assert_eq!(
+            sender.rto,
+            Duration::from_millis(120),
+            "the doubled wait the sample has to pull back"
+        );
+
+        sender.send_block(&interface, vec![5]).await;
+        // The round trip of the block just sent, measured at 5 ms.
+        let block = sender.in_flight.back_mut().expect("the block on the wire");
+        block.sent_at = Instant::now()
+            .checked_sub(Duration::from_millis(5))
+            .expect("the process has been up for longer than the sample");
+
+        sender.settle(&interface, 2).await;
+
+        assert_eq!(
+            sender.rto,
+            sender.estimated_rto(),
+            "the new sample pulls the wait back to the estimate"
+        );
+        assert!(
+            sender.rto >= Duration::from_millis(60),
+            "the estimate for a 5 ms line is above the floor, got {:?}",
+            sender.rto
+        );
+        assert!(
+            sender.rto < Duration::from_millis(120),
+            "the backoff is gone again, got {:?}",
+            sender.rto
+        );
     }
 
     // -----------------------------------------------------------------------

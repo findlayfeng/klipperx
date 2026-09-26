@@ -37,6 +37,7 @@ pub mod filament_switch_sensor;
 pub mod firmware_retraction;
 pub mod force_move;
 pub mod gcode_arcs;
+pub mod gcode_button;
 pub mod gcode_macro;
 pub mod gcode_move;
 pub mod heater_bed;

@@ -373,6 +373,7 @@ mod tests {
                 "filament_switch_sensor",
                 "firmware_retraction",
                 "gcode_arcs",
+                "gcode_button",
                 "gcode_macro",
                 "heater_fan",
                 "homing_heaters",

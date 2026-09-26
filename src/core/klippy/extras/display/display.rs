@@ -60,6 +60,7 @@ use crate::core::klippy::load::section;
 use crate::core::klippy::printer::{Printer, PrinterObject};
 use crate::core::klippy::reactor::{Reactor, TimerHandle};
 
+use super::aip31068_spi::Aip31068Spi;
 use super::hd44780::Hd44780;
 use super::ssd1306::Ssd1306;
 use super::st7920::ST7920;
@@ -79,9 +80,9 @@ const REDRAW_MIN_TIME: f64 = 0.100;
 /// The panel names `lcd_type` accepts — upstream's `LCD_chips` keys
 /// (`display.py:12-19`).
 ///
-/// The whole list is accepted even though only `st7920`, `hd44780`, `uc1701`
-/// and `ssd1306` have drivers here, so the choice error is upstream's wording
-/// and the names are not silently rejected.
+/// The whole list is accepted even though only `st7920`, `hd44780`, `uc1701`,
+/// `ssd1306` and `aip31068_spi` have drivers here, so the choice error is
+/// upstream's wording and the names are not silently rejected.
 const LCD_TYPES: &[&str] = &[
     "st7920",
     "emulated_st7920",
@@ -240,6 +241,7 @@ impl PrinterLCD {
             "hd44780" => Arc::new(Hd44780::new(config, printer)?),
             "uc1701" => Arc::new(Uc1701::new(config, printer)?),
             "ssd1306" => Arc::new(Ssd1306::new(config, printer)?),
+            "aip31068_spi" => Arc::new(Aip31068Spi::new(config, printer)?),
             other => {
                 return Err(ConfigError::new(format!(
                     "lcd_type '{other}' is not implemented in this host"
@@ -1151,8 +1153,9 @@ mod tests {
     fn test_the_sibling_panels_that_still_have_no_driver_are_reported() {
         // `sh1106` is the SSD1306's own variant (`uc1701.py:238-242`): the
         // name is accepted by `lcd_type` and refused with the same sentence
-        // as every other gap.
-        for lcd_type in ["sh1106", "emulated_st7920", "aip31068_spi"] {
+        // as every other gap. `aip31068_spi` left this list when its driver
+        // landed; it is now built like the others.
+        for lcd_type in ["sh1106", "emulated_st7920"] {
             let err = machine()
                 .load_config(&display_config(&format!("lcd_type: {lcd_type}\n")))
                 .unwrap_err();

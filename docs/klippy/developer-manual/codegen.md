@@ -71,7 +71,7 @@ section!("stepper_x", order = 50, phase = late, load = load_config);
 
 - `load` 对应 `[id]`，`prefix` 对应 `[id <name>]`，至少写一个；
 - `order` 必填，决定同一半（main / prefix）内的装载顺序（`load.rs` 的两次遍历按表序进行）；
-- `phase = early | generic | late`（默认 `generic`）：`early` 排在普通节之前（上游先 `pins`/`mcu`），
+- `phase = early | generic | late`（默认 `generic`）：`early` 排在普通节之前（上游先 `pins`/`mcu`）；目前 `early` 只有 `[mcu]`/`[mcu <name>]` 与 `[adc_scaled <name>]`（后者必须早于 `[extruder]`/`[heater_bed]`，否则它们的 `sensor_pin: <name>:PA0` 报 `Unknown pin chip name`）。
   `late` 排在之后（上游最后才 load `toolhead`）；`[stepper_*]` 也在 `late`（order 50，早于 toolhead）——
   它的 `endstop_pin` 可能指向其它段注册的 pin chip（如 `probe:`、`tmc*_stepper_x:`），必须等所有
 generic 段装载完再解析；

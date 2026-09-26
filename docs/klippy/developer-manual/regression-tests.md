@@ -199,7 +199,7 @@ M3 `smart_effector` 落地后，仅剩 `eddy.test`——`probe_eddy_current` 属
 - 头两个转绿的用例：`linuxtest.test`（只需 `kinematics: none`、`heaters` 的传感器注册表、
   `temperature_sensor` 与 `ds18b20`，g-code 只是一次 `G4 P1000`）；随后 `gcode_move`（G4-1）与
   `EXTRUDER` 默认项（e8bf2b7）让 `commands.test` 与 `out_of_bounds.test` 也过了守卫，移出忽略列表。
-- `KLIPPERX_UPSTREAM_ALL=1` 只去掉忽略列表这一层：默认构建下它会跑 237 条可用运行，其中 **198 条通过、39 条失败**（2026-09-25 实跑，批 #18 合入后；批 #8/#11 转绿 tachometer 与 bed_mesh，批 #12 摘除 `corexyuv.test`/`generic_cartesian.test`（IGNORED 8→6），批 #13 面板四驱动使 `lcd_type` 拒收清零，批 #15 `pause_resume` 转 5、批 #16 `ad5206` 转 7、批 #17 模板过滤器转 3、批 #18 `fan_generic` 转 2；**`printers.test` 子进度 169/203**（失败 34）），另外 2 条以「字典未构建」计入统计，不算失败。失败大多
+- `KLIPPERX_UPSTREAM_ALL=1` 只去掉忽略列表这一层：默认构建下它会跑 237 条可用运行，其中 **201 条通过、36 条失败**（2026-09-25 实跑，批 #19 合入后；批 #8/#11 转绿 tachometer 与 bed_mesh，批 #12 摘除 `corexyuv.test`/`generic_cartesian.test`（IGNORED 8→6），批 #13 面板四驱动使 `lcd_type` 拒收清零，批 #15 `pause_resume` 转 5、批 #16 `ad5206` 转 7、批 #17 模板过滤器转 3、批 #18 `fan_generic` 转 2、批 #19 `adc_scaled` 转 3（`vref_scaled` 首因归零）；**`printers.test` 子进度 172/203**（失败 31）），另外 2 条以「字典未构建」计入统计，不算失败。失败大多
   在配置装载阶段，个别在 g-code / 就绪阶段（`Move out of range`、`not ready: Pin …`）。失败原因的
   逐项分布记在 [上游回归测试失败原因分析](../../work-log/2026-09-22-upstream-regression-failures.md)
   的最新快照与 `TODO.md` 的 T 节，本页不重复维护。

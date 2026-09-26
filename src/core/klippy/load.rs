@@ -366,6 +366,7 @@ mod tests {
                 "gcode_macro",
                 "heater_fan",
                 "homing_override",
+                "idle_timeout",
                 "input_shaper",
                 "manual_probe",
                 "pause_resume",

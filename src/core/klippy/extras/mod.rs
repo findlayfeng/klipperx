@@ -45,6 +45,7 @@ pub mod homing_override;
 pub mod hx71x;
 pub mod i2c_device;
 pub mod idex_modes;
+pub mod idle_timeout;
 pub mod input_shaper;
 pub mod ldc1612;
 pub mod led;

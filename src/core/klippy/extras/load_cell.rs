@@ -16,15 +16,16 @@
 //!
 //! # Known gaps
 //!
-//! * The four `LOAD_CELL_*` commands are registered with upstream's help
-//!   strings but answer *not implemented*: they need the sample collector
-//!   (`LoadCellSampleCollector`) and, for `LOAD_CELL_CALIBRATE`, the
-//!   interactive `LoadCellGuidedCalibrationHelper`.
-//! * `[load_cell_probe]`, the load cell as a Z probe, now loads its section and
-//!   attaches the `trigger_analog` (see
-//!   [`load_cell_probe`](crate::core::klippy::extras::load_cell_probe)); its
-//!   probe-run path is still unwired. The guided calibration's
-//!   `configfile.set` write-back is not wired either.
+//! * The `LOAD_CELL_TARE` / `LOAD_CELL_READ` / `LOAD_CELL_DIAGNOSTIC` commands
+//!   are registered with upstream's help strings but answer *not implemented*;
+//!   the sample collector (`LoadCellSampleCollector`) and `avg_counts` they
+//!   need are wired, so only the command bodies and `LOAD_CELL_CALIBRATE`'s
+//!   interactive `LoadCellGuidedCalibrationHelper` remain. The guided
+//!   calibration's `configfile.set` write-back is not wired either.
+//! * `[load_cell_probe]` runs the probe path (its session, tare, probing move
+//!   and ascent fit) — see
+//!   [`load_cell_probe`](crate::core::klippy::extras::load_cell_probe) for the
+//!   remaining gaps.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, Weak};
@@ -41,10 +42,12 @@ use crate::core::klippy::extras::ads1220::Ads1220;
 use crate::core::klippy::extras::ads131m0x::{params_for as ads131m0x_params_for, Ads131M0x};
 use crate::core::klippy::extras::bulk_sensor::ClientCb;
 use crate::core::klippy::extras::hx71x::{params_for, Hx71x};
+use crate::core::klippy::extras::spi_device::mcu_object_name;
 use crate::core::klippy::gcode::{
     CommandError, CommandHandler, GCodeDispatch, GcodeCommand, GCODE_OBJECT,
 };
 use crate::core::klippy::load::section;
+use crate::core::klippy::mcu::McuObject;
 use crate::core::klippy::printer::{ConnectFuture, Printer, PrinterObject};
 
 // Loaded after the buses and heaters (order 30) with the other devices.
@@ -459,6 +462,338 @@ impl LoadCell {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .len()
+    }
+
+    /// A fresh sample collector over this cell (`get_collector`).
+    pub fn get_collector(&self) -> LoadCellSampleCollector {
+        LoadCellSampleCollector::new(&self.state)
+    }
+
+    /// The mean raw count over `num_samples` samples (`avg_counts`), or an
+    /// error when the sensor reports faults or the window saturates.
+    ///
+    /// # Errors
+    /// The sensor's error counters, or a saturated sample, as upstream's
+    /// `command_error`.
+    pub async fn avg_counts(&self, num_samples: Option<usize>) -> Result<f64, CommandError> {
+        let num_samples =
+            num_samples.unwrap_or_else(|| self.state.sensor.samples_per_second().max(0.0) as usize);
+        let collector = self.get_collector();
+        let (samples, errors) = collector.collect_min(num_samples.max(1)).await?;
+        if let Some((errs, overflows)) = errors {
+            return Err(CommandError::new(format!(
+                "Sensor reported {} errors while sampling",
+                errs + overflows
+            )));
+        }
+        let (range_min, range_max) = self.state.sensor.range();
+        for sample in &samples {
+            let counts = sample[2] as i64;
+            if counts >= range_max || counts <= range_min {
+                return Err(CommandError::new("Some samples are saturated (+/-100%)"));
+            }
+        }
+        if samples.is_empty() {
+            return Ok(0.0);
+        }
+        let sum: f64 = samples.iter().map(|sample| sample[2]).sum();
+        Ok(sum / samples.len() as f64)
+    }
+
+    /// The sensor's saturated bounds (`saturation_range`).
+    pub fn saturation_range(&self) -> (i64, i64) {
+        self.state.sensor.range()
+    }
+}
+
+/// A row the collector keeps: `[time, force (g), counts]` — the converted
+/// columns `LoadCellSampleCollector` reads upstream (`sample[0]` time,
+/// `sample[1]` grams, `sample[2]` counts).
+pub type CollectedSample = [f64; 3];
+
+/// The delay between collection polls (`RETRY_DELAY = 0.05`, 20 Hz).
+const COLLECT_RETRY_DELAY: f64 = 0.05;
+
+/// What a running [`LoadCellSampleCollector`] accumulates.
+struct CollectorInner {
+    /// The earliest sample time kept (`min_time`).
+    min_time: f64,
+    /// The latest sample time kept (`max_time`).
+    max_time: f64,
+    /// Stop once this many samples are in hand (`min_count`).
+    min_count: usize,
+    /// Whether the client is still collecting (`is_started`).
+    is_started: bool,
+    /// The samples inside the window (`_samples`).
+    samples: Vec<CollectedSample>,
+    /// The latest sensor error count (`_errors`).
+    errors: i64,
+    /// The latest overflow count (`_overflows`).
+    overflows: i64,
+    /// The error count at start (`_start_errors`).
+    start_errors: i64,
+    /// The overflow count at start (`_start_overflows`).
+    start_overflows: i64,
+}
+
+impl Default for CollectorInner {
+    fn default() -> Self {
+        Self {
+            min_time: 0.0,
+            max_time: f64::INFINITY,
+            min_count: usize::MAX,
+            is_started: false,
+            samples: Vec::new(),
+            errors: 0,
+            overflows: 0,
+            start_errors: 0,
+            start_overflows: 0,
+        }
+    }
+}
+
+/// Fold one converted batch into a collector's window (`_on_samples`).
+///
+/// Returns whether collection should continue (`is_started`).
+fn accumulate(inner: &mut CollectorInner, message: &Value) -> bool {
+    if !inner.is_started {
+        return false;
+    }
+    inner.errors = message.get("errors").and_then(Value::as_i64).unwrap_or(0);
+    inner.overflows = message
+        .get("overflows")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    if let Some(rows) = message.get("data").and_then(Value::as_array) {
+        for row in rows {
+            let Some(row) = row.as_array() else { continue };
+            let time = row.first().and_then(Value::as_f64).unwrap_or(0.0);
+            if time >= inner.min_time && time <= inner.max_time {
+                let grams = row.get(1).and_then(Value::as_f64).unwrap_or(0.0);
+                let counts = row.get(2).and_then(Value::as_f64).unwrap_or(0.0);
+                inner.samples.push([time, grams, counts]);
+            }
+            if time > inner.max_time {
+                inner.is_started = false;
+            }
+        }
+    }
+    if inner.samples.len() >= inner.min_count {
+        inner.is_started = false;
+    }
+    inner.is_started
+}
+
+/// Utility to collect samples from the load cell for later analysis
+/// (`LoadCellSampleCollector`).
+///
+/// The converted batch stream feeds [`on_samples`](Self::on_samples); a
+/// caller waits for a window with [`collect_min`](Self::collect_min) /
+/// [`collect_until`](Self::collect_until), both of which short-circuit under
+/// file-output mode exactly as upstream's `_finish_collecting` does.
+pub struct LoadCellSampleCollector {
+    /// The cell whose converted stream feeds this collector.
+    state: Arc<LoadCellState>,
+    /// The shared accumulation between the client and the caller.
+    inner: Arc<Mutex<CollectorInner>>,
+}
+
+impl LoadCellSampleCollector {
+    /// Build a collector over `state` (`__init__`).
+    fn new(state: &Arc<LoadCellState>) -> Self {
+        Self {
+            state: Arc::clone(state),
+            inner: Arc::new(Mutex::new(CollectorInner::default())),
+        }
+    }
+
+    /// A sample delivered by the load cell's batch fan-out (`_on_samples`).
+    ///
+    /// Returns whether the collector wants more (`is_started`), dropping the
+    /// client once the window ends.
+    #[cfg(test)]
+    fn on_samples(&self, message: &Value) -> bool {
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        accumulate(&mut inner, message)
+    }
+
+    /// Whether the collector is still running (`is_started`).
+    fn is_started(&self) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_started
+    }
+
+    /// Reset and take the collected samples (`_finish_collecting`).
+    fn finish_collecting(&self) -> (Vec<CollectedSample>, Option<(i64, i64)>) {
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        inner.is_started = false;
+        inner.min_time = 0.0;
+        inner.max_time = f64::INFINITY;
+        inner.min_count = usize::MAX;
+        let samples = std::mem::take(&mut inner.samples);
+        let errors = (inner.errors - inner.start_errors).max(0);
+        inner.errors = 0;
+        let overflows = (inner.overflows - inner.start_overflows).max(0);
+        inner.start_overflows = 0;
+        // Upstream's file-output branch returns a single dummy sample.
+        let samples = if self.fileoutput() {
+            vec![[0.0, 0.0, 0.0]]
+        } else {
+            samples
+        };
+        let errors = if errors != 0 || overflows != 0 {
+            Some((errors, overflows))
+        } else {
+            None
+        };
+        (samples, errors)
+    }
+
+    /// Start collecting (`start_collecting`); `min_time` seeds the window.
+    pub fn start_collecting(&self, min_time: Option<f64>) {
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if inner.is_started {
+            return;
+        }
+        if let Some(min_time) = min_time {
+            inner.min_time = min_time;
+        }
+        inner.is_started = true;
+        let status = self.state.sensor.status(0.0);
+        inner.start_errors = status.get("errors").and_then(Value::as_i64).unwrap_or(0);
+        inner.start_overflows = status.get("overflows").and_then(Value::as_i64).unwrap_or(0);
+        drop(inner);
+        let inner = Arc::clone(&self.inner);
+        self.state
+            .clients
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(Arc::new(move |message: &Value| {
+                let mut guard = inner.lock().unwrap_or_else(|p| p.into_inner());
+                accumulate(&mut guard, message)
+            }));
+    }
+
+    /// Stop collecting and take the results (`stop_collecting`).
+    pub fn stop_collecting(&self) -> (Vec<CollectedSample>, Option<(i64, i64)>) {
+        self.finish_collecting()
+    }
+
+    /// Whether this run writes its MCU output to a file (`MCU.is_fileoutput`).
+    fn fileoutput(&self) -> bool {
+        self.state
+            .printer
+            .upgrade()
+            .is_some_and(|printer| printer.is_fileoutput())
+    }
+
+    /// The MCU's print-time estimate (`MCU.estimated_print_time`).
+    fn estimated_print_time(&self, eventtime: f64) -> f64 {
+        self.state
+            .printer
+            .upgrade()
+            .and_then(|printer| {
+                printer.lookup_object_as::<McuObject>(&mcu_object_name(
+                    self.state.sensor.mcu_chip_name(),
+                ))
+            })
+            .and_then(|object| object.estimated_print_time(eventtime))
+            .unwrap_or(eventtime)
+    }
+
+    /// The reactor's monotonic clock (`reactor.monotonic`).
+    fn monotonic(&self) -> f64 {
+        self.state
+            .printer
+            .upgrade()
+            .map(|printer| printer.reactor().monotonic())
+            .unwrap_or(0.0)
+    }
+
+    /// Poll until the window closes or the timeout passes
+    /// (`_collect_until`).
+    ///
+    /// # Errors
+    /// `LoadCellSampleCollector timed out!` when the firmware never delivers
+    /// enough samples.
+    async fn collect_until_timeout(
+        &self,
+        timeout: f64,
+    ) -> Result<(Vec<CollectedSample>, Option<(i64, i64)>), CommandError> {
+        self.start_collecting(None);
+        while self.is_started() {
+            let now = self.monotonic();
+            if self.estimated_print_time(now) > timeout {
+                let (samples, errors) = self.finish_collecting();
+                let (errors, overflows) = errors.unwrap_or((0, 0));
+                return Err(CommandError::new(format!(
+                    "LoadCellSampleCollector timed out! Collected {} samples, Errors: {}, Overflows: {}",
+                    samples.len(),
+                    errors,
+                    overflows
+                )));
+            }
+            if self.fileoutput() {
+                break;
+            }
+            let delay = (self.monotonic() + COLLECT_RETRY_DELAY - now).max(0.0);
+            tokio::time::sleep(std::time::Duration::from_secs_f64(delay)).await;
+        }
+        Ok(self.finish_collecting())
+    }
+
+    /// Block until at least `min_count` samples are collected (`collect_min`).
+    ///
+    /// # Errors
+    /// As [`collect_until_timeout`](Self::collect_until_timeout).
+    pub async fn collect_min(
+        &self,
+        min_count: usize,
+    ) -> Result<(Vec<CollectedSample>, Option<(i64, i64)>), CommandError> {
+        {
+            let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            inner.min_count = min_count;
+            if inner.samples.len() >= min_count {
+                drop(inner);
+                return Ok(self.finish_collecting());
+            }
+        }
+        let print_time = self.estimated_print_time(self.monotonic());
+        let min_time = self
+            .inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .min_time;
+        let start_time = print_time.max(min_time);
+        let sps = self.state.sensor.samples_per_second().max(1.0);
+        self.collect_until_timeout(start_time + 1.0 + (min_count as f64 / sps))
+            .await
+    }
+
+    /// Block until a sample with a timestamp after `print_time` arrives
+    /// (`collect_until`).
+    ///
+    /// # Errors
+    /// As [`collect_until_timeout`](Self::collect_until_timeout).
+    pub async fn collect_until(
+        &self,
+        print_time: f64,
+    ) -> Result<(Vec<CollectedSample>, Option<(i64, i64)>), CommandError> {
+        {
+            let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            inner.max_time = print_time;
+            if inner
+                .samples
+                .last()
+                .is_some_and(|sample| sample[0] >= print_time)
+            {
+                drop(inner);
+                return Ok(self.finish_collecting());
+            }
+        }
+        self.collect_until_timeout(print_time + 1.0).await
     }
 }
 
@@ -1029,5 +1364,55 @@ mod tests {
         assert!((counts_to_percent(0x40_0000, 0x7F_FFFF) - 50.).abs() < 1e-5);
         assert_eq!(counts_to_percent(0x7F_FFFF, 0x7F_FFFF), 100.);
         assert_eq!(counts_to_percent(0, 0x7F_FFFF), 0.);
+    }
+
+    /// The collector's window, its `min_count` stop, and its error delta
+    /// (`LoadCellSampleCollector._on_samples` / `_finish_collecting`).
+    #[tokio::test]
+    async fn test_the_sample_collector_keeps_the_window_and_reports_errors() {
+        let printer = printer();
+        let cell = LoadCell::new(&wrap(None, &HX711_CHIP), &printer).unwrap();
+        let collector = cell.get_collector();
+        collector.start_collecting(Some(10.0));
+        // 9.0 is before the window; 11.0/12.0 are kept.
+        let keeps = collector.on_samples(&json!({
+            "data": [[9.0, 0.5, 50.0, 0], [11.0, 1.5, 100.0, 0], [12.0, 1.6, 110.0, 0]],
+            "errors": 0,
+            "overflows": 0
+        }));
+        assert!(keeps, "the window is still open");
+        let (samples, errors) = collector.stop_collecting();
+        assert_eq!(samples.len(), 2);
+        assert_eq!(samples[0][2], 100.0, "counts are the third column");
+        assert_eq!(errors, None, "no faults reported");
+
+        // An error delta stops the collection and is reported as upstream's
+        // `(errors, overflows)` pair.
+        collector.start_collecting(None);
+        collector.on_samples(&json!({
+            "data": [[1.0, 0.0, 1.0, 0]],
+            "errors": 3,
+            "overflows": 1
+        }));
+        let (_, errors) = collector.stop_collecting();
+        assert_eq!(errors, Some((3, 1)));
+    }
+
+    /// `collect_min` returns at once when the window already holds enough
+    /// samples (`LoadCellSampleCollector.collect_min`).
+    #[tokio::test]
+    async fn test_the_sample_collector_returns_early_once_min_count_is_met() {
+        let printer = printer();
+        let cell = LoadCell::new(&wrap(None, &HX711_CHIP), &printer).unwrap();
+        let collector = cell.get_collector();
+        collector.start_collecting(None);
+        collector.on_samples(&json!({
+            "data": [[1.0, 0.0, 10.0, 0], [2.0, 0.0, 20.0, 0]],
+            "errors": 0,
+            "overflows": 0
+        }));
+        let (samples, errors) = collector.collect_min(2).await.unwrap();
+        assert_eq!(samples.len(), 2);
+        assert_eq!(errors, None);
     }
 }

@@ -199,7 +199,7 @@ M3 `smart_effector` 落地后，仅剩 `eddy.test`——`probe_eddy_current` 属
 - 头两个转绿的用例：`linuxtest.test`（只需 `kinematics: none`、`heaters` 的传感器注册表、
   `temperature_sensor` 与 `ds18b20`，g-code 只是一次 `G4 P1000`）；随后 `gcode_move`（G4-1）与
   `EXTRUDER` 默认项（e8bf2b7）让 `commands.test` 与 `out_of_bounds.test` 也过了守卫，移出忽略列表。
-- `KLIPPERX_UPSTREAM_ALL=1` 只去掉忽略列表这一层：默认构建下它会跑 237 条可用运行，其中 **218 条通过、19 条失败**（2026-09-25 实跑，批 #32 合入后；批 #8/#11 转绿 tachometer 与 bed_mesh，批 #12 摘除 `corexyuv.test`/`generic_cartesian.test`（IGNORED 8→6），批 #13 面板四驱动使 `lcd_type` 拒收清零，批 #15 `pause_resume` 转 5、批 #16 `ad5206` 转 7、批 #17 模板过滤器转 3、批 #18 `fan_generic` 转 2、批 #19 `adc_scaled` 转 3、批 #20 `verify_heater` 转 3、批 #21 `idle_timeout` 转 2、批 #22 自定义 `thermistor` 装载序转 3、批 #23 `dac084S085` 转 2、批 #25 `mcp4451` 转 2、批 #26 `multi_pin`（修掉 pin-chip 首因，该配置接下来卡 `homing_heaters`）、批 #28 `aip31068_spi`（推进 A10T 到 `respond`）；批 #24 模板列表字面量与批 #27 `dual_carriage` 的 `primary_carriage` 可选共同使 `generic_cartesian_iqex/itex` 转绿并**摘出 IGNORED（6→4）**；批 #29 `respond` 使 `printer-geeetech-A10T-A20T-2021.cfg` 整例转绿、批 #30 `hd44780_spi`、批 #31 `homing_heaters` 使 `printer-geeetech-301-2019.cfg` 转绿、批 #32 `firmware_retraction` 使 `printer-lulzbot-mini1-2016.cfg` 转绿；**`printers.test` 子进度 187/203**（失败 16）），另外 2 条以「字典未构建」计入统计，不算失败。失败大多
+- `KLIPPERX_UPSTREAM_ALL=1` 只去掉忽略列表这一层：默认构建下它会跑 237 条可用运行，其中 **224 条通过、13 条失败**（2026-09-25 实跑，批 #34 合入后；批 #8/#11 转绿 tachometer 与 bed_mesh，批 #12 摘除 `corexyuv.test`/`generic_cartesian.test`（IGNORED 8→6），批 #13 面板四驱动使 `lcd_type` 拒收清零，批 #15 `pause_resume` 转 5、批 #16 `ad5206` 转 7、批 #17 模板过滤器转 3、批 #18 `fan_generic` 转 2、批 #19 `adc_scaled` 转 3、批 #20 `verify_heater` 转 3、批 #21 `idle_timeout` 转 2、批 #22 自定义 `thermistor` 装载序转 3、批 #23 `dac084S085` 转 2、批 #25 `mcp4451` 转 2、批 #26 `multi_pin`（修掉 pin-chip 首因，该配置接下来卡 `homing_heaters`）、批 #28 `aip31068_spi`（推进 A10T 到 `respond`）；批 #24 模板列表字面量与批 #27 `dual_carriage` 的 `primary_carriage` 可选共同使 `generic_cartesian_iqex/itex` 转绿并**摘出 IGNORED（6→4）**；批 #29 `respond` 使 `printer-geeetech-A10T-A20T-2021.cfg` 整例转绿、批 #30 `hd44780_spi`、批 #31 `homing_heaters` 使 `printer-geeetech-301-2019.cfg` 转绿、批 #32 `firmware_retraction` 使 `printer-lulzbot-mini1-2016.cfg` 转绿、批 #33 `mcp4018` 转 2（`generic-mightyboard`/`flashforge-creator-pro`）、批 #34 **`tmc2130`（W2）转 4**（两节 + 两 pin-chip；`tmc.test` 前移到 `tmc5160`）；**`printers.test` 子进度 193/203**（失败 10）），另外 2 条以「字典未构建」计入统计，不算失败。失败大多
   在配置装载阶段，个别在 g-code / 就绪阶段（`Move out of range`、`not ready: Pin …`）。失败原因的
   逐项分布记在 [上游回归测试失败原因分析](../../work-log/2026-09-22-upstream-regression-failures.md)
   的最新快照与 `TODO.md` 的 T 节，本页不重复维护。
@@ -217,7 +217,7 @@ M3 `smart_effector` 落地后，仅剩 `eddy.test`——`probe_eddy_current` 属
 - 上面按「**首次失败原因**」的分组只用于**定位**，不是工作队列：`load_config` 遇到第一个未知
   section 就停，修好一个缺口只会让运行前进到下一个缺口，总数可能不变（T7 后的 234 就是例子），
   各组收益不可加。
-- 进度以**转绿运行数 / `IGNORED` 条目数**衡量（当前 35 / 4）；先产出「**运行 × 缺口**」矩阵
+- 进度以**转绿运行数 / `IGNORED` 条目数**衡量（当前 41 / 4）；先产出「**运行 × 缺口**」矩阵
   （列出每条运行的**全部**缺口，而非第一个），据此找「只差一个缺口」的用例与公共前缀。
 - **验收标准**：对应 `.test` 从 `IGNORED` 移除后通过。`ignored_cases_still_fail` 是守卫（opt-in 亦点名「能装载但 g-code 未绿」的候选；历史上曾有 `dual_carriage.test`+`exclude_object.test` 两点名，已随 U-A7b 宏体渲染于 2026-09-24 清零，现 0 点名）——
   某个忽略文件的全部可跑运行都通过时报失败并提示移除。

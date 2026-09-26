@@ -403,6 +403,12 @@ SET_IDLE_TIMEOUT [TIMEOUT=<秒>]
 ```
 不带参数时保持当前值；成功回 `idle_timeout: Timeout set to <值> s`；`TIMEOUT` 必须大于 0。
 
+### SET_DIGIPOT — 设置数字电位器（多路键 `DIGIPOT`，批 #33）
+```
+SET_DIGIPOT DIGIPOT=<name> [WIPER=<0..scale>]
+```
+每个 `[mcp4018 <name>]` 注册一个 `DIGIPOT` 值；不给 `WIPER` 时不写也不报错；给值后回 `New value for DIGIPOT = <name>, wiper = <%.2f>`。
+
 ### SET_FAN_SPEED — 设置通用风扇速度（多路键 `FAN`，批 #18）
 ```
 SET_FAN_SPEED FAN=<name> SPEED=<0..1>

@@ -556,7 +556,7 @@ max_temp: 300
 
 ### `[thermistor <name>]` / `[adc_temperature <name>]` — 自定义传感器定义
 
-定义一个新的传感器类型供 `sensor_type` 引用；节的 `<name>` 就是注册的类型名。两者的差别
+定义一个新的传感器类型供 `sensor_type` 引用；节的 `<name>` 就是注册的类型名。定义与引用在本仓**与文件中先后无关**（`[thermistor <name>]` 声明为 `phase = early`，见开发手册的相位通则）；若用 `[adc_temperature <name>]` 定制电压型，**请把定义写在引用它的 `[extruder]`/`[heater_bed]` 之前**（该 prefix 尚未设为 early，属待补项）。两者的差别
 是标定点的写法（与上游一致，`[adc_temperature]` 按是否给 `resistance1` 区分电阻/电压型）：
 
 | 参数 | 类型 | 说明 |
@@ -950,6 +950,16 @@ gap（如实登记）：**屏幕内容不渲染**（`display_template`/`display_
 | `check_gain_time` | `60`（`heater_bed`）/ `20`（其他） | 升温窗口秒数（`minval=1.`） |
 
 每个 heater 自动获得一个检查器（配置无此节时用默认值）；失败 `invoke_shutdown("Heater <name> not heating at expected rate" + 提示)`。已知差异：`[verify_heater <不存在的 heater>]` 报装载器的 `Section '…' is not a valid config section`，而非上游的 `Unknown heater`。
+
+### `[dac084S085 <name>]` — 四通道 SPI DAC（批 #23）
+
+| 选项 | 默认 | 说明 |
+|------|------|------|
+| `enable_pin` | —（必填） | SPI 片选（mode 1、默认速率 10 MHz） |
+| `scale` | `1.0` | 满量程参考，`above=0.` |
+| `channel_A` … `channel_D` | — | 各通道目标值（`minval=0.`、`maxval=scale`）；写值 `int(val*255/scale)`（**截断**，与 `[ad5206]` 的 `+0.5` 不同），未给的通道不写 |
+
+写入在 bring-up 时经 MCU post-init 回调发出。⚠️ 节名**大小写敏感**：配置里写 `[dac084S085 stepper_digipot]`，`section!` 的 id 必须逐字 `dac084S085`（写成小写会报 `Section 'dac084s085 …' is not a valid config section`）。
 
 ### `[adc_scaled <name>]` — 参考电压缩放 ADC（批 #19）
 

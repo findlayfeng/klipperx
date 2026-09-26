@@ -312,7 +312,8 @@ git config core.hooksPath .githooks
 | `config/mod.rs`（同名段合并，M5d） | 重复段选项并集、同段重复选项后者胜、合并保首现位、非重复段零变化（4 测） |
 | `interface/devices/simulator.rs`（M5d 策略 b） | `trigger_analog_sample_activity_pushes_the_monitor_deadline`：活动顺延 + 非活动不顺延双向断言 |
 | `mathutil.rs`（M5d 校准数学） | `gaussian_solve_recovers_known_values`、`gaussian_solve_refuses_a_singular_system`、`solve_linear_equations_fits_a_quadratic_and_substitutes_back`、`mat_mul_transp_matches_the_reference_product`（4 测；另修 `mat_mul_transp` 参照积笔误 a·aᵀ） |
-| `template.rs` + `gcode_macro.rs`（批 #4 引擎 + 批 #9 `set` + 批 #17 过滤器参数/`default`/`float`） | 模板子集逐构 15（新增过滤器参数语法与 `default`/`float`，语料实测 31 处 `|default`、29 处 `|float`；`set` 三态作用域 + 链式可见 + 语料 288 行真句）、宏体渲染→gcode 派发 e2e/递归检测/`SET_GCODE_VARIABLE` 4、排除区 E 补偿 2、`get_status.extruder`/idex 帧交接 1（共 22 测；三处钉子测试已翻转） |
+| `template.rs` + `gcode_macro.rs`（批 #4 引擎 + 批 #9 `set` + 批 #17 过滤器参数/`default`/`float` + 批 #24 列表字面量/`|min`/`|max`） | 模板子集逐构 17（过滤器参数语法与 `default`/`float`，语料实测 31 处 `|default`、29 处 `|float`；列表字面量 `[a, b]` 与 `|min`(2)/`|max`(4)，含 Jinja2 `ignore_case` 比较与空序列文案；`set` 三态作用域 + 链式可见 + 语料 288 行真句）、宏体渲染→gcode 派发 e2e/递归检测/`SET_GCODE_VARIABLE` 4、排除区 E 补偿 2、`get_status.extruder`/idex 帧交接 1（共 24 测；四处钉子测试已翻转） |
+| `extras/dac084s085.rs`（批 #23，8 测） | 语料字节逐字 `[0x19,0x90]`/`[0x59,0x90]`/`[0x99,0x90]`/`[0xd6,0x60]`、**截断**语义（`*255/scale` 无 `+0.5`）、`scale`/通道越界、缺 `enable_pin`、通道缺省不写、SPI mode 1 与 10 MHz 默认、`section!` 名大小写（小写会报「not a valid config section」） |
 | `motion/kinematics.rs`（polar）+ `extras/stepper.rs`（两轨段）+ `toolhead.rs` polar 分支（批 #5，17 测） | 已知构型正/逆回代、±π 解卷与单次移位边界、`check_move` 门与中心减速、两轨段认领与选项矩阵、G28 联合回零（XY 后 Z）、`Error loading kinematics` 文案 |
 | `motion/delta.rs` + `extras/delta_calibrate.rs` + delta 段/工具头分支（批 #5，24 测） | 三角测量已知构型回代、同步 home、三塔段认领（无 position_max、b/c 继承 a 的 endstop）、SAVE_CONFIG 块解析（header 逐字节/剥前缀/正文优先/无块零变化）、假 MCU 多端停 per-oid 多槽（同 arm 同触发/单端停回归/按 oid 摘除）、弧度 gear_ratio 推断 |
 | `extras/shaper_defs.rs` + `extras/input_shaper.rs` + `mathutil.rs::pseudo_inverse`（wave-2，13 测） | 整形系数与上游 Python 逐位对齐（`mzv(5,0.6)`/`2hump_ei`/`ei(v_tol=)`/`zv`/`zvd`/`3hump_ei` 金值）、括号参数与 `get_shaper_cfg` 元数据、错误路径（`Too small n=…`/`Too large t=…`/`Unsupported arguments…`）、两条语料行的上报文案（x→y→z）、`dual_carriage` 的 connect 期 config_error 与运行期允许 |
@@ -337,7 +338,7 @@ git config core.hooksPath .githooks
 | `smart_effector.rs` | 选项默认与语料认领；`ACCEL`/`RECOVERY_TIME` 负值拒绝、`SENSITIVITY`/`ACCEL` 越界拒绝（含上游文案）；`SET` 参数解析与默认、无 `control_pin` 时拒绝 `SENSITIVITY`；位流逐字节成帧；`control_pin` 预留与二次使用拒绝；装载注册 chip/对象（async：加载+bring_up+`G28`+两命令端到端）；无 `control_pin` 时 `RESET` 不注册 |
 | `spi_device.rs` | 注册两条调试命令；无片选允许；`spi_mode`/`spi_speed` 越界拒、部分软件引脚报错、片选须在指定 MCU、未知 MCU 点名节；就绪后 `get_status` 报配置；软件设备接受本 MCU 引脚 |
 | `static_digital_output.rs` | 每个引脚都被预留、取反的引脚有记录、缺 `pins` 报错 |
-| `adc_temperature.rs` | 线性插值正反向、热敏电阻 Steinhart-Hart 与 Beta 模型（与上游公式对拍） |
+| `adc_temperature.rs` | 线性插值正反向、热敏电阻 Steinhart-Hart 与 Beta 模型（与上游公式对拍）；自定义 `[thermistor]` 定义写在消费者前/后两种布局都能装载（`phase = early` 保证顺序无关，批 #22 +1 测） |
 | `extras/adc_scaled.rs`（批 #19，15 测） | 四个文案逐字（`must be specified`/`must be above 0`/`vref and vssa must be on same mcu`/`adc_scaled only supports adc pins`）、装载顺序（缺节时 `sensor_pin: Unknown pin chip name 'vref_scaled'`，有的则通）、参考采样 `(0.300,0.001,8,1,0.,1.,0)`、每 `sensor_pin` 各建一个内层 ADC、换算方向与 `calc_smooth=min(Δt/smooth_time,1)`、只取末样本、参考未就绪时的 0/0（NaN/±inf，照上游复现） |
 | `spi_temperature.rs` | MAX6675/MAX31855 转换、符号位负温、MAX31856 与 MAX31865 转换 |
 | `extras/ad5206.rs`（批 #16，7 测） | `enable_pin` 作 CS 的 SPI mode 0 / 25 MHz 默认、`scale` 默认 1.0 与 `above=0.` 越界文案、`channel_1..6` 的 `minval=0.`/`maxval=scale` 文案、`int(val*256/scale+.5)` 换算（含 scale 顶值与未给通道跳过）、写入顺序与 bring-up 后经 post-init 回调发出 |

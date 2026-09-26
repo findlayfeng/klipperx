@@ -313,7 +313,7 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 是「对应 `.test` 从 `IGNORED` 移除后通过」**，不是「某个错误不再出现」。详见
 [失败原因分析复盘](docs/work-log/2026-09-22-upstream-regression-failures.md#复盘计数口径与重排后补)。
 
-**当前失败原因统计**（`KLIPPERX_UPSTREAM_ALL=1` 实跑，2026-09-25（批 #21 合入后）：**31 次失败**、206 次通过、
+**当前失败原因统计**（`KLIPPERX_UPSTREAM_ALL=1` 实跑，2026-09-25（批 #24 合入后）：**26 次失败**、211 次通过、
 2 条因未构建 `pru` 字典不计，合计 239；下表为**选项名大小写修复后**的分布——49 次
 `must be specified` 归零但总数不变、首因整体后移，见[复盘](docs/work-log/2026-09-22-upstream-regression-failures.md#复盘计数口径与重排后补)
 的「收益不可加」）：
@@ -330,7 +330,7 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 | `Section 'filament_switch_sensor …'` 等 | 8 | H7 |
 | `sensor_pin: … 'vref_scaled'`（`adc_scaled`） | **0** | H1 已消（批 #19，4 处首因归零） |
 | H9 其余（`bed_mesh` 6、`safe_z_home` 4、`bed_screws` 3、`quad_gantry_level` 2、`z_tilt`/`endstop_phase` 各 1） | 17 | H9 |
-| 板级扩展 section（`mcp4451`/`dac084s085`/`multi_pin`/`sx1509_duex`/`replicape`） | 7 | H2 / H7（`ad5206` 7 处已随批 #16 转绿） |
+| 板级扩展 section（`mcp4451`/`multi_pin`/`sx1509_duex`/`replicape`） | 5 | H2 / H7（`ad5206` 批 #16、`dac084S085` 批 #23 已转绿） |
 | `Option 'tachometer_pin' … pulse_counter` | **0** | F9 / H7 已消（批 #8，2 run 实测 `run_case OK`） |
 | `Section 'extruder_stepper …'` | 2 | H10 |
 | `Section 'verify_heater …'` | **0** | H1 已消（批 #20，3 处首因归零） |
@@ -374,7 +374,7 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
       `tmc2130_stepper_x` 3）。依赖 H5（TMC）。
 - [ ] **T9. 其余 extras 段**（2026-09-23 选项大小写修复后实跑的散项，按域归入 H1–H10）：`display`（21，H8）、
       `filament_switch_sensor`（8，H7）、板级扩展
-      （`mcp4451` 2 + `dac084s085` 2 + `multi_pin`/`sx1509_duex`/`replicape` 各 1，H2/H7；`ad5206` 已随批 #16 转绿）、
+      （`mcp4451` 2 + `multi_pin`/`sx1509_duex`/`replicape` 各 1，H2/H7；`ad5206` 批 #16、`dac084S085` 批 #23 已转绿）、
       `bed_screws`（3，H9）、`dual_carriage`/`safe_z_home`/`gcode_macro`（各 2），以及 `virtual_sdcard`/
       `exclude_object`/`gcode_arcs`/`manual_stepper`/`pwm_cycle_time`/`led`/`input_shaper`/`temperature_fan`/
       `controller_fan`（1）。`static_digital_output` 已在阶段 0 落地，`stepper_z1`（多轴）已由
@@ -398,7 +398,7 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 - [ ] `pid_calibrate.py`（`PID_CALIBRATE`）：仍缺（`verify_heater.py` 批 #20 已完成）
       （`extruder.rs:21` 明示 still open）。
 - [ ] 传感器**剩余**：`temperature_host.py` /
-      `temperature_probe.py` / `temperature_fan.py`，以及 `thermistor` 自定义型号
+      `temperature_probe.py` / `temperature_fan.py`（`thermistor` 自定义型号的装载序已随批 #22 修复；`[adc_temperature <name>]` 同族待补 `phase = early`）
       （`G2` / `Kingroon_B3950` 2 次）。已落地并归档：`temperature_sensor` / `thermistor` /
       `adc_temperature` / `spi_temperature`（MAX6675/31855/31856/31865） /
       `temperature_combined` / `temperature_mcu`（T7）。
@@ -409,13 +409,13 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 - [ ] **引用（拆分、拍板点与依赖以笔记为准）**：[H2 动工前调查](docs/work-log/2026-09-23-h2-notes.md)
   ——上游 21 个文件的依赖盘点、H2-1…H2-7 拆分与四个拍板点。余项：`pwm_tool.py`（队列化 PWM，随运动）、
   `pwm_cycle_time.py`、`static_pwm_clock.py`、`multi_pin.py`、`servo.py`、`duplicate_pin_override.py`、
-  板级扩展（`mcp4451`/`dac084s085`/`sx1509`/`replicape`）；失败统计里的 `heater_fan`/`controller_fan`
+  板级扩展（`mcp4451`/`sx1509`/`replicape`）；失败统计里的 `heater_fan`/`controller_fan`
   归本域。
 
 ### H3 G-Code 宏与脚本
 
 - [ ] `gcode_macro.py`：段与宏注册**已落地**（2026-09-24 集成批 #1，语料绿）；剩余 = 宏体模板/表达式引擎、`SET_GCODE_VARIABLE`、`rename_existing` 连接期换名，以及读
-      `printer.objects` 的反射式能力（**Q5**）。**U-A7b 已完成（2026-09-24 批 #4）**：受控子集引擎落地，`exclude_object.test`+`dual_carriage.test` 双翻转、guard 归零；子集外（过滤器等）报错缺口入 `template.rs` 文档（`{% set %}` 批 #9、过滤器参数与 `default`/`float` 批 #17 已落地；C–F 单元：列表字面量（`[a, b]` + `|min`/`|max`）、三元、`%` 格式化、方法白名单待做），完整 Jinja 仍属 H3。
+      `printer.objects` 的反射式能力（**Q5**）。**U-A7b 已完成（2026-09-24 批 #4）**：受控子集引擎落地，`exclude_object.test`+`dual_carriage.test` 双翻转、guard 归零；子集外（过滤器等）报错缺口入 `template.rs` 文档（`{% set %}` 批 #9、过滤器参数与 `default`/`float` 批 #17 已落地；列表字面量与 `|min`/`|max` 批 #24 已落地；D–F 单元：三元、`%` 格式化、方法白名单待做。iqex/itex 的模板阻塞已消，首因前移到 `dual_carriage` 的 `primary_carriage`），完整 Jinja 仍属 H3。
 - [ ] `save_variables.py`（`SAVE_VARIABLE` / `[variables]`）。
 - [ ] `delayed_gcode.py`（`[delayed_gcode]`）。
 - [ ] `respond.py`（`RESPOND` / `M118`）。

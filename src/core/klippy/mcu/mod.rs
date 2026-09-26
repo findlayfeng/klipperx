@@ -139,6 +139,9 @@ enum SendItem {
     Payload(Payload),
     /// Send whatever is queued so far, then signal completion.
     Flush(oneshot::Sender<()>),
+    /// Adopt the sequence the firmware last reported and signal completion
+    /// (see [`Mcu::renumber_to_firmware`]).
+    Renumber(oneshot::Sender<()>),
 }
 
 /// Queue `item` for the send task, waiting a bounded time for room.
@@ -367,6 +370,15 @@ struct Wire {
     /// Set when the connection's first new sequence number showed a firmware
     /// that was already mid-session, i.e. one nothing had reset.
     took_over: AtomicBool,
+    /// The firmware's counter as its own frames last reported it, in this
+    /// connection's unwrapped numbering: maintained by the receive task, read by
+    /// [`Sender::renumber_to_firmware`].
+    ///
+    /// Where the send side looks when silence turns out to have been a nak.
+    /// `next` alone only says what this connection sent last — which is exactly
+    /// what an ambiguous empty frame (ack *and* nak carry the same number) cannot
+    /// confirm.
+    seen: AtomicU64,
 }
 
 /// How long the host waits for an answer before putting the unacknowledged
@@ -516,6 +528,15 @@ impl Sender {
     ///   firmware is still waiting for the block this connection sent and it never
     ///   arrived. Put the unacknowledged blocks back **as they are**: their
     ///   sequences are the ones being waited for.
+    ///
+    /// The one number this deliberately never acts on by itself is the
+    /// **ambiguity band**: `seen` landing exactly on `next` is how the ack of
+    /// *every* block looks, and the nak of a block the firmware never took
+    /// carries that very same number — one 5-byte empty frame cannot say which
+    /// it is. Guessing here would either renumber a healthy session or read a
+    /// nak as an ack, so the band is left to the caller that can watch the line
+    /// fall silent after its request: identify's retry adopts the number through
+    /// [`Mcu::renumber_to_firmware`] instead.
     async fn settle(&mut self, interface: &Interface, seen: u64) {
         let next = self.wire.next.load(Ordering::Relaxed);
         if seen > next {
@@ -565,6 +586,35 @@ impl Sender {
                 self.retransmitted = None;
             }
         }
+    }
+
+    /// Adopt the sequence the firmware last reported, abandoning what is in flight.
+    ///
+    /// Connection init: an answer this connection's window cannot place says
+    /// where the firmware really is (`serialqueue.c:196-201`, "Got an ack for a
+    /// message not sent; must be connection init"), and the firmware's number is
+    /// the one the next block has to carry.
+    ///
+    /// [`Sender::settle`] deliberately does **not** do this on an empty frame
+    /// alone: `seen == next` is both the ack of a healthy block and the nak of
+    /// one the firmware never took. Only the caller that watched the line stay
+    /// silent after its request — identify's retry (see
+    /// [`Mcu::renumber_to_firmware`]) — is entitled to read the number as a nak.
+    /// What is in flight goes: before the dictionary is installed the only blocks
+    /// on the wire are earlier attempts at the very chunk being retried, and the
+    /// retry re-issues it.
+    fn renumber_to_firmware(&mut self) {
+        let seen = self.wire.seen.load(Ordering::Relaxed);
+        let next = self.wire.next.load(Ordering::Relaxed);
+        if seen != next {
+            debug!("Renumbering: firmware waits for {seen}, this connection would send {next}");
+        }
+        self.wire.next.store(seen, Ordering::Relaxed);
+        self.in_flight.clear();
+        self.retransmit_at = None;
+        self.acked = None;
+        self.retransmitted = None;
+        self.rto = MIN_RTO;
     }
 }
 
@@ -616,6 +666,11 @@ impl Mcu {
                                 let _ = done.send(());
                                 continue;
                             }
+                            Some(SendItem::Renumber(applied)) => {
+                                sender.renumber_to_firmware();
+                                let _ = applied.send(());
+                                continue;
+                            }
                             None => break, // channel closed
                         },
                         changed = acks_rx.changed() => {
@@ -664,6 +719,13 @@ impl Mcu {
                                     // Boundary requested: send this batch now.
                                     flush_done = Some(done);
                                     break;
+                                }
+                                Some(SendItem::Renumber(applied)) => {
+                                    // Applied to the window; a batch already being
+                                    // coalesced goes out under the adopted number
+                                    // (identify queues nothing while it waits).
+                                    sender.renumber_to_firmware();
+                                    let _ = applied.send(());
                                 }
                                 None => {
                                     // Channel closed
@@ -766,6 +828,10 @@ impl Mcu {
                         continue;
                     }
                     seen = rseq;
+                    // Where the firmware says it is, kept for the one caller
+                    // entitled to adopt it: identify's retry after silence
+                    // (`Mcu::renumber_to_firmware`).
+                    wire_for_recv.seen.store(seen, Ordering::Relaxed);
                     if first_new && rseq > 1 {
                         // A firmware that just booted answers this connection's
                         // first block with 0 or 1 (`src/command.c`, whose counter
@@ -1171,6 +1237,37 @@ impl Mcu {
                 Err(McuCallError::Timeout(format!("flush not reached within {timeout:?}")).into())
             }
         }
+    }
+
+    /// Renumber the send window onto the sequence the firmware last reported.
+    ///
+    /// The identify handshake's answer to silence. An empty ack/nak frame and
+    /// the ack of a healthy block carry the same number, so when a request is
+    /// met with nothing at all, the number that empty frame carried is read as
+    /// the nak it probably was: the window adopts it and the request goes out
+    /// again under that number (connection init, `serialqueue.c:196-201`).
+    /// Blocks still in flight are abandoned — before the dictionary is
+    /// installed they are only ever earlier attempts at the same identify
+    /// chunk, which the caller re-issues
+    /// ([`Identify::fetch`](crate::core::klippy::identify::Identify::fetch)).
+    ///
+    /// Only the send task writes the wire, so this is a message to it
+    /// ([`SendItem::Renumber`]); it resolves once the renumber has been applied.
+    ///
+    /// # Errors
+    /// Returns [`McuError::Call`] if the send task is gone.
+    pub(crate) async fn renumber_to_firmware(&self) -> Result<(), McuError> {
+        let (applied_tx, applied_rx) = oneshot::channel();
+        self.send_buf_tx
+            .send(SendItem::Renumber(applied_tx))
+            .await
+            .map_err(|e| McuError::Call(McuCallError::SendFailed(e.to_string())))?;
+        applied_rx.await.map_err(|_| {
+            McuError::Call(McuCallError::SendFailed(
+                "the send task dropped the renumber".to_string(),
+            ))
+        })?;
+        Ok(())
     }
 
     /// A command on its way out, as its DEBUG line shows it: the dictionary's
@@ -1748,6 +1845,43 @@ mod tests {
         let sent = recorder.frames();
         let seqs: Vec<u8> = sent.iter().map(|frame| frame.seq()).collect();
         assert_eq!(seqs, [0, 1], "one block per exchange, at its own number");
+    }
+
+    /// The renumber adopts the sequence the firmware reported and abandons what
+    /// is in flight: those blocks are earlier attempts at the chunk being
+    /// retried, which goes out again under the adopted number (see
+    /// [`Mcu::renumber_to_firmware`]). The state that belongs to the old
+    /// numbering — the ack bookkeeping and the retransmit wait — starts over.
+    #[test]
+    fn test_renumber_adopts_the_firmware_sequence_and_clears_the_window() {
+        let wire = Arc::new(Wire::default());
+        wire.next.store(2, Ordering::Relaxed);
+        wire.seen.store(1, Ordering::Relaxed);
+        let mut sender = Sender::new(Arc::clone(&wire));
+        sender.in_flight.push_back((0, make_frame(0, &[5])));
+        sender.acked = Some(2);
+        sender.retransmitted = Some(2);
+        sender.rto = Duration::from_secs(1);
+        sender.arm_retransmit();
+
+        sender.renumber_to_firmware();
+
+        assert_eq!(
+            wire.next.load(Ordering::Relaxed),
+            1,
+            "the firmware's number is the one the next block carries"
+        );
+        assert!(
+            sender.in_flight.is_empty(),
+            "what waited under the old numbering is abandoned; the retry re-issues its chunk"
+        );
+        assert!(
+            sender.retransmit_at.is_none(),
+            "nothing waits to be resent under the old numbering"
+        );
+        assert_eq!(sender.rto, MIN_RTO, "the wait starts over");
+        assert!(sender.acked.is_none());
+        assert!(sender.retransmitted.is_none());
     }
 
     // -----------------------------------------------------------------------

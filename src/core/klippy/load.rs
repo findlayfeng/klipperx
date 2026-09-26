@@ -391,6 +391,7 @@ mod tests {
                 "static_digital_output",
                 "ad5206",
                 "adxl345",
+                "dac084S085",
                 "display_template",
                 "dotstar",
                 "i2c_device",

@@ -931,6 +931,26 @@ gap（如实登记）：**屏幕内容不渲染**（`display_template`/`display_
 
 本身不读选项：整节交给 `[fan]` 的核心（`pin`/`max_power`/`kick_start_time`/`off_below`/`cycle_time`/`hardware_pwm`/`shutdown_speed`/`enable_pin`/`tachometer_*`；**`shutdown_speed` 默认 `0.0`**，与 `[heater_fan]` 的 1.0 不同）；节名即 mux 值，注册 `SET_FAN_SPEED FAN=<name> SPEED=<0..1>`。`TEMPLATE=` 形式**未实现**（模板求值器未落地，调用报明确拒绝）。
 
+### `[idle_timeout]` — 空闲超时（批 #21）
+
+| 选项 | 默认 | 说明 |
+|------|------|------|
+| `timeout` | `600` | 空闲秒数，`above 0` |
+| `gcode` | 内置（`{% if 'heaters' in printer %}` → `TURN_OFF_HEATERS`；`M84`） | 超时后跑的脚本 |
+
+`SET_IDLE_TIMEOUT [TIMEOUT=]` 可改超时；`get_status` 给 `state`（`Idle`/`Ready`/`Printing`）、`printing_time`、`idle_timeout`。gap：`TURN_OFF_HEATERS` 未实现（默认脚本里那行走「未知命令」）；上游的 `update_timer` 抢占唤醒与 `toolhead:sync_print_time` 事件在本仓降级为定时器自续期 + 观察 `print_time` 前进。
+
+### `[verify_heater <heater_name>]` — 加热器升温校验（批 #20）
+
+| 选项 | 默认 | 说明 |
+|------|------|------|
+| `hysteresis` | `5` | 目标附近容差（`minval=0.`） |
+| `max_error` | `120` | 累积误差上限（`minval=0.`） |
+| `heating_gain` | `2` | 期望升温（`above 0.`） |
+| `check_gain_time` | `60`（`heater_bed`）/ `20`（其他） | 升温窗口秒数（`minval=1.`） |
+
+每个 heater 自动获得一个检查器（配置无此节时用默认值）；失败 `invoke_shutdown("Heater <name> not heating at expected rate" + 提示)`。已知差异：`[verify_heater <不存在的 heater>]` 报装载器的 `Section '…' is not a valid config section`，而非上游的 `Unknown heater`。
+
 ### `[adc_scaled <name>]` — 参考电压缩放 ADC（批 #19）
 
 | 选项 | 默认 | 说明 |

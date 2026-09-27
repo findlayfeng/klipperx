@@ -29,6 +29,12 @@ pub struct ToolHead {
     commanded_pos: Coord,
     print_time: f64,
     estimated_print_time: f64,
+    /// The step-generation horizon the planner has actually reached: the
+    /// `step_gen_time` of the last successful `flush_step_generation`.
+    /// Upstream's `motion_queuing.last_step_gen_time`
+    /// (`motion_queuing.py:145-146`), the `kin_time` half of
+    /// `_calc_print_time`'s floor (`toolhead.py:263` → `motion_queuing.py:191`).
+    last_step_gen_time: f64,
     special_queuing_state: bool,
     motion_queuing: MotionQueuing,
     kinematics: Option<Box<dyn Kinematics>>,
@@ -50,6 +56,7 @@ impl ToolHead {
             commanded_pos: Coord::default(),
             print_time: 0.0,
             estimated_print_time: 0.0,
+            last_step_gen_time: 0.0,
             // Upstream starts in "NeedPrime" and resyncs the print time on the
             // first planned move (`klippy/toolhead.py:224`).
             special_queuing_state: true,
@@ -196,9 +203,16 @@ impl ToolHead {
         }
         if self.special_queuing_state {
             // Leaving "NeedPrime": start the print time a buffer ahead of the
-            // MCU so the queue is never empty when motion starts.
+            // MCU so the queue is never empty when motion starts. Upstream's
+            // `_calc_print_time` floors it further at `kin_time` —
+            // `max(est + MIN_KIN_TIME, last_step_gen_time) + kin_flush_delay`
+            // (`toolhead.py:263` → `motion_queuing.py:190-192`) — and
+            // `last_step_gen_time` is the floor that keeps a move queued after
+            // a drip from starting behind steps that drip already generated
+            // (`kin_flush_delay` is not modelled in this host).
             self.special_queuing_state = false;
-            let min_print_time = self.estimated_print_time + BUFFER_TIME_START;
+            let min_print_time =
+                (self.estimated_print_time + BUFFER_TIME_START).max(self.last_step_gen_time);
             if min_print_time > self.print_time {
                 self.print_time = min_print_time;
             }
@@ -243,7 +257,11 @@ impl ToolHead {
         step_gen_time: f64,
     ) -> Result<Vec<(String, Vec<StepCommand>)>, StepCompressError> {
         self.process_lookahead();
-        self.motion_queuing.generate(step_gen_time)
+        let batches = self.motion_queuing.generate(step_gen_time)?;
+        // Generation is what advances the horizon: a flush that produced
+        // nothing for a stepper still generated *to* `step_gen_time`.
+        self.last_step_gen_time = self.last_step_gen_time.max(step_gen_time);
+        Ok(batches)
     }
 
     /// Plan everything queued so far (`ToolHead.wait_moves`,
@@ -274,9 +292,14 @@ impl ToolHead {
     ///
     /// A homing move must not be joined to a previous move — it has to stop on
     /// its own endstop — so this sets its junction speeds to zero (start and end
-    /// at rest), appends its trapezoid at the current print time, and advances
-    /// the print time. The caller runs the step generation while the firmware
-    /// moves (the drip loop), so only a small window is ever queued.
+    /// at rest) and appends its trapezoid at the current print time. As
+    /// upstream's `_drip_load_trapq` (`toolhead.py:459-476`), **loading does
+    /// not advance `print_time`**: the move's end is returned as the drip's
+    /// boundary, and step generation advances with the drip itself
+    /// (`motion_queuing.py:265-290`, segment by segment, wherever the drip
+    /// stops). Advancing `print_time` to the end here would leave the planner
+    /// claiming a horizon the machine never reached when the drip aborts at its
+    /// endstop — the next queued move would inherit it as its start time.
     ///
     /// Returns the move's start and end print times.
     ///
@@ -296,15 +319,29 @@ impl ToolHead {
         }
         self.process_lookahead();
         move_.set_junction(0.0, move_.max_cruise_v2, 0.0);
+        // `_drip_load_trapq` calls `_calc_print_time()` before taking the start
+        // (`toolhead.py:465` → `:260-268`): `print_time` is raised — never
+        // lowered — to `max(estimated_print_time + BUFFER_TIME_START, kin_time)`,
+        // with `kin_time = max(est + MIN_KIN_TIME, last_step_gen_time) +
+        // kin_flush_delay` (`motion_queuing.py:190-192`). This host models
+        // neither `MIN_KIN_TIME` nor `kin_flush_delay`; the two floors it does
+        // model are the buffer and the generated horizon, and the latter is
+        // what keeps the drip's start from landing behind steps a previous
+        // drip already generated (an "Invalid sequence" in the step solver).
+        let min_print_time =
+            (self.estimated_print_time + BUFFER_TIME_START).max(self.last_step_gen_time);
+        if min_print_time > self.print_time {
+            self.print_time = min_print_time;
+        }
         let start_time = self.print_time;
         append_move(
             self.motion_queuing.trapq_mut(self.main_trapq),
             start_time,
             &move_,
         );
-        self.print_time = start_time + move_.accel_t + move_.cruise_t + move_.decel_t;
+        let end_time = start_time + move_.accel_t + move_.cruise_t + move_.decel_t;
         self.commanded_pos = move_.end_pos;
-        Ok((start_time, self.print_time))
+        Ok((start_time, end_time))
     }
 
     /// Wait `delay` seconds without moving (`ToolHead.dwell`,
@@ -333,6 +370,15 @@ impl ToolHead {
     /// or truncates any history the old position recorded.
     pub fn set_position(&mut self, newpos: Coord, homing_axes: &[usize]) {
         self.process_lookahead();
+        // Upstream's `set_position` flushes step generation first
+        // (`toolhead.py:384` → `flush_step_generation`, `:317-319`), whose
+        // `_flush_lookahead` re-enters "NeedPrime" (`:300-304`) — so the next
+        // planned move re-runs `_calc_print_time` and floors `print_time` at
+        // the generated horizon. Re-prime the state here for the same reason:
+        // without it the position is re-anchored at a `print_time` that a
+        // completed drip's generated steps may already be past, and the next
+        // move solves out of order ("Invalid sequence").
+        self.special_queuing_state = true;
         self.motion_queuing
             .trapq_mut(self.main_trapq)
             .set_position(self.print_time, Xyz::from(newpos));
@@ -594,7 +640,12 @@ mod tests {
 
         assert!(end > start);
         assert_eq!(toolhead.commanded_pos().x(), 10.0);
-        assert_eq!(toolhead.get_last_move_time(), end);
+        // Loading does not advance `print_time`: upstream's
+        // `_drip_load_trapq` (`toolhead.py:459-476`) returns start/end without
+        // touching it, so a drip aborted at its endstop cannot leave the
+        // planner claiming a horizon the machine never reached — `end` is only
+        // the drip's boundary.
+        assert_eq!(toolhead.get_last_move_time(), start);
         // The move is in the trapq and generates its steps.
         let batches = toolhead.flush_step_generation(end).unwrap();
         assert_eq!(step_count(&batches), 10);

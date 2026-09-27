@@ -75,6 +75,93 @@ impl FrameMock {
     }
 }
 
+/// A frame **recorder** for transport-timing tests: every payload it is sent is
+/// recorded (no input validation — the gate tests assert *when* something goes
+/// out, and the derived command bytes are not worth predicting), each block is
+/// acked with `seq + 1`, and one configured request is answered with a canned
+/// response so a `call` round trip can complete.
+///
+/// Cloneable: the test keeps a handle so it can [`RecordingWire::shutdown`]
+/// the wire explicitly — a bare `Mcu` in a test can be kept alive by the
+/// resource callback cycles (the object layer breaks those in
+/// `McuObject::release_cycles`), and a blocked receive would then park the
+/// test runtime's shutdown.
+#[derive(Clone)]
+pub struct RecordingWire(Arc<RecordingWireInner>);
+
+struct RecordingWireInner {
+    sent: Arc<Mutex<Vec<Vec<u8>>>>,
+    reply: Mutex<Option<(Vec<u8>, Vec<u8>)>>,
+    tx: Mutex<Option<Sender<Frame>>>,
+    rx: Receiver<Frame>,
+}
+
+impl RecordingWire {
+    pub fn new() -> Self {
+        let (tx, rx) = bounded(64);
+        Self(Arc::new(RecordingWireInner {
+            sent: Arc::new(Mutex::new(Vec::new())),
+            reply: Mutex::new(None),
+            tx: Mutex::new(Some(tx)),
+            rx,
+        }))
+    }
+
+    /// The live record of every payload this wire was sent.
+    pub fn sent(&self) -> Arc<Mutex<Vec<Vec<u8>>>> {
+        Arc::clone(&self.0.sent)
+    }
+
+    /// Answer a send whose payload equals `request` with `response` (before
+    /// the ack of that block).
+    pub fn reply_to(&self, request: Vec<u8>, response: Vec<u8>) {
+        *self.0.reply.lock().unwrap() = Some((request, response));
+    }
+
+    /// Close the wire: pending and future `receive()` calls return `None`.
+    pub fn shutdown(&self) {
+        *self.0.tx.lock().unwrap() = None;
+    }
+}
+
+impl std::fmt::Debug for RecordingWire {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecordingWire")
+            .field("sent", &self.0.sent.lock().unwrap().len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Device for RecordingWire {
+    fn send(&self, frame: &Frame) -> Result<(), InterfaceError> {
+        let payload = frame.payload().to_vec();
+        self.0.sent.lock().unwrap().push(payload.clone());
+        let tx = self.0.tx.lock().unwrap().clone();
+        let Some(tx) = tx else {
+            return Ok(());
+        };
+        let seq = (frame.seq() + 1) & 0x0f;
+        let reply = self.0.reply.lock().unwrap();
+        if let Some((request, response)) = reply.as_ref() {
+            if *request == payload {
+                let _ = tx.send(Frame::new(seq, response.clone()));
+            }
+        }
+        drop(reply);
+        // The block was taken, so the window advances (`Sender::settle`).
+        let _ = tx.send(Frame::new(seq, Vec::new()));
+        Ok(())
+    }
+
+    fn receive(&self) -> Option<Frame> {
+        self.0.rx.recv().ok()
+    }
+
+    fn shutdown(&self) {
+        *self.0.tx.lock().unwrap() = None;
+    }
+}
+
 impl Device for FrameMock {
     fn send(&self, frame: &Frame) -> Result<(), InterfaceError> {
         let (entry, tx) = {

@@ -265,9 +265,11 @@ mod tests {
     use super::*;
 
     use crate::core::klippy::cmd::clock::McuClock;
-    use crate::core::klippy::interface::devices::frame_mock::FrameMock;
+    use crate::core::klippy::interface::devices::frame_mock::{FrameMock, RecordingWire};
     use crate::core::klippy::interface::Interface;
     use crate::core::klippy::mcu::{ConfigBuilder, Dictionary, Mcu};
+    use crate::core::klippy::msg::parser::Parser;
+    use crate::core::klippy::msg::proto::ArgValue;
     use crate::core::klippy::pins::PrinterPins;
     use crate::core::klippy::reactor::ManualReactor;
     use serde_json::json;
@@ -304,6 +306,11 @@ mod tests {
             Interface::new(FrameMock::new(Vec::new())),
         ));
         mcu.install_dictionary(dictionary()).unwrap();
+        (chip_with(Arc::clone(&mcu)), mcu)
+    }
+
+    /// The same chip, wired to an MCU the caller keeps a handle to.
+    fn chip_with(mcu: Arc<Mcu>) -> McuChip {
         let chip = McuChip::new(
             "mcu".to_string(),
             Arc::new(ConfigBuilder::new()),
@@ -312,8 +319,8 @@ mod tests {
         let clock = Arc::new(McuClock::new(Arc::clone(&mcu), ManualReactor::shared()));
         clock.seed(0.0, 0);
         chip.set_clock(clock, 0.0);
-        chip.attach(Arc::clone(&mcu));
-        (chip, mcu)
+        chip.attach(mcu);
+        chip
     }
 
     fn params(pin: &str, invert: bool) -> PinParams {
@@ -345,5 +352,146 @@ mod tests {
         // anything but an endstop hit. This is the pure half of the decision.
         assert!(!TriggerReason::EndstopHit.is_failure());
         assert_eq!(TriggerReason::from_u8(1), Some(TriggerReason::EndstopHit));
+    }
+
+    /// Encode one message with the test dictionary's formats.
+    fn wire_bytes(format: &str, id: i16, args: &[ArgValue]) -> Vec<u8> {
+        let mut parser = Parser::new();
+        parser.register(id, format).unwrap();
+        parser.encode(name_of(format), args).unwrap().into_raw()
+    }
+
+    fn name_of(format: &str) -> &str {
+        format.split_whitespace().next().unwrap()
+    }
+
+    /// ⑤ The arm carries upstream's `reqclock` (`klippy/mcu.py:385`): with the
+    /// arm clock far ahead of the estimate, `endstop_home` and the trsync pair
+    /// wait for the 100 ms lead window instead of going out at once — the
+    /// ordering that keeps the arm behind this move's queue_step messages
+    /// (upstream commit `6bd5f4e4`).
+    #[tokio::test]
+    async fn test_home_start_waits_for_its_reqclock_window() {
+        use tokio::time::sleep;
+        let wire = RecordingWire::new();
+        let closer = wire.clone();
+        let sent = wire.sent();
+        let mcu = Arc::new(Mcu::for_test("mcu", Interface::recording(wire)));
+        mcu.install_dictionary(dictionary()).unwrap();
+        mcu.set_clock_base(0);
+        let chip = chip_with(Arc::clone(&mcu));
+        let endstop = McuEndstop::new(chip, &params("PA1", false)).unwrap();
+
+        // Arm 10 s out on the 1 MHz clock; the window opens at 10 s − 0.1 s.
+        endstop.home_start(10.0, 0.000_015, 4, 0.01, true).unwrap();
+        sleep(std::time::Duration::from_millis(60)).await;
+        assert_eq!(
+            sent.lock().unwrap().len(),
+            0,
+            "the arm went out without its reqclock holding it to the window"
+        );
+
+        mcu.set_clock_base(10_000_000 - 100_000 + 1);
+        sleep(std::time::Duration::from_millis(60)).await;
+        // The whole arm releases — and the send task may coalesce it into one
+        // block, so count messages, not frames.
+        let frames = sent.lock().unwrap().clone();
+        assert!(!frames.is_empty(), "the arm never left after the window");
+        let mut parser = Parser::new();
+        parser
+            .register(
+                31,
+                "trsync_start oid=%c report_clock=%u report_ticks=%u expire_reason=%c",
+            )
+            .unwrap();
+        parser
+            .register(32, "trsync_set_timeout oid=%c clock=%u")
+            .unwrap();
+        parser
+            .register(
+                41,
+                "endstop_home oid=%c clock=%u sample_ticks=%u sample_count=%c rest_ticks=%u pin_value=%c trsync_oid=%c trigger_reason=%c",
+            )
+            .unwrap();
+        let mut names: Vec<String> = Vec::new();
+        let names: Vec<String> = frames
+            .iter()
+            .flat_map(|payload| {
+                parser
+                    .decode(crate::core::klippy::msg::proto::Payload::from_raw(
+                        payload.clone(),
+                    ))
+                    .unwrap_or_default()
+            })
+            .map(|(msg, _)| msg.name.clone())
+            .collect();
+        assert_eq!(
+            names,
+            ["trsync_start", "trsync_set_timeout", "endstop_home"],
+            "the arm must go out whole, in queue order"
+        );
+        // Production breaks the `Mcu → events → resource → Mcu` cycle in
+        // `McuObject::release_cycles`; a bare test has to do the same or the
+        // response callback keeps the `Mcu` (and its blocked receive) alive
+        // past the runtime's shutdown.
+        mcu.clear_events();
+        drop(endstop);
+        // Close the wire explicitly: the bare `Mcu` can be kept alive by the
+        // resource callback cycle (production breaks it in
+        // `McuObject::release_cycles`), and a still-blocked receive would park
+        // this test runtime's shutdown.
+        closer.shutdown();
+    }
+
+    /// ⑤ `endstop_query_state` carries upstream's `minclock`
+    /// (`klippy/mcu.py:401-405`): `query_endstop(print_time)` waits for that
+    /// print time instead of answering the pin as it is *now* — the FW6 old
+    /// behaviour the module docs used to describe.
+    #[tokio::test]
+    async fn test_query_endstop_holds_until_its_minclock() {
+        use tokio::time::sleep;
+        let wire = RecordingWire::new();
+        let sent = wire.sent();
+        let query = wire_bytes("endstop_query_state oid=%c", 42, &[ArgValue::UInt8(0)]);
+        let state = wire_bytes(
+            "endstop_state oid=%c homing=%c next_clock=%u pin_value=%c",
+            43,
+            &[
+                ArgValue::UInt8(0),
+                ArgValue::UInt8(0),
+                ArgValue::UInt32(0),
+                ArgValue::UInt8(1),
+            ],
+        );
+        wire.reply_to(query.clone(), state);
+        let mcu = Arc::new(Mcu::for_test("mcu", Interface::recording(wire)));
+        mcu.install_dictionary(dictionary()).unwrap();
+        mcu.set_clock_base(0);
+        let chip = chip_with(Arc::clone(&mcu));
+        let endstop = McuEndstop::new(chip, &params("PA1", false)).unwrap();
+
+        // `min_clock` = 10 s of MCU clock; the estimate sits at 0.
+        let pending = endstop.query_endstop(10.0);
+        tokio::pin!(pending);
+        tokio::select! {
+            early = &mut pending => panic!("query answered before its minclock: {early:?}"),
+            _ = sleep(std::time::Duration::from_millis(60)) => {}
+        }
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "the query went out before print_time arrived"
+        );
+
+        mcu.set_clock_base(10_000_000 - 100_000 + 1);
+        let answered = tokio::time::timeout(std::time::Duration::from_secs(1), pending)
+            .await
+            .expect("the gated query completes after the release")
+            .expect("the canned endstop_state answers");
+        assert!(answered, "pin_value=1 with invert=false");
+        assert_eq!(
+            sent.lock().unwrap().iter().filter(|p| **p == query).count(),
+            1,
+            "exactly one query once the minclock passed"
+        );
     }
 }

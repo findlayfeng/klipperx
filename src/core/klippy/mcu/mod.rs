@@ -3744,7 +3744,8 @@ mod tests {
                 "config_reset": 6,
                 "emergency_stop": 7,
                 "debug_nop": 8,
-                "queue_digital_out oid=%c clock=%u on_ticks=%u": 12
+                "queue_digital_out oid=%c clock=%u on_ticks=%u": 12,
+                "queue_step oid=%c interval=%u count=%u add=%i": 9
             },
             "config": {"CLOCK_FREQ": 16000000}
         }))
@@ -4051,6 +4052,168 @@ mod tests {
             slots.record(3_000_000, &live),
             None,
             "the freed entries were pruned, so the pool has room again"
+        );
+    }
+
+    /// ③ The safety window around a slot-starved send: with the pool full, the
+    /// move is released by its floor **and** goes no later than its own start
+    /// clock minus `MIN_SCHEDULE_TIME` — the upper edge is asserted against the
+    /// **start clock** (the batch's first step, per Q2(b)), and it is the
+    /// property that keeps a full pool from turning overflow prevention into a
+    /// "Timer too close" (`src/sched.c:94`). The lower edge (never *before* the
+    /// release) is test ①'s single-gate job: with a future `req_clock` also on
+    /// the message, the two gates only ever combine (release = max of both), so
+    /// one message cannot show `min` alone — see the paired configs in ①/②.
+    #[tokio::test]
+    async fn test_slot_release_and_start_clock_bracket_the_send() {
+        const BASE: u64 = 1_000_000;
+        const FREQ: f64 = 16_000_000.0;
+        let completion = BASE + 16_000_000; // 1.0 s: the predecessor in the pool
+        let floor = MoveSlots::free_at(completion, FREQ); // +20 ms margin
+        let start = completion + 3_200_000; // 0.2 s later: this move's own clock
+        let window = start - (MIN_REQTIME_DELTA * FREQ) as u64; // opens at +0.1 s
+        assert!(floor < window, "the floor must sit inside the lead window");
+
+        // One slot: the predecessor takes it, the move queues behind it.
+        let (mcu, recorder) = gate_mcu(vec![gate_block(0, &[5]), gate_block(1, &[6])], BASE);
+        mcu.set_move_slot_capacity(1);
+        mcu.send_move("get_clock", &[], BASE, completion).unwrap();
+        sleep(Duration::from_millis(60)).await;
+        assert_eq!(sent_count(&recorder, 5), 1, "the predecessor goes");
+
+        // The move: floor = free-at(predecessor completion), req = start.
+        mcu.send_move("config_reset", &[], start, start + 1_600_000)
+            .unwrap();
+        sleep(Duration::from_millis(60)).await;
+        assert_eq!(
+            sent_count(&recorder, 6),
+            0,
+            "before the slot releases, the move does not go"
+        );
+
+        // The slot releases (floor passed) but the req window has not opened:
+        // both gates have to pass, so it still waits (② pins the window itself).
+        mcu.set_clock_base(floor + 1);
+        sleep(Duration::from_millis(60)).await;
+        assert_eq!(
+            sent_count(&recorder, 6),
+            0,
+            "slot released, but its own start window has not opened"
+        );
+
+        // Window opens → out it goes: `sent_clock <= start - MIN_SCHEDULE_TIME`
+        // (+1 tick of re-poll). If a (buggy) floor ever sat *past* this point,
+        // this step would stay red — the Timer-too-close detector.
+        mcu.set_clock_base(window + 1);
+        sleep(Duration::from_millis(60)).await;
+        assert_eq!(
+            sent_count(&recorder, 6),
+            1,
+            "not sent by its start clock minus MIN_SCHEDULE_TIME"
+        );
+    }
+
+    /// ⑤ Step-path integration: `send_move_payload` carries the batch's
+    /// `(start, completion)` window into the gates — the completion clock
+    /// becomes the pool floor the next batch waits on, and the frame only
+    /// leaves once that floor frees.
+    #[tokio::test]
+    async fn test_step_batches_carry_their_window_into_the_gates() {
+        const BASE: u64 = 1_000_000;
+        const FREQ: f64 = 16_000_000.0;
+        let completion = BASE + 16_000_000;
+        let floor = MoveSlots::free_at(completion, FREQ);
+
+        let first = mcu_encode_step(1_000_000); // interval is incidental; the window does the gating
+        let second = mcu_encode_step(2_000);
+
+        let (mcu, recorder) = gate_mcu(vec![gate_block(0, &first), gate_block(1, &second)], BASE);
+        mcu.set_move_slot_capacity(1);
+
+        // First batch: pool has room, goes at once (start in the past → req open).
+        mcu.send_move_payload(payload_from(&first), BASE, completion)
+            .await
+            .unwrap();
+        sleep(Duration::from_millis(60)).await;
+        assert_eq!(recorder.frames().len(), 1, "first batch on the wire");
+
+        // Second batch: its completion entered the pool, so its floor is the
+        // first batch's completion + margin — held until then.
+        mcu.send_move_payload(payload_from(&second), BASE, completion + 8_000_000)
+            .await
+            .unwrap();
+        sleep(Duration::from_millis(60)).await;
+        assert_eq!(
+            recorder.frames().len(),
+            1,
+            "completion clock did not reach the pool: no floor held it"
+        );
+
+        mcu.set_clock_base(floor + 1);
+        sleep(Duration::from_millis(60)).await;
+        assert_eq!(
+            recorder.frames().len(),
+            2,
+            "released at its predecessor's slot-free clock"
+        );
+    }
+
+    /// Encode one `queue_step` for the step-path test (bytes the wire expects).
+    fn mcu_encode_step(interval: u32) -> Vec<u8> {
+        let mut parser = Parser::new();
+        parser
+            .register(9, "queue_step oid=%c interval=%u count=%u add=%i")
+            .unwrap();
+        parser
+            .encode(
+                "queue_step",
+                &[
+                    ArgValue::UInt8(0),
+                    ArgValue::UInt32(interval),
+                    ArgValue::UInt32(1),
+                    ArgValue::Int32(0),
+                ],
+            )
+            .unwrap()
+            .into_raw()
+    }
+
+    /// Raw payload → a [`Payload`] to hand the send path.
+    fn payload_from(raw: &[u8]) -> Payload {
+        Payload::from_raw(raw.to_vec())
+    }
+
+    /// ⑥ An unknown clock never blocks: no estimate seed means
+    /// [`SendClocks::released`] opens both gates (`serialqueue.c:612-618`,
+    /// "Clock unknown during initial startup … return PR_NOW") — the send chain
+    /// must not be able to park on a clock the host cannot judge.
+    #[tokio::test]
+    async fn test_an_unknown_clock_never_blocks_a_gated_message() {
+        // Deliberately **no** `set_clock_base`: `estimated_clock()` is `None`.
+        let device = FrameMock::new(vec![gate_block(0, &[5])]);
+        let recorder = device.recorder();
+        let mcu = Mcu::for_test("test_mcu", Interface::new(device));
+        mcu.install_dictionary(gate_dictionary()).unwrap();
+        assert!(
+            mcu.estimated_clock().is_none(),
+            "clock must be unknown here"
+        );
+
+        mcu.send_with_clocks(
+            "get_clock",
+            &[],
+            SendClocks {
+                min_clock: Some(u64::MAX - 1),
+                req_clock: Some(u64::MAX - 1),
+            },
+        )
+        .unwrap();
+
+        sleep(Duration::from_millis(60)).await;
+        assert_eq!(
+            recorder.frames().len(),
+            1,
+            "a gated message parked on an unjudgeable clock"
         );
     }
 

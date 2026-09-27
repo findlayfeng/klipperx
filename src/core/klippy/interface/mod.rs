@@ -71,6 +71,9 @@ enum Transport {
     FrameMock(Arc<FrameMock>),
     #[cfg(test)]
     Simulator(Arc<SimulatorDevice>),
+    /// A recording wire for transport-timing tests (`Interface::recording`).
+    #[cfg(test)]
+    Recording(Arc<devices::frame_mock::RecordingWire>),
 }
 
 impl Interface {
@@ -104,6 +107,14 @@ impl Interface {
     #[cfg(test)]
     pub fn simulator(device: SimulatorDevice) -> Self {
         Self::with_transport(Transport::Simulator(Arc::new(device)))
+    }
+
+    /// Create an interface over a recording wire (`RecordingWire`): records
+    /// every frame sent, acks, answers one configured request — for tests that
+    /// assert *when* a message goes out without predicting its derived bytes.
+    #[cfg(test)]
+    pub fn recording(device: devices::frame_mock::RecordingWire) -> Self {
+        Self::with_transport(Transport::Recording(Arc::new(device)))
     }
 
     /// Create an interface for a real MCU on the serial port `path`.
@@ -186,6 +197,11 @@ impl Interface {
                 let device = Arc::clone(device);
                 self.off_runtime(move || device.send(&frame)).await
             }
+            #[cfg(test)]
+            Transport::Recording(device) => {
+                let device = Arc::clone(device);
+                self.off_runtime(move || device.send(&frame)).await
+            }
         }
     }
 
@@ -213,6 +229,11 @@ impl Interface {
                 let device = Arc::clone(device);
                 self.off_runtime(move || device.receive()).await
             }
+            #[cfg(test)]
+            Transport::Recording(device) => {
+                let device = Arc::clone(device);
+                self.off_runtime(move || device.receive()).await
+            }
         }
     }
 
@@ -226,6 +247,8 @@ impl Interface {
             Transport::FrameMock(device) => device.shutdown(),
             #[cfg(test)]
             Transport::Simulator(device) => device.shutdown(),
+            #[cfg(test)]
+            Transport::Recording(device) => device.shutdown(),
         }
     }
 }

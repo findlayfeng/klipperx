@@ -894,6 +894,21 @@ impl PrinterObject for McuObject {
                 other => KlippyError::Internal(other.to_string()),
             })?;
             let configured = loop {
+                // `test:` serves the corpus against the fake, whose clock only
+                // moves with wall time while the corpus' motion is virtual: a
+                // scheduling gate there degenerates into wall-clock
+                // serialisation (the estimate can never lead the stream it
+                // waits on — measured in C4), so the gates are opened for this
+                // transport only. Every connection passes through here once —
+                // and again after `reconnect` below — so one call covers each
+                // `Mcu` this section ever gets. Production links never take
+                // this branch, and `Mcu::for_test` (FrameMock) never reaches
+                // this object at all. (`object.rs` is touched because it is the
+                // only place that sees both the section's interface key and
+                // every live `Mcu`.)
+                if self.section.parameters.contains_key("test") {
+                    mcu.open_send_gates();
+                }
                 match self
                     .chip
                     .config()

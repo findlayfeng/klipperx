@@ -102,7 +102,7 @@ git config core.hooksPath .githooks
 | `resource/pin.rs` | `McuChip` 经 `pins` 注册后被 `setup_digital_out` 派发；`McuDigitalOut` 的 build：`config_digital_out` 的 oid/pin 编号/value/default_value/max_duration（2 s × CLOCK_FREQ）、`update_digital_out` 进 restart 列表、`!` 翻转电平、`max_duration` 与 start/shutdown 不一致报错、枚举里没有的引脚报 `Pin 'X' is not a valid pin name on mcu 'Y'`、保留引脚报错；运行期：attach 后 `update`/`queue` 可发送（名字与参数可编码），未 build 与未 connect 各自报错；`resolve_bus_name`：按 `BUS_PINS_<bus>` 预留固件声明的引脚、缺省取名为 0 的总线、`Unknown spi_bus` / `Must specify spi_bus` 两种错误、无总线枚举时原样透传；**析构**：资源注册的 config 回调必须 `Weak` 持有 pins registry（否则 `registry → chip → config → callback → registry` 成环，跨 `teardown` 留住 chip 与其 MCU 连接）—— `test_a_resource_does_not_keep_the_pin_registry_alive` |
 | `resource/pwm.rs` | 硬件路径建 `config_pwm_out`（`PWM_MAX` 满量程、restart 的 `queue_pwm_out`）；软件路径建 `config_digital_out` + `set_digital_out_pwm_cycle` + init 的 `queue_digital_out`；`shutdown_value` 非 0/1 的软件 PWM 报错、`max_duration` 与 start/shutdown 不一致报错、`!` 翻转；`next_aligned_clock` 对软件 PWM 按周期上取整、满/全关与硬件 PWM 不调整；`update_pwm` 用估计时钟发送，未连接报错 |
 | `resource/adc.rs` | 批量 `query_analog_in`（`bytes_per_report`）/ 旧格式按字典格式串选择；`ADC_MAX` 与 `sample_count*ADC_MAX < 2^16` 上限；`sample_count=0` 不建任何命令；`get_query_slot` 把首报排在估计时钟 +1.5 s；`analog_in_state` 旧格式单值缩放、新格式按 report 周期给每个样本打时钟 |
-| `resource/stepper.rs` | 方向变化变 `set_next_step_dir`、连续步变 `queue_step`；`!` 翻转方向线上的方向位；负 `add` 窄化后仍正确 |
+| `resource/stepper.rs` | 方向变化变 `set_next_step_dir`、连续步变 `queue_step`；`!` 翻转方向线上的方向位；负 `add` 窄化后仍正确；**C5**：`test_a_stepper_reanchors_the_firmware_chain_on_a_reused_firmware`（复用分支 `built.restart` 必含 `reset_step_clock oid=0 clock=0`、且不进 config 哈希——回退 `add_restart_cmd` 即红，同模块另 4 条照常绿） |
 | `resource/endstop.rs` | `home_start` 同时武装 endstop 与 trsync（async）；`home_wait` 对主机请求（无固件触发）回 0 |
 | `resource/trsync.rs` | 状态报告完成触发组、次级 MCU 报文把组超时拉到最慢那颗；registry 按 oid 路由、同一 MCU 上两个 endstop 共享 registry；一个 trsync 停住多个 stepper；共享轴跨 MCU 被拒（上游 `TriggerDispatch` 同规则）；raw reason 贯通：未知 raw 照样完成 completion、typed 视图折叠、reason 0 不完成（1-4 行为零变化的守卫） |
 | `resource/trigger_analog.rs` | 5 命令 + state 响应对字典编解码、错误码四类字典文案与 `SENSOR_SPECIFIC` 走传感器回调、SOS 去重缓存（仅变更才发、state+active 每次发）、超量段/状态数不匹配报错、range/trigger 去重、双 trigger_analog 的 oid 互异且各恰一次 config、非正采样率拒绝；e2e：`set_trigger→home` 首条 move 在监控窗内完成、无样本时 MONITOR 到期回 `Trigger analog error: MONITOR` 不挂起；M5b：`&dyn HomingEndstop` 端到端 arm/wait、stub 生产者投样与错误码回调消费（低于 `SENSOR_SPECIFIC` 走字典） |
@@ -181,7 +181,7 @@ git config core.hooksPath .githooks
 | `trapq.rs` | 梯形变三段、相位连续、时间空隙填静止段、坐标沿加速度走；`finalize_moves` 过期段、`extract_old` 按窗口取段 |
 | `itersolve.rs` | cartesian 只读自己的轴、corexy 读 x±y、corexz 读 x±z；不动的 stepper 是惰性的；步距处生成步进、`generate` 走完整 trapq、位置坐标往返 |
 | `stepper.rs` | cartesian stepper 只动自己的轴、每个 stepper 在自己的 MCU 时钟里生成、`mcu_position` / `past_position`、`generate` 交出该 stepper 的命令 |
-| `toolhead.rs` | 额外轴（挤出机）在自己的 trapq 检查与排队、限制拐角；move 到 trapq 生成 `queue_step`；两条共线 move 保住拐角速度；`dwell` 推进 print time；`drip_move` 直灌 trapq（零长度不做事）；未 homed 轴拒绝、零长 move 忽略 |
+| `toolhead.rs` | 额外轴（挤出机）在自己的 trapq 检查与排队、限制拐角；move 到 trapq 生成 `queue_step`；两条共线 move 保住拐角速度；`dwell` 推进 print time；`drip_move` 直灌 trapq（零长度不做事）；未 homed 轴拒绝、零长 move 忽略；**C5 五测（两组转红）**：实时 est 打底（`print_time ≥ live_est + BUFFER_TIME_START`，回退成 connect 快照即 5 条全红）、`need_prime_rearm::{wait_moves,dwell,flush_step_generation}` 三条复位路径（去复位恰好 3 条红）、入队批 `req`/`completion` 域界（`req ≤ est+0.100`、`completion ≥ est`） |
 | `queuing.rs` | `append` 与 `generate` 共用同一 trapq；没事做的 stepper 静默；两个 stepper 在同一 MCU 上都生成 |
 | `extra.rs` / `mod.rs` | 无独立测试（额外轴的检查/排队由 `toolhead.rs` 覆盖） |
 

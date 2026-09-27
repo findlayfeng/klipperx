@@ -7,8 +7,9 @@
 klipperx stress [OPTIONS] <CONFIG_FILE> [MCU]
 ```
 
-- `CONFIG_FILE` 用来取 `[mcu …]`（传输方式）；`--task step` / `--task motion` 还要一个
-  stepper 的 `step_pin` / `dir_pin`；
+- `CONFIG_FILE` 用来取 `[mcu …]`（传输方式）；`--task step` / `--task motion` 还要该板名下
+  带 `step_pin` / `dir_pin` 的 stepper 节（按 `step_pin` 的 chip 归属，同板多个全收；`motion`
+  取第一个可用节）；
 - `MCU` 省略或为空即裸 `[mcu]`；`[mcu zboard]` 要写 `zboard`；
 - `--task`（默认 `step`）选做什么：`step` 压步进生成，`comm` 压主机↔MCU 链路，
   `motion` 跑一遍完整运动链路的真板冒烟；
@@ -21,8 +22,12 @@ klipperx stress [OPTIONS] <CONFIG_FILE> [MCU]
 ## 任务一：步进生成（`--task step`，默认）
 
 负载选自上游的**步进引擎**（`src/stepper.c`）——MCU 的主要工作就是按 `queue_step` 生成步进脉冲。
-工具借用配置里某个 `[stepper_*]` / `[manual_stepper]` 的 step/dir 引脚，用 `ConfigBuilder`
-配置**一个自己的 stepper**（不是那个 section 的 stepper），然后按段加大步频。
+工具按**参加测试的板**收集配置里全部 `step_pin` 归属该板的 `[stepper_*]` / `[manual_stepper]`
+节（归属只看 `step_pin` 的 chip；`enable_pin`/`endstop_pin` 落在别的板不改变归属，stress 本就不读
+它们），用 `ConfigBuilder` 在**同一轮配置**里给每节各配一个自己的压力 stepper（各自 oid——固件
+`finalize_config` 后再握手会 `config_reset` 掉先前配置，故不能逐节握手），同板并发驱动、同一
+ramp 同步下发，然后按段加大步频。`dir_pin` 与 `step_pin` 不同板的节**按节拒绝**（固件口径
+`Stepper dir pin must be on same mcu as step pin`），不拖累同板其它节。
 
 每段的目标是**一段持续、均匀的步频**：
 
@@ -144,6 +149,9 @@ klipperx stress config.cfg --all-mcus --task comm
 失败不阻断其它板，记入汇总）。**所有输出行带 `[<mcu>] ` 前缀**（含单板运行），收尾按板汇总：
 step 打 `last rate it survived`（两条退出路径都打）、comm 打 `last rate it carried`、到顶打
 `no failure up to …`。退出码：任一板**硬错误**（连接/配置失败）→ 1；各板「找到上限」仍算成功。
+`--task step` 时每板驱动其名下**全部** stepper 节（按 `step_pin` 归属）；没有 stepper 节的板打
+`[<mcu>] no stepper section on this MCU; skipping step task` 跳过（不算硬错误），多 stepper 板的段行
+带 `; N steppers` 注记、配置行形如 `configured 2 steppers (oids 0, 1; …)`。
 
 运行时仍是 `worker_threads(2)`（`run()` 处有注释）：阻塞 I/O 走 blocking 池，每板只占
 send/recv 两个后台任务——**双路 ramp 的余量未实测**，出现调度延迟再调。
@@ -160,8 +168,9 @@ send/recv 两个后台任务——**双路 ramp 的余量未实测**，出现调
 
 ## 要求与缺口
 
-- 配置里必须有 `[mcu …]`（或 `[mcu]`）；`--task step` 还要一个带 `step_pin`/`dir_pin` 的 stepper
-  section，没有就直接报错（`--task comm` 不需要）。
+- 配置里必须有 `[mcu …]`（或 `[mcu]`）；`--task step` 还要该板名下带 `step_pin`/`dir_pin` 的
+  stepper section：**显式点名**的板没有 → 直接报错（原文案）；**`--all-mcus` 扫出**的板没有 →
+  打跳过行、不改退出码，全部板都没有才整体报错（`--task comm` 不需要 stepper）。
 - 引脚名支持 `PA0`、`mcu:PA0`、`<chip>:PA0` 和尾随 `!`（忽略）；**别名（`[board_pins]`）还没
   解析**。
 - 压力 stepper 用 `invert_step = 0`、`step_pulse_ticks = 0`；`[stepper_*]` 的 `invert_step` /

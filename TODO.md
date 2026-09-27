@@ -482,10 +482,20 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 - [ ] **Q9 `wait_moves`（FW5d）打印节拍缺失**：上游在运动队列将满时会等待 MCU 追上（`wait_moves`；
       语料另有 `is_fileoutput` 虚拟时钟同款语义），本仓 `motion/toolhead.rs` 文档自述 **FW5d 未实现**
       （2026-09-27 C4 侦察发现）——G-Code 可瞬间把整段运动灌进 trapq，print horizon 相对
-      `estimated_clock` 无界。后果分两层：① fake 环境靠 simulator 虚拟时钟兑住（C4 已批
-      `simulator.rs` 随执行推进合成时钟）；② **真机**上 C4 的 min/req 闸会以「压队=背压」形态工作
+      `estimated_clock` 无界。后果分两层：① fake 环境最终以「`test:` 传输放行两道闸」解（探针实证
+      闸会退化为墙钟串行；早先批过的 simulator 跳钟方案已撤销，见 `eeb0e79`）；② **真机**上 C4 的 min/req 闸会以「压队=背压」形态工作
       （放行速度由固件消费决定，上游同款），但宿主侧没有上游的节拍保护。**R8 真机观察点**：
       长 gcode 连灌时 print horizon 与压队深度。实现 wait_moves 属独立工单（上游正解），不阻塞 C4。
+
+- [ ] **Q10 模拟设备的步进时序模型（两会话固件链）**：C5 案（接管已配置固件缺 `reset_step_clock`
+      → 首拍截止期 `(leftover + first) mod 2³²` 落过去 = `Timer too close`、落未来 = 迟启最高 29.6 s
+      且 `pos` 掩盖）暴露的测试缺口——现有假设备（FrameMock / SimulatorDevice / 语料）**都不维护
+      `next_step_time` 链、不做 `timer_is_before` 回绕**，且语料每例全新实例，永久复现不了
+      「同一假固件跨两次宿主会话」的状态；目前只能靠契约测试（复用分支必含 `reset_step_clock`，
+      已在 C5 补）+ 真机样本矩阵定界。方案：`SimulatorDevice` 加最小时序模型（per-oid
+      `next_step_clock`、`reset_step_clock` 重锚、过期置错）+ 两会话单测（**修复前代码在此转红**）。
+      **已排期**：B6/C5 合并、scout 逐句 C 对照（其 `timer_is_before`/首拍时基语义直接用于建模）
+      之后执行；原则：真机定案、假件固化。
 
 - [~] **Q8 GCodeIO（伪 tty / OctoPrint 串口仿真）补不补**：**已定（2026-09-21）：暂不实现**，
       归档为将来可选项，等需要时再操作。纯 API 主机（Moonraker）不需要它；代价是

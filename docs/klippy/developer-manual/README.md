@@ -174,7 +174,7 @@ klipperx（bin，src/main.rs）
 | `gpio.rs` | `config_digital_out` / `update_digital_out` / `queue_digital_out` / `set_digital_out_pwm_cycle`：数字输出与软件 PWM 周期（固件 `gpiocmds.c`） |
 | `pwm.rs` | `config_pwm_out` / `queue_pwm_out`：硬件 PWM（固件 `pwmcmds.c`） |
 | `adc.rs` | `config_analog_in` / `query_analog_in`（新旧两种）与 `analog_in_state`（新旧两种）：ADC 周期采样（固件 `adccmds.c`） |
-| `stepper.rs` | `config_stepper` / `queue_step` / `reset_step_clock` / `set_next_step_dir` / `stepper_get_position` / `stepper_stop_on_trigger`：步进生成（固件 `stepper.c`） |
+| `stepper.rs` | `config_stepper` / `queue_step` / `reset_step_clock` / `set_next_step_dir` / `stepper_get_position` / `stepper_stop_on_trigger`：步进生成（固件 `stepper.c`）；**配置期/接管期经 restart 列表补 `reset_step_clock clock=0` 重锚固件步进链**（上游 `stepper.py:117-118` `on_restart=True`，新配置与复用两分支 `mcu.py:1014/1069` 均下发——C5 案的修复点） |
 | `endstop.rs` | `config_endstop` / `endstop_home` / `endstop_query_state`：归零期的固件侧限位（固件 `endstop.c`） |
 | `trsync.rs` | `config_trsync` / `trsync_start` / `trsync_set_timeout` / `trsync_trigger`：触发组——多个步进器同时停（固件 `trsync.c`，回零的停止机制） |
 | `trigger_analog.rs` | `config_trigger_analog` / `trigger_analog_set_raw_range` / `trigger_analog_set_trigger` / `trigger_analog_home` / `trigger_analog_query_state` 与响应 `trigger_analog_state`：探针式触发（固件 `trigger_analog.c`，配合 `sos_filter.c`） |

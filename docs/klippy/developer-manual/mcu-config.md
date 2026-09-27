@@ -29,7 +29,7 @@ oid_count = count;
 | 列表 | 什么时候发 | 作用 | 例子 |
 |---|---|---|---|
 | `config` | 只有固件不是这份 CRC 时才发 | 建立对象 | `config_digital_out`、`config_spi`、`finalize_config` |
-| `restart` | 每次连接都发 | 恢复起始值 | `update_digital_out`（上电默认电平） |
+| `restart` | 每次连接都发 | 恢复起始值 | `update_digital_out`（上电默认电平）、**每步进一条 `reset_step_clock oid clock=0`**（接管已配置固件时重锚步进链——C5 案：不发则首拍截止期 `(leftover + interval) mod 2³²` 落过去 = `Timer too close`、落未来 = 迟启） |
 | `init` | 每次连接都发，在其它之后 | 武装周期查询、启动时传输 | 周期 `query_analog_in`、启动 SPI 写 |
 
 `build` 的过程是：
@@ -118,6 +118,9 @@ oid 的**分配顺序 = 对象创建顺序 = config 里的顺序**，因此配�
    - `!is_config`：设备未配置（新上电，或刚被复位）→ 发 `config` 列表 + `init`；
    - `is_config && crc == 主机值`：设备上留的正是这份配置 → 只发 `restart` + `init`；
    - `is_config && crc != 主机值`：设备上是另一份配置 → 先复位（优先 `reset` + 重连，没有才 `config_reset` 就地；见 [CRC 一节](#crc我们与上游算的不是同一样东西)），再发 `config` + `init`。
+
+   注意 `restart` 列表里含**每步进一条 `reset_step_clock oid clock=0`**（上表）——复用分支靠它把固件步进链
+   基址归零，与上游 `mcu.py:1069`（`_restart_cmds + _init_cmds`）同构；新配置分支本就由 `oid_alloc` 清零。
 
 固件**不重算、也不校验**这个值，只是原样存取（`src/basecmd.c:256` `:248`）。它是主机的缓存键：命中省掉一次配置下发，未命中就必须复位重配（配置期已由 `finalize_config` 锁住，不能就地重发）。因此它只需满足两条：
 

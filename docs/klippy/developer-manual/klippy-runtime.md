@@ -215,7 +215,9 @@ stepcompress                           压缩为 queue_step(interval,count,add)
       │
       ▼
 MotionQueuing（定时器）                 决定何时 flush
-      │                                 （时机依据 ClockSync.estimated_print_time）
+      │                                 （时机依据**实时** `ClockSync.estimated_print_time`——C5 起打底现取 est（connect 快照已废），
+       且 `wait_moves`/`dwell`/`flush_step_generation` 后回 NeedPrime 重打底，对齐
+       `toolhead.py:260-268/299-307/310-317`）
       ▼
 固件
 ```

@@ -182,6 +182,13 @@ impl ToolHead {
         self.print_time
     }
 
+    /// The live estimate of the print time *now* — `_flush_handler`'s
+    /// `est_print_time` (`extras/motion_queuing.py:193,196`), read fresh from
+    /// the injected source (see [`EstimatedPrintTime`]), never cached.
+    pub fn estimated_print_time(&self) -> f64 {
+        self.estimated_print_time.get()
+    }
+
     /// The trapezoid queue the kinematic move is appended to.
     pub fn trapq(&self) -> &Trapq {
         self.motion_queuing.trapq(self.main_trapq)

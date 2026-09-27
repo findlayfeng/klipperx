@@ -252,7 +252,8 @@ connect_file(输出文件, 字典):
 - 用 `identify` 分块下发 zlib 压缩后的字典（最后一块为空，与真固件一致）；
 - 在 `finalize_config crc=%u` 记下 CRC，之后把 `get_config` 报为已配置；
 - 用单调计数器回答 `get_clock` / `get_uptime`；
-- 对每个收到的块回一个同序号的空载荷 ack，推进主机的发送窗口。
+- 对每个收到的块回一个同序号的空载荷 ack，推进主机的发送窗口；
+- 按 `config_stepper` / `queue_step` / `reset_step_clock` 维护 **per-oid 固件步进链**并做 `timer_is_before` u32 回绕判定：首拍落过去 → 以字典 `static_string_id` 发 `Timer too close` shutdown 帧（Q10/C5 的两会话复现，修复缺失 `reset_step_clock` 重锚的宿主在此转红）；传感器 attach 后 monitor 窗由固件侧样本续命（样本不走线上，窗口只在采样真断时才过期）。
 
 harness 把每个 `[mcu]` / `[mcu <name>]` 的传输键换成 `test: dict=<字典路径>`，主机因此走它的
 正常路径（identify、配置握手、时钟、消息序号），而不是一条生产不存在的分支。

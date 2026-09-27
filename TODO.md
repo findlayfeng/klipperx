@@ -487,15 +487,17 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
       （放行速度由固件消费决定，上游同款），但宿主侧没有上游的节拍保护。**R8 真机观察点**：
       长 gcode 连灌时 print horizon 与压队深度。实现 wait_moves 属独立工单（上游正解），不阻塞 C4。
 
-- [ ] **Q10 模拟设备的步进时序模型（两会话固件链）**：C5 案（接管已配置固件缺 `reset_step_clock`
-      → 首拍截止期 `(leftover + first) mod 2³²` 落过去 = `Timer too close`、落未来 = 迟启最高 29.6 s
-      且 `pos` 掩盖）暴露的测试缺口——现有假设备（FrameMock / SimulatorDevice / 语料）**都不维护
-      `next_step_time` 链、不做 `timer_is_before` 回绕**，且语料每例全新实例，永久复现不了
-      「同一假固件跨两次宿主会话」的状态；目前只能靠契约测试（复用分支必含 `reset_step_clock`，
-      已在 C5 补）+ 真机样本矩阵定界。方案：`SimulatorDevice` 加最小时序模型（per-oid
-      `next_step_clock`、`reset_step_clock` 重锚、过期置错）+ 两会话单测（**修复前代码在此转红**）。
-      **已排期**：B6/C5 合并、scout 逐句 C 对照（其 `timer_is_before`/首拍时基语义直接用于建模）
-      之后执行；原则：真机定案、假件固化。
+- [x] **Q10 模拟设备的步进时序模型（两会话固件链）——已完成（2026-09-27，`agents/feat-simulator-step-timing`）**：
+      `SimulatorDevice` 落 per-oid `StepChain`（`config_stepper` 归零、`queue_step` 空闲首拍/忙延展/
+      首拍过期三态、`reset_step_clock` 忙拒+重锚）、`timer_is_before` u32 回绕（含 2³¹ 假阳边界），
+      过期/忙拒经字典 `static_string_id` 发 shutdown 帧并置 `get_config is_shutdown`；5 条单测（两会话
+      红/绿对）+ 转红实证（剪过期判定恰红 2 条）。配套：宿主生成地上游 BGFLUSH 地平线（est+0.4/0.7 s
+      出生垫——同修语料两类 `Timer too close`：管线迟打戳与半回绕越界）、假件时钟定为纯墙钟（早先
+      跳钟方案撤销）、monitor 窗改由固件侧样本续命（`eddy.test`）。语料 `KLIPPERX_UPSTREAM_ALL=1`
+      237/0、workspace 2052+ 全绿。**原任务书**（存档）：C5 案暴露的测试缺口——当时假设备（FrameMock /
+      SimulatorDevice / 语料）都不维护 `next_step_time` 链、不做 `timer_is_before` 回绕，且语料每例全新
+      实例，复现不了「同一假固件跨两次宿主会话」；方案即上述最小时序模型 + 两会话单测（修复前代码转红），
+      原则：真机定案、假件固化。
 
 - [~] **Q8 GCodeIO（伪 tty / OctoPrint 串口仿真）补不补**：**已定（2026-09-21）：暂不实现**，
       归档为将来可选项，等需要时再操作。纯 API 主机（Moonraker）不需要它；代价是

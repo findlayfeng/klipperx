@@ -218,6 +218,9 @@ MotionQueuing（定时器）                 决定何时 flush
       │                                 （时机依据**实时** `ClockSync.estimated_print_time`——C5 起打底现取 est（connect 快照已废），
        且 `wait_moves`/`dwell`/`flush_step_generation` 后回 NeedPrime 重打底，对齐
        `toolhead.py:260-268/299-307/310-317`）
+      │                                 （生成带上游 BGFLUSH **地平线**：后台每 10 ms 只生成到 est+0.4 s、
+       有积压时 est+0.7 s（0.25 s 批窗）——步在到期前 ~0.4 s 出生，出生垫吸收管线延迟，
+       戳顶封在 u32 半回绕内；`extras/toolhead.rs::horizon` 对 `motion_queuing.py:9-12/196-215`）
       ▼
 固件
 ```

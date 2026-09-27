@@ -137,11 +137,212 @@ use tracing::{debug, error, info, warn};
 enum SendItem {
     /// A message to append to the current batch.
     Payload(Payload),
+    /// A message carrying scheduling gates (see [`SendClocks`]).
+    Clocked(Payload, SendClocks),
     /// Send whatever is queued so far, then signal completion.
     Flush(oneshot::Sender<()>),
     /// Adopt the sequence the firmware last reported and signal completion
     /// (see [`Mcu::renumber_to_firmware`]).
     Renumber(oneshot::Sender<()>),
+}
+
+/// The scheduling gates a message carries: upstream's `min_clock`/`req_clock`,
+/// the two numbers `serialqueue_send` stamps on every queued message
+/// (`serialqueue.c:939-944`). Both are firmware clock ticks of this MCU.
+///
+/// * `min_clock` — **not before**: the send task parks the message until the
+///   estimated clock reaches it (`serialqueue.c:556`, where `ack_clock <
+///   qm->min_clock` keeps a message out of the ready queues).
+/// * `req_clock` — **not later than / priority**: the message wants to be on
+///   the wire by `req_clock` with [`MIN_REQTIME_DELTA`] of lead. It is
+///   released as soon as `req_clock <= ack_clock + MIN_REQTIME_DELTA`
+///   (`PR_NOW`, `serialqueue.c:644-646`), and among the messages the gates
+///   release the **lowest** `req_clock` goes first (`serialqueue.c:478-486`,
+///   "highest priority message").
+///
+/// A message with neither gate — the configuration phase, the g-code class
+/// sends — never waits: there is no gate to check, and its `req_clock` reads
+/// as 0, upstream's default for `send(data)` (`mcu.py:101`). So among ungated
+/// messages every key ties and the pick falls back to queue order, byte for
+/// byte the batching this task did before the gates existed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct SendClocks {
+    /// Hold until the estimated clock is at or past this.
+    pub min_clock: Option<u64>,
+    /// Send by this clock — this window before it, and behind any lower one.
+    pub req_clock: Option<u64>,
+}
+
+/// How long before its `req_clock` a gated message wants to be on the wire.
+///
+/// Upstream's `MIN_REQTIME_DELTA` (`serialqueue.c:110`): a message whose
+/// `req_clock` is inside this window of the estimated clock sends now
+/// (`PR_NOW`) instead of waiting for the clock to climb to it.
+const MIN_REQTIME_DELTA: f64 = 0.100;
+
+/// How long the send task sleeps at a time while a gated message is parked.
+///
+/// The gates are judged against an estimate that can be re-anchored
+/// ([`Mcu::set_clock_base`], on connect and in tests) *while* a message waits;
+/// one sleep computed from the old anchor would outlive the new one. Slicing
+/// the wait costs nothing — the task is parked either way — and bounds how
+/// long a re-anchored clock goes unnoticed.
+const GATE_REPOLL_MAX: Duration = Duration::from_millis(10);
+
+/// A message waiting on its gates in the send task, or a flush barrier queued
+/// behind such messages. The send task owns this list; nothing else sees it.
+enum Parked {
+    Payload(Payload, SendClocks),
+    /// [`Mcu::flush`] behind parked messages: everything queued ahead of the
+    /// barrier includes the parked messages, so the barrier waits with them.
+    Flush(oneshot::Sender<()>),
+}
+
+impl Parked {
+    fn is_flush(&self) -> bool {
+        matches!(self, Self::Flush(_))
+    }
+
+    fn clocks(&self) -> SendClocks {
+        match self {
+            Self::Payload(_, clocks) => *clocks,
+            Self::Flush(_) => SendClocks::default(),
+        }
+    }
+}
+
+/// "Now" as the gates see it: the estimated firmware clock, plus
+/// [`MIN_REQTIME_DELTA`] already converted to ticks of that clock.
+struct GateNow {
+    clock: u64,
+    req_lead: u64,
+}
+
+impl SendClocks {
+    /// Whether both gates allow this message onto the wire at `now`.
+    ///
+    /// `now = None` — no clock estimate or no `CLOCK_FREQ` yet — opens both
+    /// gates: upstream does the same while its clock is still unknown
+    /// (`serialqueue.c:612-618`, "Clock unknown during initial startup ...
+    /// return PR_NOW").
+    fn released(&self, now: Option<&GateNow>) -> bool {
+        let Some(now) = now else {
+            return true;
+        };
+        if let Some(min_clock) = self.min_clock {
+            if now.clock < min_clock {
+                return false;
+            }
+        }
+        if let Some(req_clock) = self.req_clock {
+            if req_clock > now.clock + now.req_lead {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// The clock the send task's gates are judged against: this connection's
+/// estimate and dictionary, shared with [`Mcu`] — the two halves
+/// [`Mcu::estimated_clock`] reads, as one cloneable handle (the send task
+/// cannot borrow the `Mcu` that is being built around it).
+#[derive(Clone)]
+struct GateClock {
+    estimate: Arc<StdMutex<Option<ClockEstimate>>>,
+    dictionary: Arc<StdMutex<Option<Arc<Dictionary>>>>,
+}
+
+impl GateClock {
+    /// The installed dictionary's nominal `CLOCK_FREQ`, if a dictionary is in.
+    fn freq(&self) -> Option<f64> {
+        self.dictionary
+            .lock()
+            .expect("dictionary lock poisoned")
+            .as_ref()?
+            .constant_f64("CLOCK_FREQ")
+    }
+
+    /// The firmware clock, extrapolated — [`Mcu::estimated_clock`] answered
+    /// from the shared state.
+    fn estimated_clock(&self) -> Option<u64> {
+        let freq = self.freq()?;
+        let estimate = self
+            .estimate
+            .lock()
+            .expect("clock estimate lock poisoned")
+            .clone()?;
+        Some(estimate.clock_at(Instant::now(), freq))
+    }
+
+    /// The gates' "now": the estimated clock and the req lead in ticks.
+    fn now(&self) -> Option<GateNow> {
+        let clock = self.estimated_clock()?;
+        let req_lead = (MIN_REQTIME_DELTA * self.freq()?) as u64;
+        Some(GateNow { clock, req_lead })
+    }
+}
+
+/// Take the next message the gates allow onto the wire: the **lowest**
+/// `req_clock` among the released ones, queue order on ties — this is
+/// `build_and_send_command` picking the "highest priority message"
+/// (`serialqueue.c:478-486`) — and never past a flush barrier.
+fn take_released(parked: &mut VecDeque<Parked>, now: Option<&GateNow>) -> Option<Payload> {
+    // Only the run before the first barrier may be picked; a barrier is a
+    // boundary for everything queued behind it.
+    let selectable = parked.iter().take_while(|item| !item.is_flush()).count();
+    let (index, _) = parked
+        .iter()
+        .enumerate()
+        .take(selectable)
+        .filter(|(_, item)| item.clocks().released(now))
+        .min_by_key(|(index, item)| (item.clocks().req_clock.unwrap_or(0), *index))?;
+    match parked.remove(index) {
+        Some(Parked::Payload(payload, _)) => Some(payload),
+        // Unreachable: `index` came from the prefix before any barrier.
+        Some(Parked::Flush(done)) => {
+            parked.insert(index, Parked::Flush(done));
+            None
+        }
+        None => None,
+    }
+}
+
+/// When the send task should next look at the parked gates: the earliest
+/// instant any parked message opens, sliced at [`GATE_REPOLL_MAX`].
+///
+/// A message opens at the **later** of its two gates (both have to pass), and
+/// the list at the earliest of its messages. `None` when nothing is parked or
+/// the clock cannot judge it — released messages are already picked by
+/// [`take_released`] before this is asked.
+fn gate_wake(parked: &VecDeque<Parked>, gate: &GateClock) -> Option<tokio::time::Instant> {
+    let now = gate.now()?;
+    let freq = gate.freq()?;
+    let mut earliest: Option<u64> = None;
+    for item in parked {
+        let Parked::Payload(_, clocks) = item else {
+            continue;
+        };
+        let mut wait: Option<u64> = None;
+        if let Some(min_clock) = clocks.min_clock {
+            if now.clock < min_clock {
+                wait = Some(min_clock - now.clock);
+            }
+        }
+        if let Some(req_clock) = clocks.req_clock {
+            let due = req_clock.saturating_sub(now.req_lead);
+            if now.clock < due {
+                let wait_req = due - now.clock;
+                wait = Some(wait.map_or(wait_req, |wait| wait.max(wait_req)));
+            }
+        }
+        if let Some(wait) = wait {
+            earliest = Some(earliest.map_or(wait, |earliest| earliest.min(wait)));
+        }
+    }
+    let ticks = earliest?;
+    let until = Duration::from_secs_f64(ticks as f64 / freq);
+    Some(tokio::time::Instant::now() + until.min(GATE_REPOLL_MAX))
 }
 
 /// Queue `item` for the send task, waiting a bounded time for room.
@@ -209,8 +410,9 @@ pub struct Mcu {
     ///
     /// Protected by a plain mutex rather than an async one: it is only read and
     /// written in short, non-awaiting critical sections, and `send_msg` needs to
-    /// check it from a synchronous context.
-    dictionary: StdMutex<Option<Arc<Dictionary>>>,
+    /// check it from a synchronous context. Shared with the send task
+    /// ([`GateClock`]), whose gates need the dictionary's `CLOCK_FREQ`.
+    dictionary: Arc<StdMutex<Option<Arc<Dictionary>>>>,
     /// Sender for the outbound queue: messages and flush barriers.
     send_buf_tx: mpsc::Sender<SendItem>,
     /// Pending synchronous calls waiting for responses.
@@ -237,8 +439,9 @@ pub struct Mcu {
     /// The stateful estimate of the firmware's free-running clock: clock
     /// round-trip samples folded in, an anchor plus a fitted rate read out.
     /// See [`Mcu::estimated_clock`] and [`ClockEstimate`]; `None` until
-    /// something seeds it (the MCU object does, right after identify).
-    clock_estimate: StdMutex<Option<ClockEstimate>>,
+    /// something seeds it (the MCU object does, right after identify). Shared
+    /// with the send task ([`GateClock`]), whose gates read it.
+    clock_estimate: Arc<StdMutex<Option<ClockEstimate>>>,
     /// Handle to the receive task, used to abort it on drop.
     recv_handle: Option<tokio::task::JoinHandle<()>>,
 }
@@ -1091,46 +1294,80 @@ impl Mcu {
         let (acks_tx, mut acks_rx) = watch::channel(0u64);
         let interface_for_send = interface.clone();
         let wire_for_send = Arc::clone(&wire);
+        // Shared with the send task as one handle: its gates judge a message's
+        // min/req clocks against the same estimate `Mcu::estimated_clock` reads
+        // (`GateClock`). The dictionary is not installed yet when the task
+        // starts — the gates treat that as "clock unknown", which is upstream's
+        // `PR_NOW` (`serialqueue.c:612-618`).
+        let dictionary = Arc::new(StdMutex::new(None));
+        let clock_estimate = Arc::new(StdMutex::new(None));
+        let gate_clock = GateClock {
+            estimate: Arc::clone(&clock_estimate),
+            dictionary: Arc::clone(&dictionary),
+        };
 
         handle.spawn(async move {
             let mut sender = Sender::new(Arc::clone(&wire_for_send));
+            // What the two gates hold back: messages not released yet, and
+            // flush barriers queued behind them (`Parked`).
+            let mut parked: VecDeque<Parked> = VecDeque::new();
 
-            loop {
-                // Wait for the first message of a batch — or for the firmware's
-                // counter to move, which is what asks for a block to go out again.
-                // A flush with nothing queued before it is already satisfied.
-                let mut payload = {
+            'outer: loop {
+                // Wait for the first message the gates release — or for the
+                // firmware's counter to move, which is what asks for a block to
+                // go out again. A flush with nothing queued before it is
+                // already satisfied; a flush behind parked messages waits with
+                // them.
+                let mut payload = loop {
+                    if let Some(first) = take_released(&mut parked, gate_clock.now().as_ref()) {
+                        break first;
+                    }
+                    if matches!(parked.front(), Some(Parked::Flush(_))) {
+                        if let Some(Parked::Flush(done)) = parked.pop_front() {
+                            let _ = done.send(());
+                        }
+                        continue;
+                    }
+                    let wake = gate_wake(&parked, &gate_clock);
+                    let wake_at = wake.unwrap_or_else(tokio::time::Instant::now);
                     let deadline = sender.retransmit_deadline();
                     let when = deadline.unwrap_or_else(|| tokio::time::Instant::now() + MAX_RTO);
                     tokio::select! {
                         item = send_buf_rx.recv() => match item {
-                            Some(SendItem::Payload(p)) => p,
+                            Some(SendItem::Payload(p)) => {
+                                parked.push_back(Parked::Payload(p, SendClocks::default()));
+                            }
+                            Some(SendItem::Clocked(p, clocks)) => {
+                                parked.push_back(Parked::Payload(p, clocks));
+                            }
                             Some(SendItem::Flush(done)) => {
-                                let _ = done.send(());
-                                continue;
+                                if parked.is_empty() {
+                                    let _ = done.send(());
+                                } else {
+                                    parked.push_back(Parked::Flush(done));
+                                }
                             }
                             Some(SendItem::Renumber(applied)) => {
                                 sender.renumber_to_firmware();
                                 let _ = applied.send(());
-                                continue;
                             }
-                            None => break, // channel closed
+                            None => break 'outer, // channel closed
                         },
                         changed = acks_rx.changed() => {
                             if changed.is_err() {
-                                break; // receive task gone: the device is shutting down
+                                break 'outer; // receive task gone: the device is shutting down
                             }
                             let seen = *acks_rx.borrow_and_update();
                             sender.settle(&interface_for_send, seen).await;
-                            continue;
                         }
                         // Unanswered blocks are put back on the wire rather than
                         // waiting for the firmware to speak: a block that never
                         // arrived leaves it waiting silently (`serialqueue.c`).
                         _ = tokio::time::sleep_until(when), if deadline.is_some() => {
                             sender.retransmit(&interface_for_send).await;
-                            continue;
                         }
+                        // A parked gate coming due.
+                        _ = tokio::time::sleep_until(wake_at), if wake.is_some() => {}
                     }
                 };
 
@@ -1143,25 +1380,51 @@ impl Mcu {
                         break;
                     }
 
-                    // Wait for more data, a flush, an ack, or a short idle timeout.
+                    // The next released message — lowest `req_clock` first,
+                    // never past a flush barrier.
+                    if let Some(next) = take_released(&mut parked, gate_clock.now().as_ref()) {
+                        if payload.try_merge(&next).is_err() {
+                            // Merge failed (would exceed max), send current batch first
+                            sender
+                                .send_block(&interface_for_send, payload.into_raw())
+                                .await;
+                            // Start new batch with next
+                            payload = next;
+                        }
+                        continue;
+                    }
+                    // A barrier the gates have let through: send this batch,
+                    // then signal it (`Mcu::flush`).
+                    if matches!(parked.front(), Some(Parked::Flush(_))) {
+                        if let Some(Parked::Flush(done)) = parked.pop_front() {
+                            flush_done = Some(done);
+                        }
+                        break;
+                    }
+
+                    // Wait for more data, a flush, an ack, a gate, or a short idle timeout.
+                    let wake = gate_wake(&parked, &gate_clock);
+                    let wake_at = wake.unwrap_or_else(tokio::time::Instant::now);
                     tokio::select! {
                         maybe_next = send_buf_rx.recv() => {
                             match maybe_next {
                                 Some(SendItem::Payload(next_payload)) => {
-                                    if payload.try_merge(&next_payload).is_err() {
-                                        // Merge failed (would exceed max), send current batch first
-                                        sender
-                                            .send_block(&interface_for_send, payload.into_raw())
-                                            .await;
-                                        // Start new batch with next
-                                        payload = next_payload;
-                                        continue;
-                                    }
+                                    parked.push_back(Parked::Payload(
+                                        next_payload,
+                                        SendClocks::default(),
+                                    ));
+                                }
+                                Some(SendItem::Clocked(next_payload, clocks)) => {
+                                    parked.push_back(Parked::Payload(next_payload, clocks));
                                 }
                                 Some(SendItem::Flush(done)) => {
-                                    // Boundary requested: send this batch now.
-                                    flush_done = Some(done);
-                                    break;
+                                    if parked.is_empty() {
+                                        // Boundary requested with nothing parked
+                                        // ahead of it: send this batch now.
+                                        flush_done = Some(done);
+                                        break;
+                                    }
+                                    parked.push_back(Parked::Flush(done));
                                 }
                                 Some(SendItem::Renumber(applied)) => {
                                     // Applied to the window; a batch already being
@@ -1187,6 +1450,7 @@ impl Mcu {
                             // Timeout, send accumulated batch
                             break;
                         }
+                        _ = tokio::time::sleep_until(wake_at), if wake.is_some() => {}
                     }
                 }
 
@@ -1355,14 +1619,14 @@ impl Mcu {
             name,
             parser,
             events,
-            dictionary: StdMutex::new(None),
+            dictionary,
             send_buf_tx,
             pending_calls,
             interface,
             handle,
             wire,
             identified: Arc::clone(&identified),
-            clock_estimate: StdMutex::new(None),
+            clock_estimate,
             recv_handle: Some(recv_handle),
         }
     }
@@ -1601,13 +1865,16 @@ impl Mcu {
     /// that, which is exactly what the old single-point snapshot answered
     /// after a seed with no round trips behind it.
     pub fn estimated_clock(&self) -> Option<u64> {
-        let estimate = self
-            .clock_estimate
-            .lock()
-            .expect("clock estimate lock poisoned")
-            .clone()?;
-        let nominal_freq = self.clock_freq().ok()?;
-        Some(estimate.clock_at(Instant::now(), nominal_freq))
+        self.gate_clock().estimated_clock()
+    }
+
+    /// The clock handle the send task judges its gates with: this MCU's
+    /// estimate and dictionary, shared (`GateClock`).
+    fn gate_clock(&self) -> GateClock {
+        GateClock {
+            estimate: Arc::clone(&self.clock_estimate),
+            dictionary: Arc::clone(&self.dictionary),
+        }
     }
 
     /// Encode a command without sending it.
@@ -1656,7 +1923,25 @@ impl Mcu {
     /// don't match the expected parameter count, the send task has gone away,
     /// or the send buffer stayed full for the whole wait.
     pub fn send(&self, name: &str, args: &[ArgValue]) -> Result<(), MsgError> {
-        self.enqueue(name, args, None)
+        self.enqueue(name, args, None, SendClocks::default())
+    }
+
+    /// [`Mcu::send`] with scheduling gates ([`SendClocks`]).
+    ///
+    /// The gates are enforced by the send task, not here: this only stamps
+    /// them on the message so `min`/`req` ordering and release happen where the
+    /// wire is (`serialqueue.c`'s two gate checks). A message with no gates is
+    /// indistinguishable from [`Mcu::send`].
+    ///
+    /// # Errors
+    /// As [`Mcu::send`].
+    pub(crate) fn send_with_clocks(
+        &self,
+        name: &str,
+        args: &[ArgValue],
+        clocks: SendClocks,
+    ) -> Result<(), MsgError> {
+        self.enqueue(name, args, None, clocks)
     }
 
     /// The body of [`Mcu::send`], plus what the caller will be waiting for.
@@ -1668,11 +1953,15 @@ impl Mcu {
     /// A queue that is still full when [`try_send_bounded`] gives up is
     /// reported with the command and the level it was full at: the bare
     /// `no available capacity` says nothing about which burst spent the queue.
+    ///
+    /// `clocks` are the message's scheduling gates ([`SendClocks`]); callers
+    /// that do not gate use [`Mcu::send`] and never attach them.
     fn enqueue(
         &self,
         name: &str,
         args: &[ArgValue],
         waiting_for: Option<&str>,
+        clocks: SendClocks,
     ) -> Result<(), MsgError> {
         let payload = self.parser.encode(name, args)?;
         match waiting_for {
@@ -1682,7 +1971,15 @@ impl Mcu {
             ),
             None => debug!("send {}", self.describe_command(name, args)),
         }
-        try_send_bounded(&self.send_buf_tx, SendItem::Payload(payload)).map_err(|e| {
+        // An ungated message stays on the plain variant: the gate path treats
+        // the two the same (`SendClocks::default()` is released on sight), and
+        // keeping the existing variant keeps the existing behaviour literal.
+        let item = if clocks == SendClocks::default() {
+            SendItem::Payload(payload)
+        } else {
+            SendItem::Clocked(payload, clocks)
+        };
+        try_send_bounded(&self.send_buf_tx, item).map_err(|e| {
             let level = match &e {
                 TrySendError::Full(_) => format!(
                     " (send queue {} of {SEND_QUEUE_CAPACITY} slots in use)",
@@ -1823,7 +2120,7 @@ impl Mcu {
             .await;
 
         // 4. Send the command. Its line names the response it is waiting for.
-        if let Err(e) = self.enqueue(command, args, Some(response_name)) {
+        if let Err(e) = self.enqueue(command, args, Some(response_name), SendClocks::default()) {
             warn!("Failed to send command '{}': {e}", command);
             // Clean up the pending call on send failure.
             self.pending_calls.cancel(response_name).await;
@@ -1931,7 +2228,9 @@ mod tests {
     use crate::core::klippy::cmd::clock::{ClockSync, McuClock};
     use crate::core::klippy::cmd::identify::IDENTIFY_CHUNK_SIZE;
     use crate::core::klippy::identify::Identify;
-    use crate::core::klippy::interface::devices::frame_mock::{FrameMock, MappingEntry};
+    use crate::core::klippy::interface::devices::frame_mock::{
+        FrameMock, FrameRecorder, MappingEntry,
+    };
     use crate::core::klippy::interface::devices::serial::DEFAULT_BAUD;
     use crate::core::klippy::interface::Interface;
     use crate::core::klippy::reactor::ManualReactor;
@@ -3140,6 +3439,227 @@ mod tests {
         mcu.flush(Duration::from_millis(500)).await.unwrap();
 
         assert!(recorder.frames().is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Scheduling gates: min_clock / req_clock (`SendClocks`)
+    // -----------------------------------------------------------------------
+
+    /// A dictionary the gate tests run against: four no-argument commands
+    /// whose id is the whole message on the wire — so counting id bytes in
+    /// the recorded frames counts messages, whatever block they landed in —
+    /// plus the `CLOCK_FREQ` the gates judge time by.
+    fn gate_dictionary() -> Dictionary {
+        Dictionary::from_json(serde_json::json!({
+            "commands": {
+                "get_clock": 5,
+                "config_reset": 6,
+                "emergency_stop": 7,
+                "debug_nop": 8
+            },
+            "config": {"CLOCK_FREQ": 16000000}
+        }))
+        .unwrap()
+    }
+
+    /// One block as the test expects it: the frame at sequence `seq`, and the
+    /// empty ack that reports the **next** sequence — the number a firmware
+    /// says when it took the block, and the one `Sender::settle` drains on
+    /// (`block.seq < seen`).
+    fn gate_block(seq: u8, payload: &[u8]) -> MappingEntry {
+        MappingEntry {
+            input: make_frame(seq, payload),
+            outputs: vec![make_frame((seq + 1) & 0x0f, &[])],
+        }
+    }
+
+    /// A transport with the gate dictionary installed and the estimate seeded
+    /// at `base` — the clock every gate test starts from.
+    fn gate_mcu(entries: Vec<MappingEntry>, base: u64) -> (Mcu, FrameRecorder) {
+        let device = FrameMock::new(entries);
+        let recorder = device.recorder();
+        let mcu = Mcu::for_test("test_mcu", Interface::new(device));
+        mcu.install_dictionary(gate_dictionary()).unwrap();
+        mcu.set_clock_base(base);
+        (mcu, recorder)
+    }
+
+    /// How often `id` went out — the gate messages carry their id as their
+    /// whole payload, so this counts messages rather than blocks.
+    fn sent_count(recorder: &FrameRecorder, id: u8) -> usize {
+        recorder
+            .frames()
+            .iter()
+            .map(|frame| frame.payload().iter().filter(|&&byte| byte == id).count())
+            .sum()
+    }
+
+    /// ① The `min_clock` floor: a message parked on a release clock in the
+    /// future does not reach the wire before it, and does once the clock gets
+    /// there (`serialqueue.c:556`, `ack_clock < min_clock` holds it back).
+    #[tokio::test]
+    async fn test_min_clock_holds_a_message_until_its_release() {
+        const BASE: u64 = 1_000_000;
+        const FREQ: f64 = 16_000_000.0;
+        let release = BASE + (10.0 * FREQ) as u64;
+        // The one block this test allows: `get_clock` (id 5).
+        let (mcu, recorder) = gate_mcu(vec![gate_block(0, &[5])], BASE);
+
+        mcu.send_with_clocks(
+            "get_clock",
+            &[],
+            SendClocks {
+                min_clock: Some(release),
+                req_clock: None,
+            },
+        )
+        .unwrap();
+
+        // The estimate sits 10 s short of the release clock.
+        sleep(Duration::from_millis(60)).await;
+        assert!(
+            recorder.frames().is_empty(),
+            "sent before the min_clock: {:?}",
+            recorder.frames()
+        );
+
+        // Give the clock the 10 s it was short by: `set_clock_base`
+        // re-anchors the estimate, and the parked gate re-polls within
+        // `GATE_REPOLL_MAX`.
+        mcu.set_clock_base(release + 1);
+        sleep(Duration::from_millis(60)).await;
+        assert_eq!(recorder.frames().len(), 1, "not sent at the release clock");
+        assert_eq!(recorder.frames()[0].payload(), &[5]);
+    }
+
+    /// ② `req_clock` priority and the lead window: both messages stay parked
+    /// until the estimate is within `MIN_REQTIME_DELTA` of their `req_clock`
+    /// (`PR_NOW`, `serialqueue.c:644-646`), and then the **lower** `req_clock`
+    /// leads the block (`serialqueue.c:478-486`, "highest priority message").
+    #[tokio::test]
+    async fn test_req_clock_orders_messages_inside_the_lead_window() {
+        const BASE: u64 = 1_000_000;
+        const FREQ: f64 = 16_000_000.0;
+        let req_low = BASE + (10.02 * FREQ) as u64;
+        let req_high = BASE + (10.05 * FREQ) as u64;
+        // One block: `emergency_stop` (7) was queued **second** but carries the
+        // lower req_clock, so it leads the `config_reset` (6) behind it.
+        let (mcu, recorder) = gate_mcu(vec![gate_block(0, &[7, 6])], BASE);
+
+        mcu.send_with_clocks(
+            "config_reset",
+            &[],
+            SendClocks {
+                min_clock: None,
+                req_clock: Some(req_high),
+            },
+        )
+        .unwrap();
+        mcu.send_with_clocks(
+            "emergency_stop",
+            &[],
+            SendClocks {
+                min_clock: None,
+                req_clock: Some(req_low),
+            },
+        )
+        .unwrap();
+
+        // Neither req_clock is within 100 ms of the estimate yet.
+        sleep(Duration::from_millis(60)).await;
+        assert!(
+            recorder.frames().is_empty(),
+            "sent outside the lead window: {:?}",
+            recorder.frames()
+        );
+
+        // Inside the window for both: PR_NOW, lowest req_clock first.
+        mcu.set_clock_base(BASE + (10.1 * FREQ) as u64);
+        sleep(Duration::from_millis(60)).await;
+        let frames = recorder.frames();
+        assert_eq!(frames.len(), 1, "expected one coalesced block: {frames:?}");
+        assert_eq!(
+            frames[0].payload(),
+            &[7, 6],
+            "the higher req_clock went first"
+        );
+    }
+
+    /// ④ Capacity cut-back: a burst that would fill the firmware's move queue
+    /// is cut back to one release per freed slot, instead of all of it going
+    /// at once.
+    ///
+    /// The per-MCU slot pool that computes these floors lands with the pool
+    /// itself; this injects the same arithmetic — the floor for the next move
+    /// is the completion clock `capacity` entries back (`pending[len -
+    /// capacity]`, the entry whose slot frees the space) — so the sender-side
+    /// throttling can be judged on its own.
+    #[tokio::test]
+    async fn test_a_full_move_capacity_releases_one_slot_at_a_time() {
+        const BASE: u64 = 1_000_000;
+        const FREQ: f64 = 16_000_000.0;
+        const CAPACITY: usize = 2;
+        let clock = |seconds: f64| BASE + (seconds * FREQ) as u64;
+        let completions = [clock(10.0), clock(20.0), clock(30.0), clock(40.0)];
+
+        // The injected pool: completion clocks enter in order; the floor is
+        // `None` while the pool has room, and the entry `capacity` places back
+        // once it does not.
+        let mut pending: Vec<u64> = Vec::new();
+        let mut floors = [None, None, None, None];
+        for (slot, &completion) in completions.iter().enumerate() {
+            floors[slot] = (pending.len() >= CAPACITY).then(|| pending[pending.len() - CAPACITY]);
+            pending.push(completion);
+        }
+        assert_eq!(
+            floors,
+            [None, None, Some(completions[0]), Some(completions[1])]
+        );
+
+        // Three blocks: the pair that has room, then one per released slot.
+        let (mcu, recorder) = gate_mcu(
+            vec![
+                gate_block(0, &[5, 6]),
+                gate_block(1, &[7]),
+                gate_block(2, &[8]),
+            ],
+            BASE,
+        );
+        let names = ["get_clock", "config_reset", "emergency_stop", "debug_nop"];
+        for (name, floor) in names.iter().zip(floors) {
+            mcu.send_with_clocks(
+                name,
+                &[],
+                SendClocks {
+                    min_clock: floor,
+                    req_clock: None,
+                },
+            )
+            .unwrap();
+        }
+
+        // The pair with room goes; the two over capacity stay parked.
+        sleep(Duration::from_millis(60)).await;
+        let sent = || [5, 6, 7, 8].map(|id| sent_count(&recorder, id));
+        assert_eq!(
+            sent(),
+            [1, 1, 0, 0],
+            "the over-capacity moves went with the burst"
+        );
+
+        // The first slot's completion: exactly one of the two parked moves
+        // lands, the one whose floor it is.
+        mcu.set_clock_base(completions[0] + 1);
+        sleep(Duration::from_millis(60)).await;
+        assert_eq!(sent(), [1, 1, 1, 0], "the second floor was not honoured");
+
+        mcu.set_clock_base(completions[1] + 1);
+        sleep(Duration::from_millis(60)).await;
+        assert_eq!(
+            sent(),
+            [1, 1, 1, 1],
+            "moves did not release one slot at a time"
+        );
     }
 
     /// An unanswered block goes out again on the retransmit timer, without

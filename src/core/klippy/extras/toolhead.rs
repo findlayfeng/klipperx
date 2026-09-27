@@ -75,7 +75,7 @@ use crate::core::klippy::gcode::{
 use crate::core::klippy::load::section;
 use crate::core::klippy::mathutil::{Coord, X_AXIS, Y_AXIS, Z_AXIS};
 use crate::core::klippy::mcu::{
-    Completion, McuEndstop, McuError, McuObject, McuStepper, TriggerDispatch,
+    Completion, McuEndstop, McuError, McuObject, McuStepper, StepBatchClocks, TriggerDispatch,
 };
 use crate::core::klippy::motion::delta::{
     delta_active_flags, delta_position_fn, DeltaConfig, DeltaKinematics, DELTA_RAIL_NAMES,
@@ -395,8 +395,28 @@ struct Connected {
     last_step_gen_time: f64,
 }
 
-/// The step commands to send, paired with the stepper that produced them.
-type StepBatches = Vec<(Arc<McuStepper>, Vec<StepCommand>)>;
+/// The step commands to send, paired with the stepper that produced them and
+/// the clock window the batch covers (`StepBatchClocks`).
+type StepBatches = Vec<(Arc<McuStepper>, Vec<StepCommand>, StepBatchClocks)>;
+
+/// The clock window one generated batch covers: the two print times in this
+/// stepper's MCU's ticks (`StepBatchClocks`).
+///
+/// No mapping yet — clock 0 for both — is what the send gates read as "send
+/// now", and a 0 completion frees its slots on sight.
+fn step_batch_clocks(
+    stepper: &McuStepper,
+    start_time: f64,
+    completion_time: f64,
+) -> StepBatchClocks {
+    StepBatchClocks {
+        start: stepper.chip().print_time_to_clock(start_time).unwrap_or(0),
+        completion: stepper
+            .chip()
+            .print_time_to_clock(completion_time)
+            .unwrap_or(0),
+    }
+}
 
 impl ToolHeadObject {
     /// Build the object from `[printer]` and the three stepper sections.
@@ -1833,8 +1853,8 @@ async fn run_flush_loop(
                 return;
             }
         };
-        for (stepper, commands) in batches {
-            if let Err(err) = stepper.send_steps_async(&commands).await {
+        for (stepper, commands, clocks) in batches {
+            if let Err(err) = stepper.send_steps_async(&commands, clocks).await {
                 warn!(
                     "{}: {err}",
                     stepper.oid().map(u32::from).unwrap_or_default()
@@ -1866,9 +1886,9 @@ async fn flush_step_generation(state: &Arc<Mutex<Option<Connected>>>) -> Result<
         let batches = connected
             .generate()
             .map_err(|err| CommandError::new(err.to_string()))?;
-        for (stepper, commands) in batches {
+        for (stepper, commands, clocks) in batches {
             stepper
-                .send_steps_async(&commands)
+                .send_steps_async(&commands, clocks)
                 .await
                 .map_err(command_error)?;
         }
@@ -1899,6 +1919,10 @@ impl Connected {
         // step generation time below covers it.
         self.toolhead.wait_moves();
         let step_gen_time = self.toolhead.print_time().max(self.last_step_gen_time);
+        // The previous generation horizon is this batch's start: a lower
+        // bound on when its first step runs, and what its messages carry as
+        // `req_clock` (`StepBatchClocks`).
+        let start_time = self.last_step_gen_time;
         let batches = self.toolhead.flush_step_generation(step_gen_time)?;
         self.toolhead.finalize_moves(
             step_gen_time,
@@ -1908,9 +1932,10 @@ impl Connected {
         Ok(batches
             .into_iter()
             .filter_map(|(name, commands)| {
-                self.mcu_steppers
-                    .get(&name)
-                    .map(|stepper| (Arc::clone(stepper), commands))
+                self.mcu_steppers.get(&name).map(|stepper| {
+                    let clocks = step_batch_clocks(stepper, start_time, step_gen_time);
+                    (Arc::clone(stepper), commands, clocks)
+                })
             })
             .collect())
     }
@@ -2544,6 +2569,9 @@ async fn home_unified(
     // the move ran out). Each wake waits on one still-pending endstop, so a
     // trigger between checks is seen promptly.
     let mut flush_time = start;
+    // The previous segment's end is this batch's start clock — the lower
+    // bound on when its first step runs (`StepBatchClocks`).
+    let mut generated = start;
     while flush_time < end
         && completions
             .iter()
@@ -2556,12 +2584,14 @@ async fn home_unified(
             .map_err(|err| CommandError::new(err.to_string()))?;
         for (name, commands) in batches {
             if let Some(stepper) = connected.mcu_steppers.get(&name) {
+                let clocks = step_batch_clocks(stepper, generated, flush_time);
                 stepper
-                    .send_steps_async(&commands)
+                    .send_steps_async(&commands, clocks)
                     .await
                     .map_err(command_error)?;
             }
         }
+        generated = flush_time;
         if let Some(pending) = completions
             .iter()
             .find(|completion| completion.reason().is_none())
@@ -2658,6 +2688,8 @@ async fn home_axis(
 
     // Drip the move out in small windows; stop as soon as the trigger fires.
     let mut flush_time = start;
+    // Previous segment's end: this batch's start clock (`StepBatchClocks`).
+    let mut generated = start;
     while flush_time < end && completion.reason().is_none() {
         flush_time = (flush_time + DRIP_SEGMENT_TIME).min(end);
         let batches = connected
@@ -2666,12 +2698,14 @@ async fn home_axis(
             .map_err(|err| CommandError::new(err.to_string()))?;
         for (name, commands) in batches {
             if let Some(stepper) = connected.mcu_steppers.get(&name) {
+                let clocks = step_batch_clocks(stepper, generated, flush_time);
                 stepper
-                    .send_steps_async(&commands)
+                    .send_steps_async(&commands, clocks)
                     .await
                     .map_err(command_error)?;
             }
         }
+        generated = flush_time;
         if completion.reason().is_none() {
             // Wake on the trigger as well as on the drip interval: the
             // completion can fire between the check above and here, in which
@@ -2777,9 +2811,9 @@ async fn probing_move(
     let backlog = connected
         .generate()
         .map_err(|err| CommandError::new(err.to_string()))?;
-    for (stepper, commands) in backlog {
+    for (stepper, commands, clocks) in backlog {
         stepper
-            .send_steps_async(&commands)
+            .send_steps_async(&commands, clocks)
             .await
             .map_err(command_error)?;
     }
@@ -2811,6 +2845,8 @@ async fn probing_move(
     // distance and fails `samples_tolerance` (the corpus's only
     // `samples: 3` config, `screws_tilt_adjust.cfg`).
     let mut flush_time = start;
+    // Previous segment's end: this batch's start clock (`StepBatchClocks`).
+    let mut generated = start;
     while flush_time < end {
         flush_time = (flush_time + DRIP_SEGMENT_TIME).min(end);
         let batches = connected
@@ -2819,12 +2855,14 @@ async fn probing_move(
             .map_err(|err| CommandError::new(err.to_string()))?;
         for (name, commands) in batches {
             if let Some(stepper) = connected.mcu_steppers.get(&name) {
+                let clocks = step_batch_clocks(stepper, generated, flush_time);
                 stepper
-                    .send_steps_async(&commands)
+                    .send_steps_async(&commands, clocks)
                     .await
                     .map_err(command_error)?;
             }
         }
+        generated = flush_time;
         // No wall-clock pacing between segments: the transport is
         // in-process, the fake firmware consumes each batch as it is
         // written, and the trigger is awaited in `home_wait` — pacing would

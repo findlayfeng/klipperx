@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use super::pin::{pin_number, McuChip};
 use crate::core::klippy::cmd::stepper::{ConfigStepper, QueueStep, ResetStepClock, SetNextStepDir};
 use crate::core::klippy::cmd::McuCommand;
-use crate::core::klippy::mcu::{ConfigBuilder, Mcu, McuError};
+use crate::core::klippy::mcu::{ConfigBuilder, Mcu, McuError, StepBatchClocks};
 use crate::core::klippy::motion::stepcompress::StepCommand;
 use crate::core::klippy::pins::{PinParams, PrinterPins};
 
@@ -196,9 +196,18 @@ impl McuStepper {
     /// instead: a move can be hundreds of `queue_step` commands, and they must
     /// all reach the firmware.
     ///
+    /// `clocks` is the window the batch covers (see [`StepBatchClocks`]): every
+    /// command goes out through the move pool, with `start` as its
+    /// `req_clock` and `completion` as the slot-freeing clock
+    /// (`Mcu::send_move_payload`).
+    ///
     /// # Errors
     /// As [`McuStepper::send`], plus any transport error from the awaited send.
-    pub async fn send_steps_async(&self, commands: &[StepCommand]) -> Result<(), McuError> {
+    pub async fn send_steps_async(
+        &self,
+        commands: &[StepCommand],
+        clocks: StepBatchClocks,
+    ) -> Result<(), McuError> {
         let oid = self.oid()?;
         let mcu = self
             .mcu()
@@ -209,7 +218,8 @@ impl McuStepper {
                 McuStepCommand::Dir(cmd) => mcu.encode(SetNextStepDir::NAME, &cmd.args())?,
                 McuStepCommand::Step(cmd) => mcu.encode(QueueStep::NAME, &cmd.args())?,
             };
-            mcu.send_payload(payload).await?;
+            mcu.send_move_payload(payload, clocks.start, clocks.completion)
+                .await?;
         }
         Ok(())
     }

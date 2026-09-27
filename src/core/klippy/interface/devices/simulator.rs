@@ -87,6 +87,13 @@ struct State {
     freq: f64,
     /// When this device was created: `clock()` counts from here.
     started: Instant,
+    /// The clock the last `queue_step` run ended at — the base a following run
+    /// counts its span from (`reset_step_clock` re-anchors it; the first run
+    /// counts from the current clock).
+    last_step_clock: Option<u64>,
+    /// The executed-clock floor [`State::clock`] never runs below (see the
+    /// `clock` function).
+    executed_floor: u64,
     /// Frames waiting for `receive()`.
     out: VecDeque<Frame>,
     /// Set by `shutdown()`: `receive()` returns `None` from then on.
@@ -192,6 +199,8 @@ impl SimulatorDevice {
                 crc: 0,
                 freq,
                 started: Instant::now(),
+                last_step_clock: None,
+                executed_floor: 0,
                 out: VecDeque::new(),
                 shutdown: false,
                 endstop_clock: 0,
@@ -216,8 +225,50 @@ impl SimulatorDevice {
     }
 
     /// The synthetic clock, in firmware ticks since construction.
+    ///
+    /// Wall time since `started`, and never below the executed floor: a
+    /// scheduled command this fake has already run (`queue_step`,
+    /// `queue_digital_out`) raises the floor to its clock, so time follows
+    /// execution instead of waiting the schedule out in real time — the
+    /// virtual clock upstream's file output keeps (`is_fileoutput`). The
+    /// floor only ever moves forward, and the wall clock is its lower bound,
+    /// so a message scheduled in the past can never rewind the clock.
     fn clock(state: &State) -> u64 {
+        Self::wall_clock(state).max(state.executed_floor)
+    }
+
+    /// The wall-time clock, in firmware ticks since construction — what the
+    /// fake's own hardware timers tick with. A `trigger_analog` monitor window
+    /// is one of those: the executed floor may jump the *host's* view of time
+    /// forward when a scheduled command runs, but a firmware timer's window is
+    /// bounded by real time, and judging it against a jumped clock would
+    /// expire it the moment motion executed ("Trigger analog error: MONITOR").
+    fn wall_clock(state: &State) -> u64 {
         (state.started.elapsed().as_secs_f64() * state.freq) as u64
+    }
+
+    /// Where a `queue_step` run ends: the previous run's end plus this run's
+    /// span — `interval × count + add × count×(count-1)/2`, the schedule the
+    /// firmware walks (`stepper.c`'s `queue_step`). With no previous run the
+    /// span counts from the current clock, so the floor starts at wall time.
+    fn queue_step_completion(state: &State, params: &[ArgValue]) -> Option<u64> {
+        let interval = match params.get(1) {
+            Some(ArgValue::UInt32(v)) => u64::from(*v),
+            _ => return None,
+        };
+        let count = match params.get(2) {
+            Some(ArgValue::UInt32(v)) => u64::from(*v),
+            _ => return None,
+        };
+        let add = match params.get(3) {
+            Some(ArgValue::Int32(v)) => i64::from(*v),
+            _ => 0,
+        };
+        let base = state.last_step_clock.unwrap_or_else(|| Self::clock(state));
+        let pairs = (count.saturating_mul(count.saturating_sub(1)) / 2) as i64;
+        let span =
+            (interval.saturating_mul(count) as i64).saturating_add(add.saturating_mul(pairs));
+        Some(base.saturating_add(span.max(0) as u64))
     }
 
     /// Encode a response and queue it.
@@ -256,7 +307,7 @@ impl SimulatorDevice {
                 message.name.as_str(),
                 "i2c_transfer" | "query_status_ldc1612"
             ) {
-                let now = Self::clock(state) as u32;
+                let now = Self::wall_clock(state) as u32;
                 if let Some(armed) = state.trigger_analog.as_mut() {
                     if !armed.fired {
                         armed.deadline = now.wrapping_add(armed.window);
@@ -461,7 +512,7 @@ impl SimulatorDevice {
                             // runs ahead, and comparing across them reports a
                             // false `error_reason + MONITOR` in the arming
                             // frame before the move can ever trip.
-                            let deadline = (Self::clock(state) as u32).wrapping_add(window);
+                            let deadline = (Self::wall_clock(state) as u32).wrapping_add(window);
                             state.ta_homing_clock = clock;
                             state.trigger_analog = Some(ArmedTriggerAnalog {
                                 trsync_oid: *trsync_oid,
@@ -556,13 +607,15 @@ impl SimulatorDevice {
                 }
                 // A stepper time base reset is the first command of a move:
                 // the carriage has started, so an armed endstop now trips. The
-                // clock it carries is what the trigger is reported at.
+                // clock it carries is what the trigger is reported at, and it
+                // is also where the next `queue_step` run counts its span from.
                 "reset_step_clock" => {
                     let clock = match params.get(1) {
                         Some(ArgValue::UInt32(v)) => *v,
                         _ => state.endstop_clock,
                     };
                     state.endstop_clock = state.endstop_clock.max(clock);
+                    state.last_step_clock = Some(u64::from(clock));
                     Self::trigger_if_armed(state, seq, clock);
                     Self::trigger_analog_if_armed(state, seq, clock);
                 }
@@ -571,6 +624,20 @@ impl SimulatorDevice {
                     let clock = state.endstop_clock;
                     Self::trigger_if_armed(state, seq, clock);
                     Self::trigger_analog_if_armed(state, seq, clock);
+                    // Executing the run moves the synthetic clock's floor to
+                    // where its last step lands (`State::executed_floor`).
+                    if let Some(done) = Self::queue_step_completion(state, &params) {
+                        state.last_step_clock = Some(done);
+                        state.executed_floor = state.executed_floor.max(done);
+                    }
+                }
+                // `queue_digital_out oid=%c clock=%u on_ticks=%u`: the change
+                // happens at its own clock, so executing it advances the floor
+                // the same way (`gpiocmds.c`'s move node, freed at `clock`).
+                "queue_digital_out" => {
+                    if let Some(ArgValue::UInt32(clock)) = params.get(1) {
+                        state.executed_floor = state.executed_floor.max(u64::from(*clock));
+                    }
                 }
                 // The ldc1612's register access over the shared I2C bus:
                 // `i2c_transfer oid=%c write=%*s read_len=%u`. The chip answers
@@ -728,7 +795,7 @@ impl SimulatorDevice {
     /// the arm clock (`cancel_homing` does not touch it). Returns whether a
     /// report was made.
     fn fire_monitor_if_expired(state: &mut State, seq: u8) -> bool {
-        let now = Self::clock(state) as u32;
+        let now = Self::wall_clock(state) as u32;
         let Some(armed) = state.trigger_analog.as_mut() else {
             return false;
         };
@@ -767,7 +834,7 @@ impl SimulatorDevice {
         if armed.fired {
             return None;
         }
-        let now = Self::clock(state) as u32;
+        let now = Self::wall_clock(state) as u32;
         let remaining = armed.deadline.wrapping_sub(now);
         if (remaining as i32) < 0 {
             return Some(std::time::Duration::ZERO);

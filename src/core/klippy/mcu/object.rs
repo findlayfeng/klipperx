@@ -375,7 +375,19 @@ impl McuObject {
     /// as usual: this timer feeds an estimate, it does not watch for a dead MCU.
     /// Cancellation is the precedent's — [`McuObject::release_cycles`] on
     /// teardown (`Drop`), so nothing polls after the machine comes down.
+    ///
+    /// One timer per object: [`McuObject::install_clock`] runs again when a
+    /// reconnect replaces the session, and a second timer beside the first
+    /// (whose handle the slot would then have lost) would poll twice over.
     fn register_clock_poll(&self, reactor: &dyn Reactor) {
+        if self
+            .clock_poll_timer
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .is_some()
+        {
+            return;
+        }
         let printer = self.printer.clone();
         let identifier = self.section.identifier();
         // The fake's jumped clock is picked up by this poll alone, so it runs
@@ -412,12 +424,22 @@ impl McuObject {
     /// query that fails (a firmware without the message, a timeout) logs at
     /// debug level, feeds nothing and changes nothing — the timer keeps its
     /// schedule and the next round tries again.
+    ///
+    /// A **closed** session is not even asked: between a reconnect's
+    /// [`Mcu::close`] and the new session's clock landing on the chip, the slot
+    /// still names the old connection, and querying it would push a dead
+    /// session onto the wire once an interval for nothing. The next fire finds
+    /// the clock `reconnect` installed.
     fn poll_clock(&self) {
         let Some(clock) = self.clock() else {
             // No estimate, so no seed either: there is nothing to feed.
             return;
         };
         let name = self.chip.name().to_string();
+        if clock.mcu().is_closed() {
+            debug!("MCU '{name}': clock poll skipped: the session is closed");
+            return;
+        }
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 handle.spawn(async move {
@@ -501,19 +523,129 @@ impl McuObject {
 
     /// Reopen a firmware that was just told to reboot.
     ///
-    /// `previous` is dropped first so its transport is closed before the port is
-    /// reopened.
+    /// The old session is **closed explicitly** before the port is reopened,
+    /// the way upstream ends one: `_restart_via_command` sends `reset`, pauses
+    /// 15 ms, then calls `self._disconnect()` (`klippy/mcu.py:729-747`) — the
+    /// disconnect is a step of its own, not a consequence of letting go of a
+    /// handle. Dropping this one reference would not end the session either:
+    /// the chip's device slot and the `McuClock` behind the clock poll still
+    /// hold their `Arc`s, so `Mcu::Drop` never runs and both transport tasks
+    /// keep working a port that is about to be reopened behind them (an old
+    /// write end failing with EIO against a re-enumerated USB CDC, an old read
+    /// end still stealing a UART's frames — r8host's death spiral).
     async fn reconnect(
         &self,
         config: &McuConfig,
         previous: Arc<Mcu>,
     ) -> Result<Arc<Mcu>, KlippyError> {
-        drop(previous);
+        previous.close();
         let mcu = self.open_and_connect(config).await?;
         self.chip.attach(Arc::clone(&mcu));
-        // A fresh connection has a fresh clock; re-seed the estimate.
-        seed_clock_base(&mcu).await;
+        // A fresh connection has a fresh clock: re-seed the estimate and put a
+        // clock bound to *this* session on the chip. The clock the first
+        // `connect` installed still queries the old `Mcu` — installing a new
+        // one is what moves the periodic `mcu_clock_poll` off the closed
+        // session and releases the `Arc<Mcu>` the old `McuClock` holds.
+        let reactor = self.printer.upgrade().map(|printer| printer.reactor());
+        let sent_time = reactor
+            .as_ref()
+            .map(|reactor| reactor.monotonic())
+            .unwrap_or(0.0);
+        let uptime = seed_clock_base(&mcu).await;
+        if let Some(reactor) = &reactor {
+            self.install_clock(&mcu, reactor, sent_time, uptime);
+        }
         Ok(mcu)
+    }
+
+    /// Build this session's clock estimate and put it on the chip.
+    ///
+    /// The primary (the bare `[mcu]`) defines the print-time origin; a
+    /// secondary is shifted so the same print time maps to its own clock
+    /// (`SecondarySync`, `klippy/clocksync.py:177-235`). Resources that
+    /// convert print time to this MCU's clock read it through the chip.
+    ///
+    /// Both bring-ups run it — `connect` for the first session of a section,
+    /// `reconnect` for the one that replaces a reset firmware — because the
+    /// chip's clock slot is how the periodic `mcu_clock_poll` reaches its
+    /// session: a slot left holding the pre-reset `McuClock` keeps querying the
+    /// old connection forever (that clock keeps its own `Arc<Mcu>`, so the old
+    /// session is never dropped either).
+    ///
+    /// `sent_time` is the reactor time just before `uptime` was read, so the
+    /// seed anchors the regression on that round trip (`seed_clock_base`).
+    fn install_clock(
+        &self,
+        mcu: &Arc<Mcu>,
+        reactor: &Arc<dyn Reactor>,
+        sent_time: f64,
+        uptime: Option<u64>,
+    ) {
+        let clock = Arc::new(McuClock::new(Arc::clone(mcu), Arc::clone(reactor)));
+        let seeded = uptime.is_some();
+        if let Some(clock64) = uptime {
+            clock.seed(sent_time, clock64 as i64);
+        }
+        let now = reactor.monotonic();
+        let offset = if self.name() == "mcu" {
+            0.0
+        } else {
+            self.printer
+                .upgrade()
+                .and_then(|printer| printer.lookup_object_as::<McuObject>("mcu"))
+                .and_then(|primary| primary.clock())
+                .map(|main| main.estimated_print_time(now) - clock.estimated_print_time(now))
+                .unwrap_or(0.0)
+        };
+        self.chip.set_clock(Arc::clone(&clock), offset);
+        // A secondary's crystals drift against the primary's; upstream
+        // realigns it every `stats` (`SecondarySync.calibrate_clock`),
+        // so a timer does it here.
+        if self.name() != "mcu" {
+            *self
+                .secondary_sync
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) =
+                Some(SecondarySync::new(clock.estimator().mcu_freq()));
+            // Registered once per object: a reconnect installs the next
+            // session's clock on the same object, and a second timer would
+            // double the recalibration next to the first (whose handle the
+            // slot would then have lost).
+            if self
+                .recalibrate_timer
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_none()
+            {
+                let printer = self.printer.clone();
+                let identifier = self.section.identifier();
+                let handle = reactor.register_timer_named(
+                    "mcu_recalibrate",
+                    Box::new(move |eventtime| {
+                        let printer = printer.upgrade()?;
+                        if let Some(object) = printer.lookup_object_as::<McuObject>(&identifier) {
+                            object.recalibrate();
+                        }
+                        Some(eventtime + RECALIBRATE_INTERVAL)
+                    }),
+                    reactor.monotonic() + RECALIBRATE_INTERVAL,
+                );
+                *self
+                    .recalibrate_timer
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()) = Some(handle);
+            }
+        }
+        // The periodic `get_clock` that keeps the estimate fed — for
+        // every MCU, primary and secondary alike (`mcu_recalibrate`
+        // only reads the estimators, it never queries). Registered
+        // only once the seed is in, so a sample always corrects a base
+        // instead of starting an unseeded regression; before identify
+        // there is no clock to poll at all. `register_clock_poll` keeps
+        // one timer per object, so the reconnect's install is a no-op for it.
+        if seeded {
+            self.register_clock_poll(reactor.as_ref());
+        }
     }
 
     /// Whether this bring-up follows a `firmware_restart`.
@@ -790,68 +922,8 @@ impl PrinterObject for McuObject {
                 .map(|reactor| reactor.monotonic())
                 .unwrap_or(0.0);
             let uptime = seed_clock_base(&mcu).await;
-            // Build this MCU's clock estimate and its print-time alignment. The
-            // primary (the bare `[mcu]`) defines the print-time origin; a
-            // secondary is shifted so the same print time maps to its own clock
-            // (`SecondarySync`, `klippy/clocksync.py:177-235`). Resources that
-            // convert print time to this MCU's clock read it through the chip.
             if let Some(reactor) = &reactor {
-                let clock = Arc::new(McuClock::new(Arc::clone(&mcu), Arc::clone(reactor)));
-                let seeded = uptime.is_some();
-                if let Some(clock64) = uptime {
-                    clock.seed(sent_time, clock64 as i64);
-                }
-                let now = reactor.monotonic();
-                let offset = if self.name() == "mcu" {
-                    0.0
-                } else {
-                    self.printer
-                        .upgrade()
-                        .and_then(|printer| printer.lookup_object_as::<McuObject>("mcu"))
-                        .and_then(|primary| primary.clock())
-                        .map(|main| {
-                            main.estimated_print_time(now) - clock.estimated_print_time(now)
-                        })
-                        .unwrap_or(0.0)
-                };
-                self.chip.set_clock(Arc::clone(&clock), offset);
-                // A secondary's crystals drift against the primary's; upstream
-                // realigns it every `stats` (`SecondarySync.calibrate_clock`),
-                // so a timer does it here.
-                if self.name() != "mcu" {
-                    *self
-                        .secondary_sync
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner()) =
-                        Some(SecondarySync::new(clock.estimator().mcu_freq()));
-                    let printer = self.printer.clone();
-                    let identifier = self.section.identifier();
-                    let handle = reactor.register_timer_named(
-                        "mcu_recalibrate",
-                        Box::new(move |eventtime| {
-                            let printer = printer.upgrade()?;
-                            if let Some(object) = printer.lookup_object_as::<McuObject>(&identifier)
-                            {
-                                object.recalibrate();
-                            }
-                            Some(eventtime + RECALIBRATE_INTERVAL)
-                        }),
-                        reactor.monotonic() + RECALIBRATE_INTERVAL,
-                    );
-                    *self
-                        .recalibrate_timer
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner()) = Some(handle);
-                }
-                // The periodic `get_clock` that keeps the estimate fed — for
-                // every MCU, primary and secondary alike (`mcu_recalibrate`
-                // only reads the estimators, it never queries). Registered
-                // only once the seed is in, so a sample always corrects a base
-                // instead of starting an unseeded regression; before identify
-                // there is no clock to poll at all.
-                if seeded {
-                    self.register_clock_poll(reactor.as_ref());
-                }
+                self.install_clock(&mcu, reactor, sent_time, uptime);
             }
             // Identify installed the dictionary; reserve the pins the firmware
             // owns before anything resolves one. A conflict here is a
@@ -865,7 +937,7 @@ impl PrinterObject for McuObject {
             // what lets this connection be the only one, instead of identifying
             // the running firmware just to tell it to reboot
             // (`before_firmware_restart`; upstream's `_restart_via_command`,
-            // `klippy/mcu.py:730-746`). What is left for this loop is the
+            // `klippy/mcu.py:729-747`). What is left for this loop is the
             // firmware whose *only* reset is `reset` and that still carries a
             // configuration: no `config_reset` to clear it in place, so it has to
             // be rebooted and re-identified here.
@@ -1759,5 +1831,132 @@ mod tests {
             "the cancelled timer never fires"
         );
         assert!(rig.recorder.frames().is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // reset → reconnect (B6 — the old session must go down explicitly)
+    // -----------------------------------------------------------------------
+
+    /// The host's reset → reconnect, end to end against the `test:` fake: the
+    /// old session is closed **before** the reopen starts, and the new
+    /// session's clock lands on the chip — the two things r8host's death
+    /// spiral (08:22:45–08:23:30) proved were missing. There the drop of one
+    /// reference was supposed to end the old session while the clock and the
+    /// chip slot still held theirs, so the old tasks outlived it: the old
+    /// write end retransmitted against a dead fd once a second, and the clock
+    /// poll kept querying the closed session forever.
+    #[tokio::test]
+    async fn test_reconnect_closes_the_old_session_and_binds_the_new_sessions_clock() {
+        // The object, its printer and a manual reactor — the poll timer is the
+        // only thing driven by hand here.
+        let manual = Arc::new(ManualReactor::new());
+        let reactor: Arc<dyn Reactor> = manual.clone();
+        let printer = Arc::new(Printer::new(Arc::clone(&reactor)));
+        printer
+            .add_object(PINS_OBJECT, Arc::new(PrinterPins::new()))
+            .unwrap();
+        let mut section = section(None);
+        section.parameters.insert(
+            "test".to_string(),
+            ConfigValue::Single(format!(
+                "dict={}",
+                klipperx_test_support::test_dicts_dir()
+                    .join("linuxprocess.dict")
+                    .display()
+            )),
+        );
+        let object = Arc::new(McuObject::new(section, &printer).unwrap());
+        printer
+            .add_object(&object.section.identifier(), object.clone())
+            .unwrap();
+        let config = McuConfig::new(&ConfigWrapper::untracked(&object.section)).unwrap();
+
+        // The old session, as `connect` leaves it at the handshake: attached,
+        // clock installed, poll registered (`install_clock` registers it).
+        let device = FrameMock::new(clock_exchange(21_000_500));
+        let recorder = device.recorder();
+        let previous = Arc::new(Mcu::for_test("old", Interface::new(device)));
+        previous
+            .install_dictionary(Dictionary::from_json(polling_dictionary()).unwrap())
+            .unwrap();
+        object.chip.attach(Arc::clone(&previous));
+        object.install_clock(&previous, &reactor, 0.0, Some(1_000_000));
+        let held = Arc::clone(&previous);
+
+        let mut reconnect = Box::pin(object.reconnect(&config, previous));
+        // One second into the reopen: the port sleeps `RECONNECT_DELAY` before
+        // the first attempt, so this lands inside that window.
+        let _ = tokio::time::timeout(Duration::from_millis(100), &mut reconnect).await;
+
+        // (1) The old session is already down — before any reopen has
+        // succeeded, and while two `Arc`s still reference it.
+        for _ in 0..100 {
+            if held.transport_tasks_finished() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            held.transport_tasks_finished(),
+            "the old session's tasks stop at the start of the reconnect, not when the Arc goes"
+        );
+        assert!(
+            Arc::strong_count(&held) >= 2,
+            "the Arc is still shared: only the explicit close stopped those tasks"
+        );
+        assert!(
+            held.send("get_clock", &[]).is_err(),
+            "the closed session refuses sends"
+        );
+
+        // The poll keeps firing through the window; a closed session is not
+        // queried (its mapping below would record the frame otherwise).
+        let _ = manual.advance(1.0);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            recorder.frames().is_empty(),
+            "no frame on the closed session's transport during the reopen"
+        );
+
+        // Let the reopen run to success against the fake.
+        tokio::time::timeout(Duration::from_secs(30), &mut reconnect)
+            .await
+            .expect("the reopen keeps trying until the port answers")
+            .expect("identify against the fake succeeds");
+
+        // (2) The chip names the new session — and so does its clock, which is
+        // what the periodic poll queries from now on.
+        let reopened = object.chip.mcu().expect("the new session is attached");
+        assert!(
+            !Arc::ptr_eq(&reopened, &held),
+            "a new session, not the old one"
+        );
+        let clock = object.clock().expect("a clock is installed");
+        assert!(
+            Arc::ptr_eq(clock.mcu(), &reopened),
+            "the clock poll is bound to the new session's wire"
+        );
+        drop(clock);
+        assert_eq!(
+            Arc::strong_count(&held),
+            1,
+            "the old clock released its Arc<Mcu>: nothing holds the closed session"
+        );
+
+        // The next fire's sample comes from the new session: the estimate
+        // moves (the old session would feed nothing — it is closed), and the
+        // old transport stays silent.
+        let before = object.clock().unwrap().estimator().last_clock();
+        let _ = manual.advance(0.35); // `test:` cadence is 150 ms
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let after = object.clock().unwrap().estimator().last_clock();
+        assert_ne!(
+            before, after,
+            "a sample from the new session folded into the estimate: {before} -> {after}"
+        );
+        assert!(
+            recorder.frames().is_empty(),
+            "the old transport stayed quiet through the reconnect"
+        );
     }
 }

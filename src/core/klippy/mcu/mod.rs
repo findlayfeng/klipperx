@@ -573,8 +573,19 @@ pub struct Mcu {
     /// slot of the firmware's move queue, and therefore the `min_clock` the
     /// next one needs (`MoveSlots`).
     move_slots: StdMutex<MoveSlots>,
-    /// Handle to the receive task, used to abort it on drop.
-    recv_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Whether [`Mcu::close`] has run: the session is over and nothing may be
+    /// queued for the wire any more.
+    ///
+    /// Set before the tasks are torn down, so a caller racing the abort gets a
+    /// refused send rather than a payload queued for a task that will never
+    /// read it.
+    closed: AtomicBool,
+    /// Handle to the send task, so [`Mcu::close`] can stop it directly instead
+    /// of waiting for the queue or the ack stream to notice the session is
+    /// gone.
+    send_handle: StdMutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Handle to the receive task, used to abort it on close and on drop.
+    recv_handle: StdMutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl std::fmt::Debug for Mcu {
@@ -1544,7 +1555,7 @@ impl Mcu {
             dictionary: Arc::clone(&dictionary),
         };
 
-        handle.spawn(async move {
+        let send_handle = handle.spawn(async move {
             let mut sender = Sender::new(Arc::clone(&wire_for_send));
             // What the two gates hold back: messages not released yet, and
             // flush barriers queued behind them (`Parked`).
@@ -1862,7 +1873,9 @@ impl Mcu {
             gates_open,
             clock_estimate,
             move_slots: StdMutex::new(MoveSlots::default()),
-            recv_handle: Some(recv_handle),
+            closed: AtomicBool::new(false),
+            send_handle: StdMutex::new(Some(send_handle)),
+            recv_handle: StdMutex::new(Some(recv_handle)),
         }
     }
 
@@ -1876,7 +1889,9 @@ impl Mcu {
     /// before the handshake — to inspect it, to retry it with a custom timeout,
     /// or because the dictionary comes from somewhere else.
     ///
-    /// The two background tasks outlive this call and are stopped by [`Drop`].
+    /// The two background tasks outlive this call and are stopped by
+    /// [`Mcu::close`] — which [`Drop`] calls too, as the backstop for a
+    /// session that simply goes away.
     ///
     /// The interface arrives already open: a [`McuConfig`] describes a transport
     /// and `McuConfig::open` opens it, so that a firmware restart can reset the
@@ -2323,6 +2338,14 @@ impl Mcu {
         waiting_for: Option<&str>,
         clocks: SendClocks,
     ) -> Result<(), MsgError> {
+        // A closed session refuses at once: the send task is already gone, and
+        // a message that merely queued would wait for a reader that never comes.
+        if self.is_closed() {
+            return Err(MsgError::new(format!(
+                "{}: the connection is closed",
+                self.describe_command(name, args)
+            )));
+        }
         let payload = self.parser.encode(name, args)?;
         match waiting_for {
             Some(response) => debug!(
@@ -2371,6 +2394,9 @@ impl Mcu {
     /// Returns [`McuError::Call`] if the send task is gone, or if the barrier was
     /// not reached within `timeout` (a wedged transport).
     pub async fn flush(&self, timeout: Duration) -> Result<(), McuError> {
+        if self.is_closed() {
+            return Err(McuCallError::SendFailed("the connection is closed".to_string()).into());
+        }
         let (done_tx, done_rx) = oneshot::channel();
         self.send_buf_tx
             .send(SendItem::Flush(done_tx))
@@ -2563,24 +2589,66 @@ impl Mcu {
     }
 }
 
-impl Drop for Mcu {
-    /// Shut down the interface and abort the receive task when `Mcu` is dropped.
+impl Mcu {
+    /// Shut this session down **explicitly**, without waiting for the last
+    /// [`Arc`] to go.
     ///
-    /// The receive task runs an infinite loop calling `interface.receive().await`,
-    /// so it has no natural exit condition. That call is backed by a synchronous
-    /// device read inside `spawn_blocking`, which **cannot** be cancelled by
-    /// aborting the async task. If the blocked read is not released, its thread
-    /// stays parked forever and the runtime hangs during shutdown. Calling
-    /// [`Interface::shutdown`] first unblocks that read; the abort then
-    /// guarantees the task itself is torn down promptly.
+    /// Upstream ends a restart's old connection the same way:
+    /// `MCURestartHelper._restart_via_command` sends `reset`, pauses 15 ms,
+    /// then calls `self._disconnect()` (`klippy/mcu.py:729-747`) — the
+    /// disconnect is a step of its own, not a consequence of reference
+    /// counting. This host needs the same because handles outlive the session
+    /// that used them: the chip's device slot and the clock estimate's
+    /// `McuClock` still hold their `Arc<Mcu>`, so without this `Drop` never
+    /// runs and both transport tasks keep working a port that has been
+    /// reopened behind them — an old write end failing with EIO against a
+    /// re-enumerated USB CDC, an old read end still stealing a UART's frames.
+    ///
+    /// The steps are `Drop`'s, taken here while the handles still exist:
+    /// release the blocking device read first, then abort the tasks.
+    /// Everything is idempotent — a session may be closed and then dropped.
+    pub(crate) fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+        // The receive task's device read runs inside `spawn_blocking` and
+        // cannot be cancelled by aborting the task; shutting the device down
+        // releases that thread, and the aborts below then tear both tasks down
+        // promptly (the send task would otherwise only notice when the queue
+        // or the ack stream closes).
+        self.interface.shutdown();
+        for handles in [&self.send_handle, &self.recv_handle] {
+            if let Some(handle) = handles
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .as_ref()
+            {
+                handle.abort();
+            }
+        }
+    }
+
+    /// Whether [`Mcu::close`] (or `Drop`, which calls it) has ended this
+    /// session.
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for Mcu {
+    /// Shut the session down when the last handle goes — [`Mcu::close`],
+    /// which this calls as the backstop for every path that ends a session by
+    /// letting it go rather than by closing it (a failed `Mcu::connect`, the
+    /// machine's teardown, an ordinary restart).
+    ///
+    /// The blocking-read rationale lives there: the device read runs inside
+    /// `spawn_blocking` and cannot be cancelled by aborting the async task, so
+    /// the interface is shut down before the tasks are aborted — otherwise the
+    /// blocked thread stays parked forever and the runtime hangs during
+    /// shutdown.
     fn drop(&mut self) {
         if trace_enabled() {
             eprintln!("MCU DROP {}", self.name);
         }
-        self.interface.shutdown();
-        if let Some(handle) = self.recv_handle.take() {
-            handle.abort();
-        }
+        self.close();
     }
 }
 
@@ -2592,6 +2660,22 @@ impl Mcu {
     /// rather than a real `McuConfig`, and most of them never identify.
     pub(crate) fn for_test(name: impl Into<String>, interface: Interface) -> Self {
         Self::from_parts(name.into(), interface)
+    }
+
+    /// Whether both transport tasks have finished — the test seam behind
+    /// [`Mcu::close`]'s promise that a session's tasks stop without the last
+    /// `Arc` going away.
+    pub(crate) fn transport_tasks_finished(&self) -> bool {
+        [&self.send_handle, &self.recv_handle]
+            .iter()
+            .all(|handles| {
+                handles
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .as_ref()
+                    .map(|handle| handle.is_finished())
+                    .unwrap_or(true)
+            })
     }
 }
 
@@ -2606,7 +2690,7 @@ mod tests {
     use crate::core::klippy::cmd::identify::IDENTIFY_CHUNK_SIZE;
     use crate::core::klippy::identify::Identify;
     use crate::core::klippy::interface::devices::frame_mock::{
-        FrameMock, FrameRecorder, MappingEntry,
+        FrameMock, FrameRecorder, MappingEntry, RecordingWire,
     };
     use crate::core::klippy::interface::devices::serial::DEFAULT_BAUD;
     use crate::core::klippy::interface::Interface;
@@ -4842,6 +4926,8 @@ mod tests {
         // receive task after the `Mcu` (and its `JoinHandle`) is gone.
         let abort_handle = mcu
             .recv_handle
+            .lock()
+            .unwrap()
             .as_ref()
             .expect("receive task handle must be present")
             .abort_handle();
@@ -4861,6 +4947,140 @@ mod tests {
         assert!(
             abort_handle.is_finished(),
             "receive task should be aborted after the Mcu is dropped"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Explicit session close (B6 — host reset → reconnect teardown)
+    // -----------------------------------------------------------------------
+
+    /// `close` ends the session even though the `Arc` is still shared: both
+    /// transport tasks stop, sends are refused, and not one more frame reaches
+    /// the transport.
+    ///
+    /// This is what makes a reconnect's teardown independent of reference
+    /// counting — on the real host the clock estimate and the chip's device
+    /// slot keep their handles, so `Drop` never runs and the old write end
+    /// retransmits against a dead fd (r8host's `Send failed (seq=9) … EIO`
+    /// once a second, forever). The second `Arc` here stands in for those
+    /// holders.
+    #[tokio::test]
+    async fn test_close_stops_the_session_while_the_arc_is_still_shared() {
+        let wire = RecordingWire::new();
+        let sent = wire.sent();
+        let mcu = Arc::new(Mcu::for_test("closing", Interface::recording(wire.clone())));
+        mcu.install_dictionary(
+            Dictionary::from_json(serde_json::json!({"commands": {"ping": 7}})).unwrap(),
+        )
+        .unwrap();
+        // One command on the wire, so the send task has real work behind it.
+        mcu.send("ping", &[]).unwrap();
+        mcu.flush(Duration::from_secs(1)).await.unwrap();
+        assert!(!sent.lock().unwrap().is_empty(), "the session was live");
+        let keeper = Arc::clone(&mcu); // the holder that outlives the close
+
+        mcu.close();
+
+        for _ in 0..100 {
+            if mcu.transport_tasks_finished() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            mcu.transport_tasks_finished(),
+            "both transport tasks stop while the Arc is still shared"
+        );
+        assert_eq!(
+            Arc::strong_count(&mcu),
+            2,
+            "the close did not wait for the reference count"
+        );
+        assert!(mcu.is_closed());
+        // Not one frame more, whatever a caller tries after the close.
+        let frozen = sent.lock().unwrap().len();
+        assert!(
+            mcu.send("ping", &[]).is_err(),
+            "a closed session refuses sends"
+        );
+        assert!(
+            mcu.flush(Duration::from_millis(50)).await.is_err(),
+            "and refuses barriers too"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            sent.lock().unwrap().len(),
+            frozen,
+            "zero frames on the transport after close"
+        );
+        drop(keeper);
+    }
+
+    /// The real-machine reconnect sequence (r8host 08:22:45–08:23:30): a
+    /// session runs at a high sequence, the firmware resets, the host reopens
+    /// the port — and on a UART the old session's tasks share the reopened
+    /// line with the new one, because a tty never re-enumerates. With the old
+    /// session closed first, the reopened connection owns the line: identify
+    /// completes, and no frame numbered by the old session reaches the new
+    /// window — in the log those frames were the old session's own drops
+    /// (`Frame with sequence 112 … answers block 107 …`) and the new
+    /// session's identify timed out forever.
+    #[tokio::test]
+    async fn test_a_closed_session_lets_the_reopened_identify_complete() {
+        // The dictionary the handshake transfers: small enough that the
+        // chunk loop below scripts each chunk and the terminator explicitly.
+        let body = br#"{"commands":{"get_clock":5},"config":{"CLOCK_FREQ":20000000}}"#;
+        let compressed = compress(body);
+        // One shared wire: both sessions' receive tasks draw from the same
+        // queue, exactly like the two fds on one UART in the log.
+        let wire = RecordingWire::new();
+        let mut offset = 0usize;
+        loop {
+            let end = (offset + IDENTIFY_CHUNK_SIZE as usize).min(compressed.len());
+            let data = &compressed[offset..end];
+            wire.reply_to(
+                identify_request_payload(offset as u32),
+                identify_response_payload(offset as u32, data),
+            );
+            if data.is_empty() {
+                break;
+            }
+            offset = end;
+        }
+
+        // The old session, mid-session numbering: its window sits past 107
+        // while the reopened connection starts from scratch.
+        let previous = Arc::new(Mcu::for_test("old", Interface::recording(wire.clone())));
+        previous.wire.next.store(107, Ordering::Relaxed);
+        previous.wire.seen.store(106, Ordering::Relaxed);
+
+        // `reset` + the reconnect's first step: the old session goes down
+        // before the port comes back up — and the `Arc` is held here the
+        // whole time, so only `close` can have stopped those tasks.
+        previous.close();
+        for _ in 0..100 {
+            if previous.transport_tasks_finished() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            previous.transport_tasks_finished(),
+            "the old session is gone while its Arc is still held"
+        );
+
+        // The reopened port: identify completes against the same wire, with
+        // nobody left to steal its answers.
+        let reopened = Mcu::connect("reopened", Interface::recording(wire.clone()))
+            .await
+            .expect("identify completes once the old session is closed");
+        assert!(
+            !reopened.took_over_session(),
+            "a reset firmware counts from zero; the old numbering is not adopted"
+        );
+        assert!(
+            reopened.wire.seen.load(Ordering::Relaxed) < 107,
+            "no frame from the old session's numbering reached the new window"
         );
     }
 

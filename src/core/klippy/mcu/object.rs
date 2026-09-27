@@ -906,7 +906,14 @@ impl PrinterObject for McuObject {
                 // this object at all. (`object.rs` is touched because it is the
                 // only place that sees both the section's interface key and
                 // every live `Mcu`.)
-                if self.section.parameters.contains_key("test") {
+                // `KLIPPERX_KEEP_GATES=1` keeps the gates shut on the fake — a
+                // debug hatch for reproducing gate-vs-generation hazards
+                // against one corpus case (pair it with
+                // `KLIPPERX_UPSTREAM_FILTER=<name>`; the C4 iqex follow-up
+                // reproduces in ~1.5 s that way).
+                if self.section.parameters.contains_key("test")
+                    && std::env::var_os("KLIPPERX_KEEP_GATES").is_none()
+                {
                     mcu.open_send_gates();
                 }
                 match self

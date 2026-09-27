@@ -36,7 +36,7 @@ use crate::core::klippy::cmd::trsync::{
     ConfigTrsync, TriggerReason, TrsyncSetTimeout, TrsyncStart, TrsyncState, TrsyncTrigger,
 };
 use crate::core::klippy::error::ConfigError;
-use crate::core::klippy::mcu::{ConfigBuilder, Mcu, McuError};
+use crate::core::klippy::mcu::{ConfigBuilder, Mcu, McuError, SendClocks};
 
 /// The deadline for a multi-MCU dispatch (`TRSYNC_TIMEOUT`, `klippy/mcu.py:259`).
 pub const TRSYNC_TIMEOUT: f64 = 0.025;
@@ -316,12 +316,22 @@ impl McuTrsync {
             .lock()
             .unwrap_or_else(|p| p.into_inner()) = min_extend_ticks;
 
-        mcu.send_msg(&TrsyncStart {
-            oid: self.oid,
-            report_clock: report_clock as u32,
-            report_ticks: report_ticks as u32,
-            expire_reason: TriggerReason::CommsTimeout as u8,
-        })?;
+        // Upstream arms the group with `reqclock=clock` (`klippy/mcu.py:260`):
+        // the start waits behind the lower `req_clock`s of the queue_step
+        // messages queued for this move (commit `6bd5f4e4`), so the trsync
+        // never starts watching before the steps it has to stop exist.
+        mcu.send_msg_clocked(
+            &TrsyncStart {
+                oid: self.oid,
+                report_clock: report_clock as u32,
+                report_ticks: report_ticks as u32,
+                expire_reason: TriggerReason::CommsTimeout as u8,
+            },
+            SendClocks {
+                min_clock: None,
+                req_clock: Some(clock),
+            },
+        )?;
         for (stepper, _) in self
             .steppers
             .lock()
@@ -337,10 +347,22 @@ impl McuTrsync {
                 trsync_oid: self.oid,
             })?;
         }
-        mcu.send_msg(&TrsyncSetTimeout {
-            oid: self.oid,
-            clock: expire_clock as u32,
-        })?;
+        // Upstream sends this with `reqclock=clock` too — the **arm** clock,
+        // not the expire one (`klippy/mcu.py:264`); the 25 ms of
+        // `TRSYNC_TIMEOUT` only moves the release point inside the same
+        // 100 ms lead window, and the arm clock is what keeps the message on
+        // the homing priority line. (The C4 design text said "expire clock";
+        // aligned to upstream per the close-to-upstream rule, noted here.)
+        mcu.send_msg_clocked(
+            &TrsyncSetTimeout {
+                oid: self.oid,
+                clock: expire_clock as u32,
+            },
+            SendClocks {
+                min_clock: None,
+                req_clock: Some(clock),
+            },
+        )?;
         Ok(())
     }
 

@@ -2371,6 +2371,23 @@ impl Mcu {
         response_name: &str,
         timeout: Duration,
     ) -> Result<Vec<ArgValue>, McuCallError> {
+        self.call_gated(command, args, response_name, timeout, SendClocks::default())
+            .await
+    }
+
+    /// [`Mcu::call`] with scheduling gates on the request ([`SendClocks`]).
+    ///
+    /// Used by the typed clocked call (`Mcu::call_msg_clocked`, `cmd`) — the
+    /// homing query paths are the callers that gate (`endstop_query_state`'s
+    /// `minclock`, upstream `klippy/mcu.py:401-405`).
+    pub(crate) async fn call_gated(
+        &self,
+        command: &str,
+        args: &[ArgValue],
+        response_name: &str,
+        timeout: Duration,
+        clocks: SendClocks,
+    ) -> Result<Vec<ArgValue>, McuCallError> {
         // 1. Verify command is registered; warn if it has a callback.
         if !self.parser.is_registered(command) {
             return Err(McuCallError::CommandNotFound(command.to_string()));
@@ -2391,7 +2408,7 @@ impl Mcu {
             .await;
 
         // 4. Send the command. Its line names the response it is waiting for.
-        if let Err(e) = self.enqueue(command, args, Some(response_name), SendClocks::default()) {
+        if let Err(e) = self.enqueue(command, args, Some(response_name), clocks) {
             warn!("Failed to send command '{}': {e}", command);
             // Clean up the pending call on send failure.
             self.pending_calls.cancel(response_name).await;

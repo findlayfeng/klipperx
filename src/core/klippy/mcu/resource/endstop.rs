@@ -15,11 +15,14 @@
 //! # Clock-ordered queries
 //!
 //! Upstream's `query_endstop(print_time)` sends its query with `minclock`, so the
-//! serial queue holds it until the queued motion has run. This host has no such
-//! queue (the FW6 decision: send now, let the firmware schedule), so the query
-//! reads the pin as soon as it arrives. When idle — the `M119` case — that is the
-//! same answer; during a move it is the current level rather than the level at
-//! the move's end.
+//! serial queue holds it until the queued motion has run (`klippy/mcu.py:401-405`).
+//! This host does the same: the print time becomes the query's `min_clock`, the
+//! send gates hold it, and the firmware reads the pin when it *processes* the
+//! message (`src/endstop.c:102-114`) — which the floor pins to the requested
+//! sample instant. When idle — the `M119` case — the floor is already behind the
+//! clock and the query goes at once. (This replaces the old FW6 decision, "send
+//! now, let the firmware schedule", whose effect was that during a move the
+//! answer read the current level rather than the level at the move's end.)
 
 use std::sync::{Arc, Mutex};
 
@@ -29,7 +32,7 @@ use crate::core::klippy::cmd::endstop::{
     ConfigEndstop, EndstopHome, EndstopQueryState, EndstopState,
 };
 use crate::core::klippy::cmd::trsync::TriggerReason;
-use crate::core::klippy::mcu::McuError;
+use crate::core::klippy::mcu::{McuError, SendClocks};
 use crate::core::klippy::pins::PinParams;
 
 /// How long a `endstop_query_state` exchange may take.
@@ -116,19 +119,27 @@ impl McuEndstop {
 
     /// Whether the pin is triggered now (`MCU_endstop.query_endstop`).
     ///
-    /// `_print_time` is upstream's `minclock`; see the module docs for why this
-    /// host does not hold the query.
+    /// `_print_time` is upstream's `minclock` (`klippy/mcu.py:401-405`): the
+    /// query is gated to that print time so the pin is sampled when the queued
+    /// motion has run (see the module docs). No clock mapping yet means no
+    /// floor — the gates read an unknown clock as "send now"
+    /// (`serialqueue.c:612-618`).
     ///
     /// # Errors
     /// Returns [`McuError`] if the MCU is not connected or does not answer.
-    pub async fn query_endstop(&self, _print_time: f64) -> Result<bool, McuError> {
+    pub async fn query_endstop(&self, print_time: f64) -> Result<bool, McuError> {
         let mcu = self
             .chip
             .mcu()
             .ok_or_else(|| McuError::Config("MCU is not connected".to_string()))?;
+        let min_clock = self.chip.print_time_to_clock(print_time);
         let state = mcu
-            .call_msg::<EndstopQueryState, EndstopState>(
+            .call_msg_clocked::<EndstopQueryState, EndstopState>(
                 &EndstopQueryState { oid: self.oid },
+                SendClocks {
+                    min_clock,
+                    req_clock: None,
+                },
                 QUERY_TIMEOUT,
             )
             .await?;
@@ -139,6 +150,11 @@ impl McuEndstop {
     ///
     /// `sample_time`/`sample_count` confirm a trigger; `rest_time` is the poll
     /// interval; `triggered` is the level to stop on (before the `!` inversion).
+    ///
+    /// The arm carries upstream's `reqclock=clock` (`klippy/mcu.py:385`): its
+    /// `req_clock` keeps it behind any lower `req_clock` on the wire — the
+    /// queue_step messages queued for this move — which is how commit
+    /// `6bd5f4e4` made steps reach the board before the check starts.
     ///
     /// # Errors
     /// Returns [`McuError`] if the MCU is not connected or a send fails.
@@ -168,16 +184,22 @@ impl McuEndstop {
         let sample_ticks = mcu.seconds_to_clock(sample_time)? as u32;
 
         let completion = self.dispatch.start(print_time)?;
-        mcu.send_msg(&EndstopHome {
-            oid: self.oid,
-            clock: clock as u32,
-            sample_ticks,
-            sample_count,
-            rest_ticks: rest_ticks as u32,
-            pin_value: u8::from(triggered ^ self.invert),
-            trsync_oid: self.dispatch.get_oid(),
-            trigger_reason: TriggerReason::EndstopHit as u8,
-        })?;
+        mcu.send_msg_clocked(
+            &EndstopHome {
+                oid: self.oid,
+                clock: clock as u32,
+                sample_ticks,
+                sample_count,
+                rest_ticks: rest_ticks as u32,
+                pin_value: u8::from(triggered ^ self.invert),
+                trsync_oid: self.dispatch.get_oid(),
+                trigger_reason: TriggerReason::EndstopHit as u8,
+            },
+            SendClocks {
+                min_clock: None,
+                req_clock: Some(clock),
+            },
+        )?;
         Ok(completion)
     }
 

@@ -124,7 +124,7 @@ pub use trsync::{
     ConfigTrsync, TriggerReason, TrsyncSetTimeout, TrsyncStart, TrsyncState, TrsyncTrigger,
 };
 
-use crate::core::klippy::mcu::{Dictionary, Enumeration, Mcu, McuError};
+use crate::core::klippy::mcu::{Dictionary, Enumeration, Mcu, McuError, SendClocks};
 use crate::core::klippy::msg::proto::{ArgType, ArgValue};
 use crate::core::klippy::msg::Msg;
 use std::sync::Arc;
@@ -400,6 +400,28 @@ impl Mcu {
         Ok(())
     }
 
+    /// [`Mcu::send_msg`] with scheduling gates ([`SendClocks`]).
+    ///
+    /// The gates are the homing paths' own: `endstop_home` carries upstream's
+    /// `reqclock` (`klippy/mcu.py:385`), so the arm lands behind the queue_step
+    /// messages that must reach the board first (commit `6bd5f4e4`).
+    /// (`cmd/mod.rs` is where the typed entry points live; putting the clocked
+    /// twin here keeps one contract for both instead of splitting the decode
+    /// and dictionary checks across two files.)
+    ///
+    /// # Errors
+    /// As [`Mcu::send_msg`].
+    pub fn send_msg_clocked<C: McuCommand>(
+        &self,
+        cmd: &C,
+        clocks: SendClocks,
+    ) -> Result<(), McuError> {
+        self.require_dictionary()?;
+        self.require_message(C::NAME)?;
+        self.send_with_clocks(C::NAME, &cmd.args(), clocks)?;
+        Ok(())
+    }
+
     /// Send a typed command and decode its typed response.
     ///
     /// Both names are resolved **before** the command is sent, so a message the
@@ -418,7 +440,27 @@ impl Mcu {
         timeout: Duration,
     ) -> Result<R, McuError> {
         let dictionary = self.require_dictionary()?;
-        self.call_typed::<C, R>(cmd, timeout, Some(dictionary))
+        self.call_typed::<C, R>(cmd, timeout, Some(dictionary), SendClocks::default())
+            .await
+    }
+
+    /// [`Mcu::call_msg`] with scheduling gates on the request ([`SendClocks`]).
+    ///
+    /// `endstop_query_state` carries upstream's `minclock`
+    /// (`klippy/mcu.py:401-405`): the query waits until the queued motion has
+    /// run, so the answer is the pin at the requested print time rather than
+    /// whenever the message happened to arrive.
+    ///
+    /// # Errors
+    /// As [`Mcu::call_msg`].
+    pub async fn call_msg_clocked<C: McuCommand, R: McuResponse>(
+        &self,
+        cmd: &C,
+        clocks: SendClocks,
+        timeout: Duration,
+    ) -> Result<R, McuError> {
+        let dictionary = self.require_dictionary()?;
+        self.call_typed::<C, R>(cmd, timeout, Some(dictionary), clocks)
             .await
     }
 
@@ -434,7 +476,8 @@ impl Mcu {
         cmd: &C,
         timeout: Duration,
     ) -> Result<R, McuError> {
-        self.call_typed::<C, R>(cmd, timeout, None).await
+        self.call_typed::<C, R>(cmd, timeout, None, SendClocks::default())
+            .await
     }
 
     /// Shared body of the typed calls.
@@ -447,11 +490,14 @@ impl Mcu {
         cmd: &C,
         timeout: Duration,
         dictionary: Option<Arc<Dictionary>>,
+        clocks: SendClocks,
     ) -> Result<R, McuError> {
         self.require_message(C::NAME)?;
         let msg = self.require_message(R::NAME)?;
 
-        let values = self.call(C::NAME, &cmd.args(), R::NAME, timeout).await?;
+        let values = self
+            .call_gated(C::NAME, &cmd.args(), R::NAME, timeout, clocks)
+            .await?;
 
         let params = match dictionary {
             Some(dictionary) => Params::new(msg, &values).with_dictionary(dictionary),

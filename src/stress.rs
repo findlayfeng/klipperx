@@ -276,30 +276,9 @@ async fn stress(args: StressArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // One future per connected board, polled together: the ramps interleave on
-    // the same runtime, each with its own port, tasks and state. `named` says
-    // which boards the command promised a stepper: every board except the ones
-    // `--all-mcus` enumerated (that flag takes names of none of its own).
-    let named = !args.all_mcus;
-    let ramps = boards
-        .iter()
-        .map(|(mcu_config, mcu)| {
-            run_board(mcu_config, mcu.clone(), args.task, &config, &args, named)
-        })
-        .collect::<Vec<_>>();
-    let mut ran = 0usize;
-    for ((mcu_config, _), outcome) in boards.iter().zip(join_all(ramps).await) {
-        match outcome {
-            Ok(BoardOutcome::Ran) => ran += 1,
-            // The skip line is the board's whole report: it neither ran nor failed.
-            Ok(BoardOutcome::Skipped) => {}
-            Err(err) => {
-                let err = err.to_string();
-                println!("{}", tagged(&mcu_config.name, format!("failed: {err}")));
-                failures.push(format!("{}: {err}", mcu_config.name));
-            }
-        }
-    }
+    // Any board's own result — the run itself, reported per board inside.
+    let (run_failures, ran) = drive_boards(boards, &config, &args).await;
+    failures.extend(run_failures);
 
     // Any board's hard error fails the command (exit code 1); a board that
     // found its limit reported that as its own result and is a success — and a
@@ -320,6 +299,55 @@ enum BoardOutcome {
     Skipped,
 }
 
+/// Every connected board's run: hand the sessions to their futures, poll them
+/// together, and report each board's outcome.
+///
+/// The connections **move** in and nothing outside keeps a reference: this run
+/// is each session's only owner, and it holds that ownership across the join.
+/// [`configure_steppers`]' `drop(mcu)` in a `ResetRequired` reconnect is what
+/// closes the old session before the port is reopened — a caller-side
+/// `Arc<Mcu>` clone would leave it releasing nothing, and the old receive task
+/// would stay a second reader on the port throughout `reconnect()`, dropping
+/// the new session's frames against its own stale sequence state until
+/// identify times out.
+///
+/// Returns the board failures (part of the command's closing error) and how
+/// many boards ran their task.
+async fn drive_boards(
+    boards: Vec<(McuConfig, Arc<Mcu>)>,
+    config: &Config,
+    args: &StressArgs,
+) -> (Vec<String>, usize) {
+    let named = !args.all_mcus;
+    let (mcu_configs, connections): (Vec<McuConfig>, Vec<Arc<Mcu>>) = boards.into_iter().unzip();
+    // One future per connected board, polled together: the ramps interleave on
+    // the same runtime, each with its own port, tasks and state. `named` says
+    // which boards the command promised a stepper: every board except the ones
+    // `--all-mcus` enumerated (that flag takes names of none of its own). The
+    // sessions move into these futures — nothing outside the join below holds
+    // one, or the reconnect's `drop(mcu)` would close nothing.
+    let ramps = connections
+        .into_iter()
+        .zip(&mcu_configs)
+        .map(|(mcu, mcu_config)| run_board(mcu_config, mcu, args.task, config, args, named))
+        .collect::<Vec<_>>();
+    let mut failures = Vec::new();
+    let mut ran = 0usize;
+    for (mcu_config, outcome) in mcu_configs.iter().zip(join_all(ramps).await) {
+        match outcome {
+            Ok(BoardOutcome::Ran) => ran += 1,
+            // The skip line is the board's whole report: it neither ran nor failed.
+            Ok(BoardOutcome::Skipped) => {}
+            Err(err) => {
+                let err = err.to_string();
+                println!("{}", tagged(&mcu_config.name, format!("failed: {err}")));
+                failures.push(format!("{}: {err}", mcu_config.name));
+            }
+        }
+    }
+    (failures, ran)
+}
+
 /// One board's share of a run: the task the command asked for, as its own future.
 ///
 /// The task functions keep their single-board signatures — this dispatcher is
@@ -332,6 +360,16 @@ async fn run_board(
     args: &StressArgs,
     named: bool,
 ) -> Result<BoardOutcome, Box<dyn std::error::Error>> {
+    // The session's only reference from the moment this future runs: a caller
+    // holding a clone would leave `configure_steppers`' `drop(mcu)` in the
+    // `ResetRequired` reconnect releasing nothing, so the old receive task
+    // would outlive the reopened port as a second reader on it.
+    assert_eq!(
+        Arc::strong_count(&mcu),
+        1,
+        "board '{}': the run must own its session alone, a clone would keep the old receive task alive",
+        mcu_config.name
+    );
     match task {
         Task::Step => step_stress(mcu_config, mcu, config, args, named).await,
         Task::Comm => comm_stress(mcu, args).await.map(|()| BoardOutcome::Ran),
@@ -1269,6 +1307,17 @@ async fn configure_steppers(
                 // only then reopen, as upstream does between `reset` and the
                 // reconnect (`klippy/mcu.py`: pause, `_disconnect()`, reopen).
                 tokio::time::sleep(RESET_DISCONNECT_DELAY).await;
+                // The same requirement, checked where it matters: this `drop`
+                // closes the session only when nothing else holds it. A
+                // surviving clone turns it into a no-op and leaves the old
+                // receive task stealing the new session's frames (vA: hundreds
+                // of `Frame with sequence … dropping it` across every reopen).
+                assert_eq!(
+                    Arc::strong_count(&mcu),
+                    1,
+                    "MCU '{}': the old session is still referenced; dropping it would leave its receive task on the port",
+                    mcu_config.name
+                );
                 drop(mcu);
                 mcu = reconnect(mcu_config).await?;
             }
@@ -2083,6 +2132,133 @@ mod tests {
             expected(6),
             "board B's own frames, in order"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Reset → reconnect closes the old session (B2)
+    // -----------------------------------------------------------------------
+
+    /// The `ResetRequired` reconnect the way hardware reached it (vA): a board
+    /// still carrying a **different** configuration can only be taken over by
+    /// rebooting it (`reset`), and the old session has to be closed before the
+    /// port is reopened. The run's hand-off ([`drive_boards`]) is what makes
+    /// that close real — with a caller-side `Arc<Mcu>` clone the `drop` in
+    /// [`configure_steppers`] would release nothing and the old receive task
+    /// would stay a second reader on the port through `reconnect()`.
+    ///
+    /// The contention itself (two readers on **one** transport) is not
+    /// expressible against a fake: every session gets its own device from
+    /// `McuConfig::open`, so no frame can be stolen. What this pins down is the
+    /// invariant behind it — the reconnect is the old session's last owner
+    /// (asserted where the drop happens), that session is really dropped, and
+    /// the new session identifies, is configured and drives its ramp to the end.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_reset_reconnect_drops_the_old_session_before_reopening() {
+        use clap::Parser;
+
+        let dict = klipperx_test_support::test_dicts_dir().join("atmega2560.dict");
+        let text = format!(
+            "[mcu]\ntest: dict={}\n\n[stepper_x]\nstep_pin: PA0\ndir_pin: PB0\n",
+            dict.display()
+        );
+        let (config, _) = Config::from_text(&text).expect("a fake board with a stepper parses");
+        let mcu_config = resolve_mcu(&config, "mcu").expect("the [mcu] section resolves");
+
+        // The reset path's preconditions: this firmware's only reset is the
+        // `reset` command (`mcu/config.rs` answers `ResetRequired` for a board
+        // that carries a different CRC), and the board already carries one.
+        let mcu = connect(&mcu_config)
+            .await
+            .expect("the fake board identifies");
+        assert!(
+            mcu.has_message(Reset::NAME),
+            "the fixture's firmware only reboots with 'reset'"
+        );
+        let stale = ConfigBuilder::new();
+        stale
+            .configure(&mcu)
+            .await
+            .expect("the board takes an initial configuration");
+        // The CRC it now carries: an empty configuration encodes the same bytes
+        // every time, so a second empty builder reads back that same value.
+        let carried_crc = ConfigBuilder::new()
+            .build(&mcu)
+            .expect("an empty configuration builds")
+            .crc;
+        let step_pin = resolve_pin(&mcu, "mcu", "PA0").expect("PA0 resolves");
+        let dir_pin = resolve_pin(&mcu, "mcu", "PB0").expect("PB0 resolves");
+        let stress_builder = ConfigBuilder::new();
+        stress_stepper(&stress_builder, step_pin, dir_pin).expect("the stress stepper fits");
+        let stress_crc = stress_builder
+            .build(&mcu)
+            .expect("the stress configuration builds")
+            .crc;
+        assert_ne!(
+            stress_crc, carried_crc,
+            "a matching CRC would reuse the configuration and never reset"
+        );
+
+        // The hand-off a run makes: the session moves into the board's future
+        // and only a `Weak` stays outside to watch it.
+        let old_session = Arc::downgrade(&mcu);
+        let args = Cli::try_parse_from([
+            "stress",
+            "printer.cfg",
+            "--stage-seconds",
+            "0.01",
+            "--rate-step",
+            "100",
+        ])
+        .expect("a short, coarse ramp parses")
+        .stress;
+        let (failures, ran) = drive_boards(vec![(mcu_config, mcu)], &config, &args).await;
+        assert!(
+            failures.is_empty(),
+            "the board's ramp does not fail: {failures:?}"
+        );
+        assert_eq!(
+            ran, 1,
+            "the reconnected session identified, configured and drove its ramp"
+        );
+
+        // The old session is gone: `configure_steppers` dropped it at the
+        // reconnect — the preconditions above make that path unavoidable, and
+        // its `Arc::strong_count` assertion runs right where the drop happens.
+        assert!(
+            old_session.upgrade().is_none(),
+            "the old session must be dropped before the port is reopened"
+        );
+    }
+
+    /// The run hands every session to its board future and keeps no reference
+    /// of its own — the caller-side half of the same invariant. `run_board`
+    /// checks `Arc::strong_count` the moment its future runs, so a clone
+    /// restored at the call site (the shape that let vA's old receive task
+    /// live through every reopen) fails here rather than on hardware.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_run_gives_each_session_to_its_board_future_outright() {
+        use clap::Parser;
+
+        let dict = klipperx_test_support::test_dicts_dir().join("atmega2560.dict");
+        let path =
+            std::env::temp_dir().join(format!("klipperx-stress-m3-{}.cfg", std::process::id()));
+        std::fs::write(&path, format!("[mcu]\ntest: dict={}\n", dict.display()))
+            .expect("the config file is written");
+        let args = Cli::try_parse_from([
+            "stress",
+            path.to_str().expect("the temp path is utf-8"),
+            "--all-mcus",
+        ])
+        .expect("the command line parses")
+        .stress;
+        let outcome = stress(args).await;
+        let _ = std::fs::remove_file(&path);
+
+        // No stepper section anywhere: the enumerated board is skipped and the
+        // step task reports that it had nothing to drive — the run itself went
+        // through `run_board`'s sole-owner assertion on the way.
+        let err = outcome.expect_err("a run with no stepper section fails");
+        assert!(err.to_string().contains("nothing to drive"), "{err}");
     }
 
     // -----------------------------------------------------------------------

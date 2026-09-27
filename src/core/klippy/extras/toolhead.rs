@@ -46,8 +46,13 @@
 //! print does not overflow the firmware's move queue.
 //!
 //! Steps are generated and sent by a task spawned at connect: it wakes every
-//! [`FLUSH_INTERVAL`], generates everything the planner has queued, and awaits
-//! the transport, so a long move cannot outrun the send queue. The task checks
+//! [`FLUSH_INTERVAL`], generates the planner's queue up to the background
+//! horizons ([`BGFLUSH_HIGH_TIME`] — the estimate plus 0.4 s, or 0.7 s while
+//! queued motion lies beyond the horizon), and awaits the transport, so a long
+//! move cannot outrun the send queue. The horizon is each stamp's birth
+//! margin: generation crosses a step 0.4 s before its own clock, so pipeline
+//! delay cannot make it late and no stamp is born so far ahead that the
+//! firmware's wrapping timer compare reads it as already expired. The task checks
 //! [`ToolHeadObject::shutdown`] each wake, so a restart stops it with the object.
 
 use std::collections::HashMap;
@@ -119,6 +124,22 @@ section!(
 
 /// How often the flush task wakes to generate and send steps.
 const FLUSH_INTERVAL: Duration = Duration::from_millis(10);
+
+/// The background flush's step-generation horizon: how far past the estimate
+/// it generates when the planner is caught up (`BGFLUSH_HIGH_TIME`,
+/// `extras/motion_queuing.py:10`; the relaxed branch at `:214-216`).
+const BGFLUSH_HIGH_TIME: f64 = 0.400;
+
+/// The aggressive branch's window: while queued motion lies beyond the
+/// horizon, generate to `est + 0.7 s`, batching from the last horizon in
+/// `BGFLUSH_SG_HIGH_TIME - BGFLUSH_SG_LOW_TIME` = 0.25 s steps for
+/// run-to-run reproducibility (`motion_queuing.py:197-212`).
+const BGFLUSH_SG_LOW_TIME: f64 = 0.450;
+const BGFLUSH_SG_HIGH_TIME: f64 = 0.700;
+
+/// How far past the planner's own reach the relaxed branch may go
+/// (`need_flush_time + BGFLUSH_EXTRA_TIME`, `motion_queuing.py:215-216`).
+const BGFLUSH_EXTRA_TIME: f64 = 0.250;
 
 /// How old a finished move may stay in the trapq history before it is dropped.
 const MOVE_HISTORY_EXPIRE: f64 = 30.0;
@@ -1909,7 +1930,16 @@ async fn flush_step_generation(state: &Arc<Mutex<Option<Connected>>>) -> Result<
 }
 
 impl Connected {
-    /// Generate the steps for everything queued, and return them by stepper.
+    /// Generate the steps queued for this pass, and return them by stepper.
+    ///
+    /// Every pass is horizon-bounded ([`Self::horizon`]): upstream's explicit
+    /// `flush_all_steps` generates to the content end, but it sends that into
+    /// serialqueue's gates, which hold a far stamp until it is due — this
+    /// host's default transport bypasses those gates, so a content-end dump
+    /// would put a half-wrap-ahead stamp straight on the wire (4.13 s at a
+    /// 520 MHz dictionary — `timer_is_before` reads it as already expired).
+    /// Bounding every pass is the gate-free equivalent: nothing is born more
+    /// than ~0.7 s ahead of the estimate.
     ///
     /// # Errors
     /// An internal [`StepCompressError`] from a stepper's compressor.
@@ -1926,7 +1956,7 @@ impl Connected {
         // Move whatever the planner has queued into the trapq first, so the
         // step generation time below covers it.
         self.toolhead.wait_moves();
-        let step_gen_time = self.toolhead.print_time().max(self.last_step_gen_time);
+        let step_gen_time = self.horizon(self.toolhead.print_time());
         // The previous generation horizon is this batch's start: a lower
         // bound on when its first step runs, and what its messages carry as
         // `req_clock` (`StepBatchClocks`).
@@ -1946,6 +1976,48 @@ impl Connected {
                 })
             })
             .collect())
+    }
+
+    /// The generation horizon for one pass — upstream's `_flush_handler`
+    /// (`extras/motion_queuing.py:196-215`), with `need_step_gen_time` /
+    /// `need_flush_time` read as the planner's own reach (`content_end`,
+    /// `wait_moves` having just drained it) and `kin_flush_delay` — not
+    /// modelled in this host — left at zero.
+    ///
+    /// Bounded by the estimate: `est + 0.4 s` at rest, `est + 0.7 s` while
+    /// queued motion lies beyond the horizon (batched in 0.25 s windows from
+    /// the last horizon). That bound is the stamp's birth margin — generation
+    /// crosses a step 0.4 s before its own clock, so the batching/queue in
+    /// front of the wire cannot land it past due, and no stamp is born more
+    /// than ~0.7 s ahead, where the firmware's wrapping compare
+    /// (`timer_is_before`, ±2³¹ ticks) still orders it.
+    ///
+    /// # Errors
+    /// An internal [`StepCompressError`] from a stepper's compressor.
+    fn horizon(&self, content_end: f64) -> f64 {
+        let last = self.last_step_gen_time;
+        let est = self.toolhead.estimated_print_time();
+        let want = if last < content_end {
+            // Actively stepping — the aggressive branch with its 0.25 s
+            // batching window (`:198-212`).
+            let mut want = est + BGFLUSH_SG_HIGH_TIME;
+            let next_batch = last + (BGFLUSH_SG_HIGH_TIME - BGFLUSH_SG_LOW_TIME);
+            if next_batch > want {
+                want = if next_batch > want + 0.005 {
+                    // Far past the window: delay to the next wakeup, so the
+                    // batch boundaries land on the same instants run to run.
+                    last
+                } else {
+                    next_batch
+                };
+            }
+            want.min(content_end)
+        } else {
+            // Caught up — the relaxed branch (`:214-216`).
+            (est + BGFLUSH_HIGH_TIME).min(content_end + BGFLUSH_EXTRA_TIME)
+        };
+        // Raise-only: a horizon the machine has not caught up with stays.
+        want.max(last)
     }
 }
 

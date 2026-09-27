@@ -80,14 +80,13 @@ const CLOCK_POLL_INTERVAL: f64 = 1.0;
 
 /// The same read, for a **fake** transport (`test: dict=`): 150 ms.
 ///
-/// The simulator's virtual clock jumps forward when it executes a scheduled
-/// command (`interface/devices/simulator.rs`, `State::executed_floor`), and
-/// this poll is the only way that jump reaches the host's estimate — the send
-/// gates judge against the estimate, so at the production cadence every gated
-/// batch would wait up to a second per jump. 150 ms bounds that wait; a
-/// production link keeps [`CLOCK_POLL_INTERVAL`] (C3b's ~1 s cadence, RTT
-/// sample density and fit-window semantics unchanged — only transports the
-/// config names `test:` poll fast).
+/// A fake link answers instantly, so only cadence is given up: polling fast
+/// keeps the estimate — and the send gates that judge against it — fresh for
+/// a run that finishes in seconds rather than hours, and fills the
+/// estimator's fit window early. A production link keeps
+/// [`CLOCK_POLL_INTERVAL`] (C3b's ~1 s cadence, RTT sample density and
+/// fit-window semantics unchanged — only transports the config names
+/// `test:` poll fast).
 const FAKE_CLOCK_POLL_INTERVAL: f64 = 0.15;
 
 /// The printer object for one `[mcu]` / `[mcu <name>]` section.

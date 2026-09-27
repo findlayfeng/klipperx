@@ -118,6 +118,58 @@ struct State {
     /// sends spontaneously (the monitor expiry) carries a sequence the receive
     /// loop has already seen instead of one it would drop.
     last_host_seq: u8,
+    /// The step chains this firmware drives, by `config_stepper` oid — the
+    /// firmware's `next_step_time` chain (`stepper.c`). Kept across host
+    /// sessions: a host that reuses the configuration must re-anchor the chain
+    /// with `reset_step_clock` (Q10 / the C5 case); a session that does not
+    /// keeps the last session's tail, which is what lets a first step land in
+    /// the past (`Timer too close`).
+    steppers: HashMap<u8, StepChain>,
+    /// Whether the attached sensor feeds the firmware its samples locally —
+    /// `ldc1612_attach_trigger_analog` hands the chip to the trigger module,
+    /// and from then on samples reach it without ever crossing the wire (the
+    /// host pulls bulk data occasionally; `home_start` sizes the monitor
+    /// window as one sample period, `MONITOR_MAX` 3 missed samples). The
+    /// monitor slides while this is alive and only a genuinely silent sensor
+    /// can expire it.
+    ldc_sampling: bool,
+    /// A shutdown the step-chain model raised, with its `static_string_id`
+    /// name. Distinct from `shutdown` (the interface-level close): real
+    /// firmware keeps answering `get_clock`/`stats` after a shutdown, and
+    /// reports why through `get_config` plus one `shutdown` frame.
+    firmware_shutdown: Option<&'static str>,
+    /// The `static_string_id` values this dictionary gives the two shutdowns
+    /// the model can raise, resolved once at construction; a dictionary
+    /// without the string suppresses that report (an unnamed id renders as
+    /// `?<value>`, which the host would not match either).
+    shutdown_ids: ShutdownIds,
+}
+
+/// The firmware's per-stepper chain state (`stepper.c`): where the next step
+/// fires from (`base + interval`), when the armed batch ends (`end`, standing
+/// in for `s->count > 0`), and how far apart steps run.
+#[derive(Debug, Clone, Copy)]
+struct StepChain {
+    /// The firmware's `s->next_step_time`: the chain anchor. `config_stepper`
+    /// zeroes it; a reused firmware keeps the last session's tail — the
+    /// leftover the C5 case hinged on.
+    base: u32,
+    /// The step distance of the batch that armed this chain.
+    interval: u32,
+    /// When the armed batch's last step fires (wrapping); the chain is busy
+    /// while `now` is before it. Approximates `count`/`add` bookkeeping
+    /// (`stepper.c:96-123`) — enough to answer "is this stepper running".
+    end: u32,
+    /// Whether a batch is armed (the firmware's `s->count > 0`).
+    armed: bool,
+}
+
+/// The `static_string_id` of the shutdowns [`State::firmware_shutdown`] can
+/// raise, read from the dictionary once, at construction.
+#[derive(Debug, Default, Clone, Copy)]
+struct ShutdownIds {
+    timer_too_close: Option<i64>,
+    reset_active: Option<i64>,
 }
 
 /// An armed `trigger_analog_home` the fake firmware has not fired yet.
@@ -181,6 +233,12 @@ impl SimulatorDevice {
         let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(&raw).map_err(|e| format!("zlib: {e}"))?;
         let compressed = encoder.finish().map_err(|e| format!("zlib: {e}"))?;
+        let static_strings = dictionary.enumeration("static_string_id");
+        let shutdown_ids = ShutdownIds {
+            timer_too_close: static_strings.and_then(|e| e.value("Timer too close")),
+            reset_active: static_strings
+                .and_then(|e| e.value("Can't reset time when stepper active")),
+        };
         Ok(Self {
             state: Mutex::new(State {
                 parser: identify::new_parser(),
@@ -201,6 +259,10 @@ impl SimulatorDevice {
                 trigger_analog: None,
                 ta_homing_clock: 0,
                 last_host_seq: 0,
+                steppers: HashMap::new(),
+                firmware_shutdown: None,
+                ldc_sampling: false,
+                shutdown_ids,
             }),
             signal: Condvar::new(),
         })
@@ -216,6 +278,13 @@ impl SimulatorDevice {
     }
 
     /// The synthetic clock, in firmware ticks since construction.
+    ///
+    /// Pure wall time: the firmware's hardware counter does not jump, so
+    /// neither does this one. (An "executed floor" that advanced time to a
+    /// scheduled command's schedule was tried for Q10 and removed — it let
+    /// one chain's far stamp pull the clock far enough ahead to expire an
+    /// earlier-stamped chain, and it parked whole batches for seconds; the
+    /// host's step-generation horizon now bounds stamps instead.)
     fn clock(state: &State) -> u64 {
         (state.started.elapsed().as_secs_f64() * state.freq) as u64
     }
@@ -229,6 +298,46 @@ impl SimulatorDevice {
     /// in-flight queue (the sender drops only what is *below* what the
     /// firmware reports) and the host would retransmit — and this fake would
     /// re-run — that block forever whenever the host then falls silent.
+    /// The firmware's timer comparison (`armcm_timer.c:26-30`): a signed
+    /// compare over wrapping 32-bit ticks — only meaningful within ±2³¹
+    /// ticks (29.8 s at 72 MHz), the edge the real `Timer too close` check
+    /// false-positives at.
+    fn timer_is_before(a: u32, b: u32) -> bool {
+        (a.wrapping_sub(b) as i32) < 0
+    }
+
+    /// Steps in the batch a `queue_step` arms, from its first step (`k = 0`,
+    /// `base + interval`) to its last (`k = count - 1`): the span the chain's
+    /// `end` covers. Truncating `as u32` wraps like the firmware's ticks;
+    /// `count = 0` is `Invalid count parameter` upstream and never arrives.
+    fn chain_span(interval: u32, count: u16, add: i16) -> u32 {
+        let n = i128::from(count.saturating_sub(1));
+        let span = i128::from(interval) * n + i128::from(add) * n * (n - 1) / 2;
+        span.max(0) as u32
+    }
+
+    /// Raise a firmware-style shutdown once: record why, and emit the
+    /// `shutdown clock=%u static_string_id=%hu` frame the host renders as
+    /// `MCU shutdown: <reason>` (the dictionary gives the id — an unnamed
+    /// reason suppresses the frame instead of sending a bogus id).
+    fn raise_firmware_shutdown(state: &mut State, seq: u8, reason: &'static str, id: Option<i64>) {
+        if state.firmware_shutdown.is_some() {
+            return;
+        }
+        state.firmware_shutdown = Some(reason);
+        let Some(id) = id else {
+            debug!("simulator: no static_string_id for '{reason}', suppressing the report");
+            return;
+        };
+        let clock = Self::clock(state) as u32;
+        Self::respond(
+            state,
+            seq,
+            "shutdown",
+            &[ArgValue::UInt32(clock), ArgValue::UInt16(id as u16)],
+        );
+    }
+
     fn respond(state: &mut State, seq: u8, name: &str, values: &[ArgValue]) {
         match state.parser.encode(name, values) {
             Ok(payload) => state
@@ -267,6 +376,7 @@ impl SimulatorDevice {
                 "identify" => Self::identify(state, seq, &params),
                 "get_config" => {
                     let is_config = u8::from(state.configured);
+                    let is_shutdown = u8::from(state.firmware_shutdown.is_some());
                     Self::respond(
                         state,
                         seq,
@@ -274,7 +384,7 @@ impl SimulatorDevice {
                         &[
                             ArgValue::UInt8(is_config),
                             ArgValue::UInt32(state.crc),
-                            ArgValue::UInt8(0),
+                            ArgValue::UInt8(is_shutdown),
                             ArgValue::UInt16(MOVE_COUNT),
                         ],
                     );
@@ -288,6 +398,20 @@ impl SimulatorDevice {
                 "config_reset" | "reset" => {
                     state.configured = false;
                     state.crc = 0;
+                    // A real `reset` reboots: chains start over at zero
+                    // (`config_stepper` will be resent) and a modelled
+                    // shutdown is gone. The clock is *not* restarted here —
+                    // construction anchors it, which only differs from a
+                    // reboot in uptime, not in ordering.
+                    state.steppers.clear();
+                    state.firmware_shutdown = None;
+                    state.ldc_sampling = false;
+                }
+                // `clear_shutdown`: the host reads a shutdown, then clears it
+                // (upstream: only valid *while* shutdown — `Shutdown cleared
+                // when not shutdown`). Idle here: clearing nothing is a no-op.
+                "clear_shutdown" => {
+                    state.firmware_shutdown = None;
                 }
                 "get_clock" => {
                     let clock = Self::clock(state) as u32;
@@ -558,19 +682,133 @@ impl SimulatorDevice {
                 // the carriage has started, so an armed endstop now trips. The
                 // clock it carries is what the trigger is reported at.
                 "reset_step_clock" => {
-                    let clock = match params.get(1) {
-                        Some(ArgValue::UInt32(v)) => *v,
-                        _ => state.endstop_clock,
+                    let (Some(ArgValue::UInt8(oid)), Some(ArgValue::UInt32(new_base))) =
+                        (params.first(), params.get(1))
+                    else {
+                        debug!("simulator: reset_step_clock with unexpected arguments");
+                        continue;
                     };
-                    state.endstop_clock = state.endstop_clock.max(clock);
-                    Self::trigger_if_armed(state, seq, clock);
-                    Self::trigger_analog_if_armed(state, seq, clock);
+                    let (oid, new_base) = (*oid, *new_base);
+                    // The firmware refuses a *running* chain before touching
+                    // the base (`stepper.c:310-313`); an idle one takes the
+                    // new anchor — which is exactly what the restart list of a
+                    // config-reusing host carries, and what a session without
+                    // it fails to do (the C5 leftover, Q10).
+                    let ids = state.shutdown_ids;
+                    let now = Self::clock(state) as u32;
+                    let busy = state
+                        .steppers
+                        .get(&oid)
+                        .is_some_and(|chain| chain.armed && Self::timer_is_before(now, chain.end));
+                    if busy {
+                        Self::raise_firmware_shutdown(
+                            state,
+                            seq,
+                            "Can't reset time when stepper active",
+                            ids.reset_active,
+                        );
+                        continue;
+                    }
+                    if let Some(chain) = state.steppers.get_mut(&oid) {
+                        chain.base = new_base;
+                        chain.armed = false;
+                    }
+                    state.endstop_clock = state.endstop_clock.max(new_base);
+                    Self::trigger_if_armed(state, seq, new_base);
+                    Self::trigger_analog_if_armed(state, seq, new_base);
                 }
                 // `queue_step` is the move itself: also a trigger point.
                 "queue_step" => {
                     let clock = state.endstop_clock;
                     Self::trigger_if_armed(state, seq, clock);
                     Self::trigger_analog_if_armed(state, seq, clock);
+                    if state.firmware_shutdown.is_some() {
+                        // The firmware refuses commands after a shutdown
+                        // (`sched.c`); the block is still acked by the caller.
+                        continue;
+                    }
+                    let (
+                        Some(ArgValue::UInt8(oid)),
+                        Some(ArgValue::UInt32(interval)),
+                        Some(ArgValue::UInt16(count)),
+                        Some(ArgValue::Int16(add)),
+                    ) = (params.get(0), params.get(1), params.get(2), params.get(3))
+                    else {
+                        debug!("simulator: queue_step with unexpected arguments");
+                        continue;
+                    };
+                    let (oid, interval, count, add) = (*oid, *interval, *count, *add);
+                    if count == 0 {
+                        // `Invalid count parameter` (`stepper.c:265-266`):
+                        // the host never sends one; ignore like the firmware
+                        // would refuse it.
+                        continue;
+                    }
+                    let now = Self::clock(state) as u32;
+                    let expired = {
+                        let Some(chain) = state.steppers.get_mut(&oid) else {
+                            debug!("simulator: queue_step for an oid without config_stepper");
+                            continue;
+                        };
+                        if chain.armed && Self::timer_is_before(now, chain.end) {
+                            // Running: the firmware only queues the move
+                            // (`stepper.c:280-281`), chaining it behind the
+                            // batch — no timer is armed, nothing can expire.
+                            chain.end = chain
+                                .end
+                                .wrapping_add(Self::chain_span(interval, count, add));
+                            false
+                        } else {
+                            // Idle: the first step fires at `base + interval`
+                            // (`stepper.c:100-101`). With `base` at zero that
+                            // makes the interval the first shot's absolute
+                            // clock; with a leftover base it is wherever the
+                            // last session left the chain.
+                            if chain.armed {
+                                // The batch ran out between commands: the
+                                // firmware's `next_step_time` walked to the
+                                // chain's tail, so the next batch chains off
+                                // `end`, not off this batch's first shot.
+                                chain.base = chain.end;
+                                chain.armed = false;
+                            }
+                            let first = chain.base.wrapping_add(interval);
+                            if Self::timer_is_before(first, now) {
+                                true
+                            } else {
+                                chain.base = first;
+                                chain.end =
+                                    first.wrapping_add(Self::chain_span(interval, count, add));
+                                chain.armed = true;
+                                false
+                            }
+                        }
+                    };
+                    if expired {
+                        let ids = state.shutdown_ids;
+                        Self::raise_firmware_shutdown(
+                            state,
+                            seq,
+                            "Timer too close",
+                            ids.timer_too_close,
+                        );
+                    }
+                }
+                // A fresh `config_stepper` zeroes the chain — over an existing
+                // oid it drops whatever the last session left (`oid_alloc`,
+                // `stepper.c:220-226`).
+                "config_stepper" => {
+                    if let Some(ArgValue::UInt8(oid)) = params.first() {
+                        state.steppers.insert(
+                            *oid,
+                            StepChain {
+                                base: 0,
+                                interval: 0,
+                                end: 0,
+                                armed: false,
+                            },
+                        );
+                    }
                 }
                 // The ldc1612's register access over the shared I2C bus:
                 // `i2c_transfer oid=%c write=%*s read_len=%u`. The chip answers
@@ -638,8 +876,13 @@ impl SimulatorDevice {
                     );
                 }
                 // Everything else is accepted and ignored: `allocate_oids`,
-                // `config_*` (`config_ldc1612*`, `ldc1612_attach_trigger_analog`,
-                // `query_ldc1612`'s arm), `emergency_stop`, and any command this
+                // The sensor coming up arms its local sample feed: from the
+                // attach on, samples are the firmware's own business
+                // (`ldc1612_attach_trigger_analog` + `config_ldc1612*`).
+                "config_ldc1612" | "config_ldc1612_with_intb" | "ldc1612_attach_trigger_analog" => {
+                    state.ldc_sampling = true;
+                }
+                // `config_*` (`query_ldc1612`'s arm), `emergency_stop`, and any command this
                 // fake firmware does not model yet.
                 _ => {}
             }
@@ -729,10 +972,22 @@ impl SimulatorDevice {
     /// report was made.
     fn fire_monitor_if_expired(state: &mut State, seq: u8) -> bool {
         let now = Self::clock(state) as u32;
+        let ldc_sampling = state.ldc_sampling;
         let Some(armed) = state.trigger_analog.as_mut() else {
             return false;
         };
         if armed.fired {
+            return false;
+        }
+        if ldc_sampling {
+            // The attached sensor's samples reach the firmware locally —
+            // the wire never carries them, so a window that waited on wire
+            // traffic would false-expire a perfectly live sensor
+            // (`monitor_ticks` = one sample period at `samples_per_second`,
+            // `MONITOR_MAX` = 3 missed, `trigger_analog.py:374-385`; fed
+            // from `ldc1612_attach_trigger_analog`, `sensor_ldc1612.c`).
+            // The window slides until the feed itself goes quiet.
+            armed.deadline = now.wrapping_add(armed.window);
             return false;
         }
         if (now.wrapping_sub(armed.deadline) as i32) < 0 {
@@ -1039,6 +1294,56 @@ mod tests {
             ],
         );
         assert!(queued(&device).is_none(), "one report ends the check");
+    }
+
+    #[test]
+    fn an_attached_sensor_slides_the_monitor_window() {
+        // `home_start` sizes the window as one sample period with three
+        // missed allowed (`trigger_analog.py:374-385`); while the sensor is
+        // attached those samples reach the firmware without crossing the
+        // wire (`ldc1612_attach_trigger_analog`), so an armed monitor must
+        // slide rather than expire on wire silence — the `eddy.test` shape
+        // (the host's next batch lands well outside a sample-period window).
+        let device = armed_device();
+        issue(
+            &device,
+            "config_ldc1612",
+            &[ArgValue::UInt8(1), ArgValue::UInt8(1)],
+        );
+        issue(
+            &device,
+            "trigger_analog_home",
+            &[
+                ArgValue::UInt8(1),
+                ArgValue::UInt8(2),
+                ArgValue::UInt8(1),
+                ArgValue::UInt8(5),
+                ArgValue::UInt32(0),
+                ArgValue::UInt32(1),
+                ArgValue::UInt32(3),
+            ],
+        );
+
+        // Walk far past the window: the local feed keeps it open.
+        advance_ticks(&device, 100_000);
+        {
+            let mut state = device.state.lock().unwrap_or_else(|p| p.into_inner());
+            assert!(
+                !SimulatorDevice::fire_monitor_if_expired(&mut state, 0),
+                "the attached sensor's samples slide the window"
+            );
+            let armed = state.trigger_analog.as_ref().expect("still armed");
+            assert!(!armed.fired, "no monitor report while sampling");
+        }
+
+        // Detach (reboot clears the feed with everything else): the same
+        // silence then expires the window, as the untouched test below pins.
+        issue(&device, "reset", &[]);
+        assert_eq!(shutdown_reason(&device), None);
+        {
+            let mut state = device.state.lock().unwrap_or_else(|p| p.into_inner());
+            assert!(!state.ldc_sampling, "a reboot drops the feed");
+        }
     }
 
     #[test]
@@ -1356,5 +1661,237 @@ mod tests {
         let (_, args) = queued(&device).expect("an answer");
         assert_eq!(args[2], ArgValue::UInt32(1000));
         assert_eq!(args[3], ArgValue::UInt8(0), "still open");
+    }
+
+    // -----------------------------------------------------------------------
+    // step chain: the firmware's `next_step_time` across sessions (Q10 / C5)
+    // -----------------------------------------------------------------------
+
+    /// `config_stepper oid=0` with dummy pins: a chain at base zero.
+    fn config_a_stepper(device: &SimulatorDevice) {
+        issue(
+            device,
+            "config_stepper",
+            &[
+                ArgValue::UInt8(0),
+                ArgValue::UInt8(16),
+                ArgValue::UInt8(17),
+                ArgValue::UInt8(0),
+                ArgValue::UInt32(0),
+            ],
+        );
+    }
+
+    /// Advance the fake's clock by `ticks` of this dictionary's `CLOCK_FREQ`
+    /// (the clock counts from construction, anchored at `State::started`), so
+    /// "now" lands where a test needs it without sleeping.
+    ///
+    /// The test dictionaries differ (16 MHz AVR, 72 MHz STM32…), so tick
+    /// math has to follow the dict rather than a hard-coded rate — a fixed
+    /// "500 ms" of wall time is 8 M ticks at 16 MHz, not the 36 M a 72 MHz
+    /// reading would give.
+    fn advance_ticks(device: &SimulatorDevice, ticks: u32) {
+        let mut state = device.state.lock().unwrap_or_else(|p| p.into_inner());
+        let by = Duration::from_secs_f64(ticks as f64 / state.freq);
+        if let Some(earlier) = state.started.checked_sub(by) {
+            state.started = earlier;
+        }
+    }
+
+    /// The recorded reason the model shut down for, if any.
+    fn shutdown_reason(device: &SimulatorDevice) -> Option<&'static str> {
+        device
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .firmware_shutdown
+    }
+
+    #[test]
+    fn timer_is_before_follows_the_firmware_wrap() {
+        assert!(SimulatorDevice::timer_is_before(100, 200));
+        assert!(!SimulatorDevice::timer_is_before(200, 100));
+        // Across the wrap the signed compare keeps ordering: 0xffff_ff00 is
+        // "now - 256", 0x0000_0100 is "now + 256".
+        assert!(SimulatorDevice::timer_is_before(0xffff_ff00, 0x0000_0100));
+        assert!(!SimulatorDevice::timer_is_before(0x0000_0100, 0xffff_ff00));
+        // The 2³¹-tick edge (29.8 s at 72 MHz): exactly half a wrap ahead
+        // compares as "before" — the false-positive side of `Timer too
+        // close`, kept because the firmware's arithmetic has it too
+        // (`armcm_timer.c:26-30`).
+        assert!(!SimulatorDevice::timer_is_before(0x7fff_ffff, 0));
+        assert!(SimulatorDevice::timer_is_before(0x8000_0000, 0));
+    }
+
+    #[test]
+    fn an_expired_first_step_reports_timer_too_close() {
+        let device = armed_device();
+        config_a_stepper(&device);
+        advance_ticks(&device, 72_000); // > 1_000 ticks at any dict rate
+
+        // `base = 0`, a small interval: the first shot (`base + interval`)
+        // lands behind the fake's now — the firmware arms it at :283-285 and
+        // `sched_add_timer` trips over the past (`sched.c:91-94`).
+        issue(
+            &device,
+            "queue_step",
+            &[
+                ArgValue::UInt8(0),
+                ArgValue::UInt32(1_000),
+                ArgValue::UInt16(100),
+                ArgValue::Int16(0),
+            ],
+        );
+        let (name, args) = queued(&device).expect("the shutdown report");
+        assert_eq!(name, "shutdown");
+        let id = device
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .shutdown_ids
+            .timer_too_close
+            .expect("the dictionary names 'Timer too close'");
+        assert!(matches!(args[0], ArgValue::UInt32(_)), "clock is a u32");
+        assert_eq!(args[1], ArgValue::UInt16(id as u16));
+        assert_eq!(shutdown_reason(&device), Some("Timer too close"));
+
+        // `get_config` reports the shutdown the way real firmware does …
+        issue(&device, "get_config", &[]);
+        let (_, cfg) = queued(&device).expect("a config answer");
+        assert_eq!(cfg[2], ArgValue::UInt8(1));
+
+        // … and refuses further steps (the block is still acked by `send`).
+        issue(
+            &device,
+            "queue_step",
+            &[
+                ArgValue::UInt8(0),
+                ArgValue::UInt32(5_000),
+                ArgValue::UInt16(10),
+                ArgValue::Int16(0),
+            ],
+        );
+        assert!(queued(&device).is_none(), "the firmware is shut down");
+    }
+
+    #[test]
+    fn a_stale_chain_expires_until_reset_step_clock_reanchors() {
+        // The C5 shape: a session leaves its chain tail behind; the next
+        // session that reuses the configuration must re-anchor it — the
+        // restart list's `reset_step_clock clock=0` (`stepper.py:117-118`).
+        let device = armed_device();
+        config_a_stepper(&device);
+        issue(
+            &device,
+            "queue_step",
+            &[
+                ArgValue::UInt8(0),
+                ArgValue::UInt32(0x00ff_ffff), // first shot far in the future
+                ArgValue::UInt16(1),
+                ArgValue::Int16(0),
+            ],
+        );
+        assert!(queued(&device).is_none(), "armed without complaint");
+        advance_ticks(&device, 0x0100_1000); // past the 0x00ff_ffff tail
+                                             // The batch ran out; the chain's base stays at its tail — the
+                                             // leftover.
+
+        // Without the re-anchor (the bug): a small interval chains onto the
+        // leftover and the first shot is in the past.
+        issue(
+            &device,
+            "queue_step",
+            &[
+                ArgValue::UInt8(0),
+                ArgValue::UInt32(64),
+                ArgValue::UInt16(50),
+                ArgValue::Int16(0),
+            ],
+        );
+        let (name, _) = queued(&device).expect("the stale chain expires");
+        assert_eq!(name, "shutdown");
+
+        // With it (a fresh device, same history): `reset_step_clock clock=0`
+        // re-anchors, and the interval becomes the first shot's absolute
+        // clock again (base 0 ⇒ P4), so a future shot is accepted.
+        let device = armed_device();
+        config_a_stepper(&device);
+        issue(
+            &device,
+            "queue_step",
+            &[
+                ArgValue::UInt8(0),
+                ArgValue::UInt32(0x00ff_ffff),
+                ArgValue::UInt16(1),
+                ArgValue::Int16(0),
+            ],
+        );
+        assert!(queued(&device).is_none());
+        advance_ticks(&device, 0x0100_1000); // now ≈ 0x0100_1000
+        issue(
+            &device,
+            "reset_step_clock",
+            &[ArgValue::UInt8(0), ArgValue::UInt32(0)],
+        );
+        assert!(queued(&device).is_none(), "no endstop is armed");
+        issue(
+            &device,
+            "queue_step",
+            &[
+                ArgValue::UInt8(0),
+                ArgValue::UInt32(0x0400_0000), // 67 M ticks > now, < 2³¹
+                ArgValue::UInt16(100),
+                ArgValue::Int16(0),
+            ],
+        );
+        assert!(queued(&device).is_none(), "the re-anchored shot is ahead");
+        assert_eq!(
+            shutdown_reason(&device),
+            None,
+            "no shutdown on the re-anchored path"
+        );
+    }
+
+    #[test]
+    fn reset_of_a_running_chain_reports_the_firmware_error() {
+        let device = armed_device();
+        config_a_stepper(&device);
+        issue(
+            &device,
+            "queue_step",
+            &[
+                ArgValue::UInt8(0),
+                ArgValue::UInt32(0x0100_0000), // armed ~0.23 s out; busy
+                ArgValue::UInt16(100),
+                ArgValue::Int16(0),
+            ],
+        );
+        assert!(queued(&device).is_none());
+
+        // Reach `busy` over the wire: the clock walks into the armed batch's
+        // span (past its first shot, before its end), and a re-anchor while
+        // the chain runs is the firmware's refusal (`stepper.c:310-313`).
+        advance_ticks(&device, 0x0100_0000 + 1_000);
+
+        // `stepper.c:310-313`: a running chain refuses the re-anchor.
+        issue(
+            &device,
+            "reset_step_clock",
+            &[ArgValue::UInt8(0), ArgValue::UInt32(0)],
+        );
+        let (name, args) = queued(&device).expect("the shutdown report");
+        assert_eq!(name, "shutdown");
+        let id = device
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .shutdown_ids
+            .reset_active
+            .expect("the dictionary names 'Can't reset time when stepper active'");
+        assert_eq!(args[1], ArgValue::UInt16(id as u16));
+        assert_eq!(
+            shutdown_reason(&device),
+            Some("Can't reset time when stepper active")
+        );
     }
 }

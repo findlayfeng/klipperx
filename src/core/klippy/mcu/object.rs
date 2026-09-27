@@ -29,9 +29,9 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use serde_json::{json, Map, Value};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
-use crate::core::klippy::cmd::clock::{McuClock, SecondarySync};
+use crate::core::klippy::cmd::clock::{ClockSync, McuClock, SecondarySync};
 use crate::core::klippy::cmd::config::Reset;
 use crate::core::klippy::cmd::shutdown::EmergencyStop;
 use crate::core::klippy::cmd::uptime::{GetUptime, Uptime};
@@ -48,7 +48,7 @@ use crate::core::klippy::mcu::{
 };
 use crate::core::klippy::pins::{PinError, PinParams, PrinterPins, PINS_OBJECT};
 use crate::core::klippy::printer::{ConnectFuture, Printer, PrinterObject, RestartFuture};
-use crate::core::klippy::reactor::TimerHandle;
+use crate::core::klippy::reactor::{Reactor, TimerHandle};
 
 /// How long to wait between attempts to reopen a board that was just told to
 /// reboot. A native-USB board re-enumerates, so the port is briefly gone.
@@ -70,6 +70,13 @@ const CLOCK_BASE_TIMEOUT: Duration = Duration::from_secs(1);
 /// How often a secondary MCU's clock alignment is recalibrated, in seconds
 /// (upstream does it in the periodic `stats`, `klippy/extras/motion_quuing.py:100`).
 const RECALIBRATE_INTERVAL: f64 = 1.0;
+
+/// How often the host reads a connected MCU's clock to keep its estimate fed,
+/// in seconds. Upstream's `get_clock` timer fires every ~0.9839 s — deliberately
+/// off the round second so it does not resonate with other periodic events
+/// (`klippy/clocksync.py:62-68`); one second here, the same order as
+/// [`RECALIBRATE_INTERVAL`], whose precedent the registration follows.
+const CLOCK_POLL_INTERVAL: f64 = 1.0;
 
 /// The printer object for one `[mcu]` / `[mcu <name>]` section.
 pub struct McuObject {
@@ -114,6 +121,8 @@ pub struct McuObject {
     secondary_sync: Mutex<Option<SecondarySync>>,
     /// The periodic recalibration timer, cancelled on drop.
     recalibrate_timer: Mutex<Option<TimerHandle>>,
+    /// The periodic clock poll timer (`mcu_clock_poll`), cancelled on drop.
+    clock_poll_timer: Mutex<Option<TimerHandle>>,
     /// The machine, for reporting a firmware shutdown. `Weak` because the
     /// printer's registry owns this object: a strong handle would be a cycle
     /// that keeps the printer (and its device) alive forever.
@@ -149,6 +158,7 @@ impl McuObject {
             last_stats: Arc::new(Mutex::new(None)),
             secondary_sync: Mutex::new(None),
             recalibrate_timer: Mutex::new(None),
+            clock_poll_timer: Mutex::new(None),
             printer: Arc::downgrade(printer),
         })
     }
@@ -334,6 +344,71 @@ impl McuObject {
             now,
         );
         self.chip.set_mapping(sync.offset, sync.freq);
+    }
+
+    /// Register the periodic clock read that feeds the estimate
+    /// (`mcu_clock_poll`), following the `mcu_recalibrate` timer's shape for
+    /// registration, cancellation and shutdown.
+    ///
+    /// Samples reach the estimators only through [`McuClock::get_clock`]
+    /// (`cmd/clock.rs`), and upstream drives it from a timer that fires every
+    /// ~0.9839 s (`klippy/clocksync.py:62-68`); without a periodic query the
+    /// estimate would run on its connect seed alone forever. The timer is
+    /// registered for **every** MCU: `mcu_recalibrate` only *reads* the
+    /// estimators (`SecondarySync::calibrate` is pure math), so a primary and a
+    /// secondary alike get their samples from this poll — one query stream per
+    /// MCU, none fed twice.
+    ///
+    /// A failed round trip is logged at debug level and the next interval runs
+    /// as usual: this timer feeds an estimate, it does not watch for a dead MCU.
+    /// Cancellation is the precedent's — [`McuObject::release_cycles`] on
+    /// teardown (`Drop`), so nothing polls after the machine comes down.
+    fn register_clock_poll(&self, reactor: &dyn Reactor) {
+        let printer = self.printer.clone();
+        let identifier = self.section.identifier();
+        let handle = reactor.register_timer_named(
+            "mcu_clock_poll",
+            Box::new(move |eventtime| {
+                let Some(printer) = printer.upgrade() else {
+                    return None;
+                };
+                if let Some(object) = printer.lookup_object_as::<McuObject>(&identifier) {
+                    object.poll_clock();
+                }
+                Some(eventtime + CLOCK_POLL_INTERVAL)
+            }),
+            reactor.monotonic() + CLOCK_POLL_INTERVAL,
+        );
+        *self
+            .clock_poll_timer
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(handle);
+    }
+
+    /// One `mcu_clock_poll` round: read the firmware clock.
+    ///
+    /// The round trip is awaited on the runtime, not here — a timer callback
+    /// must not block the dispatcher. [`McuClock::get_clock`] folds the answer
+    /// into its regression and, through it, into `Mcu::record_clock_sample`; a
+    /// query that fails (a firmware without the message, a timeout) logs at
+    /// debug level, feeds nothing and changes nothing — the timer keeps its
+    /// schedule and the next round tries again.
+    fn poll_clock(&self) {
+        let Some(clock) = self.clock() else {
+            // No estimate, so no seed either: there is nothing to feed.
+            return;
+        };
+        let name = self.chip.name().to_string();
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    if let Err(err) = clock.get_clock().await {
+                        debug!("MCU '{name}': clock poll failed: {err}");
+                    }
+                });
+            }
+            Err(_) => debug!("MCU '{name}': the clock poll needs an async runtime"),
+        }
     }
 
     /// Snapshot a connected MCU's identify status for `objects/query`.
@@ -546,6 +621,14 @@ impl McuObject {
         {
             handle.cancel();
         }
+        if let Some(handle) = self
+            .clock_poll_timer
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .take()
+        {
+            handle.cancel();
+        }
         if let Some(mcu) = self.chip.mcu() {
             mcu.clear_events();
         }
@@ -695,6 +778,7 @@ impl PrinterObject for McuObject {
             // convert print time to this MCU's clock read it through the chip.
             if let Some(reactor) = &reactor {
                 let clock = Arc::new(McuClock::new(Arc::clone(&mcu), Arc::clone(reactor)));
+                let seeded = uptime.is_some();
                 if let Some(clock64) = uptime {
                     clock.seed(sent_time, clock64 as i64);
                 }
@@ -739,6 +823,15 @@ impl PrinterObject for McuObject {
                         .recalibrate_timer
                         .lock()
                         .unwrap_or_else(|p| p.into_inner()) = Some(handle);
+                }
+                // The periodic `get_clock` that keeps the estimate fed — for
+                // every MCU, primary and secondary alike (`mcu_recalibrate`
+                // only reads the estimators, it never queries). Registered
+                // only once the seed is in, so a sample always corrects a base
+                // instead of starting an unseeded regression; before identify
+                // there is no clock to poll at all.
+                if seeded {
+                    self.register_clock_poll(reactor.as_ref());
                 }
             }
             // Identify installed the dictionary; reserve the pins the firmware
@@ -1453,5 +1546,177 @@ mod tests {
         let status = object.get_status(0.0);
         assert_eq!(status["last_stats"]["mcu_tick_awake"], 0.25);
         assert_eq!(status["last_stats"]["mcu_tick_avg"], 1.5e-6);
+    }
+
+    // -----------------------------------------------------------------------
+    // The periodic clock poll (`mcu_clock_poll`)
+    // -----------------------------------------------------------------------
+
+    /// The dictionary of a firmware that answers `get_clock`, as the clock
+    /// module's own tests script it.
+    fn polling_dictionary() -> Value {
+        json!({
+            "commands": {"get_clock": 5},
+            "responses": {"clock clock=%u": 18},
+            "config": {"CLOCK_FREQ": 20000000},
+        })
+    }
+
+    /// The one scripted `get_clock` → `clock <value>` exchange.
+    fn clock_exchange(clock: u32) -> Vec<MappingEntry> {
+        let mut response = Payload::new();
+        response.push_u8(18).unwrap(); // response id, `clock clock=%u`
+        response.push_u32(clock).unwrap();
+        vec![MappingEntry {
+            input: Frame::new(0, vec![5]), // `get_clock`, no parameters
+            outputs: vec![Frame::new(0, response.into_raw())],
+        }]
+    }
+
+    /// Wait up to a second for `want` recorded frames, then hand them over.
+    async fn wait_for_frames(recorder: &FrameRecorder, want: usize) -> Vec<Frame> {
+        for _ in 0..200 {
+            let frames = recorder.frames();
+            if frames.len() >= want {
+                return frames;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        recorder.frames()
+    }
+
+    /// The state `connect` leaves behind, assembled without the handshake: an
+    /// `McuObject` registered on its printer, its chip holding a connected MCU
+    /// (`mappings` scripted on its mock device), and a clock estimate seeded
+    /// from one `get_uptime` reading — what the poll timer finds when it runs.
+    struct PollRig {
+        /// Stepped by the test to fire the timer.
+        manual: Arc<ManualReactor>,
+        /// Held because the timer callback only holds a `Weak`.
+        printer: Arc<Printer>,
+        object: Arc<McuObject>,
+        mcu: Arc<Mcu>,
+        recorder: FrameRecorder,
+    }
+
+    impl PollRig {
+        fn new(dictionary: Value, mappings: Vec<MappingEntry>) -> Self {
+            let manual = Arc::new(ManualReactor::new());
+            let reactor: Arc<dyn Reactor> = manual.clone();
+            let printer = Arc::new(Printer::new(Arc::clone(&reactor)));
+            printer
+                .add_object(PINS_OBJECT, Arc::new(PrinterPins::new()))
+                .unwrap();
+            let object = Arc::new(McuObject::new(section(None), &printer).unwrap());
+            printer
+                .add_object(&object.section.identifier(), object.clone())
+                .unwrap();
+
+            let device = FrameMock::new(mappings);
+            let recorder = device.recorder();
+            let mcu = Arc::new(Mcu::for_test("mcu", Interface::new(device)));
+            mcu.install_dictionary(Dictionary::from_json(dictionary).unwrap())
+                .unwrap();
+            object.chip.attach(Arc::clone(&mcu));
+
+            // The seed `connect` takes from `get_uptime`: in the MCU's own
+            // estimate, and as the regression's base point behind `McuClock`.
+            mcu.set_clock_base(1_000_000);
+            let clock = Arc::new(McuClock::new(Arc::clone(&mcu), reactor));
+            clock.seed(0.0, 1_000_000);
+            object.chip.set_clock(clock, 0.0);
+
+            Self {
+                manual,
+                printer,
+                object,
+                mcu,
+                recorder,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_the_clock_poll_fires_on_schedule_and_queries_get_clock() {
+        // The poll has to arrive on the wire as `get_clock`: that query is the
+        // only path that folds a sample into the estimator
+        // (`McuClock::get_clock`), and it has to come after a full interval
+        // rather than immediately.
+        let rig = PollRig::new(polling_dictionary(), clock_exchange(21_000_500));
+        // What the timer callback resolves: the object, by its section id.
+        assert!(rig.printer.lookup_object_as::<McuObject>("mcu").is_some());
+        rig.object.register_clock_poll(rig.manual.as_ref());
+
+        assert_eq!(rig.manual.advance(0.5), 0, "no fire before the interval");
+        assert_eq!(rig.manual.advance(0.5), 1, "one fire at the interval");
+        let sent = wait_for_frames(&rig.recorder, 1).await;
+        assert_eq!(sent.len(), 1, "one query, got {sent:?}");
+        assert_eq!(sent[0].payload(), &[5], "the query is get_clock");
+    }
+
+    #[tokio::test]
+    async fn test_one_clock_poll_feeds_the_estimator() {
+        // What the poll is for: the sample moves the regression's clock onto
+        // the reading and re-anchors `Mcu::estimated_clock` on it
+        // (`Mcu::record_clock_sample`, behind `McuClock::get_clock`).
+        let rig = PollRig::new(polling_dictionary(), clock_exchange(21_000_500));
+        let before = rig.mcu.estimated_clock().unwrap();
+        assert!(before < 21_000_500, "still on the connect seed: {before}");
+
+        rig.object.register_clock_poll(rig.manual.as_ref());
+        rig.manual.advance(1.0);
+        wait_for_frames(&rig.recorder, 1).await;
+
+        let clock = rig.object.clock().unwrap();
+        assert_eq!(
+            clock.estimator().last_clock(),
+            21_000_500,
+            "the sample folded into the regression"
+        );
+        let got = rig.mcu.estimated_clock().unwrap();
+        assert!(got >= 21_000_500, "re-anchored on the sample: {got}");
+    }
+
+    #[tokio::test]
+    async fn test_a_failed_clock_poll_feeds_nothing_and_keeps_its_schedule() {
+        // A query that cannot go through (here `get_clock` is not even in the
+        // firmware's dictionary, so it fails before anything is sent) must not
+        // disturb anything: no sample, no panic, no state change — and the
+        // next interval runs as usual. Watching for a dead MCU is a different
+        // feature and deliberately not part of this timer.
+        let rig = PollRig::new(json!({"config": {"CLOCK_FREQ": 20000000}}), vec![]);
+        let seed = rig.object.clock().unwrap().estimator().last_clock();
+        rig.object.register_clock_poll(rig.manual.as_ref());
+
+        assert_eq!(rig.manual.advance(1.0), 1, "the first round fires");
+        tokio::time::sleep(Duration::from_millis(50)).await; // let the query fail
+        assert!(rig.recorder.frames().is_empty(), "nothing reached the wire");
+        assert_eq!(
+            rig.object.clock().unwrap().estimator().last_clock(),
+            seed,
+            "no sample folded in"
+        );
+        assert!(rig.mcu.estimated_clock().is_some(), "the seed stands");
+
+        assert_eq!(rig.manual.advance(1.0), 1, "the next round fires again");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(rig.recorder.frames().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_releasing_the_object_stops_the_clock_poll() {
+        // The `mcu_recalibrate` precedent's stop semantics: teardown cancels
+        // the timer, so nothing polls after the machine comes down.
+        let rig = PollRig::new(polling_dictionary(), clock_exchange(21_000_500));
+        rig.object.register_clock_poll(rig.manual.as_ref());
+
+        rig.object.release_cycles();
+
+        assert_eq!(
+            rig.manual.advance(10.0),
+            0,
+            "the cancelled timer never fires"
+        );
+        assert!(rig.recorder.frames().is_empty());
     }
 }

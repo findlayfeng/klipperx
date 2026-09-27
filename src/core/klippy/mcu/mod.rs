@@ -327,7 +327,11 @@ impl GateClock {
 /// `req_clock` among the released ones, queue order on ties — this is
 /// `build_and_send_command` picking the "highest priority message"
 /// (`serialqueue.c:478-486`) — and never past a flush barrier.
-fn take_released(parked: &mut VecDeque<Parked>, now: Option<&GateNow>) -> Option<Payload> {
+fn take_released(
+    parked: &mut VecDeque<Parked>,
+    now: Option<&GateNow>,
+    gates_open: bool,
+) -> Option<Payload> {
     // Only the run before the first barrier may be picked; a barrier is a
     // boundary for everything queued behind it.
     let selectable = parked.iter().take_while(|item| !item.is_flush()).count();
@@ -335,7 +339,7 @@ fn take_released(parked: &mut VecDeque<Parked>, now: Option<&GateNow>) -> Option
         .iter()
         .enumerate()
         .take(selectable)
-        .filter(|(_, item)| item.clocks().released(now))
+        .filter(|(_, item)| gates_open || item.clocks().released(now))
         .min_by_key(|(index, item)| (item.clocks().req_clock.unwrap_or(0), *index))?;
     match parked.remove(index) {
         Some(Parked::Payload(payload, _)) => Some(payload),
@@ -355,7 +359,15 @@ fn take_released(parked: &mut VecDeque<Parked>, now: Option<&GateNow>) -> Option
 /// the list at the earliest of its messages. `None` when nothing is parked or
 /// the clock cannot judge it — released messages are already picked by
 /// [`take_released`] before this is asked.
-fn gate_wake(parked: &VecDeque<Parked>, gate: &GateClock) -> Option<tokio::time::Instant> {
+fn gate_wake(
+    parked: &VecDeque<Parked>,
+    gate: &GateClock,
+    gates_open: bool,
+) -> Option<tokio::time::Instant> {
+    if gates_open {
+        // Every message releases on sight, so nothing is ever parked.
+        return None;
+    }
     let now = gate.now()?;
     let freq = gate.freq()?;
     let mut earliest: Option<u64> = None;
@@ -545,6 +557,12 @@ pub struct Mcu {
     /// running firmware's unsolicited `stats`/`shutdown`, which carry ids the
     /// host does not know yet — from a genuinely unknown message afterwards.
     identified: Arc<AtomicBool>,
+    /// Whether the scheduling gates ([`SendClocks`]) still hold messages back.
+    ///
+    /// `true` everywhere a real link runs — and on the `test:` fake transport
+    /// it is switched off ([`Mcu::disable_send_gates`]). Shared with the send
+    /// task, which is the only reader.
+    gates_open: Arc<AtomicBool>,
     /// The stateful estimate of the firmware's free-running clock: clock
     /// round-trip samples folded in, an anchor plus a fitted rate read out.
     /// See [`Mcu::estimated_clock`] and [`ClockEstimate`]; `None` until
@@ -1399,6 +1417,11 @@ impl Mcu {
         let wire = Arc::new(Wire::default());
         let identified = Arc::new(AtomicBool::new(false));
         let identified_for_task = Arc::clone(&identified);
+        // The gates start shut (holding): `gates_open` reads as "release on
+        // sight", and only a fake transport opens them (`Mcu::open_send_gates`)
+        // before any motion is queued.
+        let gates_open = Arc::new(AtomicBool::new(false));
+        let gates_open_for_task = Arc::clone(&gates_open);
         let (send_buf_tx, mut send_buf_rx) = mpsc::channel::<SendItem>(SEND_QUEUE_CAPACITY);
         // Where the firmware's counter has been seen at, one value per ack/nak
         // frame (see `Wire`). A watch channel: only the newest value matters, the
@@ -1424,7 +1447,7 @@ impl Mcu {
             // What the two gates hold back: messages not released yet, and
             // flush barriers queued behind them (`Parked`).
             let mut parked: VecDeque<Parked> = VecDeque::new();
-
+            let gates_open = Arc::clone(&gates_open_for_task);
             'outer: loop {
                 // Wait for the first message the gates release — or for the
                 // firmware's counter to move, which is what asks for a block to
@@ -1432,7 +1455,11 @@ impl Mcu {
                 // already satisfied; a flush behind parked messages waits with
                 // them.
                 let mut payload = loop {
-                    if let Some(first) = take_released(&mut parked, gate_clock.now().as_ref()) {
+                    if let Some(first) = take_released(
+                        &mut parked,
+                        gate_clock.now().as_ref(),
+                        gates_open.load(Ordering::Relaxed),
+                    ) {
                         break first;
                     }
                     if matches!(parked.front(), Some(Parked::Flush(_))) {
@@ -1441,7 +1468,7 @@ impl Mcu {
                         }
                         continue;
                     }
-                    let wake = gate_wake(&parked, &gate_clock);
+                    let wake = gate_wake(&parked, &gate_clock, gates_open.load(Ordering::Relaxed));
                     let wake_at = wake.unwrap_or_else(tokio::time::Instant::now);
                     let deadline = sender.retransmit_deadline();
                     let when = deadline.unwrap_or_else(|| tokio::time::Instant::now() + MAX_RTO);
@@ -1495,7 +1522,11 @@ impl Mcu {
 
                     // The next released message — lowest `req_clock` first,
                     // never past a flush barrier.
-                    if let Some(next) = take_released(&mut parked, gate_clock.now().as_ref()) {
+                    if let Some(next) = take_released(
+                        &mut parked,
+                        gate_clock.now().as_ref(),
+                        gates_open.load(Ordering::Relaxed),
+                    ) {
                         if payload.try_merge(&next).is_err() {
                             // Merge failed (would exceed max), send current batch first
                             sender
@@ -1516,7 +1547,7 @@ impl Mcu {
                     }
 
                     // Wait for more data, a flush, an ack, a gate, or a short idle timeout.
-                    let wake = gate_wake(&parked, &gate_clock);
+                    let wake = gate_wake(&parked, &gate_clock, gates_open.load(Ordering::Relaxed));
                     let wake_at = wake.unwrap_or_else(tokio::time::Instant::now);
                     tokio::select! {
                         maybe_next = send_buf_rx.recv() => {
@@ -1739,6 +1770,7 @@ impl Mcu {
             handle,
             wire,
             identified: Arc::clone(&identified),
+            gates_open,
             clock_estimate,
             move_slots: StdMutex::new(MoveSlots::default()),
             recv_handle: Some(recv_handle),
@@ -1989,6 +2021,28 @@ impl Mcu {
             estimate: Arc::clone(&self.clock_estimate),
             dictionary: Arc::clone(&self.dictionary),
         }
+    }
+
+    /// Open the scheduling gates on this connection: every message releases on
+    /// sight instead of waiting for its `min_clock`/`req_clock`
+    /// ([`SendClocks::released`] short-circuits, the send task never parks).
+    /// Pool accounting keeps running, so the floors are still computed — they
+    /// are simply never enforced here.
+    ///
+    /// **Fake transports only** (`test:` → `interface/devices/simulator.rs`),
+    /// called by `McuObject`'s connect path. The simulator's clock only moves
+    /// with wall time while the corpus' motion is virtual, so a gate there
+    /// degenerates into wall-clock serialisation: the estimate can never lead
+    /// the stream it is waiting on (the C4 probes measured it — released
+    /// batches only extend the clock by their own span, so `estimated_clock`
+    /// stays pinned to the wall and messages wait out the print horizon in
+    /// real seconds). Upstream likewise never validates message scheduling
+    /// against the corpus: its file output short-circuits those waits
+    /// (`is_fileoutput`, e.g. `klippy/mcu.py:401-405`). Production links —
+    /// and the `FrameMock` unit tests — keep the gates; nothing sets the flag
+    /// there.
+    pub(crate) fn open_send_gates(&self) {
+        self.gates_open.store(true, Ordering::Relaxed);
     }
 
     /// Encode a command without sending it.

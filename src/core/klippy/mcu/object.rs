@@ -78,6 +78,18 @@ const RECALIBRATE_INTERVAL: f64 = 1.0;
 /// [`RECALIBRATE_INTERVAL`], whose precedent the registration follows.
 const CLOCK_POLL_INTERVAL: f64 = 1.0;
 
+/// The same read, for a **fake** transport (`test: dict=`): 150 ms.
+///
+/// The simulator's virtual clock jumps forward when it executes a scheduled
+/// command (`interface/devices/simulator.rs`, `State::executed_floor`), and
+/// this poll is the only way that jump reaches the host's estimate — the send
+/// gates judge against the estimate, so at the production cadence every gated
+/// batch would wait up to a second per jump. 150 ms bounds that wait; a
+/// production link keeps [`CLOCK_POLL_INTERVAL`] (C3b's ~1 s cadence, RTT
+/// sample density and fit-window semantics unchanged — only transports the
+/// config names `test:` poll fast).
+const FAKE_CLOCK_POLL_INTERVAL: f64 = 0.15;
+
 /// The printer object for one `[mcu]` / `[mcu <name>]` section.
 pub struct McuObject {
     /// The section as parsed, kept whole so the device is only opened at
@@ -366,6 +378,13 @@ impl McuObject {
     fn register_clock_poll(&self, reactor: &dyn Reactor) {
         let printer = self.printer.clone();
         let identifier = self.section.identifier();
+        // The fake's jumped clock is picked up by this poll alone, so it runs
+        // at `test:` cadence; everything else keeps the production interval.
+        let interval = if self.section.parameters.contains_key("test") {
+            FAKE_CLOCK_POLL_INTERVAL
+        } else {
+            CLOCK_POLL_INTERVAL
+        };
         let handle = reactor.register_timer_named(
             "mcu_clock_poll",
             Box::new(move |eventtime| {
@@ -375,9 +394,9 @@ impl McuObject {
                 if let Some(object) = printer.lookup_object_as::<McuObject>(&identifier) {
                     object.poll_clock();
                 }
-                Some(eventtime + CLOCK_POLL_INTERVAL)
+                Some(eventtime + interval)
             }),
-            reactor.monotonic() + CLOCK_POLL_INTERVAL,
+            reactor.monotonic() + interval,
         );
         *self
             .clock_poll_timer

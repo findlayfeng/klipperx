@@ -479,6 +479,14 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 
 ## 未决问题
 
+- [ ] **Q9 `wait_moves`（FW5d）打印节拍缺失**：上游在运动队列将满时会等待 MCU 追上（`wait_moves`；
+      语料另有 `is_fileoutput` 虚拟时钟同款语义），本仓 `motion/toolhead.rs` 文档自述 **FW5d 未实现**
+      （2026-09-27 C4 侦察发现）——G-Code 可瞬间把整段运动灌进 trapq，print horizon 相对
+      `estimated_clock` 无界。后果分两层：① fake 环境靠 simulator 虚拟时钟兑住（C4 已批
+      `simulator.rs` 随执行推进合成时钟）；② **真机**上 C4 的 min/req 闸会以「压队=背压」形态工作
+      （放行速度由固件消费决定，上游同款），但宿主侧没有上游的节拍保护。**R8 真机观察点**：
+      长 gcode 连灌时 print horizon 与压队深度。实现 wait_moves 属独立工单（上游正解），不阻塞 C4。
+
 - [~] **Q8 GCodeIO（伪 tty / OctoPrint 串口仿真）补不补**：**已定（2026-09-21）：暂不实现**，
       归档为将来可选项，等需要时再操作。纯 API 主机（Moonraker）不需要它；代价是
       `debuginput_exit`、`is_fileinput`/`error_exit`、`stats gcodein=`、`input_log`、`M112` 乱序

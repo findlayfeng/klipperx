@@ -2,9 +2,12 @@
 //!
 //! Upstream's `MCU_stepper` (`klippy/stepper.py:22-260`): it owns the oid and
 //! the step/dir pins, adds `config_stepper` while the config is built, and
-//! sends `queue_step`/`set_next_step_dir` at runtime. The host-side solver and
-//! compressor live in `motion::Stepper`; this is the wire half, and the two are
-//! joined when `[stepper_*]` sections land (FW5e).
+//! sends `queue_step`/`set_next_step_dir` at runtime. It also re-anchors the
+//! firmware's step chain to 0 whenever a configured firmware is taken over
+//! (`stepper.py:117-118`, restart list), which is what keeps a fresh session's
+//! `last_step_clock = 0` in step with the chain the firmware still carries.
+//! The host-side solver and compressor live in `motion::Stepper`; this is the
+//! wire half, and the two are joined when `[stepper_*]` sections land (FW5e).
 
 use std::sync::{Arc, Mutex};
 
@@ -286,6 +289,23 @@ impl StepperState {
             invert_step,
             step_pulse_ticks,
         })?;
+        // Re-anchor the firmware's step chain whenever a **configured**
+        // firmware is taken over (upstream `klippy/stepper.py:117-118`: an
+        // `on_restart=True` command, which lands in the restart list and is
+        // what the reused branch sends — `klippy/mcu.py:1069`; this port maps
+        // it to `add_restart_cmd`, as `resource/endstop.rs` does for
+        // `endstop_home`).
+        //
+        // A fresh session's compressor starts at `last_step_clock = 0`, so
+        // without this the first `queue_step` interval is added onto the chain
+        // the **previous** session left behind (B6 reuses a running firmware):
+        // the first deadline lands at `leftover + first` mod 2^32 — seconds
+        // late when that wraps ahead (silent), and in the past when it wraps
+        // behind → firmware `Timer too close`. C5's sampling measured both
+        // (c5c.log +2.4 s late but silent; verify.log −14.9 s in the past →
+        // trip), while the estimate stayed aligned throughout (`est − fw`
+        // +1..2 ms on every sample).
+        builder.add_restart_cmd(&ResetStepClock { oid, clock: 0 })?;
         Ok(())
     }
 }
@@ -330,6 +350,9 @@ pub enum McuStepCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::klippy::interface::devices::frame_mock::FrameMock;
+    use crate::core::klippy::interface::Interface;
+    use crate::core::klippy::mcu::Dictionary;
 
     #[test]
     fn test_a_direction_change_becomes_set_next_step_dir() {
@@ -401,5 +424,119 @@ mod tests {
         };
         assert_eq!(step.add, -3);
         assert_eq!(step.count, 40);
+    }
+
+    // =====================================================================
+    // C5: the firmware's step chain must be re-anchored on a takeover
+    // =====================================================================
+
+    /// A dictionary with the stepper's two commands and its two pins.
+    fn dictionary() -> Dictionary {
+        Dictionary::from_json(serde_json::json!({
+            "commands": {
+                "allocate_oids count=%c": 2,
+                "get_config": 7,
+                "finalize_config crc=%u": 6,
+                "config_stepper oid=%c step_pin=%c dir_pin=%c invert_step=%c step_pulse_ticks=%u": 41,
+                "reset_step_clock oid=%c clock=%u": 42
+            },
+            "responses": {
+                "config is_config=%c crc=%u is_shutdown=%c move_count=%hu": 9
+            },
+            "enumerations": {
+                "pin": {"PA0": 0, "PA1": 1}
+            },
+            "config": {"CLOCK_FREQ": 20000000}
+        }))
+        .unwrap()
+    }
+
+    /// An identified MCU that sends nowhere.
+    fn mcu() -> Mcu {
+        let mcu = Mcu::for_test("mcu", Interface::new(FrameMock::new(Vec::new())));
+        mcu.install_dictionary(dictionary()).unwrap();
+        mcu
+    }
+
+    /// A chip with its pins registry, so a stepper can resolve its pins.
+    fn chip() -> (McuChip, Arc<PrinterPins>) {
+        let pins = Arc::new(PrinterPins::new());
+        let chip = McuChip::new(
+            "mcu".to_string(),
+            Arc::new(ConfigBuilder::new()),
+            Arc::clone(&pins),
+        );
+        pins.register_chip("mcu", Arc::new(chip.clone())).unwrap();
+        (chip, pins)
+    }
+
+    #[tokio::test]
+    async fn test_a_stepper_reanchors_the_firmware_chain_on_a_reused_firmware() {
+        use crate::core::klippy::frame::Frame;
+        use crate::core::klippy::msg::parser::Parser;
+        use crate::core::klippy::msg::proto::ArgValue;
+
+        let (chip, _pins) = chip();
+        let params = |pin: &str| PinParams {
+            chip_name: "mcu".to_string(),
+            pin: pin.to_string(),
+            invert: false,
+            pullup: 0,
+            share_type: None,
+        };
+        // `_pins` stays bound: the chip holds only a `Weak` to it, and the
+        // config callback upgrades it at build time.
+        chip.setup_stepper(params("PA0"), params("PA1"), 0, 0.0, false);
+        let mcu = mcu();
+
+        let built = chip.config().build(&mcu).unwrap();
+        let mut parser = Parser::new();
+        mcu.dictionary().unwrap().install(&mut parser).unwrap();
+        let name_of = |payload: &[u8]| {
+            parser
+                .decode(Frame::new(0, payload.to_vec()).into())
+                .unwrap()[0]
+                .0
+                .name
+                .clone()
+        };
+
+        // Upstream sends `reset_step_clock oid clock=0` whenever a configured
+        // firmware is taken over (`klippy/stepper.py:117-118`, an
+        // `on_restart=True` command; the reused branch sends the restart list,
+        // `klippy/mcu.py:1069`). Without it the fresh session's
+        // `last_step_clock = 0` and the firmware's leftover chain disagree,
+        // and the first deadline lands at `leftover + first` mod 2^32 — late
+        // or in the past (`Timer too close`).
+        assert_eq!(
+            built.restart.len(),
+            1,
+            "the stepper re-anchors the firmware chain on takeover"
+        );
+        let decoded = parser
+            .decode(Frame::new(0, built.restart[0].payload().to_vec()).into())
+            .unwrap();
+        assert_eq!(decoded[0].0.name, "reset_step_clock");
+        assert_eq!(
+            decoded[0].1,
+            vec![ArgValue::UInt8(0), ArgValue::UInt32(0)],
+            "oid 0, clock 0 — the chain starts where the compressor does"
+        );
+
+        // It stays out of the hashed config: `config_stepper` alone is the
+        // CRC's stepper half, and a fresh firmware already boots at 0.
+        let config_names: Vec<String> = built
+            .config
+            .iter()
+            .map(|payload| name_of(payload.payload()))
+            .collect();
+        assert!(
+            config_names.iter().any(|name| name == "config_stepper"),
+            "{config_names:?}"
+        );
+        assert!(
+            !config_names.iter().any(|name| name == "reset_step_clock"),
+            "the re-anchor is a restart command, not a config one: {config_names:?}"
+        );
     }
 }

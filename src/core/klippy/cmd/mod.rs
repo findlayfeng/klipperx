@@ -411,7 +411,7 @@ impl Mcu {
     ///
     /// # Errors
     /// As [`Mcu::send_msg`].
-    pub fn send_msg_clocked<C: McuCommand>(
+    pub(crate) fn send_msg_clocked<C: McuCommand>(
         &self,
         cmd: &C,
         clocks: SendClocks,
@@ -453,7 +453,7 @@ impl Mcu {
     ///
     /// # Errors
     /// As [`Mcu::call_msg`].
-    pub async fn call_msg_clocked<C: McuCommand, R: McuResponse>(
+    pub(crate) async fn call_msg_clocked<C: McuCommand, R: McuResponse>(
         &self,
         cmd: &C,
         clocks: SendClocks,

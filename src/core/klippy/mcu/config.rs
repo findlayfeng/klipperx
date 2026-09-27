@@ -658,6 +658,11 @@ impl ConfigBuilder {
             )));
         }
 
+        // The pool that keeps move-class messages from outrunning the
+        // firmware's move queue is armed with the same number, straight from
+        // this answer (`Mcu::set_move_slot_capacity`, `MoveSlots`).
+        mcu.set_move_slot_capacity(after.move_count);
+
         for callback in built.take_post_init() {
             callback(mcu);
         }

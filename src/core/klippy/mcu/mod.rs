@@ -180,6 +180,23 @@ pub(crate) struct SendClocks {
 /// (`PR_NOW`) instead of waiting for the clock to climb to it.
 const MIN_REQTIME_DELTA: f64 = 0.100;
 
+/// How far past a move's completion clock the host treats its slot in the
+/// firmware's move queue as free ([`MoveSlots::free_at`]).
+///
+/// The pool judges with `estimated_clock()`, so this has to absorb how far
+/// that estimate can run **ahead** of the firmware's clock: released early
+/// means the board is handed a move while it still holds the previous one —
+/// a "Move queue overflow" (`basecmd.c:85-90`). The estimate is re-anchored at
+/// every clock round trip's midpoint (`ClockEstimate::record`), so its error
+/// is bounded by one sample's placement and the fitted rate — a few ms, the
+/// order of upstream's `TRANSMIT_EXTRA = .001` (`clocksync.py:130`); 20 ms
+/// covers that with margin to spare. The other direction (estimate running
+/// slow) only makes the host wait out this same 20 ms, and it has to stay an
+/// order below upstream's `MIN_SCHEDULE_TIME = 0.100` (`mcu.py:13`) — the
+/// lead a move still needs before its own clock — or preventing overflow
+/// would turn into sending too late.
+const SLOT_RELEASE_MARGIN: f64 = 0.020;
+
 /// How long the send task sleeps at a time while a gated message is parked.
 ///
 /// The gates are judged against an estimate that can be re-anchored
@@ -345,6 +362,75 @@ fn gate_wake(parked: &VecDeque<Parked>, gate: &GateClock) -> Option<tokio::time:
     Some(tokio::time::Instant::now() + until.min(GATE_REPOLL_MAX))
 }
 
+/// One MCU's in-flight move pool: the completion clocks of move-class
+/// commands sent but not yet executed, kept in completion order.
+///
+/// The firmware keeps one free list of move nodes **per board** and shuts the
+/// board down with "Move queue overflow" when a command arrives and none is
+/// free (`basecmd.c:85-90`, `move_alloc`, taken by `queue_step` /
+/// `set_next_step_dir` in `stepper.c:262` and by `queue_digital_out` in
+/// `gpiocmds.c:148`). The host holds the same count — capacity is the
+/// firmware's `move_count`, which the config handshake already checks
+/// against the reserved slots (`mcu/config.rs`) — so the next move whose
+/// slot is not there yet gets the `min_clock` of the entry that will free
+/// one. That is A-lite: no upstream `heap_replace` / `move_clocks` heap, just
+/// the deque and its front.
+#[derive(Debug, Default)]
+struct MoveSlots {
+    /// The firmware's `move_count`; `None` until the config handshake arms it
+    /// ([`Mcu::set_move_slot_capacity`]), and then no message is held back.
+    capacity: Option<usize>,
+    /// Completion clocks of the moves still holding a slot, ascending.
+    pending: VecDeque<u64>,
+}
+
+impl MoveSlots {
+    /// The clock at which a move that completes at `completion` counts as
+    /// having freed its slot: its completion plus [`SLOT_RELEASE_MARGIN`].
+    fn free_at(completion: u64, freq: f64) -> u64 {
+        completion + (SLOT_RELEASE_MARGIN * freq) as u64
+    }
+
+    /// Take one sent move into the pool and answer with the `min_clock` the
+    /// **next** move needs — `None` while a slot is free for it.
+    ///
+    /// Freed entries drop off the front first (the list is kept ascending, so
+    /// the front is the earliest release). The move is then recorded — it is
+    /// held back by its floor, not cancelled, so from here it occupies a slot
+    /// too — and the floor, once the pool is over capacity, is the completion
+    /// clock of the entry `capacity - 1` places back from the end: the move
+    /// whose freeing makes room for exactly this one. That is the
+    /// `(len - capacity)`-th earliest completion of the whole list
+    /// (`pending[len - capacity - 1]` once the new entry is in), which for
+    /// in-order completions — steps — is simply the entry `capacity` deep.
+    ///
+    /// A clock the estimate cannot answer yet (`None`) frees nothing and
+    /// imposes nothing — the same "clock unknown, send" the gates open for
+    /// (`serialqueue.c:612-618`); the entries are judged as soon as the
+    /// estimate exists.
+    fn record(&mut self, completion: u64, gate: &GateClock) -> Option<u64> {
+        let freq = gate.freq().unwrap_or(0.0);
+        if let Some(estimated) = gate.estimated_clock() {
+            while let Some(&front) = self.pending.front() {
+                if estimated < Self::free_at(front, freq) {
+                    break;
+                }
+                self.pending.pop_front();
+            }
+        }
+        let index = self
+            .pending
+            .iter()
+            .take_while(|&&known| known <= completion)
+            .count();
+        self.pending.insert(index, completion);
+        let capacity = self.capacity?;
+        (self.pending.len() > capacity)
+            .then(|| self.pending[self.pending.len() - capacity - 1])
+            .map(|completion| Self::free_at(completion, freq))
+    }
+}
+
 /// Queue `item` for the send task, waiting a bounded time for room.
 ///
 /// This is the synchronous senders' half of the queue's flow control (see
@@ -442,6 +528,10 @@ pub struct Mcu {
     /// something seeds it (the MCU object does, right after identify). Shared
     /// with the send task ([`GateClock`]), whose gates read it.
     clock_estimate: Arc<StdMutex<Option<ClockEstimate>>>,
+    /// This MCU's in-flight move pool: which move-class commands still hold a
+    /// slot of the firmware's move queue, and therefore the `min_clock` the
+    /// next one needs (`MoveSlots`).
+    move_slots: StdMutex<MoveSlots>,
     /// Handle to the receive task, used to abort it on drop.
     recv_handle: Option<tokio::task::JoinHandle<()>>,
 }
@@ -1627,6 +1717,7 @@ impl Mcu {
             wire,
             identified: Arc::clone(&identified),
             clock_estimate,
+            move_slots: StdMutex::new(MoveSlots::default()),
             recv_handle: Some(recv_handle),
         }
     }
@@ -1942,6 +2033,76 @@ impl Mcu {
         clocks: SendClocks,
     ) -> Result<(), MsgError> {
         self.enqueue(name, args, None, clocks)
+    }
+
+    /// Arm this MCU's move pool at the firmware's `move_count`.
+    ///
+    /// The capacity comes from the config handshake, where the firmware's
+    /// answer has just been checked against the reserved slots
+    /// (`mcu/config.rs`, the value reported as `Configured::move_count`).
+    /// Until then the pool holds no message back ([`MoveSlots::capacity`]).
+    pub(crate) fn set_move_slot_capacity(&self, move_count: u16) {
+        self.move_slots
+            .lock()
+            .expect("move slots lock poisoned")
+            .capacity = Some(move_count as usize);
+    }
+
+    /// Send a **move-class** command: one whose firmware handler takes a slot
+    /// from the board's move free list (`queue_step`, `set_next_step_dir`,
+    /// `queue_digital_out` — each `move_alloc()`s, `stepper.c:262` /
+    /// `gpiocmds.c:148`).
+    ///
+    /// The command enters this MCU's pool with `completion_clock` — when its
+    /// last step (or its own scheduled instant) runs — which is what later
+    /// moves' `min_clock` floors are cut from. Its `req_clock` is
+    /// `start_clock`: when the command's own work begins, so it goes out
+    /// [`MIN_REQTIME_DELTA`] before that and behind any lower `req_clock` —
+    /// upstream stamps both on every step message
+    /// (`stepcompress.c:359`, `min_clock = req_clock = last_step_clock`).
+    ///
+    /// # Errors
+    /// As [`Mcu::send`].
+    pub(crate) fn send_move(
+        &self,
+        name: &str,
+        args: &[ArgValue],
+        start_clock: u64,
+        completion_clock: u64,
+    ) -> Result<(), MsgError> {
+        let min_clock = self
+            .move_slots
+            .lock()
+            .expect("move slots lock poisoned")
+            .record(completion_clock, &self.gate_clock());
+        self.enqueue(
+            name,
+            args,
+            None,
+            SendClocks {
+                min_clock,
+                req_clock: Some(start_clock),
+            },
+        )
+    }
+
+    /// [`Mcu::send_move`] for a typed command — the move-class counterpart of
+    /// `Mcu::send_msg` (which lives with the other typed sends in [`cmd`](crate::core::klippy::cmd)).
+    ///
+    /// # Errors
+    /// As [`Mcu::send`], plus [`McuError::NotIdentified`] before the identify
+    /// handshake and [`McuError::UnknownMessage`] when the name is absent from
+    /// the dictionary.
+    pub(crate) fn send_move_msg<C: crate::core::klippy::cmd::McuCommand>(
+        &self,
+        cmd: &C,
+        start_clock: u64,
+        completion_clock: u64,
+    ) -> Result<(), McuError> {
+        self.require_dictionary()?;
+        self.require_message(C::NAME)?;
+        self.send_move(C::NAME, &cmd.args(), start_clock, completion_clock)?;
+        Ok(())
     }
 
     /// The body of [`Mcu::send`], plus what the caller will be waiting for.
@@ -3455,7 +3616,8 @@ mod tests {
                 "get_clock": 5,
                 "config_reset": 6,
                 "emergency_stop": 7,
-                "debug_nop": 8
+                "debug_nop": 8,
+                "queue_digital_out oid=%c clock=%u on_ticks=%u": 12
             },
             "config": {"CLOCK_FREQ": 16000000}
         }))
@@ -3585,80 +3747,183 @@ mod tests {
         );
     }
 
-    /// ④ Capacity cut-back: a burst that would fill the firmware's move queue
-    /// is cut back to one release per freed slot, instead of all of it going
-    /// at once.
+    /// ④ Capacity cut-back: a burst larger than the firmware's move queue is
+    /// cut back to one release per freed slot, instead of all of it going at
+    /// once — and `queue_digital_out` draws from the same pool, so a later
+    /// move's floor is **its** completion clock.
     ///
-    /// The per-MCU slot pool that computes these floors lands with the pool
-    /// itself; this injects the same arithmetic — the floor for the next move
-    /// is the completion clock `capacity` entries back (`pending[len -
-    /// capacity]`, the entry whose slot frees the space) — so the sender-side
-    /// throttling can be judged on its own.
+    /// Capacity 2 over five move-class commands (`m1`..`m4` plus the digital
+    /// out `d`): completions 10/20/30/40 s out, `d`'s own clock at 25 s. Each
+    /// step walks `set_clock_base` over the next floor, so every boundary
+    /// below is a clock, not a sleep.
     #[tokio::test]
     async fn test_a_full_move_capacity_releases_one_slot_at_a_time() {
         const BASE: u64 = 1_000_000;
         const FREQ: f64 = 16_000_000.0;
-        const CAPACITY: usize = 2;
         let clock = |seconds: f64| BASE + (seconds * FREQ) as u64;
-        let completions = [clock(10.0), clock(20.0), clock(30.0), clock(40.0)];
+        let (c1, c2, c3, c4) = (clock(10.0), clock(20.0), clock(30.0), clock(40.0));
+        let own_clock = clock(25.0);
+        let free_at = |completion: u64| MoveSlots::free_at(completion, FREQ);
 
-        // The injected pool: completion clocks enter in order; the floor is
-        // `None` while the pool has room, and the entry `capacity` places back
-        // once it does not.
-        let mut pending: Vec<u64> = Vec::new();
-        let mut floors = [None, None, None, None];
-        for (slot, &completion) in completions.iter().enumerate() {
-            floors[slot] = (pending.len() >= CAPACITY).then(|| pending[pending.len() - CAPACITY]);
-            pending.push(completion);
-        }
-        assert_eq!(
-            floors,
-            [None, None, Some(completions[0]), Some(completions[1])]
-        );
+        // The digital out's bytes as the firmware sees them, so the block it
+        // lands in can be matched exactly — built with the same parser the
+        // transport encodes with.
+        let mut parser = Parser::new();
+        parser
+            .register(12, "queue_digital_out oid=%c clock=%u on_ticks=%u")
+            .unwrap();
+        let d_args = [
+            ArgValue::UInt8(0),
+            ArgValue::UInt32(own_clock as u32),
+            ArgValue::UInt32(1),
+        ];
+        let d_payload = parser
+            .encode("queue_digital_out", &d_args)
+            .unwrap()
+            .into_raw();
 
-        // Three blocks: the pair that has room, then one per released slot.
+        // Four blocks: the pair with room, one per released slot, and the
+        // digital out on its own (it carries arguments).
         let (mcu, recorder) = gate_mcu(
             vec![
                 gate_block(0, &[5, 6]),
                 gate_block(1, &[7]),
-                gate_block(2, &[8]),
+                gate_block(2, &d_payload),
+                gate_block(3, &[8]),
             ],
             BASE,
         );
-        let names = ["get_clock", "config_reset", "emergency_stop", "debug_nop"];
-        for (name, floor) in names.iter().zip(floors) {
-            mcu.send_with_clocks(
-                name,
-                &[],
-                SendClocks {
-                    min_clock: floor,
-                    req_clock: None,
-                },
-            )
-            .unwrap();
-        }
+        mcu.set_move_slot_capacity(2);
 
-        // The pair with room goes; the two over capacity stay parked.
+        // `m1`/`m2` take the two slots; `m3` queues behind `c1`, the digital
+        // out behind `c2` and its own clock, `m4` behind the digital out.
+        // The moves start in the past, so their `req_clock` never holds them.
+        mcu.send_move("get_clock", &[], BASE, c1).unwrap();
+        mcu.send_move("config_reset", &[], BASE, c2).unwrap();
+        mcu.send_move("emergency_stop", &[], BASE, c3).unwrap();
+        mcu.send_move("queue_digital_out", &d_args, own_clock, own_clock)
+            .unwrap();
+        mcu.send_move("debug_nop", &[], BASE, c4).unwrap();
+
+        let counts = || [5, 6, 7, 8].map(|id| sent_count(&recorder, id));
+        let d_sent = || {
+            recorder
+                .frames()
+                .iter()
+                .filter(|frame| frame.payload() == d_payload.as_slice())
+                .count()
+        };
+
+        // At the base clock only the two with a free slot go.
         sleep(Duration::from_millis(60)).await;
-        let sent = || [5, 6, 7, 8].map(|id| sent_count(&recorder, id));
         assert_eq!(
-            sent(),
+            counts(),
             [1, 1, 0, 0],
             "the over-capacity moves went with the burst"
         );
+        assert_eq!(d_sent(), 0, "the digital out went before its own clock");
 
-        // The first slot's completion: exactly one of the two parked moves
-        // lands, the one whose floor it is.
-        mcu.set_clock_base(completions[0] + 1);
-        sleep(Duration::from_millis(60)).await;
-        assert_eq!(sent(), [1, 1, 1, 0], "the second floor was not honoured");
-
-        mcu.set_clock_base(completions[1] + 1);
+        // The first slot's completion (+ margin): exactly one move lands.
+        mcu.set_clock_base(free_at(c1) + 1);
         sleep(Duration::from_millis(60)).await;
         assert_eq!(
-            sent(),
+            counts(),
+            [1, 1, 1, 0],
+            "one slot did not release exactly one move"
+        );
+        assert_eq!(d_sent(), 0);
+
+        // The second slot's floor: `m4` still waits — its floor is the digital
+        // out's completion (25 s), not `c2`, because `queue_digital_out` is in
+        // the pool too. (Without it, `m4` would go right here.)
+        mcu.set_clock_base(free_at(c2) + 1);
+        sleep(Duration::from_millis(60)).await;
+        assert_eq!(
+            counts(),
+            [1, 1, 1, 0],
+            "m4's floor does not account for queue_digital_out's slot"
+        );
+        assert_eq!(d_sent(), 0);
+
+        // The digital out releases on its own clock's lead window, ahead of
+        // the pool floor that would otherwise still hold it.
+        mcu.set_clock_base(own_clock - (MIN_REQTIME_DELTA * FREQ) as u64 + 1);
+        sleep(Duration::from_millis(60)).await;
+        assert_eq!(d_sent(), 1, "the digital out missed its req_clock window");
+        assert_eq!(
+            counts(),
+            [1, 1, 1, 0],
+            "m4 went before the digital out's slot freed"
+        );
+
+        // The slot the digital out held: `m4` goes at its completion (+ margin).
+        mcu.set_clock_base(free_at(own_clock) + 1);
+        sleep(Duration::from_millis(60)).await;
+        assert_eq!(
+            counts(),
             [1, 1, 1, 1],
             "moves did not release one slot at a time"
+        );
+        assert_eq!(d_sent(), 1);
+    }
+
+    /// The pool's arithmetic on its own: no floor while a slot is free, the
+    /// floor is the completion that frees a slot, entries sort in even when
+    /// they arrive out of order, an unarmed pool holds nothing back, and a
+    /// live estimate drops what has already freed.
+    #[test]
+    fn test_move_slots_floor_is_the_slot_freeing_completion() {
+        // No estimate, no dictionary: nothing frees, the release margin is 0,
+        // and the assertions are the raw completion clocks.
+        let gate = GateClock {
+            estimate: Arc::new(StdMutex::new(None)),
+            dictionary: Arc::new(StdMutex::new(None)),
+        };
+        let mut slots = MoveSlots {
+            capacity: Some(2),
+            pending: VecDeque::new(),
+        };
+
+        assert_eq!(slots.record(100, &gate), None, "first slot");
+        assert_eq!(slots.record(200, &gate), None, "second slot");
+        assert_eq!(
+            slots.record(300, &gate),
+            Some(100),
+            "over capacity: the move waits for the entry that frees a slot"
+        );
+        // An out-of-order completion sorts in, and the floor recomputes over
+        // the whole list: two slots free once the second-earliest (150) has
+        // completed.
+        assert_eq!(slots.record(150, &gate), Some(150));
+
+        // Before the config handshake reports `move_count` the pool is
+        // unarmed and holds nothing back.
+        let mut unarmed = MoveSlots::default();
+        assert_eq!(unarmed.record(100, &gate), None);
+
+        // With a live estimate, entries whose free-at has passed drop off the
+        // front instead of keeping the floor down: at an estimated 10 s, both
+        // earlier completions (free at completion + 20 ms) are gone before the
+        // third move is recorded.
+        let dictionary = Arc::new(StdMutex::new(Some(Arc::new(gate_dictionary()))));
+        let estimate = Arc::new(StdMutex::new(Some(ClockEstimate::seeded(
+            Instant::now(),
+            10_000_000,
+        ))));
+        let live = GateClock {
+            estimate,
+            dictionary,
+        };
+        let mut slots = MoveSlots {
+            capacity: Some(2),
+            pending: VecDeque::new(),
+        };
+        assert_eq!(slots.record(1_000_000, &live), None);
+        assert_eq!(slots.record(2_000_000, &live), None);
+        assert_eq!(
+            slots.record(3_000_000, &live),
+            None,
+            "the freed entries were pruned, so the pool has room again"
         );
     }
 

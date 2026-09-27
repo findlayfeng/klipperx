@@ -650,11 +650,25 @@ impl DigitalOut for McuDigitalOut {
         let oid = self.oid()?;
         // For a plain output `on_ticks` carries the level (`gpiocmds.c:174`).
         let on_ticks = u32::from(value ^ self.pin.invert);
-        self.send(&QueueDigitalOut {
+        let cmd = QueueDigitalOut {
             oid,
             clock,
             on_ticks,
-        })
+        };
+        let mcu = self
+            .mcu
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
+            .ok_or_else(|| McuError::Config("MCU is not connected".to_string()))?;
+        // Move-class: the firmware takes this change's node from the same
+        // per-board move list `queue_step` does (`gpiocmds.c:148`,
+        // `move_alloc`), so it enters the pool — its own clock is both when
+        // the change is due (`req_clock`, upstream's `reqclock=clock`,
+        // `mcu.py:448`) and when its slot frees (`completion_clock`). No
+        // `minclock=last_clock` ordering floor: the pool's slot floor is all
+        // this path asks for.
+        mcu.send_move_msg(&cmd, u64::from(clock), u64::from(clock))
     }
 
     fn update_digital_out(&self, value: bool) -> Result<(), McuError> {

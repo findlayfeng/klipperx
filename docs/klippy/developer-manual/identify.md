@@ -27,7 +27,9 @@ Identify 是 Klipper 主机端（klippy）与 MCU 端（固件）之间建立通
 `src/command.c:301-306`），单看一帧无法区分。固件停在「领先一号」时，首发请求被 nak 而固件
 永不再回话，交换就死在那里。`Identify::request_chunk` 因此把「本块窗口内没等到响应」读作 nak，
 调 `Mcu::renumber_to_firmware`（connection-init，对齐上游 `serialqueue.c:196-201`）把发送
-序号改到固件报告的位置再重发。**根因靠改号修，不靠重试遮羞**：重试只是改号失败后的有界兜底
+序号改到固件报告的位置再重发。**改号同时对齐接收窗**：`next` 退回 `seen`、`Wire::seen` 取帧申报的号，
+并**重挂一次 connection-init 豁免**（改号后第一个新号越号也采纳，对齐 `serialqueue.c:261`），否则固件
+随后的响应仍会被判 never-sent 丢弃——只改发送侧会造成「发得进、回不来」的单向死锁。**根因靠改号修，不靠重试遮羞**：重试只是改号失败后的有界兜底
 （`IDENTIFY_ATTEMPT_TIMEOUT=500ms` 早退、`IDENTIFY_MAX_RETRIES=3`、`IDENTIFY_RETRY_BACKOFF`
 50ms 起倍增，**所有尝试共享原 `IDENTIFY_TIMEOUT` 总预算**，单块耗时口径不变；不抄上游 ×5）。
 `Sender::settle` 刻意不对空帧单独改号（二义性只有盯着「请求后静默」的 identify 重试才有权读作

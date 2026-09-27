@@ -119,6 +119,8 @@ KLIPPERX_HW_SERIAL=/dev/ttyACM0 cargo test -p klipperx --lib \
 | `KLIPPERX_UPSTREAM_ALL` | 未设置 | 设成任意值即取消语料忽略列表（当前列表为空，故这只是口径上的保险；字典未构建的运行仍然跑不起来）。 |
 | `KLIPPERX_UPSTREAM_GUARD` | 未设置 | 设成任意值则额外跑「忽略列表守卫」：以 load-only（不建连接、不跑 g-code）方式重跑忽略用例，某个文件的所有运行都能装载，守卫就报失败，提示该核实并从忽略列表里删掉。 |
 | `KLIPPERX_UPSTREAM_VERBOSE` | 未设置 | 设成任意值后每个语料用例打一行 `VERBOSE <耗时> ok/fail <用例>`。 |
+| `KLIPPERX_UPSTREAM_FILTER` | 未设置 | 只跑名字匹配的语料用例（迭代加速用；**不设置 = 237 全量原样**，默认路径零变化）。 |
+| `KLIPPERX_KEEP_GATES` | 未设置 | 设成任意值后，`test:` fake 传输也**不放行**两道时钟闸——复现「闸×语料」交互用（如 iqex 的 `Invalid sequence` 配方），默认 fake 放行。 |
 | `KLIPPERX_TRACE` | 未设置（关闭） | 非 `0` 值打开诊断 trace：模拟器与 MCU 拆除打的 `SIM-DIAG: …` / `MCU DROP …` 行（追挂起用，平时是噪声）。 |
 | `KLIPPERX_HW_SERIAL` | 未设置 | 真机用例要用的串口路径。以 `--ignored` 显式请求而没设它时用例**失败**；不带 `--ignored` 不执行。 |
 | `KLIPPERX_USB_IDS` | `1d50:614e 1d50:606f` | `scripts/klipperx-usb-udev.sh` 按空格分隔的 `vendor:product` 找 Klipper 设备；自编固件改了 USB id 时用。 |

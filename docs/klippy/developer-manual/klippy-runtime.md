@@ -226,7 +226,8 @@ MotionQueuing（定时器）                 决定何时 flush
 G28 ──▶ Homing.home_rails
           ├─ set_position(forcepos)
           ├─ endstop.home_start ──▶ trsync_start + stepper_stop_on_trigger + endstop_home
-          ├─ ToolHead.drip_move ──▶ trapq 直灌 + 推进 print_time
+          ├─ ToolHead.drip_move ──▶ trapq 直灌（**不推进 print_time**：对齐上游 `_drip_load_trapq`，
+          │    终点只作 drip 边界；print_time 由 `_calc_print_time` 的 est+BUFFER 与生成水位两层下界抬升）
           └─ endstop.home_wait  ──▶ 等固件触发
 固件：按 rest_ticks 轮询 endstop → 命中 → trsync_do_trigger → 停步并记录位置
 主机：按 stepcompress 的 history 反推触发时刻的位置 → set_position(haltpos)

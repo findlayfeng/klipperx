@@ -21,6 +21,46 @@ use crate::core::klippy::mathutil::{Coord, Xyz, E_AXIS};
 /// (`BUFFER_TIME_START`, `klippy/toolhead.py:196`).
 pub const BUFFER_TIME_START: f64 = 0.250;
 
+/// Where the toolhead reads the MCU's estimated print time from
+/// (`MCU.estimated_print_time`).
+///
+/// Upstream asks its `self.mcu` every time it floors the print time
+/// (`_calc_print_time`, `klippy/toolhead.py:260-264`), so the floor follows the
+/// clock. This layer has no MCU, so the object that has one injects a getter at
+/// connect — a **value** rather than a snapshot: a connect-time reading goes
+/// stale by exactly the idle time since (C5 measured it: a machine idle 33 s
+/// planned its next motion 33 s in the past, so every step batch expired at
+/// once and the boards got the whole motion in one dump).
+#[derive(Clone)]
+pub struct EstimatedPrintTime(Arc<dyn Fn() -> f64 + Send + Sync>);
+
+impl std::fmt::Debug for EstimatedPrintTime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("EstimatedPrintTime(live)")
+    }
+}
+
+impl Default for EstimatedPrintTime {
+    /// A source that always reads `0.0` — the toolhead before anything
+    /// injected one (a test, or a machine that has not connected yet), for
+    /// which the floor is the buffer alone.
+    fn default() -> Self {
+        Self(Arc::new(|| 0.0))
+    }
+}
+
+impl EstimatedPrintTime {
+    /// A source reading through `source`, called fresh on every floor.
+    pub fn new(source: impl Fn() -> f64 + Send + Sync + 'static) -> Self {
+        Self(Arc::new(source))
+    }
+
+    /// The estimate right now.
+    pub fn get(&self) -> f64 {
+        (self.0)()
+    }
+}
+
 /// The toolhead: commanded position, print time, and the motion queue.
 #[derive(Debug)]
 pub struct ToolHead {
@@ -28,7 +68,9 @@ pub struct ToolHead {
     lookahead: LookAheadQueue,
     commanded_pos: Coord,
     print_time: f64,
-    estimated_print_time: f64,
+    /// The live source of the MCU's estimated print time (see
+    /// [`EstimatedPrintTime`]): read on every prime, never cached.
+    estimated_print_time: EstimatedPrintTime,
     /// The step-generation horizon the planner has actually reached: the
     /// `step_gen_time` of the last successful `flush_step_generation`.
     /// Upstream's `motion_queuing.last_step_gen_time`
@@ -55,7 +97,7 @@ impl ToolHead {
             lookahead: LookAheadQueue::new(),
             commanded_pos: Coord::default(),
             print_time: 0.0,
-            estimated_print_time: 0.0,
+            estimated_print_time: EstimatedPrintTime::default(),
             last_step_gen_time: 0.0,
             // Upstream starts in "NeedPrime" and resyncs the print time on the
             // first planned move (`klippy/toolhead.py:224`).
@@ -150,10 +192,11 @@ impl ToolHead {
         &mut self.motion_queuing
     }
 
-    /// The MCU's estimated print time, used when planning starts
-    /// (`MCU.estimated_print_time`).
-    pub fn set_estimated_print_time(&mut self, print_time: f64) {
-        self.estimated_print_time = print_time;
+    /// Where the toolhead reads the MCU's estimated print time from
+    /// (`ToolHeadObject::connect` installs it: the primary MCU's own estimate,
+    /// read fresh — [`EstimatedPrintTime`]).
+    pub fn set_estimated_print_time_source(&mut self, source: EstimatedPrintTime) {
+        self.estimated_print_time = source;
     }
 
     /// Queue a move (`ToolHead.move`, `klippy/toolhead.py:395-408`).
@@ -194,6 +237,25 @@ impl ToolHead {
         Ok(())
     }
 
+    /// Floor `print_time` at the live estimate plus the start buffer, never
+    /// below the horizon already generated (`_calc_print_time`,
+    /// `klippy/toolhead.py:260-268`).
+    ///
+    /// Raise-only: a horizon the machine has not caught up with is left alone,
+    /// so re-priming after an idle moves the next move **forward** — onto
+    /// "now plus a buffer", never onto steps already generated. That is the
+    /// invariant C5's reproduction broke: with a connect-time snapshot the
+    /// floor stood still while the clock advanced, and after `N` seconds idle
+    /// every move was planned `N` seconds in the past (see
+    /// [`EstimatedPrintTime`]).
+    fn calc_print_time(&mut self) {
+        let min_print_time =
+            (self.estimated_print_time.get() + BUFFER_TIME_START).max(self.last_step_gen_time);
+        if min_print_time > self.print_time {
+            self.print_time = min_print_time;
+        }
+    }
+
     /// Flush the look-ahead into the trapq and advance the print time
     /// (`ToolHead._process_lookahead`, `klippy/toolhead.py:269-298`).
     fn process_lookahead(&mut self) {
@@ -203,19 +265,17 @@ impl ToolHead {
         }
         if self.special_queuing_state {
             // Leaving "NeedPrime": start the print time a buffer ahead of the
-            // MCU so the queue is never empty when motion starts. Upstream's
-            // `_calc_print_time` floors it further at `kin_time` —
+            // MCU so the queue is never empty when motion starts — upstream's
+            // `_calc_print_time` (`klippy/toolhead.py:260-268`), which reads
+            // the estimate **now** rather than from a connect-time snapshot
+            // (see [`EstimatedPrintTime`]), and floors further at `kin_time` —
             // `max(est + MIN_KIN_TIME, last_step_gen_time) + kin_flush_delay`
-            // (`toolhead.py:263` → `motion_queuing.py:190-192`) — and
+            // (`toolhead.py:263` → `motion_queuing.py:190-192`) — where
             // `last_step_gen_time` is the floor that keeps a move queued after
             // a drip from starting behind steps that drip already generated
             // (`kin_flush_delay` is not modelled in this host).
             self.special_queuing_state = false;
-            let min_print_time =
-                (self.estimated_print_time + BUFFER_TIME_START).max(self.last_step_gen_time);
-            if min_print_time > self.print_time {
-                self.print_time = min_print_time;
-            }
+            self.calc_print_time();
         }
         let mut next_move_time = self.print_time;
         for mut move_ in moves {
@@ -257,6 +317,15 @@ impl ToolHead {
         step_gen_time: f64,
     ) -> Result<Vec<(String, Vec<StepCommand>)>, StepCompressError> {
         self.process_lookahead();
+        // Upstream's `flush_step_generation` opens with `_flush_lookahead()`,
+        // which leaves the toolhead in "NeedPrime" (`klippy/toolhead.py:317-319`
+        // → `:299-307`), and `_handle_step_flush` returns to it whenever
+        // generation reaches the planner horizon (`:310-317`). Either way the
+        // next planned move re-runs `_calc_print_time` against the **live**
+        // estimate — without this the state is consumed by the first move ever
+        // planned and the print time never re-syncs after an idle (C5: a
+        // machine idle since connect planned its motion in the past).
+        self.special_queuing_state = true;
         let batches = self.motion_queuing.generate(step_gen_time)?;
         // Generation is what advances the horizon: a flush that produced
         // nothing for a stepper still generated *to* `step_gen_time`.
@@ -266,16 +335,28 @@ impl ToolHead {
 
     /// Plan everything queued so far (`ToolHead.wait_moves`,
     /// `klippy/toolhead.py:422-428`): upstream then waits for the MCU to catch
-    /// up, which needs the clock estimate and is FW5d's MCU side.
+    /// up, which needs the clock estimate and is FW5d's MCU side. What this
+    /// host does take from upstream is the `_flush_lookahead` the wait opens
+    /// with (`toolhead.py:299-307`): the toolhead is left in "NeedPrime", so
+    /// the next planned move floors `print_time` at the estimate **of that
+    /// moment** instead of chaining from a horizon the clock has long passed
+    /// (`M400` is where a replay pauses between segments).
     pub fn wait_moves(&mut self) {
         self.process_lookahead();
+        self.special_queuing_state = true;
     }
 
-    /// The print time the planner has reached (`ToolHead.get_last_move_time`):
-    /// flush the look-ahead into the trapq first, then report. Updates based on
-    /// this value are what the MCU is executing.
+    /// The print time the planner has reached (`ToolHead.get_last_move_time`,
+    /// `klippy/toolhead.py:320-326`): flush the look-ahead into the trapq
+    /// first, and while the toolhead is still priming run `_calc_print_time`
+    /// as well — a caller that schedules from this value (the probe callback,
+    /// the restart hooks) must not get a horizon the clock has already passed.
+    /// Updates based on this value are what the MCU is executing.
     pub fn get_last_move_time(&mut self) -> f64 {
         self.process_lookahead();
+        if self.special_queuing_state {
+            self.calc_print_time();
+        }
         self.print_time
     }
 
@@ -325,14 +406,11 @@ impl ToolHead {
         // with `kin_time = max(est + MIN_KIN_TIME, last_step_gen_time) +
         // kin_flush_delay` (`motion_queuing.py:190-192`). This host models
         // neither `MIN_KIN_TIME` nor `kin_flush_delay`; the two floors it does
-        // model are the buffer and the generated horizon, and the latter is
-        // what keeps the drip's start from landing behind steps a previous
-        // drip already generated (an "Invalid sequence" in the step solver).
-        let min_print_time =
-            (self.estimated_print_time + BUFFER_TIME_START).max(self.last_step_gen_time);
-        if min_print_time > self.print_time {
-            self.print_time = min_print_time;
-        }
+        // model are the buffer — read live, `calc_print_time` — and the
+        // generated horizon, and the latter is what keeps the drip's start from
+        // landing behind steps a previous drip already generated (an "Invalid
+        // sequence" in the step solver).
+        self.calc_print_time();
         let start_time = self.print_time;
         append_move(
             self.motion_queuing.trapq_mut(self.main_trapq),
@@ -348,6 +426,11 @@ impl ToolHead {
     /// `klippy/toolhead.py:417-420`).
     pub fn dwell(&mut self, delay: f64) {
         self.process_lookahead();
+        // `_flush_lookahead` re-enters "NeedPrime" (`klippy/toolhead.py:299-307`),
+        // which is what lets the next move re-floor `print_time` against the
+        // live estimate; the delay itself is added on top, as upstream does
+        // (`toolhead.py:417-420`).
+        self.special_queuing_state = true;
         self.print_time += delay.max(0.0);
     }
 
@@ -628,6 +711,165 @@ mod tests {
         toolhead.dwell(0.5);
 
         assert!((toolhead.print_time() - (before + 0.5)).abs() < 1e-9);
+    }
+
+    /// A toolhead whose estimate the test drives: the prime floor has to read
+    /// it at plan time (C5), so a test moves it between two plans.
+    fn toolhead_with_estimate(est: &Arc<Mutex<f64>>) -> ToolHead {
+        let mut toolhead = toolhead();
+        let estimate = Arc::clone(est);
+        toolhead.set_estimated_print_time_source(EstimatedPrintTime::new(move || {
+            *estimate.lock().unwrap()
+        }));
+        toolhead
+    }
+
+    #[test]
+    fn test_the_prime_floor_reads_the_estimate_at_plan_time_not_at_connect() {
+        let est = Arc::new(Mutex::new(0.0));
+        let mut toolhead = toolhead_with_estimate(&est);
+
+        toolhead
+            .move_to(Coord::new(10.0, 0.0, 0.0, 0.0), 100.0)
+            .unwrap();
+        let first = toolhead.get_last_move_time();
+        assert!(
+            first >= BUFFER_TIME_START - 1e-9,
+            "the first prime floors at the buffer above the estimate: {first}"
+        );
+
+        // The clock runs on while the planner idles: the next prime must read
+        // the estimate **of that moment**. A connect-time reading would keep
+        // flooring here at 0.25 for ever, and every later move would be
+        // planned in the past (C5: idle 301 s → every step batch's
+        // `completion` sat 301 s behind `est` and the whole motion was dumped
+        // at once).
+        *est.lock().unwrap() = 301.0;
+        // `set_position` re-enters "NeedPrime" (the re-arm this host already
+        // had, `klippy/toolhead.py:383-391`), so this is a fresh prime — the
+        // only thing under test is *which* estimate it reads.
+        toolhead.set_position(Coord::new(10.0, 0.0, 0.0, 0.0), &[0]);
+        toolhead
+            .move_to(Coord::new(20.0, 0.0, 0.0, 0.0), 100.0)
+            .unwrap();
+        let horizon = toolhead.get_last_move_time();
+
+        assert!(
+            horizon >= 301.0 + BUFFER_TIME_START - 1e-9,
+            "the floor follows the estimate: {horizon}"
+        );
+    }
+
+    /// The three re-arm paths upstream's `_flush_lookahead` covers
+    /// (`klippy/toolhead.py:299-307`) — each has to leave the toolhead primed
+    /// so the next move re-floors against the live estimate. One test each,
+    /// because removing any one of the three re-arms must turn exactly its own
+    /// test red.
+    mod need_prime_rearm {
+        use super::*;
+        /// Idle the planner, exercise one re-arm path, then plan again and
+        /// report the horizon that path's re-prime produced.
+        fn horizon_after_idle(toolhead: &mut ToolHead, est: &Arc<Mutex<f64>>, rearm: ReArm) -> f64 {
+            toolhead
+                .move_to(Coord::new(10.0, 0.0, 0.0, 0.0), 100.0)
+                .unwrap();
+            let _ = toolhead.get_last_move_time(); // plans: the first prime is spent
+            *est.lock().unwrap() = 60.0; // the clock runs on while the planner idles
+            match rearm {
+                ReArm::WaitMoves => toolhead.wait_moves(), // `M400`
+                ReArm::Dwell => toolhead.dwell(0.5),       // `G4`
+                ReArm::Flush => {
+                    toolhead.flush_step_generation(1.0).unwrap(); // generation
+                }
+            }
+            toolhead
+                .move_to(Coord::new(20.0, 0.0, 0.0, 0.0), 100.0)
+                .unwrap();
+            toolhead.get_last_move_time()
+        }
+
+        /// Which `_flush_lookahead` equivalent the path under test runs.
+        enum ReArm {
+            WaitMoves,
+            Dwell,
+            Flush,
+        }
+
+        fn assert_reprimed(horizon: f64, path: &str) {
+            assert!(
+                horizon >= 60.0 + BUFFER_TIME_START - 1e-9,
+                "{path} left the toolhead primed, so the next move floors at the live \
+                 estimate: {horizon}"
+            );
+        }
+
+        #[test]
+        fn test_wait_moves_re_primes_for_the_next_move() {
+            let est = Arc::new(Mutex::new(0.0));
+            let mut toolhead = toolhead_with_estimate(&est);
+
+            let horizon = horizon_after_idle(&mut toolhead, &est, ReArm::WaitMoves);
+
+            assert_reprimed(horizon, "wait_moves");
+        }
+
+        #[test]
+        fn test_dwell_re_primes_for_the_next_move() {
+            let est = Arc::new(Mutex::new(0.0));
+            let mut toolhead = toolhead_with_estimate(&est);
+
+            let horizon = horizon_after_idle(&mut toolhead, &est, ReArm::Dwell);
+
+            assert_reprimed(horizon, "dwell");
+        }
+
+        #[test]
+        fn test_flush_step_generation_re_primes_for_the_next_move() {
+            let est = Arc::new(Mutex::new(0.0));
+            let mut toolhead = toolhead_with_estimate(&est);
+
+            let horizon = horizon_after_idle(&mut toolhead, &est, ReArm::Flush);
+
+            assert_reprimed(horizon, "flush_step_generation");
+        }
+    }
+
+    #[test]
+    fn test_a_batch_planned_after_an_idle_lands_in_the_current_clock_domain() {
+        let est = Arc::new(Mutex::new(0.0));
+        let mut toolhead = toolhead_with_estimate(&est);
+
+        toolhead
+            .move_to(Coord::new(10.0, 0.0, 0.0, 0.0), 100.0)
+            .unwrap();
+        // What the next batch carries as `start` — and so as its `req_clock`
+        // (`StepBatchClocks`, `extras/toolhead.rs`).
+        let req_horizon = toolhead.get_last_move_time();
+
+        *est.lock().unwrap() = 301.0;
+        toolhead.set_position(Coord::new(10.0, 0.0, 0.0, 0.0), &[0]);
+        toolhead
+            .move_to(Coord::new(20.0, 0.0, 0.0, 0.0), 100.0)
+            .unwrap();
+        // The batch's `completion` — the clock that frees its slots.
+        let completion_horizon = toolhead.get_last_move_time();
+        let est_now = *est.lock().unwrap();
+
+        // `start`/`completion` are print times converted to this MCU's clock
+        // linearly (`stepcompress.rs:254-256`), so this ordering *is* the
+        // clocks' ordering, and the gates judge `req_clock` against
+        // `estimated_clock` with `MIN_REQTIME_DELTA` of lead (`mcu/mod.rs`):
+        // a `req` at or behind the estimate releases on sight, a `completion`
+        // at or after it is a batch the firmware can still schedule.
+        assert!(
+            req_horizon <= est_now + 0.100,
+            "req inside the release window, not queued into the future: {req_horizon} vs {est_now}"
+        );
+        assert!(
+            completion_horizon >= est_now,
+            "completion not before the estimate — an expired batch is the C5 dump: \
+             {completion_horizon} vs {est_now}"
+        );
     }
 
     #[test]

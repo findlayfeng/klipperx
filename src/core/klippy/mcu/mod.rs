@@ -2443,7 +2443,10 @@ impl Mcu {
         // The gates' inputs as the message enters the queue: this is the only
         // place the step path is visible (it bypasses `Mcu::enqueue`'s `send`
         // line), and the pair it prints — `completion` here, `est` there — is
-        // what the release comparison runs on.
+        // what the release comparison runs on. C5 measured that pair before
+        // the print-time floor went live: `completion` sat 27 s behind `est`
+        // after 33 s idle and 294 s behind it after 301 s idle — both gates
+        // opened on sight and the whole motion went out in one dump.
         let (pending, capacity) = self
             .move_slots
             .lock()

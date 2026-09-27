@@ -101,7 +101,7 @@ use crate::core::klippy::motion::rotary_delta::{
     ROTARY_DELTA_DEFAULT_ANGLES, ROTARY_DELTA_RAIL_NAMES,
 };
 use crate::core::klippy::motion::stepcompress::{StepCommand, StepCompressError};
-use crate::core::klippy::motion::toolhead::ToolHead;
+use crate::core::klippy::motion::toolhead::{EstimatedPrintTime, ToolHead};
 use crate::core::klippy::motion::winch::{winch_active_flags, winch_position_fn, WinchKinematics};
 use crate::core::klippy::motion::{HomeCoord, Homing, HomingHandle, HomingInfo};
 use crate::core::klippy::printer::{ConnectFuture, Printer, PrinterObject, RestartHooks};
@@ -1032,13 +1032,11 @@ impl PrinterObject for ToolHeadObject {
             // The primary MCU (the bare `[mcu]`) defines the print-time origin;
             // each stepper's compressor was already pointed at its own MCU's
             // clock domain (`SecondarySync`) during its own connect, which used
-            // this same `[mcu]` object's clock.
-            let main_print_time = self
-                .printer
-                .upgrade()
-                .and_then(|printer| printer.lookup_object_as::<McuObject>("mcu"))
-                .and_then(|object| object.estimated_print_time(self.reactor.monotonic()))
-                .unwrap_or(0.0);
+            // this same `[mcu]` object's clock. The origin is handed over as a
+            // **getter**, not a reading (see `EstimatedPrintTime`): every prime
+            // asks for the estimate of that moment.
+            let printer_for_est = self.printer.clone();
+            let reactor_for_est = self.reactor.clone();
 
             let mut toolhead = ToolHead::new(self.limits);
             for stepper in host_steppers {
@@ -1149,8 +1147,18 @@ impl PrinterObject for ToolHeadObject {
                 }
             }
 
-            // The toolhead's print time is the primary MCU's.
-            toolhead.set_estimated_print_time(main_print_time);
+            // The toolhead's print time is the primary MCU's, read live on
+            // every prime (`_calc_print_time`, `klippy/toolhead.py:260-264`).
+            // A reading taken here, at connect, would floor every later move at
+            // a horizon the clock passed `idle` seconds ago (C5: the whole
+            // motion expired and was dumped in one burst → `Timer too close`).
+            toolhead.set_estimated_print_time_source(EstimatedPrintTime::new(move || {
+                printer_for_est
+                    .upgrade()
+                    .and_then(|printer| printer.lookup_object_as::<McuObject>("mcu"))
+                    .and_then(|object| object.estimated_print_time(reactor_for_est.monotonic()))
+                    .unwrap_or(0.0)
+            }));
 
             // The extruders are the toolhead's `extra_axes`: each has its own
             // trapq, and the extruder queues the extrusion into it

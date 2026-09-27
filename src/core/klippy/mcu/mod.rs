@@ -1569,9 +1569,9 @@ impl Mcu {
     /// instead; a sample that arrives before any seed simply becomes the
     /// estimate.
     ///
-    /// Called by the clock-read path (`McuClock::get_clock` in `cmd::clock`);
-    /// this host has no periodic `get_clock` poller of its own, so nothing
-    /// calls it on a timer.
+    /// Called by the clock-read path (`McuClock::get_clock` in `cmd::clock`),
+    /// which the `mcu_clock_poll` timer (`McuObject`) drives about once a second
+    /// per MCU after the seed.
     pub(crate) fn record_clock_sample(&self, sent: Instant, received: Instant, clock64: u64) {
         let mut slot = self
             .clock_estimate

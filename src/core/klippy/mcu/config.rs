@@ -413,7 +413,8 @@ impl ConfigBuilder {
     /// Upstream's `MCUConfigHelper.get_query_slot` (`klippy/mcu.py:1136`): the
     /// current time plus 1.5 s, then `oid * 0.01 s` so a bank of queries does not
     /// fire at once. Upstream reads the time from its clock sync; this host uses
-    /// [`Mcu::estimated_clock`], the one clock reading taken at connect. The
+    /// [`Mcu::estimated_clock`] — seeded at connect, then refreshed once a
+    /// second by the `mcu_clock_poll` timer. The
     /// 1.5 s is what keeps the first report after the `init` commands that arm
     /// the query.
     ///

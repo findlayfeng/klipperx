@@ -260,6 +260,29 @@ impl SendClocks {
     }
 }
 
+/// The clock window one generated step batch covers, in ticks of its MCU —
+/// what the step path hands the move pool (`McuStepper::send_steps_async`).
+///
+/// * `start` — when the batch's first step can run: the previous generation
+///   horizon (`last_step_gen_time`), a lower bound on the batch's first step.
+///   It is the batch's `req_clock`, so the message wants to be on the wire
+///   [`MIN_REQTIME_DELTA`] before it — upstream stamps the same boundary on
+///   every step message (`stepcompress.c:359`,
+///   `min_clock = req_clock = last_step_clock`).
+/// * `completion` — when its last step runs (`step_gen_time`): the clock that
+///   frees this batch's slots in the firmware's move queue (`MoveSlots`).
+///
+/// A stepper with no print-time mapping yet reports clock 0 for both: the
+/// gates read that as "send now" (unknown clock) and a 0 completion frees on
+/// sight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StepBatchClocks {
+    /// When the batch's first step can run — its `req_clock`.
+    pub start: u64,
+    /// When its last step runs — the slot-freeing clock.
+    pub completion: u64,
+}
+
 /// The clock the send task's gates are judged against: this connection's
 /// estimate and dictionary, shared with [`Mcu`] — the two halves
 /// [`Mcu::estimated_clock`] reads, as one cloneable handle (the send task
@@ -2070,20 +2093,53 @@ impl Mcu {
         start_clock: u64,
         completion_clock: u64,
     ) -> Result<(), MsgError> {
+        self.enqueue(
+            name,
+            args,
+            None,
+            self.move_clocks(start_clock, completion_clock),
+        )
+    }
+
+    /// [`Mcu::send_move`] for an already-encoded payload — the stepper's flush
+    /// path, where a batch is encoded once and sent with its window
+    /// (`McuStepper::send_steps_async`).
+    ///
+    /// The pool entry is taken here, before the payload waits for room, so the
+    /// slot accounting is in step with the queue.
+    ///
+    /// # Errors
+    /// As [`Mcu::send_payload`].
+    pub(crate) async fn send_move_payload(
+        &self,
+        payload: Payload,
+        start_clock: u64,
+        completion_clock: u64,
+    ) -> Result<(), McuError> {
+        let clocks = self.move_clocks(start_clock, completion_clock);
+        // Same headroom wait as `send_payload`: a long step batch must not
+        // starve the synchronous senders (`SYNC_SEND_HEADROOM`).
+        while !payload_has_room(&self.send_buf_tx) && !self.send_buf_tx.is_closed() {
+            sleep(Duration::from_micros(100)).await;
+        }
+        self.send_buf_tx
+            .send(SendItem::Clocked(payload, clocks))
+            .await
+            .map_err(|e| McuError::Msg(MsgError::new(e.to_string())))
+    }
+
+    /// The gates for one move-class command: the pool's floor for its
+    /// `min_clock`, its start clock for `req_clock` (`Mcu::send_move`).
+    fn move_clocks(&self, start_clock: u64, completion_clock: u64) -> SendClocks {
         let min_clock = self
             .move_slots
             .lock()
             .expect("move slots lock poisoned")
             .record(completion_clock, &self.gate_clock());
-        self.enqueue(
-            name,
-            args,
-            None,
-            SendClocks {
-                min_clock,
-                req_clock: Some(start_clock),
-            },
-        )
+        SendClocks {
+            min_clock,
+            req_clock: Some(start_clock),
+        }
     }
 
     /// [`Mcu::send_move`] for a typed command — the move-class counterpart of

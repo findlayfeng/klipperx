@@ -7,8 +7,9 @@
 klipperx stress [OPTIONS] <CONFIG_FILE> [MCU]
 ```
 
-- `CONFIG_FILE` 用来取 `[mcu …]`（传输方式）；`--task step` / `--task motion` 还要一个
-  stepper 的 `step_pin` / `dir_pin`；
+- `CONFIG_FILE` 用来取 `[mcu …]`（传输方式）；`--task step` / `--task motion` 还要该板名下
+  带 `step_pin` / `dir_pin` 的 stepper 节（按 `step_pin` 的 chip 归属，同板多个全收；`motion`
+  取第一个可用节）；
 - `MCU` 省略或为空即裸 `[mcu]`；`[mcu zboard]` 要写 `zboard`；
 - `--task`（默认 `step`）选做什么：`step` 压步进生成，`comm` 压主机↔MCU 链路，
   `motion` 跑一遍完整运动链路的真板冒烟；
@@ -21,8 +22,12 @@ klipperx stress [OPTIONS] <CONFIG_FILE> [MCU]
 ## 任务一：步进生成（`--task step`，默认）
 
 负载选自上游的**步进引擎**（`src/stepper.c`）——MCU 的主要工作就是按 `queue_step` 生成步进脉冲。
-工具借用配置里某个 `[stepper_*]` / `[manual_stepper]` 的 step/dir 引脚，用 `ConfigBuilder`
-配置**一个自己的 stepper**（不是那个 section 的 stepper），然后按段加大步频。
+工具按**参加测试的板**收集配置里全部 `step_pin` 归属该板的 `[stepper_*]` / `[manual_stepper]`
+节（归属只看 `step_pin` 的 chip；`enable_pin`/`endstop_pin` 落在别的板不改变归属，stress 本就不读
+它们），用 `ConfigBuilder` 在**同一轮配置**里给每节各配一个自己的压力 stepper（各自 oid——固件
+`finalize_config` 后再握手会 `config_reset` 掉先前配置，故不能逐节握手），同板并发驱动、同一
+ramp 同步下发，然后按段加大步频。`dir_pin` 与 `step_pin` 不同板的节**按节拒绝**（固件口径
+`Stepper dir pin must be on same mcu as step pin`），不拖累同板其它节。
 
 每段的目标是**一段持续、均匀的步频**：
 
@@ -127,6 +132,30 @@ Trapq（一段匀速 5 mm 移动）
 即链路能稳定扛住约 **3.5k 往返/秒**，再高响应就开始积压。注意这与“名义 250000 baud”无关——
 USB CDC 走的是 USB 全速，真正的瓶颈在固件的命令处理与响应队列。
 
+## 多机（同时打多块板）
+
+`[MCU]...` 是多值参数：**省略 = 只连裸 `[mcu]`**（与旧单机行为一致），可给一个或多个名字
+（重复自动去重）；`--all-mcus` 枚举配置里全部 `[mcu …]` 节（按配置顺序，裸 `[mcu]` 计一个），
+与显式名单互斥（同给报错）。
+
+```sh
+klipperx stress config.cfg                       # 单板（默认 [mcu]）
+klipperx stress config.cfg mcu2                  # 指定一块
+klipperx stress config.cfg mcu mcu2 --task step  # 两板并发
+klipperx stress config.cfg --all-mcus --task comm
+```
+
+每板一路 future 由 `join_all` 并发轮询（板数运行期才知道，等价于逐 future `join!`；单板连接
+失败不阻断其它板，记入汇总）。**所有输出行带 `[<mcu>] ` 前缀**（含单板运行），收尾按板汇总：
+step 打 `last rate it survived`（两条退出路径都打）、comm 打 `last rate it carried`、到顶打
+`no failure up to …`。退出码：任一板**硬错误**（连接/配置失败）→ 1；各板「找到上限」仍算成功。
+`--task step` 时每板驱动其名下**全部** stepper 节（按 `step_pin` 归属）；没有 stepper 节的板打
+`[<mcu>] no stepper section on this MCU; skipping step task` 跳过（不算硬错误），多 stepper 板的段行
+带 `; N steppers` 注记、配置行形如 `configured 2 steppers (oids 0, 1; …)`。
+
+运行时仍是 `worker_threads(2)`（`run()` 处有注释）：阻塞 I/O 走 blocking 池，每板只占
+send/recv 两个后台任务——**双路 ramp 的余量未实测**，出现调度延迟再调。
+
 ## 它会怎么对待板子
 
 这是一次**接管**：`ConfigBuilder` 的握手会给一块跑着别的配置（或已 shutdown）的板子发
@@ -134,20 +163,27 @@ USB CDC 走的是 USB 全速，真正的瓶颈在固件的命令处理与响应�
 `McuObject` 一致）——重连的顺序是：`reset` 发出并 flush → **15 ms 排空停顿**（`RESET_DISCONNECT_DELAY`，
 对齐上游 `klippy/mcu.py` 的 `_disconnect()` 口径）→ **先 drop 旧会话**（中止接收任务、关闭口）→
 再重开；不先关旧会话的话，重连循环期间两个读端会抢同一 tty，新会话被饿死直到 identify 超时——
-然后配置上这个压力 stepper。测试结束时板子通常停在 shutdown 状态，下一次
+**但 `drop` 只有在 `Arc::strong_count==1` 时才会真正关旧**：多板重构（M1）曾把会话 clone 进 `boards`
+横跨 `join_all` 存活，使 `drop` 形同虚设（真机 396 条 `answers block 110` 恒定 + identify 10s 死循环）；
+现由 `drive_boards` 把会话所有权下移（`unzip` 后 move 进逐板 future，持有者与 join 同寿命），并在
+`run_board` 入口与重连前**断言 `strong_count==1`**（两条新单测，两种回退形态均转红实录）。然后
+配置上这个压力 stepper。测试结束时板子通常停在 shutdown 状态，下一次
 运行（或正常的主机）会重新配置它。
 
 ## 要求与缺口
 
-- 配置里必须有 `[mcu …]`（或 `[mcu]`）；`--task step` 还要一个带 `step_pin`/`dir_pin` 的 stepper
-  section，没有就直接报错（`--task comm` 不需要）。
+- 配置里必须有 `[mcu …]`（或 `[mcu]`）；`--task step` 还要该板名下带 `step_pin`/`dir_pin` 的
+  stepper section：**显式点名**的板没有 → 直接报错（原文案）；**`--all-mcus` 扫出**的板没有 →
+  打跳过行、不改退出码，全部板都没有才整体报错（`--task comm` 不需要 stepper）。
 - 引脚名支持 `PA0`、`mcu:PA0`、`<chip>:PA0` 和尾随 `!`（忽略）；**别名（`[board_pins]`）还没
   解析**。
 - 压力 stepper 用 `invert_step = 0`、`step_pulse_ticks = 0`；`[stepper_*]` 的 `invert_step` /
   `microsteps` / `enable_pin` 等**不读**——这些选项现在由 `extras/stepper.rs` 的正式 stepper
   资源消费，压力工具只借 step/dir 引脚，自己造一个固定的 stepper（剩余项见 S1）。
 - 夹具每次 reset + reconnect（无 `config_reset` 的固件）约 0.5 s。
-- 端到端只在真板上手工跑过；单测覆盖的是段计算、引脚解析与命令编码。
+- 端到端只在真板上手工跑过（**双板并发的真板验证项**：双 step ramp、双 comm ramp 的调度余量、
+  `--all-mcus` 真实枚举、单板旧命令行回归、一板连接失败另一板照常+退出码 1）；单测覆盖的是段
+  计算、引脚解析、命令编码与多机选择/双假设备并发的帧隔离（见 [测试](testing.md)）。
 
 TODO 里记着这些剩余项（**S1**）。
 

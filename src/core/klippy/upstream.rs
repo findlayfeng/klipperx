@@ -814,6 +814,14 @@ mod tests {
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default();
             let name = format!("{file} ({})", relative(&run.config));
+            // `KLIPPERX_UPSTREAM_FILTER=<substr>` runs only the cases whose
+            // name contains it: a local iteration lever (the default, unset,
+            // runs the full suite exactly as before).
+            if let Some(needle) = std::env::var_os("KLIPPERX_UPSTREAM_FILTER") {
+                if !name.contains(needle.to_string_lossy().as_ref()) {
+                    continue;
+                }
+            }
 
             // A run without a dictionary cannot be started the way upstream
             // starts one; upstream itself refuses to.

@@ -2,10 +2,14 @@ use crate::core::klippy::frame::Frame;
 use crate::core::klippy::interface::error::InterfaceError;
 
 use crate::core::klippy::interface::Device;
-use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender};
 use std::{
     collections::VecDeque,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
+    time::Duration,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -78,56 +82,96 @@ impl FrameMock {
 /// A frame **recorder** for transport-timing tests: every payload it is sent is
 /// recorded (no input validation — the gate tests assert *when* something goes
 /// out, and the derived command bytes are not worth predicting), each block is
-/// acked with `seq + 1`, and one configured request is answered with a canned
+/// acked with `seq + 1`, and every scripted request is answered with a canned
 /// response so a `call` round trip can complete.
 ///
-/// Cloneable: the test keeps a handle so it can [`RecordingWire::shutdown`]
-/// the wire explicitly — a bare `Mcu` in a test can be kept alive by the
-/// resource callback cycles (the object layer breaks those in
-/// `McuObject::release_cycles`), and a blocked receive would then park the
-/// test runtime's shutdown.
-#[derive(Clone)]
-pub struct RecordingWire(Arc<RecordingWireInner>);
+/// Cloneable: each clone is a new **view** of the wire — its own place in the
+/// receive queue and its own lifetime — while the record, the scripted
+/// answers and the wire's own sender are shared. Two sessions on one wire
+/// then read like two fds on one UART: whichever reader is still running
+/// takes the frame (session theft included), and a session's
+/// [`RecordingWire::shutdown`] stops **its** reads without closing the line
+/// the session that reopens the port is about to use — the shape the
+/// reset → reconnect fixture in `mcu/mod.rs` needs.
+///
+/// The test keeps a handle so it can shut its own view down explicitly, but
+/// the guarantee that no receive outlives its session comes from
+/// `Mcu::close` (called by `Mcu::Drop` too): the receive runs inside
+/// `spawn_blocking`, and a view that is still parked would hold up the test
+/// runtime's shutdown.
+pub struct RecordingWire {
+    /// What every view shares: the record of sends, the scripted answers, and
+    /// the firmware→wire sender.
+    inner: Arc<RecordingWireInner>,
+    /// This view's position in the firmware→host queue (a crossbeam receiver
+    /// is multi-consumer: a frame goes to exactly one waiting view).
+    rx: Receiver<Frame>,
+    /// Set by [`RecordingWire::shutdown`]: this view reads no more.
+    closed: Arc<AtomicBool>,
+}
 
 struct RecordingWireInner {
     sent: Arc<Mutex<Vec<Vec<u8>>>>,
-    reply: Mutex<Option<(Vec<u8>, Vec<u8>)>>,
+    replies: Mutex<Vec<(Vec<u8>, Vec<u8>)>>,
     tx: Mutex<Option<Sender<Frame>>>,
-    rx: Receiver<Frame>,
+}
+
+impl Clone for RecordingWire {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            rx: self.rx.clone(),
+            closed: Arc::new(AtomicBool::new(false)),
+        }
+    }
 }
 
 impl RecordingWire {
     pub fn new() -> Self {
         let (tx, rx) = bounded(64);
-        Self(Arc::new(RecordingWireInner {
-            sent: Arc::new(Mutex::new(Vec::new())),
-            reply: Mutex::new(None),
-            tx: Mutex::new(Some(tx)),
+        Self {
+            inner: Arc::new(RecordingWireInner {
+                sent: Arc::new(Mutex::new(Vec::new())),
+                replies: Mutex::new(Vec::new()),
+                tx: Mutex::new(Some(tx)),
+            }),
             rx,
-        }))
+            closed: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     /// The live record of every payload this wire was sent.
     pub fn sent(&self) -> Arc<Mutex<Vec<Vec<u8>>>> {
-        Arc::clone(&self.0.sent)
+        Arc::clone(&self.inner.sent)
     }
 
     /// Answer a send whose payload equals `request` with `response` (before
     /// the ack of that block).
+    ///
+    /// Several requests may be scripted at once: the identify handshake asks
+    /// for its one data chunk and then for the terminator, and both need an
+    /// answer. A later call for the same `request` replaces its answer.
     pub fn reply_to(&self, request: Vec<u8>, response: Vec<u8>) {
-        *self.0.reply.lock().unwrap() = Some((request, response));
+        let mut replies = self.inner.replies.lock().unwrap();
+        replies.retain(|(known, _)| *known != request);
+        replies.push((request, response));
     }
 
-    /// Close the wire: pending and future `receive()` calls return `None`.
+    /// Stop **this view's** receives: a pending call returns within one
+    /// poll tick and future calls return `None` — the wire itself stays up.
+    ///
+    /// A session that closes before the port is reopened (the reset →
+    /// reconnect path) must not take the firmware's answers away from the
+    /// session that reopens it: only this view stops reading.
     pub fn shutdown(&self) {
-        *self.0.tx.lock().unwrap() = None;
+        self.closed.store(true, Ordering::SeqCst);
     }
 }
 
 impl std::fmt::Debug for RecordingWire {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RecordingWire")
-            .field("sent", &self.0.sent.lock().unwrap().len())
+            .field("sent", &self.inner.sent.lock().unwrap().len())
             .finish_non_exhaustive()
     }
 }
@@ -135,30 +179,47 @@ impl std::fmt::Debug for RecordingWire {
 impl Device for RecordingWire {
     fn send(&self, frame: &Frame) -> Result<(), InterfaceError> {
         let payload = frame.payload().to_vec();
-        self.0.sent.lock().unwrap().push(payload.clone());
-        let tx = self.0.tx.lock().unwrap().clone();
+        self.inner.sent.lock().unwrap().push(payload.clone());
+        let tx = self.inner.tx.lock().unwrap().clone();
         let Some(tx) = tx else {
             return Ok(());
         };
         let seq = (frame.seq() + 1) & 0x0f;
-        let reply = self.0.reply.lock().unwrap();
-        if let Some((request, response)) = reply.as_ref() {
-            if *request == payload {
-                let _ = tx.send(Frame::new(seq, response.clone()));
-            }
+        let replies = self.inner.replies.lock().unwrap();
+        if let Some((_, response)) = replies.iter().find(|(request, _)| *request == payload) {
+            let _ = tx.send(Frame::new(seq, response.clone()));
         }
-        drop(reply);
+        drop(replies);
         // The block was taken, so the window advances (`Sender::settle`).
         let _ = tx.send(Frame::new(seq, Vec::new()));
         Ok(())
     }
 
     fn receive(&self) -> Option<Frame> {
-        self.0.rx.recv().ok()
+        // A bounded wait rather than a bare `recv()`: this view has to notice
+        // its own `shutdown` without the wire's sender being dropped (another
+        // session may still be reading it). The wait ends immediately when a
+        // frame arrives, so delivery is not slowed by the poll.
+        loop {
+            if self.closed.load(Ordering::SeqCst) {
+                return None;
+            }
+            match self.rx.recv_timeout(Duration::from_millis(20)) {
+                Ok(frame) => {
+                    if self.closed.load(Ordering::SeqCst) {
+                        return None;
+                    }
+                    return Some(frame);
+                }
+                Err(RecvTimeoutError::Timeout) => continue,
+                // The wire itself is gone: every sender dropped with it.
+                Err(RecvTimeoutError::Disconnected) => return None,
+            }
+        }
     }
 
     fn shutdown(&self) {
-        *self.0.tx.lock().unwrap() = None;
+        RecordingWire::shutdown(self);
     }
 }
 

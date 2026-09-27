@@ -374,7 +374,6 @@ mod tests {
     async fn test_home_start_waits_for_its_reqclock_window() {
         use tokio::time::sleep;
         let wire = RecordingWire::new();
-        let closer = wire.clone();
         let sent = wire.sent();
         let mcu = Arc::new(Mcu::for_test("mcu", Interface::recording(wire)));
         mcu.install_dictionary(dictionary()).unwrap();
@@ -436,11 +435,10 @@ mod tests {
         // past the runtime's shutdown.
         mcu.clear_events();
         drop(endstop);
-        // Close the wire explicitly: the bare `Mcu` can be kept alive by the
-        // resource callback cycle (production breaks it in
-        // `McuObject::release_cycles`), and a still-blocked receive would park
-        // this test runtime's shutdown.
-        closer.shutdown();
+        // Close the session explicitly: the receive runs inside
+        // `spawn_blocking`, and `Mcu::close` releases that parked read (its
+        // own view of the wire stops reading; the wire itself stays up).
+        mcu.close();
     }
 
     /// ⑤ `endstop_query_state` carries upstream's `minclock`

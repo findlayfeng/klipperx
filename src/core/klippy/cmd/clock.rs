@@ -391,12 +391,16 @@ pub trait ClockSync {
 
 /// [`ClockSync`] backed by an MCU.
 ///
-/// The handle is shared rather than cloned: the `Mcu` owns the device connection
-/// and shutting it down is tied to dropping the last reference. Every query
-/// also feeds the [`ClockEstimator`], so this is how the host learns the
-/// mapping from the reactor's clock to the firmware's — and, through the same
-/// round trip, the `Mcu`'s own clock estimate (`Mcu::record_clock_sample`,
-/// behind `Mcu::estimated_clock`).
+/// The handle is shared rather than cloned: the `Mcu` owns the device
+/// connection. A reconnect ends the old session explicitly (`Mcu::close`,
+/// which `reconnect` calls — reference counting is not what waits on here,
+/// since this clock is precisely one of the handles that outlives it), and
+/// dropping the last reference still closes the connection as the backstop
+/// (`Drop` behind `Mcu::close`). Every query also feeds the
+/// [`ClockEstimator`], so this is how the host learns the mapping from the
+/// reactor's clock to the firmware's — and, through the same round trip, the
+/// `Mcu`'s own clock estimate (`Mcu::record_clock_sample`, behind
+/// `Mcu::estimated_clock`).
 pub struct McuClock {
     mcu: Arc<Mcu>,
     reactor: Arc<dyn Reactor>,

@@ -110,7 +110,7 @@ impl Interface {
     }
 
     /// Create an interface over a recording wire (`RecordingWire`): records
-    /// every frame sent, acks, answers one configured request — for tests that
+    /// every frame sent, acks, and answers scripted requests — for tests that
     /// assert *when* a message goes out without predicting its derived bytes.
     #[cfg(test)]
     pub fn recording(device: devices::frame_mock::RecordingWire) -> Self {

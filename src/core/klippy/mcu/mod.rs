@@ -712,7 +712,98 @@ struct Wire {
     /// `next` alone only says what this connection sent last — which is exactly
     /// what an ambiguous empty frame (ack *and* nak carry the same number) cannot
     /// confirm.
+    ///
+    /// Every frame carries the number, including one the window cannot place and
+    /// drops: a frame past `next` is still the firmware saying where it is, and
+    /// a renumber that could only read the last *accepted* frame would adopt a
+    /// number the firmware has long left behind (see [`place_frame`]).
     seen: AtomicU64,
+    /// Set when the window was just renumbered onto the firmware's number
+    /// ([`Sender::renumber_to_firmware`]), cleared when the receive task places
+    /// the next new number ([`place_frame`]).
+    ///
+    /// A renumber rewinds `next` to `seen`, so the firmware's next number may be
+    /// past anything this connection has sent — not a frame from an earlier
+    /// session but *this* connection re-initialising itself, which upstream
+    /// adopts rather than drops (`serialqueue.c:196-201`: "Got an ack for a
+    /// message not sent; must be connection init"). The exemption is the one the
+    /// session's first new number already has (`serialqueue.c:261`,
+    /// `receive_seq != 1`): without re-arming it, a window that was rewound can
+    /// never place the firmware's answer again — every frame from it is judged
+    /// "a block this connection never sent" and dropped, for good.
+    connection_init: AtomicBool,
+}
+
+/// What one received frame's sequence byte decides for the receive window.
+///
+/// The pure half of the receive task's sequence handling, so the two rules that
+/// decide whether a frame is *placed* or *dropped* can be tested without a
+/// transport on the line.
+#[derive(Debug, PartialEq, Eq)]
+enum Placement {
+    /// The frame repeats the number the window is at: no new number, nothing to
+    /// adopt, and nothing spent — a firmware whose counter sits at a multiple of
+    /// 16 looks exactly like this against a session that starts at 0.
+    Repeat,
+    /// A new number the window takes. `session_start` says this is the session's
+    /// first new number (the takeover test); `ahead_of_window` says it is past
+    /// `next`, which is the send task's cue to adopt it and resend
+    /// ([`Sender::settle`]).
+    Adopt {
+        rseq: u64,
+        session_start: bool,
+        ahead_of_window: bool,
+    },
+    /// A number past anything this connection sent, with no connection-init
+    /// exemption left: the frame is dropped (its payload never reaches the
+    /// parser), but its number has already been recorded as where the firmware
+    /// says it is.
+    Ahead { rseq: u64, next: u64 },
+}
+
+/// Place a frame's 4-bit sequence in this connection's unwrapped window.
+///
+/// The firmware stamps everything it sends with its one counter, and that
+/// counter only ever moves forward (`src/command.c:16,208,301-305`): a frame
+/// that looks behind is really ahead, so the delta picks the representative in
+/// `[seen, seen + 15]`.
+///
+/// Two exemptions let a number *past* `next` through, both connection init:
+///
+/// * the session's **first** new number (`seen == 0`, i.e. upstream's
+///   `receive_seq == 1` at `serialqueue.c:261`) — how a firmware that never
+///   rebooted is taken over;
+/// * the first new number after a **renumber** (`wire.connection_init`) — the
+///   window was just rewound onto the firmware's number, so its answer arriving
+///   is this connection resynchronising, not an answer to a block never sent
+///   (`serialqueue.c:196-201`).
+///
+/// A frame that has no exemption and is past `next` is dropped — and that is
+/// where the firmware's number has to be kept anyway: `Wire::seen` is what
+/// [`Sender::renumber_to_firmware`] adopts, so a drop that discarded the number
+/// would leave every later renumber aiming at a stale window.
+fn place_frame(seen: u64, wire: &Wire, frame_seq: u8) -> Placement {
+    let delta = (frame_seq.wrapping_sub(seen as u8) & 0xf) as u64;
+    if delta == 0 {
+        return Placement::Repeat;
+    }
+    let rseq = seen + delta;
+    let next = wire.next.load(Ordering::Relaxed);
+    let session_start = seen == 0;
+    let exempt = session_start || wire.connection_init.load(Ordering::Relaxed);
+    if !exempt && rseq > next {
+        // The frame goes, the report does not: the renumber adopts it.
+        wire.seen.store(rseq, Ordering::Relaxed);
+        return Placement::Ahead { rseq, next };
+    }
+    wire.seen.store(rseq, Ordering::Relaxed);
+    // Any new number spends the exemption that let it through.
+    wire.connection_init.store(false, Ordering::Relaxed);
+    Placement::Adopt {
+        rseq,
+        session_start,
+        ahead_of_window: rseq > next,
+    }
 }
 
 /// How long the host waits for an answer before putting the unacknowledged
@@ -1368,7 +1459,12 @@ impl Sender {
     /// Connection init: an answer this connection's window cannot place says
     /// where the firmware really is (`serialqueue.c:196-201`, "Got an ack for a
     /// message not sent; must be connection init"), and the firmware's number is
-    /// the one the next block has to carry.
+    /// the one the next block has to carry. It is also where the receive side
+    /// needs an exemption of its own: the window has just moved back to the
+    /// firmware's number, so its answer arriving next can be past what this
+    /// connection has sent — an answer the receive task would otherwise drop as
+    /// one to a block never sent, leaving the retry answered by a window that can
+    /// no longer hear it (see [`place_frame`], `connection_init`).
     ///
     /// [`Sender::settle`] deliberately does **not** do this on an empty frame
     /// alone: `seen == next` is both the ack of a healthy block and the nak of
@@ -1385,6 +1481,12 @@ impl Sender {
             debug!("Renumbering: firmware waits for {seen}, this connection would send {next}");
         }
         self.wire.next.store(seen, Ordering::Relaxed);
+        // Rewinding the window is what the receive side has to be told about:
+        // the firmware's next number may now be ahead of it, and that frame is
+        // this connection initialising itself, not a block this connection never
+        // sent (`serialqueue.c:196-201`). Spent by the first new number that
+        // arrives (`place_frame`), so it cannot outlive this renumber.
+        self.wire.connection_init.store(true, Ordering::Relaxed);
         self.in_flight.clear();
         self.retransmit_at = None;
         self.acked = None;
@@ -1635,8 +1737,8 @@ impl Mcu {
             // `0` until a frame carries a new number, and a frame that merely
             // repeats the number so far leaves it at `0` — the same way
             // upstream's `receive_seq` only moves on a new sequence
-            // (`serialqueue.c:254-268`). "No new number taken in yet" is this
-            // session's first-frame test: it is what says whether the firmware
+            // (`serialqueue.c:254-268`). `0` is also this session's first-frame
+            // test: no new number taken in yet is what says whether the firmware
             // was already running (`Wire::took_over`).
             let mut seen = 0u64;
 
@@ -1647,58 +1749,45 @@ impl Mcu {
                     None => break,
                 };
 
-                // The firmware stamps everything it sends with its one counter, and
-                // that counter only ever moves forward (`src/command.c:16,208,301-305`):
-                // map the 4-bit value onto this connection's unwrapped one, so a
-                // frame that looks behind is read as ahead.
-                let delta = (frame.seq().wrapping_sub(seen as u8) & 0xf) as u64;
-                let rseq = seen + delta;
-                if delta != 0 {
-                    // A new number: it answers a block. The firmware's counter is
-                    // the authority on which blocks those are, so a number past
-                    // anything this connection sent comes from a session that came
-                    // before it. Drop it — unless this is still the session's
-                    // **first** new number (`receive_seq == 1` upstream,
-                    // `serialqueue.c:261`; `seen == 0` here): that one is how a
-                    // firmware that never rebooted is taken over, and it may be
-                    // carrying a leftover frame the previous session never
-                    // acknowledged. Dropping it would leave the firmware replaying
-                    // it forever while everything queued behind it — an identify
-                    // answer included — never goes out. It is adopted instead:
-                    // the connection-init case of `serialqueue.c:197-201`, where
-                    // an answer to a block this connection never sent says where
-                    // the firmware is, and the send task renumbers and resends
-                    // what was not accepted.
-                    let next = wire_for_recv.next.load(Ordering::Relaxed);
-                    let first_new = seen == 0;
-                    if !first_new && rseq > next {
+                // Whether this frame's number can be placed in the window, and
+                // where — the two connection-init exemptions and the drop are
+                // all decided there (`place_frame`).
+                match place_frame(seen, &wire_for_recv, frame.seq()) {
+                    Placement::Repeat => {}
+                    Placement::Ahead { rseq, next } => {
+                        // The number is kept as the firmware's last report (the
+                        // renumber adopts it), but this frame's payload has no
+                        // place in the window: it answers a block this
+                        // connection never sent.
                         warn!(
                             "Frame with sequence {rseq} answers block {next} or later, which this \
                              connection never sent; dropping it"
                         );
                         continue;
                     }
-                    seen = rseq;
-                    // Where the firmware says it is, kept for the one caller
-                    // entitled to adopt it: identify's retry after silence
-                    // (`Mcu::renumber_to_firmware`).
-                    wire_for_recv.seen.store(seen, Ordering::Relaxed);
-                    if first_new && rseq > 1 {
-                        // A firmware that just booted answers this connection's
-                        // first block with 0 or 1 (`src/command.c`, whose counter
-                        // starts at 0). Anything else was already running when the
-                        // port was opened — a board nothing reset.
-                        wire_for_recv.took_over.store(true, Ordering::Relaxed);
-                        info!(
-                            "Firmware is still in an earlier session (sequence {rseq}); \
-                             taking it over"
-                        );
-                    }
-                    // A data frame is a response, and the ack that follows it (in
-                    // the normal flow) carries the same number — so a takeover is
-                    // the only thing about a data frame the send task has to know.
-                    if rseq > next {
-                        let _ = acks_tx.send(seen);
+                    Placement::Adopt {
+                        rseq,
+                        session_start,
+                        ahead_of_window,
+                    } => {
+                        seen = rseq;
+                        if session_start && rseq > 1 {
+                            // A firmware that just booted answers this connection's
+                            // first block with 0 or 1 (`src/command.c`, whose counter
+                            // starts at 0). Anything else was already running when the
+                            // port was opened — a board nothing reset.
+                            wire_for_recv.took_over.store(true, Ordering::Relaxed);
+                            info!(
+                                "Firmware is still in an earlier session (sequence {rseq}); \
+                                 taking it over"
+                            );
+                        }
+                        // A data frame is a response, and the ack that follows it (in
+                        // the normal flow) carries the same number — so a takeover is
+                        // the only thing about a data frame the send task has to know.
+                        if ahead_of_window {
+                            let _ = acks_tx.send(seen);
+                        }
                     }
                 }
 
@@ -3079,6 +3168,116 @@ mod tests {
         assert!(
             sender.sample_seq.is_none(),
             "the pinned sample belonged to the abandoned window"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The receive window: a dropped frame still reports, and a renumber
+    // re-arms connection init (B5 — reset → reconnect against an arbitrary
+    // residue, firmware rebooted or not).
+    //
+    // Both rules are what keeps a rewound window from going deaf: the receive
+    // side decides on its own whether a frame is placed or dropped
+    // (`place_frame`), and the two halves of that decision are what the sender
+    // then acts on.
+    // -----------------------------------------------------------------------
+
+    /// A frame past the window is dropped — but it is still the firmware saying
+    /// where it is, and `Wire::seen` is exactly what `renumber_to_firmware`
+    /// adopts. A drop that discarded the number would leave every later renumber
+    /// aiming at a window the firmware has already left, and the receive side
+    /// would then drop every answer against a `next` that never moves.
+    ///
+    /// The real shape: `/tmp/vA.log` dropped 396 frames, all against the same
+    /// `answers block 110` — the recorded number never moved with what the
+    /// firmware reported.
+    #[test]
+    fn test_a_frame_past_the_window_still_reports_where_the_firmware_is() {
+        // Both sides at 110, then the firmware's counter moves on without this
+        // connection having sent the blocks: frame sequence 0 is two past 110 in
+        // this window's numbering.
+        let wire = Wire::default();
+        wire.next.store(110, Ordering::Relaxed);
+        wire.seen.store(110, Ordering::Relaxed);
+
+        assert_eq!(
+            place_frame(110, &wire, 0),
+            Placement::Ahead {
+                rseq: 112,
+                next: 110
+            },
+            "the frame is dropped: it answers a block this connection never sent"
+        );
+        assert_eq!(
+            wire.seen.load(Ordering::Relaxed),
+            112,
+            "the drop keeps the firmware's report — that is what the next renumber adopts"
+        );
+    }
+
+    /// A renumber rewinds the window, so the firmware's answer arriving next can
+    /// be ahead of it. That frame is this connection initialising itself
+    /// (`serialqueue.c:196-201`), not an answer to a block never sent: without
+    /// the re-armed exemption the receive side drops it and the retry is never
+    /// answered.
+    #[test]
+    fn test_a_renumber_rearms_connection_init_for_the_answer_behind_it() {
+        let wire = Arc::new(Wire::default());
+        wire.next.store(6, Ordering::Relaxed);
+        wire.seen.store(5, Ordering::Relaxed);
+        let mut sender = Sender::new(Arc::clone(&wire));
+
+        sender.renumber_to_firmware();
+
+        assert_eq!(
+            wire.next.load(Ordering::Relaxed),
+            5,
+            "the window is rewound onto the firmware's number"
+        );
+        // The firmware took the block this connection sent before the silence,
+        // so it is past the rewound window when its answer arrives.
+        assert_eq!(
+            place_frame(5, &wire, 6),
+            Placement::Adopt {
+                rseq: 6,
+                session_start: false,
+                ahead_of_window: true,
+            },
+            "the answer behind a renumber is placed, and the send task is told"
+        );
+        // One exemption, one frame: spent by the number it let through, so a
+        // later frame past the window is dropped as it was before. The send task
+        // has adopted 6 in between (`Sender::settle`), which is what the window
+        // reads here.
+        wire.next.store(6, Ordering::Relaxed);
+        assert_eq!(
+            place_frame(6, &wire, 8),
+            Placement::Ahead { rseq: 8, next: 6 },
+            "the exemption does not outlive the renumber it belongs to"
+        );
+    }
+
+    /// A congruent frame is no decision at all: no number moves and no
+    /// exemption is spent, so a firmware whose counter sits at a multiple of 16
+    /// opens the session exactly like one at 0 — same window, no takeover.
+    #[test]
+    fn test_a_congruent_frame_is_no_decision_at_all() {
+        let wire = Wire::default(); // next 0, seen 0: a session that just opened
+
+        assert_eq!(
+            place_frame(0, &wire, 0),
+            Placement::Repeat,
+            "a frame congruent with `seen` carries no new number"
+        );
+        assert_eq!(wire.seen.load(Ordering::Relaxed), 0, "and moves nothing");
+        assert_eq!(
+            place_frame(0, &wire, 5),
+            Placement::Adopt {
+                rseq: 5,
+                session_start: true,
+                ahead_of_window: true,
+            },
+            "the first-frame exemption is still armed for the next real number"
         );
     }
 

@@ -278,7 +278,7 @@ MCU 'mcu' is configured with CRC 0x…, the host computed 0x…
 > 本节原为「还没有的」，所列各项均已落地，保留为逐项说明与上游的对应关系。
 
 - **pin 名改写**：已完成（F2）。`PinResolver` 在资源**加入命令之前**把别名/保留作用于参数，与上游“finalize 时改写文本”顺序相反，原因见上一节。`[board_pins]` 是它的装载入口（`extras/board_pins.rs`）。
-- **`get_query_slot`**：已完成。`ConfigBuilder::get_query_slot` 返回 `现在的估计时钟 + 1.5 s + oid*0.01 s`；它用 `Mcu::estimated_clock`——connect 时 `get_uptime` 种子加主机时间外推；有样本后由时钟估计器（中点半 RTT 错点 + 窗口最小二乘）跟踪漂移，**但当前主机无周期 `get_clock` 轮询**，运行期无样本时退化为标称外推；也没有 print time。没有 `get_uptime` 的固件拿不到估计，`get_query_slot` 报 `McuError::Config`。
+- **`get_query_slot`**：已完成。`ConfigBuilder::get_query_slot` 返回 `现在的估计时钟 + 1.5 s + oid*0.01 s`；它用 `Mcu::estimated_clock`——connect 时 `get_uptime` 种子加主机时间外推，之后由 **1 s 的 `mcu_clock_poll`**（seed 成功才注册）持续喂样本（中点半 RTT 错点 + 窗口最小二乘）跟踪漂移；也没有 print time。没有 `get_uptime` 的固件拿不到估计，`get_query_slot` 报 `McuError::Config`。
 - **固件复位（`config_reset` / `reset`）**：已完成。`firmware_restart` 且 `restart_method: command` 时，`reset` 在**拆机之前**由 `McuObject::before_firmware_restart` 在**活连接**上发出（上游把它放在 `klippy:firmware_restart` 事件里，`klippy/mcu.py:754`），所以重连后只需 identify + 配置一次，而不用先连上去告诉它重启。配置握手路径上，`config_reset` 就地清；只有 `reset` 的固件发 `reset` + 重连 + 重试握手；两者都没有才报错。
 - **`rpi_usb` 的连接期门控**：已完成。`restart::restart_before_bringup` 对应上游 `check_restart_on_attach` / `check_restart_on_send_config`（串口不在先上电、未配置先断电再配置），`check_usb_power` 在每次 connect 探测 hub 能否切电（不能则降级 `command`）。
 - **`restart_method` 分派**：已完成。`McuConfig.restart_method` 被三处读取：`McuObject::connect` 挑 `command` 的 `reset`、`McuConfig::open` 给 `cheetah` 定 RTS、物理分派在 `mcu/restart.rs`（`command` / `arduino` / `cheetah` / `rpi_usb`）。

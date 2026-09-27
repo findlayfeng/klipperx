@@ -163,7 +163,11 @@ send/recv 两个后台任务——**双路 ramp 的余量未实测**，出现调
 `McuObject` 一致）——重连的顺序是：`reset` 发出并 flush → **15 ms 排空停顿**（`RESET_DISCONNECT_DELAY`，
 对齐上游 `klippy/mcu.py` 的 `_disconnect()` 口径）→ **先 drop 旧会话**（中止接收任务、关闭口）→
 再重开；不先关旧会话的话，重连循环期间两个读端会抢同一 tty，新会话被饿死直到 identify 超时——
-然后配置上这个压力 stepper。测试结束时板子通常停在 shutdown 状态，下一次
+**但 `drop` 只有在 `Arc::strong_count==1` 时才会真正关旧**：多板重构（M1）曾把会话 clone 进 `boards`
+横跨 `join_all` 存活，使 `drop` 形同虚设（真机 396 条 `answers block 110` 恒定 + identify 10s 死循环）；
+现由 `drive_boards` 把会话所有权下移（`unzip` 后 move 进逐板 future，持有者与 join 同寿命），并在
+`run_board` 入口与重连前**断言 `strong_count==1`**（两条新单测，两种回退形态均转红实录）。然后
+配置上这个压力 stepper。测试结束时板子通常停在 shutdown 状态，下一次
 运行（或正常的主机）会重新配置它。
 
 ## 要求与缺口

@@ -206,24 +206,38 @@ const SLOT_RELEASE_MARGIN: f64 = 0.020;
 /// long a re-anchored clock goes unnoticed.
 const GATE_REPOLL_MAX: Duration = Duration::from_millis(10);
 
+/// A message waiting on its gates in the send task, and what its park/release
+/// lines read back (C5's observability): when it parked, and which gate was
+/// holding it then.
+struct ParkedMsg {
+    payload: Payload,
+    clocks: SendClocks,
+    /// When it entered the deque — the release line reports how long it sat.
+    parked_at: Instant,
+    /// [`SendClocks::held_by`] answered at that moment: the gate that has to
+    /// open again before this message can go out.
+    held_by: &'static str,
+}
+
 /// A message waiting on its gates in the send task, or a flush barrier queued
 /// behind such messages. The send task owns this list; nothing else sees it.
 enum Parked {
-    Payload(Payload, SendClocks),
+    Payload(ParkedMsg),
     /// [`Mcu::flush`] behind parked messages: everything queued ahead of the
     /// barrier includes the parked messages, so the barrier waits with them.
-    Flush(oneshot::Sender<()>),
+    /// The `Instant` is when the barrier was queued (how long it waited).
+    Flush(oneshot::Sender<()>, Instant),
 }
 
 impl Parked {
     fn is_flush(&self) -> bool {
-        matches!(self, Self::Flush(_))
+        matches!(self, Self::Flush(..))
     }
 
     fn clocks(&self) -> SendClocks {
         match self {
-            Self::Payload(_, clocks) => *clocks,
-            Self::Flush(_) => SendClocks::default(),
+            Self::Payload(msg) => msg.clocks,
+            Self::Flush(..) => SendClocks::default(),
         }
     }
 }
@@ -243,20 +257,35 @@ impl SendClocks {
     /// (`serialqueue.c:612-618`, "Clock unknown during initial startup ...
     /// return PR_NOW").
     fn released(&self, now: Option<&GateNow>) -> bool {
-        let Some(now) = now else {
-            return true;
-        };
-        if let Some(min_clock) = self.min_clock {
-            if now.clock < min_clock {
-                return false;
-            }
+        self.held_by_raw(now).is_none()
+    }
+
+    /// Which gate(s) hold this message at `now`: `"min"`, `"req"`,
+    /// `"min+req"`, or `"none"` when nothing does (`now = None` reads as
+    /// "clock unknown", which releases).
+    ///
+    /// This is the label the park line writes down and the release line reads
+    /// back as its reason — the gates have no other trace.
+    fn held_by(&self, now: Option<&GateNow>) -> &'static str {
+        self.held_by_raw(now).unwrap_or("none")
+    }
+
+    /// [`SendClocks::held_by`] without the `"none"` label, so `released` can
+    /// share the one judgement.
+    fn held_by_raw(&self, now: Option<&GateNow>) -> Option<&'static str> {
+        let now = now?;
+        let held_min = self
+            .min_clock
+            .is_some_and(|min_clock| now.clock < min_clock);
+        let held_req = self
+            .req_clock
+            .is_some_and(|req_clock| req_clock > now.clock + now.req_lead);
+        match (held_min, held_req) {
+            (true, true) => Some("min+req"),
+            (true, false) => Some("min"),
+            (false, true) => Some("req"),
+            (false, false) => None,
         }
-        if let Some(req_clock) = self.req_clock {
-            if req_clock > now.clock + now.req_lead {
-                return false;
-            }
-        }
-        true
     }
 }
 
@@ -323,14 +352,29 @@ impl GateClock {
     }
 }
 
+/// A gate as a log line: its number, or `-` when that gate is not set.
+fn show_gate(clock: Option<u64>) -> String {
+    clock.map_or_else(|| "-".to_string(), |clock| clock.to_string())
+}
+
+/// The estimate as a log line: the clock, or `?` when there is none.
+fn show_est(clock: Option<u64>) -> String {
+    clock.map_or_else(|| "?".to_string(), |clock| clock.to_string())
+}
+
 /// Take the next message the gates allow onto the wire: the **lowest**
 /// `req_clock` among the released ones, queue order on ties — this is
 /// `build_and_send_command` picking the "highest priority message"
 /// (`serialqueue.c:478-486`) — and never past a flush barrier.
+///
+/// A message that had been held reports its release (board, both gates, the
+/// estimate it was judged against, and how long it sat): the gates are
+/// otherwise invisible, and C5 needs to see which one opened.
 fn take_released(
     parked: &mut VecDeque<Parked>,
     now: Option<&GateNow>,
     gates_open: bool,
+    board: &str,
 ) -> Option<Payload> {
     // Only the run before the first barrier may be picked; a barrier is a
     // boundary for everything queued behind it.
@@ -342,14 +386,76 @@ fn take_released(
         .filter(|(_, item)| gates_open || item.clocks().released(now))
         .min_by_key(|(index, item)| (item.clocks().req_clock.unwrap_or(0), *index))?;
     match parked.remove(index) {
-        Some(Parked::Payload(payload, _)) => Some(payload),
+        Some(Parked::Payload(msg)) => {
+            if msg.held_by != "none" {
+                let reason = if gates_open {
+                    "gates open"
+                } else if now.is_none() {
+                    "clock unknown"
+                } else {
+                    msg.held_by
+                };
+                debug!(
+                    "[{board}] gate open: released after {:.0} ms (was held by {reason}) — \
+                     min={} req={} est={}",
+                    msg.parked_at.elapsed().as_secs_f64() * 1000.,
+                    show_gate(msg.clocks.min_clock),
+                    show_gate(msg.clocks.req_clock),
+                    show_est(now.map(|now| now.clock)),
+                );
+            }
+            Some(msg.payload)
+        }
         // Unreachable: `index` came from the prefix before any barrier.
-        Some(Parked::Flush(done)) => {
-            parked.insert(index, Parked::Flush(done));
+        Some(Parked::Flush(done, queued_at)) => {
+            parked.insert(index, Parked::Flush(done, queued_at));
             None
         }
         None => None,
     }
+}
+
+/// Queue one message for the gates, and report the hold: a message the gates
+/// keep back is the one worth a line — the rest releases on sight — and that
+/// line is the park half of the park/release pair (C5's observability).
+fn park_payload(
+    parked: &mut VecDeque<Parked>,
+    payload: Payload,
+    clocks: SendClocks,
+    now: Option<&GateNow>,
+    gates_open: bool,
+    board: &str,
+) {
+    let held_by = if gates_open {
+        "none"
+    } else {
+        clocks.held_by(now)
+    };
+    if held_by != "none" {
+        debug!(
+            "[{board}] gate park: min={} req={} est={} held_by={held_by}",
+            show_gate(clocks.min_clock),
+            show_gate(clocks.req_clock),
+            show_est(now.map(|now| now.clock)),
+        );
+    }
+    parked.push_back(Parked::Payload(ParkedMsg {
+        payload,
+        clocks,
+        parked_at: Instant::now(),
+        held_by,
+    }));
+}
+
+/// Queue a flush barrier behind what is parked, saying how far back it has to
+/// wait (`Mcu::flush`'s half of the pair: a barrier covers the parked messages
+/// and therefore waits with them).
+fn park_flush(parked: &mut VecDeque<Parked>, done: oneshot::Sender<()>, board: &str) {
+    debug!(
+        "[{board}] gate flush: barrier queued behind {} parked message(s)",
+        parked.len()
+    );
+    parked.push_back(Parked::Flush(done, Instant::now()));
 }
 
 /// When the send task should next look at the parked gates: the earliest
@@ -372,9 +478,10 @@ fn gate_wake(
     let freq = gate.freq()?;
     let mut earliest: Option<u64> = None;
     for item in parked {
-        let Parked::Payload(_, clocks) = item else {
+        let Parked::Payload(msg) = item else {
             continue;
         };
+        let clocks = msg.clocks;
         let mut wait: Option<u64> = None;
         if let Some(min_clock) = clocks.min_clock {
             if now.clock < min_clock {
@@ -463,6 +570,17 @@ impl MoveSlots {
         (self.pending.len() > capacity)
             .then(|| self.pending[self.pending.len() - capacity - 1])
             .map(|completion| Self::free_at(completion, freq))
+    }
+
+    /// How full the pool is, as the enqueue line reports it: entries waiting
+    /// for their completion clocks, and the firmware's `move_count` once the
+    /// handshake armed it (`"unarmed"` until then).
+    fn report(&self) -> (usize, String) {
+        (
+            self.pending.len(),
+            self.capacity
+                .map_or_else(|| "unarmed".to_string(), |capacity| capacity.to_string()),
+        )
     }
 }
 
@@ -1555,6 +1673,7 @@ impl Mcu {
             dictionary: Arc::clone(&dictionary),
         };
 
+        let board = name.clone();
         let send_handle = handle.spawn(async move {
             let mut sender = Sender::new(Arc::clone(&wire_for_send));
             // What the two gates hold back: messages not released yet, and
@@ -1572,11 +1691,17 @@ impl Mcu {
                         &mut parked,
                         gate_clock.now().as_ref(),
                         gates_open.load(Ordering::Relaxed),
+                        &board,
                     ) {
                         break first;
                     }
-                    if matches!(parked.front(), Some(Parked::Flush(_))) {
-                        if let Some(Parked::Flush(done)) = parked.pop_front() {
+                    if matches!(parked.front(), Some(Parked::Flush(..))) {
+                        if let Some(Parked::Flush(done, queued_at)) = parked.pop_front() {
+                            debug!(
+                                "[{board}] gate flush: barrier satisfied after {:.0} ms with \
+                                 nothing parked ahead",
+                                queued_at.elapsed().as_secs_f64() * 1000.
+                            );
                             let _ = done.send(());
                         }
                         continue;
@@ -1588,16 +1713,32 @@ impl Mcu {
                     tokio::select! {
                         item = send_buf_rx.recv() => match item {
                             Some(SendItem::Payload(p)) => {
-                                parked.push_back(Parked::Payload(p, SendClocks::default()));
+                                let now = gate_clock.now();
+                                park_payload(
+                                    &mut parked,
+                                    p,
+                                    SendClocks::default(),
+                                    now.as_ref(),
+                                    gates_open.load(Ordering::Relaxed),
+                                    &board,
+                                );
                             }
                             Some(SendItem::Clocked(p, clocks)) => {
-                                parked.push_back(Parked::Payload(p, clocks));
+                                let now = gate_clock.now();
+                                park_payload(
+                                    &mut parked,
+                                    p,
+                                    clocks,
+                                    now.as_ref(),
+                                    gates_open.load(Ordering::Relaxed),
+                                    &board,
+                                );
                             }
                             Some(SendItem::Flush(done)) => {
                                 if parked.is_empty() {
                                     let _ = done.send(());
                                 } else {
-                                    parked.push_back(Parked::Flush(done));
+                                    park_flush(&mut parked, done, &board);
                                 }
                             }
                             Some(SendItem::Renumber(applied)) => {
@@ -1639,6 +1780,7 @@ impl Mcu {
                         &mut parked,
                         gate_clock.now().as_ref(),
                         gates_open.load(Ordering::Relaxed),
+                        &board,
                     ) {
                         if payload.try_merge(&next).is_err() {
                             // Merge failed (would exceed max), send current batch first
@@ -1652,9 +1794,14 @@ impl Mcu {
                     }
                     // A barrier the gates have let through: send this batch,
                     // then signal it (`Mcu::flush`).
-                    if matches!(parked.front(), Some(Parked::Flush(_))) {
-                        if let Some(Parked::Flush(done)) = parked.pop_front() {
-                            flush_done = Some(done);
+                    if matches!(parked.front(), Some(Parked::Flush(..))) {
+                        if let Some(Parked::Flush(done, queued_at)) = parked.pop_front() {
+                            debug!(
+                                "[{board}] gate flush: barrier let go after {:.0} ms — the \
+                                 messages ahead of it are out",
+                                queued_at.elapsed().as_secs_f64() * 1000.
+                            );
+                            flush_done = Some((done, queued_at));
                         }
                         break;
                     }
@@ -1666,22 +1813,35 @@ impl Mcu {
                         maybe_next = send_buf_rx.recv() => {
                             match maybe_next {
                                 Some(SendItem::Payload(next_payload)) => {
-                                    parked.push_back(Parked::Payload(
+                                    let now = gate_clock.now();
+                                    park_payload(
+                                        &mut parked,
                                         next_payload,
                                         SendClocks::default(),
-                                    ));
+                                        now.as_ref(),
+                                        gates_open.load(Ordering::Relaxed),
+                                        &board,
+                                    );
                                 }
                                 Some(SendItem::Clocked(next_payload, clocks)) => {
-                                    parked.push_back(Parked::Payload(next_payload, clocks));
+                                    let now = gate_clock.now();
+                                    park_payload(
+                                        &mut parked,
+                                        next_payload,
+                                        clocks,
+                                        now.as_ref(),
+                                        gates_open.load(Ordering::Relaxed),
+                                        &board,
+                                    );
                                 }
                                 Some(SendItem::Flush(done)) => {
                                     if parked.is_empty() {
                                         // Boundary requested with nothing parked
                                         // ahead of it: send this batch now.
-                                        flush_done = Some(done);
+                                        flush_done = Some((done, Instant::now()));
                                         break;
                                     }
-                                    parked.push_back(Parked::Flush(done));
+                                    park_flush(&mut parked, done, &board);
                                 }
                                 Some(SendItem::Renumber(applied)) => {
                                     // Applied to the window; a batch already being
@@ -1735,7 +1895,12 @@ impl Mcu {
                 sender
                     .send_block(&interface_for_send, payload.into_raw())
                     .await;
-                if let Some(done) = flush_done {
+                if let Some((done, queued_at)) = flush_done {
+                    debug!(
+                        "[{board}] gate flush: satisfied after {:.0} ms — its batch is on the \
+                         wire",
+                        queued_at.elapsed().as_secs_f64() * 1000.
+                    );
                     let _ = done.send(());
                 }
             }
@@ -2275,6 +2440,26 @@ impl Mcu {
         completion_clock: u64,
     ) -> Result<(), McuError> {
         let clocks = self.move_clocks(start_clock, completion_clock);
+        // The gates' inputs as the message enters the queue: this is the only
+        // place the step path is visible (it bypasses `Mcu::enqueue`'s `send`
+        // line), and the pair it prints — `completion` here, `est` there — is
+        // what the release comparison runs on.
+        let (pending, capacity) = self
+            .move_slots
+            .lock()
+            .expect("move slots lock poisoned")
+            .report();
+        debug!(
+            "[{}] move in: {} bytes, start={} completion={} min={} req={} est={} \
+             pool={pending}/{capacity}",
+            self.name,
+            payload.len(),
+            start_clock,
+            completion_clock,
+            show_gate(clocks.min_clock),
+            show_gate(clocks.req_clock),
+            show_est(self.gate_clock().estimated_clock()),
+        );
         // Same headroom wait as `send_payload`: a long step batch must not
         // starve the synchronous senders (`SYNC_SEND_HEADROOM`).
         while !payload_has_room(&self.send_buf_tx) && !self.send_buf_tx.is_closed() {
@@ -2353,6 +2538,19 @@ impl Mcu {
                 self.describe_command(name, args)
             ),
             None => debug!("send {}", self.describe_command(name, args)),
+        }
+        // A gated message says what holds it: `min`/`req` against the estimate
+        // at the moment it joins the queue (the park line reports the same
+        // three numbers once the send task has it).
+        if clocks != SendClocks::default() {
+            debug!(
+                "[{}] gate in: {} min={} req={} est={}",
+                self.name,
+                self.describe_command(name, args),
+                show_gate(clocks.min_clock),
+                show_gate(clocks.req_clock),
+                show_est(self.gate_clock().estimated_clock()),
+            );
         }
         // An ungated message stays on the plain variant: the gate path treats
         // the two the same (`SendClocks::default()` is released on sight), and

@@ -496,8 +496,22 @@ mod tests {
     /// starts: `0` for a board that takes this connection's first block, `1` for
     /// one whose counter is already one ahead of it.
     fn chunked_mappings(compressed: &[u8], chunk_size: usize, first_seq: u8) -> Vec<MappingEntry> {
+        chunked_mappings_from(compressed, chunk_size, first_seq, 0)
+    }
+
+    /// [`chunked_mappings`] for a transfer that starts part-way in: the first
+    /// entry answers `start_offset` under `first_seq`, and every chunk after it
+    /// follows in order. The prefix of the transfer is scripted by the caller —
+    /// a nak, a takeover, a silence that costs a renumber — and this is what
+    /// continues from wherever that left the exchange.
+    fn chunked_mappings_from(
+        compressed: &[u8],
+        chunk_size: usize,
+        first_seq: u8,
+        start_offset: usize,
+    ) -> Vec<MappingEntry> {
         let mut mappings = Vec::new();
-        let mut offset = 0usize;
+        let mut offset = start_offset;
         let mut seq = first_seq;
 
         loop {
@@ -759,6 +773,183 @@ mod tests {
             1,
             "the retry carries the number the firmware asked for"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // reset → reconnect: 对任意残余数的接收侧对齐（B5）
+    //
+    // 真机失败现场（/tmp/vA.log）：reset 后的重连会话里，固件的回答被接收侧
+    // 判成「本连接从未发过的块」连环丢弃，identify 四轮全部超时。三条按现场
+    // 时序复刻：同余首帧、空 ack 首帧、改号后的响应帧。
+    // -----------------------------------------------------------------------
+
+    /// （a）固件的 `next_sequence` 停在 16 的倍数上（一块没重启的板子），它的
+    /// 首帧与本会话 `seen = 0` **同余**（`delta == 0`）：既不动号、不消耗首帧
+    /// 豁免，也不宣称接管——传输照常完成，每块一个请求，一个不多。
+    #[tokio::test]
+    async fn test_a_congruent_first_frame_completes_the_transfer_in_phase() {
+        let compressed = compress(DICTIONARY_JSON.as_bytes());
+        let chunk = IDENTIFY_CHUNK_SIZE as usize;
+        assert!(
+            compressed.len() > chunk,
+            "the transfer needs a second chunk"
+        );
+        let mut mappings = vec![MappingEntry {
+            input: Frame::new(0, request_payload(0)),
+            outputs: vec![
+                // The leftover ack of the session before this one: stamped with
+                // the firmware's counter, which sits at a multiple of 16 —
+                // congruent with this host's `seen = 0`, so it moves no number.
+                Frame::new(0, Vec::new()),
+                // This connection's block 0 matches the firmware's own low nibble
+                // and is taken, so the answer carries the counter after it.
+                Frame::new(
+                    1,
+                    response_payload(0, &compressed[..chunk.min(compressed.len())]),
+                ),
+                Frame::new(1, Vec::new()),
+            ],
+        }];
+        // From chunk 1 on the exchange runs in phase: the answer put `seen` at 1,
+        // so the next request goes out under 1.
+        mappings.extend(chunked_mappings_from(&compressed, chunk, 1, chunk));
+
+        let device = FrameMock::new(mappings.clone());
+        let recorder = device.recorder();
+        let mcu = Mcu::for_test("test_mcu", Interface::new(device));
+
+        let identify = Identify::fetch(&mcu, Duration::from_secs(2))
+            .await
+            .expect("a congruent first frame leaves the transfer in phase");
+
+        assert_eq!(identify.data["app"], "Klipper");
+        assert!(
+            !mcu.took_over_session(),
+            "a congruent frame names no session to take over"
+        );
+        let sent = recorder.frames();
+        let expected: Vec<Frame> = mappings.iter().map(|entry| entry.input.clone()).collect();
+        assert_eq!(
+            sent, expected,
+            "one request per chunk from 0 on: no renumber, no retransmit"
+        );
+    }
+
+    /// （b）本会话的首帧是**空 ack**（携带固件正在等的号），它消耗掉首帧豁免；
+    /// 紧随其后的响应帧号更高——接收侧必须照样采纳（不能判 never-sent），
+    /// identify 一次完成、不重试。
+    #[tokio::test]
+    async fn test_an_empty_ack_first_frame_adopts_the_response_behind_it() {
+        let compressed = compress(DICTIONARY_JSON.as_bytes());
+        let chunk = IDENTIFY_CHUNK_SIZE as usize;
+        assert!(
+            compressed.len() > chunk,
+            "the transfer needs a second chunk"
+        );
+        let mut mappings = vec![
+            // The nak: the firmware waits for 5, this connection's first block
+            // is 0. The empty frame carries 5 — the session's first *new*
+            // number, which the adoption below spends.
+            MappingEntry {
+                input: Frame::new(0, request_payload(0)),
+                outputs: vec![Frame::new(5, Vec::new())],
+            },
+            // The same request again under the adopted number. Its answer is
+            // stamped 6 — a number this connection has not sent anything at
+            // yet (it sent 5), so it only lands if the receive side takes it
+            // with the window it just announced.
+            MappingEntry {
+                input: Frame::new(5, request_payload(0)),
+                outputs: vec![
+                    Frame::new(
+                        6,
+                        response_payload(0, &compressed[..chunk.min(compressed.len())]),
+                    ),
+                    Frame::new(6, Vec::new()),
+                ],
+            },
+        ];
+        // The answer put `seen` at 6, so chunk 1 goes out under 6.
+        mappings.extend(chunked_mappings_from(&compressed, chunk, 6, chunk));
+
+        let device = FrameMock::new(mappings.clone());
+        let recorder = device.recorder();
+        let mcu = Mcu::for_test("test_mcu", Interface::new(device));
+
+        let identify = Identify::fetch(&mcu, Duration::from_secs(2))
+            .await
+            .expect("the number behind a spent first-frame exemption is still adopted");
+
+        assert_eq!(identify.data["app"], "Klipper");
+        assert!(mcu.took_over_session(), "the nak named a running session");
+        let sent = recorder.frames();
+        let expected: Vec<Frame> = mappings.iter().map(|entry| entry.input.clone()).collect();
+        assert_eq!(
+            sent, expected,
+            "the first block goes out at 0, the adopted number carries the rest; \
+             no attempt is burned"
+        );
+        assert_eq!(sent[0].seq(), 0);
+        assert_eq!(sent[1].seq(), 5, "the retry carries the firmware's 5");
+    }
+
+    /// （c）改号（identify 读到静默就改号重发）之后，固件的回答必须仍被接收侧
+    /// 采纳。改号把发送窗退回到 `seen`，接收侧若因此把固件的号判成「本连接从未
+    /// 发过」，回答永远进不来，identify 只能一轮轮超时到死。
+    #[tokio::test]
+    async fn test_a_response_behind_a_renumber_is_still_accepted() {
+        let compressed = compress(DICTIONARY_JSON.as_bytes());
+        let chunk = IDENTIFY_CHUNK_SIZE as usize;
+        assert!(
+            compressed.len() > chunk,
+            "the transfer needs a second chunk"
+        );
+        let mut mappings = vec![
+            // The nak: the firmware waits for 5. Adoption → resend at 5.
+            MappingEntry {
+                input: Frame::new(0, request_payload(0)),
+                outputs: vec![Frame::new(5, Vec::new())],
+            },
+            // The firmware takes the resent block (its counter moves to 6) but
+            // its answer is still on the wire: the first attempt's window runs
+            // out in silence, and identify reads that as a nak — the window is
+            // renumbered back onto 5 and the chunk is asked for again.
+            MappingEntry {
+                input: Frame::new(5, request_payload(0)),
+                outputs: Vec::new(),
+            },
+            // The renumbered retry, and the answer behind it: stamped 6, one
+            // past the number the window was rewound to.
+            MappingEntry {
+                input: Frame::new(5, request_payload(0)),
+                outputs: vec![
+                    Frame::new(
+                        6,
+                        response_payload(0, &compressed[..chunk.min(compressed.len())]),
+                    ),
+                    Frame::new(6, Vec::new()),
+                ],
+            },
+        ];
+        mappings.extend(chunked_mappings_from(&compressed, chunk, 6, chunk));
+
+        let device = FrameMock::new(mappings.clone());
+        let recorder = device.recorder();
+        let mcu = Mcu::for_test("test_mcu", Interface::new(device));
+
+        let identify = Identify::fetch(&mcu, Duration::from_millis(2500))
+            .await
+            .expect("the answer behind the renumbered window is accepted");
+
+        assert_eq!(identify.data["app"], "Klipper");
+        let sent = recorder.frames();
+        let expected: Vec<Frame> = mappings.iter().map(|entry| entry.input.clone()).collect();
+        assert_eq!(
+            sent, expected,
+            "0 → 5 (adoption) → 5 (renumbered retry) → one per chunk after it"
+        );
+        assert_eq!(sent[1].seq(), 5, "the adoption carries the firmware's 5");
+        assert_eq!(sent[2].seq(), 5, "the renumber puts the retry back on 5");
     }
 
     /// The healthy path is untouched: the first answer arrives, so the send

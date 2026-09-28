@@ -328,7 +328,7 @@ impl MuxEndpoint for MuxBatchEndpoint {
     }
 
     /// Dropping this registration stops the helper's stream
-    /// ([`BatchBulkHelper::stop`]), which the loop then finishes off.
+    /// (`BatchBulkHelper::stop`), which the loop then finishes off.
     fn detach(&self) {
         self.bulk.stop();
     }

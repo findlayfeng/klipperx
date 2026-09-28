@@ -106,7 +106,7 @@ pub(crate) fn callback(&self, id: i16) -> Option<MsgCallback>;
 
 1. 若有同步调用（`Mcu::call`）正在等待该响应名，投递给该调用，回调**不会**触发；
 2. 否则按消息 id 查 `McuEvents`，命中就调用它；
-3. 否则记录 `Unhandled message … discarding` 警告。
+3. 否则记录 `[<MCU 名>] Unhandled message … discarding` 警告（握手期固件真停机时，`McuObject` 在握手之前绑的那对**只记录**处理器会先接住它，见 [MCU 配置构建](mcu-config.md)）。
 
 `McuObject` 在本身被丢弃（机器拆机）时调用 `Mcu::clear_events()` 清空该表：回调可能
 持有会反向引用 `Mcu` 的资源（传输句柄），不清理就形成强引用环，`Mcu::Drop` 不跑、其

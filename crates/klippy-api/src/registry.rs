@@ -10,11 +10,13 @@
 //!
 //! # Lifecycle
 //!
-//! Endpoints are registered while printer objects are being created and the
-//! table is frozen before the socket is served, so [`Api::register`] takes
-//! `&mut self` and dispatch needs no lock on the hot path. Remote methods are
-//! the exception: clients register and drop them while serving, so that one
-//! table sits behind a lock.
+//! Plain endpoints are registered while printer objects are being created and
+//! the table is frozen before the socket is served, so [`Api::register`] takes
+//! `&mut self` and dispatch needs no lock on the hot path. Two tables are
+//! mutable at runtime: mux instances, which a configuration reload replaces
+//! ([`Api::register_mux`], [`Api::clear_mux`]), and remote methods, which
+//! clients register and drop while serving. Dispatch takes their locks only
+//! long enough to resolve a request, never across an `.await`.
 //!
 //! Registration failures are [`RegistrationError`], not [`ApiError`]: a
 //! duplicated path is a bug in klippy that no client can provoke, and it should
@@ -86,6 +88,16 @@ pub trait MuxEndpoint: Send + Sync {
         request: &'a Request,
         context: &'a EndpointContext<'a>,
     ) -> EndpointFuture<'a>;
+
+    /// Called when this registration is dropped.
+    ///
+    /// [`Api::clear_mux`] invokes it for every instance when the host rebuilds
+    /// the configuration that registered them — a reload replaced this
+    /// instance or its section went away. An instance that started background
+    /// work or registered clients must stop them here; otherwise the old
+    /// instance, and every object it holds, outlives the configuration it
+    /// belonged to. Does nothing by default.
+    fn detach(&self) {}
 }
 
 /// What a handler is given besides the request itself.
@@ -180,11 +192,11 @@ struct Mux {
 }
 
 impl Mux {
-    fn dispatch<'a>(
-        &'a self,
-        request: &'a Request,
-        context: &'a EndpointContext<'a>,
-    ) -> EndpointFuture<'a> {
+    /// Pick the instance a request addresses.
+    ///
+    /// The handler comes back as an owned `Arc` rather than a borrow of the
+    /// table, so the caller can drop its lock before awaiting the handler.
+    fn resolve(&self, request: &Request) -> Result<Arc<dyn MuxEndpoint>, ApiError> {
         let params = request.params();
 
         // A non-string value cannot name an instance; a missing one is only
@@ -192,31 +204,22 @@ impl Mux {
         let requested = match params.get_opt(&self.key) {
             Some(Value::String(name)) => Some(name.clone()),
             Some(other) => {
-                return Box::pin(std::future::ready(Err(ApiError::UnknownMuxValue {
+                return Err(ApiError::UnknownMuxValue {
                     key: self.key.clone(),
                     value: other.to_string(),
-                })))
+                })
             }
             None if self.values.contains_key(&None) => None,
-            None => {
-                return Box::pin(std::future::ready(Err(ApiError::MissingArgument(
-                    self.key.clone(),
-                ))))
-            }
+            None => return Err(ApiError::MissingArgument(self.key.clone())),
         };
 
-        let handler = match self.values.get(&requested) {
-            Some(handler) => Arc::clone(handler),
-            None => {
-                return Box::pin(std::future::ready(Err(ApiError::UnknownMuxValue {
-                    key: self.key.clone(),
-                    value: requested.unwrap_or_default(),
-                })))
-            }
-        };
-        // The handler is moved into the returned future: the future may not
-        // borrow this stack frame.
-        Box::pin(async move { handler.handle(request, context).await })
+        match self.values.get(&requested) {
+            Some(handler) => Ok(Arc::clone(handler)),
+            None => Err(ApiError::UnknownMuxValue {
+                key: self.key.clone(),
+                value: requested.unwrap_or_default(),
+            }),
+        }
     }
 }
 
@@ -239,7 +242,7 @@ pub type InternalErrorHook = Arc<dyn Fn(&str) + Send + Sync>;
 /// [`Server`](super::Server).
 pub struct Api {
     endpoints: BTreeMap<String, Arc<dyn Endpoint>>,
-    mux: BTreeMap<String, Mux>,
+    mux: RwLock<BTreeMap<String, Mux>>,
     remote: RwLock<BTreeMap<String, Vec<RemoteRegistration>>>,
     /// What to tell the host when a handler fails on its own account.
     ///
@@ -261,7 +264,7 @@ impl Api {
     pub fn new() -> Self {
         let mut api = Self {
             endpoints: BTreeMap::new(),
-            mux: BTreeMap::new(),
+            mux: RwLock::new(BTreeMap::new()),
             remote: RwLock::new(BTreeMap::new()),
             internal_error: None,
         };
@@ -307,7 +310,7 @@ impl Api {
     /// instance used a different key, or
     /// [`RegistrationError::DuplicateMuxValue`] if `value` is taken.
     pub fn register_mux(
-        &mut self,
+        &self,
         path: &str,
         key: &str,
         value: Option<&str>,
@@ -315,40 +318,60 @@ impl Api {
     ) -> Result<(), RegistrationError> {
         let value = value.map(str::to_string);
 
-        let existing = match self.mux.get_mut(path) {
-            Some(existing) => existing,
+        // One write lock decides the whole registration: `endpoints` needs no
+        // lock of its own, and checking the path through [`Self::path_taken`]
+        // here would take the read lock a second time and deadlock.
+        let mut mux = self.mux.write().expect("mux table is not poisoned");
+        match mux.get_mut(path) {
+            Some(existing) => {
+                if existing.key != key {
+                    return Err(RegistrationError::MuxKeyConflict {
+                        path: path.to_string(),
+                        expected: existing.key.clone(),
+                        found: key.to_string(),
+                    });
+                }
+                if existing.values.contains_key(&value) {
+                    return Err(RegistrationError::DuplicateMuxValue {
+                        path: path.to_string(),
+                        value,
+                    });
+                }
+                existing.values.insert(value, handler);
+            }
             None => {
-                if self.path_taken(path) {
+                if self.endpoints.contains_key(path) {
                     return Err(RegistrationError::DuplicatePath(path.to_string()));
                 }
                 let mut values = BTreeMap::new();
                 values.insert(value, handler);
-                self.mux.insert(
+                mux.insert(
                     path.to_string(),
                     Mux {
                         key: key.to_string(),
                         values,
                     },
                 );
-                return Ok(());
             }
-        };
-
-        if existing.key != key {
-            return Err(RegistrationError::MuxKeyConflict {
-                path: path.to_string(),
-                expected: existing.key.clone(),
-                found: key.to_string(),
-            });
         }
-        if existing.values.contains_key(&value) {
-            return Err(RegistrationError::DuplicateMuxValue {
-                path: path.to_string(),
-                value,
-            });
-        }
-        existing.values.insert(value, handler);
         Ok(())
+    }
+
+    /// Drop every mux registration, telling each instance to
+    /// [`detach`](MuxEndpoint::detach) first.
+    ///
+    /// The host calls this when the configuration that registered these
+    /// instances is rebuilt: they belong to the configuration that just went
+    /// away. The same `(path, value)` may be registered again afterwards, with
+    /// a fresh handler.
+    pub fn clear_mux(&self) {
+        let mut mux = self.mux.write().expect("mux table is not poisoned");
+        for mux_entry in mux.values() {
+            for handler in mux_entry.values.values() {
+                handler.detach();
+            }
+        }
+        mux.clear();
     }
 
     /// Register a remote method for one connection.
@@ -410,7 +433,13 @@ impl Api {
     /// any other, and `list_endpoints` is how it discovers them.
     pub fn endpoints(&self) -> Vec<String> {
         let mut paths: Vec<String> = self.endpoints.keys().cloned().collect();
-        paths.extend(self.mux.keys().cloned());
+        paths.extend(
+            self.mux
+                .read()
+                .expect("mux table is not poisoned")
+                .keys()
+                .cloned(),
+        );
         paths.sort();
         paths.dedup();
         paths
@@ -437,8 +466,22 @@ impl Api {
         client: Arc<dyn PushTarget>,
     ) -> Result<Value, ApiError> {
         let context = EndpointContext { api: self, client };
-        let fut: EndpointFuture<'_> = if let Some(mux) = self.mux.get(request.method()) {
-            mux.dispatch(request, &context)
+
+        // Resolve the mux instance under a read lock and release it: the lock
+        // must not be held across the handler's `.await`, or a reload needing
+        // the write lock would wait on a request that waits on the handler. The
+        // owned `Arc` keeps the instance alive for the request without
+        // borrowing the table.
+        let mux_handler = {
+            let mux = self.mux.read().expect("mux table is not poisoned");
+            match mux.get(request.method()) {
+                Some(mux) => Some(mux.resolve(request)?),
+                None => None,
+            }
+        };
+
+        let fut: EndpointFuture<'_> = if let Some(handler) = &mux_handler {
+            handler.handle(request, &context)
         } else {
             match self.endpoints.get(request.method()) {
                 Some(endpoint) => endpoint.handle(request, &context),
@@ -475,7 +518,12 @@ impl Api {
 
     /// Whether `path` is already an endpoint or a mux path.
     fn path_taken(&self, path: &str) -> bool {
-        self.endpoints.contains_key(path) || self.mux.contains_key(path)
+        self.endpoints.contains_key(path)
+            || self
+                .mux
+                .read()
+                .expect("mux table is not poisoned")
+                .contains_key(path)
     }
 }
 
@@ -532,7 +580,7 @@ async fn catch_poll<'a>(
 mod tests {
     use super::*;
     use crate::protocol::{Params, ResponseTemplate};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex;
 
     // -----------------------------------------------------------------------
@@ -653,6 +701,26 @@ mod tests {
         }
     }
 
+    /// A mux handler that answers with its instance name and counts detaches.
+    struct Detachable {
+        answer: &'static str,
+        detaches: Arc<AtomicUsize>,
+    }
+
+    impl MuxEndpoint for Detachable {
+        fn handle<'a>(
+            &'a self,
+            _request: &'a Request,
+            _context: &'a EndpointContext<'a>,
+        ) -> EndpointFuture<'a> {
+            Box::pin(async move { Ok(json!(self.answer)) })
+        }
+
+        fn detach(&self) {
+            self.detaches.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
     /// A handler that records the connection it was given.
     struct ConnectionRecorder;
 
@@ -747,7 +815,7 @@ mod tests {
 
     #[test]
     fn test_mux_instances_must_agree_on_their_key() {
-        let mut api = Api::new();
+        let api = Api::new();
         api.register_mux("sensors/dump", "sensor", Some("a"), Arc::new(Instance("a")))
             .unwrap();
 
@@ -906,7 +974,7 @@ mod tests {
 
     #[test]
     fn test_mux_selects_an_instance_by_key() {
-        let mut api = Api::new();
+        let api = Api::new();
         api.register_mux("sensors/dump", "sensor", Some("a"), Arc::new(Instance("a")))
             .unwrap();
         api.register_mux("sensors/dump", "sensor", Some("b"), Arc::new(Instance("b")))
@@ -920,7 +988,7 @@ mod tests {
 
     #[test]
     fn test_mux_requires_the_key_unless_a_default_exists() {
-        let mut api = Api::new();
+        let api = Api::new();
         api.register_mux("sensors/dump", "sensor", Some("a"), Arc::new(Instance("a")))
             .unwrap();
 
@@ -948,7 +1016,7 @@ mod tests {
 
     #[test]
     fn test_mux_default_instance_makes_the_key_optional() {
-        let mut api = Api::new();
+        let api = Api::new();
         api.register_mux(
             "sensors/dump",
             "sensor",
@@ -969,6 +1037,77 @@ mod tests {
         );
         // The default does not make an unknown name acceptable.
         assert!(dispatch(&api, r#"{"method":"sensors/dump","params":{"sensor":"z"}}"#).is_err());
+    }
+
+    #[test]
+    fn test_a_mux_endpoint_can_be_registered_after_the_registry_is_built() {
+        // Registration is not build-time only: a configuration reload replaces
+        // mux instances while the socket is being served.
+        let api = Api::new();
+        api.register_mux("p", "k", Some("a"), Arc::new(Instance("h1")))
+            .unwrap();
+
+        assert!(api.endpoints().contains(&"p".to_string()));
+        assert_eq!(
+            dispatch(&api, r#"{"method":"p","params":{"k":"a"}}"#).unwrap(),
+            json!("h1")
+        );
+    }
+
+    #[test]
+    fn test_clear_mux_drops_every_instance() {
+        let api = Api::new();
+        api.register_mux("p", "k", Some("a"), Arc::new(Instance("a")))
+            .unwrap();
+
+        api.clear_mux();
+
+        assert!(!api.endpoints().contains(&"p".to_string()));
+        assert_eq!(
+            dispatch(&api, r#"{"method":"p","params":{"k":"a"}}"#).unwrap_err(),
+            ApiError::UnknownEndpoint("p".to_string())
+        );
+    }
+
+    #[test]
+    fn test_clear_mux_detaches_every_instance() {
+        // The instances belong to the configuration going away, so each one is
+        // told to stop before its registration is dropped.
+        let api = Api::new();
+        let detaches = Arc::new(AtomicUsize::new(0));
+        for value in ["a", "b"] {
+            api.register_mux(
+                "p",
+                "k",
+                Some(value),
+                Arc::new(Detachable {
+                    answer: value,
+                    detaches: Arc::clone(&detaches),
+                }),
+            )
+            .unwrap();
+        }
+
+        api.clear_mux();
+
+        assert_eq!(detaches.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn test_a_cleared_path_can_be_registered_again_with_a_new_handler() {
+        // Nothing of the old instance survives the clear: dispatch reaches the
+        // fresh registration, not a stale snapshot of the old one.
+        let api = Api::new();
+        api.register_mux("p", "k", Some("a"), Arc::new(Instance("h1")))
+            .unwrap();
+        api.clear_mux();
+        api.register_mux("p", "k", Some("a"), Arc::new(Instance("h2")))
+            .unwrap();
+
+        assert_eq!(
+            dispatch(&api, r#"{"method":"p","params":{"k":"a"}}"#).unwrap(),
+            json!("h2")
+        );
     }
 
     // -----------------------------------------------------------------------

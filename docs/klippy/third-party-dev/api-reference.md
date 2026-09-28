@@ -69,7 +69,7 @@
 > `objects/*` / 五个 `gcode/*` / `query_endstops/status`）**已实现**；第 13–15 节
 > （`pause_resume/*`）与第 17–18 节（`bed_mesh/dump_mesh`、`*/dump_*`）**部分落地**——截至
 > 2026-09-25（批 #15）：`pause_resume` 对象与 `[buttons]` 最小实现已落地，且 `[pause_resume]` 节注册了
-> `PAUSE`/`RESUME`/`CLEAR_PAUSE`/`CANCEL_PRINT` 四条命令；但 `pause_resume/*` 端点仍未注册；`*/dump_*` 的 mux 机制与 `ldc1612` / `adxl345` / `mpu9250` 三个消费者已落地，
+> `PAUSE`/`RESUME`/`CLEAR_PAUSE`/`CANCEL_PRINT` 四条命令；但 `pause_resume/*` 端点仍未注册；`*/dump_*` 的 mux 机制与 `ldc1612` / `adxl345` / `mpu9250` / `load_cell`（`dump_force`）四个消费者已落地（实例随配置重载注销并在下一轮重新注册，旧连接不再收到推送），
 > `bed_mesh/dump_mesh` 与其余 dump 端点随各自的 extras 落地。调用未实现的端点会得到 `unknown method` 错误。本文描述的是目标形状，
 > 实现随模块推进。
 
@@ -369,7 +369,7 @@
 
 ### 10. `gcode/restart` — 重启 Klipper 主机
 
-重新加载配置文件并重启 Klipper 主机进程。
+从磁盘重新读取配置文件并重启主机（`RESTART`）。
 
 **请求：**
 ```json
@@ -378,11 +378,15 @@
 
 **响应：** 无参数响应（`{}`）
 
+> 即使配置装载失败、`gcode` 对象不存在（对象图已被拆掉，`state_message` 处于 startup/error），
+> 本端点仍回 `{}`：它直接以 `restart` 请求宿主重启，让客户端改好文件后再试。
+> 同一状态下 `gcode/script` 仍回 `error`（携带 `state_message`）。
+
 ---
 
 ### 11. `gcode/firmware_restart` — 重启固件和主机
 
-重启固件和主机进程，重新加载配置文件。
+重启固件和主机，并从磁盘重新读取配置文件（`FIRMWARE_RESTART`）。
 
 **请求：**
 ```json
@@ -390,6 +394,8 @@
 ```
 
 **响应：** 无参数响应（`{}`）
+
+> 与 `gcode/restart` 一样，`gcode` 对象不在时仍回 `{}` 并直接请求宿主重启。
 
 ---
 

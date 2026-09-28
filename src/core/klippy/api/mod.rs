@@ -103,6 +103,15 @@ include!(concat!(env!("OUT_DIR"), "/endpoint_installers.rs"));
 /// served before its objects are registered is one a client can observe only
 /// halfway up, and no client can provoke a duplicate registration to find out.
 ///
+/// # One call per process
+///
+/// The mux registrations the config made while it was read are **moved** into
+/// the table here — the `webhooks` object's one drain — and after that modules
+/// register straight into the table itself (`WebhooksStatus::set_api`). A
+/// second call on a fresh [`Api`] would therefore start with no mux endpoints.
+/// Build the table once, as `run` does; a host that ever rebuilds its server
+/// would have to move the registrations across instead of draining them.
+///
 /// # Errors
 /// Returns [`RegistrationError`] if a name or a path is already taken — a
 /// wiring mistake in klippy, never something a client can cause.
@@ -126,10 +135,16 @@ pub fn register(
     for install in ENDPOINT_INSTALLERS {
         install(api, &wiring)?;
     }
-    // Mux endpoints are registered by modules on the `webhooks` object while
-    // the config is read, and the host builds this table afterwards, so what
-    // they collected goes in here. Upstream registers the path on the first
+    // The one drain of the `webhooks` object's pending list: the modules of
+    // this first config registered their mux endpoints while it was read, and
+    // the table did not exist then. Upstream registers the path on the first
     // instance (`klippy/webhooks.py:330-334`).
+    //
+    // Only this first load goes through the object: the host hands the table
+    // over with `WebhooksStatus::set_api` right after this, and from then on a
+    // module registers straight into it. The object clears the table again when
+    // the config goes away (`Printer::teardown`), which is what a restart needs
+    // to register its own instances rather than collide with this load's.
     for registration in webhooks.take_mux_endpoints() {
         api.register_mux(
             &registration.path,

@@ -231,11 +231,11 @@ pub struct Printer {
     objects: Mutex<Vec<(String, Arc<dyn PrinterObject>)>>,
     /// Option values that override the **in-memory** config, per section.
     ///
-    /// A restart reloads the same parsed config and never re-reads the file
-    /// (`klippy.rs`), and [`Printer::reset_for_restart`] drops the objects built
-    /// from it, so something a part learns about its own section at run time has
-    /// to be kept here to reach the next bring-up. The loader applies these as it
-    /// hands a section over (`load.rs`); the file on disk is the operator's.
+    /// A restart re-reads the config file from disk (`klippy.rs`) and
+    /// [`Printer::reset_for_restart`] drops the objects built from it, so
+    /// something a part learns about its own section at run time has to be kept
+    /// here to reach the next bring-up. The loader applies these on top of the
+    /// section it read (`load.rs`); the file on disk is the operator's.
     config_overrides: Mutex<HashMap<String, HashMap<String, ConfigValue>>>,
     /// The reads recorded by the config load that is currently loaded.
     ///

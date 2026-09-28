@@ -26,13 +26,37 @@
 //! * [`WebhooksStatus::register_mux_endpoint`] — upstream's
 //!   `register_mux_endpoint` (`klippy/webhooks.py:329-343`). An `[adxl345]`
 //!   section registers `adxl345/dump_adxl345` keyed by `sensor` while the
-//!   config is read; [`super::register`] moves the registrations into the table
-//!   afterwards.
+//!   config is read.
 //! * [`WebhooksStatus::call_remote_method`] — upstream's `call_remote_method`
 //!   (`klippy/webhooks.py:411-420`), the push side of
 //!   `register_remote_method`. A `gcode_macro`'s `action_call_remote_method`
 //!   uses it. The table is put in with [`WebhooksStatus::set_api`] once the
 //!   server has been built.
+//!
+//! # The mux table's lifecycle
+//!
+//! A module registers a mux endpoint while the config is read, so it cannot
+//! hold the API table: the table is built *after* the read, and a reload
+//! replaces the modules while the same table keeps serving. This object is
+//! therefore the table's lifecycle driver:
+//!
+//! 1. **before the table exists** (the initial load, which
+//!    [`super::register`] follows) `register_mux_endpoint` buffers what it is
+//!    given in [`WebhooksStatus`]'s pending list;
+//! 2. `super::register` **drains** that list into the table, exactly once, when
+//!    it builds it;
+//! 3. the host hands the table over with [`WebhooksStatus::set_api`]; from then
+//!    on every `register_mux_endpoint` goes **straight into the table** — a
+//!    reload re-registers its instances that way, with no drain in between;
+//! 4. when the config that registered them goes away, the table is **cleared**:
+//!    [`PrinterObject::release_cycles`] (which [`Printer::teardown`] calls, and
+//!    so does every restart) drops every mux registration, detaching the
+//!    instances that belonged to the config that just left. The next load
+//!    registers its own.
+//!
+//! Without step 4 a second restart would find the first load's registrations
+//! still in the table and fail with `already registered`, while the old
+//! handlers — and every module object they hold — kept being served.
 //!
 //! The name is upstream's, and clients — Moonraker among them — ask for it by
 //! name, so it stays on the wire even though this host calls the same component
@@ -72,10 +96,44 @@ pub fn install(printer: &Arc<Printer>) -> Result<Arc<WebhooksStatus>, ConfigErro
     Ok(object)
 }
 
+/// Upstream's mux conflict checks (`klippy/webhooks.py:332-345`).
+///
+/// `existing` is what `path` already has — its key and the instance values
+/// taken — or `None` when the path is new. Both registration paths call this,
+/// so a conflict reads the same whether it is found in the first load's buffer
+/// or in the API table after a reload.
+fn check_mux_conflict(
+    path: &str,
+    key: &str,
+    value: Option<&str>,
+    existing: Option<(String, Vec<Option<String>>)>,
+) -> Result<(), ConfigError> {
+    let Some((existing_key, values)) = existing else {
+        return Ok(());
+    };
+    let shown = value.unwrap_or("None");
+    if existing_key != key {
+        return Err(ConfigError::new(format!(
+            "mux endpoint {path} {key} {shown} may have only one key ({existing_key})"
+        )));
+    }
+    if values.iter().any(|taken| taken.as_deref() == value) {
+        let registered: Vec<&str> = values
+            .iter()
+            .map(|taken| taken.as_deref().unwrap_or("None"))
+            .collect();
+        return Err(ConfigError::new(format!(
+            "mux endpoint {path} {key} {shown} already registered ({})",
+            registered.join(", ")
+        )));
+    }
+    Ok(())
+}
+
 /// One mux endpoint a module registered before the API table existed.
 ///
-/// [`super::register`] drains these into [`Api::register_mux`] once the table
-/// can be built.
+/// [`WebhooksStatus`] holds these as its pending list; [`super::register`]
+/// drains them into [`Api::register_mux`] once the table can be built.
 pub struct MuxRegistration {
     /// The path clients use, e.g. `"adxl345/dump_adxl345"`.
     pub path: String,
@@ -90,8 +148,13 @@ pub struct MuxRegistration {
 /// The API server's printer object: the printer's state, for clients.
 pub struct WebhooksStatus {
     printer: Arc<Printer>,
-    /// Mux endpoints registered while the config is read.
-    mux: Mutex<Vec<MuxRegistration>>,
+    /// Mux endpoints registered while the API table does not exist yet.
+    ///
+    /// Only the initial load buffers here: [`super::register`] drains the list
+    /// when it builds the table, and once [`WebhooksStatus::set_api`] has run,
+    /// [`WebhooksStatus::register_mux_endpoint`] registers straight into
+    /// [`Api`] and this stays empty.
+    pending: Mutex<Vec<MuxRegistration>>,
     /// The API table, set by the host once the server is built.
     api: Mutex<Option<Arc<Api>>>,
 }
@@ -101,7 +164,7 @@ impl WebhooksStatus {
     pub fn new(printer: Arc<Printer>) -> Self {
         Self {
             printer,
-            mux: Mutex::new(Vec::new()),
+            pending: Mutex::new(Vec::new()),
             api: Mutex::new(None),
         }
     }
@@ -112,6 +175,12 @@ impl WebhooksStatus {
     /// a path may serve several instances, all selected by the same key. Two
     /// registrations for a path with different keys, or the same instance
     /// twice, are config errors.
+    ///
+    /// Once the API table exists the registration goes straight into it. Before
+    /// that — during the initial load only — it is buffered, because the table
+    /// has not been built yet; [`super::register`] drains the buffer into the
+    /// table afterwards. Both paths run `check_mux_conflict` first, so a
+    /// conflict reads the same either way.
     pub fn register_mux_endpoint(
         &self,
         path: &str,
@@ -119,31 +188,32 @@ impl WebhooksStatus {
         value: Option<&str>,
         handler: Arc<dyn MuxEndpoint>,
     ) -> Result<(), ConfigError> {
-        let mut mux = self.mux.lock().unwrap_or_else(|p| p.into_inner());
-        let shown = value.unwrap_or("None");
-        if let Some(first) = mux.iter().find(|registration| registration.path == path) {
-            if first.key != key {
-                return Err(ConfigError::new(format!(
-                    "mux endpoint {path} {key} {shown} may have only one key ({})",
-                    first.key
-                )));
-            }
+        let api = self.api.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        if let Some(api) = api {
+            // Checked against the table (upstream's wording), then registered;
+            // the table is only touched from the load path, so nothing can
+            // slip between the two.
+            check_mux_conflict(path, key, value, api.mux_registrations(path))?;
+            return api
+                .register_mux(path, key, value, handler)
+                .map_err(|err| ConfigError::new(err.to_string()));
         }
-        if mux
+        let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
+        let existing = pending
             .iter()
-            .any(|registration| registration.path == path && registration.value.as_deref() == value)
-        {
-            let registered: Vec<&str> = mux
-                .iter()
-                .filter(|registration| registration.path == path)
-                .map(|registration| registration.value.as_deref().unwrap_or("None"))
-                .collect();
-            return Err(ConfigError::new(format!(
-                "mux endpoint {path} {key} {shown} already registered ({})",
-                registered.join(", ")
-            )));
-        }
-        mux.push(MuxRegistration {
+            .find(|registration| registration.path == path)
+            .map(|first| {
+                (
+                    first.key.clone(),
+                    pending
+                        .iter()
+                        .filter(|registration| registration.path == path)
+                        .map(|registration| registration.value.clone())
+                        .collect(),
+                )
+            });
+        check_mux_conflict(path, key, value, existing)?;
+        pending.push(MuxRegistration {
             path: path.to_string(),
             key: key.to_string(),
             value: value.map(str::to_string),
@@ -152,9 +222,10 @@ impl WebhooksStatus {
         Ok(())
     }
 
-    /// Take the mux registrations out, for [`super::register`] to install.
+    /// Take the pending mux registrations out, for [`super::register`] to
+    /// install — the one drain, when the table is built.
     pub(crate) fn take_mux_endpoints(&self) -> Vec<MuxRegistration> {
-        std::mem::take(&mut *self.mux.lock().unwrap_or_else(|p| p.into_inner()))
+        std::mem::take(&mut *self.pending.lock().unwrap_or_else(|p| p.into_inner()))
     }
 
     /// Give the object the API table, once the server has been built.
@@ -189,6 +260,27 @@ impl PrinterObject for WebhooksStatus {
             "state_message": state.message,
         })
     }
+
+    fn release_cycles(&self) {
+        // This object outlives the config (it is a host object), but the mux
+        // instances in the table do not: each one was registered by a module of
+        // the config that is being dropped and holds that module's objects.
+        // Clearing detaches every instance — which stops whatever stream it
+        // started — and releases those objects, so the next load starts from an
+        // empty table rather than colliding with this one's paths.
+        //
+        // `release_cycles` is the moment because `Printer::teardown` calls it on
+        // every object before truncating the config's parts, and a restart goes
+        // through the same teardown.
+        let api = self.api.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        if let Some(api) = api {
+            api.clear_mux();
+        }
+        self.pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
+    }
 }
 
 // ===========================================================================
@@ -200,7 +292,7 @@ mod tests {
     use super::*;
     use crate::core::klippy::api::protocol::{PushTarget, Request};
     use crate::core::klippy::api::registry::{EndpointContext, EndpointFuture};
-    use crate::core::klippy::api::test_support::RecordingTarget;
+    use crate::core::klippy::api::test_support::{silent_target, RecordingTarget};
     use crate::core::klippy::reactor::ManualReactor;
 
     /// A mux handler that records the instance it was registered for.
@@ -303,6 +395,37 @@ mod tests {
         );
     }
 
+    /// The same conflict found in the API table after `set_api` (a reload)
+    /// reads exactly as it did while the first load was buffered — one message,
+    /// not two.
+    #[tokio::test]
+    async fn test_a_conflict_after_set_api_uses_the_same_message() {
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        let object = install(&printer).unwrap();
+        let api = Arc::new(Api::new());
+        object.set_api(Arc::clone(&api));
+
+        object
+            .register_mux_endpoint("path", "sensor", Some("one"), Arc::new(Echo("a")))
+            .unwrap();
+
+        let err = object
+            .register_mux_endpoint("path", "sensor", Some("one"), Arc::new(Echo("b")))
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "mux endpoint path sensor one already registered (one)"
+        );
+
+        let err = object
+            .register_mux_endpoint("path", "name", Some("two"), Arc::new(Echo("c")))
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "mux endpoint path name two may have only one key (sensor)"
+        );
+    }
+
     #[tokio::test]
     async fn test_a_remote_method_needs_a_registered_connection() {
         let object = status();
@@ -335,6 +458,64 @@ mod tests {
             recording.pushes(),
             [json!({"method": "notify", "params": {"a": 1}})]
         );
+    }
+
+    /// A mux request for the instance the regression test registers.
+    fn dump_request() -> Request {
+        Request::parse(r#"{"method":"sensors/dump","params":{"sensor":"a"}}"#.as_bytes())
+            .expect("test body is a valid request")
+    }
+
+    /// Dispatch that request and return what the mux instance answered.
+    async fn dispatch(api: &Api) -> Value {
+        api.dispatch(&dump_request(), silent_target())
+            .await
+            .expect("the mux instance answers")
+    }
+
+    /// The regression: a second restart must not find the previous load's mux
+    /// instances still in the table.
+    ///
+    /// Once [`WebhooksStatus::set_api`] has run, a registration goes straight
+    /// into the API — no drain as at startup. `Printer::teardown` (which
+    /// `reset_for_restart` also reaches) then takes them out again, so the next
+    /// load registers the same `(path, value)` with a fresh handler instead of
+    /// failing with `already registered` while the old handler keeps being
+    /// served.
+    #[tokio::test]
+    async fn test_a_registration_after_set_api_reaches_the_table_and_teardown_clears_it() {
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        let webhooks = install(&printer).unwrap();
+        let api = Arc::new(Api::new());
+        webhooks.set_api(Arc::clone(&api));
+
+        webhooks
+            .register_mux_endpoint("sensors/dump", "sensor", Some("a"), Arc::new(Echo("first")))
+            .unwrap();
+        assert!(api.endpoints().contains(&"sensors/dump".to_string()));
+        assert_eq!(dispatch(&api).await, json!("first"));
+
+        printer.teardown();
+
+        assert!(!api.endpoints().contains(&"sensors/dump".to_string()));
+        assert_eq!(
+            api.dispatch(&dump_request(), silent_target())
+                .await
+                .unwrap_err(),
+            ApiError::UnknownEndpoint("sensors/dump".to_string())
+        );
+
+        // The next load re-registers the instance; the table serves its
+        // handler, not the one the config that left installed.
+        webhooks
+            .register_mux_endpoint(
+                "sensors/dump",
+                "sensor",
+                Some("a"),
+                Arc::new(Echo("second")),
+            )
+            .unwrap();
+        assert_eq!(dispatch(&api).await, json!("second"));
     }
 
     #[tokio::test]

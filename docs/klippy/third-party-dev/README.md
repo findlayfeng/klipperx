@@ -56,6 +56,9 @@ Local commands:
   .help          this text
   .subscribe     watch every object (`objects/list` + `objects/subscribe`)
   .subscribe a b watch only the named objects
+  .firmware_restart
+                 restart the firmware; the printer comes back up
+  .reload        reload the config file from disk and restart the printer
   .quit          leave (also ^D)
 
 Replies print as `<id> (<method>) <result>`; pushes print as `< <message>`.

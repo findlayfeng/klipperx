@@ -225,8 +225,8 @@ gcode> SET_PIN PIN=fan VALUE=1
 
 第一次进入 g-code 模式时会自动订阅一次 `gcode/subscribe_output`，于是命令的
 `// …` 信息与 `!! …` 错误会以推送的形式出现在日志里（不订阅的话只能看到命令的应答，
-`respond_info` 看不到）。`.` 开头的本地命令在两种模式下都有效，所以 `.quit`、`.help`
-不会被当成 g-code 发出去。
+`respond_info` 看不到）。`.` 开头的本地命令在两种模式下都有效（例如 `.reload`、`.quit`、`.help`），所以
+`.quit`、`.help` 不会被当成 g-code 发出去。
 
 ### 一行就是一个请求
 
@@ -251,10 +251,16 @@ gcode> SET_PIN PIN=fan VALUE=1
 | `.help` | 把这一行的说明打进日志 |
 | `.subscribe` | 先问主机有哪些对象（`objects/list`），再订阅全部，之后状态变化会持续出现 |
 | `.subscribe <对象> …` | 只订阅指定的对象，例如 `.subscribe toolhead extruder heater_bed` |
+| `.firmware_restart` | 重启固件并重载配置（`gcode/firmware_restart`）；连接不断，随后会有一段 `startup` |
+| `.reload`（或 `.reload_config`） | 从磁盘重新读取配置文件并重启主机（`gcode/restart`）；`printer.cfg` 改完用它生效 |
 | `.quit`（或 `.exit`） | 退出；已经在路上的应答会先打出来 |
 | `.yaml` / `.json` | **仅窗口**：把消息正文在 YAML（默认）与紧凑 JSON 之间切换，`<`/`>` 标记不变 |
 
 想要停止订阅，直接退出即可：协议规定客户端靠断开连接来取消订阅。
+
+`.reload` 与 `.firmware_restart` 都会让主机**重新从磁盘读配置文件**（改完文件再发一次即可，
+不必重启主机进程）。mux 端点（`*/dump_*`）的实例随配置一起注销并在下一轮重新注册，所以
+含 `[load_cell]`、`[adxl345]` 等节的配置反复重载也不会累积、不会卡在 `already registered`。
 
 ### 日志怎么读
 
@@ -306,7 +312,7 @@ $ klippy-client console --plain -a /tmp/klippy_uds
 | 跑 G-Code | `gcode/script {"script": "M115"}` |
 | 发一条不等待的 G-Code | `gcode/script {"script": "M104 S200"}` |
 | 紧急停止 | `emergency_stop` |
-| 重载配置并重启主机 | `gcode/restart` |
+| 重载配置并重启主机（从磁盘重读） | `gcode/restart` |
 | 重启固件与主机 | `gcode/firmware_restart` |
 | 暂停 / 恢复 / 取消 | `pause_resume/pause`、`pause_resume/resume`、`pause_resume/cancel` |
 
@@ -326,7 +332,7 @@ $ klippy-client api -a /tmp/klippy_uds gcode/script '{"script": "M115"}'
 | `--api-server: unknown scheme 'http://'` | 把 Moonraker 的 HTTP 端口当成 API 地址了 | 换成 socket 路径或 `tcp:主机:端口`；`7125` 是 Moonraker 的，不是这里的 |
 | 应答是 `webhooks: No registered callback for path '…'` | 主机没有这个端点（见上一节的状态说明） | 用 `list_endpoints` 看主机现在有什么 |
 | 敲了请求，一直没有任何输出 | 请求里写了 `"id": null`，按约定不会有应答 | 去掉 `id`，或让客户端自己补 |
-| `the API server closed the connection` | 主机重启或关机了（`RESTART`、`FIRMWARE_RESTART`、故障停机） | 客户端不会自动重连，重新打开一次即可 |
+| `the API server closed the connection` | 主机进程没了（`^C`/`SIGTERM`、`--tui` 窗口关闭、致命错误退出） | 客户端不会自动重连，重新打开一次即可。注意 `RESTART`/`FIRMWARE_RESTART` **不断连接**：主机就地重建打印机，连接与订阅全程有效 |
 | `no reply to '…' within 10s` | 主机在，但那个端点没应答 | 多半是端点卡住或没实现；`--timeout` 可以调 |
 
 ---

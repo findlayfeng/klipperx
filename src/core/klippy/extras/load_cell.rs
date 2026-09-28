@@ -969,6 +969,12 @@ impl MuxEndpoint for DumpForceEndpoint {
     /// Dropping this registration unregisters every converted-batch client of
     /// the cell, so the next fan-out pushes nothing to the gone configuration's
     /// connections.
+    ///
+    /// A request that resolved this instance just before the reload can still
+    /// land a client after the clear. Unlike `MuxBatchEndpoint` there is
+    /// nothing to re-animate: the fan-out is driven by the sensor's own batch
+    /// loop, which stops with the configuration, so that client simply gets no
+    /// data instead of a revived stream.
     fn detach(&self) {
         if let Some(state) = self.state.upgrade() {
             state

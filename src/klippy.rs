@@ -134,13 +134,16 @@ fn report_reactor_latency(report: crate::core::klippy::LatencyReport) {
 /// time this is called. The run loop blocks, so it gets a blocking thread of its
 /// own.
 ///
-/// A restart reloads the same parsed config rather than re-reading the file, so
-/// an edit on disk takes effect at the next *start*, like upstream. The machine
-/// is reset and reloaded **in place**: the same `Arc<Printer>` keeps serving, so
-/// the endpoints and any attached window survive a restart (this is the answer
-/// to Q7 — no printer slot to swap, because the printer is rebuilt under its
-/// one handle).
-async fn klippy_process(printer: Arc<Printer>, config: Arc<Config>) -> String {
+/// A restart reads the config file again, as upstream's `_connect` →
+/// `_read_config` does (`klippy/klippy.py:128`, `:114-121`): an edit made while
+/// the printer was running takes effect at the next `RESTART`, and a file that
+/// no longer parses leaves the printer in its `error` state, which a later
+/// `RESTART` can fix without the process going away. The machine is reset and
+/// reloaded **in place**: the same `Arc<Printer>` keeps serving, so the
+/// endpoints and any attached window survive a restart (this is the answer to
+/// Q7 — no printer slot to swap, because the printer is rebuilt under its one
+/// handle).
+async fn klippy_process(printer: Arc<Printer>, config_file: String) -> String {
     let result = loop {
         printer.bring_up().await;
 
@@ -170,10 +173,22 @@ async fn klippy_process(printer: Arc<Printer>, config: Arc<Config>) -> String {
             printer.prepare_firmware_restart().await;
         }
         printer.reset_for_restart(&result);
-        if let Err(err) = printer.load_config(&config) {
-            // A config the reload rejects is an `error`, not a shutdown:
-            // upstream's `_connect` sets the state and lets a `RESTART` fix it.
-            printer.set_error_state(&format!("{err}"));
+        // Read from disk again: upstream builds a fresh `Printer` per restart
+        // and its `_connect` reads the config then (`klippy/klippy.py:353-360`),
+        // so a file edited while the printer was running is what comes up.
+        match Config::from_file(&config_file) {
+            Ok((config, _sources)) => {
+                if let Err(err) = printer.load_config(&config) {
+                    // A config the reload rejects is an `error`, not a shutdown:
+                    // upstream's `_connect` sets the state and lets a `RESTART`
+                    // fix it.
+                    printer.set_error_state(&format!("{err}"));
+                }
+            }
+            // A file that cannot be read or parsed is the same story: the
+            // printer reports why and waits for the next `RESTART`; the run
+            // loop keeps turning, so a client can still read the state.
+            Err(err) => printer.set_error_state(&err),
         }
         tokio::time::sleep(RESTART_DELAY).await;
         // A restart is this host's log rollover: mark the seam again.
@@ -235,7 +250,11 @@ pub fn run(
     logging::set_rollover_info("versions", Some(&versions_block(&config_file)));
     logging::write_rollover();
 
-    // Parse the config file
+    // Parse the config file.
+    //
+    // This parse feeds the start-up load only: the run loop re-reads the file on
+    // every restart (see `klippy_process`), so it is handed the path rather than
+    // this value.
     let (config, sources) = Config::from_file(&config_file)?;
     debug!("Config sources: {:?}", sources);
     info!(
@@ -245,9 +264,6 @@ pub fn run(
     for section in config.sections() {
         debug!("Section: {}", section.identifier());
     }
-
-    // Shared with the run loop: a restart reloads this same parsed config.
-    let config = Arc::new(config);
 
     // Resolving the target before the runtime starts means a typo is reported
     // like any other bad option, not after the printer has begun to come up.
@@ -416,11 +432,13 @@ pub fn run(
         // driver thread parks in `block_on` for the whole run, which is fine —
         // the machine's tasks run on that runtime's workers, not on this thread.
         let machine_printer = Arc::clone(&printer);
-        let machine_config = Arc::clone(&config);
+        // The run loop re-reads this file on every restart, so it is handed the
+        // path rather than the parse above.
+        let machine_config_file = config_file.clone();
         let machine_thread = std::thread::Builder::new()
             .name("klippy-machine".into())
             .spawn(move || {
-                machine_runtime.block_on(klippy_process(machine_printer, machine_config))
+                machine_runtime.block_on(klippy_process(machine_printer, machine_config_file))
             })?;
 
         let exit_code = match attachment {
@@ -468,12 +486,27 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::klippy::config::object::{PrinterConfig, CONFIGFILE_OBJECT};
     use crate::core::klippy::config::Config;
     use crate::core::klippy::printer::{ConnectFuture, PrinterObject, PrinterState};
     use crate::core::klippy::reactor::ManualReactor;
     use serde_json::Value;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Weak;
+    use std::sync::{Mutex, Weak};
+
+    /// Write a config file for one test and return its path.
+    ///
+    /// The name carries the test's own tag, so parallel tests in this module do
+    /// not share a file, and `std::process::id()` keeps concurrent `cargo test`
+    /// processes apart — the pattern the other temp-file tests here use.
+    fn write_temp_config(tag: &str, content: &str) -> String {
+        let path = std::env::temp_dir().join(format!(
+            "klipperx-klippy-restart-{tag}-{}.cfg",
+            std::process::id()
+        ));
+        std::fs::write(&path, content).expect("the config file is written");
+        path.to_str().expect("the temp path is utf-8").to_string()
+    }
 
     #[test]
     fn test_only_a_restart_result_rebuilds_the_printer() {
@@ -523,6 +556,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_a_restart_rebuilds_the_printer_before_the_next_run() {
+        // The restart re-reads the file, so the run loop needs one on disk: an
+        // empty config, which loads with no sections.
+        let config_file = write_temp_config("rebuild", "");
+
         let printer = Arc::new(Printer::new(ManualReactor::shared()));
         let connects = Arc::new(AtomicUsize::new(0));
         // Registered before `mark_host_objects`, so it is a host part and a
@@ -538,12 +575,186 @@ mod tests {
             .unwrap();
         printer.mark_host_objects();
 
-        klippy_process(Arc::clone(&printer), Arc::new(Config::new())).await;
+        klippy_process(Arc::clone(&printer), config_file.clone()).await;
+        let _ = std::fs::remove_file(&config_file);
 
         // `restart` rebuilt the printer (config reloaded, brought up again)
         // instead of ending the loop; `exit` then ended it.
         assert_eq!(connects.load(Ordering::SeqCst), 2);
         assert_eq!(printer.get_state_message().category, PrinterState::Ready);
+    }
+
+    /// A host part that edits the config on disk and asks for a restart the
+    /// first time it connects, and records what `configfile` reports before
+    /// asking for an exit the second.
+    ///
+    /// It is a *host* part (registered before `mark_host_objects`), so a reset
+    /// keeps it and it connects again — that second connect is what makes the
+    /// re-read observable from inside the run loop.
+    struct ReloadingConfigFile {
+        config_file: String,
+        edited_content: String,
+        observed: Arc<Mutex<Vec<Option<Value>>>>,
+        printer: Weak<Printer>,
+    }
+
+    impl PrinterObject for ReloadingConfigFile {
+        fn get_status(&self, _eventtime: f64) -> Value {
+            serde_json::json!({})
+        }
+
+        fn connect<'a>(&'a self) -> ConnectFuture<'a> {
+            if let Some(printer) = self.printer.upgrade() {
+                // What `configfile` reports at connect time: the start-up parse
+                // on the first round, the file re-read at the restart on the
+                // second.
+                let seen = printer
+                    .lookup_object_as::<PrinterConfig>(CONFIGFILE_OBJECT)
+                    .map(|configfile| configfile.get_status(0.0)["config"].clone());
+                let first = {
+                    let mut observed = self.observed.lock().unwrap_or_else(|p| p.into_inner());
+                    observed.push(seen);
+                    observed.len() == 1
+                };
+                if first {
+                    // The operator's edit, made while the printer was running.
+                    std::fs::write(&self.config_file, &self.edited_content)
+                        .expect("the edited config is written");
+                    printer.request_exit("restart");
+                } else {
+                    printer.request_exit("exit");
+                }
+            }
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_restart_rereads_the_config_file_from_disk() {
+        // What `run` does at start-up: parse the file, load it, then hand the
+        // *path* to the run loop. The file changes on disk afterwards, and the
+        // restart has to pick the new content up — upstream's `_connect` reads
+        // the config again for every restart (`klippy/klippy.py:114-121`).
+        let config_file = write_temp_config("reread", "[pause_resume]\nrecover_velocity: 50\n");
+        let (startup_config, _) = Config::from_file(&config_file).expect("the config parses");
+
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        printer
+            .add_object(
+                "stub",
+                Arc::new(ReloadingConfigFile {
+                    config_file: config_file.clone(),
+                    edited_content: "[pause_resume]\nrecover_velocity: 120\n".to_string(),
+                    observed: Arc::clone(&observed),
+                    printer: Arc::downgrade(&printer),
+                }),
+            )
+            .unwrap();
+        printer.mark_host_objects();
+        printer
+            .load_config(&startup_config)
+            .expect("the startup config loads");
+
+        klippy_process(Arc::clone(&printer), config_file.clone()).await;
+        let _ = std::fs::remove_file(&config_file);
+
+        let observed = observed.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(observed.len(), 2, "the host part connected once per run");
+        // The first run saw the start-up parse …
+        let first = observed[0]
+            .clone()
+            .expect("`configfile` is registered before the first connect");
+        assert_eq!(
+            first["pause_resume"]["recover_velocity"],
+            serde_json::json!("50")
+        );
+        // … and the second saw the file as it stood when the restart was
+        // served, which is the re-read rather than a reused parse.
+        let second = observed[1]
+            .clone()
+            .expect("`configfile` is registered again by the reload");
+        assert_eq!(
+            second["pause_resume"]["recover_velocity"],
+            serde_json::json!("120")
+        );
+        assert_eq!(printer.get_state_message().category, PrinterState::Ready);
+    }
+
+    /// A host part that breaks the config on disk the first time it connects and
+    /// asks for a restart.
+    ///
+    /// The reload can then only fail, and nothing connects on that round (a
+    /// printer in `error` has nothing to bring up), so the exit has to come from
+    /// outside the printer's own parts.
+    struct BreakingConfigFile {
+        config_file: String,
+        printer: Weak<Printer>,
+    }
+
+    impl PrinterObject for BreakingConfigFile {
+        fn get_status(&self, _eventtime: f64) -> Value {
+            serde_json::json!({})
+        }
+
+        fn connect<'a>(&'a self) -> ConnectFuture<'a> {
+            if let Some(printer) = self.printer.upgrade() {
+                // A file that no longer parses: the restart must report the
+                // parse failure rather than come up with a broken machine.
+                std::fs::write(&self.config_file, "this is not a config file\n")
+                    .expect("the broken config is written");
+                printer.request_exit("restart");
+            }
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_restart_whose_config_no_longer_parses_reports_error() {
+        let config_file = write_temp_config("broken", "[pause_resume]\nrecover_velocity: 50\n");
+        let (startup_config, _) = Config::from_file(&config_file).expect("the config parses");
+
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        printer
+            .add_object(
+                "stub",
+                Arc::new(BreakingConfigFile {
+                    config_file: config_file.clone(),
+                    printer: Arc::downgrade(&printer),
+                }),
+            )
+            .unwrap();
+        printer.mark_host_objects();
+        printer
+            .load_config(&startup_config)
+            .expect("the startup config loads");
+
+        // The exit cannot come from the printer's parts on the failed round, so
+        // watch the state and ask for it once the reload has been rejected.
+        let watcher = {
+            let printer = Arc::clone(&printer);
+            tokio::spawn(async move {
+                while printer.get_state_message().category != PrinterState::Error {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                printer.request_exit("exit");
+            })
+        };
+
+        let result = klippy_process(Arc::clone(&printer), config_file.clone()).await;
+        watcher.await.unwrap();
+        let _ = std::fs::remove_file(&config_file);
+
+        // The loop kept turning — the restart delay, then another run — until it
+        // was asked to stop, rather than ending the process on the bad config.
+        assert_eq!(result, "exit");
+        let state = printer.get_state_message();
+        assert_eq!(state.category, PrinterState::Error);
+        assert!(
+            state.message.contains("Parameter outside of section"),
+            "the state message is the parse failure: {}",
+            state.message
+        );
     }
 
     #[test]

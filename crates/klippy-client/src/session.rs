@@ -331,9 +331,9 @@ impl Session {
     /// Restart the firmware (`gcode/firmware_restart`).
     ///
     /// The server runs the `FIRMWARE_RESTART` command: the printer is rebuilt
-    /// and comes back, so a moment of `startup` follows and a subscription may
-    /// need re-establishing. The API connection itself stays up — the host
-    /// rebuilds the printer in place rather than restarting the server.
+    /// and comes back, so a moment of `startup` follows. The API connection
+    /// itself stays up, and existing subscriptions are kept — the host rebuilds
+    /// the printer in place rather than restarting the server.
     ///
     /// # Errors
     /// Returns [`TransportError`] if the request cannot be sent.
@@ -351,8 +351,8 @@ impl Session {
     ///
     /// The server runs the `RESTART` command: the host reads the configuration
     /// file from disk again and rebuilds the printer in place, so a moment of
-    /// `startup` follows and a subscription may need re-establishing. The API
-    /// connection itself stays up — the host does not restart the server.
+    /// `startup` follows. The API connection itself stays up, and existing
+    /// subscriptions are kept — the host does not restart the server.
     ///
     /// # Errors
     /// Returns [`TransportError`] if the request cannot be sent.

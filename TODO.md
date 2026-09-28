@@ -284,6 +284,11 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 - [ ] **rollover 的 `log_config`**：上游每次 `_read_config` 都把整份配置写进 rollover
       （`configfile.py:482-487`、`klippy.py:118`），本仓只有 `versions` 块；重启重读上线后，
       「这次重载的是哪份配置」在日志里看不到。
+- [ ] **`StartArgs.start_reason` 已死**：上游主循环每轮 `start_args['start_reason'] = res`
+      （`klippy.py:368`）、`mcu.py:682`/`:1060` 从字典读；本仓 MCU 改读
+      `Printer::start_reason()`（`reset_for_restart` 每轮更新，语义一致），
+      `StartArgs.start_reason` 停在 `"startup"` 且无人读。要么让它随重启更新（对外形状与上游一致），
+      要么删掉该字段。
 
 ### R1 mux 端点注册表不是重启安全的
 

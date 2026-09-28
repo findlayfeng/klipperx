@@ -112,8 +112,9 @@ points: 100, 100
 有默认值的选项（如 `[output_pin]` 的 `value`）算作已读，不需要写出来。
 
 配置出错时打印机进入 `error` 状态（`info` 的 `state` 为 `error`，不是 `shutdown`）：
-修正文件后用 `RESTART` 重载即可，不必重启进程。这与 G-code 参数错误（`!!` 回复、不停机）
-和真正的内部错误（停机，`state` 为 `shutdown`）是三条不同的路。
+`RESTART` 会重新从磁盘读取配置文件，所以改好文件再发一次 `RESTART` 即可，不必重启进程；
+文件被删或语法错误时同样是 `error`，消息里带失败原因，进程也不退出。这与 G-code 参数错误
+（`!!` 回复、不停机）和真正的内部错误（停机，`state` 为 `shutdown`）是三条不同的路。
 
 `configfile` 是内置的只读对象，`objects/query configfile` 可读到：
 

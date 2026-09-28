@@ -85,10 +85,13 @@ M115
 
 | 命令 | 作用 |
 |------|------|
-| `RESTART` | 重新装载配置并重启主机软件（换一份对象图，进程不退出） |
-| `FIRMWARE_RESTART` | 重启固件 + 主机 + 重新装载配置 |
+| `RESTART` | 从磁盘重新读取配置文件并重启主机软件（换一份对象图，进程不退出） |
+| `FIRMWARE_RESTART` | 重启固件 + 主机 + 从磁盘重新读取配置文件 |
 
-两者都会触发 `gcode:request_restart` 事件（携带当前打印时间）。
+两者都会触发 `gcode:request_restart` 事件（携带当前打印时间）。它们都会重新读盘，所以改完
+配置文件后发 `RESTART` 就生效；文件读不到或解析失败时打印机进 `error`（带失败原因，进程不
+退出），修好后再发一次。API 的 `gcode/restart` / `gcode/firmware_restart` 在 `gcode` 对象尚未
+建立（配置没装载成功）时不等 ready，直接请求宿主重启，因此仍是可用的退路。
 
 ### ECHO — 回显命令行
 

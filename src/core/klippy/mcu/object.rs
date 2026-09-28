@@ -672,8 +672,8 @@ impl McuObject {
     /// method becomes `command` — upstream's generic path, which resets the
     /// firmware through its own `config_reset` (`mcu/config.rs`).
     ///
-    /// The replacement is recorded on the printer, not here: a restart reloads the
-    /// parsed config and rebuilds this object, and the config file is not written
+    /// The replacement is recorded on the printer, not here: a restart re-reads the
+    /// config file and rebuilds this object, and the config file is not written
     /// to (see [`Printer::override_config`]). Printed when it happens — the
     /// fallback is what keeps it from happening again.
     fn usb_reset_unusable(&self, config: &McuConfig, observed: &str) {

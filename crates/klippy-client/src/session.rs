@@ -331,9 +331,9 @@ impl Session {
     /// Restart the firmware (`gcode/firmware_restart`).
     ///
     /// The server runs the `FIRMWARE_RESTART` command: the printer is rebuilt
-    /// and comes back, so a moment of `startup` follows and a subscription may
-    /// need re-establishing. The API connection itself stays up — the host
-    /// rebuilds the printer in place rather than restarting the server.
+    /// and comes back, so a moment of `startup` follows. The API connection
+    /// itself stays up, and existing subscriptions are kept — the host rebuilds
+    /// the printer in place rather than restarting the server.
     ///
     /// # Errors
     /// Returns [`TransportError`] if the request cannot be sent.
@@ -343,6 +343,24 @@ impl Session {
         out.write(Entry::notice(
             Notice::Info,
             "Restarting the firmware; the printer will come back up.",
+        ));
+        Ok(())
+    }
+
+    /// Reload the configuration file and restart (`gcode/restart`).
+    ///
+    /// The server runs the `RESTART` command: the host reads the configuration
+    /// file from disk again and rebuilds the printer in place, so a moment of
+    /// `startup` follows. The API connection itself stays up, and existing
+    /// subscriptions are kept — the host does not restart the server.
+    ///
+    /// # Errors
+    /// Returns [`TransportError`] if the request cannot be sent.
+    pub async fn reload_config(&mut self, out: &mut impl Output) -> Result<(), TransportError> {
+        self.request("gcode/restart", Map::new(), out).await?;
+        out.write(Entry::notice(
+            Notice::Info,
+            "Reloading the config file; the printer will come back up.",
         ));
         Ok(())
     }
@@ -440,6 +458,10 @@ impl Session {
             // is the request `gcode/firmware_restart`, which is a mouthful to
             // type in g-code mode where lines are not methods.
             "firmware_restart" | "restart_firmware" => self.firmware_restart(out).await?,
+            // Reloading the config file is the same shape of shortcut: the
+            // request is `gcode/restart`, and the point is to re-read the file
+            // on disk rather than restart the firmware.
+            "reload" | "reload_config" => self.reload_config(out).await?,
             other => out.write(Entry::notice(
                 Notice::Problem,
                 format!("unknown command '.{other}'; try '.help'"),
@@ -581,6 +603,7 @@ Local commands:
   .subscribe a b watch only the named objects
   .firmware_restart
                  restart the firmware; the printer comes back up
+  .reload        reload the config file from disk and restart the printer
   .quit          leave, after printing any reply still owed (also ^D)
 
 Replies and pushes carry their direction; line mode prints one compact JSON line
@@ -1082,6 +1105,58 @@ mod tests {
             methods,
             ["gcode/firmware_restart", "gcode/firmware_restart"]
         );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn test_reload_config_sends_the_endpoint() {
+        let dir = SocketDir::new("reload");
+        let (mut session, mut out, task) = session(&dir).await;
+
+        session.reload_config(&mut out).await.unwrap();
+
+        // One request: `gcode/restart`, with no parameters.
+        let sent = out.sent();
+        assert_eq!(sent.len(), 1);
+        match sent[0] {
+            Entry::Sent {
+                method, message, ..
+            } => {
+                assert_eq!(method, "gcode/restart");
+                assert_eq!(message["params"], json!({}));
+            }
+            other => panic!("expected a sent entry, got {other:?}"),
+        }
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn test_reload_config_is_a_local_command() {
+        let dir = SocketDir::new("reloadlocal");
+        let (mut session, mut out, task) = session(&dir).await;
+
+        // The two names reach the same request, in either input mode.
+        assert_eq!(
+            session.handle_line(".reload", &mut out).await.unwrap(),
+            Control::Continue
+        );
+        assert_eq!(
+            session
+                .handle_gcode_line(".reload_config", &mut out)
+                .await
+                .unwrap(),
+            Control::Continue
+        );
+
+        let methods: Vec<&str> = out
+            .sent()
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::Sent { method, .. } => Some(method.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(methods, ["gcode/restart", "gcode/restart"]);
         task.abort();
     }
 

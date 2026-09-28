@@ -67,8 +67,8 @@ restart 循环、以及同步阻塞的 `printer.run()`（机器 runtime 的 `spa
 5. API 侧 `machine_thread.join()` 返回，abort `ctrl_c` 监听与 API server，`run()` 返回。
 
 重启（`restart` / `firmware_restart`）不换 runtime、不换线程：`klippy_process` 在**同一个**
-机器 runtime 上 `reset_for_restart` → `load_config` → 再 `bring_up`，所以 `Arc<Printer>`、endpoints
-和 attachment 全程有效（Q7 的答案）。
+机器 runtime 上 `reset_for_restart` → **从磁盘重读配置文件** → `load_config` → 再 `bring_up`，
+所以 `Arc<Printer>`、endpoints 和 attachment 全程有效。
 
 ## 与上游的对应
 

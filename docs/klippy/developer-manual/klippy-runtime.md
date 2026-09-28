@@ -28,7 +28,9 @@ main():
 `start_args` 携带 `config_file`、`apiserver`、`start_reason`、`debuginput`、`debugoutput`、
 `dictionary`，以及 `software_version`、`cpu_info`、`device`、`linux_version`。
 `RESTART` 与 `FIRMWARE_RESTART` 因此不是重启进程，而是换一个新的对象图在同一个进程里继续
-运行；`error_exit` 最终以非零码退出进程。出处：`klippy/klippy.py:354-374`。
+运行；每一轮（含每次 `RESTART`）都重新从磁盘读配置文件（`_connect` → `_read_config` →
+`read_main_config`，`klippy/klippy.py:128`、`configfile.py:295-298`）；`error_exit` 最终以
+非零码退出进程。出处：`klippy/klippy.py:354-374`。
 
 > **与上游的差异**：`start_args` 中的 `debuginput`、`debugoutput`、`dictionary` 在上游可组成
 > 「文件输出 + 数据字典」的**无固件运行模式**。本项目的等价物分两半：`start_args.debug_output`
@@ -262,6 +264,18 @@ run() 返回 ──▶ res = firmware_restart│restart ──▶ 主循环下�
 
 固件自报停机时 `MCU` 将其转为打印机停机；主机侧停机时 `MCU` 监听 `klippy:shutdown` 向固件发送
 `emergency_stop`，使两端同步停下。`error_mcu`（`klippy/extras/error_mcu.py`）负责展开消息。
+
+本仓的重启是**就地重建**（上游每轮新建 `Printer`，连 `WebHooks` 一起重建）：回退到 `restart` /
+`firmware_restart` 的下一轮先 `reset_for_restart()`（丢掉配置装载的部件，保留 `webhooks` 等宿主
+对象），再**从磁盘重读配置文件** → `load_config` → `bring_up`（`src/klippy.rs` 的
+`klippy_process`）。文件读不到或解析失败时打印机进 `error`（消息即失败原因，进程不退出），
+修好后再发一次 `RESTART` 即可。mux 端点（`*/dump_*`）的实例随配置一起注销（`Api::clear_mux`
+对每个实例调 `MuxEndpoint::detach`，停掉旧数据流），下一轮装载重新注册——本仓「就地重建」
+为 mux 表补上的就是这一步，所以含 `[load_cell]` / `[adxl345]` 的配置反复重启不会累积。
+另有一处 `start_reason` 表示差异：上游主循环每轮把它写回
+`start_args` 字典、`mcu.py` 从字典读（`klippy.py:368`、`mcu.py:682`/`:1060`）；本仓由
+`reset_for_restart` 更新在 `Printer::start_reason()` 上，MCU 读的正是它（语义一致），而
+`StartArgs.start_reason` 停在 `"startup"` 且当前无人读（见 `TODO.md` D1）。
 
 ## 客户端侧
 

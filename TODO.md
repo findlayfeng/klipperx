@@ -41,8 +41,8 @@
   （`klippy/klippy.py:36-40` `:90-113`）。
 - **客户端 API 的线形状**以 `docs/klippy/third-party-dev/api-reference.md` 为准。
 - **重启是就地重建**（Q7 的答案）：`restart` / `firmware_restart` 在同一个 `Arc<Printer>` 上
-  `reset_for_restart()` → 重载配置 → 再 `bring_up`，端点与 `--tui` 的 in-process server 全程
-  有效；不换 printer、不重建 Api/Server。
+  `reset_for_restart()` → 从磁盘重读配置 → 再 `bring_up`，端点与 `--tui` 的 in-process server
+  全程有效；不换 printer、不重建 Api/Server。
 
 ## 待办
 
@@ -280,6 +280,14 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
       `--debuginput`/`--debugoutput` 的命令行解析（`StartArgs::collect` 里仍是 `None`）与
       每个 MCU 的字典路径。`software_version` 已由宿主 `set_start_args` 注入
       （`src/klippy.rs:324`）并被 `info` 与 `M115` 读取——接线已完成并归档。
+- [ ] **rollover 的 `log_config`**：上游每次 `_read_config` 都把整份配置写进 rollover
+      （`configfile.py:482-487`、`klippy.py:118`），本仓只有 `versions` 块；重启重读上线后，
+      「这次重载的是哪份配置」在日志里看不到。
+- [ ] **`StartArgs.start_reason` 已死**：上游主循环每轮 `start_args['start_reason'] = res`
+      （`klippy.py:368`）、`mcu.py:682`/`:1060` 从字典读；本仓 MCU 改读
+      `Printer::start_reason()`（`reset_for_restart` 每轮更新，语义一致），
+      `StartArgs.start_reason` 停在 `"startup"` 且无人读。要么让它随重启更新（对外形状与上游一致），
+      要么删掉该字段。
 
 ### E2 `python_path` 的取消（**远期，依赖外部项目**）
 

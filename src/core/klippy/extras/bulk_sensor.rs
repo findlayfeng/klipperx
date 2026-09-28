@@ -200,6 +200,25 @@ impl BatchBulkHelper {
             .len()
     }
 
+    /// Stop streaming to every registered client.
+    ///
+    /// The loop sees the empty list on its next tick, breaks, and goes through
+    /// [`finish`](Self::finish) — which runs the stop callback and turns
+    /// `running` off. `running` is deliberately left alone here: [`finish`] is
+    /// the single owner of that flag, and it restarts the loop when a client
+    /// registered again while stopping.
+    ///
+    /// Called by [`MuxBatchEndpoint::detach`] when the host drops the mux
+    /// registration (a configuration reload), so the old instance's stream
+    /// stops with the configuration that started it.
+    pub(crate) fn stop(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clients
+            .clear();
+    }
+
     /// Whether the batch loop is running.
     #[cfg(test)]
     fn is_running(&self) -> bool {
@@ -306,6 +325,12 @@ impl MuxEndpoint for MuxBatchEndpoint {
                 .add_client(Arc::new(move |message: &Value| client.send(message)));
             Ok(self.start_resp.clone())
         })
+    }
+
+    /// Dropping this registration stops the helper's stream
+    /// ([`BatchBulkHelper::stop`]), which the loop then finishes off.
+    fn detach(&self) {
+        self.bulk.stop();
     }
 }
 
@@ -1335,6 +1360,66 @@ mod tests {
         assert_eq!(seen.load(Ordering::SeqCst), 2, "exactly two batches");
         assert_eq!(stops.load(Ordering::SeqCst), 1, "stopped once");
         assert_eq!(helper.client_count(), 0);
+        assert!(!helper.is_running());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_batch_helper_stop_clears_the_clients_and_the_loop_finishes() {
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        let stops = Arc::new(AtomicUsize::new(0));
+        let batch_cb: BatchCb = Arc::new(|_| Box::pin(async { Ok(Some(json!({ "x": 1 }))) }));
+        let start_cb: LifecycleCb = Arc::new(|| Box::pin(async { Ok(()) }));
+        let stop_count = Arc::clone(&stops);
+        let stop_cb: LifecycleCb = Arc::new(move || {
+            let stop_count = Arc::clone(&stop_count);
+            Box::pin(async move {
+                stop_count.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        });
+        let helper = BatchBulkHelper::new(&printer, batch_cb, start_cb, stop_cb, 0.05);
+
+        helper.add_client(Arc::new(|_message: &Value| true));
+        assert_eq!(helper.client_count(), 1);
+        // `stop` empties the client list synchronously; `running` stays true
+        // until the loop's next tick hands over to `finish`.
+        helper.stop();
+        assert_eq!(helper.client_count(), 0);
+        assert!(helper.is_running(), "`stop` does not touch `running`");
+
+        // A few intervals: the loop wakes, sees no client, and finishes.
+        tokio::time::sleep(Duration::from_secs_f64(0.2)).await;
+        assert_eq!(stops.load(Ordering::SeqCst), 1, "the loop finished itself");
+        assert!(!helper.is_running());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_batch_mux_endpoint_detach_stops_the_helpers_clients() {
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        let stops = Arc::new(AtomicUsize::new(0));
+        let batch_cb: BatchCb = Arc::new(|_| Box::pin(async { Ok(Some(json!({ "x": 1 }))) }));
+        let start_cb: LifecycleCb = Arc::new(|| Box::pin(async { Ok(()) }));
+        let stop_count = Arc::clone(&stops);
+        let stop_cb: LifecycleCb = Arc::new(move || {
+            let stop_count = Arc::clone(&stop_count);
+            Box::pin(async move {
+                stop_count.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        });
+        let helper = BatchBulkHelper::new(&printer, batch_cb, start_cb, stop_cb, 0.05);
+        let endpoint = MuxBatchEndpoint {
+            bulk: Arc::clone(&helper),
+            start_resp: json!({ "header": "#x" }),
+        };
+
+        helper.add_client(Arc::new(|_message: &Value| true));
+        assert_eq!(helper.client_count(), 1);
+        endpoint.detach();
+        assert_eq!(helper.client_count(), 0, "detach drops the registration");
+
+        tokio::time::sleep(Duration::from_secs_f64(0.2)).await;
+        assert_eq!(stops.load(Ordering::SeqCst), 1, "the stream stopped");
         assert!(!helper.is_running());
     }
 }

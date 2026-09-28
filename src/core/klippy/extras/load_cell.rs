@@ -965,6 +965,19 @@ impl MuxEndpoint for DumpForceEndpoint {
             Ok(self.start_resp.clone())
         })
     }
+
+    /// Dropping this registration unregisters every converted-batch client of
+    /// the cell, so the next fan-out pushes nothing to the gone configuration's
+    /// connections.
+    fn detach(&self) {
+        if let Some(state) = self.state.upgrade() {
+            state
+                .clients
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clear();
+        }
+    }
 }
 
 /// A batch pusher for one `dump_force` connection (`BatchWebhooksClient`).
@@ -1201,6 +1214,27 @@ mod tests {
         };
         assert_eq!(sensor.client_count(), 1);
         assert_eq!(cell.client_count(), 1, "the force tracker is a client too");
+    }
+
+    /// A dropped `load_cell/dump_force` registration stops the cell's fan-out
+    /// (`ApiClientHelper`'s converted-batch clients).
+    #[test]
+    fn test_dump_force_endpoint_detach_clears_the_cells_clients() {
+        let printer = printer();
+        let cell = LoadCell::new(&wrap(Some("my_cell"), &HX711_CHIP), &printer).unwrap();
+        let endpoint = DumpForceEndpoint {
+            state: Arc::downgrade(&cell.state),
+            start_resp: json!({ "header": DUMP_HEADER }),
+        };
+
+        cell.add_client(Arc::new(|_message: &Value| true));
+        assert_eq!(cell.client_count(), 1);
+        endpoint.detach();
+        assert_eq!(cell.client_count(), 0, "detach drops the registration");
+
+        // A cell that is already gone is a no-op, not a panic.
+        drop(cell);
+        endpoint.detach();
     }
 
     /// The corpus options of `[load_cell my_ads131m02]`.

@@ -145,7 +145,10 @@ impl WebhooksStatus {
     /// Once the API table exists the registration goes straight into it. Before
     /// that — during the initial load only — it is buffered, because the table
     /// has not been built yet; [`super::register`] drains the buffer into the
-    /// table afterwards, so the same checks apply either way.
+    /// table afterwards, so the same checks apply either way. The *wording* of a
+    /// rejected registration differs, though: the buffered path formats
+    /// upstream's message, while the direct path surfaces the API table's own
+    /// (`RegistrationError`).
     pub fn register_mux_endpoint(
         &self,
         path: &str,

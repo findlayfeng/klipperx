@@ -34,7 +34,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::core::klippy::api::protocol::{PushTarget, Request, ResponseTemplate};
+use crate::core::klippy::api::protocol::{ApiError, PushTarget, Request, ResponseTemplate};
 use crate::core::klippy::api::registry::{EndpointContext, EndpointFuture, MuxEndpoint};
 use crate::core::klippy::api::webhooks;
 use crate::core::klippy::cmd::ldc1612::{QueryStatusLdc1612, SensorBulkData, SensorBulkStatus};
@@ -98,6 +98,9 @@ pub type LifecycleCb = Arc<dyn Fn() -> BulkFuture<Result<(), String>> + Send + S
 struct BulkState {
     clients: Vec<ClientCb>,
     running: bool,
+    /// Set by [`BatchBulkHelper::stop`]: the registration that owned this helper
+    /// is gone, so it must not take a client again (see [`BatchBulkHelper::add_client`]).
+    detached: bool,
 }
 
 /// Periodic batch processing with client fan-out
@@ -141,12 +144,21 @@ impl BatchBulkHelper {
     /// Register a client; the first one starts the batch loop
     /// (`add_client` → `_start` upstream).
     ///
+    /// Returns `false` when the helper was detached: its mux registration is
+    /// gone (a configuration reload dropped it), so it must not take a client
+    /// again. The caller reports the endpoint as unknown rather than leaving a
+    /// client subscribed to a stream that will never run — and, worse, having
+    /// `finish` restart the loop for a registration that no longer exists.
+    ///
     /// # Panics
     /// Panics when called outside a Tokio runtime — every caller here runs
     /// inside one.
-    pub fn add_client(self: &Arc<Self>, client: ClientCb) {
+    pub fn add_client(self: &Arc<Self>, client: ClientCb) -> bool {
         let start = {
             let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            if state.detached {
+                return false;
+            }
             state.clients.push(client);
             if state.running {
                 false
@@ -158,6 +170,7 @@ impl BatchBulkHelper {
         if start {
             self.spawn_loop();
         }
+        true
     }
 
     /// Register one instance of a `*/dump_*` mux endpoint that streams this
@@ -180,6 +193,7 @@ impl BatchBulkHelper {
             Arc::new(MuxBatchEndpoint {
                 bulk: Arc::clone(self),
                 start_resp,
+                path: path.to_string(),
             }),
         )
     }
@@ -200,23 +214,26 @@ impl BatchBulkHelper {
             .len()
     }
 
-    /// Stop streaming to every registered client.
+    /// Stop streaming to every registered client and refuse new ones.
     ///
     /// The loop sees the empty list on its next tick, breaks, and goes through
-    /// [`finish`](Self::finish) — which runs the stop callback and turns
-    /// `running` off. `running` is deliberately left alone here: [`finish`] is
-    /// the single owner of that flag, and it restarts the loop when a client
-    /// registered again while stopping.
+    /// [`finish`](Self::finish) — which turns `running` off (and skips the stop
+    /// callback, because this helper's configuration is gone). `running` is
+    /// deliberately left alone here: [`finish`] is the single owner of that
+    /// flag, and it restarts the loop when a client registered again while
+    /// stopping.
+    ///
+    /// `detached` is set **under the same lock** as the client list, so a
+    /// request that resolved this instance just before the reload cannot add a
+    /// client after the list was emptied (see [`add_client`](Self::add_client)).
     ///
     /// Called by [`MuxBatchEndpoint::detach`] when the host drops the mux
     /// registration (a configuration reload), so the old instance's stream
     /// stops with the configuration that started it.
     pub(crate) fn stop(&self) {
-        self.state
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clients
-            .clear();
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.detached = true;
+        state.clients.clear();
     }
 
     /// Whether the batch loop is running.
@@ -266,21 +283,28 @@ impl BatchBulkHelper {
         self.finish().await;
     }
 
-    /// Stop: clear the clients, run the stop callback, and restart if a new
-    /// client arrived while stopping (upstream's `_stop`).
+    /// Stop: clear the clients, run the stop callback (unless the helper was
+    /// detached), and restart if a new client arrived while stopping
+    /// (upstream's `_stop`).
     async fn finish(self: &Arc<Self>) {
-        self.state
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clients
-            .clear();
-        if let Err(err) = (self.stop_cb)().await {
-            tracing::error!("BatchBulkHelper stop callback error: {err}");
+        let detached = {
+            let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            state.clients.clear();
+            state.detached
+        };
+        // A detached helper's configuration is gone: the stop callback would
+        // reach for objects `Printer::teardown` has already dropped (upstream
+        // drops the whole printer instead of stopping it), so it is skipped
+        // rather than reported as a failure.
+        if !detached {
+            if let Err(err) = (self.stop_cb)().await {
+                tracing::error!("BatchBulkHelper stop callback error: {err}");
+            }
         }
         let restart = {
             let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
             state.running = false;
-            !state.clients.is_empty()
+            !state.detached && !state.clients.is_empty()
         };
         if restart {
             let start = {
@@ -307,6 +331,9 @@ impl BatchBulkHelper {
 pub struct MuxBatchEndpoint {
     bulk: Arc<BatchBulkHelper>,
     start_resp: Value,
+    /// The mux path, so a request that arrives after [`detach`](Self::detach)
+    /// can be answered with the path it asked for.
+    path: String,
 }
 
 impl MuxEndpoint for MuxBatchEndpoint {
@@ -321,8 +348,17 @@ impl MuxEndpoint for MuxBatchEndpoint {
                 target: Arc::clone(&context.client),
                 template,
             };
-            self.bulk
-                .add_client(Arc::new(move |message: &Value| client.send(message)));
+            if !self
+                .bulk
+                .add_client(Arc::new(move |message: &Value| client.send(message)))
+            {
+                // The registration is gone: a reload detached this instance
+                // after the request was routed to it, so the path is not served
+                // any more. Answer like the table would have — the client
+                // retries instead of waiting forever on a stream that will
+                // never run.
+                return Err(ApiError::UnknownEndpoint(self.path.clone()));
+            }
             Ok(self.start_resp.clone())
         })
     }
@@ -1364,7 +1400,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn test_batch_helper_stop_clears_the_clients_and_the_loop_finishes() {
+    async fn test_batch_helper_stop_detaches_the_clients_and_the_loop_finishes() {
         let printer = Arc::new(Printer::new(ManualReactor::shared()));
         let stops = Arc::new(AtomicUsize::new(0));
         let batch_cb: BatchCb = Arc::new(|_| Box::pin(async { Ok(Some(json!({ "x": 1 }))) }));
@@ -1381,16 +1417,29 @@ mod tests {
 
         helper.add_client(Arc::new(|_message: &Value| true));
         assert_eq!(helper.client_count(), 1);
-        // `stop` empties the client list synchronously; `running` stays true
-        // until the loop's next tick hands over to `finish`.
+        // `stop` marks the helper detached and empties the client list
+        // synchronously; `running` stays true until the loop's next tick hands
+        // over to `finish`.
         helper.stop();
         assert_eq!(helper.client_count(), 0);
         assert!(helper.is_running(), "`stop` does not touch `running`");
+        // A detached helper takes no new client: a request routed to it just
+        // before the reload is answered as an unknown endpoint instead.
+        assert!(
+            !helper.add_client(Arc::new(|_message: &Value| true)),
+            "a detached helper refuses clients"
+        );
+        assert_eq!(helper.client_count(), 0);
 
         // A few intervals: the loop wakes, sees no client, and finishes.
         tokio::time::sleep(Duration::from_secs_f64(0.2)).await;
-        assert_eq!(stops.load(Ordering::SeqCst), 1, "the loop finished itself");
         assert!(!helper.is_running());
+        // The stop callback is skipped — the configuration it would stop is gone.
+        assert_eq!(
+            stops.load(Ordering::SeqCst),
+            0,
+            "detach skips the stop callback"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1411,6 +1460,7 @@ mod tests {
         let endpoint = MuxBatchEndpoint {
             bulk: Arc::clone(&helper),
             start_resp: json!({ "header": "#x" }),
+            path: "sensors/dump".to_string(),
         };
 
         helper.add_client(Arc::new(|_message: &Value| true));
@@ -1419,7 +1469,45 @@ mod tests {
         assert_eq!(helper.client_count(), 0, "detach drops the registration");
 
         tokio::time::sleep(Duration::from_secs_f64(0.2)).await;
-        assert_eq!(stops.load(Ordering::SeqCst), 1, "the stream stopped");
+        assert_eq!(
+            stops.load(Ordering::SeqCst),
+            0,
+            "a detached helper does not run the stop callback"
+        );
         assert!(!helper.is_running());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_a_detached_mux_endpoint_answers_unknown_endpoint() {
+        // The window the `detached` flag closes: dispatch resolved this instance
+        // just before a reload dropped its registration, so the request lands on
+        // a helper that must not take a client. Answering as the emptied table
+        // would makes the client retry instead of waiting on a stream that will
+        // never run.
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        let batch_cb: BatchCb = Arc::new(|_| Box::pin(async { Ok(Some(json!({ "x": 1 }))) }));
+        let start_cb: LifecycleCb = Arc::new(|| Box::pin(async { Ok(()) }));
+        let stop_cb: LifecycleCb = Arc::new(|| Box::pin(async { Ok(()) }));
+        let helper = BatchBulkHelper::new(&printer, batch_cb, start_cb, stop_cb, 0.05);
+        let endpoint = MuxBatchEndpoint {
+            bulk: Arc::clone(&helper),
+            start_resp: json!({ "header": "#x" }),
+            path: "sensors/dump".to_string(),
+        };
+        endpoint.detach();
+
+        let api = crate::core::klippy::api::registry::Api::new();
+        let request = Request::parse(br#"{"method":"sensors/dump","params":{}}"#)
+            .expect("test body is a valid request");
+        let context = EndpointContext {
+            api: &api,
+            client: crate::core::klippy::api::test_support::silent_target(),
+        };
+        let err = endpoint
+            .handle(&request, &context)
+            .await
+            .expect_err("a detached instance takes no client");
+        assert_eq!(err, ApiError::UnknownEndpoint("sensors/dump".to_string()));
+        assert_eq!(helper.client_count(), 0);
     }
 }

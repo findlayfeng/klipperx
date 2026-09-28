@@ -97,6 +97,10 @@ pub trait MuxEndpoint: Send + Sync {
     /// work or registered clients must stop them here; otherwise the old
     /// instance, and every object it holds, outlives the configuration it
     /// belonged to. Does nothing by default.
+    ///
+    /// It runs with the registry lock released, but it must not call back into
+    /// the [`Api`] (registering or dispatching from here would re-enter the
+    /// table the caller is clearing).
     fn detach(&self) {}
 }
 
@@ -365,13 +369,21 @@ impl Api {
     /// away. The same `(path, value)` may be registered again afterwards, with
     /// a fresh handler.
     pub fn clear_mux(&self) {
-        let mut mux = self.mux.write().expect("mux table is not poisoned");
-        for mux_entry in mux.values() {
-            for handler in mux_entry.values.values() {
-                handler.detach();
-            }
+        // Drain under the lock, detach after releasing it: `detach` is
+        // implementation code that may take locks of its own, and holding the
+        // table would also block every dispatch that resolves an instance.
+        let drained: Vec<Arc<dyn MuxEndpoint>> = {
+            let mut mux = self.mux.write().expect("mux table is not poisoned");
+            let handlers: Vec<Arc<dyn MuxEndpoint>> = mux
+                .values()
+                .flat_map(|mux_entry| mux_entry.values.values().cloned())
+                .collect();
+            mux.clear();
+            handlers
+        };
+        for handler in drained {
+            handler.detach();
         }
-        mux.clear();
     }
 
     /// Register a remote method for one connection.

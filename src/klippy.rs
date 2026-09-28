@@ -140,9 +140,8 @@ fn report_reactor_latency(report: crate::core::klippy::LatencyReport) {
 /// no longer parses leaves the printer in its `error` state, which a later
 /// `RESTART` can fix without the process going away. The machine is reset and
 /// reloaded **in place**: the same `Arc<Printer>` keeps serving, so the
-/// endpoints and any attached window survive a restart (this is the answer to
-/// Q7 — no printer slot to swap, because the printer is rebuilt under its one
-/// handle).
+/// endpoints and any attached window survive a restart (no printer slot to
+/// swap: the printer is rebuilt under its one handle).
 async fn klippy_process(printer: Arc<Printer>, config_file: String) -> String {
     let result = loop {
         printer.bring_up().await;

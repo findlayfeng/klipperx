@@ -29,6 +29,12 @@
 //! ends up doing — so a client that hit a config error can still ask for a
 //! restart instead of being stuck until the host process is restarted.
 //!
+//! Nothing is lost by skipping the command: `RESTART` and `FIRMWARE_RESTART` are
+//! registered `when_not_ready` (`gcode.rs`), and the ready-only preamble they
+//! run (fire `gcode:request_restart`, dwell, wait for queued moves) is skipped
+//! whenever the printer is not ready — which is exactly the state that removed
+//! the dispatcher.
+//!
 //! # Output subscriptions
 //!
 //! A subscriber is an [`OutputHandler`] over the requesting connection: it
@@ -185,7 +191,9 @@ impl Endpoint for GcodeRestart {
     ) -> EndpointFuture<'a> {
         Box::pin(async move {
             // No dispatcher: the config that would have built it never got
-            // there, and a restart is the only way to try again.
+            // there, and a restart is the only way to try again. The command's
+            // ready-gated preamble would be skipped here anyway (see the module
+            // note).
             let Ok(gcode) = gcode(&self.printer) else {
                 self.printer.request_exit(self.script);
                 return Ok(json!({}));

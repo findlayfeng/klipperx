@@ -225,8 +225,8 @@ gcode> SET_PIN PIN=fan VALUE=1
 
 第一次进入 g-code 模式时会自动订阅一次 `gcode/subscribe_output`，于是命令的
 `// …` 信息与 `!! …` 错误会以推送的形式出现在日志里（不订阅的话只能看到命令的应答，
-`respond_info` 看不到）。`.` 开头的本地命令在两种模式下都有效，所以 `.quit`、`.help`
-不会被当成 g-code 发出去。
+`respond_info` 看不到）。`.` 开头的本地命令在两种模式下都有效（例如 `.reload`、`.quit`、`.help`），所以
+`.quit`、`.help` 不会被当成 g-code 发出去。
 
 ### 一行就是一个请求
 
@@ -251,10 +251,17 @@ gcode> SET_PIN PIN=fan VALUE=1
 | `.help` | 把这一行的说明打进日志 |
 | `.subscribe` | 先问主机有哪些对象（`objects/list`），再订阅全部，之后状态变化会持续出现 |
 | `.subscribe <对象> …` | 只订阅指定的对象，例如 `.subscribe toolhead extruder heater_bed` |
+| `.firmware_restart` | 重启固件并重载配置（`gcode/firmware_restart`）；连接不断，随后会有一段 `startup` |
+| `.reload`（或 `.reload_config`） | 从磁盘重新读取配置文件并重启主机（`gcode/restart`）；`printer.cfg` 改完用它生效 |
 | `.quit`（或 `.exit`） | 退出；已经在路上的应答会先打出来 |
 | `.yaml` / `.json` | **仅窗口**：把消息正文在 YAML（默认）与紧凑 JSON 之间切换，`<`/`>` 标记不变 |
 
 想要停止订阅，直接退出即可：协议规定客户端靠断开连接来取消订阅。
+
+`.reload` 与 `.firmware_restart` 都会让主机**重新从磁盘读配置文件**（改完文件再发一次即可，
+不必重启主机进程）。注意一个现有缺陷：含 mux 端点的配置（`[load_cell]`、`[adxl345]`、
+`[probe_eddy_current]` 等）**第二次**重启会因注册表重复而进 `error`（`TODO.md` 的 R1）——
+这类配置改完文件后需要重启主机进程。
 
 ### 日志怎么读
 
@@ -306,7 +313,7 @@ $ klippy-client console --plain -a /tmp/klippy_uds
 | 跑 G-Code | `gcode/script {"script": "M115"}` |
 | 发一条不等待的 G-Code | `gcode/script {"script": "M104 S200"}` |
 | 紧急停止 | `emergency_stop` |
-| 重载配置并重启主机 | `gcode/restart` |
+| 重载配置并重启主机（从磁盘重读） | `gcode/restart` |
 | 重启固件与主机 | `gcode/firmware_restart` |
 | 暂停 / 恢复 / 取消 | `pause_resume/pause`、`pause_resume/resume`、`pause_resume/cancel` |
 

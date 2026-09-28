@@ -369,7 +369,7 @@
 
 ### 10. `gcode/restart` — 重启 Klipper 主机
 
-重新加载配置文件并重启 Klipper 主机进程。
+从磁盘重新读取配置文件并重启主机（`RESTART`）。
 
 **请求：**
 ```json
@@ -378,11 +378,15 @@
 
 **响应：** 无参数响应（`{}`）
 
+> 即使配置装载失败、`gcode` 对象不存在（对象图已被拆掉，`state_message` 处于 startup/error），
+> 本端点仍回 `{}`：它直接以 `restart` 请求宿主重启，让客户端改好文件后再试。
+> 同一状态下 `gcode/script` 仍回 `error`（携带 `state_message`）。
+
 ---
 
 ### 11. `gcode/firmware_restart` — 重启固件和主机
 
-重启固件和主机进程，重新加载配置文件。
+重启固件和主机，并从磁盘重新读取配置文件（`FIRMWARE_RESTART`）。
 
 **请求：**
 ```json
@@ -390,6 +394,8 @@
 ```
 
 **响应：** 无参数响应（`{}`）
+
+> 与 `gcode/restart` 一样，`gcode` 对象不在时仍回 `{}` 并直接请求宿主重启。
 
 ---
 

@@ -41,8 +41,8 @@
   （`klippy/klippy.py:36-40` `:90-113`）。
 - **客户端 API 的线形状**以 `docs/klippy/third-party-dev/api-reference.md` 为准。
 - **重启是就地重建**（Q7 的答案）：`restart` / `firmware_restart` 在同一个 `Arc<Printer>` 上
-  `reset_for_restart()` → 重载配置 → 再 `bring_up`，端点与 `--tui` 的 in-process server 全程
-  有效；不换 printer、不重建 Api/Server。
+  `reset_for_restart()` → 从磁盘重读配置 → 再 `bring_up`，端点与 `--tui` 的 in-process server
+  全程有效；不换 printer、不重建 Api/Server。
 
 ## 待办
 
@@ -58,6 +58,7 @@ H1–H12 是上游 extras 里按域归并的消费者（2026-09-21 全量盘点�
 | C1 | 运动层收尾：轴/stepper 抽象 + 多轴（C1a）、extruder 运动（C1b）、运动学族（C1c：delta/polar/generic_cartesian/rotary_delta/winch/deltesian 全落地）、print-time 回调（C1d）——**✅ 收官** | — |
 | C2 | 配置装载：框架部分 ✅（FW1，含 choice/range 文案与 `deprecate` 警告）；autosave/`SAVE_CONFIG` 仍待（属模块） | — |
 | D1 | 主机层 start args / rollover / `--logfile` ✅（FW8）；剩余：`debuginput`/`debugoutput` 的命令行接线与每 MCU 字典路径 | — |
+| R1 | 重启安全：`webhooks` 的 mux 注册表跨 `reset_for_restart` 累积、而 `Api` 端点表每进程只建一次——含 `[load_cell]` / `[adxl345]` / `[probe_eddy_current]` 的配置第 2 次 `RESTART` 必以 `mux endpoint … already registered` 进 `error`（既有缺陷，非重读引入） | — |
 
 **MCU 资源与总线**
 
@@ -280,6 +281,30 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
       `--debuginput`/`--debugoutput` 的命令行解析（`StartArgs::collect` 里仍是 `None`）与
       每个 MCU 的字典路径。`software_version` 已由宿主 `set_start_args` 注入
       （`src/klippy.rs:324`）并被 `info` 与 `M115` 读取——接线已完成并归档。
+- [ ] **rollover 的 `log_config`**：上游每次 `_read_config` 都把整份配置写进 rollover
+      （`configfile.py:482-487`、`klippy.py:118`），本仓只有 `versions` 块；重启重读上线后，
+      「这次重载的是哪份配置」在日志里看不到。
+
+### R1 mux 端点注册表不是重启安全的
+
+`webhooks` 是宿主对象（`src/klippy.rs` 在 `load_config` 之前 `api::webhooks::install`），跨
+`reset_for_restart` 存活；而 `Api` 端点表只在进程启动时由 `api::register` 建一次，mux 注册项
+也只在那一刻被 `take_mux_endpoints()` 抽干（`api/mod.rs:126-141`）。于是每轮 `load_config`
+里模块都会再调一次 `WebhooksStatus::register_mux_endpoint`（`webhooks.rs:111-152`）：
+
+- 第 1 次重启：vec 已抽干，注册成功，但这些新注册**再也不会进 `Api` 表**——客户端仍打到
+  启动时那个 handler，`MuxBatchEndpoint` 持有的旧 `BulkSensor`（`bulk_sensor.rs:186-189`）
+  也被这条强引用钉住、不走 `teardown`；
+- 第 2 次重启：同 `(path, value)` 重复 → `ConfigError: mux endpoint … already registered`，
+  打印机进 `error`。
+
+**实测**（合成调用：`register_mux_endpoint` → `take_mux_endpoints` → 再注册两次）：
+restart #1 = `Ok`，restart #2 =
+`Err(mux endpoint load_cell/dump_force load_cell lc already registered (lc))`。
+这是**既有缺陷**：改动前第 2 次重启同样踩，与「重启从磁盘重读配置」无关；但重读让重启成为
+日常动作、且允许配置变化，暴露面变大。修法要让 mux 分派不再依赖一次性 `Api` 表（每轮重建表
+不行：`Api` 建后即 `Arc` 不可变），属独立工单。在此之前，含 mux 端点的配置第二次 `.reload`
+会失败——已记入[客户端使用](docs/klippy/user-manual/client.md)。
 
 ### E2 `python_path` 的取消（**远期，依赖外部项目**）
 

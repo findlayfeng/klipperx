@@ -95,7 +95,7 @@ klipperx（bin，src/main.rs）
   ├─ logging::to_window(records)   ← 主机日志改道进窗口，不再写 stdout
   ├─ Window                        ← 实现 klippy::Attachment
   └─ klippy::run(AppArgs, Some(Box::new(window)))
-       ├─ Api / Server / klippy_process(config)     ← 照常
+       ├─ Api / Server / klippy_process(config_file)     ← 照常
        └─ Attachment::run(api)
             ├─ tokio::io::duplex(64 KiB)
             │    ├─ 一端：klippy_api::server::serve(ClientConnection::new(api))
@@ -368,7 +368,7 @@ identify 的命令**定义**（名称、参数、解码）与其它命令一样�
 | 文件 | 职责 |
 |------|------|
 | `mod.rs` | 说明主机侧与 API 的分界，把 `klippy-api` 的四个模块转出，并提供 `register`：一次把服务器这一侧（`webhooks` + 端点）装到机器上。端点来自各模块 `endpoint!` 声明生成的安装函数表（[声明式表生成](codegen.md)），`register` 只负责先装 `webhooks` 再遍历该表 |
-| `endpoints/` | 一个端点一个文件：`info.rs`、`emergency_stop.rs`、`objects_list.rs`、`objects_query.rs`、`objects_subscribe.rs`、`gcode.rs`、`query_endstops.rs`、`register_remote_method.rs`（共 12 条注册路径 + 内建 `list_endpoints` = 13 条，见 `api/mod.rs` 的测试断言）；参数、响应形状、handler 与安装函数都在各文件里。`objects/query` 与 `objects/subscribe` 共用字段选择（`select_fields` / `status_object`），`gcode/*` 按请求从 `printer` 里取 `gcode`。未实现的表面（`pause_resume/*`、`bed_mesh/dump_mesh`、`*/dump_*`）见 `endpoints/mod.rs` 的状态表 |
+| `endpoints/` | 一个端点一个文件：`info.rs`、`emergency_stop.rs`、`objects_list.rs`、`objects_query.rs`、`objects_subscribe.rs`、`gcode.rs`、`query_endstops.rs`、`register_remote_method.rs`（共 12 条注册路径 + 内建 `list_endpoints` = 13 条，见 `api/mod.rs` 的测试断言）；参数、响应形状、handler 与安装函数都在各文件里。`objects/query` 与 `objects/subscribe` 共用字段选择（`select_fields` / `status_object`），`gcode/*` 按请求从 `printer` 里取 `gcode`（例外：`gcode/restart` / `gcode/firmware_restart` 在 `gcode` 缺席时直接 `request_exit`，让配置没装载成功时仍能重启）。未实现的表面（`pause_resume/*`、`bed_mesh/dump_mesh`、`*/dump_*`）见 `endpoints/mod.rs` 的状态表 |
 | `webhooks.rs` | 服务器自己的打印机对象：名字与字段对齐上游 `webhooks.get_status`，读的是机器状态 |
 | `start_args.rs` | 主机启动参数（`config_file` / `log_file` / `software_version` / `cpu_info`）：上游放在 printer 上（29 处 `get_start_args`），这里归主机侧，`info` 是第一个消费者 |
 

@@ -96,6 +96,40 @@ pub fn install(printer: &Arc<Printer>) -> Result<Arc<WebhooksStatus>, ConfigErro
     Ok(object)
 }
 
+/// Upstream's mux conflict checks (`klippy/webhooks.py:332-345`).
+///
+/// `existing` is what `path` already has — its key and the instance values
+/// taken — or `None` when the path is new. Both registration paths call this,
+/// so a conflict reads the same whether it is found in the first load's buffer
+/// or in the API table after a reload.
+fn check_mux_conflict(
+    path: &str,
+    key: &str,
+    value: Option<&str>,
+    existing: Option<(String, Vec<Option<String>>)>,
+) -> Result<(), ConfigError> {
+    let Some((existing_key, values)) = existing else {
+        return Ok(());
+    };
+    let shown = value.unwrap_or("None");
+    if existing_key != key {
+        return Err(ConfigError::new(format!(
+            "mux endpoint {path} {key} {shown} may have only one key ({existing_key})"
+        )));
+    }
+    if values.iter().any(|taken| taken.as_deref() == value) {
+        let registered: Vec<&str> = values
+            .iter()
+            .map(|taken| taken.as_deref().unwrap_or("None"))
+            .collect();
+        return Err(ConfigError::new(format!(
+            "mux endpoint {path} {key} {shown} already registered ({})",
+            registered.join(", ")
+        )));
+    }
+    Ok(())
+}
+
 /// One mux endpoint a module registered before the API table existed.
 ///
 /// [`WebhooksStatus`] holds these as its pending list; [`super::register`]
@@ -145,10 +179,8 @@ impl WebhooksStatus {
     /// Once the API table exists the registration goes straight into it. Before
     /// that — during the initial load only — it is buffered, because the table
     /// has not been built yet; [`super::register`] drains the buffer into the
-    /// table afterwards, so the same checks apply either way. The *wording* of a
-    /// rejected registration differs, though: the buffered path formats
-    /// upstream's message, while the direct path surfaces the API table's own
-    /// (`RegistrationError`).
+    /// table afterwards. Both paths run `check_mux_conflict` first, so a
+    /// conflict reads the same either way.
     pub fn register_mux_endpoint(
         &self,
         path: &str,
@@ -158,37 +190,29 @@ impl WebhooksStatus {
     ) -> Result<(), ConfigError> {
         let api = self.api.lock().unwrap_or_else(|p| p.into_inner()).clone();
         if let Some(api) = api {
+            // Checked against the table (upstream's wording), then registered;
+            // the table is only touched from the load path, so nothing can
+            // slip between the two.
+            check_mux_conflict(path, key, value, api.mux_registrations(path))?;
             return api
                 .register_mux(path, key, value, handler)
                 .map_err(|err| ConfigError::new(err.to_string()));
         }
         let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
-        let shown = value.unwrap_or("None");
-        if let Some(first) = pending
+        let existing = pending
             .iter()
             .find(|registration| registration.path == path)
-        {
-            if first.key != key {
-                return Err(ConfigError::new(format!(
-                    "mux endpoint {path} {key} {shown} may have only one key ({})",
-                    first.key
-                )));
-            }
-        }
-        if pending
-            .iter()
-            .any(|registration| registration.path == path && registration.value.as_deref() == value)
-        {
-            let registered: Vec<&str> = pending
-                .iter()
-                .filter(|registration| registration.path == path)
-                .map(|registration| registration.value.as_deref().unwrap_or("None"))
-                .collect();
-            return Err(ConfigError::new(format!(
-                "mux endpoint {path} {key} {shown} already registered ({})",
-                registered.join(", ")
-            )));
-        }
+            .map(|first| {
+                (
+                    first.key.clone(),
+                    pending
+                        .iter()
+                        .filter(|registration| registration.path == path)
+                        .map(|registration| registration.value.clone())
+                        .collect(),
+                )
+            });
+        check_mux_conflict(path, key, value, existing)?;
         pending.push(MuxRegistration {
             path: path.to_string(),
             key: key.to_string(),
@@ -368,6 +392,37 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "mux endpoint path sensor one already registered (one)"
+        );
+    }
+
+    /// The same conflict found in the API table after `set_api` (a reload)
+    /// reads exactly as it did while the first load was buffered — one message,
+    /// not two.
+    #[tokio::test]
+    async fn test_a_conflict_after_set_api_uses_the_same_message() {
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        let object = install(&printer).unwrap();
+        let api = Arc::new(Api::new());
+        object.set_api(Arc::clone(&api));
+
+        object
+            .register_mux_endpoint("path", "sensor", Some("one"), Arc::new(Echo("a")))
+            .unwrap();
+
+        let err = object
+            .register_mux_endpoint("path", "sensor", Some("one"), Arc::new(Echo("b")))
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "mux endpoint path sensor one already registered (one)"
+        );
+
+        let err = object
+            .register_mux_endpoint("path", "name", Some("two"), Arc::new(Echo("c")))
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "mux endpoint path name two may have only one key (sensor)"
         );
     }
 

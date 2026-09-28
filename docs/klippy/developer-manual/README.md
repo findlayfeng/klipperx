@@ -317,7 +317,7 @@ identify 的命令**定义**（名称、参数、解码）与其它命令一样�
 | `safe_z_home.rs` | `[safe_z_home]`：接管 G28（Z-hop → 按需 `X0 Y0` → 安全位 → `Z0`）；`section!(order = 70, phase = late)` **必须晚于 toolhead（`printer`，order 60 late）**，否则 `unregister_command("G28")` 得 `None`；与 `[homing_override]` 互斥（批 #6） |
 | `manual_stepper.rs` + `force_move.rs` | `[manual_stepper <name>]` 与 `MANUAL_STEPPER`（含 `GCODE_AXIS` 动态注册/注销 extra axis）；`force_move.rs` 目前只含 `calc_move_time`（归属对齐上游）（批 #6） |
 | `display/{mod,display,st7920,hd44780,hd44780_spi,uc1701,ssd1306,aip31068_spi}.rs` + vendored `display.cfg` | `[display]` 框架与六驱动（批 #7+#13+#28+#30）；**storage-only**（不渲染、菜单未实现，见 config 手册的 gap）；`display_status` 的 `M73`/`M117`/`SET_DISPLAY_TEXT` 批 #7 落地 |
-| `hx71x.rs` + `load_cell.rs` + `cmd/hx71x.rs` | `[load_cell]` 节与 HX711/HX717 驱动（批 #14，走 LC-1 的 `with_format("<i",…)` 接缝）；ads1220/ads131m0x、`load_cell_probe`、四条 `LOAD_CELL_*` 实现待后续单元；`load_cell/dump_force` 的 `detach` 清该 cell 的推送客户端 |
+| `hx71x.rs` + `load_cell.rs` + `cmd/hx71x.rs` | `[load_cell]` 节与 HX711/HX717 驱动（批 #14，走 LC-1 的 `with_format("<i",…)` 接缝）；ads1220/ads131m0x、`load_cell_probe`、四条 `LOAD_CELL_*` 实现待后续单元；`load_cell/dump_force` 的 `detach` 清该 cell 的推送客户端并置 `detached`（竞态中的请求回 `UnknownMuxValue`） |
 | `tmc.rs` + `tmc_uart.rs` + `tmc2208.rs` + `tmc2209.rs` | TMC UART 驱动族（批 #7）：单一 `TmcDriver` + `TmcTransport` trait + 表驱动；虚拟端停用装饰器实现；**SPI 族**：`tmc_spi.rs`（W0）+ `tmc2130`（批 #34）已落地，`tmc5160`/`tmc2660`/`tmc2240` 进行中；旧描述里的 `tmc2130`/`tmc2660`/`tmc5160`/`tmc2240` 待做 |
 | `board_pins.rs` | `[board_pins]` / `[board_pins <name>]`：读 `mcu` 列表与 `aliases` / `aliases_*`（`名=引脚`，值写成 `<...>` 则保留），调用 `PrinterPins::alias_pin` / `reserve_pin`。对象不可查询 |
 | `static_digital_output.rs` | `[static_digital_output <name>]`：读 `pins`（引脚列表），一次全部拉到固定电平（上游同名节）；`order = 35` 排在 `board_pins` 后，别名可用 |
@@ -369,7 +369,7 @@ identify 的命令**定义**（名称、参数、解码）与其它命令一样�
 |------|------|
 | `mod.rs` | 说明主机侧与 API 的分界，把 `klippy-api` 的四个模块转出，并提供 `register`：一次把服务器这一侧（`webhooks` + 端点）装到机器上。端点来自各模块 `endpoint!` 声明生成的安装函数表（[声明式表生成](codegen.md)），`register` 只负责先装 `webhooks` 再遍历该表 |
 | `endpoints/` | 一个端点一个文件：`info.rs`、`emergency_stop.rs`、`objects_list.rs`、`objects_query.rs`、`objects_subscribe.rs`、`gcode.rs`、`query_endstops.rs`、`register_remote_method.rs`（共 12 条注册路径 + 内建 `list_endpoints` = 13 条，见 `api/mod.rs` 的测试断言）；参数、响应形状、handler 与安装函数都在各文件里。`objects/query` 与 `objects/subscribe` 共用字段选择（`select_fields` / `status_object`），`gcode/*` 按请求从 `printer` 里取 `gcode`（例外：`gcode/restart` / `gcode/firmware_restart` 在 `gcode` 缺席时直接 `request_exit`，让配置没装载成功时仍能重启）。未实现的表面（`pause_resume/*`、`bed_mesh/dump_mesh`、其余 `*/dump_*`）见 `endpoints/mod.rs` 的状态表 |
-| `webhooks.rs` | 服务器自己的打印机对象：名字与字段对齐上游 `webhooks.get_status`，读的是机器状态；同时是 mux 表的生命周期驱动者——初始装载缓冲 `pending`、`api::register` 只抽干一次、`set_api` 后直连注册、`release_cycles`（teardown）时 `clear_mux()` |
+| `webhooks.rs` | 服务器自己的打印机对象：名字与字段对齐上游 `webhooks.get_status`，读的是机器状态；同时是 mux 表的生命周期驱动者——初始装载缓冲 `pending`、`api::register` 只抽干一次、`set_api` 后直连注册、`release_cycles`（teardown）时 `clear_mux()`，两条路径共用 `check_mux_conflict` 的检查与文案 |
 | `start_args.rs` | 主机启动参数（`config_file` / `log_file` / `software_version` / `cpu_info`）：上游放在 printer 上（29 处 `get_start_args`），这里归主机侧，`info` 是第一个消费者 |
 
 API 本身在 `crates/klippy-api/src/`：
@@ -379,7 +379,7 @@ API 本身在 `crates/klippy-api/src/`：
 | `lib.rs` | crate 说明：线上的形状、监听位置、并发模型、模块表 |
 | `address.rs` | `ApiTarget`：把 `--api-server` 的值解析成 socket 路径或 TCP 地址；未知 scheme（比如曾经的 `http://…:7125`）直接报错而不是当成文件名。`Transport` 也在这里：两个方向都只用它一个类型看待 socket。`DEFAULT_API_SERVER` / `NO_API_SERVER` 两个常量也在这里 —— 主机与客户端共用同一个默认值，而「空值＝不提供服务」只有主机认 |
 | `protocol.rs` | `Framing`（粘包 / 拆包）、`Request` / `Response`、`Params` 访问器、`ApiError`、`ResponseTemplate`、`PushTarget`；不认 socket，也不认端点 |
-| `registry.rs` | `Endpoint` / `MuxEndpoint` trait（`MuxEndpoint::detach` 默认空实现，`Api::clear_mux` 在配置重建时对每个实例调用）、`Api` 注册表与 `dispatch`、mux 的 key 选择（mux 表运行期可变：`register_mux(&self)` / `clear_mux`，分派只在读锁下解析、不跨 await 持锁）、remote method、内建 `list_endpoints`；注册期错误单独用 `RegistrationError` |
+| `registry.rs` | `Endpoint` / `MuxEndpoint` trait（`MuxEndpoint::detach` 默认空实现，`Api::clear_mux` 在配置重建时对每个实例调用）、`Api` 注册表与 `dispatch`、mux 的 key 选择（mux 表运行期可变：`register_mux(&self)` / `clear_mux`，分派只在读锁下解析、不跨 await 持锁）、`mux_registrations` 供 `webhooks` 查路径已有实例、remote method、内建 `list_endpoints`；注册期错误单独用 `RegistrationError` |
 | `server.rs` | `Listener`（两种传输）、`Server::bind` / `run`（accept 循环）、`ClientConnection`（分帧状态、发件箱、`Notify` 唤醒、关闭标志，即端点拿到的 `PushTarget`），以及每条连接的读写 `select!` 与 5 秒写超时 |
 | `error.rs` | `TransportError`：socket 层面的失败（`Bind` / `Connect` / `Closed` / `Io`），与请求层面的 `ApiError` 分开 |
 

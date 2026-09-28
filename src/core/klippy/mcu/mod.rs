@@ -1462,14 +1462,14 @@ impl Sender {
     /// not the way the wait is normally chosen: it runs off the current value
     /// — estimate-backed or already backed off — up to [`MAX_RTO`], and the
     /// next sample ([`Sender::record_sample`]) replaces it with the estimate.
-    async fn retransmit(&mut self, interface: &Interface) {
+    async fn retransmit(&mut self, interface: &Interface, board: &str) {
         let again: Vec<InFlightBlock> = self.in_flight.drain(..).collect();
         self.retransmit_at = None;
         if again.is_empty() {
             return;
         }
         warn!(
-            "No answer for {} in-flight block(s); retransmitting",
+            "[{board}] No answer for {} in-flight block(s); retransmitting",
             again.len()
         );
         for block in again {
@@ -1673,7 +1673,11 @@ impl Mcu {
             dictionary: Arc::clone(&dictionary),
         };
 
+        // The name both transport tasks put on their lines: two MCUs share one
+        // log, and a frame that could not be placed or a message nobody bound
+        // says nothing useful without its board.
         let board = name.clone();
+        let board_for_recv = board.clone();
         let send_handle = handle.spawn(async move {
             let mut sender = Sender::new(Arc::clone(&wire_for_send));
             // What the two gates hold back: messages not released yet, and
@@ -1758,7 +1762,7 @@ impl Mcu {
                         // waiting for the firmware to speak: a block that never
                         // arrived leaves it waiting silently (`serialqueue.c`).
                         _ = tokio::time::sleep_until(when), if deadline.is_some() => {
-                            sender.retransmit(&interface_for_send).await;
+                            sender.retransmit(&interface_for_send, &board).await;
                         }
                         // A parked gate coming due.
                         _ = tokio::time::sleep_until(wake_at), if wake.is_some() => {}
@@ -1885,7 +1889,7 @@ impl Mcu {
                             sender.settle(&interface_for_send, seen).await;
                         }
                         _ = tokio::time::sleep_until(when), if deadline.is_some() => {
-                            sender.retransmit(&interface_for_send).await;
+                            sender.retransmit(&interface_for_send, &board).await;
                         }
                     }
                 }
@@ -1990,16 +1994,19 @@ impl Mcu {
                         // whose ids are not known yet. That is expected, not an
                         // error — see `identified`.
                         if identified_for_task.load(Ordering::SeqCst) {
-                            error!("Decode error: {e}");
+                            error!("[{board_for_recv}] Decode error: {e}");
                         } else {
-                            debug!("Decode error before the dictionary: {e}");
+                            debug!("[{board_for_recv}] Decode error before the dictionary: {e}");
                         }
                         continue;
                     }
                 };
 
                 for (msg, params) in decoded {
-                    debug!("recv {}", describe_message(&msg, &params));
+                    debug!(
+                        "[{board_for_recv}] recv {}",
+                        describe_message(&msg, &params)
+                    );
                     // Pending call has priority — if matched, consume and skip callback.
                     if pending_calls_for_task.resolve(&msg.name, &params).await {
                         debug!(
@@ -2018,7 +2025,10 @@ impl Mcu {
                         cb(params.as_slice());
                     } else {
                         // No callback and no pending call — discard with warning.
-                        warn!("Unhandled message {} (id={}), discarding", msg.name, msg.id);
+                        warn!(
+                            "[{board_for_recv}] Unhandled message {} (id={}), discarding",
+                            msg.name, msg.id
+                        );
                     }
                 }
             }
@@ -2185,6 +2195,22 @@ impl Mcu {
     /// Get the MCU name.
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Drop every synchronous call this session has in flight.
+    ///
+    /// The calls will not be answered any more — the caller is the connect-time
+    /// shutdown watcher (`mcu/object.rs`), and a firmware that reported a stop
+    /// refuses every command but the handful that run while stopped
+    /// (`src/command.c:346-349`). Dropping the registrations returns each waiter
+    /// now instead of after its own timeout (see [`PendingCalls::abort_all`]).
+    ///
+    /// Handed to this session's runtime rather than awaited here: the caller is
+    /// a message callback running on the receive task, which must not block
+    /// ([`Mcu::bind_event`]).
+    pub(crate) fn abort_pending_calls(&self) {
+        let calls = self.pending_calls.clone();
+        self.handle.spawn(async move { calls.abort_all().await });
     }
 
     /// The firmware's clock frequency (`CLOCK_FREQ`), in ticks per second.
@@ -2509,7 +2535,7 @@ impl Mcu {
 
     /// The body of [`Mcu::send`], plus what the caller will be waiting for.
     ///
-    /// A call is one round trip, so it gets one line: `send identify offset=0
+    /// A call is one round trip, so it gets one line: `[mcu] send identify offset=0
     /// count=40 (waiting for identify_response)` says what went out and what is
     /// expected back, where two lines said half of that each.
     ///
@@ -2537,10 +2563,11 @@ impl Mcu {
         let payload = self.parser.encode(name, args)?;
         match waiting_for {
             Some(response) => debug!(
-                "send {} (waiting for {response})",
+                "[{}] send {} (waiting for {response})",
+                self.name,
                 self.describe_command(name, args)
             ),
-            None => debug!("send {}", self.describe_command(name, args)),
+            None => debug!("[{}] send {}", self.name, self.describe_command(name, args)),
         }
         // A gated message says what holds it: `min`/`req` against the estimate
         // at the moment it joins the queue (the park line reports the same
@@ -2740,7 +2767,10 @@ impl Mcu {
             Ok(Err(_recv)) => {
                 // Receiver dropped (shouldn't happen in normal flow).
                 self.pending_calls.cancel(response_name).await;
-                error!("Response receiver dropped for '{}'", response_name);
+                error!(
+                    "[{}] Response receiver dropped for '{}'",
+                    self.name, response_name
+                );
                 Err(McuCallError::SendFailed(
                     "response receiver dropped".to_string(),
                 ))
@@ -2748,7 +2778,10 @@ impl Mcu {
             Err(_) => {
                 // Timeout — clean up the pending call.
                 self.pending_calls.cancel(response_name).await;
-                warn!("Timeout waiting for response '{}'", response_name);
+                warn!(
+                    "[{}] Timeout waiting for response '{}'",
+                    self.name, response_name
+                );
                 Err(McuCallError::Timeout(format!(
                     "no response for {} within {:?}",
                     response_name, timeout
@@ -3793,7 +3826,7 @@ mod tests {
         let mut sender = Sender::new(Arc::new(Wire::default()));
 
         sender.send_block(&interface, vec![5]).await;
-        sender.retransmit(&interface).await;
+        sender.retransmit(&interface, "test_mcu").await;
         assert!(
             sender.sample_seq.is_none(),
             "a retransmit throws the pinned sample away"
@@ -3849,9 +3882,9 @@ mod tests {
             "and the estimate says the same"
         );
 
-        sender.retransmit(&interface).await;
+        sender.retransmit(&interface, "test_mcu").await;
         assert_eq!(sender.rto, MIN_RTO * 2, "a timeout still doubles the wait");
-        sender.retransmit(&interface).await;
+        sender.retransmit(&interface, "test_mcu").await;
         assert_eq!(sender.rto, MIN_RTO * 4, "and doubles again");
     }
 
@@ -3920,7 +3953,7 @@ mod tests {
         );
 
         sender.send_block(&interface, vec![5]).await;
-        sender.retransmit(&interface).await;
+        sender.retransmit(&interface, "test_mcu").await;
         assert_eq!(
             sender.rto,
             Duration::from_millis(120),
@@ -3963,7 +3996,7 @@ mod tests {
         sender.record_sample(Duration::from_millis(5));
 
         sender.send_block(&interface, vec![5]).await;
-        sender.retransmit(&interface).await;
+        sender.retransmit(&interface, "test_mcu").await;
         assert_eq!(
             sender.rto,
             Duration::from_millis(120),

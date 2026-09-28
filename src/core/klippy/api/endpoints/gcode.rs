@@ -8,8 +8,8 @@
 //! |---|---|
 //! | `gcode/help` | the flat `{command: help}` table |
 //! | `gcode/script` | `{}`, or an `error` reply with the command's message |
-//! | `gcode/restart` | `{}`; runs the `RESTART` command |
-//! | `gcode/firmware_restart` | `{}`; runs the `FIRMWARE_RESTART` command |
+//! | `gcode/restart` | `{}`; runs `RESTART`, or restarts the machine directly |
+//! | `gcode/firmware_restart` | `{}`; runs `FIRMWARE_RESTART`, or restarts the machine directly |
 //! | `gcode/subscribe_output` | `{}`; later lines are pushed as `{response: line}` |
 //!
 //! # Why the dispatcher is looked up per request
@@ -21,6 +21,13 @@
 //! `lookup_object` an upstream module would do. Before the config is loaded the
 //! lookup fails and the request gets the printer's state message as a command
 //! error, which is what a script sent that early deserves.
+//!
+//! The two restart endpoints are the exception: a restart is the way out of a
+//! machine that failed to come up, so it must not depend on the `gcode` object
+//! that failure took down with it. With no dispatcher they call
+//! `Printer::request_exit` themselves — the same thing the `RESTART` command
+//! ends up doing — so a client that hit a config error can still ask for a
+//! restart instead of being stuck until the host process is restarted.
 //!
 //! # Output subscriptions
 //!
@@ -137,7 +144,9 @@ impl Endpoint for GcodeScript {
 /// `gcode/restart` and `gcode/firmware_restart` — run the restart command.
 ///
 /// The command itself decides what a restart means (`request_exit`); the restart
-/// loop (`src/klippy.rs`) rebuilds the machine or exits on the result.
+/// loop (`src/klippy.rs`) rebuilds the machine or exits on the result. When no
+/// dispatcher exists (a config that failed to load), the endpoint skips the
+/// command and asks the printer to exit with the same result itself.
 pub struct GcodeRestart {
     printer: Arc<Printer>,
     path: &'static str,
@@ -175,7 +184,12 @@ impl Endpoint for GcodeRestart {
         _context: &'a EndpointContext<'a>,
     ) -> EndpointFuture<'a> {
         Box::pin(async move {
-            let gcode = gcode(&self.printer)?;
+            // No dispatcher: the config that would have built it never got
+            // there, and a restart is the only way to try again.
+            let Ok(gcode) = gcode(&self.printer) else {
+                self.printer.request_exit(self.script);
+                return Ok(json!({}));
+            };
             gcode
                 .run_script(self.script)
                 .await
@@ -535,6 +549,42 @@ mod tests {
 
         // The built-in FIRMWARE_RESTART asks the printer to exit with that
         // result; `run` returns it without waiting because it is already set.
+        assert_eq!(printer.run(), "firmware_restart");
+    }
+
+    #[tokio::test]
+    async fn test_restart_without_a_dispatcher_still_restarts() {
+        // No `gcode` object: the config that would build one failed to load.
+        // The client must still be able to ask for a restart.
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        let api = Api::new();
+
+        let response = GcodeRestart::restart(Arc::clone(&printer))
+            .handle(
+                &request(r#"{"method":"gcode/restart"}"#),
+                &context(&api, silent_target()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response, json!({}));
+        assert_eq!(printer.run(), "restart");
+    }
+
+    #[tokio::test]
+    async fn test_firmware_restart_without_a_dispatcher_still_restarts() {
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        let api = Api::new();
+
+        let response = GcodeRestart::firmware_restart(Arc::clone(&printer))
+            .handle(
+                &request(r#"{"method":"gcode/firmware_restart"}"#),
+                &context(&api, silent_target()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response, json!({}));
         assert_eq!(printer.run(), "firmware_restart");
     }
 

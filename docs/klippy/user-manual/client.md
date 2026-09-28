@@ -259,9 +259,8 @@ gcode> SET_PIN PIN=fan VALUE=1
 想要停止订阅，直接退出即可：协议规定客户端靠断开连接来取消订阅。
 
 `.reload` 与 `.firmware_restart` 都会让主机**重新从磁盘读配置文件**（改完文件再发一次即可，
-不必重启主机进程）。注意一个现有缺陷：含 mux 端点的配置（`[load_cell]`、`[adxl345]`、
-`[probe_eddy_current]` 等）**第二次**重启会因注册表重复而进 `error`（`TODO.md` 的 R1）——
-这类配置改完文件后需要重启主机进程。
+不必重启主机进程）。mux 端点（`*/dump_*`）的实例随配置一起注销并在下一轮重新注册，所以
+含 `[load_cell]`、`[adxl345]` 等节的配置反复重载也不会累积、不会卡在 `already registered`。
 
 ### 日志怎么读
 

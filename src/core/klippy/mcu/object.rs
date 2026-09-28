@@ -43,8 +43,8 @@ use crate::core::klippy::error::{ConfigError, KlippyError};
 use crate::core::klippy::event::stats::{register_stats, LastStats};
 use crate::core::klippy::event::{IsShutdown, KlippyEvent, McuEvent, Shutdown, Starting};
 use crate::core::klippy::mcu::{
-    ConfigBuilder, Dictionary, I2cMode, Mcu, McuChip, McuError, McuI2c, McuRestartMethod, McuSpi,
-    McuStepper, SpiMode,
+    BuiltConfig, ConfigBuilder, Configured, Dictionary, I2cMode, Mcu, McuChip, McuError, McuI2c,
+    McuRestartMethod, McuSpi, McuStepper, SpiMode,
 };
 use crate::core::klippy::pins::{PinError, PinParams, PrinterPins, PINS_OBJECT};
 use crate::core::klippy::printer::{ConnectFuture, Printer, PrinterObject, RestartFuture};
@@ -60,6 +60,30 @@ const RECONNECT_ATTEMPTS: usize = 20;
 /// How long to wait for the `reset` command to leave the send queue before the
 /// rebooted board takes the transport with it.
 const RESET_FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// How many times one bring-up may reset the firmware in place before it gives
+/// up.
+///
+/// A firmware whose only way out of a configuration is `reset` drops its
+/// connection when it reboots, so the handshake has to be re-run on the
+/// connection that comes back — and on a real board that reboot sometimes comes
+/// back stopped: the firmware reports a clock fault (`Timer too close`,
+/// `Rescheduled timer in the past`) less than a second after it starts, and the
+/// handshake can never finish on that session. Observed on a two-board setup
+/// (an stm32f103 `mcu` beside a CP2102 `mcu2`): a fresh process was often ready
+/// on its second or third start, so a bring-up that resets again usually
+/// succeeds. Bounded because each round is a reboot and a re-identify; a board
+/// that cannot come up in three tries is not going to on the fourth.
+const MAX_IN_PLACE_RESETS: u32 = 3;
+
+/// How long the firmware gets to start before the port is reopened after a
+/// `reset`.
+///
+/// A rebooted board is not ready when the `reset` has flushed: the firmware
+/// still has to come up, and reopening the port straight away races its startup
+/// — on the real board that showed as an identify timeout, or as the firmware
+/// tripping a clock fault of its own less than a second after it started.
+const RESET_SETTLE: Duration = Duration::from_millis(500);
 
 /// How long the one `get_uptime` that seeds the clock estimate may take.
 ///
@@ -807,6 +831,132 @@ impl McuObject {
         }
     }
 
+    /// Whether a failed handshake round is worth another in-place firmware
+    /// reset, with `resets` of them already done.
+    ///
+    /// Two failures send the bring-up back to `reset`:
+    ///
+    /// - [`McuError::ResetRequired`]: the firmware's only way out of its
+    ///   configuration is to reboot itself (`mcu/config.rs`).
+    /// - a stop this session reported on the way through
+    ///   ([`McuObject::connect_shutdown`]): the firmware came up stopped — a
+    ///   clock fault it hit while starting, on the real board — so it refuses
+    ///   every configuration command and no further handshake round on this
+    ///   session will finish. A fresh reboot is the way out.
+    ///
+    /// Both are capped by [`MAX_IN_PLACE_RESETS`]; past that the bring-up
+    /// reports the failure it holds instead of rebooting forever.
+    fn should_reset_and_retry(&self, err: &McuError, resets: u32) -> bool {
+        if resets >= MAX_IN_PLACE_RESETS {
+            return false;
+        }
+        matches!(err, McuError::ResetRequired) || self.connect_shutdown().is_some()
+    }
+
+    /// The bring-up's failure once the handshake has run out of in-place
+    /// resets.
+    ///
+    /// A `ResetRequired` that outlived every reset means the firmware kept
+    /// carrying its configuration through them — say that, rather than the
+    /// terse "must be reset" the retry already acted on. Everything else goes
+    /// through [`McuObject::connect_failure`], so a session that came up
+    /// stopped fails with the firmware's own reason instead of a response
+    /// timeout.
+    fn handshake_failure(&self, err: &McuError) -> KlippyError {
+        let err = match err {
+            McuError::ResetRequired => KlippyError::Connection(format!(
+                "MCU '{}' still carries a configuration after a 'reset'",
+                self.name()
+            )),
+            other => KlippyError::Connection(other.to_string()),
+        };
+        self.connect_failure(err)
+    }
+
+    /// Run the configuration handshake, resetting the firmware in place when it
+    /// cannot accept the configuration yet.
+    ///
+    /// Split out of [`McuObject::connect`] so the retry is callable against a
+    /// mock first session: a `test:` section's fake starts a *working* firmware,
+    /// so the one thing `connect` cannot be scripted into is a handshake that
+    /// fails and then succeeds on the connection a reset brings back. Handed the
+    /// connection it starts from, this is the same loop either way.
+    ///
+    /// The point is `FIRMWARE_RESTART` on the `command` method, which already
+    /// sent the firmware's own `reset` on the live connection before the parts
+    /// came down (`before_firmware_restart`; upstream's `_restart_via_command`,
+    /// `klippy/mcu.py:729-747`). What is left here is the firmware whose *only*
+    /// reset is `reset` and that still carries a configuration: no `config_reset`
+    /// to clear it in place, so it has to be rebooted and re-identified — with
+    /// the in-place retries this loop owns.
+    async fn handshake_with_in_place_resets(
+        &self,
+        config: &McuConfig,
+        mut mcu: Arc<Mcu>,
+        mut built: BuiltConfig,
+    ) -> Result<(Arc<Mcu>, Configured), KlippyError> {
+        let mut resets = 0u32;
+        loop {
+            // `test:` serves the corpus against the fake, whose clock only
+            // moves with wall time while the corpus' motion is virtual: a
+            // scheduling gate there degenerates into wall-clock serialisation
+            // (the estimate can never lead the stream it waits on — measured in
+            // C4), so the gates are opened for this transport only. Every
+            // connection passes through here once — and again after
+            // `reconnect` — so one call covers each `Mcu` this section ever
+            // gets. Production links never take this branch, and `Mcu::for_test`
+            // (FrameMock) never reaches this object outside the tests below.
+            // (`object.rs` is touched because it is the only place that sees
+            // both the section's interface key and every live `Mcu`.)
+            // `KLIPPERX_KEEP_GATES=1` keeps the gates shut on the fake — a
+            // debug hatch for reproducing gate-vs-generation hazards against one
+            // corpus case (pair it with `KLIPPERX_UPSTREAM_FILTER=<name>`; the C4
+            // iqex follow-up reproduces in ~1.5 s that way).
+            if self.section.parameters.contains_key("test")
+                && std::env::var_os("KLIPPERX_KEEP_GATES").is_none()
+            {
+                mcu.open_send_gates();
+            }
+            let err = match self
+                .chip
+                .config()
+                .handshake(&mcu, &mut built, self.is_firmware_restart())
+                .await
+            {
+                Ok(configured) => return Ok((mcu, configured)),
+                Err(err) => err,
+            };
+            if !self.should_reset_and_retry(&err, resets) {
+                return Err(self.handshake_failure(&err));
+            }
+            resets += 1;
+            // The two ways in read differently on the console: a `ResetRequired`
+            // is the firmware's own plan, while a stop is a reboot that did not
+            // come up — worth a warning, because on the real board it is the
+            // signal that the retry is doing its job.
+            match self.connect_shutdown() {
+                Some(reason) => warn!(
+                    "MCU '{}': firmware is still shutdown after a reset ({reason}); \
+                     resetting again",
+                    config.name
+                ),
+                None => info!(
+                    "MCU '{}': resetting the firmware with the 'reset' command",
+                    config.name
+                ),
+            }
+            // `reset_and_flush` reports what the old connection said on its way
+            // out: a stop recorded there is still this bring-up's reason.
+            if let Err(err) = reset_and_flush(&mcu).await {
+                return Err(self.connect_failure(err));
+            }
+            // Let the rebooted firmware start before the port is reopened; the
+            // reopen races its startup otherwise (`RESET_SETTLE`).
+            tokio::time::sleep(RESET_SETTLE).await;
+            mcu = self.reconnect(config, mcu).await?;
+        }
+    }
+
     /// Report a firmware shutdown, restart, or already-stopped state.
     ///
     /// The events carry the reason; the machine is what knows what a stop
@@ -1005,7 +1155,7 @@ impl PrinterObject for McuObject {
             // it — so the port is retried until it comes back. A plain start
             // opens it once and reports the error, so a missing device is not
             // hidden behind a retry.
-            let mut mcu = if self.is_firmware_restart() {
+            let mcu = if self.is_firmware_restart() {
                 match self.open_and_connect(&config).await {
                     Ok(mcu) => mcu,
                     Err(err) => {
@@ -1061,11 +1211,11 @@ impl PrinterObject for McuObject {
             // what lets this connection be the only one, instead of identifying
             // the running firmware just to tell it to reboot
             // (`before_firmware_restart`; upstream's `_restart_via_command`,
-            // `klippy/mcu.py:729-747`). What is left for this loop is the
-            // firmware whose *only* reset is `reset` and that still carries a
+            // `klippy/mcu.py:729-747`). What is left for the handshake below is
+            // the firmware whose *only* reset is `reset` and that still carries a
             // configuration: no `config_reset` to clear it in place, so it has to
-            // be rebooted and re-identified here.
-            let mut reset_sent = false;
+            // be rebooted and re-identified here — with the in-place retries
+            // [`McuObject::handshake_with_in_place_resets`] owns.
 
             // The accumulated configuration is encoded once, and the handshake
             // can then be retried on a fresh connection if the firmware has to
@@ -1083,70 +1233,15 @@ impl PrinterObject for McuObject {
                     McuError::Config(message) => KlippyError::Config(ConfigError::new(message)),
                     other => KlippyError::Internal(other.to_string()),
                 })?;
-            let mut built = self.chip.config().build(&mcu).map_err(|err| match err {
+            let built = self.chip.config().build(&mcu).map_err(|err| match err {
                 // A config callback resolves pins/buses against the
                 // dictionary; a bad pin is a config problem, not klippy's.
                 McuError::Config(message) => KlippyError::Config(ConfigError::new(message)),
                 other => KlippyError::Internal(other.to_string()),
             })?;
-            let configured = loop {
-                // `test:` serves the corpus against the fake, whose clock only
-                // moves with wall time while the corpus' motion is virtual: a
-                // scheduling gate there degenerates into wall-clock
-                // serialisation (the estimate can never lead the stream it
-                // waits on — measured in C4), so the gates are opened for this
-                // transport only. Every connection passes through here once —
-                // and again after `reconnect` below — so one call covers each
-                // `Mcu` this section ever gets. Production links never take
-                // this branch, and `Mcu::for_test` (FrameMock) never reaches
-                // this object at all. (`object.rs` is touched because it is the
-                // only place that sees both the section's interface key and
-                // every live `Mcu`.)
-                // `KLIPPERX_KEEP_GATES=1` keeps the gates shut on the fake — a
-                // debug hatch for reproducing gate-vs-generation hazards
-                // against one corpus case (pair it with
-                // `KLIPPERX_UPSTREAM_FILTER=<name>`; the C4 iqex follow-up
-                // reproduces in ~1.5 s that way).
-                if self.section.parameters.contains_key("test")
-                    && std::env::var_os("KLIPPERX_KEEP_GATES").is_none()
-                {
-                    mcu.open_send_gates();
-                }
-                match self
-                    .chip
-                    .config()
-                    .handshake(&mcu, &mut built, self.is_firmware_restart())
-                    .await
-                {
-                    Ok(configured) => break configured,
-                    Err(McuError::ResetRequired) if !reset_sent => {
-                        // No `config_reset`, but the firmware can reboot itself:
-                        // send `reset` and re-run the handshake on the
-                        // connection that comes back.
-                        info!(
-                            "MCU '{}': resetting the firmware with the 'reset' command",
-                            config.name
-                        );
-                        // `reset_and_flush` reports what the old connection said
-                        // on its way out: a stop recorded there is still this
-                        // bring-up's reason.
-                        if let Err(err) = reset_and_flush(&mcu).await {
-                            return Err(self.connect_failure(err));
-                        }
-                        reset_sent = true;
-                        mcu = self.reconnect(&config, mcu).await?;
-                    }
-                    Err(McuError::ResetRequired) => {
-                        return Err(self.connect_failure(KlippyError::Connection(format!(
-                            "MCU '{}' still carries a configuration after a 'reset'",
-                            config.name
-                        ))));
-                    }
-                    Err(err) => {
-                        return Err(self.connect_failure(KlippyError::Connection(err.to_string())));
-                    }
-                }
-            };
+            let (mcu, configured) = self
+                .handshake_with_in_place_resets(&config, mcu, built)
+                .await?;
             // A board that just rebooted has a sequence that starts over and no
             // configuration: the transport had nothing to take over
             // (`Mcu::took_over_session`), and the firmware was neither configured
@@ -2122,10 +2217,15 @@ mod tests {
 
     /// A firmware dictionary with what the config phase needs, plus the two
     /// messages a stopped firmware reports itself with.
+    ///
+    /// `allocate_oids` / `finalize_config` / `get_config` use the ids the
+    /// `test:` fake's dictionary has (`linuxprocess.dict`), so a configuration
+    /// built on this one is accepted by the session a reopen brings up
+    /// (`test_a_reset_that_comes_back_stopped_is_reset_again_and_connects`).
     fn stopping_dictionary() -> Value {
         json!({
             "commands": {
-                "allocate_oids count=%c": 2,
+                "allocate_oids count=%c": 8,
                 "get_config": 7,
                 "finalize_config crc=%u": 6,
                 "reset": 30
@@ -2296,6 +2396,135 @@ mod tests {
             object.connect_shutdown(),
             None,
             "the session that comes up starts with a clean slot"
+        );
+    }
+
+    /// The retry that makes a real board's flaky reboot tolerable: a session the
+    /// reopen brings back **stopped** (a clock fault while it started) refuses
+    /// the configuration, so one reset is not enough — the bring-up has to
+    /// reset again instead of handing the shutdown to the user.
+    ///
+    /// The first session is a mock whose `get_config` is answered with
+    /// `is_shutdown`; the reopen brings up the `test:` fake, which accepts the
+    /// configuration. Nothing here is scripted through `connect` itself — it
+    /// opens the section's port — but the loop `connect` runs is the same one,
+    /// handed the session it starts from.
+    #[tokio::test]
+    async fn test_a_reset_that_comes_back_stopped_is_reset_again_and_connects() {
+        let manual = Arc::new(ManualReactor::new());
+        let reactor: Arc<dyn Reactor> = manual.clone();
+        let printer = Arc::new(Printer::new(Arc::clone(&reactor)));
+        printer
+            .add_object(PINS_OBJECT, Arc::new(PrinterPins::new()))
+            .unwrap();
+        let mut section = section(Some("mcu2"));
+        section.parameters.insert(
+            "test".to_string(),
+            ConfigValue::Single(format!(
+                "dict={}",
+                klipperx_test_support::test_dicts_dir()
+                    .join("linuxprocess.dict")
+                    .display()
+            )),
+        );
+        let object = Arc::new(McuObject::new(section, &printer).unwrap());
+        printer
+            .add_object(&object.section.identifier(), object.clone())
+            .unwrap();
+        let config = McuConfig::new(&ConfigWrapper::untracked(&object.section)).unwrap();
+
+        // The stopped session: `get_config` answered with `is_shutdown`, and
+        // `reset` scripted so `reset_and_flush` has something to send.
+        let mut get_config = Payload::new();
+        get_config.push_i16(7).unwrap();
+        let mut stopped = Payload::new();
+        stopped.push_i16(21).unwrap(); // is_shutdown
+        stopped.push_u16(3).unwrap(); // static_string_id 3 = "Timer too close"
+        let mut reset = Payload::new();
+        reset.push_i16(30).unwrap(); // reset
+        let device = FrameMock::new(vec![
+            MappingEntry {
+                input: Frame::new(0, get_config.into_raw()),
+                outputs: vec![Frame::new(0, stopped.into_raw())],
+            },
+            MappingEntry {
+                input: Frame::new(1, reset.into_raw()),
+                outputs: vec![],
+            },
+        ]);
+        let recorder = device.recorder();
+        let first = Arc::new(Mcu::for_test("mcu2", Interface::new(device)));
+        first
+            .install_dictionary(Dictionary::from_json(stopping_dictionary()).unwrap())
+            .unwrap();
+        object.chip.attach(Arc::clone(&first));
+        object.watch_connect_shutdown(&first).unwrap();
+        let built = object.chip.config().build(&first).unwrap();
+        let held = Arc::clone(&first);
+
+        let (mcu, _configured) = tokio::time::timeout(
+            Duration::from_secs(30),
+            object.handshake_with_in_place_resets(&config, first, built),
+        )
+        .await
+        .expect("the retry does not hang")
+        .expect("the connection the reset brings back accepts the configuration");
+
+        // The stop was retried, not reported: the reset went out on the stopped
+        // session, and the handshake finished on a new one.
+        let resets: Vec<_> = recorder
+            .frames()
+            .into_iter()
+            .filter(|frame| frame.payload() == [30u8].as_slice())
+            .collect();
+        assert_eq!(resets.len(), 1, "one reset on the stopped session");
+        assert!(!Arc::ptr_eq(&mcu, &held), "a new session, not the old one");
+    }
+
+    /// The retry is bounded: each round is a reboot, and the bring-up has to
+    /// hand the failure over at some point.
+    #[test]
+    fn test_a_come_back_stopped_is_retried_only_a_bounded_number_of_times() {
+        let object = object(Some("mcu2"));
+
+        // A clean slot: only `ResetRequired` — the firmware's own plan — is
+        // worth a reset.
+        assert!(object.should_reset_and_retry(&McuError::ResetRequired, 0));
+        assert!(!object.should_reset_and_retry(&McuError::NotIdentified, 0));
+
+        // With a stop recorded, any failed round is retried while resets are
+        // left...
+        note_connect_shutdown(&object.connect_shutdown, "mcu2", "Timer too close");
+        assert!(object.should_reset_and_retry(&McuError::NotIdentified, 0));
+        assert!(object.should_reset_and_retry(&McuError::NotIdentified, MAX_IN_PLACE_RESETS - 1));
+
+        // ...and is not, once they are spent.
+        assert!(!object.should_reset_and_retry(&McuError::NotIdentified, MAX_IN_PLACE_RESETS));
+        assert!(!object.should_reset_and_retry(&McuError::ResetRequired, MAX_IN_PLACE_RESETS));
+    }
+
+    /// The failure a spent bring-up hands over names the MCU and quotes the
+    /// firmware's own reason, not a response timeout.
+    #[test]
+    fn test_a_bring_up_that_runs_out_of_resets_reports_the_mcus_name_and_reason() {
+        let stopped_object = object(Some("mcu2"));
+        note_connect_shutdown(&stopped_object.connect_shutdown, "mcu2", "Timer too close");
+
+        let stopped = stopped_object
+            .handshake_failure(&McuError::NotIdentified)
+            .to_string();
+        assert!(stopped.contains("MCU 'mcu2'"), "{stopped}");
+        assert!(stopped.contains("Timer too close"), "{stopped}");
+
+        // A `ResetRequired` that outlived every reset keeps its own wording:
+        // the firmware kept carrying its configuration through them.
+        let carried_object = object(Some("mcu2"));
+        let carried = carried_object
+            .handshake_failure(&McuError::ResetRequired)
+            .to_string();
+        assert!(
+            carried.contains("MCU 'mcu2' still carries a configuration after a 'reset'"),
+            "{carried}"
         );
     }
 }

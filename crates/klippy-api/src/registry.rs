@@ -361,6 +361,18 @@ impl Api {
         Ok(())
     }
 
+    /// The key and instance values already registered for mux `path`.
+    ///
+    /// `None` when the path has no instances. The host-side `webhooks` object
+    /// uses this to reject a conflict with the same message it would produce
+    /// while buffering a first load, so one bad registration reads the same
+    /// before and after a reload.
+    pub fn mux_registrations(&self, path: &str) -> Option<(String, Vec<Option<String>>)> {
+        let mux = self.mux.read().expect("mux table is not poisoned");
+        let entry = mux.get(path)?;
+        Some((entry.key.clone(), entry.values.keys().cloned().collect()))
+    }
+
     /// Drop every mux registration, telling each instance to
     /// [`detach`](MuxEndpoint::detach) first.
     ///
@@ -1063,6 +1075,23 @@ mod tests {
         assert_eq!(
             dispatch(&api, r#"{"method":"p","params":{"k":"a"}}"#).unwrap(),
             json!("h1")
+        );
+    }
+
+    /// What a path already has, for the host-side checks (and their message).
+    #[test]
+    fn test_mux_registrations_reports_what_a_path_has() {
+        let api = Api::new();
+        assert_eq!(api.mux_registrations("p"), None);
+
+        api.register_mux("p", "k", Some("a"), Arc::new(Instance("a")))
+            .unwrap();
+        api.register_mux("p", "k", None, Arc::new(Instance("d")))
+            .unwrap();
+
+        assert_eq!(
+            api.mux_registrations("p"),
+            Some(("k".to_string(), vec![None, Some("a".to_string())]))
         );
     }
 

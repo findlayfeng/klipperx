@@ -193,7 +193,8 @@ impl BatchBulkHelper {
             Arc::new(MuxBatchEndpoint {
                 bulk: Arc::clone(self),
                 start_resp,
-                path: path.to_string(),
+                key: key.to_string(),
+                value: value.to_string(),
             }),
         )
     }
@@ -331,9 +332,11 @@ impl BatchBulkHelper {
 pub struct MuxBatchEndpoint {
     bulk: Arc<BatchBulkHelper>,
     start_resp: Value,
-    /// The mux path, so a request that arrives after [`detach`](Self::detach)
-    /// can be answered with the path it asked for.
-    path: String,
+    /// The mux key and instance value, so a request that arrives after
+    /// [`detach`](Self::detach) can be answered as the unknown instance it now
+    /// is.
+    key: String,
+    value: String,
 }
 
 impl MuxEndpoint for MuxBatchEndpoint {
@@ -353,11 +356,13 @@ impl MuxEndpoint for MuxBatchEndpoint {
                 .add_client(Arc::new(move |message: &Value| client.send(message)))
             {
                 // The registration is gone: a reload detached this instance
-                // after the request was routed to it, so the path is not served
-                // any more. Answer like the table would have — the client
-                // retries instead of waiting forever on a stream that will
-                // never run.
-                return Err(ApiError::UnknownEndpoint(self.path.clone()));
+                // after the request was routed to it. Answer like the table
+                // would have — the client retries instead of waiting forever on
+                // a stream that will never run.
+                return Err(ApiError::UnknownMuxValue {
+                    key: self.key.clone(),
+                    value: self.value.clone(),
+                });
             }
             Ok(self.start_resp.clone())
         })
@@ -1460,7 +1465,8 @@ mod tests {
         let endpoint = MuxBatchEndpoint {
             bulk: Arc::clone(&helper),
             start_resp: json!({ "header": "#x" }),
-            path: "sensors/dump".to_string(),
+            key: "sensor".to_string(),
+            value: "a".to_string(),
         };
 
         helper.add_client(Arc::new(|_message: &Value| true));
@@ -1478,7 +1484,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn test_a_detached_mux_endpoint_answers_unknown_endpoint() {
+    async fn test_a_detached_mux_endpoint_answers_unknown_mux_value() {
         // The window the `detached` flag closes: dispatch resolved this instance
         // just before a reload dropped its registration, so the request lands on
         // a helper that must not take a client. Answering as the emptied table
@@ -1492,12 +1498,13 @@ mod tests {
         let endpoint = MuxBatchEndpoint {
             bulk: Arc::clone(&helper),
             start_resp: json!({ "header": "#x" }),
-            path: "sensors/dump".to_string(),
+            key: "sensor".to_string(),
+            value: "a".to_string(),
         };
         endpoint.detach();
 
         let api = crate::core::klippy::api::registry::Api::new();
-        let request = Request::parse(br#"{"method":"sensors/dump","params":{}}"#)
+        let request = Request::parse(br#"{"method":"sensors/dump","params":{"sensor":"a"}}"#)
             .expect("test body is a valid request");
         let context = EndpointContext {
             api: &api,
@@ -1507,7 +1514,13 @@ mod tests {
             .handle(&request, &context)
             .await
             .expect_err("a detached instance takes no client");
-        assert_eq!(err, ApiError::UnknownEndpoint("sensors/dump".to_string()));
+        assert_eq!(
+            err,
+            ApiError::UnknownMuxValue {
+                key: "sensor".to_string(),
+                value: "a".to_string(),
+            }
+        );
         assert_eq!(helper.client_count(), 0);
     }
 }

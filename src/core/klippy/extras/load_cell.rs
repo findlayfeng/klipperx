@@ -234,6 +234,18 @@ pub struct LoadCell {
     state: Arc<LoadCellState>,
 }
 
+/// The converted-batch fan-out of one cell (`ApiClientHelper.client_cbs`),
+/// plus whether the `dump_force` mux instance was detached from the API table.
+///
+/// `detached` shares the callbacks' lock, so a request that resolved the
+/// instance just before a reload cannot add a client after the reload cleared
+/// them (the same window `BatchBulkHelper` closes with its `detached` flag).
+#[derive(Default)]
+struct FanOut {
+    callbacks: Vec<ClientCb>,
+    detached: bool,
+}
+
 /// Everything the callbacks and the interface share (`LoadCell`'s fields).
 struct LoadCellState {
     /// The section's last name segment (`config.get_name().split()[-1]`).
@@ -254,7 +266,7 @@ struct LoadCellState {
     force_buffer: Mutex<VecDeque<f64>>,
     /// The batch fan-out (`ApiClientHelper.client_cbs`): the force tracker
     /// plus every `dump_force` connection.
-    clients: Mutex<Vec<ClientCb>>,
+    clients: Mutex<FanOut>,
     /// Whether the sensor's client is attached (`_handle_do_ready`).
     sensor_client: Mutex<bool>,
 }
@@ -328,7 +340,7 @@ impl LoadCell {
             counts_per_gram,
             tare_counts: Mutex::new(tare_counts),
             force_buffer: Mutex::new(force_buffer),
-            clients: Mutex::new(Vec::new()),
+            clients: Mutex::new(FanOut::default()),
             sensor_client: Mutex::new(false),
         });
         // `load_cell/dump_force`, keyed by the section's name.
@@ -450,6 +462,7 @@ impl LoadCell {
             .clients
             .lock()
             .unwrap_or_else(|p| p.into_inner())
+            .callbacks
             .push(client);
     }
 
@@ -461,6 +474,7 @@ impl LoadCell {
             .clients
             .lock()
             .unwrap_or_else(|p| p.into_inner())
+            .callbacks
             .len()
     }
 
@@ -670,6 +684,7 @@ impl LoadCellSampleCollector {
             .clients
             .lock()
             .unwrap_or_else(|p| p.into_inner())
+            .callbacks
             .push(Arc::new(move |message: &Value| {
                 let mut guard = inner.lock().unwrap_or_else(|p| p.into_inner());
                 accumulate(&mut guard, message)
@@ -810,7 +825,7 @@ impl LoadCellState {
     /// (`ApiClientHelper.send`), dropping clients that are gone.
     fn send(&self, message: &Value) {
         let mut clients = self.clients.lock().unwrap_or_else(|p| p.into_inner());
-        clients.retain(|client| client(message));
+        clients.callbacks.retain(|client| client(message));
     }
 
     /// `_sensor_data_event`: map `[time, counts, adc]` rows to
@@ -909,6 +924,7 @@ impl LoadCellState {
         self.clients
             .lock()
             .unwrap_or_else(|p| p.into_inner())
+            .callbacks
             .push(Arc::new(move |message: &Value| {
                 if let Some(state) = tracker.upgrade() {
                     state.track_force(message);
@@ -957,31 +973,34 @@ impl MuxEndpoint for DumpForceEndpoint {
                 target: Arc::clone(&context.client),
                 template,
             };
-            state
-                .clients
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
+            let mut clients = state.clients.lock().unwrap_or_else(|p| p.into_inner());
+            if clients.detached {
+                // The registration is gone: a reload detached this instance
+                // after the request was routed to it. Answer like the table
+                // would have, so the client retries instead of waiting on a
+                // stream that will never run.
+                return Err(ApiError::UnknownMuxValue {
+                    key: DUMP_KEY.to_string(),
+                    value: state.name.clone(),
+                });
+            }
+            clients
+                .callbacks
                 .push(Arc::new(move |message: &Value| pusher.send(message)));
+            drop(clients);
             Ok(self.start_resp.clone())
         })
     }
 
     /// Dropping this registration unregisters every converted-batch client of
     /// the cell, so the next fan-out pushes nothing to the gone configuration's
-    /// connections.
-    ///
-    /// A request that resolved this instance just before the reload can still
-    /// land a client after the clear. Unlike `MuxBatchEndpoint` there is
-    /// nothing to re-animate: the fan-out is driven by the sensor's own batch
-    /// loop, which stops with the configuration, so that client simply gets no
-    /// data instead of a revived stream.
+    /// connections, and marks the fan-out detached so a request that resolved
+    /// this instance just before the reload cannot add a client afterwards.
     fn detach(&self) {
         if let Some(state) = self.state.upgrade() {
-            state
-                .clients
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .clear();
+            let mut clients = state.clients.lock().unwrap_or_else(|p| p.into_inner());
+            clients.detached = true;
+            clients.callbacks.clear();
         }
     }
 }
@@ -1241,6 +1260,42 @@ mod tests {
         // A cell that is already gone is a no-op, not a panic.
         drop(cell);
         endpoint.detach();
+    }
+
+    /// A request routed to the instance just before its reload is answered as
+    /// the unknown instance it now is, instead of subscribing the client to a
+    /// fan-out the reload already cleared.
+    #[tokio::test]
+    async fn test_a_detached_dump_force_endpoint_answers_unknown_mux_value() {
+        let printer = printer();
+        let cell = LoadCell::new(&wrap(Some("my_cell"), &HX711_CHIP), &printer).unwrap();
+        let endpoint = DumpForceEndpoint {
+            state: Arc::downgrade(&cell.state),
+            start_resp: json!({ "header": DUMP_HEADER }),
+        };
+        endpoint.detach();
+
+        let api = crate::core::klippy::api::registry::Api::new();
+        let request = Request::parse(
+            br#"{"method":"load_cell/dump_force","params":{"load_cell":"my_cell"}}"#,
+        )
+        .expect("test body is a valid request");
+        let context = EndpointContext {
+            api: &api,
+            client: crate::core::klippy::api::test_support::silent_target(),
+        };
+        let err = endpoint
+            .handle(&request, &context)
+            .await
+            .expect_err("a detached instance takes no client");
+        assert_eq!(
+            err,
+            ApiError::UnknownMuxValue {
+                key: DUMP_KEY.to_string(),
+                value: "my_cell".to_string(),
+            }
+        );
+        assert_eq!(cell.client_count(), 0);
     }
 
     /// The corpus options of `[load_cell my_ads131m02]`.

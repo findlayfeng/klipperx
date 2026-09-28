@@ -73,6 +73,19 @@ impl PendingCalls {
         true
     }
 
+    /// Drop **every** in-flight call, so each waiter returns at once.
+    ///
+    /// Dropping a registration drops its `oneshot::Sender`, which resolves the
+    /// waiter with `Err(RecvError)` — the "receiver dropped" outcome
+    /// [`Mcu::call`](super::Mcu::call) already reports as a send failure, not
+    /// the timeout it would otherwise sit out. Used when the connection itself
+    /// has made every waiting call moot: a firmware that reported a stop during
+    /// the connect handshake will not answer any of them.
+    pub(crate) async fn abort_all(&self) {
+        let mut calls = self.calls.lock().await;
+        calls.clear();
+    }
+
     /// Drop the oldest call registered for `response_name`, if any.
     ///
     /// Used to clean up after a send failure, a dropped receiver, or a timeout,
@@ -145,6 +158,30 @@ mod tests {
         assert_eq!(rx1.await.unwrap(), vec![ArgValue::UInt32(1)]);
         assert_eq!(rx2.await.unwrap(), vec![ArgValue::UInt32(2)]);
         assert_eq!(calls.len().await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_abort_all_wakes_every_waiter_at_once() {
+        // The registrations go, and with them their senders: each waiter
+        // resolves with the dropped-receiver outcome instead of waiting out its
+        // own timeout.
+        let calls = PendingCalls::new();
+        let (config_tx, config_rx) = oneshot::channel();
+        let (clock_tx, clock_rx) = oneshot::channel();
+
+        calls.register("config".to_string(), config_tx).await;
+        calls.register("clock".to_string(), clock_tx).await;
+        calls.abort_all().await;
+
+        assert_eq!(calls.len().await, 0);
+        for (response, rx) in [("config", config_rx), ("clock", clock_rx)] {
+            let outcome = tokio::time::timeout(std::time::Duration::from_millis(50), rx)
+                .await
+                .expect("each waiter returns at once, not after a timeout");
+            assert!(outcome.is_err(), "'{response}': the sender was dropped");
+        }
+        // Nothing is left for a late response to be mis-delivered to.
+        assert!(!calls.resolve("config", &params()).await);
     }
 
     #[tokio::test]

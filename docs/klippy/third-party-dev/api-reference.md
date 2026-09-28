@@ -69,7 +69,7 @@
 > `objects/*` / 五个 `gcode/*` / `query_endstops/status`）**已实现**；第 13–15 节
 > （`pause_resume/*`）与第 17–18 节（`bed_mesh/dump_mesh`、`*/dump_*`）**部分落地**——截至
 > 2026-09-25（批 #15）：`pause_resume` 对象与 `[buttons]` 最小实现已落地，且 `[pause_resume]` 节注册了
-> `PAUSE`/`RESUME`/`CLEAR_PAUSE`/`CANCEL_PRINT` 四条命令；但 `pause_resume/*` 端点仍未注册；`*/dump_*` 的 mux 机制与 `ldc1612` / `adxl345` / `mpu9250` 三个消费者已落地，
+> `PAUSE`/`RESUME`/`CLEAR_PAUSE`/`CANCEL_PRINT` 四条命令；但 `pause_resume/*` 端点仍未注册；`*/dump_*` 的 mux 机制与 `ldc1612` / `adxl345` / `mpu9250` / `load_cell`（`dump_force`）四个消费者已落地（实例随配置重载注销并在下一轮重新注册，旧连接不再收到推送），
 > `bed_mesh/dump_mesh` 与其余 dump 端点随各自的 extras 落地。调用未实现的端点会得到 `unknown method` 错误。本文描述的是目标形状，
 > 实现随模块推进。
 

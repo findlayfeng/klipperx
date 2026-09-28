@@ -228,7 +228,7 @@ identify 的命令**定义**（名称、参数、解码）与其它命令一样�
 
 一台机器一个实例：它持有配置装载出来的 printer objects，并管理自己的生命周期（bring up、状态、停机、空闲直到退出）。对应上游 `klippy/klippy.py` 的 `Printer`，骨架与装载拆在 `printer.rs` 与 `load.rs` 两个文件。
 
-`PrinterObject::release_cycles()`：`teardown()` 在**丢弃部件之前**对每个部件调用它，用来打断「部件相互强引用」的环——环存在时 `Drop` 永远不会跑，被环拴住的 `Mcu` 会让接收任务的阻塞读一直挂着、共享 runtime 收不了尾（`McuObject` 覆写它清事件表；`Drop` 里再调一次兜底）。
+`PrinterObject::release_cycles()`：`teardown()` 在**丢弃部件之前**对每个部件调用它，用来打断「部件相互强引用」的环——环存在时 `Drop` 永远不会跑，被环拴住的 `Mcu` 会让接收任务的阻塞读一直挂着、共享 runtime 收不了尾（`McuObject` 覆写它清事件表；`Drop` 里再调一次兜底）；`WebhooksStatus` 也覆写它——配置被重建时经 `Api::clear_mux()` 注销该配置的 mux 实例（逐个 `detach`），让下一轮装载重新注册。
 
 | 项 | 职责 |
 |------|------|
@@ -284,7 +284,7 @@ identify 的命令**定义**（名称、参数、解码）与其它命令一样�
 | `bltouch.rs` | `[bltouch]`：BLTouch 探针。`control_pin`（PWM 占空比即单线协议，按上游 `Commands` 表发命令）+ `sensor_pin`（endstop）；connect 按上游 raise+verify；把自己注册为 `probe` 对象与 `probe` 虚拟 chip（复用 `probe.rs` 的会话/chip 件，`endstop` 已是 `Arc<dyn HomingEndstop>`），注册 `BLTOUCH_DEBUG`（`COMMAND`）/`BLTOUCH_STORE`（`MODE`），探针族三命令复用 `probe.rs` 的注册路径；`home_start` 夹 `ENDSTOP_REST_TIME` 并在触发后按 `multi` 抬针 |
 | `screws_tilt_adjust.rs` | `[screws_tilt_adjust]` 与 `SCREWS_TILT_CALCULATE`：逐螺丝测床面、按 `screw_thread` 螺距把偏差折成 `HH:MM` 圈数（对应上游 `screws_tilt_adjust.py`） |
 | `trigger_analog.rs` | trigger_analog 主机侧 design 半边（上游同名文件 L11-110）：`to_fixed_32` / `calc_frac_bits` 定点转换、`GeneratedSOS` 表生成、`DigitalFilter` 低通/导数设计；无 `section!`（非配置段），与 `cmd/trigger_analog.rs`、`mcu/resource/trigger_analog.rs` 构成三件套（M5b） |
-| `bulk_sensor.rs` | 批读框架（工单 H6，对应上游 `bulk_sensor.py`）：`FixedFreqReader`（状态应用/块切片/16 位序号回绕）、`BatchBulkHelper`（首客户端启动批循环、末客户端停）、`ClockSyncRegression`（EMA 时钟回归）、`MuxBatchEndpoint`/`WebhooksBatchClient`（`response_template` 推送；mux 注销时 `MuxBatchEndpoint::detach` → `BatchBulkHelper::stop()` 清客户端停流）与按 oid 路由的 `BulkDataRegistry` |
+| `bulk_sensor.rs` | 批读框架（工单 H6，对应上游 `bulk_sensor.py`）：`FixedFreqReader`（状态应用/块切片/16 位序号回绕）、`BatchBulkHelper`（首客户端启动批循环、末客户端停）、`ClockSyncRegression`（EMA 时钟回归）、`MuxBatchEndpoint`/`WebhooksBatchClient`（`response_template` 推送；mux 注销时 `MuxBatchEndpoint::detach` → `BatchBulkHelper::stop()` 标记 detached、清客户端、拒绝新客户端并停流，且不再对已消失的配置跑 stop 回调）与按 oid 路由的 `BulkDataRegistry` |
 | `ldc1612.rs` | LDC1612 传感器库对象（对应上游 `ldc1612.py`，**无配置段**，由 probe_eddy_current 构造——该接线随 M5d 落地生效）：I2C 复用 `setup_i2c`、`config_ldc1612[_with_intb]` + restart `query_ldc1612`、`freq_conv`/`sensor_div` 换算、`convert_samples` 错误分支、`LDC_CALIBRATE_DRIVE_CURRENT`（mux `CHIP=`，`reg_drive_current` 提取）、`dump_ldc1612` 端点与 `setup_trigger_analog`→`ldc1612_attach_trigger_analog` 绑定 |
 | `axis_twist_compensation.rs` | `[axis_twist_compensation]`：按 X/Y 位置插值 Z 补偿，经 **`probe:update_results` 载荷**（`ProbeResultsHandle`，批 #36 新增）原地改上报 Z；`AXIS_TWIST_COMPENSATION_CALIBRATE` 校准向导 |
 | `gcode_button.rs` | `[gcode_button <name>]` 数字路径（`pin`/`press_gcode`/`release_gcode`/`debounce_delay`、`QUERY_BUTTON`、`get_status`）；gap：固件按钮查询未接、`analog_range` 明确拒绝（无 `query_adc`，批 #37） |
@@ -369,7 +369,7 @@ identify 的命令**定义**（名称、参数、解码）与其它命令一样�
 |------|------|
 | `mod.rs` | 说明主机侧与 API 的分界，把 `klippy-api` 的四个模块转出，并提供 `register`：一次把服务器这一侧（`webhooks` + 端点）装到机器上。端点来自各模块 `endpoint!` 声明生成的安装函数表（[声明式表生成](codegen.md)），`register` 只负责先装 `webhooks` 再遍历该表 |
 | `endpoints/` | 一个端点一个文件：`info.rs`、`emergency_stop.rs`、`objects_list.rs`、`objects_query.rs`、`objects_subscribe.rs`、`gcode.rs`、`query_endstops.rs`、`register_remote_method.rs`（共 12 条注册路径 + 内建 `list_endpoints` = 13 条，见 `api/mod.rs` 的测试断言）；参数、响应形状、handler 与安装函数都在各文件里。`objects/query` 与 `objects/subscribe` 共用字段选择（`select_fields` / `status_object`），`gcode/*` 按请求从 `printer` 里取 `gcode`（例外：`gcode/restart` / `gcode/firmware_restart` 在 `gcode` 缺席时直接 `request_exit`，让配置没装载成功时仍能重启）。未实现的表面（`pause_resume/*`、`bed_mesh/dump_mesh`、其余 `*/dump_*`）见 `endpoints/mod.rs` 的状态表 |
-| `webhooks.rs` | 服务器自己的打印机对象：名字与字段对齐上游 `webhooks.get_status`，读的是机器状态 |
+| `webhooks.rs` | 服务器自己的打印机对象：名字与字段对齐上游 `webhooks.get_status`，读的是机器状态；同时是 mux 表的生命周期驱动者——初始装载缓冲 `pending`、`api::register` 只抽干一次、`set_api` 后直连注册、`release_cycles`（teardown）时 `clear_mux()` |
 | `start_args.rs` | 主机启动参数（`config_file` / `log_file` / `software_version` / `cpu_info`）：上游放在 printer 上（29 处 `get_start_args`），这里归主机侧，`info` 是第一个消费者 |
 
 API 本身在 `crates/klippy-api/src/`：

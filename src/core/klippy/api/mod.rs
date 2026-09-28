@@ -103,6 +103,15 @@ include!(concat!(env!("OUT_DIR"), "/endpoint_installers.rs"));
 /// served before its objects are registered is one a client can observe only
 /// halfway up, and no client can provoke a duplicate registration to find out.
 ///
+/// # One call per process
+///
+/// The mux registrations the config made while it was read are **moved** into
+/// the table here — the `webhooks` object's one drain — and after that modules
+/// register straight into the table itself (`WebhooksStatus::set_api`). A
+/// second call on a fresh [`Api`] would therefore start with no mux endpoints.
+/// Build the table once, as `run` does; a host that ever rebuilds its server
+/// would have to move the registrations across instead of draining them.
+///
 /// # Errors
 /// Returns [`RegistrationError`] if a name or a path is already taken — a
 /// wiring mistake in klippy, never something a client can cause.

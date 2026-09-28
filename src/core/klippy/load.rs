@@ -154,9 +154,12 @@ impl Printer {
     ///
     /// This is not the first thing that happens to a fresh machine. The API
     /// server's own object (`webhooks`) is registered *before* the config is
-    /// loaded, so that `objects/list` starts with it as upstream's does (see
+    /// loaded, so that `objects/list` starts with it (see
     /// [`api::register`](crate::core::klippy::api::register)); a host that loads
-    /// first and registers it afterwards reorders that list.
+    /// first and registers it afterwards reorders that list. Upstream's list
+    /// starts with its *early* objects instead (`gcode`, `gcode_io`, `webhooks`,
+    /// `klippy/klippy.py:38-40`, `gcode.py:492-494`): here `gcode` is built by
+    /// this load, so it comes after `webhooks`.
     ///
     /// [`GCodeDispatch`](crate::core::klippy::gcode::GCodeDispatch) comes first
     /// of all, because `pins` sections and resources register commands with it

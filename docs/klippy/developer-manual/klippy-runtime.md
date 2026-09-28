@@ -269,8 +269,11 @@ run() 返回 ──▶ res = firmware_restart│restart ──▶ 主循环下�
 `firmware_restart` 的下一轮先 `reset_for_restart()`（丢掉配置装载的部件，保留 `webhooks` 等宿主
 对象），再**从磁盘重读配置文件** → `load_config` → `bring_up`（`src/klippy.rs` 的
 `klippy_process`）。文件读不到或解析失败时打印机进 `error`（消息即失败原因，进程不退出），
-修好后再发一次 `RESTART` 即可。注意两处本仓差异：`start_reason` 尚未随重启更新；含 mux 端点的
-配置第二次重启会因注册表重复而失败（既有缺陷，见 `TODO.md` 的 R1）。
+修好后再发一次 `RESTART` 即可。注意本仓差异：含 mux 端点的配置第二次重启会因注册表重复而失败
+（既有缺陷，见 `TODO.md` 的 R1）。另有一处 `start_reason` 表示差异：上游主循环每轮把它写回
+`start_args` 字典、`mcu.py` 从字典读（`klippy.py:368`、`mcu.py:682`/`:1060`）；本仓由
+`reset_for_restart` 更新在 `Printer::start_reason()` 上，MCU 读的正是它（语义一致），而
+`StartArgs.start_reason` 停在 `"startup"` 且当前无人读（见 `TODO.md` D1）。
 
 ## 客户端侧
 

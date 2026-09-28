@@ -333,7 +333,7 @@ $ klippy-client api -a /tmp/klippy_uds gcode/script '{"script": "M115"}'
 | `--api-server: unknown scheme 'http://'` | 把 Moonraker 的 HTTP 端口当成 API 地址了 | 换成 socket 路径或 `tcp:主机:端口`；`7125` 是 Moonraker 的，不是这里的 |
 | 应答是 `webhooks: No registered callback for path '…'` | 主机没有这个端点（见上一节的状态说明） | 用 `list_endpoints` 看主机现在有什么 |
 | 敲了请求，一直没有任何输出 | 请求里写了 `"id": null`，按约定不会有应答 | 去掉 `id`，或让客户端自己补 |
-| `the API server closed the connection` | 主机重启或关机了（`RESTART`、`FIRMWARE_RESTART`、故障停机） | 客户端不会自动重连，重新打开一次即可 |
+| `the API server closed the connection` | 主机进程没了（`^C`/`SIGTERM`、`--tui` 窗口关闭、致命错误退出） | 客户端不会自动重连，重新打开一次即可。注意 `RESTART`/`FIRMWARE_RESTART` **不断连接**：主机就地重建打印机，连接与订阅全程有效 |
 | `no reply to '…' within 10s` | 主机在，但那个端点没应答 | 多半是端点卡住或没实现；`--timeout` 可以调 |
 
 ---

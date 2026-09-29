@@ -750,7 +750,7 @@ pins: !PD0, PD1, PD2
 | `rename_existing` | — | 被改名的命令（仅 load 期同型检查，连接期换名未做） |
 | `variable_<名>` | — | 字面量，`get_status` 可见（只读） |
 
-宏即命令（大写注册）；**宏体已渲染执行**（批 #4：受控子集引擎，渲染后经 gcode 派发）；`SET_GCODE_VARIABLE` 已注册（变量可写）；裸 `[gcode_macro]` 为共享模板持有者（零选项）。**`{% set %}` 已支持**（批 #9：顶层可见、`if` 块外泄、`for` 块不外泄，作用域对齐 Jinja2 3.1.6）；其余子集外构（`float`/`default(x)` 过滤器等）仍显式报错（缺口见 `extras/template.rs` 模块文档），完整 Jinja 保真仍属 H3。
+宏即命令（大写注册）；**宏体已渲染执行**（渲染引擎是 `extras/template.rs` 的 **minijinja 2.24 适配层**：单花括号定界符 `{`/`{%`/`{#}`、缺键即报错、装载期编译，渲染后经 gcode 派发）；`SET_GCODE_VARIABLE` 已注册（变量可写）；裸 `[gcode_macro]` 为共享模板持有者（零选项）。`{% set %}` 作用域对齐 Jinja2 3.1.6（顶层/`if` 块外泄、`for` 块不外泄）；`namespace()`、关键字实参、`{% block %}`、`|float(默认)` 等 Jinja2 构型均可解析（仓库同名 `config.cfg` 的三个步进宏即实测用例）。仍缺的在缝上：`rename_existing` 连接期换名与读 `printer.objects`。与 Jinja2 的已知差异（`%`/`//` 为欧几里得取余、Strict 下缺键在打印/迭代/判真时报错、部分错误 detail 措辞）见 `extras/template.rs` 模块文档。
 
 ### [led <name>] / [neopixel <name>] / [dotstar <name>] / [pca9533 <name>] / [pca9632 <name>] / [display_template <name>]
 
@@ -763,7 +763,7 @@ pins: !PD0, PD1, PD2
 | `i2c_*`（bus 选项组） | `pca9533`/`pca9632` | I2C 地址/速率等（`bus.py:302`）；`pca9632` 另有 `color_order` |
 | `text`、`param_*` | `display_template` | 模板文本与参数（惰性对象，`is_queryable=false`） |
 
-六段已落地（2026-09-24 批 #2）；`SET_LED`/`SET_LED_TEMPLATE` 未注册（H3/H8），模板 `text` 不渲染（随 U-A7b）。
+六段已落地（2026-09-24 批 #2）；`SET_LED`/`SET_LED_TEMPLATE` 未注册（H3/H8），模板 `text` 不渲染（渲染引擎已在 `extras/template.rs`，缺的是 `SET_LED_TEMPLATE` 这条缝）。
 
 ### [extruder_stepper <name>]
 
@@ -777,7 +777,7 @@ pins: !PD0, PD1, PD2
 
 ### [exclude_object]
 
-零选项段（上游 `exclude_object.py:16-46`）。装载时注册 `EXCLUDE_OBJECT_START`/`_END`/`EXCLUDE_OBJECT`/`EXCLUDE_OBJECT_DEFINE` 四命令并持有对象状态；排除区内移动被 `MoveTarget` 变换丢弃，**离区时按上游扣被丢弃 prime 段的 E**（`offset[3]`/`extruder_adj`，批 #4）。已随 U-A7b 宏体渲染转绿（2026-09-24）。
+零选项段（上游 `exclude_object.py:16-46`）。装载时注册 `EXCLUDE_OBJECT_START`/`_END`/`EXCLUDE_OBJECT`/`EXCLUDE_OBJECT_DEFINE` 四命令并持有对象状态；排除区内移动被 `MoveTarget` 变换丢弃，**离区时按上游扣被丢弃 prime 段的 E**（`offset[3]`/`extruder_adj`，批 #4）。相关语料用例已转绿（2026-09-24）。
 
 ### [virtual_sdcard] / [display_status] / [homing_override] / [sdcard_loop]
 
@@ -796,7 +796,7 @@ pins: !PD0, PD1, PD2
 | `primary_carriage`（generic 形态，**可选**） | 无它 = 该轴的**主动滑架**（`axis` 必填、无 `safe_distance`）；有它 = 从动滑架（`axis` 可选、仅作交叉校验，`safe_distance` 生效）。同主滑架的两个 dual 会报重（按**主滑架名**判，非按轴）；`[extra_carriage <name>]` 的 `primary_carriage` **仍必填**（批 #27） |
 | 电机组 | 经 `PrinterStepper`（同上游 `LookupMultiRail`） |
 
-cartesian 在 late 阶段认领；注册 `dual_carriage` 对象与 `SET_DUAL_CARRIAGE`/`SAVE_…_STATE`/`RESTORE_…_STATE`。**轨间坐标交接已实现**（批 #4，`toggle_active_dc_rail` 语义：切换/恢复携带 gcode 坐标）；步进仍仅主轨（`updateLimits` 未移植，C1）。已随 U-A7b 转绿（2026-09-24）。**generic 形态**（批 #12）：`[carriage <name>]`/`[dual_carriage <name>]`/`[extra_carriage <name>]`/`[stepper <name>]` 由运动学注册同一对象与三命令（`dual_carriage` status 报 `active_carriage` + `carriages`），`[printer]` 的 `max_z_velocity/max_z_accel` 经 `carriage::build` 进入 generic 归零（原写死 0 为首因）。
+cartesian 在 late 阶段认领；注册 `dual_carriage` 对象与 `SET_DUAL_CARRIAGE`/`SAVE_…_STATE`/`RESTORE_…_STATE`。**轨间坐标交接已实现**（批 #4，`toggle_active_dc_rail` 语义：切换/恢复携带 gcode 坐标）；步进仍仅主轨（`updateLimits` 未移植，C1）。已转绿（2026-09-24）。**generic 形态**（批 #12）：`[carriage <name>]`/`[dual_carriage <name>]`/`[extra_carriage <name>]`/`[stepper <name>]` 由运动学注册同一对象与三命令（`dual_carriage` status 报 `active_carriage` + `carriages`），`[printer]` 的 `max_z_velocity/max_z_accel` 经 `carriage::build` 进入 generic 归零（原写死 0 为首因）。
 
 ### [servo <name>]
 
@@ -933,7 +933,7 @@ gap（如实登记）：**屏幕内容不渲染**（`display_template`/`display_
 
 ### `[fan_generic <name>]` — 通用风扇（批 #18）
 
-本身不读选项：整节交给 `[fan]` 的核心（`pin`/`max_power`/`kick_start_time`/`off_below`/`cycle_time`/`hardware_pwm`/`shutdown_speed`/`enable_pin`/`tachometer_*`；**`shutdown_speed` 默认 `0.0`**，与 `[heater_fan]` 的 1.0 不同）；节名即 mux 值，注册 `SET_FAN_SPEED FAN=<name> SPEED=<0..1>`。`TEMPLATE=` 形式**未实现**（模板求值器未落地，调用报明确拒绝）。
+本身不读选项：整节交给 `[fan]` 的核心（`pin`/`max_power`/`kick_start_time`/`off_below`/`cycle_time`/`hardware_pwm`/`shutdown_speed`/`enable_pin`/`tachometer_*`；**`shutdown_speed` 默认 `0.0`**，与 `[heater_fan]` 的 1.0 不同）；节名即 mux 值，注册 `SET_FAN_SPEED FAN=<name> SPEED=<0..1>`。`TEMPLATE=` 形式**未实现**（渲染引擎已在 `extras/template.rs`，但这条缝未接，调用报明确拒绝）。
 
 ### `[idle_timeout]` — 空闲超时（批 #21）
 

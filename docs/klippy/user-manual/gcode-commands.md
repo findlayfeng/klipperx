@@ -422,7 +422,7 @@ SET_DIGIPOT DIGIPOT=<name> [WIPER=<0..scale>]
 ```
 SET_FAN_SPEED FAN=<name> SPEED=<0..1>
 ```
-每个 `[fan_generic <name>]` 注册一个 `FAN` 值。`SPEED` 与 `TEMPLATE` 必须恰给一个，否则报 `SET_FAN_SPEED must specify SPEED or TEMPLATE`；`TEMPLATE=` 形式未实现（模板求值器未落地）。
+每个 `[fan_generic <name>]` 注册一个 `FAN` 值。`SPEED` 与 `TEMPLATE` 必须恰给一个，否则报 `SET_FAN_SPEED must specify SPEED or TEMPLATE`；`TEMPLATE=` 形式未实现（渲染引擎已在 `extras/template.rs`，这条缝未接）。
 
 ### SET_PIN — 设置引脚值（多路键 `PIN`）
 
@@ -548,7 +548,7 @@ SET_PIN PIN=pwm_fan VALUE=0.25  ; PWM：25% 占空比
 
 ### G-Code 宏命令（由 `[gcode_macro <名>]` 注册）
 
-每个 `[gcode_macro <名>]` 段在装载时以**大写宏名**注册为一条命令（help = `description`）。**宏体已渲染执行**（批 #4 受控子集引擎 `extras/template.rs`，渲染后经 gcode 派发）；`SET_GCODE_VARIABLE` 已注册；**`{% set %}` 已支持**（批 #9，作用域对齐 Jinja2）；其余子集外构（过滤器等）显式报错，完整 Jinja 属 H3。
+每个 `[gcode_macro <名>]` 段在装载时以**大写宏名**注册为一条命令（help = `description`）。**宏体已渲染执行**：渲染引擎是 `extras/template.rs` 的 **minijinja 2.24 适配层**（单花括号定界符、缺键即报错、装载期编译），渲染后回 gcode 派发；`SET_GCODE_VARIABLE` 已注册；`{% set %}` 作用域对齐 Jinja2；`namespace()`、关键字实参、`{% block %}`、`|float(默认)` 等构型均可解析（含 `config.cfg` 步进宏的实测用例）。与 Jinja2 的已知差异与错误 detail 措辞见 `extras/template.rs` 模块文档。
 
 ### QUERY_ENDSTOPS / M119
 
@@ -749,7 +749,7 @@ SPI_SEND     DEVICE=flash DATA=04          // spi send ok
 | `SAVE_DUAL_CARRIAGE_STATE` | `NAME=<名>` | 保存当前滑架状态 |
 | `RESTORE_DUAL_CARRIAGE_STATE` | `NAME=<名>`、`MOVE=<0..1>` | 恢复（含恢复移动的完整语义未移植） |
 
-错误措辞对上游 `idex_modes.py:240/283/295`；`T0`/`T1` 宏驱动的切换用例转绿前置=U-A7b 宏体渲染。
+错误措辞对上游 `idex_modes.py:240/283/295`；`T0`/`T1` 宏驱动的切换用例已随宏体渲染引擎转绿。
 
 ### EXCLUDE_OBJECT 族 — 打印对象排除（由 `[exclude_object]` 注册）
 
@@ -760,7 +760,7 @@ SPI_SEND     DEVICE=flash DATA=04          // spi send ok
 | `EXCLUDE_OBJECT` | 按名/当前排除、RESET 或列表（:215-238） |
 | `EXCLUDE_OBJECT_DEFINE` | 定义对象（CENTER/POLYGON）或重置文件（:240-267） |
 
-参数与错误文案对上游；`[gcode_macro M486]` 的宏体驱动用例已随 U-A7b 引擎转绿（批 #4，含排除区 E 补偿）。
+参数与错误文案对上游；`[gcode_macro M486]` 的宏体驱动用例已转绿（2026-09-24，含排除区 E 补偿）。
 
 ### 传统命令
 

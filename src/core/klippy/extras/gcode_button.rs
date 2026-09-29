@@ -90,8 +90,8 @@ impl GCodeButton {
     /// (`gcode_button.py:9-25`).
     ///
     /// # Errors
-    /// A missing `pin` / `press_gcode`, a template outside
-    /// [`template`](crate::core::klippy::extras::template)'s subset, or a
+    /// A missing `pin` / `press_gcode`, a template
+    /// [`template`](crate::core::klippy::extras::template) refuses to compile, or a
     /// section that sets `analog_range` (read and validated first, then
     /// refused — see the module docs).
     fn new(config: &ConfigWrapper, printer: &Arc<Printer>) -> Result<Self, ConfigError> {

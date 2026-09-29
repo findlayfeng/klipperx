@@ -91,8 +91,8 @@ impl DelayedGcode {
     /// (`delayed_gcode.py:16-33`).
     ///
     /// # Errors
-    /// A missing `gcode`, an `initial_duration` below 0, a template outside
-    /// [`template`](crate::core::klippy::extras::template)'s subset, a
+    /// A missing `gcode`, an `initial_duration` below 0, a template
+    /// [`template`](crate::core::klippy::extras::template) refuses to compile, a
     /// `gcode_macro` object that cannot be created, or a taken command name.
     fn new(config: &ConfigWrapper, printer: &Arc<Printer>) -> Result<Arc<Self>, ConfigError> {
         let name = config

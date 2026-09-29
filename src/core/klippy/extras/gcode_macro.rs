@@ -776,8 +776,8 @@ mod tests {
     }
 
     /// A `{% set %}` body loads and renders — this pin used to refuse `set`
-    /// at load; a statement outside [`template`]'s subset is still refused
-    /// when the section loads, with upstream's `Error loading template` frame
+    /// at load; an unknown statement is still refused when the section loads,
+    /// with upstream's `Error loading template` frame
     /// (`gcode_macro.py:61-66`).
     #[test]
     fn a_set_body_loads_and_renders_but_an_unknown_statement_fails() {
@@ -812,18 +812,19 @@ mod tests {
             "the rendered body reached the receiver"
         );
 
-        // A statement outside it is refused at load.
-        let sect = section("BADSTMT", &[("gcode", "{% block body %}")]);
+        // An unknown statement is refused at load. `{% block %}` used to stand
+        // in here; the template engine parses it now, exactly as the Jinja2 of
+        // `gcode_macro.py:82` does, so the fixture is a tag no Jinja2 has —
+        // which keeps what this assertion is about: not a tag this host
+        // happens to omit, but a statement nobody defines.
+        let sect = section("BADSTMT", &[("gcode", "{% foo %}")]);
         let config = ConfigWrapper::untracked(&sect);
         let error = GCodeMacro::new(&config, &printer)
-            .expect_err("the subset does not carry `block`")
+            .expect_err("no Jinja2 defines `foo`")
             .to_string();
-        assert!(
-            error.starts_with(
-                "Error loading template 'gcode_macro BADSTMT:gcode'\nline 1: \
-                 unsupported statement 'block'"
-            ),
-            "{error}"
+        assert_eq!(
+            error,
+            "Error loading template 'gcode_macro BADSTMT:gcode'\nline 1: unknown statement foo"
         );
     }
 }

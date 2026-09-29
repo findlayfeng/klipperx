@@ -1,78 +1,123 @@
-//! A Jinja2-subset template engine for `gcode_macro` bodies.
+//! A `minijinja`-backed adapter for the macro bodies of `gcode_macro`.
 //!
 //! Upstream renders every macro body with `jinja2.Environment('{%', '%}', '{',
 //! '}')` (`klippy/extras/gcode_macro.py:82`) — the variable delimiters are
 //! **single braces**, which is why the corpus writes `{params.P}` rather than
-//! `{{ params.P }}`, and [`TemplateWrapper`] (`:46-79`) compiles the body at
+//! `{{ params.P }}` — and `TemplateWrapper` (`:46-79`) compiles the body at
 //! load and renders it against `create_template_context` (`:101-108`) before
 //! `gcode.run_script_from_command` feeds the text back to the dispatcher.
 //!
-//! This port implements the subset the corpus actually uses, one context at a
-//! time, and fails **explicitly** outside it — a template that does not parse
-//! is a config-load error, a template that does not evaluate is a command
-//! error; nothing silently renders empty.
+//! This module adapts `minijinja` 2.24 (`Cargo.toml`) to that environment.
+//! [`Template::parse`] and [`Template::render`] keep this port's contract: a
+//! body that does not parse is a **config-load** error, a body that does not
+//! evaluate is a **command** error, the text between tags survives verbatim,
+//! and the error frames are upstream's (`gcode_macro.py:47-79`).
 //!
-//! # Supported
+//! # The environment
 //!
-//! | construct | example from the corpus |
+//! | setting | value | why |
+//! |---|---|---|
+//! | delimiters | `{% %}` / `{ }` / `{# #}` | upstream's `jinja2.Environment('{%', '%}', '{', '}')` (`gcode_macro.py:82`) |
+//! | undefined behavior | `UndefinedBehavior::Strict` | a missing status key must not render a blank `PARK_` line — the rule the hand-written subset had |
+//! | auto escape | `AutoEscape::None` | a macro body is g-code, not HTML (the engine's default callback switches on the template name's extension) |
+//! | trailing newline | kept | a corpus body ends with a newline and the rendered text is run line by line; Jinja2/minijinja drop the last one by default (see the deviation table) |
+//! | filters | the engine's, with `int`, `float`, `min`, `max` replaced | the corpus spells its coercions `params.S\|default(1000.0)\|float` and folds lists with `\|min`/`\|max` |
+//! | globals | the engine's, with `range` and `namespace` bound explicitly | `range(...)` (`exclude_object.cfg:92`) and `namespace(...)`, which the operator's own `config.cfg` uses |
+//!
+//! Compiling and evaluating are **two phases**: [`Template::parse`] compiles the
+//! body into the environment (`Environment::add_template_owned`),
+//! [`Template::render`] evaluates the compiled template. `Environment::render_str`
+//! is deliberately not used — it does both in one call, which is exactly the
+//! distinction the two error frames draw. One [`Environment`] is built per
+//! template, because a `minijinja::Template` borrows the environment it was
+//! looked up in and the two cannot live in one struct; the environment's
+//! defaults are `Arc`-shared, so a body's compile cost is the body's own.
+//!
+//! # What a render sees
+//!
+//! [`Context::insert`] binds [`Rt`] values the way `MacroState::context`
+//! (`gcode_macro.rs`) builds them — `printer`, the `action_*` builtins,
+//! `range`, `params`, `rawparams`, and the macro's `variable_*` values — and
+//! each one becomes a minijinja value:
+//!
+//! - `Rt::Json` and `Rt::List` become minijinja containers, and their arrays
+//!   **stay plain lists**: a list literal, `params`, or a `variable_*` list is
+//!   indexed and iterated like any other sequence.
+//! - `Rt::Printer` becomes the [`PrinterView`] object: `printer.<name>` and
+//!   `printer["<name>"]` are one registered object's status, cached for the
+//!   render the way `GetStatusWrapper.cache` caches it (`gcode_macro.py:17`),
+//!   and `'<name>' in printer` asks whether that object is registered
+//!   (`GetStatusWrapper.__contains__`, `:33-37`) — the engine's containment
+//!   check on a map object *is* its lookup, so an unregistered name is absent,
+//!   not an error. The view is not enumerable, the way upstream's wrapper is
+//!   not iterable; a `{% for %}` over `printer` is refused rather than
+//!   silently walking every object the machine registered.
+//! - **Only a `printer` status array** becomes a [`Coord`]: klippy reports
+//!   `Coord` namedtuples (`klippy/gcode.py`) whose fields are `x y z e`
+//!   (`mathutil.rs`), this host's statuses are JSON arrays, and a body reads
+//!   `printer.toolhead.position.x` (`macros.cfg:34`). A coordinate object also
+//!   takes integer subscripts and `{% for v in printer.toolhead.position %}`;
+//!   `.w` — a field `Coord` does not have — is undefined, exactly as it is on
+//!   the namedtuple. Arrays **outside** a status keep their JSON meaning.
+//! - `Rt::Builtin` becomes a callable: `range`, `action_respond_info`
+//!   (`gcode_macro.py:94-96`) and `action_raise_error` (`:97-98`), the last
+//!   failing the render with its own message.
+//!
+//! # Deviations
+//!
+//! The engine is minijinja's, so anything it accepts is accepted here. Most of
+//! what the hand-written subset refused is Jinja2 too, and is now simply
+//! available: `{% block %}`/`{% include %}`/`{% macro %}`/`{% with %}`/
+//! `{% raw %}`/`{% filter %}`, `//`, `**`, `~`, `{% if %}` expressions, keyword
+//! arguments (`default(0, boolean=True)`), chained comparisons, `is none`,
+//! `|abs`, `|replace`, `|length`, … A body outside the engine's own syntax is
+//! still a loud load error.
+//!
+//! Where this port still differs, deliberately:
+//!
+//! | case | Jinja2 (upstream) | this port |
+//! |---|---|---|
+//! | `//` and `%` on a negative operand | floor division / floor remainder (`-7 % 3 == 2`, `-7 // 3 == -3`) | Euclidean (`math_binop!(rem, checked_rem_euclid, %)`, `int_div`'s `div_euclid`); the corpus and the operator's `config.cfg` are all non-negative, where the two agree |
+//! | undefined in a *lookup* | `Undefined` value, error only when used | same: `UndefinedBehavior::Strict` fails at **print / iterate / test**, not when the name or key is read, so `{% if x is defined %}` and `\|default(…)` still probe quietly |
+//! | `\|default` | catches `Undefined` only | same (the old subset probed its whole base expression quietly, so it also swallowed real errors) |
+//! | `\|int`, `\|float` with an unusable value and **no** default | `0` / `0.0` | an error (`invalid literal for int()`), the old subset's rule — a macro that reads a missing number should not silently drive a pin with `0`; with a default (`\|int(0)`, `\|float(0.25)`) the default is returned, Jinja2's own shape |
+//! | `\|min`, `\|max` on an empty sequence | `Undefined` (renders blank) | an error (`min() arg is an empty sequence`); there is no `Undefined` to hand back and a blank line would be silent |
+//! | `range(a, b, step)` | 1–3 arguments | same (the old subset took exactly one) |
+//! | a missing status object (`printer.nope`) | `Undefined` | same: undefined, which Strict then fails on if it is used |
+//! | trailing newline | one newline dropped | kept (`set_keep_trailing_newline(true)`), because `idle_timeout`'s default script and the corpus' bodies are written to keep theirs |
+//! | `{-3.5}` | `3.5`: `-` right after the opening brace is the whitespace-control marker (`{{-`'s, with single-brace delimiters), which swallows the sign — measured against `jinja2.Environment('{%','%}','{','}')` | same; a negative literal after `{` needs the space (`{ -3.5}`), and no corpus body writes `{-` |
+//!
+//! Detail wording differs wherever the engine owns the wording. The frames
+//! (`Error loading template '<name>'\nline <n>: …`, `Error evaluating
+//! '<name>': line <n>: …`) are this port's; what follows `line <n>: ` is the
+//! engine's `detail` (or its error kind when it has none):
+//!
+//! | old subset's detail | this port's detail |
 //! |---|---|
-//! | text | `PARK_{printer.toolhead.extruder}` (`dual_carriage.cfg:72`) |
-//! | `{ … }` expressions | `{action_raise_error("…")}` (`exclude_object.cfg:86`) |
-//! | `{% if %}` / `elif` / `else` / `endif` | `exclude_object.cfg:85-113` |
-//! | `{% for x in … %}` / `endfor` | `exclude_object.cfg:92` |
-//! | `{% set name = expr %}` | `{% set x_center = 0.5 * (x_max + x_min) %}` (`generic_cartesian_iqex.cfg:288`) |
-//! | `{# … #}` comments | (none in the corpus; parsed and skipped) |
-//! | literals | `0.0`, `'-1'`, `"abc"`, `True`/`False`/`None` |
-//! | list literals `[a, b]` | `[…settings["dual_carriage carriage_t3"].position_max, …]|min` (`generic_cartesian_iqex.cfg:286`) |
-//! | names, `a.b`, `a["k"]`, `a[0]`, calls | `printer["gcode_macro T"].t` |
-//! | `and` `or` `not`, `in` `not in`, `==` `!=` `<` `>` `<=` `>=` | `macros.cfg:66` |
-//! | `+ - * / %`, unary `-`, `t - 12.0` | `macros.cfg:37` |
-//! | `x is defined` / `is not defined` | `sdcard_loop.cfg:90` |
-//! | filters `\| int`, `\| float`, `\| default(x)`, `\| min`, `\| max` | `params.S \| default(1000.0) \| float` (`printer-velleman-k8800-2017.cfg:125`) |
-//! | `range(n)` | `range(params.T \| int)` |
-//! | `action_respond_info`, `action_raise_error` | `macros.cfg`, `exclude_object.cfg` |
-//! | the macro's `variable_*` as bare names, `params`, `rawparams` | `macros.cfg:33` |
+//! | `'nope' is undefined` | `undefined value` |
+//! | `position has no attribute 'w'` | `undefined value` |
+//! | `printer has no object 'nope'` | `undefined value` |
+//! | `unsupported statement 'block' (this port implements …)` | `unknown statement foo` (for a tag no Jinja2 has) |
+//! | `unknown filter 'abs' (this port implements …)` | `filter nosuch is unknown` (`abs` is a filter now, as in Jinja2) |
+//! | `the 'float' filter takes at most 1 argument here, got 2 (this port's gap)` | `too many arguments` |
+//! | `invalid literal for int(): "oops" (jinja's 'int' filter)` | `invalid literal for int(): oops` |
+//! | `cannot iterate over number` | unchanged (this port's own `min`/`max`) |
+//! | `unorderable types: str and number (<)` | unchanged (this port's own `min`/`max`) |
+//! | `min() arg is an empty sequence (jinja2 leaves it undefined; …)` | `min() arg is an empty sequence` |
 //!
-//! # Deliberate gaps (explicit errors, not silent blanks)
-//!
-//! - Statements outside `if/elif/else/endif/for/endfor/set` — Jinja also has
-//!   `{% block %}`, `{% include %}`, … — are refused at load
-//!   (`unsupported statement 'block'`).
-//! - Filters outside `int`/`float`/`default`/`min`/`max` (`abs`/`replace` in
-//!   the same corpus) are refused at render; a filter's keyword arguments
-//!   (`default(0, boolean=True)`, `min(attribute="x")`) are outside the
-//!   subset, so the tokenizer refuses the `=`. `min`/`max` take no argument
-//!   here, while Jinja reads a positional one as `case_sensitive`.
-//! - `range(n)` takes one argument; `action_emergency_stop` and
-//!   `action_call_remote_method` are not bound, so a name error says so.
-//! - Python literals in `ast.literal_eval` syntax (`None`, `'str'`, …) are
-//!   JSON here, matching this port's `variable_*` reader (`gcode_macro.rs`).
-//! - A missing printer object or status key is an **error**, where Jinja2's
-//!   default `Undefined` would render an empty string. Upstream's *corpus*
-//!   always names a key that exists; a port gap that hides behind a blank
-//!   `PARK_` line would be silent, so it fails loudly instead. The same holds
-//!   for `[]|min` / `[]|max`: Jinja2 3.1.6 returns an `Undefined` there (it
-//!   renders blank and `is defined` is false), and this port has no
-//!   `Undefined` to return, so an empty sequence is the error
-//!   `min() arg is an empty sequence`.
-//! - `\| default(x)` is the one construct that expects to miss: it probes its
-//!   base quietly, the way `is defined` does, and falls back to `x`, because
-//!   `params.S \| default(…)` is exactly how the corpus spells an omitted
-//!   parameter. Every other lookup still fails loudly.
-//!
-//! Status coordinates deserve their own note: klippy reports `Coord`
-//! namedtuples (`klippy/gcode.py`), which Jinja reads as `.x`/`.y`/`.z`/`.e`,
-//! while this host's statuses are JSON arrays. An **array attribute** lookup
-//! maps `x y z e` to indices `0..3` — the namedtuple's field order — and
-//! nothing else (`Coord` is `x y z e` in `mathutil.rs` too).
+//! A failure the engine reports without a location (`error.line()` is `None`)
+//! reads as line 1.
 
-use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
-use serde_json::{json, Value};
+use minijinja::syntax::SyntaxConfig;
+use minijinja::value::{Enumerator, Object, ObjectRepr, Value as MjValue, ValueKind};
+use minijinja::{AutoEscape, Environment, Error as MjError, ErrorKind, UndefinedBehavior::Strict};
+use serde_json::Value;
 
+use crate::core::klippy::gcode::{GCodeDispatch, GCODE_OBJECT};
 use crate::core::klippy::printer::Printer;
 
 // ===========================================================================
@@ -88,7 +133,7 @@ enum Phase {
 }
 
 /// A template failure, worded after upstream's `TemplateWrapper`
-/// (`gcode_macro.py:47-79`, `:70-79`): a load error is
+/// (`gcode_macro.py:47-79`): a load error is
 /// `Error loading template '<name>'\nline <n>: <detail>`; a render error is
 /// `Error evaluating '<name>': line <n>: <detail>` — the line is this port's
 /// addition, because a rendered macro body spans many of them.
@@ -101,21 +146,18 @@ pub struct TemplateError {
 }
 
 impl TemplateError {
-    fn load(name: &str, line: usize, detail: impl Into<String>) -> Self {
+    /// Frame an engine failure: its own detail when it has one, its error kind
+    /// otherwise (a strict undefined fails as `undefined value`), and its line
+    /// when it recorded one.
+    fn of(name: &str, phase: Phase, error: &MjError) -> Self {
         Self {
             name: name.to_string(),
-            line,
-            phase: Phase::Load,
-            detail: detail.into(),
-        }
-    }
-
-    fn evaluate(name: &str, line: usize, detail: impl Into<String>) -> Self {
-        Self {
-            name: name.to_string(),
-            line,
-            phase: Phase::Evaluate,
-            detail: detail.into(),
+            line: error.line().unwrap_or(1),
+            phase,
+            detail: error
+                .detail()
+                .map(str::to_string)
+                .unwrap_or_else(|| error.kind().to_string()),
         }
     }
 }
@@ -149,7 +191,8 @@ impl std::error::Error for TemplateError {}
 pub enum Rt {
     /// Status data, `params`, a `variable_*` literal — the JSON world.
     Json(Value),
-    /// A literal list (`[a, b]`, or what `range(n)` builds).
+    /// A list of [`Rt`] values, kept from the hand-written engine's API — a
+    /// render turns it into an engine list of the same elements.
     List(Vec<Rt>),
     /// `printer`: upstream's `GetStatusWrapper` (`gcode_macro.py:15-43`).
     Printer(PrinterView),
@@ -160,7 +203,7 @@ pub enum Rt {
 /// The callables a template context binds.
 #[derive(Clone)]
 pub enum Builtin {
-    /// `range(n)` — one argument, `0..n` (`exclude_object.cfg:92`).
+    /// `range(...)` — `exclude_object.cfg:92`.
     Range,
     /// `action_respond_info(msg)` (`gcode_macro.py:94-96`): logs the line and
     /// renders nothing.
@@ -183,17 +226,20 @@ impl fmt::Debug for Builtin {
 
 /// `printer.<name>` / `printer["<name>"]` — one object's status, cached for
 /// the render the way `GetStatusWrapper.cache` caches it (`gcode_macro.py:17`).
+///
+/// The cache is a `Mutex` because the engine requires its objects to be `Sync`;
+/// the view is `Clone` so a [`Rt`] can be cloned into a render.
 #[derive(Clone)]
 pub struct PrinterView {
     printer: Arc<Printer>,
-    cache: RefCell<HashMap<String, Value>>,
+    cache: Arc<Mutex<HashMap<String, MjValue>>>,
 }
 
 impl fmt::Debug for PrinterView {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // `Printer` has no `Debug`; the cache is the interesting part.
         f.debug_struct("PrinterView")
-            .field("cached", &self.cache.borrow().keys().collect::<Vec<_>>())
+            .field("cached", &self.lock().keys().collect::<Vec<_>>())
             .finish()
     }
 }
@@ -203,171 +249,130 @@ impl PrinterView {
     pub fn new(printer: Arc<Printer>) -> Self {
         Self {
             printer,
-            cache: RefCell::new(HashMap::new()),
+            cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    /// One object's status (`GetStatusWrapper.__getitem__`, `:19-32`).
-    fn status(&self, name: &str) -> Option<Value> {
-        if let Some(cached) = self.cache.borrow().get(name) {
+    /// One object's status (`GetStatusWrapper.__getitem__`, `:19-32`), as the
+    /// templates read it: `None` for a name nobody registered, which is what
+    /// makes `'name' in printer` a registration test.
+    fn status(&self, name: &str) -> Option<MjValue> {
+        if let Some(cached) = self.lock().get(name) {
             return Some(cached.clone());
         }
-        let status = self.printer.status_of(name, self.printer.eventtime())?;
-        self.cache
-            .borrow_mut()
-            .insert(name.to_string(), status.clone());
+        let status = status_value(&self.printer.status_of(name, self.printer.eventtime())?);
+        self.lock().insert(name.to_string(), status.clone());
         Some(status)
     }
 
-    /// `'name' in printer` (`GetStatusWrapper.__contains__`, `:33-37`): an
-    /// object nobody registered is absent, not an error.
-    fn has(&self, name: &str) -> bool {
-        self.printer.lookup_object(name).is_some()
+    fn lock(&self) -> MutexGuard<'_, HashMap<String, MjValue>> {
+        self.cache
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
     }
 }
 
-/// Python truthiness for the values templates branch on.
-fn truthy(value: &Rt) -> bool {
-    match value {
-        Rt::Json(Value::Null) => false,
-        Rt::Json(Value::Bool(flag)) => *flag,
-        Rt::Json(Value::Number(number)) => number.as_f64().is_some_and(|n| n != 0.0),
-        Rt::Json(Value::String(text)) => !text.is_empty(),
-        Rt::Json(Value::Array(items)) => !items.is_empty(),
-        Rt::Json(Value::Object(map)) => !map.is_empty(),
-        Rt::List(items) => !items.is_empty(),
-        Rt::Printer(_) | Rt::Builtin(_) => true,
+impl Object for PrinterView {
+    fn repr(self: &Arc<Self>) -> ObjectRepr {
+        ObjectRepr::Map
+    }
+
+    fn get_value(self: &Arc<Self>, key: &MjValue) -> Option<MjValue> {
+        self.status(key.as_str()?)
+    }
+
+    /// Not enumerable: upstream's wrapper is a `__getitem__`-only mapping, so
+    /// `{% for %}` over `printer` is refused, while containment (a map lookup)
+    /// and truthiness still work.
+    fn enumerate(self: &Arc<Self>) -> Enumerator {
+        Enumerator::NonEnumerable
     }
 }
 
-/// `str(value)` for a rendered `{ … }` (`gcode_macro.py` renders with Jinja's
-/// `str`): Python's spelling for scalars, compact JSON for containers (Python
-/// would print a list/dict repr — no corpus template renders one).
-fn to_text(value: &Rt) -> Result<String, String> {
+/// A `printer` status array, read the way klippy's `Coord` namedtuple is
+/// (`klippy/gcode.py`): `.x`/`.y`/`.z`/`.e` are the first four elements
+/// (`mathutil.rs`'s field order), integer subscripts index it, and `{% for %}`
+/// walks it.
+#[derive(Debug)]
+struct Coord {
+    items: Vec<MjValue>,
+}
+
+impl Object for Coord {
+    fn repr(self: &Arc<Self>) -> ObjectRepr {
+        ObjectRepr::Seq
+    }
+
+    fn get_value(self: &Arc<Self>, key: &MjValue) -> Option<MjValue> {
+        if let Some(index) = key.as_usize() {
+            return self.items.get(index).cloned();
+        }
+        let index = match key.as_str()? {
+            "x" => 0,
+            "y" => 1,
+            "z" => 2,
+            "e" => 3,
+            _ => return None,
+        };
+        self.items.get(index).cloned()
+    }
+
+    fn enumerate(self: &Arc<Self>) -> Enumerator {
+        Enumerator::Seq(self.items.len())
+    }
+
+    fn enumerator_len(self: &Arc<Self>) -> Option<usize> {
+        Some(self.items.len())
+    }
+}
+
+/// One status value as the templates read it: an array is a [`Coord`] — and so
+/// are the arrays nested inside it — an object is a map of the same, and a
+/// scalar is itself.
+fn status_value(value: &Value) -> MjValue {
     match value {
-        Rt::Json(Value::String(text)) => Ok(text.clone()),
-        Rt::Json(Value::Bool(flag)) => Ok(if *flag { "True" } else { "False" }.to_string()),
-        Rt::Json(Value::Null) => Ok("None".to_string()),
-        Rt::Json(Value::Number(number)) => {
-            if let Some(int) = number.as_i64() {
-                Ok(int.to_string())
-            } else {
-                Ok(fmt_float(number.as_f64().unwrap_or(f64::NAN)))
-            }
+        Value::Array(items) => MjValue::from_object(Coord {
+            items: items.iter().map(status_value).collect(),
+        }),
+        Value::Object(map) => {
+            let entries: BTreeMap<String, MjValue> = map
+                .iter()
+                .map(|(key, item)| (key.clone(), status_value(item)))
+                .collect();
+            MjValue::from_serialize(&entries)
         }
-        Rt::Json(Value::Array(_) | Value::Object(_)) => {
-            serde_json::to_string(value_json(value)).map_err(|error| error.to_string())
-        }
+        other => MjValue::from_serialize(other),
+    }
+}
+
+/// One binding as the engine sees it.
+fn rt_value(value: Rt) -> MjValue {
+    match value {
+        // JSON and literal lists become the engine's own containers: a
+        // `params` value or a `variable_*` list is a plain list, **not** a
+        // coordinate array — only a `printer` status is (`status_value`).
+        Rt::Json(json) => MjValue::from_serialize(&json),
         Rt::List(items) => {
-            let mut parts = Vec::with_capacity(items.len());
-            for item in items {
-                parts.push(to_text(item)?);
-            }
-            Ok(format!("[{}]", parts.join(", ")))
+            MjValue::from_serialize(items.into_iter().map(rt_value).collect::<Vec<_>>())
         }
-        Rt::Printer(_) => Err("a printer status object cannot be rendered as text".to_string()),
-        Rt::Builtin(_) => Err("a builtin function cannot be rendered as text".to_string()),
-    }
-}
-
-/// A float the way Python's `str` writes it: `3.0`, not `3`.
-fn fmt_float(value: f64) -> String {
-    if value.is_finite() {
-        format!("{value:?}")
-    } else if value.is_nan() {
-        "nan".to_string()
-    } else if value.is_sign_positive() {
-        "inf".to_string()
-    } else {
-        "-inf".to_string()
-    }
-}
-
-fn value_json(value: &Rt) -> &Value {
-    match value {
-        Rt::Json(inner) => inner,
-        _ => unreachable!("only JSON containers reach to_text's serializer"),
-    }
-}
-
-/// `==` / `!=`, Python-flavoured: numbers compare across int/float, other
-/// types compare within themselves.
-fn equals(left: &Rt, right: &Rt) -> bool {
-    match (left, right) {
-        (Rt::Json(a), Rt::Json(b)) => json_equals(a, b),
-        _ => false,
-    }
-}
-
-fn json_equals(left: &Value, right: &Value) -> bool {
-    match (left, right) {
-        (Value::Number(a), Value::Number(b)) => {
-            a.as_f64().is_some() && b.as_f64().is_some() && a.as_f64() == b.as_f64()
+        Rt::Printer(view) => MjValue::from_object(view),
+        Rt::Builtin(Builtin::Range) => MjValue::from_function(minijinja::functions::range),
+        Rt::Builtin(Builtin::RespondInfo(printer)) => {
+            MjValue::from_function(move |message: MjValue| -> Result<MjValue, MjError> {
+                if let Some(gcode) = printer.lookup_object_as::<GCodeDispatch>(GCODE_OBJECT) {
+                    gcode.respond_info(&message.to_string(), true);
+                }
+                Ok(MjValue::from(""))
+            })
         }
-        // Python compares `True == 1`; fold booleans into the number side.
-        (Value::Bool(a), Value::Number(_)) => json_equals(&json!(i64::from(*a)), right),
-        (Value::Number(_), Value::Bool(b)) => json_equals(left, &json!(i64::from(*b))),
-        _ => left == right,
-    }
-}
-
-/// Both operands as floats when they are numbers (or booleans, which Python
-/// compares as `0`/`1`).
-fn as_numbers(left: &Rt, right: &Rt) -> Option<(f64, f64)> {
-    fn number(value: &Rt) -> Option<f64> {
-        match value {
-            Rt::Json(Value::Number(n)) => n.as_f64(),
-            Rt::Json(Value::Bool(flag)) => Some(if *flag { 1.0 } else { 0.0 }),
-            _ => None,
+        Rt::Builtin(Builtin::RaiseError) => {
+            MjValue::from_function(|message: MjValue| -> Result<MjValue, MjError> {
+                Err(MjError::new(
+                    ErrorKind::InvalidOperation,
+                    message.to_string(),
+                ))
+            })
         }
-    }
-    Some((number(left)?, number(right)?))
-}
-
-/// Python's `+` on the types templates concatenate: numbers add, strings
-/// join. Everything else is an explicit error.
-fn add(left: &Rt, right: &Rt) -> Result<Rt, String> {
-    if let Some((a, b)) = as_numbers(left, right) {
-        return Ok(Rt::Json(json_number(left, right, a + b)));
-    }
-    if let (Rt::Json(Value::String(a)), Rt::Json(Value::String(b))) = (left, right) {
-        return Ok(Rt::Json(Value::String(format!("{a}{b}"))));
-    }
-    Err(format!(
-        "unsupported operand types for +: {} and {}",
-        type_name(left),
-        type_name(right)
-    ))
-}
-
-/// Keep int arithmetic integral, the way Python does (`12.0 - 12.0` is a
-/// float, `3 + 4` is an int).
-fn json_number(left: &Rt, right: &Rt, value: f64) -> Value {
-    let both_int = matches!(
-        (left, right),
-        (Rt::Json(Value::Number(a)), Rt::Json(Value::Number(b)))
-            if a.as_f64().is_some_and(|n| n.fract() == 0.0)
-                && b.as_f64().is_some_and(|n| n.fract() == 0.0)
-                && a.is_i64()
-                && b.is_i64()
-    );
-    if both_int {
-        json!(value as i64)
-    } else {
-        json!(value)
-    }
-}
-
-fn type_name(value: &Rt) -> &'static str {
-    match value {
-        Rt::Json(Value::String(_)) => "str",
-        Rt::Json(Value::Bool(_)) | Rt::Json(Value::Number(_)) => "number",
-        Rt::Json(Value::Null) => "NoneType",
-        Rt::Json(Value::Array(_)) => "list",
-        Rt::Json(Value::Object(_)) => "dict",
-        Rt::List(_) => "list",
-        Rt::Printer(_) => "printer",
-        Rt::Builtin(_) => "builtin_function_or_method",
     }
 }
 
@@ -376,12 +381,11 @@ fn type_name(value: &Rt) -> &'static str {
 // ===========================================================================
 
 /// The names a render resolves against: the globals a macro builds (printer,
-/// actions, `params`, `rawparams`, the macro's `variable_*` values) plus the
-/// frame each `{% for %}` iteration pushes.
+/// actions, `params`, `rawparams`, the macro's `variable_*` values), plus
+/// whatever `{% set %}` and `{% for %}` scope while the body runs.
 #[derive(Debug, Default)]
 pub struct Context {
     globals: HashMap<String, Rt>,
-    frames: Vec<HashMap<String, Rt>>,
 }
 
 impl Context {
@@ -396,66 +400,51 @@ impl Context {
         self.globals.insert(name.into(), value);
     }
 
-    fn lookup(&self, name: &str) -> Option<&Rt> {
-        self.frames
+    /// The bindings as the engine takes them: one map of minijinja values,
+    /// which is the render's root scope — `{% set %}` inside an `{% if %}`
+    /// assigns into it, `{% for %}` pushes its own frame per iteration.
+    fn bindings(&self) -> BTreeMap<String, MjValue> {
+        self.globals
             .iter()
-            .rev()
-            .find_map(|frame| frame.get(name))
-            .or_else(|| self.globals.get(name))
-    }
-
-    fn push_frame(&mut self) {
-        self.frames.push(HashMap::new());
-    }
-
-    fn pop_frame(&mut self) {
-        self.frames.pop();
-    }
-
-    fn bind(&mut self, name: &str, value: Rt) {
-        if let Some(frame) = self.frames.last_mut() {
-            frame.insert(name.to_string(), value);
-        }
+            .map(|(name, value)| (name.clone(), rt_value(value.clone())))
+            .collect()
     }
 }
 
 // ===========================================================================
-// Parse: source → nodes
+// Template
 // ===========================================================================
 
 /// A compiled template: its name (`gcode_macro M486:gcode`, the upstream
-/// `TemplateWrapper` name, `gcode_macro.py:87`) and its parsed nodes.
-#[derive(Debug)]
+/// `TemplateWrapper` name, `gcode_macro.py:87`) and the environment it was
+/// compiled into.
 pub struct Template {
     name: String,
-    nodes: Vec<Node>,
+    env: Environment<'static>,
+}
+
+impl fmt::Debug for Template {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Template")
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Template {
-    /// Compile `source`, reporting an unparsable construct with upstream's
+    /// Compile `source`, reporting an unparsable body with upstream's
     /// load-error frame (`gcode_macro.py:61-66`).
     ///
     /// # Errors
-    /// An unclosed tag, a statement outside `if/elif/else/endif/for/endfor`,
-    /// an unbalanced block, or an expression this port's grammar refuses.
+    /// A syntax error in the body: an unclosed tag, a statement the engine
+    /// does not know, an unbalanced block, a malformed expression.
     pub fn parse(name: &str, source: &str) -> Result<Self, TemplateError> {
-        let mut parser = Parser {
-            name,
-            src: source,
-            pos: 0,
-        };
-        let (nodes, terminator) = parser.parse_nodes(&[])?;
-        if let Some(stmt) = terminator {
-            let keyword = keyword_of(&stmt);
-            return Err(TemplateError::load(
-                name,
-                parser.line_at(parser.src.len()),
-                format!("unexpected '{keyword}', no block is open"),
-            ));
-        }
+        let mut env = environment();
+        env.add_template_owned(name.to_string(), source.to_string())
+            .map_err(|error| TemplateError::of(name, Phase::Load, &error))?;
         Ok(Self {
             name: name.to_string(),
-            nodes,
+            env,
         })
     }
 
@@ -467,1607 +456,220 @@ impl Template {
     /// Render against `context`, or report the first failing expression with
     /// upstream's `Error evaluating` frame (`gcode_macro.py:70-79`).
     ///
-    /// The body runs inside one frame: [`Context::bind`] writes the innermost
-    /// frame, so a top-level `{% set %}` needs somewhere to land (an empty
-    /// `frames` would drop it silently). The frame is popped with the render,
-    /// so an assignment never survives into the next render, while `{% for %}`
-    /// still pushes its own frame on top — a loop-body `set` dies with the
-    /// iteration, and an `if` at the top level shares the body frame, exactly
-    /// where Jinja2 scopes those assignments.
+    /// The context's bindings are the render's root frame, so a top-level
+    /// `{% set %}` lands there and a later node sees it, an `{% if %}` body
+    /// shares it, and a `{% for %}` body does not — the scoping Jinja2 gives
+    /// those three, and what `MacroState` relies on.
     pub fn render(&self, context: &mut Context) -> Result<String, TemplateError> {
-        let mut out = String::new();
-        context.push_frame();
-        let rendered = render_nodes(&self.nodes, context, &self.name, &mut out);
-        context.pop_frame();
-        rendered?;
-        Ok(out)
+        let template = self
+            .env
+            .get_template(&self.name)
+            .map_err(|error| TemplateError::of(&self.name, Phase::Evaluate, &error))?;
+        template
+            .render(&context.bindings())
+            .map_err(|error| TemplateError::of(&self.name, Phase::Evaluate, &error))
     }
 }
 
-/// One node of a parsed template.
-#[derive(Debug)]
-enum Node {
-    /// Literal text between tags.
-    Text(String),
-    /// `{ … }` — rendered as `str(value)`.
-    Expr(Expr),
-    /// `{% if %}` … (`branches`: condition + body) with its optional `else`.
-    If {
-        branches: Vec<(Expr, Vec<Node>)>,
-        otherwise: Option<Vec<Node>>,
-    },
-    /// `{% for name in … %}` … `{% endfor %}`.
-    For {
-        var: String,
-        iter: Expr,
-        body: Vec<Node>,
-        line: usize,
-    },
-    /// `{% set name = expr %}` — bound where Jinja2 scopes it: into the
-    /// body frame at the top level (so a later node, or an `if` body, sees
-    /// it), into the loop frame inside `{% for %}` (so it dies with the
-    /// iteration).
-    Set { name: String, value: Expr },
-}
-
-struct Parser<'a> {
-    name: &'a str,
-    src: &'a str,
-    pos: usize,
-}
-
-impl<'a> Parser<'a> {
-    /// The 1-based line `offset` falls on.
-    fn line_at(&self, offset: usize) -> usize {
-        self.src[..offset.min(self.src.len())].matches('\n').count() + 1
-    }
-
-    fn load_error(&self, offset: usize, detail: impl Into<String>) -> TemplateError {
-        TemplateError::load(self.name, self.line_at(offset), detail)
-    }
-
-    /// Parse nodes until the template ends or one of `stop`'s statements
-    /// appears; returns the nodes and the terminator's statement text (`else`,
-    /// `elif …`, `endif`, `endfor`) when one did.
-    fn parse_nodes(&mut self, stop: &[&str]) -> Result<(Vec<Node>, Option<String>), TemplateError> {
-        let mut nodes = Vec::new();
-        loop {
-            let Some(brace) = self.src[self.pos..].find('{') else {
-                if self.pos < self.src.len() {
-                    nodes.push(Node::Text(self.src[self.pos..].to_string()));
-                    self.pos = self.src.len();
-                }
-                return Ok((nodes, None));
-            };
-            let open = self.pos + brace;
-            if open > self.pos {
-                nodes.push(Node::Text(self.src[self.pos..open].to_string()));
-            }
-            let rest = &self.src[open..];
-
-            if rest.starts_with("{%") {
-                let close = rest[2..]
-                    .find("%}")
-                    .map(|offset| open + 2 + offset)
-                    .ok_or_else(|| self.load_error(open, "unclosed block tag, '%}' expected"))?;
-                let stmt = self.src[open + 2..close].trim().to_string();
-                self.pos = close + 2;
-                let keyword = keyword_of(&stmt);
-                if stop.contains(&keyword.as_str()) {
-                    return Ok((nodes, Some(stmt)));
-                }
-                let line = self.line_at(open);
-                let node = match keyword.as_str() {
-                    "if" => self.parse_if(&stmt, line)?,
-                    "for" => self.parse_for(&stmt, line)?,
-                    "set" => self.parse_set(&stmt, line)?,
-                    "elif" | "else" | "endif" | "endfor" => {
-                        return Err(self.load_error(
-                            open,
-                            format!("unexpected '{keyword}', no matching block is open"),
-                        ));
-                    }
-                    other => {
-                        return Err(self.load_error(
-                            open,
-                            format!(
-                                "unsupported statement '{other}' \
-                                 (this port implements if/elif/else/endif/for/endfor/set)"
-                            ),
-                        ));
-                    }
-                };
-                nodes.push(node);
-                continue;
-            }
-
-            if rest.starts_with("{#") {
-                let close = rest[2..]
-                    .find("#}")
-                    .map(|offset| open + 2 + offset)
-                    .ok_or_else(|| self.load_error(open, "unclosed comment, '#}' expected"))?;
-                self.pos = close + 2;
-                continue;
-            }
-
-            // `{ expression }` — the environment's variable tag
-            // (`jinja2.Environment('{%', '%}', '{', '}')`).
-            let close = find_expr_end(rest)
-                .map(|offset| open + offset)
-                .ok_or_else(|| self.load_error(open, "unclosed expression, '}' expected"))?;
-            let text = &rest[1..close - open];
-            let line = self.line_at(open);
-            let expr = parse_expr(self.name, line, text)?;
-            nodes.push(Node::Expr(expr));
-            self.pos = close + 1;
-        }
-    }
-
-    /// `{% if … %}` … with its `elif`/`else` chain.
-    fn parse_if(&mut self, stmt: &str, line: usize) -> Result<Node, TemplateError> {
-        let mut branches = Vec::new();
-        let mut otherwise = None;
-        let mut stmt = stmt.to_string();
-        loop {
-            let condition = stmt
-                .trim_start()
-                .strip_prefix("if")
-                .or_else(|| stmt.trim_start().strip_prefix("elif"))
-                .map(str::trim)
-                .ok_or_else(|| {
-                    self.load_error(self.pos, format!("malformed condition in '{stmt}'"))
-                })?;
-            let expr = parse_expr(self.name, line, condition)?;
-            let (body, terminator) = self.parse_nodes(&["elif", "else", "endif"])?;
-            branches.push((expr, body));
-            let Some(terminator) = terminator else {
-                return Err(TemplateError::load(
-                    self.name,
-                    line,
-                    "unexpected end of template, 'endif' expected",
-                ));
-            };
-            match keyword_of(&terminator).as_str() {
-                "endif" => {
-                    return Ok(Node::If {
-                        branches,
-                        otherwise,
-                    })
-                }
-                "else" => {
-                    let (body, terminator) = self.parse_nodes(&["endif"])?;
-                    otherwise = Some(body);
-                    match terminator {
-                        Some(_) => {
-                            return Ok(Node::If {
-                                branches,
-                                otherwise,
-                            })
-                        }
-                        None => {
-                            return Err(TemplateError::load(
-                                self.name,
-                                line,
-                                "unexpected end of template, 'endif' expected",
-                            ))
-                        }
-                    }
-                }
-                // `elif …`: loop with the new condition.
-                "elif" => {
-                    stmt = terminator;
-                }
-                other => {
-                    return Err(TemplateError::load(
-                        self.name,
-                        line,
-                        format!("unexpected '{other}', no block is open"),
-                    ))
-                }
-            }
-        }
-    }
-
-    /// `{% for name in … %}` … `{% endfor %}`.
-    fn parse_for(&mut self, stmt: &str, line: usize) -> Result<Node, TemplateError> {
-        let rest = stmt
-            .trim_start()
-            .strip_prefix("for")
-            .map(str::trim)
-            .ok_or_else(|| self.load_error(self.pos, format!("malformed loop in '{stmt}'")))?;
-        let name_end = rest.find(char::is_whitespace).unwrap_or_else(|| rest.len());
-        let var = &rest[..name_end];
-        if var.is_empty() || !var.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-            return Err(self.load_error(self.pos, format!("malformed loop variable in '{stmt}'")));
-        }
-        let after = rest[name_end..].trim_start();
-        let Some(expr_text) = after.strip_prefix("in").map(str::trim) else {
-            return Err(self.load_error(self.pos, format!("expected 'in' in loop '{stmt}'")));
-        };
-        if expr_text.is_empty() {
-            return Err(self.load_error(self.pos, format!("missing loop iterable in '{stmt}'")));
-        }
-        let expr = parse_expr(self.name, line, expr_text)?;
-        let (body, terminator) = self.parse_nodes(&["endfor"])?;
-        if terminator.is_none() {
-            return Err(TemplateError::load(
-                self.name,
-                line,
-                "unexpected end of template, 'endfor' expected",
-            ));
-        }
-        Ok(Node::For {
-            var: var.to_string(),
-            iter: expr,
-            body,
-            line,
-        })
-    }
-
-    /// `{% set name = expr %}` — one name and one expression; tuple targets
-    /// and `set` without `=` are refused the way a malformed loop is.
-    fn parse_set(&mut self, stmt: &str, line: usize) -> Result<Node, TemplateError> {
-        let rest = stmt
-            .trim_start()
-            .strip_prefix("set")
-            .map(str::trim)
-            .ok_or_else(|| {
-                self.load_error(self.pos, format!("malformed assignment in '{stmt}'"))
-            })?;
-        let name_end = rest
-            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-            .unwrap_or_else(|| rest.len());
-        let name = &rest[..name_end];
-        if name.is_empty() || name.starts_with(|c: char| c.is_ascii_digit()) {
-            return Err(
-                self.load_error(self.pos, format!("malformed assignment target in '{stmt}'"))
-            );
-        }
-        let after = rest[name_end..].trim_start();
-        let Some(expr_text) = after.strip_prefix('=').map(str::trim) else {
-            return Err(self.load_error(self.pos, format!("expected '=' in assignment '{stmt}'")));
-        };
-        if expr_text.is_empty() {
-            return Err(self.load_error(self.pos, format!("missing value in assignment '{stmt}'")));
-        }
-        let value = parse_expr(self.name, line, expr_text)?;
-        Ok(Node::Set {
-            name: name.to_string(),
-            value,
-        })
-    }
-}
-
-/// The first word of a statement text.
-fn keyword_of(stmt: &str) -> String {
-    stmt.split_whitespace()
-        .next()
-        .unwrap_or_default()
-        .to_string()
-}
-
-/// The offset of the `}` that closes a `{ expression }`, skipping braces
-/// inside string literals.
-fn find_expr_end(text: &str) -> Option<usize> {
-    let bytes = text.as_bytes();
-    let mut quote: Option<u8> = None;
-    let mut escaped = false;
-    for (index, &byte) in bytes.iter().enumerate().skip(1) {
-        match quote {
-            Some(current) => {
-                if escaped {
-                    escaped = false;
-                } else if byte == b'\\' {
-                    escaped = true;
-                } else if byte == current {
-                    quote = None;
-                }
-            }
-            None => match byte {
-                b'\'' | b'"' => quote = Some(byte),
-                b'}' => return Some(index),
-                _ => {}
-            },
-        }
-    }
-    None
+/// The environment every body is compiled into: upstream's delimiters,
+/// undefined behavior and escaping, this port's trailing-newline rule, the four
+/// filters the corpus spells differently, and the two Jinja2 globals the corpus
+/// and the operator's own `config.cfg` call.
+fn environment() -> Environment<'static> {
+    let mut env = Environment::new();
+    env.set_syntax(
+        SyntaxConfig::builder()
+            .block_delimiters("{%", "%}")
+            .variable_delimiters("{", "}")
+            .comment_delimiters("{#", "#}")
+            .build()
+            .expect("'{%' and '{' are distinct start delimiters"),
+    );
+    env.set_auto_escape_callback(|_| AutoEscape::None);
+    env.set_undefined_behavior(Strict);
+    env.set_keep_trailing_newline(true);
+    env.add_filter("int", filter_int);
+    env.add_filter("float", filter_float);
+    env.add_filter("min", filter_min);
+    env.add_filter("max", filter_max);
+    env.add_function("range", minijinja::functions::range);
+    env.add_function("namespace", minijinja::functions::namespace);
+    env
 }
 
 // ===========================================================================
-// Parse: expressions
+// Filters
 // ===========================================================================
 
-/// One expression token and the line it starts on.
-#[derive(Debug, Clone)]
-enum Tok {
-    /// A number: `is_int` distinguishes `3` from `3.0`.
-    Num {
-        text: String,
-        is_int: bool,
-    },
-    Str(String),
-    Name(String),
-    Op(String),
-}
-
-/// Compile one expression's text (already stripped of its delimiters).
-fn parse_expr(name: &str, line: usize, text: &str) -> Result<Expr, TemplateError> {
-    let toks = tokenize(name, line, text)?;
-    let mut expr = ExprParser {
-        name,
-        toks,
-        pos: 0,
-        line,
-    };
-    let parsed = expr.parse_or()?;
-    if let Some((tok, tok_line)) = expr.peek() {
-        return Err(TemplateError::load(
-            name,
-            *tok_line,
-            format!("unexpected token '{}' in expression", describe_tok(tok)),
-        ));
-    }
-    Ok(parsed)
-}
-
-fn describe_tok(tok: &Tok) -> String {
-    match tok {
-        Tok::Num { text, .. } => text.clone(),
-        Tok::Str(text) => format!("'{text}'"),
-        Tok::Name(text) => text.clone(),
-        Tok::Op(text) => text.clone(),
-    }
-}
-
-/// Split an expression into tokens, tracking each token's line.
-fn tokenize(name: &str, line: usize, text: &str) -> Result<Vec<(Tok, usize)>, TemplateError> {
-    let mut toks = Vec::new();
-    let mut current_line = line;
-    let mut rest = text;
-    while !rest.is_empty() {
-        let c = rest.chars().next().expect("non-empty");
-        if c.is_whitespace() {
-            let consumed = rest.len() - rest[c.len_utf8()..].len();
-            current_line += rest[..consumed].matches('\n').count();
-            rest = &rest[consumed..];
-            continue;
-        }
-
-        let start_line = current_line;
-        if c == '\'' || c == '"' {
-            let quote = c;
-            let mut value = String::new();
-            let mut chars = rest[1..].chars();
-            let mut closed = false;
-            while let Some(ch) = chars.next() {
-                if ch == '\\' {
-                    match chars.next() {
-                        Some('n') => value.push('\n'),
-                        Some('t') => value.push('\t'),
-                        Some('r') => value.push('\r'),
-                        Some(other) => value.push(other),
-                        None => {
-                            return Err(TemplateError::load(
-                                name,
-                                start_line,
-                                "unterminated string literal".to_string(),
-                            ))
-                        }
-                    }
-                } else if ch == quote {
-                    closed = true;
-                    break;
-                } else {
-                    value.push(ch);
-                }
-            }
-            if !closed {
-                return Err(TemplateError::load(
-                    name,
-                    start_line,
-                    "unterminated string literal".to_string(),
-                ));
-            }
-            // `consumed` counts the whole literal, quotes included.
-            let consumed = rest.len() - chars.as_str().len();
-            rest = &rest[consumed..];
-            toks.push((Tok::Str(value), start_line));
-            continue;
-        }
-        if c.is_ascii_digit() {
-            let end = rest
-                .find(|ch: char| !ch.is_ascii_digit() && ch != '.')
-                .unwrap_or(rest.len());
-            let text = &rest[..end];
-            if text.matches('.').count() > 1 {
-                return Err(TemplateError::load(
-                    name,
-                    start_line,
-                    format!("malformed number '{text}'"),
-                ));
-            }
-            toks.push((
-                Tok::Num {
-                    text: text.to_string(),
-                    is_int: !text.contains('.'),
-                },
-                start_line,
-            ));
-            rest = &rest[end..];
-            continue;
-        }
-        if c.is_ascii_alphabetic() || c == '_' {
-            let end = rest
-                .find(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
-                .unwrap_or(rest.len());
-            toks.push((Tok::Name(rest[..end].to_string()), start_line));
-            rest = &rest[end..];
-            continue;
-        }
-        // Operators: the two-character forms first, then one character —
-        // sliced by `len_utf8` so a multi-byte character is reported, never
-        // cut in half.
-        let op = match rest.get(..2) {
-            Some(two @ ("==" | "!=" | "<=" | ">=")) => {
-                rest = &rest[2..];
-                two.to_string()
-            }
-            _ => match c {
-                '<' | '>' | '+' | '-' | '*' | '/' | '%' | '|' | '.' | '(' | ')' | '[' | ']'
-                | ',' => {
-                    rest = &rest[c.len_utf8()..];
-                    c.to_string()
-                }
-                _ => {
-                    return Err(TemplateError::load(
-                        name,
-                        start_line,
-                        format!("unexpected character '{c}' in expression"),
-                    ))
-                }
-            },
-        };
-        toks.push((Tok::Op(op), start_line));
-    }
-    Ok(toks)
-}
-
-/// One parsed expression, with the line it started on (for render errors).
-#[derive(Debug)]
-pub struct Expr {
-    kind: ExprKind,
-    line: usize,
-}
-
-#[derive(Debug)]
-enum ExprKind {
-    Literal(Value),
-    /// `[a, b]` — a list literal (`generic_cartesian_iqex.cfg:286`).
-    List(Vec<Expr>),
-    Name(String),
-    Attr(Box<Expr>, String),
-    Index(Box<Expr>, Box<Expr>),
-    Call(Box<Expr>, Vec<Expr>),
-    Filter(Box<Expr>, String, Vec<Expr>),
-    /// `x is defined` / `x is not defined` (`sdcard_loop.cfg:90`).
-    IsDefined {
-        negated: bool,
-        test: Box<Expr>,
-    },
-    Not(Box<Expr>),
-    Neg(Box<Expr>),
-    Arith(Arith, Box<Expr>, Box<Expr>),
-    Compare(Cmp, Box<Expr>, Box<Expr>),
-    Membership {
-        negated: bool,
-        needle: Box<Expr>,
-        haystack: Box<Expr>,
-    },
-    Bool(BoolOp, Box<Expr>, Box<Expr>),
-}
-
-#[derive(Debug, Clone, Copy)]
-enum Arith {
-    Add,
-    Sub,
-    Mul,
-    Div,
-    Mod,
-}
-
-#[derive(Debug, Clone, Copy)]
-enum Cmp {
-    Eq,
-    Ne,
-    Lt,
-    Le,
-    Gt,
-    Ge,
-}
-
-#[derive(Debug, Clone, Copy)]
-enum BoolOp {
-    And,
-    Or,
-}
-
-impl Expr {
-    /// The expression's source shape, for error messages
-    /// (`printer.toolhead has no attribute 'extruder'`).
-    fn describe(&self) -> String {
-        match &self.kind {
-            ExprKind::Literal(value) => match value {
-                Value::String(text) => format!("'{text}'"),
-                Value::Bool(flag) => (if *flag { "True" } else { "False" }).to_string(),
-                Value::Null => "None".to_string(),
-                other => other.to_string(),
-            },
-            ExprKind::Name(name) => name.clone(),
-            ExprKind::List(items) => {
-                let items: Vec<String> = items.iter().map(Expr::describe).collect();
-                format!("[{}]", items.join(", "))
-            }
-            ExprKind::Attr(base, key) => format!("{}.{}", base.describe(), key),
-            ExprKind::Index(base, index) => {
-                format!("{}[{}]", base.describe(), index.describe())
-            }
-            ExprKind::Call(callee, args) => {
-                let args: Vec<String> = args.iter().map(Expr::describe).collect();
-                format!("{}({})", callee.describe(), args.join(", "))
-            }
-            ExprKind::Filter(base, filter, args) => {
-                if args.is_empty() {
-                    format!("{} | {}", base.describe(), filter)
-                } else {
-                    let args: Vec<String> = args.iter().map(Expr::describe).collect();
-                    format!("{} | {}({})", base.describe(), filter, args.join(", "))
-                }
-            }
-            ExprKind::IsDefined { negated, test } => {
-                format!(
-                    "{} is {}defined",
-                    test.describe(),
-                    if *negated { "not " } else { "" }
-                )
-            }
-            ExprKind::Not(inner) => format!("not {}", inner.describe()),
-            ExprKind::Neg(inner) => format!("-{}", inner.describe()),
-            ExprKind::Arith(op, left, right) => format!(
-                "{} {} {}",
-                left.describe(),
-                match op {
-                    Arith::Add => "+",
-                    Arith::Sub => "-",
-                    Arith::Mul => "*",
-                    Arith::Div => "/",
-                    Arith::Mod => "%",
-                },
-                right.describe()
-            ),
-            ExprKind::Compare(op, left, right) => format!(
-                "{} {} {}",
-                left.describe(),
-                match op {
-                    Cmp::Eq => "==",
-                    Cmp::Ne => "!=",
-                    Cmp::Lt => "<",
-                    Cmp::Le => "<=",
-                    Cmp::Gt => ">",
-                    Cmp::Ge => ">=",
-                },
-                right.describe()
-            ),
-            ExprKind::Membership {
-                negated,
-                needle,
-                haystack,
-            } => format!(
-                "{} {}in {}",
-                needle.describe(),
-                if *negated { "not " } else { "" },
-                haystack.describe()
-            ),
-            ExprKind::Bool(op, left, right) => format!(
-                "{} {} {}",
-                left.describe(),
-                match op {
-                    BoolOp::And => "and",
-                    BoolOp::Or => "or",
-                },
-                right.describe()
-            ),
-        }
-    }
-}
-
-/// Recursive-descent parser over one expression's tokens. Precedence follows
-/// Jinja2: `or` < `not` < comparisons/`in`/`is` < `+ -` < `* / %` < unary `-`
-/// < `|` < postfix (`a.b`, `a[i]`, `a(…)`).
-struct ExprParser<'a> {
-    name: &'a str,
-    toks: Vec<(Tok, usize)>,
-    pos: usize,
-    line: usize,
-}
-
-impl<'a> ExprParser<'a> {
-    fn peek(&self) -> Option<&(Tok, usize)> {
-        self.toks.get(self.pos)
-    }
-
-    fn line_here(&self) -> usize {
-        self.toks
-            .get(self.pos)
-            .or(self.toks.last())
-            .map(|(_, line)| *line)
-            .unwrap_or(self.line)
-    }
-
-    fn error(&self, detail: impl Into<String>) -> TemplateError {
-        TemplateError::load(self.name, self.line_here(), detail)
-    }
-
-    fn is_op(&self, op: &str) -> bool {
-        matches!(self.peek(), Some((Tok::Op(word), _)) if word == op)
-    }
-
-    fn is_name(&self, name: &str) -> bool {
-        matches!(self.peek(), Some((Tok::Name(word), _)) if word == name)
-    }
-
-    fn bump(&mut self) -> Option<Tok> {
-        let tok = self.toks.get(self.pos).map(|(tok, _)| tok.clone());
-        if tok.is_some() {
-            self.pos += 1;
-        }
-        tok
-    }
-
-    fn expect_op(&mut self, op: &str) -> Result<(), TemplateError> {
-        if self.is_op(op) {
-            self.bump();
-            Ok(())
-        } else {
-            Err(self.error(format!("expected '{op}'")))
-        }
-    }
-
-    fn parse_or(&mut self) -> Result<Expr, TemplateError> {
-        let mut left = self.parse_and()?;
-        while self.is_name("or") {
-            self.bump();
-            let line = self.line_here();
-            let right = self.parse_and()?;
-            left = Expr {
-                kind: ExprKind::Bool(BoolOp::Or, Box::new(left), Box::new(right)),
-                line,
-            };
-        }
-        Ok(left)
-    }
-
-    fn parse_and(&mut self) -> Result<Expr, TemplateError> {
-        let mut left = self.parse_not()?;
-        while self.is_name("and") {
-            self.bump();
-            let line = self.line_here();
-            let right = self.parse_not()?;
-            left = Expr {
-                kind: ExprKind::Bool(BoolOp::And, Box::new(left), Box::new(right)),
-                line,
-            };
-        }
-        Ok(left)
-    }
-
-    fn parse_not(&mut self) -> Result<Expr, TemplateError> {
-        if self.is_name("not") {
-            let line = self.line_here();
-            self.bump();
-            let inner = self.parse_not()?;
-            return Ok(Expr {
-                kind: ExprKind::Not(Box::new(inner)),
-                line,
-            });
-        }
-        self.parse_compare()
-    }
-
-    fn parse_compare(&mut self) -> Result<Expr, TemplateError> {
-        let mut left = self.parse_add()?;
-        loop {
-            let line = self.line_here();
-            let comparison = match self.peek().cloned() {
-                Some((Tok::Op(op), _)) if Cmp::from(&op).is_some() => {
-                    let op = Cmp::from(&op).expect("checked");
-                    self.bump();
-                    let right = self.parse_add()?;
-                    ExprKind::Compare(op, Box::new(left), Box::new(right))
-                }
-                Some((Tok::Name(word), _)) if word == "in" => {
-                    self.bump();
-                    let haystack = self.parse_add()?;
-                    ExprKind::Membership {
-                        negated: false,
-                        needle: Box::new(left),
-                        haystack: Box::new(haystack),
-                    }
-                }
-                Some((Tok::Name(word), _)) if word == "not" => {
-                    // `x not in y` — but `x not …` otherwise is a syntax gap.
-                    if !matches!(self.toks.get(self.pos + 1), Some((Tok::Name(w), _)) if w == "in")
-                    {
-                        return Err(self.error(
-                            "expected 'in' after 'not' \
-                             (only 'not in' is supported here)",
-                        ));
-                    }
-                    self.pos += 2;
-                    let haystack = self.parse_add()?;
-                    ExprKind::Membership {
-                        negated: true,
-                        needle: Box::new(left),
-                        haystack: Box::new(haystack),
-                    }
-                }
-                Some((Tok::Name(word), _)) if word == "is" => {
-                    self.bump();
-                    let negated = if self.is_name("not") {
-                        self.bump();
-                        true
-                    } else {
-                        false
-                    };
-                    let Some((Tok::Name(test), _)) = self.peek().cloned() else {
-                        return Err(self.error("expected a test name after 'is'"));
-                    };
-                    self.bump();
-                    if test != "defined" {
-                        return Err(self.error(format!(
-                            "unsupported test '{test}' (this port implements 'is defined')"
-                        )));
-                    }
-                    ExprKind::IsDefined {
-                        negated,
-                        test: Box::new(left),
-                    }
-                }
-                _ => break,
-            };
-            left = Expr {
-                kind: comparison,
-                line,
-            };
-            // Python's chained comparisons (`a < b < c`) are not implemented.
-            let chained = match self.peek() {
-                Some((Tok::Op(op), _)) => Cmp::from(op).is_some(),
-                Some((Tok::Name(word), _)) => matches!(word.as_str(), "in" | "is"),
-                _ => false,
-            };
-            if chained {
-                return Err(self.error("chained comparisons are not supported"));
-            }
-        }
-        Ok(left)
-    }
-
-    fn parse_add(&mut self) -> Result<Expr, TemplateError> {
-        let mut left = self.parse_mul()?;
-        loop {
-            let line = self.line_here();
-            let op = match self.peek().cloned() {
-                Some((Tok::Op(op), _)) if op == "+" => Arith::Add,
-                Some((Tok::Op(op), _)) if op == "-" => Arith::Sub,
-                _ => break,
-            };
-            self.bump();
-            let right = self.parse_mul()?;
-            left = Expr {
-                kind: ExprKind::Arith(op, Box::new(left), Box::new(right)),
-                line,
-            };
-        }
-        Ok(left)
-    }
-
-    fn parse_mul(&mut self) -> Result<Expr, TemplateError> {
-        let mut left = self.parse_unary()?;
-        loop {
-            let line = self.line_here();
-            let op = match self.peek().cloned() {
-                Some((Tok::Op(op), _)) if op == "*" => Arith::Mul,
-                Some((Tok::Op(op), _)) if op == "/" => Arith::Div,
-                Some((Tok::Op(op), _)) if op == "%" => Arith::Mod,
-                _ => break,
-            };
-            self.bump();
-            let right = self.parse_unary()?;
-            left = Expr {
-                kind: ExprKind::Arith(op, Box::new(left), Box::new(right)),
-                line,
-            };
-        }
-        Ok(left)
-    }
-
-    fn parse_unary(&mut self) -> Result<Expr, TemplateError> {
-        if self.is_op("-") {
-            let line = self.line_here();
-            self.bump();
-            let inner = self.parse_unary()?;
-            return Ok(Expr {
-                kind: ExprKind::Neg(Box::new(inner)),
-                line,
-            });
-        }
-        self.parse_filter()
-    }
-
-    /// `expr | name` with Jinja's optional argument list, `expr | name(a, b)`
-    /// — `params.S | default(1000.0) | float`
-    /// (`printer-velleman-k8800-2017.cfg:125`).
-    fn parse_filter(&mut self) -> Result<Expr, TemplateError> {
-        let mut left = self.parse_postfix()?;
-        while self.is_op("|") {
-            let line = self.line_here();
-            self.bump();
-            let Some((Tok::Name(filter), _)) = self.peek().cloned() else {
-                return Err(self.error("expected a filter name after '|'"));
-            };
-            self.bump();
-            let mut args = Vec::new();
-            if self.is_op("(") {
-                self.bump();
-                if !self.is_op(")") {
-                    loop {
-                        args.push(self.parse_or()?);
-                        if self.is_op(",") {
-                            self.bump();
-                            continue;
-                        }
-                        break;
-                    }
-                }
-                self.expect_op(")")?;
-            }
-            left = Expr {
-                kind: ExprKind::Filter(Box::new(left), filter, args),
-                line,
-            };
-        }
-        Ok(left)
-    }
-
-    fn parse_postfix(&mut self) -> Result<Expr, TemplateError> {
-        let mut expr = self.parse_primary()?;
-        loop {
-            let line = self.line_here();
-            if self.is_op(".") {
-                self.bump();
-                let Some((Tok::Name(key), _)) = self.peek().cloned() else {
-                    return Err(self.error("expected an attribute name after '.'"));
-                };
-                self.bump();
-                expr = Expr {
-                    kind: ExprKind::Attr(Box::new(expr), key),
-                    line,
-                };
-                continue;
-            }
-            if self.is_op("[") {
-                self.bump();
-                let index = self.parse_or()?;
-                self.expect_op("]")?;
-                expr = Expr {
-                    kind: ExprKind::Index(Box::new(expr), Box::new(index)),
-                    line,
-                };
-                continue;
-            }
-            if self.is_op("(") {
-                self.bump();
-                let mut args = Vec::new();
-                if !self.is_op(")") {
-                    loop {
-                        args.push(self.parse_or()?);
-                        if self.is_op(",") {
-                            self.bump();
-                            continue;
-                        }
-                        break;
-                    }
-                }
-                self.expect_op(")")?;
-                expr = Expr {
-                    kind: ExprKind::Call(Box::new(expr), args),
-                    line,
-                };
-                continue;
-            }
-            break;
-        }
-        Ok(expr)
-    }
-
-    fn parse_primary(&mut self) -> Result<Expr, TemplateError> {
-        let line = self.line_here();
-        let Some(tok) = self.peek().cloned() else {
-            return Err(self.error("unexpected end of expression"));
-        };
-        match tok {
-            (Tok::Num { text, is_int }, _) => {
-                self.bump();
-                let value = if is_int {
-                    json!(text.parse::<i64>().map_err(|_| {
-                        TemplateError::load(self.name, line, format!("malformed number '{text}'"))
-                    })?)
-                } else {
-                    json!(text.parse::<f64>().map_err(|_| {
-                        TemplateError::load(self.name, line, format!("malformed number '{text}'"))
-                    })?)
-                };
-                Ok(Expr {
-                    kind: ExprKind::Literal(value),
-                    line,
-                })
-            }
-            (Tok::Str(text), _) => {
-                self.bump();
-                Ok(Expr {
-                    kind: ExprKind::Literal(Value::String(text)),
-                    line,
-                })
-            }
-            (Tok::Name(word), _) => {
-                self.bump();
-                match word.as_str() {
-                    "True" => Ok(Expr {
-                        kind: ExprKind::Literal(json!(true)),
-                        line,
-                    }),
-                    "False" => Ok(Expr {
-                        kind: ExprKind::Literal(json!(false)),
-                        line,
-                    }),
-                    "None" => Ok(Expr {
-                        kind: ExprKind::Literal(Value::Null),
-                        line,
-                    }),
-                    "and" | "or" | "not" | "in" | "is" | "defined" => {
-                        Err(self.error(format!("unexpected '{word}'")))
-                    }
-                    _ => Ok(Expr {
-                        kind: ExprKind::Name(word),
-                        line,
-                    }),
-                }
-            }
-            (Tok::Op(op), _) if op == "(" => {
-                self.bump();
-                let inner = self.parse_or()?;
-                self.expect_op(")")?;
-                Ok(inner)
-            }
-            // `[a, b]` — the list literal `generic_cartesian_iqex.cfg:286`
-            // reduces with `|min`; elements are whole expressions, so they may
-            // carry filters of their own.
-            (Tok::Op(op), _) if op == "[" => {
-                self.bump();
-                let mut items = Vec::new();
-                if !self.is_op("]") {
-                    loop {
-                        items.push(self.parse_or()?);
-                        if self.is_op(",") {
-                            self.bump();
-                            continue;
-                        }
-                        break;
-                    }
-                }
-                self.expect_op("]")?;
-                Ok(Expr {
-                    kind: ExprKind::List(items),
-                    line,
-                })
-            }
-            other => Err(self.error(format!(
-                "unexpected token '{}' in expression",
-                describe_tok(&other.0)
-            ))),
-        }
-    }
-}
-
-impl Cmp {
-    fn from(op: &str) -> Option<Self> {
-        Some(match op {
-            "==" => Cmp::Eq,
-            "!=" => Cmp::Ne,
-            "<" => Cmp::Lt,
-            "<=" => Cmp::Le,
-            ">" => Cmp::Gt,
-            ">=" => Cmp::Ge,
-            _ => return None,
-        })
-    }
-}
-
-// ===========================================================================
-// Render
-// ===========================================================================
-
-fn render_nodes(
-    nodes: &[Node],
-    context: &mut Context,
-    name: &str,
-    out: &mut String,
-) -> Result<(), TemplateError> {
-    for node in nodes {
-        match node {
-            Node::Text(text) => out.push_str(text),
-            Node::Expr(expr) => {
-                let value = eval(expr, context, name)?;
-                out.push_str(
-                    &to_text(&value)
-                        .map_err(|detail| TemplateError::evaluate(name, expr.line, detail))?,
-                );
-            }
-            Node::If {
-                branches,
-                otherwise,
-            } => {
-                let mut done = false;
-                for (condition, body) in branches {
-                    let value = eval(condition, context, name)?;
-                    if truthy(&value) {
-                        render_nodes(body, context, name, out)?;
-                        done = true;
-                        break;
-                    }
-                }
-                if !done {
-                    if let Some(body) = otherwise {
-                        render_nodes(body, context, name, out)?;
-                    }
-                }
-            }
-            Node::For {
-                var,
-                iter,
-                body,
-                line,
-            } => {
-                let value = eval(iter, context, name)?;
-                let items = iterate(value).map_err(|detail| {
-                    TemplateError::evaluate(name, *line, format!("in loop: {detail}"))
-                })?;
-                for item in items {
-                    context.push_frame();
-                    context.bind(var, item);
-                    render_nodes(body, context, name, out)?;
-                    context.pop_frame();
-                }
-            }
-            Node::Set {
-                name: target,
-                value,
-            } => {
-                let value = eval(value, context, name)?;
-                context.bind(target, value);
-            }
-        }
-    }
-    Ok(())
-}
-
-/// The values a `{% for %}` walks: a `range(n)` result, a JSON list or
-/// string, or a literal list.
-fn iterate(value: Rt) -> Result<Vec<Rt>, String> {
-    match value {
-        Rt::List(items) => Ok(items),
-        Rt::Json(Value::Array(items)) => Ok(items.into_iter().map(Rt::Json).collect()),
-        Rt::Json(Value::String(text)) => Ok(text
-            .chars()
-            .map(|c| Rt::Json(Value::String(c.to_string())))
-            .collect()),
-        other => Err(format!("cannot iterate over {}", type_name(&other))),
-    }
-}
-
-fn eval(expr: &Expr, context: &Context, name: &str) -> Result<Rt, TemplateError> {
-    let error = |detail: String| TemplateError::evaluate(name, expr.line, detail);
-    match &expr.kind {
-        ExprKind::Literal(value) => Ok(Rt::Json(value.clone())),
-        ExprKind::List(items) => {
-            let mut evaluated = Vec::with_capacity(items.len());
-            for item in items {
-                evaluated.push(eval(item, context, name)?);
-            }
-            Ok(Rt::List(evaluated))
-        }
-        ExprKind::Name(binding) => match binding.as_str() {
-            // Python's keywords are literals in Jinja too.
-            "True" => Ok(Rt::Json(json!(true))),
-            "False" => Ok(Rt::Json(json!(false))),
-            "None" => Ok(Rt::Json(Value::Null)),
-            _ => context
-                .lookup(binding)
-                .cloned()
-                .ok_or_else(|| error(format!("'{binding}' is undefined"))),
-        },
-        ExprKind::Attr(base, key) => {
-            let base_value = eval(base, context, name)?;
-            attr(&base_value, key)
-                .ok_or_else(|| error(format!("{} has no attribute '{key}'", base.describe())))
-        }
-        ExprKind::Index(base, index) => {
-            let base_value = eval(base, context, name)?;
-            let index_value = eval(index, context, name)?;
-            index_into(&base_value, &index_value).map_err(|detail| error(detail))
-        }
-        ExprKind::Call(callee, args) => {
-            let mut evaluated = Vec::with_capacity(args.len());
-            for arg in args {
-                evaluated.push(eval(arg, context, name)?);
-            }
-            call(callee, &evaluated, context, name).map_err(|detail| error(detail))
-        }
-        ExprKind::Filter(base, filter, args) => {
-            // Arity is the filter's own property, so it is reported before the
-            // base resolves — a missing `params.S` would mask it.
-            check_filter_arity(filter, args.len()).map_err(error)?;
-            // `default` must know whether its base *resolves*, so it probes it
-            // quietly instead of failing the render the way every other
-            // operand does (`params.S|default(…)` with `S` omitted).
-            if filter == "default" {
-                let fallback = eval(&args[0], context, name)?;
-                return Ok(eval_quiet(base, context).unwrap_or(fallback));
-            }
-            let mut evaluated = Vec::with_capacity(args.len());
-            for arg in args {
-                evaluated.push(eval(arg, context, name)?);
-            }
-            let value = eval(base, context, name)?;
-            match filter.as_str() {
-                // Jinja's `int` filter: `int(value)`, then `int(float(value))`.
-                "int" => filter_int(&value).map_err(error),
-                // Jinja's `float` filter: `float(value)` or the filter's own
-                // default, `0.0` when it has no argument.
-                "float" => filter_float(&value, evaluated.first()).map_err(error),
-                // Jinja's `min`/`max`: the smallest/largest item of a sequence
-                // (`generic_cartesian_iqex.cfg:286-287`).
-                "min" | "max" => filter_extreme(filter, &value).map_err(error),
-                other => Err(error(format!(
-                    "unknown filter '{other}' \
-                     (this port implements 'int', 'float', 'default', 'min' and 'max')"
-                ))),
-            }
-        }
-        ExprKind::IsDefined { negated, test } => {
-            let found = probe_defined(test, context);
-            Ok(Rt::Json(json!(found != *negated)))
-        }
-        ExprKind::Not(inner) => {
-            let value = eval(inner, context, name)?;
-            Ok(Rt::Json(json!(!truthy(&value))))
-        }
-        ExprKind::Neg(inner) => {
-            let value = eval(inner, context, name)?;
-            match value {
-                Rt::Json(Value::Number(number)) => Ok(Rt::Json(json!(-number
-                    .as_f64()
-                    .ok_or_else(|| error(format!("cannot negate {}", number)))?))),
-                other => Err(error(format!(
-                    "bad operand type for unary '-': {}",
-                    type_name(&other)
-                ))),
-            }
-        }
-        ExprKind::Arith(op, left, right) => {
-            let left = eval(left, context, name)?;
-            let right = eval(right, context, name)?;
-            arith(*op, &left, &right).map_err(error)
-        }
-        ExprKind::Compare(op, left, right) => {
-            let left = eval(left, context, name)?;
-            let right = eval(right, context, name)?;
-            compare(*op, &left, &right).map_err(error)
-        }
-        ExprKind::Membership {
-            negated,
-            needle,
-            haystack,
-        } => {
-            let needle = eval(needle, context, name)?;
-            let haystack = eval(haystack, context, name)?;
-            let found = contains(&needle, &haystack);
-            Ok(Rt::Json(json!(found != *negated)))
-        }
-        ExprKind::Bool(op, left, right) => {
-            let left = eval(left, context, name)?;
-            match op {
-                BoolOp::And => {
-                    if !truthy(&left) {
-                        return Ok(Rt::Json(json!(false)));
-                    }
-                    let right = eval(right, context, name)?;
-                    Ok(Rt::Json(json!(truthy(&right))))
-                }
-                BoolOp::Or => {
-                    if truthy(&left) {
-                        return Ok(Rt::Json(json!(true)));
-                    }
-                    let right = eval(right, context, name)?;
-                    Ok(Rt::Json(json!(truthy(&right))))
-                }
-            }
-        }
-    }
-}
-
-/// `Rt` clones carry the `printer` view's cache with them; a probe and the
-/// render it feeds therefore see the same statuses.
-
-/// `value.key`: status objects by key, JSON arrays by the `Coord` field order
-/// (`x y z e`), the `printer` view by object name.
-fn attr(base: &Rt, key: &str) -> Option<Rt> {
-    match base {
-        Rt::Json(Value::Object(map)) => map.get(key).cloned().map(Rt::Json),
-        Rt::Json(Value::Array(items)) => coord(items, key).map(Rt::Json),
-        Rt::Printer(view) => view.status(key).map(Rt::Json),
-        Rt::Json(_) | Rt::List(_) | Rt::Builtin(_) => None,
-    }
-}
-
-/// The `Coord` namedtuple's field order (`klippy/gcode.py`, `mathutil.rs`).
-fn coord(items: &[Value], key: &str) -> Option<Value> {
-    let index = match key {
-        "x" => 0,
-        "y" => 1,
-        "z" => 2,
-        "e" => 3,
-        _ => return None,
-    };
-    items.get(index).cloned()
-}
-
-fn index_into(base: &Rt, index: &Rt) -> Result<Rt, String> {
-    match base {
-        Rt::Json(Value::Object(map)) => {
-            let key = to_text(index)?;
-            map.get(&key)
-                .cloned()
-                .map(Rt::Json)
-                .ok_or_else(|| format!("dict has no key '{key}'"))
-        }
-        Rt::Json(Value::Array(items)) => {
-            let offset = as_index(index)?;
-            items
-                .get(offset)
-                .cloned()
-                .map(Rt::Json)
-                .ok_or_else(|| format!("list index {offset} is out of range"))
-        }
-        Rt::List(items) => {
-            let offset = as_index(index)?;
-            match items.get(offset) {
-                Some(item) => Ok(item.clone()),
-                None => Err(format!("list index {offset} is out of range")),
-            }
-        }
-        Rt::Printer(view) => {
-            let key = to_text(index)?;
-            view.status(&key)
-                .map(Rt::Json)
-                .ok_or_else(|| format!("printer has no object '{key}'"))
-        }
-        Rt::Builtin(_) => Err("a builtin function cannot be indexed".to_string()),
-        Rt::Json(_) => Err(format!("{} is not subscriptable", type_name(base))),
-    }
-}
-
-fn as_index(index: &Rt) -> Result<usize, String> {
-    match index {
-        Rt::Json(Value::Number(number)) => {
-            let value = number.as_f64().ok_or("index is not a number")?;
-            if value < 0.0 || value.fract() != 0.0 {
-                Err(format!("list index {value} is not an integer"))
-            } else {
-                Ok(value as usize)
-            }
-        }
-        other => Err(format!(
-            "list indices must be integers, not {}",
-            type_name(other)
-        )),
-    }
-}
-
-/// `x is defined`: quiet probing, so an undefined name is *false*, never an
-/// error (`sdcard_loop.cfg:90`).
-fn probe_defined(expr: &Expr, context: &Context) -> bool {
-    eval_quiet(expr, context).is_some()
-}
-
-/// Evaluate without reporting an error: anything that fails to produce a
-/// value is "not defined".
-fn eval_quiet(expr: &Expr, context: &Context) -> Option<Rt> {
-    eval(expr, context, "").ok()
-}
-
-/// `callable(args)` — the context's builtins only.
-fn call(callee: &Expr, args: &[Rt], context: &Context, name: &str) -> Result<Rt, String> {
-    let ExprKind::Name(binding) = &callee.kind else {
-        return Err(format!("{} is not callable", callee.describe()));
-    };
-    let resolved = context
-        .lookup(binding)
-        .ok_or_else(|| format!("'{binding}' is undefined"))?;
-    match resolved {
-        Rt::Builtin(Builtin::Range) => {
-            if args.len() != 1 {
-                return Err(format!(
-                    "range() takes 1 argument here, got {} (this port's gap)",
-                    args.len()
-                ));
-            }
-            let stop = match &args[0] {
-                Rt::Json(Value::Number(number)) => {
-                    let value = number.as_f64().ok_or("range() needs a number")?;
-                    if value.fract() != 0.0 {
-                        return Err(format!(
-                            "'{}' cannot be interpreted as an integer",
-                            fmt_float(value)
-                        ));
-                    }
-                    value as i64
-                }
-                Rt::Json(Value::Bool(flag)) => i64::from(*flag),
-                other => {
-                    return Err(format!(
-                        "'{}' cannot be interpreted as an integer",
-                        to_text(other)?
-                    ))
-                }
-            };
-            Ok(Rt::List(
-                (0..stop.max(0)).map(|n| Rt::Json(json!(n))).collect(),
-            ))
-        }
-        Rt::Builtin(Builtin::RespondInfo(printer)) => {
-            let message = to_text(args.first().unwrap_or(&Rt::Json(Value::Null)))?;
-            if let Some(gcode) = printer
-                .lookup_object_as::<crate::core::klippy::gcode::GCodeDispatch>(
-                    crate::core::klippy::gcode::GCODE_OBJECT,
-                )
-            {
-                gcode.respond_info(&message, true);
-            }
-            let _ = name;
-            Ok(Rt::Json(Value::String(String::new())))
-        }
-        Rt::Builtin(Builtin::RaiseError) => {
-            let message = to_text(args.first().unwrap_or(&Rt::Json(Value::Null)))?;
-            Err(message)
-        }
-        Rt::Json(_) | Rt::List(_) | Rt::Printer(_) => {
-            Err(format!("{} is not callable", callee.describe()))
-        }
-    }
-}
-
-/// The argument count each implemented filter accepts; anything else is one of
-/// this port's gaps, named as such.
-fn check_filter_arity(filter: &str, count: usize) -> Result<(), String> {
-    match filter {
-        "int" if count > 0 => Err(format!(
-            "the 'int' filter takes no arguments here, got {count} (this port's gap)"
-        )),
-        "float" if count > 1 => Err(format!(
-            "the 'float' filter takes at most 1 argument here, got {count} (this port's gap)"
-        )),
-        "default" if count != 1 => Err(format!(
-            "the 'default' filter takes 1 argument here, got {count} (this port's gap)"
-        )),
-        // Jinja reads a positional argument as `case_sensitive` and a keyword
-        // one as `attribute`; the tokenizer has no `=`, so only the bare
-        // spelling is inside the subset (`generic_cartesian_iqex.cfg:286-287`).
-        "min" | "max" if count > 0 => Err(format!(
-            "the '{filter}' filter takes no arguments here, got {count} (this port's gap)"
-        )),
-        _ => Ok(()),
-    }
-}
-
-/// `| int`: `int(value)`, falling back to `int(float(value))` as Jinja's
-/// filter does.
-fn filter_int(value: &Rt) -> Result<Rt, String> {
-    match value {
-        Rt::Json(Value::Number(number)) => {
-            let float = number.as_f64().ok_or("not a number")?;
-            Ok(Rt::Json(json!(float.trunc() as i64)))
-        }
-        Rt::Json(Value::Bool(flag)) => Ok(Rt::Json(json!(i64::from(*flag)))),
-        Rt::Json(Value::String(text)) => {
-            let trimmed = text.trim();
-            if let Ok(int) = trimmed.parse::<i64>() {
-                return Ok(Rt::Json(json!(int)));
-            }
-            if let Ok(float) = trimmed.parse::<f64>() {
-                return Ok(Rt::Json(json!(float.trunc() as i64)));
-            }
-            Err(format!(
-                "invalid literal for int(): {text:?} (jinja's 'int' filter)"
-            ))
-        }
-        other => Err(format!("cannot convert {} to an integer", type_name(other))),
-    }
-}
-
-/// `| float` (and `| float(d)`): `float(value)`, returning the filter's own
-/// default — `d`, or `0.0` when it has none — for the types Python's `float()`
-/// rejects (`TypeError`) and for strings it cannot parse (`ValueError`).
-fn filter_float(value: &Rt, default: Option<&Rt>) -> Result<Rt, String> {
-    fn fallback(default: Option<&Rt>) -> Result<Rt, String> {
-        Ok(default.cloned().unwrap_or_else(|| Rt::Json(json!(0.0))))
-    }
-    match value {
-        Rt::Json(Value::Number(number)) => match number.as_f64() {
-            Some(float) => Ok(Rt::Json(json!(float))),
-            None => fallback(default),
-        },
-        Rt::Json(Value::Bool(flag)) => Ok(Rt::Json(json!(if *flag { 1.0 } else { 0.0 }))),
-        Rt::Json(Value::String(text)) => match text.trim().parse::<f64>() {
-            Ok(float) => Ok(Rt::Json(json!(float))),
-            Err(_) => fallback(default),
-        },
-        // `None`, a container, `printer`, a builtin: `float()` raises.
-        Rt::Json(_) | Rt::List(_) | Rt::Printer(_) | Rt::Builtin(_) => fallback(default),
-    }
-}
-
-/// `| min` / `| max` (`generic_cartesian_iqex.cfg:286-287`): the smallest /
-/// largest item of a sequence, as Jinja's `_min_or_max` (`jinja2/filters.py`)
-/// computes it — the environment's default `case_sensitive=False` means the
-/// comparison key folds strings to lower case (`min(["B", "a"])` is `"a"`)
-/// while the *original* item is what comes back, and everything else is its
-/// own key. CPython's `min`/`max` compare with `<`/`>`, which this port's
-/// [`compare`] already spells (numbers numerically, strings by code point,
-/// anything else an explicit `unorderable types` error).
+/// `| int` and `| int(default)`.
 ///
-/// An empty sequence is where this port leaves Jinja2: `_min_or_max` returns
-/// `environment.undefined("No aggregated item, sequence was empty.")` (3.1.6
-/// renders it blank and `is defined` is false), and this port has no
-/// `Undefined` value to hand back — see the module docs' gaps.
-fn filter_extreme(filter: &str, value: &Rt) -> Result<Rt, String> {
-    let mut items = iterate(value.clone())?.into_iter();
+/// `int(value)` with Jinja2's optional default. A value the conversion cannot
+/// take falls back to the default — `|int(0)` is Jinja2's spelling of the
+/// corpus' `|default(0)|int` — and **without** a default it fails, which is
+/// this port's rule: a body that meant `|int(0)` and wrote `|int` should not
+/// drive a pin with a number nobody supplied.
+///
+/// An undefined value is always an error, default or not: that is what Jinja2
+/// does (`Undefined.__int__` raises) and what the old subset did (it evaluated
+/// the filter's base strictly).
+fn filter_int(value: &MjValue, default: Option<MjValue>) -> Result<MjValue, MjError> {
+    if value.is_undefined() {
+        return Err(MjError::from(ErrorKind::UndefinedError));
+    }
+    let parsed = match value.kind() {
+        ValueKind::Number => value
+            .as_i64()
+            .or_else(|| f64::try_from(value.clone()).ok().map(|f| f.trunc() as i64)),
+        ValueKind::Bool => Some(i64::from(value.is_true())),
+        ValueKind::String => {
+            let text = value.as_str().unwrap_or_default().trim();
+            text.parse::<i64>()
+                .ok()
+                .or_else(|| text.parse::<f64>().ok().map(|f| f.trunc() as i64))
+        }
+        _ => None,
+    };
+    match parsed {
+        Some(int) => Ok(MjValue::from(int)),
+        None => match default {
+            Some(fallback) => Ok(fallback),
+            None => Err(MjError::new(
+                ErrorKind::InvalidOperation,
+                format!("invalid literal for int(): {}", value),
+            )),
+        },
+    }
+}
+
+/// `| float` and `| float(default)`.
+///
+/// `float(value)` with Jinja2's optional default: a value Python's `float()`
+/// would reject — `None`, a container, a string that is not a number — falls
+/// back to the argument, or to `0.0` when the filter has none
+/// (`sample-macros.cfg:285`). `1e3` and surrounding whitespace are Python's
+/// own spellings and are accepted.
+///
+/// As above, an undefined value is an error with or without a default.
+fn filter_float(value: &MjValue, default: Option<MjValue>) -> Result<MjValue, MjError> {
+    if value.is_undefined() {
+        return Err(MjError::from(ErrorKind::UndefinedError));
+    }
+    let fallback = || default.clone().unwrap_or_else(|| MjValue::from(0.0));
+    let parsed = match value.kind() {
+        ValueKind::Number => f64::try_from(value.clone()).ok(),
+        ValueKind::Bool => Some(if value.is_true() { 1.0 } else { 0.0 }),
+        ValueKind::String => value
+            .as_str()
+            .unwrap_or_default()
+            .trim()
+            .parse::<f64>()
+            .ok(),
+        _ => None,
+    };
+    match parsed {
+        Some(float) => Ok(MjValue::from(float)),
+        None => Ok(fallback()),
+    }
+}
+
+/// `| min` — the smallest item of a sequence
+/// (`generic_cartesian_iqex.cfg:286-287`).
+///
+/// Jinja's `_min_or_max` with its default `case_sensitive=False`: strings
+/// compare folded to lower case while the *original* item comes back
+/// (`min(["B", "a"])` is `"a"`), and everything else is its own key.
+fn filter_min(value: MjValue) -> Result<MjValue, MjError> {
+    extreme("min", value, true)
+}
+
+/// `| max` — the largest item of a sequence, as `| min` reads it.
+fn filter_max(value: MjValue) -> Result<MjValue, MjError> {
+    extreme("max", value, false)
+}
+
+fn extreme(filter: &str, value: MjValue, least: bool) -> Result<MjValue, MjError> {
+    let mut items = sequence(&value)?.into_iter();
     let Some(mut best) = items.next() else {
-        return Err(format!(
-            "{filter}() arg is an empty sequence \
-             (jinja2 leaves it undefined; this port fails loudly)"
+        return Err(MjError::new(
+            ErrorKind::InvalidOperation,
+            format!("{filter}() arg is an empty sequence"),
         ));
     };
-    let op = if filter == "min" { Cmp::Lt } else { Cmp::Gt };
+    let op = if least { "<" } else { ">" };
     for item in items {
-        let replaces = compare(op, &extreme_key(&item), &extreme_key(&best))?;
-        if truthy(&replaces) {
+        let ordering = key_order(&item, &best).ok_or_else(|| {
+            MjError::new(
+                ErrorKind::InvalidOperation,
+                format!(
+                    "unorderable types: {} and {} ({op})",
+                    ordering_name(&item),
+                    ordering_name(&best)
+                ),
+            )
+        })?;
+        let replaces = if least {
+            ordering.is_lt()
+        } else {
+            ordering.is_gt()
+        };
+        if replaces {
             best = item;
         }
     }
     Ok(best)
 }
 
-/// The `ignore_case` key Jinja's `min`/`max` use when `case_sensitive` is
-/// false: strings fold for the comparison, every other type is its own key.
-fn extreme_key(value: &Rt) -> Rt {
-    match value {
-        Rt::Json(Value::String(text)) => Rt::Json(Value::String(text.to_lowercase())),
-        other => other.clone(),
+/// The values `| min`/`| max` walk, with a non-sequence named the way CPython
+/// names it (`cannot iterate over number`).
+fn sequence(value: &MjValue) -> Result<Vec<MjValue>, MjError> {
+    match value.kind() {
+        ValueKind::String | ValueKind::Seq | ValueKind::Iterable | ValueKind::Map => value
+            .try_iter()
+            .map(|items| items.collect())
+            .map_err(|_| uniterable(value)),
+        _ => Err(uniterable(value)),
     }
 }
 
-fn contains(needle: &Rt, haystack: &Rt) -> bool {
-    match haystack {
-        Rt::Printer(view) => view.has(&needle_display(needle)),
-        Rt::Json(Value::Object(map)) => map.contains_key(&needle_display(needle)),
-        Rt::Json(Value::Array(items)) => items
-            .iter()
-            .any(|item| equals(needle, &Rt::Json(item.clone()))),
-        Rt::Json(Value::String(text)) => text.contains(&needle_display(needle)),
-        Rt::List(items) => items.iter().any(|item| equals(needle, item)),
-        Rt::Json(_) | Rt::Builtin(_) => false,
+fn uniterable(value: &MjValue) -> MjError {
+    MjError::new(
+        ErrorKind::InvalidOperation,
+        format!("cannot iterate over {}", value.kind()),
+    )
+}
+
+/// How `| min`/`| max` order two items: numbers (booleans count as `0`/`1`, as
+/// Python compares them) numerically, strings folded to lower case, and
+/// anything else unorderable — CPython's own refusal, which this port keeps
+/// loudly rather than falling back on a cross-type ordering.
+fn key_order(left: &MjValue, right: &MjValue) -> Option<std::cmp::Ordering> {
+    match (number_key(left), number_key(right)) {
+        (Some(a), Some(b)) => return Some(a.cmp(&b)),
+        (None, None) => {}
+        _ => return None,
+    }
+    let (a, b) = (left.as_str()?, right.as_str()?);
+    Some(a.to_lowercase().cmp(&b.to_lowercase()))
+}
+
+/// A number or a boolean as the number it compares as.
+fn number_key(value: &MjValue) -> Option<MjValue> {
+    match value.kind() {
+        ValueKind::Number => Some(value.clone()),
+        ValueKind::Bool => Some(MjValue::from(i64::from(value.is_true()))),
+        _ => None,
     }
 }
 
-/// The membership key: `GetStatusWrapper` does `str(val).strip()`
-/// (`gcode_macro.py:19-20`), so render the same way.
-fn needle_display(needle: &Rt) -> String {
-    to_text(needle).unwrap_or_default().trim().to_string()
-}
-
-fn arith(op: Arith, left: &Rt, right: &Rt) -> Result<Rt, String> {
-    match op {
-        Arith::Add => add(left, right),
-        Arith::Sub | Arith::Mul | Arith::Div | Arith::Mod => {
-            let (a, b) = as_numbers(left, right).ok_or_else(|| {
-                format!(
-                    "unsupported operand types for {}: {} and {}",
-                    match op {
-                        Arith::Add => "+",
-                        Arith::Sub => "-",
-                        Arith::Mul => "*",
-                        Arith::Div => "/",
-                        Arith::Mod => "%",
-                    },
-                    type_name(left),
-                    type_name(right)
-                )
-            })?;
-            match op {
-                Arith::Sub => Ok(Rt::Json(json_number(left, right, a - b))),
-                Arith::Mul => Ok(Rt::Json(json_number(left, right, a * b))),
-                Arith::Div => {
-                    if b == 0.0 {
-                        return Err("division by zero".to_string());
-                    }
-                    Ok(Rt::Json(json!(a / b)))
-                }
-                Arith::Mod => {
-                    if b == 0.0 {
-                        return Err("integer modulo by zero".to_string());
-                    }
-                    // Python's `%` takes the divisor's sign.
-                    let mut rem = a % b;
-                    if rem != 0.0 && (rem.is_sign_negative() != b.is_sign_negative()) {
-                        rem += b;
-                    }
-                    Ok(Rt::Json(json_number(left, right, rem)))
-                }
-                Arith::Add => unreachable!("handled in add"),
-            }
-        }
-    }
-}
-
-fn compare(op: Cmp, left: &Rt, right: &Rt) -> Result<Rt, String> {
-    if let Some((a, b)) = as_numbers(left, right) {
-        let result = match op {
-            Cmp::Eq => a == b,
-            Cmp::Ne => a != b,
-            Cmp::Lt => a < b,
-            Cmp::Le => a <= b,
-            Cmp::Gt => a > b,
-            Cmp::Ge => a >= b,
-        };
-        return Ok(Rt::Json(json!(result)));
-    }
-    if let (Rt::Json(Value::String(a)), Rt::Json(Value::String(b))) = (left, right) {
-        let ordering = a.cmp(b);
-        let result = match op {
-            Cmp::Eq => ordering.is_eq(),
-            Cmp::Ne => ordering.is_ne(),
-            Cmp::Lt => ordering.is_lt(),
-            Cmp::Le => ordering.is_le(),
-            Cmp::Gt => ordering.is_gt(),
-            Cmp::Ge => ordering.is_ge(),
-        };
-        return Ok(Rt::Json(json!(result)));
-    }
-    match op {
-        Cmp::Eq => Ok(Rt::Json(json!(equals(left, right)))),
-        Cmp::Ne => Ok(Rt::Json(json!(!equals(left, right)))),
-        ordering => Err(format!(
-            "unorderable types: {} and {} ({})",
-            type_name(left),
-            type_name(right),
-            match ordering {
-                Cmp::Lt => "<",
-                Cmp::Le => "<=",
-                Cmp::Gt => ">",
-                Cmp::Ge => ">=",
-                Cmp::Eq | Cmp::Ne => unreachable!(),
-            }
-        )),
+/// The Python type name an `unorderable types` message uses.
+fn ordering_name(value: &MjValue) -> &'static str {
+    match value.kind() {
+        ValueKind::Number | ValueKind::Bool => "number",
+        ValueKind::String => "str",
+        ValueKind::None | ValueKind::Undefined => "NoneType",
+        ValueKind::Seq => "list",
+        ValueKind::Map => "dict",
+        _ => "object",
     }
 }
 
@@ -2079,6 +681,9 @@ fn compare(op: Cmp, left: &Rt, right: &Rt) -> Result<Rt, String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    use crate::core::klippy::printer::PrinterObject;
+    use crate::core::klippy::reactor::ManualReactor;
 
     /// A context with the corpus' `params` / `rawparams` and one macro
     /// variable, the way `MacroState::context` builds them
@@ -2105,8 +710,24 @@ mod tests {
         render(source, &mut context(&[], "")).unwrap_or_else(|error| panic!("{error}"))
     }
 
-    /// The scalar spellings are Python's `str`, because Jinja renders through
-    /// it — `3.0`, not `3`; `True`, not `true`.
+    /// A machine with one object registered under `name` whose status is
+    /// `status`, for the tests that read `printer.<name>`.
+    fn printer_with(name: &str, status: Value) -> Arc<Printer> {
+        struct Fixed(Value);
+        impl PrinterObject for Fixed {
+            fn get_status(&self, _eventtime: f64) -> Value {
+                self.0.clone()
+            }
+        }
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        printer
+            .add_object(name, Arc::new(Fixed(status)))
+            .expect("the name is free");
+        printer
+    }
+
+    /// The scalar spellings are Python's `str`, because the body is rendered
+    /// through the engine's own formatter — `3.0`, not `3`; `True`, not `true`.
     #[test]
     fn expressions_render_python_spelling() {
         assert_eq!(ok("PARK_{3}"), "PARK_3");
@@ -2115,7 +736,13 @@ mod tests {
         assert_eq!(ok("{1 + 2}"), "3");
         assert_eq!(ok("{True}/{False}/{None}"), "True/False/None");
         assert_eq!(ok("{ 17 * 2 + 1 % 4 }"), "35");
-        assert_eq!(ok("{-3.5}"), "-3.5");
+        // `-` right after the opening brace is the whitespace-control marker,
+        // as `{{-` is with the default delimiters: upstream's
+        // `jinja2.Environment('{%','%}','{','}')` renders `{-3.5}` as `3.5`
+        // too, so the space is what upstream requires as well.
+        assert_eq!(ok("{-3.5}"), "3.5");
+        assert_eq!(ok("{ -3.5}"), "-3.5");
+        assert_eq!(ok("{ 0 - 3.5 }"), "-3.5");
     }
 
     /// `if` / `elif` / `else` and `for` over `range(… | int)`, the shapes
@@ -2174,27 +801,89 @@ mod tests {
         );
     }
 
-    /// Status coordinates are JSON arrays, but klippy's `Coord` namedtuple
-    /// exposes `.x`/`.y`/`.z`/`.e` (`mathutil.rs`) — the bridge the corpus
-    /// needs (`macros.cfg:34`).
+    /// A **status** array is read the way klippy's `Coord` namedtuple is
+    /// (`klippy/gcode.py`): `.x`/`.y`/`.z`/`.e`, integer subscripts, and
+    /// iteration — the bridge `macros.cfg:34` needs. `printer` itself answers
+    /// containment by registration, and is not iterable.
     #[test]
-    fn coordinate_attributes_map_onto_json_arrays() {
-        let mut context = context(&[], "");
-        context.insert("position", Rt::Json(json!([1.5, 2.5, 3.5, 4.5])));
+    fn printer_status_arrays_expose_coordinate_fields() {
+        let printer = printer_with(
+            "toolhead",
+            json!({"position": [1.5, 2.5, 3.5, 4.5], "extruder": "extruder"}),
+        );
+        let mut context = Context::new();
+        context.insert("printer", Rt::Printer(PrinterView::new(printer)));
+
+        assert_eq!(
+            render("{printer.toolhead.position.x} {printer.toolhead.position.y} {printer.toolhead.position.z} {printer.toolhead.position.e}", &mut context)
+                .expect("renders"),
+            "1.5 2.5 3.5 4.5"
+        );
+        // Integer subscripts and `{% for %}` read the same array.
+        assert_eq!(
+            render("{printer.toolhead.position[2]}", &mut context).expect("renders"),
+            "3.5"
+        );
         assert_eq!(
             render(
-                "{position.x} {position.y} {position.z} {position.e}",
+                "{% for v in printer.toolhead.position %}{v} {% endfor %}",
                 &mut context
             )
             .expect("renders"),
-            "1.5 2.5 3.5 4.5"
+            "1.5 2.5 3.5 4.5 "
         );
-        // Outside the four Coord fields an array attribute is an error.
-        let error = render("{position.w}", &mut context).expect_err("no such field");
-        assert!(
-            error.to_string().contains("position has no attribute 'w'"),
-            "{error}"
+        // `'name' in printer` is registration (`GetStatusWrapper.__contains__`).
+        assert_eq!(
+            render(
+                "{% if 'toolhead' in printer %}yes{% else %}no{% endif %}",
+                &mut context
+            )
+            .expect("renders"),
+            "yes"
         );
+        assert_eq!(
+            render(
+                "{% if 'nope' in printer %}yes{% else %}no{% endif %}",
+                &mut context
+            )
+            .expect("renders"),
+            "no"
+        );
+        // The view itself is truthy, as upstream's wrapper is.
+        assert_eq!(
+            render("{% if printer %}truthy{% endif %}", &mut context).expect("renders"),
+            "truthy"
+        );
+        // Outside the four Coord fields an array attribute is undefined, as it
+        // is on the namedtuple.
+        let error = render("{printer.toolhead.position.w}", &mut context).expect_err("no field");
+        assert!(error.to_string().contains("undefined"), "{error}");
+    }
+
+    /// An array outside `printer` keeps its JSON meaning: `params`,
+    /// `variable_*`, `Rt::List` and list literals are plain lists, without
+    /// `.x`.
+    #[test]
+    fn arrays_outside_printer_status_stay_plain_lists() {
+        let mut context = context(&[], "");
+        context.insert("points", Rt::Json(json!([1.5, 2.5])));
+        context.insert(
+            "variables",
+            Rt::List(vec![
+                Rt::Json(json!(1)),
+                Rt::Json(Value::String("a".to_string())),
+            ]),
+        );
+        assert_eq!(
+            render("{points[1]} { [3, 4][0] } {variables[1]}", &mut context).expect("renders"),
+            "2.5 3 a"
+        );
+        assert_eq!(
+            render("{% for v in variables %}{v} {% endfor %}", &mut context).expect("renders"),
+            "1 a "
+        );
+        let error = render("{points.x}", &mut context).expect_err("not a Coord");
+        assert!(error.to_string().contains("undefined"), "{error}");
     }
 
     /// `rawparams` is the line's tail, verbatim (`gcode_macro.py:189`).
@@ -2207,25 +896,33 @@ mod tests {
         );
     }
 
-    /// A construct outside the subset fails the **load** with upstream's frame
-    /// (`gcode_macro.py:61-66`), naming the line and the statement. `{% set %}`
-    /// used to be refused here; it is inside the subset now.
+    /// A statement the engine does not know fails the **load** with upstream's
+    /// frame (`gcode_macro.py:61-66`), naming the line and the statement.
+    /// `{% block %}` is no longer one of them: Jinja2 parses it, and so does
+    /// this engine — the old subset was the stricter one.
     #[test]
     fn an_unknown_statement_is_a_load_error_with_upstream_frame() {
         assert_eq!(ok("{% set x = 1 %}{ x }"), "1");
 
-        let error = Template::parse("gcode_macro SETTY:gcode", "{% block body %}")
-            .expect_err("block is not implemented");
+        let error = Template::parse("gcode_macro SETTY:gcode", "{% foo %}")
+            .expect_err("foo is not a statement");
         assert_eq!(
             error.to_string(),
-            "Error loading template 'gcode_macro SETTY:gcode'\n\
-             line 1: unsupported statement 'block' \
-             (this port implements if/elif/else/endif/for/endfor/set)"
+            "Error loading template 'gcode_macro SETTY:gcode'\nline 1: unknown statement foo"
         );
 
-        // An unbalanced block reads the same way.
+        assert!(
+            Template::parse("gcode_macro SETTY:gcode", "{% block body %}{% endblock %}").is_ok(),
+            "block is upstream Jinja2, and parses here"
+        );
+
+        // An unbalanced block reads the same way — the engine names the tag
+        // it wanted, not the one it found.
         let error = Template::parse("gcode_macro BAD:gcode", "{% if 1 %}").expect_err("no endif");
-        assert!(error.to_string().contains("endif' expected"), "{error}");
+        assert!(
+            error.to_string().contains("expected end of block"),
+            "{error}"
+        );
     }
 
     /// `{% set %}` scoping, checked against jinja2 3.1.6 with upstream's
@@ -2262,23 +959,42 @@ mod tests {
         assert_eq!(render(source, &mut context).expect("renders"), "150.0");
     }
 
-    /// A name or filter outside the subset fails the **render**, with the
-    /// expression's source in the message.
+    /// A name or filter outside the context fails the **render**, and a
+    /// Strict undefined fails at the point the value is *used* — printed,
+    /// iterated, or asked whether it is true — never at the lookup itself, so
+    /// `is defined` and `\|default(…)` still probe quietly.
     #[test]
     fn an_unknown_name_or_filter_is_a_render_error() {
         let error = render("{nope}", &mut context(&[], "")).expect_err("undefined");
         assert_eq!(
             error.to_string(),
-            "Error evaluating 'gcode_macro TEST:gcode': line 1: 'nope' is undefined"
+            "Error evaluating 'gcode_macro TEST:gcode': line 1: undefined value"
         );
+        for source in [
+            "{nope}",
+            "{% if nope %}x{% endif %}",
+            "{% for x in nope %}x{% endfor %}",
+        ] {
+            let error = render(source, &mut context(&[], "")).expect_err("undefined");
+            assert!(error.to_string().contains("undefined value"), "{error}");
+        }
+        // …while the two quiet probes still answer.
+        assert_eq!(ok("{% if nope is defined %}x{% else %}y{% endif %}"), "y");
+        assert_eq!(ok("{nope|default(1)}"), "1");
 
         let error =
-            render("{params.L | abs}", &mut context(&[("L", "-1")], "")).expect_err("no filter");
+            render("{params.L | nosuch}", &mut context(&[("L", "-1")], "")).expect_err("no filter");
+        assert_eq!(
+            error.to_string(),
+            "Error evaluating 'gcode_macro TEST:gcode': line 1: filter nosuch is unknown"
+        );
+
+        // `abs` is the engine's filter, as it is Jinja2's — the old subset
+        // refused it. A string operand is what both refuse.
+        let error =
+            render("{params.L | abs}", &mut context(&[("L", "-1")], "")).expect_err("string");
         assert!(
-            error.to_string().contains(
-                "unknown filter 'abs' \
-                 (this port implements 'int', 'float', 'default', 'min' and 'max')"
-            ),
+            error.to_string().contains("cannot get absolute value"),
             "{error}"
         );
 
@@ -2296,6 +1012,34 @@ mod tests {
                 .to_string()
                 .contains("[exclude_object] is not enabled"),
             "{error}"
+        );
+    }
+
+    /// `action_respond_info` is callable and renders nothing
+    /// (`gcode_macro.py:94-96`): the body's surrounding text is all that
+    /// reaches the command, and the line goes to the client through the
+    /// dispatcher.
+    #[test]
+    fn action_respond_info_renders_nothing() {
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        printer
+            .add_object(
+                GCODE_OBJECT,
+                Arc::new(GCodeDispatch::new(Arc::clone(&printer))),
+            )
+            .expect("gcode registers");
+        let mut context = context(&[], "");
+        context.insert(
+            "action_respond_info",
+            Rt::Builtin(Builtin::RespondInfo(Arc::clone(&printer))),
+        );
+        assert_eq!(
+            render(
+                "before {action_respond_info(\"a line\")} after",
+                &mut context
+            )
+            .expect("renders"),
+            "before  after"
         );
     }
 
@@ -2395,7 +1139,7 @@ mod tests {
         // fallback as `|default(0.0)|float` when it wants one
         // (`sample-pwm-tool.cfg:21`).
         let error = render("{nope|float}", &mut context(&[], "")).expect_err("undefined");
-        assert!(error.to_string().contains("'nope' is undefined"), "{error}");
+        assert!(error.to_string().contains("undefined"), "{error}");
     }
 
     /// The blocks the corpus puts a filter in: an `{% if %}` condition
@@ -2451,57 +1195,51 @@ mod tests {
         );
     }
 
-    /// The argument counts this port refuses, spelled out rather than
-    /// guessed at.
+    /// The argument shapes the filters take: Jinja2's optional default
+    /// (`|int(0)`, `|float(0.25)` — the short spelling of the corpus'
+    /// `|default(0)|int`), and `default`'s own signature
+    /// (`default(value, default_value='', boolean=False)`) including the
+    /// keyword spelling the old tokenizer refused for want of `=`. What stays
+    /// refused is an argument the filter has no room for.
     #[test]
-    fn filter_arity_errors_name_the_filter() {
+    fn filter_arguments_are_jinjas_own_shapes() {
+        // `|int(7)` holds a value the conversion cannot take, while the same
+        // body without the default fails loudly (last assertion).
+        assert_eq!(
+            render("{params.S|int(7)}", &mut context(&[("S", "oops")], "")).expect("default"),
+            "7"
+        );
+
+        // More than the filter's own arguments is still refused.
         let error = render("{params.S|float(1, 2)}", &mut context(&[], "")).expect_err("arity");
-        assert!(
-            error.to_string().contains(
-                "the 'float' filter takes at most 1 argument here, got 2 (this port's gap)"
-            ),
-            "{error}"
+        assert!(error.to_string().contains("too many arguments"), "{error}");
+        let error = render("{ [1, 5]|max(1) }", &mut context(&[], "")).expect_err("arity");
+        assert!(error.to_string().contains("too many arguments"), "{error}");
+
+        // `default`'s own signature, as Jinja2 writes it: without an argument
+        // the fallback is `''`, a second positional argument is the lax flag,
+        // and both the keyword spelling and the falsy-counts-as-undefined rule
+        // hold.
+        assert_eq!(
+            render("{params.S|default}", &mut context(&[], "")).expect("no argument"),
+            ""
+        );
+        assert_eq!(
+            render("{params.S|default(1, 2)}", &mut context(&[], "")).expect("second argument"),
+            "1"
+        );
+        assert_eq!(
+            render("{params.S|default(0, boolean=True)}", &mut context(&[], ""))
+                .expect("keyword argument"),
+            "0"
+        );
+        assert_eq!(
+            render("{''|default('fallback', true)}", &mut context(&[], ""))
+                .expect("falsy counts as undefined"),
+            "fallback"
         );
 
-        let error = render("{params.S|int(1)}", &mut context(&[], "")).expect_err("arity");
-        assert!(
-            error
-                .to_string()
-                .contains("the 'int' filter takes no arguments here, got 1 (this port's gap)"),
-            "{error}"
-        );
-
-        let error = render("{params.S|default}", &mut context(&[], "")).expect_err("arity");
-        assert!(
-            error
-                .to_string()
-                .contains("the 'default' filter takes 1 argument here, got 0 (this port's gap)"),
-            "{error}"
-        );
-
-        let error = render("{params.S|default(1, 2)}", &mut context(&[], "")).expect_err("arity");
-        assert!(
-            error
-                .to_string()
-                .contains("the 'default' filter takes 1 argument here, got 2 (this port's gap)"),
-            "{error}"
-        );
-
-        // Jinja's other spelling is a keyword argument (`default(0, boolean=True)`);
-        // the tokenizer has no `=`, so that stays a load error.
-        let error = Template::parse(
-            "gcode_macro TEST:gcode",
-            "{params.S|default(0, boolean=True)}",
-        )
-        .expect_err("keyword argument");
-        assert!(
-            error
-                .to_string()
-                .contains("unexpected character '=' in expression"),
-            "{error}"
-        );
-
-        // `int`'s type refusal is unchanged.
+        // `int`'s type refusal is unchanged, and names the filter's own rule.
         let error = render("{params.S|int}", &mut context(&[("S", "oops")], "")).expect_err("type");
         assert!(
             error.to_string().contains("invalid literal for int()"),
@@ -2569,8 +1307,8 @@ mod tests {
             "120.0"
         );
 
-        // A rendered literal reaches `str()` the way Python's list repr does;
-        // filtered, it is the extreme item — floats keep their spelling.
+        // A rendered literal reaches the formatter the way Python's list repr
+        // does; filtered, it is the extreme item — floats keep their spelling.
         assert_eq!(ok("[1, 5, 3]"), "[1, 5, 3]");
         assert_eq!(ok("{ [1, 5, 3]|max }"), "5");
         assert_eq!(ok("{ [1.0, 2]|min }"), "1.0");
@@ -2602,22 +1340,13 @@ mod tests {
         assert_eq!(ok("{ [\"B\", \"a\"]|max }"), "B");
     }
 
-    /// The error paths list literals and `min`/`max` add: an argument count the
-    /// filters do not take, an operand that is not a sequence, a sequence
-    /// CPython cannot order, and the empty sequence.
+    /// The error paths list literals and `min`/`max` add: an operand that is
+    /// not a sequence, a sequence CPython cannot order, and the empty
+    /// sequence. `|default` no longer catches the last one — it probes for
+    /// undefined, the way Jinja2's does, not for errors.
     #[test]
     fn list_and_extreme_errors_name_what_failed() {
-        // `min`/`max` take no argument here — Jinja reads one as
-        // `case_sensitive`, and this port's tokenizer refuses `=` anyway.
-        let error = render("{ [1, 5]|max(1) }", &mut context(&[], "")).expect_err("arity");
-        assert!(
-            error
-                .to_string()
-                .contains("the 'max' filter takes no arguments here, got 1 (this port's gap)"),
-            "{error}"
-        );
-
-        // A non-sequence operand fails the way a `{% for %}` over it does.
+        // A non-sequence operand is named the way CPython names it.
         let error = render("{ 5|min }", &mut context(&[], "")).expect_err("not iterable");
         assert!(
             error.to_string().contains("cannot iterate over number"),
@@ -2626,7 +1355,7 @@ mod tests {
 
         // Mixed element types are unorderable (`min([1, "a"])` in CPython),
         // and so is a nesting the corpus never writes: this port's ordering is
-        // numbers and strings (`compare`).
+        // numbers and strings.
         let error = render("{ [1, \"a\"]|min }", &mut context(&[], "")).expect_err("mixed");
         assert!(
             error
@@ -2644,25 +1373,26 @@ mod tests {
 
         // The empty sequence is where this port parts with Jinja2 3.1.6:
         // `_min_or_max` returns an `Undefined` there (blank, `is defined`
-        // false) and this port has no `Undefined`, so it fails loudly — with
-        // `|default` the escape hatch, probing quietly, exactly as upstream
-        // writes `params.X|default(…)`.
+        // false) and this port has no `Undefined` to return, so it fails
+        // loudly — and `|default`, which probes for undefined, cannot catch
+        // that.
         let error = render("{ []|min }", &mut context(&[], "")).expect_err("empty");
         assert!(
-            error.to_string().contains(
-                "min() arg is an empty sequence \
-                 (jinja2 leaves it undefined; this port fails loudly)"
-            ),
+            error.to_string().contains("min() arg is an empty sequence"),
             "{error}"
         );
-        assert_eq!(
-            render("{ []|max|default(7) }", &mut context(&[], "")).expect("default catches it"),
-            "7"
+        let error = render("{ []|max|default(7) }", &mut context(&[], "")).expect_err("empty");
+        assert!(
+            error.to_string().contains("max() arg is an empty sequence"),
+            "{error}"
         );
 
         // A literal's own load errors: an unclosed bracket.
         let error = Template::parse("gcode_macro TEST:gcode", "{ [1, 2 }").expect_err("unclosed");
-        assert!(error.to_string().contains("expected ']'"), "{error}");
+        assert_eq!(
+            error.to_string(),
+            "Error loading template 'gcode_macro TEST:gcode'\nline 1: unexpected `}`, expected `,`"
+        );
     }
 
     /// The two `SET_COPY_MODE` templates (`generic_cartesian_iqex.cfg:282-299`,
@@ -2761,5 +1491,172 @@ mod tests {
             }}})),
         );
         context
+    }
+
+    /// An error names the line it happened on, counting from 1, for both
+    /// frames.
+    #[test]
+    fn errors_name_the_line_they_happened_on() {
+        let source = "line one\n{% if 1 %}\n{ nope }\n{% endif %}\n";
+        let error = render(source, &mut context(&[], "")).expect_err("undefined");
+        assert_eq!(
+            error.to_string(),
+            "Error evaluating 'gcode_macro TEST:gcode': line 3: undefined value"
+        );
+
+        let error = Template::parse("gcode_macro LINES:gcode", "one\n{% foo %}\n")
+            .expect_err("unknown statement");
+        assert_eq!(
+            error.to_string(),
+            "Error loading template 'gcode_macro LINES:gcode'\nline 2: unknown statement foo"
+        );
+    }
+
+    /// The macros of the operator's own `config.cfg`, verbatim: an
+    /// `if`/`elif` chain over `params`, and `STEPPER_MOVE`, which needs
+    /// `namespace(...)` and `{% set count.phase = … %}` — the shape whose
+    /// absence from the old subset is what moved this module onto minijinja.
+    ///
+    /// `config.cfg` is a **local, unversioned** file (`.gitignore`'s
+    /// `/config.cfg`), so it cannot be `include_str!`d from a tree that does
+    /// not carry it: these are literal copies of its three `gcode:` bodies as
+    /// the config parser hands them over (each line trimmed, the block's last
+    /// newline dropped, the first line's indent gone — `config/mod.rs`'s
+    /// continuation rule). A later edit to `config.cfg` is therefore **not**
+    /// tracked by this test; the copy has to be refreshed by hand.
+    #[test]
+    fn the_stepper_config_macros_load_and_render() {
+        let phases = "\
+{% set phase = params.PHASE|default(0)|int %}
+{% if phase == 0 %}
+SET_PIN PIN=motor_in1 VALUE=1
+SET_PIN PIN=motor_in2 VALUE=0
+SET_PIN PIN=motor_in3 VALUE=0
+SET_PIN PIN=motor_in4 VALUE=0
+{% elif phase == 1 %}
+SET_PIN PIN=motor_in1 VALUE=1
+SET_PIN PIN=motor_in2 VALUE=1
+SET_PIN PIN=motor_in3 VALUE=0
+SET_PIN PIN=motor_in4 VALUE=0
+{% elif phase == 2 %}
+SET_PIN PIN=motor_in1 VALUE=0
+SET_PIN PIN=motor_in2 VALUE=1
+SET_PIN PIN=motor_in3 VALUE=0
+SET_PIN PIN=motor_in4 VALUE=0
+{% elif phase == 3 %}
+SET_PIN PIN=motor_in1 VALUE=0
+SET_PIN PIN=motor_in2 VALUE=1
+SET_PIN PIN=motor_in3 VALUE=1
+SET_PIN PIN=motor_in4 VALUE=0
+{% elif phase == 4 %}
+SET_PIN PIN=motor_in1 VALUE=0
+SET_PIN PIN=motor_in2 VALUE=0
+SET_PIN PIN=motor_in3 VALUE=1
+SET_PIN PIN=motor_in4 VALUE=0
+{% elif phase == 5 %}
+SET_PIN PIN=motor_in1 VALUE=0
+SET_PIN PIN=motor_in2 VALUE=0
+SET_PIN PIN=motor_in3 VALUE=1
+SET_PIN PIN=motor_in4 VALUE=1
+{% elif phase == 6 %}
+SET_PIN PIN=motor_in1 VALUE=0
+SET_PIN PIN=motor_in2 VALUE=0
+SET_PIN PIN=motor_in3 VALUE=0
+SET_PIN PIN=motor_in4 VALUE=1
+{% elif phase == 7 %}
+SET_PIN PIN=motor_in1 VALUE=1
+SET_PIN PIN=motor_in2 VALUE=0
+SET_PIN PIN=motor_in3 VALUE=0
+SET_PIN PIN=motor_in4 VALUE=1
+{% endif %}";
+        // The text between the tags survives: the two newlines after
+        // `{% set %}` and `{% if %}` open the branch.
+        assert_eq!(
+            render(phases, &mut context(&[("PHASE", "1")], "")).expect("phase 1"),
+            "\n\nSET_PIN PIN=motor_in1 VALUE=1\nSET_PIN PIN=motor_in2 VALUE=1\n\
+             SET_PIN PIN=motor_in3 VALUE=0\nSET_PIN PIN=motor_in4 VALUE=0\n"
+        );
+        assert_eq!(
+            render(phases, &mut context(&[("PHASE", "7")], "")).expect("phase 7"),
+            "\n\nSET_PIN PIN=motor_in1 VALUE=1\nSET_PIN PIN=motor_in2 VALUE=0\n\
+             SET_PIN PIN=motor_in3 VALUE=0\nSET_PIN PIN=motor_in4 VALUE=1\n"
+        );
+        // `default(0)` takes the first branch, and a phase no branch names
+        // renders only the lead-in the `{% set %}` left.
+        assert_eq!(
+            render(phases, &mut context(&[], "")).expect("phase 0 by default"),
+            "\n\nSET_PIN PIN=motor_in1 VALUE=1\nSET_PIN PIN=motor_in2 VALUE=0\n\
+             SET_PIN PIN=motor_in3 VALUE=0\nSET_PIN PIN=motor_in4 VALUE=0\n"
+        );
+        assert_eq!(
+            render(phases, &mut context(&[("PHASE", "9")], "")).expect("no branch"),
+            "\n"
+        );
+
+        let release = "\
+SET_PIN PIN=motor_in1 VALUE=0
+SET_PIN PIN=motor_in2 VALUE=0
+SET_PIN PIN=motor_in3 VALUE=0
+SET_PIN PIN=motor_in4 VALUE=0";
+        assert_eq!(
+            render(release, &mut context(&[], "")).expect("release"),
+            release
+        );
+
+        let stepper_move = "\
+{% set steps = params.STEPS|default(100)|int %}
+{% set dir = params.DIR|default(1)|int %}
+{% set delay = params.DELAY|default(0.002)|float %}
+
+{% set count = namespace(phase=0) %}
+
+{% for i in range(steps) %}
+# 计算当前的节拍索引 (0-7)
+{% if dir == 1 %}
+{% set count.phase = (i % 8) %}
+{% else %}
+{% set count.phase = (7 - (i % 8)) %}
+{% endif %}
+
+# 执行当前步的引脚电平设置
+_STEPPER_SET_PHASE PHASE={count.phase}
+
+# 延迟，给电机物理转动的时间
+G4 P{ (delay * 1000)|int }
+{% endfor %}
+
+# # 动作完成后，默认释放电机避免发热
+STEPPER_RELEASE";
+        let forward = render(
+            stepper_move,
+            &mut context(&[("STEPS", "8"), ("DIR", "1"), ("DELAY", "0.002")], ""),
+        )
+        .expect("the clockwise move renders");
+        assert!(forward.contains("_STEPPER_SET_PHASE PHASE=0"), "{forward}");
+        assert!(forward.contains("_STEPPER_SET_PHASE PHASE=7"), "{forward}");
+        assert!(
+            forward.find("_STEPPER_SET_PHASE PHASE=0").expect("first")
+                < forward.find("_STEPPER_SET_PHASE PHASE=1").expect("then"),
+            "{forward}"
+        );
+        assert_eq!(forward.matches("G4 P2").count(), 8, "{forward}");
+        assert!(forward.ends_with("STEPPER_RELEASE"), "{forward}");
+
+        let backward = render(
+            stepper_move,
+            &mut context(&[("STEPS", "8"), ("DIR", "0"), ("DELAY", "0.005")], ""),
+        )
+        .expect("the counter-clockwise move renders");
+        assert!(
+            backward.contains("_STEPPER_SET_PHASE PHASE=7"),
+            "{backward}"
+        );
+        assert!(
+            backward.find("_STEPPER_SET_PHASE PHASE=7").expect("first")
+                < backward.find("_STEPPER_SET_PHASE PHASE=6").expect("then"),
+            "{backward}"
+        );
+        assert_eq!(backward.matches("G4 P5").count(), 8, "{backward}");
+        assert_eq!(backward.matches("G4 P5\n").count(), 8, "{backward}");
     }
 }

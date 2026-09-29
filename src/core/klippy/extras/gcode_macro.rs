@@ -24,8 +24,8 @@
 //! `range`), then `params` and `rawparams` make up upstream's `kwparams`
 //! (`:186-190`); the rendered text is fed back through
 //! `run_script_from_command`, exactly `TemplateWrapper.run_gcode_from_command`
-//! (`:79-80`). The supported template subset — and every construct refused
-//! explicitly outside it — is listed in [`template`]'s module docs.
+//! (`:79-80`). The engine behind it — and every construct it still refuses —
+//! is documented in [`template`]'s module docs.
 //!
 //! `SET_GCODE_VARIABLE` is a mux command keyed by the section's own name, one
 //! value per macro (`gcode_macro.py:148-150`). Its `VALUE` parses as JSON,
@@ -224,7 +224,7 @@ impl GCodeMacro {
     ///
     /// # Errors
     /// A section name with more than one name token, a missing `gcode` body, a
-    /// template outside [`template`]'s subset, a `rename_existing` that names
+    /// template [`template`] refuses to compile, a `rename_existing` that names
     /// another command type, a `variable_*` value that is not a literal, or a
     /// command name that is taken — upstream's wordings, except the two
     /// literal errors, whose tail is this port's JSON parser rather than
@@ -776,8 +776,8 @@ mod tests {
     }
 
     /// A `{% set %}` body loads and renders — this pin used to refuse `set`
-    /// at load; a statement outside [`template`]'s subset is still refused
-    /// when the section loads, with upstream's `Error loading template` frame
+    /// at load; an unknown statement is still refused when the section loads,
+    /// with upstream's `Error loading template` frame
     /// (`gcode_macro.py:61-66`).
     #[test]
     fn a_set_body_loads_and_renders_but_an_unknown_statement_fails() {
@@ -797,8 +797,8 @@ mod tests {
                 .expect("the fake receiver registers");
         }
 
-        // `set` is inside the subset: the section loads and the body uses the
-        // binding on the next line.
+        // `set` loads: the section loads and the body uses the binding on the
+        // next line.
         let sect = section(
             "SETTY",
             &[("gcode", "{% set x = 41 %}ECHO_LINE VALUE={x + 1}")],
@@ -812,18 +812,19 @@ mod tests {
             "the rendered body reached the receiver"
         );
 
-        // A statement outside it is refused at load.
-        let sect = section("BADSTMT", &[("gcode", "{% block body %}")]);
+        // An unknown statement is refused at load. `{% block %}` used to stand
+        // in here; the template engine parses it now, exactly as the Jinja2 of
+        // `gcode_macro.py:82` does, so the fixture is a tag no Jinja2 has —
+        // which keeps what this assertion is about: not a tag this host
+        // happens to omit, but a statement nobody defines.
+        let sect = section("BADSTMT", &[("gcode", "{% foo %}")]);
         let config = ConfigWrapper::untracked(&sect);
         let error = GCodeMacro::new(&config, &printer)
-            .expect_err("the subset does not carry `block`")
+            .expect_err("no Jinja2 defines `foo`")
             .to_string();
-        assert!(
-            error.starts_with(
-                "Error loading template 'gcode_macro BADSTMT:gcode'\nline 1: \
-                 unsupported statement 'block'"
-            ),
-            "{error}"
+        assert_eq!(
+            error,
+            "Error loading template 'gcode_macro BADSTMT:gcode'\nline 1: unknown statement foo"
         );
     }
 }

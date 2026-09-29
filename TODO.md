@@ -371,8 +371,8 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 
 ### H3 G-Code 宏与脚本
 
-- [ ] `gcode_macro.py`：段与宏注册**已落地**（2026-09-24 集成批 #1，语料绿）；剩余 = 宏体模板/表达式引擎、`SET_GCODE_VARIABLE`、`rename_existing` 连接期换名，以及读
-      `printer.objects` 的反射式能力（**Q5**）。**U-A7b 已完成（2026-09-24 批 #4）**：受控子集引擎落地，`exclude_object.test`+`dual_carriage.test` 双翻转、guard 归零；子集外（过滤器等）报错缺口入 `template.rs` 文档（`{% set %}` 批 #9、过滤器参数与 `default`/`float` 批 #17 已落地；列表字面量与 `|min`/`|max` 批 #24 已落地；D–F 单元：三元、`%` 格式化、方法白名单待做。iqex/itex 的模板阻塞已消，首因前移到 `dual_carriage` 的 `primary_carriage`），完整 Jinja 仍属 H3。
+- [ ] `gcode_macro.py`：段与宏注册**已落地**（2026-09-24 集成批 #1，语料绿）；剩余 = `rename_existing` 连接期换名，以及读
+      `printer.objects` 的反射式能力（**Q5**）。**U-A7b 已归档**（2026-09-24 批 #4 起的「受控子集引擎」阶段：`exclude_object.test`+`dual_carriage.test` 双翻转、guard 归零，`{% set %}` 批 #9、过滤器参数与 `default`/`float` 批 #17、列表字面量与 `|min`/`|max` 批 #24 相继落地）。**2026-09-29 引擎换为 minijinja 2.24 适配层**（`custom_syntax` 单花括号定界符、Strict undefined、装载期编译与求值分两段）：原子集外的 `namespace()`、关键字实参、`{% block %}`、`|float(默认)` 由此接上（语料 160 绿）。仍缺：`%` 字符串格式化（minijinja 的 `%` 是数值取模）、模板内方法调用（`Coord`/`PrinterView` 未实现 `call_method`；「方法调用白名单」待办消解——不装 `unknown_method_callback` 即天然拒绝）；三元 `x if c else y` 由 minijinja 原生支持但本仓未单列测试。与 Jinja2 的已知差异（`%`/`//` 欧几里得取余、Strict 下缺键在打印/迭代/判真时报错、部分 detail 措辞）见 `template.rs` 模块文档。iqex/itex 的模板阻塞已消，首因前移到 `dual_carriage` 的 `primary_carriage`。
 - [ ] `save_variables.py`（`SAVE_VARIABLE` / `[variables]`）。
 - [ ] `delayed_gcode.py`（`[delayed_gcode]`）。
 - [x] `respond.py`（`RESPOND` / `M118`，批 #29）。

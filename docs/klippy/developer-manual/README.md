@@ -294,10 +294,11 @@ identify 的命令**定义**（名称、参数、解码）与其它命令一样�
 | `pwm_tool.rs` | `[pwm_tool <name>]`：带 `maximum_mcu_duration` 固件兕底的 PWM 工具引脚（`pwm_tool.py`） |
 | `temperature_fan.rs` | `[temperature_fan <name>]`：传感器+风扇+`watermark`/`pid` 双控制环，`SET_TEMPERATURE_FAN_TARGET`（mux，`temperature_fan.py`） |
 | `controller_fan.rs` | `[controller_fan <name>]`：`klippy:ready` 起每秒 tick，active→idle→stop（`controller_fan.py`） |
-| `gcode_macro.rs` | `[gcode_macro <名>]`：宏即命令（大写注册、description 为 help）；模板/表达式引擎与 `SET_GCODE_VARIABLE` 未做（H3，`gcode_macro.py`） |
+| `gcode_macro.rs` | `[gcode_macro <名>]`：宏即命令（大写注册、description 为 help）、宏体经 `template` 渲染后回派发、`SET_GCODE_VARIABLE` 已注册（mux 按段名）；尚缺 `rename_existing` 的连接期换名与读 `printer.objects` 的反射能力（`gcode_macro.py`） |
+| `template.rs` | 模板引擎——**minijinja 2.24 的适配层**（`custom_syntax` 特性给单花括号定界符 `{`/`{%`/`{#}`、`UndefinedBehavior::Strict`、关自动转义、装载期编译与求值分两段）。公开门面 `Template`/`TemplateError`/`Context`/`Rt`/`Builtin`/`PrinterView` 保持不变，5 个消费方零改动；值桥=只有 printer 状态里的数组暴露 `.x/.y/.z/.e`、`action_*` 与 `range`/`namespace` 显式绑定、自定义 `int`/`float`/`min`/`max` 复刻 Jinja2 形态（可选默认参、大小写不敏感）；错误帧逐字保上游 `Error loading template …`/`Error evaluating …`，行号 1 基。与 Jinja2 的已知差异（`%`/`//` 欧几里得取余、Strict 下缺键在打印/迭代/判真时报错、部分 detail 措辞）见该模块文档 |
 | `led.rs` | LED 六段一体（`led`/`neopixel`/`dotstar`/`pca9533`/`pca9632` + `display_template` 惰性单例）：共享 `LEDHelper`，上游仅因 Python 模块布局分文件（`led.py` 等五文件+`display/display.py:168`）；`SET_LED`/`SET_LED_TEMPLATE` 未注册（H3/H8） |
 | `extruder_stepper.rs` | `[extruder_stepper <name>]` prefix 段：段全读+绑定校验（上游文案）+`motion_queue` 记账+`SET_PRESSURE_ADVANCE` 按名挂值（`extruder_stepper.py:23`）；宿主 step 同步待 toolhead 缝（H10） |
-| `exclude_object.rs` | `[exclude_object]` 零选项段 + 四命令（`EXCLUDE_OBJECT[_START/_END/_DEFINE]`）+ 排除区移动变换（`exclude_object.py`）；转绿前置=U-A7b 宏体渲染（H4） |
+| `exclude_object.rs` | `[exclude_object]` 零选项段 + 四命令（`EXCLUDE_OBJECT[_START/_END/_DEFINE]`）+ 排除区移动变换（`exclude_object.py`）；语料用例已随宏体渲染引擎转绿（2026-09-24） |
 | `virtual_sdcard.rs` | `[virtual_sdcard]`：`path` 必填 + `on_error_gcode`（`virtual_sdcard.py:322`）；文件回放命令族未注册（H4） |
 | `display_status.rs` | `[display_status]` 裸段（`display_status.py:49`）；`M73`/`M117`/`SET_DISPLAY_TEXT` 已注册（批 #7，`[display]` 会按需创建它） |
 | `homing_override.rs` | `[homing_override]`：`axes`/`set_position_*`/`gcode`（`homing_override.py:65`）；G28 包装未装（模板未渲染，H9 共担） |
@@ -313,7 +314,7 @@ identify 的命令**定义**（名称、参数、解码）与其它命令一样�
 | `filament_switch_sensor.rs` + `filament_motion_sensor.rs` + `buttons.rs` | 断料检测两段与 `[buttons]` 依赖对象（wave-2，`extruders.test` 转绿即其验收） |
 | `pause_resume.rs` | `[pause_resume]` 节与 `PAUSE`/`RESUME`/`CLEAR_PAUSE`/`CANCEL_PRINT`（批 #15）；`pause_resume/*` 三个 webhooks 端点未注册，`virtual_sdcard` 的暂停/恢复原语未做 |
 | `heater_fan.rs` | `[heater_fan <name>]`：`Fan` 核心 + `klippy:ready` 起的每秒 tick，任一 heater 有 target 或温度 > `heater_temp` 即为 `fan_speed`，**仅速度变化时写 PWM**（批 #6；`printers.test` 的 run 级收益） |
-| `fan_generic.rs` | `[fan_generic <name>]`：全部选项交给 `Fan` 核心（`shutdown_speed` 默认 **0.0**），注册 mux 命令 `SET_FAN_SPEED FAN=<name>`；`TEMPLATE=` 分支明确拒绝（模板求值器未实现，批 #18） |
+| `fan_generic.rs` | `[fan_generic <name>]`：全部选项交给 `Fan` 核心（`shutdown_speed` 默认 **0.0**），注册 mux 命令 `SET_FAN_SPEED FAN=<name>`；`TEMPLATE=` 分支明确拒绝（模板引擎已存在于 `extras/template.rs`，但这条缝未接，批 #18） |
 | `safe_z_home.rs` | `[safe_z_home]`：接管 G28（Z-hop → 按需 `X0 Y0` → 安全位 → `Z0`）；`section!(order = 70, phase = late)` **必须晚于 toolhead（`printer`，order 60 late）**，否则 `unregister_command("G28")` 得 `None`；与 `[homing_override]` 互斥（批 #6） |
 | `manual_stepper.rs` + `force_move.rs` | `[manual_stepper <name>]` 与 `MANUAL_STEPPER`（含 `GCODE_AXIS` 动态注册/注销 extra axis）；`force_move.rs` 目前只含 `calc_move_time`（归属对齐上游）（批 #6） |
 | `display/{mod,display,st7920,hd44780,hd44780_spi,uc1701,ssd1306,aip31068_spi}.rs` + vendored `display.cfg` | `[display]` 框架与六驱动（批 #7+#13+#28+#30）；**storage-only**（不渲染、菜单未实现，见 config 手册的 gap）；`display_status` 的 `M73`/`M117`/`SET_DISPLAY_TEXT` 批 #7 落地 |
@@ -454,7 +455,7 @@ API 本身在 `crates/klippy-api/src/`：
 
 参数定义全在库里（`klippy::AppArgs`、`klippy_client::{ApiArgs, ConsoleArgs}`），二进制只做三件事：解析命令行、装日志、把错误打成一行并以退出码 1 结束。后两个二进制只装载各自那部分，因此命令行与帮助文本是干净的。
 
-`klippy` 与 `klipperx` 在同一个包里，共用一套依赖；`klippy-client` 在另一个包里，只依赖 `klippy-api` 与 clap / serde_json / tokio / tracing，所以它既不会编 `reqwest` / `flate2` / `libloading`，产物也小得多（实测 debug 66.2 MB vs 150.7 MB、release 4.0 MB vs 11.2 MB，2026-09-23）。
+`klippy` 与 `klipperx` 在同一个包里，共用一套依赖（模板引擎是 `minijinja 2.24`，启用 `custom_syntax` 与 `json` 特性）；`klippy-client` 在另一个包里，只依赖 `klippy-api` 与 clap / serde_json / tokio / tracing，所以它既不会编 `reqwest` / `flate2` / `libloading`，产物也小得多（实测 debug 66.2 MB vs 150.7 MB、release 4.0 MB vs 11.2 MB，2026-09-23）。
 
 ## 目录
 

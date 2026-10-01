@@ -548,7 +548,7 @@ SET_PIN PIN=pwm_fan VALUE=0.25  ; PWM：25% 占空比
 
 ### G-Code 宏命令（由 `[gcode_macro <名>]` 注册）
 
-每个 `[gcode_macro <名>]` 段在装载时以**大写宏名**注册为一条命令（help = `description`）。**宏体已渲染执行**：渲染引擎是 `extras/template.rs` 的 **minijinja 2.24 适配层**（单花括号定界符、缺键即报错、装载期编译），渲染后回 gcode 派发；`SET_GCODE_VARIABLE` 已注册；`{% set %}` 作用域对齐 Jinja2；`namespace()`、关键字实参、`{% block %}`、`|float(默认)` 等构型均可解析（含 `config.cfg` 步进宏的实测用例）。与 Jinja2 的已知差异与错误 detail 措辞见 `extras/template.rs` 模块文档。
+每个 `[gcode_macro <名>]` 段在装载时以**大写宏名**注册为一条命令（help = `description`）。 宏命令的**参数名**也随注册进入 `status.gcode.commands[<大写宏名>]["parameters"]`：装载时扫模板体里的 `params.NAME` / `params['NAME']` / `params["NAME"]`（去重、首次出现序），扫不到则退回该节的 `variable_*` 名，两者都无则不带该键——客户端补全 `KEY=` 左边时用这份（**内建兜底表不含配置定义的宏**，宏只能运行时知道）。**宏体已渲染执行**：渲染引擎是 `extras/template.rs` 的 **minijinja 2.24 适配层**（单花括号定界符、缺键即报错、装载期编译），渲染后回 gcode 派发；`SET_GCODE_VARIABLE` 已注册；`{% set %}` 作用域对齐 Jinja2；`namespace()`、关键字实参、`{% block %}`、`|float(默认)` 等构型均可解析（含 `config.cfg` 步进宏的实测用例）。与 Jinja2 的已知差异与错误 detail 措辞见 `extras/template.rs` 模块文档。
 
 ### QUERY_ENDSTOPS / M119
 

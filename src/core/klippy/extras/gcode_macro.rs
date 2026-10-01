@@ -27,6 +27,11 @@
 //! (`:79-80`). The engine behind it — and every construct it still refuses —
 //! is documented in [`template`]'s module docs.
 //!
+//! The registered command also declares the parameter names its body reads
+//! through `params` — or, when it reads none, its `variable_*` names — for a
+//! client that completes the left of `=`
+//! (`GCodeDispatch::register_command_with_params`, `gcode.rs`).
+//!
 //! `SET_GCODE_VARIABLE` is a mux command keyed by the section's own name, one
 //! value per macro (`gcode_macro.py:148-150`). Its `VALUE` parses as JSON,
 //! the literal rule this port's `variable_*` reader already applies
@@ -40,7 +45,7 @@
 //!   renaming macro does not register at all — matching upstream's *load-time*
 //!   behaviour, minus the deferred half.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -217,6 +222,84 @@ impl Drop for MacroGuard<'_> {
     }
 }
 
+/// A byte that continues an identifier, `[A-Za-z0-9_]`.
+fn is_ident_tail(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+/// A byte that starts one, `[A-Za-z_]`.
+fn is_ident_head(byte: u8) -> bool {
+    byte.is_ascii_alphabetic() || byte == b'_'
+}
+
+/// The key the `params` word ending just before `at` names, with the index
+/// just past it: `params.NAME`, `params['NAME']`, `params["NAME"]`. Any other
+/// byte after `params` is not a lookup that names a key.
+fn key_after_params(bytes: &[u8], at: usize) -> Option<(&str, usize)> {
+    match bytes.get(at) {
+        Some(b'.') => {
+            let start = at + 1;
+            let mut end = start;
+            while end < bytes.len() && is_ident_tail(bytes[end]) {
+                end += 1;
+            }
+            if end > start && is_ident_head(bytes[start]) {
+                // An ASCII run is UTF-8, so this never fails.
+                Some((std::str::from_utf8(&bytes[start..end]).ok()?, end))
+            } else {
+                None
+            }
+        }
+        Some(b'[') => {
+            let quote = *bytes.get(at + 1)?;
+            if quote != b'\'' && quote != b'"' {
+                return None;
+            }
+            let start = at + 2;
+            let end = start + bytes[start..].iter().position(|byte| *byte == quote)?;
+            if matches!(bytes.get(start), Some(byte) if is_ident_head(*byte))
+                && bytes[start..end].iter().all(|byte| is_ident_tail(*byte))
+            {
+                Some((std::str::from_utf8(&bytes[start..end]).ok()?, end + 1))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The names a macro body reads out of `params`, in first-use order.
+///
+/// Only the three shapes a body writes a key in count — `params.NAME`,
+/// `params['NAME']`, `params["NAME"]`, `NAME` an ASCII identifier. So the
+/// declaration lists the arguments the body actually names (`{params.P}`,
+/// `params['X']` or the `params.S|default(…)` chain, whose lookup comes
+/// first), and not `params | default(…)` (the object itself), `'P' in params`
+/// (no key) or `rawparams` (another binding entirely). A name written in more
+/// than one shape is declared once, where it was written first.
+fn template_params(body: &str) -> Vec<String> {
+    const WORD: &[u8] = b"params";
+    let bytes = body.as_bytes();
+    let mut names: Vec<String> = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        // `rawparams` ends in `params` too: only a word of its own looks up.
+        if bytes[i..].starts_with(WORD) && (i == 0 || !is_ident_tail(bytes[i - 1])) {
+            if let Some((name, end)) = key_after_params(bytes, i + WORD.len()) {
+                if seen.insert(name) {
+                    names.push(name.to_string());
+                }
+                i = end;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    names
+}
+
 impl GCodeMacro {
     /// Read the section, enforce `rename_existing`'s load-time rules, compile
     /// the body, and register the macro as its command plus
@@ -278,6 +361,22 @@ impl GCodeMacro {
             variables.insert(name, value);
         }
 
+        // The parameter names declared for a client's completion
+        // (`register_command_with_params`). The template's own `params.…`
+        // reads are what the macro takes, so they win outright: the
+        // `variable_*` names are the macro's own state, which a body reads
+        // bare (`{t}`) and which `SET_GCODE_VARIABLE` writes, so mixing them
+        // into the argument list would offer keys the body never looks up in
+        // `params`. Only a body that reads no `params` key falls back to
+        // them. Both empty declares none, and the status then carries no
+        // `parameters` key, like every other command that declares none.
+        let read_params = template_params(&body);
+        let declared: Vec<String> = if read_params.is_empty() {
+            variables.keys().cloned().collect()
+        } else {
+            read_params
+        };
+
         let state = Arc::new(MacroState {
             alias: alias.clone(),
             template,
@@ -316,8 +415,15 @@ impl GCodeMacro {
                     gcode.run_script_from_command(&script).await
                 })
             });
+            let declared_refs: Vec<&str> = declared.iter().map(String::as_str).collect();
             gcode
-                .register_command(&alias, handler, Some(&description), false)
+                .register_command_with_params(
+                    &alias,
+                    handler,
+                    Some(&description),
+                    &declared_refs,
+                    false,
+                )
                 .map_err(ConfigError::new)?;
         }
 
@@ -548,6 +654,114 @@ mod tests {
         assert_eq!(
             gcode(&printer).command_help().get("TEST_VARIABLE"),
             Some(&"G-Code macro".to_string())
+        );
+    }
+
+    /// A macro's command declares the `params` names its body reads — the
+    /// three shapes, in first-use order and without repeats — for a client
+    /// that completes the left of `=`
+    /// (`register_command_with_params`, `gcode.rs`). The command itself stays
+    /// the one the section registered.
+    #[test]
+    fn a_macro_declares_the_params_its_body_reads() {
+        let printer = printer();
+        let sect = section(
+            "TEST_params",
+            &[(
+                "gcode",
+                "ECHO_LINE VALUE={params.X}\nECHO_LINE VALUE={params.Y}\n\
+                 ECHO_LINE VALUE={params['Z']}\nECHO_LINE VALUE={params.X}\n\
+                 ECHO_LINE VALUE={params[\"W\"]}",
+            )],
+        );
+        let config = ConfigWrapper::untracked(&sect);
+        load_config_prefix(&config, &printer).expect("the macro loads");
+
+        let status = gcode(&printer).get_status(0.0);
+        assert_eq!(
+            status["commands"]["TEST_PARAMS"]["parameters"],
+            json!(["X", "Y", "Z", "W"]),
+            "both spellings, in first-use order, the repeat declared once"
+        );
+        assert_eq!(
+            status["commands"]["TEST_PARAMS"]["help"],
+            json!("G-Code macro"),
+            "the section's command is still the one in the table"
+        );
+    }
+
+    /// A body that reads no `params` key stands in its `variable_*` names;
+    /// one that reads neither, and has no variables, declares nothing at all,
+    /// so its status entry carries no `parameters` key (`gcode.rs:975-993`).
+    #[test]
+    fn a_macro_without_params_declares_its_variables() {
+        let printer = printer();
+        let sect = section(
+            "TEST_vars",
+            &[
+                ("gcode", "{action_respond_info(\"x\")}"),
+                ("variable_foo", "1"),
+                ("variable_bar", "2"),
+            ],
+        );
+        let config = ConfigWrapper::untracked(&sect);
+        load_config_prefix(&config, &printer).expect("the macro loads");
+        assert_eq!(
+            gcode(&printer).get_status(0.0)["commands"]["TEST_VARS"]["parameters"],
+            json!(["bar", "foo"]),
+            "the variable names, in the order `variables` keeps them"
+        );
+
+        let sect = section("TEST_none", &[("gcode", "G28")]);
+        let config = ConfigWrapper::untracked(&sect);
+        load_config_prefix(&config, &printer).expect("the macro loads");
+        assert!(
+            gcode(&printer).get_status(0.0)["commands"]["TEST_NONE"]
+                .get("parameters")
+                .is_none(),
+            "nothing to declare is no key, not an empty list"
+        );
+    }
+
+    /// A body that reads `params` declares those names and not the macro's
+    /// `variable_*`: the variables are state the body reads bare, not
+    /// arguments it looks up in `params`.
+    #[test]
+    fn a_template_reading_params_declares_no_variable_names() {
+        let printer = printer();
+        let sect = section(
+            "TEST_mixed",
+            &[
+                ("gcode", "ECHO_LINE VALUE={params.N}"),
+                ("variable_t", "12.0"),
+            ],
+        );
+        let config = ConfigWrapper::untracked(&sect);
+        load_config_prefix(&config, &printer).expect("the macro loads");
+        assert_eq!(
+            gcode(&printer).get_status(0.0)["commands"]["TEST_MIXED"]["parameters"],
+            json!(["N"]),
+            "the template's argument, not the variable name"
+        );
+    }
+
+    /// `rawparams` and a bare `params` are not the macro's argument list:
+    /// neither names a key, so a body that writes only those declares
+    /// nothing.
+    #[test]
+    fn params_outside_a_named_lookup_declares_nothing() {
+        let printer = printer();
+        let sect = section(
+            "TEST_neg",
+            &[("gcode", "{rawparams.X}{params|default('none')}")],
+        );
+        let config = ConfigWrapper::untracked(&sect);
+        load_config_prefix(&config, &printer).expect("the macro loads");
+        assert!(
+            gcode(&printer).get_status(0.0)["commands"]["TEST_NEG"]
+                .get("parameters")
+                .is_none(),
+            "rawparams and a bare `params` name no argument"
         );
     }
 

@@ -301,7 +301,7 @@ git config core.hooksPath .githooks
 | `pwm_tool.rs` | 选项矩阵与默认、prefix 命名错误、`cycle_time` 值域、`maximum_mcu_duration` minval 0.5、配对约束 build 期拒绝（11 测） |
 | `temperature_fan.rs` | 6 实例选项矩阵、`max_temp<40` 取目标、pid 选项与上下界、bang-bang 驱动、`SET_TEMPERATURE_FAN_TARGET` 命令与三段错误文案、未知 sensor/非法 control、缺 pin 前缀名（11 测） |
 | `controller_fan.rs` | 默认值、全选项+覆盖+跟踪器矩阵、缺 pin 前缀名、未知 stepper/heater 上游文案（connect 解析）、运行→怠速→停 tick 状态机（6 测） |
-| `gcode_macro.rs` | 真语料八实例全选项入 access、八个大写命令+帮助、变量 status、畸形节上游文案、`rename_existing` 类型检查与延迟注册、裸节认领、宏体渲染→派发 e2e、递归防护、`SET_GCODE_VARIABLE`、未知语句装载报错（9 测；未知语句的 fixture 用 `{% foo %}`——`{% block %}` 现由引擎解析，与 Jinja2 一致） |
+| `gcode_macro.rs` | 真语料八实例全选项入 access、八个大写命令+帮助、变量 status、畸形节上游文案、`rename_existing` 类型检查与延迟注册、裸节认领、宏体渲染→派发 e2e、递归防护、`SET_GCODE_VARIABLE`、未知语句装载报错（9 测；未知语句的 fixture 用 `{% foo %}`——`{% block %}` 现由引擎解析，与 Jinja2 一致）；**宏把参数名带进 `status.gcode.commands`**：扫模板体里的 `params.NAME` / `params['NAME']` / `params["NAME"]`（去重、首次出现序），扫不到则退回 `variable_*` 名，两者都无则不带 `parameters` 键（4 条测试） |
 | `led.rs` | 六段选项矩阵与上游文案（`No LED pin definitions found`/`color_order does not match chain_count`/`neopixel chain too long`/同 mcu 约束）、`LEDHelper` 颜色记账与初始值边界、`lookup_display_templates` 惰性单例（`is_queryable=false`）等（21 测） |
 | `extruder_stepper.rs` | 段全选项与步距 28.2/(200·16)、默认 PA `0.`/`0.040` 与越界文案、绑定校验逐字 `'bogus' is not a valid extruder.`、按名挂值与主挤出机槽位隔离、命令值域（7 测） |
 | `exclude_object.rs` | 零选项段+reset、get_status 三键、START/END 跟踪（大写化/隐式 define）、EXCLUDE 按名/当前/RESET+排序、`There is no current object to cancel`、DEFINE CENTER/POLYGON JSON 与 RESET、排除区丢弃/区外转发、四命令 help（9 测） |

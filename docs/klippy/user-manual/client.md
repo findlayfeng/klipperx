@@ -158,14 +158,14 @@ Connected to unix:/tmp/klippy_uds.
     - gcode/firmware_restart
     - …（完整清单随实现变化，以 `list_endpoints` 实际应答为准）
 klippy> objects/query {objects: {toolhead: [position]}}
-Enter send · ↑↓ history · PgUp/PgDn/Home/End log · ^G g-code · Esc×3 stop · .help · ^C quit
+Enter send · Tab complete · ↑↓ history · PgUp/PgDn log · ^G g-code · Esc×3 stop · /help · ^C quit
 ```
 
 第一行是状态行（左边那个符号：`●` 就绪、`◌` 启动中或状态未知、`▲` 出错/停机、
 `✕` 已断开），最后一行是按键提示，中间是日志，倒数第二行是你的输入。
 
 > 每条消息以 `<`（收到）或 `>`（发出）开头、空一格再写正文，正文默认是 **YAML**
-> （树状、不用给每个键加引号）；`.json` / `.yaml` 在窗口里切换正文格式，标记与
+> （树状、不用给每个键加引号）；`/json` / `/yaml` 在窗口里切换正文格式，标记与
 > 空格不变。相邻两条消息用两种颜色交替（错误仍是红色；g-code 模式下的 g-code 来往
 > 改用方向配色，见 [G-code 模式](#g-code-模式)）。行模式（`--plain` 或管道）不这样：
 > 它保持“每件事一行”的紧凑 JSON，便于重定向和 grep。
@@ -178,11 +178,13 @@ Enter send · ↑↓ history · PgUp/PgDn/Home/End log · ^G g-code · Esc×3 st
 | `↑` / `↓` | 翻之前敲过的命令；日志回滚后改为逐行滚动（`Ctrl+↑` / `Ctrl+↓` 始终逐行） |
 | `PgUp` / `PgDn` | 日志往上 / 往下翻一页（`Ctrl+↑` / `Ctrl+↓` 一次一行） |
 | `←` `→` `Backspace` `Delete` | 行内编辑 |
-| `Home` / `End` | 日志最顶 / 最新 |
+| `Home` / `End` | 日志最顶 / 最新（不在 footer 里，位置不够） |
+| `Tab` | 补全输入行的**第一个词**：唯一命中直接补上；多个候选先补到公共前缀并弹出候选层，再按 `Tab` 往后循环（`Shift+Tab` 往前），选中的候选立刻写进输入行 |
+| 候选层开着时按其它键 | 先收起候选层，然后该键照常生效（`Backspace` 收起后照常删一个字符；`Esc` 仍是急停、`Enter` 仍是发送） |
 | `Ctrl+A` / `Ctrl+E` | 跳到行首 / 行尾 |
 | `Ctrl+U` | 清掉这一行（不记进历史） |
-| `Ctrl+G` | 在请求模式与 g-code 模式之间切换（同 `.gcode`） |
-| `Ctrl+S` | 把鼠标交给终端——可以拖选、复制文字；按任意键收回（同 `.mouse`） |
+| `Ctrl+G` | 在请求模式与 g-code 模式之间切换（同 `/gcode`） |
+| `Ctrl+S` | 把鼠标交给终端——可以拖选、复制文字；按任意键收回（同 `/mouse`） |
 | `Ctrl+L` | 清空日志 |
 | `Ctrl+C` / `Ctrl+D` | 立刻退出（欠着的应答会先打完） |
 | `Esc` | **急停**：连按 3 下（0.8 s 内）发 `emergency_stop`，打印机停机直到重启；**单击不做任何事**——退出请用 `Ctrl+C` / `Ctrl+D` |
@@ -198,6 +200,25 @@ Enter send · ↑↓ history · PgUp/PgDn/Home/End log · ^G g-code · Esc×3 st
 在任何时候都逐行）。滚动的单位是**换行后的一行**，所以一条被折成好几行的长
 消息也能逐行看。
 
+### 命令补全
+
+`Tab` 只补输入行的**第一个词**（参数不补）。候选有两个来源：
+
+- **`/` 开头**：本地命令——会话的 `/help` `/subscribe` `/quit` 等与窗口的 `/gcode` `/mouse`
+  `/yaml` `/json`。候选**带斜杠**、只列规范名；别名照旧可用，所以敲 `/h` 也能补到 `/help`。
+- **g-code 模式下不以 `/` 开头**：打印机的命令名，来自主机的 `gcode/help`，**进入 g-code
+  模式时拉一次**（那时打印机得是 `ready`；拉不到就是没有候选，不会为此报警）；
+  匹配大小写不敏感，`m1` 能补到 `M115`，写进去的是打印机自己的拼写。
+
+请求模式下敲裸方法名不补——方法名是主机的，窗口没有那份清单（`/subscribe` 之后
+对象名倒是知道，但那是另一回事）。
+
+唯一命中直接补上；多个候选先把词补到它们的最长公共前缀，并在输入行**上方**弹出
+候选层：再按 `Tab` 往后、`Shift+Tab` 往前，列表循环，选中的候选立刻写进输入行。
+候选层打开时按**其它任何键**都会先收起它、然后该键照常生效：`Backspace` 收起列表
+并照常删一个字符，`Esc` 仍是急停、`Enter` 仍是发送。候选层最多 6 行，分页跟随
+选中项；终端太矮时干脆不画（补全本身照常可用）。
+
 日志区最右边一列是滚动条：占满一屏时显示滑块（`█`）与轨道（`│`），停在底部时
 滑块贴底、`Home` 时回到顶端；不足一屏时那列留空。这一列始终给滚动条留着，所以
 日志正文比窗口窄一列，也不会在超过一屏的瞬间左右跳。鼠标点或拖这一列可以直接
@@ -205,7 +226,7 @@ Enter send · ↑↓ history · PgUp/PgDn/Home/End log · ^G g-code · Esc×3 st
 拖动也不会中断，只按指针所在的行定位。
 
 滚轮和滚动条要占用鼠标，所以窗口默认把鼠标抓在手里，终端的拖选用不了。要选文字：
-**在日志正文上点一下**（或按 `Ctrl+S` / 敲 `.mouse`）把鼠标交回终端，然后拖选、用终端
+**在日志正文上点一下**（或按 `Ctrl+S` / 敲 `/mouse`）把鼠标交回终端，然后拖选、用终端
 自己的方式复制；之后**按任意键**（翻页、打字都算）鼠标就自动收回，不用记快捷键。
 交出鼠标期间**日志会冻住**（新日志不再推动画面），否则终端的选区会跟着文字跑偏；
 收回后画面停在原处，按 `End` 回到底部继续跟随。注意点的那一下只用来交出鼠标，选区
@@ -217,7 +238,7 @@ Enter send · ↑↓ history · PgUp/PgDn/Home/End log · ^G g-code · Esc×3 st
 
 ### G-code 模式
 
-按 `Ctrl+G`（或敲 `.gcode`）切换「请求模式」与「g-code 模式」，输入提示符会从
+按 `Ctrl+G`（或敲 `/gcode`）切换「请求模式」与「g-code 模式」，输入提示符会从
 `klippy>` 变成 `gcode>`。g-code 模式下整行都当作脚本发给 `gcode/script`，所以直接敲命令：
 
 ```
@@ -229,7 +250,7 @@ g-code 模式下日志**只显示 G-Code 本身的来往，不显示 API 信封*
 打印机的 `// …` 信息、`!! …` 错误原样跟在自己的标记后面（多行回答的续行按窗口惯例
 缩进两格，行首不被改写）。**g-code 来往**的颜色按方向分：`> ` 的行青色（`Color::Cyan`）、
 `< ` 的行白色（`Color::White`），其中 `!! …` 错误行红色（`Color::Red`）；非 g-code
-通道（`.subscribe` 发出的 `objects/*`、宿主推来的 `klippy:status` 等）仍照常带信封、
+通道（`/subscribe` 发出的 `objects/*`、宿主推来的 `klippy:status` 等）仍照常带信封、
 仍按青/白交替。
 
 `gcode/script` 的成功应答（`{}`）和 `gcode/subscribe_output`、`gcode/restart` 等
@@ -245,14 +266,14 @@ gcode> M115
 ```
 
 非 g-code 通道（`objects/query`、`klippy:status` 推送等）在 g-code 模式下照常显示
-信封，不受影响。切回请求模式（再按 `Ctrl+G` / `.gcode`）后，历史日志里**还留着**的
+信封，不受影响。切回请求模式（再按 `Ctrl+G` / `/gcode`）后，历史日志里**还留着**的
 条目（`gcode/script` 请求、`gcode:output` 输出行）重新带回 `> id: …`/`< id: …`
 信封显示——进入 g-code 模式时被丢掉的成功应答不会回来（它当时就没进日志）。
 
 第一次进入 g-code 模式时会自动订阅一次 `gcode/subscribe_output`，于是命令的
 `// …` 信息与 `!! …` 错误会以推送的形式出现在日志里（不订阅的话只能看到命令的应答，
-`respond_info` 看不到）。`.` 开头的本地命令在两种模式下都有效（例如 `.reload`、`.quit`、`.help`），所以
-`.quit`、`.help` 不会被当成 g-code 发出去。
+`respond_info` 看不到）。`/` 开头的本地命令在两种模式下都有效（例如 `/reload`、`/quit`、`/help`），所以
+`/quit`、`/help` 不会被当成 g-code 发出去。
 
 ### 一行就是一个请求
 
@@ -269,22 +290,22 @@ gcode> M115
 
 ### 本地命令
 
-以 `.` 开头的行由客户端自己处理，不会发给主机。这类行在输入时提示符会变成
+以 `/` 开头的行由客户端自己处理，不会发给主机。这类行在输入时提示符会变成
 `local>`：
 
 | 命令 | 作用 |
 |------|------|
-| `.help` | 把这一行的说明打进日志 |
-| `.subscribe` | 先问主机有哪些对象（`objects/list`），再订阅全部，之后状态变化会持续出现 |
-| `.subscribe <对象> …` | 只订阅指定的对象，例如 `.subscribe toolhead extruder heater_bed` |
-| `.firmware_restart` | 重启固件并重载配置（`gcode/firmware_restart`）；连接不断，随后会有一段 `startup` |
-| `.reload`（或 `.reload_config`） | 从磁盘重新读取配置文件并重启主机（`gcode/restart`）；`printer.cfg` 改完用它生效 |
-| `.quit`（或 `.exit`） | 退出；已经在路上的应答会先打出来 |
-| `.yaml` / `.json` | **仅窗口**：把消息正文在 YAML（默认）与紧凑 JSON 之间切换，`<`/`>` 标记不变 |
+| `/help` | 把这一行的说明打进日志 |
+| `/subscribe` | 先问主机有哪些对象（`objects/list`），再订阅全部，之后状态变化会持续出现 |
+| `/subscribe <对象> …` | 只订阅指定的对象，例如 `/subscribe toolhead extruder heater_bed` |
+| `/firmware_restart` | 重启固件并重载配置（`gcode/firmware_restart`）；连接不断，随后会有一段 `startup` |
+| `/reload`（或 `/reload_config`） | 从磁盘重新读取配置文件并重启主机（`gcode/restart`）；`printer.cfg` 改完用它生效 |
+| `/quit`（或 `/exit`） | 退出；已经在路上的应答会先打出来 |
+| `/yaml` / `/json` | **仅窗口**：把消息正文在 YAML（默认）与紧凑 JSON 之间切换，`<`/`>` 标记不变 |
 
 想要停止订阅，直接退出即可：协议规定客户端靠断开连接来取消订阅。
 
-`.reload` 与 `.firmware_restart` 都会让主机**重新从磁盘读配置文件**（改完文件再发一次即可，
+`/reload` 与 `/firmware_restart` 都会让主机**重新从磁盘读配置文件**（改完文件再发一次即可，
 不必重启主机进程）。mux 端点（`*/dump_*`）的实例随配置一起注销并在下一轮重新注册，所以
 含 `[load_cell]`、`[adxl345]` 等节的配置反复重载也不会累积、不会卡在 `already registered`。
 
@@ -297,7 +318,7 @@ gcode> M115
 | `! 3 (objects/query) Missing Argument [objects]` | 请求失败（这里是缺参数），后面是主机的错误说明（红色） |
 | `< method: klippy:status` | 主机主动推来的消息（没有 `id`）—— 订阅之后就会看到 |
 
-`.json` 只改正文的写法：上面的前缀变成 `> {"id":2,…}` / `< {"id":2,…}`，
+`/json` 只改正文的写法：上面的前缀变成 `> {"id":2,…}` / `< {"id":2,…}`，
 标记、空格与颜色交替都不变。
 
 **g-code 模式下**（`Ctrl+G`）标记的含义不变（`>` 发、`<` 收），只是正文换成
@@ -341,7 +362,7 @@ $ klippy-client console --plain -a /tmp/klippy_uds
 | 看打印机状态、版本、CPU | `info` |
 | 看当前坐标 | `objects/query {"objects": {"toolhead": ["position"]}}` |
 | 看温度 | `objects/query {"objects": {"extruder": ["temperature", "target"]}}` |
-| 实时盯状态 | `.subscribe toolhead extruder heater_bed` |
+| 实时盯状态 | `/subscribe toolhead extruder heater_bed` |
 | 跑 G-Code | `gcode/script {"script": "M115"}` |
 | 发一条不等待的 G-Code | `gcode/script {"script": "M104 S200"}` |
 | 紧急停止 | `emergency_stop` |

@@ -1348,11 +1348,23 @@ fn entry_line(entry: &Entry, text: String, first: bool, style: Style) -> Line<'s
 /// instead: it is the one thing that must not blend in. Log lines and notices
 /// keep their own colours.
 fn entry_style(entry: &Entry, message_index: usize, render: Render) -> Style {
-    // In g-code mode the stripped exchange reads like a terminal: the typed
-    // line and the printer's reply share one steady hue, so the pane does not
-    // flicker between cyan and white on every line of output.
-    if render.gcode && (gcode_script_sent(entry).is_some() || gcode_output_line(entry).is_some()) {
-        return Style::new().fg(Color::White);
+    // In g-code mode the exchange reads like a terminal: the window's `>`/`<`
+    // markers are its only scaffolding, so the colour carries the direction —
+    // the typed line cyan, the printer's output white — and a run of output
+    // does not flicker between the message colours. A `!! ` line is an error
+    // the printer reported, so it is red like any other failure.
+    if render.gcode {
+        if gcode_script_sent(entry).is_some() {
+            return Style::new().fg(Color::Cyan);
+        }
+        if let Some(line) = gcode_output_line(entry) {
+            let colour = if line.starts_with("!! ") {
+                Color::Red
+            } else {
+                Color::White
+            };
+            return Style::new().fg(colour);
+        }
     }
     match entry {
         // A failed request is the thing the user has to notice.
@@ -1415,17 +1427,21 @@ fn is_message(entry: &Entry) -> bool {
 /// JSON line per event.
 ///
 /// In g-code mode the `gcode/script` envelope is stripped: the typed script is
-/// shown behind a `>` (the direction a G-Code line travels), and a
-/// `gcode:output` push is shown as the bare `response` line the printer wrote —
-/// no `<` marker, no `method`/`params` scaffolding — so the pane reads like a
-/// G-Code terminal rather than a wire dump. Other traffic keeps its envelope.
+/// shown behind a `>` and the printer's output behind a `<` (the direction a
+/// G-Code line travels), with the `method`/`params` scaffolding gone — so the
+/// pane reads like a G-Code terminal rather than a wire dump. The printer's own
+/// text is kept line for line, `// ` and `!! ` prefixes included: those are how
+/// Klipper writes its output, so the window marks the direction rather than
+/// rewriting the line. Only the continuation lines of a multi-line answer are
+/// indented under the marker, the layout [`marked`] gives every message.
+/// Other traffic keeps its envelope.
 fn entry_text(entry: &Entry, render: Render) -> String {
     if render.gcode {
         if let Some(script) = gcode_script_sent(entry) {
-            return format!("> {script}");
+            return marked('>', script);
         }
         if let Some(line) = gcode_output_line(entry) {
-            return line.to_string();
+            return marked('<', line);
         }
     }
     match entry {
@@ -1460,7 +1476,9 @@ fn gcode_script_sent(entry: &Entry) -> Option<&str> {
 /// entry is.
 ///
 /// G-code mode shows the printer's own output line rather than the push
-/// envelope, so this is what picks it out of a [`Entry::Push`].
+/// envelope, so this is what picks it out of a [`Entry::Push`]. The line comes
+/// back exactly as the printer wrote it; [`entry_text`] puts the window's `<`
+/// marker in front of it.
 fn gcode_output_line(entry: &Entry) -> Option<&str> {
     let Entry::Push(message) = entry else {
         return None;
@@ -1475,10 +1493,17 @@ fn gcode_output_line(entry: &Entry) -> Option<&str> {
 }
 
 /// Put a `<`/`>` marker in front of a body, indenting the rest under it.
+///
+/// A body with nothing in it gets the marker by itself — no trailing space to
+/// hide in the log.
 fn marked(marker: char, body: &str) -> String {
     let mut lines = body.lines();
     let first = lines.next().unwrap_or_default();
-    let mut text = format!("{marker} {first}");
+    let mut text = if first.is_empty() {
+        marker.to_string()
+    } else {
+        format!("{marker} {first}")
+    };
     for line in lines {
         text.push('\n');
         text.push_str("  ");
@@ -2558,29 +2583,60 @@ mod tests {
     }
 
     #[test]
-    fn test_gcode_mode_shows_output_pushes_as_the_bare_response_line() {
-        // A `gcode:output` push is the printer's own line (`// …`, `!! …`), so
-        // g-code mode shows that line alone — no `<` marker, no `method`/
-        // `params` scaffolding.
-        let entry = Entry::Push(serde_json::json!({
+    fn test_gcode_mode_marks_the_output_push_with_the_received_marker() {
+        // Klipper writes `// ` on `respond_info` lines and `!! ` on errors; in
+        // g-code mode the window puts its own `<` in front of that line rather
+        // than rewriting it, so the text stays the printer's.
+        let gcode = Render {
+            format: Format::Yaml,
+            gcode: true,
+        };
+        let info = Entry::Push(serde_json::json!({
             "id": null,
             "method": "gcode:output",
             "params": {"response": "// echo: SET_PIN PIN=fan VALUE=1"}
         }));
+        let error = Entry::Push(serde_json::json!({
+            "id": null,
+            "method": "gcode:output",
+            "params": {"response": "!! Unknown command"}
+        }));
+        let plain = Entry::Push(serde_json::json!({
+            "id": null,
+            "method": "gcode:output",
+            "params": {"response": "FIRMWARE_NAME: Klipper"}
+        }));
+        let multi = Entry::Push(serde_json::json!({
+            "id": null,
+            "method": "gcode:output",
+            "params": {"response": "// A: help\n// B: help"}
+        }));
+        let empty = Entry::Push(serde_json::json!({
+            "id": null,
+            "method": "gcode:output",
+            "params": {"response": ""}
+        }));
 
         assert_eq!(
-            entry_text(
-                &entry,
-                Render {
-                    format: Format::Yaml,
-                    gcode: true
-                }
-            ),
-            "// echo: SET_PIN PIN=fan VALUE=1"
+            entry_text(&info, gcode),
+            "< // echo: SET_PIN PIN=fan VALUE=1",
+            "the `// ` the printer wrote is left alone"
+        );
+        assert_eq!(entry_text(&error, gcode), "< !! Unknown command");
+        assert_eq!(entry_text(&plain, gcode), "< FIRMWARE_NAME: Klipper");
+        assert_eq!(
+            entry_text(&multi, gcode),
+            "< // A: help\n  // B: help",
+            "each line stays the printer's; the continuation sits under the marker"
+        );
+        assert_eq!(
+            entry_text(&empty, gcode),
+            "<",
+            "an empty line gets the marker by itself"
         );
         // Request mode keeps the envelope behind a `<` marker.
         assert!(
-            entry_text(&entry, Render::DEFAULT).contains("method: gcode:output"),
+            entry_text(&info, Render::DEFAULT).contains("method: gcode:output"),
             "request mode keeps the envelope"
         );
     }
@@ -2851,8 +2907,8 @@ mod tests {
         let joined = lines.join("\n");
         assert!(joined.contains("> M115"), "the typed line: {joined}");
         assert!(
-            joined.contains("FIRMWARE_NAME: Klipper"),
-            "the output: {joined}"
+            joined.contains("< FIRMWARE_NAME: Klipper"),
+            "the printer's line, marked as received: {joined}"
         );
         assert!(!joined.contains("gcode/script"), "no envelope: {joined}");
         assert!(
@@ -2897,9 +2953,10 @@ mod tests {
     }
 
     #[test]
-    fn test_gcode_mode_gives_the_exchange_one_steady_colour() {
-        // The typed line and the output share one hue, so the pane does not
-        // flicker between cyan and white on every line of G-Code output.
+    fn test_gcode_mode_colours_the_directions() {
+        // The window's markers are the only scaffolding in g-code mode, so the
+        // colour carries the direction: typed lines cyan, the printer's output
+        // white, and a `!! ` line red like any other failure.
         let script = Entry::Sent {
             id: Some(2),
             method: "gcode/script".to_string(),
@@ -2909,18 +2966,64 @@ mod tests {
                 "params": {"script": "M115"}
             }),
         };
-        let output = Entry::Push(serde_json::json!({
+        let info = Entry::Push(serde_json::json!({
             "id": null,
             "method": "gcode:output",
-            "params": {"response": "FIRMWARE_NAME: Klipper"}
+            "params": {"response": "// Klipper version: v0.12.0"}
+        }));
+        let error = Entry::Push(serde_json::json!({
+            "id": null,
+            "method": "gcode:output",
+            "params": {"response": "!! Unknown command"}
         }));
         let render = Render {
             format: Format::Yaml,
             gcode: true,
         };
 
-        assert_eq!(entry_style(&script, 0, render).fg, Some(Color::White));
-        assert_eq!(entry_style(&output, 1, render).fg, Some(Color::White));
+        // The indices are picked so the plain alternation would hand out the
+        // *other* colour: without the direction branch every assertion below
+        // fails, which is the point of the test.
+        assert_eq!(entry_style(&script, 1, render).fg, Some(Color::Cyan));
+        assert_eq!(entry_style(&info, 0, render).fg, Some(Color::White));
+        assert_eq!(entry_style(&error, 1, render).fg, Some(Color::Red));
+    }
+
+    #[test]
+    fn test_gcode_mode_entries_still_count_toward_the_alternation() {
+        // g-code lines are drawn in their own colours, but they are messages
+        // like any other: the two status pushes around one still share a colour
+        // because the g-code line in between took the second slot. Drop it from
+        // the count and the second push would take the other colour instead.
+        let mut app = app_with(vec![
+            Entry::Push(serde_json::json!({"method": "klippy:status"})),
+            Entry::Push(serde_json::json!({
+                "id": null,
+                "method": "gcode:output",
+                "params": {"response": "// ok"}
+            })),
+            Entry::Push(serde_json::json!({"method": "klippy:status"})),
+        ]);
+        app.gcode = true;
+        app.render.gcode = true;
+
+        let total = app.total_lines(40);
+        let lines = visible_lines(&app, 40, 10, total).lines;
+        let colours: Vec<Option<Color>> = lines
+            .iter()
+            .filter(|line| line.spans[0].content.starts_with('<'))
+            .map(|line| line.spans[0].style.fg)
+            .collect();
+
+        assert_eq!(
+            colours,
+            vec![
+                Some(MESSAGE_COLORS[0]),
+                Some(Color::White),
+                Some(MESSAGE_COLORS[0])
+            ],
+            "{lines:?}"
+        );
     }
 
     #[test]

@@ -10,7 +10,7 @@
 //!   }
 //! < {"id": null, "method": "klippy:status", "params": {...}}
 //! klippy> objects/query {"objects": {"toolhead": ["position"]}}
-//! Enter send · ↑↓ history · PgUp/PgDn/Home/End log · ^↑/^↓ line · ^G g-code · .help · Esc×3 stop · ^C quit
+//! Enter send · Tab complete · ↑↓ history · PgUp/PgDn log · ^G g-code · Esc×3 stop · /help · ^C quit
 //! ```
 //!
 //! The header tracks the printer's state, the log holds everything that
@@ -29,7 +29,7 @@
 //!
 //! - **Mouse wheel**: scroll up/down by 3 lines
 //! - **Click/drag the scrollbar**: go to that part of the log
-//! - **^S** (or `.mouse`, or a click on the log's text): hand the mouse back to
+//! - **^S** (or `/mouse`, or a click on the log's text): hand the mouse back to
 //!   the terminal so text can be selected and copied there; any key takes it
 //!   back. The view freezes while it is released, since a terminal's selection
 //!   is anchored to the screen and a line arriving would slide it off.
@@ -51,6 +51,26 @@
 //! only when there is something to scroll. Because the log pane itself owns that
 //! column, it is one column narrower than the window.
 //!
+//! ## Completion
+//!
+//! `Tab` completes the *first* word of the line — the names of things, which is
+//! what a terminal can usefully finish — and the candidates come from the two
+//! places the window knows names from:
+//!
+//! - A word starting with `/` completes from the window's own commands and the
+//!   session's (`/help`, `/gcode`, `/subscribe`, …): a local command never
+//!   reaches the printer, so the client is the only one who can name it.
+//! - A bare word in g-code mode completes from the printer's command names, as
+//!   `gcode/help` lists them. That list is asked for once, the first time g-code
+//!   mode is entered with a printer that is ready: a printer that is not up yet
+//!   has no dispatcher to list, and the list does not change under a running
+//!   session.
+//!
+//! One candidate is simply filled in. Several narrow the line to what all of
+//! them agree on and open a layer above the input line, where `Tab`/`BackTab`
+//! walk the candidates and `Backspace` or any other key closes the layer and does
+//! its own job — a key that only closed a layer would be a keypress thrown away.
+//!
 //! # Threads and tasks
 //!
 //! One task (the one running [`run`]) draws and owns all the state, one blocking
@@ -64,7 +84,7 @@
 //!
 //! * Selection and copying are the terminal's, not the window's — but a
 //!   terminal only selects with a mouse it owns, and the window needs the mouse
-//!   for its wheel and its scrollbar. `^S` / `.mouse` / a click on the log gives
+//!   for its wheel and its scrollbar. `^S` / `/mouse` / a click on the log gives
 //!   it back, and the next key takes it again.
 //! * No reconnection: the window closes when the server goes away, after
 //!   printing why. Reconnecting would mean re-establishing every subscription.
@@ -84,7 +104,7 @@ use ratatui::crossterm::event::{
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
+use ratatui::widgets::{Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
 use ratatui::Frame;
 use serde_json::Value;
 
@@ -117,6 +137,21 @@ const LEAVE_GRACE: Duration = Duration::from_secs(1);
 
 /// How many entries the log keeps before dropping the oldest.
 const LOG_LIMIT: usize = 2_000;
+
+/// How many candidates the input line's completion layer shows at once.
+///
+/// Six is what fits above an input line without eating the log the window is
+/// for; a longer list scrolls (see [`Completion::first_shown`]).
+const COMPLETION_ROWS: usize = 6;
+
+/// How long the window waits for `gcode/help` when g-code mode is entered.
+///
+/// The ask is made once, when it is needed, and the window waits for it: the
+/// reply is read on the same event loop that draws, so entering g-code mode can
+/// pause for up to this long before the first frame of it appears. That is why
+/// it is short — a printer answering at all answers in milliseconds, and one
+/// that does not has no list to offer this time round.
+const GCODE_HELP_WINDOW: Duration = Duration::from_secs(2);
 
 /// Open a window on `target`.
 ///
@@ -190,6 +225,8 @@ pub fn is_available() -> bool {
 struct App {
     entries: Vec<Entry>,
     input: Input,
+    /// The candidate layer, while one is open (see [the module docs](self)).
+    completion: Option<Completion>,
     /// How many rendered lines the viewport is scrolled back from the bottom
     /// (0 = the newest line). Counted in lines, not entries, so a wrapped entry
     /// scrolls a row at a time.
@@ -213,7 +250,7 @@ struct App {
     dragging: bool,
     /// Whether the window has taken the mouse. While it has, the wheel scrolls
     /// and the scrollbar drags — and the terminal cannot select text, because it
-    /// never sees the drag. `^S` / `.mouse` hands it back.
+    /// never sees the drag. `^S` / `/mouse` hands it back.
     mouse: bool,
     /// The connection's state, shown in the header.
     status: Status,
@@ -228,6 +265,18 @@ struct App {
     /// Whether this window has already subscribed to G-Code output; every
     /// `gcode/subscribe_output` registers another output handler.
     gcode_subscribed: bool,
+    /// The printer's own command names, from `gcode/help`, for completing a
+    /// g-code line. Empty until g-code mode is first entered (see
+    /// [`App::ensure_gcode_help`]) — and empty is what "no candidates" means,
+    /// so a printer without them costs nothing.
+    gcode_help: Vec<String>,
+    /// Whether `gcode/help` has been answered for this connection.
+    ///
+    /// Answered — even with nothing in it — is what stops the window asking
+    /// again: a printer that has no named commands would otherwise be asked
+    /// once per `^G`. A refusal (a printer still coming up) leaves this false
+    /// on purpose, so the next visit can try again.
+    gcode_help_asked: bool,
     /// Whether the handshake's `info` has been answered.
     ///
     /// Until it has, an `info` reply is the header's business rather than the
@@ -289,6 +338,7 @@ impl App {
         Self {
             entries: Vec::new(),
             input: Input::default(),
+            completion: None,
             scroll: 0,
             viewport: Cell::new(0),
             width: Cell::new(0),
@@ -303,6 +353,8 @@ impl App {
             escape_deadline: None,
             gcode: false,
             gcode_subscribed: false,
+            gcode_help: Vec::new(),
+            gcode_help_asked: false,
             greeted: false,
             render: Render::DEFAULT,
         }
@@ -312,7 +364,7 @@ impl App {
     ///
     /// The window holds the mouse — the wheel and the scrollbar need it — so
     /// letting go is the move that has to be asked for, and this is how: `^S`,
-    /// `.mouse`, or a click on the log's text. Holding it again is not asked
+    /// `/mouse`, or a click on the log's text. Holding it again is not asked
     /// for at all: a key does that (see [`App::mouse_for_key`]), which is just
     /// as well — a terminal with the mouse no longer sends the window a click
     /// to go on.
@@ -352,7 +404,7 @@ impl App {
         self.gcode = !self.gcode;
         self.render.gcode = self.gcode;
         let text = if self.gcode {
-            "g-code mode: typed lines go to gcode/script, output shown raw (^G or .gcode to leave)"
+            "g-code mode: typed lines go to gcode/script, output shown raw (^G or /gcode to leave)"
         } else {
             "request mode: typed lines are requests"
         };
@@ -373,6 +425,39 @@ impl App {
         session.subscribe_gcode_output(self).await?;
         self.gcode_subscribed = true;
         Ok(())
+    }
+
+    /// Whether the printer's command list still has to be asked for.
+    ///
+    /// Kept apart from the ask itself so the gate can be tested without a
+    /// session: this is the whole of the decision. A list is only useful when
+    /// g-code mode is on (that is the only thing that completes from it) and
+    /// only askable from a printer that is ready — a printer still loading its
+    /// config has no dispatcher, and `gcode/help` against one is an error at
+    /// best and a wait at worst.
+    fn needs_gcode_help(&self) -> bool {
+        self.gcode
+            && !self.gcode_help_asked
+            && matches!(&self.status, Status::Connected { state, .. } if state == "ready")
+    }
+
+    /// Ask the printer for its command names, once, for completion.
+    ///
+    /// `gcode/help` is the only list of them, and the printer cannot answer it
+    /// until it is up, so the ask is made the first time g-code mode is entered
+    /// with a ready printer and never again. Failing is not news: the list is a
+    /// convenience, an empty one only means `Tab` has nothing to offer, and a
+    /// notice per `^G` would be noise in the log that the log is for.
+    async fn ensure_gcode_help(&mut self, session: &mut Session) {
+        if !self.needs_gcode_help() {
+            return;
+        }
+        if let Ok(Some(names)) = session.gcode_help(self, GCODE_HELP_WINDOW).await {
+            self.gcode_help = names;
+            // A refusal is not an answer: the flag stays false so the next
+            // visit to the mode can ask a printer that has come up since.
+            self.gcode_help_asked = true;
+        }
     }
 
     fn push(&mut self, entry: Entry) {
@@ -551,22 +636,22 @@ impl App {
     /// Handle a local command only the window has.
     ///
     /// Returns whether the line was one; the session's own commands
-    /// (`.subscribe`, `.quit`) go to the session. `.yaml` and `.json` are the
+    /// (`/subscribe`, `/quit`) go to the session. `/yaml` and `/json` are the
     /// window's because the line front-end has nothing to switch — it is one
-    /// compact JSON line per event by design — and `.help` is answered here so
+    /// compact JSON line per event by design — and `/help` is answered here so
     /// that the window's commands sit in the same list as the session's.
     fn window_command(&mut self, line: &str) -> bool {
         match line.trim() {
-            ".gcode" => {
+            "/gcode" => {
                 self.toggle_gcode();
                 true
             }
-            ".mouse" => {
+            "/mouse" => {
                 self.release_mouse();
                 true
             }
-            ".yaml" | ".json" => {
-                self.render.format = if line.trim() == ".json" {
+            "/yaml" | "/json" => {
+                self.render.format = if line.trim() == "/json" {
                     Format::Json
                 } else {
                     Format::Yaml
@@ -581,11 +666,11 @@ impl App {
                 ));
                 true
             }
-            ".help" => {
+            "/help" => {
                 self.push(Entry::notice(
                     Notice::Info,
                     format!(
-                        "{}\n\nWindow:\n  .yaml / .json   show message bodies as YAML or JSON\n  .gcode          toggle g-code mode (^G): typed lines go to gcode/script\n  .mouse          hand the mouse back to the terminal (^S, or click the log) so text can be selected\n  ^↑ / ^↓         move the caret a line (multi-line input)\n  Esc ×3          emergency stop (Esc on its own does nothing)",
+                        "{}\n\nWindow:\n  /yaml / /json   show message bodies as YAML or JSON\n  /gcode          toggle g-code mode (^G): typed lines go to gcode/script\n  /mouse          hand the mouse back to the terminal (^S, or click the log) so text can be selected\n  Tab / BackTab   complete the first word, then walk the candidates; any other key closes the list\n  Backspace       closes the candidate list and deletes, in one press\n  ^↑ / ^↓         scroll the log one line, even at the newest entry\n  Esc ×3          emergency stop (Esc on its own does nothing)",
                         session::usage()
                     ),
                 ));
@@ -895,6 +980,11 @@ async fn handle_key(
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     // The mouse settles first, and this key still does its own job after.
     app.mouse_for_key(key.code, ctrl);
+    // The candidate layer settles next, and this key still does its own job
+    // after — except `Tab`, which is the layer's own key.
+    if app.completion_key(key.code) {
+        return Ok(Control::Continue);
+    }
     match (key.code, ctrl) {
         // Leaving: ^C and ^D leave at once.
         (KeyCode::Char('c') | KeyCode::Char('d'), true) => return Ok(Control::Quit),
@@ -917,6 +1007,7 @@ async fn handle_key(
         (KeyCode::Char('g'), true) => {
             app.toggle_gcode();
             app.ensure_gcode_subscription(session).await?;
+            app.ensure_gcode_help(session).await;
         }
         (KeyCode::Enter, _) => {
             let line = app.input.take();
@@ -926,8 +1017,10 @@ async fn handle_key(
             app.scroll = 0;
             if app.window_command(&line) {
                 // Entering g-code mode is the window's business, but the output
-                // subscription it needs belongs to the session.
+                // subscription it needs belongs to the session — and so does
+                // the command list that completing a g-code line draws from.
                 app.ensure_gcode_subscription(session).await?;
+                app.ensure_gcode_help(session).await;
             } else {
                 let outcome = if app.gcode {
                     session.handle_gcode_line(&line, app).await?
@@ -1014,6 +1107,9 @@ fn draw(frame: &mut Frame, app: &App) {
     draw_log(frame, app, log);
     draw_input(frame, app, input);
     draw_footer(frame, app, footer);
+    // Last, because it is an overlay: the candidate layer is drawn over the log
+    // rather than given rows of its own, and the four panes keep their sizes.
+    draw_completions(frame, app, input, log);
 }
 
 /// What the header says: the marker, the text, and the style of both.
@@ -1140,6 +1236,65 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
     frame.set_cursor_position((area.x + prompt_width + cursor_column as u16, area.y));
 }
 
+/// Draw the open candidate layer just above the input line.
+///
+/// It hangs off the input line — same left edge, bottom row against the line
+/// above it — so that it reads as belonging to the word being typed. It overlays
+/// the log instead of taking rows of its own, since the panes' heights are fixed
+/// in [`draw`] and the candidates are a passing thing; nothing is drawn when the
+/// log has no room for it, which costs the picture and not the feature.
+fn draw_completions(frame: &mut Frame, app: &App, input: Rect, log: Rect) {
+    let Some(completion) = app.completion.as_ref() else {
+        return;
+    };
+    if completion.candidates.is_empty() {
+        return;
+    }
+    let rows = completion.candidates.len().min(COMPLETION_ROWS);
+    // One blank column on each side of the longest candidate, so the names are
+    // not against the edge of the layer — and never wider than the input line
+    // the layer belongs to.
+    let widest = completion
+        .candidates
+        .iter()
+        .map(|candidate| candidate.chars().count())
+        .max()
+        .unwrap_or(0);
+    let width = (widest + 2).min(input.width as usize);
+    if width == 0 || input.y < log.y.saturating_add(rows as u16) {
+        return;
+    }
+    let area = Rect::new(input.x, input.y - rows as u16, width as u16, rows as u16);
+
+    // The log is behind the layer, and a `Paragraph` only writes the cells it
+    // has text for: without this the log's own lines would show through the
+    // gaps between the candidates.
+    frame.render_widget(Clear, area);
+
+    let first = completion.first_shown(rows);
+    let lines: Vec<Line<'static>> = completion.candidates[first..first + rows]
+        .iter()
+        .enumerate()
+        .map(|(offset, candidate)| {
+            let picked = completion.selected == Some(first + offset);
+            let mut text = format!(" {candidate}");
+            // The picked row is a bar across the layer rather than an emphasised
+            // word, so which one it is can be seen at a glance.
+            if picked {
+                let padding = width.saturating_sub(text.chars().count());
+                text.push_str(&" ".repeat(padding));
+            }
+            let style = if picked {
+                Style::new().reversed()
+            } else {
+                Style::new()
+            };
+            Line::from(Span::styled(text, style))
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(Text::from(lines)), area);
+}
+
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     // How far back the log really is. `scroll` can be past the top (`Home` is
     // `usize::MAX`) and a log that fits cannot be scrolled at all, so the offset
@@ -1164,12 +1319,13 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
             "viewing older entries · {back} {lines} back · ↑↓ scroll · End bottom · Home top · ^C quit"
         )
     } else if app.gcode {
-        "g-code mode · Enter send · ^G request mode · .gcode · Esc×3 stop · ^C quit".to_string()
+        "g-code mode · Enter send · ^G request mode · /gcode · Esc×3 stop · ^C quit".to_string()
     } else {
-        // Kept inside 100 columns (the footer is one line and truncates): the
-        // two gestures that no longer fit here (^↑/^↓ line, and what Esc×3
-        // means next to plain Esc) are spelled out in `.help`.
-        "Enter send · ↑↓ history · PgUp/PgDn/Home/End log · ^G g-code · Esc×3 stop · .help · ^C quit"
+        // Kept inside 100 columns (the footer is one line and truncates): `Tab
+        // complete` cost the log's `Home/End` their place here, and the two
+        // gestures that never fitted (^↑/^↓ line, and what Esc×3 means next to
+        // plain Esc, and where the log's ends are) are spelled out in `/help`.
+        "Enter send · Tab complete · ↑↓ history · PgUp/PgDn log · ^G g-code · Esc×3 stop · /help · ^C quit"
             .to_string()
     };
     frame.render_widget(
@@ -1678,6 +1834,283 @@ impl Input {
         let shown: String = self.buffer[start..].iter().take(width).collect();
         (shown, self.cursor - start)
     }
+
+    /// The first word of the line, when the caret is in it.
+    ///
+    /// `None` is "there is nothing here to complete", and it is the honest
+    /// answer in three cases the caller does not have to know apart: the caret
+    /// is past the first word (what follows is an argument, and the window has
+    /// nothing to say about arguments); the line has only blanks before the
+    /// caret; or the caret is in the middle of a gap between words.
+    fn completion_word(&self) -> Option<Word> {
+        let before = &self.buffer[..self.cursor];
+        // Leading blanks belong to the line, not to the word: `/help` indented
+        // by a space is still the command the line is.
+        let start = before
+            .iter()
+            .position(|character| !character.is_whitespace())?;
+        if before[start..]
+            .iter()
+            .any(|character| character.is_whitespace())
+        {
+            return None;
+        }
+        // The word runs to the first blank after the caret, or to the end of the
+        // line: completion replaces the whole of it, wherever in it the caret
+        // happens to be.
+        let end = self.buffer[self.cursor..]
+            .iter()
+            .position(|character| character.is_whitespace())
+            .map_or(self.buffer.len(), |offset| self.cursor + offset);
+        Some(Word { start, end })
+    }
+
+    /// The characters a [`Word`] covers.
+    fn word_text(&self, word: &Word) -> String {
+        self.buffer[word.start..word.end].iter().collect()
+    }
+
+    /// Put `replacement` where `word` was, and leave the caret after it.
+    ///
+    /// The caret goes to the end of the replacement rather than staying where it
+    /// was: a completion finishes a name, and what the reader types next is the
+    /// arguments that name takes, which go after it.
+    ///
+    /// Returns where the replacement now is.
+    fn replace(&mut self, word: &Word, replacement: &str) -> Word {
+        self.buffer
+            .splice(word.start..word.end, replacement.chars());
+        let end = word.start + replacement.chars().count();
+        self.cursor = end;
+        Word {
+            start: word.start,
+            end,
+        }
+    }
+}
+
+// ===========================================================================
+// Completion
+// ===========================================================================
+
+/// The commands the window answers itself, without their leading slash.
+///
+/// The names rather than the lines, because the input line completes from this
+/// list and [`App::window_command`] runs the same set: the test that every one
+/// of these is answered holds the two spellings together.
+const WINDOW_COMMANDS: &[&str] = &["gcode", "mouse", "yaml", "json", "help"];
+
+/// Where the first word of the input line is.
+///
+/// Completion is for one word and one word only, so what it needs from the line
+/// is where that word begins and ends. Both are character offsets, the unit
+/// [`Input`] counts in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Word {
+    /// Where the word starts, from the start of the line.
+    start: usize,
+    /// Where it ends (one past its last character).
+    end: usize,
+}
+
+/// An open candidate layer: what `Tab` found, and what is picked so far.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Completion {
+    /// The candidates, in the order they are shown.
+    candidates: Vec<String>,
+    /// The word the layer is completing, as it stands in the line now. It moves
+    /// as candidates are picked, since each one replaces the last.
+    word: Word,
+    /// Which candidate is picked. `None` while the layer has only just opened
+    /// from a multiple match: nothing is in the line but the candidates' shared
+    /// prefix, so picking the first of them would be arbitrary.
+    selected: Option<usize>,
+}
+
+impl Completion {
+    /// The first candidate the layer draws, so that the picked one is in it.
+    ///
+    /// The list scrolls as little as it can: with nothing picked, or a pick
+    /// near the front, it shows the candidates from the beginning rather than
+    /// keeping the pick at a fixed row.
+    fn first_shown(&self, rows: usize) -> usize {
+        self.selected
+            .unwrap_or(0)
+            .saturating_sub(rows.saturating_sub(1))
+    }
+}
+
+/// The longest prefix every one of `names` starts with.
+///
+/// This is what a multiple match leaves in the line: the characters the reader
+/// would have had to type for any of the candidates, so that `Tab` narrows the
+/// line exactly as far as it can without choosing.
+fn common_prefix(names: &[String]) -> String {
+    let mut prefix: Vec<char> = names
+        .first()
+        .map(|name| name.chars().collect())
+        .unwrap_or_default();
+    for name in names {
+        let shared = prefix
+            .iter()
+            .zip(name.chars())
+            .take_while(|(mine, theirs)| **mine == *theirs)
+            .count();
+        prefix.truncate(shared);
+    }
+    prefix.into_iter().collect()
+}
+
+impl App {
+    /// The keypresses that belong to completion, and whether they were one.
+    ///
+    /// The whole of the feature's keyboard contract is here, away from
+    /// [`handle_key`], because none of it needs a session — and a `Tab` that
+    /// only works with a printer attached is a `Tab` that is never tested.
+    ///
+    /// `Tab` opens the layer or walks it; `BackTab` walks it back. Every other
+    /// key closes the layer and is then nobody's: the caller goes on to do what
+    /// it always did, which is what keeps `Backspace`, `Esc`, `Enter` and the
+    /// rest exactly as they were. (`Tab` on a line with nothing to complete is
+    /// still consumed: there is no tab character in a line the printer is sent.)
+    fn completion_key(&mut self, code: KeyCode) -> bool {
+        match code {
+            KeyCode::Tab => {
+                if self.completion.is_some() {
+                    self.cycle_completion(1);
+                } else {
+                    self.complete();
+                }
+                true
+            }
+            KeyCode::BackTab if self.completion.is_some() => {
+                self.cycle_completion(-1);
+                true
+            }
+            // Nothing to walk: `BackTab` is not a way to open the layer (`Tab`
+            // is), so the key stays nobody's and falls through.
+            KeyCode::BackTab => false,
+            _ => {
+                self.completion = None;
+                false
+            }
+        }
+    }
+
+    /// Complete the word at the caret, and open the layer if it needs choosing.
+    ///
+    /// One candidate is unambiguous, so it goes straight in. Several go in as
+    /// the prefix they share, and the layer opens so the reader can pick between
+    /// them. None changes nothing: `Tab` on a line with no names behind it is
+    /// not an error, it is simply not a completion.
+    fn complete(&mut self) {
+        let Some(word) = self.input.completion_word() else {
+            return;
+        };
+        let candidates = self.completions();
+        match candidates.as_slice() {
+            [] => (),
+            [only] => {
+                self.input.replace(&word, only);
+            }
+            several => {
+                let common = common_prefix(several);
+                // Only ever characters the candidates agree on, never fewer than
+                // what is already typed: matching is case-insensitive, and a
+                // candidate spelled differently from the line (a lower-case
+                // `m1` meeting `M115`) can share less with its neighbours than
+                // the line already has. Taking that prefix would delete what the
+                // reader typed.
+                let span = if common.chars().count() >= self.input.word_text(&word).chars().count()
+                {
+                    self.input.replace(&word, &common)
+                } else {
+                    word
+                };
+                self.completion = Some(Completion {
+                    candidates,
+                    word: span,
+                    selected: None,
+                });
+            }
+        }
+    }
+
+    /// Pick the next or previous candidate, and put it in the line.
+    ///
+    /// The list wraps in both directions, which is what makes holding `Tab`
+    /// workable: the reader sees the whole list go past rather than having to
+    /// find their way back. The word in the line follows the pick, so what is
+    /// left to type is whatever argument comes after it.
+    fn cycle_completion(&mut self, step: isize) {
+        let Some(completion) = self.completion.as_mut() else {
+            return;
+        };
+        let count = completion.candidates.len();
+        if count == 0 {
+            return;
+        }
+        let next = match completion.selected {
+            // The first `Tab` on a layer that has nothing picked takes the first
+            // candidate; `BackTab` on one takes the last, so that both keys move
+            // away from where the layer opened rather than nowhere.
+            None if step > 0 => 0,
+            None => count - 1,
+            Some(index) => (index as isize + step).rem_euclid(count as isize) as usize,
+        };
+        completion.selected = Some(next);
+        let candidate = completion.candidates[next].clone();
+        // Each pick replaces the word as the line has it now — the prefix, or
+        // the candidate before this one — and the word moves to wherever the new
+        // candidate ends, which is where the next pick will replace from.
+        let word = self.input.replace(&completion.word, &candidate);
+        completion.word = word;
+    }
+
+    /// The names the word at the caret could be completed to.
+    ///
+    /// A word starting with `/` is answered from the window's commands and the
+    /// session's; a bare word in g-code mode from the printer's command names;
+    /// and a bare word in request mode from nothing, because a method name is
+    /// the printer's and the window has no list of those to offer.
+    fn completions(&self) -> Vec<String> {
+        let Some(word) = self.input.completion_word() else {
+            return Vec::new();
+        };
+        let prefix = self.input.word_text(&word);
+
+        if prefix.starts_with('/') {
+            // Only the canonical name of each command: the aliases would double
+            // every entry, and `/h` finds `/help` by prefix anyway. `help` is
+            // both the window's and the session's — one entry is enough, since
+            // the reader is choosing a line to type, not a place for it to go.
+            let mut candidates: Vec<String> = Vec::new();
+            for name in session::LOCAL_COMMANDS
+                .iter()
+                .map(|(name, _)| *name)
+                .chain(WINDOW_COMMANDS.iter().copied())
+            {
+                let candidate = format!("/{name}");
+                if candidate.starts_with(&prefix) && !candidates.contains(&candidate) {
+                    candidates.push(candidate);
+                }
+            }
+            candidates.sort();
+            candidates
+        } else if self.gcode {
+            // The printer's own names, matched without case: G-Code is written
+            // in capitals but typed in lower case, and what goes in the line is
+            // the name the printer spells (so what is inserted runs).
+            let typed = prefix.to_ascii_lowercase();
+            self.gcode_help
+                .iter()
+                .filter(|name| name.to_ascii_lowercase().starts_with(&typed))
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        }
+    }
 }
 
 // ===========================================================================
@@ -2020,12 +2453,19 @@ mod tests {
 
     #[test]
     fn test_the_hint_line_names_the_keys() {
-        // Use wider width to fit the full hint text.
-        let rows = render(&app_with(Vec::new()), 100, 6);
+        // Rendered wider than the footer's own budget, so the width check below
+        // measures the string instead of the terminal: `render` only collects
+        // the cells the terminal has, which would cap every line at the width it
+        // was handed and make the check true whatever the footer says.
+        let rows = render(&app_with(Vec::new()), 120, 6);
         let footer = rows.last().unwrap();
         assert!(footer.contains("Enter send"), "{footer}");
         assert!(footer.contains("^C quit"), "{footer}");
-        assert!(footer.contains("Home/End"), "{footer}");
+        // The log's `Home/End` gave up their place here to `Tab complete`; the
+        // footer is one line and is kept inside 100 columns.
+        assert!(footer.contains("PgUp/PgDn"), "{footer}");
+        assert!(footer.contains("Tab complete"), "{footer}");
+        assert!(footer.chars().count() <= 100, "{footer}");
     }
 
     #[test]
@@ -2034,16 +2474,16 @@ mod tests {
         assert!(app.mouse, "the window holds the mouse to begin with");
 
         // A captured mouse is the window's, so the terminal never sees a drag
-        // and cannot select. `.mouse` (and `^S`) hands it over; the footer is
+        // and cannot select. `/mouse` (and `^S`) hands it over; the footer is
         // where that is said, since a log line would land under the frozen pane.
-        assert!(app.window_command(".mouse"));
+        assert!(app.window_command("/mouse"));
         assert!(!app.mouse);
 
         let rows = render(&app, 60, 5);
         assert!(rows.last().unwrap().contains("mouse released"), "{rows:?}");
 
         // Asking again changes nothing: the mouse is already the terminal's.
-        assert!(app.window_command(".mouse"));
+        assert!(app.window_command("/mouse"));
         assert!(!app.mouse);
 
         // A key is what takes it back.
@@ -2517,11 +2957,11 @@ mod tests {
 
         // A local command is marked as one before it is sent.
         app.input.edit(KeyCode::Char('u'), true);
-        for character in ".help".chars() {
+        for character in "/help".chars() {
             app.input.edit(KeyCode::Char(character), false);
         }
         let rows = render(&app, 40, 5);
-        assert!(rows[3].starts_with("local> .help"), "{rows:?}");
+        assert!(rows[3].starts_with("local> /help"), "{rows:?}");
     }
 
     #[test]
@@ -2544,11 +2984,11 @@ mod tests {
         // A local command keeps its own prompt even in g-code mode.
         app.toggle_gcode();
         app.input.edit(KeyCode::Char('u'), true);
-        for character in ".help".chars() {
+        for character in "/help".chars() {
             app.input.edit(KeyCode::Char(character), false);
         }
         let rows = render(&app, 60, 5);
-        assert!(rows[3].starts_with("local> .help"), "{rows:?}");
+        assert!(rows[3].starts_with("local> /help"), "{rows:?}");
     }
 
     #[test]
@@ -3281,12 +3721,12 @@ mod tests {
         let mut app = app_with(Vec::new());
         assert_eq!(app.render.format, Format::Yaml, "YAML is the default");
 
-        assert!(app.window_command(".json"));
+        assert!(app.window_command("/json"));
         assert_eq!(app.render.format, Format::Json);
-        assert!(app.window_command(".yaml"));
+        assert!(app.window_command("/yaml"));
         assert_eq!(app.render.format, Format::Yaml);
         assert!(
-            !app.window_command(".subscribe"),
+            !app.window_command("/subscribe"),
             "the session's own command"
         );
         assert!(
@@ -3473,5 +3913,500 @@ mod tests {
             Color::Reset,
             "and the message itself is not"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Completion
+    // -----------------------------------------------------------------------
+
+    /// Type `line` into the input line, a press at a time.
+    fn type_line(app: &mut App, line: &str) {
+        for character in line.chars() {
+            app.input.edit(KeyCode::Char(character), false);
+        }
+    }
+
+    /// An app in g-code mode with the printer's command names already cached,
+    /// which is what a bare g-code word completes from.
+    fn app_with_gcode_commands(names: &[&str]) -> App {
+        let mut app = app_with(Vec::new());
+        app.gcode = true;
+        app.gcode_help = names.iter().map(|name| (*name).to_string()).collect();
+        app
+    }
+
+    #[test]
+    fn test_the_word_at_the_caret_is_the_first_one_or_nothing() {
+        // Indented, the first word is still the first word.
+        let mut input = Input::default();
+        for character in "  /hel".chars() {
+            input.edit(KeyCode::Char(character), false);
+        }
+        let word = input.completion_word().expect("an indented first word");
+        assert_eq!(word, Word { start: 2, end: 6 });
+        assert_eq!(input.word_text(&word), "/hel");
+
+        // Past a word, the caret is among the arguments: there is nothing to
+        // complete there, and `Tab` must not touch them.
+        input.edit(KeyCode::Char(' '), false);
+        input.edit(KeyCode::Char('x'), false);
+        assert!(input.completion_word().is_none());
+
+        // A line of blanks has no word in it either.
+        let mut input = Input::default();
+        for character in "   ".chars() {
+            input.edit(KeyCode::Char(character), false);
+        }
+        assert!(input.completion_word().is_none());
+
+        // The caret inside the word takes the whole of it.
+        let mut input = Input::default();
+        for character in "/help".chars() {
+            input.edit(KeyCode::Char(character), false);
+        }
+        input.edit(KeyCode::Home, false);
+        input.edit(KeyCode::Right, false);
+        assert_eq!(input.completion_word(), Some(Word { start: 0, end: 5 }));
+    }
+
+    #[test]
+    fn test_tab_completes_the_only_candidate() {
+        let mut app = app_with(Vec::new());
+        type_line(&mut app, "/hel");
+        assert!(
+            app.completion_key(KeyCode::Tab),
+            "Tab is the completion key"
+        );
+        assert_eq!(app.input.text(), "/help");
+        assert!(app.completion.is_none(), "one candidate needs no layer");
+        assert_eq!(app.input.cursor, 5, "the caret is after the word");
+
+        // `/h` is an alias of `/help`, and `Tab` finds the command by prefix
+        // like any other: what goes in the line is the canonical name.
+        let mut app = app_with(Vec::new());
+        type_line(&mut app, "/h");
+        assert!(app.completion_key(KeyCode::Tab));
+        assert_eq!(app.input.text(), "/help");
+    }
+
+    #[test]
+    fn test_tab_narrows_to_the_shared_prefix_and_opens_the_layer() {
+        let mut app = app_with_gcode_commands(&["M104", "M115", "M140"]);
+        type_line(&mut app, "m1");
+        assert!(app.completion_key(KeyCode::Tab));
+        // The candidates all start `M1`, so the line gains what they agree on —
+        // spelled the way the printer spells it, since that is what runs.
+        assert_eq!(app.input.text(), "M1");
+        let completion = app.completion.as_ref().expect("the layer is open");
+        assert_eq!(completion.candidates, ["M104", "M115", "M140"]);
+        assert_eq!(completion.selected, None, "nothing is picked yet");
+        assert_eq!(completion.word, Word { start: 0, end: 2 });
+    }
+
+    #[test]
+    fn test_a_shared_prefix_never_shortens_what_was_typed() {
+        // Matching is case-insensitive, so two candidates can agree on less than
+        // the line already has: `m1` reaches `M115` and `m115`, which share no
+        // first character at all. Filling in that prefix would delete the word
+        // the reader typed, so the line keeps it and only the layer opens.
+        let mut app = app_with_gcode_commands(&["M115", "m115"]);
+        type_line(&mut app, "m1");
+
+        assert!(app.completion_key(KeyCode::Tab));
+
+        assert_eq!(app.input.text(), "m1", "the typed word survives");
+        let completion = app.completion.as_ref().expect("the layer is open");
+        assert_eq!(completion.candidates, ["M115", "m115"]);
+        assert_eq!(completion.word, Word { start: 0, end: 2 });
+    }
+
+    #[test]
+    fn test_tab_on_a_word_with_no_candidates_does_nothing() {
+        // Request mode has no names to offer at all.
+        let mut app = app_with(Vec::new());
+        type_line(&mut app, "objects/quer");
+        assert!(app.completion_key(KeyCode::Tab), "the key is still Tab's");
+        assert_eq!(app.input.text(), "objects/quer");
+        assert!(app.completion.is_none());
+
+        // And a local word nothing starts with is the same case.
+        let mut app = app_with(Vec::new());
+        type_line(&mut app, "/zz");
+        assert!(app.completion_key(KeyCode::Tab));
+        assert_eq!(app.input.text(), "/zz");
+        assert!(app.completion.is_none());
+    }
+
+    #[test]
+    fn test_tab_leaves_the_arguments_alone() {
+        let mut app = app_with(Vec::new());
+        type_line(&mut app, "/subscribe tool");
+        assert!(
+            app.input.completion_word().is_none(),
+            "the caret is past the first word"
+        );
+        assert!(app.completion_key(KeyCode::Tab));
+        assert_eq!(app.input.text(), "/subscribe tool");
+        assert!(app.completion.is_none());
+    }
+
+    #[test]
+    fn test_a_completion_replaces_the_whole_word_from_wherever_the_caret_is() {
+        let mut app = app_with(Vec::new());
+        type_line(&mut app, "/he");
+        app.input.edit(KeyCode::Left, false);
+        app.input.edit(KeyCode::Left, false);
+        assert!(app.completion_key(KeyCode::Tab));
+        assert_eq!(
+            app.input.text(),
+            "/help",
+            "the whole word, not just the head"
+        );
+        assert_eq!(app.input.cursor, 5, "and the caret ends up after it");
+    }
+
+    #[test]
+    fn test_an_indented_local_line_still_completes() {
+        let mut app = app_with(Vec::new());
+        type_line(&mut app, "  /gco");
+        assert!(app.completion_key(KeyCode::Tab));
+        assert_eq!(
+            app.input.text(),
+            "  /gcode",
+            "the indentation is not the word"
+        );
+        assert_eq!(app.input.cursor, 8);
+    }
+
+    #[test]
+    fn test_a_gcode_completion_ignores_case_and_inserts_the_printers_spelling() {
+        let mut app = app_with_gcode_commands(&["M115", "M104"]);
+        type_line(&mut app, "m115");
+        assert!(app.completion_key(KeyCode::Tab));
+        assert_eq!(app.input.text(), "M115");
+        assert!(app.completion.is_none(), "one candidate, so no layer");
+    }
+
+    #[test]
+    fn test_the_layer_cycles_through_the_candidates_and_wraps() {
+        let mut app = app_with_gcode_commands(&["M104", "M115", "M140"]);
+        type_line(&mut app, "m1");
+        app.completion_key(KeyCode::Tab);
+
+        assert!(
+            app.completion_key(KeyCode::Tab),
+            "the first Tab picks a candidate"
+        );
+        assert_eq!(app.input.text(), "M104");
+        assert_eq!(app.input.cursor, 4, "the caret stays at the word's end");
+        assert!(app.completion_key(KeyCode::Tab));
+        assert_eq!(app.input.text(), "M115");
+        assert!(app.completion_key(KeyCode::Tab));
+        assert_eq!(app.input.text(), "M140");
+        // Off the end is the beginning again...
+        assert!(app.completion_key(KeyCode::Tab));
+        assert_eq!(app.input.text(), "M104");
+        // ...and the other key goes round the same list the other way.
+        assert!(app.completion_key(KeyCode::BackTab));
+        assert_eq!(app.input.text(), "M140");
+        assert_eq!(app.completion.as_ref().unwrap().selected, Some(2));
+    }
+
+    #[test]
+    fn test_backtab_with_no_layer_is_not_consumed() {
+        let mut app = app_with(Vec::new());
+        type_line(&mut app, "/hel");
+        assert!(
+            !app.completion_key(KeyCode::BackTab),
+            "`Tab` opens the layer"
+        );
+        assert!(app.completion.is_none());
+        assert_eq!(app.input.text(), "/hel");
+    }
+
+    #[test]
+    fn test_backspace_closes_the_layer_and_still_deletes() {
+        let mut app = app_with_gcode_commands(&["M104", "M115"]);
+        type_line(&mut app, "m1");
+        app.completion_key(KeyCode::Tab);
+
+        assert!(
+            !app.completion_key(KeyCode::Backspace),
+            "the layer lets it go"
+        );
+        assert!(app.completion.is_none(), "and closes on the way");
+        app.input.edit(KeyCode::Backspace, false);
+        assert_eq!(app.input.text(), "M", "the key did its own job");
+    }
+
+    #[test]
+    fn test_the_layer_does_not_swallow_the_keys_that_are_not_its_own() {
+        // Every one of these has a job of its own in `handle_key`, which only
+        // runs if `completion_key` says the key is not the layer's: an open
+        // layer must never be a mode the keyboard is stuck in.
+        for code in [
+            KeyCode::Esc,
+            KeyCode::Enter,
+            KeyCode::Backspace,
+            KeyCode::Delete,
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Char('c'),
+            KeyCode::Char('d'),
+            KeyCode::Char('g'),
+            KeyCode::Char('l'),
+            KeyCode::Char('u'),
+        ] {
+            let mut app = app_with_gcode_commands(&["M104", "M115"]);
+            type_line(&mut app, "m1");
+            app.completion_key(KeyCode::Tab);
+            assert!(app.completion.is_some(), "the layer is open for {code:?}");
+
+            assert!(!app.completion_key(code), "{code:?} is its own key");
+            assert!(app.completion.is_none(), "{code:?} closed the layer");
+            assert_eq!(app.input.text(), "M1", "the layer left the line alone");
+        }
+    }
+
+    #[test]
+    fn test_a_local_line_completes_from_the_session_and_the_window_once_each() {
+        let mut app = app_with(Vec::new());
+        type_line(&mut app, "/");
+        let candidates = app.completions();
+
+        assert!(candidates.contains(&"/gcode".to_string()), "{candidates:?}");
+        assert!(
+            candidates.contains(&"/subscribe".to_string()),
+            "{candidates:?}"
+        );
+        assert!(candidates.contains(&"/quit".to_string()), "{candidates:?}");
+        assert_eq!(
+            candidates
+                .iter()
+                .filter(|candidate| *candidate == "/help")
+                .count(),
+            1,
+            "`help` is the window's and the session's, and is offered once: {candidates:?}"
+        );
+
+        // Canonical names only: an alias is a second way to spell a line that is
+        // already in the list, and `/h` finds `/help` by prefix as it is.
+        for alias in [
+            "/h",
+            "/?",
+            "/q",
+            "/exit",
+            "/sub",
+            "/reload_config",
+            "/restart_firmware",
+        ] {
+            assert!(
+                !candidates.contains(&alias.to_string()),
+                "{alias} in {candidates:?}"
+            );
+        }
+
+        // Sorted, so the layer reads the way a list reads.
+        let mut sorted = candidates.clone();
+        sorted.sort();
+        assert_eq!(candidates, sorted);
+    }
+
+    #[test]
+    fn test_a_gcode_line_completes_from_the_printers_own_names() {
+        let mut app = app_with_gcode_commands(&["G28", "M104", "M115"]);
+        type_line(&mut app, "m1");
+        assert_eq!(
+            app.completions(),
+            ["M104", "M115"],
+            "bare names, no slashes"
+        );
+    }
+
+    #[test]
+    fn test_a_local_line_completes_in_gcode_mode_too() {
+        // A local command never reaches the printer, so g-code mode is no reason
+        // to stop completing one.
+        let mut app = app_with_gcode_commands(&["G28", "M104"]);
+        type_line(&mut app, "/su");
+        assert_eq!(app.completions(), ["/subscribe"]);
+    }
+
+    #[test]
+    fn test_request_mode_has_no_names_to_offer() {
+        let mut app = app_with(Vec::new());
+        type_line(&mut app, "info");
+        assert!(app.completions().is_empty(), "a method is not the window's");
+
+        // A cached command list is not offered either: `M115` is not a method.
+        let mut app = app_with_gcode_commands(&["M115"]);
+        app.gcode = false;
+        type_line(&mut app, "m1");
+        assert!(app.completions().is_empty());
+    }
+
+    #[test]
+    fn test_the_window_command_list_is_what_the_window_answers() {
+        // Completion draws from `WINDOW_COMMANDS` and `window_command` runs the
+        // same set. This holds the two spellings together: a command in one and
+        // not the other would be either a candidate that does nothing or a
+        // command nobody is offered.
+        for name in WINDOW_COMMANDS {
+            let line = format!("/{name}");
+            assert!(App::new().window_command(&line), "{line} is not answered");
+
+            // And each one is its own candidate, with nothing else alongside.
+            let mut app = App::new();
+            type_line(&mut app, &line);
+            assert_eq!(app.completions(), [line.as_str()]);
+        }
+    }
+
+    #[test]
+    fn test_the_printer_command_list_is_asked_for_once_and_only_from_a_ready_printer() {
+        let mut app = App::new();
+        app.gcode = true;
+        assert!(!app.needs_gcode_help(), "the printer's state is unknown");
+
+        app.status = Status::Connected {
+            state: "startup".to_string(),
+            message: "Loading config".to_string(),
+        };
+        assert!(!app.needs_gcode_help(), "a printer still loading has none");
+
+        app.status = Status::Connected {
+            state: "ready".to_string(),
+            message: "Printer is ready".to_string(),
+        };
+        assert!(
+            app.needs_gcode_help(),
+            "ready, in g-code mode, without a list"
+        );
+
+        app.gcode_help = vec!["M115".to_string()];
+        app.gcode_help_asked = true;
+        assert!(
+            !app.needs_gcode_help(),
+            "the list is kept, so it is asked once"
+        );
+
+        // An answer with nothing in it is still an answer: asking again would
+        // be a second round trip for the same empty list.
+        app.gcode_help.clear();
+        assert!(
+            !app.needs_gcode_help(),
+            "an empty answer is still an answer"
+        );
+        app.gcode = false;
+        assert!(
+            !app.needs_gcode_help(),
+            "request mode has nowhere to show it"
+        );
+    }
+
+    #[test]
+    fn test_the_candidate_layer_is_drawn_above_the_input_line() {
+        let mut app = app_with_gcode_commands(&["M104", "M115", "M140"]);
+        type_line(&mut app, "m1");
+        app.completion_key(KeyCode::Tab);
+        app.completion_key(KeyCode::Tab); // pick `M104`, so the bar is somewhere
+
+        // Header row 0, the log to row 5, the input line at 6 and the footer at
+        // 7: the layer hangs off the input line and covers the log's last rows.
+        let rows = render(&app, 40, 8);
+        assert!(rows[3].contains("M104"), "{rows:?}");
+        assert!(rows[4].contains("M115"), "{rows:?}");
+        assert!(rows[5].contains("M140"), "{rows:?}");
+        assert!(rows[6].starts_with("gcode> M104"), "{rows:?}");
+        assert!(!rows[0].contains("M1"), "the header is above it: {rows:?}");
+    }
+
+    #[test]
+    fn test_the_candidate_layer_is_left_out_when_the_log_has_no_room() {
+        let mut app = app_with_gcode_commands(&["M104", "M115", "M140"]);
+        type_line(&mut app, "m1");
+        app.completion_key(KeyCode::Tab);
+
+        // Five rows: the header, two of log, the input line and the footer. The
+        // layer would cover the whole log, so it is not drawn — and the
+        // candidates are still there, because the picture is not the feature.
+        let rows = render(&app, 40, 5);
+        assert!(rows.iter().all(|row| !row.contains("M104")), "{rows:?}");
+        assert!(app.completion.is_some());
+
+        // One row more and it fits, so it is back.
+        let rows = render(&app, 40, 6);
+        assert!(rows[1].contains("M104"), "{rows:?}");
+    }
+
+    #[test]
+    fn test_the_candidate_layer_covers_the_log_behind_it() {
+        let mut app = app_with(vec![Entry::notice(Notice::Info, "XXXXXXXXXXXXXXXXXXXX")]);
+        app.gcode = true;
+        app.gcode_help = vec!["M104".to_string(), "M115".to_string()];
+        type_line(&mut app, "m1");
+        app.completion_key(KeyCode::Tab);
+
+        // A short log sits at the top of its pane, so the layer's two rows are
+        // below the log's one line — and that line is not showing through them.
+        let rows = render(&app, 30, 6);
+        assert!(
+            rows[1].contains("XXXX"),
+            "the log line is above it: {rows:?}"
+        );
+        assert!(rows[2].contains("M104"), "{rows:?}");
+        assert!(rows[3].contains("M115"), "{rows:?}");
+        assert!(
+            rows[2..=3].iter().all(|row| !row.contains("XXX")),
+            "the log is cleared behind the layer: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn test_the_picked_candidate_is_the_highlighted_row() {
+        let mut app = app_with_gcode_commands(&["M104", "M115", "M140"]);
+        type_line(&mut app, "m1");
+        app.completion_key(KeyCode::Tab);
+        app.completion_key(KeyCode::Tab); // pick `M104`
+
+        let mut terminal = Terminal::new(TestBackend::new(40, 8)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let buffer = terminal.backend().buffer();
+
+        assert!(
+            buffer[(1, 3)].modifier.contains(Modifier::REVERSED),
+            "the picked row is a bar: {:?}",
+            buffer[(1, 3)]
+        );
+        assert!(
+            !buffer[(1, 4)].modifier.contains(Modifier::REVERSED),
+            "and the others are not: {:?}",
+            buffer[(1, 4)]
+        );
+        assert_eq!(buffer[(2, 4)].symbol(), "1", "still the candidates' text");
+    }
+
+    #[test]
+    fn test_a_long_candidate_list_scrolls_to_keep_the_pick_in_view() {
+        let names: Vec<String> = (100..110).map(|number| format!("M{number}")).collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let mut app = app_with_gcode_commands(&names);
+        type_line(&mut app, "m1");
+        app.completion_key(KeyCode::Tab); // opens on `M10`, the candidates' prefix
+        for _ in 0..10 {
+            app.completion_key(KeyCode::Tab);
+        }
+        assert_eq!(app.input.text(), "M109", "the last of the ten");
+
+        // Six rows for ten candidates: the list has to have moved for the pick
+        // to be in it.
+        let rows = render(&app, 40, 9);
+        let text = rows.join("\n");
+        assert!(text.contains("M109"), "{text}");
+        assert!(
+            !text.contains("M100"),
+            "the front has scrolled away: {text}"
+        );
+        assert!(rows[7].starts_with("gcode> M109"), "{rows:?}");
     }
 }

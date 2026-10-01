@@ -49,19 +49,21 @@ $ klipperx console -a /tmp/klippy_uds
 Connected to unix:/tmp/klippy_uds.
 Printer is ready — Printer is ready (v0.12.0-123-gabcdef, 4 core ARMv7 Processor rev 4 (v7l))
 Type a request: a method name (`info`), a method and parameters
-(`objects/query {"objects": {"toolhead": null}}`), or a whole JSON object.
-An `id` is added when you leave it out; `"id": null` sends it unanswered.
+(`objects/query {objects: {toolhead: null}}`), or a whole request object.
+They are YAML — JSON is YAML too. An `id` is added when you leave it out;
+`{id: null, ...}` sends it unanswered.
 
 Local commands:
-  .help          this text
-  .subscribe     watch every object (`objects/list` + `objects/subscribe`)
-  .subscribe a b watch only the named objects
-  .firmware_restart
+  /help          this text
+  /subscribe     watch every object (`objects/list` + `objects/subscribe`)
+  /subscribe a b watch only the named objects
+  /firmware_restart
                  restart the firmware; the printer comes back up
-  .reload        reload the config file from disk and restart the printer
-  .quit          leave (also ^D)
+  /reload        reload the config file from disk and restart the printer
+  /quit          leave, after printing any reply still owed (also ^D)
 
-Replies print as `<id> (<method>) <result>`; pushes print as `< <message>`.
+Replies and pushes carry their direction; line mode prints one compact JSON line
+each, the window shows the body as YAML by default.
 klippy> objects/query {"objects": {"toolhead": ["position"]}}
 2 (objects/query)
   {
@@ -72,10 +74,10 @@ klippy> objects/query {"objects": {"toolhead": ["position"]}}
       }
     }
   }
-klippy> .subscribe toolhead
+klippy> /subscribe toolhead
 Subscribed to 1 object(s); updates print as `<`.
 < {"id": null, "method": "klippy:status", "params": {"eventtime": 1234.5, "status": {...}}}
-klippy> .quit
+klippy> /quit
 Disconnected from unix:/tmp/klippy_uds.
 ```
 
@@ -89,7 +91,7 @@ Disconnected from unix:/tmp/klippy_uds.
 
 `id` 由客户端补上（除非你已经写了，包括写成 `null`）；`"id": null` 会被原样发送，
 也就是按协议约定不要应答。回包按 `id` 与发出的方法名配对后打印，服务端主动推来的
-消息（无 `id`）以 `<` 开头单独打印 —— 这也是 `.subscribe` 之后能一直看到状态更新
+消息（无 `id`）以 `<` 开头单独打印 —— 这也是 `/subscribe` 之后能一直看到状态更新
 的原因。
 
 > `klipperx console` 在终端里开的是全屏窗口（状态行 + 日志 + 输入行），要行式

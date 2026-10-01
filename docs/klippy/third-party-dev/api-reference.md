@@ -316,6 +316,8 @@
 
 获取所有注册的 G-Code 命令及其帮助信息。返回值为扁平的 `{命令名: 帮助文本}` 字典，内容随已加载模块动态变化，下列仅为示例：
 
+> **命令的参数名不在这个返回值里**（本端点的载荷形状保持扁平字典，不改）。要拿参数名，用 `objects/query {"objects": {"gcode": null}}` 取 `result.status.gcode.commands`，其中每个命令的值可能带 `parameters`（见下方「G-Code 命令表」一节的说明）。
+
 **请求：**
 ```json
 {"method": "gcode/help"}
@@ -843,6 +845,16 @@
 | `MANUAL_PROBE` | 手动探测（`manual_probe`） |
 
 > 上表只列出常见命令，实际可用命令以 `gcode/help` 的返回（或 `objects/query` 查询 `gcode.commands`）为准；部分命令需要先启用对应模块（如 `gcode_arcs`、`bed_mesh`、`probe`、`z_tilt`）。
+>
+> `objects/query {"objects": {"gcode": null}}`（以及 `objects/subscribe` 的应答快照与后续
+> `klippy:status` 推送）里，`result.status.gcode.commands[<命令>]` 的每个值是一个对象：
+> 除 `help`（如有）之外，**声明过具名参数的命令**会多出 `parameters: ["…"]`，按声明/读取
+> 顺序排列，mux 命令的 key（如 `SET_PIN` 的 `PIN`）排在最前；**没有参数名的命令维持
+> `{}` 或 `{"help": …}` 的原形状**，所以这是加性字段、老客户端不受影响。
+>
+> 两点要按连接实时查：① 命令集合随配置加载的模块而变；② 同一命令由多个模块注册时
+> （例如 `SET_PIN` 由 `[output_pin]`/`[pwm_tool]`/`[pwm_cycle_time]` 分别注册），
+> 参数声明按**首次出现顺序合并**，所以同一命令在不同配置下可能报出不同的参数名集合。
 
 ---
 

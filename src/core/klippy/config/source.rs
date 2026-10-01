@@ -37,11 +37,11 @@ mod tests {
 
     #[test]
     fn test_config_source_display() {
-        let file_source = ConfigSource::File(PathBuf::from("/path/to/config.cfg"));
-        assert_eq!(format!("{}", file_source), "/path/to/config.cfg");
+        let file_source = ConfigSource::File(PathBuf::from("/path/to/printer.cfg"));
+        assert_eq!(format!("{}", file_source), "/path/to/printer.cfg");
 
-        let url_source = ConfigSource::Url("https://example.com/config.cfg".to_string());
-        assert_eq!(format!("{}", url_source), "https://example.com/config.cfg");
+        let url_source = ConfigSource::Url("https://example.com/printer.cfg".to_string());
+        assert_eq!(format!("{}", url_source), "https://example.com/printer.cfg");
 
         let none_source = ConfigSource::None(String::new());
         assert_eq!(format!("{}", none_source), "<in-memory:empty>");

@@ -56,7 +56,13 @@ impl PrinterHeaterBed {
                 set_bed_temperature(&heater, temp)
             });
             gcode
-                .register_command(name, handler, Some("Set bed temperature"), false)
+                .register_command_with_params(
+                    name,
+                    handler,
+                    Some("Set bed temperature"),
+                    M140_M190_PARAMS,
+                    false,
+                )
                 .map_err(ConfigError::new)?;
         }
         Ok(())
@@ -74,6 +80,10 @@ impl std::fmt::Debug for PrinterHeaterBed {
         f.debug_struct("PrinterHeaterBed").finish_non_exhaustive()
     }
 }
+
+/// `M140`/`M190` read one word, `S` (`heater_bed.py:35-38`), through the
+/// inline handler both names share.
+const M140_M190_PARAMS: &[&str] = &["S"];
 
 /// `M140`/`M190`: set the bed target (`PrinterHeaterBed.cmd_M140`).
 fn set_bed_temperature(heater: &Heater, temp: f64) -> Result<(), CommandError> {

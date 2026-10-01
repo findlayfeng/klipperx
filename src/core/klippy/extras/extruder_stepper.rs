@@ -136,12 +136,13 @@ impl PrinterExtruderStepper {
         let handler: CommandHandler =
             sync(move |gcmd: &GcodeCommand| cmd_set_pressure_advance(gcmd, &advance, &smooth));
         gcode
-            .register_mux_command(
+            .register_mux_command_with_params(
                 "SET_PRESSURE_ADVANCE",
                 "EXTRUDER",
                 Some(&self.name),
                 handler,
                 Some("Set pressure advance parameters"),
+                &["ADVANCE", "SMOOTH_TIME"],
             )
             .map_err(ConfigError::new)?;
 
@@ -155,12 +156,13 @@ impl PrinterExtruderStepper {
                 cmd_set_extruder_rotation_distance(gcmd, &name, &stepper)
             });
             gcode
-                .register_mux_command(
+                .register_mux_command_with_params(
                     "SET_EXTRUDER_ROTATION_DISTANCE",
                     "EXTRUDER",
                     Some(&self.name),
                     handler,
                     Some("Set extruder rotation distance"),
+                    &["DISTANCE"],
                 )
                 .map_err(ConfigError::new)?;
         }
@@ -172,12 +174,13 @@ impl PrinterExtruderStepper {
                 cmd_sync_extruder_motion(gcmd, &name, &printer, &queue)
             });
             gcode
-                .register_mux_command(
+                .register_mux_command_with_params(
                     "SYNC_EXTRUDER_MOTION",
                     "EXTRUDER",
                     Some(&self.name),
                     handler,
                     Some("Set extruder stepper motion queue"),
+                    &["MOTION_QUEUE"],
                 )
                 .map_err(ConfigError::new)?;
         }

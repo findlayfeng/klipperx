@@ -816,7 +816,8 @@ impl ToolHeadObject {
             sync(move |gcmd| cmd_dwell(&state, gcmd))
         };
         gcode
-            .register_command("G4", dwell_handler, None, false)
+            // `S` is seconds, `P` milliseconds; the handler prefers `S`.
+            .register_command_with_params("G4", dwell_handler, None, &["S", "P"], false)
             .map_err(ConfigError::new)?;
         let wait_handler: CommandHandler = {
             let state = Arc::clone(&self.state);
@@ -831,10 +832,13 @@ impl ToolHeadObject {
             sync(move |gcmd| cmd_set_kinematic_position(&state, &printer, gcmd))
         };
         gcode
-            .register_command(
+            .register_command_with_params(
                 "SET_KINEMATIC_POSITION",
                 position_handler,
                 Some("Force a low-level kinematic position"),
+                // The axes the handler reads by loop (`X`/`Y`/`Z`), then the
+                // homing words it reads by name.
+                &["X", "Y", "Z", "SET_HOMED", "CLEAR", "CLEAR_HOMED"],
                 false,
             )
             .map_err(ConfigError::new)?;
@@ -851,7 +855,14 @@ impl ToolHeadObject {
             })
         };
         gcode
-            .register_command("G28", home_handler, Some("Home one or more axes"), false)
+            // Naming an axis homes it; naming none homes all three.
+            .register_command_with_params(
+                "G28",
+                home_handler,
+                Some("Home one or more axes"),
+                &["X", "Y", "Z"],
+                false,
+            )
             .map_err(ConfigError::new)?;
         Ok(())
     }
@@ -4375,5 +4386,34 @@ mod tests {
             object.z_stepper_names(),
             ["stepper_z", "stepper_z1", "stepper_z2"]
         );
+    }
+
+    /// The declarations a client completes `KEY=` from, as they appear on
+    /// `status.gcode.commands`: `G4` takes either unit of dwell time, `G28`
+    /// takes the axes, `SET_KINEMATIC_POSITION` takes the axes and its homing
+    /// words, and `M400` waits for what is already queued — nothing to name.
+    #[test]
+    fn test_every_command_declares_the_parameters_it_reads() {
+        let (printer, object) = object_over(Arc::new(Mutex::new(None)));
+        printer
+            .add_object(
+                GCODE_OBJECT,
+                Arc::new(GCodeDispatch::new(Arc::clone(&printer))),
+            )
+            .unwrap();
+        object.register_commands(&printer).unwrap();
+        printer.send_event(&KlippyEvent::KlippyReady);
+
+        let gcode = printer
+            .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+            .expect("the dispatcher is registered");
+        let commands = gcode.get_status(0.0)["commands"].clone();
+        assert_eq!(commands["G4"]["parameters"], json!(["S", "P"]));
+        assert_eq!(commands["G28"]["parameters"], json!(["X", "Y", "Z"]));
+        assert_eq!(
+            commands["SET_KINEMATIC_POSITION"]["parameters"],
+            json!(["X", "Y", "Z", "SET_HOMED", "CLEAR", "CLEAR_HOMED"])
+        );
+        assert!(commands["M400"].get("parameters").is_none());
     }
 }

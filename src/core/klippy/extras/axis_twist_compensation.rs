@@ -43,7 +43,7 @@ use crate::core::klippy::event::KlippyEvent;
 use crate::core::klippy::extras::manual_probe::{
     FinalizeCallback, ManualProbe, MANUAL_PROBE_OBJECT,
 };
-use crate::core::klippy::extras::probe::{lookup_probe_session, ProbeSession};
+use crate::core::klippy::extras::probe::{lookup_probe_session, ProbeSession, PROBE_PARAMS};
 use crate::core::klippy::extras::toolhead::ToolHeadObject;
 use crate::core::klippy::gcode::{CommandError, GCodeDispatch, GcodeCommand, GCODE_OBJECT};
 use crate::core::klippy::load::section;
@@ -72,6 +72,17 @@ const DEFAULT_HORIZONTAL_MOVE_Z: f64 = 5.;
 /// The command's help, byte for byte (`cmd_AXIS_TWIST_COMPENSATION_CALIBRATE_help`,
 /// `axis_twist_compensation.py:133-137`).
 const CALIBRATE_HELP: &str = "\n    Performs the x twist calibration wizard\n    Measure z probe offset at n points along the x axis,\n    and calculate x twist compensation\n    ";
+
+/// The `KEY` names `AXIS_TWIST_COMPENSATION_CALIBRATE` reads, in read order:
+/// its own sample count and axis, then the probe parameters each point's
+/// session reads, then the `SPEED` the interactive manual probe helper reads
+/// (`axis_twist_compensation.py:151-283`).
+fn calibrate_params() -> Vec<&'static str> {
+    let mut params = vec!["SAMPLE_COUNT", "AXIS"];
+    params.extend_from_slice(PROBE_PARAMS);
+    params.push("SPEED");
+    params
+}
 
 /// The `[axis_twist_compensation]` options as written
 /// (`axis_twist_compensation.py:22-46`).
@@ -724,13 +735,14 @@ impl AxisTwistCompensation {
         {
             let calibrater = Arc::clone(&calibrater);
             gcode
-                .register_command(
+                .register_command_with_params(
                     "AXIS_TWIST_COMPENSATION_CALIBRATE",
                     Arc::new(move |gcmd| {
                         let calibrater = Arc::clone(&calibrater);
                         Box::pin(async move { calibrater.cmd_calibrate(gcmd).await })
                     }),
                     Some(CALIBRATE_HELP),
+                    &calibrate_params(),
                     false,
                 )
                 .map_err(ConfigError::new)?;

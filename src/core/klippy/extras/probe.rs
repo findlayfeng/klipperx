@@ -176,6 +176,40 @@ pub struct ProbeParams {
     pub samples_result: String,
 }
 
+/// The `KEY` names [`ProbeParams::from_command`] reads, in read order: every
+/// command that runs a probe session accepts them.
+pub(crate) const PROBE_PARAMS: &[&str] = &[
+    "PROBE_SPEED",
+    "LIFT_SPEED",
+    "SAMPLES",
+    "SAMPLE_RETRACT_DIST",
+    "SAMPLES_TOLERANCE",
+    "SAMPLES_TOLERANCE_RETRIES",
+    "SAMPLES_RESULT",
+];
+
+/// The `KEY` names [`ProbePointsHelper::start_probe`] reads before the probe
+/// parameters, in read order (`probe.py:start_probe`).
+pub(crate) const PROBE_POINTS_PARAMS: &[&str] = &["METHOD", "HORIZONTAL_MOVE_Z"];
+
+/// The declared parameters of a command that drives a full
+/// [`ProbePointsHelper::start_probe`] round: the method and move height the
+/// round reads first, then the probe parameters it hands on to the session.
+pub(crate) fn probe_points_params() -> Vec<&'static str> {
+    let mut params = PROBE_POINTS_PARAMS.to_vec();
+    params.extend_from_slice(PROBE_PARAMS);
+    params
+}
+
+/// The declared parameters of `PROBE_CALIBRATE`: the probe parameters, then
+/// the `SPEED` the interactive manual probe helper reads
+/// (`manual_probe.py:ManualProbeHelper.__init__`).
+fn probe_calibrate_params() -> Vec<&'static str> {
+    let mut params = PROBE_PARAMS.to_vec();
+    params.push("SPEED");
+    params
+}
+
 impl ProbeParams {
     /// The section's defaults: `lift_speed` falls back to `speed`, as upstream
     /// does (`probe.py:250`).
@@ -886,7 +920,7 @@ pub(crate) fn register_commands(
         let session = Arc::clone(session);
         let state = Arc::clone(state);
         gcode
-            .register_command(
+            .register_command_with_params(
                 "PROBE",
                 Arc::new(move |gcmd| {
                     let session = Arc::clone(&session);
@@ -909,6 +943,7 @@ pub(crate) fn register_commands(
                     })
                 }),
                 Some("Probe Z-height at current XY position"),
+                PROBE_PARAMS,
                 false,
             )
             .map_err(ConfigError::new)?;
@@ -919,7 +954,7 @@ pub(crate) fn register_commands(
     {
         let session = Arc::clone(session);
         gcode
-            .register_command(
+            .register_command_with_params(
                 "PROBE_ACCURACY",
                 Arc::new(move |gcmd| {
                     let session = Arc::clone(&session);
@@ -979,6 +1014,7 @@ pub(crate) fn register_commands(
                     })
                 }),
                 Some("Probe Z-height accuracy at current XY position"),
+                PROBE_PARAMS,
                 false,
             )
             .map_err(ConfigError::new)?;
@@ -992,7 +1028,7 @@ pub(crate) fn register_commands(
         let calibrate_z = Arc::new(Mutex::new(0.0f64));
         let printer_weak = Arc::downgrade(printer);
         gcode
-            .register_command(
+            .register_command_with_params(
                 "PROBE_CALIBRATE",
                 Arc::new(move |gcmd| {
                     let session = Arc::clone(&session);
@@ -1059,6 +1095,7 @@ pub(crate) fn register_commands(
                     })
                 }),
                 Some("Calibrate the probe's z_offset"),
+                &probe_calibrate_params(),
                 false,
             )
             .map_err(ConfigError::new)?;

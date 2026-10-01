@@ -297,11 +297,15 @@ impl PrinterStepperEnable {
             set_motors_enable_inner(&enable_lines2, std::slice::from_ref(&stepper_name), enable);
             Ok(())
         });
+        // `STEPPER` names the line, `ENABLE` the state
+        // (`stepper_enable.py:cmd_SET_STEPPER_ENABLE`); `M18` / `M84` above
+        // read no key.
         gcode
-            .register_command(
+            .register_command_with_params(
                 "SET_STEPPER_ENABLE",
                 handler_set,
                 Some("Enable/disable individual stepper"),
+                &["STEPPER", "ENABLE"],
                 false,
             )
             .ok();

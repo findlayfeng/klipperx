@@ -233,21 +233,23 @@ impl FirmwareRetraction {
             .expect("the loader registers `gcode` before any section");
         type Command =
             for<'a> fn(&'a Arc<FirmwareRetraction>, &'a GcodeCommand) -> CommandFuture<'a>;
-        const COMMANDS: &[(&str, Command, Option<&str>)] = &[
+        const COMMANDS: &[(&str, Command, Option<&str>, &[&str])] = &[
             (
                 "SET_RETRACTION",
                 cmd_set_retraction,
                 Some(SET_RETRACTION_HELP),
+                SET_RETRACTION_PARAMS,
             ),
             (
                 "GET_RETRACTION",
                 cmd_get_retraction,
                 Some(GET_RETRACTION_HELP),
+                &[],
             ),
-            ("G10", cmd_g10, None),
-            ("G11", cmd_g11, None),
+            ("G10", cmd_g10, None, &[]),
+            ("G11", cmd_g11, None, &[]),
         ];
-        for &(name, command, help) in COMMANDS {
+        for &(name, command, help, params) in COMMANDS {
             let handler: CommandHandler = {
                 let object = Arc::clone(self);
                 Arc::new(move |gcmd| {
@@ -256,12 +258,21 @@ impl FirmwareRetraction {
                 })
             };
             gcode
-                .register_command(name, handler, help, false)
+                .register_command_with_params(name, handler, help, params, false)
                 .map_err(ConfigError::new)?;
         }
         Ok(())
     }
 }
+
+/// The four words `SET_RETRACTION` reads, in source order
+/// (`firmware_retraction.py:39-51`). Listed once for the `COMMANDS` table.
+const SET_RETRACTION_PARAMS: &[&str] = &[
+    "RETRACT_LENGTH",
+    "RETRACT_SPEED",
+    "UNRETRACT_EXTRA_LENGTH",
+    "UNRETRACT_SPEED",
+];
 
 /// Upstream's `cmd_SET_RETRACTION_help` (`firmware_retraction.py:38`).
 const SET_RETRACTION_HELP: &str = "Set firmware retraction parameters";

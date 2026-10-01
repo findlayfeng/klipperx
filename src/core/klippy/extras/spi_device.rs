@@ -234,12 +234,15 @@ impl SpiDevice {
             })
         };
         gcode
-            .register_mux_command(
+            .register_mux_command_with_params(
                 "SPI_TRANSFER",
                 "DEVICE",
                 Some(&name),
                 transfer_handler,
                 Some("Full-duplex SPI transfer (debug)"),
+                // `cmd_spi_transfer` reads the payload; the mux key `DEVICE`
+                // is prepended by the registration.
+                SPI_DATA_PARAMS,
             )
             .map_err(|err| ConfigError::new(format!("{identifier}: {err}")))?;
         let send_handler: CommandHandler = {
@@ -250,12 +253,13 @@ impl SpiDevice {
             })
         };
         gcode
-            .register_mux_command(
+            .register_mux_command_with_params(
                 "SPI_SEND",
                 "DEVICE",
                 Some(&name),
                 send_handler,
                 Some("Shift bytes out on an SPI device (debug)"),
+                SPI_DATA_PARAMS,
             )
             .map_err(|err| ConfigError::new(format!("{identifier}: {err}")))?;
 
@@ -305,6 +309,10 @@ pub(crate) fn mcu_object_name(mcu_name: &str) -> String {
         format!("mcu {mcu_name}")
     }
 }
+
+/// The word `SPI_TRANSFER` and `SPI_SEND` both read (`cmd_spi_transfer`,
+/// `cmd_spi_send`); the mux key `DEVICE` is prepended by the registration.
+const SPI_DATA_PARAMS: &[&str] = &["DATA"];
 
 /// `SPI_TRANSFER DEVICE=<name> DATA=<hex>` — full duplex; reply is what came in.
 async fn cmd_spi_transfer(device: &Arc<McuSpi>, gcmd: &GcodeCommand) -> Result<(), CommandError> {

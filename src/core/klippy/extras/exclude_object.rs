@@ -293,35 +293,42 @@ impl ExcludeObject {
             .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
             .expect("the loader registers `gcode` before any section");
         type Command = fn(&Arc<ExcludeObject>, &GcodeCommand) -> Result<(), CommandError>;
-        const COMMANDS: &[(&str, Command, &str)] = &[
+        // Each command reads its own set of `KEY=` words, so every entry
+        // carries its own list rather than sharing one (the arrays' whole
+        // point is that one registration call covers four different commands).
+        const COMMANDS: &[(&str, Command, &str, &[&str])] = &[
             (
                 "EXCLUDE_OBJECT_START",
                 cmd_exclude_object_start,
                 "Marks the beginning the current object as labeled",
+                &["NAME"],
             ),
             (
                 "EXCLUDE_OBJECT_END",
                 cmd_exclude_object_end,
                 "Marks the end the current object",
+                &["NAME"],
             ),
             (
                 "EXCLUDE_OBJECT",
                 cmd_exclude_object,
                 "Cancel moves inside a specified objects",
+                &["RESET", "CURRENT", "NAME"],
             ),
             (
                 "EXCLUDE_OBJECT_DEFINE",
                 cmd_exclude_object_define,
                 "Provides a summary of an object",
+                &["RESET", "NAME", "JSON", "CENTER", "POLYGON"],
             ),
         ];
-        for (name, command, desc) in COMMANDS {
+        for (name, command, desc, params) in COMMANDS {
             let handler: CommandHandler = {
                 let object = Arc::clone(self);
                 sync(move |gcmd| command(&object, gcmd))
             };
             gcode
-                .register_command(name, handler, Some(desc), false)
+                .register_command_with_params(name, handler, Some(desc), params, false)
                 .map_err(ConfigError::new)?;
         }
         Ok(())

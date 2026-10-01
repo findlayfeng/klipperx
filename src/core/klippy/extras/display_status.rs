@@ -81,13 +81,13 @@ impl DisplayStatus {
             expire_progress: Mutex::new(0.0),
             message: Mutex::new(None),
         });
-        for (name, command, desc) in COMMANDS {
+        for (name, command, desc, params) in COMMANDS {
             let handler: CommandHandler = {
                 let object = Arc::clone(&object);
                 sync(move |gcmd| command(&object, gcmd))
             };
             gcode
-                .register_command(name, handler, *desc, false)
+                .register_command_with_params(name, handler, *desc, params, false)
                 .map_err(ConfigError::new)?;
         }
         Ok(object)
@@ -156,14 +156,18 @@ impl std::fmt::Debug for DisplayStatus {
 
 /// The three commands, with upstream's registrations
 /// (`display_status.py:19-25`).
+///
+/// `M117` takes the rest of the line, not a named parameter, so it declares
+/// none.
 type Command = fn(&Arc<DisplayStatus>, &GcodeCommand) -> Result<(), CommandError>;
-const COMMANDS: &[(&str, Command, Option<&str>)] = &[
-    ("M73", cmd_m73, None),
-    ("M117", cmd_m117, None),
+const COMMANDS: &[(&str, Command, Option<&str>, &[&str])] = &[
+    ("M73", cmd_m73, None, &["P"]),
+    ("M117", cmd_m117, None, &[]),
     (
         "SET_DISPLAY_TEXT",
         cmd_set_display_text,
         Some(SET_DISPLAY_TEXT_HELP),
+        &["MSG"],
     ),
 ];
 

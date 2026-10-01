@@ -1552,9 +1552,19 @@ impl TmcDriver {
             .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
             .ok_or_else(|| ConfigError::new("the g-code dispatcher is not registered"))?;
         let name = self.name.clone();
-        let register = |cmd: &str, handler, desc: &str| {
+        // One registration helper for the four driver commands; each command
+        // reads a different set of words from its handler, so the caller passes
+        // the list (`STEPPER` is prepended by the mux itself).
+        let register = |cmd: &str, handler, desc: &str, params: &[&str]| {
             gcode
-                .register_mux_command(cmd, "STEPPER", Some(&name), handler, Some(desc))
+                .register_mux_command_with_params(
+                    cmd,
+                    "STEPPER",
+                    Some(&name),
+                    handler,
+                    Some(desc),
+                    params,
+                )
                 .map_err(|err| ConfigError::new(err))
         };
         let set_field = Arc::clone(self);
@@ -1562,24 +1572,28 @@ impl TmcDriver {
             "SET_TMC_FIELD",
             sync(move |gcmd| set_field.cmd_set_tmc_field(gcmd)),
             "Set a register field of a TMC driver",
+            &["FIELD", "VALUE", "VELOCITY"],
         )?;
         let init = Arc::clone(self);
         register(
             "INIT_TMC",
             sync(move |gcmd| init.cmd_init_tmc(gcmd)),
             "Initialize TMC stepper driver registers",
+            &[],
         )?;
         let set_current = Arc::clone(self);
         register(
             "SET_TMC_CURRENT",
             sync(move |gcmd| set_current.cmd_set_tmc_current(gcmd)),
             "Set the current of a TMC driver",
+            &["CURRENT", "HOLDCURRENT"],
         )?;
         let dump = Arc::clone(self);
         register(
             "DUMP_TMC",
             sync(move |gcmd| dump.cmd_dump_tmc(gcmd)),
             "Read and display TMC stepper driver registers",
+            &["REGISTER"],
         )?;
         Ok(())
     }

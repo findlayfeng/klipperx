@@ -276,18 +276,32 @@ impl PauseResume {
         let gcode = printer
             .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
             .expect("the loader registers `gcode` before any section");
+        /// The one word `cmd_RESUME` reads (`pause_resume.py:68-76`); the
+        /// other three commands read none.
+        const RESUME_PARAMS: &[&str] = &["VELOCITY"];
         type Command = for<'a> fn(&'a Arc<PauseResume>, &'a GcodeCommand) -> CommandFuture<'a>;
-        const COMMANDS: &[(&str, Command, &str)] = &[
-            ("PAUSE", cmd_pause, "Pauses the current print"),
-            ("RESUME", cmd_resume, "Resumes the print from a pause"),
+        const COMMANDS: &[(&str, Command, &str, &[&str])] = &[
+            ("PAUSE", cmd_pause, "Pauses the current print", &[]),
+            (
+                "RESUME",
+                cmd_resume,
+                "Resumes the print from a pause",
+                RESUME_PARAMS,
+            ),
             (
                 "CLEAR_PAUSE",
                 cmd_clear_pause,
                 "Clears the current paused state without resuming the print",
+                &[],
             ),
-            ("CANCEL_PRINT", cmd_cancel_print, "Cancel the current print"),
+            (
+                "CANCEL_PRINT",
+                cmd_cancel_print,
+                "Cancel the current print",
+                &[],
+            ),
         ];
-        for &(name, command, help) in COMMANDS {
+        for &(name, command, help, params) in COMMANDS {
             let handler: CommandHandler = {
                 let object = Arc::clone(self);
                 Arc::new(move |gcmd| {
@@ -296,7 +310,7 @@ impl PauseResume {
                 })
             };
             gcode
-                .register_command(name, handler, Some(help), false)
+                .register_command_with_params(name, handler, Some(help), params, false)
                 .map_err(ConfigError::new)?;
         }
         Ok(())

@@ -126,12 +126,15 @@ impl PwmTool {
             sync(move |gcmd| cmd_set_pin(&pwm, &value_slot, scale, gcmd))
         };
         gcode
-            .register_mux_command(
+            .register_mux_command_with_params(
                 "SET_PIN",
                 "PIN",
                 Some(&name),
                 handler,
                 Some("Set the value of an output pin"),
+                // `cmd_set_pin` reads the level; the mux key `PIN` is prepended
+                // by the registration.
+                &["VALUE"],
             )
             .map_err(|err| ConfigError::new(format!("{identifier}: {err}")))?;
 

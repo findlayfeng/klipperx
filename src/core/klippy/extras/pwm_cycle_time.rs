@@ -128,12 +128,16 @@ impl PwmCycleTime {
             sync(move |gcmd| cmd_set_pin(&pwm, &state, scale, cycle_time, gcmd))
         };
         gcode
-            .register_mux_command(
+            .register_mux_command_with_params(
                 "SET_PIN",
                 "PIN",
                 Some(&name),
                 handler,
                 Some("Set the value of an output pin"),
+                // `cmd_set_pin` reads the level and then the optional cycle
+                // time (`pwm_cycle_time.py:62-77`); the mux key `PIN` is
+                // prepended by the registration.
+                &["VALUE", "CYCLE_TIME"],
             )
             .map_err(|err| ConfigError::new(format!("{identifier}: {err}")))?;
 

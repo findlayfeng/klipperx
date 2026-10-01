@@ -269,7 +269,7 @@ impl IdleTimeout {
         let weak = Arc::downgrade(&object);
         object
             .gcode
-            .register_command(
+            .register_command_with_params(
                 "SET_IDLE_TIMEOUT",
                 sync(move |gcmd: &GcodeCommand| {
                     let this = weak
@@ -278,6 +278,9 @@ impl IdleTimeout {
                     this.cmd_set_idle_timeout(gcmd)
                 }),
                 Some(SET_IDLE_TIMEOUT_HELP),
+                // The one word `cmd_set_idle_timeout` reads
+                // (`idle_timeout.py:108-115`).
+                &["TIMEOUT"],
                 false,
             )
             .map_err(ConfigError::new)?;

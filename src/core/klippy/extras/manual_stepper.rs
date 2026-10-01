@@ -105,6 +105,19 @@ pub struct ManualStepper {
     printer: Weak<Printer>,
 }
 
+/// The words `cmd_manual_stepper` reads (`manual_stepper.py:94-137`), in read
+/// order; `STEPPER` is the mux key and is prepended by the registration.
+const MANUAL_STEPPER_PARAMS: &[&str] = &[
+    "GCODE_AXIS",
+    "ENABLE",
+    "SET_POSITION",
+    "SPEED",
+    "ACCEL",
+    "STOP_ON_ENDSTOP",
+    "MOVE",
+    "SYNC",
+];
+
 impl ManualStepper {
     /// Build the section: read the options, build the stepper, install the
     /// cartesian X solver (upstream's `cartesian_stepper_alloc, b'x'`).
@@ -188,12 +201,13 @@ impl ManualStepper {
             object.cmd_manual_stepper(gcmd)
         });
         gcode
-            .register_mux_command(
+            .register_mux_command_with_params(
                 "MANUAL_STEPPER",
                 "STEPPER",
                 Some(&self.short_name),
                 handler,
                 Some("Command a manually configured stepper"),
+                MANUAL_STEPPER_PARAMS,
             )
             .map_err(ConfigError::new)?;
         Ok(())

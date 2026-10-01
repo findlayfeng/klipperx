@@ -57,7 +57,7 @@ use crate::core::klippy::cmd::trigger_analog::TriggerAnalogType;
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
 use crate::core::klippy::extras::load_cell::{LoadCell, LoadCellSampleCollector};
 use crate::core::klippy::extras::probe::{
-    calc_probe_z_average, ProbeOffsets, ProbeParams, ProbeSession,
+    calc_probe_z_average, ProbeOffsets, ProbeParams, ProbeSession, PROBE_PARAMS,
 };
 use crate::core::klippy::extras::toolhead::ToolHeadObject;
 use crate::core::klippy::extras::trigger_analog::{calc_frac_bits, to_fixed_32, DigitalFilter};
@@ -906,7 +906,10 @@ impl LoadCellProbe {
             .map_err(ConfigError::new)?;
         let probe = Arc::clone(self);
         gcode
-            .register_command(
+            // Both the session and `LoadCellParameterHelper.get_probe_params`
+            // read their keys through `ProbeParams::from_command`, so the
+            // declared list is the shared probe one.
+            .register_command_with_params(
                 "PROBE",
                 Arc::new(move |gcmd| {
                     let probe = Arc::clone(&probe);
@@ -929,6 +932,7 @@ impl LoadCellProbe {
                     })
                 }),
                 Some("Probe Z-height at current XY position"),
+                PROBE_PARAMS,
                 false,
             )
             .map_err(ConfigError::new)?;

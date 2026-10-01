@@ -124,7 +124,7 @@ impl DelayedGcode {
         let weak = Arc::downgrade(&object);
         object
             .gcode
-            .register_mux_command(
+            .register_mux_command_with_params(
                 "UPDATE_DELAYED_GCODE",
                 "ID",
                 Some(&object.name),
@@ -135,6 +135,7 @@ impl DelayedGcode {
                     this.cmd_update_delayed_gcode(gcmd)
                 }),
                 Some(UPDATE_DELAYED_GCODE_HELP),
+                &["DURATION"],
             )
             .map_err(ConfigError::new)?;
         Ok(object)

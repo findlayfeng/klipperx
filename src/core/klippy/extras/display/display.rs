@@ -310,22 +310,24 @@ impl PrinterLCD {
             sync(move |gcmd| display.cmd_set_display_group(gcmd))
         };
         gcode
-            .register_mux_command(
+            .register_mux_command_with_params(
                 "SET_DISPLAY_GROUP",
                 "DISPLAY",
                 Some("display"),
                 Arc::clone(&handler),
                 Some(SET_DISPLAY_GROUP_HELP),
+                &["GROUP"],
             )
             .and_then(|()| {
                 // The primary display also answers the unqualified command
                 // (`display.py:212-214`).
-                gcode.register_mux_command(
+                gcode.register_mux_command_with_params(
                     "SET_DISPLAY_GROUP",
                     "DISPLAY",
                     None,
                     handler,
                     Some(SET_DISPLAY_GROUP_HELP),
+                    &["GROUP"],
                 )
             })
             .map_err(ConfigError::new)

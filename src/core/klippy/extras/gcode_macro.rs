@@ -347,12 +347,13 @@ impl GCodeMacro {
             Ok(())
         });
         gcode
-            .register_mux_command(
+            .register_mux_command_with_params(
                 "SET_GCODE_VARIABLE",
                 "MACRO",
                 Some(&section_name),
                 setter,
                 Some(SET_GCODE_VARIABLE_HELP),
+                &["VARIABLE", "VALUE"],
             )
             .map_err(ConfigError::new)?;
 

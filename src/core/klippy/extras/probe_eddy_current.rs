@@ -375,6 +375,26 @@ impl EddyOptions {
     }
 }
 
+/// The `KEY` names the eddy `PROBE` / `PROBE_ACCURACY` handlers read.
+///
+/// `METHOD` leads because `PrinterEddyProbe::start_probe_session` reads it
+/// before anything else to pick the move; the parameter-helper keys follow in
+/// [`probe_params`]'s read order; the last three are the keys the move the
+/// method picked reads itself (`TAP_THRESHOLD` in `prep_tap`,
+/// `SAMPLE_RETRACT_DIST` in `tap_once`, `SAMPLE_TIME` in `scan_once`).
+const EDDY_PROBE_PARAMS: &[&str] = &[
+    "METHOD",
+    "SAMPLES_TOLERANCE",
+    "SAMPLES",
+    "PROBE_SPEED",
+    "LIFT_SPEED",
+    "SAMPLES_TOLERANCE_RETRIES",
+    "SAMPLES_RESULT",
+    "TAP_THRESHOLD",
+    "SAMPLE_RETRACT_DIST",
+    "SAMPLE_TIME",
+];
+
 /// `EddyParameterHelper.get_probe_params`: the plain parameters for the
 /// descend path, upstream's forced set for `scan` / `rapid_scan` / `tap`
 /// (one sample, no retract).
@@ -916,7 +936,7 @@ impl PrinterEddyProbe {
         {
             let probe = Arc::clone(self);
             gcode
-                .register_command(
+                .register_command_with_params(
                     "PROBE",
                     Arc::new(move |gcmd| {
                         let probe = Arc::clone(&probe);
@@ -944,6 +964,7 @@ impl PrinterEddyProbe {
                         })
                     }),
                     Some("Probe Z-height at current XY position"),
+                    EDDY_PROBE_PARAMS,
                     false,
                 )
                 .map_err(ConfigError::new)?;
@@ -954,8 +975,10 @@ impl PrinterEddyProbe {
         // way upstream drives `self.probe`).
         {
             let probe = Arc::clone(self);
+            // It re-drives the same session through `start_probe_session` /
+            // `run_probe`, so it accepts the same names as `PROBE`.
             gcode
-                .register_command(
+                .register_command_with_params(
                     "PROBE_ACCURACY",
                     Arc::new(move |gcmd| {
                         let probe = Arc::clone(&probe);
@@ -1027,6 +1050,7 @@ impl PrinterEddyProbe {
                         })
                     }),
                     Some("Probe Z-height accuracy at current XY position"),
+                    EDDY_PROBE_PARAMS,
                     false,
                 )
                 .map_err(ConfigError::new)?;
@@ -1581,10 +1605,13 @@ impl EddyTapCalibration {
             })
         };
         gcode
-            .register_command(
+            // `TAP` picks the step (`TAP=guess` / `refine` / `verify`); the
+            // threshold and sample count it needs are computed, not read.
+            .register_command_with_params(
                 "PROBE_EDDY_CURRENT_TAP_CALIBRATE",
                 handler,
                 Some("Calibrate tap_threshold for 'tap' probing"),
+                &["TAP"],
                 false,
             )
             .map_err(ConfigError::new)?;

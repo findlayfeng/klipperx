@@ -168,12 +168,15 @@ impl I2cDevice {
             })
         };
         gcode
-            .register_mux_command(
+            .register_mux_command_with_params(
                 "IIC_WRITE",
                 "DEVICE",
                 Some(&name),
                 write_handler,
                 Some("Write bytes to an I2C device (debug)"),
+                // `cmd_i2c_write` reads the payload; the mux key `DEVICE` is
+                // prepended by the registration.
+                &["DATA"],
             )
             .map_err(|err| ConfigError::new(format!("{identifier}: {err}")))?;
         let read_handler: CommandHandler = {
@@ -184,12 +187,15 @@ impl I2cDevice {
             })
         };
         gcode
-            .register_mux_command(
+            .register_mux_command_with_params(
                 "IIC_READ",
                 "DEVICE",
                 Some(&name),
                 read_handler,
                 Some("Write then read bytes from an I2C device (debug)"),
+                // `cmd_i2c_read` reads the optional write payload first, then
+                // the length; `DEVICE` is the mux key.
+                &["WRITE", "READ_LEN"],
             )
             .map_err(|err| ConfigError::new(format!("{identifier}: {err}")))?;
 

@@ -24,7 +24,7 @@
 //! # Typing
 //!
 //! Before a line is sent it is looked at three ways, in this order: empty, a
-//! `.`-prefixed local command, a whole request object, or `method` followed by
+//! `/`-prefixed local command, a whole request object, or `method` followed by
 //! optional parameters. Requests and parameters are written in YAML — of which
 //! JSON is a subset, so a line that was valid as JSON still is — because a
 //! request is a small tree and YAML is what a tree is written in without
@@ -252,7 +252,7 @@ impl Session {
         if line.is_empty() {
             return Ok(Control::Continue);
         }
-        if let Some(command) = line.strip_prefix('.') {
+        if let Some(command) = line.strip_prefix('/') {
             return self.local_command(command, out).await;
         }
 
@@ -283,8 +283,8 @@ impl Session {
     ///
     /// What the window's g-code mode calls: the whole line is the script, so a
     /// command is typed the way it is written (`SET_PIN PIN=fan VALUE=1`)
-    /// rather than as a request object. A `.`-prefixed line is still a local
-    /// command, so `.quit` is not sent to the printer.
+    /// rather than as a request object. A `/`-prefixed line is still a local
+    /// command, so `/quit` is not sent to the printer.
     ///
     /// # Errors
     /// Returns [`TransportError`] if the request cannot be sent.
@@ -297,7 +297,7 @@ impl Session {
         if line.is_empty() {
             return Ok(Control::Continue);
         }
-        if let Some(command) = line.strip_prefix('.') {
+        if let Some(command) = line.strip_prefix('/') {
             return self.local_command(command, out).await;
         }
         let mut params = Map::new();
@@ -436,7 +436,7 @@ impl Session {
         Ok(Control::Continue)
     }
 
-    /// Handle a `.`-prefixed line, which the server never sees.
+    /// Handle a `/`-prefixed line, which the server never sees.
     async fn local_command(
         &mut self,
         command: &str,
@@ -464,10 +464,47 @@ impl Session {
             "reload" | "reload_config" => self.reload_config(out).await?,
             other => out.write(Entry::notice(
                 Notice::Problem,
-                format!("unknown command '.{other}'; try '.help'"),
+                format!("unknown command '/{other}'; try '/help'"),
             )),
         }
         Ok(Control::Continue)
+    }
+
+    /// The printer's own list of G-Code commands, from `gcode/help`: every
+    /// command the dispatcher registered with a description, which is what a
+    /// G-Code terminal offers to complete.
+    ///
+    /// A printer that is not up yet answers nothing useful, and waiting on one
+    /// forever would freeze the window, so a missing or failing answer is
+    /// `None` rather than an error: the caller either has a list to complete
+    /// from or it has none, and neither is a fault.
+    pub async fn gcode_help(
+        &mut self,
+        out: &mut impl Output,
+        within: std::time::Duration,
+    ) -> Result<Option<Vec<String>>, TransportError> {
+        let id = self.request("gcode/help", Map::new(), out).await?;
+        let reply = match tokio::time::timeout(within, self.await_reply(id, out)).await {
+            Ok(reply) => reply?,
+            // Ran out of patience. If the answer ever turns up it is read as an
+            // ordinary message by whoever reads next, so nothing is dropped.
+            Err(_) => return Ok(None),
+        };
+        let Some(reply) = reply else {
+            return Ok(None);
+        };
+        // Refused: the printer has no dispatcher yet, which is normal while the
+        // config is still loading.
+        if reply.is_error() {
+            return Ok(None);
+        }
+        let mut names: Vec<String> = reply
+            .result()
+            .and_then(Value::as_object)
+            .map(|help| help.keys().cloned().collect())
+            .unwrap_or_default();
+        names.sort();
+        Ok(Some(names))
     }
 
     /// Subscribe to objects, so their updates start arriving as pushes.
@@ -589,7 +626,22 @@ impl Session {
     }
 }
 
-/// The text `.help` prints, and the TUI shows in its footer.
+/// The local (`/`) commands, each with the names that are aliases for it, the
+/// canonical one first.
+///
+/// The window answers a few of its own on top of these and keeps its own list;
+/// the input line completes from both. This is where the session's half is
+/// written down, and the tests hold the matcher and `/help` to it, so a command
+/// cannot be added in one place only.
+pub const LOCAL_COMMANDS: &[(&str, &[&str])] = &[
+    ("help", &["h", "?"]),
+    ("quit", &["exit", "q"]),
+    ("subscribe", &["sub"]),
+    ("firmware_restart", &["restart_firmware"]),
+    ("reload", &["reload_config"]),
+];
+
+/// The text `/help` prints, and the TUI shows in its footer.
 pub fn usage() -> &'static str {
     "\
 Type a request: a method name (`info`), a method and parameters
@@ -598,13 +650,13 @@ They are YAML — JSON is YAML too. An `id` is added when you leave it out;
 `{id: null, ...}` sends it unanswered.
 
 Local commands:
-  .help          this text
-  .subscribe     watch every object (`objects/list` + `objects/subscribe`)
-  .subscribe a b watch only the named objects
-  .firmware_restart
+  /help          this text
+  /subscribe     watch every object (`objects/list` + `objects/subscribe`)
+  /subscribe a b watch only the named objects
+  /firmware_restart
                  restart the firmware; the printer comes back up
-  .reload        reload the config file from disk and restart the printer
-  .quit          leave, after printing any reply still owed (also ^D)
+  /reload        reload the config file from disk and restart the printer
+  /quit          leave, after printing any reply still owed (also ^D)
 
 Replies and pushes carry their direction; line mode prints one compact JSON line
 each, the window shows the body as YAML by default."
@@ -652,7 +704,7 @@ fn answerable_id(message: &Value) -> Option<u64> {
 
 /// Whether `line` is a local command rather than a request.
 pub fn is_local(line: &str) -> bool {
-    line.trim_start().starts_with('.')
+    line.trim_start().starts_with('/')
 }
 
 // ===========================================================================
@@ -745,7 +797,7 @@ mod tests {
         }
     }
 
-    /// What `objects/list` reports, so `.subscribe` has something to find.
+    /// What `objects/list` reports, so `/subscribe` has something to find.
     struct ListObjects;
 
     impl Endpoint for ListObjects {
@@ -860,6 +912,96 @@ mod tests {
         }
     }
 
+    /// Answers `gcode/help` with the command table the real endpoint sends.
+    struct GcodeHelp;
+
+    impl Endpoint for GcodeHelp {
+        fn path(&self) -> &'static str {
+            "gcode/help"
+        }
+
+        fn handle<'a>(
+            &'a self,
+            _request: &'a Request,
+            _context: &'a EndpointContext<'a>,
+        ) -> EndpointFuture<'a> {
+            Box::pin(async move {
+                Ok(json!({
+                    "M115": "Report firmware version",
+                    "G28": "Home all axes",
+                    "SET_PIN": "Set a pin"
+                }))
+            })
+        }
+    }
+
+    /// A `gcode/help` that never answers, and one that refuses: the two ways a
+    /// printer can leave the window without a command list.
+    struct SilentHelp;
+
+    impl Endpoint for SilentHelp {
+        fn path(&self) -> &'static str {
+            "gcode/help"
+        }
+
+        fn handle<'a>(
+            &'a self,
+            _request: &'a Request,
+            _context: &'a EndpointContext<'a>,
+        ) -> EndpointFuture<'a> {
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                Ok(json!({}))
+            })
+        }
+    }
+
+    struct FailingHelp;
+
+    impl Endpoint for FailingHelp {
+        fn path(&self) -> &'static str {
+            "gcode/help"
+        }
+
+        fn handle<'a>(
+            &'a self,
+            _request: &'a Request,
+            _context: &'a EndpointContext<'a>,
+        ) -> EndpointFuture<'a> {
+            Box::pin(async move { Err(ApiError::CommandError("Printer is not ready".to_string())) })
+        }
+    }
+
+    /// A server with `info` and one shape of `gcode/help`, for the tests that
+    /// need a printer answering that call badly.
+    async fn server_with_help<E: Endpoint + 'static>(
+        dir: &SocketDir,
+        help: E,
+    ) -> tokio::task::JoinHandle<()> {
+        let mut api = Api::new();
+        api.register(Info).unwrap();
+        api.register(help).unwrap();
+        let server = Server::bind(dir.target(), Arc::new(api))
+            .await
+            .expect("cannot bind");
+        tokio::spawn(async move {
+            let _ = server.run().await;
+        })
+    }
+
+    /// A connected session whose handshake is done, against a server that is
+    /// already running.
+    async fn connect(dir: &SocketDir) -> (Session, Recording) {
+        let mut session = Session::connect(dir.target())
+            .await
+            .expect("cannot connect");
+        session
+            .handshake(&mut Recording::default())
+            .await
+            .expect("handshake failed");
+        (session, Recording::default())
+    }
+
     /// A server with the endpoints these tests talk to.
     async fn server(dir: &SocketDir) -> tokio::task::JoinHandle<()> {
         let mut api = Api::new();
@@ -870,6 +1012,7 @@ mod tests {
         api.register(FirmwareRestart).unwrap();
         api.register(ListObjects).unwrap();
         api.register(Subscribe).unwrap();
+        api.register(GcodeHelp).unwrap();
         let server = Server::bind(dir.target(), Arc::new(api))
             .await
             .expect("cannot bind");
@@ -1017,9 +1160,9 @@ mod tests {
         let dir = SocketDir::new("gcodequit");
         let (mut session, mut out, task) = session(&dir).await;
 
-        // `.quit` is the client's, not a g-code line to send.
+        // `/quit` is the client's, not a g-code line to send.
         assert_eq!(
-            session.handle_gcode_line(".quit", &mut out).await.unwrap(),
+            session.handle_gcode_line("/quit", &mut out).await.unwrap(),
             Control::Quit
         );
         assert!(out.sent().is_empty(), "{:?}", out.texts());
@@ -1077,17 +1220,17 @@ mod tests {
         let dir = SocketDir::new("fwrestartlocal");
         let (mut session, mut out, task) = session(&dir).await;
 
-        // The `.`-prefixed name reaches the same request, in either input mode.
+        // The `/`-prefixed name reaches the same request, in either input mode.
         assert_eq!(
             session
-                .handle_line(".firmware_restart", &mut out)
+                .handle_line("/firmware_restart", &mut out)
                 .await
                 .unwrap(),
             Control::Continue
         );
         assert_eq!(
             session
-                .handle_gcode_line(".firmware_restart", &mut out)
+                .handle_gcode_line("/firmware_restart", &mut out)
                 .await
                 .unwrap(),
             Control::Continue
@@ -1137,12 +1280,12 @@ mod tests {
 
         // The two names reach the same request, in either input mode.
         assert_eq!(
-            session.handle_line(".reload", &mut out).await.unwrap(),
+            session.handle_line("/reload", &mut out).await.unwrap(),
             Control::Continue
         );
         assert_eq!(
             session
-                .handle_gcode_line(".reload_config", &mut out)
+                .handle_gcode_line("/reload_config", &mut out)
                 .await
                 .unwrap(),
             Control::Continue
@@ -1342,18 +1485,18 @@ mod tests {
         let dir = SocketDir::new("local");
         let (mut session, mut out, task) = session(&dir).await;
 
-        session.handle_line(".help", &mut out).await.unwrap();
-        session.handle_line(".nonsense", &mut out).await.unwrap();
+        session.handle_line("/help", &mut out).await.unwrap();
+        session.handle_line("/nonsense", &mut out).await.unwrap();
 
         assert!(out.sent().is_empty(), "{:?}", out.texts());
         let texts = out.texts();
         assert!(texts[0].contains("Local commands:"), "{texts:?}");
         assert!(
-            texts[1].contains("unknown command '.nonsense'"),
+            texts[1].contains("unknown command '/nonsense'"),
             "{texts:?}"
         );
 
-        for line in [".quit", ".exit", ".q"] {
+        for line in ["/quit", "/exit", "/q"] {
             assert_eq!(
                 session.handle_line(line, &mut out).await.unwrap(),
                 Control::Quit,
@@ -1369,7 +1512,7 @@ mod tests {
         let (mut session, mut out, task) = session(&dir).await;
 
         session
-            .handle_line(".subscribe toolhead extruder", &mut out)
+            .handle_line("/subscribe toolhead extruder", &mut out)
             .await
             .unwrap();
         settle(&mut session, &mut out).await;
@@ -1413,7 +1556,7 @@ mod tests {
         let dir = SocketDir::new("suball");
         let (mut session, mut out, task) = session(&dir).await;
 
-        session.handle_line(".subscribe", &mut out).await.unwrap();
+        session.handle_line("/subscribe", &mut out).await.unwrap();
         settle(&mut session, &mut out).await;
 
         // `objects/list` first, then a subscription built from what it reported.
@@ -1533,8 +1676,8 @@ mod tests {
 
     #[test]
     fn test_client_lines_are_told_apart() {
-        assert!(is_local(".help"));
-        assert!(is_local("  .quit"));
+        assert!(is_local("/help"));
+        assert!(is_local("  /quit"));
         assert!(!is_local("info"));
         assert!(!is_local(r#"{"method": "info"}"#));
     }
@@ -1542,8 +1685,85 @@ mod tests {
     #[test]
     fn test_usage_names_every_local_command() {
         let usage = usage();
-        for command in [".help", ".subscribe", ".quit"] {
-            assert!(usage.contains(command), "{command} is not documented");
+        for (canonical, _) in LOCAL_COMMANDS {
+            let command = format!("/{canonical}");
+            assert!(usage.contains(&command), "{command} is not documented");
         }
+    }
+
+    #[tokio::test]
+    async fn test_every_listed_local_command_is_one_the_session_answers() {
+        // The list the input line completes from and the matcher that runs the
+        // command have to agree: every name in the table — aliases included —
+        // must be one the session does not call unknown.
+        let dir = SocketDir::new("local-commands");
+        let (mut session, _out, task) = session(&dir).await;
+
+        for (canonical, aliases) in LOCAL_COMMANDS {
+            for name in std::iter::once(canonical).chain(aliases.iter()) {
+                let mut out = Recording::default();
+                session
+                    .handle_line(&format!("/{name}"), &mut out)
+                    .await
+                    .expect("a listed command must be handled");
+                let texts = out.texts().join("\n");
+                assert!(
+                    !texts.contains("unknown command"),
+                    ".{name} is listed but the session does not answer it: {texts}"
+                );
+            }
+        }
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn test_gcode_help_returns_the_printers_command_names_in_order() {
+        let dir = SocketDir::new("gcode-help");
+        let (mut session, _out, task) = session(&dir).await;
+        let mut out = Recording::default();
+
+        let names = session
+            .gcode_help(&mut out, Duration::from_secs(1))
+            .await
+            .expect("the request is sent")
+            .expect("the printer answered");
+
+        assert_eq!(names, vec!["G28", "M115", "SET_PIN"]);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn test_gcode_help_says_nothing_when_the_printer_refuses() {
+        // Refused, as `gcode/help` is while the config is still loading: no
+        // candidates, and not an error for the caller to report.
+        let dir = SocketDir::new("gcode-help-failing");
+        let task = server_with_help(&dir, FailingHelp).await;
+        let (mut session, mut out) = connect(&dir).await;
+
+        let names = session
+            .gcode_help(&mut out, Duration::from_secs(1))
+            .await
+            .expect("the request is sent");
+
+        assert!(names.is_none(), "a refusal is no candidates: {names:?}");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn test_gcode_help_gives_up_on_a_printer_that_never_answers() {
+        let dir = SocketDir::new("gcode-help-silent");
+        let task = server_with_help(&dir, SilentHelp).await;
+        let (mut session, mut out) = connect(&dir).await;
+
+        let names = session
+            .gcode_help(&mut out, Duration::from_millis(50))
+            .await
+            .expect("the request is sent");
+
+        assert!(
+            names.is_none(),
+            "an answer that never comes is no candidates"
+        );
+        task.abort();
     }
 }

@@ -66,10 +66,13 @@
 //!   printer that is not up yet has no dispatcher to list, and the list does not
 //!   change under a running session.
 //!
-//! One candidate is simply filled in. Several narrow the line to what all of
-//! them agree on and open a layer above the input line, where `Tab`/`BackTab`
-//! walk the candidates and `Backspace` or any other key closes the layer and does
-//! its own job — a key that only closed a layer would be a keypress thrown away.
+//! One candidate the line does not already spell is simply filled in; one the
+//! line already spells opens the layer on it, so that a `Tab` on a whole name
+//! shows something rather than replacing the word with itself. Several narrow
+//! the line to what all of them agree on and open a layer above the input line,
+//! where `Tab`/`BackTab` walk the candidates and `Backspace` or any other key
+//! closes the layer and does its own job — a key that only closed a layer would
+//! be a keypress thrown away.
 //!
 //! # Threads and tasks
 //!
@@ -2017,11 +2020,16 @@ impl App {
 
     /// Complete the word at the caret, and open the layer if it needs choosing.
     ///
-    /// One candidate is unambiguous, so it goes straight in. Several go in as
-    /// the prefix they share, and the layer opens so the reader can pick between
-    /// them. None changes nothing, and says why in the log: a `Tab` that does
-    /// nothing at all is indistinguishable from a `Tab` that was not received,
-    /// which is what made a missing command list hard to notice.
+    /// A candidate the line spells differently goes straight in: it is a change
+    /// the reader sees, and one candidate to make it is no choice at all. A
+    /// candidate the line already spells goes into the layer instead, with the
+    /// line left alone — completing a word to itself is no change and no layer,
+    /// which is a `Tab` that reads as a dead key on a name that is already
+    /// whole. Several candidates go in as the prefix they share, and the layer
+    /// opens so the reader can pick between them. None changes nothing, and says
+    /// why in the log: a `Tab` that does nothing at all is indistinguishable
+    /// from a `Tab` that was not received, which is what made a missing command
+    /// list hard to notice.
     fn complete(&mut self) {
         let Some(word) = self.input.completion_word() else {
             return;
@@ -2030,7 +2038,18 @@ impl App {
         match candidates.as_slice() {
             [] => self.explain_no_candidates(&word),
             [only] => {
-                self.input.replace(&word, only);
+                if *only == self.input.word_text(&word) {
+                    // The name is already whole, so the layer is what is left to
+                    // show: opening it on its one candidate says the word was
+                    // understood, where a self-replacement would say nothing.
+                    self.completion = Some(Completion {
+                        candidates,
+                        word,
+                        selected: Some(0),
+                    });
+                } else {
+                    self.input.replace(&word, only);
+                }
             }
             several => {
                 let common = common_prefix(several);
@@ -4250,6 +4269,64 @@ mod tests {
         assert!(app.completion_key(KeyCode::Tab));
         assert_eq!(app.input.text(), "M115");
         assert!(app.completion.is_none(), "one candidate, so no layer");
+    }
+
+    #[test]
+    fn test_tab_on_a_whole_gcode_name_opens_the_layer_on_it() {
+        // The word is already complete, so there is nothing to put in the line:
+        // a self-replacement is no change at all, which makes `Tab` look like a
+        // key the window did not receive. The layer is the answer instead.
+        let mut app = app_with_gcode_commands(&PRINTER_COMMANDS);
+        type_line(&mut app, "HELP");
+
+        assert!(app.completion_key(KeyCode::Tab));
+
+        assert_eq!(app.input.text(), "HELP", "the line is not touched");
+        let completion = app.completion.as_ref().expect("the layer is open");
+        assert_eq!(completion.candidates, ["HELP"], "the one name it matched");
+        assert_eq!(completion.selected, Some(0), "and it is the picked one");
+    }
+
+    #[test]
+    fn test_tab_on_a_lower_case_name_still_takes_the_printers_spelling() {
+        // The candidate differs from the line, so it goes in as before: this is
+        // the case the exact-match rule must not swallow.
+        let mut app = app_with_gcode_commands(&PRINTER_COMMANDS);
+        type_line(&mut app, "help");
+
+        assert!(app.completion_key(KeyCode::Tab));
+
+        assert_eq!(app.input.text(), "HELP", "the printer's spelling");
+        assert!(app.completion.is_none(), "a change needs no layer");
+    }
+
+    #[test]
+    fn test_tab_twice_on_a_whole_name_holds_its_place() {
+        let mut app = app_with_gcode_commands(&PRINTER_COMMANDS);
+        type_line(&mut app, "HELP");
+        app.completion_key(KeyCode::Tab);
+
+        assert!(app.completion_key(KeyCode::Tab), "the layer's key again");
+
+        assert_eq!(app.input.text(), "HELP", "still the same word");
+        let completion = app.completion.as_ref().expect("the layer stays open");
+        assert_eq!(completion.selected, Some(0), "on the only candidate");
+    }
+
+    #[test]
+    fn test_tab_on_a_whole_local_command_opens_the_layer_on_it() {
+        // The window's own commands are whole words too: `/gcode` is the only
+        // name it matches, and it is already spelled the way the window spells
+        // it.
+        let mut app = app_with(Vec::new());
+        type_line(&mut app, "/gcode");
+
+        assert!(app.completion_key(KeyCode::Tab));
+
+        assert_eq!(app.input.text(), "/gcode");
+        let completion = app.completion.as_ref().expect("the layer is open");
+        assert_eq!(completion.candidates, ["/gcode"]);
+        assert_eq!(completion.selected, Some(0));
     }
 
     #[test]

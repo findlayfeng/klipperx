@@ -62,9 +62,12 @@
 //!   reaches the printer, so the client is the only one who can name it.
 //! - A bare word in g-code mode completes from the printer's command names, as
 //!   the `gcode` object of `objects/query` lists them. That list is asked for
-//!   once, the first time g-code mode is entered with a printer that is ready: a
-//!   printer that is not up yet has no dispatcher to list, and the list does not
-//!   change under a running session.
+//!   the first time g-code mode is entered and asked again on later visits
+//!   until the printer answers: the window has no live status to wait on (its
+//!   one `info` reply may say `startup` forever), and a printer that is not up
+//!   yet refuses the query rather than making it wait, so there is nothing to
+//!   lose by asking. Once answered — even with an empty list — it is kept, as
+//!   the list does not change under a running session.
 //!
 //! One candidate the line does not already spell is simply filled in; one the
 //! line already spells opens the layer on it, so that a `Tab` on a whole name
@@ -435,21 +438,28 @@ impl App {
     ///
     /// Kept apart from the ask itself so the gate can be tested without a
     /// session: this is the whole of the decision. A list is only useful when
-    /// g-code mode is on (that is the only thing that completes from it) and
-    /// only askable from a printer that is ready — a printer still loading its
-    /// config has no dispatcher, and `objects/query` against one is an error at
-    /// best and a wait at worst.
+    /// g-code mode is on (that is the only thing that completes from it), and
+    /// until it has been answered there is nothing to lose by asking.
+    ///
+    /// [`Status`] is deliberately not consulted for a `ready` state. It holds
+    /// whatever the handshake's single `info` reply said, and this window never
+    /// subscribes to `webhooks`, so it is not updated after that: a printer
+    /// that was still coming up at connect time leaves it saying `startup` for
+    /// the life of the connection, and gating on `ready` there would mean never
+    /// asking at all. Asking instead is cheap — a printer that is not up
+    /// refuses `objects/query` at once rather than making it wait — and a
+    /// refusal leaves the flag false, so the next `Tab` asks again.
     fn needs_gcode_commands(&self) -> bool {
-        self.gcode
-            && !self.gcode_commands_asked
-            && matches!(&self.status, Status::Connected { state, .. } if state == "ready")
+        self.gcode && !self.gcode_commands_asked
     }
 
     /// Ask the printer for its command names, once, for completion.
     ///
     /// The `gcode` object of `objects/query` is the only list of them, and the
     /// printer cannot answer it until it is up, so the ask is made the first
-    /// time g-code mode is entered with a ready printer and never again.
+    /// time g-code mode is entered and repeated on later visits until it is
+    /// answered (see [`App::needs_gcode_commands`] for why `ready` is not
+    /// waited for).
     /// Failing is not news: the list is a convenience, an empty one only means
     /// `Tab` has nothing to offer, and a notice per `^G` would be noise in the
     /// log that the log is for.
@@ -987,8 +997,9 @@ async fn handle_key(
     app.mouse_for_key(key.code, ctrl);
     // `Tab` is the last chance to ask for the printer's command list: a `Tab` on
     // a g-code line whose list was never answered has nothing to offer, so the
-    // ask is repeated here. The gate only opens until the first answer, so this
-    // is a one-off rather than a round trip per keypress.
+    // ask is repeated here. The gate closes on the first answer, so a printer
+    // that has a list is only ever asked once; until it answers, a `Tab` may be
+    // a round trip, which is the price of not having a live status to wait on.
     if key.code == KeyCode::Tab {
         app.ensure_gcode_commands(session).await;
     }
@@ -2095,7 +2106,23 @@ impl App {
             // nothing to explain, and a notice per stray `Tab` would be noise.
             return;
         } else if self.gcode_commands.is_empty() {
-            "no G-Code command list yet (the printer did not answer; ^G to try again)".to_string()
+            if self.gcode_commands_asked {
+                // The printer did answer and its list was empty: there is
+                // nothing to retry, so the notice reports what came back.
+                "the printer answered objects/query but listed no commands".to_string()
+            } else {
+                // No answer yet — either nothing has been asked or the printer
+                // refused because it is not up. The state is the handshake's
+                // one `info`, so it may be stale; it is quoted rather than
+                // judged, and the next `Tab` asks again either way.
+                let state = match &self.status {
+                    Status::Connected { state, .. } => state.as_str(),
+                    Status::Unknown | Status::Closed(_) => "unknown",
+                };
+                format!(
+                    "no G-Code command list yet: the printer reports \"{state}\" (Tab asks again)"
+                )
+            }
         } else {
             format!(
                 "no G-Code command starts with \"{typed}\" (the printer reports {} commands)",
@@ -4163,9 +4190,15 @@ mod tests {
 
     #[test]
     fn test_tab_on_an_empty_gcode_line_without_a_list_says_so() {
-        // The printer never answered, so there are no candidates — and `Tab`
-        // says why rather than doing nothing at all.
+        // The printer never answered — it refused an ask, or was never asked —
+        // so there are no candidates, and `Tab` says why rather than doing
+        // nothing at all. The state it quotes is the handshake's one `info`,
+        // which the window cannot keep up to date.
         let mut app = app_with_gcode_commands(&[]);
+        app.status = Status::Connected {
+            state: "startup".to_string(),
+            message: "Loading config".to_string(),
+        };
 
         assert!(app.completion_key(KeyCode::Tab));
 
@@ -4173,7 +4206,29 @@ mod tests {
         assert_eq!(app.entries.len(), 1, "one notice");
         let text = app.entries[0].text();
         assert!(text.contains("no G-Code command list yet"), "{text}");
-        assert!(text.contains("^G to try again"), "{text}");
+        assert!(text.contains("\"startup\""), "the state is quoted: {text}");
+        assert!(text.contains("Tab asks again"), "{text}");
+        assert!(app.input.text().is_empty(), "the notice is not the line");
+    }
+
+    #[test]
+    fn test_tab_on_an_empty_gcode_line_from_an_answered_printer_says_it_has_none() {
+        // The list was asked for and the answer was empty: retrying would be a
+        // second round trip for the same nothing, so the notice says what came
+        // back instead of offering a retry.
+        let mut app = app_with_gcode_commands(&[]);
+        app.gcode_commands_asked = true;
+
+        assert!(app.completion_key(KeyCode::Tab));
+
+        assert!(app.completion.is_none(), "there is nothing to open");
+        assert_eq!(app.entries.len(), 1, "one notice");
+        let text = app.entries[0].text();
+        assert!(text.contains("listed no commands"), "{text}");
+        assert!(
+            !text.contains("Tab asks again"),
+            "no retry to offer: {text}"
+        );
         assert!(app.input.text().is_empty(), "the notice is not the line");
     }
 
@@ -4505,21 +4560,26 @@ mod tests {
     }
 
     #[test]
-    fn test_the_printer_command_list_is_asked_for_once_and_only_from_a_ready_printer() {
+    fn test_the_printer_command_list_is_asked_for_until_it_is_answered() {
         let mut app = App::new();
         app.gcode = true;
         assert!(
-            !app.needs_gcode_commands(),
-            "the printer's state is unknown"
+            app.needs_gcode_commands(),
+            "nothing has been asked, whatever the state"
         );
 
+        // The status is the handshake's one `info`, which is never updated (no
+        // `webhooks` subscription), so a printer that was still loading then
+        // keeps saying `startup` here for the life of the connection. Waiting
+        // for `ready` would therefore mean never asking at all — and asking a
+        // printer that is not up is not a wait: it refuses at once.
         app.status = Status::Connected {
             state: "startup".to_string(),
             message: "Loading config".to_string(),
         };
         assert!(
-            !app.needs_gcode_commands(),
-            "a printer still loading has none"
+            app.needs_gcode_commands(),
+            "a printer still loading is asked anyway, and refuses"
         );
 
         app.status = Status::Connected {

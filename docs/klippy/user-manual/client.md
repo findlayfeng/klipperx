@@ -209,8 +209,8 @@ Enter send · Tab complete · ↑↓ history · PgUp/PgDn log · ^G g-code · Es
 - **g-code 模式下不以 `/` 开头**：打印机的命令名，来自主机的 `objects/query
   {objects: {gcode: null}}`——取 `status.gcode.commands` 的**全部键**，所以**没有帮助文本
   的内建命令（`M115`、`M110`、`ECHO` …）也在里面**（主机的 `gcode/help` 只有带描述的那部分，
-  会漏掉它们，补全不用它）。进入 g-code 模式时拉一次（那时打印机得是 `ready`），
-  **没得到过答案时按 `Tab` 会补问一次**；匹配大小写不敏感，`m1` 能补到 `M115`，
+  会漏掉它们，补全不用它）。进入 g-code 模式时拉一次，
+  **没得到答案就会一直补问**（按 `Tab` 会再问一次）——`ready` 不是前提：客户端只在连接时从 `info` 拿到状态、之后没订阅 `webhooks`，所以那个状态可能一直是旧的；匹配大小写不敏感，`m1` 能补到 `M115`，
   写进去的是打印机自己的拼写。
 
 请求模式下敲裸方法名不补——方法名是主机的，窗口没有那份清单（`/subscribe` 之后
@@ -226,8 +226,9 @@ Enter send · Tab complete · ↑↓ history · PgUp/PgDn log · ^G g-code · Es
 
 **没有候选时会写一行提示**，不会出现「按了没反应又不知道为什么」：本地词会说
 `no local command starts with "/zz"`，g-code 词会说 `no G-Code command starts with "M1x"
-(the printer reports 13 commands)`；还没拿到命令表时说 `no G-Code command list yet
-(the printer did not answer; ^G to try again)`。请求模式下敲裸方法名本来就没有清单，
+(the printer reports 13 commands)`；还没拿到命令表时会把打印机自报的状态写出来，例如 `no G-Code command list yet:
+the printer reports "startup" (Tab asks again)`；若打印机答了但表是空的，则说
+`the printer answered objects/query but listed no commands`。请求模式下敲裸方法名本来就没有清单，
 所以那条路保持安静。
 
 日志区最右边一列是滚动条：占满一屏时显示滑块（`█`）与轨道（`│`），停在底部时

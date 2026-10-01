@@ -63,11 +63,12 @@
 //! - A bare word in g-code mode completes from the printer's command names, as
 //!   the `gcode` object of `objects/query` lists them. That list is asked for
 //!   the first time g-code mode is entered and asked again on later visits
-//!   until the printer answers: the window has no live status to wait on (its
-//!   one `info` reply may say `startup` forever), and a printer that is not up
-//!   yet refuses the query rather than making it wait, so there is nothing to
-//!   lose by asking. Once answered — even with an empty list — it is kept, as
-//!   the list does not change under a running session.
+//!   until the printer answers: the state the header shows only moves when the
+//!   printer reports a change (see [`event_loop`]), so a printer that has not
+//!   reported `ready` yet is one there is nothing to wait for, and a printer
+//!   that is not up yet refuses the query rather than making it wait, so there
+//!   is nothing to lose by asking. Once answered — even with an empty list — it
+//!   is kept, as the list does not change under a running session.
 //!
 //! One candidate the line does not already spell is simply filled in; one the
 //! line already spells opens the layer on it, so that a `Tab` on a whole name
@@ -441,14 +442,14 @@ impl App {
     /// g-code mode is on (that is the only thing that completes from it), and
     /// until it has been answered there is nothing to lose by asking.
     ///
-    /// [`Status`] is deliberately not consulted for a `ready` state. It holds
-    /// whatever the handshake's single `info` reply said, and this window never
-    /// subscribes to `webhooks`, so it is not updated after that: a printer
-    /// that was still coming up at connect time leaves it saying `startup` for
-    /// the life of the connection, and gating on `ready` there would mean never
-    /// asking at all. Asking instead is cheap — a printer that is not up
-    /// refuses `objects/query` at once rather than making it wait — and a
-    /// refusal leaves the flag false, so the next `Tab` asks again.
+    /// [`Status`] is deliberately not consulted for a `ready` state. The header
+    /// starts at the handshake's `info` reply and is updated from then on only
+    /// by a `webhooks` push, which says what *changed* — so until the printer
+    /// reports one it still holds the connect-time value, and gating on `ready`
+    /// would mean not asking during exactly the wait this is here for. Asking
+    /// instead is cheap — a printer that is not up refuses `objects/query` at
+    /// once rather than making it wait — and a refusal leaves the flag false, so
+    /// the next `Tab` asks again.
     fn needs_gcode_commands(&self) -> bool {
         self.gcode && !self.gcode_commands_asked
     }
@@ -891,6 +892,10 @@ async fn event_loop(
         format!("Connected to {}.", session.label()),
     ));
     session.handshake(&mut app).await?;
+    // The header would otherwise stand still at what the handshake's `info`
+    // reply said: the printer reports every later state change through its
+    // `webhooks` object, and nothing pushes that unless it is subscribed to.
+    session.subscribe_webhooks(&mut app).await?;
 
     let (mut keys, keyboard) = spawn_keyboard();
     // The window holds the mouse unless the reader has handed it back, and the
@@ -2433,6 +2438,26 @@ mod tests {
         let rows = render(&app_with(Vec::new()), 60, 6);
         assert!(rows[0].contains("ready"), "{rows:?}");
         assert!(rows[0].contains("Printer is ready"), "{rows:?}");
+    }
+
+    #[test]
+    fn test_a_webhooks_push_moves_the_header_on() {
+        // This is what the window subscribes to at startup. The header's first
+        // value is the handshake's `info` reply, which nothing repeats; a
+        // `webhooks` push is the only thing that replaces it later.
+        let mut app = App::new();
+        app.write(Entry::Push(serde_json::json!({
+            "id": null,
+            "method": "klippy:status",
+            "params": {"eventtime": 12.5, "status": {"webhooks": {
+                "state": "shutdown",
+                "state_message": "Printer is halted"
+            }}}
+        })));
+
+        let rows = render(&app, 60, 6);
+        assert!(rows[0].contains("shutdown"), "{rows:?}");
+        assert!(rows[0].contains("Printer is halted"), "{rows:?}");
     }
 
     #[test]
@@ -4192,8 +4217,8 @@ mod tests {
     fn test_tab_on_an_empty_gcode_line_without_a_list_says_so() {
         // The printer never answered — it refused an ask, or was never asked —
         // so there are no candidates, and `Tab` says why rather than doing
-        // nothing at all. The state it quotes is the handshake's one `info`,
-        // which the window cannot keep up to date.
+        // nothing at all. The state it quotes is the last one the printer
+        // reported, which until it reports a change is the handshake's `info`.
         let mut app = app_with_gcode_commands(&[]);
         app.status = Status::Connected {
             state: "startup".to_string(),
@@ -4568,11 +4593,11 @@ mod tests {
             "nothing has been asked, whatever the state"
         );
 
-        // The status is the handshake's one `info`, which is never updated (no
-        // `webhooks` subscription), so a printer that was still loading then
-        // keeps saying `startup` here for the life of the connection. Waiting
-        // for `ready` would therefore mean never asking at all — and asking a
-        // printer that is not up is not a wait: it refuses at once.
+        // The status starts at the handshake's one `info` and is only moved by a
+        // `webhooks` push, so a printer that was still loading when the window
+        // connected keeps saying `startup` here until its first push arrives.
+        // Waiting for `ready` would therefore mean not asking during the load —
+        // and asking a printer that is not up is not a wait: it refuses at once.
         app.status = Status::Connected {
             state: "startup".to_string(),
             message: "Loading config".to_string(),

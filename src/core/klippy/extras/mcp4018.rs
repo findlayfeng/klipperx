@@ -202,12 +202,15 @@ impl Mcp4018 {
             })
         });
         gcode
-            .register_mux_command(
+            .register_mux_command_with_params(
                 "SET_DIGIPOT",
                 "DIGIPOT",
                 Some(&self.name),
                 handler,
                 Some(CMD_SET_DIGIPOT_HELP),
+                // `cmd_set_digipot` reads the wiper position; the mux key
+                // `DIGIPOT` is prepended by the registration.
+                &["WIPER"],
             )
             .map_err(|err| ConfigError::new(format!("{}: {err}", self.name)))?;
         Ok(())

@@ -145,12 +145,13 @@ impl RunoutHelper {
         let query_handler: CommandHandler =
             sync(move |gcmd: &GcodeCommand| cmd_query_filament_sensor(&query, gcmd));
         gcode
-            .register_mux_command(
+            .register_mux_command_with_params(
                 "QUERY_FILAMENT_SENSOR",
                 "SENSOR",
                 Some(&self.name),
                 query_handler,
                 Some("Query the status of the Filament Sensor"),
+                &[],
             )
             .map_err(ConfigError::new)?;
 
@@ -158,12 +159,13 @@ impl RunoutHelper {
         let set_handler: CommandHandler =
             sync(move |gcmd: &GcodeCommand| cmd_set_filament_sensor(&set, gcmd));
         gcode
-            .register_mux_command(
+            .register_mux_command_with_params(
                 "SET_FILAMENT_SENSOR",
                 "SENSOR",
                 Some(&self.name),
                 set_handler,
                 Some("Sets the filament sensor on/off"),
+                &["ENABLE"],
             )
             .map_err(ConfigError::new)?;
 

@@ -101,7 +101,16 @@ impl HostResponder {
         let respond_prefix = default_prefix.clone();
         let handler: CommandHandler = sync(move |gcmd| cmd_respond(&respond_prefix, gcmd));
         gcode
-            .register_command("RESPOND", handler, Some(RESPOND_HELP), true)
+            // `M118` above reads only the raw remainder, so it declares no
+            // `KEY`; `RESPOND` reads `TYPE`, `PREFIX` and `MSG` in that order
+            // (`cmd_respond`).
+            .register_command_with_params(
+                "RESPOND",
+                handler,
+                Some(RESPOND_HELP),
+                &["TYPE", "PREFIX", "MSG"],
+                true,
+            )
             .map_err(|err| ConfigError::new(format!("{identifier}: {err}")))?;
 
         Ok(Self { default_prefix })

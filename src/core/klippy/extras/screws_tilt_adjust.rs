@@ -30,7 +30,9 @@ use serde_json::{json, Map, Value};
 use tracing::warn;
 
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
-use crate::core::klippy::extras::probe::{ProbeOffsets, ProbePointsFinalize, ProbePointsHelper};
+use crate::core::klippy::extras::probe::{
+    probe_points_params, ProbeOffsets, ProbePointsFinalize, ProbePointsHelper,
+};
 use crate::core::klippy::gcode::{
     CommandError, CommandHandler, GCodeDispatch, GcodeCommand, GCODE_OBJECT,
 };
@@ -42,6 +44,15 @@ section!("screws_tilt_adjust", order = 30, load = load_config);
 
 /// The command this section registers (`screws_tilt_adjust.py:43`).
 const COMMAND: &str = "SCREWS_TILT_CALCULATE";
+
+/// The `KEY` names `SCREWS_TILT_CALCULATE` reads, in read order: the
+/// deviation limit and direction the handler reads first, then the probe
+/// round's (`screws_tilt_adjust.py:47-54`).
+fn command_params() -> Vec<&'static str> {
+    let mut params = vec!["MAX_DEVIATION", "DIRECTION"];
+    params.extend(probe_points_params());
+    params
+}
 
 /// The `screw_thread` choices mapped to their upstream index
 /// (`screws_tilt_adjust.py:30-32`).
@@ -162,13 +173,14 @@ impl ScrewsTiltAdjust {
             })
         });
         gcode
-            .register_command(
+            .register_command_with_params(
                 COMMAND,
                 handler,
                 Some(
                     "Tool to help adjust bed leveling screws by calculating \
                      the number of turns to level it.",
                 ),
+                &command_params(),
                 false,
             )
             .map_err(ConfigError::new)?;

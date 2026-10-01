@@ -397,12 +397,15 @@ pub fn load_config_prefix(
     let handler: CommandHandler = sync(move |gcmd: &GcodeCommand| this.cmd_set_target(gcmd));
     let mux_key = temperature_fan.name.clone();
     gcode
-        .register_mux_command(
+        // `cmd_set_target` reads `TARGET`, `MIN_SPEED` and `MAX_SPEED` in that
+        // order; the mux `TEMPERATURE_FAN` key is prepended by the registrar.
+        .register_mux_command_with_params(
             "SET_TEMPERATURE_FAN_TARGET",
             "TEMPERATURE_FAN",
             Some(mux_key.as_str()),
             handler,
             Some("Sets a temperature fan target and fan speed limits"),
+            &["TARGET", "MIN_SPEED", "MAX_SPEED"],
         )
         .map_err(ConfigError::new)?;
 

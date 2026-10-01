@@ -74,12 +74,13 @@ impl PrinterFanGeneric {
         let speed = Arc::clone(&fan);
         let handler: CommandHandler = sync(move |gcmd| cmd_set_fan_speed(&speed, gcmd));
         gcode
-            .register_mux_command(
+            .register_mux_command_with_params(
                 "SET_FAN_SPEED",
                 "FAN",
                 Some(&name),
                 handler,
                 Some("Sets the speed of a fan"),
+                &["SPEED", "TEMPLATE"],
             )
             .map_err(|err| ConfigError::new(format!("{identifier}: {err}")))?;
 

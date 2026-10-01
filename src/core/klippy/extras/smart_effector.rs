@@ -397,7 +397,9 @@ fn register_commands(
     let printer_weak = Arc::downgrade(printer);
     let set_control = Arc::clone(control);
     gcode
-        .register_command(
+        // `parse_set` reads `SENSITIVITY`, `ACCEL` then `RECOVERY_TIME`;
+        // `RESET_SMART_EFFECTOR` below reads no key.
+        .register_command_with_params(
             "SET_SMART_EFFECTOR",
             Arc::new(move |gcmd| {
                 let printer_weak = printer_weak.clone();
@@ -427,6 +429,7 @@ fn register_commands(
                 })
             }),
             Some("Set SmartEffector parameters"),
+            &["SENSITIVITY", "ACCEL", "RECOVERY_TIME"],
             false,
         )
         .map_err(ConfigError::new)?;

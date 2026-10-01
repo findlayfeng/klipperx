@@ -976,10 +976,11 @@ impl PrinterBLTouch {
         {
             let protocol = Arc::clone(&protocol);
             gcode
-                .register_command(
+                .register_command_with_params(
                     "BLTOUCH_DEBUG",
                     sync(move |gcmd| protocol.cmd_bl_touch_debug(gcmd)),
                     Some("Send a command to the bltouch for debugging"),
+                    &["COMMAND"],
                     false,
                 )
                 .map_err(ConfigError::new)?;
@@ -987,10 +988,11 @@ impl PrinterBLTouch {
         {
             let protocol = Arc::clone(&protocol);
             gcode
-                .register_command(
+                .register_command_with_params(
                     "BLTOUCH_STORE",
                     sync(move |gcmd| protocol.cmd_bl_touch_store(gcmd)),
                     Some("Store an output mode in the BLTouch EEPROM"),
+                    &["MODE"],
                     false,
                 )
                 .map_err(ConfigError::new)?;

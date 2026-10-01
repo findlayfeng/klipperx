@@ -425,9 +425,11 @@ impl SafeZHoming {
             })
         };
         // No help text: upstream leaves the previous one in place
-        // (`gcode.rs:575-583`).
+        // (`gcode.rs:575-583`). The axes are `X` / `Y` / `Z` (read order), the
+        // ones `run_g28` looks for in the command's parameters; declaring them
+        // keeps the list the toolhead's `G28` put on the re-registration.
         gcode
-            .register_command("G28", handler, None, false)
+            .register_command_with_params("G28", handler, None, &["X", "Y", "Z"], false)
             .map_err(ConfigError::new)?;
 
         // The override owns `G28`, so the two cannot share it

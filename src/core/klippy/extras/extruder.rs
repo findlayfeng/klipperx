@@ -263,7 +263,13 @@ impl PrinterExtruder {
                 let handler: CommandHandler =
                     sync(move |gcmd: &GcodeCommand| cmd_set_temperature(&printer, gcmd, wait));
                 gcode
-                    .register_command(name, handler, Some("Set extruder temperature"), false)
+                    .register_command_with_params(
+                        name,
+                        handler,
+                        Some("Set extruder temperature"),
+                        M104_M109_PARAMS,
+                        false,
+                    )
                     .map_err(ConfigError::new)?;
             }
         }
@@ -276,12 +282,13 @@ impl PrinterExtruder {
             let handler: CommandHandler =
                 sync(move |gcmd: &GcodeCommand| set_pressure_advance(gcmd, &pa, &smooth));
             gcode
-                .register_mux_command(
+                .register_mux_command_with_params(
                     "SET_PRESSURE_ADVANCE",
                     "EXTRUDER",
                     Some(&self.name),
                     handler,
                     Some("Set pressure advance parameters"),
+                    SET_PRESSURE_ADVANCE_PARAMS,
                 )
                 .map_err(ConfigError::new)?;
         }
@@ -296,12 +303,13 @@ impl PrinterExtruder {
             let handler: CommandHandler =
                 sync(move |gcmd: &GcodeCommand| forward_pressure_advance(&printer, gcmd));
             gcode
-                .register_mux_command(
+                .register_mux_command_with_params(
                     "SET_PRESSURE_ADVANCE",
                     "EXTRUDER",
                     None,
                     handler,
                     Some("Set pressure advance parameters"),
+                    SET_PRESSURE_ADVANCE_PARAMS,
                 )
                 .map_err(ConfigError::new)?;
         }
@@ -342,12 +350,14 @@ impl PrinterExtruder {
                 cmd_set_extruder_rotation_distance(gcmd, &name, &stepper)
             });
             gcode
-                .register_mux_command(
+                .register_mux_command_with_params(
                     "SET_EXTRUDER_ROTATION_DISTANCE",
                     "EXTRUDER",
                     Some(&self.name),
                     handler,
                     Some("Set extruder rotation distance"),
+                    // The mux key `EXTRUDER` is prepended by the registration.
+                    &["DISTANCE"],
                 )
                 .map_err(ConfigError::new)?;
 
@@ -358,12 +368,14 @@ impl PrinterExtruder {
                 cmd_sync_extruder_motion(gcmd, &name, &printer, &queue)
             });
             gcode
-                .register_mux_command(
+                .register_mux_command_with_params(
                     "SYNC_EXTRUDER_MOTION",
                     "EXTRUDER",
                     Some(&self.name),
                     handler,
                     Some("Set extruder stepper motion queue"),
+                    // The mux key `EXTRUDER` is prepended by the registration.
+                    &["MOTION_QUEUE"],
                 )
                 .map_err(ConfigError::new)?;
         }
@@ -375,6 +387,11 @@ impl PrinterExtruder {
         slot.lock().unwrap_or_else(|p| p.into_inner())
     }
 }
+
+/// The words `SET_PRESSURE_ADVANCE` reads (`kinematics/extruder.py:93-97`):
+/// shared by the per-extruder value and the `EXTRUDER` default, which run the
+/// same body against a different extruder.
+const SET_PRESSURE_ADVANCE_PARAMS: &[&str] = &["ADVANCE", "SMOOTH_TIME"];
 
 /// `SET_PRESSURE_ADVANCE`'s body: record both values and report them
 /// (upstream `extruder_stepper.cmd_SET_PRESSURE_ADVANCE`).
@@ -564,6 +581,11 @@ impl std::fmt::Debug for PrinterExtruder {
 }
 
 /// `M104`/`M109`: set the (optionally `T`-indexed) extruder temperature.
+/// The words `M104`/`M109` read (`kinematics/extruder.py:180-190`). Both names
+/// share `cmd_set_temperature`; `wait` only selects the not-yet-wired wait
+/// loop.
+const M104_M109_PARAMS: &[&str] = &["S", "T"];
+
 fn cmd_set_temperature(
     printer: &std::sync::Weak<Printer>,
     gcmd: &GcodeCommand,

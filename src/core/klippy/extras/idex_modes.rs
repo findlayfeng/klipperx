@@ -493,6 +493,13 @@ pub fn register_generic(
     Ok(())
 }
 
+/// The words `select_carriage` reads (`idex_modes.py:240-262`), in read order.
+const SET_DUAL_CARRIAGE_PARAMS: &[&str] = &["CARRIAGE", "MODE"];
+
+/// The words `cmd_restore_dual_carriage_state` reads
+/// (`idex_modes.py:295-302`), in read order.
+const RESTORE_DUAL_CARRIAGE_STATE_PARAMS: &[&str] = &["NAME", "MOVE_SPEED", "MOVE"];
+
 /// Register `SET_DUAL_CARRIAGE` / `SAVE_DUAL_CARRIAGE_STATE` /
 /// `RESTORE_DUAL_CARRIAGE_STATE` on `shared` (`idex_modes.py:46-59`): the
 /// same three handlers whether the module came from the bare section or from
@@ -515,10 +522,13 @@ fn register_commands(
             cmd_save_dual_carriage_state(&shared, gcmd, printer.as_ref())
         });
         gcode
-            .register_command(
+            .register_command_with_params(
                 "SAVE_DUAL_CARRIAGE_STATE",
                 handler,
                 Some("Save dual carriages modes and positions"),
+                // The state's name, read by `cmd_save_dual_carriage_state`
+                // (`idex_modes.py:283-293`).
+                &["NAME"],
                 false,
             )
             .map_err(ConfigError::new)?;
@@ -527,16 +537,18 @@ fn register_commands(
     // `SET_DUAL_CARRIAGE` / `RESTORE_DUAL_CARRIAGE_STATE` re-anchor the
     // toolhead, so they are async handlers — upstream's
     // `toolhead.set_position` (`idex_modes.py:114,348`) has the same job.
-    for (name, desc, restoring) in [
+    for (name, desc, restoring, params) in [
         (
             "SET_DUAL_CARRIAGE",
             "Configure the dual carriages mode",
             false,
+            SET_DUAL_CARRIAGE_PARAMS,
         ),
         (
             "RESTORE_DUAL_CARRIAGE_STATE",
             "Restore dual carriages modes and positions",
             true,
+            RESTORE_DUAL_CARRIAGE_STATE_PARAMS,
         ),
     ] {
         let shared = Arc::clone(shared);
@@ -557,7 +569,7 @@ fn register_commands(
             })
         });
         gcode
-            .register_command(name, handler, Some(desc), false)
+            .register_command_with_params(name, handler, Some(desc), params, false)
             .map_err(ConfigError::new)?;
     }
     Ok(())

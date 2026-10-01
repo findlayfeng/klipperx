@@ -412,12 +412,16 @@ impl Ldc1612 {
             Box::pin(async move { state.calibrate_drive_current(gcmd).await })
         });
         gcode
-            .register_mux_command(
+            .register_mux_command_with_params(
                 "LDC_CALIBRATE_DRIVE_CURRENT",
                 "CHIP",
                 Some(&state.name),
                 handler,
                 Some("Calibrate LDC1612 DRIVE_CURRENT register"),
+                // `cmd_LDC_CALIBRATE` reads no word but the chip it is
+                // addressed by, which the registration prepends
+                // (`ldc1612.py:50-70`).
+                &[],
             )
             .map_err(|err| ConfigError::new(format!("{identifier}: {err}")))?;
 

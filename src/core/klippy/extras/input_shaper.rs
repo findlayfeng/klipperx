@@ -370,10 +370,11 @@ impl InputShaper {
             sync(move |gcmd| object.cmd_set_input_shaper(gcmd))
         };
         gcode
-            .register_command(
+            .register_command_with_params(
                 "SET_INPUT_SHAPER",
                 handler,
                 Some("Set cartesian parameters for input shaper"),
+                SET_INPUT_SHAPER_PARAMS,
                 false,
             )
             .map_err(ConfigError::new)
@@ -392,6 +393,23 @@ impl PrinterObject for InputShaper {
         false
     }
 }
+
+/// The words `SET_INPUT_SHAPER` reads, in read order: `InputShaperParams::
+/// update` reads the plain `SHAPER_TYPE` first and then that axis's own
+/// spellings, and the handler runs it for x, y and z in turn
+/// (`input_shaper.py:26-46,199-205`).
+const SET_INPUT_SHAPER_PARAMS: &[&str] = &[
+    "SHAPER_TYPE",
+    "SHAPER_TYPE_X",
+    "DAMPING_RATIO_X",
+    "SHAPER_FREQ_X",
+    "SHAPER_TYPE_Y",
+    "DAMPING_RATIO_Y",
+    "SHAPER_FREQ_Y",
+    "SHAPER_TYPE_Z",
+    "DAMPING_RATIO_Z",
+    "SHAPER_FREQ_Z",
+];
 
 /// Upstream's `motion_queuing.check_step_generation_scan_windows()`, which
 /// `_update_input_shaping` ends with (`input_shaper.py:196`): the step

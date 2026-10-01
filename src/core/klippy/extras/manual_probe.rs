@@ -102,7 +102,7 @@ impl ManualProbe {
             let printer = Arc::downgrade(printer);
             let status = Arc::clone(&status);
             gcode
-                .register_command(
+                .register_command_with_params(
                     "MANUAL_PROBE",
                     Arc::new(move |gcmd| {
                         let printer = printer.clone();
@@ -126,6 +126,7 @@ impl ManualProbe {
                         })
                     }),
                     Some("Start manual probe helper script"),
+                    MANUAL_PROBE_START_PARAMS,
                     false,
                 )
                 .map_err(ConfigError::new)?;
@@ -136,7 +137,7 @@ impl ManualProbe {
             let printer = Arc::downgrade(printer);
             let status = Arc::clone(&status);
             gcode
-                .register_command(
+                .register_command_with_params(
                     "Z_ENDSTOP_CALIBRATE",
                     Arc::new(move |gcmd| {
                         let printer = printer.clone();
@@ -175,6 +176,7 @@ impl ManualProbe {
                         })
                     }),
                     Some("Calibrate a Z endstop"),
+                    MANUAL_PROBE_START_PARAMS,
                     false,
                 )
                 .map_err(ConfigError::new)?;
@@ -288,6 +290,11 @@ pub(crate) fn verify_no_manual_probe(
     }
 }
 
+/// The word the manual probe helper reads when it starts, `SPEED`
+/// (`manual_probe.py:24-25`): `MANUAL_PROBE` and `Z_ENDSTOP_CALIBRATE` both
+/// start the same helper.
+const MANUAL_PROBE_START_PARAMS: &[&str] = &["SPEED"];
+
 /// The helper one manual probe runs (`manual_probe.py:ManualProbeHelper`).
 struct ManualProbeHelper {
     /// The machine, for the toolhead.
@@ -341,13 +348,15 @@ impl ManualProbeHelper {
         {
             let helper = Arc::clone(&helper);
             gcode
-                .register_command(
+                .register_command_with_params(
                     "ACCEPT",
                     Arc::new(move |gcmd| {
                         let helper = Arc::clone(&helper);
                         Box::pin(async move { helper.cmd_accept(gcmd) })
                     }),
                     Some("Accept the current Z position"),
+                    // `cmd_accept` reads no word.
+                    &[],
                     false,
                 )
                 .map_err(CommandError::new)?;
@@ -355,13 +364,15 @@ impl ManualProbeHelper {
         {
             let helper = Arc::clone(&helper);
             gcode
-                .register_command(
+                .register_command_with_params(
                     "NEXT",
                     Arc::new(move |gcmd| {
                         let helper = Arc::clone(&helper);
                         Box::pin(async move { helper.cmd_accept(gcmd) })
                     }),
                     None,
+                    // `NEXT` is `ACCEPT`: the same handler.
+                    &[],
                     false,
                 )
                 .map_err(CommandError::new)?;
@@ -369,13 +380,15 @@ impl ManualProbeHelper {
         {
             let helper = Arc::clone(&helper);
             gcode
-                .register_command(
+                .register_command_with_params(
                     "ABORT",
                     Arc::new(move |gcmd| {
                         let helper = Arc::clone(&helper);
                         Box::pin(async move { helper.cmd_abort(gcmd) })
                     }),
                     Some("Abort manual Z probing tool"),
+                    // `cmd_abort` reads no word.
+                    &[],
                     false,
                 )
                 .map_err(CommandError::new)?;
@@ -383,13 +396,16 @@ impl ManualProbeHelper {
         {
             let helper = Arc::clone(&helper);
             gcode
-                .register_command(
+                .register_command_with_params(
                     "TESTZ",
                     Arc::new(move |gcmd| {
                         let helper = Arc::clone(&helper);
                         Box::pin(async move { helper.cmd_testz(gcmd) })
                     }),
                     Some("Move to new Z height"),
+                    // `cmd_testz` reads the requested height (`manual_probe.py`
+                    // `cmd_TESTZ`).
+                    &["Z"],
                     false,
                 )
                 .map_err(CommandError::new)?;

@@ -26,7 +26,7 @@ use crate::core::klippy::extras::probe::{
     ProbeOffsets, ProbePointsFinalize, ProbePointsHelper, RETRY,
 };
 use crate::core::klippy::extras::z_tilt::{
-    block_in_command, read_xy_option, RetryHelper, ZAdjustHelper, ZAdjustStatus,
+    block_in_command, read_xy_option, retry_probe_params, RetryHelper, ZAdjustHelper, ZAdjustStatus,
 };
 use crate::core::klippy::gcode::{
     CommandError, CommandHandler, GCodeDispatch, GcodeCommand, GCODE_OBJECT,
@@ -265,10 +265,11 @@ impl QuadGantryLevel {
             })
         });
         gcode
-            .register_command(
+            .register_command_with_params(
                 "QUAD_GANTRY_LEVEL",
                 handler,
                 Some("Conform a moving, twistable gantry to the shape of a stationary bed"),
+                &retry_probe_params(),
                 false,
             )
             .map_err(ConfigError::new)?;

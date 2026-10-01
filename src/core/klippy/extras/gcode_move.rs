@@ -272,6 +272,12 @@ impl GCodeMove {
 impl GCodeMove {
     /// Register the commands, capturing a handle to this object.
     ///
+    /// Each row also declares the parameter names its command reads, in the
+    /// order the handler reads them. They are **not** what the handler parses;
+    /// they reach a client as `status.gcode.commands[<name>]["parameters"]`,
+    /// which is what completes the left of `=`. A command that reads no named
+    /// parameter declares an empty list.
+    ///
     /// The last field of each row is upstream's `when_not_ready`: `M114`
     /// answers before the printer is ready, the rest do not.
     fn register_commands(self: &Arc<Self>, printer: &Arc<Printer>) -> Result<(), ConfigError> {
@@ -279,45 +285,70 @@ impl GCodeMove {
             .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
             .expect("the loader registers `gcode` before any section");
         type Command = fn(&GCodeMove, &GcodeCommand) -> Result<(), CommandError>;
-        const COMMANDS: &[(&str, Command, Option<&str>, bool)] = &[
-            ("G0", cmd_g1, None, false),
-            ("G1", cmd_g1, None, false),
-            ("G20", cmd_g20, None, false),
-            ("G21", cmd_g21, None, false),
-            ("G90", cmd_g90, None, false),
-            ("G91", cmd_g91, None, false),
-            ("G92", cmd_g92, None, false),
-            ("M82", cmd_m82, None, false),
-            ("M83", cmd_m83, None, false),
-            ("M114", cmd_m114, None, true),
-            ("M220", cmd_m220, None, false),
-            ("M221", cmd_m221, None, false),
+        /// The words `cmd_g1` reads, shared by both spellings of the move.
+        const G1_PARAMS: &[&str] = &["X", "Y", "Z", "E", "F"];
+        /// The axes `cmd_g92` anchors on.
+        const G92_PARAMS: &[&str] = &["X", "Y", "Z", "E"];
+        /// `cmd_m220` and `cmd_m221` each read their factor as a percentage, in
+        /// `S`.
+        const PERCENT_PARAMS: &[&str] = &["S"];
+        /// `cmd_set_gcode_offset` reads every axis and then that same axis's
+        /// `_ADJUST` form — the loop reads one axis's two words before it moves
+        /// on, which is why each `*_ADJUST` follows its axis here.
+        const GCODE_OFFSET_PARAMS: &[&str] = &[
+            "X",
+            "X_ADJUST",
+            "Y",
+            "Y_ADJUST",
+            "Z",
+            "Z_ADJUST",
+            "E",
+            "E_ADJUST",
+            "MOVE",
+            "MOVE_SPEED",
+        ];
+        const COMMANDS: &[(&str, Command, Option<&str>, &[&str], bool)] = &[
+            ("G0", cmd_g1, None, G1_PARAMS, false),
+            ("G1", cmd_g1, None, G1_PARAMS, false),
+            ("G20", cmd_g20, None, &[], false),
+            ("G21", cmd_g21, None, &[], false),
+            ("G90", cmd_g90, None, &[], false),
+            ("G91", cmd_g91, None, &[], false),
+            ("G92", cmd_g92, None, G92_PARAMS, false),
+            ("M82", cmd_m82, None, &[], false),
+            ("M83", cmd_m83, None, &[], false),
+            ("M114", cmd_m114, None, &[], true),
+            ("M220", cmd_m220, None, PERCENT_PARAMS, false),
+            ("M221", cmd_m221, None, PERCENT_PARAMS, false),
             (
                 "SET_GCODE_OFFSET",
                 cmd_set_gcode_offset,
                 Some("Set a virtual offset to g-code positions"),
+                GCODE_OFFSET_PARAMS,
                 false,
             ),
             (
                 "SAVE_GCODE_STATE",
                 cmd_save_gcode_state,
                 Some("Save G-Code coordinate state"),
+                &["NAME"],
                 false,
             ),
             (
                 "RESTORE_GCODE_STATE",
                 cmd_restore_gcode_state,
                 Some("Restore a previously saved G-Code state"),
+                &["NAME", "MOVE", "MOVE_SPEED"],
                 false,
             ),
         ];
-        for (name, command, desc, when_not_ready) in COMMANDS {
+        for (name, command, desc, params, when_not_ready) in COMMANDS {
             let handler: CommandHandler = {
                 let object = Arc::clone(self);
                 sync(move |gcmd| command(&object, gcmd))
             };
             gcode
-                .register_command(name, handler, *desc, *when_not_ready)
+                .register_command_with_params(name, handler, *desc, params, *when_not_ready)
                 .map_err(ConfigError::new)?;
         }
         Ok(())
@@ -1102,5 +1133,46 @@ mod tests {
         let err = gcode.run_script_sync("G20").unwrap_err();
 
         assert!(err.to_string().contains("G20"), "{err}");
+    }
+
+    /// The declarations a client completes `KEY=` from, as they appear on
+    /// `status.gcode.commands`: `G0` and `G1` answer with the one list their
+    /// shared handler reads, `G20` declares nothing, and `SET_GCODE_OFFSET`
+    /// pairs each axis with its `_ADJUST`.
+    #[test]
+    fn test_every_command_declares_the_parameters_it_reads() {
+        let (_printer, gcode, _object, _target) = machine(Coord::default());
+
+        let commands = gcode.get_status(0.0)["commands"].clone();
+        assert_eq!(
+            commands["G1"]["parameters"],
+            json!(["X", "Y", "Z", "E", "F"])
+        );
+        assert_eq!(commands["G0"]["parameters"], commands["G1"]["parameters"]);
+        assert_eq!(commands["G92"]["parameters"], json!(["X", "Y", "Z", "E"]));
+        assert_eq!(commands["M220"]["parameters"], json!(["S"]));
+        assert_eq!(commands["M221"]["parameters"], json!(["S"]));
+        assert_eq!(
+            commands["SET_GCODE_OFFSET"]["parameters"],
+            json!([
+                "X",
+                "X_ADJUST",
+                "Y",
+                "Y_ADJUST",
+                "Z",
+                "Z_ADJUST",
+                "E",
+                "E_ADJUST",
+                "MOVE",
+                "MOVE_SPEED"
+            ])
+        );
+        assert_eq!(commands["SAVE_GCODE_STATE"]["parameters"], json!(["NAME"]));
+        assert_eq!(
+            commands["RESTORE_GCODE_STATE"]["parameters"],
+            json!(["NAME", "MOVE", "MOVE_SPEED"])
+        );
+        // No named word at all: the object a client saw before.
+        assert!(commands["G20"].get("parameters").is_none());
     }
 }

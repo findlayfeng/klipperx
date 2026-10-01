@@ -419,7 +419,7 @@ impl PrinterFan {
             speed.set_speed_from_command(value)
         });
         gcode
-            .register_command("M106", handler, None, false)
+            .register_command_with_params("M106", handler, None, &["S"], false)
             .map_err(ConfigError::new)?;
 
         let off = Arc::clone(&fan);

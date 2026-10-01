@@ -33,7 +33,9 @@ use tracing::{info, warn};
 use crate::core::klippy::config::object::{PrinterConfig, CONFIGFILE_OBJECT};
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
 use crate::core::klippy::error::KlippyError;
-use crate::core::klippy::extras::probe::{ProbeOffsets, ProbePointsFinalize, ProbePointsHelper};
+use crate::core::klippy::extras::probe::{
+    probe_points_params, ProbeOffsets, ProbePointsFinalize, ProbePointsHelper,
+};
 use crate::core::klippy::extras::toolhead::ToolHeadObject;
 use crate::core::klippy::gcode::{
     sync, CommandError, CommandHandler, GCodeDispatch, GcodeCommand, GCODE_OBJECT,
@@ -51,6 +53,19 @@ const TOOLHEAD_OBJECT: &str = "toolhead";
 /// The two commands this section registers (`delta_calibrate.py:121-123`).
 const COMMAND_CALIBRATE: &str = "DELTA_CALIBRATE";
 const COMMAND_ANALYZE: &str = "DELTA_ANALYZE";
+
+/// The `KEY` names `DELTA_ANALYZE` reads, in read order: the manual height,
+/// then the measurement keys of `cmd_delta_analyze`'s `ARGS`, then the
+/// calibration action (`delta_calibrate.py:257-284`).
+const DELTA_ANALYZE_PARAMS: &[&str] = &[
+    "MANUAL_HEIGHT",
+    "CENTER_DISTS",
+    "CENTER_PILLAR_WIDTHS",
+    "OUTER_DISTS",
+    "OUTER_PILLAR_WIDTHS",
+    "SCALE",
+    "CALIBRATE",
+];
 
 /// How much to prefer a distance measurement over a height measurement
 /// (`MEASURE_WEIGHT`).
@@ -188,10 +203,11 @@ impl DeltaCalibrate {
                 })
             });
             gcode
-                .register_command(
+                .register_command_with_params(
                     COMMAND_CALIBRATE,
                     handler,
                     Some("Delta calibration script"),
+                    &probe_points_params(),
                     false,
                 )
                 .map_err(ConfigError::new)?;
@@ -205,10 +221,11 @@ impl DeltaCalibrate {
                 this.cmd_delta_analyze(gcmd)
             });
             gcode
-                .register_command(
+                .register_command_with_params(
                     COMMAND_ANALYZE,
                     handler,
                     Some("Extended delta calibration tool"),
+                    DELTA_ANALYZE_PARAMS,
                     false,
                 )
                 .map_err(ConfigError::new)?;

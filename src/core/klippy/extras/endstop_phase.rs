@@ -396,10 +396,11 @@ impl EndstopPhases {
             .upgrade()
             .ok_or_else(|| ConfigError::new("the g-code dispatcher is gone"))?;
         gcode
-            .register_command(
+            .register_command_with_params(
                 "ENDSTOP_PHASE_CALIBRATE",
                 handler,
                 Some(Self::CMD_ENDSTOP_PHASE_CALIBRATE_HELP),
+                &["STEPPER"],
                 false,
             )
             .map_err(ConfigError::new)?;

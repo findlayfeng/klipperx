@@ -364,20 +364,31 @@ impl LoadCell {
                 let error = CommandError::new(format!("{command} is not implemented in this host"));
                 Box::pin(async move { Err::<(), CommandError>(error) })
             });
+            // Neither this host's stub bodies nor upstream's
+            // `LoadCellCommandHelper` read any `KEY` beyond the mux key, so
+            // the declared list is the key alone.
             gcode
-                .register_mux_command(
+                .register_mux_command_with_params(
                     command,
                     LOAD_CELL_KEY,
                     Some(state.name.as_str()),
                     Arc::clone(&handler),
                     Some(help),
+                    &[],
                 )
                 .map_err(|err| ConfigError::new(format!("{config_name}: {err}")))?;
             // A bare `[load_cell]` answers to the default instance too
             // (`if len(name_parts) == 1: self.register_commands(None)`).
             if !config_name.contains(' ') {
                 gcode
-                    .register_mux_command(command, LOAD_CELL_KEY, None, handler, Some(help))
+                    .register_mux_command_with_params(
+                        command,
+                        LOAD_CELL_KEY,
+                        None,
+                        handler,
+                        Some(help),
+                        &[],
+                    )
                     .map_err(|err| ConfigError::new(format!("{config_name}: {err}")))?;
             }
         }

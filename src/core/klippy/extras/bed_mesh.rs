@@ -32,7 +32,7 @@ use std::sync::{Arc, Mutex};
 use serde_json::{json, Value};
 
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
-use crate::core::klippy::extras::probe::lookup_probe_session;
+use crate::core::klippy::extras::probe::{lookup_probe_session, PROBE_PARAMS};
 use crate::core::klippy::extras::toolhead::ToolHeadObject;
 use crate::core::klippy::gcode::{CommandError, GCodeDispatch, GCODE_OBJECT};
 use crate::core::klippy::load::section;
@@ -393,7 +393,7 @@ impl BedMesh {
             let mesh = Arc::clone(&mesh);
             let printer_weak = printer_weak.clone();
             gcode
-                .register_command(
+                .register_command_with_params(
                     "BED_MESH_CALIBRATE",
                     Arc::new(move |gcmd| {
                         let options = Arc::clone(&options);
@@ -465,6 +465,7 @@ impl BedMesh {
                         })
                     }),
                     Some("Calibrate the bed mesh"),
+                    PROBE_PARAMS,
                     false,
                 )
                 .map_err(ConfigError::new)?;

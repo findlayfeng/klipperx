@@ -38,7 +38,9 @@ use crate::core::klippy::config::object::{PrinterConfig, CONFIGFILE_OBJECT};
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
 use crate::core::klippy::event::KlippyEvent;
 use crate::core::klippy::extras::gcode_move::{self, GCodeMove, MoveTarget, GCODE_MOVE_OBJECT};
-use crate::core::klippy::extras::probe::{ProbeOffsets, ProbePointsFinalize, ProbePointsHelper};
+use crate::core::klippy::extras::probe::{
+    probe_points_params, ProbeOffsets, ProbePointsFinalize, ProbePointsHelper,
+};
 use crate::core::klippy::extras::toolhead::ToolHeadObject;
 use crate::core::klippy::gcode::{CommandError, GCodeDispatch, GCODE_OBJECT};
 use crate::core::klippy::load::section;
@@ -275,7 +277,7 @@ impl BedTiltCalibrate {
             .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
             .expect("the loader registers `gcode` first");
         gcode
-            .register_command(
+            .register_command_with_params(
                 "BED_TILT_CALIBRATE",
                 {
                     let calibrate = Arc::clone(&calibrate);
@@ -285,6 +287,7 @@ impl BedTiltCalibrate {
                     })
                 },
                 Some("Bed tilt calibration script"),
+                &probe_points_params(),
                 false,
             )
             .map_err(ConfigError::new)?;

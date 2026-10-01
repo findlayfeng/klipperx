@@ -356,7 +356,10 @@ impl ResonanceTester {
         let gcode = printer
             .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
             .expect("the loader registers `gcode` before any section");
-        let commands: [(&str, CommandHandler, &str); 3] = [
+        // Each entry's parameter list is the `KEY`s that command's handler
+        // reads, in read order (`cmd_measure_axes_noise` / `cmd_test_resonances`
+        // / `cmd_shaper_calibrate`).
+        let commands: [(&str, CommandHandler, &str, &[&str]); 3] = [
             (
                 "MEASURE_AXES_NOISE",
                 sync({
@@ -364,6 +367,7 @@ impl ResonanceTester {
                     move |gcmd| object.cmd_measure_axes_noise(gcmd)
                 }),
                 "Measures noise of all enabled accelerometer chips",
+                &["MEAS_TIME"],
             ),
             (
                 "TEST_RESONANCES",
@@ -372,6 +376,7 @@ impl ResonanceTester {
                     move |gcmd| object.cmd_test_resonances(gcmd)
                 }),
                 "Runs the resonance test for a specified axis",
+                &["AXIS", "CHIPS", "POINT", "OUTPUT", "NAME"],
             ),
             (
                 "SHAPER_CALIBRATE",
@@ -380,11 +385,12 @@ impl ResonanceTester {
                     move |gcmd| object.cmd_shaper_calibrate(gcmd)
                 }),
                 "Similar to TEST_RESONANCES but suggest input shaper config",
+                &["AXIS", "CHIPS", "MAX_SMOOTHING", "NAME"],
             ),
         ];
-        for (name, handler, desc) in commands {
+        for (name, handler, desc, params) in commands {
             gcode
-                .register_command(name, handler, Some(desc), false)
+                .register_command_with_params(name, handler, Some(desc), params, false)
                 .map_err(ConfigError::new)?;
         }
         Ok(())

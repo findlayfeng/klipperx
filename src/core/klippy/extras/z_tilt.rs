@@ -25,7 +25,7 @@ use crate::core::klippy::config::{ConfigError, ConfigWrapper};
 use crate::core::klippy::error::KlippyError;
 use crate::core::klippy::event::KlippyEvent;
 use crate::core::klippy::extras::probe::{
-    ProbeOffsets, ProbePointsFinalize, ProbePointsHelper, RETRY,
+    probe_points_params, ProbeOffsets, ProbePointsFinalize, ProbePointsHelper, RETRY,
 };
 use crate::core::klippy::extras::toolhead::ToolHeadObject;
 use crate::core::klippy::gcode::{
@@ -249,6 +249,19 @@ impl RetryHelper {
         }
         Ok("retry")
     }
+}
+
+/// The `KEY` names [`RetryHelper::start`] reads, in read order
+/// (`z_tilt.py:88-93`).
+pub(crate) const RETRY_PARAMS: &[&str] = &["RETRIES", "RETRY_TOLERANCE"];
+
+/// The declared parameters of a retry-driven probe command
+/// (`Z_TILT_ADJUST`, `QUAD_GANTRY_LEVEL`): the retries the helper reads
+/// first, then the probe round's.
+pub(crate) fn retry_probe_params() -> Vec<&'static str> {
+    let mut params = RETRY_PARAMS.to_vec();
+    params.extend(probe_points_params());
+    params
 }
 
 impl RetryState {
@@ -633,7 +646,13 @@ impl ZTilt {
             })
         });
         gcode
-            .register_command("Z_TILT_ADJUST", handler, Some("Adjust the Z tilt"), false)
+            .register_command_with_params(
+                "Z_TILT_ADJUST",
+                handler,
+                Some("Adjust the Z tilt"),
+                &retry_probe_params(),
+                false,
+            )
             .map_err(ConfigError::new)?;
 
         Ok(z_tilt)

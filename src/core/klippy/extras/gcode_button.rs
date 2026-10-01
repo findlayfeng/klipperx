@@ -167,12 +167,13 @@ impl GCodeButton {
             Ok(())
         });
         self.gcode
-            .register_mux_command(
+            .register_mux_command_with_params(
                 "QUERY_BUTTON",
                 "BUTTON",
                 Some(&self.name),
                 handler,
                 Some(QUERY_BUTTON_HELP),
+                &[],
             )
             .map_err(ConfigError::new)?;
         Ok(())

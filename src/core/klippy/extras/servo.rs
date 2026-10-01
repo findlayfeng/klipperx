@@ -181,12 +181,15 @@ impl PrinterServo {
             sync(move |gcmd| cmd_set_servo(&pwm, &value_slot, geometry, gcmd))
         };
         gcode
-            .register_mux_command(
+            // `WIDTH` and `ANGLE` are the two keys `cmd_set_servo` reads (in
+            // that order); the mux `SERVO` key is prepended by the registrar.
+            .register_mux_command_with_params(
                 "SET_SERVO",
                 "SERVO",
                 Some(&name),
                 handler,
                 Some("Set servo angle"),
+                &["WIDTH", "ANGLE"],
             )
             .map_err(|err| ConfigError::new(format!("{identifier}: {err}")))?;
 

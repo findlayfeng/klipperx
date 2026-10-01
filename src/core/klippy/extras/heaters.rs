@@ -566,12 +566,13 @@ impl PrinterHeaters {
             heater.set_temp(target)
         });
         gcode
-            .register_mux_command(
+            .register_mux_command_with_params(
                 "SET_HEATER_TEMPERATURE",
                 "HEATER",
                 Some(short_name),
                 handler,
                 Some("Set a heater temperature"),
+                &["TARGET"],
             )
             .map_err(ConfigError::new)
     }

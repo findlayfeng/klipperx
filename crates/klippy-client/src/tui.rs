@@ -234,8 +234,9 @@ struct App {
     /// log's — but only that one: a later, typed `info` is the user's, and it
     /// belongs in the log like any other reply.
     greeted: bool,
-    /// How message bodies are shown: YAML by default, JSON on demand.
-    format: Format,
+    /// How the window renders an entry: the body format plus whether g-code
+    /// mode strips the API envelope off `gcode/script` traffic.
+    render: Render,
 }
 
 /// What the header says about the connection.
@@ -259,6 +260,30 @@ enum Format {
     Json,
 }
 
+/// How the window renders an entry.
+///
+/// The body format (YAML or JSON) is one axis; whether g-code mode strips the
+/// API envelope off `gcode/script` traffic is the other. The two are kept
+/// together because every rendering path needs both at once, and a change to
+/// either one re-wraps the whole log — which is why [`Heights`] stores the pair
+/// it was measured at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct Render {
+    /// How to show a message body.
+    format: Format,
+    /// Whether g-code mode is on, so `gcode/script` traffic shows as the bare
+    /// G-Code exchange rather than the API envelope.
+    gcode: bool,
+}
+
+impl Render {
+    /// YAML bodies, request mode: the default view.
+    const DEFAULT: Self = Self {
+        format: Format::Yaml,
+        gcode: false,
+    };
+}
+
 impl App {
     fn new() -> Self {
         Self {
@@ -279,7 +304,7 @@ impl App {
             gcode: false,
             gcode_subscribed: false,
             greeted: false,
-            format: Format::Yaml,
+            render: Render::DEFAULT,
         }
     }
 
@@ -318,10 +343,16 @@ impl App {
     }
 
     /// Flip between request mode and g-code mode.
+    ///
+    /// The render option is kept in step with [`App::gcode`] so the whole log
+    /// re-wraps on the switch: in g-code mode a past `gcode/script` exchange
+    /// is shown as the bare script and output, which takes a different number
+    /// of lines than its envelope did.
     fn toggle_gcode(&mut self) {
         self.gcode = !self.gcode;
+        self.render.gcode = self.gcode;
         let text = if self.gcode {
-            "g-code mode: typed lines go to gcode/script (^G or .gcode to leave)"
+            "g-code mode: typed lines go to gcode/script, output shown raw (^G or .gcode to leave)"
         } else {
             "request mode: typed lines are requests"
         };
@@ -356,7 +387,7 @@ impl App {
         // slide the selection off what it was drawn around. So the view freezes
         // — the offset grows, and the same lines stay where they are.
         let width = self.width.get().max(1);
-        let height = entry_height(&entry, width, self.format);
+        let height = entry_height(&entry, width, self.render);
         let added = if self.scroll > 0 || !self.mouse {
             height
         } else {
@@ -370,10 +401,10 @@ impl App {
         // without re-wrapping it.
         let mut measured = self.heights.borrow_mut();
         if measured.width != width
-            || measured.format != self.format
+            || measured.render != self.render
             || measured.heights.len() != self.entries.len()
         {
-            measured.remeasure(&self.entries, width, self.format);
+            measured.remeasure(&self.entries, width, self.render);
         }
 
         self.entries.push(entry);
@@ -502,17 +533,17 @@ impl App {
     ///
     /// Wrapping is the only reason this differs from `entries.len()`, and it is
     /// not free, so the per-entry heights are kept and only measured again when
-    /// the pane width, the body format, or the set of entries changed.
+    /// the pane width, the render options, or the set of entries changed.
     fn total_lines(&self, width: usize) -> usize {
         let width = width.max(1);
         let mut measured = self.heights.borrow_mut();
         // The heights parallel the entries; if anything emptied one without the
         // other (`Ctrl+L`), the two disagree and the log is measured again.
         if measured.width != width
-            || measured.format != self.format
+            || measured.render != self.render
             || measured.heights.len() != self.entries.len()
         {
-            measured.remeasure(&self.entries, width, self.format);
+            measured.remeasure(&self.entries, width, self.render);
         }
         measured.total
     }
@@ -535,12 +566,12 @@ impl App {
                 true
             }
             ".yaml" | ".json" => {
-                self.format = if line.trim() == ".json" {
+                self.render.format = if line.trim() == ".json" {
                     Format::Json
                 } else {
                     Format::Yaml
                 };
-                let name = match self.format {
+                let name = match self.render.format {
                     Format::Yaml => "YAML",
                     Format::Json => "JSON",
                 };
@@ -663,8 +694,56 @@ impl Output for App {
             }
             _ => (),
         }
+        // G-code mode strips the API envelope down to the G-Code exchange
+        // itself: the `gcode/script` request and the `gcode:output` push are
+        // rewritten by the renderer, and the *successful* `gcode/*` plumbing —
+        // the subscription, the restarts, the script's own `{}` reply — is
+        // dropped, because a notice or the output subscription already said
+        // what it did. Failures are kept: see [`gcode_suppress`].
+        if self.gcode && gcode_suppress(&entry) {
+            return;
+        }
         self.push(entry);
     }
+}
+
+/// Whether g-code mode drops `entry` from the log entirely.
+///
+/// The `gcode/script` request and the `gcode:output` push are kept — the
+/// renderer rewrites them into the bare G-Code exchange — so they are not
+/// suppressed. What is suppressed is the *successful* plumbing around them: the
+/// `{}` reply to `gcode/script` (the output subscription already carried the
+/// result) and the `gcode/*` requests whose effect a notice announced (the
+/// subscription, the restarts).
+///
+/// A failure is never suppressed. A command error normally arrives twice — as a
+/// `!!` line on the output subscription and as the reply's `error` — but when no
+/// dispatcher is up yet, `gcode/subscribe_output` fails too, so there is no
+/// subscription and the reply is the only place the error appears.
+fn gcode_suppress(entry: &Entry) -> bool {
+    match entry {
+        // `gcode/script` is the user's line, so its request is shown; only its
+        // successful reply is dropped, since the output subscription carries
+        // the result.
+        Entry::Sent { method, .. } => is_gcode_plumbing_method(method),
+        Entry::Reply(reply) => {
+            !reply.is_error()
+                && reply.method.as_deref().is_some_and(|method| {
+                    method == "gcode/script" || is_gcode_plumbing_method(method)
+                })
+        }
+        _ => false,
+    }
+}
+
+/// Whether `method` is a `gcode/*` endpoint other than `gcode/script`.
+///
+/// `gcode/script` is the one the user drives, so its request is shown (as the
+/// typed script); the rest — `gcode/subscribe_output`, `gcode/restart`,
+/// `gcode/firmware_restart` — is plumbing the window or a local command asked
+/// for, and a notice already said what it did.
+fn is_gcode_plumbing_method(method: &str) -> bool {
+    method.starts_with("gcode/") && method != "gcode/script"
 }
 
 /// A string field of a JSON object, or `?`.
@@ -1105,13 +1184,14 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
 /// it would be the most expensive thing the window does — the log is capped at
 /// [`LOG_LIMIT`] entries, so it is not a small number. The heights are therefore
 /// kept: one entry per [`App::push`], the whole log only when the pane width or
-/// body format changes, since either one re-wraps everything.
+/// the render options change, since either one re-wraps everything.
 #[derive(Default)]
 struct Heights {
     /// The pane width these heights were measured at (0 = never measured).
     width: usize,
-    /// The body format they were measured in.
-    format: Format,
+    /// The render options they were measured in: the body format plus whether
+    /// g-code mode strips the `gcode/script` envelope.
+    render: Render,
     /// One height per entry, parallel to `App::entries`.
     heights: Vec<usize>,
     /// The sum of `heights`.
@@ -1119,13 +1199,13 @@ struct Heights {
 }
 
 impl Heights {
-    fn remeasure(&mut self, entries: &[Entry], width: usize, format: Format) {
+    fn remeasure(&mut self, entries: &[Entry], width: usize, render: Render) {
         self.width = width;
-        self.format = format;
+        self.render = render;
         self.heights.clear();
         self.total = 0;
         for entry in entries {
-            let height = entry_height(entry, width, format);
+            let height = entry_height(entry, width, render);
             self.heights.push(height);
             self.total += height;
         }
@@ -1146,8 +1226,8 @@ impl Heights {
 /// The renderer lays text out exactly this way, so this is both the scrollbar's
 /// arithmetic and what keeps a pinned viewport over the same lines when new
 /// output arrives.
-fn entry_height(entry: &Entry, width: usize, format: Format) -> usize {
-    wrap(&entry_text(entry, format), width.max(1)).len()
+fn entry_height(entry: &Entry, width: usize, render: Render) -> usize {
+    wrap(&entry_text(entry, render), width.max(1)).len()
 }
 
 /// Where a viewport starting at `first` belongs on the scrollbar's track.
@@ -1203,8 +1283,8 @@ fn visible_lines(app: &App, width: usize, height: usize, total: usize) -> Viewpo
         } else {
             0
         };
-        let style = entry_style(entry, index);
-        let wrapped = wrap(&entry_text(entry, app.format), width);
+        let style = entry_style(entry, index, app.render);
+        let wrapped = wrap(&entry_text(entry, app.render), width);
         for (position, text) in wrapped.into_iter().enumerate().rev() {
             lines.push(entry_line(entry, text, position == 0, style));
             if lines.len() >= cap {
@@ -1267,7 +1347,13 @@ fn entry_line(entry: &Entry, text: String, first: bool, style: Style) -> Line<'s
 /// look alike however many log lines sit between them. A failed request is red
 /// instead: it is the one thing that must not blend in. Log lines and notices
 /// keep their own colours.
-fn entry_style(entry: &Entry, message_index: usize) -> Style {
+fn entry_style(entry: &Entry, message_index: usize, render: Render) -> Style {
+    // In g-code mode the stripped exchange reads like a terminal: the typed
+    // line and the printer's reply share one steady hue, so the pane does not
+    // flicker between cyan and white on every line of output.
+    if render.gcode && (gcode_script_sent(entry).is_some() || gcode_output_line(entry).is_some()) {
+        return Style::new().fg(Color::White);
+    }
     match entry {
         // A failed request is the thing the user has to notice.
         Entry::Reply(reply) if reply.is_error() => Style::new().fg(Color::Red),
@@ -1311,6 +1397,10 @@ fn entry_style(entry: &Entry, message_index: usize) -> Style {
 const MESSAGE_COLORS: [Color; 2] = [Color::Cyan, Color::White];
 
 /// Whether an entry is a message, rather than the window talking to itself.
+///
+/// A stripped `gcode/script` request and a `gcode:output` push are messages like
+/// any other; they count toward the colour alternation, though a g-code exchange
+/// is drawn in one steady colour (see [`entry_style`]).
 fn is_message(entry: &Entry) -> bool {
     matches!(entry, Entry::Sent { .. } | Entry::Reply(_) | Entry::Push(_))
 }
@@ -1323,13 +1413,65 @@ fn is_message(entry: &Entry) -> bool {
 /// a sentence (an error, a notice, a log line) is left to [`Entry::text`]; the
 /// line front-end uses that for all of it, deliberately: it wants one compact
 /// JSON line per event.
-fn entry_text(entry: &Entry, format: Format) -> String {
+///
+/// In g-code mode the `gcode/script` envelope is stripped: the typed script is
+/// shown behind a `>` (the direction a G-Code line travels), and a
+/// `gcode:output` push is shown as the bare `response` line the printer wrote —
+/// no `<` marker, no `method`/`params` scaffolding — so the pane reads like a
+/// G-Code terminal rather than a wire dump. Other traffic keeps its envelope.
+fn entry_text(entry: &Entry, render: Render) -> String {
+    if render.gcode {
+        if let Some(script) = gcode_script_sent(entry) {
+            return format!("> {script}");
+        }
+        if let Some(line) = gcode_output_line(entry) {
+            return line.to_string();
+        }
+    }
     match entry {
-        Entry::Sent { message, .. } => marked('>', &body(message, format)),
-        Entry::Reply(reply) if !reply.is_error() => marked('<', &body(&reply.message, format)),
-        Entry::Push(message) => marked('<', &body(message, format)),
+        Entry::Sent { message, .. } => marked('>', &body(message, render.format)),
+        Entry::Reply(reply) if !reply.is_error() => {
+            marked('<', &body(&reply.message, render.format))
+        }
+        Entry::Push(message) => marked('<', &body(message, render.format)),
         other => other.text(),
     }
+}
+
+/// The `script` parameter of a `gcode/script` request this client sent, when
+/// that is what the entry is.
+///
+/// G-code mode shows the typed script rather than the `gcode/script` envelope,
+/// so this is what picks it out of a [`Entry::Sent`].
+fn gcode_script_sent(entry: &Entry) -> Option<&str> {
+    let Entry::Sent { message, .. } = entry else {
+        return None;
+    };
+    if message.get("method").and_then(Value::as_str) != Some("gcode/script") {
+        return None;
+    }
+    message
+        .get("params")
+        .and_then(|p| p.get("script"))
+        .and_then(Value::as_str)
+}
+
+/// The `response` line a `gcode:output` push carried, when that is what the
+/// entry is.
+///
+/// G-code mode shows the printer's own output line rather than the push
+/// envelope, so this is what picks it out of a [`Entry::Push`].
+fn gcode_output_line(entry: &Entry) -> Option<&str> {
+    let Entry::Push(message) = entry else {
+        return None;
+    };
+    if message.get("method").and_then(Value::as_str) != Some("gcode:output") {
+        return None;
+    }
+    message
+        .get("params")
+        .and_then(|p| p.get("response"))
+        .and_then(Value::as_str)
 }
 
 /// Put a `<`/`>` marker in front of a body, indenting the rest under it.
@@ -2385,6 +2527,403 @@ mod tests {
     }
 
     #[test]
+    fn test_gcode_mode_strips_the_script_envelope_to_the_typed_line() {
+        // The `gcode/script` request shows as the bare G-Code line, not the
+        // `gcode/script` envelope — the pane reads like a G-Code terminal.
+        let entry = Entry::Sent {
+            id: Some(2),
+            method: "gcode/script".to_string(),
+            message: serde_json::json!({
+                "id": 2,
+                "method": "gcode/script",
+                "params": {"script": "SET_PIN PIN=fan VALUE=1"}
+            }),
+        };
+
+        assert_eq!(
+            entry_text(
+                &entry,
+                Render {
+                    format: Format::Yaml,
+                    gcode: true
+                }
+            ),
+            "> SET_PIN PIN=fan VALUE=1"
+        );
+        // Request mode keeps the envelope, so the same entry is unchanged.
+        assert!(
+            entry_text(&entry, Render::DEFAULT).starts_with("> id: 2\n  method: gcode/script"),
+            "request mode keeps the envelope"
+        );
+    }
+
+    #[test]
+    fn test_gcode_mode_shows_output_pushes_as_the_bare_response_line() {
+        // A `gcode:output` push is the printer's own line (`// …`, `!! …`), so
+        // g-code mode shows that line alone — no `<` marker, no `method`/
+        // `params` scaffolding.
+        let entry = Entry::Push(serde_json::json!({
+            "id": null,
+            "method": "gcode:output",
+            "params": {"response": "// echo: SET_PIN PIN=fan VALUE=1"}
+        }));
+
+        assert_eq!(
+            entry_text(
+                &entry,
+                Render {
+                    format: Format::Yaml,
+                    gcode: true
+                }
+            ),
+            "// echo: SET_PIN PIN=fan VALUE=1"
+        );
+        // Request mode keeps the envelope behind a `<` marker.
+        assert!(
+            entry_text(&entry, Render::DEFAULT).contains("method: gcode:output"),
+            "request mode keeps the envelope"
+        );
+    }
+
+    #[test]
+    fn test_gcode_mode_drops_only_successful_script_and_plumbing_replies() {
+        // The empty `{}` reply to `gcode/script` carries nothing the output
+        // push did not already show, so it is dropped in g-code mode.
+        let script_reply = Entry::Reply(crate::connection::Reply {
+            id: serde_json::json!(2),
+            method: Some("gcode/script".to_string()),
+            message: serde_json::json!({"id": 2, "result": {}}),
+        });
+        // A failed `gcode/script` is kept. Normally the `!! …` output line is
+        // the thing to read, but with no dispatcher up there is no output
+        // subscription at all, and this reply is the only error there is.
+        let script_error = Entry::Reply(crate::connection::Reply {
+            id: serde_json::json!(3),
+            method: Some("gcode/script".to_string()),
+            message: serde_json::json!({
+                "id": 3,
+                "error": {"error": "WebRequestError", "message": "Printer is halted"}
+            }),
+        });
+        // The subscription's request and empty reply are plumbing a notice
+        // already announced, so they are dropped as well.
+        let sub_sent = Entry::Sent {
+            id: Some(1),
+            method: "gcode/subscribe_output".to_string(),
+            message: serde_json::json!({
+                "id": 1,
+                "method": "gcode/subscribe_output",
+                "params": {"response_template": {"method": "gcode:output"}}
+            }),
+        };
+        let sub_reply = Entry::Reply(crate::connection::Reply {
+            id: serde_json::json!(1),
+            method: Some("gcode/subscribe_output".to_string()),
+            message: serde_json::json!({"id": 1, "result": {}}),
+        });
+        // Its failure is not dropped: "the printer has no dispatcher yet" is
+        // exactly the error no output line can carry.
+        let sub_error = Entry::Reply(crate::connection::Reply {
+            id: serde_json::json!(1),
+            method: Some("gcode/subscribe_output".to_string()),
+            message: serde_json::json!({
+                "id": 1,
+                "error": {"error": "CommandError", "message": "Printer is not ready"}
+            }),
+        });
+
+        assert!(gcode_suppress(&script_reply), "the script reply is dropped");
+        assert!(
+            !gcode_suppress(&script_error),
+            "a failed script reply is kept"
+        );
+        assert!(
+            gcode_suppress(&sub_sent),
+            "the subscription request is dropped"
+        );
+        assert!(
+            gcode_suppress(&sub_reply),
+            "the subscription reply is dropped"
+        );
+        assert!(
+            !gcode_suppress(&sub_error),
+            "a failed subscription reply is kept"
+        );
+    }
+
+    #[test]
+    fn test_gcode_mode_keeps_a_failed_subscription_in_the_log() {
+        // End to end, the dispatcher-less case: the subscription fails, so the
+        // `gcode:output` push never comes and the only trace of the problem is
+        // the error reply — which must therefore reach the pane.
+        let mut app = app_with(Vec::new());
+        app.gcode = true;
+        app.render.gcode = true;
+
+        app.write(Entry::Sent {
+            id: Some(1),
+            method: "gcode/subscribe_output".to_string(),
+            message: serde_json::json!({
+                "id": 1,
+                "method": "gcode/subscribe_output",
+                "params": {"response_template": {"method": "gcode:output"}}
+            }),
+        });
+        app.write(Entry::Reply(crate::connection::Reply {
+            id: serde_json::json!(1),
+            method: Some("gcode/subscribe_output".to_string()),
+            message: serde_json::json!({
+                "id": 1,
+                "error": {"error": "CommandError", "message": "Printer is not ready"}
+            }),
+        }));
+
+        let joined = log_text(&app, 60, 8).join("\n");
+        assert!(
+            joined.contains("Printer is not ready"),
+            "the error is visible: {joined}"
+        );
+        assert!(
+            !joined.contains("method: gcode/subscribe_output"),
+            "but not as an envelope: {joined}"
+        );
+    }
+
+    #[test]
+    fn test_request_mode_shows_the_gcode_plumbing_the_window_sends() {
+        // The stripping is g-code mode's alone: entering the mode sends
+        // `gcode/subscribe_output` itself, so in request mode the same request
+        // and reply are ordinary entries behind their envelopes.
+        let mut app = app_with(Vec::new());
+        assert!(!app.gcode, "the window starts in request mode");
+
+        app.write(Entry::Sent {
+            id: Some(1),
+            method: "gcode/subscribe_output".to_string(),
+            message: serde_json::json!({
+                "id": 1,
+                "method": "gcode/subscribe_output",
+                "params": {"response_template": {"method": "gcode:output"}}
+            }),
+        });
+        app.write(Entry::Reply(crate::connection::Reply {
+            id: serde_json::json!(1),
+            method: Some("gcode/subscribe_output".to_string()),
+            message: serde_json::json!({"id": 1, "result": {}}),
+        }));
+
+        assert_eq!(app.entries.len(), 2, "nothing is dropped in request mode");
+        let joined = log_text(&app, 60, 12).join("\n");
+        assert!(
+            joined.contains("method: gcode/subscribe_output"),
+            "the envelope stays: {joined}"
+        );
+    }
+
+    #[test]
+    fn test_changing_the_render_options_remeasures_the_log() {
+        // The measured heights are keyed on the render options, not only on the
+        // pane width: the same entry is shorter once its envelope is stripped,
+        // so flipping the option has to throw the cached heights away. The
+        // width is set first so the render options are the *only* key that
+        // differs between the two measurements.
+        let mut app = app_with(Vec::new());
+        app.width.set(60);
+        app.write(Entry::Sent {
+            id: Some(2),
+            method: "gcode/script".to_string(),
+            message: serde_json::json!({
+                "id": 2,
+                "method": "gcode/script",
+                "params": {"script": "M115"}
+            }),
+        });
+
+        assert_eq!(app.total_lines(60), 4, "the envelope, at 60 columns");
+
+        // Flipping the option changes no entry and no width: only the render
+        // key can force the log to be measured again.
+        app.render.gcode = true;
+        assert_eq!(app.total_lines(60), 1, "stripped to the typed line");
+    }
+
+    #[test]
+    fn test_gcode_mode_keeps_the_script_request_and_output_push() {
+        // The `gcode/script` request and the `gcode:output` push are the
+        // exchange itself, so they are kept — the renderer rewrites them.
+        let script_sent = Entry::Sent {
+            id: Some(2),
+            method: "gcode/script".to_string(),
+            message: serde_json::json!({
+                "id": 2,
+                "method": "gcode/script",
+                "params": {"script": "M115"}
+            }),
+        };
+        let output_push = Entry::Push(serde_json::json!({
+            "id": null,
+            "method": "gcode:output",
+            "params": {"response": "FIRMWARE_NAME: Klipper"}
+        }));
+
+        assert!(!gcode_suppress(&script_sent), "the script request is kept");
+        assert!(!gcode_suppress(&output_push), "the output push is kept");
+    }
+
+    #[test]
+    fn test_gcode_mode_does_not_touch_other_channels() {
+        // A `klippy:status` push and an `objects/query` reply are not g-code
+        // traffic, so g-code mode leaves them alone: still shown, still behind
+        // their envelopes.
+        let status = Entry::Push(serde_json::json!({
+            "method": "klippy:status",
+            "params": {"status": {"webhooks": {"state": "ready"}}}
+        }));
+        let query = Entry::Reply(crate::connection::Reply {
+            id: serde_json::json!(4),
+            method: Some("objects/query".to_string()),
+            message: serde_json::json!({"id": 4, "result": {}}),
+        });
+
+        assert!(
+            !gcode_suppress(&status),
+            "a status push is never suppressed"
+        );
+        assert!(!gcode_suppress(&query), "a query reply is never suppressed");
+        assert!(
+            entry_text(
+                &status,
+                Render {
+                    format: Format::Yaml,
+                    gcode: true
+                }
+            )
+            .starts_with("< method: klippy:status"),
+            "non-g-code traffic keeps its envelope in g-code mode"
+        );
+    }
+
+    #[test]
+    fn test_gcode_mode_renders_the_exchange_without_the_envelope() {
+        // End to end: a script request, its output push, and the plumbing the
+        // window drops, all written through `Output` in g-code mode. The pane
+        // shows the typed line and the printer's reply, and nothing else from
+        // the `gcode/*` plumbing.
+        let mut app = app_with(Vec::new());
+        app.gcode = true;
+        app.render.gcode = true;
+
+        app.write(Entry::Sent {
+            id: Some(1),
+            method: "gcode/subscribe_output".to_string(),
+            message: serde_json::json!({
+                "id": 1,
+                "method": "gcode/subscribe_output",
+                "params": {"response_template": {"method": "gcode:output"}}
+            }),
+        });
+        app.write(Entry::Reply(crate::connection::Reply {
+            id: serde_json::json!(1),
+            method: Some("gcode/subscribe_output".to_string()),
+            message: serde_json::json!({"id": 1, "result": {}}),
+        }));
+        app.write(Entry::Sent {
+            id: Some(2),
+            method: "gcode/script".to_string(),
+            message: serde_json::json!({
+                "id": 2,
+                "method": "gcode/script",
+                "params": {"script": "M115"}
+            }),
+        });
+        app.write(Entry::Reply(crate::connection::Reply {
+            id: serde_json::json!(2),
+            method: Some("gcode/script".to_string()),
+            message: serde_json::json!({"id": 2, "result": {}}),
+        }));
+        app.write(Entry::Push(serde_json::json!({
+            "id": null,
+            "method": "gcode:output",
+            "params": {"response": "FIRMWARE_NAME: Klipper"}
+        })));
+
+        let lines = log_text(&app, 60, 8);
+        let joined = lines.join("\n");
+        assert!(joined.contains("> M115"), "the typed line: {joined}");
+        assert!(
+            joined.contains("FIRMWARE_NAME: Klipper"),
+            "the output: {joined}"
+        );
+        assert!(!joined.contains("gcode/script"), "no envelope: {joined}");
+        assert!(
+            !joined.contains("gcode:output"),
+            "no push envelope: {joined}"
+        );
+        assert!(
+            !joined.contains("subscribe_output"),
+            "no plumbing: {joined}"
+        );
+    }
+
+    #[test]
+    fn test_request_mode_after_gcode_shows_the_envelope_again() {
+        // Toggling back to request mode re-wraps the log, so the same `gcode/
+        // script` exchange shows its envelope again.
+        let mut app = app_with(Vec::new());
+        app.gcode = true;
+        app.render.gcode = true;
+        app.write(Entry::Sent {
+            id: Some(2),
+            method: "gcode/script".to_string(),
+            message: serde_json::json!({
+                "id": 2,
+                "method": "gcode/script",
+                "params": {"script": "M115"}
+            }),
+        });
+
+        // G-code mode: the bare typed line.
+        let gcode_lines = log_text(&app, 60, 6);
+        assert!(gcode_lines.join("\n").contains("> M115"));
+
+        // Back to request mode: the envelope returns.
+        app.toggle_gcode();
+        let request_lines = log_text(&app, 60, 6);
+        let joined = request_lines.join("\n");
+        assert!(
+            joined.contains("method: gcode/script"),
+            "envelope is back: {joined}"
+        );
+    }
+
+    #[test]
+    fn test_gcode_mode_gives_the_exchange_one_steady_colour() {
+        // The typed line and the output share one hue, so the pane does not
+        // flicker between cyan and white on every line of G-Code output.
+        let script = Entry::Sent {
+            id: Some(2),
+            method: "gcode/script".to_string(),
+            message: serde_json::json!({
+                "id": 2,
+                "method": "gcode/script",
+                "params": {"script": "M115"}
+            }),
+        };
+        let output = Entry::Push(serde_json::json!({
+            "id": null,
+            "method": "gcode:output",
+            "params": {"response": "FIRMWARE_NAME: Klipper"}
+        }));
+        let render = Render {
+            format: Format::Yaml,
+            gcode: true,
+        };
+
+        assert_eq!(entry_style(&script, 0, render).fg, Some(Color::White));
+        assert_eq!(entry_style(&output, 1, render).fg, Some(Color::White));
+    }
+
+    #[test]
     fn test_a_message_alternates_between_two_colours() {
         let sent = Entry::Sent {
             id: Some(1),
@@ -2406,26 +2945,32 @@ mod tests {
         };
 
         // One colour, the other, and back again.
-        assert_eq!(entry_style(&sent, 0).fg, Some(MESSAGE_COLORS[0]));
         assert_eq!(
-            entry_style(&Entry::Push(serde_json::json!({})), 1).fg,
+            entry_style(&sent, 0, Render::DEFAULT).fg,
+            Some(MESSAGE_COLORS[0])
+        );
+        assert_eq!(
+            entry_style(&Entry::Push(serde_json::json!({})), 1, Render::DEFAULT).fg,
             Some(MESSAGE_COLORS[1])
         );
         assert_eq!(
-            entry_style(&Entry::Reply(ok), 2).fg,
+            entry_style(&Entry::Reply(ok), 2, Render::DEFAULT).fg,
             Some(MESSAGE_COLORS[0])
         );
 
         // A failed request is red wherever it falls in the alternation.
         assert_eq!(
-            entry_style(&Entry::Reply(failed.clone()), 0).fg,
+            entry_style(&Entry::Reply(failed.clone()), 0, Render::DEFAULT).fg,
             Some(Color::Red)
         );
-        assert_eq!(entry_style(&Entry::Reply(failed), 1).fg, Some(Color::Red));
+        assert_eq!(
+            entry_style(&Entry::Reply(failed), 1, Render::DEFAULT).fg,
+            Some(Color::Red)
+        );
 
         // The window's own lines keep their colours.
         assert_eq!(
-            entry_style(&Entry::notice(Notice::Problem, "x"), 0).fg,
+            entry_style(&Entry::notice(Notice::Problem, "x"), 0, Render::DEFAULT).fg,
             Some(Color::Red)
         );
     }
@@ -2537,7 +3082,7 @@ mod tests {
 
     #[test]
     fn test_a_reply_is_shown_as_yaml_behind_a_marker() {
-        let text = entry_text(&Entry::Reply(query_reply()), Format::Yaml);
+        let text = entry_text(&Entry::Reply(query_reply()), Render::DEFAULT);
 
         assert!(text.starts_with("< id: 2\n  result:\n"), "{text}");
         assert!(text.contains("eventtime: 1.5"), "{text}");
@@ -2548,7 +3093,13 @@ mod tests {
 
     #[test]
     fn test_json_keeps_the_marker_and_the_wire_form() {
-        let text = entry_text(&Entry::Reply(query_reply()), Format::Json);
+        let text = entry_text(
+            &Entry::Reply(query_reply()),
+            Render {
+                format: Format::Json,
+                gcode: false,
+            },
+        );
 
         assert!(text.starts_with("< {\"id\":2,"), "{text}");
         assert!(text.contains("\"mcu_version\":\"abc\""), "{text}");
@@ -2563,7 +3114,7 @@ mod tests {
                 "method": "klippy:status",
                 "params": {"state": "ready"}
             })),
-            Format::Yaml,
+            Render::DEFAULT,
         );
 
         assert!(
@@ -2582,11 +3133,17 @@ mod tests {
         };
 
         assert_eq!(
-            entry_text(&entry, Format::Yaml),
+            entry_text(&entry, Render::DEFAULT),
             "> id: 2\n  method: objects/query"
         );
         assert_eq!(
-            entry_text(&entry, Format::Json),
+            entry_text(
+                &entry,
+                Render {
+                    format: Format::Json,
+                    gcode: false
+                }
+            ),
             "> {\"id\":2,\"method\":\"objects/query\"}"
         );
     }
@@ -2604,7 +3161,13 @@ mod tests {
 
         for format in [Format::Yaml, Format::Json] {
             assert_eq!(
-                entry_text(&Entry::Reply(reply.clone()), format),
+                entry_text(
+                    &Entry::Reply(reply.clone()),
+                    Render {
+                        format,
+                        gcode: false
+                    }
+                ),
                 "! 3 (gcode/script) Printer is halted"
             );
         }
@@ -2613,12 +3176,12 @@ mod tests {
     #[test]
     fn test_the_format_command_switches_and_says_so() {
         let mut app = app_with(Vec::new());
-        assert_eq!(app.format, Format::Yaml, "YAML is the default");
+        assert_eq!(app.render.format, Format::Yaml, "YAML is the default");
 
         assert!(app.window_command(".json"));
-        assert_eq!(app.format, Format::Json);
+        assert_eq!(app.render.format, Format::Json);
         assert!(app.window_command(".yaml"));
-        assert_eq!(app.format, Format::Yaml);
+        assert_eq!(app.render.format, Format::Yaml);
         assert!(
             !app.window_command(".subscribe"),
             "the session's own command"
@@ -2721,6 +3284,7 @@ mod tests {
                     text: String::new(),
                 },
                 0,
+                Render::DEFAULT,
             )
         };
 
@@ -2753,7 +3317,7 @@ mod tests {
             level: LogLevel::Info,
             text: "API server listening".to_string(),
         };
-        let style = entry_style(&entry, 0);
+        let style = entry_style(&entry, 0, Render::DEFAULT);
 
         // The tag `entry_text` wrote, then the line itself, plain.
         let line = entry_line(
@@ -2779,7 +3343,7 @@ mod tests {
             &message,
             "< method: a".to_string(),
             true,
-            entry_style(&message, 0),
+            entry_style(&message, 0, Render::DEFAULT),
         );
         assert_eq!(line.spans.len(), 1);
         assert_eq!(line.spans[0].style.fg, Some(MESSAGE_COLORS[0]));

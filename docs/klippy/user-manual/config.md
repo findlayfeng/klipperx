@@ -750,7 +750,7 @@ pins: !PD0, PD1, PD2
 | `rename_existing` | — | 被改名的命令（仅 load 期同型检查，连接期换名未做） |
 | `variable_<名>` | — | 字面量，`get_status` 可见（只读） |
 
-宏即命令（大写注册）；**宏体已渲染执行**（渲染引擎是 `extras/template.rs` 的 **minijinja 2.24 适配层**：单花括号定界符 `{`/`{%`/`{#}`、缺键即报错、装载期编译，渲染后经 gcode 派发）；`SET_GCODE_VARIABLE` 已注册（变量可写）；裸 `[gcode_macro]` 为共享模板持有者（零选项）。`{% set %}` 作用域对齐 Jinja2 3.1.6（顶层/`if` 块外泄、`for` 块不外泄）；`namespace()`、关键字实参、`{% block %}`、`|float(默认)` 等 Jinja2 构型均可解析（仓库同名 `config.cfg` 的三个步进宏即实测用例）。仍缺的在缝上：`rename_existing` 连接期换名与读 `printer.objects`。与 Jinja2 的已知差异（`%`/`//` 为欧几里得取余、Strict 下缺键在打印/迭代/判真时报错、部分错误 detail 措辞）见 `extras/template.rs` 模块文档。
+宏即命令（大写注册）；**宏体已渲染执行**（渲染引擎是 `extras/template.rs` 的 **minijinja 2.24 适配层**：单花括号定界符 `{`/`{%`/`{#}`、缺键即报错、装载期编译，渲染后经 gcode 派发）；`SET_GCODE_VARIABLE` 已注册（变量可写）；裸 `[gcode_macro]` 为共享模板持有者（零选项）。`{% set %}` 作用域对齐 Jinja2 3.1.6（顶层/`if` 块外泄、`for` 块不外泄）；`namespace()`、关键字实参、`{% block %}`、`|float(默认)` 等 Jinja2 构型均可解析（`template.rs` 的三个步进宏字面用例即实测：`namespace(phase=0)`、`{% set count.phase %}`、if/elif 链、for+range、`G4 P` 值与 DIR 正反转）。仍缺的在缝上：`rename_existing` 连接期换名与读 `printer.objects`。与 Jinja2 的已知差异（`%`/`//` 为欧几里得取余、Strict 下缺键在打印/迭代/判真时报错、部分错误 detail 措辞）见 `extras/template.rs` 模块文档。
 
 ### [led <name>] / [neopixel <name>] / [dotstar <name>] / [pca9533 <name>] / [pca9632 <name>] / [display_template <name>]
 

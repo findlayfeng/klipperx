@@ -168,6 +168,19 @@ impl Connection {
         !self.pending.is_empty()
     }
 
+    /// Stop treating `id` as owing a reply.
+    ///
+    /// A caller that gave up waiting for a reply — a timeout wrapped around
+    /// [`Connection::receive`], say — has to say so here, or the request stays
+    /// outstanding for the rest of the connection: [`Connection::has_pending`]
+    /// would stay true, and a reader on its way out would wait out its grace
+    /// for an answer that is too late to use. The reply is not lost by this — a
+    /// late one is still read, just without the method label this table would
+    /// have given it. An `id` that is not outstanding does nothing.
+    pub fn forget_pending(&mut self, id: u64) {
+        self.pending.remove(&id.to_string());
+    }
+
     /// The last `id` issued, or 0 before the first request.
     ///
     /// A reply carries this id, so a caller that did not keep the return value
@@ -536,6 +549,50 @@ mod tests {
             .await
             .unwrap();
         assert!(!connection.has_pending());
+
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn test_a_forgotten_request_is_no_longer_owed() {
+        let path = SocketPath::new("forget");
+        let task = serve(&path).await;
+        let mut connection = connect(&path).await;
+
+        let id = connection.request("echo", Map::new()).await.unwrap();
+        assert!(connection.has_pending(), "a request owes a reply");
+        assert!(connection.pending.contains_key(&id.to_string()));
+
+        connection.forget_pending(id);
+        assert!(!connection.has_pending());
+        assert!(!connection.pending.contains_key(&id.to_string()));
+
+        // Forgetting an `id` that was never outstanding is nothing to do.
+        connection.forget_pending(id + 100);
+        assert!(!connection.has_pending());
+
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn test_a_reply_to_a_forgotten_id_is_still_read_unlabelled() {
+        // A caller that timed out forgets the id, but the server's answer may
+        // still be on its way. Forgetting must not turn it into a push — it is
+        // still a reply, read and handed out like any other — and the method
+        // label is the only thing that goes with the id.
+        let path = SocketPath::new("forgetreply");
+        let task = serve(&path).await;
+        let mut connection = connect(&path).await;
+
+        let id = connection.request("echo", Map::new()).await.unwrap();
+        connection.forget_pending(id);
+
+        let reply = match connection.receive().await.unwrap() {
+            Incoming::Reply(reply) => reply,
+            other => panic!("expected a reply, got {other:?}"),
+        };
+        assert_eq!(reply.id, json!(id));
+        assert_eq!(reply.method, None, "the label went with the id");
 
         task.abort();
     }

@@ -217,7 +217,8 @@ Enter send · Tab complete · ↑↓ history · PgUp/PgDn log · ^G g-code · Es
   的内建命令（`M115`、`M110`、`ECHO` …）也在里面**（主机的 `gcode/help` 只有带描述的那部分，
   会漏掉它们，补全不用它）。进入 g-code 模式时拉一次，
   **没得到答案就会一直补问**（按 `Tab` 会再问一次）——`ready` 不是前提：状态行只反映窗口**收到过的**状态（连接时的 `info`、订阅 `webhooks` 时应答里的即时快照，以及之后 `klippy:status` 推送），订阅建立之前它可能还是旧值；匹配大小写不敏感，`m1` 能补到 `M115`，
-  写进去的是打印机自己的拼写。 同一次请求还带回每条命令的 `parameters`（该命令声明过的具名参数），**参数名以它为准**；某条命令没给 `parameters` 时，该命令的参数名取自窗口签入的内建表（`crates/klippy-client/src/gcode_params.rs`，由主机源码的声明生成）。
+  写进去的是打印机自己的拼写。 同一次请求还带回每条命令的 `parameters`（该命令声明过的具名参数），**参数名以它为准**；某条命令没给 `parameters` 时，该命令的参数名取自窗口签入的内建表（`crates/klippy-client/src/gcode_params.rs`，由主机源码的声明生成）。参数名查找**大小写
+不敏感**：主机用小写命令名也能命中它自己的参数，展示仍按主机的拼写。
 
 请求模式下敲裸方法名不补——方法名是主机的，窗口没有那份清单（`/subscribe` 之后
 对象名倒是知道，但那是另一回事）。
@@ -233,8 +234,12 @@ Enter send · Tab complete · ↑↓ history · PgUp/PgDn log · ^G g-code · Es
 **没有候选时会写一行提示**，不会出现「按了没反应又不知道为什么」：本地词会说
 `no local command starts with "/zz"`，g-code 词会说 `no G-Code command starts with "M1x"
 (the printer reports 13 commands)`；打印机**答不上来**（超时/被拒）时，命令名与参数名都退回上面那份内建表，并且
-**每场会话只提示一条** `no G-code parameters from the printer; using the built-in table`；
-打印机答了、但某条命令没给参数名时，那条命令的参数名同样取自内建表（**不**额外提示）。请求模式下敲裸方法名本来就没有清单，
+**每场会话只提示一条** `no G-code parameters from the printer; using the built-in table`。
+主机**答了命令名、但一条命令都没带 `parameters`**（老主机）时同理：参数名退回内建表，
+提示也只发一条（`the printer does not report G-code parameters; using the built-in table`）——
+两类**共用同一个「已提示过」标志**，所以最多一条；而且只在**补参数名**时才会发，补命令名
+不会为「缺参数」报警。主机只给**部分**命令 `parameters` 时，缺的那些命令逐命令**静默**用
+内建表（不提示）；应答里一条命令名都没有时同样静默。请求模式下敲裸方法名本来就没有清单，
 所以那条路保持安静。
 
 日志区最右边一列是滚动条：占满一屏时显示滑块（`█`）与轨道（`│`），停在底部时

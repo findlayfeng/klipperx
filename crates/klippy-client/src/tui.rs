@@ -63,12 +63,14 @@
 //! - The first word of a g-code line completes from the printer's command
 //!   names, as the `gcode` object of `objects/query` lists them. That table is
 //!   asked for the first time g-code mode is entered and asked again on later
-//!   visits until the printer answers: the state the header shows only moves
-//!   when the printer reports a change (see [`event_loop`]), so a printer that
-//!   has not reported `ready` yet is one there is nothing to wait for, and a
-//!   printer that is not up yet refuses the query rather than making it wait,
-//!   so there is nothing to lose by asking. Once answered — even with an empty
-//!   list — it is kept, as the list does not change under a running session.
+//!   visits until the printer answers: the header's state says what the last
+//!   report said, not whether the printer is up (it comes from the handshake's
+//!   `info`, the `objects/subscribe` snapshot and the `klippy:status` pushes
+//!   after it), so a printer that has not reported `ready` yet is one there is
+//!   nothing to wait for, and a printer that is not up yet refuses the query
+//!   rather than making it wait, so there is nothing to lose by asking. Once
+//!   answered — even with an empty list — it is kept, as the list does not
+//!   change under a running session.
 //! - A later word of a g-code line, before its `=`, completes from that
 //!   command's parameter names, which come from the same answer. What follows
 //!   the `=` is a value, and a value is the printer's business: the window has
@@ -78,7 +80,10 @@
 //! Until the printer answers, both the command names and the parameters come
 //! from the built-in table [`gcode_params::BUILTIN`] — generated from this
 //! host's sources, so it is the right list for a printer of this host — and the
-//! first `Tab` that draws on it says so once in the log.
+//! first `Tab` that draws on it says so once in the log. A printer that answers
+//! with commands but names no parameters for any of them — a host older than the
+//! field — leaves the parameters on the table too, and the same one line covers
+//! it.
 //!
 //! One candidate the line does not already spell is simply filled in; one the
 //! line already spells opens the layer on it, so that a `Tab` on a whole name
@@ -272,7 +277,9 @@ struct App {
     /// and the scrollbar drags — and the terminal cannot select text, because it
     /// never sees the drag. `^S` / `/mouse` hands it back.
     mouse: bool,
-    /// The connection's state, shown in the header.
+    /// The connection's state, shown in the header. Set from the handshake's
+    /// `info` reply, from the `objects/subscribe` reply's snapshot and from the
+    /// `klippy:status` pushes after it.
     status: Status,
     /// Set by a local command that asked to leave.
     quit: bool,
@@ -308,7 +315,8 @@ struct App {
     /// Whether the log has been told that a completion drew on the built-in
     /// table (see [`App::warn_about_the_builtin_table`]). One per session, not
     /// one per `Tab`: it is the same fact every time, and the log is for what
-    /// happened.
+    /// happened. The ask going unanswered and a printer that cannot report
+    /// parameters share it, since both leave a completion on the table.
     gcode_fallback_warned: bool,
     /// Whether the handshake's `info` has been answered.
     ///
@@ -470,13 +478,14 @@ impl App {
     /// until it has been answered there is nothing to lose by asking.
     ///
     /// [`Status`] is deliberately not consulted for a `ready` state. The header
-    /// starts at the handshake's `info` reply and is updated from then on only
-    /// by a `webhooks` push, which says what *changed* — so until the printer
-    /// reports one it still holds the connect-time value, and gating on `ready`
-    /// would mean not asking during exactly the wait this is here for. Asking
-    /// instead is cheap — a printer that is not up refuses `objects/query` at
-    /// once rather than making it wait — and a refusal leaves the flag false, so
-    /// the next `Tab` asks again.
+    /// is moved by the handshake's `info` reply, by the `objects/subscribe`
+    /// reply's snapshot and then by the `klippy:status` pushes that report each
+    /// change — none of which is a promise about the printer now, only about
+    /// what the last report said — so gating on `ready` would mean not asking
+    /// during exactly the wait this is here for. Asking instead is cheap — a
+    /// printer that is not up refuses `objects/query` at once rather than
+    /// making it wait — and a refusal leaves the flag false, so the next `Tab`
+    /// asks again.
     fn needs_gcode_commands(&self) -> bool {
         self.gcode && !self.gcode_commands_asked
     }
@@ -2264,27 +2273,58 @@ impl App {
 
     /// Say once that the candidates are the built-in table's, not the printer's.
     ///
-    /// The printer is asked for its command table whenever g-code mode is
-    /// entered and again on every `Tab` until it answers, so by the time a
-    /// completion runs the ask has just been made — and a refusal, which is what
-    /// a printer still coming up sends, is not an answer. Which table the names
-    /// came from is worth one line in the log, and only one: completing a
-    /// command the machine does not have looks exactly like completing from a
-    /// list it does, and a line per `Tab` would bury the log in the same fact.
+    /// Two answers leave a completion on the table, and they share this one
+    /// line: the ask was never answered — a refusal, which is what a printer
+    /// still coming up sends, or no ask at all — or the printer answered with
+    /// commands but named no parameters for any of them, which is a host older
+    /// than the field (see [`App::printer_names_no_parameters`]). The ask is
+    /// made whenever g-code mode is entered and again on every `Tab` until it
+    /// answers, so by the time a completion runs it is a fresh fact.
+    ///
+    /// Which table the names came from is worth one line in the log, and only
+    /// one per session: completing a command the machine does not have looks
+    /// exactly like completing from a list it does, and a line per `Tab` would
+    /// bury the log in the same fact. Which of the two it was is not counted
+    /// either — the reader's business is that the names are not the printer's,
+    /// and a count of `Tab`s says nothing about the printer.
+    ///
+    /// The no-parameters answer is only a parameter completion's business. A
+    /// command name comes from the printer's own list there, so a line about
+    /// parameters would name the wrong thing.
     fn warn_about_the_builtin_table(&mut self, target: &Target) {
         if !self.gcode
-            || self.gcode_commands_asked
             || self.gcode_fallback_warned
             // A local word is the window's own list, and needs no printer.
             || target.is_local()
         {
             return;
         }
+        let text = if self.gcode_commands_asked {
+            if !matches!(target, Target::Parameter { .. }) || !self.printer_names_no_parameters() {
+                return;
+            }
+            "the printer does not report G-code parameters; using the built-in table"
+        } else {
+            "no G-code parameters from the printer; using the built-in table"
+        };
         self.gcode_fallback_warned = true;
-        self.write(Entry::notice(
-            Notice::Problem,
-            "no G-code parameters from the printer; using the built-in table",
-        ));
+        self.write(Entry::notice(Notice::Problem, text));
+    }
+
+    /// Whether the printer answered with commands but named no parameters.
+    ///
+    /// The `parameters` field of a command is newer than the dispatcher that
+    /// reports it, so a host too old to send it answers with the command names
+    /// and nothing else. That is a fact about the host rather than about one
+    /// command: every parameter name then comes from the built-in table, and
+    /// the reader is owed one line saying so.
+    ///
+    /// An answer with no commands at all is not this. There the field was not
+    /// missing, and a parameter completion on such a printer is explained by
+    /// the empty command list rather than by a host that cannot report.
+    fn printer_names_no_parameters(&self) -> bool {
+        !self.gcode_commands.is_empty()
+            && self.gcode_parameters.values().all(|named| named.is_empty())
     }
 
     /// Say why a `Tab` found nothing, when there is a source that should have.
@@ -2465,16 +2505,22 @@ impl App {
     /// command names do. A command it named none for says nothing at all — a
     /// host too old to report parameters is exactly the case this falls back
     /// for — and the built-in table then has the names the command declared
-    /// upstream. Lookups are without case: the table is keyed by the name the
-    /// source spells, and a line may be typed in lower case.
+    /// upstream.
+    ///
+    /// The printer's key is found without case: it may spell its commands in
+    /// lower case, and a line written that way names the same command. What
+    /// comes back is spelled as the printer spells it, which is what runs. The
+    /// table is keyed by the capitalised name the upstream source spells, so
+    /// the lookup there is on the upper-cased name.
     fn parameter_names(&self, command: &str) -> Vec<String> {
-        let name = command.to_ascii_uppercase();
-        if let Some(named) = self.gcode_parameters.get(&name) {
-            if !named.is_empty() {
-                return named.clone();
-            }
+        if let Some((_, named)) = self
+            .gcode_parameters
+            .iter()
+            .find(|(name, named)| name.eq_ignore_ascii_case(command) && !named.is_empty())
+        {
+            return named.clone();
         }
-        builtin_parameters(&name)
+        builtin_parameters(&command.to_ascii_uppercase())
             .iter()
             .map(|parameter| (*parameter).to_string())
             .collect()
@@ -2709,9 +2755,10 @@ mod tests {
 
     #[test]
     fn test_a_webhooks_push_moves_the_header_on() {
-        // This is what the window subscribes to at startup. The header's first
-        // value is the handshake's `info` reply, which nothing repeats; a
-        // `webhooks` push is the only thing that replaces it later.
+        // This is what the window subscribes to at startup. The header's value
+        // is the handshake's `info` reply, then the `objects/subscribe`
+        // snapshot, and from there on each `klippy:status` push — this one —
+        // reports a change.
         let mut app = App::new();
         app.write(Entry::Push(serde_json::json!({
             "id": null,
@@ -4829,9 +4876,14 @@ mod tests {
     #[test]
     fn test_a_command_the_printer_named_no_parameters_for_uses_the_table() {
         // A key the answer left out says the same as an empty list — the printer
-        // named nothing — and the table has what the command declared upstream.
+        // named nothing for this command — and the table has what the command
+        // declared upstream. Another command's parameters are named, so this is
+        // one command the printer is quiet about rather than a host that cannot
+        // report the field at all.
         for named in [None, Some(Vec::new())] {
-            let mut app = app_with_gcode_commands(&["SET_PIN"]);
+            let mut app = app_with_gcode_commands(&["SET_PIN", "ECHO"]);
+            app.gcode_parameters
+                .insert("ECHO".to_string(), vec!["X".to_string()]);
             if let Some(named) = named {
                 app.gcode_parameters.insert("SET_PIN".to_string(), named);
             }
@@ -4848,11 +4900,118 @@ mod tests {
     }
 
     #[test]
+    fn test_a_command_left_out_of_a_partial_answer_falls_back_silently() {
+        // A printer that names parameters for some commands and not others does
+        // report the field: the quiet command falls back per command, and a
+        // line about the host would name the wrong cause.
+        let mut app = app_with_gcode_commands(&["SET_PIN", "ECHO"]);
+        app.gcode_parameters
+            .insert("ECHO".to_string(), vec!["X".to_string()]);
+        type_line(&mut app, "SET_PIN va");
+
+        assert!(app.completion_key(KeyCode::Tab));
+
+        assert_eq!(app.input.text(), "SET_PIN VALUE", "the table's name");
+        assert!(
+            app.entries.is_empty(),
+            "and nothing to say: {:?}",
+            app.entries
+        );
+    }
+
+    #[test]
+    fn test_a_command_named_in_lower_case_finds_the_printers_parameters() {
+        // A printer may report its commands in lower case, and the answer's keys
+        // are then lower case too. A line written either way names the same
+        // command, so the key is found without case — and what comes back is
+        // spelled as the printer spelled it, which is what runs.
+        for typed in ["SET_PIN CH", "set_pin CH"] {
+            let mut app = app_with_gcode_commands(&["set_pin"]);
+            app.gcode_parameters.insert(
+                "set_pin".to_string(),
+                vec!["CHANNEL".to_string(), "VALUE".to_string()],
+            );
+            type_line(&mut app, typed);
+
+            assert!(app.completion_key(KeyCode::Tab));
+
+            let expected = format!("{}CHANNEL", &typed[..typed.len() - 2]);
+            assert_eq!(app.input.text(), expected);
+            assert!(
+                app.entries.is_empty(),
+                "the printer's own answer needs no line: {:?}",
+                app.entries
+            );
+        }
+    }
+
+    #[test]
+    fn test_a_printer_that_reports_no_parameters_says_so_once() {
+        // A host older than the `parameters` field answers with the command
+        // names and names nothing else. Every parameter completion then draws
+        // on the built-in table, and the reader hears it once: it is the same
+        // fact on each `Tab`, and a second line would be the log repeating
+        // itself.
+        let mut app = app_with_gcode_commands(&["SET_PIN", "ABORT"]);
+
+        type_line(&mut app, "SET_PIN PI");
+        assert!(app.completion_key(KeyCode::Tab));
+
+        assert_eq!(app.input.text(), "SET_PIN PIN", "the table's name");
+        assert_eq!(app.entries.len(), 1, "one notice: {:?}", app.entries);
+        let text = app.entries[0].text();
+        assert!(text.contains("does not report G-code parameters"), "{text}");
+        assert!(matches!(
+            app.entries[0],
+            Entry::Notice {
+                kind: Notice::Problem,
+                ..
+            }
+        ));
+
+        // Later parameter completions say nothing more.
+        for _ in 0..3 {
+            app.completion = None;
+            assert!(app.completion_key(KeyCode::Tab));
+        }
+        assert_eq!(app.entries.len(), 1, "and not per Tab: {:?}", app.entries);
+    }
+
+    #[test]
+    fn test_the_ask_and_the_no_parameters_answer_share_their_one_notice() {
+        // Both answers leave a completion on the table, and the reader only
+        // needs to hear that once: whichever comes first spends the session's
+        // line, so a printer that is answered later cannot say it again.
+        let mut app = app_with_no_printer_commands();
+        assert!(app.completion_key(KeyCode::Tab));
+        assert_eq!(app.entries.len(), 1, "the unanswered ask's line");
+
+        // The ask is answered later, with the commands but with no parameters.
+        app.gcode_commands = vec!["SET_PIN".to_string()];
+        app.gcode_commands_asked = true;
+        app.completion = None;
+        type_line(&mut app, "SET_PIN PI");
+        assert!(app.completion_key(KeyCode::Tab));
+
+        assert_eq!(app.input.text(), "SET_PIN PIN");
+        assert_eq!(
+            app.entries.len(),
+            1,
+            "and no second line: {:?}",
+            app.entries
+        );
+    }
+
+    #[test]
     fn test_a_command_with_no_known_parameters_says_so() {
-        // `ABORT` declares none, and this printer named none: there is nothing
-        // to complete the word with, and the notice says which side is empty
-        // rather than blaming the prefix.
-        let mut app = app_with_gcode_commands(&["ABORT"]);
+        // `ABORT` declares none, and this printer named none for it — while
+        // naming some for another command, so this is one command the printer
+        // knows less about rather than a host that cannot report parameters:
+        // there is nothing to complete the word with, and the notice says which
+        // side is empty rather than blaming the prefix.
+        let mut app = app_with_gcode_commands(&["ABORT", "SET_PIN"]);
+        app.gcode_parameters
+            .insert("SET_PIN".to_string(), vec!["CHANNEL".to_string()]);
         type_line(&mut app, "ABORT X");
 
         assert!(app.completion_key(KeyCode::Tab));
@@ -4869,7 +5028,12 @@ mod tests {
 
     #[test]
     fn test_a_parameter_prefix_that_matches_nothing_names_the_command() {
+        // The printer names parameters for this command, so its silence on `ZZ`
+        // is the command's own list talking rather than a host that cannot
+        // report: one notice, and it names the command.
         let mut app = app_with_gcode_commands(&["SET_PIN"]);
+        app.gcode_parameters
+            .insert("SET_PIN".to_string(), vec!["PIN".to_string()]);
         type_line(&mut app, "SET_PIN PIN=fan ZZ");
 
         assert!(app.completion_key(KeyCode::Tab));
@@ -5199,11 +5363,12 @@ mod tests {
             "nothing has been asked, whatever the state"
         );
 
-        // The status starts at the handshake's one `info` and is only moved by a
-        // `webhooks` push, so a printer that was still loading when the window
-        // connected keeps saying `startup` here until its first push arrives.
-        // Waiting for `ready` would therefore mean not asking during the load —
-        // and asking a printer that is not up is not a wait: it refuses at once.
+        // The status is the last thing the printer reported — the handshake's
+        // `info`, the `objects/subscribe` snapshot, then a `klippy:status` push
+        // per change — so `startup` here says what was said, not what is true
+        // now. Waiting for `ready` would therefore mean not asking during the
+        // load — and asking a printer that is not up is not a wait: it refuses
+        // at once.
         app.status = Status::Connected {
             state: "startup".to_string(),
             message: "Loading config".to_string(),

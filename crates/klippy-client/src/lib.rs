@@ -36,6 +36,9 @@
 
 pub mod connection;
 pub mod console;
+pub mod gcode_params;
+#[doc(hidden)]
+pub mod gcode_params_scan;
 pub mod session;
 pub mod tui;
 

@@ -438,6 +438,12 @@ struct Commands {
     base: HashMap<String, CommandHandler>,
     mux: HashMap<String, Mux>,
     help: HashMap<String, String>,
+    /// The parameter names each command declared, in declaration order.
+    ///
+    /// Reported by `get_status` so a client can complete the left of `=`.
+    /// A command that declared none has an empty list here, and its status
+    /// entry keeps the shape it had before this table existed.
+    params: HashMap<String, Vec<String>>,
 }
 
 impl Commands {
@@ -488,6 +494,7 @@ impl GCodeDispatch {
                     base: HashMap::new(),
                     mux: HashMap::new(),
                     help: HashMap::new(),
+                    params: HashMap::new(),
                 }),
                 outputs: Mutex::new(Vec::new()),
             }),
@@ -543,6 +550,10 @@ impl GCodeDispatch {
     /// `when_not_ready` keeps it available before the printer is ready, which is
     /// only for the built-ins.
     ///
+    /// A module that also knows the command's parameter names registers with
+    /// [`GCodeDispatch::register_command_with_params`] so a client can complete
+    /// them; this form declares none.
+    ///
     /// # Errors
     /// Returns a message when the name is malformed or already registered — a
     /// wiring mistake in klippy, reported at config load like upstream's
@@ -554,22 +565,52 @@ impl GCodeDispatch {
         desc: Option<&str>,
         when_not_ready: bool,
     ) -> Result<(), String> {
-        if !is_traditional_gcode(name) && !is_valid_extended_name(name) {
-            return Err(format!("Can't register '{name}' as it is an invalid name"));
+        self.register_command_with_params(name, handler, desc, &[], when_not_ready)
+    }
+
+    /// Register a command handler and the parameter names it accepts.
+    ///
+    /// `params` is the list of `KEY` names the command reads, in the order a
+    /// client should offer them. It is **additive**: the names are reported in
+    /// `status.gcode.commands[<name>]["parameters"]` for a client that completes
+    /// the left of `=`; the command's own behaviour does not depend on the list,
+    /// and a command registered without one reports exactly what it did before.
+    ///
+    /// `when_not_ready` keeps it available before the printer is ready, which is
+    /// only for the built-ins.
+    ///
+    /// # Errors
+    /// Returns a message when the name is malformed or already registered — a
+    /// wiring mistake in klippy, reported at config load like upstream's
+    /// `config_error`.
+    pub fn register_command_with_params(
+        &self,
+        cmd: &str,
+        handler: CommandHandler,
+        desc: Option<&str>,
+        params: &[&str],
+        when_not_ready: bool,
+    ) -> Result<(), String> {
+        if !is_traditional_gcode(cmd) && !is_valid_extended_name(cmd) {
+            return Err(format!("Can't register '{cmd}' as it is an invalid name"));
         }
         let mut commands = self.lock();
-        if commands.ready.contains_key(name) {
-            return Err(format!("gcode command {name} already registered"));
+        if commands.ready.contains_key(cmd) {
+            return Err(format!("gcode command {cmd} already registered"));
         }
-        commands
-            .ready
-            .insert(name.to_string(), Arc::clone(&handler));
+        commands.ready.insert(cmd.to_string(), Arc::clone(&handler));
         if when_not_ready {
-            commands.base.insert(name.to_string(), handler);
+            commands.base.insert(cmd.to_string(), handler);
         }
         if let Some(desc) = desc {
-            commands.help.insert(name.to_string(), desc.to_string());
+            commands.help.insert(cmd.to_string(), desc.to_string());
         }
+        // Always stored, empty list included: a name unregistered and registered
+        // again (a homing override) must not keep its previous declaration.
+        commands.params.insert(
+            cmd.to_string(),
+            params.iter().map(|param| (*param).to_string()).collect(),
+        );
         Ok(())
     }
 
@@ -594,6 +635,10 @@ impl GCodeDispatch {
     /// The first registration fixes the key parameter; every later one must
     /// agree, and no value may be taken twice.
     ///
+    /// A module that also knows the command's other parameter names registers
+    /// with [`GCodeDispatch::register_mux_command_with_params`]; this form
+    /// declares only the key.
+    ///
     /// # Errors
     /// As [`GCodeDispatch::register_command`], plus the mux conflicts upstream
     /// reports.
@@ -604,6 +649,30 @@ impl GCodeDispatch {
         value: Option<&str>,
         handler: CommandHandler,
         desc: Option<&str>,
+    ) -> Result<(), String> {
+        self.register_mux_command_with_params(cmd, key, value, handler, desc, &[])
+    }
+
+    /// Register one value of a mux command and the command's parameter names.
+    ///
+    /// The mux `key` is itself a parameter of the command, so it is **prepended**
+    /// to `params` and de-duplicated against it: a caller lists only the other
+    /// names, and the key still comes first, in its natural position.
+    ///
+    /// As [`GCodeDispatch::register_mux_command`], the first value fixes the key
+    /// and every later one must agree; the whole declared list is taken from
+    /// that first registration.
+    ///
+    /// # Errors
+    /// As [`GCodeDispatch::register_mux_command`].
+    pub fn register_mux_command_with_params(
+        &self,
+        cmd: &str,
+        key: &str,
+        value: Option<&str>,
+        handler: CommandHandler,
+        desc: Option<&str>,
+        params: &[&str],
     ) -> Result<(), String> {
         if self.lock().mux.contains_key(cmd) {
             let mut commands = self.lock();
@@ -640,7 +709,16 @@ impl GCodeDispatch {
             let command = command.clone();
             Box::pin(async move { dispatch_mux(&inner, &command, gcmd).await })
         });
-        self.register_command(cmd, dispatcher, desc, false)?;
+        // The key leads the declared list, and appears once even when the caller
+        // also lists it among the other names.
+        let mut declared = Vec::with_capacity(params.len() + 1);
+        declared.push(key);
+        for param in params {
+            if !declared.contains(param) {
+                declared.push(param);
+            }
+        }
+        self.register_command_with_params(cmd, dispatcher, desc, &declared, false)?;
         self.lock().mux.insert(
             cmd.to_string(),
             Mux {
@@ -884,6 +962,23 @@ impl PrinterObject for GCodeDispatch {
             let mut entry = Map::new();
             if let Some(help) = commands.help.get(name) {
                 entry.insert("help".to_string(), Value::String(help.clone()));
+            }
+            // Only a command that declared names gets the field: one that
+            // declared none reports the plain object it did before.
+            if let Some(params) = commands
+                .params
+                .get(name)
+                .filter(|params| !params.is_empty())
+            {
+                entry.insert(
+                    "parameters".to_string(),
+                    Value::Array(
+                        params
+                            .iter()
+                            .map(|param| Value::String(param.clone()))
+                            .collect(),
+                    ),
+                );
             }
             status.insert(name.clone(), Value::Object(entry));
         }
@@ -2467,6 +2562,73 @@ mod tests {
 
         assert!(status["commands"]["M110"].is_object());
         assert!(status["commands"]["SET_PIN"].is_null());
+    }
+
+    #[test]
+    fn test_a_declared_parameter_list_reaches_the_status() {
+        let (dispatch, _output) = dispatch();
+        dispatch.inner.set_ready(true);
+        dispatch
+            .register_command_with_params(
+                "MY_CMD",
+                sync(|_| Ok(())),
+                Some("My command"),
+                &["VALUE", "SPEED"],
+                false,
+            )
+            .unwrap();
+
+        let status = dispatch.get_status(0.0);
+
+        // Declaration order, and alongside the help text.
+        assert_eq!(
+            status["commands"]["MY_CMD"]["parameters"],
+            json!(["VALUE", "SPEED"])
+        );
+        assert_eq!(status["commands"]["MY_CMD"]["help"], "My command");
+    }
+
+    #[test]
+    fn test_a_mux_command_reports_its_key_first_and_once() {
+        let (dispatch, _output) = dispatch();
+        dispatch.inner.set_ready(true);
+        dispatch
+            .register_mux_command_with_params(
+                "SET_PIN",
+                "PIN",
+                Some("fan"),
+                sync(|_| Ok(())),
+                Some("Set a pin"),
+                // The key is declared by the mux itself: a caller that repeats
+                // it (twice) does not produce a duplicate.
+                &["VALUE", "PIN", "VALUE"],
+            )
+            .unwrap();
+
+        let status = dispatch.get_status(0.0);
+
+        assert_eq!(
+            status["commands"]["SET_PIN"]["parameters"],
+            json!(["PIN", "VALUE"])
+        );
+    }
+
+    #[test]
+    fn test_a_command_without_declared_parameters_has_no_parameters_key() {
+        let (dispatch, _output) = dispatch();
+        dispatch.inner.set_ready(true);
+        let (handler, _) = recorder();
+        dispatch
+            .register_command("SET_PIN", handler, Some("Set a pin"), false)
+            .unwrap();
+
+        let status = dispatch.get_status(0.0);
+
+        // The shape a client sees today, unchanged: `help`, and nothing else.
+        assert_eq!(status["commands"]["SET_PIN"]["help"], "Set a pin");
+        assert!(status["commands"]["SET_PIN"].get("parameters").is_none());
+        // A built-in that declares nothing is the same.
+        assert!(status["commands"]["M110"].get("parameters").is_none());
     }
 
     #[test]

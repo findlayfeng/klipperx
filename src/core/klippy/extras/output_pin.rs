@@ -24,24 +24,50 @@
 //! (`klippy/extras/output_pin.py:217`), so the firmware's "return to the
 //! shutdown value" limit is off and `value` and `shutdown_value` may differ.
 //!
+//! # Scheduling
+//!
+//! `SET_PIN` schedules like upstream (`output_pin.py:15-90, 196-269`): the
+//! value rides this repo's `GCodeRequestQueue`, dated by a
+//! `toolhead.register_lookahead_callback`, and a flush callback registered
+//! once on the toolhead drains the queue — the sink (`RequestSink::set_at`,
+//! upstream's `_set_pin`) turns each due request into a `queue_digital_out` /
+//! `set_pwm` at the pin's MCU clock.
+//!
+//! Two forks keep the **immediate** path (`update_digital_out` /
+//! `update_pwm`), with no error and no panic:
+//!
+//! * **No `toolhead` object** — this port allows a config without a
+//!   `[printer]` section. With nothing to date the change against, `SET_PIN`
+//!   drives the pin at once.
+//! * **The resource cannot schedule yet** — its MCU is not connected, so the
+//!   queue's schedule floor (upstream's `mcu_pin.get_mcu()
+//!   .min_schedule_time()`) or the print-time-to-clock mapping does not exist.
+//!   A `SET_PIN` before connect then behaves exactly as before (the immediate
+//!   path reports "MCU is not connected").
+//!
+//! The queue arms lazily at the first `SET_PIN` that finds both a toolhead
+//! and a schedulable resource, so the section keeps its `order = 20` and
+//! never races the toolhead's later load.
+//!
 //! # What is not here
 //!
-//! * **Scheduling.** Upstream queues `SET_PIN` through the toolhead
-//!   (`GCodeRequestQueue`, `output_pin.py:15-85`) so the change lands at a print
-//!   time. The print-time layer exists here (C1d: `ToolHead::print_time`,
-//!   `motion_queuing.register_flush_callback`); what is still missing is that
-//!   queue, so this port calls the immediate forms (`update_digital_out`,
-//!   `update_pwm`) and `update_pwm` aligns a software PWM to its cycle using the
-//!   estimated clock. `fan` / `servo` / `pwm_tool` share the same gap.
 //! * **`static_value` / `template`**: the display-template machinery.
+//! * **`fan` / `servo` / `pwm_tool`** still drive every change through the
+//!   immediate forms; their own module comments record that gap.
 
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use serde_json::{json, Value};
+use tracing::warn;
 
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
+use crate::core::klippy::extras::gcode_request_queue::{
+    FlushAction, GCodeRequestQueue, RequestSink,
+};
+use crate::core::klippy::extras::toolhead::ToolHeadObject;
 use crate::core::klippy::gcode::{sync, CommandError, CommandHandler, GCodeDispatch, GCODE_OBJECT};
 use crate::core::klippy::load::section;
+use crate::core::klippy::mcu::McuError;
 use crate::core::klippy::pins::{DigitalOut, PrinterPins, PwmOut, PINS_OBJECT};
 use crate::core::klippy::printer::{Printer, PrinterObject};
 
@@ -50,19 +76,18 @@ section!("output_pin", order = 20, prefix = load_config_prefix);
 
 /// One configured `[output_pin <name>]`.
 ///
-/// The resource itself is owned by the `SET_PIN` handler (the only thing that
-/// drives it); this object keeps the name and the last value for `get_status`.
+/// The resource lives in the scheduling state the `SET_PIN` handler drives;
+/// this object shares it, so `get_status` reads the value last driven.
 pub struct OutputPin {
-    /// The name in `SET_PIN PIN=<name>`: the section's sub.
-    name: String,
-    /// The value last set, for `get_status`; shared with the `SET_PIN` handler.
-    value: Arc<Mutex<f64>>,
+    /// The scheduling state the `SET_PIN` handler and the request queue share.
+    schedule: Arc<PinSchedule>,
 }
 
 /// What `SET_PIN` drives: a plain output or a PWM.
 ///
 /// The two have different trait objects but the same `0..=1` client interface,
-/// so the section keeps the choice behind one enum and the handler matches on it.
+/// so the section keeps the choice behind one enum and the handlers match on it.
+#[derive(Clone)]
 enum PinHandle {
     Digital(Arc<dyn DigitalOut>),
     Pwm(Arc<dyn PwmOut>),
@@ -74,7 +99,7 @@ impl OutputPin {
     /// # Errors
     /// Returns a config error (a message naming the section) when an option is
     /// missing, unparseable, or asks for something this port does not do yet.
-    pub fn new(config: &ConfigWrapper, printer: &Printer) -> Result<Self, ConfigError> {
+    pub fn new(config: &ConfigWrapper, printer: &Arc<Printer>) -> Result<Self, ConfigError> {
         let identifier = config.identifier();
         let name = config.section().sub.clone().ok_or_else(|| {
             ConfigError::new(format!(
@@ -137,11 +162,16 @@ impl OutputPin {
             .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
             .expect("the loader registers `gcode` before any section");
         let value_slot = Arc::new(Mutex::new(value));
-        let handle = Arc::new(handle);
+        let schedule = Arc::new(PinSchedule {
+            name: name.clone(),
+            value: value_slot,
+            handle,
+            printer: Arc::downgrade(printer),
+            armed: Mutex::new(None),
+        });
         let handler: CommandHandler = {
-            let handle = Arc::clone(&handle);
-            let value_slot = Arc::clone(&value_slot);
-            sync(move |gcmd| cmd_set_pin(&handle, &value_slot, scale, gcmd))
+            let schedule = Arc::clone(&schedule);
+            sync(move |gcmd| cmd_set_pin(&schedule, scale, gcmd))
         };
         gcode
             .register_mux_command_with_params(
@@ -156,26 +186,24 @@ impl OutputPin {
             )
             .map_err(|err| ConfigError::new(format!("{identifier}: {err}")))?;
 
-        Ok(Self {
-            name,
-            value: value_slot,
-        })
+        Ok(Self { schedule })
     }
 
     /// The name `SET_PIN` addresses this pin by.
     pub fn name(&self) -> &str {
-        &self.name
+        &self.schedule.name
     }
 
     fn lock(&self) -> MutexGuard<'_, f64> {
-        self.value
+        self.schedule
+            .value
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
     }
 }
 
 impl PrinterObject for OutputPin {
-    /// The value last set, as upstream's `PrinterOutputPin.get_status`.
+    /// The value last driven, as upstream's `PrinterOutputPin.get_status`.
     fn get_status(&self, _eventtime: f64) -> Value {
         json!({ "value": *self.lock() })
     }
@@ -184,20 +212,182 @@ impl PrinterObject for OutputPin {
 impl std::fmt::Debug for OutputPin {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OutputPin")
-            .field("name", &self.name)
+            .field("name", &self.schedule.name)
             .finish_non_exhaustive()
     }
 }
 
-/// `SET_PIN PIN=<name> VALUE=<0..scale>`: drive the pin.
+/// The scheduling state behind `SET_PIN`: the shared value slot, the pin
+/// handle, and the request queue once the first schedulable `SET_PIN` arms it.
 ///
-/// Upstream schedules this at a print time; without a clock layer the change
-/// happens through the resource's immediate path. `VALUE` is bounded by the
-/// pin's `scale` and divided by it before driving (`output_pin.py:249-269`); a
-/// digital output treats the result `>= 0.5` as "on", a PWM takes it as a duty.
+/// Shared by the `OutputPin` object (status), the `SET_PIN` handler (pushes)
+/// and the queue's sink (drives) — all three see the same last driven value.
+struct PinSchedule {
+    /// The section's sub: names the pin in a send-failure log line.
+    name: String,
+    /// The value last **driven** (upstream `last_value`, updated when the
+    /// change lands: at flush time on the queued path, at once on the
+    /// immediate one), for `get_status`.
+    value: Arc<Mutex<f64>>,
+    /// What `SET_PIN` queues or drives.
+    handle: PinHandle,
+    /// The printer, so a command can find the toolhead after config load.
+    /// Weak: the printer owns the g-code handlers, a strong handle would be a
+    /// `printer → objects → gcode → handler → printer` cycle.
+    printer: Weak<Printer>,
+    /// The queue, built and armed (its flush callback registered with the
+    /// toolhead) exactly once — by the first `SET_PIN` that finds both a
+    /// toolhead and a schedulable resource. See the module docs for the two
+    /// fallbacks.
+    armed: Mutex<Option<Arc<GCodeRequestQueue<PinSink>>>>,
+}
+
+impl PinSchedule {
+    /// The queue, arming it on the first call.
+    ///
+    /// The flush callback is registered **before** the queue is published, so
+    /// a push can never sit in a queue nothing drains
+    /// (`register_flush_callback` is connect-safe: before the toolhead
+    /// connects both wait in its pending lists and are installed together).
+    /// `None` when the resource cannot schedule yet — its MCU is not
+    /// connected, so the queue's schedule floor does not exist; the command
+    /// then keeps the immediate path.
+    fn arm(&self, toolhead: &ToolHeadObject) -> Option<Arc<GCodeRequestQueue<PinSink>>> {
+        let mut armed = self
+            .armed
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(queue) = armed.as_ref() {
+            return Some(Arc::clone(queue));
+        }
+        let min_schedule_time = self.handle.min_schedule_time()?;
+        let sink = PinSink {
+            name: self.name.clone(),
+            handle: self.handle.clone(),
+            value: Arc::clone(&self.value),
+        };
+        let queue = Arc::new(GCodeRequestQueue::new(sink, min_schedule_time));
+        let flush_queue = Arc::clone(&queue);
+        toolhead.register_flush_callback(Box::new(move |flush_time| {
+            flush_queue.flush(flush_time);
+        }));
+        *armed = Some(Arc::clone(&queue));
+        Some(queue)
+    }
+
+    /// The immediate path: drive the pin now and record the value
+    /// (`update_digital_out` / `update_pwm`).
+    ///
+    /// # Errors
+    /// Whatever the resource reports — typically "MCU is not connected"
+    /// before connect.
+    fn drive_now(&self, value: f64) -> Result<(), McuError> {
+        self.handle.drive_now(value)?;
+        *self
+            .value
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = value;
+        Ok(())
+    }
+}
+
+/// The queue's downstream end: where a due request lands at its print time
+/// (upstream's `_set_pin`, `output_pin.py:196-201`).
+struct PinSink {
+    /// Names the pin in a send-failure log line.
+    name: String,
+    /// What to drive.
+    handle: PinHandle,
+    /// The last driven value — upstream's `last_value`: a repeat of it is
+    /// discarded before a frame is built, and `get_status` reports it.
+    value: Arc<Mutex<f64>>,
+}
+
+impl RequestSink for PinSink {
+    fn set_at(&self, print_time: f64, value: f64) -> Option<(FlushAction, f64)> {
+        {
+            let mut last = self
+                .value
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            if value == *last {
+                // Upstream answers "discard", 0. and sends nothing
+                // (`output_pin.py:197-198`).
+                return Some((FlushAction::Discard, 0.0));
+            }
+            // Upstream updates `last_value` before driving (`:199`).
+            *last = value;
+        }
+        if let Err(err) = self.handle.drive_at(print_time, value) {
+            // The flush callback has no error channel; upstream would raise
+            // into the reactor. The frame is lost either way, so say so —
+            // quietly dropping it would hide a dead pin.
+            warn!("SET_PIN PIN={}: {err}", self.name);
+        }
+        None
+    }
+}
+
+impl PinHandle {
+    /// The schedule floor the queue spaces its sends by, or `None` while the
+    /// resource's MCU is not connected (upstream reads it from
+    /// `mcu_pin.get_mcu().min_schedule_time()`).
+    fn min_schedule_time(&self) -> Option<f64> {
+        match self {
+            PinHandle::Digital(pin) => pin.min_schedule_time(),
+            PinHandle::Pwm(pin) => pin.min_schedule_time(),
+        }
+    }
+
+    /// The immediate path: drive without a date (`update_digital_out` /
+    /// `update_pwm`). A digital output keeps this port's `>= 0.5` is "on"
+    /// semantics.
+    fn drive_now(&self, value: f64) -> Result<(), McuError> {
+        match self {
+            PinHandle::Digital(pin) => pin.update_digital_out(value >= 0.5),
+            PinHandle::Pwm(pin) => pin.update_pwm(value),
+        }
+    }
+
+    /// Land the change at `print_time` on the pin's MCU clock: upstream's
+    /// `set_digital` / `set_pwm` (`mcu.py:445-449, 545-553`).
+    ///
+    /// A resource whose clock is not there yet (MCU not connected) falls back
+    /// to the immediate form, which reports the missing connection itself.
+    ///
+    /// # Errors
+    /// Whatever the resource reports: a software PWM's alignment needing a
+    /// firmware frequency, or a failed send.
+    fn drive_at(&self, print_time: f64, value: f64) -> Result<(), McuError> {
+        match self {
+            PinHandle::Digital(pin) => match pin.print_time_to_clock(print_time) {
+                Some(clock) => pin.queue_digital_out(clock as u32, value >= 0.5),
+                None => pin.update_digital_out(value >= 0.5),
+            },
+            PinHandle::Pwm(pin) => match pin.print_time_to_clock(print_time) {
+                Some(clock) => {
+                    // A software PWM may only change on a cycle boundary:
+                    // `next_aligned_clock` rounds up to one (a hardware PWM
+                    // needs none and returns the clock untouched). Landing
+                    // early is not wanted, so `allow_early` is 0 — the figure
+                    // the immediate path aligns with too.
+                    let clock = pin.next_aligned_clock(clock as u32, 0.0)?;
+                    pin.set_pwm(clock, value)
+                }
+                None => pin.update_pwm(value),
+            },
+        }
+    }
+}
+
+/// `SET_PIN PIN=<name> VALUE=<0..scale>`: queue the change at the print time
+/// the toolhead gives it (upstream `cmd_SET_PIN`, `output_pin.py:249-269`),
+/// or drive the pin at once when no timeline can date it.
+///
+/// `VALUE` is bounded by the pin's `scale` and divided by it first; a digital
+/// output treats the result `>= 0.5` as "on", a PWM takes it as a duty.
 fn cmd_set_pin(
-    handle: &PinHandle,
-    value_slot: &Arc<Mutex<f64>>,
+    schedule: &PinSchedule,
     scale: f64,
     gcmd: &crate::core::klippy::gcode::GcodeCommand,
 ) -> Result<(), CommandError> {
@@ -205,14 +395,24 @@ fn cmd_set_pin(
         .get_float_range("VALUE", 0.0, scale)
         .map_err(|err| CommandError::new(err.to_string()))?
         / scale;
-    let result = match handle {
-        PinHandle::Digital(pin) => pin.update_digital_out(value >= 0.5),
-        PinHandle::Pwm(pin) => pin.update_pwm(value),
-    };
-    result.map_err(|err| CommandError::new(err.to_string()))?;
-    *value_slot
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner()) = value;
+    // The toolhead (`phase = late, order = 60`) loads after this section
+    // (`order = 20`), so it is looked up per command, never at config load.
+    // Without one — a config with no `[printer]` — the immediate path stands.
+    let toolhead = schedule
+        .printer
+        .upgrade()
+        .and_then(|printer| printer.lookup_object_as::<ToolHeadObject>("toolhead"));
+    if let Some(toolhead) = toolhead {
+        if let Some(queue) = schedule.arm(&toolhead) {
+            toolhead.register_lookahead_callback(Box::new(move |print_time| {
+                queue.push(print_time, value);
+            }));
+            return Ok(());
+        }
+    }
+    schedule
+        .drive_now(value)
+        .map_err(|err| CommandError::new(err.to_string()))?;
     Ok(())
 }
 
@@ -240,12 +440,23 @@ mod tests {
     use crate::core::klippy::pins::{PinChip, PinError, PinParams, PwmOut};
     use crate::core::klippy::reactor::ManualReactor;
 
-    /// A digital output that records what it was told.
+    /// The clock the fake resources map print time through, in Hz.
+    const TEST_CLOCK_HZ: f64 = 1_000_000.0;
+
+    /// The schedule floor the fake resources report (the real one is 0.100).
+    const TEST_MIN_SCHEDULE_TIME: f64 = 0.1;
+
+    /// A digital output that records what it was told: clocked changes and
+    /// immediate ones separately.
     #[derive(Default)]
     struct FakeDigitalOut {
         max_duration: Mutex<f64>,
         start_value: Mutex<(bool, bool)>,
         updates: Mutex<Vec<bool>>,
+        queued: Mutex<Vec<(u32, bool)>>,
+        /// Whether the fake models a connected MCU — a clock to convert print
+        /// times with and a schedule floor to queue against.
+        schedulable: bool,
     }
 
     impl DigitalOut for FakeDigitalOut {
@@ -255,22 +466,38 @@ mod tests {
         fn setup_start_value(&self, start_value: bool, shutdown_value: bool) {
             *self.start_value.lock().unwrap() = (start_value, shutdown_value);
         }
-        fn queue_digital_out(&self, _clock: u32, _value: bool) -> Result<(), McuError> {
+        fn queue_digital_out(&self, clock: u32, value: bool) -> Result<(), McuError> {
+            self.queued.lock().unwrap().push((clock, value));
             Ok(())
         }
         fn update_digital_out(&self, value: bool) -> Result<(), McuError> {
             self.updates.lock().unwrap().push(value);
             Ok(())
         }
+        fn print_time_to_clock(&self, print_time: f64) -> Option<u64> {
+            self.schedulable
+                .then_some((print_time * TEST_CLOCK_HZ) as u64)
+        }
+        fn min_schedule_time(&self) -> Option<f64> {
+            self.schedulable.then_some(TEST_MIN_SCHEDULE_TIME)
+        }
     }
 
-    /// A PWM that records what it was told.
+    /// A PWM that records what it was told: clocked changes (with the clock
+    /// they went out at) and immediate ones separately.
     #[derive(Default)]
     struct FakePwm {
         max_duration: Mutex<f64>,
         cycle_time: Mutex<(f64, bool)>,
         start_value: Mutex<(f64, f64)>,
         updates: Mutex<Vec<f64>>,
+        queued: Mutex<Vec<(u32, f64)>>,
+        /// The last duty set, for [`FakePwm::next_aligned_clock`] — `McuPwm`
+        /// tracks the same figure to decide whether a duty has a cycle to
+        /// land on.
+        last_value: Mutex<f64>,
+        /// See [`FakeDigitalOut::schedulable`].
+        schedulable: bool,
     }
 
     impl PwmOut for FakePwm {
@@ -282,43 +509,85 @@ mod tests {
         }
         fn setup_start_value(&self, start_value: f64, shutdown_value: f64) {
             *self.start_value.lock().unwrap() = (start_value, shutdown_value);
+            *self.last_value.lock().unwrap() = start_value;
         }
-        fn set_pwm(&self, _clock: u32, value: f64) -> Result<(), McuError> {
-            self.updates.lock().unwrap().push(value);
+        fn set_pwm(&self, clock: u32, value: f64) -> Result<(), McuError> {
+            self.queued.lock().unwrap().push((clock, value));
+            *self.last_value.lock().unwrap() = value;
             Ok(())
         }
         fn update_pwm(&self, value: f64) -> Result<(), McuError> {
             self.updates.lock().unwrap().push(value);
+            *self.last_value.lock().unwrap() = value;
             Ok(())
         }
         fn next_aligned_clock(&self, clock: u32, _allow_early: f64) -> Result<u32, McuError> {
-            Ok(clock)
+            // Mirrors `McuPwm`: a hardware PWM needs no alignment, and a duty
+            // fully on or off has no cycle to land on.
+            let (cycle_time, hardware) = *self.cycle_time.lock().unwrap();
+            if hardware {
+                return Ok(clock);
+            }
+            let last_value = *self.last_value.lock().unwrap();
+            if last_value == 0.0 || last_value == 1.0 {
+                return Ok(clock);
+            }
+            // Round up to the next cycle boundary (in fake-clock ticks).
+            let cycle = (cycle_time * TEST_CLOCK_HZ) as u32;
+            if cycle == 0 {
+                return Ok(clock);
+            }
+            Ok((clock + cycle - 1) / cycle * cycle)
+        }
+        fn print_time_to_clock(&self, print_time: f64) -> Option<u64> {
+            self.schedulable
+                .then_some((print_time * TEST_CLOCK_HZ) as u64)
+        }
+        fn min_schedule_time(&self) -> Option<f64> {
+            self.schedulable.then_some(TEST_MIN_SCHEDULE_TIME)
         }
     }
 
     /// A chip that hands out a [`FakeDigitalOut`] or [`FakePwm`] per setup.
-    #[derive(Default)]
     struct FakeChip {
         created: Mutex<Vec<Arc<FakeDigitalOut>>>,
         pwms: Mutex<Vec<Arc<FakePwm>>>,
+        /// Whether its resources model a connected MCU (the fixtures' default).
+        schedulable: bool,
+    }
+
+    impl Default for FakeChip {
+        fn default() -> Self {
+            Self {
+                created: Mutex::new(Vec::new()),
+                pwms: Mutex::new(Vec::new()),
+                schedulable: true,
+            }
+        }
     }
 
     impl PinChip for FakeChip {
         fn setup_digital_out(&self, _params: &PinParams) -> Result<Arc<dyn DigitalOut>, PinError> {
-            let out = Arc::new(FakeDigitalOut::default());
+            let out = Arc::new(FakeDigitalOut {
+                schedulable: self.schedulable,
+                ..Default::default()
+            });
             self.created.lock().unwrap().push(Arc::clone(&out));
             Ok(out)
         }
 
         fn setup_pwm(&self, _params: &PinParams) -> Result<Arc<dyn PwmOut>, PinError> {
-            let pwm = Arc::new(FakePwm::default());
+            let pwm = Arc::new(FakePwm {
+                schedulable: self.schedulable,
+                ..Default::default()
+            });
             self.pwms.lock().unwrap().push(Arc::clone(&pwm));
             Ok(pwm)
         }
     }
 
-    /// A ready printer with `gcode` and `pins` over a fake chip.
-    fn printer() -> (Arc<Printer>, Arc<FakeChip>) {
+    /// A ready printer with `gcode` and `pins` over `chip`.
+    fn printer_with(chip: FakeChip) -> (Arc<Printer>, Arc<FakeChip>) {
         let printer = Arc::new(Printer::new(ManualReactor::shared()));
         printer
             .add_object(
@@ -327,11 +596,40 @@ mod tests {
             )
             .unwrap();
         let pins = Arc::new(PrinterPins::new());
-        let chip = Arc::new(FakeChip::default());
+        let chip = Arc::new(chip);
         pins.register_chip("mcu", chip.clone()).unwrap();
         printer.add_object(PINS_OBJECT, pins).unwrap();
         printer.send_event(&KlippyEvent::KlippyReady);
         (printer, chip)
+    }
+
+    /// A ready printer with `gcode` and `pins` over the default fake chip.
+    fn printer() -> (Arc<Printer>, Arc<FakeChip>) {
+        printer_with(FakeChip::default())
+    }
+
+    /// The same printer with a connected `toolhead` registered —
+    /// `kinematics: none`, the dwell-only timeline whose flush callbacks must
+    /// still run (`toolhead`'s own fixture).
+    async fn add_toolhead(printer: &Arc<Printer>) -> Arc<ToolHeadObject> {
+        let mut section = ConfigSection::new("printer", None);
+        for (key, value) in [
+            ("kinematics", "none"),
+            ("max_velocity", "300"),
+            ("max_accel", "3000"),
+        ] {
+            section
+                .parameters
+                .insert(key.to_string(), ConfigValue::Single(value.to_string()));
+        }
+        let object =
+            ToolHeadObject::new(&wrap(&section), printer).expect("kinematics: none builds");
+        printer.add_object("toolhead", Arc::new(object)).unwrap();
+        let object = printer
+            .lookup_object_as::<ToolHeadObject>("toolhead")
+            .unwrap();
+        object.connect().await.expect("the toolhead connects");
+        object
     }
 
     /// An `[output_pin <name>]` section with `pin: <pin>` plus `options`.
@@ -563,6 +861,224 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "Unable to parse option 'pwm' in section 'output_pin fan'"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The queued (print-time) path
+    // -----------------------------------------------------------------------
+
+    /// A queued `SET_PIN` lands as a **clocked** `queue_digital_out` dated by
+    /// the toolhead's print time — never the immediate `update_digital_out` —
+    /// and only then does the status report the new value (upstream
+    /// `last_value` moves when the change lands).
+    #[tokio::test]
+    async fn test_a_queued_set_pin_sends_a_clocked_change() {
+        let (printer, chip) = printer();
+        let toolhead = add_toolhead(&printer).await;
+        let pin = OutputPin::new(&wrap(&section("fan", "PA1", &[])), &printer).unwrap();
+
+        gcode(&printer)
+            .run_script("SET_PIN PIN=fan VALUE=1")
+            .await
+            .unwrap();
+        toolhead.flush_step_generation().await.unwrap();
+
+        let out = created(&chip, 0);
+        let print_time = toolhead.print_time();
+        assert_eq!(
+            *out.queued.lock().unwrap(),
+            [((print_time * TEST_CLOCK_HZ) as u64 as u32, true)],
+            "the frame carries the print time as a clock"
+        );
+        assert!(
+            out.updates.lock().unwrap().is_empty(),
+            "the immediate update_digital_out path is not taken"
+        );
+        assert_eq!(pin.get_status(0.0)["value"], 1.0);
+    }
+
+    /// Neighbouring changes are clocked exactly their print-time gap apart:
+    /// a `dwell` of 0.25 s between two `SET_PIN`s shows up as a 0.25 s clock
+    /// gap (0.25 × `TEST_CLOCK_HZ` ticks) on the wire.
+    #[tokio::test]
+    async fn test_the_clock_gap_between_two_changes_is_their_print_time_gap() {
+        let (printer, chip) = printer();
+        let toolhead = add_toolhead(&printer).await;
+        OutputPin::new(&wrap(&section("fan", "PA1", &[])), &printer).unwrap();
+
+        gcode(&printer)
+            .run_script("SET_PIN PIN=fan VALUE=1")
+            .await
+            .unwrap();
+        let first_time = toolhead.print_time();
+        toolhead.flush_step_generation().await.unwrap();
+
+        toolhead.dwell(0.25);
+        gcode(&printer)
+            .run_script("SET_PIN PIN=fan VALUE=0")
+            .await
+            .unwrap();
+        let second_time = toolhead.print_time();
+        toolhead.flush_step_generation().await.unwrap();
+
+        assert_eq!(
+            second_time - first_time,
+            0.25,
+            "dwell advanced the timeline"
+        );
+        let out = created(&chip, 0);
+        let queued = out.queued.lock().unwrap().clone();
+        assert_eq!(queued.len(), 2, "{queued:?}");
+        assert!(queued[0].1, "first change is on");
+        assert!(!queued[1].1, "second change is off");
+        let clock_gap = f64::from(queued[1].0) - f64::from(queued[0].0);
+        let print_time_gap = (second_time - first_time) * TEST_CLOCK_HZ;
+        assert!(
+            (clock_gap - print_time_gap).abs() < 1e-6,
+            "clock gap {clock_gap} vs print-time gap {print_time_gap}"
+        );
+        assert!(out.updates.lock().unwrap().is_empty());
+    }
+
+    /// Repeating the value that is already driven is discarded by the sink:
+    /// the later request flushes (it is past the schedule floor) and sends
+    /// nothing — upstream's `"discard"` (`output_pin.py:197-198`).
+    #[tokio::test]
+    async fn test_repeating_the_driven_value_sends_no_second_frame() {
+        let (printer, chip) = printer();
+        let toolhead = add_toolhead(&printer).await;
+        OutputPin::new(&wrap(&section("fan", "PA1", &[])), &printer).unwrap();
+
+        gcode(&printer)
+            .run_script("SET_PIN PIN=fan VALUE=1")
+            .await
+            .unwrap();
+        toolhead.flush_step_generation().await.unwrap();
+        assert_eq!(created(&chip, 0).queued.lock().unwrap().len(), 1);
+
+        // A later request for the same value — past the schedule floor of the
+        // first send, so it reaches the sink and is discarded there.
+        toolhead.dwell(0.25);
+        gcode(&printer)
+            .run_script("SET_PIN PIN=fan VALUE=1")
+            .await
+            .unwrap();
+        toolhead.flush_step_generation().await.unwrap();
+
+        assert_eq!(
+            created(&chip, 0).queued.lock().unwrap().len(),
+            1,
+            "the repeat sent no second frame"
+        );
+        assert!(created(&chip, 0).updates.lock().unwrap().is_empty());
+    }
+
+    /// No `toolhead` object (a config without `[printer]`), even though the
+    /// resource could schedule: `SET_PIN` keeps the immediate path — driven at
+    /// once, nothing queued.
+    #[test]
+    fn test_without_a_toolhead_the_pin_is_still_set_immediately() {
+        let (printer, chip) = printer();
+        OutputPin::new(&wrap(&section("fan", "PA1", &[])), &printer).unwrap();
+
+        gcode(&printer)
+            .run_script_sync("SET_PIN PIN=fan VALUE=1")
+            .unwrap();
+
+        let out = created(&chip, 0);
+        assert_eq!(*out.updates.lock().unwrap(), [true]);
+        assert!(out.queued.lock().unwrap().is_empty());
+    }
+
+    /// The second fork: a toolhead, but a resource whose MCU is not connected
+    /// (no schedule floor to queue with) — immediate path, no error, no panic.
+    #[tokio::test]
+    async fn test_a_resource_that_cannot_schedule_is_set_immediately() {
+        let (printer, chip) = printer_with(FakeChip {
+            schedulable: false,
+            ..FakeChip::default()
+        });
+        add_toolhead(&printer).await;
+        OutputPin::new(&wrap(&section("fan", "PA1", &[])), &printer).unwrap();
+
+        gcode(&printer)
+            .run_script("SET_PIN PIN=fan VALUE=1")
+            .await
+            .unwrap();
+
+        let out = created(&chip, 0);
+        assert_eq!(*out.updates.lock().unwrap(), [true]);
+        assert!(out.queued.lock().unwrap().is_empty());
+    }
+
+    /// The digital `0.5` is "on" on the queued path too: the level decision
+    /// (`>= 0.5`) is made where the frame is built, unchanged.
+    #[tokio::test]
+    async fn test_a_queued_half_value_lands_as_on() {
+        let (printer, chip) = printer();
+        let toolhead = add_toolhead(&printer).await;
+        OutputPin::new(&wrap(&section("fan", "PA1", &[])), &printer).unwrap();
+
+        gcode(&printer)
+            .run_script("SET_PIN PIN=fan VALUE=0.5")
+            .await
+            .unwrap();
+        toolhead.flush_step_generation().await.unwrap();
+
+        let queued = created(&chip, 0).queued.lock().unwrap().clone();
+        assert_eq!(queued.len(), 1, "{queued:?}");
+        assert!(queued[0].1, "0.5 queues as on");
+        assert!(created(&chip, 0).updates.lock().unwrap().is_empty());
+    }
+
+    /// The queued PWM path: `set_pwm` at the converted clock, with a software
+    /// PWM rounded up to its cycle boundary once the duty is mid-cycle (a
+    /// change from a fully off duty is not aligned — there is no cycle to
+    /// land on yet, as `McuPwm` itself decides).
+    #[tokio::test]
+    async fn test_a_queued_pwm_change_is_aligned_to_its_cycle() {
+        let (printer, chip) = printer();
+        let toolhead = add_toolhead(&printer).await;
+        OutputPin::new(
+            &wrap(&section(
+                "fan",
+                "PA1",
+                &[("pwm", "true"), ("cycle_time", "0.1")],
+            )),
+            &printer,
+        )
+        .unwrap();
+
+        // From the startup duty 0: no alignment yet.
+        gcode(&printer)
+            .run_script("SET_PIN PIN=fan VALUE=0.25")
+            .await
+            .unwrap();
+        let first_print_time = toolhead.print_time();
+        toolhead.flush_step_generation().await.unwrap();
+
+        // Now the duty is mid-cycle: the next change rounds up to the next
+        // 0.1 s boundary of the fake's 1 MHz clock.
+        toolhead.dwell(0.125);
+        gcode(&printer)
+            .run_script("SET_PIN PIN=fan VALUE=0.5")
+            .await
+            .unwrap();
+        toolhead.flush_step_generation().await.unwrap();
+
+        let pwm = chip.pwms.lock().unwrap()[0].clone();
+        assert_eq!(
+            *pwm.queued.lock().unwrap(),
+            [
+                ((first_print_time * TEST_CLOCK_HZ) as u64 as u32, 0.25),
+                (400_000, 0.5),
+            ],
+            "unaligned at the start, aligned to the cycle afterwards"
+        );
+        assert!(
+            pwm.updates.lock().unwrap().is_empty(),
+            "the immediate update_pwm path is not taken"
         );
     }
 }

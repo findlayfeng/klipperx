@@ -159,6 +159,32 @@ pub trait DigitalOut: Send + Sync {
     /// # Errors
     /// As [`DigitalOut::queue_digital_out`].
     fn update_digital_out(&self, value: bool) -> Result<(), McuError>;
+
+    /// The MCU clock an absolute print time maps to, once the resource's MCU
+    /// is connected (upstream reaches the same conversion through
+    /// `mcu_pin.get_mcu().print_time_to_clock()`; here it is the chip's
+    /// [`McuChip::print_time_to_clock`](crate::core::klippy::mcu::McuChip::print_time_to_clock)).
+    ///
+    /// `None` while there is no clock to convert with — before the MCU
+    /// connects, or on a resource that does not model one. A scheduler that
+    /// dates changes by print time falls back to its immediate path then
+    /// (see `extras/output_pin`). The default answers `None`.
+    fn print_time_to_clock(&self, print_time: f64) -> Option<u64> {
+        let _ = print_time;
+        None
+    }
+
+    /// The lead the firmware's scheduler puts between a request and its clock
+    /// (`Mcu::min_schedule_time`, upstream's
+    /// `mcu_pin.get_mcu().min_schedule_time()`), or `None` before the MCU is
+    /// connected.
+    ///
+    /// A print-time queue spaces its sends by this figure; the default is
+    /// `None`, so a resource that does not model an MCU keeps its caller on
+    /// the immediate path.
+    fn min_schedule_time(&self) -> Option<f64> {
+        None
+    }
 }
 
 /// A PWM output resource: a pin whose duty cycle is set as a fraction.
@@ -195,9 +221,10 @@ pub trait PwmOut: Send + Sync {
     /// The PWM counterpart of [`DigitalOut::update_digital_out`]: there is no
     /// clockless PWM command, so the resource uses
     /// [`Mcu::estimated_clock`](crate::core::klippy::mcu::Mcu::estimated_clock) and
-    /// aligns a software PWM to its cycle. This is what a `SET_PIN` does while
-    /// the print-time request queue (upstream `GCodeRequestQueue`) is not
-    /// ported.
+    /// aligns a software PWM to its cycle. This is `SET_PIN`'s immediate
+    /// path — what it drives with when no print-time timeline can date the
+    /// change (`extras/output_pin`), and what the outputs whose own
+    /// `GCodeRequestQueue` gap still stands (`fan`, `servo`, …) drive with.
     ///
     /// # Errors
     /// As [`PwmOut::set_pwm`], plus when the firmware clock cannot be
@@ -216,6 +243,20 @@ pub trait PwmOut: Send + Sync {
     /// # Errors
     /// Returns [`McuError`] if the firmware frequency is unknown.
     fn next_aligned_clock(&self, clock: u32, allow_early: f64) -> Result<u32, McuError>;
+
+    /// The MCU clock an absolute print time maps to, once the resource's MCU
+    /// is connected; see [`DigitalOut::print_time_to_clock`]. The default
+    /// answers `None`.
+    fn print_time_to_clock(&self, print_time: f64) -> Option<u64> {
+        let _ = print_time;
+        None
+    }
+
+    /// The lead the firmware's scheduler puts between a request and its clock;
+    /// see [`DigitalOut::min_schedule_time`]. The default answers `None`.
+    fn min_schedule_time(&self) -> Option<f64> {
+        None
+    }
 }
 
 /// A batch of ADC samples: `(firmware clock, value)` pairs, oldest first.

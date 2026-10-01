@@ -22,7 +22,7 @@ use super::pin::{pin_number, MAX_SCHEDULE_TICKS};
 use crate::core::klippy::cmd::gpio::{ConfigDigitalOut, QueueDigitalOut, SetDigitalOutPwmCycle};
 use crate::core::klippy::cmd::pwm::{ConfigPwmOut, QueuePwmOut};
 use crate::core::klippy::cmd::McuCommand;
-use crate::core::klippy::mcu::{ConfigBuilder, Mcu, McuError};
+use crate::core::klippy::mcu::{ConfigBuilder, Mcu, McuChip, McuError};
 use crate::core::klippy::pins::{PinError, PinParams, PrinterPins, PwmOut};
 
 /// The default period of a PWM output, in seconds (`klippy/mcu.py:453`).
@@ -68,6 +68,10 @@ pub struct McuPwm {
     state: Arc<PwmState>,
     /// Shared with the chip, so runtime sends reach the connected device.
     mcu: Arc<Mutex<Option<Arc<Mcu>>>>,
+    /// The chip this pin was built on: it carries the print-time → clock
+    /// mapping and the schedule lead a print-time scheduler reads
+    /// (`McuChip::print_time_to_clock`, `Mcu::min_schedule_time`).
+    chip: McuChip,
     pin: PinParams,
 }
 
@@ -84,6 +88,7 @@ impl McuPwm {
         chip_name: String,
         mcu: Arc<Mutex<Option<Arc<Mcu>>>>,
         pin: PinParams,
+        chip: McuChip,
     ) -> Self {
         let state = Arc::new(PwmState {
             max_duration: Mutex::new(DEFAULT_MAX_DURATION),
@@ -116,7 +121,12 @@ impl McuPwm {
             }))
             .expect("a resource is always built before the configuration is");
 
-        Self { state, mcu, pin }
+        Self {
+            state,
+            chip,
+            mcu,
+            pin,
+        }
     }
 
     /// The oid the config callback assigned.
@@ -232,6 +242,14 @@ impl PwmOut for McuPwm {
         // Round up to the next cycle boundary after `req_clock`.
         let pulses = (req_clock - last_clock + cycle_ticks - 1).div_euclid(cycle_ticks);
         Ok((last_clock + pulses * cycle_ticks) as u32)
+    }
+
+    fn print_time_to_clock(&self, print_time: f64) -> Option<u64> {
+        self.chip.print_time_to_clock(print_time)
+    }
+
+    fn min_schedule_time(&self) -> Option<f64> {
+        self.chip.mcu().map(|mcu| mcu.min_schedule_time())
     }
 }
 

@@ -462,6 +462,7 @@ impl PinChip for McuChip {
             self.name.clone(),
             Arc::clone(&self.mcu),
             params.clone(),
+            self.clone(),
         )))
     }
 
@@ -495,6 +496,7 @@ impl PinChip for McuChip {
             self.name.clone(),
             Arc::clone(&self.mcu),
             params.clone(),
+            self.clone(),
         )))
     }
 
@@ -555,6 +557,10 @@ pub struct McuDigitalOut {
     state: Arc<DigitalOutState>,
     /// Shared with the chip, so runtime sends reach the connected device.
     mcu: Arc<Mutex<Option<Arc<Mcu>>>>,
+    /// The chip this pin was built on: it carries the print-time → clock
+    /// mapping and the schedule lead a print-time scheduler reads
+    /// (`McuChip::print_time_to_clock`, `Mcu::min_schedule_time`).
+    chip: McuChip,
     pin: PinParams,
 }
 
@@ -570,6 +576,7 @@ impl McuDigitalOut {
         chip_name: String,
         mcu: Arc<Mutex<Option<Arc<Mcu>>>>,
         pin: PinParams,
+        chip: McuChip,
     ) -> Self {
         let state = Arc::new(DigitalOutState {
             max_duration: Mutex::new(DEFAULT_MAX_DURATION),
@@ -596,7 +603,12 @@ impl McuDigitalOut {
             }))
             .expect("a resource is always built before the configuration is");
 
-        Self { state, mcu, pin }
+        Self {
+            state,
+            chip,
+            mcu,
+            pin,
+        }
     }
 
     /// The oid the config callback assigned.
@@ -677,6 +689,14 @@ impl DigitalOut for McuDigitalOut {
             oid,
             value: u8::from(value ^ self.pin.invert),
         })
+    }
+
+    fn print_time_to_clock(&self, print_time: f64) -> Option<u64> {
+        self.chip.print_time_to_clock(print_time)
+    }
+
+    fn min_schedule_time(&self) -> Option<f64> {
+        self.chip.mcu().map(|mcu| mcu.min_schedule_time())
     }
 }
 
@@ -892,6 +912,7 @@ mod tests {
             "mcu".to_string(),
             Arc::clone(&chip.mcu),
             params,
+            chip.clone(),
         );
 
         drop(resource);

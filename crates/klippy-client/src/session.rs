@@ -470,20 +470,31 @@ impl Session {
         Ok(Control::Continue)
     }
 
-    /// The printer's own list of G-Code commands, from `gcode/help`: every
-    /// command the dispatcher registered with a description, which is what a
-    /// G-Code terminal offers to complete.
+    /// The printer's own G-Code command names, from the `gcode` object of
+    /// `objects/query`: every command the dispatcher knows, described or not,
+    /// which is what a G-Code terminal offers to complete.
+    ///
+    /// `gcode/help` is the obvious-looking source and the wrong one: it returns
+    /// only the commands that were registered *with a description*, so a
+    /// built-in that has none (`M115`, `M110`, `ECHO`, …) is missing from it and
+    /// could not be completed. The object's keys are the whole list.
     ///
     /// A printer that is not up yet answers nothing useful, and waiting on one
     /// forever would freeze the window, so a missing or failing answer is
     /// `None` rather than an error: the caller either has a list to complete
     /// from or it has none, and neither is a fault.
-    pub async fn gcode_help(
+    pub async fn gcode_commands(
         &mut self,
         out: &mut impl Output,
         within: std::time::Duration,
     ) -> Result<Option<Vec<String>>, TransportError> {
-        let id = self.request("gcode/help", Map::new(), out).await?;
+        // `null` per object means "every field", and `gcode` is the object
+        // whose `status` carries the command table.
+        let params = json!({ "objects": { "gcode": null } })
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+        let id = self.request("objects/query", params, out).await?;
         let reply = match tokio::time::timeout(within, self.await_reply(id, out)).await {
             Ok(reply) => reply?,
             // Ran out of patience. If the answer ever turns up it is read as an
@@ -500,8 +511,13 @@ impl Session {
         }
         let mut names: Vec<String> = reply
             .result()
+            .and_then(|result| result.get("status"))
+            .and_then(|status| status.get("gcode"))
+            .and_then(|gcode| gcode.get("commands"))
             .and_then(Value::as_object)
-            .map(|help| help.keys().cloned().collect())
+            // A key is one command name, so the object's keys are the list;
+            // their values (`{}` or `{"help": …}`) say nothing new.
+            .map(|commands| commands.keys().cloned().collect())
             .unwrap_or_default();
         names.sort();
         Ok(Some(names))
@@ -912,12 +928,15 @@ mod tests {
         }
     }
 
-    /// Answers `gcode/help` with the command table the real endpoint sends.
-    struct GcodeHelp;
+    /// Answers `objects/query` for the `gcode` object with the shape the real
+    /// endpoint sends: the command names are the keys of
+    /// `status.gcode.commands`, and a built-in without a description is there
+    /// as an empty object.
+    struct GcodeCommands;
 
-    impl Endpoint for GcodeHelp {
+    impl Endpoint for GcodeCommands {
         fn path(&self) -> &'static str {
-            "gcode/help"
+            "objects/query"
         }
 
         fn handle<'a>(
@@ -927,21 +946,38 @@ mod tests {
         ) -> EndpointFuture<'a> {
             Box::pin(async move {
                 Ok(json!({
-                    "M115": "Report firmware version",
-                    "G28": "Home all axes",
-                    "SET_PIN": "Set a pin"
+                    "eventtime": 14.0,
+                    "status": {
+                        "gcode": {
+                            "commands": {
+                                "ECHO": {},
+                                "FIRMWARE_RESTART": {"help": "Restart the firmware"},
+                                "HELP": {"help": "List all available commands"},
+                                "M110": {},
+                                "M112": {},
+                                "M115": {},
+                                "RESTART": {"help": "Restart the firmware"},
+                                "SET_GCODE_VARIABLE": {"help": "Set a G-Code macro variable"},
+                                "SET_PIN": {"help": "Set the value of an output pin"},
+                                "STATUS": {"help": "Report the printer status"},
+                                "STEPPER_MOVE": {"help": "Set the stepper position"},
+                                "STEPPER_RELEASE": {"help": "Release the steppers"},
+                                "_STEPPER_SET_PHASE": {"help": "Set the stepper phase"}
+                            }
+                        }
+                    }
                 }))
             })
         }
     }
 
-    /// A `gcode/help` that never answers, and one that refuses: the two ways a
-    /// printer can leave the window without a command list.
-    struct SilentHelp;
+    /// An `objects/query` that never answers, and one that refuses: the two ways
+    /// a printer can leave the window without a command list.
+    struct SilentCommands;
 
-    impl Endpoint for SilentHelp {
+    impl Endpoint for SilentCommands {
         fn path(&self) -> &'static str {
-            "gcode/help"
+            "objects/query"
         }
 
         fn handle<'a>(
@@ -956,11 +992,11 @@ mod tests {
         }
     }
 
-    struct FailingHelp;
+    struct FailingCommands;
 
-    impl Endpoint for FailingHelp {
+    impl Endpoint for FailingCommands {
         fn path(&self) -> &'static str {
-            "gcode/help"
+            "objects/query"
         }
 
         fn handle<'a>(
@@ -972,15 +1008,15 @@ mod tests {
         }
     }
 
-    /// A server with `info` and one shape of `gcode/help`, for the tests that
+    /// A server with `info` and one shape of `objects/query`, for the tests that
     /// need a printer answering that call badly.
-    async fn server_with_help<E: Endpoint + 'static>(
+    async fn server_with_query<E: Endpoint + 'static>(
         dir: &SocketDir,
-        help: E,
+        query: E,
     ) -> tokio::task::JoinHandle<()> {
         let mut api = Api::new();
         api.register(Info).unwrap();
-        api.register(help).unwrap();
+        api.register(query).unwrap();
         let server = Server::bind(dir.target(), Arc::new(api))
             .await
             .expect("cannot bind");
@@ -1012,7 +1048,7 @@ mod tests {
         api.register(FirmwareRestart).unwrap();
         api.register(ListObjects).unwrap();
         api.register(Subscribe).unwrap();
-        api.register(GcodeHelp).unwrap();
+        api.register(GcodeCommands).unwrap();
         let server = Server::bind(dir.target(), Arc::new(api))
             .await
             .expect("cannot bind");
@@ -1717,31 +1753,60 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_gcode_help_returns_the_printers_command_names_in_order() {
-        let dir = SocketDir::new("gcode-help");
+    async fn test_gcode_commands_lists_every_command_the_printer_has_in_order() {
+        let dir = SocketDir::new("gcode-commands");
         let (mut session, _out, task) = session(&dir).await;
         let mut out = Recording::default();
 
         let names = session
-            .gcode_help(&mut out, Duration::from_secs(1))
+            .gcode_commands(&mut out, Duration::from_secs(1))
             .await
             .expect("the request is sent")
             .expect("the printer answered");
 
-        assert_eq!(names, vec!["G28", "M115", "SET_PIN"]);
+        // Every key of `status.gcode.commands`, sorted — the described ones and
+        // the ones the dispatcher registered with no description alike, which is
+        // what says this is not `gcode/help`.
+        assert_eq!(
+            names,
+            vec![
+                "ECHO",
+                "FIRMWARE_RESTART",
+                "HELP",
+                "M110",
+                "M112",
+                "M115",
+                "RESTART",
+                "SET_GCODE_VARIABLE",
+                "SET_PIN",
+                "STATUS",
+                "STEPPER_MOVE",
+                "STEPPER_RELEASE",
+                "_STEPPER_SET_PHASE",
+            ]
+        );
+        assert!(
+            names.contains(&"M115".to_string()),
+            "a built-in with no help"
+        );
+        assert!(
+            names.contains(&"ECHO".to_string()),
+            "a built-in with no help"
+        );
+        assert_eq!(names.len(), 13);
         task.abort();
     }
 
     #[tokio::test]
-    async fn test_gcode_help_says_nothing_when_the_printer_refuses() {
-        // Refused, as `gcode/help` is while the config is still loading: no
+    async fn test_gcode_commands_says_nothing_when_the_printer_refuses() {
+        // Refused, as `objects/query` is while the config is still loading: no
         // candidates, and not an error for the caller to report.
-        let dir = SocketDir::new("gcode-help-failing");
-        let task = server_with_help(&dir, FailingHelp).await;
+        let dir = SocketDir::new("gcode-commands-failing");
+        let task = server_with_query(&dir, FailingCommands).await;
         let (mut session, mut out) = connect(&dir).await;
 
         let names = session
-            .gcode_help(&mut out, Duration::from_secs(1))
+            .gcode_commands(&mut out, Duration::from_secs(1))
             .await
             .expect("the request is sent");
 
@@ -1750,13 +1815,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_gcode_help_gives_up_on_a_printer_that_never_answers() {
-        let dir = SocketDir::new("gcode-help-silent");
-        let task = server_with_help(&dir, SilentHelp).await;
+    async fn test_gcode_commands_gives_up_on_a_printer_that_never_answers() {
+        let dir = SocketDir::new("gcode-commands-silent");
+        let task = server_with_query(&dir, SilentCommands).await;
         let (mut session, mut out) = connect(&dir).await;
 
         let names = session
-            .gcode_help(&mut out, Duration::from_millis(50))
+            .gcode_commands(&mut out, Duration::from_millis(50))
             .await
             .expect("the request is sent");
 

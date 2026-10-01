@@ -61,6 +61,23 @@ impl EstimatedPrintTime {
     }
 }
 
+/// A lookahead callback parked on the move it was registered against: the
+/// index of that move in the batch that will flush it
+/// (`ToolHead::register_lookahead_callback`).
+struct ParkedLookahead {
+    /// Where the target move sits in the batch that flushes it (0-based).
+    index: usize,
+    callback: Box<dyn FnOnce(f64) + Send>,
+}
+
+impl std::fmt::Debug for ParkedLookahead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ParkedLookahead")
+            .field("index", &self.index)
+            .finish_non_exhaustive()
+    }
+}
+
 /// The toolhead: commanded position, print time, and the motion queue.
 #[derive(Debug)]
 pub struct ToolHead {
@@ -78,6 +95,13 @@ pub struct ToolHead {
     /// `_calc_print_time`'s floor (`toolhead.py:263` → `motion_queuing.py:191`).
     last_step_gen_time: f64,
     special_queuing_state: bool,
+    /// How many moves sit in `lookahead`: one is added with every `move_to`
+    /// and leaves with the batch `process_lookahead` flushes. It is the queue
+    /// order a [`Self::register_lookahead_callback`] callback was parked at.
+    lookahead_depth: usize,
+    /// Lookahead callbacks registered while their move was still queued, each
+    /// at the index that move will flush at (`register_lookahead_callback`).
+    parked_lookahead: Vec<ParkedLookahead>,
     motion_queuing: MotionQueuing,
     kinematics: Option<Box<dyn Kinematics>>,
     /// The trapq the kinematic move is appended to; each extra axis has its
@@ -102,6 +126,8 @@ impl ToolHead {
             // Upstream starts in "NeedPrime" and resyncs the print time on the
             // first planned move (`klippy/toolhead.py:224`).
             special_queuing_state: true,
+            lookahead_depth: 0,
+            parked_lookahead: Vec::new(),
             motion_queuing,
             kinematics: None,
             main_trapq,
@@ -206,6 +232,34 @@ impl ToolHead {
         self.estimated_print_time = source;
     }
 
+    /// Register a lookahead callback (`ToolHead.register_lookahead_callback`,
+    /// `klippy/toolhead.py:526-530`).
+    ///
+    /// With the look-ahead empty it fires at once with the last move time;
+    /// with moves queued it rides the queue's last move and fires with that
+    /// move's end time when the look-ahead is flushed
+    /// (`Move.timing_callbacks`, drained in [`Self::process_lookahead`]).
+    pub fn register_lookahead_callback(&mut self, callback: Box<dyn FnOnce(f64) + Send + 'static>) {
+        if self.lookahead.is_empty() {
+            let last_move_time = self.get_last_move_time();
+            callback(last_move_time);
+            return;
+        }
+        // The move was queued after everything ahead of it and before
+        // everything behind it (`lookahead_depth` counts with the queue), so
+        // it flushes at this index.
+        let index = self.lookahead_depth - 1;
+        self.parked_lookahead
+            .push(ParkedLookahead { index, callback });
+    }
+
+    /// Register a flush callback (`MotionQueuing::register_flush_callback`):
+    /// it fires with the flush time on every step generation, in registration
+    /// order — including generations that produce no steps at all.
+    pub fn register_flush_callback(&mut self, callback: Box<dyn Fn(f64) + Send + 'static>) {
+        self.motion_queuing.register_flush_callback(callback);
+    }
+
     /// Queue a move (`ToolHead.move`, `klippy/toolhead.py:395-408`).
     ///
     /// # Errors
@@ -237,6 +291,10 @@ impl ToolHead {
             }
         }
         self.commanded_pos = move_.end_pos;
+        // Every non-zero move adds exactly one queue entry (`add_move` pushes
+        // unconditionally; the zero-length move left above), so the depth
+        // counter mirrors the queue's length.
+        self.lookahead_depth += 1;
         let want_flush = self.lookahead.add_move(move_, &self.extra_axes);
         if want_flush {
             self.process_lookahead();
@@ -266,10 +324,28 @@ impl ToolHead {
     /// Flush the look-ahead into the trapq and advance the print time
     /// (`ToolHead._process_lookahead`, `klippy/toolhead.py:269-298`).
     fn process_lookahead(&mut self) {
-        let moves = self.lookahead.flush(false);
+        let mut moves = self.lookahead.flush(false);
         if moves.is_empty() {
             return;
         }
+        // Parked callbacks ride the move they were registered against: moves
+        // flush in queue order, so that move sits at its recorded index in
+        // this batch. Should a flush ever take only part of the queue, the
+        // moves it leaves behind carry their callbacks over, shifted by what
+        // this batch took.
+        let mut carried = Vec::new();
+        for parked in std::mem::take(&mut self.parked_lookahead) {
+            if let Some(move_) = moves.get_mut(parked.index) {
+                move_.timing_callbacks.push(parked.callback);
+            } else {
+                carried.push(ParkedLookahead {
+                    index: parked.index - moves.len(),
+                    callback: parked.callback,
+                });
+            }
+        }
+        self.parked_lookahead = carried;
+        self.lookahead_depth -= moves.len();
         if self.special_queuing_state {
             // Leaving "NeedPrime": start the print time a buffer ahead of the
             // MCU so the queue is never empty when motion starts — upstream's

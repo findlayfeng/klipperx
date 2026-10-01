@@ -223,6 +223,27 @@ Enter send · ↑↓ history · PgUp/PgDn/Home/End log · ^G g-code · Esc×3 st
 gcode> SET_PIN PIN=fan VALUE=1
 ```
 
+g-code 模式下日志**只显示 G-Code 本身的来往，不显示 API 信封**：你敲的命令以
+`> ` 开头原样回显，打印机回的 `// …` 信息、`!! …` 错误直接逐行出现在日志里，
+`gcode/script` 的成功应答（`{}`）和 `gcode/subscribe_output`、`gcode/restart` 等
+`gcode/*` 管线的成功请求/应答都被隐藏（它们的效果已由提示行说明）。**失败的应答
+不会被隐藏**：命令本身报错时通常还伴随一条 `!! …` 输出行（两条都会出现）；而没有
+`!! …` 可依靠时（例如配置加载失败、调度器还不存在，订阅本身也失败），应答就是错误
+唯一的去处。g-code 模式下这些往返行一律白色（`!! …` 输出行也一样）；唯一例外是失败
+应答那一句（`! N (method) …`）用红色——一条命令报错时，红色那句才是要看的。于是
+窗口读起来就像一个 G-Code 终端：
+
+```text
+gcode> M115
+> M115
+FIRMWARE_NAME: Klipper
+```
+
+非 g-code 通道（`objects/query`、`klippy:status` 推送等）在 g-code 模式下照常显示
+信封，不受影响。切回请求模式（再按 `Ctrl+G` / `.gcode`）后，历史日志里**还留着**的
+条目（`gcode/script` 请求、`gcode:output` 输出行）重新带回 `> id: …`/`< id: …`
+信封显示——进入 g-code 模式时被丢掉的成功应答不会回来（它当时就没进日志）。
+
 第一次进入 g-code 模式时会自动订阅一次 `gcode/subscribe_output`，于是命令的
 `// …` 信息与 `!! …` 错误会以推送的形式出现在日志里（不订阅的话只能看到命令的应答，
 `respond_info` 看不到）。`.` 开头的本地命令在两种模式下都有效（例如 `.reload`、`.quit`、`.help`），所以
@@ -273,6 +294,12 @@ gcode> SET_PIN PIN=fan VALUE=1
 
 `.json` 只改正文的写法：上面的前缀变成 `> {"id":2,…}` / `< {"id":2,…}`，
 标记、空格与颜色交替都不变。
+
+**g-code 模式下**（`Ctrl+G`）这套前缀只用于非 g-code 通道；`gcode/script` 的来往
+剥掉信封直接显示——你敲的命令以 `> <脚本>` 回显，打印机回的 `// …`/`!! …` 原样
+出现，成功的 `gcode/script` 应答与 `gcode/subscribe_output` 等管线请求/应答被隐藏，
+失败应答保留（见上节 [G-code 模式](#g-code-模式)）。切回请求模式后历史日志中还留着
+的条目重新带回信封。
 
 ### 没有终端的时候
 

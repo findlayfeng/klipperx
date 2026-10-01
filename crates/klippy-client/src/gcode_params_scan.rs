@@ -11,22 +11,34 @@
 //!
 //! It is a source scan, not a Rust parser: it finds the registration calls, then
 //! resolves each argument the way the host would — a string literal, a
-//! same-file `const`/`static` array, or a `for` loop's array element. Anything
-//! it cannot resolve is returned in [`Scan::unresolved`] rather than dropped;
-//! `tests/gcode_params_table.rs` asserts that tally so a new registration cannot
-//! vanish silently.
+//! `const`/`static` array, a `for` loop's array element, a zero-argument helper
+//! that builds the list (`probe_points_params()`), or a constant or helper a
+//! `use` names in a sibling module, followed through `crate::`/`super::` to the
+//! file that defines it. A registration inside a closure that takes the command
+//! name and its parameters (`extras/tmc.rs` registers four commands that way) is
+//! resolved at the closure's call sites, where the literals are. Anything it
+//! cannot resolve — a name only the caller knows — is returned in
+//! [`Scan::unresolved`] rather than dropped; `tests/gcode_params_table.rs`
+//! asserts that tally so a new registration cannot vanish silently.
 //!
 //! `#[cfg(test)]` items are skipped: the registrations a test makes are fixtures
 //! (`"MY_CMD"`), not commands the host actually answers.
 //!
 //! [`GCodeDispatch::register_command_with_params`]: crate
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
+
+/// How many `const`/`use`/helper hops one argument may take before the scanner
+/// gives up. It bounds a definition cycle as well as a chain that is merely
+/// deeper than this scanner understands.
+const MAX_DEPTH: usize = 8;
 
 /// A registration call site the scanner could not turn into parameter names.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,6 +124,7 @@ pub fn scan_dir(dir: &Path) -> Result<Scan, ScanError> {
     collect_rs_files(dir, &mut files)?;
     files.sort();
 
+    let resolver = Resolver::new(dir.to_path_buf());
     let mut scan = Scan::default();
     let mut entries: Vec<(String, Vec<String>)> = Vec::new();
     for path in files {
@@ -120,7 +133,8 @@ pub fn scan_dir(dir: &Path) -> Result<Scan, ScanError> {
             .unwrap_or(&path)
             .to_string_lossy()
             .replace('\\', "/");
-        let file = scan_file(&path, rel)?;
+        let source = resolver.file(&rel)?;
+        let file = scan_file(source, &resolver)?;
         scan.call_sites += file.call_sites;
         scan.resolved_call_sites += file.resolved_call_sites;
         scan.unresolved.extend(file.unresolved);
@@ -167,6 +181,262 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), ScanError>
     Ok(())
 }
 
+/// The scanned tree, with each file read and tokenized on demand: following a
+/// name a `use` imports means reading a file the scan has not reached yet, and
+/// only the files an argument actually names need to be in memory.
+struct Resolver {
+    /// The tree root, `src/core/klippy`, which a module path is relative to.
+    root: PathBuf,
+    files: RefCell<BTreeMap<String, Rc<SourceFile>>>,
+}
+
+/// One file: its tokens, and the names its `use` statements import.
+struct SourceFile {
+    /// Path relative to the root, e.g. `extras/probe.rs`.
+    rel: String,
+    tokens: Vec<Token>,
+    /// Local name -> (the file that defines it, the name there).
+    imports: BTreeMap<String, (String, String)>,
+}
+
+/// Where one registration argument is read from: the file it sits in, plus the
+/// tree the other files can be read from.
+#[derive(Clone)]
+struct Ctx<'a> {
+    resolver: &'a Resolver,
+    file: Rc<SourceFile>,
+}
+
+impl Resolver {
+    fn new(root: PathBuf) -> Self {
+        Self {
+            root,
+            files: RefCell::new(BTreeMap::new()),
+        }
+    }
+
+    /// The file at `rel`, tokenized and cached.
+    fn file(&self, rel: &str) -> Result<Rc<SourceFile>, ScanError> {
+        if let Some(file) = self.files.borrow().get(rel) {
+            return Ok(Rc::clone(file));
+        }
+        let path = self.root.join(rel);
+        let source = fs::read_to_string(&path)
+            .map_err(|error| ScanError::new(format!("cannot read {}: {error}", path.display())))?;
+        let tokens = strip_cfg_test(tokenize(&source)?);
+        let imports = self.imports_of(&tokens, rel);
+        let file = Rc::new(SourceFile {
+            rel: rel.to_string(),
+            tokens,
+            imports,
+        });
+        self.files
+            .borrow_mut()
+            .insert(rel.to_string(), Rc::clone(&file));
+        Ok(file)
+    }
+
+    /// What the `use` statements of the file at `rel` import: the local name,
+    /// the file it is defined in, and the name it has there.
+    ///
+    /// A glob (`use a::*`) and a path outside the tree are not recorded: the
+    /// scanner follows a name to its definition, it does not search a module
+    /// for one.
+    fn imports_of(&self, tokens: &[Token], rel: &str) -> BTreeMap<String, (String, String)> {
+        let mut imports = BTreeMap::new();
+        let mut i = 0;
+        while i < tokens.len() {
+            let is_use = matches!(&tokens[i].kind, Kind::Ident(word) if word == "use");
+            if !is_use {
+                i += 1;
+                continue;
+            }
+            let Some(end) = statement_end(tokens, i + 1) else {
+                break;
+            };
+            for (local, module, name) in use_paths(&tokens[i + 1..end]) {
+                if let Some(file) = self.module_file(rel, &module) {
+                    imports.insert(local, (file, name));
+                }
+            }
+            i = end + 1;
+        }
+        imports
+    }
+
+    /// The file a module path names, as read from the file at `from`.
+    ///
+    /// `crate::core::klippy::…` is relative to the tree root, `self::…` to the
+    /// module `from` declares and `super::…` to its parent, exactly as the
+    /// source reads. A path outside the tree (an external crate) and one with
+    /// no file behind it are not followed.
+    fn module_file(&self, from: &str, path: &[String]) -> Option<String> {
+        let dir = parent_dir(from);
+        let stem = file_stem(from);
+        // The directory this file's own module keeps its children in: beside a
+        // `mod.rs`, under `<stem>/` otherwise.
+        let own = if stem == "mod" {
+            dir.to_string()
+        } else if dir.is_empty() {
+            stem.to_string()
+        } else {
+            format!("{dir}/{stem}")
+        };
+        let mut segments: Vec<&str> = path.iter().map(String::as_str).collect();
+        let mut dir = dir.to_string();
+        match segments.first().copied()? {
+            "crate" => {
+                if segments.get(1) != Some(&"core") || segments.get(2) != Some(&"klippy") {
+                    return None;
+                }
+                // `crate::core::klippy` is the tree root itself, so the rest of
+                // the path is relative to the root, not to this file's directory.
+                dir.clear();
+                segments.drain(..3);
+            }
+            "self" => {
+                segments.remove(0);
+                dir = own;
+            }
+            "super" => {
+                // The first `super` is this file's own directory; each further
+                // one steps out of a module directory.
+                segments.remove(0);
+                while segments.first() == Some(&"super") {
+                    segments.remove(0);
+                    dir = parent_dir(&dir).to_string();
+                }
+            }
+            _ => return None,
+        }
+        if segments.is_empty() {
+            return None;
+        }
+        let rel = if dir.is_empty() {
+            segments.join("/")
+        } else {
+            format!("{dir}/{}", segments.join("/"))
+        };
+        [format!("{rel}.rs"), format!("{rel}/mod.rs")]
+            .into_iter()
+            .find(|candidate| self.root.join(candidate).is_file())
+    }
+}
+
+impl<'a> Ctx<'a> {
+    fn tokens(&self) -> &[Token] {
+        &self.file.tokens
+    }
+
+    /// The same tree, read as `rel`.
+    fn in_file(&self, rel: &str) -> Result<Self, String> {
+        Ok(Self {
+            resolver: self.resolver,
+            file: self.resolver.file(rel).map_err(|error| error.to_string())?,
+        })
+    }
+}
+
+/// One `use` item's imports: the local name, the module path it comes from and
+/// the name it has there.
+///
+/// `a::b::c` imports `c` from `a::b`; `a::b::{c, d as e}` imports both. A glob
+/// and a nested tree are not followed.
+fn use_paths(tokens: &[Token]) -> Vec<(String, Vec<String>, String)> {
+    let mut out = Vec::new();
+    let mut i = skip_visibility(tokens);
+    let mut segments: Vec<String> = Vec::new();
+    loop {
+        let Some(Kind::Ident(segment)) = tokens.get(i).map(|token| &token.kind) else {
+            return out;
+        };
+        segments.push(segment.clone());
+        i += 1;
+        match tokens.get(i).map(|token| &token.kind) {
+            Some(Kind::Punct(':'))
+                if matches!(
+                    tokens.get(i + 1).map(|token| &token.kind),
+                    Some(Kind::Punct(':'))
+                ) =>
+            {
+                i += 2;
+                if matches!(
+                    tokens.get(i).map(|token| &token.kind),
+                    Some(Kind::Punct('{'))
+                ) {
+                    let Some(close) = close_bracket(tokens, i) else {
+                        return out;
+                    };
+                    for part in split_top_level(&tokens[i + 1..close]) {
+                        match part {
+                            [Token {
+                                kind: Kind::Ident(name),
+                                ..
+                            }] if name != "self" => {
+                                out.push((name.clone(), segments.clone(), name.clone()));
+                            }
+                            [Token {
+                                kind: Kind::Ident(name),
+                                ..
+                            }, Token {
+                                kind: Kind::Ident(word),
+                                ..
+                            }, Token {
+                                kind: Kind::Ident(alias),
+                                ..
+                            }] if word == "as" => {
+                                out.push((alias.clone(), segments.clone(), name.clone()));
+                            }
+                            _ => {}
+                        }
+                    }
+                    return out;
+                }
+                if matches!(
+                    tokens.get(i).map(|token| &token.kind),
+                    Some(Kind::Punct('*'))
+                ) {
+                    return out;
+                }
+            }
+            Some(Kind::Ident(word)) if word == "as" => {
+                let Some(Kind::Ident(alias)) = tokens.get(i + 1).map(|token| &token.kind) else {
+                    return out;
+                };
+                let Some(name) = segments.pop() else {
+                    return out;
+                };
+                out.push((alias.clone(), segments, name));
+                return out;
+            }
+            _ => {
+                let Some(name) = segments.pop() else {
+                    return out;
+                };
+                out.push((name.clone(), segments, name));
+                return out;
+            }
+        }
+    }
+}
+
+/// The index after a leading `pub` / `pub(crate)` on a `use` item.
+fn skip_visibility(tokens: &[Token]) -> usize {
+    let mut i = 0;
+    if matches!(tokens.first().map(|token| &token.kind), Some(Kind::Ident(word)) if word == "pub") {
+        i = 1;
+        if matches!(
+            tokens.get(i).map(|token| &token.kind),
+            Some(Kind::Punct('('))
+        ) {
+            if let Some(close) = close_bracket(tokens, i) {
+                i = close + 1;
+            }
+        }
+    }
+    i
+}
+
 /// What one file contributed.
 #[derive(Debug, Default)]
 struct FileScan {
@@ -176,11 +446,14 @@ struct FileScan {
     commands: Vec<(String, Vec<String>)>,
 }
 
-fn scan_file(path: &Path, rel: String) -> Result<FileScan, ScanError> {
-    let source = fs::read_to_string(path)
-        .map_err(|error| ScanError::new(format!("cannot read {}: {error}", path.display())))?;
-    let tokens = strip_cfg_test(tokenize(&source)?);
-    let loops = find_loops(&tokens);
+fn scan_file(source: Rc<SourceFile>, resolver: &Resolver) -> Result<FileScan, ScanError> {
+    let ctx = Ctx {
+        resolver,
+        file: source,
+    };
+    let tokens = ctx.tokens();
+    let rel = ctx.file.rel.clone();
+    let loops = find_loops(tokens);
 
     let mut scan = FileScan::default();
     let mut i = 0;
@@ -225,7 +498,7 @@ fn scan_file(path: &Path, rel: String) -> Result<FileScan, ScanError> {
 
         scan.call_sites += 1;
         let line = tokens[i].line;
-        let Some(close) = close_bracket(&tokens, i + 1) else {
+        let Some(close) = close_bracket(tokens, i + 1) else {
             scan.unresolved.push(Unresolved {
                 file: rel.clone(),
                 line,
@@ -235,7 +508,7 @@ fn scan_file(path: &Path, rel: String) -> Result<FileScan, ScanError> {
             continue;
         };
         let args = split_top_level(&tokens[i + 2..close]);
-        match resolve_call(&tokens, kind, &args, &loops, i) {
+        match resolve_call(&ctx, kind, &args, &loops, i, true) {
             Ok(commands) => {
                 scan.resolved_call_sites += 1;
                 scan.commands.extend(commands);
@@ -257,31 +530,54 @@ enum CallKind {
     Mux,
 }
 
+/// One call's arguments, each argument as its own tokens.
+struct Arguments(Vec<Vec<Token>>);
+
 /// Resolve one registration call to `(command, declared parameters)` pairs.
 ///
-/// A loop-driven call yields one pair per array element; everything else yields
-/// exactly one.
+/// A loop-driven call yields one pair per array element, a closure-driven one a
+/// pair per call of the closure; everything else yields exactly one.
 fn resolve_call(
-    tokens: &[Token],
+    ctx: &Ctx,
+    kind: CallKind,
+    args: &[&[Token]],
+    loops: &[Loop],
+    pos: usize,
+    expand_closure: bool,
+) -> Result<Vec<(String, Vec<String>)>, String> {
+    let attempt = resolve_arguments(ctx, kind, args, loops, pos);
+    if attempt.is_ok() || !expand_closure {
+        return attempt;
+    }
+    // A registration inside a `let register = |params| { … }` closure takes its
+    // command name from that closure's parameters, which only the calls of
+    // `register` supply (`extras/tmc.rs` registers four commands through one
+    // closure). Re-resolve each call with its arguments substituted.
+    let Some(calls) = closure_call_arguments(ctx, kind, args, pos)? else {
+        return attempt;
+    };
+    let mut out = Vec::new();
+    for call in calls {
+        let refs: Vec<&[Token]> = call.0.iter().map(Vec::as_slice).collect();
+        out.extend(resolve_call(ctx, kind, &refs, loops, pos, false)?);
+    }
+    Ok(out)
+}
+
+/// Resolve one registration call against its own arguments: the arguments of a
+/// loop-driven call index the loop's array rows.
+fn resolve_arguments(
+    ctx: &Ctx,
     kind: CallKind,
     args: &[&[Token]],
     loops: &[Loop],
     pos: usize,
 ) -> Result<Vec<(String, Vec<String>)>, String> {
-    let (name_arg, params_arg, key_arg) = match kind {
-        CallKind::Command => {
-            if args.len() != 5 {
-                return Err(format!("expected 5 arguments, found {}", args.len()));
-            }
-            (args[0], args[3], None)
-        }
-        CallKind::Mux => {
-            if args.len() != 6 {
-                return Err(format!("expected 6 arguments, found {}", args.len()));
-            }
-            (args[0], args[5], Some(args[1]))
-        }
-    };
+    let Declared {
+        name: name_arg,
+        params: params_arg,
+        key: key_arg,
+    } = split_arguments(kind, args)?;
 
     let enclosing = enclosing_loop(loops, pos);
     let name_binding = loop_binding(name_arg, enclosing);
@@ -291,14 +587,14 @@ fn resolve_call(
     // Only a loop-driven call needs the array rows.
     let rows = if name_binding.or(params_binding).or(key_binding).is_some() {
         let loop_ = enclosing.ok_or("a loop binding without an enclosing loop")?;
-        iterable_rows(tokens, loop_)?
+        iterable_rows(ctx.tokens(), loop_)?
     } else {
         Vec::new()
     };
 
-    let names = collect_names(tokens, &rows, name_binding, name_arg)?;
-    let paramses = collect_params(tokens, &rows, params_binding, params_arg)?;
-    let keys = collect_keys(tokens, &rows, key_binding, key_arg)?;
+    let names = collect_names(ctx, &rows, name_binding, name_arg)?;
+    let paramses = collect_params(ctx, &rows, params_binding, params_arg)?;
+    let keys = collect_keys(ctx, &rows, key_binding, key_arg)?;
 
     let count = names.len().max(paramses.len()).max(keys.len());
     let consistent = |len: usize| len == 1 || len == count;
@@ -318,6 +614,248 @@ fn resolve_call(
     Ok(out)
 }
 
+/// The three arguments of a registration that carry a declaration.
+struct Declared<'a> {
+    /// The command name.
+    name: &'a [Token],
+    /// The parameter list.
+    params: &'a [Token],
+    /// The key, for a mux command.
+    key: Option<&'a [Token]>,
+}
+
+/// The three arguments that carry a declaration: the command name, its
+/// parameter list, and a mux command's key.
+fn split_arguments<'a>(kind: CallKind, args: &[&'a [Token]]) -> Result<Declared<'a>, String> {
+    match kind {
+        CallKind::Command => {
+            if args.len() != 5 {
+                return Err(format!("expected 5 arguments, found {}", args.len()));
+            }
+            Ok(Declared {
+                name: args[0],
+                params: args[3],
+                key: None,
+            })
+        }
+        CallKind::Mux => {
+            if args.len() != 6 {
+                return Err(format!("expected 6 arguments, found {}", args.len()));
+            }
+            Ok(Declared {
+                name: args[0],
+                params: args[5],
+                key: Some(args[1]),
+            })
+        }
+    }
+}
+
+/// The re-resolved arguments for a registration whose command name or parameter
+/// list is an enclosing closure's parameter: one entry per call of that closure,
+/// with the call's arguments substituted for the parameters.
+///
+/// `None` when no such argument is a closure parameter, or when the closure is
+/// not bound to a name this file calls.
+fn closure_call_arguments(
+    ctx: &Ctx,
+    kind: CallKind,
+    args: &[&[Token]],
+    pos: usize,
+) -> Result<Option<Vec<Arguments>>, String> {
+    let Declared {
+        name: name_arg,
+        params: params_arg,
+        key: key_arg,
+    } = split_arguments(kind, args)?;
+    let Some(closure) = enclosing_closure(ctx.tokens(), pos) else {
+        return Ok(None);
+    };
+    let is_parameter = |arg: &[Token]| matches!(arg, [Token { kind: Kind::Ident(name), .. }] if closure.params.contains(name));
+    if ![Some(name_arg), key_arg, Some(params_arg)]
+        .into_iter()
+        .flatten()
+        .any(is_parameter)
+    {
+        return Ok(None);
+    }
+    let mut out = Vec::new();
+    for call in closure_calls(ctx.tokens(), &closure.binding) {
+        if call.0.len() != closure.params.len() {
+            continue;
+        }
+        let mut substituted = Arguments(args.iter().map(|arg| arg.to_vec()).collect());
+        for (index, arg) in args.iter().enumerate() {
+            let [Token {
+                kind: Kind::Ident(name),
+                ..
+            }] = *arg
+            else {
+                continue;
+            };
+            if let Some(position) = closure.params.iter().position(|param| param == name) {
+                substituted.0[index] = call.0[position].clone();
+            }
+        }
+        out.push(substituted);
+    }
+    if out.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(out))
+}
+
+/// A closure a `let` binds, with the names its parameter pattern binds.
+struct Closure {
+    /// The name the `let` binds the closure to.
+    binding: String,
+    /// The parameter names, in order.
+    params: Vec<String>,
+    /// The body, so the innermost closure around a call is the one found.
+    body: Range<usize>,
+}
+
+/// The innermost `let NAME = |params| { body }` whose body contains `pos`.
+///
+/// Only a closure bound to a name is followed: the calls of that name are where
+/// a registration inside it gets its command name and parameters.
+fn enclosing_closure(tokens: &[Token], pos: usize) -> Option<Closure> {
+    let mut found: Option<Closure> = None;
+    for (i, token) in tokens.iter().enumerate() {
+        if !matches!(&token.kind, Kind::Ident(word) if word == "let") {
+            continue;
+        }
+        let mut j = i + 1;
+        if matches!(tokens.get(j).map(|token| &token.kind), Some(Kind::Ident(word)) if word == "mut")
+        {
+            j += 1;
+        }
+        let Some(Kind::Ident(binding)) = tokens.get(j).map(|token| &token.kind) else {
+            continue;
+        };
+        j += 1;
+        if !matches!(
+            tokens.get(j).map(|token| &token.kind),
+            Some(Kind::Punct('='))
+        ) {
+            continue;
+        }
+        j += 1;
+        if matches!(tokens.get(j).map(|token| &token.kind), Some(Kind::Ident(word)) if word == "move")
+        {
+            j += 1;
+        }
+        if !matches!(
+            tokens.get(j).map(|token| &token.kind),
+            Some(Kind::Punct('|'))
+        ) {
+            continue;
+        }
+        let Some(params_end) = closure_params_end(tokens, j) else {
+            continue;
+        };
+        let open = params_end + 1;
+        if !matches!(
+            tokens.get(open).map(|token| &token.kind),
+            Some(Kind::Punct('{'))
+        ) {
+            continue;
+        }
+        let Some(end) = close_bracket(tokens, open) else {
+            continue;
+        };
+        let body = (open + 1)..end;
+        if !body.contains(&pos) {
+            continue;
+        }
+        let closure = Closure {
+            binding: binding.clone(),
+            params: closure_params(&tokens[j + 1..params_end]),
+            body,
+        };
+        if found
+            .as_ref()
+            .is_none_or(|current| current.body.start < closure.body.start)
+        {
+            found = Some(closure);
+        }
+    }
+    found
+}
+
+/// The index of the `|` that closes a closure's parameter list, at bracket
+/// depth 0.
+fn closure_params_end(tokens: &[Token], open: usize) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut i = open + 1;
+    while i < tokens.len() {
+        match tokens[i].kind {
+            Kind::Punct('(') | Kind::Punct('[') | Kind::Punct('{') => depth += 1,
+            Kind::Punct(')') | Kind::Punct(']') | Kind::Punct('}') => depth -= 1,
+            Kind::Punct('|') if depth == 0 => return Some(i),
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The names a closure's parameter pattern binds: the first name of each
+/// top-level parameter. `|cmd: &str, params: &[&str]|` binds `cmd` and
+/// `params`; the names in the types are not bindings.
+///
+/// An empty result means the pattern is not the flat list this scanner maps to
+/// a call's arguments one for one.
+fn closure_params(pattern: &[Token]) -> Vec<String> {
+    let mut out = Vec::new();
+    for part in split_top_level(pattern) {
+        let Some(Token {
+            kind: Kind::Ident(name),
+            ..
+        }) = part.first()
+        else {
+            return Vec::new();
+        };
+        out.push(name.clone());
+    }
+    out
+}
+
+/// Every call of the closure `binding` names, as its argument list.
+fn closure_calls(tokens: &[Token], binding: &str) -> Vec<Arguments> {
+    let mut out = Vec::new();
+    for (i, token) in tokens.iter().enumerate() {
+        if !matches!(&token.kind, Kind::Ident(name) if name == binding) {
+            continue;
+        }
+        let is_method = matches!(
+            i.checked_sub(1)
+                .and_then(|previous| tokens.get(previous))
+                .map(|token| &token.kind),
+            Some(Kind::Punct('.'))
+        );
+        if is_method {
+            continue;
+        }
+        if !matches!(
+            tokens.get(i + 1).map(|token| &token.kind),
+            Some(Kind::Punct('('))
+        ) {
+            continue;
+        }
+        let Some(close) = close_bracket(tokens, i + 1) else {
+            continue;
+        };
+        out.push(Arguments(
+            split_top_level(&tokens[i + 2..close])
+                .into_iter()
+                .map(<[Token]>::to_vec)
+                .collect(),
+        ));
+    }
+    out
+}
+
 /// The array index a call argument binds to, when it is a `for` loop variable.
 fn loop_binding(arg: &[Token], enclosing: Option<&Loop>) -> Option<usize> {
     let [Token {
@@ -334,45 +872,45 @@ fn loop_binding(arg: &[Token], enclosing: Option<&Loop>) -> Option<usize> {
 }
 
 fn collect_names(
-    tokens: &[Token],
+    ctx: &Ctx,
     rows: &[Vec<Vec<Token>>],
     binding: Option<usize>,
     arg: &[Token],
 ) -> Result<Vec<String>, String> {
     let Some(index) = binding else {
-        return Ok(vec![resolve_name_scalar(arg, tokens)?]);
+        return Ok(vec![resolve_name_scalar(arg, ctx)?]);
     };
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
         let field = row
             .get(index)
             .ok_or_else(|| format!("the loop element has no field {index}"))?;
-        out.push(resolve_name_scalar(field, tokens)?);
+        out.push(resolve_name_scalar(field, ctx)?);
     }
     Ok(out)
 }
 
 fn collect_params(
-    tokens: &[Token],
+    ctx: &Ctx,
     rows: &[Vec<Vec<Token>>],
     binding: Option<usize>,
     arg: &[Token],
 ) -> Result<Vec<Vec<String>>, String> {
     let Some(index) = binding else {
-        return Ok(vec![resolve_params_scalar(arg, tokens)?]);
+        return Ok(vec![resolve_params_scalar(arg, ctx)?]);
     };
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
         let field = row
             .get(index)
             .ok_or_else(|| format!("the loop element has no field {index}"))?;
-        out.push(resolve_params_scalar(field, tokens)?);
+        out.push(resolve_params_scalar(field, ctx)?);
     }
     Ok(out)
 }
 
 fn collect_keys(
-    tokens: &[Token],
+    ctx: &Ctx,
     rows: &[Vec<Vec<Token>>],
     binding: Option<usize>,
     arg: Option<&[Token]>,
@@ -381,14 +919,14 @@ fn collect_keys(
         return Ok(vec![None]);
     };
     let Some(index) = binding else {
-        return Ok(vec![Some(resolve_name_scalar(arg, tokens)?)]);
+        return Ok(vec![Some(resolve_name_scalar(arg, ctx)?)]);
     };
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
         let field = row
             .get(index)
             .ok_or_else(|| format!("the loop element has no field {index}"))?;
-        out.push(Some(resolve_name_scalar(field, tokens)?));
+        out.push(Some(resolve_name_scalar(field, ctx)?));
     }
     Ok(out)
 }
@@ -414,8 +952,9 @@ fn prepend_key(key: &str, params: Vec<String>) -> Vec<String> {
     declared
 }
 
-/// A command name: a string literal, or a same-file `const`/`static` `&str`.
-fn resolve_name_scalar(arg: &[Token], file: &[Token]) -> Result<String, String> {
+/// A command name: a string literal, or a `const`/`static` `&str` — in this
+/// file, or in a module a `use` names.
+fn resolve_name_scalar(arg: &[Token], ctx: &Ctx) -> Result<String, String> {
     let arg = strip_reference(arg);
     if let [Token {
         kind: Kind::Str(value),
@@ -429,49 +968,53 @@ fn resolve_name_scalar(arg: &[Token], file: &[Token]) -> Result<String, String> 
         ..
     }] = arg
     {
-        return const_string(file, name, 0);
+        return const_string(ctx, name, 0);
     }
     Err(format!(
-        "the command name is not a string literal or a same-file constant: {}",
+        "the command name is not a string literal or a constant: {}",
         render(arg)
     ))
 }
 
-fn const_string(file: &[Token], name: &str, depth: usize) -> Result<String, String> {
-    if depth > 8 {
+fn const_string(ctx: &Ctx, name: &str, depth: usize) -> Result<String, String> {
+    if depth > MAX_DEPTH {
         return Err(format!("constant {name} is nested too deeply"));
     }
-    let init = find_initializer(file, name, false)
-        .ok_or_else(|| format!("no same-file `const {name}` declaration"))?;
-    let init = strip_reference(init);
-    if let [Token {
-        kind: Kind::Str(value),
-        ..
-    }] = init
-    {
-        return Ok(value.clone());
+    if let Some(init) = find_initializer(ctx.tokens(), name, false) {
+        let init = strip_reference(init);
+        if let [Token {
+            kind: Kind::Str(value),
+            ..
+        }] = init
+        {
+            return Ok(value.clone());
+        }
+        if let [Token {
+            kind: Kind::Ident(other),
+            ..
+        }] = init
+        {
+            return const_string(ctx, other, depth + 1);
+        }
+        return Err(format!("constant {name} is not a string literal"));
     }
-    if let [Token {
-        kind: Kind::Ident(other),
-        ..
-    }] = init
-    {
-        return const_string(file, other, depth + 1);
-    }
-    Err(format!("constant {name} is not a string literal"))
+    let Some((file, target)) = ctx.file.imports.get(name) else {
+        return Err(format!(
+            "no `const {name}` declaration here or imported by a `use`"
+        ));
+    };
+    let ctx = ctx.in_file(file)?;
+    const_string(&ctx, target, depth + 1)
 }
 
-/// A parameter list: an array literal, or a same-file `const`/`static` array.
-fn resolve_params_scalar(arg: &[Token], file: &[Token]) -> Result<Vec<String>, String> {
-    resolve_params_inner(arg, file, 0)
+/// A parameter list: an array literal, a `const`/`static` array, or a
+/// zero-argument helper that builds one.
+fn resolve_params_scalar(arg: &[Token], ctx: &Ctx) -> Result<Vec<String>, String> {
+    resolve_params_inner(arg, ctx, 0)
 }
 
-fn resolve_params_inner(
-    arg: &[Token],
-    file: &[Token],
-    depth: usize,
-) -> Result<Vec<String>, String> {
-    if depth > 8 {
+fn resolve_params_inner(arg: &[Token], ctx: &Ctx, depth: usize) -> Result<Vec<String>, String> {
+    if depth > MAX_DEPTH {
         return Err("the parameter list is nested too deeply".to_string());
     }
     let arg = strip_reference(arg);
@@ -508,20 +1051,249 @@ fn resolve_params_inner(
         }
         return Ok(out);
     }
+    // `vec!["SAMPLE_COUNT", "AXIS"]`, the literal form of an array.
+    if matches!(first.kind, Kind::Ident(ref word) if word == "vec")
+        && matches!(arg.get(1).map(|token| &token.kind), Some(Kind::Punct('!')))
+    {
+        return resolve_params_inner(&arg[2..], ctx, depth + 1);
+    }
+    // `PROBE_POINTS_PARAMS.to_vec()`: a copy of a constant array.
+    if let [Token {
+        kind: Kind::Ident(name),
+        ..
+    }, Token {
+        kind: Kind::Punct('.'),
+        ..
+    }, Token {
+        kind: Kind::Ident(method),
+        ..
+    }, Token {
+        kind: Kind::Punct('('),
+        ..
+    }, Token {
+        kind: Kind::Punct(')'),
+        ..
+    }] = arg
+    {
+        if method == "to_vec" {
+            return resolve_const_array(ctx, name, depth + 1);
+        }
+    }
+    // `probe_points_params()`: a helper that builds the list.
+    if let [Token {
+        kind: Kind::Ident(name),
+        ..
+    }, Token {
+        kind: Kind::Punct('('),
+        ..
+    }, Token {
+        kind: Kind::Punct(')'),
+        ..
+    }] = arg
+    {
+        return resolve_params_fn(ctx, name, depth + 1);
+    }
     if let [Token {
         kind: Kind::Ident(name),
         ..
     }] = arg
     {
-        let init = find_initializer(file, name, false).ok_or_else(|| {
-            format!("no same-file `const {name}` declaration for the parameter list")
-        })?;
-        return resolve_params_inner(init, file, depth + 1);
+        return resolve_const_array(ctx, name, depth + 1);
     }
     Err(format!(
-        "the parameter list is neither an array literal nor a same-file constant: {}",
+        "the parameter list is neither an array literal, a constant, nor a helper: {}",
         render(arg)
     ))
+}
+
+/// The array `const`/`static` `name` holds: in this file, or in a module a `use`
+/// names.
+fn resolve_const_array(ctx: &Ctx, name: &str, depth: usize) -> Result<Vec<String>, String> {
+    if let Some(init) = find_initializer(ctx.tokens(), name, false) {
+        return resolve_params_inner(init, ctx, depth);
+    }
+    let Some((file, target)) = ctx.file.imports.get(name) else {
+        return Err(format!(
+            "no `const {name}` declaration here or imported by a `use` for the parameter list"
+        ));
+    };
+    let ctx = ctx.in_file(file)?;
+    resolve_const_array(&ctx, target, depth + 1)
+}
+
+/// The list the zero-argument helper `name` builds: in this file, or in a module
+/// a `use` names.
+fn resolve_params_fn(ctx: &Ctx, name: &str, depth: usize) -> Result<Vec<String>, String> {
+    if let Some(body) = find_fn_body(ctx.tokens(), name) {
+        return eval_params_fn(ctx, &body, name, depth);
+    }
+    let Some((file, target)) = ctx.file.imports.get(name) else {
+        return Err(format!(
+            "no `fn {name}()` here or imported by a `use` for the parameter list"
+        ));
+    };
+    let ctx = ctx.in_file(file)?;
+    resolve_params_fn(&ctx, target, depth + 1)
+}
+
+/// The body of a zero-argument `fn name` in this file: the tokens inside its
+/// braces. A method of the same name takes arguments, so it is not the helper
+/// this looks for.
+fn find_fn_body(tokens: &[Token], name: &str) -> Option<Range<usize>> {
+    for (i, token) in tokens.iter().enumerate() {
+        if !matches!(&token.kind, Kind::Ident(word) if word == "fn") {
+            continue;
+        }
+        if !matches!(tokens.get(i + 1).map(|token| &token.kind), Some(Kind::Ident(word)) if word == name)
+        {
+            continue;
+        }
+        if !matches!(
+            tokens.get(i + 2).map(|token| &token.kind),
+            Some(Kind::Punct('('))
+        ) {
+            continue;
+        }
+        let Some(close) = close_bracket(tokens, i + 2) else {
+            continue;
+        };
+        if close != i + 3 {
+            continue;
+        }
+        let Some(open) = find_body_brace(tokens, close + 1) else {
+            continue;
+        };
+        let Some(end) = close_bracket(tokens, open) else {
+            continue;
+        };
+        return Some((open + 1)..end);
+    }
+    None
+}
+
+/// The list a helper builds: its `let [mut] params = …` base, then every
+/// `params.push` / `params.extend` / `params.extend_from_slice` in the order the
+/// body runs them.
+fn eval_params_fn(
+    ctx: &Ctx,
+    body: &Range<usize>,
+    fn_name: &str,
+    depth: usize,
+) -> Result<Vec<String>, String> {
+    if depth > MAX_DEPTH {
+        return Err(format!(
+            "the parameters `{fn_name}` builds are nested too deeply"
+        ));
+    }
+    let tokens = &ctx.tokens()[body.clone()];
+    let Some((binding, base)) = bound_list(tokens) else {
+        return Err(format!("`fn {fn_name}` builds no `let` parameter list"));
+    };
+    let mut params = resolve_params_inner(base, ctx, depth + 1)?;
+    for (method, argument) in appends(tokens, &binding)? {
+        if method == "push" {
+            let [Token {
+                kind: Kind::Str(value),
+                ..
+            }] = strip_reference(argument)
+            else {
+                return Err(format!(
+                    "`fn {fn_name}` pushes a parameter that is not a literal"
+                ));
+            };
+            if !params.contains(value) {
+                params.push(value.clone());
+            }
+            continue;
+        }
+        for param in resolve_params_inner(argument, ctx, depth + 1)? {
+            if !params.contains(&param) {
+                params.push(param);
+            }
+        }
+    }
+    Ok(params)
+}
+
+/// The `let [mut] NAME = …;` that starts a helper's list: the binding and the
+/// tokens of its initializer.
+fn bound_list(tokens: &[Token]) -> Option<(String, &[Token])> {
+    for (i, token) in tokens.iter().enumerate() {
+        if !matches!(&token.kind, Kind::Ident(word) if word == "let") {
+            continue;
+        }
+        let mut j = i + 1;
+        if matches!(tokens.get(j).map(|token| &token.kind), Some(Kind::Ident(word)) if word == "mut")
+        {
+            j += 1;
+        }
+        let Some(Kind::Ident(binding)) = tokens.get(j).map(|token| &token.kind) else {
+            continue;
+        };
+        if !matches!(
+            tokens.get(j + 1).map(|token| &token.kind),
+            Some(Kind::Punct('='))
+        ) {
+            continue;
+        }
+        let Some(end) = statement_end(tokens, j + 2) else {
+            continue;
+        };
+        return Some((binding.clone(), &tokens[j + 2..end]));
+    }
+    None
+}
+
+/// The calls that add to the list `binding` builds, in order: the method and its
+/// argument. A method this scanner does not follow is an error, so a list built
+/// in a way it does not understand is reported rather than half-read.
+fn appends<'a>(tokens: &'a [Token], binding: &str) -> Result<Vec<(&'a str, &'a [Token])>, String> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        let is_binding = matches!(&tokens[i].kind, Kind::Ident(name) if name == binding);
+        let is_method = matches!(
+            i.checked_sub(1)
+                .and_then(|previous| tokens.get(previous))
+                .map(|token| &token.kind),
+            Some(Kind::Punct('.'))
+        );
+        if !is_binding || is_method {
+            i += 1;
+            continue;
+        }
+        if !matches!(
+            tokens.get(i + 1).map(|token| &token.kind),
+            Some(Kind::Punct('.'))
+        ) {
+            i += 1;
+            continue;
+        }
+        let Some(Kind::Ident(method)) = tokens.get(i + 2).map(|token| &token.kind) else {
+            return Err(format!(
+                "the parameter list is built with `{binding}.` and something that is not a method"
+            ));
+        };
+        if !matches!(
+            tokens.get(i + 3).map(|token| &token.kind),
+            Some(Kind::Punct('('))
+        ) {
+            return Err(format!(
+                "the parameter list is built with `{binding}.{method}`, which the scanner does not follow"
+            ));
+        }
+        if !matches!(method.as_str(), "push" | "extend" | "extend_from_slice") {
+            return Err(format!(
+                "the parameter list is built with `{binding}.{method}(…)`, which the scanner does not follow"
+            ));
+        }
+        let Some(close) = close_bracket(tokens, i + 3) else {
+            return Err(format!("`{binding}.{method}(` has no closing `)`"));
+        };
+        out.push((method.as_str(), &tokens[i + 4..close]));
+        i = close + 1;
+    }
+    Ok(out)
 }
 
 /// The tokens an `const`/`static` (and, when `include_let`, `let`) binding of
@@ -787,6 +1559,40 @@ fn split_top_level(tokens: &[Token]) -> Vec<&[Token]> {
         parts.push(&tokens[start..]);
     }
     parts
+}
+
+/// The `;` that ends the statement starting at `from`, at bracket depth 0 — a
+/// `;` inside a `use` tree is not the end of the item.
+fn statement_end(tokens: &[Token], from: usize) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut i = from;
+    while i < tokens.len() {
+        match tokens[i].kind {
+            Kind::Punct('(') | Kind::Punct('[') | Kind::Punct('{') => depth += 1,
+            Kind::Punct(')') | Kind::Punct(']') | Kind::Punct('}') => depth -= 1,
+            Kind::Punct(';') if depth == 0 => return Some(i),
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The directory of a path relative to the tree root; `""` at the root.
+fn parent_dir(rel: &str) -> &str {
+    match rel.rfind('/') {
+        Some(index) => &rel[..index],
+        None => "",
+    }
+}
+
+/// The file name of a path relative to the tree root, without its extension.
+fn file_stem(rel: &str) -> &str {
+    let name = match rel.rfind('/') {
+        Some(index) => &rel[index + 1..],
+        None => rel,
+    };
+    name.strip_suffix(".rs").unwrap_or(name)
 }
 
 fn strip_reference(tokens: &[Token]) -> &[Token] {

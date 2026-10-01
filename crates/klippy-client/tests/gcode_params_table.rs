@@ -15,23 +15,15 @@ use std::collections::BTreeSet;
 use klippy_client::gcode_params::BUILTIN;
 use klippy_client::gcode_params_scan;
 
-/// The call sites the scanner cannot resolve today, by file. Each is a dynamic
-/// name (the host's own forwarding helpers, a registration closure) or a
-/// parameter list built by a helper function rather than a literal or a
-/// same-file constant. If this changes, the scan changed.
-const KNOWN_UNRESOLVED_FILES: &[&str] = &[
-    "extras/axis_twist_compensation.rs",
-    "extras/bed_mesh.rs",
-    "extras/bed_tilt.rs",
-    "extras/delta_calibrate.rs",
-    "extras/load_cell_probe.rs",
-    "extras/probe.rs",
-    "extras/quad_gantry_level.rs",
-    "extras/screws_tilt_adjust.rs",
-    "extras/tmc.rs",
-    "extras/z_tilt.rs",
-    "gcode.rs",
-];
+/// The call sites the scanner cannot resolve today, by file.
+///
+/// What is left is the host's own forwarding helpers in `gcode.rs`
+/// (`register_command` / `register_mux_command`): the command name is a
+/// parameter of whoever calls them, so there is no literal to read at the
+/// registration. Every other site resolves — through a helper function that
+/// builds the list, a constant a sibling module defines, or the call sites of
+/// the closure that registers the command.
+const KNOWN_UNRESOLVED_FILES: &[&str] = &["gcode.rs"];
 
 #[test]
 fn test_builtin_table_is_what_a_fresh_scan_produces() {
@@ -81,7 +73,7 @@ fn test_every_registration_call_site_is_resolved_or_recorded() {
     let known: BTreeSet<&str> = KNOWN_UNRESOLVED_FILES.iter().copied().collect();
     assert_eq!(
         scan.unresolved.len(),
-        13,
+        3,
         "the number of unresolved registration call sites changed: {:#?}",
         scan.unresolved
     );

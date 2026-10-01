@@ -202,7 +202,13 @@ Enter send · Tab complete · ↑↓ history · PgUp/PgDn log · ^G g-code · Es
 
 ### 命令补全
 
-`Tab` 只补输入行的**第一个词**（参数不补）。候选有两个来源：
+`Tab` 补**光标所在的那个词**（只补名字，不补取值）：
+
+- **第一个词 = 命令名**（来源见下）；
+- **后面的词 = 参数名**：光标在 `=` **左边**（或该词还没有 `=`）时，用这条命令的参数名补它，替换范围止于 `=`，所以循环候选只改名字、`=fan`/`=1` 原样保留；光标已经落在 `=` **右边**（值里）就**不补**（本期不补取值）；
+- 非首位、词为空（如 `SET_PIN PIN=fan |`）→ 列出该命令的全部参数名。
+
+命令名的候选来源：
 
 - **`/` 开头**：本地命令——会话的 `/help` `/subscribe` `/quit` 等与窗口的 `/gcode` `/mouse`
   `/yaml` `/json`。候选**带斜杠**、只列规范名；别名照旧可用，所以敲 `/h` 也能补到 `/help`。
@@ -211,7 +217,7 @@ Enter send · Tab complete · ↑↓ history · PgUp/PgDn log · ^G g-code · Es
   的内建命令（`M115`、`M110`、`ECHO` …）也在里面**（主机的 `gcode/help` 只有带描述的那部分，
   会漏掉它们，补全不用它）。进入 g-code 模式时拉一次，
   **没得到答案就会一直补问**（按 `Tab` 会再问一次）——`ready` 不是前提：状态行只反映窗口**收到过的**状态（连接时的 `info`、订阅 `webhooks` 时应答里的即时快照，以及之后 `klippy:status` 推送），订阅建立之前它可能还是旧值；匹配大小写不敏感，`m1` 能补到 `M115`，
-  写进去的是打印机自己的拼写。
+  写进去的是打印机自己的拼写。 同一次请求还带回每条命令的 `parameters`（该命令声明过的具名参数），**参数名以它为准**；某条命令没给 `parameters` 时，该命令的参数名取自窗口签入的内建表（`crates/klippy-client/src/gcode_params.rs`，由主机源码的声明生成）。
 
 请求模式下敲裸方法名不补——方法名是主机的，窗口没有那份清单（`/subscribe` 之后
 对象名倒是知道，但那是另一回事）。
@@ -226,9 +232,9 @@ Enter send · Tab complete · ↑↓ history · PgUp/PgDn log · ^G g-code · Es
 
 **没有候选时会写一行提示**，不会出现「按了没反应又不知道为什么」：本地词会说
 `no local command starts with "/zz"`，g-code 词会说 `no G-Code command starts with "M1x"
-(the printer reports 13 commands)`；还没拿到命令表时会把打印机自报的状态写出来，例如 `no G-Code command list yet:
-the printer reports "startup" (Tab asks again)`；若打印机答了但表是空的，则说
-`the printer answered objects/query but listed no commands`。请求模式下敲裸方法名本来就没有清单，
+(the printer reports 13 commands)`；打印机**答不上来**（超时/被拒）时，命令名与参数名都退回上面那份内建表，并且
+**每场会话只提示一条** `no G-code parameters from the printer; using the built-in table`；
+打印机答了、但某条命令没给参数名时，那条命令的参数名同样取自内建表（**不**额外提示）。请求模式下敲裸方法名本来就没有清单，
 所以那条路保持安静。
 
 日志区最右边一列是滚动条：占满一屏时显示滑块（`█`）与轨道（`│`），停在底部时

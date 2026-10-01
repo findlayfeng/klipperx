@@ -53,22 +53,32 @@
 //!
 //! ## Completion
 //!
-//! `Tab` completes the *first* word of the line — the names of things, which is
-//! what a terminal can usefully finish — and the candidates come from the two
-//! places the window knows names from:
+//! `Tab` completes the word at the caret — the names of things, which is what a
+//! terminal can usefully finish — and the candidates come from the places the
+//! window knows names from:
 //!
 //! - A word starting with `/` completes from the window's own commands and the
 //!   session's (`/help`, `/gcode`, `/subscribe`, …): a local command never
 //!   reaches the printer, so the client is the only one who can name it.
-//! - A bare word in g-code mode completes from the printer's command names, as
-//!   the `gcode` object of `objects/query` lists them. That list is asked for
-//!   the first time g-code mode is entered and asked again on later visits
-//!   until the printer answers: the state the header shows only moves when the
-//!   printer reports a change (see [`event_loop`]), so a printer that has not
-//!   reported `ready` yet is one there is nothing to wait for, and a printer
-//!   that is not up yet refuses the query rather than making it wait, so there
-//!   is nothing to lose by asking. Once answered — even with an empty list — it
-//!   is kept, as the list does not change under a running session.
+//! - The first word of a g-code line completes from the printer's command
+//!   names, as the `gcode` object of `objects/query` lists them. That table is
+//!   asked for the first time g-code mode is entered and asked again on later
+//!   visits until the printer answers: the state the header shows only moves
+//!   when the printer reports a change (see [`event_loop`]), so a printer that
+//!   has not reported `ready` yet is one there is nothing to wait for, and a
+//!   printer that is not up yet refuses the query rather than making it wait,
+//!   so there is nothing to lose by asking. Once answered — even with an empty
+//!   list — it is kept, as the list does not change under a running session.
+//! - A later word of a g-code line, before its `=`, completes from that
+//!   command's parameter names, which come from the same answer. What follows
+//!   the `=` is a value, and a value is the printer's business: the window has
+//!   no list of those. A `/`-line's arguments are the session's, and a
+//!   request's are the printer's, so neither is completed either.
+//!
+//! Until the printer answers, both the command names and the parameters come
+//! from the built-in table [`gcode_params::BUILTIN`] — generated from this
+//! host's sources, so it is the right list for a printer of this host — and the
+//! first `Tab` that draws on it says so once in the log.
 //!
 //! One candidate the line does not already spell is simply filled in; one the
 //! line already spells opens the layer on it, so that a `Tab` on a whole name
@@ -99,6 +109,7 @@
 //!   subscription will grow it without bound.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::io::IsTerminal as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -118,6 +129,7 @@ use serde_json::Value;
 use klippy_api::address::ApiTarget;
 use klippy_api::TransportError;
 
+use crate::gcode_params;
 use crate::session::{self, Control, Entry, LogLevel, Notice, Output, Session};
 
 /// How often the keyboard thread wakes to check whether it should stop.
@@ -275,16 +287,29 @@ struct App {
     gcode_subscribed: bool,
     /// The printer's own command names, from the `gcode` object of
     /// `objects/query`, for completing a g-code line. Empty until g-code mode is
-    /// first entered (see [`App::ensure_gcode_commands`]) — and empty is what
-    /// "no candidates" means, so a printer without them costs nothing.
+    /// first entered (see [`App::ensure_gcode_commands`]) — and empty with
+    /// [`App::gcode_commands_asked`] false is what a completion falls back to the
+    /// built-in table from (see [`App::command_names`]).
     gcode_commands: Vec<String>,
-    /// Whether the printer's command list has been answered for this connection.
+    /// The parameter names the printer gave for each of those commands, from
+    /// the same answer. A command it named none for is absent, and the built-in
+    /// table stands in for it (see [`App::parameter_names`]).
+    gcode_parameters: HashMap<String, Vec<String>>,
+    /// Whether the printer's command table has been answered for this connection.
     ///
     /// Answered — even with nothing in it — is what stops the window asking
     /// again: a printer that has no named commands would otherwise be asked
     /// once per `^G`. A refusal (a printer still coming up) leaves this false
     /// on purpose, so the next visit can try again.
+    ///
+    /// It is also what says which table a completion drew on: until it is true
+    /// the window completes from its built-in table.
     gcode_commands_asked: bool,
+    /// Whether the log has been told that a completion drew on the built-in
+    /// table (see [`App::warn_about_the_builtin_table`]). One per session, not
+    /// one per `Tab`: it is the same fact every time, and the log is for what
+    /// happened.
+    gcode_fallback_warned: bool,
     /// Whether the handshake's `info` has been answered.
     ///
     /// Until it has, an `info` reply is the header's business rather than the
@@ -362,7 +387,9 @@ impl App {
             gcode: false,
             gcode_subscribed: false,
             gcode_commands: Vec::new(),
+            gcode_parameters: HashMap::new(),
             gcode_commands_asked: false,
+            gcode_fallback_warned: false,
             greeted: false,
             render: Render::DEFAULT,
         }
@@ -454,22 +481,26 @@ impl App {
         self.gcode && !self.gcode_commands_asked
     }
 
-    /// Ask the printer for its command names, once, for completion.
+    /// Ask the printer for its command table, once, for completion.
     ///
-    /// The `gcode` object of `objects/query` is the only list of them, and the
-    /// printer cannot answer it until it is up, so the ask is made the first
-    /// time g-code mode is entered and repeated on later visits until it is
-    /// answered (see [`App::needs_gcode_commands`] for why `ready` is not
-    /// waited for).
-    /// Failing is not news: the list is a convenience, an empty one only means
-    /// `Tab` has nothing to offer, and a notice per `^G` would be noise in the
-    /// log that the log is for.
+    /// The `gcode` object of `objects/query` is the only list of command names,
+    /// and the one place the parameter names are reported too, so one ask
+    /// answers both. The printer cannot answer it until it is up, so the ask is
+    /// made the first time g-code mode is entered and repeated on later visits
+    /// until it is answered (see [`App::needs_gcode_commands`] for why `ready`
+    /// is not waited for).
+    ///
+    /// Failing is not news of its own: completion falls back to the built-in
+    /// table, which says what it can, and a notice per `^G` about a printer
+    /// that is simply still loading would be noise in the log that the log is
+    /// for.
     async fn ensure_gcode_commands(&mut self, session: &mut Session) {
         if !self.needs_gcode_commands() {
             return;
         }
-        if let Ok(Some(names)) = session.gcode_commands(self, GCODE_COMMANDS_WINDOW).await {
-            self.gcode_commands = names;
+        if let Ok(Some(commands)) = session.gcode_commands(self, GCODE_COMMANDS_WINDOW).await {
+            self.gcode_commands = commands.names;
+            self.gcode_parameters = commands.parameters;
             // A refusal is not an answer: the flag stays false so the next
             // visit to the mode can ask a printer that has come up since.
             self.gcode_commands_asked = true;
@@ -686,7 +717,7 @@ impl App {
                 self.push(Entry::notice(
                     Notice::Info,
                     format!(
-                        "{}\n\nWindow:\n  /yaml / /json   show message bodies as YAML or JSON\n  /gcode          toggle g-code mode (^G): typed lines go to gcode/script\n  /mouse          hand the mouse back to the terminal (^S, or click the log) so text can be selected\n  Tab / BackTab   complete the first word, then walk the candidates; any other key closes the list\n  Backspace       closes the candidate list and deletes, in one press\n  ^↑ / ^↓         scroll the log one line, even at the newest entry\n  Esc ×3          emergency stop (Esc on its own does nothing)",
+                        "{}\n\nWindow:\n  /yaml / /json   show message bodies as YAML or JSON\n  /gcode          toggle g-code mode (^G): typed lines go to gcode/script\n  /mouse          hand the mouse back to the terminal (^S, or click the log) so text can be selected\n  Tab / BackTab   complete the word at the caret, then walk the candidates; any other key closes the list\n  Backspace       closes the candidate list and deletes, in one press\n  ^↑ / ^↓         scroll the log one line, even at the newest entry\n  Esc ×3          emergency stop (Esc on its own does nothing)",
                         session::usage()
                     ),
                 ));
@@ -1895,43 +1926,61 @@ impl Input {
         (shown, self.cursor - start)
     }
 
-    /// The first word of the line, when the caret is in it.
+    /// The word the caret is in, if it is in one.
     ///
-    /// `None` is "there is nothing here to complete", and it is the honest
-    /// answer in three cases the caller does not have to know apart: the caret
-    /// is past the first word (what follows is an argument, and the window has
-    /// nothing to say about arguments); the line has only blanks before the
-    /// caret; or the caret is in the middle of a gap between words.
+    /// `None` is "there is nothing here to complete": the caret is on a blank
+    /// — in the gap between two words, or in the blanks a line was started with
+    /// — or the line is nothing but blanks.
     ///
     /// An empty line is the exception: it is a word of no characters, so `Tab`
     /// there lists everything that could be typed rather than nothing. That is
     /// the only way to browse the candidates when no prefix is known. Blank
     /// lines are not that case — they have a word, the reader just has not
-    /// started it — so they stay `None`.
+    /// started it — so they stay `None`. A word of no characters at the *end*
+    /// of a line that has one is the same case one step along: `SET_PIN PIN=fan `
+    /// is asking what comes next, which is what lists that command's parameters.
     fn completion_word(&self) -> Option<Word> {
         if self.buffer.is_empty() {
             return Some(Word { start: 0, end: 0 });
         }
-        let before = &self.buffer[..self.cursor];
-        // Leading blanks belong to the line, not to the word: `/help` indented
-        // by a space is still the command the line is.
-        let start = before
-            .iter()
-            .position(|character| !character.is_whitespace())?;
-        if before[start..]
-            .iter()
-            .any(|character| character.is_whitespace())
+        // A blank under the caret is a gap, not a word: completion replaces the
+        // word it is in, and there is none to replace there.
+        if self.buffer[self.cursor..]
+            .first()
+            .is_some_and(|character| character.is_whitespace())
         {
             return None;
         }
-        // The word runs to the first blank after the caret, or to the end of the
-        // line: completion replaces the whole of it, wherever in it the caret
-        // happens to be.
+        // The word runs back to the blank before the caret and forward to the
+        // blank after it, or to the ends of the line: completion replaces the
+        // whole of it, wherever in it the caret happens to be.
+        let start = self.buffer[..self.cursor]
+            .iter()
+            .rposition(|character| character.is_whitespace())
+            .map_or(0, |index| index + 1);
         let end = self.buffer[self.cursor..]
             .iter()
             .position(|character| character.is_whitespace())
             .map_or(self.buffer.len(), |offset| self.cursor + offset);
+        if start == self.cursor && self.buffer[..start].iter().all(|c| c.is_whitespace()) {
+            // Nothing but blanks: a word has been started, but there is nothing
+            // in it that names anything.
+            return None;
+        }
         Some(Word { start, end })
+    }
+
+    /// The first word of the line, if it has one.
+    ///
+    /// Leading blanks are not part of it. What a later word is an argument *of*:
+    /// `PIN=` is a parameter only if the line really starts with `SET_PIN`.
+    fn first_word(&self) -> Option<String> {
+        let start = self.buffer.iter().position(|c| !c.is_whitespace())?;
+        let end = self.buffer[start..]
+            .iter()
+            .position(|c| c.is_whitespace())
+            .map_or(self.buffer.len(), |offset| start + offset);
+        Some(self.buffer[start..end].iter().collect())
     }
 
     /// The characters a [`Word`] covers.
@@ -1969,11 +2018,11 @@ impl Input {
 /// of these is answered holds the two spellings together.
 const WINDOW_COMMANDS: &[&str] = &["gcode", "mouse", "yaml", "json", "help"];
 
-/// Where the first word of the input line is.
+/// Where one word of the input line is.
 ///
-/// Completion is for one word and one word only, so what it needs from the line
-/// is where that word begins and ends. Both are character offsets, the unit
-/// [`Input`] counts in.
+/// Completion is for one word at a time, so what it needs from the line is where
+/// that word begins and ends. Both are character offsets, the unit [`Input`]
+/// counts in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Word {
     /// Where the word starts, from the start of the line.
@@ -2030,6 +2079,95 @@ fn common_prefix(names: &[String]) -> String {
     prefix.into_iter().collect()
 }
 
+/// What a `Tab` at the caret is completing.
+///
+/// The line says which names are wanted: the first word of a G-Code line is a
+/// command name, and a later word before its `=` is a parameter of the command
+/// the line starts with. Everything else — a local word's arguments, a
+/// request's, a value — has no list in the window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Target {
+    /// The first word of the line: a local command, or a G-Code command name.
+    Command {
+        /// The word in the line, which is what a candidate replaces.
+        word: Word,
+        /// What is typed of it, which is what a candidate has to start with.
+        prefix: String,
+    },
+    /// A later word of a G-Code line, before its `=`: a parameter name of
+    /// `command`. The word ends at the `=` when there is one, so that replacing
+    /// it leaves the value beside it alone.
+    Parameter {
+        /// The command whose parameters are being completed. Each word carries
+        /// its command, so a completion needs no reading back through the line.
+        command: String,
+        /// The name part of the word.
+        word: Word,
+        /// What is typed of the name, up to the caret: the caret may be in the
+        /// middle of it.
+        prefix: String,
+    },
+}
+
+impl Target {
+    /// The span of the line a candidate replaces.
+    fn word(&self) -> Word {
+        match self {
+            Target::Command { word, .. } | Target::Parameter { word, .. } => *word,
+        }
+    }
+
+    /// Whether this is a local command, which the window answers itself.
+    fn is_local(&self) -> bool {
+        matches!(self, Target::Command { prefix, .. } if prefix.starts_with('/'))
+    }
+}
+
+/// The candidates among `names` that start with `prefix`, matched without case.
+///
+/// G-Code is written in capitals but typed in lower case, and what goes into
+/// the line is the name as its source spells it (the printer's own, or the
+/// built-in table's), so that what is inserted is what runs.
+fn matching(names: &[String], prefix: &str) -> Vec<String> {
+    let typed = prefix.to_ascii_lowercase();
+    names
+        .iter()
+        .filter(|name| name.to_ascii_lowercase().starts_with(&typed))
+        .cloned()
+        .collect()
+}
+
+/// The parameter names the built-in table declares for `command`, which is
+/// spelled the way the printer spells it (capitalised).
+fn builtin_parameters(command: &str) -> &'static [&'static str] {
+    gcode_params::BUILTIN
+        .iter()
+        .find(|(name, _)| *name == command)
+        .map_or(&[], |(_, parameters)| *parameters)
+}
+
+/// The local commands — and the window's own — that start with `prefix`.
+///
+/// Only the canonical name of each: the aliases would double every entry, and
+/// `/h` finds `/help` by prefix anyway. `help` is both the window's and the
+/// session's — one entry is enough, since the reader is choosing a line to type,
+/// not a place for it to go.
+fn local_command_candidates(prefix: &str) -> Vec<String> {
+    let mut candidates: Vec<String> = Vec::new();
+    for name in session::LOCAL_COMMANDS
+        .iter()
+        .map(|(name, _)| *name)
+        .chain(WINDOW_COMMANDS.iter().copied())
+    {
+        let candidate = format!("/{name}");
+        if candidate.starts_with(prefix) && !candidates.contains(&candidate) {
+            candidates.push(candidate);
+        }
+    }
+    candidates.sort();
+    candidates
+}
+
 impl App {
     /// The keypresses that belong to completion, and whether they were one.
     ///
@@ -2079,12 +2217,14 @@ impl App {
     /// from a `Tab` that was not received, which is what made a missing command
     /// list hard to notice.
     fn complete(&mut self) {
-        let Some(word) = self.input.completion_word() else {
+        let Some(target) = self.completion_target() else {
             return;
         };
-        let candidates = self.completions();
+        self.warn_about_the_builtin_table(&target);
+        let candidates = self.completions_for(&target);
+        let word = target.word();
         match candidates.as_slice() {
-            [] => self.explain_no_candidates(&word),
+            [] => self.explain_no_candidates(&target),
             [only] => {
                 if *only == self.input.word_text(&word) {
                     // The name is already whole, so the layer is what is left to
@@ -2122,49 +2262,78 @@ impl App {
         }
     }
 
+    /// Say once that the candidates are the built-in table's, not the printer's.
+    ///
+    /// The printer is asked for its command table whenever g-code mode is
+    /// entered and again on every `Tab` until it answers, so by the time a
+    /// completion runs the ask has just been made — and a refusal, which is what
+    /// a printer still coming up sends, is not an answer. Which table the names
+    /// came from is worth one line in the log, and only one: completing a
+    /// command the machine does not have looks exactly like completing from a
+    /// list it does, and a line per `Tab` would bury the log in the same fact.
+    fn warn_about_the_builtin_table(&mut self, target: &Target) {
+        if !self.gcode
+            || self.gcode_commands_asked
+            || self.gcode_fallback_warned
+            // A local word is the window's own list, and needs no printer.
+            || target.is_local()
+        {
+            return;
+        }
+        self.gcode_fallback_warned = true;
+        self.write(Entry::notice(
+            Notice::Problem,
+            "no G-code parameters from the printer; using the built-in table",
+        ));
+    }
+
     /// Say why a `Tab` found nothing, when there is a source that should have.
     ///
-    /// Only g-code mode has anything to say: its list comes from the printer, so
-    /// an empty one is the printer's business — either it never answered, or it
-    /// has no command by that name. A bare word in request mode draws from
-    /// nothing by design (a method name is the printer's and the window has no
-    /// list of those), so a notice there would explain a non-feature.
+    /// Only g-code mode has anything to say: its names come from the printer,
+    /// whose answer either never arrived or has no name by that prefix. A bare
+    /// word in request mode draws from nothing by design (a method name is the
+    /// printer's and the window has no list of those), so a notice there would
+    /// explain a non-feature.
     ///
     /// The notice goes to the log rather than the input line, so what was typed
     /// is left exactly as it was.
-    fn explain_no_candidates(&mut self, word: &Word) {
-        let typed = self.input.word_text(word);
-        let text = if typed.starts_with('/') {
+    fn explain_no_candidates(&mut self, target: &Target) {
+        let text = match target {
             // A `/` word is answered from the local commands even here, so a
             // miss is the window's own list talking, not the printer's.
-            format!("no local command starts with \"{typed}\"")
-        } else if !self.gcode {
+            Target::Command { prefix, .. } if target.is_local() => {
+                format!("no local command starts with \"{prefix}\"")
+            }
             // A bare word in request mode had no list to begin with: there is
             // nothing to explain, and a notice per stray `Tab` would be noise.
-            return;
-        } else if self.gcode_commands.is_empty() {
-            if self.gcode_commands_asked {
-                // The printer did answer and its list was empty: there is
-                // nothing to retry, so the notice reports what came back.
-                "the printer answered objects/query but listed no commands".to_string()
-            } else {
-                // No answer yet — either nothing has been asked or the printer
-                // refused because it is not up. The state is the handshake's
-                // one `info`, so it may be stale; it is quoted rather than
-                // judged, and the next `Tab` asks again either way.
-                let state = match &self.status {
-                    Status::Connected { state, .. } => state.as_str(),
-                    Status::Unknown | Status::Closed(_) => "unknown",
-                };
-                format!(
-                    "no G-Code command list yet: the printer reports \"{state}\" (Tab asks again)"
-                )
+            Target::Command { .. } if !self.gcode => return,
+            Target::Command { prefix, .. } if self.gcode_commands_asked => {
+                if self.gcode_commands.is_empty() {
+                    // The printer did answer and its list was empty: there is
+                    // nothing to retry, so the notice reports what came back.
+                    "the printer answered objects/query but listed no commands".to_string()
+                } else {
+                    format!(
+                        "no G-Code command starts with \"{prefix}\" (the printer reports {} commands)",
+                        self.gcode_commands.len()
+                    )
+                }
             }
-        } else {
-            format!(
-                "no G-Code command starts with \"{typed}\" (the printer reports {} commands)",
-                self.gcode_commands.len()
-            )
+            Target::Command { prefix, .. } => format!(
+                "no G-Code command starts with \"{prefix}\" (the built-in table has {} commands)",
+                gcode_params::BUILTIN.len()
+            ),
+            Target::Parameter {
+                command, prefix, ..
+            } => {
+                if self.parameter_names(command).is_empty() {
+                    // Neither source names a parameter of this command, so the
+                    // miss is not about the prefix at all.
+                    format!("no parameter names are known for {command}")
+                } else {
+                    format!("no parameter of {command} starts with \"{prefix}\"")
+                }
+            }
         };
         self.write(Entry::notice(Notice::Info, text));
     }
@@ -2200,49 +2369,115 @@ impl App {
         completion.word = word;
     }
 
+    /// What the word at the caret is a name of, if it is a name of anything.
+    ///
+    /// The first word of a line names the line: a local command in either mode
+    /// (`/help`), or a G-Code command in g-code mode. A later word names an
+    /// argument, and the only arguments the window has names for are a G-Code
+    /// command's parameters — which is also why a `/`-line's arguments and a
+    /// request's are not completed: the first are the session's business and the
+    /// second the printer's.
+    ///
+    /// `None` is the same "nothing here to complete" the word itself can say,
+    /// plus one case of its own: a word to the right of the `=` in it. That is a
+    /// value, and a value is the printer's; only the names on the left are the
+    /// window's.
+    fn completion_target(&self) -> Option<Target> {
+        let word = self.input.completion_word()?;
+        // Nothing but blanks before the word makes it the first one: an
+        // indented `/help` is still the command the line is.
+        if self.input.buffer[..word.start]
+            .iter()
+            .all(|character| character.is_whitespace())
+        {
+            return Some(Target::Command {
+                word,
+                prefix: self.input.word_text(&word),
+            });
+        }
+        if !self.gcode {
+            return None;
+        }
+        let command = self.input.first_word()?;
+        if command.starts_with('/') {
+            return None;
+        }
+        let equals = self.input.buffer[word.start..word.end]
+            .iter()
+            .position(|character| *character == '=')
+            .map(|offset| word.start + offset);
+        if equals.is_some_and(|equals| self.input.cursor > equals) {
+            return None;
+        }
+        // The word ends at the `=` when there is one, so that replacing it —
+        // which `Tab` does as the reader walks the candidates — leaves the value
+        // beside it where it was, and only the name changes.
+        let prefix: String = self.input.buffer[word.start..self.input.cursor]
+            .iter()
+            .collect();
+        Some(Target::Parameter {
+            command,
+            word: Word {
+                start: word.start,
+                end: equals.unwrap_or(word.end),
+            },
+            prefix,
+        })
+    }
+
     /// The names the word at the caret could be completed to.
     ///
-    /// A word starting with `/` is answered from the window's commands and the
-    /// session's; a bare word in g-code mode from the printer's command names;
-    /// and a bare word in request mode from nothing, because a method name is
-    /// the printer's and the window has no list of those to offer.
-    fn completions(&self) -> Vec<String> {
-        let Some(word) = self.input.completion_word() else {
-            return Vec::new();
-        };
-        let prefix = self.input.word_text(&word);
-
-        if prefix.starts_with('/') {
-            // Only the canonical name of each command: the aliases would double
-            // every entry, and `/h` finds `/help` by prefix anyway. `help` is
-            // both the window's and the session's — one entry is enough, since
-            // the reader is choosing a line to type, not a place for it to go.
-            let mut candidates: Vec<String> = Vec::new();
-            for name in session::LOCAL_COMMANDS
-                .iter()
-                .map(|(name, _)| *name)
-                .chain(WINDOW_COMMANDS.iter().copied())
-            {
-                let candidate = format!("/{name}");
-                if candidate.starts_with(&prefix) && !candidates.contains(&candidate) {
-                    candidates.push(candidate);
-                }
-            }
-            candidates.sort();
-            candidates
-        } else if self.gcode {
-            // The printer's own names, matched without case: G-Code is written
-            // in capitals but typed in lower case, and what goes in the line is
-            // the name the printer spells (so what is inserted runs).
-            let typed = prefix.to_ascii_lowercase();
-            self.gcode_commands
-                .iter()
-                .filter(|name| name.to_ascii_lowercase().starts_with(&typed))
-                .cloned()
-                .collect()
-        } else {
-            Vec::new()
+    /// What `complete` works from, so that a test can look at the candidates
+    /// without a keypress making a layer of them.
+    fn completions_for(&self, target: &Target) -> Vec<String> {
+        match target {
+            Target::Command { prefix, .. } if target.is_local() => local_command_candidates(prefix),
+            Target::Command { prefix, .. } if self.gcode => matching(&self.command_names(), prefix),
+            Target::Command { .. } => Vec::new(),
+            Target::Parameter {
+                command, prefix, ..
+            } => matching(&self.parameter_names(command), prefix),
         }
+    }
+
+    /// The command names a line completes from: the printer's, once it has
+    /// answered, and the built-in table's until then.
+    ///
+    /// A printer that is up knows better than a table built from the sources —
+    /// it knows what its configuration actually registered, and the names it
+    /// spells are the ones that run — but one that has not answered leaves `Tab`
+    /// with nothing at all, which is worse than a table for a printer of this
+    /// same host.
+    fn command_names(&self) -> Vec<String> {
+        if self.gcode_commands_asked {
+            return self.gcode_commands.clone();
+        }
+        gcode_params::BUILTIN
+            .iter()
+            .map(|(name, _)| (*name).to_string())
+            .collect()
+    }
+
+    /// The parameter names of `command`: the printer's if it named any, and the
+    /// built-in table's otherwise.
+    ///
+    /// The printer's answer wins where there is one, for the same reason its
+    /// command names do. A command it named none for says nothing at all — a
+    /// host too old to report parameters is exactly the case this falls back
+    /// for — and the built-in table then has the names the command declared
+    /// upstream. Lookups are without case: the table is keyed by the name the
+    /// source spells, and a line may be typed in lower case.
+    fn parameter_names(&self, command: &str) -> Vec<String> {
+        let name = command.to_ascii_uppercase();
+        if let Some(named) = self.gcode_parameters.get(&name) {
+            if !named.is_empty() {
+                return named.clone();
+            }
+        }
+        builtin_parameters(&name)
+            .iter()
+            .map(|parameter| (*parameter).to_string())
+            .collect()
     }
 }
 
@@ -4132,12 +4367,32 @@ mod tests {
         }
     }
 
-    /// An app in g-code mode with the printer's command names already cached,
+    /// The candidates `Tab` would find at the caret, without the keypress and
+    /// so without the layer or the notice one might make.
+    fn candidates_at(app: &App) -> Vec<String> {
+        match app.completion_target() {
+            Some(target) => app.completions_for(&target),
+            None => Vec::new(),
+        }
+    }
+
+    /// An app in g-code mode with the printer's command table already cached,
     /// which is what a bare g-code word completes from.
     fn app_with_gcode_commands(names: &[&str]) -> App {
         let mut app = app_with(Vec::new());
         app.gcode = true;
         app.gcode_commands = names.iter().map(|name| (*name).to_string()).collect();
+        // Cached means answered: the flag is what says the printer had its say,
+        // including the say that there are no commands.
+        app.gcode_commands_asked = true;
+        app
+    }
+
+    /// An app in g-code mode whose printer has not answered: nothing is cached,
+    /// so completion draws on the built-in table.
+    fn app_with_no_printer_commands() -> App {
+        let mut app = app_with(Vec::new());
+        app.gcode = true;
         app
     }
 
@@ -4161,21 +4416,37 @@ mod tests {
     ];
 
     #[test]
-    fn test_the_word_at_the_caret_is_the_first_one_or_nothing() {
-        // Indented, the first word is still the first word.
+    fn test_the_word_at_the_caret_is_the_one_under_it() {
+        // Indented, the word is still the first word.
         let mut input = Input::default();
         for character in "  /hel".chars() {
             input.edit(KeyCode::Char(character), false);
         }
-        let word = input.completion_word().expect("an indented first word");
+        let word = input.completion_word().expect("an indented word");
         assert_eq!(word, Word { start: 2, end: 6 });
         assert_eq!(input.word_text(&word), "/hel");
+        assert_eq!(input.first_word().as_deref(), Some("/hel"));
 
-        // Past a word, the caret is among the arguments: there is nothing to
-        // complete there, and `Tab` must not touch them.
+        // A word after the first one is a word too — what the word *is* is the
+        // caller's question, and an argument of a local line is still none of
+        // the window's business.
         input.edit(KeyCode::Char(' '), false);
         input.edit(KeyCode::Char('x'), false);
-        assert!(input.completion_word().is_none());
+        let word = input.completion_word().expect("the argument's word");
+        assert_eq!(word, Word { start: 7, end: 8 });
+        assert_eq!(input.first_word().as_deref(), Some("/hel"));
+
+        // A blank under the caret is the gap between two words, not a word.
+        let mut input = Input::default();
+        for character in "SET_PIN  PIN".chars() {
+            input.edit(KeyCode::Char(character), false);
+        }
+        input.cursor = 8;
+        assert!(
+            input.completion_word().is_none(),
+            "the caret is between the two blanks: {}",
+            input.text()
+        );
 
         // A line of blanks has no word in it either.
         let mut input = Input::default();
@@ -4183,11 +4454,20 @@ mod tests {
             input.edit(KeyCode::Char(character), false);
         }
         assert!(input.completion_word().is_none());
+        assert!(input.first_word().is_none());
 
         // An empty line, though, is a word of no characters: `Tab` there lists
         // every candidate rather than nothing.
         let input = Input::default();
         assert_eq!(input.completion_word(), Some(Word { start: 0, end: 0 }));
+
+        // So is the end of a line that has something on it: `SET_PIN PIN=fan `
+        // has a word to start after the blank.
+        let mut input = Input::default();
+        for character in "SET_PIN PIN=fan ".chars() {
+            input.edit(KeyCode::Char(character), false);
+        }
+        assert_eq!(input.completion_word(), Some(Word { start: 16, end: 16 }));
 
         // The caret inside the word takes the whole of it.
         let mut input = Input::default();
@@ -4299,26 +4579,84 @@ mod tests {
     }
 
     #[test]
-    fn test_tab_on_an_empty_gcode_line_without_a_list_says_so() {
+    fn test_an_unanswered_printer_completes_from_the_built_in_table_once() {
         // The printer never answered — it refused an ask, or was never asked —
-        // so there are no candidates, and `Tab` says why rather than doing
-        // nothing at all. The state it quotes is the last one the printer
-        // reported, which until it reports a change is the handshake's `info`.
-        let mut app = app_with_gcode_commands(&[]);
-        app.status = Status::Connected {
-            state: "startup".to_string(),
-            message: "Loading config".to_string(),
-        };
+        // so `Tab` completes from the built-in table, which knows this host's
+        // commands, and says once that that is what it is doing. Which table the
+        // names came from is not visible in a candidate.
+        let mut app = app_with_no_printer_commands();
 
         assert!(app.completion_key(KeyCode::Tab));
 
-        assert!(app.completion.is_none(), "there is nothing to open");
-        assert_eq!(app.entries.len(), 1, "one notice");
+        let completion = app
+            .completion
+            .as_ref()
+            .expect("the built-in table has commands to offer");
+        assert_eq!(completion.candidates.len(), gcode_params::BUILTIN.len());
+        assert!(
+            completion.candidates.contains(&"SET_PIN".to_string()),
+            "the table is the host's own commands"
+        );
+        assert!(
+            !completion.candidates.contains(&"M115".to_string()),
+            "and it is not the printer's list: those names are not in it"
+        );
+        assert_eq!(app.entries.len(), 1, "one notice, and only about the table");
         let text = app.entries[0].text();
-        assert!(text.contains("no G-Code command list yet"), "{text}");
-        assert!(text.contains("\"startup\""), "the state is quoted: {text}");
-        assert!(text.contains("Tab asks again"), "{text}");
+        assert!(text.contains("using the built-in table"), "{text}");
+        assert!(matches!(
+            app.entries[0],
+            Entry::Notice {
+                kind: Notice::Problem,
+                ..
+            }
+        ));
         assert!(app.input.text().is_empty(), "the notice is not the line");
+    }
+
+    #[test]
+    fn test_the_built_in_table_is_announced_once_and_not_per_tab() {
+        // The same fact holds for every `Tab` until the printer answers, so it
+        // is worth saying once and would be noise said again: the log is for
+        // what happened, not for what is still the case.
+        let mut app = app_with_no_printer_commands();
+
+        for _ in 0..5 {
+            // Each press is a fresh `Tab`: the layer is closed the way any other
+            // key closes it, so the next one completes again.
+            app.completion = None;
+            assert!(app.completion_key(KeyCode::Tab));
+        }
+
+        let warnings = app
+            .entries
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry,
+                    Entry::Notice {
+                        kind: Notice::Problem,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(warnings, 1, "one per session: {:?}", app.entries);
+    }
+
+    #[test]
+    fn test_a_completion_from_the_printers_table_says_nothing() {
+        // The names are the machine's own, so there is nothing to explain.
+        let mut app = app_with_gcode_commands(&PRINTER_COMMANDS);
+
+        assert!(app.completion_key(KeyCode::Tab));
+
+        assert!(app.completion.is_some(), "the list is what `Tab` opens");
+        assert!(
+            app.entries.is_empty(),
+            "and it is not news: {:?}",
+            app.entries
+        );
     }
 
     #[test]
@@ -4327,7 +4665,6 @@ mod tests {
         // second round trip for the same nothing, so the notice says what came
         // back instead of offering a retry.
         let mut app = app_with_gcode_commands(&[]);
-        app.gcode_commands_asked = true;
 
         assert!(app.completion_key(KeyCode::Tab));
 
@@ -4388,15 +4725,196 @@ mod tests {
 
     #[test]
     fn test_tab_leaves_the_arguments_alone() {
+        // A local line's arguments are the session's business: the window can
+        // name a local command, not what one takes.
         let mut app = app_with(Vec::new());
         type_line(&mut app, "/subscribe tool");
-        assert!(
-            app.input.completion_word().is_none(),
-            "the caret is past the first word"
-        );
+        assert_eq!(app.input.first_word().as_deref(), Some("/subscribe"));
+
         assert!(app.completion_key(KeyCode::Tab));
+
         assert_eq!(app.input.text(), "/subscribe tool");
         assert!(app.completion.is_none());
+        assert!(app.entries.is_empty(), "and nothing to explain");
+
+        // A request's arguments are the printer's, and the window has no list
+        // of those either.
+        let mut app = app_with(Vec::new());
+        type_line(&mut app, "objects/query tool");
+        assert!(app.completion_key(KeyCode::Tab));
+        assert_eq!(app.input.text(), "objects/query tool");
+        assert!(app.completion.is_none());
+        assert!(app.entries.is_empty());
+    }
+
+    #[test]
+    fn test_the_word_after_a_command_completes_from_its_parameters() {
+        // The names after the command are the command's parameter names, and
+        // the window knows those: the built-in table has them, and this printer
+        // has not said otherwise.
+        let mut app = app_with_no_printer_commands();
+        type_line(&mut app, "SET_PIN PI");
+
+        assert!(app.completion_key(KeyCode::Tab));
+
+        assert_eq!(app.input.text(), "SET_PIN PIN");
+        assert_eq!(app.input.cursor, 11, "the caret is after the name");
+    }
+
+    #[test]
+    fn test_a_parameter_word_is_completed_left_of_its_equals() {
+        // What is typed before the `=` is a name, and completing it replaces the
+        // name alone: the value beside it belongs to the printer and stays.
+        let mut app = app_with_gcode_commands(&["SET_PIN"]);
+        type_line(&mut app, "SET_PIN PIN=fan VA");
+
+        assert!(app.completion_key(KeyCode::Tab));
+
+        assert_eq!(app.input.text(), "SET_PIN PIN=fan VALUE");
+        assert_eq!(app.input.cursor, 21, "the caret is after the name");
+    }
+
+    #[test]
+    fn test_a_value_after_the_equals_is_not_completed() {
+        // The caret past the `=` is in a value, and the window has no list of
+        // values: there is nothing to offer and nothing to explain.
+        let mut app = app_with_gcode_commands(&["SET_PIN"]);
+        type_line(&mut app, "SET_PIN PIN=fan");
+
+        assert!(app.completion_key(KeyCode::Tab), "the key is still Tab's");
+
+        assert_eq!(app.input.text(), "SET_PIN PIN=fan");
+        assert!(app.completion.is_none());
+        assert!(app.entries.is_empty(), "and nothing to say");
+    }
+
+    #[test]
+    fn test_a_blank_after_a_command_lists_its_parameters() {
+        // The word at the end of the line is empty, which is the same case the
+        // empty line is: everything that could come next.
+        let mut app = app_with_gcode_commands(&["SET_PIN"]);
+        type_line(&mut app, "SET_PIN PIN=fan ");
+
+        assert!(app.completion_key(KeyCode::Tab));
+
+        let completion = app.completion.as_ref().expect("the layer opens");
+        assert_eq!(completion.candidates, ["PIN", "VALUE", "CYCLE_TIME"]);
+        assert_eq!(completion.word, Word { start: 16, end: 16 });
+        assert_eq!(completion.selected, None, "nothing is picked yet");
+        assert_eq!(app.input.text(), "SET_PIN PIN=fan ", "the line is entire");
+    }
+
+    #[test]
+    fn test_the_printers_parameters_win_over_the_built_in_table() {
+        // The printer knows what its configuration registered, so its answer is
+        // the one that runs — including when it disagrees with the table.
+        let mut app = app_with_gcode_commands(&["SET_PIN"]);
+        app.gcode_parameters.insert(
+            "SET_PIN".to_string(),
+            vec!["CHANNEL".to_string(), "VALUE".to_string()],
+        );
+        type_line(&mut app, "SET_PIN ");
+
+        assert!(app.completion_key(KeyCode::Tab));
+
+        let completion = app.completion.as_ref().expect("the layer opens");
+        assert_eq!(completion.candidates, ["CHANNEL", "VALUE"]);
+        assert!(
+            !completion.candidates.contains(&"PIN".to_string()),
+            "the table's `PIN` is not in the printer's list: {:?}",
+            completion.candidates
+        );
+    }
+
+    #[test]
+    fn test_a_command_the_printer_named_no_parameters_for_uses_the_table() {
+        // A key the answer left out says the same as an empty list — the printer
+        // named nothing — and the table has what the command declared upstream.
+        for named in [None, Some(Vec::new())] {
+            let mut app = app_with_gcode_commands(&["SET_PIN"]);
+            if let Some(named) = named {
+                app.gcode_parameters.insert("SET_PIN".to_string(), named);
+            }
+            type_line(&mut app, "SET_PIN va");
+
+            assert!(app.completion_key(KeyCode::Tab));
+
+            assert_eq!(
+                app.input.text(),
+                "SET_PIN VALUE",
+                "spelled as the table has it"
+            );
+        }
+    }
+
+    #[test]
+    fn test_a_command_with_no_known_parameters_says_so() {
+        // `ABORT` declares none, and this printer named none: there is nothing
+        // to complete the word with, and the notice says which side is empty
+        // rather than blaming the prefix.
+        let mut app = app_with_gcode_commands(&["ABORT"]);
+        type_line(&mut app, "ABORT X");
+
+        assert!(app.completion_key(KeyCode::Tab));
+
+        assert!(app.completion.is_none());
+        assert_eq!(app.entries.len(), 1, "one notice");
+        let text = app.entries[0].text();
+        assert!(
+            text.contains("no parameter names are known for ABORT"),
+            "{text}"
+        );
+        assert_eq!(app.input.text(), "ABORT X");
+    }
+
+    #[test]
+    fn test_a_parameter_prefix_that_matches_nothing_names_the_command() {
+        let mut app = app_with_gcode_commands(&["SET_PIN"]);
+        type_line(&mut app, "SET_PIN PIN=fan ZZ");
+
+        assert!(app.completion_key(KeyCode::Tab));
+
+        assert!(app.completion.is_none(), "there is nothing to open");
+        assert_eq!(app.entries.len(), 1, "one notice");
+        let text = app.entries[0].text();
+        assert!(
+            text.contains("no parameter of SET_PIN starts with \"ZZ\""),
+            "{text}"
+        );
+        assert_eq!(app.input.text(), "SET_PIN PIN=fan ZZ");
+    }
+
+    #[test]
+    fn test_walking_a_parameters_candidates_leaves_the_value_alone() {
+        // Every pick replaces the name the layer is completing and nothing else:
+        // the `=fan` beside it is the reader's and stays where it is.
+        let mut app = app_with_gcode_commands(&["SET_PIN"]);
+        app.gcode_parameters.insert(
+            "SET_PIN".to_string(),
+            vec!["CHANNEL".to_string(), "CHECK".to_string()],
+        );
+        type_line(&mut app, "SET_PIN PIN=fan C");
+
+        assert!(app.completion_key(KeyCode::Tab), "the layer opens");
+        assert!(app.completion_key(KeyCode::Tab), "on the first candidate");
+
+        assert_eq!(app.input.text(), "SET_PIN PIN=fan CHANNEL");
+        assert!(app.completion_key(KeyCode::Tab));
+        assert_eq!(app.input.text(), "SET_PIN PIN=fan CHECK");
+    }
+
+    #[test]
+    fn test_the_first_word_is_a_command_name_and_not_a_parameter() {
+        // The regression guard for the word parameters hang off: `M1` names a
+        // command, whatever the command before it in the line might take.
+        let mut app = app_with_gcode_commands(&["M104", "SET_PIN"]);
+        type_line(&mut app, "M1");
+
+        assert_eq!(candidates_at(&app), ["M104"]);
+
+        assert!(app.completion_key(KeyCode::Tab));
+
+        assert_eq!(app.input.text(), "M104");
     }
 
     #[test]
@@ -4579,7 +5097,7 @@ mod tests {
     fn test_a_local_line_completes_from_the_session_and_the_window_once_each() {
         let mut app = app_with(Vec::new());
         type_line(&mut app, "/");
-        let candidates = app.completions();
+        let candidates = candidates_at(&app);
 
         assert!(candidates.contains(&"/gcode".to_string()), "{candidates:?}");
         assert!(
@@ -4624,7 +5142,7 @@ mod tests {
         let mut app = app_with_gcode_commands(&["G28", "M104", "M115"]);
         type_line(&mut app, "m1");
         assert_eq!(
-            app.completions(),
+            candidates_at(&app),
             ["M104", "M115"],
             "bare names, no slashes"
         );
@@ -4636,20 +5154,23 @@ mod tests {
         // to stop completing one.
         let mut app = app_with_gcode_commands(&["G28", "M104"]);
         type_line(&mut app, "/su");
-        assert_eq!(app.completions(), ["/subscribe"]);
+        assert_eq!(candidates_at(&app), ["/subscribe"]);
     }
 
     #[test]
     fn test_request_mode_has_no_names_to_offer() {
         let mut app = app_with(Vec::new());
         type_line(&mut app, "info");
-        assert!(app.completions().is_empty(), "a method is not the window's");
+        assert!(
+            candidates_at(&app).is_empty(),
+            "a method is not the window's"
+        );
 
         // A cached command list is not offered either: `M115` is not a method.
         let mut app = app_with_gcode_commands(&["M115"]);
         app.gcode = false;
         type_line(&mut app, "m1");
-        assert!(app.completions().is_empty());
+        assert!(candidates_at(&app).is_empty());
     }
 
     #[test]
@@ -4665,7 +5186,7 @@ mod tests {
             // And each one is its own candidate, with nothing else alongside.
             let mut app = App::new();
             type_line(&mut app, &line);
-            assert_eq!(app.completions(), [line.as_str()]);
+            assert_eq!(candidates_at(&app), [line.as_str()]);
         }
     }
 
@@ -4762,6 +5283,7 @@ mod tests {
         let mut app = app_with(vec![Entry::notice(Notice::Info, "XXXXXXXXXXXXXXXXXXXX")]);
         app.gcode = true;
         app.gcode_commands = vec!["M104".to_string(), "M115".to_string()];
+        app.gcode_commands_asked = true;
         type_line(&mut app, "m1");
         app.completion_key(KeyCode::Tab);
 

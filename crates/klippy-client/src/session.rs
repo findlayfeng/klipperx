@@ -328,6 +328,37 @@ impl Session {
         Ok(())
     }
 
+    /// Subscribe this connection to the printer's own state object, `webhooks`
+    /// (`objects/subscribe`).
+    ///
+    /// `webhooks` is the object the printer registers before anything else, and
+    /// it reports the printer's `state` and `state_message`. It is what keeps a
+    /// state display honest: the handshake's `info` says what the state was when
+    /// the client connected and nothing ever repeats it, while a subscription
+    /// pushes every change. Called once per connection — a front-end that
+    /// reconnects has to call it again.
+    ///
+    /// Deliberately no notice: this is part of connecting, so a line on every
+    /// start would be noise, and the state updating is the feedback.
+    ///
+    /// # Errors
+    /// Returns [`TransportError`] if the request cannot be sent.
+    pub async fn subscribe_webhooks(
+        &mut self,
+        out: &mut impl Output,
+    ) -> Result<(), TransportError> {
+        // `null` per object means "every field", so `state` and `state_message`
+        // arrive without being named; the template names the pushes.
+        let mut params = Map::new();
+        params.insert("objects".to_string(), json!({"webhooks": null}));
+        params.insert(
+            "response_template".to_string(),
+            json!({"id": null, "method": "klippy:status"}),
+        );
+        self.request("objects/subscribe", params, out).await?;
+        Ok(())
+    }
+
     /// Restart the firmware (`gcode/firmware_restart`).
     ///
     /// The server runs the `FIRMWARE_RESTART` command: the printer is rebuilt
@@ -1222,6 +1253,36 @@ mod tests {
                 assert_eq!(
                     message["params"]["response_template"]["method"],
                     "gcode:output"
+                );
+            }
+            other => panic!("expected a sent entry, got {other:?}"),
+        }
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn test_subscribing_to_webhooks_asks_for_that_object() {
+        let dir = SocketDir::new("webhooks");
+        let (mut session, mut out, task) = session(&dir).await;
+
+        session.subscribe_webhooks(&mut out).await.unwrap();
+
+        // The request and nothing else: subscribing is part of connecting, so
+        // it says no notice of its own, and `texts()` covers every entry.
+        assert_eq!(out.texts().len(), 1, "{:?}", out.texts());
+        let sent = out.sent();
+        assert_eq!(sent.len(), 1);
+        match sent[0] {
+            Entry::Sent {
+                method, message, ..
+            } => {
+                assert_eq!(method, "objects/subscribe");
+                // `null` means every field, so the pushes carry `state` and
+                // `state_message` without the client naming them.
+                assert_eq!(message["params"]["objects"], json!({"webhooks": null}));
+                assert_eq!(
+                    message["params"]["response_template"]["method"],
+                    "klippy:status"
                 );
             }
             other => panic!("expected a sent entry, got {other:?}"),

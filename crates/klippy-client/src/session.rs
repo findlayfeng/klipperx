@@ -555,9 +555,14 @@ impl Session {
         let id = self.request("objects/query", params, out).await?;
         let reply = match tokio::time::timeout(within, self.await_reply(id, out)).await {
             Ok(reply) => reply?,
-            // Ran out of patience. If the answer ever turns up it is read as an
-            // ordinary message by whoever reads next, so nothing is dropped.
-            Err(_) => return Ok(None),
+            // Ran out of patience. The request stops being owed, so a reader on
+            // its way out does not wait for an answer that is too late to use;
+            // if the answer does turn up it is read as an ordinary message by
+            // whoever reads next, so nothing is dropped.
+            Err(_) => {
+                self.connection.forget_pending(id);
+                return Ok(None);
+            }
         };
         let Some(reply) = reply else {
             return Ok(None);
@@ -1973,6 +1978,14 @@ mod tests {
         assert!(
             commands.is_none(),
             "an answer that never comes is no candidates"
+        );
+        // Giving up must also stop the request from being owed: otherwise a
+        // reader on its way out waits out its whole grace for an answer that is
+        // too late to use, and a late reply is matched against a request nobody
+        // is waiting for any more.
+        assert!(
+            !session.has_pending(),
+            "the timed-out request was left outstanding"
         );
         task.abort();
     }

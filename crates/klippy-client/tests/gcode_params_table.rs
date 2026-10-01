@@ -23,7 +23,7 @@ use klippy_client::gcode_params_scan;
 /// registration. Every other site resolves — through a helper function that
 /// builds the list, a constant a sibling module defines, or the call sites of
 /// the closure that registers the command.
-const KNOWN_UNRESOLVED_FILES: &[&str] = &["gcode.rs"];
+const KNOWN_UNRESOLVED_FILES: &[&str] = &["extras/gcode_macro.rs", "gcode.rs"];
 
 #[test]
 fn test_builtin_table_is_what_a_fresh_scan_produces() {
@@ -58,7 +58,7 @@ fn test_every_registration_call_site_is_resolved_or_recorded() {
     // Pinning the total is what keeps that sum honest: were the scanner to stop
     // recognising a call site entirely, this drops and the check goes red.
     assert_eq!(
-        scan.call_sites, 78,
+        scan.call_sites, 79,
         "the number of registration call sites the scanner sees changed"
     );
 
@@ -73,7 +73,7 @@ fn test_every_registration_call_site_is_resolved_or_recorded() {
     let known: BTreeSet<&str> = KNOWN_UNRESOLVED_FILES.iter().copied().collect();
     assert_eq!(
         scan.unresolved.len(),
-        3,
+        4,
         "the number of unresolved registration call sites changed: {:#?}",
         scan.unresolved
     );

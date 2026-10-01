@@ -660,8 +660,8 @@ impl GCodeDispatch {
     /// names, and the key still comes first, in its natural position.
     ///
     /// As [`GCodeDispatch::register_mux_command`], the first value fixes the key
-    /// and every later one must agree; the whole declared list is taken from
-    /// that first registration.
+    /// and every later one must agree. The declared lists of one command
+    /// **merge** across its values, in first-seen order.
     ///
     /// # Errors
     /// As [`GCodeDispatch::register_mux_command`].
@@ -674,6 +674,15 @@ impl GCodeDispatch {
         desc: Option<&str>,
         params: &[&str],
     ) -> Result<(), String> {
+        // The key leads the declared list, and appears once even when the caller
+        // also lists it among the other names.
+        let mut declared = Vec::with_capacity(params.len() + 1);
+        declared.push(key);
+        for param in params {
+            if !declared.contains(param) {
+                declared.push(param);
+            }
+        }
         if self.lock().mux.contains_key(cmd) {
             let mut commands = self.lock();
             let mux = commands.mux.get_mut(cmd).expect("checked");
@@ -689,6 +698,19 @@ impl GCodeDispatch {
                 ));
             }
             mux.values.insert(value.map(str::to_string), handler);
+            // A mux command's values **coexist**, each registered by whatever
+            // module owns it: `[output_pin]` and `[pwm_tool]` add a `VALUE`
+            // value to `SET_PIN`, `[pwm_cycle_time]` adds one that also takes
+            // `CYCLE_TIME`. A client completes the command once, so a name that
+            // only a later value declares disappears unless it joins the list
+            // here. Names already present stay where they first appeared, and a
+            // value that declares nothing leaves the list as it is.
+            let declared_names = commands.params.entry(cmd.to_string()).or_default();
+            for param in &declared {
+                if !declared_names.iter().any(|existing| existing == param) {
+                    declared_names.push((*param).to_string());
+                }
+            }
             if let Some(desc) = desc {
                 commands.help.insert(cmd.to_string(), desc.to_string());
             }
@@ -709,15 +731,6 @@ impl GCodeDispatch {
             let command = command.clone();
             Box::pin(async move { dispatch_mux(&inner, &command, gcmd).await })
         });
-        // The key leads the declared list, and appears once even when the caller
-        // also lists it among the other names.
-        let mut declared = Vec::with_capacity(params.len() + 1);
-        declared.push(key);
-        for param in params {
-            if !declared.contains(param) {
-                declared.push(param);
-            }
-        }
         self.register_command_with_params(cmd, dispatcher, desc, &declared, false)?;
         self.lock().mux.insert(
             cmd.to_string(),
@@ -2611,6 +2624,91 @@ mod tests {
             status["commands"]["SET_PIN"]["parameters"],
             json!(["PIN", "VALUE"])
         );
+    }
+
+    #[test]
+    fn test_a_mux_command_reports_the_parameters_of_every_value() {
+        let (dispatch, _output) = dispatch();
+        dispatch.inner.set_ready(true);
+        dispatch
+            .register_mux_command_with_params(
+                "SET_PIN",
+                "PIN",
+                Some("fan"),
+                sync(|_| Ok(())),
+                Some("Set a pin"),
+                &["VALUE"],
+            )
+            .unwrap();
+        // `[pwm_cycle_time]`: the same command and key, another value, and a
+        // name no earlier value declares.
+        dispatch
+            .register_mux_command_with_params(
+                "SET_PIN",
+                "PIN",
+                Some("tool"),
+                sync(|_| Ok(())),
+                None,
+                &["VALUE", "CYCLE_TIME"],
+            )
+            .unwrap();
+
+        let status = dispatch.get_status(0.0);
+
+        // The union: key first, each name once, in the order they first appeared.
+        assert_eq!(
+            status["commands"]["SET_PIN"]["parameters"],
+            json!(["PIN", "VALUE", "CYCLE_TIME"])
+        );
+    }
+
+    #[test]
+    fn test_a_mux_value_that_declares_nothing_keeps_the_parameters() {
+        let (dispatch, _output) = dispatch();
+        dispatch.inner.set_ready(true);
+        dispatch
+            .register_mux_command_with_params(
+                "SET_PIN",
+                "PIN",
+                Some("fan"),
+                sync(|_| Ok(())),
+                None,
+                &["VALUE"],
+            )
+            .unwrap();
+        dispatch
+            .register_mux_command_with_params(
+                "SET_PIN",
+                "PIN",
+                Some("led"),
+                sync(|_| Ok(())),
+                None,
+                &[],
+            )
+            .unwrap();
+
+        let status = dispatch.get_status(0.0);
+
+        // A later value's silence is not a withdrawal.
+        assert_eq!(
+            status["commands"]["SET_PIN"]["parameters"],
+            json!(["PIN", "VALUE"])
+        );
+    }
+
+    #[test]
+    fn test_a_mux_value_cannot_be_registered_twice() {
+        let (dispatch, _output) = dispatch();
+        dispatch.inner.set_ready(true);
+        dispatch
+            .register_mux_command("SET_PIN", "PIN", Some("fan"), sync(|_| Ok(())), None)
+            .unwrap();
+
+        let err = dispatch
+            .register_mux_command("SET_PIN", "PIN", Some("fan"), sync(|_| Ok(())), None)
+            .unwrap_err();
+
+        assert!(err.contains("already registered"), "{err}");
     }
 
     #[test]

@@ -72,7 +72,7 @@ H1–H12 是上游 extras 里按域归并的消费者（2026-09-21 全量盘点�
 | # | 事项 | 依赖 |
 |---|---|---|
 | G1b | gcode 调度器与上游的行为差异（`get_mutex` 等价物等；`GCodeIO` 暂缓 `[~]`；参数访问器与 `M115`/`Coord`/`request_restart` 已完成并归档） | C1 |
-| G2b | 用 GCODE 控制 GPIO：数字/PWM 驱动与 `SET_PIN` **已落地**；余项＝「随打印时间生效的请求队列」（上游 `GCodeRequestQueue`，仍未移植）与 `output_pin` 的 `static_value`/`template` | —（C1 已收官，不再是前置） |
+| G2b | 用 GCODE 控制 GPIO：数字/PWM 驱动与 `SET_PIN` **已落地**；「随打印时间生效的请求队列」（上游 `GCodeRequestQueue`）**已移植并接入 `output_pin`**；余项＝`output_pin` 的 `static_value`/`template`，以及 `fan`/`servo`/`pwm_tool` 切到同一队列 | —（C1 已收官，不再是前置） |
 | G4 | 运动命令（G0/G1/G28…） | G1、C1 |
 | B4 | 其余端点（pause_resume / `*/dump_*` / …；estop 与 remote method 已落地） | G3、H4、H9 |
 
@@ -113,14 +113,16 @@ H1–H12 是上游 extras 里按域归并的消费者（2026-09-21 全量盘点�
 `SET_PIN PIN=<name> VALUE=<0..1>`；运行时走立即路径（`update_digital_out` / `update_pwm`，
 软件 PWM 对齐到周期边界）。剩下的是：
 
-- [ ] **与运动 / 打印时间同步的 `SET_PIN`**（上游 `GCodeRequestQueue`，
-      `klippy/extras/output_pin.py:13-85` `:249-269`）：上游把请求排进 toolhead 的
-      lookahead、在 print time 生效，并对移动中的 pin 变化与 MCU 最小调度间隔做对齐。
-      **现状**：print-time 层本身**已随 C1d 落地**（`ToolHead::print_time`/`estimated_print_time`、
-      `motion_queuing.register_flush_callback`），**只差把 `GCodeRequestQueue` 这一个队列移植过来**
-      ——全仓 `grep GCodeRequestQueue` 无实现，只在本模块与 `fan`/`servo`/`pwm_tool` 的「已知偏差」
-      里被引用；今天它们都走立即路径（`update_digital_out`/`update_pwm`，软件 PWM 对齐到周期边界）。
-      对一个独立 GPIO 不紧急，但**打印中改 pin 不会与 move 同步**（同源的 `fan`/`servo`/`heaters` 一并受益）。
+- [x] **与运动 / 打印时间同步的 `SET_PIN`**（上游 `GCodeRequestQueue`，
+      `klippy/extras/output_pin.py:13-85` `:249-269`）：**已落地**——队列本体
+      `extras/gcode_request_queue.rs`（覆盖压缩、`next_min_flush_time` 按
+      `min_schedule_time` 对齐、`discard`/`reschedule`/`repeat`、sink 回调在锁外、12 测），
+      接线在 `output_pin`：`cmd_set_pin` 经 `register_lookahead_callback` 把请求钉到
+      前瞻时刻，flush 回调由 `MotionQueuing::generate` 消化，digital 走
+      `queue_digital_out(clock)`、软 PWM 先 `next_aligned_clock` 再 `set_pwm`；
+      **两条兜底**——没有 `[printer]`（lookup 不到 `toolhead`）或资源不可调度
+      （`min_schedule_time()` 为 `None`）时保留立即路径（`update_digital_out`/`update_pwm`）。
+      **余项**：`fan`/`servo`/`pwm_tool`/`heaters` 仍走立即路径，切到同一队列另行排期。
 - [ ] **`output_pin` 的 `static_value` / `TEMPLATE` + `template_evaluator`**（display 模板，
       `output_pin.py:88-170`）——与开关 GPIO 本身无关；`display_template` 机制已在（工厂表里有
       `display_template`），缺的是把它接到 `SET_PIN TEMPLATE=`。**语料 0 处使用**，可按需再补
@@ -365,7 +367,7 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
   ——上游 21 个文件的依赖盘点、H2-1…H2-7 拆分与四个拍板点。**已落地**：`fan`/`fan_generic`/
   `heater_fan`/`controller_fan`（含 heater 注册表）、`tachometer_pin`→`pulse_counter`、
   `pwm_tool`/`pwm_cycle_time`/`servo` 模块本体、`multi_pin`（批 #26）、`sx1509`（批 #41）；
-  **余项**：`GCodeRequestQueue` 队列移植（`pwm_tool` 的队列化 PWM，同 **G2b**）、
+  **余项**：把 `pwm_tool` 切到已移植的 `GCodeRequestQueue`（队列化 PWM，同 **G2b**）、
   `static_pwm_clock.py`（语料 1 处）、`replicape.py`（语料 1 处，另见本文件「特定板/芯片」）、
   `duplicate_pin_override.py`（语料 0 用）。
 

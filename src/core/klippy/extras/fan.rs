@@ -26,13 +26,15 @@
 //! * **Print-time scheduling.** Upstream queues each change through
 //!   `output_pin.GCodeRequestQueue`, so a speed lands at a print time, later
 //!   requests override earlier ones, and the kick-start tail is a *re-run* of
-//!   the queued request (`output_pin.py:15-73`). That queue needs
-//!   `toolhead.register_lookahead_callback` +
-//!   `motion_queuing.register_flush_callback` + `Mcu::min_schedule_time`, which
-//!   are C1d. This port drives the pin immediately — the same trade
-//!   [`output_pin`](crate::core::klippy::extras::output_pin) already makes —
-//!   and gives the kick-start tail a reactor timer instead of a queue slot.
-//!   When C1d lands, both switch to the queue in one step.
+//!   the queued request (`output_pin.py:15-73`). The queue and its three
+//!   dependencies are **in this port now** — `extras/gcode_request_queue.rs`
+//!   plus `register_lookahead_callback` / `register_flush_callback` /
+//!   `min_schedule_time`, wired into
+//!   [`output_pin`](crate::core::klippy::extras::output_pin) — **but `fan` has
+//!   not switched to them yet**: it still drives the pin immediately and gives
+//!   the kick-start tail a reactor timer instead of a queue slot. Switching is
+//!   a wiring job against the queue `output_pin` already uses, not new
+//!   machinery.
 //!
 //! The tachometer is not one of the gaps: `tachometer_pin` builds a
 //! [`pulse_counter`](crate::core::klippy::extras::pulse_counter) frequency
@@ -244,8 +246,8 @@ impl Fan {
 
     /// Choose the speed: upstream's `Fan.set_speed` (a print-time request).
     ///
-    /// With no print-time queue (C1d) this drives the pin now; see the module
-    /// docs.
+    /// `fan` has not been wired to this port's print-time queue yet, so this
+    /// drives the pin now; see the module docs.
     ///
     /// # Errors
     /// A failed PWM or enable-pin write.

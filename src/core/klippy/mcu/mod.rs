@@ -2239,6 +2239,21 @@ impl Mcu {
         Ok((seconds * freq).max(0.0) as u64)
     }
 
+    /// Minimum time the host needs to get scheduled events queued into the
+    /// MCU — upstream's `MCU.min_schedule_time` (`klippy/mcu.py:1187-1188`),
+    /// which returns `MIN_SCHEDULE_TIME = 0.100` (`mcu.py:13`).
+    ///
+    /// In this repo that number already exists as [`MIN_REQTIME_DELTA`]
+    /// (upstream `serialqueue.c:110`, the lead a gated message wants before
+    /// its `req_clock` — the same 0.100 s), so this accessor hands out that
+    /// constant rather than keeping a second copy. It exists for upper layers
+    /// that need upstream's scheduling-lead definition — e.g. `GCodeRequestQueue`'s
+    /// `next_min_flush_time` alignment — without reaching into this module's
+    /// internals.
+    pub fn min_schedule_time(&self) -> f64 {
+        MIN_REQTIME_DELTA
+    }
+
     /// Record the firmware clock read at this moment, so [`Mcu::estimated_clock`]
     /// can extrapolate from it.
     ///
@@ -4299,6 +4314,18 @@ mod tests {
             .iter()
             .map(|frame| frame.payload().iter().filter(|&&byte| byte == id).count())
             .sum()
+    }
+
+    /// `min_schedule_time` answers upstream's `MCU.min_schedule_time`
+    /// (`mcu.py:1187-1188` → `MIN_SCHEDULE_TIME = 0.100`), and it is the
+    /// same number as [`MIN_REQTIME_DELTA`] — asserting both pins the two
+    /// names to one value so they cannot drift apart.
+    #[tokio::test]
+    async fn test_min_schedule_time_is_the_upstream_0_100_schedule_lead() {
+        let mcu = Mcu::for_test("test_mcu", Interface::new(FrameMock::new(vec![])));
+
+        assert_eq!(mcu.min_schedule_time(), 0.100);
+        assert_eq!(mcu.min_schedule_time(), MIN_REQTIME_DELTA);
     }
 
     /// ① The `min_clock` floor: a message parked on a release clock in the

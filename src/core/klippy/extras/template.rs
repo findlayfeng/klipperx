@@ -22,7 +22,7 @@
 //! | auto escape | `AutoEscape::None` | a macro body is g-code, not HTML (the engine's default callback switches on the template name's extension) |
 //! | trailing newline | kept | a corpus body ends with a newline and the rendered text is run line by line; Jinja2/minijinja drop the last one by default (see the deviation table) |
 //! | filters | the engine's, with `int`, `float`, `min`, `max` replaced | the corpus spells its coercions `params.S\|default(1000.0)\|float` and folds lists with `\|min`/`\|max` |
-//! | globals | the engine's, with `range` and `namespace` bound explicitly | `range(...)` (`exclude_object.cfg:92`) and `namespace(...)`, which the operator's own `config.cfg` uses |
+//! | globals | the engine's, with `range` and `namespace` bound explicitly | `range(...)` (`exclude_object.cfg:92`) and `namespace(...)`, which `gcode_macro` bodies call — the corpus spells `range`, this module's stepper-macro test binds `namespace` |
 //!
 //! Compiling and evaluating are **two phases**: [`Template::parse`] compiles the
 //! body into the environment (`Environment::add_template_owned`),
@@ -77,7 +77,7 @@
 //!
 //! | case | Jinja2 (upstream) | this port |
 //! |---|---|---|
-//! | `//` and `%` on a negative operand | floor division / floor remainder (`-7 % 3 == 2`, `-7 // 3 == -3`) | Euclidean (`math_binop!(rem, checked_rem_euclid, %)`, `int_div`'s `div_euclid`); the corpus and the operator's `config.cfg` are all non-negative, where the two agree |
+//! | `//` and `%` on a negative operand | floor division / floor remainder (`-7 % 3 == 2`, `-7 // 3 == -3`) | Euclidean (`math_binop!(rem, checked_rem_euclid, %)`, `int_div`'s `div_euclid`); the corpus and this module's stepper-macro test use only non-negative operands, where the two agree |
 //! | undefined in a *lookup* | `Undefined` value, error only when used | same: `UndefinedBehavior::Strict` fails at **print / iterate / test**, not when the name or key is read, so `{% if x is defined %}` and `\|default(…)` still probe quietly |
 //! | `\|default` | catches `Undefined` only | same (the old subset probed its whole base expression quietly, so it also swallowed real errors) |
 //! | `\|int`, `\|float` with an unusable value and **no** default | `0` / `0.0` | an error (`invalid literal for int()`), the old subset's rule — a macro that reads a missing number should not silently drive a pin with `0`; with a default (`\|int(0)`, `\|float(0.25)`) the default is returned, Jinja2's own shape |
@@ -473,8 +473,8 @@ impl Template {
 
 /// The environment every body is compiled into: upstream's delimiters,
 /// undefined behavior and escaping, this port's trailing-newline rule, the four
-/// filters the corpus spells differently, and the two Jinja2 globals the corpus
-/// and the operator's own `config.cfg` call.
+/// filters the corpus spells differently, and the two Jinja2 globals the
+/// corpus (`range`) and this module's stepper-macro test (`namespace`) call.
 fn environment() -> Environment<'static> {
     let mut env = Environment::new();
     env.set_syntax(
@@ -1512,18 +1512,18 @@ mod tests {
         );
     }
 
-    /// The macros of the operator's own `config.cfg`, verbatim: an
-    /// `if`/`elif` chain over `params`, and `STEPPER_MOVE`, which needs
-    /// `namespace(...)` and `{% set count.phase = … %}` — the shape whose
-    /// absence from the old subset is what moved this module onto minijinja.
+    /// Three stepper macro bodies as literal test cases: `phases` (an
+    /// `if`/`elif` chain over `params`), `release`, and `stepper_move`, which
+    /// needs `namespace(...)` and `{% set count.phase = … %}` — the shape
+    /// whose absence from the old subset is what moved this module onto
+    /// minijinja. Between them they cover `namespace(phase=0)`,
+    /// `{% set count.phase = … %}`, the `if`/`elif` chain, `for` + `range`,
+    /// the rendered `G4 P` delay values, and both `DIR` directions.
     ///
-    /// `config.cfg` is a **local, unversioned** file (`.gitignore`'s
-    /// `/config.cfg`), so it cannot be `include_str!`d from a tree that does
-    /// not carry it: these are literal copies of its three `gcode:` bodies as
-    /// the config parser hands them over (each line trimmed, the block's last
-    /// newline dropped, the first line's indent gone — `config/mod.rs`'s
-    /// continuation rule). A later edit to `config.cfg` is therefore **not**
-    /// tracked by this test; the copy has to be refreshed by hand.
+    /// The bodies carry no `#` comment lines: the config parser strips them
+    /// before a `gcode:` value reaches this engine (`config/mod.rs`), and a
+    /// `#` line that did reach the gcode dispatcher would answer
+    /// `Unknown command` (`gcode.rs`'s `parse_line` strips `;` only).
     #[test]
     fn the_stepper_config_macros_load_and_render() {
         let phases = "\
@@ -1611,21 +1611,17 @@ SET_PIN PIN=motor_in4 VALUE=0";
 {% set count = namespace(phase=0) %}
 
 {% for i in range(steps) %}
-# 计算当前的节拍索引 (0-7)
 {% if dir == 1 %}
 {% set count.phase = (i % 8) %}
 {% else %}
 {% set count.phase = (7 - (i % 8)) %}
 {% endif %}
 
-# 执行当前步的引脚电平设置
 _STEPPER_SET_PHASE PHASE={count.phase}
 
-# 延迟，给电机物理转动的时间
 G4 P{ (delay * 1000)|int }
 {% endfor %}
 
-# # 动作完成后，默认释放电机避免发热
 STEPPER_RELEASE";
         let forward = render(
             stepper_move,

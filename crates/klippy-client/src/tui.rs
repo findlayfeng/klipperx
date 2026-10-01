@@ -756,6 +756,29 @@ impl App {
             )
         })
     }
+
+    /// Move the header onto the printer state a `status` object reports.
+    ///
+    /// Both callers hand in the same shape — an `objects/…` `status` payload
+    /// holding a `webhooks` object — so the reading of it lives in one place.
+    /// Only a status that carries both fields is applied: the header shows a
+    /// state and its message together, and half of one says less than what is
+    /// already there.
+    fn apply_status(&mut self, status: &Value) {
+        let Some(webhooks) = status.get("webhooks") else {
+            return;
+        };
+        let state = webhooks.get("state").and_then(Value::as_str);
+        let message = webhooks.get("state_message").and_then(Value::as_str);
+        if let (Some(state), Some(message)) = (state, message) {
+            self.status = Status::Connected {
+                state: state.to_string(),
+                // The header is a single row, so a multi-line message would
+                // fold it open.
+                message: message.replace('\n', " "),
+            };
+        }
+    }
 }
 
 impl Output for App {
@@ -774,23 +797,32 @@ impl Output for App {
                     return;
                 }
             }
+            // The `objects/subscribe` reply is a snapshot of the objects as
+            // they were when the subscription was taken, while the pushes that
+            // follow carry only what *changes*. A state that settles in
+            // between — after the handshake's `info` above and before the
+            // subscription was answered — would therefore never be pushed, and
+            // the header would stay on the `info` value for good. So the
+            // snapshot is read too. It stays in the log like any other reply,
+            // which is why this arm does not `return`.
+            Entry::Reply(reply)
+                if self.greeted
+                    && reply.method.as_deref() == Some("objects/subscribe")
+                    && !reply.is_error() =>
+            {
+                if let Some(status) = reply.result().and_then(|result| result.get("status")) {
+                    self.apply_status(status);
+                }
+            }
             // After that it is the `webhooks` object that reports the state, on
             // every change — so a subscription keeps the header honest without
             // anyone asking.
             Entry::Push(message) => {
                 let status = message
                     .get("params")
-                    .and_then(|params| params.get("status"))
-                    .and_then(|status| status.get("webhooks"));
+                    .and_then(|params| params.get("status"));
                 if let Some(status) = status {
-                    let state = status.get("state").and_then(Value::as_str);
-                    let message = status.get("state_message").and_then(Value::as_str);
-                    if let (Some(state), Some(message)) = (state, message) {
-                        self.status = Status::Connected {
-                            state: state.to_string(),
-                            message: message.replace('\n', " "),
-                        };
-                    }
+                    self.apply_status(status);
                 }
             }
             _ => (),
@@ -2458,6 +2490,59 @@ mod tests {
         let rows = render(&app, 60, 6);
         assert!(rows[0].contains("shutdown"), "{rows:?}");
         assert!(rows[0].contains("Printer is halted"), "{rows:?}");
+    }
+
+    #[test]
+    fn test_the_subscribe_reply_snapshot_moves_the_header_on() {
+        // The reply to the startup `objects/subscribe` is `webhooks` as it was
+        // when the subscription was taken; everything the printer pushes after
+        // it is a *change*. A state that settled in between would otherwise
+        // never reach the header, which still shows what the handshake's `info`
+        // said.
+        let mut app = App::new();
+        // By the time a subscription is answered the handshake's `info` has
+        // been, so the reply is an ordinary entry rather than the greeting.
+        app.greeted = true;
+        app.write(Entry::Reply(crate::connection::Reply {
+            id: serde_json::json!(3),
+            method: Some("objects/subscribe".to_string()),
+            message: serde_json::json!({
+                "id": 3,
+                "result": {"eventtime": 12.5, "status": {"webhooks": {
+                    "state": "ready",
+                    "state_message": "Printer is ready"
+                }}}
+            }),
+        }));
+
+        let rows = render(&app, 60, 6);
+        assert!(rows[0].contains("ready"), "{rows:?}");
+        assert!(rows[0].contains("Printer is ready"), "{rows:?}");
+    }
+
+    #[test]
+    fn test_a_failed_subscribe_reply_leaves_the_header_alone() {
+        // A refusal carries no `status`, and a printer that told the window the
+        // subscription did not take is not news about the printer's state: the
+        // header keeps what it has.
+        let mut app = App::new();
+        app.greeted = true;
+        app.write(Entry::Reply(crate::connection::Reply {
+            id: serde_json::json!(3),
+            method: Some("objects/subscribe".to_string()),
+            message: serde_json::json!({
+                "id": 3,
+                "error": {"error": "CommandError", "message": "Printer is not ready"},
+                "result": {"status": {"webhooks": {
+                    "state": "ready",
+                    "state_message": "Printer is ready"
+                }}}
+            }),
+        }));
+
+        assert_eq!(app.status, Status::Unknown, "nothing was applied");
+        let rows = render(&app, 60, 6);
+        assert!(!rows[0].contains("ready"), "{rows:?}");
     }
 
     #[test]

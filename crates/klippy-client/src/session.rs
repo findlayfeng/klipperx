@@ -31,6 +31,8 @@
 //! quoting every key. Only the last three can produce a request, and a
 //! malformed one is a notice rather than an error — the session stays up.
 
+use std::collections::HashMap;
+
 use serde_json::{json, Map, Value};
 
 use klippy_api::address::{ApiTarget, Transport};
@@ -159,6 +161,26 @@ pub enum Control {
     Continue,
     /// The user asked to leave.
     Quit,
+}
+
+/// What the printer's `gcode` object says about its commands: what they are
+/// called, and which parameter names each one declares.
+///
+/// Both come out of one answer because one request is the only place either is
+/// reported, and a terminal that completes a G-Code line needs them together:
+/// the first word from [`names`](Self::names), a word before its `=` from
+/// [`parameters`](Self::parameters).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GcodeCommands {
+    /// Every command the dispatcher knows, sorted by name. The keys of
+    /// `status.gcode.commands`, which is the whole list: `gcode/help` returns
+    /// only the commands registered *with* a description.
+    pub names: Vec<String>,
+    /// The parameter names a command declares, keyed by command name. A
+    /// command the printer names none for is absent, which says the same as an
+    /// empty list: the caller has no names of its own from the printer and
+    /// stands in its own table for them.
+    pub parameters: HashMap<String, Vec<String>>,
 }
 
 /// A session with an API server.
@@ -501,24 +523,29 @@ impl Session {
         Ok(Control::Continue)
     }
 
-    /// The printer's own G-Code command names, from the `gcode` object of
-    /// `objects/query`: every command the dispatcher knows, described or not,
-    /// which is what a G-Code terminal offers to complete.
+    /// What the printer has to say about its G-Code commands, from the `gcode`
+    /// object of `objects/query`: every command the dispatcher knows —
+    /// described or not — and the parameter names each one declares. The names
+    /// are what a G-Code terminal offers to complete, the parameters what it
+    /// offers for a word before its `=`.
     ///
     /// `gcode/help` is the obvious-looking source and the wrong one: it returns
     /// only the commands that were registered *with a description*, so a
     /// built-in that has none (`M115`, `M110`, `ECHO`, …) is missing from it and
-    /// could not be completed. The object's keys are the whole list.
+    /// could not be completed. The object's keys are the whole list. The
+    /// `parameters` field of a command is newer than the dispatcher itself (see
+    /// the third-party development manual), so a host that does not send it
+    /// leaves the caller to complete from its own table instead.
     ///
     /// A printer that is not up yet answers nothing useful, and waiting on one
     /// forever would freeze the window, so a missing or failing answer is
-    /// `None` rather than an error: the caller either has a list to complete
+    /// `None` rather than an error: the caller either has a table to complete
     /// from or it has none, and neither is a fault.
     pub async fn gcode_commands(
         &mut self,
         out: &mut impl Output,
         within: std::time::Duration,
-    ) -> Result<Option<Vec<String>>, TransportError> {
+    ) -> Result<Option<GcodeCommands>, TransportError> {
         // `null` per object means "every field", and `gcode` is the object
         // whose `status` carries the command table.
         let params = json!({ "objects": { "gcode": null } })
@@ -540,18 +567,39 @@ impl Session {
         if reply.is_error() {
             return Ok(None);
         }
-        let mut names: Vec<String> = reply
+        let mut commands = GcodeCommands::default();
+        // A key is one command name, so the object's keys are the names;
+        // their values say what else is known about the command.
+        if let Some(table) = reply
             .result()
             .and_then(|result| result.get("status"))
             .and_then(|status| status.get("gcode"))
             .and_then(|gcode| gcode.get("commands"))
             .and_then(Value::as_object)
-            // A key is one command name, so the object's keys are the list;
-            // their values (`{}` or `{"help": …}`) say nothing new.
-            .map(|commands| commands.keys().cloned().collect())
-            .unwrap_or_default();
-        names.sort();
-        Ok(Some(names))
+        {
+            for (name, fields) in table {
+                commands.names.push(name.clone());
+                // `{}` and `{"help": …}` carry no parameters, and neither
+                // does a host too old to send the field at all: all three are
+                // the same absence to a caller.
+                let declared: Vec<String> = fields
+                    .get("parameters")
+                    .and_then(Value::as_array)
+                    .map(|names| {
+                        names
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if !declared.is_empty() {
+                    commands.parameters.insert(name.clone(), declared);
+                }
+            }
+        }
+        commands.names.sort();
+        Ok(Some(commands))
     }
 
     /// Subscribe to objects, so their updates start arriving as pushes.
@@ -961,8 +1009,8 @@ mod tests {
 
     /// Answers `objects/query` for the `gcode` object with the shape the real
     /// endpoint sends: the command names are the keys of
-    /// `status.gcode.commands`, and a built-in without a description is there
-    /// as an empty object.
+    /// `status.gcode.commands`, a built-in without a description is there as an
+    /// empty object, and a command that declared named parameters carries them.
     struct GcodeCommands;
 
     impl Endpoint for GcodeCommands {
@@ -989,9 +1037,15 @@ mod tests {
                                 "M115": {},
                                 "RESTART": {"help": "Restart the firmware"},
                                 "SET_GCODE_VARIABLE": {"help": "Set a G-Code macro variable"},
-                                "SET_PIN": {"help": "Set the value of an output pin"},
+                                "SET_PIN": {
+                                    "help": "Set the value of an output pin",
+                                    "parameters": ["PIN", "VALUE"]
+                                },
                                 "STATUS": {"help": "Report the printer status"},
-                                "STEPPER_MOVE": {"help": "Set the stepper position"},
+                                "STEPPER_MOVE": {
+                                    "help": "Set the stepper position",
+                                    "parameters": []
+                                },
                                 "STEPPER_RELEASE": {"help": "Release the steppers"},
                                 "_STEPPER_SET_PHASE": {"help": "Set the stepper phase"}
                             }
@@ -1819,7 +1873,7 @@ mod tests {
         let (mut session, _out, task) = session(&dir).await;
         let mut out = Recording::default();
 
-        let names = session
+        let commands = session
             .gcode_commands(&mut out, Duration::from_secs(1))
             .await
             .expect("the request is sent")
@@ -1829,7 +1883,7 @@ mod tests {
         // the ones the dispatcher registered with no description alike, which is
         // what says this is not `gcode/help`.
         assert_eq!(
-            names,
+            commands.names,
             vec![
                 "ECHO",
                 "FIRMWARE_RESTART",
@@ -1847,14 +1901,41 @@ mod tests {
             ]
         );
         assert!(
-            names.contains(&"M115".to_string()),
+            commands.names.contains(&"M115".to_string()),
             "a built-in with no help"
         );
         assert!(
-            names.contains(&"ECHO".to_string()),
+            commands.names.contains(&"ECHO".to_string()),
             "a built-in with no help"
         );
-        assert_eq!(names.len(), 13);
+        assert_eq!(commands.names.len(), 13);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn test_gcode_commands_carries_the_parameter_names_too() {
+        let dir = SocketDir::new("gcode-parameters");
+        let (mut session, _out, task) = session(&dir).await;
+        let mut out = Recording::default();
+
+        let commands = session
+            .gcode_commands(&mut out, Duration::from_secs(1))
+            .await
+            .expect("the request is sent")
+            .expect("the printer answered");
+
+        // One request answers both: the names and the parameters belong to the
+        // same `status.gcode.commands` table.
+        assert_eq!(
+            commands.parameters.get("SET_PIN"),
+            Some(&vec!["PIN".to_string(), "VALUE".to_string()])
+        );
+        // A command with no `parameters` field, and one whose field is an empty
+        // list, are the same absence: both are left out, so a caller that has a
+        // table of its own stands in for them alike.
+        assert_eq!(commands.parameters.get("ECHO"), None);
+        assert_eq!(commands.parameters.get("STEPPER_MOVE"), None);
+        assert_eq!(commands.parameters.len(), 1);
         task.abort();
     }
 
@@ -1866,12 +1947,15 @@ mod tests {
         let task = server_with_query(&dir, FailingCommands).await;
         let (mut session, mut out) = connect(&dir).await;
 
-        let names = session
+        let commands = session
             .gcode_commands(&mut out, Duration::from_secs(1))
             .await
             .expect("the request is sent");
 
-        assert!(names.is_none(), "a refusal is no candidates: {names:?}");
+        assert!(
+            commands.is_none(),
+            "a refusal is no candidates: {commands:?}"
+        );
         task.abort();
     }
 
@@ -1881,13 +1965,13 @@ mod tests {
         let task = server_with_query(&dir, SilentCommands).await;
         let (mut session, mut out) = connect(&dir).await;
 
-        let names = session
+        let commands = session
             .gcode_commands(&mut out, Duration::from_millis(50))
             .await
             .expect("the request is sent");
 
         assert!(
-            names.is_none(),
+            commands.is_none(),
             "an answer that never comes is no candidates"
         );
         task.abort();

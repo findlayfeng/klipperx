@@ -348,9 +348,10 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 
 - [ ] `pid_calibrate.py`（`PID_CALIBRATE`）：仍缺（`verify_heater.py` 批 #20 已完成）
       （`extruder.rs:21` 明示 still open）。
-- [ ] 传感器**剩余**：`temperature_host.py` /
+- [ ] 传感器**剩余**：
       `temperature_probe.py` / `temperature_fan.py`（`thermistor` 自定义型号的装载序已随批 #22 修复；`[adc_temperature <name>]` 同族待补 `phase = early`）
-      （`G2` / `Kingroon_B3950` 2 次）。已落地并归档：`temperature_sensor` / `thermistor` /
+      （`G2` / `Kingroon_B3950` 2 次）。已落地并归档：`temperature_host`（2026-10-03，`87d7b01`）/
+      `temperature_sensor` / `thermistor` /
       `adc_temperature` / `spi_temperature`（MAX6675/31855/31856/31865） /
       `temperature_combined` / `temperature_mcu`（T7）。
 - 依赖 F4（PWM）、F5（ADC）、F6（SPI 温度）、C1（`temperature_fan` 随运动）。

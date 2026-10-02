@@ -307,7 +307,8 @@ git config core.hooksPath .githooks
 | `led.rs` | 六段选项矩阵与上游文案（`No LED pin definitions found`/`color_order does not match chain_count`/`neopixel chain too long`/同 mcu 约束）、`LEDHelper` 颜色记账与初始值边界、`lookup_display_templates` 惰性单例（`is_queryable=false`）等（21 测） |
 | `extruder_stepper.rs` | 段全选项与步距 28.2/(200·16)、默认 PA `0.`/`0.040` 与越界文案、绑定校验逐字 `'bogus' is not a valid extruder.`、按名挂值与主挤出机槽位隔离、命令值域（7 测） |
 | `exclude_object.rs` | 零选项段+reset、get_status 三键、START/END 跟踪（大写化/隐式 define）、EXCLUDE 按名/当前/RESET+排序、`There is no current object to cancel`、DEFINE CENTER/POLYGON JSON 与 RESET、排除区丢弃/区外转发、四命令 help（9 测） |
-| `virtual_sdcard.rs` | 选项矩阵与默认 `on_error_gcode`、显式值、缺 `path` 文案、rest-state（4 测） |
+| `virtual_sdcard.rs` | 选项矩阵与默认 `on_error_gcode`、显式值、缺 `path` 文案；`get_file_list`（顶层 + 递归 + 缺目录）；`M20`/`M21`/`M23`（打开/不存在/大小写不敏感/去前导 `/`）、`M26`、`M27`、`SDCARD_RESET_FILE`/`SDCARD_PRINT_FILE`（子目录）、`M28`–`M30`（`cmd_error`）、`do_cancel`、`get_status` 两态（30 测）；回放循环：EOF 完成 + `progress`=1.0 + `Done printing file`、`is_active` 随 task、`M25` 暂停 + `note_pause`、错误触发 `note_error` + `on_error_gcode` 渲染运行、`do_resume` 活动时拒 `SD busy` |
+| `print_stats.rs` | reset 初值、`set_current_file`、`note_start`→`note_pause`→`note_complete` 流转与 duration、`note_error`/`note_cancel`/`note_pause` 不覆盖 error、`SET_PRINT_STATS_INFO` layer 逻辑（0 清空/切换 total 重置/截断/无参保持）、`get_status` standby/printing/paused 三态、命令注册、`ensure` 单例、filament 随 E 累积（19 测） |
 | `display_status.rs` | 裸段+`check_unused`+状态形状（1 测） |
 | `homing_override.rs` | 语料选项矩阵、默认 `XYZ`/无强制位、parse 与 `must be specified` 文案、G28 语句轴掩码=上游 `cmd_G28:33-46`（4 测） |
 | `sdcard_loop.rs` | 裸段、sd 内外 BEGIN/END、count 0/1/>1 索引、空栈+嵌套、DESIST（5 测） |

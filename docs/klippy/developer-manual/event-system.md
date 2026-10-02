@@ -143,7 +143,8 @@ MCU 侧另有独立的 `event` 模块，以 `McuEvent` trait 表达固件主动�
 | `stepper_enable:` | `motor_off` | — |
 | `extruder:` | — | `activate_extruder`（已注册处理器，发送方是 G4-2） |
 | `stepper:` | — | `sync_mcu_position`、`set_dir_inverted`（依赖 stepper 资源的同步路径） |
-| `virtual_sdcard:` / `menu:` / `dual_carriage:` | — | 对应 extras 模块尚未实现（H3/H4/H6/H8/H9） |
+| `virtual_sdcard:` | `reset_file` | `_reset_file` 末尾发出（`SDCARD_RESET_FILE`/`SDCARD_PRINT_FILE`/`M23` 重置时） |
+| `menu:` / `dual_carriage:` | — | 对应 extras 模块尚未实现（H3/H6/H8/H9） |
 
 事件名与变体已经就绪，处理器可先注册；上表右列的事件一旦模块落地，发送点直接用现成变体。`load_cell:` 已有发射者（批 #14：`klippy:ready` 时按状态发 `load_cell:calibrate`/`load_cell:tare`）。
 

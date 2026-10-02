@@ -962,6 +962,13 @@ impl GCodeDispatch {
         self.inner.respond_info(msg, log);
     }
 
+    /// Send a raw line to all output handlers — upstream's
+    /// `gcode.respond_raw(msg)` (`klippy/gcode.py:288`). Used by
+    /// `virtual_sdcard`'s replay loop, which has no `GcodeCommand` in hand.
+    pub fn respond_raw(&self, msg: &str) {
+        self.inner.respond_raw(msg);
+    }
+
     fn lock(&self) -> MutexGuard<'_, Commands> {
         self.inner
             .commands

@@ -434,6 +434,7 @@ mod tests {
                 "input_shaper",
                 "manual_probe",
                 "pause_resume",
+                "print_stats",
                 "probe",
                 "probe_eddy_current",
                 "quad_gantry_level",

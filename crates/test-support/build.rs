@@ -538,11 +538,53 @@ fn generate_upstream_tests(klipper_dir: &Path, dicts_dir: &Path, out_dir: &Path)
     //   * `fixtures/<dict_name>.dict` — every built dictionary the corpus
     //     references, copied here alongside the configs.
     let gen_dir = out_dir.join("upstream_generated");
-    let _ = std::fs::remove_dir_all(&gen_dir);
+    // Clear only the generated bits (`cases/`, `fixtures/`, `mod.rs`); leave
+    // `extra.rs` alone — it is hand-written and tracked in git.
+    let _ = std::fs::remove_dir_all(gen_dir.join("cases"));
+    let _ = std::fs::remove_dir_all(gen_dir.join("fixtures"));
+    let _ = std::fs::remove_file(gen_dir.join("mod.rs"));
     let cases_dir = gen_dir.join("cases");
     let fixtures_dir = gen_dir.join("fixtures");
     std::fs::create_dir_all(&cases_dir).expect("create upstream_generated/cases");
     std::fs::create_dir_all(&fixtures_dir).expect("create upstream_generated/fixtures");
+
+    // Build any hand-written `extra_configs/*.config` (not part of upstream's
+    // `test/configs`) into dictionaries under `fixtures/`, using the same
+    // `make` path the upstream dictionaries use. A config whose architecture
+    // is not enabled under `KLIPPERX_ARCHES` is skipped (its `.dict` will not
+    // exist in `fixtures/`); a `extra_*` test that names it should carry
+    // `#[ignore]` or be gated accordingly. Built dictionaries land directly
+    // in `fixtures/<name>.dict` so `extra.rs` references them by the same
+    // `concat!(env!("CARGO_MANIFEST_DIR"), .../fixtures/<name>.dict")` path
+    // the generated cases use.
+    let extra_configs_dir = gen_dir.join("extra_configs");
+    if extra_configs_dir.is_dir() {
+        let all_architectures = std::env::var_os("KLIPPERX_ALL_ARCHES").is_some();
+        let architectures = enabled_architectures();
+        let extra_build_dir = dicts_dir.parent().unwrap_or(&dicts_dir).join("extra_build");
+        for entry in std::fs::read_dir(&extra_configs_dir).expect("extra_configs is readable") {
+            let config = entry.expect("a directory entry").path();
+            if config.extension().and_then(|e| e.to_str()) != Some("config") {
+                continue;
+            }
+            let Some(name) = config.file_stem().map(|s| s.to_string_lossy().to_string()) else {
+                continue;
+            };
+            let text = std::fs::read_to_string(&config)
+                .unwrap_or_else(|e| panic!("failed to read {}: {e}", config.display()));
+            let Some(architecture) = architecture(&text) else {
+                continue;
+            };
+            if !all_architectures && !architectures.contains(&architecture) {
+                continue;
+            }
+            let target_out = build(klipper_dir, &extra_build_dir.join(&name), &text);
+            let dictionary = require_dict(&target_out);
+            std::fs::copy(&dictionary, fixtures_dir.join(format!("{name}.dict"))).unwrap_or_else(
+                |e| panic!("failed to collect extra dict {}: {e}", dictionary.display()),
+            );
+        }
+    }
 
     let mut root = String::new();
     root.push_str(
@@ -670,8 +712,25 @@ fn generate_upstream_tests(klipper_dir: &Path, dicts_dir: &Path, out_dir: &Path)
         ));
     }
 
+    // A home for hand-written tests that are not in upstream's corpus but
+    // belong alongside it — `extra.rs` is **not** written by this generator
+    // (only `mod.rs` and `cases/` are), so a developer can add tests there
+    // without being clobbered on the next build. The file is optional: it is
+    // `include!`d only if it exists. Hand-written tests should use a distinct
+    // prefix (e.g. `extra_*`) to tell them apart from the generated
+    // `upstream_*` cases.
+    let extra_file = gen_dir.join("extra.rs");
+    if extra_file.exists() {
+        root.push_str("\n// Hand-written tests (not @generated) — edit `extra.rs` directly.\n");
+        root.push_str("mod extra {\n    include!(\"extra.rs\");\n}\n");
+    }
+
     let mod_file = gen_dir.join("mod.rs");
     std::fs::write(&mod_file, root)
         .unwrap_or_else(|e| panic!("failed to write {}: {e}", mod_file.display()));
     println!("cargo:rerun-if-changed={}", gen_dir.display());
+    let extra_configs_dir = gen_dir.join("extra_configs");
+    if extra_configs_dir.is_dir() {
+        println!("cargo:rerun-if-changed={}", extra_configs_dir.display());
+    }
 }

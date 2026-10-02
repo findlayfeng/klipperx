@@ -27,10 +27,12 @@
 //!   period (`pwm_cycle_time.py:56-62`). [`PwmOut`](crate::core::klippy::pins::PwmOut)
 //!   configures the period before the build and has no runtime reprogram, so a
 //!   changed `CYCLE_TIME` updates the host's bookkeeping
-//!   (`setup_cycle_time`) and the duty is still queued against the built
-//!   period. Same trade as [`output_pin`](crate::core::klippy::extras::output_pin):
-//!   no print-time request queue yet (upstream `GCodeRequestQueue`; the print-time
-//!   layer itself landed with C1d).
+//!   (`setup_cycle_time`) and the duty is applied against the built period.
+//!   Upstream does not queue this section either — `SET_PIN` pins the update
+//!   through `register_lookahead_callback` and spaces updates by
+//!   `min_schedule_time` itself (`pwm_cycle_time.py:102-122`), with no
+//!   `GCodeRequestQueue` — but this port has neither the queue nor that
+//!   lookahead pinning: `SET_PIN` drives the pin immediately.
 //! * **`cycle_time`'s `maxval`.** Upstream bounds it by the chip's
 //!   `max_nominal_duration` (`pwm_cycle_time.py:69-70`); this port has no such
 //!   figure, and the resource still refuses a period the scheduler cannot

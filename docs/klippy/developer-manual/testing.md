@@ -382,29 +382,35 @@ git config core.hooksPath .githooks
 其中 `every_upstream_printer_config_parses` 覆盖 259 份上游 `.cfg`，现已全部通过；它最初暴露的
 四处解析器分歧（多行值、`=` 分隔、节头行内注释、`;` 行内注释）已修复，并各有单测。
 
-端到端执行（`upstream_test_cases_run`）把每个 `[mcu]` 换成 `test: dict=<字典>`，由
+端到端执行由 `test-support/build.rs` 在 test 构建时生成：扫描 `test/klippy/*.test`，为每个 `CONFIG` 块
+生成一个独立 `#[test]`（命名 `upstream_<stem>__config_<n>_<cfg>`），config 路径 / 字典路径 / g-code /
+`SHOULD_FAIL` 标志全固化在生成代码里。每个 `[mcu]` 换成 `test: dict=<字典>`，由
 `interface/devices/simulator.rs` 的字典驱动应答机跑真实协议路径（identify、配置握手、时钟、ack）。
 激活单位是「按 `CONFIG` 拆出的**运行**」，启用条件是**该运行声明的全部字典都已构建**：架构列表
 `KLIPPERX_ARCHES`（默认 `linux` + `avr` + 各 ARM 家族，即主机 / `avr-gcc` / `arm-none-eabi` 三类工具链）
 与 `KLIPPERX_ALL_ARCHES`（全开）在**构建阶段**过滤 `test/configs/*.config` 并产出同名 `.dict`
-（构建失败即报错）；未构建字典的运行直接跳过，不拿别的目标顶替。忽略列表（`IGNORED`）**已清空**：
-历史上登记过因缺配置节而必然失败的 `.test`，随各节落地逐条移出；`KLIPPERX_UPSTREAM_ALL=1` 只作用于
-这张列表，不能让字典未构建的运行跑起来。
+（构建失败即报错）；未构建字典的运行生成时带 `#[ignore = "dictionary <name> not built"]`，
+不拿别的目标顶替。忽略列表（`IGNORED`，权威在 `crates/test-support/build.rs`，按生成函数名匹配）
+现登记 1 条：`out_of_bounds.test`（move-bounds 未实现，`G1 Y9999` 未被拒）；详见
+[回归测试](regression-tests.md)。
 
-全语料 37 份文件共 **239 次运行**；默认构建下只有 2 条（`printers.test` 里 `DICTIONARY pru.dict` 下的
-`generic-cramps.cfg` 与 `generic-replicape.cfg`）因未构建 `pru` 字典跳过，其余 **237 条全部运行并通过
+全语料 37 份文件共 **239 次运行**；默认构建下 2 条（`printers.test` 里 `DICTIONARY pru.dict` 下的
+`generic-cramps.cfg` 与 `generic-replicape.cfg`）因未构建 `pru` 字典生成为 `#[ignore]`，1 条
+（`out_of_bounds.test`）因 move-bounds 未实现列入 `IGNORED`，其余 **236 条全部运行并通过
 （0 失败）**；用例的内联 g-code 由端到端运行真送进 dispatcher，更有独立的内联解析阶段
 （`upstream_inline_gcode_parses`，仍 `#[ignore]`）。上游 `configparser` 的 `optionxform = str.lower` 已对齐（`mod.rs` 存储侧小写 + `section.rs` 查询侧小写），`Option 'pid_Kp' … must be specified` 类的 49 次回归失败已归零。
 
+生成式运行器取代了旧的 `upstream_test_cases_run`（单个 `#[test]` 串行跑 239 case，十几分钟易超时
+且无法单跑定位）；旧环境变量 `KLIPPERX_UPSTREAM_ALL` / `KLIPPERX_UPSTREAM_FILTER` 不再适用。
+
 ```bash
-cargo test -p klipperx --lib upstream                 # 语料相关的全部用例
-cargo test -p klipperx --lib upstream -- --ignored    # 内联 g-code 阶段（未实现，会失败）
+cargo test -p klipperx --lib upstream                 # 语料相关的全部用例（含生成的 239 个 #[test]）
+cargo test -p klipperx --lib upstream_bed_mesh        # 单条：只跑 bed_mesh.test 的那个 case
+cargo test -p klipperx --lib --ignored upstream      # 跑全部被忽略的 case（含 IGNORED 与字典未构建）
 KLIPPERX_ARCHES=linux \
-  cargo test -p klipperx --lib upstream_test_cases_run # 只编 linux 一份（最快）
+  cargo test -p klipperx --lib upstream               # 只编 linux 一份字典（最快）
 KLIPPERX_ALL_ARCHES=1 \
-  cargo test -p klipperx --lib upstream_test_cases_run # 构建全部目标（需所有交叉工具链）
-KLIPPERX_UPSTREAM_ALL=1 \
-  cargo test -p klipperx --lib upstream_test_cases_run # 只去掉忽略列表，跑全部可用运行
+  cargo test -p klipperx --lib upstream               # 构建全部目标（需所有交叉工具链）
 ```
 
 ## 写 MCU 相关测试的两个要点

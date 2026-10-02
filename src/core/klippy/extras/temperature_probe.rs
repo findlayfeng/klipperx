@@ -1740,11 +1740,14 @@ impl EddyDriftCompensation {
         Self::check_calibration(&polynomials, &self.name, min_temp, end_vld_temp)
             .map_err(CommandError::new)?;
         // The two `configfile.set` writes and the report (`:645-656`).
-        let coef_cfg = polynomials
+        let curves = polynomials
             .iter()
             .map(|poly| poly.to_string())
             .collect::<Vec<_>>()
             .join("\n");
+        // Upstream's `"\n" + "\n".join([str(p) …])` (`:646`): the option's
+        // first line stays empty, every curve a continuation below it.
+        let coef_cfg = format!("\n{curves}");
         let configfile = printer
             .lookup_object_as::<PrinterConfig>(CONFIGFILE_OBJECT)
             .ok_or_else(|| CommandError::new("Printer is not ready"))?;
@@ -3535,9 +3538,13 @@ calibration_bed_temp: 60
         let saved = pending["drift_calibration"]
             .as_str()
             .expect("the curves are saved as text");
+        // Upstream's `"\n" + "\n".join([str(p) …])` (`:646`): the option's
+        // first line is empty and the curves hang below it, so the split
+        // starts with an empty string.
         let lines: Vec<&str> = saved.split('\n').collect();
-        assert_eq!(lines.len(), DRIFT_SAMPLE_COUNT);
-        for (i, line) in lines.iter().enumerate() {
+        assert_eq!(lines.len(), DRIFT_SAMPLE_COUNT + 1, "{saved}");
+        assert_eq!(lines[0], "", "the first line is empty: {saved}");
+        for (i, line) in lines.iter().skip(1).enumerate() {
             let coefs: Vec<f64> = line
                 .split(',')
                 .map(|coef| coef.trim().parse().expect("a number"))
@@ -3571,6 +3578,98 @@ calibration_bed_temp: 60
             "{:?}",
             m.replies()
         );
+    }
+
+    /// The write-back end to end: the curves `finish_calibration` queues go
+    /// through `SAVE_CONFIG`'s file rewrite, and the file a restart reads
+    /// yields the pending value verbatim — then still loads as nine curves.
+    #[tokio::test]
+    async fn finish_calibrations_curves_survive_a_save_config_round_trip() {
+        let m = Machine::new("temperature_probe probe").await;
+        let helper = drift_helper(&m.printer, &m.probe, USABLE_DRIFT);
+        helper.start_calibration();
+        {
+            let mut state = helper.lock();
+            let samples = state
+                .calibration_samples
+                .as_mut()
+                .expect("start_calibration opened the buckets");
+            for (i, window) in samples.iter_mut().enumerate() {
+                let level = 300. - 20. * i as f64;
+                for temp in [20., 30., 40.] {
+                    window.push((temp, level));
+                }
+            }
+        }
+        helper.finish_calibration(true).expect("the run fits");
+
+        let configfile = m
+            .printer
+            .lookup_object_as::<PrinterConfig>(CONFIGFILE_OBJECT)
+            .expect("configfile is registered");
+        let pending = configfile.get_status(0.)["save_config_pending_items"]
+            ["temperature_probe probe"]["drift_calibration"]
+            .as_str()
+            .expect("the curves are saved as text")
+            .to_string();
+
+        let prefix = format!("drift_save_roundtrip_{}", std::process::id());
+        let path = std::env::temp_dir().join(format!("{prefix}.cfg"));
+        std::fs::write(&path, "[temperature_probe probe]\nsensor_type: Scripted\n")
+            .expect("the body config is written");
+        let cfgname = path.to_str().unwrap().to_string();
+        crate::core::klippy::config::save_config::write_config(&configfile, &cfgname)
+            .expect("SAVE_CONFIG writes");
+
+        // The block's shape is upstream's: `drift_calibration =` with an
+        // empty first line, each curve a tab-indented continuation.
+        let written = std::fs::read_to_string(&path).expect("rewritten file readable");
+        assert!(
+            written.contains("#*# drift_calibration =\n#*# \t"),
+            "{written}"
+        );
+
+        // What a restart reads back: parseable, and byte-for-byte the value
+        // the run queued.
+        let (reloaded, _) = Config::from_file(&path).expect("the rewritten config parses");
+        let section = reloaded
+            .get_section("temperature_probe probe")
+            .expect("the section");
+        assert_eq!(
+            section.get_text("drift_calibration").expect("read back"),
+            pending,
+            "the pending value round trips verbatim"
+        );
+
+        // …and it still loads as the nine curves the loader reads.
+        let reloaded_helper = EddyDriftCompensation::read(
+            &ConfigWrapper::untracked(section),
+            Arc::downgrade(&m.printer),
+            Arc::new(Mutex::new(State::new())),
+        )
+        .expect("the drift options read");
+        assert_eq!(
+            reloaded_helper
+                .lock()
+                .drift_calibration
+                .as_ref()
+                .map(Vec::len),
+            Some(DRIFT_SAMPLE_COUNT)
+        );
+
+        // The rewrite left a timestamped backup behind with the prefix too.
+        let leftovers = std::fs::read_dir(std::env::temp_dir())
+            .expect("the temp dir lists")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|candidate| {
+                candidate
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with(&prefix))
+            });
+        for leftover in leftovers {
+            let _ = std::fs::remove_file(leftover);
+        }
     }
 
     /// Curves that would cross are refused before anything is saved —

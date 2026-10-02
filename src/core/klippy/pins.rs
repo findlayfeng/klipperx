@@ -223,8 +223,9 @@ pub trait PwmOut: Send + Sync {
     /// [`Mcu::estimated_clock`](crate::core::klippy::mcu::Mcu::estimated_clock) and
     /// aligns a software PWM to its cycle. This is `SET_PIN`'s immediate
     /// path — what it drives with when no print-time timeline can date the
-    /// change (`extras/output_pin`), and what the outputs whose own
-    /// `GCodeRequestQueue` gap still stands (`fan`, `servo`, …) drive with.
+    /// change (`extras/output_pin`), the same fallback `fan`'s queue keeps
+    /// (`extras/fan`), and what the outputs whose own `GCodeRequestQueue`
+    /// gap still stands (`servo`, …) drive with.
     ///
     /// # Errors
     /// As [`PwmOut::set_pwm`], plus when the firmware clock cannot be

@@ -430,7 +430,8 @@ API 本身在 `crates/klippy-api/src/`：
 | `devices/serial.rs` | `SerialDevice`：tty 字节流（raw 模式、`termios2`、阻塞读） |
 | `devices/canserial.rs` | `CanSerialDevice`：SocketCAN——承载的仍是同一份 serial 字节流（8 字节切 CAN 帧、`0x100+2n` 寻址、admin 报文指派节点号） |
 | `devices/host.rs` | `HostDevice`：`dlopen` klipper host 库，输入输出都是协议字节（测试逐字节、发布走整帧接口） |
-| `devices/simulator.rs` | `SimulatorDevice`（`test: dict=…`）：字典驱动的应答机——分块回 zlib 字典、记 `finalize_config` 的 CRC、回 ack、回答时钟，回归语料的端到端就跑在它上面；**步进时序模型**：per-oid 固件步进链（config/queue/reset 三态、`timer_is_before` u32 回绕、首拍过期/忙拒 → 字典 `static_string_id` 的 shutdown 帧）与固件侧样本续窗的 monitor——两会话复现（C5/Q10）的确定性假件 |
+| `devices/simulator.rs` | `SimulatorDevice`（`test: dict=…`）：字典驱动的应答机——分块回 zlib 字典、记 `finalize_config` 的 CRC、回 ack、回答时钟，回归语料的端到端就跑在它上面；**步进时序模型**：per-oid 固件步进链（config/queue/reset 三态、`timer_is_before` u32 回绕、首拍过期/忙拒 → 字典 `static_string_id` 的 shutdown 帧）与固件侧样本续窗的 monitor——两会话复现（C5/Q10）的确定性假件；**多实例连机**：`link_machine(&[…])` 把多块板连成一台机器——本板步进置 `move_pending`、释放自身锁后把信号一跳转发给 peer（不回响，两板同时步进不互锁），peer 用被 arm 的自家时钟触发 armed 检查；未 link 的实例 `peers` 为空、行为与开销零变化（2026-10-03，`d14ce6a`） |
+| `devices/responder_mcu.rs` | 响应器式假 MCU 句柄（可多实例）：`section()/sections()` 生成 `[mcu …] test: dict=` 块、bring_up 后 `mcu()/device()` 取回各自连接与实例、`link_machine()` 连机；取物全为 Option/Result，bring_up 阶段不 panic（否则跳过 teardown 会挂住运行时收尾）；两个 `#[cfg(test)]` 取物缝在 `Interface`/`Mcu` 上 |
 | `devices/frame_mock.rs` | `FrameMock`：测试夹具——FIFO 精确帧比对 + 预设输出帧 |
 | `pty.rs` | `posix_openpt` 开的 pty 对（仅 `cfg(test)`）：串口测试需要真内核 tty 时用 |
 | `usb.rs` | `restart_method: rpi_usb` 的 USB 端口切电：sysfs 拓扑发现（tty→hub→端口号）与两种机制（sysfs `disable` / `nusb` 控制传输） |

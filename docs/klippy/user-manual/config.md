@@ -555,6 +555,32 @@ serial_no: 28ff00abcdef
 max_temp: 300
 ```
 
+### `[temperature_probe <name>]` — 探针温度传感器（eddy 漂移补偿的温度通道）
+
+内层先按 `sensor_type` 建一个普通传感器（与 `[temperature_sensor]` 同一 `heaters` 工厂机制），
+本节再把它包成可 `objects/query` 的对象 `temperature_probe <name>`。**A 核心已落地**
+（2026-10-03，`f6ea201`）；标定命令族（`TEMPERATURE_PROBE_*`）与 eddy 漂移补偿
+（`EddyDriftCompensation`）待后续单元——落地前 `get_status` 的 `in_calibration` 与
+`compensation_enabled` 恒 `false`。
+
+| 参数 | 类型 | 必需 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| `sensor_type` | 字符串 | 是 | — | 内层传感器类型（查传感器类型表） |
+| `gcode_id` | 字符串 | 否 | — | `M105` 报告用 ID（`heaters` 侧读取） |
+| `speed` | 浮点 (mm/s) | 否 | — | 校准移动速度（`> 0`）；缺省时取 probe/lift 速度的较大者 |
+| `horizontal_move_z` | 浮点 (mm) | 否 | `2.0` | 点间抬升，`> 0` |
+| `resting_z` | 浮点 (mm) | 否 | `0.4` | 采样间停驻高度，`> 0` |
+| `calibration_position` | 3 浮点 | 否 | — | 校准起始位置 `x y z`（count 措辞同上游） |
+| `calibration_bed_temp` | 浮点 (°C) | 否 | — | 校准期热床目标，`> 50` |
+| `calibration_extruder_temp` | 浮点 (°C) | 否 | — | 校准期挤出机目标，`> 50` |
+| `extruder_heating_z` | 浮点 (mm) | 否 | `50.0` | 加热期间的停靠高度，`> 0` |
+| `smooth_time` | 浮点 (s) | 否 | `2.0` | 读数平滑窗口，`> 0` |
+| `min_temp` | 浮点 (°C) | 否 | `-273.15` | 报警下限（`minval` 同值） |
+| `max_temp` | 浮点 (°C) | 否 | `99999999.9` | 报警上限，`> min_temp` |
+
+`get_status` 六键：`temperature`（平滑值，**不**舍入）、`measured_min_temp` / `measured_max_temp`
+（round2）、`in_calibration`、`estimated_expansion`、`compensation_enabled`（见上）。
+
 ### `[thermistor <name>]` / `[adc_temperature <name>]` — 自定义传感器定义
 
 定义一个新的传感器类型供 `sensor_type` 引用；节的 `<name>` 就是注册的类型名。定义与引用在本仓**与文件中先后无关**（`[thermistor <name>]` 声明为 `phase = early`，见开发手册的相位通则）；若用 `[adc_temperature <name>]` 定制电压型，**请把定义写在引用它的 `[extruder]`/`[heater_bed]` 之前**（该 prefix 尚未设为 early，属待补项）。两者的差别

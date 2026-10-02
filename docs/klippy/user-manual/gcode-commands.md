@@ -346,9 +346,9 @@ TEMPERATURE_PROBE_NEXT / TEMPERATURE_PROBE_COMPLETE / ABORT   （标定期间动
 - `PROBE` 是 mux 键，值 = `[temperature_probe <name>]` 的 `<name>`；
 - **CALIBRATE** 要求（按序）：已注册标定 helper（无则先报 `No calibration helper registered for […]`）
   → 轴已 homed → 已链接探针（`probe` 对象）→ 无手动探针在跑；
-  `TARGET` 必须 `> min_temp`、`STEP > 0`，预期样本数 `≥ 3` 否则报错中止；启动后注册
-  `TEMPERATURE_PROBE_NEXT`/`_COMPLETE`，第一次手动探针会话期间由 `_prepare_next_sample`
-  注册裸名 `ABORT`；
+  `TARGET` 必须**大于传感器当前平滑读数**（非 `min_temp`）、`STEP ≥ 1.0`，预期样本数 `≥ 3`
+  否则报错中止；启动后注册 `TEMPERATURE_PROBE_NEXT`/`_COMPLETE`；裸名 `ABORT` 在**第一轮手动
+  探针会话结束后**（finalize 的 `_prepare_next_sample`）注册，覆盖升温等待期；
 - 流程：移动到 `calibration_position`（可选加热床/挤出机脚本，经 `TEMPERATURE_WAIT` 等温）
   → 手动探针定零点 → 每轮升温 `STEP` → 升温到位经 kick 自动发 `TEMPERATURE_PROBE_NEXT`
   → 记热膨胀 → 样本满由 `COMPLETE` 收尾（`≥3` 才出结果）、任何时刻 `ABORT` 收尾；
@@ -356,7 +356,7 @@ TEMPERATURE_PROBE_NEXT / TEMPERATURE_PROBE_COMPLETE / ABORT   （标定期间动
 - 上游 quirk：`TEMPERATURE_PROBE_COMPLETE` 的 help 显示的是 NEXT 的文案（上游注册即如此，
   本仓逐字保留）。
 
-（2026-10-03 `dfaf418` + `704ee0d`；`_check_homed` 成功分支与端到端归真机验证，见 `TESTING.md`）
+（2026-10-03 `dfaf418` + `704ee0d`；`_check_homed` 成功分支与整条 `cmd_calibrate` 端到端单测不可达——测试机恒 unhomed，按 `TESTING.md` 的真机约定待真机验证）
 
 ### M104 / M109 — 设置挤出机温度
 

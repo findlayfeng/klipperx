@@ -579,13 +579,14 @@ max_temp: 300
 | `smooth_time` | 浮点 (s) | 否 | `2.0` | 读数平滑窗口，`> 0` |
 | `min_temp` | 浮点 (°C) | 否 | `-273.15` | 报警下限（`minval` 同值） |
 | `max_temp` | 浮点 (°C) | 否 | `99999999.9` | 报警上限，`> min_temp` |
-| `calibration_temp` | 浮点 (°C) | 否 | — | 漂移校准温度（`note_z_calibration_*` 经 `SAVE_CONFIG` 写回） |
+| `calibration_temp` | 浮点 (°C) | 否 | `0.0` | 漂移校准温度（`note_z_calibration_*` 经 `SAVE_CONFIG` 写回） |
 | `max_validation_temp` | 浮点 (°C) | 否 | `60.0` | 漂移校验允许的最高温度 |
 | `drift_calibration_min_temp` | 浮点 (°C) | 否 | `0.0` | 漂移曲线适用下限（`finish` 时随曲线写回） |
 | `drift_calibration` | 两层列表 | 否 | — | 9 段二次多项式系数（`fit` 输出，SAVE_CONFIG 写出；坏曲线报 `Invalid polynomial in drift calibration`） |
 
 > 上述四个漂移选项**仅在同名 `[probe_eddy_current]` 段存在时**被读取（与上游一致），
-> 否则会被未用选项校验拒绝。
+> 否则会被未用选项校验拒绝。另：`drift_calibration` 写为空视为「未配置」
+> （上游空值会崩在 `_check_calibration` 拒载，本仓取代码注释声明的取舍）。
 
 `get_status` 六键：`temperature`（平滑值，**不**舍入）、`measured_min_temp` / `measured_max_temp`
 （round2）、`in_calibration`、`estimated_expansion`、`compensation_enabled`（C 起为真实开关，无 eddy 段时恒 `false`）。

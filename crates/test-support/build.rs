@@ -304,14 +304,14 @@ fn make(klipper_dir: &Path, config: &Path, klipper_out: &Path, targets: &[&str])
 /// Matching by the full generated name (rather than by config file name, as
 /// the old `upstream_test_cases_run` did) scopes the ignore to a single case:
 /// `example-cartesian.cfg` is referenced by `out_of_bounds.test`,
-/// `commands.test` and `printers.test`, but only the `out_of_bounds` case
-/// needs to be ignored here.
-const IGNORED: &[&str] = &[
-    // `out_of_bounds.test` expects `G1 Y9999` to fail a move-bounds check this
-    // host has not implemented yet; the move succeeds, so `SHOULD_FAIL` is not
-    // satisfied. Remove when move-bounds validation lands.
-    "upstream_out_of_bounds_config_0_example_cartesian",
-];
+/// `commands.test` and `printers.test`, so a file-name match would over-apply.
+const IGNORED: &[&str] = &[];
+
+// `out_of_bounds.test` (the corpus's only `SHOULD_FAIL`) was briefly listed
+// here: a harness bug double-inverted the `SHOULD_FAIL` expectation, making
+// the case fail even though `G1 Y9999` correctly errors with "Move out of
+// range". The bug is fixed (the `run_case` inversion is no longer re-applied
+// in the harness), so the case passes and the entry is gone — kept empty.
 
 /// One MCU dictionary a case names.
 #[derive(Clone)]

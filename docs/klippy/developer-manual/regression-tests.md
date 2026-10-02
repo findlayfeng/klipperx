@@ -189,8 +189,8 @@ connect_file(输出文件, 字典):
 | 判定 | 次数 | 原因 |
 |------|------|------|
 | 因字典未构建跳过 | 2 | `printers.test` 中引用 `pru` 的两条运行（默认不编 `pru`） |
-| 因忽略列表跳过 | **1** | `out_of_bounds.test`（move-bounds 未实现，`G1 Y9999` 未被拒；见下文「忽略列表」） |
-| 实际执行 | **236** | 全部通过（下表列出各 `.test`，`printers.test` 一个文件 203 条运行） |
+| 因忽略列表跳过 | **0** | `IGNORED` 已清空 |
+| 实际执行 | **237** | 全部通过（下表列出各 `.test`，`printers.test` 一个文件 203 条运行） |
 | 其中早期转绿 | — | 逐批转绿的先后顺序（各批提交信息里可查）：`linuxtest.test`、`commands.test`、`out_of_bounds.test`（b39750f 移出）、`bed_mesh.test`、`z_virtual_endstop.test`（探针链路）、`z_tilt.test`、`quad_gantry_level.test`（调平族）、`bltouch.test`、`smart_effector.test`（探针族）、`multi_z.test`（发送队列水位）、`screws_tilt_adjust.test`（探测语义与亚纳米守卫）、`gcode_arcs.test`、`bed_screws.test`、`pwm.test`、`temperature.test`、`macros.test`、`led.test`、`sdcard_loop.test`、`pressure_advance.test`、`eddy.test`、`dual_carriage.test`、`exclude_object.test`（宏体渲染）、`polar.test`、`delta.test`、`delta_calibrate.test`（运动学）、`hybrid_corexy_dual_carriage.test`（`[input_shaper]` 段）、`extruders.test`（filament 传感器段）、`manual_stepper.test`、`generic_cartesian_iqex.test`/`generic_cartesian_itex.test`，**全部通过** |
 
 上游 `configparser` 的 `optionxform = str.lower` 已对齐（`mod.rs` 存储侧小写 + `section.rs` 查询侧小写），`Option 'pid_Kp' … must be specified` 类的 49 次回归失败已归零；`must be specified` 错误文案保留调用方传入的大小写，`is not valid` 与 `Section '…' is not valid` 使用存储侧小写。
@@ -206,11 +206,12 @@ connect_file(输出文件, 字典):
   **237 条通过、0 条失败**，`IGNORED` **已清空**（2026-09-25 收官；逐批转绿过程见各批提交信息与
   `TODO.md`）。另有 2 条运行声明 `DICTIONARY … pru.dict`，默认不构建 `pru`（需 `pru-gcc`），
   不计入统计。
-- **2026-10-02 回退**：运行器从单个 `#[test]` 串行改为 build 时生成独立 `#[test]` 后（见下文
-  「运行」），暴露出 `out_of_bounds.test` 因本主机未实现 move-bounds 检查而实际成功——`G1 Y9999`
-  未被拒，`SHOULD_FAIL` 不满足。旧串行运行器在转绿时依赖 `gcode_move` 落地后配置可装载，但越界
-  检查一直缺位；改为独立 `#[test]` 后该缺口直接表现为测试失败，故重新登记进 `IGNORED`。
-  move-bounds 实现后从列表移除即可。
+- **2026-10-02 回退与修复**：运行器从单个 `#[test]` 串行改为 build 时生成独立
+  `#[test]` 后，`out_of_bounds.test` 一度表现为「成功」被误判为 move-bounds 未实现而
+  重新登记进 `IGNORED`；诊断发现 g-code 阶段实际报了 `Move out of range: 0.000 9999.000`，
+  `check_move` 一直在工作——真正的 bug 是 harness 对 `SHOULD_FAIL` 做了**双重反转**
+  （`run_case` 已反转一次，harness 末尾又按 `should_fail` 反转一次），修掉后 case 通过，
+  `IGNORED` 重归清空。
 - 按「首次失败」归类的历史分布（分域工单、运动学细分、完整失败日志与「收益不可加」的复盘）
   曾记在 `docs/work-log/2026-09-22-upstream-regression-failures.md`；该快照**随收官从工作记录目录
   清理**（`git log --diff-filter=D -- docs/work-log/` 可找回）。本页只保留机制与推进口径，避免两处
@@ -223,8 +224,8 @@ connect_file(输出文件, 字典):
 
 - 按「**首次失败原因**」分组只用于**定位**，不是工作队列：`load_config` 遇到第一个未知
   section 就停，修好一个缺口只会让运行前进到下一个缺口，总数可能不变，各组收益不可加。
-- 进度以**实测口径**衡量：默认构建下 **236 通过 / 0 失败**、`IGNORED` **1** 条
-  （`out_of_bounds.test`，move-bounds 未实现；2026-10-02 回退登记）；
+- 进度以**实测口径**衡量：默认构建下 **237 通过 / 0 失败**、`IGNORED` **0** 条
+  （`out_of_bounds.test` 的双重反转 bug 已修复，见上）；
   推进期的做法是先产出「**运行 × 缺口**」矩阵
   （列出每条运行的**全部**缺口，而非第一个），据此找「只差一个缺口」的用例与公共前缀。
 - **验收标准**：对应 case 从 `IGNORED`（`crates/test-support/build.rs`，按生成函数名登记）
@@ -293,11 +294,8 @@ harness 把每个 `[mcu]` / `[mcu <name>]` 的传输键换成 `test: dict=<字�
 引用同一 config 的其它用例）。登记在内的 case 生成时带 `#[ignore = "upstream IGNORED"]`，
 `cargo test --ignored` 可单跑；移除后即恢复为普通 `#[test]`。
 
-**当前列表**（1 条）：
-
-| 函数名 | 原因 |
-|--------|------|
-| `upstream_out_of_bounds_config_0_example_cartesian` | `G1 Y9999` 越界未被拒——本主机未实现 move-bounds 检查，`SHOULD_FAIL` 不满足；move-bounds 落地后移除 |
+**当前列表**（0 条，已清空）：`out_of_bounds.test` 曾因 harness 双重反转 bug 误登记，
+  修复后移除（见上文「回退与修复」）。保留列表机制为下一处缺口留登记处。
 
 字典未构建的 case（如 `printers.test` 里声明 `pru.dict` 的 2 条）不进这张列表，而是在生成时
 按字典文件是否存在判定，带 `#[ignore = "dictionary <name> not built"]`——它随 `KLIPPERX_ARCHES`
@@ -323,11 +321,13 @@ harness 把每个 `[mcu]` / `[mcu <name>]` 的传输键换成 `test: dict=<字�
 - 只有 g-code 阶段的错误才反转成成功（`run_phases` 的两段返回值）。
 
 所以它的验收要点是：移出忽略列表前，配置必须先能装载——否则非零退出来自配置错误，反转就会被
-「喂饱」。这一条在 b39750f 移出时已满足（`gcode_move` 落地后 `example-cartesian.cfg` 可装载）。
+「喂饱」。这一条在 b39750f 移出时已满足（`gcode_move` 落地后 `example-cartesian.cfg` 可装载，
+反转验的正是 `G1 Y9999` 越界）。
 
-**2026-10-02 回退**：生成式运行器暴露出反转一直未被真正验到——`G1 Y9999` 在本主机成功
-（move-bounds 检查未实现），`SHOULD_FAIL` 因「g-code 阶段未报错」而不满足，case 重新进
-`IGNORED`。move-bounds 落地后从列表移除，验收时须确认反转验的真是越界检查。
+**2026-10-02 回退与修复**：生成式运行器一度报告该 case 「成功」，被误读为 move-bounds 未实现而
+重新登记进 `IGNORED`；诊断发现 g-code 阶段实际报了 `Move out of range`，`check_move` 一直在工作——
+真正的 bug 是 harness 对 `SHOULD_FAIL` 做了**双重反转**（`run_case` 已反转一次，harness 末尾
+又按 `should_fail` 反转一次），修掉后 case 通过，`IGNORED` 重归清空。
 
 ### 运行
 

@@ -64,10 +64,11 @@ AI 写实现」：人类负责方向与取舍、任务拆解、验收判定、�
 
 按「打印任务」链路列出（细节与证据见 [`TODO.md`](TODO.md) 与[客户端/开发手册](docs/README.md)）：
 
-1. **输入回放**：`virtual_sdcard` 只有配置节、**没有文件回放**（无 `M20`–`M27`），`print_stats` 缺失
-   → 「上传 gcode → 开打 → 看进度 → 暂停/恢复」这条标准工作流还不存在（可先用 API 逐行喂 gcode 顶替）。
-2. **温度语义**：`M105` 目前硬编码回 `T:0`；`M190`/`M109` 设了目标但**不等温**，`TEMPERATURE_WAIT`
-   未注册 → 预热时序不正确。
+1. **输入回放**：`virtual_sdcard` 的文件回放（`M20`–`M27`）与 `print_stats` 已落地；`pause_resume/*`
+   端点未注册（对象与 `PAUSE`/`RESUME`/`CANCEL_PRINT` 可经 `gcode/script` 发）→ 标准工作流的
+   暂停/恢复缺 API 端点一环。
+2. **温度语义**：`M105` 目前硬编码回 `T:0`（gcode_id 表未接线）；`M190`/`M109` 设了目标但**不等温**；
+   `TEMPERATURE_WAIT` 已注册（2026-10-03，`b5da84e`）→ 预热可用它等待。
 3. **运行时参数**：`M204`/`M201`/`M205`/`SET_VELOCITY_LIMIT` 未注册（只能用 `[printer]` 静态值）；
    `SET_PRESSURE_ADVANCE` 会记录但**不作用于运动**（PA 无效果）。
 4. **常见宏依赖**：`save_variables`（`SAVE_VARIABLE`）缺失，社区 `printer.cfg` 多数用不了；

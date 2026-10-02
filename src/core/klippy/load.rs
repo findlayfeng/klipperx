@@ -444,6 +444,7 @@ mod tests {
                 "sdcard_loop",
                 "smart_effector",
                 "temperature_fan",
+                "temperature_probe",
                 "temperature_sensor",
                 "virtual_sdcard",
                 "z_tilt",

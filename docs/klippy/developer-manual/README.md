@@ -337,6 +337,7 @@ identify 的命令**定义**（名称、参数、解码）与其它命令一样�
 | `temperature_sensor.rs` | `[temperature_sensor <name>]`：读 `sensor_type`（交给 `heaters` 查工厂）与 `min_temp` / `max_temp`，`get_status` 报 `temperature` / `measured_min_temp` / `measured_max_temp` |
 | `temperature_mcu.rs` | 传感器工厂 `temperature_mcu`：MCU 自带的 ADC 温度通道（`cmd/debug.rs` 的 `debug_read` 读寄存器），标定数据在内 |
 | `temperature_combined.rs` | 传感器工厂 `temperature_combined`：把多个传感器合成一个（上游同名），周期定时器在阈值越界时报警 |
+| `temperature_probe.rs` | `[temperature_probe <name>]`（`temperature_probe.py`）：内层按 `sensor_type` 建传感器再包成对象（`register_sensor` 同上游），10 个探针选项 + `Polynomial2d`（求值/拟合）、1 s 平滑读数与 kick、`get_status` 六键、`stats`、`phase` 为 generic（order 30）；**A 核心**（2026-10-03，`f6ea201`），`TEMPERATURE_PROBE_*` 命令族与 `EddyDriftCompensation` 待后续单元 |
 | `multi_pin.rs` | `[multi_pin <name>]`（**`phase = early`**）：`pins`（必填、逗号分隔）把调用扇出到多个真实 pin；节名注册为虚拟 pin chip（重复注册的 `DuplicateChip` 吞掉），`multi_pin:<name>` 作为 lookup 值；`update_pwm` 等逐子 pin 转发，`next_aligned_clock` 原样返回（批 #26） |
 | `respond.rs` | `[respond]`：`default_type`（`echo`/`command`/`error`，默认 `echo`）与 `default_prefix`；注册就绪前可用的 `M118`（原样透传）与 `RESPOND`（`TYPE`/`PREFIX`/`MSG`，含 `echo_no_space` 不加空格，批 #29） |
 | `homing_heaters.rs` | `[homing_heaters]`：归零期间把选中 heater 目标置 0、结束后恢复（`heaters`/`steppers` 列表，`steppers` 的资格过滤未实现——本仓 homing 事件无载荷）；批 #31 |
@@ -360,7 +361,7 @@ identify 的命令**定义**（名称、参数、解码）与其它命令一样�
 | `bus_debug.rs` | `i2c_device` / `spi_device` 共用的调试命令底座：同步→异步桥与 `DATA=` 的十六进制编解码（无配置节） |
 | `error_mcu.rs` | MCU 停机消息的展开（无配置节，第一个 `[mcu]` 拉起）：监听 `klippy:shutdown` / `klippy:analyze_shutdown`，把简短原因扩成原因+提示（上游 `extras/error_mcu.py`） |
 
-`extras/` 的 102 个模块（101 `pub mod` + `pub(crate) bus_debug`）全部在 `extras/mod.rs` 声明；其中 78 个文件注册了 115 个 `section!`（含 `printer`，声明在 `toolhead.rs`；`mcu` 声明在 `mcu/mod.rs` 且同时声明普通与 prefix 两种形式，共 116 个装载 id）构成工厂表；`heaters` / `gcode_move` / `query_endstops` / `error_mcu` / `bus_debug` 等非节模块由上述模块按需 `ensure`，不占配置节。
+`extras/` 的 104 个模块（103 `pub mod` + `pub(crate) bus_debug`）全部在 `extras/mod.rs` 声明；其中 80 个文件注册了 117 个 `section!`（含 `printer`，声明在 `toolhead.rs`；`mcu` 声明在 `mcu/mod.rs` 且同时声明普通与 prefix 两种形式，共 117 个装载 id——与声明一一对应，由 `test_the_factory_table_is_in_load_order` 钉住；计数 2026-10-03 实测重核，旧文 102/78/115/116 已过时）构成工厂表；`heaters` / `gcode_move` / `query_endstops` / `error_mcu` / `bus_debug` 等非节模块由上述模块按需 `ensure`，不占配置节。
 
 ### `api/` — 客户端 API 层
 

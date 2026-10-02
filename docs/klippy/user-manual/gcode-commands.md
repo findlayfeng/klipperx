@@ -344,6 +344,28 @@ M190 [S<temperature>]
 
 `S` 默认 `0`。**当前 `M190` 不等待升温**，与 `M140` 行为相同。
 
+### PID_CALIBRATE — PID 自整定
+
+```
+PID_CALIBRATE HEATER=<name> TARGET=<celsius> [WRITE_FILE=<0|1>]
+```
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `HEATER` | —（必填） | 加热器短名（同 `SET_HEATER_TEMPERATURE` 的多路键） |
+| `TARGET` | —（必填） | 目标温度（摄氏度） |
+| `WRITE_FILE` | `0` | 为 `1` 时把采样过程写入 `/tmp/heattest.txt` |
+
+- 命令由**首台加热器装载**时注册（上游 `Heater.__init__` 的 `load_object` 对应物）——
+  配置里没有加热器就没有这条命令，也没有 `[pid_calibrate]` 节（手写会被判未知节，与上游差异见模块文档）；
+- 校准跑 `ControlAutoTune`：满功率加热/降功率冷却双相摆动（目标周期性下摆 `TUNE_PID_DELTA=5`），
+  记满 12 个峰后用 Åström–Hägglund 估出终极周期/增益、按 Ziegler–Nichols 出参；
+- 完成后回三行 `PID parameters: pid_Kp=… pid_Ki=… pid_Kd=…` 与
+  `The SAVE_CONFIG command will update the printer config file with these parameters and restart the printer.`；
+  结果经 `configfile.set` 暂存四条（`control: pid` + 三个 `pid_K*`），**执行 `SAVE_CONFIG` 才写回并重启**；
+- 校准未跑满（如停机）时报 `pid_calibrate interrupted`，交还原控制环（错误路径同样交还）；
+- 等待循环走 `set_temperature(.., wait)`，**当前不回显 `M105` 行**（g-code-id 表未接线，见模块文档）。
+
 ### M106 / M107 — 风扇（由 `[fan]` 装载）
 
 ```

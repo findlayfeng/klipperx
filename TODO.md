@@ -64,7 +64,7 @@ H1–H12 是上游 extras 里按域归并的消费者（2026-09-21 全量盘点�
 | # | 事项 | 依赖 |
 |---|---|---|
 | F6 | SPI 总线剩余：`spi_transfer_with_preface` / `setup_shutdown_msg` | F1、F2 |
-| F8 | endstop / trsync ✅（FW6）；测试侧「响应器式多实例假 MCU」待办（可用 `SimulatorDevice`） | F1、F2、C1 |
+| F8 | endstop / trsync ✅（FW6）；测试侧「响应器式多实例假 MCU」✅（2026-10-03，`d14ce6a`） | F1、F2、C1 |
 | F9 | 固件资源剩余：buttons / trigger_analog / initial_pins / sdcard / sensor_bulk / lcd / neopixel / tmcuart 等（已接：`cmd/thermocouple.rs` + `spi_temperature`；pulse_counter 批 #8 落地） | F1–F7 |
 
 **G-Code 与端点**
@@ -230,9 +230,6 @@ toolhead / 开放事件）一起补，一部分是现在就独立可补的小行
 数据。
 
 #### F8 endstop / trsync（与 C1 共享，框架 FW6a–FW6e 已落地）
-
-- [ ] **FW6a-2** 测试侧加**响应器式假 MCU**（可多实例），并补 `ToolHeadObject::connect` 的
-      两 MCU 端到端测试。（挪到 FW6c 一起做；时钟偏移已有 `McuChip` 单测）
 
 ##### F8b `Mcu` ↔ 资源的强引用环（阻塞回归）
 
@@ -433,8 +430,8 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
       seam + `MoveSplitter` + `fade_*`）。素材：`abandoned/wip-main-leftovers` 的 `bed_mesh.rs`
       （含 `ZMesh`/lagrange/bicubic 与两个测试），按主线结构重做并补手册。
 - [ ] **保真单元：探针精度**（排在 H9 模块闭包之后）：按触发步数反算位置与 `rest_time`
-      （上游 `_calc_endstop_rate`）。前置：模拟器步数模型（否则 `stepper_get_position` 恒 0，无法验收），
-      见 F8 的「响应器式假 MCU」。
+      （上游 `_calc_endstop_rate`）。前置已满足：模拟器步数模型与多实例假 MCU 已落地
+      （Q10 + `d14ce6a`，两 MCU 端到端测试在案）。
 - **端停位置的缺口（需接口化）**：上游 rail 会优先向 endstop 要位置（`mcu_endstop.get_position_endstop()`，
       探针 wrapper 返回 `z_offset`）；本仓 `position_endstop` 缺省退到 `position_min`，所以用
       `probe:z_virtual_endstop` 的配置虽然在解析上能过，但 Z 回零后的位置不等于上游——`z_virtual_endstop.test`

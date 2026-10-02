@@ -344,7 +344,7 @@ git config core.hooksPath .githooks
 | `smart_effector.rs` | 选项默认与语料认领；`ACCEL`/`RECOVERY_TIME` 负值拒绝、`SENSITIVITY`/`ACCEL` 越界拒绝（含上游文案）；`SET` 参数解析与默认、无 `control_pin` 时拒绝 `SENSITIVITY`；位流逐字节成帧；`control_pin` 预留与二次使用拒绝；装载注册 chip/对象（async：加载+bring_up+`G28`+两命令端到端）；无 `control_pin` 时 `RESET` 不注册 |
 | `spi_device.rs` | 注册两条调试命令；无片选允许；`spi_mode`/`spi_speed` 越界拒、部分软件引脚报错、片选须在指定 MCU、未知 MCU 点名节；就绪后 `get_status` 报配置；软件设备接受本 MCU 引脚 |
 | `static_digital_output.rs` | 每个引脚都被预留、取反的引脚有记录、缺 `pins` 报错 |
-| `adc_temperature.rs` | 线性插值正反向、热敏电阻 Steinhart-Hart 与 Beta 模型（与上游公式对拍）；自定义 `[thermistor]` 定义写在消费者前/后两种布局都能装载（`phase = early` 保证顺序无关，批 #22 +1 测） |
+| `adc_temperature.rs` | 线性插值正反向、热敏电阻 Steinhart-Hart 与 Beta 模型（与上游公式对拍）；自定义 `[thermistor]` 与 `[adc_temperature]` 定义写在消费者前/后两种布局都能装载（`phase = early` 保证顺序无关；批 #22 与 `372cd93` 各 +1 测） |
 | `extras/adc_scaled.rs`（批 #19，15 测） | 四个文案逐字（`must be specified`/`must be above 0`/`vref and vssa must be on same mcu`/`adc_scaled only supports adc pins`）、装载顺序（缺节时 `sensor_pin: Unknown pin chip name 'vref_scaled'`，有的则通）、参考采样 `(0.300,0.001,8,1,0.,1.,0)`、每 `sensor_pin` 各建一个内层 ADC、换算方向与 `calc_smooth=min(Δt/smooth_time,1)`、只取末样本、参考未就绪时的 0/0（NaN/±inf，照上游复现） |
 | `extras/multi_pin.rs`（批 #26，10 测） | 两个 `[multi_pin]` 节都能装载（`DuplicateChip` 吞掉）、`set_pwm`/`update_pwm`/`setup_cycle_time`/`setup_start_value`/`setup_max_duration` 逐子 pin 转发、`next_aligned_clock` 原样、`multi_pin <name> not configured` 与 `Can't setup multi_pin <name> twice` 逐字、缺 `pins` 文案、`!` 反相前缀 |
 | `extras/respond.rs`（批 #29，14 测） | `default_type` 三取值与 `default_prefix` 覆盖、非法 choice 文案；`M118` 原样透传（含引号/空格与大空白）；`RESPOND` 的 `TYPE` 四分支（含 `echo_no_space` 无空格）、`PREFIX` 覆盖、`MSG` 缺省为空、非法 TYPE 逐字文案；两条命令就绪前可用 |

@@ -557,7 +557,7 @@ max_temp: 300
 
 ### `[thermistor <name>]` / `[adc_temperature <name>]` — 自定义传感器定义
 
-定义一个新的传感器类型供 `sensor_type` 引用；节的 `<name>` 就是注册的类型名。定义与引用在本仓**与文件中先后无关**（`[thermistor <name>]` 声明为 `phase = early`，见开发手册的相位通则）；若用 `[adc_temperature <name>]` 定制电压型，**请把定义写在引用它的 `[extruder]`/`[heater_bed]` 之前**（该 prefix 尚未设为 early，属待补项）。两者的差别
+定义一个新的传感器类型供 `sensor_type` 引用；节的 `<name>` 就是注册的类型名。定义与引用在本仓**与文件中先后无关**（两族都声明为 `phase = early`，见开发手册的相位通则）。两者的差别
 是标定点的写法（与上游一致，`[adc_temperature]` 按是否给 `resistance1` 区分电阻/电压型）：
 
 | 参数 | 类型 | 说明 |

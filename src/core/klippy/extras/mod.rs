@@ -93,6 +93,7 @@ pub mod sx1509;
 pub mod temperature_combined;
 pub mod temperature_fan;
 pub mod temperature_mcu;
+pub mod temperature_probe;
 pub mod temperature_sensor;
 pub mod template;
 pub mod tmc;

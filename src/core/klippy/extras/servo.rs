@@ -18,10 +18,11 @@
 //!
 //! * **No print-time scheduling.** Upstream queues each update through
 //!   `output_pin.GCodeRequestQueue` and aligns it to the next MCU cycle
-//!   (`servo.py:47-61`, `RESCHEDULE_SLACK`); this port drives the pin through
-//!   the resource's immediate path, like [`pwm_tool`](super::pwm_tool). The
-//!   duty value is upstream's formula, so what is missing is *when* the pulse
-//!   lands, not what it is.
+//!   (`servo.py:47-61`, `RESCHEDULE_SLACK`). The queue is ported
+//!   (`extras/gcode_request_queue.rs`) but `servo` is not wired to it yet, so
+//!   this port drives the pin through the resource's immediate path, like
+//!   [`pwm_tool`](super::pwm_tool). The duty value is upstream's formula, so
+//!   what is missing is *when* the pulse lands, not what it is.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 

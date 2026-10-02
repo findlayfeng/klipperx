@@ -404,6 +404,14 @@ pub struct ToolHeadObject {
     printer: Weak<Printer>,
     /// The connected motion state; `None` until connect.
     state: Arc<Mutex<Option<Connected>>>,
+    /// Lookahead callbacks registered before there was a planner to hang them
+    /// on (`register_lookahead_callback` at config load): installed by
+    /// [`Self::connect`], the same connect-time handover as
+    /// `set_estimated_print_time_source`.
+    pending_lookahead_callbacks: Mutex<Vec<Box<dyn FnOnce(f64) + Send + 'static>>>,
+    /// Flush callbacks registered before connect, installed the same way
+    /// (`register_flush_callback` at config load).
+    pending_flush_callbacks: Mutex<Vec<Box<dyn Fn(f64) + Send + 'static>>>,
     /// Set when the object is dropped, to stop the flush task.
     shutdown: Arc<AtomicBool>,
 }
@@ -797,6 +805,8 @@ impl ToolHeadObject {
             reactor: printer.reactor(),
             printer: Arc::downgrade(printer),
             state,
+            pending_lookahead_callbacks: Mutex::new(Vec::new()),
+            pending_flush_callbacks: Mutex::new(Vec::new()),
             shutdown: Arc::new(AtomicBool::new(false)),
         };
         object.register_commands(printer)?;
@@ -1213,11 +1223,37 @@ impl PrinterObject for ToolHeadObject {
                 }
             }
 
-            *self.lock() = Some(Connected {
-                toolhead,
-                mcu_steppers,
-                last_step_gen_time: 0.0,
-            });
+            // Callbacks registered at config load, when there was no
+            // planner to hang them on (`register_lookahead_callback` /
+            // `register_flush_callback`): install them now, under the state
+            // lock. A registration racing this window blocks on that same
+            // lock — it has either filled these lists before the drain, or
+            // arrives after the install and goes straight to the live
+            // toolhead — so none can be lost. The handover mirrors
+            // `set_estimated_print_time_source`.
+            {
+                let mut guard = self.lock();
+                let mut pending = self
+                    .pending_lookahead_callbacks
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                for callback in std::mem::take(&mut *pending) {
+                    toolhead.register_lookahead_callback(callback);
+                }
+                drop(pending);
+                let mut pending = self
+                    .pending_flush_callbacks
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                for callback in std::mem::take(&mut *pending) {
+                    toolhead.register_flush_callback(callback);
+                }
+                *guard = Some(Connected {
+                    toolhead,
+                    mcu_steppers,
+                    last_step_gen_time: 0.0,
+                });
+            }
 
             // Let the G-code dispatcher reach the planner before a restart
             // (`GCodeDispatch.request_restart` needs the last print time, a
@@ -1618,6 +1654,51 @@ impl ToolHeadObject {
     pub fn dwell(&self, delay: f64) {
         if let Some(connected) = self.lock().as_mut() {
             connected.toolhead.dwell(delay);
+        }
+    }
+
+    /// Queue a lookahead callback (`toolhead.register_lookahead_callback`,
+    /// `klippy/toolhead.py:526-530`).
+    ///
+    /// Connect-safe: before connect there is no planner and
+    /// [`Self::get_last_move_time`] would read `0.0`, so the callback waits in
+    /// a pending list that [`Self::connect`] installs into the fresh toolhead.
+    /// After connect it takes effect at once — with the look-ahead empty the
+    /// callback fires immediately with the last move time, with moves queued
+    /// it fires when the move it was registered against reaches the trapq.
+    ///
+    /// Like every consumer callback the toolhead runs (a move's timing
+    /// callbacks, fired under the same state lock by [`Self::move_to`]), it
+    /// runs while the connected state is locked out: it must not re-enter this
+    /// object synchronously.
+    pub fn register_lookahead_callback(&self, callback: Box<dyn FnOnce(f64) + Send + 'static>) {
+        let mut guard = self.lock();
+        if let Some(connected) = guard.as_mut() {
+            connected.toolhead.register_lookahead_callback(callback);
+        } else {
+            self.pending_lookahead_callbacks
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .push(callback);
+        }
+    }
+
+    /// Queue a flush callback (`motion_queuing.register_flush_callback`): it
+    /// fires with the flush time on every step generation, in registration
+    /// order — including a generation with no steppers at all, which is what
+    /// a dwell-only (`kinematics: none`) timeline produces.
+    ///
+    /// Connect-safe like [`Self::register_lookahead_callback`]: before connect
+    /// it waits in a pending list that [`Self::connect`] installs.
+    pub fn register_flush_callback(&self, callback: Box<dyn Fn(f64) + Send + 'static>) {
+        let mut guard = self.lock();
+        if let Some(connected) = guard.as_mut() {
+            connected.toolhead.register_flush_callback(callback);
+        } else {
+            self.pending_flush_callbacks
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .push(callback);
         }
     }
 
@@ -3691,9 +3772,160 @@ mod tests {
             reactor: printer.reactor(),
             printer: Arc::downgrade(&printer),
             state,
+            pending_lookahead_callbacks: Mutex::new(Vec::new()),
+            pending_flush_callbacks: Mutex::new(Vec::new()),
             shutdown: Arc::new(AtomicBool::new(false)),
         };
         (printer, object)
+    }
+
+    /// ① Connect-safety: at config load there is no planner
+    /// (`get_last_move_time()` reads `0.0`), so both registrations wait in
+    /// their pending lists and are installed by `connect`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_callbacks_registered_before_connect_fire_after_connect() {
+        use crate::core::klippy::config::section::ConfigSection;
+        use crate::core::klippy::config::value::ConfigValue;
+        use crate::core::klippy::pins::{PrinterPins, PINS_OBJECT};
+        use crate::core::klippy::reactor::ManualReactor;
+
+        let mut section = ConfigSection::new("printer", None);
+        for (key, value) in [
+            ("kinematics", "none"),
+            ("max_velocity", "300"),
+            ("max_accel", "3000"),
+        ] {
+            section
+                .parameters
+                .insert(key.to_string(), ConfigValue::Single(value.to_string()));
+        }
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        printer
+            .add_object(
+                GCODE_OBJECT,
+                Arc::new(GCodeDispatch::new(Arc::clone(&printer))),
+            )
+            .unwrap();
+        printer
+            .add_object(PINS_OBJECT, Arc::new(PrinterPins::new()))
+            .unwrap();
+        // `kinematics: none` has no steppers — exactly the dwell-only
+        // timeline on which `generate` must still fire the flush callbacks.
+        let object = ToolHeadObject::new(&ConfigWrapper::untracked(&section), &printer)
+            .expect("kinematics: none builds without steppers");
+
+        let lookahead_times = Arc::new(Mutex::new(Vec::new()));
+        let flush_times = Arc::new(Mutex::new(Vec::new()));
+        {
+            let times = Arc::clone(&lookahead_times);
+            object.register_lookahead_callback(Box::new(move |time| {
+                times.lock().unwrap().push(time);
+            }));
+        }
+        {
+            let times = Arc::clone(&flush_times);
+            object.register_flush_callback(Box::new(move |time| {
+                times.lock().unwrap().push(time);
+            }));
+        }
+
+        // The registration must not burn the callback on the phantom `0.0`
+        // an unconnected toolhead reports.
+        assert_eq!(object.get_last_move_time(), 0.0);
+        assert!(
+            lookahead_times.lock().unwrap().is_empty(),
+            "a pre-connect registration must not fire before connect"
+        );
+
+        object.connect().await.expect("connect");
+
+        // Installed at connect: the look-ahead is empty, so the lookahead
+        // callback fired immediately with the fresh toolhead's last move time.
+        {
+            let times = lookahead_times.lock().unwrap();
+            assert_eq!(times.len(), 1, "installed at connect and fired once");
+            let expected = object.get_last_move_time();
+            assert!(
+                (times[0] - expected).abs() < 1e-9,
+                "{} vs {expected}",
+                times[0]
+            );
+        }
+        // The flush callback was installed too, and a generation with no
+        // steppers at all still delivers the flush time to it.
+        object.flush_step_generation().await.expect("a flush");
+        assert!(
+            !flush_times.lock().unwrap().is_empty(),
+            "the installed flush callback fires on generate"
+        );
+
+        // Registered after connect, it takes effect immediately.
+        let late = Arc::new(Mutex::new(Vec::new()));
+        {
+            let times = Arc::clone(&late);
+            object.register_flush_callback(Box::new(move |time| {
+                times.lock().unwrap().push(time);
+            }));
+        }
+        object.flush_step_generation().await.expect("another flush");
+        assert!(!late.lock().unwrap().is_empty());
+    }
+
+    /// ② Connected, look-ahead empty: the callback fires at once, with the
+    /// same time `get_last_move_time()` reports.
+    #[test]
+    fn test_a_lookahead_callback_registered_after_connect_fires_with_the_last_move_time() {
+        let (state, _gcode) = connected(homed_toolhead());
+        let (_printer, object) = object_over(state);
+
+        let times = Arc::new(Mutex::new(Vec::new()));
+        {
+            let fired = Arc::clone(&times);
+            object.register_lookahead_callback(Box::new(move |time| {
+                fired.lock().unwrap().push(time);
+            }));
+        }
+
+        let expected = object.get_last_move_time();
+        let mut fired = times.lock().unwrap();
+        assert_eq!(fired.len(), 1, "the empty look-ahead fires immediately");
+        assert!(
+            (fired[0] - expected).abs() < 1e-9,
+            "{} vs {expected}",
+            fired[0]
+        );
+    }
+
+    /// ③ A move still queued: the callback waits for it and fires with that
+    /// move's end time when the look-ahead is flushed.
+    #[test]
+    fn test_a_lookahead_callback_registered_with_a_queued_move_fires_at_its_end_time() {
+        let (state, _gcode) = connected(homed_toolhead());
+        let (_printer, object) = object_over(state);
+        object
+            .move_to(Coord::new(10.0, 0.0, 0.0, 0.0), 100.0)
+            .unwrap();
+
+        let times = Arc::new(Mutex::new(Vec::new()));
+        {
+            let fired = Arc::clone(&times);
+            object.register_lookahead_callback(Box::new(move |time| {
+                fired.lock().unwrap().push(time);
+            }));
+        }
+        assert!(
+            times.lock().unwrap().is_empty(),
+            "the move is still queued, so the callback waits for it"
+        );
+
+        // Flushes the look-ahead into the trapq.
+        let _ = object.get_last_move_time();
+
+        let fired = times.lock().unwrap();
+        assert_eq!(fired.len(), 1, "fires when the queued move is flushed");
+        let end = object.print_time();
+        assert!((fired[0] - end).abs() < 1e-9, "{} vs {end}", fired[0]);
+        assert!(fired[0] > 0.0);
     }
 
     /// A move goes through the planner to the trapq — the half of `G1` that

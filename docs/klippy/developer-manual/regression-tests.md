@@ -248,7 +248,7 @@ connect_file(输出文件, 字典):
 | 全部缺口扫描（**报告**，不失败） | 无 | `upstream_gap_report`（`-- --nocapture` 查看缺口矩阵） |
 | `IGNORED` 条目守卫 | 运行声明的全部字典 + 所用配置节 | `ignored_cases_still_fail`（按 `upstream.rs` 内旧 `IGNORED` 常量检测，现空；生成器权威列表在 `build.rs`，暂未对接） |
 | 运行内联 g-code 可解析 | —（用例 g-code 已由端到端运行真送进 dispatcher） | `#[ignore] upstream_inline_gcode_parses`（更早的窄解析阶段，未对接） |
-| 运行端到端执行 | 运行声明的全部字典 + 所用配置节 | build 时生成的 239 个独立 `#[test]`（`upstream_<stem>__config_<n>_<cfg>`，见下文「运行」；字典未构建或列入忽略的生成为 `#[ignore]`） |
+| 运行端到端执行 | 运行声明的全部字典 + 所用配置节 | build 时生成的 239 个独立 `#[test]`（`upstream_<stem>_config_<n>_<cfg>`，见下文「运行」；字典未构建或列入忽略的生成为 `#[ignore]`） |
 
 ### 应答机
 
@@ -289,7 +289,7 @@ harness 把每个 `[mcu]` / `[mcu <name>]` 的传输键换成 `test: dict=<字�
 `tmc*`…），它们在 `load_config` 阶段就被拒绝，因此曾逐条登记在 `IGNORED` 里跳过；随节落地逐条移除。
 
 **生成式运行器后**（2026-10-02）：`IGNORED` 的权威列表搬到 `crates/test-support/build.rs`，
-按生成的测试函数名 `upstream_<stem>__config_<n>_<cfg>` 匹配（旧版按 `.test` 文件名匹配，会误伤
+按生成的测试函数名 `upstream_<stem>_config_<n>_<cfg>` 匹配（旧版按 `.test` 文件名匹配，会误伤
 引用同一 config 的其它用例）。登记在内的 case 生成时带 `#[ignore = "upstream IGNORED"]`，
 `cargo test --ignored` 可单跑；移除后即恢复为普通 `#[test]`。
 
@@ -297,7 +297,7 @@ harness 把每个 `[mcu]` / `[mcu <name>]` 的传输键换成 `test: dict=<字�
 
 | 函数名 | 原因 |
 |--------|------|
-| `upstream_out_of_bounds__config_0_example_cartesian` | `G1 Y9999` 越界未被拒——本主机未实现 move-bounds 检查，`SHOULD_FAIL` 不满足；move-bounds 落地后移除 |
+| `upstream_out_of_bounds_config_0_example_cartesian` | `G1 Y9999` 越界未被拒——本主机未实现 move-bounds 检查，`SHOULD_FAIL` 不满足；move-bounds 落地后移除 |
 
 字典未构建的 case（如 `printers.test` 里声明 `pru.dict` 的 2 条）不进这张列表，而是在生成时
 按字典文件是否存在判定，带 `#[ignore = "dictionary <name> not built"]`——它随 `KLIPPERX_ARCHES`
@@ -332,7 +332,7 @@ harness 把每个 `[mcu]` / `[mcu <name>]` 的传输键换成 `test: dict=<字�
 ### 运行
 
 `test-support/build.rs` 在 test 构建时扫描 `test/klippy/*.test`，为每个 `CONFIG` 块生成一个
-独立的 `#[test]`（命名 `upstream_<stem>__config_<n>_<cfg>`），config 路径、字典路径、g-code、
+独立的 `#[test]`（命名 `upstream_<stem>_config_<n>_<cfg>`），config 路径、字典路径、g-code、
 `SHOULD_FAIL` 标志全部固化在生成代码里——运行时不再扫语料、不再读 `GCODE` 文件。生成的测试
 `include!`进 `src/core/klippy/upstream.rs` 的 `#[cfg(test)] mod upstream`，文件本身
 （`src/core/klippy/upstream_generated.rs`）被 gitignore，永不提交。
@@ -345,7 +345,7 @@ cargo test -p klipperx --lib upstream
 # IGNORED 的生成为 #[ignore]，默认跳过
 
 cargo test -p klipperx --lib upstream_bed_mesh
-# 单条：只跑 bed_mesh.test 的那个 case（可替换为任意 upstream_<stem>__config_<n>_<cfg>）
+# 单条：只跑 bed_mesh.test 的那个 case（可替换为任意 upstream_<stem>_config_<n>_<cfg>）
 
 cargo test -p klipperx --lib --ignored upstream
 # 跑全部被忽略的 case（含 IGNORED 列表与字典未构建的），用于验证移除条件

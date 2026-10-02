@@ -14,13 +14,15 @@
 //! `temperature_sensors.cfg` for that).
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::time::Duration;
 
 use serde_json::{json, Value};
 
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
 use crate::core::klippy::extras::adc_temperature;
 use crate::core::klippy::extras::ds18b20;
+use crate::core::klippy::extras::heater_generic::PrinterHeaterGeneric;
 use crate::core::klippy::extras::spi_temperature;
 use crate::core::klippy::extras::temperature_combined;
 use crate::core::klippy::extras::temperature_mcu;
@@ -29,7 +31,7 @@ use crate::core::klippy::gcode::{
     sync, CommandError, CommandHandler, GCodeDispatch, GcodeCommand, GCODE_OBJECT,
 };
 use crate::core::klippy::pins::{PrinterPins, PwmOut, PINS_OBJECT};
-use crate::core::klippy::printer::{Printer, PrinterObject};
+use crate::core::klippy::printer::{Printer, PrinterObject, PrinterState};
 
 /// The name other modules look the registry up by.
 pub const HEATERS_OBJECT: &str = "heaters";
@@ -43,10 +45,20 @@ const MAX_HEAT_TIME: f64 = 3.0;
 const AMBIENT_TEMP: f64 = 25.0;
 /// The divisor upstream stores PID constants over (`PID_PARAM_BASE`).
 const PID_PARAM_BASE: f64 = 255.0;
-/// How close a PID must settle before `TEMPERATURE_WAIT` returns
-/// (`PID_SETTLE_DELTA`/`PID_SETTLE_SLOPE`).
+/// How close a PID must settle before its target counts reached
+/// (`PID_SETTLE_DELTA`/`PID_SETTLE_SLOPE`, read by [`Heater::check_busy`]).
+/// Upstream polls it in `_wait_for_temperature` for `M109`/`M190`, whose wait
+/// loop is not wired yet; `TEMPERATURE_WAIT` does not use it — it waits on the
+/// reading itself.
 const PID_SETTLE_DELTA: f64 = 1.0;
 const PID_SETTLE_SLOPE: f64 = 0.1;
+/// `cmd_TEMPERATURE_WAIT_help` (`heaters.py:366`).
+const TEMPERATURE_WAIT_HELP: &str = "Wait for a temperature on a sensor";
+/// What the wait loop reports between polls: upstream's `_get_temp(eventtime)`
+/// (`heaters.py:336-347`) over an empty g-code-id table — `T:0`. No id is
+/// registered to report: the `gcode_id` table is the still-open M105 unit
+/// (`register_sensor` claims the option and drops it).
+const TEMPERATURE_WAIT_REPORT: &str = "T:0";
 
 /// Called with `(read_time, temperature)` for every reading.
 pub type SensorCallback = Box<dyn Fn(f64, f64) + Send + Sync>;
@@ -244,8 +256,11 @@ impl Heater {
         state.last_pwm_value = value;
     }
 
-    /// Whether a `TEMPERATURE_WAIT` for `target` must keep waiting
-    /// (`Heater.check_busy`).
+    /// Whether a `target` has not settled yet (`Heater.check_busy`).
+    ///
+    /// Upstream polls it in `_wait_for_temperature` while `M109`/`M190` wait
+    /// for their target (`heaters.py:326-334`); those waits are not wired yet.
+    /// `TEMPERATURE_WAIT` does not use it — it waits on the reading itself.
     pub fn check_busy(&self, target: f64) -> bool {
         let state = self.lock();
         state.control.check_busy(state.smoothed_temp, target)
@@ -297,6 +312,11 @@ impl std::fmt::Debug for Heater {
 /// object names instead (`controller_fan.rs:22-30`), because that table did not
 /// exist when it was written.
 pub struct PrinterHeaters {
+    /// The machine this registry serves, for the `TEMPERATURE_WAIT` handler to
+    /// resolve its sensor with (upstream's bound method reaches the same state
+    /// through `gcmd`'s printer). `Weak`, so the command table the printer
+    /// keeps does not keep the printer alive.
+    printer: Weak<Printer>,
     factories: Mutex<BTreeMap<String, SensorFactory>>,
     sensors: Mutex<Vec<String>>,
     monitors: Mutex<Vec<String>>,
@@ -304,8 +324,9 @@ pub struct PrinterHeaters {
 }
 
 impl PrinterHeaters {
-    fn new() -> Self {
+    fn new(printer: Weak<Printer>) -> Self {
         Self {
+            printer,
             factories: Mutex::new(BTreeMap::new()),
             sensors: Mutex::new(Vec::new()),
             monitors: Mutex::new(Vec::new()),
@@ -357,17 +378,79 @@ impl PrinterHeaters {
         factory(config, printer)
     }
 
-    /// Note a sensor that was set up, upstream's `register_sensor`.
+    /// Note a sensor that was set up, upstream's `register_sensor`
+    /// (`heaters.py:301-307`).
     ///
-    /// The `TEMPERATURE_WAIT` command and the `M105` g-code-id table are not
-    /// wired yet; `gcode_id` is still read so the option is claimed.
+    /// The sensor's section name joins `available_sensors` and becomes one
+    /// value of the `TEMPERATURE_WAIT` mux command, keyed by `SENSOR` — every
+    /// sensor section answers the command under its own name, as upstream
+    /// registers it right here. The `M105` g-code-id table is still open, so
+    /// `gcode_id` is only claimed.
+    ///
+    /// # Errors
+    /// The option is unreadable, or the mux value is already registered (one
+    /// section loaded twice), as upstream reports it.
     pub fn register_sensor(&self, config: &ConfigWrapper) -> Result<(), ConfigError> {
+        let identifier = config.identifier();
         let _ = config.get_str("gcode_id");
         self.sensors
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .push(config.identifier());
+            .push(identifier.clone());
+        let printer = self
+            .printer
+            .upgrade()
+            .expect("the printer outlives the registry it built");
+        let gcode = printer
+            .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+            .expect("the loader registers `gcode` before any section");
+        gcode
+            .register_mux_command_with_params(
+                "TEMPERATURE_WAIT",
+                "SENSOR",
+                Some(identifier.as_str()),
+                temperature_wait_handler(Weak::clone(&self.printer)),
+                Some(TEMPERATURE_WAIT_HELP),
+                &["MINIMUM", "MAXIMUM"],
+            )
+            .map_err(ConfigError::new)?;
         Ok(())
+    }
+
+    /// Where `TEMPERATURE_WAIT SENSOR=<sensor_name>` reads its temperature
+    /// from (`heaters.py:376-379`): the heaters table first, then the object
+    /// the section registered under that name.
+    ///
+    /// # Errors
+    /// No object answers to `sensor_name`, with upstream's `lookup_object`
+    /// wording (`klippy/klippy.py:75-80`).
+    fn wait_sensor(
+        &self,
+        printer: &Arc<Printer>,
+        sensor_name: &str,
+    ) -> Result<WaitSensor, CommandError> {
+        if let Some(heater) = self
+            .heaters
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(sensor_name)
+            .cloned()
+        {
+            return Ok(WaitSensor::Heater(heater));
+        }
+        // A `[heater_generic <name>]` is the one heater whose section name is
+        // not the short name the table is keyed by; its object wraps the same
+        // heater upstream's `lookup_object` would hand back.
+        if let Some(generic) = printer.lookup_object_as::<PrinterHeaterGeneric>(sensor_name) {
+            return Ok(WaitSensor::Heater(Arc::clone(generic.heater())));
+        }
+        let object = printer
+            .lookup_object(sensor_name)
+            .ok_or_else(|| CommandError::new(format!("Unknown config object '{sensor_name}'")))?;
+        Ok(WaitSensor::Object {
+            name: sensor_name.to_string(),
+            object,
+        })
     }
 
     /// The registered monitor sections, for `get_status`.
@@ -597,6 +680,115 @@ impl PrinterHeaters {
     }
 }
 
+// ===========================================================================
+// TEMPERATURE_WAIT
+// ===========================================================================
+
+/// Where `TEMPERATURE_WAIT` polls its temperature (`heaters.py:376-379`).
+enum WaitSensor {
+    /// A heater from the table — its own reading, unrounded
+    /// (`Heater::get_temp`).
+    Heater(Arc<Heater>),
+    /// The object the section registered under its name, read from the
+    /// `temperature` it reports. Upstream reads `psensor.get_temp(eventtime)`
+    /// here; the sensor objects (`temperature_sensor.rs`, `temperature_fan.rs`)
+    /// keep their reading behind the status they report, which rounds to two
+    /// decimals — up to 0.005 °C at the wait's bounds.
+    Object {
+        name: String,
+        object: Arc<dyn PrinterObject>,
+    },
+}
+
+impl WaitSensor {
+    /// One reading: the current temperature the command compares
+    /// (`heaters.py:384-386`; upstream's `get_temp` pair minus the target it
+    /// never uses).
+    ///
+    /// # Errors
+    /// The object reports no `temperature`, which upstream's `get_temp` would
+    /// fail on too — reported with the same wording its failed
+    /// `lookup_object` has.
+    fn get_temp(&self, eventtime: f64) -> Result<f64, CommandError> {
+        match self {
+            Self::Heater(heater) => Ok(heater.get_temp().0),
+            Self::Object { name, object } => object
+                .get_status(eventtime)
+                .get("temperature")
+                .and_then(Value::as_f64)
+                .ok_or_else(|| CommandError::new(format!("Unknown config object '{name}'"))),
+        }
+    }
+}
+
+/// The `TEMPERATURE_WAIT` handler the mux stores — one per sensor value, all
+/// reading the machine up at dispatch time (upstream registers its bound
+/// method the same way, `heaters.py:305-307`).
+fn temperature_wait_handler(printer: Weak<Printer>) -> CommandHandler {
+    Arc::new(move |gcmd| {
+        let printer = Weak::clone(&printer);
+        Box::pin(async move { cmd_temperature_wait(&printer, gcmd).await })
+    })
+}
+
+/// `TEMPERATURE_WAIT`: wait until a sensor's reading is within the bounds
+/// (`heaters.py:367-389`), checked in upstream's order — the parameters first,
+/// then file-output mode, then the sensor, then the polling loop.
+///
+/// # Errors
+/// As upstream, verbatim: an unparseable parameter, `MAXIMUM` not above
+/// `MINIMUM`, neither bound given, or a sensor name nothing answers to.
+async fn cmd_temperature_wait(
+    printer: &Weak<Printer>,
+    gcmd: &GcodeCommand,
+) -> Result<(), CommandError> {
+    let printer = printer
+        .upgrade()
+        .ok_or_else(|| CommandError::new("printer is gone"))?;
+    let sensor_name = gcmd.get_str("SENSOR")?;
+    let min_temp = gcmd.get_float_default("MINIMUM", f64::NEG_INFINITY)?;
+    let max_temp = gcmd.get_float_default("MAXIMUM", f64::INFINITY)?;
+    // Upstream reads `MAXIMUM` with `above=min_temp` (`heaters.py:370`) and
+    // checks no default it did not get (`gcode.py:65-86`), so the bound is
+    // checked only for a given parameter, with upstream's wording — which
+    // `GcodeCommand::get`'s shared bound path does not spell.
+    if gcmd.get_command_parameters().contains_key("MAXIMUM") && max_temp <= min_temp {
+        return Err(CommandError::new(format!(
+            "Error on '{}': MAXIMUM must be above {min_temp:?}",
+            gcmd.commandline()
+        )));
+    }
+    if min_temp == f64::NEG_INFINITY && max_temp == f64::INFINITY {
+        return Err(CommandError::new(
+            "Error on 'TEMPERATURE_WAIT': missing MINIMUM or MAXIMUM.".to_string(),
+        ));
+    }
+    if printer.is_fileoutput() {
+        // Upstream's `debugoutput` return (`heaters.py:374-375`): its own cases
+        // run against an input that never answers a temperature query.
+        return Ok(());
+    }
+    let heaters = printer
+        .lookup_object_as::<PrinterHeaters>(HEATERS_OBJECT)
+        .ok_or_else(|| CommandError::new(format!("Unknown config object '{HEATERS_OBJECT}'")))?;
+    let sensor = heaters.wait_sensor(&printer, &sensor_name)?;
+    loop {
+        // Upstream's `while not self.printer.is_shutdown()` (`heaters.py:383`).
+        if printer.get_state_message().category == PrinterState::Shutdown {
+            return Ok(());
+        }
+        let temp = sensor.get_temp(printer.eventtime())?;
+        if temp >= min_temp && temp <= max_temp {
+            return Ok(());
+        }
+        gcmd.respond_raw(TEMPERATURE_WAIT_REPORT);
+        // Upstream parks the greenlet for a second (`reactor.pause`,
+        // `heaters.py:389`); this reactor has no pause on purpose — the wait is
+        // an ordinary timer the async command sleeps on.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
 impl PrinterObject for PrinterHeaters {
     fn get_status(&self, _eventtime: f64) -> Value {
         json!({
@@ -630,7 +822,7 @@ pub fn ensure(printer: &Arc<Printer>) -> Result<Arc<PrinterHeaters>, ConfigError
     if let Some(existing) = printer.lookup_object_as::<PrinterHeaters>(HEATERS_OBJECT) {
         return Ok(existing);
     }
-    let heaters = Arc::new(PrinterHeaters::new());
+    let heaters = Arc::new(PrinterHeaters::new(Arc::downgrade(printer)));
     printer.add_object(
         HEATERS_OBJECT,
         Arc::clone(&heaters) as Arc<dyn PrinterObject>,
@@ -780,7 +972,9 @@ mod tests {
 
     #[test]
     fn test_the_status_lists_what_was_registered() {
-        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        // `register_sensor` now also registers the `TEMPERATURE_WAIT` mux
+        // value, so the dispatcher has to be there.
+        let printer = ready_printer();
         let heaters = ensure(&printer).unwrap();
         heaters
             .register_sensor(&ConfigWrapper::untracked(&section("Fake")))
@@ -1070,5 +1264,242 @@ mod tests {
              See the 'verify_heater' section in docs/Config_Reference.md\n\
              for the parameters that control this check.\n"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // TEMPERATURE_WAIT
+    // ------------------------------------------------------------------
+
+    /// A printer with `[temperature_sensor probe]` loaded through its factory
+    /// and registered the way the loader registers the section — the
+    /// `TEMPERATURE_WAIT` value `register_sensor` grants included — plus the
+    /// sensor whose readings the test delivers by hand.
+    fn temperature_sensor_printer() -> (Arc<Printer>, Arc<GCodeDispatch>, Arc<ScriptedSensor>) {
+        let printer = ready_printer();
+        let heaters = ensure(&printer).unwrap();
+        let sensor = Arc::new(ScriptedSensor::default());
+        let built = Arc::clone(&sensor);
+        heaters.add_sensor_factory(
+            "Fake",
+            Arc::new(move |_config, _printer| Ok(Arc::clone(&built) as Arc<dyn Sensor>)),
+        );
+        let object = crate::core::klippy::extras::temperature_sensor::load_config_prefix(
+            &ConfigWrapper::untracked(&section("Fake")),
+            &printer,
+        )
+        .expect("the section loads");
+        printer
+            .add_object("temperature_sensor probe", object)
+            .expect("one object per section");
+        printer.send_event(&KlippyEvent::KlippyReady);
+        let gcode = printer
+            .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+            .expect("gcode is registered");
+        (printer, gcode, sensor)
+    }
+
+    /// Everything `gcode` reported from here on, one entry per line.
+    fn captured_lines(gcode: &Arc<GCodeDispatch>) -> Arc<Mutex<Vec<String>>> {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&lines);
+        gcode.register_output_handler(Arc::new(move |line: &str| {
+            sink.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(line.to_string());
+        }));
+        lines
+    }
+
+    fn emitted(lines: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
+        lines.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// `register_sensor` gives every sensor section the mux value, and the
+    /// command comes out with upstream's help text and its parameter names
+    /// (`heaters.py:305-307`, `:366`).
+    #[test]
+    fn test_temperature_wait_is_registered_for_every_sensor() {
+        let (_printer, gcode, _sensor) = temperature_sensor_printer();
+        assert_eq!(
+            gcode
+                .command_help()
+                .get("TEMPERATURE_WAIT")
+                .map(String::as_str),
+            Some("Wait for a temperature on a sensor")
+        );
+        assert_eq!(
+            gcode.get_status(0.0)["commands"]["TEMPERATURE_WAIT"]["parameters"],
+            json!(["SENSOR", "MINIMUM", "MAXIMUM"])
+        );
+    }
+
+    /// A value no sensor registered is refused by the mux, with the listing of
+    /// the values that do exist (`_cmd_mux`, `gcode.py:317-336`).
+    #[tokio::test]
+    async fn test_temperature_wait_names_an_unregistered_sensor() {
+        let (_printer, gcode, _sensor) = temperature_sensor_printer();
+        let err = gcode
+            .run_script("TEMPERATURE_WAIT SENSOR=nope MINIMUM=1")
+            .await
+            .expect_err("no sensor answers to that name");
+        assert_eq!(
+            err.to_string(),
+            "The value 'nope' is not valid for SENSOR. Options: 'temperature_sensor probe'"
+        );
+    }
+
+    /// `SENSOR` is the mux key: without it the dispatch stops before the
+    /// command runs (`gcode.py:322`, "missing SENSOR").
+    #[tokio::test]
+    async fn test_temperature_wait_requires_sensor() {
+        let (_printer, gcode, _sensor) = temperature_sensor_printer();
+        let err = gcode
+            .run_script("TEMPERATURE_WAIT MINIMUM=1")
+            .await
+            .expect_err("the sensor is missing");
+        assert_eq!(
+            err.to_string(),
+            "Error on 'TEMPERATURE_WAIT MINIMUM=1': missing SENSOR"
+        );
+    }
+
+    /// Neither bound given, with upstream's own message
+    /// (`heaters.py:371-373`).
+    #[tokio::test]
+    async fn test_temperature_wait_needs_minimum_or_maximum() {
+        let (_printer, gcode, _sensor) = temperature_sensor_printer();
+        let err = gcode
+            .run_script("TEMPERATURE_WAIT SENSOR=\"temperature_sensor probe\"")
+            .await
+            .expect_err("both bounds are missing");
+        assert_eq!(
+            err.to_string(),
+            "Error on 'TEMPERATURE_WAIT': missing MINIMUM or MAXIMUM."
+        );
+    }
+
+    /// `MAXIMUM` is read with `above=min_temp` (`heaters.py:370`): the line
+    /// comes back with upstream's bound wording.
+    #[tokio::test]
+    async fn test_temperature_wait_maximum_must_be_above_minimum() {
+        let (_printer, gcode, _sensor) = temperature_sensor_printer();
+        let line = "TEMPERATURE_WAIT SENSOR=\"temperature_sensor probe\" MINIMUM=10 MAXIMUM=5";
+        let err = gcode.run_script(line).await.expect_err("5 is not above 10");
+        assert_eq!(
+            err.to_string(),
+            format!("Error on '{line}': MAXIMUM must be above 10.0")
+        );
+    }
+
+    /// A value the mux let through but no object answers to: upstream's
+    /// `lookup_object` message (`klippy/klippy.py:75-80`).
+    #[tokio::test]
+    async fn test_temperature_wait_names_a_sensor_that_registered_no_object() {
+        let printer = ready_printer();
+        let heaters = ensure(&printer).unwrap();
+        heaters
+            .register_sensor(&ConfigWrapper::untracked(&section("Fake")))
+            .unwrap();
+        printer.send_event(&KlippyEvent::KlippyReady);
+        let gcode = printer
+            .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+            .expect("gcode is registered");
+        let err = gcode
+            .run_script("TEMPERATURE_WAIT SENSOR=\"temperature_sensor probe\" MINIMUM=1")
+            .await
+            .expect_err("the section registered no object");
+        assert_eq!(
+            err.to_string(),
+            "Unknown config object 'temperature_sensor probe'"
+        );
+    }
+
+    /// A heater is read from the heaters table (`heaters.py:376-377`), and
+    /// `MINIMUM` is inclusive (`temp >= min_temp`, `heaters.py:385`): a reading
+    /// exactly at the bound returns at once, without one poll.
+    #[tokio::test]
+    async fn test_temperature_wait_reads_a_heater_from_the_heaters_table() {
+        let printer = ready_printer();
+        let heaters = ensure(&printer).unwrap();
+        heaters.add_sensor_factory(
+            "Fake",
+            Arc::new(|_config, _printer| Ok(Arc::new(FakeSensor) as Arc<dyn Sensor>)),
+        );
+        let section = heater_section(&[
+            ("sensor_type", "Fake"),
+            ("heater_pin", "PA0"),
+            ("min_temp", "0"),
+            ("max_temp", "250"),
+            ("min_extrude_temp", "0"),
+            ("control", "watermark"),
+        ]);
+        let heater = heaters
+            .setup_heater(&ConfigWrapper::untracked(&section), &printer, None)
+            .unwrap();
+        heater.temperature_callback(1.0, 30.0);
+        printer.send_event(&KlippyEvent::KlippyReady);
+        let gcode = printer
+            .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+            .expect("gcode is registered");
+        gcode
+            .run_script("TEMPERATURE_WAIT SENSOR=extruder MINIMUM=30")
+            .await
+            .expect("the reading is exactly the minimum");
+    }
+
+    /// The loop polls about once a second and answers between polls — with
+    /// upstream's `_get_temp` over the still-open g-code-id table, `T:0` —
+    /// until the reading enters the range (`heaters.py:383-389`).
+    #[tokio::test(start_paused = true)]
+    async fn test_temperature_wait_polls_until_the_reading_reaches_the_minimum() {
+        let (_printer, gcode, sensor) = temperature_sensor_printer();
+        let lines = captured_lines(&gcode);
+        let reader = Arc::clone(&sensor);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(1_500)).await;
+            reader.read(2.0, 55.0);
+        });
+        gcode
+            .run_script("TEMPERATURE_WAIT SENSOR=\"temperature_sensor probe\" MINIMUM=50")
+            .await
+            .expect("the wait ends once the reading reaches the minimum");
+        // One report per unsatisfied poll: at t=0 and t=1 s; the reading
+        // arrives at t=1.5 s and the poll at t=2 s finds it in range.
+        assert_eq!(emitted(&lines), ["T:0", "T:0"]);
+    }
+
+    /// The loop stops with the printer — upstream's
+    /// `while not self.printer.is_shutdown()` (`heaters.py:383`) — ending the
+    /// command without the bounds ever being met.
+    #[tokio::test(start_paused = true)]
+    async fn test_temperature_wait_stops_when_the_printer_shuts_down() {
+        let (printer, gcode, _sensor) = temperature_sensor_printer();
+        let lines = captured_lines(&gcode);
+        let stopping = Arc::clone(&printer);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            stopping.invoke_shutdown("test shutdown");
+        });
+        gcode
+            .run_script("TEMPERATURE_WAIT SENSOR=\"temperature_sensor probe\" MINIMUM=100")
+            .await
+            .expect("the shutdown ends the wait");
+        assert_eq!(emitted(&lines), ["T:0", "// Klipper state: Shutdown"]);
+    }
+
+    /// File-output mode returns instead of waiting (`heaters.py:374-375`):
+    /// the input never answers a temperature query, so there is nothing to
+    /// wait for. Without the return this would never end — `MINIMUM=100` is
+    /// far above anything the sensor reports.
+    #[tokio::test(start_paused = true)]
+    async fn test_temperature_wait_returns_in_file_output_mode() {
+        let (printer, gcode, _sensor) = temperature_sensor_printer();
+        let mut args = crate::core::klippy::api::StartArgs::collect("/tmp/printer.cfg", None);
+        args.debug_output = Some("_test_output".to_string());
+        printer.set_start_args(Arc::new(args));
+        gcode
+            .run_script("TEMPERATURE_WAIT SENSOR=\"temperature_sensor probe\" MINIMUM=100")
+            .await
+            .expect("file output does not wait");
     }
 }

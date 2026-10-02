@@ -4,7 +4,7 @@
 //! it maps message names and ids to encoders/decoders and is shared by the send
 //! and receive paths; callbacks belong to whatever object bound them. Separating
 //! the two is what lets the MCU's transport be held by resources without the
-//! callbacks pulling the owning `Mcu` back in (`TODO.md` F8b).
+//! callbacks pulling the owning `Mcu` back in.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

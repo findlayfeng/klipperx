@@ -101,7 +101,8 @@ impl std::fmt::Debug for McuChip {
 /// [`TrsyncRegistry`] that owns the trsync, so storing a chip here would make
 /// `registry ↔ trsync` a strong cycle, and through the chip's `mcu` slot it
 /// would keep the connected `Mcu` alive after the machine's parts are dropped
-/// (its blocking device read would then park runtime shutdown — `TODO.md` F8b).
+/// (its blocking device read would then park runtime shutdown; the `Weak` /
+/// `clear_events` design keeps that from happening).
 #[derive(Clone)]
 pub struct TrsyncChip {
     name: String,

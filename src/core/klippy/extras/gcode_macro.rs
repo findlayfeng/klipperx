@@ -52,10 +52,11 @@ use std::sync::{Arc, Mutex};
 use serde_json::{json, Value};
 
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
+use crate::core::klippy::event::KlippyEvent;
 use crate::core::klippy::extras::template::{Builtin, Context, PrinterView, Rt, Template};
 use crate::core::klippy::gcode::{
-    is_traditional_gcode, sync, CommandError, CommandHandler, GCodeDispatch, GcodeCommand,
-    GCODE_OBJECT,
+    command_of_line, is_traditional_gcode, sync, CommandError, CommandHandler, GCodeDispatch,
+    GcodeCommand, GCODE_OBJECT,
 };
 use crate::core::klippy::load::section;
 use crate::core::klippy::printer::{Printer, PrinterObject};
@@ -155,6 +156,11 @@ struct MacroState {
     /// Upstream's `in_script` flag (`gcode_macro.py:183`): set while this
     /// macro runs, so reaching itself is refused instead of recursing.
     in_script: AtomicBool,
+    /// The command names the body writes verbatim (outside Jinja2 tags),
+    /// collected at load for the `klippy:ready` existence check. A name the
+    /// dispatcher does not know by then is warned about, not refused — the
+    /// body may still compute a command at run time this list did not see.
+    static_commands: Vec<String>,
 }
 
 impl MacroState {
@@ -300,6 +306,152 @@ fn template_params(body: &str) -> Vec<String> {
     names
 }
 
+/// Replace every Jinja2 tag's content with spaces — `{% … %}`, `{# … #}` and
+/// `{ … }` (upstream's `jinja2.Environment('{%', '%}', '{', '}')`, the single-
+/// brace variable delimiters the corpus uses) — while keeping newlines, so
+/// the remaining bytes are exactly what the engine emits verbatim and the
+/// line structure survives. String literals inside a tag are tracked so a
+/// `}` / `%}` written inside one does not close early, and `{` … `}` variable
+/// tags count brace depth so a dict literal `{'a': 1}` nested in an expression
+/// does not close at its inner `}`.
+///
+/// A body that reaches this has already compiled ([`Template::parse`] ran in
+/// `GCodeMacro::new`), so the tags are balanced; the scan is nonetheless
+/// defensive — an unterminated tag is emitted as spaces to the end.
+fn strip_template_tags(body: &str) -> String {
+    let bytes = body.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    let space = |b: u8| -> u8 {
+        if b == b'\n' {
+            b'\n'
+        } else {
+            b' '
+        }
+    };
+    while i < bytes.len() {
+        if bytes[i] != b'{' {
+            out.push(bytes[i]);
+            i += 1;
+            continue;
+        }
+        match bytes.get(i + 1) {
+            // Statement tag `{% … %}`: scan to `%}`, honouring quotes.
+            Some(b'%') => {
+                out.push(b' ');
+                out.push(b' ');
+                i += 2;
+                let mut quote: Option<u8> = None;
+                while i < bytes.len() {
+                    let b = bytes[i];
+                    if let Some(q) = quote {
+                        if b == q {
+                            quote = None;
+                        }
+                        out.push(space(b));
+                        i += 1;
+                        continue;
+                    }
+                    if b == b'\'' || b == b'"' {
+                        quote = Some(b);
+                        out.push(b' ');
+                        i += 1;
+                        continue;
+                    }
+                    if b == b'%' && bytes.get(i + 1) == Some(&b'}') {
+                        out.push(b' ');
+                        out.push(b' ');
+                        i += 2;
+                        break;
+                    }
+                    out.push(space(b));
+                    i += 1;
+                }
+            }
+            // Comment tag `{# … #}`: scan to `#}`, no quote handling needed.
+            Some(b'#') => {
+                out.push(b' ');
+                out.push(b' ');
+                i += 2;
+                while i < bytes.len() {
+                    let b = bytes[i];
+                    if b == b'#' && bytes.get(i + 1) == Some(&b'}') {
+                        out.push(b' ');
+                        out.push(b' ');
+                        i += 2;
+                        break;
+                    }
+                    out.push(space(b));
+                    i += 1;
+                }
+            }
+            // Variable tag `{ … }`: scan to the matching `}`, honouring quotes
+            // and brace depth (a nested dict literal `{'a': 1}`).
+            _ => {
+                out.push(b' ');
+                i += 1;
+                let mut quote: Option<u8> = None;
+                let mut depth: u32 = 1;
+                while i < bytes.len() && depth > 0 {
+                    let b = bytes[i];
+                    if let Some(q) = quote {
+                        if b == q {
+                            quote = None;
+                        }
+                        out.push(space(b));
+                        i += 1;
+                        continue;
+                    }
+                    if b == b'\'' || b == b'"' {
+                        quote = Some(b);
+                        out.push(b' ');
+                        i += 1;
+                        continue;
+                    }
+                    if b == b'{' {
+                        depth += 1;
+                        out.push(b' ');
+                        i += 1;
+                        continue;
+                    }
+                    if b == b'}' {
+                        depth -= 1;
+                        out.push(b' ');
+                        i += 1;
+                        continue;
+                    }
+                    out.push(space(b));
+                    i += 1;
+                }
+            }
+        }
+    }
+    String::from_utf8(out).unwrap_or_default()
+}
+
+/// The command names a macro body references **statically** — the first token
+/// of each literal (non-tag) line, in first-use order without repeats.
+///
+/// A line whose command is computed by the template (`{% set cmd = … %}` then
+/// `{{ cmd }}`, or a command emitted by an `{% if %}` branch) cannot be read
+/// off the source, so it is simply not collected — the check stays quiet on
+/// what it cannot see, and only warns about names written verbatim. The
+/// macro's own alias is registered by the time the check runs, so a
+/// self-referencing body does not warn about itself.
+fn static_command_names(body: &str) -> Vec<String> {
+    let stripped = strip_template_tags(body);
+    let mut names: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for line in stripped.lines() {
+        if let Some(command) = command_of_line(line) {
+            if seen.insert(command.clone()) {
+                names.push(command);
+            }
+        }
+    }
+    names
+}
+
 impl GCodeMacro {
     /// Read the section, enforce `rename_existing`'s load-time rules, compile
     /// the body, and register the macro as its command plus
@@ -377,11 +529,17 @@ impl GCodeMacro {
             read_params
         };
 
+        // The command names the body writes verbatim, for the `klippy:ready`
+        // existence check (module docs). Computed after `template_params`
+        // because both walk the body, and neither mutates it.
+        let static_commands = static_command_names(&body);
+
         let state = Arc::new(MacroState {
             alias: alias.clone(),
             template,
             variables: Mutex::new(variables),
             in_script: AtomicBool::new(false),
+            static_commands,
         });
 
         let gcode = printer
@@ -462,6 +620,42 @@ impl GCodeMacro {
                 &["VARIABLE", "VALUE"],
             )
             .map_err(ConfigError::new)?;
+
+        // At `klippy:ready` — after every section has loaded and registered
+        // its commands — warn about any command the body names verbatim that
+        // the dispatcher does not know. The check is informational: a body
+        // that computes a command at run time is not seen here, and a command
+        // registered later by a `klippy:connect` hook is in place by ready.
+        // Registered for every macro, rename or not, because the body's
+        // references are independent of whether the macro itself registers.
+        {
+            let weak = Arc::downgrade(printer);
+            let check_state = Arc::clone(&state);
+            printer.register_event_handler(
+                KlippyEvent::KlippyReady,
+                Box::new(move |_| {
+                    let Some(printer) = weak.upgrade() else {
+                        return;
+                    };
+                    let Some(gcode) = printer.lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+                    else {
+                        return;
+                    };
+                    for command in &check_state.static_commands {
+                        if !gcode.command_exists(command) {
+                            gcode.respond_info(
+                                &format!(
+                                    "gcode_macro {}: command '{}' is not registered \
+                                     (referenced in macro body)",
+                                    check_state.alias, command
+                                ),
+                                true,
+                            );
+                        }
+                    }
+                }),
+            );
+        }
 
         Ok(Arc::new(Self { state }))
     }
@@ -1040,6 +1234,165 @@ mod tests {
         assert_eq!(
             error,
             "Error loading template 'gcode_macro BADSTMT:gcode'\nline 1: unknown statement foo"
+        );
+    }
+
+    /// A printer with `gcode` registered **but `klippy:ready` not yet fired**,
+    /// plus an output sink that captures every `respond_info` line. The
+    /// load-time command check runs at `klippy:ready`, so tests drive the
+    /// event themselves after loading the macro.
+    fn printer_not_ready() -> (Arc<Printer>, Arc<Mutex<Vec<String>>>) {
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        let dispatch = Arc::new(GCodeDispatch::new(Arc::clone(&printer)));
+        let output = Arc::new(Mutex::new(Vec::new()));
+        {
+            let output = Arc::clone(&output);
+            dispatch.register_output_handler(Arc::new(move |line: &str| {
+                output
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push(line.to_string());
+            }));
+        }
+        printer
+            .add_object(GCODE_OBJECT, dispatch as Arc<dyn PrinterObject>)
+            .expect("gcode registers");
+        (printer, output)
+    }
+
+    /// `strip_template_tags` blanks every Jinja2 tag — statement, comment and
+    /// the single-brace variable tag — while keeping the literal text and the
+    /// line structure, so the verbatim command lines survive to be parsed.
+    #[test]
+    fn strip_template_tags_blanks_tags_but_keeps_literal_lines() {
+        let body = r#"
+{% set delay = params.DELAY|default(0.002)|float %}
+{# a comment with } and { braces #}
+    _STEPPER_SET_PHASE PHASE={count.phase}
+    G4 P{ (delay * 1000)|int }
+{% if s == "%}" %}M117 ok{% endif %}
+STEPPER_RELEASE"#;
+        let stripped = strip_template_tags(body);
+        // The three literal command lines keep their commands; tag lines are
+        // blanked to spaces (newlines preserved).
+        let commands: Vec<&str> = stripped
+            .lines()
+            .map(|line| line.trim())
+            .filter(|line| !line.is_empty())
+            .map(|line| line.split_whitespace().next().unwrap_or(""))
+            .collect();
+        assert_eq!(
+            commands,
+            vec!["_STEPPER_SET_PHASE", "G4", "M117", "STEPPER_RELEASE"],
+            "only the verbatim commands remain; the percent-brace inside the string did not close the if early"
+        );
+    }
+
+    /// `static_command_names` reads the verbatim commands off a body, in
+    /// first-use order without repeats — the stepper-macro shape from
+    /// `config.cfg`, with `{% for %}` / `{% if %}` / `{% set %}` logic and a
+    /// `{ … }` variable expression on the `G4` line.
+    #[test]
+    fn static_command_names_reads_the_verbatim_commands() {
+        let body = "\
+{% set steps = params.STEPS|default(100)|int %}
+{% set count = namespace(phase=0) %}
+{% for i in range(steps) %}
+    {% if dir == 1 %}
+        {% set count.phase = (i % 8) %}
+    {% else %}
+        {% set count.phase = (7 - (i % 8)) %}
+    {% endif %}
+    _STEPPER_SET_PHASE PHASE={count.phase}
+    G4 P{ (delay * 1000)|int }
+{% endfor %}
+STEPPER_RELEASE";
+        assert_eq!(
+            static_command_names(body),
+            vec!["_STEPPER_SET_PHASE", "G4", "STEPPER_RELEASE"],
+            "the three verbatim commands, in order; logic lines and expressions are not commands"
+        );
+    }
+
+    /// A command computed by the template (`{{ cmd }}`) is not seen statically,
+    /// so it is not collected — the check stays quiet on what it cannot read
+    /// off the source. The body is the expression alone, with no verbatim
+    /// command token beside it.
+    #[test]
+    fn a_dynamically_computed_command_is_not_collected() {
+        let body = "{% set cmd = 'G4' if dwell else 'G1' %}{{ cmd }}";
+        assert!(
+            static_command_names(body).is_empty(),
+            "the command is an expression, not a verbatim token"
+        );
+    }
+
+    /// At `klippy:ready`, a macro that names a command the dispatcher does not
+    /// know is warned about — once per missing name, through `respond_info` —
+    /// while a name that is registered stays quiet. This is the `STEPPER_MOVE`
+    /// scenario: `G4` and `_STEPPER_SET_PHASE` are not registered, but
+    /// `STEPPER_RELEASE` is.
+    #[test]
+    fn a_macro_warns_about_unregistered_commands_at_ready() {
+        let (printer, output) = printer_not_ready();
+        let dispatch = gcode(&printer);
+        // `STEPPER_RELEASE` is registered (a fake receiver); the other two are
+        // not, so they are the ones that warn.
+        dispatch
+            .register_command("STEPPER_RELEASE", sync(|_| Ok(())), None, false)
+            .expect("the fake receiver registers");
+
+        let body = "\
+{% for i in range(steps) %}
+    _STEPPER_SET_PHASE PHASE={count.phase}
+    G4 P{ (delay * 1000)|int }
+{% endfor %}
+STEPPER_RELEASE";
+        let sect = section("STEPPER_MOVE", &[("gcode", body)]);
+        let config = ConfigWrapper::untracked(&sect);
+        load_config_prefix(&config, &printer).expect("the macro loads");
+
+        // The check runs at `klippy:ready`, which the test fires now — after
+        // every command (the fake `STEPPER_RELEASE` and the macro itself) has
+        // registered.
+        printer.send_event(&KlippyEvent::KlippyReady);
+
+        let lines = output.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let mentions = |name: &str| {
+            lines
+                .iter()
+                .any(|line| line.contains(&format!("command '{name}' is not registered")))
+        };
+        assert!(mentions("G4"), "G4 is not registered: {{lines:?}}");
+        assert!(
+            mentions("_STEPPER_SET_PHASE"),
+            "_STEPPER_SET_PHASE is not registered: {{lines:?}}"
+        );
+        assert!(
+            !mentions("STEPPER_RELEASE"),
+            "STEPPER_RELEASE is registered: no warning: {{lines:?}}"
+        );
+    }
+
+    /// A macro whose every verbatim command is registered warns nothing at
+    /// `klippy:ready` — the check is quiet when the body resolves.
+    #[test]
+    fn a_macro_whose_commands_resolve_warns_nothing() {
+        let (printer, output) = printer_not_ready();
+        let dispatch = gcode(&printer);
+        dispatch
+            .register_command("G28", sync(|_| Ok(())), None, false)
+            .expect("G28 registers");
+
+        let sect = section("HOME_ALL", &[("gcode", "G28")]);
+        let config = ConfigWrapper::untracked(&sect);
+        load_config_prefix(&config, &printer).expect("the macro loads");
+        printer.send_event(&KlippyEvent::KlippyReady);
+
+        let lines = output.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        assert!(
+            lines.iter().all(|line| !line.contains("is not registered")),
+            "G28 is registered, so the check is silent: {{lines:?}}"
         );
     }
 }

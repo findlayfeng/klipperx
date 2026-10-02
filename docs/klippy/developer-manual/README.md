@@ -260,7 +260,7 @@ identify 的命令**定义**（名称、参数、解码）与其它命令一样�
 
 | 项 | 职责 |
 |------|------|
-| `GCodeDispatch` | printer object `gcode`：`register_command` / `register_mux_command`（`SET_PIN PIN=…` 这类按一个参数选处理器）、`run_script` / `run_script_from_command`（处理器内部入口，宏类模块用）、`create_gcode_command`（合成命令）、输出处理器、`get_status` 报命令表（所以它是**可查询**对象） |
+| `GCodeDispatch` | printer object `gcode`：`register_command` / `register_mux_command`（`SET_PIN PIN=…` 这类按一个参数选处理器）、`run_script` / `run_script_from_command`（处理器内部入口，宏类模块用）、`create_gcode_command`（合成命令）、`command_exists`（查命令名是否注册，供 `gcode_macro` 装载期检查用）、输出处理器、`get_status` 报命令表（所以它是**可查询**对象）；`command_of_line` 是公开 helper，复用解析逻辑返回一行的命令名，供外部消费者（`gcode_macro`）只取名字 |
 | `GcodeCommand` | 交给处理器的已解析命令：通用 `get`（parser + `minval`/`maxval`/`above`/`below`）与 `get_str` / `get_int` / `get_int_bounded` / `get_float` / `get_float_bounded` / `get_float_range`（缺参 / 解析失败 / 超范围都报上游文案的 `CommandError`），`get_command_parameters` / `get_raw_command_parameters`，以及 `respond_info` / `respond_raw` / `ack` |
 | 传统 / 扩展命令 | 传统（`M110`、`G1`）参数是 `S200` 这种“字母+值”；扩展（`SET_PIN`）是 `KEY=VALUE`，带 shell 引号——后者在分派时重解析（上游 `_get_extended_params`） |
 
@@ -294,7 +294,7 @@ identify 的命令**定义**（名称、参数、解码）与其它命令一样�
 | `pwm_tool.rs` | `[pwm_tool <name>]`：带 `maximum_mcu_duration` 固件兕底的 PWM 工具引脚（`pwm_tool.py`） |
 | `temperature_fan.rs` | `[temperature_fan <name>]`：传感器+风扇+`watermark`/`pid` 双控制环，`SET_TEMPERATURE_FAN_TARGET`（mux，`temperature_fan.py`） |
 | `controller_fan.rs` | `[controller_fan <name>]`：`klippy:ready` 起每秒 tick，active→idle→stop（`controller_fan.py`） |
-| `gcode_macro.rs` | `[gcode_macro <名>]`：宏即命令（大写注册、description 为 help）、宏体经 `template` 渲染后回派发、`SET_GCODE_VARIABLE` 已注册（mux 按段名）；尚缺 `rename_existing` 的连接期换名与读 `printer.objects` 的反射能力（`gcode_macro.py`） |
+| `gcode_macro.rs` | `[gcode_macro <名>]`：宏即命令（大写注册、description 为 help）、宏体经 `template` 渲染后回派发、`SET_GCODE_VARIABLE` 已注册（mux 按段名）；**装载期静态命令存在性检查**：装载时抽出宏体中字面写死的命令名（`strip_template_tags` 置空 Jinja2 标签后取每行首词），`klippy:ready` 后逐个查 `GCodeDispatch::command_exists`，未注册者 `respond_info` 告警（不拒绝、不阻断加载），动态算出的命令名不抽取故不告警；尚缺 `rename_existing` 的连接期换名与读 `printer.objects` 的反射能力（`gcode_macro.py`） |
 | `gcode_request_queue.rs` | 打印时间请求队列（**无配置节、纯逻辑**，移植上游 `output_pin.py:15-90` 的 `GCodeRequestQueue`）：按 `print_time` 排队、覆盖压缩（后一条请求盖过前一条）、`next_min_flush_time` 按 `min_schedule_time` 对齐、`discard`/`reschedule`/`repeat` 三分支与 `send_async_request` 直通；sink 回调在**锁外**执行（上游单线程 reactor 与本仓 gcode/flush 双线程的差异），`flush` 假设单 flusher（由 `extras/toolhead.rs` 的 10 ms tick 单驱动保证）。消费方 `output_pin` **已接线**（首次可调度 `SET_PIN` 懒注册 flush 回调），12 个单测 |
 | `template.rs` | 模板引擎——**minijinja 2.24 的适配层**（`custom_syntax` 特性给单花括号定界符 `{`/`{%`/`{#}`、`UndefinedBehavior::Strict`、关自动转义、装载期编译与求值分两段）。公开门面 `Template`/`TemplateError`/`Context`/`Rt`/`Builtin`/`PrinterView` 保持不变，5 个消费方零改动；值桥=只有 printer 状态里的数组暴露 `.x/.y/.z/.e`、`action_*` 与 `range`/`namespace` 显式绑定、自定义 `int`/`float`/`min`/`max` 复刻 Jinja2 形态（可选默认参、大小写不敏感）；错误帧逐字保上游 `Error loading template …`/`Error evaluating …`，行号 1 基。与 Jinja2 的已知差异（`%`/`//` 欧几里得取余、Strict 下缺键在打印/迭代/判真时报错、部分 detail 措辞）见该模块文档 |
 | `led.rs` | LED 六段一体（`led`/`neopixel`/`dotstar`/`pca9533`/`pca9632` + `display_template` 惰性单例）：共享 `LEDHelper`，上游仅因 Python 模块布局分文件（`led.py` 等五文件+`display/display.py:168`）；`SET_LED`/`SET_LED_TEMPLATE` 未注册（H3/H8） |

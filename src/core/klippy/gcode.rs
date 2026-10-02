@@ -623,6 +623,14 @@ impl GCodeDispatch {
         Ok(())
     }
 
+    /// Whether a command name is registered (in the ready table, which holds
+    /// every registration — `when_not_ready` built-ins land here too). Used by
+    /// `gcode_macro`'s load-time check that a macro body's static command
+    /// references will resolve at run time.
+    pub fn command_exists(&self, name: &str) -> bool {
+        self.lock().ready.contains_key(name)
+    }
+
     /// Remove a registered command, as upstream's `register_command(cmd, None)`.
     ///
     /// Returns the handler that was registered, so a module can chain to it (a
@@ -1480,6 +1488,13 @@ fn split_command_parts(upper: &str) -> Vec<&str> {
     }
     parts.push(&upper[last..]);
     parts
+}
+
+/// The command name a G-Code line would dispatch to, or `None` for a
+/// blank/comment-only line. Wraps [`parse_line`] for callers (the
+/// `gcode_macro` load-time checker) that need only the name.
+pub fn command_of_line(line: &str) -> Option<String> {
+    parse_line(line).map(|parsed| parsed.command)
 }
 
 /// Parse one line, or `None` for a blank/comment-only line.

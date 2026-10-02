@@ -371,6 +371,7 @@ git config core.hooksPath .githooks
 
 | `mod.rs` | `Interface` 的收发：单发单收、多次收发、比对不上报错、无映射条目、克隆共享同一设备、一次发多条输出、帧负载保真、发送错误保留消息文本 |
 | `frame_mock.rs` | 夹具自身：单次/多次收发、帧不匹配报错、无映射条目、多输出、空输出、无匹配不发、负载保真、并发收发 |
+| `responder_mcu.rs` | （响应器式假 MCU 夹具，无独立测试；由 `toolhead.rs` 的两 MCU 端到端与 `simulator.rs` 的 `linked_fake_mcus_forward_the_move_but_nothing_else` 消费，`d14ce6a`） |
 | `pty.rs` | （仅 `cfg(test)` 的夹具，无独立测试；串口测试用它开真 pty） |
 
 ### 上游语料（`src/core/klippy/upstream.rs`）

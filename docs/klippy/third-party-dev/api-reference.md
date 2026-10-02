@@ -67,10 +67,10 @@
 > **实现状态**（截至 2026-10-03，权威清单见主机侧 `api/endpoints/mod.rs` 的状态表）：
 > 下文第 1–16 节（`info` / `emergency_stop` / `list_endpoints` / `register_remote_method` /
 > `objects/*` / 五个 `gcode/*` / `query_endstops/status` / `pause_resume/*`）**已实现**；
-> 第 17–18 节（`bed_mesh/dump_mesh`、`*/dump_*`）**部分落地**——`pause_resume` 对象与
-> `[pause_resume]` 节的四条命令（批 #15）以及 `pause_resume/*` 三个端点（2026-10-03）均已落地；
-> `*/dump_*` 的 mux 机制与 `ldc1612` / `adxl345` / `mpu9250` / `load_cell`（`dump_force`）四个消费者已落地（实例随配置重载注销并在下一轮重新注册，旧连接不再收到推送），
-> `bed_mesh/dump_mesh` 与其余 dump 端点随各自的 extras 落地。调用未实现的端点会得到 `unknown method` 错误。本文描述的是目标形状，
+> 第 18 节（`*/dump_*`）**部分落地**——mux 机制与 `ldc1612` / `adxl345` / `mpu9250` / `load_cell`
+> （`dump_force`）四个消费者已落地（实例随配置重载注销并在下一轮重新注册，旧连接不再收到推送），
+> 其余 dump 端点随各自的 extras 落地；第 17 节（`bed_mesh/dump_mesh`）**未实现**（随 `bed_mesh` 落地）。
+> 未注册的路径报 `No registered callback`，已注册端点上的未知方法报 `unknown method`。本文描述的是目标形状，
 > 实现随模块推进。
 
 ### 1. `info` — 获取打印机状态信息

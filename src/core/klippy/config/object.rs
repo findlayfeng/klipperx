@@ -8,7 +8,7 @@
 //! | `config` | every section/option as written (`status_raw_config`) | the snapshot [`PrinterConfig::new`] was handed |
 //! | `warnings` | deprecated options, runtime warnings | the recorded warnings, deduplicated as upstream does |
 //! | `settings` | every option a module read, parsed (`ConfigValidate`) | the live [`AccessTracking`] |
-//! | `save_config_pending` / `_items` | `SAVE_CONFIG` state | the pending autosave values (`set` / `remove_section`); writing the file back is still to come |
+//! | `save_config_pending` / `_items` | `SAVE_CONFIG` state | the pending autosave values (`set` / `remove_section`); the `SAVE_CONFIG` command writes them back to the file and restarts |
 //!
 //! `settings` is read live rather than snapshotted because parts read their
 //! sections as they connect; `config` is a snapshot because it never changes.
@@ -21,7 +21,8 @@ use serde_json::{json, Map, Value};
 use tracing::{info, warn};
 
 use crate::core::klippy::config::access::AccessTracking;
-use crate::core::klippy::config::Config;
+use crate::core::klippy::config::value::ConfigValue;
+use crate::core::klippy::config::{Config, ConfigSection};
 use crate::core::klippy::printer::PrinterObject;
 
 /// The name other modules use to find the config object.
@@ -44,11 +45,26 @@ pub struct PrinterConfig {
     pending: Mutex<Map<String, Value>>,
     /// Whether anything is waiting to be written back.
     save_pending: AtomicBool,
+    /// The block fileconfig, mutated by [`PrinterConfig::set`] and
+    /// [`PrinterConfig::remove_section`] — upstream's
+    /// `ConfigAutoSave.fileconfig` (`configfile.py:305`), what a `SAVE_CONFIG`
+    /// writes back. `None` until something is set on a file without a block.
+    autosave: Mutex<Option<Config>>,
 }
 
 impl PrinterConfig {
     /// Build the object over the reads of one config load.
     pub fn new(access: Arc<AccessTracking>, raw_config: Map<String, Value>) -> Self {
+        Self::new_with_autosave(access, raw_config, None)
+    }
+
+    /// As [`PrinterConfig::new`], plus the block fileconfig to write back —
+    /// the `SAVE_CONFIG` block parsed on its own (see [`Config::autosave_block`]).
+    pub fn new_with_autosave(
+        access: Arc<AccessTracking>,
+        raw_config: Map<String, Value>,
+        autosave: Option<Config>,
+    ) -> Self {
         Self {
             access,
             raw_config,
@@ -56,6 +72,7 @@ impl PrinterConfig {
             seen: Mutex::new(HashSet::new()),
             pending: Mutex::new(Map::new()),
             save_pending: AtomicBool::new(false),
+            autosave: Mutex::new(autosave),
         }
     }
 
@@ -78,6 +95,17 @@ impl PrinterConfig {
         }
         self.save_pending.store(true, Ordering::SeqCst);
         info!("save_config: set [{section}] {option} = {value}");
+        // Keep the block fileconfig in step: `set` writes into it, so a later
+        // `SAVE_CONFIG` has the value to serialize.
+        self.update_autosave(|config| {
+            let (id, sub) = split_section(section);
+            let mut saved = ConfigSection::new(id, sub);
+            saved.parameters.insert(
+                option.to_lowercase(),
+                ConfigValue::Single(value.to_string()),
+            );
+            config.add_section(saved);
+        });
     }
 
     /// Drop a section at the next `SAVE_CONFIG` (`ConfigAutoSave.remove_section`,
@@ -88,6 +116,48 @@ impl PrinterConfig {
             .unwrap_or_else(|p| p.into_inner())
             .insert(section.to_string(), Value::Null);
         self.save_pending.store(true, Ordering::SeqCst);
+        self.remove_autosave_section(section);
+    }
+
+    /// Keep the block fileconfig in step with [`PrinterConfig::set`],
+    /// initializing it on first use so a `SAVE_CONFIG` on a file with no
+    /// previous block still has somewhere to write.
+    fn update_autosave(&self, f: impl FnOnce(&mut Config)) {
+        let mut guard = self.autosave.lock().unwrap_or_else(|p| p.into_inner());
+        if guard.is_none() {
+            *guard = Some(Config::new());
+        }
+        f(guard.as_mut().expect("initialized above"));
+    }
+
+    /// Remove a section from the block fileconfig, matching
+    /// [`PrinterConfig::remove_section`].
+    fn remove_autosave_section(&self, section: &str) {
+        let mut guard = self.autosave.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(config) = guard.as_mut() {
+            config.remove_identifier(section);
+        }
+    }
+
+    /// The block fileconfig as a `SAVE_CONFIG` would serialize it — upstream's
+    /// `ConfigAutoSave.fileconfig`. `None` when nothing was ever set on a file
+    /// without a prior block.
+    pub fn autosave_fileconfig(&self) -> Option<Config> {
+        self.autosave
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    /// Whether a `SAVE_CONFIG` has anything to write back: the block
+    /// fileconfig holds at least one section (upstream's
+    /// `if not self.fileconfig.sections(): return`, `configfile.py:347`).
+    pub fn has_pending_sections(&self) -> bool {
+        self.autosave
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .is_some_and(|config| !config.sections_vec().is_empty())
     }
 
     /// Build the `config` status snapshot from a parsed config.
@@ -229,6 +299,15 @@ impl PrinterConfig {
         if self.add_warning(warning) {
             warn!("{message}");
         }
+    }
+}
+
+/// Split a section identifier into its `(id, sub)` pair on the first space,
+/// the same way `Config::get_section` does (`"mcu zboard"` → `("mcu", "zboard")`).
+fn split_section(name: &str) -> (&str, Option<&str>) {
+    match name.split_once(' ') {
+        Some((id, sub)) => (id, Some(sub)),
+        None => (name, None),
     }
 }
 

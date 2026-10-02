@@ -10,6 +10,7 @@
 pub mod access;
 pub mod mcu;
 pub mod object;
+pub mod save_config;
 pub mod section;
 pub mod source;
 pub mod validate;
@@ -50,13 +51,34 @@ fn lower_option_name(name: &str) -> String {
 pub struct Config {
     /// All sections, indexed by key (unique) and id (non-unique)
     sections: section::ConfigSectionMap,
+    /// The `SAVE_CONFIG` block parsed on its own — after `_strip_duplicates`
+    /// and before the merge — which is exactly upstream's
+    /// `ConfigAutoSave.fileconfig` (`klippy/configfile.py:305`): the block a
+    /// `SAVE_CONFIG` writes back. `None` when the file has no block. Boxed so
+    /// the option stays a sized member of `Config`.
+    autosave: Option<Box<Config>>,
 }
 
 impl Config {
     pub fn new() -> Self {
         Self {
             sections: section::ConfigSectionMap::default(),
+            autosave: None,
         }
+    }
+
+    /// The `SAVE_CONFIG` block alone (upstream's `ConfigAutoSave.fileconfig`).
+    pub fn autosave_block(&self) -> Option<&Config> {
+        self.autosave.as_deref()
+    }
+
+    /// Remove a section by full identifier (`"mcu"` or `"mcu zboard"`);
+    /// returns it when it was present. Used by `remove_section` to drop a
+    /// section from the block fileconfig at the next `SAVE_CONFIG`.
+    pub fn remove_identifier(&mut self, identifier: &str) -> Option<ConfigSection> {
+        let parts: Vec<&str> = identifier.splitn(2, ' ').collect();
+        let key = (parts[0].to_string(), parts.get(1).map(|s| s.to_string()));
+        self.sections.remove(&key)
     }
 
     /// Get a section by full identifier (e.g., "mcu" or "mcu zboard")
@@ -123,6 +145,7 @@ impl Config {
         visited.insert(source.clone());
         let (mut included_config, sources_list) =
             Self::parse_with_includes(regular, &source, &mut visited, true)?;
+        let mut autosave_config: Option<Config> = None;
         if let Some(block) = autosave {
             // `_strip_duplicates` needs the body (with its includes) parsed
             // first; the block itself never resolves includes (upstream
@@ -130,6 +153,10 @@ impl Config {
             let stripped = strip_autosave_duplicates(&block, &included_config);
             let (saved, _) =
                 Self::parse_with_includes(&stripped, &source, &mut HashSet::new(), false)?;
+            // The block, kept whole for the write-back side: a `SAVE_CONFIG`
+            // re-serializes it, exactly the `ConfigAutoSave.fileconfig`
+            // upstream keeps after `load_main_config`.
+            autosave_config = Some(saved.clone());
             merge_autosave(&mut included_config, &saved);
         }
         let mut all_sources = Vec::new();
@@ -140,6 +167,7 @@ impl Config {
         for section in included_config.sections_vec() {
             config.add_section(section.clone());
         }
+        config.autosave = autosave_config.map(Box::new);
 
         Ok((config, all_sources))
     }
@@ -651,6 +679,42 @@ fn merge_autosave(body: &mut Config, saved: &Config) {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Serialization (the write half of the `SAVE_CONFIG` block)
+// ---------------------------------------------------------------------------
+
+/// Serialize a config's sections to plain ini text, upstream's
+/// `build_config_string` (`configfile.py:210-226`): `[identifier]`, one
+/// `option = value` line per parameter (a multi-line value's continuation
+/// lines stay embedded), and a blank line closing each section.
+pub fn build_config_string(config: &Config) -> String {
+    let mut out = String::new();
+    for section in config.sections_vec() {
+        out.push_str(&format!("[{}]\n", section.identifier()));
+        for (option, value) in &section.parameters {
+            out.push_str(&format!("{option} = {}\n", value.as_str()));
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// The text a `SAVE_CONFIG` appends below the regular config: the block
+/// config, every line `#*# `-prefixed, with the header and a trailing blank in
+/// exactly the shape upstream's `cmd_SAVE_CONFIG` builds
+/// (`configfile.py:346-360`). The leading newline keeps the block off the last
+/// regular line without adding a separator upstream does not.
+pub fn build_autosave_block(config: &Config) -> String {
+    let text = build_config_string(config);
+    let mut lines: Vec<String> = text
+        .split('\n')
+        .map(|line| format!("#*# {line}").trim_end().to_string())
+        .collect();
+    lines.insert(0, format!("\n{}", AUTOSAVE_HEADER.trim_end()));
+    lines.push(String::new());
+    lines.join("\n")
 }
 
 #[cfg(test)]

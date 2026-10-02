@@ -54,12 +54,14 @@
 use std::sync::Arc;
 
 use crate::core::klippy::config::object::{PrinterConfig, CONFIGFILE_OBJECT};
+use crate::core::klippy::config::save_config;
 use crate::core::klippy::config::{
     check_unused, AccessTracking, Config, ConfigError, ConfigWrapper,
 };
-use crate::core::klippy::gcode::{GCodeDispatch, GCODE_OBJECT};
+use crate::core::klippy::gcode::{self, GCodeDispatch, GCODE_OBJECT};
 use crate::core::klippy::pins::{PrinterPins, PINS_OBJECT};
 use crate::core::klippy::printer::{Printer, PrinterObject};
+use crate::core::klippy::CommandError;
 
 /// Builds one printer object from a config section.
 ///
@@ -196,15 +198,60 @@ impl Printer {
         self.add_object(GCODE_OBJECT, Arc::new(GCodeDispatch::new(Arc::clone(self))))?;
         self.add_object(
             CONFIGFILE_OBJECT,
-            Arc::new(PrinterConfig::new(
+            Arc::new(PrinterConfig::new_with_autosave(
                 Arc::clone(&access),
                 PrinterConfig::raw_config(config),
+                config.autosave_block().cloned(),
             )),
         )?;
+        // `SAVE_CONFIG` is the configfile object's own command; register it
+        // next to the object, once — upstream does it in
+        // `ConfigAutoSave.__init__` (`configfile.py:246-247`).
+        self.register_save_config()?;
         self.add_object(PINS_OBJECT, Arc::new(PrinterPins::new()))?;
 
         let claimed = self.load_sections(config, &access, FACTORIES)?;
         check_unused(config, &access, &claimed)?;
+        Ok(())
+    }
+
+    /// Register the `SAVE_CONFIG` command: rewrite the config file from the
+    /// pending autosave values, then restart (upstream
+    /// `ConfigAutoSave.cmd_SAVE_CONFIG`, `configfile.py:346-402`). Failing to
+    /// find the `gcode`, `configfile` object, or a config file path leaves the
+    /// command inert rather than erroring at load — the file may be being
+    /// loaded with no on-disk path in tests.
+    fn register_save_config(self: &Arc<Self>) -> Result<(), ConfigError> {
+        let printer = Arc::clone(self);
+        let handler = gcode::sync(move |_gcmd| {
+            let Some(cfgname) = printer.start_args().map(|a| a.config_file.clone()) else {
+                return Ok(());
+            };
+            let Some(configfile) = printer.lookup_object_as::<PrinterConfig>(CONFIGFILE_OBJECT)
+            else {
+                return Ok(());
+            };
+            if let Err(err) = save_config::write_config(&configfile, &cfgname) {
+                return Err(CommandError::new(err));
+            }
+            // The file is written; reload it from disk (`restart`), the way a
+            // `SAVE_CONFIG` finishes upstream.
+            if let Some(gcode) = printer.lookup_object_as::<GCodeDispatch>(GCODE_OBJECT) {
+                gcode.request_restart("restart");
+            }
+            Ok(())
+        });
+        let Some(gcode) = self.lookup_object_as::<GCodeDispatch>(GCODE_OBJECT) else {
+            return Ok(());
+        };
+        gcode
+            .register_command(
+                "SAVE_CONFIG",
+                handler,
+                Some("Overwrite config file and restart"),
+                false,
+            )
+            .map_err(ConfigError::from)?;
         Ok(())
     }
 

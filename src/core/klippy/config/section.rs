@@ -66,6 +66,13 @@ impl ConfigSectionMap {
         }
     }
 
+    /// Remove a section by key, returning it when it was present.
+    pub fn remove(&mut self, key: &(String, Option<String>)) -> Option<ConfigSection> {
+        let removed = self.by_key.remove(key)?;
+        self.keys.retain(|k| k != key);
+        Some(removed)
+    }
+
     /// Iterate over all sections. See the type-level docs for why this does
     /// not filter by a specific id.
     pub fn iter_by_id(&self) -> impl Iterator<Item = &ConfigSection> + '_ {

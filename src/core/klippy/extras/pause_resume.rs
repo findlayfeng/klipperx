@@ -31,12 +31,10 @@
 //!   therefore take the `respond_info` side of each branch
 //!   (`action:paused`/`action:resumed`/`action:cancel`).
 //! - **The three webhooks endpoints** (`pause_resume/cancel|pause|resume`,
-//!   `pause_resume.py:47-52`) are not installed. The API crate has the
-//!   registration primitive (`endpoint!` + the `Api` table), but the
-//!   endpoints live in `api/endpoints/` and the object they drive is built
-//!   while the config is read — wiring them is a separate change. The
-//!   endpoint table already lists them "not started"
-//!   (`api/endpoints/mod.rs`).
+//!   `pause_resume.py:47-52`) live on the API side, in
+//!   `api/endpoints/pause_resume.rs`: each one runs the matching command
+//!   (`CANCEL_PRINT`/`PAUSE`/`RESUME`) through the dispatcher, looked up per
+//!   request because the endpoints are installed before this object is built.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};

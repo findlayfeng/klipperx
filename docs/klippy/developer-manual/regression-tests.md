@@ -189,8 +189,8 @@ connect_file(输出文件, 字典):
 | 判定 | 次数 | 原因 |
 |------|------|------|
 | 因字典未构建跳过 | 2 | `printers.test` 中引用 `pru` 的两条运行（默认不编 `pru`） |
-| 因忽略列表跳过 | **0** | `IGNORED` 已清空 |
-| 实际执行 | **237** | 全部通过（下表列出各 `.test`，`printers.test` 一个文件 203 条运行） |
+| 因忽略列表跳过 | **1** | `out_of_bounds.test`（move-bounds 未实现，`G1 Y9999` 未被拒；见下文「忽略列表」） |
+| 实际执行 | **236** | 全部通过（下表列出各 `.test`，`printers.test` 一个文件 203 条运行） |
 | 其中早期转绿 | — | 逐批转绿的先后顺序（各批提交信息里可查）：`linuxtest.test`、`commands.test`、`out_of_bounds.test`（b39750f 移出）、`bed_mesh.test`、`z_virtual_endstop.test`（探针链路）、`z_tilt.test`、`quad_gantry_level.test`（调平族）、`bltouch.test`、`smart_effector.test`（探针族）、`multi_z.test`（发送队列水位）、`screws_tilt_adjust.test`（探测语义与亚纳米守卫）、`gcode_arcs.test`、`bed_screws.test`、`pwm.test`、`temperature.test`、`macros.test`、`led.test`、`sdcard_loop.test`、`pressure_advance.test`、`eddy.test`、`dual_carriage.test`、`exclude_object.test`（宏体渲染）、`polar.test`、`delta.test`、`delta_calibrate.test`（运动学）、`hybrid_corexy_dual_carriage.test`（`[input_shaper]` 段）、`extruders.test`（filament 传感器段）、`manual_stepper.test`、`generic_cartesian_iqex.test`/`generic_cartesian_itex.test`，**全部通过** |
 
 上游 `configparser` 的 `optionxform = str.lower` 已对齐（`mod.rs` 存储侧小写 + `section.rs` 查询侧小写），`Option 'pid_Kp' … must be specified` 类的 49 次回归失败已归零；`must be specified` 错误文案保留调用方传入的大小写，`is not valid` 与 `Section '…' is not valid` 使用存储侧小写。
@@ -206,6 +206,11 @@ connect_file(输出文件, 字典):
   **237 条通过、0 条失败**，`IGNORED` **已清空**（2026-09-25 收官；逐批转绿过程见各批提交信息与
   `TODO.md`）。另有 2 条运行声明 `DICTIONARY … pru.dict`，默认不构建 `pru`（需 `pru-gcc`），
   不计入统计。
+- **2026-10-02 回退**：运行器从单个 `#[test]` 串行改为 build 时生成独立 `#[test]` 后（见下文
+  「运行」），暴露出 `out_of_bounds.test` 因本主机未实现 move-bounds 检查而实际成功——`G1 Y9999`
+  未被拒，`SHOULD_FAIL` 不满足。旧串行运行器在转绿时依赖 `gcode_move` 落地后配置可装载，但越界
+  检查一直缺位；改为独立 `#[test]` 后该缺口直接表现为测试失败，故重新登记进 `IGNORED`。
+  move-bounds 实现后从列表移除即可。
 - 按「首次失败」归类的历史分布（分域工单、运动学细分、完整失败日志与「收益不可加」的复盘）
   曾记在 `docs/work-log/2026-09-22-upstream-regression-failures.md`；该快照**随收官从工作记录目录
   清理**（`git log --diff-filter=D -- docs/work-log/` 可找回）。本页只保留机制与推进口径，避免两处
@@ -218,12 +223,13 @@ connect_file(输出文件, 字典):
 
 - 按「**首次失败原因**」分组只用于**定位**，不是工作队列：`load_config` 遇到第一个未知
   section 就停，修好一个缺口只会让运行前进到下一个缺口，总数可能不变，各组收益不可加。
-- 进度以**实测口径**衡量：`KLIPPERX_UPSTREAM_ALL=1` 下 **237 通过 / 0 失败**、`IGNORED` **0** 条
-  （2026-09-25 收官）；
+- 进度以**实测口径**衡量：默认构建下 **236 通过 / 0 失败**、`IGNORED` **1** 条
+  （`out_of_bounds.test`，move-bounds 未实现；2026-10-02 回退登记）；
   推进期的做法是先产出「**运行 × 缺口**」矩阵
   （列出每条运行的**全部**缺口，而非第一个），据此找「只差一个缺口」的用例与公共前缀。
-- **验收标准**：对应 `.test` 从 `IGNORED` 移除后通过。`ignored_cases_still_fail` 是守卫（opt-in 亦点名「能装载但 g-code 未绿」的候选：历史上曾点名 `dual_carriage.test` 与 `exclude_object.test`，已随宏体渲染于 2026-09-24 清零，现 0 点名）——
-  某个忽略文件的全部可跑运行都通过时报失败并提示移除。
+- **验收标准**：对应 case 从 `IGNORED`（`crates/test-support/build.rs`，按生成函数名登记）
+  移除后通过。旧守卫 `ignored_cases_still_fail` 仍按 `upstream.rs` 内的旧 `IGNORED` 常量（现空）
+  检测，与生成器的权威列表暂未对接——移除时需同步两处，或在 move-bounds 落地后一并清理守卫。
 - 看全部缺口（而不只是首次失败）：
   `cargo test -p klipperx --lib upstream_gap_report -- --nocapture`。
 - `out_of_bounds.test` 是唯一的 `SHOULD_FAIL`：验收时必须确认反转真的验的是**越界检查**，
@@ -240,9 +246,9 @@ connect_file(输出文件, 字典):
 | 语料结构完整、引用可解析 | 无 | `upstream_test_cases_are_well_formed`、`upstream_test_inputs_resolve` |
 | 每份 `.cfg` 由本仓库解析器读取 | 无 | `every_upstream_printer_config_parses` |
 | 全部缺口扫描（**报告**，不失败） | 无 | `upstream_gap_report`（`-- --nocapture` 查看缺口矩阵） |
-| `IGNORED` 条目守卫 | 运行声明的全部字典 + 所用配置节 | `ignored_cases_still_fail`（某个忽略文件全跑通了就报失败；现列表为空） |
+| `IGNORED` 条目守卫 | 运行声明的全部字典 + 所用配置节 | `ignored_cases_still_fail`（按 `upstream.rs` 内旧 `IGNORED` 常量检测，现空；生成器权威列表在 `build.rs`，暂未对接） |
 | 运行内联 g-code 可解析 | —（用例 g-code 已由端到端运行真送进 dispatcher） | `#[ignore] upstream_inline_gcode_parses`（更早的窄解析阶段，未对接） |
-| 运行端到端执行 | 运行声明的全部字典 + 所用配置节 | `upstream_test_cases_run`（按运行的可用性过滤；忽略列表已空） |
+| 运行端到端执行 | 运行声明的全部字典 + 所用配置节 | build 时生成的 239 个独立 `#[test]`（`upstream_<stem>__config_<n>_<cfg>`，见下文「运行」；字典未构建或列入忽略的生成为 `#[ignore]`） |
 
 ### 应答机
 
@@ -280,14 +286,22 @@ harness 把每个 `[mcu]` / `[mcu <name>]` 的传输键换成 `test: dict=<字�
 ### 忽略列表
 
 上游绝大多数配置会用到本主机尚未实现的节（`extruder`、`heater_bed`、`fan`、`gcode_macro`、
-`tmc*`…），它们在 `load_config` 阶段就被拒绝，因此曾逐条登记在 `IGNORED` 里跳过；随节落地逐条移除，
-现已一条不剩。列表按 `.test` 文件登记，作用域是该文件的**全部运行**。
+`tmc*`…），它们在 `load_config` 阶段就被拒绝，因此曾逐条登记在 `IGNORED` 里跳过；随节落地逐条移除。
 
-`KLIPPERX_UPSTREAM_ALL=1` **只作用于这张列表**：它让字典齐备的运行无视忽略判定并报出失败，
-**不会**让因字典未构建而跳过的运行跑起来（那是构建阶段的事，见上一节）。
+**生成式运行器后**（2026-10-02）：`IGNORED` 的权威列表搬到 `crates/test-support/build.rs`，
+按生成的测试函数名 `upstream_<stem>__config_<n>_<cfg>` 匹配（旧版按 `.test` 文件名匹配，会误伤
+引用同一 config 的其它用例）。登记在内的 case 生成时带 `#[ignore = "upstream IGNORED"]`，
+`cargo test --ignored` 可单跑；移除后即恢复为普通 `#[test]`。
 
-**已清空**（2026-09-25 收官）：最后一条移出后列表为空，保留它是为了下一处缺口有地方登记；
-每个 `.test` 的转绿过程见各批提交信息与 `TODO.md`。
+**当前列表**（1 条）：
+
+| 函数名 | 原因 |
+|--------|------|
+| `upstream_out_of_bounds__config_0_example_cartesian` | `G1 Y9999` 越界未被拒——本主机未实现 move-bounds 检查，`SHOULD_FAIL` 不满足；move-bounds 落地后移除 |
+
+字典未构建的 case（如 `printers.test` 里声明 `pru.dict` 的 2 条）不进这张列表，而是在生成时
+按字典文件是否存在判定，带 `#[ignore = "dictionary <name> not built"]`——它随 `KLIPPERX_ARCHES`
+变化，不该在列表里登记。
 
 `multi_z.test` 已转绿并移出忽略列表（2026-09-24）：首因是同步 `Mcu::send` 的 `try_send` 被异步生产者
 灌满报 `no available capacity`（插桩定位到 `endstop_home` 武装撞上瞬时满载），修复为 `send_payload`
@@ -309,29 +323,43 @@ harness 把每个 `[mcu]` / `[mcu <name>]` 的传输键换成 `test: dict=<字�
 - 只有 g-code 阶段的错误才反转成成功（`run_phases` 的两段返回值）。
 
 所以它的验收要点是：移出忽略列表前，配置必须先能装载——否则非零退出来自配置错误，反转就会被
-「喂饱」。这一条在 b39750f 移出时已满足（`gcode_move` 落地后 `example-cartesian.cfg` 可装载，
-反转验的正是 `G1 Y9999` 越界）。
+「喂饱」。这一条在 b39750f 移出时已满足（`gcode_move` 落地后 `example-cartesian.cfg` 可装载）。
+
+**2026-10-02 回退**：生成式运行器暴露出反转一直未被真正验到——`G1 Y9999` 在本主机成功
+（move-bounds 检查未实现），`SHOULD_FAIL` 因「g-code 阶段未报错」而不满足，case 重新进
+`IGNORED`。move-bounds 落地后从列表移除，验收时须确认反转验的真是越界检查。
 
 ### 运行
 
-用例在 lib 测试目标里，用 `-p klipperx --lib` 加名字过滤运行：
+`test-support/build.rs` 在 test 构建时扫描 `test/klippy/*.test`，为每个 `CONFIG` 块生成一个
+独立的 `#[test]`（命名 `upstream_<stem>__config_<n>_<cfg>`），config 路径、字典路径、g-code、
+`SHOULD_FAIL` 标志全部固化在生成代码里——运行时不再扫语料、不再读 `GCODE` 文件。生成的测试
+`include!`进 `src/core/klippy/upstream.rs` 的 `#[cfg(test)] mod upstream`，文件本身
+（`src/core/klippy/upstream_generated.rs`）被 gitignore，永不提交。
+
+用 `cargo test` 加名字过滤运行（名字即生成函数名）：
 
 ```bash
 cargo test -p klipperx --lib upstream
-# 语料相关的全部用例；字典未构建或列入忽略列表的运行跳过，内联 g-code 阶段不执行
+# 语料相关的全部用例（含生成的 239 个 #[test] 与手写的机制守卫）；字典未构建或列入
+# IGNORED 的生成为 #[ignore]，默认跳过
 
-cargo test -p klipperx --lib every_upstream_printer_config_parses
-# 单条：全部上游 .cfg 能否被本仓库解析
+cargo test -p klipperx --lib upstream_bed_mesh
+# 单条：只跑 bed_mesh.test 的那个 case（可替换为任意 upstream_<stem>__config_<n>_<cfg>）
 
-KLIPPERX_ARCHES=linux cargo test -p klipperx --lib upstream_test_cases_run
-# 只编 linux 一份，构建最快；默认还会编 avr 与各 ARM 家族
+cargo test -p klipperx --lib --ignored upstream
+# 跑全部被忽略的 case（含 IGNORED 列表与字典未构建的），用于验证移除条件
 
-KLIPPERX_ALL_ARCHES=1 cargo test -p klipperx --lib upstream_test_cases_run
-# 构建 test/configs 下的全部目标（需要所有交叉工具链）
+KLIPPERX_ARCHES=linux cargo test -p klipperx --lib upstream
+# 只编 linux 一份字典，构建最快；默认还会编 avr 与各 ARM 家族
 
-KLIPPERX_UPSTREAM_ALL=1 cargo test -p klipperx --lib upstream_test_cases_run
-# 只去掉忽略列表：跑全部「字典齐备」的运行并列出失败
+KLIPPERX_ALL_ARCHES=1 cargo test -p klipperx --lib upstream
+# 构建 test/configs 下的全部目标（需要所有交叉工具链，含 pru/ar100）
 ```
+
+生成式运行器取代了旧的 `upstream_test_cases_run`（单个 `#[test]` 串行跑 239 case，十几分钟
+易超时且无法单跑定位）；旧环境变量 `KLIPPERX_UPSTREAM_ALL` / `KLIPPERX_UPSTREAM_FILTER` 不再
+适用——「只去掉忽略列表」改用 `cargo test --ignored`，「只跑某用例」改用名字过滤。
 
 `--workspace` 与 `--lib` 的取舍、真机用例的约定见[测试](testing.md)。
 

@@ -426,6 +426,94 @@ mod tests {
     const IGNORED: &[&str] = &[];
 
     // -----------------------------------------------------------------------
+    // Generated upstream cases
+    // -----------------------------------------------------------------------
+    //
+    // `test-support/build.rs` scans `test/klippy/*.test` at build time and emits
+    // one `#[test]` per `CONFIG` directive into `OUT_DIR/upstream-tests/
+    // upstream_cases.rs`, with the config path, dictionary paths, g-code and
+    // `SHOULD_FAIL` flag frozen in as literals — no `.test` file is scanned at
+    // run time. Cases whose dictionary is not built, or whose config is on the
+    // `IGNORED` list, are emitted with `#[ignore]` (run with `cargo test
+    // --ignored`). The generated functions are named `upstream_<stem>__
+    // config_<idx>_<cfg>` so the `upstream_` prefix marks every generated case
+    // and the `<stem>` segment records which `.test` file it came from,
+    // distinguishing them from the hand-written tests below (`a_*`,
+    // `the_corpus_*`, …).
+    //
+    // The generated cases are written to `src/core/klippy/upstream_generated.rs`
+    // (gitignored) by `test-support/build.rs` and pulled in here with a relative
+    // `include!`. The whole module is `#[cfg(test)]`, so the file only needs to
+    // exist under `cargo test` — which is exactly when the dev-dependency's
+    // build script runs and writes it.
+    include!("upstream_generated.rs");
+
+    /// Entry point the generated `#[test]`s call — the runtime half of the
+    /// generated corpus. Each generated function passes the frozen config path,
+    /// dictionary paths (already resolved against the built-dictionary
+    /// directory), g-code and `SHOULD_FAIL` flag; this builds a fresh
+    /// multi-threaded runtime for the case (isolation from a leaked `Mcu`),
+    /// injects the fake firmware, brings the machine up, runs the g-code, and
+    /// applies the `should_fail` inversion as a panic.
+    ///
+    /// This mirrors the old `upstream_test_cases_run` loop body, but per case.
+    fn run_generated_upstream_case(
+        config_path: &str,
+        dictionaries: &[(Option<&str>, &str)],
+        gcode: &str,
+        should_fail: bool,
+    ) {
+        // Upstream's `test/klippy/test-klippy.sh` runs each case with the
+        // klipper source root as the working directory, so a config's relative
+        // `path:` (only `sdcard_loop.cfg` ships one) resolves the way
+        // `os.listdir` does. Cargo's working directory is the package root,
+        // where `test/` is not present, so without this guard
+        // `[virtual_sdcard]`'s `get_file_list` cannot find the directory. The
+        // process-global change is scoped to this case and restored on exit,
+        // including a panic — exactly the `CwdGuard` the old
+        // `upstream_test_cases_run` used.
+        struct CwdGuard(Option<std::path::PathBuf>);
+        impl Drop for CwdGuard {
+            fn drop(&mut self) {
+                if let Some(prev) = self.0.take() {
+                    let _ = std::env::set_current_dir(prev);
+                }
+            }
+        }
+        let _cwd_guard = CwdGuard(std::env::current_dir().ok());
+        let _ = std::env::set_current_dir(klipper_dir());
+
+        let resolved: Vec<(Option<String>, PathBuf)> = dictionaries
+            .iter()
+            .map(|(mcu, path)| (mcu.map(str::to_string), PathBuf::from(*path)))
+            .collect();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("a case runtime");
+        let outcome = runtime.block_on(async {
+            let parsed = injected_config(Path::new(config_path), &resolved)?;
+            let case_file = Path::new(config_path).display().to_string();
+            let gcode = match run_phases(&parsed, &case_file, gcode).await {
+                Err(setup) => return Err(format!("{case_file}: {setup}")),
+                Ok(gcode) => gcode,
+            };
+            match (should_fail, gcode) {
+                (false, outcome) => outcome,
+                (true, Err(_)) => Ok(()),
+                (true, Ok(())) => Err("the run was expected to fail".to_string()),
+            }
+        });
+        runtime.shutdown_timeout(std::time::Duration::from_secs(CASE_SHUTDOWN_TIMEOUT));
+        match (should_fail, outcome) {
+            (false, Ok(())) => {}
+            (false, Err(e)) => panic!("upstream case failed: {e}"),
+            (true, Ok(())) => panic!("upstream case was expected to fail but succeeded"),
+            (true, Err(_)) => {}
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Which architectures and dictionaries to run
     // -----------------------------------------------------------------------
 
@@ -794,131 +882,6 @@ mod tests {
     /// every case is its own process. The bound is generous (the measured
     /// shutdown is milliseconds) so only a real leak trips it.
     const CASE_SHUTDOWN_TIMEOUT: u64 = 5;
-
-    /// Run the upstream runs whose dictionaries were built and that are not on
-    /// the ignore list; `KLIPPERX_UPSTREAM_ALL=1` drops the ignore list (and
-    /// `KLIPPERX_UPSTREAM_VERBOSE=1` prints a per-case line with its duration).
-    #[test]
-    fn upstream_test_cases_run() {
-        // Upstream's `test/klippy/test-klippy.sh` runs each case with the
-        // klipper source root as the working directory, so a config's relative
-        // `path:` (only `sdcard_loop.cfg` ships one: `test/klippy/sdcard_loop`)
-        // resolves the way `os.listdir` does in upstream. This port's cases run
-        // in-process with cargo's working directory, which is the package
-        // root (a worktree where `test/` is not even present); without this
-        // guard `[virtual_sdcard]`'s `get_file_list` cannot find the directory.
-        // No other test reads a path relative to the working directory — they
-        // all go through `klipper_dir()` / `CARGO_MANIFEST_DIR` — so the
-        // process-global change is scoped to this one function and restored on
-        // exit, including a panic.
-        struct CwdGuard(Option<std::path::PathBuf>);
-        impl Drop for CwdGuard {
-            fn drop(&mut self) {
-                if let Some(prev) = self.0.take() {
-                    let _ = std::env::set_current_dir(prev);
-                }
-            }
-        }
-        let _cwd_guard = CwdGuard(std::env::current_dir().ok());
-        let _ = std::env::set_current_dir(klipper_dir());
-
-        let all = std::env::var_os("KLIPPERX_UPSTREAM_ALL").is_some();
-
-        let mut ran = 0usize;
-        let mut no_dictionary = 0usize;
-        let mut unbuilt = Vec::new();
-        let mut ignored = 0usize;
-        let mut failures = Vec::new();
-        for run in all_runs() {
-            let file = run
-                .path
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
-            let name = format!("{file} ({})", relative(&run.config));
-            // `KLIPPERX_UPSTREAM_FILTER=<substr>` runs only the cases whose
-            // name contains it: a local iteration lever (the default, unset,
-            // runs the full suite exactly as before).
-            if let Some(needle) = std::env::var_os("KLIPPERX_UPSTREAM_FILTER") {
-                if !name.contains(needle.to_string_lossy().as_ref()) {
-                    continue;
-                }
-            }
-
-            // A run without a dictionary cannot be started the way upstream
-            // starts one; upstream itself refuses to.
-            if run.dictionaries.is_empty() {
-                no_dictionary += 1;
-                continue;
-            }
-
-            let dictionaries = run_dictionaries(&run);
-            let missing: Vec<&str> = dictionaries
-                .iter()
-                .filter(|(_, path)| path.is_none())
-                .map(|(mcu, _)| mcu.as_deref().unwrap_or("mcu"))
-                .collect();
-            // A run without its dictionaries cannot be started at all, so this
-            // is not something `KLIPPERX_UPSTREAM_ALL` bypasses — enabling more
-            // architectures at build time is what makes these runs possible.
-            if !missing.is_empty() {
-                unbuilt.push(format!("{name} needs {}", missing.join(", ")));
-                continue;
-            }
-            if !all && IGNORED.contains(&file.as_str()) {
-                ignored += 1;
-                continue;
-            }
-
-            let verbose = std::env::var_os("KLIPPERX_UPSTREAM_VERBOSE").is_some();
-            let started = std::time::Instant::now();
-            // One runtime per case, as upstream gives every case its own
-            // `klippy.py` process (`scripts/test_klippy.py`). A case that leaks a
-            // part (a reference cycle keeping an `Mcu` alive parks its receive
-            // task's blocking read) must not be able to keep the *next* case's
-            // runtime — or the whole suite — from shutting down.
-            let runtime = tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .expect("a case runtime");
-            let outcome = runtime.block_on(run_case(&run, &dictionaries));
-            runtime.shutdown_timeout(std::time::Duration::from_secs(CASE_SHUTDOWN_TIMEOUT));
-            match outcome {
-                Ok(()) => {
-                    ran += 1;
-                    if verbose {
-                        eprintln!(
-                            "VERBOSE {:7.3}s ok   {name}",
-                            started.elapsed().as_secs_f64()
-                        );
-                    }
-                }
-                Err(e) => {
-                    if verbose {
-                        eprintln!(
-                            "VERBOSE {:7.3}s FAIL {name}",
-                            started.elapsed().as_secs_f64()
-                        );
-                    }
-                    failures.push(format!("{name}: {e}"));
-                }
-            }
-        }
-
-        assert!(
-            failures.is_empty(),
-            "{} upstream run(s) failed ({} ran, {} without a dictionary, {} with \
-             an unbuilt dictionary, {} ignored; KLIPPERX_UPSTREAM_ALL=1 drops the \
-             ignore list, KLIPPERX_ARCHES/KLIPPERX_ALL_ARCHES build more \
-             dictionaries):\n  {}",
-            failures.len(),
-            ran,
-            no_dictionary,
-            unbuilt.len(),
-            ignored,
-            failures.join("\n  ")
-        );
-    }
 
     // ---------------------------------------------------------------------
     // Focused end-to-end checks: does an endstop actually reach a homing move

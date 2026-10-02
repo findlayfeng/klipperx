@@ -14,21 +14,38 @@
 //! | `initial_pulse_width` | 0 s | `0 ..= maximum_pulse_width` | startup pulse when no angle |
 //! | `pin` | — (required) | — | the PWM pin |
 //!
-//! # Gaps this port does not close yet
+//! # Scheduling
 //!
-//! * **No print-time scheduling.** Upstream queues each update through
-//!   `output_pin.GCodeRequestQueue` and aligns it to the next MCU cycle
-//!   (`servo.py:47-61`, `RESCHEDULE_SLACK`). The queue is ported
-//!   (`extras/gcode_request_queue.rs`) but `servo` is not wired to it yet, so
-//!   this port drives the pin through the resource's immediate path, like
-//!   [`pwm_tool`](super::pwm_tool). The duty value is upstream's formula, so
-//!   what is missing is *when* the pulse lands, not what it is.
+//! `SET_SERVO` rides this port's print-time request queue, as upstream's does
+//! (`servo.py:38-40` builds an `output_pin.GCodeRequestQueue`, `:66-73` queues
+//! each value through `queue_gcode_request`): the duty is pinned to the
+//! toolhead's lookahead time, a flush callback drains the queue, and the sink
+//! below is upstream's `_set_pwm` (`servo.py:48-55`) one for one — a repeat of
+//! the driven duty answers `discard`, the pulse is aligned to the servo's
+//! 0.020 s cycle allowing [`RESCHEDULE_SLACK`] early (`servo.py:51`), an
+//! alignment landing more than `RESCHEDULE_SLACK` late answers `reschedule`
+//! with the aligned time (the queue retries there), and only then is the frame
+//! sent. The lookahead/arm wiring (`queue_at_lookahead` in
+//! [`output_pin`](super::output_pin)) is shared with [`pwm_tool`]; `servo`
+//! keeps its own sink because only upstream's servo aligns this way.
+//!
+//! Two forks keep the **immediate** path (`update_pwm`), with no error and no
+//! panic — the same two [`output_pin`](crate::core::klippy::extras::output_pin)
+//! documents: no `toolhead` object (a config without `[printer]`), or the pin
+//! resource cannot schedule yet (`min_schedule_time()` is `None`: its MCU is
+//! not connected). A repeat of the driven duty is then skipped by the command
+//! itself, where the queued path lets the sink discard it.
 
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, Weak};
 
 use serde_json::{json, Value};
+use tracing::warn;
 
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
+use crate::core::klippy::extras::gcode_request_queue::{
+    FlushAction, GCodeRequestQueue, RequestSink,
+};
+use crate::core::klippy::extras::output_pin::queue_at_lookahead;
 use crate::core::klippy::gcode::{
     sync, CommandError, CommandHandler, GCodeDispatch, GcodeCommand, GCODE_OBJECT,
 };
@@ -41,6 +58,11 @@ section!("servo", order = 20, prefix = load_config_prefix);
 
 /// The PWM period every servo runs at (`servo.py:7`).
 const SERVO_SIGNAL_PERIOD: f64 = 0.020;
+
+/// How far before the requested time a cycle-aligned pulse may land — and the
+/// overshoot past it that makes `_set_pwm` answer `reschedule`
+/// (`servo.py:9`, `:51-53`).
+const RESCHEDULE_SLACK: f64 = 0.000500;
 
 /// The pulse geometry of one servo: how angles and widths map to a duty
 /// fraction of [`SERVO_SIGNAL_PERIOD`] (`servo.py:16-24`, `:56-63`).
@@ -87,11 +109,9 @@ impl Geometry {
 
 /// One configured `[servo <name>]`.
 pub struct PrinterServo {
-    /// The name `SET_SERVO SERVO=<name>` addresses it by: the section's sub.
-    name: String,
-    /// The duty last sent, for `get_status` (`servo.py:45-46`); starts at 0
-    /// as upstream's `last_value` does, regardless of the startup pulse.
-    value: Arc<Mutex<f64>>,
+    /// The scheduling state `SET_SERVO` and `get_status` share: the value
+    /// slot, the pin, and the armed request queue.
+    schedule: Arc<ServoSchedule>,
 }
 
 impl PrinterServo {
@@ -101,7 +121,7 @@ impl PrinterServo {
     /// Returns a config error (a message naming the section) when the section
     /// has no name, an option is missing or out of bounds, or the pin cannot
     /// be built.
-    pub fn new(config: &ConfigWrapper, printer: &Printer) -> Result<Self, ConfigError> {
+    pub fn new(config: &ConfigWrapper, printer: &Arc<Printer>) -> Result<Self, ConfigError> {
         let identifier = config.identifier();
         let name = config.section().sub.clone().ok_or_else(|| {
             ConfigError::new(format!(
@@ -174,12 +194,18 @@ impl PrinterServo {
         let gcode = printer
             .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
             .expect("the loader registers `gcode` before any section");
-        let value_slot = Arc::new(Mutex::new(0.));
-        let pwm = Arc::new(pwm);
+        // `last_value` starts at 0 whatever the startup pulse drives
+        // (`servo.py:17`); the sink and `get_status` share the slot.
+        let schedule = Arc::new(ServoSchedule {
+            name: name.clone(),
+            value: Arc::new(Mutex::new(0.)),
+            pwm,
+            printer: Arc::downgrade(printer),
+            armed: Mutex::new(None),
+        });
         let handler: CommandHandler = {
-            let pwm = Arc::clone(&pwm);
-            let value_slot = Arc::clone(&value_slot);
-            sync(move |gcmd| cmd_set_servo(&pwm, &value_slot, geometry, gcmd))
+            let schedule = Arc::clone(&schedule);
+            sync(move |gcmd| cmd_set_servo(&schedule, geometry, gcmd))
         };
         gcode
             // `WIDTH` and `ANGLE` are the two keys `cmd_set_servo` reads (in
@@ -194,48 +220,73 @@ impl PrinterServo {
             )
             .map_err(|err| ConfigError::new(format!("{identifier}: {err}")))?;
 
-        Ok(Self {
-            name,
-            value: value_slot,
-        })
+        Ok(Self { schedule })
     }
 
     /// The name `SET_SERVO SERVO=<name>` addresses this servo by.
     pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn lock(&self) -> MutexGuard<'_, f64> {
-        self.value
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
+        &self.schedule.name
     }
 }
 
 impl PrinterObject for PrinterServo {
-    /// The duty last sent, as upstream's `PrinterServo.get_status`
+    /// The duty last driven, as upstream's `PrinterServo.get_status`
     /// (`servo.py:45-46`).
     fn get_status(&self, _eventtime: f64) -> Value {
-        json!({ "value": *self.lock() })
+        json!({ "value": self.schedule.value() })
     }
 }
 
 impl std::fmt::Debug for PrinterServo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PrinterServo")
-            .field("name", &self.name)
+            .field("name", &self.schedule.name)
             .finish_non_exhaustive()
     }
 }
 
-/// `SET_SERVO SERVO=<name> ANGLE=<a>` or `WIDTH=<seconds>`: drive the pin.
+/// The scheduling state behind `SET_SERVO`: the shared value slot, the pin,
+/// and the request queue once the first schedulable command arms it —
+/// `output_pin::PinSchedule`'s counterpart for a sink that aligns.
+struct ServoSchedule {
+    /// The section's sub: names the servo in send-failure log lines.
+    name: String,
+    /// The duty last **driven** (upstream's `last_value`, `servo.py:17, 54`):
+    /// moved when the frame lands — at flush time on the queued path, at once
+    /// on the immediate one — and read by `get_status`.
+    value: Arc<Mutex<f64>>,
+    /// The PWM pin the sink aligns and drives.
+    pwm: Arc<dyn PwmOut>,
+    /// The printer, so a command can find the toolhead after config load.
+    /// Weak: the printer owns the g-code handlers, a strong handle would close
+    /// a `printer → objects → gcode → handler → printer` cycle.
+    printer: Weak<Printer>,
+    /// The queue, built and armed exactly once — by the first `SET_SERVO`
+    /// that finds both a toolhead and a schedulable resource (see the module
+    /// docs for the two fallbacks).
+    armed: Mutex<Option<Arc<GCodeRequestQueue<ServoSink>>>>,
+}
+
+impl ServoSchedule {
+    /// The value last driven.
+    fn value(&self) -> f64 {
+        *self
+            .value
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+}
+
+/// `SET_SERVO SERVO=<name> ANGLE=<a>` or `WIDTH=<seconds>`: queue the change
+/// at the print time the toolhead gives it (upstream `cmd_SET_SERVO`,
+/// `servo.py:66-73`), or drive the pin at once when no timeline can date it.
 ///
 /// `WIDTH` wins when present; otherwise `ANGLE` is required
-/// (`servo.py:64-71`). A repeat of the current duty sends nothing — upstream's
-/// `GCodeRequestQueue` reaches the same discard in `_set_pwm` (`servo.py:50`).
+/// (`servo.py:64-71`). A repeat of the current duty sends nothing: the queued
+/// path reaches that discard in [`ServoSink::set_at`] (upstream's `_set_pwm`,
+/// `servo.py:49-50`), the immediate path guards it here.
 fn cmd_set_servo(
-    pwm: &Arc<dyn PwmOut>,
-    value_slot: &Arc<Mutex<f64>>,
+    schedule: &ServoSchedule,
     geometry: Geometry,
     gcmd: &GcodeCommand,
 ) -> Result<(), CommandError> {
@@ -244,18 +295,142 @@ fn cmd_set_servo(
     } else {
         geometry.pwm_from_angle(gcmd.get_float("ANGLE")?)
     };
-    let current = *value_slot
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
-    if value == current {
+    let sink = ServoSink {
+        name: schedule.name.clone(),
+        pwm: Arc::clone(&schedule.pwm),
+        value: Arc::clone(&schedule.value),
+    };
+    if queue_at_lookahead(
+        &schedule.printer,
+        &schedule.armed,
+        schedule.pwm.min_schedule_time(),
+        sink,
+        value,
+    ) {
         return Ok(());
     }
-    pwm.update_pwm(value)
+    // Immediate fallback (no toolhead, or the pin cannot schedule): the sink
+    // would discard a repeat there, so the guard lives here instead.
+    if value == schedule.value() {
+        return Ok(());
+    }
+    schedule
+        .pwm
+        .update_pwm(value)
         .map_err(|err| CommandError::new(err.to_string()))?;
-    *value_slot
+    *schedule
+        .value
         .lock()
         .unwrap_or_else(|poison| poison.into_inner()) = value;
     Ok(())
+}
+
+/// The queue's downstream end: upstream's `PrinterServo._set_pwm`
+/// (`servo.py:48-55`) — discard a repeat, align the pulse to the servo's
+/// cycle, reschedule a late alignment, and only then send.
+struct ServoSink {
+    /// Names the servo in send-failure log lines.
+    name: String,
+    /// The pin to align and drive.
+    pwm: Arc<dyn PwmOut>,
+    /// Upstream's `last_value`.
+    value: Arc<Mutex<f64>>,
+}
+
+impl RequestSink for ServoSink {
+    fn set_at(&self, print_time: f64, value: f64) -> Option<(FlushAction, f64)> {
+        {
+            let last = self
+                .value
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            if value == *last {
+                // Upstream answers "discard", 0. (`servo.py:49-50`).
+                return Some((FlushAction::Discard, 0.0));
+            }
+        }
+        let Some(clock) = self.pwm.print_time_to_clock(print_time) else {
+            // The MCU went away between arming and flush: keep the change by
+            // the immediate form, as `output_pin`'s sink does.
+            self.drive_now(value);
+            return None;
+        };
+        let aligned = match self.pwm.next_aligned_clock(clock as u32, RESCHEDULE_SLACK) {
+            Ok(aligned) => aligned,
+            Err(err) => {
+                // The flush callback has no error channel; upstream would
+                // raise into the reactor. The frame is lost either way, and
+                // `last_value` stays put so a later request retries.
+                warn!("SET_SERVO SERVO={}: {err}", self.name);
+                return None;
+            }
+        };
+        // `servo.py:51-53`: an alignment more than RESCHEDULE_SLACK after the
+        // requested time is rescheduled to the aligned time; the queue
+        // retries the request there.
+        if let Some(aligned_ptime) = aligned_print_time(&self.pwm, print_time, clock, aligned) {
+            if aligned_ptime > print_time + RESCHEDULE_SLACK {
+                return Some((FlushAction::Reschedule, aligned_ptime));
+            }
+        }
+        // `servo.py:54-55`: `last_value` moves before the frame is sent.
+        *self
+            .value
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = value;
+        if let Err(err) = self.pwm.set_pwm(aligned, value) {
+            warn!("SET_SERVO SERVO={}: {err}", self.name);
+        }
+        None
+    }
+}
+
+impl ServoSink {
+    /// The immediate fallback: drive without a date and record the duty.
+    fn drive_now(&self, value: f64) {
+        *self
+            .value
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = value;
+        if let Err(err) = self.pwm.update_pwm(value) {
+            warn!("SET_SERVO SERVO={}: {err}", self.name);
+        }
+    }
+}
+
+/// The print time `aligned` (a clock [`PwmOut::next_aligned_clock`] returned
+/// for `print_time`) lands at — upstream's `clock_to_print_time` after
+/// `next_aligned_print_time` (`servo.py:51, 55`), for the sink's
+/// `reschedule` floor. `None` when the probes disagree (no connected MCU);
+/// the sink then sends without a reschedule.
+///
+/// The `PwmOut` trait maps print time to a clock but exposes neither the
+/// inverse nor the frequency (`pins.rs` stays untouched for this wiring), and
+/// the mapping is affine — `clock = (print_time − offset) × freq` — so the
+/// slope is read off one probe a second later: truncating the two `u64`
+/// conversions costs at most a tick over that interval. `delta` is the
+/// wrap-safe gap between the two clocks: alignment runs in the 32-bit
+/// wire-clock domain, so `aligned` may sit up to `RESCHEDULE_SLACK` *before*
+/// `clock` (legitimately early), or just below its `2^32` window.
+fn aligned_print_time(
+    pwm: &Arc<dyn PwmOut>,
+    print_time: f64,
+    clock: u64,
+    aligned: u32,
+) -> Option<f64> {
+    let freq = pwm
+        .print_time_to_clock(print_time + 1.0)?
+        .checked_sub(clock)? as f64;
+    if freq <= 0. {
+        return None;
+    }
+    let mut delta = i64::from(aligned) - i64::from(clock as u32);
+    if delta < -(1i64 << 31) {
+        // The aligned clock wrapped below `clock`'s window: read it as the
+        // next one up (the gap is far smaller than a whole window either way).
+        delta += 1i64 << 32;
+    }
+    Some(print_time + delta as f64 / freq)
 }
 
 /// The factory `section!` names for each `[servo <name>]`
@@ -277,6 +452,7 @@ mod tests {
     use super::*;
     use crate::core::klippy::config::{Config, ConfigSection, ConfigValue};
     use crate::core::klippy::event::KlippyEvent;
+    use crate::core::klippy::extras::toolhead::ToolHeadObject;
     use crate::core::klippy::mcu::McuError;
     use crate::core::klippy::pins::{DigitalOut, PinChip, PinError, PinParams};
     use crate::core::klippy::reactor::ManualReactor;
@@ -312,13 +488,30 @@ mod tests {
     // MCU's PWM cannot be driven before a connect, the fake records the duty.
     // -----------------------------------------------------------------------
 
-    /// A PWM that records what it was told.
+    /// The clock the fake resources map print time through, in Hz.
+    const TEST_CLOCK_HZ: f64 = 1_000_000.0;
+
+    /// The schedule floor the fake resources report (the real one comes from
+    /// `Mcu::min_schedule_time`).
+    const TEST_MIN_SCHEDULE_TIME: f64 = 0.1;
+
+    /// A PWM that records what it was told: clocked changes (with the clock
+    /// they went out at) and immediate ones separately, as `output_pin`'s
+    /// fake does.
     #[derive(Default)]
     struct FakePwm {
         max_duration: Mutex<f64>,
         cycle_time: Mutex<(f64, bool)>,
         start_value: Mutex<(f64, f64)>,
         updates: Mutex<Vec<f64>>,
+        queued: Mutex<Vec<(u32, f64)>>,
+        /// The last duty set, for [`FakePwm::next_aligned_clock`] — the real
+        /// `McuPwm` aligns against its own last clock and skips alignment
+        /// while fully on/off.
+        last_value: Mutex<f64>,
+        /// Whether the fake models a connected MCU — a clock to convert print
+        /// times with and a schedule floor to queue against.
+        schedulable: bool,
     }
 
     impl PwmOut for FakePwm {
@@ -330,24 +523,60 @@ mod tests {
         }
         fn setup_start_value(&self, start_value: f64, shutdown_value: f64) {
             *self.start_value.lock().unwrap() = (start_value, shutdown_value);
+            *self.last_value.lock().unwrap() = start_value;
         }
-        fn set_pwm(&self, _clock: u32, value: f64) -> Result<(), McuError> {
-            self.updates.lock().unwrap().push(value);
+        fn set_pwm(&self, clock: u32, value: f64) -> Result<(), McuError> {
+            self.queued.lock().unwrap().push((clock, value));
+            *self.last_value.lock().unwrap() = value;
             Ok(())
         }
         fn update_pwm(&self, value: f64) -> Result<(), McuError> {
             self.updates.lock().unwrap().push(value);
+            *self.last_value.lock().unwrap() = value;
             Ok(())
         }
-        fn next_aligned_clock(&self, clock: u32, _allow_early: f64) -> Result<u32, McuError> {
-            Ok(clock)
+        fn next_aligned_clock(&self, clock: u32, allow_early: f64) -> Result<u32, McuError> {
+            // Mirrors `McuPwm`: a duty fully on/off has no cycle to land on.
+            let (cycle_time, hardware) = *self.cycle_time.lock().unwrap();
+            if hardware
+                || *self.last_value.lock().unwrap() == 0.0
+                || *self.last_value.lock().unwrap() == 1.0
+            {
+                return Ok(clock);
+            }
+            let cycle = (cycle_time * TEST_CLOCK_HZ) as u32;
+            if cycle == 0 {
+                return Ok(clock);
+            }
+            // Round up to the next cycle boundary, allowed early by
+            // `allow_early` (upstream `req_ptime`, `servo.py:51` / `mcu.py:531-543`).
+            let early = ((allow_early.min(0.5 * cycle_time)) * TEST_CLOCK_HZ) as u32;
+            let req = clock.saturating_sub(early);
+            Ok((req + cycle - 1) / cycle * cycle)
+        }
+        fn print_time_to_clock(&self, print_time: f64) -> Option<u64> {
+            self.schedulable
+                .then_some((print_time * TEST_CLOCK_HZ) as u64)
+        }
+        fn min_schedule_time(&self) -> Option<f64> {
+            self.schedulable.then_some(TEST_MIN_SCHEDULE_TIME)
         }
     }
 
-    /// A chip that hands out a [`FakePwm`] per setup.
-    #[derive(Default)]
+    /// A chip that hands out a [`FakePwm`] per setup; its resources model a
+    /// connected MCU unless told otherwise.
     struct FakeChip {
         pwms: Mutex<Vec<Arc<FakePwm>>>,
+        schedulable: bool,
+    }
+
+    impl Default for FakeChip {
+        fn default() -> Self {
+            Self {
+                pwms: Mutex::new(Vec::new()),
+                schedulable: true,
+            }
+        }
     }
 
     impl PinChip for FakeChip {
@@ -356,15 +585,17 @@ mod tests {
         }
 
         fn setup_pwm(&self, _params: &PinParams) -> Result<Arc<dyn PwmOut>, PinError> {
-            let pwm = Arc::new(FakePwm::default());
+            let pwm = Arc::new(FakePwm {
+                schedulable: self.schedulable,
+                ..FakePwm::default()
+            });
             self.pwms.lock().unwrap().push(Arc::clone(&pwm));
             Ok(pwm)
         }
     }
 
-    /// A ready printer with `gcode` and `pins` over the fake chip, plus the
-    /// corpus servo built on it.
-    fn servo_printer() -> (Arc<Printer>, PrinterServo, Arc<FakeChip>) {
+    /// A ready printer with `gcode` and `pins` over `chip`.
+    fn printer_with(chip: FakeChip) -> (Arc<Printer>, Arc<FakeChip>) {
         let printer = Arc::new(Printer::new(ManualReactor::shared()));
         printer
             .add_object(
@@ -373,19 +604,67 @@ mod tests {
             )
             .unwrap();
         let pins = Arc::new(PrinterPins::new());
-        let chip = Arc::new(FakeChip::default());
+        let chip = Arc::new(chip);
         pins.register_chip("mcu", chip.clone()).unwrap();
         printer.add_object(PINS_OBJECT, pins).unwrap();
         printer.send_event(&KlippyEvent::KlippyReady);
+        (printer, chip)
+    }
 
+    /// Wrap a hand-built section the way the loader does.
+    fn wrap(section: &ConfigSection) -> ConfigWrapper<'_> {
+        ConfigWrapper::untracked(section)
+    }
+
+    /// The corpus servo built on `printer`: `pin: PA4`, no initial options.
+    fn servo_on(printer: &Arc<Printer>) -> PrinterServo {
         let mut section = ConfigSection::new("servo", Some("my_servo"));
         section
             .parameters
             .insert("pin".to_string(), ConfigValue::Single("PA4".to_string()));
-        let access = crate::core::klippy::config::AccessTracking::shared();
-        let wrapper = ConfigWrapper::new(&section, access);
-        let servo = PrinterServo::new(&wrapper, &printer).unwrap();
+        PrinterServo::new(&wrap(&section), printer).unwrap()
+    }
+
+    /// A ready printer with `gcode` and `pins` over a schedulable fake chip,
+    /// plus the corpus servo built on it.
+    fn servo_printer() -> (Arc<Printer>, PrinterServo, Arc<FakeChip>) {
+        let (printer, chip) = printer_with(FakeChip::default());
+        let servo = servo_on(&printer);
         (printer, servo, chip)
+    }
+
+    /// A connected `toolhead` registered on `printer` — `kinematics: none`,
+    /// the dwell-only timeline whose flush callbacks must still run
+    /// (`toolhead`'s own fixture, as `output_pin`'s tests use it).
+    async fn add_toolhead(printer: &Arc<Printer>) -> Arc<ToolHeadObject> {
+        let mut section = ConfigSection::new("printer", None);
+        for (key, value) in [
+            ("kinematics", "none"),
+            ("max_velocity", "300"),
+            ("max_accel", "3000"),
+        ] {
+            section
+                .parameters
+                .insert(key.to_string(), ConfigValue::Single(value.to_string()));
+        }
+        let object =
+            ToolHeadObject::new(&wrap(&section), printer).expect("kinematics: none builds");
+        printer.add_object("toolhead", Arc::new(object)).unwrap();
+        let object = printer
+            .lookup_object_as::<ToolHeadObject>("toolhead")
+            .unwrap();
+        object.connect().await.expect("the toolhead connects");
+        object
+    }
+
+    fn gcode(printer: &Arc<Printer>) -> Arc<GCodeDispatch> {
+        printer
+            .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+            .unwrap()
+    }
+
+    fn created(chip: &FakeChip, index: usize) -> Arc<FakePwm> {
+        chip.pwms.lock().unwrap()[index].clone()
     }
 
     /// The section loads: every option it carries (and the defaults it omits)
@@ -515,5 +794,197 @@ mod tests {
         let (_, result) = load(&servo_config("initial_angle: 400\n"));
         let err = result.unwrap_err().to_string();
         assert!(err.contains("must have maximum of 360"), "{err}");
+    }
+
+    // -----------------------------------------------------------------------
+    // The queued (print-time) path — see the module docs' Scheduling section
+    // -----------------------------------------------------------------------
+
+    /// A queued `SET_SERVO` is pinned to the toolhead's lookahead time
+    /// (`register_lookahead_callback`) and lands as a **clocked** `set_pwm`
+    /// on the flush — never the immediate `update_pwm` — with the status
+    /// moving only when the frame lands.
+    #[tokio::test]
+    async fn set_servo_is_pinned_to_the_lookahead_time_and_lands_on_the_flush() {
+        let (printer, chip) = printer_with(FakeChip::default());
+        let toolhead = add_toolhead(&printer).await;
+        let servo = servo_on(&printer);
+
+        gcode(&printer)
+            .run_script("SET_SERVO SERVO=my_servo ANGLE=90")
+            .await
+            .unwrap();
+
+        let pwm = created(&chip, 0);
+        // The request rides the lookahead/queue; nothing has been driven yet.
+        assert!(pwm.queued.lock().unwrap().is_empty());
+        assert!(pwm.updates.lock().unwrap().is_empty());
+        assert_eq!(servo.get_status(0.0), json!({ "value": 0.0 }));
+
+        let print_time = toolhead.print_time();
+        toolhead.flush_step_generation().await.unwrap();
+
+        let duty = geometry().pwm_from_angle(90.);
+        assert_eq!(
+            *pwm.queued.lock().unwrap(),
+            [((print_time * TEST_CLOCK_HZ) as u64 as u32, duty)],
+            "the frame carries the lookahead print time as a clock"
+        );
+        assert!(
+            pwm.updates.lock().unwrap().is_empty(),
+            "the immediate update_pwm path is not taken"
+        );
+        assert_eq!(servo.get_status(0.0), json!({ "value": duty }));
+    }
+
+    /// A later `SET_SERVO` pushed ahead of the same flush overrides the
+    /// earlier one: the queue compresses them and only the covering duty is
+    /// sent (`output_pin.py:35-38`).
+    #[tokio::test]
+    async fn a_later_set_servo_overrides_the_pending_request() {
+        let (printer, chip) = printer_with(FakeChip::default());
+        let toolhead = add_toolhead(&printer).await;
+        let servo = servo_on(&printer);
+
+        gcode(&printer)
+            .run_script("SET_SERVO SERVO=my_servo ANGLE=90")
+            .await
+            .unwrap();
+        gcode(&printer)
+            .run_script("SET_SERVO SERVO=my_servo WIDTH=0.002")
+            .await
+            .unwrap();
+        toolhead.flush_step_generation().await.unwrap();
+
+        let pwm = created(&chip, 0);
+        let print_time = toolhead.print_time();
+        assert_eq!(
+            *pwm.queued.lock().unwrap(),
+            [((print_time * TEST_CLOCK_HZ) as u64 as u32, 0.1)],
+            "only the covering duty reaches the pin"
+        );
+        assert!(pwm.updates.lock().unwrap().is_empty());
+        assert_eq!(servo.get_status(0.0), json!({ "value": 0.1 }));
+    }
+
+    /// First fork: no `toolhead` object (a config without `[printer]`), even
+    /// though the resource could schedule — `SET_SERVO` keeps the immediate
+    /// path: driven at once, nothing queued.
+    #[test]
+    fn without_a_toolhead_set_servo_drives_the_pin_immediately() {
+        let (printer, servo, chip) = servo_printer();
+
+        gcode(&printer)
+            .run_script_sync("SET_SERVO SERVO=my_servo ANGLE=90")
+            .unwrap();
+
+        let pwm = created(&chip, 0);
+        assert_eq!(
+            *pwm.updates.lock().unwrap(),
+            [geometry().pwm_from_angle(90.)]
+        );
+        assert!(pwm.queued.lock().unwrap().is_empty());
+        assert_eq!(
+            servo.get_status(0.0),
+            json!({ "value": geometry().pwm_from_angle(90.) })
+        );
+    }
+
+    /// Second fork: a toolhead, but a pin resource whose MCU is not connected
+    /// (no schedule floor to queue with) — immediate path, no error, no panic.
+    #[tokio::test]
+    async fn a_servo_that_cannot_schedule_is_driven_immediately() {
+        let (printer, chip) = printer_with(FakeChip {
+            schedulable: false,
+            ..FakeChip::default()
+        });
+        add_toolhead(&printer).await;
+        let servo = servo_on(&printer);
+
+        gcode(&printer)
+            .run_script("SET_SERVO SERVO=my_servo ANGLE=90")
+            .await
+            .unwrap();
+
+        let pwm = created(&chip, 0);
+        assert_eq!(
+            *pwm.updates.lock().unwrap(),
+            [geometry().pwm_from_angle(90.)]
+        );
+        assert!(pwm.queued.lock().unwrap().is_empty());
+        assert_eq!(
+            servo.get_status(0.0),
+            json!({ "value": geometry().pwm_from_angle(90.) })
+        );
+    }
+
+    /// Upstream's `_set_pwm` reschedule (`servo.py:51-53`): an alignment that
+    /// would land more than [`RESCHEDULE_SLACK`] late answers `reschedule`
+    /// with the aligned time and leaves `last_value` alone; the retry at that
+    /// time then drives the pulse exactly on the cycle boundary.
+    #[test]
+    fn the_sink_reschedules_a_late_alignment_and_drives_on_the_retry() {
+        let fake = Arc::new(FakePwm {
+            schedulable: true,
+            ..FakePwm::default()
+        });
+        fake.setup_cycle_time(SERVO_SIGNAL_PERIOD, false);
+        let value = Arc::new(Mutex::new(0.));
+        let sink = ServoSink {
+            name: "my_servo".to_string(),
+            pwm: Arc::clone(&fake) as Arc<dyn PwmOut>,
+            value: Arc::clone(&value),
+        };
+
+        // First frame: the duty starts at 0, so there is no cycle to align
+        // to (`pwm.rs`/`mcu.py:531-536` filter) — it lands as requested
+        // (the fake's clock for 1.000001 s truncates to 1 000 000).
+        assert_eq!(sink.set_at(1.000001, 0.05), None);
+        assert_eq!(*fake.queued.lock().unwrap(), [(1_000_000, 0.05)]);
+        assert_eq!(*value.lock().unwrap(), 0.05);
+
+        // Requested at clock 1 010 000 (mid-cycle): the next boundary is
+        // 1 020 000, more than RESCHEDULE_SLACK later — reschedule to it,
+        // sending nothing.
+        let Some((action, floor)) = sink.set_at(1.010001, 0.075) else {
+            panic!("a late alignment must reschedule");
+        };
+        assert_eq!(action, FlushAction::Reschedule);
+        // The probe reads the frequency through two truncating clock
+        // conversions, so the floor carries a ~1e-8 s slop.
+        assert!((floor - 1.020001).abs() < 1e-7, "floor {floor}");
+        assert_eq!(fake.queued.lock().unwrap().len(), 1, "nothing sent yet");
+        assert_eq!(*value.lock().unwrap(), 0.05, "last_value waits");
+
+        // The retry at the aligned time passes the slack check and lands on
+        // the boundary.
+        assert_eq!(sink.set_at(1.020001, 0.075), None);
+        assert_eq!(
+            *fake.queued.lock().unwrap(),
+            [(1_000_000, 0.05), (1_020_000, 0.075)]
+        );
+        assert_eq!(*value.lock().unwrap(), 0.075);
+        assert!(fake.updates.lock().unwrap().is_empty());
+    }
+
+    /// The sink discards a repeat of the driven duty without sending
+    /// (`servo.py:49-50`), and the discard carries no schedule floor.
+    #[test]
+    fn the_sink_discards_a_repeat_of_the_driven_duty() {
+        let fake = Arc::new(FakePwm {
+            schedulable: true,
+            ..FakePwm::default()
+        });
+        fake.setup_cycle_time(SERVO_SIGNAL_PERIOD, false);
+        let value = Arc::new(Mutex::new(0.));
+        let sink = ServoSink {
+            name: "my_servo".to_string(),
+            pwm: Arc::clone(&fake) as Arc<dyn PwmOut>,
+            value: Arc::clone(&value),
+        };
+
+        assert_eq!(sink.set_at(1.0, 0.05), None);
+        assert_eq!(sink.set_at(2.0, 0.05), Some((FlushAction::Discard, 0.0)));
+        assert_eq!(fake.queued.lock().unwrap().len(), 1);
     }
 }

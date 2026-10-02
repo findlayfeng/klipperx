@@ -52,8 +52,14 @@
 //! # What is not here
 //!
 //! * **`static_value` / `template`**: the display-template machinery.
-//! * **`fan` / `servo` / `pwm_tool`** still drive every change through the
-//!   immediate forms; their own module comments record that gap.
+//! * **`fan`** still drives every change through the immediate form; its own
+//!   module comment records that gap. [`servo`](crate::core::klippy::extras::servo)
+//!   and [`pwm_tool`](crate::core::klippy::extras::pwm_tool) ride this queue
+//!   too: the schedule state and the lookahead wiring here (`PinSchedule`,
+//!   `queue_at_lookahead`) are shared with them — `servo` keeps its own sink
+//!   because upstream aligns it to the pulse cycle
+//!   (`servo.py:47-53`, `RESCHEDULE_SLACK`). `pwm_cycle_time` is not on the
+//!   queue because upstream's is not either (see that module).
 
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
@@ -217,12 +223,17 @@ impl std::fmt::Debug for OutputPin {
     }
 }
 
-/// The scheduling state behind `SET_PIN`: the shared value slot, the pin
-/// handle, and the request queue once the first schedulable `SET_PIN` arms it.
+/// The scheduling state behind a pin-like `SET_PIN`: the shared value slot,
+/// the pin handle, and the request queue once the first schedulable command
+/// arms it.
 ///
-/// Shared by the `OutputPin` object (status), the `SET_PIN` handler (pushes)
-/// and the queue's sink (drives) — all three see the same last driven value.
-struct PinSchedule {
+/// Shared by the section object (status), the command handler (pushes) and
+/// the queue's sink (drives) — all three see the same last driven value.
+/// `output_pin` builds it with either handle; `pwm_tool` with
+/// [`PinSchedule::new_pwm`] (its upstream `SET_PIN` rides the same queue per
+/// this repo's wiring, `pwm_tool.py:177-184`); `servo` carries its own state
+/// because its sink differs.
+pub(crate) struct PinSchedule {
     /// The section's sub: names the pin in a send-failure log line.
     name: String,
     /// The value last **driven** (upstream `last_value`, updated when the
@@ -236,43 +247,82 @@ struct PinSchedule {
     /// `printer → objects → gcode → handler → printer` cycle.
     printer: Weak<Printer>,
     /// The queue, built and armed (its flush callback registered with the
-    /// toolhead) exactly once — by the first `SET_PIN` that finds both a
+    /// toolhead) exactly once — by the first command that finds both a
     /// toolhead and a schedulable resource. See the module docs for the two
     /// fallbacks.
     armed: Mutex<Option<Arc<GCodeRequestQueue<PinSink>>>>,
 }
 
 impl PinSchedule {
-    /// The queue, arming it on the first call.
-    ///
-    /// The flush callback is registered **before** the queue is published, so
-    /// a push can never sit in a queue nothing drains
-    /// (`register_flush_callback` is connect-safe: before the toolhead
-    /// connects both wait in its pending lists and are installed together).
-    /// `None` when the resource cannot schedule yet — its MCU is not
-    /// connected, so the queue's schedule floor does not exist; the command
-    /// then keeps the immediate path.
-    fn arm(&self, toolhead: &ToolHeadObject) -> Option<Arc<GCodeRequestQueue<PinSink>>> {
-        let mut armed = self
-            .armed
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        if let Some(queue) = armed.as_ref() {
-            return Some(Arc::clone(queue));
+    /// The scheduling state for a PWM section that shares this queue:
+    /// `pwm_tool`'s `SET_PIN` (`pwm_tool.py:177-184` pins it to the lookahead
+    /// time just like this module's own command does).
+    pub(crate) fn new_pwm(
+        name: String,
+        pwm: Arc<dyn PwmOut>,
+        initial_value: f64,
+        printer: &Arc<Printer>,
+    ) -> Self {
+        Self::with_handle(name, PinHandle::Pwm(pwm), initial_value, printer)
+    }
+
+    /// The scheduling state around an already-built handle.
+    fn with_handle(
+        name: String,
+        handle: PinHandle,
+        initial_value: f64,
+        printer: &Arc<Printer>,
+    ) -> Self {
+        Self {
+            name,
+            value: Arc::new(Mutex::new(initial_value)),
+            handle,
+            printer: Arc::downgrade(printer),
+            armed: Mutex::new(None),
         }
-        let min_schedule_time = self.handle.min_schedule_time()?;
-        let sink = PinSink {
+    }
+
+    /// The section's sub: the name commands address the pin by.
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The value last **driven** (at once on the immediate path, at its print
+    /// time on the queued one) — what `get_status` reports and what a repeat
+    /// is compared against on the immediate path.
+    pub(crate) fn value(&self) -> f64 {
+        *self
+            .value
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    /// Pin `value` to the toolhead's lookahead time through the shared
+    /// request queue (upstream `GCodeRequestQueue.queue_gcode_request`,
+    /// `output_pin.py:65-67`), arming the queue on the first call.
+    ///
+    /// `false` when there is no timeline to date the change against — no
+    /// `toolhead` object, or the resource cannot schedule yet
+    /// (`min_schedule_time()` is `None`) — so the command keeps its
+    /// immediate path, as the module docs describe.
+    pub(crate) fn queue(&self, value: f64) -> bool {
+        queue_at_lookahead(
+            &self.printer,
+            &self.armed,
+            self.handle.min_schedule_time(),
+            self.sink(),
+            value,
+        )
+    }
+
+    /// This schedule's end of the queue: the sink sees the same handle and
+    /// value slot the immediate path drives and records.
+    fn sink(&self) -> PinSink {
+        PinSink {
             name: self.name.clone(),
             handle: self.handle.clone(),
             value: Arc::clone(&self.value),
-        };
-        let queue = Arc::new(GCodeRequestQueue::new(sink, min_schedule_time));
-        let flush_queue = Arc::clone(&queue);
-        toolhead.register_flush_callback(Box::new(move |flush_time| {
-            flush_queue.flush(flush_time);
-        }));
-        *armed = Some(Arc::clone(&queue));
-        Some(queue)
+        }
     }
 
     /// The immediate path: drive the pin now and record the value
@@ -281,7 +331,7 @@ impl PinSchedule {
     /// # Errors
     /// Whatever the resource reports — typically "MCU is not connected"
     /// before connect.
-    fn drive_now(&self, value: f64) -> Result<(), McuError> {
+    pub(crate) fn drive_now(&self, value: f64) -> Result<(), McuError> {
         self.handle.drive_now(value)?;
         *self
             .value
@@ -289,6 +339,59 @@ impl PinSchedule {
             .unwrap_or_else(|poison| poison.into_inner()) = value;
         Ok(())
     }
+}
+
+/// Pin one command's `value` to the toolhead's lookahead time through `armed`
+///'s request queue, building and arming that queue on the first call
+/// (upstream `queue_gcode_request`, `output_pin.py:65-67` — the shared wiring
+/// behind `output_pin`, `pwm_tool` and `servo`).
+///
+/// The flush callback is registered **before** the queue is published, so a
+/// push can never sit in a queue nothing drains (`register_flush_callback` is
+/// connect-safe: before the toolhead connects both wait in its pending lists
+/// and are installed together). `false` means no timeline could date the
+/// change — no `toolhead` object, or `min_schedule_time()` is `None` (the
+/// resource's MCU is not connected) — and the caller keeps its immediate
+/// path.
+pub(crate) fn queue_at_lookahead<S: RequestSink>(
+    printer: &Weak<Printer>,
+    armed: &Mutex<Option<Arc<GCodeRequestQueue<S>>>>,
+    min_schedule_time: Option<f64>,
+    sink: S,
+    value: f64,
+) -> bool {
+    // The toolhead (`phase = late, order = 60`) loads after these sections
+    // (`order = 20`), so it is looked up per command, never at config load.
+    let Some(toolhead) = printer
+        .upgrade()
+        .and_then(|printer| printer.lookup_object_as::<ToolHeadObject>("toolhead"))
+    else {
+        // No `[printer]` section: nothing to date the change against.
+        return false;
+    };
+    let Some(min_schedule_time) = min_schedule_time else {
+        // The resource cannot schedule yet: its MCU is not connected, so the
+        // queue's schedule floor does not exist.
+        return false;
+    };
+    let queue = {
+        let mut armed = armed.lock().unwrap_or_else(|poison| poison.into_inner());
+        if let Some(queue) = armed.as_ref() {
+            Arc::clone(queue)
+        } else {
+            let queue = Arc::new(GCodeRequestQueue::new(sink, min_schedule_time));
+            let flush_queue = Arc::clone(&queue);
+            toolhead.register_flush_callback(Box::new(move |flush_time| {
+                flush_queue.flush(flush_time);
+            }));
+            *armed = Some(Arc::clone(&queue));
+            queue
+        }
+    };
+    toolhead.register_lookahead_callback(Box::new(move |print_time| {
+        queue.push(print_time, value);
+    }));
+    true
 }
 
 /// The queue's downstream end: where a due request lands at its print time
@@ -395,20 +498,8 @@ fn cmd_set_pin(
         .get_float_range("VALUE", 0.0, scale)
         .map_err(|err| CommandError::new(err.to_string()))?
         / scale;
-    // The toolhead (`phase = late, order = 60`) loads after this section
-    // (`order = 20`), so it is looked up per command, never at config load.
-    // Without one — a config with no `[printer]` — the immediate path stands.
-    let toolhead = schedule
-        .printer
-        .upgrade()
-        .and_then(|printer| printer.lookup_object_as::<ToolHeadObject>("toolhead"));
-    if let Some(toolhead) = toolhead {
-        if let Some(queue) = schedule.arm(&toolhead) {
-            toolhead.register_lookahead_callback(Box::new(move |print_time| {
-                queue.push(print_time, value);
-            }));
-            return Ok(());
-        }
+    if schedule.queue(value) {
+        return Ok(());
     }
     schedule
         .drive_now(value)

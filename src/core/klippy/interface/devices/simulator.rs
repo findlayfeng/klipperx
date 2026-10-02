@@ -40,7 +40,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::Write;
 use std::path::Path;
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::Instant;
 
 use flate2::write::ZlibEncoder;
@@ -143,6 +143,15 @@ struct State {
     /// without the string suppresses that report (an unnamed id renders as
     /// `?<value>`, which the host would not match either).
     shutdown_ids: ShutdownIds,
+    /// The other fake MCUs this one runs beside in one machine
+    /// ([`SimulatorDevice::link_machine`]). Weakly held: the instances of one
+    /// test must not keep each other (and their receive threads) alive past
+    /// teardown.
+    peers: Vec<Weak<SimulatorDevice>>,
+    /// A move started on this board while its host block was handled: the
+    /// signal [`Device::send`] forwards to `peers` once this board's own lock
+    /// is free (see [`SimulatorDevice::note_move`]).
+    move_pending: bool,
 }
 
 /// The firmware's per-stepper chain state (`stepper.c`): where the next step
@@ -263,6 +272,8 @@ impl SimulatorDevice {
                 firmware_shutdown: None,
                 ldc_sampling: false,
                 shutdown_ids,
+                peers: Vec::new(),
+                move_pending: false,
             }),
             signal: Condvar::new(),
         })
@@ -275,6 +286,89 @@ impl SimulatorDevice {
             .unwrap_or_else(|p| p.into_inner())
             .raw
             .len()
+    }
+
+    /// Join `devices` into one machine: a move that starts on any of them trips
+    /// the armed checks of **every** one of them.
+    ///
+    /// The fake reads "the carriage moved" off the steps it receives
+    /// (`reset_step_clock` / `queue_step`), but a real machine's endstop may
+    /// live on another board than the stepper it guards: the arm arrives on
+    /// this board, the steps on that one. Forwarding the step signal is what
+    /// lets a two-MCU homing move fire the check on the endstop's board in the
+    /// same move it was armed for. Nothing else is shared — every instance
+    /// still serves only its own dictionary and its own oids — and each call
+    /// replaces the previous membership, so relinking a board is exact.
+    pub fn link_machine(devices: &[Arc<Self>]) {
+        for (index, device) in devices.iter().enumerate() {
+            let peers = devices
+                .iter()
+                .enumerate()
+                .filter(|(other, _)| *other != index)
+                .map(|(_, peer)| Arc::downgrade(peer))
+                .collect();
+            device.state.lock().unwrap_or_else(|p| p.into_inner()).peers = peers;
+        }
+    }
+
+    /// Note that a move started on this board ([`SimulatorDevice::link_machine`]):
+    /// a board with peers leaves a pending signal for [`Device::send`] to carry
+    /// to them, outside this board's own lock.
+    fn note_move(state: &mut State) {
+        if !state.peers.is_empty() {
+            state.move_pending = true;
+        }
+    }
+
+    /// Carry the move signal to every peer: their armed checks fire, each at
+    /// the clock *it* was armed with, in its own domain — this board's own
+    /// checks already fired where the block was handled
+    /// ([`SimulatorDevice::note_move`]).
+    ///
+    /// Runs with this board's lock released (called from [`Device::send`]): two
+    /// boards stepping at once must not end up holding one lock while asking
+    /// for the other's. The peers fire only their own checks and never forward
+    /// the signal again, so the fan-out is one hop wide.
+    fn forward_move_to_peers(&self) {
+        let peers: Vec<Arc<SimulatorDevice>> = self
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .peers
+            .iter()
+            .filter_map(Weak::upgrade)
+            .collect();
+        for peer in peers {
+            peer.fire_checks_armed_for_the_move();
+        }
+    }
+
+    /// This board's armed checks, tripped by a move that started on a peer:
+    /// the checks fire at their own arm clock (the floor `trigger_if_armed`
+    /// already applies), which is this move's start in this board's domain.
+    fn fire_checks_armed_for_the_move(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let armed_endstop = state.armed.values().any(|armed| !armed.fired);
+        let armed_trigger_analog = state
+            .trigger_analog
+            .as_ref()
+            .is_some_and(|armed| !armed.fired);
+        if !armed_endstop && !armed_trigger_analog {
+            return;
+        }
+        // The sequence the host's last block arrived with, so the frame this
+        // device sends spontaneously carries one it has already seen
+        // (`State::last_host_seq`, the same reason the monitor expiry uses it).
+        let seq = state.last_host_seq;
+        if armed_endstop {
+            let clock = state.endstop_clock;
+            Self::trigger_if_armed(&mut state, seq, clock);
+        }
+        if armed_trigger_analog {
+            let clock = state.ta_homing_clock;
+            Self::trigger_analog_if_armed(&mut state, seq, clock);
+        }
+        self.signal.notify_all();
     }
 
     /// The synthetic clock, in firmware ticks since construction.
@@ -716,12 +810,14 @@ impl SimulatorDevice {
                     state.endstop_clock = state.endstop_clock.max(new_base);
                     Self::trigger_if_armed(state, seq, new_base);
                     Self::trigger_analog_if_armed(state, seq, new_base);
+                    Self::note_move(state);
                 }
                 // `queue_step` is the move itself: also a trigger point.
                 "queue_step" => {
                     let clock = state.endstop_clock;
                     Self::trigger_if_armed(state, seq, clock);
                     Self::trigger_analog_if_armed(state, seq, clock);
+                    Self::note_move(state);
                     if state.firmware_shutdown.is_some() {
                         // The firmware refuses commands after a shutdown
                         // (`sched.c`); the block is still acked by the caller.
@@ -1079,24 +1175,33 @@ impl std::fmt::Debug for SimulatorDevice {
 
 impl Device for SimulatorDevice {
     fn send(&self, frame: &Frame) -> Result<(), InterfaceError> {
-        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        let seq = frame.seq();
-        let payload = frame.payload().to_vec();
-        state.last_host_seq = seq;
-        if !payload.is_empty() {
-            // A window that expired before this block wins over what the block
-            // asks for (the firmware's monitor timer is not part of it), and
-            // one that the block itself arms into is checked again below.
-            Self::fire_monitor_if_expired(&mut state, seq);
-            Self::dispatch(&mut state, seq, payload);
-            Self::fire_monitor_if_expired(&mut state, seq);
+        let move_pending = {
+            let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            let seq = frame.seq();
+            let payload = frame.payload().to_vec();
+            state.last_host_seq = seq;
+            if !payload.is_empty() {
+                // A window that expired before this block wins over what the block
+                // asks for (the firmware's monitor timer is not part of it), and
+                // one that the block itself arms into is checked again below.
+                Self::fire_monitor_if_expired(&mut state, seq);
+                Self::dispatch(&mut state, seq, payload);
+                Self::fire_monitor_if_expired(&mut state, seq);
+            }
+            // Every accepted block is acknowledged by echoing its sequence with an
+            // empty payload; that is what advances the host's send window. The
+            // number is the firmware's counter *after* taking the block
+            // (`command.c:305`), i.e. `seq + 1` — see `respond`.
+            state.out.push_back(Frame::new((seq + 1) & 0xf, Vec::new()));
+            self.signal.notify_all();
+            std::mem::take(&mut state.move_pending)
+        };
+        // A move that started here has to trip the armed checks of the peers
+        // (`link_machine`) — after this board's lock is released, so two boards
+        // stepping at once cannot deadlock on each other.
+        if move_pending {
+            self.forward_move_to_peers();
         }
-        // Every accepted block is acknowledged by echoing its sequence with an
-        // empty payload; that is what advances the host's send window. The
-        // number is the firmware's counter *after* taking the block
-        // (`command.c:305`), i.e. `seq + 1` — see `respond`.
-        state.out.push_back(Frame::new((seq + 1) & 0xf, Vec::new()));
-        self.signal.notify_all();
         Ok(())
     }
 
@@ -1173,19 +1278,33 @@ mod tests {
     // trigger_analog arm/fire
     // -----------------------------------------------------------------------
 
-    /// A device whose parser already knows the corpus dictionary, for tests
-    /// that drive `dispatch` directly instead of running the identify exchange.
-    fn armed_device() -> SimulatorDevice {
-        let device =
-            SimulatorDevice::new(klipperx_test_support::test_dicts_dir().join("atmega2560.dict"))
-                .expect("the corpus dictionary");
+    /// Install the data dictionary into the parser, as the host's identify
+    /// handshake would: from then on the device can answer any command the
+    /// dictionary defines, without running the exchange.
+    fn install_dictionary(device: &SimulatorDevice) {
         let mut state = device.state.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(dictionary) = state.dictionary.take() {
             dictionary
                 .install(&mut state.parser)
                 .expect("install the dictionary");
         }
-        drop(state);
+    }
+
+    /// A device whose parser already knows the corpus dictionary, for tests
+    /// that drive `dispatch` directly instead of running the identify exchange.
+    fn armed_device() -> SimulatorDevice {
+        let device =
+            SimulatorDevice::new(klipperx_test_support::test_dicts_dir().join("atmega2560.dict"))
+                .expect("the corpus dictionary");
+        install_dictionary(&device);
+        device
+    }
+
+    /// [`installed_device`] over `dict`, ready to be linked as one of several
+    /// instances of one machine.
+    fn installed_device(dict: &Path) -> Arc<SimulatorDevice> {
+        let device = Arc::new(SimulatorDevice::new(dict).expect("the dictionary"));
+        install_dictionary(&device);
         device
     }
 
@@ -1661,6 +1780,105 @@ mod tests {
         let (_, args) = queued(&device).expect("an answer");
         assert_eq!(args[2], ArgValue::UInt32(1000));
         assert_eq!(args[3], ArgValue::UInt8(0), "still open");
+    }
+
+    // -----------------------------------------------------------------------
+    // linked instances: two fake boards, one machine (FW6a-2)
+    // -----------------------------------------------------------------------
+
+    /// Encode `name` and feed it to `device` as one host block over the whole
+    /// [`Device::send`] path — unlike [`issue`], which drives the dispatcher
+    /// directly and therefore never runs the peer forward that
+    /// [`SimulatorDevice::link_machine`] hangs off a block.
+    fn host_block(device: &SimulatorDevice, name: &str, args: &[ArgValue]) {
+        let payload = {
+            let state = device.state.lock().unwrap_or_else(|p| p.into_inner());
+            state
+                .parser
+                .encode(name, args)
+                .expect("encode the message")
+                .into_raw()
+        };
+        Device::send(device, &Frame::new(0, payload)).expect("the fake accepts the block");
+    }
+
+    /// The next frame `device` would send, stepping over the empty block acks.
+    fn next_answer(device: &SimulatorDevice) -> Option<(String, Vec<ArgValue>)> {
+        let mut state = device.state.lock().unwrap_or_else(|p| p.into_inner());
+        while let Some(frame) = state.out.pop_front() {
+            if frame.payload().is_empty() {
+                continue;
+            }
+            let decoded = state
+                .parser
+                .decode(Payload::from_raw(frame.payload().to_vec()))
+                .expect("decode the queued frame");
+            return Some((decoded[0].0.name.clone(), decoded[0].1.clone()));
+        }
+        None
+    }
+
+    /// Two instances of one machine: each answers only its own traffic, and a
+    /// move starting on one board trips the endstop armed on the other — the
+    /// stepper-on-A / endstop-on-B shape a single instance cannot express.
+    #[test]
+    fn linked_fake_mcus_forward_the_move_but_nothing_else() {
+        let dict = klipperx_test_support::test_dicts_dir().join("atmega2560.dict");
+        let board_a = installed_device(&dict);
+        let board_b = installed_device(&dict);
+        assert!(
+            !Arc::ptr_eq(&board_a, &board_b),
+            "two instances, not one shared device"
+        );
+        SimulatorDevice::link_machine(&[Arc::clone(&board_a), Arc::clone(&board_b)]);
+
+        // B arms its endstop (oid 1, trsync 2) for a move; the move starts on A.
+        arm_endstop(&board_b, 1, 2, 1000);
+        host_block(
+            &board_a,
+            "reset_step_clock",
+            &[ArgValue::UInt8(0), ArgValue::UInt32(2000)],
+        );
+
+        // B reports the trigger on its own trsync, at *its* arm clock — A's
+        // step clock never crosses the instance boundary.
+        let (name, args) = next_answer(&board_b).expect("B fires the armed check");
+        assert_eq!(name, "trsync_state");
+        assert_eq!(
+            args,
+            vec![
+                ArgValue::UInt8(2),
+                ArgValue::UInt8(0),
+                ArgValue::UInt8(1),
+                ArgValue::UInt32(1001)
+            ]
+        );
+        // A had nothing armed, so it stays silent — only its block ack, which
+        // `next_answer` skips.
+        assert!(next_answer(&board_a).is_none(), "A's checks are its own");
+
+        // Each instance still answers for itself: a query sent to A comes from
+        // A, and B (never asked) says nothing.
+        host_block(&board_a, "get_clock", &[]);
+        let (name, args) = next_answer(&board_a).expect("A answers its own query");
+        assert_eq!(name, "clock");
+        assert!(matches!(args.as_slice(), [ArgValue::UInt32(_)]));
+        assert!(next_answer(&board_b).is_none(), "B was not queried");
+
+        // Unlinked, the same shape is silent again: the forward only ever runs
+        // between instances a test explicitly joined.
+        let solo = installed_device(&dict);
+        let lonely = installed_device(&dict);
+        arm_endstop(&lonely, 1, 5, 4000);
+        host_block(
+            &solo,
+            "reset_step_clock",
+            &[ArgValue::UInt8(0), ArgValue::UInt32(2000)],
+        );
+        assert!(
+            next_answer(&lonely).is_none(),
+            "unlinked instances do not hear each other's moves"
+        );
     }
 
     // -----------------------------------------------------------------------

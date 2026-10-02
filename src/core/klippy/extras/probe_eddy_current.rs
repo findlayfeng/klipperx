@@ -6,6 +6,7 @@
 //! | here | upstream |
 //! |---|---|
 //! | [`EddyCalibration`] | `EddyCalibration` (the `calibrate = z:freq,…` table, `freq_to_height` / `height_to_freq`) |
+//! | [`DriftCompensation`] and [`EddyCalibration::register_drift_compensation`] | the `drift_comp` chain: upstream's `DummyDriftCompensation` default, the duck-typed helper, and the registration `temperature_probe` drives (`:18-54`, `:1073-1074`) |
 //! | [`EddyGatherSamples`] | `EddyGatherSamples` (samples in a time window → one probe result) |
 //! | [`PrinterEddyProbe`] | `PrinterEddyProbe` — registered as **`probe`**, dispatching `METHOD` over descend / tap / scan sessions |
 //! | [`EddyTapCalibration`] | `EddyTapCalibration` (`PROBE_EDDY_CURRENT_TAP_CALIBRATE`) |
@@ -120,6 +121,30 @@ fn bisect_right(ascending: &[f64], needle: f64) -> usize {
 // Calibration
 // ===========================================================================
 
+/// Upstream's duck-typed `drift_comp` (`probe_eddy_current.py:18-54`): what
+/// [`EddyCalibration`] asks of the temperature drift helper that
+/// `temperature_probe` builds (`EddyDriftCompensation`,
+/// `temperature_probe.py:479+`).
+///
+/// Before anything registers one, upstream serves these calls from
+/// `DummyDriftCompensation` (`probe_eddy_current.py:19-28`): pass the
+/// frequency through, report `0.` temperature. Here that default is the
+/// `None` around the registered `Arc` — every forwarding method falls back to
+/// exactly what the dummy does.
+pub trait DriftCompensation: Send + Sync {
+    /// The temperature the corrections are read at (`get_temperature`).
+    fn get_temperature(&self) -> f64;
+
+    /// Move a frequency measured at `origin_temp` (or now, when it is `None`)
+    /// toward the calibration temperature (`adjust_freq(freq, temp=None)`).
+    fn adjust_freq(&self, freq: f64, origin_temp: Option<f64>) -> f64;
+
+    /// Move a frequency that belongs to the calibration temperature out to
+    /// `dest_temp` (or now, when it is `None`)
+    /// (`unadjust_freq(freq, temp=None)`).
+    fn unadjust_freq(&self, freq: f64, dest_temp: Option<f64>) -> f64;
+}
+
 /// The frequency→height table (`probe_eddy_current.EddyCalibration`), storage
 /// for the `calibrate = z:freq,z:freq,…` option and the two conversions every
 /// session runs samples through.
@@ -129,6 +154,10 @@ pub struct EddyCalibration {
     /// The height belonging to [`Self::cal_freqs`] at the same index
     /// (descending: frequency falls as the probe rises).
     cal_zpos: Vec<f64>,
+    /// The registered drift helper (`self.drift_comp`); `None` is upstream's
+    /// `DummyDriftCompensation` standing in until `temperature_probe`
+    /// registers the real one.
+    drift_comp: Mutex<Option<Arc<dyn DriftCompensation>>>,
 }
 
 impl EddyCalibration {
@@ -137,6 +166,7 @@ impl EddyCalibration {
         let mut calibration = Self {
             cal_freqs: Vec::new(),
             cal_zpos: Vec::new(),
+            drift_comp: Mutex::new(None),
         };
         let Some(raw) = config.get_str("calibrate") else {
             return Ok(calibration);
@@ -178,7 +208,46 @@ impl EddyCalibration {
         Self {
             cal_freqs: pairs.iter().map(|(f, _)| *f).collect(),
             cal_zpos: pairs.iter().map(|(_, z)| *z).collect(),
+            drift_comp: Mutex::new(None),
         }
+    }
+
+    /// Hand the table the temperature drift helper `temperature_probe` built
+    /// (`register_drift_compensation`, `probe_eddy_current.py:53-54`). Any
+    /// previously registered helper is replaced, as upstream's assignment is.
+    pub fn register_drift_compensation(&self, comp: Arc<dyn DriftCompensation>) {
+        *self.drift_comp.lock().unwrap_or_else(|p| p.into_inner()) = Some(comp);
+    }
+
+    /// The registered helper (`self.drift_comp`), `None` while the dummy
+    /// stands in.
+    fn drift_comp(&self) -> Option<Arc<dyn DriftCompensation>> {
+        self.drift_comp
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    /// The helper's temperature (`drift_comp.get_temperature()`), `0.` with
+    /// none — the dummy's answer (`probe_eddy_current.py:20-21`).
+    fn drift_temperature(&self) -> f64 {
+        self.drift_comp()
+            .map(|comp| comp.get_temperature())
+            .unwrap_or(0.)
+    }
+
+    /// `drift_comp.adjust_freq(freq, temp)`, or `freq` with no helper.
+    fn adjust(&self, freq: f64, origin_temp: Option<f64>) -> f64 {
+        self.drift_comp()
+            .map(|comp| comp.adjust_freq(freq, origin_temp))
+            .unwrap_or(freq)
+    }
+
+    /// `drift_comp.unadjust_freq(freq, temp)`, or `freq` with no helper.
+    fn unadjust(&self, freq: f64, dest_temp: Option<f64>) -> f64 {
+        self.drift_comp()
+            .map(|comp| comp.unadjust_freq(freq, dest_temp))
+            .unwrap_or(freq)
     }
 
     /// More than two points, or a refusal (`verify_calibrated`).
@@ -194,16 +263,33 @@ impl EddyCalibration {
         (self.cal_freqs.clone(), self.cal_zpos.clone())
     }
 
-    /// Fill each row's `z` from its `frequency` (`apply_calibration`).
+    /// Fill each row's `z` from its `frequency` (`apply_calibration`,
+    /// `probe_eddy_current.py:61-79`): the frequency is adjusted toward the
+    /// current temperature **once** — `cur_temp =
+    /// drift_comp.get_temperature()` — before the table is read, and the row
+    /// keeps its original frequency.
     pub fn apply_calibration(&self, data: &mut [[f64; 3]]) {
+        let cur_temp = self.drift_temperature();
         for row in data.iter_mut() {
-            row[2] = self.freq_to_height(row[1]);
+            let adj_freq = self.adjust(row[1], Some(cur_temp));
+            row[2] = round6(self.table_height(adj_freq));
         }
     }
 
-    /// Frequency → height (`freq_to_height`): piecewise-linear between the
-    /// bracketing calibration points, `[±OUT_OF_RANGE]` outside them.
+    /// Frequency → height (`freq_to_height`): the adjusted frequency walked
+    /// through the table — upstream sends a one-row sample through
+    /// `apply_calibration` (`probe_eddy_current.py:80-83`), so the helper's
+    /// temperature is read once for the one row.
     pub fn freq_to_height(&self, freq: f64) -> f64 {
+        let cur_temp = self.drift_temperature();
+        let adj_freq = self.adjust(freq, Some(cur_temp));
+        round6(self.table_height(adj_freq))
+    }
+
+    /// The table walk itself (`freq_to_height`'s interpolation):
+    /// piecewise-linear between the bracketing calibration points,
+    /// `[±OUT_OF_RANGE]` outside them.
+    fn table_height(&self, freq: f64) -> f64 {
         let pos = bisect_right(&self.cal_freqs, freq);
         let zpos = if pos >= self.cal_zpos.len() {
             -OUT_OF_RANGE
@@ -218,12 +304,14 @@ impl EddyCalibration {
             let offset = prev_zpos - prev_freq * gain;
             freq * gain + offset
         };
-        round6(zpos)
+        zpos
     }
 
-    /// Height → frequency (`height_to_freq`): the same interpolation walked
-    /// the other way; an uncalibrated height is an error
-    /// ("Invalid probe_eddy_current height").
+    /// Height → frequency (`height_to_freq`, `probe_eddy_current.py:84-99`):
+    /// the same interpolation walked the other way, then handed to
+    /// `drift_comp.unadjust_freq` with no destination — the *current*
+    /// temperature, as upstream passes nothing (`:99`); an uncalibrated
+    /// height is an error ("Invalid probe_eddy_current height").
     pub fn height_to_freq(&self, height: f64) -> Result<f64, CommandError> {
         // The table is ascending in frequency = descending in height, so the
         // reversed views are ascending in height.
@@ -239,7 +327,7 @@ impl EddyCalibration {
         let prev_zpos = rev_zpos[pos - 1];
         let gain = (this_freq - prev_freq) / (this_zpos - prev_zpos);
         let offset = prev_freq - prev_zpos * gain;
-        Ok(height * gain + offset)
+        Ok(self.unadjust(height * gain + offset, None))
     }
 }
 
@@ -1505,6 +1593,14 @@ impl PrinterEddyProbe {
         self.sensor.add_client(client);
     }
 
+    /// Give the probe `temperature_probe`'s drift helper
+    /// (`PrinterEddyProbe.register_drift_compensation`,
+    /// `probe_eddy_current.py:1073-1074`): every frequency the table converts
+    /// is adjusted through it from here on.
+    pub fn register_drift_compensation(&self, comp: Arc<dyn DriftCompensation>) {
+        self.calibration.register_drift_compensation(comp);
+    }
+
     /// The section identifier.
     pub fn identifier(&self) -> &str {
         &self.identifier
@@ -1647,5 +1743,157 @@ impl EddyTapCalibration {
         let z = positions.first().map(Coord::z).ok_or_else(state_error)?;
         gcmd.respond_info(&format!("Tap probing reports z={z:.6}"));
         Ok(())
+    }
+}
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Which way a [`RecordingDrift`] call came in.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Direction {
+        Adjust,
+        Unadjust,
+    }
+
+    /// A drift helper that shifts every frequency by `add` and writes down
+    /// each call — the registered stand-in for `temperature_probe`'s
+    /// `EddyDriftCompensation`.
+    struct RecordingDrift {
+        temperature: f64,
+        add: f64,
+        calls: Mutex<Vec<(Direction, f64, Option<f64>)>>,
+    }
+
+    impl RecordingDrift {
+        fn new(temperature: f64, add: f64) -> Self {
+            Self {
+                temperature,
+                add,
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        /// Every call recorded, in order.
+        fn calls(&self) -> Vec<(Direction, f64, Option<f64>)> {
+            self.calls.lock().unwrap_or_else(|p| p.into_inner()).clone()
+        }
+    }
+
+    impl DriftCompensation for RecordingDrift {
+        fn get_temperature(&self) -> f64 {
+            self.temperature
+        }
+
+        fn adjust_freq(&self, freq: f64, origin_temp: Option<f64>) -> f64 {
+            self.calls.lock().unwrap_or_else(|p| p.into_inner()).push((
+                Direction::Adjust,
+                freq,
+                origin_temp,
+            ));
+            freq + self.add
+        }
+
+        fn unadjust_freq(&self, freq: f64, dest_temp: Option<f64>) -> f64 {
+            self.calls.lock().unwrap_or_else(|p| p.into_inner()).push((
+                Direction::Unadjust,
+                freq,
+                dest_temp,
+            ));
+            freq + self.add
+        }
+    }
+
+    /// The table the tests convert through: frequency 1000/800/600 at Z 0/1/2
+    /// (sorted ascending by frequency, as `read` stores it).
+    fn table() -> EddyCalibration {
+        EddyCalibration::from_pairs(&[(1000., 0.), (800., 1.), (600., 2.)])
+    }
+
+    /// With nothing registered the conversions are the plain table — upstream's
+    /// `DummyDriftCompensation` passes frequencies through and reports `0.`
+    /// temperature, so the result is byte-for-byte the pre-drift behaviour.
+    #[test]
+    fn without_a_registered_helper_the_table_walks_alone() {
+        let calibration = table();
+        // Between 600 (Z 2) and 800 (Z 1): -0.005·f + 5 = 1.5.
+        assert_eq!(calibration.freq_to_height(700.), 1.5);
+        // The other direction: Z 1 sits at exactly 800.
+        assert_eq!(calibration.height_to_freq(1.0).expect("in range"), 800.);
+        // `apply_calibration` fills the z column and keeps the frequency.
+        let mut rows = [[0., 700., 99.]];
+        calibration.apply_calibration(&mut rows);
+        assert_eq!(rows[0], [0., 700., 1.5]);
+        // The dummy's temperature: the drift path is a pass-through, so a
+        // helper that never gets asked shows no calls at all.
+        assert_eq!(calibration.drift_temperature(), 0.);
+    }
+
+    /// `apply_calibration` runs each frequency through `adjust_freq` at the
+    /// helper's *current* temperature — read once per call — before the table,
+    /// and leaves the row's own frequency untouched
+    /// (`probe_eddy_current.py:61-79`).
+    #[test]
+    fn apply_calibration_adjusts_through_the_registered_helper() {
+        let calibration = table();
+        let drift = Arc::new(RecordingDrift::new(42., 100.));
+        calibration.register_drift_compensation(Arc::clone(&drift) as Arc<dyn DriftCompensation>);
+
+        let mut rows = [[0., 700., 99.]];
+        calibration.apply_calibration(&mut rows);
+        // 700 + 100 = 800, which the table maps to Z 1.0 (unadjusted: 1.5).
+        assert_eq!(rows[0][2], 1.0);
+        // The row keeps the frequency the sensor measured.
+        assert_eq!(rows[0][1], 700.);
+        // The helper was asked at the temperature it reported — read once for
+        // the whole call, as upstream's `cur_temp` is.
+        assert_eq!(drift.calls(), vec![(Direction::Adjust, 700., Some(42.))]);
+    }
+
+    /// `height_to_freq` hands its table result to `unadjust_freq` with **no**
+    /// destination temperature — the current one, upstream's `:99`.
+    #[test]
+    fn height_to_freq_unadjusts_through_the_registered_helper() {
+        let calibration = table();
+        let drift = Arc::new(RecordingDrift::new(42., 100.));
+        calibration.register_drift_compensation(Arc::clone(&drift) as Arc<dyn DriftCompensation>);
+
+        // Z 1 → table 800, then +100.
+        assert_eq!(calibration.height_to_freq(1.0).expect("in range"), 900.);
+        assert_eq!(drift.calls(), vec![(Direction::Unadjust, 800., None)]);
+        // And the helper's temperature is what `adjust` sees through
+        // `freq_to_height`.
+        assert_eq!(calibration.freq_to_height(700.), 1.0);
+        assert_eq!(drift.calls()[1], (Direction::Adjust, 700., Some(42.)));
+    }
+
+    /// A second registration replaces the first, as upstream's assignment
+    /// does (`probe_eddy_current.py:54`).
+    #[test]
+    fn registering_a_helper_replaces_the_previous_one() {
+        let calibration = table();
+        calibration.register_drift_compensation(Arc::new(RecordingDrift::new(42., 0.)));
+        let drift = Arc::new(RecordingDrift::new(42., 100.));
+        calibration.register_drift_compensation(Arc::clone(&drift) as Arc<dyn DriftCompensation>);
+
+        assert_eq!(calibration.freq_to_height(700.), 1.0);
+        assert_eq!(drift.calls().len(), 1);
+    }
+
+    /// Outside the table the sentinel heights still apply after adjustment —
+    /// the helper moves the frequency, the range check stays the table's.
+    #[test]
+    fn adjustment_does_not_move_the_out_of_range_guards() {
+        let calibration = table();
+        calibration.register_drift_compensation(Arc::new(RecordingDrift::new(42., 100.)));
+        // 1200 + 100 = 1300: past the top of the table → -OUT_OF_RANGE.
+        assert_eq!(calibration.freq_to_height(1200.), -OUT_OF_RANGE);
+        // 100 + 100 = 200: below the bottom → +OUT_OF_RANGE.
+        assert_eq!(calibration.freq_to_height(100.), OUT_OF_RANGE);
     }
 }

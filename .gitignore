@@ -2,4 +2,6 @@
 
 # Local debug configuration, not part of the tree.
 /config.cfg
-src/core/klippy/upstream_generated/
+src/core/klippy/upstream_generated/cases/
+src/core/klippy/upstream_generated/fixtures/
+src/core/klippy/upstream_generated/mod.rs

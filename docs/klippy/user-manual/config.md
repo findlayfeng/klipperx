@@ -558,10 +558,11 @@ max_temp: 300
 ### `[temperature_probe <name>]` — 探针温度传感器（eddy 漂移补偿的温度通道）
 
 内层先按 `sensor_type` 建一个普通传感器（与 `[temperature_sensor]` 同一 `heaters` 工厂机制），
-本节再把它包成可 `objects/query` 的对象 `temperature_probe <name>`。**A 核心已落地**
-（2026-10-03，`f6ea201`）；标定命令族（`TEMPERATURE_PROBE_*`）与 eddy 漂移补偿
-（`EddyDriftCompensation`）待后续单元——落地前 `get_status` 的 `in_calibration` 与
-`compensation_enabled` 恒 `false`。
+本节再把它包成可 `objects/query` 的对象 `temperature_probe <name>`。核心与标定命令族
+均已落地（A `f6ea201`、B `dfaf418`——`calibration_position` / `calibration_bed_temp` /
+`calibration_extruder_temp` / `extruder_heating_z` / `resting_z` / `horizontal_move_z` / `speed`
+由 `TEMPERATURE_PROBE_*` 命令族消费）；eddy 漂移补偿（`EddyDriftCompensation`，C 单元）
+待排——落地前 `get_status` 的 `compensation_enabled` 恒 `false`。
 
 | 参数 | 类型 | 必需 | 默认值 | 说明 |
 |------|------|------|--------|------|

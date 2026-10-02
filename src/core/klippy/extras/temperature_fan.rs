@@ -25,7 +25,10 @@
 //!   against the sensor's report period (`speed_delay`). The [`Sensor`](crate::core::klippy::extras::heaters::Sensor)
 //!   interface here does not carry a report period, so every computed speed is
 //!   written; the `Fan` core itself already drops an unchanged request.
-//! * Print-time scheduling of the write — C1d, see [`fan`](crate::core::klippy::extras::fan).
+//! * The explicit `speed_time` upstream's `set_tf_speed` passes
+//!   (`temperature_fan.py:60-63`, `read_time + speed_delay`) — this port calls
+//!   `Fan::set_speed` and lets the core date the write. (The `Fan` core has
+//!   been queue-wired since 2026-10-03; only this explicit delay is absent.)
 
 use std::sync::{Arc, Mutex, MutexGuard};
 

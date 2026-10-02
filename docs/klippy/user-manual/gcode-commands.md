@@ -354,6 +354,7 @@ M107
 - `M106` 的 `S` 默认 `255`、下限 `0`、**没有上限**（真正封顶的是 `max_power`），内部除以 255
   得到占空比；
 - `M107` 等价于 `M106 S0`。
+- 速度变更**按打印时间生效**（有 `[printer]` 即 toolhead 在时）：经 `GCodeRequestQueue` 钉到前瞻时刻，flush 时落 PWM，kick-start 尾巴作为队列请求重跑；无 toolhead 或资源无法定时则立即生效（两条兑底，兑底时 kick 才用 `call_later`）。
 
 ---
 

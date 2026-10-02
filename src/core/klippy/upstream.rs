@@ -435,7 +435,7 @@ mod tests {
     // `SHOULD_FAIL` flag frozen in as literals — no `.test` file is scanned at
     // run time. Cases whose dictionary is not built, or whose config is on the
     // `IGNORED` list, are emitted with `#[ignore]` (run with `cargo test
-    // --ignored`). The generated functions are named `upstream_<stem>__
+    // --ignored`). The generated functions are named `upstream_<stem>_
     // config_<idx>_<cfg>` so the `upstream_` prefix marks every generated case
     // and the `<stem>` segment records which `.test` file it came from,
     // distinguishing them from the hand-written tests below (`a_*`,

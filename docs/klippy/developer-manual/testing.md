@@ -383,7 +383,7 @@ git config core.hooksPath .githooks
 四处解析器分歧（多行值、`=` 分隔、节头行内注释、`;` 行内注释）已修复，并各有单测。
 
 端到端执行由 `test-support/build.rs` 在 test 构建时生成：扫描 `test/klippy/*.test`，为每个 `CONFIG` 块
-生成一个独立 `#[test]`（命名 `upstream_<stem>__config_<n>_<cfg>`），config 路径 / 字典路径 / g-code /
+生成一个独立 `#[test]`（命名 `upstream_<stem>_config_<n>_<cfg>`），config 路径 / 字典路径 / g-code /
 `SHOULD_FAIL` 标志全固化在生成代码里。每个 `[mcu]` 换成 `test: dict=<字典>`，由
 `interface/devices/simulator.rs` 的字典驱动应答机跑真实协议路径（identify、配置握手、时钟、ack）。
 激活单位是「按 `CONFIG` 拆出的**运行**」，启用条件是**该运行声明的全部字典都已构建**：架构列表

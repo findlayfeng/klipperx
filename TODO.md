@@ -74,7 +74,7 @@ H1–H12 是上游 extras 里按域归并的消费者（2026-09-21 全量盘点�
 | G1b | gcode 调度器与上游的行为差异（`get_mutex` 等价物等；`GCodeIO` 暂缓 `[~]`；参数访问器与 `M115`/`Coord`/`request_restart` 已完成并归档） | C1 |
 | G2b | 用 GCODE 控制 GPIO：数字/PWM 驱动与 `SET_PIN` **已落地**；「随打印时间生效的请求队列」（上游 `GCodeRequestQueue`）**已移植并接入 `output_pin`**；余项＝`output_pin` 的 `static_value`/`template`，以及 `fan`/`servo`/`pwm_tool` 切到同一队列 | —（C1 已收官，不再是前置） |
 | G4 | 运动命令（G0/G1/G28…） | G1、C1 |
-| B4 | 其余端点（pause_resume / `*/dump_*` / …；estop 与 remote method 已落地） | G3、H4、H9 |
+| B4 | 其余端点（`bed_mesh/dump_mesh` / `*/dump_*` / …；estop、remote method 与 `pause_resume/*` 已落地） | G3、H4、H9 |
 
 **上游 extras 消费者**（详见「上游 extras 覆盖盘点」）
 
@@ -201,7 +201,7 @@ toolhead / 开放事件）一起补，一部分是现在就独立可补的小行
 `api-reference.md` 有、`endpoints/mod.rs` 的表里标「not started」的其余部分，各自等它读的
 对象先存在：
 
-- [ ] `pause_resume/{pause,resume,cancel}`：对象与四条命令已落地（批 #15），仍缺 webhook 端点注册层。
+- [ ] `bed_mesh/dump_mesh` 与其余 `*/dump_*`（mux 机制已就绪，实例随各自 extras 落地）。
 
 ### F MCU 基础资源（F6、F8、F9）
 
@@ -378,7 +378,7 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 
 - [x] `virtual_sdcard.py`：主机侧文件打印、`M20`–`M27`/`SDCARD_RESET_FILE`/`SDCARD_PRINT_FILE`、`work_handler` 回放、进度（**2026-10-02**；省略 `gcode.get_mutex().test()` 让出、`_handle_analyze_shutdown`/`_handle_debuginput_exit`/`stats`，`path` 不做 `expanduser`/`normpath`）。
 - [x] `print_stats.py`（**2026-10-02**；省略 `_handle_activate_extruder`，事件未 fire）、`display_status.py`（`M73`/`M117`）。
-- [x] `pause_resume.py` 的节与 `PAUSE`/`RESUME`/`CLEAR_PAUSE`/`CANCEL_PRINT`（批 #15）；- [ ] 三个端点（见 **B4**）。
+- [x] `pause_resume.py` 的节、四条命令与 `pause_resume/*` 三个端点（批 #15 + 2026-10-03）。
 - [ ] `exclude_object.py`（段+四命令落地，**2026-09-24 批 #4 随引擎转绿**，含排除区 E 补偿）、`sdcard_loop.py`（段已落地，`SDCARD_LOOP_*` 命令与文件回放未接）、`firmware_retraction.py`（G10/G11，**批 #32 已落地**）。
 - 依赖 F9（固件 `sdiocmds.c` 的 sdcard 资源）、C1（`gcode_move` 的位置恢复）。
 

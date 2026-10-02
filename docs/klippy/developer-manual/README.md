@@ -314,7 +314,7 @@ identify 的命令**定义**（名称、参数、解码）与其它命令一样�
 | `adxl345.rs` + `cmd/adxl345.rs` | `[adxl345]` 加速度计（SPI、`axes_map`、`rate` 默认 3200）与 `adxl345/dump_adxl345` 端点（wave-2）；bulk 数据通路待共享泛化 |
 | `mpu9250.rs` + `cmd/mpu9250.rs` | `[mpu9250]` 加速度计（I2C、默认 0x68/400k、`rate` 4000）与 `mpu9250/dump_mpu9250`（wave-2）；同上的 bulk gap |
 | `filament_switch_sensor.rs` + `filament_motion_sensor.rs` + `buttons.rs` | 断料检测两段与 `[buttons]` 依赖对象（wave-2，`extruders.test` 转绿即其验收） |
-| `pause_resume.rs` | `[pause_resume]` 节与 `PAUSE`/`RESUME`/`CLEAR_PAUSE`/`CANCEL_PRINT`（批 #15）；`pause_resume/*` 三个 webhooks 端点未注册；`virtual_sdcard` 的 `do_pause`/`do_resume`/`do_cancel` 已实现，`is_sd_active` 现可达（`is_active` 反映回放 task） |
+| `pause_resume.rs` | `[pause_resume]` 节与 `PAUSE`/`RESUME`/`CLEAR_PAUSE`/`CANCEL_PRINT`（批 #15）；`pause_resume/*` 三个 webhooks 端点已注册（2026-10-03，`api/endpoints/pause_resume.rs`）；`virtual_sdcard` 的 `do_pause`/`do_resume`/`do_cancel` 已实现，`is_sd_active` 现可达（`is_active` 反映回放 task） |
 | `heater_fan.rs` | `[heater_fan <name>]`：`Fan` 核心 + `klippy:ready` 起的每秒 tick，任一 heater 有 target 或温度 > `heater_temp` 即为 `fan_speed`，**仅速度变化时写 PWM**（批 #6；`printers.test` 的 run 级收益） |
 | `fan_generic.rs` | `[fan_generic <name>]`：全部选项交给 `Fan` 核心（`shutdown_speed` 默认 **0.0**），注册 mux 命令 `SET_FAN_SPEED FAN=<name>`；`TEMPLATE=` 分支明确拒绝（模板引擎已存在于 `extras/template.rs`，但这条缝未接，批 #18） |
 | `safe_z_home.rs` | `[safe_z_home]`：接管 G28（Z-hop → 按需 `X0 Y0` → 安全位 → `Z0`）；`section!(order = 70, phase = late)` **必须晚于 toolhead（`printer`，order 60 late）**，否则 `unregister_command("G28")` 得 `None`；与 `[homing_override]` 互斥（批 #6） |
@@ -371,7 +371,7 @@ identify 的命令**定义**（名称、参数、解码）与其它命令一样�
 | 文件 | 职责 |
 |------|------|
 | `mod.rs` | 说明主机侧与 API 的分界，把 `klippy-api` 的四个模块转出，并提供 `register`：一次把服务器这一侧（`webhooks` + 端点）装到机器上。端点来自各模块 `endpoint!` 声明生成的安装函数表（[声明式表生成](codegen.md)），`register` 只负责先装 `webhooks` 再遍历该表；mux 注册在建表这一刻从 `webhooks` 的 pending **抽干一次**（此后模块直连表）——所以 `register` 每进程只调一次，`Api`/`Server` 不重建 |
-| `endpoints/` | 一个端点一个文件：`info.rs`、`emergency_stop.rs`、`objects_list.rs`、`objects_query.rs`、`objects_subscribe.rs`、`gcode.rs`、`query_endstops.rs`、`register_remote_method.rs`（共 12 条注册路径 + 内建 `list_endpoints` = 13 条，见 `api/mod.rs` 的测试断言）；参数、响应形状、handler 与安装函数都在各文件里。`objects/query` 与 `objects/subscribe` 共用字段选择（`select_fields` / `status_object`），`gcode/*` 按请求从 `printer` 里取 `gcode`（例外：`gcode/restart` / `gcode/firmware_restart` 在 `gcode` 缺席时直接 `request_exit`，让配置没装载成功时仍能重启）。未实现的表面（`pause_resume/*`、`bed_mesh/dump_mesh`、其余 `*/dump_*`）见 `endpoints/mod.rs` 的状态表 |
+| `endpoints/` | 一个端点一个文件：`info.rs`、`emergency_stop.rs`、`objects_list.rs`、`objects_query.rs`、`objects_subscribe.rs`、`gcode.rs`、`query_endstops.rs`、`register_remote_method.rs`、`pause_resume.rs`（共 15 条注册路径 + 内建 `list_endpoints` = 16 条，见 `api/mod.rs` 的测试断言）；参数、响应形状、handler 与安装函数都在各文件里。`objects/query` 与 `objects/subscribe` 共用字段选择（`select_fields` / `status_object`），`gcode/*` 按请求从 `printer` 里取 `gcode`（例外：`gcode/restart` / `gcode/firmware_restart` 在 `gcode` 缺席时直接 `request_exit`，让配置没装载成功时仍能重启）。未实现的表面（`bed_mesh/dump_mesh`、其余 `*/dump_*`）见 `endpoints/mod.rs` 的状态表 |
 | `webhooks.rs` | 服务器自己的打印机对象：名字与字段对齐上游 `webhooks.get_status`，读的是机器状态；同时是 mux 表的生命周期驱动者——初始装载缓冲 `pending`、`api::register` 只抽干一次、`set_api` 后直连注册、`release_cycles`（teardown）时 `clear_mux()`，两条路径共用 `check_mux_conflict` 的检查与文案 |
 | `start_args.rs` | 主机启动参数（`config_file` / `log_file` / `software_version` / `cpu_info`）：上游放在 printer 上（29 处 `get_start_args`），这里归主机侧，`info` 是第一个消费者 |
 

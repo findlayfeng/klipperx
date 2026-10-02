@@ -232,7 +232,7 @@ git config core.hooksPath .githooks
 | （主机侧）`endpoints/info.rs` | 端点路径、`client_info` 可省略且必须是对象、响应 12 个字段与文档逐个对齐、`log_file` 为 `None` 时是 `null` 而非缺字段、响应不回显 `client_info`；**handler**：状态跟着机器（`startup`→`shutdown`）、四个 start args 与 `process_id` 真的进响应、`klipper_path` / `python_path` 非空且确实不存在 |
 | （主机侧）`api/start_args.rs` | CPU 描述的解析（processor 计数 + model name、缺 model 时问号）、`collect` 带上配置路径 / 版本、`log_file` 为 `None` |
 | （主机侧）`api/webhooks.rs` | 对象名是 `webhooks`、对象报的就是打印机状态（`startup` / `ready` / `shutdown` 三种都跟得上，因为它是读状态而不是存状态）；**mux 表生命周期**：`set_api` 后注册直连 `Api`（无需 drain）、`Printer::teardown` 经 `release_cycles` 清表并 `detach`，随后同 `(path, value)` 可重新注册（`test_a_registration_after_set_api_reaches_the_table_and_teardown_clears_it`）；两条装载路径的冲突检查与文案一致（`test_a_conflict_after_set_api_uses_the_same_message`） |
-| （主机侧）`api/mod.rs` | `register` 一次装完服务器这一侧：装完 `objects/list` 含 `webhooks`、端点表含 13 条路径（`info` / `emergency_stop` / `list_endpoints` / `objects/*` / 五个 `gcode/*` / `query_endstops/status` / `register_remote_method`）；装完后客户端能按名查到 `info`、能按名查到 `webhooks` 并跟着状态变；**重复注册报错**且归为「自己接错线」的 `RegistrationError`（不是客户端能引起的错误） |
+| （主机侧）`api/mod.rs` | `register` 一次装完服务器这一侧：装完 `objects/list` 含 `webhooks`、端点表含 16 条路径（`info` / `emergency_stop` / `list_endpoints` / `objects/*` / 五个 `gcode/*` / `query_endstops/status` / `register_remote_method` / `pause_resume/*`）；装完后客户端能按名查到 `info`、能按名查到 `webhooks` 并跟着状态变；**重复注册报错**且归为「自己接错线」的 `RegistrationError`（不是客户端能引起的错误） |
 | （主机侧）`endpoints/objects_list.rs` | 端点路径、没有组成部分的机器列表为空、按注册顺序列出多个对象、不看参数（上游的 handler 不读任何参数） |
 | （主机侧）`endpoints/objects_query.rs` | 端点路径、`null` 取全部字段 / 列表取指定字段 / 不存在的字段回 `null`、未知对象回 `{}`（不报错）、对象名与应答的 `eventtime` 一致且真的传给了源、服务器那个 `webhooks` 对象随机器 `startup`→`ready`→`shutdown` 变化、`objects` 缺失 / 非对象 / 值非 `null` 或字符串数组分别报三种错（文本对齐上游的 `Invalid argument`）、空字段列表取空、一次查询多个对象、空 `objects` 是空 `status` |
 | （主机侧）`endpoints/objects_subscribe.rs` | 订阅请求**立即**回一份全量快照（所有请求字段都返回）、0.25 s 后只推变化的字段、无变化不推、`response_template` 包住每次推送、`null` 字段列表展开为对象当时的字段、字段从缺到有会推而一直缺不推、未知对象回 `{}` 且不推、连接关闭后下一 tick 清理并自行停掉定时器（再没有 tick）、同一连接再订阅是替换不是追加、一个定时器服务多个订阅者、注册表按路径可达、参数校验与 `objects/query` 一致、`response_template` 非对象被拒 |
@@ -241,6 +241,7 @@ git config core.hooksPath .githooks
 | （主机侧）`endpoints/emergency_stop.rs` | 请求把打印机停机并回 `{}`（上游 `emergency_stop` 语义） |
 | （主机侧）`endpoints/query_endstops.rs` | 路径是上游那条 `query_endstops/status`；无 endstop 时回空对象 |
 | （主机侧）`endpoints/register_remote_method.rs` | 注册的方法收到模板与参数；`response_template` 可选；缺 `remote_method` 报参数错；只推给注册的那条连接 |
+| （主机侧）`endpoints/pause_resume.rs` | 三条路径名与文档一致（`test_the_paths_are_the_documented_ones`）、`install` 注册三端点、`pause`/`resume`/`cancel` 各自跑对应命令并回 `{}`、`gcode` 分发器未注册时报告打印机状态、未装载 `[pause_resume]` 节时以 `// Unknown command:…` 输出行安静应答且端点仍回 `{}`（共 7 测） |
 
 ### `klippy-client`
 

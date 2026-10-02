@@ -64,12 +64,12 @@
 
 ## 端点列表
 
-> **实现状态**（截至 2026-09-24，权威清单见主机侧 `api/endpoints/mod.rs` 的状态表）：
-> 下文第 1–12、16 节（`info` / `emergency_stop` / `list_endpoints` / `register_remote_method` /
-> `objects/*` / 五个 `gcode/*` / `query_endstops/status`）**已实现**；第 13–15 节
-> （`pause_resume/*`）与第 17–18 节（`bed_mesh/dump_mesh`、`*/dump_*`）**部分落地**——截至
-> 2026-09-25（批 #15）：`pause_resume` 对象与 `[buttons]` 最小实现已落地，且 `[pause_resume]` 节注册了
-> `PAUSE`/`RESUME`/`CLEAR_PAUSE`/`CANCEL_PRINT` 四条命令；但 `pause_resume/*` 端点仍未注册；`*/dump_*` 的 mux 机制与 `ldc1612` / `adxl345` / `mpu9250` / `load_cell`（`dump_force`）四个消费者已落地（实例随配置重载注销并在下一轮重新注册，旧连接不再收到推送），
+> **实现状态**（截至 2026-10-03，权威清单见主机侧 `api/endpoints/mod.rs` 的状态表）：
+> 下文第 1–16 节（`info` / `emergency_stop` / `list_endpoints` / `register_remote_method` /
+> `objects/*` / 五个 `gcode/*` / `query_endstops/status` / `pause_resume/*`）**已实现**；
+> 第 17–18 节（`bed_mesh/dump_mesh`、`*/dump_*`）**部分落地**——`pause_resume` 对象与
+> `[pause_resume]` 节的四条命令（批 #15）以及 `pause_resume/*` 三个端点（2026-10-03）均已落地；
+> `*/dump_*` 的 mux 机制与 `ldc1612` / `adxl345` / `mpu9250` / `load_cell`（`dump_force`）四个消费者已落地（实例随配置重载注销并在下一轮重新注册，旧连接不再收到推送），
 > `bed_mesh/dump_mesh` 与其余 dump 端点随各自的 extras 落地。调用未实现的端点会得到 `unknown method` 错误。本文描述的是目标形状，
 > 实现随模块推进。
 
@@ -446,6 +446,12 @@
 
 ## Pause/Resume 相关端点
 
+> 三个端点的请求都没有参数，响应都是 `{}`，与上游 `pause_resume.py:47-52` 的 handler 一致
+> （上游没有 `silent` 参数）。`PAUSE`/`RESUME`/`CANCEL_PRINT` 产生的 `action:*` 输出行不走
+> 响应体，由 `gcode/subscribe_output` 的输出通道推送。注册时机与上游不同：上游只在
+> `[pause_resume]` 装载时注册，本仓按既有惯例（同 `query_endstops/status`）无条件注册——
+> 未装载该节时端点仍回 `{}`，命令分发以 `// Unknown command:…` 的输出行应答。
+
 ### 13. `pause_resume/pause` — 暂停打印
 
 **请求：**
@@ -711,7 +717,7 @@
 |------|------|------|
 | `is_paused` | bool | 打印是否处于暂停状态 |
 
-批 #15：`[pause_resume]` 节装载后注册 `PAUSE`/`RESUME`/`CLEAR_PAUSE`/`CANCEL_PRINT`，`is_paused` 由状态机维护；`pause_resume/pause|resume|cancel` 三个端点仍未注册。
+批 #15：`[pause_resume]` 节装载后注册 `PAUSE`/`RESUME`/`CLEAR_PAUSE`/`CANCEL_PRINT`，`is_paused` 由状态机维护；`pause_resume/pause|resume|cancel` 三个端点已注册（2026-10-03，见第 13–15 节）。
 
 ### `print_stats`
 

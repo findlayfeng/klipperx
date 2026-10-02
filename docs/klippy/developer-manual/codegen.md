@@ -71,7 +71,7 @@ section!("stepper_x", order = 50, phase = late, load = load_config);
 
 - `load` 对应 `[id]`，`prefix` 对应 `[id <name>]`，至少写一个；
 - `order` 必填，决定同一半（main / prefix）内的装载顺序（`load.rs` 的两次遍历按表序进行）；
-- `phase = early | generic | late`（默认 `generic`）：`early` 排在普通节之前（上游先 `pins`/`mcu`）；目前 `early` 有 `[mcu]`/`[mcu <name>]`、`[adc_scaled <name>]` 与 `[thermistor <name>]`。**通则**：同一 phase 内**先装载全部主节、再装载全部 prefix 节**，因此一个「在装载期被别的节消费」的定义者若是 **prefix-only**，**降 `order` 无效**，只能放进更早的 phase（`adc_scaled`/`thermistor` 都是此例，见 `load.rs` 的 `# Order` 文档）。
+- `phase = early | generic | late`（默认 `generic`）：`early` 排在普通节之前（上游先 `pins`/`mcu`）；目前 `early` 有 `[mcu]`/`[mcu <name>]`、`[adc_scaled <name>]`、`[thermistor <name>]` 与 `[adc_temperature]`/`[adc_temperature <name>]`。**通则**：同一 phase 内**先装载全部主节、再装载全部 prefix 节**，因此一个「在装载期被别的节消费」的定义者若是 **prefix-only**，**降 `order` 无效**，只能放进更早的 phase（`adc_scaled`/`thermistor`/`adc_temperature` 都是此例，见 `load.rs` 的 `# Order` 文档）。
   `late` 排在之后（上游最后才 load `toolhead`）；`[stepper_*]` 也在 `late`（order 50，早于 toolhead）——
   它的 `endstop_pin` 可能指向其它段注册的 pin chip（如 `probe:`、`tmc*_stepper_x:`），必须等所有
 generic 段装载完再解析；

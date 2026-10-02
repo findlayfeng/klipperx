@@ -391,14 +391,14 @@ git config core.hooksPath .githooks
 与 `KLIPPERX_ALL_ARCHES`（全开）在**构建阶段**过滤 `test/configs/*.config` 并产出同名 `.dict`
 （构建失败即报错）；未构建字典的运行生成时带 `#[ignore = "dictionary <name> not built"]`，
 不拿别的目标顶替。忽略列表（`IGNORED`，权威在 `crates/test-support/build.rs`，按生成函数名匹配）
-现登记 1 条：`out_of_bounds.test`（move-bounds 未实现，`G1 Y9999` 未被拒）；详见
+现登记 0 条（`out_of_bounds.test` 曾因 harness 双重反转 bug 误登记，已修复移除）；详见
 [回归测试](regression-tests.md)。
 
 全语料 37 份文件共 **239 次运行**；默认构建下 2 条（`printers.test` 里 `DICTIONARY pru.dict` 下的
-`generic-cramps.cfg` 与 `generic-replicape.cfg`）因未构建 `pru` 字典生成为 `#[ignore]`，1 条
-（`out_of_bounds.test`）因 move-bounds 未实现列入 `IGNORED`，其余 **236 条全部运行并通过
-（0 失败）**；用例的内联 g-code 由端到端运行真送进 dispatcher，更有独立的内联解析阶段
-（`upstream_inline_gcode_parses`，仍 `#[ignore]`）。上游 `configparser` 的 `optionxform = str.lower` 已对齐（`mod.rs` 存储侧小写 + `section.rs` 查询侧小写），`Option 'pid_Kp' … must be specified` 类的 49 次回归失败已归零。
+`generic-cramps.cfg` 与 `generic-replicape.cfg`）因未构建 `pru` 字典生成为 `#[ignore]`，
+其余 **237 条全部运行并通过（0 失败）**（`out_of_bounds.test` 的双重反转 bug 已修复，
+`G1 Y9999` 正确报 `Move out of range`，`SHOULD_FAIL` 满足）；用例的内联 g-code 由端到端运行
+真送进 dispatcher，更有独立的内联解析阶段（`upstream_inline_gcode_parses`，仍 `#[ignore]`）。上游 `configparser` 的 `optionxform = str.lower` 已对齐（`mod.rs` 存储侧小写 + `section.rs` 查询侧小写），`Option 'pid_Kp' … must be specified` 类的 49 次回归失败已归零。
 
 生成式运行器取代了旧的 `upstream_test_cases_run`（单个 `#[test]` 串行跑 239 case，十几分钟易超时
 且无法单跑定位）；旧环境变量 `KLIPPERX_UPSTREAM_ALL` / `KLIPPERX_UPSTREAM_FILTER` 不再适用。

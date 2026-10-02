@@ -506,11 +506,13 @@ mod tests {
             }
         });
         runtime.shutdown_timeout(std::time::Duration::from_secs(CASE_SHUTDOWN_TIMEOUT));
-        match (should_fail, outcome) {
-            (false, Ok(())) => {}
-            (false, Err(e)) => panic!("upstream case failed: {e}"),
-            (true, Ok(())) => panic!("upstream case was expected to fail but succeeded"),
-            (true, Err(_)) => {}
+        // `run_case` already applied the `SHOULD_FAIL` inversion above, so
+        // `outcome` is `Ok(())` when the expectation is met (a normal run
+        // passed, or a `SHOULD_FAIL` run failed as expected) and `Err` when it
+        // was not. There is nothing to invert a second time here.
+        match outcome {
+            Ok(()) => {}
+            Err(e) => panic!("upstream case failed: {e}"),
         }
     }
 

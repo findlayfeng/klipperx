@@ -5,9 +5,9 @@
 //! thermal-drift calibration of an eddy probe that is driven *from* that
 //! sensor. This module is that file — the section reads its options, `heaters`
 //! builds and delivers readings, `_temp_callback`'s smoothing lands in
-//! `get_status`, and the `TEMPERATURE_PROBE_*` family runs the calibration
-//! state machine. Only the drift-compensation helper the calibration feeds is
-//! elsewhere (unit C, below).
+//! `get_status`, the `TEMPERATURE_PROBE_*` family runs the calibration
+//! state machine, and `EddyDriftCompensation` turns each run's samples into
+//! the drift correction the eddy probe applies.
 //!
 //! | here | upstream |
 //! |---|---|
@@ -18,6 +18,7 @@
 //! | [`check_kick_next`] | `_check_kick_next` (`:155-159`) |
 //! | [`TemperatureProbe::register_commands`] and the flow behind it | the `TEMPERATURE_PROBE_*` family: registration (`:112-123`), flow (`:164-337`), command bodies (`:338-448`) |
 //! | [`TemperatureProbe::get_status`] | `get_status` (`:453-465`) |
+//! | [`EddyDriftCompensation`] | the drift helper (`:479-714`) and its `probe_eddy_current` registration (`:125-137`) |
 //!
 //! The family drives a calibration state machine over the same section's
 //! options: `in_calibration` in the shared state is what [`check_kick_next`]
@@ -26,29 +27,31 @@
 //!
 //! # Not here (deferred; the upstream line ranges are the gap list)
 //!
-//! * **`EddyDriftCompensation`** (`temperature_probe.py:479-714`) and the
-//!   `probe_eddy_current` registration it needs (`:125-137`): until it exists,
-//!   `get_status`'s `compensation_enabled` is always `false` — which is exactly
-//!   what upstream reports when no drift compensation was registered. Three
-//!   seams wait for it, marked `TODO(C)`: upstream's `cal_helper is None` guard
-//!   at the top of `cmd_TEMPERATURE_PROBE_CALIBRATE`,
-//!   `cal_helper.start_calibration()` / `.finish_calibration()` around the
-//!   state machine, and the sample temperature `_collect_sample` returns.
+//! * **`EddyCalibrationTool`'s two calls into the helper**
+//!   (`note_z_calibration_start` / `_finish`, `temperature_probe.py:544-558`):
+//!   the methods are here, their upstream caller
+//!   (`EddyCalibrationTool.do_calibration_moves`, `probe_eddy_current.py:134`
+//!   and `:157`) is part of the not-yet-ported calibration tool — see
+//!   [`probe_eddy_current`]'s gap list.
 //! * **`stats`** (`temperature_probe.py:467-468`): the port has no
 //!   `Printer`-level walker that collects object `stats` yet;
 //!   [`TemperatureProbe::stats`] is upstream's shape, ready for one.
+//!
+//! [`probe_eddy_current`]: crate::core::klippy::extras::probe_eddy_current
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use serde_json::{json, Value};
 
-use crate::core::klippy::config::{ConfigError, ConfigWrapper};
+use crate::core::klippy::config::object::CONFIGFILE_OBJECT;
+use crate::core::klippy::config::{ConfigError, ConfigWrapper, PrinterConfig};
 use crate::core::klippy::extras::heaters;
 use crate::core::klippy::extras::manual_probe::{
     self, FinalizeCallback, ManualProbe, MANUAL_PROBE_OBJECT,
 };
 use crate::core::klippy::extras::probe::{lookup_probe_session, ProbeSession};
+use crate::core::klippy::extras::probe_eddy_current::{DriftCompensation, PrinterEddyProbe};
 use crate::core::klippy::extras::toolhead::ToolHeadObject;
 use crate::core::klippy::gcode::{
     sync, CommandError, CommandHandler, GCodeDispatch, GcodeCommand, GCODE_OBJECT,
@@ -76,6 +79,10 @@ const Z_AXIS: usize = 2;
 const X_AXIS: usize = 0;
 /// The Y axis index, as [`Coord`] numbers them.
 const Y_AXIS: usize = 1;
+
+/// The sample windows one drift sweep takes (`DRIFT_SAMPLE_COUNT`), each a
+/// half-millimetre of Z apart (`temperature_probe.py:476`).
+const DRIFT_SAMPLE_COUNT: usize = 9;
 
 // ===========================================================================
 // Polynomial2d
@@ -523,9 +530,23 @@ pub struct TemperatureProbe {
     sensor: Arc<dyn heaters::Sensor>,
     /// The readings and calibration flags the sensor callback shares.
     state: Arc<Mutex<State>>,
+    /// The drift helper upstream builds in `__init__`
+    /// (`self.cal_helper = EddyDriftCompensation(…)`, `temperature_probe.py:125-137`):
+    /// `None` while the config names no `probe_eddy_current <name>` section,
+    /// which is upstream's `cal_helper is None`.
+    cal_helper: Mutex<Option<Arc<EddyDriftCompensation>>>,
 }
 
 impl TemperatureProbe {
+    /// The registered drift helper, cloned out of its slot — upstream's
+    /// `self.cal_helper` read.
+    fn drift_helper(&self) -> Option<Arc<EddyDriftCompensation>> {
+        self.cal_helper
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
     /// Upstream's `get_temp` (`:161-162`): the smoothed temperature and the
     /// calibration's target.
     pub fn get_temp(&self) -> (f64, f64) {
@@ -552,6 +573,11 @@ impl PrinterObject for TemperatureProbe {
     /// Upstream's `get_status` (`:453-465`). `temperature` is reported raw —
     /// upstream rounds only the two measured extremes.
     fn get_status(&self, _eventtime: f64) -> Value {
+        // Upstream reads this off its `cal_helper` (`:457-459`): `false` when
+        // no helper is registered, the helper's flag when one is.
+        let compensation_enabled = self
+            .drift_helper()
+            .is_some_and(|helper| helper.is_enabled());
         let state = lock_state(&self.state);
         let (smoothed, measured_min, measured_max) = state.measurement;
         json!({
@@ -560,9 +586,7 @@ impl PrinterObject for TemperatureProbe {
             "measured_max_temp": round2(measured_max),
             "in_calibration": state.in_calibration,
             "estimated_expansion": state.total_expansion,
-            // Upstream reads this off its `cal_helper` (`EddyDriftCompensation`,
-            // not ported — module docs); without one it is `false` too.
-            "compensation_enabled": false,
+            "compensation_enabled": compensation_enabled,
         })
     }
 }
@@ -647,7 +671,7 @@ impl TemperatureProbe {
                     sync(move |gcmd| this.cmd_enable(gcmd)),
                     Some(ENABLE_HELP),
                     // What `EddyDriftCompensation.set_enabled` reads
-                    // (`temperature_probe.py:530`), unit C's.
+                    // (`temperature_probe.py:530`).
                     &["ENABLE"],
                 )
                 .map_err(ConfigError::new)?;
@@ -830,14 +854,21 @@ impl TemperatureProbe {
     }
 
     /// Upstream's `_collect_sample` (`temperature_probe.py:164-178`): lift,
-    /// move over the probe point, then take the sample.
+    /// move over the probe point, then hand the sample to the drift helper —
+    /// which is what upstream returns unconditionally (`:178`).
     ///
     /// # Errors
-    /// "No probe configured", or whatever the moves report.
-    fn collect_sample(&self, _mpresult: &Coord, _tool_zero_z: f64) -> Result<f64, CommandError> {
+    /// "No probe configured", whatever the moves report, or whatever the
+    /// helper's sweep reports.
+    async fn collect_sample(
+        &self,
+        mpresult: &Coord,
+        tool_zero_z: f64,
+    ) -> Result<f64, CommandError> {
         let probe = self.get_probe()?;
         let offsets = probe.offsets();
-        let (lift_speed, _, move_speed) = self.get_speeds()?;
+        let speeds = self.get_speeds()?;
+        let (lift_speed, _, move_speed) = speeds;
         let toolhead = self.toolhead()?;
         let mut cur_pos = toolhead
             .position()
@@ -848,13 +879,17 @@ impl TemperatureProbe {
         cur_pos.set_axis(X_AXIS, cur_pos.x() - offsets.x);
         cur_pos.set_axis(Y_AXIS, cur_pos.y() - offsets.y);
         toolhead.move_to(cur_pos, move_speed)?;
-        // TODO(C): upstream returns
-        // `self.cal_helper.collect_sample(mpresult, tool_zero_z, speeds)`
-        // (`:178`) — the temperature the drift sweep recorded, averaged over
-        // one sweep of the probe (`:617-618` reads this same sensor). The
-        // helper is `EddyDriftCompensation`, unit C; until it lands the sample
-        // temperature is this sensor's current reading, so the state machine
-        // still climbs `step` by `step` towards `target_temp`.
+        if let Some(helper) = self.drift_helper() {
+            // Upstream's `return self.cal_helper.collect_sample(mpresult,
+            // tool_zero_z, speeds)` (`:178`): the temperature the drift sweep
+            // recorded, averaged over one sweep of the probe (`:617-618` reads
+            // this same sensor).
+            return helper.collect_sample(mpresult, tool_zero_z, speeds).await;
+        }
+        // Upstream never gets here: `cmd_TEMPERATURE_PROBE_CALIBRATE` refuses
+        // a run with no helper registered first (`:355-358`). What a run
+        // without one returns is this sensor's current reading, so the state
+        // machine still climbs `step` by `step` towards `target_temp`.
         Ok(lock_state(&self.state).measurement.0)
     }
 
@@ -939,7 +974,7 @@ impl TemperatureProbe {
             .position()
             .ok_or_else(|| CommandError::new("Printer is not ready"))?
             .z();
-        let last_temp = match self.collect_sample(&mpresult, tool_zero_z) {
+        let last_temp = match self.collect_sample(&mpresult, tool_zero_z).await {
             Ok(temp) => temp,
             Err(err) => {
                 self.finalize_drift_cal(false, None).await?;
@@ -1028,14 +1063,19 @@ impl TemperatureProbe {
         // Turn off the heaters (`:247-248`).
         self.set_extruder_temp(0., false).await?;
         self.set_bed_temp(0.).await?;
-        // TODO(C): upstream calls `self.cal_helper.finish_calibration(success)`
-        // here (`:249-254`) and turns a `gcode.error` from it into
-        // `success = False` + its message. `EddyDriftCompensation` is unit C,
-        // so nothing raises until then.
+        // The helper's close-out (`:249-254`): upstream calls
+        // `self.cal_helper.finish_calibration(success)` and turns a
+        // `gcode.error` from it into `success = False` + its message.
+        let mut success = success;
+        let mut msg = msg.map(str::to_string);
+        if let Some(helper) = self.drift_helper() {
+            if let Err(err) = helper.finish_calibration(success) {
+                success = false;
+                msg = Some(err.to_string());
+            }
+        }
         if !success {
-            let msg = msg
-                .map(str::to_string)
-                .unwrap_or_else(|| format!("{}: calibration aborted", self.name));
+            let msg = msg.unwrap_or_else(|| format!("{}: calibration aborted", self.name));
             gcode.respond_info(&msg, true);
         }
         Ok(())
@@ -1075,11 +1115,15 @@ impl TemperatureProbe {
     /// [`Self::start_calibration`] reports.
     async fn cmd_calibrate(self: &Arc<Self>, gcmd: &GcodeCommand) -> Result<(), CommandError> {
         let method = gcmd.get_str_default("METHOD", "manual").to_lowercase();
-        // TODO(C): upstream refuses right here when no drift-compensation
-        // helper is registered (`:340-343`, "No calibration helper registered
-        // for [%s]"). The helper is `EddyDriftCompensation` (unit C); the
-        // guard lands with it, since refusing everything until then would
-        // leave the whole family unreachable.
+        // Upstream reads `METHOD` first (`:354`), then refuses right here
+        // when no drift-compensation helper is registered (`:355-358`,
+        // "No calibration helper registered for [%s]").
+        if self.drift_helper().is_none() {
+            return Err(CommandError::new(format!(
+                "No calibration helper registered for [{}]",
+                self.name
+            )));
+        }
         self.check_homed()?;
         self.start_calibration(gcmd, &method).await
     }
@@ -1203,9 +1247,18 @@ impl TemperatureProbe {
         {
             let mut state = lock_state(&self.state);
             state.method = method.to_string();
-            // TODO(C): upstream `self.cal_helper.start_calibration()` resets
-            // the helper's sample buckets here (`:388`).
+            // Upstream sets `in_calibration` and then calls
+            // `self.cal_helper.start_calibration()` (`:387-388`), which
+            // switches the correction off and empties the helper's sample
+            // buckets. The state lock is dropped first: the helper reads the
+            // sensor's state of its own, and the two locks stay unordered.
             state.in_calibration = true;
+        }
+        if let Some(helper) = self.drift_helper() {
+            helper.start_calibration();
+        }
+        {
+            let mut state = lock_state(&self.state);
             state.target_temp = target_temp;
             state.step = step;
             state.sample_count = 0;
@@ -1285,12 +1338,16 @@ impl TemperatureProbe {
         self.finalize_drift_cal(false, None).await
     }
 
-    /// `TEMPERATURE_PROBE_ENABLE` (`temperature_probe.py:446-448`).
+    /// `TEMPERATURE_PROBE_ENABLE` (`temperature_probe.py:446-448`): forward to
+    /// the helper's `set_enabled`, which does the parameter read and both
+    /// refusals — with no helper registered this is the no-op upstream runs.
     ///
-    /// Upstream forwards to `cal_helper.set_enabled(gcmd)` only when a helper
-    /// is registered; `EddyDriftCompensation` is unit C, so without one this
-    /// is the no-op upstream runs.
-    fn cmd_enable(&self, _gcmd: &GcodeCommand) -> Result<(), CommandError> {
+    /// # Errors
+    /// Whatever `EddyDriftCompensation::set_enabled` reports.
+    fn cmd_enable(&self, gcmd: &GcodeCommand) -> Result<(), CommandError> {
+        if let Some(helper) = self.drift_helper() {
+            helper.set_enabled(gcmd)?;
+        }
         Ok(())
     }
 
@@ -1310,6 +1367,691 @@ impl TemperatureProbe {
         });
         manual.start_helper(&printer, gcmd, callback)
     }
+}
+
+// ===========================================================================
+// EddyDriftCompensation
+// ===========================================================================
+
+/// `config.getlists("drift_calibration", None, seps=(',', '\n'), parser=float)`
+/// (`temperature_probe.py:488-490`): split on newlines first — blank lines
+/// drop out, as upstream's nested parser filters them — then each line on
+/// commas with **no** empty filter, so a stray separator is a parse failure of
+/// the whole option. Every group is parsed before any group's length is
+/// checked, as upstream's two passes are ordered.
+///
+/// `None` when the option is absent — and when it is present but empty, where
+/// upstream's empty tuple walks on into `_check_calibration` and raises
+/// `IndexError`; here that reads as "no curves configured".
+///
+/// # Errors
+/// "Unable to parse option 'drift_calibration' in section '\<id\>'" for a
+/// non-number, or upstream's "Invalid polynomial in drift calibration" for a
+/// group that is not three coefficients (`:492-495`).
+fn read_drift_calibration(
+    config: &ConfigWrapper,
+) -> Result<Option<Vec<Polynomial2d>>, ConfigError> {
+    let Some(text) = config.get_str("drift_calibration") else {
+        return Ok(None);
+    };
+    let identifier = config.identifier();
+    let mut groups: Vec<Vec<f64>> = Vec::new();
+    for line in text.split('\n') {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut coefs = Vec::new();
+        for raw in line.split(',') {
+            let coef = raw.trim().parse::<f64>().map_err(|_| {
+                ConfigError::new(format!(
+                    "Unable to parse option 'drift_calibration' in section '{identifier}'"
+                ))
+            })?;
+            coefs.push(coef);
+        }
+        groups.push(coefs);
+    }
+    if groups.is_empty() {
+        return Ok(None);
+    }
+    for coefs in &groups {
+        if coefs.len() != 3 {
+            return Err(ConfigError::new(
+                "Invalid polynomial in drift calibration".to_string(),
+            ));
+        }
+    }
+    Ok(Some(
+        groups
+            .into_iter()
+            .map(|coefs| Polynomial2d::new(coefs[0], coefs[1], coefs[2]))
+            .collect(),
+    ))
+}
+
+/// The eddy probe's temperature-drift correction (`EddyDriftCompensation`,
+/// `temperature_probe.py:479-714`): the stored `drift_calibration` curves say
+/// how the probe's resonance drifts with temperature, and every frequency the
+/// probe converts is moved back toward the temperature its Z calibration was
+/// taken at.
+///
+/// The loader builds it when the config names a `probe_eddy_current <name>`
+/// section and registers it with that probe on the spot (`:125-137`) — which
+/// is what [`TemperatureProbe`]'s `cal_helper` slot holds. With no such
+/// section there is no helper: the command family refuses to calibrate
+/// (`:355-358`) and `get_status` reports `compensation_enabled: false`.
+pub struct EddyDriftCompensation {
+    /// The section id upstream calls `self.name`.
+    name: String,
+    /// The machine upstream keeps as `self.printer`: the sweep looks the
+    /// toolhead and the probe up through it, the close-outs the `gcode` and
+    /// `configfile` objects. `Weak`, as [`TemperatureProbe`] holds it.
+    printer: Weak<Printer>,
+    /// The sensor every correction is dated from (upstream's
+    /// `self.temp_sensor`, the `TemperatureProbe` itself) — shared as its
+    /// readings state, so the helper reads the temperature without pinning
+    /// the object that owns the helper.
+    temp: Arc<Mutex<State>>,
+    /// The helper's own fields under one lock (upstream's `cal_temp` /
+    /// `drift_calibration` / `calibration_samples` / `max_valid_temp` /
+    /// `dc_min_temp` / `min_freq` / `enabled`, `:484-525`).
+    inner: Mutex<DriftState>,
+}
+
+/// What [`EddyDriftCompensation`] keeps of upstream's `__init__` fields.
+#[derive(Debug)]
+struct DriftState {
+    /// The temperature the Z calibration was taken at (`cal_temp`, `0.`).
+    cal_temp: f64,
+    /// The highest temperature the curves are validated over
+    /// (`max_validation_temp`, default `60.`).
+    max_valid_temp: f64,
+    /// The stored curves, highest frequency first (`drift_calibration`);
+    /// `None` when none are configured.
+    drift_calibration: Option<Vec<Polynomial2d>>,
+    /// The lowest frequency the lowest curve reaches over `0..=120` °C
+    /// (`min_freq`, `999999999999.` until a calibration exists — `:486, :499`).
+    min_freq: f64,
+    /// The current run's samples: one `(temperature, frequency)` list per
+    /// window (`calibration_samples`); `None` between runs.
+    calibration_samples: Option<Vec<Vec<(f64, f64)>>>,
+    /// Whether the correction is applied (`enabled`).
+    enabled: bool,
+}
+
+impl EddyDriftCompensation {
+    /// Upstream's `__init__` (`:481-525`): read the section's four options,
+    /// load and validate the drift curves, and start enabled exactly when
+    /// they can be used.
+    ///
+    /// # Errors
+    /// The option reads' parse wording, `Invalid polynomial in drift
+    /// calibration` for a curve that is not three coefficients, or
+    /// [`Self::check_calibration`]'s crossing message.
+    fn read(
+        config: &ConfigWrapper,
+        printer: Weak<Printer>,
+        temp: Arc<Mutex<State>>,
+    ) -> Result<Self, ConfigError> {
+        let name = config.identifier();
+        // Upstream's read order (`:484-488`).
+        let cal_temp = config.get_float("calibration_temp", Some(0.))?;
+        let max_valid_temp = config.get_float("max_validation_temp", Some(60.))?;
+        let dc_min_temp = config.get_float("drift_calibration_min_temp", Some(0.))?;
+        let drift_calibration = read_drift_calibration(config)?;
+        let mut min_freq = 999999999999.;
+        if let Some(calibration) = &drift_calibration {
+            // Validate before the curves are used for anything (`:496`).
+            Self::check_calibration(calibration, &name, dc_min_temp, max_valid_temp)
+                .map_err(ConfigError::new)?;
+            // `low_poly = self.drift_calibration[-1]; min([low_poly(temp) for
+            // temp in range(121)])` (`:498-499`).
+            let low_poly = calibration
+                .last()
+                .expect("a configured drift calibration is never empty");
+            min_freq = (0..121)
+                .map(|temp| low_poly.eval(temp as f64))
+                .fold(f64::INFINITY, f64::min);
+            let curves = calibration
+                .iter()
+                .map(|poly| format!("{poly:?}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            tracing::info!(
+                "{name}: loaded temperature drift calibration. Min Temp: {dc_min_temp:.2}, \
+                 Min Freq: {min_freq:.6}\n{curves}"
+            );
+        } else {
+            tracing::info!(
+                "{name}: No drift calibration configured, disabling temperature drift \
+                 compensation"
+            );
+        }
+        let mut enabled = drift_calibration.is_some();
+        if cal_temp < 1e-6 && enabled {
+            // No saved Z-calibration temperature to correct toward (`:517-523`).
+            enabled = false;
+            tracing::info!(
+                "{name}: No temperature saved for eddy probe calibration, disabling temperature \
+                 drift compensation."
+            );
+        }
+        Ok(Self {
+            name,
+            printer,
+            temp,
+            inner: Mutex::new(DriftState {
+                cal_temp,
+                max_valid_temp,
+                drift_calibration,
+                min_freq,
+                calibration_samples: None,
+                enabled,
+            }),
+        })
+    }
+
+    /// The helper's own lock, poisoned or not.
+    fn lock(&self) -> MutexGuard<'_, DriftState> {
+        self.inner.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// The machine, or the standing "not ready" error (the lookup failure
+    /// upstream's `self.printer.lookup_object(...)` becomes).
+    fn live_printer(&self) -> Result<Arc<Printer>, CommandError> {
+        self.printer
+            .upgrade()
+            .ok_or_else(|| CommandError::new("Printer is not ready"))
+    }
+
+    /// `_check_calibration` (`:657-673`): every curve must sit strictly below
+    /// the one before it, degree by degree, over `start_temp..=end_temp`.
+    /// Upstream raises through the `error` argument it is handed —
+    /// `config.error` at load, `gcode.error` at finish — so the message comes
+    /// back here for the caller to raise as its own error type.
+    ///
+    /// # Panics
+    /// Never: both call sites pass a non-empty slice — a loaded calibration
+    /// has curves, and a finished run fits one per window.
+    fn check_calibration(
+        calibration: &[Polynomial2d],
+        name: &str,
+        start_temp: f64,
+        end_temp: f64,
+    ) -> Result<(), String> {
+        // Python's `int()` truncates toward zero, as the cast does.
+        let mut temp = start_temp as i64;
+        let end = end_temp as i64 + 1;
+        while temp < end {
+            let mut last_freq = calibration[0].eval(temp as f64);
+            for (i, poly) in calibration[1..].iter().enumerate() {
+                let next_freq = poly.eval(temp as f64);
+                if next_freq >= last_freq {
+                    return Err(format!(
+                        "{name}: invalid calibration detected, curve at index {} overlaps \
+                         previous curve at temp {temp}C.",
+                        i + 1
+                    ));
+                }
+                last_freq = next_freq;
+            }
+            temp += 1;
+        }
+        Ok(())
+    }
+
+    /// `is_enabled` (`:526-527`).
+    pub fn is_enabled(&self) -> bool {
+        self.lock().enabled
+    }
+
+    /// `set_enabled` (`:528-543`): read `ENABLE`, refuse an enable that could
+    /// never apply, then switch the flag.
+    ///
+    /// # Errors
+    /// "Error on '\<commandline\>': missing ENABLE" without the word, or
+    /// upstream's two refusals (`:534-541`).
+    pub fn set_enabled(&self, gcmd: &GcodeCommand) -> Result<(), CommandError> {
+        let enabled = gcmd.get_int("ENABLE")? != 0;
+        let mut state = self.lock();
+        if enabled {
+            if state.drift_calibration.is_none() {
+                return Err(CommandError::new(
+                    "No drift calibration configured, cannot enable temperature drift \
+                     compensation",
+                ));
+            }
+            if state.cal_temp < 1e-6 {
+                return Err(CommandError::new(
+                    "Z Calibration temperature not configured, cannot enable temperature drift \
+                     compensation",
+                ));
+            }
+        }
+        state.enabled = enabled;
+        Ok(())
+    }
+
+    /// `note_z_calibration_start` (`:544-546`): the Z calibration begins, so
+    /// the saved calibration temperature starts at the sensor's reading.
+    ///
+    /// No caller yet: upstream's is `EddyCalibrationTool.do_calibration_moves`
+    /// (`probe_eddy_current.py:134`), which this port has not brought over
+    /// (see the module docs).
+    pub fn note_z_calibration_start(&self) {
+        let temperature = self.get_temperature();
+        self.lock().cal_temp = temperature;
+    }
+
+    /// `note_z_calibration_finish` (`:547-558`): the run's temperature is the
+    /// midpoint of its start and finish readings, written back as
+    /// `calibration_temp` for `SAVE_CONFIG` and reported.
+    ///
+    /// No caller yet — see [`Self::note_z_calibration_start`].
+    pub fn note_z_calibration_finish(&self) {
+        let temperature = self.get_temperature();
+        let cal_temp = {
+            let mut state = self.lock();
+            state.cal_temp = (state.cal_temp + temperature) / 2.0;
+            state.cal_temp
+        };
+        let Some(printer) = self.printer.upgrade() else {
+            tracing::warn!("{}: printer is gone, calibration_temp not saved", self.name);
+            return;
+        };
+        let Some(configfile) = printer.lookup_object_as::<PrinterConfig>(CONFIGFILE_OBJECT) else {
+            tracing::warn!(
+                "{}: no configfile object, calibration_temp not saved",
+                self.name
+            );
+            return;
+        };
+        // `"%.6f "` upstream — trailing space and all (`:554`).
+        configfile.set(&self.name, "calibration_temp", &format!("{cal_temp:.6} "));
+        if let Some(gcode) = printer.lookup_object_as::<GCodeDispatch>(GCODE_OBJECT) {
+            gcode.respond_info(
+                &format!(
+                    "{}: Z Calibration Temperature set to {cal_temp:.2}. The SAVE_CONFIG command \
+                     will update the printer config file and restart the printer.",
+                    self.name
+                ),
+                true,
+            );
+        }
+    }
+
+    /// `start_calibration` (`:622-625`): switch the correction off and open
+    /// fresh sample buckets for the run.
+    pub fn start_calibration(&self) {
+        let mut state = self.lock();
+        state.enabled = false;
+        state.calibration_samples = Some(vec![Vec::new(); DRIFT_SAMPLE_COUNT]);
+    }
+
+    /// `finish_calibration` (`:626-656`): fit one curve per sample window once
+    /// the run is closed out, check the curves do not cross, and save them.
+    ///
+    /// # Errors
+    /// "calibration error, not enough samples" with no run behind it (`:633-636`),
+    /// [`Self::check_calibration`]'s crossing message, or a window set
+    /// `Polynomial2d::fit` cannot solve — upstream's `fit` would raise out of
+    /// the solve instead.
+    pub fn finish_calibration(&self, success: bool) -> Result<(), CommandError> {
+        let cal_samples = self.lock().calibration_samples.take();
+        if !success {
+            return Ok(());
+        }
+        let printer = self.live_printer()?;
+        let gcode = printer
+            .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+            .ok_or_else(|| CommandError::new("Printer is not ready"))?;
+        let Some(cal_samples) = cal_samples else {
+            return Err(CommandError::new("calibration error, not enough samples"));
+        };
+        if cal_samples.len() < 3 {
+            return Err(CommandError::new("calibration error, not enough samples"));
+        }
+        // `min_temp, _ = cal_samples[0][0]` / `max_temp, _ = cal_samples[-1][0]`
+        // (`:637-638`): every sample in a window carries that window's
+        // temperature, so the first tuple of the first and last window bounds
+        // the validation range.
+        let min_temp = cal_samples
+            .first()
+            .and_then(|window| window.first())
+            .map(|(temp, _)| *temp)
+            .ok_or_else(|| CommandError::new("calibration error, not enough samples"))?;
+        let max_temp = cal_samples
+            .last()
+            .and_then(|window| window.first())
+            .map(|(temp, _)| *temp)
+            .ok_or_else(|| CommandError::new("calibration error, not enough samples"))?;
+        // One fit per window at its Z height (`:639-644`).
+        let mut polynomials = Vec::with_capacity(cal_samples.len());
+        for (i, coords) in cal_samples.iter().enumerate() {
+            let height = 0.05 + i as f64 * 0.5;
+            let poly = Polynomial2d::fit(coords).ok_or_else(|| {
+                CommandError::new("calibration error, unable to fit a drift calibration polynomial")
+            })?;
+            tracing::info!("Polynomial at Z={height:.2}: {poly:?}");
+            polynomials.push(poly);
+        }
+        let end_vld_temp = self.lock().max_valid_temp.max(max_temp);
+        Self::check_calibration(&polynomials, &self.name, min_temp, end_vld_temp)
+            .map_err(CommandError::new)?;
+        // The two `configfile.set` writes and the report (`:645-656`).
+        let coef_cfg = polynomials
+            .iter()
+            .map(|poly| poly.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let configfile = printer
+            .lookup_object_as::<PrinterConfig>(CONFIGFILE_OBJECT)
+            .ok_or_else(|| CommandError::new("Printer is not ready"))?;
+        configfile.set(&self.name, "drift_calibration", &coef_cfg);
+        configfile.set(
+            &self.name,
+            "drift_calibration_min_temp",
+            // Upstream stores the float as-is; `{:?}` prints it the way
+            // Python's `str()` would for a temperature.
+            &format!("{min_temp:?}"),
+        );
+        gcode.respond_info(
+            &format!(
+                "{}: generated {} 2D polynomials\nThe SAVE_CONFIG command will update the printer \
+                 config file and restart the printer.",
+                self.name,
+                polynomials.len()
+            ),
+            true,
+        );
+        Ok(())
+    }
+
+    /// `collect_sample` (`:559-621`): one drift sweep — put a client on the
+    /// probe's batch stream, walk nine half-millimetre Z windows up from the
+    /// probe point, wait for the stream to fill them, and average each window
+    /// into `calibration_samples`.
+    ///
+    /// Waits: upstream's `toolhead.wait_moves()` becomes this port's
+    /// `flush_step_generation` (the queued moves generated and sent), and its
+    /// `reactor.pause` loop (`:626-628`) becomes a `tokio` sleep polling the
+    /// same condition — the window list emptying as the probe's data arrives.
+    /// Like upstream's, the wait is unbounded: a sensor that stops delivering
+    /// leaves the sweep waiting, where a reactor that never sees the data
+    /// would.
+    ///
+    /// # Errors
+    /// "Unknown config object 'probe_eddy_current \<name\>'" (upstream's
+    /// `lookup_object`), a refused move or flush, or a window the stream left
+    /// empty — where upstream divides by its length and raises (`:619-621`).
+    pub async fn collect_sample(
+        &self,
+        mpresult: &Coord,
+        tool_zero_z: f64,
+        speeds: (f64, f64, f64),
+    ) -> Result<f64, CommandError> {
+        let printer = self.live_printer()?;
+        let toolhead = printer
+            .lookup_object_as::<ToolHeadObject>(TOOLHEAD_OBJECT)
+            .ok_or_else(|| CommandError::new("Printer is not ready"))?;
+        let (lift_speed, probe_speed, _) = speeds;
+        // Upstream's `sect_name = "probe_eddy_current " + self.name.split(None,
+        // 1)[-1]`, then `lookup_object(sect_name).add_client(...)` (`:604-606`).
+        let sect_name = format!("probe_eddy_current {}", short_name(&self.name));
+        let probe = printer
+            .lookup_object_as::<PrinterEddyProbe>(&sect_name)
+            .ok_or_else(|| CommandError::new(format!("Unknown config object '{sect_name}'")))?;
+
+        let mut cur_pos = toolhead
+            .position()
+            .ok_or_else(|| CommandError::new("Printer is not ready"))?;
+        let sweep = Arc::new(Mutex::new(SweepState::default()));
+        {
+            // The client keeps its own handle to the sweep — it outlives this
+            // call, as upstream's closure does.
+            let sweep = Arc::clone(&sweep);
+            let temp = Arc::clone(&self.temp);
+            probe.add_client(move |msg| {
+                let Some(rows) = batch_rows(msg) else {
+                    return true;
+                };
+                let mut sweep = sweep.lock().unwrap_or_else(|p| p.into_inner());
+                if sweep.move_times.is_empty() {
+                    return true;
+                }
+                let cur_temp = lock_state(&temp).measurement.0;
+                sweep.absorb(&rows, cur_temp)
+            });
+        }
+        for i in 0..DRIFT_SAMPLE_COUNT {
+            if i == 0 {
+                // Move down to the first sample location (`:607-609`).
+                cur_pos.set_axis(Z_AXIS, tool_zero_z + 0.05);
+            } else {
+                // Sample each .5mm in z: hop up 1mm, descend .5 (`:610-615`).
+                cur_pos.set_axis(Z_AXIS, cur_pos.z() + 1.0);
+                toolhead.move_to(cur_pos, lift_speed)?;
+                cur_pos.set_axis(Z_AXIS, cur_pos.z() - 0.5);
+            }
+            toolhead.move_to(cur_pos, probe_speed)?;
+            // The window this sample's data must land in (`:616-619`).
+            let start = toolhead.get_last_move_time() + 0.05;
+            let end = start + 0.1;
+            sweep
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .move_times
+                .push((i, start, end));
+            toolhead.dwell(0.2);
+        }
+        // Upstream's `toolhead.wait_moves()`.
+        toolhead.flush_step_generation().await?;
+        // "Wait for sample collection to finish" (`:626-628`): upstream polls
+        // the window list on its reactor — the condition is the same one.
+        loop {
+            let drained = sweep
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .move_times
+                .is_empty();
+            if drained {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let taken = std::mem::take(&mut *sweep.lock().unwrap_or_else(|p| p.into_inner()));
+        let (sample_temp, windows) = taken.into_samples(mpresult.z())?;
+        let mut state = self.lock();
+        let samples = state
+            .calibration_samples
+            .get_or_insert_with(|| vec![Vec::new(); DRIFT_SAMPLE_COUNT]);
+        for (bucket, sample) in samples.iter_mut().zip(windows) {
+            bucket.push(sample);
+        }
+        Ok(sample_temp)
+    }
+
+    /// `get_temperature` (`:710-712`): this sensor's smoothed reading — what
+    /// upstream reaches as `self.temp_sensor.get_temp()[0]`.
+    pub fn get_temperature(&self) -> f64 {
+        lock_state(&self.temp).measurement.0
+    }
+
+    /// `adjust_freq` (`:674-686`): a measured frequency moved from its origin
+    /// temperature toward the stored calibration temperature.
+    pub fn adjust_freq(&self, freq: f64, origin_temp: Option<f64>) -> f64 {
+        let (enabled, min_freq, cal_temp) = {
+            let state = self.lock();
+            (state.enabled, state.min_freq, state.cal_temp)
+        };
+        if !enabled || freq < min_freq {
+            return freq;
+        }
+        let origin_temp = origin_temp.unwrap_or_else(|| self.get_temperature());
+        self.calc_freq(freq, origin_temp, cal_temp)
+    }
+
+    /// `unadjust_freq` (`:687-698`): the other direction — a frequency stored
+    /// at the calibration temperature moved out to the destination.
+    pub fn unadjust_freq(&self, freq: f64, dest_temp: Option<f64>) -> f64 {
+        let (enabled, min_freq, cal_temp) = {
+            let state = self.lock();
+            (state.enabled, state.min_freq, state.cal_temp)
+        };
+        if !enabled || freq < min_freq {
+            return freq;
+        }
+        let dest_temp = dest_temp.unwrap_or_else(|| self.get_temperature());
+        self.calc_freq(freq, cal_temp, dest_temp)
+    }
+
+    /// `_calc_freq` (`:699-710`): walk the curves from the highest down until
+    /// `freq` sits at or above one, then interpolate the move to `dest_temp`
+    /// between that curve and the one above; above every curve, correct by how
+    /// much the highest curve itself moves. Below them all, untouched.
+    fn calc_freq(&self, freq: f64, origin_temp: f64, dest_temp: f64) -> f64 {
+        let Some(calibration) = self.lock().drift_calibration.clone() else {
+            return freq;
+        };
+        let mut high_freq: Option<f64> = None;
+        for (pos, poly) in calibration.iter().enumerate() {
+            let low_freq = poly.eval(origin_temp);
+            if freq >= low_freq {
+                let Some(high_freq) = high_freq else {
+                    // Frequency above the max calibration value: correct by
+                    // the top curve's own drift (`:702-704`).
+                    return freq + (poly.eval(dest_temp) - low_freq);
+                };
+                // Piecewise interpolation toward `dest_temp` (`:705-709`).
+                // `max` before `min`, as upstream's `min(1., max(0., …))`.
+                let t = ((freq - low_freq) / (high_freq - low_freq)).max(0.).min(1.);
+                let low_tgt_freq = poly.eval(dest_temp);
+                let high_tgt_freq = calibration[pos - 1].eval(dest_temp);
+                return (1. - t) * low_tgt_freq + t * high_tgt_freq;
+            }
+            high_freq = Some(low_freq);
+        }
+        // Frequency below the minimum: no correction.
+        freq
+    }
+}
+
+/// The probe-facing view of the helper: upstream hands `EddyCalibration` a
+/// duck-typed object, here a trait (`probe_eddy_current::DriftCompensation`).
+/// Each method is the inherent one above, reached through the name so the two
+/// spellings cannot shadow each other.
+impl DriftCompensation for EddyDriftCompensation {
+    fn get_temperature(&self) -> f64 {
+        EddyDriftCompensation::get_temperature(self)
+    }
+
+    fn adjust_freq(&self, freq: f64, origin_temp: Option<f64>) -> f64 {
+        EddyDriftCompensation::adjust_freq(self, freq, origin_temp)
+    }
+
+    fn unadjust_freq(&self, freq: f64, dest_temp: Option<f64>) -> f64 {
+        EddyDriftCompensation::unadjust_freq(self, freq, dest_temp)
+    }
+}
+
+/// One drift sweep's live data (`temperature_probe.py:561-565`): upstream
+/// keeps `move_times`, `temps` and `probe_samples` as locals the batch client
+/// `_on_bulk_data_recd` closes over; here the client and the sweep share them
+/// through this.
+struct SweepState {
+    /// The windows still to be filled: `(index, start, end)` in print time.
+    move_times: Vec<(usize, f64, f64)>,
+    /// The temperature each window recorded (`temps`).
+    temps: Vec<f64>,
+    /// Each window's `(frequency, measured z)` rows (`probe_samples`).
+    probe_samples: Vec<Vec<(f64, f64)>>,
+}
+
+impl Default for SweepState {
+    fn default() -> Self {
+        Self {
+            move_times: Vec::new(),
+            temps: vec![0.; DRIFT_SAMPLE_COUNT],
+            probe_samples: vec![Vec::new(); DRIFT_SAMPLE_COUNT],
+        }
+    }
+}
+
+impl SweepState {
+    /// One batch message through upstream's `_on_bulk_data_recd` (`:586-603`):
+    /// each row lands in the window its time falls in, windows retire as the
+    /// stream passes them, and the answer is whether the client stays
+    /// registered.
+    fn absorb(&mut self, rows: &[[f64; 3]], cur_temp: f64) -> bool {
+        let Some(&(mut idx, mut start_time, mut end_time)) = self.move_times.first() else {
+            // No window open: upstream falls through to `True`.
+            return true;
+        };
+        for row in rows {
+            let ptime = row[0];
+            while ptime > end_time {
+                self.move_times.remove(0);
+                let Some(&next) = self.move_times.first() else {
+                    // The last window just retired (`:592-594`).
+                    return idx >= DRIFT_SAMPLE_COUNT - 1;
+                };
+                (idx, start_time, end_time) = next;
+            }
+            if ptime < start_time {
+                continue;
+            }
+            self.temps[idx] = cur_temp;
+            self.probe_samples[idx].push((row[1], row[2]));
+        }
+        true
+    }
+
+    /// The sweep's results (`:617-624`): the average of all nine window
+    /// temperatures, then each window's `(sample_temp, average frequency)`
+    /// with upstream's log line in front of it.
+    ///
+    /// # Errors
+    /// "Failed calibration - incomplete sensor data" for a window the stream
+    /// left empty — upstream divides by its length there and raises.
+    fn into_samples(self, bed_z: f64) -> Result<(f64, Vec<(f64, f64)>), CommandError> {
+        let sample_temp = self.temps.iter().sum::<f64>() / self.temps.len() as f64;
+        let mut windows = Vec::with_capacity(DRIFT_SAMPLE_COUNT);
+        for (i, data) in self.probe_samples.iter().enumerate() {
+            if data.is_empty() {
+                return Err(CommandError::new(
+                    "Failed calibration - incomplete sensor data",
+                ));
+            }
+            let avg_freq = data.iter().map(|(freq, _)| freq).sum::<f64>() / data.len() as f64;
+            let avg_z = data.iter().map(|(_, z)| z).sum::<f64>() / data.len() as f64;
+            let kin_z = i as f64 * 0.5 + 0.05 + bed_z;
+            tracing::info!(
+                "Probe Values at Temp {sample_temp:.2}C, Z {kin_z:.4}mm: Avg Freq = \
+                 {avg_freq:.6}, Avg Measured Z = {avg_z:.6}"
+            );
+            windows.push((sample_temp, avg_freq));
+        }
+        Ok((sample_temp, windows))
+    }
+}
+
+/// A batch message's rows (`{"data": [[time, frequency, z], …]}`), `None`
+/// when the message carries no usable `data`.
+fn batch_rows(msg: &Value) -> Option<Vec<[f64; 3]>> {
+    let rows = msg.get("data")?.as_array()?;
+    Some(
+        rows.iter()
+            .filter_map(|row| {
+                let row = row.as_array()?;
+                Some([
+                    row.first()?.as_f64()?,
+                    row.get(1)?.as_f64()?,
+                    row.get(2)?.as_f64()?,
+                ])
+            })
+            .collect(),
+    )
 }
 
 // ===========================================================================
@@ -1356,11 +2098,41 @@ fn build_temperature_probe(
         printer: Arc::downgrade(printer),
         options,
         sensor,
-        state,
+        state: Arc::clone(&state),
+        cal_helper: Mutex::new(None),
     });
     // Upstream registers both mux commands in `__init__` (`:112-123`), so a
     // duplicate registration fails at config load rather than at first use.
     probe.register_commands(printer)?;
+    // Register the drift helper with the eddy probe (`:125-137`): upstream
+    // `load_object`s `probe_eddy_current <pname>`, builds the helper from
+    // *this* section's options and hands it over. The loader walks sections by
+    // `order` then name — `probe_eddy_current` before `temperature_probe` — so
+    // the object is registered by the time this factory runs, which is what
+    // upstream's on-demand load guarantees.
+    let probe_sect = format!("probe_eddy_current {}", short_name(&probe.name));
+    if config.has_sibling(&probe_sect) {
+        let pprobe = printer
+            .lookup_object_as::<PrinterEddyProbe>(&probe_sect)
+            .ok_or_else(|| ConfigError::new(format!("Unknown config object '{probe_sect}'")))?;
+        let helper = Arc::new(EddyDriftCompensation::read(
+            config,
+            Arc::downgrade(printer),
+            Arc::clone(&state),
+        )?);
+        pprobe.register_drift_compensation(Arc::clone(&helper) as Arc<dyn DriftCompensation>);
+        tracing::info!(
+            "{}: registered drift compensation with probe [{probe_sect}]",
+            probe.name
+        );
+        *probe.cal_helper.lock().unwrap_or_else(|p| p.into_inner()) = Some(helper);
+    } else {
+        tracing::info!(
+            "{}: No probe named {} configured, thermal drift compensation disabled.",
+            probe.name,
+            short_name(&probe.name)
+        );
+    }
     Ok(probe)
 }
 
@@ -1447,6 +2219,17 @@ mod tests {
         let gcode = printer
             .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
             .expect("the dispatcher is registered");
+        // The `configfile` object the drift helper's `SAVE_CONFIG` writes go
+        // through (`configfile.set`).
+        printer
+            .add_object(
+                CONFIGFILE_OBJECT,
+                Arc::new(PrinterConfig::new(
+                    AccessTracking::shared(),
+                    serde_json::Map::new(),
+                )),
+            )
+            .expect("configfile is free");
         printer.send_event(&KlippyEvent::KlippyReady);
         (printer, reactor, gcode)
     }
@@ -1976,20 +2759,31 @@ gcode_id: T0
             );
         }
         // `PROBE=probe` is the mux value the section registered, and the
-        // handler stops at the homed gate — the axes of a `kinematics: none`
-        // machine are never homed (`:344`).
+        // handler stops at upstream's helper gate first (`:355-358`) — `METHOD`
+        // has already been read with its default (`:354`).
+        let err = m
+            .run("TEMPERATURE_PROBE_CALIBRATE PROBE=probe")
+            .await
+            .expect_err("the helper gate refuses");
+        assert_eq!(
+            err.to_string(),
+            "No calibration helper registered for [temperature_probe probe]"
+        );
+        // With a helper registered the homed gate is next (`:359`) — the axes
+        // of a `kinematics: none` machine are never homed.
+        drift_helper(&m.printer, &m.probe, &[]);
         let err = m
             .run("TEMPERATURE_PROBE_CALIBRATE PROBE=probe")
             .await
             .expect_err("the homed gate refuses");
         assert_eq!(err.to_string(), "Printer must be homed before calibration");
-        // The gate comes before any parameter is read (`:339-344`), so a
-        // command with no TARGET reports the gate, not the missing value.
+        // Both gates come before TARGET is read (`:354-359`), so a command
+        // with no TARGET reports the gate, not the missing value.
         assert!(
             !m.replies()
                 .iter()
                 .any(|line| line.contains("missing TARGET")),
-            "TARGET is read after the gate: {:?}",
+            "TARGET is read after the gates: {:?}",
             m.replies()
         );
     }
@@ -2497,5 +3291,623 @@ calibration_bed_temp: 60
             m.probe.get_status(0.0)["compensation_enabled"],
             json!(false)
         );
+    }
+
+    // --- The drift helper ------------------------------------------------
+
+    /// The drift options of a correction that can work: three curves that
+    /// never cross (`pᵢ(T) = aᵢ`) and a saved calibration temperature to
+    /// correct toward.
+    const USABLE_DRIFT: &[(&str, &str)] = &[
+        ("calibration_temp", "25"),
+        ("drift_calibration", "300, 0, 0\n200, 0, 0\n100, 0, 0"),
+    ];
+
+    /// A helper read from a hand-built section against a fresh sensor state —
+    /// `EddyDriftCompensation::read` alone, as the wiring calls it, with no
+    /// probe to register it with.
+    fn read_drift(
+        printer: &Arc<Printer>,
+        options: &[(&str, &str)],
+    ) -> (Arc<EddyDriftCompensation>, Arc<Mutex<State>>) {
+        let section = section(options);
+        let state = Arc::new(Mutex::new(State::new()));
+        let helper = Arc::new(
+            EddyDriftCompensation::read(
+                &ConfigWrapper::untracked(&section),
+                Arc::downgrade(printer),
+                Arc::clone(&state),
+            )
+            .expect("the drift options read"),
+        );
+        (helper, state)
+    }
+
+    /// The same, installed the way the wiring installs it: built from a
+    /// section named after `probe`'s own, dropped into `cal_helper`.
+    fn drift_helper(
+        printer: &Arc<Printer>,
+        probe: &Arc<TemperatureProbe>,
+        options: &[(&str, &str)],
+    ) -> Arc<EddyDriftCompensation> {
+        let mut built = ConfigSection::new("temperature_probe", Some(short_name(&probe.name)));
+        for (option, value) in options {
+            built.parameters.insert(
+                (*option).to_string(),
+                ConfigValue::Single((*value).to_string()),
+            );
+        }
+        let helper = Arc::new(
+            EddyDriftCompensation::read(
+                &ConfigWrapper::untracked(&built),
+                Arc::downgrade(printer),
+                Arc::clone(&probe.state),
+            )
+            .expect("the drift options read"),
+        );
+        *probe.cal_helper.lock().unwrap_or_else(|p| p.into_inner()) = Some(Arc::clone(&helper));
+        helper
+    }
+
+    /// The four options read with upstream's defaults, and `enabled` exactly
+    /// where upstream leaves it (`temperature_probe.py:481-525`).
+    #[test]
+    fn drift_options_read_upstreams_way() {
+        let (printer, _, _) = machine();
+
+        // No curves: nothing to correct with, and `min_freq` keeps its
+        // starting sentinel (`:486`).
+        let (helper, _) = read_drift(&printer, &[]);
+        assert!(!helper.is_enabled());
+        assert!(helper.lock().drift_calibration.is_none());
+        assert_eq!(helper.lock().min_freq, 999999999999.);
+        assert_eq!(helper.lock().cal_temp, 0.);
+        assert_eq!(helper.lock().max_valid_temp, 60.);
+
+        // Curves plus a saved calibration temperature: usable, and `min_freq`
+        // is the lowest curve's minimum over `range(121)` (`:498-499`) — a
+        // constant 100 everywhere.
+        let (helper, _) = read_drift(&printer, USABLE_DRIFT);
+        assert!(helper.is_enabled());
+        assert_eq!(helper.lock().min_freq, 100.);
+        assert_eq!(helper.lock().cal_temp, 25.);
+        assert_eq!(
+            helper.lock().drift_calibration.as_ref().map(Vec::len),
+            Some(3)
+        );
+
+        // Curves but no saved temperature: loaded, then switched off again
+        // (`:517-523`).
+        let (helper, _) = read_drift(
+            &printer,
+            &[("drift_calibration", "300, 0, 0\n200, 0, 0\n100, 0, 0")],
+        );
+        assert!(!helper.is_enabled());
+        assert!(helper.lock().drift_calibration.is_some());
+    }
+
+    /// The load-time refusals: parse first, then the per-curve length, then
+    /// the crossing check — upstream's order and wording (`:488-496`).
+    #[test]
+    fn drift_calibration_refuses_what_upstream_refuses() {
+        let (printer, _, _) = machine();
+        let read = |options: &[(&str, &str)]| {
+            let section = section(options);
+            EddyDriftCompensation::read(
+                &ConfigWrapper::untracked(&section),
+                Arc::downgrade(&printer),
+                Arc::new(Mutex::new(State::new())),
+            )
+            .map(|_| ())
+        };
+
+        // The whole option parses before any curve's length is checked
+        // (`:488-490`): a bad number in the second curve wins.
+        let err = read(&[("drift_calibration", "300, 0, 0\n150, x, 0")])
+            .expect_err("a coefficient does not parse");
+        assert_eq!(
+            err.to_string(),
+            "Unable to parse option 'drift_calibration' in section 'temperature_probe name'"
+        );
+        // A stray separator is a non-number too (upstream does not filter
+        // empty items at the inner level).
+        let err = read(&[("drift_calibration", "300, 0,")]).expect_err("trailing separator");
+        assert_eq!(
+            err.to_string(),
+            "Unable to parse option 'drift_calibration' in section 'temperature_probe name'"
+        );
+
+        // Not three coefficients (`:492-495`).
+        let err = read(&[("drift_calibration", "300, 0")]).expect_err("two coefficients");
+        assert_eq!(err.to_string(), "Invalid polynomial in drift calibration");
+
+        // Adjacent curves must not meet over `drift_calibration_min_temp ..
+        // max_validation_temp` (`:657-673`): `200 - T` reaches the constant
+        // 150 exactly at 50 °C.
+        let err =
+            read(&[("drift_calibration", "200, -1, 0\n150, 0, 0")]).expect_err("the curves cross");
+        assert_eq!(
+            err.to_string(),
+            "temperature_probe name: invalid calibration detected, curve at index 1 overlaps \
+             previous curve at temp 50C."
+        );
+    }
+
+    /// `adjust_freq` / `unadjust_freq` through `_calc_freq`: both gates, all
+    /// three interpolation branches, and the round trip
+    /// (`temperature_probe.py:674-710`).
+    #[test]
+    fn adjust_and_unadjust_walk_the_curves_upstreams_way() {
+        let (printer, _, _) = machine();
+        // Parallel curves `pᵢ(T) = aᵢ - T`, so every branch moves.
+        let (helper, state) = read_drift(
+            &printer,
+            &[
+                ("calibration_temp", "25"),
+                ("drift_calibration", "300, -1, 0\n200, -1, 0\n100, -1, 0"),
+            ],
+        );
+        assert!(helper.is_enabled());
+
+        // Above the highest curve at the origin (260 at 40 °C): correct by
+        // the curve's own drift, 275 - 260 (`:702-704`).
+        assert_eq!(helper.adjust_freq(300., Some(40.)), 315.);
+        // Between two curves: interpolate — 110 sits halfway between 60 and
+        // 160 at 40 °C, and lands halfway between 75 and 175 at 25 °C.
+        assert_eq!(helper.adjust_freq(110., Some(40.)), 125.);
+        // Below every curve: untouched (`:709-710`).
+        assert_eq!(helper.adjust_freq(50., Some(40.)), 50.);
+        // …and back out to the origin temperature, exactly.
+        assert_eq!(helper.unadjust_freq(125., Some(40.)), 110.);
+
+        // With no temperature given the sensor's reading is the origin —
+        // shared state set to 40 °C, the same answer as above.
+        lock_state(&state).measurement.0 = 40.;
+        assert_eq!(helper.adjust_freq(110., None), 125.);
+        assert_eq!(helper.unadjust_freq(125., None), 110.);
+
+        // `freq < min_freq` short-circuits: `min_freq` is -20 (the lowest
+        // curve at 120 °C), and below it nothing is corrected — even where
+        // the curves at an out-of-range origin would have moved it.
+        assert_eq!(helper.adjust_freq(-30., Some(200.)), -30.);
+        assert_eq!(helper.adjust_freq(0., Some(200.)), 175.);
+
+        // A stopped run switches the correction off wholesale (`:622-624`).
+        helper.start_calibration();
+        assert!(!helper.is_enabled());
+        assert_eq!(helper.adjust_freq(300., Some(40.)), 300.);
+        assert_eq!(helper.unadjust_freq(300., Some(40.)), 300.);
+    }
+
+    /// `finish_calibration` with no run behind it (`:627-636`): upstream's
+    /// `calibration_samples` is `None` here; the port reports the length
+    /// check's refusal rather than the `TypeError` upstream walks into.
+    #[test]
+    fn finish_without_a_run_reports_not_enough_samples() {
+        let (printer, _, _) = machine();
+        let (helper, _) = read_drift(&printer, USABLE_DRIFT);
+
+        let err = helper
+            .finish_calibration(true)
+            .expect_err("there were no samples");
+        assert_eq!(err.to_string(), "calibration error, not enough samples");
+        // An aborted run is silent, whatever is behind it (`:630-631`).
+        assert!(helper.finish_calibration(false).is_ok());
+    }
+
+    /// A finished run: nine fits at their window heights, the crossing check,
+    /// the two `configfile.set` writes and the report
+    /// (`temperature_probe.py:639-656`).
+    #[tokio::test]
+    async fn finish_calibration_fits_and_saves_the_curves() {
+        let m = Machine::new("temperature_probe probe").await;
+        let helper = drift_helper(&m.printer, &m.probe, USABLE_DRIFT);
+        helper.start_calibration();
+        {
+            let mut state = helper.lock();
+            let samples = state
+                .calibration_samples
+                .as_mut()
+                .expect("start_calibration opened the buckets");
+            // Nine constant curves, 300 down to 140, over three temperatures
+            // each — every adjacent pair stays strictly ordered.
+            for (i, window) in samples.iter_mut().enumerate() {
+                let level = 300. - 20. * i as f64;
+                for temp in [20., 30., 40.] {
+                    window.push((temp, level));
+                }
+            }
+        }
+        helper.finish_calibration(true).expect("the run fits");
+
+        // The buckets went with the run (`:627-629`).
+        assert!(helper.lock().calibration_samples.is_none());
+
+        // The two writes (`:645-649`): the window temperatures bound the
+        // range, so the saved minimum is the first sample's 20 °C.
+        let configfile = m
+            .printer
+            .lookup_object_as::<PrinterConfig>(CONFIGFILE_OBJECT)
+            .expect("configfile is registered");
+        let status = configfile.get_status(0.);
+        let pending = &status["save_config_pending_items"]["temperature_probe probe"];
+        assert_eq!(pending["drift_calibration_min_temp"], json!("20.0"));
+        let saved = pending["drift_calibration"]
+            .as_str()
+            .expect("the curves are saved as text");
+        let lines: Vec<&str> = saved.split('\n').collect();
+        assert_eq!(lines.len(), DRIFT_SAMPLE_COUNT);
+        for (i, line) in lines.iter().enumerate() {
+            let coefs: Vec<f64> = line
+                .split(',')
+                .map(|coef| coef.trim().parse().expect("a number"))
+                .collect();
+            assert_eq!(coefs.len(), 3, "line {i}: {line}");
+            // The fit recovers each constant; the flat coefficients only have
+            // to round away — the solve may leave a hair of one behind.
+            assert!(
+                (coefs[0] - (300. - 20. * i as f64)).abs() < 1e-6,
+                "line {i}: {line}"
+            );
+            assert!(
+                coefs[1].abs() < 1e-6 && coefs[2].abs() < 1e-6,
+                "line {i}: {line}"
+            );
+        }
+
+        // The report (`:650-656`).
+        assert!(
+            m.replies()
+                .iter()
+                .any(|line| line.contains("temperature_probe probe: generated 9 2D polynomials")),
+            "{:?}",
+            m.replies()
+        );
+        assert!(
+            m.replies().iter().any(|line| line.contains(
+                "The SAVE_CONFIG command will update the printer config file and restart the \
+                 printer."
+            )),
+            "{:?}",
+            m.replies()
+        );
+    }
+
+    /// Curves that would cross are refused before anything is saved —
+    /// `_check_calibration` through `gcode.error` (`:645`, `:657-673`).
+    #[test]
+    fn finish_calibration_refuses_curves_that_cross() {
+        let (printer, _, _) = machine();
+        let (helper, _) = read_drift(&printer, USABLE_DRIFT);
+        helper.start_calibration();
+        {
+            let mut state = helper.lock();
+            let samples = state
+                .calibration_samples
+                .as_mut()
+                .expect("start_calibration opened the buckets");
+            // Window 0 below the rest: the pair meets at the first
+            // validation temperature, the first sample's 20 °C.
+            for (i, window) in samples.iter_mut().enumerate() {
+                let level = if i == 0 { 100. } else { 200. };
+                for temp in [20., 30., 40.] {
+                    window.push((temp, level));
+                }
+            }
+        }
+        let err = helper
+            .finish_calibration(true)
+            .expect_err("the curves cross");
+        assert_eq!(
+            err.to_string(),
+            "temperature_probe name: invalid calibration detected, curve at index 1 overlaps \
+             previous curve at temp 20C."
+        );
+
+        // The check runs before `configfile.set` (`:645`), so nothing was
+        // queued for `SAVE_CONFIG`.
+        let configfile = printer
+            .lookup_object_as::<PrinterConfig>(CONFIGFILE_OBJECT)
+            .expect("configfile is registered");
+        assert_eq!(
+            configfile.get_status(0.)["save_config_pending"],
+            json!(false)
+        );
+    }
+
+    /// `TEMPERATURE_PROBE_ENABLE` reaches `set_enabled` and `get_status`
+    /// reads the flag back — the command wired to the helper (`:446-448`,
+    /// `:457-459`).
+    #[tokio::test]
+    async fn enable_drives_the_registered_helper() {
+        let m = Machine::new("temperature_probe probe").await;
+        let helper = drift_helper(&m.printer, &m.probe, USABLE_DRIFT);
+        assert!(helper.is_enabled());
+        assert_eq!(m.probe.get_status(0.0)["compensation_enabled"], json!(true));
+
+        m.run("TEMPERATURE_PROBE_ENABLE PROBE=probe ENABLE=0")
+            .await
+            .expect("the command runs");
+        assert!(!helper.is_enabled());
+        assert_eq!(
+            m.probe.get_status(0.0)["compensation_enabled"],
+            json!(false)
+        );
+
+        m.run("TEMPERATURE_PROBE_ENABLE PROBE=probe ENABLE=1")
+            .await
+            .expect("the command runs");
+        assert!(helper.is_enabled());
+        assert_eq!(m.probe.get_status(0.0)["compensation_enabled"], json!(true));
+
+        // The word itself is required (`gcmd.get_int("ENABLE")`, `:530`).
+        let err = m
+            .run("TEMPERATURE_PROBE_ENABLE PROBE=probe")
+            .await
+            .expect_err("ENABLE is read");
+        assert_eq!(
+            err.to_string(),
+            "Error on 'TEMPERATURE_PROBE_ENABLE PROBE=probe': missing ENABLE"
+        );
+    }
+
+    /// The two refusals `set_enabled` guards an impossible enable with
+    /// (`temperature_probe.py:533-541`).
+    #[tokio::test]
+    async fn enable_refuses_what_could_never_work() {
+        // Curves, but no saved Z-calibration temperature.
+        let m = Machine::new("temperature_probe probe").await;
+        drift_helper(
+            &m.printer,
+            &m.probe,
+            &[("drift_calibration", "300, 0, 0\n200, 0, 0\n100, 0, 0")],
+        );
+        let err = m
+            .run("TEMPERATURE_PROBE_ENABLE PROBE=probe ENABLE=1")
+            .await
+            .expect_err("there is no temperature to correct toward");
+        assert_eq!(
+            err.to_string(),
+            "Z Calibration temperature not configured, cannot enable temperature drift \
+             compensation"
+        );
+        assert_eq!(
+            m.probe.get_status(0.0)["compensation_enabled"],
+            json!(false)
+        );
+
+        // No curves at all.
+        let m = Machine::new("temperature_probe probe").await;
+        drift_helper(&m.printer, &m.probe, &[("calibration_temp", "25")]);
+        let err = m
+            .run("TEMPERATURE_PROBE_ENABLE PROBE=probe ENABLE=1")
+            .await
+            .expect_err("there is nothing to apply");
+        assert_eq!(
+            err.to_string(),
+            "No drift calibration configured, cannot enable temperature drift compensation"
+        );
+    }
+
+    /// `_collect_sample`'s split (`temperature_probe.py:178`): the sensor's
+    /// reading with no helper, the helper's sweep with one — which here stops
+    /// at the probe lookup, since no `probe_eddy_current` object is on this
+    /// machine.
+    #[tokio::test]
+    async fn collect_sample_follows_the_helper_or_the_sensor() {
+        let m = Machine::new("temperature_probe probe").await;
+        let coord = Coord::new(0., 0., 0., 0.);
+
+        m.sensor.read(1000., 41.);
+        let temp = m
+            .probe
+            .collect_sample(&coord, 0.)
+            .await
+            .expect("the sensor's reading");
+        assert_eq!(temp, 41.);
+
+        drift_helper(&m.printer, &m.probe, USABLE_DRIFT);
+        let err = m
+            .probe
+            .collect_sample(&coord, 0.)
+            .await
+            .expect_err("the eddy probe object is missing");
+        assert_eq!(
+            err.to_string(),
+            "Unknown config object 'probe_eddy_current probe'"
+        );
+    }
+
+    /// The helper rides the state machine where upstream puts it: reset when
+    /// the run starts (`:388`), closed out when it ends (`:249-254`).
+    #[tokio::test]
+    async fn the_state_machine_drives_the_helper_where_upstream_does() {
+        let m = Machine::new("temperature_probe probe").await;
+        let helper = drift_helper(&m.printer, &m.probe, USABLE_DRIFT);
+        assert!(helper.is_enabled());
+
+        // `:387-388`: the run switches the correction off and opens the
+        // buckets.
+        let gcmd = m.command(
+            "TEMPERATURE_PROBE_CALIBRATE",
+            &[("TARGET", "10"), ("STEP", "2")],
+        );
+        m.probe
+            .start_calibration(&gcmd, "manual")
+            .await
+            .expect("the run starts");
+        assert!(!helper.is_enabled());
+        assert!(helper.lock().calibration_samples.is_some());
+
+        // Close the interactive probe without sampling: the manual probe's
+        // `ABORT` runs `_finalize_drift_cal(False)`, whose helper call comes
+        // back silent with the buckets taken (`:249-254`).
+        m.run("ABORT").await.expect("the run aborts");
+        Machine::settle().await;
+        assert!(helper.lock().calibration_samples.is_none());
+        assert!(
+            m.replies()
+                .iter()
+                .any(|line| line.contains("temperature_probe probe: calibration aborted")),
+            "{:?}",
+            m.replies()
+        );
+
+        // The successful close-out: fill a valid run and let COMPLETE carry
+        // it through `finalize` into `finish_calibration(true)`.
+        helper.start_calibration();
+        {
+            let mut state = helper.lock();
+            let samples = state
+                .calibration_samples
+                .as_mut()
+                .expect("start_calibration opened the buckets");
+            for (i, window) in samples.iter_mut().enumerate() {
+                let level = 300. - 20. * i as f64;
+                for temp in [20., 30., 40.] {
+                    window.push((temp, level));
+                }
+            }
+        }
+        lock_state(&m.probe.state).sample_count = 3;
+        let complete = m.command("TEMPERATURE_PROBE_COMPLETE", &[]);
+        m.probe
+            .cmd_complete(&complete)
+            .await
+            .expect("the run completes");
+        assert!(
+            m.replies()
+                .iter()
+                .any(|line| line.contains("temperature_probe probe: generated 9 2D polynomials")),
+            "{:?}",
+            m.replies()
+        );
+        assert!(helper.lock().calibration_samples.is_none());
+    }
+
+    /// The batch client's window bookkeeping (`_on_bulk_data_recd`,
+    /// `temperature_probe.py:586-603`): rows land in their window, rows that
+    /// pass one retire it, and the last retirement lets the client stay.
+    #[test]
+    fn the_sweep_buckets_samples_and_retires_windows_upstreams_way() {
+        let mut sweep = SweepState::default();
+        for i in 0..DRIFT_SAMPLE_COUNT {
+            let start = 10. + i as f64;
+            sweep.move_times.push((i, start, start + 0.1));
+        }
+        let mut rows = Vec::new();
+        // Before the first window: recorded nowhere (`:599-600`).
+        rows.push([9.5, 555., 555.]);
+        // Window 0's sample, then a row in the gap that retires it without
+        // landing anywhere (`:591-597`).
+        rows.push([10.05, 1000., 0.]);
+        rows.push([10.5, 555., 555.]);
+        // One row per remaining window.
+        for i in 1..DRIFT_SAMPLE_COUNT {
+            rows.push([10. + i as f64 + 0.05, 1000. - i as f64, i as f64]);
+        }
+        // Past the last window: the sweep is done, and the answer is
+        // `idx >= DRIFT_SAMPLE_COUNT - 1` — the client may stay (`:592-594`).
+        rows.push([18.2, 0., 0.]);
+        assert!(sweep.absorb(&rows, 42.));
+        assert!(sweep.move_times.is_empty());
+        for i in 0..DRIFT_SAMPLE_COUNT {
+            assert_eq!(
+                sweep.probe_samples[i],
+                vec![(1000. - i as f64, i as f64)],
+                "window {i}"
+            );
+            assert_eq!(sweep.temps[i], 42.);
+        }
+
+        // With no window open every message is a keep-alive (`:586-587`).
+        let mut idle = SweepState::default();
+        assert!(idle.absorb(&[[10.05, 1000., 0.]], 42.));
+    }
+
+    /// The sweep's results (`:617-624`): the averaged temperature over all
+    /// nine windows, each window's average, and the refusal for a window the
+    /// stream never filled (upstream divides by its length there and raises).
+    #[test]
+    fn the_sweep_averages_each_window_and_refuses_an_empty_one() {
+        let mut sweep = SweepState::default();
+        for i in 0..DRIFT_SAMPLE_COUNT {
+            let start = 10. + i as f64;
+            sweep.move_times.push((i, start, start + 0.1));
+            sweep.temps[i] = 42.;
+            sweep.probe_samples[i].push((1000. - i as f64, i as f64));
+        }
+        let (sample_temp, windows) = sweep.into_samples(0.).expect("every window has data");
+        // `sum(temps) / len(temps)` over the nine (`:617-618`).
+        assert_eq!(sample_temp, 42.);
+        assert_eq!(windows.len(), DRIFT_SAMPLE_COUNT);
+        for (i, (temp, freq)) in windows.iter().enumerate() {
+            assert_eq!(*temp, 42.);
+            assert_eq!(*freq, 1000. - i as f64);
+        }
+
+        let mut incomplete = SweepState::default();
+        incomplete.temps[0] = 42.;
+        incomplete.probe_samples[0].push((1000., 0.));
+        let err = incomplete.into_samples(0.).expect_err("window 1 is empty");
+        assert_eq!(
+            err.to_string(),
+            "Failed calibration - incomplete sensor data"
+        );
+    }
+
+    /// The wiring gate (`temperature_probe.py:125-137`): a section that names
+    /// `probe_eddy_current <name>` must find its object — the loader
+    /// registers it before this factory runs — and one that does not runs
+    /// without a helper, upstream's `else`.
+    #[test]
+    fn the_drift_wiring_follows_the_probe_section() {
+        // The sibling section exists but its object does not (a machine
+        // where nothing registered the eddy probe): upstream's
+        // `printer.load_object(...)` would have built it; the port reports
+        // the lookup it does instead.
+        let (printer, _, _) = machine();
+        let heaters = heaters::ensure(&printer).expect("heaters registers");
+        heaters.add_sensor_factory(
+            "Scripted",
+            Arc::new(|_, _| Ok(Arc::new(ScriptedSensor::default()) as Arc<dyn heaters::Sensor>)),
+        );
+        let text = "\
+[temperature_probe probe]
+sensor_type: Scripted
+
+[probe_eddy_current probe]
+sensor_type: ldc1612
+";
+        let (config, _) = Config::from_text(text).expect("the test config parses");
+        let section = config
+            .get_section("temperature_probe probe")
+            .expect("the section");
+        let access = AccessTracking::shared();
+        let wrapper = ConfigWrapper::with_config(section, Arc::clone(&access), None, &config);
+        let err = build_temperature_probe(&wrapper, &printer)
+            .expect_err("the eddy probe object is not registered");
+        assert_eq!(
+            err.to_string(),
+            "Unknown config object 'probe_eddy_current probe'"
+        );
+
+        // No sibling section: the helper stays absent (`:135-137`), and the
+        // drift options are not read — they would not be valid here either.
+        let (printer, _, _) = machine();
+        let heaters = heaters::ensure(&printer).expect("heaters registers");
+        heaters.add_sensor_factory(
+            "Scripted",
+            Arc::new(|_, _| Ok(Arc::new(ScriptedSensor::default()) as Arc<dyn heaters::Sensor>)),
+        );
+        let text = "[temperature_probe probe]\nsensor_type: Scripted\n";
+        let (config, _) = Config::from_text(text).expect("the test config parses");
+        let section = config
+            .get_section("temperature_probe probe")
+            .expect("the section");
+        let access = AccessTracking::shared();
+        let wrapper = ConfigWrapper::with_config(section, Arc::clone(&access), None, &config);
+        let probe = build_temperature_probe(&wrapper, &printer).expect("the section loads");
+        assert!(probe.drift_helper().is_none());
     }
 }

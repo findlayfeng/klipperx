@@ -91,6 +91,20 @@ points: 100, 100
 
 空的续行与整行注释不参与连接，也不会终止多行值。
 
+**序列化与回写（2026-10-03，`0960f44`）**：写多行值时（`SAVE_CONFIG` 块与 `build_config_string`），
+值内的换行落为 **tab 缩进续行**（与上游 `configparser` 逐字同形）；**空的首行被保留**——
+`key:`（值为空）后接缩进续行的配置，读回时值以 `\n` 开头（同 configparser；执行侧 gcode 逐行跑、
+空行无害）。块内形状示例：
+
+```ini
+#*# [temperature_probe probe]
+#*# drift_calibration =
+#*# \t300, 0, 0
+#*# \t200, 0, 0
+```
+
+（上例中 `\t` 为实际 tab 字符，紧跟在 `#*# ` 之后。）
+
 ### 空节（Empty Section）
 
 节可以没有参数，仅用于声明存在。

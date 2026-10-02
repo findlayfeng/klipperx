@@ -300,7 +300,8 @@ identify 的命令**定义**（名称、参数、解码）与其它命令一样�
 | `led.rs` | LED 六段一体（`led`/`neopixel`/`dotstar`/`pca9533`/`pca9632` + `display_template` 惰性单例）：共享 `LEDHelper`，上游仅因 Python 模块布局分文件（`led.py` 等五文件+`display/display.py:168`）；`SET_LED`/`SET_LED_TEMPLATE` 未注册（H3/H8） |
 | `extruder_stepper.rs` | `[extruder_stepper <name>]` prefix 段：段全读+绑定校验（上游文案）+`motion_queue` 记账+`SET_PRESSURE_ADVANCE` 按名挂值（`extruder_stepper.py:23`）；宿主 step 同步待 toolhead 缝（H10） |
 | `exclude_object.rs` | `[exclude_object]` 零选项段 + 四命令（`EXCLUDE_OBJECT[_START/_END/_DEFINE]`）+ 排除区移动变换（`exclude_object.py`）；语料用例已随宏体渲染引擎转绿（2026-09-24） |
-| `virtual_sdcard.rs` | `[virtual_sdcard]`：`path` 必填 + `on_error_gcode`（`virtual_sdcard.py:322`）；文件回放命令族未注册（H4） |
+| `virtual_sdcard.rs` | `[virtual_sdcard]`：`path` 必填 + `on_error_gcode`（`virtual_sdcard.py:322`）；文件管理 + `M20`–`M27`/`M28`–`M30`（`cmd_error`）/`SDCARD_RESET_FILE`/`SDCARD_PRINT_FILE` 命令族已注册；`M24` 经 `do_resume` 注册 reactor 定时器 → spawn 回放 task，逐行 `gcode.run_script` 回放，`M25`/`do_pause` 经 `must_pause_work` 旗标停回放，EOF/pause/error 分别 `print_stats.note_complete/pause/error` 收尾。省略：`gcode.get_mutex().test()` 让出（本仓无该 API）、`_handle_analyze_shutdown`/`_handle_debuginput_exit`、`stats`（`PrinterObject` 无 `stats`）；`path` 不做 `expanduser`/`normpath`，按原样用于 `read_dir`（语料 `sdcard_loop.cfg` 的相对 `path` 靠语料测试期切 CWD 到 klipper 根解析） |
+| `print_stats.rs` | `print_stats` 打印机对象（`print_stats.py`）：`state`（standby/printing/paused/complete/error/cancelled）、`filename`、`filament_used`、`total_duration`/`print_duration`/`prev_pause_duration`、`info_total_layer`/`info_current_layer`；`set_current_file`/`note_start`/`note_pause`/`note_complete`/`note_error`/`note_cancel`/`reset`；`SET_PRINT_STATS_INFO`（`TOTAL_LAYER`/`CURRENT_LAYER`，0 清空、切换 total 重置 current、current 截断到 total）；`get_status` 三态形状；耗材靠 `gcode_move.get_status` 的 `position[3]`/`extrude_factor`。省略 `_handle_activate_extruder`（`extruder:activate_extruder` 事件未 fire） |
 | `display_status.rs` | `[display_status]` 裸段（`display_status.py:49`）；`M73`/`M117`/`SET_DISPLAY_TEXT` 已注册（批 #7，`[display]` 会按需创建它） |
 | `homing_override.rs` | `[homing_override]`：`axes`/`set_position_*`/`gcode`（`homing_override.py:65`）；G28 包装未装（模板未渲染，H9 共担） |
 | `sdcard_loop.rs` | `[sdcard_loop]` 裸段：`SDCARD_LOOP_*` 三命令的栈/索引语义已单测钉住（`sdcard_loop.py:72`），命令本身未注册（H4） |
@@ -313,7 +314,7 @@ identify 的命令**定义**（名称、参数、解码）与其它命令一样�
 | `adxl345.rs` + `cmd/adxl345.rs` | `[adxl345]` 加速度计（SPI、`axes_map`、`rate` 默认 3200）与 `adxl345/dump_adxl345` 端点（wave-2）；bulk 数据通路待共享泛化 |
 | `mpu9250.rs` + `cmd/mpu9250.rs` | `[mpu9250]` 加速度计（I2C、默认 0x68/400k、`rate` 4000）与 `mpu9250/dump_mpu9250`（wave-2）；同上的 bulk gap |
 | `filament_switch_sensor.rs` + `filament_motion_sensor.rs` + `buttons.rs` | 断料检测两段与 `[buttons]` 依赖对象（wave-2，`extruders.test` 转绿即其验收） |
-| `pause_resume.rs` | `[pause_resume]` 节与 `PAUSE`/`RESUME`/`CLEAR_PAUSE`/`CANCEL_PRINT`（批 #15）；`pause_resume/*` 三个 webhooks 端点未注册，`virtual_sdcard` 的暂停/恢复原语未做 |
+| `pause_resume.rs` | `[pause_resume]` 节与 `PAUSE`/`RESUME`/`CLEAR_PAUSE`/`CANCEL_PRINT`（批 #15）；`pause_resume/*` 三个 webhooks 端点未注册；`virtual_sdcard` 的 `do_pause`/`do_resume`/`do_cancel` 已实现，`is_sd_active` 现可达（`is_active` 反映回放 task） |
 | `heater_fan.rs` | `[heater_fan <name>]`：`Fan` 核心 + `klippy:ready` 起的每秒 tick，任一 heater 有 target 或温度 > `heater_temp` 即为 `fan_speed`，**仅速度变化时写 PWM**（批 #6；`printers.test` 的 run 级收益） |
 | `fan_generic.rs` | `[fan_generic <name>]`：全部选项交给 `Fan` 核心（`shutdown_speed` 默认 **0.0**），注册 mux 命令 `SET_FAN_SPEED FAN=<name>`；`TEMPLATE=` 分支明确拒绝（模板引擎已存在于 `extras/template.rs`，但这条缝未接，批 #18） |
 | `safe_z_home.rs` | `[safe_z_home]`：接管 G28（Z-hop → 按需 `X0 Y0` → 安全位 → `Z0`）；`section!(order = 70, phase = late)` **必须晚于 toolhead（`printer`，order 60 late）**，否则 `unregister_command("G28")` 得 `None`；与 `[homing_override]` 互斥（批 #6） |

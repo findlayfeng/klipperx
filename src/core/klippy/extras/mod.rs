@@ -68,6 +68,7 @@ pub mod mpu9250;
 pub mod multi_pin;
 pub mod output_pin;
 pub mod pause_resume;
+pub mod print_stats;
 pub mod probe;
 pub mod probe_eddy_current;
 pub mod pulse_counter;

@@ -677,6 +677,28 @@ SPI_SEND     DEVICE=flash DATA=04          // spi send ok
 |------|------|------|
 | `LDC_CALIBRATE_DRIVE_CURRENT` | `CHIP`（传感器名） | 对目标 LDC1612 做驱动电流标定，回显 `reg_drive_current` 提取值并给出 `SAVE_CONFIG` 提示（细节见 `extras/ldc1612.rs`）；`ldc1612` 对象由 probe_eddy_current 构造（接线随 M5d 落地生效），该命令随对象装载注册 |
 
+## 虚拟 SD 卡与打印统计（`[virtual_sdcard]` / `print_stats`）
+
+`[virtual_sdcard]` 装载后注册主机侧文件打印命令族（上游 `klippy/extras/virtual_sdcard.py`）；`print_stats` 对象随 `virtual_sdcard` 懒装载，注册 `SET_PRINT_STATS_INFO`。
+
+| 命令 | 参数 | 说明 |
+|------|------|------|
+| `M20` | — | 列出 SD 目录：`Begin file list` / 每行 `<名> <字节>` / `End file list`（顶层，不滤扩展名） |
+| `M21` | — | 回显 `SD card ok` |
+| `M23` | `<filename>`（裸参数） | 选中 SD 文件（去前导 `/`，大小写不敏感匹配）；回显 `File opened:<名> Size:<字节>` / `File selected`；回放中报 `SD busy` |
+| `M24` | — | 开始/恢复 SD 打印：`do_resume` 注册 reactor 定时器 → spawn 回放 task，逐行 `gcode.run_script` 回放；已在回放时报 `SD busy` |
+| `M25` | — | 暂停 SD 打印：置 `must_pause_work`，回放 task 下一次迭代退出并 `note_pause` |
+| `M26` | `S`（int，minval 0） | 设文件位置 `file_position`（回放中报 `SD busy`） |
+| `M27` | — | 报 SD 打印状态：无文件时 `Not SD printing.`，否则 `SD printing byte <pos>/<size>` |
+| `M28` / `M29` / `M30` | — | 上游 SD 写命令，本仓报 `SD write not supported` |
+| `SDCARD_RESET_FILE` | — | 清除已装载的 SD 文件（必要时暂停并关闭）；从 SD 回放中执行时报错 |
+| `SDCARD_PRINT_FILE` | `FILENAME` | 重置后装载 SD 文件（去前导 `/`，含子目录递归查找）并立即 `do_resume` 开始打印；回放中报 `SD busy` |
+| `SET_PRINT_STATS_INFO` | `TOTAL_LAYER`（int，minval 0）/ `CURRENT_LAYER`（int，minval 0） | 传递切片层信息：`TOTAL_LAYER=0` 清空两值；切换 `TOTAL_LAYER` 重置 `CURRENT_LAYER=0`；`CURRENT_LAYER` 截断到 `TOTAL_LAYER` |
+
+**进度与状态**：`virtual_sdcard` 的 `get_status` 报 `file_path`/`progress`/`is_active`/`file_position`/`file_size`；`print_stats` 的 `get_status` 报 `filename`/`total_duration`/`print_duration`/`filament_used`/`state`/`message`/`info`。回放结束按结果 `note_complete`（EOF）/`note_pause`（被暂停）/`note_error`（错误，并渲染运行 `on_error_gcode`）。
+
+**未实现**：`gcode.get_mutex().test()` 让出（本仓无该 API，回放期间外部命令交错与上游不同）、`_handle_analyze_shutdown`/`_handle_debuginput_exit`、`stats`。`path` 不做 `expanduser`/`normpath`，按原样用于目录列举。
+
 ## 未注册命令的处理
 
 没有命中处理器的命令走默认处理器（对应上游 `klippy/gcode.py` 的 `cmd_default`）：

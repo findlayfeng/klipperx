@@ -800,6 +800,28 @@ mod tests {
     /// `KLIPPERX_UPSTREAM_VERBOSE=1` prints a per-case line with its duration).
     #[test]
     fn upstream_test_cases_run() {
+        // Upstream's `test/klippy/test-klippy.sh` runs each case with the
+        // klipper source root as the working directory, so a config's relative
+        // `path:` (only `sdcard_loop.cfg` ships one: `test/klippy/sdcard_loop`)
+        // resolves the way `os.listdir` does in upstream. This port's cases run
+        // in-process with cargo's working directory, which is the package
+        // root (a worktree where `test/` is not even present); without this
+        // guard `[virtual_sdcard]`'s `get_file_list` cannot find the directory.
+        // No other test reads a path relative to the working directory — they
+        // all go through `klipper_dir()` / `CARGO_MANIFEST_DIR` — so the
+        // process-global change is scoped to this one function and restored on
+        // exit, including a panic.
+        struct CwdGuard(Option<std::path::PathBuf>);
+        impl Drop for CwdGuard {
+            fn drop(&mut self) {
+                if let Some(prev) = self.0.take() {
+                    let _ = std::env::set_current_dir(prev);
+                }
+            }
+        }
+        let _cwd_guard = CwdGuard(std::env::current_dir().ok());
+        let _ = std::env::set_current_dir(klipper_dir());
+
         let all = std::env::var_os("KLIPPERX_UPSTREAM_ALL").is_some();
 
         let mut ran = 0usize;

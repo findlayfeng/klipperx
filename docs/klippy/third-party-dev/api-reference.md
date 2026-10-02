@@ -793,6 +793,10 @@
 | `SET_HEATER_TEMPERATURE` | 设置任意加热器温度 |
 | `PID_CALIBRATE` | PID 自整定 |
 
+> `PID_CALIBRATE` 由**首台加热器装载**时注册（配置无加热器则该命令不存在）；结果经
+> `configfile.set` 暂存 `control` / `pid_Kp` / `pid_Ki` / `pid_Kd` 四条，执行 `SAVE_CONFIG`
+> 才写回并重启（2026-10-03；详见主机侧 `user-manual/gcode-commands.md` 的命令参考）。
+
 ### 速度与加速度
 | 命令 | 说明 |
 |------|------|

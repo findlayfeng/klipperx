@@ -867,13 +867,16 @@ mod tests {
     }
 
     /// A `gcode` option replaces the default script (`idle_timeout.py:26-28`),
-    /// rendered as a template.
+    /// rendered as a template. The value keeps the empty first line its
+    /// option line carries — upstream's `configparser` does the same
+    /// (`get` returns `'\n…'`) — so the render starts with a newline; the
+    /// script runs line by line and an empty line is nothing.
     #[test]
     fn test_a_configured_idle_gcode_is_rendered() {
         let (printer, _reactor) = loaded(
             "[idle_timeout]\ngcode:\n    {% if 'heaters' in printer %}TURN_OFF_HEATERS\n    {% endif %}M84\n",
         );
-        assert_eq!(idle(&printer).render(&printer).unwrap(), "M84");
+        assert_eq!(idle(&printer).render(&printer).unwrap(), "\nM84");
 
         struct Present;
         impl PrinterObject for Present {
@@ -886,7 +889,7 @@ mod tests {
             .expect("the name is free");
         assert_eq!(
             idle(&printer).render(&printer).unwrap(),
-            "TURN_OFF_HEATERS\nM84"
+            "\nTURN_OFF_HEATERS\nM84"
         );
     }
 

@@ -1229,17 +1229,19 @@ pub fn load_adc_temperature_prefix(
     Ok(Arc::new(SensorSection))
 }
 
-// The sections the loader must know about. `thermistor` is prefix-only; the bare
-// `[adc_temperature]` is upstream's "load the defaults" switch.
+// The sections the loader must know about. `thermistor` and the
+// `adc_temperature` prefix are definitions; the bare `[adc_temperature]` is
+// upstream's "load the defaults" switch.
 //
 // `phase = early` is load-bearing: this loader walks a phase's main sections
 // before its prefix sections, so a prefix-only *definition* only precedes the
 // generic `[extruder]`/`[heater_bed]` sections if it sits in an earlier phase.
-// A `[thermistor <name>]` registers a sensor factory that those sections look up
-// through `sensor_type` while they are being loaded, so an `order` below 20
-// would not help — within the generic phase the prefixes still load after every
-// main section. Upstream does not need this because it loads a file's sections
-// in file order. Same reason as `adc_scaled` (see its module docs).
+// `[thermistor <name>]` and `[adc_temperature <name>]` each register a sensor
+// factory that those sections look up through `sensor_type` while they are
+// being loaded, so an `order` below 20 would not help — within the generic
+// phase the prefixes still load after every main section. Upstream does not
+// need this because it loads a file's sections in file order. Same reason as
+// `adc_scaled` (see its module docs).
 section!(
     "thermistor",
     order = 20,
@@ -1249,6 +1251,7 @@ section!(
 section!(
     "adc_temperature",
     order = 25,
+    phase = early,
     load = load_config,
     prefix = load_adc_temperature_prefix
 );
@@ -1337,6 +1340,41 @@ mod tests {
             // The definition was claimed: the loader would otherwise report
             // `Section 'thermistor MyThermistor' is not a valid config section`.
             assert!(printer.lookup_object("thermistor MyThermistor").is_some());
+        }
+    }
+
+    /// The `[adc_temperature <name>]` twin of the test above: `[extruder]` is a
+    /// *main* section, and a phase loads its main sections before its prefix
+    /// sections, so a generic-phase definition would register its factory too
+    /// late — `setup_heater` resolves `sensor_type` while the consumer loads.
+    /// Both file layouts must load, which is what `phase = early` on the
+    /// `adc_temperature` declaration buys (see the `section!` comment).
+    #[test]
+    fn test_a_custom_adc_temperature_loads_before_or_after_its_consumer() {
+        use crate::core::klippy::config::Config;
+        use crate::core::klippy::reactor::ManualReactor;
+
+        let head = "[mcu]\nserial: /dev/not-opened-yet\n\
+             [stepper_x]\nstep_pin: PA0\ndir_pin: PA1\nrotation_distance: 40\nmicrosteps: 16\n\
+             position_max: 200\n";
+        let definition =
+            "[adc_temperature MyAdc]\ntemperature1: 25\nvoltage1: 0\ntemperature2: 100\nvoltage2: 2\n";
+        let extruder = "[extruder]\nstep_pin: PA2\ndir_pin: PA3\nrotation_distance: 33.5\n\
+             microsteps: 16\nnozzle_diameter: 0.4\nfilament_diameter: 1.75\nheater_pin: PB0\n\
+             sensor_type: MyAdc\nsensor_pin: PA4\ncontrol: pid\n\
+             pid_Kp: 1\npid_Ki: 0.1\npid_Kd: 10\nmin_temp: 0\nmax_temp: 250\n\
+             min_extrude_temp: 0\n";
+
+        for text in [
+            format!("{head}{definition}{extruder}"),
+            format!("{head}{extruder}{definition}"),
+        ] {
+            let printer = Arc::new(Printer::new(ManualReactor::shared()));
+            let (config, _) = Config::from_text(&text).expect("the test config parses");
+            printer
+                .load_config(&config)
+                .expect("the custom adc_temperature resolves in either layout");
+            assert!(printer.lookup_object("adc_temperature MyAdc").is_some());
         }
     }
 }

@@ -16,9 +16,10 @@
 //!
 //! [`info`](info), [`objects/list`](objects_list), [`objects/query`](objects_query),
 //! [`objects/subscribe`](objects_subscribe), the five [`gcode`](gcode)
-//! endpoints, [`emergency_stop`](emergency_stop) and
-//! [`register_remote_method`](register_remote_method) are written and registered
-//! by [`register`](super::register); the rest of the documented surface is not
+//! endpoints, [`emergency_stop`](emergency_stop),
+//! [`register_remote_method`](register_remote_method) and the three
+//! [`pause_resume`](pause_resume) endpoints are written and registered by
+//! [`register`](super::register); the rest of the documented surface is not
 //! written yet, so the table below is the checklist.
 //!
 //! | Endpoint | Status |
@@ -32,7 +33,7 @@
 //! | `emergency_stop` | done ([`emergency_stop`]) |
 //! | `query_endstops/status` | done ([`query_endstops`]) |
 //! | `register_remote_method` | done ([`register_remote_method`]) |
-//! | `pause_resume/{pause,resume,cancel}` | not started |
+//! | `pause_resume/{pause,resume,cancel}` | done ([`pause_resume`]) |
 //! | `bed_mesh/dump_mesh` | not started |
 //! | the `*/dump_*` mux endpoints | mechanism ready ([`WebhooksStatus::register_mux_endpoint`](super::webhooks::WebhooksStatus::register_mux_endpoint); instances are re-registered per config load and detached on the way out); `ldc1612` / `adxl345` / `mpu9250` / `load_cell` consumed; the rest arrive with their extras |
 
@@ -52,6 +53,7 @@ pub mod info;
 pub mod objects_list;
 pub mod objects_query;
 pub mod objects_subscribe;
+pub mod pause_resume;
 pub mod query_endstops;
 pub mod register_remote_method;
 
@@ -61,3 +63,4 @@ pub use info::{Info, InfoParams, InfoResponse};
 pub use objects_list::ObjectsList;
 pub use objects_query::{ObjectsQuery, ObjectsQueryParams};
 pub use objects_subscribe::{ObjectsSubscribe, SUBSCRIPTION_REFRESH_TIME};
+pub use pause_resume::PauseResumeEndpoint;

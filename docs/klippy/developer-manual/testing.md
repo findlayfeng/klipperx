@@ -163,7 +163,8 @@ git config core.hooksPath .githooks
 |------|------|
 | `mod.rs` | 解析语法与上游 `configparser` 对齐：节头可带 `#` / `;` 行内注释、`:` 与 `=` 等价且取最先出现者、非空首行的缩进续行（值以换行连接）、缩进的 `[x]` 是续行而非节头、`;` 仅在行首或前为空白时开始注释、引号内的 `#` 保留；**选项名统一小写**（`optionxform = str.lower`），节名与值保留原样；重复选项（同节内大小写不同）按上游行为取最后写入者 |
 | `wrapper.rs` | 类型化 getter 与范围/取值文案（`get_choice`、`get_float_bounded` 等）、`get_list` 记账；`deprecate` 只对写过的选项记一条警告；**选项名大小写折叠**：任意查询大小写可读、`must be specified` 保留调用方大小写、同节大小写重复后者胜、`prefix_options` 返回小写名、access 键小写、节名与多行值保留原样 |
-| `object.rs` | `configfile` 状态形状与 `set`/`remove_section` 的 pending 记账（含节移除记为 `null`）；`warnings` 的五种形状（`deprecated_option` / `deprecated_value` / `deprecated_gcode` / `deprecated_mcu_code` / `runtime_warning`）的字段与上游文案、按序列化键去重 |
+| `object.rs` | `configfile` 状态形状与 `set`/`remove_section` 的 pending 记账（含节移除记为 `null`）；`warnings` 的五种形状（`deprecated_option` / `deprecated_value` / `deprecated_gcode` / `deprecated_mcu_code` / `runtime_warning`）的字段与上游文案、按序列化键去重；`set`/`remove_section` 同步维护块 fileconfig（`autosave_fileconfig`/`has_pending_sections`） |
+| `save_config.rs` | `SAVE_CONFIG` 回写：把待写项追加进 `#*#` 块（正文保留、块加新值）并以带时间戳备份换旧文件；无预先块时新建块；无待写项时文件原样不动；正文里与块重复的选项被注释掉（块获胜） |
 | `access.rs` | 读取账本：按名（大小写不敏感）登记、按节分组、每节只列一次 |
 | `section.rs` | 节存储：按 id+sub 区分同名选项、替换不重复、保持插入序、按 id 过滤遍历；`get_list` 去空白丢空项并拼多行值、缺项报错、`get_list_of_lists` 解析 `名:值` 对与条数不对的报错；`get`/`get_str`/`get_text`/`has` 按小写键查询（存储侧已是小写）、节名不折叠 |
 | `source.rs` | 配置来源的 `Display` |
@@ -197,7 +198,7 @@ git config core.hooksPath .githooks
 |------|------|
 | `printer.rs` | 状态与事件名即线上名；生命周期：新机器是 `startup`、`bring_up` 先按注册顺序 `connect` 每个对象再上线到 `ready` 并按序发 `connect`/`ready`/（firmware_restart）/`disconnect`、对象 `connect` 失败即 `invoke_shutdown` 并带上原因、已停机的机器 `bring_up` 不 connect 任何对象、handler 按注册顺序调用、`run` 等另一线程的 `request_exit`（先在另一线程起 `run`）、先请求退出则不等待、首个退出结果固定、`invoke_shutdown` 只接受首条消息、停机后 `bring_up` 不会变成 `ready`；对象表：**新机器没有任何对象**（`webhooks` 是主机侧的）、注册顺序、重名被拒且首个注册保留、按名 `lookup_object` 拿得到且未注册返回 `None`、`connect` 默认是空实现；时间：`eventtime` 就是机器的 reactor 的钟（`ManualReactor` 拨表后跟着变）、`Printer::reactor()` 交回的正是建机器时给的那个；**内存覆盖**：`override_config` 按 section 分存、重记即覆盖、别的 section 不受影响；`prepare_firmware_restart` 按注册顺序 await 每个对象的 `before_firmware_restart`（`test_prepare_firmware_restart_awaits_every_part`） |
 | `mathutil.rs` | `coordinate_descent`：二次函数收敛到 1e-4；耦合残差的平面拟合恢复已知平面到 1e-3（实测 4.4e-6）；误差永不改善时的步长阈值退出；每轮都改善时的 10000 轮上限（精确断言 20001 次误差调用，防死循环） |
-| `load.rs` | `Printer::load_config`：主 section 先于前缀 section、按 section identifier 登记、`[mcu]`→`mcu` 与 `[mcu x]`→`mcu x`、未知 section 报上游原文 `Section 'x' is not a valid config section`、空配置装载为空、坏接口要到 `connect` 才报、**交给工厂的 section 带上打印机记的内存覆盖**（`override_config` 改的选项真的会被读到，其键名与解析器一样按 `optionxform` 折叠）、**工厂调用 `ConfigWrapper::deprecate` 时警告落到装载器带进来的 `configfile` 对象** |
+| `load.rs` | `Printer::load_config`：主 section 先于前缀 section、按 section identifier 登记、`[mcu]`→`mcu` 与 `[mcu x]`→`mcu x`、未知 section 报上游原文 `Section 'x' is not a valid config section`、空配置装载为空、坏接口要到 `connect` 才报、**交给工厂的 section 带上打印机记的内存覆盖**（`override_config` 改的选项真的会被读到，其键名与解析器一样按 `optionxform` 折叠）、**工厂调用 `ConfigWrapper::deprecate` 时警告落到装载器带进来的 `configfile` 对象**；**`configfile` 对象带上 `#*#` 块并注册 `SAVE_CONFIG` 命令**（命令用 `printer.start_args().config_file` 落盘并 `request_restart`） |
 
 ### `reactor`
 

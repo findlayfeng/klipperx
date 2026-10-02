@@ -538,11 +538,20 @@ impl GCodeDispatch {
     }
 
     /// The printer this dispatcher reports to (`gcode:request_restart` and
+    /// the shutdown message). `Weak` by design: see `Inner::printer`.
     /// friends are sent there).
     ///
     /// `None` once the printer is gone, which is the end of the process.
     pub fn printer(&self) -> Option<Arc<Printer>> {
         self.inner.printer.upgrade()
+    }
+
+    /// Request a restart with the given reason — upstream
+    /// `gcode.request_restart` (`klippy/gcode.py:352`). Exposed so a module
+    /// that must finish file work (a `SAVE_CONFIG`) can trigger the reload
+    /// after it is done.
+    pub(crate) fn request_restart(&self, result: &str) {
+        self.inner.request_restart(result);
     }
 
     /// Register a command handler.
@@ -1318,7 +1327,7 @@ impl Inner {
     /// `GCodeDispatch.request_restart` (`klippy/gcode.py:352-362`): with the
     /// printer ready, note the last print time, fire `gcode:request_restart`,
     /// dwell, and wait for the queued moves; then ask the printer to exit.
-    fn request_restart(&self, result: &str) {
+    pub(crate) fn request_restart(&self, result: &str) {
         // No printer left means nothing to restart: the process is already on
         // its way out (the `Weak` is why this cannot keep it alive).
         let Some(printer) = self.printer.upgrade() else {

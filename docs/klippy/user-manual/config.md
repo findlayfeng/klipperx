@@ -621,7 +621,7 @@ pins: !PD0, PD1, PD2
 补偿方式是把自己装成 `gcode_move` 的移动变换：G-Code 空间的 Z 按平面加/减，喷嘴相对床面的
 实际 Z 保持平整；`M114`/`GET_POSITION` 看到的是补偿后的值。`BED_TILT_CALIBRATE` 逐点探测后
 用 `coordinate_descent` 拟合平面并立即应用，同时把三项以 `%.6f` 记入 `SAVE_CONFIG` 待写区
-（**落盘仍需 `SAVE_CONFIG`，该回写见 TODO C2，本仓尚未实现**）。
+（`SAVE_CONFIG` 命令把这些回写项写回文件并重启，见配置装载）。
 
 ### `[z_tilt]` — 多 Z 电机调平（`Z_TILT_ADJUST`）
 
@@ -823,7 +823,7 @@ cartesian 在 late 阶段认领；注册 `dual_carriage` 对象与 `SET_DUAL_CAR
 
 段与对象已落地（2026-09-24 批 #3，`eddy.test` 转绿）；**同名 section 按上游 `strict=False` 后写覆盖合并**（本仓自 2026-09-24 起，eddy.cfg 双段即其用例）。静态标定与 `PROBE_EDDY_CURRENT_CALIBRATE`/`Z_OFFSET_APPLY_PROBE` 未实现（模块残差注记）。
 
-> 配置解析补充（批 #5）：除同名 section 合并外，`#*# SAVE_CONFIG` 自动保存块按上游 `_find_autosave_data` **读取合并**（header 逐字节识别、`#*# ` 前缀剥离、正文优先/块只补新、损坏行告警）——语料 `delta_calibrate.cfg` 的双段与高度数据即其用例（回写侧 `SAVE_CONFIG` 命令未做）。
+> 配置解析补充（批 #5）：除同名 section 合并外，`#*# SAVE_CONFIG` 自动保存块按上游 `_find_autosave_data` **读取合并**（header 逐字节识别、`#*# ` 前缀剥离、正文优先/块只补新、损坏行告警）——语料 `delta_calibrate.cfg` 的双段与高度数据即其用例（回写侧 `SAVE_CONFIG` 命令把待写项写回文件并重启）。
 
 ### `[input_shaper]` — 输入整形参数（wave-2）
 

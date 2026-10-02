@@ -56,7 +56,7 @@ H1–H12 是上游 extras 里按域归并的消费者（2026-09-21 全量盘点�
 | # | 事项 | 依赖 |
 |---|---|---|
 | C1 | 运动层收尾：轴/stepper 抽象 + 多轴（C1a）、extruder 运动（C1b）、运动学族（C1c：delta/polar/generic_cartesian/rotary_delta/winch/deltesian 全落地）、print-time 回调（C1d）——**✅ 收官** | — |
-| C2 | 配置装载：框架部分 ✅（FW1，含 choice/range 文案与 `deprecate` 警告）；autosave/`SAVE_CONFIG` 仍待（属模块） | — |
+| C2 | 配置装载：框架部分 ✅（FW1，含 choice/range 文案与 `deprecate` 警告）；autosave/`SAVE_CONFIG` 写回 ✅（2026-10-02，详见下） | — |
 | D1 | 主机层 start args / rollover / `--logfile` ✅（FW8）；剩余：`debuginput`/`debugoutput` 的命令行接线与每 MCU 字典路径 | — |
 
 **MCU 资源与总线**
@@ -267,13 +267,7 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 
 ### C2 配置装载收尾（框架 FW1）
 
-- [ ] **autosave / `SAVE_CONFIG`**：`#*#` 自动保存区块的**读取侧已落地**（2026-09-24 批 #5，忠实移植 `_find_autosave_data`——语料 `delta_calibrate.cfg` 的双段+高度数据即其验收，`delta_calibrate.test` 转绿；修正：此前「语料 0 个 `#*#`」的统计口径是 `config/` 示例目录、非 `test/klippy` 语料）。余下是回写侧：`SAVE_CONFIG` 命令、备份、重启，属模块而非框架；`bed_tilt` / PID /
-      `probe_eddy_current` 等消费者都依赖它（上游 `klippy/configfile.py:248`、`:346`）。
-      语料里 **0 个配置带 `#*#` 区块**，本项对当前回归失败数为零——原先「首位失败是
-      `pid_Kp` 49 次」的归因有误，那实际是选项名大小写问题，已修复归零（见下方失败原因
-      统计）。本项要做的是写回侧：`PID_CALIBRATE` 等调用 `configfile.set()` 后由
-      `SAVE_CONFIG` 落盘（重启）。
-      （`getchoice` 与 `minval/maxval/above/below/count` 文案已由框架补齐并归档，见 FW1/C2。）
+- [x] **autosave / `SAVE_CONFIG` 写回侧**（2026-10-02）：`#*#` 区块读取合并批 #5 已落地；回写侧由 `%s 待办无` —— `SAVE_CONFIG` 命令在本批完成：`Config` 保留块 fileconfig（`autosave_block`）、`PrinterConfig` 在 `set`/`remove_section` 同步维护它并暴露给写回侧、`config/save_config.rs` 把块序列化回文件（`#*# ` 前缀、正文去重让块获胜、带时间戳备份 + temp/rename 换主文件）、装载器注册 `SAVE_CONFIG` 并 `request_restart` 重启重读。消费者（`PID_CALIBRATE`、`probe_eddy_current`、`bed_tilt` 等）依赖它做完。语料 0 个 `#*#` 块，不引入回归。
 
 ### D1 主机层 start args / rollover / 日志（框架 FW8）
 

@@ -441,12 +441,13 @@ mod tests {
     // distinguishing them from the hand-written tests below (`a_*`,
     // `the_corpus_*`, …).
     //
-    // The generated cases are written to `src/core/klippy/upstream_generated.rs`
-    // (gitignored) by `test-support/build.rs` and pulled in here with a relative
-    // `include!`. The whole module is `#[cfg(test)]`, so the file only needs to
-    // exist under `cargo test` — which is exactly when the dev-dependency's
-    // build script runs and writes it.
-    include!("upstream_generated.rs");
+    // The generated cases live under `src/core/klippy/upstream_generated/`
+    // (gitignored) — one file per upstream `.test`, with config / dictionary /
+    // g-code frozen in as raw string literals — and are pulled in here with a
+    // relative `include!`. The whole module is `#[cfg(test)]`, so the files
+    // only need to exist under `cargo test` — which is exactly when the
+    // dev-dependency's build script runs and writes them.
+    include!("upstream_generated/mod.rs");
 
     /// Entry point the generated `#[test]`s call — the runtime half of the
     /// generated corpus. Each generated function passes the frozen config path,

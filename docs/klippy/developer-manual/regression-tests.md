@@ -335,7 +335,8 @@ harness 把每个 `[mcu]` / `[mcu <name>]` 的传输键换成 `test: dict=<字�
 独立的 `#[test]`（命名 `upstream_<stem>_config_<n>_<cfg>`），config 路径、字典路径、g-code、
 `SHOULD_FAIL` 标志全部固化在生成代码里——运行时不再扫语料、不再读 `GCODE` 文件。生成的测试
 `include!`进 `src/core/klippy/upstream.rs` 的 `#[cfg(test)] mod upstream`，文件本身
-（`src/core/klippy/upstream_generated.rs`）被 gitignore，永不提交。
+（`src/core/klippy/upstream_generated/`，一个 `.test` 一个 `.rs`、config 与字典复制到
+`fixtures/`、g-code 内联为 raw string）被 gitignore，永不提交。
 
 用 `cargo test` 加名字过滤运行（名字即生成函数名）：
 

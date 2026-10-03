@@ -600,8 +600,24 @@ impl std::fmt::Debug for TemperatureProbe {
 }
 
 /// Upstream's `round(value, 2)` (`temperature_probe.py:460-461`).
+///
+/// Python's `round` is half-to-even (banker's rounding), not Rust's
+/// half-away-from-zero `.round()`. The logic mirrors [`round8`] but scales
+/// to two decimal places.
 fn round2(value: f64) -> f64 {
-    (value * 100.0).round() / 100.0
+    let scaled = value * 100.0;
+    let floor = scaled.floor();
+    let frac = scaled - floor;
+    let up = if frac > 0.5 {
+        true
+    } else if frac < 0.5 {
+        false
+    } else {
+        // Exactly halfway: land on the even neighbour, as Python does — an
+        // odd `floor` moves up to the even `floor + 1`.
+        (floor as i64) % 2 != 0
+    };
+    (if up { floor + 1.0 } else { floor }) / 100.0
 }
 
 // ===========================================================================
@@ -4008,5 +4024,40 @@ sensor_type: ldc1612
         let wrapper = ConfigWrapper::with_config(section, Arc::clone(&access), None, &config);
         let probe = build_temperature_probe(&wrapper, &printer).expect("the section loads");
         assert!(probe.drift_helper().is_none());
+    }
+
+    // ---- round2 half-to-even ----
+
+    /// `round2` matches Python's `round(v, 2)` — half-to-even, not
+    /// half-away-from-zero. The cases below are genuine half-way points
+    /// (where `v * 100.0` is exactly `xxx.5` in IEEE 754) and were verified
+    /// against CPython's `round(v, 2)`.
+    #[test]
+    fn round2_half_to_even_matches_python() {
+        // 2.005 * 100 = 200.5 — halfway. Even neighbour is 200 → 2.00.
+        // Rust's .round() (half-away-from-zero) would give 2.01.
+        assert_eq!(round2(2.005), 2.0);
+        // 3.445 * 100 = 344.5 — halfway. Even neighbour is 344 → 3.44.
+        // Rust's .round() would give 3.45.
+        assert_eq!(round2(3.445), 3.44);
+        // 3.455 * 100 = 345.5 — halfway. Even neighbour is 346 → 3.46
+        // (floor is odd, so we round up to even).
+        assert_eq!(round2(3.455), 3.46);
+        // 0.055 * 100 = 5.5 — halfway. Even neighbour is 6 → 0.06
+        // (floor is odd, so we round up to even).
+        assert_eq!(round2(0.055), 0.06);
+    }
+
+    /// Values that are not exact halves round normally in both modes —
+    /// `round2` must still produce the standard nearest-neighbour result.
+    #[test]
+    fn round2_non_half_values_round_normally() {
+        assert_eq!(round2(2.344), 2.34);
+        assert_eq!(round2(2.346), 2.35);
+        assert_eq!(round2(0.0), 0.0);
+        assert_eq!(round2(65.0), 65.0);
+        // Negative: -3.445 * 100 = -344.5, floor = -345 (odd in absolute
+        // terms), even neighbour is -344 → -3.44.
+        assert_eq!(round2(-3.445), -3.44);
     }
 }

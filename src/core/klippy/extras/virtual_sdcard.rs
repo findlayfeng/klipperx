@@ -28,15 +28,13 @@
 //!   timer runs (`virtual_sdcard.py:272-276`). `PrinterObject` has no `stats`
 //!   method, so this is omitted; `stats` is a reactor scheduling hint, not
 //!   user-visible.
-//! - **`do_pause` synchronous wait** — upstream's `do_pause` spins until the
-//!   replay task exits (`virtual_sdcard.py:123-127`). This port's `do_pause`
-//!   sets the flag and returns immediately; the task exits on its next
-//!   iteration, and `is_active` turns `false` only after the task actually
-//!   ends. `do_cancel` has the same caveat: it does not wait for the task to
-//!   stop before closing the file, so `pause_resume`'s `CANCEL_PRINT` — the
-//!   one caller that can reach it during a replay (`extras/pause_resume.rs`)
-//!   — closes the file under the winding-down task, where upstream's wait
-//!   (`virtual_sdcard.py:123-127`) keeps the two serial.
+//! - **`do_pause` now waits** for the replay task to exit, matching
+//!   upstream's synchronous spin (`virtual_sdcard.py:123-127`). The wait is
+//!   async (`tokio::time::sleep` polling `work_active`) so the replay task
+//!   can run to completion on the same runtime; the `cmd_from_sd` guard
+//!   skips the wait when `do_pause` is called from a replayed line (avoiding
+//!   self-deadlock). `do_cancel` and `reset_file` both call `do_pause`, so
+//!   they also wait before closing the file.
 //! - **`expanduser`/`normpath`** — upstream runs `normpath(expanduser(…))`
 //!   over `path`; this port uses it as-is for `join`. Corpus paths are
 //!   relative (`test/klippy/sdcard_loop`) and need no expansion.
@@ -48,6 +46,7 @@ use std::path::Path;
 #[cfg(test)]
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde_json::{json, Value};
 
@@ -270,9 +269,12 @@ impl VirtualSdCard {
 
     /// `_reset_file()` (`virtual_sdcard.py:113-118`): close the current file,
     /// zero the counters, reset print_stats, and fire `virtual_sdcard:reset_file`.
-    fn reset_file(&self) {
+    ///
+    /// Calls `do_pause` first, so if a replay is running it waits for the
+    /// task to exit before closing the file (upstream's serial ordering).
+    async fn reset_file(&self) {
         if self.current_file.lock().unwrap().is_some() {
-            self.do_pause();
+            self.do_pause().await;
             self.current_file.lock().unwrap().take();
         }
         *self.file_position.lock().unwrap() = 0;
@@ -282,17 +284,25 @@ impl VirtualSdCard {
             .send_event(&KlippyEvent::VirtualSdcardResetFile);
     }
 
-    /// `do_pause()` (`virtual_sdcard.py:123-127`): set the pause flag. The
-    /// replay task checks this flag each iteration and exits the loop.
+    /// `do_pause()` (`virtual_sdcard.py:123-127`): set the pause flag and,
+    /// if a replay is running, wait for the replay task to exit before
+    /// returning — matching upstream's synchronous spin. The wait is async
+    /// (`tokio::time::sleep` polling `work_active`) so the replay task can
+    /// run to completion on the same runtime.
     ///
-    /// Upstream waits synchronously for `work_timer` to go `None`; this port
-    /// returns immediately and the task exits on its next iteration (module
-    /// docs).
+    /// The `cmd_from_sd` guard skips the wait when `do_pause` is called from
+    /// a replayed line (e.g. M25 inside the file), avoiding self-deadlock:
+    /// the replay task is the caller and cannot exit while `do_pause` is
+    /// blocking it.
     ///
-    /// `pub(crate)` for the `pause_resume` SD seam (`extras/pause_resume.rs`);
-    /// behaviour unchanged.
-    pub(crate) fn do_pause(&self) {
+    /// `pub(crate)` for the `pause_resume` SD seam (`extras/pause_resume.rs`).
+    pub(crate) async fn do_pause(&self) {
         *self.must_pause_work.lock().unwrap() = true;
+        // Upstream: `while self.work_timer is not None and not
+        // self.cmd_from_sd: reactor.pause(monotonic()+.001)`.
+        while *self.work_active.lock().unwrap() && !*self.cmd_from_sd.lock().unwrap() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
     }
 
     /// `do_resume()` (`virtual_sdcard.py:128-133`): clear the pause flag and
@@ -336,13 +346,14 @@ impl VirtualSdCard {
     }
 
     /// `do_cancel()` (`virtual_sdcard.py:134-139`): close the file, cancel
-    /// print_stats, and zero the counters.
+    /// print_stats, and zero the counters. Calls `do_pause` first, so if a
+    /// replay is running it waits for the task to exit before closing the
+    /// file.
     ///
-    /// `pub(crate)` for the `pause_resume` SD seam (`extras/pause_resume.rs`);
-    /// behaviour unchanged.
-    pub(crate) fn do_cancel(&self) {
+    /// `pub(crate)` for the `pause_resume` SD seam (`extras/pause_resume.rs`).
+    pub(crate) async fn do_cancel(&self) {
         if self.current_file.lock().unwrap().is_some() {
-            self.do_pause();
+            self.do_pause().await;
             self.current_file.lock().unwrap().take();
             self.print_stats.note_cancel();
         }
@@ -725,7 +736,7 @@ fn cmd_m23<'a>(object: &'a Arc<VirtualSdCard>, gcmd: &'a GcodeCommand) -> Comman
         if object.work_timer_is_some() {
             return Err(CommandError::new("SD busy"));
         }
-        object.reset_file();
+        object.reset_file().await;
         let mut filename = gcmd.get_raw_command_parameters();
         filename = filename.trim().to_string();
         if filename.starts_with('/') {
@@ -747,7 +758,7 @@ fn cmd_m24<'a>(object: &'a Arc<VirtualSdCard>, _gcmd: &'a GcodeCommand) -> Comma
 /// `M25` — pause SD print (`virtual_sdcard.py:160-161`).
 fn cmd_m25<'a>(object: &'a Arc<VirtualSdCard>, _gcmd: &'a GcodeCommand) -> CommandFuture<'a> {
     Box::pin(async move {
-        object.do_pause();
+        object.do_pause().await;
         Ok(())
     })
 }
@@ -789,7 +800,7 @@ fn cmd_sdcard_reset_file<'a>(
                 "SDCARD_RESET_FILE cannot be run from the sdcard",
             ));
         }
-        object.reset_file();
+        object.reset_file().await;
         Ok(())
     })
 }
@@ -803,7 +814,7 @@ fn cmd_sdcard_print_file<'a>(
         if object.work_timer_is_some() {
             return Err(CommandError::new("SD busy"));
         }
-        object.reset_file();
+        object.reset_file().await;
         let mut filename = gcmd.get(
             "FILENAME",
             None,
@@ -1242,22 +1253,22 @@ mod tests {
     // -- do_cancel -------------------------------------------------------
 
     /// `do_cancel` closes the file, calls `note_cancel`, and zeroes counters.
-    #[test]
-    fn do_cancel_closes_file_and_cancels_print_stats() {
+    #[tokio::test]
+    async fn do_cancel_closes_file_and_cancels_print_stats() {
         let dir = TempDir::new("cancel");
         let path = dir.path();
         std::fs::write(path.join("f.gcode"), "G28\nG1 X10\n").unwrap();
 
         let (_printer, object, gcode) = machine_with_dir(path);
         // Open a file via M23 so there is something to cancel.
-        gcode.run_script_sync("M23 f.gcode").unwrap();
+        gcode.run_script("M23 f.gcode").await.unwrap();
         assert_eq!(
             status_str(&object, "file_path"),
             Some("f.gcode".to_string())
         );
         // Simulate a started print so note_cancel has an effect.
         object.print_stats.note_start();
-        object.do_cancel();
+        object.do_cancel().await;
         assert_eq!(status_str(&object, "file_path"), None);
         assert_eq!(object.get_status(0.0)["file_size"], 0);
         assert_eq!(object.get_status(0.0)["file_position"], 0);
@@ -1314,13 +1325,15 @@ mod tests {
             help.get("SDCARD_PRINT_FILE").map(String::as_str),
             Some("Loads a SD file and starts the print.  May include files in subdirectories.")
         );
-        // M20-M27 are registered (no help text, but they exist as commands).
+        // M20-M30 are registered (no help text, but they exist as commands).
+        // M24 is excluded: it arms the replay (`work_active=true`) and the
+        // `ManualReactor::shared()` test context never fires the timer, so a
+        // subsequent M25 would deadlock waiting for the task to exit. M24
+        // and M25 are covered by the dedicated replay tests below.
         for cmd in &[
-            "M20", "M21", "M23", "M24", "M25", "M26", "M27", "M28", "M29", "M30",
+            "M20", "M21", "M23", "M25", "M26", "M27", "M28", "M29", "M30",
         ] {
             // Running the command should not give "unknown command" error.
-            // M20/M21 are safe to run; for others we just check they're not
-            // "unknown" by verifying the error is different.
             let _ = gcode.run_script_sync(cmd);
         }
     }
@@ -1449,6 +1462,59 @@ mod tests {
         assert!(object.is_active());
         settle().await;
         assert!(!object.is_active());
+    }
+
+    /// `do_pause` during an active replay waits for the replay task to exit
+    /// before returning, so `work_active` is `false` when it returns
+    /// (upstream `virtual_sdcard.py:123-127`).
+    #[tokio::test]
+    async fn do_pause_waits_for_replay_task_to_exit() {
+        let dir = TempDir::new("pause_wait");
+        let path = dir.path();
+        std::fs::write(path.join("job.gcode"), "M21\nM21\n").unwrap();
+
+        let (reactor, _printer, object, gcode) = machine_with_reactor(path);
+
+        gcode.run_script("M23 job.gcode").await.unwrap();
+        gcode.run_script("M24").await.unwrap();
+        assert!(object.is_active());
+
+        // Fire the timer so the replay task is spawned (but hasn't run yet).
+        reactor.run_due();
+
+        // `do_pause` sets `must_pause_work`, then yields; the replay task
+        // sees the flag and exits, setting `work_active=false`. `do_pause`
+        // returns only after the task has exited.
+        object.do_pause().await;
+
+        assert!(!object.is_active(), "the replay task has exited");
+        assert_eq!(
+            object.print_stats.get_status(0.0)["state"].as_str(),
+            Some("paused"),
+            "the print is paused, not complete"
+        );
+    }
+
+    /// `do_pause` with `cmd_from_sd=true` returns immediately without
+    /// waiting for the replay task to exit, avoiding self-deadlock when M25
+    /// is replayed from inside the file (upstream `not self.cmd_from_sd`
+    /// guard, `virtual_sdcard.py:125`).
+    #[tokio::test]
+    async fn do_pause_with_cmd_from_sd_does_not_wait() {
+        let (_dir, _printer, object, _gcode) = machine();
+
+        // Simulate the state the replay task sets before dispatching a line:
+        // work is active and the command is from the SD card.
+        *object.work_active.lock().unwrap() = true;
+        *object.cmd_from_sd.lock().unwrap() = true;
+
+        // `do_pause` should return immediately despite `work_active` being
+        // true, because `cmd_from_sd` guards the wait.
+        let result = tokio::time::timeout(Duration::from_millis(100), object.do_pause()).await;
+
+        assert!(result.is_ok(), "do_pause did not hang (cmd_from_sd guard)");
+        assert!(object.is_active(), "work_active is unchanged (no wait)");
+        assert!(*object.must_pause_work.lock().unwrap(), "pause flag is set");
     }
 
     /// M25 inside the replayed file sets `must_pause_work`, the loop exits,

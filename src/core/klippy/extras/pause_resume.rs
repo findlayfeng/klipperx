@@ -25,20 +25,20 @@
 //!
 //! # What is not here
 //!
-//! - **`do_pause` does not wait for the replay task.** Upstream's
-//!   `virtual_sdcard.do_pause` spins until the replay task has exited
-//!   (`virtual_sdcard.py:123-127`); this port's sets the pause flag and
-//!   returns at once (`extras/virtual_sdcard.rs` module docs). So a
-//!   `CANCEL_PRINT` can close the file under a replay that is still winding
-//!   down, and a `RESUME` that outruns the exiting task is refused with
-//!   `SD busy` — the refusal upstream's `do_resume` raises
-//!   (`virtual_sdcard.py:128-133`) in a much narrower window.
+//! - **`do_pause` now waits** for the replay task to exit, matching
+//!   upstream's `virtual_sdcard.do_pause` spin (`virtual_sdcard.py:123-127`).
+//!   The `SdCard` seam's `do_pause`/`do_cancel` return boxed futures so the
+//!   wait is async; `send_pause_command` and `cancel_sd_print` are async to
+//!   propagate it. The `cmd_from_sd` guard skips the wait when the pause is
+//!   called from a replayed line (upstream `not self.cmd_from_sd`).
 //! - **The three webhooks endpoints** (`pause_resume/cancel|pause|resume`,
 //!   `pause_resume.py:26-32`) live on the API side, in
 //!   `api/endpoints/pause_resume.rs`: each one runs the matching command
 //!   (`CANCEL_PRINT`/`PAUSE`/`RESUME`) through the dispatcher, looked up per
 //!   request because the endpoints are installed before this object is built.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
@@ -73,13 +73,17 @@ section!("pause_resume", order = 30, load = load_config);
 pub trait SdCard: Send + Sync {
     /// `is_active` (`pause_resume.py:46`): a file replay is running.
     fn is_active(&self) -> bool;
-    /// `do_pause`: stop the replay (`pause_resume.py:55`).
-    fn do_pause(&self);
+    /// `do_pause`: stop the replay (`pause_resume.py:55`). Returns a boxed
+    /// future because `do_pause` now waits for the replay task to exit
+    /// (upstream `virtual_sdcard.py:123-127`).
+    fn do_pause(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
     /// `do_resume`: continue the replay; `Err("SD busy")` while one is still
     /// running (`pause_resume.py:71`, `virtual_sdcard.py:128-133`).
     fn do_resume(&self) -> Result<(), CommandError>;
-    /// `do_cancel`: cancel the running print (`pause_resume.py:94`).
-    fn do_cancel(&self);
+    /// `do_cancel`: cancel the running print (`pause_resume.py:94`). Returns
+    /// a boxed future because `do_cancel` waits for the replay task to exit
+    /// via `do_pause`.
+    fn do_cancel(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
 }
 
 /// The registered `virtual_sdcard` object behind the [`SdCard`] seam — the
@@ -92,16 +96,16 @@ impl SdCard for RegisteredSdCard {
         self.0.is_active()
     }
 
-    fn do_pause(&self) {
-        self.0.do_pause();
+    fn do_pause(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(self.0.do_pause())
     }
 
     fn do_resume(&self) -> Result<(), CommandError> {
         self.0.do_resume()
     }
 
-    fn do_cancel(&self) {
-        self.0.do_cancel();
+    fn do_cancel(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(self.0.do_cancel())
     }
 }
 
@@ -187,14 +191,17 @@ impl PauseResume {
     /// inside an event, once. With a replay running the file is paused and
     /// nothing is reported; otherwise this is the
     /// `respond_info("action:paused")` branch.
-    pub fn send_pause_command(&self) {
+    ///
+    /// Async because `do_pause` now waits for the replay task to exit
+    /// (upstream `virtual_sdcard.py:123-127`).
+    pub async fn send_pause_command(&self) {
         if self.pause_command_sent.load(Ordering::SeqCst) {
             return;
         }
         if self.is_sd_active() {
             self.sd_paused.store(true, Ordering::SeqCst);
             if let Some(sd) = self.v_sd() {
-                sd.do_pause();
+                sd.do_pause().await;
             }
         } else {
             self.sd_paused.store(false, Ordering::SeqCst);
@@ -232,9 +239,12 @@ impl PauseResume {
     /// The SD side of `CANCEL_PRINT` (`pause_resume.py:93-94`): cancel the
     /// running file. A no-op without an SD object — the only caller reaches it
     /// through `is_sd_active`/`sd_paused`, which need one.
-    fn cancel_sd_print(&self) {
+    ///
+    /// Async because `do_cancel` waits for the replay task to exit via
+    /// `do_pause`.
+    async fn cancel_sd_print(&self) {
         if let Some(sd) = self.v_sd() {
-            sd.do_cancel();
+            sd.do_cancel().await;
         }
     }
 
@@ -385,7 +395,7 @@ fn cmd_pause<'a>(object: &'a Arc<PauseResume>, gcmd: &'a GcodeCommand) -> Comman
             gcmd.respond_info("Print already paused");
             return Ok(());
         }
-        object.send_pause_command();
+        object.send_pause_command().await;
         object
             .gcode()
             .ok_or_else(|| CommandError::new("Printer is not ready"))?
@@ -433,7 +443,7 @@ fn cmd_clear_pause<'a>(object: &'a Arc<PauseResume>, _gcmd: &'a GcodeCommand) ->
 fn cmd_cancel_print<'a>(object: &'a Arc<PauseResume>, gcmd: &'a GcodeCommand) -> CommandFuture<'a> {
     Box::pin(async move {
         if object.is_sd_active() || object.sd_paused.load(Ordering::SeqCst) {
-            object.cancel_sd_print();
+            object.cancel_sd_print().await;
         } else {
             gcmd.respond_info("action:cancel");
         }
@@ -512,15 +522,17 @@ mod tests {
         fn is_active(&self) -> bool {
             self.active
         }
-        fn do_pause(&self) {
+        fn do_pause(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
             self.pauses.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {})
         }
         fn do_resume(&self) -> Result<(), CommandError> {
             self.resumes.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
-        fn do_cancel(&self) {
+        fn do_cancel(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
             self.cancels.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {})
         }
     }
 
@@ -746,8 +758,8 @@ mod tests {
     /// The SD branches of the pause/resume helpers
     /// (`pause_resume.py:49-56,57-65`): the file is told, and the
     /// `action:*` reports are skipped.
-    #[test]
-    fn an_active_sd_print_is_paused_and_resumed_through_the_file() {
+    #[tokio::test]
+    async fn an_active_sd_print_is_paused_and_resumed_through_the_file() {
         let (printer, gcode, object) = machine();
         let lines = captured_lines(&printer);
         let sd = Arc::new(FakeSd {
@@ -756,7 +768,7 @@ mod tests {
         });
         *object.lock() = Some(Arc::clone(&sd) as Arc<dyn SdCard>);
 
-        object.send_pause_command();
+        object.send_pause_command().await;
         assert_eq!(sd.pauses.load(Ordering::SeqCst), 1);
         assert!(object.sd_paused.load(Ordering::SeqCst));
         assert!(emitted(&lines).is_empty(), "no `action:paused` line");
@@ -768,7 +780,7 @@ mod tests {
 
         // The guard still makes a second pause a no-op.
         object.pause_command_sent.store(true, Ordering::SeqCst);
-        object.send_pause_command();
+        object.send_pause_command().await;
         assert_eq!(sd.pauses.load(Ordering::SeqCst), 1);
         drop(gcode);
     }
@@ -898,13 +910,13 @@ mod tests {
         gcode.run_script("M24").await.expect("the replay arms");
         assert!(vsd.is_active(), "the replay is armed");
 
+        // Fire the timer so the replay task is spawned; `do_pause` will wait
+        // for it to exit. The task sees the pause flag (set by `do_pause`
+        // before it yields) and exits before dispatching a single line.
+        reactor.run_due();
+
         gcode.run_script("PAUSE").await.expect("PAUSE runs");
         assert!(object.is_paused());
-
-        // The replay task starts now: it must see the pause flag, exit before
-        // the first line, and leave the file open.
-        reactor.run_due();
-        settle().await;
         assert!(!vsd.is_active(), "the replay task exited");
 
         let out = emitted(&lines);
@@ -943,9 +955,10 @@ mod tests {
             .await
             .expect("the file loads");
         gcode.run_script("M24").await.expect("the replay arms");
-        gcode.run_script("PAUSE").await.expect("PAUSE runs");
+        // Fire the timer so the replay task is spawned; `do_pause` will wait
+        // for it to exit.
         reactor.run_due();
-        settle().await;
+        gcode.run_script("PAUSE").await.expect("PAUSE runs");
 
         // `PAUSE` held the file: nothing has been replayed yet.
         let out = emitted(&lines);
@@ -978,35 +991,35 @@ mod tests {
         assert!(!vsd.is_active());
     }
 
-    /// `do_resume`'s `SD busy` refusal (`virtual_sdcard.py:128-133`) reaches
-    /// `RESUME`: the port's `do_pause` does not wait for the replay task to
-    /// exit, so a `RESUME` that outruns it is refused, and the pause stays up.
+    /// After `do_pause` waits for the replay task to exit, `RESUME`
+    /// succeeds instead of being refused with `SD busy`. Previously, when
+    /// `do_pause` returned immediately, a `RESUME` that outran the exiting
+    /// task was refused; now `do_pause` blocks until `work_active` is
+    /// `false`, so `do_resume` finds the slot free.
     #[tokio::test]
-    async fn resume_while_the_replay_is_still_running_reports_sd_busy() {
-        let dir = TempDir::new("resume_busy");
+    async fn resume_after_pause_succeeds_when_task_has_exited() {
+        let dir = TempDir::new("resume_after_pause");
         std::fs::write(dir.path().join("job.gcode"), "M21\nM21\n").expect("the file");
-        let (_reactor, printer, gcode, object, _vsd) = sd_machine(dir.path());
-        let lines = captured_lines(&printer);
+        let (reactor, printer, gcode, object, vsd) = sd_machine(dir.path());
+        let _lines = captured_lines(&printer);
 
-        // `M24` arms the replay, but the test never fires the timer, so
-        // `work_active` — and with it `is_active` — stays `true`.
         gcode
             .run_script("M23 job.gcode")
             .await
             .expect("the file loads");
         gcode.run_script("M24").await.expect("the replay arms");
-        gcode.run_script("PAUSE").await.expect("PAUSE runs");
+        // Fire the timer so the replay task is spawned; `do_pause` will wait
+        // for it to exit.
+        reactor.run_due();
 
-        let err = gcode
-            .run_script("RESUME")
-            .await
-            .expect_err("the replay is still armed");
-        assert_eq!(err.to_string(), "SD busy");
-        assert!(object.is_paused(), "the refused RESUME leaves the pause up");
-        assert!(
-            !emitted(&lines).iter().any(|l| l.contains("action:resumed")),
-            "the SD branch reports nothing"
-        );
+        gcode.run_script("PAUSE").await.expect("PAUSE runs");
+        // `do_pause` has waited for the task to exit.
+        assert!(!vsd.is_active(), "the replay task exited");
+        assert!(object.is_paused());
+
+        // `RESUME` succeeds because `work_active` is `false`.
+        gcode.run_script("RESUME").await.expect("RESUME runs");
+        assert!(!object.is_paused());
     }
 
     /// `CANCEL_PRINT` during a replay takes the SD branch
@@ -1032,6 +1045,9 @@ mod tests {
             .lookup_object_as::<PrintStats>(PRINT_STATS_OBJECT)
             .expect("print_stats is registered")
             .note_start();
+        // Fire the timer so the replay task is spawned; `do_pause` will wait
+        // for it to exit.
+        reactor.run_due();
         gcode.run_script("PAUSE").await.expect("PAUSE runs");
         assert!(object.is_paused());
 
@@ -1050,13 +1066,7 @@ mod tests {
             !emitted(&lines).iter().any(|l| l.contains("action:cancel")),
             "the SD branch reports nothing"
         );
-
-        // The armed replay starts against a closed file and stops again
-        // without touching `print_stats`.
-        reactor.run_due();
-        settle().await;
         assert!(!vsd.is_active());
-        assert_eq!(print_state(&printer), "cancelled");
     }
 
     /// With the SD object held but no replay running, `is_sd_active()` is

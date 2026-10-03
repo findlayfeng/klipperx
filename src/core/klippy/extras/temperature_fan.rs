@@ -364,7 +364,7 @@ pub fn load_config_prefix(
         }
     };
 
-    heaters.register_sensor(config)?;
+    heaters.register_sensor(config, None, None)?;
 
     let temperature_fan = Arc::new(TemperatureFan {
         name,

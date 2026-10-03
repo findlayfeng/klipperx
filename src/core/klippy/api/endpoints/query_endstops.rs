@@ -1,7 +1,7 @@
 //! `query_endstops/status` — every endstop's current level.
 //!
 //! Upstream's `QueryEndstops._handle_web_request`
-//! (`klippy/extras/query_endstops.py:23-31`): run the queries against the last
+//! (`klippy/extras/query_endstops.py:24-32`): run the queries against the last
 //! move time, then answer `{name: "open"|"TRIGGERED"}` per endstop.
 //!
 //! ```json

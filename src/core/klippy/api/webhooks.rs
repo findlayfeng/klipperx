@@ -24,7 +24,7 @@
 //! and cannot hold it:
 //!
 //! * [`WebhooksStatus::register_mux_endpoint`] — upstream's
-//!   `register_mux_endpoint` (`klippy/webhooks.py:329-343`). An `[adxl345]`
+//!   `register_mux_endpoint` (`klippy/webhooks.py:332-346`). An `[adxl345]`
 //!   section registers `adxl345/dump_adxl345` keyed by `sensor` while the
 //!   config is read.
 //! * [`WebhooksStatus::call_remote_method`] — upstream's `call_remote_method`
@@ -80,7 +80,7 @@ pub const WEBHOOKS_OBJECT: &str = "webhooks";
 
 /// Register the `webhooks` object on a machine, once.
 ///
-/// Upstream's `add_early_printer_objects` (`klippy/webhooks.py:563-565`), which
+/// Upstream's `add_early_printer_objects` (`klippy/webhooks.py:564-567`), which
 /// the printer calls before the config is read so that a module can find the
 /// server by name while it loads. Idempotent, so a caller that is not sure
 /// whether the host already installed it can call it again.
@@ -171,7 +171,7 @@ impl WebhooksStatus {
 
     /// Register one instance of a mux endpoint.
     ///
-    /// Upstream's `WebHooks.register_mux_endpoint` (`klippy/webhooks.py:329`):
+    /// Upstream's `WebHooks.register_mux_endpoint` (`klippy/webhooks.py:332-346`):
     /// a path may serve several instances, all selected by the same key. Two
     /// registrations for a path with different keys, or the same instance
     /// twice, are config errors.

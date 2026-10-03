@@ -177,7 +177,7 @@ impl Device for SerialDevice {
 /// A reset needs the port to itself: it opens it briefly, at another rate, and
 /// toggles the control lines. It therefore has to run while the device is
 /// **closed**, which is why it is a short-lived handle rather than a device — it
-/// never reads or writes frames (`klippy/serialhdl.py:365-405`).
+/// never reads or writes frames (`klippy/serialhdl.py:365-402`).
 pub struct ModemLines {
     port: File,
     path: PathBuf,

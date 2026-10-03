@@ -33,7 +33,7 @@ use crate::core::klippy::interface::usb;
 use crate::core::klippy::mcu::McuRestartMethod;
 
 /// How long to leave the board between the steps of a reset. Upstream pauses
-/// `0.100` s between each (`klippy/serialhdl.py:365-405`).
+/// `0.100` s between each (`klippy/serialhdl.py:365-402`).
 const RESET_SETTLE: Duration = Duration::from_millis(100);
 
 /// The line speed Klipper opens at for a reset. A different rate is part of what

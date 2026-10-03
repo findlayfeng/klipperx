@@ -47,7 +47,7 @@ pub struct PrinterConfig {
     save_pending: AtomicBool,
     /// The block fileconfig, mutated by [`PrinterConfig::set`] and
     /// [`PrinterConfig::remove_section`] — upstream's
-    /// `ConfigAutoSave.fileconfig` (`configfile.py:305`), what a `SAVE_CONFIG`
+    /// `ConfigAutoSave.fileconfig` (`configfile.py:304`), what a `SAVE_CONFIG`
     /// writes back. `None` until something is set on a file without a block.
     autosave: Mutex<Option<Config>>,
 }
@@ -77,7 +77,7 @@ impl PrinterConfig {
     }
 
     /// Record an autosave value (`ConfigAutoSave.set`,
-    /// `klippy/configfile.py:317-330`).
+    /// `klippy/configfile.py:311-324`).
     ///
     /// The value is only remembered: upstream writes it back at `SAVE_CONFIG`.
     pub fn set(&self, section: &str, option: &str, value: &str) {
@@ -109,7 +109,7 @@ impl PrinterConfig {
     }
 
     /// Drop a section at the next `SAVE_CONFIG` (`ConfigAutoSave.remove_section`,
-    /// `klippy/configfile.py:331-343`).
+    /// `klippy/configfile.py:325-337`).
     pub fn remove_section(&self, section: &str) {
         self.pending
             .lock()
@@ -292,7 +292,7 @@ impl PrinterConfig {
 
     /// Record a runtime warning, deduplicated like a deprecation.
     ///
-    /// Upstream `PrinterConfig.runtime_warning` (`klippy/configfile.py:497`):
+    /// Upstream `PrinterConfig.runtime_warning` (`klippy/configfile.py:498-502`):
     /// the warning is also logged, once.
     pub fn runtime_warning(&self, message: &str) {
         let warning = json!({"type": "runtime_warning", "message": message});

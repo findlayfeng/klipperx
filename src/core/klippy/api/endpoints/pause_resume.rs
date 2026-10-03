@@ -2,7 +2,7 @@
 //! the print's pause state from a client.
 //!
 //! Upstream's three `webhooks.register_endpoint` calls in `PauseResume.__init__`
-//! (`klippy/extras/pause_resume.py:47-52`): each handler just runs the matching
+//! (`klippy/extras/pause_resume.py:27-32`): each handler just runs the matching
 //! g-code command —
 //!
 //! | Endpoint | Script |

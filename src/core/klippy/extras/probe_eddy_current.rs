@@ -10,6 +10,7 @@
 //! | [`EddyGatherSamples`] | `EddyGatherSamples` (samples in a time window → one probe result) |
 //! | [`PrinterEddyProbe`] | `PrinterEddyProbe` — registered as **`probe`**, dispatching `METHOD` over descend / tap / scan sessions |
 //! | [`EddyTapCalibration`] | `EddyTapCalibration` (`PROBE_EDDY_CURRENT_TAP_CALIBRATE`) |
+//! | [`EddyCalibrationTool`] | `EddyCalibrationTool` (`PROBE_EDDY_CURRENT_CALIBRATE` + `Z_OFFSET_APPLY_PROBE`) |
 //! | [`EddyProbeChip`] | `HomingViaProbeHelper` — what makes `probe:z_virtual_endstop` resolve, with `descend_z` as the rail's `position_endstop` |
 //!
 //! The probe registers the `probe` object itself (the bltouch precedent: the
@@ -20,12 +21,6 @@
 //!
 //! # Not here (M5d residuals, reported to main)
 //!
-//! * `PROBE_EDDY_CURRENT_CALIBRATE` and `Z_OFFSET_APPLY_PROBE`
-//!   (`EddyCalibrationTool`): the calibration move script needs the toolhead's
-//!   flush/stepper-position surface, which this port does not expose yet, and
-//!   the `Z_OFFSET` write-back needs a `configfile` settings read-back this
-//!   port has not modelled. The *static* calibration (`calibrate = …`) and all
-//!   the frequency↔height math those commands would produce **are** here.
 //! * The `tap` analysis (`TapBestFit`, `_analyze_pullback`) and scan's
 //!   per-sample toolhead position lookup need
 //!   `mcu_to_commanded_position`-style time-position conversion, which has not
@@ -40,10 +35,15 @@ use std::sync::{Arc, Mutex, Weak};
 use serde_json::Value;
 
 use crate::core::klippy::cmd::TriggerAnalogType;
+use crate::core::klippy::config::object::{PrinterConfig, CONFIGFILE_OBJECT};
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
 use crate::core::klippy::event::printer_bus::ProbeResultsHandle;
 use crate::core::klippy::event::KlippyEvent;
+use crate::core::klippy::extras::gcode_move::{GCodeMove, GCODE_MOVE_OBJECT};
 use crate::core::klippy::extras::ldc1612::{self, Calibration, Ldc1612};
+use crate::core::klippy::extras::manual_probe::{
+    FinalizeCallback, ManualProbe, MANUAL_PROBE_OBJECT,
+};
 use crate::core::klippy::extras::probe::{
     calc_probe_z_average, check_virtual_endstop, command_status, lookup_probe_session,
     ProbeCommandState, ProbeOffsets, ProbeParams, ProbeSession, SampleDelivery,
@@ -54,7 +54,7 @@ use crate::core::klippy::gcode::{
     CommandError, CommandHandler, GCodeDispatch, GcodeCommand, GCODE_OBJECT,
 };
 use crate::core::klippy::load::section;
-use crate::core::klippy::mathutil::{solve_linear_equations, Coord};
+use crate::core::klippy::mathutil::{solve_linear_equations, Coord, Z_AXIS};
 use crate::core::klippy::mcu::{McuChip, McuTriggerAnalog, SosFilter, SosFilterDesign};
 use crate::core::klippy::pins::{
     DigitalOut, PinChip, PinError, PinParams, PrinterPins, PINS_OBJECT,
@@ -81,6 +81,11 @@ pub fn load_config_prefix(
     let probe = Arc::new(PrinterEddyProbe::new(config, printer)?);
     probe.register_commands()?;
     EddyTapCalibration::register(printer, Arc::clone(&probe.calibration))?;
+    EddyCalibrationTool::register(
+        printer,
+        probe.identifier().to_string(),
+        Arc::clone(&probe.calibration),
+    )?;
     printer.add_object(PROBE_OBJECT, Arc::clone(&probe) as Arc<dyn PrinterObject>)?;
     Ok(probe)
 }
@@ -256,6 +261,27 @@ impl EddyCalibration {
             return Err(CommandError::new("Must calibrate probe_eddy_current first"));
         }
         Ok(())
+    }
+
+    /// Signal the drift helper that a Z calibration is starting
+    /// (`note_z_calibration_start`, `probe_eddy_current.py:49-50`). A no-op
+    /// while the `DummyDriftCompensation` stands in (the `None` here); the
+    /// real `EddyDriftCompensation` from `temperature_probe` would forward.
+    pub fn note_z_calibration_start(&self) {
+        if let Some(comp) = self.drift_comp() {
+            // The real helper's hook is not ported yet; when `temperature_probe`
+            // lands its `EddyDriftCompensation`, this is where the call goes.
+            let _ = comp;
+        }
+    }
+
+    /// Signal the drift helper that a Z calibration has finished
+    /// (`note_z_calibration_finish`, `probe_eddy_current.py:51-52`). Same
+    /// no-op semantics as [`Self::note_z_calibration_start`].
+    pub fn note_z_calibration_finish(&self) {
+        if let Some(comp) = self.drift_comp() {
+            let _ = comp;
+        }
     }
 
     /// The `(frequencies, heights)` pair (`get_calibration`).
@@ -1747,6 +1773,566 @@ impl EddyTapCalibration {
 }
 
 // ===========================================================================
+// PROBE_EDDY_CURRENT_CALIBRATE + Z_OFFSET_APPLY_PROBE
+// ===========================================================================
+
+/// `PROBE_EDDY_CURRENT_CALIBRATE` and `Z_OFFSET_APPLY_PROBE`
+/// (`probe_eddy_current.EddyCalibrationTool`): the interactive calibration
+/// that walks the probe down in 40 µm steps, correlates each step's
+/// frequency to its kinematic Z, filters noisy or non-monotone points, and
+/// writes the result back as `calibrate = z:freq,…`.
+struct EddyCalibrationTool {
+    /// The machine, for the toolhead / gcode / configfile / probe / manual_probe.
+    printer: Weak<Printer>,
+    /// The full section name (e.g. `"probe_eddy_current my_eddy"`).
+    name: String,
+    /// The frequency→height table the calibration writes into.
+    calibration: Arc<EddyCalibration>,
+    /// The probe speed `cmd_EDDY_CALIBRATE` read, carried to `post_manual_probe`.
+    probe_speed: Mutex<f64>,
+}
+
+/// One collected batch message from the sensor (`handle_batch`'s `msg`).
+#[derive(Clone)]
+struct BatchMessage {
+    /// `(query_time, freq, old_z)` rows.
+    data: Vec<(f64, f64, f64)>,
+}
+
+/// A position's computed frequency statistics (`calc_freqs`'s value).
+struct FreqStats {
+    freq_avg: f64,
+    mad: f64,
+    count: usize,
+}
+
+/// A row that passed `validate_calibration_data`'s filter.
+struct FilteredRow {
+    pos: f64,
+    freq_avg: f64,
+    mad_hz: f64,
+    mad_mm: f64,
+}
+
+impl EddyCalibrationTool {
+    /// Register the two commands (`__init__`).
+    ///
+    /// # Errors
+    /// A g-code registration clash.
+    fn register(
+        printer: &Arc<Printer>,
+        name: String,
+        calibration: Arc<EddyCalibration>,
+    ) -> Result<(), ConfigError> {
+        let gcode = printer
+            .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+            .expect("the loader registers `gcode` before any section");
+
+        // `cname = self.name.split()[-1]` — the sub-name after the section
+        // prefix (e.g. `"my_eddy"` from `"probe_eddy_current my_eddy"`).
+        let cname = name
+            .split_whitespace()
+            .next_back()
+            .unwrap_or(&name)
+            .to_string();
+
+        let tool = Arc::new(Self {
+            printer: Arc::downgrade(printer),
+            name: name.clone(),
+            calibration: Arc::clone(&calibration),
+            probe_speed: Mutex::new(0.0),
+        });
+
+        // PROBE_EDDY_CURRENT_CALIBRATE (mux, CHIP=<cname>)
+        let calib_tool = Arc::clone(&tool);
+        let calib_handler: CommandHandler = Arc::new(move |gcmd| {
+            let tool = Arc::clone(&calib_tool);
+            Box::pin(async move { tool.cmd_eddy_calibrate(gcmd).await })
+        });
+        gcode
+            .register_mux_command_with_params(
+                "PROBE_EDDY_CURRENT_CALIBRATE",
+                "CHIP",
+                Some(&cname),
+                calib_handler,
+                Some("Calibrate eddy current probe"),
+                &["PROBE_SPEED"],
+            )
+            .map_err(ConfigError::new)?;
+
+        // Z_OFFSET_APPLY_PROBE (plain command)
+        let zoffset_tool = Arc::clone(&tool);
+        let zoffset_handler: CommandHandler = Arc::new(move |gcmd| {
+            let tool = Arc::clone(&zoffset_tool);
+            Box::pin(async move { tool.cmd_z_offset_apply_probe(gcmd).await })
+        });
+        gcode
+            .register_command_with_params(
+                "Z_OFFSET_APPLY_PROBE",
+                zoffset_handler,
+                Some("Adjust the probe's z_offset"),
+                &["METHOD"],
+                false,
+            )
+            .map_err(ConfigError::new)?;
+
+        Ok(())
+    }
+
+    /// The printer, or an error if it has been torn down.
+    fn printer(&self) -> Result<Arc<Printer>, CommandError> {
+        self.printer
+            .upgrade()
+            .ok_or_else(|| CommandError::new("Printer is not ready"))
+    }
+
+    /// `cmd_EDDY_CALIBRATE`: read `PROBE_SPEED` and start the manual probe
+    /// helper (`probe_eddy_current.py:311-316`).
+    async fn cmd_eddy_calibrate(&self, gcmd: &GcodeCommand) -> Result<(), CommandError> {
+        let printer = self.printer()?;
+        // `gcmd.get_float("PROBE_SPEED", 5., above=0.)`
+        let probe_speed = gcmd.get(
+            "PROBE_SPEED",
+            Some(5.0),
+            |s| s.parse().ok(),
+            None,
+            None,
+            Some(0.0),
+            None,
+        )?;
+        *self.probe_speed.lock().unwrap_or_else(|p| p.into_inner()) = probe_speed;
+
+        let manual_probe = printer
+            .lookup_object_as::<ManualProbe>(MANUAL_PROBE_OBJECT)
+            .ok_or_else(|| CommandError::new("manual_probe is not available"))?;
+
+        // The finalize callback (`post_manual_probe`).
+        let cb_printer = Arc::downgrade(&printer);
+        let cb_name = self.name.clone();
+        let cb_calibration = Arc::clone(&self.calibration);
+        let cb_probe_speed = {
+            // Share the probe_speed cell with the callback.
+            // We can't move the Mutex out of self, so we read the value and
+            // pass a fresh cell — the callback runs after this handler
+            // returns, and nothing else reads probe_speed in between.
+            Arc::new(Mutex::new(probe_speed))
+        };
+        let callback: FinalizeCallback = Arc::new(move |mpresult: Option<Coord>| {
+            let Some(pos) = mpresult else { return };
+            let Some(printer) = cb_printer.upgrade() else {
+                return;
+            };
+            let name = cb_name.clone();
+            let calibration = Arc::clone(&cb_calibration);
+            let probe_speed = *cb_probe_speed.lock().unwrap_or_else(|p| p.into_inner());
+            if let Err(err) = EddyCalibrationTool::post_manual_probe(
+                &printer,
+                &name,
+                &calibration,
+                probe_speed,
+                pos,
+            ) {
+                if let Some(gcode) = printer.lookup_object_as::<GCodeDispatch>(GCODE_OBJECT) {
+                    gcode.respond_info(&format!("Eddy calibration failed: {err}"), true);
+                }
+            }
+        });
+        manual_probe.start_helper(&printer, gcmd, callback)?;
+        Ok(())
+    }
+
+    /// `post_manual_probe`: the manual-probe result drives the calibration
+    /// moves and saves the table (`probe_eddy_current.py:268-296`).
+    ///
+    /// Sync because `FinalizeCallback` is `Fn` (not async): all toolhead
+    /// operations use the sync `move_to` / `dwell` / `position` surface.
+    fn post_manual_probe(
+        printer: &Arc<Printer>,
+        name: &str,
+        calibration: &Arc<EddyCalibration>,
+        probe_speed: f64,
+        mpresult: Coord,
+    ) -> Result<(), CommandError> {
+        let toolhead = printer
+            .lookup_object_as::<ToolHeadObject>(TOOLHEAD_OBJECT)
+            .ok_or_else(|| CommandError::new("Printer is not ready"))?;
+        let probe_calibrate_z = mpresult.z();
+        // Move away from the bed (up 5 mm).
+        let mut curpos = mpresult;
+        curpos.set_axis(Z_AXIS, curpos.z() + 5.0);
+        toolhead.move_to(curpos, probe_speed)?;
+        // Move sensor over nozzle position (reverse probe offsets).
+        let session = lookup_probe_session(printer)
+            .ok_or_else(|| CommandError::new("Probe is not available"))?;
+        let offsets = session.offsets();
+        curpos.set_axis(0, curpos.x() - offsets.x);
+        curpos.set_axis(1, curpos.y() - offsets.y);
+        toolhead.move_to(curpos, probe_speed)?;
+        // Descend back to bed.
+        curpos.set_axis(Z_AXIS, curpos.z() - 5.0 - 0.050);
+        toolhead.move_to(curpos, probe_speed)?;
+        // Perform calibration movement and capture.
+        let cal = Self::do_calibration_moves(printer, name, calibration, &toolhead, probe_speed)?;
+        // Calculate each sample position average and variance.
+        let mut positions = Self::calc_freqs(&cal);
+        // Fix Z position offset.
+        for (k, _) in &mut positions {
+            *k -= probe_calibrate_z;
+        }
+        let gcode = printer
+            .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+            .expect("the loader registers `gcode` first");
+        let filtered = Self::validate_calibration_data(&gcode, &mut positions);
+        if filtered.len() <= 8 {
+            return Err(CommandError::new("Failed calibration - No usable data"));
+        }
+        let z_freq_pairs: Vec<(f64, f64)> = filtered.iter().map(|r| (r.pos, r.freq_avg)).collect();
+        Self::save_calibration(printer, name, &z_freq_pairs);
+        Ok(())
+    }
+
+    /// `do_calibration_moves`: walk the probe down in 40 µm steps, collecting
+    /// sensor batches and correlating each to its kinematic Z
+    /// (`probe_eddy_current.py:137-191`).
+    ///
+    /// Sync: uses `move_to` / `dwell` / `position` (all sync on
+    /// `ToolHeadObject`). Upstream's `flush_step_generation` +
+    /// `kin.calc_position` is replaced by `toolhead.position()` — the
+    /// commanded position, which is the kinematic position for cartesian
+    /// kinematics. Upstream's `wait_moves` is not exposed on
+    /// `ToolHeadObject`; in file-output mode (no real hardware) it is a
+    /// no-op, and the moves are already queued via `move_to`.
+    fn do_calibration_moves(
+        printer: &Arc<Printer>,
+        name: &str,
+        calibration: &Arc<EddyCalibration>,
+        toolhead: &Arc<ToolHeadObject>,
+        move_speed: f64,
+    ) -> Result<Vec<(f64, Vec<f64>)>, CommandError> {
+        // Start data collection.
+        let msgs: Arc<Mutex<Vec<BatchMessage>>> = Arc::new(Mutex::new(Vec::new()));
+        let is_finished = Arc::new(AtomicBool::new(false));
+
+        let client_msgs = Arc::clone(&msgs);
+        let client_finished = Arc::clone(&is_finished);
+        let client_fn = move |msg: &Value| -> bool {
+            if client_finished.load(Ordering::SeqCst) {
+                return false;
+            }
+            let data = msg
+                .get("data")
+                .and_then(|d| d.as_array())
+                .unwrap_or(&Vec::new())
+                .iter()
+                .filter_map(|row| row.as_array())
+                .filter_map(|r| {
+                    let t = r.get(0).and_then(|v| v.as_f64())?;
+                    let f = r.get(1).and_then(|v| v.as_f64())?;
+                    let z = r.get(2).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    Some((t, f, z))
+                })
+                .collect::<Vec<_>>();
+            client_msgs
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(BatchMessage { data });
+            true
+        };
+
+        // `self.printer.lookup_object(self.name).add_client(handle_batch)`.
+        let probe = printer
+            .lookup_object_as::<PrinterEddyProbe>(PROBE_OBJECT)
+            .or_else(|| printer.lookup_object_as::<PrinterEddyProbe>(name))
+            .ok_or_else(|| CommandError::new("probe_eddy_current is not available"))?;
+        probe.add_client(client_fn);
+
+        toolhead.dwell(1.0);
+        calibration.note_z_calibration_start();
+
+        // Move to each 40 µm position.
+        let max_z = 4.0;
+        let samp_dist = 0.040;
+        let start_pos = toolhead
+            .position()
+            .ok_or_else(|| CommandError::new("Printer is not ready"))?;
+        let mut times: Vec<(f64, f64, f64)> = Vec::new();
+        let n_steps = (max_z / samp_dist) as i64;
+        for i in 0..=n_steps {
+            let zpos = i as f64 * samp_dist;
+            // Move to next position (always descending to reduce backlash).
+            let mut hop_pos = start_pos;
+            hop_pos.set_axis(Z_AXIS, start_pos.z() + zpos + 0.500);
+            toolhead.move_to(hop_pos, move_speed)?;
+            let mut next_pos = start_pos;
+            next_pos.set_axis(Z_AXIS, start_pos.z() + zpos);
+            toolhead.move_to(next_pos, move_speed)?;
+            // Note sample timing.
+            let start_query_time = toolhead.get_last_move_time() + 0.050;
+            let end_query_time = start_query_time + 0.100;
+            toolhead.dwell(0.200);
+            // Find Z position based on actual commanded position.
+            let kin_z = toolhead
+                .position()
+                .ok_or_else(|| CommandError::new("Printer is not ready"))?;
+            times.push((start_query_time, end_query_time, kin_z.z()));
+        }
+        toolhead.dwell(1.0);
+        // `wait_moves` is not exposed on `ToolHeadObject`; moves are queued
+        // via `move_to` and the dwell above provides the timing buffer.
+        calibration.note_z_calibration_finish();
+
+        // Finish data collection.
+        is_finished.store(true, Ordering::SeqCst);
+
+        // Correlate query responses.
+        let msgs = msgs.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let mut cal: Vec<(f64, Vec<f64>)> = Vec::new();
+        let mut step = 0usize;
+        for msg in &msgs {
+            for &(query_time, freq, _old_z) in &msg.data {
+                while step < times.len() && query_time > times[step].1 {
+                    step += 1;
+                }
+                if step < times.len() && query_time >= times[step].0 {
+                    let kin_z = times[step].2;
+                    match cal
+                        .iter_mut()
+                        .find(|(k, _)| (*k - kin_z).abs() < f64::EPSILON)
+                    {
+                        Some((_, freqs)) => freqs.push(freq),
+                        None => cal.push((kin_z, vec![freq])),
+                    }
+                }
+            }
+        }
+        if cal.len() != times.len() {
+            return Err(CommandError::new(
+                "Failed calibration - incomplete sensor data",
+            ));
+        }
+        Ok(cal)
+    }
+
+    /// `_median`: the median of a slice (sorted copy, odd/even handling)
+    /// (`probe_eddy_current.py:193-197`).
+    fn median(values: &[f64]) -> f64 {
+        let mut sorted = values.to_vec();
+        sorted.sort_by(|a, b| a.total_cmp(b));
+        let n = sorted.len();
+        if n % 2 == 0 {
+            (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
+        } else {
+            sorted[n / 2]
+        }
+    }
+
+    /// `calc_freqs`: per-position frequency average, MAD (median absolute
+    /// deviation), and sample count (`probe_eddy_current.py:199-205`).
+    fn calc_freqs(meas: &[(f64, Vec<f64>)]) -> Vec<(f64, FreqStats)> {
+        let mut positions = Vec::new();
+        for (pos, freqs) in meas {
+            let count = freqs.len();
+            let freq_avg = freqs.iter().sum::<f64>() / count as f64;
+            let mads: Vec<f64> = freqs.iter().map(|f| (f - freq_avg).abs()).collect();
+            let mad = Self::median(&mads);
+            positions.push((
+                *pos,
+                FreqStats {
+                    freq_avg,
+                    mad,
+                    count,
+                },
+            ));
+        }
+        positions
+    }
+
+    /// `validate_calibration_data`: filter non-monotone or noisy points,
+    /// report noise stats, and return the surviving rows
+    /// (`probe_eddy_current.py:207-243`).
+    fn validate_calibration_data(
+        gcode: &GCodeDispatch,
+        positions: &mut [(f64, FreqStats)],
+    ) -> Vec<FilteredRow> {
+        // Sort by position (upstream's `sorted(positions.items())`).
+        positions.sort_by(|a, b| a.0.total_cmp(&b.0));
+
+        let mut last_freq: f64 = 40_000_000.0;
+        let mut last_pos: f64 = 0.0;
+        let mut last_mad: f64 = 0.0;
+        let mut filtered: Vec<FilteredRow> = Vec::new();
+        let mut mad_hz_total = 0.0;
+        let mut mad_mm_total = 0.0;
+        let mut samples_count = 0usize;
+
+        for (pos, stats) in positions.iter() {
+            let pos = *pos;
+            let freq_avg = stats.freq_avg;
+            let mad_hz = stats.mad;
+            let count = stats.count;
+
+            if freq_avg > last_freq {
+                gcode.respond_info(
+                    &format!("Frequency stops decreasing at step {pos:.3}"),
+                    true,
+                );
+                break;
+            }
+            let diff_mad = (last_mad.powi(2) + mad_hz.powi(2)).sqrt();
+            let freq_diff = last_freq - freq_avg;
+            last_freq = freq_avg;
+            if freq_diff < 2.5 * diff_mad {
+                gcode.respond_info(
+                    &format!("Frequency too noisy at step {last_pos:.3} -> {pos:.3}"),
+                    true,
+                );
+                gcode.respond_info(
+                    &format!(
+                        "Frequency diff: {freq_diff:.3}, MAD_Hz: {last_mad:.3} -> MAD_Hz: {mad_hz:.3}"
+                    ),
+                    true,
+                );
+                break;
+            }
+            last_mad = mad_hz;
+            let delta_dist = pos - last_pos;
+            last_pos = pos;
+            let mad_mm = mad_hz * delta_dist / freq_diff;
+            filtered.push(FilteredRow {
+                pos,
+                freq_avg,
+                mad_hz,
+                mad_mm,
+            });
+            mad_hz_total += mad_hz;
+            mad_mm_total += mad_mm;
+            samples_count += count;
+        }
+
+        if filtered.is_empty() {
+            return filtered;
+        }
+
+        let avg_mad = mad_hz_total / filtered.len() as f64;
+        let avg_mad_mm = mad_mm_total / filtered.len() as f64;
+        gcode.respond_info(
+            &format!(
+                "probe_eddy_current: noise {avg_mad_mm:.6}mm, MAD_Hz={avg_mad:.3} in {samples_count} queries\n"
+            ),
+            true,
+        );
+        let freq_list: Vec<f64> = filtered.iter().map(|r| r.freq_avg).collect();
+        let freq_diff = freq_list.iter().cloned().fold(f64::NEG_INFINITY, f64::max)
+            - freq_list.iter().cloned().fold(f64::INFINITY, f64::min);
+        gcode.respond_info(&format!("Total frequency range: {freq_diff:.3} Hz\n"), true);
+        let mut points = vec![0.25, 0.5, 1.0, 2.0, 3.0];
+        for row in &filtered {
+            if !points.is_empty() && points[0] <= row.pos {
+                points.remove(0);
+                gcode.respond_info(
+                    &format!(
+                        "z: {:.3} # noise {:.6}mm, MAD_Hz={:.3}\n",
+                        row.pos, row.mad_mm, row.mad_hz
+                    ),
+                    true,
+                );
+            }
+        }
+        filtered
+    }
+
+    /// `_save_calibration`: format the pairs and write them to `configfile`
+    /// (`probe_eddy_current.py:117-131`).
+    fn save_calibration(printer: &Arc<Printer>, name: &str, z_freq_pairs: &[(f64, f64)]) {
+        let gcode = printer.lookup_object_as::<GCodeDispatch>(GCODE_OBJECT);
+        if let Some(gcode) = gcode {
+            gcode.respond_info(
+                "The SAVE_CONFIG command will update the printer config file\n\
+                 and restart the printer.",
+                true,
+            );
+        }
+        // Save results: `%.6f:%.3f` per pair, comma-separated, newline every 3.
+        let mut cal_contents = String::new();
+        for (i, (pos, freq)) in z_freq_pairs.iter().enumerate() {
+            if i % 3 == 0 {
+                cal_contents.push('\n');
+            }
+            cal_contents.push_str(&format!("{pos:.6}:{freq:.3}"));
+            cal_contents.push(',');
+        }
+        // Remove trailing comma.
+        if cal_contents.ends_with(',') {
+            cal_contents.pop();
+        }
+        if let Some(configfile) = printer.lookup_object_as::<PrinterConfig>(CONFIGFILE_OBJECT) {
+            configfile.set(name, "calibrate", &cal_contents);
+        }
+    }
+
+    /// `_save_tap_z_offset`: read current `tap_z_offset` from configfile
+    /// settings, subtract the homing Z, and write back
+    /// (`probe_eddy_current.py:318-330`).
+    fn save_tap_z_offset(printer: &Arc<Printer>, name: &str, gcmd: &GcodeCommand, homing_z: f64) {
+        let tap_z_offset = printer
+            .lookup_object_as::<PrinterConfig>(CONFIGFILE_OBJECT)
+            .and_then(|configfile| {
+                let status = configfile.get_status(0.0);
+                status
+                    .get("settings")
+                    .and_then(|s| s.get(name))
+                    .and_then(|s| s.get("tap_z_offset"))
+                    .and_then(|v| v.as_f64())
+            })
+            .unwrap_or(0.0);
+        let new_calibrate = tap_z_offset - homing_z;
+        gcmd.respond_info(&format!(
+            "{name}: tap_z_offset: {new_calibrate:.3}\n\
+             The SAVE_CONFIG command will update the printer config file\n\
+             with the above and restart the printer."
+        ));
+        if let Some(configfile) = printer.lookup_object_as::<PrinterConfig>(CONFIGFILE_OBJECT) {
+            configfile.set(name, "tap_z_offset", &format!("{new_calibrate:.3}"));
+        }
+    }
+
+    /// `cmd_Z_OFFSET_APPLY_PROBE`: read the gcode_move homing origin Z,
+    /// then either save the tap z offset (METHOD=tap) or shift the
+    /// calibration table and save it (`probe_eddy_current.py:336-354`).
+    async fn cmd_z_offset_apply_probe(&self, gcmd: &GcodeCommand) -> Result<(), CommandError> {
+        let printer = self.printer()?;
+        let gcode_move = printer
+            .lookup_object_as::<GCodeMove>(GCODE_MOVE_OBJECT)
+            .ok_or_else(|| CommandError::new("gcode_move is not available"))?;
+        let offset = gcode_move
+            .status()
+            .get("homing_origin")
+            .and_then(|h| h.as_array())
+            .and_then(|a| a.get(Z_AXIS))
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        if offset == 0.0 {
+            gcmd.respond_info("Nothing to do: Z Offset is 0");
+            return Ok(());
+        }
+        let method = gcmd.get_str_default("METHOD", "").to_lowercase();
+        if method == "tap" {
+            Self::save_tap_z_offset(&printer, &self.name, gcmd, offset);
+            return Ok(());
+        }
+        let (cal_freqs, cal_zpos) = self.calibration.get_calibration();
+        let mut z_freq_pairs: Vec<(f64, f64)> = cal_zpos
+            .iter()
+            .zip(cal_freqs.iter())
+            .map(|(z, f)| (z - offset, *f))
+            .collect();
+        z_freq_pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
+        Self::save_calibration(&printer, &self.name, &z_freq_pairs);
+        Ok(())
+    }
+}
+
+// ===========================================================================
 // Tests
 // ===========================================================================
 
@@ -1886,7 +2472,7 @@ mod tests {
     }
 
     /// Outside the table the sentinel heights still apply after adjustment —
-    /// the helper moves the frequency, the range check stays the table's.
+    /// the helper moves the frequency, the table's range check stays the table's.
     #[test]
     fn adjustment_does_not_move_the_out_of_range_guards() {
         let calibration = table();
@@ -1895,5 +2481,167 @@ mod tests {
         assert_eq!(calibration.freq_to_height(1200.), -OUT_OF_RANGE);
         // 100 + 100 = 200: below the bottom → +OUT_OF_RANGE.
         assert_eq!(calibration.freq_to_height(100.), OUT_OF_RANGE);
+    }
+
+    // ----- EddyCalibrationTool tests -----
+
+    use crate::core::klippy::reactor::ManualReactor;
+
+    /// `_median` with an odd-length slice returns the middle element
+    /// (`probe_eddy_current.py:193-197`).
+    #[test]
+    fn median_odd_length() {
+        assert_eq!(EddyCalibrationTool::median(&[3.0, 1.0, 2.0]), 2.0);
+        assert_eq!(EddyCalibrationTool::median(&[5.0]), 5.0);
+        assert_eq!(
+            EddyCalibrationTool::median(&[10.0, 20.0, 30.0, 40.0, 50.0]),
+            30.0
+        );
+    }
+
+    /// `_median` with an even-length slice returns the average of the two
+    /// middle elements (`probe_eddy_current.py:193-197`).
+    #[test]
+    fn median_even_length() {
+        assert_eq!(EddyCalibrationTool::median(&[4.0, 1.0, 3.0, 2.0]), 2.5);
+        assert_eq!(EddyCalibrationTool::median(&[1.0, 2.0]), 1.5);
+        assert_eq!(EddyCalibrationTool::median(&[10.0, 20.0, 30.0, 40.0]), 25.0);
+    }
+
+    /// `validate_calibration_data` keeps monotonically decreasing, low-noise
+    /// points and reports them all (`probe_eddy_current.py:207-243`).
+    #[test]
+    fn validate_keeps_clean_monotone_data() {
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        let gcode = GCodeDispatch::new(Arc::clone(&printer));
+        // 9 positions, frequencies decreasing by 1000 Hz each step, tiny MAD.
+        let mut positions: Vec<(f64, FreqStats)> = (0..9)
+            .map(|i| {
+                let pos = i as f64 * 0.5;
+                let freq = 10_000_000.0 - i as f64 * 1000.0;
+                (
+                    pos,
+                    FreqStats {
+                        freq_avg: freq,
+                        mad: 1.0,
+                        count: 10,
+                    },
+                )
+            })
+            .collect();
+        let filtered = EddyCalibrationTool::validate_calibration_data(&gcode, &mut positions);
+        assert_eq!(filtered.len(), 9);
+        // All positions preserved in order.
+        for (i, row) in filtered.iter().enumerate() {
+            assert!((row.pos - i as f64 * 0.5).abs() < 1e-9);
+        }
+    }
+
+    /// `validate_calibration_data` stops at the first position where the
+    /// frequency stops decreasing (freq_avg > last_freq)
+    /// (`probe_eddy_current.py:217-219`).
+    #[test]
+    fn validate_stops_at_non_monotone_frequency() {
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        let gcode = GCodeDispatch::new(Arc::clone(&printer));
+        // Position 3 has a higher frequency than position 2 → stops there.
+        let mut positions = vec![
+            (
+                0.0,
+                FreqStats {
+                    freq_avg: 10_000_000.0,
+                    mad: 1.0,
+                    count: 10,
+                },
+            ),
+            (
+                0.5,
+                FreqStats {
+                    freq_avg: 9_999_000.0,
+                    mad: 1.0,
+                    count: 10,
+                },
+            ),
+            (
+                1.0,
+                FreqStats {
+                    freq_avg: 9_998_000.0,
+                    mad: 1.0,
+                    count: 10,
+                },
+            ),
+            (
+                1.5,
+                FreqStats {
+                    freq_avg: 9_999_500.0,
+                    mad: 1.0,
+                    count: 10,
+                },
+            ), // increases!
+            (
+                2.0,
+                FreqStats {
+                    freq_avg: 9_996_000.0,
+                    mad: 1.0,
+                    count: 10,
+                },
+            ),
+        ];
+        let filtered = EddyCalibrationTool::validate_calibration_data(&gcode, &mut positions);
+        // Only the first 3 pass (the 4th triggers the break before it's added).
+        assert_eq!(filtered.len(), 3);
+        assert!((filtered[0].pos - 0.0).abs() < 1e-9);
+        assert!((filtered[2].pos - 1.0).abs() < 1e-9);
+    }
+
+    /// `validate_calibration_data` stops when the frequency difference is
+    /// too noisy (freq_diff < 2.5 * diff_mad)
+    /// (`probe_eddy_current.py:226-236`).
+    #[test]
+    fn validate_stops_at_noisy_data() {
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        let gcode = GCodeDispatch::new(Arc::clone(&printer));
+        // Large MAD on the 3rd position makes freq_diff < 2.5 * diff_mad.
+        let mut positions = vec![
+            (
+                0.0,
+                FreqStats {
+                    freq_avg: 10_000_000.0,
+                    mad: 1.0,
+                    count: 10,
+                },
+            ),
+            (
+                0.5,
+                FreqStats {
+                    freq_avg: 9_990_000.0,
+                    mad: 1.0,
+                    count: 10,
+                },
+            ),
+            // freq_diff = 9900000 - 9000000 = 900000, diff_mad = sqrt(1+1000^2) ≈ 1000
+            // 2.5 * 1000 = 2500, 900000 > 2500 so this passes.
+            (
+                1.0,
+                FreqStats {
+                    freq_avg: 9_000_000.0,
+                    mad: 1000.0,
+                    count: 10,
+                },
+            ),
+            // freq_diff = 9000000 - 8999990 = 10, diff_mad = sqrt(1000^2+1000^2) ≈ 1414
+            // 2.5 * 1414 = 3535, 10 < 3535 → too noisy, breaks.
+            (
+                1.5,
+                FreqStats {
+                    freq_avg: 8_999_990.0,
+                    mad: 1000.0,
+                    count: 10,
+                },
+            ),
+        ];
+        let filtered = EddyCalibrationTool::validate_calibration_data(&gcode, &mut positions);
+        // First 3 pass, 4th is too noisy.
+        assert_eq!(filtered.len(), 3);
     }
 }

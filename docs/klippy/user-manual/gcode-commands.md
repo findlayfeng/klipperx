@@ -820,7 +820,9 @@ SPI_SEND     DEVICE=flash DATA=04          // spi send ok
 
 | 命令 | 参数 | 说明 |
 |------|------|------|
-| `PROBE_EDDY_CURRENT_TAP_CALIBRATE` | `TAP=` 子模式（信息分支/试打/拒绝文案对上游 `probe_eddy_current.py`） | eddy tap 标定流程；**静态标定 `CALIBRATE=enable` 与 `Z_OFFSET_APPLY_PROBE` 未实现**（显式报错，模块残差注记） |
+| `PROBE_EDDY_CURRENT_TAP_CALIBRATE` | `TAP=` 子模式（信息分支/试打/拒绝文案对上游 `probe_eddy_current.py`） | eddy tap 标定流程；**静态标定 `CALIBRATE=enable` 与 `Z_OFFSET_APPLY_PROBE` 已实现**（2026-10-03，`4caf425`） |
+| `PROBE_EDDY_CURRENT_CALIBRATE` | `CHIP=`（mux，段名）+ `PROBE_SPEED`（默认 5，above 0） | 手动探针 + 校准移动采样生成 `calibrate` 表（`EddyCalibrationTool`，2026-10-03） |
+| `Z_OFFSET_APPLY_PROBE` | `METHOD=`（`tap` 走 tap_z_offset 写回，否则偏移校准表） | 把回零偏移应用到校准数据（`EddyCalibrationTool`，2026-10-03） |
 
 ### SET_SERVO — 舵机控制（由 `[servo <名>]` 注册，mux 键 `SERVO=`）
 

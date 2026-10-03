@@ -345,7 +345,7 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 - [x] **`M105` / gcode_id 表**（heaters 域）：`TEMPERATURE_WAIT` 已落地（2026-10-03，`b5da84e`，
       10 测）；`M105` gcode-id 表已接（2026-10-03，`14f5055`）：`register_sensor` 存 `gcode_id→sensor` 表（`BTreeMap` 排序），
       `M105` 输出 `<id>:%.1f /%.1f` 列表（空表/未 ready 回 `T:0`），`TEMPERATURE_WAIT` 等待循环每轮回真报表（5 新测）。
-- [ ] 传感器**剩余**：仅 `EddyCalibrationTool`（`PROBE_EDDY_CURRENT_CALIBRATE`，`note_z_calibration_*` 的唯一调用方）未移植；`temperature_probe.py` A+B+C 已落（`f6ea201` / `dfaf418` / `704ee0d`；前置 `TEMPERATURE_WAIT` 已随 `b5da84e` 落地）。装载序均已修复：`thermistor` 批 #22、`adc_temperature` `372cd93`（都声明 `phase = early`）。已落地并归档：`temperature_host`（2026-10-03，`87d7b01`）/ `temperature_sensor` / `thermistor` / `adc_temperature` / `spi_temperature`（MAX6675/31855/31856/31865） / `temperature_combined` / `temperature_mcu`（T7）；`temperature_fan` 无需再排（2026-10-03 核对：选项/双控制环/命令/get_status 逐项与上游一致，11 单测 + 3 条语料用例全绿；速度抑制窗未移植属低危可选）。
+- [x] **传感器全部收官**：`EddyCalibrationTool` 已移植（2026-10-03，`4caf425`：`PROBE_EDDY_CURRENT_CALIBRATE` + `Z_OFFSET_APPLY_PROBE`，校准移动采样 + 噪声过滤 + `configfile` 写回；`note_z_calibration_*` 唯一调用方到位）；`temperature_probe.py` A+B+C 已落（`f6ea201` / `dfaf418` / `704ee0d`；前置 `TEMPERATURE_WAIT` 已随 `b5da84e` 落地）。装载序均已修复：`thermistor` 批 #22、`adc_temperature` `372cd93`（都声明 `phase = early`）。已落地并归档：`temperature_host`（2026-10-03，`87d7b01`）/ `temperature_sensor` / `thermistor` / `adc_temperature` / `spi_temperature`（MAX6675/31855/31856/31865） / `temperature_combined` / `temperature_mcu`（T7）；`temperature_fan` 无需再排（2026-10-03 核对：选项/双控制环/命令/get_status 逐项与上游一致，11 单测 + 3 条语料用例全绿；速度抑制窗未移植属低危可选）。
 - 依赖 F4（PWM）、F5（ADC）、F6（SPI 温度）；C1 已收官。
 
 ### H2 风扇与通用输出

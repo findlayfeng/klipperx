@@ -75,7 +75,7 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Map, Number, Value};
 
-use crate::core::klippy::config::{ConfigError, ConfigWrapper};
+use crate::core::klippy::config::{py_float_str, ConfigError, ConfigWrapper};
 use crate::core::klippy::gcode::{sync, CommandError, GCodeDispatch, GcodeCommand, GCODE_OBJECT};
 use crate::core::klippy::load::section;
 use crate::core::klippy::printer::{Printer, PrinterObject};
@@ -330,14 +330,15 @@ fn format_literal(value: &Value) -> String {
 }
 
 /// A number the way `repr` shows it: an integer as written, a float with its
-/// decimal point or exponent kept (`2.0`, not `2`, so it reads back a float).
+/// decimal point or exponent kept (`2.0`, not `2`, so it reads back a float;
+/// the exponent is Python's spelling too, `1e-05`).
 fn format_number(number: &Number) -> String {
     if let Some(value) = number.as_i64() {
         value.to_string()
     } else if let Some(value) = number.as_u64() {
         value.to_string()
     } else if let Some(value) = number.as_f64() {
-        format!("{value:?}")
+        py_float_str(value)
     } else {
         number.to_string()
     }
@@ -706,6 +707,28 @@ mod tests {
         assert_eq!(
             printer.status_of("save_variables", 0.0),
             Some(json!({ "variables": { "counter": 7 } }))
+        );
+    }
+
+    /// Floats reach the file in Python's `repr` spelling: an integral one keeps
+    /// its `.0`, and a small one uses Python's exponent (`save_variables.py:54`
+    /// writes `repr(val)`).
+    #[test]
+    fn test_a_saved_float_keeps_pythons_repr_spelling() {
+        let dir = TempDir::new("floatspelling");
+        let file = dir.path().join("variables.cfg");
+        let (_printer, gcode) = machine(&file);
+
+        gcode
+            .run_script_sync("SAVE_VARIABLE VARIABLE=counter VALUE=7.0")
+            .expect("the save succeeds");
+        gcode
+            .run_script_sync("SAVE_VARIABLE VARIABLE=epsilon VALUE=1e-05")
+            .expect("the save succeeds");
+
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "[Variables]\ncounter = 7.0\nepsilon = 1e-05\n"
         );
     }
 

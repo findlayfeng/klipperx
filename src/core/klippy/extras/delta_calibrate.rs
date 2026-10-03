@@ -31,7 +31,7 @@ use serde_json::{json, Value};
 use tracing::{info, warn};
 
 use crate::core::klippy::config::object::{PrinterConfig, CONFIGFILE_OBJECT};
-use crate::core::klippy::config::{ConfigError, ConfigWrapper};
+use crate::core::klippy::config::{py_float_str, ConfigError, ConfigWrapper};
 use crate::core::klippy::error::KlippyError;
 use crate::core::klippy::extras::probe::{
     probe_points_params, ProbeOffsets, ProbePointsFinalize, ProbePointsHelper,
@@ -407,7 +407,7 @@ impl DeltaCalibrate {
             configfile.set(
                 section,
                 &format!("height{index}"),
-                &format_stable_height(*height),
+                &format_measured(*height),
             );
             configfile.set(
                 section,
@@ -425,7 +425,7 @@ impl DeltaCalibrate {
             configfile.set(
                 section,
                 &format!("manual_height{index}"),
-                &format_stable_height(*height),
+                &format_measured(*height),
             );
             configfile.set(
                 section,
@@ -434,7 +434,11 @@ impl DeltaCalibrate {
             );
         }
         for (index, (distance, first, second)) in distances.iter().enumerate() {
-            configfile.set(section, &format!("distance{index}"), &format!("{distance}"));
+            configfile.set(
+                section,
+                &format!("distance{index}"),
+                &format_measured(*distance),
+            );
             configfile.set(
                 section,
                 &format!("distance{index}_pos1"),
@@ -685,9 +689,12 @@ fn format_stable(stable: &Stable) -> String {
     format!("{:.3},{:.3},{:.3}", stable[0], stable[1], stable[2])
 }
 
-/// A height as the config stores it (upstream writes the raw float).
-fn format_stable_height(height: f64) -> String {
-    format!("{height}")
+/// A measurement the config stores as a raw float (`height%d`,
+/// `manual_height%d`, `distance%d`): upstream hands the float straight to
+/// `configfile.set` (`delta_calibrate.py:140`, `:145`, `:150`), so the text is
+/// Python's `str()` of it — `0.0`, not `0`.
+fn format_measured(value: f64) -> String {
+    py_float_str(value)
 }
 
 // ===========================================================================
@@ -959,5 +966,16 @@ mod tests {
         assert_eq!(heights.len(), 1);
         assert_eq!(heights[0].0, 0.0);
         assert_eq!(heights[0].1, [2970499.999, 2970499.999, 2970499.999]);
+    }
+
+    /// The three measurement options are stored as raw floats, so the config
+    /// text is Python's `str()` of them (`delta_calibrate.py:140`, `:145`,
+    /// `:150`) — an integral measurement keeps its `.0`.
+    #[test]
+    fn test_a_saved_measurement_keeps_pythons_spelling() {
+        assert_eq!(format_measured(0.0), "0.0");
+        assert_eq!(format_measured(153.0), "153.0");
+        assert_eq!(format_measured(153.000032), "153.000032");
+        assert_eq!(format_measured(1e-5), "1e-05");
     }
 }

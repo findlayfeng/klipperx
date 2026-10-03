@@ -447,6 +447,10 @@ API 本身在 `crates/klippy-api/src/`：
 越界报错的措辞与上游逐字一致（`configfile.py:49-59`）；限制值的数字写法见上面 `gcode.rs`
 一节的「越界报错里限制值的写法」，是同一处**有意保留**差异。
 
+回写进 `SAVE_CONFIG` 块的值文本不在此列：浮点走 `py_float_str`（Python 的 `str()` 写法，指数与
+NaN 也归一），与上游写出的文件逐字一致，见用户手册 [配置文件参考](../user-manual/config.md)
+的「序列化与回写」。
+
 ### `interface/` — 传输与设备
 
 `Mcu` 只见 `Device` trait（`send` / 阻塞 `receive` / `shutdown`）；字节怎么走是下面各实现的事。

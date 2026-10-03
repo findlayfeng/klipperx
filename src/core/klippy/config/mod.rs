@@ -548,6 +548,33 @@ fn remove_inline_comment(value: &str) -> &str {
 }
 
 // ---------------------------------------------------------------------------
+// Value text
+// ---------------------------------------------------------------------------
+
+/// A float spelled the way Python's `str()` spells it.
+///
+/// Upstream hands raw floats to `configfile.set()` (a `SAVE_CONFIG` value) and
+/// to `save_variables`'s `repr`, so the text a saved value gets is Python's own
+/// rendering. Rust's `{:?}` picks the same digits and switches to an exponent
+/// at the same places (fixed from `1e-4` through `1e15`), and differs only in
+/// two spellings, both fixed up here: the exponent loses its sign and leading
+/// zero (`1e-5` for Python's `1e-05`) and NaN reads `NaN` for `nan`.
+pub(crate) fn py_float_str(value: f64) -> String {
+    if value.is_nan() {
+        return "nan".to_string();
+    }
+    let text = format!("{value:?}");
+    let Some((mantissa, exponent)) = text.split_once('e') else {
+        return text;
+    };
+    let (sign, digits) = match exponent.strip_prefix('-') {
+        Some(digits) => ('-', digits),
+        None => ('+', exponent),
+    };
+    format!("{mantissa}e{sign}{digits:0>2}")
+}
+
+// ---------------------------------------------------------------------------
 // The SAVE_CONFIG block (`klippy/configfile.py:233-294`)
 // ---------------------------------------------------------------------------
 
@@ -740,6 +767,38 @@ mod tests {
             .get(option)
             .unwrap_or_else(|| panic!("option {option}"))
             .as_str()
+    }
+
+    /// The expected strings are CPython's `repr` output (`str` of a float is
+    /// the same); `{:?}` alone misses the four exponent spellings.
+    #[test]
+    fn a_float_is_spelled_the_way_python_spells_it() {
+        let cases: &[(f64, &str)] = &[
+            (0.0, "0.0"),
+            (-0.0, "-0.0"),
+            (1.0, "1.0"),
+            (12.0, "12.0"),
+            (-1.0, "-1.0"),
+            (0.5, "0.5"),
+            (8400000.0, "8400000.0"),
+            (2.675, "2.675"),
+            (1.0 / 3.0, "0.3333333333333333"),
+            // The fixed/scientific switch sits where Python's does.
+            (0.0001, "0.0001"),
+            (1e-5, "1e-05"),
+            (1e15, "1000000000000000.0"),
+            (1e16, "1e+16"),
+            (1.5e16, "1.5e+16"),
+            (1e-7, "1e-07"),
+            (5e-324, "5e-324"),
+            (1.7976931348623157e308, "1.7976931348623157e+308"),
+            (f64::INFINITY, "inf"),
+            (f64::NEG_INFINITY, "-inf"),
+            (f64::NAN, "nan"),
+        ];
+        for (value, expected) in cases {
+            assert_eq!(&py_float_str(*value), expected, "for {value}");
+        }
     }
 
     #[test]

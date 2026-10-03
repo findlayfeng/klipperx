@@ -551,7 +551,7 @@
 | `calibration` | object | 仅在传入 `mesh_args` 时存在 |
 
 > **与上游的已知差异（2026-10-03 落地时）**：
-> ① `calibration` 本机仅在传 `mesh_args` 时返回，上游无条件返回（`bed_mesh.py:304-307`）；
+> ① `calibration` 本机仅在传 `mesh_args` 时返回，上游无条件返回（`bed_mesh.py:303-309`）；
 > 且本机缺 `probe_path`/`rapid_path`（探针调度路径未实现），上游另返回的 `probe_offsets` /
 > `axis_minimum` / `axis_maximum`（`bed_mesh.py:308-310`）本机未返回。
 > ② `mesh_args` 只作开关，其键不回灌配置（上游 `update_config` 的 per-command 覆盖未实现）。

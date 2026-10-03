@@ -834,9 +834,9 @@ pins: !PD0, PD1, PD2
 | 选项 | 适用 | 说明 |
 |------|------|------|
 | `initial_RED`/`initial_GREEN`/`initial_BLUE`/`initial_WHITE` | 各灯段 | 0..=1 初值（驱动无该色时忽略） |
-| `cycle_time`/`hardware_pwm`/`red_pin`…`white_pin` | `led` | PWM/引脚组（`led.py:150`） |
-| `pin`/`chain_count`/`color_order` | `neopixel` | 链长与色序（`neopixel.py:106`） |
-| `data_pin`/`clock_pin`/`chain_count` | `dotstar` | 双线链（`dotstar.py:55`） |
+| `cycle_time`/`hardware_pwm`/`red_pin`…`white_pin` | `led` | PWM/引脚组（`led.py:113-115`） |
+| `pin`/`chain_count`/`color_order` | `neopixel` | 链长与色序（`neopixel.py:28-29`） |
+| `data_pin`/`clock_pin`/`chain_count` | `dotstar` | 双线链（`dotstar.py:24`） |
 | `i2c_*`（bus 选项组） | `pca9533`/`pca9632` | I2C 地址/速率等（`bus.py:302`）；`pca9632` 另有 `color_order` |
 | `text`、`param_*` | `display_template` | 模板文本与参数（惰性对象，`is_queryable=false`） |
 
@@ -854,7 +854,7 @@ pins: !PD0, PD1, PD2
 
 ### [exclude_object]
 
-零选项段（上游 `exclude_object.py:16-46`）。装载时注册 `EXCLUDE_OBJECT_START`/`_END`/`EXCLUDE_OBJECT`/`EXCLUDE_OBJECT_DEFINE` 四命令并持有对象状态；排除区内移动被 `MoveTarget` 变换丢弃，**离区时按上游扣被丢弃 prime 段的 E**（`offset[3]`/`extruder_adj`，批 #4）。相关语料用例已转绿（2026-09-24）。
+零选项段（上游 `exclude_object.py:12-37`）。装载时注册 `EXCLUDE_OBJECT_START`/`_END`/`EXCLUDE_OBJECT`/`EXCLUDE_OBJECT_DEFINE` 四命令并持有对象状态；排除区内移动被 `MoveTarget` 变换丢弃，**离区时按上游扣被丢弃 prime 段的 E**（`offset[3]`/`extruder_adj`，批 #4）。相关语料用例已转绿（2026-09-24）。
 
 ### [virtual_sdcard] / [display_status] / [homing_override] / [sdcard_loop]
 

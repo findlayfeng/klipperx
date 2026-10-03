@@ -237,7 +237,7 @@ MCU 'mcu' is configured with CRC 0x…, the host computed 0x…
 我们现在也复位，而且**优先真重启**：`handshake` 发现固件已停机或 CRC 不一致时，`reset_firmware`
 先看固件有没有 `reset`（`basecmd.c` 之外的板级命令）——有就返回 `McuError::ResetRequired`，
 `McuObject::connect` 发 `reset`、重开连接、用同一份 `BuiltConfig` 重跑握手（得到一次真正的重启，
-把定时器与步进队列也清掉，同上游 `_reset_cmd` 优先，`klippy/mcu.py:733-740`）。只有没有 `reset`
+把定时器与步进队列也清掉，同上游 `_reset_cmd` 优先，`klippy/mcu.py:730-746`）。只有没有 `reset`
 时才走 `config_reset` 就地清（运行中的固件先 `emergency_stop`，因为它只在停机时可跑），再重新
 `get_config`、发这份配置。因为自己发起的 `emergency_stop` 不能被当成意外停机，**上报**语义的停机事件只在握手**之后**才绑；
 但握手**之前**会先绑一对**只记录**的 `shutdown`/`is_shutdown`（写 `connect_shutdown` 槽、让在飞 `call`

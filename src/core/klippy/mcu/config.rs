@@ -105,7 +105,7 @@ const CONFIG_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// Only a fallback: the firmware's own `shutdown` message is the real barrier
 /// (see [`stop_firmware`]). Upstream uses the same fixed 15 ms
-/// (`klippy/mcu.py:739`) for every firmware.
+/// (`klippy/mcu.py:740`) for every firmware.
 const RESET_SETTLE_TIME: Duration = Duration::from_millis(15);
 
 /// The largest oid count that fits `allocate_oids count=%c`.

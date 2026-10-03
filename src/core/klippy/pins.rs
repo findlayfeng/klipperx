@@ -270,7 +270,7 @@ pub type AdcCallback = Box<dyn Fn(&[(u64, f64)]) + Send + Sync>;
 
 /// An analog input resource.
 ///
-/// Upstream's `MCU_adc` (`klippy/mcu.py:555-655`). A consumer configures the
+/// Upstream's `MCU_adc` (`klippy/mcu.py:555-648`). A consumer configures the
 /// sampling and installs a callback; the firmware then pushes batches after the
 /// query is armed at init.
 pub trait Adc: Send + Sync {

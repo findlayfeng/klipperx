@@ -38,13 +38,13 @@ class Printer:
 |----------|------|--------|------|
 | `klippy:` | 8 | `mcu_identify`、`connect`、`ready`、`shutdown`、`disconnect`、`firmware_restart` | 无 |
 | | | `notify_mcu_error`、`analyze_shutdown` | `msg: str, details: dict` |
-| `idle_timeout:` | 3 | `idle`、`printing`、`ready` | 有（`{print_time: f64}`，批 #21） |
-| `homing:` | 4 | `homing_move_begin`、`homing_move_end`、`home_rails_begin`、`home_rails_end` | 对象引用（`homing_state`） |
+| `idle_timeout:` | 3 | `idle`、`printing`、`ready` | `print_time: float` |
+| `homing:` | 4 | `homing_move_begin`、`homing_move_end`、`home_rails_begin`、`home_rails_end` | 对象引用（`homing_state`）；`home_rails_*` 另带 `rails` |
 | `stepper:` | 2 | `sync_mcu_position`、`set_dir_inverted` | 对象引用（`stepper`） |
-| `toolhead:` | 4 | `manual_move`、`set_position`、`sync_print_time`、`update_extra_axes` | 混合 |
+| `toolhead:` | 4 | `manual_move`、`set_position`、`sync_print_time`、`update_extra_axes` | `manual_move`/`set_position`/`update_extra_axes` 无；`sync_print_time` 三个（`curtime, est_print_time, print_time`） |
 | `gcode:` | 3 | `command_error`、`debuginput_exit` | 无 |
 | | | `request_restart` | `print_time: float` |
-| `probe:` | 1 | `update_results` | `ProbeResultsHandle`（`Arc<Mutex<Vec<Coord>>>` 共享句柄；消费者可**原地**改 Z，probe/eddy 上报读回改后的值——批 #36） |
+| `probe:` | 1 | `update_results` | `results`（list；消费者可**原地**改，上游 `probe.py:366`） |
 | `extruder:` | 1 | `activate_extruder` | 无 |
 | `stepper_enable:` | 1 | `motor_off` | 无 |
 | `virtual_sdcard:` | 1 | `reset_file` | 无 |
@@ -52,8 +52,13 @@ class Printer:
 | `menu:` | 4 | `populate`、`init`、`begin`、`exit` | 无 |
 | `dual_carriage:` | 1 | `update_kinematics` | 无 |
 
-除 `klippy:notify_mcu_error`、`klippy:analyze_shutdown` 与 `gcode:request_restart` 外，
-其余事件的载荷均为空或为对象引用。
+除上述带值的五类（`klippy:notify_mcu_error`、`klippy:analyze_shutdown`、`idle_timeout:*`
+三件、`gcode:request_restart`、`probe:update_results`）外，其余事件的载荷均为空或为对象引用。
+
+> 本表是**上游口径**（`send_event(name, *params)` 的实参）。本仓实际载荷以
+> `src/core/klippy/event/decl/` 下的 `event!` 声明为准（上游传对象引用的事件在本仓多数是
+> 裸声明，处理器按需用闭包或 `lookup_object` 自取），逐事件对照见 `TODO.md` 的
+> 「上游事件对照清单」。
 
 ### 1.3 触发时序
 
@@ -132,8 +137,7 @@ MCU 侧另有独立的 `event` 模块，以 `McuEvent` trait 表达固件主动�
 或 `"MCU error during connect"`）与 `details`（原始错误信息）。与上游 `_connect` 中的
 `send_event("klippy:notify_mcu_error", msg, {"error": str(e)})` 一致。
 
-生产路径上**实际发出**的事件（按命名空间；下表为 2026-09-23 盘点，`toolhead:` 行已按
-2026-10-03 复核更正）：
+截至 2026-10-04，生产路径上**实际发出**的事件（按命名空间）：
 
 | 命名空间 | 已发出 | 尚未发出（模块/发送方未就位） |
 |----------|--------|------------------------------|
@@ -145,9 +149,12 @@ MCU 侧另有独立的 `event` 模块，以 `McuEvent` trait 表达固件主动�
 | `extruder:` | — | `activate_extruder`（已注册处理器，发送方是 G4-2） |
 | `stepper:` | — | `sync_mcu_position`、`set_dir_inverted`（依赖 stepper 资源的同步路径） |
 | `virtual_sdcard:` | `reset_file` | `_reset_file` 末尾发出（`SDCARD_RESET_FILE`/`SDCARD_PRINT_FILE`/`M23` 重置时） |
-| `menu:` / `dual_carriage:` | — | 对应 extras 模块尚未实现（H3/H6/H8/H9） |
+| `idle_timeout:` | `ready`、`idle`、`printing`（批 #21） | — |
+| `probe:` | `update_results`（`probe`、`probe_eddy_current`、`axis_twist_compensation`；批 #36） | — |
+| `load_cell:` | `calibrate`、`tare`（批 #14） | — |
+| `menu:` / `dual_carriage:` | — | 对应 extras 模块尚未实现（H3/H6/H8/H9）；`dual_carriage:update_kinematics` 的变体已声明，`input_shaper.rs` 注明无人发送 |
 
-事件名与变体已经就绪，处理器可先注册；上表右列的事件一旦模块落地，发送点直接用现成变体。`load_cell:` 已有发射者（批 #14：`klippy:ready` 时按状态发 `load_cell:calibrate`/`load_cell:tare`）。
+事件名与变体已经就绪，处理器可先注册；上表右列的事件一旦模块落地，发送点直接用现成变体。
 
 ## 3. 设计
 
@@ -278,8 +285,11 @@ type EventHandler = Arc<dyn Fn(&KlippyEvent) + Send + Sync>;
 `stepper:sync_mcu_position` 的 `stepper` 等），载荷不进入枚举：处理器在注册时已能从
 闭包捕获所需对象，或经 `Printer::lookup_object` 取得，无需在分发路径上传递引用。这与
 上游处理器直接接收对象的写法在效果上一致，同时避免在枚举中保存带生命周期的引用。
-少数需要值的载荷例外地进了枚举：`homing:home_rails_end` 的 `axes: Vec<usize>`（
-`gcode_move` 按轴清 homed 状态）与 `gcode:request_restart` 的 `print_time: f64`。
+需要值的载荷则进了枚举，共六类：`homing:home_rails_end` 的 `axes`（`gcode_move` 按轴清
+homed 状态）与 `homing` 句柄、`gcode:request_restart` 与 `idle_timeout:ready`/`idle`/
+`printing` 的 `print_time: f64`、`probe:update_results` 的 `results`（`ProbeResultsHandle`，
+可原地改 Z）、`klippy:notify_mcu_error` 与 `klippy:analyze_shutdown` 的 `{msg, details}`。
+其余 27 个事件是裸声明。
 
 `details` 使用 `HashMap<String, Value>`（`serde_json::Value`），与上游的 `dict` 对应。
 
@@ -452,7 +462,7 @@ impl Printer {
 | 5 | `invoke_shutdown` 触发 `KlippyAnalyzeShutdown` | 3 | 已实现 |
 | 6 | 迁移 `gcode.rs`、`extras/output_pin.rs`、`api/endpoints/gcode.rs` 的调用点 | 3 | 已实现 |
 | 7 | 更新测试并删除 `PrinterEvent` | 6 | 已实现 |
-| 8 | 其余命名空间的事件在各自模块就位后逐步注册处理器 | 3 | 进行中：`homing` / `gcode` / `toolhead:set_position` / `stepper_enable:motor_off` 已发出（见 §2.2 表）；`idle_timeout`（批 #21）已发出；`probe` / `virtual_sdcard` / `load_cell` / `menu` / `dual_carriage` 等模块落地后接入 |
+| 8 | 其余命名空间的事件在各自模块就位后逐步注册处理器 | 3 | 进行中：35 个里 25 个已发出（逐项见 §2.2 表）。仍无发送方的 10 个：`toolhead:sync_print_time`、`stepper:sync_mcu_position`、`stepper:set_dir_inverted`、`extruder:activate_extruder`、`menu:populate`/`init`/`begin`/`exit`、`dual_carriage:update_kinematics`、`gcode:debuginput_exit` |
 
 ## 6. 与上游的差异
 

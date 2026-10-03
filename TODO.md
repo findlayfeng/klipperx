@@ -510,7 +510,12 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 `KlippyEvent` 已声明全部 35 个名字，`Printer::register_event_handler` / `send_event` 按名
 注册与分发，处理器签名为 `Fn(&KlippyEvent)`。以下事件可按优先级逐个注册处理器；依赖
 关系标注在「实现依赖」列中，`—` 表示仅依赖事件总线，其他依赖的模块已标记为其他 TODO 条目。
-生命周期事件已触发，其余事件的触发点随对应模块落地（逐项状态 2026-09-23 复核，见各表）。
+生命周期事件已触发，其余事件的触发点随对应模块落地（逐项状态 2026-10-04 复核，见各表）。
+
+> **「参数」列的口径＝本仓载荷**：按 `src/core/klippy/event/decl/*.rs` 的 `event!` 声明写，
+> 裸声明一律写「无」，带字段的写 `{字段}`。上游 `send_event` 的实参（对象引用、位置参数等）
+> 见「上游位置」列与[事件系统](docs/klippy/developer-manual/event-system.md) 的上游载荷表；
+> 上游传对象引用而本仓 `decl` 为裸声明时，本列写「无」（处理器按需自行 `lookup_object`）。
 
 ### 生命周期事件（最高优先级）
 
@@ -522,8 +527,8 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 | `klippy:shutdown` | 进入 shutdown 状态 | 无 | `klippy/klippy.py:211` | — |
 | `klippy:disconnect` | 运行结束/退出时 | 无 | `klippy/klippy.py:195` | — |
 | `klippy:firmware_restart` | firmware restart 前 | 无 | `klippy/klippy.py:194` | — |
-| `klippy:notify_mcu_error` | MCU 通信出错时 | `msg: str, details: dict` | `klippy/klippy.py:144,151` | ✅ 已接入 |
-| `klippy:analyze_shutdown` | 进入 shutdown 后分析 | `msg: str, details: dict` | `klippy/klippy.py:216-220` | ✅ 已接入 |
+| `klippy:notify_mcu_error` | MCU 通信出错时 | `{msg, details}` | `klippy/klippy.py:144,151` | ✅ 已接入 |
+| `klippy:analyze_shutdown` | 进入 shutdown 后分析 | `{msg, details}` | `klippy/klippy.py:216-220` | ✅ 已接入 |
 
 > **说明**：两个事件由带载荷的变体承载（`KlippyEvent::KlippyNotifyMcuError` /
 > `KlippyEvent::KlippyAnalyzeShutdown { msg, details }`）。`analyze_shutdown` 触发时
@@ -543,16 +548,16 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 
 | 事件名 | 触发时机 | 参数 | 上游位置 | 实现依赖 |
 |---|---|---|---|---|
-| `homing:home_rails_begin` | 回零开始 | `homing_state` | `klippy/extras/homing.py:80` | ✅ 已触发（`extras/toolhead.rs:910`） |
-| `homing:home_rails_end` | 回零结束 | `homing_state` | `klippy/extras/homing.py:148` | ✅ 已触发（`extras/toolhead.rs:923`，带 `axes` 载荷） |
-| `homing:homing_move_begin` | 回零移动开始 | `homing_state` | `klippy/extras/homing.py:210` | ✅ 已触发（`extras/toolhead.rs:974`） |
-| `homing:homing_move_end` | 回零移动结束 | `homing_state` | `klippy/extras/homing.py:234` | ✅ 已触发（`extras/toolhead.rs:1008`） |
-| `stepper:sync_mcu_position` | stepper 位置同步 | `stepper` | `klippy/stepper.py:56` | C1 |
-| `stepper:set_dir_inverted` | 方向反转设置 | `stepper` | `klippy/stepper.py:153` | C1 |
-| `dual_carriage:update_kinematics` | IDEx 双滑车运动学更新 | — | `klippy/kinematics/idex_modes.py:383` | C1 |
+| `homing:home_rails_begin` | 回零开始 | 无 | `klippy/extras/homing.py:210` | ✅ 已触发（`extras/toolhead.rs:2316`，回零循环与各运动学路径多处） |
+| `homing:home_rails_end` | 回零结束 | `{axes, homing}` | `klippy/extras/homing.py:234` | ✅ 已触发（`extras/toolhead.rs:3236`） |
+| `homing:homing_move_begin` | 回零移动开始 | 无 | `klippy/extras/homing.py:80` | ✅ 已触发（`extras/toolhead.rs:2734` 等） |
+| `homing:homing_move_end` | 回零移动结束 | 无 | `klippy/extras/homing.py:148` | ✅ 已触发（`extras/toolhead.rs:2806` 等） |
+| `stepper:sync_mcu_position` | stepper 位置同步 | 无 | `klippy/stepper.py:227` | C1 |
+| `stepper:set_dir_inverted` | 方向反转设置 | 无 | `klippy/stepper.py:153` | C1 |
+| `dual_carriage:update_kinematics` | IDEx 双滑车运动学更新 | 无 | `klippy/kinematics/idex_modes.py:383` | C1 |
 
-> `homing:*` 四个已随 toolhead 产线触发（`extras/toolhead.rs:910` `:923` `:974` `:1008`，
-> `G28` 路径）；`stepper:sync_mcu_position`、`stepper:set_dir_inverted`、
+> `homing:*` 四个已随 toolhead 产线触发（`extras/toolhead.rs:2316` `:3236` `:2734` `:2806`，
+> `G28` 路径；`homing_heaters` 也会发 move 对）；`stepper:sync_mcu_position`、`stepper:set_dir_inverted`、
 > `dual_carriage:update_kinematics` 仍无触发点，分别随 stepper 位置同步、目录反转变更、
 > C1c 的 IDEX/双滑车落地。
 
@@ -560,9 +565,9 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 
 | 事件名 | 触发时机 | 参数 | 上游位置 | 实现依赖 |
 |---|---|---|---|---|
-| `idle_timeout:ready` | idle_timeout 模块就绪 | `{print_time: f64}` | `klippy/extras/idle_timeout.py:44` | — |
+| `idle_timeout:ready` | idle_timeout 模块就绪 | `{print_time: f64}` | `klippy/extras/idle_timeout.py:95` | — |
 | `idle_timeout:idle` | 进入空闲状态 | `{print_time: f64}` | `klippy/extras/idle_timeout.py:57` | — |
-| `idle_timeout:printing` | 开始打印（恢复活动） | `{print_time: f64}` | `klippy/extras/idle_timeout.py:95` | — |
+| `idle_timeout:printing` | 开始打印（恢复活动） | `{print_time: f64}` | `klippy/extras/idle_timeout.py:106` | — |
 
 > 批 #21 已落地：`[idle_timeout]` 装载即注册，三个事件带 `{print_time: f64}` 载荷发出。
 
@@ -570,10 +575,10 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 
 | 事件名 | 触发时机 | 参数 | 上游位置 | 实现依赖 |
 |---|---|---|---|---|
-| `toolhead:manual_move` | 手动移动前 | `positions, speed` | `klippy/toolhead.py:416` | ✅ 已触发（`safe_z_home` 的 `HomeOps::manual_move`，`extras/safe_z_home.rs:215`） |
-| `toolhead:set_position` | 设置位置（G92 等） | `positions, e` | `klippy/toolhead.py:390` | ✅ 已触发（`extras/toolhead.rs:1752`，`SET_KINEMATIC_POSITION`） |
-| `toolhead:sync_print_time` | print_time 更新 | `print_time` | `klippy/toolhead.py:267` | **尚无发送点**（C1d 的回调已落地，但该事件没有触发方；`idle_timeout` 改为观察 `print_time` 前进） |
-| `toolhead:update_extra_axes` | 额外轴位置更新 | `positions` | `klippy/toolhead.py:455` | ✅ 已触发（`ToolHeadObject::add_extra_axis` / `remove_extra_axis`，`extras/toolhead.rs:1876` / `:1892`，`manual_stepper` 调用） |
+| `toolhead:manual_move` | 手动移动前 | 无 | `klippy/toolhead.py:416` | ✅ 已触发（`safe_z_home` 的 `HomeOps::manual_move`，`extras/safe_z_home.rs:215`） |
+| `toolhead:set_position` | 设置位置（G92 等） | 无 | `klippy/toolhead.py:390` | ✅ 已触发（`extras/toolhead.rs:1752`，`SET_KINEMATIC_POSITION`） |
+| `toolhead:sync_print_time` | print_time 更新 | 无 | `klippy/toolhead.py:267` | **尚无发送点**（C1d 的回调已落地，但该事件没有触发方；`idle_timeout` 改为观察 `print_time` 前进） |
+| `toolhead:update_extra_axes` | 额外轴位置更新 | 无 | `klippy/toolhead.py:455` | ✅ 已触发（`ToolHeadObject::add_extra_axis` / `remove_extra_axis`，`extras/toolhead.rs:1876` / `:1892`，`manual_stepper` 调用） |
 
 > `toolhead:set_position`（`gcode_move` 重置链之一）、`toolhead:manual_move`（`safe_z_home`）
 > 与 `toolhead:update_extra_axes`（`manual_stepper`）都已产线触发；只剩
@@ -585,10 +590,10 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 |---|---|---|---|---|
 | `gcode:command_error` | gcode 命令错误 | 无 | `klippy/gcode.py:226` | ✅ 已触发（`process_line`） |
 | `gcode:debuginput_exit` | debuginput EOF | 无 | `klippy/gcode.py:433` | **暂缓 `[~]`**（随 GCodeIO；需 `send_event` 返回值） |
-| `gcode:request_restart` | 请求重启 | `print_time` | `klippy/gcode.py:358` | ✅ 已触发（`gcode.rs:1191`，`get_last_move_time` 取 print time） |
+| `gcode:request_restart` | 请求重启 | `{print_time: f64}` | `klippy/gcode.py:358` | ✅ 已触发（`gcode.rs:1357`，`get_last_move_time` 取 print time） |
 
 > `gcode:command_error` 已接（handler 的 `CommandError` 触发，panic 不触发）；`gcode:request_restart`
-> 已在 `request_restart` 处理器里产线触发（`gcode.rs:1191`，先 `get_last_move_time` 再
+> 已在 `request_restart` 处理器里产线触发（`gcode.rs:1357`，先 `get_last_move_time` 再
 > dwell/wait）；`gcode:debuginput_exit` 随 `GCodeIO` **暂缓 `[~]`**（不做 OctoPrint 串口仿真），
 > 将来做时还要先让 `send_event` 收集 handler 返回值（上游 `all(...)`）。
 
@@ -596,9 +601,9 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 
 | 事件名 | 触发时机 | 参数 | 上游位置 | 实现依赖 |
 |---|---|---|---|---|
-| `probe:update_results` | probe 测量完成 | `ProbeResultsHandle`（可原地改 Z，批 #36） | `klippy/extras/probe.py:200` | endstop |
-| `extruder:activate_extruder` | 切换 active extruder | `extruder` | `klippy/kinematics/extruder.py:25` | 尚无发送方（handler 已备，`gcode_move.rs:392`；`ACTIVATE_EXTRUDER` 不触发它） |
-| `stepper_enable:motor_off` | stepper 电机关闭 | `stepper_enable` | `klippy/extras/stepper_enable.py:120` | ✅ 已触发（`stepper_enable.rs:338`） |
+| `probe:update_results` | probe 测量完成 | `{results: ProbeResultsHandle}`（可原地改 Z，批 #36） | `klippy/extras/probe.py:366` | endstop |
+| `extruder:activate_extruder` | 切换 active extruder | 无 | `klippy/kinematics/extruder.py:289` | 尚无发送方（handler 已备，`gcode_move.rs:392`；`ACTIVATE_EXTRUDER` 不触发它） |
+| `stepper_enable:motor_off` | stepper 电机关闭 | 无 | `klippy/extras/stepper_enable.py:120` | ✅ 已触发（`stepper_enable.rs:351`） |
 | `virtual_sdcard:reset_file` | VSD 文件重置 | 无 | `klippy/extras/virtual_sdcard.py:151` | sdcard |
 | `load_cell:calibrate` | 称重传感器校准 | 无 | `klippy/extras/load_cell.py:404` | ADC |
 | `load_cell:tare` | 称重传感器归零 | 无 | `klippy/extras/load_cell.py:406` | ADC |
@@ -609,10 +614,10 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 
 | 事件名 | 触发时机 | 参数 | 上游位置 | 实现依赖 |
 |---|---|---|---|---|
-| `menu:populate` | 菜单填充 | `menu` | `klippy/extras/display/menu.py:346` | display |
-| `menu:init` | 菜单初始化 | `menu` | `klippy/extras/display/menu.py:722` | display |
-| `menu:begin` | 菜单开始 | `menu` | `klippy/extras/display/menu.py:754` | display |
-| `menu:exit` | 菜单退出 | `menu` | `klippy/extras/display/menu.py:913` | display |
+| `menu:populate` | 菜单填充 | 无 | `klippy/extras/display/menu.py:346` | display |
+| `menu:init` | 菜单初始化 | 无 | `klippy/extras/display/menu.py:722` | display |
+| `menu:begin` | 菜单开始 | 无 | `klippy/extras/display/menu.py:754` | display |
+| `menu:exit` | 菜单退出 | 无 | `klippy/extras/display/menu.py:913` | display |
 
 > 依赖 display/menu 模块，优先级最低。上游 `menu.send_event` 实际发 `"menu:" + <名>`，
 > 共四个（2026-09-23 复核行号：populate 346 / init 722 / begin 754 / exit 913）；曾列出的

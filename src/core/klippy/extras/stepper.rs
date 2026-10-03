@@ -958,7 +958,7 @@ fn deltesian_arm_default_endstop(config: &ConfigWrapper) -> Result<Option<f64>, 
     primary.get_float("position_endstop", None).map(Some)
 }
 
-/// The factory `[stepper_arm]` names (`kinematics/polar.py:27`'s
+/// The factory `[stepper_arm]` names (`kinematics/polar.py:34`'s
 /// `stepper.LookupRail`): a rail with geometry. Its stepper homes toolhead X
 /// (upstream homes axis 0 on this rail, with Y pinned to 0), so it carries
 /// [`Axis::X`].

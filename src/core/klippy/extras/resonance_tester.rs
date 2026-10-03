@@ -100,30 +100,30 @@ pub struct ResonanceTester {
     /// `accel_per_hz_z`, default `15.`, above `0`.
     accel_per_hz_z: f64,
     /// `hz_per_sec`, default `1.`, in `0.1`…`2.`
-    /// (`resonance_tester.py:62-63`).
+    /// (`resonance_tester.py:66`).
     hz_per_sec: f64,
     /// `sweeping_accel`, default `400.`, above `0`
-    /// (`resonance_tester.py:116`).
+    /// (`resonance_tester.py:100`).
     sweeping_accel: f64,
     /// `sweeping_accel_z`, default `50.`, above `0`.
     sweeping_accel_z: f64,
     /// `sweeping_period`, default `1.2`, minimum `0.`
-    /// (`resonance_tester.py:118`).
+    /// (`resonance_tester.py:102`).
     sweeping_period: f64,
     /// `probe_points`, three floats per line; empty when unset
     /// (`resonance_tester.py:290-291`).
     probe_points: Vec<[f64; 3]>,
     /// `max_smoothing`, optional, minimum `0.05`
-    /// (`resonance_tester.py:289`).
+    /// (`resonance_tester.py:284`).
     max_smoothing: Option<f64>,
     /// The chips to measure with, as `(axis letters, chip name)`: grouped by
     /// chip name and sorted, the axis letters of one chip joined
-    /// (`resonance_tester.py:278-283`).
+    /// (`resonance_tester.py:279-283`).
     accel_chip_names: Vec<(String, String)>,
 }
 
 impl ResonanceTester {
-    /// Read the section (`resonance_tester.py:261-291`).
+    /// Read the section (`resonance_tester.py:263-298`).
     ///
     /// # Errors
     /// [`ConfigError`] for an option outside its bounds, a `probe_points` line
@@ -132,7 +132,7 @@ impl ResonanceTester {
         let move_speed =
             config.get_float_bounded("move_speed", Some(50.0), None, None, Some(0.0), None)?;
         // `SweepingVibrationsTestGenerator.__init__` builds the pulse generator
-        // first, then the sweeping options (`resonance_tester.py:57-118`).
+        // first, then the sweeping options (`resonance_tester.py:57-103`).
         let min_freq =
             config.get_float_bounded("min_freq", Some(5.0), Some(1.0), None, None, None)?;
         let max_freq = config.get_float_bounded(
@@ -295,7 +295,7 @@ impl ResonanceTester {
         if let Ok(axis) = gcmd.get_str("AXIS") {
             // Upstream spells this `axis.lower() not in 'xyz'`, a substring
             // test, so a multi-character `AXIS` (`xy`) is accepted here too;
-            // the error quotes the raw parameter (`resonance_tester.py:384-389`).
+            // the error quotes the raw parameter (`resonance_tester.py:452-453`).
             if !"xyz".contains(&axis.to_lowercase()) {
                 return Err(CommandError::new(format!("Unsupported axis '{axis}'")));
             }
@@ -344,7 +344,7 @@ impl ResonanceTester {
     }
 
     /// The commands and events upstream's `__init__` registers
-    /// (`resonance_tester.py:292-298`).
+    /// (`resonance_tester.py:288-298`).
     fn register_handlers(self: &Arc<Self>, printer: &Arc<Printer>) -> Result<(), ConfigError> {
         printer.register_event_handler(
             KlippyEvent::KlippyConnect,
@@ -578,7 +578,7 @@ fn check_name_suffix(name_suffix: &str) -> Result<(), CommandError> {
         .filter(|c| *c != '-' && *c != '_')
         .collect();
     // `str.isalnum()` is false for the empty string, so an empty `NAME` is
-    // invalid too (`resonance_tester.py:438-439`).
+    // invalid too (`resonance_tester.py:529-530`).
     if stripped.is_empty() || !stripped.chars().all(char::is_alphanumeric) {
         return Err(CommandError::new("Invalid NAME parameter"));
     }

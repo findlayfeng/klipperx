@@ -547,7 +547,7 @@ impl ToolHeadObject {
             KinematicsKind::GenericCartesian => {
                 // `GenericCartesianKinematics.__init__` reads every `[carriage
                 // <name>]` / `[stepper <name>]` section here
-                // (`generic_cartesian.py:118-172`) and installs each motor's
+                // (`generic_cartesian.py:120-172`) and installs each motor's
                 // solver as it reads it; the built kinematics waits for
                 // connect, like delta's.
                 let built = carriage::build(printer, max_z_velocity, max_z_accel)?;
@@ -1658,7 +1658,7 @@ impl ToolHeadObject {
     }
 
     /// Queue a lookahead callback (`toolhead.register_lookahead_callback`,
-    /// `klippy/toolhead.py:526-530`).
+    /// `klippy/toolhead.py:526-531`).
     ///
     /// Connect-safe: before connect there is no planner and
     /// [`Self::get_last_move_time`] would read `0.0`, so the callback waits in
@@ -1714,7 +1714,7 @@ impl ToolHeadObject {
     /// the transport, and [`ToolHeadObject::print_time`] is upstream's
     /// `get_last_move_time()` — that pair is the flush entry
     /// `ProbePointsHelper._invoke_callback` needs before its callback
-    /// (`probe.py:419-424`).
+    /// (`probe.py:463-469`).
     ///
     /// # Errors
     /// "Printer is not ready" before connect (or while a homing/probe run
@@ -1724,7 +1724,7 @@ impl ToolHeadObject {
     }
 
     /// Force the toolhead to `newpos`, marking `homing_axes` as homed
-    /// (`ToolHead.set_position`, `toolhead.py:383-391`).
+    /// (`ToolHead.set_position`, `toolhead.py:383-390`).
     ///
     /// Upstream's `set_position` starts by flushing step generation (the
     /// queued moves' steps must be generated before the trapq's position is
@@ -2647,7 +2647,7 @@ fn apply_stepper_adjustments(
 
 /// The axes a homing force position marks as homed: every axis whose
 /// `forcepos` entry is set (`Homing._set_start_position`,
-/// `klippy/extras/homing.py:178-184`). For polar's arm home that is x **and**
+/// `klippy/extras/homing.py:188-192`). For polar's arm home that is x **and**
 /// y — both must be marked to open `limit_xy2`.
 fn homing_axes_of(forcepos: &HomeCoord) -> Vec<usize> {
     forcepos
@@ -3255,7 +3255,7 @@ pub(crate) fn load_config(
     // the toolhead (`toolhead.py:610-613`), and `gcode_move` is the first of
     // them: it is what turns g-code coordinates into the toolhead's.
     crate::core::klippy::extras::gcode_move::ensure(printer)?;
-    // `manual_probe` is on the same upstream list (`toolhead.py:293`), which is
+    // `manual_probe` is on the same upstream list (`toolhead.py:610-613`), which is
     // why `PROBE_CALIBRATE` works on a config that never writes
     // `[manual_probe]`: the object is always there.
     crate::core::klippy::extras::manual_probe::ensure(printer, config)?;
@@ -3543,7 +3543,7 @@ mod tests {
 
         // `anchor_x` is the first anchor read, so its absence is the error the
         // winch load reports (`config.getfloat('anchor_' + n)`,
-        // `kinematics/winch.py:19`).
+        // `kinematics/winch.py:20`).
         let printer = Arc::new(Printer::new(ManualReactor::shared()));
         let text = "[mcu]\nserial: /dev/not-opened-yet\n\
              [stepper_a]\nstep_pin: PA0\ndir_pin: PA1\nmicrosteps: 16\nrotation_distance: 40\n\

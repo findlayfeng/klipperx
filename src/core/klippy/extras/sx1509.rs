@@ -18,7 +18,7 @@
 //! Supported pin types are **digital output** and **hardware PWM**, exactly the
 //! two upstream builds (`SX1509_digital_out`, `SX1509_pwm`). Every other type
 //! (and a pin whose name does not start with `PIN_`) is refused with upstream's
-//! `Wrong pin or incompatible type: …! ` message (`sx1509.py:48-54`).
+//! `Wrong pin or incompatible type: …! ` message (`sx1509.py:60-66`).
 //!
 //! # Bring-up
 //!
@@ -52,7 +52,7 @@
 //! # What is not here
 //!
 //! Upstream's `SX1509_digital_out.set_pwm` (a digital pin driven as a
-//! software PWM, `sx1509.py:134-135`) has no host counterpart: the
+//! software PWM, `sx1509.py:136-137`) has no host counterpart: the
 //! [`DigitalOut`] trait has no `set_pwm`, and a consumer that wants PWM asks for
 //! `setup_pwm`, which builds the hardware LED driver.
 
@@ -80,7 +80,7 @@ section!(
     prefix = load_config_prefix
 );
 
-/// Word registers (`sx1509.py:8-16`): the reset pair, the oscillator and clock
+/// Word registers (`sx1509.py:10-18`): the reset pair, the oscillator and clock
 /// divider, and the six the cache starts with.
 const REG_RESET: u8 = 0x7D;
 const REG_CLOCK: u8 = 0x1E;
@@ -92,19 +92,19 @@ const REG_PULLDOWN: u8 = 0x08;
 const REG_INPUT_DISABLE: u8 = 0x00;
 const REG_ANALOG_DRIVER_ENABLE: u8 = 0x20;
 
-/// Per-pin LED-driver registers, one byte each (`sx1509.py:19-21`).
+/// Per-pin LED-driver registers, one byte each (`sx1509.py:21-23`).
 const REG_I_ON: [u8; 16] = [
     0x2A, 0x2D, 0x30, 0x33, 0x36, 0x3B, 0x40, 0x45, 0x4A, 0x4D, 0x50, 0x53, 0x56, 0x5B, 0x5F, 0x65,
 ];
 
 /// Upstream passes `default_speed=400000` to `MCU_I2C_from_config`
-/// (`sx1509.py:22`), unlike the 100000 of most I2C extras.
+/// (`sx1509.py:28`), unlike the 100000 of most I2C extras.
 const DEFAULT_SPEED: i64 = 400_000;
 
 /// Upstream's `i2c_speed` `minval` (`bus.py:307`).
 const MIN_SPEED: i64 = 100_000;
 
-/// The default `_max_duration` of both resources (`sx1509.py:110`, `:125`).
+/// The default `_max_duration` of both resources (`sx1509.py:110`, `:150`).
 const DEFAULT_MAX_DURATION: f64 = 2.0;
 
 /// One `[sx1509 <name>]`: the I2C device, the register cache, and the chip
@@ -292,7 +292,7 @@ impl Sx1509 {
             .map_err(|err| ConfigError::new(err.to_string()))?;
 
         // Upstream registers `handle_connect` for `klippy:connect`
-        // (`sx1509.py:34-35`); weak, so the printer's handler list does not keep
+        // (`sx1509.py:40-41`); weak, so the printer's handler list does not keep
         // the chip (and through it the connected device) alive across a restart.
         let weak = Arc::downgrade(&chip);
         printer.register_event_handler(
@@ -506,7 +506,7 @@ fn register_build_checks(
     }))
 }
 
-/// The pin number in `PIN_<n>` (`int(pin.split('_')[1])`, `sx1509.py:101`).
+/// The pin number in `PIN_<n>` (`int(pin.split('_')[1])`, `sx1509.py:104`).
 fn parse_pin_number(pin: &str, pin_type: &str) -> Result<usize, PinError> {
     pin.split('_')
         .nth(1)
@@ -542,7 +542,7 @@ struct Sx1509DigitalOut {
     /// The pin's `!`: the level written is inverted.
     invert: bool,
     /// `setup_max_duration`: a non-zero value means a heater, which upstream
-    /// refuses at build (`sx1509.py:115-117`).
+    /// refuses at build (`sx1509.py:114-116`).
     max_duration: Arc<Mutex<f64>>,
 }
 
@@ -596,15 +596,15 @@ struct Sx1509Pwm {
     /// The pin's `!`.
     invert: bool,
     /// `setup_cycle_time`'s hardware flag; upstream refuses a software PWM at
-    /// build (`sx1509.py:145-146`).
+    /// build (`sx1509.py:163-164`).
     hardware_pwm: Arc<Mutex<bool>>,
     /// `setup_max_duration`; a non-zero value is a heater and is refused
-    /// (`sx1509.py:147-148`).
+    /// (`sx1509.py:165-166`).
     max_duration: Arc<Mutex<f64>>,
 }
 
 /// The LED-driver byte for a duty: `~int(255 * value)` for a normal pin, or
-/// `int(255 * value)` for an inverted one (`sx1509.py:185`, `:163-167`),
+/// `int(255 * value)` for an inverted one (`sx1509.py:185`, `:187`),
 /// both masked to a byte the way the send is.
 fn i_on_byte(value: f64, invert: bool) -> u8 {
     let raw = (255.0 * value) as i32;
@@ -632,7 +632,7 @@ impl PwmOut for Sx1509Pwm {
 
     fn setup_start_value(&self, start_value: f64, shutdown_value: f64) {
         // Upstream complements both before clamping when inverted and writes
-        // the start level (`sx1509.py:154-161`).
+        // the start level (`sx1509.py:174-181`).
         let (start_value, _shutdown_value) = if self.invert {
             (1.0 - start_value, 1.0 - shutdown_value)
         } else {
@@ -917,7 +917,7 @@ mod tests {
         pwm.setup_start_value(0.0, 0.0);
 
         // `~int(255 * .25) & 0xFF` = 0xC0, on `REG_I_ON[5]` = 0x3B
-        // (`sx1509.py:163-167`).
+        // (`sx1509.py:184-188`).
         pwm.set_pwm(0, 0.25).unwrap();
         assert_eq!(chip.writes().last().unwrap(), &vec![0x3B, 0xC0]);
 
@@ -952,7 +952,7 @@ mod tests {
     #[test]
     fn test_the_speed_defaults_to_400000_and_has_a_minimum() {
         // The default speed is accepted (`default_speed=400000`,
-        // `sx1509.py:22`).
+        // `sx1509.py:28`).
         let defaulted = section(&[("i2c_address", "62")]);
         Sx1509::new(&wrap(&defaulted), &printer()).expect("the default speed is accepted");
 

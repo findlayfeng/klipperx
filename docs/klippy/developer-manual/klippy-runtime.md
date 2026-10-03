@@ -29,7 +29,7 @@ main():
 `dictionary`，以及 `software_version`、`cpu_info`、`device`、`linux_version`。
 `RESTART` 与 `FIRMWARE_RESTART` 因此不是重启进程，而是换一个新的对象图在同一个进程里继续
 运行；每一轮（含每次 `RESTART`）都重新从磁盘读配置文件（`_connect` → `_read_config` →
-`read_main_config`，`klippy/klippy.py:128`、`configfile.py:295-298`）；`error_exit` 最终以
+`read_main_config`，`klippy/klippy.py:128`、`configfile.py:474-481`）；`error_exit` 最终以
 非零码退出进程。出处：`klippy/klippy.py:354-374`。
 
 > **与上游的差异**：`start_args` 中的 `debuginput`、`debugoutput`、`dictionary` 在上游可组成
@@ -135,7 +135,7 @@ Printer.__init__          _connect（reactor 回调）                 对象图
    get_status(eventtime) → objects/list 只列出实现了它的对象
 ```
 
-`_read_config`（`klippy/klippy.py:114-127`）按上表顺序建立对象；`load_object`（`:90-112`）
+`_read_config`（`klippy/klippy.py:114-127`）按上表顺序建立对象；`load_object`（`:90-113`）
 完成节名到模块的映射，重复装载直接返回已有对象。配置项的读取经 `ConfigWrapper` 记录，
 `check_unused_options` 据此拒绝未被任何对象读过的 section 或 option——**读取记录即 schema**。
 `objects/list` 的过滤见 `klippy/webhooks.py:484`。
@@ -165,7 +165,7 @@ Printer.__init__          _connect（reactor 回调）                 对象图
 
 打印机事件（`klippy:` 前缀）由主机触发：`mcu_identify`、`connect`、`ready`、`shutdown`、
 `analyze_shutdown`、`disconnect`、`firmware_restart`、`notify_mcu_error`。固件事件由固件上报，
-按响应名绑定（`MCU.register_response`）。`run()` 结束时（`klippy/klippy.py:186-196`）：若结果为
+按响应名绑定（`MCU.register_response`）。`run()` 结束时（`klippy/klippy.py:190-196`）：若结果为
 `firmware_restart` 则先派发 `klippy:firmware_restart`，随后一律派发 `klippy:disconnect`。
 注册与派发见 `:224`、`:226`；对应关系见[事件系统](event-system.md)。
 

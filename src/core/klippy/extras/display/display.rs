@@ -9,7 +9,7 @@
 //! | `[display_status]` | created on demand, whether or not the config names it | `display.py:188` |
 //! | the menu keys | the options are read, no menu is built | `menu.py:688-722`, `menu_keys.py:12-43` |
 //! | templates | the shipped `display.cfg` is merged into the `display_template` registry | `display.py:115-166` |
-//! | layouts | `display_data` groups | `display.py:56-88` |
+//! | layouts | `display_data` groups | `display.py:56-87` |
 //! | glyphs | `display_glyph` sections | `display.py:103-114` |
 //! | the group | `display_group`, defaulted from the panel's width | `display.py:194-200` |
 //! | refresh | `klippy:ready` initialises the panel and starts the timer | `display.py:217-241` |
@@ -157,9 +157,9 @@ pub struct SentMessage {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Glyph {
     /// The 16x16 icon, split into its two byte-per-row halves
-    /// (`display.py:105-107`).
+    /// (`display.py:159-161`).
     pub icon16x16: Option<(Vec<u8>, Vec<u8>)>,
-    /// The HD44780 CGRAM slot and the 5x8 icon (`display.py:109-113`).
+    /// The HD44780 CGRAM slot and the 5x8 icon (`display.py:164-166`).
     pub icon5x8: Option<(u8, Vec<u8>)>,
 }
 
@@ -1050,7 +1050,7 @@ mod tests {
                 "mcu",
                 "display_status",
                 // The shipped layout's `display_template` sections bring the
-                // registry up (`display/display.py:168-173`), before the
+                // registry up (`display/display.py:168-174`), before the
                 // display itself is registered.
                 "display_template",
                 "display"

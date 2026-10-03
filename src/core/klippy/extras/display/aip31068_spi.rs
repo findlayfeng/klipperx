@@ -68,7 +68,7 @@ const CMND_ENTERY_MODE: u16 = 1 << 2;
 const FLG_ENTERY_MODE_INC: u16 = 1 << 1;
 /// `CMND.DISPLAY` — display on/off control (`aip31068_spi.py:36`).
 const CMND_DISPLAY: u16 = 1 << 3;
-/// `flg_DISPLAY.ON` (`aip31068_spi.py:50`).
+/// `flg_DISPLAY.ON` (`aip31068_spi.py:49`).
 const FLG_DISPLAY_ON: u16 = 1 << 2;
 /// `CMND.SHIFT` — cursor or display shift (`aip31068_spi.py:37`).
 const CMND_SHIFT: u16 = 1 << 4;
@@ -76,13 +76,13 @@ const CMND_SHIFT: u16 = 1 << 4;
 const FLG_SHIFT_RIGHT: u16 = 1 << 2;
 /// `CMND.FUNCTION` — function set (`aip31068_spi.py:38`).
 const CMND_FUNCTION: u16 = 1 << 5;
-/// `flg_FUNCTION.TWO_LINES` (`aip31068_spi.py:60`).
+/// `flg_FUNCTION.TWO_LINES` (`aip31068_spi.py:58`).
 const FLG_FUNCTION_TWO_LINES: u16 = 1 << 3;
 /// `CMND.CGRAM` — character generator RAM (`aip31068_spi.py:39`).
 const CMND_CGRAM: u16 = 1 << 6;
 /// `CMND.DDRAM` — display data RAM (`aip31068_spi.py:40`).
 const CMND_DDRAM: u16 = 1 << 7;
-/// `flg_DDRAM.MASK` (`aip31068_spi.py:67`).
+/// `flg_DDRAM.MASK` (`aip31068_spi.py:65`).
 const FLG_DDRAM_MASK: u16 = 0b0111_1111;
 /// `CMND.WRITE_RAM` (`aip31068_spi.py:41`).
 const CMND_WRITE_RAM: u16 = 1 << 8;

@@ -52,8 +52,9 @@
 //! # What is not here
 //!
 //! * **`static_value` / `template`**: the display-template machinery.
-//! * **`fan` / `servo` / `pwm_tool`** still drive every change through the
-//!   immediate forms; their own module comments record that gap.
+//! * **`servo` / `pwm_tool`** still drive every change through the
+//!   immediate forms; their own module comments record that gap. (`fan` has
+//!   its own wiring of this same queue now — see `extras/fan`.)
 
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 

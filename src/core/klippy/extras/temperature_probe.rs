@@ -3,9 +3,11 @@
 //! Upstream's `temperature_probe.py` is two halves in one file: a smoothed
 //! temperature sensor that joins the `heaters` registry, and the interactive
 //! thermal-drift calibration of an eddy probe that is driven *from* that
-//! sensor. This module is the sensor half — the section reads its options,
-//! `heaters` builds and delivers readings, and `_temp_callback`'s smoothing
-//! lands in `get_status`.
+//! sensor. This module is that file — the section reads its options, `heaters`
+//! builds and delivers readings, `_temp_callback`'s smoothing lands in
+//! `get_status`, and the `TEMPERATURE_PROBE_*` family runs the calibration
+//! state machine. Only the drift-compensation helper the calibration feeds is
+//! elsewhere (unit C, below).
 //!
 //! | here | upstream |
 //! |---|---|
@@ -14,39 +16,45 @@
 //! | [`TemperatureProbe`] | `TemperatureProbe.__init__` (`:60-111`) |
 //! | [`sensor_callback`] | `_temp_callback` (`:140-153`) |
 //! | [`check_kick_next`] | `_check_kick_next` (`:155-159`) |
+//! | [`TemperatureProbe::register_commands`] and the flow behind it | the `TEMPERATURE_PROBE_*` family: registration (`:112-123`), flow (`:164-337`), command bodies (`:338-448`) |
 //! | [`TemperatureProbe::get_status`] | `get_status` (`:453-465`) |
+//!
+//! The family drives a calibration state machine over the same section's
+//! options: `in_calibration` in the shared state is what [`check_kick_next`]
+//! needs before it can run `TEMPERATURE_PROBE_NEXT`, so that script is live as
+//! soon as a calibration starts.
 //!
 //! # Not here (deferred; the upstream line ranges are the gap list)
 //!
-//! * **The command family and the calibration state machine behind it.**
-//!   `TEMPERATURE_PROBE_CALIBRATE` / `_NEXT` / `_COMPLETE` / `_ABORT` /
-//!   `_ENABLE` registration (`temperature_probe.py:112-123`), the flow they
-//!   drive (`:164-337`) and the command bodies (`:338-448`). The section
-//!   already parses every option that flow consumes — `speed`,
-//!   `horizontal_move_z`, `resting_z`, `calibration_position`,
-//!   `calibration_bed_temp`, `calibration_extruder_temp`,
-//!   `extruder_heating_z` — and `get_status` keeps `in_calibration` /
-//!   `estimated_expansion`, so the status shape is upstream's and only the
-//!   flow is missing. [`check_kick_next`] is ported and runs the upstream
-//!   script, but nothing sets `in_calibration` until that flow lands, so it
-//!   cannot fire yet.
 //! * **`EddyDriftCompensation`** (`temperature_probe.py:479-714`) and the
 //!   `probe_eddy_current` registration it needs (`:125-137`): until it exists,
 //!   `get_status`'s `compensation_enabled` is always `false` — which is exactly
-//!   what upstream reports when no drift compensation was registered.
+//!   what upstream reports when no drift compensation was registered. Three
+//!   seams wait for it, marked `TODO(C)`: upstream's `cal_helper is None` guard
+//!   at the top of `cmd_TEMPERATURE_PROBE_CALIBRATE`,
+//!   `cal_helper.start_calibration()` / `.finish_calibration()` around the
+//!   state machine, and the sample temperature `_collect_sample` returns.
 //! * **`stats`** (`temperature_probe.py:467-468`): the port has no
 //!   `Printer`-level walker that collects object `stats` yet;
 //!   [`TemperatureProbe::stats`] is upstream's shape, ready for one.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use serde_json::{json, Value};
 
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
 use crate::core::klippy::extras::heaters;
-use crate::core::klippy::gcode::{GCodeDispatch, GCODE_OBJECT};
+use crate::core::klippy::extras::manual_probe::{
+    self, FinalizeCallback, ManualProbe, MANUAL_PROBE_OBJECT,
+};
+use crate::core::klippy::extras::probe::{lookup_probe_session, ProbeSession};
+use crate::core::klippy::extras::toolhead::ToolHeadObject;
+use crate::core::klippy::gcode::{
+    sync, CommandError, CommandHandler, GCodeDispatch, GcodeCommand, GCODE_OBJECT,
+};
 use crate::core::klippy::load::section;
-use crate::core::klippy::mathutil::solve_linear_equations;
+use crate::core::klippy::mathutil::{solve_linear_equations, Coord};
 use crate::core::klippy::printer::{Printer, PrinterObject};
 
 section!("temperature_probe", order = 30, prefix = load_config_prefix);
@@ -54,6 +62,20 @@ section!("temperature_probe", order = 30, prefix = load_config_prefix);
 /// Upstream's `KELVIN_TO_CELSIUS` (`temperature_probe.py:10`): the `min_temp`
 /// default *and* its `minval`.
 const KELVIN_TO_CELSIUS: f64 = -273.15;
+
+/// The toolhead object, as the loader registers `[printer]`.
+const TOOLHEAD_OBJECT: &str = "toolhead";
+
+/// The probe object, which `probe.py` registers under this name and the
+/// calibration looks every probe up by.
+const PROBE_OBJECT: &str = "probe";
+
+/// The Z axis index, as [`Coord`] numbers them.
+const Z_AXIS: usize = 2;
+/// The X axis index, as [`Coord`] numbers them.
+const X_AXIS: usize = 0;
+/// The Y axis index, as [`Coord`] numbers them.
+const Y_AXIS: usize = 1;
 
 // ===========================================================================
 // Polynomial2d
@@ -333,10 +355,14 @@ fn optional_float_list(
 
 /// The readings and calibration flags the sensor callback and the object share
 /// (upstream's `last_temp_read_time` / `last_measurement` / `in_calibration` /
-/// `next_auto_temp` / `target_temp` / `total_expansion`, `:64-67,104-110`).
+/// `next_auto_temp` / `target_temp` / `total_expansion` / `expected_count` /
+/// `sample_count` / `step` / `last_zero_pos` / `start_pos` / `_method`,
+/// `:64-67,98-110`).
 ///
 /// Shared rather than owned by the object because `_temp_callback` is bound as
-/// a plain closure while the object is still being built.
+/// a plain closure while the object is still being built. The calibration
+/// counters live here too so one lock covers the state the sensor callback
+/// checks against the state a command writes.
 #[derive(Debug)]
 struct State {
     /// The clock the last reading was dated from (`last_temp_read_time`).
@@ -351,10 +377,23 @@ struct State {
     target_temp: f64,
     /// The expansion the calibration has estimated (`total_expansion`).
     total_expansion: f64,
+    /// The probing method the calibration runs with (`_method`, `"manual"`).
+    method: String,
+    /// How many samples the calibration expects (`expected_count`).
+    expected_count: i64,
+    /// How many samples it has taken (`sample_count`).
+    sample_count: i64,
+    /// The temperature step between two samples (`step`).
+    step: f64,
+    /// The Z the previous sample was taken at (`last_zero_pos`).
+    last_zero_pos: Option<f64>,
+    /// The XY the calibration started from (`start_pos`; `[]` upstream, so
+    /// `None` until `TEMPERATURE_PROBE_CALIBRATE` captures it).
+    start_pos: Option<[f64; 2]>,
 }
 
 impl State {
-    /// Upstream's `__init__` starting values (`:64-67,104-110`).
+    /// Upstream's `__init__` starting values (`:64-67,98-110`).
     fn new() -> Self {
         Self {
             last_temp_read_time: 0.,
@@ -363,6 +402,12 @@ impl State {
             next_auto_temp: 99999999.,
             target_temp: 0.,
             total_expansion: 0.,
+            method: "manual".to_string(),
+            expected_count: 0,
+            sample_count: 0,
+            step: 2.,
+            last_zero_pos: None,
+            start_pos: None,
         }
     }
 
@@ -467,6 +512,10 @@ pub struct TemperatureProbe {
     pub name: String,
     /// The section's parsed options.
     pub options: TemperatureProbeOptions,
+    /// The machine upstream keeps as `self.printer`: the command family looks
+    /// the toolhead, the probe and the dispatcher up through it. `Weak` so the
+    /// object adds no cycle of its own.
+    printer: Weak<Printer>,
     /// The sensor the readings come from. Held (not just a weak handle) so the
     /// ADC/report callback that drives it keeps upgrading — the reason
     /// `temperature_sensor.rs` holds its own.
@@ -532,6 +581,738 @@ fn round2(value: f64) -> f64 {
 }
 
 // ===========================================================================
+// The calibration command family
+// ===========================================================================
+
+/// `TEMPERATURE_PROBE_CALIBRATE`'s help (`temperature_probe.py:324-325`).
+const CALIBRATE_HELP: &str = "Calibrate probe temperature drift compensation";
+/// `TEMPERATURE_PROBE_NEXT`'s help (`temperature_probe.py:409`).
+///
+/// It is also what the registration gives `TEMPERATURE_PROBE_COMPLETE`,
+/// which upstream does although it defines
+/// `cmd_TEMPERATURE_PROBE_COMPLETE_help` itself (`:434` vs `:377-381`);
+/// the registration is kept verbatim, quirk included.
+const NEXT_HELP: &str = "Sample next probe drift temperature";
+/// `TEMPERATURE_PROBE_ABORT`'s help (`temperature_probe.py:439`).
+const ABORT_HELP: &str = "Abort Probe Drift Calibration";
+/// `TEMPERATURE_PROBE_ENABLE`'s help (`temperature_probe.py:443-445`).
+const ENABLE_HELP: &str = "Set adjustment factor applied to drift correction";
+
+/// The word after a section's prefix — upstream's `name.split(None, 1)[-1]`.
+/// It is the mux value `TEMPERATURE_PROBE_CALIBRATE` / `_ENABLE` register
+/// their `PROBE` key under (`temperature_probe.py:111`) and the word the
+/// calibration compares against the probe's own name (`:347-348`).
+fn short_name(name: &str) -> &str {
+    match name.split_once(char::is_whitespace) {
+        Some((_, rest)) => rest.trim_start(),
+        None => name,
+    }
+}
+
+impl TemperatureProbe {
+    /// Register the two commands the section owns, muxed on the section's
+    /// probe name (`temperature_probe.py:112-123`).
+    ///
+    /// # Errors
+    /// A command name or mux value already taken, reported at config load the
+    /// way upstream's `register_mux_command` reports it.
+    fn register_commands(self: &Arc<Self>, printer: &Arc<Printer>) -> Result<(), ConfigError> {
+        let gcode = printer
+            .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+            .expect("the loader registers `gcode` first");
+        let pname = short_name(&self.name);
+        {
+            let this = Arc::clone(self);
+            gcode
+                .register_mux_command_with_params(
+                    "TEMPERATURE_PROBE_CALIBRATE",
+                    "PROBE",
+                    Some(pname),
+                    Arc::new(move |gcmd| {
+                        let this = Arc::clone(&this);
+                        Box::pin(async move { this.cmd_calibrate(gcmd).await })
+                    }),
+                    Some(CALIBRATE_HELP),
+                    &["METHOD", "TARGET", "STEP"],
+                )
+                .map_err(ConfigError::new)?;
+        }
+        {
+            let this = Arc::clone(self);
+            gcode
+                .register_mux_command_with_params(
+                    "TEMPERATURE_PROBE_ENABLE",
+                    "PROBE",
+                    Some(pname),
+                    sync(move |gcmd| this.cmd_enable(gcmd)),
+                    Some(ENABLE_HELP),
+                    // What `EddyDriftCompensation.set_enabled` reads
+                    // (`temperature_probe.py:530`), unit C's.
+                    &["ENABLE"],
+                )
+                .map_err(ConfigError::new)?;
+        }
+        Ok(())
+    }
+
+    /// The live machine, or the standing "not ready" error.
+    fn live_printer(&self) -> Result<Arc<Printer>, CommandError> {
+        self.printer
+            .upgrade()
+            .ok_or_else(|| CommandError::new("Printer is not ready"))
+    }
+
+    /// The dispatcher, which upstream reaches as `self.gcode`.
+    fn gcode(&self) -> Result<Arc<GCodeDispatch>, CommandError> {
+        let printer = self.live_printer()?;
+        printer
+            .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+            .ok_or_else(|| CommandError::new("Printer is not ready"))
+    }
+
+    /// The toolhead every move of the calibration goes through.
+    fn toolhead(&self) -> Result<Arc<ToolHeadObject>, CommandError> {
+        let printer = self.live_printer()?;
+        printer
+            .lookup_object_as::<ToolHeadObject>(TOOLHEAD_OBJECT)
+            .ok_or_else(|| CommandError::new("Printer is not ready"))
+    }
+
+    /// Upstream's `_get_probe` (`temperature_probe.py:259-263`): the probe
+    /// the calibration drives, or its refusal.
+    ///
+    /// # Errors
+    /// "No probe configured" when no probe section registered the object.
+    fn get_probe(&self) -> Result<Arc<dyn ProbeSession>, CommandError> {
+        let printer = self.live_printer()?;
+        lookup_probe_session(&printer).ok_or_else(|| CommandError::new("No probe configured"))
+    }
+
+    /// The name the `probe` object reports — upstream reads
+    /// `probe.get_status(None)["name"]` (`:346`). `None` when the probe's
+    /// status carries no name (upstream's probe command helper always adds
+    /// one, so this only happens for a probe whose status is its own).
+    fn probe_name(&self) -> Option<String> {
+        let printer = self.printer.upgrade()?;
+        let probe = printer.lookup_object(PROBE_OBJECT)?;
+        probe
+            .get_status(printer.reactor().monotonic())
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    }
+
+    /// Upstream's `_check_homed` (`temperature_probe.py:289-297`): every axis
+    /// must be homed before the calibration moves anything.
+    ///
+    /// # Errors
+    /// "Printer must be homed before calibration" for the first axis that is
+    /// not homed.
+    fn check_homed(&self) -> Result<(), CommandError> {
+        let printer = self.live_printer()?;
+        let toolhead = printer
+            .lookup_object_as::<ToolHeadObject>(TOOLHEAD_OBJECT)
+            .ok_or_else(|| CommandError::new("Printer is not ready"))?;
+        let status = toolhead.get_status(printer.reactor().monotonic());
+        // A toolhead that has not connected reports no status at all; taking
+        // that as "nothing homed" keeps the refusal instead of a missing key.
+        let homed = status
+            .get("homed_axes")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if ["x", "y", "z"].iter().all(|axis| homed.contains(*axis)) {
+            return Ok(());
+        }
+        Err(CommandError::new(
+            "Printer must be homed before calibration",
+        ))
+    }
+
+    /// Upstream's `_get_speeds` (`temperature_probe.py:317-322`):
+    /// `(lift_speed, probe_speed, move_speed)`.
+    ///
+    /// # Errors
+    /// "No probe configured", or whatever the probe's parameter read reports.
+    fn get_speeds(&self) -> Result<(f64, f64, f64), CommandError> {
+        let probe = self.get_probe()?;
+        // Upstream asks the probe for its params with no command in hand
+        // (`get_probe_params()`), so an empty command reads the same defaults
+        // the section configured.
+        let gcmd = self
+            .gcode()?
+            .create_gcode_command("PROBE", "", HashMap::new());
+        let params = probe.probe_params(&gcmd)?;
+        let move_speed = self
+            .options
+            .speed
+            .unwrap_or_else(|| params.probe_speed.max(params.lift_speed));
+        Ok((params.lift_speed, params.probe_speed, move_speed))
+    }
+
+    /// Upstream's `_move_to_start` (`temperature_probe.py:300-315`): park the
+    /// nozzle where the calibration heats it up.
+    ///
+    /// # Errors
+    /// Whatever the moves, the speeds or the heating wait report.
+    async fn move_to_start(&self) -> Result<(), CommandError> {
+        let toolhead = self.toolhead()?;
+        let mut position = toolhead
+            .position()
+            .ok_or_else(|| CommandError::new("Printer is not ready"))?;
+        let move_speed = self.get_speeds()?.2;
+        if let Some(cal_pos) = self.options.cal_pos.clone() {
+            if self.options.cal_extruder_temp.is_some() {
+                // Move to the extruder heating z position.
+                position.set_axis(Z_AXIS, self.options.cal_extruder_z);
+                toolhead.move_to(position, move_speed)?;
+            }
+            position.set_axis(X_AXIS, cal_pos[0]);
+            position.set_axis(Y_AXIS, cal_pos[1]);
+            toolhead.move_to(position, move_speed)?;
+            if let Some(temp) = self.options.cal_extruder_temp {
+                self.set_extruder_temp(temp, true).await?;
+            }
+            position.set_axis(Z_AXIS, cal_pos[2]);
+            toolhead.move_to(position, move_speed)?;
+        } else if let Some(temp) = self.options.cal_extruder_temp {
+            position.set_axis(Z_AXIS, self.options.cal_extruder_z);
+            toolhead.move_to(position, move_speed)?;
+            self.set_extruder_temp(temp, true).await?;
+        }
+        Ok(())
+    }
+
+    /// Upstream's `_set_extruder_temp` (`temperature_probe.py:265-278`): the
+    /// heater script, and the `TEMPERATURE_WAIT` that follows it when asked
+    /// to wait.
+    ///
+    /// Nothing to run when `calibration_extruder_temp` is not configured —
+    /// the early return upstream starts with.
+    ///
+    /// # Errors
+    /// The toolhead lookup, or the scripts themselves.
+    async fn set_extruder_temp(&self, temp: f64, wait: bool) -> Result<(), CommandError> {
+        if self.options.cal_extruder_temp.is_none() {
+            return Ok(());
+        }
+        let extruder = self.toolhead()?.active_extruder();
+        let gcode = self.gcode()?;
+        // `%f` upstream: six decimals.
+        gcode
+            .run_script_from_command(&format!(
+                "SET_HEATER_TEMPERATURE HEATER={extruder} TARGET={temp:.6}"
+            ))
+            .await?;
+        if wait {
+            gcode
+                .run_script_from_command(&format!(
+                    "TEMPERATURE_WAIT SENSOR={extruder} MINIMUM={temp:.6}"
+                ))
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Upstream's `_set_bed_temp` (`temperature_probe.py:280-287`), with the
+    /// same "not configured, nothing to run" guard.
+    ///
+    /// # Errors
+    /// The heater script itself.
+    async fn set_bed_temp(&self, temp: f64) -> Result<(), CommandError> {
+        if self.options.cal_bed_temp.is_none() {
+            return Ok(());
+        }
+        self.gcode()?
+            .run_script_from_command(&format!(
+                "SET_HEATER_TEMPERATURE HEATER=heater_bed TARGET={temp:.6}"
+            ))
+            .await
+    }
+
+    /// Upstream's `_collect_sample` (`temperature_probe.py:164-178`): lift,
+    /// move over the probe point, then take the sample.
+    ///
+    /// # Errors
+    /// "No probe configured", or whatever the moves report.
+    fn collect_sample(&self, _mpresult: &Coord, _tool_zero_z: f64) -> Result<f64, CommandError> {
+        let probe = self.get_probe()?;
+        let offsets = probe.offsets();
+        let (lift_speed, _, move_speed) = self.get_speeds()?;
+        let toolhead = self.toolhead()?;
+        let mut cur_pos = toolhead
+            .position()
+            .ok_or_else(|| CommandError::new("Printer is not ready"))?;
+        // Move to the probe to sample collection position.
+        cur_pos.set_axis(Z_AXIS, cur_pos.z() + self.options.horizontal_move_z);
+        toolhead.move_to(cur_pos, lift_speed)?;
+        cur_pos.set_axis(X_AXIS, cur_pos.x() - offsets.x);
+        cur_pos.set_axis(Y_AXIS, cur_pos.y() - offsets.y);
+        toolhead.move_to(cur_pos, move_speed)?;
+        // TODO(C): upstream returns
+        // `self.cal_helper.collect_sample(mpresult, tool_zero_z, speeds)`
+        // (`:178`) — the temperature the drift sweep recorded, averaged over
+        // one sweep of the probe (`:617-618` reads this same sensor). The
+        // helper is `EddyDriftCompensation`, unit C; until it lands the sample
+        // temperature is this sensor's current reading, so the state machine
+        // still climbs `step` by `step` towards `target_temp`.
+        Ok(lock_state(&self.state).measurement.0)
+    }
+
+    /// Upstream's `_prepare_next_sample` (`temperature_probe.py:179-197`):
+    /// take `ABORT` back from the finished manual probe, settle at
+    /// `resting_z` and schedule the next sample's temperature.
+    ///
+    /// # Errors
+    /// The registration, the speeds or the move.
+    fn prepare_next_sample(
+        self: &Arc<Self>,
+        last_temp: f64,
+        tool_zero_z: f64,
+    ) -> Result<(), CommandError> {
+        let gcode = self.gcode()?;
+        // Register our own abort command now that the manual probe has
+        // finished and unregistered (`:181-186`).
+        {
+            let this = Arc::clone(self);
+            let handler: CommandHandler = Arc::new(move |gcmd| {
+                let this = Arc::clone(&this);
+                Box::pin(async move { this.cmd_abort(gcmd).await })
+            });
+            gcode
+                .register_command("ABORT", handler, Some(ABORT_HELP), false)
+                .map_err(CommandError::new)?;
+        }
+        let probe_speed = self.get_speeds()?.1;
+        let toolhead = self.toolhead()?;
+        let mut cur_pos = toolhead
+            .position()
+            .ok_or_else(|| CommandError::new("Printer is not ready"))?;
+        // Move down to the resting position.
+        cur_pos.set_axis(Z_AXIS, tool_zero_z + self.options.resting_z);
+        toolhead.move_to(cur_pos, probe_speed)?;
+        let (cnt, exp_cnt, next_auto_temp) = {
+            let mut state = lock_state(&self.state);
+            let next_auto_temp = last_temp + state.step;
+            state.next_auto_temp = next_auto_temp;
+            (state.sample_count, state.expected_count, next_auto_temp)
+        };
+        gcode.respond_info(
+            &format!(
+                "{}: collected sample {cnt}/{exp_cnt} at temp {last_temp:.2}C, \
+                 next sample scheduled at temp {next_auto_temp:.2}C",
+                self.name
+            ),
+            true,
+        );
+        Ok(())
+    }
+
+    /// Upstream's `_manual_probe_finalize` (`temperature_probe.py:200-232`):
+    /// fold the accepted Z into the expansion estimate, take the sample and
+    /// either finish or schedule the next one.
+    ///
+    /// # Errors
+    /// Whatever the sample, the moves or the finalization report — after
+    /// finalizing, as upstream's `except …: finalize(False); raise` does.
+    async fn manual_probe_finalize(
+        self: &Arc<Self>,
+        mpresult: Option<Coord>,
+    ) -> Result<(), CommandError> {
+        let Some(mpresult) = mpresult else {
+            // Calibration aborted.
+            return self.finalize_drift_cal(false, None).await;
+        };
+        let bed_z = mpresult.z();
+        {
+            let mut state = lock_state(&self.state);
+            if let Some(last_zero_z) = state.last_zero_pos {
+                state.total_expansion += last_zero_z - bed_z;
+                tracing::info!(
+                    "Estimated Total Thermal Expansion: {:.6}",
+                    state.total_expansion
+                );
+            }
+            state.last_zero_pos = Some(bed_z);
+        }
+        let tool_zero_z = self
+            .toolhead()?
+            .position()
+            .ok_or_else(|| CommandError::new("Printer is not ready"))?
+            .z();
+        let last_temp = match self.collect_sample(&mpresult, tool_zero_z) {
+            Ok(temp) => temp,
+            Err(err) => {
+                self.finalize_drift_cal(false, None).await?;
+                return Err(err);
+            }
+        };
+        let (sample_count, target_temp) = {
+            let mut state = lock_state(&self.state);
+            state.sample_count += 1;
+            (state.sample_count, state.target_temp)
+        };
+        if last_temp >= target_temp {
+            // Calibration done.
+            return self.finalize_drift_cal(true, None).await;
+        }
+        if let Err(err) = self.prepare_next_sample(last_temp, tool_zero_z) {
+            self.finalize_drift_cal(false, None).await?;
+            return Err(err);
+        }
+        if sample_count == 1 {
+            if let Some(temp) = self.options.cal_bed_temp {
+                if let Err(err) = self.set_bed_temp(temp).await {
+                    self.finalize_drift_cal(false, None).await?;
+                    return Err(err);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// `_manual_probe_finalize` from the finalize callback, which is not
+    /// itself async: the continuation runs as a spawned task when a runtime is
+    /// driving the host (`axis_twist_compensation`'s manual-probe callback
+    /// runs the same way).
+    fn spawn_manual_probe_finalize(self: &Arc<Self>, mpresult: Option<Coord>) {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            tracing::warn!(
+                "temperature_probe: continuing a manual probe sample needs an async runtime"
+            );
+            return;
+        };
+        let this = Arc::clone(self);
+        handle.spawn(async move {
+            if let Err(err) = this.manual_probe_finalize(mpresult).await {
+                // Upstream re-raises into the command that ended the manual
+                // probe; from a continuation there is no command left to
+                // carry it, so the line is reported the way one reports a
+                // failed command.
+                if let Ok(gcode) = this.gcode() {
+                    gcode.respond_raw(&format!("!! {err}"));
+                }
+            }
+        });
+    }
+
+    /// Upstream's `_finalize_drift_cal` (`temperature_probe.py:233-257`):
+    /// clear the state, take the temporary commands away, switch the heaters
+    /// off and report an aborted run.
+    ///
+    /// # Errors
+    /// The heater scripts — the same point at which upstream's own
+    /// `run_script_from_command` would stop it.
+    async fn finalize_drift_cal(
+        &self,
+        success: bool,
+        msg: Option<&str>,
+    ) -> Result<(), CommandError> {
+        {
+            let mut state = lock_state(&self.state);
+            state.next_auto_temp = 99999999.;
+            state.target_temp = 0.;
+            state.expected_count = 0;
+            state.sample_count = 0;
+            state.step = 2.;
+            state.in_calibration = false;
+            state.last_zero_pos = None;
+            state.total_expansion = 0.;
+            state.start_pos = None;
+        }
+        let gcode = self.gcode()?;
+        // Unregister the temporary commands (`:244-246`); a name that is not
+        // registered is upstream's no-op here too.
+        gcode.unregister_command("ABORT");
+        gcode.unregister_command("TEMPERATURE_PROBE_NEXT");
+        gcode.unregister_command("TEMPERATURE_PROBE_COMPLETE");
+        // Turn off the heaters (`:247-248`).
+        self.set_extruder_temp(0., false).await?;
+        self.set_bed_temp(0.).await?;
+        // TODO(C): upstream calls `self.cal_helper.finish_calibration(success)`
+        // here (`:249-254`) and turns a `gcode.error` from it into
+        // `success = False` + its message. `EddyDriftCompensation` is unit C,
+        // so nothing raises until then.
+        if !success {
+            let msg = msg
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("{}: calibration aborted", self.name));
+            gcode.respond_info(&msg, true);
+        }
+        Ok(())
+    }
+
+    /// Upstream's `_auto_probe` (`temperature_probe.py:327-337`): one `PROBE`
+    /// round through the probe session, then the same finalize the manual
+    /// probe would run.
+    ///
+    /// # Errors
+    /// "No probe configured", whatever the session reports, or the finalize.
+    async fn auto_probe(self: &Arc<Self>, gcmd: &GcodeCommand) -> Result<(), CommandError> {
+        let method = lock_state(&self.state).method.clone();
+        let mut fo_params = gcmd.get_command_parameters().clone();
+        fo_params.insert("METHOD".to_string(), method);
+        let fo_gcmd = self
+            .gcode()?
+            .create_gcode_command("PROBE", "PROBE", fo_params);
+        let probe = self.get_probe()?;
+        probe.start_probe_session(&fo_gcmd)?;
+        probe.run_probe(&fo_gcmd).await?;
+        let pos = probe
+            .pull_probed_results()
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                CommandError::new("Internal probe error - probe session returned no result")
+            })?;
+        probe.end_probe_session()?;
+        self.manual_probe_finalize(Some(pos)).await
+    }
+
+    /// `TEMPERATURE_PROBE_CALIBRATE` (`temperature_probe.py:338-409`).
+    ///
+    /// # Errors
+    /// In upstream's order: not homed, then whatever
+    /// [`Self::start_calibration`] reports.
+    async fn cmd_calibrate(self: &Arc<Self>, gcmd: &GcodeCommand) -> Result<(), CommandError> {
+        let method = gcmd.get_str_default("METHOD", "manual").to_lowercase();
+        // TODO(C): upstream refuses right here when no drift-compensation
+        // helper is registered (`:340-343`, "No calibration helper registered
+        // for [%s]"). The helper is `EddyDriftCompensation` (unit C); the
+        // guard lands with it, since refusing everything until then would
+        // leave the whole family unreachable.
+        self.check_homed()?;
+        self.start_calibration(gcmd, &method).await
+    }
+
+    /// Everything `TEMPERATURE_PROBE_CALIBRATE` does after the homed gate
+    /// (`temperature_probe.py:345-408`): link the probe, refuse a calibration
+    /// that is already running, read `TARGET`/`STEP`, register the two
+    /// temporary commands, move to the start and hand over to the
+    /// interactive probe.
+    ///
+    /// Split from [`Self::cmd_calibrate`] only at that gate, so the error
+    /// paths behind it are reachable on a test machine whose axes are never
+    /// homed; the order inside is upstream's.
+    ///
+    /// # Errors
+    /// "No probe configured", a link or conflict refusal, a `TARGET`/`STEP`
+    /// bound, "too few expected samples", taken temporary commands, or the
+    /// initial move.
+    async fn start_calibration(
+        self: &Arc<Self>,
+        gcmd: &GcodeCommand,
+        method: &str,
+    ) -> Result<(), CommandError> {
+        let printer = self.live_printer()?;
+        let gcode = self.gcode()?;
+        // Upstream's `_get_probe` refusal sits here, before the link check
+        // (`:345`); the session itself is reached again where it is driven.
+        let _ = self.get_probe()?;
+        // `[temperature_probe <name>]` has to be the section its probe reports
+        // (`:345-352`). A probe whose status carries no `name` has nothing to
+        // compare against, so the check stands aside for it rather than
+        // failing on a missing key.
+        if let Some(probe_name) = self.probe_name() {
+            if short_name(&probe_name) != short_name(&self.name) {
+                return Err(CommandError::new(format!(
+                    "[{}] not linked to registered probe [{}].",
+                    self.name, probe_name
+                )));
+            }
+        }
+        manual_probe::verify_no_manual_probe(&printer, &gcode)?;
+        if lock_state(&self.state).in_calibration {
+            return Err(CommandError::new(
+                "Already in probe drift calibration. Use TEMPERATURE_PROBE_COMPLETE or ABORT \
+                 to exit.",
+            ));
+        }
+        let cur_temp = lock_state(&self.state).measurement.0;
+        // `TARGET` and `STEP` (`:361-362`): both parse through the shared
+        // `get`, whose missing/parse wording is upstream's. The `above` bound
+        // is checked here because this port's `get` prints it as "must have
+        // above of …" (`gcode.rs`) where upstream prints "must be above …" —
+        // and the error text is upstream's.
+        let target_temp = gcmd.get(
+            "TARGET",
+            None,
+            |raw| raw.parse::<f64>().ok(),
+            None,
+            None,
+            None,
+            None,
+        )?;
+        if target_temp <= cur_temp {
+            return Err(CommandError::new(format!(
+                "Error on '{}': TARGET must be above {}",
+                gcmd.commandline(),
+                cur_temp
+            )));
+        }
+        let step = gcmd.get(
+            "STEP",
+            Some(2.),
+            |raw| raw.parse::<f64>().ok(),
+            Some(1.),
+            None,
+            None,
+            None,
+        )?;
+        let expected_count = ((target_temp - cur_temp) / step + 0.5) as i64;
+        if expected_count < 3 {
+            return Err(CommandError::new(format!(
+                "Invalid STEP and/or TARGET parameters resulted in too few expected samples: \
+                 {expected_count}"
+            )));
+        }
+        // The two temporary commands (`:372-386`): NEXT is registered first,
+        // and a failure leaves it registered exactly as upstream's `try`
+        // does.
+        let next: CommandHandler = {
+            let this = Arc::clone(self);
+            Arc::new(move |gcmd| {
+                let this = Arc::clone(&this);
+                Box::pin(async move { this.cmd_next(gcmd).await })
+            })
+        };
+        let complete: CommandHandler = {
+            let this = Arc::clone(self);
+            Arc::new(move |gcmd| {
+                let this = Arc::clone(&this);
+                Box::pin(async move { this.cmd_complete(gcmd).await })
+            })
+        };
+        let registered = gcode
+            .register_command("TEMPERATURE_PROBE_NEXT", next, Some(NEXT_HELP), false)
+            .and_then(|()| {
+                // Upstream passes NEXT's help for COMPLETE (`:377-381`);
+                // see [`NEXT_HELP`].
+                gcode.register_command(
+                    "TEMPERATURE_PROBE_COMPLETE",
+                    complete,
+                    Some(NEXT_HELP),
+                    false,
+                )
+            });
+        if registered.is_err() {
+            return Err(CommandError::new(
+                "Auxiliary Probe Drift Commands already registered. Use \
+                 TEMPERATURE_PROBE_COMPLETE or ABORT to exit.",
+            ));
+        }
+        {
+            let mut state = lock_state(&self.state);
+            state.method = method.to_string();
+            // TODO(C): upstream `self.cal_helper.start_calibration()` resets
+            // the helper's sample buckets here (`:388`).
+            state.in_calibration = true;
+            state.target_temp = target_temp;
+            state.step = step;
+            state.sample_count = 0;
+            state.expected_count = expected_count;
+        }
+        // If configured, move to the heating position and turn on the
+        // extruder (`:394-398`).
+        if let Err(err) = self.move_to_start().await {
+            self.finalize_drift_cal(false, Some("Error during initial move"))
+                .await?;
+            return Err(err);
+        }
+        // Capture the start position and begin the initial probe (`:399-408`).
+        let start = self
+            .toolhead()?
+            .position()
+            .ok_or_else(|| CommandError::new("Printer is not ready"))?;
+        lock_state(&self.state).start_pos = Some([start.x(), start.y()]);
+        if method == "tap" {
+            return self.auto_probe(gcmd).await;
+        }
+        self.start_manual_probe(gcmd)
+    }
+
+    /// `TEMPERATURE_PROBE_NEXT` (`temperature_probe.py:410-433`).
+    ///
+    /// # Errors
+    /// A manual probe is running, or whatever the moves report.
+    async fn cmd_next(self: &Arc<Self>, gcmd: &GcodeCommand) -> Result<(), CommandError> {
+        let printer = self.live_printer()?;
+        let gcode = self.gcode()?;
+        manual_probe::verify_no_manual_probe(&printer, &gcode)?;
+        lock_state(&self.state).next_auto_temp = 99999999.;
+        let toolhead = self.toolhead()?;
+        let mut cur_pos = toolhead
+            .position()
+            .ok_or_else(|| CommandError::new("Printer is not ready"))?;
+        let start_z = cur_pos.z();
+        let (lift_speed, probe_speed, move_speed) = self.get_speeds()?;
+        // Lift, move the nozzle back to the start position, and come back
+        // down to where the probe started (`:416-425`).
+        cur_pos.set_axis(Z_AXIS, cur_pos.z() + self.options.horizontal_move_z);
+        toolhead.move_to(cur_pos, lift_speed)?;
+        let [start_x, start_y] = lock_state(&self.state)
+            .start_pos
+            .ok_or_else(|| CommandError::new("No calibration start position"))?;
+        cur_pos.set_axis(X_AXIS, start_x);
+        cur_pos.set_axis(Y_AXIS, start_y);
+        toolhead.move_to(cur_pos, move_speed)?;
+        cur_pos.set_axis(Z_AXIS, start_z);
+        toolhead.move_to(cur_pos, probe_speed)?;
+        // The manual probe registers its own `ABORT` (`:426`).
+        gcode.unregister_command("ABORT");
+        if lock_state(&self.state).method == "tap" {
+            return self.auto_probe(gcmd).await;
+        }
+        self.start_manual_probe(gcmd)
+    }
+
+    /// `TEMPERATURE_PROBE_COMPLETE` (`temperature_probe.py:435-437`).
+    ///
+    /// # Errors
+    /// A manual probe is running, or the heater scripts the finalize runs.
+    async fn cmd_complete(&self, _gcmd: &GcodeCommand) -> Result<(), CommandError> {
+        let printer = self.live_printer()?;
+        let gcode = self.gcode()?;
+        manual_probe::verify_no_manual_probe(&printer, &gcode)?;
+        let sample_count = lock_state(&self.state).sample_count;
+        self.finalize_drift_cal(sample_count >= 3, None).await
+    }
+
+    /// `TEMPERATURE_PROBE_ABORT` (`temperature_probe.py:440-441`).
+    ///
+    /// # Errors
+    /// The heater scripts the finalize runs.
+    async fn cmd_abort(&self, _gcmd: &GcodeCommand) -> Result<(), CommandError> {
+        self.finalize_drift_cal(false, None).await
+    }
+
+    /// `TEMPERATURE_PROBE_ENABLE` (`temperature_probe.py:446-448`).
+    ///
+    /// Upstream forwards to `cal_helper.set_enabled(gcmd)` only when a helper
+    /// is registered; `EddyDriftCompensation` is unit C, so without one this
+    /// is the no-op upstream runs.
+    fn cmd_enable(&self, _gcmd: &GcodeCommand) -> Result<(), CommandError> {
+        Ok(())
+    }
+
+    /// Hand one sample to the interactive probe — upstream's
+    /// `manual_probe.ManualProbeHelper` at `:405-408` and `:430-433`.
+    ///
+    /// # Errors
+    /// No `manual_probe` object, or an already running manual probe.
+    fn start_manual_probe(self: &Arc<Self>, gcmd: &GcodeCommand) -> Result<(), CommandError> {
+        let printer = self.live_printer()?;
+        let manual = printer
+            .lookup_object_as::<ManualProbe>(MANUAL_PROBE_OBJECT)
+            .ok_or_else(|| CommandError::new("Printer is not ready"))?;
+        let this = Arc::clone(self);
+        let callback: FinalizeCallback = Arc::new(move |mpresult| {
+            this.spawn_manual_probe_finalize(mpresult);
+        });
+        manual.start_helper(&printer, gcmd, callback)
+    }
+}
+
+// ===========================================================================
 // Loading
 // ===========================================================================
 
@@ -570,12 +1351,17 @@ fn build_temperature_probe(
         Arc::downgrade(printer),
     ));
     heaters.register_sensor(config)?;
-    Ok(Arc::new(TemperatureProbe {
+    let probe = Arc::new(TemperatureProbe {
         name,
+        printer: Arc::downgrade(printer),
         options,
         sensor,
         state,
-    }))
+    });
+    // Upstream registers both mux commands in `__init__` (`:112-123`), so a
+    // duplicate registration fails at config load rather than at first use.
+    probe.register_commands(printer)?;
+    Ok(probe)
 }
 
 // ===========================================================================
@@ -587,7 +1373,14 @@ mod tests {
     use super::*;
     use crate::core::klippy::config::access::AccessTracking;
     use crate::core::klippy::config::{check_unused, Config, ConfigSection, ConfigValue};
-    use crate::core::klippy::reactor::ManualReactor;
+    use crate::core::klippy::event::KlippyEvent;
+    use crate::core::klippy::extras::probe::{
+        PrinterProbe, ProbeCommandState, ProbeOptions, ProbeSessionHelper,
+    };
+    use crate::core::klippy::extras::toolhead::HomingEndstop;
+    use crate::core::klippy::mcu::{ConfigBuilder, McuChip, McuEndstop};
+    use crate::core::klippy::pins::{PinParams, PrinterPins, PINS_OBJECT};
+    use crate::core::klippy::reactor::{ManualReactor, Reactor};
 
     /// A `[temperature_probe <name>]` section with the given options, as the
     /// parser would build it.
@@ -640,11 +1433,95 @@ mod tests {
         }
     }
 
-    /// Load a `[temperature_probe name]` from `text` with a scripted sensor,
-    /// returning the object and the slot its readings come from.
-    fn load(text: &str) -> (Arc<TemperatureProbe>, Arc<ScriptedSensor>) {
-        let printer = Arc::new(Printer::new(ManualReactor::shared()));
-        let heaters = heaters::ensure(&printer).expect("heaters registers");
+    /// A printer with the dispatcher, ready for commands the way `klippy:
+    /// ready` makes it, on a reactor the test can advance by hand.
+    fn machine() -> (Arc<Printer>, Arc<ManualReactor>, Arc<GCodeDispatch>) {
+        let reactor = Arc::new(ManualReactor::new());
+        let printer = Arc::new(Printer::new(Arc::clone(&reactor) as Arc<dyn Reactor>));
+        printer
+            .add_object(
+                GCODE_OBJECT,
+                Arc::new(GCodeDispatch::new(Arc::clone(&printer))),
+            )
+            .expect("gcode is free");
+        let gcode = printer
+            .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+            .expect("the dispatcher is registered");
+        printer.send_event(&KlippyEvent::KlippyReady);
+        (printer, reactor, gcode)
+    }
+
+    /// The `[printer]` section a `kinematics: none` toolhead builds from.
+    fn printer_section() -> ConfigSection {
+        let mut section = ConfigSection::new("printer", None);
+        for (key, value) in [
+            ("kinematics", "none"),
+            ("max_velocity", "300"),
+            ("max_accel", "3000"),
+        ] {
+            section
+                .parameters
+                .insert(key.to_string(), ConfigValue::Single(value.to_string()));
+        }
+        section
+    }
+
+    /// A `[probe]` assembled from its parts the way `PrinterProbe::new` does
+    /// once the pin layer built the endstop — no machine needed for the
+    /// session's command surface (probe.rs's own session tests build one the
+    /// same way).
+    fn real_z_probe(printer: &Arc<Printer>) -> Arc<PrinterProbe> {
+        let mut section = ConfigSection::new("probe", None);
+        section
+            .parameters
+            .insert("pin".to_string(), ConfigValue::Single("PA0".to_string()));
+        section.parameters.insert(
+            "z_offset".to_string(),
+            ConfigValue::Single("1.5".to_string()),
+        );
+        let config = ConfigWrapper::untracked(&section);
+        let options = ProbeOptions::read(&config).expect("the probe options read");
+        let chip = McuChip::new(
+            "mcu".to_string(),
+            Arc::new(ConfigBuilder::new()),
+            Arc::new(PrinterPins::new()),
+        );
+        let params = PinParams {
+            chip_name: "mcu".to_string(),
+            pin: "PA0".to_string(),
+            invert: false,
+            pullup: 0,
+            share_type: None,
+        };
+        let endstop = Arc::new(McuEndstop::new(chip, &params).expect("the endstop builds"));
+        let session = Arc::new(
+            ProbeSessionHelper::new(
+                &config,
+                printer,
+                Arc::clone(&endstop) as Arc<dyn HomingEndstop>,
+                Arc::clone(&endstop),
+                &options,
+                None,
+            )
+            .expect("the session builds"),
+        );
+        Arc::new(PrinterProbe::from_parts(
+            "probe".to_string(),
+            options,
+            Arc::clone(&endstop),
+            session,
+            Arc::new(ProbeCommandState::default()),
+        ))
+    }
+
+    /// Build the section's object on `printer` with a scripted sensor,
+    /// returning it with the slot its readings come from.
+    fn load_on(
+        printer: &Arc<Printer>,
+        text: &str,
+        section_name: &str,
+    ) -> (Arc<TemperatureProbe>, Arc<ScriptedSensor>) {
+        let heaters = heaters::ensure(printer).expect("heaters registers");
         let slot = Arc::new(ScriptedSensor::default());
         let sensor = Arc::clone(&slot);
         heaters.add_sensor_factory(
@@ -653,14 +1530,18 @@ mod tests {
         );
 
         let (config, _) = Config::from_text(text).expect("the test config parses");
-        let section = config
-            .get_section("temperature_probe name")
-            .expect("the section");
+        let section = config.get_section(section_name).expect("the section");
         let access = AccessTracking::shared();
         let wrapper = ConfigWrapper::new(section, Arc::clone(&access));
-        let probe = build_temperature_probe(&wrapper, &printer).expect("the section loads");
+        let probe = build_temperature_probe(&wrapper, printer).expect("the section loads");
         check_unused(&config, &access, &[]).expect("no option is left unread");
         (probe, slot)
+    }
+
+    /// Load a `[temperature_probe name]` from `text` on a printer of its own.
+    fn load(text: &str) -> (Arc<TemperatureProbe>, Arc<ScriptedSensor>) {
+        let (printer, _, _) = machine();
+        load_on(&printer, text, "temperature_probe name")
     }
 
     /// The minimal section text: `sensor_type` is what `setup_sensor` reads.
@@ -769,7 +1650,7 @@ min_temp: -100
 max_temp: 300
 gcode_id: T0
 ";
-        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        let (printer, _, _) = machine();
         let heaters = heaters::ensure(&printer).expect("heaters registers");
         heaters.add_sensor_factory(
             "Scripted",
@@ -930,7 +1811,7 @@ gcode_id: T0
     /// The loader hands back the object under its own section name.
     #[test]
     fn the_loader_registers_the_object_under_its_section_name() {
-        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        let (printer, _, _) = machine();
         let heaters = heaters::ensure(&printer).expect("heaters registers");
         heaters.add_sensor_factory(
             "Scripted",
@@ -951,5 +1832,670 @@ gcode_id: T0
             .lookup_object_as::<TemperatureProbe>("temperature_probe name")
             .expect("the object is there");
         assert_eq!(found.name, "temperature_probe name");
+    }
+
+    // --- The command family ------------------------------------------------
+
+    /// A machine the command family runs on: the dispatcher, a
+    /// `kinematics: none` toolhead, the `manual_probe` object, a real
+    /// `[probe]`, and the `[temperature_probe …]` section loaded on top. Every
+    /// line the dispatcher emits is kept in `log`.
+    struct Machine {
+        /// Held so the `Weak<Printer>` the section keeps stays alive.
+        #[allow(dead_code)]
+        printer: Arc<Printer>,
+        /// The clock the sensor callback arms `call_later` on.
+        reactor: Arc<ManualReactor>,
+        /// The dispatcher every command runs through.
+        gcode: Arc<GCodeDispatch>,
+        /// The section under test.
+        probe: Arc<TemperatureProbe>,
+        /// Where its readings are delivered from.
+        sensor: Arc<ScriptedSensor>,
+        /// The lines the dispatcher has emitted.
+        log: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Machine {
+        /// The standard machine: a connected toolhead and a `[probe]`.
+        async fn new(section_name: &str) -> Self {
+            let text = format!("[{section_name}]\nsensor_type: Scripted\n");
+            Self::build(&text, section_name, true, true).await
+        }
+
+        /// The standard machine with the section's own options; `connect` says
+        /// whether the toolhead has a planner (a toolhead before `connect` has
+        /// no position to move from).
+        async fn with_options(text: &str, section_name: &str, connect: bool) -> Self {
+            Self::build(text, section_name, connect, true).await
+        }
+
+        /// The standard machine without a `probe` object, so `_get_probe` has
+        /// nothing to find.
+        async fn without_probe(section_name: &str) -> Self {
+            let text = format!("[{section_name}]\nsensor_type: Scripted\n");
+            Self::build(&text, section_name, true, false).await
+        }
+
+        async fn build(text: &str, section_name: &str, connect: bool, with_probe: bool) -> Self {
+            let (printer, reactor, gcode) = machine();
+            let log = Arc::new(Mutex::new(Vec::new()));
+            {
+                let log = Arc::clone(&log);
+                gcode.register_output_handler(Arc::new(move |line: &str| {
+                    log.lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .push(line.to_string());
+                }));
+            }
+            printer
+                .add_object(PINS_OBJECT, Arc::new(PrinterPins::new()))
+                .expect("pins is free");
+            let toolhead = Arc::new(
+                ToolHeadObject::new(&ConfigWrapper::untracked(&printer_section()), &printer)
+                    .expect("kinematics: none builds"),
+            );
+            if connect {
+                toolhead.connect().await.expect("the toolhead connects");
+            }
+            printer
+                .add_object(TOOLHEAD_OBJECT, toolhead)
+                .expect("toolhead is free");
+            manual_probe::ensure(&printer, &ConfigWrapper::untracked(&printer_section()))
+                .expect("manual_probe");
+            if with_probe {
+                printer
+                    .add_object(PROBE_OBJECT, real_z_probe(&printer))
+                    .expect("probe is free");
+            }
+            let (probe, sensor) = load_on(&printer, text, section_name);
+            Self {
+                printer,
+                reactor,
+                gcode,
+                probe,
+                sensor,
+                log,
+            }
+        }
+
+        /// Run one line through the dispatcher.
+        async fn run(&self, line: &str) -> Result<(), CommandError> {
+            self.gcode.run_script(line).await
+        }
+
+        /// A command with the given parameters, as the dispatcher would hand
+        /// it to a handler.
+        fn command(&self, name: &str, params: &[(&str, &str)]) -> GcodeCommand {
+            let mut words = HashMap::new();
+            let mut line = name.to_string();
+            for (key, value) in params {
+                words.insert((*key).to_string(), (*value).to_string());
+                line.push_str(&format!(" {key}={value}"));
+            }
+            self.gcode.create_gcode_command(name, &line, words)
+        }
+
+        /// Every line the dispatcher has emitted.
+        fn replies(&self) -> Vec<String> {
+            self.log.lock().unwrap_or_else(|p| p.into_inner()).clone()
+        }
+
+        /// Let a spawned continuation run to completion (`ManualReactor` runs
+        /// no tasks, so the test drives the runtime itself).
+        async fn settle() {
+            for _ in 0..16 {
+                tokio::task::yield_now().await;
+            }
+        }
+    }
+
+    /// The section registers both mux commands under its probe name with
+    /// upstream's help, and the temporary trio waits for a calibration
+    /// (`temperature_probe.py:112-123, :372-381`).
+    #[tokio::test]
+    async fn the_commands_are_registered_upstreams_way() {
+        let m = Machine::new("temperature_probe probe").await;
+        let help = m.gcode.command_help();
+        assert_eq!(
+            help.get("TEMPERATURE_PROBE_CALIBRATE").map(String::as_str),
+            Some("Calibrate probe temperature drift compensation")
+        );
+        assert_eq!(
+            help.get("TEMPERATURE_PROBE_ENABLE").map(String::as_str),
+            Some("Set adjustment factor applied to drift correction")
+        );
+        for name in [
+            "ABORT",
+            "TEMPERATURE_PROBE_NEXT",
+            "TEMPERATURE_PROBE_COMPLETE",
+        ] {
+            assert!(
+                !m.gcode.command_exists(name),
+                "{name} waits for a calibration"
+            );
+        }
+        // `PROBE=probe` is the mux value the section registered, and the
+        // handler stops at the homed gate — the axes of a `kinematics: none`
+        // machine are never homed (`:344`).
+        let err = m
+            .run("TEMPERATURE_PROBE_CALIBRATE PROBE=probe")
+            .await
+            .expect_err("the homed gate refuses");
+        assert_eq!(err.to_string(), "Printer must be homed before calibration");
+        // The gate comes before any parameter is read (`:339-344`), so a
+        // command with no TARGET reports the gate, not the missing value.
+        assert!(
+            !m.replies()
+                .iter()
+                .any(|line| line.contains("missing TARGET")),
+            "TARGET is read after the gate: {:?}",
+            m.replies()
+        );
+    }
+
+    /// `_get_probe`'s refusal (`:259-263`) and the link check that follows it
+    /// (`:345-352`).
+    #[tokio::test]
+    async fn calibrate_refuses_a_missing_or_unlinked_probe() {
+        // No probe at all.
+        let m = Machine::without_probe("temperature_probe probe").await;
+        let gcmd = m.command(
+            "TEMPERATURE_PROBE_CALIBRATE",
+            &[("TARGET", "10"), ("STEP", "2")],
+        );
+        let err = m
+            .probe
+            .start_calibration(&gcmd, "manual")
+            .await
+            .expect_err("no probe");
+        assert_eq!(err.to_string(), "No probe configured");
+
+        // A section the probe is not named after.
+        let m = Machine::new("temperature_probe name").await;
+        let gcmd = m.command(
+            "TEMPERATURE_PROBE_CALIBRATE",
+            &[("TARGET", "10"), ("STEP", "2")],
+        );
+        let err = m
+            .probe
+            .start_calibration(&gcmd, "manual")
+            .await
+            .expect_err("not linked");
+        assert_eq!(
+            err.to_string(),
+            "[temperature_probe name] not linked to registered probe [probe]."
+        );
+    }
+
+    /// A running manual probe refuses the calibration (`:354`).
+    #[tokio::test]
+    async fn calibrate_refuses_while_a_manual_probe_runs() {
+        let m = Machine::new("temperature_probe probe").await;
+        m.run("MANUAL_PROBE")
+            .await
+            .expect("the manual probe starts");
+        let gcmd = m.command(
+            "TEMPERATURE_PROBE_CALIBRATE",
+            &[("TARGET", "10"), ("STEP", "2")],
+        );
+        let err = m
+            .probe
+            .start_calibration(&gcmd, "manual")
+            .await
+            .expect_err("busy");
+        assert_eq!(
+            err.to_string(),
+            "Already in a manual Z probe. Use ABORT to abort it."
+        );
+        // Nothing of the calibration was set up behind the refusal.
+        assert!(!m.probe.is_in_calibration());
+        assert!(!m.gcode.command_exists("TEMPERATURE_PROBE_NEXT"));
+    }
+
+    /// `TARGET`, `STEP` and the sample count keep upstream's wording
+    /// (`:361-371`).
+    #[tokio::test]
+    async fn calibrate_validates_target_step_and_sample_count() {
+        let m = Machine::new("temperature_probe probe").await;
+        // The sensor starts at 0 °C, so a TARGET at or below it is refused.
+        let gcmd = m.command(
+            "TEMPERATURE_PROBE_CALIBRATE",
+            &[("TARGET", "0"), ("STEP", "2")],
+        );
+        let err = m
+            .probe
+            .start_calibration(&gcmd, "manual")
+            .await
+            .expect_err("at the current temperature");
+        assert_eq!(
+            err.to_string(),
+            "Error on 'TEMPERATURE_PROBE_CALIBRATE TARGET=0 STEP=2': TARGET must be above 0"
+        );
+
+        let gcmd = m.command(
+            "TEMPERATURE_PROBE_CALIBRATE",
+            &[("TARGET", "10"), ("STEP", "0.5")],
+        );
+        let err = m
+            .probe
+            .start_calibration(&gcmd, "manual")
+            .await
+            .expect_err("a step below the minimum");
+        assert_eq!(
+            err.to_string(),
+            "Error on 'TEMPERATURE_PROBE_CALIBRATE TARGET=10 STEP=0.5': STEP must have minimum of 1"
+        );
+
+        let gcmd = m.command(
+            "TEMPERATURE_PROBE_CALIBRATE",
+            &[("TARGET", "1"), ("STEP", "2")],
+        );
+        let err = m
+            .probe
+            .start_calibration(&gcmd, "manual")
+            .await
+            .expect_err("too few samples");
+        assert_eq!(
+            err.to_string(),
+            "Invalid STEP and/or TARGET parameters resulted in too few expected samples: 1"
+        );
+    }
+
+    /// Taken temporary commands are refused with upstream's text, at the same
+    /// point of the flow (`:372-386`).
+    #[tokio::test]
+    async fn calibrate_refuses_when_the_temporary_commands_are_taken() {
+        let m = Machine::new("temperature_probe probe").await;
+        m.gcode
+            .register_command("TEMPERATURE_PROBE_NEXT", sync(|_| Ok(())), None, false)
+            .expect("registered");
+        let gcmd = m.command(
+            "TEMPERATURE_PROBE_CALIBRATE",
+            &[("TARGET", "10"), ("STEP", "2")],
+        );
+        let err = m
+            .probe
+            .start_calibration(&gcmd, "manual")
+            .await
+            .expect_err("taken");
+        assert_eq!(
+            err.to_string(),
+            "Auxiliary Probe Drift Commands already registered. Use TEMPERATURE_PROBE_COMPLETE or ABORT to exit."
+        );
+        // Upstream's `try` leaves the command it managed to register standing,
+        // and nothing of the calibration started.
+        assert!(m.gcode.command_exists("TEMPERATURE_PROBE_NEXT"));
+        assert!(!m.probe.is_in_calibration());
+    }
+
+    /// The body behind the gate: register the two temporary commands, arm the
+    /// state machine and hand the first sample to the interactive probe
+    /// (`:387-408`).
+    #[tokio::test]
+    async fn calibrate_starts_the_state_machine_and_the_manual_probe() {
+        let m = Machine::new("temperature_probe probe").await;
+        let gcmd = m.command(
+            "TEMPERATURE_PROBE_CALIBRATE",
+            &[("TARGET", "10"), ("STEP", "2")],
+        );
+        m.probe
+            .start_calibration(&gcmd, "manual")
+            .await
+            .expect("the calibration starts");
+
+        assert!(m.gcode.command_exists("TEMPERATURE_PROBE_NEXT"));
+        assert!(m.gcode.command_exists("TEMPERATURE_PROBE_COMPLETE"));
+        // Upstream registers NEXT's help for COMPLETE too (`:377-381`).
+        assert_eq!(
+            m.gcode
+                .command_help()
+                .get("TEMPERATURE_PROBE_COMPLETE")
+                .map(String::as_str),
+            Some("Sample next probe drift temperature")
+        );
+        // The manual probe took the interactive commands over (`:405-408`).
+        for name in ["ACCEPT", "NEXT", "TESTZ", "ABORT"] {
+            assert!(m.gcode.command_exists(name), "{name} is the manual probe's");
+        }
+        let status = m.probe.get_status(0.0);
+        assert_eq!(status["in_calibration"], json!(true));
+        assert!(
+            m.replies().iter().any(|line| line
+                .contains("Starting manual Z probe. Use TESTZ to adjust position.")),
+            "{:?}",
+            m.replies()
+        );
+        // What the command wrote (`:387-392`).
+        let state = lock_state(&m.probe.state);
+        assert_eq!(state.method, "manual");
+        assert_eq!(state.target_temp, 10.);
+        assert_eq!(state.step, 2.);
+        assert_eq!(state.sample_count, 0);
+        assert_eq!(state.expected_count, 5);
+        assert!(state.start_pos.is_some());
+    }
+
+    /// One sample round: `ACCEPT` takes the sample and schedules the next
+    /// temperature, and the reading reaching it kicks
+    /// `TEMPERATURE_PROBE_NEXT`, which opens the following round
+    /// (`:155-159, :179-197, :410-433`).
+    #[tokio::test]
+    async fn a_sample_cycle_kicks_the_next_one_when_the_temperature_rises() {
+        let m = Machine::new("temperature_probe probe").await;
+        let gcmd = m.command(
+            "TEMPERATURE_PROBE_CALIBRATE",
+            &[("TARGET", "10"), ("STEP", "2")],
+        );
+        m.probe
+            .start_calibration(&gcmd, "manual")
+            .await
+            .expect("the calibration starts");
+
+        // The interactive part: move the nozzle down and accept it.
+        m.run("TESTZ Z=-0.5").await.expect("the manual probe moves");
+        m.run("ACCEPT").await.expect("the sample is accepted");
+        Machine::settle().await;
+
+        assert!(
+            m.replies().iter().any(|line| line.contains(
+                "temperature_probe probe: collected sample 1/5 at temp 0.00C, \
+                 next sample scheduled at temp 2.00C"
+            )),
+            "{:?}",
+            m.replies()
+        );
+        // The finished manual probe handed `ABORT` back to the calibration
+        // (`:182-186`), and the helper's own commands are gone.
+        assert!(m.gcode.command_exists("ABORT"));
+        assert_eq!(
+            m.gcode.command_help().get("ABORT").map(String::as_str),
+            Some("Abort Probe Drift Calibration")
+        );
+        assert!(!m.gcode.command_exists("ACCEPT"));
+        assert_eq!(lock_state(&m.probe.state).next_auto_temp, 2.);
+        assert!(m.probe.is_in_calibration());
+
+        // The reading reaches the scheduled temperature: the sensor callback
+        // arms `_check_kick_next`, which runs `TEMPERATURE_PROBE_NEXT`.
+        m.sensor.read(1000., 5.);
+        m.reactor.advance(1.0);
+        Machine::settle().await;
+
+        // The next round is open again. It can only be: `cmd_TEMPERATURE_PROBE_NEXT`
+        // unregisters `ABORT` before the helper registers its own, so a
+        // leftover would have made the helper fail to start.
+        assert!(m.gcode.command_exists("ACCEPT"));
+        assert!(m.gcode.command_exists("TESTZ"));
+        assert!(
+            m.replies()
+                .iter()
+                .any(|line| line.contains("Starting manual Z probe.")),
+            "{:?}",
+            m.replies()
+        );
+        assert!(m.probe.is_in_calibration());
+    }
+
+    /// `TEMPERATURE_PROBE_COMPLETE` closes a short run as an abort and takes
+    /// the temporary commands with it (`:435-437`, `:233-257`).
+    #[tokio::test]
+    async fn complete_short_of_three_samples_aborts_the_calibration() {
+        let m = Machine::new("temperature_probe probe").await;
+        let gcmd = m.command(
+            "TEMPERATURE_PROBE_CALIBRATE",
+            &[("TARGET", "10"), ("STEP", "2")],
+        );
+        m.probe
+            .start_calibration(&gcmd, "manual")
+            .await
+            .expect("the calibration starts");
+        m.run("TESTZ Z=-0.5").await.expect("the manual probe moves");
+        m.run("ACCEPT").await.expect("the sample is accepted");
+        Machine::settle().await;
+
+        m.run("TEMPERATURE_PROBE_COMPLETE")
+            .await
+            .expect("the command runs");
+        assert!(
+            m.replies()
+                .iter()
+                .any(|line| line.contains("temperature_probe probe: calibration aborted")),
+            "{:?}",
+            m.replies()
+        );
+        for name in [
+            "ABORT",
+            "TEMPERATURE_PROBE_NEXT",
+            "TEMPERATURE_PROBE_COMPLETE",
+        ] {
+            assert!(!m.gcode.command_exists(name), "{name} is gone");
+        }
+        let status = m.probe.get_status(0.0);
+        assert_eq!(status["in_calibration"], json!(false));
+        assert_eq!(status["estimated_expansion"], json!(0.0));
+    }
+
+    /// A run with three samples or more completes silently (`:435-437`).
+    #[tokio::test]
+    async fn complete_with_three_samples_finishes_the_calibration() {
+        let m = Machine::new("temperature_probe probe").await;
+        let gcmd = m.command(
+            "TEMPERATURE_PROBE_CALIBRATE",
+            &[("TARGET", "10"), ("STEP", "2")],
+        );
+        m.probe
+            .start_calibration(&gcmd, "manual")
+            .await
+            .expect("the calibration starts");
+        m.run("TESTZ Z=-0.5").await.expect("the manual probe moves");
+        m.run("ACCEPT").await.expect("the sample is accepted");
+        Machine::settle().await;
+        // Three samples collected — the count `cmd_TEMPERATURE_PROBE_COMPLETE`
+        // needs (`sample_count >= 3`).
+        lock_state(&m.probe.state).sample_count = 3;
+
+        m.run("TEMPERATURE_PROBE_COMPLETE")
+            .await
+            .expect("the command runs");
+        assert!(
+            !m.replies()
+                .iter()
+                .any(|line| line.contains("calibration aborted")),
+            "{:?}",
+            m.replies()
+        );
+        assert!(!m.gcode.command_exists("TEMPERATURE_PROBE_NEXT"));
+        assert!(!m.probe.is_in_calibration());
+    }
+
+    /// The `ABORT` the calibration registers between samples takes the run
+    /// down (`:440-441`): upstream's `cmd_TEMPERATURE_PROBE_ABORT` answers as
+    /// `ABORT`, the name `_prepare_next_sample` registers it under (`:182-186`).
+    #[tokio::test]
+    async fn abort_takes_the_calibration_down() {
+        let m = Machine::new("temperature_probe probe").await;
+        let gcmd = m.command(
+            "TEMPERATURE_PROBE_CALIBRATE",
+            &[("TARGET", "10"), ("STEP", "2")],
+        );
+        m.probe
+            .start_calibration(&gcmd, "manual")
+            .await
+            .expect("the calibration starts");
+        m.run("TESTZ Z=-0.5").await.expect("the manual probe moves");
+        m.run("ACCEPT").await.expect("the sample is accepted");
+        Machine::settle().await;
+
+        m.run("ABORT").await.expect("the command runs");
+        assert!(
+            m.replies()
+                .iter()
+                .any(|line| line.contains("temperature_probe probe: calibration aborted")),
+            "{:?}",
+            m.replies()
+        );
+        for name in [
+            "ABORT",
+            "TEMPERATURE_PROBE_NEXT",
+            "TEMPERATURE_PROBE_COMPLETE",
+        ] {
+            assert!(!m.gcode.command_exists(name), "{name} is gone");
+        }
+        assert!(!m.probe.is_in_calibration());
+    }
+
+    /// An initial move that fails aborts the calibration where upstream does
+    /// (`:394-398`): the run is reported, taken down, and the failure itself
+    /// is what the command returns.
+    #[tokio::test]
+    async fn a_failed_initial_move_aborts_the_calibration() {
+        let text = "\
+[temperature_probe probe]
+sensor_type: Scripted
+calibration_position: 100, 100, 5
+";
+        // A toolhead before `connect` has no position to move from.
+        let m = Machine::with_options(text, "temperature_probe probe", false).await;
+        let gcmd = m.command(
+            "TEMPERATURE_PROBE_CALIBRATE",
+            &[("TARGET", "10"), ("STEP", "2")],
+        );
+        let err = m
+            .probe
+            .start_calibration(&gcmd, "manual")
+            .await
+            .expect_err("the move refuses");
+        assert_eq!(err.to_string(), "Printer is not ready");
+        assert!(
+            m.replies()
+                .iter()
+                .any(|line| line.contains("Error during initial move")),
+            "{:?}",
+            m.replies()
+        );
+        assert!(!m.gcode.command_exists("TEMPERATURE_PROBE_NEXT"));
+        assert!(!m.gcode.command_exists("TEMPERATURE_PROBE_COMPLETE"));
+        assert!(!m.probe.is_in_calibration());
+    }
+
+    /// Two samples: the Z the second one accepts becomes the expansion
+    /// estimate, `TEMPERATURE_PROBE_NEXT` opens the round by hand, and
+    /// `ABORT` puts the status back (`:200-210, :410-433, :440-441`).
+    #[tokio::test]
+    async fn the_expansion_estimate_accumulates_and_resets() {
+        let m = Machine::new("temperature_probe probe").await;
+        let gcmd = m.command(
+            "TEMPERATURE_PROBE_CALIBRATE",
+            &[("TARGET", "10"), ("STEP", "2")],
+        );
+        m.probe
+            .start_calibration(&gcmd, "manual")
+            .await
+            .expect("the calibration starts");
+
+        // First sample: there is nothing to compare the Z against yet.
+        m.run("TESTZ Z=-0.5").await.expect("the manual probe moves");
+        m.run("ACCEPT").await.expect("the first sample is accepted");
+        Machine::settle().await;
+        assert_eq!(m.probe.get_status(0.0)["estimated_expansion"], json!(0.0));
+
+        // The temperature never reached the schedule, so the next round is
+        // started by hand — upstream's `TEMPERATURE_PROBE_NEXT`.
+        let next = m.command("TEMPERATURE_PROBE_NEXT", &[]);
+        m.probe
+            .cmd_next(&next)
+            .await
+            .expect("the next round starts");
+        // `TESTZ` is a relative move (`manual_probe.py:280`), and the nozzle
+        // sits at the resting Z: -0.5 + 0.4 = -0.1. Six tenths down puts the
+        // second sample at -0.7.
+        m.run("TESTZ Z=-0.6").await.expect("the manual probe moves");
+        m.run("ACCEPT")
+            .await
+            .expect("the second sample is accepted");
+        Machine::settle().await;
+
+        // `last_zero_pos - bed_z` = -0.5 - (-0.7) (`:204-208`).
+        let expansion = m.probe.get_status(0.0)["estimated_expansion"]
+            .as_f64()
+            .expect("a number");
+        assert!((expansion - 0.2).abs() < 1e-9, "{expansion}");
+
+        // `ABORT` is the calibration's own again (the helper gave it back on
+        // `ACCEPT`) and the finalize cleared the estimate with the rest.
+        m.run("ABORT").await.expect("the command runs");
+        assert_eq!(m.probe.get_status(0.0)["in_calibration"], json!(false));
+        assert_eq!(m.probe.get_status(0.0)["estimated_expansion"], json!(0.0));
+        assert!(!m.gcode.command_exists("TEMPERATURE_PROBE_NEXT"));
+    }
+
+    /// The heater scripts are upstream's strings, `%f` and all
+    /// (`temperature_probe.py:265-287`), and with no calibration temperature
+    /// configured neither runs.
+    #[tokio::test]
+    async fn the_heater_scripts_are_upstreams_verbatim() {
+        let text = "\
+[temperature_probe probe]
+sensor_type: Scripted
+calibration_extruder_temp: 150
+calibration_bed_temp: 60
+";
+        let m = Machine::with_options(text, "temperature_probe probe", true).await;
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        for (cmd, key, value) in [
+            ("SET_HEATER_TEMPERATURE", "HEATER", "extruder"),
+            ("SET_HEATER_TEMPERATURE", "HEATER", "heater_bed"),
+            ("TEMPERATURE_WAIT", "SENSOR", "extruder"),
+        ] {
+            let lines = Arc::clone(&lines);
+            m.gcode
+                .register_mux_command_with_params(
+                    cmd,
+                    key,
+                    Some(value),
+                    sync(move |gcmd| {
+                        lines
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .push(gcmd.commandline().to_string());
+                        Ok(())
+                    }),
+                    None,
+                    &[],
+                )
+                .expect("the value is free");
+        }
+
+        m.probe
+            .set_extruder_temp(150., true)
+            .await
+            .expect("the heater script runs");
+        m.probe
+            .set_bed_temp(60.)
+            .await
+            .expect("the bed script runs");
+        assert_eq!(
+            *lines.lock().unwrap_or_else(|p| p.into_inner()),
+            vec![
+                "SET_HEATER_TEMPERATURE HEATER=extruder TARGET=150.000000",
+                "TEMPERATURE_WAIT SENSOR=extruder MINIMUM=150.000000",
+                "SET_HEATER_TEMPERATURE HEATER=heater_bed TARGET=60.000000",
+            ]
+        );
+    }
+
+    /// `TEMPERATURE_PROBE_ENABLE` takes the parameter and leaves the status
+    /// alone: upstream's run with no drift helper registered (`:446-448`).
+    #[tokio::test]
+    async fn enable_is_the_no_op_upstream_runs_without_a_helper() {
+        let m = Machine::new("temperature_probe probe").await;
+        m.run("TEMPERATURE_PROBE_ENABLE PROBE=probe ENABLE=1")
+            .await
+            .expect("the command runs");
+        assert_eq!(
+            m.probe.get_status(0.0)["compensation_enabled"],
+            json!(false)
+        );
     }
 }

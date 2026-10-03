@@ -120,7 +120,7 @@ pub struct RetryHelper {
     state: Mutex<RetryState>,
 }
 
-/// One `start`'s worth of retry bookkeeping (`z_tilt.py:96-103`).
+/// One `start`'s worth of retry bookkeeping (`z_tilt.py:93-101`).
 #[derive(Default)]
 struct RetryState {
     max_retries: i64,
@@ -131,7 +131,7 @@ struct RetryState {
 }
 
 impl RetryHelper {
-    /// Read `retries` and `retry_tolerance` (`z_tilt.py:88-93`).
+    /// Read `retries` and `retry_tolerance` (`z_tilt.py:88-90`).
     ///
     /// # Errors
     /// When a bound is violated: `retries` has `minval=0`,
@@ -572,7 +572,7 @@ async fn run_adjust<O: Adjust + ?Sized>(
 // ===========================================================================
 
 /// The `[z_tilt]` section: probe points, the plane fit behind
-/// `Z_TILT_ADJUST`, and its status (`z_tilt.py:126-176`).
+/// `Z_TILT_ADJUST`, and its status (`z_tilt.py:127-170`).
 pub struct ZTilt {
     /// The configured motor positions, `z_positions` rows.
     z_positions: Vec<(f64, f64)>,

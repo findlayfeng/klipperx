@@ -17,7 +17,7 @@
 //! # What is not here
 //!
 //! Upstream's `inside_timer` / `repeat` handshake is dropped. It exists because
-//! `delayed_gcode.py:32` calls `gcode.run_script` **synchronously** inside the
+//! `delayed_gcode.py:34` calls `gcode.run_script` **synchronously** inside the
 //! timer callback: a `UPDATE_DELAYED_GCODE` issued *by the delayed script
 //! itself* runs while `inside_timer` is set, so upstream records `repeat` and
 //! wakes again at `eventtime + duration` (`:37-41`).
@@ -107,7 +107,7 @@ impl DelayedGcode {
             })?;
         let gcode_macro = PrinterGCodeMacro::ensure(printer)?;
         let timer_gcode = gcode_macro.load_template(config, "gcode", None)?;
-        // `delayed_gcode.py:22`: `getfloat('initial_duration', 0., minval=0.)`.
+        // `delayed_gcode.py:17`: `getfloat('initial_duration', 0., minval=0.)`.
         let duration =
             config.get_float_bounded("initial_duration", Some(0.0), Some(0.0), None, None, None)?;
 
@@ -146,7 +146,7 @@ impl DelayedGcode {
         *self.duration.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// Register the timer (`DelayedGcode._handle_ready`, `delayed_gcode.py:34-39`):
+    /// Register the timer (`DelayedGcode._handle_ready`, `delayed_gcode.py:25-30`):
     /// armed for `initial_duration` seconds, or retired at [`NEVER`] when the
     /// duration is 0.
     fn handle_ready(&self) {
@@ -189,7 +189,7 @@ impl DelayedGcode {
     }
 
     /// One timer callback (`DelayedGcode._gcode_timer_event`,
-    /// `delayed_gcode.py:40-49`): render the template, run it, and retire.
+    /// `delayed_gcode.py:31-41`): render the template, run it, and retire.
     ///
     /// The returned `None` is upstream's `NEVER` (`:44-47`); the command
     /// re-arms a retired timer through [`DelayedGcode::arm`] (module docs).
@@ -427,7 +427,7 @@ mod tests {
     }
 
     /// A callback fires once and retires: upstream returns `NEVER` from
-    /// `_gcode_timer_event` (`delayed_gcode.py:44-47`), so a later clock has
+    /// `_gcode_timer_event` (`delayed_gcode.py:31-41`), so a later clock has
     /// nothing left to run.
     #[tokio::test]
     async fn test_the_timer_retires_after_it_fires() {

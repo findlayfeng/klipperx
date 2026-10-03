@@ -30,7 +30,7 @@ section!("gcode_arcs", order = 30, load = load_config);
 #[derive(Debug)]
 pub struct GCodeArcs {
     /// `resolution`: millimetres per arc segment — upstream's
-    /// `mm_per_arc_segment` (`gcode_arcs.py:19`), kept for the `G2`/`G3`
+    /// `mm_per_arc_segment` (`gcode_arcs.py:31`), kept for the `G2`/`G3`
     /// implementation that is still pending.
     mm_per_arc_segment: f64,
 }

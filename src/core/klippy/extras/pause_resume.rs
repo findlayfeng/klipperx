@@ -228,7 +228,7 @@ impl PauseResume {
         Ok(())
     }
 
-    /// Upstream's `cmd_CLEAR_PAUSE` body (`pause_resume.py:79-81`): forget
+    /// Upstream's `cmd_CLEAR_PAUSE` body (`pause_resume.py:89-90`): forget
     /// the paused and the command-sent state. `sd_paused` is left as it is,
     /// as upstream leaves it.
     fn clear_pause(&self) {
@@ -295,7 +295,7 @@ impl PauseResume {
         let gcode = printer
             .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
             .expect("the loader registers `gcode` before any section");
-        /// The one word `cmd_RESUME` reads (`pause_resume.py:68-76`); the
+        /// The one word `cmd_RESUME` reads (`pause_resume.py:81`); the
         /// other three commands read none.
         const RESUME_PARAMS: &[&str] = &["VELOCITY"];
         type Command = for<'a> fn(&'a Arc<PauseResume>, &'a GcodeCommand) -> CommandFuture<'a>;
@@ -429,7 +429,7 @@ fn cmd_resume<'a>(object: &'a Arc<PauseResume>, gcmd: &'a GcodeCommand) -> Comma
     })
 }
 
-/// `CLEAR_PAUSE` (`pause_resume.py:79-81`): drop the paused state without
+/// `CLEAR_PAUSE` (`pause_resume.py:89-90`): drop the paused state without
 /// resuming the print.
 fn cmd_clear_pause<'a>(object: &'a Arc<PauseResume>, _gcmd: &'a GcodeCommand) -> CommandFuture<'a> {
     Box::pin(async move {
@@ -709,7 +709,7 @@ mod tests {
     }
 
     /// `CLEAR_PAUSE` drops the paused and command-sent state without resuming
-    /// (`pause_resume.py:79-81`).
+    /// (`pause_resume.py:89-90`).
     #[test]
     fn clear_pause_forgets_the_pause() {
         let (printer, gcode, object) = machine();

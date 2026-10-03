@@ -89,7 +89,7 @@ impl SDCardLoop {
         true
     }
 
-    /// `SDCARD_LOOP_DESIST`'s stack clear (`sdcard_loop.py:70-75`).
+    /// `SDCARD_LOOP_DESIST`'s stack clear (`sdcard_loop.py:69`).
     ///
     /// # Returns
     /// `false` — and the caller raises `Only permitted outside of a SD file.` —

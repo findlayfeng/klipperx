@@ -1,7 +1,7 @@
 //! `[pwm_cycle_time <name>]` — a PWM pin whose cycle time a `SET_PIN` may change.
 //!
 //! Upstream is `klippy/extras/pwm_cycle_time.py`: an `output_pin` whose PWM is
-//! always a software one (`MCU_pwm_cycle`, `pwm_cycle_time.py:9-80`) and whose
+//! always a software one (`MCU_pwm_cycle`, `pwm_cycle_time.py:7-73`) and whose
 //! `SET_PIN` takes a `CYCLE_TIME=<seconds>` parameter on top of `VALUE`
 //! (`pwm_cycle_time.py:114-123`). The firmware reprograms the period in place
 //! (`set_digital_out_pwm_cycle`), so a client can retune the frequency while
@@ -16,7 +16,7 @@
 //! | `cycle_time` | PWM period in seconds (default 0.1, `> 0`) |
 //!
 //! There is deliberately no `hardware_pwm` option: upstream's
-//! `MCU_pwm_cycle` is always the software path (`pwm_cycle_time.py:124-127`
+//! `MCU_pwm_cycle` is always the software path (`pwm_cycle_time.py:7-73`
 //! never asks for hardware), so the section configures the pin with
 //! `hardware_pwm = false` unconditionally.
 //!
@@ -67,7 +67,7 @@ struct PinState {
     /// The period last set, seconds (upstream's `last_cycle_time`).
     cycle_time: f64,
     /// The print time the last update landed at (upstream's
-    /// `last_print_time`, `pwm_cycle_time.py:93`): the lookahead callback
+    /// `last_print_time`, `pwm_cycle_time.py:78`): the lookahead callback
     /// spaces the next send by `min_schedule_time` past this.
     last_print_time: f64,
 }
@@ -123,7 +123,7 @@ impl PwmCycleTime {
         // Always the software path — upstream never offers hardware here.
         pwm.setup_cycle_time(cycle_time, false);
         // Upstream's `MCU_pwm_cycle` builds `config_digital_out` with
-        // `max_duration=0` (`pwm_cycle_time.py:47-48`): no return-to-shutdown
+        // `max_duration=0` (`pwm_cycle_time.py:40-42`): no return-to-shutdown
         // limit, so `value` and `shutdown_value` may differ.
         pwm.setup_max_duration(0.0);
         pwm.setup_start_value(value, shutdown_value);

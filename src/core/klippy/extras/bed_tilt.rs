@@ -54,11 +54,11 @@ section!("bed_tilt", order = 30, load = load_config);
 const TOOLHEAD_OBJECT: &str = "toolhead";
 
 /// The section's name — upstream hardcodes `'bed_tilt'` in the `SAVE_CONFIG`
-/// write-back (`bed_tilt.py:40-42`); the section has no prefix form.
+/// write-back (`bed_tilt.py:42-44`); the section has no prefix form.
 const SECTION: &str = "bed_tilt";
 
 /// The plane the transform applies: upstream's `x_adjust`/`y_adjust`/
-/// `z_adjust` trio, copied as one value (`bed_tilt.py:36-42`).
+/// `z_adjust` trio, copied as one value (`bed_tilt.py:36-38`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Adjust {
     /// The Z slope along X.
@@ -70,7 +70,7 @@ struct Adjust {
 }
 
 /// One `[bed_tilt]` section: the plane and the move transform
-/// (`bed_tilt.py:9-42`).
+/// (`bed_tilt.py:10-44`).
 pub struct BedTilt {
     /// The machine, to find `toolhead`/`gcode_move`/`configfile` at run time.
     printer: Weak<Printer>,
@@ -82,7 +82,7 @@ pub struct BedTilt {
 }
 
 impl BedTilt {
-    /// Read the section's plane (`bed_tilt.py:14-17`).
+    /// Read the section's plane (`bed_tilt.py:15-17`).
     ///
     /// # Errors
     /// When an adjust option is malformed.
@@ -98,7 +98,7 @@ impl BedTilt {
         })
     }
 
-    /// The events upstream's `__init__` subscribes to (`bed_tilt.py:11-12`).
+    /// The events upstream's `__init__` subscribes to (`bed_tilt.py:13-14`).
     fn register_handlers(self: &Arc<Self>, printer: &Arc<Printer>) {
         printer.register_event_handler(
             KlippyEvent::KlippyConnect,
@@ -126,7 +126,7 @@ impl BedTilt {
     }
 
     /// Store the new plane, re-anchor `gcode_move`'s `last_position` and
-    /// queue the values for `SAVE_CONFIG` (`bed_tilt.py:33-42`).
+    /// queue the values for `SAVE_CONFIG` (`bed_tilt.py:35-44`).
     pub fn update_adjust(&self, x_adjust: f64, y_adjust: f64, z_adjust: f64) {
         *self.adjust.lock().unwrap_or_else(|p| p.into_inner()) = Adjust {
             x_adjust,
@@ -159,7 +159,7 @@ impl BedTilt {
 }
 
 impl MoveTarget for BedTilt {
-    /// Upstream's `move` (`bed_tilt.py:29-32`): add the plane back — the
+    /// Upstream's `move` (`bed_tilt.py:31-34`): add the plane back — the
     /// caller speaks the tilted bed's coordinates, the toolhead the real ones.
     fn move_to(&self, position: Coord, speed: f64) -> Result<(), CommandError> {
         let adjust = self.adjust();
@@ -179,7 +179,7 @@ impl MoveTarget for BedTilt {
         }
     }
 
-    /// Upstream's `get_position` (`bed_tilt.py:26-28`): the toolhead's
+    /// Upstream's `get_position` (`bed_tilt.py:26-30`): the toolhead's
     /// position with the plane **subtracted**, so the g-code space reads flat.
     fn position(&self) -> Coord {
         let Some(target) = self.target() else {
@@ -239,7 +239,7 @@ impl MoveTarget for ToolheadMove {
 }
 
 /// The `BED_TILT_CALIBRATE` half of the section — upstream's embedded
-/// `BedTiltCalibrate` class (`bed_tilt.py:45-57`). Built only when the
+/// `BedTiltCalibrate` class (`bed_tilt.py:47-84`). Built only when the
 /// section writes `points`; the registered command holds the long-lived
 /// reference.
 pub struct BedTiltCalibrate {
@@ -296,7 +296,7 @@ impl BedTiltCalibrate {
 }
 
 /// One calibration round: fit the plane through the probed positions, apply
-/// it and report it (`bed_tilt.py:59-95`).
+/// it and report it (`bed_tilt.py:61-84`).
 ///
 /// `coordinate_descent` minimises the squared height left over when every
 /// point is pushed through `z - x*x_adjust - y*y_adjust - z_adjust`,
@@ -338,7 +338,7 @@ fn probe_finalize(
     bedtilt.update_adjust(x_adjust, y_adjust, z_adjust);
 
     // Log, tell the log rollover, and answer the command
-    // (`bed_tilt.py:87-95`).
+    // (`bed_tilt.py:78-84`).
     let msg = format!("x_adjust: {x_adjust:.6} y_adjust: {y_adjust:.6} z_adjust: {z_adjust:.6}");
     set_rollover_info(SECTION, Some(&format!("bed_tilt: {msg}")));
     if let Some(printer) = printer {
@@ -355,7 +355,7 @@ fn probe_finalize(
     }
 }
 
-/// Upstream's `load_config` for `[bed_tilt]` (`bed_tilt.py:95`).
+/// Upstream's `load_config` for `[bed_tilt]` (`bed_tilt.py:86-87`).
 ///
 /// `gcode_move::ensure` stands in for upstream's
 /// `load_object(config, 'gcode_move')`: the transform takes the slot before
@@ -722,7 +722,7 @@ mod tests {
         );
 
         // The report says what was applied and what `SAVE_CONFIG` will do
-        // (`bed_tilt.py:91-95`).
+        // (`bed_tilt.py:81-84`).
         let lines = emitted(&output);
         assert!(
             lines.contains("The above parameters have been applied to the current"),

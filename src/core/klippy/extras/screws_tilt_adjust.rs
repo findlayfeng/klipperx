@@ -257,7 +257,7 @@ impl ScrewsTiltAdjust {
         }
     }
 
-    /// One round's work (`screws_tilt_adjust.py:66-133`): compute the report
+    /// One round's work (`screws_tilt_adjust.py:66-127`): compute the report
     /// ([`round_report`]), send its lines, store `results`, then fail with the
     /// deferred `MAX_DEVIATION` error when the round breached the limit.
     fn run_finalize(&self, positions: &[Coord]) -> Result<(), CommandError> {
@@ -337,7 +337,7 @@ fn read_screws(config: &ConfigWrapper) -> Result<Vec<((f64, f64), String)>, Conf
 }
 
 /// One round's report lines and `results` entries
-/// (`screws_tilt_adjust.py:66-133`).
+/// (`screws_tilt_adjust.py:66-127`).
 #[derive(Debug)]
 struct RoundReport {
     /// Everything to `respond_info`, in order: the reading hint, the base
@@ -762,7 +762,7 @@ mod tests {
     /// `MAX_DEVIATION` fails the round with upstream's wording, comparing
     /// only the non-base screws' raw differences — truthy `max_diff` only,
     /// so `0.0` disables the check like Python's `if self.max_diff`
-    /// (`screws_tilt_adjust.py:127-133`).
+    /// (`screws_tilt_adjust.py:123-127`).
     #[test]
     fn max_deviation_fails_the_round_with_upstream_wording() {
         let screws = three_screws();

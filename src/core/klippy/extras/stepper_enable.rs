@@ -34,7 +34,7 @@ use crate::core::klippy::pins::{DigitalOut, PrinterPins, PINS_OBJECT};
 use crate::core::klippy::printer::{Printer, PrinterObject};
 
 // The constant upstream uses for the dwell before disabling motors
-// (`DISABLE_STALL_TIME`, `stepper_enable.py:7`).
+// (`DISABLE_STALL_TIME`, `stepper_enable.py:8`).
 #[allow(dead_code)]
 const DISABLE_STALL_TIME: f64 = 0.100;
 
@@ -325,7 +325,7 @@ impl PrinterStepperEnable {
 
     /// Enable or disable several steppers by name, returning whether any
     /// changed (`PrinterStepperEnable.set_motors_enable`,
-    /// `stepper_enable.py:92-108`).
+    /// `stepper_enable.py:92-115`).
     ///
     /// A name with no tracking is skipped, as the `SET_STEPPER_ENABLE` handler
     /// has always done; that keeps the manual stepper's `ENABLE` able to name a
@@ -423,7 +423,7 @@ fn set_motors_enable_inner(
 
 /// Set up an enable pin for a stepper.
 ///
-/// Upstream's `setup_enable_pin` (`stepper_enable.py:34-50`): if `enable_pin`
+/// Upstream's `setup_enable_pin` (`stepper_enable.py:25-42`): if `enable_pin`
 /// is absent, return a "always enabled" placeholder; if the pin is already
 /// shared (same `share_type`), return the existing object; otherwise create a
 /// new dedicated pin.

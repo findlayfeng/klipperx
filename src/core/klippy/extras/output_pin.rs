@@ -57,7 +57,7 @@
 //!   all ride this queue: the schedule state and the lookahead wiring here
 //!   (`PinSchedule`, `queue_at_lookahead`) are shared with them — `servo`
 //!   keeps its own sink because upstream aligns it to the pulse cycle
-//!   (`servo.py:47-53`, `RESCHEDULE_SLACK`).
+//!   (`servo.py:48-56`, `RESCHEDULE_SLACK`).
 
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
@@ -393,7 +393,7 @@ pub(crate) fn queue_at_lookahead<S: RequestSink>(
 }
 
 /// The queue's downstream end: where a due request lands at its print time
-/// (upstream's `_set_pin`, `output_pin.py:196-201`).
+/// (upstream's `_set_pin`, `output_pin.py:237-244`).
 struct PinSink {
     /// Names the pin in a send-failure log line.
     name: String,

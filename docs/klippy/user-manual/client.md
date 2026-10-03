@@ -374,10 +374,11 @@ $ klippy-client console --plain -a /tmp/klippy_uds
 客户端会什么，取决于**主机实现了哪些端点**。完整清单与每个端点的参数、返回字段见
 [第三方开发手册的 API 参考](../third-party-dev/api-reference.md)。
 
-> **当前状态**：主机只实现了 `list_endpoints`，所以下表里除它以外的操作现在都会
-> 得到 `webhooks: No registered callback for path '…'`。那不是客户端的问题，是那
-> 些端点还没写（清单见 [开发手册](../developer-manual/README.md)）。表里先列出
-> 各操作**将来**的敲法。
+> **当前状态**：端点是逐个落地的，下表里的操作**都已实现**；仍未实现的
+> （`bed_mesh/dump_mesh` 与尚未接入的 `*/dump_*`）调用时才会得到
+> `webhooks: No registered callback for path '…'`——那不是客户端的问题。
+> 权威状态见 [第三方开发手册的 API 参考](../third-party-dev/api-reference.md) 开头的
+> 实现状态与主机侧 `api/endpoints/mod.rs` 的状态表。
 
 | 想做什么 | 在 `console` 里敲 |
 |----------|-------------------|

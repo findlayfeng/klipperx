@@ -29,13 +29,14 @@
 //!   method, so this is omitted; `stats` is a reactor scheduling hint, not
 //!   user-visible.
 //! - **`do_pause` synchronous wait** — upstream's `do_pause` spins until the
-//!   replay task exits (`virtual_sdcard.py:108-109`). This port's `do_pause`
+//!   replay task exits (`virtual_sdcard.py:123-127`). This port's `do_pause`
 //!   sets the flag and returns immediately; the task exits on its next
 //!   iteration, and `is_active` turns `false` only after the task actually
 //!   ends. `do_cancel` has the same caveat: it does not wait for the task to
-//!   stop before closing the file, so it should not be called while a replay
-//!   is in progress (it is dead code — not registered as a command — in this
-//!   port).
+//!   stop before closing the file, so `pause_resume`'s `CANCEL_PRINT` — the
+//!   one caller that can reach it during a replay (`extras/pause_resume.rs`)
+//!   — closes the file under the winding-down task, where upstream's wait
+//!   (`virtual_sdcard.py:123-127`) keeps the two serial.
 //! - **`expanduser`/`normpath`** — upstream runs `normpath(expanduser(…))`
 //!   over `path`; this port uses it as-is for `join`. Corpus paths are
 //!   relative (`test/klippy/sdcard_loop`) and need no expansion.
@@ -281,20 +282,26 @@ impl VirtualSdCard {
             .send_event(&KlippyEvent::VirtualSdcardResetFile);
     }
 
-    /// `do_pause()` (`virtual_sdcard.py:107-110`): set the pause flag. The
+    /// `do_pause()` (`virtual_sdcard.py:123-127`): set the pause flag. The
     /// replay task checks this flag each iteration and exits the loop.
     ///
     /// Upstream waits synchronously for `work_timer` to go `None`; this port
     /// returns immediately and the task exits on its next iteration (module
     /// docs).
-    fn do_pause(&self) {
+    ///
+    /// `pub(crate)` for the `pause_resume` SD seam (`extras/pause_resume.rs`);
+    /// behaviour unchanged.
+    pub(crate) fn do_pause(&self) {
         *self.must_pause_work.lock().unwrap() = true;
     }
 
-    /// `do_resume()` (`virtual_sdcard.py:111-115`): clear the pause flag and
+    /// `do_resume()` (`virtual_sdcard.py:128-133`): clear the pause flag and
     /// start the replay task. Registers a one-shot reactor timer at `NOW`
     /// whose callback spawns the `work_handler` task and retires itself.
-    fn do_resume(self: &Arc<Self>) -> Result<(), CommandError> {
+    ///
+    /// `pub(crate)` for the `pause_resume` SD seam (`extras/pause_resume.rs`);
+    /// behaviour unchanged.
+    pub(crate) fn do_resume(self: &Arc<Self>) -> Result<(), CommandError> {
         if *self.work_active.lock().unwrap() {
             return Err(CommandError::new("SD busy"));
         }
@@ -328,10 +335,12 @@ impl VirtualSdCard {
         Ok(())
     }
 
-    /// `do_cancel()` (`virtual_sdcard.py:116-121`): close the file, cancel
+    /// `do_cancel()` (`virtual_sdcard.py:134-139`): close the file, cancel
     /// print_stats, and zero the counters.
-    #[allow(dead_code)]
-    fn do_cancel(&self) {
+    ///
+    /// `pub(crate)` for the `pause_resume` SD seam (`extras/pause_resume.rs`);
+    /// behaviour unchanged.
+    pub(crate) fn do_cancel(&self) {
         if self.current_file.lock().unwrap().is_some() {
             self.do_pause();
             self.current_file.lock().unwrap().take();
@@ -363,9 +372,12 @@ impl VirtualSdCard {
         }
     }
 
-    /// `is_active()` (`virtual_sdcard.py:104`): whether the replay task is
+    /// `is_active()` (`virtual_sdcard.py:121-122`): whether the replay task is
     /// running.
-    fn is_active(&self) -> bool {
+    ///
+    /// `pub(crate)` for the `pause_resume` SD seam (`extras/pause_resume.rs`);
+    /// behaviour unchanged.
+    pub(crate) fn is_active(&self) -> bool {
         *self.work_active.lock().unwrap()
     }
 

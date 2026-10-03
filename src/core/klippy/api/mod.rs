@@ -26,11 +26,11 @@
 //! [`register`] installs the server's own object and every endpoint that is
 //! written: `webhooks`, `info`, `objects/list`, `objects/query`,
 //! `objects/subscribe`, the five `gcode/*` endpoints, `emergency_stop`,
-//! `query_endstops/status` and `register_remote_method`. The `*/dump_*` mux
-//! endpoints are installed through the `webhooks` object —
+//! `query_endstops/status`, `register_remote_method` and `pause_resume/*`. The
+//! `*/dump_*` mux endpoints are installed through the `webhooks` object —
 //! [`WebhooksStatus::register_mux_endpoint`] — once an extras module registers
-//! one. What is left of the documented surface is `pause_resume/*`, which waits
-//! for the `pause_resume` object.
+//! one. What is left of the documented surface is `bed_mesh/dump_mesh` and the
+//! `*/dump_*` instances whose extras are not written yet.
 //!
 //! The public reference for the endpoints themselves (paths, parameters,
 //! response fields) is `docs/klippy/third-party-dev/api-reference.md`; keep the
@@ -230,6 +230,9 @@ mod tests {
                 "objects/list",
                 "objects/query",
                 "objects/subscribe",
+                "pause_resume/cancel",
+                "pause_resume/pause",
+                "pause_resume/resume",
                 "query_endstops/status",
                 "register_remote_method",
             ]

@@ -232,7 +232,7 @@ git config core.hooksPath .githooks
 | （主机侧）`endpoints/info.rs` | 端点路径、`client_info` 可省略且必须是对象、响应 12 个字段与文档逐个对齐、`log_file` 为 `None` 时是 `null` 而非缺字段、响应不回显 `client_info`；**handler**：状态跟着机器（`startup`→`shutdown`）、四个 start args 与 `process_id` 真的进响应、`klipper_path` / `python_path` 非空且确实不存在 |
 | （主机侧）`api/start_args.rs` | CPU 描述的解析（processor 计数 + model name、缺 model 时问号）、`collect` 带上配置路径 / 版本、`log_file` 为 `None` |
 | （主机侧）`api/webhooks.rs` | 对象名是 `webhooks`、对象报的就是打印机状态（`startup` / `ready` / `shutdown` 三种都跟得上，因为它是读状态而不是存状态）；**mux 表生命周期**：`set_api` 后注册直连 `Api`（无需 drain）、`Printer::teardown` 经 `release_cycles` 清表并 `detach`，随后同 `(path, value)` 可重新注册（`test_a_registration_after_set_api_reaches_the_table_and_teardown_clears_it`）；两条装载路径的冲突检查与文案一致（`test_a_conflict_after_set_api_uses_the_same_message`） |
-| （主机侧）`api/mod.rs` | `register` 一次装完服务器这一侧：装完 `objects/list` 含 `webhooks`、端点表含 13 条路径（`info` / `emergency_stop` / `list_endpoints` / `objects/*` / 五个 `gcode/*` / `query_endstops/status` / `register_remote_method`）；装完后客户端能按名查到 `info`、能按名查到 `webhooks` 并跟着状态变；**重复注册报错**且归为「自己接错线」的 `RegistrationError`（不是客户端能引起的错误） |
+| （主机侧）`api/mod.rs` | `register` 一次装完服务器这一侧：装完 `objects/list` 含 `webhooks`、端点表含 16 条路径（`info` / `emergency_stop` / `list_endpoints` / `objects/*` / 五个 `gcode/*` / `query_endstops/status` / `register_remote_method` / `pause_resume/*`）；装完后客户端能按名查到 `info`、能按名查到 `webhooks` 并跟着状态变；**重复注册报错**且归为「自己接错线」的 `RegistrationError`（不是客户端能引起的错误） |
 | （主机侧）`endpoints/objects_list.rs` | 端点路径、没有组成部分的机器列表为空、按注册顺序列出多个对象、不看参数（上游的 handler 不读任何参数） |
 | （主机侧）`endpoints/objects_query.rs` | 端点路径、`null` 取全部字段 / 列表取指定字段 / 不存在的字段回 `null`、未知对象回 `{}`（不报错）、对象名与应答的 `eventtime` 一致且真的传给了源、服务器那个 `webhooks` 对象随机器 `startup`→`ready`→`shutdown` 变化、`objects` 缺失 / 非对象 / 值非 `null` 或字符串数组分别报三种错（文本对齐上游的 `Invalid argument`）、空字段列表取空、一次查询多个对象、空 `objects` 是空 `status` |
 | （主机侧）`endpoints/objects_subscribe.rs` | 订阅请求**立即**回一份全量快照（所有请求字段都返回）、0.25 s 后只推变化的字段、无变化不推、`response_template` 包住每次推送、`null` 字段列表展开为对象当时的字段、字段从缺到有会推而一直缺不推、未知对象回 `{}` 且不推、连接关闭后下一 tick 清理并自行停掉定时器（再没有 tick）、同一连接再订阅是替换不是追加、一个定时器服务多个订阅者、注册表按路径可达、参数校验与 `objects/query` 一致、`response_template` 非对象被拒 |
@@ -241,6 +241,7 @@ git config core.hooksPath .githooks
 | （主机侧）`endpoints/emergency_stop.rs` | 请求把打印机停机并回 `{}`（上游 `emergency_stop` 语义） |
 | （主机侧）`endpoints/query_endstops.rs` | 路径是上游那条 `query_endstops/status`；无 endstop 时回空对象 |
 | （主机侧）`endpoints/register_remote_method.rs` | 注册的方法收到模板与参数；`response_template` 可选；缺 `remote_method` 报参数错；只推给注册的那条连接 |
+| （主机侧）`endpoints/pause_resume.rs` | 三条路径名与文档一致（`test_the_paths_are_the_documented_ones`）、`install` 注册三端点、`pause`/`resume`/`cancel` 各自跑对应命令并回 `{}`、`gcode` 分发器未注册时报告打印机状态、未装载 `[pause_resume]` 节时以 `// Unknown command:…` 输出行安静应答且端点仍回 `{}`（共 7 测） |
 
 ### `klippy-client`
 
@@ -312,7 +313,7 @@ git config core.hooksPath .githooks
 | `led.rs` | 六段选项矩阵与上游文案（`No LED pin definitions found`/`color_order does not match chain_count`/`neopixel chain too long`/同 mcu 约束）、`LEDHelper` 颜色记账与初始值边界、`lookup_display_templates` 惰性单例（`is_queryable=false`）等（21 测） |
 | `extruder_stepper.rs` | 段全选项与步距 28.2/(200·16)、默认 PA `0.`/`0.040` 与越界文案、绑定校验逐字 `'bogus' is not a valid extruder.`、按名挂值与主挤出机槽位隔离、命令值域（7 测） |
 | `exclude_object.rs` | 零选项段+reset、get_status 三键、START/END 跟踪（大写化/隐式 define）、EXCLUDE 按名/当前/RESET+排序、`There is no current object to cancel`、DEFINE CENTER/POLYGON JSON 与 RESET、排除区丢弃/区外转发、四命令 help（9 测） |
-| `virtual_sdcard.rs` | 选项矩阵与默认 `on_error_gcode`、显式值、缺 `path` 文案；`get_file_list`（顶层 + 递归 + 缺目录）；`M20`/`M21`/`M23`（打开/不存在/大小写不敏感/去前导 `/`）、`M26`、`M27`、`SDCARD_RESET_FILE`/`SDCARD_PRINT_FILE`（子目录）、`M28`–`M30`（`cmd_error`）、`do_cancel`、`get_status` 两态（30 测）；回放循环：EOF 完成 + `progress`=1.0 + `Done printing file`、`is_active` 随 task、`M25` 暂停 + `note_pause`、错误触发 `note_error` + `on_error_gcode` 渲染运行、`do_resume` 活动时拒 `SD busy` |
+| `virtual_sdcard.rs` | 选项矩阵与默认 `on_error_gcode`、显式值、缺 `path` 文案；`get_file_list`（顶层 + 递归 + 缺目录）；`M20`/`M21`/`M23`（打开/不存在/大小写不敏感/去前导 `/`）、`M26`、`M27`、`SDCARD_RESET_FILE`/`SDCARD_PRINT_FILE`（子目录）、`M28`–`M30`（`cmd_error`）、`do_cancel`、`get_status` 两态（29 测，2026-10-03 实测重核）；回放循环：EOF 完成 + `progress`=1.0 + `Done printing file`、`is_active` 随 task、`M25` 暂停 + `note_pause`、错误触发 `note_error` + `on_error_gcode` 渲染运行、`do_resume` 活动时拒 `SD busy` |
 | `print_stats.rs` | reset 初值、`set_current_file`、`note_start`→`note_pause`→`note_complete` 流转与 duration、`note_error`/`note_cancel`/`note_pause` 不覆盖 error、`SET_PRINT_STATS_INFO` layer 逻辑（0 清空/切换 total 重置/截断/无参保持）、`get_status` standby/printing/paused 三态、命令注册、`ensure` 单例、filament 随 E 累积（19 测） |
 | `display_status.rs` | 裸段+`check_unused`+状态形状（1 测） |
 | `homing_override.rs` | 语料选项矩阵、默认 `XYZ`/无强制位、parse 与 `must be specified` 文案、G28 语句轴掩码=上游 `cmd_G28:33-46`（4 测） |
@@ -331,7 +332,7 @@ git config core.hooksPath .githooks
 | `extras/adxl345.rs` + `cmd/adxl345.rs`（wave-2，9 测） | `rate` 默认 3200 与非法值文案、`axes_map: -x,-y,z` → `[(0,-1),(1,-1),(2,1)]`、mux 端点 `adxl345/dump_adxl345`（key `sensor`）、带名节 identifier 注册、`cmd` 命令名/参数与语料字典一致 |
 | `extras/mpu9250.rs` + `cmd/mpu9250.rs`（wave-2，19 测） | 真 `Printer::load_config` 下按 identifier 注册（`mpu9250 my_mpu`）、默认值 4000/0x68/400000、`mpu9250/dump_mpu9250` 的 value、`convert_samples`/`read_axes_map` 换算；bulk 数据通路显式登记为 gap |
 | `extras/filament_switch_sensor.rs` + `extras/filament_motion_sensor.rs` + `buttons.rs`（wave-2） | 选项默认值与下界（`pause_on_runout` 默认 True、`pause_delay` 0.5、`event_delay` 3.0、`detection_length` 7.0）、`extruder` 值按段标识取对象、两条 mux 命令注册；`SYNC_EXTRUDER_MOTION` 空值解绑/非挤出机名文案、`SET_EXTRUDER_ROTATION_DISTANCE` 的 0 与负值分支（`extruders.test` 转绿即其验收） |
-| `extras/pause_resume.rs`（批 #15，11 测） | `[pause_resume]` 节装载与 `recover_velocity` 默认/越界、四条命令注册与 help 逐字、`PAUSE`/`RESUME`/`CLEAR_PAUSE`/`CANCEL_PRINT` 状态机四种文案、`CANCEL_PRINT` 两分支、`get_status` 的 `is_paused` |
+| `extras/pause_resume.rs`（批 #15 + `0890669`，16 测） | `[pause_resume]` 节装载与 `recover_velocity` 默认/越界、四条命令注册与 help 逐字、`PAUSE`/`RESUME`/`CLEAR_PAUSE`/`CANCEL_PRINT` 状态机四种文案、`CANCEL_PRINT` 两分支、`get_status` 的 `is_paused`；SD 分支接线（+5）：回放中 `PAUSE` 置位暂停且不发 action 行、`RESUME` 真重启回放到 EOF、`SD busy` 拒绝且 `is_paused` 保留、回放中 `CANCEL_PRINT` 关文件清状态、空闲 SD 仍发 action 行 |
 | `extras/heater_fan.rs`（批 #6，8 测） | 默认值（heater=extruder / heater_temp=50 / fan_speed=1）、越界拒绝、关机 PWM=1.0、tick 四反例（含「速度未变不重复写 PWM」）、未知 heater 文案、`check_unused`、整份配置装载 |
 | `extras/fan_generic.rs`（批 #18，6 测） | `shutdown_speed` 默认 0.0（非 heater_fan 的 1.0）、整份最小配置装载与对象名/`get_status`、`SET_FAN_SPEED SPEED=` 写 PWM（负值 `minimum of 0`、`SPEED=2` 被 `max_power` 封顶）、`SPEED`/`TEMPLATE` 互斥逐字、`TEMPLATE` 拒绝文案、缺 `pin` 前缀名 |
 | `extras/safe_z_home.rs`（批 #6，17 测） | 选项默认与下界、`home_xy_position` 缺失/单值拒绝、z 端停两分支（`stepper_z` / `carriage axis=z`）、与 `homing_override` 互斥、`G28 Z` 未归零 X/Y 文案、G28 合成语句 params、hop 顺序反例（`set_position` → `move` → `clear_homing_state`）、`z_hop=0` 跳过、`move_to_previous`、**装载顺序钉住**（注册后原 G28 handler 为 `Some`） |

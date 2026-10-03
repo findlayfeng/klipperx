@@ -34,6 +34,9 @@ $ klipperx api -a /tmp/klippy_uds list_endpoints
     "objects/list",
     "objects/query",
     "objects/subscribe",
+    "pause_resume/cancel",
+    "pause_resume/pause",
+    "pause_resume/resume",
     "query_endstops/status",
     "register_remote_method"
   ]

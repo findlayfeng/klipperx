@@ -149,6 +149,7 @@ pub const BUILTIN: &[(&str, &[&str])] = &[
     ("MEASURE_AXES_NOISE", &["MEAS_TIME"]),
     ("NEXT", &[]),
     ("PAUSE", &[]),
+    ("PID_CALIBRATE", &["HEATER", "TARGET", "WRITE_FILE"]),
     (
         "PROBE",
         &[
@@ -316,6 +317,12 @@ pub const BUILTIN: &[(&str, &[&str])] = &[
     ("SPI_SEND", &["DEVICE", "DATA"]),
     ("SPI_TRANSFER", &["DEVICE", "DATA"]),
     ("SYNC_EXTRUDER_MOTION", &["EXTRUDER", "MOTION_QUEUE"]),
+    (
+        "TEMPERATURE_PROBE_CALIBRATE",
+        &["PROBE", "METHOD", "TARGET", "STEP"],
+    ),
+    ("TEMPERATURE_PROBE_ENABLE", &["PROBE", "ENABLE"]),
+    ("TEMPERATURE_WAIT", &["SENSOR", "MINIMUM", "MAXIMUM"]),
     ("TESTZ", &["Z"]),
     (
         "TEST_RESONANCES",

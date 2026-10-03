@@ -381,7 +381,8 @@ M140 [S<temperature>]
 M190 [S<temperature>]
 ```
 
-`S` 默认 `0`。**当前 `M190` 不等待升温**，与 `M140` 行为相同。
+`S` 默认 `0`。**`M190` 等待升温**：`wait=true` 经 `PrinterHeaters::set_temperature(.., wait)`
+阻塞到热床到达目标（2026-10-03，`6745e83`，匹配上游 `heater_bed.py:17-28`）；`M140` 仅设目标即返回。
 
 ### PID_CALIBRATE — PID 自整定
 

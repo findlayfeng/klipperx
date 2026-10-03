@@ -45,7 +45,7 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use serde_json::{json, Value};
 
 use crate::core::klippy::config::object::CONFIGFILE_OBJECT;
-use crate::core::klippy::config::{ConfigError, ConfigWrapper, PrinterConfig};
+use crate::core::klippy::config::{py_float_str, ConfigError, ConfigWrapper, PrinterConfig};
 use crate::core::klippy::extras::heaters;
 use crate::core::klippy::extras::manual_probe::{
     self, FinalizeCallback, ManualProbe, MANUAL_PROBE_OBJECT,
@@ -1771,9 +1771,8 @@ impl EddyDriftCompensation {
         configfile.set(
             &self.name,
             "drift_calibration_min_temp",
-            // Upstream stores the float as-is; `{:?}` prints it the way
-            // Python's `str()` would for a temperature.
-            &format!("{min_temp:?}"),
+            // Upstream stores the float as-is, so the text is Python's `str()`.
+            &py_float_str(min_temp),
         );
         gcode.respond_info(
             &format!(

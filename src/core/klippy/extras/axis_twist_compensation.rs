@@ -36,7 +36,7 @@ use std::sync::{Arc, Mutex, Weak};
 
 use serde_json::{json, Value};
 
-use crate::core::klippy::config::{ConfigError, ConfigWrapper, PrinterConfig};
+use crate::core::klippy::config::{py_float_str, ConfigError, ConfigWrapper, PrinterConfig};
 use crate::core::klippy::error::KlippyError;
 use crate::core::klippy::event::printer_bus::ProbeResultsHandle;
 use crate::core::klippy::event::KlippyEvent;
@@ -239,6 +239,13 @@ fn interpolated_z_compensation(
         z_compensations[index],
         z_compensations[index + 1],
     )
+}
+
+/// Where a curve starts or ends, as the config stores it: upstream hands the
+/// raw float to `configfile.set` (`axis_twist_compensation.py:327-341`), so the
+/// text is Python's `str()` of it — `3.0`, not `3`.
+fn format_extent(value: f64) -> String {
+    py_float_str(value)
 }
 
 /// Add the interpolated compensation to every probed Z
@@ -600,7 +607,7 @@ impl Calibrater {
                             configfile.set(
                                 &self.configname,
                                 "compensation_start_x",
-                                &start.to_string(),
+                                &format_extent(start),
                             );
                         }
                     }
@@ -609,7 +616,7 @@ impl Calibrater {
                             configfile.set(
                                 &self.configname,
                                 "compensation_end_x",
-                                &end.to_string(),
+                                &format_extent(end),
                             );
                         }
                     }
@@ -626,7 +633,7 @@ impl Calibrater {
                             configfile.set(
                                 &self.configname,
                                 "compensation_start_y",
-                                &start.to_string(),
+                                &format_extent(start),
                             );
                         }
                     }
@@ -635,7 +642,7 @@ impl Calibrater {
                             configfile.set(
                                 &self.configname,
                                 "compensation_end_y",
-                                &end.to_string(),
+                                &format_extent(end),
                             );
                         }
                     }
@@ -1075,5 +1082,14 @@ compensation_end_y: 195
         let positions = results.to_vec();
         assert_eq!(positions[0].z(), 7.0 + 0.5);
         assert_eq!(positions[0].x(), 50.);
+    }
+
+    /// The curve's extents are stored as raw floats by upstream
+    /// (`axis_twist_compensation.py:327-341`), so an integral one reads `3.0`.
+    #[test]
+    fn a_saved_extent_keeps_pythons_spelling() {
+        assert_eq!(format_extent(3.0), "3.0");
+        assert_eq!(format_extent(100.0), "100.0");
+        assert_eq!(format_extent(12.5), "12.5");
     }
 }

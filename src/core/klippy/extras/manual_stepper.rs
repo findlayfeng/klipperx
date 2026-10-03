@@ -723,7 +723,7 @@ mod tests {
     }
 
     /// `SPEED`/`ACCEL` fall back to the section's `velocity`/`accel`
-    /// (`manual_stepper.py:106-107`). The dwell-only timeline leaves
+    /// (`manual_stepper.py:105-106`). The dwell-only timeline leaves
     /// `next_cmd_time` at the trapezoid's duration, which is the observable.
     #[test]
     fn test_speed_and_accel_default_to_the_section_values() {

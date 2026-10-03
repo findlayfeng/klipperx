@@ -104,7 +104,7 @@ const DEFAULT_SPEED: i64 = 400_000;
 /// Upstream's `i2c_speed` `minval` (`bus.py:307`).
 const MIN_SPEED: i64 = 100_000;
 
-/// The default `_max_duration` of both resources (`sx1509.py:105`, `:125`).
+/// The default `_max_duration` of both resources (`sx1509.py:110`, `:125`).
 const DEFAULT_MAX_DURATION: f64 = 2.0;
 
 /// One `[sx1509 <name>]`: the I2C device, the register cache, and the chip
@@ -157,7 +157,7 @@ impl Registers {
         }
     }
 
-    /// `clear_bits_in_register` (`sx1509.py:60-64`): the register keeps
+    /// `clear_bits_in_register` (`sx1509.py:71-75`): the register keeps
     /// everything but `bitmask`.
     fn clear_bits(&mut self, reg: u8, bitmask: u32) {
         if let Some((_, value)) = self.word.iter_mut().find(|(r, _)| *r == reg) {
@@ -169,7 +169,7 @@ impl Registers {
         }
     }
 
-    /// `set_bits_in_register` (`sx1509.py:65-69`).
+    /// `set_bits_in_register` (`sx1509.py:76-80`).
     fn set_bits(&mut self, reg: u8, bitmask: u32) {
         if let Some((_, value)) = self.word.iter_mut().find(|(r, _)| *r == reg) {
             *value |= bitmask as u16;
@@ -178,7 +178,7 @@ impl Registers {
         }
     }
 
-    /// `set_register` (`sx1509.py:70-74`). The LED-driver registers hold one
+    /// `set_register` (`sx1509.py:81-85`). The LED-driver registers hold one
     /// byte, so a larger value is truncated the way the send masks it.
     fn set_register(&mut self, reg: u8, value: u16) {
         if let Some((_, current)) = self.word.iter_mut().find(|(r, _)| *r == reg) {
@@ -188,7 +188,7 @@ impl Registers {
         }
     }
 
-    /// `send_register`'s payload (`sx1509.py:75-87`): the register byte, then
+    /// `send_register`'s payload (`sx1509.py:86-98`): the register byte, then
     /// two value bytes for a word register or one for a byte register.
     fn register_bytes(&self, reg: u8) -> Option<Vec<u8>> {
         if let Some((_, value)) = self.word.iter().find(|(r, _)| *r == reg) {
@@ -209,7 +209,7 @@ impl Registers {
 impl Sx1509 {
     /// Read the bus options, register the chip, and arm the connect write.
     ///
-    /// Upstream's `SX1509.__init__` (`sx1509.py:22-36`): the I2C device first,
+    /// Upstream's `SX1509.__init__` (`sx1509.py:25-41`): the I2C device first,
     /// the chip registration second, the connect handler last.
     ///
     /// # Errors
@@ -349,7 +349,7 @@ impl Sx1509 {
         }
     }
 
-    /// Upstream's `handle_connect` (`sx1509.py:36-50`).
+    /// Upstream's `handle_connect` (`sx1509.py:42-59`).
     ///
     /// The two reset writes and the oscillator/clock-divider writes come first
     /// and are unconditional; then the whole word-register dict, then the whole
@@ -431,7 +431,7 @@ impl PinChip for Sx1509 {
         }
         let sxpin = parse_pin_number(&params.pin, "pwm")?;
         let bitmask = pin_bitmask(sxpin)?;
-        // `REG_I_ON[self._sxpin]` (`sx1509.py:117`).
+        // `REG_I_ON[self._sxpin]` (`sx1509.py:145`).
         let i_on_reg = REG_I_ON
             .get(sxpin)
             .copied()
@@ -444,7 +444,7 @@ impl PinChip for Sx1509 {
             Some(Arc::clone(&hardware_pwm)),
         )
         .map_err(|err| PinError::Message(err.to_string()))?;
-        // Upstream's `SX1509_pwm.__init__` register setup (`sx1509.py:132-140`).
+        // Upstream's `SX1509_pwm.__init__` register setup (`sx1509.py:140-161`).
         self.set_bits(REG_INPUT_DISABLE, bitmask);
         self.clear_bits(REG_PULLUP, bitmask);
         self.clear_bits(REG_DIR, bitmask);
@@ -472,7 +472,7 @@ impl PinChip for Sx1509 {
     }
 }
 
-/// Upstream's `_build_config` checks (`sx1509.py:115-117`, `:145-149`), run at
+/// Upstream's `_build_config` checks (`sx1509.py:114-116`, `:145-149`), run at
 /// build time on the MCU's configuration builder.
 ///
 /// A PWM also refuses a software cycle (`hardware_pwm` off), which upstream
@@ -514,7 +514,7 @@ fn parse_pin_number(pin: &str, pin_type: &str) -> Result<usize, PinError> {
         .ok_or_else(|| wrong_type(pin, pin_type))
 }
 
-/// The one-bit mask for `sxpin` (`1 << self._sxpin`, `sx1509.py:102`).
+/// The one-bit mask for `sxpin` (`1 << self._sxpin`, `sx1509.py:105`).
 ///
 /// Upstream builds the mask with Python's unbounded ints; the cache is 16 bits
 /// wide, so a pin above 15 shifts out of the word and its mask becomes a no-op
@@ -525,7 +525,7 @@ fn pin_bitmask(sxpin: usize) -> Result<u32, PinError> {
         .ok_or_else(|| PinError::Message(format!("SX1509 has no pin {sxpin}")))
 }
 
-/// Upstream's `setup_pin` refusal (`sx1509.py:52-54`), shared by every type
+/// Upstream's `setup_pin` refusal (`sx1509.py:60-66`), shared by every type
 /// this chip does not build.
 fn wrong_type(pin: &str, pin_type: &str) -> PinError {
     let first4: String = pin.chars().take(4).collect();
@@ -547,7 +547,7 @@ struct Sx1509DigitalOut {
 }
 
 impl Sx1509DigitalOut {
-    /// Upstream's `set_digital` (`sx1509.py:127-133`).
+    /// Upstream's `set_digital` (`sx1509.py:130-135`).
     fn set_digital(&self, value: bool) {
         if u8::from(value) ^ u8::from(self.invert) != 0 {
             self.chip.set_bits(REG_DATA, self.bitmask);
@@ -604,7 +604,7 @@ struct Sx1509Pwm {
 }
 
 /// The LED-driver byte for a duty: `~int(255 * value)` for a normal pin, or
-/// `int(255 * value)` for an inverted one (`sx1509.py:152-153`, `:163-167`),
+/// `int(255 * value)` for an inverted one (`sx1509.py:185`, `:163-167`),
 /// both masked to a byte the way the send is.
 fn i_on_byte(value: f64, invert: bool) -> u8 {
     let raw = (255.0 * value) as i32;
@@ -844,7 +844,7 @@ mod tests {
         assert_eq!(chip.writes().last().unwrap(), &vec![0x10, 0x00, 0x00]);
 
         // `queue_digital_out` is the clocked twin and writes the same bytes
-        // (`set_digital`, `sx1509.py:127-133`).
+        // (`set_digital`, `sx1509.py:130-135`).
         out.queue_digital_out(1234, true).unwrap();
         assert_eq!(chip.writes().last().unwrap(), &vec![0x10, 0x10, 0x00]);
         out.queue_digital_out(1235, false).unwrap();

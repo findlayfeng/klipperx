@@ -87,9 +87,9 @@ the accelerometer sample collection and PSD fitting data path is not wired.";
 #[allow(dead_code)]
 pub struct ResonanceTester {
     printer: Weak<Printer>,
-    /// `move_speed`, default `50.`, above `0` (`resonance_tester.py:263`).
+    /// `move_speed`, default `50.`, above `0` (`resonance_tester.py:265`).
     move_speed: f64,
-    /// `min_freq`, default `5.`, minimum `1.` (`resonance_tester.py:58`).
+    /// `min_freq`, default `5.`, minimum `1.` (`resonance_tester.py:59`).
     min_freq: f64,
     /// `max_freq`, default `135.`, in `min_freq`…`300.`.
     max_freq: f64,
@@ -230,7 +230,7 @@ impl ResonanceTester {
         }
     }
 
-    /// Upstream's `_parse_chips` (`resonance_tester.py:331-341`): each
+    /// Upstream's `_parse_chips` (`resonance_tester.py:382-393`): each
     /// comma-separated name must resolve to an accelerometer. The parsed chips
     /// are unused while the run is a gap, so only the validation runs.
     ///
@@ -259,7 +259,7 @@ impl ResonanceTester {
         Ok(())
     }
 
-    /// Upstream's `cmd_TEST_RESONANCES` (`resonance_tester.py:345-378`): parse
+    /// Upstream's `cmd_TEST_RESONANCES` (`resonance_tester.py:397-444`): parse
     /// every parameter, then report the gap.
     ///
     /// # Errors
@@ -286,7 +286,7 @@ impl ResonanceTester {
         Err(CommandError::new(DATA_PATH_GAP))
     }
 
-    /// Upstream's `cmd_SHAPER_CALIBRATE` (`resonance_tester.py:381-436`): parse
+    /// Upstream's `cmd_SHAPER_CALIBRATE` (`resonance_tester.py:447-505`): parse
     /// every parameter, then report the gap.
     ///
     /// # Errors
@@ -325,7 +325,7 @@ impl ResonanceTester {
         Err(CommandError::new(DATA_PATH_GAP))
     }
 
-    /// Upstream's `cmd_MEASURE_AXES_NOISE` (`resonance_tester.py:379-380`):
+    /// Upstream's `cmd_MEASURE_AXES_NOISE` (`resonance_tester.py:508-527`):
     /// parse `MEAS_TIME`, then report the gap.
     ///
     /// # Errors
@@ -467,7 +467,7 @@ fn group_chips(mut chips: Vec<(String, String)>) -> Vec<(String, String)> {
     groups
 }
 
-/// Read `probe_points` (`resonance_tester.py:290-291`): three floats per line.
+/// Read `probe_points` (`resonance_tester.py:285-286`): three floats per line.
 ///
 /// # Errors
 /// [`ConfigError`] for a line whose parsed group is not three floats, or a
@@ -490,7 +490,7 @@ fn read_probe_points(config: &ConfigWrapper) -> Result<Vec<[f64; 3]>, ConfigErro
     Ok(points)
 }
 
-/// Parse an `AXIS` parameter (`_parse_axis`, `resonance_tester.py:43-60`): an
+/// Parse an `AXIS` parameter (`_parse_axis`, `resonance_tester.py:39-55`): an
 /// axis letter, or a two- or three-component vibration direction.
 ///
 /// The direction itself is unused while the run is a gap, so only the format is
@@ -564,7 +564,7 @@ fn parse_outputs(outputs: &str) -> Result<(), CommandError> {
     Ok(())
 }
 
-/// Check a `NAME` suffix (`is_valid_name_suffix`, `resonance_tester.py:438-439`):
+/// Check a `NAME` suffix (`is_valid_name_suffix`, `resonance_tester.py:529-530`):
 /// alphanumeric once `-` and `_` are dropped.
 ///
 /// Only a written `NAME` reaches this; upstream's default is a timestamp, which
@@ -585,7 +585,7 @@ fn check_name_suffix(name_suffix: &str) -> Result<(), CommandError> {
     Ok(())
 }
 
-/// The factory `section!` names (`resonance_tester.py:441 def load_config`).
+/// The factory `section!` names (`resonance_tester.py:552-553 def load_config`).
 pub fn load_config(
     config: &ConfigWrapper,
     printer: &Arc<Printer>,

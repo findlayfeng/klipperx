@@ -25,7 +25,7 @@
 //!   registers these to log file-tail on shutdown and to wait for replay to
 //!   finish on debuginput exit (`virtual_sdcard.py:278-294`). Not wired here.
 //! - **`stats(eventtime)`** — upstream returns `(True, "sd_pos=%d")` while the
-//!   timer runs (`virtual_sdcard.py:272-276`). `PrinterObject` has no `stats`
+//!   timer runs (`virtual_sdcard.py:75-78`). `PrinterObject` has no `stats`
 //!   method, so this is omitted; `stats` is a reactor scheduling hint, not
 //!   user-visible.
 //! - **`do_pause` now waits** for the replay task to exit, matching
@@ -89,15 +89,15 @@ pub struct VirtualSdCard {
     /// `file_position` / `file_size` (`virtual_sdcard.py:23`).
     file_position: Mutex<u64>,
     file_size: Mutex<u64>,
-    /// `must_pause_work` / `cmd_from_sd` (`virtual_sdcard.py:30`).
+    /// `must_pause_work` / `cmd_from_sd` (`virtual_sdcard.py:28`).
     must_pause_work: Mutex<bool>,
     cmd_from_sd: Mutex<bool>,
     /// `work_timer is not None` — `true` while the replay task is running
-    /// (`virtual_sdcard.py:31`). `do_resume` sets it `true` when spawning the
+    /// (`virtual_sdcard.py:30`). `do_resume` sets it `true` when spawning the
     /// task; the task sets it `false` on exit.
     work_active: Mutex<bool>,
     /// `next_file_position` — written by `work_handler` before each line and
-    /// read by `get_file_position` (`virtual_sdcard.py:31`).
+    /// read by `get_file_position` (`virtual_sdcard.py:29`).
     next_file_position: Mutex<u64>,
     /// The `print_stats` object, loaded via `PrintStats::ensure`
     /// (`virtual_sdcard.py:25`).
@@ -166,7 +166,7 @@ impl VirtualSdCard {
         Ok(object)
     }
 
-    /// `get_file_list(check_subdirs)` (`virtual_sdcard.py:73-88`):
+    /// `get_file_list(check_subdirs)` (`virtual_sdcard.py:79-103`):
     /// list g-code files, optionally recursing into subdirectories.
     ///
     /// Returns `Vec<(relative_path, size)>` sorted by lowercase path.
@@ -211,7 +211,7 @@ impl VirtualSdCard {
         }
     }
 
-    /// `_load_file(gcmd, filename, check_subdirs)` (`virtual_sdcard.py:139-157`):
+    /// `_load_file(gcmd, filename, check_subdirs)` (`virtual_sdcard.py:189-213`):
     /// find the file in the listing, open it, report its size, and set it as
     /// the current file.
     ///
@@ -267,7 +267,7 @@ impl VirtualSdCard {
         Ok(())
     }
 
-    /// `_reset_file()` (`virtual_sdcard.py:113-118`): close the current file,
+    /// `_reset_file()` (`virtual_sdcard.py:144-151`): close the current file,
     /// zero the counters, reset print_stats, and fire `virtual_sdcard:reset_file`.
     ///
     /// Calls `do_pause` first, so if a replay is running it waits for the
@@ -361,7 +361,7 @@ impl VirtualSdCard {
         *self.file_size.lock().unwrap() = 0;
     }
 
-    /// `file_path()` (`virtual_sdcard.py:97-99`): the current file's name, or
+    /// `file_path()` (`virtual_sdcard.py:112-115`): the current file's name, or
     /// `None`.
     fn file_path(&self) -> Option<String> {
         self.current_file
@@ -371,7 +371,7 @@ impl VirtualSdCard {
             .map(|f| f.name.clone())
     }
 
-    /// `progress()` (`virtual_sdcard.py:100-103`): `file_position / file_size`,
+    /// `progress()` (`virtual_sdcard.py:116-120`): `file_position / file_size`,
     /// or `0.` when the size is zero.
     #[allow(dead_code)]
     fn progress(&self) -> f64 {
@@ -457,7 +457,7 @@ impl VirtualSdCard {
 
     // -- work_handler (replay loop) -------------------------------------
 
-    /// `work_handler(self, eventtime)` (`virtual_sdcard.py:196-262`): the
+    /// `work_handler(self, eventtime)` (`virtual_sdcard.py:240-320`): the
     /// replay loop, running as a detached tokio task spawned by `do_resume`'s
     /// reactor timer callback.
     ///
@@ -680,7 +680,7 @@ impl std::fmt::Debug for VirtualSdCard {
 }
 
 impl PrinterObject for VirtualSdCard {
-    /// `get_status` (`virtual_sdcard.py:90-95`).
+    /// `get_status` (`virtual_sdcard.py:104-111`).
     fn get_status(&self, _eventtime: f64) -> Value {
         let s = self.snapshot();
         let progress = if s.file_size > 0 {

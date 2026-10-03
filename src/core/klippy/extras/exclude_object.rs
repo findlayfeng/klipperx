@@ -32,7 +32,7 @@
 //!   (`_get_extrusion_offsets`, `:94-101`) and this port keeps one array,
 //!   which is the same value while one extruder prints.
 //! - **The transform does not chain over other transforms.** Upstream keeps
-//!   the previous slot occupant (`next_transform`, `exclude_object.py:47-59`)
+//!   the previous slot occupant (`next_transform`, `exclude_object.py:38-57`)
 //!   because Python's `set_move_transform` returns it; this port's
 //!   `gcode_move::set_move_transform` does not, so the transform forwards to
 //!   the toolhead captured at `klippy:connect`. A config that combines this
@@ -64,7 +64,7 @@ const TOOLHEAD_OBJECT: &str = "toolhead";
 
 section!("exclude_object", order = 30, load = load_config);
 
-/// The object state upstream keeps in `_reset_state` (`exclude_object.py:70-75`).
+/// The object state upstream keeps in `_reset_state` (`exclude_object.py:75-79`).
 #[derive(Debug, Default)]
 struct State {
     /// Defined objects, sorted by name (`exclude_object.py:_add_object_definition`).
@@ -116,7 +116,7 @@ struct ExcludedMotion {
     /// exclusions apply (`_register_transform`, `initial_extrusion_moves = 5`).
     initial_extrusion_moves: i32,
     /// Whether the last move was inside the excluded region
-    /// (`move()`, `exclude_object.py:161-172`).
+    /// (`move()`, `exclude_object.py:182-195`).
     in_excluded_region: bool,
 }
 
@@ -186,7 +186,7 @@ impl ExcludeObject {
         }
     }
 
-    /// Upstream's `_register_transform` (`exclude_object.py:47-77`): take
+    /// Upstream's `_register_transform` (`exclude_object.py:38-57`): take
     /// `gcode_move`'s slot on the first exclusion.
     ///
     /// Needs the `Arc` because the transform registers itself. Upstream keeps
@@ -211,7 +211,7 @@ impl ExcludeObject {
         gcode_move
             .set_move_transform(Arc::clone(object) as Arc<dyn MoveTarget>, true)
             .map_err(|error| CommandError::new(error.to_string()))?;
-        // `_register_transform` (`exclude_object.py:52-64`): the offsets start
+        // `_register_transform` (`exclude_object.py:38-57`): the offsets start
         // empty and the three tracked positions start at the toolhead's.
         let pos = object
             .target()
@@ -229,7 +229,7 @@ impl ExcludeObject {
         Ok(())
     }
 
-    /// Upstream's `_unregister_transform` (`exclude_object.py:79-91`): hand
+    /// Upstream's `_unregister_transform` (`exclude_object.py:62-73`): hand
     /// the slot back to the toolhead below this transform.
     fn unregister_transform(&self) {
         if !self.lock().transform_registered {
@@ -248,7 +248,7 @@ impl ExcludeObject {
         }
     }
 
-    /// Upstream's `_reset_file` (`exclude_object.py:70-77`): the state starts
+    /// Upstream's `_reset_file` (`exclude_object.py:81-83`): the state starts
     /// over and the transform lets go of the slot.
     fn reset_file(&self) {
         {
@@ -260,7 +260,7 @@ impl ExcludeObject {
         self.unregister_transform();
     }
 
-    /// Upstream's `_exclude_object` (`exclude_object.py:219-224`): claim the
+    /// Upstream's `_exclude_object` (`exclude_object.py:279-283`): claim the
     /// transform, report, then remember the name (sorted).
     fn exclude_object(
         object: &Arc<ExcludeObject>,
@@ -281,7 +281,7 @@ impl ExcludeObject {
         Ok(())
     }
 
-    /// Upstream's `_unexclude_object` (`exclude_object.py:226-231`).
+    /// Upstream's `_unexclude_object` (`exclude_object.py:285-290`).
     fn unexclude_object(gcmd: &GcodeCommand, state: &mut State, name: &str) {
         gcmd.respond_info(&format!("Unexcluding object {name}"));
         state.excluded_objects.retain(|excluded| excluded != name);
@@ -350,7 +350,7 @@ impl ExcludeObject {
 
 impl PrinterObject for ExcludeObject {
     /// Upstream's `get_status`: `objects`, `excluded_objects`,
-    /// `current_object` (`exclude_object.py:174-181`).
+    /// `current_object` (`exclude_object.py:174-180`).
     fn get_status(&self, _eventtime: f64) -> Value {
         let state = self.lock();
         json!({
@@ -375,7 +375,7 @@ impl MoveTarget for ToolheadMove {
     }
 }
 
-/// `_ignore_move` (`exclude_object.py:128-136`): record the move without
+/// `_ignore_move` (`exclude_object.py:145-153`): record the move without
 /// forwarding it — the XY/Z drift lands in the offsets, the extrusion in
 /// `offset[3]`, so the compensation on the way out subtracts it again.
 fn ignore_move(motion: &mut ExcludedMotion, newpos: Coord) {
@@ -390,7 +390,7 @@ fn ignore_move(motion: &mut ExcludedMotion, newpos: Coord) {
     motion.max_position_excluded = motion.max_position_excluded.max(newpos.axis(E_AXIS));
 }
 
-/// `_normal_move` (`exclude_object.py:104-127`): track the move, settle the
+/// `_normal_move` (`exclude_object.py:102-143`): track the move, settle the
 /// boundary corrections, and return the position to forward — `newpos` minus
 /// the standing offsets.
 fn normal_move(motion: &mut ExcludedMotion, newpos: Coord) -> Coord {
@@ -435,7 +435,7 @@ fn normal_move(motion: &mut ExcludedMotion, newpos: Coord) -> Coord {
 }
 
 impl MoveTarget for ExcludeObject {
-    /// Upstream's `move` (`exclude_object.py:161-172`): a move inside an
+    /// Upstream's `move` (`exclude_object.py:182-195`): a move inside an
     /// excluded object is dropped, anything else passes on — with the
     /// extrusion offsets applied, so the cancelled filament is never
     /// forwarded (`_normal_move`/`_ignore_move`, `:117-146`).
@@ -498,7 +498,7 @@ impl MoveTarget for ExcludeObject {
         }
     }
 
-    /// Upstream's `get_position` (`exclude_object.py:88-93`): the toolhead's
+    /// Upstream's `get_position` (`exclude_object.py:95-100`): the toolhead's
     /// position plus the standing extrusion offset, so the gcode coordinate
     /// keeps counting filament the toolhead never extruded.
     fn position(&self) -> Coord {
@@ -522,7 +522,7 @@ impl MoveTarget for ExcludeObject {
 /// The factory `section!` names (`exclude_object.py:303`).
 ///
 /// `gcode_move::ensure` stands in for upstream's
-/// `printer.load_object(config, 'gcode_move')` (`exclude_object.py:18`).
+/// `printer.load_object(config, 'gcode_move')` (`exclude_object.py:15`).
 pub fn load_config(
     config: &ConfigWrapper,
     printer: &Arc<Printer>,
@@ -672,7 +672,7 @@ fn cmd_exclude_object_define(
         entry[option.as_str()] = Value::String(value.clone());
     }
     if let Some(center) = parameters.get("CENTER") {
-        // Upstream: `json.loads('[%s]' % center)` (`exclude_object.py:258-260`).
+        // Upstream: `json.loads('[%s]' % center)` (`exclude_object.py:265`).
         let center: Value = serde_json::from_str(&format!("[{center}]"))
             .map_err(|error| CommandError::new(error.to_string()))?;
         entry["center"] = center;

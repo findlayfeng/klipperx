@@ -55,6 +55,7 @@ use serde_json::{json, Value};
 
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
 use crate::core::klippy::error::KlippyError;
+use crate::core::klippy::extras::force_move::ForceMove;
 use crate::core::klippy::extras::stepper_enable::PrinterStepperEnable;
 use crate::core::klippy::extras::toolhead::HomingEndstop;
 use crate::core::klippy::load::section;
@@ -210,6 +211,10 @@ pub struct PrinterStepper {
     axis: Axis,
     /// Microsteps per full step, as configured (`microsteps`).
     microsteps: i64,
+    /// Whether the step distance is in radians (upstream's
+    /// `MCU_stepper.units_in_radians`): a bare stepper whose `rotation_distance`
+    /// is inferred from `gear_ratio` — the polar bed (`stepper.py:302-304`).
+    units_in_radians: bool,
     /// Millimetres per step, after rotation distance, microsteps and gearing.
     step_dist: f64,
     /// The rotation distance the section wrote, and the full steps that make
@@ -349,7 +354,12 @@ impl PrinterStepper {
         // in radians — `[stepper_bed]` of a polar printer is exactly this
         // (`polar.py:33` passes `units_in_radians=True`). A section with
         // neither option still fails on `rotation_distance`, as upstream does.
-        let rotation_distance = if !config.has("rotation_distance") && config.has("gear_ratio") {
+        //
+        // The flag is kept (`units_in_radians`, upstream's
+        // `MCU_stepper.units_in_radians`) rather than recomputed: the force-move
+        // buzz reads it to choose a distance in degrees or millimetres.
+        let units_in_radians = !config.has("rotation_distance") && config.has("gear_ratio");
+        let rotation_distance = if units_in_radians {
             std::f64::consts::TAU
         } else {
             config.get_float_bounded("rotation_distance", None, None, None, Some(0.0), None)?
@@ -488,10 +498,18 @@ impl PrinterStepper {
         let stepper_enable = PrinterStepperEnable::ensure(printer);
         stepper_enable.register_stepper(config, &name)?;
 
+        // Register with force_move, upstream's other helper module
+        // (`klippy/stepper.py:282-285`): every stepper gets a `STEPPER_BUZZ`
+        // mux command, and — when `enable_force_move` is set — a `FORCE_MOVE`
+        // one. The object is created on first use when the config named no
+        // `[force_move]` section (`ForceMove::ensure`).
+        ForceMove::ensure(printer).register_stepper(&name, units_in_radians)?;
+
         Ok(Self {
             name,
             axis,
             microsteps,
+            units_in_radians,
             step_dist,
             rotation_distance: Mutex::new(rotation_distance),
             steps_per_rotation,
@@ -601,6 +619,14 @@ impl PrinterStepper {
     /// (`endstop_phase.py:58`).
     pub fn microsteps(&self) -> i64 {
         self.microsteps
+    }
+
+    /// Whether the step distance is in radians, not millimetres (upstream's
+    /// `MCU_stepper.units_in_radians`, `klippy/stepper.py:65-67`): the polar
+    /// bed answers true. `force_move`'s buzz reads it to pick a distance in
+    /// degrees (`BUZZ_RADIANS_DISTANCE`) instead of millimetres.
+    pub fn units_in_radians(&self) -> bool {
+        self.units_in_radians
     }
 
     /// The rail range and homing point.

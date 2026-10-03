@@ -233,7 +233,7 @@ impl ToolHead {
     }
 
     /// Register a lookahead callback (`ToolHead.register_lookahead_callback`,
-    /// `klippy/toolhead.py:526-530`).
+    /// `klippy/toolhead.py:526-531`).
     ///
     /// With the look-ahead empty it fires at once with the last move time;
     /// with moves queued it rides the queue's last move and fires with that
@@ -402,8 +402,8 @@ impl ToolHead {
         self.process_lookahead();
         // Upstream's `flush_step_generation` opens with `_flush_lookahead()`,
         // which leaves the toolhead in "NeedPrime" (`klippy/toolhead.py:317-319`
-        // → `:299-307`), and `_handle_step_flush` returns to it whenever
-        // generation reaches the planner horizon (`:310-317`). Either way the
+        // → `:300-309`), and `_handle_step_flush` returns to it whenever
+        // generation reaches the planner horizon (`:310-316`). Either way the
         // next planned move re-runs `_calc_print_time` against the **live**
         // estimate — without this the state is consumed by the first move ever
         // planned and the print time never re-syncs after an idle (C5: a
@@ -417,7 +417,7 @@ impl ToolHead {
     }
 
     /// Plan everything queued so far (`ToolHead.wait_moves`,
-    /// `klippy/toolhead.py:422-428`): upstream then waits for the MCU to catch
+    /// `klippy/toolhead.py:422-429`): upstream then waits for the MCU to catch
     /// up, which needs the clock estimate and is FW5d's MCU side. What this
     /// host does take from upstream is the `_flush_lookahead` the wait opens
     /// with (`toolhead.py:300-309`): the toolhead is left in "NeedPrime", so

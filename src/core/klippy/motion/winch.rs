@@ -44,7 +44,7 @@ use crate::core::klippy::mathutil::Coord;
 ///
 /// The anchor rides the bound [`PositionFn`] as `[anchor_x, anchor_y,
 /// anchor_z, 0, 0, 0]`, the way `setup_itersolve('winch_stepper_alloc', *a)`
-/// passes it (`kinematics/winch.py:20`); the parameter block is six wide
+/// passes it (`kinematics/winch.py:22`); the parameter block is six wide
 /// (rotary delta's shoulders use the extra slots), so the unused tail is zero.
 pub fn winch_position_fn(anchor: [f64; 3]) -> PositionFn {
     PositionFn::bind(

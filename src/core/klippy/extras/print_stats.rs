@@ -51,7 +51,7 @@ const FILAMENT_USED_EPSILON: f64 = 1e-7;
 
 section!("print_stats", order = 30, load = load_config);
 
-/// The mutable state machine (`print_stats.py:60-72` `reset`).
+/// The mutable state machine (`print_stats.py:90-98` `reset`).
 #[derive(Debug)]
 struct PrintStatsState {
     filename: String,
@@ -69,7 +69,7 @@ struct PrintStatsState {
 }
 
 impl PrintStatsState {
-    /// Upstream's `reset` (`print_stats.py:60-72`).
+    /// Upstream's `reset` (`print_stats.py:90-98`).
     fn reset(&mut self) {
         self.filename = String::new();
         self.error_message = String::new();
@@ -142,12 +142,12 @@ impl PrintStats {
         Ok(object)
     }
 
-    /// Upstream's `reset` (`print_stats.py:60-72`).
+    /// Upstream's `reset` (`print_stats.py:90-98`).
     pub fn reset(&self) {
         self.lock().reset();
     }
 
-    /// Upstream's `set_current_file` (`print_stats.py:26-28`): `reset` then
+    /// Upstream's `set_current_file` (`print_stats.py:29-31`): `reset` then
     /// set the filename.
     pub fn set_current_file(&self, filename: &str) {
         let mut s = self.lock();
@@ -155,7 +155,7 @@ impl PrintStats {
         s.filename = filename.to_string();
     }
 
-    /// Upstream's `note_start` (`print_stats.py:29-39`).
+    /// Upstream's `note_start` (`print_stats.py:32-45`).
     pub fn note_start(&self) {
         let t = self.reactor_monotonic();
         let mut s = self.lock();
@@ -171,7 +171,7 @@ impl PrintStats {
         s.error_message = String::new();
     }
 
-    /// Upstream's `note_pause` (`print_stats.py:41-47`).
+    /// Upstream's `note_pause` (`print_stats.py:46-53`).
     pub fn note_pause(&self) {
         let t = self.reactor_monotonic();
         let mut s = self.lock();
@@ -184,22 +184,22 @@ impl PrintStats {
         }
     }
 
-    /// Upstream's `note_complete` (`print_stats.py:48-49`).
+    /// Upstream's `note_complete` (`print_stats.py:54-55`).
     pub fn note_complete(&self) {
         self.note_finish("complete", "");
     }
 
-    /// Upstream's `note_error` (`print_stats.py:50-51`).
+    /// Upstream's `note_error` (`print_stats.py:56-57`).
     pub fn note_error(&self, message: &str) {
         self.note_finish("error", message);
     }
 
-    /// Upstream's `note_cancel` (`print_stats.py:52-53`).
+    /// Upstream's `note_cancel` (`print_stats.py:58-59`).
     pub fn note_cancel(&self) {
         self.note_finish("cancelled", "");
     }
 
-    /// Upstream's `_note_finish` (`print_stats.py:54-59`).
+    /// Upstream's `_note_finish` (`print_stats.py:60-71`).
     fn note_finish(&self, state: &str, error_message: &str) {
         let mut s = self.lock();
         if s.print_start_time.is_none() {
@@ -216,7 +216,7 @@ impl PrintStats {
         s.print_start_time = None;
     }
 
-    /// Upstream's `_update_filament_usage` (`print_stats.py:25-31`).
+    /// Upstream's `_update_filament_usage` (`print_stats.py:23-28`).
     ///
     /// Called with the state lock held; reads `gcode_move.get_status` which
     /// locks a separate `Mutex`, so there is no deadlock.
@@ -292,7 +292,7 @@ impl PrintStats {
         Ok(())
     }
 
-    /// Upstream's `cmd_SET_PRINT_STATS_INFO` (`print_stats.py:73-84`).
+    /// Upstream's `cmd_SET_PRINT_STATS_INFO` (`print_stats.py:74-89`).
     fn cmd_set_print_stats_info(&self, gcmd: &GcodeCommand) -> Result<(), CommandError> {
         let mut s = self.lock();
         // `get_int(name, default, minval=0)`: when the parameter is absent, the
@@ -337,7 +337,7 @@ impl std::fmt::Debug for PrintStats {
 }
 
 impl PrinterObject for PrintStats {
-    /// Upstream's `get_status` (`print_stats.py:86-100`).
+    /// Upstream's `get_status` (`print_stats.py:99-122`).
     fn get_status(&self, eventtime: f64) -> Value {
         let mut s = self.lock();
         let mut time_paused = s.prev_pause_duration;
@@ -578,7 +578,7 @@ mod tests {
 
     // -- note_error / note_cancel ----------------------------------------
 
-    /// `note_error` sets the state and message (`print_stats.py:50-51`).
+    /// `note_error` sets the state and message (`print_stats.py:56-57`).
     #[test]
     fn note_error_sets_state_and_message() {
         let (reactor, _printer, _gcode, object) = machine();
@@ -591,7 +591,7 @@ mod tests {
         assert_eq!(s["message"], "Thermistor failed");
     }
 
-    /// `note_cancel` sets the state to "cancelled" (`print_stats.py:52-53`).
+    /// `note_cancel` sets the state to "cancelled" (`print_stats.py:58-59`).
     #[test]
     fn note_cancel_sets_state_to_cancelled() {
         let (reactor, _printer, _gcode, object) = machine();

@@ -334,7 +334,7 @@ pub(crate) fn cmd_set_extruder_rotation_distance(
 }
 
 /// `SYNC_EXTRUDER_MOTION`'s body for one extruder stepper (upstream
-/// `cmd_SYNC_EXTRUDER_MOTION`, `kinematics/extruder.py:128-133`).
+/// `cmd_SYNC_EXTRUDER_MOTION`, `kinematics/extruder.py:133-137`).
 ///
 /// An empty `MOTION_QUEUE` detaches — upstream's `sync_to_extruder("")` branch,
 /// which must **not** be treated as an invalid name; any other value must name

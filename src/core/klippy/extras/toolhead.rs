@@ -17,7 +17,7 @@
 //! The section is declared `phase = late, object = "toolhead"`: the loader loads
 //! it after the generic walk and registers the object under the name upstream
 //! uses, which is `toolhead`, not `printer`
-//! (`klippy/toolhead.py:604-615`). The G-code commands are registered at load
+//! (`klippy/toolhead.py:604-614`). The G-code commands are registered at load
 //! time (they only become active once the printer is ready) and capture the
 //! shared motion state rather than the object, so a restart can drop the object
 //! without leaving a handler behind.
@@ -375,7 +375,7 @@ pub struct ToolHeadObject {
     /// The deltesian kinematics, parked the same way as `delta`.
     deltesian: Mutex<Option<DeltesianKinematics>>,
     /// The generic-cartesian kinematics, parked here at load until connect
-    /// installs it (`generic_cartesian.py:118-127` builds it in `__init__`;
+    /// installs it (`generic_cartesian.py:120-172` builds it in `__init__`;
     /// only the toolhead's install waits for connect).
     generic: Mutex<Option<GenericCartesianKinematics>>,
     /// The `[stepper <name>]` motors of a generic-cartesian printer. They
@@ -918,7 +918,7 @@ impl ToolHeadObject {
     ///
     /// Answerable from the load-time kind, so `[delta_calibrate]` can check at
     /// its own connect — which runs before this object's, since upstream loads
-    /// `toolhead` last (`toolhead.py:604-615`).
+    /// `toolhead` last (`toolhead.py:604-614`).
     pub fn has_delta_calibration(&self) -> bool {
         matches!(
             self.kind,
@@ -927,7 +927,7 @@ impl ToolHeadObject {
     }
 
     /// The delta calibration parameters the kinematics carries
-    /// (`get_calibration`, `delta.py:153-160` / `rotary_delta.py:131-132`), or
+    /// (`get_calibration`, `delta.py:160-166` / `rotary_delta.py:129-130`), or
     /// `None` for any other kinematics.
     ///
     /// Read from the connected kinematics when the machine is up, and from
@@ -1519,7 +1519,7 @@ fn build_deltesian(
         rails[2].params().position_max,
     );
 
-    // `min_angle` and `print_width` (`deltesian.py:54-67`): the arms' reach at
+    // `min_angle` and `print_width` (`deltesian.py:45-56`): the arms' reach at
     // `min_angle` bounds `print_width`.
     let min_angle = config.get_float_bounded(
         "min_angle",
@@ -2071,7 +2071,7 @@ impl Connected {
     }
 
     /// The generation horizon for one pass — upstream's `_flush_handler`
-    /// (`extras/motion_queuing.py:196-215`), with `need_step_gen_time` /
+    /// (`extras/motion_queuing.py:193-234`), with `need_step_gen_time` /
     /// `need_flush_time` read as the planner's own reach (`content_end`,
     /// `wait_moves` having just drained it) and `kin_flush_delay` — not
     /// modelled in this host — left at zero.
@@ -2155,7 +2155,7 @@ impl RestartHooks for ToolHeadRestartHooks {
 // ===========================================================================
 
 /// How long to wait after arming the endstop before moving
-/// (`HOMING_START_DELAY`, `klippy/extras/homing.py:9`).
+/// (`HOMING_START_DELAY`, `klippy/extras/homing.py:8`).
 const HOMING_START_DELAY: f64 = 0.001;
 
 /// How long the endstop confirms a trigger over
@@ -2476,7 +2476,7 @@ async fn home_axes(
             let info = rail.homing_info();
             let (mut forcepos, mut movepos) =
                 home_move(Y_AXIS, &info, params.position_min, params.position_max);
-            // The arm home already pinned X and Z (`deltesian.py:102-107`).
+            // The arm home already pinned X and Z (`deltesian.py:122-146`).
             if home_xz {
                 forcepos[X_AXIS] = Some(0.0);
                 forcepos[Z_AXIS] = Some(home.arm_target_z);

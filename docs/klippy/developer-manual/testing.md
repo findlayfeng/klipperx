@@ -301,7 +301,7 @@ git config core.hooksPath .githooks
 | `gcode_arcs.rs` | `resolution` 默认 `1.` 记账、显式值解析、`0`/`-1`/非数拒绝文案对上游、经 loader 认领并注册（4 测） |
 | `bed_screws.rs` | 全选项 `check_unused` 直证、行进默认 50/5/5/0 与默认名、螺丝缺失即停（access 无残留）、<3 与两元素/解析/fine_adjust 上游文案、above 0 边界、静止态 status（6 测） |
 | `pwm_cycle_time.rs` | 选项矩阵与默认、`SET_PIN` 值域与 `CYCLE_TIME`、重复值丢弃、无 `hardware_pwm` 恒软件路径（11 测） |
-| `pwm_tool.rs` | 选项矩阵与默认、prefix 命名错误、`cycle_time` 值域、`maximum_mcu_duration` minval 0.5、配对约束 build 期拒绝（11 测） |
+| `pwm_tool.rs` | 选项矩阵与默认、prefix 命名错误、`cycle_time` 值域、`maximum_mcu_duration` minval 0.5、配对约束 build 期拒绝（15 测；2026-10-03 +4 队列化：前瞻钉时→flush 落 clocked、后请求覆盖、两条兕底、同构对接） |
 | `temperature_fan.rs` | 6 实例选项矩阵、`max_temp<40` 取目标、pid 选项与上下界、bang-bang 驱动、`SET_TEMPERATURE_FAN_TARGET` 命令与三段错误文案、未知 sensor/非法 control、缺 pin 前缀名（11 测） |
 | `temperature_host.rs` | `sensor_path` 默认/显式解析、开文件错误逐字 `Unable to open temperature file '<path>'`、对象名取末词、临时文件假读数驱动 poll（首采 42.5 → 改写文件 + `advance(1.0)` 恰一次触发 → 43.1 与 `get_status` 形状、回调序列）、读失败置 0 并退役定时器、min/max 越界 shutdown 文案双侧、裸节全链路装载（工厂注册 + 对象 + 不可 query + 消费者 `get_status` 形状）、裸节拒收选项（8 测） |
 | `temperature_probe.rs`（40 测，`f6ea201` + `dfaf418` + `704ee0d` + `0960f44`） | A：`Polynomial2d` 求值/拟合恢复系数/无点无解/上游格式化；选项默认值与 9 条边界措辞、`calibration_position` 的 count 措辞、check_unused 全选项记账；读数平滑同上游、`get_status` 六键形状、`stats` 行、装载按节名注册对象。B（+14）：命令注册/help/`homed` 门（走真实 mux 分发）、无 probe、链接不符、手动探针冲突、TARGET/STEP/样本数文案、临时命令被占、启动+手动探针会话、升温 kick 下一轮、COMPLETE 短样 abort / ≥3 静默完成、ABORT 收尾、初始移动失败回滚、热膨胀累计与清零、加热脚本逐字、ENABLE no-op（C 起接真）。C（+13）：四选项默认与三类拒绝文案、`_check_calibration` 交叉消息、adjust/unadjust 三分支+两闸门+往返+传感器温度、`finish` 无 run / 九段 fit+configfile 写回+交叉拒绝、ENABLE 真开关三态、collect_sample 无/有 helper 分支、状态机 start/finish 接线、SweepState 窗口记账与聚合、接线闸门三态。回环（+1，`0960f44`）：`finish_calibrations_curves_survive_a_save_config_round_trip`。**注**：测试机 `kinematics: none` 恒 unhomed → `_check_homed` 成功分支与门后 `cmd_calibrate` 端到端归真机 |
@@ -317,7 +317,7 @@ git config core.hooksPath .githooks
 | `display_status.rs` | 裸段+`check_unused`+状态形状（1 测） |
 | `homing_override.rs` | 语料选项矩阵、默认 `XYZ`/无强制位、parse 与 `must be specified` 文案、G28 语句轴掩码=上游 `cmd_G28:33-46`（4 测） |
 | `sdcard_loop.rs` | 裸段、sd 内外 BEGIN/END、count 0/1/>1 索引、空栈+嵌套、DESIST（5 测） |
-| `servo.rs` | 段选项全读+`SET_SERVO` 注册、脉宽↔占空比公式、mux ANGLE/WIDTH/缺参、`maximum_pulse_width` 下界措辞、`initial_angle`（5 测） |
+| `servo.rs` | 段选项全读+`SET_SERVO` 注册、脉宽↔占空比公式、mux ANGLE/WIDTH/缺参、`maximum_pulse_width` 下界措辞、`initial_angle`（11 测；2026-10-03 +6 队列化：前瞻钉时落 clocked `set_pwm`、后请求覆盖、两条兕底、sink `reschedule`/`discard`） |
 | `idex_modes.rs` | cartesian 认领（主轨 stepper_x+初始 0）、corexy 不认领、对象三命令与 SAVE→RESTORE 还原、四类上游措辞、`safe_distance` 下界、双挤出超槽守卫双侧语义（6 测）；批 #4 增：轨间坐标交接（SET/RESTORE 携 gcode 坐标到目标帧） |
 | `config/mod.rs`（同名段合并，M5d） | 重复段选项并集、同段重复选项后者胜、合并保首现位、非重复段零变化（4 测）；多行值回环（2026-10-03 `0960f44` +2）：`a_multiline_block_value_is_written_with_indented_continuations`、`a_multiline_block_value_round_trips_verbatim`（写 → 剥 `#*# ` → 重解析逐字还原）；`an_equals_option_may_continue_from_an_empty_value` 按 configparser 语义重钉（空首行保留 `['', …]`） |
 | `interface/devices/simulator.rs`（M5d 策略 b） | `trigger_analog_sample_activity_pushes_the_monitor_deadline`：活动顺延 + 非活动不顺延双向断言 |

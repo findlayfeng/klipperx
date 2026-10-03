@@ -72,7 +72,7 @@ H1–H12 是上游 extras 里按域归并的消费者（2026-09-21 全量盘点�
 | # | 事项 | 依赖 |
 |---|---|---|
 | G1b | gcode 调度器与上游的行为差异（`get_mutex` 等价物等；`GCodeIO` 暂缓 `[~]`；参数访问器与 `M115`/`Coord`/`request_restart` 已完成并归档） | C1 |
-| G2b | 用 GCODE 控制 GPIO：数字/PWM 驱动与 `SET_PIN` **已落地**；「随打印时间生效的请求队列」（上游 `GCodeRequestQueue`）**已移植并接入 `output_pin`**；余项＝`output_pin` 的 `static_value`/`template`，以及 `servo`/`pwm_tool` 切到同一队列（`fan` 2026-10-03 已切换） | —（C1 已收官，不再是前置） |
+| G2b | 用 GCODE 控制 GPIO：数字/PWM 驱动与 `SET_PIN` **已落地**；「随打印时间生效的请求队列」（上游 `GCodeRequestQueue`）**已移植并接入 `output_pin`**；余项＝`output_pin` 的 `static_value`/`template`，以及 `heaters` 切到同一队列（`fan`/`servo`/`pwm_tool` 2026-10-03 已切换） | —（C1 已收官，不再是前置） |
 | G4 | 运动命令（G0/G1/G28…） | G1、C1 |
 | B4 | 其余端点（pause_resume / `*/dump_*` / …；estop 与 remote method 已落地） | G3、H4、H9 |
 
@@ -110,7 +110,7 @@ H1–H12 是上游 extras 里按域归并的消费者（2026-09-21 全量盘点�
 （`extras/output_pin.rs`）读 `pin` / `value` / `shutdown_value`（PWM 另加 `pwm` /
 `cycle_time` / `hardware_pwm`），经 `PrinterPins::setup_digital_out` / `setup_pwm`
 （`pins.rs`）建出 `McuDigitalOut` / `McuPwm`，并注册 mux 命令
-`SET_PIN PIN=<name> VALUE=<0..1>`；运行时经 `GCodeRequestQueue` 按打印时间生效（`output_pin`/`fan` 已接线，`servo`/`pwm_tool` 仍走立即路径；两条兕底见下）。剩下的是：
+`SET_PIN PIN=<name> VALUE=<0..1>`；运行时经 `GCodeRequestQueue` 按打印时间生效（`output_pin`/`fan`/`pwm_tool`/`servo` 已接线，`heaters` 侧无队列化消费者；两条兕底见下）。剩下的是：
 
 - [x] **与运动 / 打印时间同步的 `SET_PIN`**（上游 `GCodeRequestQueue`，
       `klippy/extras/output_pin.py:13-85` `:249-269`）：**已落地**——队列本体
@@ -121,7 +121,7 @@ H1–H12 是上游 extras 里按域归并的消费者（2026-09-21 全量盘点�
       `queue_digital_out(clock)`、软 PWM 先 `next_aligned_clock` 再 `set_pwm`；
       **两条兜底**——没有 `[printer]`（lookup 不到 `toolhead`）或资源不可调度
       （`min_schedule_time()` 为 `None`）时保留立即路径（`update_digital_out`/`update_pwm`）。
-      **余项**：`servo`/`pwm_tool`/`heaters` 仍走立即路径，切到同一队列另行排期（`fan` 已于 2026-10-03 切换，`d0eb7ce`）。
+      **余项**：`heaters` 无队列化消费者待切（`fan` `d0eb7ce`、`servo`/`pwm_tool` `cf9c884` 已于 2026-10-03 切换）。
 - [ ] **`output_pin` 的 `static_value` / `TEMPLATE` + `template_evaluator`**（display 模板，
       `output_pin.py:88-170`）——与开关 GPIO 本身无关；`display_template` 机制已在（工厂表里有
       `display_template`），缺的是把它接到 `SET_PIN TEMPLATE=`。**语料 0 处使用**，可按需再补
@@ -356,9 +356,8 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
   ——上游 21 个文件的依赖盘点、H2-1…H2-7 拆分与四个拍板点。**已落地**：`fan`/`fan_generic`/
   `heater_fan`/`controller_fan`（含 heater 注册表）、`tachometer_pin`→`pulse_counter`、
   `pwm_tool`/`pwm_cycle_time`/`servo` 模块本体、`multi_pin`（批 #26）、`sx1509`（批 #41）；
-  **余项**：把 `pwm_tool` 切到已移植的 `GCodeRequestQueue`（队列化 PWM，同 **G2b**）、
-  `static_pwm_clock.py`（语料 1 处）、`replicape.py`（语料 1 处，另见本文件「特定板/芯片」）、
-  `duplicate_pin_override.py`（语料 0 用）。
+  **余项**：`static_pwm_clock.py`（语料 1 处）、`replicape.py`（语料 1 处，另见本文件「特定板/芯片」）、
+  `duplicate_pin_override.py`（语料 0 用）；`pwm_tool` 队列化已完成（2026-10-03，`cf9c884`，同 **G2b**）。
 
 ### H3 G-Code 宏与脚本
 

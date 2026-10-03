@@ -22,7 +22,7 @@
 //! dispatcher (`run_script_from_command`) that parks the g-code state, goes
 //! relative, moves the extruder, and restores the state — so the move is an
 //! ordinary `G1` and takes the active coordinate system and factors with it
-//! (`firmware_retraction.py:56-66`). The `is_retracted` guard keeps a repeated
+//! (`firmware_retraction.py:55-70`). The `is_retracted` guard keeps a repeated
 //! `G10` from pulling back twice; `SET_RETRACTION` clears it, as upstream does.
 //!
 //! The dispatcher is held as a `Weak`: its command table owns this object
@@ -48,11 +48,11 @@ section!("firmware_retraction", order = 30, load = load_config);
 /// half-updated set.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Settings {
-    /// `retract_length` (`firmware_retraction.py:11`).
+    /// `retract_length` (`firmware_retraction.py:10`).
     retract_length: f64,
-    /// `retract_speed`, mm/s (`:12`).
+    /// `retract_speed`, mm/s (`:11`).
     retract_speed: f64,
-    /// `unretract_extra_length` (`:13-14`).
+    /// `unretract_extra_length` (`:12-13`).
     unretract_extra_length: f64,
     /// `unretract_speed`, mm/s (`:14`).
     unretract_speed: f64,
@@ -126,12 +126,12 @@ impl FirmwareRetraction {
         self.lock().is_retracted
     }
 
-    /// Set `is_retracted` (`firmware_retraction.py:60,66`).
+    /// Set `is_retracted` (`firmware_retraction.py:61,71`).
     fn set_retracted(&self, value: bool) {
         self.lock().is_retracted = value;
     }
 
-    /// The script `G10` runs (`firmware_retraction.py:56-61`): park the state,
+    /// The script `G10` runs (`firmware_retraction.py:55-60`): park the state,
     /// go relative, pull the extruder back, restore the state.
     fn retract_script(&self) -> String {
         let settings = self.lock();
@@ -145,7 +145,7 @@ impl FirmwareRetraction {
         )
     }
 
-    /// The script `G11` runs (`firmware_retraction.py:62-66`), with
+    /// The script `G11` runs (`firmware_retraction.py:65-70`), with
     /// `unretract_length` and `unretract_speed`.
     fn unretract_script(&self) -> String {
         let settings = self.lock();
@@ -159,7 +159,7 @@ impl FirmwareRetraction {
         )
     }
 
-    /// `SET_RETRACTION` (`firmware_retraction.py:39-51`): override any of the
+    /// `SET_RETRACTION` (`firmware_retraction.py:34-45`): override any of the
     /// four parameters, re-derive `unretract_length`, and clear
     /// `is_retracted`.
     ///
@@ -209,7 +209,7 @@ impl FirmwareRetraction {
         Ok(())
     }
 
-    /// `GET_RETRACTION` (`firmware_retraction.py:52-57`): report the four
+    /// `GET_RETRACTION` (`firmware_retraction.py:47-51`): report the four
     /// parameters, and nothing else.
     fn cmd_get_retraction(&self, gcmd: &GcodeCommand) {
         let settings = *self.lock();
@@ -266,7 +266,7 @@ impl FirmwareRetraction {
 }
 
 /// The four words `SET_RETRACTION` reads, in source order
-/// (`firmware_retraction.py:39-51`). Listed once for the `COMMANDS` table.
+/// (`firmware_retraction.py:34-45`). Listed once for the `COMMANDS` table.
 const SET_RETRACTION_PARAMS: &[&str] = &[
     "RETRACT_LENGTH",
     "RETRACT_SPEED",
@@ -274,14 +274,14 @@ const SET_RETRACTION_PARAMS: &[&str] = &[
     "UNRETRACT_SPEED",
 ];
 
-/// Upstream's `cmd_SET_RETRACTION_help` (`firmware_retraction.py:38`).
+/// Upstream's `cmd_SET_RETRACTION_help` (`firmware_retraction.py:33`).
 const SET_RETRACTION_HELP: &str = "Set firmware retraction parameters";
 
-/// Upstream's `cmd_GET_RETRACTION_help` (`firmware_retraction.py:52`).
+/// Upstream's `cmd_GET_RETRACTION_help` (`firmware_retraction.py:46`).
 const GET_RETRACTION_HELP: &str = "Report firmware retraction parameters";
 
 /// The `F` word of a retraction move: upstream's `%d % (speed*60)`
-/// (`firmware_retraction.py:59`), a feedrate in mm/min.
+/// (`firmware_retraction.py:58`), a feedrate in mm/min.
 ///
 /// Python's `%d` formats a float by truncating toward zero; `as i64` does the
 /// same for the values a speed can take.
@@ -307,7 +307,7 @@ fn cmd_g10<'a>(object: &'a Arc<FirmwareRetraction>, _gcmd: &'a GcodeCommand) -> 
     })
 }
 
-/// `G11` (`firmware_retraction.py:62-66`): undo the retraction. An extruder
+/// `G11` (`firmware_retraction.py:65-70`): undo the retraction. An extruder
 /// that is not retracted is left alone.
 fn cmd_g11<'a>(object: &'a Arc<FirmwareRetraction>, _gcmd: &'a GcodeCommand) -> CommandFuture<'a> {
     Box::pin(async move {
@@ -325,7 +325,7 @@ fn cmd_g11<'a>(object: &'a Arc<FirmwareRetraction>, _gcmd: &'a GcodeCommand) -> 
     })
 }
 
-/// `SET_RETRACTION` (`firmware_retraction.py:39-51`).
+/// `SET_RETRACTION` (`firmware_retraction.py:34-45`).
 fn cmd_set_retraction<'a>(
     object: &'a Arc<FirmwareRetraction>,
     gcmd: &'a GcodeCommand,
@@ -333,7 +333,7 @@ fn cmd_set_retraction<'a>(
     Box::pin(async move { object.cmd_set_retraction(gcmd) })
 }
 
-/// `GET_RETRACTION` (`firmware_retraction.py:52-57`).
+/// `GET_RETRACTION` (`firmware_retraction.py:47-51`).
 fn cmd_get_retraction<'a>(
     object: &'a Arc<FirmwareRetraction>,
     gcmd: &'a GcodeCommand,
@@ -345,7 +345,7 @@ fn cmd_get_retraction<'a>(
 }
 
 impl PrinterObject for FirmwareRetraction {
-    /// Upstream's `FirmwareRetraction.get_status` (`firmware_retraction.py:26-33`).
+    /// Upstream's `FirmwareRetraction.get_status` (`firmware_retraction.py:26-32`).
     fn get_status(&self, _eventtime: f64) -> Value {
         let settings = *self.lock();
         json!({
@@ -357,7 +357,7 @@ impl PrinterObject for FirmwareRetraction {
     }
 }
 
-/// The factory `section!` names (`firmware_retraction.py:68 def load_config`).
+/// The factory `section!` names (`firmware_retraction.py:73 def load_config`).
 ///
 /// # Errors
 /// A value below its `minval`, or a command name this dispatcher refuses.
@@ -494,7 +494,7 @@ mod tests {
     }
 
     /// The defaults are upstream's, and `get_status` reports them
-    /// (`firmware_retraction.py:11-14,26-33`).
+    /// (`firmware_retraction.py:10-14,26-32`).
     #[test]
     fn test_defaults_and_status() {
         let (printer, _gcode, _target, _output) = machine();
@@ -512,7 +512,7 @@ mod tests {
     }
 
     /// A `retract_length` below 0 and a `retract_speed` below 1 are refused
-    /// with upstream's wording (`configfile.py:49-51`).
+    /// with upstream's wording (`configfile.py:49-50`).
     #[test]
     fn test_a_negative_retract_length_is_refused() {
         let (printer, _gcode, _target, _output) = machine();
@@ -555,7 +555,7 @@ mod tests {
     }
 
     /// `G10` pulls the extruder back by `retract_length` at `retract_speed`,
-    /// and says so on the move target (`firmware_retraction.py:56-60`).
+    /// and says so on the move target (`firmware_retraction.py:55-60`).
     #[test]
     fn test_g10_retracts_by_length_at_speed() {
         let (printer, gcode, target, _output) = machine();
@@ -578,7 +578,7 @@ mod tests {
     }
 
     /// `G11` moves the extruder back by `retract_length +
-    /// unretract_extra_length` at `unretract_speed` (`firmware_retraction.py:62-66`).
+    /// unretract_extra_length` at `unretract_speed` (`firmware_retraction.py:65-70`).
     #[test]
     fn test_g11_unretracts_by_the_derived_length() {
         let (printer, gcode, target, _output) = machine();
@@ -620,7 +620,7 @@ mod tests {
         assert_eq!(target.moves().len(), 2, "SET_RETRACTION cleared the flag");
     }
 
-    /// A `G11` while not retracted does nothing (`firmware_retraction.py:63`).
+    /// A `G11` while not retracted does nothing (`firmware_retraction.py:64`).
     #[test]
     fn test_a_g11_while_not_retracted_is_a_no_op() {
         let (printer, gcode, target, _output) = machine();
@@ -632,7 +632,7 @@ mod tests {
     }
 
     /// With `retract_length = 0` the script still runs — upstream has no
-    /// special case — but the move is zero (`firmware_retraction.py:59`).
+    /// special case — but the move is zero (`firmware_retraction.py:58`).
     #[test]
     fn test_a_zero_retract_length_moves_zero() {
         let (printer, gcode, target, _output) = machine();
@@ -646,7 +646,7 @@ mod tests {
     }
 
     /// `SET_RETRACTION` overrides all four parameters and `GET_RETRACTION`
-    /// reports them back with upstream's line (`firmware_retraction.py:39-57`).
+    /// reports them back with upstream's line (`firmware_retraction.py:34-51`).
     #[test]
     fn test_set_retraction_overrides_and_get_retraction_reports() {
         let (printer, gcode, _target, output) = machine();
@@ -682,7 +682,7 @@ mod tests {
 
     /// A `SET_RETRACTION` parameter leaves the unset ones alone, and a value
     /// below its `minval` is refused with upstream's wording
-    /// (`firmware_retraction.py:40-49`).
+    /// (`firmware_retraction.py:35-42`).
     #[test]
     fn test_set_retraction_keeps_unset_parameters_and_bounds_each() {
         let (printer, gcode, _target, _output) = machine();

@@ -3,7 +3,7 @@
 //!
 //! The section parses the pulse geometry upstream's `PrinterServo.__init__`
 //! reads, builds the PWM output on the configured pin, and registers
-//! `SET_SERVO` as a mux command keyed by `SERVO` (`servo.py:40-44`).
+//! `SET_SERVO` as a mux command keyed by `SERVO` (`servo.py:41-45`).
 //!
 //! | option | default | bounds | role |
 //! |---|---|---|---|
@@ -17,10 +17,10 @@
 //! # Scheduling
 //!
 //! `SET_SERVO` rides this port's print-time request queue, as upstream's does
-//! (`servo.py:38-40` builds an `output_pin.GCodeRequestQueue`, `:66-73` queues
+//! (`servo.py:38-39` builds an `output_pin.GCodeRequestQueue`, `:66-73` queues
 //! each value through `queue_gcode_request`): the duty is pinned to the
 //! toolhead's lookahead time, a flush callback drains the queue, and the sink
-//! below is upstream's `_set_pwm` (`servo.py:48-55`) one for one — a repeat of
+//! below is upstream's `_set_pwm` (`servo.py:48-56`) one for one — a repeat of
 //! the driven duty answers `discard`, the pulse is aligned to the servo's
 //! 0.020 s cycle allowing [`RESCHEDULE_SLACK`] early (`servo.py:51`), an
 //! alignment landing more than `RESCHEDULE_SLACK` late answers `reschedule`
@@ -56,7 +56,7 @@ use crate::core::klippy::printer::{Printer, PrinterObject};
 // Only the prefix form (`[servo <name>]`) exists upstream (`servo.py:75`).
 section!("servo", order = 20, prefix = load_config_prefix);
 
-/// The PWM period every servo runs at (`servo.py:7`).
+/// The PWM period every servo runs at (`servo.py:8`).
 const SERVO_SIGNAL_PERIOD: f64 = 0.020;
 
 /// How far before the requested time a cycle-aligned pulse may land — and the
@@ -65,7 +65,7 @@ const SERVO_SIGNAL_PERIOD: f64 = 0.020;
 const RESCHEDULE_SLACK: f64 = 0.000500;
 
 /// The pulse geometry of one servo: how angles and widths map to a duty
-/// fraction of [`SERVO_SIGNAL_PERIOD`] (`servo.py:16-24`, `:56-63`).
+/// fraction of [`SERVO_SIGNAL_PERIOD`] (`servo.py:16-24`, `:57-64`).
 #[derive(Debug, Clone, Copy)]
 struct Geometry {
     /// Pulse width at angle 0 (`minimum_pulse_width`).
@@ -83,7 +83,7 @@ impl Geometry {
     }
 
     /// The duty for an angle: clamped to `0 ..= max_angle`, mapped linearly
-    /// onto `min_width ..= max_width` (`servo.py:56-59`).
+    /// onto `min_width ..= max_width` (`servo.py:57-60`).
     fn pwm_from_angle(&self, angle: f64) -> f64 {
         let angle = angle.max(0.).min(self.max_angle);
         let width = self.min_width + angle * self.angle_to_width();
@@ -91,7 +91,7 @@ impl Geometry {
     }
 
     /// The duty for a raw pulse width: a zero width stays zero, anything else
-    /// is clamped into `min_width ..= max_width` (`servo.py:60-63`).
+    /// is clamped into `min_width ..= max_width` (`servo.py:61-64`).
     fn pwm_from_pulse_width(&self, width: f64) -> f64 {
         let width = if width != 0. {
             width.max(self.min_width).min(self.max_width)
@@ -101,7 +101,7 @@ impl Geometry {
         Self::width_to_value(width)
     }
 
-    /// Millimetres of width one degree of angle adds (`servo.py:17`).
+    /// Millimetres of width one degree of angle adds (`servo.py:20`).
     fn angle_to_width(&self) -> f64 {
         (self.max_width - self.min_width) / self.max_angle
     }
@@ -195,7 +195,7 @@ impl PrinterServo {
             .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
             .expect("the loader registers `gcode` before any section");
         // `last_value` starts at 0 whatever the startup pulse drives
-        // (`servo.py:17`); the sink and `get_status` share the slot.
+        // (`servo.py:22`); the sink and `get_status` share the slot.
         let schedule = Arc::new(ServoSchedule {
             name: name.clone(),
             value: Arc::new(Mutex::new(0.)),
@@ -231,7 +231,7 @@ impl PrinterServo {
 
 impl PrinterObject for PrinterServo {
     /// The duty last driven, as upstream's `PrinterServo.get_status`
-    /// (`servo.py:45-46`).
+    /// (`servo.py:46-47`).
     fn get_status(&self, _eventtime: f64) -> Value {
         json!({ "value": self.schedule.value() })
     }
@@ -251,7 +251,7 @@ impl std::fmt::Debug for PrinterServo {
 struct ServoSchedule {
     /// The section's sub: names the servo in send-failure log lines.
     name: String,
-    /// The duty last **driven** (upstream's `last_value`, `servo.py:17, 54`):
+    /// The duty last **driven** (upstream's `last_value`, `servo.py:22, 55`):
     /// moved when the frame lands — at flush time on the queued path, at once
     /// on the immediate one — and read by `get_status`.
     value: Arc<Mutex<f64>>,
@@ -282,7 +282,7 @@ impl ServoSchedule {
 /// `servo.py:66-73`), or drive the pin at once when no timeline can date it.
 ///
 /// `WIDTH` wins when present; otherwise `ANGLE` is required
-/// (`servo.py:64-71`). A repeat of the current duty sends nothing: the queued
+/// (`servo.py:66-73`). A repeat of the current duty sends nothing: the queued
 /// path reaches that discard in [`ServoSink::set_at`] (upstream's `_set_pwm`,
 /// `servo.py:49-50`), the immediate path guards it here.
 fn cmd_set_servo(
@@ -326,7 +326,7 @@ fn cmd_set_servo(
 }
 
 /// The queue's downstream end: upstream's `PrinterServo._set_pwm`
-/// (`servo.py:48-55`) — discard a repeat, align the pulse to the servo's
+/// (`servo.py:48-56`) — discard a repeat, align the pulse to the servo's
 /// cycle, reschedule a late alignment, and only then send.
 struct ServoSink {
     /// Names the servo in send-failure log lines.
@@ -373,7 +373,7 @@ impl RequestSink for ServoSink {
                 return Some((FlushAction::Reschedule, aligned_ptime));
             }
         }
-        // `servo.py:54-55`: `last_value` moves before the frame is sent.
+        // `servo.py:55-56`: `last_value` moves before the frame is sent.
         *self
             .value
             .lock()
@@ -670,7 +670,7 @@ mod tests {
     /// The section loads: every option it carries (and the defaults it omits)
     /// land in the access record the option check runs on
     /// (`config/validate.rs:44-51`), and `SET_SERVO` registers as a mux
-    /// command — the section's whole contract (`servo.py:12-44`).
+    /// command — the section's whole contract (`servo.py:12-45`).
     #[test]
     fn the_servo_section_reads_its_options_and_registers_set_servo() {
         let (printer, result) = load(&servo_config(""));
@@ -704,12 +704,12 @@ mod tests {
             .expect("the section registered a servo object");
         assert_eq!(servo.name(), "my_servo");
         // Before any `SET_SERVO`, `value` is 0 as upstream's `last_value`
-        // (`servo.py:20`), even though the pin starts at the initial duty.
+        // (`servo.py:22`), even though the pin starts at the initial duty.
         assert_eq!(servo.get_status(0.0), json!({ "value": 0.0 }));
     }
 
     /// The angle/width → duty formulas are upstream's, one for one
-    /// (`servo.py:16-24`, `:56-63`).
+    /// (`servo.py:16-24`, `:57-64`).
     #[test]
     fn the_pwm_value_follows_upstreams_pulse_math() {
         let geometry = geometry();
@@ -726,7 +726,7 @@ mod tests {
     }
 
     /// `SET_SERVO` drives the pin through the mux, by angle and by width
-    /// (`servo.py:64-71`), and refuses a line with neither parameter.
+    /// (`servo.py:66-73`), and refuses a line with neither parameter.
     #[test]
     fn set_servo_drives_the_pin_through_the_mux() {
         let (printer, servo, chip) = servo_printer();
@@ -742,7 +742,7 @@ mod tests {
         let pwm = Arc::clone(&chip.pwms.lock().unwrap()[0]);
         assert_eq!(*pwm.updates.lock().unwrap(), [first]);
         // The pin starts at duty 0 (no initial option) and runs at the
-        // servo's fixed period, software PWM (`servo.py:33-37`).
+        // servo's fixed period, software PWM (`servo.py:33-36`).
         assert_eq!(
             *pwm.cycle_time.lock().unwrap(),
             (SERVO_SIGNAL_PERIOD, false)
@@ -767,7 +767,7 @@ mod tests {
     }
 
     /// A `maximum_pulse_width` at or below `minimum_pulse_width` is refused
-    /// with upstream's bound wording (`servo.py:14-16`).
+    /// with upstream's bound wording (`servo.py:16-18`).
     #[test]
     fn a_pulse_width_below_the_minimum_is_refused() {
         let (_, result) = load(&servo_config("maximum_pulse_width: 0.0005\n"));

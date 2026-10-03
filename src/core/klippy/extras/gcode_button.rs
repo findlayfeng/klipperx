@@ -1,35 +1,35 @@
 //! `[gcode_button <name>]` — run g-code when a hardware button is pressed or
 //! released (upstream `klippy/extras/gcode_button.py`).
 //!
-//! The section is prefix-only (`load_config_prefix`, `gcode_button.py:42`). It
+//! The section is prefix-only (`load_config_prefix`, `gcode_button.py:55`). It
 //! reads its options as upstream does:
 //!
 //! | option | default | role |
 //! |---|---|---|
 //! | `pin` | — (required) | the button's pin (`gcode_button.py:13`) |
-//! | `press_gcode` | — (required) | the template rendered on press (`:19`) |
-//! | `release_gcode` | `""` | the template rendered on release (`:20-21`) |
-//! | `debounce_delay` | `0.`, minimum `0.` | read by the button registration (`buttons.py:255`) |
+//! | `press_gcode` | — (required) | the template rendered on press (`:25`) |
+//! | `release_gcode` | `""` | the template rendered on release (`:26-27`) |
+//! | `debounce_delay` | `0.`, minimum `0.` | read by the button registration (`buttons.py:257`) |
 //! | `analog_range` | — | parsed, then refused — see below |
 //! | `analog_pullup_resistor` | `4700.`, above `0.` | read only alongside `analog_range`, then refused |
 //!
 //! [`GCodeButton::button_callback`] is upstream's `button_callback`
-//! (`gcode_button.py:29-39`): the new state is recorded, then the press template
+//! (`gcode_button.py:37-48`): the new state is recorded, then the press template
 //! (state set) or the release template (state clear) is rendered and, when it
 //! is not blank, run through the dispatcher. [`get_status`] reports `PRESSED`
-//! / `RELEASED` (`:36-39`), and `QUERY_BUTTON BUTTON=<name>` reports the same
-//! (`:27-28`).
+//! / `RELEASED` (`:50-53`), and `QUERY_BUTTON BUTTON=<name>` reports the same
+//! (`:34-35`).
 //!
 //! # Gaps this port does not close yet
 //!
 //! * **The button event.** Upstream registers a debounced button with the
-//!   `buttons` module (`:16`), whose firmware query (`buttons.py`'s
+//!   `buttons` module (`:17-18`), whose firmware query (`buttons.py`'s
 //!   `MCU_buttons`) fires the callback on a pin change. This host has no button
 //!   query (see [`buttons`](crate::core::klippy::extras::buttons)), so the
 //!   callback is recorded but never reached by the firmware. The corpus only
 //!   *loads* `[gcode_button lcd_button]` (`printer-biqu-bx-2021.cfg:185`) and
 //!   never presses it, so that is faithful on the corpus.
-//! * **`analog_range`.** Upstream's analog branch (`gcode_button.py:17-21`)
+//! * **`analog_range`.** Upstream's analog branch (`gcode_button.py:19-23`)
 //!   registers through `buttons.register_debounce_adc_button`, which rests on
 //!   the `query_adc` object — absent from this host, the same reason
 //!   [`adc_scaled`](crate::core::klippy::extras::adc_scaled) skips it. The two
@@ -52,10 +52,10 @@ use crate::core::klippy::gcode::{sync, CommandHandler, GCodeDispatch, GcodeComma
 use crate::core::klippy::load::section;
 use crate::core::klippy::printer::{Printer, PrinterObject};
 
-// Only the prefix form exists upstream (`gcode_button.py:42`).
+// Only the prefix form exists upstream (`gcode_button.py:55`).
 section!("gcode_button", order = 30, prefix = load_config_prefix);
 
-/// `cmd_QUERY_BUTTON_help` (`gcode_button.py:27`).
+/// `cmd_QUERY_BUTTON_help` (`gcode_button.py:33`).
 const QUERY_BUTTON_HELP: &str = "Report on the state of a button";
 
 /// Why a section that sets `analog_range` is refused: the analog button path
@@ -67,27 +67,27 @@ const ANALOG_UNSUPPORTED: &str =
 /// One `[gcode_button <name>]` (upstream `GCodeButton`).
 pub struct GCodeButton {
     /// The section suffix (`lcd_button`), the `QUERY_BUTTON` mux value
-    /// (`gcode_button.py:11`).
+    /// (`gcode_button.py:12`).
     name: String,
     /// The `pin` option, kept for the button registration in
     /// [`GCodeButton::attach`].
     pin: String,
-    /// `last_state` (`gcode_button.py:12`): the last state the button reported.
+    /// `last_state` (`gcode_button.py:14`): the last state the button reported.
     last_state: Mutex<bool>,
-    /// The compiled `press_gcode` (`:19`).
+    /// The compiled `press_gcode` (`:25`).
     press_template: Template,
-    /// The compiled `release_gcode`, defaulting to empty (`:20-21`).
+    /// The compiled `release_gcode`, defaulting to empty (`:26-27`).
     release_template: Template,
     /// The machine, for the render context's `printer` view; weak so an object
     /// holding its button does not keep the machine alive.
     printer: Weak<Printer>,
-    /// The dispatcher a button script is run through (`:22`).
+    /// The dispatcher a button script is run through (`:28`).
     gcode: Arc<GCodeDispatch>,
 }
 
 impl GCodeButton {
     /// Read the section, load the templates, and take the dispatcher
-    /// (`gcode_button.py:9-25`).
+    /// (`gcode_button.py:10-31`).
     ///
     /// # Errors
     /// A missing `pin` / `press_gcode`, a template
@@ -102,10 +102,10 @@ impl GCodeButton {
             .unwrap_or_else(|| config.section().id.clone());
         let pin = config.get("pin", None)?;
         // Upstream loads the `buttons` module even before it branches on
-        // `analog_range` (`gcode_button.py:14-16`).
+        // `analog_range` (`gcode_button.py:15-16`).
         PrinterButtons::ensure(printer)?;
         if config.get_str("analog_range").is_some() {
-            // Read both values the way upstream reads them (`:17-18`), so their
+            // Read both values the way upstream reads them (`:20-21`), so their
             // wording and the section's option check match, then report the gap.
             parse_float_list(config, "analog_range", 2)?;
             config.get_float_bounded(
@@ -139,7 +139,7 @@ impl GCodeButton {
     }
 
     /// Register the debounced button and the `QUERY_BUTTON` command
-    /// (`gcode_button.py:16, :23-25`).
+    /// (`gcode_button.py:17-18, :29-31`).
     ///
     /// Called after the `Arc` exists, so the handler can hold this button.
     ///
@@ -179,7 +179,7 @@ impl GCodeButton {
         Ok(())
     }
 
-    /// Upstream's `button_callback` (`gcode_button.py:29-39`): record the state,
+    /// Upstream's `button_callback` (`gcode_button.py:37-48`): record the state,
     /// render the matching template, and run it when it is not blank.
     fn button_callback(&self, _eventtime: f64, state: bool) {
         *self.lock() = state;
@@ -224,7 +224,7 @@ impl GCodeButton {
     }
 
     /// Render a template the way upstream's `TemplateWrapper.render` does with
-    /// no context (`gcode_macro.py:61-68`): the `printer` view plus the two
+    /// no context (`gcode_macro.py:66-68`): the `printer` view plus the two
     /// actions a loaded template may call.
     fn render(&self, printer: &Arc<Printer>, template: &Template) -> Result<String, TemplateError> {
         let mut context = Context::new();
@@ -241,7 +241,7 @@ impl GCodeButton {
         template.render(&mut context)
     }
 
-    /// Upstream's `get_status` state name (`gcode_button.py:36-39`).
+    /// Upstream's `get_status` state name (`gcode_button.py:50-53`).
     fn state_name(&self) -> &'static str {
         if *self.lock() {
             "PRESSED"
@@ -267,7 +267,7 @@ impl std::fmt::Debug for GCodeButton {
 }
 
 impl PrinterObject for GCodeButton {
-    /// Upstream's `get_status` (`gcode_button.py:36-39`).
+    /// Upstream's `get_status` (`gcode_button.py:50-53`).
     fn get_status(&self, _eventtime: f64) -> Value {
         json!({ "state": self.state_name() })
     }
@@ -307,7 +307,7 @@ fn parse_float_list(
 }
 
 /// Upstream's `load_config_prefix` for `[gcode_button <name>]`
-/// (`gcode_button.py:42-43`).
+/// (`gcode_button.py:55-56`).
 pub fn load_config_prefix(
     config: &ConfigWrapper,
     printer: &Arc<Printer>,
@@ -407,7 +407,7 @@ mod tests {
     }
 
     /// Press and release each render their template and reach the dispatcher,
-    /// and `get_status` follows the last state (`gcode_button.py:29-39`).
+    /// and `get_status` follows the last state (`gcode_button.py:50-53`).
     #[tokio::test]
     async fn test_press_and_release_render_and_dispatch_their_templates() {
         let printer = printer();
@@ -453,7 +453,7 @@ mod tests {
     }
 
     /// A release whose template is the empty default is not run
-    /// (`gcode_button.py:20-21, :34-35`).
+    /// (`gcode_button.py:26-27, :43-45`).
     #[tokio::test]
     async fn test_an_empty_release_template_is_not_run() {
         let printer = printer();
@@ -486,7 +486,7 @@ mod tests {
     }
 
     /// `QUERY_BUTTON BUTTON=<name>` is registered with upstream's help and
-    /// reports the state `get_status` holds (`gcode_button.py:23-28`).
+    /// reports the state `get_status` holds (`gcode_button.py:50-53`).
     #[test]
     fn test_query_button_is_registered_and_reports_the_state() {
         let printer = printer();
@@ -506,7 +506,7 @@ mod tests {
     }
 
     /// A missing `pin` or `press_gcode` is refused with the loader's wording
-    /// (`gcode_button.py:13, :19`).
+    /// (`gcode_button.py:13, :25`).
     #[test]
     fn test_a_missing_required_option_is_refused() {
         let printer = printer();
@@ -532,7 +532,7 @@ mod tests {
     }
 
     /// `debounce_delay` is read by the registration with upstream's bound
-    /// (`buttons.py:255`, `minval=0.`).
+    /// (`buttons.py:257`, `minval=0.`).
     #[test]
     fn test_a_negative_debounce_delay_is_refused() {
         let printer = printer();
@@ -570,7 +570,7 @@ mod tests {
     }
 
     /// The two analog options keep upstream's parse and bound wording, reported
-    /// before the gap message (`configfile.py:88-102`, `gcode_button.py:17-18`).
+    /// before the gap message (`configfile.py:88-102`, `gcode_button.py:20-21`).
     #[test]
     fn test_analog_options_keep_upstream_wording() {
         let printer = printer();

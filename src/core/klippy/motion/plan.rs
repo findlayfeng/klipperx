@@ -39,6 +39,33 @@ pub struct MoveLimits {
     pub mcr_pseudo_accel: f64,
 }
 
+impl MoveLimits {
+    /// The planner limits the four values upstream's `ToolHead` stores derive
+    /// (`ToolHead._calc_junction_deviation`, `klippy/toolhead.py:534-537`):
+    /// `junction_deviation` is the corner deviation the junction speed is
+    /// limited by, `mcr_pseudo_accel` the pseudo-acceleration
+    /// `minimum_cruise_ratio` is enforced with.
+    ///
+    /// Every producer of a `MoveLimits` goes through here, so the formula has
+    /// one home — next to the fields the planner reads it into ([`Move::new`])
+    /// and this setter rebuilds at runtime. `max_accel` is an `above=0.`
+    /// option, so the division is safe.
+    pub fn from_velocity_limits(
+        max_velocity: f64,
+        max_accel: f64,
+        square_corner_velocity: f64,
+        min_cruise_ratio: f64,
+    ) -> Self {
+        Self {
+            max_velocity,
+            max_accel,
+            junction_deviation: square_corner_velocity.powi(2) * (std::f64::consts::SQRT_2 - 1.0)
+                / max_accel,
+            mcr_pseudo_accel: max_accel * (1.0 - min_cruise_ratio),
+        }
+    }
+}
+
 /// One requested move and its trapezoidal velocity profile.
 ///
 /// Distances are `_d`, velocities `_v`, velocities squared `_v2`, times `_t`

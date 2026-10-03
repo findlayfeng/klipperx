@@ -10,7 +10,7 @@
 
 ## 用例格式
 
-`.test` 是行式指令文件（`scripts/test_klippy.py:32`）：
+`.test` 是行式指令文件（`scripts/test_klippy.py:35`）：
 
 | 指令 | 含义 |
 |------|------|

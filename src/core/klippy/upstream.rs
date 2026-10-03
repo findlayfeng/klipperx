@@ -76,7 +76,7 @@ mod tests {
     /// Every case must say what to run and against what.
     ///
     /// A `CONFIG` and a `DICTIONARY` are what `test_klippy.py` requires
-    /// (`scripts/test_klippy.py:76-81`); the g-code is either a file or inline
+    /// (`scripts/test_klippy.py:86-89`); the g-code is either a file or inline
     /// lines. This checks the corpus itself, so a malformed fixture is reported
     /// as such instead of as a mystery failure in a later stage.
     #[test]
@@ -613,7 +613,7 @@ mod tests {
         let printer = Arc::new(Printer::new(reactor));
 
         // Upstream runs every case as `klippy.py -i <gcode> -o <output> -d
-        // <dict>` (`scripts/test_klippy.py:100-104`). The `-o` lands in
+        // <dict>` (`scripts/test_klippy.py:93-96`). The `-o` lands in
         // `start_args['debugoutput']`, and `heaters.py:38-39` reads it: a case
         // never answers its temperature queries, so `can_extrude` starts true
         // and the `G1 E…` lines of a case's g-code are not rejected as cold.
@@ -1305,7 +1305,7 @@ fn test_files() -> Vec<PathBuf> {
 
 /// Read one `.test` file into its runs.
 ///
-/// The grammar is upstream's (`scripts/test_klippy.py:32-64`): strip `#`
+/// The grammar is upstream's (`scripts/test_klippy.py:35-74`): strip `#`
 /// comments, split on whitespace, and dispatch on the first word. `CONFIG` and
 /// `GCODE` paths are relative to the `.test` file; `DICTIONARY` names a file
 /// (qualified `mcu=file` for a secondary MCU), not a path here — see

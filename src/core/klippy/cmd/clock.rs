@@ -68,7 +68,7 @@ impl McuResponse for ClockState {
 
 /// The regression that maps host time to the MCU clock.
 ///
-/// Upstream's `ClockSync` (`klippy/clocksync.py:12-175`) fits the MCU clock
+/// Upstream's `ClockSync` (`klippy/clocksync.py:12-173`) fits the MCU clock
 /// against the system time at which each `get_clock` was sent, and keeps the
 /// best round-trip time as a lower bound on the latency. This is the part that
 /// carries no transport: it is handed the three numbers a sample produces —
@@ -192,7 +192,7 @@ impl ClockEstimator {
     ///
     /// Returns whether the sample was used: upstream discards the ones that
     /// look like an outlier rather than letting them drag the regression
-    /// (`klippy/clocksync.py:68-99`). `clock32` is the firmware's low 32 bits;
+    /// (`klippy/clocksync.py:68-100`). `clock32` is the firmware's low 32 bits;
     /// the extension to 64 bits happens here.
     pub fn update(&mut self, sent_time: f64, receive_time: f64, clock32: u32) -> bool {
         self.queries_pending = 0;
@@ -218,7 +218,7 @@ impl ClockEstimator {
         true
     }
 
-    /// The EWMA regression step (`klippy/clocksync.py:68-99`).
+    /// The EWMA regression step (`klippy/clocksync.py:68-100`).
     fn update_regression(&mut self, sent_time: f64, clock: i64) -> bool {
         let clock = clock as f64;
         let old_freq = self.clock_freq;
@@ -295,7 +295,7 @@ impl ClockEstimator {
     }
 
     /// Extend a 32-bit clock reading into the 64-bit domain
-    /// (`klippy/clocksync.py:151-154`).
+    /// (`klippy/clocksync.py:151-155`).
     pub fn clock32_to_clock64(&self, clock32: u32) -> i64 {
         let mut diff = (i64::from(clock32) - self.last_clock) & 0xffff_ffff;
         // A reading more than 2^31 ahead is really behind (wrap-around).
@@ -305,7 +305,7 @@ impl ClockEstimator {
 }
 
 /// A secondary MCU's clock mapping (upstream's `SecondarySync`,
-/// `klippy/clocksync.py:177-235`).
+/// `klippy/clocksync.py:177-231`).
 ///
 /// The primary MCU *defines* print time (`print_time = clock / mcu_freq`), so its
 /// own crystal drift only rescales it. A secondary has its own crystal, so it is
@@ -513,7 +513,7 @@ impl ClockSync for McuClock {
             }
             // Only a sample the regression kept counts as a clock reading:
             // `update` discards the ones it reads as delayed messages
-            // (`klippy/clocksync.py:68-99`), and a reading that late is just
+            // (`klippy/clocksync.py:68-100`), and a reading that late is just
             // as wrong for the MCU's own estimate, which has no outlier logic
             // of its own.
             if estimator.update(sent_time, receive_time, state.clock) {

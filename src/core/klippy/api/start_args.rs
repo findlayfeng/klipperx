@@ -75,7 +75,7 @@ impl StartArgs {
 }
 
 /// This machine's CPU description, as upstream's `util.get_cpu_info` writes it
-/// (`klippy/util.py:116`): the count of `processor` entries and the `model name`,
+/// (`klippy/util.py:116-124`): the count of `processor` entries and the `model name`,
 /// as `"{n} core {model}"`.
 ///
 /// `"?"` when `/proc/cpuinfo` cannot be read, which is upstream's answer too.

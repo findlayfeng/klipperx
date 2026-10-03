@@ -38,7 +38,7 @@ use crate::core::klippy::cmd::trsync::{
 use crate::core::klippy::error::ConfigError;
 use crate::core::klippy::mcu::{ConfigBuilder, Mcu, McuError, SendClocks};
 
-/// The deadline for a multi-MCU dispatch (`TRSYNC_TIMEOUT`, `klippy/mcu.py:259`).
+/// The deadline for a multi-MCU dispatch (`TRSYNC_TIMEOUT`, `klippy/mcu.py:279`).
 pub const TRSYNC_TIMEOUT: f64 = 0.025;
 
 /// The deadline for a single-MCU dispatch (`TRSYNC_SINGLE_MCU_TIMEOUT`,
@@ -548,7 +548,7 @@ impl TriggerDispatch {
     /// # Errors
     /// Returns a config error for a multi-MCU shared axis — two steppers of one
     /// axis on different MCUs — which upstream rejects too
-    /// (`TriggerDispatch.add_stepper`, `klippy/mcu.py:294-307`).
+    /// (`TriggerDispatch.add_stepper`, `klippy/mcu.py:293-308`).
     pub fn add_stepper(
         &self,
         chip: McuChip,

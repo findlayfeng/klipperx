@@ -1,6 +1,6 @@
 //! Config-driven object loading: section id → factory.
 //!
-//! Upstream's `Printer._read_config` (`klippy/klippy.py:111`) turns the parsed
+//! Upstream's `Printer._read_config` (`klippy/klippy.py:114-127`) turns the parsed
 //! config into printer objects: it asks the modules that must exist before
 //! anything else for their objects, then walks every prefix section, then
 //! validates that no section was left unused (`klippy/configfile.py:425`). This
@@ -183,7 +183,7 @@ impl Printer {
     /// Returns [`ConfigError`] if a factory rejects a section, if a name is
     /// already taken, or if a section or option nothing read is left over — the
     /// last is upstream's `Section '%s' is not a valid config section` and
-    /// `Option '%s' is not valid in section '%s'` (`klippy/configfile.py:431`,
+    /// `Option '%s' is not valid in section '%s'` (`klippy/configfile.py:435`,
     /// `:440`).
     pub fn load_config(self: &Arc<Self>, config: &Config) -> Result<(), ConfigError> {
         // Remember where the host's own parts end, so a restart can keep them

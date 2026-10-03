@@ -13,7 +13,7 @@
 //! | MCU → host | `endstop_state oid=%c homing=%c next_clock=%u pin_value=%c` |
 //!
 //! An all-zero `endstop_home` (no clock, no sample count) disables the check, as
-//! upstream does when a homing move ends (`klippy/mcu.py:383`).
+//! upstream does when a homing move ends (`klippy/mcu.py:389`).
 
 use crate::core::klippy::cmd::{McuCommand, McuResponse, Params};
 use crate::core::klippy::mcu::McuError;
@@ -71,7 +71,7 @@ pub struct EndstopHome {
 
 impl EndstopHome {
     /// The all-zero message that disables checking
-    /// (`home_wait`'s cleanup, `klippy/mcu.py:383`).
+    /// (`home_wait`'s cleanup, `klippy/mcu.py:389`).
     pub fn disable(oid: u8) -> Self {
         Self {
             oid,

@@ -292,7 +292,7 @@ impl PrinterConfig {
 
     /// Record a runtime warning, deduplicated like a deprecation.
     ///
-    /// Upstream `PrinterConfig.runtime_warning` (`klippy/configfile.py:497`):
+    /// Upstream `PrinterConfig.runtime_warning` (`klippy/configfile.py:498-502`):
     /// the warning is also logged, once.
     pub fn runtime_warning(&self, message: &str) {
         let warning = json!({"type": "runtime_warning", "message": message});

@@ -44,7 +44,7 @@ use crate::core::klippy::mcu::{Mcu, McuError};
 const QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// How many missed sample windows cancel homing
-/// (`MCU_trigger_analog.MONITOR_MAX`, `trigger_analog.py:226`).
+/// (`MCU_trigger_analog.MONITOR_MAX`, `trigger_analog.py:272`).
 pub const MONITOR_MAX: u32 = 3;
 
 /// One `sos_filter` on one MCU: the fixed-point filter description plus the
@@ -143,7 +143,7 @@ impl SosFilter {
     /// the last send; states and activation are always included, because the
     /// firmware deactivates the filter whenever a section or state is written
     /// (`sos_filter.c:144-160`) and the activation is what re-arms it
-    /// (upstream `reset_filter`, `trigger_analog.py:264-291`).
+    /// (upstream `reset_filter`, `trigger_analog.py:230-263`).
     ///
     /// # Errors
     /// Returns [`McuError`] when there are more sections than `max_sections`,
@@ -272,11 +272,11 @@ pub struct McuTriggerAnalog {
     /// The raw range to enforce while homing (`set_raw_range`).
     raw_range: Mutex<(i32, i32)>,
     /// The range last sent; only a change goes out
-    /// (`_last_range_args`, `trigger_analog.py:295-300`).
+    /// (`_last_range_args`, `trigger_analog.py:283`).
     last_range_args: Mutex<Option<(i32, i32)>>,
     /// The trigger to enforce while homing (`set_trigger`).
     trigger: Mutex<(TriggerAnalogType, i32)>,
-    /// The trigger last sent (`_last_trigger_args`, `trigger_analog.py:301-306`).
+    /// The trigger last sent (`_last_trigger_args`, `trigger_analog.py:287`).
     last_trigger_args: Mutex<Option<(TriggerAnalogType, i32)>>,
     /// The 64-bit clock the last `trigger_analog_home` armed at, so
     /// `home_wait` can map the firmware's 32-bit `homing_clock` onto **this**
@@ -386,7 +386,7 @@ impl McuTriggerAnalog {
 
     /// The messages one arm sends: raw range and trigger when changed since
     /// the last arm, then the SOS filter's pending messages
-    /// (upstream `_reset_filter`, `trigger_analog.py:319-334`).
+    /// (upstream `_reset_filter`, `trigger_analog.py:351-363`).
     ///
     /// # Errors
     /// As [`SosFilter::take_pending_messages`].

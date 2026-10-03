@@ -22,7 +22,7 @@ pub struct MotionQueuing {
     steppers: Vec<Stepper>,
     /// The flush callbacks (`register_flush_callback`), invoked with the
     /// flush time at the start of every [`MotionQueuing::generate`]
-    /// (`motion_queuing.py:146-156`).
+    /// (`motion_queuing.py:147-150`).
     flush_callbacks: Vec<Box<dyn Fn(f64) + Send>>,
 }
 
@@ -53,7 +53,7 @@ impl MotionQueuing {
     /// it is called with the flush time at the start of every
     /// [`MotionQueuing::generate`], in registration order, and stays
     /// registered for the later ones. Upstream's `_advance_flush_time` calls
-    /// each with `flush_time` and `step_gen_time` (`motion_queuing.py:146-156`);
+    /// each with `flush_time` and `step_gen_time` (`motion_queuing.py:147-150`);
     /// only the flush time crosses this seam.
     pub fn register_flush_callback(&mut self, callback: Box<dyn Fn(f64) + Send + 'static>) {
         self.flush_callbacks.push(callback);
@@ -125,7 +125,7 @@ impl MotionQueuing {
             flush_callbacks,
         } = self;
         // Flush callbacks run first (`_advance_flush_time` invokes them before
-        // generating, `motion_queuing.py:149-151`) — and they run even when
+        // generating, `motion_queuing.py:149-150`) — and they run even when
         // there is no stepper to generate for: a macro-driven dwell timeline
         // queues no steps, but its flush time still advances.
         for callback in flush_callbacks.iter() {
@@ -301,7 +301,7 @@ mod tests {
     fn test_flush_callbacks_run_in_registration_order_even_without_steppers() {
         // A dwell-only timeline — no stepper reads the trapq, so `generate`
         // produces nothing — still advances the flush time, and the flush
-        // callbacks registered on it still run (`motion_queuing.py:146-156`).
+        // callbacks registered on it still run (`motion_queuing.py:147-150`).
         let mut queuing = MotionQueuing::new();
         queuing.allocate_trapq();
         let calls = Arc::new(Mutex::new(Vec::new()));

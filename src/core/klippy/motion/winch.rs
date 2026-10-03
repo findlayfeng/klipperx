@@ -72,10 +72,10 @@ pub fn winch_active_flags() -> AxisFlags {
 // WinchKinematics (kinematics/winch.py)
 // ===========================================================================
 
-/// The cable-winch kinematics (`WinchKinematics`, `kinematics/winch.py:9-45`).
+/// The cable-winch kinematics (`WinchKinematics`, `kinematics/winch.py:8-54`).
 ///
 /// Reverse mapping only uses the first three cables (`calc_position`,
-/// `winch.py:21-24`); any further cables still drive their own steppers, so the
+/// `winch.py:31-34`); any further cables still drive their own steppers, so the
 /// section list is kept whole.
 #[derive(Debug, Clone)]
 pub struct WinchKinematics {
@@ -83,14 +83,14 @@ pub struct WinchKinematics {
     names: Vec<String>,
     /// Each cable's anchor, in the same order.
     anchors: Vec<[f64; 3]>,
-    /// The anchor-coordinate bounding box, for `get_status` (`winch.py:19-20`).
+    /// The anchor-coordinate bounding box, for `get_status` (`winch.py:26-27`).
     axes_min: Coord,
     axes_max: Coord,
 }
 
 impl WinchKinematics {
     /// Build the kinematics from the cables' names and anchors
-    /// (`WinchKinematics.__init__`, `kinematics/winch.py:11-20`).
+    /// (`WinchKinematics.__init__`, `kinematics/winch.py:9-28`).
     ///
     /// `cables` is each cable's `(stepper name, anchor)` pair, in section
     /// order. The bounding box is the `min`/`max` of each anchor coordinate.
@@ -127,7 +127,7 @@ impl WinchKinematics {
 
 impl Kinematics for WinchKinematics {
     fn calc_position(&self, stepper_positions: &HashMap<String, f64>) -> [Option<f64>; 3] {
-        // `calc_position` of `kinematics/winch.py:21-24`: only the first three
+        // `calc_position` of `kinematics/winch.py:31-34`: only the first three
         // cables give the carriage position, and their sphere radii are the
         // squared cable lengths. A missing cable leaves the whole position
         // unknown (upstream would raise a `KeyError`).
@@ -153,13 +153,13 @@ impl Kinematics for WinchKinematics {
     }
 
     fn check_move(&self, _ctx: &mut MoveContext<'_>) -> Result<(), CommandError> {
-        // `check_move` of `kinematics/winch.py:38-40`: boundary checks and
+        // `check_move` of `kinematics/winch.py:45-47`: boundary checks and
         // speed limits are not implemented, so every move is accepted.
         Ok(())
     }
 
     fn set_position(&mut self, _newpos: Coord, _homing_axes: &[usize]) {
-        // Upstream sets each stepper's position here (`winch.py:25-27`); the
+        // Upstream sets each stepper's position here (`winch.py:35-37`); the
         // toolhead already does that for every stepper it drives
         // (`ToolHead.set_position`), so the kinematics keeps no limits.
     }
@@ -171,12 +171,12 @@ impl Kinematics for WinchKinematics {
     }
 
     fn clear_homing_state(&mut self, _axes: &[usize]) {
-        // `clear_homing_state` of `kinematics/winch.py:28-30`: "XXX - homing
+        // `clear_homing_state` of `kinematics/winch.py:38-40`: "XXX - homing
         // not implemented", a no-op.
     }
 
     fn get_status(&self) -> Value {
-        // `get_status` of `kinematics/winch.py:41-47`: the axes read as homed
+        // `get_status` of `kinematics/winch.py:48-54`: the axes read as homed
         // unconditionally and the "limits" are the anchor bounding box.
         json!({
             "homed_axes": "xyz",
@@ -186,7 +186,7 @@ impl Kinematics for WinchKinematics {
     }
 
     fn home(&mut self, _homing: &mut dyn HomingState) {
-        // `home` of `kinematics/winch.py:31-35` ("XXX - homing not
+        // `home` of `kinematics/winch.py:41-44` ("XXX - homing not
         // implemented") marks all three axes and forces the position to
         // `0, 0, 0`; both are done by the driver's winch branch, which fires no
         // endstop move and no `homing:home_rails_end`. The trait's `HomingState`
@@ -279,9 +279,9 @@ mod tests {
     fn test_the_status_reports_the_anchor_bounding_box() {
         let kin = example_winch();
         let status = kin.get_status();
-        // The axes always read as homed (`winch.py:43`).
+        // The axes always read as homed (`winch.py:51`).
         assert_eq!(status["homed_axes"], "xyz");
-        // min/max over every anchor coordinate (`winch.py:19-20`).
+        // min/max over every anchor coordinate (`winch.py:26-27`).
         assert_eq!(
             status["axis_minimum"],
             json!([-2000.0, -2000.0, -100.0, 0.0])
@@ -301,7 +301,7 @@ mod tests {
             mcr_pseudo_accel: 1500.0,
         };
         // A move far outside the anchor box is still accepted
-        // (`winch.py:38-40`).
+        // (`winch.py:45-47`).
         let mut move_ = Move::new(
             Coord::default(),
             Coord::new(1e6, -1e6, 1e6, 0.0),

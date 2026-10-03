@@ -362,7 +362,7 @@ impl PrinterObject for ExcludeObject {
 }
 
 /// The toolhead as the transform's downstream, the way `gcode_move`'s own
-/// `ToolheadTarget` wraps it (`gcode_move.rs:92-101`).
+/// `ToolheadTarget` wraps it (`gcode_move.rs:96-105`).
 struct ToolheadMove(Arc<ToolHeadObject>);
 
 impl MoveTarget for ToolheadMove {

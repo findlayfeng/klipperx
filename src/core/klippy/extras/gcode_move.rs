@@ -39,7 +39,10 @@
 //! | `homing:home_rails_end` (with `axes`) | `toolhead`'s homing loop |
 //! | `toolhead:set_position` | `SET_KINEMATIC_POSITION` |
 //! | `gcode:command_error` | the dispatcher |
-//! | `toolhead:manual_move` / `extruder:activate_extruder` | registered, no sender yet (their APIs are G4-2) |
+//! | `toolhead:manual_move` | `safe_z_home`'s `HomeOps::manual_move` (`safe_z_home.rs:215`) |
+//! | `toolhead:update_extra_axes` | `ToolHeadObject::add_extra_axis` / `remove_extra_axis`
+//!   (`toolhead.rs:1876` / `:1892`, called by `manual_stepper`) |
+//! | `extruder:activate_extruder` | registered, no sender yet (`ACTIVATE_EXTRUDER` does not fire it) |
 //!
 //! # What is not here
 //!
@@ -49,8 +52,9 @@
 //!   failing them.
 //! * `axis_map` grows for extra axes upstream (`_update_extra_axes`); a
 //!   [`Coord`] is four axes here, so the mapping stops at `E` (G4-2).
-//! * `set_move_transform` is written and takes the slot upstream's `bed_mesh`
-//!   fills, but nothing swaps the target yet.
+//! * `set_move_transform` is written and both `bed_tilt` (`bed_tilt.rs:376`) and
+//!   `exclude_object` (`exclude_object.rs:212`) already swap the target through
+//!   it; what is missing is upstream's `bed_mesh` itself.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};

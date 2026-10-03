@@ -191,9 +191,11 @@ toolhead / 开放事件）一起补，一部分是现在就独立可补的小行
 ### G4 运动命令（G0/G1/G28/G92/M114…）
 
 - [ ] **G4-2 外围**：`GET_POSITION`（要 `kin.get_steppers()` + `calc_position` + MCU 位置）、
-      extra-axes 的 `axis_map`（`Coord` 目前固定 4 轴）、`toolhead:manual_move` /
-      `toolhead:update_extra_axes` / `extruder:activate_extruder` 的发送方（等它们的 API）、
-      `move_transform`（等 `bed_mesh`）。
+      extra-axes 的 `axis_map`（`Coord` 目前固定 4 轴）、上游 `ToolHead.manual_move` /
+      `ToolHead.add_extra_axis` 的其余调用方（`toolhead:manual_move` 由 `safe_z_home` 发、
+      `toolhead:update_extra_axes` 由 `ToolHeadObject` 发，见下表；`extruder:activate_extruder`
+      仍只有处理器、无发送方）、`bed_mesh`（`set_move_transform` 已实现，`bed_tilt` /
+      `exclude_object` 在用）。
 
 ### B4 其余端点（机制部分 FW9）
 
@@ -568,13 +570,14 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 
 | 事件名 | 触发时机 | 参数 | 上游位置 | 实现依赖 |
 |---|---|---|---|---|
-| `toolhead:manual_move` | 手动移动前 | `positions, speed` | `klippy/toolhead.py:416` | 尚无触发点（handler 已备，G4-2） |
-| `toolhead:set_position` | 设置位置（G92 等） | `positions, e` | `klippy/toolhead.py:390` | ✅ 已触发（`extras/toolhead.rs:1091`，`SET_KINEMATIC_POSITION`） |
+| `toolhead:manual_move` | 手动移动前 | `positions, speed` | `klippy/toolhead.py:416` | ✅ 已触发（`safe_z_home` 的 `HomeOps::manual_move`，`extras/safe_z_home.rs:215`） |
+| `toolhead:set_position` | 设置位置（G92 等） | `positions, e` | `klippy/toolhead.py:390` | ✅ 已触发（`extras/toolhead.rs:1752`，`SET_KINEMATIC_POSITION`） |
 | `toolhead:sync_print_time` | print_time 更新 | `print_time` | `klippy/toolhead.py:267` | **尚无发送点**（C1d 的回调已落地，但该事件没有触发方；`idle_timeout` 改为观察 `print_time` 前进） |
-| `toolhead:update_extra_axes` | 额外轴位置更新 | `positions` | `klippy/toolhead.py:455` | 尚无触发点（handler 已备，G4-2） |
+| `toolhead:update_extra_axes` | 额外轴位置更新 | `positions` | `klippy/toolhead.py:455` | ✅ 已触发（`ToolHeadObject::add_extra_axis` / `remove_extra_axis`，`extras/toolhead.rs:1876` / `:1892`，`manual_stepper` 调用） |
 
-> `toolhead:set_position` 已产线触发（`gcode_move` 重置链之一）；其余三个尚无触发点：
-> `manual_move`/`update_extra_axes` 等 G4-2 的 API；`sync_print_time` 仍无发送点（C1d 已收官）。
+> `toolhead:set_position`（`gcode_move` 重置链之一）、`toolhead:manual_move`（`safe_z_home`）
+> 与 `toolhead:update_extra_axes`（`manual_stepper`）都已产线触发；只剩
+> `toolhead:sync_print_time` 无发送点（C1d 已收官）。
 
 ### gcode 事件
 
@@ -594,7 +597,7 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 | 事件名 | 触发时机 | 参数 | 上游位置 | 实现依赖 |
 |---|---|---|---|---|
 | `probe:update_results` | probe 测量完成 | `ProbeResultsHandle`（可原地改 Z，批 #36） | `klippy/extras/probe.py:200` | endstop |
-| `extruder:activate_extruder` | 切换 active extruder | `extruder` | `klippy/kinematics/extruder.py:25` | 尚无发送方（handler 已备，`gcode_move.rs:357`） |
+| `extruder:activate_extruder` | 切换 active extruder | `extruder` | `klippy/kinematics/extruder.py:25` | 尚无发送方（handler 已备，`gcode_move.rs:392`；`ACTIVATE_EXTRUDER` 不触发它） |
 | `stepper_enable:motor_off` | stepper 电机关闭 | `stepper_enable` | `klippy/extras/stepper_enable.py:120` | ✅ 已触发（`stepper_enable.rs:338`） |
 | `virtual_sdcard:reset_file` | VSD 文件重置 | 无 | `klippy/extras/virtual_sdcard.py:151` | sdcard |
 | `load_cell:calibrate` | 称重传感器校准 | 无 | `klippy/extras/load_cell.py:404` | ADC |

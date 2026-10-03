@@ -5,9 +5,13 @@
 （上游由 `toolhead.py:610-613` 的 default modules 列表按名字加载），所以 `upstream_gap_report`
 看不见它，它只出现在 `upstream_test_cases_run` 的首次失败里。
 
-- 上游基线：`third_party/klipper/`（commit `02e71b9`），`klippy/extras/gcode_move.py`（349 行）
+- 上游基线：`third_party/klipper/`（commit `02e71b9`），`klippy/extras/gcode_move.py`（**294 行**，
+  2026-10-03 复核更正，原记 349 行）
 - 本地基线：`cb50abf`
 - 相关记录：[H2 动工前调查](2026-09-23-h2-notes.md)
+
+> **本文是 2026-09-23 当时的快照，不是规范。** 正文 §1–§5 记的是那天的盘点与拍板建议，
+> 其中多处已被实现推进取代；**余项与现状以 §6 为准**（`TODO.md` 是权威台账）。
 
 ---
 
@@ -41,8 +45,11 @@ M106/M107                           ← H2-1
 G92 Y-3  G1 Y-2  G91  G1 Y-1        ← 未知：G92 无效 → G1 Y-2 按绝对坐标 → Y=-2 越界
 ```
 
-上游的账：回零后工具头 Y=1.5（`G1 Y1.5`），`G92 Y-3` 让 `base_position[Y] = 1.5 - (-3) = 4.5`，
-于是 `G1 Y-2` → 工具头 Y = `-2 + 4.5` = **2.5**，`G91` 之后的 `G1 Y-1` 再减 1 = 1.5。全程在范围内。
+上游的账：`G92 Y-3` 之前工具头最后一次 Y 来自 `G1 X0 Y0 E.01`，是 **0**（不是 `G1 Y1.5`），
+`G92 Y-3` 让 `base_position[Y] = 0 - (-3) = 3`，于是 `G1 Y-2` → 工具头 Y = `-2 + 3` = **1**，
+`G91` 之后的 `G1 Y-1` 再减 1 = 0。全程在范围内。
+
+（2026-10-03 复核更正：原文按 `G1 Y1.5` 起算得 4.5 / 2.5 / 1.5，与同篇 §0 的「落在 Y=+1」自相矛盾。）
 
 ---
 
@@ -163,7 +170,7 @@ gcode id 的 API 落地）、`move_transform`（等 `bed_mesh`）、`extruder:ac
 
 ---
 
-## 6. 实施记录（2026-09-25 回填）
+## 6. 实施记录（2026-09-25 回填；2026-10-03 复核）
 
 **G4-1 坐标系核心：已落地** —— `extras/gcode_move.rs`（状态、`G90/G91`、`M82/M83`、`G92`、
 `SET_GCODE_OFFSET`、`M220/M221`、`SAVE/RESTORE`、`M114`、`get_status`）；`commands.test` 与
@@ -174,8 +181,28 @@ gcode id 的 API 落地）、`move_transform`（等 `bed_mesh`）、`extruder:ac
 | 余项 | 现状 |
 |---|---|
 | `GET_POSITION` | **未注册**（未知命令静默放行，因此不扣分）；需 `kin.get_steppers()` + `calc_position` + `McuStepper` 的 MCU 位置 |
-| extra 轴的 `axis_map` | 本仓 `Coord` 是 4 轴，映射停在 `E` |
-| `toolhead:manual_move` / `toolhead:update_extra_axes` | 处理器已备，**无发送点**（其 API 属 G4-2） |
-| `set_move_transform` | 已写并占上游 `bed_mesh` 的槽，但无人换 target |
+| extra 轴的 `axis_map` | 本仓 `Coord` 是 4 轴（`mathutil.rs:22` `AXES = 4`），映射停在 `E` |
 | `toolhead:sync_print_time` | 仍无发送点（C1d 的回调已落地；`idle_timeout` 改为观察 `print_time` 前进） |
 | `motion_report`（`dump_trapq`/`dump_stepper`） | 未做，跟踪在 `TODO.md` 的 H10 / B4 |
+| `extruder:activate_extruder` 的发送方 | `ACTIVATE_EXTRUDER` 已落地（`extruder.rs:338`）但只调 `set_active_extruder`，**不发事件**——处理器仍空转 |
+
+**原表两行已收尾（复核订正）**：
+
+| 原记 | 现状 |
+|---|---|
+| `toolhead:manual_move` / `toolhead:update_extra_axes`「处理器已备，**无发送点**」 | 两个事件都已有产线发送点：`manual_move` 由 `safe_z_home` 的 `HomeOps::manual_move` 发出（`safe_z_home.rs:215`，`LiveHome` 在 `:419` 构造）；`update_extra_axes` 由 `ToolHeadObject::add_extra_axis` / `remove_extra_axis` 发出（`toolhead.rs:1876` / `:1892`，`manual_stepper.rs:452` / `:462` 调用）。仍缺的只是上游那两个通用 API 的其余调用方 |
+| `set_move_transform`「已写并占上游 `bed_mesh` 的槽，但无人换 target」 | 已有人换：`bed_tilt.rs:376`、`exclude_object.rs:212` 都在产线路径上换 target；缺口只剩上游 `bed_mesh` 本身 |
+
+**正文（§1–§5）中已被实现取代的断言**——正文是 2026-09-23 的快照，除 §1 那处就地更正
+与开头那处行数更正外不再改写：
+
+| 正文 | 现状 |
+|---|---|
+| §2.1「状态（`__init__`，`gcode_move.py:21-37`）」、§2.2「`G1` 算法（`:117-141`）」 | 行号已漂移：`__init__` 在 `:9`、状态字段块 `:29-40`、`cmd_G1` 在 `:134` |
+| §3「`G0`/`G1` 现在在 `toolhead`（`extras/toolhead.rs:394` + `move_command :998`）」 | 已搬家：`toolhead.rs` 里没有 `move_command`，`G0`/`G1` 注册在 `extras/gcode_move.rs` |
+| §3「`last_position` 重置：发送方缺 2 个，`homing:home_rails_end` **没有载荷**」 | 已补齐：`event/decl/homing.rs:6` 带 `axes`；`extras/toolhead.rs:1752` 发 `toolhead:set_position` |
+| §3「我们现在 `DEFAULT_MOVE_SPEED = 50.0`」 | 该常量已不存在；`gcode_move.rs:80` `DEFAULT_SPEED = 25.0` |
+| §3「四个现有单测直接构造 `move_command`（`toolhead.rs:1377/1410/1437/1461`）」 | 那四行现是 kinematics 构建代码；参数解析测试已搬到 `gcode_move.rs`（`test_g1_parses_axes_and_speed_into_a_move` 等），「未回零轴拒绝」留在 `toolhead.rs` |
+| §3「`move_transform` — 缓（先只认 toolhead）」 | 已实现并被产线使用（见上表） |
+| §1「语料里的坐标系命令（inline + `*.gcode`）」的计数 | 实测是 `test/klippy/*.test` 的口径（复核 `G1 212`、`G90 15`、`G91 9`、`M83 3`、`M114 2`、`G92 2` 与正文一致；`G2`/`M486` 为 19/40，正文 18/39），并非正文自称的「inline + `*.gcode`」 |
+| §5 拍板①–⑥ | ①搬到 `gcode_move` ✅ ②解析放 `klippy:ready` ✅ ③`home_rails_end` 加 `axes` ✅ ④命令处发 `set_position` ✅ ⑤`Coord` 仍 4 轴（未做，见余项）⑥默认速度 25 ✅ |

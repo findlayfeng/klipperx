@@ -1026,10 +1026,12 @@ async fn cmd_temperature_wait(
     let sensor_name = gcmd.get_str("SENSOR")?;
     let min_temp = gcmd.get_float_default("MINIMUM", f64::NEG_INFINITY)?;
     let max_temp = gcmd.get_float_default("MAXIMUM", f64::INFINITY)?;
-    // Upstream reads `MAXIMUM` with `above=min_temp` (`heaters.py:370`) and
-    // checks no default it did not get (`gcode.py:65-86`), so the bound is
-    // checked only for a given parameter, with upstream's wording — which
-    // `GcodeCommand::get`'s shared bound path does not spell.
+    // Upstream reads `MAXIMUM` with `above=min_temp` (`heaters.py:370`), whose
+    // shared `get` checks a bound only when the parameter was actually given
+    // (a default returns before the bounds, `gcode.py:65-86`). The check is
+    // written out here because the limit has to render the way Python's `%s`
+    // would (`10.0`); the shared bound path formats f64 Rust-style (`10`) — see
+    // `gcode.rs` `range_error`.
     if gcmd.get_command_parameters().contains_key("MAXIMUM") && max_temp <= min_temp {
         return Err(CommandError::new(format!(
             "Error on '{}': MAXIMUM must be above {min_temp:?}",

@@ -308,8 +308,9 @@ harness 把每个 `[mcu]` / `[mcu <name>]` 的传输键换成 `test: dict=<字�
 同一形状在 2026-09-25 再次出现（`generic-mightyboard.cfg` / `printer-flashforge-creator-pro-2018.cfg`）：
 `hd44780_spi` 面板刷新一次 480 条同步 `spi_send` 灌满 512 格队列，撞上 `G28` 的 **`trsync_start`**（同步路径）。
 修法：同步 `send` 改为**有界退避等待**（50µs→10ms，总 ≤ `SYNC_SEND_WAIT` 1s，超时仍报错），
-并把错误串扩成「命令名 + 队列水位」；`SYNC_SEND_HEADROOM` 语义与前一条修复都不变。该用例不依赖 `STEPPER_BUZZ`
-实现即可通过——未知命令当前静默 `Ok` 放行；`STEPPER_BUZZ` 本身仍属 H10 工单。
+并把错误串扩成「命令名 + 队列水位」；`SYNC_SEND_HEADROOM` 语义与前一条修复都不变。该用例跑的是
+`STEPPER_BUZZ`，当时该命令尚未注册、靠未知命令静默放行才通过；**`STEPPER_BUZZ` 已于 2026-10-04
+落地**（`extras/force_move.rs`，逐电机 mux 注册），这条用例现在走的是真实现。
 
 失败原因的历史分组与完整失败日志随收官从工作记录目录清理（见上文的说明）；本手册只保留机制与
 推进口径——第一次失败修好后会露出下一个，分组随落地进度变化。

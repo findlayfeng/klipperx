@@ -16,7 +16,7 @@ use crate::core::klippy::mathutil::Xyz;
 
 /// A time past any real move, so the tail sentinel is always searched past
 /// (`NEVER_TIME`, `chelper/trapq.c:36`).
-const NEVER_TIME: f64 = 9999999999999999.9;
+pub(crate) const NEVER_TIME: f64 = 9999999999999999.9;
 
 /// The longest filler the very first segment may insert
 /// (`MAX_NULL_MOVE`, `chelper/trapq.c:104`).

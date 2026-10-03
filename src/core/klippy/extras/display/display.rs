@@ -5,13 +5,13 @@
 //!
 //! | step | here | upstream |
 //! |---|---|---|
-//! | the panel | `lcd_type` picks a [`LcdChip`] | `display.py:12-19`, `:181` |
-//! | `[display_status]` | created on demand, whether or not the config names it | `display.py:190` |
-//! | the menu keys | the options are read, no menu is built | `menu.py:688-722`, `menu_keys.py:12-38` |
-//! | templates | the shipped `display.cfg` is merged into the `display_template` registry | `display.py:115-135` |
+//! | the panel | `lcd_type` picks a [`LcdChip`] | `display.py:16-22`, `:181` |
+//! | `[display_status]` | created on demand, whether or not the config names it | `display.py:188` |
+//! | the menu keys | the options are read, no menu is built | `menu.py:688-722`, `menu_keys.py:12-43` |
+//! | templates | the shipped `display.cfg` is merged into the `display_template` registry | `display.py:115-166` |
 //! | layouts | `display_data` groups | `display.py:56-88` |
-//! | glyphs | `display_glyph` sections | `display.py:93-114` |
-//! | the group | `display_group`, defaulted from the panel's width | `display.py:196-203` |
+//! | glyphs | `display_glyph` sections | `display.py:103-114` |
+//! | the group | `display_group`, defaulted from the panel's width | `display.py:194-200` |
 //! | refresh | `klippy:ready` initialises the panel and starts the timer | `display.py:217-241` |
 //! | g-code | `SET_DISPLAY_GROUP` | `display.py:207-214`, `:266-271` |
 //!
@@ -33,11 +33,11 @@
 //!
 //! * **Rendering and the menu.** See the parent module's docs; the panel is
 //!   cleared and flushed every `REDRAW_TIME`, and nothing is drawn.
-//! * **`draw_text` / `draw_progress_bar`** (`display.py:244-265`): they are the
+//! * **`draw_text` / `draw_progress_bar`** (`display.py:247-264`): they are the
 //!   drawing half of a render step that does not run.
 //! * **The `display_template` parameter check.** Upstream raises `Invalid
 //!   parameter to display_template <name>` from inside `DisplayTemplate.render`
-//!   (`display.py:43-46`); the rule is [`check_render_params`], and nothing
+//!   (`display.py:45-53`); the rule is [`check_render_params`], and nothing
 //!   calls it yet because nothing renders.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -73,13 +73,13 @@ use super::uc1701::Uc1701;
 // after everything it reads and before the bus consumers.
 section!("display", order = 45, load = load_config);
 
-/// Normal time between each screen redraw (`display.py:10`).
+/// Normal time between each screen redraw (`display.py:12`).
 const REDRAW_TIME: f64 = 0.500;
-/// Minimum time between screen redraws (`display.py:11`).
+/// Minimum time between screen redraws (`display.py:14`).
 const REDRAW_MIN_TIME: f64 = 0.100;
 
 /// The panel names `lcd_type` accepts — upstream's `LCD_chips` keys
-/// (`display.py:12-19`).
+/// (`display.py:16-22`).
 ///
 /// The whole list is accepted even though only `st7920`, `hd44780`,
 /// `hd44780_spi`, `uc1701`, `ssd1306` and `aip31068_spi` have drivers here, so
@@ -106,9 +106,9 @@ const DISPLAY_CFG: &str = include_str!("display.cfg");
 /// so errors name the file the way a reader knows it.
 const DISPLAY_CFG_NAME: &str = "display.cfg";
 
-/// The default group for a 16-character panel (`display.py:196`).
+/// The default group for a 16-character panel (`display.py:194`).
 const DEFAULT_GROUP_16X4: &str = "_default_16x4";
-/// The default group for a 20-character panel (`display.py:198`).
+/// The default group for a 20-character panel (`display.py:196`).
 const DEFAULT_GROUP_20X4: &str = "_default_20x4";
 
 // ===========================================================================
@@ -116,7 +116,7 @@ const DEFAULT_GROUP_20X4: &str = "_default_20x4";
 // ===========================================================================
 
 /// The panel behind a `[display]` section — one value of `lcd_type`
-/// (upstream's `LCD_chips`, `display.py:12-19`).
+/// (upstream's `LCD_chips`, `display.py:16-22`).
 ///
 /// The framework's half of the contract is small: bring the panel up, blank it
 /// and flush it on every redraw, say how wide it is (the default `display_group`
@@ -124,11 +124,11 @@ const DEFAULT_GROUP_20X4: &str = "_default_20x4";
 pub trait LcdChip: Send + Sync {
     /// Bring the panel up (`display.py:218`).
     fn init(&self);
-    /// Blank the framebuffer (`display.py:232`).
+    /// Blank the framebuffer (`display.py:226`).
     fn clear(&self);
-    /// Send the framebuffer differences (`display.py:241`).
+    /// Send the framebuffer differences (`display.py:238`).
     fn flush(&self);
-    /// The panel's size in characters (`display.py:197`, `:252`).
+    /// The panel's size in characters (`display.py:195`, `:215`).
     fn get_dimensions(&self) -> (usize, usize);
     /// Take the glyphs the layout may name (`display.py:193`).
     fn set_glyphs(&self, glyphs: &BTreeMap<String, Glyph>);
@@ -143,7 +143,7 @@ pub trait LcdChip: Send + Sync {
 }
 
 /// One message a panel handed to the firmware, with the extension-mode switch
-/// already applied (`st7920.py:180-189`).
+/// already applied (`st7920.py:174-184`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SentMessage {
     /// Whether it went as `st7920_send_data` (the other is
@@ -153,7 +153,7 @@ pub struct SentMessage {
     pub bytes: Vec<u8>,
 }
 
-/// One parsed `[display_glyph <name>]` section (`display.py:93-114`).
+/// One parsed `[display_glyph <name>]` section (`display.py:103-114`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Glyph {
     /// The 16x16 icon, split into its two byte-per-row halves
@@ -167,7 +167,7 @@ pub struct Glyph {
 // Layouts
 // ===========================================================================
 
-/// One `[display_data <group> <item>]` row (`display.py:56-72`).
+/// One `[display_data <group> <item>]` row (`display.py:57-77`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DisplayDataItem {
     /// The screen row.
@@ -181,7 +181,7 @@ pub struct DisplayDataItem {
 }
 
 /// One `display_data` group: its items, ordered by screen position
-/// (`display.py:56-72`).
+/// (`display.py:68-77`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DisplayGroup {
     items: Vec<DisplayDataItem>,
@@ -189,7 +189,7 @@ pub struct DisplayGroup {
 
 impl DisplayGroup {
     /// The items, ordered by `(row, col, identifier)` as upstream sorts them
-    /// (`display.py:71`).
+    /// (`display.py:73`).
     pub fn items(&self) -> &[DisplayDataItem] {
         &self.items
     }
@@ -206,7 +206,7 @@ pub struct PrinterLCD {
     lcd_chip: Arc<dyn LcdChip>,
     /// Every `display_data` group by name (`display.py:192`).
     display_data_groups: BTreeMap<String, DisplayGroup>,
-    /// The name of the group currently shown (`display.py:203`).
+    /// The name of the group currently shown (`display.py:198`).
     show_data_group: Mutex<String>,
     /// The template registry (`display.py:191`).
     display_templates: Arc<DisplayTemplates>,
@@ -215,9 +215,9 @@ pub struct PrinterLCD {
     /// The refresh timer, registered at ready.
     timer: Mutex<Option<TimerHandle>>,
     /// Whether something asked for a redraw sooner than the next period
-    /// (`display.py:212-215`).
+    /// (`display.py:205`).
     redraw_request_pending: AtomicBool,
-    /// The time the pending redraw is due at (`display.py:215`).
+    /// The time the pending redraw is due at (`display.py:206`).
     redraw_time: Mutex<f64>,
     /// A weak handle to this object, for the event handler and the timer.
     self_ref: Weak<PrinterLCD>,
@@ -227,7 +227,7 @@ impl PrinterLCD {
     /// Build the display: panel, layouts, templates, glyphs, group and
     /// g-code.
     ///
-    /// Upstream's `PrinterLCD.__init__` (`display.py:176-215`), with the menu
+    /// Upstream's `PrinterLCD.__init__` (`display.py:177-214`), with the menu
     /// left out (module docs).
     ///
     /// # Errors
@@ -253,7 +253,7 @@ impl PrinterLCD {
         };
 
         // The `[display]` section is the only section that registers a display
-        // (`display.py:185-189`); the menu-key options below are therefore
+        // (`display.py:185-187`); the menu-key options below are therefore
         // always read.
         let _menu = read_menu_options(config)?;
 
@@ -462,16 +462,16 @@ pub fn load_config(
 /// built (module docs), so the values only prove the section was read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MenuOptions {
-    /// `menu_timeout` (`menu.py:702`).
+    /// `menu_timeout` (`menu.py:703`).
     pub timeout: i64,
-    /// `menu_reverse_navigation` (`menu.py:705`).
+    /// `menu_reverse_navigation` (`menu.py:705-707`).
     pub reverse_navigation: bool,
 }
 
 /// Read the options the menu would consume.
 ///
-/// Upstream reads them in `MenuManager.__init__` (`menu.py:700-708`) and
-/// `MenuKeys.__init__` (`menu_keys.py:19-38`); with no menu here, they are read
+/// Upstream reads them in `MenuManager.__init__` (`menu.py:689-722`) and
+/// `MenuKeys.__init__` (`menu_keys.py:13-43`); with no menu here, they are read
 /// because `check_unused` requires a reader for every option a config writes —
 /// `menu_timeout` and `menu_reverse_navigation` are in the corpus.
 ///
@@ -481,17 +481,17 @@ pub struct MenuOptions {
 ///
 /// # Errors
 /// Upstream's wording: an unparseable `encoder_pins` (`Unable to parse
-/// encoder_pins`, `menu_keys.py:27-28`), a bad `encoder_steps_per_detent`
+/// encoder_pins`, `menu_keys.py:22-26`), a bad `encoder_steps_per_detent`
 /// choice, a non-positive `encoder_fast_rate`, or a malformed
 /// `analog_range_*` pair.
 pub fn read_menu_options(config: &ConfigWrapper) -> Result<MenuOptions, ConfigError> {
     let identifier = config.identifier();
-    // `MenuManager.__init__` (`menu.py:700-706`).
+    // `MenuManager.__init__` (`menu.py:689-722`).
     let _menu_root = config.get("menu_root", Some("__main"))?;
     let timeout = config.get_int("menu_timeout", Some(0))?;
     let reverse_navigation = config.get_bool("menu_reverse_navigation", Some(false))?;
 
-    // `MenuKeys.__init__` (`menu_keys.py:19-33`).
+    // `MenuKeys.__init__` (`menu_keys.py:13-43`).
     if let Some(pins) = config.get_str("encoder_pins") {
         if pins.split(',').count() != 2 {
             return Err(ConfigError::new("Unable to parse encoder_pins".to_string()));
@@ -507,7 +507,7 @@ pub fn read_menu_options(config: &ConfigWrapper) -> Result<MenuOptions, ConfigEr
         None,
     )?;
 
-    // `MenuKeys.register_button` (`menu_keys.py:34-50`): the button pins, each
+    // `MenuKeys.register_button` (`menu_keys.py:45-61`): the button pins, each
     // optionally paired with an analog range and a pull-up resistor.
     let mut analog = false;
     for option in ["click_pin", "back_pin", "up_pin", "down_pin", "kill_pin"] {
@@ -574,7 +574,7 @@ fn parse_float_list(
 
 /// Parse the shipped layout.
 ///
-/// Upstream `pconfig.read_config(<display.cfg>)` (`display.py:124-128`); a
+/// Upstream `pconfig.read_config(<display.cfg>)` (`display.py:118-120`); a
 /// failure there is `Cannot load config '<path>'`.
 fn published_config() -> Result<Config, ConfigError> {
     Config::from_text(DISPLAY_CFG)
@@ -584,7 +584,7 @@ fn published_config() -> Result<Config, ConfigError> {
 
 /// The template registry, with the shipped layout merged in.
 ///
-/// Upstream's `lookup_display_templates` (`display.py:115-135`, `:168-173`)
+/// Upstream's `lookup_display_templates` (`display.py:124-131`, `:168-174`)
 /// loads the main config's `[display_template]` sections — which the loader
 /// already did, through their factory in [`super::led`] — and then every shipped
 /// one whose name the main config does not define, so the main config wins.
@@ -648,7 +648,7 @@ fn load_display_groups(
         .collect())
 }
 
-/// One `[display_data <group> <item>]` section (`display.py:58-72`).
+/// One `[display_data <group> <item>]` section (`display.py:57-77`).
 ///
 /// # Errors
 /// Upstream's wording for a malformed section name or `position`.
@@ -695,7 +695,7 @@ fn parse_position(position: &str) -> Option<(usize, usize)> {
 ///
 /// # Errors
 /// Upstream's `Invalid glyph line in <name>` / `Glyph <name> incorrect lines`
-/// (`display.py:93-103`), and a missing or out-of-range `hd44780_slot`.
+/// (`display.py:109-113`), and a missing or out-of-range `hd44780_slot`.
 fn load_display_glyphs(config: &ConfigWrapper) -> Result<BTreeMap<String, Glyph>, ConfigError> {
     let mut glyphs = BTreeMap::new();
     let main: BTreeSet<String> = config
@@ -719,7 +719,7 @@ fn load_display_glyphs(config: &ConfigWrapper) -> Result<BTreeMap<String, Glyph>
     Ok(glyphs)
 }
 
-/// One `[display_glyph <name>]` section (`display.py:115-140`).
+/// One `[display_glyph <name>]` section (`display.py:147-166`).
 ///
 /// # Errors
 /// Upstream's glyph wording, and `hd44780_slot`'s bounds.
@@ -745,7 +745,7 @@ fn parse_glyph_section(config: &ConfigWrapper) -> Result<(String, Glyph), Config
     Ok((name, glyph))
 }
 
-/// Upstream's `PrinterDisplayTemplate._parse_glyph` (`display.py:93-103`).
+/// Upstream's `PrinterDisplayTemplate._parse_glyph` (`display.py:103-114`).
 ///
 /// The two error wordings are the user's: a line that is not `width` columns of
 /// `.`/`*`, and a glyph whose line count is not `height`.
@@ -779,7 +779,7 @@ fn parse_glyph(
 }
 
 /// Whether a shipped section is skipped because the main config defines a
-/// section with the same identifier (`display.py:120-123`).
+/// section with the same identifier (`display.py:126-128`).
 fn skip_published(section: &ConfigSection, main: &BTreeSet<String>) -> bool {
     if section.sub.is_none() {
         return true;
@@ -790,7 +790,7 @@ fn skip_published(section: &ConfigSection, main: &BTreeSet<String>) -> bool {
 /// Check one `render("name", k=…)` call against a template's declared
 /// parameters.
 ///
-/// Upstream's `DisplayTemplate.render` (`display/display.py:43-46`) copies the
+/// Upstream's `DisplayTemplate.render` (`display/display.py:45-53`) copies the
 /// template's `param_*` values and then updates them with the call's keywords:
 /// the sizes only match while every keyword the call passes is one the template
 /// already declares. That rule is user-visible text, so it is kept here even
@@ -899,7 +899,7 @@ mod tests {
     #[test]
     fn test_a_glyph_line_must_be_the_full_width() {
         // A line that is not five columns, and one with a character that is
-        // neither `.` nor `*` (`display.py:98-99`).
+        // neither `.` nor `*` (`display.py:109-110`).
         let err = parse_glyph("bed", ".....\n....", 5, 8).unwrap_err();
         assert_eq!(err.to_string(), "Invalid glyph line in bed");
 
@@ -915,7 +915,7 @@ mod tests {
 
     #[test]
     fn test_a_glyph_is_read_as_binary_rows() {
-        // `.` is a clear bit and `*` a set one (`display.py:95-96`).
+        // `.` is a clear bit and `*` a set one (`display.py:106`).
         let rows = parse_glyph("x", ".*.*.\n*****", 5, 2).unwrap();
         assert_eq!(rows, vec![0b01010, 0b11111]);
     }
@@ -1039,7 +1039,7 @@ mod tests {
             .expect("the section loads and reads every option");
 
         // `display_status` comes with the display, whether the config names it
-        // or not (`display.py:190`), and it is registered before the display.
+        // or not (`display.py:188`), and it is registered before the display.
         assert_eq!(
             printer.objects(),
             [
@@ -1154,7 +1154,7 @@ mod tests {
 
     #[test]
     fn test_the_sibling_panels_that_still_have_no_driver_are_reported() {
-        // `sh1106` is the SSD1306's own variant (`uc1701.py:238-242`): the
+        // `sh1106` is the SSD1306's own variant (`uc1701.py:238-241`): the
         // name is accepted by `lcd_type` and refused with the same sentence
         // as every other gap. `aip31068_spi` left this list when its driver
         // landed; it is now built like the others.
@@ -1383,7 +1383,7 @@ mod tests {
         printer.teardown();
         let (messages, message, progress, group) = outcome.expect("the display comes up");
 
-        // The init sequence, as one `st7920_send_cmds` (`st7920.py:63-74`).
+        // The init sequence, as one `st7920_send_cmds` (`st7920.py:63-73`).
         assert_eq!(
             messages[0],
             SentMessage {

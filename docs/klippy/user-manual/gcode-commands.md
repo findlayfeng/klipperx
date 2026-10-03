@@ -349,6 +349,9 @@ STEPPER_BUZZ STEPPER=<name>
 （没有 `rotation_distance` 但有 `gear_ratio`）改走 `1°`（速度 `1°/0.25 s`）。
 每个已注册的电机都有一条 `STEPPER_BUZZ STEPPER=<name>`，**不受 `enable_force_move` 影响**。
 
+> **已知缺口（与 `MANUAL_STEPPER MOVE` 同一处）**：`[manual_stepper]` 这类没有接进运动队列
+> 的电机，两条命令目前只走时间轴、**不实际出步**——命令会成功返回，但电机会不动。
+
 ---
 
 ## 电机使能（`stepper_enable`）
@@ -983,7 +986,7 @@ SAVE_VARIABLE VARIABLE=<name> VALUE=<literal>
 |------|------|
 | 缺参数 | `Error on '<整行>': missing <参数名>` |
 | 解析失败 | `Error on '<整行>': unable to parse <原值>`；移动词另有一套：`Unable to parse move '<整行>'`，`F<=0` 是 `Invalid speed in '<整行>'` |
-| 越界 | `Error on '<整行>': <参数名> must have minimum/maximum/above/below of <限制>` |
+| 越界 | `Error on '<整行>': <参数名> must have minimum of <限制>`（`maximum` 同形）与 `Error on '<整行>': <参数名> must be above <限制>`（`below` 同形） |
 | 多路键值未注册 | `The value '<值>' is not valid for <键>. Options: 'a', 'b'`（候选里有包含关系时改成 `. Did you mean 'a'?`，**取排序后的第一个**，与上游取字典序最后一个不同——为了消息稳定） |
 | 处理器自己的错误 | 各命令自带的文案（如 `Printer is not ready`、`Extruder not configured`） |
 

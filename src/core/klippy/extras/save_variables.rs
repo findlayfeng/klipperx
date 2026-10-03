@@ -53,6 +53,20 @@
 //! with single quotes (Python's `repr` switches to double quotes for a string
 //! that holds a single quote and no double quote) and only ASCII control
 //! characters are escaped; both read back identically.
+//!
+//! # Known deviations from upstream
+//!
+//! * **No interpolation on read.** Upstream's `configparser` interpolates by
+//!   default, so a stored value holding a bare `%` makes the load fail with
+//!   `Unable to parse existing variable file`; this reader and writer leave
+//!   `%` alone (`save_variables.py:16-22`).
+//! * **File I/O is synchronous.** Upstream hands reads and writes to
+//!   `aio_executor.allocate_executor("save_variables")`; this port has no such
+//!   executor, so the command thread does the I/O itself.
+//! * **`get_status` is sorted by name** (`BTreeMap`), where upstream reports the
+//!   file's insertion order.
+//! * Integers outside `i64`, and the tuple/set/bytes/complex literals above,
+//!   are refused rather than round-tripped.
 
 use std::collections::BTreeMap;
 use std::fs;

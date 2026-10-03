@@ -8,7 +8,7 @@
 
 use super::stepcompress::{StepCommand, StepCompressError};
 use super::stepper::Stepper;
-use super::trapq::Trapq;
+use super::trapq::{Trapq, NEVER_TIME};
 use crate::core::klippy::mathutil::Xyz;
 
 /// The trapqs and the steppers reading them.
@@ -105,7 +105,7 @@ impl MotionQueuing {
     /// (`MotionQueuing.wipe_trapq`, `motion_queuing.py:68-70`: force to the
     /// history list with no expiry).
     pub fn wipe_trapq(&mut self, trapq: usize) {
-        self.trapqs[trapq].finalize_moves(f64::MAX, 0.0);
+        self.trapqs[trapq].finalize_moves(NEVER_TIME, 0.0);
     }
 
     /// Drop finished segments from every live queue into its history

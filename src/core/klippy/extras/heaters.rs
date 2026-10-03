@@ -44,11 +44,11 @@ use crate::core::klippy::printer::{Printer, PrinterObject, PrinterState};
 pub const HEATERS_OBJECT: &str = "heaters";
 
 /// The longest a heater PWM change may sit before the firmware falls back
-/// (upstream `MAX_HEAT_TIME`, `heaters.py:15`).
+/// (upstream `MAX_HEAT_TIME`, `heaters.py:14`).
 #[allow(dead_code)]
 const MAX_HEAT_TIME: f64 = 3.0;
 /// The temperature the PID's first derivative is measured against
-/// (upstream `AMBIENT_TEMP`, `heaters.py:17`).
+/// (upstream `AMBIENT_TEMP`, `heaters.py:15`).
 const AMBIENT_TEMP: f64 = 25.0;
 /// The divisor upstream stores PID constants over (`PID_PARAM_BASE`) — what
 /// `pid_calibrate` multiplies its tuned gains by before storing them
@@ -83,12 +83,12 @@ pub trait Sensor: Send + Sync + std::fmt::Debug {
 
 /// What the M105 g-code-id table stores — any object that can report its
 /// `(current, target)` temperature, as upstream's `gcode_id_to_sensor` does
-/// (`heaters.py:301-317`). A heater answers with its smoothed reading and
+/// (`heaters.py:247`). A heater answers with its smoothed reading and
 /// target; a sensor-only section with `gcode_id` would answer with its last
 /// reading and a target of zero.
 pub trait GcodeTempSensor: Send + Sync {
     /// The current and target temperatures (`Heater.get_temp`,
-    /// `heaters.py:331-339`).
+    /// `heaters.py:116-122`).
     fn get_temp(&self, eventtime: f64) -> (f64, f64);
 }
 
@@ -215,7 +215,7 @@ impl HeaterControl for Control {
 
 /// One configured heater (an extruder hotend, a bed, a generic heater).
 ///
-/// Upstream's `Heater` (`klippy/extras/heaters.py:14-160`): it owns the sensor
+/// Upstream's `Heater` (`klippy/extras/heaters.py:21-160`): it owns the sensor
 /// callback, the bang-bang/PID control loop and the PWM output. The periodic
 /// check over it is [`verify_heater::HeaterCheck`], which [`PrinterHeaters::setup_heater`]
 /// gives each heater.
@@ -348,7 +348,7 @@ impl Heater {
     /// Whether a `target` has not settled yet (`Heater.check_busy`).
     ///
     /// Upstream polls it in `_wait_for_temperature` while `M109`/`M190` wait
-    /// for their target (`heaters.py:326-334`); both waits are wired through
+    /// for their target (`heaters.py:348-359`); both waits are wired through
     /// [`Self::set_temperature`] (2026-10-03, `6900894` / `6745e83`).
     /// `TEMPERATURE_WAIT` does not use it — it waits on the reading itself.
     pub fn check_busy(&self, target: f64) -> bool {
@@ -412,10 +412,10 @@ pub struct PrinterHeaters {
     sensors: Mutex<Vec<String>>,
     monitors: Mutex<Vec<String>>,
     heaters: Mutex<BTreeMap<String, Arc<Heater>>>,
-    /// Upstream's `gcode_id_to_sensor` (`heaters.py:301-317`): the g-code-id
+    /// Upstream's `gcode_id_to_sensor` (`heaters.py:247`): the g-code-id
     /// table M105 reports and TEMPERATURE_WAIT echoes.
     gcode_id_to_sensor: Mutex<BTreeMap<String, Arc<dyn GcodeTempSensor>>>,
-    /// Upstream's `has_started` (`heaters.py:329-330`): set on `klippy:ready`,
+    /// Upstream's `has_started` (`heaters.py:251`): set on `klippy:ready`,
     /// gates `_get_temp` so M105 before ready reports `T:0`.
     has_started: AtomicBool,
 }
@@ -433,7 +433,7 @@ impl PrinterHeaters {
         }
     }
 
-    /// Upstream's `_get_temp` (`heaters.py:331-339`): the M105 temperature
+    /// Upstream's `_get_temp` (`heaters.py:331-340`): the M105 temperature
     /// line.
     ///
     /// After `has_started`, each registered g-code-id sensor reports
@@ -460,7 +460,7 @@ impl PrinterHeaters {
     }
 
     /// Register the M105 command and wire `klippy:ready` to set `has_started`
-    /// (upstream's `PrinterHeaters.__init__`, `heaters.py:281-285,329-330`).
+    /// (upstream's `PrinterHeaters.__init__`, `heaters.py:243-259,329-330`).
     fn register_commands(self: &Arc<Self>, printer: &Arc<Printer>) {
         let weak_heaters = Arc::downgrade(self);
         printer.register_event_handler(
@@ -554,7 +554,7 @@ impl PrinterHeaters {
     /// What differs from upstream:
     ///
     /// * the per-second M105 line is echoed via `_get_temp`, as upstream does
-    ///   (`heaters.py:355`);
+    ///   (`heaters.py:358`);
     /// * a file-output run returns at once, as upstream's does
     ///   (`heaters.py:350-351`);
     /// * the sleep is a `tokio` timer rather than `reactor.pause`.
@@ -619,7 +619,7 @@ impl PrinterHeaters {
     }
 
     /// Note a sensor that was set up, upstream's `register_sensor`
-    /// (`heaters.py:301-317`).
+    /// (`heaters.py:301-315`).
     ///
     /// The sensor's section name joins `available_sensors` and becomes one
     /// value of the `TEMPERATURE_WAIT` mux command, keyed by `SENSOR` — every
@@ -663,7 +663,7 @@ impl PrinterHeaters {
             )
             .map_err(ConfigError::new)?;
 
-        // Upstream's g-code-id registration (`heaters.py:309-317`): if no id
+        // Upstream's g-code-id registration (`heaters.py:308-315`): if no id
         // was passed, read it from the section; if the section has none
         // either, the sensor does not appear in M105.
         let gcode_id = match gcode_id {
@@ -739,7 +739,7 @@ impl PrinterHeaters {
     /// with no readings never changes its output.
     ///
     /// `can_extrude` starts as upstream's `min_extrude_temp <= 0. or
-    /// is_fileoutput` (`heaters.py:38-39`) and every reading recomputes it.
+    /// is_fileoutput` (`heaters.py:37-39`) and every reading recomputes it.
     /// File-output mode is how upstream runs its own test cases, where nothing
     /// answers the temperature queries — see [`Printer::is_fileoutput`].
     ///
@@ -864,7 +864,7 @@ impl PrinterHeaters {
                 smoothed_temp: 0.0,
                 last_temp_time: 0.0,
                 // Upstream: `min_extrude_temp <= 0. or is_fileoutput`
-                // (`heaters.py:38-39`). File-output mode is how upstream runs
+                // (`heaters.py:37-39`). File-output mode is how upstream runs
                 // its own cases, where the temperature queries are never
                 // answered and so no reading ever flips this on again.
                 can_extrude: min_extrude_temp <= 0.0 || printer.is_fileoutput(),
@@ -1305,7 +1305,7 @@ mod tests {
         );
     }
 
-    /// `heaters.py:38-39`: file-output mode (upstream's `-o`, which
+    /// `heaters.py:37-39`: file-output mode (upstream's `-o`, which
     /// `test_klippy.py` runs every case with) lets a heater extrude from a cold
     /// start — such a run never answers its temperature queries, so no reading
     /// would ever turn the flag on again.
@@ -1818,7 +1818,7 @@ mod tests {
     }
 
     /// M105 reports each registered g-code-id sensor as `"<id>:{cur:.1} /{target:.1}"`
-    /// (`heaters.py:331-339`).
+    /// (`heaters.py:331-340`).
     #[tokio::test]
     async fn test_m105_reports_a_registered_gcode_id_sensor() {
         let (_printer, gcode, _heater) = m105_printer();
@@ -1843,7 +1843,7 @@ mod tests {
     }
 
     /// Before `klippy:ready`, `has_started` is false so M105 reports `"T:0"`
-    /// even with a registered sensor (`heaters.py:332`).
+    /// even with a registered sensor (`heaters.py:334`).
     #[tokio::test]
     async fn test_m105_reports_t0_before_ready() {
         let printer = ready_printer();
@@ -1875,7 +1875,7 @@ mod tests {
     }
 
     /// A duplicate g-code-id is rejected with upstream's message
-    /// (`heaters.py:315-316`).
+    /// (`heaters.py:312-314`).
     #[test]
     fn test_duplicate_gcode_id_is_rejected() {
         let printer = ready_printer();

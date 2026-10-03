@@ -3,7 +3,7 @@
 //!
 //! A `[gcode_macro <name>]` section *is* a command: its uppercased name is
 //! registered with the dispatcher under the section's `description`, the way
-//! `GCodeMacro.__init__` does (`gcode_macro.py:124-147`). The bare
+//! `GCodeMacro.__init__` does (`gcode_macro.py:124-162`). The bare
 //! `[gcode_macro]` section is the shared template holder upstream creates for
 //! `load_template` (`gcode_macro.py:81-115`); it reads no options of its own,
 //! so its factory only claims the section.
@@ -12,7 +12,7 @@
 //! |---|---|---|
 //! | `gcode` | — (required) | the macro body |
 //! | `description` | `G-Code macro` | the command's help text |
-//! | `rename_existing` | — | the command this one renames (`:135-142`) |
+//! | `rename_existing` | — | the command this one renames (`:137-142`) |
 //! | `variable_<name>` | — | a literal reported in `get_status` (`:153-162`) |
 //!
 //! # How the body runs
@@ -22,9 +22,9 @@
 //! 132`) — and the registered command renders it per invocation: the macro's
 //! `variable_*` values, the template context (`printer`, `action_*`,
 //! `range`), then `params` and `rawparams` make up upstream's `kwparams`
-//! (`:186-190`); the rendered text is fed back through
+//! (`:192-195`); the rendered text is fed back through
 //! `run_script_from_command`, exactly `TemplateWrapper.run_gcode_from_command`
-//! (`:79-80`). The engine behind it — and every construct it still refuses —
+//! (`:76-77`). The engine behind it — and every construct it still refuses —
 //! is documented in [`template`]'s module docs.
 //!
 //! The registered command also declares the parameter names its body reads
@@ -39,7 +39,7 @@
 //!
 //! # Gaps this port does not close yet
 //!
-//! - **`rename_existing` stops at the load-time checks** (`:135-142`): the
+//! - **`rename_existing` stops at the load-time checks** (`:137-142`): the
 //!   option is read and the same-type rule enforced, but upstream's swap at
 //!   `klippy:connect` (`handle_connect`, `:163-171`) is not implemented, so a
 //!   renaming macro does not register at all — matching upstream's *load-time*
@@ -61,7 +61,7 @@ use crate::core::klippy::gcode::{
 use crate::core::klippy::load::section;
 use crate::core::klippy::printer::{Printer, PrinterObject};
 
-/// `cmd_SET_GCODE_VARIABLE_help` (`gcode_macro.py:163`).
+/// `cmd_SET_GCODE_VARIABLE_help` (`gcode_macro.py:174`).
 const SET_GCODE_VARIABLE_HELP: &str = "Set the value of a G-Code macro variable";
 
 // Both `[gcode_macro]` (the shared template holder) and every
@@ -104,7 +104,7 @@ impl PrinterGCodeMacro {
         Ok(object)
     }
 
-    /// Upstream's `PrinterGCodeMacro.load_template` (`gcode_macro.py:81-88`):
+    /// Upstream's `PrinterGCodeMacro.load_template` (`gcode_macro.py:84-90`):
     /// read `option` from `config` (or its `default` when given) and compile it.
     ///
     /// A module that carries a g-code option of its own (the filament sensors'
@@ -153,7 +153,7 @@ struct MacroState {
     /// The `variable_*` values, keyed without the prefix
     /// (`gcode_macro.py:153-158`); `SET_GCODE_VARIABLE` writes them.
     variables: Mutex<BTreeMap<String, Value>>,
-    /// Upstream's `in_script` flag (`gcode_macro.py:183`): set while this
+    /// Upstream's `in_script` flag (`gcode_macro.py:151`): set while this
     /// macro runs, so reaching itself is refused instead of recursing.
     in_script: AtomicBool,
     /// The command names the body writes verbatim (outside Jinja2 tags),
@@ -165,7 +165,7 @@ struct MacroState {
 
 impl MacroState {
     /// Claim the run, or report the recursion upstream reports
-    /// (`gcode_macro.py:183-184`).
+    /// (`gcode_macro.py:190-191`).
     fn enter(&self) -> Result<MacroGuard<'_>, CommandError> {
         if self.in_script.swap(true, Ordering::SeqCst) {
             return Err(CommandError::new(format!(
@@ -176,7 +176,7 @@ impl MacroState {
         Ok(MacroGuard(&self.in_script))
     }
 
-    /// The render context upstream's `cmd` builds (`gcode_macro.py:186-190`):
+    /// The render context upstream's `cmd` builds (`gcode_macro.py:192-195`):
     /// the macro's variables first, then the globals that override them, then
     /// `params` / `rawparams`.
     fn context(
@@ -195,7 +195,7 @@ impl MacroState {
                 context.insert(name.clone(), Rt::Json(value.clone()));
             }
         }
-        // `create_template_context` (`gcode_macro.py:101-108`): the `printer`
+        // `create_template_context` (`gcode_macro.py:106-113`): the `printer`
         // status view, the two actions the corpus' bodies call, and `range`
         // behind `{% for %}` (`exclude_object.cfg:92`).
         context.insert(
@@ -219,7 +219,7 @@ impl MacroState {
 }
 
 /// A macro run in progress: clears `in_script` however the run ends, the way
-/// upstream's `try/finally` does (`gcode_macro.py:186-190`).
+/// upstream's `try/finally` does (`gcode_macro.py:197-200`).
 struct MacroGuard<'a>(&'a AtomicBool);
 
 impl Drop for MacroGuard<'_> {
@@ -549,7 +549,7 @@ impl GCodeMacro {
         if rename_existing.is_none() {
             // The macro is its command (`gcode_macro.py:143-147`): render the
             // body and hand the text back to the dispatcher
-            // (`TemplateWrapper.run_gcode_from_command`, `:79-80`).
+            // (`TemplateWrapper.run_gcode_from_command`, `:76-77`).
             let weak = Arc::downgrade(printer);
             let state = Arc::clone(&state);
             let handler: CommandHandler = Arc::new(move |gcmd: &GcodeCommand| {
@@ -1039,8 +1039,8 @@ mod tests {
 
     /// The seam upstream calls `run_gcode_from_command`: a macro renders its
     /// body against `params` / `rawparams` / its own `variable_*` status and
-    /// the rendered lines reach the dispatcher (`gcode_macro.py:186-190` +
-    /// `:79-80`). The receiving command is a fake this test registers.
+    /// the rendered lines reach the dispatcher (`gcode_macro.py:192-195` +
+    /// `:76-77`). The receiving command is a fake this test registers.
     #[test]
     fn a_macro_body_renders_and_dispatches_its_lines() {
         let printer = printer();
@@ -1089,7 +1089,7 @@ mod tests {
         );
     }
 
-    /// Upstream's `in_script` guard (`gcode_macro.py:183-184`): a macro whose
+    /// Upstream's `in_script` guard (`gcode_macro.py:190-191`): a macro whose
     /// body reaches itself is refused instead of recursing, and the refusal
     /// leaves the macro usable — the flag clears with the run.
     #[test]
@@ -1135,7 +1135,7 @@ mod tests {
     }
 
     /// `SET_GCODE_VARIABLE` is mux-keyed by the section's name and writes the
-    /// value `get_status` then reports (`gcode_macro.py:148-150, :164-173`);
+    /// value `get_status` then reports (`gcode_macro.py:148-150, :172-173`);
     /// an unknown variable and a non-literal value are refused with upstream's
     /// wording (the parse tail is this port's JSON parser).
     #[test]

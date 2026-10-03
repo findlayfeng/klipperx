@@ -81,9 +81,9 @@ connect_file(输出文件, 字典):
 | 位置 | 行为 |
 |------|------|
 | `MCU.__init__`（`mcu.py:1161`） | `estimated_print_time` 替换为恒返回 0 的实现 |
-| `MCUConfigHelper._send_get_config`（`mcu.py:1033`） | 不发送 `get_config`，直接返回 `{is_config: 0, move_count: 500, crc: 0}` |
+| `MCUConfigHelper._send_get_config`（`mcu.py:1037`） | 不发送 `get_config`，直接返回 `{is_config: 0, move_count: 500, crc: 0}` |
 | `MCU_trsync.stop` / `wait_end`、`MCU_endstop.home_wait` / `query_endstop`（`mcu.py:271`、`325`、`396`、`403`） | 归位与探测判定直接返回，`wait_end` 立即完成 |
-| `MCU.check_timeout`（`mcu.py:897`） | 不进入超时判定，不触发「Lost communication」停机 |
+| `MCU.check_timeout`（`mcu.py:898`） | 不进入超时判定，不触发「Lost communication」停机 |
 | `MCUConnectHelper._analyze_shutdown`（`mcu.py:884`） | 不分析停机原因 |
 | `MCUStatsHelper._ready`（`mcu.py:951`） | 不校验固件时钟频率 |
 | `MCUConfigHelper._connect` 收尾（`mcu.py:1073`） | 跳过「配置未生效」检查 |

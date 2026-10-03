@@ -140,7 +140,7 @@ pub trait Reactor: Send + Sync {
     ///
     /// The name is what [`Reactor::set_latency_notifier`] shows. Upstream reads
     /// it off the callback (`get_function_owner`,
-    /// `klippy/extras/garbage_collection.py:21`); a Rust closure has no name, so
+    /// `klippy/extras/garbage_collection.py:13`); a Rust closure has no name, so
     /// a caller gives one.
     ///
     /// The callback may be called again whenever it asks to be, by returning

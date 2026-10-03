@@ -17,7 +17,7 @@
 //! The reason numbers travel over `trsync`: [`REASON_TRIGGER_ANALOG`] is the
 //! base, and a failure adds the `trigger_analog_error:` enumeration value —
 //! the same decode `MCU_trigger_analog.home_wait` performs upstream
-//! (`klippy/extras/trigger_analog.py:374-395`).
+//! (`klippy/extras/trigger_analog.py:387-411`).
 
 use crate::core::klippy::cmd::trsync::TriggerReason;
 use crate::core::klippy::cmd::{McuCommand, McuResponse, Params};
@@ -152,7 +152,7 @@ pub struct TriggerAnalogHome {
 impl TriggerAnalogHome {
     /// The all-zero message that disables checking — upstream's `_clear_home`
     /// sends it before reading the trigger clock back
-    /// (`trigger_analog.py:300-304`).
+    /// (`trigger_analog.py:365-369`).
     pub fn disable(oid: u8) -> Self {
         Self {
             oid,

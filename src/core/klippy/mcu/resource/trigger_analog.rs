@@ -8,7 +8,7 @@
 //! [`TriggerDispatch`] and stops the steppers. Failures (raw range, filter
 //! overflow, a sensor that went quiet) fire the same dispatch with an error
 //! code, and [`McuTriggerAnalog::home_wait`] decodes it into the upstream
-//! message (`trigger_analog.py:374-395`).
+//! message (`trigger_analog.py:387-411`).
 //!
 //! # What is here
 //!
@@ -49,7 +49,7 @@ pub const MONITOR_MAX: u32 = 3;
 
 /// One `sos_filter` on one MCU: the fixed-point filter description plus the
 /// resend caches upstream keeps (`_last_sent_coeffs` / `_last_sent_offset_scale`,
-/// `trigger_analog.py:145-147, 264-291`).
+/// `trigger_analog.py:141-142, 264-291`).
 ///
 /// Writing sections/state deactivates the firmware filter, so [`reset`](Self::reset)
 /// always re-sends states and the activation; coefficients and offset/scale
@@ -148,7 +148,7 @@ impl SosFilter {
     /// # Errors
     /// Returns [`McuError`] when there are more sections than `max_sections`,
     /// or the state count does not match the section count — upstream raises
-    /// the same as `ValueError` (`trigger_analog.py:270-279`).
+    /// the same as `ValueError` (`trigger_analog.py:230-263`).
     pub fn take_pending_messages(
         &self,
     ) -> Result<Vec<(&'static str, Vec<crate::core::klippy::msg::proto::ArgValue>)>, McuError> {
@@ -440,7 +440,7 @@ impl McuTriggerAnalog {
     /// Arm the object for a probing move (`MCU_trigger_analog.home_start`).
     ///
     /// The sample-count arguments are upstream's uniform homing interface —
-    /// `MCU_trigger_analog` ignores them too (`trigger_analog.py:341-355`);
+    /// `MCU_trigger_analog` ignores them too (`trigger_analog.py:374-385`);
     /// the sensor's rate, fixed at construction, sets the monitor window.
     ///
     /// # Errors
@@ -495,7 +495,7 @@ impl McuTriggerAnalog {
     }
 
     /// Stop homing and read back the trigger clock (upstream `_clear_home`,
-    /// `trigger_analog.py:300-304`): an all-zero `trigger_analog_home`
+    /// `trigger_analog.py:365-369`): an all-zero `trigger_analog_home`
     /// disables the check, and `trigger_analog_state` carries the arm or
     /// trigger clock as a print time.
     async fn clear_home(&self) -> Result<f64, McuError> {
@@ -563,7 +563,7 @@ impl McuTriggerAnalog {
         let raw = self.dispatch.completion().wait_raw().await;
         // Clear the homing state before judging the reason: the trigger clock
         // is read back here, and upstream runs `_clear_home` first too
-        // (`trigger_analog.py:368-395`).
+        // (`trigger_analog.py:365-369`).
         let trigger_time = self.clear_home().await?;
         self.dispatch.stop();
         if raw_is_failure(raw) {

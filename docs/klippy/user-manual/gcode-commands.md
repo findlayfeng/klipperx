@@ -319,6 +319,22 @@ SET_HEATER_TEMPERATURE HEATER=<name> [TARGET=<celsius>]
   （`[heater_bed]`）、`[heater_generic <name>]` 的 `<name>` 等；
 - `TARGET` 默认 `0`（关掉）。
 
+### TEMPERATURE_WAIT — 等待温度越界
+
+```
+TEMPERATURE_WAIT SENSOR=<section> [MINIMUM=<celsius>] [MAXIMUM=<celsius>]
+```
+
+- `SENSOR` 必填，值是传感器所属**配置节名**（如 `extruder`、`temperature_sensor mcu_temp`、
+  `temperature_fan chamber`）——mux 键，每个经 `heaters::register_sensor` 注册的节自动获得条目；
+- `MINIMUM` 默认 -∞、`MAXIMUM` 默认 +∞，**至少给一个**（都缺报
+  `Error on 'TEMPERATURE_WAIT': missing MINIMUM or MAXIMUM.`）；给了两者时 `MAXIMUM` 必须
+  **严格大于** `MINIMUM`（错误文案逐字上游）；
+- 等待循环每秒读一次，读数进入 `[MINIMUM, MAXIMUM]` 即返回；期间每轮回一行 `T:0`
+ （`M105` 的 gcode_id 表未接线，见 TODO H1）；printer shutdown 时中止。
+
+（上游 `G-Codes.md` 同款语义；2026-10-03 `b5da84e`）
+
 ### M104 / M109 — 设置挤出机温度
 
 ```

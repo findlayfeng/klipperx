@@ -346,6 +346,8 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 
 ### H1 加热与温度
 
+- [ ] **`M105` / gcode_id 表**（heaters 域）：`TEMPERATURE_WAIT` 已落地（2026-10-03，`b5da84e`，
+      10 测；等待循环每轮回的 `T:0` 即空表口径），`M105` 仍硬编码 `T:0`——接表后换真实报表。
 - [ ] `pid_calibrate.py`（`PID_CALIBRATE`）：仍缺（`verify_heater.py` 批 #20 已完成）
       （`extruder.rs:21` 明示 still open）。
 - [ ] 传感器**剩余**：`temperature_host.py` /

@@ -954,12 +954,19 @@ mod tests {
         // …and the same numbers are reported. `respond_info` hands the whole
         // three-line message to the output as one entry, with every line
         // after the first prefixed (`gcode.rs`, `Inner::respond_info`).
-        assert_eq!(
-            lines.emitted(),
-            [format!(
-                "// PID parameters: pid_Kp={} pid_Ki={} pid_Kd={}\n// The SAVE_CONFIG command will update the printer config file\n// with these parameters and restart the printer.",
-                constants[0], constants[1], constants[2]
-            )]
+        // The `set_temperature(.., wait)` run also echoes an `M105` line each
+        // second it waits (`T:0` here — `has_started` is false in this test
+        // so the gcode-id table reports the empty default), matching
+        // upstream's `_wait_for_temperature` (`heaters.py:349-360`).
+        let expected_pid = format!(
+            "// PID parameters: pid_Kp={} pid_Ki={} pid_Kd={}\n// The SAVE_CONFIG command will update the printer config file\n// with these parameters and restart the printer.",
+            constants[0], constants[1], constants[2]
+        );
+        let emitted = lines.emitted();
+        assert_eq!(emitted.last(), Some(&expected_pid), "the PID line is last");
+        assert!(
+            emitted[..emitted.len() - 1].iter().all(|l| l == "T:0"),
+            "every earlier line is the empty-table M105 report"
         );
 
         // The run ends with the heater off and its own control back.

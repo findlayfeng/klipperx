@@ -473,26 +473,30 @@ impl PrinterHeaters {
 
         let weak_heaters = Arc::downgrade(self);
         let weak_printer = Arc::downgrade(printer);
-        let gcode = printer
-            .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
-            .expect("the loader registers `gcode` before any section");
-        gcode
-            .register_command(
-                "M105",
-                sync(move |gcmd: &GcodeCommand| {
-                    let msg = match (weak_heaters.upgrade(), weak_printer.upgrade()) {
-                        (Some(heaters), Some(printer)) => heaters._get_temp(printer.eventtime()),
-                        _ => "T:0".to_string(),
-                    };
-                    if !gcmd.ack(Some(&msg)) {
-                        gcmd.respond_raw(&msg);
-                    }
-                    Ok(())
-                }),
-                None,
-                true,
-            )
-            .expect("M105 is a valid, unique command name");
+        // `ensure` may run in test setups without a `gcode` object; skip M105
+        // registration then (upstream registers it in `__init__` where `gcode`
+        // always exists — `heaters.py:259`).
+        if let Some(gcode) = printer.lookup_object_as::<GCodeDispatch>(GCODE_OBJECT) {
+            gcode
+                .register_command(
+                    "M105",
+                    sync(move |gcmd: &GcodeCommand| {
+                        let msg = match (weak_heaters.upgrade(), weak_printer.upgrade()) {
+                            (Some(heaters), Some(printer)) => {
+                                heaters._get_temp(printer.eventtime())
+                            }
+                            _ => "T:0".to_string(),
+                        };
+                        if !gcmd.ack(Some(&msg)) {
+                            gcmd.respond_raw(&msg);
+                        }
+                        Ok(())
+                    }),
+                    None,
+                    true,
+                )
+                .expect("M105 is a valid, unique command name");
+        }
     }
 
     /// The heater registered under `name` (`PrinterHeaters.lookup_heater`).

@@ -2095,7 +2095,7 @@ fn build_temperature_probe(
         options.inv_smooth_time,
         Arc::downgrade(printer),
     ));
-    heaters.register_sensor(config)?;
+    heaters.register_sensor(config, None, None)?;
     let probe = Arc::new(TemperatureProbe {
         name,
         printer: Arc::downgrade(printer),

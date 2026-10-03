@@ -109,6 +109,17 @@ impl Stepper {
         &mut self.kinematics
     }
 
+    /// Install a new solver for this stepper, returning the one it had
+    /// (`MCU_stepper.set_stepper_kinematics`).
+    ///
+    /// The force-move queue swaps in a cartesian, single-axis solver so a move
+    /// can drive the motor in its own coordinates, then puts the old one back
+    /// — the old solver keeps its own `commanded_pos`/`last_flush_time` state,
+    /// so swapping it out and back does not disturb it.
+    pub fn set_stepper_kinematics(&mut self, kinematics: StepKinematics) -> StepKinematics {
+        std::mem::replace(&mut self.kinematics, kinematics)
+    }
+
     /// The stepper position the solver has reached.
     pub fn commanded_position(&self) -> f64 {
         self.kinematics.commanded_pos()

@@ -9,6 +9,7 @@
 use super::stepcompress::{StepCommand, StepCompressError};
 use super::stepper::Stepper;
 use super::trapq::Trapq;
+use crate::core::klippy::mathutil::Xyz;
 
 /// The trapqs and the steppers reading them.
 ///
@@ -73,6 +74,38 @@ impl MotionQueuing {
     /// A trapq by id, to append to or move the current position in it.
     pub fn trapq_mut(&mut self, id: usize) -> &mut Trapq {
         &mut self.trapqs[id]
+    }
+
+    /// Append one move's trapezoid to the trapq `handle`
+    /// (`MotionQueuing.lookup_trapq_append` → `trapq_append`).
+    ///
+    /// A handle-based form of [`Trapq::append`], so a caller that owns a trapq
+    /// id (the force-move queue) appends without holding a `&mut Trapq` across
+    /// the toolhead borrow it also needs.
+    #[allow(clippy::too_many_arguments)]
+    pub fn append(
+        &mut self,
+        trapq: usize,
+        print_time: f64,
+        accel_t: f64,
+        cruise_t: f64,
+        decel_t: f64,
+        start_pos: Xyz,
+        axes_r: Xyz,
+        start_v: f64,
+        cruise_v: f64,
+        accel: f64,
+    ) {
+        self.trapqs[trapq].append(
+            print_time, accel_t, cruise_t, decel_t, start_pos, axes_r, start_v, cruise_v, accel,
+        );
+    }
+
+    /// Expire every queued move of the trapq `handle` into its history
+    /// (`MotionQueuing.wipe_trapq`, `motion_queuing.py:68-70`: force to the
+    /// history list with no expiry).
+    pub fn wipe_trapq(&mut self, trapq: usize) {
+        self.trapqs[trapq].finalize_moves(f64::MAX, 0.0);
     }
 
     /// Drop finished segments from every live queue into its history
@@ -144,6 +177,40 @@ impl MotionQueuing {
             }
         }
         Ok(out)
+    }
+
+    /// Generate steps for one stepper only, up to `flush_time`.
+    ///
+    /// The force-move queue uses this: it moves a motor on its own trapq and
+    /// must generate **only that motor**, to the move's end rather than the
+    /// background horizon ([`Self::generate`]). Generating every stepper to a
+    /// content end ahead of the horizon would advance their solvers past it,
+    /// and the next horizon-bounded pass would rewind them onto moves it had
+    /// already generated.
+    ///
+    /// Returns the commands to send; an unknown name, or a detached stepper,
+    /// produces none.
+    ///
+    /// # Errors
+    /// An internal [`StepCompressError`] from the stepper's compressor.
+    pub fn generate_stepper(
+        &mut self,
+        name: &str,
+        flush_time: f64,
+    ) -> Result<Vec<StepCommand>, StepCompressError> {
+        let Self {
+            trapqs, steppers, ..
+        } = self;
+        for stepper in steppers.iter_mut() {
+            if stepper.name() != name {
+                continue;
+            }
+            let Some(trapq_id) = stepper.trapq_id() else {
+                return Ok(Vec::new());
+            };
+            return stepper.generate(&trapqs[trapq_id], flush_time);
+        }
+        Ok(Vec::new())
     }
 }
 

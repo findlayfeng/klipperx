@@ -1189,10 +1189,10 @@ impl TemperatureProbe {
         }
         let cur_temp = lock_state(&self.state).measurement.0;
         // `TARGET` and `STEP` (`:361-362`): both parse through the shared
-        // `get`, whose missing/parse wording is upstream's. The `above` bound
-        // is checked here because this port's `get` prints it as "must have
-        // above of …" (`gcode.rs`) where upstream prints "must be above …" —
-        // and the error text is upstream's.
+        // `get`, whose missing/parse wording is upstream's. The `above` bound is
+        // checked by hand so the limit renders the way Python's `%s` would
+        // (`0.0`): the shared `get` phrases the bound as upstream does, but
+        // formats the f64 Rust-style (`0`)— see `gcode.rs` `range_error`.
         let target_temp = gcmd.get(
             "TARGET",
             None,

@@ -394,6 +394,9 @@ mod tests {
                 "stepper_enable",
                 "multi_pin",
                 "sx1509",
+                // The force-move helper, before every section that builds a
+                // stepper (`force_move` is created on first stepper load).
+                "force_move",
                 "adc_scaled",
                 "extruder",
                 "extruder_stepper",
@@ -768,6 +771,11 @@ mod tests {
                 "error_mcu",
                 "mcu",
                 "stepper_enable",
+                // `[stepper_x]`'s build registers with the force-move helper
+                // (`stepper.py:282-285`), which creates the object on first use
+                // when the config named no `[force_move]` section, so it lands
+                // just before the stepper that asked for it.
+                "force_move",
                 "stepper_x",
                 "stepper_y",
                 "stepper_z",

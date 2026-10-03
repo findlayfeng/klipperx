@@ -1188,7 +1188,7 @@ impl TemperatureProbe {
         )?;
         if target_temp <= cur_temp {
             return Err(CommandError::new(format!(
-                "Error on '{}': TARGET must be above {}",
+                "Error on '{}': TARGET must be above {:?}",
                 gcmd.commandline(),
                 cur_temp
             )));
@@ -2867,7 +2867,7 @@ gcode_id: T0
             .expect_err("at the current temperature");
         assert_eq!(
             err.to_string(),
-            "Error on 'TEMPERATURE_PROBE_CALIBRATE TARGET=0 STEP=2': TARGET must be above 0"
+            "Error on 'TEMPERATURE_PROBE_CALIBRATE TARGET=0 STEP=2': TARGET must be above 0.0"
         );
 
         let gcmd = m.command(

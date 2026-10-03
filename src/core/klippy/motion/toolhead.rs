@@ -260,6 +260,46 @@ impl ToolHead {
         self.motion_queuing.register_flush_callback(callback);
     }
 
+    /// `ToolHead.set_max_velocities` (`klippy/toolhead.py:538-550`): override
+    /// the named velocity/acceleration limits, rebuild the derived junction
+    /// geometry, and return the four current values.
+    ///
+    /// The next [`Self::move_to`] profiles from whatever this leaves in
+    /// `self.limits`, so the caller that keeps the matching copy
+    /// (`SET_VELOCITY_LIMIT`) calls this to keep the two in step.
+    ///
+    /// `square_corner_velocity` and `min_cruise_ratio` are **full** values:
+    /// this layer keeps only their derived geometry, so the caller — which
+    /// stores the ratio itself — resolves them and passes them in. The
+    /// velocity and acceleration are optional overrides against the limits
+    /// already stored here, as upstream's `None` arguments are.
+    pub fn set_max_velocities(
+        &mut self,
+        max_velocity: Option<f64>,
+        max_accel: Option<f64>,
+        square_corner_velocity: f64,
+        min_cruise_ratio: f64,
+    ) -> (f64, f64, f64, f64) {
+        if let Some(velocity) = max_velocity {
+            self.limits.max_velocity = velocity;
+        }
+        if let Some(accel) = max_accel {
+            self.limits.max_accel = accel;
+        }
+        self.limits = MoveLimits::from_velocity_limits(
+            self.limits.max_velocity,
+            self.limits.max_accel,
+            square_corner_velocity,
+            min_cruise_ratio,
+        );
+        (
+            self.limits.max_velocity,
+            self.limits.max_accel,
+            square_corner_velocity,
+            min_cruise_ratio,
+        )
+    }
+
     /// Queue a move (`ToolHead.move`, `klippy/toolhead.py:395-409`).
     ///
     /// # Errors

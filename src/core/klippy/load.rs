@@ -440,6 +440,7 @@ mod tests {
                 "quad_gantry_level",
                 "resonance_tester",
                 "respond",
+                "save_variables",
                 "screws_tilt_adjust",
                 "sdcard_loop",
                 "smart_effector",

@@ -73,6 +73,7 @@ use crate::core::klippy::error::KlippyError;
 use crate::core::klippy::event::KlippyEvent;
 use crate::core::klippy::extras::carriage::{self, KinematicStepper};
 use crate::core::klippy::extras::extruder::PrinterExtruder;
+use crate::core::klippy::extras::force_move::calc_move_time;
 use crate::core::klippy::extras::idex_modes;
 use crate::core::klippy::extras::query_endstops::{QueryEndstops, QUERY_ENDSTOPS_OBJECT};
 use crate::core::klippy::extras::stepper::{PrinterStepper, Rail};
@@ -80,7 +81,7 @@ use crate::core::klippy::gcode::{
     parse_float, sync, CommandError, CommandHandler, GCodeDispatch, GcodeCommand, GCODE_OBJECT,
 };
 use crate::core::klippy::load::section;
-use crate::core::klippy::mathutil::{Coord, X_AXIS, Y_AXIS, Z_AXIS};
+use crate::core::klippy::mathutil::{Coord, Xyz, X_AXIS, Y_AXIS, Z_AXIS};
 use crate::core::klippy::mcu::{
     Completion, McuEndstop, McuError, McuObject, McuStepper, StepBatchClocks, TriggerDispatch,
 };
@@ -95,7 +96,7 @@ use crate::core::klippy::motion::extra::ExtraAxis;
 use crate::core::klippy::motion::generic_cartesian::GenericCartesianKinematics;
 use crate::core::klippy::motion::itersolve::{
     cartesian_active_flags, cartesian_position_fn, corexy_active_flags, corexy_position_fn,
-    corexz_active_flags, corexz_position_fn, Axis, AxisFlags, PositionFn,
+    corexz_active_flags, corexz_position_fn, Axis, AxisFlags, PositionFn, StepKinematics,
 };
 use crate::core::klippy::motion::kinematics::{
     home_move, polar_active_flags, polar_angle_normalize, polar_angle_solver, polar_angle_unwrap,
@@ -485,6 +486,11 @@ struct Connected {
     mcu_steppers: HashMap<String, Arc<McuStepper>>,
     /// The print time the solvers have generated up to.
     last_step_gen_time: f64,
+    /// The trapq the force-move queue swaps a stepper onto while it moves it
+    /// outside the planner, allocated on first use (upstream `ForceMove`'s own
+    /// `self.trapq`, `force_move.py:33`). Kept beside the toolhead because the
+    /// id only means anything for this connection's [`MotionQueuing`].
+    force_move_trapq: Option<usize>,
 }
 
 /// The step commands to send, paired with the stepper that produced them and
@@ -1364,6 +1370,7 @@ impl PrinterObject for ToolHeadObject {
                     toolhead,
                     mcu_steppers,
                     last_step_gen_time: 0.0,
+                    force_move_trapq: None,
                 });
             }
 
@@ -1967,6 +1974,49 @@ impl ToolHeadObject {
         Ok(())
     }
 
+    /// Drive one stepper `dist` millimetres in its own coordinates, outside the
+    /// planner and the kinematics (upstream `ForceMove.manual_move`,
+    /// `force_move.py:75-91`): the `FORCE_MOVE` / `STEPPER_BUZZ` move.
+    ///
+    /// The connected state is taken out of the shared slot for the run (as
+    /// [`ToolHeadObject::probing_move`] and [`ToolHeadObject::flush_step_generation`]
+    /// do), so the background flush task stands back and only this call
+    /// generates and sends. It is put back on every exit, success or failure.
+    ///
+    /// The move swaps in a cartesian single-axis solver and a force-move-only
+    /// trapq, appends the `calc_move_time` trapezoid, dwells its duration,
+    /// generates and sends the steps, then puts the stepper's original solver
+    /// and trapq back and wipes the force-move trapq. The toolhead's
+    /// `commanded_pos` and the stepper's own solver position are deliberately
+    /// **not** touched: the move invalidates the kinematics (a
+    /// `SET_KINEMATIC_POSITION` re-syncs it), it does not move the planner.
+    ///
+    /// A `stepper_name` the toolhead's motion queue does not hold — a stepper
+    /// `force_move` knows but those modules have not wired (the manual stepper,
+    /// the IDEX second carriage) — carries the move on the timeline only; see
+    /// [`manual_move`] for why.
+    ///
+    /// # Errors
+    /// "Printer is not ready" before connect, or a step-generation/send
+    /// failure.
+    pub async fn manual_move(
+        &self,
+        stepper_name: &str,
+        dist: f64,
+        speed: f64,
+        accel: f64,
+    ) -> Result<(), CommandError> {
+        let mut connected = {
+            let mut guard = self.lock();
+            guard
+                .take()
+                .ok_or_else(|| CommandError::new("Printer is not ready"))?
+        };
+        let result = manual_move(&mut connected, stepper_name, dist, speed, accel).await;
+        *self.lock() = Some(connected);
+        result
+    }
+
     /// Add a non-kinematic axis (`ToolHead.add_extra_axis`) and tell the
     /// machine (`toolhead:update_extra_axes`).
     ///
@@ -2131,6 +2181,136 @@ async fn flush_step_generation(state: &Arc<Mutex<Option<Connected>>>) -> Result<
     // Restore the state whether the flush succeeded or failed.
     *state.lock().unwrap_or_else(|poison| poison.into_inner()) = Some(connected);
     result
+}
+
+/// Upstream `ForceMove.manual_move` (`force_move.py:75-91`): drive one motion
+/// stepper in its own coordinates, bypassing the planner and the kinematics.
+///
+/// The timing is upstream's, in order: flush the pending steps, swap in the
+/// force-move solver and trapq (remembering the old pair), zero the solver's
+/// position, append the `calc_move_time` trapezoid at the planner's last move
+/// time, dwell the trapq's duration, generate and send those steps (the target
+/// stepper alone — see [`MotionQueuing::generate_stepper`]), then restore the
+/// solver and trapq and wipe the force-move queue.
+///
+/// `note_mcu_movequeue_activity` has no equivalent here — this host's flush is
+/// driven by a 10 ms tick (`run_flush_loop`), not by a queue-length estimate,
+/// so there is nothing to note. See [`force_move`](crate::core::klippy::extras::force_move).
+///
+/// # Errors
+/// A step-generation/send failure.
+async fn manual_move(
+    connected: &mut Connected,
+    stepper_name: &str,
+    dist: f64,
+    speed: f64,
+    accel: f64,
+) -> Result<(), CommandError> {
+    // Upstream's first `toolhead.flush_step_generation()`: drain what is
+    // queued before the solver is swapped, so the two timelines do not
+    // interleave.
+    let backlog = connected
+        .generate()
+        .map_err(|err| CommandError::new(err.to_string()))?;
+    for (stepper, commands, clocks) in backlog {
+        stepper
+            .send_steps_async(&commands, clocks)
+            .await
+            .map_err(command_error)?;
+    }
+
+    // The force-move trapq (upstream's `self.trapq`), allocated once per
+    // connection.
+    let trapq = match connected.force_move_trapq {
+        Some(trapq) => trapq,
+        None => {
+            let trapq = connected.toolhead.allocate_trapq();
+            connected.force_move_trapq = Some(trapq);
+            trapq
+        }
+    };
+
+    // Swap in the cartesian single-axis solver and the force-move trapq,
+    // keeping the old pair to restore afterwards.
+    //
+    // A stepper `force_move` knows but the toolhead's motion queue does not
+    // (the manual stepper and the IDEX second carriage build a `PrinterStepper`
+    // without being added to it — a documented gap of those modules) has no
+    // motor this port can drive. Upstream would move it; here the move is
+    // carried on the timeline only, so `STEPPER_BUZZ` / `FORCE_MOVE` on such a
+    // name still answer instead of erroring.
+    let index = connected
+        .toolhead
+        .motion_queuing_mut()
+        .steppers()
+        .iter()
+        .position(|stepper| stepper.name() == stepper_name);
+    let (axis_r, accel_t, cruise_t, cruise_v) = calc_move_time(dist, speed, accel);
+    let move_time = accel_t + cruise_t + accel_t;
+    let Some(index) = index else {
+        connected.toolhead.get_last_move_time();
+        connected.toolhead.dwell(move_time);
+        return Ok(());
+    };
+    let (prev_kinematics, prev_trapq) = {
+        let stepper = &mut connected.toolhead.motion_queuing_mut().steppers_mut()[index];
+        let solver = StepKinematics::new(
+            stepper.step_dist(),
+            cartesian_position_fn(Axis::X),
+            cartesian_active_flags(Axis::X),
+        );
+        let prev_kinematics = stepper.set_stepper_kinematics(solver);
+        let prev_trapq = stepper.trapq_id();
+        stepper.set_trapq(trapq);
+        // `stepper.set_position((0., 0., 0.))`: the solver's own position, not
+        // the toolhead's.
+        stepper.set_position(Xyz::default());
+        (prev_kinematics, prev_trapq)
+    };
+
+    let print_time = connected.toolhead.get_last_move_time();
+    connected.toolhead.motion_queuing_mut().append(
+        trapq,
+        print_time,
+        accel_t,
+        cruise_t,
+        accel_t,
+        Xyz::default(),
+        Xyz::new(axis_r, 0.0, 0.0),
+        0.0,
+        cruise_v,
+        accel,
+    );
+    connected.toolhead.dwell(move_time);
+
+    // Upstream's second `toolhead.flush_step_generation()`: generate and send
+    // the force-move steps. It generates the **target stepper alone**, to the
+    // move's end rather than the background horizon, so the whole trapezoid
+    // leaves the host here without advancing any other stepper's solver past
+    // the horizon `Connected::generate` bounds generation to (see
+    // [`MotionQueuing::generate_stepper`]).
+    let end_time = print_time + move_time;
+    let commands = connected
+        .toolhead
+        .motion_queuing_mut()
+        .generate_stepper(stepper_name, end_time)
+        .map_err(|err| CommandError::new(err.to_string()))?;
+    if let Some(stepper) = connected.mcu_steppers.get(stepper_name) {
+        let clocks = step_batch_clocks(stepper, print_time, end_time);
+        stepper
+            .send_steps_async(&commands, clocks)
+            .await
+            .map_err(command_error)?;
+    }
+
+    // Restore the stepper and wipe the force-move queue.
+    {
+        let stepper = &mut connected.toolhead.motion_queuing_mut().steppers_mut()[index];
+        stepper.set_trapq(prev_trapq);
+        stepper.set_stepper_kinematics(prev_kinematics);
+    }
+    connected.toolhead.motion_queuing_mut().wipe_trapq(trapq);
+    Ok(())
 }
 
 impl Connected {
@@ -3967,6 +4147,7 @@ mod tests {
             toolhead,
             mcu_steppers: HashMap::new(),
             last_step_gen_time: 0.0,
+            force_move_trapq: None,
         })));
         let printer = Arc::new(Printer::new(
             crate::core::klippy::reactor::ManualReactor::shared(),
@@ -4532,6 +4713,7 @@ mod tests {
             toolhead,
             mcu_steppers: HashMap::new(),
             last_step_gen_time: 0.0,
+            force_move_trapq: None,
         };
         // Advance print time so the first move has a non-zero delta.
         connected.toolhead.dwell(0.01);
@@ -5379,6 +5561,143 @@ mod tests {
             evidence.homed_axes.contains('x'),
             "the stepper on the primary board tripped the endstop on the secondary: {:?}",
             evidence.homed_axes
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // `ToolHeadObject::manual_move` — the force-move move
+    // ------------------------------------------------------------------
+
+    /// A connected state over [`homed_toolhead`] for the force-move seam: its
+    /// steppers are cartesian at one millimetre per step, so a move of `dist`
+    /// millimetres is exactly `dist` steps.
+    fn force_move_connected() -> Connected {
+        let mut connected = Connected {
+            toolhead: homed_toolhead(),
+            mcu_steppers: HashMap::new(),
+            last_step_gen_time: 0.0,
+            force_move_trapq: None,
+        };
+        // Advance print time so the move starts at a non-zero time.
+        connected.toolhead.dwell(0.01);
+        connected
+    }
+
+    /// The force-move move drives the motor, then restores the stepper's own
+    /// solver and trapq and wipes the force-move queue — the planner is not
+    /// moved (`force_move.py:75-91`).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_manual_move_restores_the_solver_and_trapq_after_moving() {
+        let mut connected = force_move_connected();
+        let main_trapq = connected.toolhead.main_trapq();
+        let commanded = connected.toolhead.commanded_pos();
+        let (solver_step, trapq_before, steps_before) = {
+            let stepper = &mut connected.toolhead.motion_queuing_mut().steppers_mut()[0];
+            (
+                stepper.kinematics().commanded_pos(),
+                stepper.trapq_id(),
+                stepper.compressor_mut().last_position(),
+            )
+        };
+
+        manual_move(&mut connected, "stepper_x", 10.0, 100.0, 0.0)
+            .await
+            .expect("the move runs");
+
+        let (solver_after, trapq_after, steps_after) = {
+            let stepper = &mut connected.toolhead.motion_queuing_mut().steppers_mut()[0];
+            (
+                stepper.kinematics().commanded_pos(),
+                stepper.trapq_id(),
+                stepper.compressor_mut().last_position(),
+            )
+        };
+        assert_eq!(
+            trapq_before,
+            Some(main_trapq),
+            "the stepper starts on the main trapq"
+        );
+        assert_eq!(
+            trapq_after,
+            Some(main_trapq),
+            "the stepper's own trapq is put back"
+        );
+        assert_eq!(
+            solver_after, solver_step,
+            "the stepper's own solver position is untouched (commanded_pos unchanged)"
+        );
+        assert_eq!(
+            connected.toolhead.commanded_pos(),
+            commanded,
+            "the planner is not moved by a force move"
+        );
+        assert_eq!(
+            steps_after - steps_before,
+            10,
+            "the 10 mm move (1 mm/step) generated 10 steps"
+        );
+        // The force-move trapq is kept for reuse but emptied.
+        let force_trapq = connected.force_move_trapq.expect("a trapq was allocated");
+        assert!(
+            connected
+                .toolhead
+                .motion_queuing_mut()
+                .trapq_mut(force_trapq)
+                .moves()
+                .is_empty(),
+            "the force-move queue is wiped"
+        );
+        // Its duration is the trapezoid's: 10 mm at 100 mm/s, no accel. The
+        // planner also primes 0.25 s past the estimate (default 0) on the first
+        // move, so the horizon lands at 0.25 + 0.1.
+        assert!(
+            (connected.toolhead.print_time() - 0.35).abs() < 1e-9,
+            "print time {} does not match the move's 0.1 s after the 0.25 s prime",
+            connected.toolhead.print_time()
+        );
+    }
+
+    /// Two moves in a row: the shared state is taken and put back each time, so
+    /// the second (and a third) run does not see a locked-out toolhead.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_consecutive_manual_moves_keep_the_shared_state_usable() {
+        let state = Arc::new(Mutex::new(Some(force_move_connected())));
+        let (_printer, object) = object_over(Arc::clone(&state));
+
+        object
+            .manual_move("stepper_x", 5.0, 50.0, 0.0)
+            .await
+            .expect("the first move runs");
+        object
+            .manual_move("stepper_x", -5.0, 50.0, 0.0)
+            .await
+            .expect("the second move runs");
+        object
+            .manual_move("stepper_x", 1.0, 100.0, 0.0)
+            .await
+            .expect("the state was restored, so a third move still runs");
+    }
+
+    /// A name the motion queue does not hold carries the move on the timeline
+    /// only, so `STEPPER_BUZZ` / `FORCE_MOVE` answer for a stepper those
+    /// modules have not wired (the manual stepper, the IDEX second carriage)
+    /// instead of erroring. The planner's position is still untouched.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_manual_move_carries_an_unwired_stepper_on_the_timeline_only() {
+        let mut connected = force_move_connected();
+        let commanded = connected.toolhead.commanded_pos();
+
+        manual_move(&mut connected, "not_on_the_queue", 10.0, 100.0, 0.0)
+            .await
+            .expect("the move is accepted");
+
+        assert_eq!(connected.toolhead.commanded_pos(), commanded);
+        // The move's 0.1 s still lands on the timeline, after the first move's
+        // 0.25 s prime (print time starts at the fixture's 0.01 s dwell).
+        assert!(
+            (connected.toolhead.print_time() - 0.35).abs() < 1e-9,
+            "print time landed at {}",
+            connected.toolhead.print_time()
         );
     }
 }

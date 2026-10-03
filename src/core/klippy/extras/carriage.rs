@@ -85,7 +85,7 @@ section!(
 /// kinematics that loads later. Not queryable: upstream has no such object.
 pub const CARRIAGE_MODEL_OBJECT: &str = "carriage_model";
 
-/// Upstream's `VALID_AXES` (`generic_cartesian.py:11`).
+/// Upstream's `VALID_AXES` (`generic_cartesian.py:12`).
 const VALID_AXES: [&str; 3] = ["x", "y", "z"];
 
 /// Which section a [`Carriage`] came from.
@@ -110,7 +110,7 @@ pub struct Carriage {
     /// The section's short name (`carriage_x`) — upstream's
     /// `rail.get_name(short=True)`, the name `SET_DUAL_CARRIAGE CARRIAGE=`
     /// takes and a `carriages` expression references
-    /// (`stepper.py:388-393` drops the `carriage ` prefix).
+    /// (`stepper.py:388-394` drops the `carriage ` prefix).
     name: String,
     kind: CarriageKind,
     axis: Axis,
@@ -206,7 +206,7 @@ impl PrinterObject for Carriage {
 }
 
 /// One `[stepper <name>]`: a motor driving a linear combination of carriages
-/// (`KinematicStepper`, `kinematics/kinematic_stepper.py:44-85`).
+/// (`KinematicStepper`, `kinematics/kinematic_stepper.py:46-92`).
 pub struct KinematicStepper {
     /// The section identifier (`stepper a`) — upstream's
     /// `PrinterStepper.get_name()`, which the toolhead's stepper map is keyed by.
@@ -255,7 +255,7 @@ impl PrinterObject for KinematicStepper {
     /// The motor connects itself: upstream's `stepper.PrinterStepper(config)`
     /// registers its own `klippy:connect` handler, and this section's object —
     /// the only one the loader walks — is the wrapper around it
-    /// (`kinematics/kinematic_stepper.py:44-48`). Without this the host solver
+    /// (`kinematics/kinematic_stepper.py:46-62`). Without this the host solver
     /// never exists and the toolhead refuses to bring the machine up.
     fn connect<'a>(&'a self) -> ConnectFuture<'a> {
         self.stepper.connect()
@@ -407,7 +407,7 @@ fn read_rail(
 
 /// The carriage axis: `axis` is required unless the carriage is *named* for the
 /// axis (`[carriage x]`), which is upstream's `MainCarriage.__init__`
-/// (`generic_cartesian.py:16-21`).
+/// (`generic_cartesian.py:15-23`).
 fn read_axis(config: &ConfigWrapper, name: &str) -> Result<Axis, ConfigError> {
     let axis = if VALID_AXES.contains(&name) {
         config.get_choice("axis", &VALID_AXES, Some(name))?
@@ -467,7 +467,7 @@ pub fn load_main_carriage(
 /// name of the primary carriage it shares its axis with.
 ///
 /// `primary_carriage` is optional (`DualCarriage.__init__`,
-/// `generic_cartesian.py:60-71`): a `[dual_carriage <name>]` without one is
+/// `generic_cartesian.py:57-69`): a `[dual_carriage <name>]` without one is
 /// itself the *primary* carriage of its own `axis` — the axis is then
 /// required, and the carriage has no `safe_distance` — while one that names a
 /// primary rides that primary's axis and may carry a `safe_distance` (whose
@@ -496,7 +496,7 @@ pub fn load_dual_carriage(
             // primary precedes the carriage it is named by (config order). One
             // that never loads leaves the placeholder, which `build` rejects
             // with upstream's wording (`resolve_primary_carriage`,
-            // `generic_cartesian.py:70-101`).
+            // `generic_cartesian.py:70-95`).
             let axis = model(printer)
                 .carriages()
                 .iter()
@@ -658,7 +658,7 @@ fn register_with_carriage_endstop(
 }
 
 /// Parse a `carriages` expression (`parse_carriages_string`,
-/// `kinematics/kinematic_stepper.py:10-42`).
+/// `kinematics/kinematic_stepper.py:10-44`).
 ///
 /// Terms are separated by `+`/`-` and may carry a `*coefficient`; each names a
 /// carriage, and a carriage's axis may appear only once. Returns the coefficient
@@ -985,7 +985,7 @@ pub fn build(
     // it as one (`[dc for dc in self.dc_carriages if
     // dc.get_primary_carriage() is None]`, `generic_cartesian.py:131-133`).
     // Each carriage carries its `position_endstop`, where the frames follow it
-    // once the axis homes (`idex_modes.py:116-131`).
+    // once the axis homes (`idex_modes.py:116-132`).
     if !duals.is_empty() {
         let dc_axes: Vec<Axis> = duals.iter().map(|dual| dual.axis()).collect();
         let as_generic = |carriage: &Arc<Carriage>| idex_modes::GenericCarriage {
@@ -1405,7 +1405,7 @@ mod tests {
 
     /// Two dual carriages on one primary carriage are refused, with upstream's
     /// wording (`if self.primary_carriage.get_dual_carriage()`,
-    /// `generic_cartesian.py:90-94`).
+    /// `generic_cartesian.py:86-90`).
     #[test]
     fn two_dual_carriages_on_one_primary_are_refused() {
         let carriages = format!(

@@ -73,7 +73,7 @@ section!("pca9632", order = 40, prefix = load_pca9632);
 pub const DISPLAY_TEMPLATES_OBJECT: &str = "display_template";
 
 /// Firmware limit on one neopixel chain's colour channels
-/// (`neopixel.py:24`, `MAX_MCU_SIZE`).
+/// (`neopixel.py:14`, `MAX_MCU_SIZE`).
 const NEOPIXEL_MAX_CHANNELS: usize = 500;
 
 // ===========================================================================
@@ -134,7 +134,7 @@ impl LEDHelper {
         )?;
 
         // Upstream reaches the registry through `output_pin.lookup_template_eval`
-        // (`led.py:26`); this port has no evaluator yet, so the LED asks for the
+        // (`led.py:24`); this port has no evaluator yet, so the LED asks for the
         // registry directly — which is what creates it when a config has LEDs
         // but no `[display_template]` section of its own.
         lookup_display_templates(printer)?;
@@ -153,7 +153,7 @@ impl LEDHelper {
 }
 
 impl PrinterObject for LEDHelper {
-    /// The colour data, as upstream's `LEDHelper.get_status` (`led.py:37-38`).
+    /// The colour data, as upstream's `LEDHelper.get_status` (`led.py:36-37`).
     fn get_status(&self, _eventtime: f64) -> Value {
         let state = self
             .state
@@ -182,7 +182,7 @@ struct DisplayTemplate {
 /// The `display_template` printer object: every template by section name.
 ///
 /// Upstream creates exactly one of these, and only when a consumer asks
-/// (`display/display.py:168-173`); [`lookup_display_templates`] is that lookup
+/// (`display/display.py:168-174`); [`lookup_display_templates`] is that lookup
 /// here. It is registered but not client-visible: upstream's
 /// `PrinterDisplayTemplate` defines no `get_status`, so it never appears in
 /// `objects/list`.
@@ -444,7 +444,7 @@ pub fn load_neopixel(
 }
 
 /// Whether `order` is a permutation of `RGB` or `RGBW`
-/// (`neopixel.py:39-40`: `sorted(co) in (sorted("RGB"), sorted("RGBW"))`).
+/// (`neopixel.py:36-37`: `sorted(co) in (sorted("RGB"), sorted("RGBW"))`).
 fn is_color_order(order: &str) -> bool {
     let mut chars: Vec<char> = order.chars().collect();
     chars.sort_unstable();
@@ -462,7 +462,7 @@ fn is_color_order(order: &str) -> bool {
 /// Upstream's `load_config_prefix` for `[dotstar <name>]` (`dotstar.py:55`).
 ///
 /// Reads `data_pin` and `clock_pin` (validating and reserving both), rejects
-/// pins on different MCUs (`dotstar.py:20-21`), then `chain_count` and the
+/// pins on different MCUs (`dotstar.py:18-19`), then `chain_count` and the
 /// shared initial colour. Upstream builds a software SPI here; that resource
 /// belongs to the transmit path this port does not have yet (module docs), so
 /// only the pins are set up.
@@ -514,8 +514,8 @@ pub fn load_pca9533(
 
 /// Upstream's `load_config_prefix` for `[pca9632 <name>]` (`pca9632.py:69`):
 /// the I²C bus options, then `color_order` — which must be a permutation of
-/// `RGBW` (`pca9632.py:34-36`) — then the shared initial colour
-/// (`pca9632.py:36-39`).
+/// `RGBW` (`pca9632.py:29-31`) — then the shared initial colour
+/// (`pca9632.py:34-35`).
 pub fn load_pca9632(
     config: &ConfigWrapper,
     printer: &Arc<Printer>,

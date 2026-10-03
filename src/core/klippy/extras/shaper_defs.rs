@@ -38,10 +38,10 @@ use std::fmt;
 use crate::core::klippy::mathutil::{mat_mat_mul, mat_transp, pseudo_inverse};
 
 /// The vibration reduction the default `ei` `v_tol` is picked for
-/// (`shaper_defs.py:8`).
+/// (`shaper_defs.py:9`).
 pub const SHAPER_VIBRATION_REDUCTION: f64 = 20.;
 /// The damping ratio a shaper uses when the config names none
-/// (`shaper_defs.py:9`).
+/// (`shaper_defs.py:10`).
 pub const DEFAULT_DAMPING_RATIO: f64 = 0.1;
 
 /// A shaper could not be built (`shaper_defs.ShaperError`): one of the checks
@@ -76,7 +76,7 @@ impl std::error::Error for ShaperError {}
 
 /// The error upstream's `init_shaper` raises through a supplied `error`
 /// callable: the shaper's own complaint with upstream's "Failed to initialize
-/// shaper: %s" prefix (`shaper_defs.py:188-189`).
+/// shaper: %s" prefix (`shaper_defs.py:193-196`).
 pub fn init_failed(error: ShaperError) -> ShaperError {
     ShaperError::new(format!("Failed to initialize shaper: {}", error.message()))
 }
@@ -107,7 +107,7 @@ pub enum ShaperInit {
 }
 
 /// One shaper's definition
-/// (`shaper_defs.InputShaperCfg`, `shaper_defs.py:11-13`).
+/// (`shaper_defs.InputShaperCfg`, `shaper_defs.py:12-14`).
 #[derive(Debug, Clone, Copy)]
 pub struct InputShaperCfg {
     /// The name a `shaper_type` option or a `SET_INPUT_SHAPER` argument uses.
@@ -166,7 +166,7 @@ pub fn get_none_shaper() -> (Vec<f64>, Vec<f64>) {
     (vec![], vec![])
 }
 
-/// The two-impulse ZV shaper (`shaper_defs.py:22-29`).
+/// The two-impulse ZV shaper (`shaper_defs.py:22-28`).
 pub fn get_zv_shaper(shaper_freq: f64, damping_ratio: f64) -> (Vec<f64>, Vec<f64>) {
     let df = (1. - damping_ratio * damping_ratio).sqrt();
     let k = (-damping_ratio * PI / df).exp();
@@ -174,7 +174,7 @@ pub fn get_zv_shaper(shaper_freq: f64, damping_ratio: f64) -> (Vec<f64>, Vec<f64
     (vec![1., k], vec![0., 0.5 * t_d])
 }
 
-/// The three-impulse ZVD shaper (`shaper_defs.py:31-38`).
+/// The three-impulse ZVD shaper (`shaper_defs.py:30-36`).
 pub fn get_zvd_shaper(shaper_freq: f64, damping_ratio: f64) -> (Vec<f64>, Vec<f64>) {
     let df = (1. - damping_ratio * damping_ratio).sqrt();
     let k = (-damping_ratio * PI / df).exp();
@@ -183,7 +183,7 @@ pub fn get_zvd_shaper(shaper_freq: f64, damping_ratio: f64) -> (Vec<f64>, Vec<f6
 }
 
 /// The impulses of the MZV family for an `n` and a duration `t`
-/// (`get_mzv_coeffs`, `shaper_defs.py:40-68`).
+/// (`get_mzv_coeffs`, `shaper_defs.py:38-64`).
 ///
 /// The amplitudes come out of the linear system the shaper's zeros imply: one
 /// row for `sum(A) = 1`, then a cosine and a sine row per additional impulse.
@@ -239,7 +239,7 @@ pub fn get_mzv_coeffs(n: i64, t: f64) -> Result<(Vec<f64>, Vec<f64>), ShaperErro
     Ok((a, times))
 }
 
-/// The MZV shaper (`shaper_defs.py:70-87`).
+/// The MZV shaper (`shaper_defs.py:66-83`).
 ///
 /// `n`, `t` and `tau` are the arguments a `mzv(...)` name may carry, with
 /// upstream's defaults `3`, `0.` and `0.` applied by [`ShaperInit::call`].
@@ -273,7 +273,7 @@ pub fn get_mzv_shaper(
     Ok((a, times))
 }
 
-/// The EI shaper (`get_ei_shaper`, `shaper_defs.py:89-110`).
+/// The EI shaper (`get_ei_shaper`, `shaper_defs.py:85-103`).
 ///
 /// `v_tol` is the residual vibration the shaper is fitted to; a `ei(...)` name
 /// may carry it.
@@ -298,7 +298,7 @@ pub fn get_ei_shaper(shaper_freq: f64, damping_ratio: f64, v_tol: f64) -> (Vec<f
 }
 
 /// Evaluate a damped shaper from its expansion in the damping ratio
-/// (`_get_shaper_from_expansion_coeffs`, `shaper_defs.py:112-123`): one row per
+/// (`_get_shaper_from_expansion_coeffs`, `shaper_defs.py:105-119`): one row per
 /// impulse, most-significant coefficient first, Horner over `damping_ratio`.
 ///
 /// Both shapers that use it carry four coefficients per impulse.
@@ -325,7 +325,7 @@ fn get_shaper_from_expansion_coeffs(
 }
 
 /// The expansion coefficients of the 2-hump EI shaper
-/// (`shaper_defs.py:125-133`).
+/// (`shaper_defs.py:122-125`).
 const TWO_HUMP_EI_T: [[f64; 4]; 4] = [
     [0., 0., 0., 0.],
     [0.49890, 0.16270, -0.54262, 6.16180],
@@ -333,7 +333,7 @@ const TWO_HUMP_EI_T: [[f64; 4]; 4] = [
     [1.49920, -0.09297, -0.28338, 1.85710],
 ];
 /// The amplitude expansion coefficients of the 2-hump EI shaper
-/// (`shaper_defs.py:128-132`).
+/// (`shaper_defs.py:126-129`).
 const TWO_HUMP_EI_A: [[f64; 4]; 4] = [
     [0.16054, 0.76699, 2.26560, -1.22750],
     [0.33911, 0.45081, -2.58080, 1.73650],
@@ -342,7 +342,7 @@ const TWO_HUMP_EI_A: [[f64; 4]; 4] = [
 ];
 
 /// The expansion coefficients of the 3-hump EI shaper
-/// (`shaper_defs.py:135-141`).
+/// (`shaper_defs.py:133-137`).
 const THREE_HUMP_EI_T: [[f64; 4]; 5] = [
     [0., 0., 0., 0.],
     [0.49974, 0.23834, 0.44559, 12.4720],
@@ -351,7 +351,7 @@ const THREE_HUMP_EI_T: [[f64; 4]; 5] = [
     [1.99960, -0.28231, 0.61536, 5.40450],
 ];
 /// The amplitude expansion coefficients of the 3-hump EI shaper
-/// (`shaper_defs.py:136-140`).
+/// (`shaper_defs.py:138-142`).
 const THREE_HUMP_EI_A: [[f64; 4]; 5] = [
     [0.11275, 0.76632, 3.29160, -1.44380],
     [0.23698, 0.61164, -2.57850, 4.85220],
@@ -360,12 +360,12 @@ const THREE_HUMP_EI_A: [[f64; 4]; 5] = [
     [0.11244, -0.45439, 0.96382, -1.46000],
 ];
 
-/// The 2-hump EI shaper (`get_2hump_ei_shaper`, `shaper_defs.py:133`).
+/// The 2-hump EI shaper (`get_2hump_ei_shaper`, `shaper_defs.py:121-130`).
 pub fn get_2hump_ei_shaper(shaper_freq: f64, damping_ratio: f64) -> (Vec<f64>, Vec<f64>) {
     get_shaper_from_expansion_coeffs(shaper_freq, damping_ratio, &TWO_HUMP_EI_T, &TWO_HUMP_EI_A)
 }
 
-/// The 3-hump EI shaper (`get_3hump_ei_shaper`, `shaper_defs.py:141`).
+/// The 3-hump EI shaper (`get_3hump_ei_shaper`, `shaper_defs.py:132-143`).
 pub fn get_3hump_ei_shaper(shaper_freq: f64, damping_ratio: f64) -> (Vec<f64>, Vec<f64>) {
     get_shaper_from_expansion_coeffs(
         shaper_freq,
@@ -416,7 +416,7 @@ fn is_word_char(c: char) -> bool {
 
 /// One parsed argument value, typed as upstream's `parse_val` types it: an
 /// integer when the text has no `.`, a float when it has one
-/// (`shaper_defs.py:175-177`).
+/// (`shaper_defs.py:180-183`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum ShaperArg {
     Int(i64),
@@ -493,7 +493,7 @@ fn parse_shaper_args(shaper: &str, text: &str) -> Result<ShaperArgs, ShaperError
     Ok(ShaperArgs { positional, named })
 }
 
-/// Upstream's `parse_val` (`shaper_defs.py:175-177`): a float when the text has
+/// Upstream's `parse_val` (`shaper_defs.py:180-183`): a float when the text has
 /// a `.`, an integer otherwise; `None` for a text that is neither.
 fn parse_val(text: &str) -> Option<ShaperArg> {
     if text.contains('.') {
@@ -503,7 +503,7 @@ fn parse_val(text: &str) -> Option<ShaperArg> {
     }
 }
 
-/// The `(?:(\w+)\s*=\s*)?\s*([\d.]+)` scan of `shaper_defs.py:174`: every run
+/// The `(?:(\w+)\s*=\s*)?\s*([\d.]+)` scan of `shaper_defs.py:179`: every run
 /// of digits and dots, paired with the `name=` that directly precedes it, if
 /// any. Text that matches neither part of the pattern is skipped, as the
 /// regex's scan skips it.
@@ -543,7 +543,7 @@ fn name_before(text: &str, pos: usize) -> Option<&str> {
 impl ShaperInit {
     /// The parameters this shaper's coefficients function takes beyond the
     /// frequency and the damping ratio, with upstream's Python defaults
-    /// (`shaper_defs.py:70 get_mzv_shaper`, `:89 get_ei_shaper`). The other
+    /// (`shaper_defs.py:66 get_mzv_shaper`, `:85 get_ei_shaper`). The other
     /// shapers take nothing.
     fn params(self) -> &'static [(&'static str, ShaperArg)] {
         match self {
@@ -561,7 +561,7 @@ impl ShaperInit {
 
     /// Call the coefficients function the way upstream's
     /// `s.init_func(shaper_freq, damping_ratio, *args_l, **args_kv)` does
-    /// (`shaper_defs.py:184`).
+    /// (`shaper_defs.py:191-192`).
     fn call(
         self,
         name: &'static str,
@@ -601,7 +601,7 @@ impl ShaperInit {
 }
 
 /// A shaper's `(A, T)` for a frequency and a damping ratio
-/// (`shaper_defs.init_shaper`, `:170-190`).
+/// (`shaper_defs.init_shaper`, `:170-197`).
 ///
 /// `Ok(None)` when no shaper carries the name — upstream's fall-through, which
 /// only a direct call can reach (its callers look the name up in
@@ -800,7 +800,7 @@ mod tests {
     }
 
     /// The argument scanner reads the two forms a shaper name uses, and skips
-    /// text that matches neither (`shaper_defs.py:174`).
+    /// text that matches neither (`shaper_defs.py:179`).
     #[test]
     fn the_argument_scan_reads_positional_and_named_values() {
         assert_eq!(

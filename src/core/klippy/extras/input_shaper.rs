@@ -31,7 +31,7 @@
 //! for. `SET_INPUT_SHAPER` therefore changes the reported parameters only.
 //!
 //! The same layer is what upstream re-points when a dual carriage changes the
-//! kinematics (`_update_kinematics`, `input_shaper.py:148-165`, on
+//! kinematics (`_update_kinematics`, `input_shaper.py:153-168`, on
 //! `dual_carriage:update_kinematics`); `idex_modes` fires no such event here
 //! (`KlippyEvent::DualCarriageUpdateKinematics` is declared, but nothing sends
 //! it), so no handler is registered and there is nothing to re-point.
@@ -57,9 +57,9 @@ const DUAL_CARRIAGE_CONFIG_ERROR: &str = "Input shaper parameters cannot be \
 configured via [input_shaper] section with dual_carriage(s) enabled. Refer to \
 Klipper documentation on how to configure input shaper for dual_carriage(s).";
 
-/// One axis's parameters (`input_shaper.InputShaperParams`, `:12-64`).
+/// One axis's parameters (`input_shaper.InputShaperParams`, `:11-63`).
 struct InputShaperParams {
-    /// The lower-case axis letter, `x`, `y` or `z` (`input_shaper.py:14`).
+    /// The lower-case axis letter, `x`, `y` or `z` (`input_shaper.py:13`).
     axis: char,
     /// The shaper type, as the config or the command wrote it — a name's
     /// arguments included (`mzv(5,0.6)`).
@@ -116,7 +116,7 @@ impl InputShaperParams {
     }
 
     /// Update this axis from a `SET_INPUT_SHAPER` line
-    /// (`input_shaper.py:26-46`).
+    /// (`input_shaper.py:27-48`).
     ///
     /// # Errors
     /// [`CommandError`] for a shaper type no shaper carries, for a damping
@@ -166,7 +166,7 @@ on axis {axis}"
         Ok(())
     }
 
-    /// Upstream's `get_shaper` (`input_shaper.py:48-58`): the number of impulses
+    /// Upstream's `get_shaper` (`input_shaper.py:49-58`): the number of impulses
     /// of the shaper these parameters describe — `0` for an axis with no
     /// `shaper_freq`, more for every shaper otherwise.
     ///
@@ -196,7 +196,7 @@ on axis {axis}"
         Ok(a.len())
     }
 
-    /// Upstream's `get_status` (`input_shaper.py:59-64`): the report's fields,
+    /// Upstream's `get_status` (`input_shaper.py:59-63`): the report's fields,
     /// in upstream's order, with upstream's `%.3f` and `%.6f` formats.
     fn get_status(&self) -> [(&'static str, String); 3] {
         [
@@ -207,7 +207,7 @@ on axis {axis}"
     }
 }
 
-/// One axis's shaper (`input_shaper.AxisInputShaper`, `:60-104`).
+/// One axis's shaper (`input_shaper.AxisInputShaper`, `:65-103`).
 struct AxisInputShaper {
     /// The lower-case axis letter.
     axis: char,
@@ -220,7 +220,7 @@ struct AxisInputShaper {
 }
 
 impl AxisInputShaper {
-    /// Read one axis's shaper (`input_shaper.py:61-65`).
+    /// Read one axis's shaper (`input_shaper.py:66-70`).
     fn new(axis: char, config: &ConfigWrapper) -> Result<Self, ConfigError> {
         let params = InputShaperParams::new(axis, config)?;
         let n = params
@@ -233,12 +233,12 @@ impl AxisInputShaper {
         Ok(Self { axis, params, n })
     }
 
-    /// Upstream's `is_enabled` (`input_shaper.py:84-85`).
+    /// Upstream's `is_enabled` (`input_shaper.py:87-88`).
     fn is_enabled(&self) -> bool {
         self.n > 0
     }
 
-    /// Upstream's `AxisInputShaper.update` (`input_shaper.py:71-73`): the
+    /// Upstream's `AxisInputShaper.update` (`input_shaper.py:75-77`): the
     /// parameters, then the shaper they now describe.
     fn update(&mut self, gcmd: &GcodeCommand) -> Result<(), CommandError> {
         self.params.update(gcmd)?;
@@ -253,7 +253,7 @@ impl AxisInputShaper {
         Ok(())
     }
 
-    /// Upstream's `report` (`input_shaper.py:101-104`).
+    /// Upstream's `report` (`input_shaper.py:100-103`).
     fn report(&self, gcmd: &GcodeCommand) {
         let info = self
             .params
@@ -275,7 +275,7 @@ impl AxisInputShaper {
 /// ```
 pub struct InputShaper {
     printer: Weak<Printer>,
-    /// The three axes, in upstream's order (`input_shaper.py:107-109`). One
+    /// The three axes, in upstream's order (`input_shaper.py:112-114`). One
     /// lock, so an update of all three and the report that follows it see one
     /// set of parameters.
     shapers: Mutex<Vec<AxisInputShaper>>,
@@ -303,12 +303,12 @@ impl InputShaper {
             .unwrap_or_else(|poison| poison.into_inner())
     }
 
-    /// Upstream's `connect` (`input_shaper.py:124-135`).
+    /// Upstream's `connect` (`input_shaper.py:124-137`).
     ///
     /// With dual carriage(s), the shaping belongs to the `dual_carriage` module:
     /// a section that configures an axis is a config error. Upstream's check
     /// reads the parameters only, and only here — a `SET_INPUT_SHAPER` that
-    /// enables shaping at run time is allowed (`:199-205`).
+    /// enables shaping at run time is allowed (`:200-207`).
     fn connect(&self) {
         let Some(printer) = self.printer.upgrade() else {
             return;
@@ -322,7 +322,7 @@ impl InputShaper {
         self.update_input_shaping();
     }
 
-    /// Upstream's `_update_input_shaping` (`input_shaper.py:166-197`): put the
+    /// Upstream's `_update_input_shaping` (`input_shaper.py:169-190`): put the
     /// shapers' coefficients into the toolhead's steppers.
     ///
     /// This port has no shaper kinematics layer to put them into (module docs),
@@ -333,7 +333,7 @@ impl InputShaper {
         recompute_scan_windows();
     }
 
-    /// Upstream's `cmd_SET_INPUT_SHAPER` (`input_shaper.py:199-205`): apply the
+    /// Upstream's `cmd_SET_INPUT_SHAPER` (`input_shaper.py:200-207`): apply the
     /// line's parameters to the three axes, then report them — the x and y axes
     /// always, the z axis when it is shaped.
     fn cmd_set_input_shaper(&self, gcmd: &GcodeCommand) -> Result<(), CommandError> {
@@ -397,7 +397,7 @@ impl PrinterObject for InputShaper {
 /// The words `SET_INPUT_SHAPER` reads, in read order: `InputShaperParams::
 /// update` reads the plain `SHAPER_TYPE` first and then that axis's own
 /// spellings, and the handler runs it for x, y and z in turn
-/// (`input_shaper.py:26-46,199-205`).
+/// (`input_shaper.py:27-48,200-207`).
 const SET_INPUT_SHAPER_PARAMS: &[&str] = &[
     "SHAPER_TYPE",
     "SHAPER_TYPE_X",
@@ -412,7 +412,7 @@ const SET_INPUT_SHAPER_PARAMS: &[&str] = &[
 ];
 
 /// Upstream's `motion_queuing.check_step_generation_scan_windows()`, which
-/// `_update_input_shaping` ends with (`input_shaper.py:196`): the step
+/// `_update_input_shaping` ends with (`input_shaper.py:185-186`): the step
 /// generation windows a shaper widens have to be recomputed when it changes.
 ///
 /// This host has no such mechanism — `motion_queuing` is not ported and nothing
@@ -421,7 +421,7 @@ const SET_INPUT_SHAPER_PARAMS: &[&str] = &[
 /// seam stays visible and cannot be lost silently when the mechanism lands.
 fn recompute_scan_windows() {}
 
-/// The factory `section!` names (`input_shaper.py:207 def load_config`).
+/// The factory `section!` names (`input_shaper.py:209 def load_config`).
 pub fn load_config(
     config: &ConfigWrapper,
     printer: &Arc<Printer>,
@@ -658,7 +658,7 @@ mod tests {
     }
 
     /// With dual carriage(s), a `[input_shaper]` that configures an axis is a
-    /// config error (`input_shaper.py:124-135`).
+    /// config error (`input_shaper.py:124-137`).
     #[test]
     fn a_configured_axis_with_dual_carriage_is_a_config_error() {
         let printer = printer(&[("shaper_freq_x", "30")]);

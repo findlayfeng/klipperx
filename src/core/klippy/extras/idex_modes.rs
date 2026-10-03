@@ -23,7 +23,7 @@
 //! carry across is the **gcode coordinate**: switching or restoring parks the
 //! departing carriage's axis coordinate and re-anchors the toolhead on the
 //! arriving carriage's frame, the way upstream's `toggle_active_dc_rail`
-//! calls `toolhead.set_position(newpos)` (`idex_modes.py:101-114`) — the
+//! calls `toolhead.set_position(newpos)` (`idex_modes.py:101-115`) — the
 //! `toolhead:set_position` event re-anchors `gcode_move` with it, so the next
 //! move lands in the new carriage's frame and its range. The upstream
 //! behaviour still missing is listed below; the hybrid dual carriage unit
@@ -43,7 +43,7 @@
 //!
 //! * **No carriage switching on the motion layer**: the active rail's trapq
 //!   swap, the scale/offset transform and `update_limits`
-//!   (`idex_modes.py:224-231`, `DualCarriagesRail.activate/inactivate`) are
+//!   (`idex_modes.py:224-235`, `DualCarriagesRail.activate/inactivate`) are
 //!   not implemented — the coordinate handover teleports the toolhead onto
 //!   the new frame, but the steps still go to the primary rail, and the
 //!   active carriage's **range** stays the primary rail's (identical in the
@@ -125,7 +125,7 @@ struct Shared {
     /// The carriage-axis coordinate each carriage's frame holds. A frame is
     /// recorded when its carriage is left and carried to when it is
     /// re-entered — the coordinate half of upstream's
-    /// `toggle_active_dc_rail` (`idex_modes.py:101-114`), where upstream
+    /// `toggle_active_dc_rail` (`idex_modes.py:101-115`), where upstream
     /// instead reads it off the scale/offset transform of a second rail that
     /// this port does not drive (module docs) — and set to the carriage's own
     /// `position_endstop` when its axis homes ([`Shared::homed`]).
@@ -143,7 +143,7 @@ struct Shared {
     axes: Vec<usize>,
     /// Where each carriage sits once its axis homes: its own
     /// `position_endstop`. Upstream homes every carriage of the axis there
-    /// (`DualCarriages.home`, `idex_modes.py:116-131`, which toggles each
+    /// (`DualCarriages.home`, `idex_modes.py:116-132`, which toggles each
     /// rail and homes it) and the frames follow the physical carriages;
     /// [`Shared::homed`] is this port's copy of that bookkeeping, and the
     /// bare `[dual_carriage]` section never calls it (its entries stay `0.0`,
@@ -195,7 +195,7 @@ impl Shared {
 
     /// An axis finished homing (`HomingHomeRailsEnd`): every carriage of that
     /// axis now sits at its own `position_endstop`, as upstream's
-    /// `DualCarriages.home` leaves them (`idex_modes.py:116-131`) — without
+    /// `DualCarriages.home` leaves them (`idex_modes.py:116-132`) — without
     /// this a dual carriage's frame stays at `0.0` forever, and the first
     /// switch onto it teleports the toolhead to a coordinate it never earned
     /// (`Move out of range` on the corpus' first `G1 X-10`).
@@ -239,7 +239,7 @@ pub struct DualCarriageModule {
     #[allow(dead_code)]
     safe_distance: Option<f64>,
     /// The second carriage's motor, built from this section the way upstream's
-    /// `LookupMultiRail(dc_config)` is (`cartesian.py:30`). Held so the
+    /// `LookupMultiRail(dc_config)` is (`cartesian.py:25-29`). Held so the
     /// firmware resource stays alive; not driven yet (module docs).
     #[allow(dead_code)]
     stepper: PrinterStepper,
@@ -323,13 +323,13 @@ pub fn claim(rails: &[Arc<Rail>], printer: &Arc<Printer>) {
         .lock()
         .unwrap_or_else(|poison| poison.into_inner()) = Some(Arc::clone(rail));
     // The primary carriage's name is the rail's short name
-    // (`rail.get_name(short=True)`, `stepper.py:388-393`), the key upstream's
+    // (`rail.get_name(short=True)`, `stepper.py:388-394`), the key upstream's
     // `dc_rails` uses for `CARRIAGE=` (`idex_modes.py:37-39`).
     module.shared_lock().names[0] = Some(short_rail_name(rail.name()).to_string());
 }
 
 /// A rail's short name (`GenericPrinterRail.get_name(short=True)`,
-/// `stepper.py:388-393`): a `stepper_x` rail is `x`, `stepper_z1` is `z1`,
+/// `stepper.py:388-394`): a `stepper_x` rail is `x`, `stepper_z1` is `z1`,
 /// and anything else is its last whitespace-separated word.
 fn short_rail_name(name: &str) -> &str {
     if let Some(rest) = name.strip_prefix("stepper") {
@@ -348,7 +348,7 @@ pub fn load_config(
     printer: &Arc<Printer>,
 ) -> Result<Arc<dyn PrinterObject>, ConfigError> {
     let identifier = config.identifier();
-    // `dc_config.getchoice('axis', ['x', 'y'])` (`cartesian.py:27`).
+    // `dc_config.getchoice('axis', ['x', 'y'])` (`cartesian.py:25-26`).
     let axis = match config.get("axis", None)?.trim().to_lowercase().as_str() {
         "x" => Axis::X,
         "y" => Axis::Y,
@@ -367,14 +367,14 @@ pub fn load_config(
         None
     };
     // The section doubles as a stepper section: upstream reads it through
-    // `stepper.LookupMultiRail(dc_config)` (`cartesian.py:30`), which is
+    // `stepper.LookupMultiRail(dc_config)` (`cartesian.py:25-29`), which is
     // exactly what building the primary stepper here reads.
     let stepper = PrinterStepper::new(config, printer, axis, true)?;
 
     let shared = Arc::new(Mutex::new(Shared::for_section(
         axis_index(axis),
         // This module's own carriage name is the section's short name
-        // (`rail.get_name(short=True)`, `stepper.py:388-393`), the key upstream's
+        // (`rail.get_name(short=True)`, `stepper.py:388-394`), the key upstream's
         // `dc_rails` uses for `CARRIAGE=` (`idex_modes.py:37-39`); the bare
         // `[dual_carriage]` section's short name is its identifier.
         identifier.clone(),
@@ -446,7 +446,7 @@ impl PrinterObject for GenericDualCarriages {
 
 /// Build the generic-cartesian `dual_carriage` module, register its three
 /// commands, and let the frames follow homing (`generic_cartesian.py:137-146`,
-/// `idex_modes.py:46-59,116-131`).
+/// `idex_modes.py:46-59,116-132`).
 ///
 /// `carriages` is every carriage upstream's `dc_rails` carries, in its order:
 /// the primary carriage of each dual axis, then the dual carriages. Called by
@@ -469,7 +469,7 @@ pub fn register_generic(
     )?;
     register_commands(&shared, printer)?;
 
-    // Upstream's `DualCarriages.home` (`idex_modes.py:116-131`) homes every
+    // Upstream's `DualCarriages.home` (`idex_modes.py:116-132`) homes every
     // carriage of the axis to its own endstop and the frames follow the
     // physical carriages there; this port homes the axis through the
     // kinematics instead, so the same refresh hangs off the homing event.
@@ -527,7 +527,7 @@ fn register_commands(
                 handler,
                 Some("Save dual carriages modes and positions"),
                 // The state's name, read by `cmd_save_dual_carriage_state`
-                // (`idex_modes.py:283-293`).
+                // (`idex_modes.py:283-292`).
                 &["NAME"],
                 false,
             )
@@ -585,7 +585,7 @@ enum Plan {
 }
 
 /// The arriving carriage's axis frame — the bookkeeping half of upstream's
-/// `toggle_active_dc_rail` (`idex_modes.py:101-114`): record the departing
+/// `toggle_active_dc_rail` (`idex_modes.py:101-115`): record the departing
 /// frame from `current` along the departing carriage's own axis (when there
 /// is a position to record), select the arriving carriage, and hand back the
 /// coordinate the toolhead should be re-anchored on. A restore overwrites
@@ -712,7 +712,7 @@ fn select_carriage(
 
 /// `SAVE_DUAL_CARRIAGE_STATE [NAME=…]`: remember the active carriage and
 /// both frames under `NAME` (default `default`) — upstream saves the axis
-/// positions too (`idex_modes.py:283-293`), so the active frame is refreshed
+/// positions too (`idex_modes.py:283-292`), so the active frame is refreshed
 /// from the toolhead first.
 fn cmd_save_dual_carriage_state(
     shared: &Arc<Mutex<Shared>>,
@@ -949,7 +949,7 @@ mod tests {
     }
 
     /// The handover bookkeeping (`toggle_active_dc_rail`,
-    /// `idex_modes.py:101-114`): a switch records the departing frame and
+    /// `idex_modes.py:101-115`): a switch records the departing frame and
     /// arrives on the other carriage's; a restore applies the snapshot
     /// wholesale; without a toolhead position only the active index moves —
     /// the pre-handover behaviour the load-only tests see.
@@ -997,7 +997,7 @@ mod tests {
     /// A homed axis carries every carriage of it to its own
     /// `position_endstop`: upstream's `DualCarriages.home` homes each carriage
     /// there and the scale/offset transform records where it stopped
-    /// (`idex_modes.py:116-131`). Without this refresh a dual carriage's
+    /// (`idex_modes.py:116-132`). Without this refresh a dual carriage's
     /// frame stays `0.0` forever, and the first switch onto it re-anchors the
     /// toolhead at the origin — `corexyuv.test`'s `G1 X-10` then ends at
     /// X=-10 (`Move out of range`).

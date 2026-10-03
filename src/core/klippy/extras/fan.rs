@@ -30,7 +30,7 @@
 //! split is kept one for one:
 //!
 //! * `set_speed_from_command` — `M106`/`M107`, `SET_FAN_SPEED` — is upstream's
-//!   `queue_gcode_request` (`output_pin.py:61-66`): the request is dated by
+//!   `queue_gcode_request` (`output_pin.py:65-67`): the request is dated by
 //!   `toolhead.register_lookahead_callback` and pushed, so a speed lands at a
 //!   print time, later requests override earlier ones, and the kick-start
 //!   tail is the queued request **re-run** at `print_time + kick_start_time`
@@ -111,7 +111,7 @@ struct FanState {
 /// Seconds between two tachometer samples (upstream's fixed `sample_time`).
 const TACHOMETER_SAMPLE_TIME: f64 = 1.;
 
-/// Upstream's `FanTachometer` (`fan.py:85-106`): the optional pulse counter
+/// Upstream's `FanTachometer` (`fan.py:83-102`): the optional pulse counter
 /// behind `tachometer_pin`, and the RPM its frequency becomes.
 struct FanTachometer {
     /// Pulses per revolution (`tachometer_ppr`), upstream's `self.ppr`.
@@ -167,7 +167,7 @@ impl FanTachometer {
 }
 
 /// Upstream's `rpm = self._freq_counter.get_frequency() * 30. / self.ppr`
-/// (`fan.py:98`): the frequency of a `tachometer_ppr`-pulse train in RPM.
+/// (`fan.py:99`): the frequency of a `tachometer_ppr`-pulse train in RPM.
 fn to_rpm(frequency: f64, ppr: f64) -> f64 {
     frequency * 30. / ppr
 }
@@ -397,7 +397,7 @@ impl Fan {
         mcu_fan.setup_max_duration(0.0);
         mcu_fan.setup_cycle_time(cycle_time, hardware_pwm);
         // A fan starts at 0; the shutdown duty is what the firmware falls back
-        // to, capped by max_power (`fan.py:26`).
+        // to, capped by max_power (`fan.py:27`).
         let shutdown_power = shutdown_speed.clamp(0.0, max_power);
         mcu_fan.setup_start_value(0.0, shutdown_power);
 
@@ -504,7 +504,7 @@ impl Fan {
 
     /// Choose the speed from a g-code line: upstream's
     /// `Fan.set_speed_from_command`, which queues the request against the
-    /// toolhead's lookahead (`queue_gcode_request`, `output_pin.py:61-66`).
+    /// toolhead's lookahead (`queue_gcode_request`, `output_pin.py:65-67`).
     ///
     /// This is where `M106`/`M107` and `SET_FAN_SPEED` land, so a speed
     /// change takes effect at a print time, later requests override earlier
@@ -687,7 +687,7 @@ impl PrinterFan {
             .expect("the loader registers `gcode` before any section");
 
         // `M106 S<value>`: default 255, `minval=0.`, no upper bound — what
-        // caps the duty is `max_power`, inside `_apply_speed` (`fan.py:117-120`).
+        // caps the duty is `max_power`, inside `_apply_speed` (`fan.py:49-68`).
         let speed = Arc::clone(&fan);
         let handler: CommandHandler = sync(move |gcmd: &GcodeCommand| {
             let value =

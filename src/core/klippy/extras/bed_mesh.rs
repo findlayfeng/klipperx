@@ -106,7 +106,7 @@ pub struct BedMeshOptions {
 }
 
 /// Two floats from a `x, y` option — upstream's `getfloatlist(…, count=2)`
-/// (`configfile.py:87-107`): every value is parsed *before* the count is
+/// (`configfile.py:87-106`): every value is parsed *before* the count is
 /// checked, a missing option is `must be specified` (`configfile.py:37-38`),
 /// a wrong count `must have 2 elements` (`configfile.py:100-101`), and an
 /// unparseable value keeps the parser's wording (`configfile.py:44-45`).

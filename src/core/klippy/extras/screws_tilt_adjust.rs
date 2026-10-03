@@ -111,7 +111,7 @@ pub struct ScrewsTiltAdjust {
 
 impl ScrewsTiltAdjust {
     /// Read the section, wire the probe helper's callback, and register
-    /// `SCREWS_TILT_CALCULATE` (`screws_tilt_adjust.py:6-45`).
+    /// `SCREWS_TILT_CALCULATE` (`screws_tilt_adjust.py:11-47`).
     ///
     /// # Errors
     /// A malformed option, fewer than three screws, fewer than three probe
@@ -814,7 +814,7 @@ mod tests {
 
     /// The section wires up and reports the status shape upstream's
     /// `get_status` answers: `error`, `max_deviation`, `results`
-    /// (`screws_tilt_adjust.py:69-72`), before any round and after one.
+    /// (`screws_tilt_adjust.py:61-64`), before any round and after one.
     #[test]
     fn the_status_shape_matches_upstream_before_and_after_a_round() {
         let printer = printer();

@@ -51,7 +51,7 @@ section!("probe", order = 30, load = load_config);
 /// The chip name the virtual endstop is reached under.
 const CHIP_NAME: &str = "probe";
 
-/// The only pin name the chip answers to (`klippy/extras/probe.py:222-229`).
+/// The only pin name the chip answers to (`klippy/extras/probe.py:238-243`).
 const VIRTUAL_ENDSTOP: &str = "z_virtual_endstop";
 
 /// The toolhead object, as the loader registers `[printer]`.
@@ -289,7 +289,7 @@ pub(crate) struct ProbeChip {
     pub(crate) endstop: Arc<McuEndstop>,
     /// The probe's trigger offset: what a `probe:z_virtual_endstop` rail uses
     /// as its `position_endstop` (`ProbeEndstopWrapper.get_position_endstop`,
-    /// `probe.py:551-552`).
+    /// `probe.py:235-236`).
     pub(crate) z_offset: f64,
 }
 
@@ -404,7 +404,7 @@ pub(crate) struct ProbeSessionHelper {
     query_endstop: Arc<McuEndstop>,
     /// The Z to move down to while probing: `[stepper_z] position_min`, or
     /// `[printer] minimum_z_position` when there is no Z stepper
-    /// (`probe.py:238-245`).
+    /// (`probe.py:188-193`).
     z_position: f64,
     /// The section's parameters; a command may override them.
     defaults: ProbeParams,
@@ -549,7 +549,7 @@ impl ProbeSessionHelper {
             }
         };
         // A consumer (`axis_twist_compensation`) edits the result in place; the
-        // reported value is what the handlers left (`probe.py:329`, where
+        // reported value is what the handlers left (`probe.py:364-367`, where
         // `_probe` reads `results[0]` back after `send_event`).
         let results = ProbeResultsHandle::new(vec![epos]);
         if let Some(printer) = self.printer.upgrade() {
@@ -1294,7 +1294,7 @@ mod tests {
 }
 
 // ===========================================================================
-// ProbePointsHelper (upstream klippy/extras/probe.py:425-530)
+// ProbePointsHelper (upstream klippy/extras/probe.py:425-529)
 // ===========================================================================
 
 /// The object the `probe` session is looked up under (the `[probe]` section

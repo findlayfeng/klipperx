@@ -41,7 +41,7 @@ section!("quad_gantry_level", order = 30, load = load_config);
 /// itself up through the registry, as `z_tilt`'s does).
 const QGL_OBJECT: &str = "quad_gantry_level";
 
-/// The four actuator names the reports use (`quad_gantry_level.py:106`).
+/// The four actuator names the reports use (`quad_gantry_level.py:93`).
 const ACTUATORS: [&str; 4] = ["z", "z1", "z2", "z3"];
 
 /// The gantry-relative corner heights and the motor adjustments from them.

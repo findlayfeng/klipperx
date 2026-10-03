@@ -6,7 +6,7 @@
 //! | — | — | the section carries no options of its own |
 //!
 //! Upstream registers `SDCARD_LOOP_BEGIN`/`_END`/`_DESIST`
-//! (`sdcard_loop.py:16-24`); those stay unregistered here, so the dispatcher
+//! (`sdcard_loop.py:14-22`); those stay unregistered here, so the dispatcher
 //! passes them through as unknown commands. The loop index itself is ported
 //! as [`SDCardLoop`]'s stack operations — the semantics upstream's three
 //! commands drive (`sdcard_loop.py:39-70`) — and the unit tests below pin them
@@ -24,7 +24,7 @@ section!("sdcard_loop", order = 30, load = load_config);
 
 /// What the loop stack needs from `virtual_sdcard` — upstream's
 /// `is_cmd_from_sd`/`get_file_position`/`set_file_position`
-/// (`sdcard_loop.py:43-68` call sites on `self.sdcard`).
+/// (`sdcard_loop.py:38-65` call sites on `self.sdcard`).
 pub trait SdCardFile {
     /// Whether the current command came from the SD file.
     fn is_cmd_from_sd(&self) -> bool;
@@ -61,14 +61,14 @@ impl SDCardLoop {
         true
     }
 
-    /// `SDCARD_LOOP_END`'s stack pop (`sdcard_loop.py:49-68`): count `0`
+    /// `SDCARD_LOOP_END`'s stack pop (`sdcard_loop.py:50-62`): count `0`
     /// repeats forever, count `1` is the last repeat, anything higher seeks
     /// back and decrements.
     ///
     /// # Returns
     /// `false` — and the caller raises `Only permitted in SD file.` — when
     /// the command did not come from the SD file. An empty stack succeeds
-    /// without seeking (`sdcard_loop.py:53-55`).
+    /// without seeking (`sdcard_loop.py:47-49`).
     pub fn loop_end(&mut self, sdcard: &mut dyn SdCardFile) -> bool {
         if !sdcard.is_cmd_from_sd() {
             return false;
@@ -169,7 +169,7 @@ mod tests {
 
     /// BEGIN/END only work inside the SD file: outside, both refuse (the
     /// caller raises `Only permitted in SD file.`) and the stack is left
-    /// alone (`sdcard_loop.py:41-55`).
+    /// alone (`sdcard_loop.py:38-46`).
     #[test]
     fn begin_and_end_only_work_inside_the_sd_file() {
         let mut loop_ = SDCardLoop::new();
@@ -187,7 +187,7 @@ mod tests {
         assert_eq!(loop_.loop_stack, [(3, 64)]);
     }
 
-    /// END's count semantics (`sdcard_loop.py:49-66`): `0` repeats
+    /// END's count semantics (`sdcard_loop.py:50-62`): `0` repeats
     /// forever (seek back, entry kept), `1` is the last repeat (pop, no
     /// seek), anything higher seeks back and decrements.
     #[test]
@@ -236,7 +236,7 @@ mod tests {
     }
 
     /// END with an empty stack succeeds without seeking, and nested loops
-    /// unwind outermost-last (`sdcard_loop.py:53-55,44`).
+    /// unwind outermost-last (`sdcard_loop.py:47-51`).
     #[test]
     fn end_with_an_empty_stack_seeks_nothing_and_nests_last() {
         let mut loop_ = SDCardLoop::new();
@@ -261,7 +261,7 @@ mod tests {
     /// DESIST only works outside the SD file: inside, it refuses (the
     /// caller raises `Only permitted outside of a SD file.`) and keeps the
     /// stack; outside, it clears every open loop
-    /// (`sdcard_loop.py:34-37,69-75`).
+    /// (`sdcard_loop.py:34-36, 64-70`).
     #[test]
     fn desist_clears_the_stack_only_outside_the_sd_file() {
         let mut loop_ = SDCardLoop::new();

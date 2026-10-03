@@ -3,15 +3,15 @@
 //! Upstream renders every macro body with `jinja2.Environment('{%', '%}', '{',
 //! '}')` (`klippy/extras/gcode_macro.py:83`) — the variable delimiters are
 //! **single braces**, which is why the corpus writes `{params.P}` rather than
-//! `{{ params.P }}` — and `TemplateWrapper` (`:46-79`) compiles the body at
-//! load and renders it against `create_template_context` (`:101-108`) before
+//! `{{ params.P }}` — and `TemplateWrapper` (`:46-77`) compiles the body at
+//! load and renders it against `create_template_context` (`:106-113`) before
 //! `gcode.run_script_from_command` feeds the text back to the dispatcher.
 //!
 //! This module adapts `minijinja` 2.24 (`Cargo.toml`) to that environment.
 //! [`Template::parse`] and [`Template::render`] keep this port's contract: a
 //! body that does not parse is a **config-load** error, a body that does not
 //! evaluate is a **command** error, the text between tags survives verbatim,
-//! and the error frames are upstream's (`gcode_macro.py:47-79`).
+//! and the error frames are upstream's (`gcode_macro.py:46-77`).
 //!
 //! # The environment
 //!
@@ -395,7 +395,7 @@ impl Context {
     }
 
     /// Bind a global (`create_template_context` plus `kwparams`,
-    /// `gcode_macro.py:186-190`).
+    /// `gcode_macro.py:106-113`).
     pub fn insert(&mut self, name: impl Into<String>, value: Rt) {
         self.globals.insert(name.into(), value);
     }
@@ -433,7 +433,7 @@ impl fmt::Debug for Template {
 
 impl Template {
     /// Compile `source`, reporting an unparsable body with upstream's
-    /// load-error frame (`gcode_macro.py:61-66`).
+    /// load-error frame (`gcode_macro.py:57-60`).
     ///
     /// # Errors
     /// A syntax error in the body: an unclosed tag, a statement the engine
@@ -886,7 +886,7 @@ mod tests {
         assert!(error.to_string().contains("undefined"), "{error}");
     }
 
-    /// `rawparams` is the line's tail, verbatim (`gcode_macro.py:189`).
+    /// `rawparams` is the line's tail, verbatim (`gcode_macro.py:195`).
     #[test]
     fn rawparams_renders_the_command_tail() {
         assert_eq!(ok("{rawparams}"), "");
@@ -897,7 +897,7 @@ mod tests {
     }
 
     /// A statement the engine does not know fails the **load** with upstream's
-    /// frame (`gcode_macro.py:61-66`), naming the line and the statement.
+    /// frame (`gcode_macro.py:57-60`), naming the line and the statement.
     /// `{% block %}` is no longer one of them: Jinja2 parses it, and so does
     /// this engine — the old subset was the stricter one.
     #[test]

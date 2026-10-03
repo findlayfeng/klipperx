@@ -52,7 +52,7 @@
 //!   one ported queue), not a line-for-line port of that file's command.
 //! * `maximum_mcu_duration`'s host-side refreshes
 //!   (`MCU_queued_pwm._gen_intermediate_updates`, `pwm_tool.py:119-135`) ride
-//!   the **motion-queue** flush callback (`pwm_tool.py:77-78`), not the
+//!   the **motion-queue** flush callback (`pwm_tool.py:66-67`), not the
 //!   g-code request queue. The firmware limit itself is configured here as
 //!   before (`setup_max_duration`); the port has no host-side regeneration —
 //!   a separate, resource-level gap this wiring does not close.
@@ -507,7 +507,7 @@ mod tests {
         assert_eq!(*created(&chip, 0).updates.lock().unwrap(), [1.0]);
         assert_eq!(pin.get_status(0.0)["value"], 1.0);
 
-        // A repeat of the current duty sends nothing (`pwm_tool.py:168-170`).
+        // A repeat of the current duty sends nothing (`pwm_tool.py:169-171`).
         gcode(&printer)
             .run_script_sync("SET_PIN PIN=tool VALUE=1")
             .unwrap();

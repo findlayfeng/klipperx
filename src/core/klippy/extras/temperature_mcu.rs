@@ -10,7 +10,7 @@
 //! Some MCUs (STM32F4/F0/G0/H7, SAMD) do not have a fixed calibration: their
 //! factory values live in chip registers and are read over `debug_read`, a
 //! request/response command (upstream reads them in `handle_mcu_identify`,
-//! `klippy/extras/temperature_mcu.py:58-89`). The read has to happen **after**
+//! `klippy/extras/temperature_mcu.py:63-104`). The read has to happen **after**
 //! identify (the dictionary must be installed) and **before** the configuration
 //! is built (the ADC's sampling range depends on the calibration). That window
 //! is exactly [`PreBuildCallback`](crate::core::klippy::mcu::ConfigBuilder), and

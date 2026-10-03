@@ -293,7 +293,7 @@ pub fn load_config_prefix(
 ) -> Result<Arc<dyn PrinterObject>, ConfigError> {
     let name = config.section().sub.clone().unwrap_or_default();
 
-    // The fan core first, as upstream constructs it (`temperature_fan.py:18`),
+    // The fan core first, as upstream constructs it (`temperature_fan.py:17`),
     // with `default_shutdown_speed=1.` — a temperature fan that keeps running
     // when klippy dies.
     let fan = Fan::new(config, printer, 1.0)?;

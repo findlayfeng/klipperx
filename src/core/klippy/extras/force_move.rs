@@ -410,6 +410,55 @@ mod tests {
         "manual_stepper buzzer"
     }
 
+    /// The two profiles the upstream function is documented on: a negative
+    /// distance flips `axis_r` and a distance too short to reach `speed` slows
+    /// the cruise (the triangle case).
+    #[test]
+    fn test_calc_move_time_matches_the_upstream_formula() {
+        // `calc_move_time(-2., 10., 100.)` in CPython returns
+        // `(-1.0, 0.1, 0.1, 10.0)`.
+        assert_eq!(calc_move_time(-2.0, 10.0, 100.0), (-1.0, 0.1, 0.1, 10.0));
+    }
+
+    /// A distance that cannot reach `speed` slows the cruise to the speed
+    /// `sqrt(dist * accel)` and leaves no cruise phase.
+    #[test]
+    fn test_a_short_move_slows_the_cruise_to_the_reachable_speed() {
+        let (axis_r, accel_t, cruise_t, cruise_v) = calc_move_time(2.0, 100.0, 100.0);
+        assert_eq!(axis_r, 1.0);
+        let expected = 200.0f64.sqrt();
+        assert!(
+            (cruise_v - expected).abs() < 1e-12,
+            "{cruise_v} vs {expected}"
+        );
+        assert!((accel_t - expected / 100.0).abs() < 1e-12, "{accel_t}");
+        assert!(cruise_t.abs() < 1e-12, "{cruise_t}");
+    }
+
+    /// No acceleration is a constant-speed cruise; no distance is a no-op.
+    #[test]
+    fn test_no_accel_or_no_distance_is_a_plain_cruise() {
+        assert_eq!(calc_move_time(5.0, 10.0, 0.0), (1.0, 0.0, 0.5, 10.0));
+        assert_eq!(calc_move_time(0.0, 10.0, 100.0), (1.0, 0.0, 0.0, 10.0));
+    }
+
+    /// The number the manual-stepper corpus move uses (`MOVE=300 SPEED=10
+    /// ACCEL=2000`): the distance is long enough to reach `speed`, so the
+    /// cruise is 10 mm/s for the bulk of the move.
+    ///
+    /// The expected tuple is CPython's, value for value: running the upstream
+    /// function itself (`force_move.py:15-28` under `python3`) on
+    /// `calc_move_time(300., 10., 2000.)` returns
+    /// `(1.0, 0.005, 29.994999999999997, 10.0)`, and every field here compares
+    /// equal to it bit for bit rather than within a tolerance.
+    #[test]
+    fn test_the_long_manual_move_is_a_full_trapezoid() {
+        assert_eq!(
+            calc_move_time(300.0, 10.0, 2000.0),
+            (1.0, 0.005, 29.994_999_999_999_997, 10.0)
+        );
+    }
+
     /// The buzz constants are upstream's, value for value
     /// (`force_move.py:9-12`), and a buzz move is a constant-speed cruise:
     /// one millimetre at 4 mm/s, no acceleration (`calc_move_time`'s `accel ==

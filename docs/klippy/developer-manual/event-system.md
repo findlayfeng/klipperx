@@ -132,14 +132,15 @@ MCU 侧另有独立的 `event` 模块，以 `McuEvent` trait 表达固件主动�
 或 `"MCU error during connect"`）与 `details`（原始错误信息）。与上游 `_connect` 中的
 `send_event("klippy:notify_mcu_error", msg, {"error": str(e)})` 一致。
 
-截至 2026-09-23，生产路径上**实际发出**的事件（按命名空间）：
+生产路径上**实际发出**的事件（按命名空间；下表为 2026-09-23 盘点，`toolhead:` 行已按
+2026-10-03 复核更正）：
 
 | 命名空间 | 已发出 | 尚未发出（模块/发送方未就位） |
 |----------|--------|------------------------------|
 | `klippy:` | 全部 8 个 | — |
 | `homing:` | 全部 4 个（`toolhead` 的回零循环发 begin/end） | — |
 | `gcode:` | `command_error`、`request_restart` | `debuginput_exit`（依赖 `GCodeIO`，暂缓） |
-| `toolhead:` | `set_position` | `manual_move`（已注册处理器，发送方是 G4-2）、`sync_print_time`、`update_extra_axes` |
+| `toolhead:` | `set_position`、`manual_move`（`safe_z_home` 的 `manual_move`）、`update_extra_axes`（`ToolHeadObject` 加/减额外轴） | `sync_print_time` |
 | `stepper_enable:` | `motor_off` | — |
 | `extruder:` | — | `activate_extruder`（已注册处理器，发送方是 G4-2） |
 | `stepper:` | — | `sync_mcu_position`、`set_dir_inverted`（依赖 stepper 资源的同步路径） |

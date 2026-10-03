@@ -832,7 +832,7 @@ mod tests {
             .expect_err("zero is refused");
         assert_eq!(
             error.to_string(),
-            "Error on 'SET_IDLE_TIMEOUT TIMEOUT=0': TIMEOUT must have above of 0"
+            "Error on 'SET_IDLE_TIMEOUT TIMEOUT=0': TIMEOUT must be above 0"
         );
         assert_eq!(idle(&printer).get_status(0.0)["idle_timeout"], 600.0);
     }

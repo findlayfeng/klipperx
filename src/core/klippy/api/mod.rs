@@ -26,8 +26,9 @@
 //! [`register`] installs the server's own object and every endpoint that is
 //! written: `webhooks`, `info`, `objects/list`, `objects/query`,
 //! `objects/subscribe`, the five `gcode/*` endpoints, `emergency_stop`,
-//! `query_endstops/status`, `register_remote_method` and `pause_resume/*`. The
-//! `*/dump_*` mux endpoints are installed through the `webhooks` object —
+//! `query_endstops/status`, `register_remote_method`, `pause_resume/*` and
+//! `bed_mesh/dump_mesh`. The `*/dump_*` mux
+//! endpoints are installed through the `webhooks` object —
 //! [`WebhooksStatus::register_mux_endpoint`] — once an extras module registers
 //! one. What is left of the documented surface is `bed_mesh/dump_mesh` and the
 //! `*/dump_*` instances whose extras are not written yet.
@@ -219,6 +220,7 @@ mod tests {
         assert_eq!(
             api.endpoints(),
             [
+                "bed_mesh/dump_mesh",
                 "emergency_stop",
                 "gcode/firmware_restart",
                 "gcode/help",
@@ -357,6 +359,13 @@ mod tests {
             matches!(err, RegistrationError::Endpoint(_)),
             "the endpoints are registered after the object: {err}"
         );
-        assert!(err.to_string().contains("emergency_stop"), "{err}");
+        // The first installer in the sorted table now owns the first path, so
+        // the check is the message itself: it is an endpoint path that was
+        // taken, not a printer object (the variant says that too).
+        assert!(
+            err.to_string()
+                .contains("path already registered to an endpoint"),
+            "{err}"
+        );
     }
 }

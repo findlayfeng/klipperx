@@ -531,6 +531,11 @@ max_temp: 110
 | `tachometer_ppr` | 2 | ≥1 | — | 每转脉冲数（需 `tachometer_pin`；`<1` 拒收） |
 | `tachometer_poll_interval` | 0.0015 | >0 | — | 测速轮询间隔秒（需 `tachometer_pin`；`≤0` 拒收） |
 
+> 速度变更**按打印时间生效**（同 `SET_PIN`，经 `GCodeRequestQueue` 钉到前瞻时刻、
+> flush 时落 PWM，kick-start 尾巴是队列重跑）；**两条兑底**：无 `[printer]`（lookup 不到
+> toolhead）或资源无法定时（`min_schedule_time` 不可得）时立即生效——此时 kick 尾巴才用
+> `call_later`。
+
 ### `[temperature_sensor <name>]` — 可查询的温度传感器
 
 把任意已注册的传感器类型暴露成一个可 `objects/query` 的对象。`get_status` 报

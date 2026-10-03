@@ -348,7 +348,8 @@ impl Heater {
     /// Whether a `target` has not settled yet (`Heater.check_busy`).
     ///
     /// Upstream polls it in `_wait_for_temperature` while `M109`/`M190` wait
-    /// for their target (`heaters.py:326-334`); those waits are not wired yet.
+    /// for their target (`heaters.py:326-334`); both waits are wired through
+    /// [`Self::set_temperature`] (2026-10-03, `6900894` / `6745e83`).
     /// `TEMPERATURE_WAIT` does not use it — it waits on the reading itself.
     pub fn check_busy(&self, target: f64) -> bool {
         let state = self.lock();

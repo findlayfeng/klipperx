@@ -41,10 +41,12 @@ impl FrameRecorder {
 /// mapping entry in FIFO order, validates the input frame, and queues the
 /// configured output frame(s) for `receive()`.
 ///
-/// **Thread safety**: `FrameMock` is `Send` but not `Sync` — it must be
-/// shared through an outer `Mutex` (e.g. `Arc<Mutex<FrameMock>>` in
-/// `Interface::run()`). Each field that needs `Sync` is individually protected
-/// (e.g. `mapping` uses its own `Mutex` since `VecDeque` is not `Sync`).
+/// **Thread safety**: `FrameMock` is `Send + Sync` — every field is
+/// individually protected (`mapping` uses its own `Mutex` since `VecDeque`
+/// is not `Sync`; `buf_tx` uses `Mutex`; `buf_rx` is a crossbeam
+/// multi-consumer `Receiver` which is `Sync`). It can be shared directly
+/// through `Arc`, as `Interface` does (`Transport::FrameMock(Arc<FrameMock>)`),
+/// without an outer `Mutex`.
 #[derive(Debug)]
 pub struct FrameMock {
     /// `crossbeam::channel::Sender` wrapped in `Option` — `take()` on the last
@@ -444,8 +446,15 @@ mod tests {
         let input2 = make_frame(3, b"concurrent2");
         let output2 = make_frame(4, b"resp2");
 
-        // Share through Arc<Mutex<>> — mirrors how Interface::run() shares the device.
-        let device = Arc::new(std::sync::Mutex::new(FrameMock::new(vec![
+        // Share through Arc — mirrors how Interface shares the device
+        // (Transport::FrameMock(Arc<FrameMock>)). FrameMock is Send + Sync:
+        // each field is individually protected, so send() and receive() can
+        // run concurrently through &self without an outer Mutex.
+        //
+        // A previous version used Arc<Mutex<FrameMock>>, which deadlocked:
+        // receive() blocks on buf_rx.recv() while holding the outer lock,
+        // preventing send() from ever acquiring it to enqueue frames.
+        let device = Arc::new(FrameMock::new(vec![
             MappingEntry {
                 input: input1.clone(),
                 outputs: vec![output1.clone()],
@@ -454,19 +463,19 @@ mod tests {
                 input: input2.clone(),
                 outputs: vec![output2.clone()],
             },
-        ])));
+        ]));
 
-        let device_send = device.clone();
-        let device_recv = device.clone();
+        let device_send = Arc::clone(&device);
+        let device_recv = Arc::clone(&device);
 
         let send_handle = tokio::task::spawn_blocking(move || {
-            device_send.lock().unwrap().send(&input1).unwrap();
-            device_send.lock().unwrap().send(&input2).unwrap();
+            device_send.send(&input1).unwrap();
+            device_send.send(&input2).unwrap();
         });
 
         let recv_handle = tokio::task::spawn_blocking(move || {
-            let r1 = device_recv.lock().unwrap().receive().unwrap();
-            let r2 = device_recv.lock().unwrap().receive().unwrap();
+            let r1 = device_recv.receive().unwrap();
+            let r2 = device_recv.receive().unwrap();
             (r1, r2)
         });
 

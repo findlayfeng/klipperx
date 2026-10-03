@@ -344,7 +344,7 @@ async fn run_g28<O: HomeOps + ?Sized>(
 }
 
 /// The `{'Z': '0'}` parameters of the Z homing statement
-/// (`safe_z_home.py:83`).
+/// (`safe_z_home.py:80`).
 fn z_only() -> HashMap<String, String> {
     HashMap::from([("Z".to_string(), "0".to_string())])
 }

@@ -131,7 +131,7 @@ impl PIDCalibrate {
                 CommandError::new(format!("Unknown config object '{HEATERS_OBJECT}'"))
             })?;
         // Upstream wraps this `config_error` in `gcmd.error`
-        // (`pid_calibrate.py:21-23`); a command error is this host's spelling.
+        // (`pid_calibrate.py:21-24`); a command error is this host's spelling.
         let heater = pheaters
             .lookup_heater(&heater_name)
             .map_err(|err| CommandError::new(err.to_string()))?;

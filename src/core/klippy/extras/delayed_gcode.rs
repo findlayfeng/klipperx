@@ -60,7 +60,7 @@ section!("delayed_gcode", order = 30, prefix = load_config_prefix);
 const NEVER: f64 = 9_999_999_999_999_999.0;
 
 /// `UPDATE_DELAYED_GCODE`'s help text, verbatim
-/// (`delayed_gcode.py:43`).
+/// (`delayed_gcode.py:42`).
 const UPDATE_DELAYED_GCODE_HELP: &str = "Update the duration of a delayed_gcode";
 
 /// One `[delayed_gcode <name>]`.
@@ -224,7 +224,7 @@ impl DelayedGcode {
     }
 
     /// Render the `gcode` template the way upstream's `TemplateWrapper.render`
-    /// does with no context (`gcode_macro.py:61-68`): the `printer` view plus
+    /// does with no context (`gcode_macro.py:66-75`): the `printer` view plus
     /// the actions a loaded template may call.
     ///
     /// # Errors
@@ -311,7 +311,7 @@ fn on_ready(printer: &Arc<Printer>, delayed: &Arc<DelayedGcode>) {
 }
 
 /// Upstream's `load_config_prefix` for `[delayed_gcode <name>]`
-/// (`delayed_gcode.py:52-53`).
+/// (`delayed_gcode.py:53-54`).
 ///
 /// # Errors
 /// A missing `gcode`, an invalid `initial_duration`, or a template that does
@@ -494,7 +494,7 @@ mod tests {
     }
 
     /// `DURATION` is required and has upstream's `minval=0.` bound
-    /// (`delayed_gcode.py:46`).
+    /// (`delayed_gcode.py:44`).
     #[test]
     fn test_update_delayed_gcode_refuses_a_missing_or_negative_duration() {
         let (printer, _reactor) = loaded("[delayed_gcode welcome]\ngcode:\n    RECORD VALUE=x\n");
@@ -578,7 +578,7 @@ mod tests {
     }
 
     /// `initial_duration` has upstream's `minval=0.` bound
-    /// (`delayed_gcode.py:22`).
+    /// (`delayed_gcode.py:17`).
     #[test]
     fn test_a_negative_initial_duration_is_refused() {
         let (config, _) = Config::from_text(

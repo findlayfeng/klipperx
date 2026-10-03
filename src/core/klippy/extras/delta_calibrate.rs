@@ -50,7 +50,7 @@ section!("delta_calibrate", order = 30, load = load_config);
 /// The object the toolhead is looked up under.
 const TOOLHEAD_OBJECT: &str = "toolhead";
 
-/// The two commands this section registers (`delta_calibrate.py:121-123`).
+/// The two commands this section registers (`delta_calibrate.py:123-126`).
 const COMMAND_CALIBRATE: &str = "DELTA_CALIBRATE";
 const COMMAND_ANALYZE: &str = "DELTA_ANALYZE";
 
@@ -82,7 +82,7 @@ const MEASURE_OUTER_RADIUS: f64 = 65.;
 const MEASURE_RIDGE_RADIUS: f64 = 5.0 - 0.5;
 
 /// A stable position: steps taken since each tower hit its endstop
-/// (`delta_calibrate.py:7-11`).
+/// (`delta_calibrate.py:10-13`).
 type Stable = [f64; 3];
 /// A measured height paired with the stable position it was taken at.
 type HeightPosition = (f64, Stable);
@@ -122,7 +122,7 @@ impl DeltaCalibrate {
     /// that is taken.
     fn new(config: &ConfigWrapper, printer: &Arc<Printer>) -> Result<Arc<Self>, ConfigError> {
         // The default probe points: the centre plus six points on a scattered
-        // ring of `radius` (`delta_calibrate.py:76-82`).
+        // ring of `radius` (`delta_calibrate.py:83-90`).
         let radius = config.get_float_bounded("radius", None, None, None, Some(0.0), None)?;
         const SCATTER: [f64; 6] = [0.95, 0.90, 0.85, 0.70, 0.75, 0.80];
         let mut points = vec![(0., 0.)];
@@ -533,7 +533,7 @@ impl DeltaCalibrate {
     }
 
     /// `DELTA_ANALYZE MANUAL_HEIGHT=`: record the height the nozzle is at,
-    /// as a stable position (`add_manual_height`, `delta_calibrate.py:222-239`).
+    /// as a stable position (`add_manual_height`, `delta_calibrate.py:224-239`).
     ///
     /// The port reads the toolhead's commanded position instead of
     /// re-deriving it from the steppers after a generation flush: the two are
@@ -891,7 +891,7 @@ mod tests {
     #[test]
     fn test_the_save_config_report_matches_the_upstream_wording() {
         // `DeltaCalibration.save_state`'s report lines, exactly as upstream
-        // formats them (`delta.py:231-240`).
+        // formats them (`delta.py:231-238`).
         let calibration = example_calibration();
         let line = format!(
             "stepper_a: position_endstop: {:.6} angle: {:.6} arm_length: {:.6}\n\

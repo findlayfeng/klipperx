@@ -43,7 +43,7 @@ section!(
 );
 
 /// The name of the MCU object whose clock dates a position lookup
-/// (`filament_motion_sensor.py:41`).
+/// (`filament_motion_sensor.py:47-48`).
 const MCU_OBJECT: &str = "mcu";
 
 /// The extruder a motion sensor watches, once resolved by name

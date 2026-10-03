@@ -3,7 +3,7 @@
 //! Upstream is `klippy/extras/pwm_cycle_time.py`: an `output_pin` whose PWM is
 //! always a software one (`MCU_pwm_cycle`, `pwm_cycle_time.py:7-73`) and whose
 //! `SET_PIN` takes a `CYCLE_TIME=<seconds>` parameter on top of `VALUE`
-//! (`pwm_cycle_time.py:114-123`). The firmware reprograms the period in place
+//! (`pwm_cycle_time.py:112-122`). The firmware reprograms the period in place
 //! (`set_digital_out_pwm_cycle`), so a client can retune the frequency while
 //! the pin runs.
 //!
@@ -59,7 +59,7 @@ use crate::core::klippy::printer::{Printer, PrinterObject};
 section!("pwm_cycle_time", order = 20, prefix = load_config_prefix);
 
 /// The duty and period last set, for `get_status` and upstream's "a repeat of
-/// the current setting sends nothing" rule (`pwm_cycle_time.py:96-98`).
+/// the current setting sends nothing" rule (`pwm_cycle_time.py:103-104`).
 #[derive(Clone, Copy, PartialEq)]
 struct PinState {
     /// The duty last set, divided by `scale` (upstream's `last_value`).
@@ -708,7 +708,7 @@ mod tests {
 
     /// Two `SET_PIN`s closer than `min_schedule_time` are spaced apart: the
     /// second lands at `last_print_time + min_schedule_time`, not at its own
-    /// print time (upstream `pwm_cycle_time.py:108-109`).
+    /// print time (upstream `pwm_cycle_time.py:106-110`).
     #[tokio::test]
     async fn test_two_changes_are_spaced_by_min_schedule_time() {
         let (printer, chip) = printer_with(FakeChip {

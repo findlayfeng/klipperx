@@ -41,7 +41,7 @@ section!("display_status", order = 30, load = load_config);
 /// by (`printer.load_object(config, "display_status")`).
 pub const DISPLAY_STATUS_OBJECT: &str = "display_status";
 
-/// How long an `M73` progress stands on its own (`display_status.py:9`).
+/// How long an `M73` progress stands on its own (`display_status.py:8`).
 const M73_TIMEOUT: f64 = 5.0;
 
 /// `SET_DISPLAY_TEXT`'s help text (`display_status.py:43`).
@@ -219,7 +219,7 @@ fn cmd_set_display_text(
 /// `[display_status]` section.
 ///
 /// Upstream's `printer.load_object(config, "display_status")`
-/// (`display/display.py:190`): a display always has one.
+/// (`display/display.py:188`): a display always has one.
 ///
 /// # Errors
 /// As [`DisplayStatus::new`], plus a name that is already taken.
@@ -357,7 +357,7 @@ mod tests {
         gcode.run_script("SET_DISPLAY_TEXT").await.unwrap();
         assert_eq!(status.get_status(0.0)["message"], Value::Null);
 
-        // A bare `M117` clears the message (`display_status.py:40-41`).
+        // A bare `M117` clears the message (`display_status.py:42-44`).
         gcode.run_script("M117 Again").await.unwrap();
         gcode.run_script("M117").await.unwrap();
         assert_eq!(status.get_status(0.0)["message"], Value::Null);

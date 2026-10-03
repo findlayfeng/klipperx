@@ -304,7 +304,7 @@ impl BedTiltCalibrate {
 /// intercept (upstream's initial `params`). The fitted intercept is still in
 /// the **toolhead** frame; dropping `z_offset` and the probe's XY offsets
 /// turns it into the bed frame `get_position` subtracts
-/// (`bed_tilt.py:82-84`).
+/// (`bed_tilt.py:26-30`).
 fn probe_finalize(
     bedtilt: &BedTilt,
     printer: Option<&Arc<Printer>>,
@@ -360,7 +360,7 @@ fn probe_finalize(
 /// `gcode_move::ensure` stands in for upstream's
 /// `load_object(config, 'gcode_move')`: the transform takes the slot before
 /// ready, so `gcode_move._handle_ready` leaves it alone
-/// (`gcode_move.py:51-58`).
+/// (`gcode_move.py:58-64`).
 pub fn load_config(
     config: &ConfigWrapper,
     printer: &Arc<Printer>,

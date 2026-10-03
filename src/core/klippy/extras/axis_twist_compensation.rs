@@ -13,7 +13,7 @@
 //! move the probe fires `probe:update_results` with the result it is about to
 //! report, this section adds the interpolated `z_compensations` / `zy_*` value
 //! for the probed X (and Y), and the probe reports the adjusted Z
-//! (`axis_twist_compensation.py:54-74`, `probe.py:329`).
+//! (`axis_twist_compensation.py:54-74`, `probe.py:364-367`).
 //!
 //! # Port scope
 //!
@@ -1044,7 +1044,7 @@ compensation_end_y: 195
     }
 
     /// The probe result event carries a shared result the section edits in
-    /// place — the seam `probe.py:329` uses (`axis_twist_compensation.py:54-74`).
+    /// place — the seam `probe.py:364-367` uses (`axis_twist_compensation.py:54-74`).
     #[test]
     fn the_result_handler_edits_the_shared_result_in_place() {
         let printer = Arc::new(Printer::new(ManualReactor::shared()));

@@ -268,6 +268,26 @@ identify 的命令**定义**（名称、参数、解码）与其它命令一样�
 
 一处**有意偏离**：mux 命令的“值不合法”提示里，上游按 dict 迭代序取最后一个匹配做 `Did you mean`，这里对候选排序后取第一个（消息要稳定）。默认项（注册 `value=None`）与上游一致：不给 key 时命中。
 
+#### 越界报错里限制值的写法（与上游不同，有意保留）
+
+命令与配置两边的越界报错都按这一节的说法；只有整数取值的限制值能看出差别（`0.5` 这类
+两边写法一样）。
+
+**现象**：报错里的限制值写成 `0`、`1`、`-1` 这种没有小数点的样子（如 `A must be above 0`），
+上游同样的报错写成 `0.0`、`1.0`、`-1.0`。
+
+**根因**：上游用 Python 的 `%s` 直接打印传进来的那个数；Python 打印“正好是整数的浮点”会带
+小数点（`0.0`），Rust 默认打印不带（`0`）。上游也有调用点传的是整数（例如
+`quad_gantry_level.py:30` 的 `above=0`），那里两边都是 `0`——所以不能统一补小数点，要逐处
+对着上游调用点才能改。
+
+**后果**：只影响这句话显示成什么样。判断在拼字符串之前就做完了，同一个值两边接受 / 拒绝一致；
+数值、配置解析与 `SAVE_CONFIG` 写回的值都不受影响；语料只比结果不比文本（见
+[回归测试](regression-tests.md)），所以它也不会被语料抓到。
+
+**决定**：不修，只记录。对齐的收益纯粹是文本（日志与上游文档一字不差），代价是按上游调用点
+逐处分类、再重推一批断言。
+
 ### `extras/` — 建立在核心之上的 `[<section>]` 模块
 
 对应上游 `klippy/extras/`：它们是核心（pin 层、G-Code 调度器、MCU 配置）的**使用者**，
@@ -423,6 +443,9 @@ API 本身在 `crates/klippy-api/src/`：
 | `validate.rs` | `check_unused`：装载末尾拒绝没人读过的节与选项（上游 `ConfigValidate.check_unused`） |
 | `mcu.rs` | `[mcu]` 节的专用解析：传输键二选一（`serial`/`canbus_*`/`host_library`/`test`）、`baud`/`restart_method`/`usb_power` 校验，产出 `McuConfig` |
 | `object.rs` | `configfile` 打印机对象：面向客户端的配置状态与五种 `warnings` 形状；`set` / `remove_section` 记下待回写的 autosave 值（`save_config_pending` / `save_config_pending_items`），并同步维护块 fileconfig；`SAVE_CONFIG` 命令由装载器注册，把这些值写回文件并重启 |
+
+越界报错的措辞与上游逐字一致（`configfile.py:49-59`）；限制值的数字写法见上面 `gcode.rs`
+一节的「越界报错里限制值的写法」，是同一处**有意保留**差异。
 
 ### `interface/` — 传输与设备
 

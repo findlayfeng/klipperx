@@ -413,7 +413,7 @@ impl GcodeCommand {
     }
 
     /// Upstream's bound-failure wording (`GCodeCommand.get`,
-    /// `klippy/gcode.py:78-86`): `minval`/`maxval` read "must have
+    /// `klippy/gcode.py:79-89`): `minval`/`maxval` read "must have
     /// minimum/maximum of X", while the strict neighbours `above`/`below` read
     /// "must be above/below X" — the split [`GcodeCommand::get`] documents.
     fn range_error(&self, name: &str, bound: &str, limit: impl fmt::Display) -> CommandError {
@@ -2437,7 +2437,7 @@ mod tests {
     }
 
     /// Each bound keeps upstream's exact wording (`GCodeCommand.get`,
-    /// `klippy/gcode.py:78-86`): `minval`/`maxval` say "must have
+    /// `klippy/gcode.py:79-89`): `minval`/`maxval` say "must have
     /// minimum/maximum of", `above`/`below` say "must be above/below".
     #[test]
     fn test_each_bound_keeps_upstream_wording() {

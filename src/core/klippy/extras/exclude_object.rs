@@ -1,7 +1,7 @@
 //! `[exclude_object]` — define, track and exclude print objects
 //! (upstream `klippy/extras/exclude_object.py`).
 //!
-//! The section reads **no options** (`exclude_object.py:16-46`): what it does
+//! The section reads **no options** (`exclude_object.py:12-36`): what it does
 //! at load is register the four commands and keep the object state the
 //! `[gcode_macro M486]` body drives through them.
 //!
@@ -15,7 +15,7 @@
 //! [`ExcludeObject`] also implements [`MoveTarget`]: while the current object
 //! is excluded, moves are dropped instead of forwarded to the toolhead —
 //! that is what keeps `G0 X-11` inside an excluded object from being a
-//! "Move out of range" (`exclude_object.py:103-172`, the transform).
+//! "Move out of range" (`exclude_object.py:102-172`, the transform).
 //!
 //! # Gaps this port does not close yet (H4)
 //!
@@ -27,12 +27,12 @@
 //!   region's E compensation — `offset[3]`, `extruder_adj`,
 //!   `last_position_extruded` / `last_position_excluded`,
 //!   `initial_extrusion_moves` and the XY catch-up on the way out
-//!   (`exclude_object.py:60-172`) — is ported in full; upstream stores the
+//!   (`exclude_object.py:102-172`) — is ported in full; upstream stores the
 //!   offsets in a map keyed by the active extruder's name
 //!   (`_get_extrusion_offsets`, `:94-101`) and this port keeps one array,
 //!   which is the same value while one extruder prints.
 //! - **The transform does not chain over other transforms.** Upstream keeps
-//!   the previous slot occupant (`next_transform`, `exclude_object.py:47-59`)
+//!   the previous slot occupant (`next_transform`, `exclude_object.py:38-57`)
 //!   because Python's `set_move_transform` returns it; this port's
 //!   `gcode_move::set_move_transform` does not, so the transform forwards to
 //!   the toolhead captured at `klippy:connect`. A config that combines this
@@ -64,7 +64,7 @@ const TOOLHEAD_OBJECT: &str = "toolhead";
 
 section!("exclude_object", order = 30, load = load_config);
 
-/// The object state upstream keeps in `_reset_state` (`exclude_object.py:70-75`).
+/// The object state upstream keeps in `_reset_state` (`exclude_object.py:75-79`).
 #[derive(Debug, Default)]
 struct State {
     /// Defined objects, sorted by name (`exclude_object.py:_add_object_definition`).
@@ -116,7 +116,7 @@ struct ExcludedMotion {
     /// exclusions apply (`_register_transform`, `initial_extrusion_moves = 5`).
     initial_extrusion_moves: i32,
     /// Whether the last move was inside the excluded region
-    /// (`move()`, `exclude_object.py:161-172`).
+    /// (`move()`, `exclude_object.py:182-195`).
     in_excluded_region: bool,
 }
 
@@ -147,7 +147,7 @@ impl std::fmt::Debug for ExcludeObject {
 
 impl ExcludeObject {
     /// Read the section — upstream reads no options
-    /// (`exclude_object.py:16-46`), so the bare `[exclude_object]` in the
+    /// (`exclude_object.py:12-36`), so the bare `[exclude_object]` in the
     /// corpus's `exclude_object.cfg:70` is accepted by the factory claiming
     /// it (`config/validate.rs:26-33`).
     pub fn new(_config: &ConfigWrapper, printer: &Arc<Printer>) -> Result<Self, ConfigError> {
@@ -175,7 +175,7 @@ impl ExcludeObject {
     }
 
     /// Upstream's `_handle_connect`: the toolhead exists by `klippy:connect`
-    /// (`exclude_object.py:30-31`).
+    /// (`exclude_object.py:59-60`).
     fn handle_connect(&self) {
         let Some(printer) = self.printer.upgrade() else {
             return;
@@ -186,7 +186,7 @@ impl ExcludeObject {
         }
     }
 
-    /// Upstream's `_register_transform` (`exclude_object.py:47-77`): take
+    /// Upstream's `_register_transform` (`exclude_object.py:38-57`): take
     /// `gcode_move`'s slot on the first exclusion.
     ///
     /// Needs the `Arc` because the transform registers itself. Upstream keeps
@@ -211,7 +211,7 @@ impl ExcludeObject {
         gcode_move
             .set_move_transform(Arc::clone(object) as Arc<dyn MoveTarget>, true)
             .map_err(|error| CommandError::new(error.to_string()))?;
-        // `_register_transform` (`exclude_object.py:52-64`): the offsets start
+        // `_register_transform` (`exclude_object.py:38-57`): the offsets start
         // empty and the three tracked positions start at the toolhead's.
         let pos = object
             .target()
@@ -229,7 +229,7 @@ impl ExcludeObject {
         Ok(())
     }
 
-    /// Upstream's `_unregister_transform` (`exclude_object.py:79-91`): hand
+    /// Upstream's `_unregister_transform` (`exclude_object.py:62-73`): hand
     /// the slot back to the toolhead below this transform.
     fn unregister_transform(&self) {
         if !self.lock().transform_registered {
@@ -248,7 +248,7 @@ impl ExcludeObject {
         }
     }
 
-    /// Upstream's `_reset_file` (`exclude_object.py:70-77`): the state starts
+    /// Upstream's `_reset_file` (`exclude_object.py:81-83`): the state starts
     /// over and the transform lets go of the slot.
     fn reset_file(&self) {
         {
@@ -260,7 +260,7 @@ impl ExcludeObject {
         self.unregister_transform();
     }
 
-    /// Upstream's `_exclude_object` (`exclude_object.py:219-224`): claim the
+    /// Upstream's `_exclude_object` (`exclude_object.py:279-283`): claim the
     /// transform, report, then remember the name (sorted).
     fn exclude_object(
         object: &Arc<ExcludeObject>,
@@ -281,7 +281,7 @@ impl ExcludeObject {
         Ok(())
     }
 
-    /// Upstream's `_unexclude_object` (`exclude_object.py:226-231`).
+    /// Upstream's `_unexclude_object` (`exclude_object.py:285-290`).
     fn unexclude_object(gcmd: &GcodeCommand, state: &mut State, name: &str) {
         gcmd.respond_info(&format!("Unexcluding object {name}"));
         state.excluded_objects.retain(|excluded| excluded != name);
@@ -335,7 +335,7 @@ impl ExcludeObject {
     }
 
     /// The events upstream subscribes to that this port can wire
-    /// (`exclude_object.py:29-31`): `virtual_sdcard:reset_file` has no sender
+    /// (`exclude_object.py:16-19`): `virtual_sdcard:reset_file` has no sender
     /// while `virtual_sdcard` is unported (module docs).
     fn register_handlers(self: &Arc<Self>, printer: &Arc<Printer>) {
         printer.register_event_handler(
@@ -350,7 +350,7 @@ impl ExcludeObject {
 
 impl PrinterObject for ExcludeObject {
     /// Upstream's `get_status`: `objects`, `excluded_objects`,
-    /// `current_object` (`exclude_object.py:174-181`).
+    /// `current_object` (`exclude_object.py:174-180`).
     fn get_status(&self, _eventtime: f64) -> Value {
         let state = self.lock();
         json!({
@@ -375,7 +375,7 @@ impl MoveTarget for ToolheadMove {
     }
 }
 
-/// `_ignore_move` (`exclude_object.py:128-136`): record the move without
+/// `_ignore_move` (`exclude_object.py:145-153`): record the move without
 /// forwarding it — the XY/Z drift lands in the offsets, the extrusion in
 /// `offset[3]`, so the compensation on the way out subtracts it again.
 fn ignore_move(motion: &mut ExcludedMotion, newpos: Coord) {
@@ -390,7 +390,7 @@ fn ignore_move(motion: &mut ExcludedMotion, newpos: Coord) {
     motion.max_position_excluded = motion.max_position_excluded.max(newpos.axis(E_AXIS));
 }
 
-/// `_normal_move` (`exclude_object.py:104-127`): track the move, settle the
+/// `_normal_move` (`exclude_object.py:102-143`): track the move, settle the
 /// boundary corrections, and return the position to forward — `newpos` minus
 /// the standing offsets.
 fn normal_move(motion: &mut ExcludedMotion, newpos: Coord) -> Coord {
@@ -435,7 +435,7 @@ fn normal_move(motion: &mut ExcludedMotion, newpos: Coord) -> Coord {
 }
 
 impl MoveTarget for ExcludeObject {
-    /// Upstream's `move` (`exclude_object.py:161-172`): a move inside an
+    /// Upstream's `move` (`exclude_object.py:182-195`): a move inside an
     /// excluded object is dropped, anything else passes on — with the
     /// extrusion offsets applied, so the cancelled filament is never
     /// forwarded (`_normal_move`/`_ignore_move`, `:117-146`).
@@ -498,7 +498,7 @@ impl MoveTarget for ExcludeObject {
         }
     }
 
-    /// Upstream's `get_position` (`exclude_object.py:88-93`): the toolhead's
+    /// Upstream's `get_position` (`exclude_object.py:95-100`): the toolhead's
     /// position plus the standing extrusion offset, so the gcode coordinate
     /// keeps counting filament the toolhead never extruded.
     fn position(&self) -> Coord {
@@ -522,7 +522,7 @@ impl MoveTarget for ExcludeObject {
 /// The factory `section!` names (`exclude_object.py:303`).
 ///
 /// `gcode_move::ensure` stands in for upstream's
-/// `printer.load_object(config, 'gcode_move')` (`exclude_object.py:18`).
+/// `printer.load_object(config, 'gcode_move')` (`exclude_object.py:15`).
 pub fn load_config(
     config: &ConfigWrapper,
     printer: &Arc<Printer>,
@@ -534,7 +534,7 @@ pub fn load_config(
     Ok(object)
 }
 
-/// `EXCLUDE_OBJECT_START` (`exclude_object.py:190-198`): remember the name —
+/// `EXCLUDE_OBJECT_START` (`exclude_object.py:199-204`): remember the name —
 /// defined if it was not — and make it current.
 fn cmd_exclude_object_start(
     object: &Arc<ExcludeObject>,
@@ -560,7 +560,7 @@ fn cmd_exclude_object_start(
     Ok(())
 }
 
-/// `EXCLUDE_OBJECT_END` (`exclude_object.py:200-213`): clear the current
+/// `EXCLUDE_OBJECT_END` (`exclude_object.py:207-218`): clear the current
 /// object, reporting the two upstream mismatches but never failing.
 fn cmd_exclude_object_end(
     object: &Arc<ExcludeObject>,
@@ -585,7 +585,7 @@ fn cmd_exclude_object_end(
     Ok(())
 }
 
-/// `EXCLUDE_OBJECT` (`exclude_object.py:215-238`): reset, exclude by name or
+/// `EXCLUDE_OBJECT` (`exclude_object.py:221-245`): reset, exclude by name or
 /// by the current object, or list what is excluded.
 fn cmd_exclude_object(
     object: &Arc<ExcludeObject>,
@@ -629,7 +629,7 @@ fn cmd_exclude_object(
     Ok(())
 }
 
-/// `EXCLUDE_OBJECT_DEFINE` (`exclude_object.py:240-267`): reset the file,
+/// `EXCLUDE_OBJECT_DEFINE` (`exclude_object.py:248-273`): reset the file,
 /// define an object (with its `CENTER`/`POLYGON` parsed as JSON), or list
 /// what is known.
 fn cmd_exclude_object_define(
@@ -672,7 +672,7 @@ fn cmd_exclude_object_define(
         entry[option.as_str()] = Value::String(value.clone());
     }
     if let Some(center) = parameters.get("CENTER") {
-        // Upstream: `json.loads('[%s]' % center)` (`exclude_object.py:258-260`).
+        // Upstream: `json.loads('[%s]' % center)` (`exclude_object.py:265`).
         let center: Value = serde_json::from_str(&format!("[{center}]"))
             .map_err(|error| CommandError::new(error.to_string()))?;
         entry["center"] = center;
@@ -773,7 +773,7 @@ mod tests {
         }
     }
 
-    /// Upstream reads no options (`exclude_object.py:16-46`): the bare
+    /// Upstream reads no options (`exclude_object.py:12-36`): the bare
     /// `[exclude_object]` in the corpus's `exclude_object.cfg:70` loads, and
     /// the factory claiming the section is what `check_unused` needs
     /// (`config/validate.rs:26-33`).
@@ -795,7 +795,7 @@ mod tests {
     }
 
     /// The status keys are exactly upstream's three
-    /// (`exclude_object.py:174-181`) — the M486 macro reads
+    /// (`exclude_object.py:174-180`) — the M486 macro reads
     /// `printer.exclude_object.current_object`.
     #[test]
     fn get_status_exposes_exactly_the_upstream_keys() {
@@ -812,7 +812,7 @@ mod tests {
     }
 
     /// `START`/`END` track the current object with upstream's uppercasing,
-    /// defining an unknown name on the way (`exclude_object.py:190-213`).
+    /// defining an unknown name on the way (`exclude_object.py:199-218`).
     #[test]
     fn start_tracks_and_end_clears_the_current_object() {
         let (_printer, gcode, object) = machine();
@@ -841,7 +841,7 @@ mod tests {
 
     /// `EXCLUDE_OBJECT` excludes by name, unexcludes with `RESET=NAME=…`,
     /// resets wholesale with `RESET=1`, and lists the rest
-    /// (`exclude_object.py:215-238`).
+    /// (`exclude_object.py:221-245`).
     #[test]
     fn exclude_resets_by_name_and_wholesale() {
         let (_printer, gcode, object) = machine();
@@ -864,7 +864,7 @@ mod tests {
     }
 
     /// `EXCLUDE_OBJECT CURRENT=1` without a current object raises upstream's
-    /// wording (`exclude_object.py:229-230`); with one it excludes it.
+    /// wording (`exclude_object.py:238-239`); with one it excludes it.
     #[test]
     fn exclude_current_without_one_is_upstreams_error() {
         let (_printer, gcode, object) = machine();
@@ -883,7 +883,7 @@ mod tests {
 
     /// `DEFINE` parses `CENTER` as the list upstream wraps in brackets and
     /// `POLYGON` as the list it is, keeping any other parameter as a string
-    /// (`exclude_object.py:250-264`).
+    /// (`exclude_object.py:256-268`).
     #[test]
     fn define_parses_center_and_polygon_as_json() {
         let (_printer, gcode, object) = machine();
@@ -904,7 +904,7 @@ mod tests {
     }
 
     /// `DEFINE RESET=1` is upstream's `_reset_file`: the whole state starts
-    /// over (`exclude_object.py:244-247`).
+    /// over (`exclude_object.py:81-83`).
     #[test]
     fn define_reset_clears_the_whole_state() {
         let (_printer, gcode, object) = machine();
@@ -930,7 +930,7 @@ mod tests {
     }
 
     /// The transform drops a move while the current object is excluded and
-    /// forwards everything else to the chain below (`exclude_object.py:161-172`).
+    /// forwards everything else to the chain below (`exclude_object.py:182-195`).
     #[test]
     fn a_move_in_an_excluded_region_is_dropped_and_the_rest_forwarded() {
         let (_printer, _gcode, object) = machine();
@@ -968,7 +968,7 @@ mod tests {
     /// printed *inside* the cancelled object is dropped, and the first move
     /// out subtracts the whole cancelled extrusion — the forwarded `ΔE` is
     /// zero, which is what keeps `G0 X0` after the prime block inside
-    /// `max_extrude_cross_section` (`exclude_object.py:104-146`).
+    /// `max_extrude_cross_section` (`exclude_object.py:102-153`).
     #[test]
     fn excluded_extrusion_is_never_forwarded_after_leaving_the_region() {
         let (_printer, _gcode, object) = machine();
@@ -1071,7 +1071,7 @@ mod tests {
 
     /// The four commands register with upstream's help text — a duplicate or
     /// invalid name would already have failed the load
-    /// (`exclude_object.py:184-189,191,202,216,242`).
+    /// (`exclude_object.py:197-198,206,220,247`).
     #[test]
     fn the_four_commands_are_registered_with_upstreams_help_text() {
         let (_printer, gcode, _object) = machine();

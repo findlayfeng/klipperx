@@ -291,7 +291,7 @@ impl PrinterStepper {
         let identifier = config.identifier();
         // The section identifier, not the bare id: a generic-cartesian motor is
         // `[stepper <name>]`, so its id alone (`stepper`) names no single
-        // motor (`config.get_name()`, `klippy/stepper.py:60-64`).
+        // motor (`config.get_name()`, `klippy/stepper.py:26`).
         let name = identifier.clone();
 
         let step_pin = config.get("step_pin", None)?;
@@ -341,13 +341,13 @@ impl PrinterStepper {
 
         // `rotation_distance` is millimetres per full rotation; the divisor is
         // full steps times microsteps times any gearing
-        // (`parse_step_distance`, `klippy/stepper.py:307-323`).
+        // (`parse_step_distance`, `klippy/stepper.py:297-318`).
         //
         // Radians mode (upstream's own inference when the caller does not say,
         // `stepper.py:302-304`: no `rotation_distance` but a `gear_ratio`):
         // the rotation is one turn in radians, so the step distance comes out
         // in radians — `[stepper_bed]` of a polar printer is exactly this
-        // (`polar.py:26` passes `units_in_radians=True`). A section with
+        // (`polar.py:33` passes `units_in_radians=True`). A section with
         // neither option still fails on `rotation_distance`, as upstream does.
         let rotation_distance = if !config.has("rotation_distance") && config.has("gear_ratio") {
             std::f64::consts::TAU
@@ -758,7 +758,7 @@ impl std::fmt::Debug for PrinterStepper {
 /// One axis' rail: its steppers, and the range/homing info the kinematics
 /// reads.
 ///
-/// Upstream's `GenericPrinterRail` (`klippy/stepper.py:326`) as a multi-stepper
+/// Upstream's `GenericPrinterRail` (`klippy/stepper.py:327`) as a multi-stepper
 /// group (`LookupMultiRail`, `:455`). The primary section (`[stepper_z]`) has a
 /// factory of its own; its numbered siblings (`[stepper_z1]`, `[stepper_z2]`…)
 /// do not, so they are read here through the primary's wrapper and registered as
@@ -943,7 +943,7 @@ fn tower_default_endstop(config: &ConfigWrapper) -> Result<Option<f64>, ConfigEr
 }
 
 /// The endstop a deltesian right arm falls back on: `stepper_left`'s
-/// `position_endstop` (`deltesian.py:18-21`, `default_position_endstop=def_pos_es`).
+/// `position_endstop` (`deltesian.py:22`, `default_position_endstop=def_pos_es`).
 ///
 /// # Errors
 /// When `stepper_left` is missing while `stepper_right` needs the default —
@@ -958,7 +958,7 @@ fn deltesian_arm_default_endstop(config: &ConfigWrapper) -> Result<Option<f64>, 
     primary.get_float("position_endstop", None).map(Some)
 }
 
-/// The factory `[stepper_arm]` names (`kinematics/polar.py:27`'s
+/// The factory `[stepper_arm]` names (`kinematics/polar.py:34`'s
 /// `stepper.LookupRail`): a rail with geometry. Its stepper homes toolhead X
 /// (upstream homes axis 0 on this rail, with Y pinned to 0), so it carries
 /// [`Axis::X`].
@@ -974,7 +974,7 @@ pub(crate) fn load_config_arm(
     )?))
 }
 
-/// The factory `[stepper_bed]` names (`kinematics/polar.py:26`'s
+/// The factory `[stepper_bed]` names (`kinematics/polar.py:32`'s
 /// `stepper.PrinterStepper(config, units_in_radians=True)`): a **bare** motor
 /// — no rail geometry (no `position_*` options), step distance in radians
 /// (inferred from `gear_ratio` without `rotation_distance`).
@@ -995,7 +995,7 @@ pub(crate) fn load_config_bed(
 }
 
 /// Parse the homing parameters of a `[stepper_*]` rail
-/// (`GenericPrinterRail.__init__`, `klippy/stepper.py:347-390`).
+/// (`GenericPrinterRail.__init__`, `klippy/stepper.py:328-387`).
 pub(crate) fn read_homing_info(
     config: &ConfigWrapper,
     identifier: &str,

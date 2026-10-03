@@ -235,7 +235,7 @@ impl ManualStepper {
         Ok(())
     }
 
-    /// `_submit_move` (`manual_stepper.py:63-72`) minus the trapq append.
+    /// `_submit_move` (`manual_stepper.py:63-73`) minus the trapq append.
     ///
     /// Returns the print time the move ends at. The trapezoid is *not* queued
     /// (see the module docs); only the time and `commanded_pos` advance.
@@ -723,7 +723,7 @@ mod tests {
     }
 
     /// `SPEED`/`ACCEL` fall back to the section's `velocity`/`accel`
-    /// (`manual_stepper.py:106-107`). The dwell-only timeline leaves
+    /// (`manual_stepper.py:105-106`). The dwell-only timeline leaves
     /// `next_cmd_time` at the trapezoid's duration, which is the observable.
     #[test]
     fn test_speed_and_accel_default_to_the_section_values() {

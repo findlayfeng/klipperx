@@ -109,7 +109,7 @@ klipperx（bin，src/main.rs）
   （`Pin<Box<dyn Future>>`）。它不知道终端、客户端或 TUI 库存在，`logging` 也只发
   中立的 `(Level, String)`。两套日志等级类型在 bin 里对接：那是两边的词汇相遇的
   地方，也正因为如此，`klippy` 二进制不再链接 ratatui / crossterm
-  （`strings target/release/klippy` 里一个 ratatui 都不剩，`klipperx` 则有 222 处），并且不再接受
+  （`strings target/release/klippy` 里一个 ratatui 都不剩，`klipperx` 则有 227 处），并且不再接受
   `--tui` —— 那本来就是 CLI 的选项。
 - 钩子返回就意味着主机停下：附加进来的东西就是这次调用的界面。反过来，主机自己
   的停机条件（信号、配置错误）会让钩子结束：先等一个再停另一个，两者就不会互相
@@ -124,7 +124,7 @@ klipperx（bin，src/main.rs）
 - **终端还原放在 `TerminalGuard` 的 Drop 里**：窗口任务是被 abort 的（主机先退出
   时），futures 被丢弃不会执行后面的清理。
 
-它是唯一**依赖不重合**的包：`cargo tree -p klippy-client` 里没有 `reqwest` / `flate2` / `libloading`（TUI 用的 `ratatui` 是它自己的），实测 debug 66.2 MB / release 4.0 MB，而 `klipperx` 是 debug 150.7 MB / release 11.2 MB（2026-09-23 实测）。代价是 `main.rs` 里那二十行日志初始化与主机重复——为它单开一个 crate 比重复更糟。
+它是唯一**依赖不重合**的包：`cargo tree -p klippy-client` 里没有 `reqwest` / `flate2` / `libloading`（TUI 用的 `ratatui` 是它自己的），实测 debug 63.5 MB / release 3.9 MB，而 `klipperx` 是 debug 242.4 MB / release 18.3 MB（2026-10-03 实测）。代价是 `main.rs` 里那二十行日志初始化与主机重复——为它单开一个 crate 比重复更糟。
 
 ## 模块结构
 
@@ -454,14 +454,14 @@ API 本身在 `crates/klippy-api/src/`：
 | 二进制 | 入口 | 是什么 |
 |--------|------|--------|
 | `klipperx` | `src/main.rs` | 项目的 CLI：跑主机（默认，也写作 `klippy`）、`api`、`console` |
-| `klippy` | `src/bin/klippy/main.rs` | 只有主机，等价于 `klipperx klippy`（名字取自上游的 `klippy.py`）；没有 `--tui`，不链接客户端与终端库（release 9.1 MB vs `klipperx` 11.2 MB，2026-09-23 实测） |
+| `klippy` | `src/bin/klippy/main.rs` | 只有主机，等价于 `klipperx klippy`（名字取自上游的 `klippy.py`）；没有 `--tui`，不链接客户端与终端库（release 16.1 MB vs `klipperx` 18.3 MB，2026-10-03 实测） |
 | `klippy-client` | `crates/klippy-client/src/main.rs` | 只有客户端，等价于 `klipperx api` / `klipperx console`；**自成一个包**，不编主机 |
 
 `klipperx` 的顶层参数里嵌着一份 `AppArgs`（`Option<AppArgs>`，与 `klippy` 子命令同一类型、`args_conflicts_with_subcommands` 保证两者不能混用），所以不带子命令时 `klipperx printer.cfg` 就是 `klipperx klippy printer.cfg`。那个 `Option` 不是为了可空：clap 只有在整组参数可选时才会放过组内必填项（配置文件），否则 `klipperx api …` 会来要一个它根本不需要的配置文件。
 
 参数定义全在库里（`klippy::AppArgs`、`klippy_client::{ApiArgs, ConsoleArgs}`），二进制只做三件事：解析命令行、装日志、把错误打成一行并以退出码 1 结束。后两个二进制只装载各自那部分，因此命令行与帮助文本是干净的。
 
-`klippy` 与 `klipperx` 在同一个包里，共用一套依赖（模板引擎是 `minijinja 2.24`，启用 `custom_syntax` 与 `json` 特性）；`klippy-client` 在另一个包里，只依赖 `klippy-api` 与 clap / serde_json / tokio / tracing，所以它既不会编 `reqwest` / `flate2` / `libloading`，产物也小得多（实测 debug 66.2 MB vs 150.7 MB、release 4.0 MB vs 11.2 MB，2026-09-23）。
+`klippy` 与 `klipperx` 在同一个包里，共用一套依赖（模板引擎是 `minijinja 2.24`，启用 `custom_syntax` 与 `json` 特性）；`klippy-client` 在另一个包里，只依赖 `klippy-api` 与 clap / serde_json / tokio / tracing，所以它既不会编 `reqwest` / `flate2` / `libloading`，产物也小得多（实测 debug 63.5 MB vs 242.4 MB、release 3.9 MB vs 18.3 MB，2026-10-03）。
 
 ## 目录
 

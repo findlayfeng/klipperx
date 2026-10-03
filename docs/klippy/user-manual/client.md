@@ -73,7 +73,7 @@ WARN  api: dropping malformed request (invalid JSON …): not json
 - 没有终端（比如 systemd 里）时 `--tui` 只打印一行警告，主机照常无窗口运行。
 - 这个选项属于 `klipperx`，**独立二进制 `klippy` 没有它**：窗口是客户端，会带进
   一整套终端界面库，而只负责提供 API 的 `klippy` 用不到 —— 不装它的 `klippy`
-  因此小一号（release 9.1 MB，带窗口的 `klipperx` 是 11.2 MB，2026-09-23 实测）。要在独立主机上加
+  因此小一号（release 16.1 MB，带窗口的 `klipperx` 是 18.3 MB，2026-10-03 实测）。要在独立主机上加
   窗口，另开一个终端跑 `klippy-client console -a …` 即可。
 
 > **安全提醒**：API 没有任何认证，能连上的人就能操作打印机。TCP 监听只应开在

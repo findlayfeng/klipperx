@@ -4648,4 +4648,240 @@ mod tests {
         );
         assert!(commands["M400"].get("parameters").is_none());
     }
+
+    /// FW6a-2: two responder fake MCUs in one printer, end to end.
+    ///
+    /// Each board runs its own identify/configuration handshake against its own
+    /// dictionary, [`ToolHeadObject::connect`] then brings the machine up over
+    /// both — the steppers it hands over live on *different* boards — and a
+    /// homing move whose stepper sits on the primary board and endstop on the
+    /// secondary fires across the link.
+    ///
+    /// The gap this pins shut: before [`SimulatorDevice::link_machine`] the
+    /// fake read "the carriage moved" only off the steps arriving at *its own*
+    /// instance, so a check armed on board B never saw board A's steps and
+    /// `G28` waited for a trsync that could not arrive. The pins are chosen so
+    /// a crossed identify cannot pass quietly: the stepper ports only exist on
+    /// the primary board's dictionary, the endstop pin index only on the
+    /// secondary's.
+    ///
+    /// Skipped when either dictionary was not built (`KLIPPERX_ARCHES`).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_toolhead_connect_brings_up_two_mcus_and_homes_across_them() {
+        use crate::core::klippy::cmd::clock::{ClockState, GetClock};
+        use crate::core::klippy::config::Config;
+        use crate::core::klippy::interface::devices::responder_mcu::ResponderMcu;
+        use crate::core::klippy::printer::PrinterState;
+        use crate::core::klippy::reactor::TokioReactor;
+
+        let (Some(primary), Some(aux)) = (
+            ResponderMcu::new("mcu", "atmega2560.dict"),
+            ResponderMcu::new("aux", "stm32f103.dict"),
+        ) else {
+            return;
+        };
+        let boards = [primary, aux];
+
+        // Steppers on the primary board (H/J ports, which no STM32F103
+        // dictionary has), the X endstop on the secondary (`aux:PB12`, pin
+        // index 12 — an AVR port only holds 8). Y and Z stay un-homed here.
+        let config_text = format!(
+            "{}\
+             [printer]\nkinematics: cartesian\nmax_velocity: 300\nmax_accel: 3000\n\
+             max_z_velocity: 15\nmax_z_accel: 100\n\
+             [stepper_x]\nstep_pin: PH0\ndir_pin: PH1\nrotation_distance: 40\nmicrosteps: 16\n\
+             endstop_pin: ^aux:PB12\nposition_endstop: 0\nposition_min: 0\nposition_max: 200\nhoming_speed: 50\n\
+             [stepper_y]\nstep_pin: PJ0\ndir_pin: PJ1\nrotation_distance: 40\nmicrosteps: 16\nposition_max: 200\n\
+             [stepper_z]\nstep_pin: aux:PA0\ndir_pin: aux:PA1\nrotation_distance: 8\nmicrosteps: 16\nposition_max: 200\n",
+            ResponderMcu::sections(&boards),
+        );
+
+        let reactor = Arc::new(TokioReactor::new(tokio::runtime::Handle::current()));
+        let printer = Arc::new(Printer::new(reactor));
+        let mut start_args = crate::core::klippy::api::StartArgs::collect("two-mcu.cfg", None);
+        start_args.debug_output = Some("_test_output".to_string());
+        printer.set_start_args(Arc::new(start_args));
+
+        /// What the run produced, read while the machine was still up — the
+        /// printer is torn down before anything is asserted, as `upstream`'s
+        /// harness does, so a failure cannot leave a receive task parked.
+        struct Evidence {
+            /// The two sections are answered by two *different* instances.
+            distinct_instances: bool,
+            /// Each board identified, against its own dictionary file.
+            primary_identified: bool,
+            aux_identified: bool,
+            primary_dict_len: usize,
+            aux_dict_len: usize,
+            primary_file_len: u64,
+            aux_file_len: u64,
+            /// A round trip answered by each board's own connection.
+            clocks: Vec<u32>,
+            /// `ToolHeadObject::connect` installed the motion state.
+            toolhead_connected: bool,
+            /// The MCU each stepper was handed over from, by axis.
+            stepper_chips: Vec<(String, String)>,
+            /// The axes homed by the cross-board move.
+            homed_axes: String,
+        }
+
+        let outcome: Result<Evidence, String> = async {
+            let (config, _) = Config::from_text(&config_text).map_err(|err| err.to_string())?;
+            printer
+                .load_config(&config)
+                .map_err(|err| err.to_string())?;
+            if tokio::time::timeout(Duration::from_secs(10), printer.bring_up())
+                .await
+                .is_err()
+            {
+                return Err("bring_up timed out".to_string());
+            }
+            let state = printer.get_state_message();
+            if state.category != PrinterState::Ready {
+                return Err(format!("not ready: {}", state.message));
+            }
+
+            // Two instances of the responder, each holding the file its own
+            // section asked for: a shared or crossed instance shows up here.
+            let primary_device = boards[0]
+                .device(&printer)
+                .ok_or_else(|| "[mcu mcu] has no responder instance".to_string())?;
+            let aux_device = boards[1]
+                .device(&printer)
+                .ok_or_else(|| "[mcu aux] has no responder instance".to_string())?;
+            let distinct_instances = !Arc::ptr_eq(&primary_device, &aux_device);
+            let primary_dict_len = primary_device.dictionary_len();
+            let aux_dict_len = aux_device.dictionary_len();
+            let primary_file_len = std::fs::metadata(boards[0].dict())
+                .map_err(|err| err.to_string())?
+                .len();
+            let aux_file_len = std::fs::metadata(boards[1].dict())
+                .map_err(|err| err.to_string())?
+                .len();
+
+            // Each board answers its own query over its own connection.
+            let mut clocks = Vec::new();
+            for board in &boards {
+                let mcu = board
+                    .mcu(&printer)
+                    .ok_or_else(|| format!("[mcu {}] is not connected", board.name()))?;
+                let clock = mcu
+                    .call_msg::<GetClock, ClockState>(&GetClock, Duration::from_secs(2))
+                    .await
+                    .map_err(|err| format!("{}: {err}", board.name()))?
+                    .clock;
+                clocks.push(clock);
+            }
+            let primary_identified = boards[0]
+                .mcu(&printer)
+                .map(|mcu| mcu.is_identified())
+                .unwrap_or(false);
+            let aux_identified = boards[1]
+                .mcu(&printer)
+                .map(|mcu| mcu.is_identified())
+                .unwrap_or(false);
+
+            // What `ToolHeadObject::connect` took: the motion state installed,
+            // and every stepper paired with the MCU its pins live on.
+            let toolhead = printer
+                .lookup_object_as::<ToolHeadObject>("toolhead")
+                .ok_or_else(|| "the toolhead is not registered".to_string())?;
+            let (toolhead_connected, stepper_chips) = {
+                let guard = toolhead.lock();
+                let connected = guard
+                    .as_ref()
+                    .ok_or_else(|| "ToolHeadObject::connect has not run".to_string())?;
+                let mut chips: Vec<(String, String)> = connected
+                    .mcu_steppers
+                    .iter()
+                    .map(|(name, stepper)| (name.clone(), stepper.chip().name().to_string()))
+                    .collect();
+                chips.sort();
+                (true, chips)
+            };
+
+            // One machine now: a move on either board trips the checks armed
+            // on the other, which is what the cross-board `G28 X` needs.
+            ResponderMcu::link_machine(&boards, &printer)?;
+            let dispatcher = printer
+                .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+                .ok_or_else(|| "the g-code dispatcher is not registered".to_string())?;
+            tokio::time::timeout(Duration::from_secs(30), dispatcher.run_script("G28 X\n"))
+                .await
+                .map_err(|_| "G28 X timed out waiting for a trsync".to_string())?
+                .map_err(|err| format!("G28 X failed: {err}"))?;
+            let state = printer.get_state_message();
+            if state.category != PrinterState::Ready {
+                return Err(format!(
+                    "G28 X left the machine {:?}: {}",
+                    state.category, state.message
+                ));
+            }
+            let homed_axes = toolhead.get_status(0.0)["homed_axes"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+
+            Ok(Evidence {
+                distinct_instances,
+                primary_identified,
+                aux_identified,
+                primary_dict_len,
+                aux_dict_len,
+                primary_file_len,
+                aux_file_len,
+                clocks,
+                toolhead_connected,
+                stepper_chips,
+                homed_axes,
+            })
+        }
+        .await;
+        printer.teardown();
+
+        let evidence = outcome.expect("the two-MCU machine comes up and homes across the boards");
+        assert!(
+            evidence.distinct_instances,
+            "two responder instances, one per [mcu …] section"
+        );
+        assert!(
+            evidence.primary_identified && evidence.aux_identified,
+            "each board ran its own identify handshake"
+        );
+        assert_eq!(
+            evidence.primary_dict_len as u64, evidence.primary_file_len,
+            "the primary board installed its own dictionary"
+        );
+        assert_eq!(
+            evidence.aux_dict_len as u64, evidence.aux_file_len,
+            "the secondary board installed its own dictionary"
+        );
+        assert_ne!(
+            evidence.primary_file_len, evidence.aux_file_len,
+            "the two dictionaries differ, so the lengths say which board got which"
+        );
+        assert!(
+            evidence.clocks.iter().all(|clock| *clock > 0),
+            "each board answered a query on its own connection: {:?}",
+            evidence.clocks
+        );
+        assert!(
+            evidence.toolhead_connected,
+            "ToolHeadObject::connect installed the motion state"
+        );
+        assert_eq!(
+            evidence.stepper_chips,
+            [
+                ("stepper_x".to_string(), "mcu".to_string()),
+                ("stepper_y".to_string(), "mcu".to_string()),
+                ("stepper_z".to_string(), "aux".to_string()),
+            ],
+            "every stepper was handed over with the MCU its pins live on"
+        );
+        assert!(
+            evidence.homed_axes.contains('x'),
+            "the stepper on the primary board tripped the endstop on the secondary: {:?}",
+            evidence.homed_axes
+        );
+    }
 }

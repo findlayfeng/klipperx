@@ -9,7 +9,9 @@
 //! - `BED_MESH_CALIBRATE`: generate the probe points, move to each (net of the
 //!   probe offsets), probe it through the `probe` object's session, store the
 //!   probed grid;
-//! - `BED_MESH_CLEAR` and the `get_status` shape clients read.
+//! - `BED_MESH_CLEAR`, the `bed_mesh/dump_mesh` endpoint (which reads the
+//!   stored grid through [`BedMesh::loaded_mesh`]) and the `get_status` shape
+//!   clients read.
 //!
 //! **Not implemented yet** (tracked in `TODO.md` H9, next unit):
 //!
@@ -21,7 +23,8 @@
 //!   mesh applies to moves (`MoveSplitter`) — so a calibration currently does
 //!   **not** affect subsequent moves;
 //! - the profile commands (`BED_MESH_PROFILE`, `BED_MESH_OUTPUT`, `BED_MESH_MAP`,
-//!   `BED_MESH_OFFSET`) and the `bed_mesh/dump_mesh` endpoint.
+//!   `BED_MESH_OFFSET`): a calibration answers as the default profile and
+//!   nothing is saved across a restart, so `profiles` stays empty.
 //!
 //! The load side is complete: every option below is claimed, which is what the
 //! corpus needs, and the gaps above are capability gaps, not silent shortcuts —
@@ -50,6 +53,15 @@ const TOOLHEAD_OBJECT: &str = "toolhead";
 
 /// The Z axis index, as [`Coord`] numbers them.
 const Z_AXIS: usize = 2;
+
+/// The object the loader registers `[bed_mesh]` under — the name
+/// `bed_mesh/dump_mesh` looks the stored grid up by.
+pub const BED_MESH_OBJECT: &str = "bed_mesh";
+
+/// The profile a calibration is stored under: upstream's default for
+/// `BED_MESH_CALIBRATE PROFILE=` (`bed_mesh.py:645`), which this unit does not
+/// read yet.
+const DEFAULT_PROFILE: &str = "default";
 
 /// One `faulty_region_<N>` rectangle: `(min_x, min_y, max_x, max_y)`.
 type FaultyRegion = (f64, f64, f64, f64);
@@ -363,12 +375,60 @@ pub fn generate_points(options: &BedMeshOptions) -> Result<Vec<(f64, f64)>, Comm
     Ok(points)
 }
 
+/// One loaded mesh: which profile it answers as and the grid itself.
+///
+/// The data half of a `bed_mesh/dump_mesh` reply — upstream reads the same two
+/// things off the loaded `z_mesh` (`bed_mesh.py:296-302`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct LoadedMesh {
+    /// The profile the grid answers as (`z_mesh.get_profile_name()`).
+    pub name: String,
+    /// The probed Z values, one row per Y line, each row X-ascending
+    /// (`z_mesh.get_probed_matrix()`).
+    pub rows: Vec<Vec<f64>>,
+}
+
+/// Group one calibration's results into the grid upstream stores
+/// (`bed_mesh.py:713-741`): a new row whenever Y moves by more than upstream's
+/// `abs_tol=.1`, each row X-ascending — the generated points zigzag, so the
+/// order they are probed in is not the order they sit in the grid.
+fn rows_by_y(points: &[(f64, f64)], values: &[f64]) -> Vec<Vec<f64>> {
+    debug_assert_eq!(points.len(), values.len());
+    let mut rows: Vec<Vec<f64>> = Vec::new();
+    let mut row: Vec<(f64, f64)> = Vec::new();
+    let mut row_y: Option<f64> = None;
+    for (&(x, y), &z) in points.iter().zip(values) {
+        let same_row = row_y.is_some_and(|prev| (y - prev).abs() <= 0.1);
+        if !same_row {
+            if !row.is_empty() {
+                rows.push(take_row(&mut row));
+            }
+            row_y = Some(y);
+        }
+        row.push((x, z));
+    }
+    if !row.is_empty() {
+        rows.push(take_row(&mut row));
+    }
+    rows
+}
+
+/// One row, sorted X-ascending and taken out of `row`.
+fn take_row(row: &mut Vec<(f64, f64)>) -> Vec<f64> {
+    row.sort_by(|left, right| {
+        left.0
+            .partial_cmp(&right.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    row.drain(..).map(|(_, z)| z).collect()
+}
+
 /// One configured `[bed_mesh]` (`bed_mesh.py:BedMesh` + `BedMeshCalibrate`).
 pub struct BedMesh {
     /// The options as read (shared with the command handlers).
     options: Arc<Mutex<BedMeshOptions>>,
-    /// The last calibration's probed Z values, row-major (shared likewise).
-    mesh: Arc<Mutex<Option<Vec<f64>>>>,
+    /// The last calibration's grid, if any (shared likewise).
+    mesh: Arc<Mutex<Option<LoadedMesh>>>,
 }
 
 impl BedMesh {
@@ -456,7 +516,13 @@ impl BedMesh {
                             }
                             probe.end_probe_session()?;
 
-                            *mesh.lock().unwrap_or_else(|p| p.into_inner()) = Some(probed);
+                            // Store the grid: grouped into rows by Y, each
+                            // row X-ascending (`bed_mesh.py:713-741`).
+                            let rows = rows_by_y(&points, &probed);
+                            *mesh.lock().unwrap_or_else(|p| p.into_inner()) = Some(LoadedMesh {
+                                name: DEFAULT_PROFILE.to_string(),
+                                rows,
+                            });
                             gcmd.respond_info(&format!(
                                 "Mesh Bed Leveling Complete ({algorithm} mesh stored, {} points)",
                                 points.len()
@@ -503,24 +569,44 @@ impl BedMesh {
             .clone()
     }
 
-    /// The last calibration's probed Z values, if any.
-    pub fn probed_matrix(&self) -> Option<Vec<f64>> {
+    /// The loaded mesh — the profile it answers as and its probed grid — or
+    /// `None` while the bed holds no calibration (`bed_mesh.py:296`, which
+    /// then answers `{}`).
+    ///
+    /// This is what `bed_mesh/dump_mesh` and `get_status` both read, so the
+    /// two cannot disagree about what is loaded.
+    pub fn loaded_mesh(&self) -> Option<LoadedMesh> {
         self.mesh.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// Put a grid in place without running a calibration — the tests' stand-in
+    /// for a completed `BED_MESH_CALIBRATE`.
+    #[cfg(test)]
+    pub(crate) fn store_mesh_for_test(&self, name: &str, rows: Vec<Vec<f64>>) {
+        *self.mesh.lock().unwrap_or_else(|p| p.into_inner()) = Some(LoadedMesh {
+            name: name.to_string(),
+            rows,
+        });
     }
 }
 
 impl PrinterObject for BedMesh {
     fn get_status(&self, _eventtime: f64) -> Value {
         let options = self.options.lock().unwrap_or_else(|p| p.into_inner());
-        let probed = self.mesh.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let loaded = self.loaded_mesh();
+        let profile_name = loaded
+            .as_ref()
+            .map(|mesh| mesh.name.clone())
+            .unwrap_or_default();
+        let rows = loaded.map(|mesh| mesh.rows).unwrap_or_default();
         json!({
-            "profile_name": "",
+            "profile_name": profile_name,
             "mesh_min": options.mesh_min,
             "mesh_max": options.mesh_max,
-            "probed_matrix": probed.clone().unwrap_or_default(),
+            "probed_matrix": rows,
             // The interpolated matrix is the next unit's job; clients that
             // expect a mesh get the probed grid for now.
-            "mesh_matrix": probed.unwrap_or_default(),
+            "mesh_matrix": rows.clone(),
             "profiles": {},
         })
     }
@@ -860,5 +946,65 @@ mod tests {
         let floored = options(&[("mesh_radius", "65.55")]);
         assert_eq!(floored.mesh_min, [-65.5, -65.5]);
         assert_eq!(floored.mesh_max, [65.5, 65.5]);
+    }
+
+    /// The probe order is not the grid order: rows zigzag, so the stored
+    /// values are grouped by Y and each row sorted X-ascending
+    /// (`bed_mesh.py:713-741`).
+    #[test]
+    fn probed_values_are_grouped_into_rows_by_y() {
+        let read = options(&[
+            ("mesh_min", "0,0"),
+            ("mesh_max", "40,40"),
+            ("probe_count", "3,3"),
+        ]);
+        let points = generate_points(&read).unwrap();
+        let values: Vec<f64> = (0..points.len()).map(|index| index as f64 / 10.).collect();
+
+        // Row 1 is probed right to left, so its three values come back
+        // reversed once the row is sorted by X.
+        assert_eq!(
+            rows_by_y(&points, &values),
+            vec![
+                vec![0.0, 0.1, 0.2],
+                vec![0.5, 0.4, 0.3],
+                vec![0.6, 0.7, 0.8],
+            ]
+        );
+    }
+
+    /// `get_status` and `bed_mesh/dump_mesh` read the same loaded mesh, so an
+    /// `objects/query` names the profile and carries the grid as rows too.
+    #[tokio::test]
+    async fn get_status_reports_the_loaded_profile_and_grid() {
+        use crate::core::klippy::reactor::ManualReactor;
+
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        printer
+            .add_object(
+                GCODE_OBJECT,
+                Arc::new(GCodeDispatch::new(Arc::clone(&printer))),
+            )
+            .unwrap();
+        let bed = BedMesh::new(
+            &ConfigWrapper::untracked(&section(&[
+                ("mesh_min", "0,0"),
+                ("mesh_max", "100,100"),
+                ("probe_count", "3,3"),
+            ])),
+            &printer,
+        )
+        .unwrap();
+
+        assert_eq!(bed.get_status(0.0)["profile_name"], "");
+        bed.store_mesh_for_test("default", vec![vec![0.1, 0.2], vec![0.3, 0.4]]);
+
+        let status = bed.get_status(0.0);
+        assert_eq!(status["profile_name"], "default");
+        assert_eq!(
+            status["probed_matrix"],
+            serde_json::json!([[0.1, 0.2], [0.3, 0.4]])
+        );
+        assert_eq!(status["mesh_matrix"], status["probed_matrix"]);
     }
 }

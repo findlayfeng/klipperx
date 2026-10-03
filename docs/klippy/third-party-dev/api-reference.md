@@ -65,12 +65,10 @@
 ## 端点列表
 
 > **实现状态**（截至 2026-10-03，权威清单见主机侧 `api/endpoints/mod.rs` 的状态表）：
-> 下文第 1–16 节（`info` / `emergency_stop` / `list_endpoints` / `register_remote_method` /
-> `objects/*` / 五个 `gcode/*` / `query_endstops/status` / `pause_resume/*`）**已实现**；
-> 第 18 节（`*/dump_*`）**部分落地**——mux 机制与 `ldc1612` / `adxl345` / `mpu9250` / `load_cell`
-> （`dump_force`）四个消费者已落地（实例随配置重载注销并在下一轮重新注册，旧连接不再收到推送），
-> 其余 dump 端点随各自的 extras 落地；第 17 节（`bed_mesh/dump_mesh`）**未实现**（随 `bed_mesh` 落地）。
-> 未注册的路径报 `No registered callback`，已注册端点上的未知方法报 `unknown method`。本文描述的是目标形状，
+> 下文第 1–17 节（`info` / `emergency_stop` / `list_endpoints` / `register_remote_method` /
+> `objects/*` / 五个 `gcode/*` / `query_endstops/status` / `pause_resume/*` / `bed_mesh/dump_mesh`）**已实现**；
+> 第 18 节（`*/dump_*`）**部分落地**——mux 机制与 `ldc1612` / `adxl345` / `mpu9250` / `load_cell`（`dump_force`）四个消费者已落地（实例随配置重载注销并在下一轮重新注册，旧连接不再收到推送），
+> 其余 dump 端点随各自的 extras 落地。未注册的路径（含未装载 `[bed_mesh]` 节时的 `bed_mesh/dump_mesh`）报 `No registered callback`，已注册端点上的未知方法报 `unknown method`。本文描述的是目标形状，
 > 实现随模块推进。
 
 ### 1. `info` — 获取打印机状态信息
@@ -552,6 +550,18 @@
 | `profiles` | object | 所有已保存的 profile |
 | `calibration` | object | 仅在传入 `mesh_args` 时存在 |
 
+> **与上游的已知差异（2026-10-03 落地时）**：
+> ① `calibration` 本机仅在传 `mesh_args` 时返回，上游无条件返回（`bed_mesh.py:304-307`）；
+> 且本机缺 `probe_path`/`rapid_path`（探针调度路径未实现），上游另返回的 `probe_offsets` /
+> `axis_minimum` / `axis_maximum`（`bed_mesh.py:308-310`）本机未返回。
+> ② `mesh_args` 只作开关，其键不回灌配置（上游 `update_config` 的 per-command 覆盖未实现）。
+> ③ `mesh_matrix` 当前等于 `probed_matrix`（插值属 H9）；`algo` 报配置值，上游
+> `_verify_algorithm` 可能改写为 `direct`/强制 lagrange（同属 H9）。
+> ④ `profiles` 恒为 `{}`（`BED_MESH_PROFILE` 未做）；`current_mesh.name` 报 `default`
+> （上游 `PROFILE` 默认值）。
+> ⑤ 圆床的行按实测返回（可能非方阵），上游会复制两端补成方阵。
+> ⑥ 请求参数只有 `mesh_args`（参数表无 profile 名键，profile 名只出现在 `current_mesh.name`）。
+
 > 运行期状态也可通过 `objects/query` 查询 `bed_mesh` 对象：
 > ```json
 > {"objects": {"bed_mesh": ["mesh_max", "mesh_min", "probed_matrix", "mesh_matrix", "profile_name", "profiles"]}}
@@ -735,11 +745,11 @@
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| `profile_name` | string | 当前网格配置文件名（未探测时为空串） |
+| `profile_name` | string | 当前网格配置文件名（已探测时为 `default`，未探测时为空串） |
 | `mesh_min` | Coord | 网格最小坐标 `[x, y]` |
 | `mesh_max` | Coord | 网格最大坐标 `[x, y]` |
-| `probed_matrix` | array | 实测 Z 值矩阵 |
-| `mesh_matrix` | array | 插值/补偿后 Z 值矩阵 |
+| `probed_matrix` | array | 实测 Z 值矩阵（二维：按 Y 分行、行内 X 升序，对齐上游 zigzag 存格） |
+| `mesh_matrix` | array | 插值/补偿后 Z 值矩阵（当前等于 `probed_matrix`，插值属 H9） |
 | `profiles` | object | 所有已保存的网格 profile |
 
 ### `query_endstops`

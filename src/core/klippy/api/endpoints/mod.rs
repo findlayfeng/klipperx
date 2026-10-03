@@ -17,8 +17,9 @@
 //! [`info`](info), [`objects/list`](objects_list), [`objects/query`](objects_query),
 //! [`objects/subscribe`](objects_subscribe), the five [`gcode`](gcode)
 //! endpoints, [`emergency_stop`](emergency_stop),
-//! [`register_remote_method`](register_remote_method) and the three
-//! [`pause_resume`](pause_resume) endpoints are written and registered by
+//! [`register_remote_method`](register_remote_method), the three
+//! [`pause_resume`](pause_resume) endpoints and
+//! [`bed_mesh/dump_mesh`](bed_mesh_dump) are written and registered by
 //! [`register`](super::register); the rest of the documented surface is not
 //! written yet, so the table below is the checklist.
 //!
@@ -34,7 +35,7 @@
 //! | `query_endstops/status` | done ([`query_endstops`]) |
 //! | `register_remote_method` | done ([`register_remote_method`]) |
 //! | `pause_resume/{pause,resume,cancel}` | done ([`pause_resume`]) |
-//! | `bed_mesh/dump_mesh` | not started |
+//! | `bed_mesh/dump_mesh` | done ([`bed_mesh_dump`]) |
 //! | the `*/dump_*` mux endpoints | mechanism ready ([`WebhooksStatus::register_mux_endpoint`](super::webhooks::WebhooksStatus::register_mux_endpoint); instances are re-registered per config load and detached on the way out); `ldc1612` / `adxl345` / `mpu9250` / `load_cell` consumed; the rest arrive with their extras |
 
 /// Declare that this module installs its endpoints. Expands to nothing;
@@ -47,6 +48,7 @@ macro_rules! endpoint {
     ($($tokens:tt)*) => {};
 }
 
+pub mod bed_mesh_dump;
 pub mod emergency_stop;
 pub mod gcode;
 pub mod info;

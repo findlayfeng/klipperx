@@ -2911,6 +2911,18 @@ impl Mcu {
         Self::from_parts(name.into(), interface)
     }
 
+    /// The dictionary-driven fake MCU behind this connection, when the section
+    /// asked for one (`test: dict=`); `None` on every other transport.
+    ///
+    /// How a multi-instance test reaches the exact responder that answers its
+    /// `[mcu …]` section (see
+    /// [`crate::core::klippy::interface::devices::responder_mcu`]).
+    pub(crate) fn simulator_device(
+        &self,
+    ) -> Option<Arc<crate::core::klippy::interface::SimulatorDevice>> {
+        self.interface.simulator_device()
+    }
+
     /// Whether both transport tasks have finished — the test seam behind
     /// [`Mcu::close`]'s promise that a session's tasks stop without the last
     /// `Arc` going away.

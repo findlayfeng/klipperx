@@ -109,6 +109,21 @@ impl Interface {
         Self::with_transport(Transport::Simulator(Arc::new(device)))
     }
 
+    /// The dictionary-driven fake MCU this interface is wired to, when it is
+    /// one (`test: dict=`).
+    ///
+    /// The test-side handle the other way round: a multi-MCU test needs the
+    /// *instance* behind each `[mcu …]` section — to prove each board answers
+    /// its own dictionary, and to link instances into one machine — not just
+    /// the connection that talks to it.
+    #[cfg(test)]
+    pub(crate) fn simulator_device(&self) -> Option<Arc<SimulatorDevice>> {
+        match &self.transport {
+            Transport::Simulator(device) => Some(Arc::clone(device)),
+            _ => None,
+        }
+    }
+
     /// Create an interface over a recording wire (`RecordingWire`): records
     /// every frame sent, acks, and answers scripted requests — for tests that
     /// assert *when* a message goes out without predicting its derived bytes.

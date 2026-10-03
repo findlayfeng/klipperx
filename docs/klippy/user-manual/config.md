@@ -943,7 +943,7 @@ cartesian 在 late 阶段认领；注册 `dual_carriage` 对象与 `SET_DUAL_CAR
 |------|------|------|
 | `recover_velocity` | `50.0` | `RESUME` 未给 `VELOCITY=` 时的恢复速度（mm/s） |
 
-四条命令 `PAUSE` / `RESUME`（`VELOCITY=`）/ `CLEAR_PAUSE` / `CANCEL_PRINT` 与 `get_status` 的 `is_paused` 已落地（help 与状态文案逐字照上游）。**gap**：`virtual_sdcard` 无 `is_active`/`do_pause`/`do_resume`/`do_cancel`（SD 分支不可达，命令走 `action:paused`/`action:resumed`/`action:cancel`）；`pause_resume/{pause,resume,cancel}` 三个 webhooks 端点未注册。
+四条命令 `PAUSE` / `RESUME`（`VELOCITY=`）/ `CLEAR_PAUSE` / `CANCEL_PRINT` 与 `get_status` 的 `is_paused` 已落地（help 与状态文案逐字照上游）。**SD 分支已接线**（2026-10-03，`0890669`）：回放中 `PAUSE` / `RESUME` / `CANCEL_PRINT` 真驱动 `virtual_sdcard`（这三支**不发** `action:*` 行，同上游；`RESUME` 撞上 `SD busy` 从命令冒出、`is_paused` 保留），空闲时仍走 `respond_info` 发 `action:paused` / `action:resumed` / `action:cancel`；`pause_resume/{pause,resume,cancel}` 三个 webhooks 端点已注册（`84a09e0`）。
 
 ### `[filament_switch_sensor <name>]` / `[filament_motion_sensor <name>]` — 断料检测（wave-2）
 

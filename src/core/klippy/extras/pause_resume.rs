@@ -18,25 +18,26 @@
 //! [`PauseResume::send_pause_command`] on a runout
 //! (`filament_switch_sensor.py:48-53`).
 //!
+//! While a file replay runs, the four commands take upstream's SD branches:
+//! the file itself is paused, resumed or cancelled and no `action:*` line is
+//! reported; with no replay running they answer through `respond_info`
+//! (`pause_resume.py:45-46,47-59,68-75,92-97`).
+//!
 //! # What is not here
 //!
-//! - **The virtual-SD branch is unreachable.** Upstream's `is_sd_active`
-//!   calls `v_sd.is_active()` and the pause/resume/cancel paths call
-//!   `v_sd.do_pause()`/`do_resume()`/`do_cancel()`
-//!   (`pause_resume.py:37-39,46-56,57-65,84-89`). This port's
-//!   `[virtual_sdcard]` (`extras/virtual_sdcard.rs`) replays no file and
-//!   exposes none of those — its status reports `is_active: false` and
-//!   nothing else — so [`SdCard`] has no production implementor that can
-//!   drive a replay, and `is_sd_active()` is always `false`. The commands
-//!   therefore take the `respond_info` side of each branch
-//!   (`action:paused`/`action:resumed`/`action:cancel`).
+//! - **`do_pause` does not wait for the replay task.** Upstream's
+//!   `virtual_sdcard.do_pause` spins until the replay task has exited
+//!   (`virtual_sdcard.py:123-127`); this port's sets the pause flag and
+//!   returns at once (`extras/virtual_sdcard.rs` module docs). So a
+//!   `CANCEL_PRINT` can close the file under a replay that is still winding
+//!   down, and a `RESUME` that outruns the exiting task is refused with
+//!   `SD busy` — the refusal upstream's `do_resume` raises
+//!   (`virtual_sdcard.py:128-133`) in a much narrower window.
 //! - **The three webhooks endpoints** (`pause_resume/cancel|pause|resume`,
-//!   `pause_resume.py:47-52`) are not installed. The API crate has the
-//!   registration primitive (`endpoint!` + the `Api` table), but the
-//!   endpoints live in `api/endpoints/` and the object they drive is built
-//!   while the config is read — wiring them is a separate change. The
-//!   endpoint table already lists them "not started"
-//!   (`api/endpoints/mod.rs`).
+//!   `pause_resume.py:26-32`) live on the API side, in
+//!   `api/endpoints/pause_resume.rs`: each one runs the matching command
+//!   (`CANCEL_PRINT`/`PAUSE`/`RESUME`) through the dispatcher, looked up per
+//!   request because the endpoints are installed before this object is built.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
@@ -45,6 +46,7 @@ use serde_json::{json, Value};
 
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
 use crate::core::klippy::event::KlippyEvent;
+use crate::core::klippy::extras::virtual_sdcard::VirtualSdCard;
 use crate::core::klippy::gcode::{
     CommandError, CommandFuture, CommandHandler, GCodeDispatch, GcodeCommand, GCODE_OBJECT,
 };
@@ -56,50 +58,51 @@ use crate::core::klippy::printer::{Printer, PrinterObject};
 pub const PAUSE_RESUME_OBJECT: &str = "pause_resume";
 
 /// The object upstream holds at connect for `is_sd_active`
-/// (`pause_resume.py:36-37`).
+/// (`pause_resume.py:33-34`).
 const VIRTUAL_SDCARD_OBJECT: &str = "virtual_sdcard";
 
 section!("pause_resume", order = 30, load = load_config);
 
 /// What `pause_resume` needs from `virtual_sdcard`
-/// (`pause_resume.py:37-39,46-56,57-65,84-89`).
+/// (`pause_resume.py:45-46,47-59,68-75,92-97`).
 ///
-/// No production type implements this yet — this port's `[virtual_sdcard]`
-/// carries no pause/resume/cancel primitive (module docs) — so the SD branch
-/// stays unreachable. The trait is the seam so the branch is still covered by
-/// a stand-in, the same shape as `sdcard_loop.rs`'s `SdCardFile`.
+/// Two implementors: `RegisteredSdCard`, which the connect handler builds
+/// from this port's registered `[virtual_sdcard]` object and which drives the
+/// real replay primitives, and a test stand-in — the same shape as
+/// `sdcard_loop.rs`'s `SdCardFile`.
 pub trait SdCard: Send + Sync {
-    /// `virtual_sdcard`'s `is_active`: a file is being replayed.
+    /// `is_active` (`pause_resume.py:46`): a file replay is running.
     fn is_active(&self) -> bool;
-    /// `do_pause`: stop the replay (`pause_resume.py:51`).
+    /// `do_pause`: stop the replay (`pause_resume.py:55`).
     fn do_pause(&self);
-    /// `do_resume`: continue the replay (`pause_resume.py:61`).
-    fn do_resume(&self);
-    /// `do_cancel`: cancel the running print (`pause_resume.py:87`).
+    /// `do_resume`: continue the replay; `Err("SD busy")` while one is still
+    /// running (`pause_resume.py:71`, `virtual_sdcard.py:128-133`).
+    fn do_resume(&self) -> Result<(), CommandError>;
+    /// `do_cancel`: cancel the running print (`pause_resume.py:94`).
     fn do_cancel(&self);
 }
 
-/// The registered `virtual_sdcard` object behind the [`SdCard`] seam.
-///
-/// `is_active` is read from its status — the only thing this port's
-/// `[virtual_sdcard]` exposes, and the flag upstream's `is_active` maps to.
-/// The three control calls have no primitive to reach
-/// (`extras/virtual_sdcard.rs` replays nothing); this status is `false`
-/// today, so they are never reached.
-struct VirtualSdCard(Arc<dyn PrinterObject>);
+/// The registered `virtual_sdcard` object behind the [`SdCard`] seam — the
+/// production implementor, holding this port's real replay object
+/// (`extras/virtual_sdcard.rs`) and forwarding to its primitives.
+struct RegisteredSdCard(Arc<VirtualSdCard>);
 
-impl SdCard for VirtualSdCard {
+impl SdCard for RegisteredSdCard {
     fn is_active(&self) -> bool {
-        self.0.get_status(0.0)["is_active"]
-            .as_bool()
-            .unwrap_or(false)
+        self.0.is_active()
     }
 
-    fn do_pause(&self) {}
+    fn do_pause(&self) {
+        self.0.do_pause();
+    }
 
-    fn do_resume(&self) {}
+    fn do_resume(&self) -> Result<(), CommandError> {
+        self.0.do_resume()
+    }
 
-    fn do_cancel(&self) {}
+    fn do_cancel(&self) {
+        self.0.do_cancel();
+    }
 }
 
 /// The `[pause_resume]` module object (upstream's `PauseResume`).
@@ -173,15 +176,17 @@ impl PauseResume {
         self.is_paused.load(Ordering::SeqCst)
     }
 
-    /// Upstream's `is_sd_active` (`pause_resume.py:37-39`): a file is being
-    /// replayed from `virtual_sdcard`. Always `false` here (module docs).
+    /// Upstream's `is_sd_active` (`pause_resume.py:45-46`): a file is being
+    /// replayed from `virtual_sdcard`, read from the real replay state
+    /// through the [`SdCard`] seam.
     fn is_sd_active(&self) -> bool {
         self.v_sd().is_some_and(|sd| sd.is_active())
     }
 
-    /// Upstream's `send_pause_command` (`pause_resume.py:46-56`): pause from
-    /// inside an event, once. The SD branch is unreachable here, so this is
-    /// the `respond_info("action:paused")` branch (module docs).
+    /// Upstream's `send_pause_command` (`pause_resume.py:47-59`): pause from
+    /// inside an event, once. With a replay running the file is paused and
+    /// nothing is reported; otherwise this is the
+    /// `respond_info("action:paused")` branch.
     pub fn send_pause_command(&self) {
         if self.pause_command_sent.load(Ordering::SeqCst) {
             return;
@@ -198,18 +203,22 @@ impl PauseResume {
         self.pause_command_sent.store(true, Ordering::SeqCst);
     }
 
-    /// Upstream's `send_resume_command` (`pause_resume.py:57-65`): continue
-    /// the replay, or report `action:resumed`, and arm the next pause.
-    fn send_resume_command(&self) {
+    /// Upstream's `send_resume_command` (`pause_resume.py:68-75`): continue
+    /// the replay — one still winding down is refused with `SD busy`, which
+    /// surfaces out of `RESUME` as upstream's exception does
+    /// (`virtual_sdcard.py:128-133`) — or report `action:resumed`, and arm
+    /// the next pause.
+    fn send_resume_command(&self) -> Result<(), CommandError> {
         if self.sd_paused.load(Ordering::SeqCst) {
             if let Some(sd) = self.v_sd() {
-                sd.do_resume();
+                sd.do_resume()?;
             }
             self.sd_paused.store(false, Ordering::SeqCst);
         } else {
             self.respond_info("action:resumed");
         }
         self.pause_command_sent.store(false, Ordering::SeqCst);
+        Ok(())
     }
 
     /// Upstream's `cmd_CLEAR_PAUSE` body (`pause_resume.py:79-81`): forget
@@ -220,7 +229,7 @@ impl PauseResume {
         self.pause_command_sent.store(false, Ordering::SeqCst);
     }
 
-    /// The SD side of `CANCEL_PRINT` (`pause_resume.py:86-87`): cancel the
+    /// The SD side of `CANCEL_PRINT` (`pause_resume.py:93-94`): cancel the
     /// running file. A no-op without an SD object — the only caller reaches it
     /// through `is_sd_active`/`sd_paused`, which need one.
     fn cancel_sd_print(&self) {
@@ -229,16 +238,16 @@ impl PauseResume {
         }
     }
 
-    /// Upstream's `handle_connect` (`pause_resume.py:36-37`): hold the
+    /// Upstream's `handle_connect` (`pause_resume.py:33-34`): hold the
     /// `virtual_sdcard` object for `is_sd_active`.
     fn handle_connect(&self) {
         let Some(printer) = self.printer.as_ref().and_then(Weak::upgrade) else {
             return;
         };
-        let Some(sd) = printer.lookup_object(VIRTUAL_SDCARD_OBJECT) else {
+        let Some(sd) = printer.lookup_object_as::<VirtualSdCard>(VIRTUAL_SDCARD_OBJECT) else {
             return;
         };
-        *self.lock() = Some(Arc::new(VirtualSdCard(sd)));
+        *self.lock() = Some(Arc::new(RegisteredSdCard(sd)));
     }
 
     /// The SD seam, copied out of its lock.
@@ -404,7 +413,7 @@ fn cmd_resume<'a>(object: &'a Arc<PauseResume>, gcmd: &'a GcodeCommand) -> Comma
                 "RESTORE_GCODE_STATE NAME=PAUSE_STATE MOVE=1 MOVE_SPEED={velocity:.4}"
             ))
             .await?;
-        object.send_resume_command();
+        object.send_resume_command()?;
         object.is_paused.store(false, Ordering::SeqCst);
         Ok(())
     })
@@ -442,8 +451,10 @@ mod tests {
     use super::*;
     use crate::core::klippy::config::Config;
     use crate::core::klippy::extras::gcode_move::{self, MoveTarget};
+    use crate::core::klippy::extras::print_stats::{PrintStats, PRINT_STATS_OBJECT};
     use crate::core::klippy::mathutil::Coord;
-    use crate::core::klippy::reactor::ManualReactor;
+    use crate::core::klippy::reactor::{ManualReactor, Reactor};
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::AtomicUsize;
 
     /// A printer with a section loaded and the ready lamp lit, as the loader
@@ -504,8 +515,9 @@ mod tests {
         fn do_pause(&self) {
             self.pauses.fetch_add(1, Ordering::SeqCst);
         }
-        fn do_resume(&self) {
+        fn do_resume(&self) -> Result<(), CommandError> {
             self.resumes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
         }
         fn do_cancel(&self) {
             self.cancels.fetch_add(1, Ordering::SeqCst);
@@ -749,7 +761,7 @@ mod tests {
         assert!(object.sd_paused.load(Ordering::SeqCst));
         assert!(emitted(&lines).is_empty(), "no `action:paused` line");
 
-        object.send_resume_command();
+        object.send_resume_command().expect("the SD resume runs");
         assert_eq!(sd.resumes.load(Ordering::SeqCst), 1);
         assert!(!object.sd_paused.load(Ordering::SeqCst));
         assert!(emitted(&lines).is_empty(), "no `action:resumed` line");
@@ -761,9 +773,9 @@ mod tests {
         drop(gcode);
     }
 
-    /// `handle_connect` holds the `virtual_sdcard` object, and its
-    /// `is_active` — the port's status flag — gates the SD branch
-    /// (`pause_resume.py:36-39`).
+    /// `handle_connect` holds the `virtual_sdcard` object, whose `is_active`
+    /// gates the SD branch (`pause_resume.py:33-34,45-46`); with no replay
+    /// running the status reads `false`.
     #[test]
     fn the_connect_handler_holds_the_virtual_sdcard_object() {
         let printer =
@@ -775,6 +787,298 @@ mod tests {
             .lookup_object_as::<PauseResume>(PAUSE_RESUME_OBJECT)
             .expect("the object");
         assert!(object.v_sd().is_some(), "the SD object is held");
-        assert!(!object.is_sd_active(), "the port's status is always false");
+        assert!(!object.is_sd_active(), "no replay is running");
+    }
+
+    // -- the SD branch against the real `virtual_sdcard` ----------------
+
+    /// A temporary directory that removes itself on drop (the
+    /// `virtual_sdcard` tests' pattern).
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            static COUNTER: AtomicUsize = AtomicUsize::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "klipperx-pr-sd-{}-{}-{}",
+                std::process::id(),
+                name,
+                COUNTER.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&path).expect("cannot create the test directory");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A printer with `pause_resume`, `virtual_sdcard` (pointing at `dir`) and
+    /// `gcode_move` — so the four commands reach both the SD primitives and
+    /// the `SAVE`/`RESTORE_GCODE_STATE` they run — plus a reactor the test
+    /// steps itself: `ManualReactor::run_due` is what fires the replay task's
+    /// one-shot timer.
+    fn sd_machine(
+        dir: &Path,
+    ) -> (
+        Arc<ManualReactor>,
+        Arc<Printer>,
+        Arc<GCodeDispatch>,
+        Arc<PauseResume>,
+        Arc<VirtualSdCard>,
+    ) {
+        let text = format!(
+            "[pause_resume]\n[virtual_sdcard]\npath: {}\n",
+            dir.display()
+        );
+        let (config, _) = Config::from_text(&text).expect("the config parses");
+        let reactor = Arc::new(ManualReactor::new());
+        let printer = Arc::new(Printer::new(Arc::clone(&reactor) as Arc<dyn Reactor>));
+        printer.load_config(&config).expect("the config loads");
+        gcode_move::ensure(&printer)
+            .expect("gcode_move registers")
+            .set_move_transform(Arc::new(FakeTarget), true)
+            .expect("the slot is free");
+        printer.send_event(&KlippyEvent::KlippyReady);
+        // `handle_connect` is what binds `pause_resume` to `virtual_sdcard`
+        // (`pause_resume.py:16-17,33-34`).
+        printer.send_event(&KlippyEvent::KlippyConnect);
+        let gcode = printer
+            .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+            .expect("the dispatcher is registered");
+        let object = printer
+            .lookup_object_as::<PauseResume>(PAUSE_RESUME_OBJECT)
+            .expect("the section registered the object");
+        let vsd = printer
+            .lookup_object_as::<VirtualSdCard>(VIRTUAL_SDCARD_OBJECT)
+            .expect("the section registered the object");
+        (reactor, printer, gcode, object, vsd)
+    }
+
+    /// Let a spawned task run (`ManualReactor` runs no tasks, so the test
+    /// drives the runtime itself) — the `virtual_sdcard` tests' helper.
+    async fn settle() {
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// `print_stats.state`, the replay's lifecycle word.
+    fn print_state(printer: &Arc<Printer>) -> String {
+        printer
+            .lookup_object_as::<PrintStats>(PRINT_STATS_OBJECT)
+            .expect("print_stats is registered")
+            .get_status(0.0)["state"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// `PAUSE` during a replay takes the SD branch (`pause_resume.py:47-59`):
+    /// the file is told to pause — the replay task exits before dispatching a
+    /// single line — and no `action:paused` line is reported.
+    #[tokio::test]
+    async fn pause_during_a_replay_pauses_the_file() {
+        let dir = TempDir::new("pause_replay");
+        std::fs::write(dir.path().join("job.gcode"), "M21\nM21\n").expect("the file");
+        let (reactor, printer, gcode, object, vsd) = sd_machine(dir.path());
+        let lines = captured_lines(&printer);
+
+        gcode
+            .run_script("M23 job.gcode")
+            .await
+            .expect("the file loads");
+        gcode.run_script("M24").await.expect("the replay arms");
+        assert!(vsd.is_active(), "the replay is armed");
+
+        gcode.run_script("PAUSE").await.expect("PAUSE runs");
+        assert!(object.is_paused());
+
+        // The replay task starts now: it must see the pause flag, exit before
+        // the first line, and leave the file open.
+        reactor.run_due();
+        settle().await;
+        assert!(!vsd.is_active(), "the replay task exited");
+
+        let out = emitted(&lines);
+        assert!(
+            !out.iter().any(|l| l == "SD card ok"),
+            "a file line was replayed in {out:?}"
+        );
+        assert!(
+            !out.iter().any(|l| l == "Done printing file"),
+            "the file ran to EOF in {out:?}"
+        );
+        assert!(
+            !out.iter().any(|l| l.contains("action:paused")),
+            "the SD branch reports nothing in {out:?}"
+        );
+        assert_eq!(print_state(&printer), "paused");
+        assert_eq!(
+            vsd.get_status(0.0)["file_path"],
+            "job.gcode",
+            "the file stays open under the pause"
+        );
+    }
+
+    /// `RESUME` after an SD pause takes `sd_paused`'s branch
+    /// (`pause_resume.py:68-75`): the replay really restarts, and no
+    /// `action:resumed` line is reported.
+    #[tokio::test]
+    async fn resume_restarts_a_paused_replay() {
+        let dir = TempDir::new("resume_replay");
+        std::fs::write(dir.path().join("job.gcode"), "M21\nM21\n").expect("the file");
+        let (reactor, printer, gcode, object, vsd) = sd_machine(dir.path());
+        let lines = captured_lines(&printer);
+
+        gcode
+            .run_script("M23 job.gcode")
+            .await
+            .expect("the file loads");
+        gcode.run_script("M24").await.expect("the replay arms");
+        gcode.run_script("PAUSE").await.expect("PAUSE runs");
+        reactor.run_due();
+        settle().await;
+
+        // `PAUSE` held the file: nothing has been replayed yet.
+        let out = emitted(&lines);
+        assert!(
+            !out.iter().any(|l| l == "Done printing file"),
+            "the file ran away before RESUME in {out:?}"
+        );
+        assert_eq!(print_state(&printer), "paused");
+
+        gcode.run_script("RESUME").await.expect("RESUME runs");
+        assert!(!object.is_paused());
+        reactor.run_due();
+        settle().await;
+
+        let out = emitted(&lines);
+        assert!(
+            out.iter().any(|l| l == "Done printing file"),
+            "the replay restarted and finished in {out:?}"
+        );
+        assert_eq!(
+            out.iter().filter(|l| *l == "SD card ok").count(),
+            2,
+            "both file lines replayed in {out:?}"
+        );
+        assert!(
+            !out.iter().any(|l| l.contains("action:")),
+            "the SD branch reports nothing in {out:?}"
+        );
+        assert_eq!(print_state(&printer), "complete");
+        assert!(!vsd.is_active());
+    }
+
+    /// `do_resume`'s `SD busy` refusal (`virtual_sdcard.py:128-133`) reaches
+    /// `RESUME`: the port's `do_pause` does not wait for the replay task to
+    /// exit, so a `RESUME` that outruns it is refused, and the pause stays up.
+    #[tokio::test]
+    async fn resume_while_the_replay_is_still_running_reports_sd_busy() {
+        let dir = TempDir::new("resume_busy");
+        std::fs::write(dir.path().join("job.gcode"), "M21\nM21\n").expect("the file");
+        let (_reactor, printer, gcode, object, _vsd) = sd_machine(dir.path());
+        let lines = captured_lines(&printer);
+
+        // `M24` arms the replay, but the test never fires the timer, so
+        // `work_active` — and with it `is_active` — stays `true`.
+        gcode
+            .run_script("M23 job.gcode")
+            .await
+            .expect("the file loads");
+        gcode.run_script("M24").await.expect("the replay arms");
+        gcode.run_script("PAUSE").await.expect("PAUSE runs");
+
+        let err = gcode
+            .run_script("RESUME")
+            .await
+            .expect_err("the replay is still armed");
+        assert_eq!(err.to_string(), "SD busy");
+        assert!(object.is_paused(), "the refused RESUME leaves the pause up");
+        assert!(
+            !emitted(&lines).iter().any(|l| l.contains("action:resumed")),
+            "the SD branch reports nothing"
+        );
+    }
+
+    /// `CANCEL_PRINT` during a replay takes the SD branch
+    /// (`pause_resume.py:92-97`): the file is closed, the counters are
+    /// cleared, `print_stats` goes `cancelled`, and no `action:cancel` line
+    /// is reported.
+    #[tokio::test]
+    async fn cancel_print_during_a_replay_cancels_the_file() {
+        let dir = TempDir::new("cancel_replay");
+        std::fs::write(dir.path().join("job.gcode"), "M21\nM21\n").expect("the file");
+        let (reactor, printer, gcode, object, vsd) = sd_machine(dir.path());
+        let lines = captured_lines(&printer);
+
+        gcode
+            .run_script("M23 job.gcode")
+            .await
+            .expect("the file loads");
+        gcode.run_script("M24").await.expect("the replay arms");
+        // The replay task has not started, so `print_stats` has no start time
+        // yet and would ignore `note_cancel`; the `virtual_sdcard` tests
+        // start one the same way.
+        printer
+            .lookup_object_as::<PrintStats>(PRINT_STATS_OBJECT)
+            .expect("print_stats is registered")
+            .note_start();
+        gcode.run_script("PAUSE").await.expect("PAUSE runs");
+        assert!(object.is_paused());
+
+        gcode
+            .run_script("CANCEL_PRINT")
+            .await
+            .expect("CANCEL_PRINT runs");
+        assert!(!object.is_paused());
+        assert!(!object.pause_command_sent.load(Ordering::SeqCst));
+        let status = vsd.get_status(0.0);
+        assert!(status["file_path"].is_null(), "the file is closed");
+        assert_eq!(status["file_size"], 0, "the counters are cleared");
+        assert_eq!(status["file_position"], 0);
+        assert_eq!(print_state(&printer), "cancelled");
+        assert!(
+            !emitted(&lines).iter().any(|l| l.contains("action:cancel")),
+            "the SD branch reports nothing"
+        );
+
+        // The armed replay starts against a closed file and stops again
+        // without touching `print_stats`.
+        reactor.run_due();
+        settle().await;
+        assert!(!vsd.is_active());
+        assert_eq!(print_state(&printer), "cancelled");
+    }
+
+    /// With the SD object held but no replay running, `is_sd_active()` is
+    /// `false` and every command keeps the `respond_info` side of its branch:
+    /// the `action:*` lines are reported
+    /// (`pause_resume.py:47-59,68-75,92-97`).
+    #[test]
+    fn an_idle_sd_card_still_reports_the_action_lines() {
+        let dir = TempDir::new("idle_sd");
+        let (_reactor, printer, gcode, object, _vsd) = sd_machine(dir.path());
+        let lines = captured_lines(&printer);
+
+        gcode.run_script_sync("PAUSE").expect("PAUSE runs");
+        assert!(object.is_paused());
+        gcode.run_script_sync("RESUME").expect("RESUME runs");
+        gcode
+            .run_script_sync("CANCEL_PRINT")
+            .expect("CANCEL_PRINT runs");
+
+        assert_eq!(
+            emitted(&lines),
+            ["// action:paused", "// action:resumed", "// action:cancel"]
+        );
     }
 }

@@ -127,7 +127,7 @@ HELP
 
 列出**带描述文本**的已激活命令，按名字排序，每行 `{命令名（至少 10 字符宽）}: {描述}`，
 不记日志。未就绪时只列就绪前那批里带描述的命令并加提示行。注册时没给 `desc` 的命令
-（`ECHO` `M110` `M112` `M115` `M114` `G0` `G1` `G4` `M400` `M106` `M107` 等）不出现在列表里。
+（`ECHO` `M110` `M112` `M115` `M114` `G0` `G1` `G4` `M400` `M204` `M106` `M107` 等）不出现在列表里。
 配置装载后的典型输出形如：
 
 ```
@@ -250,7 +250,7 @@ RESTORE_GCODE_STATE [NAME=<name>] [MOVE=0|1] [MOVE_SPEED=<mm/s>]
 
 ## 运动控制（`toolhead`，由 `[printer]` 装载）
 
-`[printer]` 是最后一个装载的节（运动学需要各 `[stepper_*]` 先在场）。它注册下面四条；
+`[printer]` 是最后一个装载的节（运动学需要各 `[stepper_*]` 先在场）。它注册下面这一组；
 解释坐标那一组（`G0` `G1` `G90` …）由它顺带装载的 [`gcode_move`](#运动与坐标系gcode_move) 注册。
 
 ### G4 — 暂停
@@ -292,6 +292,62 @@ G28 [X] [Y] [Z]
 
 点名的轴归零；**一个都不给就归零 XYZ 三轴**。归零由固件触发（endstop 命中即停步），
 是本主机里少数几个 `async` 处理器之一。
+
+### SET_VELOCITY_LIMIT — 运行期改速度上限
+
+```
+SET_VELOCITY_LIMIT [VELOCITY=<v>] [ACCEL=<a>] [SQUARE_CORNER_VELOCITY=<v>] [MINIMUM_CRUISE_RATIO=<r>]
+```
+
+四个参数都可省，给谁改谁（没给的不动）；改完**同时**进规划器与 `get_status`（不像只改状态
+那样会报旧值）。约束与 `[printer]` 的对应选项相同：`VELOCITY` / `ACCEL` 必须**大于** 0，
+`SQUARE_CORNER_VELOCITY` 不得小于 0，`MINIMUM_CRUISE_RATIO` 在 `[0, 1)`。
+
+四个都没给时回一段四行当前值（顺序：`max_velocity` / `max_accel` / `minimum_cruise_ratio` /
+`square_corner_velocity`）；给了参数则**不**回话（同上游），值另经日志 rollover 行与
+`get_status` 可查。
+
+```
+SET_VELOCITY_LIMIT VELOCITY=200 ACCEL=3000
+SET_VELOCITY_LIMIT          ; 回当前四个值
+```
+
+### M204 — 设置加速度
+
+```
+M204 [S<accel>] | [P<accel> T<accel>]
+```
+
+`S` 优先；没有 `S` 时取 `P`、`T` 里较小者；`P`/`T` 缺任意一个则整条命令报
+`Invalid M204 command "<命令行>"` 且**不改任何值**。等价于只带 `ACCEL` 的
+`SET_VELOCITY_LIMIT`。注册时没有描述文本，因此不出现在 `HELP` 列表里。
+
+### FORCE_MOVE — 绕过规划器直接移动一个电机
+
+```
+FORCE_MOVE STEPPER=<name> DISTANCE=<mm> VELOCITY=<mm/s> [ACCEL=<mm/s²>]
+```
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `STEPPER` | —（必填） | 电机名（mux 键，同 `[stepper_*]` / `[manual_stepper]` 的名字） |
+| `DISTANCE` | —（必填） | 有符号距离；负值反向 |
+| `VELOCITY` | —（必填） | 必须大于 0 |
+| `ACCEL` | `0` | 不得为负；0 表示匀速 |
+
+它把一段梯形直接灌给这个电机自己的时间轴（不走规划器），**会让运动学位置失效**（上游原文
+即如此标注），只作诊断用。
+**只在 [`[force_move]`](config.md) 的 `enable_force_move: True` 时注册**（默认关）。
+
+### STEPPER_BUZZ — 往复摆动电机以确认身份
+
+```
+STEPPER_BUZZ STEPPER=<name>
+```
+
+跑 10 个来回：正走 `1 mm`（速度 `4 mm/s`）、停 50 ms、反走 `1 mm`、停 450 ms；角度模式的段
+（没有 `rotation_distance` 但有 `gear_ratio`）改走 `1°`（速度 `1°/0.25 s`）。
+每个已注册的电机都有一条 `STEPPER_BUZZ STEPPER=<name>`，**不受 `enable_force_move` 影响**。
 
 ---
 
@@ -742,6 +798,23 @@ SPI_SEND     DEVICE=flash DATA=04          // spi send ok
 |------|------|------|
 | `LDC_CALIBRATE_DRIVE_CURRENT` | `CHIP`（传感器名） | 对目标 LDC1612 做驱动电流标定，回显 `reg_drive_current` 提取值并给出 `SAVE_CONFIG` 提示（细节见 `extras/ldc1612.rs`）；`ldc1612` 对象由 probe_eddy_current 构造（接线随 M5d 落地生效），该命令随对象装载注册 |
 
+## 变量（`save_variables`）
+
+### SAVE_VARIABLE — 保存一个变量
+
+```
+SAVE_VARIABLE VARIABLE=<name> VALUE=<literal>
+```
+
+| 参数 | 说明 |
+|------|------|
+| `VARIABLE` | 变量名，**必须全小写**（含大写报 `VARIABLE must not contain upper case`） |
+| `VALUE` | Python 字面量：`None` / `True` / `False` / 整数 / 浮点 / 字符串 / 列表 / 字典（字符串键） |
+
+写进 [`[save_variables]`](config.md) 的 `filename`（合并已有变量后重写整个 `[Variables]` 段），
+随后重新加载；宏里用 `printer.save_variables.variables.<name>` 读取。
+`VALUE` 解析失败报 `Unable to parse '<v>' as a literal`。
+
 ## 虚拟 SD 卡与打印统计（`[virtual_sdcard]` / `print_stats`）
 
 `[virtual_sdcard]` 装载后注册主机侧文件打印命令族（上游 `klippy/extras/virtual_sdcard.py`）；`print_stats` 对象随 `virtual_sdcard` 懒装载，注册 `SET_PRINT_STATS_INFO`。
@@ -901,6 +974,10 @@ SPI_SEND     DEVICE=flash DATA=04          // spi send ok
 ```
 
 几类来源：
+
+> 越界文案里 `above` / `below` 是「必须严格大于 / 小于」，`minimum` / `maximum` 是「不得小于 /
+> 大于」（同上游 `gcode.py:78-86`）。上限值按 Rust 的渲染输出（如 `0`），上游 Python 的
+> `%s` 会带小数点（`0.0`）——这是本仓的已知渲染差异。
 
 | 来源 | 文案 |
 |------|------|

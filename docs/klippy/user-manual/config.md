@@ -1161,3 +1161,25 @@ gap（如实登记）：**屏幕内容不渲染**（`display_template`/`display_
 
 命令：`INIT_TMC` / `DUMP_TMC` / `SET_TMC_FIELD` / `SET_TMC_CURRENT`（mux 键 `STEPPER`）；`tmc2209_<stepper>:virtual_endstop` 可用作端停。gap：fileoutput 下总线读短路为 0；`tmc2130`/`tmc2660`/`tmc5160`/`tmc2240` 与 SPI 传输未实现。
 
+### `[save_variables]` — 变量持久化（2026-10-04）
+
+| 选项 | 默认 | 说明 |
+|------|------|------|
+| `filename` | —（必填） | 变量文件路径；只展开 `~` 与 `~/`（`~user` 原样保留） |
+
+文件是 `[Variables]` 段的 configparser 格式，值按 Python literal 写。缺文件时自动建空；
+已有文件解析失败报 `Unable to parse existing variable file`。命令见
+[`SAVE_VARIABLE`](gcode-commands.md)；变量经 `printer.save_variables.variables.<name>` 供宏读取
+（`get_status` 形状即 `{variables: {...}}`）。支持的字面量子集：`None` / `True` / `False` /
+整数 / 浮点 / 字符串 / 列表 / 字典（字符串键）；不支持 tuple / set / bytes / complex 与
+非字符串 dict 键。
+
+### `[force_move]` — 诊断用力移动（2026-10-04）
+
+| 选项 | 默认 | 说明 |
+|------|------|------|
+| `enable_force_move` | `False` | 为 `True` 才注册 `FORCE_MOVE`；`STEPPER_BUZZ` 始终注册 |
+
+命令见 [`FORCE_MOVE` / `STEPPER_BUZZ`](gcode-commands.md)。该段会在首个电机装载时被创建，
+因此它总在 `[stepper_*]` 之前进工厂表。
+

@@ -661,6 +661,19 @@
 | `axis_maximum` | Coord | 运动学最大坐标（来自运动学） |
 | `cone_start_z` | float | 仅 delta 运动学额外提供 |
 
+> **与上游的已知差异（2026-10-04 复核）**：本机 `get_status` 实际只返回上表中的 `position` /
+> `print_time` / `extruder` / `max_velocity` / `max_accel` / `minimum_cruise_ratio` /
+> `square_corner_velocity` / `homed_axes`；`stalls` / `estimated_print_time` / `extra_axes_status` /
+> `axis_minimum` / `axis_maximum` / `cone_start_z` **未返回**（前两个与停滞计数有关，额外轴状态
+> 表与运动学端点仍是缺口）。`max_velocity` / `max_accel` / `minimum_cruise_ratio` /
+> `square_corner_velocity` 可由 `SET_VELOCITY_LIMIT`（或 `M204`）在运行期修改，改完两侧同时生效。
+
+### `save_variables`
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `variables` | object | `{变量名: 值}`，值为写入时的 Python 字面量（`None`/布尔/数字/字符串/列表/字典）；由 `[save_variables]` 在装载时读入，`SAVE_VARIABLE` 每次写盘后重载 |
+
 ### `webhooks`
 
 | 字段 | 类型 | 说明 |
@@ -861,7 +874,9 @@
 | `SCREWS_TILT_CALCULATE` | 螺丝倾斜计算（`screws_tilt_adjust`） |
 | `SHAPER_CALIBRATE` | 输入整形校准（`resonance_tester`） |
 | `QUERY_ENDSTOPS` | 查询限位开关 |
-| `FORCE_MOVE` | 强制移动轴（`force_move`，调试用） |
+| `FORCE_MOVE` | 强制移动一个电机（`force_move`，调试用；**只在 `[force_move] enable_force_move` 为真时注册**，会让运动学位置失效） |
+| `STEPPER_BUZZ` | 往复摆动一个电机以确认身份（`force_move`；每个已注册电机一条，不受 `enable_force_move` 影响） |
+| `SAVE_VARIABLE` | 保存一个变量到 `[save_variables]` 的 `filename`（`save_variables`，2026-10-04） |
 | `MANUAL_PROBE` | 手动探测（`manual_probe`） |
 
 > 上表只列出常见命令，实际可用命令以 `gcode/help` 的返回（或 `objects/query` 查询 `gcode.commands`）为准；部分命令需要先启用对应模块（如 `gcode_arcs`、`bed_mesh`、`probe`、`z_tilt`）。

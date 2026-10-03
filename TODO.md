@@ -82,14 +82,14 @@ H1–H12 是上游 extras 里按域归并的消费者（2026-09-21 全量盘点�
 |---|---|---|
 | H1 | 加热与温度（heaters / heater_bed / heater_generic / pid_calibrate / verify_heater / temperature_*） | F4、F5、C1 |
 | H2 | 风扇与通用输出（fan / fan_generic / heater_fan / controller_fan / pwm_tool / static_* / multi_pin / servo / led / neopixel / dotstar / 电位器与 LED 驱动） | F3、F4、F6、F7 |
-| H3 | G-Code 宏与脚本（gcode_macro / save_variables / delayed_gcode / respond） | G1b、Q5 |
+| H3 | G-Code 宏与脚本（gcode_macro / delayed_gcode / respond） | G1b、Q5 |
 | H4 | 打印流程与 SD 卡（virtual_sdcard / print_stats / display_status / pause_resume / exclude_object / sdcard_loop / firmware_retraction） | F9、C1 |
 | H5 | TMC 步进驱动（tmc / tmc_uart / tmc2130…tmc5160） | F6、F7、F9、C1 |
 | H6 | 传感器与块状数据（bulk_sensor / 加速度计 / angle / ldc1612 / hx71x / ads* / load_cell / input_shaper / resonance） | F5、F6、F7、F9、C1 |
 | H7 | 输入与外设（buttons / gcode_button / pulse_counter / trigger_analog / 断料与线宽传感器 / GPIO 扩展 / DAC） | F3、F5、F9 |
 | H8 | LCD 显示与菜单（display/*） | F9、G1b |
 | H9 | 探测 / 调平 / 校准（probe / bltouch / bed_mesh / z_tilt / quad_gantry_level / bed_screws / …） | C1、F8 |
-| H10 | 运动相关 extras（gcode_arcs / force_move 剩余 / manual_stepper / idle_timeout / motion_report / …；gcode_move、stepper_enable、motion_queuing 已落地） | C1 |
+| H10 | 运动相关 extras（gcode_arcs / manual_stepper / idle_timeout / motion_report / …；gcode_move、stepper_enable、motion_queuing、force_move 已落地） | C1 |
 | H11 | 主机运行时与调试（statistics / canbus_ids / canbus_stats；error_mcu 已落地） | — |
 | H12 | 核心工具补齐（mathutil / util 反射 / clocksync / pins 消费侧） | C1 |
 
@@ -363,7 +363,6 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 
 - [ ] `gcode_macro.py`：段与宏注册**已落地**（2026-09-24 集成批 #1，语料绿）；剩余 = `rename_existing` 连接期换名，以及读
       `printer.objects` 的反射式能力（**Q5**）。**U-A7b 已归档**（2026-09-24 批 #4 起的「受控子集引擎」阶段：`exclude_object.test`+`dual_carriage.test` 双翻转、guard 归零，`{% set %}` 批 #9、过滤器参数与 `default`/`float` 批 #17、列表字面量与 `|min`/`|max` 批 #24 相继落地）。**2026-09-29 引擎换为 minijinja 2.24 适配层**（`custom_syntax` 单花括号定界符、Strict undefined、装载期编译与求值分两段）：原子集外的 `namespace()`、关键字实参、`{% block %}`、`|float(默认)` 由此接上（语料 160 绿）。仍缺：`%` 字符串格式化（minijinja 的 `%` 是数值取模）、模板内方法调用（`Coord`/`PrinterView` 未实现 `call_method`；「方法调用白名单」待办消解——不装 `unknown_method_callback` 即天然拒绝）；三元 `x if c else y` 由 minijinja 原生支持但本仓未单列测试。与 Jinja2 的已知差异（`%`/`//` 欧几里得取余、Strict 下缺键在打印/迭代/判真时报错、部分 detail 措辞）见 `template.rs` 模块文档。iqex/itex 的模板阻塞已消，首因前移到 `dual_carriage` 的 `primary_carriage`。
-- [ ] `save_variables.py`（`SAVE_VARIABLE` / `[variables]`）。
 - [ ] `delayed_gcode.py`（`[delayed_gcode]`）。
 - [x] `respond.py`（`RESPOND` / `M118`，批 #29）。
 - 前置：**G1b** 的 `create_gcode_command` 与参数访问器（宏类模块要构造 gcmd）。
@@ -449,8 +448,9 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 
 ### H10 运动相关 extras
 
-- [ ] `gcode_arcs.py`：**段已落地**（2026-09-24 批 #1），G2/G3 弧规划与平面命令仍未接；`manual_stepper.py`；`force_move.py` **部分**（只有
-      `SET_KINEMATIC_POSITION`，`FORCE_MOVE`/`STEPPER_BUZZ` 未接）；`extruder_stepper.py` 段已落地（2026-09-24 批 #2，宿主 step 同步的 toolhead 缝仍缺）。
+- [ ] `gcode_arcs.py`：**段已落地**（2026-09-24 批 #1），G2/G3 弧规划与平面命令仍未接；`manual_stepper.py`；
+      `force_move.py` **主体已落地**（2026-10-04：`FORCE_MOVE`/`STEPPER_BUZZ` + 整段 force-move 时序，motion 侧按 handle 的
+      trapq 原语；`SET_KINEMATIC_POSITION` 一直在 `toolhead`）；`extruder_stepper.py` 段已落地（2026-09-24 批 #2，宿主 step 同步的 toolhead 缝仍缺）。
       （`stepper_enable.py` ✅ 已随 T2 落地并归档。）
 - [x] `idle_timeout.py`（批 #21：节 + `SET_IDLE_TIMEOUT` + 三个事件带载荷）、
       `motion_report.py`（`dump_trapq`/`dump_stepper` 端点，见 **B4**）。

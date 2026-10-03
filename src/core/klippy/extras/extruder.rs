@@ -18,10 +18,10 @@
 //! The heater runs through `heaters::setup_heater`: options and sensor are set
 //! up there, the bang-bang/PID control loop is in place, and so are the
 //! `[verify_heater]` check over it and the `pid_calibrate` object
-//! (`PID_CALIBRATE`). What is still open is the `M109` wait-for-temperature
-//! loop (`_wait` is accepted and ignored): the loop itself is
-//! `PrinterHeaters::set_temperature`, which `PID_CALIBRATE` drives, but
-//! `M104`/`M109` do not call it yet.
+//! (`PID_CALIBRATE`). `M109` waits for the target via
+//! `PrinterHeaters::set_temperature(.., wait=true)`, the same loop
+//! `PID_CALIBRATE` drives; `M104` sets the target and returns
+//! (`set_temperature(.., wait=false)`).
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -262,8 +262,10 @@ impl PrinterExtruder {
         if self.name == "extruder" {
             for (name, wait) in [("M104", false), ("M109", true)] {
                 let printer = Arc::downgrade(printer);
-                let handler: CommandHandler =
-                    sync(move |gcmd: &GcodeCommand| cmd_set_temperature(&printer, gcmd, wait));
+                let handler: CommandHandler = Arc::new(move |gcmd: &GcodeCommand| {
+                    let printer = printer.clone();
+                    Box::pin(async move { cmd_set_temperature(&printer, gcmd, wait).await })
+                });
                 gcode
                     .register_command_with_params(
                         name,
@@ -584,14 +586,15 @@ impl std::fmt::Debug for PrinterExtruder {
 
 /// `M104`/`M109`: set the (optionally `T`-indexed) extruder temperature.
 /// The words `M104`/`M109` read (`kinematics/extruder.py:180-190`). Both names
-/// share `cmd_set_temperature`; `wait` only selects the not-yet-wired wait
-/// loop.
+/// share `cmd_set_temperature`; `wait=true` (M109) waits for the heater to
+/// reach the target via `PrinterHeaters::set_temperature`, `wait=false`
+/// (M104) sets the target and returns.
 const M104_M109_PARAMS: &[&str] = &["S", "T"];
 
-fn cmd_set_temperature(
+async fn cmd_set_temperature(
     printer: &std::sync::Weak<Printer>,
     gcmd: &GcodeCommand,
-    _wait: bool,
+    wait: bool,
 ) -> Result<(), CommandError> {
     let temp = gcmd.get_float_default("S", 0.0)?;
     let index = gcmd.get_int_default("T", 0)?;
@@ -606,7 +609,12 @@ fn cmd_set_temperature(
     let extruder = printer
         .lookup_object_as::<PrinterExtruder>(&section)
         .ok_or_else(|| CommandError::new("Extruder not configured"))?;
-    extruder.heater().set_temp(temp)?;
+    let pheaters = printer
+        .lookup_object_as::<heaters::PrinterHeaters>(heaters::HEATERS_OBJECT)
+        .ok_or_else(|| CommandError::new("Heaters not configured"))?;
+    pheaters
+        .set_temperature(extruder.heater(), temp, wait)
+        .await?;
     Ok(())
 }
 
@@ -818,5 +826,54 @@ mod tests {
         );
         let v2 = ExtraAxis::calc_junction(extruder.as_ref(), &prev, &cur2, E_AXIS);
         assert_eq!(v2, cur2.max_cruise_v2);
+    }
+
+    /// `M109 S<temp>` waits for the heater to reach the target via
+    /// `PrinterHeaters::set_temperature(.., wait=true)`
+    /// (`kinematics/extruder.py:260-279`). Under file-output the wait loop
+    /// returns at once (`heaters.py:350-351`), so the observable effect is the
+    /// target being set — the same path `PID_CALIBRATE` uses.
+    #[tokio::test]
+    async fn test_m109_with_wait_sets_the_target_through_pheaters() {
+        let printer = load_ok(&extruder_config(""));
+        // File-output mode: `wait_for_temperature` returns immediately.
+        let mut args = crate::core::klippy::api::StartArgs::collect("/tmp/printer.cfg", None);
+        args.debug_output = Some("_test_output".to_string());
+        printer.set_start_args(Arc::new(args));
+        printer.send_event(&KlippyEvent::KlippyReady);
+        let gcode = printer
+            .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+            .expect("the loader registers `gcode`");
+
+        gcode
+            .run_script("M109 S200")
+            .await
+            .expect("M109 sets the target");
+
+        let extruder = printer
+            .lookup_object_as::<PrinterExtruder>("extruder")
+            .expect("the extruder is registered");
+        assert_eq!(extruder.heater().target_temp(), 200.0);
+    }
+
+    /// `M104 S<temp>` sets the target and returns without waiting
+    /// (`set_temperature(.., wait=false)`).
+    #[tokio::test]
+    async fn test_m104_sets_the_target_without_waiting() {
+        let printer = load_ok(&extruder_config(""));
+        printer.send_event(&KlippyEvent::KlippyReady);
+        let gcode = printer
+            .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+            .expect("the loader registers `gcode`");
+
+        gcode
+            .run_script("M104 S180")
+            .await
+            .expect("M104 sets the target");
+
+        let extruder = printer
+            .lookup_object_as::<PrinterExtruder>("extruder")
+            .expect("the extruder is registered");
+        assert_eq!(extruder.heater().target_temp(), 180.0);
     }
 }

@@ -10,10 +10,10 @@
 //!
 //! | framework call | here | upstream |
 //! |---|---|---|
-//! | `init()` | reset, the 17-command power-up list, `0xA5`/`0xA4`, flush | `uc1701.py:174-197` |
-//! | `clear()` | blank the eight page framebuffers | `uc1701.py:110-111` |
-//! | `flush()` | batch the framebuffer differences and send them | `uc1701.py:28-62` |
-//! | `set_glyphs()` | — (see below) | `uc1701.py:64-72` |
+//! | `init()` | reset, the 17-command power-up list, `0xA5`/`0xA4`, flush | `uc1701.py:174-196` |
+//! | `clear()` | blank the eight page framebuffers | `uc1701.py:110-113` |
+//! | `flush()` | batch the framebuffer differences and send them | `uc1701.py:28-52` |
+//! | `set_glyphs()` | — (see below) | `uc1701.py:64-70` |
 //!
 //! # What is not here
 //!
@@ -22,18 +22,18 @@
 //!   `_swizzle_bits` and the font — are not ported; `set_glyphs` therefore has
 //!   nothing to store, because upstream only caches the swizzled icons there
 //!   for `write_glyph` to draw later.
-//! * **`BACKGROUND_PRIORITY_CLOCK`** (`uc1701.py:7`): upstream sends every
+//! * **`BACKGROUND_PRIORITY_CLOCK`** (`uc1701.py:11`): upstream sends every
 //!   byte with `reqclock=0x7fffffff00000000`, which lets the panel writes
 //!   overtake queued g-code. This host's [`McuCommand`](crate::core::klippy::cmd::McuCommand) carries no clock, so
 //!   commands go out in call order.
-//! * **The reset helper's queue stall** (`uc1701.py:164-166`): upstream orders
+//! * **The reset helper's queue stall** (`uc1701.py:163-165`): upstream orders
 //!   the three reset writes by `minclock` *and* notes that the last one
 //!   "force[s] a delay to any subsequent commands on the command queue", which
 //!   is what holds the panel's power-up bytes back until reset is released.
 //!   This host schedules the three writes on the MCU clock
 //!   ([`ResetHelper`]) but has no way to stall the queue, so a panel that needs
 //!   `rst_pin` gets its init bytes in call order rather than after `+0.300s`.
-//! * **`SH1106`** (`uc1701.py:238-242`): the 132-column sibling is a separate
+//! * **`SH1106`** (`uc1701.py:238-241`): the 132-column sibling is a separate
 //!   `lcd_type` and is still refused by [`super::display`].
 //! * **The I2C status reply.** Upstream's SSD1306 sends `i2c_transfer …
 //!   read_len=0` as an ordinary command and only *listens* for the
@@ -64,7 +64,7 @@ pub(crate) const DEFAULT_SPI_SPEED: u32 = 10_000_000;
 pub(crate) const DEFAULT_UC1701_CONTRAST: i64 = 40;
 
 /// The panel's framebuffer: one page of `columns` bytes, plus the copy the
-/// firmware has already been told about (`uc1701.py:16-25`).
+/// firmware has already been told about (`uc1701.py:21-23`).
 #[derive(Debug)]
 pub(crate) struct Page {
     /// What the screen should show.
@@ -85,7 +85,7 @@ pub(crate) struct DisplayBase {
 }
 
 impl DisplayBase {
-    /// Eight blank pages, each with an unsent copy (`uc1701.py:16-25`).
+    /// Eight blank pages, each with an unsent copy (`uc1701.py:21-23`).
     pub(crate) fn new(columns: usize) -> Self {
         Self {
             columns,
@@ -98,7 +98,7 @@ impl DisplayBase {
         }
     }
 
-    /// Upstream's `DisplayBase.clear` (`uc1701.py:110-111`): every page goes
+    /// Upstream's `DisplayBase.clear` (`uc1701.py:110-113`): every page goes
     /// back to zeros.
     pub(crate) fn clear(&mut self) {
         for page in &mut self.pages {
@@ -106,7 +106,7 @@ impl DisplayBase {
         }
     }
 
-    /// Upstream's `DisplayBase.flush` (`uc1701.py:28-62`): for every page that
+    /// Upstream's `DisplayBase.flush` (`uc1701.py:28-52`): for every page that
     /// changed, send the changed runs — set the page and column registers, then
     /// shift the bytes in as data.
     ///
@@ -120,7 +120,7 @@ impl DisplayBase {
             }
             for (pos, count) in changed_runs(&page.data, &page.synced) {
                 // Page start (`0xb0 | page`), then the column address as its
-                // high and low nibbles (`uc1701.py:53-57`).
+                // high and low nibbles (`uc1701.py:46-49`).
                 let page_register = 0xb0 | ((index as u8) & 0x0f);
                 let column_msb = 0x10 | (((pos >> 4) as u8) & 0x0f);
                 let column_lsb = (pos & 0x0f) as u8;
@@ -132,7 +132,7 @@ impl DisplayBase {
     }
 }
 
-/// Upstream's flush batching (`uc1701.py:44-48`): the positions of every
+/// Upstream's flush batching (`uc1701.py:34-42`): the positions of every
 /// changed byte as `(position, length)` runs, with runs closer than five bytes
 /// joined while the run ahead is shorter than sixteen.
 pub(crate) fn changed_runs(data: &[u8], synced: &[u8]) -> Vec<(usize, usize)> {
@@ -159,7 +159,7 @@ pub(crate) fn changed_runs(data: &[u8], synced: &[u8]) -> Vec<(usize, usize)> {
 // ===========================================================================
 
 /// Where the panel's bytes go: upstream's `SPI4wire` (`uc1701.py:118-127`) and
-/// `I2C` (`uc1701.py:130-141`) wrappers behind one type, because a chip holds
+/// `I2C` (`uc1701.py:130-142`) wrappers behind one type, because a chip holds
 /// one of them.
 enum Transport {
     /// A "4 wire" SPI bus: the firmware drives `cs_pin` around each write and
@@ -193,10 +193,10 @@ impl PanelIo {
     /// SPI bus from `cs_pin` plus one extra data/control line.
     ///
     /// # Errors
-    /// A missing `cs_pin` (upstream's `config.get(pin_option)`, `bus.py:125`),
+    /// A missing `cs_pin` (upstream's `config.get(pin_option)`, `bus.py:129`),
     /// a missing `data_pin_option`, an unresolvable or already-used pin, a pin
     /// that is not on the panel's MCU (`Pin <desc> must be on mcu <mcu>`,
-    /// `bus.py:110-112`), or an unknown `spi_mcu`.
+    /// `bus.py:343-345`), or an unknown `spi_mcu`.
     pub(crate) fn spi4wire(
         config: &ConfigWrapper,
         printer: &Arc<Printer>,
@@ -220,7 +220,7 @@ impl PanelIo {
         Ok((io, mcu))
     }
 
-    /// Upstream's `I2C(config, default_addr)` (`uc1701.py:131-133`): the I2C
+    /// Upstream's `I2C(config, default_addr)` (`uc1701.py:131-134`): the I2C
     /// bus at the SSD1306's default address of 60.
     ///
     /// # Errors
@@ -234,7 +234,7 @@ impl PanelIo {
         let mcu = panel_mcu(config, printer, "i2c_mcu")?;
 
         // `MCU_I2C_from_config(config, default_addr=60, default_speed=400000)`
-        // (`uc1701.py:131-133`).
+        // (`uc1701.py:131-134`).
         let address = config.get_int("i2c_address", Some(60))?;
         if !(0..=127).contains(&address) {
             return Err(ConfigError::new(format!(
@@ -297,7 +297,7 @@ impl PanelIo {
 
     /// Send one message to the panel: `is_data` selects the data/control line
     /// (`SPI4wire.send`, `uc1701.py:124-127`) or the I2C control byte
-    /// (`I2C.send`, `uc1701.py:135-141`).
+    /// (`I2C.send`, `uc1701.py:135-142`).
     ///
     /// The I2C half is upstream's `async_write_only` path: `i2c_transfer` with
     /// `read_len=0` sent as an ordinary command (`bus.py:256-259`), because
@@ -359,7 +359,7 @@ impl PanelIo {
 
 /// The MCU a panel's bus lives on: `spi_mcu` / `i2c_mcu`, defaulting to the
 /// main one, the way `MCU_SPI_from_config` takes it from the chip-select pin
-/// (`bus.py:143`) and `MCU_I2C_from_config` from `i2c_mcu` (`bus.py:317`).
+/// (`bus.py:136`) and `MCU_I2C_from_config` from `i2c_mcu` (`bus.py:306`).
 fn panel_mcu(
     config: &ConfigWrapper,
     printer: &Arc<Printer>,
@@ -378,12 +378,12 @@ fn panel_mcu(
 }
 
 /// One of the panel's own GPIO lines built as an output: upstream's
-/// `MCU_bus_digital_out(io_bus.get_mcu(), pin_desc, …)` (`uc1701.py:110-112`,
-/// `:147-150`).
+/// `MCU_bus_digital_out(io_bus.get_mcu(), pin_desc, …)` (`uc1701.py:122-123`,
+/// `:150-151`).
 ///
 /// The pin is looked up without inversion or a pull-up (`pins.lookup_pin`'s
 /// defaults, `pins.py:96-97`) and must sit on the MCU the bus is on
-/// (`bus.py:110-112`).
+/// (`bus.py:343-345`).
 ///
 /// # Errors
 /// A malformed pin description, a pin on another MCU, or a pin already used.
@@ -413,7 +413,7 @@ fn digital_out(
 // The reset helper
 // ===========================================================================
 
-/// Upstream's `ResetHelper` (`uc1701.py:145-166`): an optional pin that is
+/// Upstream's `ResetHelper` (`uc1701.py:145-165`): an optional pin that is
 /// pulled low, then high, then held high 100/200/300 ms into startup.
 pub(crate) struct ResetHelper {
     /// The reset line, or `None` when the config writes no `rst_pin`/
@@ -448,7 +448,7 @@ impl ResetHelper {
         })
     }
 
-    /// Upstream's `ResetHelper.init` (`uc1701.py:152-166`): low at `+0.100s`,
+    /// Upstream's `ResetHelper.init` (`uc1701.py:152-165`): low at `+0.100s`,
     /// high at `+0.200s`, and high again at `+0.300s` (which upstream uses to
     /// hold the command queue back — module docs).
     ///
@@ -505,7 +505,7 @@ pub(crate) fn uc1701_init_commands(contrast: i64) -> Vec<u8> {
     ]
 }
 
-/// One `lcd_type: uc1701` panel (upstream's `UC1701`, `uc1701.py:168-197`).
+/// One `lcd_type: uc1701` panel (upstream's `UC1701`, `uc1701.py:168-196`).
 pub struct Uc1701 {
     /// The eight page framebuffers.
     base: Mutex<DisplayBase>,
@@ -548,7 +548,7 @@ impl Uc1701 {
 }
 
 impl LcdChip for Uc1701 {
-    /// Upstream's `UC1701.init` (`uc1701.py:174-197`): the reset toggle, the
+    /// Upstream's `UC1701.init` (`uc1701.py:174-196`): the reset toggle, the
     /// 17 power-up commands, "display all", "normal display", then the first
     /// flush.
     fn init(&self) {
@@ -569,12 +569,12 @@ impl LcdChip for Uc1701 {
         self.flush();
     }
 
-    /// Upstream's `DisplayBase.clear` (`uc1701.py:110-111`).
+    /// Upstream's `DisplayBase.clear` (`uc1701.py:110-113`).
     fn clear(&self) {
         self.base().clear();
     }
 
-    /// Upstream's `DisplayBase.flush` (`uc1701.py:28-62`).
+    /// Upstream's `DisplayBase.flush` (`uc1701.py:28-52`).
     fn flush(&self) {
         if let Err(err) = self.base().flush(&self.io) {
             warn!("uc1701: could not flush the panel: {err}");
@@ -587,7 +587,7 @@ impl LcdChip for Uc1701 {
     }
 
     /// Upstream's `DisplayBase.set_glyphs` stores the icons so `write_glyph`
-    /// can draw them (`uc1701.py:64-72`); nothing draws here (module docs), so
+    /// can draw them (`uc1701.py:64-70`); nothing draws here (module docs), so
     /// there is nothing to keep.
     fn set_glyphs(&self, _glyphs: &BTreeMap<String, Glyph>) {}
 
@@ -737,7 +737,7 @@ mod tests {
     #[test]
     fn test_the_data_pin_must_be_on_the_panels_mcu() {
         // Upstream's `MCU_bus_digital_out` refuses a pin on another MCU
-        // (`bus.py:110-112`).
+        // (`bus.py:343-345`).
         let printer = printer();
         let section = display_section(&[("cs_pin", "PA3"), ("a0_pin", "board2:PA1")]);
 
@@ -809,7 +809,7 @@ mod tests {
     #[test]
     fn test_the_framebuffers_start_unsent() {
         // Eight blank pages, each with `~` as its "already sent" copy, so the
-        // first flush sends the whole screen (`uc1701.py:16-25`).
+        // first flush sends the whole screen (`uc1701.py:21-23`).
         let base = DisplayBase::new(128);
         assert_eq!(base.columns, 128);
         assert_eq!(base.pages.len(), 8);
@@ -834,7 +834,7 @@ mod tests {
     #[test]
     fn test_close_changes_are_batched_into_one_run() {
         // The upstream rule: a change runs up to five bytes ahead while the run
-        // ahead is shorter than sixteen (`uc1701.py:44-48`).
+        // ahead is shorter than sixteen (`uc1701.py:34-42`).
         let synced = vec![0; 8];
         let mut data = vec![0; 8];
         data[0] = 1;
@@ -850,7 +850,7 @@ mod tests {
 
         // A twenty-byte run stops growing once the run ahead is sixteen bytes,
         // and the four bytes in front of it are batched separately
-        // (`uc1701.py:44-48`).
+        // (`uc1701.py:34-42`).
         let mut data = vec![0; 32];
         for byte in data.iter_mut().take(20) {
             *byte = 1;

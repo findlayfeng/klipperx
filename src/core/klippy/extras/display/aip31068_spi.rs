@@ -5,31 +5,31 @@
 //! controller is HD44780-compatible but speaks a different transport: every
 //! command or data word is nine bits — a register-select bit in front of eight
 //! bits — and the panel sits behind an SPI bus whose chip select is
-//! `latch_pin` (`aip31068_spi.py:81-83`). Upstream keeps the SW_SPI driver at
+//! `latch_pin` (`aip31068_spi.py:83-84`). Upstream keeps the SW_SPI driver at
 //! whole bytes by sending eight of those nine-bit words as nine bytes, so one
-//! `spi_send` carries a whole group (`aip31068_spi.py:112-136`).
+//! `spi_send` carries a whole group (`aip31068_spi.py:113-137`).
 //!
 //! | framework call | here | upstream |
 //! |---|---|---|
-//! | `init()` | the five power-up commands, then a flush | `aip31068_spi.py:159-168` |
-//! | `clear()` | blank both text framebuffers | `aip31068_spi.py:190-193` |
-//! | `flush()` | batch the framebuffer differences and send them | `aip31068_spi.py:137-157` |
-//! | `set_glyphs()` | keep the 5x8 icons for the glyphs the layout names | `aip31068_spi.py:169-174` |
+//! | `init()` | the five power-up commands, then a flush | `aip31068_spi.py:172-178` |
+//! | `clear()` | blank both text framebuffers | `aip31068_spi.py:204-207` |
+//! | `flush()` | batch the framebuffer differences and send them | `aip31068_spi.py:150-171` |
+//! | `set_glyphs()` | keep the 5x8 icons for the glyphs the layout names | `aip31068_spi.py:184-188` |
 //!
 //! As `hd44780`, the framebuffers are the two text buffers of `2*line_length`
 //! bytes — each of the panel's four rows is one half of one buffer — plus the
 //! 64-byte character generator buffer, and every "already sent" copy starts as
-//! `~`, so the first flush writes the whole screen (`aip31068_spi.py:88-111`).
-//! `line_length` is 16 or 20 (`aip31068_spi.py:20-21,86-87`) and decides the
+//! `~`, so the first flush writes the whole screen (`aip31068_spi.py:91-111`).
+//! `line_length` is 16 or 20 (`aip31068_spi.py:19-20,87-88`) and decides the
 //! panel's width, and with it the default `display_group`.
 //!
 //! # What is not here
 //!
 //! * **Text and glyph drawing.** [`super::display`] never draws, so
-//!   `write_text`/`write_glyph`/`write_graphics` (`aip31068_spi.py:176-189`) are
+//!   `write_text`/`write_glyph`/`write_graphics` (`aip31068_spi.py:179-203`) are
 //!   not ported; [`Aip31068Spi::set_glyphs`] keeps the 5x8 icons because
-//!   upstream collects them there (`aip31068_spi.py:169-174`).
-//! * **`minclock`** (`aip31068_spi.py:159-168`): upstream stamps each init group
+//!   upstream collects them there (`aip31068_spi.py:184-188`).
+//! * **`minclock`** (`aip31068_spi.py:172-178`): upstream stamps each init group
 //!   with a clock deadline 100ms apart; this host's
 //!   [`McuCommand`](crate::core::klippy::cmd::McuCommand) carries no clock, so
 //!   commands go out in call order.
@@ -47,56 +47,56 @@ use crate::core::klippy::printer::{Printer, PrinterObject};
 
 use super::display::{Glyph, LcdChip, SentMessage};
 
-/// The panel's width when `line_length` is not written (`aip31068_spi.py:20`).
+/// The panel's width when `line_length` is not written (`aip31068_spi.py:19`).
 const LINE_LENGTH_DEFAULT: &str = "20";
-/// The widths `line_length` may choose between (`aip31068_spi.py:21`).
+/// The widths `line_length` may choose between (`aip31068_spi.py:20`).
 const LINE_LENGTH_OPTIONS: &[&str] = &["16", "20"];
 
 /// Upstream's `MCU_SPI_from_config(config, 0x00, pin_option="latch_pin")`
-/// (`aip31068_spi.py:82-83`): SPI mode 0 with the default 100 kHz clock
+/// (`aip31068_spi.py:83-84`): SPI mode 0 with the default 100 kHz clock
 /// (`bus.py:124`).
 const SPI_SPEED: u32 = 100_000;
 
-// Upstream's `CMND` opcodes (`aip31068_spi.py:29-38`) and the flag bits the
-// driver uses (`aip31068_spi.py:41-70`).
+// Upstream's `CMND` opcodes (`aip31068_spi.py:32-41`) and the flag bits the
+// driver uses (`aip31068_spi.py:44-68`).
 
-/// `CMND.HOME` — move the cursor home (`aip31068_spi.py:31`).
+/// `CMND.HOME` — move the cursor home (`aip31068_spi.py:34`).
 const CMND_HOME: u16 = 2;
-/// `CMND.ENTERY_MODE` — entry-mode set (`aip31068_spi.py:32`).
+/// `CMND.ENTERY_MODE` — entry-mode set (`aip31068_spi.py:35`).
 const CMND_ENTERY_MODE: u16 = 1 << 2;
-/// `flg_ENTERY_MODE.INC` — increment the cursor (`aip31068_spi.py:42`).
+/// `flg_ENTERY_MODE.INC` — increment the cursor (`aip31068_spi.py:45`).
 const FLG_ENTERY_MODE_INC: u16 = 1 << 1;
-/// `CMND.DISPLAY` — display on/off control (`aip31068_spi.py:33`).
+/// `CMND.DISPLAY` — display on/off control (`aip31068_spi.py:36`).
 const CMND_DISPLAY: u16 = 1 << 3;
-/// `flg_DISPLAY.ON` (`aip31068_spi.py:47`).
+/// `flg_DISPLAY.ON` (`aip31068_spi.py:50`).
 const FLG_DISPLAY_ON: u16 = 1 << 2;
-/// `CMND.SHIFT` — cursor or display shift (`aip31068_spi.py:34`).
+/// `CMND.SHIFT` — cursor or display shift (`aip31068_spi.py:37`).
 const CMND_SHIFT: u16 = 1 << 4;
-/// `flg_SHIFT.RIGHT` (`aip31068_spi.py:52`).
+/// `flg_SHIFT.RIGHT` (`aip31068_spi.py:55`).
 const FLG_SHIFT_RIGHT: u16 = 1 << 2;
-/// `CMND.FUNCTION` — function set (`aip31068_spi.py:35`).
+/// `CMND.FUNCTION` — function set (`aip31068_spi.py:38`).
 const CMND_FUNCTION: u16 = 1 << 5;
-/// `flg_FUNCTION.TWO_LINES` (`aip31068_spi.py:57`).
+/// `flg_FUNCTION.TWO_LINES` (`aip31068_spi.py:60`).
 const FLG_FUNCTION_TWO_LINES: u16 = 1 << 3;
-/// `CMND.CGRAM` — character generator RAM (`aip31068_spi.py:36`).
+/// `CMND.CGRAM` — character generator RAM (`aip31068_spi.py:39`).
 const CMND_CGRAM: u16 = 1 << 6;
-/// `CMND.DDRAM` — display data RAM (`aip31068_spi.py:37`).
+/// `CMND.DDRAM` — display data RAM (`aip31068_spi.py:40`).
 const CMND_DDRAM: u16 = 1 << 7;
-/// `flg_DDRAM.MASK` (`aip31068_spi.py:64`).
+/// `flg_DDRAM.MASK` (`aip31068_spi.py:67`).
 const FLG_DDRAM_MASK: u16 = 0b0111_1111;
-/// `CMND.WRITE_RAM` (`aip31068_spi.py:38`).
+/// `CMND.WRITE_RAM` (`aip31068_spi.py:41`).
 const CMND_WRITE_RAM: u16 = 1 << 8;
 
-/// The number of bits in one command/data word (`aip31068_spi.py:40-46`).
+/// The number of bits in one command/data word (`aip31068_spi.py:24-31`).
 const COMMAND_BITS: u32 = 9;
 /// A group of this many words encodes to exactly nine bytes
-/// (`aip31068_spi.py:112-136`).
+/// (`aip31068_spi.py:113-137`).
 const GROUP_WORDS: usize = 8;
 /// The pad for a short group: the fast entry-mode command, whose 39us is far
-/// shorter than a clear (`aip31068_spi.py:129-131`).
+/// shorter than a clear (`aip31068_spi.py:139-141`).
 const SEND_PAD: u16 = CMND_ENTERY_MODE | FLG_ENTERY_MODE_INC;
 
-/// Upstream's `DISPLAY_INIT_CMNDS` (`aip31068_spi.py:71-79`): home, positive
+/// Upstream's `DISPLAY_INIT_CMNDS` (`aip31068_spi.py:70-77`): home, positive
 /// entry direction, display on with the cursor and blink off, right shift, and
 /// the 2-line 5x8 function set. No clear — the first flush rewrites the screen.
 const DISPLAY_INIT_CMNDS: &[u16] = &[
@@ -109,7 +109,7 @@ const DISPLAY_INIT_CMNDS: &[u16] = &[
 
 /// One framebuffer and the copy the firmware has already been told about —
 /// upstream's `(new_data, old_data, fb_cmnd)` triples
-/// (`aip31068_spi.py:100-110`).
+/// (`aip31068_spi.py:103-111`).
 #[derive(Debug)]
 struct Framebuffer {
     /// What the screen should show.
@@ -121,19 +121,19 @@ struct Framebuffer {
 }
 
 /// The two text framebuffers and the character generator's buffer, in the order
-/// upstream flushes them (`aip31068_spi.py:100-110`).
+/// upstream flushes them (`aip31068_spi.py:103-111`).
 #[derive(Debug)]
 struct Framebuffers {
-    /// One buffer per pair of panel rows (`aip31068_spi.py:89-90`).
+    /// One buffer per pair of panel rows (`aip31068_spi.py:91-92`).
     text: [Framebuffer; 2],
-    /// The 64-byte CGRAM buffer (`aip31068_spi.py:91`).
+    /// The 64-byte CGRAM buffer (`aip31068_spi.py:93`).
     glyph: Framebuffer,
 }
 
 impl Framebuffers {
     /// Upstream's `__init__` buffers: the text screens are spaces, the glyph
     /// buffer is zeros, and every "already sent" copy is `~` so the first flush
-    /// sends the lot (`aip31068_spi.py:88-111`).
+    /// sends the lot (`aip31068_spi.py:91-111`).
     fn new(line_length: usize) -> Self {
         let half = 2 * line_length;
         let blank = |len: usize, byte: u8, fb_cmnd: u8| Framebuffer {
@@ -144,14 +144,14 @@ impl Framebuffers {
         Self {
             text: [
                 // The first text buffer starts at RAM 0:
-                // `CMND.DDRAM | (flg_DDRAM.MASK & 0x00)` (`aip31068_spi.py:102-103`).
+                // `CMND.DDRAM | (flg_DDRAM.MASK & 0x00)` (`aip31068_spi.py:106`).
                 blank(half, b' ', CMND_DDRAM as u8),
                 // The second starts half-way through the RAM:
-                // `CMND.DDRAM | (flg_DDRAM.MASK & 0x40)` (`aip31068_spi.py:104-105`).
+                // `CMND.DDRAM | (flg_DDRAM.MASK & 0x40)` (`aip31068_spi.py:108`).
                 blank(half, b' ', (CMND_DDRAM | (FLG_DDRAM_MASK & 0x40)) as u8),
             ],
             // The glyph buffer sits at RAM 0 of the character generator:
-            // `CMND.CGRAM | (flg_CGRAM.MASK & 0x00)` (`aip31068_spi.py:106-108`).
+            // `CMND.CGRAM | (flg_CGRAM.MASK & 0x00)` (`aip31068_spi.py:111`).
             glyph: blank(64, 0, CMND_CGRAM as u8),
         }
     }
@@ -174,13 +174,13 @@ impl Framebuffers {
 
 /// One `lcd_type: aip31068_spi` panel.
 pub struct Aip31068Spi {
-    /// The SPI bus `latch_pin` addressed (`aip31068_spi.py:81-83`).
+    /// The SPI bus `latch_pin` addressed (`aip31068_spi.py:83-84`).
     spi: Arc<McuSpi>,
-    /// The panel's width in characters (`aip31068_spi.py:86-87`).
+    /// The panel's width in characters (`aip31068_spi.py:87-88`).
     line_length: usize,
     /// The framebuffers.
     framebuffers: Mutex<Framebuffers>,
-    /// The 5x8 icons by glyph name (`aip31068_spi.py:169-174`).
+    /// The 5x8 icons by glyph name (`aip31068_spi.py:184-188`).
     icons: Mutex<HashMap<String, (u8, Vec<u8>)>>,
     /// Every message handed to the firmware, in order (tests and diagnostics).
     sent: Mutex<Vec<SentMessage>>,
@@ -189,7 +189,7 @@ pub struct Aip31068Spi {
 impl Aip31068Spi {
     /// Read the SPI bus and `line_length`.
     ///
-    /// Upstream's `aip31068_spi.__init__` (`aip31068_spi.py:80-87`): the bus
+    /// Upstream's `aip31068_spi.__init__` (`aip31068_spi.py:80-88`): the bus
     /// options first — `latch_pin` among them — and only then `line_length`.
     ///
     /// # Errors
@@ -199,7 +199,7 @@ impl Aip31068Spi {
     /// [`LINE_LENGTH_OPTIONS`], or an unknown `spi_mcu`.
     pub fn new(config: &ConfigWrapper, printer: &Arc<Printer>) -> Result<Self, ConfigError> {
         // `latch_pin` is required: unlike a temperature sensor, the panel has
-        // no "no chip select" mode (`aip31068_spi.py:82-83`).
+        // no "no chip select" mode (`aip31068_spi.py:83-84`).
         config.get("latch_pin", None)?;
         let setup = mcu_spi_from_config(config, printer.as_ref(), 0, "latch_pin", SPI_SPEED)?;
         let line_length = config
@@ -222,7 +222,7 @@ impl Aip31068Spi {
 
     /// Send one list of nine-bit words: split into groups of eight, pad the
     /// last group, encode each as nine bytes, and hand them to the bus
-    /// (`aip31068_spi.py:128-136`).
+    /// (`aip31068_spi.py:138-149`).
     ///
     /// # Errors
     /// The first `spi_send` that fails stops the send with that error; the
@@ -251,7 +251,7 @@ impl Aip31068Spi {
 }
 
 impl LcdChip for Aip31068Spi {
-    /// Upstream's `aip31068_spi.init` (`aip31068_spi.py:159-168`): the five
+    /// Upstream's `aip31068_spi.init` (`aip31068_spi.py:172-178`): the five
     /// power-up commands, one message each, then the first flush.
     fn init(&self) {
         for command in DISPLAY_INIT_CMNDS {
@@ -263,7 +263,7 @@ impl LcdChip for Aip31068Spi {
         self.flush();
     }
 
-    /// Upstream's `aip31068_spi.clear` (`aip31068_spi.py:190-193`): only the
+    /// Upstream's `aip31068_spi.clear` (`aip31068_spi.py:204-207`): only the
     /// text framebuffers are blanked; the glyph buffer keeps the icons.
     fn clear(&self) {
         let mut framebuffers = self.framebuffers();
@@ -272,7 +272,7 @@ impl LcdChip for Aip31068Spi {
         }
     }
 
-    /// Upstream's `aip31068_spi.flush` (`aip31068_spi.py:137-157`): send the
+    /// Upstream's `aip31068_spi.flush` (`aip31068_spi.py:150-171`): send the
     /// changed bytes of every framebuffer, batching changes that are close
     /// together.
     fn flush(&self) {
@@ -292,12 +292,12 @@ impl LcdChip for Aip31068Spi {
         }
     }
 
-    /// The panel's size in characters (`aip31068_spi.py:195-196`).
+    /// The panel's size in characters (`aip31068_spi.py:208-209`).
     fn get_dimensions(&self) -> (usize, usize) {
         (self.line_length, 4)
     }
 
-    /// Upstream's `aip31068_spi.set_glyphs` (`aip31068_spi.py:169-174`): keep
+    /// Upstream's `aip31068_spi.set_glyphs` (`aip31068_spi.py:184-188`): keep
     /// every 5x8 icon by glyph name.
     fn set_glyphs(&self, glyphs: &BTreeMap<String, Glyph>) {
         let mut icons = self
@@ -343,7 +343,7 @@ impl std::fmt::Debug for Aip31068Spi {
     }
 }
 
-/// Upstream's `aip31068_spi.encode` (`aip31068_spi.py:112-136`): pack each
+/// Upstream's `aip31068_spi.encode` (`aip31068_spi.py:113-137`): pack each
 /// `width`-bit word of `data` into a big-endian bit stream, emitting a byte
 /// whenever eight bits have accumulated and right-padding the last byte with
 /// zero bits.
@@ -373,7 +373,7 @@ fn encode(data: &[u16], width: u32) -> Vec<u8> {
     encoded
 }
 
-/// Upstream's `aip31068_spi.send` (`aip31068_spi.py:128-136`): the nine-bit
+/// Upstream's `aip31068_spi.send` (`aip31068_spi.py:138-149`): the nine-bit
 /// words of `data` as groups of eight, the last group padded with
 /// [`SEND_PAD`], each group encoded to nine bytes.
 fn encoded_groups(data: &[u16]) -> Vec<Vec<u8>> {
@@ -386,7 +386,7 @@ fn encoded_groups(data: &[u16]) -> Vec<Vec<u8>> {
     groups
 }
 
-/// Upstream's flush batching (`aip31068_spi.py:146-153`): the positions of
+/// Upstream's flush batching (`aip31068_spi.py:156-164`): the positions of
 /// every changed byte as `(position, length)` runs, with runs closer than five
 /// bytes joined while the run ahead is shorter than sixteen.
 fn changed_runs(data: &[u8], synced: &[u8]) -> Vec<(usize, usize)> {
@@ -409,7 +409,7 @@ fn changed_runs(data: &[u8], synced: &[u8]) -> Vec<(usize, usize)> {
 }
 
 /// The send arguments `flush` produces for one framebuffer
-/// (`aip31068_spi.py:154-156`): for every batched run, the position command
+/// (`aip31068_spi.py:165-170`): for every batched run, the position command
 /// (`fb_cmnd + pos`) and then the run's bytes as `CMND.WRITE_RAM | byte`.
 fn flush_messages(data: &[u8], synced: &[u8], fb_cmnd: u8) -> Vec<Vec<u16>> {
     let mut messages = Vec::new();
@@ -483,7 +483,7 @@ mod tests {
 
     #[test]
     fn test_the_options_are_read_with_upstream_defaults() {
-        // Without `line_length` the panel is 20 wide (`aip31068_spi.py:20,86-87`),
+        // Without `line_length` the panel is 20 wide (`aip31068_spi.py:19,87-88`),
         // and reading it records the option — `check_unused` requires a reader
         // for every option a config writes.
         let printer = printer();
@@ -512,7 +512,7 @@ mod tests {
         assert_eq!(chip.line_length, 16);
         assert_eq!(chip.get_dimensions(), (16, 4));
         // The framebuffers follow the width: two half-lines of 16 characters
-        // (`aip31068_spi.py:89-90`).
+        // (`aip31068_spi.py:91-92`).
         assert_eq!(chip.framebuffers().text[0].data.len(), 32);
     }
 
@@ -609,7 +609,7 @@ mod tests {
 
     #[test]
     fn test_the_init_sequence_is_upstreams_five_commands() {
-        // `aip31068_spi.py:71-79`: home, entry mode with INC, display off's
+        // `aip31068_spi.py:70-77`: home, entry mode with INC, display off's
         // other half plus ON, right shift, and the 2-line 5x8 function set.
         assert_eq!(DISPLAY_INIT_CMNDS, &[0x02, 0x06, 0x0c, 0x14, 0x28]);
     }
@@ -617,7 +617,7 @@ mod tests {
     #[test]
     fn test_eight_nine_bit_words_are_packed_into_nine_bytes() {
         // The pad word's own bytes are the same tail for every group
-        // (`aip31068_spi.py:112-136`): 8x9 = 72 bits = nine bytes.
+        // (`aip31068_spi.py:113-137`): 8x9 = 72 bits = nine bytes.
         let pad = SEND_PAD;
         // A single word is nine bits, so it fills one byte and one bit of the
         // next, which is right-padded with zeros.
@@ -655,7 +655,7 @@ mod tests {
 
     #[test]
     fn test_a_long_message_becomes_one_nine_byte_group_per_eight_words() {
-        // Sixteen words is two `spi_send` calls (`aip31068_spi.py:130-136`).
+        // Sixteen words is two `spi_send` calls (`aip31068_spi.py:143-149`).
         let words = vec![CMND_WRITE_RAM | 0x20; 16];
         let groups = encoded_groups(&words);
         assert_eq!(groups.len(), 2);
@@ -668,7 +668,7 @@ mod tests {
     #[test]
     fn test_the_framebuffers_start_unsent() {
         // Every "already sent" copy is `~`, so the first flush writes the whole
-        // screen (`aip31068_spi.py:88-111`).
+        // screen (`aip31068_spi.py:91-111`).
         let framebuffers = Framebuffers::new(20);
         assert_eq!(framebuffers.text[0].data, vec![b' '; 40]);
         assert_eq!(framebuffers.text[0].synced, vec![b'~'; 40]);
@@ -725,7 +725,7 @@ mod tests {
         );
         chip.set_glyphs(&glyphs);
 
-        // Only the HD44780-sized glyphs are kept (`aip31068_spi.py:169-174`).
+        // Only the HD44780-sized glyphs are kept (`aip31068_spi.py:184-188`).
         assert_eq!(
             *chip.icons.lock().unwrap(),
             HashMap::from([("thermometer".to_string(), (3u8, vec![0x0e; 8]))])
@@ -737,7 +737,7 @@ mod tests {
     #[test]
     fn test_close_changes_are_batched_into_one_run() {
         // The upstream rule: a change runs up to four bytes ahead while the run
-        // ahead is shorter than sixteen (`aip31068_spi.py:146-153`).
+        // ahead is shorter than sixteen (`aip31068_spi.py:156-164`).
         let synced = vec![0; 8];
         let mut data = vec![0; 8];
         data[0] = 1;
@@ -766,7 +766,7 @@ mod tests {
     #[test]
     fn test_the_first_flush_writes_the_blank_screen() {
         // The 40-byte text buffer splits into runs of 8, 16 and 16
-        // (`aip31068_spi.py:146-153`), each as a position command and its data.
+        // (`aip31068_spi.py:156-164`), each as a position command and its data.
         let synced = vec![b'~'; 40];
         let data = vec![b' '; 40];
         let messages = flush_messages(&data, &synced, 0x80);
@@ -804,7 +804,7 @@ mod tests {
     #[test]
     fn test_the_position_command_rides_the_framebuffers_base_address() {
         // The glyph buffer's base is `CMND.CGRAM` (0x40) and the second text
-        // buffer's is 0xc0 (`aip31068_spi.py:102-108`).
+        // buffer's is 0xc0 (`aip31068_spi.py:105-111`).
         let mut synced = vec![0u8; 4];
         let mut data = vec![0u8; 4];
         data[2] = 0x0e;
@@ -897,7 +897,7 @@ mod tests {
         let messages = outcome.expect("the display comes up");
 
         // The five init groups, one `spi_send` each, encoded to nine bytes
-        // (`aip31068_spi.py:159-166`).
+        // (`aip31068_spi.py:172-178`).
         let init: Vec<SentMessage> = DISPLAY_INIT_CMNDS
             .iter()
             .map(|command| SentMessage {
@@ -908,7 +908,7 @@ mod tests {
         assert_eq!(messages[..init.len()], init[..]);
 
         // And the first flush wrote the blank screen. Upstream's batching
-        // (`aip31068_spi.py:146-153`) splits each 40-byte text buffer into runs
+        // (`aip31068_spi.py:156-164`) splits each 40-byte text buffer into runs
         // of 8, 16 and 16 bytes, each as a position command (`0x80` + position)
         // and its data; the second text buffer starts at 0xc0 and the character
         // generator buffer at 0x40.

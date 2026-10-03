@@ -168,7 +168,7 @@ impl Hd44780Spi {
     pub fn new(config: &ConfigWrapper, printer: &Arc<Printer>) -> Result<Self, ConfigError> {
         let hd44780_protocol_init = config.get_bool("hd44780_protocol_init", Some(true))?;
         // The latch pin is required: `MCU_SPI_from_config` reports a missing
-        // chip select instead of a "no chip select" device (`bus.py:125`).
+        // chip select instead of a "no chip select" device (`bus.py:129-134`).
         config.get("latch_pin", None)?;
         let setup = mcu_spi_from_config(
             config,

@@ -1,25 +1,25 @@
 //! `ssd1306` — the SSD1306 (128x64 OLED) panel driver (upstream defines it in
-//! `klippy/extras/display/uc1701.py:199-236`, because it is the same
+//! `klippy/extras/display/uc1701.py:199-235`, because it is the same
 //! framebuffer and flush as the UC1701; `display.py:19` maps `lcd_type:
 //! ssd1306` to `uc1701.SSD1306`).
 //!
 //! The panel picks its bus from the config, exactly as upstream does
-//! (`uc1701.py:202-207`): a `cs_pin` makes it a "4 wire" SPI panel that also
+//! (`uc1701.py:201-207`): a `cs_pin` makes it a "4 wire" SPI panel that also
 //! needs a `dc_pin`, and without one it is an I2C panel at address 60 — which
 //! is what the corpus's `printer-wanhao-duplicator-6-2016.cfg` is.
 //!
 //! | framework call | here | upstream |
 //! |---|---|---|
 //! | `init()` | reset, the 25-command power-up list, flush | `uc1701.py:213-235` |
-//! | `clear()` | blank the eight page framebuffers | `uc1701.py:110-111` |
-//! | `flush()` | batch the framebuffer differences and send them | `uc1701.py:28-62` |
+//! | `clear()` | blank the eight page framebuffers | `uc1701.py:110-113` |
+//! | `flush()` | batch the framebuffer differences and send them | `uc1701.py:28-52` |
 //!
 //! The framebuffers, the flush, the IO wrappers and the reset helper are
 //! [`super::uc1701`]'s — upstream imports them from the same module.
 //!
 //! # What is not here
 //!
-//! * **`SH1106`** (`uc1701.py:238-242`): the 132-column variant adds an
+//! * **`SH1106`** (`uc1701.py:238-241`): the 132-column variant adds an
 //!   `x_offset` option and is a separate `lcd_type`, still refused by
 //!   [`super::display`]; the `columns`/`x_offset` parameters of upstream's
 //!   `SSD1306.__init__` exist only for that subclass, so this driver takes the
@@ -78,7 +78,7 @@ fn init_commands(contrast: i64, vcomh: i64, invert: bool) -> Vec<u8> {
     ]
 }
 
-/// One `lcd_type: ssd1306` panel (upstream's `SSD1306`, `uc1701.py:199-236`).
+/// One `lcd_type: ssd1306` panel (upstream's `SSD1306`, `uc1701.py:199-235`).
 pub struct Ssd1306 {
     /// The eight page framebuffers.
     base: Mutex<DisplayBase>,
@@ -107,7 +107,7 @@ impl Ssd1306 {
     /// `contrast` outside `0..=255`, or a `vcomh` outside `0..=63`.
     pub fn new(config: &ConfigWrapper, printer: &Arc<Printer>) -> Result<Self, ConfigError> {
         let (io, mcu) = if config.get_str("cs_pin").is_some() {
-            // `SPI4wire(config, "dc_pin")` (`uc1701.py:204-206`).
+            // `SPI4wire(config, "dc_pin")` (`uc1701.py:205-207`).
             PanelIo::spi4wire(config, printer, "dc_pin")?
         } else {
             // `I2C(config, 60)` (`uc1701.py:203`).
@@ -149,12 +149,12 @@ impl LcdChip for Ssd1306 {
         self.flush();
     }
 
-    /// Upstream's `DisplayBase.clear` (`uc1701.py:110-111`).
+    /// Upstream's `DisplayBase.clear` (`uc1701.py:110-113`).
     fn clear(&self) {
         self.base().clear();
     }
 
-    /// Upstream's `DisplayBase.flush` (`uc1701.py:28-62`).
+    /// Upstream's `DisplayBase.flush` (`uc1701.py:28-52`).
     fn flush(&self) {
         if let Err(err) = self.base().flush(&self.io) {
             warn!("ssd1306: could not flush the panel: {err}");

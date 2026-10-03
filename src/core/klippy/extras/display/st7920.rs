@@ -9,27 +9,27 @@
 //!
 //! | framework call | here | upstream |
 //! |---|---|---|
-//! | `init()` | the 8-command power-up sequence, then a flush | `st7920.py:63-74` |
-//! | `clear()` | blank the text and graphics framebuffers | `st7920.py:125-130` |
-//! | `flush()` | batch the framebuffer differences and send them | `st7920.py:30-54` |
-//! | `set_glyphs()` | keep the 16x16 icons and cache the two animated pairs | `st7920.py:109-116` |
+//! | `init()` | the 8-command power-up sequence, then a flush | `st7920.py:63-73` |
+//! | `clear()` | blank the text and graphics framebuffers | `st7920.py:131-135` |
+//! | `flush()` | batch the framebuffer differences and send them | `st7920.py:35-62` |
+//! | `set_glyphs()` | keep the 16x16 icons and cache the two animated pairs | `st7920.py:86-93` |
 //!
 //! The framebuffers are upstream's three (text, glyph, 32 graphics rows), and so
 //! is the flush algorithm: find the changed bytes, join runs closer than five
 //! bytes, then send each run as a command pair plus its data. Commands take the
 //! panel in and out of extended mode by prepending `0x26`/`0x22`
-//! (`st7920.py:181-189`).
+//! (`st7920.py:174-184`).
 //!
 //! # What is not here
 //!
-//! * **`emulated_st7920`** (`st7920.py:191-234`): the software-SPI variant that
+//! * **`emulated_st7920`** (`st7920.py:209-256`): the software-SPI variant that
 //!   shifts each byte as two nibbles and toggles an enable pin. Not implemented;
 //!   `lcd_type` reports it as a gap.
 //! * **Text and glyph drawing.** [`super::display`] never draws, so the
 //!   `write_text`/`write_glyph`/`write_graphics` half of `DisplayBase` is not
 //!   ported. The glyph framebuffer is still filled by [`ST7920::set_glyphs`],
 //!   because upstream caches the animated icons at load time.
-//! * **`BACKGROUND_PRIORITY_CLOCK` / `minclock`** (`st7920.py:9,186`): upstream
+//! * **`BACKGROUND_PRIORITY_CLOCK` / `minclock`** (`st7920.py:10,184`): upstream
 //!   sends with `reqclock=0x7fffffff00000000` and orders startup writes by clock;
 //!   this host's [`McuCommand`](crate::core::klippy::cmd::McuCommand) carries no
 //!   clock, so commands go out in call order.
@@ -49,20 +49,20 @@ use crate::core::klippy::printer::{Printer, PrinterObject};
 
 use super::display::{Glyph, LcdChip, SentMessage};
 
-/// Upstream's `ST7920_SYNC_DELAY` (`st7920.py:12`), in seconds.
+/// Upstream's `ST7920_SYNC_DELAY` (`st7920.py:14`), in seconds.
 const ST7920_SYNC_DELAY: f64 = 0.000045;
-/// Upstream's `ST7920_CMD_DELAY` (`st7920.py:14`), in seconds.
+/// Upstream's `ST7920_CMD_DELAY` (`st7920.py:13`), in seconds.
 const ST7920_CMD_DELAY: f64 = 0.000020;
 
-/// The glyph framebuffer's id in the flush order (`st7920.py:26`).
+/// The glyph framebuffer's id in the flush order (`st7920.py:29`).
 const GLYPH_FB_ID: u8 = 0x40;
-/// The text framebuffer's id in the flush order (`st7920.py:24`).
+/// The text framebuffer's id in the flush order (`st7920.py:27`).
 const TEXT_FB_ID: u8 = 0x80;
-/// The panel's size in characters (`st7920.py:132-133`).
+/// The panel's size in characters (`st7920.py:136-137`).
 const DIMENSIONS: (usize, usize) = (16, 4);
 
 /// One framebuffer and the copy the firmware has already been told about —
-/// upstream's `(new_data, old_data, fb_id)` triples (`st7920.py:24-30`).
+/// upstream's `(new_data, old_data, fb_id)` triples (`st7920.py:25-32`).
 #[derive(Debug)]
 struct Framebuffer {
     /// What the screen should show.
@@ -74,7 +74,7 @@ struct Framebuffer {
 }
 
 /// The three framebuffers, in the order upstream flushes them
-/// (`st7920.py:23-30`).
+/// (`st7920.py:25-32`).
 #[derive(Debug)]
 struct Framebuffers {
     text: Framebuffer,
@@ -85,7 +85,7 @@ struct Framebuffers {
 impl Framebuffers {
     /// Upstream's `DisplayBase.__init__` buffers: the text screen is spaces,
     /// everything else zeros, and every "already sent" copy is `~` so the first
-    /// flush sends the lot (`st7920.py:20-30`).
+    /// flush sends the lot (`st7920.py:20-34`).
     fn new() -> Self {
         let blank = |len: usize, byte: u8, fb_id: u8| Framebuffer {
             data: vec![byte; len],
@@ -131,7 +131,7 @@ struct St7920State {
     /// The framebuffers.
     framebuffers: Mutex<Framebuffers>,
     /// The 16x16 icons by glyph name, split into the two column halves
-    /// (`st7920.py:27`).
+    /// (`st7920.py:34`).
     icons: Mutex<HashMap<String, (Vec<u8>, Vec<u8>)>>,
     /// Every message handed to the firmware, in order (tests and diagnostics).
     sent: Mutex<Vec<SentMessage>>,
@@ -147,7 +147,7 @@ pub struct ST7920 {
 impl ST7920 {
     /// Read the three pins, allocate the oid, and register the config callback.
     ///
-    /// Upstream's `ST7920.__init__` (`st7920.py:140-155`).
+    /// Upstream's `ST7920.__init__` (`st7920.py:140-160`).
     ///
     /// # Errors
     /// A missing pin, an unresolvable or already-used pin, pins on different
@@ -211,7 +211,7 @@ impl ST7920 {
     }
 
     /// Send one protocol message, switching extended mode when upstream does
-    /// (`st7920.py:181-189`).
+    /// (`st7920.py:174-184`).
     fn send(&self, cmds: &[u8], is_data: bool, is_extended: bool) -> Result<(), McuError> {
         let mut bytes = cmds.to_vec();
         if !is_data {
@@ -258,7 +258,7 @@ impl ST7920 {
 }
 
 impl LcdChip for ST7920 {
-    /// Upstream's `DisplayBase.init` (`st7920.py:63-74`): the eight power-up
+    /// Upstream's `DisplayBase.init` (`st7920.py:63-73`): the eight power-up
     /// commands, then the first flush.
     fn init(&self) {
         let cmds = [0x24, 0x40, 0x02, 0x26, 0x22, 0x02, 0x06, 0x0c];
@@ -269,7 +269,7 @@ impl LcdChip for ST7920 {
         self.flush();
     }
 
-    /// Upstream's `DisplayBase.clear` (`st7920.py:125-130`). The glyph
+    /// Upstream's `DisplayBase.clear` (`st7920.py:131-135`). The glyph
     /// framebuffer is deliberately left alone: the cached icons live there.
     fn clear(&self) {
         let mut framebuffers = self.framebuffers();
@@ -279,7 +279,7 @@ impl LcdChip for ST7920 {
         }
     }
 
-    /// Upstream's `DisplayBase.flush` (`st7920.py:30-54`): send the changed
+    /// Upstream's `DisplayBase.flush` (`st7920.py:35-62`): send the changed
     /// bytes of every framebuffer, batching runs that are close together.
     fn flush(&self) {
         let mut framebuffers = self.framebuffers();
@@ -297,7 +297,7 @@ impl LcdChip for ST7920 {
                 .map(|(i, _)| (i, 1))
                 .collect();
             // Join runs closer than five bytes, as upstream does
-            // (`st7920.py:38-44`).
+            // (`st7920.py:43-49`).
             for i in (0..diffs.len().saturating_sub(1)).rev() {
                 let (pos, _count) = diffs[i];
                 let (next_pos, next_count) = diffs[i + 1];
@@ -330,12 +330,12 @@ impl LcdChip for ST7920 {
         }
     }
 
-    /// The panel's size in characters (`st7920.py:132-133`).
+    /// The panel's size in characters (`st7920.py:136-137`).
     fn get_dimensions(&self) -> (usize, usize) {
         DIMENSIONS
     }
 
-    /// Upstream's `DisplayBase.set_glyphs` (`st7920.py:109-116`): keep every
+    /// Upstream's `DisplayBase.set_glyphs` (`st7920.py:86-93`): keep every
     /// 16x16 icon, then cache the two animated glyph pairs.
     fn set_glyphs(&self, glyphs: &BTreeMap<String, Glyph>) {
         {
@@ -384,7 +384,7 @@ impl std::fmt::Debug for ST7920 {
 }
 
 impl ST7920 {
-    /// Upstream's `DisplayBase.cache_glyph` (`st7920.py:75-86`): store the
+    /// Upstream's `DisplayBase.cache_glyph` (`st7920.py:74-85`): store the
     /// difference between an animated glyph and its base in the character
     /// generator's CGRAM slots, so the two frames can be shown by writing a
     /// text byte.
@@ -420,7 +420,7 @@ impl ST7920 {
 impl St7920State {
     /// Add this panel's configuration command, with the pin numbers resolved.
     ///
-    /// Upstream's `ST7920.build_config` (`st7920.py:157-169`): the pin *names*
+    /// Upstream's `ST7920.build_config` (`st7920.py:161-173`): the pin *names*
     /// become firmware numbers here, the first moment the dictionary exists.
     fn build(
         &self,
@@ -459,7 +459,7 @@ impl St7920State {
 /// `config_st7920 oid=%c cs_pin=%u sclk_pin=%u sid_pin=%u
 /// sync_delay_ticks=%u cmd_delay_ticks=%u` — configure one panel.
 ///
-/// Upstream builds this as a text command in `build_config` (`st7920.py:160-166`);
+/// Upstream builds this as a text command in `build_config` (`st7920.py:163-168`);
 /// the wording of the format string is the firmware's, and the delay ticks are
 /// `mcu.seconds_to_clock` of the two delays above.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -716,7 +716,7 @@ mod tests {
     #[test]
     fn test_the_framebuffers_start_unsent() {
         // Every "already sent" copy is `~`, so the first flush sends the whole
-        // screen (`st7920.py:24-30`).
+        // screen (`st7920.py:25-32`).
         let framebuffers = Framebuffers::new();
         assert_eq!(framebuffers.text.data, vec![b' '; 64]);
         assert_eq!(framebuffers.text.synced, vec![b'~'; 64]);

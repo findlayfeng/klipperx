@@ -561,8 +561,9 @@ max_temp: 300
 本节再把它包成可 `objects/query` 的对象 `temperature_probe <name>`。核心与标定命令族
 均已落地（A `f6ea201`、B `dfaf418`——`calibration_position` / `calibration_bed_temp` /
 `calibration_extruder_temp` / `extruder_heating_z` / `resting_z` / `horizontal_move_z` / `speed`
-由 `TEMPERATURE_PROBE_*` 命令族消费）；eddy 漂移补偿（`EddyDriftCompensation`，C 单元）
-待排——落地前 `get_status` 的 `compensation_enabled` 恒 `false`。
+由 `TEMPERATURE_PROBE_*` 命令族消费）；漂移补偿 `EddyDriftCompensation` 也已落地
+（C `704ee0d`）：需**同名** `[probe_eddy_current <name>]` 段才会注册，`get_status` 的
+`compensation_enabled` 是真实开关。
 
 | 参数 | 类型 | 必需 | 默认值 | 说明 |
 |------|------|------|--------|------|
@@ -578,9 +579,17 @@ max_temp: 300
 | `smooth_time` | 浮点 (s) | 否 | `2.0` | 读数平滑窗口，`> 0` |
 | `min_temp` | 浮点 (°C) | 否 | `-273.15` | 报警下限（`minval` 同值） |
 | `max_temp` | 浮点 (°C) | 否 | `99999999.9` | 报警上限，`> min_temp` |
+| `calibration_temp` | 浮点 (°C) | 否 | `0.0` | 漂移校准温度（`note_z_calibration_*` 经 `SAVE_CONFIG` 写回） |
+| `max_validation_temp` | 浮点 (°C) | 否 | `60.0` | 漂移校验允许的最高温度 |
+| `drift_calibration_min_temp` | 浮点 (°C) | 否 | `0.0` | 漂移曲线适用下限（`finish` 时随曲线写回） |
+| `drift_calibration` | 两层列表 | 否 | — | 9 段二次多项式系数（`fit` 输出，SAVE_CONFIG 写出；坏曲线报 `Invalid polynomial in drift calibration`） |
+
+> 上述四个漂移选项**仅在同名 `[probe_eddy_current]` 段存在时**被读取（与上游一致），
+> 否则会被未用选项校验拒绝。另：`drift_calibration` 写为空视为「未配置」
+> （上游空值会崩在 `_check_calibration` 拒载，本仓取代码注释声明的取舍）。
 
 `get_status` 六键：`temperature`（平滑值，**不**舍入）、`measured_min_temp` / `measured_max_temp`
-（round2）、`in_calibration`、`estimated_expansion`、`compensation_enabled`（见上）。
+（round2）、`in_calibration`、`estimated_expansion`、`compensation_enabled`（C 起为真实开关，无 eddy 段时恒 `false`）。
 
 ### `[thermistor <name>]` / `[adc_temperature <name>]` — 自定义传感器定义
 

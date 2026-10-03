@@ -4,7 +4,7 @@
 //! wrapper and records `(section, option) -> value` on each get
 //! (`klippy/configfile.py:29-64`). That dict is the schema: after the config is
 //! loaded, `ConfigValidate.check_unused` rejects any option nobody read
-//! (`klippy/configfile.py:424-445`), and `_build_status_settings` turns it into
+//! (`klippy/configfile.py:424-446`), and `_build_status_settings` turns it into
 //! the `configfile` object's `settings` status (`klippy/configfile.py:447-452`).
 //!
 //! Keys are lowercased, section and option both, so a config that writes `[MCU]`

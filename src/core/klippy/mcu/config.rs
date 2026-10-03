@@ -145,7 +145,7 @@ pub type ConfigCallback = Box<dyn Fn(&ConfigBuilder, &Mcu) -> Result<(), McuErro
 
 /// A callback run after the firmware has accepted the configuration.
 ///
-/// Upstream's `register_post_init_callback` (`klippy/mcu.py:1130`). It sees the
+/// Upstream's `register_post_init_callback` (`klippy/mcu.py:1133-1135`). It sees the
 /// connected MCU so it can start periodic queries or send startup commands.
 pub type PostInitCallback = Box<dyn Fn(&Mcu) + Send + Sync>;
 
@@ -733,7 +733,7 @@ async fn get_config(mcu: &Mcu) -> Result<ConfigState, McuError> {
 /// per board, not in `basecmd.c`).
 async fn reset_firmware(mcu: &Mcu, state: &ConfigState, crc: u32) -> Result<(), McuError> {
     // Upstream prefers the firmware's own `reset` when it has one
-    // (`klippy/mcu.py:733-740`: `_reset_cmd` is chosen over `config_reset`). A
+    // (`klippy/mcu.py:736-745`: `_reset_cmd` is chosen over `config_reset`). A
     // reboot clears the timers and the step queue as well as the configuration,
     // where `config_reset` only clears the configuration. It drops this
     // connection, so the caller reconnects and re-runs the handshake
@@ -1439,7 +1439,7 @@ mod tests {
     async fn test_configure_prefers_reset_over_config_reset() {
         // A firmware that can reboot itself is rebooted even when it can also
         // clear its configuration in place (upstream `_reset_cmd` over
-        // `config_reset`, `klippy/mcu.py:733-740`). The handshake asks for the
+        // `config_reset`, `klippy/mcu.py:736-745`). The handshake asks for the
         // reconnect instead of sending `config_reset`.
         let mcu = scripted_mcu_with_both_resets(vec![MappingEntry {
             input: Frame::new(0, get_config_payload()),

@@ -704,7 +704,7 @@ impl DigitalOut for McuDigitalOut {
 impl DigitalOutState {
     /// The build-time half: resolve the pin and add the configuration.
     ///
-    /// Upstream's `MCU_digital_out._build_config` (`klippy/mcu.py:426-449`).
+    /// Upstream's `MCU_digital_out._build_config` (`klippy/mcu.py:426-444`).
     fn build(
         &self,
         builder: &ConfigBuilder,
@@ -764,7 +764,7 @@ impl DigitalOutState {
 /// Look a pin name up in the firmware's `pin` enumeration.
 ///
 /// Upstream reports this from the message parser and the caller turns it into
-/// `Pin '%s' is not a valid pin name on mcu '%s'` (`klippy/mcu.py:1032-1038`).
+/// `Pin '%s' is not a valid pin name on mcu '%s'` (`klippy/mcu.py:1030`).
 pub(crate) fn pin_number(mcu: &Mcu, name: &str, chip_name: &str) -> Result<u32, PinError> {
     let invalid = || PinError::InvalidName {
         pin: name.to_string(),

@@ -23,7 +23,7 @@
 //!
 //! # Upstream
 //!
-//! `QueryStatusHelper` (`klippy/webhooks.py:470-561`) serves `objects/list`,
+//! `QueryStatusHelper` (`klippy/webhooks.py:471-562`) serves `objects/list`,
 //! `objects/query` and `objects/subscribe` from one timer. Two of its decisions
 //! are visible to a client and kept here:
 //!
@@ -71,7 +71,7 @@ pub(crate) fn install(api: &mut Api, wiring: &ApiWiring<'_>) -> Result<(), Regis
 }
 
 /// Seconds between subscription refreshes: upstream's
-/// `SUBSCRIPTION_REFRESH_TIME` (`klippy/webhooks.py:467`).
+/// `SUBSCRIPTION_REFRESH_TIME` (`klippy/webhooks.py:469`).
 pub const SUBSCRIPTION_REFRESH_TIME: f64 = 0.25;
 
 /// The `objects/subscribe` endpoint.

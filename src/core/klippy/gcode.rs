@@ -971,7 +971,7 @@ impl GCodeDispatch {
     }
 
     /// Send a raw line to all output handlers — upstream's
-    /// `gcode.respond_raw(msg)` (`klippy/gcode.py:288`). Used by
+    /// `gcode.respond_raw(msg)` (`klippy/gcode.py:247-249`). Used by
     /// `virtual_sdcard`'s replay loop, which has no `GcodeCommand` in hand.
     pub fn respond_raw(&self, msg: &str) {
         self.inner.respond_raw(msg);
@@ -1122,7 +1122,7 @@ async fn process_line(inner: &Arc<Inner>, line: &str, need_ack: bool) -> Result<
         HandlerOutcome::Internal(msg) => {
             // The printer was already shut down above; the client is still told.
             // No `gcode:command_error`: upstream fires it only for a
-            // `CommandError` (`klippy/gcode.py:229-234`).
+            // `CommandError` (`klippy/gcode.py:224-226`).
             inner.respond_error(&msg);
             if need_ack {
                 gcmd.ack(None);
@@ -1429,7 +1429,7 @@ pub fn is_traditional_gcode(cmd: &str) -> bool {
         return false;
     }
     // The rest must be a number, not merely start with one. Upstream tries
-    // `float(cmd[1:])` (`klippy/gcode.py:125`), so `M110` is traditional but
+    // `float(cmd[1:])` (`klippy/gcode.py:129`), so `M110` is traditional but
     // `I2C_READ` is not: it is an extended name that happens to begin with a
     // letter and a digit, and one upstream rejects at registration.
     name[1..].parse::<f64>().is_ok()

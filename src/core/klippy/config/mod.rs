@@ -691,7 +691,7 @@ fn merge_autosave(body: &mut Config, saved: &Config) {
 // ---------------------------------------------------------------------------
 
 /// Serialize a config's sections to plain ini text, upstream's
-/// `build_config_string` (`configfile.py:210-226`): `[identifier]`, one
+/// `build_config_string` (`configfile.py:152-155`): `[identifier]`, one
 /// `option = value` line per parameter, and a blank line closing each
 /// section. A multi-line value's continuation lines are indented with a tab,
 /// exactly as `configparser.write` leaves them (`'\n'` → `'\n\t'`), so the

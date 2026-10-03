@@ -1,7 +1,7 @@
 //! `[mcu]` as a printer object: the section, and the connection it needs.
 //!
 //! Upstream's `MCU` is one printer object per `[mcu]` / `[mcu <name>]` section
-//! (`klippy/mcu.py:1147`), registered by `mcu.add_printer_objects` under the
+//! (`klippy/mcu.py:1146`), registered by `mcu.add_printer_objects` under the
 //! section's name (`klippy/mcu.py:1239`). Its status is the identify snapshot
 //! `MCUStatsHelper` takes once the handshake is done (`klippy/mcu.py:938-975`).
 //!
@@ -92,13 +92,13 @@ const RESET_SETTLE: Duration = Duration::from_millis(500);
 const CLOCK_BASE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// How often a secondary MCU's clock alignment is recalibrated, in seconds
-/// (upstream does it in the periodic `stats`, `klippy/extras/motion_quuing.py:100`).
+/// (upstream does it in the periodic `stats`, `klippy/extras/motion_queuing.py:100`).
 const RECALIBRATE_INTERVAL: f64 = 1.0;
 
 /// How often the host reads a connected MCU's clock to keep its estimate fed,
 /// in seconds. Upstream's `get_clock` timer fires every ~0.9839 s — deliberately
 /// off the round second so it does not resonate with other periodic events
-/// (`klippy/clocksync.py:62-68`); one second here, the same order as
+/// (`klippy/clocksync.py:62-67`); one second here, the same order as
 /// [`RECALIBRATE_INTERVAL`], whose precedent the registration follows.
 const CLOCK_POLL_INTERVAL: f64 = 1.0;
 
@@ -182,7 +182,7 @@ impl McuObject {
     ///
     /// Also declares this MCU as a chip on the shared `pins` object, as
     /// upstream's `MCUConfigHelper.__init__` does
-    /// (`klippy/mcu.py:996-997`): a pin description may name this MCU as its
+    /// (`klippy/mcu.py:1000`): a pin description may name this MCU as its
     /// chip from the moment the config file mentions it.
     ///
     /// # Errors
@@ -219,7 +219,7 @@ impl McuObject {
 
     /// Whether this firmware is stopped (or the host has marked it so).
     ///
-    /// Upstream's `MCU.is_shutdown()` (`klippy/mcu.py:908`).
+    /// Upstream's `MCU.is_shutdown()` (`klippy/mcu.py:906-907`).
     pub fn is_shutdown(&self) -> bool {
         self.is_shutdown.load(Ordering::SeqCst)
     }
@@ -401,7 +401,7 @@ impl McuObject {
     ///
     /// Samples reach the estimators only through [`McuClock::get_clock`]
     /// (`cmd/clock.rs`), and upstream drives it from a timer that fires every
-    /// ~0.9839 s (`klippy/clocksync.py:62-68`); without a periodic query the
+    /// ~0.9839 s (`klippy/clocksync.py:62-67`); without a periodic query the
     /// estimate would run on its connect seed alone forever. The timer is
     /// registered for **every** MCU: `mcu_recalibrate` only *reads* the
     /// estimators (`SecondarySync::calibrate` is pure math), so a primary and a
@@ -562,7 +562,7 @@ impl McuObject {
     ///
     /// The old session is **closed explicitly** before the port is reopened,
     /// the way upstream ends one: `_restart_via_command` sends `reset`, pauses
-    /// 15 ms, then calls `self._disconnect()` (`klippy/mcu.py:729-747`) — the
+    /// 15 ms, then calls `self._disconnect()` (`klippy/mcu.py:730-747`) — the
     /// disconnect is a step of its own, not a consequence of letting go of a
     /// handle. Dropping this one reference would not end the session either:
     /// the chip's device slot and the `McuClock` behind the clock poll still
@@ -612,7 +612,7 @@ impl McuObject {
     ///
     /// The primary (the bare `[mcu]`) defines the print-time origin; a
     /// secondary is shifted so the same print time maps to its own clock
-    /// (`SecondarySync`, `klippy/clocksync.py:177-235`). Resources that
+    /// (`SecondarySync`, `klippy/clocksync.py:177-231`). Resources that
     /// convert print time to this MCU's clock read it through the chip.
     ///
     /// Both bring-ups run it — `connect` for the first session of a section,
@@ -702,7 +702,7 @@ impl McuObject {
     ///
     /// Only then is the firmware itself reset; a first start and a plain
     /// `restart` reconnect without touching it (upstream keys the same decision
-    /// on `start_reason`, `klippy/mcu.py:678-680`).
+    /// on `start_reason`, `klippy/mcu.py:682-683`).
     fn is_firmware_restart(&self) -> bool {
         self.printer
             .upgrade()
@@ -885,7 +885,7 @@ impl McuObject {
     /// The point is `FIRMWARE_RESTART` on the `command` method, which already
     /// sent the firmware's own `reset` on the live connection before the parts
     /// came down (`before_firmware_restart`; upstream's `_restart_via_command`,
-    /// `klippy/mcu.py:729-747`). What is left here is the firmware whose *only*
+    /// `klippy/mcu.py:730-747`). What is left here is the firmware whose *only*
     /// reset is `reset` and that still carries a configuration: no `config_reset`
     /// to clear it in place, so it has to be rebooted and re-identified — with
     /// the in-place retries this loop owns.
@@ -1211,7 +1211,7 @@ impl PrinterObject for McuObject {
             // what lets this connection be the only one, instead of identifying
             // the running firmware just to tell it to reboot
             // (`before_firmware_restart`; upstream's `_restart_via_command`,
-            // `klippy/mcu.py:729-747`). What is left for the handshake below is
+            // `klippy/mcu.py:730-747`). What is left for the handshake below is
             // the firmware whose *only* reset is `reset` and that still carries a
             // configuration: no `config_reset` to clear it in place, so it has to
             // be rebooted and re-identified here — with the in-place retries
@@ -1457,7 +1457,7 @@ pub fn load_config(
             .map_err(|err| ConfigError::new(err.to_string()))?,
     );
     // A host shutdown stops the firmware too (upstream registers the same
-    // handler in `MCU.__init__`, `klippy/mcu.py:798-799`). Registered here
+    // handler in `MCU.__init__`, `klippy/mcu.py:800`). Registered here
     // rather than in `connect` because the handler is `'static` and needs a
     // handle to the object the registry owns; a `Weak` avoids keeping it alive.
     let weak = Arc::downgrade(&object);
@@ -1839,7 +1839,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_a_host_shutdown_sends_emergency_stop_to_the_firmware() {
-        // Upstream's `MCU._shutdown` (`klippy/mcu.py:888-893`): a host shutdown
+        // Upstream's `MCU._shutdown` (`klippy/mcu.py:889-893`): a host shutdown
         // stops the firmware too, so it cannot keep executing queued work while
         // the host is gone.
         let printer = printer();

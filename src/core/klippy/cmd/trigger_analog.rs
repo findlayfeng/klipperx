@@ -25,7 +25,7 @@ use crate::core::klippy::mcu::McuError;
 use crate::core::klippy::msg::proto::ArgValue;
 
 /// The first trsync reason a `trigger_analog` failure carries
-/// (`MCU_trigger_analog.REASON_TRIGGER_ANALOG`, `trigger_analog.py:225`):
+/// (`MCU_trigger_analog.REASON_TRIGGER_ANALOG`, `trigger_analog.py:273`):
 /// `REASON_COMMS_TIMEOUT + 1`, plus the `trigger_analog_error:` value.
 pub const REASON_TRIGGER_ANALOG: u8 = TriggerReason::CommsTimeout as u8 + 1;
 

@@ -8,7 +8,7 @@
 //!   accepted, since its consumer registers as `toolhead`, not `printer`;
 //! - an option is valid exactly when someone read it **or** the `SAVE_CONFIG`
 //!   block wrote it: `start_access_tracking` folds the autosave fileconfig into
-//!   the access set (`configfile.py:416-422`), so `SAVE_CONFIG`-written options
+//!   the access set (`configfile.py:416-423`), so `SAVE_CONFIG`-written options
 //!   are never undefined. This is what lets a saved `[stepper_a] lower_arm`
 //!   pass even though the kinematics reads `lower_arm_length`
 //!   (`test/klippy/rotary_delta_calibrate.cfg`).

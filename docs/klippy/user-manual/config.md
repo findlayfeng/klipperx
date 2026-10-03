@@ -554,6 +554,7 @@ max_temp: 110
 | 1-wire | `DS18B20`（`serial_no` 必需、`sensor_mcu` 必需、`ds18_report_time` 默认 3.0 s ≥ 1.0 s） |
 | MCU 内部 | `temperature_mcu`（可带 `sensor_mcu`，默认 `mcu`） |
 | 组合 | `temperature_combined`（`sensor_list` 必需、`maximum_deviation` ≥ 0、`combination_method` ∈ `min`/`max`/`mean` 必需） |
+| 主机热区 | `temperature_host`（`sensor_path` 可选，默认 `/sys/class/thermal/thermal_zone0/temp`，见下节） |
 | 自定义 | 用 `[thermistor <name>]` / `[adc_temperature <name>]` 定义后按 `<name>` 引用（见下节） |
 
 ```ini
@@ -568,6 +569,27 @@ sensor_mcu: mcu
 serial_no: 28ff00abcdef
 max_temp: 300
 ```
+
+### `[temperature_host]` — 主机热区温度传感器（工厂注册节）
+
+裸节本身**没有选项**（写任何选项都会被判 `Option '…' is not valid in section
+'temperature_host'`），唯一作用是把 `temperature_host` 传感器工厂注册给 `heaters`
+（上游经 `temperature_sensors.cfg` 装载该节的同款语义）。真正的传感器在**消费节**里建：
+
+```ini
+[temperature_sensor host]
+sensor_type: temperature_host
+# sensor_path 可选，默认 /sys/class/thermal/thermal_zone0/temp
+# min_temp / max_temp 也写在这个节里
+```
+
+- 每 1 s 读一次内核的毫制摄氏度（÷1000），`min_temp`/`max_temp` 越界即
+  `invoke_shutdown("HOST temperature … below/above …")`（文案逐字）；
+- 传感器自身也是对象 `temperature_host <name>`（`<name>` 取消费节名的最后一词），
+  `get_status` 只有 `temperature`（round2）；构造时打不开文件报
+  `Unable to open temperature file '<path>'`；
+- `--debugoutput` 下跳过开文件与定时器（对应回放/调试输出模式）；读失败时
+  `temperature` 置 0 且采样定时器退役（上游 `reactor.NEVER` 同款）。
 
 ### `[temperature_probe <name>]` — 探针温度传感器（eddy 漂移补偿的温度通道）
 

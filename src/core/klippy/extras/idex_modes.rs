@@ -132,7 +132,7 @@ struct Shared {
     axis_position: Vec<f64>,
     /// The names `CARRIAGE=` takes, in carriage order — upstream's `dc_rails`
     /// keys, each carriage's `rail.get_name(short=True)`
-    /// (`idex_modes.py:37-39`). This module's own name is known when the
+    /// (`idex_modes.py:40-43`). This module's own name is known when the
     /// section loads; the primary rail's short name is filled in by [`claim`],
     /// which is when the cartesian kinematics hands the rail over. A generic
     /// cartesian machine knows all of them when the kinematics builds the
@@ -150,7 +150,7 @@ struct Shared {
     /// like its frames before any homing).
     endstops: Vec<f64>,
     /// `SAVE_DUAL_CARRIAGE_STATE NAME=…` states: the active index and the
-    /// axis frames (`idex_modes.py:285-293`; modes are not modelled — module
+    /// axis frames (`idex_modes.py:285-292`; modes are not modelled — module
     /// docs).
     saved: HashMap<String, SavedState>,
 }
@@ -324,7 +324,7 @@ pub fn claim(rails: &[Arc<Rail>], printer: &Arc<Printer>) {
         .unwrap_or_else(|poison| poison.into_inner()) = Some(Arc::clone(rail));
     // The primary carriage's name is the rail's short name
     // (`rail.get_name(short=True)`, `stepper.py:388-394`), the key upstream's
-    // `dc_rails` uses for `CARRIAGE=` (`idex_modes.py:37-39`).
+    // `dc_rails` uses for `CARRIAGE=` (`idex_modes.py:40-43`).
     module.shared_lock().names[0] = Some(short_rail_name(rail.name()).to_string());
 }
 
@@ -375,7 +375,7 @@ pub fn load_config(
         axis_index(axis),
         // This module's own carriage name is the section's short name
         // (`rail.get_name(short=True)`, `stepper.py:388-394`), the key upstream's
-        // `dc_rails` uses for `CARRIAGE=` (`idex_modes.py:37-39`); the bare
+        // `dc_rails` uses for `CARRIAGE=` (`idex_modes.py:40-43`); the bare
         // `[dual_carriage]` section's short name is its identifier.
         identifier.clone(),
     )));

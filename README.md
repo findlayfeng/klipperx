@@ -48,10 +48,10 @@ AI 写实现」：人类负责方向与取舍、任务拆解、验收判定、�
 | 项 | 状态 |
 |---|---|
 | 上游语料（`KLIPPERX_UPSTREAM_ALL=1`） | **239 条声明运行**：其中 **237 条字典齐备、全部通过 / 0 条失败**；另 2 条（`generic-cramps.cfg`、`generic-replicape.cfg`，BeagleBone/PRU 板）因未构建 `pru` 字典而跳过——它们也正是静态缺口报告里**仅剩**的一处（`replicape` 节未实现）。忽略列表**已清空** |
-| 单进程闸门 | `cargo test -p klipperx --lib` → **1976 通过 / 0 失败 / 2 忽略**（约 65 s，含全部语料；忽略列表守卫是 `KLIPPERX_UPSTREAM_GUARD`，见[环境变量](#环境变量开发与测试)） |
+| 单进程闸门 | `cargo test -p klipperx --lib` → **2519 通过 / 0 失败 / 4 忽略**（含全部语料；4 忽略 = `pru` 字典未构建×2、内联 gcode 解析、真机用例；忽略列表守卫是 `KLIPPERX_UPSTREAM_GUARD`，见[环境变量](#环境变量开发与测试)；计数 2026-10-03 实测重核） |
 | 真机 | 只有少量冒烟（单轴运动与位置读回、SPI flash、`stats`、`output_pin`、`mcu_temp`）；完整三轴/归零待接线，见 [`TESTING.md`](TESTING.md) |
-| `[extras]` 覆盖 | `src/core/klippy/extras/` 101 个模块文件、115 个 `section!` 声明；覆盖范围与逐模块说明见[开发手册模块表](docs/klippy/developer-manual/README.md) |
-| 输入通道 | API（`-a` unix socket，Moonraker 语义）与终端客户端**可用**；`virtual_sdcard` 的文件回放与 `GCodeIO`（伪 tty）**未实现/暂缓** |
+| `[extras]` 覆盖 | `src/core/klippy/extras/` 104 个模块、117 个 `section!` 声明（装载 id 同数，由 `test_the_factory_table_is_in_load_order` 钉住；2026-10-03 实测重核）；覆盖范围与逐模块说明见[开发手册模块表](docs/klippy/developer-manual/README.md) |
+| 输入通道 | API（`-a` unix socket，Moonraker 语义）与终端客户端**可用**；`virtual_sdcard` 的文件回放（`M20`–`M27`）**已实现**，`GCodeIO`（伪 tty）**暂缓** |
 
 ### 能做什么
 

@@ -412,10 +412,18 @@ impl GcodeCommand {
         CommandError::new(format!("Error on '{}': missing {}", self.commandline, name))
     }
 
+    /// Upstream's bound-failure wording (`GCodeCommand.get`,
+    /// `klippy/gcode.py:78-86`): `minval`/`maxval` read "must have
+    /// minimum/maximum of X", while the strict neighbours `above`/`below` read
+    /// "must be above/below X" — the split [`GcodeCommand::get`] documents.
     fn range_error(&self, name: &str, bound: &str, limit: impl fmt::Display) -> CommandError {
+        let requirement = match bound {
+            "above" | "below" => format!("must be {bound}"),
+            _ => format!("must have {bound} of"),
+        };
         CommandError::new(format!(
-            "Error on '{}': {} must have {} of {}",
-            self.commandline, name, bound, limit
+            "Error on '{}': {} {requirement} {}",
+            self.commandline, name, limit
         ))
     }
 }
@@ -2425,6 +2433,36 @@ mod tests {
             gcmd.get("MISSING", Some(7), parse_int, None, None, None, None)
                 .unwrap(),
             7
+        );
+    }
+
+    /// Each bound keeps upstream's exact wording (`GCodeCommand.get`,
+    /// `klippy/gcode.py:78-86`): `minval`/`maxval` say "must have
+    /// minimum/maximum of", `above`/`below` say "must be above/below".
+    #[test]
+    fn test_each_bound_keeps_upstream_wording() {
+        let gcmd = command("MY_CMD A=5 B=0.5");
+        assert_eq!(
+            gcmd.get_float_range("A", 6.0, 10.0)
+                .unwrap_err()
+                .to_string(),
+            "Error on 'MY_CMD A=5 B=0.5': A must have minimum of 6"
+        );
+        assert_eq!(
+            gcmd.get_float_range("A", 0.0, 4.0).unwrap_err().to_string(),
+            "Error on 'MY_CMD A=5 B=0.5': A must have maximum of 4"
+        );
+        assert_eq!(
+            gcmd.get_float_bounded("A", Some(5.0), None)
+                .unwrap_err()
+                .to_string(),
+            "Error on 'MY_CMD A=5 B=0.5': A must be above 5"
+        );
+        assert_eq!(
+            gcmd.get_float_bounded("A", None, Some(5.0))
+                .unwrap_err()
+                .to_string(),
+            "Error on 'MY_CMD A=5 B=0.5': A must be below 5"
         );
     }
 

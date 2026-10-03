@@ -100,7 +100,7 @@ pub fn load_config_prefix(
         }
     }));
 
-    heaters.register_sensor(config)?;
+    heaters.register_sensor(config, None, None)?;
     Ok(Arc::new(TemperatureSensor { reading, sensor }))
 }
 

@@ -17,12 +17,14 @@
 //! `temperature_sensors.cfg` for that).
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
 
 use serde_json::{json, Value};
 
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
+use crate::core::klippy::event::KlippyEvent;
 use crate::core::klippy::extras::adc_temperature;
 use crate::core::klippy::extras::ds18b20;
 use crate::core::klippy::extras::heater_generic::PrinterHeaterGeneric;
@@ -61,11 +63,6 @@ const PID_SETTLE_DELTA: f64 = 1.0;
 const PID_SETTLE_SLOPE: f64 = 0.1;
 /// `cmd_TEMPERATURE_WAIT_help` (`heaters.py:366`).
 const TEMPERATURE_WAIT_HELP: &str = "Wait for a temperature on a sensor";
-/// What the wait loop reports between polls: upstream's `_get_temp(eventtime)`
-/// (`heaters.py:336-347`) over an empty g-code-id table — `T:0`. No id is
-/// registered to report: the `gcode_id` table is the still-open M105 unit
-/// (`register_sensor` claims the option and drops it).
-const TEMPERATURE_WAIT_REPORT: &str = "T:0";
 
 /// The toolhead a `set_temperature` wait flushes through, upstream's
 /// `lookup_object("toolhead")` (`heaters.py:352,361`).
@@ -82,6 +79,26 @@ pub trait Sensor: Send + Sync + std::fmt::Debug {
 
     /// Where readings are delivered.
     fn setup_callback(&self, callback: SensorCallback);
+}
+
+/// What the M105 g-code-id table stores — any object that can report its
+/// `(current, target)` temperature, as upstream's `gcode_id_to_sensor` does
+/// (`heaters.py:301-317`). A heater answers with its smoothed reading and
+/// target; a sensor-only section with `gcode_id` would answer with its last
+/// reading and a target of zero.
+pub trait GcodeTempSensor: Send + Sync {
+    /// The current and target temperatures (`Heater.get_temp`,
+    /// `heaters.py:331-339`).
+    fn get_temp(&self, eventtime: f64) -> (f64, f64);
+}
+
+impl GcodeTempSensor for Heater {
+    fn get_temp(&self, _eventtime: f64) -> (f64, f64) {
+        // The existing `Heater::get_temp` does not take `eventtime` — the
+        // stale-reading check upstream does (`QUELL_STALE_TIME`) needs a
+        // print-time clock this host does not have (see `Heater::get_temp`).
+        self.get_temp()
+    }
 }
 
 /// Builds one sensor from its section (upstream's `sensor_factories` entry).
@@ -394,6 +411,12 @@ pub struct PrinterHeaters {
     sensors: Mutex<Vec<String>>,
     monitors: Mutex<Vec<String>>,
     heaters: Mutex<BTreeMap<String, Arc<Heater>>>,
+    /// Upstream's `gcode_id_to_sensor` (`heaters.py:301-317`): the g-code-id
+    /// table M105 reports and TEMPERATURE_WAIT echoes.
+    gcode_id_to_sensor: Mutex<BTreeMap<String, Arc<dyn GcodeTempSensor>>>,
+    /// Upstream's `has_started` (`heaters.py:329-330`): set on `klippy:ready`,
+    /// gates `_get_temp` so M105 before ready reports `T:0`.
+    has_started: AtomicBool,
 }
 
 impl PrinterHeaters {
@@ -404,7 +427,72 @@ impl PrinterHeaters {
             sensors: Mutex::new(Vec::new()),
             monitors: Mutex::new(Vec::new()),
             heaters: Mutex::new(BTreeMap::new()),
+            gcode_id_to_sensor: Mutex::new(BTreeMap::new()),
+            has_started: AtomicBool::new(false),
         }
+    }
+
+    /// Upstream's `_get_temp` (`heaters.py:331-339`): the M105 temperature
+    /// line.
+    ///
+    /// After `has_started`, each registered g-code-id sensor reports
+    /// `"<id>:{cur:.1} /{target:.1}"`, sorted by id (BTreeMap order); an empty
+    /// or pre-start table reports `"T:0"`.
+    fn _get_temp(&self, eventtime: f64) -> String {
+        let mut out = Vec::new();
+        if self.has_started.load(Ordering::SeqCst) {
+            for (gcode_id, sensor) in self
+                .gcode_id_to_sensor
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .iter()
+            {
+                let (cur, target) = sensor.get_temp(eventtime);
+                out.push(format!("{gcode_id}:{cur:.1} /{target:.1}"));
+            }
+        }
+        if out.is_empty() {
+            "T:0".to_string()
+        } else {
+            out.join(" ")
+        }
+    }
+
+    /// Register the M105 command and wire `klippy:ready` to set `has_started`
+    /// (upstream's `PrinterHeaters.__init__`, `heaters.py:281-285,329-330`).
+    fn register_commands(self: &Arc<Self>, printer: &Arc<Printer>) {
+        let weak_heaters = Arc::downgrade(self);
+        printer.register_event_handler(
+            KlippyEvent::KlippyReady,
+            Box::new(move |_| {
+                if let Some(heaters) = weak_heaters.upgrade() {
+                    heaters.has_started.store(true, Ordering::SeqCst);
+                }
+            }),
+        );
+
+        let weak_heaters = Arc::downgrade(self);
+        let weak_printer = Arc::downgrade(printer);
+        let gcode = printer
+            .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+            .expect("the loader registers `gcode` before any section");
+        gcode
+            .register_command(
+                "M105",
+                sync(move |gcmd: &GcodeCommand| {
+                    let msg = match (weak_heaters.upgrade(), weak_printer.upgrade()) {
+                        (Some(heaters), Some(printer)) => heaters._get_temp(printer.eventtime()),
+                        _ => "T:0".to_string(),
+                    };
+                    if !gcmd.ack(Some(&msg)) {
+                        gcmd.respond_raw(&msg);
+                    }
+                    Ok(())
+                }),
+                None,
+                true,
+            )
+            .expect("M105 is a valid, unique command name");
     }
 
     /// The heater registered under `name` (`PrinterHeaters.lookup_heater`).
@@ -460,9 +548,8 @@ impl PrinterHeaters {
     ///
     /// What differs from upstream:
     ///
-    /// * the per-second `M105` line is not echoed — the `M105` g-code-id
-    ///   table is not wired yet (`TODO H1`), so there is no temperature line
-    ///   to report;
+    /// * the per-second M105 line is echoed via `_get_temp`, as upstream does
+    ///   (`heaters.py:355`);
     /// * a file-output run returns at once, as upstream's does
     ///   (`heaters.py:350-351`);
     /// * the sleep is a `tokio` timer rather than `reactor.pause`.
@@ -473,6 +560,7 @@ impl PrinterHeaters {
         if printer.is_fileoutput() {
             return;
         }
+        let gcode = printer.lookup_object_as::<GCodeDispatch>(GCODE_OBJECT);
         loop {
             if matches!(
                 printer.get_state_message().category,
@@ -487,6 +575,9 @@ impl PrinterHeaters {
             // Keep the look-ahead moving, as upstream does each second.
             if let Some(toolhead) = printer.lookup_object_as::<ToolHeadObject>(TOOLHEAD_OBJECT) {
                 let _ = toolhead.get_last_move_time();
+            }
+            if let Some(gcode) = &gcode {
+                gcode.respond_raw(&self._get_temp(printer.eventtime()));
             }
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
@@ -523,20 +614,28 @@ impl PrinterHeaters {
     }
 
     /// Note a sensor that was set up, upstream's `register_sensor`
-    /// (`heaters.py:301-307`).
+    /// (`heaters.py:301-317`).
     ///
     /// The sensor's section name joins `available_sensors` and becomes one
     /// value of the `TEMPERATURE_WAIT` mux command, keyed by `SENSOR` — every
     /// sensor section answers the command under its own name, as upstream
-    /// registers it right here. The `M105` g-code-id table is still open, so
-    /// `gcode_id` is only claimed.
+    /// registers it right here. When a `gcode_id` is provided (or found in the
+    /// section), the sensor is also stored in the M105 g-code-id table.
+    ///
+    /// `sensor` is the object whose `(cur, target)` M105 reports; heaters pass
+    /// their `Arc<Heater>`, and sensor-only sections that do not yet carry a
+    /// g-code-id object pass `None`.
     ///
     /// # Errors
-    /// The option is unreadable, or the mux value is already registered (one
-    /// section loaded twice), as upstream reports it.
-    pub fn register_sensor(&self, config: &ConfigWrapper) -> Result<(), ConfigError> {
+    /// The mux value is already registered (one section loaded twice), or a
+    /// g-code-id is already in the table, as upstream reports it.
+    pub fn register_sensor(
+        &self,
+        config: &ConfigWrapper,
+        sensor: Option<Arc<dyn GcodeTempSensor>>,
+        gcode_id: Option<&str>,
+    ) -> Result<(), ConfigError> {
         let identifier = config.identifier();
-        let _ = config.get_str("gcode_id");
         self.sensors
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -558,6 +657,28 @@ impl PrinterHeaters {
                 &["MINIMUM", "MAXIMUM"],
             )
             .map_err(ConfigError::new)?;
+
+        // Upstream's g-code-id registration (`heaters.py:309-317`): if no id
+        // was passed, read it from the section; if the section has none
+        // either, the sensor does not appear in M105.
+        let gcode_id = match gcode_id {
+            Some(id) => Some(id.to_string()),
+            None => config.get_str("gcode_id"),
+        };
+        if let Some(gcode_id) = gcode_id {
+            let mut table = self
+                .gcode_id_to_sensor
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if table.contains_key(&gcode_id) {
+                return Err(ConfigError::new(format!(
+                    "G-Code sensor id {gcode_id} already registered"
+                )));
+            }
+            if let Some(sensor) = sensor {
+                table.insert(gcode_id, sensor);
+            }
+        }
         Ok(())
     }
 
@@ -721,8 +842,6 @@ impl PrinterHeaters {
         };
 
         sensor.setup_minmax(min_temp, max_temp);
-        self.register_sensor(config)?;
-        let _ = gcode_id; // TODO H1: the M105 g-code id table
 
         let heater = Arc::new(Heater {
             name: short_name.clone(),
@@ -778,6 +897,11 @@ impl PrinterHeaters {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .insert(short_name.clone(), Arc::clone(&heater));
+        self.register_sensor(
+            config,
+            Some(Arc::clone(&heater) as Arc<dyn GcodeTempSensor>),
+            gcode_id,
+        )?;
         self.register_heater_command(printer, &short_name, Arc::clone(&heater))?;
         Ok(heater)
     }
@@ -930,7 +1054,7 @@ async fn cmd_temperature_wait(
         if temp >= min_temp && temp <= max_temp {
             return Ok(());
         }
-        gcmd.respond_raw(TEMPERATURE_WAIT_REPORT);
+        gcmd.respond_raw(&heaters._get_temp(printer.eventtime()));
         // Upstream parks the greenlet for a second (`reactor.pause`,
         // `heaters.py:389`); this reactor has no pause on purpose — the wait is
         // an ordinary timer the async command sleeps on.
@@ -976,6 +1100,7 @@ pub fn ensure(printer: &Arc<Printer>) -> Result<Arc<PrinterHeaters>, ConfigError
         HEATERS_OBJECT,
         Arc::clone(&heaters) as Arc<dyn PrinterObject>,
     )?;
+    heaters.register_commands(printer);
     ds18b20::ensure(&heaters)?;
     adc_temperature::ensure(&heaters)?;
     temperature_mcu::ensure(&heaters)?;
@@ -1104,7 +1229,7 @@ mod tests {
 
     #[test]
     fn test_a_factory_builds_the_sensor_it_registered() {
-        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        let printer = ready_printer();
         let heaters = ensure(&printer).unwrap();
 
         assert!(heaters
@@ -1126,7 +1251,7 @@ mod tests {
         let printer = ready_printer();
         let heaters = ensure(&printer).unwrap();
         heaters
-            .register_sensor(&ConfigWrapper::untracked(&section("Fake")))
+            .register_sensor(&ConfigWrapper::untracked(&section("Fake")), None, None)
             .unwrap();
 
         assert_eq!(
@@ -1547,7 +1672,7 @@ mod tests {
         let printer = ready_printer();
         let heaters = ensure(&printer).unwrap();
         heaters
-            .register_sensor(&ConfigWrapper::untracked(&section("Fake")))
+            .register_sensor(&ConfigWrapper::untracked(&section("Fake")), None, None)
             .unwrap();
         printer.send_event(&KlippyEvent::KlippyReady);
         let gcode = printer
@@ -1597,8 +1722,8 @@ mod tests {
     }
 
     /// The loop polls about once a second and answers between polls — with
-    /// upstream's `_get_temp` over the still-open g-code-id table, `T:0` —
-    /// until the reading enters the range (`heaters.py:383-389`).
+    /// upstream's `_get_temp` over an empty g-code-id table, `T:0` — until the
+    /// reading enters the range (`heaters.py:383-389`).
     #[tokio::test(start_paused = true)]
     async fn test_temperature_wait_polls_until_the_reading_reaches_the_minimum() {
         let (_printer, gcode, sensor) = temperature_sensor_printer();
@@ -1650,5 +1775,158 @@ mod tests {
             .run_script("TEMPERATURE_WAIT SENSOR=\"temperature_sensor probe\" MINIMUM=100")
             .await
             .expect("file output does not wait");
+    }
+
+    // ------------------------------------------------------------------
+    // M105 g-code-id temperature reporting
+    // ------------------------------------------------------------------
+
+    /// A printer with one `[extruder]` heater whose g-code-id is `T0`,
+    /// ready to report.
+    fn m105_printer() -> (Arc<Printer>, Arc<GCodeDispatch>, Arc<Heater>) {
+        let printer = ready_printer();
+        let heaters = ensure(&printer).unwrap();
+        let sensor = Arc::new(ScriptedSensor::default());
+        let built = Arc::clone(&sensor);
+        heaters.add_sensor_factory(
+            "Fake",
+            Arc::new(move |_config, _printer| Ok(Arc::clone(&built) as Arc<dyn Sensor>)),
+        );
+        let section = heater_section(&[
+            ("sensor_type", "Fake"),
+            ("heater_pin", "PA0"),
+            ("min_temp", "0"),
+            ("max_temp", "250"),
+            ("min_extrude_temp", "0"),
+            ("control", "watermark"),
+        ]);
+        let heater = heaters
+            .setup_heater(&ConfigWrapper::untracked(&section), &printer, Some("T0"))
+            .unwrap();
+        heater.temperature_callback(1.0, 20.0);
+        heater.set_temp(200.0).unwrap();
+        printer.send_event(&KlippyEvent::KlippyReady);
+        let gcode = printer
+            .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+            .expect("gcode is registered");
+        (printer, gcode, heater)
+    }
+
+    /// M105 reports each registered g-code-id sensor as `"<id>:{cur:.1} /{target:.1}"`
+    /// (`heaters.py:331-339`).
+    #[tokio::test]
+    async fn test_m105_reports_a_registered_gcode_id_sensor() {
+        let (_printer, gcode, _heater) = m105_printer();
+        let lines = captured_lines(&gcode);
+        gcode.run_script("M105").await.expect("M105 runs");
+        assert_eq!(emitted(&lines), ["T0:20.0 /200.0"]);
+    }
+
+    /// With no g-code-id sensors registered, M105 reports `"T:0"`
+    /// (`heaters.py:338`).
+    #[tokio::test]
+    async fn test_m105_reports_t0_with_no_gcode_id_sensors() {
+        let printer = ready_printer();
+        let _heaters = ensure(&printer).unwrap();
+        printer.send_event(&KlippyEvent::KlippyReady);
+        let gcode = printer
+            .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+            .expect("gcode is registered");
+        let lines = captured_lines(&gcode);
+        gcode.run_script("M105").await.expect("M105 runs");
+        assert_eq!(emitted(&lines), ["T:0"]);
+    }
+
+    /// Before `klippy:ready`, `has_started` is false so M105 reports `"T:0"`
+    /// even with a registered sensor (`heaters.py:332`).
+    #[tokio::test]
+    async fn test_m105_reports_t0_before_ready() {
+        let printer = ready_printer();
+        let heaters = ensure(&printer).unwrap();
+        heaters.add_sensor_factory(
+            "Fake",
+            Arc::new(|_config, _printer| Ok(Arc::new(FakeSensor) as Arc<dyn Sensor>)),
+        );
+        let section = heater_section(&[
+            ("sensor_type", "Fake"),
+            ("heater_pin", "PA0"),
+            ("min_temp", "0"),
+            ("max_temp", "250"),
+            ("min_extrude_temp", "0"),
+            ("control", "watermark"),
+        ]);
+        let heater = heaters
+            .setup_heater(&ConfigWrapper::untracked(&section), &printer, Some("T0"))
+            .unwrap();
+        heater.temperature_callback(1.0, 20.0);
+        heater.set_temp(200.0).unwrap();
+        // No KlippyReady event — has_started stays false.
+        let gcode = printer
+            .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+            .expect("gcode is registered");
+        let lines = captured_lines(&gcode);
+        gcode.run_script("M105").await.expect("M105 runs");
+        assert_eq!(emitted(&lines), ["T:0"]);
+    }
+
+    /// A duplicate g-code-id is rejected with upstream's message
+    /// (`heaters.py:315-316`).
+    #[test]
+    fn test_duplicate_gcode_id_is_rejected() {
+        let printer = ready_printer();
+        let heaters = ensure(&printer).unwrap();
+        heaters.add_sensor_factory(
+            "Fake",
+            Arc::new(|_config, _printer| Ok(Arc::new(FakeSensor) as Arc<dyn Sensor>)),
+        );
+        let section = heater_section(&[
+            ("sensor_type", "Fake"),
+            ("heater_pin", "PA0"),
+            ("min_temp", "0"),
+            ("max_temp", "250"),
+            ("min_extrude_temp", "0"),
+            ("control", "watermark"),
+        ]);
+        heaters
+            .setup_heater(&ConfigWrapper::untracked(&section), &printer, Some("T0"))
+            .unwrap();
+        // A second heater under a different name with the same g-code-id.
+        let mut section2 = ConfigSection::new("heater_generic", Some("extra"));
+        for (key, value) in [
+            ("sensor_type", "Fake"),
+            ("heater_pin", "PA1"),
+            ("min_temp", "0"),
+            ("max_temp", "250"),
+            ("control", "watermark"),
+        ] {
+            section2
+                .parameters
+                .insert(key.to_string(), ConfigValue::Single(value.to_string()));
+        }
+        let err = heaters
+            .setup_heater(&ConfigWrapper::untracked(&section2), &printer, Some("T0"))
+            .unwrap_err();
+        assert_eq!(err.to_string(), "G-Code sensor id T0 already registered");
+    }
+
+    /// TEMPERATURE_WAIT echoes the real M105 temperature report — not the
+    /// hardcoded `T:0` — when a g-code-id sensor is registered
+    /// (`heaters.py:388`).
+    #[tokio::test(start_paused = true)]
+    async fn test_temperature_wait_reports_real_gcode_id_temp() {
+        let (printer, gcode, heater) = m105_printer();
+        let lines = captured_lines(&gcode);
+        // The reading (20 °C) is below MINIMUM=100, so the wait polls.
+        let reader = Arc::clone(&heater);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(1_500)).await;
+            reader.temperature_callback(2.0, 105.0);
+        });
+        gcode
+            .run_script("TEMPERATURE_WAIT SENSOR=extruder MINIMUM=100")
+            .await
+            .expect("the wait ends once the reading reaches the minimum");
+        // Each poll reports the real table: `T0:20.0 /200.0` at t=0 and t=1 s.
+        assert_eq!(emitted(&lines), ["T0:20.0 /200.0", "T0:20.0 /200.0"]);
     }
 }

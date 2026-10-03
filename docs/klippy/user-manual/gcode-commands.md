@@ -370,8 +370,9 @@ M109 [S<temperature>] [T<index>]
 | `S` | `0` | 目标温度（摄氏度） |
 | `T` | `0` | 挤出机编号：`0` 是 `extruder`，`n` 是 `extruder<n>` |
 
-只有名字是 `extruder` 的主挤出机注册这两条（与上游一致）。**当前 `M109` 不等待升温**，
-与 `M104` 行为相同（`_wait` 参数尚未接上）。编号指向的挤出机不存在时报
+只有名字是 `extruder` 的主挤出机注册这两条（与上游一致）。**`M109` 等待升温**：
+`wait=true` 经 `PrinterHeaters::set_temperature(.., wait)` 阻塞到加热器到达目标
+（2026-10-03，`6900894`，匹配上游 `kinematics/extruder.py:260-279`）；`M104` 仅设目标即返回。编号指向的挤出机不存在时报
 `Extruder not configured`。
 
 ### M140 / M190 — 设置热床温度

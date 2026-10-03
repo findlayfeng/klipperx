@@ -16,10 +16,12 @@
 //!   which the toolhead then takes.
 //!
 //! The heater runs through `heaters::setup_heater`: options and sensor are set
-//! up there, the bang-bang/PID control loop is in place, and so is the
-//! `[verify_heater]` check over it. What is still open is the `M109`
-//! wait-for-temperature loop (`_wait` is accepted and ignored) and
-//! `pid_calibrate`.
+//! up there, the bang-bang/PID control loop is in place, and so are the
+//! `[verify_heater]` check over it and the `pid_calibrate` object
+//! (`PID_CALIBRATE`). What is still open is the `M109` wait-for-temperature
+//! loop (`_wait` is accepted and ignored): the loop itself is
+//! `PrinterHeaters::set_temperature`, which `PID_CALIBRATE` drives, but
+//! `M104`/`M109` do not call it yet.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 

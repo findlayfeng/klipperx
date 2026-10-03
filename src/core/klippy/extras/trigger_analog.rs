@@ -26,12 +26,12 @@
 use crate::core::klippy::config::ConfigError;
 
 /// The largest value a signed 32-bit fixed-point word holds
-/// (`trigger_analog.py:11-12`).
+/// (`trigger_analog.py:14-15`).
 const MAX_INT32: f64 = 2_147_483_647.0;
 const MIN_INT32: f64 = -2_147_483_648.0;
 
 /// Upstream's `OverflowError("Fixed point Q%d.%d overflow" …)`
-/// (`trigger_analog.py:16-18`), raised when [`to_fixed_32`] cannot keep a
+/// (`trigger_analog.py:16-26`), raised when [`to_fixed_32`] cannot keep a
 /// value inside a signed 32-bit word.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FixedPointOverflow {
@@ -169,7 +169,7 @@ static GENERATED_SOS: &[(&str, f64, u32, &[[f64; 6]])] = &[
 ];
 
 /// Look a design up in [`GENERATED_SOS`] (upstream's `GeneratedSOS.get`
-/// through `_butter`, `trigger_analog.py:96-101`).
+/// through `_butter`, `trigger_analog.py:104-110`).
 ///
 /// # Errors
 /// None: a miss is the caller's signal to reach for SciPy.
@@ -214,7 +214,7 @@ impl DigitalFilter {
     ///
     /// # Errors
     /// "DigitalFilter require the SciPy module" when the design is not in
-    /// [`GENERATED_SOS`] (`trigger_analog.py:77-80, 96-101`).
+    /// [`GENERATED_SOS`] (`trigger_analog.py:79-84, 104-110`).
     pub fn add_lowpass(&mut self, frequency: f64, order: u32) -> Result<(), ConfigError> {
         self.add_butter("lowpass", frequency, order)
     }
@@ -228,7 +228,7 @@ impl DigitalFilter {
     }
 
     /// `_butter`: the table first, SciPy (which this host does not have) for
-    /// anything else (`trigger_analog.py:96-101`).
+    /// anything else (`trigger_analog.py:104-110`).
     fn add_butter(&mut self, btype: &str, frequency: f64, order: u32) -> Result<(), ConfigError> {
         let sections =
             generated_sos(btype, self.sample_frequency / frequency, order).ok_or_else(|| {
@@ -238,7 +238,7 @@ impl DigitalFilter {
         Ok(())
     }
 
-    /// Add a second-order IIR notch (`add_notch`, `trigger_analog.py:88-94`).
+    /// Add a second-order IIR notch (`add_notch`, `trigger_analog.py:91-96`).
     ///
     /// Upstream asks SciPy for `iirnotch(notch_freq, Q, fs=sps)` and takes the
     /// single `tf2sos` section; the closed form here is exactly that pair of
@@ -273,7 +273,7 @@ impl DigitalFilter {
     }
 
     /// Append the sample-to-sample difference stage (`add_derivative`,
-    /// `trigger_analog.py:91-94`).
+    /// `trigger_analog.py:97-99`).
     pub fn add_derivative(&mut self) {
         self.filter_sections.push([1., -1., 0., 1., 0., 0.]);
     }
@@ -295,7 +295,7 @@ impl DigitalFilter {
     }
 
     /// The fractional bits every coefficient converts at
-    /// (`MCU_SosFilter._calc_coeff_bits`, `trigger_analog.py:164-170`: the
+    /// (`MCU_SosFilter._calc_coeff_bits`, `trigger_analog.py:165-170`: the
     /// flattened sections, column 3 included).
     pub fn coeff_frac_bits(&self) -> u32 {
         let flattened: Vec<f64> = self.filter_sections.iter().flatten().copied().collect();
@@ -303,7 +303,7 @@ impl DigitalFilter {
     }
 
     /// Render the sections as fixed-point `[b0 b1 b2 a1 a2]` words
-    /// (`MCU_SosFilter._convert_filter`, `trigger_analog.py:173-191`):
+    /// (`MCU_SosFilter._convert_filter`, `trigger_analog.py:173-193`):
     /// column 3 (the `a0` divider, always `1.0`) is omitted.
     ///
     /// # Errors
@@ -333,7 +333,7 @@ impl DigitalFilter {
     }
 
     /// Render the initial state as fixed-point words
-    /// (`MCU_SosFilter._convert_state`, `trigger_analog.py:194-211`): each
+    /// (`MCU_SosFilter._convert_state`, `trigger_analog.py:196-212`): each
     /// state value scaled by `start_value`, converted with no fractional bits.
     ///
     /// # Errors

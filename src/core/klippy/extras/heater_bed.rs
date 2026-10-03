@@ -87,12 +87,12 @@ impl std::fmt::Debug for PrinterHeaterBed {
     }
 }
 
-/// `M140`/`M190` read one word, `S` (`heater_bed.py:35-38`), through the
+/// `M140`/`M190` read one word, `S` (`heater_bed.py:20`), through the
 /// inline handler both names share.
 const M140_M190_PARAMS: &[&str] = &["S"];
 
 /// `M140`/`M190`: set the bed target, waiting when asked
-/// (`PrinterHeaterBed.cmd_M140` with `wait`, `heater_bed.py:17-28`).
+/// (`PrinterHeaterBed.cmd_M140` with `wait`, `heater_bed.py:18-25`).
 ///
 /// Both names go through `PrinterHeaters::set_temperature`; `M190` passes
 /// `wait=true` so the call blocks until the bed reaches the target.

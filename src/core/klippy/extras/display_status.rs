@@ -17,7 +17,7 @@
 //!
 //! `idle_timeout`. Upstream clears a progress that is older than `M73_TIMEOUT`
 //! only while `idle_timeout` reports something other than `Printing`
-//! (`display_status.py:28-32`); this host's `[idle_timeout]` object exists
+//! (`display_status.py:24-28`); this host's `[idle_timeout]` object exists
 //! (批 #21) but is not consulted here yet, so an expired progress is cleared
 //! unconditionally. `virtual_sdcard`'s progress is used as
 //! the fallback, as upstream does, and is `0.` when there is no
@@ -41,7 +41,7 @@ section!("display_status", order = 30, load = load_config);
 /// by (`printer.load_object(config, "display_status")`).
 pub const DISPLAY_STATUS_OBJECT: &str = "display_status";
 
-/// How long an `M73` progress stands on its own (`display_status.py:9`).
+/// How long an `M73` progress stands on its own (`display_status.py:8`).
 const M73_TIMEOUT: f64 = 5.0;
 
 /// `SET_DISPLAY_TEXT`'s help text (`display_status.py:43`).
@@ -109,7 +109,7 @@ impl DisplayStatus {
 }
 
 impl PrinterObject for DisplayStatus {
-    /// Upstream's `DisplayStatus.get_status` (`display_status.py:26-41`).
+    /// Upstream's `DisplayStatus.get_status` (`display_status.py:22-34`).
     fn get_status(&self, eventtime: f64) -> Value {
         let mut progress = *self.progress.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(value) = progress {
@@ -219,7 +219,7 @@ fn cmd_set_display_text(
 /// `[display_status]` section.
 ///
 /// Upstream's `printer.load_object(config, "display_status")`
-/// (`display/display.py:190`): a display always has one.
+/// (`display/display.py:188`): a display always has one.
 ///
 /// # Errors
 /// As [`DisplayStatus::new`], plus a name that is already taken.
@@ -235,7 +235,7 @@ pub fn ensure(printer: &Arc<Printer>) -> Result<Arc<DisplayStatus>, ConfigError>
     Ok(object)
 }
 
-/// The factory `section!` names (`display_status.py:48-49 def load_config`).
+/// The factory `section!` names (`display_status.py:49-50 def load_config`).
 ///
 /// # Errors
 /// As [`DisplayStatus::new`].
@@ -269,7 +269,7 @@ mod tests {
 
     /// The bare `[display_status]` section loads with no options to read —
     /// upstream's class reads none of its own either (`display_status.py:12-16`)
-    /// — and reports the rest state (`display_status.py:26-41`).
+    /// — and reports the rest state (`display_status.py:22-34`).
     #[test]
     fn the_bare_section_loads_and_leaves_no_option_unread() {
         let text = "[mcu]\nserial: /dev/a\n[display_status]\n";
@@ -357,13 +357,13 @@ mod tests {
         gcode.run_script("SET_DISPLAY_TEXT").await.unwrap();
         assert_eq!(status.get_status(0.0)["message"], Value::Null);
 
-        // A bare `M117` clears the message (`display_status.py:40-41`).
+        // A bare `M117` clears the message (`display_status.py:42-44`).
         gcode.run_script("M117 Again").await.unwrap();
         gcode.run_script("M117").await.unwrap();
         assert_eq!(status.get_status(0.0)["message"], Value::Null);
     }
 
-    /// An `M73` progress expires after `M73_TIMEOUT` (`display_status.py:28-32`).
+    /// An `M73` progress expires after `M73_TIMEOUT` (`display_status.py:24-28`).
     #[tokio::test(flavor = "multi_thread")]
     async fn an_expired_progress_is_dropped() {
         let printer = loaded("[mcu]\nserial: /dev/a\n[display_status]\n");

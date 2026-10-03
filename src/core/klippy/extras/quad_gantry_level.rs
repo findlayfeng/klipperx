@@ -41,7 +41,7 @@ section!("quad_gantry_level", order = 30, load = load_config);
 /// itself up through the registry, as `z_tilt`'s does).
 const QGL_OBJECT: &str = "quad_gantry_level";
 
-/// The four actuator names the reports use (`quad_gantry_level.py:106`).
+/// The four actuator names the reports use (`quad_gantry_level.py:93`).
 const ACTUATORS: [&str; 4] = ["z", "z1", "z2", "z3"];
 
 /// The gantry-relative corner heights and the motor adjustments from them.
@@ -52,7 +52,7 @@ struct GantryFit {
     adjustments: Vec<f64>,
 }
 
-/// Fit a straight line through two points (`quad_gantry_level.py:126-133`).
+/// Fit a straight line through two points (`quad_gantry_level.py:115-121`).
 ///
 /// Equal Y is upstream's "straight line" shortcut: the horizontal fit
 /// `(0, y)`. Equal X with unequal Y would divide by zero upstream; here it
@@ -66,7 +66,7 @@ fn linefit(p1: (f64, f64), p2: (f64, f64)) -> (f64, f64) {
     (slope, intercept)
 }
 
-/// Evaluate a fitted line (`quad_gantry_level.py:134-135`).
+/// Evaluate a fitted line (`quad_gantry_level.py:122-123`).
 fn plot(fit: (f64, f64), x: f64) -> f64 {
     fit.0 * x + fit.1
 }
@@ -133,12 +133,12 @@ fn gantry_heights(
 }
 
 /// The corner heights plus the motor adjustments, including the
-/// `max_adjust` abort (`quad_gantry_level.py:94-116`): each actuator moves
+/// `max_adjust` abort (`quad_gantry_level.py:97-111`): each actuator moves
 /// by `average - height`.
 ///
 /// # Errors
 /// "Aborting quad_gantry_level required adjustment … is greater than
-/// max_adjust …" (`quad_gantry_level.py:99-103`).
+/// max_adjust …" (`quad_gantry_level.py:104-108`).
 fn fit_gantry(
     offsets: &ProbeOffsets,
     positions: &[Coord],
@@ -439,7 +439,7 @@ mod tests {
     }
 
     /// The two-point fit: equal Y is upstream's straight-line shortcut,
-    /// anything else is slope + intercept (`quad_gantry_level.py:126-135`).
+    /// anything else is slope + intercept (`quad_gantry_level.py:115-121`).
     #[test]
     fn linefit_handles_the_straight_line_and_a_slope() {
         assert_eq!(linefit((3.0, 2.5), (17.0, 2.5)), (0.0, 2.5));

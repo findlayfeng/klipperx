@@ -3,7 +3,7 @@
 //!
 //! The section reads one option, `recover_velocity` (default `50.`), and
 //! registers the four commands upstream's `__init__` does
-//! (`pause_resume.py:33-46`):
+//! (`pause_resume.py:8-32`):
 //!
 //! | command | role (`pause_resume.py`) |
 //! |---|---|
@@ -132,7 +132,7 @@ pub struct PauseResume {
 
 impl PauseResume {
     /// Read the section upstream's `__init__` reads
-    /// (`pause_resume.py:7-9`).
+    /// (`pause_resume.py:11`).
     ///
     /// # Errors
     /// An unparsable `recover_velocity`.
@@ -154,7 +154,7 @@ impl PauseResume {
     /// Reads `recover_velocity` from whichever config triggered the load:
     /// upstream's `load_object` passes the caller's config to the new module's
     /// `load_config`, and `PauseResume.__init__` reads `recover_velocity` from
-    /// it (`pause_resume.py:9`).
+    /// it (`pause_resume.py:11`).
     ///
     /// # Errors
     /// An unparsable `recover_velocity`, or a duplicate registration.
@@ -228,7 +228,7 @@ impl PauseResume {
         Ok(())
     }
 
-    /// Upstream's `cmd_CLEAR_PAUSE` body (`pause_resume.py:79-81`): forget
+    /// Upstream's `cmd_CLEAR_PAUSE` body (`pause_resume.py:89-90`): forget
     /// the paused and the command-sent state. `sd_paused` is left as it is,
     /// as upstream leaves it.
     fn clear_pause(&self) {
@@ -275,7 +275,7 @@ impl PauseResume {
 
     /// The dispatcher, for the `action:*` reports and `run_script_from_command`
     /// (upstream keeps `self.gcode` from `config.get_printer()`,
-    /// `pause_resume.py:8`).
+    /// `pause_resume.py:10`).
     fn gcode(&self) -> Option<Arc<GCodeDispatch>> {
         self.printer
             .as_ref()
@@ -295,7 +295,7 @@ impl PauseResume {
         let gcode = printer
             .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
             .expect("the loader registers `gcode` before any section");
-        /// The one word `cmd_RESUME` reads (`pause_resume.py:68-76`); the
+        /// The one word `cmd_RESUME` reads (`pause_resume.py:81`); the
         /// other three commands read none.
         const RESUME_PARAMS: &[&str] = &["VELOCITY"];
         type Command = for<'a> fn(&'a Arc<PauseResume>, &'a GcodeCommand) -> CommandFuture<'a>;
@@ -365,7 +365,7 @@ impl PrinterObject for PauseResume {
     }
 }
 
-/// The factory `section!` names (`pause_resume.py:91-92`).
+/// The factory `section!` names (`pause_resume.py:99-100`).
 ///
 /// # Errors
 /// An unparsable `recover_velocity`, an already-registered object, or a
@@ -429,7 +429,7 @@ fn cmd_resume<'a>(object: &'a Arc<PauseResume>, gcmd: &'a GcodeCommand) -> Comma
     })
 }
 
-/// `CLEAR_PAUSE` (`pause_resume.py:79-81`): drop the paused state without
+/// `CLEAR_PAUSE` (`pause_resume.py:89-90`): drop the paused state without
 /// resuming the print.
 fn cmd_clear_pause<'a>(object: &'a Arc<PauseResume>, _gcmd: &'a GcodeCommand) -> CommandFuture<'a> {
     Box::pin(async move {
@@ -568,7 +568,7 @@ mod tests {
         assert_eq!(object.get_status(0.0), json!({ "is_paused": false }));
     }
 
-    /// The default is upstream's `50.` (`pause_resume.py:9`); an unparsable
+    /// The default is upstream's `50.` (`pause_resume.py:11`); an unparsable
     /// value is the loader's wording for a bad float.
     #[test]
     fn recover_velocity_defaults_to_50_and_rejects_garbage() {
@@ -709,7 +709,7 @@ mod tests {
     }
 
     /// `CLEAR_PAUSE` drops the paused and command-sent state without resuming
-    /// (`pause_resume.py:79-81`).
+    /// (`pause_resume.py:89-90`).
     #[test]
     fn clear_pause_forgets_the_pause() {
         let (printer, gcode, object) = machine();

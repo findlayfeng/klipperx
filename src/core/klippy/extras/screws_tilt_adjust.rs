@@ -111,7 +111,7 @@ pub struct ScrewsTiltAdjust {
 
 impl ScrewsTiltAdjust {
     /// Read the section, wire the probe helper's callback, and register
-    /// `SCREWS_TILT_CALCULATE` (`screws_tilt_adjust.py:6-45`).
+    /// `SCREWS_TILT_CALCULATE` (`screws_tilt_adjust.py:11-47`).
     ///
     /// # Errors
     /// A malformed option, fewer than three screws, fewer than three probe
@@ -257,7 +257,7 @@ impl ScrewsTiltAdjust {
         }
     }
 
-    /// One round's work (`screws_tilt_adjust.py:66-133`): compute the report
+    /// One round's work (`screws_tilt_adjust.py:66-127`): compute the report
     /// ([`round_report`]), send its lines, store `results`, then fail with the
     /// deferred `MAX_DEVIATION` error when the round breached the limit.
     fn run_finalize(&self, positions: &[Coord]) -> Result<(), CommandError> {
@@ -337,7 +337,7 @@ fn read_screws(config: &ConfigWrapper) -> Result<Vec<((f64, f64), String)>, Conf
 }
 
 /// One round's report lines and `results` entries
-/// (`screws_tilt_adjust.py:66-133`).
+/// (`screws_tilt_adjust.py:66-127`).
 #[derive(Debug)]
 struct RoundReport {
     /// Everything to `respond_info`, in order: the reading hint, the base
@@ -762,7 +762,7 @@ mod tests {
     /// `MAX_DEVIATION` fails the round with upstream's wording, comparing
     /// only the non-base screws' raw differences — truthy `max_diff` only,
     /// so `0.0` disables the check like Python's `if self.max_diff`
-    /// (`screws_tilt_adjust.py:127-133`).
+    /// (`screws_tilt_adjust.py:123-127`).
     #[test]
     fn max_deviation_fails_the_round_with_upstream_wording() {
         let screws = three_screws();
@@ -814,7 +814,7 @@ mod tests {
 
     /// The section wires up and reports the status shape upstream's
     /// `get_status` answers: `error`, `max_deviation`, `results`
-    /// (`screws_tilt_adjust.py:69-72`), before any round and after one.
+    /// (`screws_tilt_adjust.py:61-64`), before any round and after one.
     #[test]
     fn the_status_shape_matches_upstream_before_and_after_a_round() {
         let printer = printer();

@@ -14,7 +14,7 @@
 //!
 //! The registers are written once at startup: channel `n` goes to register
 //! `n - 1` as the two bytes `[register, int(value * 256 / scale + .5)]`
-//! (`ad5206.py:15-20`). Upstream queues exactly these bytes as init config
+//! (`ad5206.py:13-19`). Upstream queues exactly these bytes as init config
 //! commands (`bus.py:105-110`); here they are sent from a post-init callback
 //! instead, because at config-load time the SPI device has no oid yet
 //! ([`McuSpi::send`] would report "not configured").
@@ -41,14 +41,14 @@ use crate::core::klippy::printer::{Printer, PrinterObject};
 section!("ad5206", order = 40, prefix = load_config_prefix);
 
 /// Upstream's `MCU_SPI_from_config(config, 0, default_speed=25000000)`
-/// (`ad5206.py:12-13`): SPI mode 0 at 25 MHz.
+/// (`ad5206.py:10-11`): SPI mode 0 at 25 MHz.
 const DEFAULT_SPI_MODE: u8 = 0;
 const DEFAULT_SPI_SPEED: u32 = 25_000_000;
 
-/// Upstream's `getfloat('scale', 1., above=0.)` default (`ad5206.py:14`).
+/// Upstream's `getfloat('scale', 1., above=0.)` default (`ad5206.py:12`).
 const DEFAULT_SCALE: f64 = 1.0;
 
-/// The AD5206 has six channels, `channel_1`..`channel_6` (`ad5206.py:16`).
+/// The AD5206 has six channels, `channel_1`..`channel_6` (`ad5206.py:14`).
 const CHANNEL_COUNT: u8 = 6;
 
 /// One configured `[ad5206 <name>]`.
@@ -64,7 +64,7 @@ pub struct Ad5206 {
 impl Ad5206 {
     /// Read the options, then queue the channel writes for bring-up.
     ///
-    /// Upstream's `ad5206.__init__` (`ad5206.py:11-20`): the bus first, then
+    /// Upstream's `ad5206.__init__` (`ad5206.py:9-17`): the bus first, then
     /// `scale`, then the channels, so the first bad option is reported in that
     /// order.
     ///
@@ -76,7 +76,7 @@ impl Ad5206 {
         // `enable_pin` is required: `MCU_SPI_from_config` reads it with a plain
         // `config.get`, while this host's port treats an absent pin option as
         // "no chip select". Read it here to keep upstream's error
-        // (`ad5206.py:12-13`).
+        // (`ad5206.py:10-11`).
         config.get("enable_pin", None)?;
         let setup = mcu_spi_from_config(
             config,
@@ -135,7 +135,7 @@ impl Ad5206 {
     }
 }
 
-/// The channel writes for one section, in channel order (`ad5206.py:15-19`):
+/// The channel writes for one section, in channel order (`ad5206.py:13-17`):
 /// channel `n` goes to register `n - 1`, and a channel the config does not
 /// write is skipped.
 fn channel_writes(config: &ConfigWrapper, scale: f64) -> Result<Vec<[u8; 2]>, ConfigError> {
@@ -153,7 +153,7 @@ fn channel_writes(config: &ConfigWrapper, scale: f64) -> Result<Vec<[u8; 2]>, Co
     Ok(writes)
 }
 
-/// One channel's tap: `int(value * 256. / scale + .5)` (`ad5206.py:18`),
+/// One channel's tap: `int(value * 256. / scale + .5)` (`ad5206.py:17`),
 /// rounded half up.
 ///
 /// The value is bounded by `scale`, where the arithmetic gives 256 — one past
@@ -260,7 +260,7 @@ mod tests {
     #[test]
     fn test_the_enable_pin_is_required() {
         // Unlike `[spi_device]`, this section always has a chip select
-        // (`ad5206.py:12`).
+        // (`ad5206.py:11`).
         let err = Ad5206::new(&wrap(&section(&[("scale", "1")])), &printer())
             .map(|_| ())
             .unwrap_err();
@@ -276,7 +276,7 @@ mod tests {
             .expect("the digipot loads without scale");
         assert!(chip.writes().is_empty());
 
-        // `getfloat('scale', 1., above=0.)` (`ad5206.py:14`).
+        // `getfloat('scale', 1., above=0.)` (`ad5206.py:12`).
         let section = section(&[("enable_pin", "PD7"), ("scale", "0"), ("channel_1", "0")]);
         let err = Ad5206::new(&wrap(&section), &printer())
             .map(|_| ())
@@ -290,7 +290,7 @@ mod tests {
     #[test]
     fn test_each_channel_is_bounded_the_way_upstream_bounds_it() {
         // `getfloat('channel_N', None, minval=0., maxval=scale)`
-        // (`ad5206.py:16-17`).
+        // (`ad5206.py:14-15`).
         let low = section(&[("enable_pin", "PD7"), ("scale", "1"), ("channel_1", "-1")]);
         let err = Ad5206::new(&wrap(&low), &printer())
             .map(|_| ())
@@ -314,7 +314,7 @@ mod tests {
 
     #[test]
     fn test_the_value_converts_to_a_tap_rounded_half_up() {
-        // `int(value * 256. / scale + .5)` (`ad5206.py:18`).
+        // `int(value * 256. / scale + .5)` (`ad5206.py:17`).
         assert_eq!(register_value(0.0, 1.0), 0);
         assert_eq!(register_value(0.25, 1.0), 64); // 64.5 -> 64
         assert_eq!(register_value(0.5, 1.0), 128); // 128.5 -> 128

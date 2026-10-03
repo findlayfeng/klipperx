@@ -1,23 +1,23 @@
 //! A `minijinja`-backed adapter for the macro bodies of `gcode_macro`.
 //!
 //! Upstream renders every macro body with `jinja2.Environment('{%', '%}', '{',
-//! '}')` (`klippy/extras/gcode_macro.py:82`) — the variable delimiters are
+//! '}')` (`klippy/extras/gcode_macro.py:83`) — the variable delimiters are
 //! **single braces**, which is why the corpus writes `{params.P}` rather than
-//! `{{ params.P }}` — and `TemplateWrapper` (`:46-79`) compiles the body at
-//! load and renders it against `create_template_context` (`:101-108`) before
+//! `{{ params.P }}` — and `TemplateWrapper` (`:46-77`) compiles the body at
+//! load and renders it against `create_template_context` (`:106-113`) before
 //! `gcode.run_script_from_command` feeds the text back to the dispatcher.
 //!
 //! This module adapts `minijinja` 2.24 (`Cargo.toml`) to that environment.
 //! [`Template::parse`] and [`Template::render`] keep this port's contract: a
 //! body that does not parse is a **config-load** error, a body that does not
 //! evaluate is a **command** error, the text between tags survives verbatim,
-//! and the error frames are upstream's (`gcode_macro.py:47-79`).
+//! and the error frames are upstream's (`gcode_macro.py:46-77`).
 //!
 //! # The environment
 //!
 //! | setting | value | why |
 //! |---|---|---|
-//! | delimiters | `{% %}` / `{ }` / `{# #}` | upstream's `jinja2.Environment('{%', '%}', '{', '}')` (`gcode_macro.py:82`) |
+//! | delimiters | `{% %}` / `{ }` / `{# #}` | upstream's `jinja2.Environment('{%', '%}', '{', '}')` (`gcode_macro.py:83`) |
 //! | undefined behavior | `UndefinedBehavior::Strict` | a missing status key must not render a blank `PARK_` line — the rule the hand-written subset had |
 //! | auto escape | `AutoEscape::None` | a macro body is g-code, not HTML (the engine's default callback switches on the template name's extension) |
 //! | trailing newline | kept | a corpus body ends with a newline and the rendered text is run line by line; Jinja2/minijinja drop the last one by default (see the deviation table) |
@@ -45,7 +45,7 @@
 //!   indexed and iterated like any other sequence.
 //! - `Rt::Printer` becomes the [`PrinterView`] object: `printer.<name>` and
 //!   `printer["<name>"]` are one registered object's status, cached for the
-//!   render the way `GetStatusWrapper.cache` caches it (`gcode_macro.py:17`),
+//!   render the way `GetStatusWrapper.cache` caches it (`gcode_macro.py:20-33`),
 //!   and `'<name>' in printer` asks whether that object is registered
 //!   (`GetStatusWrapper.__contains__`, `:33-37`) — the engine's containment
 //!   check on a map object *is* its lookup, so an unregistered name is absent,
@@ -133,7 +133,7 @@ enum Phase {
 }
 
 /// A template failure, worded after upstream's `TemplateWrapper`
-/// (`gcode_macro.py:47-79`): a load error is
+/// (`gcode_macro.py:46-77`): a load error is
 /// `Error loading template '<name>'\nline <n>: <detail>`; a render error is
 /// `Error evaluating '<name>': line <n>: <detail>` — the line is this port's
 /// addition, because a rendered macro body spans many of them.
@@ -225,7 +225,7 @@ impl fmt::Debug for Builtin {
 }
 
 /// `printer.<name>` / `printer["<name>"]` — one object's status, cached for
-/// the render the way `GetStatusWrapper.cache` caches it (`gcode_macro.py:17`).
+/// the render the way `GetStatusWrapper.cache` caches it (`gcode_macro.py:20-33`).
 ///
 /// The cache is a `Mutex` because the engine requires its objects to be `Sync`;
 /// the view is `Clone` so a [`Rt`] can be cloned into a render.
@@ -395,7 +395,7 @@ impl Context {
     }
 
     /// Bind a global (`create_template_context` plus `kwparams`,
-    /// `gcode_macro.py:186-190`).
+    /// `gcode_macro.py:106-113`).
     pub fn insert(&mut self, name: impl Into<String>, value: Rt) {
         self.globals.insert(name.into(), value);
     }
@@ -416,7 +416,7 @@ impl Context {
 // ===========================================================================
 
 /// A compiled template: its name (`gcode_macro M486:gcode`, the upstream
-/// `TemplateWrapper` name, `gcode_macro.py:87`) and the environment it was
+/// `TemplateWrapper` name, `gcode_macro.py:47-65`) and the environment it was
 /// compiled into.
 pub struct Template {
     name: String,
@@ -433,7 +433,7 @@ impl fmt::Debug for Template {
 
 impl Template {
     /// Compile `source`, reporting an unparsable body with upstream's
-    /// load-error frame (`gcode_macro.py:61-66`).
+    /// load-error frame (`gcode_macro.py:57-60`).
     ///
     /// # Errors
     /// A syntax error in the body: an unclosed tag, a statement the engine
@@ -886,7 +886,7 @@ mod tests {
         assert!(error.to_string().contains("undefined"), "{error}");
     }
 
-    /// `rawparams` is the line's tail, verbatim (`gcode_macro.py:189`).
+    /// `rawparams` is the line's tail, verbatim (`gcode_macro.py:195`).
     #[test]
     fn rawparams_renders_the_command_tail() {
         assert_eq!(ok("{rawparams}"), "");
@@ -897,7 +897,7 @@ mod tests {
     }
 
     /// A statement the engine does not know fails the **load** with upstream's
-    /// frame (`gcode_macro.py:61-66`), naming the line and the statement.
+    /// frame (`gcode_macro.py:57-60`), naming the line and the statement.
     /// `{% block %}` is no longer one of them: Jinja2 parses it, and so does
     /// this engine — the old subset was the stricter one.
     #[test]

@@ -30,7 +30,7 @@ section!("gcode_arcs", order = 30, load = load_config);
 #[derive(Debug)]
 pub struct GCodeArcs {
     /// `resolution`: millimetres per arc segment — upstream's
-    /// `mm_per_arc_segment` (`gcode_arcs.py:19`), kept for the `G2`/`G3`
+    /// `mm_per_arc_segment` (`gcode_arcs.py:31`), kept for the `G2`/`G3`
     /// implementation that is still pending.
     mm_per_arc_segment: f64,
 }
@@ -41,7 +41,7 @@ impl GCodeArcs {
     /// # Errors
     /// An unparseable `resolution`, or one at or below `0.` — upstream's
     /// `config.getfloat('resolution', 1., above=0.0)`
-    /// (`gcode_arcs.py:19`) with the shared wording.
+    /// (`gcode_arcs.py:31`) with the shared wording.
     pub fn new(config: &ConfigWrapper) -> Result<Self, ConfigError> {
         let mm_per_arc_segment =
             config.get_float_bounded("resolution", Some(1.), None, None, Some(0.0), None)?;
@@ -122,7 +122,7 @@ mod tests {
     }
 
     /// `above=0.0` refuses `0.` and negatives with the shared bound wording,
-    /// and a non-number keeps the parser's wording (`gcode_arcs.py:19`,
+    /// and a non-number keeps the parser's wording (`gcode_arcs.py:31`,
     /// `configfile.py:44/55`).
     #[test]
     fn a_resolution_at_or_below_zero_and_a_non_number_are_refused() {

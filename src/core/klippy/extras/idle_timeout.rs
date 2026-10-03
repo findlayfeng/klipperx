@@ -68,7 +68,7 @@
 //! `Idle` and the event sent before the script finishes, and a script failure is
 //! logged instead. A render failure is still a retry at `eventtime + 1.`, as
 //! upstream's is. The template is rendered with the same context a
-//! `[gcode_macro]` body gets (`gcode_macro.py:93-108`), minus `params` /
+//! `[gcode_macro]` body gets (`gcode_macro.py:106-113`), minus `params` /
 //! `rawparams`, which only exist for a macro being run.
 //!
 //! Upstream's default `gcode` calls `TURN_OFF_HEATERS`, which this host does not
@@ -97,7 +97,7 @@ use crate::core::klippy::reactor::TimerHandle;
 // Only the bare section exists upstream (`idle_timeout.py:117-118`).
 section!("idle_timeout", order = 30, load = load_config);
 
-/// Upstream's default idle script (`idle_timeout.py:7-12`); the leading newline
+/// Upstream's default idle script (`idle_timeout.py:8-13`); the leading newline
 /// is part of it.
 const DEFAULT_IDLE_GCODE: &str =
     "\n{% if 'heaters' in printer %}\n   TURN_OFF_HEATERS\n{% endif %}\nM84\n";
@@ -173,7 +173,7 @@ impl Default for Machine {
 
 /// What the timeout state machine asks of the toolhead: upstream's
 /// `toolhead.check_busy` (`toolhead.py:500-502`) and
-/// `toolhead.get_last_move_time` (`toolhead.py:501`).
+/// `toolhead.get_last_move_time` (`toolhead.py:320-326`).
 ///
 /// The trait is the seam: the production implementor is `MotionToolhead`,
 /// and a test drives the state machine with a stand-in instead of a motion
@@ -527,7 +527,7 @@ impl IdleTimeout {
     /// The first template error, as upstream's `render` raises it.
     fn render(&self, printer: &Arc<Printer>) -> Result<String, TemplateError> {
         let mut context = Context::new();
-        // The context a `[gcode_macro]` body gets (`gcode_macro.py:93-108`),
+        // The context a `[gcode_macro]` body gets (`gcode_macro.py:106-113`),
         // minus `params` / `rawparams`: those belong to a macro being run.
         context.insert(
             "printer",
@@ -838,7 +838,7 @@ mod tests {
     }
 
     /// The default idle gcode renders to upstream's text, with and without a
-    /// `heaters` object to take the `{% if %}` branch (`idle_timeout.py:7-12`).
+    /// `heaters` object to take the `{% if %}` branch (`idle_timeout.py:8-13`).
     ///
     /// The tag lines keep the newlines around them, as Jinja2 renders them
     /// (`jinja2` of the same template gives `"\n\n   TURN_OFF_HEATERS\n\nM84"`).

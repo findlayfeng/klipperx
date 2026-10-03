@@ -7,8 +7,8 @@
 //! | upstream | here |
 //! |---|---|
 //! | `rotary_delta_stepper_alloc` (`chelper/kin_rotary_delta.c:44-72`) | [`rotary_delta_position_fn`] / [`rotary_delta_active_flags`] |
-//! | `RotaryDeltaKinematics` (`klippy/kinematics/rotary_delta.py:10-132`) | [`RotaryDeltaKinematics`] |
-//! | `RotaryDeltaCalibration` (`rotary_delta.py:135-235`) | [`RotaryDeltaCalibration`] |
+//! | `RotaryDeltaKinematics` (`klippy/kinematics/rotary_delta.py:9-130`) | [`RotaryDeltaKinematics`] |
+//! | `RotaryDeltaCalibration` (`rotary_delta.py:133-224`) | [`RotaryDeltaCalibration`] |
 //!
 //! **Placement.** Like [`super::delta`], this is its own file so the cartesian
 //! family's code stays untouched and so `[delta_calibrate]`'s calibration half
@@ -41,10 +41,10 @@ use crate::core::klippy::gcode::CommandError;
 use crate::core::klippy::mathutil::{Coord, Z_AXIS};
 
 /// The stepper names the three rails answer to (`'stepper_' + a` for
-/// `a in 'abc'`, `rotary_delta.py:15`), in rail order.
+/// `a in 'abc'`, `rotary_delta.py:12`), in rail order.
 pub const ROTARY_DELTA_RAIL_NAMES: [&str; 3] = ["stepper_a", "stepper_b", "stepper_c"];
 
-/// Each tower's default mounting angle in degrees (`rotary_delta.py:40`,
+/// Each tower's default mounting angle in degrees (`rotary_delta.py:38-39`,
 /// `[30., 150., 270.]`).
 pub const ROTARY_DELTA_DEFAULT_ANGLES: [f64; 3] = [30., 150., 270.];
 
@@ -118,11 +118,11 @@ pub fn rotary_delta_active_flags() -> AxisFlags {
 }
 
 // ===========================================================================
-// RotaryDeltaCalibration (rotary_delta.py:135-235)
+// RotaryDeltaCalibration (rotary_delta.py:133-224)
 // ===========================================================================
 
 /// The rotary delta's calibration parameters (`RotaryDeltaCalibration`,
-/// `rotary_delta.py:135-235`).
+/// `rotary_delta.py:133-224`).
 ///
 /// The mounting angles are held in **degrees** (the config's unit), while the
 /// solver and [`Self::elbow_coord`] convert to radians, exactly as upstream
@@ -147,7 +147,7 @@ pub struct RotaryDeltaCalibration {
 
 impl RotaryDeltaCalibration {
     /// The absolute angle of each endstop (`self.abs_endstops`,
-    /// `rotary_delta.py:148-152`): the solver at `(0, 0, position_endstop)`.
+    /// `rotary_delta.py:149-151`): the solver at `(0, 0, position_endstop)`.
     pub fn abs_endstops(&self) -> [f64; 3] {
         let mut out = [0.0; 3];
         for i in 0..3 {
@@ -178,7 +178,7 @@ impl RotaryDeltaCalibration {
     }
 
     /// The elbow position in the main cartesian frame for one tower
-    /// (`elbow_coord`, `rotary_delta.py:182-192`).
+    /// (`elbow_coord`, `rotary_delta.py:178-187`).
     pub fn elbow_coord(&self, elbow_id: usize, spos: f64) -> [f64; 3] {
         // Elbow position in the shoulder joint's coordinate system.
         let sj_elbow_x = self.upper_arms[elbow_id] * spos.cos();
@@ -193,7 +193,7 @@ impl RotaryDeltaCalibration {
     }
 
     /// The carriage position for the three arm angles
-    /// (`actuator_to_cartesian`, `rotary_delta.py:193-196`).
+    /// (`actuator_to_cartesian`, `rotary_delta.py:188-191`).
     ///
     /// `None` when the three spheres do not intersect (upstream's `ValueError`
     /// out of `trilateration`).
@@ -212,7 +212,7 @@ impl RotaryDeltaCalibration {
     }
 
     /// The cartesian coordinate a stable position describes
-    /// (`get_position_from_stable`, `rotary_delta.py:197-202`).
+    /// (`get_position_from_stable`, `rotary_delta.py:192-197`).
     pub fn get_position_from_stable(&self, stable_position: [f64; 3]) -> Option<[f64; 3]> {
         let abs_endstops = self.abs_endstops();
         let mut spos = [0.0; 3];
@@ -223,7 +223,7 @@ impl RotaryDeltaCalibration {
     }
 
     /// The stable position (steps since each endstop hit) for a cartesian
-    /// coordinate (`calc_stable_position`, `rotary_delta.py:203-207`).
+    /// coordinate (`calc_stable_position`, `rotary_delta.py:198-204`).
     pub fn calc_stable_position(&self, coord: [f64; 3]) -> [f64; 3] {
         let abs_endstops = self.abs_endstops();
         let mut stable = [0.0; 3];
@@ -235,7 +235,7 @@ impl RotaryDeltaCalibration {
     }
 
     /// The adjustable parameters in upstream's `adj_params` order
-    /// (`coordinate_descent_params`, `rotary_delta.py:153-172`):
+    /// (`coordinate_descent_params`, `rotary_delta.py:152-165`):
     /// `shoulder_height`, `endstop_a/b/c`, and — for an extended fit —
     /// `shoulder_radius`, `angle_a`, `angle_b`.
     ///
@@ -254,7 +254,7 @@ impl RotaryDeltaCalibration {
     }
 
     /// Rebuild a calibration from [`Self::descent_params`] values
-    /// (`new_calibration`, `rotary_delta.py:173-182`): everything the
+    /// (`new_calibration`, `rotary_delta.py:166-177`): everything the
     /// adjustable set does not cover carries over from `base`.
     pub fn from_descent_params(base: &Self, values: &[f64], extended: bool) -> Self {
         let mut out = base.clone();
@@ -269,7 +269,7 @@ impl RotaryDeltaCalibration {
     }
 
     /// The config options [`Self::save_state`] writes
-    /// (`RotaryDeltaCalibration.save_state`, `rotary_delta.py:208-223`):
+    /// (`RotaryDeltaCalibration.save_state`, `rotary_delta.py:205-224`):
     /// `shoulder_radius`/`shoulder_height` on `[printer]` and each tower's
     /// `angle`/`position_endstop`.
     ///
@@ -304,7 +304,7 @@ impl RotaryDeltaCalibration {
         out
     }
 
-    /// The report `save_state` prints (`rotary_delta.py:217-223`).
+    /// The report `save_state` prints (`rotary_delta.py:216-224`).
     pub fn save_state_report(&self) -> String {
         format!(
             "stepper_a: position_endstop: {:.6} angle: {:.6}\n\
@@ -329,7 +329,7 @@ impl RotaryDeltaCalibration {
 
 /// What `[printer]` and its three `[stepper_a/b/c]` sections say about a
 /// rotary-delta machine, as plain numbers the config readers already
-/// bounds-checked (`kinematics/rotary_delta.py:10-48` reads the same options).
+/// bounds-checked (`kinematics/rotary_delta.py:10-76` reads the same options).
 #[derive(Debug, Clone)]
 pub struct RotaryDeltaConfig {
     /// `shoulder_radius`, above 0.
@@ -361,35 +361,35 @@ pub struct RotaryDeltaConfig {
 
 /// Rotary-delta kinematics: three shoulder joints whose arm angles place the
 /// carriage, simultaneous homing, and a cylindrical envelope
-/// (`RotaryDeltaKinematics`, `rotary_delta.py:10-132`).
+/// (`RotaryDeltaKinematics`, `rotary_delta.py:9-130`).
 #[derive(Debug)]
 pub struct RotaryDeltaKinematics {
     /// The calibration parameters (also `[delta_calibrate]`'s view).
     cal: RotaryDeltaCalibration,
-    /// The cartesian position homing drives to (`rotary_delta.py:52-55`).
+    /// The cartesian position homing drives to (`rotary_delta.py:58-61`).
     home_position: Coord,
     axes_min: Coord,
     axes_max: Coord,
-    /// The lowest endstop (`rotary_delta.py:57`).
+    /// The lowest endstop (`rotary_delta.py:62`).
     max_z: f64,
     /// `minimum_z_position`.
     min_z: f64,
-    /// Above this Z the cylinder tapers (`rotary_delta.py:64`).
+    /// Above this Z the cylinder tapers (`rotary_delta.py:69`).
     limit_z: f64,
-    /// The squared radius the cylinder allows (`rotary_delta.py:62`).
+    /// The squared radius the cylinder allows (`rotary_delta.py:66`).
     max_xy2: f64,
     max_z_velocity: f64,
     max_z_accel: f64,
-    /// The squared radius a completed check cached (`rotary_delta.py:51`,
-    /// `93-129`). Interior-mutable because `check_move` takes `&self`.
+    /// The squared radius a completed check cached (`rotary_delta.py:57`,
+    /// `101-122`). Interior-mutable because `check_move` takes `&self`.
     limit_xy2: Mutex<f64>,
-    /// Whether `G28` still has to run (`rotary_delta.py:51`).
+    /// Whether `G28` still has to run (`rotary_delta.py:56`).
     need_home: bool,
 }
 
 impl RotaryDeltaKinematics {
     /// Build the kinematics from the config's numbers
-    /// (`RotaryDeltaKinematics.__init__`, `rotary_delta.py:10-68`), mirroring
+    /// (`RotaryDeltaKinematics.__init__`, `rotary_delta.py:10-76`), mirroring
     /// its bounds, derived envelope and log lines.
     ///
     /// # Errors
@@ -408,7 +408,7 @@ impl RotaryDeltaKinematics {
         let eangles = cal.abs_endstops();
 
         // Where the machine believes home is: the endstop angles read back as
-        // one cartesian point (`rotary_delta.py:52-55`).
+        // one cartesian point (`rotary_delta.py:58-61`).
         let home_xyz = cal.actuator_to_cartesian(eangles).ok_or_else(|| {
             ConfigError::new(
                 "Unable to compute the rotary delta home position in section 'printer'".to_string(),
@@ -422,7 +422,7 @@ impl RotaryDeltaKinematics {
             .copied()
             .fold(f64::INFINITY, f64::min);
         let min_z = config.minimum_z_position;
-        // The radius the arms allow (`rotary_delta.py:58-63`).
+        // The radius the arms allow (`rotary_delta.py:64-66`).
         let min_ua = config
             .upper_arms
             .iter()
@@ -436,7 +436,7 @@ impl RotaryDeltaKinematics {
         let max_xy2 = min_ua.min(min_la).powi(2);
         let max_xy = max_xy2.sqrt();
         // The height above which the cylinder tapers: the lowest elbow's
-        // height minus its lower arm (`rotary_delta.py:64-67`).
+        // height minus its lower arm (`rotary_delta.py:67-69`).
         let limit_z = (0..3)
             .map(|i| cal.elbow_coord(i, eangles[i])[2] - config.lower_arms[i])
             .fold(f64::INFINITY, f64::min);
@@ -464,7 +464,7 @@ impl RotaryDeltaKinematics {
 
     /// The parameters each rail's solver is bound with, in rail order
     /// (`setup_itersolve('rotary_delta_stepper_alloc', shoulder_radius,
-    /// shoulder_height, math.radians(a), ua, la)`, `rotary_delta.py:49-51`):
+    /// shoulder_height, math.radians(a), ua, la)`, `rotary_delta.py:49-52`):
     /// `(shoulder_radius, shoulder_height, angle_degrees, upper_arm,
     /// lower_arm)`.
     pub fn tower_geometry(&self) -> [(f64, f64, f64, f64, f64); 3] {
@@ -482,12 +482,12 @@ impl RotaryDeltaKinematics {
     }
 
     /// The calibration view `[delta_calibrate]` takes
-    /// (`get_calibration`, `rotary_delta.py:131-132`).
+    /// (`get_calibration`, `rotary_delta.py:129-130`).
     pub fn calibration(&self) -> RotaryDeltaCalibration {
         self.cal.clone()
     }
 
-    /// The one-piece homing move (`home`, `rotary_delta.py:104-110`): start at
+    /// The one-piece homing move (`home`, `rotary_delta.py:93-100`): start at
     /// the home XY but below the bed (`forcepos[2] = -1`), end at the home
     /// position, all three towers travelling together.
     fn home_move(&self) -> ([f64; 3], [f64; 3], [f64; 3]) {
@@ -540,12 +540,12 @@ impl Kinematics for RotaryDeltaKinematics {
         let end_z = end.z();
         let mut limit_xy2 = self.max_xy2;
         if end_z > self.limit_z {
-            // Higher up, the arms reach less far out (`rotary_delta.py:118-121`).
+            // Higher up, the arms reach less far out (`rotary_delta.py:111-112`).
             limit_xy2 = limit_xy2.min((self.max_z - end_z).powi(2));
         }
         if end_xy2 > limit_xy2 || end_z > self.max_z || end_z < self.min_z {
             // Out of range — unless this is the homing move finishing at the
-            // home XY/Z (`rotary_delta.py:122-127`).
+            // home XY/Z (`rotary_delta.py:113-118`).
             if end.x() != self.home_position.x()
                 || end.y() != self.home_position.y()
                 || end_z < self.min_z
@@ -568,7 +568,7 @@ impl Kinematics for RotaryDeltaKinematics {
     fn set_position(&mut self, _newpos: Coord, homing_axes: &[usize]) {
         *self.limit_xy2.lock().unwrap_or_else(|p| p.into_inner()) = -1.;
         // Upstream keys off `homing_axes == "xyz"`; all three axes is the only
-        // three-element set there is (`rotary_delta.py:95-100`).
+        // three-element set there is (`rotary_delta.py:82-87`).
         if homing_axes.len() == 3 {
             self.need_home = false;
         }
@@ -581,7 +581,7 @@ impl Kinematics for RotaryDeltaKinematics {
 
     fn clear_homing_state(&mut self, clear_axes: &[usize]) {
         // Clearing homing state per axis is not implemented upstream either —
-        // any axis drops the whole machine (`rotary_delta.py:101-105`).
+        // any axis drops the whole machine (`rotary_delta.py:88-92`).
         if !clear_axes.is_empty() {
             *self.limit_xy2.lock().unwrap_or_else(|p| p.into_inner()) = -1.;
             self.need_home = true;
@@ -597,7 +597,7 @@ impl Kinematics for RotaryDeltaKinematics {
     }
 
     fn home(&mut self, homing: &mut dyn HomingState) {
-        // All axes are homed simultaneously (`rotary_delta.py:104-110`).
+        // All axes are homed simultaneously (`rotary_delta.py:93-100`).
         let (force, target, _) = self.home_move();
         let to_home_coord = |pos: [f64; 3]| -> [Option<f64>; 4] {
             [Some(pos[0]), Some(pos[1]), Some(pos[2]), None]

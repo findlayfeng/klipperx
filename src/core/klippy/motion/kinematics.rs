@@ -21,7 +21,7 @@ use crate::core::klippy::mathutil::{Coord, AXES, X_AXIS, Y_AXIS, Z_AXIS};
 /// What a kinematics may inspect and change about one move.
 ///
 /// Upstream hands the kinematics the whole `Move` and lets it call
-/// `limit_speed` (`klippy/kinematics/cartesian.py:113-117`). This is the narrow
+/// `limit_speed` (`klippy/kinematics/cartesian.py:115-119`). This is the narrow
 /// version: the kinematics sees the geometry and may lower the speed, but not
 /// touch the planner's junction state.
 pub struct MoveContext<'a> {
@@ -44,7 +44,7 @@ impl<'a> MoveContext<'a> {
     /// Polar's near-center slowdown measures the segment's closest approach
     /// to the bed center from both ends; Delta's `check_move` compares it
     /// with the home position to recognize the homing move finishing outside
-    /// the envelope (`kinematics/delta.py:137-146`).
+    /// the envelope (`kinematics/delta.py:132-137`).
     pub fn start_pos(&self) -> &Coord {
         &self.move_.start_pos
     }
@@ -64,7 +64,7 @@ impl<'a> MoveContext<'a> {
     /// The per-axis distance over the total distance (the direction cosines).
     ///
     /// The extruder's `check_move` reads the E direction cosine
-    /// (`kinematics/extruder.py:180-205`).
+    /// (`kinematics/extruder.py:208-235`).
     pub fn axes_r(&self) -> &[f64; 4] {
         &self.move_.axes_r
     }
@@ -77,7 +77,7 @@ impl<'a> MoveContext<'a> {
     /// Whether this move moves the toolhead (an extrude-only move does not).
     ///
     /// A manual stepper's `check_move` lowers the acceleration of an
-    /// extrude-only move (`manual_stepper.py:158-160`).
+    /// extrude-only move (`manual_stepper.py:190-192`).
     pub fn is_kinematic_move(&self) -> bool {
         self.move_.is_kinematic_move
     }
@@ -106,7 +106,7 @@ impl<'a> MoveContext<'a> {
 
 /// Where an axis' endstop is and how to home it.
 ///
-/// Upstream's `GenericPrinterRail.get_homing_info()` (`klippy/stepper.py:475`),
+/// Upstream's `GenericPrinterRail.get_homing_info()` (`klippy/stepper.py:397-404`),
 /// which the kinematics reads to compute a homing move's endpoints. It lives
 /// here rather than beside the rail so the homing protocol below does not have
 /// to reach up into the extras.
@@ -301,9 +301,9 @@ impl HomingHandle {
 /// config options live behind this enum.
 #[derive(Debug, Clone)]
 pub enum KinematicsCalibration {
-    /// A linear delta's `DeltaCalibration` (`delta.py:163-241`).
+    /// A linear delta's `DeltaCalibration` (`delta.py:169-238`).
     Linear(DeltaCalibration),
-    /// A rotary delta's `RotaryDeltaCalibration` (`rotary_delta.py:135-235`).
+    /// A rotary delta's `RotaryDeltaCalibration` (`rotary_delta.py:133-224`).
     Rotary(super::rotary_delta::RotaryDeltaCalibration),
 }
 
@@ -444,7 +444,7 @@ pub trait Kinematics: Send + Sync + std::fmt::Debug {
     fn home(&mut self, homing: &mut dyn HomingState);
 
     /// A homing move the kinematics takes as one piece instead of axis by axis
-    /// (`kinematics/delta.py:104-110`: all three towers home in one move).
+    /// (`kinematics/delta.py:110-115`: all three towers home in one move).
     ///
     /// `None` — the default — means the driver homes each rail independently
     /// as it does for the cartesian family.
@@ -453,7 +453,7 @@ pub trait Kinematics: Send + Sync + std::fmt::Debug {
     }
 
     /// The deltesian home split (`DeltesianKinematics.home`,
-    /// `deltesian.py:88-110`), or `None` for every other kinematics.
+    /// `deltesian.py:122-146`), or `None` for every other kinematics.
     ///
     /// Deltesian is neither a whole-machine group home ([`Self::unified_home`])
     /// nor the cartesian per-axis walk: its two arm rails home together as one
@@ -466,7 +466,7 @@ pub trait Kinematics: Send + Sync + std::fmt::Debug {
     }
 
     /// The delta calibration parameters this kinematics carries
-    /// (`kinematics/delta.py:153-160`, `get_calibration`).
+    /// (`kinematics/delta.py:160-166`, `get_calibration`).
     ///
     /// `None` — the default — for every non-delta kinematics, which is what
     /// `[delta_calibrate]` checks for (`delta_calibrate.py:127-131`). The
@@ -478,7 +478,7 @@ pub trait Kinematics: Send + Sync + std::fmt::Debug {
     }
 }
 
-/// Deltesian's homing split (`DeltesianKinematics.home`, `deltesian.py:88-110`).
+/// Deltesian's homing split (`DeltesianKinematics.home`, `deltesian.py:122-146`).
 ///
 /// Upstream's `home` makes two `home_rails` calls: the two arm rails together
 /// (`rails[:2]`, forcepos `[0, None, force_z]` → homepos `[0, None, home_z]`),
@@ -509,7 +509,7 @@ pub struct UnifiedHome {
     pub target: [f64; 3],
     /// Each rail's actuator travel over the move, millimetres — the endstop
     /// sample pacing derives from it (`HomingMove._calc_endstop_rate`,
-    /// `extras/homing.py:60-70`).
+    /// `extras/homing.py:55-66`).
     pub actuator_travel: [f64; 3],
 }
 
@@ -629,7 +629,7 @@ impl CartesianKinematics {
             axes_min,
             axes_max,
             // Upstream starts with `(1.0, -1.0)`, an empty range that reads as
-            // "not homed" (`klippy/kinematics/cartesian.py:44`).
+            // "not homed" (`klippy/kinematics/cartesian.py:45`).
             limits: [None; 3],
             max_z_velocity,
             max_z_accel,
@@ -679,7 +679,7 @@ impl Kinematics for CartesianKinematics {
     fn check_move(&self, ctx: &mut MoveContext<'_>) -> Result<(), CommandError> {
         let end = *ctx.end_pos();
         let axes_d = *ctx.axes_d();
-        // XY first, as upstream does (`klippy/kinematics/cartesian.py:104-112`).
+        // XY first, as upstream does (`klippy/kinematics/cartesian.py:106-114`).
         for axis in [X_AXIS, Y_AXIS] {
             if axes_d[axis] == 0.0 {
                 continue;
@@ -721,7 +721,7 @@ impl Kinematics for CartesianKinematics {
     fn update_limits(&mut self, axis: usize, range: Option<(f64, f64)>) {
         if let Some(range) = range {
             // Only a homed axis gets new limits, as upstream does
-            // (`klippy/kinematics/cartesian.py:63-68`).
+            // (`klippy/kinematics/cartesian.py:56-61`).
             if self.limits[axis].is_some() {
                 self.limits[axis] = Some(range);
             }
@@ -828,7 +828,7 @@ pub fn polar_angle_normalize(commanded: &mut f64) {
 }
 
 /// The closest distance from the bed center (origin) to the segment
-/// `p1 → p2` (`distance_to_center`, `kinematics/polar.py:5-21`): which part
+/// `p1 → p2` (`distance_to_center`, `kinematics/polar.py:10-26`): which part
 /// of the segment a slowdown applies to — the segment start, its end, or
 /// the perpendicular foot.
 pub fn distance_to_center(p1: (f64, f64), p2: (f64, f64)) -> f64 {
@@ -851,7 +851,7 @@ pub fn distance_to_center(p1: (f64, f64), p2: (f64, f64)) -> f64 {
 }
 
 /// The homing endpoints for one polar axis (`_home_axis`,
-/// `kinematics/polar.py:64-79`): 1.0× push (not the cartesian 1.5× —
+/// `kinematics/polar.py:80-94`): 1.0× push (not the cartesian 1.5× —
 /// overshooting the arm's `position_min` would put the toolhead *behind*
 /// the center, where the angle flips), and when homing the arm (axis 0)
 /// **Y is pinned to 0** so the drip move stays on the +X radius.
@@ -911,7 +911,7 @@ pub struct PolarKinematics {
 
 impl PolarKinematics {
     /// The polar kinematics over its two rails and the bed stepper
-    /// (`PolarKinematics.__init__`, `kinematics/polar.py:14-59`).
+    /// (`PolarKinematics.__init__`, `kinematics/polar.py:30-58`).
     ///
     /// `names` are the stepper names for [`calc_position`](Self::calc_position)
     /// (bed, arm, z), `arm_range`/`z_range` the rail ranges.
@@ -940,7 +940,7 @@ impl PolarKinematics {
             v_rad_max,
             // Upstream starts every limit unhomed: an inverted z range and a
             // negative squared radius that no move can pass
-            // (`kinematics/polar.py:57-58`).
+            // (`kinematics/polar.py:53-54`).
             limit_z: (1.0, -1.0),
             limit_xy2: -1.0,
         }
@@ -949,7 +949,7 @@ impl PolarKinematics {
 
 impl Kinematics for PolarKinematics {
     fn calc_position(&self, stepper_positions: &HashMap<String, f64>) -> [Option<f64>; 3] {
-        // `calc_position` of `kinematics/polar.py:61-65`: the carriage is
+        // `calc_position` of `kinematics/polar.py:61-66`: the carriage is
         // the bed angle and arm radius in polar coordinates. An axis is
         // `None` when a stepper it needs is missing (the port's convention;
         // upstream would raise a `KeyError`).
@@ -967,7 +967,7 @@ impl Kinematics for PolarKinematics {
     }
 
     fn check_move(&self, ctx: &mut MoveContext<'_>) -> Result<(), CommandError> {
-        // `check_move` of `kinematics/polar.py:104-139`, in upstream order:
+        // `check_move` of `kinematics/polar.py:111-139`, in upstream order:
         // the gated XY radius, then Z's range and speed, then the
         // near-center angular slowdown.
         let end = *ctx.end_pos();
@@ -1016,7 +1016,7 @@ impl Kinematics for PolarKinematics {
     }
 
     fn set_position(&mut self, _newpos: Coord, homing_axes: &[usize]) {
-        // `set_position` of `kinematics/polar.py:81-86`: the stepper
+        // `set_position` of `kinematics/polar.py:67-73`: the stepper
         // positions are set centrally by the toolhead; only the homed
         // limits live here. X **and** Y together open the whole square
         // (a single axis would leave `limit_xy2` untouched).
@@ -1035,7 +1035,7 @@ impl Kinematics for PolarKinematics {
     }
 
     fn clear_homing_state(&mut self, axes: &[usize]) {
-        // `clear_homing_state` of `kinematics/polar.py:88-93`: "X and Y
+        // `clear_homing_state` of `kinematics/polar.py:74-79`: "X and Y
         // cannot be cleared separately", so either clears both.
         if axes.contains(&X_AXIS) || axes.contains(&Y_AXIS) {
             self.limit_xy2 = -1.0;
@@ -1046,7 +1046,7 @@ impl Kinematics for PolarKinematics {
     }
 
     fn get_status(&self) -> Value {
-        // `get_status` of `kinematics/polar.py:141-151`.
+        // `get_status` of `kinematics/polar.py:141-148`.
         let xy_home = if self.limit_xy2 >= 0.0 { "xy" } else { "" };
         let z_home = if self.limit_z.0 <= self.limit_z.1 {
             "z"
@@ -1061,7 +1061,7 @@ impl Kinematics for PolarKinematics {
     }
 
     fn home(&mut self, homing: &mut dyn HomingState) {
-        // `home` of `kinematics/polar.py:95-108`: X and Y are always homed
+        // `home` of `kinematics/polar.py:95-110`: X and Y are always homed
         // together on the arm rail (axis 0, Y pinned to 0 by
         // [`polar_home_move`]), then Z on its own rail.
         let requested = homing.axes();
@@ -1557,7 +1557,7 @@ mod tests {
 
         // Arm (axis 0, endstop at the max): force sits exactly at the min
         // (1.0× push — no overshoot behind the center) and Y is pinned to 0
-        // so the drip move stays on the +X radius (`polar.py:70-74`).
+        // so the drip move stays on the +X radius (`polar.py:86-90`).
         let info = homing_info(300.0, true);
         let (forcepos, movepos) = polar_home_move(X_AXIS, &info, 0.0, 300.0);
         assert_eq!(forcepos, [Some(0.0), Some(0.0), None, None]);

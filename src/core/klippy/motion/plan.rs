@@ -7,7 +7,7 @@
 //! sequence of moves with `accel_t`/`cruise_t`/`decel_t`, which the
 //! [`trapq`](super::trapq) turns into step times.
 //!
-//! The formulas follow upstream (`klippy/toolhead.py:14-198`) line for line, so
+//! The formulas follow upstream (`klippy/toolhead.py:14-193`) line for line, so
 //! a move planned here has the same timing as one planned by Klipper. The
 //! extra-axes hooks (`Move.calc_junction`'s `extra_axes`, the extruder) are not
 //! wired in yet — they arrive with `[extruder]` in FW5e.
@@ -19,12 +19,12 @@ use crate::core::klippy::gcode::CommandError;
 use crate::core::klippy::mathutil::{Coord, E_AXIS};
 
 /// How long the look-ahead accumulates moves before flushing, in seconds
-/// (`LOOKAHEAD_FLUSH_TIME`, `klippy/toolhead.py:120`).
+/// (`LOOKAHEAD_FLUSH_TIME`, `klippy/toolhead.py:116`).
 pub const LOOKAHEAD_FLUSH_TIME: f64 = 0.150;
 
 /// The toolhead limits a planner needs to profile one move.
 ///
-/// Upstream reads these off the toolhead object (`klippy/toolhead.py:212-217`);
+/// Upstream reads these off the toolhead object (`klippy/toolhead.py:209-216`);
 /// they are passed in here so a [`Move`] can be planned — and tested — without
 /// a toolhead.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -43,7 +43,7 @@ pub struct MoveLimits {
 ///
 /// Distances are `_d`, velocities `_v`, velocities squared `_v2`, times `_t`
 /// and ratios `_r`, as upstream's naming convention
-/// (`klippy/toolhead.py:11-13`) has it.
+/// (`klippy/toolhead.py:9-11`) has it.
 pub struct Move {
     /// Where the move starts.
     pub start_pos: Coord,
@@ -96,7 +96,7 @@ impl Move {
     ///
     /// `start_pos`/`end_pos` are four-axis toolhead positions; `speed` is the
     /// requested speed in mm/s, capped at [`MoveLimits::max_velocity`]
-    /// (`klippy/toolhead.py:15-50`).
+    /// (`klippy/toolhead.py:15-51`).
     pub fn new(start_pos: Coord, end_pos: Coord, speed: f64, limits: &MoveLimits) -> Self {
         let mut axes_d = [0.0; 4];
         for (axis, slot) in axes_d.iter_mut().enumerate() {
@@ -154,7 +154,7 @@ impl Move {
     }
 
     /// Lower this move's speed and/or acceleration
-    /// (`klippy/toolhead.py:52-58`). A kinematics uses this to respect a slow
+    /// (`klippy/toolhead.py:52-59`). A kinematics uses this to respect a slow
     /// axis, the way cartesian slows Z.
     pub fn limit_speed(&mut self, speed: f64, accel: f64) {
         let speed2 = speed * speed;
@@ -174,7 +174,7 @@ impl Move {
     }
 
     /// The error to report when the move is rejected
-    /// (`klippy/toolhead.py:62-64`).
+    /// (`klippy/toolhead.py:62-65`).
     pub fn move_error(&self, msg: &str) -> CommandError {
         let ep = self.end_pos;
         CommandError::new(format!(
@@ -189,7 +189,7 @@ impl Move {
 
     /// Work out how fast the junction before this move may be crossed.
     ///
-    /// `prev` is the move immediately before it (`klippy/toolhead.py:66-98`).
+    /// `prev` is the move immediately before it (`klippy/toolhead.py:66-99`).
     /// The junction speed is limited by both moves' cruise caps, by how much
     /// squared velocity the previous move can add, and by the "approximated
     /// centripetal velocity" the corner deviation allows. `extra_v2` is the
@@ -237,7 +237,7 @@ impl Move {
     }
 
     /// Fix this move's profile from the junction speeds around it
-    /// (`klippy/toolhead.py:100-118`).
+    /// (`klippy/toolhead.py:100-114`).
     ///
     /// `start_v2`/`cruise_v2`/`end_v2` are squared velocities. The move is
     /// divided into an accelerating, a cruising and a decelerating part, each
@@ -290,7 +290,7 @@ fn divide(numerator: f64, denominator: f64) -> f64 {
 /// Moves are added as they are requested and flushed once enough time has
 /// accumulated (or when the caller asks), which is what lets the planner look
 /// *ahead* and not decelerate to a stop at every move boundary
-/// (`klippy/toolhead.py:120-198`).
+/// (`klippy/toolhead.py:120-193`).
 #[derive(Debug, Default)]
 pub struct LookAheadQueue {
     queue: Vec<Move>,
@@ -328,11 +328,11 @@ impl LookAheadQueue {
     }
 
     /// Add a move; returns whether the queue wants flushing now
-    /// (`klippy/toolhead.py:186-198`).
+    /// (`klippy/toolhead.py:186-193`).
     ///
     /// `extra_axes` are the non-kinematic axes (the extruder); each contributes
     /// a junction limit, as upstream's `Move.calc_junction` folds in
-    /// (`klippy/toolhead.py:66-98`).
+    /// (`klippy/toolhead.py:66-99`).
     pub fn add_move(&mut self, move_: Move, extra_axes: &[Arc<dyn ExtraAxis>]) -> bool {
         let len = self.queue.len();
         self.queue.push(move_);
@@ -368,7 +368,7 @@ impl LookAheadQueue {
     /// assuming the toolhead must come to a stop after the last queued move;
     /// the forward pass then propagates the cruise speeds it found. `lazy`
     /// leaves the trailing moves in the queue when it can
-    /// (`klippy/toolhead.py:135-184`).
+    /// (`klippy/toolhead.py:135-185`).
     pub fn flush(&mut self, lazy: bool) -> Vec<Move> {
         self.junction_flush = LOOKAHEAD_FLUSH_TIME;
         let mut update_flush_count = lazy;
@@ -446,7 +446,7 @@ mod tests {
 
     /// The limits a default `[printer]` produces: 200 mm/s, 1000 mm/s^2,
     /// 5 mm/s square corner, 0.5 minimum cruise ratio
-    /// (`klippy/toolhead.py:212-217` `:534-537`).
+    /// (`klippy/toolhead.py:209-216` `:534-537`).
     fn limits() -> MoveLimits {
         MoveLimits {
             max_velocity: 200.0,

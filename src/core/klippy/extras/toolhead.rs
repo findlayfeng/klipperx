@@ -30,6 +30,8 @@
 //! | `M400` | flush the planner |
 //! | `G28` | home the named axes (all three when none is named) |
 //! | `SET_KINEMATIC_POSITION` | force the low-level position, homing the named axes |
+//! | `SET_VELOCITY_LIMIT` | change (or report) the velocity limits |
+//! | `M204` | change the acceleration limit (`S`, or the lesser of `P` and `T`) |
 //!
 //! `G0` / `G1` are **not** here: they belong to
 //! [`gcode_move`](crate::core::klippy::extras::gcode_move), which reads them off
@@ -75,7 +77,7 @@ use crate::core::klippy::extras::idex_modes;
 use crate::core::klippy::extras::query_endstops::{QueryEndstops, QUERY_ENDSTOPS_OBJECT};
 use crate::core::klippy::extras::stepper::{PrinterStepper, Rail};
 use crate::core::klippy::gcode::{
-    sync, CommandError, CommandHandler, GCodeDispatch, GcodeCommand, GCODE_OBJECT,
+    parse_float, sync, CommandError, CommandHandler, GCodeDispatch, GcodeCommand, GCODE_OBJECT,
 };
 use crate::core::klippy::load::section;
 use crate::core::klippy::mathutil::{Coord, X_AXIS, Y_AXIS, Z_AXIS};
@@ -111,6 +113,7 @@ use crate::core::klippy::motion::winch::{winch_active_flags, winch_position_fn, 
 use crate::core::klippy::motion::{HomeCoord, Homing, HomingHandle, HomingInfo};
 use crate::core::klippy::printer::{ConnectFuture, Printer, PrinterObject, RestartHooks};
 use crate::core::klippy::reactor::Reactor;
+use crate::logging::set_rollover_info;
 
 // Loaded after the generic walk (upstream loads `toolhead` last), registered as
 // the `toolhead` object (`[printer]`'s consumer).
@@ -346,9 +349,69 @@ impl KinematicsKind {
     }
 }
 
+/// The four velocity limits as upstream's `ToolHead` stores them
+/// (`ToolHead.__init__`, `klippy/toolhead.py:209-216`). The planner's
+/// [`MoveLimits`] is derived from these ([`Self::move_limits`]), so a runtime
+/// change must recompute it (`ToolHead._calc_junction_deviation`).
+///
+/// This object holds the copy `get_status` and the kinematics defaults read;
+/// the connected planner keeps its own (`ToolHead::set_max_velocities`), and
+/// [`cmd_set_velocity_limit`] / [`cmd_m204`] keep the two in step.
+struct VelocityLimits {
+    max_velocity: f64,
+    max_accel: f64,
+    square_corner_velocity: f64,
+    min_cruise_ratio: f64,
+}
+
+impl VelocityLimits {
+    /// The planner limits these four values derive
+    /// (`MoveLimits::from_velocity_limits`).
+    fn move_limits(&self) -> MoveLimits {
+        MoveLimits::from_velocity_limits(
+            self.max_velocity,
+            self.max_accel,
+            self.square_corner_velocity,
+            self.min_cruise_ratio,
+        )
+    }
+
+    /// `ToolHead.set_max_velocities` (`klippy/toolhead.py:538-550`): override
+    /// the named values and return the four current ones. Only a `Some`
+    /// overrides, as upstream's `None` arguments leave the field alone.
+    fn set_max_velocities(
+        &mut self,
+        max_velocity: Option<f64>,
+        max_accel: Option<f64>,
+        square_corner_velocity: Option<f64>,
+        min_cruise_ratio: Option<f64>,
+    ) -> (f64, f64, f64, f64) {
+        if let Some(velocity) = max_velocity {
+            self.max_velocity = velocity;
+        }
+        if let Some(accel) = max_accel {
+            self.max_accel = accel;
+        }
+        if let Some(velocity) = square_corner_velocity {
+            self.square_corner_velocity = velocity;
+        }
+        if let Some(ratio) = min_cruise_ratio {
+            self.min_cruise_ratio = ratio;
+        }
+        (
+            self.max_velocity,
+            self.max_accel,
+            self.square_corner_velocity,
+            self.min_cruise_ratio,
+        )
+    }
+}
+
 /// The `toolhead` object: the planner, its kinematics, and the MCU steppers.
 pub struct ToolHeadObject {
-    limits: MoveLimits,
+    /// The velocity limits this object keeps (see [`VelocityLimits`]); shared
+    /// with the command handlers, which outlive the object on a restart.
+    limits: Arc<Mutex<VelocityLimits>>,
     max_z_velocity: f64,
     max_z_accel: f64,
     /// The cartesian rails, `[stepper_x]`, `[stepper_y]`, and `[stepper_z]`;
@@ -523,15 +586,15 @@ impl ToolHeadObject {
             None,
         )?;
 
-        // The junction geometry (`ToolHead._calc_junction_deviation`).
-        let junction_deviation =
-            square_corner_velocity.powi(2) * (std::f64::consts::SQRT_2 - 1.0) / max_accel;
-        let limits = MoveLimits {
+        // The four limits as upstream stores them; the planner's view (the
+        // junction geometry) is derived from them (`ToolHead.__init__`,
+        // `klippy/toolhead.py:209-216`).
+        let limits = Arc::new(Mutex::new(VelocityLimits {
             max_velocity,
             max_accel,
-            junction_deviation,
-            mcr_pseudo_accel: max_accel * (1.0 - min_cruise_ratio),
-        };
+            square_corner_velocity,
+            min_cruise_ratio,
+        }));
 
         let mut rails: Vec<Arc<Rail>> = Vec::new();
         let mut bed = None;
@@ -874,6 +937,34 @@ impl ToolHeadObject {
                 false,
             )
             .map_err(ConfigError::new)?;
+        let velocity_handler: CommandHandler = {
+            let state = Arc::clone(&self.state);
+            let limits = Arc::clone(&self.limits);
+            sync(move |gcmd| cmd_set_velocity_limit(&state, &limits, gcmd))
+        };
+        gcode
+            .register_command_with_params(
+                "SET_VELOCITY_LIMIT",
+                velocity_handler,
+                Some("Set printer velocity limits"),
+                &[
+                    "VELOCITY",
+                    "ACCEL",
+                    "SQUARE_CORNER_VELOCITY",
+                    "MINIMUM_CRUISE_RATIO",
+                ],
+                false,
+            )
+            .map_err(ConfigError::new)?;
+        let m204_handler: CommandHandler = {
+            let state = Arc::clone(&self.state);
+            let limits = Arc::clone(&self.limits);
+            sync(move |gcmd| cmd_m204(&state, &limits, gcmd))
+        };
+        gcode
+            // `S` sets the accel; with no `S`, the minimum of `P` and `T` does.
+            .register_command_with_params("M204", m204_handler, None, &["S", "P", "T"], false)
+            .map_err(ConfigError::new)?;
         Ok(())
     }
 
@@ -907,9 +998,22 @@ impl ToolHeadObject {
             .unwrap_or_default()
     }
 
+    /// The stored velocity limits, locked.
+    fn limits_guard(&self) -> MutexGuard<'_, VelocityLimits> {
+        self.limits
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    /// The planner limits right now — the four stored values with the derived
+    /// junction geometry (`MoveLimits::from_velocity_limits`).
+    fn move_limits(&self) -> MoveLimits {
+        self.limits_guard().move_limits()
+    }
+
     /// The machine's maximum velocity, for `[extruder]`'s speed defaults.
     pub fn max_velocity(&self) -> f64 {
-        self.limits.max_velocity
+        self.limits_guard().max_velocity
     }
 
     /// Whether the loaded `[printer]` kinematics carries a delta calibration
@@ -965,7 +1069,7 @@ impl ToolHeadObject {
 
     /// The machine's maximum acceleration, for `[extruder]`'s speed defaults.
     pub fn max_accel(&self) -> f64 {
-        self.limits.max_accel
+        self.limits_guard().max_accel
     }
 
     /// Record the active extruder (`ACTIVATE_EXTRUDER`).
@@ -997,6 +1101,10 @@ impl PrinterObject for ToolHeadObject {
             .kinematics()
             .map(|kinematics| kinematics.get_status()["homed_axes"].clone())
             .unwrap_or_else(|| json!(""));
+        // The four velocity limits as upstream reports them (`get_status`,
+        // `toolhead.py:502-515`); this object owns the copy the planner was
+        // built from, and the runtime setters keep the two in step.
+        let limits = self.limits_guard();
         json!({
             "position": position.as_array(),
             "homed_axes": homed_axes,
@@ -1005,8 +1113,10 @@ impl PrinterObject for ToolHeadObject {
             // (`toolhead.py:511`); `PARK_{printer.toolhead.extruder}` and
             // friends read it through the macro template.
             "extruder": self.active_extruder(),
-            "max_velocity": self.limits.max_velocity,
-            "max_accel": self.limits.max_accel,
+            "max_velocity": limits.max_velocity,
+            "max_accel": limits.max_accel,
+            "minimum_cruise_ratio": limits.min_cruise_ratio,
+            "square_corner_velocity": limits.square_corner_velocity,
         })
     }
 
@@ -1080,7 +1190,9 @@ impl PrinterObject for ToolHeadObject {
             let printer_for_est = self.printer.clone();
             let reactor_for_est = self.reactor.clone();
 
-            let mut toolhead = ToolHead::new(self.limits);
+            // The planner is built from this object's limits, and the runtime
+            // setters keep the two copies in step (`ToolHead::set_max_velocities`).
+            let mut toolhead = ToolHead::new(self.move_limits());
             for stepper in host_steppers {
                 toolhead.add_stepper(stepper);
             }
@@ -1104,7 +1216,7 @@ impl PrinterObject for ToolHeadObject {
                         ],
                         (arm.params().position_min, arm.params().position_max),
                         (z.params().position_min, z.params().position_max),
-                        self.limits,
+                        self.move_limits(),
                         self.max_z_velocity,
                         self.max_z_accel,
                         self.max_angular_velocity,
@@ -3135,6 +3247,133 @@ fn cmd_wait_moves(
     Ok(())
 }
 
+/// An optional float word: upstream's `gcmd.get_float(name, None, …)`. An
+/// absent word is `None`; a present one is parsed and bounds-checked with the
+/// dispatcher's wording ("must have minimum of …", "must be above …").
+fn optional_float(
+    gcmd: &GcodeCommand,
+    name: &str,
+    minval: Option<f64>,
+    above: Option<f64>,
+    below: Option<f64>,
+) -> Result<Option<f64>, CommandError> {
+    if !gcmd.get_command_parameters().contains_key(name) {
+        return Ok(None);
+    }
+    Ok(Some(gcmd.get(
+        name,
+        None,
+        parse_float,
+        minval,
+        None,
+        above,
+        below,
+    )?))
+}
+
+/// Apply `set_max_velocities` to both copies of the limits — the one this
+/// object keeps and the connected planner's — and return the four current
+/// values. Only a `Some` overrides, as upstream's `None` arguments do.
+fn apply_max_velocities(
+    state: &Arc<Mutex<Option<Connected>>>,
+    limits: &Arc<Mutex<VelocityLimits>>,
+    max_velocity: Option<f64>,
+    max_accel: Option<f64>,
+    square_corner_velocity: Option<f64>,
+    min_cruise_ratio: Option<f64>,
+) -> (f64, f64, f64, f64) {
+    // The object's copy first, then the planner's (whose copy the next move is
+    // profiled from). The two locks are taken one at a time, never together:
+    // `get_status` takes the state lock then this one, so holding both here in
+    // the other order would deadlock.
+    let (mv, ma, scv, mcr) = limits
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .set_max_velocities(
+            max_velocity,
+            max_accel,
+            square_corner_velocity,
+            min_cruise_ratio,
+        );
+    if let Some(connected) = state
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .as_mut()
+    {
+        connected
+            .toolhead
+            .set_max_velocities(max_velocity, max_accel, scv, mcr);
+    }
+    (mv, ma, scv, mcr)
+}
+
+/// `SET_VELOCITY_LIMIT`: change the velocity limits (`toolhead.py:573-589`).
+///
+/// A parameter that is not named is left alone; naming none reports the current
+/// limits instead of changing them.
+fn cmd_set_velocity_limit(
+    state: &Arc<Mutex<Option<Connected>>>,
+    limits: &Arc<Mutex<VelocityLimits>>,
+    gcmd: &GcodeCommand,
+) -> Result<(), CommandError> {
+    let max_velocity = optional_float(gcmd, "VELOCITY", None, Some(0.0), None)?;
+    let max_accel = optional_float(gcmd, "ACCEL", None, Some(0.0), None)?;
+    let square_corner_velocity =
+        optional_float(gcmd, "SQUARE_CORNER_VELOCITY", Some(0.0), None, None)?;
+    let min_cruise_ratio =
+        optional_float(gcmd, "MINIMUM_CRUISE_RATIO", Some(0.0), None, Some(1.0))?;
+    let (mv, ma, scv, mcr) = apply_max_velocities(
+        state,
+        limits,
+        max_velocity,
+        max_accel,
+        square_corner_velocity,
+        min_cruise_ratio,
+    );
+    let msg = format!(
+        "max_velocity: {mv:.6}\nmax_accel: {ma:.6}\n\
+         minimum_cruise_ratio: {mcr:.6}\nsquare_corner_velocity: {scv:.6}"
+    );
+    set_rollover_info("toolhead", Some(&format!("toolhead: {msg}")));
+    // Upstream echoes the current limits only when nothing was named — a query
+    // — and does so without logging; a change is silent (`toolhead.py:587-589`).
+    if max_velocity.is_none()
+        && max_accel.is_none()
+        && square_corner_velocity.is_none()
+        && min_cruise_ratio.is_none()
+    {
+        gcmd.respond_info_no_log(&msg);
+    }
+    Ok(())
+}
+
+/// `M204`: change the acceleration limit (`toolhead.py:590-601`).
+///
+/// `S` sets it directly; with no `S`, the minimum of `P` and `T` does, and
+/// either missing makes the command invalid (nothing is changed).
+fn cmd_m204(
+    state: &Arc<Mutex<Option<Connected>>>,
+    limits: &Arc<Mutex<VelocityLimits>>,
+    gcmd: &GcodeCommand,
+) -> Result<(), CommandError> {
+    let accel = match optional_float(gcmd, "S", None, Some(0.0), None)? {
+        Some(accel) => accel,
+        None => {
+            let p = optional_float(gcmd, "P", None, Some(0.0), None)?;
+            let t = optional_float(gcmd, "T", None, Some(0.0), None)?;
+            match (p, t) {
+                (Some(p), Some(t)) => p.min(t),
+                _ => {
+                    gcmd.respond_info(&format!("Invalid M204 command \"{}\"", gcmd.commandline()));
+                    return Ok(());
+                }
+            }
+        }
+    };
+    apply_max_velocities(state, limits, None, Some(accel), None, None);
+    Ok(())
+}
+
 /// `SET_KINEMATIC_POSITION`: force the low-level position (`force_move.py:118`).
 fn cmd_set_kinematic_position(
     state: &Arc<Mutex<Option<Connected>>>,
@@ -3748,12 +3987,12 @@ mod tests {
             crate::core::klippy::reactor::ManualReactor::shared(),
         ));
         let object = ToolHeadObject {
-            limits: MoveLimits {
+            limits: Arc::new(Mutex::new(VelocityLimits {
                 max_velocity: 200.0,
                 max_accel: 1000.0,
-                junction_deviation: 0.01,
-                mcr_pseudo_accel: 500.0,
-            },
+                square_corner_velocity: 5.0,
+                min_cruise_ratio: 0.5,
+            })),
             max_z_velocity: 15.0,
             max_z_accel: 100.0,
             rails: Vec::new(),
@@ -4623,7 +4862,8 @@ mod tests {
     /// The declarations a client completes `KEY=` from, as they appear on
     /// `status.gcode.commands`: `G4` takes either unit of dwell time, `G28`
     /// takes the axes, `SET_KINEMATIC_POSITION` takes the axes and its homing
-    /// words, and `M400` waits for what is already queued — nothing to name.
+    /// words, `SET_VELOCITY_LIMIT` the four limits, `M204` its accel words, and
+    /// `M400` waits for what is already queued — nothing to name.
     #[test]
     fn test_every_command_declares_the_parameters_it_reads() {
         let (printer, object) = object_over(Arc::new(Mutex::new(None)));
@@ -4646,7 +4886,264 @@ mod tests {
             commands["SET_KINEMATIC_POSITION"]["parameters"],
             json!(["X", "Y", "Z", "SET_HOMED", "CLEAR", "CLEAR_HOMED"])
         );
+        assert_eq!(
+            commands["SET_VELOCITY_LIMIT"]["parameters"],
+            json!([
+                "VELOCITY",
+                "ACCEL",
+                "SQUARE_CORNER_VELOCITY",
+                "MINIMUM_CRUISE_RATIO"
+            ])
+        );
+        assert_eq!(
+            commands["SET_VELOCITY_LIMIT"]["help"],
+            json!("Set printer velocity limits")
+        );
+        assert_eq!(commands["M204"]["parameters"], json!(["S", "P", "T"]));
         assert!(commands["M400"].get("parameters").is_none());
+    }
+
+    /// Neither velocity command reaches the unknown-command path (`gcode.py`'s
+    /// `cmd_default`): both are registered, so a run reaches their handlers and
+    /// emits no `Unknown command` line.
+    #[test]
+    fn test_the_velocity_commands_are_not_unknown() {
+        let (printer, object) = object_over(Arc::new(Mutex::new(None)));
+        let gcode = Arc::new(GCodeDispatch::new(Arc::clone(&printer)));
+        let registered: Arc<dyn PrinterObject> = gcode.clone();
+        printer.add_object(GCODE_OBJECT, registered).unwrap();
+        object.register_commands(&printer).unwrap();
+        printer.send_event(&KlippyEvent::KlippyReady);
+
+        let output = Arc::new(Mutex::new(Vec::new()));
+        {
+            let output = Arc::clone(&output);
+            gcode.register_output_handler(Arc::new(move |line: &str| {
+                output
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .push(line.to_string());
+            }));
+        }
+
+        // `SET_VELOCITY_LIMIT` with no word reports the limits; `M204 S5` sets
+        // the accel and is silent. Neither is an unknown command.
+        assert!(gcode.run_script_sync("SET_VELOCITY_LIMIT").is_ok());
+        assert!(gcode.run_script_sync("M204 S5").is_ok());
+
+        let lines = output.lock().unwrap_or_else(|poison| poison.into_inner());
+        assert!(
+            !lines.iter().any(|line| line.contains("Unknown command")),
+            "{lines:?}"
+        );
+        assert_eq!(object.limits_guard().max_accel, 5.0);
+    }
+
+    /// A word the command names must sit inside its bound; each bound keeps the
+    /// dispatcher's wording, as upstream's `get_float` bounds do.
+    #[test]
+    fn test_set_velocity_limit_rejects_each_out_of_range_value() {
+        let (state, gcode) = connected(homed_toolhead());
+        let (_printer, object) = object_over(Arc::clone(&state));
+        for (word, value, expected) in [
+            ("VELOCITY", "0", "VELOCITY must be above 0"),
+            ("ACCEL", "-1", "ACCEL must be above 0"),
+            (
+                "SQUARE_CORNER_VELOCITY",
+                "-1",
+                "SQUARE_CORNER_VELOCITY must have minimum of 0",
+            ),
+            (
+                "MINIMUM_CRUISE_RATIO",
+                "1",
+                "MINIMUM_CRUISE_RATIO must be below 1",
+            ),
+        ] {
+            let line = format!("SET_VELOCITY_LIMIT {word}={value}");
+            let command = gcode.create_gcode_command(
+                "SET_VELOCITY_LIMIT",
+                &line,
+                HashMap::from([(word.to_string(), value.to_string())]),
+            );
+            let err = cmd_set_velocity_limit(&object.state, &object.limits, &command).unwrap_err();
+            assert!(err.to_string().contains(expected), "{word}: {err}");
+        }
+    }
+
+    /// `M204 P… T…` uses the smaller of the two (`toolhead.py:593-600`).
+    #[test]
+    fn test_m204_takes_the_minimum_of_p_and_t() {
+        let (state, gcode) = connected(homed_toolhead());
+        let (_printer, object) = object_over(Arc::clone(&state));
+        let command = gcode.create_gcode_command(
+            "M204",
+            "M204 P1 T2",
+            HashMap::from([
+                ("P".to_string(), "1".to_string()),
+                ("T".to_string(), "2".to_string()),
+            ]),
+        );
+        cmd_m204(&object.state, &object.limits, &command).unwrap();
+        assert_eq!(object.limits_guard().max_accel, 1.0);
+    }
+
+    /// `M204 S0` is out of range, as upstream's `above=0.` refuses it.
+    #[test]
+    fn test_m204_rejects_a_zero_accel() {
+        let (state, gcode) = connected(homed_toolhead());
+        let (_printer, object) = object_over(Arc::clone(&state));
+        let command = gcode.create_gcode_command(
+            "M204",
+            "M204 S0",
+            HashMap::from([("S".to_string(), "0".to_string())]),
+        );
+        let err = cmd_m204(&object.state, &object.limits, &command).unwrap_err();
+        assert!(err.to_string().contains("S must be above 0"), "{err}");
+    }
+
+    /// `M204` with neither `S` nor both of `P`/`T` reports the line and changes
+    /// nothing (`toolhead.py:597-599`).
+    #[test]
+    fn test_m204_without_a_usable_word_is_refused() {
+        let (state, gcode) = connected(homed_toolhead());
+        let (_printer, object) = object_over(Arc::clone(&state));
+        let output = Arc::new(Mutex::new(Vec::new()));
+        {
+            let output = Arc::clone(&output);
+            gcode.register_output_handler(Arc::new(move |line: &str| {
+                output
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .push(line.to_string());
+            }));
+        }
+        for (line, params) in [
+            ("M204", HashMap::new()),
+            (
+                "M204 P5",
+                HashMap::from([("P".to_string(), "5".to_string())]),
+            ),
+        ] {
+            let command = gcode.create_gcode_command("M204", line, params);
+            cmd_m204(&object.state, &object.limits, &command).unwrap();
+            let lines = output.lock().unwrap_or_else(|poison| poison.into_inner());
+            assert_eq!(lines.len(), 1, "{lines:?}");
+            assert_eq!(lines[0], format!("// Invalid M204 command \"{line}\""));
+            drop(lines);
+            assert_eq!(object.limits_guard().max_accel, 1000.0);
+            output
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .clear();
+        }
+    }
+
+    /// The change shows up in `status.toolhead`, all four limits
+    /// (`toolhead.py:502-515`).
+    #[test]
+    fn test_set_velocity_limit_updates_the_reported_limits() {
+        let (state, gcode) = connected(homed_toolhead());
+        let (_printer, object) = object_over(Arc::clone(&state));
+        let command = gcode.create_gcode_command(
+            "SET_VELOCITY_LIMIT",
+            "SET_VELOCITY_LIMIT VELOCITY=20 ACCEL=100 SQUARE_CORNER_VELOCITY=1 \
+             MINIMUM_CRUISE_RATIO=0",
+            HashMap::from([
+                ("VELOCITY".to_string(), "20".to_string()),
+                ("ACCEL".to_string(), "100".to_string()),
+                ("SQUARE_CORNER_VELOCITY".to_string(), "1".to_string()),
+                ("MINIMUM_CRUISE_RATIO".to_string(), "0".to_string()),
+            ]),
+        );
+        cmd_set_velocity_limit(&object.state, &object.limits, &command).unwrap();
+        let status = object.get_status(0.0);
+        assert_eq!(status["max_velocity"].as_f64(), Some(20.0));
+        assert_eq!(status["max_accel"].as_f64(), Some(100.0));
+        assert_eq!(status["square_corner_velocity"].as_f64(), Some(1.0));
+        assert_eq!(status["minimum_cruise_ratio"].as_f64(), Some(0.0));
+    }
+
+    /// The planner profiles the *next* move from the new limits: a 100 mm move
+    /// at 1000 mm/s is capped at 20 mm/s and accelerated at 100 mm/s², so it
+    /// takes `d/v + v/a` = 5.2 s. This pins the two copies together — a
+    /// `get_status` that reports the new limits while the planner keeps the old
+    /// ones would fail here.
+    ///
+    /// The move is laid down with `drip_move` because it hands the profiled
+    /// times back; it reads the same `Move::new(…, &self.limits)` a `move_to`
+    /// does, so the limits a `move_to` would use are what is asserted.
+    #[test]
+    fn test_set_velocity_limit_reaches_the_next_move() {
+        let (state, gcode) = connected(homed_toolhead());
+        let (_printer, object) = object_over(Arc::clone(&state));
+        let command = gcode.create_gcode_command(
+            "SET_VELOCITY_LIMIT",
+            "SET_VELOCITY_LIMIT VELOCITY=20 ACCEL=100",
+            HashMap::from([
+                ("VELOCITY".to_string(), "20".to_string()),
+                ("ACCEL".to_string(), "100".to_string()),
+            ]),
+        );
+        cmd_set_velocity_limit(&object.state, &object.limits, &command).unwrap();
+
+        let mut guard = state.lock().unwrap_or_else(|poison| poison.into_inner());
+        let connected = guard.as_mut().expect("the machine is up");
+        let (start, end) = connected
+            .toolhead
+            .drip_move(Coord::new(100.0, 0.0, 0.0, 0.0), 1000.0)
+            .unwrap();
+        let expected = 100.0 / 20.0 + 20.0 / 100.0;
+        assert!((end - start - expected).abs() < 1e-9, "{}", end - start);
+    }
+
+    /// A bare `SET_VELOCITY_LIMIT` reports the limits; naming a word is silent
+    /// (`toolhead.py:582-589` — only the all-`None` query responds, and without
+    /// logging).
+    #[test]
+    fn test_set_velocity_limit_reports_only_when_no_word_is_named() {
+        let (state, gcode) = connected(homed_toolhead());
+        let (_printer, object) = object_over(Arc::clone(&state));
+        let output = Arc::new(Mutex::new(Vec::new()));
+        {
+            let output = Arc::clone(&output);
+            gcode.register_output_handler(Arc::new(move |line: &str| {
+                output
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .push(line.to_string());
+            }));
+        }
+
+        let query =
+            gcode.create_gcode_command("SET_VELOCITY_LIMIT", "SET_VELOCITY_LIMIT", HashMap::new());
+        cmd_set_velocity_limit(&object.state, &object.limits, &query).unwrap();
+        let lines = output.lock().unwrap_or_else(|poison| poison.into_inner());
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(
+            lines[0].as_str(),
+            "// max_velocity: 200.000000\n// max_accel: 1000.000000\n\
+             // minimum_cruise_ratio: 0.500000\n// square_corner_velocity: 5.000000"
+        );
+        drop(lines);
+        output
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clear();
+
+        let change = gcode.create_gcode_command(
+            "SET_VELOCITY_LIMIT",
+            "SET_VELOCITY_LIMIT VELOCITY=10",
+            HashMap::from([("VELOCITY".to_string(), "10".to_string())]),
+        );
+        cmd_set_velocity_limit(&object.state, &object.limits, &change).unwrap();
+        assert!(
+            output
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .is_empty(),
+            "a change is silent"
+        );
+        assert_eq!(object.limits_guard().max_velocity, 10.0);
     }
 
     /// FW6a-2: two responder fake MCUs in one printer, end to end.

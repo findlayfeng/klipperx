@@ -5,7 +5,7 @@
 //! | upstream | here |
 //! |---|---|
 //! | `deltesian_stepper_alloc` (`chelper/kin_deltesian.c:17-40`) | [`deltesian_position_fn`] / [`deltesian_active_flags`] |
-//! | `DeltesianKinematics` (`klippy/kinematics/deltesian.py:11-136`) | [`DeltesianKinematics`] |
+//! | `DeltesianKinematics` (`klippy/kinematics/deltesian.py:15-181`) | [`DeltesianKinematics`] |
 //!
 //! **Placement.** Like [`super::delta`] and [`super::rotary_delta`], this is its
 //! own file so the cartesian family's code stays untouched. Deltesian is a
@@ -37,14 +37,14 @@ use crate::core::klippy::gcode::CommandError;
 use crate::core::klippy::mathutil::{Coord, AXES, X_AXIS, Y_AXIS, Z_AXIS};
 
 /// Slow moves once the ratio of arm to XY movement exceeds this
-/// (`SLOW_RATIO`, `deltesian.py:9`).
+/// (`SLOW_RATIO`, `deltesian.py:10`).
 pub const SLOW_RATIO: f64 = 3.;
 
 /// The minimum angle with the horizontal for the arm, in degrees
-/// (`MIN_ANGLE`, `deltesian.py:12`).
+/// (`MIN_ANGLE`, `deltesian.py:13`).
 pub const MIN_ANGLE: f64 = 5.;
 
-/// The stepper names the three rails answer to (`deltesian.py:15`), in rail
+/// The stepper names the three rails answer to (`deltesian.py:18-19`), in rail
 /// order: the two arms, then the Y rail.
 pub const DELTESIAN_RAIL_NAMES: [&str; 3] = ["stepper_left", "stepper_right", "stepper_y"];
 
@@ -57,7 +57,7 @@ pub const DELTESIAN_RAIL_NAMES: [&str; 3] = ["stepper_left", "stepper_right", "s
 ///
 /// Parameters ride the bound [`PositionFn`]: `[arm2, arm_x]`. The left arm is
 /// allocated with `−arm_x_length` and the right with `+arm_x_length`
-/// (`deltesian.py:30-34`), so the single signed value carries the side.
+/// (`deltesian.py:36-39`), so the single signed value carries the side.
 pub fn deltesian_position_fn(arm2: f64, arm_x: f64) -> PositionFn {
     PositionFn::bind(deltesian_calc_position, [arm2, arm_x, 0.0, 0.0, 0.0, 0.0])
 }
@@ -79,7 +79,7 @@ pub fn deltesian_active_flags() -> AxisFlags {
 // Geometry helpers (`DeltesianKinematics.__init__` derived values)
 // ===========================================================================
 
-/// The two arms' endstop heights (`self._abs_endstop`, `deltesian.py:72-73`):
+/// The two arms' endstop heights (`self._abs_endstop`, `deltesian.py:61-62`):
 /// each arm rail's `position_endstop` plus the vertical reach
 /// `sqrt(arm2 − arm_x²)`.
 pub fn arm_abs_endstops(arm_endstops: [f64; 2], arm_x: [f64; 2], arm2: [f64; 2]) -> [f64; 2] {
@@ -90,7 +90,7 @@ pub fn arm_abs_endstops(arm_endstops: [f64; 2], arm_x: [f64; 2], arm2: [f64; 2])
 }
 
 /// The X travel the `min_angle` limit allows (`x_kin_min`/`x_kin_max`,
-/// `deltesian.py:59-62`).
+/// `deltesian.py:48-49`).
 pub fn x_kin_limits(min_angle: f64, arm_x: [f64; 2], arm: [f64; 2]) -> (f64, f64) {
     let cos_angle = min_angle.to_radians().cos();
     let x_kin_min = -(arm_x[0].min(cos_angle * arm[1] - arm_x[1])).ceil();
@@ -98,7 +98,7 @@ pub fn x_kin_limits(min_angle: f64, arm_x: [f64; 2], arm: [f64; 2]) -> (f64, f64
     (x_kin_min, x_kin_max)
 }
 
-/// The highest Z the arms allow at `x` (`_pillars_z_max`, `deltesian.py:78-82`).
+/// The highest Z the arms allow at `x` (`_pillars_z_max`, `deltesian.py:103-107`).
 pub fn pillars_z_max(arm_x: [f64; 2], arm2: [f64; 2], abs_endstop: [f64; 2], x: f64) -> f64 {
     let dz = [
         (arm2[0] - (arm_x[0] + x) * (arm_x[0] + x)).sqrt(),
@@ -113,7 +113,7 @@ pub fn pillars_z_max(arm_x: [f64; 2], arm2: [f64; 2], abs_endstop: [f64; 2], x: 
 
 /// What `[printer]` and its `[stepper_left]`/`[stepper_right]`/`[stepper_y]`
 /// sections say about a deltesian machine, as plain numbers the config readers
-/// already bounds-checked (`kinematics/deltesian.py:11-45` reads the same
+/// already bounds-checked (`kinematics/deltesian.py:16-89` reads the same
 /// options).
 #[derive(Debug, Clone)]
 pub struct DeltesianConfig {
@@ -150,16 +150,16 @@ pub struct DeltesianConfig {
 
 /// Deltesian kinematics: two arms placing X/Z, one straight Y rail,
 /// simultaneous arm homing, and an X-dependent Z ceiling
-/// (`DeltesianKinematics`, `kinematics/deltesian.py:11-136`).
+/// (`DeltesianKinematics`, `kinematics/deltesian.py:15-181`).
 #[derive(Debug)]
 pub struct DeltesianKinematics {
     /// Each arm's signed `arm_x` offset (`−left`, `+right`).
     arm_x: [f64; 2],
     /// Each arm's squared length.
     arm2: [f64; 2],
-    /// The Y rail's travel range (`deltesian.py:70`).
+    /// The Y rail's travel range (`deltesian.py:58`).
     y_range: (f64, f64),
-    /// X, Y and Z limits (`deltesian.py:67-76`).
+    /// X, Y and Z limits (`deltesian.py:59-66`).
     limits: [(f64, f64); 3],
     /// The printable box, for `get_status`.
     axes_min: Coord,
@@ -182,14 +182,14 @@ pub struct DeltesianKinematics {
 
 impl DeltesianKinematics {
     /// Build the kinematics from the config's numbers
-    /// (`DeltesianKinematics.__init__`, `deltesian.py:11-86`), mirroring its
+    /// (`DeltesianKinematics.__init__`, `deltesian.py:16-89`), mirroring its
     /// bounds, derived envelope and log line.
     pub fn new(config: DeltesianConfig) -> Self {
         let arm_x = config.arm_x;
         let arm2 = config.arm2;
         let arm = [arm2[0].sqrt(), arm2[1].sqrt()];
 
-        // X axis limits (`deltesian.py:57-69`): the arms' reach at the
+        // X axis limits (`deltesian.py:44-56`): the arms' reach at the
         // `min_angle` limit, optionally centred by `print_width`.
         let (x_kin_min, x_kin_max) = x_kin_limits(config.min_angle, arm_x, arm);
         let mut limits = [(1.0, -1.0); 3];
@@ -197,9 +197,9 @@ impl DeltesianKinematics {
             Some(width) if width != 0.0 => (-width * 0.5, width * 0.5),
             _ => (x_kin_min, x_kin_max),
         };
-        // Y axis limits: the straight rail's own range (`deltesian.py:70`).
+        // Y axis limits: the straight rail's own range (`deltesian.py:58`).
         limits[1] = config.y_range;
-        // Z axis limits (`deltesian.py:71-76`): the carriage Z where both arm
+        // Z axis limits (`deltesian.py:59-66`): the carriage Z where both arm
         // endstops sit, and the arms' highest Z over the X range.
         let abs_endstop = arm_abs_endstops(config.arm_endstops, arm_x, arm2);
         let home_z = Self::actuator_to_cartesian_of(arm_x, arm2, abs_endstop)[1];
@@ -211,7 +211,7 @@ impl DeltesianKinematics {
         ));
         limits[2] = (config.minimum_z_position, z_max);
 
-        // The X edge slowdown (`deltesian.py:78-86`).
+        // The X edge slowdown (`deltesian.py:67-79`).
         let (slow_x2, very_slow_x2) = if config.slow_ratio > 0.0 {
             let sr2 = config.slow_ratio * config.slow_ratio;
             let reach = |scale: f64| {
@@ -255,7 +255,7 @@ impl DeltesianKinematics {
 
     /// The parameters each arm rail's solver is bound with, in rail order
     /// (`setup_itersolve('deltesian_stepper_alloc', arm2[i], ±arm_x[i])`,
-    /// `deltesian.py:30-34`): `(arm2, signed arm_x)`.
+    /// `deltesian.py:36-39`): `(arm2, signed arm_x)`.
     pub fn arm_geometry(&self) -> [(f64, f64); 2] {
         [
             (self.arm2[0], -self.arm_x[0]),
@@ -264,7 +264,7 @@ impl DeltesianKinematics {
     }
 
     /// The carriage `(x, z)` for the two arm actuator positions
-    /// (`_actuator_to_cartesian`, `deltesian.py:45-56`).
+    /// (`_actuator_to_cartesian`, `deltesian.py:92-102`).
     ///
     /// The two arms are trilaterated in the frame along the left-to-right
     /// pivots, then rotated and shifted back.
@@ -288,7 +288,7 @@ impl DeltesianKinematics {
     }
 
     /// The arm group's start Z: below every endstop sphere so the move starts
-    /// on the correct side (`forcepos[2]`, `deltesian.py:99`).
+    /// on the correct side (`forcepos[2]`, `deltesian.py:135`).
     fn arm_force_z(&self) -> f64 {
         let dz2 = [
             self.arm2[0] - self.arm_x[0] * self.arm_x[0],
@@ -297,7 +297,7 @@ impl DeltesianKinematics {
         -1.5 * dz2[0].max(dz2[1]).sqrt()
     }
 
-    /// The two arm rails' home move (`deltesian.py:96-102`): start at `x = 0`
+    /// The two arm rails' home move (`deltesian.py:130-136`): start at `x = 0`
     /// below the bed, end at `x = 0`, `z = home_z`, both arms travelling
     /// together.
     ///
@@ -331,7 +331,7 @@ impl Kinematics for DeltesianKinematics {
             return [None, None, None];
         };
         let [x, z] = self.actuator_to_cartesian([left, right]);
-        // Y is the straight rail's own actuator position (`deltesian.py:45-47`).
+        // Y is the straight rail's own actuator position (`deltesian.py:108-111`).
         let y = stepper_positions.get(DELTESIAN_RAIL_NAMES[2]).copied();
         [Some(x), y, Some(z)]
     }
@@ -341,7 +341,7 @@ impl Kinematics for DeltesianKinematics {
         let spos = *ctx.start_pos();
         let epos = *ctx.end_pos();
         let axes_d = *ctx.axes_d();
-        // Recognize the arm home's final position (`deltesian.py:113-121`).
+        // Recognize the arm home's final position (`deltesian.py:151-153`).
         let mut homing_move = false;
         if epos.x() == 0.0 && epos.z() == self.home_z && axes_d[Y_AXIS] == 0.0 {
             homing_move = true;
@@ -367,7 +367,7 @@ impl Kinematics for DeltesianKinematics {
             let z_ratio = ctx.move_d() / axes_d[Z_AXIS].abs();
             ctx.limit_speed(self.max_z_velocity * z_ratio, self.max_z_accel * z_ratio);
         }
-        // Slow at the extreme ends of X (`deltesian.py:130-135`).
+        // Slow at the extreme ends of X (`deltesian.py:168-174`).
         if axes_d[X_AXIS] != 0.0 {
             if let (Some(slow_x2), Some(very_slow_x2)) = (self.slow_x2, self.very_slow_x2) {
                 let move_x2 = (spos.x() * spos.x()).max(epos.x() * epos.x());
@@ -383,7 +383,7 @@ impl Kinematics for DeltesianKinematics {
 
     fn set_position(&mut self, _newpos: Coord, homing_axes: &[usize]) {
         // The steppers' positions are set centrally by the toolhead; only the
-        // homed flags live here (`deltesian.py:58-62`).
+        // homed flags live here (`deltesian.py:112-117`).
         for axis in homing_axes {
             self.homed_axis[*axis] = true;
         }
@@ -395,7 +395,7 @@ impl Kinematics for DeltesianKinematics {
     }
 
     fn clear_homing_state(&mut self, axes: &[usize]) {
-        // Per-axis, unlike the deltas (`deltesian.py:63-66`).
+        // Per-axis, unlike the deltas (`deltesian.py:118-121`).
         for axis in axes {
             self.homed_axis[*axis] = false;
         }
@@ -416,7 +416,7 @@ impl Kinematics for DeltesianKinematics {
     }
 
     fn home(&mut self, homing: &mut dyn HomingState) {
-        // The two arms home together, then Y (`deltesian.py:88-110`). The
+        // The two arms home together, then Y (`deltesian.py:122-146`). The
         // upstream `set_axes` calls only feed `Homing.changed_axes`, which
         // nothing reads after `home`, so the shape is carried by the
         // `forcepos` entries the driver derives its homed axes from.
@@ -435,7 +435,7 @@ impl Kinematics for DeltesianKinematics {
             let info = homing.homing_info(Y_AXIS);
             let (mut forcepos, mut movepos) =
                 super::kinematics::home_move(Y_AXIS, &info, self.y_range.0, self.y_range.1);
-            // The Y move keeps the arm-homed X/Z (`deltesian.py:102-107`).
+            // The Y move keeps the arm-homed X/Z (`deltesian.py:137-146`).
             if home_xz {
                 forcepos[X_AXIS] = Some(0.0);
                 forcepos[Z_AXIS] = Some(self.home_z);
@@ -529,7 +529,7 @@ mod tests {
     #[test]
     fn test_the_inverse_is_the_upstream_hand_computed_home() {
         // `_actuator_to_cartesian` at the two endstop heights lands on the
-        // origin, `z = 268` (hand-computed from `deltesian.py:45-56`).
+        // origin, `z = 268` (hand-computed from `deltesian.py:92-102`).
         let kin = example_deltesian();
         let abs = arm_abs_endstops([268.0, 268.0], [160.0, 160.0], [217.0 * 217.0; 2]);
         assert!((abs[0] - 268.0 - 146.591_268).abs() < 1e-4, "{abs:?}");
@@ -677,7 +677,7 @@ mod tests {
     fn test_check_move_accepts_the_arm_home_and_the_x_ceiling() {
         let mut kin = example_deltesian();
         // The arm home ends at (0, current_y, home_z), above the Z ceiling at
-        // x=0 — recognized as the homing move (`deltesian.py:117-118`). The
+        // x=0 — recognized as the homing move (`deltesian.py:151-153`). The
         // force position the driver sets first marks X and Z homed.
         kin.set_position(Coord::new(0.0, 0.0, -219.886_903, 0.0), &[X_AXIS, Z_AXIS]);
         let mut move_ = crate::core::klippy::motion::plan::Move::new(

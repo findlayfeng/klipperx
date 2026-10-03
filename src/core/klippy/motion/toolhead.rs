@@ -25,7 +25,7 @@ pub const BUFFER_TIME_START: f64 = 0.250;
 /// (`MCU.estimated_print_time`).
 ///
 /// Upstream asks its `self.mcu` every time it floors the print time
-/// (`_calc_print_time`, `klippy/toolhead.py:260-264`), so the floor follows the
+/// (`_calc_print_time`, `klippy/toolhead.py:260-268`), so the floor follows the
 /// clock. This layer has no MCU, so the object that has one injects a getter at
 /// connect — a **value** rather than a snapshot: a connect-time reading goes
 /// stale by exactly the idle time since (C5 measured it: a machine idle 33 s
@@ -124,7 +124,7 @@ impl ToolHead {
             estimated_print_time: EstimatedPrintTime::default(),
             last_step_gen_time: 0.0,
             // Upstream starts in "NeedPrime" and resyncs the print time on the
-            // first planned move (`klippy/toolhead.py:224`).
+            // first planned move (`klippy/toolhead.py:227`).
             special_queuing_state: true,
             lookahead_depth: 0,
             parked_lookahead: Vec::new(),
@@ -209,7 +209,7 @@ impl ToolHead {
     }
 
     /// The live estimate of the print time *now* — `_flush_handler`'s
-    /// `est_print_time` (`extras/motion_queuing.py:193,196`), read fresh from
+    /// `est_print_time` (`extras/motion_queuing.py:193,195`), read fresh from
     /// the injected source (see [`EstimatedPrintTime`]), never cached.
     pub fn estimated_print_time(&self) -> f64 {
         self.estimated_print_time.get()
@@ -233,7 +233,7 @@ impl ToolHead {
     }
 
     /// Register a lookahead callback (`ToolHead.register_lookahead_callback`,
-    /// `klippy/toolhead.py:526-530`).
+    /// `klippy/toolhead.py:526-531`).
     ///
     /// With the look-ahead empty it fires at once with the last move time;
     /// with moves queued it rides the queue's last move and fires with that
@@ -260,7 +260,7 @@ impl ToolHead {
         self.motion_queuing.register_flush_callback(callback);
     }
 
-    /// Queue a move (`ToolHead.move`, `klippy/toolhead.py:395-408`).
+    /// Queue a move (`ToolHead.move`, `klippy/toolhead.py:395-409`).
     ///
     /// # Errors
     /// A zero-length move is ignored; the kinematics' own `check_move`
@@ -322,7 +322,7 @@ impl ToolHead {
     }
 
     /// Flush the look-ahead into the trapq and advance the print time
-    /// (`ToolHead._process_lookahead`, `klippy/toolhead.py:269-298`).
+    /// (`ToolHead._process_lookahead`, `klippy/toolhead.py:269-299`).
     fn process_lookahead(&mut self) {
         let mut moves = self.lookahead.flush(false);
         if moves.is_empty() {
@@ -370,7 +370,7 @@ impl ToolHead {
                 );
             }
             // The extra axes queue their own trapezoid, on their own trapq
-            // (`klippy/toolhead.py:288-291`).
+            // (`klippy/toolhead.py:290-292`).
             for (index, axis) in self.extra_axes.iter().enumerate() {
                 let ea_index = index + E_AXIS;
                 // Slots past the move's four are skipped, as in `move_to`.
@@ -402,8 +402,8 @@ impl ToolHead {
         self.process_lookahead();
         // Upstream's `flush_step_generation` opens with `_flush_lookahead()`,
         // which leaves the toolhead in "NeedPrime" (`klippy/toolhead.py:317-319`
-        // → `:299-307`), and `_handle_step_flush` returns to it whenever
-        // generation reaches the planner horizon (`:310-317`). Either way the
+        // → `:300-309`), and `_handle_step_flush` returns to it whenever
+        // generation reaches the planner horizon (`:310-316`). Either way the
         // next planned move re-runs `_calc_print_time` against the **live**
         // estimate — without this the state is consumed by the first move ever
         // planned and the print time never re-syncs after an idle (C5: a
@@ -417,10 +417,10 @@ impl ToolHead {
     }
 
     /// Plan everything queued so far (`ToolHead.wait_moves`,
-    /// `klippy/toolhead.py:422-428`): upstream then waits for the MCU to catch
+    /// `klippy/toolhead.py:422-429`): upstream then waits for the MCU to catch
     /// up, which needs the clock estimate and is FW5d's MCU side. What this
     /// host does take from upstream is the `_flush_lookahead` the wait opens
-    /// with (`toolhead.py:299-307`): the toolhead is left in "NeedPrime", so
+    /// with (`toolhead.py:300-309`): the toolhead is left in "NeedPrime", so
     /// the next planned move floors `print_time` at the estimate **of that
     /// moment** instead of chaining from a horizon the clock has long passed
     /// (`M400` is where a replay pauses between segments).
@@ -452,7 +452,7 @@ impl ToolHead {
     }
 
     /// Load one move straight into the trapq, bypassing the look-ahead
-    /// (`ToolHead.drip_move` / `_drip_load_trapq`, `klippy/toolhead.py:459-493`).
+    /// (`ToolHead.drip_move` / `_drip_load_trapq`, `klippy/toolhead.py:459-492`).
     ///
     /// A homing move must not be joined to a previous move — it has to stop on
     /// its own endstop — so this sets its junction speeds to zero (start and end
@@ -506,13 +506,13 @@ impl ToolHead {
     }
 
     /// Wait `delay` seconds without moving (`ToolHead.dwell`,
-    /// `klippy/toolhead.py:417-420`).
+    /// `klippy/toolhead.py:417-421`).
     pub fn dwell(&mut self, delay: f64) {
         self.process_lookahead();
-        // `_flush_lookahead` re-enters "NeedPrime" (`klippy/toolhead.py:299-307`),
+        // `_flush_lookahead` re-enters "NeedPrime" (`klippy/toolhead.py:300-309`),
         // which is what lets the next move re-floor `print_time` against the
         // live estimate; the delay itself is added on top, as upstream does
-        // (`toolhead.py:417-420`).
+        // (`toolhead.py:417-421`).
         self.special_queuing_state = true;
         self.print_time += delay.max(0.0);
     }
@@ -527,7 +527,7 @@ impl ToolHead {
     }
 
     /// Force the toolhead to `newpos`, marking `homing_axes` as homed
-    /// (`ToolHead.set_position`, `klippy/toolhead.py:383-391`).
+    /// (`ToolHead.set_position`, `klippy/toolhead.py:383-390`).
     ///
     /// This is `G92`'s low-level half and `SET_KINEMATIC_POSITION`: the print
     /// time does not move and no steps are generated, but the solver and the
@@ -829,7 +829,7 @@ mod tests {
         // at once).
         *est.lock().unwrap() = 301.0;
         // `set_position` re-enters "NeedPrime" (the re-arm this host already
-        // had, `klippy/toolhead.py:383-391`), so this is a fresh prime — the
+        // had, `klippy/toolhead.py:383-390`), so this is a fresh prime — the
         // only thing under test is *which* estimate it reads.
         toolhead.set_position(Coord::new(10.0, 0.0, 0.0, 0.0), &[0]);
         toolhead
@@ -844,7 +844,7 @@ mod tests {
     }
 
     /// The three re-arm paths upstream's `_flush_lookahead` covers
-    /// (`klippy/toolhead.py:299-307`) — each has to leave the toolhead primed
+    /// (`klippy/toolhead.py:300-309`) — each has to leave the toolhead primed
     /// so the next move re-floors against the live estimate. One test each,
     /// because removing any one of the three re-arms must turn exactly its own
     /// test red.

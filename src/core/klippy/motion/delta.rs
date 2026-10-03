@@ -6,8 +6,8 @@
 //! | upstream | here |
 //! |---|---|
 //! | `delta_stepper_alloc` (`chelper/kin_delta.c:25-41`) | [`delta_position_fn`] / [`delta_active_flags`] |
-//! | `DeltaKinematics` (`klippy/kinematics/delta.py:11-160`) | [`DeltaKinematics`] |
-//! | `DeltaCalibration` (`delta.py:163-241`) + `mathutil.trilateration` | [`DeltaCalibration`] and the shared [`trilateration`] (also the winch kinematics' reverse mapping) |
+//! | `DeltaKinematics` (`klippy/kinematics/delta.py:12-166`) | [`DeltaKinematics`] |
+//! | `DeltaCalibration` (`delta.py:169-238`) + `mathutil.trilateration` | [`DeltaCalibration`] and the shared [`trilateration`] (also the winch kinematics' reverse mapping) |
 //!
 //! **Placement.** The cartesian family lives in [`super::kinematics`]; delta is
 //! a separate file so that family's code stays untouched (the task's
@@ -27,7 +27,7 @@
 //! on the towers intersect at the carriage position (`mathutil.trilateration`).
 //! A "stable position" is steps taken since the endstop hit — a coordinate
 //! independent of the software parameters, which is what `[delta_calibrate]`
-//! stores (`delta_calibrate.py:7-11`).
+//! stores (`delta_calibrate.py:10-13`).
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -43,7 +43,7 @@ use crate::core::klippy::gcode::CommandError;
 use crate::core::klippy::mathutil::{Coord, Z_AXIS};
 
 /// Slow moves once the ratio of tower to XY movement exceeds this
-/// (`SLOW_RATIO`, `delta.py:9`).
+/// (`SLOW_RATIO`, `delta.py:10`).
 const SLOW_RATIO: f64 = 3.;
 
 /// The stepper names the three rails answer to (`'stepper_' + a` for
@@ -93,7 +93,7 @@ pub fn delta_active_flags() -> AxisFlags {
 ///
 /// Shared by the two kinematics that invert a trilateration: delta recovers its
 /// carriage from the three towers, and winch from the first three cable
-/// lengths (`kinematics/winch.py:21-24`) — upstream keeps this one routine in
+/// lengths (`kinematics/winch.py:31-34`) — upstream keeps this one routine in
 /// `mathutil.py:93-113` for both.
 pub(crate) fn trilateration(sphere_coords: [[f64; 3]; 3], radius2: [f64; 3]) -> Option<[f64; 3]> {
     let [c1, c2, c3] = sphere_coords;
@@ -134,12 +134,12 @@ pub(crate) fn trilateration(sphere_coords: [[f64; 3]; 3], radius2: [f64; 3]) -> 
 }
 
 // ===========================================================================
-// DeltaCalibration (delta.py:163-241)
+// DeltaCalibration (delta.py:169-238)
 // ===========================================================================
 
 /// The five parameters `DELTA_CALIBRATE` fits: radius, tower angles, arm
 /// lengths, endstop heights, and the steppers' step distances
-/// (`DeltaCalibration`, `delta.py:163-241`).
+/// (`DeltaCalibration`, `delta.py:169-238`).
 #[derive(Debug, Clone)]
 pub struct DeltaCalibration {
     /// The delta radius, millimetres (`delta_radius`).
@@ -155,7 +155,7 @@ pub struct DeltaCalibration {
 }
 
 impl DeltaCalibration {
-    /// The towers' XY positions (`delta.py:44-46`).
+    /// The towers' XY positions (`delta.py:177-179`).
     pub fn towers(&self) -> [(f64, f64); 3] {
         let mut towers = [(0.0, 0.0); 3];
         for (i, angle) in self.angles.iter().enumerate() {
@@ -165,7 +165,7 @@ impl DeltaCalibration {
         towers
     }
 
-    /// The absolute Z height of each tower's endstop (`delta.py:47-49`).
+    /// The absolute Z height of each tower's endstop (`delta.py:181-183`).
     pub fn abs_endstops(&self) -> [f64; 3] {
         let radius2 = self.radius * self.radius;
         let mut out = [0.0; 3];
@@ -176,7 +176,7 @@ impl DeltaCalibration {
     }
 
     /// The carriage position for actuator (stable-position *plus* endstop)
-    /// coordinates — `_actuator_to_cartesian` (`delta.py:81-84`).
+    /// coordinates — `_actuator_to_cartesian` (`delta.py:93-95`).
     pub fn actuator_to_cartesian(&self, actuator: [f64; 3]) -> Option<[f64; 3]> {
         let towers = self.towers();
         let sphere_coords = [
@@ -197,7 +197,7 @@ impl DeltaCalibration {
     }
 
     /// The stable position (steps since each endstop hit) for a cartesian
-    /// coordinate (`calc_stable_position`, `delta.py:213-222`).
+    /// coordinate (`calc_stable_position`, `delta.py:212-219`).
     pub fn calc_stable_position(&self, coord: [f64; 3]) -> [f64; 3] {
         let towers = self.towers();
         let abs_endstops = self.abs_endstops();
@@ -213,7 +213,7 @@ impl DeltaCalibration {
     }
 
     /// The cartesian coordinate a stable position describes
-    /// (`get_position_from_stable`, `delta.py:202-211`).
+    /// (`get_position_from_stable`, `delta.py:205-211`).
     ///
     /// `None` when the three spheres do not intersect (upstream's
     /// `ValueError` out of `trilateration`).
@@ -241,7 +241,7 @@ impl DeltaCalibration {
     }
 
     /// The adjustable parameters in upstream's `adj_params` order
-    /// (`coordinate_descent_params`, `delta.py:187-199`): `radius`,
+    /// (`coordinate_descent_params`, `delta.py:184-196`): `radius`,
     /// `angle_a`, `angle_b`, `endstop_a/b/c`, and — for an extended
     /// (distance-measured) fit — `arm_a/b/c`.
     ///
@@ -263,7 +263,7 @@ impl DeltaCalibration {
     }
 
     /// Rebuild a calibration from [`Self::descent_params`] values
-    /// (`new_calibration`, `delta.py:200-211`): everything the adjustable set
+    /// (`new_calibration`, `delta.py:197-204`): everything the adjustable set
     /// does not cover carries over from `base`.
     pub fn from_descent_params(base: &Self, values: &[f64], extended: bool) -> Self {
         let mut out = base.clone();
@@ -286,7 +286,7 @@ impl DeltaCalibration {
 
 /// What `[printer]` and its three `[stepper_a/b/c]` sections say about a
 /// delta machine, as plain numbers the config readers already bounds-checked
-/// (`kinematics/delta.py:11-77` reads the same options).
+/// (`kinematics/delta.py:13-90` reads the same options).
 #[derive(Debug, Clone)]
 pub struct DeltaConfig {
     /// `delta_radius`, above 0.
@@ -315,7 +315,7 @@ pub struct DeltaConfig {
 }
 
 /// Linear-delta kinematics: three towers, simultaneous homing, an envelope
-/// that tapers with height (`DeltaKinematics`, `delta.py:11-160`).
+/// that tapers with height (`DeltaKinematics`, `delta.py:12-166`).
 #[derive(Debug)]
 pub struct DeltaKinematics {
     /// The calibration parameters (also `[delta_calibrate]`'s view).
@@ -324,15 +324,15 @@ pub struct DeltaKinematics {
     arm2: [f64; 3],
     /// The towers' XY positions.
     towers: [(f64, f64); 3],
-    /// The cartesian position homing drives to (`delta.py:78-80`).
+    /// The cartesian position homing drives to (`delta.py:58-59`).
     home_position: Coord,
     axes_min: Coord,
     axes_max: Coord,
-    /// The lowest endstop: the build height (`delta.py:75`).
+    /// The lowest endstop: the build height (`delta.py:60-61`).
     max_z: f64,
     /// `minimum_z_position`.
     min_z: f64,
-    /// Above this Z the envelope tapers with radius (`delta.py:76`).
+    /// Above this Z the envelope tapers with radius (`delta.py:63-64`).
     limit_z: f64,
     /// The shortest arm and its square, for the tapered bound.
     min_arm_length: f64,
@@ -346,19 +346,19 @@ pub struct DeltaKinematics {
     max_z_velocity: f64,
     max_z_accel: f64,
     /// `[printer] max_velocity` / `max_accel`: the envelope-slowdown step
-    /// (`delta.py:150-157`).
+    /// (`delta.py:143-150`).
     max_velocity: f64,
     max_accel: f64,
-    /// The XY bound a completed check cached (`delta.py:66/120-159`).
+    /// The XY bound a completed check cached (`delta.py:57/116-152`).
     /// Interior-mutable because `check_move` takes `&self`.
     limit_xy2: Mutex<f64>,
-    /// Whether `G28` still has to run (`delta.py:77`).
+    /// Whether `G28` still has to run (`delta.py:56`).
     need_home: bool,
 }
 
 impl DeltaKinematics {
     /// Build the kinematics from the config's numbers (`DeltaKinematics.__init__`,
-    /// `delta.py:11-160`), mirroring its bounds, derived envelope and log lines.
+    /// `delta.py:13-90`), mirroring its bounds, derived envelope and log lines.
     ///
     /// # Errors
     /// When the three endstops have no common sphere intersection — the home
@@ -377,7 +377,7 @@ impl DeltaKinematics {
         let abs_endstops = cal.abs_endstops();
 
         // Where the machine believes home is: the actuator positions at the
-        // endstops read back as one cartesian point (`delta.py:78-80`).
+        // endstops read back as one cartesian point (`delta.py:58-59`).
         let home_xyz = cal.actuator_to_cartesian(abs_endstops).ok_or_else(|| {
             ConfigError::new(format!(
                 "Unable to compute the delta home position in section 'printer'"
@@ -398,7 +398,7 @@ impl DeltaKinematics {
             .fold(f64::INFINITY, f64::min);
 
         // The point where an XY move could move a tower too fast
-        // (`delta.py:58-73`).
+        // (`delta.py:70-82`).
         let half_min_step_dist = config
             .step_dists
             .iter()
@@ -467,7 +467,7 @@ impl DeltaKinematics {
 
     /// The parameters each rail's solver is bound with, in rail order
     /// (`setup_itersolve('delta_stepper_alloc', arm2, tower_x, tower_y)`,
-    /// `delta.py:50-52`).
+    /// `delta.py:51-52`).
     pub fn tower_geometry(&self) -> [(f64, f64, f64); 3] {
         let mut out = [(0.0, 0.0, 0.0); 3];
         for i in 0..3 {
@@ -477,7 +477,7 @@ impl DeltaKinematics {
     }
 
     /// The calibration view `[delta_calibrate]` takes
-    /// (`get_calibration`, `delta.py:153-160`).
+    /// (`get_calibration`, `delta.py:160-166`).
     pub fn calibration(&self) -> DeltaCalibration {
         self.cal.clone()
     }
@@ -492,7 +492,7 @@ impl DeltaKinematics {
         trilateration(sphere_coords, self.arm2)
     }
 
-    /// The one-piece homing move (`home`, `delta.py:104-110`): start below
+    /// The one-piece homing move (`home`, `delta.py:110-115`): start below
     /// every sphere, end at the home position, all three towers travelling
     /// together.
     fn home_move(&self) -> ([f64; 3], [f64; 3], [f64; 3]) {
@@ -549,7 +549,7 @@ impl Kinematics for DeltaKinematics {
         let end_z = end.z();
         let mut limit_xy2 = self.max_xy2;
         if end_z > self.limit_z {
-            // Higher up, the arm reaches less far out (`delta.py:129-135`).
+            // Higher up, the arm reaches less far out (`delta.py:126-131`).
             let above_z_limit = end_z - self.limit_z;
             let allowed_radius = self.radius
                 - (self.min_arm2 - (self.min_arm_length - above_z_limit).powi(2)).sqrt();
@@ -557,7 +557,7 @@ impl Kinematics for DeltaKinematics {
         }
         if end_xy2 > limit_xy2 || end_z > self.max_z || end_z < self.min_z {
             // Out of range — unless this is the homing move finishing at the
-            // home XY (`delta.py:137-146`).
+            // home XY (`delta.py:132-137`).
             let start = *ctx.start_pos();
             if start.x() != self.home_position.x()
                 || start.y() != self.home_position.y()
@@ -574,7 +574,7 @@ impl Kinematics for DeltaKinematics {
             ctx.limit_speed(self.max_z_velocity * z_ratio, self.max_z_accel * z_ratio);
             limit_xy2 = -1.;
         }
-        // Slow down at the extreme edge of the envelope (`delta.py:150-157`).
+        // Slow down at the extreme edge of the envelope (`delta.py:143-150`).
         let start = *ctx.start_pos();
         let extreme_xy2 = end_xy2.max(start.x() * start.x() + start.y() * start.y());
         if extreme_xy2 > self.slow_xy2 {
@@ -593,7 +593,7 @@ impl Kinematics for DeltaKinematics {
     fn set_position(&mut self, _newpos: Coord, homing_axes: &[usize]) {
         *self.limit_xy2.lock().unwrap_or_else(|p| p.into_inner()) = -1.;
         // Upstream keys off `homing_axes == "xyz"`; all three axes is the only
-        // three-element set there is (`delta.py:96-102`).
+        // three-element set there is (`delta.py:99-104`).
         if homing_axes.len() == 3 {
             self.need_home = false;
         }
@@ -606,7 +606,7 @@ impl Kinematics for DeltaKinematics {
 
     fn clear_homing_state(&mut self, clear_axes: &[usize]) {
         // Clearing homing state is not implemented per axis upstream either —
-        // it drops the whole machine (`delta.py:103-107`).
+        // it drops the whole machine (`delta.py:105-109`).
         if !clear_axes.is_empty() {
             *self.limit_xy2.lock().unwrap_or_else(|p| p.into_inner()) = -1.;
             self.need_home = true;
@@ -623,7 +623,7 @@ impl Kinematics for DeltaKinematics {
     }
 
     fn home(&mut self, homing: &mut dyn HomingState) {
-        // All axes are homed simultaneously (`delta.py:104-110`).
+        // All axes are homed simultaneously (`delta.py:110-115`).
         let (force, target, _) = self.home_move();
         let to_home_coord = |pos: [f64; 3]| -> [Option<f64>; 4] {
             [Some(pos[0]), Some(pos[1]), Some(pos[2]), None]

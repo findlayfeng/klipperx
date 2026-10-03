@@ -20,7 +20,7 @@
 //!
 //! - **`_handle_activate_extruder` is not wired.** Upstream registers a handler
 //!   for `extruder:activate_extruder` that re-anchors `last_epos` when the
-//!   active extruder changes mid-print (`print_stats.py:22-24`). This port's
+//!   active extruder changes mid-print (`print_stats.py:20-22`). This port's
 //!   `extruder.rs` declares the event but does not fire it, so the handler would
 //!   never run. The `last_epos` is only re-anchored at `note_start`; a mid-print
 //!   extruder swap will produce a spurious filament-used spike. Wire the handler
@@ -371,7 +371,7 @@ impl PrinterObject for PrintStats {
     }
 }
 
-/// The factory `section!` names (`print_stats.py:102-103`).
+/// The factory `section!` names (`print_stats.py:124-125`).
 ///
 /// # Errors
 /// An already-registered object, or a g-code name this dispatcher refuses.
@@ -469,7 +469,7 @@ mod tests {
     // -- reset / initial state -------------------------------------------
 
     /// `reset` (and the initial state) match upstream's `reset`
-    /// (`print_stats.py:60-72`).
+    /// (`print_stats.py:90-98`).
     #[test]
     fn reset_sets_all_fields_to_their_initial_values() {
         let (_reactor, _printer, _gcode, object) = machine();
@@ -493,7 +493,7 @@ mod tests {
     // -- set_current_file ------------------------------------------------
 
     /// `set_current_file` resets then sets the filename
-    /// (`print_stats.py:26-28`).
+    /// (`print_stats.py:29-31`).
     #[test]
     fn set_current_file_resets_then_sets_the_filename() {
         let (_reactor, _printer, _gcode, object) = machine();
@@ -512,7 +512,7 @@ mod tests {
     // -- note_start / note_pause / note_complete -------------------------
 
     /// `note_start` sets `state="printing"` and clears `error_message`
-    /// (`print_stats.py:29-39`).
+    /// (`print_stats.py:32-45`).
     #[test]
     fn note_start_sets_state_to_printing() {
         let (_reactor, _printer, _gcode, object) = machine();
@@ -617,7 +617,7 @@ mod tests {
     // -- SET_PRINT_STATS_INFO --------------------------------------------
 
     /// `SET_PRINT_STATS_INFO TOTAL_LAYER=0` clears both layer fields
-    /// (`print_stats.py:77-78`).
+    /// (`print_stats.py:79-81`).
     #[test]
     fn total_layer_zero_clears_both_layer_fields() {
         let (_reactor, _printer, gcode, object) = machine();
@@ -638,7 +638,7 @@ mod tests {
 
     /// A new `TOTAL_LAYER` (different from the current one) resets
     /// `current_layer` to 0 when `CURRENT_LAYER` is also 0
-    /// (`print_stats.py:79-81`). Without an explicit `CURRENT_LAYER`, the
+    /// (`print_stats.py:82-89`). Without an explicit `CURRENT_LAYER`, the
     /// default is the old `info_current_layer`, so the second `if` would set
     /// it back — matching upstream's behavior.
     #[test]
@@ -660,7 +660,7 @@ mod tests {
     /// Without an explicit `CURRENT_LAYER`, a new `TOTAL_LAYER` resets
     /// `info_current_layer` to 0 but the second `if` restores it from the
     /// default — matching upstream's behavior exactly
-    /// (`print_stats.py:79-84`).
+    /// (`print_stats.py:82-89`).
     #[test]
     fn a_new_total_layer_without_current_keeps_the_default_current() {
         let (_reactor, _printer, gcode, object) = machine();
@@ -677,7 +677,7 @@ mod tests {
     }
 
     /// `CURRENT_LAYER` is truncated to `info_total_layer`
-    /// (`print_stats.py:83-84`).
+    /// (`print_stats.py:89`).
     #[test]
     fn current_layer_is_truncated_to_total() {
         let (_reactor, _printer, gcode, object) = machine();
@@ -763,7 +763,7 @@ mod tests {
     }
 
     /// The command is registered with upstream's help text
-    /// (`print_stats.py:71-72`).
+    /// (`print_stats.py:72-73`).
     #[test]
     fn the_command_is_registered_with_upstreams_help_text() {
         let (_reactor, _printer, gcode, _object) = machine();

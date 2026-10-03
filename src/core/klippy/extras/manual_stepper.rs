@@ -235,7 +235,7 @@ impl ManualStepper {
         Ok(())
     }
 
-    /// `_submit_move` (`manual_stepper.py:63-72`) minus the trapq append.
+    /// `_submit_move` (`manual_stepper.py:63-73`) minus the trapq append.
     ///
     /// Returns the print time the move ends at. The trapezoid is *not* queued
     /// (see the module docs); only the time and `commanded_pos` advance.

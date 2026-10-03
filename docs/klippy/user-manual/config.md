@@ -895,10 +895,10 @@ cartesian 在 late 阶段认领；注册 `dual_carriage` 对象与 `SET_DUAL_CAR
 | `i2c_mcu` / `i2c_bus` / `i2c_address` | I2C 组（`setup_i2c` 共享读取） |
 | `sensor_type` | 传感器类型（语料 `eddy`） |
 | `z_offset` | 探针 Z 偏移 |
-| `calibrate` | 静态标定开关（`enable`/`enable_with_touch`；**实现未接——调用显式报错**，见模块残差注记） |
+| `calibrate` | 静态标定开关（`enable`/`enable_with_touch`；**已接**——2026-10-03 `4caf425` 由 `PROBE_EDDY_CURRENT_CALIBRATE` 生成，`Z_OFFSET_APPLY_PROBE METHOD=tap` 写回 `tap_z_offset`） |
 | 采样组（`samples`/`sample_retract_dist`/`samples_tolerance`/`lift_speed`…） | 由 probe/`ProbePointsHelper` 读取 |
 
-段与对象已落地（2026-09-24 批 #3，`eddy.test` 转绿）；**同名 section 按上游 `strict=False` 后写覆盖合并**（本仓自 2026-09-24 起，eddy.cfg 双段即其用例）。静态标定与 `PROBE_EDDY_CURRENT_CALIBRATE`/`Z_OFFSET_APPLY_PROBE` 未实现（模块残差注记）。
+段与对象已落地（2026-09-24 批 #3，`eddy.test` 转绿）；**同名 section 按上游 `strict=False` 后写覆盖合并**（本仓自 2026-09-24 起，eddy.cfg 双段即其用例）。静态标定与 `PROBE_EDDY_CURRENT_CALIBRATE`/`Z_OFFSET_APPLY_PROBE` 已实现（2026-10-03，`4caf425`）。
 
 > 配置解析补充（批 #5）：除同名 section 合并外，`#*# SAVE_CONFIG` 自动保存块按上游 `_find_autosave_data` **读取合并**（header 逐字节识别、`#*# ` 前缀剥离、正文优先/块只补新、损坏行告警）——语料 `delta_calibrate.cfg` 的双段与高度数据即其用例（回写侧 `SAVE_CONFIG` 命令把待写项写回文件并重启）。
 

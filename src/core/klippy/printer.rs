@@ -276,7 +276,7 @@ struct Inner {
     host_objects: Option<usize>,
     /// Why the current bring-up is happening: the result `run` returned before a
     /// restart, or `None` for the first start. Upstream keeps the same fact in
-    /// the printer's start args (`klippy/klippy.py:283`), and the MCU restart
+    /// the printer's start args (`klippy/klippy.py:288`), and the MCU restart
     /// reads it to decide whether to reset the firmware (`mcu/restart.rs`).
     start_reason: Option<String>,
     /// The toolhead's restart handle, registered by it at connect.
@@ -601,7 +601,7 @@ impl Printer {
 
     /// Look up one registered object, reporting a config error when absent
     /// (upstream's `lookup_object` with no default: `Unknown config object
-    /// 'x'`, `klippy/klippy.py:79-82`).
+    /// 'x'`, `klippy/klippy.py:75-80`).
     ///
     /// # Errors
     /// Returns [`ConfigError`] naming the object when nothing registered it.

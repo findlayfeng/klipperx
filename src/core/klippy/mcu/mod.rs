@@ -189,7 +189,7 @@ const MIN_REQTIME_DELTA: f64 = 0.100;
 /// a "Move queue overflow" (`basecmd.c:85-90`). The estimate is re-anchored at
 /// every clock round trip's midpoint (`ClockEstimate::record`), so its error
 /// is bounded by one sample's placement and the fitted rate — a few ms, the
-/// order of upstream's `TRANSMIT_EXTRA = .001` (`clocksync.py:130`); 20 ms
+/// order of upstream's `TRANSMIT_EXTRA = .001` (`clocksync.py:10`); 20 ms
 /// covers that with margin to spare. The other direction (estimate running
 /// slow) only makes the host wait out this same 20 ms, and it has to stay an
 /// order below upstream's `MIN_SCHEDULE_TIME = 0.100` (`mcu.py:13`) — the
@@ -2230,7 +2230,7 @@ impl Mcu {
     }
 
     /// Convert seconds to firmware clock ticks, as upstream's
-    /// `MCU.seconds_to_clock` (`klippy/mcu.py:1140`).
+    /// `MCU.seconds_to_clock` (`klippy/mcu.py:1184-1185`).
     ///
     /// # Errors
     /// As [`Mcu::clock_freq`].
@@ -2280,7 +2280,7 @@ impl Mcu {
     /// [`Mcu::estimated_clock`]: the host instants that bracket the exchange
     /// and the 64-bit clock the answer reported — the three numbers upstream's
     /// serial queue stamps on every message and its clock sync consumes
-    /// (`klippy/clocksync.py:68-99`).
+    /// (`klippy/clocksync.py:68-100`).
     ///
     /// The sample joins the fit window (its oldest member is pushed out past
     /// `CLOCK_FIT_WINDOW`) and becomes the extrapolation anchor, at its round
@@ -2348,7 +2348,7 @@ impl Mcu {
     /// stays pinned to the wall and messages wait out the print horizon in
     /// real seconds). Upstream likewise never validates message scheduling
     /// against the corpus: its file output short-circuits those waits
-    /// (`is_fileoutput`, e.g. `klippy/mcu.py:401-405`). Production links —
+    /// (`is_fileoutput`, e.g. `klippy/mcu.py:403-404`). Production links —
     /// and the `FrameMock` unit tests — keep the gates; nothing sets the flag
     /// there.
     pub(crate) fn open_send_gates(&self) {
@@ -2844,7 +2844,7 @@ impl Mcu {
     ///
     /// Upstream ends a restart's old connection the same way:
     /// `MCURestartHelper._restart_via_command` sends `reset`, pauses 15 ms,
-    /// then calls `self._disconnect()` (`klippy/mcu.py:729-747`) — the
+    /// then calls `self._disconnect()` (`klippy/mcu.py:730-747`) — the
     /// disconnect is a step of its own, not a consequence of reference
     /// counting. This host needs the same because handles outlive the session
     /// that used them: the chip's device slot and the clock estimate's

@@ -278,7 +278,7 @@ impl StepperState {
         let dir_number = pin_number(mcu, &pins.resolve_pin(chip_name, &dir_pin.pin)?, chip_name)?;
         // The pulse width is written in seconds in the config and becomes clock
         // ticks here, where the firmware frequency is known
-        // (`MCU.seconds_to_clock`, `klippy/mcu.py:1140`).
+        // (`MCU.seconds_to_clock`, `klippy/mcu.py:1184-1185`).
         let step_pulse_ticks = mcu.seconds_to_clock(step_pulse_duration.max(0.0))? as u32;
         let oid = builder.create_oid()?;
         *self.oid.lock().unwrap_or_else(|poison| poison.into_inner()) = Some(oid);

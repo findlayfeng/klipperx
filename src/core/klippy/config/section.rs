@@ -26,7 +26,7 @@ pub struct ConfigSection {
     /// close enough until the parser preserves insertion order.
     pub parameters: BTreeMap<String, ConfigValue>,
     /// Option names the `SAVE_CONFIG` block contributed to this section, lowercased
-    /// (upstream's `autosave_options`, `klippy/configfile.py:416-422`).
+    /// (upstream's `autosave_options`, `klippy/configfile.py:416-423`).
     /// [`check_unused`](super::check_unused) exempts them: the block wrote them,
     /// so they are not undefined options even when no section reads them.
     pub(crate) autosave_options: BTreeSet<String>,

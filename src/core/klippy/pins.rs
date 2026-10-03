@@ -270,7 +270,7 @@ pub type AdcCallback = Box<dyn Fn(&[(u64, f64)]) + Send + Sync>;
 
 /// An analog input resource.
 ///
-/// Upstream's `MCU_adc` (`klippy/mcu.py:555-655`). A consumer configures the
+/// Upstream's `MCU_adc` (`klippy/mcu.py:555-648`). A consumer configures the
 /// sampling and installs a callback; the firmware then pushes batches after the
 /// query is armed at init.
 pub trait Adc: Send + Sync {
@@ -297,7 +297,7 @@ pub trait Adc: Send + Sync {
 /// The chip (MCU) side of pin setup.
 ///
 /// Upstream's `MCU.setup_pin` dispatches on the pin type to `MCU_digital_out`,
-/// `MCU_pwm`, `MCU_adc` or `MCU_endstop` (`klippy/mcu.py:1111-1116`). Here the
+/// `MCU_pwm`, `MCU_adc` or `MCU_endstop` (`klippy/mcu.py:1111-1117`). Here the
 /// dispatch is one method per resource kind, added with the kinds; only
 /// `digital_out` exists so far.
 pub trait PinChip: Send + Sync + Any {
@@ -747,7 +747,7 @@ impl PrinterPins {
     /// `chip` is what builds resources on its behalf.
     ///
     /// Upstream's `register_chip(chip_name, chip)` stores the MCU object, which
-    /// `setup_pin` then dispatches to (`klippy/pins.py:126-130`).
+    /// `setup_pin` then dispatches to (`klippy/pins.py:126-131`).
     ///
     /// # Errors
     /// Returns [`PinError::DuplicateChip`] if the name is taken.

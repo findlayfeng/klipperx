@@ -400,7 +400,7 @@ fn connect_error(mcu: &Mcu, err: McuError) -> McuError {
 
 /// What the firmware reported about itself, as one DEBUG record.
 ///
-/// The shape upstream's `MCUConnectHelper.log_info` prints (`klippy/mcu.py:845`):
+/// The shape upstream's `MCUConnectHelper.log_info` prints (`klippy/mcu.py:830-840`):
 /// the version pair, how many messages the firmware declared, and its
 /// compile-time constants. Constants are sorted because they arrive in a
 /// `HashMap`, which has no order — two runs of the same firmware should read the

@@ -256,7 +256,7 @@ impl PwmOut for McuPwm {
 impl PwmState {
     /// The build-time half: resolve the pin and add the configuration.
     ///
-    /// Upstream's `MCU_pwm._build_config` (`klippy/mcu.py:475-527`).
+    /// Upstream's `MCU_pwm._build_config` (`klippy/mcu.py:480-530`).
     fn build(
         &self,
         builder: &ConfigBuilder,

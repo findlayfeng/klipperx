@@ -53,7 +53,7 @@ pub struct Config {
     sections: section::ConfigSectionMap,
     /// The `SAVE_CONFIG` block parsed on its own — after `_strip_duplicates`
     /// and before the merge — which is exactly upstream's
-    /// `ConfigAutoSave.fileconfig` (`klippy/configfile.py:305`): the block a
+    /// `ConfigAutoSave.fileconfig` (`klippy/configfile.py:304`): the block a
     /// `SAVE_CONFIG` writes back. `None` when the file has no block. Boxed so
     /// the option stays a sized member of `Config`.
     autosave: Option<Box<Config>>,
@@ -691,7 +691,7 @@ fn merge_autosave(body: &mut Config, saved: &Config) {
 // ---------------------------------------------------------------------------
 
 /// Serialize a config's sections to plain ini text, upstream's
-/// `build_config_string` (`configfile.py:210-226`): `[identifier]`, one
+/// `build_config_string` (`configfile.py:152-155`): `[identifier]`, one
 /// `option = value` line per parameter, and a blank line closing each
 /// section. A multi-line value's continuation lines are indented with a tab,
 /// exactly as `configparser.write` leaves them (`'\n'` → `'\n\t'`), so the

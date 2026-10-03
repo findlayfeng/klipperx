@@ -41,7 +41,7 @@ use tracing::warn;
 const OLD_QUERY: &str = "query_analog_in oid=%c clock=%u sample_ticks=%u sample_count=%c \
                          rest_ticks=%u min_value=%hu max_value=%hu range_check_count=%c";
 
-/// The most samples one report may batch (`48 // 2`, `klippy/mcu.py:581`).
+/// The most samples one report may batch (`48 // 2`, `klippy/mcu.py:576`).
 const MAX_BATCH_NUM: u32 = 24;
 
 /// Per-oid routing for `analog_in_state`, one per MCU.
@@ -274,7 +274,7 @@ impl AdcState {
 
     /// The build-time half: resolve the pin and add the configuration/query.
     ///
-    /// Upstream's `MCU_adc._build_config` (`klippy/mcu.py:585-655`).
+    /// Upstream's `MCU_adc._build_config` (`klippy/mcu.py:584-630`).
     fn build(
         self: &Arc<Self>,
         builder: &ConfigBuilder,

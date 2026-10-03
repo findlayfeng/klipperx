@@ -3804,7 +3804,7 @@ calibration_bed_temp: 60
         );
     }
 
-    /// `_collect_sample`'s split (`temperature_probe.py:178`): the sensor's
+    /// `_collect_sample`'s split (`temperature_probe.py:164-177`): the sensor's
     /// reading with no helper, the helper's sweep with one — which here stops
     /// at the probe lookup, since no `probe_eddy_current` object is on this
     /// machine.

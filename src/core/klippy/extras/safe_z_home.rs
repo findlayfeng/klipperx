@@ -1,5 +1,5 @@
 //! `[safe_z_home]` — home Z at a chosen XY position
-//! (upstream `klippy/extras/safe_z_home.py:7 def load_config`).
+//! (upstream `klippy/extras/safe_z_home.py:92-93 def load_config`).
 //!
 //! | option | default | role |
 //! |---|---|---|
@@ -452,7 +452,7 @@ impl PrinterObject for SafeZHoming {
     }
 }
 
-/// The factory `section!` names (`safe_z_home.py:91-92 def load_config`).
+/// The factory `section!` names (`safe_z_home.py:92-93 def load_config`).
 pub fn load_config(
     config: &ConfigWrapper,
     printer: &Arc<Printer>,
@@ -991,7 +991,7 @@ mod tests {
     }
 
     /// After homing Z at the safe position, Z is hopped again when it ended up
-    /// below `z_hop` (`safe_z_home.py:80-84`).
+    /// below `z_hop` (`safe_z_home.py:83-87`).
     #[tokio::test]
     async fn test_z_is_hopped_again_after_homing() {
         let options = options(10.0, false);

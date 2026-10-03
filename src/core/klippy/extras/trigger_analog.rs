@@ -31,7 +31,7 @@ const MAX_INT32: f64 = 2_147_483_647.0;
 const MIN_INT32: f64 = -2_147_483_648.0;
 
 /// Upstream's `OverflowError("Fixed point Q%d.%d overflow" …)`
-/// (`trigger_analog.py:16-18`), raised when [`to_fixed_32`] cannot keep a
+/// (`trigger_analog.py:16-26`), raised when [`to_fixed_32`] cannot keep a
 /// value inside a signed 32-bit word.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FixedPointOverflow {
@@ -169,7 +169,7 @@ static GENERATED_SOS: &[(&str, f64, u32, &[[f64; 6]])] = &[
 ];
 
 /// Look a design up in [`GENERATED_SOS`] (upstream's `GeneratedSOS.get`
-/// through `_butter`, `trigger_analog.py:96-101`).
+/// through `_butter`, `trigger_analog.py:104-110`).
 ///
 /// # Errors
 /// None: a miss is the caller's signal to reach for SciPy.
@@ -238,7 +238,7 @@ impl DigitalFilter {
         Ok(())
     }
 
-    /// Add a second-order IIR notch (`add_notch`, `trigger_analog.py:88-94`).
+    /// Add a second-order IIR notch (`add_notch`, `trigger_analog.py:91-96`).
     ///
     /// Upstream asks SciPy for `iirnotch(notch_freq, Q, fs=sps)` and takes the
     /// single `tf2sos` section; the closed form here is exactly that pair of
@@ -333,7 +333,7 @@ impl DigitalFilter {
     }
 
     /// Render the initial state as fixed-point words
-    /// (`MCU_SosFilter._convert_state`, `trigger_analog.py:194-211`): each
+    /// (`MCU_SosFilter._convert_state`, `trigger_analog.py:196-212`): each
     /// state value scaled by `start_value`, converted with no fractional bits.
     ///
     /// # Errors

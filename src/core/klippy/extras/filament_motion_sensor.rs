@@ -47,7 +47,7 @@ section!(
 const MCU_OBJECT: &str = "mcu";
 
 /// The extruder a motion sensor watches, once resolved by name
-/// (`printer.lookup_object(self.extruder_name)`, `filament_motion_sensor.py:40`).
+/// (`printer.lookup_object(self.extruder_name)`, `filament_motion_sensor.py:46`).
 enum ExtruderSource {
     /// A `[extruder]` (upstream's `PrinterExtruder`, an `ExtraAxis`).
     Extruder(Arc<PrinterExtruder>),
@@ -76,7 +76,7 @@ impl ExtruderSource {
 }
 
 /// One `[filament_motion_sensor <name>]` (upstream `EncoderSensor`,
-/// `filament_motion_sensor.py:11-75`).
+/// `filament_motion_sensor.py:11-74`).
 pub struct EncoderSensor {
     /// The section suffix (`runout_encoder`), upstream's object name.
     name: String,
@@ -213,7 +213,7 @@ impl EncoderSensor {
         }
     }
 
-    /// Upstream's `_handle_ready` (`filament_motion_sensor.py:39-45`): resolve
+    /// Upstream's `_handle_ready` (`filament_motion_sensor.py:45-51`): resolve
     /// the watched extruder and the MCU clock, then seed the runout position.
     ///
     /// A name that does not resolve is left unset (upstream raises); ready
@@ -246,13 +246,13 @@ impl EncoderSensor {
         self.update_filament_runout_pos(None);
     }
 
-    /// Upstream's `_update_filament_runout_pos` (`filament_motion_sensor.py:31-36`).
+    /// Upstream's `_update_filament_runout_pos` (`filament_motion_sensor.py:39-44`).
     fn update_filament_runout_pos(&self, eventtime: Option<f64>) {
         let pos = self.extruder_pos(eventtime);
         *self.lock(&self.filament_runout_pos) = Some(pos + self.detection_length);
     }
 
-    /// Upstream's `_get_extruder_pos` (`filament_motion_sensor.py:55-58`): the
+    /// Upstream's `_get_extruder_pos` (`filament_motion_sensor.py:58-62`): the
     /// position at the print time the MCU clock implies.
     fn extruder_pos(&self, eventtime: Option<f64>) -> f64 {
         let now = eventtime.unwrap_or_else(|| self.now());

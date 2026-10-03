@@ -492,7 +492,7 @@ mod tests {
 
         let err = block_on(hf.connect()).unwrap_err();
 
-        // `heaters.py:288` — `Unknown heater '%s'`.
+        // `heaters.py:291` — `Unknown heater '%s'`.
         assert!(
             err.to_string().contains("Unknown heater 'no_such_heater'"),
             "{err}"

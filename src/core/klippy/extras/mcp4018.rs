@@ -58,7 +58,7 @@ const DEFAULT_SCALE: f64 = 1.0;
 /// The lowest clock upstream accepts (its `minval` for `i2c_speed`).
 const MIN_SPEED: u32 = 100_000;
 
-/// Upstream's `cmd_SET_DIGIPOT_help` (`mcp4018.py:25`).
+/// Upstream's `cmd_SET_DIGIPOT_help` (`mcp4018.py:28`).
 const CMD_SET_DIGIPOT_HELP: &str = "Set digipot value";
 
 /// One configured `[mcp4018 <name>]`.
@@ -267,7 +267,7 @@ impl Mcp4018 {
         }
     }
 
-    /// Upstream's `set_dac` (`mcp4018.py:22-24`): one tap, one byte.
+    /// Upstream's `set_dac` (`mcp4018.py:25-27`): one tap, one byte.
     ///
     /// # Errors
     /// The bus error [`McuI2c::write`] reports; a NACK stops the machine, as
@@ -306,7 +306,7 @@ fn read_wiper(gcmd: &GcodeCommand, scale: f64) -> Result<Option<f64>, CommandErr
     Ok(Some(gcmd.get_float_range("WIPER", 0.0, scale)?))
 }
 
-/// The line `SET_DIGIPOT` reports after a write (`mcp4018.py:30-31`).
+/// The line `SET_DIGIPOT` reports after a write (`mcp4018.py:33-34`).
 fn wiper_response(name: &str, wiper: f64) -> String {
     format!("New value for DIGIPOT = {name}, wiper = {wiper:.2}")
 }
@@ -726,7 +726,7 @@ mod tests {
 
     #[test]
     fn test_the_reply_names_the_section_and_the_value() {
-        // `"New value for DIGIPOT = %s, wiper = %.2f"` (`mcp4018.py:30-31`):
+        // `"New value for DIGIPOT = %s, wiper = %.2f"` (`mcp4018.py:33-34`):
         // two decimals.
         assert_eq!(
             wiper_response("x_axis_pot", 0.50),

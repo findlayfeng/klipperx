@@ -13,7 +13,7 @@
 //! move the probe fires `probe:update_results` with the result it is about to
 //! report, this section adds the interpolated `z_compensations` / `zy_*` value
 //! for the probed X (and Y), and the probe reports the adjusted Z
-//! (`axis_twist_compensation.py:57-86`, `probe.py:329`).
+//! (`axis_twist_compensation.py:54-74`, `probe.py:329`).
 //!
 //! # Port scope
 //!
@@ -211,7 +211,7 @@ fn lerp(t: f64, v0: f64, v1: f64) -> f64 {
 }
 
 /// The compensation at `coord` along one curve
-/// (`_get_interpolated_z_compensation`, `axis_twist_compensation.py:88-105`).
+/// (`_get_interpolated_z_compensation`, `axis_twist_compensation.py:76-92`).
 ///
 /// The curve is a piecewise-linear function over
 /// `[comp_start, comp_end]`; a coordinate outside the range clamps to the end
@@ -242,7 +242,7 @@ fn interpolated_z_compensation(
 }
 
 /// Add the interpolated compensation to every probed Z
-/// (`_update_z_compensation_value`, `axis_twist_compensation.py:57-86`).
+/// (`_update_z_compensation_value`, `axis_twist_compensation.py:54-74`).
 ///
 /// The X curve reads the probed X, the Y curve the probed Y; a curve without
 /// its `compensation_start_*` / `compensation_end_*` extent is skipped, since
@@ -348,7 +348,7 @@ impl Calibrater {
         Ok(())
     }
 
-    /// `clear_compensations` (`axis_twist_compensation.py:107-113`).
+    /// `clear_compensations` (`axis_twist_compensation.py:94-101`).
     fn clear_compensations(&self, axis: Option<&str>) {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         match axis {
@@ -437,7 +437,7 @@ impl Calibrater {
     }
 
     /// Probe one point, then hand over to the manual probe
-    /// (`_calibration`, `axis_twist_compensation.py:236-283`).
+    /// (`_calibration`, `axis_twist_compensation.py:259-287`).
     async fn probe_point(
         self: &Arc<Self>,
         gcmd: &GcodeCommand,
@@ -557,7 +557,7 @@ impl Calibrater {
         });
     }
 
-    /// `_finalize_calibration` (`axis_twist_compensation.py:284-345`): average
+    /// `_finalize_calibration` (`axis_twist_compensation.py:312-356`): average
     /// the offsets, fold the average out, write the curve back and store it.
     fn finalize(self: &Arc<Self>) {
         let Some(printer) = self.printer.upgrade() else {
@@ -773,7 +773,7 @@ impl PrinterObject for AxisTwistCompensation {
         false
     }
 
-    /// `Calibrater._handle_connect` (`axis_twist_compensation.py:116-122`):
+    /// `Calibrater._handle_connect` (`axis_twist_compensation.py:132-137`):
     /// a `[probe]` section is required.
     fn connect<'a>(&'a self) -> ConnectFuture<'a> {
         Box::pin(async move {
@@ -940,7 +940,7 @@ compensation_end_y: 195
 
     /// A two-point curve is a straight line through its endpoints, and a
     /// coordinate outside the extent clamps to the near segment
-    /// (`axis_twist_compensation.py:88-105`, upstream's `bed_mesh.constrain`).
+    /// (`axis_twist_compensation.py:76-92`, upstream's `bed_mesh.constrain`).
     #[test]
     fn a_two_point_curve_interpolates_and_clamps() {
         let curve = [0.0, 0.4];
@@ -978,7 +978,7 @@ compensation_end_y: 195
 
     /// The X curve reads the probed X and the Y curve the probed Y; both add to
     /// the probed Z (`_update_z_compensation_value`,
-    /// `axis_twist_compensation.py:57-86`).
+    /// `axis_twist_compensation.py:54-74`).
     #[test]
     fn the_curves_add_to_the_probed_z() {
         let state = Compensations {
@@ -1044,7 +1044,7 @@ compensation_end_y: 195
     }
 
     /// The probe result event carries a shared result the section edits in
-    /// place — the seam `probe.py:329` uses (`axis_twist_compensation.py:57-86`).
+    /// place — the seam `probe.py:329` uses (`axis_twist_compensation.py:54-74`).
     #[test]
     fn the_result_handler_edits_the_shared_result_in_place() {
         let printer = Arc::new(Printer::new(ManualReactor::shared()));

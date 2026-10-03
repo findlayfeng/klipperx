@@ -24,7 +24,7 @@
 //!   (`pwm_tool.py:147-151`); the resource re-checks both figures at build
 //!   (`PinError::PwmCycleTimeTooLarge` / `PwmMaxDurationTooLarge`).
 //! * With a `maximum_mcu_duration` set, upstream requires `value` and
-//!   `shutdown_value` to match (`pwm_tool.py:83-86`); the firmware build makes
+//!   `shutdown_value` to match (`pwm_tool.py:52-54`); the firmware build makes
 //!   the same demand (`PinError::MaxDurationMismatch`), at build rather than
 //!   load time.
 //!

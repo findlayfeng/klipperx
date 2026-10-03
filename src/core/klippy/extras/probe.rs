@@ -2013,7 +2013,7 @@ mod probe_points_tests {
         assert!(!helper.use_offsets.load(Ordering::SeqCst));
         assert_eq!(helper.get_lift_speed(), 50.0);
 
-        // `speed` is `above=0.` (`probe.py:441`).
+        // `speed` is `above=0.` (`probe.py:438`).
         section
             .parameters
             .insert("speed".to_string(), ConfigValue::Single("0".into()));

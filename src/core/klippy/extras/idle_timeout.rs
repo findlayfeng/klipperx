@@ -173,7 +173,7 @@ impl Default for Machine {
 
 /// What the timeout state machine asks of the toolhead: upstream's
 /// `toolhead.check_busy` (`toolhead.py:500-502`) and
-/// `toolhead.get_last_move_time` (`toolhead.py:501`).
+/// `toolhead.get_last_move_time` (`toolhead.py:320-326`).
 ///
 /// The trait is the seam: the production implementor is `MotionToolhead`,
 /// and a test drives the state machine with a stand-in instead of a motion

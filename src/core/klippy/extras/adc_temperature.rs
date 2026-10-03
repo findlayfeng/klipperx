@@ -673,7 +673,7 @@ fn sensor_adc(config: &ConfigWrapper, printer: &Arc<Printer>) -> Result<Arc<dyn 
 
 /// Bridge between MCU ADC and heater temperature callback.
 ///
-/// Upstream's `PrinterADCtoTemperature` (`klippy/extras/adc_temperature.py:17`):
+/// Upstream's `PrinterADCtoTemperature` (`klippy/extras/adc_temperature.py:19-41`):
 /// it owns the ADC resource for the section's `sensor_pin`, converts each report
 /// with the [`Convert`] it was given, and forwards the temperature to the
 /// heater's callback.

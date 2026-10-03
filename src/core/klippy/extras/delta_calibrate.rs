@@ -17,7 +17,7 @@
 //! The math is upstream's: stable positions and trilateration come from
 //! [`DeltaCalibration`](crate::core::klippy::motion::delta::DeltaCalibration),
 //! the measurement geometry from `measurements_to_distances`
-//! (`delta_calibrate.py:32-66`), the fit from `mathutil.coordinate_descent`
+//! (`delta_calibrate.py:35-71`), the fit from `mathutil.coordinate_descent`
 //! (already in [`coordinate_descent`](crate::core::klippy::mathutil)).
 //!
 //! What is deliberately not here: running the fit in a background process
@@ -90,7 +90,7 @@ type HeightPosition = (f64, Stable);
 type Distance = (f64, Stable, Stable);
 
 /// `[delta_calibrate]`: the probe helper, the saved measurements, and the
-/// running `DELTA_ANALYZE` entry (`DeltaCalibrate`, `delta_calibrate.py:69-160`).
+/// running `DELTA_ANALYZE` entry (`DeltaCalibrate`, `delta_calibrate.py:78-284`).
 pub struct DeltaCalibrate {
     /// The machine, for the commands, the toolhead and the configfile object.
     printer: Weak<Printer>,
@@ -115,7 +115,7 @@ pub struct DeltaCalibrate {
 impl DeltaCalibrate {
     /// Read the section, wire the probe helper, restore the saved
     /// measurements, and register both commands
-    /// (`DeltaCalibrate.__init__`, `delta_calibrate.py:73-123`).
+    /// (`DeltaCalibrate.__init__`, `delta_calibrate.py:79-126`).
     ///
     /// # Errors
     /// A malformed option, fewer than three probe points, or a command name
@@ -377,8 +377,8 @@ impl DeltaCalibrate {
         Ok(())
     }
 
-    /// Store the fit for `SAVE_CONFIG` (`save_state`, `delta_calibrate.py:135-160`,
-    /// plus `DeltaCalibration.save_state`, `delta.py:223-240`).
+    /// Store the fit for `SAVE_CONFIG` (`save_state`, `delta_calibrate.py:132-154`,
+    /// plus `DeltaCalibration.save_state`, `delta.py:220-238`).
     fn save_state(
         &self,
         probe_positions: &[HeightPosition],
@@ -616,7 +616,7 @@ pub fn load_config(
 // ===========================================================================
 
 /// Load a stable position from a config entry (`load_config_stable`,
-/// `delta_calibrate.py:14-15`): three floats on one line.
+/// `delta_calibrate.py:16-17`): three floats on one line.
 ///
 /// # Errors
 /// When the option is missing (the entry it belongs to is incomplete) or a
@@ -691,7 +691,7 @@ fn format_stable_height(height: f64) -> String {
 }
 
 // ===========================================================================
-// measurements_to_distances (delta_calibrate.py:32-66)
+// measurements_to_distances (delta_calibrate.py:35-71)
 // ===========================================================================
 
 /// Convert distance measurements made on the calibration object into

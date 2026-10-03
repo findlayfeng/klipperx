@@ -77,12 +77,12 @@ async fn debug_read(mcu: &Mcu, order: u8, addr: u32) -> Result<u32, McuError> {
     Ok(result.val)
 }
 
-/// Upstream's `read16` (`klippy/extras/temperature_mcu.py:104`).
+/// Upstream's `read16` (`klippy/extras/temperature_mcu.py:169-171`).
 async fn read16(mcu: &Mcu, addr: u32) -> Result<f64, McuError> {
     Ok(f64::from(debug_read(mcu, 1, addr).await?))
 }
 
-/// Upstream's `read32` (`klippy/extras/temperature_mcu.py:107`).
+/// Upstream's `read32` (`klippy/extras/temperature_mcu.py:172-174`).
 async fn read32(mcu: &Mcu, addr: u32) -> Result<u32, McuError> {
     debug_read(mcu, 2, addr).await
 }
@@ -93,7 +93,7 @@ async fn read32(mcu: &Mcu, addr: u32) -> Result<u32, McuError> {
 
 /// The calibration for `model` (the dictionary's `MCU` constant).
 ///
-/// Ports upstream's `config_*` helpers (`klippy/extras/temperature_mcu.py:92-190`).
+/// Ports upstream's `config_*` helpers (`klippy/extras/temperature_mcu.py:92-167`).
 /// The model prefixes are tested in upstream's order, so e.g. `stm32f103xe`
 /// matches `stm32f1` and not a shorter key.
 ///

@@ -621,7 +621,7 @@ async fn cmd_set_temperature(
 /// The `[extruder]` factory: build the primary and its numbered siblings.
 ///
 /// Upstream's `kinematics.extruder.add_printer_objects` loops `extruder`,
-/// `extruder1`… (`kinematics/extruder.py:314-320`); here the numbered sections
+/// `extruder1`… (`kinematics/extruder.py:310-319`); here the numbered sections
 /// are read through the primary's wrapper and registered by hand.
 pub(crate) fn load_config(
     config: &ConfigWrapper,

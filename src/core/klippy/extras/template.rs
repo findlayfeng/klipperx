@@ -1,7 +1,7 @@
 //! A `minijinja`-backed adapter for the macro bodies of `gcode_macro`.
 //!
 //! Upstream renders every macro body with `jinja2.Environment('{%', '%}', '{',
-//! '}')` (`klippy/extras/gcode_macro.py:82`) — the variable delimiters are
+//! '}')` (`klippy/extras/gcode_macro.py:83`) — the variable delimiters are
 //! **single braces**, which is why the corpus writes `{params.P}` rather than
 //! `{{ params.P }}` — and `TemplateWrapper` (`:46-79`) compiles the body at
 //! load and renders it against `create_template_context` (`:101-108`) before
@@ -17,7 +17,7 @@
 //!
 //! | setting | value | why |
 //! |---|---|---|
-//! | delimiters | `{% %}` / `{ }` / `{# #}` | upstream's `jinja2.Environment('{%', '%}', '{', '}')` (`gcode_macro.py:82`) |
+//! | delimiters | `{% %}` / `{ }` / `{# #}` | upstream's `jinja2.Environment('{%', '%}', '{', '}')` (`gcode_macro.py:83`) |
 //! | undefined behavior | `UndefinedBehavior::Strict` | a missing status key must not render a blank `PARK_` line — the rule the hand-written subset had |
 //! | auto escape | `AutoEscape::None` | a macro body is g-code, not HTML (the engine's default callback switches on the template name's extension) |
 //! | trailing newline | kept | a corpus body ends with a newline and the rendered text is run line by line; Jinja2/minijinja drop the last one by default (see the deviation table) |
@@ -45,7 +45,7 @@
 //!   indexed and iterated like any other sequence.
 //! - `Rt::Printer` becomes the [`PrinterView`] object: `printer.<name>` and
 //!   `printer["<name>"]` are one registered object's status, cached for the
-//!   render the way `GetStatusWrapper.cache` caches it (`gcode_macro.py:17`),
+//!   render the way `GetStatusWrapper.cache` caches it (`gcode_macro.py:20-33`),
 //!   and `'<name>' in printer` asks whether that object is registered
 //!   (`GetStatusWrapper.__contains__`, `:33-37`) — the engine's containment
 //!   check on a map object *is* its lookup, so an unregistered name is absent,
@@ -133,7 +133,7 @@ enum Phase {
 }
 
 /// A template failure, worded after upstream's `TemplateWrapper`
-/// (`gcode_macro.py:47-79`): a load error is
+/// (`gcode_macro.py:46-77`): a load error is
 /// `Error loading template '<name>'\nline <n>: <detail>`; a render error is
 /// `Error evaluating '<name>': line <n>: <detail>` — the line is this port's
 /// addition, because a rendered macro body spans many of them.
@@ -225,7 +225,7 @@ impl fmt::Debug for Builtin {
 }
 
 /// `printer.<name>` / `printer["<name>"]` — one object's status, cached for
-/// the render the way `GetStatusWrapper.cache` caches it (`gcode_macro.py:17`).
+/// the render the way `GetStatusWrapper.cache` caches it (`gcode_macro.py:20-33`).
 ///
 /// The cache is a `Mutex` because the engine requires its objects to be `Sync`;
 /// the view is `Clone` so a [`Rt`] can be cloned into a render.
@@ -416,7 +416,7 @@ impl Context {
 // ===========================================================================
 
 /// A compiled template: its name (`gcode_macro M486:gcode`, the upstream
-/// `TemplateWrapper` name, `gcode_macro.py:87`) and the environment it was
+/// `TemplateWrapper` name, `gcode_macro.py:47-65`) and the environment it was
 /// compiled into.
 pub struct Template {
     name: String,

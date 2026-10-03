@@ -65,7 +65,7 @@ impl HomingOverride {
     }
 
     /// The three trigger axes as a mask, from the `axes` option
-    /// (`homing_override.py:16` + `cmd_G28`'s `for axis in self.axes`).
+    /// (`homing_override.py:12` + `cmd_G28`'s `for axis in self.axes`).
     /// Letters outside `x`/`y`/`z` select nothing.
     pub fn axis_mask(&self) -> [bool; 3] {
         let mut mask = [false; 3];

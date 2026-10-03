@@ -454,6 +454,40 @@ KLIPPERX_ALL_ARCHES=1 \
 **豁免范围**：`TODO.md` 与 `docs/work-log/` 自身是台账与档案，其中的历史标号照旧保留，
 本规则不适用于这两个位置。悬空标号（查无此号）同样要清——它和过时断言是一类问题。
 
+### 上游行号引用的核验（`scripts/pyref-audit.py`）
+
+源码注释与手册里大量引用上游 Python 的行号（`` (`mcu.py:718-719`) ``）。这些引用会
+漂移——它们可能写在另一份检出上，而 pinned 的 `third_party/klipper/` 一直在动。改动
+周边代码时顺手重核，或定期整体扫一遍：
+
+```bash
+python3 scripts/pyref-audit.py                      # src/core/klippy 全树，摘要
+python3 scripts/pyref-audit.py extras/display/ --detail
+python3 scripts/pyref-audit.py --docs               # 手册侧
+python3 scripts/pyref-audit.py --window 1            # 只认同行锚点（严格、少噪声）
+```
+
+它用 `ast` 解析 pinned 上游，取出每个 class/def 的精确 `lineno..end_lineno`，与注释里
+点名的符号比对；锚点默认取**本行与其前 9 行**（`--window`）。输出分三档：`file`（引用
+超出上游文件长度，无争议）、`symbol`（点名了某个 class/def 而引用范围与之不符，给建议
+范围）、`literal`（反引号里的代码片段在上游只出现在别处）。
+
+**它是候选清单，不是判据**：锚点窗口是刻意放宽的，噪声很大——窗口里的英文词/Rust
+标识符会撞上同名 `def`（`move`/`reset`/`flush`/`get_status`/`__init__`…），多个类各有
+`__init__`/`get_status` 时只保留一个范围，合法地指向函数**内部**的子块引用、模块级常量、
+空行边界也会被报。**每一条都要打开 pinned 上游核对再改**，判不准就留着。
+
+两个容易踩的口径陷阱：
+
+1. 有些表格（如 [regression-tests.md](regression-tests.md) 的 `is_fileoutput()` 短路表）
+   刻意引用**实现该行为的那一行**（body 行）而不是 `def` 行——把 1037「修」成 1033 是错的。
+2. 同一个符号在同一个文件里可能有多个定义（`create_oid` 在 `MCUConfigHelper` 与 `MCU`
+   各一份），工具只保留一个范围，报出来的建议可能对错了那个。
+
+一次实测（2026-10-03，105 个 `.rs`）：窗口模式报出的候选中约一半是真漂移，另一半是上述
+噪声；`--window 1` 的严格模式噪声低得多，但会漏掉「符号名写在上一条注释行」这类——两种
+模式互补，先用严格模式清一遍，再用窗口模式补漏。
+
 `cargo doc --no-deps --lib` 的警告数应与改动前一致（根包目前有 2 条残留于 `frame.rs` / `msg/parser.rs`；`klippy-api` 与 `klippy-client` 是 0 条）。新增模块时注意两个陷阱：
 
 1. **模块的文档链接是在它的 `mod` 声明所在作用域里解析的**，不是在被声明模块自己的作用域里。`klippy/mod.rs` 里的 `pub mod …;` 因此都不带 `///` 文档。

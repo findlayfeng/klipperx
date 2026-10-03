@@ -16,7 +16,7 @@
 //! | `[display]` | `display/display.py:176` `load_config` | the only section; the panel is chosen by `lcd_type` |
 //! | `[display_template <name>]` | `display/display.py:168` (no file of its own) | lives in [`led`](super::led) |
 //! | `[display_data <group> <item>]` | `display/display.py:56` | shipped `display.cfg` only |
-//! | `[display_glyph <name>]` | `display/display.py:93` | shipped `display.cfg` only |
+//! | `[display_glyph <name>]` | `display/display.py:103` | shipped `display.cfg` only |
 //!
 //! # What is not here
 //!
@@ -26,7 +26,7 @@
 //!   `"%3.0f" % …` and `.format`, which the template engine
 //!   (`super::template`) does not have yet. A refresh clears the panel and
 //!   flushes the framebuffer differences, exactly as upstream does around its
-//!   own (swallowed) render step (`display/display.py:236-240`), so the screen
+//!   own (swallowed) render step (`display/display.py:234-237`), so the screen
 //!   stays blank rather than the printer failing to come up.
 //! * **The menu.** `menu.cfg` is not loaded: no `menu` object, no `menu:*`
 //!   events, no menu drawing. The menu options a config writes are still read

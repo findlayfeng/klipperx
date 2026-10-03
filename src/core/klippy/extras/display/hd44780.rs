@@ -10,12 +10,12 @@
 //! | framework call | here | upstream |
 //! |---|---|---|
 //! | `init()` | the power-up command groups, then a flush | `hd44780.py:90-103` |
-//! | `clear()` | blank both text framebuffers | `hd44780.py:129-131` |
-//! | `flush()` | batch the framebuffer differences and send them | `hd44780.py:69-88` |
-//! | `set_glyphs()` | keep the 5x8 icons for the glyphs the layout names | `hd44780.py:109-112` |
+//! | `clear()` | blank both text framebuffers | `hd44780.py:129-132` |
+//! | `flush()` | batch the framebuffer differences and send them | `hd44780.py:69-89` |
+//! | `set_glyphs()` | keep the 5x8 icons for the glyphs the layout names | `hd44780.py:109-113` |
 //!
 //! The framebuffers are upstream's three: two text buffers of `2*line_length`
-//! bytes (`hd44780.py:31-40`), because each of the panel's four rows is driven
+//! bytes (`hd44780.py:40-50`), because each of the panel's four rows is driven
 //! as one half of one buffer, and the 64-byte character generator buffer. As
 //! upstream, every "already sent" copy starts as `~`, so the first flush writes
 //! the whole screen. `line_length` is 16 or 20 (`hd44780.py:10-11,26-27`) and
@@ -24,9 +24,9 @@
 //! # What is not here
 //!
 //! * **Text and glyph drawing.** [`super::display`] never draws, so
-//!   `write_text`/`write_glyph`/`write_graphics` (`hd44780.py:104-127`) are not
+//!   `write_text`/`write_glyph`/`write_graphics` (`hd44780.py:104-128`) are not
 //!   ported; [`Hd44780::set_glyphs`] keeps the 5x8 icons because upstream
-//!   collects them there (`hd44780.py:109-112`).
+//!   collects them there (`hd44780.py:109-113`).
 //! * **`hd44780_spi`**: the SPI backpack variant is a different `lcd_type`, and
 //!   `lcd_type` reports it as a gap.
 //! * **`BACKGROUND_PRIORITY_CLOCK` / `minclock`** (`hd44780.py:9,92-102`):
@@ -58,7 +58,7 @@ const LINE_LENGTH_DEFAULT: &str = "20";
 const LINE_LENGTH_OPTIONS: &[&str] = &["16", "20"];
 
 /// One framebuffer and the copy the firmware has already been told about —
-/// upstream's `(new_data, old_data, fb_id)` triples (`hd44780.py:32-40`).
+/// upstream's `(new_data, old_data, fb_id)` triples (`hd44780.py:43-50`).
 #[derive(Debug)]
 struct Framebuffer {
     /// What the screen should show.
@@ -70,19 +70,19 @@ struct Framebuffer {
 }
 
 /// The two text framebuffers and the character generator's buffer, in the order
-/// upstream flushes them (`hd44780.py:32-40`).
+/// upstream flushes them (`hd44780.py:43-50`).
 #[derive(Debug)]
 struct Framebuffers {
-    /// One buffer per pair of panel rows (`hd44780.py:31`).
+    /// One buffer per pair of panel rows (`hd44780.py:40-41`).
     text: [Framebuffer; 2],
-    /// The 64-byte CGRAM buffer (`hd44780.py:30`).
+    /// The 64-byte CGRAM buffer (`hd44780.py:42`).
     glyph: Framebuffer,
 }
 
 impl Framebuffers {
     /// Upstream's `__init__` buffers: the text screens are spaces, the glyph
     /// buffer is zeros, and every "already sent" copy is `~` so the first flush
-    /// sends the lot (`hd44780.py:31-40`).
+    /// sends the lot (`hd44780.py:40-50`).
     fn new(line_length: usize) -> Self {
         let half = 2 * line_length;
         let blank = |len: usize, byte: u8, fb_id: u8| Framebuffer {
@@ -129,7 +129,7 @@ struct Hd44780State {
     hd44780_protocol_init: bool,
     /// The framebuffers.
     framebuffers: Mutex<Framebuffers>,
-    /// The 5x8 icons by glyph name (`hd44780.py:109-112`).
+    /// The 5x8 icons by glyph name (`hd44780.py:109-113`).
     icons: Mutex<HashMap<String, (u8, Vec<u8>)>>,
     /// Every message handed to the firmware, in order (tests and diagnostics).
     sent: Mutex<Vec<SentMessage>>,
@@ -270,7 +270,7 @@ impl LcdChip for Hd44780 {
         self.flush();
     }
 
-    /// Upstream's `HD44780.clear` (`hd44780.py:129-131`): only the text
+    /// Upstream's `HD44780.clear` (`hd44780.py:129-132`): only the text
     /// framebuffers are blanked; the glyph buffer keeps the icons.
     fn clear(&self) {
         let mut framebuffers = self.framebuffers();
@@ -279,7 +279,7 @@ impl LcdChip for Hd44780 {
         }
     }
 
-    /// Upstream's `HD44780.flush` (`hd44780.py:69-88`): send the changed bytes
+    /// Upstream's `HD44780.flush` (`hd44780.py:69-89`): send the changed bytes
     /// of every framebuffer, batching changes that are close together.
     fn flush(&self) {
         let mut framebuffers = self.framebuffers();
@@ -325,7 +325,7 @@ impl LcdChip for Hd44780 {
         (self.state.line_length, 4)
     }
 
-    /// Upstream's `HD44780.set_glyphs` (`hd44780.py:109-112`): keep every 5x8
+    /// Upstream's `HD44780.set_glyphs` (`hd44780.py:109-113`): keep every 5x8
     /// icon by glyph name.
     fn set_glyphs(&self, glyphs: &BTreeMap<String, Glyph>) {
         let mut icons = self
@@ -372,7 +372,7 @@ impl std::fmt::Debug for Hd44780 {
 impl Hd44780State {
     /// Add this panel's configuration command, with the pin numbers resolved.
     ///
-    /// Upstream's `HD44780.build_config` (`hd44780.py:51-61`): the pin
+    /// Upstream's `HD44780.build_config` (`hd44780.py:51-62`): the pin
     /// *names* become firmware numbers here, and the delay is
     /// `mcu.seconds_to_clock(HD44780_DELAY)`.
     fn build(
@@ -682,7 +682,7 @@ mod tests {
         assert_eq!(chip.state.line_length, 16);
         assert_eq!(chip.get_dimensions(), (16, 4));
         // The framebuffers follow the width: two half-lines of 16 characters
-        // (`hd44780.py:31`).
+        // (`hd44780.py:40-41`).
         assert_eq!(chip.framebuffers().text[0].data.len(), 32);
     }
 
@@ -793,7 +793,7 @@ mod tests {
     #[test]
     fn test_the_framebuffers_start_unsent() {
         // Every "already sent" copy is `~`, so the first flush writes the whole
-        // screen (`hd44780.py:31-40`).
+        // screen (`hd44780.py:40-50`).
         let framebuffers = Framebuffers::new(20);
         assert_eq!(framebuffers.text[0].data, vec![b' '; 40]);
         assert_eq!(framebuffers.text[0].synced, vec![b'~'; 40]);
@@ -850,7 +850,7 @@ mod tests {
         );
         chip.set_glyphs(&glyphs);
 
-        // Only the HD44780-sized glyphs are kept (`hd44780.py:109-112`).
+        // Only the HD44780-sized glyphs are kept (`hd44780.py:109-113`).
         assert_eq!(
             *chip.state.icons.lock().unwrap(),
             HashMap::from([("thermometer".to_string(), (3u8, vec![0x0e; 8]))])

@@ -568,9 +568,9 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 
 | 事件名 | 触发时机 | 参数 | 上游位置 | 实现依赖 |
 |---|---|---|---|---|
-| `toolhead:manual_move` | 手动移动前 | `positions, speed` | `klippy/toolhead.py:390` | 尚无触发点（handler 已备，G4-2） |
-| `toolhead:set_position` | 设置位置（G92 等） | `positions, e` | `klippy/toolhead.py:416` | ✅ 已触发（`extras/toolhead.rs:1091`，`SET_KINEMATIC_POSITION`） |
-| `toolhead:sync_print_time` | print_time 更新 | `print_time` | `klippy/toolhead.py:446` | **尚无发送点**（C1d 的回调已落地，但该事件没有触发方；`idle_timeout` 改为观察 `print_time` 前进） |
+| `toolhead:manual_move` | 手动移动前 | `positions, speed` | `klippy/toolhead.py:416` | 尚无触发点（handler 已备，G4-2） |
+| `toolhead:set_position` | 设置位置（G92 等） | `positions, e` | `klippy/toolhead.py:390` | ✅ 已触发（`extras/toolhead.rs:1091`，`SET_KINEMATIC_POSITION`） |
+| `toolhead:sync_print_time` | print_time 更新 | `print_time` | `klippy/toolhead.py:267` | **尚无发送点**（C1d 的回调已落地，但该事件没有触发方；`idle_timeout` 改为观察 `print_time` 前进） |
 | `toolhead:update_extra_axes` | 额外轴位置更新 | `positions` | `klippy/toolhead.py:455` | 尚无触发点（handler 已备，G4-2） |
 
 > `toolhead:set_position` 已产线触发（`gcode_move` 重置链之一）；其余三个尚无触发点：
@@ -597,8 +597,8 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 | `extruder:activate_extruder` | 切换 active extruder | `extruder` | `klippy/kinematics/extruder.py:25` | 尚无发送方（handler 已备，`gcode_move.rs:357`） |
 | `stepper_enable:motor_off` | stepper 电机关闭 | `stepper_enable` | `klippy/extras/stepper_enable.py:120` | ✅ 已触发（`stepper_enable.rs:338`） |
 | `virtual_sdcard:reset_file` | VSD 文件重置 | 无 | `klippy/extras/virtual_sdcard.py:151` | sdcard |
-| `load_cell:calibrate` | 称重传感器校准 | 无 | `klippy/extras/load_cell.py:397` | ADC |
-| `load_cell:tare` | 称重传感器归零 | 无 | `klippy/extras/load_cell.py:404` | ADC |
+| `load_cell:calibrate` | 称重传感器校准 | 无 | `klippy/extras/load_cell.py:404` | ADC |
+| `load_cell:tare` | 称重传感器归零 | 无 | `klippy/extras/load_cell.py:406` | ADC |
 
 > 依赖各自模块（endstop、sdcard、ADC 等），不阻塞运动。
 

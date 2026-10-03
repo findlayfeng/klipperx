@@ -110,7 +110,7 @@ pub trait Reactor: Send + Sync {
 - `busy`：从最早唤醒时间到本轮结束，所以**唤醒晚了**和**回调慢**算在同一条线上；
 - `CallbackRun { name, duration, lateness }`：每个回调的名字、自己跑了多久、比唤醒时间晚启动了多少。
 
-名字在注册时给出（`register_timer_named`）——上游是反射出回调名（`get_function_owner`，`extras/garbage_collection.py:21`），Rust 闭包没有名字可读。`register_timer` 是无名版（报告里叫 `"<timer>"`）。
+名字在注册时给出（`register_timer_named`）——上游是反射出回调名（`get_function_owner`，`extras/garbage_collection.py:13`），Rust 闭包没有名字可读。`register_timer` 是无名版（报告里叫 `"<timer>"`）。
 
 上游的 `set_latency_notifier`（`reactor.py:316`）消费者是 `extras/garbage_collection.py`（它把警告写成 `Reactor busy for …`）；Rust 没有 GC，所以这里**纯是诊断**：trait 默认什么都不做，只有 `TokioReactor` 实现，主机在 `src/klippy.rs` 挂一个 50 ms 阈值的日志回调（与上游 `THRESHOLD` 同为 50 ms）。这个回调自己跑在 dispatcher 上，同样不许阻塞。抖动的来源与要不要绑核见 [延迟与抖动](latency.md)。
 
@@ -127,7 +127,7 @@ pub trait Reactor: Send + Sync {
 ## 还没有的
 
 - **周期性任务的"武装/解除"**：上游用 `register_timer(cb, NEVER)` 注册、`update_timer` 择机武装。我们没有 `update_timer`，因为当前没有消费者；`objects/subscribe` 在无订阅时直接 `unregister_timer`（上游 `webhooks.py` 也是这么收尾的），不需要它。
-- **idle 钩子**：`set_idle_notifier`（上游 `reactor.py:180`）未做——它的消费者是 Python 的垃圾回收（`extras/garbage_collection.py`），Rust 没有对应物。延迟度量已落地（见上）。
+- **idle 钩子**：`set_idle_notifier`（上游 `reactor.py:174`）未做——它的消费者是 Python 的垃圾回收（`extras/garbage_collection.py`），Rust 没有对应物。延迟度量已落地（见上）。
 - **机器与 API 分 runtime**：已完成——机器跑在专用 runtime 上，reactor 就建在它的 handle 上（见 [运行时编排](runtime.md)）。这与 `reactor` 本身的定时器语义无关。
 - **fd 事件**：API 层的 socket 由 tokio 管，MCU 的串口由 `mcu` 的收发任务管，机器层不需要 `register_fd`。
 

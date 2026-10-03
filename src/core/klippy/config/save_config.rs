@@ -244,6 +244,48 @@ mod tests {
         let _ = fs::remove_file(&backup);
     }
 
+    /// The write-back of a multi-line pending value (what
+    /// `temperature_probe::finish_calibration` queues): the block carries it
+    /// with tab-indented continuations, and the rewritten file parses back to
+    /// the exact value — byte for byte, blank first line included.
+    #[test]
+    fn write_config_round_trips_a_multiline_value() {
+        const VALUE: &str = "\n300, 0, 0\n200, 0, 0\n100, 0, 0";
+        let path = temp_file(
+            "multiline.cfg",
+            "[temperature_probe probe]\nsensor_type: Scripted\n",
+        );
+        let cfgname = path.to_str().unwrap().to_string();
+
+        let configfile = object("[temperature_probe probe]\nsensor_type: Scripted\n");
+        configfile.set("temperature_probe probe", "drift_calibration", VALUE);
+
+        write_config(&configfile, &cfgname).expect("SAVE_CONFIG writes");
+
+        let written = fs::read_to_string(&cfgname).expect("rewritten file readable");
+        // `drift_calibration =` with an empty first line, every curve a
+        // tab-indented continuation under the `#*# ` prefix.
+        assert!(
+            written.contains("#*# drift_calibration =\n#*# \t300, 0, 0"),
+            "{written}"
+        );
+
+        // What a restart reads: the block splits, parses, and yields the
+        // value verbatim.
+        let (reloaded, _) = Config::from_file(&cfgname).expect("the rewritten file parses");
+        let section = reloaded
+            .get_section("temperature_probe probe")
+            .expect("the section");
+        assert_eq!(
+            section.get_text("drift_calibration").expect("read back"),
+            VALUE
+        );
+
+        let backup = cfgname.trim_end_matches(".cfg").to_string() + &datestr() + ".cfg";
+        let _ = fs::remove_file(&cfgname);
+        let _ = fs::remove_file(&backup);
+    }
+
     #[test]
     fn strip_regular_duplicates_comments_out_body_copies_of_block_options() {
         let (block_config, _) = Config::from_text("[probe]\nz_offset: 1\nx_offset: 2\n").unwrap();

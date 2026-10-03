@@ -290,7 +290,7 @@ identify 的命令**定义**（名称、参数、解码）与其它命令一样�
 | `gcode_button.rs` | `[gcode_button <name>]` 数字路径（`pin`/`press_gcode`/`release_gcode`/`debounce_delay`、`QUERY_BUTTON`、`get_status`）；gap：固件按钮查询未接、`analog_range` 明确拒绝（无 `query_adc`，批 #37） |
 | `gcode_arcs.rs` | `[gcode_arcs]` 段落地（`resolution`，语料档位）：G2/G3 与平面选择命令属 H10 未注册（对应上游 `gcode_arcs.py`） |
 | `bed_screws.rs` | `[bed_screws]` 手动调平段（screw1..99 缺失即停/名称/fine_adjust/行进默认，≥3 螺丝；对应 `bed_screws.py`）；`BED_SCREWS_ADJUST` 命令族未移植（H9） |
-| `pwm_cycle_time.rs` | `[pwm_cycle_time <name>]`：软件 PWM 引脚 + `SET_PIN` 的 `CYCLE_TIME=`（固件周期 build 期定，运行期改只记主机账；`pwm_cycle_time.py`） |
+| `pwm_cycle_time.rs` | `[pwm_cycle_time <name>]`：软件 PWM 引脚 + `SET_PIN` 的 `CYCLE_TIME=`（固件周期 build 期定，运行期改只记主机账；`pwm_cycle_time.py`）；`SET_PIN` 经 `register_lookahead_callback` 钉 print-time 调度、按 `min_schedule_time` 自间隔（2026-10-03，`a3e1d4c`，匹配上游 `pwm_cycle_time.py:102-122`）；无 `toolhead` 或 MCU 未连接时回退立即路径 |
 | `pwm_tool.rs` | `[pwm_tool <name>]`：带 `maximum_mcu_duration` 固件兕底的 PWM 工具引脚（`pwm_tool.py`）；`SET_PIN` 经 `GCodeRequestQueue` **按打印时间生效**（复用 `output_pin` 接线件 + 两条兜底，2026-10-03） |
 | `temperature_fan.rs` | `[temperature_fan <name>]`：传感器+风扇+`watermark`/`pid` 双控制环，`SET_TEMPERATURE_FAN_TARGET`（mux，`temperature_fan.py`） |
 | `temperature_host.rs` | 裸 `[temperature_host]` 只把 `temperature_host` 工厂注册给 `heaters`（**`phase = early`**，order 30）；传感器在消费节（`[temperature_sensor]`/加热器，`sensor_type: temperature_host`）里建：`sensor_path` 默认 `/sys/class/thermal/thermal_zone0/temp`、1 s 定时采样 ÷1000、min/max 越界 shutdown 逐字、对象 `temperature_host <末词>` 的 `get_status` 只有 `temperature`、`--debugoutput` 跳过开文件与定时器、读失败置 0 并退役定时器（2026-10-03，上游 `temperature_host.py`） |

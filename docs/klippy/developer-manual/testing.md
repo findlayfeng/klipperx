@@ -304,7 +304,7 @@ git config core.hooksPath .githooks
 | `extras/gcode_button.rs`（批 #37，8 测） | 语料节选项全读、按下/释放各渲染派发、空 `release_gcode` 不跑、`QUERY_BUTTON` 与 `get_status`、缺 `pin`/`press_gcode` 文案、`debounce_delay` 下界、`analog_range` 读取后的明确拒绝与上游解析/越界文案 |
 | `gcode_arcs.rs` | `resolution` 默认 `1.` 记账、显式值解析、`0`/`-1`/非数拒绝文案对上游、经 loader 认领并注册（4 测） |
 | `bed_screws.rs` | 全选项 `check_unused` 直证、行进默认 50/5/5/0 与默认名、螺丝缺失即停（access 无残留）、<3 与两元素/解析/fine_adjust 上游文案、above 0 边界、静止态 status（6 测） |
-| `pwm_cycle_time.rs` | 选项矩阵与默认、`SET_PIN` 值域与 `CYCLE_TIME`、重复值丢弃、无 `hardware_pwm` 恒软件路径（11 测） |
+| `pwm_cycle_time.rs` | 选项矩阵与默认、`SET_PIN` 值域与 `CYCLE_TIME`、重复值丢弃、无 `hardware_pwm` 恒软件路径；**lookahead 调度**（2026-10-03 +6 测）：clocked `set_pwm`、两次改按 `min_schedule_time` 间隔、`CYCLE_TIME` 在 lookahead 路径更新簿记、重复丢弃、无 `toolhead` fallback、MCU 未连接 fallback（17 测） |
 | `pwm_tool.rs` | 选项矩阵与默认、prefix 命名错误、`cycle_time` 值域、`maximum_mcu_duration` minval 0.5、配对约束 build 期拒绝（15 测；2026-10-03 +4 队列化：前瞻钉时→flush 落 clocked、后请求覆盖、两条兕底、同构对接） |
 | `temperature_fan.rs` | 6 实例选项矩阵、`max_temp<40` 取目标、pid 选项与上下界、bang-bang 驱动、`SET_TEMPERATURE_FAN_TARGET` 命令与三段错误文案、未知 sensor/非法 control、缺 pin 前缀名（11 测） |
 | `temperature_host.rs` | `sensor_path` 默认/显式解析、开文件错误逐字 `Unable to open temperature file '<path>'`、对象名取末词、临时文件假读数驱动 poll（首采 42.5 → 改写文件 + `advance(1.0)` 恰一次触发 → 43.1 与 `get_status` 形状、回调序列）、读失败置 0 并退役定时器、min/max 越界 shutdown 文案双侧、裸节全链路装载（工厂注册 + 对象 + 不可 query + 消费者 `get_status` 形状）、裸节拒收选项（8 测） |

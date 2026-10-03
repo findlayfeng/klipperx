@@ -87,9 +87,9 @@ the accelerometer sample collection and PSD fitting data path is not wired.";
 #[allow(dead_code)]
 pub struct ResonanceTester {
     printer: Weak<Printer>,
-    /// `move_speed`, default `50.`, above `0` (`resonance_tester.py:263`).
+    /// `move_speed`, default `50.`, above `0` (`resonance_tester.py:265`).
     move_speed: f64,
-    /// `min_freq`, default `5.`, minimum `1.` (`resonance_tester.py:58`).
+    /// `min_freq`, default `5.`, minimum `1.` (`resonance_tester.py:59`).
     min_freq: f64,
     /// `max_freq`, default `135.`, in `min_freq`…`300.`.
     max_freq: f64,
@@ -100,30 +100,30 @@ pub struct ResonanceTester {
     /// `accel_per_hz_z`, default `15.`, above `0`.
     accel_per_hz_z: f64,
     /// `hz_per_sec`, default `1.`, in `0.1`…`2.`
-    /// (`resonance_tester.py:62-63`).
+    /// (`resonance_tester.py:66`).
     hz_per_sec: f64,
     /// `sweeping_accel`, default `400.`, above `0`
-    /// (`resonance_tester.py:116`).
+    /// (`resonance_tester.py:100`).
     sweeping_accel: f64,
     /// `sweeping_accel_z`, default `50.`, above `0`.
     sweeping_accel_z: f64,
     /// `sweeping_period`, default `1.2`, minimum `0.`
-    /// (`resonance_tester.py:118`).
+    /// (`resonance_tester.py:102`).
     sweeping_period: f64,
     /// `probe_points`, three floats per line; empty when unset
     /// (`resonance_tester.py:290-291`).
     probe_points: Vec<[f64; 3]>,
     /// `max_smoothing`, optional, minimum `0.05`
-    /// (`resonance_tester.py:289`).
+    /// (`resonance_tester.py:284`).
     max_smoothing: Option<f64>,
     /// The chips to measure with, as `(axis letters, chip name)`: grouped by
     /// chip name and sorted, the axis letters of one chip joined
-    /// (`resonance_tester.py:278-283`).
+    /// (`resonance_tester.py:279-283`).
     accel_chip_names: Vec<(String, String)>,
 }
 
 impl ResonanceTester {
-    /// Read the section (`resonance_tester.py:261-291`).
+    /// Read the section (`resonance_tester.py:263-298`).
     ///
     /// # Errors
     /// [`ConfigError`] for an option outside its bounds, a `probe_points` line
@@ -132,7 +132,7 @@ impl ResonanceTester {
         let move_speed =
             config.get_float_bounded("move_speed", Some(50.0), None, None, Some(0.0), None)?;
         // `SweepingVibrationsTestGenerator.__init__` builds the pulse generator
-        // first, then the sweeping options (`resonance_tester.py:57-118`).
+        // first, then the sweeping options (`resonance_tester.py:57-103`).
         let min_freq =
             config.get_float_bounded("min_freq", Some(5.0), Some(1.0), None, None, None)?;
         let max_freq = config.get_float_bounded(
@@ -230,7 +230,7 @@ impl ResonanceTester {
         }
     }
 
-    /// Upstream's `_parse_chips` (`resonance_tester.py:331-341`): each
+    /// Upstream's `_parse_chips` (`resonance_tester.py:382-393`): each
     /// comma-separated name must resolve to an accelerometer. The parsed chips
     /// are unused while the run is a gap, so only the validation runs.
     ///
@@ -259,7 +259,7 @@ impl ResonanceTester {
         Ok(())
     }
 
-    /// Upstream's `cmd_TEST_RESONANCES` (`resonance_tester.py:345-378`): parse
+    /// Upstream's `cmd_TEST_RESONANCES` (`resonance_tester.py:397-444`): parse
     /// every parameter, then report the gap.
     ///
     /// # Errors
@@ -286,7 +286,7 @@ impl ResonanceTester {
         Err(CommandError::new(DATA_PATH_GAP))
     }
 
-    /// Upstream's `cmd_SHAPER_CALIBRATE` (`resonance_tester.py:381-436`): parse
+    /// Upstream's `cmd_SHAPER_CALIBRATE` (`resonance_tester.py:447-505`): parse
     /// every parameter, then report the gap.
     ///
     /// # Errors
@@ -295,7 +295,7 @@ impl ResonanceTester {
         if let Ok(axis) = gcmd.get_str("AXIS") {
             // Upstream spells this `axis.lower() not in 'xyz'`, a substring
             // test, so a multi-character `AXIS` (`xy`) is accepted here too;
-            // the error quotes the raw parameter (`resonance_tester.py:384-389`).
+            // the error quotes the raw parameter (`resonance_tester.py:452-453`).
             if !"xyz".contains(&axis.to_lowercase()) {
                 return Err(CommandError::new(format!("Unsupported axis '{axis}'")));
             }
@@ -325,7 +325,7 @@ impl ResonanceTester {
         Err(CommandError::new(DATA_PATH_GAP))
     }
 
-    /// Upstream's `cmd_MEASURE_AXES_NOISE` (`resonance_tester.py:379-380`):
+    /// Upstream's `cmd_MEASURE_AXES_NOISE` (`resonance_tester.py:508-527`):
     /// parse `MEAS_TIME`, then report the gap.
     ///
     /// # Errors
@@ -344,7 +344,7 @@ impl ResonanceTester {
     }
 
     /// The commands and events upstream's `__init__` registers
-    /// (`resonance_tester.py:292-298`).
+    /// (`resonance_tester.py:288-298`).
     fn register_handlers(self: &Arc<Self>, printer: &Arc<Printer>) -> Result<(), ConfigError> {
         printer.register_event_handler(
             KlippyEvent::KlippyConnect,
@@ -467,7 +467,7 @@ fn group_chips(mut chips: Vec<(String, String)>) -> Vec<(String, String)> {
     groups
 }
 
-/// Read `probe_points` (`resonance_tester.py:290-291`): three floats per line.
+/// Read `probe_points` (`resonance_tester.py:285-286`): three floats per line.
 ///
 /// # Errors
 /// [`ConfigError`] for a line whose parsed group is not three floats, or a
@@ -490,7 +490,7 @@ fn read_probe_points(config: &ConfigWrapper) -> Result<Vec<[f64; 3]>, ConfigErro
     Ok(points)
 }
 
-/// Parse an `AXIS` parameter (`_parse_axis`, `resonance_tester.py:43-60`): an
+/// Parse an `AXIS` parameter (`_parse_axis`, `resonance_tester.py:39-55`): an
 /// axis letter, or a two- or three-component vibration direction.
 ///
 /// The direction itself is unused while the run is a gap, so only the format is
@@ -564,7 +564,7 @@ fn parse_outputs(outputs: &str) -> Result<(), CommandError> {
     Ok(())
 }
 
-/// Check a `NAME` suffix (`is_valid_name_suffix`, `resonance_tester.py:438-439`):
+/// Check a `NAME` suffix (`is_valid_name_suffix`, `resonance_tester.py:529-530`):
 /// alphanumeric once `-` and `_` are dropped.
 ///
 /// Only a written `NAME` reaches this; upstream's default is a timestamp, which
@@ -578,14 +578,14 @@ fn check_name_suffix(name_suffix: &str) -> Result<(), CommandError> {
         .filter(|c| *c != '-' && *c != '_')
         .collect();
     // `str.isalnum()` is false for the empty string, so an empty `NAME` is
-    // invalid too (`resonance_tester.py:438-439`).
+    // invalid too (`resonance_tester.py:529-530`).
     if stripped.is_empty() || !stripped.chars().all(char::is_alphanumeric) {
         return Err(CommandError::new("Invalid NAME parameter"));
     }
     Ok(())
 }
 
-/// The factory `section!` names (`resonance_tester.py:441 def load_config`).
+/// The factory `section!` names (`resonance_tester.py:552-553 def load_config`).
 pub fn load_config(
     config: &ConfigWrapper,
     printer: &Arc<Printer>,

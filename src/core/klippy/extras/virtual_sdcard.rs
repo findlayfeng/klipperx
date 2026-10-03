@@ -23,9 +23,9 @@
 //!   revisited when `gcode` exposes a mutex/test API.
 //! - **`_handle_analyze_shutdown` / `_handle_debuginput_exit`** — upstream
 //!   registers these to log file-tail on shutdown and to wait for replay to
-//!   finish on debuginput exit (`virtual_sdcard.py:278-294`). Not wired here.
+//!   finish on debuginput exit (`virtual_sdcard.py:53-74`). Not wired here.
 //! - **`stats(eventtime)`** — upstream returns `(True, "sd_pos=%d")` while the
-//!   timer runs (`virtual_sdcard.py:272-276`). `PrinterObject` has no `stats`
+//!   timer runs (`virtual_sdcard.py:75-78`). `PrinterObject` has no `stats`
 //!   method, so this is omitted; `stats` is a reactor scheduling hint, not
 //!   user-visible.
 //! - **`do_pause` now waits** for the replay task to exit, matching
@@ -61,11 +61,11 @@ use crate::core::klippy::gcode::{
 use crate::core::klippy::load::section;
 use crate::core::klippy::printer::{Printer, PrinterObject};
 
-/// File extensions upstream accepts (`virtual_sdcard.py:6`).
+/// File extensions upstream accepts (`virtual_sdcard.py:8`).
 const VALID_GCODE_EXTS: &[&str] = &["gcode", "g", "gco"];
 
 /// Upstream's `DEFAULT_ERROR_GCODE` — the default of `on_error_gcode`
-/// (`virtual_sdcard.py:8-12`). Loaded as a template; not rendered until Unit C.
+/// (`virtual_sdcard.py:10-14`). Loaded as a template; not rendered until Unit C.
 const DEFAULT_ERROR_GCODE: &str = "
 {% if 'heaters' in printer %}
    TURN_OFF_HEATERS
@@ -80,7 +80,7 @@ section!("virtual_sdcard", order = 30, load = load_config);
 /// the dispatcher's async task while `get_status` can be called from any
 /// thread.
 pub struct VirtualSdCard {
-    /// The `path` option as written (`virtual_sdcard.py:17-19`). Upstream runs
+    /// The `path` option as written (`virtual_sdcard.py:20-21`). Upstream runs
     /// `normpath(expanduser(…))` over it; this port uses it as-is (module docs).
     sdcard_dirname: String,
     /// The open file handle, or `None` when no file is selected
@@ -89,26 +89,26 @@ pub struct VirtualSdCard {
     /// `file_position` / `file_size` (`virtual_sdcard.py:23`).
     file_position: Mutex<u64>,
     file_size: Mutex<u64>,
-    /// `must_pause_work` / `cmd_from_sd` (`virtual_sdcard.py:30`).
+    /// `must_pause_work` / `cmd_from_sd` (`virtual_sdcard.py:28`).
     must_pause_work: Mutex<bool>,
     cmd_from_sd: Mutex<bool>,
     /// `work_timer is not None` — `true` while the replay task is running
-    /// (`virtual_sdcard.py:31`). `do_resume` sets it `true` when spawning the
+    /// (`virtual_sdcard.py:30`). `do_resume` sets it `true` when spawning the
     /// task; the task sets it `false` on exit.
     work_active: Mutex<bool>,
     /// `next_file_position` — written by `work_handler` before each line and
-    /// read by `get_file_position` (`virtual_sdcard.py:31`).
+    /// read by `get_file_position` (`virtual_sdcard.py:29`).
     next_file_position: Mutex<u64>,
     /// The `print_stats` object, loaded via `PrintStats::ensure`
     /// (`virtual_sdcard.py:25`).
     print_stats: Arc<PrintStats>,
-    /// The compiled `on_error_gcode` template (`virtual_sdcard.py:33-35`).
+    /// The compiled `on_error_gcode` template (`virtual_sdcard.py:35-36`).
     /// Rendered inside `work_handler` when a replayed line errors.
     on_error_gcode: Template,
     /// The `gcode` dispatcher, for `run_script` / `respond_raw` from the
     /// replay task (which has no `GcodeCommand` in hand).
     gcode: Arc<GCodeDispatch>,
-    /// The printer, for `send_event` and `reactor` (`virtual_sdcard.py:117`).
+    /// The printer, for `send_event` and `reactor` (`virtual_sdcard.py:18`).
     printer: Arc<Printer>,
 }
 
@@ -133,7 +133,7 @@ struct FileHandle {
 
 impl VirtualSdCard {
     /// Read the section and wire the commands (upstream's `__init__`,
-    /// `virtual_sdcard.py:14-46`).
+    /// `virtual_sdcard.py:17-52`).
     ///
     /// # Errors
     /// A missing `path`, an unparsable `on_error_gcode` template, or a g-code
@@ -166,7 +166,7 @@ impl VirtualSdCard {
         Ok(object)
     }
 
-    /// `get_file_list(check_subdirs)` (`virtual_sdcard.py:73-88`):
+    /// `get_file_list(check_subdirs)` (`virtual_sdcard.py:79-103`):
     /// list g-code files, optionally recursing into subdirectories.
     ///
     /// Returns `Vec<(relative_path, size)>` sorted by lowercase path.
@@ -211,7 +211,7 @@ impl VirtualSdCard {
         }
     }
 
-    /// `_load_file(gcmd, filename, check_subdirs)` (`virtual_sdcard.py:139-157`):
+    /// `_load_file(gcmd, filename, check_subdirs)` (`virtual_sdcard.py:189-213`):
     /// find the file in the listing, open it, report its size, and set it as
     /// the current file.
     ///
@@ -267,7 +267,7 @@ impl VirtualSdCard {
         Ok(())
     }
 
-    /// `_reset_file()` (`virtual_sdcard.py:113-118`): close the current file,
+    /// `_reset_file()` (`virtual_sdcard.py:144-151`): close the current file,
     /// zero the counters, reset print_stats, and fire `virtual_sdcard:reset_file`.
     ///
     /// Calls `do_pause` first, so if a replay is running it waits for the
@@ -361,7 +361,7 @@ impl VirtualSdCard {
         *self.file_size.lock().unwrap() = 0;
     }
 
-    /// `file_path()` (`virtual_sdcard.py:97-99`): the current file's name, or
+    /// `file_path()` (`virtual_sdcard.py:112-115`): the current file's name, or
     /// `None`.
     fn file_path(&self) -> Option<String> {
         self.current_file
@@ -371,7 +371,7 @@ impl VirtualSdCard {
             .map(|f| f.name.clone())
     }
 
-    /// `progress()` (`virtual_sdcard.py:100-103`): `file_position / file_size`,
+    /// `progress()` (`virtual_sdcard.py:116-120`): `file_position / file_size`,
     /// or `0.` when the size is zero.
     #[allow(dead_code)]
     fn progress(&self) -> f64 {
@@ -409,7 +409,7 @@ impl VirtualSdCard {
     }
 
     /// Register all commands (upstream's `__init__` loop,
-    /// `virtual_sdcard.py:37-46`).
+    /// `virtual_sdcard.py:37-48`).
     fn register_commands(self: &Arc<Self>, printer: &Arc<Printer>) -> Result<(), ConfigError> {
         let gcode = printer
             .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
@@ -457,7 +457,7 @@ impl VirtualSdCard {
 
     // -- work_handler (replay loop) -------------------------------------
 
-    /// `work_handler(self, eventtime)` (`virtual_sdcard.py:196-262`): the
+    /// `work_handler(self, eventtime)` (`virtual_sdcard.py:240-320`): the
     /// replay loop, running as a detached tokio task spawned by `do_resume`'s
     /// reactor timer callback.
     ///
@@ -680,7 +680,7 @@ impl std::fmt::Debug for VirtualSdCard {
 }
 
 impl PrinterObject for VirtualSdCard {
-    /// `get_status` (`virtual_sdcard.py:90-95`).
+    /// `get_status` (`virtual_sdcard.py:104-111`).
     fn get_status(&self, _eventtime: f64) -> Value {
         let s = self.snapshot();
         let progress = if s.file_size > 0 {
@@ -703,12 +703,12 @@ impl PrinterObject for VirtualSdCard {
 // ---------------------------------------------------------------------------
 
 /// `cmd_error` (M28/M29/M30) — `SD write not supported`
-/// (`virtual_sdcard.py:105-106`).
+/// (`virtual_sdcard.py:142-143`).
 fn cmd_error<'a>(_object: &'a Arc<VirtualSdCard>, _gcmd: &'a GcodeCommand) -> CommandFuture<'a> {
     Box::pin(async move { Err(CommandError::new("SD write not supported")) })
 }
 
-/// `M20` — list SD card (`virtual_sdcard.py:131-136`).
+/// `M20` — list SD card (`virtual_sdcard.py:170-176`).
 fn cmd_m20<'a>(object: &'a Arc<VirtualSdCard>, gcmd: &'a GcodeCommand) -> CommandFuture<'a> {
     Box::pin(async move {
         let files = object.get_file_list(false).map_err(CommandError::new)?;
@@ -721,7 +721,7 @@ fn cmd_m20<'a>(object: &'a Arc<VirtualSdCard>, gcmd: &'a GcodeCommand) -> Comman
     })
 }
 
-/// `M21` — initialize SD card (`virtual_sdcard.py:137-138`).
+/// `M21` — initialize SD card (`virtual_sdcard.py:177-179`).
 fn cmd_m21<'a>(object: &'a Arc<VirtualSdCard>, gcmd: &'a GcodeCommand) -> CommandFuture<'a> {
     Box::pin(async move {
         let _ = object;
@@ -730,7 +730,7 @@ fn cmd_m21<'a>(object: &'a Arc<VirtualSdCard>, gcmd: &'a GcodeCommand) -> Comman
     })
 }
 
-/// `M23` — select SD file (`virtual_sdcard.py:143-150`).
+/// `M23` — select SD file (`virtual_sdcard.py:180-188`).
 fn cmd_m23<'a>(object: &'a Arc<VirtualSdCard>, gcmd: &'a GcodeCommand) -> CommandFuture<'a> {
     Box::pin(async move {
         if object.work_timer_is_some() {
@@ -747,7 +747,7 @@ fn cmd_m23<'a>(object: &'a Arc<VirtualSdCard>, gcmd: &'a GcodeCommand) -> Comman
     })
 }
 
-/// `M24` — start/resume SD print (`virtual_sdcard.py:158-159`).
+/// `M24` — start/resume SD print (`virtual_sdcard.py:214-216`).
 fn cmd_m24<'a>(object: &'a Arc<VirtualSdCard>, _gcmd: &'a GcodeCommand) -> CommandFuture<'a> {
     Box::pin(async move {
         object.do_resume()?;
@@ -755,7 +755,7 @@ fn cmd_m24<'a>(object: &'a Arc<VirtualSdCard>, _gcmd: &'a GcodeCommand) -> Comma
     })
 }
 
-/// `M25` — pause SD print (`virtual_sdcard.py:160-161`).
+/// `M25` — pause SD print (`virtual_sdcard.py:217-219`).
 fn cmd_m25<'a>(object: &'a Arc<VirtualSdCard>, _gcmd: &'a GcodeCommand) -> CommandFuture<'a> {
     Box::pin(async move {
         object.do_pause().await;
@@ -763,7 +763,7 @@ fn cmd_m25<'a>(object: &'a Arc<VirtualSdCard>, _gcmd: &'a GcodeCommand) -> Comma
     })
 }
 
-/// `M26` — set SD position (`virtual_sdcard.py:162-166`).
+/// `M26` — set SD position (`virtual_sdcard.py:220-225`).
 fn cmd_m26<'a>(object: &'a Arc<VirtualSdCard>, gcmd: &'a GcodeCommand) -> CommandFuture<'a> {
     Box::pin(async move {
         if object.work_timer_is_some() {
@@ -775,7 +775,7 @@ fn cmd_m26<'a>(object: &'a Arc<VirtualSdCard>, gcmd: &'a GcodeCommand) -> Comman
     })
 }
 
-/// `M27` — report SD print status (`virtual_sdcard.py:167-172`).
+/// `M27` — report SD print status (`virtual_sdcard.py:226-232`).
 fn cmd_m27<'a>(object: &'a Arc<VirtualSdCard>, gcmd: &'a GcodeCommand) -> CommandFuture<'a> {
     Box::pin(async move {
         if object.current_file.lock().unwrap().is_none() {
@@ -789,7 +789,7 @@ fn cmd_m27<'a>(object: &'a Arc<VirtualSdCard>, gcmd: &'a GcodeCommand) -> Comman
     })
 }
 
-/// `SDCARD_RESET_FILE` (`virtual_sdcard.py:122-127`).
+/// `SDCARD_RESET_FILE` (`virtual_sdcard.py:154-158`).
 fn cmd_sdcard_reset_file<'a>(
     object: &'a Arc<VirtualSdCard>,
     _gcmd: &'a GcodeCommand,
@@ -1498,7 +1498,7 @@ mod tests {
     /// `do_pause` with `cmd_from_sd=true` returns immediately without
     /// waiting for the replay task to exit, avoiding self-deadlock when M25
     /// is replayed from inside the file (upstream `not self.cmd_from_sd`
-    /// guard, `virtual_sdcard.py:125`).
+    /// guard, `virtual_sdcard.py:126`).
     #[tokio::test]
     async fn do_pause_with_cmd_from_sd_does_not_wait() {
         let (_dir, _printer, object, _gcode) = machine();

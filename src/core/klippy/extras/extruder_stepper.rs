@@ -288,7 +288,7 @@ fn cmd_set_pressure_advance(
 
 /// `SET_EXTRUDER_ROTATION_DISTANCE`'s body for one extruder's stepper
 /// (upstream `ExtruderStepper.cmd_SET_E_ROTATION_DISTANCE`,
-/// `kinematics/extruder.py:110-125`).
+/// `kinematics/extruder.py:111-131`).
 ///
 /// A missing `DISTANCE` reports the current value; a zero is refused; a
 /// negative value flips the direction and stores the absolute distance. Each
@@ -334,7 +334,7 @@ pub(crate) fn cmd_set_extruder_rotation_distance(
 }
 
 /// `SYNC_EXTRUDER_MOTION`'s body for one extruder stepper (upstream
-/// `cmd_SYNC_EXTRUDER_MOTION`, `kinematics/extruder.py:128-133`).
+/// `cmd_SYNC_EXTRUDER_MOTION`, `kinematics/extruder.py:133-137`).
 ///
 /// An empty `MOTION_QUEUE` detaches — upstream's `sync_to_extruder("")` branch,
 /// which must **not** be treated as an invalid name; any other value must name

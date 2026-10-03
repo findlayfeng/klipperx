@@ -80,6 +80,7 @@ pub mod query_endstops;
 pub mod resonance_tester;
 pub mod respond;
 pub mod safe_z_home;
+pub mod save_variables;
 pub mod screws_tilt_adjust;
 pub mod sdcard_loop;
 pub mod servo;

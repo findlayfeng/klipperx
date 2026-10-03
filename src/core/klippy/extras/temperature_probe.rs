@@ -3804,7 +3804,7 @@ calibration_bed_temp: 60
         );
     }
 
-    /// `_collect_sample`'s split (`temperature_probe.py:178`): the sensor's
+    /// `_collect_sample`'s split (`temperature_probe.py:164-177`): the sensor's
     /// reading with no helper, the helper's sweep with one — which here stops
     /// at the probe lookup, since no `probe_eddy_current` object is on this
     /// machine.
@@ -3901,7 +3901,7 @@ calibration_bed_temp: 60
     }
 
     /// The batch client's window bookkeeping (`_on_bulk_data_recd`,
-    /// `temperature_probe.py:586-603`): rows land in their window, rows that
+    /// `temperature_probe.py:569-619`): rows land in their window, rows that
     /// pass one retire it, and the last retirement lets the client stay.
     #[test]
     fn the_sweep_buckets_samples_and_retires_windows_upstreams_way() {

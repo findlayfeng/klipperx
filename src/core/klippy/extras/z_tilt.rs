@@ -120,7 +120,7 @@ pub struct RetryHelper {
     state: Mutex<RetryState>,
 }
 
-/// One `start`'s worth of retry bookkeeping (`z_tilt.py:96-103`).
+/// One `start`'s worth of retry bookkeeping (`z_tilt.py:93-101`).
 #[derive(Default)]
 struct RetryState {
     max_retries: i64,
@@ -131,7 +131,7 @@ struct RetryState {
 }
 
 impl RetryHelper {
-    /// Read `retries` and `retry_tolerance` (`z_tilt.py:88-93`).
+    /// Read `retries` and `retry_tolerance` (`z_tilt.py:88-90`).
     ///
     /// # Errors
     /// When a bound is violated: `retries` has `minval=0`,
@@ -252,7 +252,7 @@ impl RetryHelper {
 }
 
 /// The `KEY` names [`RetryHelper::start`] reads, in read order
-/// (`z_tilt.py:88-93`).
+/// (`z_tilt.py:93-101`).
 pub(crate) const RETRY_PARAMS: &[&str] = &["RETRIES", "RETRY_TOLERANCE"];
 
 /// The declared parameters of a retry-driven probe command
@@ -308,7 +308,7 @@ impl ZAdjustStatus {
         status
     }
 
-    /// Clear `applied` (`z_tilt.py:79-80`).
+    /// Clear `applied` (`z_tilt.py:78-79`).
     pub fn reset(&self) {
         self.applied.store(false, Ordering::SeqCst);
     }
@@ -322,7 +322,7 @@ impl ZAdjustStatus {
         retry_result
     }
 
-    /// The status dict (`z_tilt.py:81-82`).
+    /// The status dict (`z_tilt.py:80-81`).
     pub fn get_status(&self, _eventtime: f64) -> Value {
         json!({ "applied": self.applied.load(Ordering::SeqCst) })
     }
@@ -572,7 +572,7 @@ async fn run_adjust<O: Adjust + ?Sized>(
 // ===========================================================================
 
 /// The `[z_tilt]` section: probe points, the plane fit behind
-/// `Z_TILT_ADJUST`, and its status (`z_tilt.py:126-176`).
+/// `Z_TILT_ADJUST`, and its status (`z_tilt.py:127-170`).
 pub struct ZTilt {
     /// The configured motor positions, `z_positions` rows.
     z_positions: Vec<(f64, f64)>,
@@ -967,7 +967,7 @@ mod tests {
     }
 
     /// A range that rises twice without relief aborts with upstream's
-    /// message (`z_tilt.py:104-112, 121-122`) — trailing space included,
+    /// message (`z_tilt.py:117-119`) — trailing space included,
     /// because upstream's `error_msg_extra` for `z_tilt` is empty.
     #[test]
     fn retry_helper_aborts_a_rising_range() {

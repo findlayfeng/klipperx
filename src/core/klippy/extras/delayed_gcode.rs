@@ -17,7 +17,7 @@
 //! # What is not here
 //!
 //! Upstream's `inside_timer` / `repeat` handshake is dropped. It exists because
-//! `delayed_gcode.py:32` calls `gcode.run_script` **synchronously** inside the
+//! `delayed_gcode.py:34` calls `gcode.run_script` **synchronously** inside the
 //! timer callback: a `UPDATE_DELAYED_GCODE` issued *by the delayed script
 //! itself* runs while `inside_timer` is set, so upstream records `repeat` and
 //! wakes again at `eventtime + duration` (`:37-41`).
@@ -60,7 +60,7 @@ section!("delayed_gcode", order = 30, prefix = load_config_prefix);
 const NEVER: f64 = 9_999_999_999_999_999.0;
 
 /// `UPDATE_DELAYED_GCODE`'s help text, verbatim
-/// (`delayed_gcode.py:43`).
+/// (`delayed_gcode.py:42`).
 const UPDATE_DELAYED_GCODE_HELP: &str = "Update the duration of a delayed_gcode";
 
 /// One `[delayed_gcode <name>]`.
@@ -107,7 +107,7 @@ impl DelayedGcode {
             })?;
         let gcode_macro = PrinterGCodeMacro::ensure(printer)?;
         let timer_gcode = gcode_macro.load_template(config, "gcode", None)?;
-        // `delayed_gcode.py:22`: `getfloat('initial_duration', 0., minval=0.)`.
+        // `delayed_gcode.py:17`: `getfloat('initial_duration', 0., minval=0.)`.
         let duration =
             config.get_float_bounded("initial_duration", Some(0.0), Some(0.0), None, None, None)?;
 
@@ -146,7 +146,7 @@ impl DelayedGcode {
         *self.duration.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// Register the timer (`DelayedGcode._handle_ready`, `delayed_gcode.py:34-39`):
+    /// Register the timer (`DelayedGcode._handle_ready`, `delayed_gcode.py:25-30`):
     /// armed for `initial_duration` seconds, or retired at [`NEVER`] when the
     /// duration is 0.
     fn handle_ready(&self) {
@@ -189,7 +189,7 @@ impl DelayedGcode {
     }
 
     /// One timer callback (`DelayedGcode._gcode_timer_event`,
-    /// `delayed_gcode.py:40-49`): render the template, run it, and retire.
+    /// `delayed_gcode.py:31-41`): render the template, run it, and retire.
     ///
     /// The returned `None` is upstream's `NEVER` (`:44-47`); the command
     /// re-arms a retired timer through [`DelayedGcode::arm`] (module docs).
@@ -224,7 +224,7 @@ impl DelayedGcode {
     }
 
     /// Render the `gcode` template the way upstream's `TemplateWrapper.render`
-    /// does with no context (`gcode_macro.py:61-68`): the `printer` view plus
+    /// does with no context (`gcode_macro.py:66-75`): the `printer` view plus
     /// the actions a loaded template may call.
     ///
     /// # Errors
@@ -311,7 +311,7 @@ fn on_ready(printer: &Arc<Printer>, delayed: &Arc<DelayedGcode>) {
 }
 
 /// Upstream's `load_config_prefix` for `[delayed_gcode <name>]`
-/// (`delayed_gcode.py:52-53`).
+/// (`delayed_gcode.py:53-54`).
 ///
 /// # Errors
 /// A missing `gcode`, an invalid `initial_duration`, or a template that does
@@ -427,7 +427,7 @@ mod tests {
     }
 
     /// A callback fires once and retires: upstream returns `NEVER` from
-    /// `_gcode_timer_event` (`delayed_gcode.py:44-47`), so a later clock has
+    /// `_gcode_timer_event` (`delayed_gcode.py:31-41`), so a later clock has
     /// nothing left to run.
     #[tokio::test]
     async fn test_the_timer_retires_after_it_fires() {
@@ -494,7 +494,7 @@ mod tests {
     }
 
     /// `DURATION` is required and has upstream's `minval=0.` bound
-    /// (`delayed_gcode.py:46`).
+    /// (`delayed_gcode.py:44`).
     #[test]
     fn test_update_delayed_gcode_refuses_a_missing_or_negative_duration() {
         let (printer, _reactor) = loaded("[delayed_gcode welcome]\ngcode:\n    RECORD VALUE=x\n");
@@ -578,7 +578,7 @@ mod tests {
     }
 
     /// `initial_duration` has upstream's `minval=0.` bound
-    /// (`delayed_gcode.py:22`).
+    /// (`delayed_gcode.py:17`).
     #[test]
     fn test_a_negative_initial_duration_is_refused() {
         let (config, _) = Config::from_text(

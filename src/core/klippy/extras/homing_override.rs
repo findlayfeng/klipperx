@@ -7,7 +7,7 @@
 //! | `set_position_x/y/z` | none | forced position applied before the script |
 //! | `gcode` | — (required) | the homing script, compiled as a macro template |
 //!
-//! The `G28` wrapper (upstream `homing_override.py:31-64`) is not installed
+//! The `G28` wrapper (upstream `homing_override.py:20-63`) is not installed
 //! here: the script body is a `gcode_macro` template, and templates do not
 //! render in this port yet (`gcode_macro.rs` module docs), so an installed
 //! wrapper could not run the script it replaces `G28` for. The section reads
@@ -24,7 +24,7 @@ use crate::core::klippy::printer::{Printer, PrinterObject};
 section!("homing_override", order = 30, load = load_config);
 
 /// The `[homing_override]` section: the trigger axes, the forced start
-/// position, and the homing script (`homing_override.py:14-19`). The parsed
+/// position, and the homing script (`homing_override.py:10-14`). The parsed
 /// values stay with the object because no `G28` wrapper consumes them yet,
 /// hence the field-level `allow`.
 #[allow(dead_code)]
@@ -65,7 +65,7 @@ impl HomingOverride {
     }
 
     /// The three trigger axes as a mask, from the `axes` option
-    /// (`homing_override.py:16` + `cmd_G28`'s `for axis in self.axes`).
+    /// (`homing_override.py:12` + `cmd_G28`'s `for axis in self.axes`).
     /// Letters outside `x`/`y`/`z` select nothing.
     pub fn axis_mask(&self) -> [bool; 3] {
         let mut mask = [false; 3];

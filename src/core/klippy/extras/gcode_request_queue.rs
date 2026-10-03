@@ -8,7 +8,7 @@
 //!
 //! | upstream | here |
 //! |---|---|
-//! | `_queue_request(print_time, value)` (`output_pin.py:61-62`) | [`GCodeRequestQueue::push`] |
+//! | `_queue_request(print_time, value)` (`output_pin.py:61-64`) | [`GCodeRequestQueue::push`] |
 //! | `_flush_notification(must_flush_time, …)` (`output_pin.py:28-60`) | [`GCodeRequestQueue::flush`] |
 //! | `send_async_request(value, print_time=None)` (`output_pin.py:68-90`) | [`GCodeRequestQueue::send_async_request`] |
 //! | `self.callback(next_time, req_val)` returning `(action, next_min_time)` | [`RequestSink::set_at`] returning [`FlushAction`] + floor |

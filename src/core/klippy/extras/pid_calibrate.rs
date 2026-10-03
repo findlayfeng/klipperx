@@ -131,7 +131,7 @@ impl PIDCalibrate {
                 CommandError::new(format!("Unknown config object '{HEATERS_OBJECT}'"))
             })?;
         // Upstream wraps this `config_error` in `gcmd.error`
-        // (`pid_calibrate.py:21-23`); a command error is this host's spelling.
+        // (`pid_calibrate.py:21-24`); a command error is this host's spelling.
         let heater = pheaters
             .lookup_heater(&heater_name)
             .map_err(|err| CommandError::new(err.to_string()))?;
@@ -957,7 +957,7 @@ mod tests {
         // The `set_temperature(.., wait)` run also echoes an `M105` line each
         // second it waits (`T:0` here — `has_started` is false in this test
         // so the gcode-id table reports the empty default), matching
-        // upstream's `_wait_for_temperature` (`heaters.py:349-360`).
+        // upstream's `_wait_for_temperature` (`heaters.py:348-359`).
         let expected_pid = format!(
             "// PID parameters: pid_Kp={} pid_Ki={} pid_Kd={}\n// The SAVE_CONFIG command will update the printer config file\n// with these parameters and restart the printer.",
             constants[0], constants[1], constants[2]

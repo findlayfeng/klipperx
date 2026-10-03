@@ -1449,7 +1449,7 @@ impl PrinterEddyProbe {
         }
         let epos = calc_probe_z_average(&positions, &params.samples_result);
         // A consumer edits the averaged result in place before it is stored; the
-        // stored value is what the handlers left (`probe.py:329`).
+        // stored value is what the handlers left (`probe.py:364-367`).
         let results = ProbeResultsHandle::new(vec![epos]);
         if let Some(printer) = self.printer.upgrade() {
             printer.send_event(&KlippyEvent::ProbeUpdateResults {
@@ -1568,7 +1568,7 @@ impl ProbeSession for PrinterEddyProbe {
         // The scan path reports its results here upstream
         // (`EddyScanningProbe.pull_probed_results`); descend/tap already
         // sent the event when their set completed. A consumer edits every
-        // result in place before they are returned (`probe.py:329`).
+        // result in place before they are returned (`probe.py:364-367`).
         let is_scan = self
             .active
             .lock()
@@ -1887,7 +1887,7 @@ impl EddyCalibrationTool {
     }
 
     /// `cmd_EDDY_CALIBRATE`: read `PROBE_SPEED` and start the manual probe
-    /// helper (`probe_eddy_current.py:311-316`).
+    /// helper (`probe_eddy_current.py:296-300`).
     async fn cmd_eddy_calibrate(&self, gcmd: &GcodeCommand) -> Result<(), CommandError> {
         let printer = self.printer()?;
         // `gcmd.get_float("PROBE_SPEED", 5., above=0.)`
@@ -1942,7 +1942,7 @@ impl EddyCalibrationTool {
     }
 
     /// `post_manual_probe`: the manual-probe result drives the calibration
-    /// moves and saves the table (`probe_eddy_current.py:268-296`).
+    /// moves and saves the table (`probe_eddy_current.py:260-294`).
     ///
     /// Sync because `FinalizeCallback` is `Fn` (not async): all toolhead
     /// operations use the sync `move_to` / `dwell` / `position` surface.
@@ -2242,7 +2242,7 @@ impl EddyCalibrationTool {
     }
 
     /// `_save_calibration`: format the pairs and write them to `configfile`
-    /// (`probe_eddy_current.py:117-131`).
+    /// (`probe_eddy_current.py:118-132`).
     fn save_calibration(printer: &Arc<Printer>, name: &str, z_freq_pairs: &[(f64, f64)]) {
         let gcode = printer.lookup_object_as::<GCodeDispatch>(GCODE_OBJECT);
         if let Some(gcode) = gcode {
@@ -2272,7 +2272,7 @@ impl EddyCalibrationTool {
 
     /// `_save_tap_z_offset`: read current `tap_z_offset` from configfile
     /// settings, subtract the homing Z, and write back
-    /// (`probe_eddy_current.py:318-330`).
+    /// (`probe_eddy_current.py:302-314`).
     fn save_tap_z_offset(printer: &Arc<Printer>, name: &str, gcmd: &GcodeCommand, homing_z: f64) {
         let tap_z_offset = printer
             .lookup_object_as::<PrinterConfig>(CONFIGFILE_OBJECT)
@@ -2298,7 +2298,7 @@ impl EddyCalibrationTool {
 
     /// `cmd_Z_OFFSET_APPLY_PROBE`: read the gcode_move homing origin Z,
     /// then either save the tap z offset (METHOD=tap) or shift the
-    /// calibration table and save it (`probe_eddy_current.py:336-354`).
+    /// calibration table and save it (`probe_eddy_current.py:316-329`).
     async fn cmd_z_offset_apply_probe(&self, gcmd: &GcodeCommand) -> Result<(), CommandError> {
         let printer = self.printer()?;
         let gcode_move = printer

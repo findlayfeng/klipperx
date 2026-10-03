@@ -17,7 +17,7 @@
 //! The math is upstream's: stable positions and trilateration come from
 //! [`DeltaCalibration`](crate::core::klippy::motion::delta::DeltaCalibration),
 //! the measurement geometry from `measurements_to_distances`
-//! (`delta_calibrate.py:32-66`), the fit from `mathutil.coordinate_descent`
+//! (`delta_calibrate.py:35-71`), the fit from `mathutil.coordinate_descent`
 //! (already in [`coordinate_descent`](crate::core::klippy::mathutil)).
 //!
 //! What is deliberately not here: running the fit in a background process
@@ -50,7 +50,7 @@ section!("delta_calibrate", order = 30, load = load_config);
 /// The object the toolhead is looked up under.
 const TOOLHEAD_OBJECT: &str = "toolhead";
 
-/// The two commands this section registers (`delta_calibrate.py:121-123`).
+/// The two commands this section registers (`delta_calibrate.py:123-126`).
 const COMMAND_CALIBRATE: &str = "DELTA_CALIBRATE";
 const COMMAND_ANALYZE: &str = "DELTA_ANALYZE";
 
@@ -82,7 +82,7 @@ const MEASURE_OUTER_RADIUS: f64 = 65.;
 const MEASURE_RIDGE_RADIUS: f64 = 5.0 - 0.5;
 
 /// A stable position: steps taken since each tower hit its endstop
-/// (`delta_calibrate.py:7-11`).
+/// (`delta_calibrate.py:10-13`).
 type Stable = [f64; 3];
 /// A measured height paired with the stable position it was taken at.
 type HeightPosition = (f64, Stable);
@@ -90,7 +90,7 @@ type HeightPosition = (f64, Stable);
 type Distance = (f64, Stable, Stable);
 
 /// `[delta_calibrate]`: the probe helper, the saved measurements, and the
-/// running `DELTA_ANALYZE` entry (`DeltaCalibrate`, `delta_calibrate.py:69-160`).
+/// running `DELTA_ANALYZE` entry (`DeltaCalibrate`, `delta_calibrate.py:78-284`).
 pub struct DeltaCalibrate {
     /// The machine, for the commands, the toolhead and the configfile object.
     printer: Weak<Printer>,
@@ -115,14 +115,14 @@ pub struct DeltaCalibrate {
 impl DeltaCalibrate {
     /// Read the section, wire the probe helper, restore the saved
     /// measurements, and register both commands
-    /// (`DeltaCalibrate.__init__`, `delta_calibrate.py:73-123`).
+    /// (`DeltaCalibrate.__init__`, `delta_calibrate.py:79-126`).
     ///
     /// # Errors
     /// A malformed option, fewer than three probe points, or a command name
     /// that is taken.
     fn new(config: &ConfigWrapper, printer: &Arc<Printer>) -> Result<Arc<Self>, ConfigError> {
         // The default probe points: the centre plus six points on a scattered
-        // ring of `radius` (`delta_calibrate.py:76-82`).
+        // ring of `radius` (`delta_calibrate.py:83-90`).
         let radius = config.get_float_bounded("radius", None, None, None, Some(0.0), None)?;
         const SCATTER: [f64; 6] = [0.95, 0.90, 0.85, 0.70, 0.75, 0.80];
         let mut points = vec![(0., 0.)];
@@ -377,8 +377,8 @@ impl DeltaCalibrate {
         Ok(())
     }
 
-    /// Store the fit for `SAVE_CONFIG` (`save_state`, `delta_calibrate.py:135-160`,
-    /// plus `DeltaCalibration.save_state`, `delta.py:223-240`).
+    /// Store the fit for `SAVE_CONFIG` (`save_state`, `delta_calibrate.py:132-154`,
+    /// plus `DeltaCalibration.save_state`, `delta.py:220-238`).
     fn save_state(
         &self,
         probe_positions: &[HeightPosition],
@@ -533,7 +533,7 @@ impl DeltaCalibrate {
     }
 
     /// `DELTA_ANALYZE MANUAL_HEIGHT=`: record the height the nozzle is at,
-    /// as a stable position (`add_manual_height`, `delta_calibrate.py:222-239`).
+    /// as a stable position (`add_manual_height`, `delta_calibrate.py:224-239`).
     ///
     /// The port reads the toolhead's commanded position instead of
     /// re-deriving it from the steppers after a generation flush: the two are
@@ -616,7 +616,7 @@ pub fn load_config(
 // ===========================================================================
 
 /// Load a stable position from a config entry (`load_config_stable`,
-/// `delta_calibrate.py:14-15`): three floats on one line.
+/// `delta_calibrate.py:16-17`): three floats on one line.
 ///
 /// # Errors
 /// When the option is missing (the entry it belongs to is incomplete) or a
@@ -691,7 +691,7 @@ fn format_stable_height(height: f64) -> String {
 }
 
 // ===========================================================================
-// measurements_to_distances (delta_calibrate.py:32-66)
+// measurements_to_distances (delta_calibrate.py:35-71)
 // ===========================================================================
 
 /// Convert distance measurements made on the calibration object into
@@ -891,7 +891,7 @@ mod tests {
     #[test]
     fn test_the_save_config_report_matches_the_upstream_wording() {
         // `DeltaCalibration.save_state`'s report lines, exactly as upstream
-        // formats them (`delta.py:231-240`).
+        // formats them (`delta.py:231-238`).
         let calibration = example_calibration();
         let line = format!(
             "stepper_a: position_endstop: {:.6} angle: {:.6} arm_length: {:.6}\n\

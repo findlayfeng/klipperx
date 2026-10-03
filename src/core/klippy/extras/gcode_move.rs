@@ -222,7 +222,7 @@ impl GCodeMove {
         Ok(())
     }
 
-    /// Upstream's `_handle_ready` (`gcode_move.py:66-71`): resolve the move
+    /// Upstream's `_handle_ready` (`gcode_move.py:58-64`): resolve the move
     /// target to the toolhead when nothing else claimed the slot, then anchor
     /// `last_position` to where the toolhead is.
     fn handle_ready(&self) {

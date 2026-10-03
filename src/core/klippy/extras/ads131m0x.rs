@@ -159,14 +159,14 @@ pub struct SensorParams {
     pub sensor_id: u8,
 }
 
-/// ADS131M02: two channels (`ads131m0x.py:403-405`).
+/// ADS131M02: two channels (`ads131m0x.py:399-400`).
 pub const ADS131M02: SensorParams = SensorParams {
     sensor_type: "ADS131M02",
     num_channels: 2,
     sensor_id: 0x22,
 };
 
-/// ADS131M04: four channels (`ads131m0x.py:407-409`).
+/// ADS131M04: four channels (`ads131m0x.py:402-403`).
 pub const ADS131M04: SensorParams = SensorParams {
     sensor_type: "ADS131M04",
     num_channels: 4,

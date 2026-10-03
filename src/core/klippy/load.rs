@@ -40,8 +40,8 @@
 //! prefix-only section that *registers something another section consumes while
 //! loading* (a pin chip, a sensor factory) cannot precede the generic sections
 //! by `order` — every generic main section still loads first. Such a definition
-//! has to sit in an earlier phase (`phase = early`); `[adc_scaled <name>]` and
-//! `[thermistor <name>]` are the two cases.
+//! has to sit in an earlier phase (`phase = early`); `[adc_scaled <name>]`,
+//! `[thermistor <name>]` and `[adc_temperature <name>]` are the cases.
 //!
 //! # Validation
 //!
@@ -519,11 +519,12 @@ mod tests {
                 "safe_z_home"
             ]
         );
-        // `mcu`, `adc_scaled` and `thermistor` are the up-front sections
-        // (upstream loads `pins` and `mcu` before the generic walk; a
-        // `[adc_scaled]` registers a chip and a `[thermistor <name>]` a sensor
-        // factory that the generic `[extruder]`/`[heater_bed]` sections resolve
-        // their `sensor_pin`/`sensor_type` against *while they load*, so both
+        // `mcu`, `adc_scaled`, `thermistor` and `adc_temperature` are the
+        // up-front sections (upstream loads `pins` and `mcu` before the generic
+        // walk; a `[adc_scaled]` registers a chip and a `[thermistor <name>]`
+        // or `[adc_temperature <name>]` a sensor factory that the generic
+        // `[extruder]`/`[heater_bed]` sections resolve their
+        // `sensor_pin`/`sensor_type` against *while they load*, so both
         // have to precede them — and a phase's main sections load before its
         // prefixes, so a prefix-only definition needs an earlier phase);
         // `[stepper_*]` and `[printer]` are late (upstream builds `toolhead`
@@ -550,6 +551,10 @@ mod tests {
         // prefix section, so it must load in an early phase (see the array
         // comment above).
         assert_eq!(by_id("thermistor").phase, Phase::Early);
+        // An `[adc_temperature <name>]` factory is consumed at load time too
+        // (`sensor_type` of the generic heater sections), so it moves with the
+        // other definition prefixes (2026-10-03, `372cd93`).
+        assert_eq!(by_id("adc_temperature").phase, Phase::Early);
         assert_eq!(by_id("output_pin").phase, Phase::Generic);
         assert_eq!(by_id("stepper_x").phase, Phase::Late);
         assert_eq!(by_id("stepper_arm").phase, Phase::Late);

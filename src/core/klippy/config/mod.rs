@@ -340,9 +340,14 @@ impl Config {
             current_key = Some(key.clone());
             option_indent = indent;
             if value_str.is_empty() {
+                // The empty option line is the value's first — empty — line.
+                // `configparser` appends continuation lines with `'\n'`, so
+                // keeping it is what makes a value that starts with `'\n'`
+                // (upstream `temperature_probe`'s `drift_calibration`,
+                // `temperature_probe.py:646`) survive the round trip.
                 section
                     .parameters
-                    .insert(key.clone(), ConfigValue::Multi(Vec::new()));
+                    .insert(key.clone(), ConfigValue::Multi(vec![String::new()]));
             } else {
                 section
                     .parameters
@@ -687,14 +692,17 @@ fn merge_autosave(body: &mut Config, saved: &Config) {
 
 /// Serialize a config's sections to plain ini text, upstream's
 /// `build_config_string` (`configfile.py:210-226`): `[identifier]`, one
-/// `option = value` line per parameter (a multi-line value's continuation
-/// lines stay embedded), and a blank line closing each section.
+/// `option = value` line per parameter, and a blank line closing each
+/// section. A multi-line value's continuation lines are indented with a tab,
+/// exactly as `configparser.write` leaves them (`'\n'` → `'\n\t'`), so the
+/// block reads back as one option instead of a run of invalid lines.
 pub fn build_config_string(config: &Config) -> String {
     let mut out = String::new();
     for section in config.sections_vec() {
         out.push_str(&format!("[{}]\n", section.identifier()));
         for (option, value) in &section.parameters {
-            out.push_str(&format!("{option} = {}\n", value.as_str()));
+            let value = value.as_str().replace('\n', "\n\t");
+            out.push_str(&format!("{option} = {value}\n"));
         }
         out.push('\n');
     }
@@ -795,13 +803,17 @@ mod tests {
 
     #[test]
     fn an_equals_option_may_continue_from_an_empty_value() {
+        // The empty option line is the value's first — empty — line, exactly
+        // what upstream's `configparser` hands back (`get` on this text
+        // returns `'\n0.05:3300,0.10:3200,\n0.20:2900'`, measured in Python),
+        // so the continuation lines hang below it.
         let config = parse(
             "[probe_eddy_current eddy]\ncalibrate =\n    0.05:3300,0.10:3200,\n    0.20:2900\nspeed: 1\n",
         );
         let section = config.get_section("probe_eddy_current eddy").unwrap();
         assert_eq!(
             section.get("calibrate").unwrap().lines(),
-            vec!["0.05:3300,0.10:3200,", "0.20:2900"]
+            vec!["", "0.05:3300,0.10:3200,", "0.20:2900"]
         );
         assert_eq!(section.get_str("speed"), Some("1"));
     }
@@ -974,6 +986,57 @@ mod tests {
         assert_eq!(
             config.get_section("stepper_a").unwrap().get_str("angle"),
             Some("210.0")
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Multi-line values in the block — the SAVE_CONFIG round trip
+    // -----------------------------------------------------------------------
+
+    /// A pending value the way `temperature_probe`'s `finish_calibration`
+    /// queues one: upstream's `"\n" + "\n".join(polys)`
+    /// (`temperature_probe.py:646`) — an empty first line, then the curves.
+    const MULTILINE_VALUE: &str = "\n300, 0, 0\n200, 0, 0\n100, 0, 0";
+
+    /// A one-section block fileconfig holding `option = value`.
+    fn block_with(option: &str, value: &str) -> Config {
+        let mut section = ConfigSection::new("temperature_probe", Some("probe"));
+        section
+            .parameters
+            .insert(option.to_string(), ConfigValue::Single(value.to_string()));
+        let mut config = Config::new();
+        config.add_section(section);
+        config
+    }
+
+    /// `configparser` writes a multi-line value as `key = ` with every
+    /// following line indented by a tab (`configfile.py:152-155` through
+    /// `ConfigParser.write`); the `#*# ` prefix keeps that indentation, so the
+    /// block stays a value the parser reads back as one option.
+    #[test]
+    fn a_multiline_block_value_is_written_with_indented_continuations() {
+        let text = build_autosave_block(&block_with("drift_calibration", MULTILINE_VALUE));
+        assert!(
+            text.contains(
+                "#*# drift_calibration =\n#*# \t300, 0, 0\n#*# \t200, 0, 0\n#*# \t100, 0, 0"
+            ),
+            "{text}"
+        );
+    }
+
+    /// Write, split, parse, and the value must be byte-for-byte the one that
+    /// went in — a multi-line value that only parses is not enough: a restart
+    /// must load exactly what the calibration saved.
+    #[test]
+    fn a_multiline_block_value_round_trips_verbatim() {
+        let text = format!(
+            "[temperature_probe probe]\nsensor_type: Scripted\n{}",
+            build_autosave_block(&block_with("drift_calibration", MULTILINE_VALUE))
+        );
+        let config = parse(&text);
+        assert_eq!(
+            value(&config, "temperature_probe probe", "drift_calibration"),
+            MULTILINE_VALUE
         );
     }
 

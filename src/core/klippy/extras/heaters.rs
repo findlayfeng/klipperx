@@ -6,7 +6,10 @@
 //! holds the sensor factories and the heaters, [`Heater`] is the control loop
 //! `[extruder]` / `[heater_bed]` / `[heater_generic]` build, and
 //! [`PrinterHeaters::setup_heater`] also gives each heater its
-//! `[verify_heater <name>]` check.
+//! `[verify_heater <name>]` check, and the first heater loads the
+//! `pid_calibrate` object with it (`heaters.py:64-65`) — where `PID_CALIBRATE`
+//! and its [`HeaterControl`] takeover come from
+//! (`crate::core::klippy::extras::pid_calibrate`).
 //!
 //! The object has no `[heaters]` section of its own — upstream loads it by name
 //! (`printer.load_object(config, 'heaters')`) and so does [`ensure`], which is
@@ -23,9 +26,11 @@ use crate::core::klippy::config::{ConfigError, ConfigWrapper};
 use crate::core::klippy::extras::adc_temperature;
 use crate::core::klippy::extras::ds18b20;
 use crate::core::klippy::extras::heater_generic::PrinterHeaterGeneric;
+use crate::core::klippy::extras::pid_calibrate;
 use crate::core::klippy::extras::spi_temperature;
 use crate::core::klippy::extras::temperature_combined;
 use crate::core::klippy::extras::temperature_mcu;
+use crate::core::klippy::extras::toolhead::ToolHeadObject;
 use crate::core::klippy::extras::verify_heater;
 use crate::core::klippy::gcode::{
     sync, CommandError, CommandHandler, GCodeDispatch, GcodeCommand, GCODE_OBJECT,
@@ -43,13 +48,15 @@ const MAX_HEAT_TIME: f64 = 3.0;
 /// The temperature the PID's first derivative is measured against
 /// (upstream `AMBIENT_TEMP`, `heaters.py:17`).
 const AMBIENT_TEMP: f64 = 25.0;
-/// The divisor upstream stores PID constants over (`PID_PARAM_BASE`).
-const PID_PARAM_BASE: f64 = 255.0;
+/// The divisor upstream stores PID constants over (`PID_PARAM_BASE`) — what
+/// `pid_calibrate` multiplies its tuned gains by before storing them
+/// (`pid_calibrate.py:124`).
+pub const PID_PARAM_BASE: f64 = 255.0;
 /// How close a PID must settle before its target counts reached
 /// (`PID_SETTLE_DELTA`/`PID_SETTLE_SLOPE`, read by [`Heater::check_busy`]).
-/// Upstream polls it in `_wait_for_temperature` for `M109`/`M190`, whose wait
-/// loop is not wired yet; `TEMPERATURE_WAIT` does not use it — it waits on the
-/// reading itself.
+/// Upstream polls it in `_wait_for_temperature` while `M109`/`M190` wait
+/// (`set_temperature(.., wait)`); `TEMPERATURE_WAIT` does not use it — its
+/// loop waits on the reading itself.
 const PID_SETTLE_DELTA: f64 = 1.0;
 const PID_SETTLE_SLOPE: f64 = 0.1;
 /// `cmd_TEMPERATURE_WAIT_help` (`heaters.py:366`).
@@ -59,6 +66,10 @@ const TEMPERATURE_WAIT_HELP: &str = "Wait for a temperature on a sensor";
 /// registered to report: the `gcode_id` table is the still-open M105 unit
 /// (`register_sensor` claims the option and drops it).
 const TEMPERATURE_WAIT_REPORT: &str = "T:0";
+
+/// The toolhead a `set_temperature` wait flushes through, upstream's
+/// `lookup_object("toolhead")` (`heaters.py:352,361`).
+const TOOLHEAD_OBJECT: &str = "toolhead";
 
 /// Called with `(read_time, temperature)` for every reading.
 pub type SensorCallback = Box<dyn Fn(f64, f64) + Send + Sync>;
@@ -78,8 +89,29 @@ pub type SensorFactory = Arc<
     dyn Fn(&ConfigWrapper, &Arc<Printer>) -> Result<Arc<dyn Sensor>, ConfigError> + Send + Sync,
 >;
 
-/// The heater control algorithms (upstream's `ControlBangBang` / `ControlPID`).
-#[derive(Debug)]
+/// A control algorithm a heater runs over each reading.
+///
+/// Upstream spells these as classes with `temperature_update` / `check_busy`
+/// (`ControlBangBang` and `ControlPID` here, `ControlAutoTune` in
+/// `pid_calibrate.py`); the trait is what lets a calibration take the
+/// heater's control over for the length of a run and hand the old one back
+/// ([`Heater::set_control`], upstream's `Heater.set_control`,
+/// `heaters.py:127-132`).
+pub trait HeaterControl: Send {
+    /// Compute the PWM value for one reading (`temperature_update`).
+    ///
+    /// `target` is the heater's own target, passed so a control may rewrite
+    /// it — that is upstream's `Heater.alter_target` (`heaters.py:133-136`),
+    /// which `ControlAutoTune` uses to swing between the calibration target
+    /// and `TUNE_PID_DELTA` below it.
+    fn update(&mut self, read_time: f64, temp: f64, target: &mut f64, max_power: f64) -> f64;
+
+    /// Whether a requested temperature has not been reached yet
+    /// (`check_busy`).
+    fn check_busy(&self, smoothed_temp: f64, target: f64) -> bool;
+}
+
+/// The configured control algorithms (upstream's `ControlBangBang` / `ControlPID`).
 enum Control {
     /// `control: watermark`.
     BangBang { max_delta: f64, heating: bool },
@@ -97,11 +129,12 @@ enum Control {
     },
 }
 
-impl Control {
-    /// Compute the PWM value for one reading (`temperature_update`).
-    fn update(&mut self, read_time: f64, temp: f64, target: f64, max_power: f64) -> f64 {
+impl HeaterControl for Control {
+    /// One reading: the PWM value the heater applies (`temperature_update`).
+    fn update(&mut self, read_time: f64, temp: f64, target: &mut f64, max_power: f64) -> f64 {
         match self {
             Control::BangBang { max_delta, heating } => {
+                let target = *target;
                 if *heating && temp >= target + *max_delta {
                     *heating = false;
                 } else if !*heating && temp <= target - *max_delta {
@@ -124,6 +157,7 @@ impl Control {
                 prev_temp_deriv,
                 prev_temp_integ,
             } => {
+                let target = *target;
                 let time_diff = read_time - *prev_temp_time;
                 let temp_diff = temp - *prev_temp;
                 let temp_deriv = if time_diff >= *min_deriv_time {
@@ -171,6 +205,10 @@ impl Control {
 pub struct Heater {
     /// The section's short name (`extruder`, `heater_bed`).
     name: String,
+    /// The section it was configured under (`heater_generic myheater`),
+    /// upstream's `Heater.get_name()` — a superset of [`Self::name`], and the
+    /// name `PID_CALIBRATE` stages its result under for `SAVE_CONFIG`.
+    section_name: String,
     /// The sensor built from the heater's section.
     sensor: Arc<dyn Sensor>,
     /// The heater's PWM output, when the pin was set up.
@@ -193,13 +231,30 @@ struct HeaterState {
     last_temp_time: f64,
     can_extrude: bool,
     last_pwm_value: f64,
-    control: Control,
+    control: Box<dyn HeaterControl>,
 }
 
 impl Heater {
     /// The heater's short name (`extruder`, `heater_bed`).
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// The section the heater was configured under (`Heater.get_name`,
+    /// `heaters.py:101-102`).
+    pub fn section_name(&self) -> &str {
+        &self.section_name
+    }
+
+    /// The configured power ceiling (`Heater.get_max_power`,
+    /// `heaters.py:105-106`).
+    pub fn max_power(&self) -> f64 {
+        self.max_power
+    }
+
+    /// The target the heater is holding (`Heater.target_temp`).
+    pub fn target_temp(&self) -> f64 {
+        self.lock().target_temp
     }
 
     /// The sensor this heater reads.
@@ -221,16 +276,31 @@ impl Heater {
     ///
     /// # Errors
     /// The requested temperature is outside the configured range, as
-    /// upstream's `SET_HEATER_TEMPERATURE` checks.
+    /// upstream's `SET_HEATER_TEMPERATURE` checks (with upstream's own
+    /// wording, `heaters.py:109-113`).
     pub fn set_temp(&self, degrees: f64) -> Result<(), CommandError> {
         if degrees != 0.0 && (degrees < self.min_temp || degrees > self.max_temp) {
             return Err(CommandError::new(format!(
-                "Requested temperature ({:.1}) out of range ({:.1}, {:.1})",
-                degrees, self.min_temp, self.max_temp
+                "Requested temperature ({degrees:.1}) out of range ({:.1}:{:.1})",
+                self.min_temp, self.max_temp
             )));
         }
         self.lock().target_temp = degrees;
         Ok(())
+    }
+
+    /// Swap in another control algorithm, returning the one that was running
+    /// (`Heater.set_control`, `heaters.py:127-132`). `PID_CALIBRATE` installs
+    /// its autotune for the length of a run and hands the configured control
+    /// back afterwards — and, as upstream does, each swap leaves the heater
+    /// with no target: the command sets the calibration target through
+    /// [`Self::set_temp`] straight afterwards, and restoring the old control
+    /// is what turns the heater off at the end of the run.
+    pub fn set_control(&self, control: Box<dyn HeaterControl>) -> Box<dyn HeaterControl> {
+        let mut state = self.lock();
+        let old = std::mem::replace(&mut state.control, control);
+        state.target_temp = 0.0;
+        old
     }
 
     /// One sensor reading: run the control loop and update the smoothed
@@ -240,10 +310,12 @@ impl Heater {
         let time_diff = read_time - state.last_temp_time;
         state.last_temp = temp;
         state.last_temp_time = read_time;
-        let target = state.target_temp;
-        let value = state
-            .control
-            .update(read_time, temp, target, self.max_power);
+        let HeaterState {
+            control,
+            target_temp,
+            ..
+        } = &mut *state;
+        let value = control.update(read_time, temp, target_temp, self.max_power);
         // Upstream schedules the change at `read_time + pwm_delay`; print-time
         // scheduling is C1d, so the output goes out immediately.
         if let Some(pwm) = &self.pwm {
@@ -312,10 +384,11 @@ impl std::fmt::Debug for Heater {
 /// object names instead (`controller_fan.rs:22-30`), because that table did not
 /// exist when it was written.
 pub struct PrinterHeaters {
-    /// The machine this registry serves, for the `TEMPERATURE_WAIT` handler to
-    /// resolve its sensor with (upstream's bound method reaches the same state
-    /// through `gcmd`'s printer). `Weak`, so the command table the printer
-    /// keeps does not keep the printer alive.
+    /// The machine this registry serves: what `set_temperature(.., wait)`
+    /// reaches for the toolhead and the shutdown check, and what the
+    /// `TEMPERATURE_WAIT` handler resolves its sensor with (upstream's bound
+    /// method reaches the same state through `gcmd`'s printer). `Weak`, so
+    /// the command table the printer keeps does not keep the printer alive.
     printer: Weak<Printer>,
     factories: Mutex<BTreeMap<String, SensorFactory>>,
     sensors: Mutex<Vec<String>>,
@@ -346,6 +419,77 @@ impl PrinterHeaters {
             .get(name)
             .cloned()
             .ok_or_else(|| ConfigError::new(format!("Unknown heater '{name}'")))
+    }
+
+    /// Give a heater a target, waiting for it when asked
+    /// (`PrinterHeaters.set_temperature`, `heaters.py:360-365`).
+    ///
+    /// Upstream's wait loop is [`Self::wait_for_temperature`]; `wait` is what
+    /// `PID_CALIBRATE` asks for. `M109`/`M190` want the same wait once their
+    /// own loop is wired — today they set their target and return.
+    ///
+    /// # Errors
+    /// The target is outside the heater's configured range (upstream raises
+    /// the same `command_error` from `heater.set_temp`).
+    pub async fn set_temperature(
+        &self,
+        heater: &Heater,
+        temp: f64,
+        wait: bool,
+    ) -> Result<(), CommandError> {
+        // Upstream registers a no-op lookahead callback first, so the planner
+        // keeps handing moves to the trapq while the wait runs
+        // (`heaters.py:361-362`).
+        if let Some(toolhead) = self
+            .printer
+            .upgrade()
+            .and_then(|printer| printer.lookup_object_as::<ToolHeadObject>(TOOLHEAD_OBJECT))
+        {
+            toolhead.register_lookahead_callback(Box::new(|_print_time| {}));
+        }
+        heater.set_temp(temp)?;
+        if wait && temp != 0.0 {
+            self.wait_for_temperature(heater).await;
+        }
+        Ok(())
+    }
+
+    /// Wait until the heater's control says the target has settled, or the
+    /// printer gives up (`PrinterHeaters._wait_for_temperature`,
+    /// `heaters.py:348-359`).
+    ///
+    /// What differs from upstream:
+    ///
+    /// * the per-second `M105` line is not echoed — the `M105` g-code-id
+    ///   table is not wired yet (`TODO H1`), so there is no temperature line
+    ///   to report;
+    /// * a file-output run returns at once, as upstream's does
+    ///   (`heaters.py:350-351`);
+    /// * the sleep is a `tokio` timer rather than `reactor.pause`.
+    async fn wait_for_temperature(&self, heater: &Heater) {
+        let Some(printer) = self.printer.upgrade() else {
+            return;
+        };
+        if printer.is_fileoutput() {
+            return;
+        }
+        loop {
+            if matches!(
+                printer.get_state_message().category,
+                PrinterState::Shutdown | PrinterState::Error
+            ) {
+                // Upstream's `not printer.is_shutdown()`.
+                break;
+            }
+            if !heater.check_busy(heater.target_temp()) {
+                break;
+            }
+            // Keep the look-ahead moving, as upstream does each second.
+            if let Some(toolhead) = printer.lookup_object_as::<ToolHeadObject>(TOOLHEAD_OBJECT) {
+                let _ = toolhead.get_last_move_time();
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
     }
 
     /// Register a sensor type, upstream's `add_sensor_factory`.
@@ -582,6 +726,7 @@ impl PrinterHeaters {
 
         let heater = Arc::new(Heater {
             name: short_name.clone(),
+            section_name: identifier,
             sensor,
             pwm: Some(pwm),
             min_temp,
@@ -600,7 +745,7 @@ impl PrinterHeaters {
                 // answered and so no reading ever flips this on again.
                 can_extrude: min_extrude_temp <= 0.0 || printer.is_fileoutput(),
                 last_pwm_value: 0.0,
-                control,
+                control: Box::new(control),
             }),
         });
         // The sensor delivers each reading to the control loop through a weak
@@ -625,6 +770,10 @@ impl PrinterHeaters {
             printer,
         )?;
         printer.add_object(&check_identifier, check)?;
+        // Upstream's `Heater.__init__` loads `pid_calibrate` right after
+        // `verify_heater` (`heaters.py:64-65`), so `PID_CALIBRATE` exists as
+        // soon as the first heater does — and not before that, as upstream.
+        pid_calibrate::ensure(printer)?;
         self.heaters
             .lock()
             .unwrap_or_else(|p| p.into_inner())

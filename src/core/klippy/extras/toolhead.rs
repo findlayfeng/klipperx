@@ -4307,7 +4307,7 @@ mod tests {
         }
 
         let expected = object.get_last_move_time();
-        let mut fired = times.lock().unwrap();
+        let fired = times.lock().unwrap();
         assert_eq!(fired.len(), 1, "the empty look-ahead fires immediately");
         assert!(
             (fired[0] - expected).abs() < 1e-9,

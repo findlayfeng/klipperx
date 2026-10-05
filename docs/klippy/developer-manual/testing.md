@@ -490,7 +490,7 @@ python3 scripts/pyref-audit.py --window 1            # 只认同行锚点（严�
 噪声；`--window 1` 的严格模式噪声低得多，但会漏掉「符号名写在上一条注释行」这类——两种
 模式互补，先用严格模式清一遍，再用窗口模式补漏。
 
-`cargo doc --no-deps --lib` 的警告数应与改动前一致（根包目前有 2 条残留于 `frame.rs` / `msg/parser.rs`；`klippy-api` 与 `klippy-client` 是 0 条）。新增模块时注意两个陷阱：
+`cargo doc --no-deps --lib` 的警告数应与改动前一致（**2026-10-06 实测基线**：根包 144 条——100 条「public documentation links to private item」、23 条「redundant explicit link target」、20 条「unresolved link」、1 条「unclosed HTML tag」；`klippy-api` 与 `klippy-client` 均 0 条。这 144 条是历史欠账，尚未清理；要求是**不新增**）。新增模块时注意两个陷阱：
 
 1. **模块的文档链接是在它的 `mod` 声明所在作用域里解析的**，不是在被声明模块自己的作用域里。`klippy/mod.rs` 里的 `pub mod …;` 因此都不带 `///` 文档。
 2. **把私有模块提升为 `pub mod` 会激活它的公开文档检查**：模块文档里指向 `pub(crate)` 项的链接会报 `links to private item`。`identify` 从 `mcu` 的子模块提升为顶层公开模块时就遇到这一点，需要把这类链接改成纯代码 span。

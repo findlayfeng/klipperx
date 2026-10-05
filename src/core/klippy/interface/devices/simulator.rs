@@ -155,16 +155,14 @@ struct State {
 }
 
 /// The firmware's per-stepper chain state (`stepper.c`): where the next step
-/// fires from (`base + interval`), when the armed batch ends (`end`, standing
-/// in for `s->count > 0`), and how far apart steps run.
+/// fires from (`base` plus the arming command's interval), and when the armed
+/// batch ends (`end`, standing in for `s->count > 0`).
 #[derive(Debug, Clone, Copy)]
 struct StepChain {
     /// The firmware's `s->next_step_time`: the chain anchor. `config_stepper`
     /// zeroes it; a reused firmware keeps the last session's tail — the
     /// leftover the C5 case hinged on.
     base: u32,
-    /// The step distance of the batch that armed this chain.
-    interval: u32,
     /// When the armed batch's last step fires (wrapping); the chain is busy
     /// while `now` is before it. Approximates `count`/`add` bookkeeping
     /// (`stepper.c:96-123`) — enough to answer "is this stepper running".
@@ -899,7 +897,6 @@ impl SimulatorDevice {
                             *oid,
                             StepChain {
                                 base: 0,
-                                interval: 0,
                                 end: 0,
                                 armed: false,
                             },
@@ -1460,7 +1457,7 @@ mod tests {
         issue(&device, "reset", &[]);
         assert_eq!(shutdown_reason(&device), None);
         {
-            let mut state = device.state.lock().unwrap_or_else(|p| p.into_inner());
+            let state = device.state.lock().unwrap_or_else(|p| p.into_inner());
             assert!(!state.ldc_sampling, "a reboot drops the feed");
         }
     }

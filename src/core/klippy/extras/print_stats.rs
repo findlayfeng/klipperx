@@ -607,7 +607,7 @@ mod tests {
     /// `note_pause` does not overwrite an error state (`print_stats.py:46`).
     #[test]
     fn note_pause_does_not_overwrite_error_state() {
-        let (reactor, _printer, _gcode, object) = machine();
+        let (_reactor, _printer, _gcode, object) = machine();
         object.note_start();
         object.note_error("boom");
         object.note_pause();

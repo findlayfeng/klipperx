@@ -28,8 +28,10 @@
 //!
 //! * **Motion.** `G0`/`G1`/`G28`/… are registered by the toolhead; this module
 //!   is only the dispatcher, so it does not depend on one.
-//! * **The `ok` acknowledgement.** Upstream's `ack()` belongs to the file-output
-//!   and debug-input protocols (`GCodeIO`), which this host does not have yet.
+//! * **The `ok` acknowledgement.** This host does not implement the line
+//!   protocols of upstream's `GCodeIO` (pseudo-tty or file input), so there is
+//!   no producer for the `ok` acknowledgement and the mechanism is *deleted*;
+//!   see the deviation page `docs/klippy/developer-manual/upstream-deviations.md`.
 //! * **`gcode:command_error`.** Upstream fires that event on a handler error;
 //!   we do too, on the `KlippyEvent` bus (an open vocabulary with an `Unknown`
 //!   fallback, see the event system doc), not a closed event set.
@@ -163,14 +165,6 @@ pub struct GcodeCommand {
     command: String,
     commandline: String,
     params: HashMap<String, String>,
-    /// Whether this line still wants an `ok` ack.
-    ///
-    /// Upstream's `need_ack` (`klippy/gcode.py:23`): true for the file/serial
-    /// input protocol, false for an API `gcode/script` line. [`GcodeCommand::ack`]
-    /// clears it, so a handler that acks itself is not acked again by the
-    /// trailing `gcmd.ack()` of `_process_commands`. An `AtomicBool` rather than
-    /// a `Cell` so `&GcodeCommand` is `Send` and a handler's future can await.
-    need_ack: AtomicBool,
 }
 
 impl GcodeCommand {
@@ -390,22 +384,6 @@ impl GcodeCommand {
     /// client sent rather than a host event.
     pub fn respond_info_no_log(&self, msg: &str) {
         self.dispatch.respond_info(msg, false);
-    }
-
-    /// Acknowledge the line, when its input wants acks.
-    ///
-    /// Upstream's `ack` (`klippy/gcode.py:54-63`): `ok`, or `ok <msg>`, and only
-    /// for a `need_ack` line. Returns whether it acknowledged, which is how
-    /// `M115` chooses between `ok <msg>` and an info line.
-    pub fn ack(&self, msg: Option<&str>) -> bool {
-        if !self.need_ack.swap(false, Ordering::SeqCst) {
-            return false;
-        }
-        match msg {
-            Some(msg) => self.respond_raw(&format!("ok {msg}")),
-            None => self.respond_raw("ok"),
-        }
-        true
     }
 
     fn missing(&self, name: &str) -> CommandError {
@@ -779,9 +757,7 @@ impl GCodeDispatch {
     /// Returns the first [`CommandError`] the script produced.
     pub async fn run_script_from_command(&self, script: &str) -> Result<(), CommandError> {
         for line in script.split('\n') {
-            // An API `gcode/script` line is not acknowledged; the file/serial
-            // input protocol is the only `need_ack` producer (`gcode.py:210`).
-            process_line(&self.inner, line, false).await?;
+            process_line(&self.inner, line).await?;
         }
         Ok(())
     }
@@ -826,8 +802,7 @@ impl GCodeDispatch {
     ///
     /// Upstream's `create_gcode_command` (`klippy/gcode.py:244-245`): used by
     /// modules that synthesise a command and hand it to another handler
-    /// (`homing`, `probe`, `safe_z_home`, `bed_mesh`, `gcode_arcs`). The line is
-    /// never acknowledged, as upstream's is not.
+    /// (`homing`, `probe`, `safe_z_home`, `bed_mesh`, `gcode_arcs`).
     pub fn create_gcode_command(
         &self,
         command: &str,
@@ -839,7 +814,6 @@ impl GCodeDispatch {
             command: command.to_string(),
             commandline: commandline.to_string(),
             params,
-            need_ack: AtomicBool::new(false),
         }
     }
 
@@ -880,11 +854,7 @@ impl GCodeDispatch {
                             .map(|printer| printer.software_version())
                             .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
                         let msg = format!("FIRMWARE_NAME:Klipper FIRMWARE_VERSION:{version}");
-                        // A file-input line gets `ok <msg>`; an API line gets the
-                        // info line instead (`klippy/gcode.py:344-350`).
-                        if !gcmd.ack(Some(&msg)) {
-                            gcmd.respond_info(&msg);
-                        }
+                        gcmd.respond_info(&msg);
                         Ok(())
                     })
                 }
@@ -1050,7 +1020,7 @@ fn upgrade(inner: &Weak<Inner>) -> Arc<Inner> {
 }
 
 /// One line of a script: parse, find the handler, run it.
-async fn process_line(inner: &Arc<Inner>, line: &str, need_ack: bool) -> Result<(), CommandError> {
+async fn process_line(inner: &Arc<Inner>, line: &str) -> Result<(), CommandError> {
     let Some(parsed) = parse_line(line) else {
         return Ok(()); // blank or comment-only
     };
@@ -1073,7 +1043,6 @@ async fn process_line(inner: &Arc<Inner>, line: &str, need_ack: bool) -> Result<
         command: parsed.command.clone(),
         commandline: parsed.commandline.clone(),
         params: parsed.params.clone(),
-        need_ack: AtomicBool::new(need_ack),
     };
 
     let outcome = {
@@ -1108,36 +1077,22 @@ async fn process_line(inner: &Arc<Inner>, line: &str, need_ack: bool) -> Result<
     };
 
     match outcome {
-        HandlerOutcome::Ok => {
-            gcmd.ack(None);
-            Ok(())
-        }
+        HandlerOutcome::Ok => Ok(()),
         HandlerOutcome::CommandError(err) => {
             // A command error is the user's problem: report it, tell the parts
-            // that listen, and only stop the script when the line was not
-            // acknowledged (`klippy/gcode.py:223-228`).
+            // that listen, and stop the script.
             inner.respond_error(err.message());
             if let Some(printer) = inner.printer.upgrade() {
                 printer.send_event(&KlippyEvent::GcodeCommandError);
             }
-            if need_ack {
-                gcmd.ack(None);
-                Ok(())
-            } else {
-                Err(err)
-            }
+            Err(err)
         }
         HandlerOutcome::Internal(msg) => {
             // The printer was already shut down above; the client is still told.
             // No `gcode:command_error`: upstream fires it only for a
-            // `CommandError` (`klippy/gcode.py:224-226`).
+            // `CommandError`.
             inner.respond_error(&msg);
-            if need_ack {
-                gcmd.ack(None);
-                Ok(())
-            } else {
-                Err(CommandError::new(msg))
-            }
+            Err(CommandError::new(msg))
         }
     }
 }
@@ -1179,7 +1134,9 @@ async fn default_handler(inner: &Arc<Inner>, gcmd: &mut GcodeCommand) -> Result<
     // Temperature and SD-card requests are answered before the ready check, so
     // a client polling them during startup is not told the printer is not ready.
     if command == "M105" {
-        gcmd.ack(Some("T:0"));
+        // An M105 here means no heaters module is registered; the request is
+        // answered with nothing at all (upstream's ack of `T:0` belongs to the
+        // line protocols this host does not implement).
         return Ok(());
     }
     if command == "M21" {
@@ -2359,7 +2316,6 @@ mod tests {
             command: parsed.command,
             commandline: parsed.commandline,
             params,
-            need_ack: AtomicBool::new(false),
         }
     }
 
@@ -2491,8 +2447,6 @@ mod tests {
         assert_eq!(gcmd.command(), "SET_PIN");
         assert_eq!(gcmd.commandline(), "SET_PIN PIN=fan");
         assert_eq!(gcmd.get_str("PIN").unwrap(), "fan");
-        // A synthesised command is never acknowledged.
-        assert!(!gcmd.ack(None));
     }
 
     #[test]
@@ -2560,61 +2514,6 @@ mod tests {
         let _ = dispatch.run_script_sync("BOOM");
 
         assert!(!fired.load(Ordering::SeqCst));
-    }
-
-    #[tokio::test]
-    async fn test_an_acknowledged_line_does_not_stop_the_script_on_error() {
-        // The file/serial protocol (`need_ack`) reports the error, fires the
-        // event and acks the line instead of propagating it
-        // (`klippy/gcode.py:223-228`), so the rest of the script still runs.
-        let printer = Arc::new(Printer::new(ManualReactor::shared()));
-        let dispatch = GCodeDispatch::new(Arc::clone(&printer));
-        dispatch.inner.set_ready(true);
-        let calls = Arc::new(AtomicUsize::new(0));
-        {
-            let calls = Arc::clone(&calls);
-            dispatch
-                .register_command(
-                    "FAIL",
-                    sync(move |_| {
-                        calls.fetch_add(1, Ordering::SeqCst);
-                        Err(CommandError::new("boom"))
-                    }),
-                    None,
-                    false,
-                )
-                .unwrap();
-        }
-        dispatch
-            .register_command("AFTER", sync(|_| Ok(())), None, false)
-            .unwrap();
-        let output = Arc::new(Mutex::new(Vec::new()));
-        {
-            let output = Arc::clone(&output);
-            dispatch.register_output_handler(Arc::new(move |line: &str| {
-                output
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .push(line.to_string());
-            }));
-        }
-
-        process_line(&dispatch.inner, "FAIL", true).await.unwrap();
-        process_line(&dispatch.inner, "AFTER", true).await.unwrap();
-
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-        let lines = output.lock().unwrap_or_else(|p| p.into_inner()).clone();
-        assert_eq!(lines, ["!! boom", "ok", "ok"]);
-    }
-
-    #[test]
-    fn test_ack_does_nothing_for_an_api_line() {
-        let gcmd = command("M115");
-
-        // The only `need_ack` producer is the file/serial input protocol, which
-        // this host does not have, so an API line is never acknowledged.
-        assert!(!gcmd.ack(None));
-        assert!(!gcmd.ack(Some("T:0")));
     }
 
     #[test]

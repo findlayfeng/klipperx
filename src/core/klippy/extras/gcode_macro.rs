@@ -12,7 +12,7 @@
 //! |---|---|---|
 //! | `gcode` | — (required) | the macro body |
 //! | `description` | `G-Code macro` | the command's help text |
-//! | `rename_existing` | — | the command this one renames (`:137-142`) |
+//! | `rename_existing` | — | the command this one renames (`:135-147`) |
 //! | `variable_<name>` | — | a literal reported in `get_status` (`:153-162`) |
 //!
 //! # How the body runs
@@ -37,21 +37,35 @@
 //! the literal rule this port's `variable_*` reader already applies
 //! (`:158-162`), where upstream uses Python's `ast.literal_eval`.
 //!
-//! # Gaps this port does not close yet
+//! # How `rename_existing` runs
 //!
-//! - **`rename_existing` stops at the load-time checks** (`:137-142`): the
-//!   option is read and the same-type rule enforced, but upstream's swap at
-//!   `klippy:connect` (`handle_connect`, `:163-171`) is not implemented, so a
-//!   renaming macro does not register at all — matching upstream's *load-time*
-//!   behaviour, minus the deferred half.
+//! `rename_existing` is read and type-checked when the section loads
+//! (`gcode_macro.py:135-147`), and the macro registers **nothing** then: the
+//! command its alias collides with is displaced at `klippy:connect`, by
+//! [`GCodeMacro::handle_connect`] (`:163-171`) — here
+//! [`PrinterObject::connect`], which the loader runs in registration order.
+//! The displaced handler is re-registered under `rename_existing` with the
+//! description `Renamed builtin of '<alias>'`, and the macro takes the alias
+//! over under its own `description`. A command missing under the alias is
+//! upstream's config error, reported as this port's connect-time config
+//! failure. `SET_GCODE_VARIABLE` is registered either way (`:148-150`).
+//!
+//! A `rename_existing` name that is already registered is refused, as
+//! upstream refuses it: its `register_command` rejects a taken name
+//! (`gcode.py:142-144`) and so does [`GCodeDispatch::register_command`], with
+//! the same `gcode command <name> already registered` wording. Clearing the
+//! name first would displace whatever holds it — a builtin, say — and accept a
+//! configuration upstream rejects, which is a silent degradation this port
+//! does not make.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use serde_json::{json, Value};
 
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
+use crate::core::klippy::error::KlippyError;
 use crate::core::klippy::event::KlippyEvent;
 use crate::core::klippy::extras::template::{Builtin, Context, PrinterView, Rt, Template};
 use crate::core::klippy::gcode::{
@@ -59,7 +73,7 @@ use crate::core::klippy::gcode::{
     GcodeCommand, GCODE_OBJECT,
 };
 use crate::core::klippy::load::section;
-use crate::core::klippy::printer::{Printer, PrinterObject};
+use crate::core::klippy::printer::{ConnectFuture, Printer, PrinterObject};
 
 /// `cmd_SET_GCODE_VARIABLE_help` (`gcode_macro.py:174`).
 const SET_GCODE_VARIABLE_HELP: &str = "Set the value of a G-Code macro variable";
@@ -140,6 +154,24 @@ pub struct GCodeMacro {
     /// Shared with the `SET_GCODE_VARIABLE` handler and the macro's own
     /// command, which are registered before this object is returned.
     state: Arc<MacroState>,
+    /// What a macro that renames needs at connect (`gcode_macro.py:163-171`);
+    /// `None` for one that registered itself as its command when it loaded.
+    rename: Option<RenameExisting>,
+}
+
+/// The inputs upstream's `handle_connect` reads off the section
+/// (`gcode_macro.py:135-136,163-171`), kept until the macro connects.
+#[derive(Debug)]
+struct RenameExisting {
+    /// The name the displaced command is re-registered under.
+    target: String,
+    /// The macro's own `description`, declared on the alias at connect.
+    description: String,
+    /// The parameter names the macro declares for a client, declared with it.
+    declared: Vec<String>,
+    /// The printer the swap registers on. Weak, as everywhere a part holds the
+    /// machine: the registry owns this object.
+    printer: Weak<Printer>,
 }
 
 /// What a macro *is*, shared by its command, its variable setter and its
@@ -452,10 +484,45 @@ fn static_command_names(body: &str) -> Vec<String> {
     names
 }
 
+/// The macro's own command (`GCodeMacro.cmd`, `gcode_macro.py:188-200`): render
+/// the body and hand the text back to the dispatcher
+/// (`TemplateWrapper.run_gcode_from_command`, `:76-77`).
+///
+/// Upstream registers this same `self.cmd` whether or not the section renames;
+/// here the load path builds it for a plain macro and
+/// [`GCodeMacro::handle_connect`] for a renaming one.
+fn macro_command(printer: &Weak<Printer>, state: &Arc<MacroState>) -> CommandHandler {
+    let weak = printer.clone();
+    let state = Arc::clone(state);
+    Arc::new(move |gcmd: &GcodeCommand| {
+        let weak = weak.clone();
+        let state = Arc::clone(&state);
+        let params = gcmd.get_command_parameters().clone();
+        let rawparams = gcmd.get_raw_command_parameters();
+        Box::pin(async move {
+            let _guard = state.enter()?;
+            let printer = weak
+                .upgrade()
+                .ok_or_else(|| CommandError::new("printer is gone"))?;
+            let mut context = state.context(&printer, &params, &rawparams);
+            let script = state
+                .template
+                .render(&mut context)
+                .map_err(|error| CommandError::new(error.to_string()))?;
+            let gcode = printer
+                .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+                .ok_or_else(|| CommandError::new("the gcode dispatcher is gone"))?;
+            gcode.run_script_from_command(&script).await
+        })
+    })
+}
+
 impl GCodeMacro {
     /// Read the section, enforce `rename_existing`'s load-time rules, compile
     /// the body, and register the macro as its command plus
-    /// `SET_GCODE_VARIABLE` (`gcode_macro.py:124-162`).
+    /// `SET_GCODE_VARIABLE` (`gcode_macro.py:124-162`). A macro that renames
+    /// registers neither of its two names here: `handle_connect` owns that,
+    /// at connect.
     ///
     /// # Errors
     /// A section name with more than one name token, a missing `gcode` body, a
@@ -490,8 +557,8 @@ impl GCodeMacro {
 
         if let Some(rename) = rename_existing.as_deref() {
             // Upstream refuses to swap commands of different types
-            // (`gcode_macro.py:137-142`); the swap itself runs at
-            // `klippy:connect` and is not implemented here (module docs).
+            // (`gcode_macro.py:137-142`); the swap itself is
+            // `handle_connect`'s job at `klippy:connect`.
             if is_traditional_gcode(&alias) != is_traditional_gcode(rename) {
                 return Err(ConfigError::new(format!(
                     "G-Code macro rename of different types ('{alias}' vs '{rename}')"
@@ -550,29 +617,7 @@ impl GCodeMacro {
             // The macro is its command (`gcode_macro.py:143-147`): render the
             // body and hand the text back to the dispatcher
             // (`TemplateWrapper.run_gcode_from_command`, `:76-77`).
-            let weak = Arc::downgrade(printer);
-            let state = Arc::clone(&state);
-            let handler: CommandHandler = Arc::new(move |gcmd: &GcodeCommand| {
-                let weak = weak.clone();
-                let state = Arc::clone(&state);
-                let params = gcmd.get_command_parameters().clone();
-                let rawparams = gcmd.get_raw_command_parameters();
-                Box::pin(async move {
-                    let _guard = state.enter()?;
-                    let printer = weak
-                        .upgrade()
-                        .ok_or_else(|| CommandError::new("printer is gone"))?;
-                    let mut context = state.context(&printer, &params, &rawparams);
-                    let script = state
-                        .template
-                        .render(&mut context)
-                        .map_err(|error| CommandError::new(error.to_string()))?;
-                    let gcode = printer
-                        .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
-                        .ok_or_else(|| CommandError::new("the gcode dispatcher is gone"))?;
-                    gcode.run_script_from_command(&script).await
-                })
-            });
+            let handler = macro_command(&Arc::downgrade(printer), &state);
             let declared_refs: Vec<&str> = declared.iter().map(String::as_str).collect();
             gcode
                 .register_command_with_params(
@@ -584,6 +629,14 @@ impl GCodeMacro {
                 )
                 .map_err(ConfigError::new)?;
         }
+        // A renaming macro registers neither name yet (`gcode_macro.py:137-147`):
+        // the swap is upstream's `handle_connect`, on `klippy:connect`.
+        let rename = rename_existing.map(|target| RenameExisting {
+            target,
+            description: description.clone(),
+            declared: declared.clone(),
+            printer: Arc::downgrade(printer),
+        });
 
         // `SET_GCODE_VARIABLE MACRO=<this section's name>` — a mux value per
         // macro, registered whether or not the macro renames (`:148-150`).
@@ -657,7 +710,59 @@ impl GCodeMacro {
             );
         }
 
-        Ok(Arc::new(Self { state }))
+        Ok(Arc::new(Self { state, rename }))
+    }
+
+    /// Upstream's `handle_connect` (`gcode_macro.py:163-171`), run at
+    /// `klippy:connect` — here [`PrinterObject::connect`], so the swap lands in
+    /// the connect phase, in the order the sections loaded:
+    ///
+    /// 1. take the command registered under the alias out of the dispatcher;
+    /// 2. a missing one is upstream's config error, wording verbatim;
+    /// 3. re-register the displaced handler under `rename_existing`, described
+    ///    as the renamed builtin;
+    /// 4. install the macro's own command under the alias.
+    ///
+    /// A `rename_existing` name that is already registered is stepped 3's
+    /// failure: upstream's `register_command` refuses a taken name with
+    /// `gcode command <name> already registered` and so does
+    /// [`GCodeDispatch::register_command`], so the name is left alone rather
+    /// than overwritten.
+    ///
+    /// # Errors
+    /// A command missing under the alias, or a name the dispatcher refuses to
+    /// register — both config errors, as upstream's are.
+    fn handle_connect(&self) -> Result<(), KlippyError> {
+        let Some(rename) = &self.rename else {
+            return Ok(());
+        };
+        let Some(printer) = rename.printer.upgrade() else {
+            return Ok(());
+        };
+        let gcode = printer
+            .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+            .ok_or_else(|| KlippyError::Config(ConfigError::new("the gcode dispatcher is gone")))?;
+        let alias = self.state.alias.as_str();
+        let displaced = gcode.unregister_command(alias).ok_or_else(|| {
+            KlippyError::Config(ConfigError::new(format!(
+                "Existing command '{alias}' not found in gcode_macro rename"
+            )))
+        })?;
+        let renamed = format!("Renamed builtin of '{alias}'");
+        gcode
+            .register_command(&rename.target, displaced, Some(&renamed), false)
+            .map_err(|error| KlippyError::Config(ConfigError::new(error)))?;
+        let handler = macro_command(&rename.printer, &self.state);
+        let declared: Vec<&str> = rename.declared.iter().map(String::as_str).collect();
+        gcode
+            .register_command_with_params(
+                alias,
+                handler,
+                Some(&rename.description),
+                &declared,
+                false,
+            )
+            .map_err(|error| KlippyError::Config(ConfigError::new(error)))
     }
 
     /// The `variable_*` values (`gcode_macro.py:172-173`).
@@ -679,6 +784,12 @@ impl GCodeMacro {
 impl PrinterObject for GCodeMacro {
     fn get_status(&self, _eventtime: f64) -> Value {
         self.variables_status()
+    }
+
+    /// Upstream's `klippy:connect` handler for a renaming macro
+    /// (`gcode_macro.py:140-141`, `handle_connect`).
+    fn connect<'a>(&'a self) -> ConnectFuture<'a> {
+        Box::pin(async move { self.handle_connect() })
     }
 }
 
@@ -745,6 +856,14 @@ mod tests {
         printer
             .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
             .expect("gcode is registered")
+    }
+
+    /// Drive a `connect` future on a private single-thread runtime.
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("a runtime for the test")
+            .block_on(future)
     }
 
     /// Every option of every `macros.cfg` instance is read, and every macro
@@ -995,12 +1114,12 @@ mod tests {
 
     /// `rename_existing` may only rename the same command type
     /// (`gcode_macro.py:137-142`); a same-type rename loads without
-    /// registering, because upstream's registration then happens at
-    /// `klippy:connect` (`handle_connect`, `:163-171`) — which this port does
-    /// not implement yet (module docs).
+    /// registering either of its two names, because upstream's registration
+    /// then happens at `klippy:connect` (`handle_connect`, `:163-171`).
     #[test]
     fn rename_existing_is_type_checked_and_defers_registration() {
         let printer = printer();
+        let dispatch = gcode(&printer);
 
         let sect = section(
             "my_macro",
@@ -1011,16 +1130,265 @@ mod tests {
             GCodeMacro::new(&config, &printer).unwrap_err().to_string(),
             "G-Code macro rename of different types ('MY_MACRO' vs 'G28')"
         );
-        assert!(gcode(&printer).command_help().get("MY_MACRO").is_none());
+        assert!(!dispatch.command_exists("MY_MACRO"));
 
-        // Both traditional: the type check passes, and — as at load time
-        // upstream — neither name is registered yet.
-        let sect = section("G29", &[("gcode", "G28"), ("rename_existing", "G28")]);
+        // Both traditional — the `sample-macros.cfg:189` shape: the type check
+        // passes and the section loads, with the command the macro takes over
+        // still its own, since the swap is `klippy:connect`'s work.
+        dispatch
+            .register_command("M117", sync(|_| Ok(())), Some("the builtin's help"), false)
+            .expect("the builtin registers");
+        let sect = section("M117", &[("gcode", "G28"), ("rename_existing", "M117.1")]);
         let config = ConfigWrapper::untracked(&sect);
-        GCodeMacro::new(&config, &printer).expect("a same-type rename loads");
-        let help = gcode(&printer).command_help();
-        assert!(help.get("G29").is_none(), "registration waits for connect");
-        assert!(help.get("G28").is_none(), "the builtin keeps its help");
+        load_config_prefix(&config, &printer).expect("a same-type rename loads");
+        assert_eq!(
+            dispatch.command_help().get("M117"),
+            Some(&"the builtin's help".to_string()),
+            "the builtin owns M117 until the macro connects"
+        );
+        assert!(
+            !dispatch.command_exists("M117.1"),
+            "the target name is created at connect too"
+        );
+    }
+
+    /// Upstream's `handle_connect` (`gcode_macro.py:163-171`): at
+    /// `klippy:connect` the command the alias collides with is displaced to
+    /// `rename_existing` under upstream's description, and the macro takes the
+    /// alias over — so the displaced builtin stays callable under its new name.
+    #[test]
+    fn rename_existing_swaps_the_command_at_connect() {
+        let printer = printer();
+        let dispatch = gcode(&printer);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        {
+            let seen = Arc::clone(&seen);
+            dispatch
+                .register_command(
+                    "OLD_HOME",
+                    sync(move |_| {
+                        seen.lock()
+                            .unwrap_or_else(|poison| poison.into_inner())
+                            .push("builtin".to_string());
+                        Ok(())
+                    }),
+                    Some("the builtin's help"),
+                    false,
+                )
+                .expect("the builtin registers");
+        }
+        {
+            let seen = Arc::clone(&seen);
+            dispatch
+                .register_command(
+                    "ECHO_LINE",
+                    sync(move |gcmd: &GcodeCommand| {
+                        seen.lock()
+                            .unwrap_or_else(|poison| poison.into_inner())
+                            .push(gcmd.get_str("VALUE").unwrap_or_default());
+                        Ok(())
+                    }),
+                    None,
+                    false,
+                )
+                .expect("the fake receiver registers");
+        }
+
+        let sect = section(
+            "OLD_HOME",
+            &[
+                ("gcode", "ECHO_LINE VALUE=macro"),
+                ("rename_existing", "OLD_HOME_ORIG"),
+                ("description", "our home"),
+            ],
+        );
+        let config = ConfigWrapper::untracked(&sect);
+        let object = load_config_prefix(&config, &printer).expect("the macro loads");
+        assert_eq!(
+            dispatch.command_help().get("OLD_HOME"),
+            Some(&"the builtin's help".to_string()),
+            "load time: the builtin still owns the name"
+        );
+        assert!(!dispatch.command_exists("OLD_HOME_ORIG"));
+
+        block_on(object.connect()).expect("the swap runs at connect");
+
+        assert!(
+            dispatch.command_exists("OLD_HOME"),
+            "the macro took the alias over"
+        );
+        assert!(
+            dispatch.command_exists("OLD_HOME_ORIG"),
+            "the displaced command keeps a name"
+        );
+        assert_eq!(
+            dispatch.command_help().get("OLD_HOME_ORIG"),
+            Some(&"Renamed builtin of 'OLD_HOME'".to_string()),
+            "upstream's description for the displaced handler"
+        );
+        assert_eq!(
+            dispatch.command_help().get("OLD_HOME"),
+            Some(&"our home".to_string()),
+            "the macro's own description on the alias"
+        );
+
+        dispatch
+            .run_script_sync("OLD_HOME")
+            .expect("the macro runs");
+        dispatch
+            .run_script_sync("OLD_HOME_ORIG")
+            .expect("the displaced command runs");
+        assert_eq!(
+            *seen.lock().unwrap_or_else(|poison| poison.into_inner()),
+            vec!["macro", "builtin"],
+            "the alias renders the body; the renamed command reaches the old handler"
+        );
+    }
+
+    /// A `rename_existing` whose alias has no command under it is refused at
+    /// connect with upstream's `config_error` wording
+    /// (`gcode_macro.py:165-168`), carried as this port's connect-time config
+    /// failure.
+    #[test]
+    fn a_rename_of_a_missing_command_is_refused_at_connect() {
+        let printer = printer();
+        let dispatch = gcode(&printer);
+        let sect = section(
+            "MY_MACRO",
+            &[("gcode", "G28"), ("rename_existing", "MY_MACRO_ORIG")],
+        );
+        let config = ConfigWrapper::untracked(&sect);
+        let object = load_config_prefix(&config, &printer).expect("the section loads");
+
+        let error = block_on(object.connect()).expect_err("nothing is registered as MY_MACRO");
+        assert_eq!(
+            error.to_string(),
+            "Existing command 'MY_MACRO' not found in gcode_macro rename"
+        );
+        assert!(!dispatch.command_exists("MY_MACRO_ORIG"));
+    }
+
+    /// A `rename_existing` name that is already registered is refused, with the
+    /// dispatcher's and upstream's shared wording
+    /// (`GCodeDispatch::register_command`, `gcode.py:142-144`): the taken name
+    /// keeps the handler it had.
+    #[test]
+    fn a_rename_target_that_is_taken_is_refused_at_connect() {
+        let printer = printer();
+        let dispatch = gcode(&printer);
+        for name in ["OLD_HOME", "OLD_HOME_ORIG"] {
+            dispatch
+                .register_command(name, sync(|_| Ok(())), None, false)
+                .expect("the fake registers");
+        }
+        let sect = section(
+            "OLD_HOME",
+            &[("gcode", "G28"), ("rename_existing", "OLD_HOME_ORIG")],
+        );
+        let config = ConfigWrapper::untracked(&sect);
+        let object = load_config_prefix(&config, &printer).expect("the section loads");
+
+        let error = block_on(object.connect()).expect_err("OLD_HOME_ORIG is taken");
+        assert_eq!(
+            error.to_string(),
+            "gcode command OLD_HOME_ORIG already registered"
+        );
+        assert!(dispatch.command_exists("OLD_HOME_ORIG"));
+    }
+
+    /// The loader wires the swap up end to end: through the real loader the
+    /// section registers nothing until the printer connects, and the swap is in
+    /// place by the time it is ready (`load.rs` registers the object under the
+    /// section name; `bring_up` connects it before `klippy:connect`/`ready`).
+    #[test]
+    fn the_loader_connects_a_renaming_macro_and_swaps_the_command() {
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        let (config, _) = Config::from_text(
+            "[gcode_macro OLD_HOME]\ngcode: ECHO_LINE VALUE=macro\n\
+             rename_existing: OLD_HOME_ORIG\n",
+        )
+        .expect("the config parses");
+        printer.load_config(&config).expect("the config loads");
+
+        let dispatch = gcode(&printer);
+        assert!(!dispatch.command_exists("OLD_HOME"), "not before connect");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        {
+            let seen = Arc::clone(&seen);
+            dispatch
+                .register_command(
+                    "OLD_HOME",
+                    sync(move |_| {
+                        seen.lock()
+                            .unwrap_or_else(|poison| poison.into_inner())
+                            .push("builtin".to_string());
+                        Ok(())
+                    }),
+                    None,
+                    false,
+                )
+                .expect("the builtin registers");
+        }
+        {
+            let seen = Arc::clone(&seen);
+            dispatch
+                .register_command(
+                    "ECHO_LINE",
+                    sync(move |gcmd: &GcodeCommand| {
+                        seen.lock()
+                            .unwrap_or_else(|poison| poison.into_inner())
+                            .push(gcmd.get_str("VALUE").unwrap_or_default());
+                        Ok(())
+                    }),
+                    None,
+                    false,
+                )
+                .expect("the fake receiver registers");
+        }
+
+        block_on(printer.bring_up());
+
+        assert!(dispatch.command_exists("OLD_HOME"));
+        assert!(dispatch.command_exists("OLD_HOME_ORIG"));
+        dispatch
+            .run_script_sync("OLD_HOME")
+            .expect("the macro runs");
+        dispatch
+            .run_script_sync("OLD_HOME_ORIG")
+            .expect("the displaced command runs");
+        assert_eq!(
+            *seen.lock().unwrap_or_else(|poison| poison.into_inner()),
+            vec!["macro", "builtin"]
+        );
+    }
+
+    /// `SET_GCODE_VARIABLE` is registered whether or not the section renames
+    /// (`gcode_macro.py:148-150`) — for a renaming macro too, before connect.
+    #[test]
+    fn a_renaming_macro_registers_set_gcode_variable_too() {
+        let printer = printer();
+        let dispatch = gcode(&printer);
+        dispatch
+            .register_command("OLD_HOME", sync(|_| Ok(())), None, false)
+            .expect("the builtin registers");
+        let sect = section(
+            "OLD_HOME",
+            &[
+                ("gcode", "G28"),
+                ("rename_existing", "OLD_HOME_ORIG"),
+                ("variable_t", "12.0"),
+            ],
+        );
+        let config = ConfigWrapper::untracked(&sect);
+        let object = load_config_prefix(&config, &printer).expect("the macro loads");
+
+        dispatch
+            .run_script_sync("SET_GCODE_VARIABLE MACRO=OLD_HOME VARIABLE=t VALUE=17")
+            .expect("the write succeeds before the swap");
+        assert_eq!(object.get_status(0.0), json!({ "t": 17 }));
+
+        block_on(object.connect()).expect("the swap runs at connect");
+        assert!(dispatch.command_exists("OLD_HOME_ORIG"));
     }
 
     /// The bare `[gcode_macro]` section is claimed and reads nothing

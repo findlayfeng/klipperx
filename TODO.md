@@ -90,7 +90,7 @@ H1–H12 是上游 extras 里按域归并的消费者（2026-09-21 全量盘点�
 | H6 | 传感器与块状数据（bulk_sensor / 加速度计 / angle / ldc1612 / hx71x / ads* / load_cell / input_shaper / resonance）——`bulk_sensor` 框架、`adxl345`/`mpu9250`、`ldc1612`、`hx71x`、`ads1220`/`ads131m0x`、`load_cell`(+`_probe`)、`input_shaper`/`resonance_tester` 均已落地；余项＝`angle`、其余加速度计（lis2dw/lis3dh/icm20948/bmi160）、`ads1x1x`，以及 `SET_PRESSURE_ADVANCE` 尚未作用于运动，见 H6 节 | F5、F6、F7、C1 |
 | H7 | 输入与外设（buttons / gcode_button / pulse_counter / trigger_analog / 断料与线宽传感器 / GPIO 扩展 / DAC）——`gcode_button`、`pulse_counter`、`filament_switch_sensor`/`filament_motion_sensor` 已落地；余项＝固件按钮查询、`trigger_analog` 宿主节、线宽传感器（hall_*/tsl1401cl）、`initial_pins`、板级模块（samd_sercom/replicape/palette2），见 H7 节 | F3、F5、F9 |
 | H8 | LCD 显示与菜单（display/*）——面板驱动均已落地（hd44780/st7920/uc1701/ssd1306/aip31068_spi/hd44780_spi/sh1106）；余项＝菜单族（`menu.py`/`menu_keys.py`/`display.cfg`/`menu.cfg`）与固件 `lcd_hd44780.c`/`lcd_st7920.c`，见 H8 节 | F9、G1b |
-| H9 | 探测 / 调平 / 校准（probe / bltouch / bed_mesh / z_tilt / quad_gantry_level / bed_screws / …）——探针与其校准命令族、末端位置接口（`virtual_endstop_position`）、z_tilt/qgl/bed_tilt/screws_tilt/axis_twist/delta_calibrate 均已落地；余项＝`bed_mesh` 插值网格与 move 应用、探针精度、`Z_OFFSET_APPLY_*`、`bed_screws` 命令族、`skew_correction`/`z_thermal_adjust`/`tuning_tower`，见 H9 节 | C1、F8 |
+| H9 | 探测 / 调平 / 校准（probe / bltouch / bed_mesh / z_tilt / quad_gantry_level / bed_screws / …）——探针与其校准命令族、末端位置接口（`virtual_endstop_position`）、z_tilt/qgl/bed_tilt/screws_tilt/axis_twist/delta_calibrate 均已落地；余项＝`bed_mesh` 的 faulty/零参照/profile 命令族、探针精度、`Z_OFFSET_APPLY_*`、`bed_screws` 命令族、`skew_correction`/`z_thermal_adjust`/`tuning_tower`，见 H9 节 | C1、F8 |
 | H10 | 运动相关 extras（gcode_arcs / manual_stepper / idle_timeout / motion_report / …；gcode_move、stepper_enable、motion_queuing、force_move、idle_timeout 已落地）——余项＝G2/G3 弧规划、`manual_stepper` 回零、`extruder_stepper` 宿主同步缝、`GET_POSITION`/`axis_map`，见 H10 节 | C1 |
 | H11 | 主机运行时与调试（statistics / canbus_ids / canbus_stats；error_mcu 已落地） | — |
 | H12 | 核心工具补齐（mathutil / util 反射 / clocksync / pins 消费侧） | C1 |
@@ -478,11 +478,15 @@ endstop 资源（`mcu/resource/endstop.rs`，含 `minclock` 门控与 `home_wait
       只有两轴 `mesh_pps` 全 0 时 `_verify_algorithm`（`:428-430`）才改写为 `direct`、`mesh_matrix` 才等于 probed。
       ⚠️ 素材分支 `abandoned/wip-main-leftovers` 的 `bed_mesh.rs` **不可复用**（`lagrange_1d` 是恒等复制、
       `bicubic_1d` 是 Catmull-Rom、不按 `mesh_pps` 细分），本单元是按上游重做的；语料对此零覆盖，验收靠自建单测。
-- [ ] **保真单元 U2/U3：把网格作用到 move**（U1 后的下一单元）：fade（`fade_start`/`fade_end`/`fade_target` 与
-      `get_z_factor`）、`MoveSplitter`（`build_move`/`split`/`_calc_z_offset`）与 `impl MoveTarget` +
-      `gcode_move.set_move_transform` 注册（上游 `bed_mesh.py:97-218` `:1257-1319`）。seam 已被 `bed_tilt`/`exclude_object`
-      实战验证（`gcode_move.rs:208-229`），**前置全满足**。现状仍是：`BED_MESH_CALIBRATE` 对后续 move **零影响**。
-      仍未做：faulty 区域替换、profile 命令族（`BED_MESH_PROFILE`/`OUTPUT`/`MAP`/`OFFSET`）。
+- [x] **保真单元 U2/U3：把网格作用到 move——已落地（2026-10-06，`05f93f6`）**：fade（`fade_start`/`fade_end`/`fade_target`
+      与 `get_z_factor`；`fade_target` 的合法性看**网格 Z 范围**、`fade_target == 0` 时免检、另有 `fade_dist` 上界）
+      与 `MoveSplitter`（`build_move`/`calc_z_offset`/`set_next_move`/`split`，逐行对齐 `bed_mesh.py:1257-1319`）；
+      `impl MoveTarget for BedMesh` 并在 `load_config` 里以 `force=false` 注册（上游 `bed_mesh.py:130-131`）。
+      规格校正：**`BED_MESH_CLEAR` 不撤销 transform**——上游只注册一次，clear 就是 `set_mesh(None)`，
+      `move()` 在无网格时直通 `toolhead.move`；另新增 `split_delta_z`（默认 `.025`、min `0.01`）、
+      `move_check_distance` 补 min `3.`。
+      仍未做：faulty 区域替换、`mesh_offsets`/`set_zero_reference`（仅被 `BED_MESH_OFFSET`/`ZERO_REFERENCE` 驱动，
+      与 move 正确性可分离）、profile 命令族（`BED_MESH_PROFILE`/`OUTPUT`/`MAP`/`OFFSET`）。
 - [ ] **保真单元：探针精度**（排在 H9 模块闭包之后）：按触发步数反算位置与 `rest_time`
       （上游 `_calc_endstop_rate`）。前置已满足：模拟器步数模型与多实例假 MCU 已落地
       （Q10 + `d14ce6a`，两 MCU 端到端测试在案）。
@@ -491,10 +495,10 @@ endstop 资源（`mcu/resource/endstop.rs`，含 `minclock` 门控与 `home_wait
       按 move 距离与步数计算）。两者都影响真实探针 Z 精度，属后续精度单元；模拟器语料不受影响。
 - [ ] 调平：`bed_mesh.py` ◐（**已落地**：`[bed_mesh]` 段与全量选项、探测点生成、
       `BED_MESH_CALIBRATE` 逐点探测存格（按 Y 分行、行内 X 升序）、`BED_MESH_CLEAR`、
-      `bed_mesh/dump_mesh` 端点（2026-10-03）、**插值网格（lagrange/bicubic/direct + `mesh_pps`，2026-10-06 `dc1dd1e`）**；
-      **待做**：faulty 区域替换、fade 与 move 的 z 补偿（U2/U3）、profile 命令族
-      （`BED_MESH_PROFILE`/`OUTPUT`/`MAP`/`OFFSET`）。现状：插值已生效于两个出口，但
-      `BED_MESH_CALIBRATE` 对后续 move **仍零影响**。）
+      `bed_mesh/dump_mesh` 端点（2026-10-03）、插值网格（2026-10-06 `dc1dd1e`）、
+      **fade + `MoveSplitter` + move transform 注册（2026-10-06 `05f93f6`——已标定后 `G1` 真的走网格补偿）**；
+      **待做**：faulty 区域替换、`mesh_offsets`/`set_zero_reference`、profile 命令族
+      （`BED_MESH_PROFILE`/`OUTPUT`/`MAP`/`OFFSET`）。）
 - [x] 螺丝：`screws_tilt_adjust` ✅；`bed_screws` **段已落地**（2026-09-24 批 #1）——**余项**：
       `BED_SCREWS_ADJUST`/`ACCEPT`/`ADJUSTED`/`ABORT` 命令族未注册（`bed_screws.rs` 无 `register_command`）。
 - [ ] 校准：`delta_calibrate` ✅（段+`DELTA_CALIBRATE`/`DELTA_ANALYZE` 落地 2026-09-24 批 #5，`delta_calibrate.test` 转绿）、`axis_twist_compensation` ✅（批 #36）；**未移植**：`skew_correction`、

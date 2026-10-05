@@ -488,9 +488,7 @@ impl PrinterHeaters {
                             }
                             _ => "T:0".to_string(),
                         };
-                        if !gcmd.ack(Some(&msg)) {
-                            gcmd.respond_raw(&msg);
-                        }
+                        gcmd.respond_raw(&msg);
                         Ok(())
                     }),
                     None,

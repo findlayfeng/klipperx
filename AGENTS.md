@@ -181,9 +181,13 @@ git config core.hooksPath .githooks
 ## 常用命令
 
 ```bash
-cargo test --workspace              # 全部单元测试（虚拟 workspace 必须带 --workspace 或 -p）
-cargo test -p klipperx --lib <过滤> # 单包过滤
-cargo fmt --all                     # 提交前格式化（钩子也会跑）
+cargo test --workspace                  # 全量闸门：单元测试 + 集成测试（虚拟 workspace 必须带 --workspace 或 -p）
+cargo test -p klipperx --lib <过滤>     # 单包过滤——快，但不含 klippy-client 的集成测试
+cargo build --workspace --all-targets   # 构建告警应为 0
+cargo fmt --all                         # 提交前格式化（钩子也会跑）
 ```
+
+- **同一 `target/` 不要并发跑两个 cargo**：第二个会在构建锁上排队，而且并发构建的 CPU 争用会让计时敏感的测试偶发卡住（实测遇到过一次 `futex_wait` 挂住）。要并发就各自 `CARGO_TARGET_DIR=<目录>`，或干脆分 worktree。
+- **合并前用全量闸门**：`cargo test -p klipperx --lib` 很快，但**不含** `klippy-client` 的集成测试（历史上内建参数表过期就是这样漏掉的）；提交/合并前跑 `cargo test --workspace`。
 
 真机 / 外设验证不阻塞主线，约定见 [`TESTING.md`](TESTING.md)。

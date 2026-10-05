@@ -1919,7 +1919,7 @@ mod tests {
     /// (`heaters.py:388`).
     #[tokio::test(start_paused = true)]
     async fn test_temperature_wait_reports_real_gcode_id_temp() {
-        let (printer, gcode, heater) = m105_printer();
+        let (_printer, gcode, heater) = m105_printer();
         let lines = captured_lines(&gcode);
         // The reading (20 °C) is below MINIMUM=100, so the wait polls.
         let reader = Arc::clone(&heater);

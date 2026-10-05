@@ -412,7 +412,6 @@ mod tests {
                 "endstop_home oid=%c clock=%u sample_ticks=%u sample_count=%c rest_ticks=%u pin_value=%c trsync_oid=%c trigger_reason=%c",
             )
             .unwrap();
-        let mut names: Vec<String> = Vec::new();
         let names: Vec<String> = frames
             .iter()
             .flat_map(|payload| {

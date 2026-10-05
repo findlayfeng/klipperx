@@ -471,12 +471,18 @@ endstop 资源（`mcu/resource/endstop.rs`，含 `minclock` 门控与 `home_wait
       `probe.rs:306`），rail 优先采用虚拟位置、否则才退 `position_min`（`extras/stepper.rs:374-406`；
       上游 `stepper.py:336-343`）。另：`z_virtual_endstop.test` **本身没有任何位置断言**（只是一串
       `G28/G1/PROBE/BED_MESH_CALIBRATE/...`），所以「该 test 需要它」的说法不成立——接口正确性靠单测。
-- [ ] **保真单元：bed_mesh 插值 + 调平应用**（H9 模块闭包已完成，本项现为**唯一大块**；已开工）：
-      `LagrangeMesh`/`BicubicMesh` + `mesh_pps` → `mesh_matrix`、`calc_z(x, y)`，以及把网格作用到 move
-      （`gcode_move` 的 move-transform seam + `MoveSplitter` + `fade_*`）。seam 已被 `bed_tilt`/`exclude_object`
-      实战验证（`gcode_move.rs:208-229`），**前置全满足**。⚠️ 素材分支 `abandoned/wip-main-leftovers` 的
-      `bed_mesh.rs` **不可直接复用**：其 `lagrange_1d` 是恒等复制、`bicubic_1d` 是 Catmull-Rom、且不按
-      `mesh_pps` 细分（只可当结构参考）。⚠️ 语料对插值/fade/move **零覆盖**，验收必须自建单测。
+- [x] **保真单元 U1：bed_mesh 插值网格——已落地（2026-10-06，`dc1dd1e`）**：`ZMesh` 的 `lagrange`/`bicubic`/`direct`
+      三个采样器 + `mesh_pps` 细分 + `bicubic_tension` + `calc_z(x, y)`（双线性查表、越界 constrain）+ `round(z,6)`。
+      两个出口（`get_status` 与 `bed_mesh/dump_mesh`）现均报插值后的 `mesh_matrix`（U1 前 dump 端点还是 `probed.clone()`）。
+      规格要点（上游 `bed_mesh.py:1321-1539`）：边长 `(count-1)*(mesh_pps+1)+1`——**`mesh_pps: 1` 仍插值**，
+      只有两轴 `mesh_pps` 全 0 时 `_verify_algorithm`（`:428-430`）才改写为 `direct`、`mesh_matrix` 才等于 probed。
+      ⚠️ 素材分支 `abandoned/wip-main-leftovers` 的 `bed_mesh.rs` **不可复用**（`lagrange_1d` 是恒等复制、
+      `bicubic_1d` 是 Catmull-Rom、不按 `mesh_pps` 细分），本单元是按上游重做的；语料对此零覆盖，验收靠自建单测。
+- [ ] **保真单元 U2/U3：把网格作用到 move**（U1 后的下一单元）：fade（`fade_start`/`fade_end`/`fade_target` 与
+      `get_z_factor`）、`MoveSplitter`（`build_move`/`split`/`_calc_z_offset`）与 `impl MoveTarget` +
+      `gcode_move.set_move_transform` 注册（上游 `bed_mesh.py:97-218` `:1257-1319`）。seam 已被 `bed_tilt`/`exclude_object`
+      实战验证（`gcode_move.rs:208-229`），**前置全满足**。现状仍是：`BED_MESH_CALIBRATE` 对后续 move **零影响**。
+      仍未做：faulty 区域替换、profile 命令族（`BED_MESH_PROFILE`/`OUTPUT`/`MAP`/`OFFSET`）。
 - [ ] **保真单元：探针精度**（排在 H9 模块闭包之后）：按触发步数反算位置与 `rest_time`
       （上游 `_calc_endstop_rate`）。前置已满足：模拟器步数模型与多实例假 MCU 已落地
       （Q10 + `d14ce6a`，两 MCU 端到端测试在案）。
@@ -485,10 +491,10 @@ endstop 资源（`mcu/resource/endstop.rs`，含 `minclock` 门控与 `home_wait
       按 move 距离与步数计算）。两者都影响真实探针 Z 精度，属后续精度单元；模拟器语料不受影响。
 - [ ] 调平：`bed_mesh.py` ◐（**已落地**：`[bed_mesh]` 段与全量选项、探测点生成、
       `BED_MESH_CALIBRATE` 逐点探测存格（按 Y 分行、行内 X 升序）、`BED_MESH_CLEAR`、
-      `bed_mesh/dump_mesh` 端点（2026-10-03）；**待做**：插值网格（lagrange/bicubic、`mesh_pps`）、
-      faulty 区域替换、fade 与 move 的 z 补偿、profile 命令族（`BED_MESH_PROFILE`/`OUTPUT`/`MAP`/`OFFSET`）。
-      现状：`get_status` 仍把 probed 网格当 `mesh_matrix` 返回，`BED_MESH_CALIBRATE` 对后续 move
-      **零影响**（`bed_mesh.rs:16-30` 自述）。）
+      `bed_mesh/dump_mesh` 端点（2026-10-03）、**插值网格（lagrange/bicubic/direct + `mesh_pps`，2026-10-06 `dc1dd1e`）**；
+      **待做**：faulty 区域替换、fade 与 move 的 z 补偿（U2/U3）、profile 命令族
+      （`BED_MESH_PROFILE`/`OUTPUT`/`MAP`/`OFFSET`）。现状：插值已生效于两个出口，但
+      `BED_MESH_CALIBRATE` 对后续 move **仍零影响**。）
 - [x] 螺丝：`screws_tilt_adjust` ✅；`bed_screws` **段已落地**（2026-09-24 批 #1）——**余项**：
       `BED_SCREWS_ADJUST`/`ACCEPT`/`ADJUSTED`/`ABORT` 命令族未注册（`bed_screws.rs` 无 `register_command`）。
 - [ ] 校准：`delta_calibrate` ✅（段+`DELTA_CALIBRATE`/`DELTA_ANALYZE` 落地 2026-09-24 批 #5，`delta_calibrate.test` 转绿）、`axis_twist_compensation` ✅（批 #36）；**未移植**：`skew_correction`、

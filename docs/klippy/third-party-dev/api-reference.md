@@ -532,7 +532,12 @@
   "current_mesh": {
     "name": "default",
     "probed_matrix": [[0.1, 0.0], [0.0, -0.1]],
-    "mesh_matrix": [[0.1, 0.0], [0.0, -0.1]],
+    "mesh_matrix": [
+      [0.1, 0.0667, 0.0333, 0.0],
+      [0.0667, 0.0333, 0.0, -0.0333],
+      [0.0333, 0.0, -0.0333, -0.0667],
+      [0.0, -0.0333, -0.0667, -0.1]
+    ],
     "mesh_params": { ... }
   },
   "profiles": { "default": { ... } },
@@ -555,11 +560,12 @@
 > 且本机缺 `probe_path`/`rapid_path`（探针调度路径未实现），上游另返回的 `probe_offsets` /
 > `axis_minimum` / `axis_maximum`（`bed_mesh.py:308-310`）本机未返回。
 > ② `mesh_args` 只作开关，其键不回灌配置（上游 `update_config` 的 per-command 覆盖未实现）。
-> ③ `mesh_matrix` 当前等于 `probed_matrix`（插值属 H9）；`algo` 报配置值，上游
-> `_verify_algorithm` 可能改写为 `direct`/强制 lagrange（同属 H9）。
+> ③ ~~`mesh_matrix` 当前等于 `probed_matrix`~~ **已闭合（2026-10-06，`dc1dd1e`）**：`mesh_matrix` 现在是
+> 插值后的 6 位小数网格（默认 `mesh_pps: 2` 把 2×2 探测点插成 4×4）；`mesh_params.algo` 报的是
+> `_verify_algorithm` 校验（并可能改写）后的值——两轴 `mesh_pps` 全 0 时它会被改写为 `direct`。
 > ④ `profiles` 恒为 `{}`（`BED_MESH_PROFILE` 未做）；`current_mesh.name` 报 `default`
 > （上游 `PROFILE` 默认值）。
-> ⑤ 圆床的行按实测返回（可能非方阵），上游会复制两端补成方阵。
+> ⑤ ~~圆床的行按实测返回（可能非方阵）~~ **已闭合（2026-10-06，`dc1dd1e`）**：圆床行按上游补齐成方阵。
 > ⑥ 请求参数只有 `mesh_args`（参数表无 profile 名键，profile 名只出现在 `current_mesh.name`）。
 
 > 运行期状态也可通过 `objects/query` 查询 `bed_mesh` 对象：
@@ -762,7 +768,7 @@
 | `mesh_min` | Coord | 网格最小坐标 `[x, y]` |
 | `mesh_max` | Coord | 网格最大坐标 `[x, y]` |
 | `probed_matrix` | array | 实测 Z 值矩阵（二维：按 Y 分行、行内 X 升序，对齐上游 zigzag 存格） |
-| `mesh_matrix` | array | 插值/补偿后 Z 值矩阵（当前等于 `probed_matrix`，插值属 H9） |
+| `mesh_matrix` | array | 插值后的 Z 值矩阵（`ZMesh` 产出、`round(z,6)`；边长 `(count-1)*(mesh_pps+1)+1`，两轴 `mesh_pps` 全 0 时才等于 `probed_matrix`） |
 | `profiles` | object | 所有已保存的网格 profile |
 
 ### `query_endstops`

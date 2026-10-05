@@ -58,7 +58,7 @@ fn test_every_registration_call_site_is_resolved_or_recorded() {
     // Pinning the total is what keeps that sum honest: were the scanner to stop
     // recognising a call site entirely, this drops and the check goes red.
     assert_eq!(
-        scan.call_sites, 90,
+        scan.call_sites, 91,
         "the number of registration call sites the scanner sees changed"
     );
 
@@ -73,7 +73,7 @@ fn test_every_registration_call_site_is_resolved_or_recorded() {
     let known: BTreeSet<&str> = KNOWN_UNRESOLVED_FILES.iter().copied().collect();
     assert_eq!(
         scan.unresolved.len(),
-        4,
+        5,
         "the number of unresolved registration call sites changed: {:#?}",
         scan.unresolved
     );

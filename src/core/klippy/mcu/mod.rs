@@ -4885,7 +4885,7 @@ mod tests {
         let actual = nominal * 1.001;
         let origin = Instant::now();
         let mut estimate = ClockEstimate::seeded(origin, 0);
-        let mut push = |estimate: &mut ClockEstimate, step: usize, rate: f64| {
+        let push = |estimate: &mut ClockEstimate, step: usize, rate: f64| {
             let sent = origin + Duration::from_micros(step as u64 * 500_000);
             let received = sent + Duration::from_millis(2);
             let midpoint_offset = sent.duration_since(origin).as_secs_f64() + 0.001;

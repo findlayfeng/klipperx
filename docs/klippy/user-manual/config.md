@@ -220,6 +220,8 @@ max_accel: 3000
 
 ## 已支持的配置节
 
+本页逐节登记的「未实现 / 与上游不同」之处，统一登记在[本项目与上游的偏移](../developer-manual/upstream-deviations.md)（那里按「不做 / 行为偏移 / 暂缓」分类）；本页仍保留各节的具体说明。
+
 以下为 KlipperX 当前已实现的配置节（共 18 个装载 id，按装载顺序；`[mcu]` 与 `[printer]`
 分别在最早与最晚装载，其余按各节 `section!` 声明的 `order`）。
 

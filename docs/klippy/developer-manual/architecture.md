@@ -137,6 +137,8 @@ let parser_for_task = parser.clone();   // 同一个 Arc<Mutex<MsgMap>>
 
 ## 已实现与未实现
 
+本页与上游不一致处（未实现项与实现形态差异）统一登记在[本项目与上游的偏移](upstream-deviations.md)。
+
 已实现：帧收发与校验、合并发送、同步请求/响应、identify 握手与字典安装（`identify`）、类型化消息与按名取参（`cmd`）。`cmd/` 下的命令模块已经就位：`allocate_oids`、`get_config` / `finalize_config`、`get_uptime`、`emergency_stop` / `clear_shutdown`（`basecmd.c` 的四个分区）、`clock`（`ClockSync` / `McuClock`，读固件时钟）、`gpio` / `pwm` / `adc`、`stepper` / `endstop` / `trsync`、`spi` / `i2c` / `thermocouple` / `ds18b20`、`debug`，以及引导用的 `identify` 一对（各模块与固件源文件的对应见[开发手册首页](README.md)的模块表）。事件消息也走上回调投递：`Mcu::bind_event` 把处理器绑到某条响应上，接收任务在无待配对调用时调用它（`event/stats.rs` 的 `stats` 是第一个）。
 
 未实现（详见 [MCU 协议与数据字典](mcu-protocol.md#当前未实现)）：`output` 表的异步投递（`Dictionary` 已解析但不注册，回调只对 `responses` 里的消息生效）、并发同名响应的区分、枚举参与 `ArgType` 编解码、命名参数。

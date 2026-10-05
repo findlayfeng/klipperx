@@ -6,7 +6,7 @@ klippy 是**单线程事件循环**上的一个对象图：主线程运行 react
 生成与压缩下发到 MCU。停机与重启都是这个对象图上的状态转换。
 
 本页描述的是**上游 klippy 与本项目共有的运行机制**，以上游实现为参照给出出处。凡是本项目与
-上游不同的地方，用「与上游的差异」单独标注。各环节的深入说明见对应专题页；本仓库的模块
+上游不同的地方，用「与上游的差异」单独标注；这些差异统一登记在[本项目与上游的偏移](upstream-deviations.md)。各环节的深入说明见对应专题页；本仓库的模块
 划分见[开发手册首页](README.md)的「分层结构」。
 
 ## 进程与主循环
@@ -144,7 +144,7 @@ Printer.__init__          _connect（reactor 回调）                 对象图
 > [声明式表生成](codegen.md)），不依赖运行时按文件导入。配置解析器读取上游全部 259 份 `.cfg`
 > （由 [回归测试](regression-tests.md) 覆盖），仅保留一处宽松：引号内的 `#` 不作注释，而上游
 > 在第一个 `#` 处截断。`deprecate` / `deprecate_gcode` / `deprecate_mcu_code` / `runtime_warning`
-> 与 `configfile` 的 `warnings` 已实现；`autosave` / `SAVE_CONFIG` 尚未实现。
+> 与 `configfile` 的 `warnings` 已实现；`autosave` / `SAVE_CONFIG`（`#*#` 块的读取与回写、写回后请求重启）也已实现。
 
 ## 事件总线
 
@@ -244,7 +244,7 @@ G28 ──▶ Homing.home_rails
 > 运动学已有 `none` / `cartesian` / `corexy` / `corexz` / `hybrid_corexy` / `hybrid_corexz`
 > （delta 族与 generic_cartesian 待做，C1c），回零目前是**单程**（`homing_retract_dist` /
 > `second_homing_speed` 已读入 `HomingInfo` 但二次回零未接，`endstop_phase` 未实现），`G28`
-> 按请求的轴**逐个**回（一次一轴，与上游 cartesian 一致）。`GCodeIO` 的输入抽象（伪 tty / 文件 / `stats gcodein`）暂缓；mux 命令的
+> 按请求的轴**逐个**回（一次一轴，与上游 cartesian 一致）。上游 `GCodeIO` 的行协议输入（伪 tty / 文件输入、`ok` 应答）本仓不实现（见[本项目与上游的偏移](upstream-deviations.md)）；mux 命令的
 > 「取值不合法」提示取排序后的第一个候选，上游取字典序最后一个。见
 > [延迟与抖动](latency.md)与 `TODO.md`。
 

@@ -286,8 +286,9 @@ harness 把每个 `[mcu]` / `[mcu <name>]` 的传输键换成 `test: dict=<字�
 
 ### 忽略列表
 
-上游绝大多数配置会用到本主机尚未实现的节（`extruder`、`heater_bed`、`fan`、`gcode_macro`、
+上游绝大多数配置会用到本主机当时尚未实现的节（`extruder`、`heater_bed`、`fan`、`gcode_macro`、
 `tmc*`…），它们在 `load_config` 阶段就被拒绝，因此曾逐条登记在 `IGNORED` 里跳过；随节落地逐条移除。
+（现存的与上游不一致处统一登记在[本项目与上游的偏移](upstream-deviations.md)。）
 
 **生成式运行器后**（2026-10-02）：`IGNORED` 的权威列表搬到 `crates/test-support/build.rs`，
 按生成的测试函数名 `upstream_<stem>_config_<n>_<cfg>` 匹配（旧版按 `.test` 文件名匹配，会误伤

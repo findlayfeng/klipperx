@@ -71,7 +71,7 @@ H1–H12 是上游 extras 里按域归并的消费者（2026-09-21 全量盘点�
 
 | # | 事项 | 依赖 |
 |---|---|---|
-| G1b | gcode 调度器与上游的行为差异（`get_mutex` 等价物等；`GCodeIO` 暂缓 `[~]`；参数访问器与 `M115`/`Coord`/`request_restart` 已完成并归档） | C1 |
+| G1b | gcode 调度器与上游的行为差异（`get_mutex` 等价物等；`GCodeIO` **不做**（2026-10-05 结案，`need_ack` 机制已删）；参数访问器与 `M115`/`Coord`/`request_restart` 已完成并归档） | C1 |
 | G2b | 用 GCODE 控制 GPIO：数字/PWM 驱动与 `SET_PIN` **已落地**；「随打印时间生效的请求队列」（上游 `GCodeRequestQueue`）**已移植并接入 `output_pin`**；`pwm_cycle_time` 的 `SET_PIN` 已通过 `register_lookahead_callback` + `min_schedule_time` 自间隔调度（2026-10-03，`a3e1d4c`）；余项＝`output_pin` 的 `static_value`/`template`，以及 `heaters` 切到同一队列（`fan`/`servo`/`pwm_tool` 2026-10-03 已切换） | —（C1 已收官，不再是前置） |
 | G4 | 运动命令（G0/G1/G28…） | G1、C1 |
 | B4 | 其余端点（`*/dump_*` / …；estop、remote method、`pause_resume/*` 与 `bed_mesh/dump_mesh` 已落地） | G3、H4、H9 |
@@ -163,18 +163,19 @@ toolhead / 开放事件）一起补，一部分是现在就独立可补的小行
 
 **随前置一起补（GCodeIO / toolhead / 事件）**
 
-- [~] **`GCodeIO` 未移植（已定：暂缓，不做 OctoPrint 串口仿真）**：伪 tty / 文件输入整块
+- [x] **`GCodeIO` 不移植（2026-09-21 暂缓 → 2026-10-05 结案：不做）**：伪 tty / 文件输入整块
       缺失——fd 读取与 `partial_input`、`pending_commands` 批量与 20 条阈值、`M112` 乱序检测
       （`m112_r` = `^(?:[nN][0-9]+)?\s*[mM]112(?:\s|$)`）、`input_log`、debuginput EOF 退出、
       `stats gcodein=`（`:390-494`）。现在输入由 API 层的 `gcode/script` 承担，客户端契约走
-      Moonraker API；**结论（2026-09-21）：暂不实现**，保留为将来的可选扩展。
-      将来要做时的最小路径与前置：① 先给 reactor 补 **fd 事件层**（本仓库只有定时器，无
+      Moonraker API；**结论：不做**（`need_ack`/`ack` 机制已于 2026-10-05 从 `gcode.rs` 删除；偏移登记在
+      [本项目与上游的偏移](docs/klippy/developer-manual/upstream-deviations.md)）。
+      以下为若要翻案时的最小路径与前置（存档）：① 先给 reactor 补 **fd 事件层**（本仓库只有定时器，无
       `register_fd`/`poll` 对应物），这是最贵的一块；② `util.create_pty`（`openpty` +
       `symlink` 到 `/tmp/printer` + 关 `ECHO` + 非阻塞）与 `GCodeIO` 对象；③ `is_fileinput`
       决定 `request_restart` / `_handle_shutdown` 是否退 `error_exit`（`:355` `:429`）；
       ④ `gcode:debuginput_exit` 需要 `send_event` 收集 handler 返回值（上游 `all(...)`）。
       tty 与 debuginput 共用同一套 `_process_data`，应一起做。
-- [~] **`gcode:debuginput_exit` 触发（随 `GCodeIO` 暂缓）**：上游 `_do_debuginput_exit`
+- [x] **`gcode:debuginput_exit` 触发（随 `GCodeIO` 结案：不做）**：上游 `_do_debuginput_exit`
       轮询 `all(send_event('gcode:debuginput_exit'))`（`:432-435`），依赖 handler 的返回值；
       本仓库 `Printer::send_event` 丢弃返回值（上游 `klippy/klippy.py:226-227` 是
       `return [cb(...)]`）。要与 `GCodeIO` 一起做（见上一条）。
@@ -269,10 +270,11 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 
 ### D1 主机层 start args / rollover / 日志（框架 FW8）
 
-- [ ] **`StartArgs` 的剩余接线**：结构体已带 `apiserver`（宿主启动时填，`src/klippy.rs:323`）、
-      `start_reason`、`debug_input`/`debug_output`、`device`、`linux_version`；缺的是
-      `--debuginput`/`--debugoutput` 的命令行解析（`StartArgs::collect` 里仍是 `None`）与
-      每个 MCU 的字典路径。`software_version` 已由宿主 `set_start_args` 注入
+- [x] **`StartArgs` 的剩余接线（2026-10-05 结案）**：结构体已带 `apiserver`（宿主启动时填，`src/klippy.rs:323`）、
+      `start_reason`、`debug_input`/`debug_output`、`device`、`linux_version`；`--debuginput`/`--debugoutput`
+      的命令行解析**不做**（随 `GCodeIO` 决策：本仓不实现行协议输入与 batch mode，`StartArgs::collect` 里保持 `None`；
+      `debug_output` 字段继续供语料 harness 使用），每个 MCU 的 `-d` 字典路径同样不做（只服务上游 `-o`）。
+      `software_version` 已由宿主 `set_start_args` 注入
       （`src/klippy.rs:324`）并被 `info` 与 `M115` 读取——接线已完成并归档。
 - [ ] **rollover 的 `log_config`**：上游每次 `_read_config` 都把整份配置写进 rollover
       （`configfile.py:482-487`、`klippy.py:118`），本仓只有 `versions` 块；重启重读上线后，
@@ -497,10 +499,12 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
       实例，复现不了「同一假固件跨两次宿主会话」；方案即上述最小时序模型 + 两会话单测（修复前代码转红），
       原则：真机定案、假件固化。
 
-- [~] **Q8 GCodeIO（伪 tty / OctoPrint 串口仿真）补不补**：**已定（2026-09-21）：暂不实现**，
-      归档为将来可选项，等需要时再操作。纯 API 主机（Moonraker）不需要它；代价是
-      `debuginput_exit`、`is_fileinput`/`error_exit`、`stats gcodein=`、`input_log`、`M112` 乱序
-      一直缺。将来做时的前置见 G1b 的 `GCodeIO` 条目（首要是 reactor 的 fd 事件层）。
+- [x] **Q8 GCodeIO（伪 tty / OctoPrint 串口仿真）补不补**：**结案（2026-10-05）：不做**（2026-09-21 曾定暂缓）。
+      `need_ack`/`ack` 机制已从 `src/core/klippy/gcode.rs` 删除；偏移登记在
+      [本项目与上游的偏移](docs/klippy/developer-manual/upstream-deviations.md)。纯 API 主机（Moonraker）不需要它；
+      放弃的能力：`debuginput_exit`、`is_fileinput`/`error_exit`、`stats gcodein=`、`input_log`、`M112` 乱序。
+      需要 OctoPrint 串口主机或上游 batch mode 的场景请用上游 Klipper。若将来翻案，前置见 G1b 的 `GCodeIO`
+      条目（首要是 reactor 的 fd 事件层）。
 
 ## 上游事件对照清单（事件总线已就绪，逐项注册处理器）
 
@@ -589,13 +593,13 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 | 事件名 | 触发时机 | 参数 | 上游位置 | 实现依赖 |
 |---|---|---|---|---|
 | `gcode:command_error` | gcode 命令错误 | 无 | `klippy/gcode.py:226` | ✅ 已触发（`process_line`） |
-| `gcode:debuginput_exit` | debuginput EOF | 无 | `klippy/gcode.py:433` | **暂缓 `[~]`**（随 GCodeIO；需 `send_event` 返回值） |
+| `gcode:debuginput_exit` | debuginput EOF | 无 | `klippy/gcode.py:433` | **不做 `[x]`**（本仓不实现行协议输入；上游靠 `send_event` 收集返回值） |
 | `gcode:request_restart` | 请求重启 | `{print_time: f64}` | `klippy/gcode.py:358` | ✅ 已触发（`gcode.rs:1357`，`get_last_move_time` 取 print time） |
 
 > `gcode:command_error` 已接（handler 的 `CommandError` 触发，panic 不触发）；`gcode:request_restart`
 > 已在 `request_restart` 处理器里产线触发（`gcode.rs:1357`，先 `get_last_move_time` 再
-> dwell/wait）；`gcode:debuginput_exit` 随 `GCodeIO` **暂缓 `[~]`**（不做 OctoPrint 串口仿真），
-> 将来做时还要先让 `send_event` 收集 handler 返回值（上游 `all(...)`）。
+> dwell/wait）；`gcode:debuginput_exit` 随 `GCodeIO` **不做 `[x]`**（本仓不实现行协议输入），
+> 若将来翻案还要先让 `send_event` 收集 handler 返回值（上游 `all(...)`）。
 
 ### 工具/传感器事件
 
@@ -632,7 +636,7 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 ├── homing:* —— 已触发（toolhead 回零路径）
 ├── toolhead:* —— set_position 已触发；其余随 G4-2（C1d 已收官）
 ├── idle_timeout:* —— 依赖 idle_timeout 对象
-├── gcode:* —— command_error / request_restart 已触发；debuginput_exit 随 GCodeIO 暂缓
+├── gcode:* —— command_error / request_restart 已触发；debuginput_exit 不做（本仓无行协议输入）
 ├── probe:* —— 依赖 endstop
 ├── extruder:* —— 依赖 C1（activate_extruder 尚无发送方）
 ├── stepper_enable:* —— 已触发（motor_off）
@@ -654,7 +658,7 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 | 主循环与重启、退出码 | `klippy/klippy.py:355-370` |
 | `emergency_stop` / `register_remote_method` / mux | `klippy/webhooks.py:319-340` |
 | gcode 调度器（命令表 / `run_script` / 输出） | `klippy/gcode.py:105-388` |
-| `GCodeIO`（伪 tty / 文件输入、`ack` 协议） | `klippy/gcode.py:390-494` |
+| `GCodeIO`（伪 tty / 文件输入、`ack` 协议；**本仓不做**，`ack`/`need_ack` 已删） | `klippy/gcode.py:390-494` |
 | `output_pin`（`SET_PIN` / `GCodeRequestQueue` / 模板） | `klippy/extras/output_pin.py:13-269` |
 | section 校验用注册表 | `klippy/configfile.py:425-445` |
 | mcu 作为 printer object、它的 status | `klippy/mcu.py:1147-1170`、`:1235`、`:938-975` |

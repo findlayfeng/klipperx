@@ -85,10 +85,11 @@
 - [ ] **R11 连续运行的真机时序** —— 真实测试：把 R1–R9 的最小任务**循环跑满一段较长
   时间**（分钟到小时级，或用 `stress --task step` 顶着上限压）。判定：无
   `Stepper too far in past` / `Timer too close`、无丢步、USB 不掉线；本项要暴露的
-  代码侧缺口是 `ToolHead.wait_moves` 的宿主等待与 `send_wait_ack`（2026-10-06 复核：
-  消息的 `min_clock`/`req_clock` 闸**已建模**，见 `mcu/mod.rs:149-176`；缺的是
-  `motion/toolhead.rs:467` 不等 MCU、`MIN_KIN_TIME`/`kin_flush_delay` 未建模，以及
-  `mcu/mod.rs` 没有「块被固件确认」原语）。
+  代码侧缺口：**宿主的 `ToolHead.wait_moves` 等待已落地（2026-10-06，`46d6e64`）**，但它按上游
+  `can_pause` 在 fileoutput 下短路，所以**真机路径（无 `debug_output`）仍未验证**——本项就是要验它；
+  一并要验的还有送出口径（batch 窗口 + move-pool 槽位释放）会不会让最后几批 step 晚到。
+  尚未建模的剩 `send_wait_ack`（消息的 `min_clock`/`req_clock` 闸**已建模**，见 `mcu/mod.rs:149-176`；
+  `mcu/mod.rs:2639-2650` 自述只是 flush、不是「块被固件确认」）。
 
 ## 已完成真机验证（留档）
 

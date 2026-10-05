@@ -2,8 +2,8 @@
 //! command declares.
 //!
 //! The host records the parameter names at the registration point
-//! ([`GCodeDispatch::register_command_with_params`] and
-//! [`GCodeDispatch::register_mux_command_with_params`]) and reports them in
+//! (`GCodeDispatch::register_command_with_params` and
+//! `GCodeDispatch::register_mux_command_with_params`) and reports them in
 //! `status.gcode.commands[<name>]["parameters"]`. A client that reaches a host
 //! reads them from there; a client that does not still needs the names, so this
 //! module re-derives them from the source and [`crate::gcode_params::BUILTIN`]
@@ -24,7 +24,6 @@
 //! `#[cfg(test)]` items are skipped: the registrations a test makes are fixtures
 //! (`"MY_CMD"`), not commands the host actually answers.
 //!
-//! [`GCodeDispatch::register_command_with_params`]: crate
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;

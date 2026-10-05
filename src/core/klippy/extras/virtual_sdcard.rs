@@ -1113,7 +1113,7 @@ mod tests {
         let path = dir.path();
         std::fs::write(path.join("Cube.GCODE"), "G28\n").unwrap();
 
-        let (printer, object, gcode) = machine_with_dir(path);
+        let (_printer, object, gcode) = machine_with_dir(path);
         gcode.run_script_sync("M23 cube.gcode").unwrap();
         assert_eq!(
             status_str(&object, "file_path"),
@@ -1128,7 +1128,7 @@ mod tests {
         let path = dir.path();
         std::fs::write(path.join("file.gcode"), "G28\n").unwrap();
 
-        let (printer, object, gcode) = machine_with_dir(path);
+        let (_printer, object, gcode) = machine_with_dir(path);
         gcode.run_script_sync("M23 /file.gcode").unwrap();
         assert_eq!(
             status_str(&object, "file_path"),

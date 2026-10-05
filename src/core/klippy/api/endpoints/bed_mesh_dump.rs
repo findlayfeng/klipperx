@@ -10,12 +10,9 @@
 //! {"id": 1, "method": "bed_mesh/dump_mesh", "params": {"mesh_args": {}}}
 //! ```
 //!
-//! Three gaps between that upstream handler and this one are deliberate, and
+//! Two gaps between that upstream handler and this one are deliberate, and
 //! each is a capability this unit does not have yet rather than a shortcut:
 //!
-//! * **`mesh_matrix` is the probed grid** — interpolation (`lagrange` /
-//!   `bicubic`) is not written yet, so the grid moves would follow is the grid
-//!   as probed, the same stand-in `bed_mesh`'s `get_status` makes;
 //! * **`mesh_args` is accepted but not applied** — upstream feeds its keys back
 //!   into the mesh configuration (`bed_mesh.py:631-633`); the per-command
 //!   overrides that reads are not written yet, so `calibration` describes the
@@ -23,6 +20,11 @@
 //! * **`profiles` is always `{}`** — nothing is saved across a restart until
 //!   `BED_MESH_PROFILE` lands, and upstream's `probe_path` / `rapid_path`
 //!   (the probe scheduler's walk) are absent with it.
+//!
+//! `current_mesh` carries the two grids upstream reports: `probed_matrix` is the
+//! grid as probed, `mesh_matrix` the interpolation grid sampled from it
+//! (`ZMesh`, `mesh_pps`) — the same two answers `bed_mesh`'s `get_status`
+//! gives, read off the same loaded mesh.
 //!
 //! A machine whose config has no `[bed_mesh]` section answers
 //! `webhooks: No registered callback for path 'bed_mesh/dump_mesh'`: upstream
@@ -131,7 +133,7 @@ fn mesh_args(request: &Request) -> Result<bool, ApiError> {
 // Response
 // ===========================================================================
 
-/// The `current_mesh` half: the loaded grid, or `{}` while there is none
+/// The `current_mesh` half: the loaded grids, or `{}` while there is none
 /// (`bed_mesh.py:296-302`).
 fn current_mesh(bed: &BedMesh) -> Result<Value, ApiError> {
     let Some(mesh) = bed.loaded_mesh() else {
@@ -139,13 +141,12 @@ fn current_mesh(bed: &BedMesh) -> Result<Value, ApiError> {
     };
     let options = bed.options();
     let points = probe_points(&options)?;
-    let probed = json!(mesh.rows);
-    let interpolated = probed.clone();
     Ok(json!({
         "name": mesh.name,
-        "probed_matrix": probed,
-        // Upstream's is the interpolated grid; see the module docs.
-        "mesh_matrix": interpolated,
+        "probed_matrix": mesh.rows,
+        // The interpolation grid, reported to 6 decimals as upstream's
+        // `get_mesh_matrix` does (`bed_mesh.py:1360-1364`).
+        "mesh_matrix": mesh.z_mesh.get_mesh_matrix(),
         "mesh_params": mesh_params(&options, &points),
     }))
 }
@@ -360,25 +361,43 @@ mod tests {
             .await
             .unwrap();
 
+        let mesh = &answer["current_mesh"];
+        assert_eq!(mesh["name"], "default");
+        // `probed_matrix` is the grid as probed …
         assert_eq!(
-            answer,
+            mesh["probed_matrix"],
+            json!([[0.1, 0.2, 0.3], [0.4, 0.5, 0.6], [0.7, 0.8, 0.9]])
+        );
+        // … and `mesh_matrix` the interpolation grid sampled from it: a 3×3
+        // probe with the default `mesh_pps: 2` becomes a 7×7 mesh, holding the
+        // probed values at the probed positions and interpolated ones between
+        // them.
+        let interpolated = mesh["mesh_matrix"].as_array().unwrap();
+        assert_eq!(interpolated.len(), 7);
+        assert!(interpolated
+            .iter()
+            .all(|row| row.as_array().unwrap().len() == 7));
+        assert_eq!(interpolated[0][0], 0.1);
+        assert_eq!(interpolated[0][3], 0.2);
+        assert_eq!(interpolated[0][6], 0.3);
+        assert_eq!(interpolated[3][0], 0.4);
+        assert_eq!(interpolated[3][3], 0.5);
+        assert_eq!(interpolated[6][6], 0.9);
+        // Neither grid is the other one: mesh row 1 sits a third of the way
+        // from probed row 0 to probed row 1, and that column rises linearly
+        // from 0.2 to 0.5 over the 50mm between them, so it holds 0.3.
+        assert!((interpolated[1][3].as_f64().unwrap() - 0.3).abs() < 1e-9);
+        assert_eq!(
+            mesh["mesh_params"],
             json!({
-                "current_mesh": {
-                    "name": "default",
-                    "probed_matrix": [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6], [0.7, 0.8, 0.9]],
-                    // No interpolation yet: the probed grid stands in for it.
-                    "mesh_matrix": [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6], [0.7, 0.8, 0.9]],
-                    "mesh_params": {
-                        "min_x": 0.0, "max_x": 100.0,
-                        "min_y": 0.0, "max_y": 100.0,
-                        "x_count": 3, "y_count": 3,
-                        "mesh_x_pps": 2, "mesh_y_pps": 2,
-                        "algo": "lagrange", "tension": 0.2
-                    }
-                },
-                "profiles": {}
+                "min_x": 0.0, "max_x": 100.0,
+                "min_y": 0.0, "max_y": 100.0,
+                "x_count": 3, "y_count": 3,
+                "mesh_x_pps": 2, "mesh_y_pps": 2,
+                "algo": "lagrange", "tension": 0.2
             })
         );
+        assert_eq!(answer["profiles"], json!({}));
     }
 
     #[tokio::test]

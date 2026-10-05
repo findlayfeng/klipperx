@@ -27,7 +27,7 @@
 //! | command | meaning |
 //! |---|---|
 //! | `G4` | dwell, `P` in milliseconds or `S` in seconds |
-//! | `M400` | flush the planner |
+//! | `M400` | plan the queued moves, then wait for the MCU's clock to reach them |
 //! | `G28` | home the named axes (all three when none is named) |
 //! | `SET_KINEMATIC_POSITION` | force the low-level position, homing the named axes |
 //! | `SET_VELOCITY_LIMIT` | change (or report) the velocity limits |
@@ -56,6 +56,13 @@
 //! delay cannot make it late and no stamp is born so far ahead that the
 //! firmware's wrapping timer compare reads it as already expired. The task checks
 //! [`ToolHeadObject::shutdown`] each wake, so a restart stops it with the object.
+//!
+//! A command that must not return until the motion it queued is **done**
+//! (`M400`) does not take the slot out for the duration — that would stop the
+//! flush task and with it the machine. It waits on the clock estimate instead
+//! (`klippy/toolhead.py:422-428`), re-reading it every 100 ms with the lock
+//! released between reads, and skips the wait entirely in file-output runs
+//! (upstream's `can_pause`, `toolhead.py:221-223`).
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -65,7 +72,7 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use tokio::time::sleep;
+use tokio::time::{sleep, Instant};
 use tracing::warn;
 
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
@@ -109,7 +116,7 @@ use crate::core::klippy::motion::rotary_delta::{
     ROTARY_DELTA_DEFAULT_ANGLES, ROTARY_DELTA_RAIL_NAMES,
 };
 use crate::core::klippy::motion::stepcompress::{StepCommand, StepCompressError};
-use crate::core::klippy::motion::toolhead::{EstimatedPrintTime, ToolHead};
+use crate::core::klippy::motion::toolhead::{EstimatedPrintTime, ToolHead, WaitMovesState};
 use crate::core::klippy::motion::winch::{winch_active_flags, winch_position_fn, WinchKinematics};
 use crate::core::klippy::motion::{HomeCoord, Homing, HomingHandle, HomingInfo};
 use crate::core::klippy::printer::{ConnectFuture, Printer, PrinterObject, RestartHooks};
@@ -128,6 +135,21 @@ section!(
 
 /// How often the flush task wakes to generate and send steps.
 const FLUSH_INTERVAL: Duration = Duration::from_millis(10);
+
+/// How long `M400` sleeps between two readings of the clock estimate, as
+/// upstream's `self.reactor.pause(eventtime + 0.100)`
+/// (`ToolHead.wait_moves`, `klippy/toolhead.py:427`).
+const WAIT_MOVES_POLL: Duration = Duration::from_millis(100);
+
+/// How long the estimate may stand still before `M400` gives up on it.
+///
+/// A live estimate advances with the machine's clock (the fake firmware's with
+/// wall time), so a full second without movement means the source is gone —
+/// with a constant estimate the horizon behind it would never be reached and
+/// the wait would never end. Upstream has no such guard: its `can_pause`
+/// covers file output and shutdown only, so a dead `mcu.estimated_print_time`
+/// would hang it.
+const WAIT_MOVES_STALL: Duration = Duration::from_secs(1);
 
 /// The background flush's step-generation horizon: how far past the estimate
 /// it generates when the planner is caught up (`BGFLUSH_HIGH_TIME`,
@@ -898,9 +920,19 @@ impl ToolHeadObject {
             // `S` is seconds, `P` milliseconds; the handler prefers `S`.
             .register_command_with_params("G4", dwell_handler, None, &["S", "P"], false)
             .map_err(ConfigError::new)?;
+        // `M400` is the one handler that must not return before the machine
+        // has caught up, so it awaits (see [`cmd_wait_moves`]) rather than
+        // wrapping a synchronous body.
         let wait_handler: CommandHandler = {
             let state = Arc::clone(&self.state);
-            sync(move |gcmd| cmd_wait_moves(&state, gcmd))
+            let printer = Arc::downgrade(printer);
+            let shutdown = Arc::clone(&self.shutdown);
+            Arc::new(move |_gcmd: &GcodeCommand| {
+                let state = Arc::clone(&state);
+                let printer = printer.clone();
+                let shutdown = Arc::clone(&shutdown);
+                Box::pin(async move { cmd_wait_moves(&state, &printer, &shutdown).await })
+            })
         };
         gcode
             .register_command("M400", wait_handler, None, false)
@@ -3414,17 +3446,119 @@ fn cmd_dwell(
     Ok(())
 }
 
-/// `M400`: wait for the moves queued so far to be planned.
-fn cmd_wait_moves(
+/// `M400`: wait for the moves queued so far to be planned **and for the
+/// machine to reach them**.
+///
+/// Upstream's `ToolHead.wait_moves` (`klippy/toolhead.py:422-428`) flushes the
+/// look-ahead and then pauses until the MCU's estimate reaches the planner's
+/// horizon:
+///
+/// ```python
+/// while (not self.special_queuing_state
+///        or self.print_time >= self.mcu.estimated_print_time(eventtime)):
+///     if not self.can_pause:
+///         break
+///     eventtime = self.reactor.pause(eventtime + 0.100)
+/// ```
+///
+/// That is the host's only print-rhythm guard: without it a replay hands the
+/// planner a whole segment at once and `print_time` runs away from the clock.
+///
+/// The loop must **not** hold [`ToolHeadObject::state`]'s lock across the
+/// sleep: the background flush task ([`run_flush_loop`]) is what keeps the
+/// machine's steps going while this waits, and it takes the same slot. So every
+/// iteration takes one short lock, copies the two numbers out
+/// ([`ToolHead::wait_moves_state`]), releases it, and then sleeps. A `std` lock
+/// held across an `.await` would additionally make this future non-`Send`.
+///
+/// Like upstream, the wait is skipped entirely when [`can_pause`] is false —
+/// under `-o` file output the run is a test, nothing answers the MCU, and
+/// pausing on its clock would never end. That is upstream's behaviour
+/// (`toolhead.py:221-223`, `:426-427`), not a host downgrade.
+///
+/// Four things end the wait, so it can never run forever: the estimate reaches
+/// the horizon; the estimate stops advancing (a gone clock source reads a
+/// constant, and the horizon could then never be reached — reported rather than
+/// waited on); the toolhead is going down ([`ToolHeadObject::shutdown`]); or
+/// [`can_pause`] says this run must not wait. An empty slot — a restart took
+/// the machine down — ends it too.
+///
+/// # Errors
+/// "Printer is not ready" before connect, or the stalled-clock report.
+async fn cmd_wait_moves(
     state: &Arc<Mutex<Option<Connected>>>,
-    _gcmd: &GcodeCommand,
+    printer: &Weak<Printer>,
+    shutdown: &Arc<AtomicBool>,
 ) -> Result<(), CommandError> {
-    let mut guard = state.lock().unwrap_or_else(|poison| poison.into_inner());
-    let Some(connected) = guard.as_mut() else {
-        return Err(CommandError::new("Printer is not ready"));
-    };
-    connected.toolhead.wait_moves();
-    Ok(())
+    {
+        let mut guard = state.lock().unwrap_or_else(|poison| poison.into_inner());
+        let Some(connected) = guard.as_mut() else {
+            return Err(CommandError::new("Printer is not ready"));
+        };
+        connected.toolhead.wait_moves();
+    }
+    // The stall guard is against the reading the loop started from: a clock
+    // that does not move again within `WAIT_MOVES_STALL` cannot be waited out.
+    let mut last_estimate = f64::NEG_INFINITY;
+    let mut standing_since = Instant::now();
+    loop {
+        let Some(wait) = wait_moves_state(state) else {
+            // The machine went away under us (a restart): there is nothing
+            // left to wait for.
+            return Ok(());
+        };
+        if !wait.waiting {
+            return Ok(());
+        }
+        if !can_pause(printer) || shutdown.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        if wait.estimated_print_time > last_estimate {
+            last_estimate = wait.estimated_print_time;
+            standing_since = Instant::now();
+        } else if standing_since.elapsed() >= WAIT_MOVES_STALL {
+            return Err(CommandError::new(format!(
+                "M400: the MCU clock estimate stood still for {:.3}s, {:.3}s of motion still ahead",
+                standing_since.elapsed().as_secs_f64(),
+                wait.print_time - wait.estimated_print_time,
+            )));
+        }
+        sleep(WAIT_MOVES_POLL).await;
+    }
+}
+
+/// Whether the machine may be paused on at all — upstream's `ToolHead.can_pause`
+/// (`klippy/toolhead.py:221-223`):
+///
+/// ```python
+/// self.can_pause = True
+/// if self.mcu.is_fileoutput():
+///     self.can_pause = False
+/// ```
+///
+/// File output is `-o` ([`Printer::is_fileoutput`]): the run is a test, the
+/// fake host never answers the MCU, and `reactor.pause` on its clock would
+/// hang — so upstream's `wait_moves` breaks out of its loop at once
+/// (`toolhead.py:426-427`), and so does this one. Every corpus case and every
+/// harness run is file output, which is why the corpus never waits here.
+///
+/// A printer that is gone reads the same way: there is nothing left to pause
+/// on.
+fn can_pause(printer: &Weak<Printer>) -> bool {
+    printer
+        .upgrade()
+        .is_some_and(|printer| !printer.is_fileoutput())
+}
+
+/// One iteration's read of the planner for [`cmd_wait_moves`]: the slot is
+/// locked only long enough to copy the numbers out, so the flush task (and the
+/// reactor) run while the wait sleeps.
+fn wait_moves_state(state: &Arc<Mutex<Option<Connected>>>) -> Option<WaitMovesState> {
+    state
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .as_ref()
+        .map(|connected| connected.toolhead.wait_moves_state())
 }
 
 /// An optional float word: upstream's `gcmd.get_float(name, None, …)`. An
@@ -4423,6 +4557,179 @@ mod tests {
         let guard = state.lock().unwrap();
         let after = guard.as_ref().unwrap().toolhead.print_time();
         assert!((after - (before + 0.5)).abs() < 1e-9, "{after}");
+    }
+
+    // ------------------------------------------------------------------
+    // `M400` — the wait for the machine (`ToolHead.wait_moves`)
+    // ------------------------------------------------------------------
+
+    /// A connected state holding one move queued ahead of the clock, with the
+    /// estimate read from `estimate`; returns the reading `M400`'s wait starts
+    /// from, which is also the gap it has to wait out.
+    ///
+    /// The estimate source is injected because these tests need a clock they
+    /// control: the default source reads a constant `0.0`. The printer is
+    /// returned because the wait asks it whether this run may pause at all
+    /// (`debug_output` — upstream's `can_pause`).
+    fn queued_move_ahead_of(
+        estimate: impl Fn() -> f64 + Send + Sync + 'static,
+        debug_output: bool,
+    ) -> (Arc<Mutex<Option<Connected>>>, Arc<Printer>, WaitMovesState) {
+        use crate::core::klippy::api::StartArgs;
+
+        let mut toolhead = homed_toolhead();
+        toolhead.set_estimated_print_time_source(EstimatedPrintTime::new(estimate));
+        toolhead
+            .move_to(Coord::new(10.0, 0.0, 0.0, 0.0), 100.0)
+            .expect("the move plans");
+        let (state, _gcode, printer) = connected_with_printer(toolhead);
+        if debug_output {
+            // The `-o` shape every corpus and harness run has.
+            let mut start_args = StartArgs::collect("m400.cfg", None);
+            start_args.debug_output = Some("_test_output".to_string());
+            printer.set_start_args(Arc::new(start_args));
+        }
+        {
+            // The `_flush_lookahead` `M400` opens with, so the reading below
+            // is the one its own wait starts from.
+            let mut guard = state.lock().unwrap_or_else(|poison| poison.into_inner());
+            guard.as_mut().expect("connected").toolhead.wait_moves();
+        }
+        let start = wait_moves_state(&state).expect("connected");
+        assert!(start.waiting, "the move must start ahead of the clock");
+        (state, printer, start)
+    }
+
+    /// `M400` waits for the clock estimate to reach the planner's horizon, and
+    /// sleeps between readings instead of blocking (`ToolHead.wait_moves`,
+    /// `klippy/toolhead.py:422-428`).
+    ///
+    /// The estimate is the test's virtual clock, so only a loop that awaits can
+    /// move it: a wait that returned at once, or slept without re-reading,
+    /// would leave the gap it was called to close.
+    #[tokio::test(start_paused = true)]
+    async fn test_wait_moves_waits_for_the_estimate_to_catch_up() {
+        let origin = Instant::now();
+        let (state, printer, start) =
+            queued_move_ahead_of(move || origin.elapsed().as_secs_f64(), false);
+        let gap = start.print_time - start.estimated_print_time;
+
+        let started = Instant::now();
+        cmd_wait_moves(
+            &state,
+            &Arc::downgrade(&printer),
+            &Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .expect("the wait returns once the clock has caught up");
+        let waited = started.elapsed().as_secs_f64();
+
+        let after = wait_moves_state(&state).expect("connected");
+        assert!(!after.waiting, "the clock reached the horizon");
+        assert!(
+            after.print_time - after.estimated_print_time <= 0.0,
+            "M400 left motion ahead of the clock: {} vs {}",
+            after.print_time,
+            after.estimated_print_time
+        );
+        assert!(
+            waited >= gap - WAIT_MOVES_POLL.as_secs_f64(),
+            "the wait must sleep and re-read: {waited:.3}s for a {gap:.3}s gap"
+        );
+    }
+
+    /// A clock estimate that never moves is **reported**, not waited on
+    /// forever: upstream has no such guard — its loop only checks `can_pause`
+    /// (`klippy/toolhead.py:426-427`) — so a dead `mcu.estimated_print_time`
+    /// would hang it, and a constant estimate can never reach the horizon.
+    #[tokio::test(start_paused = true)]
+    async fn test_wait_moves_gives_up_when_the_estimate_stands_still() {
+        let (state, printer, _start) = queued_move_ahead_of(|| 0.0, false);
+
+        let started = Instant::now();
+        let err = cmd_wait_moves(
+            &state,
+            &Arc::downgrade(&printer),
+            &Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .expect_err("a still estimate cannot be waited out");
+
+        assert!(err.to_string().contains("clock estimate"), "{err}");
+        assert!(
+            started.elapsed() >= WAIT_MOVES_STALL - WAIT_MOVES_POLL,
+            "the guard spans the whole window: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            started.elapsed() < WAIT_MOVES_STALL * 2,
+            "and is bounded: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A toolhead on its way down stops waiting at once ([`ToolHeadObject::shutdown`]).
+    #[tokio::test(start_paused = true)]
+    async fn test_wait_moves_stops_when_the_toolhead_is_going_down() {
+        let origin = Instant::now();
+        let (state, printer, _start) =
+            queued_move_ahead_of(move || origin.elapsed().as_secs_f64(), false);
+
+        let started = Instant::now();
+        cmd_wait_moves(
+            &state,
+            &Arc::downgrade(&printer),
+            &Arc::new(AtomicBool::new(true)),
+        )
+        .await
+        .expect("a toolhead that is going down stops waiting");
+
+        assert!(
+            started.elapsed() < WAIT_MOVES_POLL,
+            "it must not sleep first: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            wait_moves_state(&state).expect("connected").waiting,
+            "it stopped because it is going down, not because the clock caught up"
+        );
+    }
+
+    /// Under `-o` file output `M400` does not wait at all: upstream's
+    /// `can_pause` is false there (`klippy/toolhead.py:221-223`), and its
+    /// `wait_moves` breaks out of the loop before the first pause
+    /// (`:426-427`). The run is a test, the fake host never answers the MCU,
+    /// and pausing on its clock would not end.
+    ///
+    /// Every corpus case and every harness run is file output, which is why the
+    /// corpus covers the wait not at all: this test pins the gate itself
+    /// (see `test_m400_waits_for_the_fake_firmware_clock_to_catch_up` for the
+    /// waiting side, which runs without `debug_output`).
+    #[tokio::test(start_paused = true)]
+    async fn test_wait_moves_does_not_wait_under_file_output() {
+        let origin = Instant::now();
+        let (state, printer, start) =
+            queued_move_ahead_of(move || origin.elapsed().as_secs_f64(), true);
+        assert!(start.waiting, "the move is queued ahead of the clock");
+
+        let started = Instant::now();
+        cmd_wait_moves(
+            &state,
+            &Arc::downgrade(&printer),
+            &Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .expect("M400 returns");
+
+        assert!(
+            started.elapsed() < WAIT_MOVES_POLL,
+            "the wait must not sleep in file output: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            wait_moves_state(&state).expect("connected").waiting,
+            "the clock is still behind: the wait was skipped, not waited out"
+        );
     }
 
     #[test]
@@ -5561,6 +5868,146 @@ mod tests {
             evidence.homed_axes.contains('x'),
             "the stepper on the primary board tripped the endstop on the secondary: {:?}",
             evidence.homed_axes
+        );
+    }
+
+    /// `M400` waits for the fake firmware's clock to reach the planner's
+    /// horizon, end to end against a real bring-up (`ToolHead.wait_moves`,
+    /// `klippy/toolhead.py:422-428`).
+    ///
+    /// The fake's clock counts wall time (Q10), so the wait converges; the
+    /// evidence is read while the machine is still up (the printer is torn down
+    /// before anything is asserted, as `upstream`'s harness does) and asserted
+    /// afterwards. The gap asserted on is `print_time - estimated_print_time` —
+    /// the motion planned ahead of the clock, which is what `M400` must leave
+    /// at zero; this host keeps no separate pending-move counter.
+    ///
+    /// The run deliberately has **no** `debug_output`, because file output is
+    /// where upstream's `can_pause` turns the wait off
+    /// (`test_wait_moves_does_not_wait_under_file_output` pins that side).
+    ///
+    /// Skipped when the dictionary was not built (`KLIPPERX_ARCHES`).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_m400_waits_for_the_fake_firmware_clock_to_catch_up() {
+        use crate::core::klippy::config::Config;
+        use crate::core::klippy::interface::devices::responder_mcu::ResponderMcu;
+        use crate::core::klippy::printer::PrinterState;
+        use crate::core::klippy::reactor::TokioReactor;
+
+        let Some(board) = ResponderMcu::new("mcu", "atmega2560.dict") else {
+            return;
+        };
+        // The config of `upstream.rs`'s
+        // `an_extruder_move_runs_against_the_fake_firmware`, without the
+        // extruder: this case is about the wait, not the extrusion.
+        let config_text = format!(
+            "{}\
+             [stepper_x]\nstep_pin: PA0\ndir_pin: PA1\nrotation_distance: 40\nmicrosteps: 16\nposition_max: 200\n\
+             [stepper_y]\nstep_pin: PA2\ndir_pin: PA3\nrotation_distance: 40\nmicrosteps: 16\nposition_max: 200\n\
+             [stepper_z]\nstep_pin: PA4\ndir_pin: PA5\nrotation_distance: 8\nmicrosteps: 16\nposition_max: 200\n\
+             [printer]\nkinematics: cartesian\nmax_velocity: 300\nmax_accel: 3000\n",
+            ResponderMcu::sections(&[board]),
+        );
+
+        let reactor = Arc::new(TokioReactor::new(tokio::runtime::Handle::current()));
+        let printer = Arc::new(Printer::new(reactor));
+        // **No `debug_output`** — this is what makes the case a wait at all:
+        // under `-o` (which every corpus case and every other test here sets),
+        // upstream's `can_pause` is false and `M400` returns without waiting
+        // (`toolhead.py:221-223`, `:426-427`). A real machine runs this way,
+        // with a working clock.
+        printer.set_start_args(Arc::new(crate::core::klippy::api::StartArgs::collect(
+            "m400.cfg", None,
+        )));
+
+        /// Read while the machine is up, asserted after it is down.
+        struct Evidence {
+            /// The motion the planner had queued when `M400` started.
+            gap_before: f64,
+            /// How long `M400` took.
+            waited: f64,
+            /// The same gap when it returned: zero, or the wait proved nothing.
+            gap_after: f64,
+        }
+
+        let outcome: Result<Evidence, String> = async {
+            let (config, _) = Config::from_text(&config_text).map_err(|err| err.to_string())?;
+            printer
+                .load_config(&config)
+                .map_err(|err| err.to_string())?;
+            if tokio::time::timeout(Duration::from_secs(10), printer.bring_up())
+                .await
+                .is_err()
+            {
+                return Err("bring_up timed out".to_string());
+            }
+            let state = printer.get_state_message();
+            if state.category != PrinterState::Ready {
+                return Err(format!("not ready: {}", state.message));
+            }
+
+            // The estimate this toolhead primes against, read the way its own
+            // source reads it (`ToolHeadObject::connect`).
+            let estimate = || {
+                printer
+                    .lookup_object_as::<McuObject>("mcu")
+                    .and_then(|mcu| mcu.estimated_print_time(printer.eventtime()))
+                    .ok_or_else(|| "the fake firmware has no clock estimate".to_string())
+            };
+            let gcode = printer
+                .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+                .ok_or_else(|| "the g-code dispatcher is not registered".to_string())?;
+            let toolhead = printer
+                .lookup_object_as::<ToolHeadObject>("toolhead")
+                .ok_or_else(|| "the toolhead is not registered".to_string())?;
+
+            gcode
+                .run_script_from_command("SET_KINEMATIC_POSITION X=0 Y=0 Z=0\nG1 X10 Y10 F6000")
+                .await
+                .map_err(|err| format!("the move failed: {err}"))?;
+            // The horizon `M400` waits for: the look-ahead flushed into the
+            // trapq (`get_last_move_time`), against the live estimate.
+            let gap_before = toolhead.get_last_move_time() - estimate()?;
+
+            let started = std::time::Instant::now();
+            gcode
+                .run_script_from_command("M400")
+                .await
+                .map_err(|err| format!("M400 failed: {err}"))?;
+            let waited = started.elapsed().as_secs_f64();
+            let gap_after = toolhead.print_time() - estimate()?;
+
+            Ok(Evidence {
+                gap_before,
+                waited,
+                gap_after,
+            })
+        }
+        .await;
+        printer.teardown();
+
+        let evidence = outcome.expect("the fake firmware's clock is waited for");
+        assert!(
+            evidence.gap_before > 0.1,
+            "the move must be planned ahead of the clock: {}s",
+            evidence.gap_before
+        );
+        assert!(
+            evidence.gap_after <= 0.0,
+            "M400 returned with {}s of motion still ahead of the clock",
+            evidence.gap_after
+        );
+        assert!(
+            evidence.waited >= evidence.gap_before - 0.2,
+            "M400 returned too early: {}s for a {}s gap",
+            evidence.waited,
+            evidence.gap_before
+        );
+        assert!(
+            evidence.waited <= evidence.gap_before + 1.0,
+            "M400 waited {}s for a {}s gap",
+            evidence.waited,
+            evidence.gap_before
         );
     }
 

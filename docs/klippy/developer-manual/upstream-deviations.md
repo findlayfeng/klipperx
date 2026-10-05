@@ -35,7 +35,7 @@
 - `ok` 应答机制与 `need_ack` 标记**已从 `src/core/klippy/gcode.rs` 删除**：命令错误一律
   "报告（`!! ` 输出行 + 日志）+ 发 `gcode:command_error` + **中止整段脚本**，把错误交回调用方"。
   因此 `gcode/script` 的成功回复是 `{}`，失败是 JSON-RPC error 回复，输出里**没有 `ok` 行**。
-- `gcode:debuginput_exit` 事件只有声明、**永不触发**（见[事件系统](event-system.md#12-事件清单)）；
+- `gcode:debuginput_exit` 事件**连声明都没有**（上游只有行协议输入会发它）：本仓的事件枚举声明 34 个上游事件名，唯一不声明的就是它（见[事件系统 §2 当前实现](event-system.md#21-已实现)）；
   `stats` / `gcodein` 计数不存在（本仓也没有上游 host 的 `Stats …` 日志行）。
 
 **这些场景本仓不能替代上游** —— 需要时请用上游 Klipper：
@@ -70,6 +70,7 @@ OctoPrint 只走 pty，与本条取舍无关。
 | 项 | 上游 | 本仓 | 详情 |
 |---|---|---|---|
 | 脚本执行与错误策略 | 行协议输入下错误不中断；`run_script` 持 `gcode` mutex 串行化 | 只有"报告 + 中止整段脚本"一种策略（`need_ack` 已删）；脚本在调用任务上跑完，不再有 mutex | [klippy-runtime](klippy-runtime.md)、`src/core/klippy/gcode.rs` 模块文档 |
+| `start_args` 字段 | 上游有 `debuginput`（`-i`）与每 MCU 字典路径（`-d`） | 本仓没有 `debug_input` 字段与字典路径（不实现文件输入 / batch mode）；`debug_output` 保留（语料 harness 的文件输出开关） | [klippy-runtime](klippy-runtime.md)、[回归测试](regression-tests.md) |
 | mux 命令的"值不合法"提示 | 按 dict 迭代序取最后一个匹配候选 | 对候选排序后取第一个（消息稳定） | [模块表](README.md) |
 | 越界报错的限制值写法 | `0.0` 这类浮点写法 | 整数限制值打印成 `0` | [模块表](README.md)、[配置手册](../user-manual/config.md) |
 | MCU 配置 CRC | 上游的 CRC 算法 | **算的不是同一样东西**（本层唯一有意偏离） | [MCU 配置构建](mcu-config.md) |
@@ -92,7 +93,6 @@ OctoPrint 只走 pty，与本条取舍无关。
 | 项 | 现状 | 详情 |
 |---|---|---|
 | 上游 host `Stats …` 日志行 / `gcodein` | 无 host 统计采集器 | 本条 1.1 |
-| `gcode:debuginput_exit` | 事件已声明，无发送方（只有行协议输入会发） | [事件系统](event-system.md#12-事件清单) |
 | `query_adc` / `QUERY_ADC` | 未实现（`adc_scaled` 只用 config 输入量程） | [配置手册](../user-manual/config.md)、[模块表](README.md) |
 | `steppers` 的资格过滤 | 未实现（本仓 homing 事件无载荷） | [配置手册](../user-manual/config.md)、[模块表](README.md) |
 | TMC 部分型号与 SPI 传输 | `tmc2130`/`tmc2660`/`tmc5160`/`tmc2240` 等未实现 | [配置手册](../user-manual/config.md) |
@@ -100,7 +100,50 @@ OctoPrint 只走 pty，与本条取舍无关。
 | MCU `output` 表的异步投递等 | 见该页「当前未实现」 | [MCU 协议](mcu-protocol.md#当前未实现) |
 | 事件名无发送方的其余项 | `toolhead:sync_print_time`、`stepper:*`、`extruder:activate_extruder`、`menu:*`、`dual_carriage:update_kinematics` | [事件系统](event-system.md#22-覆盖范围) |
 
-## 4. 计数与清单（改了要连带重核的地方）
+## 4. 本仓特有（上游没有）
+
+这一节反过来：**上游没有、本仓自己加的**内容。做第三方兼容性判断时（比如「某个客户端会不会
+看到多余的东西」）要知道它们存在。
+
+### 4.1 配置节与命令
+
+| 项 | 位置 | 干什么 | 上游对应物 |
+|---|---|---|---|
+| `[i2c_device <name>]` | `src/core/klippy/extras/i2c_device.rs`、[配置手册](../user-manual/config.md) | 通用原始 I2C 设备节：只搬字节，不含设备协议 | **无**（上游各 I2C 器件各自走 `bus.MCU_I2C_from_config`） |
+| `[spi_device <name>]` | `src/core/klippy/extras/spi_device.rs`、[配置手册](../user-manual/config.md) | 通用原始 SPI 设备节：一次传输 = 一个片选脉冲 | **无**（上游走 `bus.MCU_SPI_from_config`） |
+| `IIC_WRITE` / `IIC_READ` / `SPI_TRANSFER` / `SPI_SEND` | 同上两模块、[G-Code 命令参考](../user-manual/gcode-commands.md) | 真机自测用的总线调试命令 | **无**（上游全树无这些名字） |
+| 其余调试总线命令 | [G-Code 命令参考](../user-manual/gcode-commands.md) 的「调试总线命令（KlipperX 自有）」一节 | 真机自测/诊断 | **无** |
+
+### 4.2 二进制、客户端与诊断工具
+
+| 项 | 位置 | 干什么 | 上游对应物 |
+|---|---|---|---|
+| `klipperx`（多子命令 CLI） | `src/main.rs`、[开发手册首页](README.md#二进制) | 主 CLI：默认跑主机，另有 `api` / `console` / `stress` 子命令与 `--tui` | 主机 ≈ 上游 `klippy.py` 脚本（无子命令）；子命令与 TUI 上游没有 |
+| `klippy` 二进制 | `src/bin/klippy/main.rs`、[开发手册首页](README.md#二进制) | 只跑主机、不链客户端库 | 上游是脚本，不是二进制 |
+| `klippy-client`（`api` / `console`） | `crates/klippy-client/`、[客户端使用](../user-manual/client.md) | 独立 API 客户端 | **无**（上游 `klippy/console.py` 是 MCU 调试台，不是 API 客户端） |
+| `--tui` 进程内窗口 | `crates/klippy-client/src/tui.rs`、[客户端使用](../user-manual/client.md) | 通过进程内管道对自身 API 开一个客户端窗口 | **无** |
+| `klipperx stress` | `src/stress.rs`、[压力测试](stress.md) | 逐步给一块 MCU 加载，直到它出错 | **无** |
+| `--logfile`（澄清项） | [日志与调试](../user-manual/logging.md) | 日志同时写终端与文件 | **上游有** `-l` / `--logfile`（`klippy.py:272`）——此条列出只为消除误解 |
+| `restart_method: rpi_usb` 的 udev 脚本（澄清项） | `scripts/klipperx-usb-udev.sh`、[MCU 连接方式](../user-manual/mcu-connection.md) | 生成 hub 供电授权规则 | 机制上游有（`mcu.py`）；**脚本**是本仓加的 |
+| `scripts/pyref-audit.py` | 本页 §6、[测试](testing.md) | 校验文档/注释里的上游行号引用是否还对上 | **无** |
+
+### 4.3 测试与构建基建
+
+| 项 | 位置 | 干什么 |
+|---|---|---|
+| `KLIPPERX_*` 环境变量族 | [`README.md` → 环境变量](../../../README.md#环境变量开发与测试)、[测试](testing.md) | 构建/测试/诊断开关（语料范围、字典集、TRACE、硬件串口…） |
+| 上游语料复用 harness | `src/core/klippy/upstream.rs`、[回归测试](regression-tests.md) | 把上游 `test/klippy/*.test` 当只读 fixture 跑（上游只有自己的 `test_klippy.py`） |
+| `crates/test-support` | [回归测试](regression-tests.md) | 构建期按 `KLIPPERX_ARCHES` 编 `.dict`、解析 klipper 检出位置 |
+| 字典驱动应答机 `SimulatorDevice` | `src/core/klippy/interface/devices/simulator.rs`、[回归测试](regression-tests.md) | test-only 假 MCU：按字典**应答** identify/配置握手/时钟/序号，走真实主机路径（上游回归是 `-d`/`-o` 短路、不回应，语义不同） |
+| `KLIPPERX_TRACE` 的 `SIM-DIAG:` / `MCU DROP` 诊断行 | `src/core/klippy/mod.rs`、[日志与调试](../user-manual/logging.md) | 追模拟器/MCU 拆除时的挂起 |
+
+### 4.4 一条负向结论
+
+**API 端点没有本仓特有项**：`src/core/klippy/api/endpoints/` 注册的 13 条 path 全部能对上上游
+`klippy/webhooks.py`（以及 `query_endstops` / `pause_resume` / `bed_mesh` 各自的 extras）的注册处，
+没有上游没有的端点；`gcode/restart` 与 `gcode/firmware_restart` 是两条 path、同一个实现结构。
+
+## 5. 计数与清单（改了要连带重核的地方）
 
 | 数字 | 位置 |
 |---|---|
@@ -110,7 +153,7 @@ OctoPrint 只走 pty，与本条取舍无关。
 | `[extras]` 模块数与 `section!` 数 | [`README.md` → 当前状态](../../../README.md#当前状态) |
 | 二进制体积 | [模块表](README.md) |
 
-## 5. 上游行号引用的核验
+## 6. 上游行号引用的核验
 
 本仓文档与源码注释里大量引上游 `xxx.py:NN-NN`。改动上游相关行为后这些行号会漂移，
 核验方式是 `python3 scripts/pyref-audit.py --docs`（以及不加 `--docs` 扫源码），细则与

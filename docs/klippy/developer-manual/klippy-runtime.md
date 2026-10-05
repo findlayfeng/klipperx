@@ -25,18 +25,19 @@ main():
         start_args.start_reason = result        # restart / firmware_restart
 ```
 
-`start_args` 携带 `config_file`、`apiserver`、`start_reason`、`debuginput`、`debugoutput`、
-`dictionary`，以及 `software_version`、`cpu_info`、`device`、`linux_version`。
+`start_args` 携带 `config_file`、`apiserver`、`start_reason`、`debugoutput`，
+以及 `software_version`、`cpu_info`、`device`、`linux_version`（上游另有 `debuginput` 与每 MCU 的
+字典路径；本仓不实现文件输入与 `-d`，故两者都没有，见[本项目与上游的偏移](upstream-deviations.md)）。
 `RESTART` 与 `FIRMWARE_RESTART` 因此不是重启进程，而是换一个新的对象图在同一个进程里继续
 运行；每一轮（含每次 `RESTART`）都重新从磁盘读配置文件（`_connect` → `_read_config` →
 `read_main_config`，`klippy/klippy.py:128`、`configfile.py:474-481`）；`error_exit` 最终以
 非零码退出进程。出处：`klippy/klippy.py:354-374`。
 
 > **与上游的差异**：`start_args` 中的 `debuginput`、`debugoutput`、`dictionary` 在上游可组成
-> 「文件输出 + 数据字典」的**无固件运行模式**。本项目的等价物分两半：`start_args.debug_output`
-> 字段与 `Printer::is_fileoutput()` 已就位（回归 harness 在装载前填它，`-o`/`-i` 的命令行入口
-> 尚未做），字典则由应答机 `SimulatorDevice` 走真实的 identify 路径下发（不是直接注入），见
-> [回归测试](regression-tests.md)。
+> 「文件输出 + 数据字典」的**无固件运行模式**。本项目只保留一半：`start_args.debug_output`
+> 字段与 `Printer::is_fileoutput()` 已就位（回归 harness 在装载前填它；`-o`/`-i` 的命令行入口
+> **不做**，`debuginput` 字段也没有），字典则由应答机 `SimulatorDevice` 走真实的 identify 路径下发（不是直接注入），见
+> [回归测试](regression-tests.md) 与[本项目与上游的偏移](upstream-deviations.md)。
 
 ## 机器状态
 
@@ -66,7 +67,7 @@ main():
 - `update_error_msg`（`:63`）允许消费者在消息未被改写的前提下替换为更详细的文本；
 - `request_exit(result)`（`:228`）记录退出结果并结束 reactor，该结果即主循环看到的 `res`。
 
-启动期如果 `start_args` 带 `debuginput`（回归测试的输入文件模式），上游会在非 ready 的新状态上直接
+启动期如果 `start_args` 带 `debuginput`（回归测试的输入文件模式；本仓 `StartArgs` 没有该字段），上游会在非 ready 的新状态上直接
 `request_exit('error_exit')`——它以进程退出码判定用例成败（`klippy/klippy.py:57-62`）。
 本项目**没有**复刻这条路径：`set_error_state` 只改状态不退进程，回归判定靠 `upstream::run_phases`
 的两段返回值（`load_config`/`bring_up` 失败与 g-code 阶段失败分开），见 [回归测试](regression-tests.md)。

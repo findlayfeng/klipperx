@@ -545,13 +545,20 @@ endstop 资源（`mcu/resource/endstop.rs`，含 `minclock` 门控与 `home_wait
 
 ## 未决问题
 
-- [ ] **Q9 `wait_moves`（FW5d）打印节拍缺失**：上游在运动队列将满时会等待 MCU 追上（`wait_moves`；
-      语料另有 `is_fileoutput` 虚拟时钟同款语义），本仓 `motion/toolhead.rs` 文档自述 **FW5d 未实现**
-      （2026-09-27 C4 侦察发现）——G-Code 可瞬间把整段运动灌进 trapq，print horizon 相对
-      `estimated_clock` 无界。后果分两层：① fake 环境最终以「`test:` 传输放行两道闸」解（探针实证
-      闸会退化为墙钟串行；早先批过的 simulator 跳钟方案已撤销，见 `eeb0e79`）；② **真机**上 C4 的 min/req 闸会以「压队=背压」形态工作
-      （放行速度由固件消费决定，上游同款），但宿主侧没有上游的节拍保护。**R8 真机观察点**：
-      长 gcode 连灌时 print horizon 与压队深度。实现 wait_moves 属独立工单（上游正解），不阻塞 C4。
+- [x] **Q9 `wait_moves`（FW5d）节拍：宿主等待已落地（2026-10-06，`46d6e64`）；余项＝送出口径 / 真机验证**：
+      本仓 `M400` 现在真的等到 MCU 的**估计时钟**追上 `print_time`（`motion/toolhead.rs` 新增
+      `wait_moves_state()` 快照 + `extras/toolhead.rs` 的异步等待环，每轮短锁读数、解锁后 sleep；
+      四条有界出口：est 追上 / est 停滞 1s 报错 / shutdown / 不可暂停）。
+      **关键语义（上游同形）**：`can_pause = !printer.is_fileoutput()`，不可暂停时**立即退出等待**
+      （`toolhead.py:221-223` 与 `:425-429`）——所以语料（`-o` 形态）下不等待，**语料对该特性零覆盖**。
+      实测：无 `debug_output` 的 e2e 里 `gap_before=0.4247s → waited=0.5048s → gap_after=-0.0793s`；
+      反向对照（去掉闸）会让 file-output 测试实测睡了 500ms，闸由测试钉住。
+      **仍缺（后续单元）**：① 送出口径 / lead 地板——batch 窗口 + move-pool 槽位释放
+      （`free_at = completion + 0.02`、逐槽按序放行），实测不加闸时最后几批 step 晚到 0.106–0.115 s，
+      被 Q10 链模型（真机 `sched.c:94`）判 `Timer too close`（11 例语料转红）；
+      ② `MIN_KIN_TIME`/`kin_flush_delay` 地板（`motion/toolhead.rs:440-443` 自述缺失）；
+      ③ fileoutput 形态下上游 `_flush_handler_debug` 的等价物；④ `send_wait_ack`（`mcu/mod.rs:2639-2650`）。
+      **真机未验证**：等待生效路径（无 `debug_output`）尚未上真板，见 TESTING.md 的 R11。
 
 - [x] **Q10 模拟设备的步进时序模型（两会话固件链）——已完成（2026-09-27，`agents/feat-simulator-step-timing`）**：
       `SimulatorDevice` 落 per-oid `StepChain`（`config_stepper` 归零、`queue_step` 空闲首拍/忙延展/

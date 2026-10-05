@@ -20,7 +20,7 @@ Identify 是 Klipper 主机端（klippy）与 MCU 端（固件）之间建立通
 3. 当固件发回**空数据块**时表示传输完成（固件在 `offset >= isize` 时把 `count` 置 0）
 4. 把完整负载做 **zlib 解压**，再解析成 JSON，得到 `Identify { data }`
 
-与 Klipper 的一个差异：Klipper 在 offset 不匹配时不追加数据、继续用同一 offset 重试（可能无限循环）；本实现直接报 `McuError::IdentifyProtocol`，避免死循环，也避免把错位的数据拼成一份看似合法的字典。
+与 Klipper 的一个差异：Klipper 在 offset 不匹配时不追加数据、继续用同一 offset 重试（可能无限循环）；本实现直接报 `McuError::IdentifyProtocol`，避免死循环，也避免把错位的数据拼成一份看似合法的字典。（本页与上游不一致处统一登记在[本项目与上游的偏移](upstream-deviations.md)。）
 
 **静默即 nak（改号重发）**：5 字节空帧既是健康块的 ack、也是固件没收下该块的 nak——两者携带
 同一个 `next_sequence`（`command_send_ack` 与 `goto nak` 都走 `encode_acknak`，

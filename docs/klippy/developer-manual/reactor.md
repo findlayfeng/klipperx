@@ -112,7 +112,7 @@ pub trait Reactor: Send + Sync {
 
 名字在注册时给出（`register_timer_named`）——上游是反射出回调名（`get_function_owner`，`extras/garbage_collection.py:13`），Rust 闭包没有名字可读。`register_timer` 是无名版（报告里叫 `"<timer>"`）。
 
-上游的 `set_latency_notifier`（`reactor.py:316`）消费者是 `extras/garbage_collection.py`（它把警告写成 `Reactor busy for …`）；Rust 没有 GC，所以这里**纯是诊断**：trait 默认什么都不做，只有 `TokioReactor` 实现，主机在 `src/klippy.rs` 挂一个 50 ms 阈值的日志回调（与上游 `THRESHOLD` 同为 50 ms）。这个回调自己跑在 dispatcher 上，同样不许阻塞。抖动的来源与要不要绑核见 [延迟与抖动](latency.md)。
+上游的 `set_latency_notifier`（`reactor.py:316`）消费者是 `extras/garbage_collection.py`（它把警告写成 `Reactor busy for …`）；Rust 没有 GC，所以这里**纯是诊断**：trait 默认什么都不做，只有 `TokioReactor` 实现，主机在 `src/klippy.rs` 挂一个 50 ms 阈值的日志回调（与上游 `THRESHOLD` 同为 50 ms）。这个回调自己跑在 dispatcher 上，同样不许阻塞。抖动的来源与要不要绑核见 [延迟与抖动](latency.md)。本页与上游不一致处统一登记在[本项目与上游的偏移](upstream-deviations.md)。
 
 ## 回调里不许等待、不许做重活
 

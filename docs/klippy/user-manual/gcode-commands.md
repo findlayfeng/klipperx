@@ -80,6 +80,7 @@ M115
 ```
 
 需要 `ok` 应答的输入源（文件输入）下这条走 `ok <msg>` 而不是 `// ` 行，与上游一致。
+本仓不实现上游的行协议输入（伪 tty / 文件输入），所以这条**恒为** `// ` 行，`ok <msg>` 形态在本仓不存在（见[本项目与上游的偏移](../developer-manual/upstream-deviations.md)）。
 
 ### RESTART / FIRMWARE_RESTART — 重启
 
@@ -838,7 +839,7 @@ SAVE_VARIABLE VARIABLE=<name> VALUE=<literal>
 
 **进度与状态**：`virtual_sdcard` 的 `get_status` 报 `file_path`/`progress`/`is_active`/`file_position`/`file_size`；`print_stats` 的 `get_status` 报 `filename`/`total_duration`/`print_duration`/`filament_used`/`state`/`message`/`info`。回放结束按结果 `note_complete`（EOF）/`note_pause`（被暂停）/`note_error`（错误，并渲染运行 `on_error_gcode`）。
 
-**未实现**：`gcode.get_mutex().test()` 让出（本仓无该 API，回放期间外部命令交错与上游不同）、`_handle_analyze_shutdown`/`_handle_debuginput_exit`、`stats`。`path` 不做 `expanduser`/`normpath`，按原样用于目录列举。
+**未实现**：`gcode.get_mutex().test()` 让出（本仓无该 API，回放期间外部命令交错与上游不同）、`_handle_analyze_shutdown`/`_handle_debuginput_exit`、`stats`。`path` 不做 `expanduser`/`normpath`，按原样用于目录列举。这些差异登记在[本项目与上游的偏移](../developer-manual/upstream-deviations.md)。
 
 ## 未注册命令的处理
 
@@ -847,7 +848,7 @@ SAVE_VARIABLE VARIABLE=<name> VALUE=<literal>
 | 情况 | 行为 |
 |------|------|
 | 打印机**未就绪** | 返回状态消息作为错误：`!! <state message>` |
-| `M105` | 需要应答的输入源回 `ok T:0`（启动期轮询不报错） |
+| `M105` | 静默成功（启动期轮询不报错；本仓不实现应答输入源，这条兜底路径不回任何内容；`heaters` 注册了 `M105` 时才是温度报表行） |
 | `M21` | 静默成功（没有 SD 卡模块） |
 | `M140` / `M104` 且 `S0`（没有对应加热器） | 静默成功 |
 | `M107`，或 `M106 S0`（没有风扇） | 静默成功 |
@@ -991,9 +992,7 @@ SAVE_VARIABLE VARIABLE=<name> VALUE=<literal>
 | 多路键值未注册 | `The value '<值>' is not valid for <键>. Options: 'a', 'b'`（候选里有包含关系时改成 `. Did you mean 'a'?`，**取排序后的第一个**，与上游取字典序最后一个不同——为了消息稳定） |
 | 处理器自己的错误 | 各命令自带的文案（如 `Printer is not ready`、`Extruder not configured`） |
 
-命令错误一律**不停机**：它回报客户端并发 `gcode:command_error` 事件，然后按输入源分两种
-走向——需要 `ok` 应答的输入源（文件输入）会被 ack 并**继续执行下一行**，不需要应答的
-（API 提交的脚本）则**中止整段脚本**，把错误交回给调用方。
+命令错误一律**不停机**：它回报客户端（`gcode/script` 的 error 回复）并发 `gcode:command_error` 事件，然后**中止整段脚本**，把错误交回给调用方。上游按输入源分两种走向（需要 `ok` 应答的输入源会被 ack 并继续下一行），本仓不实现行协议输入、`need_ack` 机制已删除，故只有一种走向 —— 见[本项目与上游的偏移](../developer-manual/upstream-deviations.md)。
 
 会让打印机停机的只有 `M112` 这类显式命令、固件自报的停机，以及处理器 **panic**
 （panic 走 `Internal error on command:"<名字>"` 并 `invoke_shutdown`，两者都与命令错误分开）。

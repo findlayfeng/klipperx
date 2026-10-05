@@ -64,7 +64,7 @@ AI 写实现」：人类负责方向与取舍、任务拆解、验收判定、�
 
 按「打印任务」链路列出（细节与证据见 [`TODO.md`](TODO.md) 与[客户端/开发手册](docs/README.md)）：
 
-1. **输入回放**：`virtual_sdcard` 的文件回放（`M20`–`M27`）、`print_stats` 与
+1. **输入回放**：`virtual_sdcard` 的文件回放（`M20`–`M29`/`SDCARD_PRINT_FILE`）、`print_stats` 与
    `pause_resume/{pause,resume,cancel}` 三个端点都已落地（`api/endpoints/pause_resume.rs`）；
    剩下 `sdcard_loop` 的 `SDCARD_LOOP_*` 与文件回放未接。
 2. **温度语义**：`M105` 的 gcode_id 表已接线（`heaters.rs:417` 的 `gcode_id_to_sensor`，
@@ -73,8 +73,13 @@ AI 写实现」：人类负责方向与取舍、任务拆解、验收判定、�
 3. **运行时参数**：`M204`/`SET_VELOCITY_LIMIT` 已注册（2026-10-04），改完**同时**进状态与
    规划器；`SET_PRESSURE_ADVANCE` 会记录但**不作用于运动**（PA 只存值，运动层未消费）。
 4. **常见宏依赖**：`save_variables`（`SAVE_VARIABLE`）已落地（2026-10-04），宏可读写
-   `printer.save_variables.variables`；仍缺 `G2/G3`（`gcode_arcs`）与 `M600`。
-5. **真机时序**：`minclock` / `send_wait_ack` 等上游时序原语未建模，真机上尚未验证（见 [`TESTING.md`](TESTING.md)）。
+   `printer.save_variables.variables`；`delayed_gcode` 与 `respond` 也已落地。仍缺
+   `gcode_macro` 的 `rename_existing` 连接期换名（KAMP / `M600` 这类常见 `printer.cfg` 靠它，
+   不生效会让配置加载即失败）、`G2/G3`（`gcode_arcs`）与 `M600`。
+5. **真机时序**：消息的 `min_clock`/`req_clock` 闸已建模（`mcu/mod.rs:149-176`），但
+   `ToolHead.wait_moves` 不等待 MCU、`MIN_KIN_TIME`/`kin_flush_delay` 未建模、`send_wait_ack`
+   还没有对应原语（`motion/toolhead.rs:440-470`、`mcu/mod.rs:2639-2650`），真机上尚未验证
+   （见 [`TESTING.md`](TESTING.md) 的 R11）。
 6. **硬件侧**：三轴 step/dir 与 endstop 接线、挤出机与加热器接线、以及按接线写一份 config。
 
 ## 快速上手

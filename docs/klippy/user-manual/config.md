@@ -502,12 +502,12 @@ SPI_TRANSFER DEVICE=flash DATA=9f000000    ; W25 flash JEDEC ID → ef 30 13
 | `pressure_advance_smooth_time` | 浮点 (s) | 否 | `0.040` | PA 平滑时间，`≤ 0.200` |
 | `step_pin` / `dir_pin` / `rotation_distance` / `microsteps` … | 同 `[stepper_*]` | 否 | — | **写了任一个**才建 E 轴 stepper（上游同规则）；不写则纯加热 |
 
-命令：`M104` / `M109`（当前不等温）/ `SET_PRESSURE_ADVANCE`（mux `EXTRUDER`）/
+命令：`M104` / `M109`（等待到目标温度）/ `SET_PRESSURE_ADVANCE`（mux `EXTRUDER`）/
 `ACTIVATE_EXTRUDER`。只有名字是 `extruder` 的主挤出机额外注册 `EXTRUDER` 默认项。
 
 ### `[heater_bed]` — 热床
 
-选项 = 加热器共用选项（`gcode_id` 内定为 `B`），注册 `M140` / `M190`（当前不等温）。
+选项 = 加热器共用选项（`gcode_id` 内定为 `B`），注册 `M140` / `M190`（等待到目标温度）。
 
 ```ini
 [heater_bed]
@@ -1169,7 +1169,11 @@ gap（如实登记）：**屏幕内容不渲染**（`display_template`/`display_
 | `run_current` / `sense_resistor` / `stealthchop_threshold` | — / 0.110 / — | 电流与静音阈值 |
 | `interpolate` / `driver_SGTHRS` / `diag_pin` | True / — / — | 仅 tmc2209 |
 
-命令：`INIT_TMC` / `DUMP_TMC` / `SET_TMC_FIELD` / `SET_TMC_CURRENT`（mux 键 `STEPPER`）；`tmc2209_<stepper>:virtual_endstop` 可用作端停。gap：fileoutput 下总线读短路为 0；`tmc2130`/`tmc2660`/`tmc5160`/`tmc2240` 与 SPI 传输未实现。
+命令：`INIT_TMC` / `DUMP_TMC` / `SET_TMC_FIELD` / `SET_TMC_CURRENT`（mux 键 `STEPPER`）；`tmc2209_<stepper>:virtual_endstop` 可用作端停。gap：fileoutput 下总线读短路为 0。
+
+**SPI 族（`[tmc2130]` / `[tmc2240]` / `[tmc2660]` / `[tmc5160]`）也已落地**（2026-10-06 复核：四个
+`section!` 均在工厂表，命令与 UART 族同）；本页尚未为它们补逐项选项表——选项集与上游同名节一致，
+逐项说明见[模块表](../developer-manual/README.md)与上游 `config/` 参考。
 
 ### `[save_variables]` — 变量持久化（2026-10-04）
 

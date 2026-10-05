@@ -79,7 +79,7 @@ OctoPrint 只走 pty，与本条取舍无关。
 | section → 对象表 | 运行时按文件导入 | 编译期由 `section!` 声明生成 | [声明式表生成](codegen.md) |
 | 事件系统 | 运行时字符串事件、`*params` 可变参数、`try/except` 隔离、`assert_no_pause()` 强制 | 编译期枚举、变体字段、`catch_unwind`、不做运行时阻塞校验 | [事件系统 §6](event-system.md#6-与上游的差异) |
 | 模板引擎 | Jinja2 | minijinja 适配层（`%`/`//` 取余、Strict 缺键时机与部分 detail 措辞不同） | [模块表](README.md)、[配置手册](../user-manual/config.md)、[G-Code 命令参考](../user-manual/gcode-commands.md) |
-| 运动数学与步进压缩 | `chelper/` 的 C 代码 | Rust 重写；回零单程、`endstop_phase` 未实现、`G28` 逐轴 | [klippy-runtime](klippy-runtime.md) |
+| 运动数学与步进压缩 | `chelper/` 的 C 代码 | Rust 重写；回零/探针位置按**指令位置**返回（上游用触发步数反算，见 TODO H9 的精度单元）、`home_start` 的 `rest_time` 硬编码 | [klippy-runtime](klippy-runtime.md)、[模块表](README.md) |
 | 时间敏感回调的锁 | 单线程 reactor，回调自然串行 | `GCodeRequestQueue` 的 sink 回调在**锁外**执行（gcode/flush 双线程） | [模块表](README.md) |
 | `start_reason` | 主循环每轮写回 `start_args` | 只在一处表示差异 | [klippy-runtime](klippy-runtime.md) |
 | `webhooks` 实现形态 | 一个文件同时是传输/派发机器与一个 printer object | 拆成 `klippy-api`（传输/派发）与 `core/klippy/api`（端点） | [klippy-runtime](klippy-runtime.md)、[运行时编排](runtime.md) |
@@ -95,7 +95,7 @@ OctoPrint 只走 pty，与本条取舍无关。
 | 上游 host `Stats …` 日志行 / `gcodein` | 无 host 统计采集器 | 本条 1.1 |
 | `query_adc` / `QUERY_ADC` | 未实现（`adc_scaled` 只用 config 输入量程） | [配置手册](../user-manual/config.md)、[模块表](README.md) |
 | `steppers` 的资格过滤 | 未实现（本仓 homing 事件无载荷） | [配置手册](../user-manual/config.md)、[模块表](README.md) |
-| TMC 部分型号与 SPI 传输 | `tmc2130`/`tmc2660`/`tmc5160`/`tmc2240` 等未实现 | [配置手册](../user-manual/config.md) |
+| TMC 的 `stallguard_dump` 查询与 SPI 片选共享 | 四个 SPI 型（`tmc2130`/`tmc2240`/`tmc2660`/`tmc5160`）均已落地；余项＝`tmc/stallguard_dump` 端点与 `spi_set_bus` 共享（每节自建 `McuSpi`） | [配置手册](../user-manual/config.md) |
 | `TEMPLATE=` 形式的菜单/显示选项 | 未实现（菜单不渲染） | [配置手册](../user-manual/config.md) |
 | MCU `output` 表的异步投递等 | 见该页「当前未实现」 | [MCU 协议](mcu-protocol.md#当前未实现) |
 | 事件名无发送方的其余项 | `toolhead:sync_print_time`、`stepper:*`、`extruder:activate_extruder`、`menu:*`、`dual_carriage:update_kinematics` | [事件系统](event-system.md#22-覆盖范围) |

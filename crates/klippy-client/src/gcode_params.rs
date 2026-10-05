@@ -117,6 +117,7 @@ pub const BUILTIN: &[(&str, &[&str])] = &[
     ("M140", &["S"]),
     ("M190", &["S"]),
     ("M20", &[]),
+    ("M204", &["S", "P", "T"]),
     ("M21", &[]),
     ("M220", &["S"]),
     ("M221", &["S"]),
@@ -193,6 +194,7 @@ pub const BUILTIN: &[(&str, &[&str])] = &[
             "SPEED",
         ],
     ),
+    ("PROBE_EDDY_CURRENT_CALIBRATE", &["CHIP", "PROBE_SPEED"]),
     ("PROBE_EDDY_CURRENT_TAP_CALIBRATE", &["TAP"]),
     (
         "QUAD_GANTRY_LEVEL",
@@ -221,6 +223,7 @@ pub const BUILTIN: &[(&str, &[&str])] = &[
     ("RESUME", &["VELOCITY"]),
     ("SAVE_DUAL_CARRIAGE_STATE", &["NAME"]),
     ("SAVE_GCODE_STATE", &["NAME"]),
+    ("SAVE_VARIABLE", &["VARIABLE", "VALUE"]),
     (
         "SCREWS_TILT_CALCULATE",
         &[
@@ -311,6 +314,15 @@ pub const BUILTIN: &[(&str, &[&str])] = &[
     ("SET_TMC_CURRENT", &["STEPPER", "CURRENT", "HOLDCURRENT"]),
     ("SET_TMC_FIELD", &["STEPPER", "FIELD", "VALUE", "VELOCITY"]),
     (
+        "SET_VELOCITY_LIMIT",
+        &[
+            "VELOCITY",
+            "ACCEL",
+            "SQUARE_CORNER_VELOCITY",
+            "MINIMUM_CRUISE_RATIO",
+        ],
+    ),
+    (
         "SHAPER_CALIBRATE",
         &["AXIS", "CHIPS", "MAX_SMOOTHING", "NAME"],
     ),
@@ -330,6 +342,7 @@ pub const BUILTIN: &[(&str, &[&str])] = &[
     ),
     ("UPDATE_DELAYED_GCODE", &["ID", "DURATION"]),
     ("Z_ENDSTOP_CALIBRATE", &["SPEED"]),
+    ("Z_OFFSET_APPLY_PROBE", &["METHOD"]),
     (
         "Z_TILT_ADJUST",
         &[

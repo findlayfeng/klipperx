@@ -1,10 +1,11 @@
 /// How the host resets an MCU's firmware: the `restart_method` config option.
 ///
 /// Upstream's `MCURestartHelper` (`klippy/mcu.py:656`) dispatches on this when it
-/// acts on a `klippy:firmware_restart`. The physical resets (DTR toggles, USB
-/// power) are not implemented yet — only `command` has a path today, through
-/// `config_reset` in `mcu/config.rs` — but the value is resolved and validated
-/// now, so a config that sets it behaves the same once the rest lands.
+/// acts on a `klippy:firmware_restart`. All four methods have a path
+/// (`mcu/restart.rs`: DTR toggles, the Cheetah RTS/DTR sequence, cutting the USB
+/// port's power, and `config_reset` for `command`), but the three physical ones
+/// are **untested on hardware** and say so when they run; the value itself is
+/// resolved and validated here, at config time.
 ///
 /// The option only applies to a serial MCU; the other transports reset with
 /// `command` (`klippy/mcu.py:668-671`).

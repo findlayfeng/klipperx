@@ -100,6 +100,7 @@ H1–H12 是上游 extras 里按域归并的消费者（2026-09-21 全量盘点�
 | # | 事项 | 依赖 |
 |---|---|---|
 | S1 | 压力测试工具（`klipperx stress`）剩余：stepper 资源、别名解析、端到端测试 | C1 |
+| S2 | 文档补齐（2026-10-06 对账发现，非新功能）：`config.md` 缺 **`[bed_mesh]` 整节**（约 20 个选项，含 `split_delta_z` / `move_check_distance`）、`gcode-commands.md` 缺 `BED_MESH_*` 命令；开发手册「模块表 / `testing.md` 覆盖行 / `regression-tests.md`」的其余陈旧行未重审（本轮只修了与已落地改动强相关的那些） | — |
 | E2 | `python_path` 的取消 | 外部项目 |
 
 > 判为**不适用**、不进待办的上游模块：`garbage_collection.py`（Python GC 调优）、

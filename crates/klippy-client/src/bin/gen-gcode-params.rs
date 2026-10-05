@@ -7,7 +7,14 @@
 //!
 //! ```console
 //! cargo run -p klippy-client --bin gen-gcode-params
+//! cargo fmt --all
 //! ```
+//!
+//! The formatter step matters: this generator writes one command per line while
+//! the repository keeps `cargo fmt`'s multi-line shape, so skipping it leaves a
+//! whole-file diff. A stale table does not wait for a test either —
+//! `build.rs` re-scans in a checkout and fails the build when the checked-in
+//! table disagrees with the host source.
 //!
 //! It scans `src/core/klippy`, prints every registration it could not resolve,
 //! and writes `BUILTIN` next to the crate's library. The freshness test in

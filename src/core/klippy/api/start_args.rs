@@ -39,9 +39,6 @@ pub struct StartArgs {
     /// Why this run started: `"startup"` for the first one, then the result
     /// the previous run ended with (upstream's `start_args['start_reason']`).
     pub start_reason: String,
-    /// The `--debuginput` file, when the host reads G-Code from a file instead
-    /// of a pty (`debuginput`).
-    pub debug_input: Option<String>,
     /// The `--debugoutput` file, when the host writes the MCU protocol to a
     /// file instead of the serial port (`debugoutput`).
     pub debug_output: Option<String>,
@@ -55,9 +52,11 @@ impl StartArgs {
     /// Gather the start arguments a host knows at startup.
     ///
     /// `log_file` is the `--logfile` path, or `None` when the host logs to the
-    /// terminal only. The fields the parser does not carry yet
-    /// (`debuginput`/`debugoutput`) stay `None`, and the API address is filled
-    /// in by the host, which is where the option lives.
+    /// terminal only. `debug_output` stays `None` until the parser carries
+    /// `--debugoutput`, and the API address is filled in by the host, which is
+    /// where the option lives. Upstream's `--debuginput` file-input mode is not
+    /// implemented here, so there is no field for it (see
+    /// `docs/klippy/developer-manual/upstream-deviations.md`).
     pub fn collect(config_file: impl Into<String>, log_file: Option<String>) -> Self {
         Self {
             config_file: config_file.into(),
@@ -66,7 +65,6 @@ impl StartArgs {
             cpu_info: cpu_info(),
             apiserver: None,
             start_reason: "startup".to_string(),
-            debug_input: None,
             debug_output: None,
             device: device_info(),
             linux_version: linux_version(),
@@ -179,9 +177,11 @@ model name\t: ARMv7 Processor rev 4 (v7l)
 
         assert_eq!(args.start_reason, "startup");
         assert_eq!(args.apiserver, None);
-        // No `--debuginput` / `--debugoutput` yet: the host reads G-Code from
-        // its pty and writes the protocol to the serial port.
-        assert_eq!(args.debug_input, None);
+        // Upstream's `--debuginput` file-input mode is not implemented here, so
+        // there is no field for it
+        // (`docs/klippy/developer-manual/upstream-deviations.md`); the host
+        // reads G-Code from its pty. `--debugoutput` stays pending: the
+        // protocol goes to the serial port for now.
         assert_eq!(args.debug_output, None);
         // Both are read from the running kernel, so only their shape is pinned.
         assert!(!args.device.is_empty());

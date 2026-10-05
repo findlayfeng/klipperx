@@ -8,10 +8,11 @@
 //! it outlives any one printer. It therefore lives on the host's side of the
 //! API, and the host builds it.
 //!
-//! Only the fields the `info` endpoint reports are here so far. Upstream's
-//! dictionary also carries `apiserver`, `start_reason`, the debug input/output
-//! and the per-MCU dictionary paths; they arrive with the modules that read
-//! them.
+//! Compared to upstream's dictionary, `debuginput` (file input) and the per-MCU
+//! dictionary paths are absent: this host implements neither (see
+//! `docs/klippy/developer-manual/upstream-deviations.md`). `debugoutput` stays
+//! even though the `-o` option does not exist, because the regression harness
+//! fills it to put the machine into upstream's file-output mode.
 
 /// What the host process was started with.
 ///

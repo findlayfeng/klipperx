@@ -57,7 +57,7 @@ H1–H12 是上游 extras 里按域归并的消费者（2026-09-21 全量盘点�
 |---|---|---|
 | C1 | 运动层收尾：轴/stepper 抽象 + 多轴（C1a）、extruder 运动（C1b）、运动学族（C1c：delta/polar/generic_cartesian/rotary_delta/winch/deltesian 全落地）、print-time 回调（C1d）——**✅ 收官** | — |
 | C2 | 配置装载：框架部分 ✅（FW1，含 choice/range 文案与 `deprecate` 警告）；autosave/`SAVE_CONFIG` 写回 ✅（2026-10-02，详见下） | — |
-| D1 | 主机层 start args / rollover / `--logfile` ✅（FW8）；剩余：`debuginput`/`debugoutput` 的命令行接线与每 MCU 字典路径 | — |
+| D1 | 主机层 start args / rollover / `--logfile` ✅（FW8）；`debuginput`/`debugoutput` 的命令行接线与每 MCU 字典路径**不做**（随 GCodeIO 决策，2026-10-05 结案；`debug_input` 字段与 `debuginput_exit` 事件已随死代码删除） | — |
 
 **MCU 资源与总线**
 
@@ -271,7 +271,7 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 ### D1 主机层 start args / rollover / 日志（框架 FW8）
 
 - [x] **`StartArgs` 的剩余接线（2026-10-05 结案）**：结构体已带 `apiserver`（宿主启动时填，`src/klippy.rs:323`）、
-      `start_reason`、`debug_input`/`debug_output`、`device`、`linux_version`；`--debuginput`/`--debugoutput`
+      `start_reason`、`debug_output`、`device`、`linux_version`（`debug_input` 字段已随死代码删除）；`--debuginput`/`--debugoutput`
       的命令行解析**不做**（随 `GCodeIO` 决策：本仓不实现行协议输入与 batch mode，`StartArgs::collect` 里保持 `None`；
       `debug_output` 字段继续供语料 harness 使用），每个 MCU 的 `-d` 字典路径同样不做（只服务上游 `-o`）。
       `software_version` 已由宿主 `set_start_args` 注入

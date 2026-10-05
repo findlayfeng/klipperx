@@ -61,6 +61,23 @@ impl EstimatedPrintTime {
     }
 }
 
+/// One iteration of the wait `M400` drives on (`ToolHead.wait_moves`,
+/// `klippy/toolhead.py:422-428`), as a single snapshot: the caller holds the
+/// planner for one short read and then sleeps with it released.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WaitMovesState {
+    /// Upstream's loop condition — whether there is still something to wait
+    /// for: `not special_queuing_state or print_time >=
+    /// estimated_print_time(eventtime)`.
+    pub waiting: bool,
+    /// The planner horizon the estimate was judged against
+    /// ([`ToolHead::print_time`]).
+    pub print_time: f64,
+    /// The MCU's estimate at the instant of this read, never cached
+    /// ([`ToolHead::estimated_print_time`]).
+    pub estimated_print_time: f64,
+}
+
 /// A lookahead callback parked on the move it was registered against: the
 /// index of that move in the batch that will flush it
 /// (`ToolHead::register_lookahead_callback`).
@@ -456,17 +473,47 @@ impl ToolHead {
         Ok(batches)
     }
 
-    /// Plan everything queued so far (`ToolHead.wait_moves`,
-    /// `klippy/toolhead.py:422-429`): upstream then waits for the MCU to catch
-    /// up, which needs the clock estimate and is FW5d's MCU side. What this
-    /// host does take from upstream is the `_flush_lookahead` the wait opens
-    /// with (`toolhead.py:300-309`): the toolhead is left in "NeedPrime", so
-    /// the next planned move floors `print_time` at the estimate **of that
-    /// moment** instead of chaining from a horizon the clock has long passed
-    /// (`M400` is where a replay pauses between segments).
+    /// Plan everything queued so far — upstream's `_flush_lookahead`, the
+    /// first half of `ToolHead.wait_moves` (`klippy/toolhead.py:422-429`,
+    /// `:300-309`): the toolhead is left in "NeedPrime", so the next planned
+    /// move floors `print_time` at the estimate **of that moment** instead of
+    /// chaining from a horizon the clock has long passed (`M400` is where a
+    /// replay pauses between segments).
+    ///
+    /// The second half — waiting for the MCU to catch up — needs the clock
+    /// estimate *live* and a reactor to sleep on, so it is driven by the
+    /// caller: read [`Self::wait_moves_state`] once per iteration and sleep
+    /// while it says `waiting` (the `[printer]` object's `M400` does).
     pub fn wait_moves(&mut self) {
         self.process_lookahead();
         self.special_queuing_state = true;
+    }
+
+    /// Read what upstream's `wait_moves` loop tests each iteration
+    /// (`klippy/toolhead.py:425-427`):
+    ///
+    /// ```text
+    /// while (not self.special_queuing_state
+    ///        or self.print_time >= self.mcu.estimated_print_time(eventtime)):
+    /// ```
+    ///
+    /// [`Self::wait_moves`] leaves the toolhead in "NeedPrime", where
+    /// `special_queuing_state` is truthy, so while nothing plans new motion the
+    /// wait runs until the estimate reaches the horizon; a `process_lookahead`
+    /// that moves the planner on takes the state back to "main" (falsy) and
+    /// ends the wait — the planner is ahead of the estimate on its own then.
+    ///
+    /// The estimate is read **fresh** ([`Self::estimated_print_time`]), so the
+    /// answer is only good for the iteration that asked: a caller that loops on
+    /// this must call it again after every sleep, and must not hold the
+    /// planner's lock across that sleep.
+    pub fn wait_moves_state(&self) -> WaitMovesState {
+        let estimated_print_time = self.estimated_print_time.get();
+        WaitMovesState {
+            waiting: !self.special_queuing_state || self.print_time >= estimated_print_time,
+            print_time: self.print_time,
+            estimated_print_time,
+        }
     }
 
     /// The print time the planner has reached (`ToolHead.get_last_move_time`,

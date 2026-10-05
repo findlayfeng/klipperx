@@ -13,12 +13,14 @@
 
 - **板子**：STM32F103xe（72 MHz，USB `usb-Klipper_stm32f103xe_39FFD7054D47323924610951-if00`
   → `/dev/ttyACM0`），固件 `third_party/klipper/out/klipper.bin`（含 `config_stepper` 等）。
-- **最小接线**：X（`PB0`/`PB1`，`config.cfg` 里只有注释）与 Y 的 `step_pin`/`dir_pin`、
-  X 的 `endstop_pin`、挤出机步进（E 轴）、加热棒 + 热敏电阻（`[extruder]`）。
-  **目前只确认过 X 的引脚**，其余未知——写 config 前逐个确认，Z/热床可选。
-- **喂 gcode 的方式**：`virtual_sdcard` 没有文件回放（无 `M20`–`M27`），标准的
-  「上传 → 开打 → 看进度」工作流尚不存在。最小任务用**客户端 g-code 模式逐行发**
-  （`Ctrl+G`）或 `gcode/script` 端点顶替。
+- **最小接线**：X 与 Y 的 `step_pin`/`dir_pin`、X 的 `endstop_pin`、挤出机步进（E 轴）、
+  加热棒 + 热敏电阻（`[extruder]`）。**引脚尚未定论**：本节此前写 X = `PB0`/`PB1`，而
+  `config.cfg` 的注释写 `PB4`/`PB5`（且那组注释与 `[output_pin] motor_in1..4` 的
+  `PB5`–`PB8` 冲突）——两处都未经实测，写 config 前必须逐个上板确认，Z/热床可选。
+- **喂 gcode 的方式**：`virtual_sdcard` 的文件回放（`M20`–`M29`/`SDCARD_PRINT_FILE`）与
+  `print_stats` 已落地（2026-10-06 复核：`extras/virtual_sdcard.rs:421-429`、`extras/print_stats.rs`），
+  所以「上传 → 开打 → 看进度」的工作流可用。最小任务仍可用**客户端 g-code 模式逐行发**
+  （`Ctrl+G`）或 `gcode/script` 端点顶替，便于逐步核对。
 - **跑起来**：
 
   ```sh
@@ -56,9 +58,10 @@
 - [ ] **R6 温度链路与加热闭环（`M104`）** —— 真实测试：挤出机加热棒 + 热敏电阻上电，
   `temperature_sensor`/`extruder` 的 ADC 读数与接触温度计对照；`M104 S150` 后看温度
   爬升并稳定、`M104 S0` 后回落。判定：读数误差可解释（同量级、单调）、PID 收敛不
-  发散、`verify_heater` 不误触发。**注意**：`M109`/`M190` 目前不等温、`M105` 回
-  `T:0`（缺口见 `TODO.md` H1）；`TEMPERATURE_WAIT` 已注册（2026-10-03，`b5da84e`），
-  预热可用它等待。
+  发散、`verify_heater` 不误触发。**注意**：`M109`/`M190` 已会等到目标温度、`M105` 按
+  gcode-id 表输出（2026-10-06 复核：`extras/extruder.rs:263`、`extras/heater_bed.rs:53`、
+  `extras/heaters.rs:417`；此前本节「不等温、回 `T:0`」的说法已过时）；`TEMPERATURE_WAIT`
+  亦可等待（2026-10-03，`b5da84e`）。
 
 - [ ] **R7 挤出机进料（E 轴）** —— 真实测试：热态下 `G1 E10`（配合 `M83`）送料，
   量实际挤出长度；冷态再发同一条。判定：进料量与 `rotation_distance`/齿轮比对账；
@@ -68,7 +71,7 @@
   `gcode/script`）把一段 20×20 mm 单壁方框的 gcode **逐行喂完**（含归零、预热到位后的
   打印段与 `M400` 收尾）。判定：全程无 `!!` 错误、行间流控不卡不丢、
   `objects/query toolhead` 的 `position` 走完全部路径、打完的方框形状/尺寸与指令一致
-  （进度只能靠日志与位置核对，`print_stats` 缺失）。
+  （进度可读 `print_stats`，也可用日志与位置核对）。
 
 - [ ] **R9 打印收尾与静止** —— 真实测试：结尾发 `M104 S0`、`M18`（或等 `idle_timeout`）。
   判定：加热器停在关断值、电机失能、`last_stats`/`stats` 正常上报、宿主保持连接仍能
@@ -81,9 +84,11 @@
 
 - [ ] **R11 连续运行的真机时序** —— 真实测试：把 R1–R9 的最小任务**循环跑满一段较长
   时间**（分钟到小时级，或用 `stress --task step` 顶着上限压）。判定：无
-  `Stepper too far in past` / `Timer too close`、无丢步、USB 不掉线；`minclock` /
-  `send_wait_ack` 等上游时序原语真机上尚未建模（见 README「离真能打印还缺什么」），
-  本项正是要暴露它们。
+  `Stepper too far in past` / `Timer too close`、无丢步、USB 不掉线；本项要暴露的
+  代码侧缺口是 `ToolHead.wait_moves` 的宿主等待与 `send_wait_ack`（2026-10-06 复核：
+  消息的 `min_clock`/`req_clock` 闸**已建模**，见 `mcu/mod.rs:149-176`；缺的是
+  `motion/toolhead.rs:467` 不等 MCU、`MIN_KIN_TIME`/`kin_flush_delay` 未建模，以及
+  `mcu/mod.rs` 没有「块被固件确认」原语）。
 
 ## 已完成真机验证（留档）
 
@@ -103,8 +108,9 @@
   USB/CAN 抖动（软件侧已用 ±100 ppm/1 h 模拟；`SecondarySync` 周期重校准）。
 - **`rpi_usb` 物理复位**：per-port 断电重启、换电后 identify 不误判、拔插（`restart_method: rpi_usb`，
   代码与决策逻辑已就绪）。
-- **未接的外设**：buttons / pulse_counter / trigger_analog、sdcard、LCD、neopixel/dotstar、
-  `sensor_bulk` 与各类 SPI/I2C 传感器、tmcuart——各接一个真实外设后验。
+- **未接的外设**：固件按钮查询、`trigger_analog` 宿主节、sdcard、LCD、tmcuart——
+  各接一个真实外设后验。（宿主模块已落地但尚未上真板的：`pulse_counter`、`neopixel`/`dotstar`、
+  `sensor_bulk` 与各类 SPI/I2C 传感器。）
 - **回零精度数字**：`homing_retract_dist` 二次回零与 `endstop_phase` 相位调节的**实际精度**
   （功能已软件落地，真板只差精度测量）。
 

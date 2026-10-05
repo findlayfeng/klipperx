@@ -58,7 +58,7 @@ fn test_every_registration_call_site_is_resolved_or_recorded() {
     // Pinning the total is what keeps that sum honest: were the scanner to stop
     // recognising a call site entirely, this drops and the check goes red.
     assert_eq!(
-        scan.call_sites, 85,
+        scan.call_sites, 90,
         "the number of registration call sites the scanner sees changed"
     );
 

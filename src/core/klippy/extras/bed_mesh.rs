@@ -18,18 +18,22 @@
 //!   stored grid through [`BedMesh::loaded_mesh`]) and the `get_status` shape
 //!   clients read;
 //! - [`ZMesh::calc_z`]: the bilinear lookup over the mesh, which is the mesh's
-//!   own answer to "how far off is the bed here".
+//!   own answer to "how far off is the bed here";
+//! - the mesh's effect on moves, fade included: [`BedMesh`] claims
+//!   `gcode_move`'s move-transform slot at load (`bed_mesh.py:131`), so every
+//!   `G1`/`M114` passes through it. [`BedMesh::move_to`] applies the mesh to
+//!   the whole move — through [`MoveSplitter`] while the fade is phased in,
+//!   and as the constant `fade_target` once it has phased out — and
+//!   [`BedMesh::position`] removes the same adjustment on the way back.
 //!
 //! **Not implemented yet** (tracked in `TODO.md` H9, next units):
 //!
 //! - the mesh offsets (`BED_MESH_OFFSET`) and the zero reference
 //!   (`ZERO_REFERENCE`) — both are profile-command state, so `calc_z` looks up
-//!   the coordinate as given;
+//!   the coordinate as given (`mesh_offsets` stays `[0., 0.]`) and nothing calls
+//!   `set_zero_reference`;
 //! - faulty-region substitution (`_process_faulty_regions`): the regions are
 //!   parsed and probed like any other point;
-//! - fade (`fade_start` / `fade_end` / `fade_target`) and the z-adjustment the
-//!   mesh applies to moves (`MoveSplitter`) — so a calibration currently does
-//!   **not** affect subsequent moves;
 //! - the profile commands (`BED_MESH_PROFILE`, `BED_MESH_OUTPUT`, `BED_MESH_MAP`,
 //!   `BED_MESH_OFFSET`): a calibration answers as the default profile and
 //!   nothing is saved across a restart, so `profiles` stays empty.
@@ -38,16 +42,19 @@
 //! corpus needs, and the gaps above are capability gaps, not silent shortcuts —
 //! they are listed in the manual and the task list.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use serde_json::{json, Value};
+use tracing::info;
 
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
+use crate::core::klippy::event::KlippyEvent;
+use crate::core::klippy::extras::gcode_move::{self, GCodeMove, MoveTarget, GCODE_MOVE_OBJECT};
 use crate::core::klippy::extras::probe::{lookup_probe_session, PROBE_PARAMS};
 use crate::core::klippy::extras::toolhead::ToolHeadObject;
 use crate::core::klippy::gcode::{CommandError, GCodeDispatch, GCODE_OBJECT};
 use crate::core::klippy::load::section;
-use crate::core::klippy::mathutil::Coord;
+use crate::core::klippy::mathutil::{Coord, AXES, X_AXIS, Y_AXIS, Z_AXIS};
 use crate::core::klippy::printer::{Printer, PrinterObject};
 
 section!("bed_mesh", order = 30, load = load_config);
@@ -59,8 +66,10 @@ const TOOLHEAD_OBJECT: &str = "toolhead";
 /// What `get_status` reports (`ProbeCommandHelper.get_status`) — the eddy
 /// probe reports through probe.rs's own helper with this section id.
 
-/// The Z axis index, as [`Coord`] numbers them.
-const Z_AXIS: usize = 2;
+/// Upstream's `BedMesh.FADE_DISABLE` (`bed_mesh.py:87`): the sentinel
+/// `fade_start` / `fade_end` collapse to when the configured distance is not
+/// positive, so no Z reaches either bound and the fade factor stays 1.
+const FADE_DISABLE: f64 = 0x7FFFFFFF as f64;
 
 /// The object the loader registers `[bed_mesh]` under — the name
 /// `bed_mesh/dump_mesh` looks the stored grid up by.
@@ -108,8 +117,12 @@ pub struct BedMeshOptions {
     pub mesh_radius: Option<f64>,
     /// A round bed's centre.
     pub mesh_origin: [f64; 2],
-    /// How far moves may go before a segmented move is checked.
+    /// How far along a move it may go before the mesh is re-sampled
+    /// (`move_check_distance`, read by [`MoveSplitter`]).
     pub move_check_distance: f64,
+    /// How much the mesh's sampled Z may change before a move is split
+    /// (`split_delta_z`, read by [`MoveSplitter`]).
+    pub split_delta_z: f64,
     /// The `faulty_region_<N>` rectangles.
     pub faulty_regions: Vec<FaultyRegion>,
 }
@@ -274,7 +287,22 @@ impl BedMeshOptions {
             round_probe_count,
             mesh_radius,
             mesh_origin: two_floats(config, "mesh_origin", Some([0.0, 0.0]))?,
-            move_check_distance: config.get_float("move_check_distance", Some(5.0))?,
+            move_check_distance: config.get_float_bounded(
+                "move_check_distance",
+                Some(5.0),
+                Some(3.0),
+                None,
+                None,
+                None,
+            )?,
+            split_delta_z: config.get_float_bounded(
+                "split_delta_z",
+                Some(0.025),
+                Some(0.01),
+                None,
+                None,
+                None,
+            )?,
             faulty_regions,
         };
         options.verify_algorithm()?;
@@ -696,6 +724,38 @@ impl ZMesh {
             .collect()
     }
 
+    /// The mesh's smallest and largest sampled Z — upstream's `get_z_range`
+    /// over the interpolation grid (`bed_mesh.py:1438-1444`), which `set_mesh`
+    /// checks `fade_target` and the fade distance against.
+    pub fn z_range(&self) -> (f64, f64) {
+        let mut min = f64::INFINITY;
+        let mut max = f64::NEG_INFINITY;
+        for row in &self.mesh_matrix {
+            for value in row {
+                min = min.min(*value);
+                max = max.max(*value);
+            }
+        }
+        (min, max)
+    }
+
+    /// The mesh's average sampled Z, rounded to hundredths — upstream's
+    /// `get_z_average` over the interpolation grid (`bed_mesh.py:1445-1454`),
+    /// which is the `fade_target` a config leaves unset.
+    ///
+    /// As [`round_six`], scaling and rounding is half-away-from-zero where
+    /// Python's `round(avg, 2)` is half-to-even; the two differ only on an
+    /// exact tie at the second decimal, which a probed average does not land on.
+    pub fn z_average(&self) -> f64 {
+        let mut sum = 0.0;
+        let mut count = 0usize;
+        for row in &self.mesh_matrix {
+            sum += row.iter().sum::<f64>();
+            count += row.len();
+        }
+        (sum / count as f64 * 100.0).round() / 100.0
+    }
+
     /// The Z the mesh holds at `(x, y)`, bilinear over the four grid points
     /// around it — `calc_z` (`bed_mesh.py:1428-1439`).
     ///
@@ -1073,12 +1133,325 @@ fn pad_round_rows(rows: Vec<Vec<f64>>, x_count: usize) -> Result<Vec<Vec<f64>>, 
     Ok(padded)
 }
 
+/// Upstream's `MoveSplitter` (`bed_mesh.py:1257-1319`): walk one move and
+/// return it as slices, each carrying the mesh's Z adjustment at its own end.
+///
+/// A move is only re-sampled every `move_check_distance`; a sample whose Z
+/// offset has moved at least `split_delta_z` from the last slice's becomes a
+/// slice, and the final slice always carries the offset. A move with no X or Y
+/// component never gets an intermediate slice — the whole move is the final
+/// slice.
+struct MoveSplitter {
+    /// The Z change between slices (`split_delta_z`, `minval=0.01`).
+    split_delta_z: f64,
+    /// How far along a move between samples (`move_check_distance`,
+    /// `minval=3.`).
+    move_check_distance: f64,
+    /// The mesh being traversed (`initialize`), or `None` with fades off
+    /// before the first calibration.
+    z_mesh: Option<ZMesh>,
+    /// The Z the fade phasing targets, which the offset is scaled about
+    /// (`fade_offset` = `fade_target`).
+    fade_offset: f64,
+    /// The slice's start (`build_move`).
+    prev_pos: Coord,
+    /// The move's end.
+    next_pos: Coord,
+    /// Where the traversal currently is.
+    current_pos: Coord,
+    /// The fade factor in force for this move (`build_move`).
+    z_factor: f64,
+    /// The Z offset the last slice was built with.
+    z_offset: f64,
+    /// Whether the final slice has been returned.
+    traverse_complete: bool,
+    /// How far along the move the next sample sits.
+    distance_checked: f64,
+    /// The move's length in the XY(Z) plane.
+    total_move_length: f64,
+    /// Which axes the move actually moves, per axis.
+    axis_move: [bool; AXES],
+}
+
+impl MoveSplitter {
+    /// `MoveSplitter.__init__` (`bed_mesh.py:1258-1266`).
+    fn new(split_delta_z: f64, move_check_distance: f64) -> Self {
+        Self {
+            split_delta_z,
+            move_check_distance,
+            z_mesh: None,
+            fade_offset: 0.0,
+            prev_pos: Coord::default(),
+            next_pos: Coord::default(),
+            current_pos: Coord::default(),
+            z_factor: 1.0,
+            z_offset: 0.0,
+            traverse_complete: true,
+            distance_checked: 0.0,
+            total_move_length: 0.0,
+            axis_move: [false; AXES],
+        }
+    }
+
+    /// Upstream's `initialize` (`bed_mesh.py:1266-1268`): hand over the mesh
+    /// the slices are sampled from and the fade offset they scale about.
+    fn initialize(&mut self, mesh: Option<ZMesh>, fade_offset: f64) {
+        self.z_mesh = mesh;
+        self.fade_offset = fade_offset;
+    }
+
+    /// Upstream's `build_move` (`bed_mesh.py:1269-1278`): set up the move, its
+    /// fade factor and which axes it moves along.
+    fn build_move(&mut self, prev_pos: Coord, next_pos: Coord, factor: f64) {
+        self.prev_pos = prev_pos;
+        self.next_pos = next_pos;
+        self.current_pos = prev_pos;
+        self.z_factor = factor;
+        self.z_offset = self.calc_z_offset(prev_pos);
+        self.traverse_complete = false;
+        self.distance_checked = 0.0;
+        let axes_d: [f64; AXES] =
+            std::array::from_fn(|axis| next_pos.axis(axis) - prev_pos.axis(axis));
+        // `total_move_length` is the X/Y/Z distance; the E axis moves along
+        // with it but does not lengthen the move (`bed_mesh.py:1276`).
+        self.total_move_length = (axes_d[0].powi(2) + axes_d[1].powi(2) + axes_d[2].powi(2)).sqrt();
+        // Upstream's `isclose(d, 0., abs_tol=1e-10)` reduces to this.
+        self.axis_move = axes_d.map(|delta| delta.abs() > 1e-10);
+    }
+
+    /// Upstream's `_calc_z_offset` (`bed_mesh.py:1279-1283`): the mesh's Z at
+    /// `pos`, scaled by the fade factor about `fade_offset`.
+    fn calc_z_offset(&self, pos: Coord) -> f64 {
+        let z = self
+            .z_mesh
+            .as_ref()
+            .map_or(0.0, |mesh| mesh.calc_z(pos.x(), pos.y()));
+        let offset = self.fade_offset;
+        self.z_factor * (z - offset) + offset
+    }
+
+    /// Upstream's `_set_next_move` (`bed_mesh.py:1284-1292`): the point
+    /// `distance_from_prev` along the move, on every axis that moves.
+    ///
+    /// # Errors
+    /// Upstream's "Slice distance is negative or greater than entire move
+    /// length", which [`MoveSplitter::split`]'s loop bounds keep out of reach.
+    fn set_next_move(&mut self, distance_from_prev: f64) -> Result<(), CommandError> {
+        let t = distance_from_prev / self.total_move_length;
+        // Upstream writes `t > 1. or t < 0.` (`bed_mesh.py:1286`).
+        if !(0.0..=1.0).contains(&t) {
+            return Err(CommandError::new(
+                "bed_mesh: Slice distance is negative or greater than entire move length",
+            ));
+        }
+        for axis in 0..AXES {
+            if self.axis_move[axis] {
+                self.current_pos.set_axis(
+                    axis,
+                    lerp(t, self.prev_pos.axis(axis), self.next_pos.axis(axis)),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Upstream's `split` (`bed_mesh.py:1293-1319`): the next slice of the
+    /// move, or `Ok(None)` once the traversal is complete.
+    ///
+    /// # Errors
+    /// As [`MoveSplitter::set_next_move`].
+    fn split(&mut self) -> Result<Option<Coord>, CommandError> {
+        if self.traverse_complete {
+            return Ok(None);
+        }
+        if self.axis_move[X_AXIS] || self.axis_move[Y_AXIS] {
+            while self.distance_checked + self.move_check_distance < self.total_move_length {
+                self.distance_checked += self.move_check_distance;
+                self.set_next_move(self.distance_checked)?;
+                let next_z = self.calc_z_offset(self.current_pos);
+                if (next_z - self.z_offset).abs() >= self.split_delta_z {
+                    self.z_offset = next_z;
+                    let mut new_position = self.current_pos;
+                    new_position.set_axis(Z_AXIS, new_position.z() + self.z_offset);
+                    return Ok(Some(new_position));
+                }
+            }
+        }
+        // The end of the move: the offset rides the final slice too, since the
+        // move is done and it will not be applied again (`bed_mesh.py:1310-1318`).
+        self.current_pos = self.next_pos;
+        self.z_offset = self.calc_z_offset(self.current_pos);
+        self.current_pos
+            .set_axis(Z_AXIS, self.current_pos.z() + self.z_offset);
+        self.traverse_complete = true;
+        Ok(Some(self.current_pos))
+    }
+}
+
+/// What a calibration and the move transform share — upstream's mutable
+/// `BedMesh` fields (`bed_mesh.py:88-107`): the options, the loaded mesh, the
+/// fade state, the splitter and the un-transformed last position.
+struct MeshState {
+    /// The section's options, read once at load.
+    options: BedMeshOptions,
+    /// The loaded mesh, or `None` while the bed holds no calibration.
+    mesh: Option<LoadedMesh>,
+    /// Where the mesh's fade begins (`fade_start`), or `FADE_DISABLE`.
+    fade_start: f64,
+    /// Where it ends (`fade_end`), or `FADE_DISABLE`.
+    fade_end: f64,
+    /// `fade_end - fade_start`; `<= 0` means fading is disabled.
+    fade_dist: f64,
+    /// The `fade_target` option, or `None` when the config leaves it out.
+    base_fade_target: Option<f64>,
+    /// The Z the faded region targets (`set_mesh`).
+    fade_target: f64,
+    /// Whether the fade completion still needs logging (`move`).
+    log_fade_complete: bool,
+    /// The `BED_MESH_OFFSET ZFADE` offset (`bed_mesh.py:284-286`); nothing sets
+    /// it yet, so it stays `0.`.
+    tool_offset: f64,
+    /// The segmented-move traverser.
+    splitter: MoveSplitter,
+    /// The last position in the un-transformed G-Code space
+    /// (`bed_mesh.py:89-91`), which `position` keeps in step with the toolhead.
+    last_position: Coord,
+}
+
+impl MeshState {
+    /// The state a freshly read section starts from — upstream's `__init__`
+    /// fade setup (`bed_mesh.py:97-106`).
+    fn new(options: BedMeshOptions) -> Self {
+        let fade_start = options.fade_start;
+        let fade_end = options.fade_end;
+        let fade_dist = fade_end - fade_start;
+        let (fade_start, fade_end) = if fade_dist <= 0.0 {
+            // No positive fade distance disables fading: both bounds collapse
+            // onto the sentinel no Z reaches, so `get_z_factor` stays 1.
+            (FADE_DISABLE, FADE_DISABLE)
+        } else {
+            (fade_start, fade_end)
+        };
+        let splitter = MoveSplitter::new(options.split_delta_z, options.move_check_distance);
+        let base_fade_target = options.fade_target;
+        Self {
+            options,
+            mesh: None,
+            fade_start,
+            fade_end,
+            fade_dist,
+            base_fade_target,
+            fade_target: 0.0,
+            log_fade_complete: false,
+            tool_offset: 0.0,
+            splitter,
+            last_position: Coord::default(),
+        }
+    }
+
+    /// Upstream's `get_z_factor` (`bed_mesh.py:173-180`): 1 below `fade_start`
+    /// (the mesh adjusts in full), 0 at or above `fade_end` (the adjustment is
+    /// gone), and a straight line between them. With fading disabled both
+    /// bounds are `FADE_DISABLE`, so the factor is always 1.
+    fn get_z_factor(&self, z_pos: f64) -> f64 {
+        let z_pos = z_pos + self.tool_offset;
+        if z_pos >= self.fade_end {
+            0.0
+        } else if z_pos >= self.fade_start {
+            (self.fade_end - z_pos) / self.fade_dist
+        } else {
+            1.0
+        }
+    }
+
+    /// The mesh's Z at `(x, y)`, or 0 with no mesh — `ZMesh.calc_z`
+    /// (`bed_mesh.py:1427-1437`).
+    fn calc_z(&self, x: f64, y: f64) -> f64 {
+        self.mesh
+            .as_ref()
+            .map_or(0.0, |mesh| mesh.z_mesh.calc_z(x, y))
+    }
+
+    /// Upstream's `set_mesh` (`bed_mesh.py:137-171`): install a mesh (or clear
+    /// one) and work out the fade target it is adjusted against.
+    ///
+    /// # Errors
+    /// The two refusals `set_mesh` raises: an explicit `fade_target` outside
+    /// the mesh's Z range, and a mesh whose Z range reaches the fade distance.
+    /// Both leave no mesh loaded, as upstream does.
+    fn set_mesh(&mut self, mesh: Option<LoadedMesh>) -> Result<(), CommandError> {
+        // Upstream's `mesh is not None and fade_end != FADE_DISABLE` guard
+        // (`bed_mesh.py:138`).
+        let fading = self.fade_end != FADE_DISABLE;
+        if let Some(loaded) = mesh.as_ref().filter(|_| fading) {
+            self.log_fade_complete = true;
+            match self.base_fade_target {
+                None => self.fade_target = loaded.z_mesh.z_average(),
+                Some(target) => {
+                    self.fade_target = target;
+                    let (min_z, max_z) = loaded.z_mesh.z_range();
+                    if !(min_z <= self.fade_target && self.fade_target <= max_z)
+                        && self.fade_target != 0.0
+                    {
+                        let err_target = self.fade_target;
+                        self.mesh = None;
+                        self.fade_target = 0.0;
+                        return Err(CommandError::new(format!(
+                            "bed_mesh: ERROR, fade_target lies outside of mesh z range\n\
+                             min: {min_z:.4}, max: {max_z:.4}, fade_target: {err_target:.4}"
+                        )));
+                    }
+                }
+            }
+            let (min_z, max_z) = loaded.z_mesh.z_range();
+            if self.fade_dist <= min_z.abs().max(max_z.abs()) {
+                self.mesh = None;
+                self.fade_target = 0.0;
+                // Upstream's two-line literal concatenates without a space
+                // after `in`, so the message reads `inexample-extras.cfg.`
+                // (`bed_mesh.py:156-159`); kept verbatim.
+                return Err(CommandError::new(format!(
+                    "bed_mesh:  Mesh extends outside of the fade range, please see the fade_start and fade_end options inexample-extras.cfg. fade distance: {:.2} mesh min: {:.4}mesh max: {:.4}",
+                    self.fade_dist, min_z, max_z
+                )));
+            }
+        } else {
+            self.fade_target = 0.0;
+        }
+        self.tool_offset = 0.0;
+        self.mesh = mesh;
+        let z_mesh = self.mesh.as_ref().map(|mesh| mesh.z_mesh.clone());
+        self.splitter.initialize(z_mesh, self.fade_target);
+        Ok(())
+    }
+}
+
+/// The toolhead behind the transform: what `position` reads and `move_to`
+/// feeds (upstream passes `self.toolhead` around directly).
+struct ToolheadMove(Arc<ToolHeadObject>);
+
+impl MoveTarget for ToolheadMove {
+    fn move_to(&self, position: Coord, speed: f64) -> Result<(), CommandError> {
+        self.0.move_to(position, speed)
+    }
+
+    fn position(&self) -> Coord {
+        self.0.position().unwrap_or_default()
+    }
+}
+
 /// One configured `[bed_mesh]` (`bed_mesh.py:BedMesh` + `BedMeshCalibrate`).
 pub struct BedMesh {
-    /// The options as read (shared with the command handlers).
-    options: Arc<Mutex<BedMeshOptions>>,
-    /// The last calibration's grid, if any (shared likewise).
-    mesh: Arc<Mutex<Option<LoadedMesh>>>,
+    /// The machine, to find `gcode_move` when a mesh is applied and the
+    /// toolhead at `klippy:connect`.
+    printer: Weak<Printer>,
+    /// The mesh, the fade and the splitter — everything the commands and the
+    /// move transform both touch.
+    state: Arc<Mutex<MeshState>>,
+    /// The move target below this transform — the toolhead, set at
+    /// `klippy:connect` (upstream's `handle_connect`), the fake a test injects
+    /// before that.
+    target: Mutex<Option<Arc<dyn MoveTarget>>>,
 }
 
 impl BedMesh {
@@ -1093,21 +1466,18 @@ impl BedMesh {
             .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
             .expect("the loader registers `gcode` first");
 
-        let mesh = Arc::new(Mutex::new(None));
-        let options = Arc::new(Mutex::new(options));
+        let state = Arc::new(Mutex::new(MeshState::new(options)));
         let printer_weak = Arc::downgrade(printer);
 
         // BED_MESH_CALIBRATE
         {
-            let options = Arc::clone(&options);
-            let mesh = Arc::clone(&mesh);
+            let state = Arc::clone(&state);
             let printer_weak = printer_weak.clone();
             gcode
                 .register_command_with_params(
                     "BED_MESH_CALIBRATE",
                     Arc::new(move |gcmd| {
-                        let options = Arc::clone(&options);
-                        let mesh = Arc::clone(&mesh);
+                        let state = Arc::clone(&state);
                         let printer_weak = printer_weak.clone();
                         Box::pin(async move {
                             let printer = printer_weak
@@ -1133,12 +1503,15 @@ impl BedMesh {
                                 ));
                             }
 
-                            *mesh.lock().unwrap_or_else(|p| p.into_inner()) = None;
+                            // Upstream clears any loaded mesh before probing
+                            // (`bed_mesh.py:648`).
+                            Self::apply_mesh(&state, &printer, None)?;
 
                             let (points, speed, move_z, algorithm) = {
-                                let options = options.lock().unwrap_or_else(|p| p.into_inner());
+                                let state = state.lock().unwrap_or_else(|p| p.into_inner());
+                                let options = &state.options;
                                 (
-                                    generate_points(&options)?,
+                                    generate_points(options)?,
                                     options.speed,
                                     options.horizontal_move_z,
                                     options.algorithm.clone(),
@@ -1167,27 +1540,27 @@ impl BedMesh {
                             probe.end_probe_session()?;
 
                             // Store the grid: grouped into rows by Y, each
-                            // row X-ascending (`bed_mesh.py:713-741`).
+                            // row X-ascending (`bed_mesh.py:713-741`), with a
+                            // round bed's short rows padded into the square
+                            // grid the mesh needs (`bed_mesh.py:749-771`).
                             let rows = rows_by_y(&points, &probed);
-                            let (rows, z_mesh) = {
-                                let options = options.lock().unwrap_or_else(|p| p.into_inner());
-                                // A round bed pads its short rows into the
-                                // square grid the mesh needs
-                                // (`bed_mesh.py:749-771`).
+                            let loaded = {
+                                let state = state.lock().unwrap_or_else(|p| p.into_inner());
+                                let options = &state.options;
                                 let rows = if options.mesh_radius.is_some() {
                                     pad_round_rows(rows, options.counts()[0] as usize)?
                                 } else {
                                     rows
                                 };
-                                let params = MeshParams::from_options(&options, &points);
+                                let params = MeshParams::from_options(options, &points);
                                 let z_mesh = ZMesh::build(&rows, &params);
-                                (rows, z_mesh)
+                                LoadedMesh {
+                                    name: DEFAULT_PROFILE.to_string(),
+                                    rows,
+                                    z_mesh,
+                                }
                             };
-                            *mesh.lock().unwrap_or_else(|p| p.into_inner()) = Some(LoadedMesh {
-                                name: DEFAULT_PROFILE.to_string(),
-                                rows,
-                                z_mesh,
-                            });
+                            Self::apply_mesh(&state, &printer, Some(loaded))?;
                             gcmd.respond_info(&format!(
                                 "Mesh Bed Leveling Complete ({algorithm} mesh stored, {} points)",
                                 points.len()
@@ -1204,14 +1577,22 @@ impl BedMesh {
 
         // BED_MESH_CLEAR
         {
-            let mesh = Arc::clone(&mesh);
+            let state = Arc::clone(&state);
+            let printer_weak = printer_weak.clone();
             gcode
                 .register_command(
                     "BED_MESH_CLEAR",
                     Arc::new(move |gcmd| {
-                        let mesh = Arc::clone(&mesh);
+                        let state = Arc::clone(&state);
+                        let printer_weak = printer_weak.clone();
                         Box::pin(async move {
-                            *mesh.lock().unwrap_or_else(|p| p.into_inner()) = None;
+                            let printer = printer_weak
+                                .upgrade()
+                                .ok_or_else(|| CommandError::new("Printer is not ready"))?;
+                            // `cmd_BED_MESH_CLEAR` is `set_mesh(None)`
+                            // (`bed_mesh.py:275-276`); the transform stays in
+                            // place and simply passes moves through.
+                            Self::apply_mesh(&state, &printer, None)?;
                             gcmd.respond_info("Bed mesh cleared");
                             Ok(())
                         })
@@ -1223,15 +1604,78 @@ impl BedMesh {
         }
 
         let _ = identifier;
-        Ok(Self { options, mesh })
+        Ok(Self {
+            printer: printer_weak,
+            state,
+            target: Mutex::new(None),
+        })
+    }
+
+    /// The state lock, poisoning treated as continued unwinding
+    /// (`gcode_move.rs` convention).
+    fn lock_state(&self) -> MutexGuard<'_, MeshState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    /// The transform chain below this one, copied out of its lock.
+    fn target(&self) -> Option<Arc<dyn MoveTarget>> {
+        self.target
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
+    }
+
+    /// The events upstream's `__init__` subscribes to (`bed_mesh.py:90-91`).
+    fn register_handlers(self: &Arc<Self>, printer: &Arc<Printer>) {
+        printer.register_event_handler(
+            KlippyEvent::KlippyConnect,
+            Box::new({
+                let object = Arc::clone(self);
+                move |_| object.handle_connect()
+            }),
+        );
+    }
+
+    /// Upstream's `handle_connect` (`bed_mesh.py:135-136`): the toolhead
+    /// exists by `klippy:connect`.
+    fn handle_connect(&self) {
+        let Some(printer) = self.printer.upgrade() else {
+            return;
+        };
+        if let Some(toolhead) = printer.lookup_object_as::<ToolHeadObject>(TOOLHEAD_OBJECT) {
+            *self.target.lock().unwrap_or_else(|p| p.into_inner()) =
+                Some(Arc::new(ToolheadMove(toolhead)));
+        }
+    }
+
+    /// Install (or clear) a mesh and re-anchor `gcode_move.last_position` —
+    /// upstream's `set_mesh`, whose last step is `reset_last_position`
+    /// (`bed_mesh.py:167-169`).
+    ///
+    /// # Errors
+    /// As [`MeshState::set_mesh`].
+    fn apply_mesh(
+        state: &Arc<Mutex<MeshState>>,
+        printer: &Arc<Printer>,
+        mesh: Option<LoadedMesh>,
+    ) -> Result<(), CommandError> {
+        state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .set_mesh(mesh)?;
+        // The g-code position was anchored to the old transform; re-read it so
+        // the next move starts where the toolhead is.
+        if let Some(gcode_move) = printer.lookup_object_as::<GCodeMove>(GCODE_MOVE_OBJECT) {
+            gcode_move.reset_last_position();
+        }
+        Ok(())
     }
 
     /// The options as read.
     pub fn options(&self) -> BedMeshOptions {
-        self.options
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone()
+        self.lock_state().options.clone()
     }
 
     /// The loaded mesh — the profile it answers as and its probed grid — or
@@ -1241,41 +1685,136 @@ impl BedMesh {
     /// This is what `bed_mesh/dump_mesh` and `get_status` both read, so the
     /// two cannot disagree about what is loaded.
     pub fn loaded_mesh(&self) -> Option<LoadedMesh> {
-        self.mesh.lock().unwrap_or_else(|p| p.into_inner()).clone()
+        self.lock_state().mesh.clone()
     }
 
     /// Put a grid in place without running a calibration — the tests' stand-in
     /// for a completed `BED_MESH_CALIBRATE`.
     ///
     /// It samples the interpolation grid the same way the command does, from
-    /// the points the configured section generates; `rows` must therefore be a
-    /// full `[y_count, x_count]` probed grid (which is what a calibration
-    /// stores).
+    /// the points the configured section generates, then installs it through
+    /// the same `set_mesh` path; `rows` must therefore be a full
+    /// `[y_count, x_count]` probed grid (which is what a calibration stores).
     #[cfg(test)]
     pub(crate) fn store_mesh_for_test(&self, name: &str, rows: Vec<Vec<f64>>) {
-        let options = self.options.lock().unwrap_or_else(|p| p.into_inner());
-        let points = generate_points(&options).expect("the test section probes a grid");
-        let params = MeshParams::from_options(&options, &points);
-        let z_mesh = ZMesh::build(&rows, &params);
-        drop(options);
-        *self.mesh.lock().unwrap_or_else(|p| p.into_inner()) = Some(LoadedMesh {
-            name: name.to_string(),
-            rows,
-            z_mesh,
-        });
+        let loaded = {
+            let state = self.lock_state();
+            let options = &state.options;
+            let points = generate_points(options).expect("the test section probes a grid");
+            let params = MeshParams::from_options(options, &points);
+            let z_mesh = ZMesh::build(&rows, &params);
+            LoadedMesh {
+                name: name.to_string(),
+                rows,
+                z_mesh,
+            }
+        };
+        let printer = self
+            .printer
+            .upgrade()
+            .expect("the test keeps the printer alive");
+        Self::apply_mesh(&self.state, &printer, Some(loaded))
+            .expect("the test section's fade options accept its grid");
+    }
+}
+
+impl MoveTarget for BedMesh {
+    /// Upstream's `move` (`bed_mesh.py:207-222`): with no mesh, or once the
+    /// fade has phased the adjustment out, the toolhead goes to the g-code
+    /// position plus the constant `fade_target`; otherwise [`MoveSplitter`]
+    /// walks the move and every slice carries its own Z adjustment.
+    fn move_to(&self, position: Coord, speed: f64) -> Result<(), CommandError> {
+        let Some(target) = self.target() else {
+            return Err(CommandError::new("Printer is not ready"));
+        };
+        let mut state = self.lock_state();
+        let factor = state.get_z_factor(position.z());
+        if state.mesh.is_none() || factor == 0.0 {
+            if state.log_fade_complete {
+                state.log_fade_complete = false;
+                info!(
+                    "bed_mesh fade complete: Current Z: {:.4} fade_target: {:.4}",
+                    position.z(),
+                    state.fade_target
+                );
+            }
+            let mut toolhead_position = position;
+            toolhead_position.set_axis(Z_AXIS, position.z() + state.fade_target);
+            state.last_position = position;
+            drop(state);
+            return target.move_to(toolhead_position, speed);
+        }
+        let prev_pos = state.last_position;
+        state.splitter.build_move(prev_pos, position, factor);
+        loop {
+            match state.splitter.split()? {
+                Some(split_move) => target.move_to(split_move, speed)?,
+                None => {
+                    return Err(CommandError::new("Mesh Leveling: Error splitting move "));
+                }
+            }
+            if state.splitter.traverse_complete {
+                break;
+            }
+        }
+        state.last_position = position;
+        Ok(())
+    }
+
+    /// Upstream's `get_position` (`bed_mesh.py:181-206`): the toolhead's
+    /// position with the mesh's adjustment **removed**, so the g-code space
+    /// reads the flat-bed Z. Also updates the cached last position, which
+    /// upstream does in the same call.
+    fn position(&self) -> Coord {
+        let Some(target) = self.target() else {
+            return Coord::default();
+        };
+        let toolhead_position = target.position();
+        let mut state = self.lock_state();
+        if state.mesh.is_none() {
+            let mut last = toolhead_position;
+            last.set_axis(Z_AXIS, toolhead_position.z() - state.fade_target);
+            state.last_position = last;
+            return last;
+        }
+        let (x, y, z) = (
+            toolhead_position.x(),
+            toolhead_position.y(),
+            toolhead_position.z(),
+        );
+        let max_adj = state.calc_z(x, y);
+        let z_adj = max_adj - state.fade_target;
+        let fade_z_pos = z + state.tool_offset;
+        let mut factor = 1.0;
+        if fade_z_pos.min(fade_z_pos - max_adj) >= state.fade_end {
+            // Fade out is complete, no factor.
+            factor = 0.0;
+        } else if fade_z_pos.max(fade_z_pos - max_adj) >= state.fade_start {
+            // Likely in the process of fading out the adjustment; the g-code Z
+            // is not known yet, so algebra recovers the factor from the
+            // toolhead's position (`bed_mesh.py:195-204`).
+            factor = (state.fade_end + state.fade_target - fade_z_pos) / (state.fade_dist - z_adj);
+            factor = constrain(factor, 0.0, 1.0);
+        }
+        let final_z_adj = factor * z_adj + state.fade_target;
+        let mut last = toolhead_position;
+        last.set_axis(Z_AXIS, z - final_z_adj);
+        state.last_position = last;
+        last
     }
 }
 
 impl PrinterObject for BedMesh {
     fn get_status(&self, _eventtime: f64) -> Value {
-        let options = self.options.lock().unwrap_or_else(|p| p.into_inner());
-        let loaded = self.loaded_mesh();
-        let profile_name = loaded
+        let state = self.lock_state();
+        let options = &state.options;
+        let profile_name = state
+            .mesh
             .as_ref()
             .map(|mesh| mesh.name.clone())
             .unwrap_or_default();
-        let (probed, mesh) = match loaded {
-            Some(mesh) => (mesh.rows, mesh.z_mesh.get_mesh_matrix()),
+        let (probed, mesh) = match &state.mesh {
+            Some(mesh) => (mesh.rows.clone(), mesh.z_mesh.get_mesh_matrix()),
             None => (Vec::new(), Vec::new()),
         };
         json!({
@@ -1292,10 +1831,7 @@ impl PrinterObject for BedMesh {
 impl std::fmt::Debug for BedMesh {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BedMesh")
-            .field(
-                "options",
-                &*self.options.lock().unwrap_or_else(|p| p.into_inner()),
-            )
+            .field("options", &self.lock_state().options)
             .finish()
     }
 }
@@ -1305,7 +1841,15 @@ pub fn load_config(
     config: &ConfigWrapper,
     printer: &Arc<Printer>,
 ) -> Result<Arc<dyn PrinterObject>, ConfigError> {
-    Ok(Arc::new(BedMesh::new(config, printer)?))
+    let bed_mesh = Arc::new(BedMesh::new(config, printer)?);
+    bed_mesh.register_handlers(printer);
+    // Upstream registers the transform at `__init__` (`bed_mesh.py:130-131`),
+    // so a `[bed_mesh]` config reaches for `gcode_move` whether or not it
+    // calibrates. `force` stays false, as upstream, so a second transform
+    // section is refused rather than silently overridden.
+    let gcode_move = gcode_move::ensure(printer)?;
+    gcode_move.set_move_transform(Arc::clone(&bed_mesh) as Arc<dyn MoveTarget>, false)?;
+    Ok(bed_mesh)
 }
 
 #[cfg(test)]
@@ -2101,5 +2645,451 @@ mod tests {
         assert!(mesh.mesh_matrix().iter().all(|row| row.len() == 13));
         // The mesh still holds the probed values at the probed points.
         assert_eq!(mesh.mesh_matrix()[6][6], rows[2][2]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Fade and the move transform
+    // -----------------------------------------------------------------------
+
+    /// The section every fade/move test starts from: a 0–100mm, 3×3, direct
+    /// mesh, so `calc_z` is the probed grid's bilinear lookup.
+    fn mesh_section(extra: &[(&'static str, &'static str)]) -> Vec<(&'static str, &'static str)> {
+        let mut written = vec![
+            ("mesh_min", "0,0"),
+            ("mesh_max", "100,100"),
+            ("probe_count", "3,3"),
+            ("mesh_pps", "0"),
+        ];
+        written.extend_from_slice(extra);
+        written
+    }
+
+    /// The state a freshly configured `[bed_mesh]` starts from.
+    fn mesh_state(written: &[(&str, &str)]) -> MeshState {
+        MeshState::new(options(written))
+    }
+
+    /// A loaded mesh from a probed grid, sampled the way
+    /// `store_mesh_for_test` does but without a printer.
+    fn loaded_mesh(written: &[(&str, &str)], rows: Vec<Vec<f64>>) -> LoadedMesh {
+        let options = options(written);
+        let points = generate_points(&options).unwrap();
+        let params = MeshParams::from_options(&options, &points);
+        let z_mesh = ZMesh::build(&rows, &params);
+        LoadedMesh {
+            name: "default".to_string(),
+            rows,
+            z_mesh,
+        }
+    }
+
+    /// A move target that records what it was asked and stands where the last
+    /// move left it — the toolhead, as far as the transform cares.
+    struct FakeTarget {
+        position: Mutex<Coord>,
+        moves: Mutex<Vec<(Coord, f64)>>,
+    }
+
+    impl FakeTarget {
+        fn new(position: Coord) -> Self {
+            Self {
+                position: Mutex::new(position),
+                moves: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn moves(&self) -> Vec<(Coord, f64)> {
+            self.moves.lock().unwrap_or_else(|p| p.into_inner()).clone()
+        }
+    }
+
+    impl MoveTarget for FakeTarget {
+        fn move_to(&self, position: Coord, speed: f64) -> Result<(), CommandError> {
+            *self.position.lock().unwrap_or_else(|p| p.into_inner()) = position;
+            self.moves
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push((position, speed));
+            Ok(())
+        }
+
+        fn position(&self) -> Coord {
+            *self.position.lock().unwrap_or_else(|p| p.into_inner())
+        }
+    }
+
+    /// `get_z_factor` (`bed_mesh.py:173-180`): the mesh adjusts in full at
+    /// `fade_start` and below, not at all at `fade_end` and above, and eases
+    /// off linearly in between — the fade runs with the height of the print.
+    #[test]
+    fn get_z_factor_fades_from_full_adjustment_to_none() {
+        let state = mesh_state(&mesh_section(&[("fade_start", "1"), ("fade_end", "10")]));
+        assert_eq!(
+            (state.fade_start, state.fade_end, state.fade_dist),
+            (1.0, 10.0, 9.0)
+        );
+
+        // At or below fade_start: (1.0, not 0.0).
+        assert_eq!(state.get_z_factor(0.0), 1.0);
+        assert_eq!(state.get_z_factor(1.0), 1.0);
+        // Linear in between: (fade_end - z) / fade_dist.
+        assert!((state.get_z_factor(5.5) - 0.5).abs() < 1e-12);
+        assert!((state.get_z_factor(2.5) - 7.5 / 9.0).abs() < 1e-12);
+        // At or above fade_end: 0.0.
+        assert_eq!(state.get_z_factor(10.0), 0.0);
+        assert_eq!(state.get_z_factor(100.0), 0.0);
+    }
+
+    /// A fade distance that is not positive disables fading: both bounds
+    /// collapse onto `FADE_DISABLE` (`bed_mesh.py:99-101`), which no Z reaches,
+    /// so the factor is 1 everywhere — including the `fade_start == fade_end`
+    /// case, whose distance is 0.
+    #[test]
+    fn fading_is_disabled_when_the_distance_is_not_positive() {
+        let default = mesh_state(&mesh_section(&[]));
+        assert_eq!(default.fade_start, FADE_DISABLE);
+        assert_eq!(default.fade_end, FADE_DISABLE);
+        assert_eq!(default.get_z_factor(0.0), 1.0);
+        assert_eq!(default.get_z_factor(1000.0), 1.0);
+
+        let equal = mesh_state(&mesh_section(&[("fade_start", "5"), ("fade_end", "5")]));
+        assert_eq!(equal.fade_start, FADE_DISABLE);
+        assert_eq!(equal.get_z_factor(0.0), 1.0);
+        assert_eq!(equal.get_z_factor(1e9), 1.0);
+    }
+
+    /// An explicit `fade_target` outside the mesh's Z range is refused with
+    /// upstream's wording (`bed_mesh.py:150-154`), leaving no mesh loaded.
+    #[test]
+    fn an_explicit_fade_target_outside_the_mesh_is_refused_verbatim() {
+        let written = mesh_section(&[
+            ("fade_start", "1"),
+            ("fade_end", "10"),
+            ("fade_target", "5"),
+        ]);
+        let mut state = mesh_state(&written);
+        let mesh = loaded_mesh(
+            &written,
+            vec![
+                vec![0.1, 0.2, 0.3],
+                vec![0.4, 0.5, 0.6],
+                vec![0.7, 0.8, 0.9],
+            ],
+        );
+
+        let err = state.set_mesh(Some(mesh)).unwrap_err();
+
+        // The mesh spans 0.1 … 0.9, so 5 is outside it.
+        assert_eq!(
+            err.to_string(),
+            "bed_mesh: ERROR, fade_target lies outside of mesh z range\n\
+             min: 0.1000, max: 0.9000, fade_target: 5.0000"
+        );
+        assert!(state.mesh.is_none(), "the refusal leaves no mesh loaded");
+        assert_eq!(state.fade_target, 0.0);
+    }
+
+    /// A mesh whose Z range reaches the fade distance is refused too, with
+    /// upstream's wording (`bed_mesh.py:156-159`).
+    #[test]
+    fn a_mesh_reaching_the_fade_distance_is_refused_verbatim() {
+        let written = mesh_section(&[("fade_start", "1"), ("fade_end", "2")]);
+        let mut state = mesh_state(&written);
+        let mesh = loaded_mesh(
+            &written,
+            vec![
+                vec![-1.0, 0.0, 1.0],
+                vec![0.0, 0.0, 0.0],
+                vec![1.0, 0.0, -1.0],
+            ],
+        );
+
+        let err = state.set_mesh(Some(mesh)).unwrap_err();
+
+        // `fade_dist` is 1.0 and the mesh spans ±1.0. Upstream's two adjacent
+        // literals join without a space after `in`, so the message reads
+        // `inexample-extras.cfg.`. Kept verbatim.
+        assert_eq!(
+            err.to_string(),
+            "bed_mesh:  Mesh extends outside of the fade range, please see the \
+             fade_start and fade_end options inexample-extras.cfg. fade distance: \
+             1.00 mesh min: -1.0000mesh max: 1.0000"
+        );
+        assert!(state.mesh.is_none());
+    }
+
+    /// An unset `fade_target` is the mesh's average Z rounded to hundredths —
+    /// `get_z_average` (`bed_mesh.py:1445-1454`).
+    #[test]
+    fn an_unset_fade_target_averages_the_mesh() {
+        let written = mesh_section(&[("fade_start", "1"), ("fade_end", "10")]);
+        let mut state = mesh_state(&written);
+        let mesh = loaded_mesh(
+            &written,
+            vec![
+                vec![0.1, 0.2, 0.3],
+                vec![0.4, 0.5, 0.6],
+                vec![0.7, 0.8, 0.9],
+            ],
+        );
+
+        state.set_mesh(Some(mesh)).unwrap();
+
+        // (0.1 + … + 0.9) / 9 = 0.5, already on a hundredth.
+        assert_eq!(state.fade_target, 0.5);
+        assert!(state.log_fade_complete, "a loaded mesh logs its fade once");
+    }
+
+    /// `_calc_z_offset` (`bed_mesh.py:1279-1283`): the mesh's Z at the point,
+    /// scaled linearly between `fade_offset` (factor 0) and the mesh's own Z
+    /// (factor 1).
+    #[test]
+    fn calc_z_offset_scales_the_mesh_z_about_the_fade_offset() {
+        let written = mesh_section(&[]);
+        // z = x / 10 over the mesh, so `calc_z(40, 50)` is 4.0.
+        let mesh = loaded_mesh(
+            &written,
+            vec![
+                vec![0.0, 5.0, 10.0],
+                vec![0.0, 5.0, 10.0],
+                vec![0.0, 5.0, 10.0],
+            ],
+        );
+        let mut splitter = MoveSplitter::new(0.025, 5.0);
+        splitter.initialize(Some(mesh.z_mesh), 2.0);
+        let pos = Coord::new(40.0, 50.0, 0.0, 0.0);
+
+        splitter.z_factor = 0.0;
+        assert_eq!(splitter.calc_z_offset(pos), 2.0, "factor 0 is fade_offset");
+        splitter.z_factor = 1.0;
+        assert_eq!(splitter.calc_z_offset(pos), 4.0, "factor 1 is the mesh Z");
+        splitter.z_factor = 0.5;
+        assert!(
+            (splitter.calc_z_offset(pos) - 3.0).abs() < 1e-12,
+            "0.5 * (4.0 - 2.0) + 2.0 = 3.0"
+        );
+    }
+
+    /// The slices one straight `+X` move is cut into, with a mesh whose Z
+    /// rises 1:1 with X.
+    fn slice_positions(split_delta_z: f64, move_check_distance: f64) -> Vec<Coord> {
+        let written = [
+            ("mesh_min", "0,0"),
+            ("mesh_max", "1000,1000"),
+            ("probe_count", "3,3"),
+            ("mesh_pps", "0"),
+        ];
+        let mesh = loaded_mesh(
+            &written,
+            vec![
+                vec![0.0, 500.0, 1000.0],
+                vec![0.0, 500.0, 1000.0],
+                vec![0.0, 500.0, 1000.0],
+            ],
+        );
+        let mut splitter = MoveSplitter::new(split_delta_z, move_check_distance);
+        splitter.initialize(Some(mesh.z_mesh), 0.0);
+        splitter.build_move(
+            Coord::new(0.0, 0.0, 0.0, 0.0),
+            Coord::new(100.0, 0.0, 0.0, 0.0),
+            1.0,
+        );
+        let mut slices = Vec::new();
+        loop {
+            let slice = splitter
+                .split()
+                .unwrap()
+                .expect("the traversal is not complete until it says so");
+            slices.push(slice);
+            if splitter.traverse_complete {
+                break;
+            }
+        }
+        slices
+    }
+
+    /// `MoveSplitter.split` (`bed_mesh.py:1293-1319`): a move is re-sampled
+    /// every `move_check_distance`, and each sample whose Z offset has moved at
+    /// least `split_delta_z` from the last slice's becomes a slice of its own,
+    /// plus the final move.
+    ///
+    /// The mesh's slope is 1, so a sample advances Z by exactly
+    /// `move_check_distance`. With `split_delta_z` under that step every sample
+    /// splits and the count is `ceil(length / move_check_distance)` — 100mm at
+    /// 3mm is 34 (33 samples at 3…99 plus the final move), at 10mm is 10 (9
+    /// samples plus the final move). Raising `split_delta_z` above the 3mm step
+    /// lets every second sample through, halving the slices to 17.
+    #[test]
+    fn the_splitter_re_samples_every_move_check_distance() {
+        let at_3mm = slice_positions(2.5, 3.0);
+        assert_eq!(at_3mm.len(), 34);
+        // Each sample sits `move_check_distance` along and carries Z = x.
+        for (index, slice) in at_3mm[..33].iter().enumerate() {
+            let x = (index + 1) as f64 * 3.0;
+            assert!(
+                (slice.x() - x).abs() < 1e-9
+                    && slice.y() == 0.0
+                    && (slice.z() - x).abs() < 1e-9
+                    && slice.e() == 0.0,
+                "sample {index} was {slice:?}, expected ({x}, 0, {x}, 0)"
+            );
+        }
+        let last = at_3mm.last().unwrap();
+        assert!(
+            (last.x() - 100.0).abs() < 1e-9 && (last.z() - 100.0).abs() < 1e-9,
+            "the final move is {last:?}"
+        );
+
+        // A coarser check spacing re-samples less often.
+        assert_eq!(slice_positions(2.5, 10.0).len(), 10);
+        // A coarser split threshold splits every second sample instead.
+        assert_eq!(slice_positions(5.0, 3.0).len(), 17);
+    }
+
+    /// A mesh flat across the move never splits before the end, so the whole
+    /// move comes back as one slice (`bed_mesh.py:1301-1318`).
+    #[test]
+    fn a_flat_mesh_never_splits_a_move() {
+        let written = mesh_section(&[]);
+        let mesh = loaded_mesh(&written, vec![vec![0.5; 3]; 3]);
+        let mut splitter = MoveSplitter::new(0.025, 3.0);
+        splitter.initialize(Some(mesh.z_mesh), 0.0);
+        splitter.build_move(Coord::default(), Coord::new(100.0, 0.0, 0.0, 0.0), 1.0);
+
+        let slice = splitter.split().unwrap().expect("the final move");
+        assert!(splitter.traverse_complete);
+        assert_eq!(slice, Coord::new(100.0, 0.0, 0.5, 0.0));
+        assert!(splitter.split().unwrap().is_none(), "nothing is left");
+    }
+
+    /// A move with no X or Y is never sampled: the gate skips the loop, so the
+    /// whole Z move comes back as the single final slice.
+    #[test]
+    fn a_move_without_x_or_y_is_one_slice() {
+        let written = mesh_section(&[]);
+        let mesh = loaded_mesh(
+            &written,
+            vec![
+                vec![0.0, 0.5, 1.0],
+                vec![0.0, 0.5, 1.0],
+                vec![0.0, 0.5, 1.0],
+            ],
+        );
+        let mut splitter = MoveSplitter::new(0.025, 3.0);
+        splitter.initialize(Some(mesh.z_mesh), 0.0);
+        splitter.build_move(
+            Coord::new(50.0, 0.0, 0.0, 0.0),
+            Coord::new(50.0, 0.0, 10.0, 0.0),
+            1.0,
+        );
+
+        assert_eq!(splitter.total_move_length, 10.0);
+        let slice = splitter.split().unwrap().expect("the final move");
+        assert!(splitter.traverse_complete);
+        // `calc_z(50, 0)` is 0.5, added to the move's end Z.
+        assert_eq!(slice, Coord::new(50.0, 0.0, 10.5, 0.0));
+    }
+
+    /// `load_config` claims `gcode_move`'s move-transform slot at load
+    /// (`bed_mesh.py:130-131`), so a later non-forced registration — the one
+    /// another transform section would use — is refused.
+    #[test]
+    fn load_takes_the_move_transform_slot() {
+        use crate::core::klippy::reactor::ManualReactor;
+
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        printer
+            .add_object(
+                GCODE_OBJECT,
+                Arc::new(GCodeDispatch::new(Arc::clone(&printer))),
+            )
+            .unwrap();
+        let bed = load_config(
+            &ConfigWrapper::untracked(&section(&[("mesh_min", "0,0"), ("mesh_max", "100,100")])),
+            &printer,
+        )
+        .unwrap();
+        printer.add_object(BED_MESH_OBJECT, bed).unwrap();
+
+        let gcode_move = printer
+            .lookup_object_as::<GCodeMove>(GCODE_MOVE_OBJECT)
+            .expect("bed_mesh reaches for gcode_move");
+        let fake = Arc::new(FakeTarget::new(Coord::default()));
+        assert!(
+            gcode_move
+                .set_move_transform(Arc::clone(&fake) as Arc<dyn MoveTarget>, false)
+                .is_err(),
+            "the slot is already taken"
+        );
+    }
+
+    /// A dispatched `G1` walks through the registered transform: the mesh
+    /// raises the toolhead's Z, and `BED_MESH_CLEAR` — which leaves the
+    /// transform in place (`bed_mesh.py:275-276`) — lets moves pass through
+    /// again.
+    #[test]
+    fn a_g1_after_a_calibration_goes_through_the_mesh_transform() {
+        use crate::core::klippy::reactor::ManualReactor;
+
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        printer
+            .add_object(
+                GCODE_OBJECT,
+                Arc::new(GCodeDispatch::new(Arc::clone(&printer))),
+            )
+            .unwrap();
+        let bed = load_config(
+            &ConfigWrapper::untracked(&section(&mesh_section(&[]))),
+            &printer,
+        )
+        .unwrap();
+        printer.add_object(BED_MESH_OBJECT, bed).unwrap();
+        let bed = printer
+            .lookup_object_as::<BedMesh>(BED_MESH_OBJECT)
+            .unwrap();
+        // The toolhead below the transform, standing at the origin.
+        let fake = Arc::new(FakeTarget::new(Coord::default()));
+        *bed.target.lock().unwrap_or_else(|p| p.into_inner()) =
+            Some(Arc::clone(&fake) as Arc<dyn MoveTarget>);
+        printer.send_event(&KlippyEvent::KlippyReady);
+
+        // z = x / 100 over the mesh, so a move to x = 50 is raised by 0.5.
+        bed.store_mesh_for_test(
+            "default",
+            vec![
+                vec![0.0, 0.5, 1.0],
+                vec![0.0, 0.5, 1.0],
+                vec![0.0, 0.5, 1.0],
+            ],
+        );
+        let gcode = printer
+            .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+            .unwrap();
+        gcode.run_script_sync("G1 X50 F600").unwrap();
+
+        // 50mm at the default `move_check_distance: 5.` is 9 samples plus the
+        // final move, each carrying its own Z.
+        let moves = fake.moves();
+        assert_eq!(moves.len(), 10, "the move is split into ten slices");
+        let last = moves.last().unwrap();
+        assert!((last.0.x() - 50.0).abs() < 1e-9, "got {last:?}");
+        assert!(
+            (last.0.z() - 0.5).abs() < 1e-9,
+            "the mesh raised Z to {}",
+            last.0.z()
+        );
+        // The reverse mapping (`get_position`) removes the adjustment, so the
+        // g-code space still reads the flat-bed Z the move asked for.
+        assert_eq!(bed.position(), Coord::new(50.0, 0.0, 0.0, 0.0));
+
+        // Clearing the mesh stops the adjustment: a g-code Z reaches the
+        // toolhead unchanged.
+        gcode.run_script_sync("BED_MESH_CLEAR").unwrap();
+        gcode.run_script_sync("G1 X80 Z1 F600").unwrap();
+        let last = fake.moves().last().cloned().unwrap();
+        assert!(
+            (last.0.z() - 1.0).abs() < 1e-9,
+            "cleared bed mesh still adjusted Z: {last:?}"
+        );
     }
 }

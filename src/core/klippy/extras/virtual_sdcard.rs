@@ -23,7 +23,9 @@
 //!   revisited when `gcode` exposes a mutex/test API.
 //! - **`_handle_analyze_shutdown` / `_handle_debuginput_exit`** — upstream
 //!   registers these to log file-tail on shutdown and to wait for replay to
-//!   finish on debuginput exit (`virtual_sdcard.py:53-74`). Not wired here.
+//!   finish on `debuginput` (file input) exit (`virtual_sdcard.py:53-74`).
+//!   This port does not implement that input mode, so there are no such
+//!   handlers (see `docs/klippy/developer-manual/upstream-deviations.md`).
 //! - **`stats(eventtime)`** — upstream returns `(True, "sd_pos=%d")` while the
 //!   timer runs (`virtual_sdcard.py:75-78`). `PrinterObject` has no `stats`
 //!   method, so this is omitted; `stats` is a reactor scheduling hint, not

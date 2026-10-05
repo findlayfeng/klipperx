@@ -502,12 +502,12 @@ SPI_TRANSFER DEVICE=flash DATA=9f000000    ; W25 flash JEDEC ID → ef 30 13
 | `pressure_advance_smooth_time` | 浮点 (s) | 否 | `0.040` | PA 平滑时间，`≤ 0.200` |
 | `step_pin` / `dir_pin` / `rotation_distance` / `microsteps` … | 同 `[stepper_*]` | 否 | — | **写了任一个**才建 E 轴 stepper（上游同规则）；不写则纯加热 |
 
-命令：`M104` / `M109`（当前不等温）/ `SET_PRESSURE_ADVANCE`（mux `EXTRUDER`）/
+命令：`M104` / `M109`（等待到目标温度）/ `SET_PRESSURE_ADVANCE`（mux `EXTRUDER`）/
 `ACTIVATE_EXTRUDER`。只有名字是 `extruder` 的主挤出机额外注册 `EXTRUDER` 默认项。
 
 ### `[heater_bed]` — 热床
 
-选项 = 加热器共用选项（`gcode_id` 内定为 `B`），注册 `M140` / `M190`（当前不等温）。
+选项 = 加热器共用选项（`gcode_id` 内定为 `B`），注册 `M140` / `M190`（等待到目标温度）。
 
 ```ini
 [heater_bed]
@@ -834,10 +834,10 @@ pins: !PD0, PD1, PD2
 |------|------|------|
 | `gcode` | 必填 | 宏体 |
 | `description` | `G-Code macro` | 命令 help 文本 |
-| `rename_existing` | — | 被改名的命令（仅 load 期同型检查，连接期换名未做） |
+| `rename_existing` | — | 被改名的命令：装载期只做同型检查，**连接期把该命令的旧处理器位移到这个名下、本宏接管原名**（2026-10-06）；目标名须未被占用，已占用时报 `gcode command … already registered`（与上游 `gcode.py:142-144` 同款） |
 | `variable_<名>` | — | 字面量，`get_status` 可见（只读） |
 
-宏即命令（大写注册）；**宏体已渲染执行**（渲染引擎是 `extras/template.rs` 的 **minijinja 2.24 适配层**：单花括号定界符 `{`/`{%`/`{#}`、缺键即报错、装载期编译，渲染后经 gcode 派发）；`SET_GCODE_VARIABLE` 已注册（变量可写）；裸 `[gcode_macro]` 为共享模板持有者（零选项）。`{% set %}` 作用域对齐 Jinja2 3.1.6（顶层/`if` 块外泄、`for` 块不外泄）；`namespace()`、关键字实参、`{% block %}`、`|float(默认)` 等 Jinja2 构型均可解析（`template.rs` 的三个步进宏字面用例即实测：`namespace(phase=0)`、`{% set count.phase %}`、if/elif 链、for+range、`G4 P` 值与 DIR 正反转）。仍缺的在缝上：`rename_existing` 连接期换名与读 `printer.objects`。与 Jinja2 的已知差异（`%`/`//` 为欧几里得取余、Strict 下缺键在打印/迭代/判真时报错、部分错误 detail 措辞）见 `extras/template.rs` 模块文档。
+宏即命令（大写注册）；**宏体已渲染执行**（渲染引擎是 `extras/template.rs` 的 **minijinja 2.24 适配层**：单花括号定界符 `{`/`{%`/`{#}`、缺键即报错、装载期编译，渲染后经 gcode 派发）；`SET_GCODE_VARIABLE` 已注册（变量可写）；裸 `[gcode_macro]` 为共享模板持有者（零选项）。`{% set %}` 作用域对齐 Jinja2 3.1.6（顶层/`if` 块外泄、`for` 块不外泄）；`namespace()`、关键字实参、`{% block %}`、`|float(默认)` 等 Jinja2 构型均可解析（`template.rs` 的三个步进宏字面用例即实测：`namespace(phase=0)`、`{% set count.phase %}`、if/elif 链、for+range、`G4 P` 值与 DIR 正反转）。仍缺的在缝上：读 `printer.objects` 的反射式枚举（`PrinterView` 目前不能被 `enumerate`）。与 Jinja2 的已知差异（`%`/`//` 为欧几里得取余、Strict 下缺键在打印/迭代/判真时报错、部分错误 detail 措辞）见 `extras/template.rs` 模块文档。
 
 ### [led <name>] / [neopixel <name>] / [dotstar <name>] / [pca9533 <name>] / [pca9632 <name>] / [display_template <name>]
 
@@ -1169,7 +1169,11 @@ gap（如实登记）：**屏幕内容不渲染**（`display_template`/`display_
 | `run_current` / `sense_resistor` / `stealthchop_threshold` | — / 0.110 / — | 电流与静音阈值 |
 | `interpolate` / `driver_SGTHRS` / `diag_pin` | True / — / — | 仅 tmc2209 |
 
-命令：`INIT_TMC` / `DUMP_TMC` / `SET_TMC_FIELD` / `SET_TMC_CURRENT`（mux 键 `STEPPER`）；`tmc2209_<stepper>:virtual_endstop` 可用作端停。gap：fileoutput 下总线读短路为 0；`tmc2130`/`tmc2660`/`tmc5160`/`tmc2240` 与 SPI 传输未实现。
+命令：`INIT_TMC` / `DUMP_TMC` / `SET_TMC_FIELD` / `SET_TMC_CURRENT`（mux 键 `STEPPER`）；`tmc2209_<stepper>:virtual_endstop` 可用作端停。gap：fileoutput 下总线读短路为 0。
+
+**SPI 族（`[tmc2130]` / `[tmc2240]` / `[tmc2660]` / `[tmc5160]`）也已落地**（2026-10-06 复核：四个
+`section!` 均在工厂表，命令与 UART 族同）；本页尚未为它们补逐项选项表——选项集与上游同名节一致，
+逐项说明见[模块表](../developer-manual/README.md)与上游 `config/` 参考。
 
 ### `[save_variables]` — 变量持久化（2026-10-04）
 

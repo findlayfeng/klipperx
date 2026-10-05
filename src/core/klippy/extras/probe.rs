@@ -2,24 +2,23 @@
 //!
 //! Upstream `klippy/extras/probe.py`. This module lands the `[probe]` section,
 //! its option set, the `probe` virtual pin chip, the probe session (sampling
-//! with tolerance retries) and `QUERY_PROBE` / `PROBE` / `PROBE_ACCURACY`.
+//! with tolerance retries) and `QUERY_PROBE` / `PROBE` / `PROBE_ACCURACY` /
+//! `PROBE_CALIBRATE` (the last one hands over to `manual_probe` and writes
+//! `z_offset` back through `configfile.set()`).
 //!
 //! What is **not** here yet (tracked in `TODO.md` H9):
 //!
-//! - the endstop *wrapper*'s overrides — `z_offset` folded into the reported
-//!   trigger position (`get_position_endstop`) and `query_endstop` /
-//!   `multi_probe_begin/end` / `probe_prepare` / `probe_finish`. The pin layer's
-//!   `PinChip::setup_endstop` returns a concrete `Arc<McuEndstop>`, so a virtual
-//!   chip cannot hand back a wrapper type yet; the trait has to become an
-//!   interface first. Until then the chip returns the physical endstop, which is
-//!   what makes `endstop_pin: probe:z_virtual_endstop` resolvable, and the rail's
-//!   `position_endstop` keeps coming from the config (upstream takes it from the
-//!   endstop, `z_offset`).
-//! - `PROBE_CALIBRATE` and `Z_OFFSET_APPLY_PROBE`: they need `manual_probe` and
-//!   `configfile.set()` (SAVE_CONFIG write-back), both later units.
-//! - `activate_gcode` / `deactivate_gcode` templates: they need the
-//!   `[gcode_macro]` template machinery, which this port does not have (H3).
-//!   The options are read and recorded; a section that sets them warns.
+//! - `Z_OFFSET_APPLY_PROBE` (the same command exists for `probe_eddy_current`,
+//!   `probe_eddy_current.rs`), and the *stow* half of upstream's wrapper:
+//!   `ProbeEndstopWrapper` drives `activate_gcode` / `deactivate_gcode` around
+//!   each sample and keeps the `OFF`/`FIRST`/`ON` multi-probe state
+//!   (`probe.py:545-605`). Here those two options are read and recorded but not
+//!   rendered, and there is no multi-probe state; a section that sets them warns
+//!   (`probe.rs:665`).
+//! - The **position** half of that wrapper is done: the pin chip's
+//!   `virtual_endstop_position` returns `z_offset` and the rail takes
+//!   `position_endstop` from it (upstream's `get_position_endstop`,
+//!   `probe.py:235`) — `probe.rs:306`, `extras/stepper.rs:374-406`.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};

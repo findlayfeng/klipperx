@@ -261,12 +261,12 @@ identify 的命令**定义**（名称、参数、解码）与其它命令一样�
 | 项 | 职责 |
 |------|------|
 | `GCodeDispatch` | printer object `gcode`：`register_command` / `register_mux_command`（`SET_PIN PIN=…` 这类按一个参数选处理器）、`run_script` / `run_script_from_command`（处理器内部入口，宏类模块用）、`create_gcode_command`（合成命令）、`command_exists`（查命令名是否注册，供 `gcode_macro` 装载期检查用）、输出处理器、`get_status` 报命令表（所以它是**可查询**对象）；`command_of_line` 是公开 helper，复用解析逻辑返回一行的命令名，供外部消费者（`gcode_macro`）只取名字 |
-| `GcodeCommand` | 交给处理器的已解析命令：通用 `get`（parser + `minval`/`maxval`/`above`/`below`）与 `get_str` / `get_int` / `get_int_bounded` / `get_float` / `get_float_bounded` / `get_float_range`（缺参 / 解析失败 / 超范围都报上游文案的 `CommandError`），`get_command_parameters` / `get_raw_command_parameters`，以及 `respond_info` / `respond_raw` / `ack` |
+| `GcodeCommand` | 交给处理器的已解析命令：通用 `get`（parser + `minval`/`maxval`/`above`/`below`）与 `get_str` / `get_int` / `get_int_bounded` / `get_float` / `get_float_bounded` / `get_float_range`（缺参 / 解析失败 / 超范围都报上游文案的 `CommandError`），`get_command_parameters` / `get_raw_command_parameters`，以及 `respond_info` / `respond_raw` |
 | 传统 / 扩展命令 | 传统（`M110`、`G1`）参数是 `S200` 这种“字母+值”；扩展（`SET_PIN`）是 `KEY=VALUE`，带 shell 引号——后者在分派时重解析（上游 `_get_extended_params`） |
 
-它在 `load_config` 里**最先**注册（在 `pins` 之前），因为资源与 `[board_pins]` 建对象时要往它注册命令；按上游，它是 `Printer.__init__` 的早对象。**运动命令不在这里**：`G0`/`G1`/`G20`/`G21`/`G90`/`G91`/`G92`/`M82`/`M83`/`M114`/`M220`/`M221`/`SET_GCODE_OFFSET`/`SAVE_GCODE_STATE`/`RESTORE_GCODE_STATE` 由 `gcode_move` 注册（坐标系那一层读它们，再把工具头坐标交给 toolhead），`G4`/`M400`/`G28`/`SET_KINEMATIC_POSITION` 由 toolhead 注册，温度类（`M104`/`M109`/`M140`/`M190`/`SET_HEATER_TEMPERATURE` 等）由各 extras 注册（见 [G-Code 命令参考](../user-manual/gcode-commands.md)）。`ok` 应答协议（`need_ack` / `ack`：处理器自 ack 后不再重复，错误在 `need_ack=true` 时报告并 ack 而不中止脚本）与 `gcode:command_error` 事件（处理器报 `CommandError` 时触发；panic 走停机、不发）已就位，但本主机还没有 `need_ack=true` 的生产者：文件 / 伪 tty 输入（`GCodeIO`）已定为**暂缓 `[~]`**，不做 OctoPrint 串口仿真。
+它在 `load_config` 里**最先**注册（在 `pins` 之前），因为资源与 `[board_pins]` 建对象时要往它注册命令；按上游，它是 `Printer.__init__` 的早对象。**运动命令不在这里**：`G0`/`G1`/`G20`/`G21`/`G90`/`G91`/`G92`/`M82`/`M83`/`M114`/`M220`/`M221`/`SET_GCODE_OFFSET`/`SAVE_GCODE_STATE`/`RESTORE_GCODE_STATE` 由 `gcode_move` 注册（坐标系那一层读它们，再把工具头坐标交给 toolhead），`G4`/`M400`/`G28`/`SET_KINEMATIC_POSITION` 由 toolhead 注册，温度类（`M104`/`M109`/`M140`/`M190`/`SET_HEATER_TEMPERATURE` 等）由各 extras 注册（见 [G-Code 命令参考](../user-manual/gcode-commands.md)）。`gcode:command_error` 事件（处理器报 `CommandError` 时触发；panic 走停机、不发）已就位；命令错误一律**报告 + 中止整段脚本**并把错误交回调用方 —— 上游 `GCodeIO` 的行协议（`ok` 应答 / `need_ack`）本仓不实现，相关机制已从 `gcode.rs` 删除。见[本项目与上游的偏移](upstream-deviations.md)。
 
-一处**有意偏离**：mux 命令的“值不合法”提示里，上游按 dict 迭代序取最后一个匹配做 `Did you mean`，这里对候选排序后取第一个（消息要稳定）。默认项（注册 `value=None`）与上游一致：不给 key 时命中。
+一处**有意偏离**：mux 命令的“值不合法”提示里，上游按 dict 迭代序取最后一个匹配做 `Did you mean`，这里对候选排序后取第一个（消息要稳定）。默认项（注册 `value=None`）与上游一致：不给 key 时命中。（本页其它与上游不一致处统一登记在[本项目与上游的偏移](upstream-deviations.md)。）
 
 #### 越界报错里限制值的写法（与上游不同，有意保留）
 
@@ -508,6 +508,7 @@ NaN 也归一），与上游写出的文件逐字一致，见用户手册 [配�
 - [测试](testing.md) — 测试覆盖与运行方式
 - [klippy 运行机制](klippy-runtime.md) — 对象图、状态机、reactor 回调模型、事件与数据流
 - [回归测试（`.test` 与数据字典）](regression-tests.md) — 上游主机回归测试的「文件输出 + 数据字典」模式、语料结构与复用分层
+- [本项目与上游的偏移](upstream-deviations.md) — 集中登记本仓与上游不一致之处（不做/不替代、行为偏移、暂缓项、计数清单）
 
 ---
 

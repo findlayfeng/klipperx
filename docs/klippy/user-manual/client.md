@@ -37,8 +37,25 @@ $ klipperx ~/printer.cfg -a tcp:127.0.0.1:7125            # TCP，供别的机�
 不想要 API 就给空值（`-a ''`）：API 没有认证，一个不需要它的主机不该被迫监听。
 
 > 从上游 Klipper 过来的话：`-I/--input-tty`（把 G-Code 输入挂在一个 pty 上，
-> 上游默认 `/tmp/printer`）以及 `-l`（日志文件）、`-i`/`-o`（调试输入输出）都还
-> 没有实现，所以这里也没有这些选项 —— 与其留一个什么都不做的开关，不如没有。
+> 上游默认 `/tmp/printer`）以及 `-l`（日志文件）、`-i`/`-o`（调试输入输出）本仓都
+> **不实现**，所以这里也没有这些选项 —— 与其留一个什么都不做的开关，不如没有。
+> 这些开关各自撑起什么场景、为什么本仓不替代上游，见下节。
+
+### 上游的输入通道（本仓不实现，需要时用上游 Klipper）
+
+上游主机除了本文这些通道，还有一条 **G-Code 行协议输入**（`klippy/gcode.py` 的 `GCodeIO`），
+本仓**不做**。它有两种用法，各对应一类真实场景：
+
+| 上游用法 | 干什么用 | 本仓为什么不能替代 |
+|---|---|---|
+| `-I/--input-tty`（默认 `/tmp/printer`，现代安装是 `~/printer_data/comms/klippy.serial`） | 把 G-Code 输入挂在一个**伪 tty** 上跑 Marlin 式行协议（每条命令回 `ok`、错误回 `!! ` 且不中断），**OctoPrint 这类串口主机软件**就靠它接 Klipper | 本仓没有 pty：输入只有 `-a` 的 API（Moonraker 语义）与终端客户端，OctoPrint 无法直接连。要接 OctoPrint / 其他串口主机，请用上游 Klipper |
+| `-i/--debuginput <file>`（配 `-o/--debugoutput` 与 `-d <dict>`） | 官方 **batch mode**：离线把 gcode 翻成 MCU 命令流，用于检视低层行为、对比改动前后的命令流、跑 host 性能基准、配 `simulavr` 联调（上游 [Debugging.md](https://www.klipper3d.org/Debugging.html)、[Benchmarks.md](https://www.klipper3d.org/Benchmarks.html)） | 本仓没有 `-i`/`-o`。想离线跑 gcode 只能用 API 的 `gcode/script` 或 `virtual_sdcard`（打印 gcodes 目录里的文件），它们**不产出** MCU 命令流文件 |
+
+注意：上游 Moonraker 的 `[octoprint_compat]` 只是给**切片软件**上传 gcode 用的 OctoPrint API
+子集，**不是** OctoPrint 接入 Klipper 的途径 —— OctoPrint 只走上面那条 pty。
+
+本仓不实现行协议输入，连带没有：`ok` 应答行、`gcode:debuginput_exit` 事件、`stats`/`gcodein`
+计数。逐条登记见开发手册的[本项目与上游的偏移](../developer-manual/upstream-deviations.md)。
 
 ### 顺便开个窗口
 

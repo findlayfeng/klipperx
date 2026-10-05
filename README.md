@@ -51,7 +51,7 @@ AI 写实现」：人类负责方向与取舍、任务拆解、验收判定、�
 | 单进程闸门 | `cargo test -p klipperx --lib` → **2572 通过 / 0 失败 / 4 忽略**（含全部语料；4 忽略 = `pru` 字典未构建×2、内联 gcode 解析、真机用例；忽略列表守卫是 `KLIPPERX_UPSTREAM_GUARD`，见[环境变量](#环境变量开发与测试)；计数 2026-10-04 实测重核） |
 | 真机 | 只有少量冒烟（单轴运动与位置读回、SPI flash、`stats`、`output_pin`、`mcu_temp`）；完整三轴/归零待接线，见 [`TESTING.md`](TESTING.md) |
 | `[extras]` 覆盖 | `src/core/klippy/extras/` 104 个模块、117 个 `section!` 声明（装载 id 同数，由 `test_the_factory_table_is_in_load_order` 钉住；2026-10-03 实测重核）；覆盖范围与逐模块说明见[开发手册模块表](docs/klippy/developer-manual/README.md) |
-| 输入通道 | API（`-a` unix socket，Moonraker 语义）与终端客户端**可用**；`virtual_sdcard` 的文件回放（`M20`–`M27`）**已实现**，`GCodeIO`（伪 tty）**暂缓** |
+| 输入通道 | API（`-a` unix socket，Moonraker 语义）与终端客户端**可用**；`virtual_sdcard` 的文件回放（`M20`–`M27`）**已实现**；上游 `GCodeIO` 的行协议输入（伪 tty / 文件输入、`ok` 应答）**不做**（需要 OctoPrint 串口主机或上游 batch mode 时请用上游 Klipper，见[本项目与上游的偏移](docs/klippy/developer-manual/upstream-deviations.md)） |
 
 ### 能做什么
 

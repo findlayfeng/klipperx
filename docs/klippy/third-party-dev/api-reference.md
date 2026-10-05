@@ -401,7 +401,7 @@
 
 ### 12. `gcode/subscribe_output` — 订阅 G-Code 输出
 
-订阅 G-Code 命令的输出（包括 `ok` 响应、信息输出和错误信息）。
+订阅 G-Code 命令的输出（信息行 `// …` 与错误行 `!! …`）。本仓不实现上游行协议的 `ok` 应答（见[本项目与上游的偏移](../developer-manual/upstream-deviations.md)）。
 
 **请求：**
 ```json
@@ -550,7 +550,7 @@
 | `profiles` | object | 所有已保存的 profile |
 | `calibration` | object | 仅在传入 `mesh_args` 时存在 |
 
-> **与上游的已知差异（2026-10-03 落地时）**：
+> **与上游的已知差异（2026-10-03 落地时）**（本页已知差异统一登记在[本项目与上游的偏移](../developer-manual/upstream-deviations.md)）：
 > ① `calibration` 本机仅在传 `mesh_args` 时返回，上游无条件返回（`bed_mesh.py:303-309`）；
 > 且本机缺 `probe_path`/`rapid_path`（探针调度路径未实现），上游另返回的 `probe_offsets` /
 > `axis_minimum` / `axis_maximum`（`bed_mesh.py:308-310`）本机未返回。
@@ -940,7 +940,7 @@
 ```
 1. 发送 {"id": "4", "method": "gcode/script", "params": {"script": "M105"}}
 2. 通过 gcode/subscribe_output 接收原始输出（M105 返回形如 "T:200.5 /200.0"，
-   经 gcode/script 执行时不会带 "ok " 前缀）
+   本仓不实现行协议的 `ok` 应答，输出里不会有 `ok` 行）
 3. 或通过 objects/query 查询 extruder 温度
 ```
 

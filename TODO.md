@@ -48,8 +48,10 @@
 
 依赖列的是**工具性前置**，不是自然顺序。下表是索引，逐条细节在后面的小节里；
 框架队列（FW1–FW9）已完成，索引见文末「已完成（留档）」；本表不再区分级别。
-H1–H12 是上游 extras 里按域归并的消费者（2026-09-21 全量盘点的结果；其中若干已落地，
-逐条见各节；覆盖审计已完结清理）。
+H1–H12 是上游 extras 里按域归并的消费者（2026-09-21 全量盘点的结果）。
+**2026-10-06 复核**：本表与各节已按源码实测重新对账——2026-10-02~05 的大批落地此前未回写
+（TMC 六型、传感器族、断料传感器、面板驱动、`delayed_gcode` 等），现已改为现状。核对口径是
+「`section!` 声明 + `load.rs` 工厂表 + 命令/事件注册点」，条目里凡写「已落地」均指这三处实测命中。
 
 **核心与架构**
 
@@ -65,7 +67,7 @@ H1–H12 是上游 extras 里按域归并的消费者（2026-09-21 全量盘点�
 |---|---|---|
 | F6 | SPI 总线剩余：`spi_transfer_with_preface` / `setup_shutdown_msg` | F1、F2 |
 | F8 | endstop / trsync ✅（FW6）；测试侧「响应器式多实例假 MCU」✅（2026-10-03，`d14ce6a`） | F1、F2、C1 |
-| F9 | 固件资源剩余：buttons / trigger_analog / initial_pins / sdcard / sensor_bulk / lcd / neopixel / tmcuart 等（已接：`cmd/thermocouple.rs` + `spi_temperature`；pulse_counter 批 #8 落地） | F1–F7 |
+| F9 | 固件资源剩余：buttons / trigger_analog / initial_pins / sdcard / lcd / tmcuart 等（已接：`cmd/thermocouple.rs` + `spi_temperature`；pulse_counter 批 #8 落地）。宿主侧已建：`extras/led.rs` 的 `led`/`neopixel`/`dotstar`/`pca9533`/`pca9632`、`extras/buttons.rs`（固件查询未接）、`cmd/trigger_analog.rs` 资源层（宿主节未建） | F1–F7 |
 
 **G-Code 与端点**
 
@@ -80,16 +82,16 @@ H1–H12 是上游 extras 里按域归并的消费者（2026-09-21 全量盘点�
 
 | # | 事项 | 依赖 |
 |---|---|---|
-| H1 | 加热与温度（heaters / heater_bed / heater_generic / pid_calibrate / verify_heater / temperature_*） | F4、F5、C1 |
-| H2 | 风扇与通用输出（fan / fan_generic / heater_fan / controller_fan / pwm_tool / static_* / multi_pin / servo / led / neopixel / dotstar / 电位器与 LED 驱动） | F3、F4、F6、F7 |
-| H3 | G-Code 宏与脚本（gcode_macro / delayed_gcode / respond） | G1b、Q5 |
-| H4 | 打印流程与 SD 卡（virtual_sdcard / print_stats / display_status / pause_resume / exclude_object / sdcard_loop / firmware_retraction） | F9、C1 |
-| H5 | TMC 步进驱动（tmc / tmc_uart / tmc2130…tmc5160） | F6、F7、F9、C1 |
-| H6 | 传感器与块状数据（bulk_sensor / 加速度计 / angle / ldc1612 / hx71x / ads* / load_cell / input_shaper / resonance） | F5、F6、F7、F9、C1 |
-| H7 | 输入与外设（buttons / gcode_button / pulse_counter / trigger_analog / 断料与线宽传感器 / GPIO 扩展 / DAC） | F3、F5、F9 |
-| H8 | LCD 显示与菜单（display/*） | F9、G1b |
-| H9 | 探测 / 调平 / 校准（probe / bltouch / bed_mesh / z_tilt / quad_gantry_level / bed_screws / …） | C1、F8 |
-| H10 | 运动相关 extras（gcode_arcs / manual_stepper / idle_timeout / motion_report / …；gcode_move、stepper_enable、motion_queuing、force_move 已落地） | C1 |
+| H1 | 加热与温度（heaters / heater_bed / heater_generic / pid_calibrate / verify_heater / temperature_*）——**✅ 收官**（传感器族、`M105` gcode-id 表、`TEMPERATURE_WAIT`、`M109`/`M190` 等待、eddy 校准工具均已落地，见 H1 节） | — |
+| H2 | 风扇与通用输出（fan / fan_generic / heater_fan / controller_fan / pwm_tool / static_* / multi_pin / servo / led / neopixel / dotstar / 电位器与 LED 驱动）——主体已落地；余项＝`static_pwm_clock`、`replicape`、`duplicate_pin_override` 与 `SET_PIN TEMPLATE=`/`static_value`（见 H2 节） | F3、F4、F6、F7 |
+| H3 | G-Code 宏与脚本（gcode_macro / delayed_gcode / respond）——`delayed_gcode` 与 `respond` **已落地**（含单测）；余项＝`gcode_macro` 的 `rename_existing` 连接期换名与可枚举反射（Q5），见 H3 节 | G1b、Q5 |
+| H4 | 打印流程与 SD 卡（virtual_sdcard / print_stats / display_status / pause_resume / exclude_object / sdcard_loop / firmware_retraction）——除 `sdcard_loop` 的三条命令外均已落地，见 H4 节 | F9、C1 |
+| H5 | TMC 步进驱动（tmc / tmc_uart / tmc2130…tmc5160）——六型（2130/2208/2209/2240/2660/5160）与 UART 框架均已落地；余项＝`stallguard_dump` 查询与 `tmc_spi` 的 `spi_set_bus` 共享，见 H5 节 | F6、F7、C1 |
+| H6 | 传感器与块状数据（bulk_sensor / 加速度计 / angle / ldc1612 / hx71x / ads* / load_cell / input_shaper / resonance）——`bulk_sensor` 框架、`adxl345`/`mpu9250`、`ldc1612`、`hx71x`、`ads1220`/`ads131m0x`、`load_cell`(+`_probe`)、`input_shaper`/`resonance_tester` 均已落地；余项＝`angle`、其余加速度计（lis2dw/lis3dh/icm20948/bmi160）、`ads1x1x`，以及 `SET_PRESSURE_ADVANCE` 尚未作用于运动，见 H6 节 | F5、F6、F7、C1 |
+| H7 | 输入与外设（buttons / gcode_button / pulse_counter / trigger_analog / 断料与线宽传感器 / GPIO 扩展 / DAC）——`gcode_button`、`pulse_counter`、`filament_switch_sensor`/`filament_motion_sensor` 已落地；余项＝固件按钮查询、`trigger_analog` 宿主节、线宽传感器（hall_*/tsl1401cl）、`initial_pins`、板级模块（samd_sercom/replicape/palette2），见 H7 节 | F3、F5、F9 |
+| H8 | LCD 显示与菜单（display/*）——面板驱动均已落地（hd44780/st7920/uc1701/ssd1306/aip31068_spi/hd44780_spi/sh1106）；余项＝菜单族（`menu.py`/`menu_keys.py`/`display.cfg`/`menu.cfg`）与固件 `lcd_hd44780.c`/`lcd_st7920.c`，见 H8 节 | F9、G1b |
+| H9 | 探测 / 调平 / 校准（probe / bltouch / bed_mesh / z_tilt / quad_gantry_level / bed_screws / …）——探针与其校准命令族、末端位置接口（`virtual_endstop_position`）、z_tilt/qgl/bed_tilt/screws_tilt/axis_twist/delta_calibrate 均已落地；余项＝`bed_mesh` 插值网格与 move 应用、探针精度、`Z_OFFSET_APPLY_*`、`bed_screws` 命令族、`skew_correction`/`z_thermal_adjust`/`tuning_tower`，见 H9 节 | C1、F8 |
+| H10 | 运动相关 extras（gcode_arcs / manual_stepper / idle_timeout / motion_report / …；gcode_move、stepper_enable、motion_queuing、force_move、idle_timeout 已落地）——余项＝G2/G3 弧规划、`manual_stepper` 回零、`extruder_stepper` 宿主同步缝、`GET_POSITION`/`axis_map`，见 H10 节 | C1 |
 | H11 | 主机运行时与调试（statistics / canbus_ids / canbus_stats；error_mcu 已落地） | — |
 | H12 | 核心工具补齐（mathutil / util 反射 / clocksync / pins 消费侧） | C1 |
 
@@ -231,24 +233,28 @@ toolhead / 开放事件）一起补，一部分是现在就独立可补的小行
 与软件 bit-bang 两条路都读出 JEDEC ID `ef 30 13`、状态寄存器 `0x00` 与地址 0x00 的
 数据。
 
-#### F8 endstop / trsync（与 C1 共享，框架 FW6a–FW6e 已落地）
+#### F8 endstop / trsync（与 C1 共享，框架 FW6a–FW6e 已落地）——**✅ 收官（2026-10-06 复核）**
 
-##### F8b `Mcu` ↔ 资源的强引用环（阻塞回归）
+endstop 资源（`mcu/resource/endstop.rs`，含 `minclock` 门控与 `home_wait` 纪元参考）、trsync、
+`query_endstops` 与测试侧多实例假 MCU 均已落地，无余项。
 
 #### F9 其他输入与外设资源
 
 建立在 F1–F6 之上，各自一个 `config_*` + 查询/事件。这一节只列**固件侧资源**；
 在它之上建的**宿主 extras 消费者**（buttons / pulse_counter / neopixel / sdcard / lcd /
-sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
+传感器）按域归到 H5–H8，两边互为前置。
 
-- [ ] `buttons`（`src/buttons.c`，`config_buttons` / `buttons_add` / `buttons_query` /
-      `buttons_ack`）—— 暂停/恢复按钮、耗材检测。
-- [ ] `neopixel` / `dotstar` / `led`、`tmcuart`、`sdcard` / `sdio`、
-      `lcd_hd44780` / `lcd_st7920`、`sensor_bulk`（批量传感器上报）与各类 SPI/I2C 传感器
-      （`sensor_adxl345` / `sensor_lis2dw` / …）。
-- 这些是 extras，不阻塞运动；等 F1–F6 完成、真有对应 section 时再逐个接。消费者见
-      H5（TMC/tmcuart）、H6（sensor_bulk/加速度计）、H7（buttons/pulse_counter/trigger_analog）、
-      H8（lcd）。
+**已落地（2026-10-06 复核）**：`sensor_bulk` 框架（`extras/bulk_sensor.rs` + `cmd/` 各传感器命令层）、
+`neopixel`/`dotstar`/`led`（宿主 `extras/led.rs` 六个 section）、`buttons` 宿主注册表（`extras/buttons.rs`）、
+各类 SPI/I2C 传感器（`cmd/adxl345.rs`、`cmd/mpu9250.rs`、`cmd/hx71x.rs`、`cmd/ads1220.rs`、
+`cmd/ads131m0x.rs`、`cmd/ldc1612.rs`、`cmd/sos_filter.rs`、`cmd/thermocouple.rs`、`cmd/ds18b20.rs`）。
+
+- [ ] 固件 **buttons 查询**（`config_buttons` / `buttons_add` / `buttons_query` / `buttons_ack`）——
+      宿主注册表已在，没有发送方。
+- [ ] `tmcuart`（`src/tmcuart.c`）——宿主资源层与 `extras/tmc_uart.rs` 已在，按 H5 余项接。
+- [ ] `sdcard` / `sdio`、`lcd_hd44780` / `lcd_st7920`、`initial_pins`。
+- 这些是 extras，不阻塞运动；消费者见 H5（TMC/tmcuart）、H6（加速度计）、
+      H7（buttons/trigger_analog）、H8（lcd）。
 
 ### C1 运动层收尾 —— ✅ 收官
 
@@ -336,11 +342,12 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 ## 上游 extras 覆盖盘点
 
 上游 133 个 extras（顶层 `*.py` 不含 `__init__.py`、不含 `display/` 子目录；2026-09-23 实数复核
-✓）里，本仓库已落地的有：`board_pins` ✅、`output_pin` ◐、`bus`（SPI/I2C 框架）✅、`fan`、
-`gcode_move`、`stepper_enable`、`query_endstops`、`error_mcu`、`static_digital_output`、`ds18b20`、
-温度传感器族（`temperature_sensor` / `thermistor` / `adc_temperature` / `spi_temperature` /
-`temperature_combined` / `temperature_mcu`），以及 `heaters` / `heater_bed` / `heater_generic`
-（控制环与住户已落地，等待 / 校准面仍缺，见 H1）；其余按域归并成 H1–H12。逐模块的完整对照表
+✓）里，本仓库已落地的远超最初盘点：`bus`（SPI/I2C）、`fan` 族、`gcode_move`、`stepper_enable`、
+`query_endstops`、`error_mcu`、`static_digital_output`、`ds18b20`、温度传感器族、
+`heaters`/`heater_bed`/`heater_generic`（含等待 / 校准面）、TMC 六型与 `tmc_uart`、
+`bulk_sensor` 与加速度计、`input_shaper`/`resonance_tester`、`virtual_sdcard`/`print_stats`/
+`pause_resume`、`filament_*_sensor`、面板四驱动、`led`/`neopixel`/`dotstar`、`delayed_gcode`/`respond`；
+未落地的按域归并成 H1–H12。逐模块的完整对照表
 （含固件命令模块、端点、判为不适用者）随覆盖审计收口清理；落点就是下文 H1–H12
 与 F/G/B 各节。
 
@@ -352,12 +359,17 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 - [x] **传感器全部收官**：`EddyCalibrationTool` 已移植（2026-10-03，`4caf425`：`PROBE_EDDY_CURRENT_CALIBRATE` + `Z_OFFSET_APPLY_PROBE`，校准移动采样 + 噪声过滤 + `configfile` 写回；`note_z_calibration_*` 唯一调用方到位）；`temperature_probe.py` A+B+C 已落（`f6ea201` / `dfaf418` / `704ee0d`；前置 `TEMPERATURE_WAIT` 已随 `b5da84e` 落地）。装载序均已修复：`thermistor` 批 #22、`adc_temperature` `372cd93`（都声明 `phase = early`）。已落地并归档：`temperature_host`（2026-10-03，`87d7b01`）/ `temperature_sensor` / `thermistor` / `adc_temperature` / `spi_temperature`（MAX6675/31855/31856/31865） / `temperature_combined` / `temperature_mcu`（T7）；`temperature_fan` 无需再排（2026-10-03 核对：选项/双控制环/命令/get_status 逐项与上游一致，11 单测 + 3 条语料用例全绿；速度抑制窗未移植属低危可选）。
 - 依赖 F4（PWM）、F5（ADC）、F6（SPI 温度）；C1 已收官。
 
+**本节收官（2026-10-06 复核）**：`M105`/`TEMPERATURE_WAIT`/`M109`/`M190` 与传感器族均已落地，
+无余项；后续新传感器（`angle` 等）归 H6。手册同步见加热器 / 温度传感器各页。
+
 ### H2 风扇与通用输出
 
 - [ ] **引用（拆分、拍板点与依赖以笔记为准）**：[H2 动工前调查](docs/work-log/2026-09-23-h2-notes.md)
   ——上游 21 个文件的依赖盘点、H2-1…H2-7 拆分与四个拍板点。**已落地**：`fan`/`fan_generic`/
   `heater_fan`/`controller_fan`（含 heater 注册表）、`tachometer_pin`→`pulse_counter`、
-  `pwm_tool`/`pwm_cycle_time`/`servo` 模块本体、`multi_pin`（批 #26）、`sx1509`（批 #41）；
+  `pwm_tool`/`pwm_cycle_time`/`servo` 模块本体、`multi_pin`（批 #26）、`sx1509`（批 #41）、
+  电位器/DAC 驱动族 `mcp4018`/`mcp4451`/`ad5206`/`dac084s085`、`led`/`neopixel`/`dotstar`/`pca9533`/`pca9632`
+  （`extras/led.rs` 六个 section，2026-10-06 复核）；
   **余项**：`static_pwm_clock.py`（语料 1 处）、`replicape.py`（语料 1 处，另见本文件「特定板/芯片」）、
   `duplicate_pin_override.py`（语料 0 用）；`pwm_tool` 队列化已完成（2026-10-03，`cf9c884`，同 **G2b**）。
 
@@ -365,7 +377,9 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 
 - [ ] `gcode_macro.py`：段与宏注册**已落地**（2026-09-24 集成批 #1，语料绿）；剩余 = `rename_existing` 连接期换名，以及读
       `printer.objects` 的反射式能力（**Q5**）。**U-A7b 已归档**（2026-09-24 批 #4 起的「受控子集引擎」阶段：`exclude_object.test`+`dual_carriage.test` 双翻转、guard 归零，`{% set %}` 批 #9、过滤器参数与 `default`/`float` 批 #17、列表字面量与 `|min`/`|max` 批 #24 相继落地）。**2026-09-29 引擎换为 minijinja 2.24 适配层**（`custom_syntax` 单花括号定界符、Strict undefined、装载期编译与求值分两段）：原子集外的 `namespace()`、关键字实参、`{% block %}`、`|float(默认)` 由此接上（语料 160 绿）。仍缺：`%` 字符串格式化（minijinja 的 `%` 是数值取模）、模板内方法调用（`Coord`/`PrinterView` 未实现 `call_method`；「方法调用白名单」待办消解——不装 `unknown_method_callback` 即天然拒绝）；三元 `x if c else y` 由 minijinja 原生支持但本仓未单列测试。与 Jinja2 的已知差异（`%`/`//` 欧几里得取余、Strict 下缺键在打印/迭代/判真时报错、部分 detail 措辞）见 `template.rs` 模块文档。iqex/itex 的模板阻塞已消，首因前移到 `dual_carriage` 的 `primary_carriage`。
-- [ ] `delayed_gcode.py`（`[delayed_gcode]`）。
+- [x] `delayed_gcode.py`（`[delayed_gcode]`）**已落地**（2026-10-06 复核：`extras/delayed_gcode.rs` 已装进
+      工厂表 `load.rs`，`initial_duration` / `UPDATE_DELAYED_GCODE` / `klippy:ready` 注册齐全，8 条单测）。
+      上游 `test/klippy/` 无对应 `.test`，语料不覆盖。
 - [x] `respond.py`（`RESPOND` / `M118`，批 #29）。
 - 前置：**G1b** 的 `create_gcode_command` 与参数访问器（宏类模块要构造 gcmd）。
 
@@ -374,85 +388,125 @@ sensor_bulk / 各类传感器）按域归到 H5–H8，两边互为前置：
 - [x] `virtual_sdcard.py`：主机侧文件打印、`M20`–`M27`/`SDCARD_RESET_FILE`/`SDCARD_PRINT_FILE`、`work_handler` 回放、进度（**2026-10-02**；省略 `gcode.get_mutex().test()` 让出、`_handle_analyze_shutdown`/`_handle_debuginput_exit`/`stats`，`path` 不做 `expanduser`/`normpath`）。
 - [x] `print_stats.py`（**2026-10-02**；省略 `_handle_activate_extruder`，事件未 fire）、`display_status.py`（`M73`/`M117`）。
 - [x] `pause_resume.py` 的节、四条命令与 `pause_resume/*` 三个端点（批 #15 + 2026-10-03）。
-- [ ] `exclude_object.py`（段+四命令落地，**2026-09-24 批 #4 随引擎转绿**，含排除区 E 补偿）、`sdcard_loop.py`（段已落地，`SDCARD_LOOP_*` 命令与文件回放未接）、`firmware_retraction.py`（G10/G11，**批 #32 已落地**）。
+- [x] `exclude_object.py`（段+四命令落地，**2026-09-24 批 #4 随引擎转绿**，含排除区 E 补偿）、`firmware_retraction.py`（G10/G11，**批 #32 已落地**）。
+- [ ] `sdcard_loop.py`：**栈语义已落地**（`extras/sdcard_loop.rs` 的 `loop_begin`/`loop_end`/`loop_desist` 与单测），
+      **命令未注册**（`load_config` 只建对象）、与 `virtual_sdcard` 回放循环的
+      「当前命令来自 SD 文件 / 读写文件游标」接缝（`SdCardFile` trait 无实现体）也未接——语料里
+      `SDCARD_LOOP_DESIST` 目前以未知命令放行。
 - 依赖 F9（固件 `sdiocmds.c` 的 sdcard 资源）、C1（`gcode_move` 的位置恢复）。
 
 ### H5 TMC 步进驱动
 
-- [ ] `tmc.py` 公共框架（寄存器、StallGuard、`DUMP_TMC`/`SET_TMC_*`）。
-- [ ] `tmc_uart.py`（固件 `src/tmcuart.c`）。
-- [ ] SPI 型：`tmc5160.py`、`tmc2240.py`、`tmc2660.py`（`tmc2130.py` 批 #34 已落地）；UART/SPI 型：`tmc2208.py`、`tmc2209.py`、
-      `tmc2240.py`、`tmc2660.py`。
-- 依赖 F6/F7、F9（tmcuart）、C1（stepper 对象）。
+**主体已落地（2026-10-06 复核）**：公共框架（`extras/tmc.rs` + `tmc_spi.rs` 的寄存器/字段表、
+`DUMP_TMC`/`SET_TMC_*`）与六型驱动都在工厂表里——`tmc2130`（批 #34）、`tmc2208`、`tmc2209`、
+`tmc2240`、`tmc2660`、`tmc5160`（各带 `section!`），`tmc_uart` 资源层在 `cmd/`、`extras/tmc_uart.rs`。
+
+- [ ] **`stallguard_dump` 查询**（`tmc/stallguard_dump` bulk 端点）：`tmc2130.rs` / `tmc2240.rs` 的模块 doc
+      自述未移植。**语料不覆盖**，按需再补。
+- [ ] **`tmc_spi` 的 `spi_set_bus` 共享**：本仓每节自建 `McuSpi`、片选只按 `"cs"` 角色共享，
+      串链会逐节发 `config_spi`/`spi_set_bus`（`tmc_spi.rs:34-38`），与上游 `share_type="tmc_spi_cs"` 不同。
+- 依赖 F6/F7、C1（stepper 对象）；`tmcuart` 固件资源仍在 **F9** 名下。
 
 ### H6 传感器与块状数据
 
-- [ ] `bulk_sensor.py` 框架 + 固件 `sensor_bulk.c` + 各 `*/dump_*` 端点（**B4**）。
-- [ ] 加速度计：`adxl345.py`、`mpu9250.py`、`icm20948.py`、`lis2dw.py`、`lis3dh.py`、
-      `bmi160.py`（固件 `src/sensor_*.c`、`sos_filter.c`）。
-- [ ] `angle.py`（磁编码）、`ldc1612.py`（涡流）、`hx71x.py`、`ads1220.py`、
-      `ads131m0x.py`、`ads1x1x.py`。
-- [ ] `load_cell.py` / `load_cell_probe.py`（称重，配固件 `trigger_analog.c`）。
-- [ ] `input_shaper.py` / `resonance_tester.py` / `shaper_calibrate.py` / `shaper_defs.py`。
-- 依赖 F5/F6/F7、F9（sensor_bulk）、C1。
+**已落地（2026-10-06 复核）**：`bulk_sensor` 框架（`extras/bulk_sensor.rs`，被 `adxl345`/`ldc1612`/
+`load_cell` 共用，固件命令层在 `cmd/`）、加速度计 `adxl345`/`mpu9250`、`hx71x`、`ads1220`、
+`ads131m0x`、`ldc1612`、`load_cell` + `load_cell_probe`、`input_shaper` + `resonance_tester`
+（`shaper_defs`/`shaper_calibrate` 的算式在本仓 `shaper_defs.rs` 与 `input_shaper.rs` 内）。
+
+- [ ] **`angle`**（磁编码传感器）——无文件、无 section。
+- [ ] **其余加速度计**：`icm20948`、`lis2dw`、`lis3dh`、`bmi160`（固件 `src/sensor_*.c` 已有，宿主未建）。
+- [ ] **`ads1x1x`**（`ads1x1x.py`）。
+- [ ] **`adxl345` 的寄存器 setup / `_convert_samples` 缩放**（`adxl345.rs:38-40` 自述）。
+- [ ] **`SET_PRESSURE_ADVANCE` 作用于运动**：现在只写槽与 status，运动/求解器不读
+      （`extras/extruder.rs:91-92` `:282`；上游 `kinematics/extruder.py:67-88` → C helper `espa`）——
+      属挤出求解器，与 `input_shaper` 同属「运动保真」块，**不做也能打印**（影响拐角质量）。
+- [ ] 各传感器的 `*/dump_*` 端点仍在 **B4** 名下。
+- 依赖 F5/F6/F7、C1。
 
 ### H7 输入与外设
 
-- [ ] 固件按钮查询（`buttons.c`）/ `query_adc`——`gcode_button` 的**数字路径**与 `[buttons]` 已落地（批 #37）；`analog_range` 明确拒绝。
+**已落地（2026-10-06 复核）**：`gcode_button`（数字路径与 `[buttons]` 注册表，批 #37；`analog_range` 明确拒绝）、
+`pulse_counter`（批 #8，接通 `tachometer_pin`）、`filament_switch_sensor`、`filament_motion_sensor`
+（各带 `section!`，`SET_FILAMENT_SENSOR` 走 mux 注册）。
+
+- [ ] 固件按钮查询（`buttons.c`）/ `query_adc`——宿主 `[buttons]` 已在（`extras/buttons.rs`），
+      **固件查询没有发送方**（`buttons.rs:42` 自述）。
 - [x] `pulse_counter.py`（批 #8：host 侧 `pulse_counter.rs` 落地并接通 `tachometer_pin`；`config_counter`/`query_counter` 按字典编码，真机验证仍待 T6）。
-- [ ] `trigger_analog.py`（固件 `trigger_analog.c`）。
-- [ ] 断料/线宽：`filament_switch_sensor.py`、`filament_motion_sensor.py`、
-      `hall_filament_width_sensor.py`、`tsl1401cl_filament_width_sensor.py`。
+- [ ] `trigger_analog` 宿主节（`extras/trigger_analog.rs` 现只有滤波设计与 `//!` 说明，**无 `section!`**；
+      固件命令层 `cmd/trigger_analog.rs` 已在，`load_cell_probe` 是现有消费面）。
+- [ ] 线宽传感器：`hall_filament_width_sensor`、`tsl1401cl_filament_width_sensor`——无文件、无 section
+      （断料两项**已落地**，见上）。
 - [ ] 固件 `initial_pins.c` 的初始引脚状态。
 - [ ] 特定板/芯片：`samd_sercom.py`、`replicape.py`、`palette2.py`。
 - 依赖 F3（GPIO）、F5（ADC）、F9。
 
 ### H8 LCD 显示与菜单
 
-- [x] `display/display.py` 框架与 `hd44780.py`、`st7920.py`、`uc1701.py`（`ssd1306` 同文件，批 #7/#13 已落地，均 storage-only）。
-- [ ] `hd44780_spi.py`、`sh1106`（`aip31068_spi` 批 #28 已落地）。
+- [x] **面板驱动全部落地（2026-10-06 复核）**：`display/display.rs` 的框架与分派里已含
+      `hd44780`、`hd44780_spi`、`st7920`（SPI）、`uc1701`、`ssd1306`/`sh1106`、`aip31068_spi`（批 #7/#13/#28 + 后续），
+      均为 storage-only。
+- [ ] 个别驱动的 `set_glyphs`：`uc1701`、`hd44780_spi`、`aip31068_spi` 自述未移植字形写入。
 - [ ] 菜单：`display/menu.py`、`display/menu_keys.py`、`display.cfg`、`menu.cfg`；
-      事件 `menu:*`。
+      事件 `menu:*`（`display/` 下无 menu 文件）。
 - [ ] 固件 `lcd_hd44780.c` / `lcd_st7920.c`。
 - 依赖 F9（固件侧 LCD）、G1b（`create_gcode_command`，菜单脚本要构造 gcmd）。
 
 ### H9 探测 / 调平 / 校准
 
-- [ ] 探针：`probe.py` ◐（**已落地**：`[probe]` 段、`probe` 虚拟 chip、选项与偏移、会话采样、
-      `QUERY_PROBE`/`PROBE`/`PROBE_ACCURACY`、`probe:update_results` 发送；**待做**：
-      `PROBE_CALIBRATE`/`Z_OFFSET_APPLY_PROBE`（需 `manual_probe` + `configfile.set()`）、
-      `ProbePointsHelper`（消费者 z_tilt/screws）、endstop wrapper 的 `z_offset`/`query_endstop` 覆盖——
-      需先把 `PinChip::setup_endstop` 的返回类型接口化）、`probe_eddy_current.py`、`manual_probe.py`、`safe_z_home.py`、`endstop_phase.py`。
-- [ ] **保真单元：bed_mesh 插值 + 调平应用**（排在 H9 模块闭包之后）：`LagrangeMesh`/`BicubicMesh` +
-      `mesh_pps` → `mesh_matrix`、`get_z(x, y)`，以及把网格作用到 move（`gcode_move` 的 move-transform
-      seam + `MoveSplitter` + `fade_*`）。素材：`abandoned/wip-main-leftovers` 的 `bed_mesh.rs`
-      （含 `ZMesh`/lagrange/bicubic 与两个测试），按主线结构重做并补手册。
+- [x] **探针与回零周边全部落地（2026-10-06 复核）**：`[probe]` 段与 `probe` 虚拟 chip、选项与偏移、会话采样、
+      `QUERY_PROBE`/`PROBE`/`PROBE_ACCURACY`/`PROBE_CALIBRATE`（`probe.rs:1032` 注册；校准后 `configfile.set`
+      回写 `z_offset`）、`ProbePointsHelper`（`probe.rs:1297`；消费者 z_tilt/qgl/bed_tilt/screws_tilt/
+      axis_twist/delta_calibrate）、`manual_probe`（`MANUAL_PROBE`/`Z_ENDSTOP_CALIBRATE`/`TESTZ`/`ACCEPT`/
+      `NEXT`/`ABORT`）、`safe_z_home`、`endstop_phase`、`bltouch`、`smart_effector`、`probe_eddy_current`
+      （含校准工具）均已落地；`probe:update_results` 已带载荷产线触发。
+- [ ] **`Z_OFFSET_APPLY_*` 小命令**：`[probe]` 的 `Z_OFFSET_APPLY_PROBE` **未注册**（同名命令只在 eddy 上注册，
+      `probe_eddy_current.rs:1863`）；`manual_probe` 的 `Z_OFFSET_APPLY_ENDSTOP` / `Z_OFFSET_APPLY_DELTA_ENDSTOPS`
+      未实现（`manual_probe.rs:14-17` 明示）。前置全满足（`gcode_move` 的 `homing_origin` 与 `configfile.set`
+      都已在），各约 30–40 行，**语料 0 处使用**。
+- **端停位置接口化：已完成（2026-10-06 复核，此前条目为陈旧断言）**。`PinChip::setup_endstop_dyn` 返回
+      `Arc<dyn HomingEndstop>`，`ProbeChip::virtual_endstop_position` 返回 `z_offset`（`pins.rs:386` `:396`、
+      `probe.rs:306`），rail 优先采用虚拟位置、否则才退 `position_min`（`extras/stepper.rs:374-406`；
+      上游 `stepper.py:336-343`）。另：`z_virtual_endstop.test` **本身没有任何位置断言**（只是一串
+      `G28/G1/PROBE/BED_MESH_CALIBRATE/...`），所以「该 test 需要它」的说法不成立——接口正确性靠单测。
+- [ ] **保真单元：bed_mesh 插值 + 调平应用**（H9 模块闭包已完成，本项现为**唯一大块**；已开工）：
+      `LagrangeMesh`/`BicubicMesh` + `mesh_pps` → `mesh_matrix`、`calc_z(x, y)`，以及把网格作用到 move
+      （`gcode_move` 的 move-transform seam + `MoveSplitter` + `fade_*`）。seam 已被 `bed_tilt`/`exclude_object`
+      实战验证（`gcode_move.rs:208-229`），**前置全满足**。⚠️ 素材分支 `abandoned/wip-main-leftovers` 的
+      `bed_mesh.rs` **不可直接复用**：其 `lagrange_1d` 是恒等复制、`bicubic_1d` 是 Catmull-Rom、且不按
+      `mesh_pps` 细分（只可当结构参考）。⚠️ 语料对插值/fade/move **零覆盖**，验收必须自建单测。
 - [ ] **保真单元：探针精度**（排在 H9 模块闭包之后）：按触发步数反算位置与 `rest_time`
       （上游 `_calc_endstop_rate`）。前置已满足：模拟器步数模型与多实例假 MCU 已落地
       （Q10 + `d14ce6a`，两 MCU 端到端测试在案）。
-- **端停位置的缺口（需接口化）**：上游 rail 会优先向 endstop 要位置（`mcu_endstop.get_position_endstop()`，
-      探针 wrapper 返回 `z_offset`）；本仓 `position_endstop` 缺省退到 `position_min`，所以用
-      `probe:z_virtual_endstop` 的配置虽然在解析上能过，但 Z 回零后的位置不等于上游——`z_virtual_endstop.test`
-      的位置断言需要它。
 - **已知偏离（探针精度）**：本仓回零与探针移动返回**指令位置**，未按上游 `StepperPosition.note_home_end`
       + `calc_toolhead_pos` 用触发步数反算；`home_start` 的 `rest_time` 也硬编码（上游 `_calc_endstop_rate`
       按 move 距离与步数计算）。两者都影响真实探针 Z 精度，属后续精度单元；模拟器语料不受影响。
 - [ ] 调平：`bed_mesh.py` ◐（**已落地**：`[bed_mesh]` 段与全量选项、探测点生成、
       `BED_MESH_CALIBRATE` 逐点探测存格（按 Y 分行、行内 X 升序）、`BED_MESH_CLEAR`、
-      `bed_mesh/dump_mesh` 端点（2026-10-03）；**待做**：插值网格
-      （lagrange/bicubic、`mesh_pps`）、faulty 区域替换、fade 与 move 的 z 补偿、profile 命令）。
-- [ ] 螺丝：`screws_tilt_adjust.py` ✅；`bed_screws.py` **段已落地**（2026-09-24 批 #1），`BED_SCREWS_ADJUST`/`ACCEPT`/`ADJUSTED`/`ABORT` 命令族未移植。
-- [ ] 校准：`delta_calibrate.py` ✅（段+`DELTA_CALIBRATE`/`DELTA_ANALYZE` 落地 2026-09-24 批 #5，`delta_calibrate.test` 转绿）、`axis_twist_compensation.py` ✅（批 #36）、`skew_correction.py`、
-      `z_thermal_adjust.py`、`tuning_tower.py`。
-- [ ] 回零周边：`homing_override.py`（`homing_heaters.py` 批 #31 已落地）；事件 `probe:update_results` 已带载荷并触发（批 #36）
-      （`homing:*` 四个已随 toolhead 落地产线触发，见事件清单）。
+      `bed_mesh/dump_mesh` 端点（2026-10-03）；**待做**：插值网格（lagrange/bicubic、`mesh_pps`）、
+      faulty 区域替换、fade 与 move 的 z 补偿、profile 命令族（`BED_MESH_PROFILE`/`OUTPUT`/`MAP`/`OFFSET`）。
+      现状：`get_status` 仍把 probed 网格当 `mesh_matrix` 返回，`BED_MESH_CALIBRATE` 对后续 move
+      **零影响**（`bed_mesh.rs:16-30` 自述）。）
+- [x] 螺丝：`screws_tilt_adjust` ✅；`bed_screws` **段已落地**（2026-09-24 批 #1）——**余项**：
+      `BED_SCREWS_ADJUST`/`ACCEPT`/`ADJUSTED`/`ABORT` 命令族未注册（`bed_screws.rs` 无 `register_command`）。
+- [ ] 校准：`delta_calibrate` ✅（段+`DELTA_CALIBRATE`/`DELTA_ANALYZE` 落地 2026-09-24 批 #5，`delta_calibrate.test` 转绿）、`axis_twist_compensation` ✅（批 #36）；**未移植**：`skew_correction`、
+      `z_thermal_adjust`、`tuning_tower`（三者无文件、无 section，语料不覆盖）。
+- [x] 回零周边：`homing_override`（`extras/homing_override.rs`）与 `homing_heaters`（批 #31）均已落地；
+      事件 `probe:update_results` 已带载荷并触发（批 #36），`homing:*` 四个已随 toolhead 产线触发（见事件清单）。
 - 依赖 C1、F8（endstop/trsync）、H3（宏）、H12（`mathutil`）。
 
 ### H10 运动相关 extras
 
-- [ ] `gcode_arcs.py`：**段已落地**（2026-09-24 批 #1），G2/G3 弧规划与平面命令仍未接；`manual_stepper.py`；
-      `force_move.py` **主体已落地**（2026-10-04：`FORCE_MOVE`/`STEPPER_BUZZ` + 整段 force-move 时序，motion 侧按 handle 的
-      trapq 原语；`SET_KINEMATIC_POSITION` 一直在 `toolhead`）；`extruder_stepper.py` 段已落地（2026-09-24 批 #2，宿主 step 同步的 toolhead 缝仍缺）。
+- [ ] `gcode_arcs.py`：**段已落地**（2026-09-24 批 #1；`extras/gcode_arcs.rs` 只读 `resolution`，
+      **未注册任何命令**），G2/G3 弧规划（`planArc`）与 G17/G18/G19 平面选择仍未接。
+- [x] `manual_stepper.py` **已落地**（section + 命令；余项：`manual_stepper` 自带回零未实现，
+      `extras/manual_stepper.rs:299` 明示拒绝）。
+- [x] `force_move.py` **主体已落地**（2026-10-04：`FORCE_MOVE`/`STEPPER_BUZZ` + 整段 force-move 时序，motion 侧按 handle 的
+      trapq 原语；`SET_KINEMATIC_POSITION` 一直在 `toolhead`）。
+- [ ] `extruder_stepper.py`：**段已落地**（2026-09-24 批 #2），宿主 step 同步的 toolhead 缝仍缺
+      （不跟随 extruder 运动）。
+- [ ] **extra-axes 外围**：`GET_POSITION`（要 `kin.get_steppers()` + `calc_position` + MCU 位置）、
+      extra-axes 的 `axis_map`（`Coord` 目前固定 4 轴）。
       （`stepper_enable.py` ✅ 已随 T2 落地并归档。）
 - [x] `idle_timeout.py`（批 #21：节 + `SET_IDLE_TIMEOUT` + 三个事件带载荷）、
       `motion_report.py`（`dump_trapq`/`dump_stepper` 端点，见 **B4**）。

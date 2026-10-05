@@ -234,7 +234,7 @@ Enter send · Tab complete · ↑↓ history · PgUp/PgDn log · ^G g-code · Es
   的内建命令（`M115`、`M110`、`ECHO` …）也在里面**（主机的 `gcode/help` 只有带描述的那部分，
   会漏掉它们，补全不用它）。进入 g-code 模式时拉一次，
   **没得到答案就会一直补问**（按 `Tab` 会再问一次）——`ready` 不是前提：状态行只反映窗口**收到过的**状态（连接时的 `info`、订阅 `webhooks` 时应答里的即时快照，以及之后 `klippy:status` 推送），订阅建立之前它可能还是旧值；匹配大小写不敏感，`m1` 能补到 `M115`，
-  写进去的是打印机自己的拼写。 同一次请求还带回每条命令的 `parameters`（该命令声明过的具名参数），**参数名以它为准**；某条命令没给 `parameters` 时，该命令的参数名取自窗口签入的内建表（`crates/klippy-client/src/gcode_params.rs`，由主机源码的声明生成）。参数名查找**大小写
+  写进去的是打印机自己的拼写。 同一次请求还带回每条命令的 `parameters`（该命令声明过的具名参数），**参数名以它为准**；某条命令没给 `parameters` 时，该命令的参数名取自窗口签入的内建表（`crates/klippy-client/src/gcode_params.rs`，由主机源码的声明生成；仓库内构建时 `crates/klippy-client/build.rs` 会校验它与主机源码一致，发布版没有主机源码、跳过校验）。参数名查找**大小写
 不敏感**：主机用小写命令名也能命中它自己的参数，展示仍按主机的拼写。
 
 请求模式下敲裸方法名不补——方法名是主机的，窗口没有那份清单（`/subscribe` 之后

@@ -705,6 +705,10 @@ mod tests {
     /// board with **only** the X endstop resource and asks the firmware for the
     /// pin level twice, in between letting the operator change the wiring.
     ///
+    /// **Premise**: the config is assumed correct; this case checks this
+    /// repository's endstop query path, not your config — a mismatch of config,
+    /// wiring or firmware is not a bug here.
+    ///
     /// # What it asserts, and what only the operator can confirm
     ///
     /// `TESTING.md`'s R3 (`TESTING.md:43-46`) reads "X endstop read once in each

@@ -21,6 +21,34 @@ use crate::core::klippy::mathutil::{Coord, Xyz, E_AXIS};
 /// (`BUFFER_TIME_START`, `klippy/toolhead.py:196`).
 pub const BUFFER_TIME_START: f64 = 0.250;
 
+/// The minimum lead a planned move keeps ahead of the estimated clock, in
+/// seconds (`MIN_KIN_TIME`, `klippy/extras/motion_queuing.py:16`).
+///
+/// It is the `est` half of `calc_step_gen_restart`: generation restarts no
+/// sooner than this after the estimate, so a move queued at the floor still
+/// has time to be generated and reach the wire before its own clock.
+///
+/// **In this host the term is dominated** — `BUFFER_TIME_START` (0.250) is
+/// already larger than `MIN_KIN_TIME + KIN_FLUSH_DELAY` (0.101) — so folding it
+/// into the floor is an alignment with upstream's formula, not a behavioural
+/// change on its own (it only ever wins when `last_step_gen_time` is further
+/// ahead than `est + 0.101`).
+const MIN_KIN_TIME: f64 = 0.100;
+
+/// The step+dir+step filter window, in seconds (`SDS_CHECK_TIME`,
+/// `klippy/extras/motion_queuing.py:17`, `chelper/stepcompress.c:504`).
+///
+/// Upstream starts `kin_flush_delay` here and only raises it for a stepper with
+/// a wider generation window (`motion_queuing.py:120-140`): an extruder's half
+/// step time (`kin_extruder.c:145`) or an input shaper's pulse span
+/// (`kin_shaper.c:202-218`). This host models neither window (see
+/// [`StepKinematics::generate_steps`](super::itersolve::StepKinematics::generate_steps)),
+/// so the filter is the whole delay — upstream's own initial value, not an
+/// approximation of a wider one. It shifts the floor by the same 1 ms there too
+/// (the buffer term dominates there as well), which is why it does not change
+/// the host's step lead on its own.
+const KIN_FLUSH_DELAY: f64 = 0.001;
+
 /// Where the toolhead reads the MCU's estimated print time from
 /// (`MCU.estimated_print_time`).
 ///
@@ -363,6 +391,22 @@ impl ToolHead {
     /// below the horizon already generated (`_calc_print_time`,
     /// `klippy/toolhead.py:260-268`).
     ///
+    /// The floor is upstream's: `max(est + BUFFER_TIME_START, kin_time)` where
+    /// `kin_time = calc_step_gen_restart(est)` is
+    /// `max(est + MIN_KIN_TIME, last_step_gen_time) + kin_flush_delay`
+    /// (`motion_queuing.py:190-192`). The `MIN_KIN_TIME` half keeps a move
+    /// queued at the floor from starting so close to the estimate that its
+    /// steps cannot be generated and sent before their own clock; the
+    /// `kin_flush_delay` half keeps it clear of the step filter the generated
+    /// horizon already passed.
+    ///
+    /// Folding both terms in is an **alignment with the upstream formula, not a
+    /// behavioural change on its own**: `BUFFER_TIME_START` (0.250) already
+    /// exceeds `MIN_KIN_TIME + KIN_FLUSH_DELAY` (0.101), so the buffer term wins
+    /// everywhere the generated horizon does not, and the rest differs only by
+    /// the 1 ms filter. The step-lead fix a live wait needs is elsewhere (the
+    /// fake firmware's step-chain model, `interface/devices/simulator.rs`).
+    ///
     /// Raise-only: a horizon the machine has not caught up with is left alone,
     /// so re-priming after an idle moves the next move **forward** — onto
     /// "now plus a buffer", never onto steps already generated. That is the
@@ -371,8 +415,10 @@ impl ToolHead {
     /// every move was planned `N` seconds in the past (see
     /// [`EstimatedPrintTime`]).
     fn calc_print_time(&mut self) {
-        let min_print_time =
-            (self.estimated_print_time.get() + BUFFER_TIME_START).max(self.last_step_gen_time);
+        let est = self.estimated_print_time.get();
+        // `calc_step_gen_restart` (`motion_queuing.py:190-192`).
+        let kin_time = (est + MIN_KIN_TIME).max(self.last_step_gen_time) + KIN_FLUSH_DELAY;
+        let min_print_time = (est + BUFFER_TIME_START).max(kin_time);
         if min_print_time > self.print_time {
             self.print_time = min_print_time;
         }
@@ -412,8 +458,7 @@ impl ToolHead {
             // `max(est + MIN_KIN_TIME, last_step_gen_time) + kin_flush_delay`
             // (`toolhead.py:263` → `motion_queuing.py:190-192`) — where
             // `last_step_gen_time` is the floor that keeps a move queued after
-            // a drip from starting behind steps that drip already generated
-            // (`kin_flush_delay` is not modelled in this host).
+            // a drip from starting behind steps that drip already generated.
             self.special_queuing_state = false;
             self.calc_print_time();
         }
@@ -574,12 +619,11 @@ impl ToolHead {
         // (`toolhead.py:465` → `:260-268`): `print_time` is raised — never
         // lowered — to `max(estimated_print_time + BUFFER_TIME_START, kin_time)`,
         // with `kin_time = max(est + MIN_KIN_TIME, last_step_gen_time) +
-        // kin_flush_delay` (`motion_queuing.py:190-192`). This host models
-        // neither `MIN_KIN_TIME` nor `kin_flush_delay`; the two floors it does
-        // model are the buffer — read live, `calc_print_time` — and the
-        // generated horizon, and the latter is what keeps the drip's start from
-        // landing behind steps a previous drip already generated (an "Invalid
-        // sequence" in the step solver).
+        // kin_flush_delay` (`motion_queuing.py:190-192`). Both floors are
+        // modelled (`calc_print_time`): the buffer, read live, and the generated
+        // horizon, which is what keeps the drip's start from landing behind
+        // steps a previous drip already generated (an "Invalid sequence" in the
+        // step solver).
         self.calc_print_time();
         let start_time = self.print_time;
         append_move(
@@ -927,6 +971,52 @@ mod tests {
         assert!(
             horizon >= 301.0 + BUFFER_TIME_START - 1e-9,
             "the floor follows the estimate: {horizon}"
+        );
+    }
+
+    /// The floor is upstream's `_calc_print_time`
+    /// (`klippy/toolhead.py:260-268` → `motion_queuing.py:190-192`):
+    /// `max(est + BUFFER_TIME_START,
+    ///      max(est + MIN_KIN_TIME, last_step_gen_time) + kin_flush_delay)`.
+    ///
+    /// The **boundary the kin terms own** is the one where the generated
+    /// horizon is further ahead than the buffer: `last_step_gen_time >
+    /// est + MIN_KIN_TIME`. Then the floor is that horizon plus the filter, not
+    /// the bare horizon — a move planned on the raw horizon would start steps
+    /// the filter window still covers.
+    ///
+    /// This host's `BUFFER_TIME_START` (0.250) already exceeds `MIN_KIN_TIME`
+    /// (0.100) + `KIN_FLUSH_DELAY` (0.001), so the boundary is the only place
+    /// the kin terms can ever bind — folding them in is an alignment with the
+    /// upstream formula, and this pins exactly what it changes.
+    #[test]
+    fn test_the_prime_floor_adds_the_step_filter_on_the_generated_horizon() {
+        let est = Arc::new(Mutex::new(0.0));
+        let mut toolhead = toolhead_with_estimate(&est);
+        // Generation reaches a horizon the estimate will lag far behind.
+        toolhead.flush_step_generation(5.0).unwrap();
+        assert_eq!(toolhead.last_step_gen_time, 5.0);
+
+        // (a) The generated horizon binds: the floor is that horizon plus the
+        // step filter — not the bare horizon, and not the buffer.
+        *est.lock().unwrap() = 1.0;
+        assert!(1.0 + MIN_KIN_TIME + KIN_FLUSH_DELAY < 5.0);
+        toolhead.set_position(Coord::default(), &[0]);
+        let floor = toolhead.get_last_move_time();
+        assert!(
+            (floor - (5.0 + KIN_FLUSH_DELAY)).abs() < 1e-9,
+            "the floor is the generated horizon plus the filter: {floor}"
+        );
+
+        // (b) The buffer binds instead: the estimate has caught up past the
+        // horizon, so `est + BUFFER_TIME_START` wins.
+        assert!(10.0 + MIN_KIN_TIME + KIN_FLUSH_DELAY < 10.0 + BUFFER_TIME_START);
+        *est.lock().unwrap() = 10.0;
+        toolhead.set_position(Coord::default(), &[0]);
+        let floor = toolhead.get_last_move_time();
+        assert!(
+            (floor - (10.0 + BUFFER_TIME_START)).abs() < 1e-9,
+            "the buffer floor binds once the estimate passes the horizon: {floor}"
         );
     }
 

@@ -339,6 +339,36 @@ mod tests {
         }
     }
 
+    /// Closes the fake session when a test ends — on a failed assertion too.
+    ///
+    /// Production breaks the `Mcu → events → resource → Mcu` cycle in
+    /// `McuObject::release_cycles`; a bare test has to do the same. Here the
+    /// cycle sits inside the chip: [`McuChip`] holds its `ConfigBuilder`, the
+    /// builder holds the config callback, and that callback captured
+    /// `chip.clone()` ([`McuEndstop::new`]) — so the chip, and the `Arc<Mcu>`
+    /// it carries, is never dropped and `Mcu::Drop` never runs.
+    ///
+    /// The parked receive is what makes that fatal rather than a leak: the
+    /// device read runs inside `spawn_blocking`, and only `Mcu::close` (through
+    /// `Interface::shutdown`) releases it. A session left open holds up the
+    /// runtime's blocking-pool shutdown forever, and the whole test binary
+    /// hangs with no CPU — the third「像挂死」case in `testing.md`.
+    ///
+    /// Bind it to a **named** variable and declare it before the resource:
+    /// `let _ = …` would drop it on the spot, and locals drop in reverse, so
+    /// the session then outlives the resource the way production does it.
+    struct SessionGuard(Arc<Mcu>);
+
+    impl Drop for SessionGuard {
+        fn drop(&mut self) {
+            // `close()` is the one that matters here (it releases the parked
+            // read); `clear_events()` is what `release_cycles` does to the
+            // event table, and is a no-op in these two tests.
+            self.0.clear_events();
+            self.0.close();
+        }
+    }
+
     #[tokio::test]
     async fn test_home_start_arms_the_endstop_and_trsync() {
         let (chip, mcu) = chip();
@@ -384,6 +414,7 @@ mod tests {
         let mcu = Arc::new(Mcu::for_test("mcu", Interface::recording(wire)));
         mcu.install_dictionary(dictionary()).unwrap();
         mcu.set_clock_base(0);
+        let _session = SessionGuard(Arc::clone(&mcu));
         let chip = chip_with(Arc::clone(&mcu));
         let endstop = McuEndstop::new(chip, &params("PA1", false)).unwrap();
 
@@ -434,16 +465,8 @@ mod tests {
             ["trsync_start", "trsync_set_timeout", "endstop_home"],
             "the arm must go out whole, in queue order"
         );
-        // Production breaks the `Mcu → events → resource → Mcu` cycle in
-        // `McuObject::release_cycles`; a bare test has to do the same or the
-        // response callback keeps the `Mcu` (and its blocked receive) alive
-        // past the runtime's shutdown.
-        mcu.clear_events();
-        drop(endstop);
-        // Close the session explicitly: the receive runs inside
-        // `spawn_blocking`, and `Mcu::close` releases that parked read (its
-        // own view of the wire stops reading; the wire itself stays up).
-        mcu.close();
+        // The session is closed by `_session`'s `Drop` (see `SessionGuard`),
+        // which a failed assertion above must reach too.
     }
 
     /// ⑤ `endstop_query_state` carries upstream's `minclock`
@@ -470,6 +493,7 @@ mod tests {
         let mcu = Arc::new(Mcu::for_test("mcu", Interface::recording(wire)));
         mcu.install_dictionary(dictionary()).unwrap();
         mcu.set_clock_base(0);
+        let _session = SessionGuard(Arc::clone(&mcu));
         let chip = chip_with(Arc::clone(&mcu));
         let endstop = McuEndstop::new(chip, &params("PA1", false)).unwrap();
 
@@ -495,6 +519,35 @@ mod tests {
             sent.lock().unwrap().iter().filter(|p| **p == query).count(),
             1,
             "exactly one query once the minclock passed"
+        );
+    }
+
+    /// The guard is what keeps a test's session from outliving it.
+    ///
+    /// This is the pin for the shape above: with the chip's callback cycle
+    /// holding the only `Arc<Mcu>`, nothing but an explicit `close()` ends the
+    /// session — `Mcu::Drop` cannot run — and a session left open parks the
+    /// wire's read past the runtime's shutdown, which hangs the whole binary.
+    /// The two assertions are the two halves: open while the guard lives,
+    /// closed once it drops.
+    #[tokio::test]
+    async fn test_the_session_guard_closes_the_wire_session() {
+        let wire = RecordingWire::new();
+        let mcu = Arc::new(Mcu::for_test("mcu", Interface::recording(wire)));
+        mcu.install_dictionary(dictionary()).unwrap();
+        mcu.set_clock_base(0);
+        let chip = chip_with(Arc::clone(&mcu));
+        let _endstop = McuEndstop::new(chip, &params("PA1", false)).unwrap();
+
+        let session = SessionGuard(Arc::clone(&mcu));
+        assert!(
+            !mcu.is_closed(),
+            "the session is open while the guard lives"
+        );
+        drop(session);
+        assert!(
+            mcu.is_closed(),
+            "the guard must close the session when it drops"
         );
     }
 

@@ -425,6 +425,16 @@ endstop 资源（`mcu/resource/endstop.rs`，含 `minclock` 门控与 `home_wait
 `ads131m0x`、`ldc1612`、`load_cell` + `load_cell_probe`、`input_shaper` + `resonance_tester`
 （`shaper_defs`/`shaper_calibrate` 的算式在本仓 `shaper_defs.rs` 与 `input_shaper.rs` 内）。
 
+- [x] **load-cell 探测三线接线（2026-10-06，`ee4d59d` + `fbc6dbf` + `432b759`）**：
+      `[load_cell_probe]` 在 `klippy:mcu_identify` 把 Z 轨电机注册进自己的 trigger dispatch（对齐上游
+      `probe.LookupZSteppers`）；建完 trigger 后调传感器 `setup_trigger_analog`（三型 init attach，
+      对齐 `trigger_analog.py:300-301`）；注册 `probe` pin chip，`endstop_pin: probe:z_virtual_endstop` 可用
+      （对齐 `load_cell_probe.py:698`）。余下：
+  - [ ] **真机 PROBE 用例**（触发即停 + 无 MONITOR）——本机无 load cell，接线后才写得安全且有意义；
+  - [ ] **多 MCU 共享 Z 轴**：`add_stepper` 会拒，上游报配置错，本仓因事件总线隔离处理器而只能
+        `tracing::error!` 后继续 bring-up（已登记为与上游的差异，见 `upstream-deviations.md`）；
+  - [ ] `dump_taps` / `LOAD_CELL_TEST_TAP` 仍未接（`load_cell_probe` 的探测结果族）。
+
 - [ ] **`angle`**（磁编码传感器）——无文件、无 section。
 - [ ] **其余加速度计**：`icm20948`、`lis2dw`、`lis3dh`、`bmi160`（固件 `src/sensor_*.c` 已有，宿主未建）。
 - [ ] **`ads1x1x`**（`ads1x1x.py`）。

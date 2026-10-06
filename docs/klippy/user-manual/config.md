@@ -1166,16 +1166,38 @@ gap（如实登记）：**屏幕内容不渲染**（`display_template`/`display_
 
 写入在 bring-up 时经 MCU post-init 回调发出（装载期 SPI oid 尚未建立）。语料里写作 `[ad5206 stepper_digipot]`。
 
-### `[load_cell]` — 称重传感器（hx711/hx717 可用，批 #14）
+### `[load_cell]` — 称重传感器（hx711/hx717/ads1220/ads131m02/ads131m04，批 #14）
 
 | 选项 | 默认 | 说明 |
 |------|------|------|
-| `sensor_type` | —（必填） | `hx711`/`hx717` 已实现；`ads1220`/`ads131m0x` 等报 `sensor_type '<x>' is not implemented in this host` |
+| `sensor_type` | —（必填） | `hx711`/`hx717`（按 `dout_pin`/`sclk_pin` 接线）或 `ads1220`/`ads131m02`/`ads131m04`（SPI 芯片，选项按上游同名：`spi_mcu`/`cs_pin`/`data_ready_pin` 等）；其余值报 `sensor_type '<x>' is not implemented in this host` |
 | `dout_pin` / `sclk_pin` | — | 数据与时钟（必须同 MCU，否则 `… config error: All pins must be connected to the same MCU`） |
 | `sample_rate` / `gain` | 按芯片 | HX711：80/10、A-128/B-32/A-64（默认 80、A-128）；HX717：320/80/20/10、A-128/B-64/A-64/B-8（默认 320、A-128） |
 | `reference_tare_counts` / `counts_per_gram` / `sensor_orientation` | — / — / `normal` | 校准三件套（`counts_per_gram` minval 1.0，非法值 `must have minimum of 1.0`） |
 
-端点 `load_cell/dump_force`（mux key `load_cell`，四列 `time, force (g), counts, tare_counts`）。gap：`ads1220`/`ads131m0x`（LC-3）、`[load_cell_probe]` 未做、`hx71x_attach_trigger_analog` 未接。
+端点 `load_cell/dump_force`（mux key `load_cell`，四列 `time, force (g), counts, tare_counts`）。
+
+### `[load_cell_probe]` — 力探针（2026-10-06）
+
+传感与校准选项与 `[load_cell]` **同一节、同一份读取**（装载期用本节建一次 load cell），所以 `sensor_type`、`dout_pin`/`sclk_pin`、`sample_rate`/`gain`、`reference_tare_counts`/`counts_per_gram`/`sensor_orientation` 都写在本节；另加探测参数：
+
+| 选项 | 默认 | 说明 |
+|------|------|------|
+| `tare_time` | `4/60` s | 归零时间，限 `[0.01, 1.0]` |
+| `trigger_force` | `75` g | 触发力，限 `[10, 250]` |
+| `force_safety_limit` | `2000` g | 安全上限，限 `[100, 10000]` |
+| `speed` / `lift_speed` | `5.0` / = `speed` | 探测与抬升速率（均须 `> 0`） |
+| `samples` / `sample_retract_dist` / `samples_result` / `samples_tolerance` / `samples_tolerance_retries` | `1` / `2.0` / `average` / `0.100` / `0` | 与 `[probe]` 同名的取样参数（`samples_result` 取 `average`/`median`） |
+| `x_offset` / `y_offset` / `z_offset` | `0.` / `0.` / —（必填） | 探针相对喷嘴的偏移；`z_offset` 同时是 `probe:z_virtual_endstop` 的 `position_endstop` |
+| `drift_filter_cutoff_frequency` / `drift_filter_delay` | 关闭 / `2` | 连续归零的漂移滤波（截止频率 `[0.1, 20]`，延迟 `[1, 2]`） |
+| `buzz_filter_cutoff_frequency` / `buzz_filter_delay` | 关闭 / `2` | 蜂鸣滤波（截止频率须大于 `80` 且低于采样率上限；延迟 `[1, 2]`） |
+| `notch_filter_frequencies` / `notch_filter_quality` | 空 / `2.0` | 陷波滤波（频率表；品质因数 `[0.5, 6.0]`） |
+
+装载行为（2026-10-06 接线，对齐上游）：
+
+- 注册 `probe` 对象（`PROBE`/`PROBE_ACCURACY` 等命令族）与 `probe` pin chip：`endstop_pin: probe:z_virtual_endstop` 可解析，轨道取本节的 `z_offset` 作 `position_endstop`；**同一配置里再有一个 `probe` chip（`[probe]`/`[probe_eddy_current]`）是配置错误**（不静默覆盖）。
+- 在 `klippy:mcu_identify`（所有节装载完、任何连接与配置构建之前）把 Z 轨电机注册进本探针 trigger analog 的 trigger dispatch，触发时才会为该电机发 `stepper_stop_on_trigger`（上游 `probe.LookupZSteppers`）。
+- 同一时刻把本节的传感器采样以 **init** 命令交给 `[trigger_analog]`（上游 `trigger_analog.py` 的 `setup_trigger_analog`），固件才会持续上报采样活动。
 
 ### `[tmc2208 <stepper>]` / `[tmc2209 <stepper>]` — TMC 步进驱动（UART，批 #7）
 

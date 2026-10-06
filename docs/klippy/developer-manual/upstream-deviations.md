@@ -76,6 +76,7 @@ OctoPrint 只走 pty，与本条取舍无关。
 | 越界报错的限制值写法 | `0.0` 这类浮点写法 | 整数限制值打印成 `0` | [模块表](README.md)、[配置手册](../user-manual/config.md) |
 | MCU 配置 CRC | 上游的 CRC 算法 | **算的不是同一样东西**（本层唯一有意偏离） | [MCU 配置构建](mcu-config.md) |
 | identify offset 不匹配 | 不追加数据、用同一 offset 重试（可无限循环） | **落后**的块同样不追加、重发同一 offset（只是用每块的超时预算兜底）；**超前**的块直接报错 | [Identify 机制](identify.md)、[klippy-runtime](klippy-runtime.md) |
+| 事件处理器里的配置错误 | `send_event` 向上抛（`_handle_mcu_identify` 里的 `add_stepper` 拒绝直接中断 bring-up） | 事件总线隔离处理器，`load_cell_probe` 的 Z 轴注册遇「共享轴跨 MCU」只 `tracing::error!` 记录后继续 bring-up（同一错误在端停路径上仍是配置错） | `src/core/klippy/extras/load_cell_probe.rs`、`event-system.md` |
 | 等待与回调模型 | greenlet + `reactor.pause()` / `completion`（含 `register_fd`） | async/await + 定时器表；`set_latency_notifier` 纯诊断 | [reactor](reactor.md)、[klippy-runtime](klippy-runtime.md) |
 | section → 对象表 | 运行时按文件导入 | 编译期由 `section!` 声明生成 | [声明式表生成](codegen.md) |
 | 事件系统 | 运行时字符串事件、`*params` 可变参数、`try/except` 隔离、`assert_no_pause()` 强制 | 编译期枚举、变体字段、`catch_unwind`、不做运行时阻塞校验 | [事件系统 §6](event-system.md#6-与上游的差异) |

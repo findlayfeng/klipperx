@@ -48,7 +48,9 @@ use crate::core::klippy::extras::gcode_macro::PrinterGCodeMacro;
 use crate::core::klippy::extras::template::{
     Builtin, Context, PrinterView, Rt, Template, TemplateError,
 };
-use crate::core::klippy::gcode::{sync, CommandHandler, GCodeDispatch, GcodeCommand, GCODE_OBJECT};
+use crate::core::klippy::gcode::{
+    sync, CommandError, CommandHandler, GCodeDispatch, GcodeCommand, GCODE_OBJECT,
+};
 use crate::core::klippy::load::section;
 use crate::core::klippy::printer::{Printer, PrinterObject};
 
@@ -161,8 +163,16 @@ impl GCodeButton {
             }),
         )?;
 
-        let button = Arc::clone(self);
+        // Weakly: this object keeps the dispatcher (`gcode`), so a strong
+        // capture here would close the loop `GCodeButton → dispatcher → command
+        // table → GCodeButton`, which would outlive `teardown` and keep every
+        // part the table captured — each `Mcu` among them — alive with it (see
+        // `VirtualSdCard::register_commands`).
+        let button = Arc::downgrade(self);
         let handler: CommandHandler = sync(move |gcmd: &GcodeCommand| {
+            let Some(button) = button.upgrade() else {
+                return Err(CommandError::new("the gcode_button object is gone"));
+            };
             gcmd.respond_info(&format!("{}: {}", button.name, button.state_name()));
             Ok(())
         });

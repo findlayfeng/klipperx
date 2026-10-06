@@ -443,10 +443,23 @@ impl VirtualSdCard {
         ];
         for &(name, command, help, params) in COMMANDS {
             let handler: CommandHandler = {
-                let object = Arc::clone(self);
+                // The object is held **weakly**: this one keeps the dispatcher
+                // (`gcode`, for the replay task), so a strong capture here would
+                // close the loop `VirtualSdCard → dispatcher → command table →
+                // VirtualSdCard`. The table would then outlive `teardown` and
+                // keep every part it captured — each `Mcu` among them, whose
+                // `Drop` releases the blocking device read — alive with it
+                // (`idle_timeout` and `delayed_gcode` hold it weakly for the
+                // same reason).
+                let object = Arc::downgrade(self);
                 Arc::new(move |gcmd| {
-                    let object = Arc::clone(&object);
-                    Box::pin(async move { command(&object, gcmd).await })
+                    let object = object.clone();
+                    Box::pin(async move {
+                        let Some(object) = object.upgrade() else {
+                            return Err(CommandError::new("the virtual_sdcard object is gone"));
+                        };
+                        command(&object, gcmd).await
+                    })
                 })
             };
             let desc = if help.is_empty() { None } else { Some(help) };

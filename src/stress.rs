@@ -938,7 +938,8 @@ fn resolve_mcu(config: &Config, name: &str) -> Result<McuConfig, String> {
         .map_err(|err| err.to_string())
 }
 
-/// Drive one stepper through the host's motion path and read its position back.
+/// The `--task motion` smoke: drive the board's first stepper through the host's
+/// motion path and read its position back.
 ///
 /// This is the FW5f real-board smoke test: a [`Trapq`] move is solved by
 /// `itersolve`, compressed by the full `stepcompress`, sent as `queue_step`
@@ -946,19 +947,17 @@ fn resolve_mcu(config: &Config, name: &str) -> Result<McuConfig, String> {
 /// distance the move asked for. It borrows the same step/dir pins as
 /// `--task step` — and the same step distance the section configures
 /// (`rotation_distance` over `microsteps` and gearing) — so it needs no full
-/// `[printer]` config (and never touches the unknown Y/Z pins).
+/// `[printer]` config (and never touches the unknown Y/Z pins). The move itself
+/// is [`move_one_axis`].
 async fn motion_smoke(
     mcu_config: &McuConfig,
     mcu: Arc<Mcu>,
     config: &Config,
     pins: &Arc<PrinterPins>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    /// The move is `DISTANCE` mm at `SPEED` mm/s.
+    /// The move the smoke asks for: `DISTANCE` mm at `SPEED` mm/s.
     const DISTANCE: f64 = 5.0;
     const SPEED: f64 = 10.0;
-    /// How long to wait for the firmware to report the expected position.
-    const SETTLE_TIMEOUT: Duration = Duration::from_secs(5);
-    const SETTLE_POLL: Duration = Duration::from_millis(5);
 
     // The smoke test drives one stepper: it takes the first the board owns
     // (the step task drives all of them) and reports what it rejected, if any.
@@ -969,6 +968,29 @@ async fn motion_smoke(
     let Some(section) = steppers.into_iter().next() else {
         return Err(no_stepper_error(&mcu_config.name, &rejected).into());
     };
+    move_one_axis(mcu_config, mcu, pins, section, DISTANCE, SPEED).await
+}
+
+/// Drive one `section` through the host's motion path and read its position
+/// back.
+///
+/// The body of [`motion_smoke`] — a single [`Stepper::cartesian`] move of
+/// `distance` mm at `speed` mm/s, solved by `itersolve`, compressed by the full
+/// `stepcompress`, sent as `queue_step`, and checked against the firmware's own
+/// `stepper_get_position`. The smoke names the board's first stepper; the R5
+/// hardware case names its own, so this takes the section to drive.
+async fn move_one_axis(
+    mcu_config: &McuConfig,
+    mcu: Arc<Mcu>,
+    pins: &Arc<PrinterPins>,
+    section: StepperSource,
+    distance: f64,
+    speed: f64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    /// How long to wait for the firmware to report the expected position.
+    const SETTLE_TIMEOUT: Duration = Duration::from_secs(5);
+    const SETTLE_POLL: Duration = Duration::from_millis(5);
+
     let (step_pin, dir_pin) = section.numbers;
     let step_dist = section.options.step_dist.unwrap_or(DEFAULT_SMOKE_STEP_DIST);
     println!(
@@ -1006,7 +1028,7 @@ async fn motion_smoke(
     // Start 100 ms after the board's now, so the first step is comfortably in the
     // future and the whole schedule lands where the firmware expects it.
     let print_time = now + 0.1;
-    let duration = DISTANCE / SPEED;
+    let duration = distance / speed;
     let mut trapq = Trapq::new();
     trapq.append(
         print_time,
@@ -1015,13 +1037,13 @@ async fn motion_smoke(
         0.0,
         Xyz::default(),
         Xyz::new(1.0, 0.0, 0.0),
-        SPEED,
-        SPEED,
+        speed,
+        speed,
         0.0,
     );
     let flush_time = print_time + duration + 0.01;
     let commands = stepper.generate(&trapq, flush_time)?;
-    let expected = (DISTANCE / step_dist).round() as i32;
+    let expected = (distance / step_dist).round() as i32;
     println!(
         "{}",
         tagged(
@@ -1048,6 +1070,119 @@ async fn motion_smoke(
     }
     println!("{}", tagged(&mcu_config.name, "motion smoke OK"));
     Ok(())
+}
+
+/// Drive one `section` at a single steady step rate for a few seconds and report
+/// the rate the firmware held — the R11 short soak.
+///
+/// Unlike [`step_stress`], which ramps until the firmware shuts down, the rate
+/// here is **fixed** and chosen well under the board's limit, so the question is
+/// "does a known-safe load hold", not "where is the limit". It queues
+/// [`stage_for`] stages back to back at `rate` until `seconds` are covered,
+/// re-anchoring between them the way the ramp does, then asks the firmware two
+/// things: is it still configured (not shut down), and did its own
+/// `stepper_get_position` advance by exactly the steps queued ("no lost steps").
+///
+/// Returns the **actual** rate (`clock_freq / interval`, which is what the
+/// firmware saw). Errors — carrying the shutdown reason when there is one — if
+/// the firmware shut down or a step went missing.
+#[cfg(test)]
+async fn step_soak(
+    mcu_config: &McuConfig,
+    mcu: Arc<Mcu>,
+    pins: &Arc<PrinterPins>,
+    section: StepperSource,
+    rate: f64,
+    seconds: f64,
+) -> Result<f64, Box<dyn std::error::Error>> {
+    let (oids, mcu) =
+        configure_steppers(mcu_config, mcu, pins, std::slice::from_ref(&section)).await?;
+    let oid = oids[0];
+    let shutdown_reason: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    bind_shutdown(&mcu, &shutdown_reason)?;
+    let freq = mcu.clock_freq().map_err(std::io::Error::other)?;
+
+    // One stage is at most `MOVE_SLOTS` commands (`stage_for` caps it), so a
+    // several-second soak repeats it; the rate is the same for every stage.
+    let stage = stage_for(rate, freq, STAGE_SECONDS);
+    let actual_rate = freq / f64::from(stage.interval);
+    let stage_seconds = stage.duration_us as f64 / 1e6;
+    let stages = (seconds / stage_seconds).ceil().max(1.0) as u32;
+    let queued_per_stepper = u64::from(stages) * stage.steps;
+    let travel = section.options.step_dist.map(|step_dist| {
+        format!(
+            " (~{:.0} mm at {step_dist:.5} mm/step)",
+            queued_per_stepper as f64 * step_dist
+        )
+    });
+    println!(
+        "{}",
+        tagged(
+            &mcu_config.name,
+            format!(
+                "soak: {actual_rate:.0} steps/s for {:.1} s in {stages} stage(s) -> {queued_per_stepper} step(s){}",
+                stages as f64 * stage_seconds,
+                travel.unwrap_or_default(),
+            )
+        )
+    );
+
+    // The firmware's counter is direction-signed and accumulates across moves and
+    // `reset_step_clock`, so the soak measures the *change*: the axis's move, not
+    // where it started.
+    let start = mcu
+        .call_msg::<_, StepperPosition>(&StepperGetPosition { oid }, CALL_TIMEOUT)
+        .await
+        .map_err(|err| std::io::Error::other(format!("stepper_get_position: {err}")))?
+        .pos;
+
+    let mut queued: i64 = 0;
+    for _ in 0..stages {
+        if shutdown_reason
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .is_some()
+        {
+            break;
+        }
+        wait_for_idle(&mcu, oid).await?;
+        anchor_stepper(&mcu, oid).await?;
+        queue_stage(&mcu, &oids, &stage).await?;
+        queued += stage.steps as i64;
+        // Let the stage run out, waking early if the firmware stops.
+        let wait = Duration::from_micros(stage.duration_us)
+            + Duration::from_millis(20)
+            + Duration::from_micros(stage.duration_us / 10);
+        sleep_until(wait, &shutdown_reason).await;
+    }
+
+    let state = mcu
+        .call_msg::<_, ConfigState>(&GetConfig, CALL_TIMEOUT)
+        .await
+        .map_err(|err| std::io::Error::other(format!("get_config: {err}")))?;
+    if state.is_shutdown {
+        return Err(format!(
+            "the firmware shut down at {actual_rate:.0} steps/s: {}",
+            shutdown_message(&shutdown_reason)
+        )
+        .into());
+    }
+
+    // "No lost steps": every step put on the wire has to have happened. The sign
+    // is the firmware's direction convention; the magnitude is what matters.
+    let moved = i64::from(
+        mcu.call_msg::<_, StepperPosition>(&StepperGetPosition { oid }, CALL_TIMEOUT)
+            .await
+            .map_err(|err| std::io::Error::other(format!("stepper_get_position: {err}")))?
+            .pos,
+    ) - i64::from(start);
+    if moved.abs() != queued {
+        return Err(format!(
+            "the stepper counted {moved} step(s), not the {queued} queued at {actual_rate:.0} steps/s"
+        )
+        .into());
+    }
+    Ok(actual_rate)
 }
 
 /// Send the compressor's commands, in batches small enough for the send queue.
@@ -1599,22 +1734,35 @@ async fn configure_steppers(
         .map(|stepper| stepper.oid())
         .collect::<Result<Vec<u8>, McuError>>()
         .map_err(|err| std::io::Error::other(format!("stepper oid: {err}")))?;
-    let mut reset_sent = false;
+    // A board already carrying another configuration has to reboot before this
+    // one can be sent. One `reset` normally settles it; a second covers a board
+    // that was reconfigured while it rebooted (a real printer host reconnecting
+    // to it), and then the run gives up rather than looping — the board is
+    // under someone else's control.
+    const MAX_RESET_ATTEMPTS: u32 = 2;
+    let mut reset_attempts = 0;
     let configured = loop {
         match builder.handshake(&mcu, &mut built, false).await {
             Ok(configured) => break configured,
-            Err(McuError::ResetRequired) if !reset_sent => {
+            Err(McuError::ResetRequired) if reset_attempts < MAX_RESET_ATTEMPTS => {
+                reset_attempts += 1;
+                // A firmware that offers `reset` — every ARM board, the F103
+                // included — is rebooted rather than cleared in place, so this
+                // is the path a board already carrying another configuration
+                // takes (`reset_firmware` in `mcu/config.rs` prefers `reset`).
                 println!(
                     "{}",
                     tagged(
                         &mcu_config.name,
-                        "firmware has no config_reset; sending 'reset' and reconnecting"
+                        format!(
+                            "board already carries a different configuration; sending 'reset' and reconnecting (attempt {reset_attempts}/{MAX_RESET_ATTEMPTS})"
+                        )
                     )
                 );
+                let reset_started = Instant::now();
                 mcu.send_msg(&Reset)
                     .map_err(|err| std::io::Error::other(format!("reset: {err}")))?;
                 let _ = mcu.flush(RESET_FLUSH_TIMEOUT).await;
-                reset_sent = true;
                 // The old session's receive task still owns the port: left
                 // alive it would be a second reader on the same tty throughout
                 // `reconnect()`, stealing the new session's frames and dropping
@@ -1638,11 +1786,22 @@ async fn configure_steppers(
                 );
                 drop(mcu);
                 mcu = reconnect(mcu_config).await?;
+                println!(
+                    "{}",
+                    tagged(
+                        &mcu_config.name,
+                        format!(
+                            "reconnected {:.2} s after the reset; retrying the configuration handshake",
+                            reset_started.elapsed().as_secs_f64()
+                        )
+                    )
+                );
             }
             Err(McuError::ResetRequired) => {
-                return Err(std::io::Error::other(
-                    "firmware still carries a configuration after 'reset'",
-                ));
+                return Err(std::io::Error::other(format!(
+                    "MCU '{}' still carries a configuration after {reset_attempts} 'reset' attempt(s); is a real printer host holding the board?",
+                    mcu_config.name
+                )));
             }
             Err(err) => {
                 return Err(std::io::Error::other(format!("configure: {err}")));
@@ -3045,5 +3204,210 @@ mod tests {
             final_error(&failures, 2, 1, Task::Step).expect("a failed board fails the command");
         assert!(failed.starts_with("1 of 2 board(s) failed"), "{failed}");
         assert!(failed.contains("zboard"), "{failed}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Real-board motion cases (R5, R11) — declarations and their bodies
+    // -----------------------------------------------------------------------
+
+    /// What the R5 hardware case needs of the configured printer: the main MCU,
+    /// and `[stepper_x]` with the pins the move drives and the geometry that
+    /// sets `step_dist`.
+    ///
+    /// Kept here so the declaration and the ignored body below cannot drift.
+    fn r5_requires() -> crate::hardware_test::Requires {
+        crate::hardware_test::Requires::new()
+            .mcu()
+            .section("stepper_x")
+            .option("stepper_x", "step_pin")
+            .option("stepper_x", "dir_pin")
+            .option("stepper_x", "rotation_distance")
+            .option("stepper_x", "microsteps")
+    }
+
+    /// What the R11 hardware case needs of the configured printer: the main MCU
+    /// and `[stepper_x]` to soak.
+    fn r11_requires() -> crate::hardware_test::Requires {
+        crate::hardware_test::Requires::new()
+            .mcu()
+            .section("stepper_x")
+    }
+
+    /// The declaration is the gate: it decides whether a case runs or is
+    /// reported `HW-IGNORED`. This pins it against synthetic config text parsed
+    /// by the real parser, so a declaration that named the wrong section or
+    /// option — which would skip the case forever on a printer that could run
+    /// it — fails here instead of on hardware.
+    #[test]
+    fn the_stepper_hardware_cases_declare_what_they_read() {
+        use crate::hardware_test::{check, Missing};
+
+        let parse = |text: &str| Config::from_text(text).expect("the fixture parses").0;
+
+        // Everything both cases read: the MCU and `[stepper_x]` with its pins,
+        // rotation distance and microsteps.
+        let full = parse(
+            "[mcu]\nserial: /dev/ttyACM0\n\
+             [stepper_x]\nstep_pin: PA0\ndir_pin: PB1\n\
+             rotation_distance: 40\nmicrosteps: 16\n",
+        );
+        assert_eq!(check(&full, &r5_requires()), Ok(()));
+        assert_eq!(check(&full, &r11_requires()), Ok(()));
+
+        // Commented out is absent — the real parser decides, not a string match,
+        // so both cases skip rather than run against nothing.
+        let commented = parse(
+            "[mcu]\nserial: /dev/ttyACM0\n\
+             # [stepper_x]\n# step_pin: PA0\n# dir_pin: PB1\n\
+             # rotation_distance: 40\n# microsteps: 16\n",
+        );
+        assert_eq!(
+            check(&commented, &r5_requires()),
+            Err(vec![Missing::Section("stepper_x".to_string())])
+        );
+        assert_eq!(
+            check(&commented, &r11_requires()),
+            Err(vec![Missing::Section("stepper_x".to_string())])
+        );
+
+        // An option R5 reads but the config leaves out is its own skip …
+        let missing_geometry = parse(
+            "[mcu]\nserial: /dev/ttyACM0\n\
+             [stepper_x]\nstep_pin: PA0\ndir_pin: PB1\nrotation_distance: 40\n",
+        );
+        assert_eq!(
+            check(&missing_geometry, &r5_requires()),
+            Err(vec![Missing::Option {
+                section: "stepper_x".to_string(),
+                option: "microsteps".to_string(),
+            }])
+        );
+        // … while R11, which only needs the section, still runs there.
+        assert_eq!(check(&missing_geometry, &r11_requires()), Ok(()));
+
+        // The MCU is part of both declarations.
+        let no_mcu = parse(
+            "[stepper_x]\nstep_pin: PA0\ndir_pin: PB1\n\
+             rotation_distance: 40\nmicrosteps: 16\n",
+        );
+        assert_eq!(
+            check(&no_mcu, &r5_requires()),
+            Err(vec![Missing::Mcu("mcu".to_string())])
+        );
+        assert_eq!(
+            check(&no_mcu, &r11_requires()),
+            Err(vec![Missing::Mcu("mcu".to_string())])
+        );
+    }
+
+    /// The one stepper section a case drives, out of the board's, or a message
+    /// naming what is missing.
+    fn named_stepper(steppers: Vec<StepperSource>, name: &str) -> StepperSource {
+        steppers
+            .into_iter()
+            .find(|section| section.name == name)
+            .unwrap_or_else(|| panic!("the board owns no [{name}] stepper to drive"))
+    }
+
+    /// R5 — a single-axis move against a real board, reconciled step for step.
+    ///
+    /// `TESTING.md`'s R5 (lines 52-56) asks for a known move and a read-back:
+    /// “电机方向/距离与指令一致，固件步数 = 距离 / `step_dist`”. That is what this
+    /// asserts, for the one axis — `[stepper_x]` — through the whole host path
+    /// (`Trapq` → `itersolve` → `stepcompress` → `queue_step` → firmware
+    /// `stepper_get_position`): the firmware's own count must equal
+    /// `round(DISTANCE_MM / step_dist)`, and [`move_one_axis`] fails the case
+    /// when it does not.
+    ///
+    /// # What it does to the machine
+    /// It drives **`[stepper_x]` only** (`step_pin`/`dir_pin`) through one move of
+    /// `DISTANCE_MM` = 5 mm at `SPEED_MM_S` = 10 mm/s — both inside the 10 mm /
+    /// 10 mm/s this case bounds itself to. That is `round(5 / step_dist)` steps:
+    /// 400 with the 0.0125 mm/step a 40 mm/rotation × 16-microstep axis gives,
+    /// 500 with the 0.01 mm the documented run used. **Make sure the X axis has
+    /// at least that ~5 mm of travel before starting**; the move checks no limit
+    /// and will step straight into one it is already against.
+    ///
+    /// # The board it takes over
+    /// Like every `stress` run it configures the board's firmware stepper, so a
+    /// board currently carrying another configuration — a real printer host's,
+    /// say — is `reset` and reconnected first. R5 and R11 configure the same
+    /// `[stepper_x]`, so whichever runs second reuses the first's configuration.
+    #[tokio::test]
+    #[ignore = "hardware: needs KLIPPERX_HW_CONFIG"]
+    async fn test_r5_single_axis_move_matches_the_firmware_step_count() {
+        /// R5's move: `DISTANCE_MM` at `SPEED_MM_S`, kept well inside the 10 mm /
+        /// 10 mm/s this hardware case allows.
+        const DISTANCE_MM: f64 = 5.0;
+        const SPEED_MM_S: f64 = 10.0;
+
+        let Some(machine) = crate::hardware_test::acquire(
+            "test_r5_single_axis_move_matches_the_firmware_step_count",
+            &r5_requires(),
+        ) else {
+            return; // reported as HW-IGNORED; the test passes without a board
+        };
+        let mcu_config = resolve_mcu(machine.config(), "mcu").expect("the [mcu] section resolves");
+        let pins = build_pin_registry(machine.config()).expect("the pin registry builds");
+        let mcu = connect(&mcu_config).await.expect("the board identifies");
+        let section = named_stepper(
+            find_steppers(machine.config(), "mcu", &mcu, &pins).0,
+            "stepper_x",
+        );
+        move_one_axis(&mcu_config, mcu, &pins, section, DISTANCE_MM, SPEED_MM_S)
+            .await
+            .expect("R5: the firmware's step count must match the move");
+    }
+
+    /// R11 — a short, controlled step soak against a real board.
+    ///
+    /// `TESTING.md`'s R11 (lines 85-87) asks that continuous stepping leave the
+    /// firmware alive — “无 `Stepper too far in past` / `Timer too close`、无丢步、
+    /// USB 不掉线”. This is the short form: a fixed, deliberately **conservative**
+    /// rate for seconds, instead of the ascending ramp `--task step` runs to the
+    /// limit. [`step_soak`] fails the case on a shutdown reason or on a step count
+    /// that does not match what was queued (the “无丢步” half), and the case prints
+    /// the rate the firmware actually held.
+    ///
+    /// # What it does to the machine
+    /// It drives **`[stepper_x]` only**, in one direction (it never reverses).
+    /// The rate is `RATE` = 5 000 steps/s — ~68× under the ~339 623 steps/s the
+    /// STM32F103 is documented to survive (`TESTING.md`) — for `SECONDS` = 2 s,
+    /// i.e. `RATE × SECONDS` = 10 000 steps. The case prints the travel that
+    /// implies using the section's own step distance (≈125 mm at a typical
+    /// 0.0125 mm/step). **Make sure the axis has that much travel before
+    /// starting** (or run it on a bench with the motor disengaged): the soak
+    /// neither reverses nor stops at a limit.
+    ///
+    /// # The board it takes over
+    /// As in R5, it configures the board's firmware stepper; a board carrying
+    /// another configuration is `reset` and reconnected first, and re-running
+    /// this case over the configuration R5 (or this soak) left reuses it.
+    #[tokio::test]
+    #[ignore = "hardware: needs KLIPPERX_HW_CONFIG"]
+    async fn test_r11_short_soak_holds_a_safe_step_rate() {
+        /// The soak's steady rate, in steps per second — a conservative fraction
+        /// of the documented ~339 623 steps/s survival line.
+        const RATE: f64 = 5_000.0;
+        /// How long the soak drives, in seconds.
+        const SECONDS: f64 = 2.0;
+
+        let Some(machine) = crate::hardware_test::acquire(
+            "test_r11_short_soak_holds_a_safe_step_rate",
+            &r11_requires(),
+        ) else {
+            return; // reported as HW-IGNORED; the test passes without a board
+        };
+        let mcu_config = resolve_mcu(machine.config(), "mcu").expect("the [mcu] section resolves");
+        let pins = build_pin_registry(machine.config()).expect("the pin registry builds");
+        let mcu = connect(&mcu_config).await.expect("the board identifies");
+        let section = named_stepper(
+            find_steppers(machine.config(), "mcu", &mcu, &pins).0,
+            "stepper_x",
+        );
+        let rate = step_soak(&mcu_config, mcu, &pins, section, RATE, SECONDS)
+            .await
+            .expect("R11: the firmware must hold the safe rate without a shutdown or a lost step");
+        println!("R11: held {rate:.0} steps/s for {SECONDS} s with no shutdown");
     }
 }

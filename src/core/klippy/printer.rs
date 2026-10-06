@@ -2078,26 +2078,39 @@ mod tests {
     ///
     /// The request goes through the same [`Request::parse`] the server uses, and
     /// the connection is [`silent_target`]: neither endpoint of the objects
-    /// family pushes anything.
-    async fn endpoint_answer<E: Endpoint>(endpoint: &E, body: &str, api: &Api) -> Value {
+    /// family pushes anything. The endpoint's `handle` is async, so [`block_on`]
+    /// drives it — this case is a plain `#[test]`, not a `#[tokio::test]`.
+    fn endpoint_answer<E: Endpoint>(endpoint: &E, body: &str, api: &Api) -> Value {
         let request = Request::parse(body.as_bytes()).expect("the request is a valid one");
-        endpoint
-            .handle(&request, &context(api, silent_target()))
-            .await
+        block_on(endpoint.handle(&request, &context(api, silent_target())))
             .unwrap_or_else(|error| panic!("{} answers: {error:?}", endpoint.path()))
+    }
+
+    /// Drive one future to completion on a runtime this call owns.
+    ///
+    /// The smoke case is a plain `#[test]`: [`crate::hardware_test::Machine::bring_up`]
+    /// owns the machine's runtime and shuts it down on `Drop`, neither of which
+    /// may run from inside another runtime (see `hardware_test.rs`). The objects
+    /// endpoints are async, so each call gets a current-thread runtime of its own
+    /// rather than the `#[tokio::test]` this case cannot be.
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a current-thread runtime")
+            .block_on(future)
     }
 
     /// The board's `mcu.last_stats`, once the firmware has sent a `stats`
     /// report; `None` when [`STATS_WAIT`] runs out first.
-    async fn wait_for_last_stats(printer: &Arc<Printer>, api: &Api) -> Option<Value> {
+    fn wait_for_last_stats(printer: &Arc<Printer>, api: &Api) -> Option<Value> {
         let deadline = Instant::now() + STATS_WAIT;
         loop {
             let answer = endpoint_answer(
                 &ObjectsQuery::new(Arc::clone(printer)),
                 r#"{"method":"objects/query","params":{"objects":{"mcu":["last_stats"]}}}"#,
                 api,
-            )
-            .await;
+            );
             let last_stats = answer["status"]["mcu"]["last_stats"].clone();
             if !last_stats.is_null() {
                 return Some(last_stats);
@@ -2105,7 +2118,7 @@ mod tests {
             if Instant::now() >= deadline {
                 return None;
             }
-            tokio::time::sleep(STATS_POLL).await;
+            thread::sleep(STATS_POLL);
         }
     }
 
@@ -2267,9 +2280,9 @@ mod tests {
     ///   cargo test -p klipperx --lib test_objects_and_status_smoke_on_a_real_board \
     ///   -- --ignored --nocapture
     /// ```
-    #[tokio::test]
+    #[test]
     #[ignore = "hardware: needs KLIPPERX_HW_CONFIG"]
-    async fn test_objects_and_status_smoke_on_a_real_board() {
+    fn test_objects_and_status_smoke_on_a_real_board() {
         const TEST_NAME: &str = "test_objects_and_status_smoke_on_a_real_board";
 
         let Some(machine) = crate::hardware_test::acquire(TEST_NAME, &smoke_case()) else {
@@ -2284,8 +2297,7 @@ mod tests {
             &ObjectsList::new(Arc::clone(printer)),
             r#"{"method":"objects/list"}"#,
             &api,
-        )
-        .await;
+        );
         let names: Vec<&str> = listed["objects"]
             .as_array()
             .unwrap_or_else(|| panic!("objects/list answers a list of names: {listed}"))
@@ -2318,8 +2330,7 @@ mod tests {
             &ObjectsQuery::new(Arc::clone(printer)),
             r#"{"method":"objects/query","params":{"objects":{"toolhead":["position","homed_axes"],"heaters":["available_sensors","available_heaters"]}}}"#,
             &api,
-        )
-        .await;
+        );
         let eventtime = queried["eventtime"]
             .as_f64()
             .unwrap_or_else(|| panic!("the answer is dated: {queried}"));
@@ -2357,8 +2368,7 @@ mod tests {
             }));
         }
         gcode
-            .run_script("M115")
-            .await
+            .run_script_sync("M115")
             .unwrap_or_else(|error| panic!("{TEST_NAME}: M115 must be answered: {error}"));
         let lines = emitted
             .lock()
@@ -2376,7 +2386,7 @@ mod tests {
         // 4. The board's own scheduler stats, through the same query. Not
         //    mandatory: the firmware reports on its own schedule, so a board that
         //    has not reported within the bound gets a note.
-        match wait_for_last_stats(printer, &api).await {
+        match wait_for_last_stats(printer, &api) {
             Some(last_stats) => {
                 for field in ["mcu_tick_avg", "mcu_tick_stddev", "mcu_tick_awake"] {
                     let value = last_stats[field].as_f64().unwrap_or_else(|| {

@@ -1084,11 +1084,17 @@ impl Printer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::klippy::api::protocol::Request;
+    use crate::core::klippy::api::registry::Api;
+    use crate::core::klippy::api::test_support::{context, silent_target};
+    use crate::core::klippy::api::{Endpoint, ObjectsList, ObjectsQuery};
+    use crate::core::klippy::gcode::{GCodeDispatch, GCODE_OBJECT};
     use crate::core::klippy::reactor::ManualReactor;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
     use std::sync::Weak;
     use std::thread;
+    use std::time::{Duration, Instant};
 
     /// A printer on a clock the test controls.
     ///
@@ -2036,5 +2042,455 @@ mod tests {
         manual.advance(2.0);
 
         assert_eq!(printer.reactor().monotonic(), 2.0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Real board: the objects and status a brought-up machine answers with
+    // -----------------------------------------------------------------------
+
+    /// How long the smoke case waits for the board's first `stats` report.
+    ///
+    /// The firmware sends one `stats` message every 5 s
+    /// (`third_party/klipper/src/basecmd.c:332`, `timer_from_us(5000000)`), so
+    /// the first one arrives a few seconds after the machine is ready. This is a
+    /// wait bound, not an assertion: a board that never reports gets a note.
+    const STATS_WAIT: Duration = Duration::from_secs(8);
+
+    /// How often the smoke case re-asks for `mcu.last_stats` while waiting.
+    const STATS_POLL: Duration = Duration::from_millis(500);
+
+    /// What the smoke case needs of the configured printer: the main MCU, the
+    /// `[printer]` section the toolhead is built from, and `[extruder]` with a
+    /// temperature sensor — the section that registers both the `extruder`
+    /// object and, through `heaters::ensure`, the `heaters` one.
+    ///
+    /// Kept here so the declaration and the ignored body below cannot drift, and
+    /// shared with [`test_the_smoke_case_declaration_matches_what_it_reads`].
+    fn smoke_case() -> crate::hardware_test::Requires {
+        crate::hardware_test::Requires::new()
+            .mcu()
+            .section("printer")
+            .option("extruder", "sensor_pin")
+    }
+
+    /// One endpoint's answer, as a client gets it, against the machine that is
+    /// up.
+    ///
+    /// The request goes through the same [`Request::parse`] the server uses, and
+    /// the connection is [`silent_target`]: neither endpoint of the objects
+    /// family pushes anything.
+    async fn endpoint_answer<E: Endpoint>(endpoint: &E, body: &str, api: &Api) -> Value {
+        let request = Request::parse(body.as_bytes()).expect("the request is a valid one");
+        endpoint
+            .handle(&request, &context(api, silent_target()))
+            .await
+            .unwrap_or_else(|error| panic!("{} answers: {error:?}", endpoint.path()))
+    }
+
+    /// The board's `mcu.last_stats`, once the firmware has sent a `stats`
+    /// report; `None` when [`STATS_WAIT`] runs out first.
+    async fn wait_for_last_stats(printer: &Arc<Printer>, api: &Api) -> Option<Value> {
+        let deadline = Instant::now() + STATS_WAIT;
+        loop {
+            let answer = endpoint_answer(
+                &ObjectsQuery::new(Arc::clone(printer)),
+                r#"{"method":"objects/query","params":{"objects":{"mcu":["last_stats"]}}}"#,
+                api,
+            )
+            .await;
+            let last_stats = answer["status"]["mcu"]["last_stats"].clone();
+            if !last_stats.is_null() {
+                return Some(last_stats);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(STATS_POLL).await;
+        }
+    }
+
+    /// Check `toolhead.position`'s shape: an array of at least three axes, all
+    /// of them numbers.
+    ///
+    /// The machine reports a coordinate as `[x, y, z, e]`, so this is four axes
+    /// on every kinematics; the bound is three because the space axes are what a
+    /// client's move math needs. A non-finite axis cannot survive the wire
+    /// (`serde_json` writes `NaN`/`inf` as `null`, which the number check below
+    /// catches first), so "a number" here is "a finite number".
+    fn position_shape(value: &Value) -> Result<(), String> {
+        let axes = value
+            .as_array()
+            .ok_or_else(|| format!("position is not an array: {value}"))?;
+        if axes.len() < 3 {
+            return Err(format!(
+                "position has {} axes, wanted at least 3: {value}",
+                axes.len()
+            ));
+        }
+        for (index, axis) in axes.iter().enumerate() {
+            let Some(number) = axis.as_f64() else {
+                return Err(format!("position[{index}] is not a number: {value}"));
+            };
+            if !number.is_finite() {
+                return Err(format!("position[{index}] is not finite: {value}"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Check `toolhead.homed_axes`'s shape: the letters of the homed axes, so
+    /// only `x`, `y` and `z` — and possibly none, since an unhomed machine
+    /// reports the empty string.
+    fn homed_axes_shape(value: &Value) -> Result<(), String> {
+        let axes = value
+            .as_str()
+            .ok_or_else(|| format!("homed_axes is not a string: {value}"))?;
+        match axes.chars().find(|axis| !matches!(axis, 'x' | 'y' | 'z')) {
+            Some(other) => Err(format!("homed_axes holds '{other}': {value}")),
+            None => Ok(()),
+        }
+    }
+
+    /// Check an `available_sensors`/`available_heaters`-shaped answer: a
+    /// non-empty array of names, one of which is `expected`.
+    fn names_shape(value: &Value, expected: &str) -> Result<(), String> {
+        let names = value
+            .as_array()
+            .ok_or_else(|| format!("the names are not an array: {value}"))?;
+        if names.is_empty() {
+            return Err(format!("there are no names at all: {value}"));
+        }
+        for name in names {
+            if name.as_str().is_none() {
+                return Err(format!("{name} is not a name: {value}"));
+            }
+        }
+        if !names.iter().any(|name| name.as_str() == Some(expected)) {
+            return Err(format!("'{expected}' is not in the list: {value}"));
+        }
+        Ok(())
+    }
+
+    /// The version out of the lines `M115` answered with.
+    ///
+    /// `M115` is upstream's `cmd_M115`: one `// ` line (`respond_info`'s
+    /// prefix) naming the firmware and the host's software version. A `!! `
+    /// line is the dispatcher refusing the command, which is not an answer.
+    fn m115_version(lines: &[String]) -> Result<String, String> {
+        if let Some(refusal) = lines.iter().find(|line| line.starts_with("!!")) {
+            return Err(format!("the command was refused: {refusal}"));
+        }
+        let line = lines
+            .iter()
+            .find(|line| line.starts_with("// FIRMWARE_NAME:"))
+            .ok_or_else(|| format!("no FIRMWARE_NAME line among {lines:?}"))?;
+        let name = line
+            .trim_start_matches("// ")
+            .split_whitespace()
+            .next()
+            .unwrap_or_default();
+        if name != "FIRMWARE_NAME:Klipper" {
+            return Err(format!("the firmware name is {name}: {line}"));
+        }
+        let version = line
+            .split_once("FIRMWARE_VERSION:")
+            .map(|(_, version)| version.trim())
+            .unwrap_or_default();
+        if version.is_empty() {
+            return Err(format!("no version in {line}"));
+        }
+        Ok(version.to_string())
+    }
+
+    /// The objects-and-status smoke case on a real board (level 2): bring the
+    /// configured machine up and then only read from it.
+    ///
+    /// 前提：**本用例假定提供的配置是正确的**（上游 Klipper 也会接受、且与实际接线一致）。
+    /// 它验的是**本仓这个模块的行为**，不是你的配置对不对——配置/接线/固件不匹配导致的失败，
+    /// 不代表模块有 bug。要验配置本身请用宿主或上游 Klipper。
+    ///
+    /// # What it verifies
+    ///
+    /// That what the config loaded is *usable*, in the four places a client
+    /// reads the machine through:
+    ///
+    /// 1. **`objects/list`** (`api/endpoints/objects_list.rs`) names every object
+    ///    the declared sections register — the list *is* the loader's registry, so
+    ///    a section that loaded without registering shows up here;
+    /// 2. **`objects/query`** (`api/endpoints/objects_query.rs`) answers with the
+    ///    shapes the protocol promises: `toolhead.position` is at least three
+    ///    finite numbers and `toolhead.homed_axes` holds only axis letters, while
+    ///    `heaters.available_sensors` / `available_heaters` are non-empty name
+    ///    lists that contain the declared `[extruder]`;
+    /// 3. **`M115`** (`gcode.rs`'s built-in, upstream's `cmd_M115`) answers the one
+    ///    `// ` line naming the firmware and the **host's own** software version —
+    ///    the value the host injected, not a constant;
+    /// 4. the board's own **`last_stats`** (`mcu/object.rs`'s periodic `stats`
+    ///    report) is readable through that same query, once the firmware has sent
+    ///    one.
+    ///
+    /// # What it does not cover
+    ///
+    /// It is a smoke case, not a functional one: no motion accuracy, no heater
+    /// closed loop, no homing, no endstop, no thermistor reading. It does not
+    /// check *your* config either — see the 前提 above. It reads fields, so a
+    /// value that is present but wrong is not its business: `toolhead.position`
+    /// is the commanded position of a machine that has not moved. `last_stats` is
+    /// deliberately not mandatory — the firmware reports on its own schedule, and
+    /// a board that has not reported yet is a note rather than a failure.
+    ///
+    /// # What it assumes about the wiring
+    ///
+    /// One board — the config's own `[mcu]` — and nothing else wired beyond what
+    /// the config already needs. The declarations are what the assertions rest on:
+    /// `[mcu]` gives the `mcu` object, `[printer]` the `toolhead` (with that
+    /// config's kinematics, so `position` and `homed_axes` are whatever it
+    /// reports), `[extruder]` with a `sensor_pin` the `extruder` and `heaters`
+    /// objects. No tool, no filament, no endstop and no sensor reading is needed
+    /// for anything asserted here.
+    ///
+    /// # What it is safe to run, and what it does to the machine
+    ///
+    /// **Nothing moves and no heater is commanded.** Every command is a read or a
+    /// query: `objects/list`, `objects/query`, one `M115` (whose handler only
+    /// formats a string the host already knows) and the periodic `stats` reads.
+    /// There is no motion bound to write because there is no motion; the only time
+    /// spent is the bounded [`STATS_WAIT`] wait for the board's own report.
+    ///
+    /// Like every level-2 case it brings the machine up — the board is configured
+    /// and its clock set — and takes it down again when the test ends, holding the
+    /// board lock throughout. The printer host must not be running: one board
+    /// carries one session.
+    ///
+    /// ```text
+    /// KLIPPERX_HW_CONFIG=~/printer_data/config/printer.cfg \
+    ///   cargo test -p klipperx --lib test_objects_and_status_smoke_on_a_real_board \
+    ///   -- --ignored --nocapture
+    /// ```
+    #[tokio::test]
+    #[ignore = "hardware: needs KLIPPERX_HW_CONFIG"]
+    async fn test_objects_and_status_smoke_on_a_real_board() {
+        const TEST_NAME: &str = "test_objects_and_status_smoke_on_a_real_board";
+
+        let Some(machine) = crate::hardware_test::acquire(TEST_NAME, &smoke_case()) else {
+            return; // reported as HW-IGNORED; nothing was touched
+        };
+        let started = machine.bring_up().expect("the machine comes up");
+        let printer = started.printer();
+        let api = Api::new();
+
+        // 1. `objects/list`: every object the declared sections register.
+        let listed = endpoint_answer(
+            &ObjectsList::new(Arc::clone(printer)),
+            r#"{"method":"objects/list"}"#,
+            &api,
+        )
+        .await;
+        let names: Vec<&str> = listed["objects"]
+            .as_array()
+            .unwrap_or_else(|| panic!("objects/list answers a list of names: {listed}"))
+            .iter()
+            .map(|name| {
+                name.as_str()
+                    .unwrap_or_else(|| panic!("every object name is a string: {listed}"))
+            })
+            .collect();
+        // Declared section → the object it registers. `[printer]` registers its
+        // object under `toolhead` (`load.rs`'s factory table), and `heaters` is
+        // registered by `[extruder]`'s `heaters::ensure` call — so each assertion
+        // rests on one of the declarations above.
+        for (declaration, object) in [
+            ("[mcu]", "mcu"),
+            ("[printer]", "toolhead"),
+            ("[extruder]", "extruder"),
+            ("[extruder]", "heaters"),
+        ] {
+            assert!(
+                names.contains(&object),
+                "{TEST_NAME}: objects/list must name '{object}' ({declaration} declares it): \
+                 {names:?}"
+            );
+        }
+        println!("{TEST_NAME}: objects/list names {} objects", names.len());
+
+        // 2. `objects/query`: the fields a client reads, in their promised shapes.
+        let queried = endpoint_answer(
+            &ObjectsQuery::new(Arc::clone(printer)),
+            r#"{"method":"objects/query","params":{"objects":{"toolhead":["position","homed_axes"],"heaters":["available_sensors","available_heaters"]}}}"#,
+            &api,
+        )
+        .await;
+        let eventtime = queried["eventtime"]
+            .as_f64()
+            .unwrap_or_else(|| panic!("the answer is dated: {queried}"));
+        assert!(
+            eventtime.is_finite() && eventtime >= 0.0,
+            "{TEST_NAME}: eventtime = {eventtime}"
+        );
+        let status = &queried["status"];
+        position_shape(&status["toolhead"]["position"]).expect("toolhead.position");
+        homed_axes_shape(&status["toolhead"]["homed_axes"]).expect("toolhead.homed_axes");
+        names_shape(&status["heaters"]["available_sensors"], "extruder")
+            .expect("heaters.available_sensors");
+        names_shape(&status["heaters"]["available_heaters"], "extruder")
+            .expect("heaters.available_heaters");
+        println!(
+            "{TEST_NAME}: toolhead.position = {}, homed_axes = {}",
+            status["toolhead"]["position"], status["toolhead"]["homed_axes"]
+        );
+
+        // 3. `M115`: the host's own version, in the one line upstream's
+        //    `cmd_M115` answers with. The handler is a built-in registered
+        //    `when_not_ready`, so a refusal here is a defect rather than a
+        //    command this board happens not to have.
+        let gcode = printer
+            .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+            .expect("the loader registers `gcode` before any section");
+        let emitted = Arc::new(Mutex::new(Vec::new()));
+        {
+            let emitted = Arc::clone(&emitted);
+            gcode.register_output_handler(Arc::new(move |line: &str| {
+                emitted
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .push(line.to_string())
+            }));
+        }
+        gcode
+            .run_script("M115")
+            .await
+            .unwrap_or_else(|error| panic!("{TEST_NAME}: M115 must be answered: {error}"));
+        let lines = emitted
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone();
+        let version =
+            m115_version(&lines).unwrap_or_else(|reason| panic!("{TEST_NAME}: M115: {reason}"));
+        assert_eq!(
+            version,
+            printer.software_version(),
+            "{TEST_NAME}: M115 reports the version the host injected"
+        );
+        println!("{TEST_NAME}: M115 answers FIRMWARE_VERSION:{version}");
+
+        // 4. The board's own scheduler stats, through the same query. Not
+        //    mandatory: the firmware reports on its own schedule, so a board that
+        //    has not reported within the bound gets a note.
+        match wait_for_last_stats(printer, &api).await {
+            Some(last_stats) => {
+                for field in ["mcu_tick_avg", "mcu_tick_stddev", "mcu_tick_awake"] {
+                    let value = last_stats[field].as_f64().unwrap_or_else(|| {
+                        panic!("{TEST_NAME}: mcu.last_stats.{field} is a number: {last_stats}")
+                    });
+                    assert!(
+                        value.is_finite() && value >= 0.0,
+                        "{TEST_NAME}: mcu.last_stats.{field} = {value}"
+                    );
+                }
+                println!("{TEST_NAME}: mcu.last_stats = {last_stats}");
+            }
+            None => println!(
+                "HW-NOTE: {TEST_NAME}: the board has not reported `stats` within {STATS_WAIT:?}, \
+                 so `mcu.last_stats` is not checked by this case (not mandatory)"
+            ),
+        }
+        // `started` goes out of scope here, and its `Drop` is what takes the
+        // machine down.
+    }
+
+    /// The declaration the smoke case runs under, against configs that do and do
+    /// not provide what it names.
+    ///
+    /// A declaration that names the wrong section or key is the one failure this
+    /// framework cannot report as a failure: the case would be skipped quietly on
+    /// every real config. So the config text is judged by the same
+    /// [`crate::hardware_test::check`] the framework uses.
+    #[test]
+    fn test_the_smoke_case_declaration_matches_what_it_reads() {
+        let parse = |text: &str| {
+            crate::core::klippy::config::Config::from_text(text)
+                .expect("the fixture parses")
+                .0
+        };
+
+        // Everything it reads: the MCU, `[printer]`, and an extruder with a sensor.
+        let full = parse(
+            "[mcu]\nserial: /dev/fake\n\
+             [printer]\nkinematics: none\nmax_velocity: 300\nmax_accel: 3000\n\
+             [extruder]\nsensor_pin: PA0\nsensor_type: EPCOS 100K B57560G104F\n",
+        );
+        assert_eq!(crate::hardware_test::check(&full, &smoke_case()), Ok(()));
+
+        // Commented out is absent — the real parser decides, not a string match —
+        // so the case skips rather than running against a machine it cannot read.
+        let commented = parse(
+            "[mcu]\nserial: /dev/fake\n\
+             # [printer]\n# kinematics: none\n\
+             # [extruder]\n# sensor_pin: PA0\n",
+        );
+        assert_eq!(
+            crate::hardware_test::check(&commented, &smoke_case()),
+            Err(vec![
+                crate::hardware_test::Missing::Section("printer".to_string()),
+                crate::hardware_test::Missing::Section("extruder".to_string()),
+            ])
+        );
+
+        // The one option it reads is what makes `heaters` report a sensor at all,
+        // so an extruder without one is its own skip.
+        let no_sensor = parse(
+            "[mcu]\nserial: /dev/fake\n[printer]\nkinematics: none\n[extruder]\nstep_pin: PA1\n",
+        );
+        assert_eq!(
+            crate::hardware_test::check(&no_sensor, &smoke_case()),
+            Err(vec![crate::hardware_test::Missing::Option {
+                section: "extruder".to_string(),
+                option: "sensor_pin".to_string(),
+            }])
+        );
+
+        // No board at all is the framework's own skip, not a missing section.
+        let no_mcu = parse("[printer]\nkinematics: none\n[extruder]\nsensor_pin: PA0\n");
+        assert_eq!(
+            crate::hardware_test::check(&no_mcu, &smoke_case()),
+            Err(vec![crate::hardware_test::Missing::Mcu("mcu".to_string())])
+        );
+    }
+
+    /// The shape checks the smoke case asserts with, on values a machine could
+    /// report — and on the wrong shapes they have to reject, so that a check which
+    /// can never fail cannot pass for one that bites.
+    #[test]
+    fn test_the_smoke_case_shape_checks_reject_the_wrong_shapes() {
+        // `position`: three or four numbers.
+        assert!(position_shape(&serde_json::json!([1.0, -2.0, 3.0, 0.0])).is_ok());
+        assert!(position_shape(&serde_json::json!([0.0, 0.0, 0.0])).is_ok());
+        assert!(position_shape(&serde_json::json!([0.0, 0.0])).is_err());
+        assert!(position_shape(&serde_json::json!(null)).is_err());
+        assert!(position_shape(&serde_json::json!([0.0, 0.0, "z"])).is_err());
+
+        // `homed_axes`: axis letters only, and an unhomed machine is the empty
+        // string.
+        assert!(homed_axes_shape(&serde_json::json!("")).is_ok());
+        assert!(homed_axes_shape(&serde_json::json!("xz")).is_ok());
+        assert!(homed_axes_shape(&serde_json::json!("xze")).is_err());
+        assert!(homed_axes_shape(&serde_json::json!(0)).is_err());
+
+        // `available_*`: non-empty names, including the declared section.
+        assert!(names_shape(&serde_json::json!(["extruder"]), "extruder").is_ok());
+        assert!(names_shape(&serde_json::json!(["extruder", "heater_bed"]), "extruder").is_ok());
+        assert!(names_shape(&serde_json::json!([]), "extruder").is_err());
+        assert!(names_shape(&serde_json::json!(["heater_bed"]), "extruder").is_err());
+        assert!(names_shape(&serde_json::json!([1]), "extruder").is_err());
+
+        // `M115`: the line's two fields, and a refusal is not an answer.
+        let answered = ["// FIRMWARE_NAME:Klipper FIRMWARE_VERSION:v0.13.0-test".to_string()];
+        assert_eq!(m115_version(&answered).as_deref(), Ok("v0.13.0-test"));
+        assert!(m115_version(&["!! boom".to_string()]).is_err());
+        assert!(m115_version(&[]).is_err());
+        assert!(m115_version(&["// FIRMWARE_NAME:Klipper FIRMWARE_VERSION:".to_string()]).is_err());
+        assert!(
+            m115_version(&["// FIRMWARE_NAME:Something FIRMWARE_VERSION:1".to_string()]).is_err()
+        );
     }
 }

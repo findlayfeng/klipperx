@@ -21,6 +21,7 @@ pub mod board_pins;
 pub mod bulk_sensor;
 pub(crate) mod bus_debug;
 pub mod buttons;
+pub mod canbus_ids;
 pub mod carriage;
 pub mod controller_fan;
 pub mod dac084s085;

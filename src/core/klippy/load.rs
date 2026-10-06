@@ -390,6 +390,10 @@ mod tests {
         assert_eq!(
             ids,
             [
+                // Before `[mcu]`: it is created on demand by the first CAN
+                // `[mcu]`, and a present `[canbus_ids]` has to load ahead of the
+                // sections that register with it (`extras/canbus_ids.rs`).
+                "canbus_ids",
                 "mcu",
                 "stepper_enable",
                 "multi_pin",
@@ -544,6 +548,9 @@ mod tests {
                 .unwrap_or_else(|| panic!("no section '{id}'"))
         };
         assert_eq!(by_id("mcu").phase, Phase::Early);
+        // The CAN node-id allocator: a present `[canbus_ids]` must load before
+        // the `[mcu]` sections that register with it.
+        assert_eq!(by_id("canbus_ids").phase, Phase::Early);
         // A virtual pin *provider* whose consumers are regular sections: like
         // `adc_scaled` it must load before the generic walk, see the module docs.
         assert_eq!(by_id("multi_pin").phase, Phase::Early);

@@ -102,6 +102,7 @@ H1–H12 是上游 extras 里按域归并的消费者（2026-09-21 全量盘点�
 | S1 | 压力测试工具（`klipperx stress`）：**已收官（2026-10-06，`23b3b9b`）**——真资源/别名/假板 e2e 均已落地；余项仅 `--task motion` 假板 e2e（假件位置恒答 0。无法做）与真板双机并发验证 | — |
 | S2 | 文档补齐（2026-10-06 对账发现，非新功能）：`config.md` 缺 **`[bed_mesh]` 整节**（约 20 个选项，含 `split_delta_z` / `move_check_distance`）、`gcode-commands.md` 缺 `BED_MESH_*` 命令；开发手册「模块表 / `testing.md` 覆盖行 / `regression-tests.md`」的其余陈旧行未重审（本轮只修了与已落地改动强相关的那些） | — |
 | S3 | 真机用例：把 `configure_taking_over`（“连接 ≠ 配置”，遇 `ResetRequired` 则 `reset` + 重开 + 重握手一次）**上提到 `hardware_test`**——现在三份需求（R3/R5/R11）共用一个局部实现（`mcu/resource/endstop.rs` 测试里 + `stress.rs` 自己的），上提后只留一份；同时把 L2（`Machine::bring_up`）已落地这件事写进框架 doc 的模板 | — |
+| S5 | 断开 API 订阅的 reactor 定时器环：`api/endpoints/objects_subscribe.rs:160` 的定时器回调强持 `Arc<Inner>`，而 `Inner{printer: Arc<Printer>, reactor: Arc<dyn Reactor>}` 持住两者 ⇒ 环 `reactor → heap → Inner → reactor`（同类环的第三处，前两处 `verify_heater`/`virtual_sdcard` 已于 2026-10-06 修）。**影响**：就地重启后旧订阅会把旧 `printer`（含其 `Mcu`）活者——与 Q11 同类的产线隐患。修法照既有 `Weak` 约定（回调持 `Weak<Inner>`） | — |
 | S4 | 真机用例继续铺（框架两层都已就绪）：R4 归零（无加热，建议先做）→ R9 收尾 / R7 挤出 / R6 温度 / R10 急停（**带加热的最后**，需先完成 Q11 那条 reactor 定时器断环）；R8 回放 | S3、Q11 |
 | E2 | `python_path` 的取消 | 外部项目 |
 
@@ -594,8 +595,17 @@ endstop 资源（`mcu/resource/endstop.rs`，含 `minclock` 门控与 `home_wait
       `a_firmware_restart_releases_the_old_session` 钉住它）。
       **前一轮的错误断言已更正**：我曾写「`-o`（fileoutput）下不 park、所以语料不受影响」——
       实测在含 `[virtual_sdcard]`/`[gcode_button]` 的 cfg 上**不成立**（这两条语料就是代价）。
-      另：真机（非 `-o`）形态的 park 复现仍保留在 `a_live_case_leaves_the_fake_devices_reader_parked`
-      （`#[ignore]`）——它是另一条路径（整台机器从不说话），不在本断环范围内。
+      另：真机（非 `-o`）形态的 park 复现已**修好并转绿**：那条探针当时叫
+      `a_live_case_leaves_the_fake_devices_reader_parked`（`#[ignore]`），现改名 `a_live_case_runtime_shuts_down`
+      并**取消忽略**——它的 cfg 带 `[extruder]` 加热器，真正首因是下面那条 reactor 定时器环，
+      **不是**我当时归因的「整台机器从不说话」（已在源码 doc 订正）。
+      **环已断（2026-10-06，`bd2f32a`）**：`verify_heater` 的 1s reactor 定时器回调强持 `Arc<Heater>`
+      （环 `reactor → 定时器堆 → Heater → McuPwm/chip → McuClock → reactor`）→ 改成 `Weak` + `upgrade()`；
+      同批修了 `virtual_sdcard::do_resume` 的一次性定时器强持 `Arc<Self>`。
+      实测：同一探针从 `5.000577767s: a part was leaked` → `MCU DROP mcu` + 收尾 **942µs**；
+      带加热器的重启用例 `a_live_heated_restart_releases_the_old_session` 收尾 **1.34ms**，
+      并断言旧会话的 `Arc<Mcu>` 强计数收敛到 1 后第二次会话才能重新 identify。
+      **全集清点**（1 2 处 `register_timer`）后**还剩一处同类环**，见 **S5**。
 
 - [x] **Q10 模拟设备的步进时序模型（两会话固件链）——已完成（2026-09-27，`agents/feat-simulator-step-timing`）**：
       `SimulatorDevice` 落 per-oid `StepChain`（`config_stepper` 归零、`queue_step` 空闲首拍/忙延展/

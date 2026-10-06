@@ -216,11 +216,14 @@ async fn test_something_on_a_real_board() {
 **活机与语料（`-o`）的语义差**：`can_pause` 为真（`M400` 会真等时钟追上）、`can_extrude` 不再由
 `-o` 兜底（`G1 E…` 会被冷挤出 / 温度未达拒绝）。写真机用例时不要照抄语料用例的这两处假设。
 
-> ⚠️ **已知环暂时挡住带加热器的 L2 用例**：活机 + 任一 `Heater` 节（`[extruder]` / `[heater_bed]` /
-> `[heater_generic]`，`control: pid|watermark` 都算）在 `teardown` 后**不析构部件**，`Mcu::Drop` 不跑 ⇒
-> `Drop` 的界断言会红并点名该环（首因：`verify_heater` 的 1s reactor 定时器回调强持 `Arc<Heater>`，
-> 而 `teardown` 从不取消 reactor 定时器）。修好前**不要连着跑带加热器的真机用例**——泄漏的会话会使
-> 串口读线程 park、fd 不关，下一条用例会二次打开同一串口。修复单元见 `TODO.md`。
+> **带加热器的活机用例已能收尾（2026-10-06 已修）**：曾经活机 + 任一 `Heater` 节（`[extruder]` /
+> `[heater_bed]` / `[heater_generic]`）在 `teardown` 后不析构部件（`verify_heater` 的 1s reactor 定时器
+> 回调强持 `Arc<Heater>`，而 `teardown` 从不取消 reactor 定时器）⇒ 串口读线程 park、`fd` 不关、
+> 下一条用例会二次打开同一串口。现已按既有 `Weak` 约定断环（同修的还有 `virtual_sdcard::do_resume` 的
+> 一次性定时器）；实测：同一探针从 `5.0005s a part was leaked` → `MCU DROP mcu` + 收尾 **0.94ms**。
+> **仍剩一处同类环未修**：`api/endpoints/objects_subscribe.rs` 的定时器回调强持 `Arc<Inner>`，
+> 而 `Inner{printer, reactor}` 持住两者（环 `reactor → heap → Inner → reactor`）——影响的是
+> **API 订阅**那条路径（就地重启后旧订阅会把旧 printer 活者），见 `TODO.md` 的 S5。
 
 ## 格式化与提交
 

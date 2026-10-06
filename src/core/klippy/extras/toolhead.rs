@@ -22,6 +22,21 @@
 //! shared motion state rather than the object, so a restart can drop the object
 //! without leaving a handler behind.
 //!
+//! # Endstop naming
+//!
+//! The homing driver names a rail **two** ways, on purpose:
+//!
+//! * The miss error, `No trigger on {name} after full movement`, uses the rail's
+//!   **short** name — `x` for `[stepper_x]` — because that is what upstream's
+//!   `HomingMove.endstops` carries (`stepper.get_name(short=True)`,
+//!   `stepper.py:388-394`; `extras/homing.py:119`).
+//! * The `M119` / `query_endstops` labels use the **full** stepper name —
+//!   `stepper_x` — the name the rails register their endstops under
+//!   (`stepper.name()`; see [`extras::query_endstops`](crate::core::klippy::extras::query_endstops)).
+//!
+//! These are not a bug to "unify": the error text follows upstream, the label
+//! follows this host's own registry. Both are pinned by tests.
+//!
 //! # What is here, and what is not
 //!
 //! | command | meaning |
@@ -2990,6 +3005,25 @@ fn send(printer: &Weak<Printer>, event: &KlippyEvent) {
     }
 }
 
+/// Upstream's error for a homing move whose endstop never triggered
+/// (`homing.py:119`): `No trigger on {name} after full movement`.
+///
+/// The name is the rail's **short** name (`stepper.get_name(short=True)`,
+/// `stepper.py:388-394`) — what upstream's `HomingMove.endstops` carries — not
+/// the full `stepper_x` that `M119` / `query_endstops` labels use (see this
+/// module's docs on that deliberate difference).
+///
+/// The trigger decision is `home_wait`'s sentinel: it returns `0.0` for
+/// anything but an endstop hit (`mcu/resource/endstop.rs`), and upstream raises
+/// when `trigger_time` is not `> 0.` — the same `<= 0.0` check the probe path
+/// makes (`homing.py:114-119`).
+fn no_trigger_error(stepper_name: &str) -> CommandError {
+    CommandError::new(format!(
+        "No trigger on {} after full movement",
+        idex_modes::short_rail_name(stepper_name)
+    ))
+}
+
 /// Home every rail in one multi-endstop move, as delta does
 /// (`Homing._do_home_rails` + `HomingMove.homing_move` with every endstop
 /// armed; upstream's retract + second pass is the gap
@@ -3002,7 +3036,7 @@ fn send(printer: &Weak<Printer>, event: &KlippyEvent) {
 /// # Errors
 /// A missing endstop, a kinematics refusal, a failed query/send, or a rail
 /// whose endstop never triggered ("No trigger on … after full movement",
-/// `extras/homing.py:104-107`).
+/// `extras/homing.py:119`).
 async fn home_unified(
     connected: &mut Connected,
     rails: &[Arc<Rail>],
@@ -3099,20 +3133,25 @@ async fn home_unified(
         }
     }
 
+    // Prepare for a miss: upstream checks every rail's `home_wait` and raises
+    // the first miss it finds, after the move-end event (`homing.py:109-119`).
+    let mut missed: Option<CommandError> = None;
     for rail in rails {
-        // The trigger itself was already proven by the drip loop completing:
-        // the fake completes each armed trsync only when the move starts, and
-        // a never-triggered check would have left this awaiting forever. The
-        // returned *time* may read 0 at machine time zero (the trigger clock
-        // minus `rest_ticks` rounds down), which is why — as in `home_axis`
-        // above — the value is not read here; upstream's file mode instead
-        // reports "No trigger on … after full movement" for a miss.
+        // A rail whose endstop never fired comes back as `0.0`
+        // (`mcu/resource/endstop.rs`); `home_axis` below reads the same value.
         let trigger_time = rail
             .endstop()
             .expect("every rail's endstop was checked above")
             .home_wait(end)
             .await
             .map_err(command_error)?;
+        if trigger_time <= 0.0 {
+            // Upstream keeps walking the rails after a miss, so its last note
+            // is still recorded; this host errors right after the move-end
+            // event either way, so it skips the note for the missed rail.
+            missed.get_or_insert_with(|| no_trigger_error(rail.name()));
+            continue;
+        }
         // Note each of the rail's steppers' trigger position
         // (`StepperPosition.note_home_end`).
         let steppers = connected.toolhead.motion_queuing_mut().steppers();
@@ -3128,6 +3167,9 @@ async fn home_unified(
         }
     }
     send(printer, &KlippyEvent::HomingHomingMoveEnd);
+    if let Some(error) = missed {
+        return Err(error);
+    }
     // The carriage is now at its home position, with the kinematics' homed
     // flags set.
     connected.toolhead.set_position(target, homing_axes);
@@ -3214,6 +3256,17 @@ async fn home_axis(
     }
 
     let trigger_time = endstop.home_wait(end).await.map_err(command_error)?;
+    // A miss: upstream raises "No trigger on {name} after full movement" from
+    // `homing_move` **after** the move-end event (`homing.py:119`). Without
+    // this the axis would be marked homed at its endstop after driving the
+    // whole 1.5× force distance.
+    if trigger_time <= 0.0 {
+        send(printer, &KlippyEvent::HomingHomingMoveEnd);
+        let name = stepper_names
+            .first()
+            .expect("every rail has a primary stepper");
+        return Err(no_trigger_error(name));
+    }
     // Note each stepper's trigger position (`StepperPosition.note_home_end`)
     // before `set_position` moves the solver to the endstop position.
     {
@@ -4864,6 +4917,161 @@ mod tests {
         assert_eq!(state_guard.get_trigger_position("stepper_x"), 0.0);
         drop(state_guard);
         *state.lock().unwrap_or_else(|p| p.into_inner()) = Some(connected);
+    }
+
+    /// A rail endstop that never triggers is upstream's `No trigger on {name}
+    /// after full movement` (`homing.py:119`): `home_axis` reports it **after**
+    /// the move-end event instead of placing the axis at its endstop and
+    /// returning success.
+    ///
+    /// The bug this closes: a dead/miswired endstop drove the whole 1.5×
+    /// force distance, the axis was marked homed, and `G28` reported success.
+    /// The name is the rail's short name (`get_name(short=True)`,
+    /// `stepper.py:388-394`) — `x`, not the full `stepper_x` that
+    /// `M119`/`query_endstops` labels use.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_home_axis_without_a_trigger_errors_after_the_move_end_event() {
+        let mut toolhead = homed_toolhead();
+        toolhead.set_position(Coord::default(), &[]);
+        if let Some(kinematics) = toolhead.kinematics_mut() {
+            kinematics.clear_homing_state(&[X_AXIS, Y_AXIS, Z_AXIS]);
+        }
+        let (state, _gcode) = connected(toolhead);
+        let mut connected = state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+            .unwrap();
+        // Armed but never fires: `home_wait` returns the `0.0` miss sentinel.
+        let endstop = TriggeringEndstop::new(false);
+        use crate::core::klippy::extras::stepper::RailParams;
+        let params = RailParams {
+            position_min: 0.0,
+            position_max: 200.0,
+            position_endstop: 0.0,
+        };
+        let info = test_homing_info();
+        let (forcepos, movepos) =
+            home_move(X_AXIS, &info, params.position_min, params.position_max);
+        let printer = Arc::new(Printer::new(
+            crate::core::klippy::reactor::ManualReactor::shared(),
+        ));
+        // Record the move-end event so the order (event, then error) is pinned.
+        let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let ended = Arc::clone(&ended);
+            printer.register_event_handler(
+                KlippyEvent::HomingHomingMoveEnd,
+                Box::new(move |_| ended.store(true, std::sync::atomic::Ordering::SeqCst)),
+            );
+        }
+        let printer = Arc::downgrade(&printer);
+
+        let homing = HomingHandle::new();
+        let result = home_axis(
+            &mut connected,
+            X_AXIS,
+            forcepos,
+            movepos,
+            &[X_AXIS],
+            info,
+            1.0,
+            &["stepper_x".to_string()],
+            &endstop,
+            &homing,
+            &printer,
+        )
+        .await;
+
+        let error = result.expect_err("a missed trigger must fail the home");
+        assert_eq!(error.to_string(), "No trigger on x after full movement");
+        assert!(
+            ended.load(std::sync::atomic::Ordering::SeqCst),
+            "homing_move_end must fire before the error (upstream's order)"
+        );
+        // The note block that records each stepper's endstop position is
+        // skipped on a miss: the stepper is left un-marked as primary (only
+        // the hit path marks it), so no endstop position is recorded.
+        assert!(
+            !homing.lock().is_primary("stepper_x"),
+            "a miss must not record an endstop trigger position"
+        );
+        *state.lock().unwrap_or_else(|p| p.into_inner()) = Some(connected);
+    }
+
+    /// Positive control for the miss check: a rail endstop that **does**
+    /// trigger still homes exactly as before — the axis lands at its endstop,
+    /// the command succeeds, and `homed_axes` is set.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_home_axis_with_a_trigger_still_homes_the_axis() {
+        let mut toolhead = homed_toolhead();
+        toolhead.set_position(Coord::default(), &[]);
+        if let Some(kinematics) = toolhead.kinematics_mut() {
+            kinematics.clear_homing_state(&[X_AXIS, Y_AXIS, Z_AXIS]);
+        }
+        let (state, _gcode) = connected(toolhead);
+        let mut connected = state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+            .unwrap();
+        // `new(true)` completes at the move and reports its end time (> 0).
+        let endstop = TriggeringEndstop::new(true);
+        use crate::core::klippy::extras::stepper::RailParams;
+        let params = RailParams {
+            position_min: 0.0,
+            position_max: 200.0,
+            position_endstop: 0.0,
+        };
+        let info = test_homing_info();
+        let (forcepos, movepos) =
+            home_move(X_AXIS, &info, params.position_min, params.position_max);
+        let printer = Arc::new(Printer::new(
+            crate::core::klippy::reactor::ManualReactor::shared(),
+        ));
+        let printer = Arc::downgrade(&printer);
+
+        let homing = HomingHandle::new();
+        home_axis(
+            &mut connected,
+            X_AXIS,
+            forcepos,
+            movepos,
+            &[X_AXIS],
+            info,
+            1.0,
+            &["stepper_x".to_string()],
+            &endstop,
+            &homing,
+            &printer,
+        )
+        .await
+        .expect("a triggering endstop still homes");
+        assert_eq!(connected.toolhead.commanded_pos().x(), 0.0);
+        assert_eq!(
+            connected.toolhead.kinematics().unwrap().get_status()["homed_axes"],
+            "x"
+        );
+        *state.lock().unwrap_or_else(|p| p.into_inner()) = Some(connected);
+    }
+
+    /// The miss message both homing paths raise names a rail the way upstream's
+    /// `HomingMove.endstops` does: its short name (`get_name(short=True)`,
+    /// `stepper.py:388-394`), not the full `stepper_x` that `M119` labels use.
+    #[test]
+    fn test_no_trigger_error_uses_the_rails_short_name() {
+        assert_eq!(
+            no_trigger_error("stepper_x").to_string(),
+            "No trigger on x after full movement"
+        );
+        assert_eq!(
+            no_trigger_error("stepper_z1").to_string(),
+            "No trigger on z1 after full movement"
+        );
+        assert_eq!(
+            no_trigger_error("stepper_arm").to_string(),
+            "No trigger on arm after full movement"
+        );
     }
 
     /// `set_stepper_adjustment` shifts the homed axis' coordinate by the

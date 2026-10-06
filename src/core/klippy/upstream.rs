@@ -825,12 +825,15 @@ mod tests {
             .expect("a minimal case runs against the fake firmware");
     }
 
-    /// An extruder move runs end to end: the E axis has its own trapq and its
-    /// stepper, and a `G1` with an `E` word drives both the kinematic axes and
-    /// the extruder.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn an_extruder_move_runs_against_the_fake_firmware() {
-        let dictionary = dict_dir().join("atmega2560.dict");
+    /// A config with an `[extruder]` that carries a heater, over the fake
+    /// firmware.
+    ///
+    /// The extruder gives the machine a sparse axis: its step batches are far
+    /// apart, which is what a chain model that drops a batch's leading interval
+    /// gets wrong first. The heater is what makes `verify_heater` build its
+    /// per-heater check — the object every config with a heater carries whether
+    /// or not it writes a `[verify_heater]` section (`heaters.py:64`).
+    fn heated_extruder_config(dictionary: &std::path::Path) -> Config {
         let text = format!(
             "[mcu]\ntest: dict={}\n\
              [stepper_x]\nstep_pin: PA0\ndir_pin: PA1\nrotation_distance: 40\nmicrosteps: 16\nposition_max: 200\n\
@@ -843,7 +846,17 @@ mod tests {
              [printer]\nkinematics: cartesian\nmax_velocity: 300\nmax_accel: 3000\n",
             dictionary.display()
         );
-        let (config, _) = Config::from_text(&text).expect("the extruder config parses");
+        let (config, _) = Config::from_text(&text).expect("the heated extruder config parses");
+        config
+    }
+
+    /// An extruder move runs end to end: the E axis has its own trapq and its
+    /// stepper, and a `G1` with an `E` word drives both the kinematic axes and
+    /// the extruder.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_extruder_move_runs_against_the_fake_firmware() {
+        let dictionary = dict_dir().join("atmega2560.dict");
+        let config = heated_extruder_config(&dictionary);
 
         run_script_on(
             &config,
@@ -858,81 +871,49 @@ mod tests {
     /// `debug_output`, so `can_pause` is true (`klippy/toolhead.py:221-223`) and
     /// `M400` waits on the fake firmware's clock instead of returning at once
     /// (the file-output shortcut `test_wait_moves_does_not_wait_under_file_output`
-    /// pins the other side).
+    /// pins the other side). The runtime must then shut down on its bound.
     ///
-    /// A **live** case (no `-o`) against the fake firmware leaves the device's
-    /// blocking reader parked, so the case's runtime cannot shut down.
+    /// This is the live counterpart of `a_case_runtime_shuts_down`, and it
+    /// guards a leak that is visible **only** without `-o`: a config with a
+    /// heater makes `verify_heater`'s `klippy:connect` timer hold its
+    /// `Arc<Heater>` strongly (`extras/verify_heater.rs`, `HeaterCheck::handle_connect`).
+    /// The timer heap lives in the reactor until a handle is cancelled, and
+    /// `Printer::teardown` never cancels it — `TimerHandle`'s `Drop` is
+    /// deliberately no-op (`reactor.rs`) and only `klippy:shutdown` cancels, so
+    /// the strong handle closed the loop `reactor → timer → heater → its chip's
+    /// clock → reactor`. The heater, its `Mcu` and the reactor all outlived
+    /// `teardown`; `Mcu::Drop` never ran, its receive task stayed parked in a
+    /// blocking device read (`SimulatorDevice::receive` waits on a condvar with
+    /// no bound, `interface/devices/simulator.rs`), and the runtime had to give
+    /// up.
     ///
-    /// This is what a first attempt at covering "a real machine's shape"
-    /// found, and it is **not** about `M400`: the same leak appears with the
-    /// move alone and no `M400` at all. It is also **not** limited to live
-    /// (non `-o`) cases, contrary to this comment's first reading:
-    /// `SimulatorDevice::receive` waits on a condvar with no bound when it has
-    /// no frame to hand out and no armed monitor window
-    /// (`interface/devices/simulator.rs`), and nothing signals it once the case
-    /// stopped talking — so the blocking thread stays parked and
-    /// `Runtime::shutdown_timeout` has to give up. What keeps the device open is
-    /// a part `Printer::teardown` cannot drop: a part holding
-    /// `Arc<GCodeDispatch>` while the dispatcher's command table
-    /// (`Commands` in `gcode.rs`) holds a handler capturing that same part is a
-    /// strong cycle, so neither side drops, the `Mcu` the cycle reaches never
-    /// runs `Drop`, and nothing releases the blocking read.
+    /// Why only the live form: `verify_heater` returns from `handle_connect`
+    /// when `debug_output` is set (`verify_heater.py:34-37`), so every corpus
+    /// `-o` run leaves the timer unregistered and is clean. The other live
+    /// shapes — steppers only, `[output_pin]`, `[temperature_sensor]` — carry
+    /// no heater, so they are clean too.
     ///
-    /// Every corpus run is `-o`, and two of them pay exactly that leak — each
-    /// runs its g-code in ~0.25s and then sits out the whole
-    /// `CASE_SHUTDOWN_TIMEOUT` in `run_generated_upstream_case`, which is what
-    /// makes them the two slowest cases in the suite:
+    /// This is **not** about `M400`: the leak appears with the move alone and
+    /// no `M400` at all. The earlier reading blamed the dispatcher's
+    /// command-table cycle, which is `a_case_runtime_shuts_down`'s subject and
+    /// has its own fix; that cycle is a corpus `-o` cost, not this one.
     ///
-    /// * `sdcard_loop.test` — `[virtual_sdcard]` holds the dispatcher (the
-    ///   `gcode` field of `extras/virtual_sdcard.rs`) and registers the
-    ///   `M2x` / `SDCARD_*` handlers, each capturing `Arc<VirtualSdCard>`.
-    /// * `printers.test` `printer-biqu-bx-2021` — `[gcode_button lcd_button]`
-    ///   (`extras/gcode_button.rs`) holds the dispatcher and registers the
-    ///   capturing `QUERY_BUTTON` mux handler.
-    ///
-    /// `a_case_runtime_shuts_down` — the probe written for this leak — uses
-    /// `example-cartesian.cfg`, which has neither part and shuts down in well
-    /// under a millisecond, so it cannot see either case: their 5s is a silent
-    /// cost, not a failure.
-    ///
-    /// Measured 2026-10-06 with `KLIPPERX_TRACE`: neither case prints
-    /// `MCU DROP`, while `example-cartesian` does; dropping `[gcode_button]`
-    /// from the biqu config and `[virtual_sdcard]` from `sdcard_loop.cfg`
-    /// takes each case back to a sub-millisecond shutdown. The cycle is the
-    /// product-side gap; this harness only bounds the wait.
-    ///
-    /// Ignored because it fails on that leak (the harmless, bounded failure
-    /// this test is written to produce: `a part was leaked`, not a hung run).
-    /// It stays here as the reproduction: whoever makes a live case release its
-    /// device can un-ignore it. The `M400` wait itself is covered by
+    /// Measured 2026-10-06 with `KLIPPERX_TRACE`: before the fix this test sat
+    /// out the whole `CASE_SHUTDOWN_TIMEOUT` (5.000s) and printed no
+    /// `MCU DROP`; after it, the runtime shuts down in well under a millisecond
+    /// and prints `MCU DROP mcu`. The `M400` wait itself is covered by
     /// `extras::toolhead`'s `test_m400_waits_for_the_fake_firmware_clock_to_catch_up`
     /// (a responder-style fake that does not park a blocking reader), and the
     /// step-chain model by `interface::devices::simulator`'s own tests.
     ///
     /// Skipped when the dictionary was not built (`KLIPPERX_ARCHES`).
     #[test]
-    #[ignore = "known: a live (non -o) case parks the fake device's blocking reader, so its runtime cannot shut down"]
-    fn a_live_case_leaves_the_fake_devices_reader_parked() {
+    fn a_live_case_runtime_shuts_down() {
         let dictionary = dict_dir().join("atmega2560.dict");
         if !dictionary.is_file() {
             return;
         }
-        // The extruder gives the machine a sparse axis: its step batches are
-        // far apart, which is what a chain model that drops a batch's leading
-        // interval gets wrong first.
-        let text = format!(
-            "[mcu]\ntest: dict={}\n\
-             [stepper_x]\nstep_pin: PA0\ndir_pin: PA1\nrotation_distance: 40\nmicrosteps: 16\nposition_max: 200\n\
-             [stepper_y]\nstep_pin: PA2\ndir_pin: PA3\nrotation_distance: 40\nmicrosteps: 16\nposition_max: 200\n\
-             [stepper_z]\nstep_pin: PA4\ndir_pin: PA5\nrotation_distance: 8\nmicrosteps: 16\nposition_max: 200\n\
-             [extruder]\nstep_pin: PA6\ndir_pin: PA7\nrotation_distance: 33.5\nmicrosteps: 16\n\
-             nozzle_diameter: 0.4\nfilament_diameter: 1.75\nheater_pin: PB0\n\
-             sensor_type: EPCOS 100K B57560G104F\nsensor_pin: PK5\ncontrol: pid\npid_Kp: 1\npid_Ki: 0.1\npid_Kd: 10\n\
-             min_temp: 0\nmax_temp: 250\nmin_extrude_temp: 0\n\
-             [printer]\nkinematics: cartesian\nmax_velocity: 300\nmax_accel: 3000\n",
-            dictionary.display()
-        );
-        let (config, _) = Config::from_text(&text).expect("the config parses");
+        let config = heated_extruder_config(&dictionary);
 
         // One runtime for this case, shut down on a **bound** — the corpus'
         // own discipline (`run_case`, `a_case_runtime_shuts_down`). It matters
@@ -1080,7 +1061,7 @@ mod tests {
             .enable_all()
             .build()
             .expect("a case runtime");
-        let outcome = runtime.block_on(restart_sessions(&parsed));
+        let outcome = runtime.block_on(restart_sessions(&parsed, "sdcard_loop.cfg", true));
         // Bounded, so a regression reports as a failure instead of hanging on the
         // parked read it leaves behind.
         runtime.shutdown_timeout(std::time::Duration::from_secs(CASE_SHUTDOWN_TIMEOUT));
@@ -1097,6 +1078,52 @@ mod tests {
         );
     }
 
+    /// A **live** machine that carries a heater must release its session when it
+    /// is torn down, so a reopen is a new session and not a second reader beside
+    /// the old one.
+    ///
+    /// This is `a_firmware_restart_releases_the_old_session` in the shape a real
+    /// board gets: no `-o`, so `verify_heater`'s per-second timer runs
+    /// (`a_live_case_runtime_shuts_down`). A leaked `Arc<Heater>` kept the old
+    /// session at three strong references — the factory registry, that timer,
+    /// and this test — so the reopen ran beside a reader still parked on the
+    /// device, which is the production hazard the count guards.
+    #[test]
+    fn a_live_heated_restart_releases_the_old_session() {
+        let dictionary = dict_dir().join("atmega2560.dict");
+        if !dictionary.is_file() {
+            return;
+        }
+        let config = heated_extruder_config(&dictionary);
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("a case runtime");
+        let outcome = runtime.block_on(restart_sessions(&config, "live-heated.cfg", false));
+        // Bounded, so a regression reports as a failure instead of hanging on the
+        // parked read it leaves behind.
+        let started = std::time::Instant::now();
+        runtime.shutdown_timeout(std::time::Duration::from_secs(CASE_SHUTDOWN_TIMEOUT));
+        let elapsed = started.elapsed();
+
+        let cycle = outcome.expect("the restart cycle runs");
+        assert!(
+            cycle.rebuilt,
+            "the reopen is a new session, not the one before the restart"
+        );
+        assert_eq!(
+            cycle.old_refs, 1,
+            "reset_for_restart released every other reference to the old session: \
+             a leaked part kept the old reader alive beside the new one"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(CASE_SHUTDOWN_TIMEOUT),
+            "the live machine's runtime did not shut down within {CASE_SHUTDOWN_TIMEOUT}s \
+             ({elapsed:?}): a part was leaked"
+        );
+    }
+
     /// What one restart cycle left behind.
     struct RestartCycle {
         /// How many `Arc`s referenced the first session once the reset had run.
@@ -1108,6 +1135,11 @@ mod tests {
     /// Bring a machine up on `config`, reset for a firmware restart, bring it up
     /// again — and report what the reset left behind.
     ///
+    /// `fileoutput` picks the machine's shape. `true` is the corpus' (`-o`), so
+    /// a case's `G1 E…` is not rejected as cold and `verify_heater` stays off;
+    /// `false` is a real board's, where `verify_heater`'s timer runs. Both must
+    /// release the first session.
+    ///
     /// The handles are dropped before this returns, so the case's runtime can
     /// shut down promptly: a session the *test* still holds would park its
     /// blocking read, and the caller's bound is there to measure a leak, not a
@@ -1116,16 +1148,20 @@ mod tests {
     /// Returns `Err` instead of panicking so a caller can shut the case's
     /// runtime down on a bound before reporting; a leak here parks a blocking
     /// read that an unbounded drop would wait for forever.
-    async fn restart_sessions(config: &Config) -> Result<RestartCycle, String> {
+    async fn restart_sessions(
+        config: &Config,
+        config_file: &str,
+        fileoutput: bool,
+    ) -> Result<RestartCycle, String> {
         use crate::core::klippy::api::StartArgs;
         use crate::core::klippy::printer::Printer;
         use crate::core::klippy::reactor::TokioReactor;
 
         let reactor = Arc::new(TokioReactor::new(tokio::runtime::Handle::current()));
         let printer = Arc::new(Printer::new(reactor));
-        // The corpus' shape (`-o`), so a case's `G1 E…` is not rejected as cold.
-        let mut start_args = StartArgs::collect("sdcard_loop.cfg", None);
-        start_args.debug_output = Some("_test_output".to_string());
+        // The corpus' shape is `-o`, so a case's `G1 E…` is not rejected as cold.
+        let mut start_args = StartArgs::collect(config_file, None);
+        start_args.debug_output = fileoutput.then(|| "_test_output".to_string());
         printer.set_start_args(Arc::new(start_args));
 
         let old = bring_up_session(&printer, config).await?;

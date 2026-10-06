@@ -4991,6 +4991,10 @@ mod tests {
     /// The fake-device tests above pin each rule of the transport; this one asks
     /// the firmware to behave the way they assume.
     ///
+    /// **Premise**: the config is assumed correct; this case checks this
+    /// repository's frame transport, not your config — a mismatch of config,
+    /// wiring or firmware is not a bug here.
+    ///
     /// It is a configuration-driven hardware test: it declares that it needs the
     /// main MCU, and `hardware_test` derives everything else from the printer
     /// config named by `KLIPPERX_HW_CONFIG`. Run it explicitly:
@@ -5159,6 +5163,10 @@ mod tests {
     /// 3. **identify and use the session** — `Mcu::connect` runs the handshake, and
     ///    one `get_clock` round trip proves the session is usable rather than
     ///    merely identified.
+    ///
+    /// **Premise**: the config is assumed correct; this case checks this
+    /// repository's reset/reconnect path, not your config — a mismatch of config,
+    /// wiring or firmware is not a bug here.
     ///
     /// What it asserts, round by round: the reconnect identifies within the budget,
     /// the firmware that answers is a **freshly booted** one

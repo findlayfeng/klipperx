@@ -1,0 +1,10 @@
+# 仓库级 cargo 别名。
+#
+# `cargo hwtest` —— 只跑真机 lane：所有以
+# `#[ignore = "hardware: needs KLIPPERX_HW_CONFIG"]` 标注的用例，加 `hardware_test::plan`。
+# 裸 `-- --ignored` 会连同上游语料里因 `pru.dict` 未构建而 `#[ignore]` 的两条
+# （`printers.test` 的 `generic-cramps.cfg` 与 `generic-replicape.cfg`）一起跑，而它们在
+# 默认构建里必然失败。语料用例全挂在 `core::klippy::upstream::` 模块下，所以用一个模块前缀
+# 整类排除，不必逐条列名字。
+[alias]
+hwtest = ["test", "-p", "klipperx", "--lib", "--", "--ignored", "--skip", "upstream", "--nocapture"]

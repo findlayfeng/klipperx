@@ -363,6 +363,10 @@ KLIPPERX_ALL_ARCHES=1 cargo test -p klipperx --lib upstream
 易超时且无法单跑定位）；旧环境变量 `KLIPPERX_UPSTREAM_ALL` / `KLIPPERX_UPSTREAM_FILTER` 不再
 适用——「只去掉忽略列表」改用 `cargo test --ignored`，「只跑某用例」改用名字过滤。
 
+`cargo test --ignored` 是**全局**口径：它也会跑真机 lane（`#[ignore = "hardware: …"]` 那一类）。
+只想跑真机用例用仓库根的 `cargo hwtest` 别名（展开即 `--ignored --skip upstream`），见
+[测试 → 运行方式](testing.md#运行方式)。
+
 `--workspace` 与 `--lib` 的取舍、真机用例的约定见[测试](testing.md)。
 
 `CONFIG` 与 `GCODE` 相对 `.test` 文件解析；`DICTIONARY` 是构建产物，因此只校验其对应的

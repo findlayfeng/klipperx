@@ -97,8 +97,8 @@ cargo test -p klipperx --lib
 # 全部 crate
 cargo test --workspace
 
-# 只看语料：每个用例打一行（约 1 分钟）
-cargo test -p klipperx --lib upstream_test_cases_run -- --nocapture
+# 只看上游语料（缺字典 / IGNORED 的默认跳过）
+cargo test -p klipperx --lib upstream
 
 # 跑宿主：连配置里写的 MCU，并起 API / 开窗口
 cargo run --release -- config.cfg                 # 只起宿主
@@ -107,8 +107,9 @@ cargo run --release -- config.cfg --tui           # 本进程内开一个终端�
 klipperx console -a /tmp/klippy_uds               # 另开终端连上去
 
 # 真机（需要一块板子；见 TESTING.md；指向你自己的 printer 配置，接口从它的 [mcu] 里读）
-KLIPPERX_HW_CONFIG=~/printer.cfg cargo test -p klipperx --lib \
-  test_frame_sequence_sync_against_a_real_board -- --ignored --nocapture
+KLIPPERX_HW_CONFIG=~/printer.cfg cargo hwtest        # 只跑真机 lane（别名，见 .cargo/config.toml）
+KLIPPERX_HW_CONFIG=~/printer.cfg cargo hwtest \
+  test_frame_sequence_sync_against_a_real_board      # 其中一条
 # 先看这份配置会激活哪些真机用例（不碰板）：
 KLIPPERX_HW_CONFIG=~/printer.cfg cargo test -p klipperx --lib hardware_test::plan \
   -- --ignored --nocapture

@@ -30,7 +30,8 @@
 
 ## 待测列表（按一次打印的顺序）
 
-> **已有可跑（自动化）的真机用例**（`--ignored` + `KLIPPERX_HW_CONFIG=<你的 printer.cfg>`，跑法与两层能力见
+> **已有可跑（自动化）的真机用例**（`KLIPPERX_HW_CONFIG=<你的 printer.cfg> cargo hwtest`——仓库根
+> `.cargo/config.toml` 的别名，只跑真机 lane；跑法与两层能力见
 > [开发手册 → 测试 → 真机测试](docs/klippy/developer-manual/testing.md#真机测试)）：
 > R1 帧序 `test_frame_sequence_sync_against_a_real_board`、R2 重启三轮
 > `test_firmware_reset_comes_back_three_times_on_a_real_board`、R3 端停电平
@@ -41,8 +42,8 @@
 
 - [ ] **R1 上电连接与配置下发** —— 真实测试：插板起宿主，走完 identify、字典下发、
   `get_config`/配置 CRC 与板端 `finalize_config`、时钟同步；`STATUS`/`M115` 有应答，
-  日志无 `!!`。可加跑真机帧序用例：`KLIPPERX_HW_CONFIG=~/printer.cfg cargo test -p klipperx
-  --lib test_frame_sequence_sync_against_a_real_board -- --ignored --nocapture`。
+  日志无 `!!`。可加跑真机帧序用例：`KLIPPERX_HW_CONFIG=~/printer.cfg cargo hwtest
+  test_frame_sequence_sync_against_a_real_board`。
   判定：会话建立、配置被固件接受、无重传/超时报错。
 
 - [ ] **R2 软复位与会话恢复** —— 真实测试：`FIRMWARE_RESTART`（`restart_method: command`）

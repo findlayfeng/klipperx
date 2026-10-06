@@ -214,16 +214,29 @@ KLIPPERX_HW_CONFIG=~/printer.cfg cargo test -p klipperx --lib hardware_test::pla
 
 ### 运行方式
 
+`cargo hwtest`（仓库根 `.cargo/config.toml` 里的别名，展开即
+`cargo test -p klipperx --lib -- --ignored --skip upstream --nocapture`）就是「只跑真机用例」：
+`--ignored` 捞出全部被忽略的用例，而真机 lane 之外唯一一类被忽略的用例都挂在
+`core::klippy::upstream::` 下，一个模块前缀就把它们整类排除。别名已带 `--nocapture`，
+别名后接的名字就是 libtest 的过滤器。
+
 ```bash
 # 跑全部真机用例（不满足声明的会逐条报 HW-IGNORED）
-KLIPPERX_HW_CONFIG=~/printer.cfg \
-  cargo test -p klipperx --lib -- --ignored --nocapture
+KLIPPERX_HW_CONFIG=~/printer.cfg cargo hwtest
 
 # 或只跑某一条
+KLIPPERX_HW_CONFIG=~/printer.cfg cargo hwtest \
+  test_frame_sequence_sync_against_a_real_board
+
+# 不想用别名，照抄它的展开
 KLIPPERX_HW_CONFIG=~/printer.cfg \
-  cargo test -p klipperx --lib test_frame_sequence_sync_against_a_real_board \
-  -- --ignored --nocapture
+  cargo test -p klipperx --lib -- --ignored --skip upstream --nocapture
 ```
+
+**别用裸 `-- --ignored` 跑真机 lane**：它会连带跑上游语料里因缺 `pru.dict` 而 `#[ignore]`
+的两条（`printers.test` 的 `generic-cramps.cfg` 与 `generic-replicape.cfg`），而它们在默认
+构建里必然失败（`generic-replicape.cfg` 还缺 `replicape` 模块），会把「真机都过了」搅成 FAILED。
+那两条的忽略理由与转绿条件见[回归测试](regression-tests.md)。
 
 框架本体与它的 16 条自测（不碰板）在 `src/hardware_test.rs`，模块 doc 里有可照抄的模板。
 

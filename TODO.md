@@ -90,7 +90,7 @@ H1–H12 是上游 extras 里按域归并的消费者（2026-09-21 全量盘点�
 | H6 | 传感器与块状数据（bulk_sensor / 加速度计 / angle / ldc1612 / hx71x / ads* / load_cell / input_shaper / resonance）——`bulk_sensor` 框架、`adxl345`/`mpu9250`、`ldc1612`、`hx71x`、`ads1220`/`ads131m0x`、`load_cell`(+`_probe`)、`input_shaper`/`resonance_tester` 均已落地；余项＝`angle`、其余加速度计（lis2dw/lis3dh/icm20948/bmi160）、`ads1x1x`，以及 `SET_PRESSURE_ADVANCE` 尚未作用于运动，见 H6 节 | F5、F6、F7、C1 |
 | H7 | 输入与外设（buttons / gcode_button / pulse_counter / trigger_analog / 断料与线宽传感器 / GPIO 扩展 / DAC）——`gcode_button`、`pulse_counter`、`filament_switch_sensor`/`filament_motion_sensor` 已落地；余项＝固件按钮查询、`trigger_analog` 宿主节、线宽传感器（hall_*/tsl1401cl）、`initial_pins`、板级模块（samd_sercom/replicape/palette2），见 H7 节 | F3、F5、F9 |
 | H8 | LCD 显示与菜单（display/*）——面板驱动均已落地（hd44780/st7920/uc1701/ssd1306/aip31068_spi/hd44780_spi/sh1106）；余项＝菜单族（`menu.py`/`menu_keys.py`/`display.cfg`/`menu.cfg`）与固件 `lcd_hd44780.c`/`lcd_st7920.c`，见 H8 节 | F9、G1b |
-| H9 | 探测 / 调平 / 校准（probe / bltouch / bed_mesh / z_tilt / quad_gantry_level / bed_screws / …）——探针与其校准命令族、末端位置接口（`virtual_endstop_position`）、z_tilt/qgl/bed_tilt/screws_tilt/axis_twist/delta_calibrate 均已落地；余项＝`bed_mesh` 的 faulty/零参照/profile 命令族、探针精度、`Z_OFFSET_APPLY_*`、`bed_screws` 命令族、`skew_correction`/`z_thermal_adjust`/`tuning_tower`，见 H9 节 | C1、F8 |
+| H9 | 探测 / 调平 / 校准（probe / bltouch / bed_mesh / z_tilt / quad_gantry_level / bed_screws / …）——探针与其校准命令族、末端位置接口（`virtual_endstop_position`）、z_tilt/qgl/bed_tilt/screws_tilt/axis_twist/delta_calibrate 均已落地；余项＝`bed_mesh` 的 faulty/零参照/profile 命令族、探针精度、`Z_OFFSET_APPLY_*`、`skew_correction`/`z_thermal_adjust`/`tuning_tower`，见 H9 节 | C1、F8 |
 | H10 | 运动相关 extras（gcode_arcs / manual_stepper / idle_timeout / motion_report / …；gcode_move、stepper_enable、motion_queuing、force_move、idle_timeout 已落地）——余项＝G2/G3 弧规划、`manual_stepper` 回零、`extruder_stepper` 宿主同步缝、`GET_POSITION`/`axis_map`，见 H10 节 | C1 |
 | H11 | 主机运行时与调试（statistics / canbus_ids / canbus_stats；error_mcu 已落地） | — |
 | H12 | 核心工具补齐（mathutil / util 反射 / clocksync / pins 消费侧） | C1 |
@@ -500,8 +500,9 @@ endstop 资源（`mcu/resource/endstop.rs`，含 `minclock` 门控与 `home_wait
       **fade + `MoveSplitter` + move transform 注册（2026-10-06 `05f93f6`——已标定后 `G1` 真的走网格补偿）**；
       **待做**：faulty 区域替换、`mesh_offsets`/`set_zero_reference`、profile 命令族
       （`BED_MESH_PROFILE`/`OUTPUT`/`MAP`/`OFFSET`）。）
-- [x] 螺丝：`screws_tilt_adjust` ✅；`bed_screws` **段已落地**（2026-09-24 批 #1）——**余项**：
-      `BED_SCREWS_ADJUST`/`ACCEPT`/`ADJUSTED`/`ABORT` 命令族未注册（`bed_screws.rs` 无 `register_command`）。
+- [x] 螺丝：`screws_tilt_adjust` ✅；`bed_screws` **段 + 命令族均已落地**（2026-10-06，`fdf182e`：`BED_SCREWS_ADJUST`
+      常驻注册，`ACCEPT`/`ADJUSTED`/`ABORT` 随会话注册与注销；粗调→精调两遍；`bed_screws.test` 走真命令转绿）。
+      有意偏离一处（已登记）：注册中途失败时本仓收回半组命令并复位，上游会留下半个命令组（`upstream-deviations.md`）。
 - [ ] 校准：`delta_calibrate` ✅（段+`DELTA_CALIBRATE`/`DELTA_ANALYZE` 落地 2026-09-24 批 #5，`delta_calibrate.test` 转绿）、`axis_twist_compensation` ✅（批 #36）；**未移植**：`skew_correction`、
       `z_thermal_adjust`、`tuning_tower`（三者无文件、无 section，语料不覆盖）。
 - [x] 回零周边：`homing_override`（`extras/homing_override.rs`）与 `homing_heaters`（批 #31）均已落地；

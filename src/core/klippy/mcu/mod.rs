@@ -2948,7 +2948,9 @@ impl Mcu {
 mod tests {
     use super::*;
     use crate::core::klippy::cmd::clock::{ClockSync, McuClock};
+    use crate::core::klippy::cmd::config::Reset;
     use crate::core::klippy::cmd::identify::IDENTIFY_CHUNK_SIZE;
+    use crate::core::klippy::cmd::McuCommand;
     use crate::core::klippy::identify::Identify;
     use crate::core::klippy::interface::devices::frame_mock::{
         FrameMock, FrameRecorder, MappingEntry, RecordingWire,
@@ -5088,6 +5090,269 @@ mod tests {
                 .await
                 .unwrap_or_else(|e| panic!("get_clock after takeover (round {round}) failed: {e}"));
         }
+    }
+
+    /// How many resets the R2 case performs.
+    const RESET_ROUNDS: usize = 3;
+
+    /// How long to wait before reopening a board that was told to `reset`: the
+    /// firmware has to reboot, and on a native-USB board re-enumerate, before the
+    /// port can be opened again.
+    const RESET_RECONNECT_DELAY: Duration = Duration::from_millis(250);
+
+    /// How many times to reopen before calling the board lost. Bounded: 40 ×
+    /// 250 ms is ten seconds for one reboot, and a board that is still not back
+    /// by then did not come back.
+    const RESET_RECONNECT_ATTEMPTS: usize = 40;
+
+    /// How long to give the `reset` command's flush before closing the port.
+    const RESET_FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
+
+    /// The pause between the flushed `reset` and closing the port, so the bytes
+    /// reach the firmware first — upstream pauses the same 15 ms between `reset`
+    /// and `_disconnect()` (`klippy/mcu.py:730-747`).
+    const RESET_DISCONNECT_DELAY: Duration = Duration::from_millis(15);
+
+    /// Reopen the board after it was told to `reset`, retrying while it reboots.
+    ///
+    /// The board is gone the moment the port is closed, so an open failure is the
+    /// expected first answer; the last one is reported when it never comes back —
+    /// a serial node that moved out from under `serial:` is exactly this failure.
+    async fn reopen_after_reset(
+        machine: &crate::hardware_test::Machine,
+    ) -> Result<Arc<Mcu>, String> {
+        let mut last = String::new();
+        for _ in 0..RESET_RECONNECT_ATTEMPTS {
+            sleep(RESET_RECONNECT_DELAY).await;
+            let interface = match machine.open_mcu() {
+                Ok(interface) => interface,
+                Err(err) => {
+                    last = err;
+                    continue;
+                }
+            };
+            // A failed `Mcu::connect` drops the half-built session on the way out,
+            // which closes the port again — so the next attempt opens it cleanly.
+            match Mcu::connect("mcu", interface).await {
+                Ok(mcu) => return Ok(mcu),
+                Err(err) => last = err.to_string(),
+            }
+        }
+        Err(last)
+    }
+
+    /// The board half of `TESTING.md`'s R2, on a real board: three firmware
+    /// resets in a row, and the board comes back every time.
+    ///
+    /// R2 is “软复位与会话恢复” (`TESTING.md:39-41`): the real test is three
+    /// `FIRMWARE_RESTART`s in a row, and its judgment sentence is “板子每次都能重启
+    /// 回来 … 不出现串口打不开或设备节点漂移”. Each round here does the three things
+    /// that sentence is about:
+    ///
+    /// 1. **reboot the firmware** — the `reset` command on the live connection,
+    ///    which is the `restart_method: command` path (`mcu/object.rs`'s
+    ///    `before_firmware_restart`, `klippy/mcu.py:730-747`: send `reset`, flush,
+    ///    pause, disconnect);
+    /// 2. **reconnect** — reopen the transport while the board is rebooting,
+    ///    retrying within a bounded budget, so a port that will not open or a node
+    ///    that drifted is a failure and not a hang;
+    /// 3. **identify and use the session** — `Mcu::connect` runs the handshake, and
+    ///    one `get_clock` round trip proves the session is usable rather than
+    ///    merely identified.
+    ///
+    /// What it asserts, round by round: the reconnect identifies within the budget,
+    /// the firmware that answers is a **freshly booted** one
+    /// (`!took_over_session()` — a board that never rebooted answers the new
+    /// connection with its old sequence, and the transport takes that session over,
+    /// `Mcu::took_over_session`), and the new session answers `get_clock`. Three
+    /// rounds with no failure is the pass; the timeout of the identify handshake,
+    /// an open failure that outlives the budget, a taken-over session, or a failed
+    /// `get_clock` is the failure.
+    ///
+    /// # Dangerous action
+    ///
+    /// **This makes the board's firmware reboot for real, three times.** Any host
+    /// session on that board dies with the first reset. A reboot drops whatever the
+    /// firmware was driving, so **do not run this with a hot or busy printer**:
+    /// power the heaters down and let the host release the board before running it.
+    ///
+    /// # What it touches
+    ///
+    /// Nothing physical. There is no assumed wiring beyond `[mcu]`'s own transport,
+    /// no stepper is moved, no pin is written, no heater is commanded, and no
+    /// endstop is read: the only messages on the wire are the identify handshake
+    /// (read), `reset` (write), and `get_clock` (write and read). The only bound it
+    /// needs is the reconnect budget (40 × 250 ms = 10 s per round) — there is no
+    /// motion to bound.
+    ///
+    /// # What it does not cover
+    ///
+    /// R2's other halves. The configuration handshake (“配置”) needs the assembled
+    /// `ConfigBuilder`, and the API subscription (“订阅”, whose continuity the
+    /// judgment sentence also asks for) needs a running `Printer`; `hardware_test`
+    /// deliberately hands a test the parsed config and the transports, never a
+    /// running machine, so both belong to the host layer rather than here.
+    ///
+    /// # Why the declaration is only `.mcu()`
+    ///
+    /// The declaration says the board is reachable. It is deliberately **not**
+    /// `.option("mcu", "restart_method")`: the key is optional and its default is
+    /// `command` (`mcu/restart_method.rs`), so the configs this case targets are
+    /// exactly the ones that do not write it — declaring the option would skip
+    /// them. What the case really needs is the firmware's `reset` command, which is
+    /// a property of the firmware's dictionary, not of the config file; a firmware
+    /// without it is detected after connecting and reported as `HW-IGNORED`, not
+    /// declared.
+    ///
+    /// # Running it
+    ///
+    /// ```text
+    /// KLIPPERX_HW_CONFIG=~/printer_data/config/printer.cfg \
+    ///   cargo test -p klipperx --lib test_firmware_reset_comes_back_three_times_on_a_real_board \
+    ///   -- --ignored --nocapture
+    /// ```
+    ///
+    /// On a machine with no `KLIPPERX_HW_CONFIG` it prints `HW-IGNORED: …` and
+    /// passes. It leaves the board freshly rebooted and unconfigured.
+    #[tokio::test]
+    #[ignore = "hardware: needs KLIPPERX_HW_CONFIG"]
+    async fn test_firmware_reset_comes_back_three_times_on_a_real_board() {
+        let Some(machine) = crate::hardware_test::acquire(
+            "test_firmware_reset_comes_back_three_times_on_a_real_board",
+            &crate::hardware_test::Requires::new().mcu(),
+        ) else {
+            return;
+        };
+
+        let mut mcu = Mcu::connect(
+            "mcu",
+            machine.open_mcu().expect("the board's transport must open"),
+        )
+        .await
+        .expect("identify must complete on the board as it is now");
+        // The reboot is the firmware's own `reset` command. A firmware that does
+        // not declare it cannot be rebooted from the host at all — R2's reboot half
+        // has nothing to drive there (a `config_reset` board is cleared in place,
+        // not restarted) — so report the skip in the same shape the framework uses
+        // instead of pretending to have tested it.
+        if !mcu.has_message(Reset::NAME) {
+            println!(
+                "HW-IGNORED: test_firmware_reset_comes_back_three_times_on_a_real_board: the \
+                 firmware declares no 'reset' command, so the host cannot reboot it — R2's \
+                 reboot half has nothing to drive on this board"
+            );
+            return;
+        }
+        println!(
+            "connected: took_over={} (the board as it is now, before any reset)",
+            mcu.took_over_session(),
+        );
+
+        for round in 1..=RESET_ROUNDS {
+            let started = Instant::now();
+
+            // 1. Reboot the firmware on the live connection, the way
+            //    `before_firmware_restart` does for `restart_method: command`:
+            //    `reset`, flushed so the bytes leave the host before the port is
+            //    closed. The flush often reports the transport going away as the
+            //    board reboots; the command was written first, so that is not an
+            //    error.
+            mcu.send_msg(&Reset).unwrap_or_else(|err| {
+                panic!("round {round}: the firmware rejected 'reset': {err}")
+            });
+            let _ = mcu.flush(RESET_FLUSH_TIMEOUT).await;
+            // Let the flushed bytes reach the firmware: closing the port
+            // immediately could cut a write the tty driver still holds, and a
+            // firmware that never saw `reset` never comes back.
+            sleep(RESET_DISCONNECT_DELAY).await;
+            // The old session must be the port's only owner, or dropping it closes
+            // nothing and its tasks keep reading the tty into the next session.
+            assert_eq!(
+                Arc::strong_count(&mcu),
+                1,
+                "round {round}: another handle still holds the session; the old tasks \
+                 would stay on the port"
+            );
+            drop(mcu);
+
+            // 2. Reopen while the firmware reboots; identify runs in
+            //    `Mcu::connect`.
+            let reconnected = reopen_after_reset(&machine).await.unwrap_or_else(|last| {
+                panic!("round {round}: the board did not come back after 'reset': {last}")
+            });
+
+            // 3. A booted firmware is what answers: a board that never rebooted
+            //    answers the new connection's first block with its old sequence,
+            //    and the transport takes that session over (`took_over_session`).
+            assert!(
+                !reconnected.took_over_session(),
+                "round {round}: the reconnected firmware was still the pre-reset \
+                 session — it did not reboot"
+            );
+
+            // 4. The new session is usable, not just identified.
+            let clock = McuClock::new(Arc::clone(&reconnected), ManualReactor::shared());
+            clock.get_clock().await.unwrap_or_else(|err| {
+                panic!("round {round}: get_clock failed on the reconnected board: {err}")
+            });
+            drop(clock);
+
+            println!(
+                "reset round {round}/{RESET_ROUNDS}: rebooted, identified and answered \
+                 get_clock in {:?}",
+                started.elapsed(),
+            );
+            mcu = reconnected;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // The reset case's declaration (no board needed)
+    // -----------------------------------------------------------------------
+
+    /// The declaration of [`test_firmware_reset_comes_back_three_times_on_a_real_board`]
+    /// is the right one: a config with a reachable `[mcu]` satisfies it, and one
+    /// without — commented out, absent, or carrying no interface — does not.
+    ///
+    /// `hardware_test` decides that from the parsed config alone, so this can be
+    /// checked without a board. It is what keeps the declaration from silently
+    /// skipping the case on the very configs it is for: the parser decides
+    /// “present”, so a commented-out `[mcu]` is simply absent.
+    #[test]
+    fn test_the_reset_case_declaration_matches_a_config() {
+        use crate::core::klippy::config::Config;
+        use crate::hardware_test::{check, Missing, Requires};
+
+        let requires = Requires::new().mcu();
+        let parse = |text: &str| Config::from_text(text).expect("the fixture parses").0;
+        let missing_main_mcu = || Err(vec![Missing::Mcu("mcu".to_string())]);
+
+        // Reachable over serial: the case runs …
+        assert_eq!(
+            check(&parse("[mcu]\nserial: /dev/ttyACM0\n"), &requires),
+            Ok(())
+        );
+        // … and over CAN. Either interface is a reachable MCU.
+        assert_eq!(
+            check(&parse("[mcu]\ncanbus_uuid: abc123\n"), &requires),
+            Ok(())
+        );
+
+        // No `[mcu]` section at all.
+        assert_eq!(
+            check(&parse("[stepper_x]\nendstop_pin: PA0\n"), &requires),
+            missing_main_mcu()
+        );
+        // Commented out is absent — the real parser decides “present”.
+        assert_eq!(
+            check(&parse("# [mcu]\n# serial: /dev/ttyACM0\n"), &requires),
+            missing_main_mcu()
+        );
+        // Present, but with nothing to open: not a reachable MCU.
+        assert_eq!(
+            check(&parse("[mcu]\nrestart_method: command\n"), &requires),
+            missing_main_mcu()
+        );
     }
 
     // -----------------------------------------------------------------------

@@ -655,7 +655,7 @@ git config core.hooksPath .githooks
 `generic-cramps.cfg` 与 `generic-replicape.cfg`）因未构建 `pru` 字典生成为 `#[ignore]`，
 其余 **237 条全部运行并通过（0 失败）**（`out_of_bounds.test` 的双重反转 bug 已修复，
 `G1 Y9999` 正确报 `Move out of range`，`SHOULD_FAIL` 满足）；用例的内联 g-code 由端到端运行
-真送进 dispatcher，更有独立的内联解析阶段（`upstream_inline_gcode_parses`，仍 `#[ignore]`）。上游 `configparser` 的 `optionxform = str.lower` 已对齐（`mod.rs` 存储侧小写 + `section.rs` 查询侧小写），`Option 'pid_Kp' … must be specified` 类的 49 次回归失败已归零。
+真送进 dispatcher（没有独立的解析阶段：早先那个未长出实现的 `upstream_inline_gcode_parses` 已删除）。上游 `configparser` 的 `optionxform = str.lower` 已对齐（`mod.rs` 存储侧小写 + `section.rs` 查询侧小写），`Option 'pid_Kp' … must be specified` 类的 49 次回归失败已归零。
 
 生成式运行器取代了旧的 `upstream_test_cases_run`（单个 `#[test]` 串行跑 239 case，十几分钟易超时
 且无法单跑定位）；旧环境变量 `KLIPPERX_UPSTREAM_ALL` / `KLIPPERX_UPSTREAM_FILTER` 不再适用。

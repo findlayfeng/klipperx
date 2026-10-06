@@ -581,6 +581,16 @@ endstop 资源（`mcu/resource/endstop.rs`，含 `minclock` 门控与 `home_wait
         **行为等价（近似 no-op）**，不要把它当成“不晚到”的保障。
       **真机未验证**：等待生效路径（无 `debug_output`）尚未上真板，见 TESTING.md 的 R11。
 
+- [ ] **Q12 rail 归零漏报「端停未触发」——安全相关（2026-10-06 真机用例 R4 暴露）**：
+      `extras/toolhead.rs` 的 `home_axis`（`home_wait` 在 `:3216`）与 `home_unified`（`:3110`）拿到 `trigger_time`
+      却**从不判断“有没有触发”**（只拿它记触发位置），于是端停坏掉/接错时 `G28` 会**走到 1.5× 强迫距离
+      撞进机械限位，然后报告成功并把轴标为已归零**。对照：**探针路径已做对**——`:3373-3376` 用
+      `trigger_time <= 0.0` 作哨兵并报 `No trigger on probe after full movement`；上游对轨道报
+      `homing.py:119` 的 `No trigger on <name> after full movement`。
+      **影响**：真机用例 R4 的「触碰即停 / 不撞机」半边只能人工看，正是因这条缺失；也是 R4 用例 doc 里
+      要求「建议临时调小 `homing_speed`」的原因。**已在修**（`agents/fix-homing-no-trigger`：两处加同一检查 +
+      先红后绿 + 正向对照）。
+
 - [x] **Q11 断环：已修（2026-10-06）** —— `VirtualSdCard` 与 `GCodeButton` 都持 `Arc<GCodeDispatch>`、
       又把**捕获 `Arc<Self>`** 的 handler 注册回它的命令/mux 表，于是命令表反向钉住部件：
       `teardown()` 后 `Mcu::Drop` 不跑 → `interface.shutdown()` 不被调用 → 收尾时那批 `spawn_blocking`

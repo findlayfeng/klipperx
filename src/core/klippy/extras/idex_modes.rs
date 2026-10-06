@@ -331,7 +331,12 @@ pub fn claim(rails: &[Arc<Rail>], printer: &Arc<Printer>) {
 /// A rail's short name (`GenericPrinterRail.get_name(short=True)`,
 /// `stepper.py:388-394`): a `stepper_x` rail is `x`, `stepper_z1` is `z1`,
 /// and anything else is its last whitespace-separated word.
-fn short_rail_name(name: &str) -> &str {
+///
+/// `pub(crate)` because the homing driver's "No trigger on … after full
+/// movement" message names rails the same way upstream does
+/// (`extras/homing.py:119` uses this short name, while `M119` labels use the
+/// full stepper name — see `toolhead`'s module docs).
+pub(crate) fn short_rail_name(name: &str) -> &str {
     if let Some(rest) = name.strip_prefix("stepper") {
         // `get_name(short=True)` skips the `stepper` prefix and the symbol
         // after it.

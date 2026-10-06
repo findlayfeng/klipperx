@@ -95,6 +95,7 @@ OctoPrint 只走 pty，与本条取舍无关。
 |---|---|---|
 | 上游 host `Stats …` 日志行 / `gcodein` | 无 host 统计采集器 | 本条 1.1 |
 | `query_adc` / `QUERY_ADC` | 未实现（`adc_scaled` 只用 config 输入量程） | [配置手册](../user-manual/config.md)、[模块表](README.md) |
+| `canbus_nodeid` 选项 | 上游没有这个选项（CAN 节点号一律由 `canbus_ids` 按声明顺序发） | 本仓保留它作显式覆盖：写了就用、且照旧计入 `len(ids)`；自增号与它撞车时**装载期报配置错**（点名双方），而不到固件 `can_id_conflict` 才停机 | [配置手册](../user-manual/config.md)、[模块表](README.md) |
 | `steppers` 的资格过滤 | 未实现（本仓 homing 事件无载荷） | [配置手册](../user-manual/config.md)、[模块表](README.md) |
 | TMC 的 `stallguard_dump` 查询与 SPI 片选共享 | 四个 SPI 型（`tmc2130`/`tmc2240`/`tmc2660`/`tmc5160`）均已落地；余项＝`tmc/stallguard_dump` 端点与 `spi_set_bus` 共享（每节自建 `McuSpi`） | [配置手册](../user-manual/config.md) |
 | `TEMPLATE=` 形式的菜单/显示选项 | 未实现（菜单不渲染） | [配置手册](../user-manual/config.md) |

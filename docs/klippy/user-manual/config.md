@@ -235,11 +235,26 @@ max_accel: 3000
 | `baud` | 整数 | 否 | `250000` | 串口波特率（仅 `serial` 模式） |
 | `canbus_uuid` | 12 位十六进制 | 二选一 | — | MCU 芯片唯一 ID（12 位 hex），CAN 模式必给 |
 | `canbus_interface` | 字符串 | 否 | `can0` | CAN 网络接口名 |
-| `canbus_nodeid` | 整数 (1..895) | 与 `canbus_uuid` 同用 | — | CAN 节点号，Klipper 由 `[canbus_ids]` 分配，klipperx 需显式给出 |
+| `canbus_nodeid` | 整数 (1..895) | 否 | 由 `[canbus_ids]` 分配 | CAN 节点号。**不写就由分配器发**（起点 4、步长 1、按 `[mcu]` 声明顺序）；写了就用写的那个（显式值也占一个号位），与自增号撞车时**装载期报错**（上游靠固件 `can_id_conflict` 兜底，本仓提前拒）。 |
 | `restart_method` | `command` / `arduino` / `cheetah` / `rpi_usb` | 否 | `arduino`（串口）/ `command`（非串口） | MCU 固件重启方式 |
 | `usb_power` | `auto` / `sysfs` / `libusb` | 否 | `auto` | `rpi_usb` 的切电机制 |
 
 > 详细参数说明见 [MCU 连接方式](mcu-connection.md)。
+
+### `[canbus_ids]` — CAN 节点号分配器
+
+**无参数节。** 给带 `canbus_uuid` 但又没写 `canbus_nodeid` 的 `[mcu]` 发节点号：编号规则照上游
+（`NODEID_FIRST = 4`、步长 1、`new_id = len(ids) + 4`、顺序 = `[mcu]` **声明顺序**）。
+不需要它时不必写——第一个 CAN `[mcu]` 会自己把它拉起来。
+
+```ini
+[canbus_ids]          # 可写可不写；写了也只是显式声明这个分配器
+```
+
+与上游的两处差异（详见[本项目与上游的偏移](../developer-manual/upstream-deviations.md)）：
+① `canbus_nodeid` 是本仓特有的显式覆盖选项（上游只有 `canbus_uuid`）；
+② 自增号与显式号撞车时**装载期报配置错**（点明双方），不像上游那样留到固件 `can_id_conflict` 才停机。
+发现未分配的板子（拿到可粘进配置的 uuid）见 `klipperx canbus-scan`。
 
 ### `[output_pin <name>]` — 输出引脚（数字 / PWM）
 

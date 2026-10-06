@@ -63,6 +63,7 @@
 mod tests {
     use super::*;
     use crate::core::klippy::config::{Config, ConfigValue};
+    use crate::core::klippy::mcu::Mcu;
     use std::sync::Arc;
 
     /// Render `path` relative to the klipper submodule, for a readable failure.
@@ -449,6 +450,33 @@ mod tests {
     // dev-dependency's build script runs and writes them.
     include!("upstream_generated/mod.rs");
 
+    /// The klipper source root as the process working directory, restored on
+    /// drop (including a panic).
+    ///
+    /// Upstream's `test/klippy/test-klippy.sh` runs each case with the klipper
+    /// source root as the working directory, so a config's relative `path:`
+    /// (only `sdcard_loop.cfg` ships one) resolves the way `os.listdir` does.
+    /// Cargo's working directory is the package root, where `test/` is not
+    /// present, so without this `[virtual_sdcard]` cannot find the directory it
+    /// was pointed at.
+    struct KlipperCwdGuard(Option<std::path::PathBuf>);
+
+    impl KlipperCwdGuard {
+        fn set() -> Self {
+            let guard = Self(std::env::current_dir().ok());
+            let _ = std::env::set_current_dir(klipper_dir());
+            guard
+        }
+    }
+
+    impl Drop for KlipperCwdGuard {
+        fn drop(&mut self) {
+            if let Some(prev) = self.0.take() {
+                let _ = std::env::set_current_dir(prev);
+            }
+        }
+    }
+
     /// Entry point the generated `#[test]`s call — the runtime half of the
     /// generated corpus. Each generated function passes the frozen config path,
     /// dictionary paths (already resolved against the built-dictionary
@@ -464,25 +492,9 @@ mod tests {
         gcode: &str,
         should_fail: bool,
     ) {
-        // Upstream's `test/klippy/test-klippy.sh` runs each case with the
-        // klipper source root as the working directory, so a config's relative
-        // `path:` (only `sdcard_loop.cfg` ships one) resolves the way
-        // `os.listdir` does. Cargo's working directory is the package root,
-        // where `test/` is not present, so without this guard
-        // `[virtual_sdcard]`'s `get_file_list` cannot find the directory. The
-        // process-global change is scoped to this case and restored on exit,
-        // including a panic — exactly the `CwdGuard` the old
-        // `upstream_test_cases_run` used.
-        struct CwdGuard(Option<std::path::PathBuf>);
-        impl Drop for CwdGuard {
-            fn drop(&mut self) {
-                if let Some(prev) = self.0.take() {
-                    let _ = std::env::set_current_dir(prev);
-                }
-            }
-        }
-        let _cwd_guard = CwdGuard(std::env::current_dir().ok());
-        let _ = std::env::set_current_dir(klipper_dir());
+        // The case runs from the klipper source root, as upstream runs it;
+        // the guard restores the working directory on exit, including a panic.
+        let _cwd_guard = KlipperCwdGuard::set();
 
         let resolved: Vec<(Option<String>, PathBuf)> = dictionaries
             .iter()
@@ -698,6 +710,28 @@ mod tests {
             .collect()
     }
 
+    /// [`run_dictionaries`]' entries, refusing one the build did not produce.
+    ///
+    /// # Errors
+    /// Returns the name of the first dictionary that was not built: running the
+    /// case with a different target's dictionary would not be the case upstream
+    /// wrote.
+    fn resolved_dictionaries(
+        dictionaries: &[(Option<String>, Option<PathBuf>)],
+    ) -> Result<Vec<(Option<String>, PathBuf)>, String> {
+        dictionaries
+            .iter()
+            .map(|(mcu, path)| {
+                path.clone().map(|path| (mcu.clone(), path)).ok_or_else(|| {
+                    format!(
+                        "dictionary for '{}' was not built",
+                        mcu.as_deref().unwrap_or("mcu")
+                    )
+                })
+            })
+            .collect()
+    }
+
     /// Run one upstream run, as `test_klippy.py` does.
     ///
     /// `dictionaries` pairs each named MCU with the dictionary to serve it; a
@@ -712,16 +746,7 @@ mod tests {
         run: &UpstreamRun,
         dictionaries: &[(Option<String>, Option<PathBuf>)],
     ) -> Result<(), String> {
-        let mut resolved = Vec::with_capacity(dictionaries.len());
-        for (mcu, path) in dictionaries {
-            let Some(path) = path else {
-                return Err(format!(
-                    "dictionary for '{}' was not built",
-                    mcu.as_deref().unwrap_or("mcu")
-                ));
-            };
-            resolved.push((mcu.clone(), path.clone()));
-        }
+        let resolved = resolved_dictionaries(dictionaries)?;
 
         let script = match &run.gcode_file {
             Some(path) => {
@@ -937,37 +962,156 @@ mod tests {
     /// it by running every case as its own process; this host gives every case
     /// its own runtime, and this test asserts that the runtime really does come
     /// back.
+    ///
+    /// The probe runs every corpus case whose **config registers commands into
+    /// the dispatcher while holding it**: a part that does that and has its
+    /// handler capture it strongly closes the loop `part → dispatcher → command
+    /// table → part`, and the pinned table then keeps every part it captured
+    /// alive across `Printer::teardown` — including the ones holding an `Mcu`,
+    /// whose blocked device read parks the runtime. Running only
+    /// `example-cartesian.cfg` (which names neither section) missed exactly
+    /// that: the leaks were a silent five seconds per case instead of a failure.
+    ///
+    /// A case whose dictionary was not built (`KLIPPERX_ARCHES`) is skipped, as
+    /// the generated cases are.
     #[test]
     fn a_case_runtime_shuts_down() {
+        let runs: Vec<UpstreamRun> = all_runs()
+            .into_iter()
+            .filter(|run| {
+                std::fs::read_to_string(&run.config).is_ok_and(|text| {
+                    text.contains("[virtual_sdcard") || text.contains("[gcode_button")
+                })
+            })
+            .collect();
+        assert!(
+            !runs.is_empty(),
+            "the corpus has a case whose config holds the dispatcher"
+        );
+
+        let _cwd_guard = KlipperCwdGuard::set();
+        let mut measured = 0;
+        for run in &runs {
+            let dictionaries = run_dictionaries(run);
+            if dictionaries.iter().any(|(_, path)| path.is_none()) {
+                continue; // this case's dictionary was not built.
+            }
+            measured += 1;
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("a case runtime");
+            runtime
+                .block_on(run_case(run, &dictionaries))
+                .unwrap_or_else(|e| {
+                    panic!("{}: the case does not run: {e}", relative(&run.config))
+                });
+            let started = std::time::Instant::now();
+            runtime.shutdown_timeout(std::time::Duration::from_secs(CASE_SHUTDOWN_TIMEOUT));
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed < std::time::Duration::from_secs(CASE_SHUTDOWN_TIMEOUT),
+                "{}: the case's runtime did not shut down within {CASE_SHUTDOWN_TIMEOUT}s \
+                 ({elapsed:?}): a part was leaked",
+                relative(&run.config)
+            );
+        }
+        assert!(measured > 0, "no such case has a built dictionary");
+    }
+
+    /// A `FIRMWARE_RESTART` must release the session the machine ran on.
+    ///
+    /// This is the production hazard of the cycle the probe above covers: a part
+    /// that survived `Printer::teardown` kept its `Arc<Mcu>`, so the reopen ran
+    /// **beside** the old, still-reading session — two readers on one device,
+    /// stealing frames from each other. The assertion is the count: after the
+    /// reset, the only handle left on the old session is this test's.
+    #[test]
+    fn a_firmware_restart_releases_the_old_session() {
         let run = all_runs()
             .into_iter()
             .find(|run| {
                 run.config
                     .file_name()
-                    .map(|name| name == "example-cartesian.cfg")
+                    .map(|name| name == "sdcard_loop.cfg")
                     .unwrap_or(false)
             })
-            .expect("the corpus has example-cartesian.cfg");
+            .expect("the corpus has sdcard_loop.cfg");
         let dictionaries = run_dictionaries(&run);
         assert!(
             dictionaries.iter().all(|(_, path)| path.is_some()),
-            "example-cartesian's dictionaries are built"
+            "sdcard_loop's dictionary is built"
         );
+        let resolved = resolved_dictionaries(&dictionaries).expect("checked");
+        let parsed = injected_config(&run.config, &resolved).expect("the config parses");
+
+        let _cwd_guard = KlipperCwdGuard::set();
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .expect("a case runtime");
-        runtime
-            .block_on(run_case(&run, &dictionaries))
-            .expect("the case runs");
-        let started = std::time::Instant::now();
+        let outcome = runtime.block_on(restart_sessions(&parsed));
+        // Bounded, so a regression reports as a failure instead of hanging on the
+        // parked read it leaves behind.
         runtime.shutdown_timeout(std::time::Duration::from_secs(CASE_SHUTDOWN_TIMEOUT));
-        let elapsed = started.elapsed();
+
+        let (old, new) = outcome.expect("the restart cycle runs");
         assert!(
-            elapsed < std::time::Duration::from_secs(CASE_SHUTDOWN_TIMEOUT),
-            "the case's runtime did not shut down within {CASE_SHUTDOWN_TIMEOUT}s ({elapsed:?}): \
-             a part was leaked"
+            !Arc::ptr_eq(&old, &new),
+            "the reopen is a new session, not the one before the restart"
         );
+        assert_eq!(
+            Arc::strong_count(&old),
+            1,
+            "reset_for_restart released every other reference to the old session: \
+             a leaked part kept the old reader alive beside the new one"
+        );
+    }
+
+    /// Bring a machine up on `config`, reset for a firmware restart, and bring it
+    /// up again — returning the two sessions.
+    ///
+    /// Returns `Err` instead of panicking so a caller can shut the case's
+    /// runtime down on a bound before reporting; a leak here parks a blocking
+    /// read that an unbounded drop would wait for forever.
+    async fn restart_sessions(config: &Config) -> Result<(Arc<Mcu>, Arc<Mcu>), String> {
+        use crate::core::klippy::api::StartArgs;
+        use crate::core::klippy::mcu::McuObject;
+        use crate::core::klippy::printer::{Printer, PrinterState};
+        use crate::core::klippy::reactor::TokioReactor;
+
+        let reactor = Arc::new(TokioReactor::new(tokio::runtime::Handle::current()));
+        let printer = Arc::new(Printer::new(reactor));
+        // The corpus' shape (`-o`), so a case's `G1 E…` is not rejected as cold.
+        let mut start_args = StartArgs::collect("sdcard_loop.cfg", None);
+        start_args.debug_output = Some("_test_output".to_string());
+        printer.set_start_args(Arc::new(start_args));
+
+        let mut sessions = Vec::new();
+        for round in 0..2 {
+            printer.load_config(config).map_err(|e| e.to_string())?;
+            if tokio::time::timeout(std::time::Duration::from_secs(10), printer.bring_up())
+                .await
+                .is_err()
+            {
+                return Err("bring_up timed out".to_string());
+            }
+            let state = printer.get_state_message();
+            if state.category != PrinterState::Ready {
+                return Err(format!("not ready: {}", state.message));
+            }
+            let session = printer
+                .lookup_object_as::<McuObject>("mcu")
+                .and_then(|mcu| mcu.mcu())
+                .ok_or_else(|| "the session is not up".to_string())?;
+            sessions.push(session);
+            if round == 0 {
+                printer.reset_for_restart("firmware_restart");
+            }
+        }
+        let new = sessions.pop().expect("two rounds pushed a session");
+        let old = sessions.pop().expect("two rounds pushed a session");
+        Ok((old, new))
     }
 
     /// How long a case's runtime may take to shut down.

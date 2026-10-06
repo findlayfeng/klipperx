@@ -40,10 +40,11 @@
 //! * `ContinuousTareFilterHelper.update_from_command`: a `PROBE`/`G28` that
 //!   overrides the drift/buzz/notch options at the command line is not read
 //!   (the corpus passes none).
-//! * `LoadCellProbingMove`'s `LookupZSteppers` and the sensors'
-//!   `setup_trigger_analog` attach, so the trigger analog's trsync is not
-//!   told which Z steppers to stop on a real MCU (the fake firmware fires on
-//!   the move's first step regardless).
+//! * the sensors' `setup_trigger_analog` attach. `LoadCellProbingMove`'s
+//!   `LookupZSteppers` *is* wired: the Z rail's steppers register with the
+//!   trigger analog's dispatch on `klippy:mcu_identify`, so a real MCU gets a
+//!   `stepper_stop_on_trigger` for each and the Z stops that way (the fake
+//!   firmware fires on the move's first step regardless).
 //! * `LOAD_CELL_TEST_TAP`.
 //!
 //! [`lookup_probe_session`]: crate::core::klippy::extras::probe
@@ -55,10 +56,12 @@ use serde_json::{json, Value};
 
 use crate::core::klippy::cmd::trigger_analog::TriggerAnalogType;
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
+use crate::core::klippy::event::KlippyEvent;
 use crate::core::klippy::extras::load_cell::{LoadCell, LoadCellSampleCollector};
 use crate::core::klippy::extras::probe::{
     calc_probe_z_average, ProbeOffsets, ProbeParams, ProbeSession, PROBE_PARAMS,
 };
+use crate::core::klippy::extras::stepper::PrinterStepper;
 use crate::core::klippy::extras::toolhead::ToolHeadObject;
 use crate::core::klippy::extras::trigger_analog::{calc_frac_bits, to_fixed_32, DigitalFilter};
 use crate::core::klippy::gcode::{
@@ -518,6 +521,48 @@ pub fn sos_design(design: &DigitalFilter) -> Result<SosFilterDesign, ConfigError
 // The section
 // ===========================================================================
 
+/// `probe.LookupZSteppers`: register every Z rail stepper with the trigger
+/// analog's dispatch, so a real MCU stops them on a hit.
+///
+/// Upstream walks the toolhead kinematics for the steppers whose
+/// `is_active_axis('z')` is true (`probe.py:195-206`); the Z rail's own stepper
+/// list is the same set — `stepper_z` then `stepper_z1`, `stepper_z2`… in
+/// config order — which is what `z_tilt` queries too (`z_tilt.rs`).
+///
+/// Runs on `klippy:mcu_identify`, once per bring-up, so the toolhead and the
+/// Z steppers exist by then. A stepper whose chip differs from the trigger
+/// analog's gets its own trsync from
+/// [`TriggerDispatch::add_stepper`](crate::core::klippy::mcu::TriggerDispatch::add_stepper).
+fn register_z_steppers(printer: &Weak<Printer>, trigger_analog: &Arc<McuTriggerAnalog>) {
+    let Some(printer) = printer.upgrade() else {
+        return;
+    };
+    let Some(toolhead) = printer.lookup_object_as::<ToolHeadObject>(TOOLHEAD_OBJECT) else {
+        return;
+    };
+    let dispatch = trigger_analog.dispatch();
+    for name in toolhead.z_stepper_names() {
+        let Some(stepper) = printer.lookup_object_as::<PrinterStepper>(&name) else {
+            continue;
+        };
+        let mcu_stepper = stepper.mcu_stepper();
+        if let Err(err) = dispatch.add_stepper(
+            mcu_stepper.chip().clone(),
+            Arc::downgrade(mcu_stepper),
+            &name,
+        ) {
+            // The one refusal here is a shared Z axis spanning MCUs, which
+            // upstream raises as a config error (`TriggerDispatch.add_stepper`,
+            // `klippy/mcu.py:293-308`). The event bus isolates a handler and
+            // keeps the rest of bring-up going, so the failure is reported
+            // rather than turned into a hard stop.
+            tracing::error!(
+                "load_cell_probe: cannot register '{name}' with the trigger dispatch: {err}"
+            );
+        }
+    }
+}
+
 /// One configured `[load_cell_probe]` (`load_cell_probe.LoadCellPrinterProbe`).
 pub struct LoadCellProbe {
     /// The section's identifier, for logging.
@@ -599,6 +644,26 @@ impl LoadCellProbe {
                 Some(Arc::clone(&sos_filter)),
             )
             .map_err(|err| ConfigError::new(err.to_string()))?,
+        );
+
+        // `probe.LookupZSteppers(config, dispatch.add_stepper)`: the trigger
+        // analog is built here, but the toolhead (and so the Z rail's steppers)
+        // does not exist yet — `toolhead` loads late, after this generic
+        // section. Upstream defers to `klippy:mcu_identify` for the same
+        // reason (`load_cell_probe.py:320-321`, `probe.py:195-206`); `bring_up`
+        // fires it after every section is loaded and before any object
+        // connects, which is the one moment both the toolhead and the steppers
+        // are reachable.
+        //
+        // The handler holds the printer **weakly**: a strong handle would close
+        // the `printer → handler → printer` loop and keep the machine alive
+        // after teardown. The dispatch is held strongly through the analog it
+        // belongs to.
+        let identify_printer = Arc::downgrade(printer);
+        let identify_analog = Arc::clone(&trigger_analog);
+        printer.register_event_handler(
+            KlippyEvent::KlippyMcuIdentify,
+            Box::new(move |_| register_z_steppers(&identify_printer, &identify_analog)),
         );
 
         // `probe.lookup_minimum_z`: `[stepper_z] position_min`, else
@@ -1166,9 +1231,14 @@ pub fn load_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::klippy::cmd::clock::McuClock;
     use crate::core::klippy::config::{AccessTracking, Config, ConfigSection, ConfigValue};
     use crate::core::klippy::gcode::{GCodeDispatch, GCODE_OBJECT};
-    use crate::core::klippy::mcu::McuObject;
+    use crate::core::klippy::interface::devices::frame_mock::RecordingWire;
+    use crate::core::klippy::interface::Interface;
+    use crate::core::klippy::mcu::{Dictionary, Mcu, McuObject};
+    use crate::core::klippy::msg::parser::Parser;
+    use crate::core::klippy::msg::proto::{ArgValue, Payload};
     use crate::core::klippy::pins::PrinterPins;
     use crate::core::klippy::reactor::ManualReactor;
 
@@ -1465,5 +1535,211 @@ mod tests {
         assert!((z_contact - 0.25).abs() <= 0.01, "z_contact={z_contact}");
         assert!(below >= FIT_MIN_POINTS, "below={below}");
         assert!(above >= FIT_MIN_POINTS, "above={above}");
+    }
+
+    // ------------------------------------------------------------------
+    // The Z steppers the trigger dispatch stops (`LookupZSteppers`)
+    // ------------------------------------------------------------------
+
+    /// Closes the test's MCU session when it drops, so a failed assertion
+    /// still releases the parked device read (the `SessionGuard` shape the
+    /// endstop and trigger-analog tests use; the point is that this must run on
+    /// the panic path too).
+    struct SessionGuard(Arc<Mcu>);
+
+    impl Drop for SessionGuard {
+        fn drop(&mut self) {
+            self.0.clear_events();
+            self.0.close();
+        }
+    }
+
+    /// A machine with the shape the Z-stepper registration cares about: an
+    /// `[mcu]`, a shared Z rail (`stepper_z` and `stepper_z1`), and the corpus
+    /// `[load_cell_probe]`.
+    ///
+    /// The MCU's configuration is built by hand over a recording wire — the
+    /// build half of `McuObject::connect`, without opening a real port — so the
+    /// Z steppers have their oids and an arm shows on the wire. `None` when the
+    /// `atmega2560` dictionary was not built (`KLIPPERX_ARCHES`).
+    struct ZMachine {
+        printer: Arc<Printer>,
+        /// Every payload the wire was sent, oldest first.
+        sent: Arc<Mutex<Vec<Vec<u8>>>>,
+        mcu: Arc<Mcu>,
+        /// Bound for the test's whole life, the failed-assertion path included.
+        _session: SessionGuard,
+    }
+
+    impl ZMachine {
+        /// The probe object the section registered.
+        fn probe(&self) -> Arc<LoadCellProbe> {
+            self.printer
+                .lookup_object_as::<LoadCellProbe>(PROBE_OBJECT)
+                .expect("the section registers the probe object")
+        }
+    }
+
+    fn z_registration_machine() -> Option<ZMachine> {
+        // `load_cell.test` runs on the atmega2560 dictionary, so it carries
+        // every command and pin this shape needs; without it there is nothing
+        // to build against.
+        let dict = klipperx_test_support::test_dicts_dir().join("atmega2560.dict");
+        if !dict.is_file() {
+            return None;
+        }
+        let text = "[mcu]\nserial: /dev/null\n\
+                    [stepper_x]\nstep_pin: PA0\ndir_pin: PA1\nrotation_distance: 40\nmicrosteps: 16\nposition_max: 200\n\
+                    [stepper_y]\nstep_pin: PA2\ndir_pin: PA3\nrotation_distance: 40\nmicrosteps: 16\nposition_max: 200\n\
+                    [stepper_z]\nstep_pin: PA4\ndir_pin: PA5\nrotation_distance: 8\nmicrosteps: 16\nposition_max: 200\n\
+                    [stepper_z1]\nstep_pin: PA6\ndir_pin: PA7\nrotation_distance: 8\nmicrosteps: 16\n\
+                    [printer]\nkinematics: cartesian\nmax_velocity: 300\nmax_accel: 3000\nmax_z_velocity: 5\nmax_z_accel: 100\n\
+                    [load_cell_probe]\nz_offset: 0\nsensor_type: ads1220\nspeed: 10.0\n\
+                    cs_pin: PJ2\ndata_ready_pin: PJ3\ncounts_per_gram: 100\nreference_tare_counts: 1000\n\
+                    drift_filter_cutoff_frequency: 0.8\nbuzz_filter_cutoff_frequency: 100.0\n\
+                    notch_filter_frequencies: 50, 60\n";
+        let (config, _) = Config::from_text(text).expect("the Z registration config parses");
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        printer
+            .load_config(&config)
+            .expect("the Z registration config loads");
+
+        let pins = printer
+            .lookup_object_as::<PrinterPins>(PINS_OBJECT)
+            .expect("the loader registers `pins`");
+        let chip = pins
+            .chip_as::<McuChip>("mcu")
+            .expect("the [mcu] section registers its chip");
+        let wire = RecordingWire::new();
+        let sent = wire.sent();
+        let mcu = Arc::new(Mcu::for_test("mcu", Interface::recording(wire)));
+        // Bound before anything that can panic: from here on the parked
+        // device read must be released whatever happens below.
+        let session = SessionGuard(Arc::clone(&mcu));
+        let dictionary: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&dict).expect("the dictionary reads"))
+                .expect("the dictionary is JSON");
+        mcu.install_dictionary(Dictionary::from_json(dictionary).expect("the dictionary parses"))
+            .expect("the dictionary installs");
+        mcu.set_clock_base(0);
+        let clock = Arc::new(McuClock::new(Arc::clone(&mcu), ManualReactor::shared()));
+        clock.seed(0.0, 0);
+        chip.attach(Arc::clone(&mcu));
+        chip.set_clock(clock, 0.0);
+        // The config callbacks `McuObject::connect` runs: this is what hands
+        // the steppers their oids, so arming can name them on the wire.
+        chip.config().build(&mcu).expect("the config builds");
+        Some(ZMachine {
+            printer,
+            sent,
+            mcu,
+            _session: session,
+        })
+    }
+
+    /// The oid the config assigned to the stepper registered under `name`.
+    fn stepper_oid(printer: &Arc<Printer>, name: &str) -> u8 {
+        printer
+            .lookup_object_as::<PrinterStepper>(name)
+            .unwrap_or_else(|| panic!("'{name}' is registered"))
+            .mcu_stepper()
+            .oid()
+            .expect("the built config assigned the stepper's oid")
+    }
+
+    /// The `stepper_stop_on_trigger` messages on the wire, as
+    /// `(stepper oid, trsync oid)` in send order.
+    fn stop_on_trigger(sent: &Arc<Mutex<Vec<Vec<u8>>>>, mcu: &Arc<Mcu>) -> Vec<(u8, u8)> {
+        let mut parser = Parser::new();
+        mcu.dictionary()
+            .expect("the test installs a dictionary")
+            .install(&mut parser)
+            .expect("the dictionary installs into the parser");
+        let frames = sent.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let mut stops = Vec::new();
+        for frame in frames {
+            let Ok(messages) = parser.decode(Payload::from_raw(frame)) else {
+                continue;
+            };
+            for (msg, args) in messages {
+                if msg.name != "stepper_stop_on_trigger" {
+                    continue;
+                }
+                if let [ArgValue::UInt8(oid), ArgValue::UInt8(trsync_oid)] = args.as_slice() {
+                    stops.push((*oid, *trsync_oid));
+                }
+            }
+        }
+        stops
+    }
+
+    /// `LoadCellProbingMove`'s `LookupZSteppers`: on `klippy:mcu_identify` the
+    /// probe registers every Z rail stepper with its own trigger dispatch, and
+    /// nothing before that (`load_cell_probe.py:320-321`, `probe.py:195-206`).
+    #[tokio::test]
+    async fn the_probe_registers_the_z_steppers_on_its_trigger_dispatch() {
+        let Some(machine) = z_registration_machine() else {
+            return;
+        };
+        let probe = machine.probe();
+        assert!(
+            probe.trigger_analog().dispatch().stepper_names().is_empty(),
+            "no Z motor registers before klippy:mcu_identify"
+        );
+
+        machine.printer.send_event(&KlippyEvent::KlippyMcuIdentify);
+
+        assert_eq!(
+            probe.trigger_analog().dispatch().stepper_names(),
+            ["stepper_z", "stepper_z1"],
+            "the Z rail's motors hang off the probe's dispatch"
+        );
+    }
+
+    /// Arming the probe's trigger dispatch sends a `stepper_stop_on_trigger`
+    /// for every registered Z motor — and none while nothing is registered.
+    ///
+    /// This is the wiring that stops the Z on a real MCU; without it the
+    /// firmware only fires the trigger and the Z walks the rest of the queued
+    /// move (the fake firmware fires on the move's first step regardless, so
+    /// only the wire shows it).
+    #[tokio::test]
+    async fn arming_the_probe_stops_the_z_motors_on_the_wire() {
+        use std::time::Duration;
+        use tokio::time::sleep;
+        let Some(machine) = z_registration_machine() else {
+            return;
+        };
+        let probe = machine.probe();
+        let trsync_oid = probe.trigger_analog().dispatch().get_oid();
+        let z_oid = stepper_oid(&machine.printer, "stepper_z");
+        let z1_oid = stepper_oid(&machine.printer, "stepper_z1");
+
+        // Before `klippy:mcu_identify` the dispatch holds no stepper, so the
+        // arm carries no stop message.
+        probe.trigger_analog().dispatch().start(0.0).unwrap();
+        sleep(Duration::from_millis(60)).await;
+        assert!(
+            stop_on_trigger(&machine.sent, &machine.mcu).is_empty(),
+            "a dispatch nobody registered with must not stop anything"
+        );
+
+        // The production path: `bring_up` fires this before any object
+        // connects, so both the toolhead and its steppers exist.
+        machine.printer.send_event(&KlippyEvent::KlippyMcuIdentify);
+
+        machine
+            .sent
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
+        probe.trigger_analog().dispatch().start(0.0).unwrap();
+        sleep(Duration::from_millis(60)).await;
+
+        assert_eq!(
+            stop_on_trigger(&machine.sent, &machine.mcu),
+            vec![(z_oid, trsync_oid), (z1_oid, trsync_oid)],
+            "each Z motor stops on the probe's own trsync"
+        );
     }
 }

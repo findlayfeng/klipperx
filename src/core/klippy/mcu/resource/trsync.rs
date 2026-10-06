@@ -602,6 +602,20 @@ impl TriggerDispatch {
         Ok(())
     }
 
+    /// The names of every stepper registered with the dispatch, across all its
+    /// trsyncs, in registration order (upstream's `TriggerDispatch.get_steppers`,
+    /// `klippy/mcu.py:308-309`, by name).
+    #[cfg(test)]
+    pub(crate) fn stepper_names(&self) -> Vec<String> {
+        self.group
+            .trsyncs
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .flat_map(|trsync| trsync.stepper_names())
+            .collect()
+    }
+
     /// Arm every trsync; the completion fires when one of them triggers.
     ///
     /// # Errors
@@ -920,6 +934,37 @@ mod tests {
 
         let trsync = first(&dispatch);
         assert_eq!(trsync.stepper_names(), vec!["stepper_x", "stepper_x1"]);
+    }
+
+    /// A trigger analog's dispatch is handed the Z rail's steppers
+    /// (`stepper_z`, `stepper_z1`…): it must report them by name, and report
+    /// nothing before anyone registers.
+    ///
+    /// This is the dispatch-layer half of the load-cell Z wiring
+    /// (`LoadCellProbingMove`'s `LookupZSteppers`, `load_cell_probe.py:320`);
+    /// the end-to-end half lives with the probe.
+    #[tokio::test]
+    async fn test_a_dispatch_reports_the_z_steppers_registered_with_it() {
+        let chip = chip("mcu", identified_mcu("mcu"));
+        let dispatch = TriggerDispatch::new(vec![chip.clone()]).unwrap();
+        assert!(
+            first(&dispatch).stepper_names().is_empty(),
+            "a dispatch nobody registered with must report no steppers"
+        );
+
+        let z = stepper(&chip, "PA1");
+        let z1 = stepper(&chip, "PA2");
+        dispatch
+            .add_stepper(chip.clone(), Arc::downgrade(&z), "stepper_z")
+            .unwrap();
+        dispatch
+            .add_stepper(chip.clone(), Arc::downgrade(&z1), "stepper_z1")
+            .unwrap();
+
+        assert_eq!(
+            first(&dispatch).stepper_names(),
+            vec!["stepper_z", "stepper_z1"]
+        );
     }
 
     #[tokio::test]

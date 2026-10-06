@@ -42,6 +42,39 @@
 //! absent, and `[include …]`s are resolved the way the printer resolves them.
 //! [`plan`] prints what the configured printer provides without opening a port.
 //!
+//! # Several boards
+//!
+//! A printer with more than one board declares each extra one as
+//! `[mcu <name>]` — `[mcu zboard]`, say — and a test asks for that board by its
+//! **name**, not by its section header:
+//!
+//! ```ignore
+//! let Some(machine) = crate::hardware_test::acquire(
+//!     "test_z_probe_uses_both_boards",
+//!     &crate::hardware_test::Requires::new()
+//!         .mcu()                 // [mcu] must be reachable
+//!         .mcu_named("zboard"),  // and so must [mcu zboard]
+//! ) else {
+//!     return; // reported as HW-IGNORED; the test passes without the boards
+//! };
+//! let main = Mcu::connect("mcu", machine.open_mcu().expect("the port opens"))
+//!     .await
+//!     .expect("identify completes");
+//! let z = Mcu::connect("zboard", machine.open_mcu_named("zboard").expect("its port opens"))
+//!     .await
+//!     .expect("identify completes");
+//! ```
+//!
+//! Two things the framework deliberately leaves out. It hands a test the
+//! **parsed config and the transports**, never a running machine: the printer's
+//! own `bring_up` walks the `[mcu]` sections in order and gives each board its
+//! clock, so a test that needs the boards to move together must start a
+//! `Printer` itself (`load_config` + `bring_up`) instead of opening two
+//! transports by hand. And the name a test passes to
+//! [`Machine::open_mcu_named`] **must be the same name** it passes to
+//! `Mcu::connect` — `"mcu"` for `[mcu]`, `"zboard"` for `[mcu zboard]` —
+//! because that name is how the printer tells the boards apart.
+//!
 //! # Ignored is reported, not failed
 //!
 //! `cargo test` and `cargo test --workspace` never touch the config: every test
@@ -75,7 +108,7 @@ use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 
 use crate::core::klippy::config::mcu::McuConfig;
-use crate::core::klippy::config::{Config, ConfigWrapper};
+use crate::core::klippy::config::{Config, ConfigSection, ConfigWrapper};
 use crate::core::klippy::interface::Interface;
 
 /// The environment variable that names the printer config to test against.
@@ -90,8 +123,9 @@ pub const HW_CONFIG_ENV: &str = "KLIPPERX_HW_CONFIG";
 /// [`check`].
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Requires {
-    /// The main MCU has a usable transport.
-    mcu: bool,
+    /// MCUs that must be reachable, as their section identifiers — `"mcu"`
+    /// for `[mcu]`, `"mcu zboard"` for `[mcu zboard]`.
+    mcus: Vec<String>,
     /// Sections that must exist, as written in the config (`"stepper_x"`,
     /// `"mcu zboard"`).
     sections: Vec<String>,
@@ -111,9 +145,24 @@ impl Requires {
     /// The main MCU, reachable: `[mcu]` carries `serial:` or `canbus_uuid:`.
     ///
     /// A `[mcu <name>]` does not count — that is another board, and opening it
-    /// is not what [`Machine::open_mcu`] does.
-    pub fn mcu(mut self) -> Self {
-        self.mcu = true;
+    /// is not what [`Machine::open_mcu`] does. Ask for it with
+    /// [`Requires::mcu_named`].
+    pub fn mcu(self) -> Self {
+        self.mcu_named("mcu")
+    }
+
+    /// The MCU named `name`, reachable: `[mcu <name>]` carries `serial:` or
+    /// `canbus_uuid:`. The name `"mcu"` is `[mcu]`, the same as
+    /// [`Requires::mcu`].
+    ///
+    /// The name is the one `Mcu::connect` takes, not the section header:
+    /// `"zboard"` for `[mcu zboard]`. A section that merely exists is not
+    /// enough — unlike [`Requires::section`], which asks no more than that.
+    pub fn mcu_named(mut self, name: impl Into<String>) -> Self {
+        let section = mcu_section_id(&name.into());
+        if !self.mcus.contains(&section) {
+            self.mcus.push(section);
+        }
         self
     }
 
@@ -136,8 +185,9 @@ impl Requires {
 /// (`HW-IGNORED: …: missing endstop_pin in [stepper_x]`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Missing {
-    /// `[mcu]` is absent, or carries neither `serial:` nor `canbus_uuid:`.
-    Mcu,
+    /// The MCU in `[<section>]` is absent, or carries neither `serial:` nor
+    /// `canbus_uuid:`. The section identifier is `"mcu"` or `"mcu zboard"`.
+    Mcu(String),
     /// A section the test named is not in the config.
     Section(String),
     /// The section exists, but the option is not written in it.
@@ -147,7 +197,9 @@ pub enum Missing {
 impl fmt::Display for Missing {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Missing::Mcu => write!(f, "missing [mcu] with serial: or canbus_uuid:"),
+            Missing::Mcu(section) => {
+                write!(f, "missing [{section}] with serial: or canbus_uuid:")
+            }
             Missing::Section(section) => write!(f, "missing [{section}]"),
             Missing::Option { section, option } => {
                 write!(f, "missing {option} in [{section}]")
@@ -162,8 +214,10 @@ impl fmt::Display for Missing {
 /// can ask it about a config written in a string literal.
 pub fn check(config: &Config, requires: &Requires) -> Result<(), Vec<Missing>> {
     let mut missing = Vec::new();
-    if requires.mcu && !has_main_mcu(config) {
-        push_unique(&mut missing, Missing::Mcu);
+    for section in &requires.mcus {
+        if !has_mcu(config, section) {
+            push_unique(&mut missing, Missing::Mcu(section.clone()));
+        }
     }
     for section in &requires.sections {
         if !config.has_section(section) {
@@ -192,11 +246,22 @@ pub fn check(config: &Config, requires: &Requires) -> Result<(), Vec<Missing>> {
     }
 }
 
-/// Whether the config describes a reachable main MCU.
-fn has_main_mcu(config: &Config) -> bool {
+/// The section identifier the config gives the MCU named `name`: `[mcu]` for
+/// `"mcu"`, `[mcu zboard]` for `"zboard"`. [`McuConfig::new`] reads the same
+/// names back out of the section, so the two spellings stay in step.
+fn mcu_section_id(name: &str) -> String {
+    if name == "mcu" {
+        "mcu".to_string()
+    } else {
+        format!("mcu {name}")
+    }
+}
+
+/// Whether the config describes a reachable MCU in `section`.
+fn has_mcu(config: &Config, section: &str) -> bool {
     config
-        .get_section("mcu")
-        .is_some_and(|section| section.has("serial") || section.has("canbus_uuid"))
+        .get_section(section)
+        .is_some_and(|found| found.has("serial") || found.has("canbus_uuid"))
 }
 
 /// Append `item` unless that exact thing is already in the list, so a test that
@@ -271,19 +336,34 @@ impl Machine {
 
     /// Open `[mcu]`'s transport, as the printer would.
     ///
+    /// The shortcut for [`Machine::open_mcu_named`] with the name `"mcu"`, and
+    /// the pair of `Mcu::connect("mcu", …)`.
+    pub fn open_mcu(&self) -> Result<Interface, String> {
+        self.open_mcu_named("mcu")
+    }
+
+    /// Open the transport of the MCU named `name`, as the printer would.
+    ///
+    /// The name is the one `Mcu::connect` takes, not the section header:
+    /// `"mcu"` for `[mcu]`, `"zboard"` for `[mcu zboard]` — the section each
+    /// name reads is the one the config gives it. Hand the result to
+    /// `Mcu::connect(name, …)` with the **same** name.
+    ///
     /// The section is parsed by [`McuConfig`], so `serial:` with its `baud:`,
     /// `canbus_uuid:`, `host_library:` and `restart_method:` all behave as they
-    /// do at run time. Hand the result to `Mcu::connect("mcu", …)`.
+    /// do at run time.
     ///
     /// # Errors
     /// A failure here is a **real** failure, not a skip: the config said the
     /// board was there, so a port that will not open is a broken test
-    /// environment. The message is the parser's or the transport's own.
-    pub fn open_mcu(&self) -> Result<Interface, String> {
+    /// environment. The message is the parser's or the transport's own, except
+    /// that a name with no section says which section is missing.
+    pub fn open_mcu_named(&self, name: &str) -> Result<Interface, String> {
+        let section_id = mcu_section_id(name);
         let section = self
             .config
-            .get_section("mcu")
-            .ok_or_else(|| "the config has no [mcu] section".to_string())?;
+            .get_section(&section_id)
+            .ok_or_else(|| format!("the config has no [{section_id}] section"))?;
         let config =
             McuConfig::new(&ConfigWrapper::untracked(section)).map_err(|e| e.to_string())?;
         config.open()
@@ -389,7 +469,8 @@ pub fn acquire(test_name: &str, requires: &Requires) -> Option<Machine> {
 /// The point is to see which tests a config would activate before running any
 /// of them: the section name list, the options each section carries (the
 /// universe [`Requires::section`] and [`Requires::option`] ask about), and
-/// whether [`Requires::mcu`] is satisfied.
+/// one line per MCU section saying what [`Requires::mcu`] and
+/// [`Requires::mcu_named`] would make of it.
 #[test]
 #[ignore = "hardware: prints what KLIPPERX_HW_CONFIG provides"]
 fn plan() {
@@ -411,7 +492,7 @@ fn plan() {
     }
 }
 
-/// The body of [`plan`]: the sections, their options, and the MCU verdict.
+/// The body of [`plan`]: the sections, their options, and the MCU verdicts.
 fn print_plan(config: &Config) {
     let sections = config.sections_vec();
     println!("HW-SECTIONS: {}", sections.len());
@@ -423,24 +504,65 @@ fn print_plan(config: &Config) {
             options.join(", ")
         );
     }
-    match config.get_section("mcu") {
-        None => println!("HW-MCU: no [mcu] section — `.mcu()` tests are ignored"),
-        Some(section) if section.has("serial") => println!(
-            "HW-MCU: serial: {} (baud: {}) — `.mcu()` tests run",
-            section.get_str("serial").unwrap_or_default(),
-            section.get_str("baud").unwrap_or("250000 (default)"),
-        ),
-        Some(section) if section.has("canbus_uuid") => println!(
-            "HW-MCU: canbus_uuid: {} (interface: {}, nodeid: {}) — `.mcu()` tests run",
-            section.get_str("canbus_uuid").unwrap_or_default(),
-            section.get_str("canbus_interface").unwrap_or("can0"),
-            section
-                .get_str("canbus_nodeid")
-                .unwrap_or("unset (klipperx needs one)"),
-        ),
-        Some(_) => println!(
-            "HW-MCU: [mcu] has neither serial: nor canbus_uuid: — `.mcu()` tests are ignored"
-        ),
+    for line in mcu_plan_lines(config) {
+        println!("{line}");
+    }
+}
+
+/// One `HW-MCU:` line per MCU section, in config order — the MCU verdicts
+/// [`plan`] prints, as the lines themselves.
+///
+/// Each line names the section and what a test would ask of it: `.mcu()` for
+/// `[mcu]`, `.mcu_named("zboard")` for `[mcu zboard]`, and whether that
+/// requirement passes (`serial:` or `canbus_uuid:`) or skips. A config with no
+/// MCU section at all is one line saying so.
+fn mcu_plan_lines(config: &Config) -> Vec<String> {
+    let sections = config.get_sections_by_id("mcu");
+    if sections.is_empty() {
+        return vec!["HW-MCU: no [mcu] section — `.mcu()` tests are ignored".to_string()];
+    }
+    sections
+        .iter()
+        .map(|section| {
+            let requirement = mcu_requirement(section);
+            let (interface, verdict) = if section.has("serial") {
+                (
+                    format!(
+                        "serial: {} (baud: {})",
+                        section.get_str("serial").unwrap_or_default(),
+                        section.get_str("baud").unwrap_or("250000 (default)"),
+                    ),
+                    format!("{requirement} tests run"),
+                )
+            } else if section.has("canbus_uuid") {
+                (
+                    format!(
+                        "canbus_uuid: {} (interface: {}, nodeid: {})",
+                        section.get_str("canbus_uuid").unwrap_or_default(),
+                        section.get_str("canbus_interface").unwrap_or("can0"),
+                        section
+                            .get_str("canbus_nodeid")
+                            .unwrap_or("unset (klipperx needs one)"),
+                    ),
+                    format!("{requirement} tests run"),
+                )
+            } else {
+                (
+                    "no serial:/canbus_uuid:".to_string(),
+                    format!("{requirement} tests skip"),
+                )
+            };
+            format!("HW-MCU: [{}] {interface} — {verdict}", section.identifier())
+        })
+        .collect()
+}
+
+/// How a test asks [`check`] for the MCU in `section`: `.mcu()` for `[mcu]`,
+/// `.mcu_named("zboard")` for `[mcu zboard]`.
+fn mcu_requirement(section: &ConfigSection) -> String {
+    match &section.sub {
+        None => ".mcu()".to_string(),
+        Some(name) => format!(".mcu_named(\"{name}\")"),
     }
 }
 
@@ -590,14 +712,14 @@ mod tests {
         let none = config("[printer]\nkinematics: none\n");
         assert_eq!(
             check(&none, &Requires::new().mcu()),
-            Err(vec![Missing::Mcu])
+            Err(vec![Missing::Mcu("mcu".to_string())])
         );
 
         // `[mcu]` with neither `serial:` nor `canbus_uuid:`.
         let bare = config("[mcu]\nrestart_method: arduino\n");
         assert_eq!(
             check(&bare, &Requires::new().mcu()),
-            Err(vec![Missing::Mcu])
+            Err(vec![Missing::Mcu("mcu".to_string())])
         );
 
         // A serial interface.
@@ -609,6 +731,40 @@ mod tests {
         assert_eq!(check(&can, &Requires::new().mcu()), Ok(()));
     }
 
+    /// `mcu_named` is `.mcu()` with the section swapped, so it asks the same
+    /// question of `[mcu <name>]` — presence of the section is not enough, and
+    /// the name `"mcu"` means `[mcu]` rather than `[mcu mcu]`.
+    #[test]
+    fn test_the_named_mcu_requirement_needs_its_own_interface_key() {
+        // No `[mcu zboard]` at all: the main MCU does not stand in for it.
+        let none = config("[mcu]\nserial: /dev/ttyACM0\n");
+        assert_eq!(
+            check(&none, &Requires::new().mcu_named("zboard")),
+            Err(vec![Missing::Mcu("mcu zboard".to_string())])
+        );
+
+        // `[mcu zboard]` with neither `serial:` nor `canbus_uuid:` — the case
+        // `Requires::section("mcu zboard")` would wave through.
+        let bare = config("[mcu zboard]\nrestart_method: arduino\n");
+        assert_eq!(check(&bare, &Requires::new().section("mcu zboard")), Ok(()));
+        assert_eq!(
+            check(&bare, &Requires::new().mcu_named("zboard")),
+            Err(vec![Missing::Mcu("mcu zboard".to_string())])
+        );
+
+        // A serial interface.
+        let serial = config("[mcu zboard]\nserial: /dev/ttyACM1\n");
+        assert_eq!(check(&serial, &Requires::new().mcu_named("zboard")), Ok(()));
+
+        // A CAN interface.
+        let can = config("[mcu zboard]\ncanbus_uuid: 11aa22bb33cc\n");
+        assert_eq!(check(&can, &Requires::new().mcu_named("zboard")), Ok(()));
+
+        // The name `"mcu"` is the main section, not `[mcu mcu]`.
+        let main = config("[mcu]\nserial: /dev/ttyACM0\n");
+        assert_eq!(check(&main, &Requires::new().mcu_named("mcu")), Ok(()));
+    }
+
     /// The boundary the requirement has: the main MCU is `[mcu]`, so a config
     /// whose only MCU is a named one does not satisfy `.mcu()`.
     #[test]
@@ -617,7 +773,7 @@ mod tests {
 
         assert_eq!(
             check(&config, &Requires::new().mcu()),
-            Err(vec![Missing::Mcu])
+            Err(vec![Missing::Mcu("mcu".to_string())])
         );
         // …though a test can still ask for that section by name.
         assert_eq!(
@@ -661,8 +817,12 @@ mod tests {
     #[test]
     fn test_a_missing_item_reads_as_what_is_missing() {
         assert_eq!(
-            Missing::Mcu.to_string(),
+            Missing::Mcu("mcu".to_string()).to_string(),
             "missing [mcu] with serial: or canbus_uuid:"
+        );
+        assert_eq!(
+            Missing::Mcu("mcu zboard".to_string()).to_string(),
+            "missing [mcu zboard] with serial: or canbus_uuid:"
         );
         assert_eq!(
             Missing::Section("stepper_x".to_string()).to_string(),
@@ -764,6 +924,77 @@ mod tests {
         assert!(
             error.contains("/dev/klipperx-hwtest-no-such-port"),
             "{error}"
+        );
+    }
+
+    /// `open_mcu_named` opens the section the name names: two boards with two
+    /// imaginary ports tell the two apart without touching a device, because the
+    /// transport's error carries the path the *chosen* section asked for.
+    #[test]
+    fn test_open_mcu_named_opens_the_section_it_names() {
+        let fixture = TempConfig::new(
+            "[mcu]\nserial: /dev/does-not-exist-a\n\
+             [mcu zboard]\nserial: /dev/does-not-exist-b\n",
+        );
+        let config = load(fixture.path()).expect("the fixture parses");
+        let board = lock_board(fixture.path(), "self-test").expect("the fixture locks");
+        let machine = Machine {
+            config,
+            _board: board,
+        };
+
+        let main = machine.open_mcu().unwrap_err();
+        assert!(main.contains("/dev/does-not-exist-a"), "{main}");
+        let named = machine.open_mcu_named("zboard").unwrap_err();
+        assert!(named.contains("/dev/does-not-exist-b"), "{named}");
+        assert!(!named.contains("/dev/does-not-exist-a"), "{named}");
+
+        // A name with no section says which section is missing.
+        assert_eq!(
+            machine.open_mcu_named("nonexistent").unwrap_err(),
+            "the config has no [mcu nonexistent] section"
+        );
+    }
+
+    /// [`plan`] says one line per MCU section, each naming the section and the
+    /// requirement a test would use to ask for it.
+    #[test]
+    fn test_the_plan_prints_one_line_per_mcu_section() {
+        let multi = config(
+            "[mcu]\nserial: /dev/ttyACM0\n\
+             [mcu zboard]\nserial: /dev/ttyACM1\n\
+             [mcu toolhead]\nrestart_method: arduino\n",
+        );
+
+        assert_eq!(
+            mcu_plan_lines(&multi),
+            vec![
+                "HW-MCU: [mcu] serial: /dev/ttyACM0 (baud: 250000 (default)) — .mcu() tests run"
+                    .to_string(),
+                "HW-MCU: [mcu zboard] serial: /dev/ttyACM1 (baud: 250000 (default)) \
+                 — .mcu_named(\"zboard\") tests run"
+                    .to_string(),
+                "HW-MCU: [mcu toolhead] no serial:/canbus_uuid: \
+                 — .mcu_named(\"toolhead\") tests skip"
+                    .to_string(),
+            ]
+        );
+
+        // A CAN board prints its transport instead of a serial device.
+        let can = config("[mcu zboard]\ncanbus_uuid: 11aa22bb33cc\ncanbus_nodeid: 2\n");
+        assert_eq!(
+            mcu_plan_lines(&can),
+            vec![
+                "HW-MCU: [mcu zboard] canbus_uuid: 11aa22bb33cc (interface: can0, nodeid: 2) \
+                 — .mcu_named(\"zboard\") tests run"
+                    .to_string()
+            ]
+        );
+
+        // No MCU section at all is one line saying so.
+        assert_eq!(
+            mcu_plan_lines(&config("[printer]\nkinematics: none\n")),
+            vec!["HW-MCU: no [mcu] section — `.mcu()` tests are ignored".to_string()]
         );
     }
 

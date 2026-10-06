@@ -9,6 +9,7 @@
 //! | point | upstream |
 //! |---|---|
 //! | [`Ads131M0x`] / configuration + bulk stream | `ADS131M0X.__init__` |
+//! | [`Ads131M0x::setup_trigger_analog`] | `ADS131M0X.setup_trigger_analog` (init command) |
 //! | [`ADS131M02`] / [`ADS131M04`] option tables | the `ADS131M0X_SENSOR_TYPES` factories |
 //! | [`convert_samples`] | `ADS131M0X._convert_samples` |
 //! | `reset_chip` / `setup_chip` (on the private state) | `reset_chip` / `setup_chip` |
@@ -25,10 +26,6 @@
 //!
 //! # Known gaps
 //!
-//! * `setup_trigger_analog` (the `ads131m0x_attach_trigger_analog` init
-//!   command, for `[load_cell_probe]` / `trigger_analog`) is not wired here —
-//!   [`crate::core::klippy::cmd::ads131m0x::Ads131M0xAttachTriggerAnalog`] is
-//!   declared but nothing calls it yet.
 //! * The `query_ads131m0x` halts in `_start_measurements` / `_finish_measurements`
 //!   are plain sends: upstream's `send_wait_ack` (and the `spi_transfer`
 //!   `minclock` that holds the reset acknowledgement past `T_REGACQ`) have no
@@ -40,7 +37,7 @@ use std::sync::{Arc, Mutex, Weak};
 use serde_json::{json, Value};
 
 use crate::core::klippy::cmd::ads131m0x::{
-    ConfigAds131M0x, QueryAds131M0x, QUERY_ADS131M0X_STATUS_MSGFORMAT,
+    Ads131M0xAttachTriggerAnalog, ConfigAds131M0x, QueryAds131M0x, QUERY_ADS131M0X_STATUS_MSGFORMAT,
 };
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
 use crate::core::klippy::extras::bulk_sensor::{
@@ -599,6 +596,20 @@ impl Ads131M0x {
         Ok(Self { state })
     }
 
+    /// Queue `ads131m0x_attach_trigger_analog` so this sensor's samples reach
+    /// the `trigger_analog` object `trigger_analog_oid` (`setup_trigger_analog`,
+    /// an **init** command — upstream `is_init=True`).
+    ///
+    /// # Errors
+    /// [`McuError::Config`] if the configuration is already built.
+    pub fn setup_trigger_analog(&self, trigger_analog_oid: u8) -> Result<(), McuError> {
+        add_attach_trigger_analog(
+            &self.state.mcu_object.config(),
+            self.state.oid,
+            trigger_analog_oid,
+        )
+    }
+
     /// The sensor's name (the section's last segment).
     pub fn name(&self) -> &str {
         &self.state.name
@@ -687,6 +698,22 @@ impl Ads131M0x {
             .as_ref()
             .map_or(0, |bulk| bulk.client_count())
     }
+}
+
+/// Queue `ads131m0x_attach_trigger_analog` on `builder` (the free form, so a
+/// test can bind it to a bare builder without a whole machine).
+///
+/// # Errors
+/// [`McuError::Config`] if the configuration is already built.
+pub fn add_attach_trigger_analog(
+    builder: &ConfigBuilder,
+    oid: u8,
+    trigger_analog_oid: u8,
+) -> Result<(), McuError> {
+    builder.add_init_cmd(&Ads131M0xAttachTriggerAnalog {
+        oid,
+        trigger_analog_oid,
+    })
 }
 
 impl Ads131M0xState {
@@ -982,6 +1009,11 @@ mod tests {
     use super::*;
     use crate::core::klippy::config::{AccessTracking, Config, ConfigSection, ConfigValue};
     use crate::core::klippy::extras::bulk_sensor::SampleFormat;
+    use crate::core::klippy::interface::devices::frame_mock::FrameMock;
+    use crate::core::klippy::interface::Interface;
+    use crate::core::klippy::mcu::Dictionary;
+    use crate::core::klippy::msg::parser::Parser;
+    use crate::core::klippy::msg::proto::ArgValue;
 
     fn section(name: Option<&str>, options: &[(&str, &str)]) -> ConfigSection {
         let mut section = ConfigSection::new("load_cell", name);
@@ -1016,6 +1048,37 @@ mod tests {
         printer.add_object("mcu", Arc::new(mcu)).unwrap();
         printer.send_event(&KlippyEvent::KlippyReady);
         printer
+    }
+
+    /// An identified test MCU over the corpus dictionary, for build tests.
+    fn test_mcu() -> Arc<Mcu> {
+        let mcu = Arc::new(Mcu::for_test(
+            "mcu",
+            Interface::new(FrameMock::new(Vec::new())),
+        ));
+        let path = klipperx_test_support::test_dicts_dir().join("atmega2560.dict");
+        let raw = std::fs::read(&path).expect("the corpus dictionary");
+        let value: serde_json::Value = serde_json::from_slice(&raw).expect("valid JSON");
+        mcu.install_dictionary(Dictionary::from_json(value).unwrap())
+            .unwrap();
+        mcu
+    }
+
+    /// Decode an encoded payload list into `(name, args)`.
+    fn decoded(
+        mcu: &Mcu,
+        payloads: &[crate::core::klippy::Payload],
+    ) -> Vec<(String, Vec<ArgValue>)> {
+        let mut parser = Parser::new();
+        mcu.dictionary().unwrap().install(&mut parser).unwrap();
+        payloads
+            .iter()
+            .map(|payload| {
+                let frame = crate::core::klippy::frame::Frame::new(0, payload.payload().to_vec());
+                let decoded = parser.decode(frame.into()).unwrap();
+                (decoded[0].0.name.clone(), decoded[0].1.clone())
+            })
+            .collect()
     }
 
     /// A minimal ADS131M02 cell's chip options (the corpus's
@@ -1344,5 +1407,28 @@ mod tests {
             err.to_string(),
             "ADS131M02 config error: SPI communication and data_ready_pin must be on the same MCU"
         );
+    }
+
+    #[tokio::test]
+    async fn test_attach_trigger_analog_is_an_init_command_binding_the_trigger_oid() {
+        let mcu = test_mcu();
+        let builder = ConfigBuilder::new();
+        let sensor_oid = builder.create_oid().unwrap();
+        // The trigger analog's oid is whatever it created — 7 here.
+        add_attach_trigger_analog(&builder, sensor_oid, 7).unwrap();
+
+        let built = builder.build(&mcu).unwrap();
+        let init = decoded(&mcu, &built.init);
+        assert_eq!(init.len(), 1, "exactly one init command: {init:?}");
+        assert_eq!(init[0].0, "ads131m0x_attach_trigger_analog");
+        assert_eq!(
+            init[0].1,
+            vec![ArgValue::UInt8(sensor_oid), ArgValue::UInt8(7)]
+        );
+        // Init commands are outside the hashed config: the same builder
+        // without the attach has the same CRC.
+        let plain = ConfigBuilder::new();
+        plain.create_oid().unwrap();
+        assert_eq!(plain.build(&mcu).unwrap().crc, built.crc);
     }
 }

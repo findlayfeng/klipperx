@@ -9,6 +9,7 @@
 //! | piece | upstream |
 //! |---|---|
 //! | [`Hx71x`] / configuration + bulk stream | `HX71xBase.__init__` |
+//! | [`Hx71x::setup_trigger_analog`] | `HX71xBase.setup_trigger_analog` (init command) |
 //! | [`read_sample_rate`] / [`read_gain`] choices | `HX711` / `HX717` option tables |
 //! | [`convert_samples`] | `HX71xBase._convert_samples` |
 //! | `errors` / `overflows` / `sample_rate` status | `HX71xBase.get_status` |
@@ -21,17 +22,14 @@
 //!
 //! The dump endpoint is **not** this chip's: upstream converts counts to grams
 //! in `load_cell` and exposes `load_cell/dump_force` from there.
-//!
-//! # Known gaps
-//!
-//! `setup_trigger_analog` (the `hx71x_attach_trigger_analog` init command,
-//! for `[load_cell_probe]` / `trigger_analog`) is not wired here.
 
 use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
 
-use crate::core::klippy::cmd::hx71x::{ConfigHx71x, QueryHx71x, QUERY_HX71X_STATUS_MSGFORMAT};
+use crate::core::klippy::cmd::hx71x::{
+    ConfigHx71x, Hx71xAttachTriggerAnalog, QueryHx71x, QUERY_HX71X_STATUS_MSGFORMAT,
+};
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
 use crate::core::klippy::extras::bulk_sensor::{
     BatchBulkHelper, BatchCb, ClientCb, FixedFreqReader, LifecycleCb, Sample, BATCH_INTERVAL,
@@ -407,6 +405,20 @@ impl Hx71x {
         self.state.oid
     }
 
+    /// Queue `hx71x_attach_trigger_analog` so this sensor's samples reach the
+    /// `trigger_analog` object `trigger_analog_oid` (`setup_trigger_analog`, an
+    /// **init** command — upstream `is_init=True`).
+    ///
+    /// # Errors
+    /// [`McuError::Config`] if the configuration is already built.
+    pub fn setup_trigger_analog(&self, trigger_analog_oid: u8) -> Result<(), McuError> {
+        add_attach_trigger_analog(
+            &self.state.mcu_object.config(),
+            self.state.oid,
+            trigger_analog_oid,
+        )
+    }
+
     /// Samples per second the firmware produces (`get_samples_per_second`).
     pub fn samples_per_second(&self) -> i64 {
         self.state.sample_rate
@@ -460,6 +472,22 @@ impl Hx71x {
             .unwrap_or_else(|p| p.into_inner())
             .is_some()
     }
+}
+
+/// Queue `hx71x_attach_trigger_analog` on `builder` (the free form, so a test
+/// can bind it to a bare builder without a whole machine).
+///
+/// # Errors
+/// [`McuError::Config`] if the configuration is already built.
+pub fn add_attach_trigger_analog(
+    builder: &ConfigBuilder,
+    oid: u8,
+    trigger_analog_oid: u8,
+) -> Result<(), McuError> {
+    builder.add_init_cmd(&Hx71xAttachTriggerAnalog {
+        oid,
+        trigger_analog_oid,
+    })
 }
 
 impl Hx71xState {
@@ -611,6 +639,11 @@ fn to_string(error: McuError) -> String {
 mod tests {
     use super::*;
     use crate::core::klippy::config::{AccessTracking, ConfigSection, ConfigValue};
+    use crate::core::klippy::interface::devices::frame_mock::FrameMock;
+    use crate::core::klippy::interface::Interface;
+    use crate::core::klippy::mcu::Dictionary;
+    use crate::core::klippy::msg::parser::Parser;
+    use crate::core::klippy::msg::proto::ArgValue;
 
     fn section(name: Option<&str>, options: &[(&str, &str)]) -> ConfigSection {
         let mut section = ConfigSection::new("load_cell", name);
@@ -645,6 +678,37 @@ mod tests {
         printer.add_object("mcu", Arc::new(mcu)).unwrap();
         printer.send_event(&KlippyEvent::KlippyReady);
         printer
+    }
+
+    /// An identified test MCU over the corpus dictionary, for build tests.
+    fn test_mcu() -> Arc<Mcu> {
+        let mcu = Arc::new(Mcu::for_test(
+            "mcu",
+            Interface::new(FrameMock::new(Vec::new())),
+        ));
+        let path = klipperx_test_support::test_dicts_dir().join("atmega2560.dict");
+        let raw = std::fs::read(&path).expect("the corpus dictionary");
+        let value: serde_json::Value = serde_json::from_slice(&raw).expect("valid JSON");
+        mcu.install_dictionary(Dictionary::from_json(value).unwrap())
+            .unwrap();
+        mcu
+    }
+
+    /// Decode an encoded payload list into `(name, args)`.
+    fn decoded(
+        mcu: &Mcu,
+        payloads: &[crate::core::klippy::Payload],
+    ) -> Vec<(String, Vec<ArgValue>)> {
+        let mut parser = Parser::new();
+        mcu.dictionary().unwrap().install(&mut parser).unwrap();
+        payloads
+            .iter()
+            .map(|payload| {
+                let frame = crate::core::klippy::frame::Frame::new(0, payload.payload().to_vec());
+                let decoded = parser.decode(frame.into()).unwrap();
+                (decoded[0].0.name.clone(), decoded[0].1.clone())
+            })
+            .collect()
     }
 
     #[test]
@@ -828,5 +892,28 @@ mod tests {
         let (rows, hit) = convert_samples(&[]);
         assert!(!hit);
         assert!(rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_attach_trigger_analog_is_an_init_command_binding_the_trigger_oid() {
+        let mcu = test_mcu();
+        let builder = ConfigBuilder::new();
+        let sensor_oid = builder.create_oid().unwrap();
+        // The trigger analog's oid is whatever it created — 7 here.
+        add_attach_trigger_analog(&builder, sensor_oid, 7).unwrap();
+
+        let built = builder.build(&mcu).unwrap();
+        let init = decoded(&mcu, &built.init);
+        assert_eq!(init.len(), 1, "exactly one init command: {init:?}");
+        assert_eq!(init[0].0, "hx71x_attach_trigger_analog");
+        assert_eq!(
+            init[0].1,
+            vec![ArgValue::UInt8(sensor_oid), ArgValue::UInt8(7)]
+        );
+        // Init commands are outside the hashed config: the same builder
+        // without the attach has the same CRC.
+        let plain = ConfigBuilder::new();
+        plain.create_oid().unwrap();
+        assert_eq!(plain.build(&mcu).unwrap().crc, built.crc);
     }
 }

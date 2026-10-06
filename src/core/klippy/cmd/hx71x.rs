@@ -4,7 +4,7 @@
 //!
 //! | group | commands |
 //! |---|---|
-//! | chip setup | [`ConfigHx71x`] |
+//! | chip setup | [`ConfigHx71x`]; [`Hx71xAttachTriggerAnalog`] (for `[load_cell_probe]`) |
 //! | sampling | [`QueryHx71x`] (arm/disarm); [`QueryHx71xStatus`] → `sensor_bulk_status` |
 //!
 //! The sample reports (`sensor_bulk_data`) and the status reply
@@ -80,6 +80,27 @@ impl McuCommand for QueryHx71xStatus {
     }
 }
 
+/// `hx71x_attach_trigger_analog oid=%c trigger_analog_oid=%c` — hand this
+/// chip's samples to `[trigger_analog]` (`hx71x.py:setup_trigger_analog`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Hx71xAttachTriggerAnalog {
+    /// The sensor's object id.
+    pub oid: u8,
+    /// The `[trigger_analog]` instance's object id.
+    pub trigger_analog_oid: u8,
+}
+
+impl McuCommand for Hx71xAttachTriggerAnalog {
+    const NAME: &'static str = "hx71x_attach_trigger_analog";
+
+    fn args(&self) -> Vec<ArgValue> {
+        vec![
+            ArgValue::UInt8(self.oid),
+            ArgValue::UInt8(self.trigger_analog_oid),
+        ]
+    }
+}
+
 /// The status-query message format the reader is parameterized with
 /// (`setup_query_command("query_hx71x_status oid=%c", …)` upstream) — the
 /// `msgformat` half of [`crate::core::klippy::extras::bulk_sensor::FixedFreqReader::with_format`].
@@ -139,9 +160,9 @@ mod tests {
         }
     }
 
-    /// The three HX71x commands, on both dictionaries that carry them: the
-    /// AVR corpus and the HC32 (which has no `*_attach_trigger_analog` for
-    /// hx71x's sibling chips but does have this trio).
+    /// The four HX71x commands, on both dictionaries that carry them: the
+    /// AVR corpus and the HC32 (whose sibling sensors' `*_attach_trigger_analog`
+    /// commands are absent, but hx71x's own is present).
     fn assert_hx71x_commands(name: &str) {
         let dict = dictionary(name);
         assert_matches_dictionary(
@@ -171,6 +192,17 @@ mod tests {
             &dict,
             &QueryHx71xStatus { oid: 7 },
             &[("oid", ArgType::UInt8)],
+        );
+        assert_matches_dictionary(
+            &dict,
+            &Hx71xAttachTriggerAnalog {
+                oid: 8,
+                trigger_analog_oid: 9,
+            },
+            &[
+                ("oid", ArgType::UInt8),
+                ("trigger_analog_oid", ArgType::UInt8),
+            ],
         );
 
         // The reader's message format names a command the firmware has, and

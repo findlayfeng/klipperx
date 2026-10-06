@@ -9,6 +9,7 @@
 //! | piece | upstream |
 //! |---|---|
 //! | [`Ads1220`] / configuration + bulk stream | `ADS1220.__init__` |
+//! | [`Ads1220::setup_trigger_analog`] | `ADS1220.setup_trigger_analog` (init command) |
 //! | [`read_gain`] / [`read_sample_rate`] / [`read_input_mux`] / [`read_vref`] | the option tables of `ADS1220` |
 //! | [`register_values`] + [`read_reg_command`] / [`write_reg_command`] | `setup_chip` / `read_reg` / `write_reg` |
 //! | [`convert_samples`] | `ADS1220._convert_samples` |
@@ -38,17 +39,15 @@
 //!
 //! # Known gaps
 //!
-//! `setup_trigger_analog` (the `ads1220_attach_trigger_analog` init command,
-//! for `[load_cell_probe]` / `trigger_analog`) is not wired here, and the SPI
-//! register traffic is only covered through the pure byte helpers above — the
-//! transfer path itself needs hardware.
+//! The SPI register traffic is only covered through the pure byte helpers
+//! above — the transfer path itself needs hardware.
 
 use std::sync::{Arc, Mutex, Weak};
 
 use serde_json::{json, Value};
 
 use crate::core::klippy::cmd::ads1220::{
-    ConfigAds1220, QueryAds1220, QUERY_ADS1220_STATUS_MSGFORMAT,
+    Ads1220AttachTriggerAnalog, ConfigAds1220, QueryAds1220, QUERY_ADS1220_STATUS_MSGFORMAT,
 };
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
 use crate::core::klippy::extras::bulk_sensor::{
@@ -627,6 +626,20 @@ impl Ads1220 {
         Ok(Self { state })
     }
 
+    /// Queue `ads1220_attach_trigger_analog` so this sensor's samples reach
+    /// the `trigger_analog` object `trigger_analog_oid` (`setup_trigger_analog`,
+    /// an **init** command — upstream `is_init=True`).
+    ///
+    /// # Errors
+    /// [`McuError::Config`] if the configuration is already built.
+    pub fn setup_trigger_analog(&self, trigger_analog_oid: u8) -> Result<(), McuError> {
+        add_attach_trigger_analog(
+            &self.state.mcu_object.config(),
+            self.state.oid,
+            trigger_analog_oid,
+        )
+    }
+
     /// The sensor's name (the section's last segment).
     pub fn name(&self) -> &str {
         &self.state.name
@@ -700,6 +713,22 @@ impl Ads1220 {
             .map(|bulk| bulk.client_count())
             .unwrap_or(0)
     }
+}
+
+/// Queue `ads1220_attach_trigger_analog` on `builder` (the free form, so a
+/// test can bind it to a bare builder without a whole machine).
+///
+/// # Errors
+/// [`McuError::Config`] if the configuration is already built.
+pub fn add_attach_trigger_analog(
+    builder: &ConfigBuilder,
+    oid: u8,
+    trigger_analog_oid: u8,
+) -> Result<(), McuError> {
+    builder.add_init_cmd(&Ads1220AttachTriggerAnalog {
+        oid,
+        trigger_analog_oid,
+    })
 }
 
 impl Ads1220State {
@@ -897,6 +926,11 @@ impl std::fmt::Debug for Ads1220 {
 mod tests {
     use super::*;
     use crate::core::klippy::config::{AccessTracking, ConfigSection, ConfigValue};
+    use crate::core::klippy::interface::devices::frame_mock::FrameMock;
+    use crate::core::klippy::interface::Interface;
+    use crate::core::klippy::mcu::Dictionary;
+    use crate::core::klippy::msg::parser::Parser;
+    use crate::core::klippy::msg::proto::ArgValue;
 
     fn section(name: Option<&str>, options: &[(&str, &str)]) -> ConfigSection {
         let mut section = ConfigSection::new("load_cell", name);
@@ -931,6 +965,37 @@ mod tests {
         printer.add_object("mcu", Arc::new(mcu)).unwrap();
         printer.send_event(&KlippyEvent::KlippyReady);
         printer
+    }
+
+    /// An identified test MCU over the corpus dictionary, for build tests.
+    fn test_mcu() -> Arc<Mcu> {
+        let mcu = Arc::new(Mcu::for_test(
+            "mcu",
+            Interface::new(FrameMock::new(Vec::new())),
+        ));
+        let path = klipperx_test_support::test_dicts_dir().join("atmega2560.dict");
+        let raw = std::fs::read(&path).expect("the corpus dictionary");
+        let value: serde_json::Value = serde_json::from_slice(&raw).expect("valid JSON");
+        mcu.install_dictionary(Dictionary::from_json(value).unwrap())
+            .unwrap();
+        mcu
+    }
+
+    /// Decode an encoded payload list into `(name, args)`.
+    fn decoded(
+        mcu: &Mcu,
+        payloads: &[crate::core::klippy::Payload],
+    ) -> Vec<(String, Vec<ArgValue>)> {
+        let mut parser = Parser::new();
+        mcu.dictionary().unwrap().install(&mut parser).unwrap();
+        payloads
+            .iter()
+            .map(|payload| {
+                let frame = crate::core::klippy::frame::Frame::new(0, payload.payload().to_vec());
+                let decoded = parser.decode(frame.into()).unwrap();
+                (decoded[0].0.name.clone(), decoded[0].1.clone())
+            })
+            .collect()
     }
 
     /// The corpus `[load_cell my_ads1220]` options.
@@ -1193,5 +1258,28 @@ mod tests {
         // the count is the registration this call just made.
         sensor.add_client(Arc::new(|_message: &Value| true));
         assert_eq!(sensor.client_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_attach_trigger_analog_is_an_init_command_binding_the_trigger_oid() {
+        let mcu = test_mcu();
+        let builder = ConfigBuilder::new();
+        let sensor_oid = builder.create_oid().unwrap();
+        // The trigger analog's oid is whatever it created — 7 here.
+        add_attach_trigger_analog(&builder, sensor_oid, 7).unwrap();
+
+        let built = builder.build(&mcu).unwrap();
+        let init = decoded(&mcu, &built.init);
+        assert_eq!(init.len(), 1, "exactly one init command: {init:?}");
+        assert_eq!(init[0].0, "ads1220_attach_trigger_analog");
+        assert_eq!(
+            init[0].1,
+            vec![ArgValue::UInt8(sensor_oid), ArgValue::UInt8(7)]
+        );
+        // Init commands are outside the hashed config: the same builder
+        // without the attach has the same CRC.
+        let plain = ConfigBuilder::new();
+        plain.create_oid().unwrap();
+        assert_eq!(plain.build(&mcu).unwrap().crc, built.crc);
     }
 }

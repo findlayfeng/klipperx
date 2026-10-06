@@ -101,6 +101,8 @@ H1–H12 是上游 extras 里按域归并的消费者（2026-09-21 全量盘点�
 |---|---|---|
 | S1 | 压力测试工具（`klipperx stress`）：**已收官（2026-10-06，`23b3b9b`）**——真资源/别名/假板 e2e 均已落地；余项仅 `--task motion` 假板 e2e（假件位置恒答 0。无法做）与真板双机并发验证 | — |
 | S2 | 文档补齐（2026-10-06 对账发现，非新功能）：`config.md` 缺 **`[bed_mesh]` 整节**（约 20 个选项，含 `split_delta_z` / `move_check_distance`）、`gcode-commands.md` 缺 `BED_MESH_*` 命令；开发手册「模块表 / `testing.md` 覆盖行 / `regression-tests.md`」的其余陈旧行未重审（本轮只修了与已落地改动强相关的那些） | — |
+| S3 | 真机用例：把 `configure_taking_over`（“连接 ≠ 配置”，遇 `ResetRequired` 则 `reset` + 重开 + 重握手一次）**上提到 `hardware_test`**——现在三份需求（R3/R5/R11）共用一个局部实现（`mcu/resource/endstop.rs` 测试里 + `stress.rs` 自己的），上提后只留一份；同时把 L2（`Machine::bring_up`）已落地这件事写进框架 doc 的模板 | — |
+| S4 | 真机用例继续铺（框架两层都已就绪）：R4 归零（无加热，建议先做）→ R9 收尾 / R7 挤出 / R6 温度 / R10 急停（**带加热的最后**，需先完成 Q11 那条 reactor 定时器断环）；R8 回放 | S3、Q11 |
 | E2 | `python_path` 的取消 | 外部项目 |
 
 > 判为**不适用**、不进待办的上游模块：`garbage_collection.py`（Python GC 调优）、

@@ -30,6 +30,15 @@
 
 ## 待测列表（按一次打印的顺序）
 
+> **已有可跑（自动化）的真机用例**（`--ignored` + `KLIPPERX_HW_CONFIG=<你的 printer.cfg>`，跑法与两层能力见
+> [开发手册 → 测试 → 真机测试](docs/klippy/developer-manual/testing.md#真机测试)）：
+> R1 帧序 `test_frame_sequence_sync_against_a_real_board`、R2 重启三轮
+> `test_firmware_reset_comes_back_three_times_on_a_real_board`、R3 端停电平
+> `test_endstop_level_reads_open_and_shorted_on_a_real_board`、R5 单轴位移
+> `test_r5_single_axis_move_matches_the_firmware_step_count`、R11 短时 soak
+> `test_r11_short_soak_holds_a_safe_step_rate`。
+> 其余项仍需按下面的步骤人工验，或用带真实交互/加热的路径（R4/R6–R10 的自动化用例待铺）。
+
 - [ ] **R1 上电连接与配置下发** —— 真实测试：插板起宿主，走完 identify、字典下发、
   `get_config`/配置 CRC 与板端 `finalize_config`、时钟同步；`STATUS`/`M115` 有应答，
   日志无 `!!`。可加跑真机帧序用例：`KLIPPERX_HW_CONFIG=~/printer.cfg cargo test -p klipperx

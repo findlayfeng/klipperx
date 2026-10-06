@@ -171,6 +171,57 @@ KLIPPERX_HW_CONFIG=~/printer.cfg \
 
 框架本体与它的 16 条自测（不碰板）在 `src/hardware_test.rs`，模块 doc 里有可照抄的模板。
 
+### 现有的真机用例
+
+每条都配一个**不碰板**的声明判定单测（给它合成配置文本，断言「有该节/键=满足、注释掉/缺=不满足」）。
+
+| 用例 | 位置 | 对应 | 它会做什么 / 安全边界 |
+|---|---|---|---|
+| `test_frame_sequence_sync_against_a_real_board` | `core/klippy/mcu/mod.rs` | R1 连接与帧序 | 对同一块**不停机**的板子连两次，验接管、4 位序号回绕、重连重编号；只 identify/`get_clock`，无运动无加热 |
+| `test_firmware_reset_comes_back_three_times_on_a_real_board` | `core/klippy/mcu/mod.rs` | R2 会话恢复 | 三轮 `reset` → 重连 → identify → `get_clock`，每轮打耗时；**会真的重启固件 ×3**（别在加热/打印中跑），无运动无加热。固件字典无 `reset` 时报 `HW-IGNORED` |
+| `test_r5_single_axis_move_matches_the_firmware_step_count` | `src/stress.rs` | R5 位移对账 | 向 `[stepper_x]` 走一小段（≤10mm、≤10mm/s，常量写死）并读回 `stepper_get_position` 对账；**会动轴**，跑前请确认行程内有空间 |
+| `test_r11_short_soak_holds_a_safe_step_rate` | `src/stress.rs` | R11 短时时序 | 按**保守速率**（5 000 步/秒，约为已留档存活线 339 623 的 1/68）压 2s ≈ 10 000 步，断言固件未 shutdown
+且**无丢步**（读回步数 == 所排步数），并打印实测速率与**推算行程**（≈125mm@0.0125——跑前请确保有这么多行程或先脱开电机） |
+| `test_endstop_level_reads_open_and_shorted_on_a_real_board` | `core/klippy/mcu/resource/endstop.rs` | R3 端停电平 | 两次读 X 端停电平（`query_endstop`），**两次之间提示按 Enter** 让人手动断开/短接；两次相同**不报失败**而是打「未检测到电平变化」提示（电气翻转只能人工）。无运动无加热。且：连接≠配置——它会先取回现有配置（遇 `ResetRequired` 则 `reset` + 重开 + 重握手一次，第二次仍失败则报错并点名「板子可能被真实主机占着」） |
+
+两条 `stress.rs` 的用例复用 `--task motion` 那套 L1 machinery，并共用 `stress.rs` 已有的「`ResetRequired` → reset + 重连 + 重握手」路径
+（限 2 次重试、每次打日志与耗时）。
+
+> **跑真机套件的前提**：板子不能被真实打印主机占着（端口只有一个）。那种情况是**真失败**（打不开串口）
+> 而不是 `HW-IGNORED`——这正是框架有意的语义（配置说要跑但打不开 = 真失败）。
+
+### 两层能力：L1 传输 / L2 起机器
+
+- **L1**：`acquire` + `open_mcu()` / `open_mcu_named("zboard")` 拿一个 `Interface`，自己 `Mcu::connect`。
+  适合只碰帧/时钟/进出的用例（R1/R2/R3/R5/R11）。
+- **L2**：`machine.bring_up()?` → `StartedMachine`，`printer()` 给 `&Arc<Printer>`。它会
+  `load_config`（**活机形态**，不设 `debug_output`）并 `bring_up` **全部** `[mcu …]` 节（L1 做不到）；
+  `Drop` 里 `printer.teardown()` → 有界 `shutdown_timeout(5s)`，**panic 路径也收尾**（unwinding 时跳过界断言，
+  以免 Drop 内二次 panic 把两个失败都吞成 abort）。适合需要 `toolhead`/`gcode`/`extras` 的用例（R4/R6/R7/R8/R9/R10）。
+
+```rust
+#[tokio::test]
+#[ignore = "hardware: needs KLIPPERX_HW_CONFIG"]
+async fn test_something_on_a_real_board() {
+    let Some(machine) = crate::hardware_test::acquire(
+        "test_something_on_a_real_board",
+        &crate::hardware_test::Requires::new().mcu().option("stepper_x", "endstop_pin"),
+    ) else { return };
+    let machine = machine.bring_up().expect("the board comes up");   // 失败=真失败，不是跳过
+    let printer = machine.printer();
+    // …用 printer 的 gcode/toolhead/extras 断言…  machine 在此作用域结束时 drop（收尾）
+}
+```
+
+**活机与语料（`-o`）的语义差**：`can_pause` 为真（`M400` 会真等时钟追上）、`can_extrude` 不再由
+`-o` 兜底（`G1 E…` 会被冷挤出 / 温度未达拒绝）。写真机用例时不要照抄语料用例的这两处假设。
+
+> ⚠️ **已知环暂时挡住带加热器的 L2 用例**：活机 + 任一 `Heater` 节（`[extruder]` / `[heater_bed]` /
+> `[heater_generic]`，`control: pid|watermark` 都算）在 `teardown` 后**不析构部件**，`Mcu::Drop` 不跑 ⇒
+> `Drop` 的界断言会红并点名该环（首因：`verify_heater` 的 1s reactor 定时器回调强持 `Arc<Heater>`，
+> 而 `teardown` 从不取消 reactor 定时器）。修好前**不要连着跑带加热器的真机用例**——泄漏的会话会使
+> 串口读线程 park、fd 不关，下一条用例会二次打开同一串口。修复单元见 `TODO.md`。
+
 ## 格式化与提交
 
 提交前代码要过 `cargo fmt --all`。仓库自带的 pre-commit 钩子会替你做这件事：它先格式化，再把已暂存的 `.rs` 重新入索引，最后用 `cargo fmt --all -- --check` 兜底；实在格式不了（语法错误之类）就中止提交。
@@ -209,7 +260,7 @@ git config core.hooksPath .githooks
 |------|------|
 | `pending.rs` | 注册/配对/取消、未知名字不消费、先到先得、接收端已关闭、只取消一条、`abort_all` 唤醒全部等待（`test_abort_all_wakes_every_waiter_at_once`） |
 | `dictionary.rs` | 三张消息表的解析（含 `output` 原样保留）、枚举单值与区间展开、常量、各类畸形输入、`install` 的跳过语义与不注册 `output` |
-| `mod.rs` | 构造后未识别（`new` 只注册 identify 一对）、发送错误路径、`Drop` 中止接收任务并释放阻塞读；序号（假设备）：**接管一块还在跑的板子**（首帧是 NAK 号 → 采纳、换号重发同一请求、调用成功、`took_over_session()` 为真、记录器显示发的是 `[0, 9]`）、**首个新序号才吃豁免**（开场先重复本会话初号的遗留帧不消耗豁免——`test_the_first_new_sequence_is_adopted_after_a_repeated_frame`：其后的高号 acknak 照样被采纳对齐、调用成功）、刚开机的固件不接管也不重发、首个新序号之后的越号帧被丢且不扰动本次交换；**改号（静默即 nak）**：`test_renumber_adopts_the_firmware_sequence_and_clears_the_window`——改号采纳固件报告的号并清空在途窗口，发起者只有 identify 的重试（`settle` 刻意不对空帧单独改号）；**字典前噪音帧**：`test_an_unknown_id_frame_before_the_dictionary_is_skipped`——`stats`(id=-12) 噪音与响应同号交错时静默跳过、不误消费 pending、不引出任何重传/改号（把跳过突变成 break 即转红）；**RTT 估计与告警**：共 14 条——首样本 ×10 保守起步、双侧平滑、`max(4·rttvar,1ms)` 下限、25ms/5s 夹取（同钉住两常数未改）、估计器记录与派生、告警状态机三态（首超阈一次、翻倍再告、回落不重告）、文案含实测值与排查提示、ack 出样本、**重传作废样本**（后两条为 FrameMock 时序真断言；公式突变两处均转红）；**RTO 消费**再 4 条——无样本地板+翻倍维持现状、样本到达接管等待值、成功回估计值而非地板（成功分支突变回 `MIN_RTO` 即转红）、翻倍值被新样本拉回；**时钟估计（C3）**再 5 条——中点半程 RTT offset 三元组断言、窗口最小二乘拟合频率（1000 ppm 漂移）、旧样本清出窗口、无漂移与旧快照等价、种子端到端夹逼（两轮转红：中点改 `received` / 拟合改单点）；**B5 接收窗与改号（三处转红）**：`test_a_frame_past_the_window_still_reports_where_the_firmware_is`（丢帧仍记固件上报号——删 store 即红 left:110/right:112）、`test_a_renumber_rearms_connection_init_for_the_answer_behind_it`（改号重挂一次豁免——删 connection_init 即红 Ahead/Adopt）、`test_a_congruent_frame_is_no_decision_at_all`（本仓 0 相位：同余首帧零决策，按上游相位解读即红，钉住 `seen==0 ⇔ receive_seq==1`）；**C4 两道闸与 move 池**：`test_min_clock_holds_a_message_until_its_release`、`test_req_clock_orders_messages_inside_the_lead_window`、`test_slot_release_and_start_clock_bracket_the_send`（早于侧以**起点 clock** 为基准）、`test_a_full_move_capacity_releases_one_slot_at_a_time`（五相位、`queue_digital_out` 占同池）、`test_move_slots_floor_is_the_slot_freeing_completion`、`test_an_unknown_clock_never_blocks_a_gated_message`（时钟未知全放行）——四组转红（min 闸 / req 提前窗 / 槽位削峰 / 未知兑底各剪即红）；**B6 显式关旧与重绑（三处转红）**：`test_reconnect_closes_the_old_session_and_binds_the_new_sessions_clock`（真 `reconnect` 打 `test:` 假件：100 ms 内旧任务终止、`Arc` 仍 ≥2、send 被拒、时钟 `ptr_eq` 新会话）、`test_a_closed_session_lets_the_reopened_identify_complete`（共享 RecordingWire：旧 next/seen=107/106 → close → 新会话 identify 一次过、无旧序号 drop）、`test_close_stops_the_session_while_the_arc_is_still_shared`（`strong_count==2` 时 close 仍停双任务 + 拒 send/flush）——转红 A：剪 `previous.close()`；B：剪 `install_clock`；C′：只剪 `closed` 旗；夹具 `RecordingWire` 改 **per-view**（独立收队列+关闭旗、共享记录与应答）。**`min_schedule_time`**——`test_min_schedule_time_is_the_upstream_0_100_schedule_lead`（返回 0.100 且等于 `MIN_REQTIME_DELTA`，防两个常量漂移；供 `GCodeRequestQueue` 对齐 `next_min_flush_time`）。另有**要真硬件的**一例（`test_frame_sequence_sync_against_a_real_board`）：经 `hardware_test::acquire("…", &Requires::new().mcu())` 声明所需配置（接口与节/选项均从 `KLIPPERX_HW_CONFIG` 推导），不满足时打 `HW-IGNORED` 并跳过；对同一块不停机的板子连两次，第一次完成 identify 并跨过 4 位回绕，第二次必须报告接管、采纳固件当前的号并继续 `get_clock` |
+| `mod.rs` | 构造后未识别（`new` 只注册 identify 一对）、发送错误路径、`Drop` 中止接收任务并释放阻塞读；序号（假设备）：**接管一块还在跑的板子**（首帧是 NAK 号 → 采纳、换号重发同一请求、调用成功、`took_over_session()` 为真、记录器显示发的是 `[0, 9]`）、**首个新序号才吃豁免**（开场先重复本会话初号的遗留帧不消耗豁免——`test_the_first_new_sequence_is_adopted_after_a_repeated_frame`：其后的高号 acknak 照样被采纳对齐、调用成功）、刚开机的固件不接管也不重发、首个新序号之后的越号帧被丢且不扰动本次交换；**改号（静默即 nak）**：`test_renumber_adopts_the_firmware_sequence_and_clears_the_window`——改号采纳固件报告的号并清空在途窗口，发起者只有 identify 的重试（`settle` 刻意不对空帧单独改号）；**字典前噪音帧**：`test_an_unknown_id_frame_before_the_dictionary_is_skipped`——`stats`(id=-12) 噪音与响应同号交错时静默跳过、不误消费 pending、不引出任何重传/改号（把跳过突变成 break 即转红）；**RTT 估计与告警**：共 14 条——首样本 ×10 保守起步、双侧平滑、`max(4·rttvar,1ms)` 下限、25ms/5s 夹取（同钉住两常数未改）、估计器记录与派生、告警状态机三态（首超阈一次、翻倍再告、回落不重告）、文案含实测值与排查提示、ack 出样本、**重传作废样本**（后两条为 FrameMock 时序真断言；公式突变两处均转红）；**RTO 消费**再 4 条——无样本地板+翻倍维持现状、样本到达接管等待值、成功回估计值而非地板（成功分支突变回 `MIN_RTO` 即转红）、翻倍值被新样本拉回；**时钟估计（C3）**再 5 条——中点半程 RTT offset 三元组断言、窗口最小二乘拟合频率（1000 ppm 漂移）、旧样本清出窗口、无漂移与旧快照等价、种子端到端夹逼（两轮转红：中点改 `received` / 拟合改单点）；**B5 接收窗与改号（三处转红）**：`test_a_frame_past_the_window_still_reports_where_the_firmware_is`（丢帧仍记固件上报号——删 store 即红 left:110/right:112）、`test_a_renumber_rearms_connection_init_for_the_answer_behind_it`（改号重挂一次豁免——删 connection_init 即红 Ahead/Adopt）、`test_a_congruent_frame_is_no_decision_at_all`（本仓 0 相位：同余首帧零决策，按上游相位解读即红，钉住 `seen==0 ⇔ receive_seq==1`）；**C4 两道闸与 move 池**：`test_min_clock_holds_a_message_until_its_release`、`test_req_clock_orders_messages_inside_the_lead_window`、`test_slot_release_and_start_clock_bracket_the_send`（早于侧以**起点 clock** 为基准）、`test_a_full_move_capacity_releases_one_slot_at_a_time`（五相位、`queue_digital_out` 占同池）、`test_move_slots_floor_is_the_slot_freeing_completion`、`test_an_unknown_clock_never_blocks_a_gated_message`（时钟未知全放行）——四组转红（min 闸 / req 提前窗 / 槽位削峰 / 未知兑底各剪即红）；**B6 显式关旧与重绑（三处转红）**：`test_reconnect_closes_the_old_session_and_binds_the_new_sessions_clock`（真 `reconnect` 打 `test:` 假件：100 ms 内旧任务终止、`Arc` 仍 ≥2、send 被拒、时钟 `ptr_eq` 新会话）、`test_a_closed_session_lets_the_reopened_identify_complete`（共享 RecordingWire：旧 next/seen=107/106 → close → 新会话 identify 一次过、无旧序号 drop）、`test_close_stops_the_session_while_the_arc_is_still_shared`（`strong_count==2` 时 close 仍停双任务 + 拒 send/flush）——转红 A：剪 `previous.close()`；B：剪 `install_clock`；C′：只剪 `closed` 旗；夹具 `RecordingWire` 改 **per-view**（独立收队列+关闭旗、共享记录与应答）。**`min_schedule_time`**——`test_min_schedule_time_is_the_upstream_0_100_schedule_lead`（返回 0.100 且等于 `MIN_REQTIME_DELTA`，防两个常量漂移；供 `GCodeRequestQueue` 对齐 `next_min_flush_time`）。另有**要真硬件的**两例（`test_frame_sequence_sync_against_a_real_board`：经 `hardware_test::acquire("…", &Requires::new().mcu())` 声明所需配置（接口与节/选项均从 `KLIPPERX_HW_CONFIG` 推导），不满足时打 `HW-IGNORED` 并跳过——对同一块不停机的板子连两次，第一次完成 identify 并跨过 4 位回绕，第二次必须报告接管、采纳固件当前的号并继续 `get_clock`；以及 R2 的 `test_firmware_reset_comes_back_three_times_on_a_real_board`：三轮 `reset`→重连→identify→`get_clock`，并断言 `!took_over_session()`（真重启过的板子不该被接管，与上一条互为反面）；固件字典无 `reset` 时运行期 `HW-IGNORED`） |
 | `object.rs` | `McuObject`：主/前缀 section 的名字（`[mcu]` → `mcu`，`[mcu zboard]` → `zboard`）、配置构建器在建对象时就可用（可在 connect 前领 oid）、未连接时报 `{}`、连接后报 identify 快照（`mcu_version` / `mcu_build_versions` / `mcu_constants`）、section 没有可用接口时 `connect` 报错、两个对象不能用同一个 chip 名；**握手期停机**（先绑只记录处理器）：假件用 `is_shutdown` 回 `get_config`（`test_a_stop_during_the_handshake_fails_the_connect_at_once_with_its_reason`：<1 s 失败且文案含 MCU 名与原因；剪掉 watcher 即退化成 5.001 s 超时转红）、固件主动发 `shutdown` 帧（`test_an_unsolicited_shutdown_during_the_handshake_fails_the_connect_at_once`）、首条原因先到先得（`test_the_first_stop_reason_is_the_one_kept`）、重开清槽（`test_a_reopen_starts_with_a_clean_connect_shutdown_slot`）；**就地复位有界重试**：回来仍停机则再复位并最终连上（`test_a_reset_that_comes_back_stopped_is_reset_again_and_connects`，只保留 `ResetRequired` 判定即转红）、次数上界（`test_a_come_back_stopped_is_retried_only_a_bounded_number_of_times`）、用尽后报 `MCU '<名>'` + 原因（`test_a_bring_up_that_runs_out_of_resets_reports_the_mcus_name_and_reason`）；**固件停机**：收到 `shutdown` 帧后打印机进 shutdown 且状态消息带原因；**`rpi_usb` 没法复位固件时**（`usb_reset_unusable`：hub 报不支持端口供电切换、开关本身失败、固件还在旧会话里、握手后它仍带着配置）把这个 MCU 的 `restart_method` 记成 `command`（内存里，`Printer::override_config`），第一种在真正去切电之前就发生；**`mcu_clock_poll`**：种子成功后注册 1 s 轮询（排程 0.5+0.5 断言、线上恰 1 帧 `get_clock`、样本折进回归、查询失败不喂不改排程且不 panic、`release_cycles` 后停火——转红：剪断取样路径前两条变红）；**`before_firmware_restart`**（在拆机之前、活连接上）：`command` 发 `reset` 并 flush（`test_a_firmware_restart_resets_on_the_live_connection`），物理方式（`rpi_usb` 等）不发（`test_a_physical_restart_method_does_not_reset_on_the_live_connection`） |
 | `config.rs` | CRC 标准校验值；oid 从 0 单调发号、走完 `MAX_OIDS` 报错不回绕、定稿后不能再领；`build`：空配置只有 `allocate_oids` + `finalize_config`、`allocate_oids` 带最终计数、命令按加入顺序、CRC 确定且对值与 oid 数敏感、`restart`/`init` 不入 CRC、config 回调在 build 时跑且可继续领 oid/加命令、二次 `build` 报错且不重跑回调、定稿后再加命令/回调/队列槽被拒、未 identify 报 `NotIdentified`、移动队列槽计数；`seconds_to_clock` 用 `CLOCK_FREQ`；`configure`：未配置时把整份配置加 `get_config` 一帧发出并确认、停机或 CRC 不一致时先 `config_reset`（运行中的固件先 `emergency_stop`）再配置、无 `config_reset` 时分别报停机 / CRC 两种配置错误；`Configured` 三个字段：`crc` / `move_count` / `reused`，加 `already_running`（首个 `get_config` 就报已配置或已停机 = 板子没重启） |
 | `restart.rs` | 空实现（`command`）与一条不是 USB tty 的串口路径各自的路由与报错；启动探测 `check_usb_power` 只对“串口 + `rpi_usb`”给结论，别的组合一律 `None`（不夺走调用方的 `rpi_usb`）。**要真硬件的没测**：端口开关、`wait_for_new_device` 的重枚举判定、hub 端口的供电能力（`usb::port_power`）都在真机上手工验过 |
@@ -217,7 +268,7 @@ git config core.hooksPath .githooks
 | `resource/pwm.rs` | 硬件路径建 `config_pwm_out`（`PWM_MAX` 满量程、restart 的 `queue_pwm_out`）；软件路径建 `config_digital_out` + `set_digital_out_pwm_cycle` + init 的 `queue_digital_out`；`shutdown_value` 非 0/1 的软件 PWM 报错、`max_duration` 与 start/shutdown 不一致报错、`!` 翻转；`next_aligned_clock` 对软件 PWM 按周期上取整、满/全关与硬件 PWM 不调整；`update_pwm` 用估计时钟发送，未连接报错 |
 | `resource/adc.rs` | 批量 `query_analog_in`（`bytes_per_report`）/ 旧格式按字典格式串选择；`ADC_MAX` 与 `sample_count*ADC_MAX < 2^16` 上限；`sample_count=0` 不建任何命令；`get_query_slot` 把首报排在估计时钟 +1.5 s；`analog_in_state` 旧格式单值缩放、新格式按 report 周期给每个样本打时钟 |
 | `resource/stepper.rs` | 方向变化变 `set_next_step_dir`、连续步变 `queue_step`；`!` 翻转方向线上的方向位；负 `add` 窄化后仍正确；**C5**：`test_a_stepper_reanchors_the_firmware_chain_on_a_reused_firmware`（复用分支 `built.restart` 必含 `reset_step_clock oid=0 clock=0`、且不进 config 哈希——回退 `add_restart_cmd` 即红，同模块另 4 条照常绿） |
-| `resource/endstop.rs` | `home_start` 同时武装 endstop 与 trsync（async）；`home_wait` 对主机请求（无固件触发）回 0 |
+| `resource/endstop.rs` | `home_start` 同时武装 endstop 与 trsync（async）；`home_wait` 对主机请求（无固件触发）回 0；**真机用例 R3（2026-10-06）**：`test_endstop_level_reads_open_and_shorted_on_a_real_board`（`#[ignore]`，两次读电平、两次之间提示按 Enter 让人手动短接；**两次相同不报失败**而是打「未检测到电平变化」提示）+ 不碰板的三条：`configure_taking_over` 的两条（首次 handshake 遇 `ResetRequired` → `reset` + 重开 + 重握手一次；第二次仍失败则报错并点名「板子可能被真实主机占着」）+ 声明判定单测。该 helper 目前**就在本模块的测试里**，是 R2/R5/R11 共用的同一件事，**待上提到 `hardware_test`**（见 `TODO.md`） |
 | `resource/trsync.rs` | 状态报告完成触发组、次级 MCU 报文把组超时拉到最慢那颗；registry 按 oid 路由、同一 MCU 上两个 endstop 共享 registry；一个 trsync 停住多个 stepper；共享轴跨 MCU 被拒（上游 `TriggerDispatch` 同规则）；raw reason 贯通：未知 raw 照样完成 completion、typed 视图折叠、reason 0 不完成（1-4 行为零变化的守卫） |
 | `resource/trigger_analog.rs` | 5 命令 + state 响应对字典编解码、错误码四类字典文案与 `SENSOR_SPECIFIC` 走传感器回调、SOS 去重缓存（仅变更才发、state+active 每次发）、超量段/状态数不匹配报错、range/trigger 去重、双 trigger_analog 的 oid 互异且各恰一次 config、非正采样率拒绝；e2e：`set_trigger→home` 首条 move 在监控窗内完成、无样本时 MONITOR 到期回 `Trigger analog error: MONITOR` 不挂起；M5b：`&dyn HomingEndstop` 端到端 arm/wait、stub 生产者投样与错误码回调消费（低于 `SENSOR_SPECIFIC` 走字典） |
 | `resource/i2c.rs` | 总线错误（非 SUCCESS）按上游把机器停机 |

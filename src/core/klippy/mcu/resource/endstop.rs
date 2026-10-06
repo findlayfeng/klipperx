@@ -265,14 +265,20 @@ mod tests {
     use super::*;
 
     use crate::core::klippy::cmd::clock::McuClock;
+    use crate::core::klippy::cmd::config::Reset;
+    use crate::core::klippy::config::{Config, ConfigWrapper};
+    use crate::core::klippy::extras::board_pins::BoardPins;
     use crate::core::klippy::interface::devices::frame_mock::{FrameMock, RecordingWire};
-    use crate::core::klippy::interface::Interface;
+    use crate::core::klippy::interface::{Interface, SimulatorDevice};
     use crate::core::klippy::mcu::{ConfigBuilder, Dictionary, Mcu};
     use crate::core::klippy::msg::parser::Parser;
     use crate::core::klippy::msg::proto::ArgValue;
-    use crate::core::klippy::pins::PrinterPins;
+    use crate::core::klippy::pins::{PrinterPins, PINS_OBJECT};
+    use crate::core::klippy::printer::{Printer, PrinterObject};
     use crate::core::klippy::reactor::ManualReactor;
     use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     fn dictionary() -> Dictionary {
         Dictionary::from_json(json!({
@@ -489,6 +495,465 @@ mod tests {
             sent.lock().unwrap().iter().filter(|p| **p == query).count(),
             1,
             "exactly one query once the minclock passed"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Real board: R3, the X endstop's level and polarity (M119)
+    // -----------------------------------------------------------------------
+
+    /// How long a rebooted board gets before its port is reopened.
+    ///
+    /// The same order as `mcu/object.rs`'s `RESET_SETTLE` (500 ms): a board
+    /// that reboots on `reset` is not ready the moment the command has been
+    /// flushed, and reopening its port too early races its startup. Kept local
+    /// because that constant is private to the bring-up.
+    const REBOOT_SETTLE: Duration = Duration::from_millis(500);
+
+    /// How long `reset` has to leave the send queue before the port is closed.
+    ///
+    /// `mcu/object.rs`'s own `RESET_FLUSH_TIMEOUT` (1 s): the firmware reboots
+    /// on receipt, so the command must be flushed while the transport is still
+    /// up. The flush itself often reports the port closing as the board goes
+    /// away — the command was still written first, so that is not an error.
+    const RESET_FLUSH: Duration = Duration::from_secs(1);
+
+    /// What the R3 real-board case needs from `KLIPPERX_HW_CONFIG`.
+    ///
+    /// `[stepper_x]` is the section the X endstop belongs to and `endstop_pin`
+    /// is the key that says which pin it is; a config that wires no X endstop
+    /// (sensorless, or a printer without X) is skipped by
+    /// [`crate::hardware_test::acquire`]. Shared with
+    /// [`test_the_endstop_case_declares_stepper_x_endstop_pin`], so the
+    /// declaration the config is judged against and the one the test runs under
+    /// cannot drift apart.
+    fn endstop_case() -> crate::hardware_test::Requires {
+        crate::hardware_test::Requires::new()
+            .mcu()
+            .option("stepper_x", "endstop_pin")
+    }
+
+    /// A builder whose only content is `oids` oids: two counts make two CRCs,
+    /// which is all a test needs to be "a configuration the board does not
+    /// carry".
+    fn builder_with_oids(oids: u32) -> Arc<ConfigBuilder> {
+        let builder = Arc::new(ConfigBuilder::new());
+        for _ in 0..oids {
+            builder
+                .create_oid()
+                .expect("the oid fits in allocate_oids' count");
+        }
+        builder
+    }
+
+    /// Leave `mcu` carrying `builder_with_oids(oids)`'s configuration.
+    async fn configure_the_fake(mcu: &Arc<Mcu>, oids: u32) {
+        let builder = builder_with_oids(oids);
+        let mut built = builder.build(mcu).expect("the dictionary encodes it");
+        builder
+            .handshake(mcu, &mut built, false)
+            .await
+            .expect("the fake firmware accepts the configuration");
+    }
+
+    /// Connect to the board and make it carry `builder`'s configuration,
+    /// rebooting it once if it still carries another.
+    ///
+    /// `Mcu::connect` completes identify; it does not configure the firmware,
+    /// and a resource built on a chip sends nothing until `config` /
+    /// `finalize_config` have been accepted. A board a running printer host has
+    /// already configured — its CRC is not the one this host just computed —
+    /// refuses the configuration until it is rebooted, and a firmware whose
+    /// only reset is its own `reset` reports `McuError::ResetRequired`
+    /// (`mcu/config.rs`). This does what `mcu/object.rs` does for the printer:
+    /// send `reset`, flush it, close the session, let the board come back, and
+    /// hand the **same** `BuiltConfig` to [`ConfigBuilder::handshake`] on the
+    /// reconnected session.
+    ///
+    /// One retry, then it gives up with a message that names the likely cause.
+    /// Each attempt prints what it found, so `--nocapture` shows whether the
+    /// board was taken over or came up free.
+    ///
+    /// Written for the R3 endstop case here; the same take-over is what the
+    /// firmware-restart, motion and long-run cases will need, so this is the
+    /// piece to lift into `crate::hardware_test` when it grows a bring-up.
+    async fn configure_taking_over<'a, F, Fut>(
+        name: &str,
+        mut mcu: Arc<Mcu>,
+        mut reopen: F,
+        builder: &ConfigBuilder,
+    ) -> Result<Arc<Mcu>, String>
+    where
+        F: FnMut() -> Fut + 'a,
+        Fut: std::future::Future<Output = Result<Arc<Mcu>, String>> + 'a,
+    {
+        let mut built = builder.build(&mcu).map_err(|err| err.to_string())?;
+        let mut reboots = 0;
+        loop {
+            match builder.handshake(&mcu, &mut built, false).await {
+                Ok(_) => {
+                    println!("HW-CONFIG: {name}: the firmware accepted the configuration");
+                    return Ok(mcu);
+                }
+                Err(McuError::ResetRequired) if reboots == 0 => {
+                    println!(
+                        "HW-CONFIG: {name}: the firmware still carries a configuration; \
+                         rebooting it with `reset` and reconnecting (attempt 2)"
+                    );
+                    mcu.send_msg(&Reset).map_err(|err| err.to_string())?;
+                    let _ = mcu.flush(RESET_FLUSH).await;
+                    mcu.close();
+                    tokio::time::sleep(REBOOT_SETTLE).await;
+                    mcu = reopen().await?;
+                    reboots += 1;
+                }
+                Err(McuError::ResetRequired) => {
+                    return Err(format!(
+                        "{name}: the firmware still carries a configuration after `reset`; \
+                         a running printer host may still hold the board — stop it (and the \
+                         printer) and run this again"
+                    ));
+                }
+                Err(err) => {
+                    return Err(format!("{name}: the configuration was refused: {err}"));
+                }
+            }
+        }
+    }
+
+    /// The pin registry a config's `endstop_pin` resolves against, and the main
+    /// MCU's chip and config builder to build on.
+    ///
+    /// The printer's loader builds one chip per `[mcu]` section and applies
+    /// every `[board_pins]` alias before any resource resolves a pin; a
+    /// hardware test that builds one resource reproduces that much of it, so an
+    /// `endstop_pin` written as an alias (`^X_STOP`) resolves the way it does at
+    /// run time.
+    fn pin_world(config: &Config) -> (Arc<PrinterPins>, McuChip, Arc<ConfigBuilder>) {
+        let pins = Arc::new(PrinterPins::new());
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        let registered: Arc<dyn PrinterObject> = pins.clone();
+        printer
+            .add_object(PINS_OBJECT, registered)
+            .expect("the pin registry is not registered twice");
+        let mut main = None;
+        for section in config.get_sections_by_id("mcu") {
+            let name = section.sub.clone().unwrap_or_else(|| "mcu".to_string());
+            let builder = Arc::new(ConfigBuilder::new());
+            let chip = McuChip::new(name.clone(), Arc::clone(&builder), Arc::clone(&pins));
+            pins.register_chip(&name, Arc::new(chip.clone()))
+                .expect("one chip per [mcu] section");
+            if name == "mcu" {
+                main = Some((chip, builder));
+            }
+        }
+        let (chip, builder) = main.expect("acquire required a reachable [mcu]");
+        for section in config.get_sections_by_id("board_pins") {
+            BoardPins::new(&ConfigWrapper::untracked(section), &printer)
+                .expect("the [board_pins] aliases apply to the registered chips");
+        }
+        (pins, chip, builder)
+    }
+
+    /// One query, printed, so `--nocapture` shows both sides of the flip.
+    ///
+    /// No clock estimate is installed on the chip, so `print_time_to_clock`
+    /// has nothing to map and the query carries no `min_clock`: this is the
+    /// idle `M119` case, which goes out at once because there is no queued
+    /// motion for it to wait behind (see the module docs' "Clock-ordered
+    /// queries").
+    async fn read_endstop_level(endstop: &McuEndstop, label: &str) -> bool {
+        let level = endstop
+            .query_endstop(0.0)
+            .await
+            .expect("the firmware answers endstop_query_state");
+        println!("HW-ENDSTOP: {label}: {}", state_name(level));
+        level
+    }
+
+    /// The two levels as the API prints them: `open` is the untriggered pin,
+    /// `TRIGGERED` the level the endstop stops on (upstream `QueryEndstops`, the
+    /// `M119` and `query_endstops/status` wording).
+    fn state_name(level: bool) -> &'static str {
+        if level {
+            "TRIGGERED"
+        } else {
+            "open"
+        }
+    }
+
+    /// Wait for the operator to press Enter, without blocking the runtime.
+    ///
+    /// The blocking read runs on a blocking thread, so the MCU's transport
+    /// tasks keep being polled while the operator works. EOF (a redirected
+    /// stdin) returns at once rather than hanging.
+    async fn wait_for_operator(prompt: &str) {
+        use std::io::Write;
+        println!("{prompt}");
+        let _ = std::io::stdout().flush();
+        let _ = tokio::task::spawn_blocking(|| {
+            let mut line = String::new();
+            let _ = std::io::stdin().read_line(&mut line);
+        })
+        .await;
+    }
+
+    /// R3: the X endstop's level under the two physical states, read twice.
+    ///
+    /// This is the real-board half of `query_endstop`'s story (the fake-device
+    /// half is `test_query_endstop_holds_until_its_minclock`): it configures the
+    /// board with **only** the X endstop resource and asks the firmware for the
+    /// pin level twice, in between letting the operator change the wiring.
+    ///
+    /// # What it asserts, and what only the operator can confirm
+    ///
+    /// `TESTING.md`'s R3 (`TESTING.md:43-46`) reads "X endstop read once in each
+    /// of 断开 / 手动短接; 判定: `open` ↔ `TRIGGERED` flips with the real level, and
+    /// the `!`/`^` polarity and pull-up match the config". Split by what the host
+    /// can see:
+    ///
+    /// - **Asserted here**: both reads return (the `endstop_query_state`
+    ///   round trip completed), and `query_endstop` maps the firmware's
+    ///   `pin_value` through the pin's `!` exactly as production does. The two
+    ///   results are printed as `open` / `TRIGGERED`.
+    /// - **The operator's call**: that the level *changed* between the two
+    ///   reads, and that it changed in the direction the wiring and the `!`/`^`
+    ///   in `endstop_pin` promise. Two identical reads are *reported* with a
+    ///   plain-language remind, never failed: with no motion and no queued
+    ///   move, a level that does not move means the wiring did not change, not
+    ///   that the query is wrong. `^`/`~` are passed to the firmware as
+    ///   `config_endstop`'s `pull_up` and never reach the host, so they are
+    ///   checked on the board, not here.
+    ///
+    /// # What it assumes about the wiring
+    ///
+    /// The X endstop's signal is wired to the pin `[stepper_x] endstop_pin`
+    /// names, on the main `[mcu]` board, and the operator can open and short
+    /// that pin for the two reads. `^`/`~` (pull-up / pull-down) and `!`
+    /// (invert) are taken from the config as written. Nothing else — no
+    /// stepper, no heater — has to be wired for this case.
+    ///
+    /// # What it is safe to run
+    ///
+    /// **No motion, no heater.** Nothing is armed and no `queue_step` is sent —
+    /// the only command that reaches the firmware after configuration is
+    /// `endstop_query_state`, and `query_endstop` never touches a stepper or a
+    /// heater. It reads the X endstop of the config's own `[stepper_x]`.
+    ///
+    /// # What it does to the board
+    ///
+    /// It takes the board over: the printer (or any other host) must not be
+    /// running, because a second session on the board is exactly what the
+    /// configuration handshake cannot share. The board ends up carrying this
+    /// test's configuration (the endstop resource and nothing else) and is
+    /// **not** restored — the printer resets it on its next start, or a
+    /// power-cycle does. A board that is already configured is rebooted once
+    /// over its own `reset` before the test's configuration is sent.
+    ///
+    /// Run it with the board's X endstop readable, one hand free to move the
+    /// jumper:
+    ///
+    /// ```text
+    /// KLIPPERX_HW_CONFIG=~/printer_data/config/printer.cfg \
+    ///   cargo test -p klipperx --lib test_endstop_level_reads_open_and_shorted \
+    ///   -- --ignored --nocapture
+    /// ```
+    #[tokio::test]
+    #[ignore = "hardware: needs KLIPPERX_HW_CONFIG"]
+    async fn test_endstop_level_reads_open_and_shorted_on_a_real_board() {
+        let Some(machine) = crate::hardware_test::acquire(
+            "test_endstop_level_reads_open_and_shorted_on_a_real_board",
+            &endstop_case(),
+        ) else {
+            return;
+        };
+        let config = machine.config();
+        let pin = config
+            .get_section("stepper_x")
+            .and_then(|section| section.get_str("endstop_pin"))
+            .expect("[stepper_x] endstop_pin, which acquire required")
+            .to_string();
+
+        let (pins, chip, builder) = pin_world(config);
+        let endstop = pins
+            .setup_endstop(&pin, None)
+            .expect("endstop_pin names a pin and a chip this config has");
+        assert_eq!(
+            endstop.chip_name(),
+            "mcu",
+            "this case declares .mcu(); an X endstop on another board needs its own declaration"
+        );
+
+        let mcu = Mcu::connect("mcu", machine.open_mcu().expect("the port opens"))
+            .await
+            .expect("identify completes");
+        let reopen = || async {
+            let interface = machine.open_mcu()?;
+            Mcu::connect("mcu", interface)
+                .await
+                .map_err(|err| err.to_string())
+        };
+        let mcu = configure_taking_over("mcu", mcu, reopen, &builder)
+            .await
+            .expect("the board carries this configuration");
+        chip.attach(mcu);
+
+        println!(
+            "HW-ENDSTOP: endstop_pin = {pin}; the host inverts the level: {}",
+            endstop.invert
+        );
+        let first = read_endstop_level(&endstop, "read 1").await;
+        wait_for_operator(
+            "HW-ENDSTOP: change the X endstop's physical state now \
+             (open it if it is shorted, short it if it is open), then press Enter",
+        )
+        .await;
+        let second = read_endstop_level(&endstop, "read 2").await;
+
+        if first == second {
+            println!(
+                "HW-ENDSTOP: 未检测到电平变化（两次都是 {}）：请确认端停是否已按需断开/短接后重跑",
+                state_name(second)
+            );
+        } else {
+            println!(
+                "HW-ENDSTOP: 电平翻转确认：{} -> {}",
+                state_name(first),
+                state_name(second)
+            );
+        }
+    }
+
+    /// The take-over helper against a fake firmware: a board that already
+    /// carries a configuration is rebooted once and then accepts this one.
+    ///
+    /// `atmega2560.dict` declares `reset` and no `config_reset`, which is the
+    /// firmware whose only way out of a configuration is to reboot itself —
+    /// the one `ConfigBuilder::handshake` answers with `ResetRequired`.
+    #[tokio::test]
+    async fn test_the_take_over_helper_reboots_a_configured_board_once() {
+        let dict = klipperx_test_support::test_dicts_dir().join("atmega2560.dict");
+        let mcu = Mcu::connect(
+            "mcu",
+            Interface::simulator(SimulatorDevice::new(&dict).unwrap()),
+        )
+        .await
+        .expect("identify against the fake firmware");
+        // Leave the fake configured, and with a different CRC than the builder
+        // below computes — what a running printer host leaves behind.
+        configure_the_fake(&mcu, 1).await;
+        let builder = builder_with_oids(2);
+
+        let reconnects = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&reconnects);
+        let reopened = configure_taking_over(
+            "mcu",
+            mcu,
+            move || {
+                let counted = Arc::clone(&counted);
+                let dict = dict.clone();
+                async move {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    let interface = Interface::simulator(SimulatorDevice::new(&dict).unwrap());
+                    Mcu::connect("mcu", interface)
+                        .await
+                        .map_err(|err| err.to_string())
+                }
+            },
+            &builder,
+        )
+        .await
+        .expect("the reboot brings back a board that takes the configuration");
+
+        assert_eq!(
+            reconnects.load(Ordering::SeqCst),
+            1,
+            "the helper must reconnect exactly once"
+        );
+        assert_eq!(reopened.name(), "mcu");
+    }
+
+    /// The same helper when the board never comes back clean: the retry is
+    /// bounded, and the failure names the likely cause.
+    #[tokio::test]
+    async fn test_the_take_over_helper_gives_up_after_one_reboot() {
+        let dict = klipperx_test_support::test_dicts_dir().join("atmega2560.dict");
+        let mcu = Mcu::connect(
+            "mcu",
+            Interface::simulator(SimulatorDevice::new(&dict).unwrap()),
+        )
+        .await
+        .expect("identify against the fake firmware");
+        configure_the_fake(&mcu, 1).await;
+        let builder = builder_with_oids(2);
+
+        let err = configure_taking_over(
+            "mcu",
+            mcu,
+            move || {
+                let dict = dict.clone();
+                async move {
+                    // The board comes back still carrying a configuration, so
+                    // the second handshake cannot get past it either.
+                    let interface = Interface::simulator(SimulatorDevice::new(&dict).unwrap());
+                    let mcu = Mcu::connect("mcu", interface)
+                        .await
+                        .map_err(|err| err.to_string())?;
+                    configure_the_fake(&mcu, 1).await;
+                    Ok(mcu)
+                }
+            },
+            &builder,
+        )
+        .await
+        .expect_err("a board that keeps its configuration is reported, not retried forever");
+
+        assert!(
+            err.contains("still carries a configuration after `reset`"),
+            "{err}"
+        );
+        assert!(err.contains("printer host"), "{err}");
+    }
+
+    /// The declaration the real-board case runs under is the one the config is
+    /// judged against: `[stepper_x]` with `endstop_pin` activates it, a
+    /// commented-out or missing pair skips it.
+    ///
+    /// This is the half of a hardware test no board is needed for, and it is
+    /// the one that keeps a wrong declaration from turning the case into one
+    /// that is *always* skipped.
+    #[test]
+    fn test_the_endstop_case_declares_stepper_x_endstop_pin() {
+        let with_it =
+            Config::from_text("[mcu]\nserial: /dev/fake\n[stepper_x]\nendstop_pin: ^PA2\n")
+                .expect("the fixture parses")
+                .0;
+        assert_eq!(
+            crate::hardware_test::check(&with_it, &endstop_case()),
+            Ok(())
+        );
+
+        let commented =
+            Config::from_text("# [stepper_x]\n# endstop_pin: ^PA2\n[mcu]\nserial: /dev/fake\n")
+                .expect("the fixture parses")
+                .0;
+        assert_eq!(
+            crate::hardware_test::check(&commented, &endstop_case()),
+            Err(vec![crate::hardware_test::Missing::Section(
+                "stepper_x".to_string()
+            )])
+        );
+
+        let without_it =
+            Config::from_text("[mcu]\nserial: /dev/fake\n[stepper_x]\nstep_pin: PA0\n")
+                .expect("the fixture parses")
+                .0;
+        assert_eq!(
+            crate::hardware_test::check(&without_it, &endstop_case()),
+            Err(vec![crate::hardware_test::Missing::Option {
+                section: "stepper_x".to_string(),
+                option: "endstop_pin".to_string(),
+            }])
         );
     }
 }

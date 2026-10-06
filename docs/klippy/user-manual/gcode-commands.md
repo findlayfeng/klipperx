@@ -904,6 +904,8 @@ SAVE_VARIABLE VARIABLE=<name> VALUE=<literal>
 | `PROBE` | 采样组参数；`METHOD=`（`scan`/`rapid_scan`/`tap`，eddy 对象分派；其余对上游 `probe.py`） | 触发一次探测并记录位置 |
 | `QUERY_PROBE` | 无 | 回显上次触发状态 |
 | `PROBE_ACCURACY` | 采样组（对上游） | 采样精度统计 |
+| `Z_OFFSET_APPLY_PROBE` | 无 | 把回零偏移（`SET_GCODE_OFFSET Z=`）折进 `z_offset` 并写回配置（`SAVE_CONFIG` 生效）；`offset == 0` 时只回 `Nothing to do: Z Offset is 0` |
+| `Z_OFFSET_APPLY_ENDSTOP` | 无 | 同上，折进 `position_endstop`；普通机写 Z 轨，`kinematics: delta` 时写三塔 `stepper_a/b/c` |
 
 ### PROBE_EDDY_CURRENT_TAP_CALIBRATE — eddy tap 标定（由 `[probe_eddy_current]` 注册，批 #3）
 

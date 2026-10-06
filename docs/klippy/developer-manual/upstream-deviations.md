@@ -61,6 +61,7 @@ OctoPrint 只走 pty，与本条取舍无关。
 
 | 项 | 现状 | 详情 |
 |---|---|---|
+| `Z_OFFSET_APPLY_ENDSTOP` 的 delta 变体 | 上游把 delta 处理函数**重注册到同名命令**上覆盖普通变体（`manual_probe.py:74-79`） | 本仓按 `kinematics: delta` **二选一注册**（`register_command` 对重名报错，与上游 `gcode.py:142-144` 同款）——对外行为等价 | [G-Code 命令参考](../user-manual/gcode-commands.md) |
 | `BED_SCREWS_ADJUST` 命令族的失败收尾 | 上游在三条命令注册中途失败时会留下半个命令组与卡住的 `state='adjust'` | 本仓把已注册的那部分收回并复位会话（`manual_probe` 的命令不被碰）——唯一有意偏离，已在模块 doc 记明 | [配置手册 `[bed_screws]`](../user-manual/config.md)、[模块表](README.md) |
 | `[display]` 菜单 | 选项只被读取，**菜单内容不渲染**（LED/屏输出本身可用） | [配置手册 `[display]`](../user-manual/config.md) |
 | 上游无、本仓有 | 通用 `[i2c_device]` / `[spi_device]` 节与 `IIC_WRITE` / `IIC_READ` / `SPI_TRANSFER` / `SPI_SEND` 调试命令、`KlipperX` 自有调试总线命令 —— 属**本仓扩展**，上游没有对应物 | [配置手册](../user-manual/config.md)、[G-Code 命令参考](../user-manual/gcode-commands.md) |

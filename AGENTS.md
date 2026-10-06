@@ -188,6 +188,8 @@ cargo fmt --all                         # 提交前格式化（钩子也会跑�
 ```
 
 - **同一 `target/` 不要并发跑两个 cargo**：第二个会在构建锁上排队，而且并发构建的 CPU 争用会让计时敏感的测试偶发卡住（实测遇到过一次 `futex_wait` 挂住）。要并发就各自 `CARGO_TARGET_DIR=<目录>`，或干脆分 worktree。
+  **想知道自己是不是在排队**：用 `scripts/cargo-locked.sh <cargo 子命令…>` 代替 `cargo`——它探的是 **cargo 自己的锁**（`<target>/<profile>/.cargo-build-lock`，cargo 用 `flock(2)`），所以**裸 `cargo` 在跑它也能发现**；会先打
+  `another cargo holds …; waiting (idle CPU here is expected, not a hang)` + 持有者 pid 与命令行，拿到锁后报 `acquired after <时长>`，退出码原样透传（实测：裸 `cargo build` 占着时，包装器报告并等了 11.5s）。
 - **合并前用全量闸门**：`cargo test -p klipperx --lib` 很快，但**不含** `klippy-client` 的集成测试（历史上内建参数表过期就是这样漏掉的）；提交/合并前跑 `cargo test --workspace`。
 
 真机 / 外设验证不阻塞主线，约定见 [`TESTING.md`](TESTING.md)。

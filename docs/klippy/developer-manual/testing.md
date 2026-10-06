@@ -63,7 +63,7 @@ cargo test --workspace -- --test-threads=1 2>&1 | scripts/test-timings.py
 「第一条测试卡住了」的坑），然后列出最慢的若干条与超过阈值的条数。
 
 已知基线与另两类看起来像挂死的情况（都不是测试自身）：① `cargo` 对同一 `target/` 的**构建锁排队**
-（第二个 cargo 安静排队、CPU 全空，见 `AGENTS.md` 的「常用命令」段）；② 需要真机/真总线的形态
+（第二个 cargo 安静排队、CPU 全空，见 `AGENTS.md` 的「常用命令」段；**用 `scripts/cargo-locked.sh …` 代替 `cargo` 就能看见**：它会报「谁占着 + 等了多久」）；② 需要真机/真总线的形态
 （例如 Q11：非 `-o` 的活机会让假设备的阻塞读 park，已改成确定性失败并保留 `#[ignore]` 复现）。
 
 ## 真机测试

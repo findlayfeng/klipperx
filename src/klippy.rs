@@ -507,6 +507,55 @@ mod tests {
         path.to_str().expect("the temp path is utf-8").to_string()
     }
 
+    /// Drive the run loop to its end over the **paused** test clock, and insist
+    /// that it took the restart delay on the way.
+    ///
+    /// [`klippy_process`] waits [`RESTART_DELAY`] between a restart and the next
+    /// bring-up, and that wait is upstream's too: `time.sleep(1.)` in the
+    /// restart loop, between `printer.run()` returning a restart and
+    /// `main_reactor.finalize()` (`third_party/klipper/klippy/klippy.py:364`,
+    /// our `src/klippy.rs:192`). It gives a device that was just closed time to
+    /// come back and rate-limits a restart that returns at once, so **do not
+    /// shorten or drop it to make these tests fast** — that would be a behaviour
+    /// change, not an optimisation.
+    ///
+    /// What makes the tests fast is the clock, not a missing wait: with the test
+    /// clock paused, a task with nothing to do lets tokio advance time to the
+    /// sleep's deadline, so the full second passes on the reactor's clock while
+    /// the test itself returns at once. The reading below keeps that honest —
+    /// the assertion fails if the loop ever stops taking the delay (a `restart`
+    /// result that fell through to `exit`, say), which is what "virtual instead
+    /// of real" must not be allowed to become: deleting the product sleep makes
+    /// this assertion read `0s < 1s` and fail.
+    ///
+    /// Two traps for anyone editing this:
+    ///
+    /// - The wait has to stay in the context it is measured in: every caller is
+    ///   a `#[tokio::test(start_paused = true)]`, and on a running clock this
+    ///   would really sleep the second.
+    /// - Under a paused clock, removing the product sleep **deadlocks** rather
+    ///   than merely speeding the test up. Tokio inhibits the clock's automatic
+    ///   advance while a `spawn_blocking` task is outstanding
+    ///   (`runtime/blocking/schedule.rs`), and the run loop's blocking thread
+    ///   parks on the printer's exit condition variable — so the clock freezes,
+    ///   the polling watcher in
+    ///   `test_a_restart_whose_config_no_longer_parses_reports_error` never
+    ///   wakes, and nothing ever asks the printer to exit. A hang there is that
+    ///   pair of facts, not a flaky test.
+    async fn klippy_process_over_the_restart_delay(
+        printer: Arc<Printer>,
+        config_file: String,
+    ) -> String {
+        let started = tokio::time::Instant::now();
+        let result = klippy_process(printer, config_file).await;
+        let waited = tokio::time::Instant::now() - started;
+        assert!(
+            waited >= RESTART_DELAY,
+            "the run loop did not wait the restart delay: {waited:?}"
+        );
+        result
+    }
+
     #[test]
     fn test_only_a_restart_result_rebuilds_the_printer() {
         // The two spellings `gcode/restart` and `gcode/firmware_restart` exit
@@ -553,7 +602,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_a_restart_rebuilds_the_printer_before_the_next_run() {
         // The restart re-reads the file, so the run loop needs one on disk: an
         // empty config, which loads with no sections.
@@ -574,7 +623,7 @@ mod tests {
             .unwrap();
         printer.mark_host_objects();
 
-        klippy_process(Arc::clone(&printer), config_file.clone()).await;
+        klippy_process_over_the_restart_delay(Arc::clone(&printer), config_file.clone()).await;
         let _ = std::fs::remove_file(&config_file);
 
         // `restart` rebuilt the printer (config reloaded, brought up again)
@@ -628,7 +677,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_a_restart_rereads_the_config_file_from_disk() {
         // What `run` does at start-up: parse the file, load it, then hand the
         // *path* to the run loop. The file changes on disk afterwards, and the
@@ -655,7 +704,7 @@ mod tests {
             .load_config(&startup_config)
             .expect("the startup config loads");
 
-        klippy_process(Arc::clone(&printer), config_file.clone()).await;
+        klippy_process_over_the_restart_delay(Arc::clone(&printer), config_file.clone()).await;
         let _ = std::fs::remove_file(&config_file);
 
         let observed = observed.lock().unwrap_or_else(|p| p.into_inner());
@@ -708,7 +757,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_a_restart_whose_config_no_longer_parses_reports_error() {
         let config_file = write_temp_config("broken", "[pause_resume]\nrecover_velocity: 50\n");
         let (startup_config, _) = Config::from_file(&config_file).expect("the config parses");
@@ -740,7 +789,8 @@ mod tests {
             })
         };
 
-        let result = klippy_process(Arc::clone(&printer), config_file.clone()).await;
+        let result =
+            klippy_process_over_the_restart_delay(Arc::clone(&printer), config_file.clone()).await;
         watcher.await.unwrap();
         let _ = std::fs::remove_file(&config_file);
 

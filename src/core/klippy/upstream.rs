@@ -865,12 +865,41 @@ mod tests {
     ///
     /// This is what a first attempt at covering "a real machine's shape"
     /// found, and it is **not** about `M400`: the same leak appears with the
-    /// move alone and no `M400` at all (and it does **not** appear under `-o`,
-    /// which every corpus run uses). `SimulatorDevice::receive` waits on a
-    /// condvar with no bound when it has no frame to hand out and no armed
-    /// monitor window (`interface/devices/simulator.rs`), and nothing signals it
-    /// once the case stopped talking — so the blocking thread stays parked and
-    /// `Runtime::shutdown_timeout` has to give up.
+    /// move alone and no `M400` at all. It is also **not** limited to live
+    /// (non `-o`) cases, contrary to this comment's first reading:
+    /// `SimulatorDevice::receive` waits on a condvar with no bound when it has
+    /// no frame to hand out and no armed monitor window
+    /// (`interface/devices/simulator.rs`), and nothing signals it once the case
+    /// stopped talking — so the blocking thread stays parked and
+    /// `Runtime::shutdown_timeout` has to give up. What keeps the device open is
+    /// a part `Printer::teardown` cannot drop: a part holding
+    /// `Arc<GCodeDispatch>` while the dispatcher's command table
+    /// (`Commands` in `gcode.rs`) holds a handler capturing that same part is a
+    /// strong cycle, so neither side drops, the `Mcu` the cycle reaches never
+    /// runs `Drop`, and nothing releases the blocking read.
+    ///
+    /// Every corpus run is `-o`, and two of them pay exactly that leak — each
+    /// runs its g-code in ~0.25s and then sits out the whole
+    /// `CASE_SHUTDOWN_TIMEOUT` in `run_generated_upstream_case`, which is what
+    /// makes them the two slowest cases in the suite:
+    ///
+    /// * `sdcard_loop.test` — `[virtual_sdcard]` holds the dispatcher (the
+    ///   `gcode` field of `extras/virtual_sdcard.rs`) and registers the
+    ///   `M2x` / `SDCARD_*` handlers, each capturing `Arc<VirtualSdCard>`.
+    /// * `printers.test` `printer-biqu-bx-2021` — `[gcode_button lcd_button]`
+    ///   (`extras/gcode_button.rs`) holds the dispatcher and registers the
+    ///   capturing `QUERY_BUTTON` mux handler.
+    ///
+    /// `a_case_runtime_shuts_down` — the probe written for this leak — uses
+    /// `example-cartesian.cfg`, which has neither part and shuts down in well
+    /// under a millisecond, so it cannot see either case: their 5s is a silent
+    /// cost, not a failure.
+    ///
+    /// Measured 2026-10-06 with `KLIPPERX_TRACE`: neither case prints
+    /// `MCU DROP`, while `example-cartesian` does; dropping `[gcode_button]`
+    /// from the biqu config and `[virtual_sdcard]` from `sdcard_loop.cfg`
+    /// takes each case back to a sub-millisecond shutdown. The cycle is the
+    /// product-side gap; this harness only bounds the wait.
     ///
     /// Ignored because it fails on that leak (the harmless, bounded failure
     /// this test is written to produce: `a part was leaked`, not a hung run).

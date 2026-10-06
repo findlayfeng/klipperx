@@ -116,6 +116,15 @@ enum Commands {
     // config file is required; the MCU names default to the bare `[mcu]`.
     #[command(arg_required_else_help = true)]
     Stress(klipperx::stress::StressArgs),
+
+    /// List the boards on a CAN bus that have no node id yet
+    //
+    // A bench tool, not part of the host: it needs no config file, and the query
+    // it sends is a broadcast that changes no board's state — the UUIDs it prints
+    // are what a `[mcu]` section then names in `canbus_uuid`. No
+    // `arg_required_else_help`, unlike `stress`: every argument has a default, so
+    // naming it alone is an instruction — scan `can0` for two seconds.
+    CanbusScan(klipperx::canbus::CanbusScanArgs),
 }
 
 fn main() {
@@ -128,6 +137,7 @@ fn main() {
         (Some(Commands::Api(args)), _) => client::run_api(args).map(|()| 0),
         (Some(Commands::Console(args)), _) => client::run_console(args).map(|()| 0),
         (Some(Commands::Stress(args)), _) => klipperx::stress::run(args).map(|()| 0),
+        (Some(Commands::CanbusScan(args)), _) => klipperx::canbus::run(args).map(|()| 0),
         // No subcommand: the arguments were the host's all along.
         (None, host) => run_host(host),
     };
@@ -460,5 +470,43 @@ mod tests {
         // `klipperx printer.cfg api …` is a mistake worth naming rather than
         // guessing at.
         assert!(parse(&["printer.cfg", "api", "-a", "/tmp/x"]).is_err());
+    }
+
+    #[test]
+    fn test_the_canbus_scan_subcommand_has_its_own_defaults() {
+        // Every argument defaults, so naming the subcommand alone is an
+        // instruction rather than a question: scan `can0` for Klipper's two
+        // seconds.
+        let cli = parse(&["canbus-scan"]).expect("no argument is required");
+        match cli.command {
+            Some(Commands::CanbusScan(args)) => {
+                assert_eq!(args.interface, "can0");
+                assert_eq!(args.timeout, 2.0);
+            }
+            other => panic!("expected `canbus-scan`, got {other:?}"),
+        }
+
+        let cli = parse(&["canbus-scan", "--interface", "can1", "--timeout", "0.5"])
+            .expect("both options are the subcommand's");
+        match cli.command {
+            Some(Commands::CanbusScan(args)) => {
+                assert_eq!(args.interface, "can1");
+                assert_eq!(args.timeout, 0.5);
+            }
+            other => panic!("expected `canbus-scan`, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_the_canbus_scan_subcommand_and_its_options_are_in_the_help() {
+        // Found by reading `--help`, like the other bench tools.
+        let error = parse(&["--help"]).expect_err("the help is not a command line");
+        let help = error.to_string();
+        assert!(help.contains("canbus-scan"), "{help}");
+
+        let error = parse(&["canbus-scan", "--help"]).expect_err("the help is not a scan");
+        let help = error.to_string();
+        assert!(help.contains("--interface"), "{help}");
+        assert!(help.contains("--timeout"), "{help}");
     }
 }

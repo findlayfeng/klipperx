@@ -1,3 +1,4 @@
+pub mod canbus;
 pub mod core;
 #[cfg(test)]
 mod hardware_test;

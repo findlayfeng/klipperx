@@ -58,6 +58,8 @@ cargo test -p klipperx --lib test_install_skips  # 单个用例（按名过滤�
 
 1. **声明**：用例在测试体开头声明自己需要什么——`hwtest::needs().mcu()`（要有可用的主 MCU 传输）、
    `.section("stepper_x")`、`.option("stepper_x", "endstop_pin")`；可组合。
+   **第二块板**用 `.mcu_named("zboard")`（要求 `[mcu zboard]` 存在**且带接口键**，比 `.section("mcu zboard")` 强），
+   再用 `machine.open_mcu_named("zboard")` 打开——`Mcu::connect` 的名字必须与节名一致（`"mcu"` / `"zboard"`）。
 2. **检查**：`hwtest::acquire("<用例名>", &needs)` 用仓库自己的 config 解析器读 `KLIPPERX_HW_CONFIG`，
    逐项核对——**被注释掉的节或选项算不存在**。
 3. **有则跑、无则报告忽略**：
@@ -108,8 +110,9 @@ KLIPPERX_HW_CONFIG=~/printer.cfg cargo test -p klipperx --lib hardware_test::pla
   -- --ignored --nocapture
 ```
 
-`plan` 不碰板，只打印这份配置的能力图（每个节及其选项、`[mcu]` 的判定与结论），
-输出同样用 `HW-` 前缀，可 grep。
+`plan` 不碰板，只打印这份配置的能力图：**每个 MCU 节一行**（`HW-MCU: [mcu] serial: … — .mcu() tests run`、
+`HW-MCU: [mcu zboard] … — .mcu_named("zboard") tests run`，缺接口键的节会如实标出），
+加上每个节的选项清单（`HW-SECTION:`）。输出同样用 `HW-` 前缀，可 grep。
 
 ### 运行方式
 
@@ -146,7 +149,7 @@ git config core.hooksPath .githooks
 
 | 模块 | 覆盖 |
 |------|------|
-| `src/hardware_test.rs` | **真机测试框架本体（全部不碰板，16 测 + 1 个 `#[ignore]` 的 `plan`）**：`check` 的纯函数语义（节存在/不存在、选项存在/不存在、**被注释掉的节或选项算不存在**、‘节内注释不影响其他选项’、节与选项去重后按声明序列出全部缺项）、`Requires::mcu()` 的四种形态（无 `[mcu]` / 无接口键 / `serial` / `canbus_uuid`、以及 `[mcu zboard]` 不算主 MCU）、空 `Requires` 只要求配置文件存在、`decide` 的四分支（未设变量 / 文件不存在 / 解析失败报解析器原文 / 缺项）、`Machine` 暴露配置与按 `[mcu]` 开传输（打不开 = 真失败）；**串行锁**：`test_hardware_tests_serialise_on_the_config_file`（两条线程 + barrier，断言同时在场的持有者最多 1）、`test_the_lock_is_released_when_the_guard_is_dropped`（drop 后可重取、无 `*.lock` 旁文件）。
+| `src/hardware_test.rs` | **真机测试框架本体（全部不碰板，19 测 + 1 个 `#[ignore]` 的 `plan`）**：`check` 的纯函数语义（节存在/不存在、选项存在/不存在、**被注释掉的节或选项算不存在**、‘节内注释不影响其他选项’、节与选项去重后按声明序列出全部缺项）、`Requires::mcu()` 的四种形态（无 `[mcu]` / 无接口键 / `serial` / `canbus_uuid`、以及 `[mcu zboard]` 不算主 MCU）、空 `Requires` 只要求配置文件存在、`decide` 的四分支（未设变量 / 文件不存在 / 解析失败报解析器原文 / 缺项）、`Machine` 暴露配置与按 `[mcu]` 开传输（打不开 = 真失败）；**串行锁**：`test_hardware_tests_serialise_on_the_config_file`（两条线程 + barrier，断言同时在场的持有者最多 1）、`test_the_lock_is_released_when_the_guard_is_dropped`（drop 后可重取、无 `*.lock` 旁文件）；**多 MCU（2026-10-06）**：`mcu_named` 的三态（节不存在 / 存在但缺接口键 / 存在且有接口键）、`test_open_mcu_named_opens_the_section_it_names`（两块板各给一个不同的、不存在的设备路径，断言错误里出现的是被点名的那个）、`test_the_plan_prints_one_line_per_mcu_section`（逐 MCU 行，含缺接口键的那一行措辞）。
 
 `plan` 是 `#[ignore]` 的，用 `KLIPPERX_HW_CONFIG=… cargo test -p klipperx --lib hardware_test::plan -- --ignored --nocapture` 运行，只打印配置的能力图（`HW-SECTIONS` / 每节 `HW-SECTION` / `HW-MCU` 判定），不打开端口。
 

@@ -171,6 +171,23 @@ KLIPPERX_HW_CONFIG=~/printer.cfg \
 
 框架本体与它的 16 条自测（不碰板）在 `src/hardware_test.rs`，模块 doc 里有可照抄的模板。
 
+### 现有的真机用例
+
+每条都配一个**不碰板**的声明判定单测（给它合成配置文本，断言「有该节/键=满足、注释掉/缺=不满足」）。
+
+| 用例 | 位置 | 对应 | 它会做什么 / 安全边界 |
+|---|---|---|---|
+| `test_frame_sequence_sync_against_a_real_board` | `core/klippy/mcu/mod.rs` | R1 连接与帧序 | 对同一块**不停机**的板子连两次，验接管、4 位序号回绕、重连重编号；只 identify/`get_clock`，无运动无加热 |
+| `test_firmware_reset_comes_back_three_times_on_a_real_board` | `core/klippy/mcu/mod.rs` | R2 会话恢复 | 三轮 `reset` → 重连 → identify → `get_clock`，每轮打耗时；**会真的重启固件 ×3**（别在加热/打印中跑），无运动无加热。固件字典无 `reset` 时报 `HW-IGNORED` |
+| `test_r5_single_axis_move_matches_the_firmware_step_count` | `src/stress.rs` | R5 位移对账 | 向 `[stepper_x]` 走一小段（≤10mm、≤10mm/s，常量写死）并读回 `stepper_get_position` 对账；**会动轴**，跑前请确认行程内有空间 |
+| `test_r11_short_soak_holds_a_safe_step_rate` | `src/stress.rs` | R11 短时时序 | 按**保守速率**压秒级，断言固件未 shutdown 且**无丢步**（读回步数 == 所排步数），并打印实测速率与行程 |
+
+两条 `stress.rs` 的用例复用 `--task motion` 那套 L1 machinery，并共用 `stress.rs` 已有的「`ResetRequired` → reset + 重连 + 重握手」路径
+（限 2 次重试、每次打日志与耗时）。
+
+> **跑真机套件的前提**：板子不能被真实打印主机占着（端口只有一个）。那种情况是**真失败**（打不开串口）
+> 而不是 `HW-IGNORED`——这正是框架有意的语义（配置说要跑但打不开 = 真失败）。
+
 ## 格式化与提交
 
 提交前代码要过 `cargo fmt --all`。仓库自带的 pre-commit 钩子会替你做这件事：它先格式化，再把已暂存的 `.rs` 重新入索引，最后用 `cargo fmt --all -- --check` 兜底；实在格式不了（语法错误之类）就中止提交。

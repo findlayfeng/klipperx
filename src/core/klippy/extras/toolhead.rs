@@ -3751,6 +3751,15 @@ fn cmd_set_kinematic_position(
     let Some(connected) = guard.as_mut() else {
         return Err(CommandError::new("Printer is not ready"));
     };
+    // Upstream primes the print time before reading the position
+    // (`force_move.py:119: toolhead.get_last_move_time()`): the flush leaves the
+    // toolhead in "NeedPrime", so the reference point this command re-anchors
+    // and the floor the first move after it applies (`_calc_print_time`, see
+    // `motion/toolhead.rs::calc_print_time`) are read against the same live
+    // estimate. Without it the reference is whatever `print_time` the connect
+    // setup left behind while the first move floors at "now plus a buffer",
+    // leaking the setup wall clock into the elapsed print time.
+    connected.toolhead.get_last_move_time();
     let current = connected.toolhead.commanded_pos();
     let mut newpos = current;
     for (axis, name) in [(X_AXIS, "X"), (Y_AXIS, "Y"), (Z_AXIS, "Z")] {

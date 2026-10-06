@@ -47,7 +47,7 @@ use crate::core::klippy::gcode::{
     CommandError, CommandHandler, GCodeDispatch, GcodeCommand, GCODE_OBJECT,
 };
 use crate::core::klippy::load::section;
-use crate::core::klippy::mcu::McuObject;
+use crate::core::klippy::mcu::{McuError, McuObject};
 use crate::core::klippy::printer::{ConnectFuture, Printer, PrinterObject};
 
 // Loaded after the buses and heaters (order 30) with the other devices.
@@ -214,6 +214,31 @@ impl LoadSensor {
             Self::Hx71x(sensor) => sensor.lookup_sensor_error(error_code),
             Self::Ads1220(sensor) => sensor.lookup_sensor_error(error_code),
             Self::Ads131M0x(sensor) => sensor.lookup_sensor_error(error_code),
+        }
+    }
+
+    /// The chip's object id on its MCU, reserved when the chip was built
+    /// (`self.sensor.oid`, the `create_oid` each sensor's `__init__` runs).
+    pub fn oid(&self) -> u8 {
+        match self {
+            Self::Hx71x(sensor) => sensor.oid(),
+            Self::Ads1220(sensor) => sensor.oid(),
+            Self::Ads131M0x(sensor) => sensor.oid(),
+        }
+    }
+
+    /// Queue the chip's `*_attach_trigger_analog` init command, so this cell's
+    /// samples reach the trigger object `trigger_analog_oid`
+    /// (`setup_trigger_analog` — upstream calls it from the trigger analog's
+    /// build, `trigger_analog.py:300-301`).
+    ///
+    /// # Errors
+    /// [`McuError::Config`] if the configuration is already built.
+    pub fn setup_trigger_analog(&self, trigger_analog_oid: u8) -> Result<(), McuError> {
+        match self {
+            Self::Hx71x(sensor) => sensor.setup_trigger_analog(trigger_analog_oid),
+            Self::Ads1220(sensor) => sensor.setup_trigger_analog(trigger_analog_oid),
+            Self::Ads131M0x(sensor) => sensor.setup_trigger_analog(trigger_analog_oid),
         }
     }
 

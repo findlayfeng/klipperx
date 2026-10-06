@@ -13,6 +13,8 @@
 //! | [`ProbeParameters`] (`LoadCellParameterHelper`) | `LoadCellParameterHelper` |
 //! | the continuous-tare filter design | `ContinuousTareFilterHelper` / `ContinuousTareFilter` |
 //! | the trigger analog + SOS filter | `MCU_trigger_analog` / `MCU_SosFilter` |
+//! | the sensor's `*_attach_trigger_analog` init command | `MCU_trigger_analog._build_config` |
+//! | [`LoadCellProbeChip`] (`probe:z_virtual_endstop`) | `probe.HomingViaProbeHelper` |
 //! | the `probe` object | `LoadCellPrinterProbe` |
 //!
 //! The cell itself (chips, calibration, `LOAD_CELL_*`, `load_cell/dump_force`)
@@ -35,17 +37,18 @@
 //!
 //! * the `load_cell_probe/dump_taps` mux endpoint (`tap` events are not
 //!   broadcast).
-//! * the `probe:z_virtual_endstop` chip (`probe.HomingViaProbeHelper`): a
-//!   config that homes via the load cell has no virtual endstop pin.
 //! * `ContinuousTareFilterHelper.update_from_command`: a `PROBE`/`G28` that
 //!   overrides the drift/buzz/notch options at the command line is not read
 //!   (the corpus passes none).
-//! * the sensors' `setup_trigger_analog` attach. `LoadCellProbingMove`'s
-//!   `LookupZSteppers` *is* wired: the Z rail's steppers register with the
-//!   trigger analog's dispatch on `klippy:mcu_identify`, so a real MCU gets a
-//!   `stepper_stop_on_trigger` for each and the Z stops that way (the fake
-//!   firmware fires on the move's first step regardless).
 //! * `LOAD_CELL_TEST_TAP`.
+//!
+//! The wiring that makes a real board's `PROBE` work is in place: the sensor
+//! is attached to the trigger analog at load (its `*_attach_trigger_analog`
+//! init command carries the trigger's oid), and `LoadCellProbingMove`'s
+//! `LookupZSteppers` registers the Z rail's steppers with the trigger analog's
+//! dispatch on `klippy:mcu_identify`, so a real MCU gets a
+//! `stepper_stop_on_trigger` for each and the Z stops that way (the fake
+//! firmware fires on the move's first step regardless).
 //!
 //! [`lookup_probe_session`]: crate::core::klippy::extras::probe
 
@@ -59,10 +62,11 @@ use crate::core::klippy::config::{ConfigError, ConfigWrapper};
 use crate::core::klippy::event::KlippyEvent;
 use crate::core::klippy::extras::load_cell::{LoadCell, LoadCellSampleCollector};
 use crate::core::klippy::extras::probe::{
-    calc_probe_z_average, ProbeOffsets, ProbeParams, ProbeSession, PROBE_PARAMS,
+    calc_probe_z_average, check_virtual_endstop, ProbeOffsets, ProbeParams, ProbeSession,
+    PROBE_PARAMS,
 };
 use crate::core::klippy::extras::stepper::PrinterStepper;
-use crate::core::klippy::extras::toolhead::ToolHeadObject;
+use crate::core::klippy::extras::toolhead::{HomingEndstop, ToolHeadObject};
 use crate::core::klippy::extras::trigger_analog::{calc_frac_bits, to_fixed_32, DigitalFilter};
 use crate::core::klippy::gcode::{
     CommandError, CommandFuture, GCodeDispatch, GcodeCommand, GCODE_OBJECT,
@@ -70,7 +74,9 @@ use crate::core::klippy::gcode::{
 use crate::core::klippy::load::section;
 use crate::core::klippy::mathutil::{gaussian_solve, mat_mat_mul, mat_transp, Coord};
 use crate::core::klippy::mcu::{McuChip, McuTriggerAnalog, SosFilter, SosFilterDesign};
-use crate::core::klippy::pins::{PrinterPins, PINS_OBJECT};
+use crate::core::klippy::pins::{
+    DigitalOut, PinChip, PinError, PinParams, PrinterPins, PINS_OBJECT,
+};
 use crate::core::klippy::printer::{Printer, PrinterObject};
 
 section!("load_cell_probe", order = 40, load = load_config);
@@ -78,6 +84,11 @@ section!("load_cell_probe", order = 40, load = load_config);
 /// The object the probe is looked up under (upstream's
 /// `printer.add_object('probe', self)`).
 const PROBE_OBJECT: &str = "probe";
+
+/// The pin chip the probe's endstop answers under (`probe.py`'s
+/// `pins.register_chip('probe', self)`), what
+/// `endstop_pin: probe:z_virtual_endstop` names.
+const PROBE_CHIP: &str = "probe";
 
 /// The toolhead object, as the loader registers `[printer]`.
 const TOOLHEAD_OBJECT: &str = "toolhead";
@@ -563,6 +574,38 @@ fn register_z_steppers(printer: &Weak<Printer>, trigger_analog: &Arc<McuTriggerA
     }
 }
 
+/// Upstream's `probe.HomingViaProbeHelper` for the load cell: the `probe` pin
+/// chip whose `z_virtual_endstop` resolves to the probe's `trigger_analog`
+/// object, with the probe's Z offset standing in as `get_position_endstop`.
+///
+/// This is what makes `[stepper_z] endstop_pin: probe:z_virtual_endstop`
+/// resolvable and what the rail takes its `position_endstop` from
+/// (`load_cell_probe.py:698`).
+pub struct LoadCellProbeChip {
+    /// The trigger the rail homes through.
+    endstop: Arc<McuTriggerAnalog>,
+    /// What a `probe:z_virtual_endstop` rail uses as `position_endstop`
+    /// (`HomingViaProbeHelper(config, self.get_offsets()[2])`).
+    position: f64,
+}
+
+impl PinChip for LoadCellProbeChip {
+    fn setup_digital_out(&self, _params: &PinParams) -> Result<Arc<dyn DigitalOut>, PinError> {
+        Err(PinError::Unsupported("digital_out".to_string()))
+    }
+
+    fn setup_endstop_dyn(&self, params: &PinParams) -> Result<Arc<dyn HomingEndstop>, PinError> {
+        check_virtual_endstop(params)?;
+        let endstop: Arc<dyn HomingEndstop> = self.endstop.clone();
+        Ok(endstop)
+    }
+
+    fn virtual_endstop_position(&self, params: &PinParams) -> Option<f64> {
+        check_virtual_endstop(params).ok()?;
+        Some(self.position)
+    }
+}
+
 /// One configured `[load_cell_probe]` (`load_cell_probe.LoadCellPrinterProbe`).
 pub struct LoadCellProbe {
     /// The section's identifier, for logging.
@@ -645,6 +688,30 @@ impl LoadCellProbe {
             )
             .map_err(|err| ConfigError::new(err.to_string()))?,
         );
+
+        // `trigger_analog.py:300-301`: the trigger's build hands its own oid to
+        // the sensor, whose `*_attach_trigger_analog` init command routes the
+        // chip's samples into the filter. Without it the firmware never feeds
+        // the trigger and every probing move ends in a monitor timeout.
+        // Emitted here rather than from a build callback: the oid exists as
+        // soon as the trigger analog is built, and an init command only rides
+        // the next connect.
+        sensor
+            .setup_trigger_analog(trigger_analog.oid())
+            .map_err(|err| ConfigError::new(err.to_string()))?;
+
+        // `probe.HomingViaProbeHelper(config, self.get_offsets()[2])`: upstream
+        // registers the chip while the section loads, which is what makes
+        // `endstop_pin: probe:z_virtual_endstop` resolvable for the Z rail
+        // (`[stepper_z]` loads after this section).
+        pins.register_chip(
+            PROBE_CHIP,
+            Arc::new(LoadCellProbeChip {
+                endstop: Arc::clone(&trigger_analog),
+                position: offsets.z,
+            }),
+        )
+        .map_err(|err| ConfigError::new(format!("{identifier}: {err}")))?;
 
         // `probe.LookupZSteppers(config, dispatch.add_stepper)`: the trigger
         // analog is built here, but the toolhead (and so the Z rail's steppers)
@@ -1566,6 +1633,9 @@ mod tests {
         printer: Arc<Printer>,
         /// Every payload the wire was sent, oldest first.
         sent: Arc<Mutex<Vec<Vec<u8>>>>,
+        /// The built configuration's init commands, decoded to `(name, args)`
+        /// in send order (a sensor's `*_attach_trigger_analog` rides here).
+        init: Vec<(String, Vec<ArgValue>)>,
         mcu: Arc<Mcu>,
         /// Bound for the test's whole life, the failed-assertion path included.
         _session: SessionGuard,
@@ -1581,6 +1651,25 @@ mod tests {
     }
 
     fn z_registration_machine() -> Option<ZMachine> {
+        built_machine(
+            "[mcu]\nserial: /dev/null\n\
+             [stepper_x]\nstep_pin: PA0\ndir_pin: PA1\nrotation_distance: 40\nmicrosteps: 16\nposition_max: 200\n\
+             [stepper_y]\nstep_pin: PA2\ndir_pin: PA3\nrotation_distance: 40\nmicrosteps: 16\nposition_max: 200\n\
+             [stepper_z]\nstep_pin: PA4\ndir_pin: PA5\nrotation_distance: 8\nmicrosteps: 16\nposition_max: 200\n\
+             [stepper_z1]\nstep_pin: PA6\ndir_pin: PA7\nrotation_distance: 8\nmicrosteps: 16\n\
+             [printer]\nkinematics: cartesian\nmax_velocity: 300\nmax_accel: 3000\nmax_z_velocity: 5\nmax_z_accel: 100\n\
+             [load_cell_probe]\nz_offset: 0\nsensor_type: ads1220\nspeed: 10.0\n\
+             cs_pin: PJ2\ndata_ready_pin: PJ3\ncounts_per_gram: 100\nreference_tare_counts: 1000\n\
+             drift_filter_cutoff_frequency: 0.8\nbuzz_filter_cutoff_frequency: 100.0\n\
+             notch_filter_frequencies: 50, 60\n",
+        )
+    }
+
+    /// Load `text` and build its `[mcu]` configuration by hand, without
+    /// opening a port: the shape a test needs to see what the build put on the
+    /// init list. `None` when the `atmega2560` dictionary was not built
+    /// (`KLIPPERX_ARCHES`).
+    fn built_machine(text: &str) -> Option<ZMachine> {
         // `load_cell.test` runs on the atmega2560 dictionary, so it carries
         // every command and pin this shape needs; without it there is nothing
         // to build against.
@@ -1588,21 +1677,11 @@ mod tests {
         if !dict.is_file() {
             return None;
         }
-        let text = "[mcu]\nserial: /dev/null\n\
-                    [stepper_x]\nstep_pin: PA0\ndir_pin: PA1\nrotation_distance: 40\nmicrosteps: 16\nposition_max: 200\n\
-                    [stepper_y]\nstep_pin: PA2\ndir_pin: PA3\nrotation_distance: 40\nmicrosteps: 16\nposition_max: 200\n\
-                    [stepper_z]\nstep_pin: PA4\ndir_pin: PA5\nrotation_distance: 8\nmicrosteps: 16\nposition_max: 200\n\
-                    [stepper_z1]\nstep_pin: PA6\ndir_pin: PA7\nrotation_distance: 8\nmicrosteps: 16\n\
-                    [printer]\nkinematics: cartesian\nmax_velocity: 300\nmax_accel: 3000\nmax_z_velocity: 5\nmax_z_accel: 100\n\
-                    [load_cell_probe]\nz_offset: 0\nsensor_type: ads1220\nspeed: 10.0\n\
-                    cs_pin: PJ2\ndata_ready_pin: PJ3\ncounts_per_gram: 100\nreference_tare_counts: 1000\n\
-                    drift_filter_cutoff_frequency: 0.8\nbuzz_filter_cutoff_frequency: 100.0\n\
-                    notch_filter_frequencies: 50, 60\n";
-        let (config, _) = Config::from_text(text).expect("the Z registration config parses");
+        let (config, _) = Config::from_text(text).expect("the config parses");
         let printer = Arc::new(Printer::new(ManualReactor::shared()));
         printer
             .load_config(&config)
-            .expect("the Z registration config loads");
+            .unwrap_or_else(|err| panic!("the config loads: {err}\n{text}"));
 
         let pins = printer
             .lookup_object_as::<PrinterPins>(PINS_OBJECT)
@@ -1628,13 +1707,37 @@ mod tests {
         chip.set_clock(clock, 0.0);
         // The config callbacks `McuObject::connect` runs: this is what hands
         // the steppers their oids, so arming can name them on the wire.
-        chip.config().build(&mcu).expect("the config builds");
+        let built = chip.config().build(&mcu).expect("the config builds");
+        let init = decoded(&mcu, &built.init);
         Some(ZMachine {
             printer,
             sent,
+            init,
             mcu,
             _session: session,
         })
+    }
+
+    /// Decode an encoded payload list into `(name, args)`.
+    fn decoded(
+        mcu: &Mcu,
+        payloads: &[crate::core::klippy::Payload],
+    ) -> Vec<(String, Vec<ArgValue>)> {
+        let mut parser = Parser::new();
+        mcu.dictionary()
+            .expect("the test installs a dictionary")
+            .install(&mut parser)
+            .expect("the dictionary installs into the parser");
+        payloads
+            .iter()
+            .map(|payload| {
+                let frame = crate::core::klippy::frame::Frame::new(0, payload.payload().to_vec());
+                let decoded = parser
+                    .decode(frame.into())
+                    .expect("the built command decodes");
+                (decoded[0].0.name.clone(), decoded[0].1.clone())
+            })
+            .collect()
     }
 
     /// The oid the config assigned to the stepper registered under `name`.
@@ -1740,6 +1843,205 @@ mod tests {
             stop_on_trigger(&machine.sent, &machine.mcu),
             vec![(z_oid, trsync_oid), (z1_oid, trsync_oid)],
             "each Z motor stops on the probe's own trsync"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // The sensor's attach to the trigger analog (`trigger_analog.py:300`)
+    // ------------------------------------------------------------------
+
+    /// The cell's sensors as the corpus `test/klippy/load_cell.cfg` configures
+    /// them, each with the attach command its chip queues for
+    /// `setup_trigger_analog`.
+    const SENSORS: [(&str, &[(&str, &str)], &str); 3] = [
+        (
+            "ads1220",
+            &[("cs_pin", "PJ2"), ("data_ready_pin", "PJ3")],
+            "ads1220_attach_trigger_analog",
+        ),
+        (
+            "ads131m02",
+            &[
+                ("cs_pin", "PB5"),
+                ("data_ready_pin", "PB6"),
+                ("clock_freq", "8192000"),
+            ],
+            "ads131m0x_attach_trigger_analog",
+        ),
+        (
+            "hx711",
+            &[("sclk_pin", "PA3"), ("dout_pin", "PA5")],
+            "hx71x_attach_trigger_analog",
+        ),
+    ];
+
+    /// The `[load_cell_probe]` section for one sensor type: the corpus probe
+    /// options (with a `z_offset` the virtual-endstop tests can tell apart
+    /// from zero) plus the chip's own.
+    ///
+    /// The continuous-tare options are left out on purpose: those cutoffs are
+    /// bounded by the sensor's own rate, and the corpus only configures them
+    /// at the ads1220's rate — the chip attach these tests are about does not
+    /// run through the filter design.
+    fn probe_section(sensor_type: &str, options: &[(&str, &str)]) -> String {
+        let mut text = format!(
+            "[load_cell_probe]\nz_offset: 2.5\nsensor_type: {sensor_type}\nspeed: 10.0\n\
+             counts_per_gram: 100\nreference_tare_counts: 1000\n"
+        );
+        for (key, value) in options {
+            text.push_str(&format!("{key}: {value}\n"));
+        }
+        text
+    }
+
+    /// The sensor's samples reach the trigger analog: building the config
+    /// queues the chip's `*_attach_trigger_analog` init command, binding the
+    /// sensor's oid to the trigger analog's (`trigger_analog.py:300-301`).
+    ///
+    /// Without it the firmware never feeds the filter from this chip's
+    /// samples, so a `PROBE` on a real board ends in a monitor timeout however
+    /// well the trigger is armed.
+    #[tokio::test]
+    async fn the_config_build_attaches_each_sensor_to_the_trigger_analog() {
+        for (sensor_type, options, command) in SENSORS {
+            let Some(machine) = built_machine(&format!(
+                "[mcu]\nserial: /dev/null\n{}",
+                probe_section(sensor_type, options)
+            )) else {
+                return;
+            };
+            let probe = machine.probe();
+            let sensor_oid = probe.load_cell().sensor().oid();
+            let trigger_oid = probe.trigger_analog().oid();
+            let attaches: Vec<_> = machine
+                .init
+                .iter()
+                .filter(|(name, _)| name == command)
+                .collect();
+            assert_eq!(
+                attaches.len(),
+                1,
+                "{sensor_type}: exactly one {command} in {:?}",
+                machine.init
+            );
+            assert_eq!(
+                attaches[0].1,
+                vec![ArgValue::UInt8(sensor_oid), ArgValue::UInt8(trigger_oid)],
+                "{sensor_type}: the sensor's oid, then the trigger analog's"
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // The `probe` pin chip (`probe.HomingViaProbeHelper`)
+    // ------------------------------------------------------------------
+
+    /// The shape `endstop_pin: probe:z_virtual_endstop` needs: the Z rail homes
+    /// through the probe chip and names no `position_endstop` of its own.
+    fn virtual_endstop_config(probe_options: &str) -> String {
+        format!(
+            "[mcu]\nserial: /dev/null\n\
+             [stepper_x]\nstep_pin: PA0\ndir_pin: PA1\nrotation_distance: 40\nmicrosteps: 16\nposition_max: 200\n\
+             [stepper_y]\nstep_pin: PA2\ndir_pin: PA3\nrotation_distance: 40\nmicrosteps: 16\nposition_max: 200\n\
+             [stepper_z]\nstep_pin: PA4\ndir_pin: PA5\nrotation_distance: 8\nmicrosteps: 16\n\
+             position_max: 200\nendstop_pin: probe:z_virtual_endstop\n\
+             [printer]\nkinematics: cartesian\nmax_velocity: 300\nmax_accel: 3000\n\
+             max_z_velocity: 5\nmax_z_accel: 100\n{probe_options}"
+        )
+    }
+
+    /// Load `text` without connecting anything: what the chip tests need is the
+    /// load itself (the probe chip registers there, and `[stepper_z]` resolves
+    /// its endstop through it).
+    fn loaded_machine(text: &str) -> Result<Arc<Printer>, ConfigError> {
+        let (config, _) = Config::from_text(text).expect("the config parses");
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        printer.load_config(&config)?;
+        Ok(printer)
+    }
+
+    /// `probe.HomingViaProbeHelper`: the chip makes
+    /// `endstop_pin: probe:z_virtual_endstop` resolvable, and the rail homing
+    /// through it takes the probe's Z offset as its `position_endstop`
+    /// (`load_cell_probe.py:698`).
+    #[test]
+    fn a_probe_z_virtual_endstop_rail_resolves_to_the_probe_chip() {
+        let text = virtual_endstop_config(&probe_section("ads1220", SENSORS[0].1));
+        let printer = loaded_machine(&text).expect("the config loads");
+
+        let probe = printer
+            .lookup_object_as::<LoadCellProbe>(PROBE_OBJECT)
+            .expect("the section registers the probe object");
+        assert_eq!(probe.offsets().z, 2.5);
+
+        let stepper = printer
+            .lookup_object_as::<PrinterStepper>("stepper_z")
+            .expect("stepper_z is registered");
+        let endstop = stepper
+            .endstop()
+            .expect("stepper_z homes through the probe chip");
+        let pins = printer
+            .lookup_object_as::<PrinterPins>(PINS_OBJECT)
+            .expect("the loader registers `pins`");
+        assert_eq!(
+            pins.virtual_endstop_position(endstop),
+            Some(2.5),
+            "the rail's endstop is the probe chip's, at the probe's z_offset"
+        );
+        assert_eq!(
+            stepper.params().position_endstop,
+            2.5,
+            "a probe:z_virtual_endstop rail takes the chip's position over the section's"
+        );
+    }
+
+    /// A second `probe` chip is a config error (`pins.register_chip`), so
+    /// `[probe]` / `[probe_eddy_current]` alongside `[load_cell_probe]` is
+    /// refused rather than silently overwritten by a probe the Z rail would
+    /// then home through.
+    #[test]
+    fn a_second_probe_chip_is_a_config_error() {
+        let text = format!(
+            "[mcu]\nserial: /dev/null\n[probe]\npin: ^PF0\nz_offset: 1.0\n{}",
+            probe_section("ads1220", SENSORS[0].1)
+        );
+        let err = loaded_machine(&text)
+            .err()
+            .expect("the second `probe` chip is refused");
+        assert_eq!(
+            err.to_string(),
+            "load_cell_probe: Duplicate chip name 'probe'"
+        );
+    }
+
+    /// The chip's own refusals (`probe.py:238-243`): only `z_virtual_endstop`
+    /// is an endstop, and it takes no invert or pull-up.
+    #[test]
+    fn the_probe_chip_refuses_any_other_pin_name() {
+        let text = format!(
+            "[mcu]\nserial: /dev/null\n{}",
+            probe_section("ads1220", SENSORS[0].1)
+        );
+        let printer = loaded_machine(&text).expect("the config loads");
+        let pins = printer
+            .lookup_object_as::<PrinterPins>(PINS_OBJECT)
+            .expect("the loader registers `pins`");
+
+        let err = pins
+            .setup_endstop_dyn("probe:z", None)
+            .err()
+            .expect("only `z_virtual_endstop` is an endstop");
+        assert_eq!(
+            err.to_string(),
+            "Probe virtual endstop only useful as endstop pin"
+        );
+        let err = pins
+            .setup_endstop_dyn("!probe:z_virtual_endstop", None)
+            .err()
+            .expect("the virtual endstop takes no invert");
+        assert_eq!(
+            err.to_string(),
+            "Can not pullup/invert probe virtual endstop"
         );
     }
 }

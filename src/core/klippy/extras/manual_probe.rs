@@ -11,16 +11,13 @@
 //!   Upstream asks the kinematics (`kin.calc_position(kin_spos)`) so linear
 //!   deltas can differ from the commanded tower positions; that matters once
 //!   `delta` lands (T5), and `position()` is the same number for cartesian.
-//! - `Z_OFFSET_APPLY_ENDSTOP` / `Z_OFFSET_APPLY_DELTA_ENDSTOPS` are not
-//!   implemented yet: they adjust `position_endstop` from the `gcode_move`
-//!   Z offset, which needs the delta tower sections (T5) and belongs with the
-//!   endstop-calibration group.
 
 use std::sync::{Arc, Mutex, Weak};
 
 use serde_json::{json, Value};
 
-use crate::core::klippy::config::{ConfigError, ConfigWrapper};
+use crate::core::klippy::config::{ConfigError, ConfigWrapper, PrinterConfig};
+use crate::core::klippy::extras::gcode_move::{GCodeMove, GCODE_MOVE_OBJECT};
 use crate::core::klippy::extras::toolhead::ToolHeadObject;
 use crate::core::klippy::gcode::{
     CommandError, CommandHandler, GCodeDispatch, GcodeCommand, GCODE_OBJECT,
@@ -53,6 +50,64 @@ const BISECT_MAX: f64 = 0.200;
 /// What a finished manual probe reports back (`finalize_callback`).
 pub(crate) type FinalizeCallback = Arc<dyn Fn(Option<Coord>) + Send + Sync>;
 
+/// The answer the Z-offset apply commands give at a zero offset
+/// (`manual_probe.py:114`, `probe.py:174`).
+const NOTHING_TO_DO: &str = "Nothing to do: Z Offset is 0";
+
+/// Upstream's `lookup_z_endstop_config` (`manual_probe.py:20-29`): `[stepper_z]`
+/// when the printer has one, else the `[carriage <name>]` whose `axis` is `z`
+/// (a `kinematics: generic_cartesian` printer describes its rails that way, and
+/// a scripted carriage falls back to its own name as the axis).
+///
+/// # Errors
+/// When a carriage's `axis` option cannot be read.
+fn lookup_z_endstop_config<'a>(
+    config: &ConfigWrapper<'a>,
+) -> Result<Option<ConfigWrapper<'a>>, ConfigError> {
+    if let Some(stepper_z) = config.sibling("stepper_z") {
+        return Ok(Some(stepper_z));
+    }
+    for carriage in config.sibling_prefix_sections("carriage ") {
+        let carriage_name = carriage
+            .identifier()
+            .rsplit(' ')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if carriage.get("axis", Some(&carriage_name))? == "z" {
+            return Ok(Some(carriage));
+        }
+    }
+    Ok(None)
+}
+
+/// The Z of `gcode_move`'s `homing_origin` — the anchor a
+/// `SET_GCODE_OFFSET Z=` left (`manual_probe.py:112`, `probe.py:172`).
+///
+/// # Errors
+/// When the printer has no `gcode_move` object.
+pub(crate) fn homing_origin_z(printer: &Arc<Printer>) -> Result<f64, CommandError> {
+    let gcode_move = printer
+        .lookup_object_as::<GCodeMove>(GCODE_MOVE_OBJECT)
+        .ok_or_else(|| CommandError::new("gcode_move is not available"))?;
+    Ok(gcode_move
+        .status()
+        .get("homing_origin")
+        .and_then(|origin| origin.as_array())
+        .and_then(|axes| axes.get(Z_AXIS))
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0))
+}
+
+/// Queue one `position_endstop` for the next `SAVE_CONFIG`
+/// (`configfile.set(section, 'position_endstop', "%.3f" % value)`).
+fn set_position_endstop(printer: &Arc<Printer>, section: &str, value: f64) {
+    if let Some(configfile) = printer.lookup_object_as::<PrinterConfig>(CONFIGFILE_OBJECT) {
+        configfile.set(section, "position_endstop", &format!("{value:.3}"));
+    }
+}
+
 /// Where `bisect_left` would insert `value` in a sorted list.
 fn bisect_left(values: &[f64], value: f64) -> usize {
     let mut lo = 0;
@@ -70,10 +125,17 @@ fn bisect_left(values: &[f64], value: f64) -> usize {
 
 /// The `[manual_probe]` section (`manual_probe.py:ManualProbe`).
 pub struct ManualProbe {
-    /// `[stepper_z] position_endstop`, when there is one: it is what
-    /// `Z_ENDSTOP_CALIBRATE` writes back, and its absence is why that command
-    /// is not registered on a printer without a Z endstop.
+    /// `[stepper_z] position_endstop` (or the Z carriage's), when there is one:
+    /// it is what `Z_ENDSTOP_CALIBRATE` writes back, and its absence is why
+    /// that command is not registered on a printer without a Z endstop.
     z_position_endstop: Option<f64>,
+    /// The section that endstop came from (`z_endstop_config_name`), what the
+    /// write-back names.
+    z_endstop_config_name: Option<String>,
+    /// The A/B/C tower endstops of a linear delta (`a/b/c_position_endstop`),
+    /// present only when all three towers declare one — `Z_OFFSET_APPLY_ENDSTOP`
+    /// shifts all three.
+    delta_position_endstops: Option<(f64, f64, f64)>,
     /// The status `get_status` reports and the helper updates.
     status: Arc<Mutex<Value>>,
 }
@@ -85,12 +147,35 @@ impl ManualProbe {
     /// When a command name is already taken.
     pub fn new(config: &ConfigWrapper, printer: &Arc<Printer>) -> Result<Self, ConfigError> {
         let identifier = config.identifier();
-        let z_position_endstop = config.sibling("stepper_z").and_then(|sibling| {
-            sibling
-                .get_optional_float("position_endstop")
-                .ok()
-                .flatten()
-        });
+        // The Z endstop and the section it is written back to
+        // (`manual_probe.py:36-43`).
+        let (z_position_endstop, z_endstop_config_name) = match lookup_z_endstop_config(config)? {
+            Some(zconfig) => (
+                zconfig.get_optional_float("position_endstop")?,
+                Some(zconfig.identifier()),
+            ),
+            None => (None, None),
+        };
+        // Endstop values for linear delta printers with vertical A,B,C towers
+        // (`manual_probe.py:44-53`): each tower's own `position_endstop`.
+        let tower_endstop = |name: &str| -> Result<Option<f64>, ConfigError> {
+            match config.sibling(name) {
+                Some(section) => section.get_optional_float("position_endstop"),
+                None => Ok(None),
+            }
+        };
+        let delta_position_endstops = match (
+            tower_endstop("stepper_a")?,
+            tower_endstop("stepper_b")?,
+            tower_endstop("stepper_c")?,
+        ) {
+            (Some(a), Some(b), Some(c)) => Some((a, b, c)),
+            _ => None,
+        };
+        let is_delta = config
+            .sibling("printer")
+            .and_then(|printer| printer.get_str("kinematics"))
+            .is_some_and(|name| name == "delta");
         let status = Arc::new(Mutex::new(reset_status()));
 
         let gcode = printer
@@ -133,7 +218,9 @@ impl ManualProbe {
         }
 
         // Z_ENDSTOP_CALIBRATE: same helper, writing `position_endstop` back.
-        if let Some(z_position_endstop) = z_position_endstop {
+        if let (Some(z_position_endstop), Some(z_endstop_config_name)) =
+            (z_position_endstop, z_endstop_config_name.clone())
+        {
             let printer = Arc::downgrade(printer);
             let status = Arc::clone(&status);
             gcode
@@ -142,6 +229,7 @@ impl ManualProbe {
                     Arc::new(move |gcmd| {
                         let printer = printer.clone();
                         let status = Arc::clone(&status);
+                        let z_endstop_config_name = z_endstop_config_name.clone();
                         Box::pin(async move {
                             let printer = printer
                                 .upgrade()
@@ -154,22 +242,16 @@ impl ManualProbe {
                                     report(
                                         &cb_printer,
                                         &format!(
-                                            "stepper_z: position_endstop: {z_pos:.3}\n\
+                                            "{z_endstop_config_name}: position_endstop: {z_pos:.3}\n\
                                              The SAVE_CONFIG command will update the printer config file\n\
                                              with the above and restart the printer."
                                         ),
                                     );
-                                    if let Some(configfile) = cb_printer
-                                        .lookup_object_as::<crate::core::klippy::config::PrinterConfig>(
-                                            CONFIGFILE_OBJECT,
-                                        )
-                                    {
-                                        configfile.set(
-                                            "stepper_z",
-                                            "position_endstop",
-                                            &format!("{z_pos:.3}"),
-                                        );
-                                    }
+                                    set_position_endstop(
+                                        &cb_printer,
+                                        &z_endstop_config_name,
+                                        z_pos,
+                                    );
                                 });
                             ManualProbeHelper::start(&printer, gcmd, callback, status)?;
                             Ok(())
@@ -182,9 +264,92 @@ impl ManualProbe {
                 .map_err(ConfigError::new)?;
         }
 
+        // Z_OFFSET_APPLY_ENDSTOP: fold the `gcode_move` Z offset into the Z
+        // endstop's `position_endstop` (`manual_probe.py:111-124`). Upstream
+        // registers this handler and then, on a delta printer, re-registers
+        // the name with the tower handler (`:74-79`) — the delta one wins.
+        // `register_command` refuses a second registration for one name, so
+        // the same outcome is an either/or here.
+        if is_delta {
+            if let Some((a_position_endstop, b_position_endstop, c_position_endstop)) =
+                delta_position_endstops
+            {
+                let printer = Arc::downgrade(printer);
+                gcode
+                    .register_command(
+                        "Z_OFFSET_APPLY_ENDSTOP",
+                        Arc::new(move |gcmd| {
+                            let printer = printer.clone();
+                            Box::pin(async move {
+                                let printer = printer
+                                    .upgrade()
+                                    .ok_or_else(|| CommandError::new("Printer is not ready"))?;
+                                let offset = homing_origin_z(&printer)?;
+                                if offset == 0.0 {
+                                    gcmd.respond_info(NOTHING_TO_DO);
+                                    return Ok(());
+                                }
+                                let new_a_calibrate = a_position_endstop - offset;
+                                let new_b_calibrate = b_position_endstop - offset;
+                                let new_c_calibrate = c_position_endstop - offset;
+                                gcmd.respond_info(&format!(
+                                    "stepper_a: position_endstop: {new_a_calibrate:.3}\n\
+                                     stepper_b: position_endstop: {new_b_calibrate:.3}\n\
+                                     stepper_c: position_endstop: {new_c_calibrate:.3}\n\
+                                     The SAVE_CONFIG command will update the printer config file\n\
+                                     with the above and restart the printer."
+                                ));
+                                set_position_endstop(&printer, "stepper_a", new_a_calibrate);
+                                set_position_endstop(&printer, "stepper_b", new_b_calibrate);
+                                set_position_endstop(&printer, "stepper_c", new_c_calibrate);
+                                Ok(())
+                            })
+                        }),
+                        Some("Adjust the z endstop_position"),
+                        false,
+                    )
+                    .map_err(ConfigError::new)?;
+            }
+        } else if let (Some(z_position_endstop), Some(z_endstop_config_name)) =
+            (z_position_endstop, z_endstop_config_name.clone())
+        {
+            let printer = Arc::downgrade(printer);
+            gcode
+                .register_command(
+                    "Z_OFFSET_APPLY_ENDSTOP",
+                    Arc::new(move |gcmd| {
+                        let printer = printer.clone();
+                        let z_endstop_config_name = z_endstop_config_name.clone();
+                        Box::pin(async move {
+                            let printer = printer
+                                .upgrade()
+                                .ok_or_else(|| CommandError::new("Printer is not ready"))?;
+                            let offset = homing_origin_z(&printer)?;
+                            if offset == 0.0 {
+                                gcmd.respond_info(NOTHING_TO_DO);
+                                return Ok(());
+                            }
+                            let new_calibrate = z_position_endstop - offset;
+                            gcmd.respond_info(&format!(
+                                "{z_endstop_config_name}: position_endstop: {new_calibrate:.3}\n\
+                                 The SAVE_CONFIG command will update the printer config file\n\
+                                 with the above and restart the printer."
+                            ));
+                            set_position_endstop(&printer, &z_endstop_config_name, new_calibrate);
+                            Ok(())
+                        })
+                    }),
+                    Some("Adjust the z endstop_position"),
+                    false,
+                )
+                .map_err(ConfigError::new)?;
+        }
+
         let _ = identifier;
         Ok(Self {
             z_position_endstop,
+            z_endstop_config_name,
+            delta_position_endstops,
             status,
         })
     }
@@ -622,6 +787,8 @@ impl std::fmt::Debug for ManualProbe {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ManualProbe")
             .field("z_position_endstop", &self.z_position_endstop)
+            .field("z_endstop_config_name", &self.z_endstop_config_name)
+            .field("delta_position_endstops", &self.delta_position_endstops)
             .finish()
     }
 }
@@ -649,6 +816,213 @@ pub fn load_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::klippy::config::{AccessTracking, Config};
+    use crate::core::klippy::event::KlippyEvent;
+    use crate::core::klippy::extras::gcode_move;
+    use crate::core::klippy::reactor::ManualReactor;
+
+    /// A printer with `gcode`, `configfile` and `gcode_move` — the objects the
+    /// Z-offset apply commands reach at run time.
+    fn machine() -> (Arc<Printer>, Arc<GCodeDispatch>, Arc<PrinterConfig>) {
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        printer
+            .add_object(
+                GCODE_OBJECT,
+                Arc::new(GCodeDispatch::new(Arc::clone(&printer))),
+            )
+            .unwrap();
+        let gcode = printer
+            .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+            .unwrap();
+        let configfile = Arc::new(PrinterConfig::new(
+            AccessTracking::shared(),
+            serde_json::Map::new(),
+        ));
+        printer
+            .add_object(
+                CONFIGFILE_OBJECT,
+                Arc::clone(&configfile) as Arc<dyn PrinterObject>,
+            )
+            .unwrap();
+        gcode_move::ensure(&printer).unwrap();
+        // The dispatcher only offers non-built-in commands once the printer is
+        // ready (`gcode.rs`, `Commands::active`).
+        printer.send_event(&KlippyEvent::KlippyReady);
+        (printer, gcode, configfile)
+    }
+
+    /// Load a `[manual_probe]` over `text`, read through the `[printer]`
+    /// wrapper the toolhead's `ensure` hands it.
+    fn load(text: &str) -> (Arc<Printer>, Arc<GCodeDispatch>, Arc<PrinterConfig>) {
+        let (printer, gcode, configfile) = machine();
+        let (config, _) = Config::from_text(text).expect("the test config parses");
+        let section = config.get_section("printer").expect("a [printer] section");
+        let wrapper = ConfigWrapper::with_config(section, AccessTracking::shared(), None, &config);
+        ManualProbe::new(&wrapper, &printer).expect("the section loads");
+        (printer, gcode, configfile)
+    }
+
+    /// Capture every line the dispatcher emits.
+    fn capture(gcode: &Arc<GCodeDispatch>) -> Arc<Mutex<Vec<String>>> {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&log);
+        gcode.register_output_handler(Arc::new(move |line: &str| {
+            sink.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(line.to_string());
+        }));
+        log
+    }
+
+    fn lines(log: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
+        log.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// The pending autosave items `SAVE_CONFIG` would write.
+    fn pending(configfile: &Arc<PrinterConfig>) -> Value {
+        configfile.get_status(0.0)["save_config_pending_items"].clone()
+    }
+
+    const CARTESIAN: &str = "[printer]\nkinematics: cartesian\n\
+                            [stepper_z]\nposition_endstop: 1.0\n";
+
+    #[test]
+    fn applying_the_endstop_at_a_zero_offset_only_reports() {
+        let (_printer, gcode, configfile) = load(CARTESIAN);
+        let log = capture(&gcode);
+
+        gcode.run_script_sync("Z_OFFSET_APPLY_ENDSTOP").unwrap();
+
+        assert_eq!(lines(&log), ["// Nothing to do: Z Offset is 0"]);
+        assert_eq!(
+            configfile.get_status(0.0)["save_config_pending"],
+            json!(false)
+        );
+    }
+
+    #[test]
+    fn applying_the_endstop_writes_the_shifted_position_endstop() {
+        let (_printer, gcode, configfile) = load(CARTESIAN);
+        let log = capture(&gcode);
+
+        gcode.run_script_sync("SET_GCODE_OFFSET Z=0.25").unwrap();
+        gcode.run_script_sync("Z_OFFSET_APPLY_ENDSTOP").unwrap();
+
+        assert_eq!(
+            lines(&log),
+            ["// stepper_z: position_endstop: 0.750\n\
+              // The SAVE_CONFIG command will update the printer config file\n\
+              // with the above and restart the printer."]
+        );
+        assert_eq!(
+            pending(&configfile)["stepper_z"]["position_endstop"],
+            json!("0.750")
+        );
+    }
+
+    #[test]
+    fn a_carriage_described_z_endstop_is_the_one_written_back() {
+        // A `kinematics: generic_cartesian` printer has no `[stepper_z]`: its Z
+        // endstop lives on the `[carriage <name>]` whose `axis` is `z`
+        // (`manual_probe.py:lookup_z_endstop_config`). The `[carriage x]` in
+        // front of it is skipped.
+        let (_printer, gcode, configfile) = load(
+            "[printer]\nkinematics: generic_cartesian\n\
+             [carriage x]\naxis: x\nposition_endstop: 9.0\n\
+             [carriage z]\naxis: z\nposition_endstop: 5.0\n",
+        );
+        let log = capture(&gcode);
+
+        gcode.run_script_sync("SET_GCODE_OFFSET Z=1.0").unwrap();
+        gcode.run_script_sync("Z_OFFSET_APPLY_ENDSTOP").unwrap();
+
+        assert_eq!(
+            lines(&log),
+            ["// carriage z: position_endstop: 4.000\n\
+              // The SAVE_CONFIG command will update the printer config file\n\
+              // with the above and restart the printer."]
+        );
+        assert_eq!(
+            pending(&configfile)["carriage z"]["position_endstop"],
+            json!("4.000")
+        );
+    }
+
+    #[test]
+    fn the_delta_variant_takes_over_the_same_command() {
+        let (_printer, gcode, configfile) = load(
+            "[printer]\nkinematics: delta\n\
+             [stepper_a]\nposition_endstop: 1.0\n\
+             [stepper_b]\nposition_endstop: 2.0\n\
+             [stepper_c]\nposition_endstop: 3.0\n",
+        );
+        let log = capture(&gcode);
+
+        gcode.run_script_sync("SET_GCODE_OFFSET Z=0.5").unwrap();
+        gcode.run_script_sync("Z_OFFSET_APPLY_ENDSTOP").unwrap();
+
+        assert_eq!(
+            lines(&log),
+            ["// stepper_a: position_endstop: 0.500\n\
+              // stepper_b: position_endstop: 1.500\n\
+              // stepper_c: position_endstop: 2.500\n\
+              // The SAVE_CONFIG command will update the printer config file\n\
+              // with the above and restart the printer."]
+        );
+        let pending = pending(&configfile);
+        assert_eq!(pending["stepper_a"]["position_endstop"], json!("0.500"));
+        assert_eq!(pending["stepper_b"]["position_endstop"], json!("1.500"));
+        assert_eq!(pending["stepper_c"]["position_endstop"], json!("2.500"));
+    }
+
+    #[test]
+    fn the_delta_variant_also_reports_at_a_zero_offset() {
+        let (_printer, gcode, configfile) = load(
+            "[printer]\nkinematics: delta\n\
+             [stepper_a]\nposition_endstop: 1.0\n\
+             [stepper_b]\nposition_endstop: 2.0\n\
+             [stepper_c]\nposition_endstop: 3.0\n",
+        );
+        let log = capture(&gcode);
+
+        gcode.run_script_sync("Z_OFFSET_APPLY_ENDSTOP").unwrap();
+
+        assert_eq!(lines(&log), ["// Nothing to do: Z Offset is 0"]);
+        assert_eq!(
+            configfile.get_status(0.0)["save_config_pending"],
+            json!(false)
+        );
+    }
+
+    #[test]
+    fn the_command_needs_an_endstop_to_write_back_to() {
+        // No `[stepper_z]`, no Z carriage: there is nothing to shift, so the
+        // command is not registered. The A/B/C towers alone are not enough on
+        // a cartesian printer.
+        let (_printer, gcode, _configfile) = load(
+            "[printer]\nkinematics: cartesian\n\
+             [stepper_a]\nposition_endstop: 1.0\n\
+             [stepper_b]\nposition_endstop: 2.0\n\
+             [stepper_c]\nposition_endstop: 3.0\n",
+        );
+
+        assert!(!gcode.command_exists("Z_OFFSET_APPLY_ENDSTOP"));
+        assert!(!gcode.command_exists("Z_ENDSTOP_CALIBRATE"));
+    }
+
+    #[test]
+    fn a_delta_without_tower_endstops_registers_no_apply_command() {
+        // The delta handler shifts all three tower endstops; a tower without
+        // one of its own leaves it unregistered rather than crashing on the
+        // missing value (upstream registers it and fails on `None`).
+        let (_printer, gcode, _configfile) = load(
+            "[printer]\nkinematics: delta\n\
+             [stepper_a]\nposition_endstop: 1.0\n\
+             [stepper_b]\nposition_endstop: 2.0\n",
+        );
+
+        assert!(!gcode.command_exists("Z_OFFSET_APPLY_ENDSTOP"));
+    }
 
     #[test]
     fn bisect_left_finds_the_insertion_point() {

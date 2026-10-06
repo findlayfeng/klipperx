@@ -3,13 +3,16 @@
 //! Upstream `klippy/extras/probe.py`. This module lands the `[probe]` section,
 //! its option set, the `probe` virtual pin chip, the probe session (sampling
 //! with tolerance retries) and `QUERY_PROBE` / `PROBE` / `PROBE_ACCURACY` /
-//! `PROBE_CALIBRATE` (the last one hands over to `manual_probe` and writes
-//! `z_offset` back through `configfile.set()`).
+//! `PROBE_CALIBRATE` / `Z_OFFSET_APPLY_PROBE`. `PROBE_CALIBRATE` hands over to
+//! `manual_probe` and writes `z_offset` back through `configfile.set()`;
+//! `Z_OFFSET_APPLY_PROBE` folds the `gcode_move` Z offset into the same option
+//! (the command is registered only by this module and, for a `[probe]`-less
+//! eddy printer, by `probe_eddy_current.rs` — the two sections cannot coexist,
+//! both claim the `probe` object).
 //!
 //! What is **not** here yet (tracked in `TODO.md` H9):
 //!
-//! - `Z_OFFSET_APPLY_PROBE` (the same command exists for `probe_eddy_current`,
-//!   `probe_eddy_current.rs`), and the *stow* half of upstream's wrapper:
+//! - The *stow* half of upstream's wrapper:
 //!   `ProbeEndstopWrapper` drives `activate_gcode` / `deactivate_gcode` around
 //!   each sample and keeps the `OFF`/`FIRST`/`ON` multi-probe state
 //!   (`probe.py:545-605`). Here those two options are read and recorded but not
@@ -30,7 +33,7 @@ use crate::core::klippy::config::{ConfigError, ConfigWrapper, PrinterConfig};
 use crate::core::klippy::event::printer_bus::ProbeResultsHandle;
 use crate::core::klippy::event::KlippyEvent;
 use crate::core::klippy::extras::manual_probe::{
-    FinalizeCallback, ManualProbe, MANUAL_PROBE_OBJECT,
+    homing_origin_z, FinalizeCallback, ManualProbe, MANUAL_PROBE_OBJECT,
 };
 use crate::core::klippy::extras::probe_eddy_current;
 use crate::core::klippy::extras::toolhead::{HomingEndstop, ToolHeadObject};
@@ -1100,6 +1103,48 @@ pub(crate) fn register_commands(
             .map_err(ConfigError::new)?;
     }
 
+    // Z_OFFSET_APPLY_PROBE: fold the `gcode_move` Z offset into `z_offset`
+    // (`probe.py:cmd_Z_OFFSET_APPLY_PROBE`). The offset is the anchor a
+    // previous `SET_GCODE_OFFSET Z=` left; subtracting it moves the same
+    // distance into the probe's own trigger offset.
+    {
+        let name = name.clone();
+        let printer_weak = Arc::downgrade(printer);
+        gcode
+            .register_command(
+                "Z_OFFSET_APPLY_PROBE",
+                Arc::new(move |gcmd| {
+                    let name = name.clone();
+                    let printer_weak = printer_weak.clone();
+                    Box::pin(async move {
+                        let printer = printer_weak
+                            .upgrade()
+                            .ok_or_else(|| CommandError::new("Printer is not ready"))?;
+                        let offset = homing_origin_z(&printer)?;
+                        if offset == 0.0 {
+                            gcmd.respond_info("Nothing to do: Z Offset is 0");
+                            return Ok(());
+                        }
+                        let new_calibrate = offsets.z - offset;
+                        gcmd.respond_info(&format!(
+                            "{name}: z_offset: {new_calibrate:.3}\n\
+                             The SAVE_CONFIG command will update the printer config file\n\
+                             with the above and restart the printer."
+                        ));
+                        if let Some(configfile) =
+                            printer.lookup_object_as::<PrinterConfig>(CONFIGFILE_OBJECT)
+                        {
+                            configfile.set(&name, "z_offset", &format!("{new_calibrate:.3}"));
+                        }
+                        Ok(())
+                    })
+                }),
+                Some("Adjust the probe's z_offset"),
+                false,
+            )
+            .map_err(ConfigError::new)?;
+    }
+
     Ok(())
 }
 
@@ -1130,7 +1175,10 @@ pub fn load_config(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::klippy::config::{ConfigSection, ConfigValue};
+    use crate::core::klippy::config::{AccessTracking, ConfigSection, ConfigValue};
+    use crate::core::klippy::event::KlippyEvent;
+    use crate::core::klippy::extras::gcode_move;
+    use crate::core::klippy::reactor::ManualReactor;
 
     /// A section with the given options, as the parser would build it.
     fn section(options: &[(&str, &str)]) -> ConfigSection {
@@ -1289,6 +1337,158 @@ mod tests {
         let median = calc_probe_z_average(&positions, "median");
 
         assert_eq!(median.z(), 4.0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Z_OFFSET_APPLY_PROBE (upstream probe.py:cmd_Z_OFFSET_APPLY_PROBE)
+    // -----------------------------------------------------------------------
+
+    /// A `[probe]`'s commands over a machine carrying `gcode`, `configfile`
+    /// and `gcode_move` — the objects `Z_OFFSET_APPLY_PROBE` reaches at run
+    /// time. The probe itself is assembled from its parts the way
+    /// `PrinterProbe::new` does once the pin layer built the endstop.
+    fn probe_machine(
+        identifier: &str,
+        options: &[(&str, &str)],
+    ) -> (Arc<Printer>, Arc<GCodeDispatch>, Arc<PrinterConfig>) {
+        use crate::core::klippy::mcu::{ConfigBuilder, McuChip};
+
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        printer
+            .add_object(
+                GCODE_OBJECT,
+                Arc::new(GCodeDispatch::new(Arc::clone(&printer))),
+            )
+            .unwrap();
+        let gcode = printer
+            .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+            .unwrap();
+        let configfile = Arc::new(PrinterConfig::new(
+            AccessTracking::shared(),
+            serde_json::Map::new(),
+        ));
+        printer
+            .add_object(
+                CONFIGFILE_OBJECT,
+                Arc::clone(&configfile) as Arc<dyn PrinterObject>,
+            )
+            .unwrap();
+        gcode_move::ensure(&printer).unwrap();
+        // The dispatcher only offers non-built-in commands once the printer is
+        // ready (`gcode.rs`, `Commands::active`).
+        printer.send_event(&KlippyEvent::KlippyReady);
+
+        let probing = section(options);
+        let config = ConfigWrapper::untracked(&probing);
+        let probe_options = ProbeOptions::read(&config).unwrap();
+        let chip = McuChip::new(
+            "mcu".to_string(),
+            Arc::new(ConfigBuilder::new()),
+            Arc::new(PrinterPins::new()),
+        );
+        let params = PinParams {
+            chip_name: "mcu".to_string(),
+            pin: "PA0".to_string(),
+            invert: false,
+            pullup: 0,
+            share_type: None,
+        };
+        let endstop = Arc::new(McuEndstop::new(chip, &params).unwrap());
+        let session = Arc::new(
+            ProbeSessionHelper::new(
+                &config,
+                &printer,
+                Arc::clone(&endstop) as Arc<dyn HomingEndstop>,
+                Arc::clone(&endstop),
+                &probe_options,
+                None,
+            )
+            .unwrap(),
+        );
+        let state = Arc::new(ProbeCommandState::default());
+        let offsets = ProbeOffsets {
+            x: probe_options.x_offset,
+            y: probe_options.y_offset,
+            z: probe_options.z_offset,
+        };
+        register_commands(&printer, identifier, &session, &state, offsets)
+            .expect("the commands register");
+        (printer, gcode, configfile)
+    }
+
+    /// Capture every line the dispatcher emits.
+    fn capture(gcode: &Arc<GCodeDispatch>) -> Arc<Mutex<Vec<String>>> {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&log);
+        gcode.register_output_handler(Arc::new(move |line: &str| {
+            sink.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(line.to_string());
+        }));
+        log
+    }
+
+    fn lines(log: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
+        log.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    const PROBE_SECTION: &[(&str, &str)] = &[("pin", "PA0"), ("z_offset", "1.5")];
+
+    #[test]
+    fn applying_a_zero_z_offset_only_reports() {
+        let (_printer, gcode, configfile) = probe_machine("probe", PROBE_SECTION);
+        let log = capture(&gcode);
+
+        gcode.run_script_sync("Z_OFFSET_APPLY_PROBE").unwrap();
+
+        assert_eq!(lines(&log), ["// Nothing to do: Z Offset is 0"]);
+        assert_eq!(
+            configfile.get_status(0.0)["save_config_pending"],
+            json!(false)
+        );
+    }
+
+    #[test]
+    fn applying_a_z_offset_writes_the_shifted_z_offset() {
+        let (_printer, gcode, configfile) = probe_machine("probe", PROBE_SECTION);
+        let log = capture(&gcode);
+
+        // 1.5 - 2.0: the anchor moves the same distance into `z_offset`.
+        gcode.run_script_sync("SET_GCODE_OFFSET Z=2.0").unwrap();
+        gcode.run_script_sync("Z_OFFSET_APPLY_PROBE").unwrap();
+
+        assert_eq!(
+            lines(&log),
+            ["// probe: z_offset: -0.500\n\
+              // The SAVE_CONFIG command will update the printer config file\n\
+              // with the above and restart the printer."]
+        );
+        assert_eq!(
+            configfile.get_status(0.0)["save_config_pending_items"]["probe"]["z_offset"],
+            json!("-0.500")
+        );
+    }
+
+    #[test]
+    fn the_section_name_is_the_one_written_back() {
+        // `self.name = config.get_name()`: a `[bltouch]` registers the same
+        // command and writes its own section (`probe.py:39-41`, `:182`).
+        let (_printer, gcode, configfile) = probe_machine("bltouch", PROBE_SECTION);
+        let log = capture(&gcode);
+
+        gcode.run_script_sync("SET_GCODE_OFFSET Z=0.25").unwrap();
+        gcode.run_script_sync("Z_OFFSET_APPLY_PROBE").unwrap();
+
+        assert_eq!(
+            lines(&log),
+            ["// bltouch: z_offset: 1.250\n\
+              // The SAVE_CONFIG command will update the printer config file\n\
+              // with the above and restart the printer."]
+        );
+        assert_eq!(
+            configfile.get_status(0.0)["save_config_pending_items"]["bltouch"]["z_offset"],
+            json!("1.250")
+        );
     }
 }
 

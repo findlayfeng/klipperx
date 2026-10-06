@@ -47,7 +47,9 @@ pub const DELIMITER: u8 = 0x03;
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```rust
+/// use klippy_api::protocol::Framing;
+///
 /// let mut framing = Framing::new();
 /// assert_eq!(framing.push(b"{\"a\":1}\x03{\"b\""), vec![b"{\"a\":1}".to_vec()]);
 /// assert_eq!(framing.partial(), b"{\"b\"");

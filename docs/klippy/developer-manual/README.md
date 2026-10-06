@@ -459,7 +459,7 @@ NaN 也归一），与上游写出的文件逐字一致，见用户手册 [配�
 
 | 文件 | 职责 |
 |------|------|
-| `mod.rs` | `Interface`：在 `spawn_blocking` 里跑设备 I/O、持有机器 runtime handle（`with_transport` 是唯一的 ambient 捕获点）、`off_runtime`；`Interface` 可克隆共享设备 |
+| `mod.rs` | `Interface`：在 `spawn_blocking` 里跑设备 I/O、持有机器 runtime handle（`with_transport` 是唯一的 ambient 捕获点）、`off_runtime`（取消 = 传输已关：`send` 拒发 `ConnectionLost`、`receive` 返 `None`）；`Interface` 可克隆共享设备 |
 | `devices/serial.rs` | `SerialDevice`：tty 字节流（raw 模式、`termios2`、阻塞读） |
 | `devices/canserial.rs` | `CanSerialDevice`：SocketCAN——承载的仍是同一份 serial 字节流（8 字节切 CAN 帧、`0x100+2n` 寻址、admin 报文指派节点号）；**admin 扫描（2026-10-06）**：`CanbusAdminSocket` + `query_unassigned(bus, window, report)` 广播 `0x3f0/[0x00]`（`CMD_QUERY_UNASSIGNED`）并收 `0x3f1` 的 `RESP_NEED_NODEID`，`UnassignedNode`/`UnassignedScan` 按 uuid 去重（`AdminBus` 把收帧与计时抽成可注入接缝，窗口是「从广播起算的截止时间」而不是空闲超时） |
 | `canbus.rs` | `klipperx canbus-scan [--interface can0] [--timeout 2]`：用上面的扫描列出未分配节点的 uuid（输出 `Found canbus_uuid=%012x, Application: …` 与总数；`0x01`/无字节=Klipper、`0x11`=CanBoot）。**只读广播，不改板子状态**，也不写配置文件 | |

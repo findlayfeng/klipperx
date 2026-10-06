@@ -46,6 +46,9 @@ restart 循环、以及同步阻塞的 `printer.run()`（机器 runtime 的 `spa
 - **机器侧的 spawn 一律走存下来的 handle**：`Interface` 存 `handle`（设备 I/O 走 `off_runtime`），
   `Mcu` 从 `interface.handle()` 取一份存字段（收发任务走它），`restart.rs` 的 `spawn_blocking`
   显式收 `&Handle`。机器侧没有裸 `tokio::spawn` / `spawn_blocking`。
+  handle 指向的 runtime 若已先关停，排队中的阻塞任务会被**取消**：`off_runtime` 把取消读作
+  **传输已关**——`send` 以 `ConnectionLost` 拒发、`receive` 返回 `None` 结束读循环，而不是当设备
+  panic（`interface/mod.rs` 的 `test_a_shut_down_runtime_is_a_closed_transport_not_a_panic` 钉住）。
 - **唯一的 ambient 捕获点**：`Interface::with_transport`（`interface/mod.rs`）的
   `Handle::current()`。它在设备**打开之后**捕获，所以打不开的传输根本不需要 runtime；而
   `load_config` 跑在 `machine_handle.enter()` 之下（`src/klippy.rs`，在 `run()` 内），所以连它捕获到的也是

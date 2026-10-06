@@ -177,45 +177,59 @@ impl Interface {
     ///
     /// The device call blocks, so it goes to the blocking pool of the stored
     /// handle rather than whatever runtime happens to be ambient.
-    async fn off_runtime<T, F>(&self, op: F) -> T
+    ///
+    /// `None` means that runtime is gone: a queued blocking op is cancelled when
+    /// its runtime shuts down, and tokio reports that as a cancelled
+    /// `JoinHandle`. That is a closed transport, not a device panic — `send`
+    /// refuses it and `receive` ends its read loop.
+    async fn off_runtime<T, F>(&self, op: F) -> Option<T>
     where
         T: Send + 'static,
         F: FnOnce() -> T + Send + 'static,
     {
-        self.handle
-            .spawn_blocking(op)
-            .await
-            .expect("Interface device task panicked")
+        self.handle.spawn_blocking(op).await.ok()
     }
 
     pub async fn send(&self, frame: Frame) -> Result<(), InterfaceError> {
         match &self.transport {
             Transport::Serial(device) => {
                 let device = Arc::clone(device);
-                self.off_runtime(move || device.send(&frame)).await
+                self.off_runtime(move || device.send(&frame))
+                    .await
+                    .unwrap_or(Err(InterfaceError::ConnectionLost))
             }
             Transport::CanSerial(device) => {
                 let device = Arc::clone(device);
-                self.off_runtime(move || device.send(&frame)).await
+                self.off_runtime(move || device.send(&frame))
+                    .await
+                    .unwrap_or(Err(InterfaceError::ConnectionLost))
             }
             Transport::Host(device) => {
                 let device = Arc::clone(device);
-                self.off_runtime(move || device.send(&frame)).await
+                self.off_runtime(move || device.send(&frame))
+                    .await
+                    .unwrap_or(Err(InterfaceError::ConnectionLost))
             }
             #[cfg(test)]
             Transport::FrameMock(device) => {
                 let device = Arc::clone(device);
-                self.off_runtime(move || device.send(&frame)).await
+                self.off_runtime(move || device.send(&frame))
+                    .await
+                    .unwrap_or(Err(InterfaceError::ConnectionLost))
             }
             #[cfg(test)]
             Transport::Simulator(device) => {
                 let device = Arc::clone(device);
-                self.off_runtime(move || device.send(&frame)).await
+                self.off_runtime(move || device.send(&frame))
+                    .await
+                    .unwrap_or(Err(InterfaceError::ConnectionLost))
             }
             #[cfg(test)]
             Transport::Recording(device) => {
                 let device = Arc::clone(device);
-                self.off_runtime(move || device.send(&frame)).await
+                self.off_runtime(move || device.send(&frame))
+                    .await
+                    .unwrap_or(Err(InterfaceError::ConnectionLost))
             }
         }
     }
@@ -224,30 +238,30 @@ impl Interface {
         match &self.transport {
             Transport::Serial(device) => {
                 let device = Arc::clone(device);
-                self.off_runtime(move || device.receive()).await
+                self.off_runtime(move || device.receive()).await.flatten()
             }
             Transport::CanSerial(device) => {
                 let device = Arc::clone(device);
-                self.off_runtime(move || device.receive()).await
+                self.off_runtime(move || device.receive()).await.flatten()
             }
             Transport::Host(device) => {
                 let device = Arc::clone(device);
-                self.off_runtime(move || device.receive()).await
+                self.off_runtime(move || device.receive()).await.flatten()
             }
             #[cfg(test)]
             Transport::FrameMock(device) => {
                 let device = Arc::clone(device);
-                self.off_runtime(move || device.receive()).await
+                self.off_runtime(move || device.receive()).await.flatten()
             }
             #[cfg(test)]
             Transport::Simulator(device) => {
                 let device = Arc::clone(device);
-                self.off_runtime(move || device.receive()).await
+                self.off_runtime(move || device.receive()).await.flatten()
             }
             #[cfg(test)]
             Transport::Recording(device) => {
                 let device = Arc::clone(device);
-                self.off_runtime(move || device.receive()).await
+                self.off_runtime(move || device.receive()).await.flatten()
             }
         }
     }
@@ -579,5 +593,43 @@ mod tests {
             "Error message should contain 'No mapping entry', got: {}",
             err_str
         );
+    }
+
+    /// A runtime that is gone is a closed transport, not a device panic.
+    ///
+    /// [`Interface`] spawns device I/O on the handle captured when it was built.
+    /// If that runtime shuts down first, the queued blocking op is cancelled —
+    /// tokio hands back a cancelled `JoinHandle` — and reading that as a device
+    /// panic killed the caller (in tests it turned a teardown race under load
+    /// into a bogus failure). `send` refuses it and `receive` ends its loop.
+    #[test]
+    fn test_a_shut_down_runtime_is_a_closed_transport_not_a_panic() {
+        // The interface captures the runtime it is built on…
+        let inner = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("the interface's runtime");
+        let interface = inner.block_on(async { Interface::new(FrameMock::new(vec![])) });
+        // …and that runtime then goes away, handle included.
+        inner.shutdown_timeout(std::time::Duration::from_millis(50));
+
+        // A later call runs on *this* runtime; the spawn still lands on the dead
+        // handle, and that must come back as a closed transport.
+        let outer = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("the caller's runtime");
+        outer.block_on(async {
+            let err = interface
+                .send(make_frame(1, b"after_shutdown"))
+                .await
+                .expect_err("a dead runtime cannot carry a send");
+            assert_eq!(err, InterfaceError::ConnectionLost);
+            assert!(
+                interface.receive().await.is_none(),
+                "a dead runtime ends the read loop"
+            );
+        });
+        outer.shutdown_timeout(std::time::Duration::from_millis(50));
     }
 }

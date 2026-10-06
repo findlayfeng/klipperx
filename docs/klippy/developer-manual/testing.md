@@ -300,7 +300,7 @@ git config core.hooksPath .githooks
 | `extras/axis_twist_compensation.rs`（批 #36，11 测；2026-10-04 +1） | 选项默认值与越界、插值（含端点外推语义）、`z_compensations` 长度校验、`probe:update_results` 载荷原地改 Z（probe/eddy 两处上报读回）、`AXIS_TWIST_COMPENSATION_CALIBRATE` 注册与首点派发、保存极值按 Python `str()` 写法（`3.0` 而非 `3`） |
 | `extras/gcode_button.rs`（批 #37，8 测） | 语料节选项全读、按下/释放各渲染派发、空 `release_gcode` 不跑、`QUERY_BUTTON` 与 `get_status`、缺 `pin`/`press_gcode` 文案、`debounce_delay` 下界、`analog_range` 读取后的明确拒绝与上游解析/越界文案 |
 | `gcode_arcs.rs` | `resolution` 默认 `1.` 记账、显式值解析、`0`/`-1`/非数拒绝文案对上游、经 loader 认领并注册（4 测） |
-| `bed_screws.rs` | 全选项 `check_unused` 直证、行进默认 50/5/5/0 与默认名、螺丝缺失即停（access 无残留）、<3 与两元素/解析/fine_adjust 上游文案、above 0 边界、静止态 status（6 测） |
+| `bed_screws.rs` | 全选项 `check_unused` 直证、行进默认 50/5/5/0 与默认名、螺丝缺失即停（access 无残留）、<3 与两元素/解析/fine_adjust 上游文案、above 0 边界、静止态 status；**命令族（2026-10-06）**：`BED_SCREWS_ADJUST` 已注册且会话三条**不**预注册、会话开始注册三条且 `ABORT` 移除、会话中再开被拒、`ACCEPT` 走完粗调与精调、无 `fine_adjust` 时粗调后即完成、`ADJUSTED` 把 `-1` 归 `0` 重数、move 失败时注销三条并复位、`ACCEPT` 被占时不半注册（共 13 测；另有语料 `bed_screws.test` 走真命令转绿） |
 | `pwm_cycle_time.rs` | 选项矩阵与默认、`SET_PIN` 值域与 `CYCLE_TIME`、重复值丢弃、无 `hardware_pwm` 恒软件路径；**lookahead 调度**（2026-10-03 +6 测）：clocked `set_pwm`、两次改按 `min_schedule_time` 间隔、`CYCLE_TIME` 在 lookahead 路径更新簿记、重复丢弃、无 `toolhead` fallback、MCU 未连接 fallback（17 测） |
 | `pwm_tool.rs` | 选项矩阵与默认、prefix 命名错误、`cycle_time` 值域、`maximum_mcu_duration` minval 0.5、配对约束 build 期拒绝（15 测；2026-10-03 +4 队列化：前瞻钉时→flush 落 clocked、后请求覆盖、两条兕底、同构对接） |
 | `temperature_fan.rs` | 6 实例选项矩阵、`max_temp<40` 取目标、pid 选项与上下界、bang-bang 驱动、`SET_TEMPERATURE_FAN_TARGET` 命令与三段错误文案、未知 sensor/非法 control、缺 pin 前缀名（11 测） |

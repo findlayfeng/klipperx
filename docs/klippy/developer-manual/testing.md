@@ -66,6 +66,13 @@ cargo test --workspace -- --test-threads=1 2>&1 | scripts/test-timings.py
 （第二个 cargo 安静排队、CPU 全空，见 `AGENTS.md` 的「常用命令」段）；② 需要真机/真总线的形态
 （例如 Q11：非 `-o` 的活机会让假设备的阻塞读 park，已改成确定性失败并保留 `#[ignore]` 复现）。
 
+还有一类**会把自己坑进去的实验做法**，专门记一笔：在 `start_paused`（暂停时钟）的测试里**删掉产品侧的
+`sleep`**，测试会真的死锁——paused 时钟下 tokio 只要有未完成的 `spawn_blocking` 就
+`inhibit_auto_advance()`（`tokio-1.53.1/src/runtime/blocking/schedule.rs:25`，完成时才 `:47` 放开），
+于是依赖定时器的 watcher 永不触发。**这不是那 1 秒在等真实信号、也不是 flaky**，重启路径那 1 秒是上游
+同款行为（`klippy.py:364`），不要为提速去删它；要跳过时间就照 `klippy.rs` 的三条测试那样用
+`start_paused` + 断言虚拟时钟位移。
+
 ## 真机测试
 
 少数用例需要真实硬件。它们由**用户提供的 printer 配置**驱动：唯一输入是环境变量
@@ -302,7 +309,7 @@ git config core.hooksPath .githooks
 
 | 模块 | 覆盖 |
 |------|------|
-| `klippy.rs` | `is_restart` 只认 `restart` / `firmware_restart`；`klippy_process` 一回合内 `restart` 重建、`exit` 结束（用 `RestartOnce` 替身对象）；重启从磁盘重读配置（`test_a_restart_rereads_the_config_file_from_disk`，以 `configfile` 的 raw config 从 `50` 变 `120` 为证）；配置文件解析失败时进 `error` 而循环不挂死（`test_a_restart_whose_config_no_longer_parses_reports_error`）；**A3 机制**：在 `machine_handle.enter()` 之下建的 `test:` 接口捕获到的是机器 runtime，而不是 ambient 的 API runtime（`Interface::with_transport` 的 `Handle::current()`） |
+| `klippy.rs` | `is_restart` 只认 `restart` / `firmware_restart`；`klippy_process` 一回合内 `restart` 重建、`exit` 结束（用 `RestartOnce` 替身对象）；重启从磁盘重读配置（`test_a_restart_rereads_the_config_file_from_disk`，以 `configfile` 的 raw config 从 `50` 变 `120` 为证）；配置文件解析失败时进 `error` 而循环不挂死（`test_a_restart_whose_config_no_longer_parses_reports_error`）；**A3 机制**：在 `machine_handle.enter()` 之下建的 `test:` 接口捕获到的是机器 runtime，而不是 ambient 的 API runtime（`Interface::with_transport` 的 `Handle::current()`）；**三条 restart 测试的 1s 不是测试兜底**：它来自产品侧 `RESTART_DELAY`（`klippy.rs:64` / `:192`，上游同款 `klippy.py:364` 的 `time.sleep(1.)`）。测试用 `#[tokio::test(start_paused = true)]` 跑在暂停时钟上，并用 helper `klippy_process_over_the_restart_delay` 断言**虚拟时钟位移 ≥ `RESTART_DELAY`**（1.003s → 0.001s×3；不花真实时间但等待确实发生，删掉产品 sleep 该断言即失败） |
 
 | `stress.rs` | 段计算与引脚解析：按节名找 MCU（带名的不拿裸 `[mcu]`、空名拿裸的）、引脚名的 chip 副本只在有冒号时出现、别的 MCU 上的 stepper 被跳过；一段填满时长且间隔均匀、时钟变慢拉长间隔而时长不变、间隔不到 0 被截且命令有上界；引脚经字典枚举解析；**多机**：选择与汇总（`mcus_are_selected_by_name_or_all_and_summarised_per_board`：多值/去重/`--all-mcus`/互斥、前缀与收尾文案）、旧单机命令行等价（`the_old_single_board_command_line_still_selects_the_default_mcu`）、双假设备**并发 identify+驱动**不串（`two_fake_boards_identify_and_drive_concurrently`，两字典命令数不同为证、回调各自恰 25 次）、**帧级隔离**（`concurrent_sessions_send_only_their_own_frames_to_their_own_recorder`，两 Recorder 各恰 8 帧、无异板 payload）；**多板 stepper 归属与并发**：`a_stepper_belongs_to_the_board_whose_step_pin_it_uses`（同板多节全收、endstop/enable 落他板不改变归属）、`a_dir_pin_on_another_board_rejects_only_that_section`（固件文案、按节拒）、`all_mcus_drives_the_board_with_a_stepper_and_skips_the_one_without`（核心回归：单板有节时 `--all-mcus` 照开、跳过行、点名仍硬错误）、`one_stage_drives_every_stepper_of_the_board_with_the_same_schedule`（同板并发、同一 ramp、按轮交错）、`every_stepper_gets_its_own_oid_in_one_config_round`（一轮配置装全部：allocate+N×config_stepper+finalize）、`a_skipped_board_keeps_the_exit_clean_but_a_run_that_skipped_everything_fails`（跳过≠失败、全跳过才报）；回退转红：剪断多节收集（`take(1)`）即红；**M3 会话所有权**（现 26 条）：`the_reset_reconnect_drops_the_old_session_before_reopening`（`test:` 夹具强制走 ResetRequired：Weak 监视旧会话→15ms 排空→断言 `strong_count==1` 才 drop→250ms 重连→新会话 identify+配置+ramp 全通→`weak.upgrade().is_none()` 证 Drop 执行）+ `run_board` 入口 `strong_count==1` 断言；回退两形态均红（字面 `mcu.clone()` 跨 join→入口断言 left:2；链内中途 clone→重连断言 left:2）；完整双板 ramp 并发需真板（待验项见 stress.md）；**2026-10-06 真资源/别名/假板 e2e（`23b3b9b`）**：step ramp 与 comm ramp 各一条端到端（假板 `SimulatorDevice`、引脚走 `[board_pins]` 别名 + 前导 `!`、`enable_pin` 置使能）、`the_stress_stepper_carries_the_sections_own_step_options` 解码线上 `config_stepper`（`invert_step=1` 来自 `!PA0`、`step_pulse_ticks=80` 来自 4 µs @20 MHz）、`board_pins_aliases_and_geometry_are_read_from_the_section`（步距由几何算出，无几何退 0.01 mm）|
 | `main.rs` | CLI 形状：不给子命令时跑主机、选项随默认子命令走、显式拼法同效、单独给子命令回帮助；`--api-server` 每处默认一致、空值=主机不开服务；`--tui` 是 CLI 自己的、客户端子命令不受影响；`--logfile` 两种拼法都是主机的；裸调用打帮助、缺配置文件的旗标后置才报、主机子命令单跑打帮助、主机参数与子命令不可混用；`canbus-scan` 子命令的默认值（`can0`/2s）与它在 help 里的可见性（2026-10-06，+2 测） |

@@ -798,7 +798,9 @@ pins: !PD0, PD1, PD2
 | `speed` / `probe_speed` | `50.` / `5.` | 行进/探入速度（均 above 0） |
 | `horizontal_move_z` / `probe_height` | `5.` / `0.` | 抬升/下探 |
 
-段已落地；`BED_SCREWS_ADJUST`/`ACCEPT`/`ADJUSTED`/`ABORT` 命令族**未移植**（H9，语料经未知命令放行）。
+命令：`BED_SCREWS_ADJUST`（常驻）；会话开始后额外注册 `ACCEPT` / `ADJUSTED` / `ABORT`，收尾（`ABORT`、走完或 move 被拒）时注销。
+流程：抬到 `horizontal_move_z` → 移到该螺丝 → 下探到 `probe_height`，按 `ACCEPT` 逐颗走完粗调再走精调；`ADJUSTED` 把该螺丝的 `-1` 归 `0` 重新数；`ABORT` 结束会话。
+该命令族**不用** `probe`/`manual_probe`/`configfile`（上游同样只用 `toolhead.manual_move`）；与 `manual_probe` 的 `ACCEPT`/`ABORT` 同名，两者同时活跃时按「先注册者占坑」（与上游一致）。
 
 ### [pwm_cycle_time <name>] / [pwm_tool <name>]
 

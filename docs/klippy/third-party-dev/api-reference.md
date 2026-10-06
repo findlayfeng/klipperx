@@ -870,7 +870,7 @@
 | `PROBE_CALIBRATE` | 探针校准（`probe`） |
 | `QUAD_GANTRY_LEVEL` | 四梁水平校准（`quad_gantry_level`） |
 | `Z_TILT_ADJUST` | Z 轴倾斜调整（`z_tilt`） |
-| `BED_SCREWS_ADJUST` | 床面螺丝调整（`bed_screws`）——**段已落地、命令未注册**（2026-09-24 批 #1，调用会收到未知命令响应） |
+| `BED_SCREWS_ADJUST` | 床面螺丝调整（`bed_screws`）——**已注册（2026-10-06）**；会话开始时会额外注册 `ACCEPT` / `ADJUSTED` / `ABORT`，收尾时注销（与 `manual_probe` 同名，先注册者占坑） |
 | `SET_SERVO` | 舵机控制（mux 键 `SERVO=`，由 `[servo <名>]` 注册，2026-09-24 批 #2） |
 | `SET_DUAL_CARRIAGE` | IDEX 滑架切换（由 `[dual_carriage]` 注册，2026-09-24；轨间坐标交接已实现于批 #4，步进仍仅主轨=C1 缺口入档；generic 路径由运动学注册于批 #12，`dual_carriage` status 为 `active_carriage` + `carriages`） |
 | `SAVE_DUAL_CARRIAGE_STATE` / `RESTORE_DUAL_CARRIAGE_STATE` | 滑架状态保存/恢复（同上；恢复移动语义未完全移植） |

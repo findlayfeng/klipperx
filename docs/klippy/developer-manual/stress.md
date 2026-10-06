@@ -23,8 +23,9 @@ klipperx stress [OPTIONS] <CONFIG_FILE> [MCU]
 
 负载选自上游的**步进引擎**（`src/stepper.c`）——MCU 的主要工作就是按 `queue_step` 生成步进脉冲。
 工具按**参加测试的板**收集配置里全部 `step_pin` 归属该板的 `[stepper_*]` / `[manual_stepper]`
-节（归属只看 `step_pin` 的 chip；`enable_pin`/`endstop_pin` 落在别的板不改变归属，stress 本就不读
-它们），用 `ConfigBuilder` 在**同一轮配置**里给每节各配一个自己的压力 stepper（各自 oid——固件
+节（归属只看 `step_pin` 的 chip；`enable_pin`/`endstop_pin` 落在别的板不改变归属；本板自己的
+`enable_pin` 会被读出并置使能，2026-10-06 起），用 `ConfigBuilder` 在**同一轮配置**里给每节各配
+一个自己的压力 stepper（各自 oid——固件
 `finalize_config` 后再握手会 `config_reset` 掉先前配置，故不能逐节握手），同板并发驱动、同一
 ramp 同步下发，然后按段加大步频。`dir_pin` 与 `step_pin` 不同板的节**按节拒绝**（固件口径
 `Stepper dir pin must be on same mcu as step pin`），不拖累同板其它节。
@@ -99,8 +100,9 @@ Trapq（一段匀速 5 mm 移动）
 把固件读回的步数与 `距离 / step_dist` 对比，相等则 `motion smoke OK`。它不写 `[printer]`
 也不需要三个轴，因此可以在只知道一个轴引脚的板子上验证压缩器；一次 5 mm/10 mm/s 的小移动。
 
-实测（STM32F103，`step_dist = 0.01`）：500 步被压成 **3 条命令**（1 条 `set_next_step_dir`
-+ 2 条 `queue_step`），固件读回正好 `500 step(s)`。
+实测（STM32F103，当时的 `step_dist = 0.01`）：500 步被压成 **3 条命令**（1 条 `set_next_step_dir`
++ 2 条 `queue_step`），固件读回正好 `500 step(s)`。（2026-10-06 起 `step_dist` 由节的
+`microsteps`/`rotation_distance` 等几何算出，不再是固定的 0.01；这条实测数字是改前的留档。）
 
 ## 任务三：命令往返（`--task comm`）
 
@@ -175,17 +177,22 @@ send/recv 两个后台任务——**双路 ramp 的余量未实测**，出现调
 - 配置里必须有 `[mcu …]`（或 `[mcu]`）；`--task step` 还要该板名下带 `step_pin`/`dir_pin` 的
   stepper section：**显式点名**的板没有 → 直接报错（原文案）；**`--all-mcus` 扫出**的板没有 →
   打跳过行、不改退出码，全部板都没有才整体报错（`--task comm` 不需要 stepper）。
-- 引脚名支持 `PA0`、`mcu:PA0`、`<chip>:PA0` 和尾随 `!`（忽略）；**别名（`[board_pins]`）还没
-  解析**。
-- 压力 stepper 用 `invert_step = 0`、`step_pulse_ticks = 0`；`[stepper_*]` 的 `invert_step` /
-  `microsteps` / `enable_pin` 等**不读**——这些选项现在由 `extras/stepper.rs` 的正式 stepper
-  资源消费，压力工具只借 step/dir 引脚，自己造一个固定的 stepper（剩余项见 S1）。
+- 引脚名支持 `PA0`、`mcu:PA0`、`<chip>:PA0`；取反是**前导** `!`（`!PA0` / `!mcu:alias`，即 `mcu:!PA0` 是非法描述）；
+  **`[board_pins]` 别名已走 F2 的正式装载器解析**（2026-10-06）。
+- 压力 stepper **复用真资源（2026-10-06）**：经 `PrinterPins::setup_stepper` 建出正式的 `McuStepper`，
+  所以固件 `config_stepper` 带的是该节自己的 `invert_step`（步进脚的前导 `!`）与 `step_pulse_ticks`
+  （来自 `step_pulse_duration`，默认 2 µs，上下界同 `extras/stepper.rs`）；`--task motion` 的步距
+  由 `microsteps`/`rotation_distance`/`full_steps_per_rotation`/`gear_ratio` 算出（节里没写几何时
+  退回 0.01 mm，使只用引脚的节仍可用）；本板自己的 `enable_pin` 会被读出并置于使能（共用线去重）。
 - 夹具每次 reset + reconnect（无 `config_reset` 的固件）约 0.5 s。
-- 端到端只在真板上手工跑过（**双板并发的真板验证项**：双 step ramp、双 comm ramp 的调度余量、
-  `--all-mcus` 真实枚举、单板旧命令行回归、一板连接失败另一板照常+退出码 1）；单测覆盖的是段
-  计算、引脚解析、命令编码与多机选择/双假设备并发的帧隔离（见 [测试](testing.md)）。
+- 端到端：**假板上的 step ramp / comm ramp / `ResetRequired` 重连已有自动化用例**（2026-10-06，
+  用 `test: dict=` 的 `SimulatorDevice`）；真板上只手工跑过单轴冒烟。**双板并发的真板验证项**：
+  双 step ramp、双 comm ramp 的调度余量、`--all-mcus` 真实枚举、单板旧命令行回归、
+  一板连接失败另一板照常+退出码 1；未覆盖的还有 `--task motion` 的假板 e2e（假件
+  `stepper_get_position` 恒答 0，位置断言无法通过）。单测另覆盖段计算、引脚解析、命令编码与
+  多机选择/双假设备并发的帧隔离（见 [测试](testing.md)）。
 
-TODO 里记着这些剩余项（**S1**）。
+TODO 里记着这些剩余项（**S1**；2026-10-06 后仅剩 `--task motion` 的假板 e2e 与真板双机验证）。
 
 ---
 

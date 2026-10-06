@@ -90,7 +90,7 @@ H1–H12 是上游 extras 里按域归并的消费者（2026-09-21 全量盘点�
 | H6 | 传感器与块状数据（bulk_sensor / 加速度计 / angle / ldc1612 / hx71x / ads* / load_cell / input_shaper / resonance）——`bulk_sensor` 框架、`adxl345`/`mpu9250`、`ldc1612`、`hx71x`、`ads1220`/`ads131m0x`、`load_cell`(+`_probe`)、`input_shaper`/`resonance_tester` 均已落地；余项＝`angle`、其余加速度计（lis2dw/lis3dh/icm20948/bmi160）、`ads1x1x`，以及 `SET_PRESSURE_ADVANCE` 尚未作用于运动，见 H6 节 | F5、F6、F7、C1 |
 | H7 | 输入与外设（buttons / gcode_button / pulse_counter / trigger_analog / 断料与线宽传感器 / GPIO 扩展 / DAC）——`gcode_button`、`pulse_counter`、`filament_switch_sensor`/`filament_motion_sensor` 已落地；余项＝固件按钮查询、`trigger_analog` 宿主节、线宽传感器（hall_*/tsl1401cl）、`initial_pins`、板级模块（samd_sercom/replicape/palette2），见 H7 节 | F3、F5、F9 |
 | H8 | LCD 显示与菜单（display/*）——面板驱动均已落地（hd44780/st7920/uc1701/ssd1306/aip31068_spi/hd44780_spi/sh1106）；余项＝菜单族（`menu.py`/`menu_keys.py`/`display.cfg`/`menu.cfg`）与固件 `lcd_hd44780.c`/`lcd_st7920.c`，见 H8 节 | F9、G1b |
-| H9 | 探测 / 调平 / 校准（probe / bltouch / bed_mesh / z_tilt / quad_gantry_level / bed_screws / …）——探针与其校准命令族、末端位置接口（`virtual_endstop_position`）、z_tilt/qgl/bed_tilt/screws_tilt/axis_twist/delta_calibrate 均已落地；余项＝`bed_mesh` 的 faulty/零参照/profile 命令族、探针精度、`Z_OFFSET_APPLY_*`、`skew_correction`/`z_thermal_adjust`/`tuning_tower`，见 H9 节 | C1、F8 |
+| H9 | 探测 / 调平 / 校准（probe / bltouch / bed_mesh / z_tilt / quad_gantry_level / bed_screws / …）——探针与其校准命令族、末端位置接口（`virtual_endstop_position`）、z_tilt/qgl/bed_tilt/screws_tilt/axis_twist/delta_calibrate 均已落地；余项＝`bed_mesh` 的 faulty/零参照/profile 命令族、探针精度、`skew_correction`/`z_thermal_adjust`/`tuning_tower`，见 H9 节 | C1、F8 |
 | H10 | 运动相关 extras（gcode_arcs / manual_stepper / idle_timeout / motion_report / …；gcode_move、stepper_enable、motion_queuing、force_move、idle_timeout 已落地）——余项＝G2/G3 弧规划、`manual_stepper` 回零、`extruder_stepper` 宿主同步缝、`GET_POSITION`/`axis_map`，见 H10 节 | C1 |
 | H11 | 主机运行时与调试（statistics / canbus_ids / canbus_stats；error_mcu 已落地） | — |
 | H12 | 核心工具补齐（mathutil / util 反射 / clocksync / pins 消费侧） | C1 |
@@ -468,10 +468,12 @@ endstop 资源（`mcu/resource/endstop.rs`，含 `minclock` 门控与 `home_wait
       axis_twist/delta_calibrate）、`manual_probe`（`MANUAL_PROBE`/`Z_ENDSTOP_CALIBRATE`/`TESTZ`/`ACCEPT`/
       `NEXT`/`ABORT`）、`safe_z_home`、`endstop_phase`、`bltouch`、`smart_effector`、`probe_eddy_current`
       （含校准工具）均已落地；`probe:update_results` 已带载荷产线触发。
-- [ ] **`Z_OFFSET_APPLY_*` 小命令**：`[probe]` 的 `Z_OFFSET_APPLY_PROBE` **未注册**（同名命令只在 eddy 上注册，
-      `probe_eddy_current.rs:1863`）；`manual_probe` 的 `Z_OFFSET_APPLY_ENDSTOP` / `Z_OFFSET_APPLY_DELTA_ENDSTOPS`
-      未实现（`manual_probe.rs:14-17` 明示）。前置全满足（`gcode_move` 的 `homing_origin` 与 `configfile.set`
-      都已在），各约 30–40 行，**语料 0 处使用**。
+- [x] **`Z_OFFSET_APPLY_*` 小命令——已落地（2026-10-06，`0725efb`）**：`[probe]` 的
+      `Z_OFFSET_APPLY_PROBE`（`probe.rs`，与 eddy 同名但 section 互斥）与 `manual_probe` 的
+      `Z_OFFSET_APPLY_ENDSTOP`（普通机写 Z 轨 `position_endstop`，delta 机为三塔
+      `stepper_a/b/c`）均已注册，文案与 `%.3f` 回写对齐上游；与上游的一处等价差异
+      （上游用重名覆盖注册、本仓因 `register_command` 拒绝重名而按 `kinematics: delta` 二选一）
+      已登记在 `upstream-deviations.md`。**语料 0 处使用**，覆盖靠单测。
 - **端停位置接口化：已完成（2026-10-06 复核，此前条目为陈旧断言）**。`PinChip::setup_endstop_dyn` 返回
       `Arc<dyn HomingEndstop>`，`ProbeChip::virtual_endstop_position` 返回 `z_offset`（`pins.rs:386` `:396`、
       `probe.rs:306`），rail 优先采用虚拟位置、否则才退 `position_min`（`extras/stepper.rs:374-406`；

@@ -225,18 +225,30 @@ KLIPPERX_HW_CONFIG=~/printer.cfg \
   以免 Drop 内二次 panic 把两个失败都吞成 abort）。适合需要 `toolhead`/`gcode`/`extras` 的用例（R4/R6/R7/R8/R9/R10）。
 
 ```rust
-#[tokio::test]
+// L2：**普通 `#[test]`**（不是 `#[tokio::test]`！），活机 g-code 用 `run_script_sync`
+#[test]
 #[ignore = "hardware: needs KLIPPERX_HW_CONFIG"]
-async fn test_something_on_a_real_board() {
+fn test_something_on_a_real_board() {
     let Some(machine) = crate::hardware_test::acquire(
         "test_something_on_a_real_board",
         &crate::hardware_test::Requires::new().mcu().option("stepper_x", "endstop_pin"),
     ) else { return };
     let machine = machine.bring_up().expect("the board comes up");   // 失败=真失败，不是跳过
     let printer = machine.printer();
+    printer
+        .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+        .expect("gcode is registered")
+        .run_script_sync("M105")
+        .expect("the script runs");
     // …用 printer 的 gcode/toolhead/extras 断言…  machine 在此作用域结束时 drop（收尾）
 }
 ```
+
+> **为什么 L2 必须是普通 `#[test]`**：`Machine::bring_up` 自持一个 runtime 并在 `Drop` 里有界收尾
+> （`shutdown_timeout`）——二者都**不能在 runtime 上下文里跑**（会 panic：
+> `Cannot start a runtime from within a runtime` / `Cannot drop a runtime in a context where blocking is
+> not allowed`）。框架现在会在 `bring_up` 的**第一件事**就检测这个误用并给出可读的 `Err`（而不是 tokio 的 panic）。
+> 对照：**L1**（只用 `Mcu::connect`）就是 `#[tokio::test]` + `.await`，没问题。
 
 **活机与语料（`-o`）的语义差**：`can_pause` 为真（`M400` 会真等时钟追上）、`can_extrude` 不再由
 `-o` 兜底（`G1 E…` 会被冷挤出 / 温度未达拒绝）。写真机用例时不要照抄语料用例的这两处假设。

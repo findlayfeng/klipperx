@@ -57,7 +57,7 @@ AI 写实现」：人类负责方向与取舍、任务拆解、验收判定、�
 
 - 起宿主、连真实 MCU、装字典、配置、同步时钟、跑 g-code：`klipperx <config.cfg>`
 - 开 API 给客户端（`-a <socket>`），或在本进程里开一个终端窗口：`--tui`
-- 独立客户端：`klipperx console`（交互式窗口）/ `klipperx api`（发一条请求）/ `klipperx stress`（压测步进或链路）
+- 独立客户端：`klipperx console`（交互式窗口）/ `klipperx api`（发一条请求）/ `klipperx stress`（压测步进或链路）/ `klipperx canbus-scan`（扫出 CAN 总线上还没分配节点号的板子，打印可粘进配置的 uuid）
 - 大部分运动学（cartesian/corexy/corexz/hybrid/polar/delta/generic_cartesian/rotary_delta/winch/deltesian）、探针与调平族、TMC 驱动（UART 与 SPI 六个）、面板四驱动、断料/称重/风扇/加热等
 
 ### 离「真能打印」还缺什么

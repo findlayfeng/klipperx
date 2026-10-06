@@ -1985,6 +1985,24 @@ mod tests {
         recorder.frames()
     }
 
+    /// Wait up to a second for the poll's sample to fold into the regression,
+    /// then hand over the folded reading.
+    ///
+    /// [`wait_for_frames`] only proves the `get_clock` query reached the wire:
+    /// the fold runs on the round trip's own task (`McuObject::poll_clock`
+    /// spawns `McuClock::get_clock`), so a test that reads the estimate has to
+    /// wait for the estimator to leave its seed, not for the frame.
+    async fn wait_for_clock_fold(clock: &McuClock, seed: i64) -> i64 {
+        for _ in 0..200 {
+            let last = clock.estimator().last_clock();
+            if last != seed {
+                return last;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        clock.estimator().last_clock()
+    }
+
     /// The state `connect` leaves behind, assembled without the handshake: an
     /// `McuObject` registered on its printer, its chip holding a connected MCU
     /// (`mappings` scripted on its mock device), and a clock estimate seeded
@@ -2058,21 +2076,20 @@ mod tests {
     async fn test_one_clock_poll_feeds_the_estimator() {
         // What the poll is for: the sample moves the regression's clock onto
         // the reading and re-anchors `Mcu::estimated_clock` on it
-        // (`Mcu::record_clock_sample`, behind `McuClock::get_clock`).
+        // (`Mcu::record_clock_sample`, behind `McuClock::get_clock`). The
+        // assertions below read the estimator, so this waits for the fold
+        // itself; that the query goes out is the sibling test's subject.
         let rig = PollRig::new(polling_dictionary(), clock_exchange(21_000_500));
         let before = rig.mcu.estimated_clock().unwrap();
         assert!(before < 21_000_500, "still on the connect seed: {before}");
 
+        let clock = rig.object.clock().unwrap();
+        let seed = clock.estimator().last_clock();
         rig.object.register_clock_poll(rig.manual.as_ref());
         rig.manual.advance(1.0);
-        wait_for_frames(&rig.recorder, 1).await;
 
-        let clock = rig.object.clock().unwrap();
-        assert_eq!(
-            clock.estimator().last_clock(),
-            21_000_500,
-            "the sample folded into the regression"
-        );
+        let folded = wait_for_clock_fold(&clock, seed).await;
+        assert_eq!(folded, 21_000_500, "the sample folded into the regression");
         let got = rig.mcu.estimated_clock().unwrap();
         assert!(got >= 21_000_500, "re-anchored on the sample: {got}");
     }

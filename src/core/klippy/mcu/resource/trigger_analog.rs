@@ -971,8 +971,50 @@ mod tests {
     use crate::core::klippy::interface::SimulatorDevice;
     use std::time::Duration;
 
+    /// Tears the fake-firmware session down when the test's scope ends.
+    ///
+    /// Two things have to happen before the runtime is dropped, and both are
+    /// easy to forget at the end of a test body — which is why they live in a
+    /// `Drop`:
+    ///
+    /// * **Break the `Mcu → events → resource → Mcu` cycle.**
+    ///   `chip.config().configure()` binds `trsync_state`, whose handler owns
+    ///   the `TrsyncRegistry` that owns the `McuTrsync` holding this `Mcu`
+    ///   through the chip — the same strong cycle production breaks in
+    ///   `McuObject::release_cycles`. Without it no handle is the last one,
+    ///   `Mcu::Drop` never runs and the session leaks.
+    /// * **Release the parked device read.** `SimulatorDevice::receive()`
+    ///   runs inside `spawn_blocking` and parks on a condvar until
+    ///   `Mcu::close()` shuts the device down. A blocking task that is already
+    ///   running cannot be cancelled, so the runtime's blocking pool waits for
+    ///   it **forever** when it is alive at shutdown — hanging the whole test
+    ///   binary, not just this test. Whether the worker had picked the read up
+    ///   yet is a race, so this shows up as a flake: under CPU pressure the
+    ///   test thread is preempted, the worker wins the race, and the run hangs.
+    ///   Closing in `Drop` also covers a failing assertion: unwinding tears the
+    ///   session down instead of turning the failure into a hang.
+    ///
+    /// Bind it to a **named** variable — `let _ = …` would drop it on the spot.
+    /// It comes first in the tuple so that it drops last (locals drop in
+    /// reverse declaration order); the order is not load-bearing — running the
+    /// teardown while the resource and the chip are still alive closes the
+    /// session just the same — it only keeps the teardown reading in the order
+    /// production does it.
+    struct SessionGuard(Arc<Mcu>);
+
+    impl Drop for SessionGuard {
+        fn drop(&mut self) {
+            self.0.clear_events();
+            self.0.close();
+        }
+    }
+
     /// An identified fake MCU with the resource configured on a chip.
-    async fn resource_harness(samples_per_second: f64) -> (Arc<Mcu>, McuChip, McuTriggerAnalog) {
+    ///
+    /// The [`SessionGuard`] returned first must stay bound for the whole test.
+    async fn resource_harness(
+        samples_per_second: f64,
+    ) -> (SessionGuard, Arc<Mcu>, McuChip, McuTriggerAnalog) {
         let device =
             SimulatorDevice::new(klipperx_test_support::test_dicts_dir().join("atmega2560.dict"))
                 .expect("the corpus dictionary");
@@ -997,12 +1039,12 @@ mod tests {
             .expect("configure against the fake firmware");
         // Keep the pin registry alive for the test's duration.
         std::mem::forget(pins);
-        (mcu, chip, ta)
+        (SessionGuard(Arc::clone(&mcu)), mcu, chip, ta)
     }
 
     #[tokio::test]
     async fn test_home_completes_when_the_move_starts() {
-        let (mcu, _chip, ta) = resource_harness(400.0).await;
+        let (_session, mcu, _chip, ta) = resource_harness(400.0).await;
         ta.set_raw_range(-2_000_000, 2_000_000);
         ta.set_trigger(TriggerAnalogType::Gt, 42);
 
@@ -1023,7 +1065,7 @@ mod tests {
     async fn test_monitor_timeout_fails_home_wait() {
         // 400 Hz → a monitor window of 4 x 2.5 ms; no move ever starts, so the
         // fake's monitor expiry must wake `home_wait` with the upstream error.
-        let (_mcu, _chip, ta) = resource_harness(400.0).await;
+        let (_session, _mcu, _chip, ta) = resource_harness(400.0).await;
         ta.home_start(0.01, 0.0, 0, 0.0, true).unwrap();
 
         let err = tokio::time::timeout(Duration::from_secs(5), ta.home_wait(1.0))
@@ -1038,7 +1080,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_it_arms_and_waits_through_the_homing_endstop_trait() {
-        let (mcu, _chip, ta) = resource_harness(400.0).await;
+        let (_session, mcu, _chip, ta) = resource_harness(400.0).await;
         ta.set_raw_range(-2_000_000, 2_000_000);
         ta.set_trigger(TriggerAnalogType::Gt, 42);
 
@@ -1054,6 +1096,25 @@ mod tests {
             .expect("a hit is not an error");
         assert!(time > 0.9 && time < 1.1, "trigger print time: {time}");
         assert_eq!(completion.reason(), Some(TriggerReason::EndstopHit));
+    }
+
+    /// The guard is what makes the harness's session droppable: `configure()`
+    /// leaves `Mcu → events → resource → Mcu` as a strong cycle, so without
+    /// `clear_events()` no handle is ever the last one and `Mcu::Drop` — the
+    /// backstop that runs `close()` — never fires. Dropping the guard mid-test
+    /// must therefore leave no live handle at all.
+    #[tokio::test]
+    async fn test_the_harness_guard_releases_the_session() {
+        let (session, mcu, chip, ta) = resource_harness(400.0).await;
+        let weak = Arc::downgrade(&mcu);
+        drop(ta);
+        drop(chip);
+        drop(mcu);
+        drop(session);
+        assert!(
+            weak.upgrade().is_none(),
+            "the guard must break the cycle, so the session can drop"
+        );
     }
 
     #[tokio::test]

@@ -7,7 +7,7 @@
 | `serial` | 串口设备路径（如 `/dev/ttyACM0`） | 打开真实 MCU 所在的串口；可配 `baud`（默认 250000） |
 | `canbus_uuid` | MCU 芯片的唯一 ID（12 位十六进制） | 通过 CAN 连接时必给，Klipper 同名参数 |
 | `canbus_interface` | CAN 网络接口名 | 可选，默认 `can0` |
-| `canbus_nodeid` | CAN 节点号（1..895） | klipperx 需要显式给出（Klipper 由 `[canbus_ids]` 分配）；配 `canbus_uuid` 一起用 |
+| `canbus_nodeid` | CAN 节点号（1..895） | **可选**：不写就由 `[canbus_ids]` 的分配器按 `[mcu]` 声明顺序发（起点 4、步长 1）；写了就用写的那个。与自增号撞车时装载期报错 |
 | `host_library` | klipper host 库（`libklipper_host.so`）的路径 | 在主机进程内运行一份 klipper 固件（模拟与自测用） |
 
 ```ini
@@ -28,7 +28,7 @@ host_library: /usr/local/lib/libklipper_host.so
 
 CAN 这条走的是 klipper 的 **can serial** 链路（就像把串口协议搬到 CAN 上跑），不是 CAN 协议本身。**配置里的键名与 Klipper 保持一致**（`canbus_uuid` / `canbus_interface`），因为它们描述的是机器怎么接线，而且现有 Klipper 配置应当照用；代码里那层实现则叫 `CanSerial*`，把 `Canbus` 这个名字留给将来真正实现 CAN 协议的接口。
 
-节点号到仲裁 ID 的映射也沿用 Klipper：`0x100 + 2 × nodeid`，主机写这个 ID、MCU 用下一个回；节点号由主机通过 admin ID `0x3f0` 的 `CMD_SET_NODEID` 报文指派，所以配置里 `canbus_uuid` 是必需的。
+节点号到仲裁 ID 的映射也沿用 Klipper：`0x100 + 2 × nodeid`，主机写这个 ID、MCU 用下一个回；节点号由主机通过 admin ID `0x3f0` 的 `CMD_SET_NODEID` 报文指派，所以配置里 `canbus_uuid` 是必需的（节点号本身可由 `[canbus_ids]` 分配，不必写）。
 
 ## 固件重启方式（`restart_method`）
 

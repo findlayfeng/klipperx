@@ -99,7 +99,7 @@ H1–H12 是上游 extras 里按域归并的消费者（2026-09-21 全量盘点�
 
 | # | 事项 | 依赖 |
 |---|---|---|
-| S1 | 压力测试工具（`klipperx stress`）剩余：stepper 资源、别名解析、端到端测试 | C1 |
+| S1 | 压力测试工具（`klipperx stress`）：**已收官（2026-10-06，`23b3b9b`）**——真资源/别名/假板 e2e 均已落地；余项仅 `--task motion` 假板 e2e（假件位置恒答 0。无法做）与真板双机并发验证 | — |
 | S2 | 文档补齐（2026-10-06 对账发现，非新功能）：`config.md` 缺 **`[bed_mesh]` 整节**（约 20 个选项，含 `split_delta_z` / `move_check_distance`）、`gcode-commands.md` 缺 `BED_MESH_*` 命令；开发手册「模块表 / `testing.md` 覆盖行 / `regression-tests.md`」的其余陈旧行未重审（本轮只修了与已落地改动强相关的那些） | — |
 | E2 | `python_path` 的取消 | 外部项目 |
 
@@ -148,14 +148,19 @@ H1–H12 是上游 extras 里按域归并的消费者（2026-09-21 全量盘点�
 375 000 步/秒 shutdown（`Stepper too far in past`）；`--task comm` 稳定扛住约 3.5k 往返/秒，
 4441 req/s 时响应积压被判定为链路顶不住。
 
-- [ ] **stepper 资源（C1 已收官，本项待改）**：C1 的 `PrinterStepper`/资源层已落地，但压力工具
-      （`src/stress.rs`）仍把 `invert_step` / `step_pulse_ticks` 硬编码为 0，也没读
-      `[stepper_*]` 的 `microsteps` / `enable_pin`（`stress.rs:787-788`）；待改成复用真资源，
-      之后才谈「压力测试与生产同参」。
-- [ ] **`[board_pins]` 别名**：现在只解析引脚名本身，别名未展开（`pins.rs` 已有解析器）。
-- [ ] **端到端测试**：可照 `identify` 的 `chunked_mappings` 脚本化 identify + config +
-      `queue_step`，用 `TestDevice` 覆盖一次加压（及 `ResetRequired` 路径）；`--task comm` 同理。
-      目前只测了段计算、引脚解析与命令编码。
+- [x] **stepper 资源（2026-10-06，`23b3b9b`）**：已改成复用真资源——每个压力 stepper 经
+      `PrinterPins::setup_stepper` 建出正式 `McuStepper`（一次建一个 `PrinterPins` 注册表，
+      每块 `[mcu]` 一个 `McuChip` + 自己的 `ConfigBuilder`），所以固件 `config_stepper` 带的是
+      该节自己的 `invert_step`（步进脚前导 `!`）与 `step_pulse_ticks`（`step_pulse_duration`，
+      默认 2 µs）；`--task motion` 的步距由 `microsteps`/`rotation_distance` /
+      `full_steps_per_rotation`/`gear_ratio` 算出（无几何时退 0.01 mm）；本板自己的 `enable_pin`
+      会被读出并置使能（共用线去重）。
+- [x] **`[board_pins]` 别名（同上）**：别名经 F2 的正式装载器（`BoardPins` + `PrinterPins::parse_pin`/
+      `resolve_pin`）解析；取反是**前导** `!`（`!PA0` / `!mcu:alias`；`mcu:!PA0` 是非法描述）。
+- [x] **端到端测试（同上）**：假板（`test: dict=` 的 `SimulatorDevice`）上的 step ramp、comm ramp、
+      `ResetRequired` 重连各有用例；另加一条解码线上 `config_stepper` 的用例（验 `invert_step`/
+      `step_pulse_ticks` 真从节里来）。**余项**：`--task motion` 的假板 e2e 做不了（假件
+      `stepper_get_position` 恒答 0，位置断言无法通过）；真板双机并发项仍需上真板。
 
 ### G1b gcode 调度器与上游的行为差异（框架部分 FW4）
 

@@ -86,6 +86,8 @@ cargo test --workspace -- --test-threads=1 2>&1 | scripts/test-timings.py
 | `mcu/object.rs:56` 的 `RECONNECT_DELAY` | 250ms | 重连前等待（`object.rs:543`） |
 | 发送任务的 1ms 合批定时器 | ~1ms × 多次 | `mcu/mod.rs:1866` |
 
+（另有两条 `toolhead.rs` 的归零用例曾各花 13.4s：那是 drip 循环按**真实时钟**推进 ~1200 轮（`DRIP_LOOKAHEAD=0.010`）。它们已改 `#[tokio::test(start_paused = true)]`（`klippy.rs` 的 restart 三条同款）→ **0.01s**，同一份代码路径与同样轮数，未缩规模、未动产品常量。）
+
 实测手段（`waits-mcu` 单元用过、可照做）：`strace -f -tt -e trace=clock_nanosleep,epoll_wait <单测>`
 能把一段 wall time 逐笔拆到「哪个常量、睡了几次」；`SYNC_SEND_WAIT` 那两例就是 200 次 ≥1ms 的
 `clock_nanosleep`，恰在 1.00s deadline 上结束。

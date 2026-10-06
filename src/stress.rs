@@ -57,15 +57,19 @@ use std::time::{Duration, Instant};
 
 use crate::core::klippy::cmd::config::{ConfigState, GetConfig, Reset};
 use crate::core::klippy::cmd::stepper::{
-    ConfigStepper, QueueStep, ResetStepClock, SetNextStepDir, StepperGetPosition, StepperPosition,
+    QueueStep, ResetStepClock, SetNextStepDir, StepperGetPosition, StepperPosition,
 };
 use crate::core::klippy::cmd::uptime::{GetUptime, Uptime};
 use crate::core::klippy::cmd::{GetClock, McuCommand};
 use crate::core::klippy::config::mcu::McuConfig;
 use crate::core::klippy::config::{AccessTracking, Config, ConfigSection, ConfigWrapper};
+use crate::core::klippy::extras::board_pins::BoardPins;
 use crate::core::klippy::mathutil::Xyz;
-use crate::core::klippy::mcu::{ConfigBuilder, Mcu, McuError};
+use crate::core::klippy::mcu::{pin_number, ConfigBuilder, Mcu, McuChip, McuError};
 use crate::core::klippy::motion::{Axis, StepCommand, Stepper, Trapq};
+use crate::core::klippy::pins::{PinParams, PrinterPins, PINS_OBJECT};
+use crate::core::klippy::printer::Printer;
+use crate::core::klippy::reactor::ManualReactor;
 
 /// The first step rate to try, in steps per second.
 ///
@@ -241,6 +245,14 @@ async fn stress(args: StressArgs) -> Result<(), Box<dyn std::error::Error>> {
     let names = select_mcus(&config, &args.mcu, args.all_mcus)
         .map_err(|err| format!("{err} in {}", args.config_file))?;
 
+    // The run's pin vocabulary: one chip per `[mcu]` section (so `[board_pins]`
+    // may name any of them) and the config's aliases, loaded through the same
+    // `[board_pins]` loader production uses. Every stepper below is built
+    // through this registry, so its pins are parsed, aliased and numbered
+    // exactly as a real load would do — and the firmware `config_stepper` gets
+    // the same `invert_step`/`step_pulse_ticks` production would send.
+    let pins = build_pin_registry(&config)?;
+
     // Connect one board at a time: each opens its own port and runs its own
     // identify, and a board that refuses must not stop the others from being
     // driven — its failure is reported at the end instead.
@@ -277,7 +289,7 @@ async fn stress(args: StressArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Any board's own result — the run itself, reported per board inside.
-    let (run_failures, ran) = drive_boards(boards, &config, &args).await;
+    let (run_failures, ran) = drive_boards(boards, &config, &args, &pins).await;
     failures.extend(run_failures);
 
     // Any board's hard error fails the command (exit code 1); a board that
@@ -317,6 +329,7 @@ async fn drive_boards(
     boards: Vec<(McuConfig, Arc<Mcu>)>,
     config: &Config,
     args: &StressArgs,
+    pins: &Arc<PrinterPins>,
 ) -> (Vec<String>, usize) {
     let named = !args.all_mcus;
     let (mcu_configs, connections): (Vec<McuConfig>, Vec<Arc<Mcu>>) = boards.into_iter().unzip();
@@ -329,7 +342,7 @@ async fn drive_boards(
     let ramps = connections
         .into_iter()
         .zip(&mcu_configs)
-        .map(|(mcu, mcu_config)| run_board(mcu_config, mcu, args.task, config, args, named))
+        .map(|(mcu, mcu_config)| run_board(mcu_config, mcu, args.task, config, args, named, pins))
         .collect::<Vec<_>>();
     let mut failures = Vec::new();
     let mut ran = 0usize;
@@ -359,6 +372,7 @@ async fn run_board(
     config: &Config,
     args: &StressArgs,
     named: bool,
+    pins: &Arc<PrinterPins>,
 ) -> Result<BoardOutcome, Box<dyn std::error::Error>> {
     // The session's only reference from the moment this future runs: a caller
     // holding a clone would leave `configure_steppers`' `drop(mcu)` in the
@@ -371,9 +385,9 @@ async fn run_board(
         mcu_config.name
     );
     match task {
-        Task::Step => step_stress(mcu_config, mcu, config, args, named).await,
+        Task::Step => step_stress(mcu_config, mcu, config, args, named, pins).await,
         Task::Comm => comm_stress(mcu, args).await.map(|()| BoardOutcome::Ran),
-        Task::Motion => motion_smoke(mcu_config, mcu, config)
+        Task::Motion => motion_smoke(mcu_config, mcu, config, pins)
             .await
             .map(|()| BoardOutcome::Ran),
     }
@@ -471,8 +485,9 @@ async fn step_stress(
     config: &Config,
     args: &StressArgs,
     named: bool,
+    pins: &Arc<PrinterPins>,
 ) -> Result<BoardOutcome, Box<dyn std::error::Error>> {
-    let (steppers, rejected) = find_steppers(config, &mcu_config.name, &mcu);
+    let (steppers, rejected) = find_steppers(config, &mcu_config.name, &mcu, pins);
     for reason in &rejected {
         println!("{}", tagged(&mcu_config.name, format!("skipped {reason}")));
     }
@@ -484,23 +499,23 @@ async fn step_stress(
         }
         StepPlan::Fail(line) => return Err(line.into()),
     };
-    for (section, step_pin, dir_pin) in &steppers {
+    for section in &steppers {
+        let (step_pin, dir_pin) = section.numbers;
         println!(
             "{}",
             tagged(
                 &mcu_config.name,
-                format!("using [{section}] -> step_pin={step_pin} dir_pin={dir_pin}")
+                format!(
+                    "using [{}] -> step_pin={step_pin} dir_pin={dir_pin}",
+                    section.name
+                )
             )
         );
     }
 
     // The handshake can reconnect (a firmware with no `config_reset` reboots), so
     // bind the events only once the connection is final.
-    let pins = steppers
-        .iter()
-        .map(|&(_, step_pin, dir_pin)| (step_pin, dir_pin))
-        .collect::<Vec<_>>();
-    let (oids, mcu) = configure_steppers(mcu_config, mcu, &pins).await?;
+    let (oids, mcu) = configure_steppers(mcu_config, mcu, pins, &steppers).await?;
     let shutdown_reason: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     bind_shutdown(&mcu, &shutdown_reason)?;
 
@@ -929,16 +944,15 @@ fn resolve_mcu(config: &Config, name: &str) -> Result<McuConfig, String> {
 /// `itersolve`, compressed by the full `stepcompress`, sent as `queue_step`
 /// commands, and the firmware's own `stepper_get_position` is compared with the
 /// distance the move asked for. It borrows the same step/dir pins as
-/// `--task step`, so it needs no full `[printer]` config (and never touches the
-/// unknown Y/Z pins).
+/// `--task step` — and the same step distance the section configures
+/// (`rotation_distance` over `microsteps` and gearing) — so it needs no full
+/// `[printer]` config (and never touches the unknown Y/Z pins).
 async fn motion_smoke(
     mcu_config: &McuConfig,
     mcu: Arc<Mcu>,
     config: &Config,
+    pins: &Arc<PrinterPins>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    /// Millimetres per step for the smoke move (100 steps/mm, so the firmware's
-    /// step count is easy to read).
-    const STEP_DIST: f64 = 0.01;
     /// The move is `DISTANCE` mm at `SPEED` mm/s.
     const DISTANCE: f64 = 5.0;
     const SPEED: f64 = 10.0;
@@ -948,21 +962,27 @@ async fn motion_smoke(
 
     // The smoke test drives one stepper: it takes the first the board owns
     // (the step task drives all of them) and reports what it rejected, if any.
-    let (steppers, rejected) = find_steppers(config, &mcu_config.name, &mcu);
+    let (steppers, rejected) = find_steppers(config, &mcu_config.name, &mcu, pins);
     for reason in &rejected {
         println!("{}", tagged(&mcu_config.name, format!("skipped {reason}")));
     }
-    let Some((stepper_section, step_pin, dir_pin)) = steppers.into_iter().next() else {
+    let Some(section) = steppers.into_iter().next() else {
         return Err(no_stepper_error(&mcu_config.name, &rejected).into());
     };
+    let (step_pin, dir_pin) = section.numbers;
+    let step_dist = section.options.step_dist.unwrap_or(DEFAULT_SMOKE_STEP_DIST);
     println!(
         "{}",
         tagged(
             &mcu_config.name,
-            format!("using [{stepper_section}] -> step_pin={step_pin} dir_pin={dir_pin}")
+            format!(
+                "using [{}] -> step_pin={step_pin} dir_pin={dir_pin} (step_dist={step_dist:.6} mm)",
+                section.name
+            )
         )
     );
-    let (oids, mcu) = configure_steppers(mcu_config, mcu, &[(step_pin, dir_pin)]).await?;
+    let (oids, mcu) =
+        configure_steppers(mcu_config, mcu, pins, std::slice::from_ref(&section)).await?;
     let oid = oids[0];
     let freq = mcu.clock_freq().map_err(std::io::Error::other)?;
 
@@ -982,7 +1002,7 @@ async fn motion_smoke(
         .map(|clock| clock as f64 / freq)
         .unwrap_or(1.0);
 
-    let mut stepper = Stepper::cartesian("smoke", u32::from(oid), STEP_DIST, Axis::X, freq);
+    let mut stepper = Stepper::cartesian("smoke", u32::from(oid), step_dist, Axis::X, freq);
     // Start 100 ms after the board's now, so the first step is comfortably in the
     // future and the whole schedule lands where the firmware expects it.
     let print_time = now + 0.1;
@@ -1001,7 +1021,7 @@ async fn motion_smoke(
     );
     let flush_time = print_time + duration + 0.01;
     let commands = stepper.generate(&trapq, flush_time)?;
-    let expected = (DISTANCE / STEP_DIST).round() as i32;
+    let expected = (DISTANCE / step_dist).round() as i32;
     println!(
         "{}",
         tagged(
@@ -1130,16 +1150,20 @@ fn describe_commands(commands: &[StepCommand]) -> String {
 /// rejected here with that wording — per section, so one bad section does not
 /// sink the board.
 ///
-/// A section is either collected — its step/dir pair resolved against this
-/// board's dictionary — or rejected with a message that starts with the
-/// section's name. A section with no step/dir pair at all is skipped silently,
-/// as it always was.
+/// The pin descriptions are parsed by the same [`PrinterPins`] production uses,
+/// so `!` (invert), `chip:` prefixes and `[board_pins]` aliases all mean here
+/// what they mean there, and the step pin's `!` is carried as upstream's
+/// `invert_step`. A section is either collected — its step/dir pair resolved
+/// through the registry and the numbered pins named this board's — or rejected
+/// with a message that starts with the section's name. A section with no
+/// step/dir pair at all is skipped silently, as it always was.
 fn find_steppers(
     config: &Config,
     mcu_name: &str,
     mcu: &Mcu,
-) -> (Vec<(String, u8, u8)>, Vec<String>) {
-    let mut selected: Vec<(String, u8, u8)> = Vec::new();
+    pins: &PrinterPins,
+) -> (Vec<StepperSource>, Vec<String>) {
+    let mut selected: Vec<StepperSource> = Vec::new();
     let mut rejected: Vec<String> = Vec::new();
     for section in config.sections() {
         if !(section.id.starts_with("stepper_") || section.id == "manual_stepper") {
@@ -1151,26 +1175,228 @@ fn find_steppers(
         ) else {
             continue;
         };
+        let name = section.identifier();
+        let step_params = match pins.parse_pin(&step, true, false) {
+            Ok(params) => params,
+            Err(err) => {
+                rejected.push(format!("{name}: {err}"));
+                continue;
+            }
+        };
         // Ownership: `step_pin`'s chip; an unprefixed pin names the bare `[mcu]`.
-        if chip_of(&step).unwrap_or("mcu") != mcu_name {
+        if step_params.chip_name != mcu_name {
             continue;
         }
-        let name = section.identifier();
-        if chip_of(&dir).unwrap_or("mcu") != mcu_name {
+        let dir_params = match pins.parse_pin(&dir, true, false) {
+            Ok(params) => params,
+            Err(err) => {
+                rejected.push(format!("{name}: {err}"));
+                continue;
+            }
+        };
+        if dir_params.chip_name != mcu_name {
             rejected.push(format!(
                 "{name}: Stepper dir pin must be on same mcu as step pin (step_pin '{step}', dir_pin '{dir}')"
             ));
             continue;
         }
-        match (
-            resolve_pin(mcu, mcu_name, &step),
-            resolve_pin(mcu, mcu_name, &dir),
+        let numbers = match (
+            resolve_number(pins, mcu, mcu_name, &step_params),
+            resolve_number(pins, mcu, mcu_name, &dir_params),
         ) {
-            (Ok(step_pin), Ok(dir_pin)) => selected.push((name, step_pin, dir_pin)),
-            (Err(err), _) | (_, Err(err)) => rejected.push(format!("{name}: {err}")),
-        }
+            (Ok(step_pin), Ok(dir_pin)) => (step_pin, dir_pin),
+            (Err(err), _) | (_, Err(err)) => {
+                rejected.push(format!("{name}: {err}"));
+                continue;
+            }
+        };
+        let options = match read_stepper_options(section, pins, mcu, mcu_name) {
+            Ok(options) => options,
+            Err(err) => {
+                rejected.push(format!("{name}: {err}"));
+                continue;
+            }
+        };
+        selected.push(StepperSource {
+            name,
+            step_pin: step,
+            dir_pin: dir,
+            numbers,
+            options,
+        });
     }
     (selected, rejected)
+}
+
+/// One stepper section a board drives: the pins as written and the options
+/// production feeds into the firmware stepper.
+///
+/// The pins stay as written (with `!`/`chip:`/alias intact) so the real
+/// resource can resolve them again when it builds `config_stepper`; `numbers`
+/// is what the report line prints and what the per-section rejection was based
+/// on. The options are read by [`read_stepper_options`].
+#[derive(Debug, Clone)]
+struct StepperSource {
+    /// The section identifier (`stepper_x`, `manual_stepper docking`).
+    name: String,
+    /// `step_pin` as written.
+    step_pin: String,
+    /// `dir_pin` as written.
+    dir_pin: String,
+    /// The firmware numbers the two pins resolve to, for the report line.
+    numbers: (u8, u8),
+    /// What `[stepper_*]` gives the firmware stepper beyond the pins.
+    options: StepperOptions,
+}
+
+/// The section options the stress stepper takes over from production.
+#[derive(Debug, Clone)]
+struct StepperOptions {
+    /// `step_pulse_duration` in seconds (upstream's default when absent),
+    /// which the resource turns into `step_pulse_ticks` on the wire.
+    step_pulse_duration: f64,
+    /// `enable_pin` as written, when the section names one: the driver is
+    /// switched on for the run, as production's `stepper_enable` does.
+    enable_pin: Option<String>,
+    /// The chip `enable_pin` names, when that pin is this board's: only then is
+    /// it driven here (another board's enable is its own run's business).
+    enable_chip: Option<String>,
+    /// Millimetres per step (`rotation_distance` over `microsteps` and gearing),
+    /// what the `--task motion` smoke moves by. `None` when the section carries
+    /// no production geometry at all (the step task needs none).
+    step_dist: Option<f64>,
+}
+
+/// The pulse width upstream uses when `step_pulse_duration` is absent
+/// (`klippy/stepper.py:80`, `extras/stepper.rs`'s `DEFAULT_STEP_PULSE_DURATION`).
+const DEFAULT_STEP_PULSE_DURATION: f64 = 0.000_002;
+
+/// The step distance the motion smoke moves by when the section names no
+/// geometry — the value the smoke always used (100 steps/mm). A section that
+/// *does* spell out geometry is held to production's rules instead.
+const DEFAULT_SMOKE_STEP_DIST: f64 = 0.01;
+
+/// Read the `[stepper_*]` / `[manual_stepper]` options the stress stepper takes
+/// from production: the pulse width, the enable pin, and the step distance.
+///
+/// The bounds are the ones `extras/stepper.rs` applies, so a value production
+/// would refuse is refused here too rather than silently clamped.
+fn read_stepper_options(
+    section: &ConfigSection,
+    pins: &PrinterPins,
+    mcu: &Mcu,
+    mcu_name: &str,
+) -> Result<StepperOptions, String> {
+    let config = ConfigWrapper::untracked(section);
+    let step_pulse_duration = config
+        .get_float_bounded(
+            "step_pulse_duration",
+            Some(DEFAULT_STEP_PULSE_DURATION),
+            Some(0.0),
+            Some(0.001),
+            None,
+            None,
+        )
+        .map_err(|err| err.to_string())?;
+    // The enable pin is only driven when it is this board's; a pin on another
+    // board is neither validated here nor touched (that board drives its own).
+    let (enable_pin, enable_chip) = match config.get_str("enable_pin") {
+        Some(enable) => {
+            let params = pins
+                .parse_pin(&enable, true, false)
+                .map_err(|err| err.to_string())?;
+            // Only this board's own enable pin is checked here; one on another
+            // board is left to that board's run.
+            if params.chip_name == mcu_name {
+                resolve_number(pins, mcu, mcu_name, &params)?;
+            }
+            (Some(enable), Some(params.chip_name))
+        }
+        None => (None, None),
+    };
+    let step_dist = read_step_dist(&config, section)?;
+    Ok(StepperOptions {
+        step_pulse_duration,
+        enable_pin,
+        enable_chip,
+        step_dist,
+    })
+}
+
+/// The step distance production would use: `rotation_distance` over full steps,
+/// `microsteps` and gearing (`extras/stepper.rs`'s `parse_step_distance`),
+/// including its radians inference for a section with `gear_ratio` but no
+/// `rotation_distance`.
+///
+/// `None` when the section carries no geometry at all: the step task only
+/// borrows step/dir pins, so it must keep working on a section with nothing
+/// else. A section that names *some* of the geometry is held to production's
+/// rules, so a half-written geometry is an error rather than a silent default.
+fn read_step_dist(config: &ConfigWrapper, section: &ConfigSection) -> Result<Option<f64>, String> {
+    if !config.has("rotation_distance") && !config.has("gear_ratio") && !config.has("microsteps") {
+        return Ok(None);
+    }
+    let identifier = section.identifier();
+    let microsteps = config
+        .get_int_bounded("microsteps", None, Some(1), None)
+        .map_err(|err| err.to_string())?;
+    let full_steps = config
+        .get_int("full_steps_per_rotation", Some(200))
+        .map_err(|err| err.to_string())?;
+    if full_steps < 1 || full_steps % 4 != 0 {
+        return Err(format!(
+            "full_steps_per_rotation invalid in section '{identifier}'"
+        ));
+    }
+    let gear_ratio = config
+        .get_list_of_lists("gear_ratio", ',', ':', 2)
+        .map_err(|err| err.to_string())?
+        .into_iter()
+        .map(|pair| {
+            let first = pair[0].trim().parse::<f64>().map_err(|_| {
+                format!("Unable to parse option 'gear_ratio' in section '{identifier}'")
+            })?;
+            let second = pair[1].trim().parse::<f64>().map_err(|_| {
+                format!("Unable to parse option 'gear_ratio' in section '{identifier}'")
+            })?;
+            if second == 0.0 {
+                return Err(format!(
+                    "Option 'gear_ratio' in section '{identifier}' must not divide by zero"
+                ));
+            }
+            Ok(first / second)
+        })
+        .collect::<Result<Vec<f64>, String>>()?
+        .into_iter()
+        .product::<f64>()
+        .max(f64::MIN_POSITIVE);
+    let units_in_radians = !config.has("rotation_distance") && config.has("gear_ratio");
+    let rotation_distance = if units_in_radians {
+        std::f64::consts::TAU
+    } else {
+        config
+            .get_float_bounded("rotation_distance", None, None, None, Some(0.0), None)
+            .map_err(|err| err.to_string())?
+    };
+    let steps_per_rotation = full_steps as f64 * microsteps as f64 * gear_ratio;
+    Ok(Some(rotation_distance / steps_per_rotation))
+}
+
+/// Resolve a parsed pin to its firmware number through the F2 registry: follow
+/// aliases first, then look the canonical name up in the board's enumeration.
+fn resolve_number(
+    pins: &PrinterPins,
+    mcu: &Mcu,
+    chip_name: &str,
+    params: &PinParams,
+) -> Result<u8, String> {
+    let canonical = pins
+        .resolve_pin(chip_name, &params.pin)
+        .map_err(|err| err.to_string())?;
+    let number = pin_number(mcu, &canonical, chip_name).map_err(|err| err.to_string())?;
+    u8::try_from(number).map_err(|_| {
+        format!("pin '{canonical}' is number {number}, which does not fit the byte `config_stepper` wants")
+    })
 }
 
 /// The hard error for a board that was promised a stepper and owns none.
@@ -1196,7 +1422,7 @@ fn no_stepper_error(mcu_name: &str, rejected: &[String]) -> String {
 #[derive(Debug)]
 enum StepPlan {
     /// Drive all of the board's steppers — one oid and anchor each, one ramp.
-    Drive(Vec<(String, u8, u8)>),
+    Drive(Vec<StepperSource>),
     /// `--all-mcus` found a board with no stepper of its own: print this line
     /// and move on, without touching the exit code.
     Skip(String),
@@ -1212,7 +1438,7 @@ enum StepPlan {
 /// a named board without a stepper is the error it has always been.
 fn plan_stepper_task(
     mcu_name: &str,
-    steppers: Vec<(String, u8, u8)>,
+    steppers: Vec<StepperSource>,
     rejected: &[String],
     named: bool,
 ) -> StepPlan {
@@ -1252,6 +1478,54 @@ async fn reconnect(mcu_config: &McuConfig) -> Result<Arc<Mcu>, std::io::Error> {
     )))
 }
 
+/// The run's pin registry: one chip per `[mcu]` section and the config's
+/// `[board_pins]` aliases, built the way a real load builds them.
+///
+/// Every board in the config gets a chip — not only the ones being driven —
+/// because `[board_pins]` may name any of them, exactly as `pins.py`'s
+/// `register_chip` walk would. Each chip owns the [`ConfigBuilder`] its
+/// steppers add `config_stepper` to.
+fn build_pin_registry(config: &Config) -> Result<Arc<PrinterPins>, Box<dyn std::error::Error>> {
+    let pins = Arc::new(PrinterPins::new());
+    for section in config.sections().filter(|section| section.id == "mcu") {
+        let name = section.sub.as_deref().unwrap_or("mcu").to_string();
+        let chip = McuChip::new(
+            name.clone(),
+            Arc::new(ConfigBuilder::new()),
+            Arc::clone(&pins),
+        );
+        pins.register_chip(&name, Arc::new(chip))
+            .map_err(|err| format!("[mcu {name}]: {err}"))?;
+    }
+    load_board_pins(config, &pins)?;
+    Ok(pins)
+}
+
+/// Apply the config's `[board_pins]` sections to the registry through the same
+/// loader production uses, so an alias means exactly what it means there.
+///
+/// The loader finds the `pins` object on a printer, so the registry is put on a
+/// bare one for the walk: no other object is registered or read, and the
+/// printer is dropped once the aliases are in.
+fn load_board_pins(
+    config: &Config,
+    pins: &Arc<PrinterPins>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let printer = Arc::new(Printer::new(ManualReactor::shared()));
+    printer.add_object(PINS_OBJECT, pins.clone())?;
+    for section in config
+        .sections()
+        .filter(|section| section.id == "board_pins")
+    {
+        BoardPins::new(
+            &ConfigWrapper::new(section, AccessTracking::shared()),
+            &printer,
+        )
+        .map_err(|err| format!("{}: {err}", section.identifier()))?;
+    }
+    Ok(())
+}
+
 /// Configure the board's stress steppers: one oid and one move-queue reserve
 /// each, **one** configuration handshake for the board, and the connection
 /// (which a reconnect may have replaced).
@@ -1260,9 +1534,14 @@ async fn reconnect(mcu_config: &McuConfig) -> Result<Arc<Mcu>, std::io::Error> {
 /// one handshake per stepper: `finalize_config` locks the firmware
 /// (`src/basecmd.c:173` — a second one shuts down with `Already finalized`),
 /// and a later handshake carrying a different CRC would `config_reset` the
-/// board and drop every stepper configured before it. So the per-stepper half
-/// lives in [`stress_stepper`], called once per pin pair below, and the
-/// handshake logic exists exactly once, here.
+/// board and drop every stepper configured before it.
+///
+/// Each stepper is the **real resource** (`PrinterPins::setup_stepper`), so the
+/// firmware `config_stepper` carries the section's own `invert_step` (the step
+/// pin's `!`) and `step_pulse_ticks` (`step_pulse_duration`), and its pins are
+/// resolved through the same registry (aliases included) production uses. The
+/// section's `enable_pin`, when it names one on this board, is switched on for
+/// the run as `stepper_enable` would.
 ///
 /// A firmware with no `config_reset` can only accept the configuration by
 /// rebooting itself (`ResetRequired`), which drops the connection, so this
@@ -1270,17 +1549,56 @@ async fn reconnect(mcu_config: &McuConfig) -> Result<Arc<Mcu>, std::io::Error> {
 async fn configure_steppers(
     mcu_config: &McuConfig,
     mut mcu: Arc<Mcu>,
-    pins: &[(u8, u8)],
+    pins: &PrinterPins,
+    sections: &[StepperSource],
 ) -> Result<(Vec<u8>, Arc<Mcu>), std::io::Error> {
-    let builder = ConfigBuilder::new();
-    let mut oids = Vec::with_capacity(pins.len());
-    for &(step_pin, dir_pin) in pins {
-        oids.push(stress_stepper(&builder, step_pin, dir_pin)?);
+    let chip = pins.chip_as::<McuChip>(&mcu_config.name).ok_or_else(|| {
+        std::io::Error::other(format!(
+            "no pin chip registered for MCU '{}'",
+            mcu_config.name
+        ))
+    })?;
+    let builder = chip.config();
+
+    let mut steppers = Vec::with_capacity(sections.len());
+    // Shared enable lines are written the same way on every section that uses
+    // them, so the pin is switched on once.
+    let mut enabled: Vec<String> = Vec::new();
+    for section in sections {
+        let stepper = pins
+            .setup_stepper(
+                &section.step_pin,
+                &section.dir_pin,
+                section.options.step_pulse_duration,
+            )
+            .map_err(|err| std::io::Error::other(format!("{}: {err}", section.name)))?;
+        for _ in 0..MOVE_SLOTS {
+            builder
+                .request_move_queue_slot()
+                .map_err(|err| std::io::Error::other(format!("request_move_queue_slot: {err}")))?;
+        }
+        if let Some(enable) = &section.options.enable_pin {
+            if section.options.enable_chip.as_deref() == Some(&mcu_config.name)
+                && !enabled.iter().any(|seen| seen == enable)
+            {
+                pins.setup_static_digital_out(enable).map_err(|err| {
+                    std::io::Error::other(format!("{}: enable_pin: {err}", section.name))
+                })?;
+                enabled.push(enable.clone());
+            }
+        }
+        steppers.push(stepper);
     }
 
     let mut built = builder
         .build(&mcu)
         .map_err(|err| std::io::Error::other(format!("build: {err}")))?;
+    // The resource assigned its oid in its config callback, which just ran.
+    let oids = steppers
+        .iter()
+        .map(|stepper| stepper.oid())
+        .collect::<Result<Vec<u8>, McuError>>()
+        .map_err(|err| std::io::Error::other(format!("stepper oid: {err}")))?;
     let mut reset_sent = false;
     let configured = loop {
         match builder.handshake(&mcu, &mut built, false).await {
@@ -1359,38 +1677,6 @@ async fn configure_steppers(
         )
     );
     Ok((oids, mcu))
-}
-
-/// One stress stepper's half of the pending configuration: its own oid, its
-/// own [`MOVE_SLOTS`] entries of the board's move queue, its own
-/// `config_stepper` command.
-///
-/// `enable_pin` and the rest of the section's options stay ignored, as they
-/// always were: this builds a fixed stepper (`invert_step = 0`,
-/// `step_pulse_ticks = 0`) that only borrows the step/dir pin pair.
-fn stress_stepper(
-    builder: &ConfigBuilder,
-    step_pin: u8,
-    dir_pin: u8,
-) -> Result<u8, std::io::Error> {
-    let oid = builder
-        .create_oid()
-        .map_err(|err| std::io::Error::other(format!("create_oid: {err}")))?;
-    for _ in 0..MOVE_SLOTS {
-        builder
-            .request_move_queue_slot()
-            .map_err(|err| std::io::Error::other(format!("request_move_queue_slot: {err}")))?;
-    }
-    builder
-        .add_config_cmd(&ConfigStepper {
-            oid,
-            step_pin,
-            dir_pin,
-            invert_step: 0,
-            step_pulse_ticks: 0,
-        })
-        .map_err(|err| std::io::Error::other(format!("config_stepper: {err}")))?;
-    Ok(oid)
 }
 
 /// One stage's `queue_step` commands, in the order they go out.
@@ -1553,41 +1839,6 @@ fn section_string(section: &ConfigSection, key: &str) -> Option<String> {
         .map(|value| value.trim().to_string())
 }
 
-/// The chip a pin names, when it is written `chip:pin`.
-fn chip_of(pin: &str) -> Option<&str> {
-    pin.split_once(':').map(|(chip, _)| chip.trim())
-}
-
-/// Resolve `pin` (as written in a config section) to the firmware's pin number.
-///
-/// Handles the `chip:pin` form and a trailing `!` (invert), which is ignored:
-/// the stress stepper always uses `invert_step = 0`.
-fn resolve_pin(mcu: &Mcu, mcu_name: &str, pin: &str) -> Result<u8, String> {
-    let pin = pin.trim().trim_end_matches('!');
-    let local = match pin.split_once(':') {
-        Some((chip, name)) if chip.trim() == mcu_name => name.trim(),
-        Some((chip, _)) => {
-            return Err(format!(
-                "pin '{pin}' belongs to MCU '{}', not '{mcu_name}'",
-                chip.trim()
-            ))
-        }
-        None => pin,
-    };
-    let dictionary = mcu
-        .dictionary()
-        .ok_or_else(|| "the MCU is not identified".to_string())?;
-    let number = dictionary
-        .enumeration("pin")
-        .and_then(|enumeration| enumeration.value(local))
-        .ok_or_else(|| format!("pin '{local}' is not in this MCU's pin enumeration"))?;
-    u8::try_from(number).map_err(|_| {
-        format!(
-            "pin '{local}' is number {number}, which does not fit the byte `config_stepper` wants"
-        )
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1644,13 +1895,6 @@ mod tests {
         let mut config = Config::new();
         config.add_section(section("mcu", None, &[("serial", "/dev/ttyACM0")]));
         assert!(find_mcu_section(&config, mcu_name("")).is_some());
-    }
-
-    #[test]
-    fn a_pin_names_its_chip_only_when_it_has_a_colon() {
-        assert_eq!(chip_of("PA0"), None);
-        assert_eq!(chip_of("zboard:PA0"), Some("zboard"));
-        assert_eq!(chip_of("mcu:PB1"), Some("mcu"));
     }
 
     #[test]
@@ -1726,6 +1970,25 @@ mod tests {
         assert_eq!(stage.commands, MOVE_SLOTS);
     }
 
+    /// A pin registry with a chip for every named board, the way a run builds
+    /// one: the same registry [`find_steppers`] and the stepper resource resolve
+    /// through.
+    fn fixture_pins(boards: &[&str]) -> Arc<PrinterPins> {
+        let pins = Arc::new(PrinterPins::new());
+        for name in boards {
+            let chip = McuChip::new(
+                (*name).to_string(),
+                Arc::new(ConfigBuilder::new()),
+                Arc::clone(&pins),
+            );
+            pins.register_chip(name, Arc::new(chip)).unwrap();
+        }
+        pins
+    }
+
+    /// The registry parses the description production parses — leading `!`,
+    /// `mcu:`/`chip:` prefixes, and `[board_pins]` aliases — and the number comes
+    /// from the firmware's own `pin` enumeration.
     #[tokio::test]
     async fn a_pin_resolves_through_the_firmware_enumeration() {
         use crate::core::klippy::interface::devices::frame_mock::FrameMock;
@@ -1740,14 +2003,28 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+        let pins = fixture_pins(&["mcu", "zboard"]);
+        let number = |pins: &PrinterPins, description: &str| {
+            let params = pins.parse_pin(description, true, false).unwrap();
+            resolve_number(pins, &mcu, &params.chip_name, &params)
+        };
 
-        assert_eq!(resolve_pin(&mcu, "mcu", "PA0"), Ok(0));
-        assert_eq!(resolve_pin(&mcu, "mcu", "mcu:PB1"), Ok(7));
-        // A trailing `!` (invert) is not part of the name.
-        assert_eq!(resolve_pin(&mcu, "mcu", "PB1!"), Ok(7));
-        // A pin on another chip, and a name the firmware does not know.
-        assert!(resolve_pin(&mcu, "mcu", "zboard:PB1").is_err());
-        assert!(resolve_pin(&mcu, "mcu", "PC9").is_err());
+        assert_eq!(number(&pins, "PA0"), Ok(0));
+        // The chip prefix is the pinned form, and a leading `!` is invert, not
+        // part of the name — `!PA0` names PA0.
+        assert_eq!(number(&pins, "mcu:PB1"), Ok(7));
+        assert_eq!(number(&pins, "!PB1"), Ok(7));
+        // A name the firmware does not know.
+        assert!(number(&pins, "PC9").is_err());
+
+        // An alias resolves to the pin it names. One pin used under two names
+        // in the same run is upstream's `IsAlias` error, so this is its own
+        // registry, where the alias is the only name the pin ever had.
+        let pins = fixture_pins(&["mcu"]);
+        pins.alias_pin("mcu", "X_STEP", "PA0").unwrap();
+        assert_eq!(number(&pins, "X_STEP"), Ok(0));
+        // `!` comes before the chip prefix, not after it (`!mcu:X_STEP`).
+        assert_eq!(number(&pins, "!mcu:X_STEP"), Ok(0));
     }
 
     // -----------------------------------------------------------------------
@@ -2185,11 +2462,19 @@ mod tests {
             .build(&mcu)
             .expect("an empty configuration builds")
             .crc;
-        let step_pin = resolve_pin(&mcu, "mcu", "PA0").expect("PA0 resolves");
-        let dir_pin = resolve_pin(&mcu, "mcu", "PB0").expect("PB0 resolves");
-        let stress_builder = ConfigBuilder::new();
-        stress_stepper(&stress_builder, step_pin, dir_pin).expect("the stress stepper fits");
-        let stress_crc = stress_builder
+        // The configuration the run will send — the same registry and the same
+        // real stepper resource — so its CRC is the one the handshake compares
+        // against. This probe uses a throwaway registry: the one the run builds
+        // inside `stress` must still be unfinalized when it gets there.
+        let probe = build_pin_registry(&config).expect("the pin registry builds");
+        let probe_builder = probe.chip_as::<McuChip>("mcu").unwrap().config();
+        probe
+            .setup_stepper("PA0", "PB0", DEFAULT_STEP_PULSE_DURATION)
+            .expect("the stress stepper fits");
+        for _ in 0..MOVE_SLOTS {
+            probe_builder.request_move_queue_slot().unwrap();
+        }
+        let stress_crc = probe_builder
             .build(&mcu)
             .expect("the stress configuration builds")
             .crc;
@@ -2211,7 +2496,8 @@ mod tests {
         ])
         .expect("a short, coarse ramp parses")
         .stress;
-        let (failures, ran) = drive_boards(vec![(mcu_config, mcu)], &config, &args).await;
+        let pins = build_pin_registry(&config).expect("the pin registry builds");
+        let (failures, ran) = drive_boards(vec![(mcu_config, mcu)], &config, &args, &pins).await;
         assert!(
             failures.is_empty(),
             "the board's ramp does not fail: {failures:?}"
@@ -2228,6 +2514,83 @@ mod tests {
             old_session.upgrade().is_none(),
             "the old session must be dropped before the port is reopened"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // End to end against a `test: dict=` fake board
+    // -----------------------------------------------------------------------
+
+    /// A whole `--task step` run against a `test: dict=` fake: identify →
+    /// configure (through the real stepper resource) → the ramp's `queue_step`
+    /// stages. The pins are reached through `[board_pins]` aliases with a leading
+    /// `!`, so this is the path a real invocation takes, end to end.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_step_ramp_runs_end_to_end_against_a_fake_board() {
+        use clap::Parser;
+
+        let dict = klipperx_test_support::test_dicts_dir().join("atmega2560.dict");
+        let path =
+            std::env::temp_dir().join(format!("klipperx-stress-step-{}.cfg", std::process::id()));
+        std::fs::write(
+            &path,
+            format!(
+                "[mcu]\ntest: dict={}\n\n\
+                 [board_pins]\nmcu: mcu\naliases: X_STEP=PA0, X_DIR=PB0, X_EN=PC0\n\n\
+                 [stepper_x]\nstep_pin: X_STEP\ndir_pin: X_DIR\nenable_pin: !X_EN\n\
+                 microsteps: 16\nrotation_distance: 40\n",
+                dict.display()
+            ),
+        )
+        .expect("the config file is written");
+        let args = Cli::try_parse_from([
+            "stress",
+            path.to_str().expect("the temp path is utf-8"),
+            "--stage-seconds",
+            "0.01",
+            "--rate-step",
+            "100",
+        ])
+        .expect("a short, coarse ramp parses")
+        .stress;
+        let outcome = stress(args).await;
+        let _ = std::fs::remove_file(&path);
+
+        // Whatever the ramp finds — the fake's step model can shut down, or the
+        // ramp can reach its top — a shutdown is the measurement, not an error.
+        outcome.expect("the step ramp ran to the end of the command");
+    }
+
+    /// A whole `--task comm` ramp against a `test: dict=` fake: identify, then
+    /// `get_clock` round-trips at a rising request rate. The comm task never
+    /// configures the firmware, so this only needs the transport.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_comm_ramp_runs_end_to_end_against_a_fake_board() {
+        use clap::Parser;
+
+        let dict = klipperx_test_support::test_dicts_dir().join("atmega2560.dict");
+        let text = format!("[mcu]\ntest: dict={}\n", dict.display());
+        let (config, _) = Config::from_text(&text).expect("a fake board parses");
+        let mcu_config = resolve_mcu(&config, "mcu").expect("the [mcu] section resolves");
+        let mcu = connect(&mcu_config)
+            .await
+            .expect("the fake board identifies");
+        let args = Cli::try_parse_from([
+            "stress",
+            "printer.cfg",
+            "--task",
+            "comm",
+            "--stage-seconds",
+            "0.5",
+            "--rate-step",
+            "3000",
+        ])
+        .expect("a short comm ramp parses")
+        .stress;
+        let pins = build_pin_registry(&config).expect("the pin registry builds");
+
+        let (failures, ran) = drive_boards(vec![(mcu_config, mcu)], &config, &args, &pins).await;
+        assert!(failures.is_empty(), "{failures:?}");
+        assert_eq!(ran, 1, "the comm ramp identified and ran its stages");
     }
 
     /// The run hands every session to its board future and keeps no reference
@@ -2288,8 +2651,11 @@ mod tests {
     }
 
     /// The section names a selection carries, for compact assertions.
-    fn sections(steppers: &[(String, u8, u8)]) -> Vec<&str> {
-        steppers.iter().map(|(name, _, _)| name.as_str()).collect()
+    fn sections(steppers: &[StepperSource]) -> Vec<&str> {
+        steppers
+            .iter()
+            .map(|section| section.name.as_str())
+            .collect()
     }
 
     /// Ownership is `step_pin`'s chip: a board takes **every** section whose
@@ -2332,18 +2698,19 @@ mod tests {
         let mcu = fixture_mcu();
 
         // The primary board owns both of *its* sections — not just the first.
-        let (mine, rejected) = find_steppers(&config, "mcu", &mcu);
+        let pins = fixture_pins(&["mcu", "zboard"]);
+        let (mine, rejected) = find_steppers(&config, "mcu", &mcu, &pins);
         assert!(rejected.is_empty(), "{rejected:?}");
         assert_eq!(sections(&mine), ["stepper_x", "manual_stepper docking"]);
-        assert_eq!((mine[0].1, mine[0].2), (0, 1), "PA0/PA1 resolved");
-        assert_eq!((mine[1].1, mine[1].2), (3, 4), "PA3/PA4 resolved");
+        assert_eq!(mine[0].numbers, (0, 1), "PA0/PA1 resolved");
+        assert_eq!(mine[1].numbers, (3, 4), "PA3/PA4 resolved");
 
         // … and only its own: `stepper_z`'s endstop on `mcu` pulls nothing
         // towards the primary board, nor `stepper_x`'s enable towards zboard.
-        let (theirs, rejected) = find_steppers(&config, "zboard", &mcu);
+        let (theirs, rejected) = find_steppers(&config, "zboard", &mcu, &pins);
         assert!(rejected.is_empty(), "{rejected:?}");
         assert_eq!(sections(&theirs), ["stepper_z"]);
-        assert_eq!((theirs[0].1, theirs[0].2), (10, 11), "PB0/PB1 resolved");
+        assert_eq!(theirs[0].numbers, (10, 11), "PB0/PB1 resolved");
     }
 
     /// A `dir_pin` on another MCU rejects that one section — with upstream's
@@ -2369,9 +2736,10 @@ mod tests {
             &[("step_pin", "mcu:PA2"), ("dir_pin", "mcu:PA3")],
         ));
         let mcu = fixture_mcu();
+        let pins = fixture_pins(&["mcu", "zboard"]);
 
         // One broken section is rejected; the board's other stepper still runs.
-        let (mine, rejected) = find_steppers(&config, "mcu", &mcu);
+        let (mine, rejected) = find_steppers(&config, "mcu", &mcu, &pins);
         assert_eq!(sections(&mine), ["stepper_ok"]);
         assert_eq!(rejected.len(), 1, "{rejected:?}");
         assert!(rejected[0].starts_with("stepper_bad: "), "{rejected:?}");
@@ -2381,7 +2749,7 @@ mod tests {
         );
 
         // Ownership stays `step_pin`'s chip: the dir pin's board does not claim it.
-        let (theirs, _) = find_steppers(&config, "zboard", &mcu);
+        let (theirs, _) = find_steppers(&config, "zboard", &mcu, &pins);
         assert!(theirs.is_empty(), "a section is never the other board's");
 
         // A board whose *only* section is broken: named → hard error carrying
@@ -2392,7 +2760,7 @@ mod tests {
             None,
             &[("step_pin", "mcu:PA0"), ("dir_pin", "zboard:PB1")],
         ));
-        let (none, rejected) = find_steppers(&broken_only, "mcu", &mcu);
+        let (none, rejected) = find_steppers(&broken_only, "mcu", &mcu, &pins);
         assert!(none.is_empty());
         assert_eq!(rejected.len(), 1, "{rejected:?}");
         match plan_stepper_task("mcu", none, &rejected, true) {
@@ -2429,14 +2797,15 @@ mod tests {
             &[("step_pin", "PA0"), ("dir_pin", "PA1")],
         ));
         let mcu = fixture_mcu();
+        let pins = fixture_pins(&["mcu", "zboard"]);
 
         // `--all-mcus` enumerates boards it did not name (`named` is false).
-        let (primary, primary_rejected) = find_steppers(&config, "mcu", &mcu);
+        let (primary, primary_rejected) = find_steppers(&config, "mcu", &mcu, &pins);
         match plan_stepper_task("mcu", primary, &primary_rejected, false) {
             StepPlan::Drive(steppers) => assert_eq!(sections(&steppers), ["stepper_x"]),
             plan => panic!("the board with a stepper must be driven: {plan:?}"),
         }
-        let (other, other_rejected) = find_steppers(&config, "zboard", &mcu);
+        let (other, other_rejected) = find_steppers(&config, "zboard", &mcu, &pins);
         match plan_stepper_task("zboard", other, &other_rejected, false) {
             StepPlan::Skip(line) => {
                 assert_eq!(line, "no stepper section on this MCU; skipping step task")
@@ -2512,22 +2881,37 @@ mod tests {
                 "commands": {
                     "allocate_oids count=%c": 40,
                     "config_stepper oid=%c step_pin=%c dir_pin=%c invert_step=%c step_pulse_ticks=%u": 41,
+                    "reset_step_clock oid=%c clock=%u": 43,
                     "finalize_config crc=%u": 42
-                }
+                },
+                "enumerations": { "pin": { "PA0": 0, "PA1": 1, "PB0": 10, "PB1": 11 } },
+                "config": { "CLOCK_FREQ": 20000000 }
             }))
             .unwrap(),
         )
         .unwrap();
 
-        let builder = ConfigBuilder::new();
-        let first = stress_stepper(&builder, 0, 1).expect("the first stepper fits");
-        let second = stress_stepper(&builder, 10, 11).expect("the second fits too");
-        assert_ne!(first, second, "each stepper gets its own oid");
-        assert_eq!(builder.oid_count(), 2);
-
+        let pins = fixture_pins(&["mcu"]);
+        let builder = pins.chip_as::<McuChip>("mcu").unwrap().config();
+        let first = pins
+            .setup_stepper("PA0", "PA1", DEFAULT_STEP_PULSE_DURATION)
+            .expect("the first stepper fits");
+        let second = pins
+            .setup_stepper("PB0", "PB1", DEFAULT_STEP_PULSE_DURATION)
+            .expect("the second fits too");
+        for _ in 0..2 {
+            for _ in 0..MOVE_SLOTS {
+                builder.request_move_queue_slot().unwrap();
+            }
+        }
         let built = builder
             .build(&mcu)
             .expect("both steppers are one configuration");
+        assert_ne!(
+            first.oid().unwrap(),
+            second.oid().unwrap(),
+            "each stepper gets its own oid"
+        );
         assert_eq!(
             built.move_slots,
             2 * MOVE_SLOTS as u16,
@@ -2538,6 +2922,109 @@ mod tests {
             4,
             "allocate_oids + 2 config_stepper + finalize_config"
         );
+    }
+
+    /// The firmware `config_stepper` wears the section's own step options: the
+    /// step pin's `!` becomes upstream's `invert_step`, and
+    /// `step_pulse_duration` becomes `step_pulse_ticks` — the two values the
+    /// stress stepper used to hardcode as `0`.
+    #[tokio::test]
+    async fn the_stress_stepper_carries_the_sections_own_step_options() {
+        use crate::core::klippy::frame::Frame;
+        use crate::core::klippy::interface::devices::frame_mock::FrameMock;
+        use crate::core::klippy::interface::Interface;
+        use crate::core::klippy::mcu::Dictionary;
+        use crate::core::klippy::msg::parser::Parser;
+        use crate::core::klippy::msg::proto::ArgValue;
+
+        let mcu = Mcu::for_test("mcu", Interface::new(FrameMock::new(vec![])));
+        mcu.install_dictionary(
+            Dictionary::from_json(serde_json::json!({
+                "commands": {
+                    "allocate_oids count=%c": 40,
+                    "config_stepper oid=%c step_pin=%c dir_pin=%c invert_step=%c step_pulse_ticks=%u": 41,
+                    "reset_step_clock oid=%c clock=%u": 43,
+                    "finalize_config crc=%u": 42
+                },
+                "enumerations": { "pin": { "PA0": 0, "PB0": 10 } },
+                "config": { "CLOCK_FREQ": 20000000 }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let pins = fixture_pins(&["mcu"]);
+        let builder = pins.chip_as::<McuChip>("mcu").unwrap().config();
+        // `!PA0` is invert_step 1; a 4 µs pulse on a 20 MHz clock is 80 ticks.
+        pins.setup_stepper("!PA0", "PB0", 0.000_004)
+            .expect("the resource builds");
+        for _ in 0..MOVE_SLOTS {
+            builder.request_move_queue_slot().unwrap();
+        }
+        let built = builder.build(&mcu).expect("the configuration builds");
+
+        let mut parser = Parser::new();
+        mcu.dictionary().unwrap().install(&mut parser).unwrap();
+        let payload = &built.config[1];
+        let frame = Frame::new(0, payload.payload().to_vec());
+        let decoded = parser.decode(frame.into()).unwrap();
+        assert_eq!(decoded[0].0.name, "config_stepper");
+        assert_eq!(
+            decoded[0].1[3],
+            ArgValue::UInt8(1),
+            "invert_step follows the step pin's `!`"
+        );
+        assert_eq!(
+            decoded[0].1[4],
+            ArgValue::UInt32(80),
+            "step_pulse_ticks follows step_pulse_duration"
+        );
+    }
+
+    /// The selection reads `[board_pins]` aliases and a leading `!` through the
+    /// shared registry, and takes `microsteps`/`rotation_distance` for the
+    /// motion smoke's step distance.
+    #[tokio::test]
+    async fn board_pins_aliases_and_geometry_are_read_from_the_section() {
+        let mut config = Config::new();
+        config.add_section(section("mcu", None, &[("serial", "/dev/ttyACM0")]));
+        config.add_section(section(
+            "stepper_x",
+            None,
+            &[
+                ("step_pin", "!X_STEP"),
+                ("dir_pin", "X_DIR"),
+                ("microsteps", "16"),
+                ("rotation_distance", "40"),
+            ],
+        ));
+        let mcu = fixture_mcu();
+        let pins = fixture_pins(&["mcu"]);
+        pins.alias_pin("mcu", "X_STEP", "PA0").unwrap();
+        pins.alias_pin("mcu", "X_DIR", "PA1").unwrap();
+
+        let (steppers, rejected) = find_steppers(&config, "mcu", &mcu, &pins);
+        assert!(rejected.is_empty(), "{rejected:?}");
+        assert_eq!(sections(&steppers), ["stepper_x"]);
+        assert_eq!(
+            steppers[0].numbers,
+            (0, 1),
+            "X_STEP/X_DIR resolved through the aliases"
+        );
+        // 40 mm per rotation over 200 full steps × 16 microsteps.
+        assert_eq!(steppers[0].options.step_dist, Some(0.0125));
+
+        // A section with no geometry at all still selects — the step task only
+        // borrows the pins — and reports no step distance.
+        let mut bare = Config::new();
+        bare.add_section(section(
+            "stepper_x",
+            None,
+            &[("step_pin", "PA0"), ("dir_pin", "PA1")],
+        ));
+        let (steppers, rejected) = find_steppers(&bare, "mcu", &mcu, &fixture_pins(&["mcu"]));
+        assert!(rejected.is_empty(), "{rejected:?}");
+        assert_eq!(steppers[0].options.step_dist, None);
     }
 
     /// The exit-code rules around skipping: a skipped board is not a failure,

@@ -6147,4 +6147,381 @@ mod tests {
             connected.toolhead.print_time()
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Real board: R4, one axis / every axis homes to its `position_endstop`
+    // -----------------------------------------------------------------------
+    //
+    // These two are the first L2 hardware cases, and they are **synchronous
+    // `#[test]`s**: `Machine::bring_up` calls `Runtime::block_on` on the runtime
+    // it owns (`hardware_test.rs`), which panics with “Cannot start a runtime
+    // from within a runtime” when it is reached from inside a `#[tokio::test]`
+    // body. The framework's own L2 self-tests are `#[test]`s for the same
+    // reason, and the g-code goes through `GCodeDispatch::run_script_sync` —
+    // the entry that exists so “a test that has no runtime gets one here”.
+
+    /// How far an axis may land from its `position_endstop` and still count as
+    /// homed.
+    ///
+    /// The R4 sentence's parenthetical names `max_error`, but no such option
+    /// exists in the homing path: the only `max_error`s in this tree are
+    /// `[verify_heater]`'s (`extras/verify_heater.rs`) and `stepcompress`'s
+    /// internal schedule bound (`motion/stepcompress.rs`), neither of which a
+    /// homing move reads. What the host does instead is record the axis at
+    /// `position_endstop` **exactly** when the move ends (`home_axis` sets the
+    /// toolhead to `home`, whose axis entry is `info.position_endstop`), so the
+    /// residual this case can see is float arithmetic — this bound only catches
+    /// a wrong axis mapping or a clobbered position.
+    const R4_POSITION_TOLERANCE_MM: f64 = 1e-6;
+
+    /// What the R4 single-axis case needs of the configured printer: the main
+    /// MCU, `[stepper_x]` with the endstop it homes to, and `[printer]` with the
+    /// `kinematics` that builds the toolhead.
+    ///
+    /// Kept in one place so the declaration and the ignored bodies below cannot
+    /// drift apart.
+    fn r4_single_axis_requires() -> crate::hardware_test::Requires {
+        crate::hardware_test::Requires::new()
+            .mcu()
+            .option("stepper_x", "endstop_pin")
+            .option("printer", "kinematics")
+    }
+
+    /// What the R4 all-axis case needs: the same, for all three rails.
+    fn r4_all_axes_requires() -> crate::hardware_test::Requires {
+        crate::hardware_test::Requires::new()
+            .mcu()
+            .option("stepper_x", "endstop_pin")
+            .option("stepper_y", "endstop_pin")
+            .option("stepper_z", "endstop_pin")
+            .option("printer", "kinematics")
+    }
+
+    /// Home `axes` through the running machine, `M400` behind them, then assert
+    /// the outcome R4 asks for: each axis is in `homed_axes` and sits at its own
+    /// `position_endstop`.
+    ///
+    /// `script` is the `G28` form the caller chose (`"G28 X\n"` for the
+    /// single-axis case, `"G28\n"` for the all-axis one) and `axes` is what that
+    /// form must home. The endstops and speeds come from the machine's
+    /// **loaded** rails, not from the config text: an unwritten
+    /// `position_endstop` defaults to `position_min` and a virtual endstop
+    /// supplies its own, so the loaded value is the one the move actually used.
+    ///
+    /// Synchronous, and driving the g-code through `run_script_sync`: this runs
+    /// outside any runtime, which is what `Machine::bring_up` requires (see the
+    /// section comment above).
+    fn r4_home_and_assert(printer: &Arc<Printer>, script: &str, axes: &[usize]) {
+        let toolhead = printer
+            .lookup_object_as::<ToolHeadObject>("toolhead")
+            .expect("the toolhead is registered");
+        let rails: Vec<(f64, f64)> = axes
+            .iter()
+            .map(|&axis| {
+                let rail = toolhead.rails.get(axis).unwrap_or_else(|| {
+                    panic!(
+                        "the config's [printer] kinematics owns no rail for axis {axis}; \
+                         this case needs a cartesian-family kinematics with its [stepper_*] \
+                         rails (e.g. not `kinematics: none`)"
+                    )
+                });
+                let info = rail.homing_info();
+                (info.position_endstop, info.speed)
+            })
+            .collect();
+        // What the move will really do, before it does it: the speed is the
+        // config's own `homing_speed`, which R4 asks the operator to lower.
+        for (&axis, &(endstop, speed)) in axes.iter().zip(&rails) {
+            println!(
+                "HW-HOME: axis {} will move at homing_speed {speed} mm/s to \
+                 position_endstop {endstop} mm",
+                ["x", "y", "z"][axis]
+            );
+        }
+
+        let gcode = printer
+            .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+            .expect("the g-code dispatcher is registered");
+        gcode
+            .run_script_sync(script)
+            .unwrap_or_else(|err| panic!("G28 failed on the board: {err}"));
+        // The live shape's `can_pause` is true (`hardware_test`'s module doc),
+        // so `M400` really waits for the move's clock instead of returning at
+        // once; the position below is then the move's end, not a value read
+        // while the carriage is still travelling.
+        gcode
+            .run_script_sync("M400\n")
+            .expect("M400 waits out the homing move");
+
+        let status = toolhead.get_status(0.0);
+        let homed_axes = status["homed_axes"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        println!("HW-HOME: after {script:?}: homed_axes={homed_axes:?}");
+        let position = status["position"].as_array().expect("a position array");
+        for (&axis, &(endstop, speed)) in axes.iter().zip(&rails) {
+            let letter = ["x", "y", "z"][axis];
+            let landed = position
+                .get(axis)
+                .and_then(|value| value.as_f64())
+                .expect("a numeric axis position");
+            println!(
+                "HW-HOME: axis {letter}: homing_speed {speed} mm/s, landed {landed} mm, \
+                 position_endstop {endstop} mm"
+            );
+            assert!(
+                homed_axes.contains(letter),
+                "{script:?} homed the board but left `{letter}` out of homed_axes: \
+                 {homed_axes:?}"
+            );
+            assert!(
+                (landed - endstop).abs() <= R4_POSITION_TOLERANCE_MM,
+                "axis {letter} landed at {landed} mm, not at its position_endstop {endstop} mm"
+            );
+        }
+    }
+
+    /// R4 — one axis homes to its endstop on a real board.
+    ///
+    /// `TESTING.md`'s R4 (`TESTING.md:56-59`) asks for `homing_speed` lowered
+    /// first (5 mm/s is its example) and then `G28 X`, judging “向
+    /// `position_endstop` 方向移动、触碰即停、回抽后二次回零（`homing_retract_dist`）；
+    /// `homed_axes` 含 `x`、`position` 落在 `position_endstop`（`max_error` 内），
+    /// 不撞机不越界”. Split by what this host can see:
+    ///
+    /// - **Asserted here**: `G28 X` completes without error against the board —
+    ///   the whole host chain (planner → `stepcompress` → `queue_step` →
+    ///   firmware's `stepper_get_position`) ran and the board answered;
+    ///   `homed_axes` then contains `x`; and the X position the toolhead reports
+    ///   after `M400` is its `position_endstop`
+    ///   ([`R4_POSITION_TOLERANCE_MM`]).
+    /// - **Not asserted — the operator's call**: whether the carriage actually
+    ///   touched the endstop. This host's `home_axis` does not read the trigger
+    ///   time its `home_wait` returns, so **a homing move whose endstop never
+    ///   triggers still comes back as a success and still marks the axis
+    ///   homed**; upstream's `No trigger on X after full movement` check
+    ///   (`extras/homing.py:119`) is the gap `home_unified`'s doc records. With a
+    ///   dead endstop the axis therefore drives the whole 1.5× force distance
+    ///   and stops against whatever is at the end of travel. **Watch the axis:**
+    ///   if it does not stop on its endstop, that is a finding against this
+    ///   chain (`G28` → `home_axis` → endstop trigger), not a verdict on the
+    ///   config.
+    /// - **Not exercised**: the retract and second pass. This host's homing is
+    ///   **one move at `homing_speed`** into the endstop; `homing_retract_dist`
+    ///   and `second_homing_speed` are parsed into `HomingInfo` but not driven
+    ///   yet (the gap `home_unified`'s and `PrinterStepper`'s module docs
+    ///   record), so R4's “回抽后二次回零” half cannot be asserted from here. The
+    ///   `max_error` in the same sentence names no option in the homing path —
+    ///   see [`R4_POSITION_TOLERANCE_MM`].
+    ///
+    /// # What it needs wired
+    ///
+    /// `[stepper_x]`'s `endstop_pin` on the main `[mcu]` board, wired to an
+    /// endstop that the axis can reach; a `[printer]` with a `kinematics` that
+    /// builds rails (any cartesian family follows `[stepper_x]`). Nothing else —
+    /// no other axis, no heater, no extruder.
+    ///
+    /// # What it does to the machine
+    ///
+    /// It homes **`[stepper_x]` only**, at the config's own `homing_speed`,
+    /// into that axis's `position_endstop`. Y and Z are not commanded, no heater
+    /// is touched, nothing extrudes. The axis travels at `homing_speed` until
+    /// the endstop triggers, then stops — or, if the trigger never arrives, the
+    /// whole 1.5× force distance (see the note above); the case prints that
+    /// speed before it moves.
+    ///
+    /// # Before you run it
+    ///
+    /// - **Lower `homing_speed` first** (5 mm/s is what R4 asks for) if it is
+    ///   not already low: the move is exactly as fast as the config says, and
+    ///   the case prints the value it will use.
+    /// - The X endstop's level and polarity must be known good — run
+    ///   `test_endstop_level_reads_open_and_shorted_on_a_real_board` (R3) first.
+    /// - X must have room to travel to its endstop from wherever it is now.
+    /// - Not while a print is running or a heater is on.
+    ///
+    /// 前提：**本用例假定提供的配置是正确的**（上游 Klipper 也会接受、且与实际接线一致）。
+    /// 它验的是**本仓这个模块的行为**，不是你的配置对不对——配置/接线/固件不匹配导致的失败，
+    /// 不代表模块有 bug。要验配置本身请用宿主或上游 Klipper。因此归零失败请按本仓这条链路
+    /// （`G28` → `home_axis` → 端停触发）的可疑行为排查并如实上报，不要先用「配置可能不对」盖过去。
+    ///
+    /// Run it:
+    ///
+    /// ```text
+    /// KLIPPERX_HW_CONFIG=~/printer_data/config/printer.cfg \
+    ///   cargo test -p klipperx --lib test_r4_x_axis_homes_to_its_position_endstop \
+    ///   -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "hardware: needs KLIPPERX_HW_CONFIG"]
+    fn test_r4_x_axis_homes_to_its_position_endstop_on_a_real_board() {
+        let Some(machine) = crate::hardware_test::acquire(
+            "test_r4_x_axis_homes_to_its_position_endstop_on_a_real_board",
+            &r4_single_axis_requires(),
+        ) else {
+            return; // reported as HW-IGNORED; the test passes without a board
+        };
+        let started = machine.bring_up().expect("the machine comes up");
+
+        r4_home_and_assert(started.printer(), "G28 X\n", &[X_AXIS]);
+
+        // `started` drops here, which is what takes the session down.
+    }
+
+    /// R4 — every axis homes on a real board (the `G28` form of the case).
+    ///
+    /// ⚠ **RISK — this case drives all three motors at once.** X, Y and Z are
+    /// each homed at their own `homing_speed`, one after another; it is the
+    /// “接线齐后再 `G28` 全轴” half of R4 (`TESTING.md:56-59`), and it is a
+    /// **separate** case so that the single-axis one stays the shape of R4 that
+    /// runs by default. Run it only on a printer that is wired, unoccupied and
+    /// homed-at-least-once-each-axis: every axis needs room to its endstop and a
+    /// known-good endstop (R3, and a first run of the single-axis case).
+    /// Nothing else moves — no heater, no extrusion.
+    ///
+    /// Asserted: `G28` completes, `homed_axes` contains `x`, `y` and `z`, and
+    /// each axis' position after `M400` is its own `position_endstop`. Same
+    /// limits as the single-axis case, and the same two things it does **not**
+    /// cover: no retract/second pass ([`R4_POSITION_TOLERANCE_MM`]), and the
+    /// trigger itself is not proven by this host's `G28` — **watch each axis
+    /// stop on its endstop**, because a missed trigger is not an error here
+    /// (see the single-axis case's notes).
+    ///
+    /// # Before you run it
+    ///
+    /// As the single-axis case, for **every** axis: lower each `homing_speed`
+    /// first, confirm each endstop's level and polarity (R3), make sure each
+    /// axis has room to travel to its endstop, and do not run it while printing
+    /// or heating.
+    ///
+    /// 前提：**本用例假定提供的配置是正确的**（上游 Klipper 也会接受、且与实际接线一致）。
+    /// 它验的是**本仓这个模块的行为**，不是你的配置对不对——配置/接线/固件不匹配导致的失败，
+    /// 不代表模块有 bug。要验配置本身请用宿主或上游 Klipper。归零失败请按本仓这条链路
+    /// （`G28` → `home_axes` 逐轴 → 端停触发）的可疑行为排查并如实上报。
+    ///
+    /// Run it:
+    ///
+    /// ```text
+    /// KLIPPERX_HW_CONFIG=~/printer_data/config/printer.cfg \
+    ///   cargo test -p klipperx --lib test_r4_all_axes_home \
+    ///   -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "hardware: needs KLIPPERX_HW_CONFIG"]
+    fn test_r4_all_axes_home_on_a_real_board() {
+        let Some(machine) = crate::hardware_test::acquire(
+            "test_r4_all_axes_home_on_a_real_board",
+            &r4_all_axes_requires(),
+        ) else {
+            return; // reported as HW-IGNORED; the test passes without a board
+        };
+        let started = machine.bring_up().expect("the machine comes up");
+
+        r4_home_and_assert(started.printer(), "G28\n", &[X_AXIS, Y_AXIS, Z_AXIS]);
+
+        // `started` drops here, which is what takes the session down.
+    }
+
+    /// The declaration the two R4 cases run under is the one the config is
+    /// judged against: `[stepper_x]` with `endstop_pin` plus `[printer]
+    /// kinematics` activates the single-axis case; all three rails activate the
+    /// all-axis one; a commented-out or missing pair skips.
+    ///
+    /// This is the half of a hardware case no board is needed for, and it is the
+    /// one that keeps a wrong declaration from turning the case into one that is
+    /// *always* skipped.
+    #[test]
+    fn test_the_homing_cases_declare_the_rails_and_their_endstops() {
+        use crate::core::klippy::config::Config;
+        use crate::hardware_test::{check, Missing};
+
+        let parse = |text: &str| Config::from_text(text).expect("the fixture parses").0;
+
+        // Everything both cases read.
+        let full = parse(
+            "[mcu]\nserial: /dev/ttyACM0\n\
+             [printer]\nkinematics: cartesian\n\
+             [stepper_x]\nendstop_pin: ^PA2\n\
+             [stepper_y]\nendstop_pin: ^PA3\n\
+             [stepper_z]\nendstop_pin: ^PA4\n",
+        );
+        assert_eq!(check(&full, &r4_single_axis_requires()), Ok(()));
+        assert_eq!(check(&full, &r4_all_axes_requires()), Ok(()));
+
+        // Commented out is absent — the real parser decides, not a string match,
+        // so both cases skip rather than home nothing.
+        let commented = parse(
+            "[mcu]\nserial: /dev/ttyACM0\n\
+             [printer]\nkinematics: cartesian\n\
+             # [stepper_x]\n# endstop_pin: ^PA2\n",
+        );
+        assert_eq!(
+            check(&commented, &r4_single_axis_requires()),
+            Err(vec![Missing::Section("stepper_x".to_string())])
+        );
+
+        // `[stepper_x]` is there, only its endstop is not: a sensorless or
+        // unwired axis is not one this case may home.
+        let without_endstop = parse(
+            "[mcu]\nserial: /dev/ttyACM0\n\
+             [printer]\nkinematics: cartesian\n\
+             [stepper_x]\nstep_pin: PA0\n",
+        );
+        assert_eq!(
+            check(&without_endstop, &r4_single_axis_requires()),
+            Err(vec![Missing::Option {
+                section: "stepper_x".to_string(),
+                option: "endstop_pin".to_string(),
+            }])
+        );
+
+        // One axis is not enough for the all-axis case, and neither is one with
+        // no `endstop_pin` among three.
+        assert_eq!(
+            check(&without_endstop, &r4_all_axes_requires()),
+            Err(vec![
+                Missing::Option {
+                    section: "stepper_x".to_string(),
+                    option: "endstop_pin".to_string(),
+                },
+                Missing::Section("stepper_y".to_string()),
+                Missing::Section("stepper_z".to_string()),
+            ])
+        );
+        let only_x = parse(
+            "[mcu]\nserial: /dev/ttyACM0\n\
+             [printer]\nkinematics: cartesian\n\
+             [stepper_x]\nendstop_pin: ^PA2\n",
+        );
+        assert_eq!(check(&only_x, &r4_single_axis_requires()), Ok(()));
+        assert_eq!(
+            check(&only_x, &r4_all_axes_requires()),
+            Err(vec![
+                Missing::Section("stepper_y".to_string()),
+                Missing::Section("stepper_z".to_string()),
+            ])
+        );
+
+        // A `[printer]` without a kinematics is no machine to home: both cases
+        // skip rather than run against a toolhead that cannot be built.
+        let no_kinematics = parse(
+            "[mcu]\nserial: /dev/ttyACM0\n\
+             [printer]\nmax_velocity: 300\n\
+             [stepper_x]\nendstop_pin: ^PA2\n",
+        );
+        assert_eq!(
+            check(&no_kinematics, &r4_single_axis_requires()),
+            Err(vec![Missing::Option {
+                section: "printer".to_string(),
+                option: "kinematics".to_string(),
+            }])
+        );
+        // No `[printer]` at all: the section is what is missing.
+        let no_printer = parse("[mcu]\nserial: /dev/ttyACM0\n[stepper_x]\nendstop_pin: ^PA2\n");
+        assert_eq!(
+            check(&no_printer, &r4_single_axis_requires()),
+            Err(vec![Missing::Section("printer".to_string())])
+        );
+    }
 }

@@ -23,6 +23,12 @@
 //! }
 //! ```
 //!
+//! That case is the **first layer**, and it is `async`: it opens the board
+//! itself with `Mcu::connect(…).await` and owns no runtime, so `#[tokio::test]`
+//! is the right frame. A case over the **second** layer is the opposite and
+//! must be a **plain `#[test]`** — see [the second
+//! layer](#the-second-layer-a-machine-that-is-up).
+//!
 //! The `#[ignore]` marker must be written out as a literal with exactly that
 //! wording — an attribute cannot name a constant. Run one like this:
 //!
@@ -31,6 +37,28 @@
 //!   cargo test -p klipperx --lib test_endstop_trigger_on_a_real_board \
 //!   -- --ignored --nocapture
 //! ```
+//!
+//! # This tests the module, not your config
+//!
+//! The premise of the whole mode, and it holds for **every** case here: what is
+//! under test is this repository's module, not the config you handed it.
+//!
+//! The config is the *input*. A case reads it to learn which section, which
+//! option and which board it has to work with, and then **takes it on trust**:
+//! an accepted config is one upstream Klipper would also accept, wired the way
+//! the config says. Nothing here validates a config, and no case is a check of
+//! one.
+//!
+//! So a result reads this way:
+//!
+//! * A failure caused by the config, the wiring, a firmware that does not match
+//!   it, or an environment that is not what the config describes is **not** a bug
+//!   in the module the case is about.
+//! * A pass does not mean the config is right either: it means the module
+//!   behaved on a board whose config was, by assumption, correct.
+//!
+//! To check a config itself, use the host (`objects/list`, `status`, the log) or
+//! upstream Klipper; this mode is not the tool for it.
 //!
 //! # Everything comes from the config file
 //!
@@ -85,9 +113,9 @@
 //! part loaded and connected, `toolhead`, `gcode` and the extras registered.
 //!
 //! ```ignore
-//! #[tokio::test]
+//! #[test]
 //! #[ignore = "hardware: needs KLIPPERX_HW_CONFIG"]
-//! async fn test_homing_reaches_the_endstop_on_a_real_board() {
+//! fn test_homing_reaches_the_endstop_on_a_real_board() {
 //!     let Some(machine) = crate::hardware_test::acquire(
 //!         "test_homing_reaches_the_endstop_on_a_real_board",
 //!         &crate::hardware_test::Requires::new()
@@ -101,13 +129,26 @@
 //!         .printer()
 //!         .lookup_object_as::<GCodeDispatch>(crate::core::klippy::gcode::GCODE_OBJECT)
 //!         .expect("the g-code dispatcher is registered");
-//!     gcode.run_script("G28 X").await.expect("the homing move runs");
+//!     gcode.run_script_sync("G28 X").expect("the homing move runs");
 //!     // … the assertions, against the running machine …
 //!     // `started` is dropped here, and that is what takes the machine down
 //!     // (`Drop`, the panic path included) — keep it alive to the end of the
 //!     // test, or put it in a scope that ends where the session should.
 //! }
 //! ```
+//!
+//! **`#[test]`, never `#[tokio::test]`.** [`Machine::bring_up`] builds the
+//! multi-threaded runtime the machine runs on and takes it down with a bounded
+//! blocking `shutdown_timeout`, and neither is legal from inside another
+//! runtime's context: tokio panics with `Cannot start a runtime from within a
+//! runtime` at the build, and `Cannot drop a runtime in a context where blocking
+//! is not allowed` at the shutdown — which is on `bring_up`'s failure path too,
+//! and in [`StartedMachine`]'s `Drop`. So a second-layer case runs its g-code
+//! through the async-free `GCodeDispatch::run_script_sync` /
+//! `run_script_from_command_sync` (`#[cfg(test)]`) instead of `.await`, and the
+//! module's own bring-up self-tests are plain `#[test]`s for the same reason.
+//! Calling `bring_up` from inside a runtime is refused with an `Err` naming the
+//! mistake rather than left to tokio's panic.
 //!
 //! Four things [`Machine::bring_up`] does and does not do:
 //!
@@ -126,8 +167,10 @@
 //!   [`SHUTDOWN_TIMEOUT`] and [`StartedMachine`]'s `Drop`. A machine that is
 //!   leaked therefore reports as a failure in bounded time instead of hanging
 //!   the test run: this is the live shape, where a device's blocking read parks
-//!   and a `#[tokio::test]` runtime would wait for it forever
-//!   (`core::klippy::upstream`'s live-case note).
+//!   and a runtime that merely waited for it would wait forever
+//!   (`core::klippy::upstream`'s live-case note). Owning the runtime is also why
+//!   a case over this layer must be a plain `#[test]`: see the guard at the top
+//!   of [`Machine::bring_up`].
 //! * **Its failures are failures.** A config that names a board which cannot be
 //!   opened, or a bring-up that does not reach `Ready`, is an `Err` — the config
 //!   said that hardware was there, so it was there to run. Only an unmet
@@ -155,38 +198,35 @@
 //! refused here, and a move that waits is real wall time. Both are the point of
 //! testing against a board; neither is a bug in the test harness.
 //!
-//! # The known leak a live machine with a heater has
+//! # The shutdown bound is a real check again
 //!
-//! `StartedMachine::drop` tears the machine down and then bounds its runtime's
-//! shutdown, so a leaked part is a **failure** rather than a hang. One such leak
-//! is known, and it is a bug of the machine rather than of this layer: with a
-//! live shape and a config that has a heater section (`[extruder]`,
-//! `[heater_bed]`, `[heater_generic]` — anything that builds a `Heater`),
-//! `Printer::teardown` leaves the session behind, so the board's device read
-//! stays parked and the runtime burns its whole [`SHUTDOWN_TIMEOUT`].
+//! [`StartedMachine`]'s `Drop` tears the machine down and then bounds its
+//! runtime's shutdown, so a leaked part is a **failure** rather than a hang.
+//! That bound used to be tripped by a known ring, a bug of the machine rather
+//! than of this layer: with a live shape and a config that has a heater section
+//! (`[extruder]`, `[heater_bed]`, `[heater_generic]` — anything that builds a
+//! `Heater`), `verify_heater`'s 1 s reactor timer callback held a **strong**
+//! `Arc<Heater>` while `Printer::teardown` never cancels reactor timers, so the
+//! reactor's own timer heap kept the last `Arc<Mcu>` alive — `Mcu::Drop` never
+//! ran, `Interface::shutdown` was never called, and the board's device read
+//! stayed parked for the whole [`SHUTDOWN_TIMEOUT`].
 //!
-//! The parts of the ring, each of which has to go for the leak to go:
+//! That ring is **fixed** (`bd2f32a`): the callback now holds a
+//! `Weak<Heater>` (`extras/verify_heater.rs`) and `HeaterCheck::Drop` cancels
+//! the timer, so the parts go and the device closes like any other config's.
+//! The bound is therefore live rather than a known cost — a heater config now
+//! shuts the session down promptly, and a case that trips the bound again is a
+//! **regression**, not an accepted leak. The history and the measured numbers
+//! are in `docs/klippy/developer-manual/testing.md` (「两层能力」) and in
+//! `TODO.md`'s Q11.
 //!
-//! * `verify_heater`'s `klippy:connect` timer callback holds a **strong**
-//!   `Arc<Heater>` (`extras/verify_heater.rs:240-249`);
-//! * `Printer::teardown` never cancels reactor timers — dropping a `TimerHandle`
-//!   deliberately does not cancel (`core/klippy/reactor.rs:276-277`, `:325-326`),
-//!   and only the `klippy:shutdown` event cancels that one — so the reactor's
-//!   own timer heap still holds the heater;
-//! * `Heater.pwm` reaches the same reactor back: `McuPwm` holds the chip's
-//!   shared `Arc<Mutex<Option<Arc<Mcu>>>>` slot and a `McuChip` whose clock slot
-//!   is a `McuClock`, which holds `Arc<dyn Reactor>`
-//!   (`mcu/resource/pwm.rs:67-76`, `cmd/clock.rs:404-407`).
-//!
-//! The cycle is what keeps the last `Arc<Mcu>` alive, so `Mcu::Drop` never runs,
-//! `Interface::shutdown` is never called, and the blocked read is never
-//! released. On a **real** board the same leak leaves the serial port open: a
-//! second hardware test in the same process opens the same device again and two
-//! readers steal frames from each other, so do not run heater-config hardware
-//! tests back to back until the ring is broken. `core::klippy::upstream`'s
-//! `a_live_case_leaves_the_fake_devices_reader_parked` is the same leak's
-//! reproduction without a board at all. The cycle itself is fixed where it
-//! lives, never papered over with `Mcu::close` here.
+//! One ring of that shape remains, and it is neither this layer's nor a
+//! heater's: `api/endpoints/objects_subscribe.rs`'s timer callback holds an
+//! `Arc<Inner>`, and `Inner` holds the `printer` and the `reactor`, so
+//! `reactor → heap → Inner → reactor` keeps a machine alive after an in-place
+//! restart (`TODO.md`'s S5). Until that is broken, a restart case with an API
+//! subscription can trip the bound; the cycle itself is fixed where it lives,
+//! never papered over with `Mcu::close` here.
 //!
 //! # Ignored is reported, not failed
 //!
@@ -458,6 +498,28 @@ fn load(path: &Path) -> Result<Config, String> {
     Config::from_file(path).map(|(config, _sources)| config)
 }
 
+/// Refuse to start a machine from inside a runtime.
+///
+/// [`Machine::bring_up`] builds and owns the runtime the machine runs on, and
+/// takes it down with a bounded blocking `shutdown_timeout`; both are illegal
+/// from inside another runtime's context (`Cannot start a runtime from within a
+/// runtime`, then `Cannot drop a runtime in a context where blocking is not
+/// allowed`). A test written as `#[tokio::test]` is a mistake in the test, not a
+/// failure of the board, so it gets a readable `Err` here rather than tokio's
+/// panic. Called as the first thing [`Machine::bring_up`] does, before any
+/// device is touched, so the refusal can be exercised without a board.
+fn ensure_not_in_runtime() -> Result<(), String> {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        return Err(
+            "Machine::bring_up owns a runtime and shuts it down on drop, so it \
+                    cannot run inside one: write the case as a plain `#[test]` (L2 cases \
+                    are plain tests; see the module docs)"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// A config that satisfies a test's [`Requires`], with the board locked.
 pub struct Machine {
     /// The parsed printer config.
@@ -489,10 +551,16 @@ impl Machine {
     /// A real failure, never a skip: the config named this hardware, so a
     /// config that will not load, a board that will not open, a bring-up that
     /// does not reach `Ready` inside [`BRING_UP_TIMEOUT`], or a runtime that
-    /// cannot be built is an `Err` with the reason. A config that does not
-    /// satisfy [`Requires`] never gets here — [`acquire`] reports that as
-    /// `HW-IGNORED` and hands out no [`Machine`] at all.
+    /// cannot be built is an `Err` with the reason. So is a call made from
+    /// inside a runtime — a case written as `#[tokio::test]` rather than a plain
+    /// `#[test]` — which is refused before any device is touched. A config that
+    /// does not satisfy [`Requires`] never gets here — [`acquire`] reports that
+    /// as `HW-IGNORED` and hands out no [`Machine`] at all.
     pub fn bring_up(&self) -> Result<StartedMachine, String> {
+        // First, before any device or config work: a bring-up from inside a
+        // runtime cannot work, and a plain `Err` beats tokio's panic (see the
+        // module doc's rule for second-layer cases).
+        ensure_not_in_runtime()?;
         // The machine gets a runtime of its own, as a corpus case does: this is
         // the live shape, so a part that is leaked leaves a blocking device read
         // parked, and a `#[tokio::test]` runtime drops by waiting for exactly
@@ -658,14 +726,15 @@ impl Drop for StartedMachine {
             elapsed < SHUTDOWN_TIMEOUT,
             "the machine's runtime did not shut down within {SHUTDOWN_TIMEOUT:?} \
              ({elapsed:?}): a part was leaked, so its blocking device read is still parked \
-             and the board's session was never closed. If the config has a heater section, \
-             this is the known reactor-timer cycle: `verify_heater`'s `klippy:connect` timer \
-             holds a strong `Arc<Heater>` (`extras/verify_heater.rs:240-249`), `teardown` \
-             never cancels reactor timers (`reactor.rs:276-277`), and `Heater.pwm` reaches \
-             the same reactor back through `McuPwm`/`McuClock` (`mcu/resource/pwm.rs:67-76`, \
-             `cmd/clock.rs:404-407`), so the reactor's own timer heap keeps the `Mcu` alive. \
-             A config without a heater must not fail here. Do not paper over this with \
-             `Mcu::close`; the cycle itself is what has to go."
+             and the board's session was never closed. The heater ring this used to name \
+             (`verify_heater`'s 1 s timer holding a strong `Arc<Heater>`) is fixed, so a \
+             regression there is a bug rather than a known cost. The one ring of that shape \
+             known to remain is the API subscription timer: `api/endpoints/objects_subscribe.rs`'s \
+             callback holds an `Arc<Inner>`, and `Inner` holds the `printer` and the \
+             `reactor`, so `reactor → heap → Inner → reactor` keeps the old `Mcu` alive \
+             after an in-place restart (`TODO.md`'s S5). Do not paper over this with \
+             `Mcu::close`; the cycle itself is what has to go. See \
+             `docs/klippy/developer-manual/testing.md`."
         );
     }
 }
@@ -723,6 +792,19 @@ fn lock_board(config: &Path, test_name: &str) -> Result<BoardLock, String> {
     }
 }
 
+/// The `HW-RUN` line [`acquire_at`] prints once a test is about to run.
+///
+/// One line, greppable by its `HW-` prefix. It names the test and carries the
+/// premise of the whole mode with it — see this module's "This tests the module,
+/// not your config": the config is taken as correct, so the run checks the host
+/// module rather than the user's config.
+fn run_line(test_name: &str) -> String {
+    format!(
+        "HW-RUN: {test_name}  \
+         (the config is assumed correct; this checks the host module, not your config)"
+    )
+}
+
 /// Hand `test_name` a machine for the configured board, or report it as skipped.
 ///
 /// The only reader of [`HW_CONFIG_ENV`]: it names the config, and [`acquire_at`]
@@ -732,7 +814,7 @@ fn lock_board(config: &Path, test_name: &str) -> Result<BoardLock, String> {
 /// test touches no device and takes no lock.
 ///
 /// Returns `Some(machine)` with the board locked exclusively when everything is
-/// in place, printing `HW-RUN: <test>` first. The lock is held until the machine
+/// in place, printing the [`run_line`] first. The lock is held until the machine
 /// is dropped, so the test body and its cleanup are one session on the board.
 pub fn acquire(test_name: &str, requires: &Requires) -> Option<Machine> {
     let path = std::env::var(HW_CONFIG_ENV).ok();
@@ -768,7 +850,7 @@ fn acquire_at(path: Option<&Path>, test_name: &str, requires: &Requires) -> Opti
             let _board = lock_board(&path, test_name).unwrap_or_else(|reason| {
                 panic!("{test_name}: cannot serialise on the board's config file: {reason}")
             });
-            println!("HW-RUN: {test_name}");
+            println!("{}", run_line(test_name));
             Some(Machine {
                 config,
                 path,
@@ -800,6 +882,10 @@ fn plan() {
     match load(Path::new(&path)) {
         Ok(config) => {
             println!("HW-CONFIG: {path}");
+            println!(
+                "HW-CONFIG: these cases test the host module, not this config \
+                 — a config they read is assumed correct"
+            );
             print_plan(&config);
         }
         Err(reason) => println!("HW-CONFIG: {reason}"),
@@ -1319,6 +1405,43 @@ mod tests {
         );
     }
 
+    /// The `HW-RUN` line a test sees when it runs: one line, prefixed `HW-`,
+    /// naming the test and carrying the mode's premise with it — the config is
+    /// assumed correct, so the run checks the host module, not the user's
+    /// config. It is the line [`acquire_at`]'s success path prints, which the
+    /// fake config fixture below reaches.
+    #[test]
+    fn test_the_run_line_names_the_test_and_the_premise() {
+        let name = "test_r5_single_axis_move_matches_the_firmware_step_count";
+        let line = run_line(name);
+
+        assert!(
+            line.starts_with(&format!("HW-RUN: {name}")),
+            "the prefix and the test's name come first: {line}"
+        );
+        assert!(
+            line.contains("the config is assumed correct"),
+            "the line carries the mode's premise: {line}"
+        );
+        assert!(
+            line.contains("not your config"),
+            "and says what the run is not checking: {line}"
+        );
+        assert_eq!(
+            line.lines().count(),
+            1,
+            "the notice stays one line rather than a multi-line block: {line}"
+        );
+
+        // The success path is what prints it: a config that provides what the
+        // test asked for hands back a machine, so `acquire_at` reached the run.
+        let fixture = TempConfig::new("[mcu]\nserial: /dev/ttyACM0\n");
+        assert!(
+            acquire_at(Some(fixture.path()), name, &Requires::new().mcu()).is_some(),
+            "a satisfied config reaches the run, whose line is the one checked above"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // The board lock — one session at a time
     // -----------------------------------------------------------------------
@@ -1404,6 +1527,45 @@ mod tests {
         board
             .mcu(started.printer())
             .unwrap_or_else(|| panic!("[mcu {}] is not connected", board.name()))
+    }
+
+    /// The guard, from inside a runtime: `bring_up` owns a runtime and cannot be
+    /// called from one.
+    ///
+    /// tokio reports both halves as a panic — building a runtime inside a
+    /// runtime, and dropping one where blocking is not allowed — so the
+    /// framework checks first and hands back a readable `Err`. The check is the
+    /// first thing `bring_up` does, so the call below never opens the port its
+    /// config names: without the guard, this test would die in the runtime build
+    /// before any device work, not reach the `Err`.
+    #[tokio::test]
+    async fn test_bring_up_refuses_to_run_inside_a_runtime() {
+        let reason = ensure_not_in_runtime().expect_err("inside a runtime the guard refuses");
+        assert!(
+            reason.contains("plain `#[test]`"),
+            "the reason says how to write the case instead: {reason}"
+        );
+
+        let fixture = TempConfig::new(
+            "[mcu]\nserial: /dev/klipperx-hwtest-no-such-port\n\
+             [printer]\nkinematics: none\nmax_velocity: 300\nmax_accel: 3000\n",
+        );
+        let machine = machine_for(&fixture);
+        let reason = match machine.bring_up() {
+            Ok(_) => panic!("bring_up refuses inside a runtime, before it touches the device"),
+            Err(reason) => reason,
+        };
+        assert!(
+            reason.contains("plain `#[test]`"),
+            "bring_up reports the guard's own reason: {reason}"
+        );
+    }
+
+    /// The same guard outside a runtime: a plain `#[test]` is the frame
+    /// `bring_up` is written for.
+    #[test]
+    fn test_bring_up_is_allowed_outside_a_runtime() {
+        assert_eq!(ensure_not_in_runtime(), Ok(()));
     }
 
     /// Bring up a machine over the fake firmware and reach `Ready`.

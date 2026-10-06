@@ -677,9 +677,9 @@ mod tests {
     ///   cargo test -p klipperx --lib test_m18_disables_every_motor_on_a_real_board \
     ///   -- --ignored --nocapture
     /// ```
-    #[tokio::test]
+    #[test]
     #[ignore = "hardware: needs KLIPPERX_HW_CONFIG"]
-    async fn test_m18_disables_every_motor_on_a_real_board() {
+    fn test_m18_disables_every_motor_on_a_real_board() {
         let Some(machine) = crate::hardware_test::acquire(
             "test_m18_disables_every_motor_on_a_real_board",
             &disable_case(),
@@ -718,7 +718,7 @@ mod tests {
             "the machine tracks the declared [stepper_x]: {before}"
         );
 
-        gcode.run_script("M18").await.expect("M18 runs");
+        gcode.run_script_sync("M18").expect("M18 runs");
 
         assert_eq!(
             motor_off.load(Ordering::SeqCst),

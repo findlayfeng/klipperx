@@ -75,6 +75,119 @@
 //! `Mcu::connect` — `"mcu"` for `[mcu]`, `"zboard"` for `[mcu zboard]` —
 //! because that name is how the printer tells the boards apart.
 //!
+//! # The second layer: a machine that is up
+//!
+//! [`Machine::open_mcu`]/[`Machine::open_mcu_named`] are the first layer — a
+//! parsed config, the board lock, and one transport a test opens itself. That is
+//! what a test about a *wire* wants (identify, a frame sequence, a clock read).
+//! A test about the **machine** asks [`Machine::bring_up`] for a
+//! [`StartedMachine`] instead, and gets the printer the host would have: every
+//! part loaded and connected, `toolhead`, `gcode` and the extras registered.
+//!
+//! ```ignore
+//! #[tokio::test]
+//! #[ignore = "hardware: needs KLIPPERX_HW_CONFIG"]
+//! async fn test_homing_reaches_the_endstop_on_a_real_board() {
+//!     let Some(machine) = crate::hardware_test::acquire(
+//!         "test_homing_reaches_the_endstop_on_a_real_board",
+//!         &crate::hardware_test::Requires::new()
+//!             .mcu()
+//!             .option("stepper_x", "endstop_pin"),
+//!     ) else {
+//!         return; // reported as HW-IGNORED; the test passes without a board
+//!     };
+//!     let started = machine.bring_up().expect("the machine comes up");
+//!     let gcode = started
+//!         .printer()
+//!         .lookup_object_as::<GCodeDispatch>(crate::core::klippy::gcode::GCODE_OBJECT)
+//!         .expect("the g-code dispatcher is registered");
+//!     gcode.run_script("G28 X").await.expect("the homing move runs");
+//!     // … the assertions, against the running machine …
+//!     // `started` is dropped here, and that is what takes the machine down
+//!     // (`Drop`, the panic path included) — keep it alive to the end of the
+//!     // test, or put it in a scope that ends where the session should.
+//! }
+//! ```
+//!
+//! Four things [`Machine::bring_up`] does and does not do:
+//!
+//! * **It starts what the config describes, not one board.** `bring_up` walks
+//!   *every* `[mcu …]` section, so a printer with `[mcu zboard]` gets both
+//!   boards connected, identified and clocked against each other — the one thing
+//!   the first layer cannot give a test. `open_mcu_named` stays the way to reach
+//!   a single board's transport, and the two are complementary rather than
+//!   alternatives: a test that wants both boards' *wires* opens two transports,
+//!   and a test that wants the machine brings it up.
+//! * **The lock is unchanged.** [`acquire`] still takes the board lock on the
+//!   config file and [`Machine`] still holds it until the test's `Machine` is
+//!   dropped; `bring_up` neither takes a second lock nor releases the first.
+//! * **It owns its runtime.** The machine runs on a multi-threaded runtime this
+//!   layer builds and keeps, and the shutdown of that runtime is bounded — see
+//!   [`SHUTDOWN_TIMEOUT`] and [`StartedMachine`]'s `Drop`. A machine that is
+//!   leaked therefore reports as a failure in bounded time instead of hanging
+//!   the test run: this is the live shape, where a device's blocking read parks
+//!   and a `#[tokio::test]` runtime would wait for it forever
+//!   (`core::klippy::upstream`'s live-case note).
+//! * **Its failures are failures.** A config that names a board which cannot be
+//!   opened, or a bring-up that does not reach `Ready`, is an `Err` — the config
+//!   said that hardware was there, so it was there to run. Only an unmet
+//!   [`Requires`] and an unset [`HW_CONFIG_ENV`] are skips, and `bring_up` is
+//!   never reached in either case.
+//!
+//! # The live shape, not the corpus' file-output shape
+//!
+//! Every corpus case and the harness that generates them run in upstream's
+//! *file-output* mode (`-o`, `debug_output` set), where nothing answers the
+//! machine. A real board is the opposite: the *live* shape, `debug_output`
+//! unset, which is what [`Machine::bring_up`] builds. The differences a test
+//! has to know about are all of that one kind — a branch that short-circuits
+//! under `-o` really runs here:
+//!
+//! | | corpus (`-o`) | live ([`Machine::bring_up`]) |
+//! |---|---|---|
+//! | `can_pause` | false | true, so `M400` really waits for the move (`extras/toolhead.rs:3547-3552`) |
+//! | `can_extrude` | forced true | `min_extrude_temp <= 0.0` or a real reading above it; `G1 E…` is refused below it (`extras/heaters.rs:868`) |
+//! | `TEMPERATURE_WAIT`, `SET_HEATER_TEMPERATURE … WAIT` | return at once | wait for the board's readings (`extras/heaters.rs:563`, `:1044`) |
+//! | `verify_heater` | never checks | checks run from `klippy:connect` and shut a heater down when it is not heating (`extras/verify_heater.rs:214-250`) |
+//! | temperature readings | never arrive | come from the board, so a move that depends on one waits for the hardware |
+//!
+//! A case that extrudes without heating therefore *passes* under `-o` and is
+//! refused here, and a move that waits is real wall time. Both are the point of
+//! testing against a board; neither is a bug in the test harness.
+//!
+//! # The known leak a live machine with a heater has
+//!
+//! `StartedMachine::drop` tears the machine down and then bounds its runtime's
+//! shutdown, so a leaked part is a **failure** rather than a hang. One such leak
+//! is known, and it is a bug of the machine rather than of this layer: with a
+//! live shape and a config that has a heater section (`[extruder]`,
+//! `[heater_bed]`, `[heater_generic]` — anything that builds a `Heater`),
+//! `Printer::teardown` leaves the session behind, so the board's device read
+//! stays parked and the runtime burns its whole [`SHUTDOWN_TIMEOUT`].
+//!
+//! The parts of the ring, each of which has to go for the leak to go:
+//!
+//! * `verify_heater`'s `klippy:connect` timer callback holds a **strong**
+//!   `Arc<Heater>` (`extras/verify_heater.rs:240-249`);
+//! * `Printer::teardown` never cancels reactor timers — dropping a `TimerHandle`
+//!   deliberately does not cancel (`core/klippy/reactor.rs:276-277`, `:325-326`),
+//!   and only the `klippy:shutdown` event cancels that one — so the reactor's
+//!   own timer heap still holds the heater;
+//! * `Heater.pwm` reaches the same reactor back: `McuPwm` holds the chip's
+//!   shared `Arc<Mutex<Option<Arc<Mcu>>>>` slot and a `McuChip` whose clock slot
+//!   is a `McuClock`, which holds `Arc<dyn Reactor>`
+//!   (`mcu/resource/pwm.rs:67-76`, `cmd/clock.rs:404-407`).
+//!
+//! The cycle is what keeps the last `Arc<Mcu>` alive, so `Mcu::Drop` never runs,
+//! `Interface::shutdown` is never called, and the blocked read is never
+//! released. On a **real** board the same leak leaves the serial port open: a
+//! second hardware test in the same process opens the same device again and two
+//! readers steal frames from each other, so do not run heater-config hardware
+//! tests back to back until the ring is broken. `core::klippy::upstream`'s
+//! `a_live_case_leaves_the_fake_devices_reader_parked` is the same leak's
+//! reproduction without a board at all. The cycle itself is fixed where it
+//! lives, never papered over with `Mcu::close` here.
+//!
 //! # Ignored is reported, not failed
 //!
 //! `cargo test` and `cargo test --workspace` never touch the config: every test
@@ -106,16 +219,41 @@ use std::fmt;
 use std::fs::File;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use tokio::runtime::Runtime;
+
+use crate::core::klippy::api::StartArgs;
 use crate::core::klippy::config::mcu::McuConfig;
 use crate::core::klippy::config::{Config, ConfigSection, ConfigWrapper};
 use crate::core::klippy::interface::Interface;
+use crate::core::klippy::printer::{Printer, PrinterState};
+use crate::core::klippy::reactor::TokioReactor;
 
 /// The environment variable that names the printer config to test against.
 ///
 /// It is the only variable this mode reads; there is no way to name an
 /// interface directly, because the config already does.
 pub const HW_CONFIG_ENV: &str = "KLIPPERX_HW_CONFIG";
+
+/// How long [`Machine::bring_up`] gives the machine to connect every part.
+///
+/// The host itself has no such bound — a board that is slow to answer identify
+/// is a slow board, not a broken run — so this is a harness budget, in the same
+/// spirit as the corpus' case bound: without it a machine that never answers
+/// parks the test instead of failing it.
+const BRING_UP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a [`StartedMachine`] gives its runtime to shut down, once the
+/// machine's parts are dropped.
+///
+/// The same bound the corpus puts on a case's runtime
+/// (`core::klippy::upstream`), for the same reason: a device's blocking read is
+/// not cancellable by aborting a task, so the only way to tell "the parts went"
+/// from "a part was leaked" is to give the runtime a budget and check that it
+/// finished inside it.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// What one test needs from the configured printer.
 ///
@@ -324,6 +462,8 @@ fn load(path: &Path) -> Result<Config, String> {
 pub struct Machine {
     /// The parsed printer config.
     config: Config,
+    /// The config file the parser read, as the host's start arguments name it.
+    path: PathBuf,
     /// The exclusive lock on the board, held until this machine is dropped.
     _board: BoardLock,
 }
@@ -332,6 +472,84 @@ impl Machine {
     /// The whole parsed printer config.
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// Start the machine the config describes, as the host does.
+    ///
+    /// The whole second layer: the parts the config names are loaded and
+    /// connected, `Ready` is reached, and every `[mcu …]` section is up (not
+    /// just the one [`Machine::open_mcu`] would open). The config is the one
+    /// [`acquire`] already parsed; the file is never read again.
+    ///
+    /// The board lock is *not* touched: it stays held by this [`Machine`] until
+    /// the test's `Machine` is dropped, so the session `bring_up` starts is the
+    /// one the lock covers.
+    ///
+    /// # Errors
+    /// A real failure, never a skip: the config named this hardware, so a
+    /// config that will not load, a board that will not open, a bring-up that
+    /// does not reach `Ready` inside [`BRING_UP_TIMEOUT`], or a runtime that
+    /// cannot be built is an `Err` with the reason. A config that does not
+    /// satisfy [`Requires`] never gets here — [`acquire`] reports that as
+    /// `HW-IGNORED` and hands out no [`Machine`] at all.
+    pub fn bring_up(&self) -> Result<StartedMachine, String> {
+        // The machine gets a runtime of its own, as a corpus case does: this is
+        // the live shape, so a part that is leaked leaves a blocking device read
+        // parked, and a `#[tokio::test]` runtime drops by waiting for exactly
+        // that thread forever. Owning the runtime is what lets `Drop` bound the
+        // wait instead.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| format!("the machine's runtime: {error}"))?;
+        let printer = Arc::new(Printer::new(Arc::new(TokioReactor::new(
+            runtime.handle().clone(),
+        ))));
+        // The host's own start arguments, minus file output: `debug_output`
+        // stays unset, which is what makes this the live shape rather than the
+        // corpus' `-o` one (see the module doc's table).
+        printer.set_start_args(Arc::new(StartArgs::collect(
+            self.path.display().to_string(),
+            None,
+        )));
+
+        let setup = runtime.block_on(async {
+            printer
+                .load_config(&self.config)
+                .map_err(|e| e.to_string())?;
+            if tokio::time::timeout(BRING_UP_TIMEOUT, printer.bring_up())
+                .await
+                .is_err()
+            {
+                return Err(format!(
+                    "bring_up did not finish within {BRING_UP_TIMEOUT:?}: a part never \
+                     connected"
+                ));
+            }
+            let state = printer.get_state_message();
+            if state.category != PrinterState::Ready {
+                return Err(format!("the machine did not come up: {}", state.message));
+            }
+            Ok(())
+        });
+
+        match setup {
+            Ok(()) => Ok(StartedMachine {
+                printer: Some(printer),
+                runtime: Some(runtime),
+            }),
+            Err(reason) => {
+                // Take the failed machine down here, exactly as a
+                // `StartedMachine` does: the parts go while the runtime is
+                // still alive (their `Drop` is what shuts a transport down),
+                // then the runtime is given the same bound. A failure must not
+                // leave the next test a parked read to trip over.
+                printer.teardown();
+                drop(printer);
+                runtime.shutdown_timeout(SHUTDOWN_TIMEOUT);
+                Err(reason)
+            }
+        }
     }
 
     /// Open `[mcu]`'s transport, as the printer would.
@@ -367,6 +585,88 @@ impl Machine {
         let config =
             McuConfig::new(&ConfigWrapper::untracked(section)).map_err(|e| e.to_string())?;
         config.open()
+    }
+}
+
+/// A machine [`Machine::bring_up`] has started, with the runtime it runs on.
+///
+/// The live half of the framework: the printer is past `Ready`, so a test can
+/// run g-code through it ([`StartedMachine::printer`] hands out the `Printer`,
+/// whose `gcode`, `toolhead` and extras are the host's), and the platform — the
+/// transport tasks and the blocking device reads they park — is this layer's to
+/// take down.
+///
+/// A `StartedMachine` must be **dropped at the end of the test** (or in a scope
+/// that ends where the session should): that is what tears the machine down,
+/// on the ordinary path and on the panic path alike. It is deliberately not
+/// `Clone` — there is one session on the board, and one owner of it.
+pub struct StartedMachine {
+    /// The running machine. Taken out first in `Drop`, so it is released while
+    /// the runtime is still alive.
+    printer: Option<Arc<Printer>>,
+    /// The runtime this machine's transports and device I/O run on. Its
+    /// shutdown is bounded, so a leaked part fails instead of hanging.
+    runtime: Option<Runtime>,
+}
+
+impl StartedMachine {
+    /// The running machine: its `gcode`, `toolhead` and extras are registered
+    /// and connected, exactly as the host has them.
+    ///
+    /// The handle is valid until this `StartedMachine` is dropped: `Drop`
+    /// tears the machine's parts down, so an `Arc<Printer>` kept past that
+    /// point names a machine that has been taken apart.
+    pub fn printer(&self) -> &Arc<Printer> {
+        self.printer
+            .as_ref()
+            .expect("the machine is alive until its `StartedMachine` is dropped")
+    }
+}
+
+impl Drop for StartedMachine {
+    /// Take the machine down, then bound the runtime's shutdown.
+    ///
+    /// In this order, and for this reason: the parts the config loaded are what
+    /// shut a device down when they drop (`Mcu::Drop` → `Interface::shutdown`,
+    /// which releases the blocking read the session parked), so they have to go
+    /// while the runtime is still alive to carry that — and only then does the
+    /// runtime get its bound. Dropping the machine as well is what makes the
+    /// bound mean something: whatever is still holding a device afterwards was
+    /// leaked by a part, not kept alive by this framework.
+    ///
+    /// A runtime that does not finish inside [`SHUTDOWN_TIMEOUT`] is a **panic**
+    /// naming the leak: the live shape's blocked read cannot be cancelled, so
+    /// waiting longer would only hide it, and a hang would hide it entirely.
+    /// The panic is skipped while unwinding from the test body's own panic —
+    /// the failure is already reported, and a second panic from `Drop` would
+    /// abort the process instead of reporting either.
+    fn drop(&mut self) {
+        if let Some(printer) = self.printer.take() {
+            printer.teardown();
+            drop(printer);
+        }
+        let Some(runtime) = self.runtime.take() else {
+            return;
+        };
+        let started = Instant::now();
+        runtime.shutdown_timeout(SHUTDOWN_TIMEOUT);
+        let elapsed = started.elapsed();
+        if std::thread::panicking() {
+            return;
+        }
+        assert!(
+            elapsed < SHUTDOWN_TIMEOUT,
+            "the machine's runtime did not shut down within {SHUTDOWN_TIMEOUT:?} \
+             ({elapsed:?}): a part was leaked, so its blocking device read is still parked \
+             and the board's session was never closed. If the config has a heater section, \
+             this is the known reactor-timer cycle: `verify_heater`'s `klippy:connect` timer \
+             holds a strong `Arc<Heater>` (`extras/verify_heater.rs:240-249`), `teardown` \
+             never cancels reactor timers (`reactor.rs:276-277`), and `Heater.pwm` reaches \
+             the same reactor back through `McuPwm`/`McuClock` (`mcu/resource/pwm.rs:67-76`, \
+             `cmd/clock.rs:404-407`), so the reactor's own timer heap keeps the `Mcu` alive. \
+             A config without a heater must not fail here. Do not paper over this with \
+             `Mcu::close`; the cycle itself is what has to go."
+        );
     }
 }
 
@@ -425,7 +725,8 @@ fn lock_board(config: &Path, test_name: &str) -> Result<BoardLock, String> {
 
 /// Hand `test_name` a machine for the configured board, or report it as skipped.
 ///
-/// The only reader of [`HW_CONFIG_ENV`]. Returns `None` — and prints one
+/// The only reader of [`HW_CONFIG_ENV`]: it names the config, and [`acquire_at`]
+/// decides what it offers. Returns `None` — and prints one
 /// `HW-IGNORED: <test>: <why>` line — when the variable is unset, the file is
 /// missing or unparsable, or the config does not provide `requires`; a skipped
 /// test touches no device and takes no lock.
@@ -435,7 +736,16 @@ fn lock_board(config: &Path, test_name: &str) -> Result<BoardLock, String> {
 /// is dropped, so the test body and its cleanup are one session on the board.
 pub fn acquire(test_name: &str, requires: &Requires) -> Option<Machine> {
     let path = std::env::var(HW_CONFIG_ENV).ok();
-    match decide(path.as_deref().map(Path::new), requires) {
+    acquire_at(path.as_deref().map(Path::new), test_name, requires)
+}
+
+/// [`acquire`], on a path instead of the environment.
+///
+/// The environment read is `acquire`'s alone; this is the rest of it, taking the
+/// path as an argument so the branches can be exercised without setting a
+/// variable (which no test can do without racing the others).
+fn acquire_at(path: Option<&Path>, test_name: &str, requires: &Requires) -> Option<Machine> {
+    match decide(path, requires) {
         Decision::NotSet => {
             println!("HW-IGNORED: {test_name}: {HW_CONFIG_ENV} is not set");
             None
@@ -459,7 +769,11 @@ pub fn acquire(test_name: &str, requires: &Requires) -> Option<Machine> {
                 panic!("{test_name}: cannot serialise on the board's config file: {reason}")
             });
             println!("HW-RUN: {test_name}");
-            Some(Machine { config, _board })
+            Some(Machine {
+                config,
+                path,
+                _board,
+            })
         }
     }
 }
@@ -570,6 +884,10 @@ fn mcu_requirement(section: &ConfigSection) -> String {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use std::sync::{Mutex, Weak};
+
+    use crate::core::klippy::interface::devices::responder_mcu::ResponderMcu;
+    use crate::core::klippy::mcu::{Mcu, McuObject};
 
     /// Parse fixture text with the real parser.
     fn config(text: &str) -> Config {
@@ -600,6 +918,19 @@ mod tests {
     impl Drop for TempConfig {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    /// A [`Machine`] over `fixture`, the way [`acquire`] builds one — the board
+    /// locked by this test itself, since no test can set the environment
+    /// variable without racing the others.
+    fn machine_for(fixture: &TempConfig) -> Machine {
+        let config = load(fixture.path()).expect("the fixture parses");
+        let board = lock_board(fixture.path(), "self-test").expect("the fixture locks");
+        Machine {
+            config,
+            path: fixture.path().to_path_buf(),
+            _board: board,
         }
     }
 
@@ -902,12 +1233,7 @@ mod tests {
     #[test]
     fn test_the_machine_exposes_its_config_and_opens_the_named_transport() {
         let fixture = TempConfig::new("[mcu]\nserial: /dev/klipperx-hwtest-no-such-port\n");
-        let config = load(fixture.path()).expect("the fixture parses");
-        let board = lock_board(fixture.path(), "self-test").expect("the fixture locks");
-        let machine = Machine {
-            config,
-            _board: board,
-        };
+        let machine = machine_for(&fixture);
 
         assert_eq!(
             machine
@@ -936,12 +1262,7 @@ mod tests {
             "[mcu]\nserial: /dev/does-not-exist-a\n\
              [mcu zboard]\nserial: /dev/does-not-exist-b\n",
         );
-        let config = load(fixture.path()).expect("the fixture parses");
-        let board = lock_board(fixture.path(), "self-test").expect("the fixture locks");
-        let machine = Machine {
-            config,
-            _board: board,
-        };
+        let machine = machine_for(&fixture);
 
         let main = machine.open_mcu().unwrap_err();
         assert!(main.contains("/dev/does-not-exist-a"), "{main}");
@@ -1057,5 +1378,183 @@ mod tests {
             1,
             "two holders inside the lock at once"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // bring_up() — the second layer, against the dictionary-driven fake firmware
+    // -----------------------------------------------------------------------
+    //
+    // These fixtures name the same `test: dict=` responder the corpus and the
+    // multi-MCU tests use, so a machine can be brought up with no board attached
+    // at all. `ResponderMcu::new` answers `None` when `build.rs` did not build
+    // that dictionary (`KLIPPERX_ARCHES`), and the test skips — a build product
+    // it never got, not a failure.
+
+    /// A config with the fake boards `boards` and nothing else: no heater, so
+    /// the known live-shape ring (see the module doc) has nothing to hold.
+    fn fake_machine_config(boards: &[ResponderMcu]) -> TempConfig {
+        TempConfig::new(&format!(
+            "{}[printer]\nkinematics: none\nmax_velocity: 300\nmax_accel: 3000\n",
+            ResponderMcu::sections(boards),
+        ))
+    }
+
+    /// The connected session of the fake board `board`, or a panic naming it.
+    fn session_of(started: &StartedMachine, board: &ResponderMcu) -> Arc<Mcu> {
+        board
+            .mcu(started.printer())
+            .unwrap_or_else(|| panic!("[mcu {}] is not connected", board.name()))
+    }
+
+    /// Bring up a machine over the fake firmware and reach `Ready`.
+    ///
+    /// Two boards, because `bring_up` being the layer that starts *every*
+    /// `[mcu …]` section is the capability this layer adds over
+    /// [`Machine::open_mcu_named`]: both sections identify against their own
+    /// dictionary, which a single-transport layer cannot do.
+    #[test]
+    fn test_bring_up_connects_every_board_and_reaches_ready() {
+        let (Some(primary), Some(aux)) = (
+            ResponderMcu::new("mcu", "atmega2560.dict"),
+            ResponderMcu::new("aux", "stm32f103.dict"),
+        ) else {
+            return; // a dictionary this fixture needs was not built
+        };
+        let boards = [primary, aux];
+        let fixture = fake_machine_config(&boards);
+        let machine = machine_for(&fixture);
+
+        let started = machine.bring_up().expect("the fake boards come up");
+
+        let state = started.printer().get_state_message();
+        assert_eq!(
+            state.category,
+            PrinterState::Ready,
+            "the machine is ready: {}",
+            state.message
+        );
+        for board in &boards {
+            let mcu = session_of(&started, board);
+            assert!(
+                mcu.is_identified(),
+                "[mcu {}] ran its own identify handshake",
+                board.name()
+            );
+            assert!(
+                board.device(started.printer()).is_some(),
+                "[mcu {}] answers through its own responder",
+                board.name()
+            );
+        }
+    }
+
+    /// Dropping the machine takes its session down: `Drop` tears the parts out
+    /// (which is what runs `Mcu::Drop` and closes the device), then bounds the
+    /// runtime's shutdown, and the assertion inside `Drop` is what proves the
+    /// device read was released rather than parked.
+    #[test]
+    fn test_dropping_the_started_machine_tears_its_session_down() {
+        let Some(board) = ResponderMcu::new("mcu", "atmega2560.dict") else {
+            return;
+        };
+        let fixture = fake_machine_config(std::slice::from_ref(&board));
+        let machine = machine_for(&fixture);
+        let started = machine.bring_up().expect("the fake board comes up");
+
+        let device = started
+            .printer()
+            .lookup_object_as::<McuObject>("mcu")
+            .and_then(|object| object.mcu())
+            .and_then(|mcu| mcu.simulator_device())
+            .expect("the fake board's responder");
+        // Weak handles: what the machine held must be gone once it is dropped,
+        // and no handle of this test's may stand in for it.
+        let session = Arc::downgrade(&session_of(&started, &board));
+        let responder = Arc::downgrade(&device);
+        drop(device);
+
+        drop(started);
+
+        assert!(
+            session.upgrade().is_none(),
+            "the machine released its session: `Mcu::Drop` ran, which shuts the device down"
+        );
+        assert!(
+            responder.upgrade().is_none(),
+            "the fake device went with the session, blocking read and all"
+        );
+    }
+
+    /// The panic path: a body that panics with the machine up must still tear it
+    /// down, because `Drop` runs while unwinding and does its work before the
+    /// test body's failure is reported.
+    #[test]
+    fn test_a_panic_in_the_body_still_tears_the_session_down() {
+        let Some(board) = ResponderMcu::new("mcu", "atmega2560.dict") else {
+            return;
+        };
+        let fixture = fake_machine_config(std::slice::from_ref(&board));
+        let machine = machine_for(&fixture);
+
+        // The session handle the body leaves behind: the body owns the machine,
+        // so the only way out of the closure is a `Weak` it stored first.
+        let seen: Mutex<Option<Weak<Mcu>>> = Mutex::new(None);
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let started = machine.bring_up().expect("the fake board comes up");
+            *seen.lock().unwrap_or_else(|poison| poison.into_inner()) =
+                Some(Arc::downgrade(&session_of(&started, &board)));
+            panic!("the body panics with the machine up");
+        }));
+
+        assert!(outcome.is_err(), "the body panicked, as intended");
+        let session = seen
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .take()
+            .expect("the body stored its session handle before panicking");
+        assert!(
+            session.upgrade().is_none(),
+            "unwinding dropped the `StartedMachine`, and its `Drop` took the session down"
+        );
+    }
+
+    /// A config that names a board which cannot be opened is a **real** failure
+    /// of `bring_up`, not a skip: the config said the hardware was there.
+    #[test]
+    fn test_a_board_that_cannot_open_is_a_failure_of_bring_up() {
+        let fixture = TempConfig::new(
+            "[mcu]\nserial: /dev/klipperx-hwtest-no-such-port\n\
+             [printer]\nkinematics: none\nmax_velocity: 300\nmax_accel: 3000\n",
+        );
+        let machine = machine_for(&fixture);
+
+        let reason = match machine.bring_up() {
+            Ok(_) => panic!("a config that names a device is a real failure, not a skip"),
+            Err(reason) => reason,
+        };
+        assert!(
+            reason.contains("/dev/klipperx-hwtest-no-such-port"),
+            "the reason names the device the config asked for: {reason}"
+        );
+    }
+
+    /// The skip path is unchanged: an unmet [`Requires`] hands back `None` (the
+    /// caller sees `HW-IGNORED` and returns), no machine is built, and the board
+    /// is not locked — so the next test can have it.
+    #[test]
+    fn test_an_unmet_requirement_skips_without_a_machine() {
+        let fixture = TempConfig::new("[mcu]\nserial: /dev/ttyACM0\n");
+        let unmet = Requires::new().section("stepper_x");
+
+        assert!(
+            acquire_at(Some(fixture.path()), "self-test", &unmet).is_none(),
+            "a config that does not provide what the test asked for is a skip"
+        );
+        assert!(
+            acquire_at(None, "self-test", &Requires::new()).is_none(),
+            "no config at all is the other skip"
+        );
+        // A skipped test took no lock: the board is free for whoever comes next.
+        let _board = lock_board(fixture.path(), "self-test").expect("a skip takes no lock");
     }
 }

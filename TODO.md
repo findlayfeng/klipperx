@@ -578,14 +578,22 @@ endstop 资源（`mcu/resource/endstop.rs`，含 `minclock` 门控与 `home_wait
         **行为等价（近似 no-op）**，不要把它当成“不晚到”的保障。
       **真机未验证**：等待生效路径（无 `debug_output`）尚未上真板，见 TESTING.md 的 R11。
 
-- [ ] **Q11 活机（非 `-o`）形态会 park 假设备的阻塞读——2026-10-06 发现，未修**：
-      语料每条用例都是 `-o`（fileoutput），所以“活机形态”从未被自动化跑过。第一次尝试覆盖它
-      （写出 `a_live_case_leaves_the_fake_devices_reader_parked`，现 `#[ignore]`）发现：**去掉 `M400` 也一样**，
-      即与等待无关——`SimulatorDevice::receive` 在没有待发帧、没有 armed monitor 窗时无界地停在条件变量上
-      （`interface/devices/simulator.rs`），用例不再说话后没人 signal 它，于是 `Runtime::shutdown_timeout` 只能放弃
-      （报「a part was leaked」）。**影响面**：目前只挡住“活机形态”的进程内测试；
-      对产线的影响待查——重启是就地重建（`reset_for_restart`），若一次活机运行会泄漏 device/Mcu 引用，
-      就地重启路径值得实测（属 R2/R11 的真机观察点）。**已有可执行复现**（ignored 测试，不是挂死）。
+- [x] **Q11 断环：已修（2026-10-06）** —— `VirtualSdCard` 与 `GCodeButton` 都持 `Arc<GCodeDispatch>`、
+      又把**捕获 `Arc<Self>`** 的 handler 注册回它的命令/mux 表，于是命令表反向钉住部件：
+      `teardown()` 后 `Mcu::Drop` 不跑 → `interface.shutdown()` 不被调用 → 收尾时那批 `spawn_blocking`
+      的阻塞读永远 park。修法照本仓已有约定（`delayed_gcode`/`idle_timeout` 同形、`gcode.rs` 的
+      「析构」段落已把它写成约定）：把注册进 dispatcher 的 handler 对自身的捕获改成 `Arc::downgrade`。
+      **实测**：撤掉修复 → 改敏感的探针失败并点名 cfg
+      `printer-biqu-bx-2021.cfg: … did not shut down within 5s (5.000556956s): a part was leaked`；
+      修复在位 → 同一探针 **0.50s** 通过；
+      `upstream` 过滤全量 422 条 69.7s、**最慢 0.83s**（此前两条各 5.25s）；`KLIPPERX_TRACE` 下这两条
+      现在会打 `MCU DROP`。
+      **顺带解决**：`firmware_restart` 时旧连接不再被命令表钉住（新增
+      `a_firmware_restart_releases_the_old_session` 钉住它）。
+      **前一轮的错误断言已更正**：我曾写「`-o`（fileoutput）下不 park、所以语料不受影响」——
+      实测在含 `[virtual_sdcard]`/`[gcode_button]` 的 cfg 上**不成立**（这两条语料就是代价）。
+      另：真机（非 `-o`）形态的 park 复现仍保留在 `a_live_case_leaves_the_fake_devices_reader_parked`
+      （`#[ignore]`）——它是另一条路径（整台机器从不说话），不在本断环范围内。
 
 - [x] **Q10 模拟设备的步进时序模型（两会话固件链）——已完成（2026-09-27，`agents/feat-simulator-step-timing`）**：
       `SimulatorDevice` 落 per-oid `StepChain`（`config_stepper` 归零、`queue_step` 空闲首拍/忙延展/

@@ -554,12 +554,25 @@ endstop 资源（`mcu/resource/endstop.rs`，含 `minclock` 门控与 `home_wait
       （`toolhead.py:221-223` 与 `:425-429`）——所以语料（`-o` 形态）下不等待，**语料对该特性零覆盖**。
       实测：无 `debug_output` 的 e2e 里 `gap_before=0.4247s → waited=0.5048s → gap_after=-0.0793s`；
       反向对照（去掉闸）会让 file-output 测试实测睡了 500ms，闸由测试钉住。
-      **仍缺（后续单元）**：① 送出口径 / lead 地板——batch 窗口 + move-pool 槽位释放
-      （`free_at = completion + 0.02`、逐槽按序放行），实测不加闸时最后几批 step 晚到 0.106–0.115 s，
-      被 Q10 链模型（真机 `sched.c:94`）判 `Timer too close`（11 例语料转红）；
-      ② `MIN_KIN_TIME`/`kin_flush_delay` 地板（`motion/toolhead.rs:440-443` 自述缺失）；
-      ③ fileoutput 形态下上游 `_flush_handler_debug` 的等价物；④ `send_wait_ack`（`mcu/mod.rs:2639-2650`）。
+      **仍缺（后续单元）**：① `send_wait_ack`（`mcu/mod.rs:2639-2650` 自述只是 flush）；
+      ② fileoutput 形态下上游 `_flush_handler_debug` 的等价物。
+      **已消除的两个“缺口”**（2026-10-06 复核，不要当未完项再排）：
+      - **“送出口径会让 step 晚到 0.106–0.115 s”是假结论——该证据的唯一来源是假固件模型漏算首拍 `interval`**
+        （`simulator.rs` 的 running 分支，已修）；修后同样的真等待复现从 11 例红变 259/0 绿。
+        真机送出口径是否存在同类偏差**无任何证据**，已降为待验假设，由 R11 观察。
+      - `MIN_KIN_TIME`/`kin_flush_delay` 地板**已对齐上游**（`calc_print_time`），
+        但在本仓 `BUFFER_TIME_START = 0.250` 远大于 `MIN_KIN_TIME + KIN_FLUSH_DELAY = 0.101` 的前提下
+        **行为等价（近似 no-op）**，不要把它当成“不晚到”的保障。
       **真机未验证**：等待生效路径（无 `debug_output`）尚未上真板，见 TESTING.md 的 R11。
+
+- [ ] **Q11 活机（非 `-o`）形态会 park 假设备的阻塞读——2026-10-06 发现，未修**：
+      语料每条用例都是 `-o`（fileoutput），所以“活机形态”从未被自动化跑过。第一次尝试覆盖它
+      （写出 `a_live_case_leaves_the_fake_devices_reader_parked`，现 `#[ignore]`）发现：**去掉 `M400` 也一样**，
+      即与等待无关——`SimulatorDevice::receive` 在没有待发帧、没有 armed monitor 窗时无界地停在条件变量上
+      （`interface/devices/simulator.rs`），用例不再说话后没人 signal 它，于是 `Runtime::shutdown_timeout` 只能放弃
+      （报「a part was leaked」）。**影响面**：目前只挡住“活机形态”的进程内测试；
+      对产线的影响待查——重启是就地重建（`reset_for_restart`），若一次活机运行会泄漏 device/Mcu 引用，
+      就地重启路径值得实测（属 R2/R11 的真机观察点）。**已有可执行复现**（ignored 测试，不是挂死）。
 
 - [x] **Q10 模拟设备的步进时序模型（两会话固件链）——已完成（2026-09-27，`agents/feat-simulator-step-timing`）**：
       `SimulatorDevice` 落 per-oid `StepChain`（`config_stepper` 归零、`queue_step` 空闲首拍/忙延展/

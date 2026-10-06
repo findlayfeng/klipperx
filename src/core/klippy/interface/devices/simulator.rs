@@ -159,13 +159,18 @@ struct State {
 /// batch ends (`end`, standing in for `s->count > 0`).
 #[derive(Debug, Clone, Copy)]
 struct StepChain {
-    /// The firmware's `s->next_step_time`: the chain anchor. `config_stepper`
-    /// zeroes it; a reused firmware keeps the last session's tail — the
-    /// leftover the C5 case hinged on.
+    /// The firmware's `s->next_step_time` when the chain is idle: the clock the
+    /// next batch's first step counts its `interval` from. Written on the
+    /// idle↔armed transitions only (a run-out copies the tail here, a fresh
+    /// arming records the first step); a **running** batch leaves it alone,
+    /// because it is read only on the idle path, which re-syncs it from `end`
+    /// first — `end` is the tail that keeps moving.
     base: u32,
     /// When the armed batch's last step fires (wrapping); the chain is busy
-    /// while `now` is before it. Approximates `count`/`add` bookkeeping
-    /// (`stepper.c:96-123`) — enough to answer "is this stepper running".
+    /// while `now` is before it. `chain_span` plus, for a batch queued behind a
+    /// running one, that batch's leading `interval`. Approximates
+    /// `count`/`add` bookkeeping (`stepper.c:96-123`) — enough to answer "is
+    /// this stepper running" and where its tail is.
     end: u32,
     /// Whether a batch is armed (the firmware's `s->count > 0`).
     armed: bool,
@@ -398,13 +403,24 @@ impl SimulatorDevice {
         (a.wrapping_sub(b) as i32) < 0
     }
 
-    /// Steps in the batch a `queue_step` arms, from its first step (`k = 0`,
-    /// `base + interval`) to its last (`k = count - 1`): the span the chain's
-    /// `end` covers. Truncating `as u32` wraps like the firmware's ticks;
-    /// `count = 0` is `Invalid count parameter` upstream and never arrives.
+    /// Steps in the batch a `queue_step` arms, measured from its first step to
+    /// its last: the span a **running** batch adds behind the tail it chains
+    /// from.
+    ///
+    /// The firmware's per-step gaps are `interval + add`, `interval + 2*add`,
+    /// … (`stepper.c:100-104`: `waketime += interval` after `interval += add`,
+    /// with `interval` loaded as `move_interval + move_add` at `:80-81`), so a
+    /// batch of `count` steps spans `(count-1)*interval +
+    /// add*count*(count-1)/2` — the same figure `stepcompress.c:348-352`
+    /// writes as `last_clock = first_clock + move->add*count*(count-1)/2 +
+    /// move->interval*(count-1)`. A single step spans nothing (`count = 1`),
+    /// which is what makes a "far step" over a gap a single `interval`.
+    ///
+    /// Truncating `as u32` wraps like the firmware's ticks; `count = 0` is
+    /// `Invalid count parameter` upstream and never arrives.
     fn chain_span(interval: u32, count: u16, add: i16) -> u32 {
         let n = i128::from(count.saturating_sub(1));
-        let span = i128::from(interval) * n + i128::from(add) * n * (n - 1) / 2;
+        let span = i128::from(interval) * n + i128::from(add) * n * (n + 1) / 2;
         span.max(0) as u32
     }
 
@@ -848,8 +864,21 @@ impl SimulatorDevice {
                             // Running: the firmware only queues the move
                             // (`stepper.c:280-281`), chaining it behind the
                             // batch — no timer is armed, nothing can expire.
+                            //
+                            // The queued batch's first step lands one
+                            // `interval` past the tail it chains from
+                            // (`stepper.c:100-104`: `waketime += move_interval`
+                            // when the running move runs out and this one is
+                            // loaded), and `chain_span` covers first→last on
+                            // top of that. Omitting the leading `interval`
+                            // makes the tail fall one interval behind per
+                            // command, which for a sparse axis' single "far
+                            // step" is that whole gap — the chain then looks
+                            // run-out while it is still fed, and the next
+                            // `queue_step` reads as `Timer too close`.
                             chain.end = chain
                                 .end
+                                .wrapping_add(interval)
                                 .wrapping_add(Self::chain_span(interval, count, add));
                             false
                         } else {
@@ -1920,6 +1949,84 @@ mod tests {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .firmware_shutdown
+    }
+
+    /// The step chain configured for oid 0 as `(base, end, armed)`.
+    fn chain(device: &SimulatorDevice) -> (u32, u32, bool) {
+        let state = device.state.lock().unwrap_or_else(|p| p.into_inner());
+        let chain = state.steppers.get(&0).expect("oid 0 is configured");
+        (chain.base, chain.end, chain.armed)
+    }
+
+    /// `chain_span` is the span from a batch's first step to its last: the
+    /// firmware's gaps are `interval + add`, `interval + 2*add`, …
+    /// (`stepper.c:100-104`), the same sum `stepcompress.c:348-352` writes.
+    #[test]
+    fn chain_span_runs_from_first_step_to_last() {
+        // A single step spans nothing — `base + interval` is the step.
+        assert_eq!(SimulatorDevice::chain_span(1_000, 1, 7), 0);
+        // Two steps: one gap, `interval + add` (the first gap already carries
+        // `add` — `stepper.c:80-81` loads `interval` as `move_interval +
+        // move_add`, and `:102` adds it after the first step).
+        assert_eq!(SimulatorDevice::chain_span(1_000, 2, 7), 1_007);
+        // Three: `interval + add` then `interval + 2*add`.
+        assert_eq!(SimulatorDevice::chain_span(1_000, 3, 100), 2_300);
+        // A long batch: `count-1` gaps whose add terms sum to
+        // `add*count*(count-1)/2`, not `add*(count-1)*(count-2)/2`.
+        assert_eq!(SimulatorDevice::chain_span(1_000, 5, 100), 5_000);
+    }
+
+    /// A batch queued behind a **running** one chains off the tail: its first
+    /// step is one `interval` past it (`stepper.c:100-104`), and `chain_span`
+    /// covers first→last on top. The bug this pins dropped that leading
+    /// `interval`, so the tail fell behind by one interval per command — for a
+    /// sparse axis' single "far step" (interval far larger than the span) that
+    /// is the whole gap, and the next command read as `Timer too close`.
+    #[test]
+    fn a_running_batch_chains_off_the_tail_plus_its_first_step() {
+        let device = armed_device();
+        config_a_stepper(&device);
+
+        // A single far step, idle: the first shot is `base + interval` (base
+        // is zero), and a one-step batch ends on that step.
+        let far = 4_000_000u32;
+        issue(
+            &device,
+            "queue_step",
+            &[
+                ArgValue::UInt8(0),
+                ArgValue::UInt32(far),
+                ArgValue::UInt16(1),
+                ArgValue::Int16(0),
+            ],
+        );
+        assert_eq!(chain(&device), (far, far, true), "the far step is armed");
+
+        // A dense batch behind it, still running: first step at the tail plus
+        // its own `interval`, then its span.
+        let (interval, count, add) = (2_000u32, 50u16, 7i16);
+        issue(
+            &device,
+            "queue_step",
+            &[
+                ArgValue::UInt8(0),
+                ArgValue::UInt32(interval),
+                ArgValue::UInt16(count),
+                ArgValue::Int16(add),
+            ],
+        );
+        let span = SimulatorDevice::chain_span(interval, count, add);
+        let end = chain(&device).1;
+        assert_eq!(
+            end,
+            far.wrapping_add(interval).wrapping_add(span),
+            "tail = far step + the chained batch's leading interval + its span"
+        );
+        assert_ne!(
+            end,
+            far.wrapping_add(span),
+            "dropping the leading interval would land exactly `interval` short"
+        );
     }
 
     #[test]

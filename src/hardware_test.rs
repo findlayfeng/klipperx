@@ -32,6 +32,28 @@
 //!   -- --ignored --nocapture
 //! ```
 //!
+//! # This tests the module, not your config
+//!
+//! The premise of the whole mode, and it holds for **every** case here: what is
+//! under test is this repository's module, not the config you handed it.
+//!
+//! The config is the *input*. A case reads it to learn which section, which
+//! option and which board it has to work with, and then **takes it on trust**:
+//! an accepted config is one upstream Klipper would also accept, wired the way
+//! the config says. Nothing here validates a config, and no case is a check of
+//! one.
+//!
+//! So a result reads this way:
+//!
+//! * A failure caused by the config, the wiring, a firmware that does not match
+//!   it, or an environment that is not what the config describes is **not** a bug
+//!   in the module the case is about.
+//! * A pass does not mean the config is right either: it means the module
+//!   behaved on a board whose config was, by assumption, correct.
+//!
+//! To check a config itself, use the host (`objects/list`, `status`, the log) or
+//! upstream Klipper; this mode is not the tool for it.
+//!
 //! # Everything comes from the config file
 //!
 //! [`HW_CONFIG_ENV`] names the same config the printer reads, and nothing else is
@@ -723,6 +745,19 @@ fn lock_board(config: &Path, test_name: &str) -> Result<BoardLock, String> {
     }
 }
 
+/// The `HW-RUN` line [`acquire_at`] prints once a test is about to run.
+///
+/// One line, greppable by its `HW-` prefix. It names the test and carries the
+/// premise of the whole mode with it — see this module's "This tests the module,
+/// not your config": the config is taken as correct, so the run checks the host
+/// module rather than the user's config.
+fn run_line(test_name: &str) -> String {
+    format!(
+        "HW-RUN: {test_name}  \
+         (the config is assumed correct; this checks the host module, not your config)"
+    )
+}
+
 /// Hand `test_name` a machine for the configured board, or report it as skipped.
 ///
 /// The only reader of [`HW_CONFIG_ENV`]: it names the config, and [`acquire_at`]
@@ -732,7 +767,7 @@ fn lock_board(config: &Path, test_name: &str) -> Result<BoardLock, String> {
 /// test touches no device and takes no lock.
 ///
 /// Returns `Some(machine)` with the board locked exclusively when everything is
-/// in place, printing `HW-RUN: <test>` first. The lock is held until the machine
+/// in place, printing the [`run_line`] first. The lock is held until the machine
 /// is dropped, so the test body and its cleanup are one session on the board.
 pub fn acquire(test_name: &str, requires: &Requires) -> Option<Machine> {
     let path = std::env::var(HW_CONFIG_ENV).ok();
@@ -768,7 +803,7 @@ fn acquire_at(path: Option<&Path>, test_name: &str, requires: &Requires) -> Opti
             let _board = lock_board(&path, test_name).unwrap_or_else(|reason| {
                 panic!("{test_name}: cannot serialise on the board's config file: {reason}")
             });
-            println!("HW-RUN: {test_name}");
+            println!("{}", run_line(test_name));
             Some(Machine {
                 config,
                 path,
@@ -800,6 +835,10 @@ fn plan() {
     match load(Path::new(&path)) {
         Ok(config) => {
             println!("HW-CONFIG: {path}");
+            println!(
+                "HW-CONFIG: these cases test the host module, not this config \
+                 — a config they read is assumed correct"
+            );
             print_plan(&config);
         }
         Err(reason) => println!("HW-CONFIG: {reason}"),
@@ -1316,6 +1355,43 @@ mod tests {
         assert_eq!(
             mcu_plan_lines(&config("[printer]\nkinematics: none\n")),
             vec!["HW-MCU: no [mcu] section — `.mcu()` tests are ignored".to_string()]
+        );
+    }
+
+    /// The `HW-RUN` line a test sees when it runs: one line, prefixed `HW-`,
+    /// naming the test and carrying the mode's premise with it — the config is
+    /// assumed correct, so the run checks the host module, not the user's
+    /// config. It is the line [`acquire_at`]'s success path prints, which the
+    /// fake config fixture below reaches.
+    #[test]
+    fn test_the_run_line_names_the_test_and_the_premise() {
+        let name = "test_r5_single_axis_move_matches_the_firmware_step_count";
+        let line = run_line(name);
+
+        assert!(
+            line.starts_with(&format!("HW-RUN: {name}")),
+            "the prefix and the test's name come first: {line}"
+        );
+        assert!(
+            line.contains("the config is assumed correct"),
+            "the line carries the mode's premise: {line}"
+        );
+        assert!(
+            line.contains("not your config"),
+            "and says what the run is not checking: {line}"
+        );
+        assert_eq!(
+            line.lines().count(),
+            1,
+            "the notice stays one line rather than a multi-line block: {line}"
+        );
+
+        // The success path is what prints it: a config that provides what the
+        // test asked for hands back a machine, so `acquire_at` reached the run.
+        let fixture = TempConfig::new("[mcu]\nserial: /dev/ttyACM0\n");
+        assert!(
+            acquire_at(Some(fixture.path()), name, &Requires::new().mcu()).is_some(),
+            "a satisfied config reaches the run, whose line is the one checked above"
         );
     }
 

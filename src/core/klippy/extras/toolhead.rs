@@ -6505,11 +6505,11 @@ mod tests {
     ///   after `M400` is its `position_endstop`
     ///   ([`R4_POSITION_TOLERANCE_MM`]).
     /// - **Not asserted — the operator's call**: whether the carriage actually
-    ///   touched the endstop. This host's `home_axis` does not read the trigger
-    ///   time its `home_wait` returns, so **a homing move whose endstop never
-    ///   triggers still comes back as a success and still marks the axis
-    ///   homed**; upstream's `No trigger on X after full movement` check
-    ///   (`extras/homing.py:119`) is the gap `home_unified`'s doc records. With a
+    ///   touched the endstop. A **missed trigger is a hard error** now
+    ///   (`No trigger on <axis> after full movement`, the rail's short name,
+    ///   upstream `extras/homing.py:119`), so a missing/dead endstop no longer
+    ///   passes silently — but the check proves the endstop *fired*, not that
+    ///   the mechanics are sound. Watch each axis. With a
     ///   dead endstop the axis therefore drives the whole 1.5× force distance
     ///   and stops against whatever is at the end of travel. **Watch the axis:**
     ///   if it does not stop on its endstop, that is a finding against this
@@ -6592,9 +6592,10 @@ mod tests {
     /// each axis' position after `M400` is its own `position_endstop`. Same
     /// limits as the single-axis case, and the same two things it does **not**
     /// cover: no retract/second pass ([`R4_POSITION_TOLERANCE_MM`]), and the
-    /// trigger itself is not proven by this host's `G28` — **watch each axis
-    /// stop on its endstop**, because a missed trigger is not an error here
-    /// (see the single-axis case's notes).
+    /// physical travel itself. A **missed trigger is an error here**
+    /// (`No trigger on <axis> after full movement`), so a dead endstop shows up
+    /// as a failure rather than a silent success — **watch each axis stop on
+    /// its endstop** anyway (see the single-axis case's notes).
     ///
     /// # Before you run it
     ///

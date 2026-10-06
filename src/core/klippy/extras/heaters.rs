@@ -1934,4 +1934,451 @@ mod tests {
         // Each poll reports the real table: `T0:20.0 /200.0` at t=0 and t=1 s.
         assert_eq!(emitted(&lines), ["T0:20.0 /200.0", "T0:20.0 /200.0"]);
     }
+
+    // ------------------------------------------------------------------
+    // Real board: temperature readings (M105, no heating)
+    // ------------------------------------------------------------------
+
+    /// How long the case lets the board take to answer its first temperature
+    /// query before calling the link dead.
+    ///
+    /// The ADC resource places a query's first report 1.5 s ahead of the
+    /// estimated clock (`mcu/resource/adc.rs:600-608`), so no reading can be
+    /// there the moment `bring_up` returns; the bound is for that first report
+    /// to arrive and be attributed, and ten seconds is generous for any sensor.
+    const TEMPERATURE_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// How often the wait re-reads while it waits.
+    const TEMPERATURE_READ_POLL: Duration = Duration::from_millis(100);
+
+    /// How many M105 rounds the case compares, for "several reads do not jump
+    /// to an illegal value".
+    const M105_ROUNDS: usize = 3;
+
+    /// What the real-board temperature case needs from `KLIPPERX_HW_CONFIG`.
+    ///
+    /// `[extruder]`'s `sensor_pin` is the key that says the config wires a
+    /// thermistor to the MCU: it makes M105 carry a `T0` entry and gives the
+    /// reading a section whose `min_temp` / `max_temp` it can be checked
+    /// against. A config without it is skipped by
+    /// [`crate::hardware_test::acquire`]. Shared with
+    /// [`test_the_temperature_case_declares_extruder_sensor_pin`], so the
+    /// declaration the config is judged against and the one the case runs under
+    /// cannot drift apart.
+    fn temperature_case() -> crate::hardware_test::Requires {
+        crate::hardware_test::Requires::new()
+            .mcu()
+            .option("extruder", "sensor_pin")
+    }
+
+    /// One registered sensor as the case reads it: the name its section is
+    /// registered under, the temperature its object reports, and the bounds its
+    /// section writes down (`None` on a side the section leaves unset).
+    struct SensorReading {
+        name: String,
+        temperature: f64,
+        min: Option<f64>,
+        max: Option<f64>,
+    }
+
+    impl SensorReading {
+        /// Whether the board has answered for this sensor.
+        ///
+        /// `0.0` is the value the module holds before the first report reaches
+        /// it — initialized at `heaters.rs:862` (`HeaterState.smoothed_temp`) and
+        /// `temperature_sensor.rs:86-87` (`Reading.last_temp`) — and it is what a
+        /// file-output (`-o`) run keeps forever, because nothing answers its
+        /// temperature queries (`heaters.py:37-39`). A real converter reading is
+        /// a fractional value, so a non-zero reading is the proof that this is
+        /// the live shape. This says nothing about the actual temperature.
+        fn has_arrived(&self) -> bool {
+            self.temperature != 0.0
+        }
+
+        /// Whether the reading is finite and inside the bounds its section
+        /// declares. A side the section does not declare is not checked.
+        fn is_legal(&self) -> bool {
+            self.temperature.is_finite()
+                && self.min.is_none_or(|min| self.temperature >= min)
+                && self.max.is_none_or(|max| self.temperature <= max)
+        }
+
+        /// The declared range, for the human-readable line.
+        fn bounds(&self) -> String {
+            match (self.min, self.max) {
+                (Some(min), Some(max)) => format!("({min}..{max})"),
+                (Some(min), None) => format!("(>= {min})"),
+                (None, Some(max)) => format!("(<= {max})"),
+                (None, None) => "(the section declares no range)".to_string(),
+            }
+        }
+    }
+
+    /// The section names the `heaters` registry has registered, from its own
+    /// status (`PrinterHeaters::get_status`'s `available_sensors`).
+    fn registered_sensor_sections(heaters: &PrinterHeaters, eventtime: f64) -> Vec<String> {
+        heaters.get_status(eventtime)["available_sensors"]
+            .as_array()
+            .expect("`available_sensors` is a list")
+            .iter()
+            .map(|name| {
+                name.as_str()
+                    .expect("every registered sensor name is a string")
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// Read one registered sensor: the temperature its object reports and the
+    /// bounds its section declares.
+    ///
+    /// Panics when `name` has no object, its status carries no `temperature`
+    /// number, or its section is not in the config — a section that registered a
+    /// sensor the host cannot then read is exactly the mismatch this case exists
+    /// to catch, not a skip.
+    fn read_sensor(printer: &Arc<Printer>, config: &Config, name: &str) -> SensorReading {
+        let object = printer.lookup_object(name).unwrap_or_else(|| {
+            panic!("`{name}` is in `available_sensors` but no printer object answers to it")
+        });
+        let temperature = object
+            .get_status(printer.eventtime())
+            .get("temperature")
+            .and_then(Value::as_f64)
+            .unwrap_or_else(|| {
+                panic!("`{name}` registered a sensor but reports no `temperature` in its status")
+            });
+        let section = config.get_section(name).unwrap_or_else(|| {
+            panic!("`{name}` is registered but its section is not in the config")
+        });
+        let wrapper = ConfigWrapper::untracked(section);
+        SensorReading {
+            name: name.to_string(),
+            temperature,
+            min: wrapper
+                .get_optional_float("min_temp")
+                .expect("a declared min_temp parses"),
+            max: wrapper
+                .get_optional_float("max_temp")
+                .expect("a declared max_temp parses"),
+        }
+    }
+
+    /// Wait until every registered sensor has answered and is inside its
+    /// section's declared range, or the bound runs out.
+    ///
+    /// Returns the readings it settled on. On the bound it prints them all and
+    /// fails, naming the two things a missing reading looks like: a sensor still
+    /// at the module's pre-report `0.0` (the `-o` shape), or a value outside the
+    /// bounds its own section wrote down.
+    fn wait_for_readings(
+        printer: &Arc<Printer>,
+        config: &Config,
+        available: &[String],
+    ) -> Vec<SensorReading> {
+        let deadline = std::time::Instant::now() + TEMPERATURE_READ_TIMEOUT;
+        loop {
+            let readings: Vec<SensorReading> = available
+                .iter()
+                .map(|name| read_sensor(printer, config, name))
+                .collect();
+            if readings
+                .iter()
+                .all(|reading| reading.has_arrived() && reading.is_legal())
+            {
+                return readings;
+            }
+            if std::time::Instant::now() >= deadline {
+                for reading in &readings {
+                    println!(
+                        "HW-TEMP: {} = {} {}",
+                        reading.name,
+                        reading.temperature,
+                        reading.bounds()
+                    );
+                }
+                panic!(
+                    "no live reading for every registered sensor within \
+                     {TEMPERATURE_READ_TIMEOUT:?}: one still reads 0.0 (the module's value \
+                     before its first report) or falls outside its section's declared range"
+                );
+            }
+            std::thread::sleep(TEMPERATURE_READ_POLL);
+        }
+    }
+
+    /// The `(g-code id, current, target)` entries an M105 line reports.
+    ///
+    /// `PrinterHeaters::_get_temp` joins `"<id>:{cur:.1} /{target:.1}"` per
+    /// sensor with spaces (`heaters.rs:442-458`), so the line is a run of
+    /// `id:current` tokens each followed by a `/target` token. The `"T:0"`
+    /// fallback — no sensor registered, or the `klippy:ready` gate not yet
+    /// passed — has no `/target` and yields no entries, which is what tells the
+    /// fallback apart from a real `T0:0.0 /0.0`.
+    fn m105_entries(line: &str) -> Vec<(String, f64, f64)> {
+        let mut entries = Vec::new();
+        let mut tokens = line.split_whitespace();
+        while let Some(token) = tokens.next() {
+            let Some((id, current)) = token.split_once(':') else {
+                continue;
+            };
+            let Ok(current) = current.parse::<f64>() else {
+                continue;
+            };
+            let Some(target) = tokens.next().and_then(|token| token.strip_prefix('/')) else {
+                continue;
+            };
+            let Ok(target) = target.parse::<f64>() else {
+                continue;
+            };
+            entries.push((id.to_string(), current, target));
+        }
+        entries
+    }
+
+    /// M105 against a real board, with no heating: every registered sensor
+    /// reports a real reading, finite and inside the range its section declares.
+    ///
+    /// # What it is for
+    ///
+    /// `TESTING.md`'s R6 (`TESTING.md:67-73`) is the temperature link and the
+    /// heating loop, and its judgment is "readings explainable (same order,
+    /// monotonic), the PID converges, `verify_heater` does not trip". This is the
+    /// **read half alone** — it never calls `M104`/`M140` /
+    /// `SET_HEATER_TEMPERATURE`, so the link is exercised without a heater
+    /// coming on:
+    ///
+    /// 1. **every registered sensor has a reading** — the `heaters` registry's
+    ///    own `available_sensors` (`heaters.rs:951-956`) drives the list, so a
+    ///    sensor the module forgot to register is a failure here, not a silent
+    ///    omission;
+    /// 2. **each reading is finite and inside the range its section declares** —
+    ///    `[extruder]` / `[heater_bed]` / `[heater_generic]` / `[temperature_fan]`
+    ///    write both bounds down and both are required (`heaters.rs:770-772`),
+    ///    while a `[temperature_sensor]` that declares none leaves the check to
+    ///    finiteness alone;
+    /// 3. **M105 is the live path, not the `-o` fallback** — in the corpus'
+    ///    file-output shape nothing answers a temperature query, so M105 can only
+    ///    ever report the module's untouched `0.0` (`heaters.py:37-39`,
+    ///    `heaters.rs:862`). A live board answers, and the case requires the
+    ///    required `[extruder]`'s `T0` entry to be a real, non-zero, in-range
+    ///    value on several reads.
+    ///
+    /// The `T:0` line M105 falls back to has two causes and the case names
+    /// which one it is: an empty `available_sensors` is a machine with no sensor
+    /// registered at all (which `temperature_case()` should have skipped), and a
+    /// populated one with `T:0` is the `klippy:ready` gate (`has_started`,
+    /// `heaters.rs:418-421`) never having fired — a machine that did not reach
+    /// `Ready`, which `bring_up` would have failed on.
+    ///
+    /// # What it assumes about the wiring
+    ///
+    /// The config's own sensors: `[extruder]`'s thermistor on its `sensor_pin`,
+    /// and whatever other `[temperature_sensor]` / `[heater_bed]` /
+    /// `[heater_generic …]` / `[temperature_fan …]` sections it names, each wired
+    /// to the pin the config gives it on the `[mcu]` board. Nothing has to be hot
+    /// or moving.
+    ///
+    /// # What it is safe to run
+    ///
+    /// **No heating, no motion, no GPIO.** The only commands that reach the
+    /// board are the temperature queries the sensors set up for themselves; the
+    /// case itself sends nothing but `M105`. No `M104` / `M140` /
+    /// `SET_HEATER_TEMPERATURE`, so no heater can come on; the ADC read is the
+    /// lightest thing the board does, and it is what the running printer already
+    /// does anyway.
+    ///
+    /// # Why this case is a plain `#[test]`, not `#[tokio::test]`
+    ///
+    /// It uses the second layer (L2): `Machine::bring_up` builds the machine's
+    /// own multi-thread runtime and `StartedMachine`'s `Drop` bounds that
+    /// runtime's shutdown, and both block — Tokio refuses to start a runtime
+    /// inside a runtime (`bring_up`) and to drop one from inside one
+    /// (`shutdown_timeout`). The case body is therefore synchronous and runs
+    /// `M105` through `GCodeDispatch::run_script_sync`, which builds its own
+    /// runtime. The L1 cases keep `#[tokio::test]` because they `.await`
+    /// `Mcu::connect` themselves.
+    ///
+    /// # 前提：本用例假定提供的配置是正确的
+    ///
+    /// 上游 Klipper 也会接受这份配置，且它与实际接线一致。本用例验的是**本仓这个模块的
+    /// 行为**——配置 / 接线 / 固件不匹配导致的失败，不代表模块有 bug；要验配置本身请用宿主
+    /// 或上游 Klipper。理由与后果见开发手册的「真机测试」小节。
+    ///
+    /// # Running it
+    ///
+    /// ```text
+    /// KLIPPERX_HW_CONFIG=~/printer_data/config/printer.cfg \
+    ///   cargo test -p klipperx --lib \
+    ///   test_m105_reports_each_registered_sensor_on_a_real_board \
+    ///   -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "hardware: needs KLIPPERX_HW_CONFIG"]
+    fn test_m105_reports_each_registered_sensor_on_a_real_board() {
+        let Some(hardware) = crate::hardware_test::acquire(
+            "test_m105_reports_each_registered_sensor_on_a_real_board",
+            &temperature_case(),
+        ) else {
+            return; // reported as HW-IGNORED; the test passes without a board
+        };
+        // `hardware` holds the board lock and must outlive `started`, whose
+        // `Drop` tears the machine down — so declare it first and keep both to
+        // the end of the test. Every part handle taken from `started`
+        // (`heaters`, `gcode`) is declared *after* it, so the ordinary
+        // reverse-declaration drop order releases them before the machine goes:
+        // the dispatcher's command table and the heaters table keep their parts
+        // (and those parts their `Mcu`) alive, and a machine that still holds
+        // its `Mcu` cannot meet `StartedMachine::drop`'s shutdown bound.
+        let config = hardware.config();
+        let started = hardware.bring_up().expect("the board comes up");
+        let printer = started.printer();
+
+        let heaters = printer
+            .lookup_object_as::<PrinterHeaters>(HEATERS_OBJECT)
+            .expect("the loader registers `heaters` before any sensor section");
+        let available = registered_sensor_sections(&heaters, printer.eventtime());
+        assert!(
+            !available.is_empty(),
+            "the config registers no temperature sensor at all: `temperature_case()` requires \
+             [extruder] sensor_pin, so `acquire` should have skipped this case before bring-up"
+        );
+
+        let readings = wait_for_readings(printer, config, &available);
+        for reading in &readings {
+            println!(
+                "HW-TEMP: {} = {} {}",
+                reading.name,
+                reading.temperature,
+                reading.bounds()
+            );
+        }
+
+        let extruder = readings
+            .iter()
+            .find(|reading| reading.name == "extruder")
+            .expect("[extruder] is registered by the section `temperature_case()` requires");
+        let (min, max) = (
+            extruder.min.expect("[extruder] declares min_temp"),
+            extruder.max.expect("[extruder] declares max_temp"),
+        );
+
+        let gcode = printer
+            .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+            .expect("the loader registers `gcode`");
+        let lines = captured_lines(&gcode);
+        for round in 1..=M105_ROUNDS {
+            gcode
+                .run_script_sync("M105")
+                .expect("M105 runs on a live machine");
+            // Whatever else the machine may print, the newest line that is
+            // either M105's fallback or a run of `id:current /target` entries is
+            // this round's answer.
+            let line = emitted(&lines)
+                .into_iter()
+                .rev()
+                .find(|line| line.trim() == "T:0" || !m105_entries(line).is_empty())
+                .expect("M105 answered one line");
+            assert_ne!(
+                line.trim(),
+                "T:0",
+                "M105 round {round}: the line fell back to `T:0` with {available:?} registered — \
+                 `has_started` is false (the machine never fired klippy:ready; state: {})",
+                printer.get_state_message().message
+            );
+            let (_, current, target) = m105_entries(&line)
+                .into_iter()
+                .find(|(id, _, _)| id == "T0")
+                .unwrap_or_else(|| {
+                    panic!(
+                        "M105 round {round}: no `T0` entry for the required [extruder]: `{line}`"
+                    )
+                });
+            assert!(
+                current.is_finite() && current != 0.0 && current >= min && current <= max,
+                "M105 round {round}: T0 = {current} is not a live reading inside [extruder]'s \
+                 declared range {min}..{max} (target {target})"
+            );
+            println!("HW-TEMP: M105 round {round}: {line}");
+        }
+    }
+
+    /// The declaration the real-board case runs under is the one the config is
+    /// judged against: `[extruder]` with `sensor_pin` activates it, and a
+    /// commented-out or missing pair skips it.
+    ///
+    /// This is the half of a hardware case that needs no board, and it is the
+    /// one that keeps a wrong declaration from turning the case into one that is
+    /// *always* skipped.
+    #[test]
+    fn test_the_temperature_case_declares_extruder_sensor_pin() {
+        let with_it = Config::from_text(
+            "[mcu]\nserial: /dev/fake\n[extruder]\nsensor_pin: PA0\nheater_pin: PA1\n",
+        )
+        .expect("the fixture parses")
+        .0;
+        assert_eq!(
+            crate::hardware_test::check(&with_it, &temperature_case()),
+            Ok(())
+        );
+
+        let commented =
+            Config::from_text("# [extruder]\n# sensor_pin: PA0\n[mcu]\nserial: /dev/fake\n")
+                .expect("the fixture parses")
+                .0;
+        assert_eq!(
+            crate::hardware_test::check(&commented, &temperature_case()),
+            Err(vec![crate::hardware_test::Missing::Section(
+                "extruder".to_string()
+            )])
+        );
+
+        let without_it =
+            Config::from_text("[mcu]\nserial: /dev/fake\n[extruder]\nheater_pin: PA1\n")
+                .expect("the fixture parses")
+                .0;
+        assert_eq!(
+            crate::hardware_test::check(&without_it, &temperature_case()),
+            Err(vec![crate::hardware_test::Missing::Option {
+                section: "extruder".to_string(),
+                option: "sensor_pin".to_string(),
+            }])
+        );
+    }
+
+    /// The two halves of the reading assertion are real, not decorative: the
+    /// `T:0` fallback is told apart from a reading line, and a value outside the
+    /// declared range (or not finite) is not legal.
+    #[test]
+    fn test_the_temperature_reading_checks_reject_the_wrong_shapes() {
+        let reading = |temperature: f64, min: Option<f64>, max: Option<f64>| SensorReading {
+            name: "extruder".to_string(),
+            temperature,
+            min,
+            max,
+        };
+
+        // A live reading is legal; the untouched 0.0 is not a report.
+        let live = reading(23.4, Some(0.0), Some(250.0));
+        assert!(live.has_arrived() && live.is_legal());
+        assert!(!reading(0.0, Some(0.0), Some(250.0)).has_arrived());
+
+        // Out of range on either side, and not finite, are all illegal.
+        assert!(!reading(300.0, Some(0.0), Some(250.0)).is_legal());
+        assert!(!reading(-1.0, Some(0.0), Some(250.0)).is_legal());
+        assert!(!reading(f64::NAN, Some(0.0), Some(250.0)).is_legal());
+        // A side the section declares is still checked on its own.
+        assert!(!reading(300.0, None, Some(250.0)).is_legal());
+        // A side the section does not declare is not checked.
+        assert!(reading(-999.0, None, None).is_legal());
+
+        // The fallback has no entries; a real line has one per sensor.
+        assert!(m105_entries("T:0").is_empty());
+        assert_eq!(
+            m105_entries("T0:20.0 /200.0 B:31.5 /0.0"),
+            vec![
+                ("T0".to_string(), 20.0, 200.0),
+                ("B".to_string(), 31.5, 0.0),
+            ]
+        );
+    }
 }

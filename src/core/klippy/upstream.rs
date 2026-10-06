@@ -605,6 +605,21 @@ mod tests {
         config_file: &str,
         script: &str,
     ) -> Result<Result<(), String>, String> {
+        run_phases_with(config, config_file, script, true).await
+    }
+
+    /// [`run_phases`], with the case's shape chosen by the caller.
+    ///
+    /// `fileoutput = true` is the corpus' shape (`-o`, `can_pause` false);
+    /// `false` is the shape a real board gets — no `debug_output`, so
+    /// `can_pause` is true and `M400` really waits
+    /// (`klippy/toolhead.py:221-223`, `:425-429`).
+    async fn run_phases_with(
+        config: &Config,
+        config_file: &str,
+        script: &str,
+        fileoutput: bool,
+    ) -> Result<Result<(), String>, String> {
         use crate::core::klippy::gcode::{GCodeDispatch, GCODE_OBJECT};
         use crate::core::klippy::printer::{Printer, PrinterState};
         use crate::core::klippy::reactor::TokioReactor;
@@ -621,7 +636,7 @@ mod tests {
         // this is that step for a case run, done before the config is loaded,
         // as the host does.
         let mut start_args = crate::core::klippy::api::StartArgs::collect(config_file, None);
-        start_args.debug_output = Some("_test_output".to_string());
+        start_args.debug_output = fileoutput.then(|| "_test_output".to_string());
         printer.set_start_args(Arc::new(start_args));
 
         let setup = async {
@@ -814,6 +829,83 @@ mod tests {
         .expect("the extruder move runs against the fake firmware");
     }
 
+    /// The **real-machine path** of a move followed by `M400`: no
+    /// `debug_output`, so `can_pause` is true (`klippy/toolhead.py:221-223`) and
+    /// `M400` waits on the fake firmware's clock instead of returning at once
+    /// (the file-output shortcut `test_wait_moves_does_not_wait_under_file_output`
+    /// pins the other side).
+    ///
+    /// A **live** case (no `-o`) against the fake firmware leaves the device's
+    /// blocking reader parked, so the case's runtime cannot shut down.
+    ///
+    /// This is what a first attempt at covering "a real machine's shape"
+    /// found, and it is **not** about `M400`: the same leak appears with the
+    /// move alone and no `M400` at all (and it does **not** appear under `-o`,
+    /// which every corpus run uses). `SimulatorDevice::receive` waits on a
+    /// condvar with no bound when it has no frame to hand out and no armed
+    /// monitor window (`interface/devices/simulator.rs`), and nothing signals it
+    /// once the case stopped talking — so the blocking thread stays parked and
+    /// `Runtime::shutdown_timeout` has to give up.
+    ///
+    /// Ignored because it fails on that leak (the harmless, bounded failure
+    /// this test is written to produce: `a part was leaked`, not a hung run).
+    /// It stays here as the reproduction: whoever makes a live case release its
+    /// device can un-ignore it. The `M400` wait itself is covered by
+    /// `extras::toolhead`'s `test_m400_waits_for_the_fake_firmware_clock_to_catch_up`
+    /// (a responder-style fake that does not park a blocking reader), and the
+    /// step-chain model by `interface::devices::simulator`'s own tests.
+    ///
+    /// Skipped when the dictionary was not built (`KLIPPERX_ARCHES`).
+    #[test]
+    #[ignore = "known: a live (non -o) case parks the fake device's blocking reader, so its runtime cannot shut down"]
+    fn a_live_case_leaves_the_fake_devices_reader_parked() {
+        let dictionary = dict_dir().join("atmega2560.dict");
+        if !dictionary.is_file() {
+            return;
+        }
+        // The extruder gives the machine a sparse axis: its step batches are
+        // far apart, which is what a chain model that drops a batch's leading
+        // interval gets wrong first.
+        let text = format!(
+            "[mcu]\ntest: dict={}\n\
+             [stepper_x]\nstep_pin: PA0\ndir_pin: PA1\nrotation_distance: 40\nmicrosteps: 16\nposition_max: 200\n\
+             [stepper_y]\nstep_pin: PA2\ndir_pin: PA3\nrotation_distance: 40\nmicrosteps: 16\nposition_max: 200\n\
+             [stepper_z]\nstep_pin: PA4\ndir_pin: PA5\nrotation_distance: 8\nmicrosteps: 16\nposition_max: 200\n\
+             [extruder]\nstep_pin: PA6\ndir_pin: PA7\nrotation_distance: 33.5\nmicrosteps: 16\n\
+             nozzle_diameter: 0.4\nfilament_diameter: 1.75\nheater_pin: PB0\n\
+             sensor_type: EPCOS 100K B57560G104F\nsensor_pin: PK5\ncontrol: pid\npid_Kp: 1\npid_Ki: 0.1\npid_Kd: 10\n\
+             min_temp: 0\nmax_temp: 250\nmin_extrude_temp: 0\n\
+             [printer]\nkinematics: cartesian\nmax_velocity: 300\nmax_accel: 3000\n",
+            dictionary.display()
+        );
+        let (config, _) = Config::from_text(&text).expect("the config parses");
+
+        // One runtime for this case, shut down on a **bound** — the corpus'
+        // own discipline (`run_case`, `a_case_runtime_shuts_down`). It matters
+        // here more than anywhere: the fake firmware's `receive` parks on a
+        // condvar until something signals it (`interface/devices/simulator.rs`),
+        // and a `#[tokio::test]` runtime drops by *waiting forever* for exactly
+        // such a parked blocking thread. A bounded shutdown turns "a part was
+        // leaked" into a failure instead of a hung test run.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("a case runtime");
+        let script = "SET_KINEMATIC_POSITION X=0 Y=0 Z=0\nG1 X10 Y10 F600\nG1 E1 F300\nM400";
+        let outcome = runtime.block_on(run_phases_with(&config, "wait-moves.cfg", script, false));
+        let started = std::time::Instant::now();
+        runtime.shutdown_timeout(std::time::Duration::from_secs(CASE_SHUTDOWN_TIMEOUT));
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(CASE_SHUTDOWN_TIMEOUT),
+            "the case's runtime did not shut down within {CASE_SHUTDOWN_TIMEOUT}s ({elapsed:?}): \
+             a part was leaked"
+        );
+        assert!(
+            matches!(outcome, Ok(Ok(()))),
+            "the move and M400 must run without file output: {outcome:?}"
+        );
+    }
     /// A homing move runs end to end and the process exits cleanly.
     ///
     /// Regression for the `Mcu → events → resource → Mcu` strong cycle: before

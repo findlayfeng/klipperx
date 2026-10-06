@@ -96,6 +96,31 @@ cargo test --workspace -- --test-threads=1 2>&1 | scripts/test-timings.py
 `KLIPPERX_HW_CONFIG`（指向你自己的 `printer.cfg`），接口（`[mcu]` 的 `serial:` / `canbus_uuid:`）与
 「哪些模块存在」都从这份配置里读。
 
+> ### ⚠️ 适用范围：**本条适用于每一条硬件测试**（不是某节的备注）
+>
+> **这套用例测的是「本仓模块实现得对不对」，不是「你的配置写得对不对」。**
+> 用例读你提供的配置，并**假定它是正确的**——一份上游 Klipper 也会接受、且与你**实际接线一致**的配置。
+> 请把这条前提记牢：
+>
+> - **配置写错**（节名/选项名错、引脚号错、单位错）、**接线不对**、**固件与配置不匹配**、
+>   **板子被别的进程占着**、以及物理环境不符（比如挤出机没料）——这些都会让用例**失败**，
+>   而那**不代表本仓模块有 bug**。先把配置确认好（用上游 Klipper 或直接起本仓宿主看到 `Ready`），
+>   再来跑这些用例。
+> - 反过来，**用例通过也不等于「你的配置对」**：它只说明「在这个正确前提下，该模块的行为符合预期」。
+> - **想验配置本身** → 用宿主（`objects/list`、`status`、日志）或上游 Klipper，不要用这套用例。
+> - 每个用例的 doc 都写了它**假设的接线**与**会做的动作**（含安全上界）；跑之前先读它。
+>
+> 这条前提不靠人记：**每条用例的 doc 各带一份**（你单独打开某一个文件也能看到），
+> 而且真正跑起来时 `HW-RUN:` 那行会把它一起打出来（另外 `src/hardware_test.rs` 的模块 doc 把它写成本模式的适用前提）。
+
+### 本套用例的两条设计准则
+
+1. **单一设备**：每条只依赖**一块 MCU** 与它自己声明的那点外设/接线——不要求第二块板、不要求额外外设。
+   需要的部分在声明里写全（`.mcu()` / `.section(..)` / `.option(section, key)`），不满足就按 `HW-IGNORED` 跳过。
+2. **尽量安全**：只做声明的动作，不顺手多做。运动类默认只动**一个轴**、距离/速率写成常量并给出上界；
+   加热类不自动升温（除非该用例的目的就是验证加热）；会重启固件/会快速移动/会开加热的用例，
+   doc 里必须写明后果与前置（例如「先跑 R3 确认端停极性」）。
+
 ### 三步流程
 
 1. **声明**：用例在测试体开头声明自己需要什么——`hwtest::needs().mcu()`（要有可用的主 MCU 传输）、
@@ -105,7 +130,7 @@ cargo test --workspace -- --test-threads=1 2>&1 | scripts/test-timings.py
 2. **检查**：`hwtest::acquire("<用例名>", &needs)` 用仓库自己的 config 解析器读 `KLIPPERX_HW_CONFIG`，
    逐项核对——**被注释掉的节或选项算不存在**。
 3. **有则跑、无则报告忽略**：
-   - 齐备 → 打 `HW-RUN: <用例名>`，返回带独占锁的机器句柄；
+   - 齐备 → 打 `HW-RUN: <用例名>  (the config is assumed correct; this checks the host module, not your config)`（那行把本模式的前提一并带出来，形状由 `run_line` 固定，可 grep），返回带独占锁的机器句柄；
    - 不齐（变量未设 / 文件不存在 / 解析失败 / 缺项）→ 打
      `HW-IGNORED: <用例名>: <原因>`（缺项会逐项列出），**返回 `None` 并跳过，不失败**。
 
@@ -200,18 +225,30 @@ KLIPPERX_HW_CONFIG=~/printer.cfg \
   以免 Drop 内二次 panic 把两个失败都吞成 abort）。适合需要 `toolhead`/`gcode`/`extras` 的用例（R4/R6/R7/R8/R9/R10）。
 
 ```rust
-#[tokio::test]
+// L2：**普通 `#[test]`**（不是 `#[tokio::test]`！），活机 g-code 用 `run_script_sync`
+#[test]
 #[ignore = "hardware: needs KLIPPERX_HW_CONFIG"]
-async fn test_something_on_a_real_board() {
+fn test_something_on_a_real_board() {
     let Some(machine) = crate::hardware_test::acquire(
         "test_something_on_a_real_board",
         &crate::hardware_test::Requires::new().mcu().option("stepper_x", "endstop_pin"),
     ) else { return };
     let machine = machine.bring_up().expect("the board comes up");   // 失败=真失败，不是跳过
     let printer = machine.printer();
+    printer
+        .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+        .expect("gcode is registered")
+        .run_script_sync("M105")
+        .expect("the script runs");
     // …用 printer 的 gcode/toolhead/extras 断言…  machine 在此作用域结束时 drop（收尾）
 }
 ```
+
+> **为什么 L2 必须是普通 `#[test]`**：`Machine::bring_up` 自持一个 runtime 并在 `Drop` 里有界收尾
+> （`shutdown_timeout`）——二者都**不能在 runtime 上下文里跑**（会 panic：
+> `Cannot start a runtime from within a runtime` / `Cannot drop a runtime in a context where blocking is
+> not allowed`）。框架现在会在 `bring_up` 的**第一件事**就检测这个误用并给出可读的 `Err`（而不是 tokio 的 panic）。
+> 对照：**L1**（只用 `Mcu::connect`）就是 `#[tokio::test]` + `.await`，没问题。
 
 **活机与语料（`-o`）的语义差**：`can_pause` 为真（`M400` 会真等时钟追上）、`can_extrude` 不再由
 `-o` 兜底（`G1 E…` 会被冷挤出 / 温度未达拒绝）。写真机用例时不要照抄语料用例的这两处假设。
@@ -245,7 +282,7 @@ git config core.hooksPath .githooks
 
 | 模块 | 覆盖 |
 |------|------|
-| `src/hardware_test.rs` | **真机测试框架本体（全部不碰板，19 测 + 1 个 `#[ignore]` 的 `plan`）**：`check` 的纯函数语义（节存在/不存在、选项存在/不存在、**被注释掉的节或选项算不存在**、‘节内注释不影响其他选项’、节与选项去重后按声明序列出全部缺项）、`Requires::mcu()` 的四种形态（无 `[mcu]` / 无接口键 / `serial` / `canbus_uuid`、以及 `[mcu zboard]` 不算主 MCU）、空 `Requires` 只要求配置文件存在、`decide` 的四分支（未设变量 / 文件不存在 / 解析失败报解析器原文 / 缺项）、`Machine` 暴露配置与按 `[mcu]` 开传输（打不开 = 真失败）；**串行锁**：`test_hardware_tests_serialise_on_the_config_file`（两条线程 + barrier，断言同时在场的持有者最多 1）、`test_the_lock_is_released_when_the_guard_is_dropped`（drop 后可重取、无 `*.lock` 旁文件）；**多 MCU（2026-10-06）**：`mcu_named` 的三态（节不存在 / 存在但缺接口键 / 存在且有接口键）、`test_open_mcu_named_opens_the_section_it_names`（两块板各给一个不同的、不存在的设备路径，断言错误里出现的是被点名的那个）、`test_the_plan_prints_one_line_per_mcu_section`（逐 MCU 行，含缺接口键的那一行措辞）。
+| `src/hardware_test.rs` | **真机测试框架本体（全部不碰板，27 测 + 1 个 `#[ignore]` 的 `plan`）**：`check` 的纯函数语义（节存在/不存在、选项存在/不存在、**被注释掉的节或选项算不存在**、‘节内注释不影响其他选项’、节与选项去重后按声明序列出全部缺项）、`Requires::mcu()` 的四种形态（无 `[mcu]` / 无接口键 / `serial` / `canbus_uuid`、以及 `[mcu zboard]` 不算主 MCU）、空 `Requires` 只要求配置文件存在、`decide` 的四分支（未设变量 / 文件不存在 / 解析失败报解析器原文 / 缺项）、`Machine` 暴露配置与按 `[mcu]` 开传输（打不开 = 真失败）；**串行锁**：`test_hardware_tests_serialise_on_the_config_file`（两条线程 + barrier，断言同时在场的持有者最多 1）、`test_the_lock_is_released_when_the_guard_is_dropped`（drop 后可重取、无 `*.lock` 旁文件）；**多 MCU（2026-10-06）**：`mcu_named` 的三态（节不存在 / 存在但缺接口键 / 存在且有接口键）、`test_open_mcu_named_opens_the_section_it_names`（两块板各给一个不同的、不存在的设备路径，断言错误里出现的是被点名的那个）、`test_the_plan_prints_one_line_per_mcu_section`（逐 MCU 行，含缺接口键的那一行措辞）；**L2 契约与护栏（2026-10-06）**：`run_line` 的形状（`HW-RUN` 带前提、单行可 grep）、`Machine::bring_up` 自持 runtime 并在 `Drop` 里有界收尾（**不能在 runtime 上下文里跑**）、`StartedMachine` 的 drop/panic 路径收尾、`ensure_not_in_runtime()`（`test_bring_up_refuses_to_run_inside_a_runtime`：断言它在**任何设备/配置工作之前**就返回可读 `Err`，措辞含「plain #[test]」；`test_bring_up_is_allowed_outside_a_runtime` 为正向对照；另有多板 `bring_up`、panic 路径、打不开板=真失败、不满足 `Requires`=跳过这五条） |
 
 `plan` 是 `#[ignore]` 的，用 `KLIPPERX_HW_CONFIG=… cargo test -p klipperx --lib hardware_test::plan -- --ignored --nocapture` 运行，只打印配置的能力图（`HW-SECTIONS` / 每节 `HW-SECTION` / `HW-MCU` 判定），不打开端口。
 

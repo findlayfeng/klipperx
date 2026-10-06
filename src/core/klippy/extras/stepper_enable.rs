@@ -493,6 +493,8 @@ section!("stepper_enable", order = 10, load = load_config);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use crate::core::klippy::reactor::ManualReactor;
 
     fn load(text: &str) -> (Arc<Printer>, Result<(), ConfigError>) {
@@ -543,5 +545,206 @@ mod tests {
 
         pin.set_disable();
         assert_eq!(pin.enable_count, 9999);
+    }
+
+    // -----------------------------------------------------------------------
+    // Real board: R9-lite, `M18` disables the motors (zero motion)
+    // -----------------------------------------------------------------------
+
+    /// What the R9-lite real-board case needs from `KLIPPERX_HW_CONFIG`.
+    ///
+    /// `[stepper_x]` is what makes the machine a motion machine, and it is the
+    /// right declaration rather than `[stepper_enable]`: the section is
+    /// optional and almost every config omits it, because `stepper.rs` calls
+    /// [`PrinterStepperEnable::ensure`] for every `[stepper_*]` section
+    /// (`extras/stepper.rs:498`), which registers the object and its `M18`/`M84`
+    /// commands anyway. Declaring `[stepper_enable]` would therefore skip the
+    /// case on exactly the printers that can run it. What the case actually
+    /// reads is one tracked stepper: with `[stepper_x]` present,
+    /// `get_status` has a line to report and `motor_off` a line to disable.
+    ///
+    /// Shared with [`the_disable_case_declares_mcu_and_stepper_x`], so the
+    /// declaration the config is judged against and the one the case runs under
+    /// cannot drift apart.
+    fn disable_case() -> crate::hardware_test::Requires {
+        crate::hardware_test::Requires::new()
+            .mcu()
+            .section("stepper_x")
+    }
+
+    /// The declaration is the gate: it decides whether the case runs or is
+    /// reported `HW-IGNORED`. Pinned against synthetic config text parsed by the
+    /// real parser, so a declaration that named the wrong section — which would
+    /// skip the case forever on a printer that could run it — fails here
+    /// instead of on hardware.
+    #[test]
+    fn the_disable_case_declares_mcu_and_stepper_x() {
+        use crate::core::klippy::config::Config;
+        use crate::hardware_test::{check, Missing};
+
+        let parse = |text: &str| Config::from_text(text).expect("the fixture parses").0;
+
+        let full = parse(
+            "[mcu]\nserial: /dev/ttyACM0\n\
+             [stepper_x]\nstep_pin: PA0\ndir_pin: PB1\n\
+             rotation_distance: 40\nmicrosteps: 16\nposition_max: 200\n",
+        );
+        assert_eq!(check(&full, &disable_case()), Ok(()));
+
+        // Commented out is absent to the real parser, so the case skips rather
+        // than runs against a machine with no stepper to disable.
+        let commented = parse(
+            "[mcu]\nserial: /dev/ttyACM0\n\
+             # [stepper_x]\n# step_pin: PA0\n# dir_pin: PB1\n",
+        );
+        assert_eq!(
+            check(&commented, &disable_case()),
+            Err(vec![Missing::Section("stepper_x".to_string())])
+        );
+
+        // The main MCU is the other half of the declaration.
+        let no_mcu = parse(
+            "[stepper_x]\nstep_pin: PA0\ndir_pin: PB1\n\
+             rotation_distance: 40\nmicrosteps: 16\nposition_max: 200\n",
+        );
+        assert_eq!(
+            check(&no_mcu, &disable_case()),
+            Err(vec![Missing::Mcu("mcu".to_string())])
+        );
+    }
+
+    /// R9-lite — `M18` disables every motor on a real board, with zero motion.
+    ///
+    /// `TESTING.md`'s R9 (“打印收尾与静止”, lines 85-87) ends a print with
+    /// `M104 S0` and `M18` and asks that “电机失能”. This case is the `M18` half
+    /// on its own: the machine comes up (L2, so `gcode`/`toolhead`/extras are
+    /// registered — the corpus' file-output mode never reaches them), `M18` is
+    /// sent through the machine's own dispatcher, and two things are asserted.
+    ///
+    /// # 前提：配置被假定为正确的
+    ///
+    /// **本用例假定提供的配置是正确的**（上游 Klipper 也会接受、且与实际接线一致）。
+    /// 它验的是**本仓 `[stepper_enable]` 这个模块的行为**，不是这份配置对不对——配置/接线/
+    /// 固件不匹配导致的失败，不代表模块有 bug。要验配置本身请用宿主或上游 Klipper。
+    ///
+    /// # What it verifies (this module's behaviour)
+    ///
+    /// * `M18` is registered and routed to [`PrinterStepperEnable::motor_off`]
+    ///   (`register_gcode_commands`, `stepper_enable.rs:254`; `M18` at `:273`);
+    /// * `motor_off` publishes `KlippyEvent::StepperEnableMotorOff`
+    ///   (`motor_off`, `stepper_enable.rs:342`; the event at `:351`) — observed
+    ///   through the existing `Printer::register_event_handler`, no new
+    ///   mechanism;
+    /// * `get_status` reports every stepper disabled afterwards, in the shape
+    ///   this object has (`{"steppers": {<name>: bool}}`,
+    ///   `stepper_enable.rs:356-368`).
+    ///
+    /// # The state before `M18`, and why it is not a bug
+    ///
+    /// On this port nothing enables a motor at bring-up: `motor_enable` /
+    /// `set_motors_enable` are called only by `force_move`, `manual_stepper` and
+    /// `SET_STEPPER_ENABLE`, never by the toolhead (the print-time enable wiring
+    /// is exactly what the module docs say has not landed). So the status is
+    /// normally already all-`false` before `M18`. The case therefore asserts
+    /// what is true — **after `M18` every stepper reads `false`**, plus the
+    /// event — rather than a `true → false` transition it could not produce
+    /// without first energising a motor. `motor_off` short-circuits an already
+    /// disabled line; that is the correct idempotent behaviour, not a mismatch.
+    ///
+    /// # What it assumes about the wiring
+    ///
+    /// `[stepper_x]` exists on the main `[mcu]` board. Nothing else: `M18`
+    /// needs no endstop, no heater and no second board.
+    ///
+    /// # What it is safe to run
+    ///
+    /// **Zero motion, no homing, no heating.** The only g-code is `M18`, which
+    /// disables the enable lines; it never queues a step and never commands a
+    /// heater or an endstop, so there is no motion to bound. The enable pins are
+    /// only driven low (the command's whole point) and read back through
+    /// `stepper_enable`'s own status: the host has no API to read a digital
+    /// output pin, so `get_status`'s per-stepper `is_enabled` is the read-only
+    /// proxy for what the pin was driven to.
+    ///
+    /// As every L2 case, it takes the board's one session (a running printer
+    /// host must not be attached) and takes the machine down on `Drop`, the
+    /// panic path included.
+    ///
+    /// # Running it
+    ///
+    /// ```text
+    /// KLIPPERX_HW_CONFIG=~/printer_data/config/printer.cfg \
+    ///   cargo test -p klipperx --lib test_m18_disables_every_motor_on_a_real_board \
+    ///   -- --ignored --nocapture
+    /// ```
+    #[tokio::test]
+    #[ignore = "hardware: needs KLIPPERX_HW_CONFIG"]
+    async fn test_m18_disables_every_motor_on_a_real_board() {
+        let Some(machine) = crate::hardware_test::acquire(
+            "test_m18_disables_every_motor_on_a_real_board",
+            &disable_case(),
+        ) else {
+            return; // reported as HW-IGNORED; the case passes without a board
+        };
+        let machine = machine.bring_up().expect("the board comes up");
+        let printer = machine.printer();
+
+        let enabled = printer
+            .lookup_object_as::<PrinterStepperEnable>("stepper_enable")
+            .expect("the machine registers `stepper_enable` for [stepper_x]");
+        let gcode = printer
+            .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+            .expect("the machine registers `gcode`");
+
+        // Observe the event this object already publishes, through the
+        // existing handler registration.
+        let motor_off = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&motor_off);
+        printer.register_event_handler(
+            KlippyEvent::StepperEnableMotorOff,
+            Box::new(move |_| {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+
+        // The declared `[stepper_x]` must really be tracked, or the assertions
+        // below would pass on an empty map.
+        let before = enabled.get_status(0.0);
+        assert!(
+            before
+                .get("steppers")
+                .and_then(Value::as_object)
+                .is_some_and(|steppers| steppers.contains_key("stepper_x")),
+            "the machine tracks the declared [stepper_x]: {before}"
+        );
+
+        gcode.run_script("M18").await.expect("M18 runs");
+
+        assert_eq!(
+            motor_off.load(Ordering::SeqCst),
+            1,
+            "M18 must publish `stepper_enable:motor_off` exactly once"
+        );
+
+        let after = enabled.get_status(0.0);
+        let steppers = after
+            .get("steppers")
+            .and_then(Value::as_object)
+            .expect("get_status reports a `steppers` map");
+        assert!(
+            steppers.contains_key("stepper_x"),
+            "the machine still tracks the declared [stepper_x]: {after}"
+        );
+        for (name, state) in steppers {
+            assert_eq!(
+                state.as_bool(),
+                Some(false),
+                "M18 must leave [{name}] disabled: {after}"
+            );
+        }
+        println!(
+            "R9-lite: M18 disabled {} stepper(s): {steppers:?}",
+            steppers.len()
+        );
     }
 }

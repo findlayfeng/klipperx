@@ -1024,8 +1024,9 @@ mod tests {
     /// This is the production hazard of the cycle the probe above covers: a part
     /// that survived `Printer::teardown` kept its `Arc<Mcu>`, so the reopen ran
     /// **beside** the old, still-reading session — two readers on one device,
-    /// stealing frames from each other. The assertion is the count: after the
-    /// reset, the only handle left on the old session is this test's.
+    /// stealing frames from each other. The assertion is the count: once the
+    /// reset has wound down, the only handle left on the old session is this
+    /// test's.
     #[test]
     fn a_firmware_restart_releases_the_old_session() {
         let run = all_runs()
@@ -1055,29 +1056,40 @@ mod tests {
         // parked read it leaves behind.
         runtime.shutdown_timeout(std::time::Duration::from_secs(CASE_SHUTDOWN_TIMEOUT));
 
-        let (old, new) = outcome.expect("the restart cycle runs");
+        let cycle = outcome.expect("the restart cycle runs");
         assert!(
-            !Arc::ptr_eq(&old, &new),
+            cycle.rebuilt,
             "the reopen is a new session, not the one before the restart"
         );
         assert_eq!(
-            Arc::strong_count(&old),
-            1,
+            cycle.old_refs, 1,
             "reset_for_restart released every other reference to the old session: \
              a leaked part kept the old reader alive beside the new one"
         );
     }
 
-    /// Bring a machine up on `config`, reset for a firmware restart, and bring it
-    /// up again — returning the two sessions.
+    /// What one restart cycle left behind.
+    struct RestartCycle {
+        /// How many `Arc`s referenced the first session once the reset had run.
+        old_refs: usize,
+        /// Whether the reopen produced a session of its own.
+        rebuilt: bool,
+    }
+
+    /// Bring a machine up on `config`, reset for a firmware restart, bring it up
+    /// again — and report what the reset left behind.
+    ///
+    /// The handles are dropped before this returns, so the case's runtime can
+    /// shut down promptly: a session the *test* still holds would park its
+    /// blocking read, and the caller's bound is there to measure a leak, not a
+    /// handle of its own.
     ///
     /// Returns `Err` instead of panicking so a caller can shut the case's
     /// runtime down on a bound before reporting; a leak here parks a blocking
     /// read that an unbounded drop would wait for forever.
-    async fn restart_sessions(config: &Config) -> Result<(Arc<Mcu>, Arc<Mcu>), String> {
+    async fn restart_sessions(config: &Config) -> Result<RestartCycle, String> {
         use crate::core::klippy::api::StartArgs;
-        use crate::core::klippy::mcu::McuObject;
-        use crate::core::klippy::printer::{Printer, PrinterState};
+        use crate::core::klippy::printer::Printer;
         use crate::core::klippy::reactor::TokioReactor;
 
         let reactor = Arc::new(TokioReactor::new(tokio::runtime::Handle::current()));
@@ -1087,31 +1099,52 @@ mod tests {
         start_args.debug_output = Some("_test_output".to_string());
         printer.set_start_args(Arc::new(start_args));
 
-        let mut sessions = Vec::new();
-        for round in 0..2 {
-            printer.load_config(config).map_err(|e| e.to_string())?;
-            if tokio::time::timeout(std::time::Duration::from_secs(10), printer.bring_up())
-                .await
-                .is_err()
-            {
-                return Err("bring_up timed out".to_string());
-            }
-            let state = printer.get_state_message();
-            if state.category != PrinterState::Ready {
-                return Err(format!("not ready: {}", state.message));
-            }
-            let session = printer
-                .lookup_object_as::<McuObject>("mcu")
-                .and_then(|mcu| mcu.mcu())
-                .ok_or_else(|| "the session is not up".to_string())?;
-            sessions.push(session);
-            if round == 0 {
-                printer.reset_for_restart("firmware_restart");
-            }
+        let old = bring_up_session(&printer, config).await?;
+        printer.reset_for_restart("firmware_restart");
+        // The release is **eventual**: the teardown cancels the session's clock
+        // poll, but the reactor's callback winds down on its own cadence (150 ms
+        // on the `test:` transport) and is the last holder besides this test.
+        // Wait for it on a bound rather than sampling once — a leaked cycle never
+        // settles.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while Arc::strong_count(&old) > 1 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        let new = sessions.pop().expect("two rounds pushed a session");
-        let old = sessions.pop().expect("two rounds pushed a session");
-        Ok((old, new))
+        let old_refs = Arc::strong_count(&old);
+
+        let new = bring_up_session(&printer, config).await?;
+        let rebuilt = !Arc::ptr_eq(&old, &new);
+        printer.teardown();
+        drop(printer);
+        drop(new);
+        drop(old);
+        Ok(RestartCycle { old_refs, rebuilt })
+    }
+
+    /// Load `config` into `printer` and bring the machine up; returns the session
+    /// it connected.
+    async fn bring_up_session(
+        printer: &Arc<crate::core::klippy::printer::Printer>,
+        config: &Config,
+    ) -> Result<Arc<Mcu>, String> {
+        use crate::core::klippy::mcu::McuObject;
+        use crate::core::klippy::printer::PrinterState;
+
+        printer.load_config(config).map_err(|e| e.to_string())?;
+        if tokio::time::timeout(std::time::Duration::from_secs(10), printer.bring_up())
+            .await
+            .is_err()
+        {
+            return Err("bring_up timed out".to_string());
+        }
+        let state = printer.get_state_message();
+        if state.category != PrinterState::Ready {
+            return Err(format!("not ready: {}", state.message));
+        }
+        printer
+            .lookup_object_as::<McuObject>("mcu")
+            .and_then(|mcu| mcu.mcu())
+            .ok_or_else(|| "the session is not up".to_string())
     }
 
     /// How long a case's runtime may take to shut down.

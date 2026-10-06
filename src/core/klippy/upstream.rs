@@ -16,7 +16,6 @@
 //! |---|---|---|
 //! | the corpus is well formed and its inputs resolve | nothing | `upstream_test_cases_are_well_formed`, `upstream_test_inputs_resolve` |
 //! | every shipped `.cfg` parses with our config parser | nothing | `every_upstream_printer_config_parses` |
-//! | the inline g-code parses | the case's g-code (already driven end to end below) | `upstream_inline_gcode_parses`, still `#[ignore]` |
 //! | a case runs end to end | the case's dictionaries | `upstream_test_cases_run` (the ignore list is empty) |
 //!
 //! An end-to-end run talks to a real answerer, not to a host-only short circuit:
@@ -44,10 +43,15 @@
 //! target's dictionary. `KLIPPERX_UPSTREAM_ALL=1` bypasses step 4 (the ignore
 //! list), so the runs that have their dictionaries report their failures.
 //!
-//! The inline-g-code stage stays an `#[ignore]` test, but no longer because of
-//! missing sections: `upstream_test_cases_run` drives each built case's g-code
-//! through the real dispatcher, so what is left there is an earlier, narrower
-//! check of the g-code parser alone.
+//! There is no separate parse-only stage: parsing is the first thing the
+//! end-to-end run does, and stopping there would only catch what
+//! `GCodeDispatch::run_script` already reports with more context. The one gap
+//! neither covers is the g-code of a case whose dictionary was not built — that
+//! is what the generated case's `#[ignore = "dictionary … not built"]` marks, and
+//! it closes the day that dictionary is built. (An earlier, narrower stage,
+//! `upstream_inline_gcode_parses`, was written when most cases named sections
+//! this host lacked; it never grew a body and was dropped once every built case's
+//! g-code ran end to end.)
 //!
 //! One thing is deliberate here: the corpus is read-only. The submodule is
 //! whatever the developer checked out, and nothing is written. The `.cfg`
@@ -379,32 +383,6 @@ mod tests {
             stale.is_empty(),
             "{} IGNORED case(s) now load; verify their g-code and remove them from IGNORED: {stale:?}",
             stale.len()
-        );
-    }
-
-    /// Parse the inline g-code of every case with our own g-code parser.
-    ///
-    /// Pending: this stage was written when most cases named sections this host
-    /// lacked, and nothing has been built for it since —
-    /// `upstream_test_cases_run` now drives every built case's g-code through the
-    /// real dispatcher end to end, which is stronger than parsing it. The run list
-    /// is computed here so the stage is a next step (or a candidate to drop), not
-    /// lost work.
-    #[test]
-    #[ignore = "needs the config sections the cases use, to build a dispatcher"]
-    fn upstream_inline_gcode_parses() {
-        let runs: Vec<_> = all_runs()
-            .into_iter()
-            .filter(|run| !run.gcode_lines.is_empty())
-            .collect();
-        assert!(
-            !runs.is_empty(),
-            "no upstream run carries inline g-code to parse"
-        );
-        panic!(
-            "not implemented: {} runs carry inline g-code, but parsing it needs the \
-             config sections they name; see the module docs for the stages",
-            runs.len()
         );
     }
 

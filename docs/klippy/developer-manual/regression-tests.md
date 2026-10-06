@@ -248,7 +248,6 @@ connect_file(输出文件, 字典):
 | 每份 `.cfg` 由本仓库解析器读取 | 无 | `every_upstream_printer_config_parses` |
 | 全部缺口扫描（**报告**，不失败） | 无 | `upstream_gap_report`（`-- --nocapture` 查看缺口矩阵） |
 | `IGNORED` 条目守卫 | 运行声明的全部字典 + 所用配置节 | `ignored_cases_still_fail`（按 `upstream.rs` 内旧 `IGNORED` 常量检测，现空；生成器权威列表在 `build.rs`，暂未对接） |
-| 运行内联 g-code 可解析 | —（用例 g-code 已由端到端运行真送进 dispatcher） | `#[ignore] upstream_inline_gcode_parses`（更早的窄解析阶段，未对接） |
 | 运行端到端执行 | 运行声明的全部字典 + 所用配置节 | build 时生成的 239 个独立 `#[test]`（`upstream_<stem>_config_<n>_<cfg>`，见下文「运行」；字典未构建或列入忽略的生成为 `#[ignore]`） |
 
 ### 应答机
@@ -367,8 +366,10 @@ KLIPPERX_ALL_ARCHES=1 cargo test -p klipperx --lib upstream
 `--workspace` 与 `--lib` 的取舍、真机用例的约定见[测试](testing.md)。
 
 `CONFIG` 与 `GCODE` 相对 `.test` 文件解析；`DICTIONARY` 是构建产物，因此只校验其对应的
-`test/configs/<name>.config` 存在。`upstream_inline_gcode_parses` 仍以 `#[ignore]` 保留，但原因已不是
-缺节：端到端运行会把每条已构建用例的 g-code 真送进 dispatcher，它只是更早、更窄的解析阶段，尚未对接。
+`test/configs/<name>.config` 存在。没有独立的「内联 g-code 可解析」阶段：解析是端到端运行的第一步，
+早先那个一直没长出实现的窄阶段（`upstream_inline_gcode_parses`）已删除。唯一两边都不覆盖的是
+**字典未构建**的用例的 g-code——那由生成用例自己的 `#[ignore = "dictionary … not built"]` 标记，
+字典一旦构建就随之关闭。
 
 `every_upstream_printer_config_parses` 覆盖 259 份 `.cfg`，现已全部通过。这条用例最初暴露了本
 仓库解析器与上游 `configparser` 的四处分歧（多行值、`=` 分隔符、节头行内注释、`;` 行内注释），

@@ -62,9 +62,38 @@ cargo test --workspace -- --test-threads=1 2>&1 | scripts/test-timings.py
 单独报出**构建+启动**花了多久（干构建一次可达 10 s以上；不算到任何测试头上——这正是最容易误判成
 「第一条测试卡住了」的坑），然后列出最慢的若干条与超过阈值的条数。
 
-已知基线与另两类看起来像挂死的情况（都不是测试自身）：① `cargo` 对同一 `target/` 的**构建锁排队**
+已知基线与另三类看起来像挂死的情况（都不是测试自身）：① `cargo` 对同一 `target/` 的**构建锁排队**
 （第二个 cargo 安静排队、CPU 全空，见 `AGENTS.md` 的「常用命令」段；**用 `scripts/cargo-locked.sh …` 代替 `cargo` 就能看见**：它会报「谁占着 + 等了多久」）；② 需要真机/真总线的形态
-（例如 Q11：非 `-o` 的活机会让假设备的阻塞读 park，已改成确定性失败并保留 `#[ignore]` 复现）。
+（例如 Q11：非 `-o` 的活机会让假设备的阻塞读 park，已改成确定性失败并保留 `#[ignore]` 复现）；
+③ **测试自己把假设备的阻塞读留到 runtime 关闭之后**（见下）。
+
+③ 单列一节，因为它看起来像某条测试「偶发超时」，实际是**整个测试二进制挂住**：`Interface::receive()` 每次都在 `spawn_blocking` 里跑，而 `SimulatorDevice::receive()` 会一直 park 在
+condvar 上，只有 `Device::shutdown()`（由 `Mcu::close()` 调）能放它走；tokio 的 blocking pool 关停是
+`BlockingPool::drop → shutdown(None)`（`tokio-1.53.1/src/runtime/blocking/pool.rs:282-286`），**无限期**
+等正在执行的任务返回，而跑起来的阻塞任务取消不掉。于是「`Arc<Mcu>` 因 `Mcu → events → resource → Mcu`
+强环永不 Drop → `Mcu::close()` 永不跑 → park 住的读活过 runtime 关闭」= 闸门挂死，且**只在这一环是强引用环时发生**（生产靠 `McuObject::release_cycles` 断环，见 [parser-api](parser-api.md)）。
+
+**为什么表现为「偶发」＋跟 CPU 压力相关**：`spawn_blocking` 是 non-mandatory（`pool.rs:164-169`），关停时
+**尚未被 worker 取走**的排队任务会被直接丢弃（`pool.rs:561-570`），已取走并 park 的则要等它返回——谁先赢是竞态。
+无压力时测试线程先关 runtime（任务被丢、通过），CPU 高压下测试线程被抢占、worker 取走并 park，于是挂死。
+实测（32 核跑 64 个 busy loop）：`resource/trigger_analog.rs` 三个 `Interface::simulator` 用例各 12 次挂
+3/5/5 次，按默认并行跑整个模块 6 次挂 3 次——**同一个 harness 的 flake，不是三条测试各自的问题**。
+
+**规矩**：任何直接建 `Mcu::connect(… Interface::simulator(…))` 的测试，必须在同一作用域里放一个
+「断环 + 关会话」的收尾。两个已落地的写法：
+
+* 固定写法——`resource/trigger_analog.rs` 的 `resource_harness` 返回 `SessionGuard`（`Drop` 里
+  `clear_events()` + `close()`），用例把它绑成**具名**变量（`let (_session, mcu, _chip, ta) = …`——`let _ = …` 会当场析构）；它排在元组第一位、按「局部变量逆序析构」最后才跑，但顺序本身不承重
+  （实测把 guard 提前手动 drop、`ta`/chip 还活着也照样收口），要的只是它**活到用例结束**；
+* 显式写法——`resource/endstop.rs` 的 harness 在收尾处直接写
+  `mcu.clear_events(); drop(endstop); mcu.close();`。
+
+用 guard 而不是每处手写的原因：断言失败时展开（unwind）也会跑 `Drop`，**把「断言失败」救回成一条失败而不是一次挂死**。
+这条线现由 `test_the_harness_guard_releases_the_session` 钉住（`Arc::downgrade` 后依次 drop，断言
+`upgrade().is_none()`）——把 guard 里的 `clear_events()` 注掉，它就转红。踩过这条线的只 `resource_harness`
+的三条 e2e（都在 `resource/trigger_analog.rs`），同一 harness 的第四条就是那条钉子测；其余 `SimulatorDevice`
+用法要么不建 `Mcu`、要么走 `Printer::teardown() → release_cycles`（后者确实调 `mcu.clear_events()`，
+`object.rs:1047-1049`），不受影响。
 
 还有一类**会把自己坑进去的实验做法**，专门记一笔：在 `start_paused`（暂停时钟）的测试里**删掉产品侧的
 `sleep`**，测试会真的死锁——paused 时钟下 tokio 只要有未完成的 `spawn_blocking` 就

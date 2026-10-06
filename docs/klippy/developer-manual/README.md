@@ -310,7 +310,7 @@ identify 的命令**定义**（名称、参数、解码）与其它命令一样�
 | `axis_twist_compensation.rs` | `[axis_twist_compensation]`：按 X/Y 位置插值 Z 补偿，经 **`probe:update_results` 载荷**（`ProbeResultsHandle`，批 #36 新增）原地改上报 Z；`AXIS_TWIST_COMPENSATION_CALIBRATE` 校准向导 |
 | `gcode_button.rs` | `[gcode_button <name>]` 数字路径（`pin`/`press_gcode`/`release_gcode`/`debounce_delay`、`QUERY_BUTTON`、`get_status`）；gap：固件按钮查询未接、`analog_range` 明确拒绝（无 `query_adc`，批 #37） |
 | `gcode_arcs.rs` | `[gcode_arcs]` 段落地（`resolution`，语料档位）：G2/G3 与平面选择命令属 H10 未注册（对应上游 `gcode_arcs.py`） |
-| `bed_screws.rs` | `[bed_screws]` 手动调平段（screw1..99 缺失即停/名称/fine_adjust/行进默认，≥3 螺丝；对应 `bed_screws.py`）；`BED_SCREWS_ADJUST` 命令族未移植（H9） |
+| `bed_screws.rs` | `[bed_screws]` 手动调平段（screw1..99 缺失即停/名称/fine_adjust/行进默认，≥3 螺丝；对应 `bed_screws.py`）；**`BED_SCREWS_ADJUST` 命令族已移植（2026-10-06）**：`BED_SCREWS_ADJUST` 装载期常驻注册，`ACCEPT`/`ADJUSTED`/`ABORT` 随会话注册、收尾（ABORT/完成/toolhead 拒绝）时注销；粗调→精调两遍、`ADJUSTED` 把 `-1` 归 `0` 重数、提示文案与 status 对齐上游。它**不依赖** `probe`/`manual_probe`/`configfile`（上游同样只用 `toolhead.manual_move` 与 `gcode`）；与 `manual_probe` 的 `ACCEPT`/`ABORT` 同名，按上游「先注册者占坑」 |
 | `pwm_cycle_time.rs` | `[pwm_cycle_time <name>]`：软件 PWM 引脚 + `SET_PIN` 的 `CYCLE_TIME=`（固件周期 build 期定，运行期改只记主机账；`pwm_cycle_time.py`）；`SET_PIN` 经 `register_lookahead_callback` 钉 print-time 调度、按 `min_schedule_time` 自间隔（2026-10-03，`a3e1d4c`，匹配上游 `pwm_cycle_time.py:102-122`）；无 `toolhead` 或 MCU 未连接时回退立即路径 |
 | `pwm_tool.rs` | `[pwm_tool <name>]`：带 `maximum_mcu_duration` 固件兕底的 PWM 工具引脚（`pwm_tool.py`）；`SET_PIN` 经 `GCodeRequestQueue` **按打印时间生效**（复用 `output_pin` 接线件 + 两条兜底，2026-10-03） |
 | `temperature_fan.rs` | `[temperature_fan <name>]`：传感器+风扇+`watermark`/`pid` 双控制环，`SET_TEMPERATURE_FAN_TARGET`（mux，`temperature_fan.py`） |

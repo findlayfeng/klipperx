@@ -4929,7 +4929,13 @@ mod tests {
     /// The name is the rail's short name (`get_name(short=True)`,
     /// `stepper.py:388-394`) — `x`, not the full `stepper_x` that
     /// `M119`/`query_endstops` labels use.
-    #[tokio::test(flavor = "multi_thread")]
+    ///
+    /// The homing move is the cartesian 1.5× force distance (300 mm at
+    /// 5 mm/s), so its drip loop paces ~1200 `DRIP_LOOKAHEAD` windows; the
+    /// paused tokio clock (`start_paused`) advances those sleeps in virtual
+    /// time, so the whole move drips out without ~12 s of real waiting per
+    /// test.
+    #[tokio::test(start_paused = true)]
     async fn test_home_axis_without_a_trigger_errors_after_the_move_end_event() {
         let mut toolhead = homed_toolhead();
         toolhead.set_position(Coord::default(), &[]);
@@ -5002,7 +5008,10 @@ mod tests {
     /// Positive control for the miss check: a rail endstop that **does**
     /// trigger still homes exactly as before — the axis lands at its endstop,
     /// the command succeeds, and `homed_axes` is set.
-    #[tokio::test(flavor = "multi_thread")]
+    ///
+    /// As above, the move drips out over the paused tokio clock: its
+    /// `DRIP_LOOKAHEAD` sleeps cost virtual time, not ~12 s of wall clock.
+    #[tokio::test(start_paused = true)]
     async fn test_home_axis_with_a_trigger_still_homes_the_axis() {
         let mut toolhead = homed_toolhead();
         toolhead.set_position(Coord::default(), &[]);

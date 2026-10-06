@@ -2953,7 +2953,6 @@ mod tests {
     use crate::core::klippy::interface::devices::frame_mock::{
         FrameMock, FrameRecorder, MappingEntry, RecordingWire,
     };
-    use crate::core::klippy::interface::devices::serial::DEFAULT_BAUD;
     use crate::core::klippy::interface::Interface;
     use crate::core::klippy::reactor::ManualReactor;
     use flate2::write::ZlibEncoder;
@@ -4988,32 +4987,39 @@ mod tests {
     /// Frame-sequence synchronisation against a real MCU.
     ///
     /// The fake-device tests above pin each rule of the transport; this one asks
-    /// the firmware to behave the way they assume. Run it explicitly, with the
-    /// board's tty in the environment:
+    /// the firmware to behave the way they assume.
+    ///
+    /// It is a configuration-driven hardware test: it declares that it needs the
+    /// main MCU, and `hardware_test` derives everything else from the printer
+    /// config named by `KLIPPERX_HW_CONFIG`. Run it explicitly:
     ///
     /// ```text
-    /// KLIPPERX_HW_SERIAL=/dev/ttyACM1 \
+    /// KLIPPERX_HW_CONFIG=~/printer_data/config/printer.cfg \
     ///   cargo test -p klipperx --lib test_frame_sequence_sync_against_a_real_board \
     ///   -- --ignored --nocapture
     /// ```
     ///
-    /// It is ignored because it needs a board, and it deliberately leaves that
-    /// board running: a firmware is only reset by a power cycle, never by a
-    /// port reopen, so the second connection below is exactly the "board that
-    /// never rebooted" the takeover path exists for.
+    /// See `docs/klippy/developer-manual/testing.md` for the full story; the
+    /// `hardware_test` module is the reference. A plain `cargo test` never runs
+    /// it (`#[ignore]`), and asking for it explicitly on a machine with no
+    /// `KLIPPERX_HW_CONFIG` prints `HW-IGNORED: …` and passes: a config that is
+    /// not there is a skip, reported rather than hidden.
     ///
-    /// A plain `cargo test` never runs it. Asking for it explicitly with
-    /// `--ignored` and no `KLIPPERX_HW_SERIAL` fails rather than passing quietly
-    /// — a green run that tested nothing is worse than a red one.
+    /// Once it runs it owns the board exclusively — `hardware_test` serialises
+    /// hardware tests — and it deliberately leaves that board running: a
+    /// firmware is only reset by a power cycle, never by a port reopen, so the
+    /// second connection below is exactly the "board that never rebooted" the
+    /// takeover path exists for.
     #[tokio::test]
-    #[ignore = "needs a real MCU: set KLIPPERX_HW_SERIAL to its tty path"]
+    #[ignore = "hardware: needs KLIPPERX_HW_CONFIG"]
     async fn test_frame_sequence_sync_against_a_real_board() {
-        let serial = std::env::var("KLIPPERX_HW_SERIAL").expect(
-            "this test needs a real MCU: set KLIPPERX_HW_SERIAL to the board's tty path \
-             (a plain `cargo test` does not run it at all)",
-        );
-        let open =
-            || Interface::serial(&serial, DEFAULT_BAUD).expect("the board's serial port must open");
+        let Some(machine) = crate::hardware_test::acquire(
+            "test_frame_sequence_sync_against_a_real_board",
+            &crate::hardware_test::Requires::new().mcu(),
+        ) else {
+            return;
+        };
+        let open = || machine.open_mcu().expect("the board's transport must open");
         let seq = |mcu: &Mcu| mcu.wire.next.load(Ordering::Relaxed) & 0xf;
 
         // 1. Whichever session the board is in — just booted, or still running

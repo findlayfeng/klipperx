@@ -92,7 +92,7 @@ H1–H12 是上游 extras 里按域归并的消费者（2026-09-21 全量盘点�
 | H8 | LCD 显示与菜单（display/*）——面板驱动均已落地（hd44780/st7920/uc1701/ssd1306/aip31068_spi/hd44780_spi/sh1106）；余项＝菜单族（`menu.py`/`menu_keys.py`/`display.cfg`/`menu.cfg`）与固件 `lcd_hd44780.c`/`lcd_st7920.c`，见 H8 节 | F9、G1b |
 | H9 | 探测 / 调平 / 校准（probe / bltouch / bed_mesh / z_tilt / quad_gantry_level / bed_screws / …）——探针与其校准命令族、末端位置接口（`virtual_endstop_position`）、z_tilt/qgl/bed_tilt/screws_tilt/axis_twist/delta_calibrate 均已落地；余项＝`bed_mesh` 的 faulty/零参照/profile 命令族、探针精度、`skew_correction`/`z_thermal_adjust`/`tuning_tower`，见 H9 节 | C1、F8 |
 | H10 | 运动相关 extras（gcode_arcs / manual_stepper / idle_timeout / motion_report / …；gcode_move、stepper_enable、motion_queuing、force_move、idle_timeout 已落地）——余项＝G2/G3 弧规划、`manual_stepper` 回零、`extruder_stepper` 宿主同步缝、`GET_POSITION`/`axis_map`，见 H10 节 | C1 |
-| H11 | 主机运行时与调试（statistics / canbus_ids / canbus_stats；error_mcu 已落地） | — |
+| H11 | 主机运行时与调试（statistics / canbus_stats；`canbus_ids` 与 CAN 扫描已落地） | — |
 | H12 | 核心工具补齐（mathutil / util 反射 / clocksync / pins 消费侧） | C1 |
 
 **工具与文档**
@@ -539,8 +539,13 @@ endstop 资源（`mcu/resource/endstop.rs`，含 `minclock` 门控与 `home_wait
 - [ ] `statistics.py`：周期上报主机统计（CPU/内存；`event/stats.rs` 是 MCU 调度时序上报，不是它）。
 - （`error_mcu.py` ✅ 已落地并归档：`extras/error_mcu.rs`，消费 `klippy:notify_mcu_error` /
   `klippy:analyze_shutdown`，由 `[mcu]` 工厂 ensure。）
-- [ ] `canbus_ids.py` / `canbus_stats.py`：CAN 节点分配与状态（接 `[mcu]` 的 canbus 选项；
-      当前 `[mcu]` 直接声明 id，见 `config/mcu.rs:265`）。
+- [x] **`canbus_ids` 与 CAN 节点发现——已落地（2026-10-06）**：`extras/canbus_ids.rs` 按
+      `[mcu]` 声明顺序发号（`NODEID_FIRST = 4`、步长 1、`new_id = len(ids) + 4`），`[mcu]` 的
+      `canbus_nodeid` 因此变为**可选**（写了就用、且占号位；与自增号撞车时**装载期报错**——
+      本仓有意偏离：上游靠固件 `can_id_conflict` 兜底）；发现侧新增 `klipperx canbus-scan
+      [--interface can0] [--timeout 2]`（广播 `0x3f0/[0x00]`，收 `0x3f1` 的 `RESP_NEED_NODEID`，
+      输出可粘进配置的 uuid）——**都不写回配置文件**（与上游 pinned 版一致）。
+      **未做**：`canbus_stats.py`（总线错误计数/状态上报）；真总线上的行为未验证（见 testing.md）。
 - 判为不适用：`garbage_collection.py`、`aio_executor.py`、`parsedump.py`（Python 侧调优/
   离线工具，与本主机无关；完整清单见「待办」表后的不适用段）。
 

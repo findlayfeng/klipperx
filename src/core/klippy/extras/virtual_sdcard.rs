@@ -320,7 +320,12 @@ impl VirtualSdCard {
         *self.must_pause_work.lock().unwrap() = false;
         *self.work_active.lock().unwrap() = true;
         let waketime = self.printer.reactor().monotonic();
-        let self_arc = Arc::clone(self);
+        // The timer holds a `Weak`: a strong `Arc<Self>` in the reactor's timer
+        // heap would close the loop `reactor → timer → card → printer →
+        // reactor` (the card holds the printer strongly) and keep the session
+        // alive past `Printer::teardown`. The spawned task still takes its own
+        // `Arc` while it replays.
+        let weak = Arc::downgrade(self);
         self.printer.reactor().register_timer_named(
             "virtual_sdcard_work",
             Box::new(move |_eventtime| {
@@ -328,16 +333,18 @@ impl VirtualSdCard {
                 // replay loop on the host runtime. `work_active` was set in
                 // `do_resume` so a second `do_resume` before the timer fires
                 // is rejected.
+                let Some(this) = weak.upgrade() else {
+                    return None;
+                };
                 match tokio::runtime::Handle::try_current() {
                     Ok(handle) => {
-                        let this = Arc::clone(&self_arc);
                         handle.spawn(async move {
                             this.work_handler().await;
                         });
                     }
                     Err(_) => {
                         tracing::warn!("virtual_sdcard: the replay loop needs a runtime to run");
-                        *self_arc.work_active.lock().unwrap() = false;
+                        *this.work_active.lock().unwrap() = false;
                     }
                 }
                 None // one-shot: retire the timer.

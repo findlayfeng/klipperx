@@ -236,11 +236,22 @@ impl HeaterCheck {
         };
         info!("Starting heater checks for {}", self.name);
         let reactor = printer.reactor();
+        // Both handles are weak: the timer lives in the reactor's heap until it
+        // is cancelled, and a strong `Heater` there would close the loop
+        // `reactor → timer → heater → its chip's clock → reactor`. That cycle
+        // outlives `Printer::teardown` — the parts are dropped but the cycle is
+        // not — so the heater, its `Mcu` and the reactor's blocked device read
+        // would all leak past a teardown. The `Weak<HeaterCheck>` is the same
+        // shape; the heater itself is kept by `PrinterHeaters`.
         let weak = self.self_ref.clone();
+        let weak_heater = Arc::downgrade(&heater);
         let handle = reactor.register_timer_named(
             "verify_heater",
             Box::new(move |eventtime| {
                 let Some(this) = weak.upgrade() else {
+                    return None;
+                };
+                let Some(heater) = weak_heater.upgrade() else {
                     return None;
                 };
                 let (temp, target) = heater.get_temp();

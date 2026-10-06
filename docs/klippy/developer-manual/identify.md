@@ -20,7 +20,13 @@ Identify 是 Klipper 主机端（klippy）与 MCU 端（固件）之间建立通
 3. 当固件发回**空数据块**时表示传输完成（固件在 `offset >= isize` 时把 `count` 置 0）
 4. 把完整负载做 **zlib 解压**，再解析成 JSON，得到 `Identify { data }`
 
-与 Klipper 的一个差异：Klipper 在 offset 不匹配时不追加数据、继续用同一 offset 重试（可能无限循环）；本实现直接报 `McuError::IdentifyProtocol`，避免死循环，也避免把错位的数据拼成一份看似合法的字典。（本页与上游不一致处统一登记在[本项目与上游的偏移](upstream-deviations.md)。）
+与 Klipper 的一个差异：offset 的两种不匹配分开对待——
+**落后的块**（回答的 offset 小于所请求的）是重试路径的**延迟重复回应**（重试会重发同一 offset，
+而固件对每个收到的请求都作答，于是第一次尝试的回答可能落在重试之后、被当成下一个挂起请求的
+回答），处理与上游同款：不追加数据、用同一 offset 重发；区别只在**每块预算**兜底，不会像上游那样
+可能无限循环。**超前的块**（回答的 offset 大于所请求的）才是真错位，直接报
+`McuError::IdentifyProtocol`，避免把错位的数据拼成一份看似合法的字典。
+（本页与上游不一致处统一登记在[本项目与上游的偏移](upstream-deviations.md)。）
 
 **静默即 nak（改号重发）**：5 字节空帧既是健康块的 ack、也是固件没收下该块的 nak——两者携带
 同一个 `next_sequence`（`command_send_ack` 与 `goto nak` 都走 `encode_acknak`，
@@ -120,7 +126,7 @@ let installed = mcu.identify(Duration::from_secs(5)).await?;  // 抓取 + 建字
 | 变体 | 触发条件 |
 |------|----------|
 | `McuError::Call` | 收发失败或分块请求超时 |
-| `McuError::IdentifyProtocol` | 分块 offset 错位，或负载超过上限（含解压后超限） |
+| `McuError::IdentifyProtocol` | 分块 offset **超前**（回答的 offset 大于所请求的），或负载超过上限（含解压后超限） |
 | `McuError::IdentifyCompression` | zlib 解压失败 |
 | `McuError::IdentifyJson` | 解压后的内容不是合法 JSON |
 | `McuError::Dictionary` | JSON 合法但字段形状不符（如 `commands` 不是对象） |

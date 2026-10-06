@@ -160,7 +160,8 @@ impl Identify {
     /// # Errors
     /// * [`McuError::Call`] — transport failure or timeout while waiting for a
     ///   chunk.
-    /// * [`McuError::IdentifyProtocol`] — a chunk arrived out of order, or the
+    /// * [`McuError::IdentifyProtocol`] — a chunk arrived past the offset it was
+    ///   asked for, or the
     ///   payload grew beyond `MAX_IDENTIFY_DATA_SIZE`.
     /// * [`McuError::IdentifyCompression`] — the payload is not valid zlib data.
     /// * [`McuError::IdentifyJson`] — the decompressed body is not valid JSON.
@@ -191,9 +192,11 @@ impl Identify {
             };
             let chunk = Self::request_chunk(mcu, &request, timeout).await?;
 
-            // The MCU echoes the offset it is answering for. A mismatch means the
-            // stream is out of sync; Klipper would silently retry the same offset
-            // forever, so surface it instead of looping or corrupting the body.
+            // The MCU echoes the offset it is answering for. A chunk *behind* the
+            // ask never gets here — `request_chunk` drops those as delayed
+            // duplicates — so what is left is a chunk past the ask: the stream is
+            // out of sync. Klipper would silently re-ask the same offset forever,
+            // so surface it instead of looping or corrupting the body.
             if chunk.offset as usize != payload.len() {
                 return Err(McuError::IdentifyProtocol(format!(
                     "identify chunk offset mismatch: expected {}, got {}",
@@ -258,6 +261,23 @@ impl Identify {
                 .call_msg_ungated::<IdentifyRequest, IdentifyChunk>(request, window)
                 .await
             {
+                // The ask names one offset; an answer *behind* it is the delayed
+                // copy of a chunk already consumed. The retry below re-asks when a
+                // window runs out, and the firmware answers every request it
+                // takes, so the first attempt's answer can arrive after the
+                // retry's and be matched to the next pending call. Drop it and ask
+                // again inside the same budget: upstream reads the same mismatch
+                // the same way (`serialhdl.py:74-84` — no append, re-ask the same
+                // offset). An answer *past* the ask is a real desync and still
+                // fails, in `fetch_compressed`.
+                Ok(chunk) if chunk.offset < request.offset => {
+                    debug!(
+                        "identify offset={}: ignoring a delayed duplicate answer for offset {} \
+                         and asking again",
+                        request.offset, chunk.offset
+                    );
+                    continue;
+                }
                 Ok(chunk) => return Ok(chunk),
                 Err(err @ McuError::Call(McuCallError::Timeout(_))) => timed_out = Some(err),
                 Err(other) => return Err(other),
@@ -595,7 +615,9 @@ mod tests {
     async fn test_fetch_rejects_offset_mismatch() {
         let compressed = compress(DICTIONARY_JSON.as_bytes());
         let mappings = vec![MappingEntry {
-            // The MCU answers a different offset than requested.
+            // The MCU answers an offset *past* the one requested: that is a real
+            // desync (a chunk behind the ask is a delayed duplicate, and is
+            // dropped in `request_chunk` — see the test below).
             input: Frame::new(0, request_payload(0)),
             outputs: vec![Frame::new(0, response_payload(40, &compressed[..8]))],
         }];
@@ -608,6 +630,65 @@ mod tests {
             }
             other => panic!("expected a protocol error, got {other:?}"),
         }
+    }
+
+    /// A delayed duplicate is stale data, not a desync.
+    ///
+    /// The retry path re-asks for the same offset when a window runs out, and
+    /// the firmware answers every request it takes — so the first attempt's
+    /// answer can land after the retry's and be matched to the *next* pending
+    /// call. It carries the offset just consumed; the transfer must drop it and
+    /// ask again (upstream reads the same mismatch the same way,
+    /// `serialhdl.py:74-84`) instead of failing the handshake.
+    ///
+    /// This is what CPU load turned into `identify chunk offset mismatch`
+    /// before: a starved host times a window out, and the retry races the late
+    /// answer.
+    #[tokio::test]
+    async fn test_a_delayed_duplicate_chunk_is_dropped_and_the_ask_repeats() {
+        let compressed = compress(DICTIONARY_JSON.as_bytes());
+        let chunk = IDENTIFY_CHUNK_SIZE as usize;
+        assert!(
+            compressed.len() > 2 * chunk,
+            "the duplicate must land mid-transfer, not on the last chunk"
+        );
+        let first = &compressed[..chunk];
+        let second = &compressed[chunk..2 * chunk];
+
+        let mut mappings = vec![
+            // Chunk 0, answered on time.
+            MappingEntry {
+                input: Frame::new(0, request_payload(0)),
+                outputs: vec![
+                    Frame::new(1, response_payload(0, first)),
+                    Frame::new(1, Vec::new()),
+                ],
+            },
+            // The ask for chunk 1 is answered by the *delayed* copy of chunk 0;
+            // the ask's own answer is still on the wire. The stale block is acked
+            // like any other, so the re-ask goes out as the next block.
+            MappingEntry {
+                input: Frame::new(1, request_payload(chunk as u32)),
+                outputs: vec![
+                    Frame::new(2, response_payload(0, first)),
+                    Frame::new(2, Vec::new()),
+                ],
+            },
+            // The re-ask, this time answered with chunk 1.
+            MappingEntry {
+                input: Frame::new(2, request_payload(chunk as u32)),
+                outputs: vec![
+                    Frame::new(3, response_payload(chunk as u32, second)),
+                    Frame::new(3, Vec::new()),
+                ],
+            },
+        ];
+        // The rest of the transfer runs in phase from block 3.
+        mappings.extend(chunked_mappings_from(&compressed, chunk, 3, 2 * chunk));
+
+        let identify = fetch(mappings, Duration::from_secs(2)).await.unwrap();
+
+        assert_eq!(identify.data["app"], "Klipper");
     }
 
     #[tokio::test]

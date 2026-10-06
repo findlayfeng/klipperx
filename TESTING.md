@@ -32,7 +32,7 @@
 
 - [ ] **R1 上电连接与配置下发** —— 真实测试：插板起宿主，走完 identify、字典下发、
   `get_config`/配置 CRC 与板端 `finalize_config`、时钟同步；`STATUS`/`M115` 有应答，
-  日志无 `!!`。可加跑真机帧序用例：`KLIPPERX_HW_SERIAL=/dev/ttyACM0 cargo test -p klipperx
+  日志无 `!!`。可加跑真机帧序用例：`KLIPPERX_HW_CONFIG=~/printer.cfg cargo test -p klipperx
   --lib test_frame_sequence_sync_against_a_real_board -- --ignored --nocapture`。
   判定：会话建立、配置被固件接受、无重传/超时报错。
 

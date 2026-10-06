@@ -62,7 +62,7 @@
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::klippy::config::{Config, ConfigValue};
+    use crate::core::klippy::config::{Config, ConfigSection, ConfigValue};
     use crate::core::klippy::mcu::Mcu;
     use std::sync::Arc;
 
@@ -450,31 +450,41 @@ mod tests {
     // dev-dependency's build script runs and writes them.
     include!("upstream_generated/mod.rs");
 
-    /// The klipper source root as the process working directory, restored on
-    /// drop (including a panic).
+    /// Resolve a section's path-valued options against the directory upstream
+    /// runs a case from, so a case never depends on the process CWD.
     ///
-    /// Upstream's `test/klippy/test-klippy.sh` runs each case with the klipper
-    /// source root as the working directory, so a config's relative `path:`
-    /// (only `sdcard_loop.cfg` ships one) resolves the way `os.listdir` does.
-    /// Cargo's working directory is the package root, where `test/` is not
-    /// present, so without this `[virtual_sdcard]` cannot find the directory it
-    /// was pointed at.
-    struct KlipperCwdGuard(Option<std::path::PathBuf>);
-
-    impl KlipperCwdGuard {
-        fn set() -> Self {
-            let guard = Self(std::env::current_dir().ok());
-            let _ = std::env::set_current_dir(klipper_dir());
-            guard
+    /// Upstream's `test/klippy/test-klippy.sh` runs every case from the klipper
+    /// source root, so `virtual_sdcard.py:21` keeps a relative `path:` relative
+    /// and `os.listdir` reads it against that directory. This host runs many
+    /// cases in one process, where the process CWD is global: a relative path
+    /// left in the config depends on whichever case moved the CWD last, which is
+    /// what made the `M20` "Unable to get file list" flake. Resolving it here —
+    /// the same directory the shell uses — keeps the case's meaning identical
+    /// without sharing the CWD.
+    ///
+    /// `[virtual_sdcard] path` is the corpus' only relative path option
+    /// (`sdcard_loop.cfg:3`); every other path-valued option in the corpus is
+    /// absolute or absent.
+    fn resolve_relative_paths(section: &mut ConfigSection) {
+        if section.id != "virtual_sdcard" {
+            return;
         }
-    }
-
-    impl Drop for KlipperCwdGuard {
-        fn drop(&mut self) {
-            if let Some(prev) = self.0.take() {
-                let _ = std::env::set_current_dir(prev);
-            }
+        let Some(value) = section
+            .parameters
+            .get("path")
+            .and_then(ConfigValue::as_str_ref)
+        else {
+            return;
+        };
+        let path = Path::new(value);
+        if path.is_absolute() {
+            return;
         }
+        let resolved = klipper_dir().join(path);
+        section.parameters.insert(
+            "path".to_string(),
+            ConfigValue::Single(resolved.display().to_string()),
+        );
     }
 
     /// Entry point the generated `#[test]`s call — the runtime half of the
@@ -492,10 +502,6 @@ mod tests {
         gcode: &str,
         should_fail: bool,
     ) {
-        // The case runs from the klipper source root, as upstream runs it;
-        // the guard restores the working directory on exit, including a panic.
-        let _cwd_guard = KlipperCwdGuard::set();
-
         let resolved: Vec<(Option<String>, PathBuf)> = dictionaries
             .iter()
             .map(|(mcu, path)| (mcu.map(str::to_string), PathBuf::from(*path)))
@@ -581,6 +587,7 @@ mod tests {
                     ConfigValue::Single(format!("dict={}", dictionary.display())),
                 );
             }
+            resolve_relative_paths(&mut section);
             out.add_section(section);
         }
         out
@@ -999,7 +1006,6 @@ mod tests {
             "the corpus has a case whose config holds the dispatcher"
         );
 
-        let _cwd_guard = KlipperCwdGuard::set();
         let mut measured = 0;
         for run in &runs {
             let dictionaries = run_dictionaries(run);
@@ -1056,7 +1062,6 @@ mod tests {
         let resolved = resolved_dictionaries(&dictionaries).expect("checked");
         let parsed = injected_config(&run.config, &resolved).expect("the config parses");
 
-        let _cwd_guard = KlipperCwdGuard::set();
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -1075,6 +1080,83 @@ mod tests {
             cycle.old_refs, 1,
             "reset_for_restart released every other reference to the old session: \
              a leaked part kept the old reader alive beside the new one"
+        );
+    }
+
+    /// A case that reads a relative path must find it without the klipper root
+    /// as the process working directory.
+    ///
+    /// Upstream's `test-klippy.sh` runs every case from the klipper source root,
+    /// so `sdcard_loop.cfg`'s `[virtual_sdcard] path: test/klippy/sdcard_loop`
+    /// resolves there. This host shares one process across cases, so a case must
+    /// not depend on the process CWD: otherwise whichever case last moved it
+    /// decides whether this one finds its files (the `M20` "Unable to get file
+    /// list" flake). Run from cargo's working directory — the package root,
+    /// never the klipper root — the case still has to pass.
+    #[test]
+    fn a_case_finds_its_relative_paths_outside_the_klipper_root() {
+        let run = all_runs()
+            .into_iter()
+            .find(|run| {
+                run.config
+                    .file_name()
+                    .map(|name| name == "sdcard_loop.cfg")
+                    .unwrap_or(false)
+            })
+            .expect("the corpus has sdcard_loop.cfg");
+        let dictionaries = run_dictionaries(&run);
+        assert!(
+            dictionaries.iter().all(|(_, path)| path.is_some()),
+            "sdcard_loop's dictionary is built"
+        );
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("a case runtime");
+        let outcome = runtime.block_on(run_case(&run, &dictionaries));
+        runtime.shutdown_timeout(std::time::Duration::from_secs(CASE_SHUTDOWN_TIMEOUT));
+        outcome
+            .unwrap_or_else(|e| panic!("sdcard_loop.cfg needs the klipper root as the CWD: {e}"));
+    }
+
+    /// The corpus' only relative path option is resolved when the config is
+    /// injected, so running the case never reads the process CWD.
+    ///
+    /// `sdcard_loop.cfg`'s `[virtual_sdcard] path` is the one relative path in
+    /// the corpus; upstream resolves it against the klipper root because that is
+    /// where `test-klippy.sh` runs from (`virtual_sdcard.py:21`). Injection
+    /// reproduces that resolution so the case keeps its upstream meaning without
+    /// sharing the process CWD with every other case.
+    #[test]
+    fn a_relative_sdcard_path_is_absolute_after_injection() {
+        let run = all_runs()
+            .into_iter()
+            .find(|run| {
+                run.config
+                    .file_name()
+                    .map(|name| name == "sdcard_loop.cfg")
+                    .unwrap_or(false)
+            })
+            .expect("the corpus has sdcard_loop.cfg");
+        let dictionaries = resolved_dictionaries(&run_dictionaries(&run)).expect("built");
+        let config = injected_config(&run.config, &dictionaries).expect("the config parses");
+        let path = config
+            .get_section("virtual_sdcard")
+            .expect("sdcard_loop.cfg has [virtual_sdcard]")
+            .parameters
+            .get("path")
+            .expect("[virtual_sdcard] has a path")
+            .as_str();
+
+        let path = Path::new(&path);
+        assert!(
+            path.is_absolute(),
+            "the injected path is absolute, not {path:?}"
+        );
+        assert!(
+            path.starts_with(klipper_dir()),
+            "the path is resolved against the klipper root, as upstream runs it: {path:?}"
         );
     }
 

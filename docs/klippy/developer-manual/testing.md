@@ -130,7 +130,7 @@ cargo test --workspace -- --test-threads=1 2>&1 | scripts/test-timings.py
 2. **检查**：`hwtest::acquire("<用例名>", &needs)` 用仓库自己的 config 解析器读 `KLIPPERX_HW_CONFIG`，
    逐项核对——**被注释掉的节或选项算不存在**。
 3. **有则跑、无则报告忽略**：
-   - 齐备 → 打 `HW-RUN: <用例名>`，返回带独占锁的机器句柄；
+   - 齐备 → 打 `HW-RUN: <用例名>  (the config is assumed correct; this checks the host module, not your config)`（那行把本模式的前提一并带出来，形状由 `run_line` 固定，可 grep），返回带独占锁的机器句柄；
    - 不齐（变量未设 / 文件不存在 / 解析失败 / 缺项）→ 打
      `HW-IGNORED: <用例名>: <原因>`（缺项会逐项列出），**返回 `None` 并跳过，不失败**。
 

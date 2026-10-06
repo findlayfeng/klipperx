@@ -601,6 +601,13 @@ SET_PIN PIN=pwm_fan VALUE=0.25  ; PWM：25% 占空比
 
 ## 端停查询
 
+### BED_SCREWS_ADJUST / ACCEPT / ADJUSTED / ABORT — 床面螺丝调整（由 `[bed_screws]` 注册，2026-10-06）
+
+`BED_SCREWS_ADJUST` 启动会话（常驻注册）；会话期间额外注册 `ACCEPT` / `ADJUSTED` / `ABORT`，
+收尾时注销。每颗螺丝先抬到 `horizontal_move_z`、移到该点、再下探到 `probe_height`：
+`ACCEPT` 逐颗推进（粗调走完再走一遍精调），`ADJUSTED` 把该螺丝的计数从 `-1` 归 `0` 重数，`ABORT` 结束会话。
+注意 `ACCEPT` / `ABORT` 与 `MANUAL_PROBE` 的同名会话命令**共用同一命名空间**，两者同时活跃时先注册者占坑。
+
 ### SET_TEMPERATURE_FAN_TARGET — 设定温度风扇目标（由 `[temperature_fan]` 注册，mux 键 `TEMPERATURE_FAN=`）
 
 | 命令 | 参数 | 说明 |

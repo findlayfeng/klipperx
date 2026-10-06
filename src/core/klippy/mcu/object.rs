@@ -36,12 +36,13 @@ use crate::core::klippy::cmd::config::Reset;
 use crate::core::klippy::cmd::shutdown::EmergencyStop;
 use crate::core::klippy::cmd::uptime::{GetUptime, Uptime};
 use crate::core::klippy::cmd::McuCommand;
-use crate::core::klippy::config::mcu::McuConfig;
+use crate::core::klippy::config::mcu::{McuConfig, Transport};
 use crate::core::klippy::config::value::ConfigValue;
 use crate::core::klippy::config::{AccessTracking, ConfigSection, ConfigWrapper};
 use crate::core::klippy::error::{ConfigError, KlippyError};
 use crate::core::klippy::event::stats::{register_stats, LastStats};
 use crate::core::klippy::event::{IsShutdown, KlippyEvent, McuEvent, Shutdown, Starting};
+use crate::core::klippy::extras::canbus_ids::{PrinterCanbusIds, CANBUS_IDS_OBJECT};
 use crate::core::klippy::mcu::{
     BuiltConfig, ConfigBuilder, Configured, Dictionary, I2cMode, Mcu, McuChip, McuError, McuI2c,
     McuRestartMethod, McuSpi, McuStepper, SpiMode,
@@ -1093,6 +1094,28 @@ impl PrinterObject for McuObject {
                 .unwrap_or_else(AccessTracking::shared);
             let wrapper = ConfigWrapper::new(&self.section, access);
             let mut config = McuConfig::new(&wrapper).map_err(KlippyError::Config)?;
+            // A CAN MCU whose section named no `canbus_nodeid` takes the id the
+            // allocator assigned it when that section was registered while the
+            // config loaded (upstream's `get_nodeid` at attach,
+            // `klippy/mcu.py:860-861`). The link is opened below, so the id has
+            // to be known here.
+            if let Transport::Can { uuid, nodeid, .. } = &mut config.transport {
+                if nodeid.is_none() {
+                    let name = config.name.clone();
+                    let ids = self
+                        .printer
+                        .upgrade()
+                        .and_then(|printer| {
+                            printer.lookup_object_as::<PrinterCanbusIds>(CANBUS_IDS_OBJECT)
+                        })
+                        .ok_or_else(|| {
+                            KlippyError::Config(ConfigError::new(format!(
+                                "MCU '{name}' is on a CAN bus but no node-id allocator is loaded"
+                            )))
+                        })?;
+                    *nodeid = Some(ids.get_nodeid(*uuid).map_err(KlippyError::Config)?);
+                }
+            }
             info!(
                 "MCU '{}' restart method: {}",
                 config.name,
@@ -1447,7 +1470,20 @@ pub fn load_config(
     // check: the check runs at the end of the load walk, before anything
     // connects, and an MCU reads its section at connect time. The parse is pure;
     // the device is still only opened by `connect`.
-    McuConfig::new(config)?;
+    let parsed = McuConfig::new(config)?;
+    // A CAN MCU registers its uuid with the node-id allocator here, while the
+    // config is loaded, so every `[mcu]`'s uuid is known before any of them
+    // connects (upstream registers in `MCU.__init__`, `klippy/mcu.py:784`). The
+    // order these calls happen in is the order `[mcu]` sections are declared,
+    // which is the order ids are handed out in. A written `canbus_nodeid` is
+    // the explicit id the allocator records for this uuid.
+    if let Transport::Can { uuid, nodeid, .. } = &parsed.transport {
+        crate::core::klippy::extras::canbus_ids::ensure(printer)?.add_uuid(
+            &parsed.name,
+            *uuid,
+            *nodeid,
+        )?;
+    }
     // The first `[mcu]` section brings the `error_mcu` module with it, as
     // upstream's `MCU.__init__` does (`klippy/mcu.py:1159`); the rest find it
     // already there. It has to exist before any MCU can fail.

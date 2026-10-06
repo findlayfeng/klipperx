@@ -18,12 +18,19 @@
 //!   receive()   ◄── FrameStream ◄── data bytes (id = tx_id + 1) ◄─ can0
 //! ```
 //!
+//! The bus carries one more conversation, which is *not* the byte stream: the
+//! **admin** broadcast on id `0x3f0`, which is how a board that has no node id is
+//! found and then given one. It is the same firmware module (`src/generic/canserial.c`,
+//! "admin command handling") and the same sockets, so it lives here too: see
+//! [`CanbusAdminSocket`], which asks every unassigned board to identify itself and
+//! reads the answers.
+//!
 //! # Naming
 //!
 //! This is the *can serial* transport: Klipper's serial link, carried over CAN.
 //! Type names therefore say `CanSerial`, and the name `Canbus` is kept for an
 //! interface that speaks the CAN protocol itself rather than borrowing the bus as
-//! a wire.
+//! a wire — which is what [`CanbusAdminSocket`] does with the admin broadcast.
 //!
 //! Configuration keys are a different matter: they follow Klipper's `[mcu]`
 //! vocabulary (`canbus_uuid`, `canbus_interface`, and `canbus_nodeid` as Klipper's
@@ -41,6 +48,7 @@ use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use tracing::{debug, info, trace, warn};
 
 /// Data bytes in one classical CAN frame.
@@ -53,13 +61,19 @@ const CAN_FRAME_SIZE: usize = 16;
 /// Klipper's node-id mapping: `nodeid` → `0x100 + 2 * nodeid`.
 const NODE_ID_BASE: u32 = 0x100;
 
-/// Klipper's admin arbitration id, and the command that tells an unassigned MCU
-/// which node id to take (`klippy/serialhdl.py`).
+/// Klipper's admin arbitration id, and the commands and answers that travel on
+/// it (`klippy/serialhdl.py`, `src/generic/canserial.c`): the one that tells an
+/// unassigned MCU which node id to take, the broadcast that asks every board
+/// without one to answer, the answer itself, and the application id CanBoot
+/// reports in it.
 const ADMIN_ID: u32 = 0x3f0;
 const CMD_SET_NODEID: u8 = 0x01;
+const CMD_QUERY_UNASSIGNED: u8 = 0x00;
+const RESP_NEED_NODEID: u8 = 0x20;
+const CMD_SET_CANBOOT_NODEID: u8 = 0x11;
 
 /// How long a receive waits for a frame before rechecking the stop flag.
-const POLL_TIMEOUT_MS: libc::c_int = 100;
+const POLL_TIMEOUT: Duration = Duration::from_millis(100);
 
 // From `linux/can.h` and `linux/can/raw.h`; `libc` does not expose these.
 const CAN_SFF_MASK: u32 = 0x7ff;
@@ -232,6 +246,185 @@ impl CanSerialLink {
     }
 }
 
+/// The broadcast that asks every board without a node id to identify itself.
+///
+/// [`CanSerialDevice`] addresses one node; this frame addresses none, which is
+/// the point: a board that has never been given a node id cannot be addressed. It
+/// goes out on the admin id with the query as its only byte, exactly as
+/// `scripts/canbus_query.py` sends it.
+pub fn query_unassigned_frame() -> CanFrame {
+    CanFrame::new(ADMIN_ID, &[CMD_QUERY_UNASSIGNED])
+        .expect("the query is one byte, which fits in a CAN frame")
+}
+
+/// One board's answer to [`query_unassigned_frame`]: the UUID it is remembered
+/// by, and the application it runs.
+///
+/// The firmware answers with `RESP_NEED_NODEID`, the six UUID bytes most
+/// significant first, and — in the builds that send it — a seventh data byte
+/// naming the application (`src/generic/canserial.c`,
+/// `docs/CANBUS_protocol.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnassignedNode {
+    uuid: [u8; 6],
+    application: Option<u8>,
+}
+
+impl UnassignedNode {
+    /// The board a frame reports, or `None` for a frame that is not an answer.
+    ///
+    /// What makes a frame an answer is its shape: the admin answer id, at least
+    /// seven data bytes, and `RESP_NEED_NODEID` in the first of them. Nothing
+    /// else is checked — in particular a UUID of six zero bytes is reported
+    /// rather than treated as unset, because the protocol has no such value and
+    /// Klipper's own tool prints one too — and the application byte is optional.
+    pub fn from_reply(frame: &CanFrame) -> Option<Self> {
+        let data = frame.data();
+        if frame.id() != ADMIN_ID + 1 || data.len() < 7 || data[0] != RESP_NEED_NODEID {
+            return None;
+        }
+        let mut uuid = [0u8; 6];
+        uuid.copy_from_slice(&data[1..7]);
+        Some(Self {
+            uuid,
+            application: data.get(7).copied(),
+        })
+    }
+
+    /// The UUID, most significant byte first.
+    pub fn uuid(&self) -> [u8; 6] {
+        self.uuid
+    }
+
+    /// The UUID as Klipper writes it: twelve hex digits (`%012x`), leading
+    /// zeros and all.
+    pub fn uuid_hex(&self) -> String {
+        format!("{:012x}", self.uuid_number())
+    }
+
+    /// The UUID as one number, summed the way Klipper's own tool sums it.
+    ///
+    /// This is what pins the byte order: the byte after the answer's first is
+    /// the *most* significant one.
+    fn uuid_number(&self) -> u64 {
+        self.uuid
+            .iter()
+            .fold(0u64, |value, byte| (value << 8) | u64::from(*byte))
+    }
+
+    /// The application byte the board sent, if it sent one.
+    pub fn application(&self) -> Option<u8> {
+        self.application
+    }
+
+    /// The application's name, as Klipper's tool names it in its `Found …` line.
+    ///
+    /// A board that sends no application byte — seven data bytes, the shape the
+    /// protocol had before the byte existed — is named Klipper, which is what
+    /// upstream's tool reads it as; an id that means neither Klipper nor CanBoot
+    /// is reported as `Unknown` rather than guessed at.
+    pub fn application_name(&self) -> &'static str {
+        match self.application {
+            None | Some(CMD_SET_NODEID) => "Klipper",
+            Some(CMD_SET_CANBOOT_NODEID) => "CanBoot",
+            Some(_) => "Unknown",
+        }
+    }
+}
+
+/// The boards one scan heard, in the order they first answered.
+#[derive(Debug, Default)]
+pub struct UnassignedScan {
+    nodes: Vec<UnassignedNode>,
+}
+
+impl UnassignedScan {
+    /// A scan that has heard nothing yet.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Take one frame: the node it reports, the first time that UUID is heard.
+    ///
+    /// A board answers with retries until the bus takes its frame
+    /// (`can_process_query_unassigned` loops on `canbus_send`), so the same
+    /// board can answer twice; the second frame is `None` here, and the board is
+    /// listed once.
+    pub fn feed(&mut self, frame: &CanFrame) -> Option<UnassignedNode> {
+        let node = UnassignedNode::from_reply(frame)?;
+        if self.nodes.iter().any(|seen| seen.uuid == node.uuid) {
+            return None;
+        }
+        self.nodes.push(node);
+        Some(node)
+    }
+
+    /// The boards found so far, in the order they first answered.
+    pub fn nodes(&self) -> &[UnassignedNode] {
+        &self.nodes
+    }
+
+    /// How many boards answered.
+    pub fn total(&self) -> usize {
+        self.nodes.len()
+    }
+}
+
+/// The bus a scan runs on: a socket in production, a scripted list of answers in
+/// tests, which is what lets the query window be exercised without a CAN
+/// interface or a real clock.
+///
+/// The clock is part of the bus rather than a parameter of its own because from
+/// the window's point of view the two are the same thing: what consumes the
+/// window is the *waiting*, so a fake bus has to advance its clock by exactly
+/// what the scan asked it to wait for.
+pub trait AdminBus {
+    /// The current time on this bus's clock.
+    fn now(&self) -> Instant;
+
+    /// Send one admin frame.
+    fn send(&mut self, frame: &CanFrame) -> Result<(), InterfaceError>;
+
+    /// Read one frame, waiting at most `wait` for it.
+    ///
+    /// `None` means nothing arrived in that time; an error means the bus failed.
+    fn receive(&mut self, wait: Duration) -> Result<Option<CanFrame>, InterfaceError>;
+}
+
+/// Ask every board with no node id to identify itself, and read the answers for
+/// `window`.
+///
+/// This is `query_unassigned` in `scripts/canbus_query.py`, and the window is the
+/// same kind of thing it is there — a *deadline*, measured from the query, not an
+/// idle timeout: every wait is shortened to what is left of it, and the scan ends
+/// when that runs out, whatever has arrived by then. `report` is called as each
+/// board is first heard, so a front-end can print answers while the window is
+/// still open; the same boards come back in the returned scan.
+pub fn query_unassigned(
+    bus: &mut impl AdminBus,
+    window: Duration,
+    mut report: impl FnMut(UnassignedNode),
+) -> Result<UnassignedScan, InterfaceError> {
+    let started = bus.now();
+    bus.send(&query_unassigned_frame())?;
+    let mut scan = UnassignedScan::new();
+    loop {
+        let remaining = window.saturating_sub(bus.now().saturating_duration_since(started));
+        if remaining.is_zero() {
+            break;
+        }
+        let Some(frame) = bus.receive(remaining)? else {
+            // The wait for what was left of the window came back empty, so
+            // nothing more can arrive inside it.
+            break;
+        };
+        if let Some(node) = scan.feed(&frame) {
+            report(node);
+        }
+    }
+    Ok(scan)
+}
+
 /// A [`Device`] on a SocketCAN interface (`can0`, `/sys/class/net/*` names).
 ///
 /// The link half above is unit tested; the socket half cannot be exercised in this
@@ -375,7 +568,7 @@ impl Device for CanSerialDevice {
                 return Some(frame);
             }
 
-            match wait_readable(self.socket.as_raw_fd()) {
+            match wait_readable(self.socket.as_raw_fd(), POLL_TIMEOUT) {
                 Wait::Readable => {}
                 Wait::Timeout => continue,
                 Wait::Closed => return None,
@@ -415,6 +608,99 @@ impl Device for CanSerialDevice {
     }
 }
 
+/// A raw CAN socket for Klipper's **admin** frames: the broadcast that finds the
+/// boards which have no node id yet.
+///
+/// [`CanSerialDevice`] cannot serve this — it opens a socket already addressed to
+/// one node and assigns that node's id before anything else, while a board with
+/// no node id cannot be addressed at all. The socket half below is the same
+/// recipe and the same helpers: what differs is the filter (the admin answer id,
+/// since a scan has nothing else to read) and that nothing is addressed.
+///
+/// As for [`CanSerialDevice`], this half cannot be exercised in this repository's
+/// test environment: the frames it carries are unit tested, and the rest is
+/// covered by compilation.
+pub struct CanbusAdminSocket {
+    socket: File,
+    interface: String,
+}
+
+impl CanbusAdminSocket {
+    /// Open `interface` and listen for answers to the admin broadcast.
+    ///
+    /// # Errors
+    /// Returns [`InterfaceError`] when the interface does not exist, or the
+    /// socket cannot be created, bound or filtered.
+    pub fn open(interface: &str) -> Result<Self, InterfaceError> {
+        let index = interface_index(interface)?;
+        let socket = open_socket()?;
+        bind_interface(&socket, index)?;
+        filter_answers(&socket, ADMIN_ID + 1)?;
+        debug!(
+            "admin socket ready on {interface}, listening for {:#x}",
+            ADMIN_ID + 1
+        );
+        Ok(Self {
+            socket,
+            interface: interface.to_string(),
+        })
+    }
+}
+
+impl fmt::Debug for CanbusAdminSocket {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CanbusAdminSocket")
+            .field("interface", &self.interface)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AdminBus for CanbusAdminSocket {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
+    fn send(&mut self, frame: &CanFrame) -> Result<(), InterfaceError> {
+        trace!(
+            "tx admin frame on {}: {}",
+            self.interface,
+            describe_can_frame(frame.id(), frame.data())
+        );
+        (&self.socket)
+            .write_all(&frame.to_abi())
+            .map_err(|e| InterfaceError::SendError(format!("CAN write failed: {e}")))
+    }
+
+    fn receive(&mut self, wait: Duration) -> Result<Option<CanFrame>, InterfaceError> {
+        let mut raw = [0u8; CAN_FRAME_SIZE];
+        loop {
+            match wait_readable(self.socket.as_raw_fd(), wait) {
+                Wait::Readable => {}
+                // The wait ran out: the slice of the window it was given is
+                // spent, and the caller decides what is left of the window.
+                Wait::Timeout => return Ok(None),
+                // A signal: wait again rather than throwing the answer away.
+                Wait::Retry => continue,
+                Wait::Closed => return Err(InterfaceError::ConnectionLost),
+            }
+            match (&self.socket).read(&mut raw) {
+                Ok(read) if read >= CAN_FRAME_SIZE => return Ok(Some(CanFrame::from_abi(&raw))),
+                // A datagram socket delivers whole frames, and the filter keeps
+                // everything but the admin answers out; treat a short read as
+                // someone else's frame rather than guessing.
+                Ok(read) => debug!("ignoring {read} byte CAN read"),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    return Err(InterfaceError::Other(format!(
+                        "CAN read on {} failed: {e}",
+                        self.interface
+                    )))
+                }
+            }
+        }
+    }
+}
+
 /// What a `poll` on the socket said.
 enum Wait {
     Readable,
@@ -423,15 +709,20 @@ enum Wait {
     Retry,
 }
 
-/// Wait up to [`POLL_TIMEOUT_MS`] for the socket to have a frame.
-fn wait_readable(fd: RawFd) -> Wait {
+/// Wait up to `timeout` for the socket to have a frame.
+///
+/// `poll` counts in whole milliseconds, so a timeout shorter than one waits that
+/// millisecond rather than spinning on a zero timeout; one longer than a `c_int`
+/// can hold is capped, which only a caller asking for tens of days would reach.
+fn wait_readable(fd: RawFd, timeout: Duration) -> Wait {
     let mut poll_fd = libc::pollfd {
         fd,
         events: libc::POLLIN,
         revents: 0,
     };
+    let millis = timeout.as_millis().clamp(1, libc::c_int::MAX as u128) as libc::c_int;
     // SAFETY: `poll_fd` is one initialised pollfd, as poll expects.
-    let ready = unsafe { libc::poll(&mut poll_fd, 1, POLL_TIMEOUT_MS) };
+    let ready = unsafe { libc::poll(&mut poll_fd, 1, millis) };
     if ready < 0 {
         let err = std::io::Error::last_os_error();
         return if err.kind() == std::io::ErrorKind::Interrupted {
@@ -694,5 +985,340 @@ mod tests {
             err.to_string().contains("no CAN interface named 'can99'"),
             "{err}"
         );
+
+        // The admin socket is the same first step, and reports it the same way.
+        let err = CanbusAdminSocket::open("can99").unwrap_err();
+        assert!(
+            err.to_string().contains("no CAN interface named 'can99'"),
+            "{err}"
+        );
+    }
+
+    // ========================================================================
+    // Finding the boards that have no node id yet
+    // ========================================================================
+
+    /// An answer frame from the board with `uuid`, as the firmware sends it: the
+    /// response byte, the UUID, and the application byte when it sends one.
+    fn answer(uuid: [u8; 6], application: Option<u8>) -> CanFrame {
+        let mut data = vec![RESP_NEED_NODEID];
+        data.extend_from_slice(&uuid);
+        if let Some(application) = application {
+            data.push(application);
+        }
+        CanFrame::new(ADMIN_ID + 1, &data).expect("an answer fits in one CAN frame")
+    }
+
+    #[test]
+    fn test_the_query_frame_is_the_admin_broadcast() {
+        // `scripts/canbus_query.py`: the broadcast id with the query as its only
+        // byte — the bytes on the wire, not just the two fields.
+        let frame = query_unassigned_frame();
+        assert_eq!(frame.id(), 0x3f0);
+        assert_eq!(frame.data(), [0x00]);
+
+        let raw = frame.to_abi();
+        assert_eq!(u32::from_ne_bytes([raw[0], raw[1], raw[2], raw[3]]), 0x3f0);
+        assert_eq!(raw[4], 1, "one data byte");
+        assert_eq!(&raw[8..9], [0x00]);
+        assert_eq!(&raw[9..], [0; CAN_DATA_BYTES - 1], "no padding is sent");
+    }
+
+    #[test]
+    fn test_an_answer_gives_the_uuid_and_the_application() {
+        let frame = answer([0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc], Some(CMD_SET_NODEID));
+
+        let node = UnassignedNode::from_reply(&frame).expect("this is an answer");
+        assert_eq!(node.uuid(), [0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc]);
+        assert_eq!(node.uuid_hex(), "11aa22bb33cc");
+        assert_eq!(node.application(), Some(0x01));
+        assert_eq!(node.application_name(), "Klipper");
+
+        // CanBoot answers the same way, and names itself.
+        let node = UnassignedNode::from_reply(&answer([0; 6], Some(CMD_SET_CANBOOT_NODEID)))
+            .expect("this is an answer");
+        assert_eq!(node.application_name(), "CanBoot");
+    }
+
+    #[test]
+    fn test_the_uuid_is_read_most_significant_byte_first() {
+        // Klipper sums the six bytes as `data[1]` shifted by 40 bits, so the
+        // first byte after the response is the most significant one: reading
+        // them the other way round would print a different number.
+        let node = UnassignedNode::from_reply(&answer([0x01, 0, 0, 0, 0, 0], None)).unwrap();
+        assert_eq!(node.uuid_hex(), "010000000000");
+
+        let node = UnassignedNode::from_reply(&answer([0, 0, 0, 0, 0, 0x01], None)).unwrap();
+        assert_eq!(node.uuid_hex(), "000000000001");
+
+        // A UUID whose leading byte is non-zero, spelled out as Klipper's tool
+        // computes it, so a whole-word byte swap cannot pass this.
+        let expected = 0x11u64 << 40 | 0x22 << 32 | 0x33 << 24 | 0x44 << 16 | 0x55 << 8 | 0x66;
+        let node = UnassignedNode::from_reply(&answer(
+            [0x11, 0x22, 0x33, 0x44, 0x55, 0x66],
+            Some(CMD_SET_NODEID),
+        ))
+        .unwrap();
+        assert_eq!(node.uuid_hex(), format!("{expected:012x}"));
+        assert_eq!(node.uuid_hex(), "112233445566");
+    }
+
+    #[test]
+    fn test_a_frame_that_is_not_an_answer_is_ignored() {
+        // Too few bytes to hold a UUID: `dlc < 7` in upstream's terms. Six is
+        // the boundary — seven is an answer, from the next test on.
+        let short = CanFrame::new(ADMIN_ID + 1, &[RESP_NEED_NODEID, 1, 2, 3, 4, 5]).unwrap();
+        assert_eq!(UnassignedNode::from_reply(&short), None);
+
+        // The response byte is not the one an unassigned board sends — an admin
+        // answer to something else.
+        let mut other = vec![0x21];
+        other.extend_from_slice(&[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x01]);
+        assert_eq!(
+            UnassignedNode::from_reply(&CanFrame::new(ADMIN_ID + 1, &other).unwrap()),
+            None
+        );
+
+        // The query itself, or any other traffic on the bus: a scan sees frames
+        // that are not answers and has to pass them by. The node's own link id
+        // (0x102) is one of them.
+        assert_eq!(UnassignedNode::from_reply(&query_unassigned_frame()), None);
+        let mut foreign = vec![RESP_NEED_NODEID];
+        foreign.extend_from_slice(&[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x01]);
+        assert_eq!(
+            UnassignedNode::from_reply(&CanFrame::new(0x102, &foreign).unwrap()),
+            None
+        );
+    }
+
+    #[test]
+    fn test_an_answer_without_the_application_byte_is_klipper() {
+        // Seven data bytes: the answer the protocol had before the application
+        // byte existed. Upstream's tool reads the missing byte as Klipper's own
+        // application id, and so does this.
+        let frame = answer([0x11, 0x22, 0x33, 0x44, 0x55, 0x66], None);
+        assert_eq!(frame.data().len(), 7);
+
+        let node = UnassignedNode::from_reply(&frame).expect("seven bytes are an answer");
+        assert_eq!(node.application(), None);
+        assert_eq!(node.application_name(), "Klipper");
+        assert_eq!(node.uuid_hex(), "112233445566");
+    }
+
+    #[test]
+    fn test_an_unknown_application_is_named_unknown() {
+        // An application id that is neither Klipper nor CanBoot is reported as
+        // it is, rather than guessed at — and a request command (0x02) is not an
+        // application id at all.
+        let node = UnassignedNode::from_reply(&answer([0; 6], Some(0x02))).unwrap();
+        assert_eq!(node.application(), Some(0x02));
+        assert_eq!(node.application_name(), "Unknown");
+    }
+
+    #[test]
+    fn test_an_all_zero_uuid_is_still_reported() {
+        // The protocol has no "no UUID programmed" value, and upstream's tool
+        // prints this answer like any other, so the shape of the frame is all
+        // that is checked here too.
+        let node = UnassignedNode::from_reply(&answer([0; 6], Some(CMD_SET_NODEID)))
+            .expect("an answer with a zero UUID is still an answer");
+        assert_eq!(node.uuid(), [0; 6]);
+        assert_eq!(node.uuid_hex(), "000000000000");
+        assert_eq!(node.application_name(), "Klipper");
+    }
+
+    #[test]
+    fn test_a_board_that_answers_twice_is_listed_once() {
+        let first = answer([0x11, 0x22, 0x33, 0x44, 0x55, 0x66], Some(CMD_SET_NODEID));
+        // The firmware retries its answer, so the same UUID arrives again.
+        let again = answer([0x11, 0x22, 0x33, 0x44, 0x55, 0x66], Some(CMD_SET_NODEID));
+        let other = answer(
+            [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+            Some(CMD_SET_CANBOOT_NODEID),
+        );
+
+        let mut scan = UnassignedScan::new();
+        assert_eq!(
+            scan.feed(&first).map(|node| node.uuid_hex()),
+            Some("112233445566".to_string())
+        );
+        assert_eq!(
+            scan.feed(&again),
+            None,
+            "the second frame of a UUID is not news"
+        );
+        assert!(scan.feed(&other).is_some());
+        assert_eq!(scan.feed(&query_unassigned_frame()), None, "not an answer");
+
+        assert_eq!(scan.total(), 2);
+        assert_eq!(
+            scan.nodes()
+                .iter()
+                .map(|node| node.uuid_hex())
+                .collect::<Vec<_>>(),
+            ["112233445566", "aabbccddeeff"],
+            "listed once each, in the order they were first heard"
+        );
+    }
+
+    /// What one [`AdminBus::receive`] on a scripted bus does.
+    enum Reply {
+        /// The frame arrives after this much of the wait.
+        After(Duration, CanFrame),
+        /// Nothing arrives: the wait runs out.
+        Never,
+    }
+
+    /// A bus that answers from a script and a clock that moves only as far as
+    /// the scan asks it to wait — the two are one object because the waiting is
+    /// exactly what consumes the window (see [`AdminBus`]).
+    struct ScriptedBus {
+        start: Instant,
+        /// How much of the window the receives so far have spent.
+        waited: Duration,
+        /// Every wait the scan asked for, in order.
+        waits: Vec<Duration>,
+        /// Every frame the scan sent.
+        sent: Vec<CanFrame>,
+        script: std::collections::VecDeque<Reply>,
+    }
+
+    impl ScriptedBus {
+        fn new(script: Vec<Reply>) -> Self {
+            Self {
+                start: Instant::now(),
+                waited: Duration::ZERO,
+                waits: Vec::new(),
+                sent: Vec::new(),
+                script: script.into(),
+            }
+        }
+    }
+
+    impl AdminBus for ScriptedBus {
+        fn now(&self) -> Instant {
+            self.start + self.waited
+        }
+
+        fn send(&mut self, frame: &CanFrame) -> Result<(), InterfaceError> {
+            self.sent.push(*frame);
+            Ok(())
+        }
+
+        fn receive(&mut self, wait: Duration) -> Result<Option<CanFrame>, InterfaceError> {
+            self.waits.push(wait);
+            match self
+                .script
+                .pop_front()
+                .expect("the test scripted every receive")
+            {
+                Reply::After(delay, frame) => {
+                    self.waited += delay;
+                    Ok(Some(frame))
+                }
+                Reply::Never => {
+                    self.waited += wait;
+                    Ok(None)
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_the_query_window_is_a_deadline_from_the_broadcast() {
+        // Two boards answer 300 ms and 400 ms in, the first twice; then the bus
+        // goes quiet. The scan asks for what is left of the two second window
+        // each time — 2.000, 1.700, 1.600, 1.500 — and stops when the last of it
+        // runs out, without waiting two real seconds or opening a socket.
+        let uuid = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
+        let mut bus = ScriptedBus::new(vec![
+            Reply::After(
+                Duration::from_millis(300),
+                answer(uuid, Some(CMD_SET_NODEID)),
+            ),
+            Reply::After(
+                Duration::from_millis(100),
+                answer(uuid, Some(CMD_SET_NODEID)),
+            ),
+            Reply::After(
+                Duration::from_millis(100),
+                answer([0xaa; 6], Some(CMD_SET_CANBOOT_NODEID)),
+            ),
+            Reply::Never,
+        ]);
+        let mut reported = Vec::new();
+        let scan = query_unassigned(&mut bus, Duration::from_secs(2), |node| reported.push(node))
+            .expect("the scripted bus does not fail");
+
+        // The broadcast goes out first, and the window is measured from it.
+        assert_eq!(bus.sent, [query_unassigned_frame()]);
+        assert_eq!(
+            bus.waits,
+            [
+                Duration::from_secs(2),
+                Duration::from_millis(1700),
+                Duration::from_millis(1600),
+                Duration::from_millis(1500),
+            ]
+        );
+
+        // The repeated answer is reported once, and both boards are in the scan.
+        assert_eq!(scan.total(), 2);
+        assert_eq!(reported, scan.nodes());
+        assert_eq!(
+            reported
+                .iter()
+                .map(|node| node.uuid_hex())
+                .collect::<Vec<_>>(),
+            ["112233445566", "aaaaaaaaaaaa"]
+        );
+    }
+
+    #[test]
+    fn test_a_frame_at_the_deadline_ends_the_window_without_another_read() {
+        // A board that answers as the window closes is still reported, and the
+        // scan then stops without asking for a read that would run past the
+        // deadline: the window is measured from the query, not from the last
+        // answer.
+        let mut bus = ScriptedBus::new(vec![Reply::After(
+            Duration::from_secs(2),
+            answer([0x11; 6], Some(CMD_SET_NODEID)),
+        )]);
+        let mut reported = Vec::new();
+        let scan = query_unassigned(&mut bus, Duration::from_secs(2), |node| reported.push(node))
+            .expect("the scripted bus does not fail");
+
+        assert_eq!(
+            bus.waits,
+            [Duration::from_secs(2)],
+            "the one read, and no more"
+        );
+        assert_eq!(scan.total(), 1);
+        assert_eq!(reported, scan.nodes());
+    }
+
+    #[test]
+    fn test_a_bus_that_fails_ends_the_scan() {
+        // A read error is the bus failing, not the window closing: it is handed
+        // back rather than reported as "no boards found".
+        struct FailingBus;
+
+        impl AdminBus for FailingBus {
+            fn now(&self) -> Instant {
+                Instant::now()
+            }
+
+            fn send(&mut self, _frame: &CanFrame) -> Result<(), InterfaceError> {
+                Ok(())
+            }
+
+            fn receive(&mut self, _wait: Duration) -> Result<Option<CanFrame>, InterfaceError> {
+                Err(InterfaceError::ConnectionLost)
+            }
+        }
+
+        let err = query_unassigned(&mut FailingBus, Duration::from_secs(2), |_| {})
+            .expect_err("the read failed");
+        assert_eq!(err, InterfaceError::ConnectionLost);
     }
 }

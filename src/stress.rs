@@ -3319,6 +3319,10 @@ mod tests {
     /// `round(DISTANCE_MM / step_dist)`, and [`move_one_axis`] fails the case
     /// when it does not.
     ///
+    /// **Premise**: the config is assumed correct; this case checks this
+    /// repository's motion path, not your config — a mismatch of config, wiring or
+    /// firmware is not a bug here.
+    ///
     /// # What it does to the machine
     /// It drives **`[stepper_x]` only** (`step_pin`/`dir_pin`) through one move of
     /// `DISTANCE_MM` = 5 mm at `SPEED_MM_S` = 10 mm/s — both inside the 10 mm /
@@ -3368,6 +3372,10 @@ mod tests {
     /// limit. [`step_soak`] fails the case on a shutdown reason or on a step count
     /// that does not match what was queued (the “无丢步” half), and the case prints
     /// the rate the firmware actually held.
+    ///
+    /// **Premise**: the config is assumed correct; this case checks this
+    /// repository's step path, not your config — a mismatch of config, wiring or
+    /// firmware is not a bug here.
     ///
     /// # What it does to the machine
     /// It drives **`[stepper_x]` only**, in one direction (it never reverses).

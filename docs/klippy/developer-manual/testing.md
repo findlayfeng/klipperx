@@ -73,6 +73,23 @@ cargo test --workspace -- --test-threads=1 2>&1 | scripts/test-timings.py
 同款行为（`klippy.py:364`），不要为提速去删它；要跳过时间就照 `klippy.rs` 的三条测试那样用
 `start_paused` + 断言虚拟时钟位移。
 
+### 已知的「有界等待」基线（超过这里就该当新问题查）
+
+下列等待都是**产品侧刻意的上界**，不是测试兜底；它们是串行闸门 100 多秒的主要来源，且**不能用假
+时钟跳掉**（下一条会真死锁）：
+
+| 位置 | 时长 | 来源 |
+|---|---|---|
+| `klippy.rs:192` 的 `RESTART_DELAY` | 1s / 每次重启 | 上游同款（`klippy.py:364`）；三条 restart 测试已改用 `start_paused` 跳过（<0.01s） |
+| `mcu/mod.rs:85` 的 `SYNC_SEND_WAIT` | 1s | 同步 `Mcu::send` 等队列空位的**预算上界**（`mod.rs:597` 的 deadline + `:604` 的 50µs→10ms 退避）；两条全队列测试的 1s 就在这 |
+| `mcu/object.rs:87` 的 `RESET_SETTLE` | 500ms | 复位后重新打开端口前的 settle（`object.rs:956`）；上游对应步骤是 0.100s（`serialhdl.py:357/375-388`），本仓取 5×，待评 |
+| `mcu/object.rs:56` 的 `RECONNECT_DELAY` | 250ms | 重连前等待（`object.rs:543`） |
+| 发送任务的 1ms 合批定时器 | ~1ms × 多次 | `mcu/mod.rs:1866` |
+
+实测手段（`waits-mcu` 单元用过、可照做）：`strace -f -tt -e trace=clock_nanosleep,epoll_wait <单测>`
+能把一段 wall time 逐笔拆到「哪个常量、睡了几次」；`SYNC_SEND_WAIT` 那两例就是 200 次 ≥1ms 的
+`clock_nanosleep`，恰在 1.00s deadline 上结束。
+
 ## 真机测试
 
 少数用例需要真实硬件。它们由**用户提供的 printer 配置**驱动：唯一输入是环境变量

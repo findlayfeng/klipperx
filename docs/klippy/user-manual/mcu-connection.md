@@ -30,6 +30,8 @@ CAN 这条走的是 klipper 的 **can serial** 链路（就像把串口协议搬
 
 节点号到仲裁 ID 的映射也沿用 Klipper：`0x100 + 2 × nodeid`，主机写这个 ID、MCU 用下一个回；节点号由主机通过 admin ID `0x3f0` 的 `CMD_SET_NODEID` 报文指派，所以配置里 `canbus_uuid` 是必需的（节点号本身可由 `[canbus_ids]` 分配，不必写）。
 
+节点号在本仓是 **MCU 层 id**：每个 `[mcu]`（不论接口）在装载期都被分配一个唯一 id（所有接口共用同一个序列，`mcu/ids.rs`），`connect` 打开传输层之前必须持有它——CAN 用它做节点寻址，其它接口的 id 目前只是分配好、暂未使用（没有具体的分配流程，也不参与任何通讯）。显式 `canbus_nodeid` 就是这个 id 的显式覆盖。
+
 ## 固件重启方式（`restart_method`）
 
 系统重启时，主机需要决定怎么把 MCU 的**固件**复位。`restart_method` 就是这件事，写在 `[mcu]` 节里。它**只对串口 MCU 有意义**：CAN 与 `host_library` 一律按 `command` 处理，配置里写了也会被忽略（并在日志里告警）。

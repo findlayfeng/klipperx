@@ -390,9 +390,9 @@ mod tests {
         assert_eq!(
             ids,
             [
-                // Before `[mcu]`: it is created on demand by the first CAN
-                // `[mcu]`, and a present `[canbus_ids]` has to load ahead of the
-                // sections that register with it (`extras/canbus_ids.rs`).
+                // Before `[mcu]`: it is created on demand by the first MCU, and a
+                // present `[canbus_ids]` has to load ahead of the sections that
+                // register with it (`mcu/ids.rs`).
                 "canbus_ids",
                 "mcu",
                 "stepper_enable",
@@ -548,8 +548,8 @@ mod tests {
                 .unwrap_or_else(|| panic!("no section '{id}'"))
         };
         assert_eq!(by_id("mcu").phase, Phase::Early);
-        // The CAN node-id allocator: a present `[canbus_ids]` must load before
-        // the `[mcu]` sections that register with it.
+        // The MCU-id allocator: a present `[canbus_ids]` must load before the
+        // `[mcu]` sections that register with it (`mcu/ids.rs`).
         assert_eq!(by_id("canbus_ids").phase, Phase::Early);
         // A virtual pin *provider* whose consumers are regular sections: like
         // `adc_scaled` it must load before the generic walk, see the module docs.
@@ -700,12 +700,20 @@ mod tests {
 
         result.unwrap();
         // `configfile` is registered after `gcode`, `pins` after it (upstream
-        // loads `pins` and `mcu` up front), then `error_mcu` — which the first
-        // `[mcu]` section brings with it (`klippy/mcu.py:1159`) — and the
-        // section's own object.
+        // loads `pins` and `mcu` up front), then `canbus_ids` — the id allocator
+        // the first `[mcu]` registers with (`mcu/ids.rs`) — then `error_mcu`,
+        // which the first `[mcu]` section also brings (`klippy/mcu.py:1159`),
+        // and the section's own object.
         assert_eq!(
             printer.objects(),
-            ["gcode", "configfile", "pins", "error_mcu", "mcu"]
+            [
+                "gcode",
+                "configfile",
+                "pins",
+                "canbus_ids",
+                "error_mcu",
+                "mcu"
+            ]
         );
     }
 
@@ -726,6 +734,7 @@ mod tests {
                 "gcode",
                 "configfile",
                 "pins",
+                "canbus_ids",
                 "error_mcu",
                 "mcu",
                 "mcu zboard",
@@ -743,7 +752,14 @@ mod tests {
         printer.load_config(&config).unwrap();
         assert_eq!(
             printer.objects(),
-            ["gcode", "configfile", "pins", "error_mcu", "mcu"]
+            [
+                "gcode",
+                "configfile",
+                "pins",
+                "canbus_ids",
+                "error_mcu",
+                "mcu"
+            ]
         );
 
         printer.reset_for_restart("restart");
@@ -751,7 +767,14 @@ mod tests {
 
         assert_eq!(
             printer.objects(),
-            ["gcode", "configfile", "pins", "error_mcu", "mcu"]
+            [
+                "gcode",
+                "configfile",
+                "pins",
+                "canbus_ids",
+                "error_mcu",
+                "mcu"
+            ]
         );
     }
 
@@ -775,6 +798,7 @@ mod tests {
                 "gcode",
                 "configfile",
                 "pins",
+                "canbus_ids",
                 "error_mcu",
                 "mcu",
                 "stepper_enable",
@@ -900,6 +924,7 @@ mod tests {
                 "gcode",
                 "configfile",
                 "pins",
+                "canbus_ids",
                 "error_mcu",
                 "mcu",
                 "mcu zboard",
@@ -966,7 +991,14 @@ mod tests {
         result.unwrap();
         assert_eq!(
             printer.objects(),
-            ["gcode", "configfile", "pins", "error_mcu", "mcu"]
+            [
+                "gcode",
+                "configfile",
+                "pins",
+                "canbus_ids",
+                "error_mcu",
+                "mcu"
+            ]
         );
     }
 
@@ -987,6 +1019,7 @@ mod tests {
                 "gcode",
                 "configfile",
                 "pins",
+                "canbus_ids",
                 "error_mcu",
                 "mcu",
                 "output_pin fan"
@@ -1011,6 +1044,7 @@ mod tests {
                 "gcode",
                 "configfile",
                 "pins",
+                "canbus_ids",
                 "error_mcu",
                 "mcu",
                 "board_pins",
@@ -1036,6 +1070,7 @@ mod tests {
                 "gcode",
                 "configfile",
                 "pins",
+                "canbus_ids",
                 "error_mcu",
                 "mcu",
                 "i2c_device accel"
@@ -1060,6 +1095,7 @@ mod tests {
                 "gcode",
                 "configfile",
                 "pins",
+                "canbus_ids",
                 "error_mcu",
                 "mcu",
                 "spi_device flash"

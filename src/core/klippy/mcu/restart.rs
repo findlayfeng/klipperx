@@ -401,6 +401,7 @@ mod tests {
             transport: Transport::Host {
                 library: String::new(),
             },
+            id: None,
             usb_power: usb::UsbPowerMethod::default(),
         }
     }
@@ -415,6 +416,7 @@ mod tests {
                 path: "/dev/not-a-serial-port".to_string(),
                 baud: 250_000,
             },
+            id: None,
             usb_power: usb::UsbPowerMethod::default(),
         }
     }
@@ -428,6 +430,7 @@ mod tests {
                 path: path.to_string(),
                 baud: 250_000,
             },
+            id: None,
             usb_power: usb::UsbPowerMethod::default(),
         }
     }

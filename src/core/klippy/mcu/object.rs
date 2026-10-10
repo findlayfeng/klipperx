@@ -31,6 +31,7 @@ use std::time::Duration;
 use serde_json::{json, Map, Value};
 use tracing::{debug, info, warn};
 
+use super::ids;
 use crate::core::klippy::cmd::clock::{ClockSync, McuClock, SecondarySync};
 use crate::core::klippy::cmd::config::Reset;
 use crate::core::klippy::cmd::shutdown::EmergencyStop;
@@ -42,7 +43,6 @@ use crate::core::klippy::config::{AccessTracking, ConfigSection, ConfigWrapper};
 use crate::core::klippy::error::{ConfigError, KlippyError};
 use crate::core::klippy::event::stats::{register_stats, LastStats};
 use crate::core::klippy::event::{IsShutdown, KlippyEvent, McuEvent, Shutdown, Starting};
-use crate::core::klippy::extras::canbus_ids::{PrinterCanbusIds, CANBUS_IDS_OBJECT};
 use crate::core::klippy::mcu::{
     BuiltConfig, ConfigBuilder, Configured, Dictionary, I2cMode, Mcu, McuChip, McuError, McuI2c,
     McuRestartMethod, McuSpi, McuStepper, SpiMode,
@@ -129,6 +129,15 @@ pub struct McuObject {
     /// What `objects/query` reports; `{}` until the handshake fills it, which is
     /// what upstream's `_get_status_info` starts as.
     status: Mutex<Value>,
+    /// The id this `[mcu]` was assigned at load, unique across every MCU
+    /// whatever its transport (`mcu/ids.rs`).
+    ///
+    /// `Some` after the loader registered the section; `connect` refuses to
+    /// open a transport without it (a CAN MCU cannot be addressed until it has
+    /// its node id, and every other transport will need its own later). `None`
+    /// only for an object built outside the loader, which is never the one a
+    /// working machine connects.
+    id: Mutex<Option<u32>>,
     /// The restart method of the connection currently up.
     ///
     /// [`McuObject::before_firmware_restart`] runs on the live connection and has
@@ -202,6 +211,7 @@ impl McuObject {
             section,
             chip,
             status: Mutex::new(json!({})),
+            id: Mutex::new(None),
             restart_method: Mutex::new(McuRestartMethod::Command),
             is_shutdown: Arc::new(AtomicBool::new(false)),
             connect_shutdown: Arc::new(Mutex::new(None)),
@@ -216,6 +226,19 @@ impl McuObject {
     /// The MCU's own name, as upstream's `MCU.get_name` reports it.
     pub fn name(&self) -> &str {
         self.chip.name()
+    }
+
+    /// The id the loader assigned this MCU, if it was registered.
+    ///
+    /// `None` for an object built outside the loader (tests); a working machine
+    /// only ever connects a registered object, which always holds one.
+    pub fn id(&self) -> Option<u32> {
+        *self.id.lock().unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    /// Record the id the loader assigned this `[mcu]` (`mcu/ids.rs`).
+    pub fn set_id(&self, id: u32) {
+        *self.id.lock().unwrap_or_else(|poison| poison.into_inner()) = Some(id);
     }
 
     /// Whether this firmware is stopped (or the host has marked it so).
@@ -1094,28 +1117,19 @@ impl PrinterObject for McuObject {
                 .unwrap_or_else(AccessTracking::shared);
             let wrapper = ConfigWrapper::new(&self.section, access);
             let mut config = McuConfig::new(&wrapper).map_err(KlippyError::Config)?;
-            // A CAN MCU whose section named no `canbus_nodeid` takes the id the
-            // allocator assigned it when that section was registered while the
-            // config loaded (upstream's `get_nodeid` at attach,
-            // `klippy/mcu.py:860-861`). The link is opened below, so the id has
-            // to be known here.
-            if let Transport::Can { uuid, nodeid, .. } = &mut config.transport {
-                if nodeid.is_none() {
-                    let name = config.name.clone();
-                    let ids = self
-                        .printer
-                        .upgrade()
-                        .and_then(|printer| {
-                            printer.lookup_object_as::<PrinterCanbusIds>(CANBUS_IDS_OBJECT)
-                        })
-                        .ok_or_else(|| {
-                            KlippyError::Config(ConfigError::new(format!(
-                                "MCU '{name}' is on a CAN bus but no node-id allocator is loaded"
-                            )))
-                        })?;
-                    *nodeid = Some(ids.get_nodeid(*uuid).map_err(KlippyError::Config)?);
-                }
-            }
+            // An MCU must hold the id it was assigned at load before its
+            // transport can be opened — a CAN MCU cannot be addressed without
+            // its node id, and every transport's id is what this layer guards
+            // (`mcu/ids.rs`). Parsing only re-derives an explicit
+            // `canbus_nodeid`, so the definitive id is the one the object
+            // registered with; a missing one is a precondition failure of the
+            // bring-up, not an option to paper over.
+            config.id = Some(self.id().ok_or_else(|| {
+                KlippyError::Connection(format!(
+                    "MCU '{}' has no id assigned; cannot open its transport",
+                    config.name
+                ))
+            })?);
             info!(
                 "MCU '{}' restart method: {}",
                 config.name,
@@ -1471,19 +1485,20 @@ pub fn load_config(
     // connects, and an MCU reads its section at connect time. The parse is pure;
     // the device is still only opened by `connect`.
     let parsed = McuConfig::new(config)?;
-    // A CAN MCU registers its uuid with the node-id allocator here, while the
-    // config is loaded, so every `[mcu]`'s uuid is known before any of them
-    // connects (upstream registers in `MCU.__init__`, `klippy/mcu.py:784`). The
-    // order these calls happen in is the order `[mcu]` sections are declared,
-    // which is the order ids are handed out in. A written `canbus_nodeid` is
-    // the explicit id the allocator records for this uuid.
-    if let Transport::Can { uuid, nodeid, .. } = &parsed.transport {
-        crate::core::klippy::extras::canbus_ids::ensure(printer)?.add_uuid(
-            &parsed.name,
-            *uuid,
-            *nodeid,
-        )?;
-    }
+    // Every `[mcu]` registers with the shared id allocator here, while the
+    // config is loaded, so the whole sequence is known before any of them
+    // connects (upstream registers a CAN MCU's uuid in `MCU.__init__`,
+    // `klippy/mcu.py:784`; the id is generalized to every transport in
+    // `mcu/ids.rs`). The order these calls happen in is the order `[mcu]`
+    // sections are declared, which is the order ids are handed out in. A CAN
+    // MCU brings its uuid and any explicit `canbus_nodeid`; another transport
+    // takes the next id from the same sequence, with no concrete allocation of
+    // its own yet.
+    let allocator = ids::ensure(printer)?;
+    let id = match &parsed.transport {
+        Transport::Can { uuid, .. } => allocator.register_can(&parsed.name, *uuid, parsed.id)?,
+        _ => allocator.register(&parsed.name)?,
+    };
     // The first `[mcu]` section brings the `error_mcu` module with it, as
     // upstream's `MCU.__init__` does (`klippy/mcu.py:1159`); the rest find it
     // already there. It has to exist before any MCU can fail.
@@ -1492,6 +1507,9 @@ pub fn load_config(
         McuObject::new(config.section().clone(), printer)
             .map_err(|err| ConfigError::new(err.to_string()))?,
     );
+    // The id assigned at load is the one the machine connects with; `connect`
+    // refuses to open a transport without it.
+    object.set_id(id);
     // A host shutdown stops the firmware too (upstream registers the same
     // handler in `MCU.__init__`, `klippy/mcu.py:800`). Registered here
     // rather than in `connect` because the handler is `'static` and needs a
@@ -1821,6 +1839,11 @@ mod tests {
             crate::core::klippy::config::ConfigValue::Single("/dev/not-a-serial-port".to_string()),
         );
         let object = McuObject::new(section, &printer()).unwrap();
+        // The loader assigns every `[mcu]` an id before it can be opened; the
+        // test builds the object by hand, so the id is set to let the connect
+        // get past the precondition and fail where this test wants it to — at
+        // the unusable port.
+        object.set_id(4);
 
         let err = object.connect().await.unwrap_err();
 

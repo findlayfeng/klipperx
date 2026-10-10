@@ -1046,6 +1046,7 @@ mod tests {
                 "gcode",
                 "configfile",
                 "pins",
+                "canbus_ids",
                 "error_mcu",
                 "mcu",
                 "display_status",

@@ -433,7 +433,7 @@ git config core.hooksPath .githooks
 | `access.rs` | 读取账本：按名（大小写不敏感）登记、按节分组、每节只列一次 |
 | `section.rs` | 节存储：按 id+sub 区分同名选项、替换不重复、保持插入序、按 id 过滤遍历；`get_list` 去空白丢空项并拼多行值、缺项报错、`get_list_of_lists` 解析 `名:值` 对与条数不对的报错；`get`/`get_str`/`get_text`/`has` 按小写键查询（存储侧已是小写）、节名不折叠 |
 | `source.rs` | 配置来源的 `Display` |
-| `mcu.rs` | `[mcu]` 解析：名字与 `restart_method` 拼写、串口默认 `arduino` / 非串口默认 `command` 且忽略该选项、未知 `restart_method` 报错、`usb_power` 默认 `auto` 并校验、传输键二选一（`serial` / `canbus_*` / `host_library` / `test`）、`canbus_uuid` 按上游格式解析、**`canbus_nodeid` 可选**（不写则由分配器发；写了就校验范围）、无 uuid 时的报错、波特率在开 port 前拒绝 |
+| `mcu.rs` | `[mcu]` 解析：名字与 `restart_method` 拼写、串口默认 `arduino` / 非串口默认 `command` 且忽略该选项、未知 `restart_method` 报错、`usb_power` 默认 `auto` 并校验、传输键二选一（`serial` / `canbus_*` / `host_library` / `test`）、`canbus_uuid` 按上游格式解析、**`canbus_nodeid` 可选且是解析层唯一已知的 id**（不写则 `McuConfig.id` 为 `None` 交给分配器、`open` 报 `node id has not been assigned`；写了就校验范围并作为 `id`）、无 uuid 时的报错、波特率在开 port 前拒绝 |
 | `validate.rs` | `check_unused`：没人认领/读过的节与没人读过的选项各自报上游文案；只读节合法；名字大小写不敏感 |
 
 ### `motion`
@@ -631,7 +631,7 @@ git config core.hooksPath .githooks
 | `temperature_mcu.rs` | 单点直线、两点标定、手动标定读上游选项（`temperature_sensor` 节上的标定点） |
 | `temperature_combined.rs` | 三种合并方式（`min`/`max`/`mean`）与舍入 |
 | `bus_debug.rs` | `DATA=` 十六进制往返（`test_hex_round_trips`） |
-| `canbus_ids.rs` | 分配器（12 测）：按登记顺序从 4 起发号、显式 nodeid 原样生效且计入序号、**自增号与显式号撞车报错**（含两个显式号相撞）、重复 uuid 报 `Duplicate canbus_uuid`（上游文案）、未登记 uuid 报 `Unknown canbus_uuid <uuid>`、**只有 `canbus_uuid` 没有 `canbus_nodeid` 的 `[mcu]` 现在能装载**（旧的「does not allocate one yet」已删）、由配置驱动的声明顺序发号与显式覆盖、serial 的 `[mcu]` 不占号、显式写 `[canbus_ids]` 仍只有一个分配器、配置里的撞号在装载期被拒 |
+| `mcu/ids.rs`（原 `extras/canbus_ids.rs`） | MCU 层 id 分配器（12+ 测）：**所有接口共用一个序列**——按登记顺序从 4 起发号（`count + 4`）、串口 MCU 与 CAN MCU 穿插登记各自拿下一个不重复的号、显式 `canbus_nodeid` 原样生效且计入序号、**自增号与显式号撞车报错**（含两个显式号相撞、**串口派生号撞上显式 CAN 号**）、重复 uuid 报 `Duplicate canbus_uuid`、经配置驱动的声明顺序发号与显式覆盖、serial 的 `[mcu]` 现在也登记拿号（并拉起分配器）、显式写 `[canbus_ids]` 仍只有一个分配器、配置里的撞号在装载期被拒、每个 `[mcu]` 把分到的 id 存在对象上 |
 | `error_mcu.rs` | 已知固件消息拿到它的提示、MCU shutdown 被扩成原因+提示、`is_shutdown` 说“此前已停”、无关停机仍告诉用户敲什么；连接错误拿到 firmware_restart 提示；协议错误列出需要升级的 MCU（6 例，无配置节、由第一个 `[mcu]` 拉起） |
 
 ### `interface`

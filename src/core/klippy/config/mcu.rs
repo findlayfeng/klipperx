@@ -25,6 +25,16 @@ pub struct McuConfig {
     pub restart_method: McuRestartMethod,
     /// What to open, described but not opened.
     pub transport: Transport,
+    /// The id this MCU was assigned, unique across every `[mcu]` whatever its
+    /// transport (the mcu-layer allocator, `mcu/ids.rs`).
+    ///
+    /// For a CAN MCU it is the node id the link is addressed with
+    /// (`0x100 + 2 * id`); for other transports nothing consumes it yet. An MCU
+    /// must hold one before its transport can be opened — parsing only knows an
+    /// explicit `canbus_nodeid`, the rest is the allocator's, so this starts
+    /// `None` and [`McuObject::connect`](crate::core::klippy::mcu::object::McuObject::connect)
+    /// fills it from the id the object registered with at load.
+    pub id: Option<u32>,
     /// Which mechanism `rpi_usb` uses to switch the port's power.
     ///
     /// Only meaningful with `restart_method: rpi_usb`; see
@@ -46,18 +56,13 @@ pub struct McuConfig {
 pub enum Transport {
     /// A tty at a line speed.
     Serial { path: String, baud: u32 },
-    /// A Klipper can-serial link (a CAN interface, a uuid, and the node id).
+    /// A Klipper can-serial link (a CAN interface and a uuid).
     ///
-    /// `nodeid` is the `canbus_nodeid` written on the section, when there is
-    /// one: it is klipperx's explicit override of the id
-    /// [`canbus_ids`](crate::core::klippy::extras::canbus_ids) would otherwise
-    /// assign. `None` means no id was named, and the allocator's assignment is
-    /// filled in before the link is opened (see [`McuConfig::open`]).
-    Can {
-        interface: String,
-        uuid: [u8; 6],
-        nodeid: Option<u32>,
-    },
+    /// The id that addresses the node is **not** part of the transport: it is
+    /// the MCU's id at the `[mcu]` level (`McuConfig::id`), allocated to every
+    /// MCU regardless of transport (`mcu/ids.rs`); the CAN arm here just
+    /// consumes it when the link is opened.
+    Can { interface: String, uuid: [u8; 6] },
     /// Klipper's host library, loaded from a shared object.
     Host { library: String },
     /// A dictionary-driven fake MCU, in test builds (`test: dict=<path>`).
@@ -147,6 +152,27 @@ impl McuConfig {
             .clone()
             .unwrap_or_else(|| section.section().id.clone());
         let transport = Self::transport_for(section)?;
+        // A CAN MCU's id is the node id it is addressed with. It is normally the
+        // allocator's to hand out at load (`mcu/ids.rs`); the only value parsing
+        // knows here is an explicit `canbus_nodeid`, read and validated now and
+        // handed to the allocator when the MCU registers (`mcu/object.rs`).
+        // Every other transport has no id yet — `register` assigns one at load.
+        let id = match &transport {
+            Transport::Can { .. } => match section.get_str("canbus_nodeid") {
+                Some(text) => match text.parse::<u32>() {
+                    Ok(id) if (1..=MAX_CANBUS_NODEID).contains(&id) => Some(id),
+                    _ => {
+                        return Err(ConfigError::new(format!(
+                            "MCU '{}' has an invalid canbus_nodeid: '{text}' \
+                             (expected 1..={MAX_CANBUS_NODEID})",
+                            section.identifier()
+                        )))
+                    }
+                },
+                None => None,
+            },
+            _ => None,
+        };
         let serial = matches!(transport, Transport::Serial { .. });
 
         // The option only means something on a serial port. Say so rather than
@@ -164,6 +190,7 @@ impl McuConfig {
             name,
             restart_method,
             transport,
+            id,
             usb_power,
         })
     }
@@ -208,7 +235,7 @@ impl McuConfig {
         // (`klippy/mcu.py:703-705`). Every other method wants the line left as
         // the driver opened it.
         let rts = self.restart_method != McuRestartMethod::Cheetah;
-        self.transport.open(rts)
+        self.transport.open(self.id, rts)
     }
 
     /// Resolve `restart_method` for an MCU whose transport is (or is not) serial.
@@ -275,29 +302,11 @@ impl McuConfig {
             let interface = section
                 .get_str("canbus_interface")
                 .unwrap_or_else(|| "can0".to_string());
-            // The node id is normally the `[canbus_ids]` allocator's to assign
-            // (`klippy/mcu.py:784`); `canbus_nodeid` is klipperx's explicit
-            // override of it, read here and handed to the allocator when the
-            // MCU is registered (see `mcu/object.rs`). Without the option the id
-            // is filled in from the allocator before the link is opened.
-            let nodeid = match section.get_str("canbus_nodeid") {
-                Some(text) => match text.parse::<u32>() {
-                    Ok(nodeid) if (1..=MAX_CANBUS_NODEID).contains(&nodeid) => Some(nodeid),
-                    _ => {
-                        return Err(ConfigError::new(format!(
-                            "MCU '{}' has an invalid canbus_nodeid: '{text}' \
-                             (expected 1..={MAX_CANBUS_NODEID})",
-                            section.identifier()
-                        )))
-                    }
-                },
-                None => None,
-            };
-            return Ok(Transport::Can {
-                interface,
-                uuid,
-                nodeid,
-            });
+            // The node id is not read here: it is the MCU's id at the
+            // `[mcu]` level (see `McuConfig::id`), where parsing keeps only an
+            // explicit `canbus_nodeid` and the allocator the rest
+            // (`mcu/object.rs`, `mcu/ids.rs`).
+            return Ok(Transport::Can { interface, uuid });
         }
 
         if section.has("canbus_nodeid") || section.has("canbus_interface") {
@@ -355,12 +364,14 @@ impl Transport {
     /// library — and the errors that name them live. Parsing, and every config
     /// check, happened in [`McuConfig::new`].
     ///
+    /// `id` is the id the MCU was assigned at load (`mcu/ids.rs`); the CAN arm
+    /// needs it to address the node, the other transports ignore it for now.
     /// `rts` is the state a serial port is left in after opening; only the
     /// [`Transport::Serial`] arm looks at it. The other transports ignore it.
     ///
     /// # Errors
     /// Returns a message prefixed with the transport that failed.
-    pub fn open(&self, rts: bool) -> Result<Interface, String> {
+    pub fn open(&self, id: Option<u32>, rts: bool) -> Result<Interface, String> {
         match self {
             Transport::Serial { path, baud } => {
                 let device = SerialDevice::open(path, *baud).map_err(|e| format!("serial: {e}"))?;
@@ -369,17 +380,13 @@ impl Transport {
                 }
                 Ok(Interface::from_serial(device))
             }
-            Transport::Can {
-                interface,
-                uuid,
-                nodeid,
-            } => {
-                // A link cannot be opened until the node id is known: the
-                // allocator fills it in at connect time (see `mcu/object.rs`)
-                // and only an explicit `canbus_nodeid` is set this early.
-                let nodeid = nodeid
-                    .ok_or_else(|| "canbus: the node id has not been assigned".to_string())?;
-                Interface::canserial(interface, *uuid, nodeid).map_err(|e| format!("canbus: {e}"))
+            Transport::Can { interface, uuid } => {
+                // A link cannot be opened until the id is known: the allocator
+                // fills it in at connect time (see `mcu/object.rs`), and only an
+                // explicit `canbus_nodeid` is set this early.
+                let id =
+                    id.ok_or_else(|| "canbus: the node id has not been assigned".to_string())?;
+                Interface::canserial(interface, *uuid, id).map_err(|e| format!("canbus: {e}"))
             }
             Transport::Host { library } => {
                 Interface::host(library).map_err(|e| format!("host_library: {e}"))
@@ -672,29 +679,22 @@ mod tests {
     #[test]
     fn test_canbus_nodeid_is_optional_and_left_for_the_allocator() {
         let mut section = section_with("canbus_uuid", "11aa22bb33cc");
-        // No `canbus_nodeid`: the transport carries no id, for the allocator to
-        // fill in before the link is opened.
+        // No `canbus_nodeid`: parsing knows no id; the allocator fills one in at
+        // load (`mcu/ids.rs`), and `connect` puts it on the config before the
+        // link is opened.
         let config = McuConfig::new(&wrap(&section)).unwrap();
-        assert!(matches!(
-            config.transport,
-            Transport::Can { nodeid: None, .. }
-        ));
+        assert!(matches!(config.id, None));
+        assert!(matches!(config.transport, Transport::Can { .. }));
         let err = config.open().unwrap_err();
         assert!(err.contains("node id has not been assigned"), "{err}");
 
-        // Written explicitly, the option is carried on the transport.
+        // Written explicitly, the option is the id parsing carries.
         section.parameters.insert(
             "canbus_nodeid".to_string(),
             ConfigValue::Single("7".to_string()),
         );
         let config = McuConfig::new(&wrap(&section)).unwrap();
-        assert!(matches!(
-            config.transport,
-            Transport::Can {
-                nodeid: Some(7),
-                ..
-            }
-        ));
+        assert_eq!(config.id, Some(7));
     }
 
     #[test]

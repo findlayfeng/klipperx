@@ -117,8 +117,10 @@ impl McuConfig {
     /// ```
     ///
     /// A CAN-connected MCU names its uuid and the CAN interface it is on
-    /// (Klipper's default is `can0`). The node id comes from the `[canbus_ids]`
-    /// allocator unless the section overrides it explicitly:
+    /// (Klipper's default is `can0`). The node id is the MCU's layer-wide id
+    /// from the `[mcu_ids]` allocator (`mcu/ids.rs`; the historical
+    /// `[canbus_ids]` spelling still loads) unless the section overrides it
+    /// explicitly:
     ///
     /// ```ini
     /// [mcu]

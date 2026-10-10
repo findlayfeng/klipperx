@@ -96,7 +96,7 @@ OctoPrint 只走 pty，与本条取舍无关。
 |---|---|---|
 | 上游 host `Stats …` 日志行 / `gcodein` | 无 host 统计采集器 | 本条 1.1 |
 | `query_adc` / `QUERY_ADC` | 未实现（`adc_scaled` 只用 config 输入量程） | [配置手册](../user-manual/config.md)、[模块表](README.md) |
-| `canbus_nodeid` 选项 | 上游没有这个选项（CAN 节点号一律由 `canbus_ids` 按声明顺序发）；且上游的分配器只服务 CAN，节点号只存在于 `Transport` 里 | 本仓保留它作显式覆盖：写了就用、且照旧计入 `count`（＝已登记 MCU 数）；自增号与它撞车时**装载期报配置错**（点名双方），而不到固件 `can_id_conflict` 才停机。更进一步：把 **node id 提升为 MCU 层 id**（`McuConfig.id`），`[canbus_ids]` 泛化成所有接口共用一个编号序列（`mcu/ids.rs`）——CAN 用它寻址，串口/host 的 id 目前只分配未使用，`connect` 打开传输层前必须持有 | [配置手册](../user-manual/config.md)、[模块表](README.md) |
+| `canbus_nodeid` 选项 | 上游没有这个选项（CAN 节点号一律由 `canbus_ids` 按声明顺序发）；且上游的分配器只服务 CAN，节点号只存在于 `Transport` 里 | 本仓保留它作显式覆盖：写了就用、且照旧计入 `count`（＝已登记 MCU 数）；自增号与它撞车时**装载期报配置错**（点名双方），而不到固件 `can_id_conflict` 才停机。更进一步：把 **node id 提升为 MCU 层 id**（`McuConfig.id`），节名改为 `[mcu_ids]`（历史拼写 `[canbus_ids]` 兼容）、分配器（`mcu/ids.rs`）泛化成所有接口共用一个编号序列——CAN 用它寻址，串口/host 的 id 目前只分配未使用，`connect` 打开传输层前必须持有 | [配置手册](../user-manual/config.md)、[模块表](README.md) |
 | `steppers` 的资格过滤 | 未实现（本仓 homing 事件无载荷） | [配置手册](../user-manual/config.md)、[模块表](README.md) |
 | TMC 的 `stallguard_dump` 查询与 SPI 片选共享 | 四个 SPI 型（`tmc2130`/`tmc2240`/`tmc2660`/`tmc5160`）均已落地；余项＝`tmc/stallguard_dump` 端点与 `spi_set_bus` 共享（每节自建 `McuSpi`） | [配置手册](../user-manual/config.md) |
 | `TEMPLATE=` 形式的菜单/显示选项 | 未实现（菜单不渲染） | [配置手册](../user-manual/config.md) |

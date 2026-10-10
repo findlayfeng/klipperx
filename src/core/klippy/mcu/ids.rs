@@ -25,8 +25,10 @@
 //! # Lifecycle
 //!
 //! One allocator per printer, created on demand as `[mcu]` sections build
-//! ([`ensure`]). The historical section/object name `canbus_ids` is kept so a
-//! config that writes `[canbus_ids]` still loads. Each `[mcu]` registers in
+//! ([`ensure`]). The canonical section/object name is `[mcu_ids]`; the historical
+//! `[canbus_ids]` (CAN was the only transport that needed an id) is still
+//! accepted and registers the **same** object, so a config written for the old
+//! name — CAN mode included — keeps loading. Each `[mcu]` registers in
 //! `mcu/object.rs::load_config` — before any of them connects, so the whole
 //! sequence is known first — and the returned id is stored on the object;
 //! `McuObject::connect` fills it into the parsed config before the transport is
@@ -41,16 +43,26 @@ use crate::core::klippy::config::{ConfigError, ConfigWrapper};
 use crate::core::klippy::load::section;
 use crate::core::klippy::printer::{Printer, PrinterObject};
 
-// `phase = early` and an order below `[mcu]` (10) keep a present `[canbus_ids]`
-// section ahead of the `[mcu]` sections that register with it; see the module
-// docs.
-section!("canbus_ids", order = 5, phase = early, load = load_config);
+// `phase = early` and an order below `[mcu]` (10) keep a present `[mcu_ids]` /
+// `[canbus_ids]` section ahead of the `[mcu]` sections that register with it;
+// see the module docs. `[canbus_ids]` is the historical spelling: it loads the
+// same allocator but registers the object under the canonical `mcu_ids` key
+// (`object = "mcu_ids"`), so both names yield one allocator, never two.
+section!("mcu_ids", order = 5, phase = early, load = load_config);
+section!(
+    "canbus_ids",
+    order = 5,
+    phase = early,
+    load = load_config,
+    object = "mcu_ids"
+);
 
-/// The key the allocator is registered under.
+/// The key the allocator is registered under (the `[mcu_ids]` section).
 ///
-/// Upstream's section name. The object it names is the mcu-layer id allocator —
-/// the name is kept so a written `[canbus_ids]` section stays accepted.
-pub const MCU_IDS_OBJECT: &str = "canbus_ids";
+/// The historical `[canbus_ids]` section also builds this object — its factory
+/// declares `object = "mcu_ids"` — so a config that writes the old name still
+/// loads and shares the one allocator.
+pub const MCU_IDS_OBJECT: &str = "mcu_ids";
 
 /// The first id in the sequence. Upstream's `NODEID_FIRST` (`canbus_ids.py:7`):
 /// ids 1-3 are left to the host/bridge.
@@ -138,17 +150,17 @@ impl McuIds {
         if let Some(owner) = state.owners.get(&new_id) {
             return Err(ConfigError::new(match (explicit, uuid) {
                 (Some(_), _) => format!(
-                    "canbus_ids: node id {new_id} is claimed by MCU '{name}' with \
+                    "mcu_ids: id {new_id} is claimed by MCU '{name}' with \
                      canbus_nodeid but is already used by MCU '{owner}'; set a \
                      different canbus_nodeid"
                 ),
                 (None, Some(_)) => format!(
-                    "canbus_ids: node id {new_id} is derived for MCU '{name}' but MCU \
+                    "mcu_ids: id {new_id} is derived for MCU '{name}' but MCU \
                      '{owner}' claims it with canbus_nodeid; set an explicit \
                      canbus_nodeid on one of them"
                 ),
                 (None, None) => format!(
-                    "mcu ids: id {new_id} is the next id for MCU '{name}' but is \
+                    "mcu_ids: id {new_id} is the next id for MCU '{name}' but is \
                      already used by MCU '{owner}' (claimed with canbus_nodeid); set \
                      an explicit canbus_nodeid on one of them"
                 ),
@@ -179,9 +191,10 @@ impl PrinterObject for McuIds {
 /// The single allocator, created on first demand.
 ///
 /// Upstream's `printer.load_object(config, 'canbus_ids')` (`mcu.py:784`): the
-/// object exists exactly once, whether the config carries a `[canbus_ids]`
-/// section or not. Every `[mcu]` factory asks for it, so a config with no CAN
-/// MCU gets one too — the serial MCU's id comes from the same sequence.
+/// object exists exactly once, whether the config carries an explicit section
+/// (under either its `[mcu_ids]` name or the historical `[canbus_ids]`) or not.
+/// Every `[mcu]` factory asks for it, so a config with no CAN MCU gets one too —
+/// the serial MCU's id comes from the same sequence.
 ///
 /// # Errors
 /// A name that is already taken by a different object.
@@ -196,9 +209,9 @@ pub fn ensure(printer: &Arc<Printer>) -> Result<Arc<McuIds>, ConfigError> {
 
 /// The factory `section!` names (`canbus_ids.py:26 def load_config`).
 ///
-/// Returns a fresh object for the loader to register; a `[canbus_ids]` section
-/// is declared before `[mcu]`, so [`ensure`] finds this one and does not build a
-/// second.
+/// Returns a fresh object for the loader to register; a `[mcu_ids]` section — or
+/// a `[canbus_ids]` one, which registers under the same key — is declared before
+/// `[mcu]`, so [`ensure`] finds this one and does not build a second.
 pub fn load_config(
     _config: &ConfigWrapper,
     _printer: &Arc<Printer>,
@@ -250,7 +263,7 @@ mod tests {
         // count = 2 → 6, which `mcu a` claimed explicitly.
         let err = ids.register_can("mcu c", C, None).unwrap_err();
         let text = err.to_string();
-        assert!(text.contains("node id 6"), "{text}");
+        assert!(text.contains("id 6"), "{text}");
         assert!(text.contains("mcu a"), "{text}");
         assert!(text.contains("mcu c"), "{text}");
     }
@@ -262,7 +275,7 @@ mod tests {
         assert_eq!(ids.register_can("mcu a", A, Some(7)).unwrap(), 7);
         let err = ids.register_can("mcu b", B, Some(7)).unwrap_err();
         let text = err.to_string();
-        assert!(text.contains("node id 7"), "{text}");
+        assert!(text.contains("id 7"), "{text}");
         assert!(text.contains("mcu a"), "{text}");
         assert!(text.contains("mcu b"), "{text}");
     }
@@ -385,12 +398,32 @@ mod tests {
         assert_eq!(assigned_id(&printer, "mcu bed"), 6);
     }
 
-    /// A `[canbus_ids]` section is accepted, and there is still one allocator
-    /// whose ids follow the `[mcu]` order (it loads ahead of `[mcu]`).
+    /// The historical `[canbus_ids]` name still loads — CAN mode compat — and
+    /// there is still one allocator whose ids follow the `[mcu]` order, but the
+    /// object it builds is registered under the canonical `mcu_ids` key.
     #[test]
-    fn an_explicit_canbus_ids_section_yields_one_allocator() {
+    fn an_explicit_canbus_ids_section_is_accepted_and_one_allocator() {
         let (printer, result) = load(
             "[canbus_ids]\n\
+             [mcu]\ncanbus_uuid: 11aa22bb33cc\n\
+             [mcu tool]\ncanbus_uuid: 0a0b0c0d0e0f\n",
+        );
+        result.expect("the legacy allocator section loads");
+        assert!(
+            printer.lookup_object_as::<McuIds>("canbus_ids").is_none(),
+            "the legacy section registers under the canonical key, not its own"
+        );
+        assert!(printer.lookup_object_as::<McuIds>("mcu_ids").is_some());
+        assert_eq!(assigned_id(&printer, "mcu"), 4);
+        assert_eq!(assigned_id(&printer, "mcu tool"), 5);
+    }
+
+    /// The canonical `[mcu_ids]` section loads a fresh allocator, and `ensure`
+    /// from the `[mcu]` sections finds it rather than building a second.
+    #[test]
+    fn an_explicit_mcu_ids_section_yields_one_allocator() {
+        let (printer, result) = load(
+            "[mcu_ids]\n\
              [mcu]\ncanbus_uuid: 11aa22bb33cc\n\
              [mcu tool]\ncanbus_uuid: 0a0b0c0d0e0f\n",
         );
@@ -410,7 +443,7 @@ mod tests {
         );
         let err = result.expect_err("the collision is a config error");
         let text = err.to_string();
-        assert!(text.contains("node id 6"), "{text}");
+        assert!(text.contains("id 6"), "{text}");
         assert!(text.contains("gamma"), "{text}");
         assert!(text.contains("alpha"), "{text}");
     }

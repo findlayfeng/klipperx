@@ -235,13 +235,13 @@ max_accel: 3000
 | `baud` | 整数 | 否 | `250000` | 串口波特率（仅 `serial` 模式） |
 | `canbus_uuid` | 12 位十六进制 | 二选一 | — | MCU 芯片唯一 ID（12 位 hex），CAN 模式必给 |
 | `canbus_interface` | 字符串 | 否 | `can0` | CAN 网络接口名 |
-| `canbus_nodeid` | 整数 (1..895) | 否 | 由 `[canbus_ids]` 分配 | CAN 节点号（即 MCU 层 id，见下）。**不写就由分配器发**（起点 4、步长 1、按 `[mcu]` 声明顺序）；写了就用写的那个（显式值也占一个号位），与自增号撞车时**装载期报错**（上游靠固件 `can_id_conflict` 兜底，本仓提前拒）。 |
+| `canbus_nodeid` | 整数 (1..895) | 否 | 由 `[mcu_ids]` 分配 | CAN 节点号（即 MCU 层 id，见下）。**不写就由分配器发**（起点 4、步长 1、按 `[mcu]` 声明顺序）；写了就用写的那个（显式值也占一个号位），与自增号撞车时**装载期报错**（上游靠固件 `can_id_conflict` 兜底，本仓提前拒）。 |
 | `restart_method` | `command` / `arduino` / `cheetah` / `rpi_usb` | 否 | `arduino`（串口）/ `command`（非串口） | MCU 固件重启方式 |
 | `usb_power` | `auto` / `sysfs` / `libusb` | 否 | `auto` | `rpi_usb` 的切电机制 |
 
 > 详细参数说明见 [MCU 连接方式](mcu-connection.md)。
 
-### `[canbus_ids]` — MCU ID 分配器（历史上叫 CAN 节点号分配器）
+### `[mcu_ids]` — MCU ID 分配器（历史名 `[canbus_ids]` 兼容）
 
 **无参数节。** 它给每个 `[mcu]`（不论接口类型）发一个**唯一 id**：编号规则照上游
 （`NODEID_FIRST = 4`、步长 1、`new_id = count + 4`、顺序 = `[mcu]` **声明顺序**，这里的
@@ -254,7 +254,8 @@ max_accel: 3000
 不需要它时不必写——第一个 `[mcu]`（不论什么接口）会自己把它拉起来。
 
 ```ini
-[canbus_ids]          # 可写可不写；写了也只是显式声明这个分配器
+[mcu_ids]             # 可写可不写；写了也只是显式声明这个分配器
+[canbus_ids]          # 历史拼写（CAN 模式兼容）：注册的是同一个分配器，两种不要同写
 ```
 
 与上游的两处差异（详见[本项目与上游的偏移](../developer-manual/upstream-deviations.md)）：

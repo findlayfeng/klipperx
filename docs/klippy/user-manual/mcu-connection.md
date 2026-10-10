@@ -30,7 +30,23 @@ CAN 这条走的是 klipper 的 **can serial** 链路（就像把串口协议搬
 
 节点号到仲裁 ID 的映射也沿用 Klipper：`0x100 + 2 × nodeid`，主机写这个 ID、MCU 用下一个回；节点号由主机通过 admin ID `0x3f0` 的 `CMD_SET_NODEID` 报文指派，所以配置里 `canbus_uuid` 是必需的（节点号本身可由 `[mcu_ids]` 分配、不必写；历史拼写 `[canbus_ids]` 仍兼容）。
 
-节点号在本仓是 **MCU 层 id**：每个 `[mcu]`（不论接口）在装载期都被分配一个唯一 id（所有接口共用同一个序列，`mcu/ids.rs`），`connect` 打开传输层之前必须持有它——CAN 用它做节点寻址，其它接口的 id 目前只是分配好、暂未使用（没有具体的分配流程，也不参与任何通讯）。显式 `canbus_nodeid` 就是这个 id 的显式覆盖。
+节点号在本仓是 **MCU 层 id**：每个 `[mcu]`（不论接口）在装载期都被分配一个唯一 id（所有接口共用同一个序列，`mcu/ids.rs`），`connect` 打开传输层之前必须持有它——CAN 用它做节点寻址（admin 帧），串口用下节的**帧级指派**把 id 交给设备；`host_library` 与 `test:` 暂不指派。显式 `canbus_nodeid` 就是这个 id 的显式覆盖。
+
+## 帧级 id 指派（identify 之前）
+
+串口没有 CAN 那样的总线旁道，指派就在**帧格式里开一条旧固件会默认抛弃的信道**：与 admin 帧同位（端口一开、identify 之前），完全不走 msg 体系（不依赖字典、不是命令）。
+
+```text
+[len][0x20]["K" "X" "I" "D"][十进制 id][crc16 hi][crc16 lo][0x7e]
+```
+
+与常规帧唯一不同的是 **seq 字节**：`0x20` 把合法帧必须置的 `MESSAGE_DEST` 位清掉、改用 bit5；载荷与头部绝不含 `0x7e`（CRC 字节是算出来的、可能恰好是——id 81 就会，固件此时分两步丢弃，同样无害）。其余（长度范围、尾部 SYNC、CRC）都是标准帧结构，有能力的固件无需新校验就能验证。
+
+**旧固件的行为**（`command_find_block`，`third_party/klipper/src/command.c`，由 `mcu/assign.rs` 的可执行移植测试钉住）：长度检查通过 → **seq 字节检查（:287）不过 → 错误分支**：不读载荷、不查 CRC、永不 dispatch、`next_sequence` 不动；丢弃恰好吞下本帧（到帧尾 `0x7e` 为止），至多回一枚**无害空帧**（seq 是它自己的 `next_sequence`，主机读作「无进展的 ack」），此后静默（`CF_NEED_VALID` 抑制重复报错）。夹在它后面的 identify 帧照常解析、照常执行。
+
+**有能力解析的固件**按同形反向回执 `[len][0x20]["KXID"][id][crc][0x7e]`——旧固件发不出这种帧（`command_add_frame` 的 seq 恒在 `0x10..=0x1f`）。主机在 `FrameStream`（`frame.rs`）认出它而不是丢弃，接收任务把 id 记到 `Mcu::assignment_confirmed()`——这是将来「有 id 就加帧头」的寻址头会读的门控钩子。
+
+**边界**：发送是 fire-and-forget——不等回执、不增加连接延迟，发送失败只记 warn 不挡连接；`host_library` 与 `test:` 不发（后者脚本帧会拒绝未映射的发送）；CAN 保留自己的 admin 帧。**本轮帧格式对所有设备都是当前格式**：指派只多发一帧，不改任何已有帧；帧头寻址**未落地**。
 
 ## 固件重启方式（`restart_method`）
 

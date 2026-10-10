@@ -244,6 +244,12 @@ impl CanSerialLink {
     pub fn next_frame(&mut self) -> Option<Frame> {
         self.incoming.next_frame()
     }
+
+    /// Ids acknowledged by a device that answered the frame-level id
+    /// assignment, drained (`crate::core::klippy::assign`).
+    pub fn take_assignment_acks(&mut self) -> Vec<u32> {
+        self.incoming.take_assignment_acks()
+    }
 }
 
 /// The broadcast that asks every board without a node id to identify itself.
@@ -605,6 +611,10 @@ impl Device for CanSerialDevice {
 
     fn shutdown(&self) {
         self.stopped.store(true, Ordering::SeqCst);
+    }
+
+    fn take_assignment_acks(&self) -> Vec<u32> {
+        self.link.lock().unwrap().take_assignment_acks()
     }
 }
 

@@ -6,6 +6,7 @@
 // - HostDevice: real implementation running klipper's host library, loaded at
 //   runtime (see interface/host.rs)
 
+pub mod assign;
 pub mod cmd;
 pub mod config;
 pub mod error;

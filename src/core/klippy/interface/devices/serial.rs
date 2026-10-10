@@ -170,6 +170,10 @@ impl Device for SerialDevice {
     fn shutdown(&self) {
         self.stopped.store(true, Ordering::SeqCst);
     }
+
+    fn take_assignment_acks(&self) -> Vec<u32> {
+        self.stream.lock().unwrap().take_assignment_acks()
+    }
 }
 
 /// Modem-line control for a tty, for the firmware-restart sequences.
@@ -411,6 +415,42 @@ mod tests {
 
         interface.shutdown();
         assert_eq!(interface.receive().await, None);
+    }
+
+    /// The frame-level id assignment on a real tty: the request goes out byte
+    /// for byte, and an answer in the same pattern is recognized and drained
+    /// instead of riding the discard path (`crate::core::klippy::assign`).
+    #[test]
+    fn test_id_assignment_frame_on_the_wire_and_its_answer() {
+        use crate::core::klippy::assign;
+
+        let pty = Pty::new();
+        let device = Arc::new(SerialDevice::open(&pty.path, DEFAULT_BAUD).unwrap());
+
+        // Request: exactly the bytes the pattern specifies reach the wire.
+        device.send(&assign::request_frame(7)).unwrap();
+        let mut buf = [0u8; 64];
+        let read = (&pty.master).read(&mut buf).unwrap();
+        let sent = &buf[..read];
+        assert_eq!(sent, assign::request_frame(7).raw_bytes());
+        assert_eq!(assign::parse_ack(sent), Some(7), "self-consistent pattern");
+
+        // Answer: the "firmware" side replies in the pattern; a reader
+        // pumping the port records it without ever returning a frame.
+        (&pty.master)
+            .write_all(&assign::request_frame(7).raw_bytes())
+            .unwrap();
+        let reader = Arc::clone(&device);
+        let handle = std::thread::spawn(move || reader.receive());
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut got = Vec::new();
+        while got.is_empty() && std::time::Instant::now() < deadline {
+            got = device.take_assignment_acks();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        device.shutdown();
+        let _ = handle.join();
+        assert_eq!(got, vec![7], "the answer must be recognized, not discarded");
     }
 
     #[test]

@@ -475,7 +475,8 @@ NaN 也归一），与上游写出的文件逐字一致，见用户手册 [配�
 
 | 文件 | 职责 |
 |------|------|
-| `frame.rs` | `Frame` 与 `FrameStream`：Klipper 的帧格式（长度、序号、载荷、CRC、`0x7e` SYNC）与分包重组——**所有字节流设备共用**，新设备不要自己再实现一遍 |
+| `frame.rs` | `Frame` 与 `FrameStream`：Klipper 的帧格式（长度、序号、载荷、CRC、`0x7e` SYNC）与分包重组——**所有字节流设备共用**，新设备不要自己再实现一遍；另有 `Frame::with_wire_seq`/`encode_wire`（按给定 seq 字节原样出帧，仅指派模式用）与 `FrameStream` 的指派回执识别钩子（解析失败时先试 `assign::parse_ack`，认出则整帧消费入 `take_assignment_acks`，其余照旧丢到下一个 SYNC） |
+| `assign.rs` | **帧级 id 指派**（identify 之前、完全独立于 msg 体系，`interface/…/canserial` 的 admin 帧的串口对应物）：指派帧形状 `[len][0x20]["KXID"][十进制 id][crc16][0x7e]`——合法帧只差 seq 字节（`0x20`：`MESSAGE_DEST` 位清、bit5 置），载荷与头部绝不含 `0x7e`（CRC 字节可能，id 81 实例）；旧固件 `command_find_block` 在 seq 字节检查处入错误分支、丢到帧尾（不读载荷、不查 CRC、永不 dispatch、序号不动，至多一枚无害空帧后转静默）——由 `command.c` 的**可执行忠实移植**钉住（含 CRC 内嵌 0x7e 的两步丢弃仍不 dispatch、夹在 identify 前后仍完好）；`parse_ack` 认回执（同形反向，旧固件 `command_add_frame` 的 seq 恒在 `0x10..=0x1f` 故永发不出）；发送在 `Transport::open` 串口臂（fire-and-forget 不等回执），回执经 `FrameStream`→`Device`→接收任务记到 `Mcu::assignment_confirmed`；`host_library`/`test:` 不发，CAN 走自己的 admin 帧；**帧头寻址（未来）未落地** |
 | `error.rs` | 主机错误词汇：`KlippyError`（Connection/Protocol/Request/Parse/Config/Internal）与 `ConfigError`——决定错误把机器带到哪个状态 |
 | `mathutil.rs` | 运动栈共用的数值帮助（`Coord` 等，上游散在 `gcode.py`），以及 `coordinate_descent`（上游 `mathutil.py:16-49` 的近似最小二乘：步长 `1.0` 起、`>1e-5` 与万轮上限、改善 `*1.1`/不改善 `*0.9`）——H9 调平族 `z_tilt`/`bed_tilt` 平面拟合的依赖 |
 | `upstream.rs` | 上游 `.test` 语料的 harness（`#[cfg(test)]`）：语料解析、缺口报告、`IGNORED` 守卫、端到端运行，见[回归测试](regression-tests.md) |

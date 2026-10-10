@@ -91,6 +91,14 @@ pub struct Frame {
     seq: u8,
     /// Payload data between header and trailer.
     payload: Vec<u8>,
+    /// A sequence byte to put on the wire verbatim, instead of deriving
+    /// `(seq & MESSAGE_SEQ_MASK) | MESSAGE_DEST`.
+    ///
+    /// `None` for every ordinary frame. The one pattern that sets it is the
+    /// frame-level id assignment ([`crate::core::klippy::assign`]), whose
+    /// whole point is a sequence byte that fails the `MESSAGE_DEST` check — a
+    /// value [`Frame::encode`] can no more produce than old firmware can.
+    wire_seq: Option<u8>,
 }
 
 impl From<Frame> for Payload {
@@ -163,7 +171,26 @@ impl Frame {
 
     /// Create a Frame from a sequence number and payload.
     pub fn new(seq: u8, payload: Vec<u8>) -> Self {
-        Self { seq, payload }
+        Self {
+            seq,
+            payload,
+            wire_seq: None,
+        }
+    }
+
+    /// Create a Frame whose wire sequence byte is `seq_byte` verbatim.
+    ///
+    /// The one use is the frame-level id assignment pattern
+    /// ([`crate::core::klippy::assign`]): a byte outside `0x10..=0x1f`, which
+    /// neither [`Frame::encode`] nor the firmware's own `command_add_frame`
+    /// can produce. Parsing such a byte from the wire never yields one of
+    /// these ([`Frame::check`] rejects it) — this is for sending.
+    pub fn with_wire_seq(seq_byte: u8, payload: Vec<u8>) -> Self {
+        Self {
+            seq: seq_byte & MESSAGE_SEQ_MASK,
+            payload,
+            wire_seq: Some(seq_byte),
+        }
     }
 
     /// Get the sequence number (lower 4 bits of the sequence byte).
@@ -178,13 +205,24 @@ impl Frame {
 
     /// Encode this frame into raw wire bytes (header + payload + trailer).
     pub fn raw_bytes(&self) -> Vec<u8> {
-        Self::encode(self.seq, &self.payload)
+        match self.wire_seq {
+            Some(seq_byte) => Self::encode_wire(seq_byte, &self.payload),
+            None => Self::encode(self.seq, &self.payload),
+        }
     }
 
     /// Encode a frame with the given sequence number and payload.
     pub fn encode(seq: u8, payload: &[u8]) -> Vec<u8> {
+        Self::encode_wire((seq & MESSAGE_SEQ_MASK) | MESSAGE_DEST, payload)
+    }
+
+    /// Encode a frame with the sequence byte exactly as given.
+    ///
+    /// The normal path always passes a byte that has `MESSAGE_DEST` set
+    /// ([`Frame::encode`]); this one takes responsibility for the value —
+    /// see [`Frame::with_wire_seq`].
+    pub fn encode_wire(seq_byte: u8, payload: &[u8]) -> Vec<u8> {
         let msglen = MESSAGE_MIN + payload.len();
-        let seq_byte = (seq & MESSAGE_SEQ_MASK) | MESSAGE_DEST;
         let mut out: Vec<u8> = vec![msglen as u8, seq_byte];
         out.extend_from_slice(payload);
 
@@ -242,6 +280,14 @@ pub struct FrameStream {
     /// Set when an error was seen and no SYNC followed it: until the next SYNC,
     /// every byte in the stream is garbage.
     needs_sync: bool,
+    /// Ids acknowledged by a device that answered the frame-level id
+    /// assignment (`crate::core::klippy::assign`).
+    ///
+    /// [`Frame::parse`] rejects the answer's sequence byte, so without this
+    /// hook the bytes would ride the normal discard path and the answer would
+    /// vanish. Recognized frames are consumed whole here — never `skip_to_sync`
+    /// — and left for [`FrameStream::take_assignment_acks`].
+    assignment_acks: Vec<u32>,
 }
 
 impl FrameStream {
@@ -283,10 +329,24 @@ impl FrameStream {
                     self.buffer.drain(..length);
                     return Some(frame);
                 }
-                // SYNC byte or CRC did not check out.
-                None => self.skip_to_sync(),
+                // The patterned answer is the one malformed frame worth
+                // reading rather than discarding (`crate::core::klippy::assign`):
+                // recognized, consumed whole, recorded. Everything else rides
+                // the normal discard path.
+                None => match crate::core::klippy::assign::parse_ack(&self.buffer[..length]) {
+                    Some(id) => {
+                        self.assignment_acks.push(id);
+                        self.buffer.drain(..length);
+                    }
+                    None => self.skip_to_sync(),
+                },
             }
         }
+    }
+
+    /// The ids acknowledged since the last call, drained.
+    pub fn take_assignment_acks(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.assignment_acks)
     }
 
     /// Discard everything up to and including the next SYNC byte.
@@ -396,6 +456,51 @@ mod tests {
         assert_eq!(frame2.payload(), b"def");
         let consumed2 = frame2.frame_length();
         assert_eq!(consumed2, f2.len());
+    }
+
+    // -----------------------------------------------------------------------
+    // Frame-level id assignment (seq byte outside MESSAGE_DEST)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_wire_seq_frames_go_out_verbatim_but_never_parse() {
+        let frame = Frame::with_wire_seq(0x20, b"payload".to_vec());
+        let bytes = frame.raw_bytes();
+        assert_eq!(bytes[MESSAGE_POS_SEQ], 0x20, "the byte goes out as given");
+        // The host's own defence still rejects it — the pattern exists to be
+        // *sent*, and its answer is caught by `assign::parse_ack`, not here.
+        assert!(Frame::check(&bytes).is_err());
+        assert!(Frame::parse(&bytes).is_none());
+        // Ordinary frames are untouched: encode still derives the DEST bit.
+        let normal = Frame::encode(3, b"payload").to_vec();
+        assert_eq!(
+            normal[MESSAGE_POS_SEQ],
+            3 | MESSAGE_DEST,
+            "encode must not leak the wire-seq path"
+        );
+    }
+
+    #[test]
+    fn test_frame_stream_recovers_an_assignment_ack_without_stalling() {
+        // The answer has the patterned seq byte; `Frame::parse` rejects it,
+        // the stream must recognize it instead of discarding.
+        let ack = crate::core::klippy::assign::request_frame(7).raw_bytes();
+        let mut stream = FrameStream::new();
+        stream.push(&ack);
+        assert_eq!(
+            stream.next_frame(),
+            None,
+            "the answer is consumed as an answer, not returned as a frame"
+        );
+        assert_eq!(stream.take_assignment_acks(), vec![7]);
+        // Drained once: nothing replays.
+        assert!(stream.take_assignment_acks().is_empty());
+
+        // The ordinary frame behind it parses untouched — no stall, no state
+        // left over from the patterned bytes.
+        stream.push(&Frame::encode(1, b"after").to_vec());
+        let frame = stream.next_frame().expect("the next frame still arrives");
+        assert_eq!(frame.payload(), b"after");
     }
 
     // -----------------------------------------------------------------------

@@ -556,7 +556,11 @@ endstop 资源（`mcu/resource/endstop.rs`，含 `minclock` 门控与 `home_wait
       `mcu/ids.rs`，并已泛化为全接口共用的 MCU 层 id 分配器）按
       `[mcu]` 声明顺序发号（`NODEID_FIRST = 4`、步长 1、`new_id = len(ids) + 4`），`[mcu]` 的
       `canbus_nodeid` 因此变为**可选**（写了就用、且占号位；与自增号撞车时**装载期报错**——
-      本仓有意偏离：上游靠固件 `can_id_conflict` 兜底）；发现侧新增 `klipperx canbus-scan
+      本仓有意偏离：上游靠固件 `can_id_conflict` 兜底）；**2026-10-11 修订**：自动号已改为
+      `4` 起**最小空位**（上界 895），并改为装载时**预扫全配置**保留全部显式 `canbus_nodeid`
+      （`reserve_explicit`）——显式号写在哪个位置都生效、发号与声明顺序无关，自动号不再撞显式
+      号，装载期只在两个显式号互撞或号段占满时报错（上面的 `new_id = len(ids) + 4` 游标已不再
+      使用）；发现侧新增 `klipperx canbus-scan
       [--interface can0] [--timeout 2]`（广播 `0x3f0/[0x00]`，收 `0x3f1` 的 `RESP_NEED_NODEID`，
       输出可粘进配置的 uuid）——**都不写回配置文件**（与上游 pinned 版一致）。
       **未做**：`canbus_stats.py`（总线错误计数/状态上报）；真总线上的行为未验证（见 testing.md）。

@@ -1851,6 +1851,26 @@ mod tests {
         assert!(err.to_string().contains("/dev/not-a-serial-port"), "{err}");
     }
 
+    /// The id gate itself: an object built outside the loader holds no id, and
+    /// `connect` refuses to open anything for it — the precondition the loader
+    /// (and every `set_id`) satisfies. Deleting the gate makes this test fail;
+    /// the port is never even opened.
+    #[tokio::test]
+    async fn test_connect_without_an_assigned_id_is_refused() {
+        let mut section = section(None);
+        section.parameters.insert(
+            "serial".to_string(),
+            crate::core::klippy::config::ConfigValue::Single("/dev/never-opened".to_string()),
+        );
+        let object = McuObject::new(section, &printer()).unwrap();
+        // Deliberately no `set_id`: the hand-built object the gate exists for.
+
+        let err = object.connect().await.unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("has no id assigned"), "{text}");
+        assert!(text.contains("cannot open its transport"), "{text}");
+    }
+
     #[test]
     fn test_the_loader_builds_an_object_from_the_section() {
         let printer = printer();

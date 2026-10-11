@@ -31,7 +31,7 @@
 //! order: length range (`:284`), **sequence byte (`:287`)**, SYNC, CRC, then
 //! the sequence number. Our frame passes the length check and bails at the
 //! sequence-byte check — *before* the payload is ever read, before the CRC is
-//! ever computed, before dispatch could run. The error path (`:306-323`)
+//! ever computed, before dispatch could run. The error path (`:311-332`)
 //! discards bytes up to and including the next `0x7e`, which is our own
 //! trailer: exactly this frame is consumed, nothing behind it. Consequences,
 //! all of them by construction:
@@ -40,7 +40,7 @@
 //! * `next_sequence` untouched → the identify exchange that follows starts
 //!   exactly where it would have;
 //! * at most **one** empty ack-shaped frame in reply (`need_sync` sends a nak
-//!   only when `CF_NEED_VALID` was clear — `:320-322`) — an empty frame stamped
+//!   only when `CF_NEED_VALID` was clear — `:327-331`) — an empty frame stamped
 //!   with the firmware's current `next_sequence`, which the receive task reads
 //!   as the protocol-consistent no-progress notice it is. Every later
 //!   assignment frame is discarded **silently** (the flag stays set until a
@@ -330,7 +330,7 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // Old-firmware behavior: a faithful port of `command_find_block`
-    // (`third_party/klipper/src/command.c:276-323`), so the compatibility
+    // (`third_party/klipper/src/command.c:276-333`), so the compatibility
     // claim above is executable. Structure and citation, not an approximation:
     // the checks run in the C order and the error path consumes through the
     // first SYNC exactly as `memchr` does.
@@ -403,7 +403,7 @@ mod tests {
         if crc != msgcrc {
             return fw_error(buf, st);
         }
-        // `:299` — a structure-valid block clears NEED_VALID.
+        // `:298` — a structure-valid block clears NEED_VALID.
         st.need_valid = false;
         // `:301-303` — sequence.
         if msgseq != st.next_sequence {
@@ -415,14 +415,14 @@ mod tests {
     }
 
     fn fw_error(buf: &[u8], st: &mut FwState) -> Outcome {
-        // `:310-313` — a leading SYNC is dropped alone, silently.
+        // `:311-316` — a leading SYNC is dropped alone, silently.
         if buf.first() == Some(&MESSAGE_SYNC) {
             return Outcome::Discarded {
                 consumed: 1,
                 nacked: false,
             };
         }
-        // `:314` then fall into need_sync (`:315`).
+        // `:317` then fall into need_sync (`:318`).
         st.need_sync = true;
         fw_need_sync(buf, st)
     }
@@ -512,8 +512,10 @@ mod tests {
         // The payload is never read on the error path — prove it by putting a
         // syntactically valid command in there with a *correct* CRC over it:
         // the sequence-byte check has already decided, so nothing downstream
-        // is reached. (If the dest check were removed, this block would
-        // dispatch — which is exactly what the pattern prevents.)
+        // is reached. (Removing the dest check would not make it dispatch
+        // either: the sequence check runs next, `next_sequence` only ever holds
+        // `0x10..=0x1f` and never `0x20`, so the block would be nakaed — both
+        // checks refuse it.)
         let mut bytes = raw(4);
         bytes[2..7].copy_from_slice(b"\x00stat"); // msgid 0 + text, CRC fixed:
         let crc = crate::crc16_ccitt!(&bytes[..bytes.len() - MESSAGE_TRAILER_SIZE]);
@@ -526,5 +528,88 @@ mod tests {
             Outcome::Discarded { .. }
         ));
         assert_eq!(st.next_sequence, MESSAGE_DEST);
+    }
+
+    #[test]
+    fn a_valid_block_rearms_the_one_nak_gate() {
+        // `sync_state &= ~CF_NEED_VALID` (`command.c:298`) is the only thing
+        // that re-arms the one-time nak: after it, the next structural error
+        // nakks again, and the one after that is silent again.
+        let mut st = FwState::default();
+        let request = raw(4);
+        assert!(matches!(
+            fw_find_block(&request, &mut st),
+            Outcome::Discarded { nacked: true, .. }
+        ));
+        // A valid identify block clears the flag on its way to dispatch.
+        assert_eq!(
+            fw_find_block(&identify_frame(MESSAGE_DEST), &mut st),
+            Outcome::Dispatch
+        );
+        // So the *next* structural error nakks once more — re-armed …
+        let request = raw(5);
+        assert!(matches!(
+            fw_find_block(&request, &mut st),
+            Outcome::Discarded { nacked: true, .. }
+        ));
+        // … and damping resumes immediately after.
+        assert!(matches!(
+            fw_find_block(&request, &mut st),
+            Outcome::Discarded { nacked: false, .. }
+        ));
+        assert_eq!(st.next_sequence, MESSAGE_DEST | 1);
+    }
+
+    #[test]
+    fn a_frame_split_across_reads_is_still_discarded_once_complete() {
+        // Real links deliver bytes in arbitrary slices: the firmware buffers
+        // (`need_more_data`, silent — `command.c:281-282`) until MESSAGE_MIN
+        // bytes are present, then runs the same checks on the accumulated
+        // buffer — our frame is discarded whole on the completing read.
+        let request = raw(4);
+        let mut st = FwState::default();
+        assert_eq!(fw_find_block(&request[..4], &mut st), Outcome::NeedMore);
+        let mut buffered = request[..4].to_vec();
+        buffered.extend_from_slice(&request[4..]);
+        assert_eq!(
+            fw_find_block(&buffered, &mut st),
+            Outcome::Discarded {
+                consumed: request.len(),
+                nacked: true
+            }
+        );
+        assert_eq!(st.next_sequence, MESSAGE_DEST);
+    }
+
+    #[test]
+    fn a_request_after_identify_is_discarded_without_disturbing_the_session() {
+        // The other half of the README's “before and after identify” claim:
+        // arriving *after* a valid block, the flag was just cleared by it, so
+        // this error nakks once (the harmless empty frame), then damps — never
+        // dispatch, and the sequence identify advanced to stays put.
+        let mut st = FwState::default();
+        assert_eq!(
+            fw_find_block(&identify_frame(MESSAGE_DEST), &mut st),
+            Outcome::Dispatch
+        );
+        assert_eq!(st.next_sequence, MESSAGE_DEST | 1);
+
+        let request = raw(4);
+        assert_eq!(
+            fw_find_block(&request, &mut st),
+            Outcome::Discarded {
+                consumed: request.len(),
+                nacked: true
+            }
+        );
+        assert_eq!(
+            st.next_sequence,
+            MESSAGE_DEST | 1,
+            "the request must not move the sequence identify left behind"
+        );
+        assert!(matches!(
+            fw_find_block(&request, &mut st),
+            Outcome::Discarded { nacked: false, .. }
+        ));
     }
 }

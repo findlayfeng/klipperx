@@ -1934,16 +1934,13 @@ impl Mcu {
             let mut seen = 0u64;
 
             loop {
-                let frame = match interface_for_recv.receive().await {
-                    Some(frame) => frame,
-                    // Device shut down: no more frames will arrive.
-                    None => break,
-                };
+                let received = interface_for_recv.receive().await;
 
                 // The frame-level id assignment may have been answered: the
                 // answer is recognized where the stream reassembles raw bytes
-                // (`crate::core::klippy::assign`) and is drained here, with any
-                // frame as its occasion.
+                // (`crate::core::klippy::assign`). Drain after *every* receive,
+                // including the shutdown one — a connection that ends before
+                // any later frame still records the answer it queued.
                 for device_id in interface_for_recv.take_assignment_acks() {
                     assignment_confirmed_for_task.store(true, Ordering::SeqCst);
                     info!(
@@ -1951,6 +1948,11 @@ impl Mcu {
                          (device id {device_id})"
                     );
                 }
+
+                // Device shut down: no more frames will arrive.
+                let Some(frame) = received else {
+                    break;
+                };
 
                 // Whether this frame's number can be placed in the window, and
                 // where — the two connection-init exemptions and the drop are
@@ -3035,6 +3037,42 @@ mod tests {
         let confirmed = mcu.assignment_confirmed();
         mcu.close();
         assert!(confirmed, "the answer must be recorded");
+    }
+
+    /// A device that answers and then goes quiet has its answer recorded too:
+    /// the receive task drains on the **shutdown** receive as well, not only
+    /// when a later frame arrives.
+    #[tokio::test]
+    async fn test_an_answer_recorded_at_connection_shutdown_is_not_lost() {
+        use crate::core::klippy::assign;
+        use crate::core::klippy::interface::devices::serial::DEFAULT_BAUD;
+        use crate::core::klippy::interface::pty::Pty;
+
+        let pty = Pty::new();
+        let interface = Interface::serial(&pty.path, DEFAULT_BAUD).unwrap();
+        let mcu = Mcu::new("mcu", interface.clone());
+
+        // The answer alone: no ordinary frame ever follows it.
+        (&pty.master)
+            .write_all(&assign::request_frame(4).raw_bytes())
+            .unwrap();
+        // Let the port's reader pull the bytes into the stream (the answer is
+        // consumed there and never surfaces as a frame).
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // End the connection: `receive()` returns None, and the drain on that
+        // path is the only thing left to record the answer.
+        interface.shutdown();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !mcu.assignment_confirmed() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let confirmed = mcu.assignment_confirmed();
+        mcu.close();
+        assert!(
+            confirmed,
+            "the shutdown path must drain the answer the stream already holds"
+        );
     }
 
     // -----------------------------------------------------------------------

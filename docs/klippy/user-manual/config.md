@@ -222,8 +222,9 @@ max_accel: 3000
 
 本页逐节登记的「未实现 / 与上游不同」之处，统一登记在[本项目与上游的偏移](../developer-manual/upstream-deviations.md)（那里按「不做 / 行为偏移 / 暂缓」分类）；本页仍保留各节的具体说明。
 
-以下为 KlipperX 当前已实现的配置节（共 18 个装载 id，按装载顺序；`[mcu]` 与 `[printer]`
-分别在最早与最晚装载，其余按各节 `section!` 声明的 `order`）。
+以下为 KlipperX 当前已实现的配置节（按装载顺序；`[mcu]` 与 `[printer]`
+分别在最早与最晚装载，其余按各节 `section!` 声明的 `order`；全仓装载 id 总数以
+[开发手册模块表](../developer-manual/README.md)的实测数字为准）。
 
 ### `[mcu]` / `[mcu <name>]` — MCU 连接
 
@@ -247,8 +248,9 @@ max_accel: 3000
 （`NODEID_FIRST = 4`、步长 1、`new_id = count + 4`、顺序 = `[mcu]` **声明顺序**，这里的
 `count` 是所有已登记的 MCU 数），**所有接口共享同一个 id 空间**——CAN 与串口的 MCU 不会拿到
 同一个号。对 CAN MCU，这个 id 就是它在总线上的节点号（寻址用 `0x100 + 2*id`，见
-[MCU 连接方式](mcu-connection.md)）；对其它接口，上面的号**只是先分配、先占用**，尚无具体
-分配流程（不通过 admin 报文指派），也暂未使用——等后面相应的传输把它变成有意义的地址。MCU
+[MCU 连接方式](mcu-connection.md)）；对其它接口：**串口**在 `open` 时以**帧级指派**
+（identify 之前，见同页）把号交给设备，`host_library` 与 `test:` 暂不指派；**寻址仍未
+使用**——带寻址头的帧格式（有 id 就加头）未落地。MCU
 在 connect 之前必须先持有这个 id（未分配就拒绝打开传输层）。
 
 不需要它时不必写——第一个 `[mcu]`（不论什么接口）会自己把它拉起来。

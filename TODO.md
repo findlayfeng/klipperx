@@ -552,7 +552,8 @@ endstop 资源（`mcu/resource/endstop.rs`，含 `minclock` 门控与 `home_wait
 - [ ] `statistics.py`：周期上报主机统计（CPU/内存；`event/stats.rs` 是 MCU 调度时序上报，不是它）。
 - （`error_mcu.py` ✅ 已落地并归档：`extras/error_mcu.rs`，消费 `klippy:notify_mcu_error` /
   `klippy:analyze_shutdown`，由 `[mcu]` 工厂 ensure。）
-- [x] **`canbus_ids` 与 CAN 节点发现——已落地（2026-10-06）**：`extras/canbus_ids.rs` 按
+- [x] **`canbus_ids` 与 CAN 节点发现——已落地（2026-10-06）**：`extras/canbus_ids.rs`（现迁移至
+      `mcu/ids.rs`，并已泛化为全接口共用的 MCU 层 id 分配器）按
       `[mcu]` 声明顺序发号（`NODEID_FIRST = 4`、步长 1、`new_id = len(ids) + 4`），`[mcu]` 的
       `canbus_nodeid` 因此变为**可选**（写了就用、且占号位；与自增号撞车时**装载期报错**——
       本仓有意偏离：上游靠固件 `can_id_conflict` 兜底）；发现侧新增 `klipperx canbus-scan

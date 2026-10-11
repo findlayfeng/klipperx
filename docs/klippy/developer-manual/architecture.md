@@ -35,7 +35,7 @@
 | 实现 | 配置键 | 线上是什么 |
 |------|--------|-----------|
 | `SerialDevice` | `serial:` | tty 上的字节流 |
-| `CanSerialDevice` | `canbus_uuid:` + `canbus_interface:`（`canbus_nodeid:` 可选，由 MCU id 分配器 `[mcu_ids]`——历史名 `[canbus_ids]` 兼容——分配，`mcu/ids.rs`；其它接口也各分到一个 id、目前未用） | SocketCAN，**承载的仍是同一份 serial 字节流**；admin 扫描（`klipperx canbus-scan`）走单独的 `CanbusAdminSocket`——它直接说 CAN 协议本身，不是 `Device` |
+| `CanSerialDevice` | `canbus_uuid:` + `canbus_interface:`（`canbus_nodeid:` 可选，由 MCU id 分配器 `[mcu_ids]`——历史名 `[canbus_ids]` 兼容——分配，`mcu/ids.rs`；其它接口也各分到一个 id——串口在 open 时以帧级指派交付、暂不用于寻址） | SocketCAN，**承载的仍是同一份 serial 字节流**；admin 扫描（`klipperx canbus-scan`）走单独的 `CanbusAdminSocket`——它直接说 CAN 协议本身，不是 `Device` |
 | `HostDevice` | `host_library:` | `dlopen` 的 klipper host 库，输入/输出都是协议字节 |
 | `FrameMock` | —（仅测试构建，代码里直接建） | 脚本化应答 |
 | `SimulatorDevice` | `test: dict=<path>`（仅测试构建） | 字典驱动应答 |

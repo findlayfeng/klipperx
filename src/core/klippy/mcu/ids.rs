@@ -15,12 +15,14 @@
 //! rejected), an explicit `canbus_nodeid` overrides the sequence and still takes
 //! a slot, and a derived id landing on a taken one is a load-time config error
 //! naming both MCUs (upstream relies on the firmware's `can_id_conflict` stop
-//! instead). Every other transport has **no concrete allocation flow yet**: the
-//! `[mcu]` object takes the next id from the shared sequence at load and keeps
-//! it; nothing consumes the number until a transport makes it meaningful. That is
-//! the point of moving the id to this layer — every MCU is assigned and gates
-//! communication on it (`McuObject::connect` refuses to open without one), while
-//! only CAN's assignment has a use today.
+//! instead). The other transports consume the number differently: serial hands
+//! it to the device as the frame-level assignment before identify
+//! (`crate::core::klippy::assign`), while `host_library` and the `test:`
+//! simulator send nothing yet. Nothing uses an id for *addressing* outside CAN
+//! — the frame-header scheme is still to be built. That is the point of moving
+//! the id to this layer: every MCU is assigned and gates communication on it
+//! (`McuObject::connect` refuses to open without one), while what each
+//! transport does with the number is its own.
 //!
 //! # Lifecycle
 //!
@@ -161,8 +163,8 @@ impl McuIds {
                 ),
                 (None, None) => format!(
                     "mcu_ids: id {new_id} is the next id for MCU '{name}' but is \
-                     already used by MCU '{owner}' (claimed with canbus_nodeid); set \
-                     an explicit canbus_nodeid on one of them"
+                     already used by MCU '{owner}', which claims it with \
+                     canbus_nodeid; set a different canbus_nodeid on that MCU"
                 ),
             }));
         }
@@ -308,8 +310,8 @@ mod tests {
     #[test]
     fn a_serial_derived_id_colliding_with_an_explicit_can_id_is_rejected() {
         let ids = McuIds::new();
-        // count = 0 → derived 4, so an explicit 4 claims it; the serial MCU then
-        // derives 4+1 = 5, which collides.
+        // The explicit 5 claims the slot first; the serial MCU then registers
+        // with count = 1 → next_auto = 5, which lands on it.
         assert_eq!(ids.register_can("mcu can", A, Some(5)).unwrap(), 5);
         let err = ids.register("mcu serial").unwrap_err();
         let text = err.to_string();
@@ -446,5 +448,16 @@ mod tests {
         assert!(text.contains("id 6"), "{text}");
         assert!(text.contains("gamma"), "{text}");
         assert!(text.contains("alpha"), "{text}");
+    }
+
+    /// Writing both section names registers the same object key twice, which
+    /// the printer refuses — one allocator, and the config is told so.
+    #[test]
+    fn writing_both_section_names_is_a_config_error() {
+        let (_printer, result) = load("[mcu_ids]\n[canbus_ids]\n");
+        let err = result.expect_err("the second section collides on the object key");
+        let text = err.to_string();
+        assert!(text.contains("already created"), "{text}");
+        assert!(text.contains("mcu_ids"), "{text}");
     }
 }

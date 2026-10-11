@@ -433,7 +433,7 @@ git config core.hooksPath .githooks
 | `access.rs` | 读取账本：按名（大小写不敏感）登记、按节分组、每节只列一次 |
 | `section.rs` | 节存储：按 id+sub 区分同名选项、替换不重复、保持插入序、按 id 过滤遍历；`get_list` 去空白丢空项并拼多行值、缺项报错、`get_list_of_lists` 解析 `名:值` 对与条数不对的报错；`get`/`get_str`/`get_text`/`has` 按小写键查询（存储侧已是小写）、节名不折叠 |
 | `source.rs` | 配置来源的 `Display` |
-| `mcu.rs` | `[mcu]` 解析：名字与 `restart_method` 拼写、串口默认 `arduino` / 非串口默认 `command` 且忽略该选项、未知 `restart_method` 报错、`usb_power` 默认 `auto` 并校验、传输键二选一（`serial` / `canbus_*` / `host_library` / `test`）、`canbus_uuid` 按上游格式解析、**`canbus_nodeid` 可选且是解析层唯一已知的 id**（不写则 `McuConfig.id` 为 `None` 交给分配器、`open` 报 `node id has not been assigned`；写了就校验范围并作为 `id`）、无 uuid 时的报错、波特率在开 port 前拒绝、**串口 `open` 的帧级指派**（pty：id=9 的指派帧字节逐项匹配，发在任何其它流量之前） |
+| `mcu.rs` | `[mcu]` 解析：名字与 `restart_method` 拼写、串口默认 `arduino` / 非串口默认 `command` 且忽略该选项、未知 `restart_method` 报错、`usb_power` 默认 `auto` 并校验、传输键二选一（`serial` / `canbus_*` / `host_library` / `test`）、`canbus_uuid` 按上游格式解析、**`canbus_nodeid` 可选且是解析层唯一已知的 id**（不写则 `McuConfig.id` 为 `None` 交给分配器、`open` 报 `MCU id has not been assigned`；写了就校验 `1..=255` 并作为 `id`）、无 uuid 时的报错、波特率在开 port 前拒绝、**串口 `open` 的帧级指派**（pty：id=9 的指派帧字节逐项匹配，发在任何其它流量之前） |
 | `validate.rs` | `check_unused`：没人认领/读过的节与没人读过的选项各自报上游文案；只读节合法；名字大小写不敏感 |
 
 ### `motion`

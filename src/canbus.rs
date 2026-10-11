@@ -2,9 +2,11 @@
 //!
 //! Klipper's own tool for this is `scripts/canbus_query.py`, and what it does is
 //! one broadcast: the host sends `CMD_QUERY_UNASSIGNED` on the admin id (`0x3f0`)
-//! and every board that has not been assigned an MCU id yet (written as
-//! `canbus_nodeid` in the config) answers on the next id (`0x3f1`) with its UUID
-//! and the application it runs. Boards that already have a node id stay quiet, so
+//! and every board that has not been assigned an MCU id yet answers on the next
+//! id (`0x3f1`) with its UUID and the application it runs. (A board's id is
+//! normally handed out by `[mcu_ids]` when the config loads; `canbus_nodeid`
+//! only overrides it for a section that wants a fixed number.) Boards that
+//! already have a node id stay quiet, so
 //! a scan lists exactly the boards a `printer.cfg` still has to name — the UUIDs
 //! that go into `[mcu]`'s `canbus_uuid`.
 //!

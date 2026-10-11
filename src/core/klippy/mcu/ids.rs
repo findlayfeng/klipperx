@@ -637,12 +637,12 @@ mod tests {
             ids.register("mcu").expect("an id is free");
         }
         let err = ids.register("mcu one too many").unwrap_err();
+        // Spelled out literally, not formatted from the constants: this is the
+        // assertion that turns red if the upper bound ever moves off `0xff`.
         assert_eq!(
             err.to_string(),
-            format!(
-                "mcu_ids: no free id for MCU 'mcu one too many': every id in \
-                 {NODEID_FIRST}..={MAX_MCU_ID} is already used or reserved"
-            )
+            "mcu_ids: no free id for MCU 'mcu one too many': every id in \
+             4..=255 is already used or reserved"
         );
     }
 

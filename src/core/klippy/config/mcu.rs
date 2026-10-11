@@ -692,6 +692,12 @@ mod tests {
                 err.to_string().contains("invalid canbus_nodeid"),
                 "{bad}: {err}"
             );
+            // Pins the rendered range too: `MAX_MCU_ID` moving (or the message
+            // losing its range) turns this red on its own.
+            assert!(
+                err.to_string().contains("(expected 1..=255)"),
+                "{bad}: {err}"
+            );
         }
 
         // 255 (`0xff`) is the largest id the single admin byte can carry, so the

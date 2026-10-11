@@ -11,11 +11,17 @@
 //! share **one** sequence, so no two MCUs — whatever they are connected by —
 //! can ever be assigned the same number.
 //!
+//! Unlike upstream's counter, an auto id here is **the lowest free id from
+//! `NODEID_FIRST` up**, and every explicit `canbus_nodeid` in the config is
+//! reserved before the first `[mcu]` takes one ([`McuIds::reserve_explicit`]).
+//! An id therefore no longer depends on how many MCUs were declared before it:
+//! an explicit claim is honoured wherever it sits in the file, and an auto id
+//! can never land on one — it steps over both the ids already handed out and
+//! the ones the config claims explicitly.
+//!
 //! The CAN flow keeps its concrete shape: a uuid registers (a duplicate is
-//! rejected), an explicit `canbus_nodeid` overrides the sequence and still takes
-//! a slot, and a derived id landing on a taken one is a load-time config error
-//! naming both MCUs (upstream relies on the firmware's `can_id_conflict` stop
-//! instead). The other transports consume the number differently: serial hands
+//! rejected), and an explicit `canbus_nodeid` overrides the sequence. The other
+//! transports consume the number differently: serial hands
 //! it to the device as the frame-level assignment before identify
 //! (`crate::core::klippy::assign`), while `host_library` and the `test:`
 //! simulator send nothing yet. Nothing uses an id for *addressing* outside CAN
@@ -36,11 +42,12 @@
 //! `McuObject::connect` fills it into the parsed config before the transport is
 //! opened.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
 
+use crate::core::klippy::config::mcu::MAX_CANBUS_NODEID;
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
 use crate::core::klippy::load::section;
 use crate::core::klippy::printer::{Printer, PrinterObject};
@@ -77,10 +84,24 @@ struct State {
     /// `canbus_uuid` is upstream's error, and the id must be stable per uuid
     /// within a run.
     by_uuid: HashMap<[u8; 6], u32>,
-    /// id → owning mcu name. A derived id landing on a taken one — an explicit
-    /// `canbus_nodeid`, or a second explicit id — is a config error that names
-    /// both.
+    /// id → owning mcu name. A second explicit `canbus_nodeid` landing on a
+    /// taken one is a config error that names both.
     owners: HashMap<u32, String>,
+    /// ids the config claims with an explicit `canbus_nodeid`, collected before
+    /// any `[mcu]` registers ([`McuIds::reserve_explicit`]). The auto sequence
+    /// steps over them, so an explicit claim is honoured whether its section
+    /// comes before or after the MCUs that take auto ids.
+    reserved: HashSet<u32>,
+}
+
+impl State {
+    /// The lowest free id from `NODEID_FIRST` up: the first id that is neither
+    /// owned already nor reserved by an explicit `canbus_nodeid`. `None` once
+    /// every id through `MAX_CANBUS_NODEID` is used up.
+    fn next_auto(&self) -> Option<u32> {
+        (NODEID_FIRST..=MAX_CANBUS_NODEID)
+            .find(|id| !self.owners.contains_key(id) && !self.reserved.contains(id))
+    }
 }
 
 /// The mcu layer's single id allocator (one per printer, `Arc`-shared).
@@ -99,11 +120,39 @@ impl McuIds {
         Self::default()
     }
 
-    /// The next id in the shared sequence: `count + NODEID_FIRST`, upstream's
-    /// `len(ids) + NODEID_FIRST` with `count` counting **every** registered MCU,
-    /// whatever its transport.
-    fn next_auto(count: usize) -> u32 {
-        count as u32 + NODEID_FIRST
+    /// Reserve the ids the config claims explicitly with `canbus_nodeid`,
+    /// before any `[mcu]` registers.
+    ///
+    /// An auto id here is the lowest free one from `NODEID_FIRST` up, so the
+    /// allocator has to know every explicit claim in advance: a `[mcu]` that
+    /// writes `canbus_nodeid: 5` owns 5 whatever its position in the file, and
+    /// the MCUs without one take the ids it left free. Without this pre-scan a
+    /// `[mcu]` declared before the explicit one would take 5 first and the
+    /// explicit claim would be rejected at load.
+    ///
+    /// The value is read straight from the section's raw parameters rather than
+    /// through `get_str`/`get_int`: those record the option as read, which
+    /// would exempt `canbus_nodeid` from
+    /// [`check_unused`](crate::core::klippy::config::check_unused) and let a
+    /// config that has CAN options without a `canbus_uuid` — a serial `[mcu]`
+    /// that also writes `canbus_nodeid`, say — pass silently. The option stays
+    /// unread here; the section's own factory reads and validates what it
+    /// means. A value that does not parse or is outside Klipper's node-id range
+    /// is ignored for the same reason: that section's factory reports it.
+    ///
+    /// Calling this again changes nothing, and a wrapper built without the
+    /// whole config (a test wrapper) reserves nothing rather than failing.
+    pub fn reserve_explicit(&self, config: &ConfigWrapper) {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let sections = config
+            .sibling("mcu")
+            .into_iter()
+            .chain(config.sibling_prefix_sections("mcu"));
+        for section in sections {
+            if let Some(id) = explicit_nodeid(&section) {
+                state.reserved.insert(id);
+            }
+        }
     }
 
     /// The next id for an MCU with no transport-specific allocation of its own.
@@ -114,8 +163,8 @@ impl McuIds {
     /// transport that later makes it meaningful.
     ///
     /// # Errors
-    /// A config error naming both MCUs when the derived id lands on one that is
-    /// already taken (only an explicit `canbus_nodeid` can claim it in advance).
+    /// A config error naming the MCU when the whole `NODEID_FIRST`..=`MAX_CANBUS_NODEID`
+    /// range is already taken.
     pub fn register(&self, name: &str) -> Result<u32, ConfigError> {
         self.insert(name, None, None)
     }
@@ -124,8 +173,9 @@ impl McuIds {
     ///
     /// # Errors
     /// Upstream's `Duplicate canbus_uuid` when the uuid already registered
-    /// (`canbus_ids.py:15`), or a config error naming both MCUs when the id this
-    /// registers would land on one that is already taken.
+    /// (`canbus_ids.py:15`), or a config error naming both MCUs when the
+    /// explicit id is already taken (by another explicit id; an auto id steps
+    /// over it) or when the id range is exhausted.
     pub fn register_can(
         &self,
         name: &str,
@@ -135,7 +185,7 @@ impl McuIds {
         self.insert(name, Some(uuid), explicit)
     }
 
-    /// The shared registration: claim the next id, or the explicit one.
+    /// The shared registration: claim the explicit id, or the lowest free one.
     fn insert(
         &self,
         name: &str,
@@ -148,31 +198,53 @@ impl McuIds {
                 return Err(ConfigError::new("Duplicate canbus_uuid".to_string()));
             }
         }
-        let new_id = explicit.unwrap_or(Self::next_auto(state.owners.len()));
-        if let Some(owner) = state.owners.get(&new_id) {
-            return Err(ConfigError::new(match (explicit, uuid) {
-                (Some(_), _) => format!(
-                    "mcu_ids: id {new_id} is claimed by MCU '{name}' with \
-                     canbus_nodeid but is already used by MCU '{owner}'; set a \
-                     different canbus_nodeid"
-                ),
-                (None, Some(_)) => format!(
-                    "mcu_ids: id {new_id} is derived for MCU '{name}' but MCU \
-                     '{owner}' claims it with canbus_nodeid; set an explicit \
-                     canbus_nodeid on one of them"
-                ),
-                (None, None) => format!(
-                    "mcu_ids: id {new_id} is the next id for MCU '{name}' but is \
-                     already used by MCU '{owner}', which claims it with \
-                     canbus_nodeid; set a different canbus_nodeid on that MCU"
-                ),
-            }));
-        }
+        let new_id = match explicit {
+            Some(new_id) => {
+                if let Some(owner) = state.owners.get(&new_id) {
+                    return Err(ConfigError::new(format!(
+                        "mcu_ids: id {new_id} is claimed by MCU '{name}' with \
+                         canbus_nodeid but is already used by MCU '{owner}'; set a \
+                         different canbus_nodeid"
+                    )));
+                }
+                new_id
+            }
+            // An auto id cannot land on a taken one: `next_auto` scans past
+            // everything owned and everything reserved by an explicit
+            // `canbus_nodeid`, so there is no "derived id collides" error here
+            // — only a range that is used up.
+            None => match state.next_auto() {
+                Some(new_id) => new_id,
+                None => {
+                    return Err(ConfigError::new(format!(
+                        "mcu_ids: no free id for MCU '{name}': every id in \
+                         {NODEID_FIRST}..={MAX_CANBUS_NODEID} is already used"
+                    )))
+                }
+            },
+        };
         if let Some(uuid) = uuid {
             state.by_uuid.insert(uuid, new_id);
         }
         state.owners.insert(new_id, name.to_string());
         Ok(new_id)
+    }
+}
+
+/// The explicit `canbus_nodeid` a section writes, read without recording it.
+///
+/// `None` when the option is absent, does not parse as an id, or is outside
+/// `1..=MAX_CANBUS_NODEID` — the range [`McuConfig::new`](crate::core::klippy::config::mcu::McuConfig::new)
+/// accepts; such a section is rejected by its own factory, so there is nothing
+/// to reserve here.
+fn explicit_nodeid(section: &ConfigWrapper) -> Option<u32> {
+    if !section.has("canbus_nodeid") {
+        return None;
+    }
+    let text = section.section().parameters.get("canbus_nodeid")?;
+    match text.as_str_ref()?.trim().parse::<u32>() {
+        Ok(id) if (1..=MAX_CANBUS_NODEID).contains(&id) => Some(id),
+        _ => None,
     }
 }
 
@@ -233,8 +305,8 @@ mod tests {
     const B: [u8; 6] = [0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f];
     const C: [u8; 6] = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06];
 
-    /// CAN uuids registered in declaration order get `NODEID_FIRST` upward, one
-    /// step each — upstream's `len(ids) + NODEID_FIRST`.
+    /// CAN uuids registered with no explicit id get `NODEID_FIRST` upward, one
+    /// step each: the auto id is the lowest free one.
     #[test]
     fn ids_are_handed_out_in_registration_order_from_four() {
         let ids = McuIds::new();
@@ -243,34 +315,41 @@ mod tests {
         assert_eq!(ids.register_can("mcu bed", C, None).unwrap(), 6);
     }
 
-    /// An explicit `canbus_nodeid` is used as written and still takes a slot, so
-    /// the next auto id counts past it: with explicit 4 and 9 registered first,
-    /// a following auto id is `count + NODEID_FIRST` = 2 + 4 = 6.
+    /// An explicit `canbus_nodeid` is used as written and the auto sequence
+    /// steps over it: with 4 and 9 claimed explicitly, the next auto id is the
+    /// lowest free one, 5 — not a count past them.
     #[test]
-    fn an_explicit_nodeid_is_used_and_counts_toward_the_sequence() {
+    fn an_explicit_nodeid_is_used_and_the_auto_sequence_steps_over_it() {
         let ids = McuIds::new();
         assert_eq!(ids.register_can("mcu a", A, Some(4)).unwrap(), 4);
         assert_eq!(ids.register_can("mcu b", B, Some(9)).unwrap(), 9);
-        assert_eq!(ids.register_can("mcu c", C, None).unwrap(), 6);
+        assert_eq!(ids.register_can("mcu c", C, None).unwrap(), 5);
     }
 
-    /// A derived id that would land on an explicit one is a config error at
-    /// registration time, naming both MCUs and the id — not a firmware
-    /// `can_id_conflict` shutdown later.
+    /// An auto id never lands on an explicit one: it scans past it and fills the
+    /// lowest free id instead, so there is no load-time collision error here.
     #[test]
-    fn a_derived_id_colliding_with_an_explicit_one_is_rejected() {
+    fn an_auto_id_avoids_an_explicitly_claimed_id() {
         let ids = McuIds::new();
         assert_eq!(ids.register_can("mcu a", A, Some(6)).unwrap(), 6);
-        assert_eq!(ids.register_can("mcu b", B, None).unwrap(), 5);
-        // count = 2 → 6, which `mcu a` claimed explicitly.
-        let err = ids.register_can("mcu c", C, None).unwrap_err();
-        let text = err.to_string();
-        assert!(text.contains("id 6"), "{text}");
-        assert!(text.contains("mcu a"), "{text}");
-        assert!(text.contains("mcu c"), "{text}");
+        // 4 and 5 are free even though 6 is claimed explicitly.
+        assert_eq!(ids.register_can("mcu b", B, None).unwrap(), 4);
+        assert_eq!(ids.register_can("mcu c", C, None).unwrap(), 5);
     }
 
-    /// Two explicit ids that collide are rejected too, with both names.
+    /// Without a pre-scan a bare allocator still starts at four and takes the
+    /// lowest free id, so it fills a hole an explicit claim left behind.
+    #[test]
+    fn a_bare_allocator_takes_the_lowest_free_id_from_four() {
+        let ids = McuIds::new();
+        assert_eq!(ids.register_can("mcu a", A, Some(4)).unwrap(), 4);
+        assert_eq!(ids.register_can("mcu b", B, Some(6)).unwrap(), 6);
+        assert_eq!(ids.register("mcu c").unwrap(), 5);
+        assert_eq!(ids.register("mcu d").unwrap(), 7);
+    }
+
+    /// A second explicit id that claims a taken one is rejected too, with both
+    /// names — the one explicit-claim error the auto scan cannot avoid.
     #[test]
     fn two_explicit_ids_that_collide_are_rejected() {
         let ids = McuIds::new();
@@ -291,33 +370,27 @@ mod tests {
         assert_eq!(err.to_string(), "Duplicate canbus_uuid");
     }
 
-    /// A non-CAN MCU takes the next id from the **same** sequence as CAN: the
-    /// two kinds never share a number (the point of the unified allocator).
+    /// A non-CAN MCU takes ids from the **same** sequence as CAN: the two kinds
+    /// never share a number (the point of the unified allocator).
     #[test]
     fn serial_and_can_share_one_sequence() {
         let ids = McuIds::new();
         assert_eq!(ids.register("mcu serial").unwrap(), 4);
         assert_eq!(ids.register_can("mcu can", A, None).unwrap(), 5);
         assert_eq!(ids.register("mcu host").unwrap(), 6);
-        // An explicit CAN id still counts toward the sequence for the auto ones:
-        // after four registrations the next auto id is 4 + 4 = 8.
+        // An explicit CAN id is skipped, not counted: with 4/5/6/9 taken, the
+        // next auto id is the lowest free one, 7.
         assert_eq!(ids.register_can("mcu tip", B, Some(9)).unwrap(), 9);
-        assert_eq!(ids.register("mcu tail").unwrap(), 8);
+        assert_eq!(ids.register("mcu tail").unwrap(), 7);
     }
 
-    /// A non-CAN derived id that lands on an explicit CAN id is a config error
-    /// naming both.
+    /// A non-CAN MCU also steps over an explicit CAN id: with 5 claimed
+    /// explicitly, the serial MCU takes 4.
     #[test]
-    fn a_serial_derived_id_colliding_with_an_explicit_can_id_is_rejected() {
+    fn a_serial_id_avoids_an_explicit_can_id() {
         let ids = McuIds::new();
-        // The explicit 5 claims the slot first; the serial MCU then registers
-        // with count = 1 → next_auto = 5, which lands on it.
         assert_eq!(ids.register_can("mcu can", A, Some(5)).unwrap(), 5);
-        let err = ids.register("mcu serial").unwrap_err();
-        let text = err.to_string();
-        assert!(text.contains("id 5"), "{text}");
-        assert!(text.contains("mcu can"), "{text}");
-        assert!(text.contains("mcu serial"), "{text}");
+        assert_eq!(ids.register("mcu serial").unwrap(), 4);
     }
 
     // -----------------------------------------------------------------------
@@ -362,18 +435,69 @@ mod tests {
         assert_eq!(assigned_id(&printer, "mcu bed"), 6);
     }
 
-    /// An explicit `canbus_nodeid` is honoured and shifts the auto sequence only
-    /// by taking its slot; the next auto id is `count + NODEID_FIRST`.
+    /// An explicit `canbus_nodeid` is honoured and the auto sequence steps over
+    /// it: the MCU without one gets the lowest free id, 4 — the claim of 9 does
+    /// not move it.
     #[test]
     fn a_config_honours_an_explicit_nodeid() {
         let (printer, result) = load(
             "[mcu]\ncanbus_uuid: 11aa22bb33cc\ncanbus_nodeid: 9\n\
              [mcu tool]\ncanbus_uuid: 0a0b0c0d0e0f\n",
         );
-        result.expect("explicit and derived ids do not collide here");
+        result.expect("explicit and auto ids do not collide here");
         assert_eq!(assigned_id(&printer, "mcu"), 9);
-        // count is 1 when the second uuid registers → 1 + 4 = 5.
+        // The lowest free id: 4, not 5.
+        assert_eq!(assigned_id(&printer, "mcu tool"), 4);
+    }
+
+    /// The auto id is the lowest free one, so an explicit `canbus_nodeid` is
+    /// honoured wherever its section sits: whether the MCU that takes the auto
+    /// id is declared before or after the one that claims 5, they get 4 and 5.
+    #[test]
+    fn an_explicit_nodeid_is_honoured_whatever_the_declaration_order() {
+        let (printer, result) = load(
+            "[mcu]\ncanbus_uuid: 11aa22bb33cc\n\
+             [mcu tool]\ncanbus_uuid: 0a0b0c0d0e0f\ncanbus_nodeid: 5\n",
+        );
+        result.expect("the explicit claim is reserved before ids are handed out");
+        assert_eq!(assigned_id(&printer, "mcu"), 4);
         assert_eq!(assigned_id(&printer, "mcu tool"), 5);
+
+        // The same two sections, in the other order, get the same ids.
+        let (printer, result) = load(
+            "[mcu tool]\ncanbus_uuid: 0a0b0c0d0e0f\ncanbus_nodeid: 5\n\
+             [mcu]\ncanbus_uuid: 11aa22bb33cc\n",
+        );
+        result.expect("the explicit claim is reserved before ids are handed out");
+        assert_eq!(assigned_id(&printer, "mcu"), 4);
+        assert_eq!(assigned_id(&printer, "mcu tool"), 5);
+    }
+
+    /// A reserved id below `NODEID_FIRST` costs the auto sequence nothing: with
+    /// `canbus_nodeid: 2` claimed, the auto MCU still gets 4.
+    #[test]
+    fn a_reserved_id_below_the_sequence_does_not_move_the_auto_id() {
+        let (printer, result) = load(
+            "[mcu]\ncanbus_uuid: 11aa22bb33cc\ncanbus_nodeid: 2\n\
+             [mcu tool]\ncanbus_uuid: 0a0b0c0d0e0f\n",
+        );
+        result.expect("a nodeid below the sequence is valid");
+        assert_eq!(assigned_id(&printer, "mcu"), 2);
+        assert_eq!(assigned_id(&printer, "mcu tool"), 4);
+    }
+
+    /// The pre-scan leaves `canbus_nodeid` unread, so a section that has CAN
+    /// settings without a `canbus_uuid` is still a config error (reading the
+    /// option with `get_str` there would have marked it used).
+    #[test]
+    fn the_pre_scan_does_not_hide_an_unmatched_canbus_nodeid() {
+        let (_printer, result) = load("[mcu]\nserial: /dev/a\ncanbus_nodeid: 5\n");
+        let err = result.expect_err("a serial MCU with CAN settings is rejected");
+        let text = err.to_string();
+        assert!(
+            text.contains("needs a canbus_uuid to go with its CAN settings"),
+            "{text}"
+        );
     }
 
     /// A CAN MCU with no `canbus_nodeid` loads (the old "does not allocate one
@@ -434,20 +558,36 @@ mod tests {
         assert_eq!(assigned_id(&printer, "mcu tool"), 5);
     }
 
-    /// A collision through a real config is rejected at load time, naming both
-    /// MCUs, instead of reaching the firmware's `can_id_conflict` shutdown.
+    /// Two sections claiming the same `canbus_nodeid` are rejected at load,
+    /// naming both MCUs and the id — the one collision the auto scan cannot
+    /// step around.
     #[test]
-    fn a_collision_through_a_config_is_rejected_at_load() {
+    fn a_config_rejects_two_sections_claiming_one_nodeid() {
         let (_printer, result) = load(
             "[mcu alpha]\ncanbus_uuid: 010203040506\ncanbus_nodeid: 6\n\
-             [mcu beta]\ncanbus_uuid: 0a0b0c0d0e0f\n\
-             [mcu gamma]\ncanbus_uuid: 11aa22bb33cc\n",
+             [mcu beta]\ncanbus_uuid: 0a0b0c0d0e0f\ncanbus_nodeid: 6\n",
         );
-        let err = result.expect_err("the collision is a config error");
+        let err = result.expect_err("the second claim on id 6 is a config error");
         let text = err.to_string();
         assert!(text.contains("id 6"), "{text}");
-        assert!(text.contains("gamma"), "{text}");
+        assert!(text.contains("beta"), "{text}");
         assert!(text.contains("alpha"), "{text}");
+    }
+
+    /// The sequence is finite: once every id from `NODEID_FIRST` through
+    /// `MAX_CANBUS_NODEID` is taken, the next MCU is refused instead of being
+    /// handed an id off the end. 892 ids fit — `0x37f - 4 + 1`.
+    #[test]
+    fn the_allocator_reports_an_exhausted_id_range() {
+        let ids = McuIds::new();
+        for _ in NODEID_FIRST..=MAX_CANBUS_NODEID {
+            ids.register("mcu").expect("an id is free");
+        }
+        let err = ids.register("mcu one too many").unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("no free id"), "{text}");
+        assert!(text.contains("mcu one too many"), "{text}");
+        assert!(text.contains(&MAX_CANBUS_NODEID.to_string()), "{text}");
     }
 
     /// Writing both section names registers the same object key twice, which

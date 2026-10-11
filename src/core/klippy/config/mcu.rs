@@ -99,7 +99,9 @@ fn interface_keys() -> &'static [&'static str] {
 
 /// Klipper's node-id range: ids are mapped to `0x100 + 2 * nodeid`, and the MCU
 /// answers on the next arbitration id, so the whole 11-bit id space has to fit.
-const MAX_CANBUS_NODEID: u32 = 0x37f;
+/// The `[mcu_ids]` allocator reuses it as the upper end of its sequence
+/// (`mcu/ids.rs`), so an auto id can never leave the range either.
+pub(crate) const MAX_CANBUS_NODEID: u32 = 0x37f;
 
 impl McuConfig {
     /// Parse MCU configuration from a ConfigSection.

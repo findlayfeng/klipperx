@@ -125,10 +125,9 @@ impl McuConfig {
     /// ```
     ///
     /// A CAN-connected MCU names its uuid and the CAN interface it is on
-    /// (Klipper's default is `can0`). The node id is the MCU's layer-wide id
-    /// from the `[mcu_ids]` allocator (`mcu/ids.rs`; the historical
-    /// `[canbus_ids]` spelling still loads) unless the section overrides it
-    /// explicitly:
+    /// (Klipper's default is `can0`). The id is the MCU-layer id from the
+    /// `[mcu_ids]` allocator (`mcu/ids.rs`; the historical `[canbus_ids]`
+    /// spelling still loads) unless the section overrides it explicitly:
     ///
     /// ```ini
     /// [mcu]
@@ -140,8 +139,9 @@ impl McuConfig {
     /// canbus_nodeid: 2
     /// ```
     ///
-    /// `canbus_nodeid` is klipperx-only (upstream has no such option): it is the
-    /// node id the MCU uses instead of the one the allocator would hand out.
+    /// `canbus_nodeid` is klipperx-only (upstream has no such option): it names the
+    /// MCU-layer id this `[mcu]` takes instead of the one the allocator would hand
+    /// out (the key keeps Klipper's spelling).
     ///
     /// `baud` only applies to `serial`, and defaults to Klipper's 250000.
     ///
@@ -414,7 +414,7 @@ impl Transport {
                 // fills it in at connect time (see `mcu/object.rs`), and only an
                 // explicit `canbus_nodeid` is set this early.
                 let id =
-                    id.ok_or_else(|| "canbus: the node id has not been assigned".to_string())?;
+                    id.ok_or_else(|| "canbus: the MCU id has not been assigned".to_string())?;
                 Interface::canserial(interface, *uuid, id).map_err(|e| format!("canbus: {e}"))
             }
             Transport::Host { library } => {
@@ -720,7 +720,7 @@ mod tests {
         assert!(matches!(config.id, None));
         assert!(matches!(config.transport, Transport::Can { .. }));
         let err = config.open().unwrap_err();
-        assert!(err.contains("node id has not been assigned"), "{err}");
+        assert!(err.contains("MCU id has not been assigned"), "{err}");
 
         // Written explicitly, the option is the id parsing carries.
         section.parameters.insert(

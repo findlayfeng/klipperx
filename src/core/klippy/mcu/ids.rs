@@ -142,6 +142,17 @@ impl McuIds {
     ///
     /// Calling this again changes nothing, and a wrapper built without the
     /// whole config (a test wrapper) reserves nothing rather than failing.
+    ///
+    /// The pre-scan reads the **parsed** config: [`ConfigWrapper::sibling`]
+    /// pulls sections straight out of the original
+    /// [`Config`](crate::core::klippy::config::Config), before the loader layers
+    /// [`Printer::override_config`] over a section
+    /// (`crate::core::klippy::load`'s `register`). `canbus_nodeid` therefore must
+    /// **not** be overridden with `override_config`: the pre-scan would reserve
+    /// the file's value while the section's own factory reads the override, so
+    /// the allocator and the MCU would see different ids. The one override today
+    /// is `restart_method` (`mcu/object.rs`'s `usb_reset_unusable`), and it never
+    /// touches an id.
     pub fn reserve_explicit(&self, config: &ConfigWrapper) {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         let sections = config
@@ -218,7 +229,7 @@ impl McuIds {
                 None => {
                     return Err(ConfigError::new(format!(
                         "mcu_ids: no free id for MCU '{name}': every id in \
-                         {NODEID_FIRST}..={MAX_CANBUS_NODEID} is already used"
+                         {NODEID_FIRST}..={MAX_CANBUS_NODEID} is already used or reserved"
                     )))
                 }
             },
@@ -397,6 +408,7 @@ mod tests {
     // Through the loader: registration happens as `[mcu]` sections are built.
     // -----------------------------------------------------------------------
 
+    use crate::core::klippy::config::AccessTracking;
     use crate::core::klippy::config::Config;
     use crate::core::klippy::mcu::object::McuObject;
     use crate::core::klippy::printer::Printer;
@@ -473,6 +485,34 @@ mod tests {
         assert_eq!(assigned_id(&printer, "mcu tool"), 5);
     }
 
+    /// An explicit `canbus_nodeid` is reserved when a *prefix* section that
+    /// takes an auto id is declared before it: `[mcu b]` registers first and
+    /// would grab 4, but the pre-scan already reserved the 4 `[mcu a]` claims,
+    /// so `[mcu b]` steps over it and the explicit claim is honoured. Without the
+    /// pre-scan this config fails at load with the id-4 collision error.
+    #[test]
+    fn an_explicit_claim_is_reserved_before_an_earlier_auto_id() {
+        let (printer, result) = load(
+            "[mcu b]\ncanbus_uuid: 0a0b0c0d0e0f\n\
+             [mcu a]\ncanbus_uuid: 11aa22bb33cc\ncanbus_nodeid: 4\n",
+        );
+        result.expect("the early prefix takes the id the later claim left free");
+        assert_eq!(assigned_id(&printer, "mcu b"), 5);
+        assert_eq!(assigned_id(&printer, "mcu a"), 4);
+
+        // The same two prefix sections, written the other way round, get the
+        // same ids. This half pins order-independence between prefix sections;
+        // on its own it does **not** discriminate the pre-scan (the explicit
+        // section now registers first), only the half above does.
+        let (printer, result) = load(
+            "[mcu a]\ncanbus_uuid: 11aa22bb33cc\ncanbus_nodeid: 4\n\
+             [mcu b]\ncanbus_uuid: 0a0b0c0d0e0f\n",
+        );
+        result.expect("both prefix sections load in either order");
+        assert_eq!(assigned_id(&printer, "mcu b"), 5);
+        assert_eq!(assigned_id(&printer, "mcu a"), 4);
+    }
+
     /// A reserved id below `NODEID_FIRST` costs the auto sequence nothing: with
     /// `canbus_nodeid: 2` claimed, the auto MCU still gets 4.
     #[test]
@@ -486,18 +526,30 @@ mod tests {
         assert_eq!(assigned_id(&printer, "mcu tool"), 4);
     }
 
-    /// The pre-scan leaves `canbus_nodeid` unread, so a section that has CAN
-    /// settings without a `canbus_uuid` is still a config error (reading the
-    /// option with `get_str` there would have marked it used).
+    /// The pre-scan reads `canbus_nodeid` straight from the raw section
+    /// parameters, so it is not recorded as read — the section's own factory
+    /// stays the one that reads and validates it. Reading it with `get_str`
+    /// instead would show up in the access tracking, which is the only way to
+    /// tell the two apart; and the reserved id is really in effect, so the auto
+    /// sequence steps over it.
     #[test]
-    fn the_pre_scan_does_not_hide_an_unmatched_canbus_nodeid() {
-        let (_printer, result) = load("[mcu]\nserial: /dev/a\ncanbus_nodeid: 5\n");
-        let err = result.expect_err("a serial MCU with CAN settings is rejected");
-        let text = err.to_string();
+    fn the_pre_scan_reads_the_explicit_id_without_recording_it() {
+        let (config, _) = Config::from_text("[mcu]\ncanbus_uuid: 11aa22bb33cc\ncanbus_nodeid: 5\n")
+            .expect("the config parses");
+        let access = AccessTracking::shared();
+        let section = config.get_section("mcu").expect("the section is there");
+        let wrapper = ConfigWrapper::with_config(section, Arc::clone(&access), None, &config);
+
+        let ids = McuIds::new();
+        ids.reserve_explicit(&wrapper);
         assert!(
-            text.contains("needs a canbus_uuid to go with its CAN settings"),
-            "{text}"
+            !access.contains("mcu", "canbus_nodeid"),
+            "the pre-scan must not record canbus_nodeid as read"
         );
+
+        // The reservation is in effect: 5 is skipped, so the second auto id is 6.
+        assert_eq!(ids.register("mcu auto").unwrap(), 4);
+        assert_eq!(ids.register("mcu auto2").unwrap(), 6);
     }
 
     /// A CAN MCU with no `canbus_nodeid` loads (the old "does not allocate one
@@ -576,7 +628,8 @@ mod tests {
 
     /// The sequence is finite: once every id from `NODEID_FIRST` through
     /// `MAX_CANBUS_NODEID` is taken, the next MCU is refused instead of being
-    /// handed an id off the end. 892 ids fit — `0x37f - 4 + 1`.
+    /// handed an id off the end. 892 ids fit — `0x37f - 4 + 1`. The message
+    /// spells out the range and that both used and reserved ids exhaust it.
     #[test]
     fn the_allocator_reports_an_exhausted_id_range() {
         let ids = McuIds::new();
@@ -584,10 +637,13 @@ mod tests {
             ids.register("mcu").expect("an id is free");
         }
         let err = ids.register("mcu one too many").unwrap_err();
-        let text = err.to_string();
-        assert!(text.contains("no free id"), "{text}");
-        assert!(text.contains("mcu one too many"), "{text}");
-        assert!(text.contains(&MAX_CANBUS_NODEID.to_string()), "{text}");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "mcu_ids: no free id for MCU 'mcu one too many': every id in \
+                 {NODEID_FIRST}..={MAX_CANBUS_NODEID} is already used or reserved"
+            )
+        );
     }
 
     /// Writing both section names registers the same object key twice, which

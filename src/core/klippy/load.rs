@@ -352,6 +352,7 @@ impl Printer {
 mod tests {
     use super::*;
     use crate::core::klippy::config::value::ConfigValue;
+    use crate::core::klippy::mcu::McuObject;
     use crate::core::klippy::reactor::ManualReactor;
     use serde_json::{json, Value};
 
@@ -755,6 +756,16 @@ mod tests {
             printer.objects(),
             ["gcode", "configfile", "pins", "mcu_ids", "error_mcu", "mcu"]
         );
+        // The main MCU's id, pinned across the restart below: the allocator is
+        // dropped with the rest of the config, so the second load starts from an
+        // empty one and re-assigns 4 — it does not carry over and drift to 5.
+        assert_eq!(
+            printer
+                .lookup_object_as::<McuObject>("mcu")
+                .expect("the main MCU registered")
+                .id(),
+            Some(4)
+        );
 
         printer.reset_for_restart("restart");
         printer.load_config(&config).unwrap();
@@ -762,6 +773,15 @@ mod tests {
         assert_eq!(
             printer.objects(),
             ["gcode", "configfile", "pins", "mcu_ids", "error_mcu", "mcu"]
+        );
+        // The reborn allocator hands the same main MCU its id again, so nothing
+        // from the first load's sequence is left behind.
+        assert_eq!(
+            printer
+                .lookup_object_as::<McuObject>("mcu")
+                .expect("the main MCU registered again")
+                .id(),
+            Some(4)
         );
     }
 

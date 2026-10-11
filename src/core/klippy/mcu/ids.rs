@@ -47,7 +47,7 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
 
-use crate::core::klippy::config::mcu::MAX_CANBUS_NODEID;
+use crate::core::klippy::config::mcu::MAX_MCU_ID;
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
 use crate::core::klippy::load::section;
 use crate::core::klippy::printer::{Printer, PrinterObject};
@@ -73,8 +73,8 @@ section!(
 /// loads and shares the one allocator.
 pub const MCU_IDS_OBJECT: &str = "mcu_ids";
 
-/// The first id in the sequence. Upstream's `NODEID_FIRST` (`canbus_ids.py:7`):
-/// ids 1-3 are left to the host/bridge.
+/// The first id in the MCU id sequence. Upstream's `NODEID_FIRST`
+/// (`canbus_ids.py:7`): ids 1-3 are left to the host/bridge.
 const NODEID_FIRST: u32 = 4;
 
 /// The shared bookkeeping.
@@ -97,9 +97,9 @@ struct State {
 impl State {
     /// The lowest free id from `NODEID_FIRST` up: the first id that is neither
     /// owned already nor reserved by an explicit `canbus_nodeid`. `None` once
-    /// every id through `MAX_CANBUS_NODEID` is used up.
+    /// every id through `MAX_MCU_ID` is used up.
     fn next_auto(&self) -> Option<u32> {
-        (NODEID_FIRST..=MAX_CANBUS_NODEID)
+        (NODEID_FIRST..=MAX_MCU_ID)
             .find(|id| !self.owners.contains_key(id) && !self.reserved.contains(id))
     }
 }
@@ -174,7 +174,7 @@ impl McuIds {
     /// transport that later makes it meaningful.
     ///
     /// # Errors
-    /// A config error naming the MCU when the whole `NODEID_FIRST`..=`MAX_CANBUS_NODEID`
+    /// A config error naming the MCU when the whole `NODEID_FIRST`..=`MAX_MCU_ID`
     /// range is already taken.
     pub fn register(&self, name: &str) -> Result<u32, ConfigError> {
         self.insert(name, None, None)
@@ -229,7 +229,7 @@ impl McuIds {
                 None => {
                     return Err(ConfigError::new(format!(
                         "mcu_ids: no free id for MCU '{name}': every id in \
-                         {NODEID_FIRST}..={MAX_CANBUS_NODEID} is already used or reserved"
+                         {NODEID_FIRST}..={MAX_MCU_ID} is already used or reserved"
                     )))
                 }
             },
@@ -245,7 +245,7 @@ impl McuIds {
 /// The explicit `canbus_nodeid` a section writes, read without recording it.
 ///
 /// `None` when the option is absent, does not parse as an id, or is outside
-/// `1..=MAX_CANBUS_NODEID` — the range [`McuConfig::new`](crate::core::klippy::config::mcu::McuConfig::new)
+/// `1..=MAX_MCU_ID` — the range [`McuConfig::new`](crate::core::klippy::config::mcu::McuConfig::new)
 /// accepts; such a section is rejected by its own factory, so there is nothing
 /// to reserve here.
 fn explicit_nodeid(section: &ConfigWrapper) -> Option<u32> {
@@ -254,7 +254,7 @@ fn explicit_nodeid(section: &ConfigWrapper) -> Option<u32> {
     }
     let text = section.section().parameters.get("canbus_nodeid")?;
     match text.as_str_ref()?.trim().parse::<u32>() {
-        Ok(id) if (1..=MAX_CANBUS_NODEID).contains(&id) => Some(id),
+        Ok(id) if (1..=MAX_MCU_ID).contains(&id) => Some(id),
         _ => None,
     }
 }
@@ -627,13 +627,13 @@ mod tests {
     }
 
     /// The sequence is finite: once every id from `NODEID_FIRST` through
-    /// `MAX_CANBUS_NODEID` is taken, the next MCU is refused instead of being
-    /// handed an id off the end. 892 ids fit — `0x37f - 4 + 1`. The message
+    /// `MAX_MCU_ID` is taken, the next MCU is refused instead of being
+    /// handed an id off the end. 252 ids fit — `0xff - 4 + 1`. The message
     /// spells out the range and that both used and reserved ids exhaust it.
     #[test]
     fn the_allocator_reports_an_exhausted_id_range() {
         let ids = McuIds::new();
-        for _ in NODEID_FIRST..=MAX_CANBUS_NODEID {
+        for _ in NODEID_FIRST..=MAX_MCU_ID {
             ids.register("mcu").expect("an id is free");
         }
         let err = ids.register("mcu one too many").unwrap_err();
@@ -641,7 +641,7 @@ mod tests {
             err.to_string(),
             format!(
                 "mcu_ids: no free id for MCU 'mcu one too many': every id in \
-                 {NODEID_FIRST}..={MAX_CANBUS_NODEID} is already used or reserved"
+                 {NODEID_FIRST}..={MAX_MCU_ID} is already used or reserved"
             )
         );
     }

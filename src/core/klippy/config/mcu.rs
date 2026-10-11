@@ -97,11 +97,17 @@ fn interface_keys() -> &'static [&'static str] {
     return &["host_library", "serial", "canbus_uuid"];
 }
 
-/// Klipper's node-id range: ids are mapped to `0x100 + 2 * nodeid`, and the MCU
-/// answers on the next arbitration id, so the whole 11-bit id space has to fit.
-/// The `[mcu_ids]` allocator reuses it as the upper end of its sequence
-/// (`mcu/ids.rs`), so an auto id can never leave the range either.
-pub(crate) const MAX_CANBUS_NODEID: u32 = 0x37f;
+/// The upper bound of an MCU-layer id.
+///
+/// It comes from the message that carries an assigned id, not from the bus: the
+/// CAN admin message puts it in a **single byte**
+/// (`can_process_set_klipper_nodeid` decodes `msg->data[7]` via
+/// `can_decode_nodeid` — `src/generic/canserial.c:140-143,177`), so the largest
+/// id the link can express is `0xff`. CAN is only the transport that constrains
+/// the bound; the id itself belongs to every `[mcu]` whatever it is connected
+/// by. The `[mcu_ids]` allocator reuses it as the upper end of its one sequence
+/// for all transports (`mcu/ids.rs`), so an auto id can never leave the range.
+pub(crate) const MAX_MCU_ID: u32 = 0xff;
 
 impl McuConfig {
     /// Parse MCU configuration from a ConfigSection.
@@ -119,10 +125,9 @@ impl McuConfig {
     /// ```
     ///
     /// A CAN-connected MCU names its uuid and the CAN interface it is on
-    /// (Klipper's default is `can0`). The node id is the MCU's layer-wide id
-    /// from the `[mcu_ids]` allocator (`mcu/ids.rs`; the historical
-    /// `[canbus_ids]` spelling still loads) unless the section overrides it
-    /// explicitly:
+    /// (Klipper's default is `can0`). The id is the MCU-layer id from the
+    /// `[mcu_ids]` allocator (`mcu/ids.rs`; the historical `[canbus_ids]`
+    /// spelling still loads) unless the section overrides it explicitly:
     ///
     /// ```ini
     /// [mcu]
@@ -134,8 +139,9 @@ impl McuConfig {
     /// canbus_nodeid: 2
     /// ```
     ///
-    /// `canbus_nodeid` is klipperx-only (upstream has no such option): it is the
-    /// node id the MCU uses instead of the one the allocator would hand out.
+    /// `canbus_nodeid` is klipperx-only (upstream has no such option): it names the
+    /// MCU-layer id this `[mcu]` takes instead of the one the allocator would hand
+    /// out (the key keeps Klipper's spelling).
     ///
     /// `baud` only applies to `serial`, and defaults to Klipper's 250000.
     ///
@@ -164,11 +170,11 @@ impl McuConfig {
         let id = match &transport {
             Transport::Can { .. } => match section.get_str("canbus_nodeid") {
                 Some(text) => match text.parse::<u32>() {
-                    Ok(id) if (1..=MAX_CANBUS_NODEID).contains(&id) => Some(id),
+                    Ok(id) if (1..=MAX_MCU_ID).contains(&id) => Some(id),
                     _ => {
                         return Err(ConfigError::new(format!(
                             "MCU '{}' has an invalid canbus_nodeid: '{text}' \
-                             (expected 1..={MAX_CANBUS_NODEID})",
+                             (expected 1..={MAX_MCU_ID})",
                             section.identifier()
                         )))
                     }
@@ -408,7 +414,7 @@ impl Transport {
                 // fills it in at connect time (see `mcu/object.rs`), and only an
                 // explicit `canbus_nodeid` is set this early.
                 let id =
-                    id.ok_or_else(|| "canbus: the node id has not been assigned".to_string())?;
+                    id.ok_or_else(|| "canbus: the MCU id has not been assigned".to_string())?;
                 Interface::canserial(interface, *uuid, id).map_err(|e| format!("canbus: {e}"))
             }
             Transport::Host { library } => {
@@ -679,7 +685,7 @@ mod tests {
 
     #[test]
     fn test_canbus_nodeid_is_validated() {
-        for bad in ["0", "fast", "900"] {
+        for bad in ["0", "fast", "256"] {
             let section = can_section(&[("canbus_nodeid", bad)]);
             let err = McuConfig::new(&wrap(&section)).unwrap_err();
             assert!(
@@ -687,6 +693,11 @@ mod tests {
                 "{bad}: {err}"
             );
         }
+
+        // 255 (`0xff`) is the largest id the single admin byte can carry, so the
+        // upper bound itself is accepted; one past it (above) is not.
+        let config = McuConfig::new(&wrap(&can_section(&[("canbus_nodeid", "255")]))).unwrap();
+        assert_eq!(config.id, Some(255));
 
         // A valid node id gets as far as the socket, which is where it fails here.
         let err = McuConfig::new(&wrap(&can_section(&[])))
@@ -709,7 +720,7 @@ mod tests {
         assert!(matches!(config.id, None));
         assert!(matches!(config.transport, Transport::Can { .. }));
         let err = config.open().unwrap_err();
-        assert!(err.contains("node id has not been assigned"), "{err}");
+        assert!(err.contains("MCU id has not been assigned"), "{err}");
 
         // Written explicitly, the option is the id parsing carries.
         section.parameters.insert(

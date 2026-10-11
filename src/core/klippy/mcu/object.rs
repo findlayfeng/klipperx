@@ -134,9 +134,9 @@ pub struct McuObject {
     ///
     /// `Some` after the loader registered the section; `connect` refuses to
     /// open a transport without it (a CAN MCU cannot be addressed until it has
-    /// its node id, and every other transport will need its own later). `None`
-    /// only for an object built outside the loader, which is never the one a
-    /// working machine connects.
+    /// the id it was assigned, and every transport takes one from the same
+    /// sequence). `None` only for an object built outside the loader, which is
+    /// never the one a working machine connects.
     id: Mutex<Option<u32>>,
     /// The restart method of the connection currently up.
     ///

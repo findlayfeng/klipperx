@@ -937,7 +937,7 @@ fn mcu_plan_lines(config: &Config) -> Vec<String> {
             } else if section.has("canbus_uuid") {
                 (
                     format!(
-                        "canbus_uuid: {} (interface: {}, nodeid: {})",
+                        "canbus_uuid: {} (interface: {}, mcu id: {})",
                         section.get_str("canbus_uuid").unwrap_or_default(),
                         section.get_str("canbus_interface").unwrap_or("can0"),
                         section
@@ -1392,7 +1392,7 @@ mod tests {
         assert_eq!(
             mcu_plan_lines(&can),
             vec![
-                "HW-MCU: [mcu zboard] canbus_uuid: 11aa22bb33cc (interface: can0, nodeid: 2) \
+                "HW-MCU: [mcu zboard] canbus_uuid: 11aa22bb33cc (interface: can0, mcu id: 2) \
                  — .mcu_named(\"zboard\") tests run"
                     .to_string()
             ]

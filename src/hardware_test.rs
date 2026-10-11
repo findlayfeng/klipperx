@@ -942,7 +942,7 @@ fn mcu_plan_lines(config: &Config) -> Vec<String> {
                         section.get_str("canbus_interface").unwrap_or("can0"),
                         section
                             .get_str("canbus_nodeid")
-                            .unwrap_or("unset (klipperx needs one)"),
+                            .unwrap_or("unset (assigned at load by [mcu_ids])"),
                     ),
                     format!("{requirement} tests run"),
                 )

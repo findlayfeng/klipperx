@@ -505,7 +505,8 @@ impl CanSerialDevice {
         &self.interface
     }
 
-    /// The CAN node id from the configuration.
+    /// This MCU's MCU-layer id, as the configuration assigned it: on this CAN
+    /// link it is the node id, addressed as `0x100 + 2 * id`.
     pub fn nodeid(&self) -> u32 {
         self.nodeid
     }

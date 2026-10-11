@@ -61,7 +61,8 @@ pub struct Interface {
 /// section can ask for:
 /// - `Serial(SerialDevice)` — a real MCU on a tty (`serial:`)
 /// - `CanSerial(CanSerialDevice)` — a real MCU reached over CAN, using Klipper's
-///   can-serial link (`canbus_uuid:` + `canbus_interface:` + `canbus_nodeid:`)
+///   can-serial link (`canbus_uuid:` + `canbus_interface:`; `canbus_nodeid:` is
+///   the Klipper-named key that explicitly overrides the MCU's layer id)
 /// - `Host(HostDevice)` — klipper's host library, loaded from a shared object
 ///   (`host_library:`)
 /// - `FrameMock(FrameMock)` — a frame-level mock for tests (built in code)

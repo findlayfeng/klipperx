@@ -1489,12 +1489,14 @@ pub fn load_config(
     // config is loaded, so the whole sequence is known before any of them
     // connects (upstream registers a CAN MCU's uuid in `MCU.__init__`,
     // `klippy/mcu.py:784`; the id is generalized to every transport in
-    // `mcu/ids.rs`). The order these calls happen in is the order `[mcu]`
-    // sections are declared, which is the order ids are handed out in. A CAN
-    // MCU brings its uuid and any explicit `canbus_nodeid`; another transport
-    // takes the next id from the same sequence, with no concrete allocation of
-    // its own yet.
+    // `mcu/ids.rs`). Before the first one takes an id, the allocator reserves
+    // every explicit `canbus_nodeid` in the config, so the auto ids the later
+    // sections receive step over them — an explicit claim is honoured wherever
+    // it sits in the file. A CAN MCU brings its uuid and any explicit
+    // `canbus_nodeid`; another transport takes the lowest free id from the same
+    // sequence, with no concrete allocation of its own yet.
     let allocator = ids::ensure(printer)?;
+    allocator.reserve_explicit(config);
     let id = match &parsed.transport {
         Transport::Can { uuid, .. } => allocator.register_can(&parsed.name, *uuid, parsed.id)?,
         _ => allocator.register(&parsed.name)?,

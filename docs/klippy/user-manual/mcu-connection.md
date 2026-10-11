@@ -7,7 +7,7 @@
 | `serial` | 串口设备路径（如 `/dev/ttyACM0`） | 打开真实 MCU 所在的串口；可配 `baud`（默认 250000） |
 | `canbus_uuid` | MCU 芯片的唯一 ID（12 位十六进制） | 通过 CAN 连接时必给，Klipper 同名参数 |
 | `canbus_interface` | CAN 网络接口名 | 可选，默认 `can0` |
-| `canbus_nodeid` | CAN 节点号（1..895） | **可选**：不写就由 `[mcu_ids]`（历史名 `[canbus_ids]`）的分配器按 `[mcu]` 声明顺序发（起点 4、步长 1）；写了就用写的那个。与自增号撞车时装载期报错 |
+| `canbus_nodeid` | CAN 节点号（1..895） | **可选**：不写就由 `[mcu_ids]`（历史名 `[canbus_ids]`）的分配器发 `4` 起的最小空位；写了就用写的那个（分配器装载时预扫全配置保留显式号，自动号绕开，写在哪个位置都生效）。只在两个显式号互撞、或 `4..=895` 占满时装载期报错 |
 | `host_library` | klipper host 库（`libklipper_host.so`）的路径 | 在主机进程内运行一份 klipper 固件（模拟与自测用） |
 
 ```ini
@@ -30,7 +30,9 @@ CAN 这条走的是 klipper 的 **can serial** 链路（就像把串口协议搬
 
 节点号到仲裁 ID 的映射也沿用 Klipper：`0x100 + 2 × nodeid`，主机写这个 ID、MCU 用下一个回；节点号由主机通过 admin ID `0x3f0` 的 `CMD_SET_NODEID` 报文指派，所以配置里 `canbus_uuid` 是必需的（节点号本身可由 `[mcu_ids]` 分配、不必写；历史拼写 `[canbus_ids]` 仍兼容）。
 
-节点号在本仓是 **MCU 层 id**：每个 `[mcu]`（不论接口）在装载期都被分配一个唯一 id（所有接口共用同一个序列，`mcu/ids.rs`），`connect` 打开传输层之前必须持有它——CAN 用它做节点寻址（admin 帧），串口用下节的**帧级指派**把 id 交给设备；`host_library` 与 `test:` 暂不指派。显式 `canbus_nodeid` 就是这个 id 的显式覆盖。
+节点号在本仓是 **MCU 层 id**：每个 `[mcu]`（不论接口）在装载期都被分配一个唯一 id（所有接口共用同一个序列，`mcu/ids.rs`），`connect` 打开传输层之前必须持有它——CAN 用它做节点寻址（admin 帧），串口用下节的**帧级指派**把 id 交给设备；`host_library` 与 `test:` 暂不指派。显式 `canbus_nodeid` 就是这个 id 的显式覆盖：分配器
+在装载时预扫全配置、先把所有显式号保留下来（`reserve_explicit`），自动号取 `4` 起的
+**最小空位**并绕开它们——所以显式号写在哪个位置都生效，发号结果与声明顺序无关。
 
 ## 帧级 id 指派（identify 之前）
 

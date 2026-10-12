@@ -95,7 +95,8 @@ pub struct Frame {
     /// `(seq & MESSAGE_SEQ_MASK) | MESSAGE_DEST`.
     ///
     /// `None` for every ordinary frame. The one pattern that sets it is the
-    /// frame-level id assignment ([`crate::core::klippy::assign`]), whose
+    /// frame-level id assignment
+    /// ([`crate::core::klippy::interface::devices::shared_serial`]), whose
     /// whole point is a sequence byte that fails the `MESSAGE_DEST` check — a
     /// value [`Frame::encode`] can no more produce than old firmware can.
     wire_seq: Option<u8>,
@@ -181,7 +182,8 @@ impl Frame {
     /// Create a Frame whose wire sequence byte is `seq_byte` verbatim.
     ///
     /// The one use is the frame-level id assignment pattern
-    /// ([`crate::core::klippy::assign`]): a byte outside `0x10..=0x1f`, which
+    /// ([`crate::core::klippy::interface::devices::shared_serial`]): a byte
+    /// outside `0x10..=0x1f`, which
     /// neither [`Frame::encode`] nor the firmware's own `command_add_frame`
     /// can produce. Parsing such a byte from the wire never yields one of
     /// these ([`Frame::check`] rejects it) — this is for sending.
@@ -446,7 +448,8 @@ mod tests {
         assert_eq!(bytes[MESSAGE_POS_SEQ], 0x20, "the byte goes out as given");
         // The host's own defence still rejects it — the pattern exists to be
         // *sent*, and its answer is matched by the assignment handshake
-        // (`crate::core::klippy::assign`), which reads raw reassembled bytes.
+        // (`crate::core::klippy::interface::devices::shared_serial`), which
+        // reads raw reassembled bytes.
         assert!(Frame::check(&bytes).is_err());
         assert!(Frame::parse(&bytes).is_none());
         // Ordinary frames are untouched: encode still derives the DEST bit.

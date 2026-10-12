@@ -890,14 +890,14 @@ mod tests {
             let _entered = handle.enter();
             config.open()
         });
-        let request = assign::assignment_request(mcu_id).expect("a valid mcu id");
+        let request = shared_serial::assignment_request(mcu_id).expect("a valid mcu id");
         assert_eq!(
             read_n(&pty.master, request.len()),
             request,
             "the assignment request goes out verbatim"
         );
         (&pty.master)
-            .write_all(&assign::assignment_reply(mcu_id).expect("a valid mcu id"))
+            .write_all(&shared_serial::assignment_reply(mcu_id).expect("a valid mcu id"))
             .expect("pty master write");
         opener.await.expect("the opener task ran")
     }
@@ -920,7 +920,7 @@ mod tests {
         // one would write the bare frame.
         let frame = Frame::new(0, vec![1, 2]);
         interface.send(frame.clone()).await.unwrap();
-        let header = assign::encode_header(assign::arb_id(7).expect("a valid id"));
+        let header = shared_serial::encode_header(assign::arb_id(7).expect("a valid id"));
         let wire = read_n(&pty.master, header.len() + frame.raw_bytes().len());
         assert_eq!(
             &wire[..header.len()],

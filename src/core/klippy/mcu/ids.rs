@@ -23,11 +23,11 @@
 //! rejected), and an explicit `canbus_nodeid` overrides the sequence. What each
 //! transport does with the number is its own: CAN uses it as the node id, a
 //! **shared** serial port takes it as the source of its arbitration-id header
-//! and assignment handshake (`crate::core::klippy::assign`), and an
+//! and assignment handshake
+//! (`crate::core::klippy::interface::devices::shared_serial`), and an
 //! **exclusive** serial port does not use it at all — `host_library` and the
-//! `test:` simulator likewise send nothing yet. Nothing uses an id for
-//! *addressing* outside CAN — the frame-header scheme is still to be built.
-//! That is the point of moving the id to this layer: every MCU is assigned —
+//! `test:` simulator likewise send nothing yet. That is the point of moving the
+//! id to this layer: every MCU is assigned —
 //! `McuObject::connect` refuses to open without one — while the number's use on
 //! the wire stays a transport's own business.
 //!

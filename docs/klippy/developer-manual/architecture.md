@@ -35,7 +35,8 @@
 | 实现 | 配置键 | 线上是什么 |
 |------|--------|-----------|
 | `SerialDevice` | `serial:` | tty 上的字节流 |
-| `CanSerialDevice` | `canbus_uuid:` + `canbus_interface:`（`canbus_nodeid:` 可选，由 MCU id 分配器 `[mcu_ids]`——历史名 `[canbus_ids]` 兼容——分配，`mcu/ids.rs`；其它接口也各分到一个 id——串口在 open 时以帧级指派交付、暂不用于寻址） | SocketCAN，**承载的仍是同一份 serial 字节流**；admin 扫描（`klipperx canbus-scan`）走单独的 `CanbusAdminSocket`——它直接说 CAN 协议本身，不是 `Device` |
+| `CanSerialDevice` | `canbus_uuid:` + `canbus_interface:`（`canbus_nodeid:` 可选，由 MCU id 分配器 `[mcu_ids]`——历史名 `[canbus_ids]` 兼容——分配，`mcu/ids.rs`；其它接口也各分到一个 id——**共享串口**用同一套 `0x100+2*id` 做帧头寻址、并在分配端口时同步握手，**独占串口不使用**） | SocketCAN，**承载的仍是同一份 serial 字节流**；admin 扫描（`klipperx canbus-scan`）走单独的 `CanbusAdminSocket`——它直接说 CAN 协议本身，不是 `Device` |
+| `SharedSerialHandle` | `serial:`（**同一路径被 ≥2 颗 `[mcu]` 引用**，由 `mcu/serial_ports.rs` 在装载期分组） | 同一个 tty 上按 id 分派：单元 = `[VLQ(0x100 + 2*mcu_id)] ++ 原始帧`（帧体一字节不改），设备在 `+1` 方向回；分配端口时做一次同步握手（[串口复用协议](serial-mux-protocol.md)） |
 | `HostDevice` | `host_library:` | `dlopen` 的 klipper host 库，输入/输出都是协议字节 |
 | `FrameMock` | —（仅测试构建，代码里直接建） | 脚本化应答 |
 | `SimulatorDevice` | `test: dict=<path>`（仅测试构建） | 字典驱动应答 |
@@ -46,6 +47,8 @@
 
 - 改 CAN 不需要另一套协议代码，只需要那个 `0x100 + 2*nodeid` 的映射（单测覆盖它，socket 层只经过编译，见 [测试](testing.md)）；
 - TRACE 日志里 CAN 打两种行：**分片行**每个 CAN 帧一行（`rx can frame [can0:0x30a]: id 0x30b data 01020304 05060708`，仲裁 id + 8 个数据字节，就是总线上看到的东西），**整块行**按 serial 帧格式打一次（`rx frame [can0:0x30a]: 0a11 | 01020304 05 | 31d87e`）。`rx` 先逐片打分片行、凑齐后再打整块行；`tx` 先打整块行（拆片之前）、再逐片打分片行。**整块只占一个 CAN 帧时两种行也都会打**——总线上的分片与协议里的块不是一回事。
+
+**串口没有寻址能力**：在总线那一侧，仲裁 id 由 CAN 硬件负责，而一条串口线上只有一个字节流。所以「同一个 `serial:` 路径被 ≥2 颗 `[mcu]` 引用」时，地址头得主机自己加：单元 = `[VLQ(0x100 + 2*mcu_id)] ++ 原始帧`（帧体一个字节不改），设备在 `+1` 方向回；端口只开一次，主机侧**唯一 reader** 按头分派到每颗 MCU 自己的 `FrameStream`，并用**分配期同步握手**（identify 之前，无回执即连接失败）确认设备懂这套协议。只被 1 颗引用时一切与 Klipper 相同（无头、无握手）。完整线上规格与设备端要求见[串口复用协议](serial-mux-protocol.md)；装载期分组在 `mcu/serial_ports.rs`，端口/reader/分派/握手在 `interface/devices/shared_serial.rs`。
 
 ### 开启 TRACE
 

@@ -4,7 +4,7 @@
 
 | 参数 | 值 | 说明 |
 |------|-----|------|
-| `serial` | 串口设备路径（如 `/dev/ttyACM0`） | 打开真实 MCU 所在的串口；可配 `baud`（默认 250000） |
+| `serial` | 串口设备路径（如 `/dev/ttyACM0`） | 打开真实 MCU 所在的串口；可配 `baud`（默认 250000）。**同一路径被两颗及以上 `[mcu]` 引用即共享**（见下节） |
 | `canbus_uuid` | MCU 芯片的唯一 ID（12 位十六进制） | 通过 CAN 连接时必给，Klipper 同名参数 |
 | `canbus_interface` | CAN 网络接口名 | 可选，默认 `can0` |
 | `canbus_nodeid` | **MCU 层 id**（1..=255；CAN 上即节点号） | **可选**：不写就由 `[mcu_ids]`（历史名 `[canbus_ids]`）的分配器发 `4` 起的最小空位；写了就用写的那个（分配器装载时预扫全配置保留显式号，自动号绕开，写在哪个位置都生效）。只在两个显式号互撞、或 `4..=255` 占满时装载期报错 |
@@ -30,25 +30,42 @@ CAN 这条走的是 klipper 的 **can serial** 链路（就像把串口协议搬
 
 节点号到仲裁 ID 的映射也沿用 Klipper：`0x100 + 2 × nodeid`，主机写这个 ID、MCU 用下一个回；节点号由主机通过 admin ID `0x3f0` 的 `CMD_SET_NODEID` 报文指派，所以配置里 `canbus_uuid` 是必需的（节点号本身可由 `[mcu_ids]` 分配、不必写；历史拼写 `[canbus_ids]` 仍兼容）。
 
-节点号在本仓是 **MCU 层 id**：每个 `[mcu]`（不论接口）在装载期都被分配一个唯一 id（所有接口共用同一个序列，`mcu/ids.rs`），`connect` 打开传输层之前必须持有它——CAN 用它做节点寻址（admin 帧），串口用下节的**帧级指派**把 id 交给设备；`host_library` 与 `test:` 暂不指派。显式 `canbus_nodeid` 就是这个 id 的显式覆盖：分配器
+节点号在本仓是 **MCU 层 id**：每个 `[mcu]`（不论接口）在装载期都被分配一个唯一 id（所有接口共用同一个序列，`mcu/ids.rs`），`connect` 打开传输层之前必须持有它——CAN 用它做节点寻址（admin 帧），**共享串口**用下节的帧头与**分配期握手**把 id 交给设备、并拿它做寻址，**独占串口不使用它**；`host_library` 与 `test:` 暂不指派。显式 `canbus_nodeid` 就是这个 id 的显式覆盖：分配器
 在装载时预扫全配置、先把所有显式号保留下来（`reserve_explicit`），自动号取 `4` 起的
 **最小空位**并绕开它们——所以显式号写在哪个位置都生效，发号结果与声明顺序无关。
 
-## 帧级 id 指派（identify 之前）
+## 共享串口（同一 `serial:` 路径被多颗 MCU 引用）
 
-串口没有 CAN 那样的总线旁道，指派就在**帧格式里开一条旧固件会默认抛弃的信道**：与 admin 帧同位（端口一开、identify 之前），完全不走 msg 体系（不依赖字典、不是命令）。
+同一个 `serial:` 路径被**两颗及以上** `[mcu]` 引用，就是**共享串口**：主机只把它打开一次，每颗 MCU 用自己的 **MCU 层 id** 给帧加一个地址头，收发按 id 分派（装载期按路径分组的是 `mcu/serial_ports.rs`，端口/reader/分派是 `interface/devices/shared_serial.rs`）。只被一颗引用时仍是**独占**，行为与 Klipper 一样：**不发任何指派帧、线上不带任何头**。
 
-```text
-[len][0x20]["K" "X" "I" "D"][十进制 id][crc16 hi][crc16 lo][0x7e]
+```ini
+[mcu]
+serial: /dev/ttyUSB0        # 与下一条同路径 → 共享
+
+[mcu tool]
+serial: /dev/ttyUSB0
 ```
 
-与常规帧唯一不同的是 **seq 字节**：`0x20` 把合法帧必须置的 `MESSAGE_DEST` 位清掉、改用 bit5；载荷与头部绝不含 `0x7e`（CRC 字节是算出来的、可能恰好是——id 81 就会，固件此时分两步丢弃，同样无害）。其余（长度范围、尾部 SYNC、CRC）都是标准帧结构，有能力的固件无需新校验就能验证。
+- **baud**：共享路径上以**显式写出的** baud 为准；多颗写了不同的值就 `warn` 并**取最小值**，没写 baud 的节跟着这个值走（不一致不再是配置错）。
+- **id**：就是 `[mcu_ids]` 分给该 MCU 的号（`canbus_nodeid` 可显式覆盖），与 CAN 节点号**同一个号段**——寻址用同一套映射 `0x100 + 2*id`（设备应答 `+1`）。
+- **握手**：每颗 MCU 在**打开（分配）这个共享端口时**同步做一次 id 指派握手，identify 之前完成；默认 **500 ms × 3 次**，无回执即连接失败。
+- **复位**：`restart_method` 的线级复位（`arduino` 的 DTR 翻转、`cheetah`、`rpi_usb` 切电）作用在**整条线**上，会把共享端口上的所有 MCU 一起打断；共享路径建议写 `restart_method: command`。
 
-**旧固件的行为**（`command_find_block`，`third_party/klipper/src/command.c`，由 `mcu/assign.rs` 的可执行移植测试钉住）：长度检查通过 → **seq 字节检查（:287）不过 → 错误分支**：不读载荷、不查 CRC、永不 dispatch、`next_sequence` 不动；丢弃恰好吞下本帧（到帧尾 `0x7e` 为止），至多回一枚**无害空帧**（seq 是它自己的 `next_sequence`，主机读作「无进展的 ack」），此后静默（`CF_NEED_VALID` 抑制重复报错）。夹在它后面的 identify 帧照常解析、照常执行。
+> 设备端**尚未实现**这套复用协议：今天的串口固件不会回执，所以共享串口现在必然握手超时、连不上。这是预期状态——误配到旧固件只会连接失败，不会搞乱会话。
 
-**有能力解析的固件**按同形反向回执 `[len][0x20]["KXID"][id][crc][0x7e]`——旧固件发不出这种帧（`command_add_frame` 的 seq 恒在 `0x10..=0x1f`）。主机在 `FrameStream`（`frame.rs`）认出它而不是丢弃，接收任务把 id 记到 `Mcu::assignment_confirmed()`——这是将来「有 id 就加帧头」的寻址头会读的门控钩子。
+### 线上的形状（设备端实现规格）
 
-**边界**：发送是 fire-and-forget——不等回执、不增加连接延迟，发送失败只记 warn 不挡连接；`host_library` 与 `test:` 不发（后者脚本帧会拒绝未映射的发送）；CAN 保留自己的 admin 帧。**本轮帧格式对所有设备都是当前格式**：指派只多发一帧，不改任何已有帧；帧头寻址**未落地**。识别在帧重组处发生，有两个边界：回执若前粘一段**不含 `0x7e` 的坏字节**，可能与回执被一并吞掉（该回执丢失、`assignment_confirmed` 不置位；噪声自带 `0x7e` 则无碍）；回执也可能要等**断连才被排空**（接收任务在关闭路径上同样排空，已有测试钉住）——今天无消费方，两者仅作记录。
+单元 = **帧头 + 原样的 Klipper 帧**，帧体一个字节都不改（长度/序号/载荷/CRC 全保持）：
+
+```text
+[VLQ(0x100 + 2*id)]      [len][seq][载荷…][crc16 hi][crc16 lo][0x7e]   主机 → 设备
+[VLQ(0x100 + 2*id + 1)]  [len][seq][载荷…][crc16 hi][crc16 lo][0x7e]   设备 → 主机
+```
+
+- 帧头是仲裁 id 的 **Klipper 数值编码**（VLQ：最高 7 位组在前、除末字节外都带 `0x80` 续位），本号段**恒 2 字节**：`id=1 → 82 02`、`id=255 → 85 7E`。`0x7e` **可以**出现在头里（`id ∈ {63,127,191,255}` 时主机方向的第二字节就是它）——上游协议本来就允许帧内容含 sync 字符（`third_party/klipper/docs/Protocol.md:178-183`），长度字节才是权威、CRC 负责校验。
+- 握手请求/回执 = 上面的头 **++ 一个 9 字节伪帧** `[09][0x20]["KXID"][crc16 hi][crc16 lo][0x7e]`：`seq` 字节用 `0x20`（把合法帧必置的 `MESSAGE_DEST` 清掉、改占 bit5），所以主机自己的 `Frame::parse` 必然拒收它，**id 只在帧头里出现一次**。
+- **请求对旧固件无害**：旧固件 `command_find_block`（`third_party/klipper/src/command.c`）在 seq 字节检查处就进错误分支——不读载荷、不查 CRC、永不 dispatch、序号不动，丢弃至多回一枚无害空帧后转静默；这条性质由 `assign.rs` 里的**可执行忠实移植测试**钉住。设备端要做的只是：认出请求 → 用 `+1` 方向的头 + 同形伪帧回执。
+- 完整的线上规格、超时/重试、主机侧的单 reader 分派与引用计数关闭，见开发手册的 [串口复用协议](../developer-manual/serial-mux-protocol.md)。
 
 ## 固件重启方式（`restart_method`）
 

@@ -1,4 +1,4 @@
-//! Which `serial:` paths are shared, and whether the MCUs on one agree on baud.
+//! Which `serial:` paths are shared, who is on one, and at what baud.
 //!
 //! A serial port normally belongs to a single `[mcu]`: one path, one device, one
 //! rate. This module is the load-time pass that tells the two shapes apart. It
@@ -6,16 +6,21 @@
 //! names a `serial:` path and groups them **by path string**: a path one section
 //! names is exclusive (the existing single-MCU mode), a path two or more name is
 //! *shared*, the mode several MCUs on one port use. Nothing here opens a port or
-//! touches a transport; it only classifies and validates, so the answer is ready
-//! before anything connects. Mapping a shared group onto the transport is the
-//! next layer's work.
+//! touches a transport; it only classifies and picks the rate, so the answer is
+//! ready before anything connects. Mapping a shared group onto the transport is
+//! the next layer's work.
 //!
-//! The one check is baud agreement: MCUs on one path talk at one rate, so two
-//! different `baud` values for the same path is a config error that names both
-//! MCUs, the path, and the two rates. An absent `baud` means [`DEFAULT_BAUD`] —
-//! the same default the section's own transport parse applies
-//! (`config/mcu.rs`) — so a shared path where one MCU writes no rate and another
-//! writes [`DEFAULT_BAUD`] is consistent, not a conflict.
+//! The one rule is baud, and the rate of a path is the **lowest** `baud` its
+//! sections write — or [`DEFAULT_BAUD`] when none of them writes one. A section
+//! that writes no `baud` has no vote of its own: it follows the rate the path
+//! ends up with, so one MCU writing a rate and another writing nothing agree on
+//! that rate instead of colliding with the default. Sections that write
+//! different rates are worth saying out loud — they would drive the port at
+//! different speeds — so the disagreement is `warn!`ed about, naming the path,
+//! the rates, the MCUs that wrote them, and the rate chosen; the lowest wins and
+//! the config still loads. Which rates are acceptable at all is the section's
+//! own transport parse's call (`config/mcu.rs`), this pass only picks among the
+//! rates it will accept.
 //!
 //! Like [`McuIds::reserve_explicit`](super::ids::McuIds::reserve_explicit), this
 //! is a pre-scan: it reads a sibling section's raw option text rather than going
@@ -24,30 +29,40 @@
 //! [`check_unused`](crate::core::klippy::config::check_unused) on its own
 //! account. The section's own factory is the one that reads and validates
 //! `serial`/`baud`; a rate that does not parse is left for it to report, and is
-//! skipped for the comparison here exactly as an unparsable `canbus_nodeid` is
-//! left unreserved.
+//! skipped here exactly as an unparsable `canbus_nodeid` is left unreserved.
 
 use std::collections::BTreeMap;
 
-use crate::core::klippy::config::{ConfigError, ConfigWrapper};
+use crate::core::klippy::config::ConfigWrapper;
 use crate::core::klippy::interface::devices::serial::DEFAULT_BAUD;
+use tracing::warn;
 
 /// The serial paths the config names, grouped by path.
 ///
 /// Built once at load by [`SerialPorts::classify`]; the transport layer asks it
-/// whether a path is shared and who is on it before opening the port.
+/// whether a path is shared, who is on it, and at what rate before opening the
+/// port.
 #[derive(Debug, Default)]
 pub struct SerialPorts {
-    /// path → the MCU names naming it, in `[mcu]` declaration order: the bare
+    /// path → its `[mcu]` sections. A `BTreeMap` so a path whose MCUs write
+    /// different rates is reported in the same order on every run.
+    by_path: BTreeMap<String, PathGroup>,
+}
+
+/// One `serial:` path and the `[mcu]` sections that name it.
+#[derive(Debug)]
+struct PathGroup {
+    /// The MCU names naming the path, in `[mcu]` declaration order: the bare
     /// `[mcu]` first, then every `[mcu <name>]` in file order, the order
     /// [`McuIds::reserve_explicit`](super::ids::McuIds::reserve_explicit) reads
-    /// them in. A `BTreeMap` so a conflicting path is reported in the same order
-    /// on every run.
-    by_path: BTreeMap<String, Vec<String>>,
+    /// them in.
+    members: Vec<String>,
+    /// The rate they share, as [`SerialPorts::effective_baud`] reports it.
+    baud: u32,
 }
 
 impl SerialPorts {
-    /// Group every `[mcu]` section's `serial:` path and check the bauds agree.
+    /// Group every `[mcu]` section's `serial:` path and pick the rate it uses.
     ///
     /// A section without a `serial` option (host library, CAN, the `test:`
     /// simulator) is not on a serial path and is skipped. The section list is
@@ -55,15 +70,14 @@ impl SerialPorts {
     /// [`McuIds::reserve_explicit`](super::ids::McuIds::reserve_explicit) scans:
     /// the bare `[mcu]` and every `[mcu <name>]`.
     ///
-    /// # Errors
-    /// A config error when one path carries two different bauds. Two sections
-    /// naming a path with no rate at all agree, since both mean
-    /// [`DEFAULT_BAUD`].
-    pub fn classify(config: &ConfigWrapper) -> Result<Self, ConfigError> {
+    /// The rate of a path is the lowest `baud` its sections write, or
+    /// [`DEFAULT_BAUD`] when none of them writes one; sections that write
+    /// different rates are warned about, and the lowest wins — see
+    /// [`effective_baud_for`].
+    pub fn classify(config: &ConfigWrapper) -> Self {
         // path → (mcu name, the baud it declares). A `None` baud means the
-        // section names one that does not parse: its own factory reports that,
-        // so it is skipped for the comparison instead of becoming a second
-        // error here.
+        // section writes none, or writes one that does not parse: its own
+        // factory reports that, so it takes no part in the choice here.
         let mut groups: BTreeMap<String, Vec<(String, Option<u32>)>> = BTreeMap::new();
         for section in config
             .sibling("mcu")
@@ -79,12 +93,18 @@ impl SerialPorts {
                 .push((section.identifier(), declared_baud(&section)));
         }
 
-        let mut by_path: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut by_path: BTreeMap<String, PathGroup> = BTreeMap::new();
         for (path, members) in groups {
-            check_baud_agrees(&path, &members)?;
-            by_path.insert(path, members.into_iter().map(|(name, _)| name).collect());
+            let baud = effective_baud_for(&path, &members);
+            by_path.insert(
+                path,
+                PathGroup {
+                    members: members.into_iter().map(|(name, _)| name).collect(),
+                    baud,
+                },
+            );
         }
-        Ok(Self { by_path })
+        Self { by_path }
     }
 
     /// Whether two or more MCUs name `path`. A path no MCU names is not shared.
@@ -95,48 +115,75 @@ impl SerialPorts {
     /// The MCUs that name `path`, in declaration order — one for an exclusive
     /// port, two or more for a shared one. Empty when no `[mcu]` names it.
     pub fn peers(&self, path: &str) -> &[String] {
-        self.by_path.get(path).map(Vec::as_slice).unwrap_or(&[])
+        self.by_path
+            .get(path)
+            .map(|group| group.members.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// The rate every MCU on `path` talks at: the lowest `baud` its sections
+    /// write, or [`DEFAULT_BAUD`] when none of them writes one. `None` when no
+    /// `[mcu]` names `path` at all.
+    pub fn effective_baud(&self, path: &str) -> Option<u32> {
+        self.by_path.get(path).map(|group| group.baud)
     }
 }
 
-/// The baud a `[mcu]` section declares: its `baud` option, or [`DEFAULT_BAUD`]
-/// when it writes none. `None` when it writes one that is not a positive
-/// integer — the section's own transport parse rejects that value
-/// (`config/mcu.rs`), so there is nothing to compare here.
+/// The baud a `[mcu]` section contributes: its `baud` option parsed as a
+/// positive integer, or `None` when it writes no `baud` or writes one that does
+/// not parse. Only sections that write a rate take part in choosing the path's
+/// rate; an absent one follows that choice instead of meaning [`DEFAULT_BAUD`]
+/// (see [`effective_baud_for`]), and a rate that is not a positive integer is
+/// the section's own transport parse's error to report (`config/mcu.rs`).
 fn declared_baud(section: &ConfigWrapper) -> Option<u32> {
-    let Some(text) = section.section().get_text("baud") else {
-        return Some(DEFAULT_BAUD);
-    };
+    let text = section.section().get_text("baud")?;
     match text.trim().parse::<u32>() {
         Ok(baud) if baud > 0 => Some(baud),
         _ => None,
     }
 }
 
-/// Reject a path whose sections name two different bauds, naming both MCUs.
+/// The rate a path's sections end up at, warning when they wrote more than one.
+///
+/// No section writes a rate: the path is at [`DEFAULT_BAUD`]. One rate is
+/// written: that rate governs the path, including the sections that wrote none.
+/// More than one: the path is `warn!`ed about — naming the path, each rate and
+/// the MCUs that wrote it, and the rate chosen — and the lowest is used, the
+/// rate every MCU on the line can talk at.
 ///
 /// Sections whose rate does not parse are skipped: their own factory reports
-/// them. The first parsed rate is the reference every later one must match, so
-/// the error names the two sections whose rates disagree, not just the path.
-fn check_baud_agrees(path: &str, members: &[(String, Option<u32>)]) -> Result<(), ConfigError> {
-    let mut first: Option<(&str, u32)> = None;
+/// them.
+fn effective_baud_for(path: &str, members: &[(String, Option<u32>)]) -> u32 {
+    // The written rates, lowest first, each with the MCUs that wrote them. A
+    // `BTreeMap` so the warning lists them in the same order on every run.
+    let mut by_rate: BTreeMap<u32, Vec<&str>> = BTreeMap::new();
     for (name, baud) in members {
-        let Some(baud) = baud else {
-            continue;
-        };
-        match first {
-            None => first = Some((name.as_str(), *baud)),
-            Some((first_name, first_baud)) if first_baud != *baud => {
-                return Err(ConfigError::new(format!(
-                    "shared serial port '{path}': MCU '{name}' sets baud {baud} but MCU \
-                     '{first_name}' sets baud {first_baud}; a serial port shared by \
-                     several MCUs needs one baud"
-                )));
-            }
-            Some(_) => {}
+        if let Some(baud) = baud {
+            by_rate.entry(*baud).or_default().push(name.as_str());
         }
     }
-    Ok(())
+    let Some((&lowest, _)) = by_rate.first_key_value() else {
+        return DEFAULT_BAUD;
+    };
+    if by_rate.len() > 1 {
+        let written = by_rate
+            .iter()
+            .map(|(baud, names)| {
+                let names = names
+                    .iter()
+                    .map(|name| format!("'{name}'"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("{baud} written by {names}")
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        warn!(
+            "shared serial port '{path}': the MCUs write different bauds ({written}); \
+             using the lowest, {lowest}"
+        );
+    }
+    lowest
 }
 
 // ===========================================================================
@@ -149,12 +196,15 @@ mod tests {
 
     use crate::core::klippy::config::access::AccessTracking;
     use crate::core::klippy::config::Config;
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::layer::SubscriberExt;
 
     /// Parse `text` and classify through its first `[mcu]` section.
     ///
     /// Any `[mcu]`-family wrapper reaches the same sibling sections, so which one
     /// is wrapped does not change the answer.
-    fn classify(text: &str) -> Result<SerialPorts, ConfigError> {
+    fn classify(text: &str) -> SerialPorts {
         let (config, _) = Config::from_text(text).expect("the test config parses");
         let section = config
             .sections()
@@ -164,16 +214,84 @@ mod tests {
         SerialPorts::classify(&wrapper)
     }
 
-    /// A path one MCU names is exclusive; `peers` reports that one MCU.
+    /// Classify `text` through its first `[mcu]` section, returning the warnings
+    /// that went out alongside the answer.
+    ///
+    /// Writing different bauds on one path is reported as a warning, which a test
+    /// has to hear to know it happened — and it must *not* be heard when the
+    /// rates agree, so both directions are asserted through this.
+    fn classify_capturing_warnings(text: &str) -> (SerialPorts, String) {
+        let capture = LogCapture::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::filter::LevelFilter::WARN)
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(capture.clone())
+                    .with_ansi(false),
+            );
+        let ports = tracing::subscriber::with_default(subscriber, || classify(text));
+        (ports, capture.text())
+    }
+
+    /// A byte sink for the fmt layer above. `with_default` keeps the capture off
+    /// the process-wide subscriber, so the tests stay independent of each other
+    /// and of whatever the caller installed.
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<Mutex<Vec<u8>>>);
+
+    impl LogCapture {
+        fn text(&self) -> String {
+            let bytes = self
+                .0
+                .lock()
+                .expect("the capture lock is not poisoned")
+                .clone();
+            String::from_utf8(bytes).expect("tracing writes UTF-8")
+        }
+    }
+
+    impl Write for LogCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("the capture lock is not poisoned")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+        type Writer = LogCapture;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// A path one MCU names is exclusive; `peers` reports that one MCU, at the
+    /// default rate it writes no `baud` for.
     #[test]
     fn a_single_mcu_on_a_path_is_exclusive() {
-        let ports = classify("[mcu]\nserial: /dev/ttyACM0\n").expect("one MCU names the path");
+        let ports = classify("[mcu]\nserial: /dev/ttyACM0\n");
         assert!(!ports.is_shared("/dev/ttyACM0"));
         assert_eq!(ports.peers("/dev/ttyACM0"), ["mcu"]);
+        assert_eq!(ports.effective_baud("/dev/ttyACM0"), Some(DEFAULT_BAUD));
 
         // A path no MCU names is not shared, and has no peers.
         assert!(!ports.is_shared("/dev/ttyACM1"));
         assert!(ports.peers("/dev/ttyACM1").is_empty());
+    }
+
+    /// A path no `[mcu]` names has no rate at all: `None`, not a default.
+    #[test]
+    fn a_path_no_mcu_names_has_no_effective_baud() {
+        let ports = classify("[mcu a]\nserial: /dev/ttyACM0\nbaud: 115200\n");
+        assert_eq!(ports.effective_baud("/dev/ttyACM0"), Some(115200));
+        assert_eq!(ports.effective_baud("/dev/ttyACM1"), None);
     }
 
     /// Two `[mcu <name>]` sections on one path are a shared group, both named.
@@ -182,8 +300,7 @@ mod tests {
         let ports = classify(
             "[mcu a]\nserial: /dev/ttyACM0\n\
              [mcu b]\nserial: /dev/ttyACM0\n",
-        )
-        .expect("the two MCUs agree on baud");
+        );
         assert!(ports.is_shared("/dev/ttyACM0"));
         assert_eq!(ports.peers("/dev/ttyACM0"), ["mcu a", "mcu b"]);
     }
@@ -195,70 +312,110 @@ mod tests {
         let ports = classify(
             "[mcu]\nserial: /dev/ttyACM0\n\
              [mcu tool]\nserial: /dev/ttyACM0\n",
-        )
-        .expect("the two MCUs agree on baud");
+        );
         assert!(ports.is_shared("/dev/ttyACM0"));
         assert_eq!(ports.peers("/dev/ttyACM0"), ["mcu", "mcu tool"]);
     }
 
-    /// Two different bauds on one path are rejected, and the error names both
-    /// MCUs, the path, and both rates.
+    /// Two different bauds on one path are warned about and the lowest wins: the
+    /// config still loads, at the rate every MCU on the line can talk at. The
+    /// warning names the path, both rates, both MCUs and the rate chosen.
     #[test]
-    fn a_shared_path_with_two_bauds_is_rejected() {
-        let err = classify(
+    fn two_different_bauds_take_the_lowest_and_warn() {
+        let (ports, warnings) = classify_capturing_warnings(
             "[mcu a]\nserial: /dev/ttyACM0\nbaud: 250000\n\
              [mcu b]\nserial: /dev/ttyACM0\nbaud: 115200\n",
-        )
-        .unwrap_err();
-        let text = err.to_string();
-        assert!(text.contains("mcu a"), "{text}");
-        assert!(text.contains("mcu b"), "{text}");
-        assert!(text.contains("/dev/ttyACM0"), "{text}");
-        assert!(text.contains("250000"), "{text}");
-        assert!(text.contains("115200"), "{text}");
+        );
+        assert_eq!(ports.effective_baud("/dev/ttyACM0"), Some(115200));
+        assert!(
+            warnings.contains(
+                "shared serial port '/dev/ttyACM0': the MCUs write different bauds \
+                 (115200 written by 'mcu b'; 250000 written by 'mcu a'); \
+                 using the lowest, 115200"
+            ),
+            "the warning should name the path, both rates, both MCUs and the choice:\n{warnings}"
+        );
     }
 
-    /// A missing `baud` means [`DEFAULT_BAUD`], so an MCU that writes no rate and
-    /// one that writes the default agree.
+    /// One written rate governs the whole path: the section that writes none
+    /// follows it instead of colliding with the default, so there is nothing to
+    /// warn about — the rate is the written one, default or not.
     #[test]
-    fn an_absent_baud_means_the_default_rate() {
-        let ports = classify(
-            "[mcu a]\nserial: /dev/ttyACM0\n\
-             [mcu b]\nserial: /dev/ttyACM0\nbaud: 250000\n",
-        )
-        .expect("the absent rate is the default, so both agree");
+    fn one_written_baud_governs_the_whole_path() {
+        let (ports, warnings) = classify_capturing_warnings(
+            "[mcu a]\nserial: /dev/ttyACM0\nbaud: 115200\n\
+             [mcu b]\nserial: /dev/ttyACM0\n",
+        );
         assert!(ports.is_shared("/dev/ttyACM0"));
-
-        // One MCU on its own with no rate is exclusive, and its path is still
-        // known.
-        let ports = classify("[mcu]\nserial: /dev/ttyACM0\n").expect("one MCU");
-        assert_eq!(ports.peers("/dev/ttyACM0"), ["mcu"]);
+        assert_eq!(ports.effective_baud("/dev/ttyACM0"), Some(115200));
+        assert!(
+            warnings.is_empty(),
+            "one written rate is not a disagreement:\n{warnings}"
+        );
     }
 
-    /// A rate that does not parse is not reported here: the section's own
-    /// factory owns that error, so it is skipped for the comparison rather than
-    /// turned into a second one.
+    /// No written rate anywhere on the path: every MCU is at [`DEFAULT_BAUD`],
+    /// which is agreement, not a disagreement to report.
+    #[test]
+    fn no_written_baud_uses_the_default_rate() {
+        let (ports, warnings) = classify_capturing_warnings(
+            "[mcu a]\nserial: /dev/ttyACM0\n\
+             [mcu b]\nserial: /dev/ttyACM0\n",
+        );
+        assert!(ports.is_shared("/dev/ttyACM0"));
+        assert_eq!(ports.effective_baud("/dev/ttyACM0"), Some(DEFAULT_BAUD));
+        assert!(
+            warnings.is_empty(),
+            "nothing was written to disagree about:\n{warnings}"
+        );
+    }
+
+    /// The same written rate on every MCU is agreement: the rate stands and
+    /// there is nothing to warn about.
+    #[test]
+    fn the_same_written_baud_on_every_mcu_is_no_warning() {
+        let (ports, warnings) = classify_capturing_warnings(
+            "[mcu a]\nserial: /dev/ttyACM0\nbaud: 250000\n\
+             [mcu b]\nserial: /dev/ttyACM0\nbaud: 250000\n",
+        );
+        assert_eq!(ports.effective_baud("/dev/ttyACM0"), Some(250_000));
+        assert!(
+            warnings.is_empty(),
+            "one rate is not a disagreement:\n{warnings}"
+        );
+    }
+
+    /// A rate that does not parse is skipped: the section's own factory owns that
+    /// error, so the other MCU's rate is the path's rate rather than a second
+    /// error or a disagreement to warn about.
     #[test]
     fn an_unparsable_baud_is_left_to_the_sections_own_factory() {
-        let ports = classify(
+        let (ports, warnings) = classify_capturing_warnings(
             "[mcu a]\nserial: /dev/ttyACM0\nbaud: fast\n\
              [mcu b]\nserial: /dev/ttyACM0\nbaud: 115200\n",
-        )
-        .expect("the unparsable rate is skipped, not turned into a baud conflict here");
+        );
         assert!(ports.is_shared("/dev/ttyACM0"));
+        assert_eq!(ports.effective_baud("/dev/ttyACM0"), Some(115200));
+        assert!(
+            warnings.is_empty(),
+            "an unparsable rate is not a disagreement:\n{warnings}"
+        );
     }
 
     /// A section without `serial:` is ignored: a `host_library` MCU has a path,
-    /// but it is not a serial path.
+    /// but it is not a serial path, so it has no peers and no rate.
     #[test]
     fn sections_without_serial_are_ignored() {
         let ports = classify(
             "[mcu]\nhost_library: /nonexistent/libklipper_host.so\n\
              [mcu tool]\nhost_library: /nonexistent/libklipper_host.so\n",
-        )
-        .expect("no serial path to check");
+        );
         assert!(!ports.is_shared("/nonexistent/libklipper_host.so"));
         assert!(ports.peers("/nonexistent/libklipper_host.so").is_empty());
+        assert_eq!(
+            ports.effective_baud("/nonexistent/libklipper_host.so"),
+            None
+        );
     }
 
     /// The scan records no reads: it must not exempt a sibling `[mcu]` section's
@@ -273,10 +430,9 @@ mod tests {
         .expect("the test config parses");
         let section = config.get_section("mcu").expect("the bare [mcu]");
         let access = AccessTracking::shared();
-        let wrapper =
-            ConfigWrapper::with_config(section, std::sync::Arc::clone(&access), None, &config);
+        let wrapper = ConfigWrapper::with_config(section, Arc::clone(&access), None, &config);
 
-        SerialPorts::classify(&wrapper).expect("the two MCUs agree on baud");
+        SerialPorts::classify(&wrapper);
 
         assert!(
             access.sections().is_empty(),

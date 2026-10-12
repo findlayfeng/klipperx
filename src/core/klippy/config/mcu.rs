@@ -5,7 +5,7 @@ use crate::core::klippy::interface::usb::UsbPowerMethod;
 #[cfg(test)]
 use crate::core::klippy::interface::SimulatorDevice;
 use crate::core::klippy::interface::{Interface, SerialDevice};
-use crate::core::klippy::mcu::McuRestartMethod;
+use crate::core::klippy::mcu::{serial_ports, McuRestartMethod};
 use std::path::Path;
 use tracing::warn;
 
@@ -195,6 +195,14 @@ impl McuConfig {
             _ => None,
         };
         let serial = matches!(transport, Transport::Serial { .. });
+        // A serial reset is line-wide: `arduino` toggles the shared line's DTR,
+        // `cheetah` drives its RTS, and `rpi_usb` cuts its power, so any of them
+        // would interrupt every MCU on the port. A path two or more `[mcu]`
+        // sections name is therefore pinned to `command` (`parse_restart_method`).
+        let shared = match &transport {
+            Transport::Serial { path, .. } => serial_ports::path_is_shared(section, path),
+            _ => false,
+        };
 
         // The option only means something on a serial port. Say so rather than
         // dropping it silently, then report what the MCU will actually use.
@@ -204,7 +212,7 @@ impl McuConfig {
                  resetting with command"
             );
         }
-        let restart_method = Self::parse_restart_method(section, serial)?;
+        let restart_method = Self::parse_restart_method(section, serial, shared)?;
         let usb_power = Self::parse_usb_power(section, &restart_method)?;
 
         Ok(Self {
@@ -273,11 +281,19 @@ impl McuConfig {
     /// An unknown value is a config error rather than silently becoming the
     /// default — upstream's `getchoice` refuses it too (`:666-671`).
     ///
-    /// The `serial` flag is a parameter rather than a look at the interface so
-    /// the rule can be exercised without a real serial port.
+    /// A **shared** serial port (`mcu/serial_ports.rs`) is pinned to `command`:
+    /// every serial method acts on the whole line, which several MCUs are on,
+    /// so the written value is not used. Only a value that was **written** and
+    /// asks for another method is reported; an unset `restart_method` (whose
+    /// serial default is `arduino`) is a silent downgrade, and an unknown
+    /// spelling is still a config error.
+    ///
+    /// The `serial` and `shared` flags are parameters rather than looks at the
+    /// interface so the rules can be exercised without a real serial port.
     fn parse_restart_method(
         section: &ConfigWrapper,
         serial: bool,
+        shared: bool,
     ) -> Result<McuRestartMethod, ConfigError> {
         // Read the option even when the transport is not serial: the read is
         // what marks it valid to the undefined-option check, so a
@@ -289,16 +305,33 @@ impl McuConfig {
         if !serial {
             return Ok(McuRestartMethod::Command);
         }
-        match text {
-            None => Ok(McuRestartMethod::Arduino),
-            Some(text) => McuRestartMethod::parse(&text).ok_or_else(|| {
+        // The value the option asks for, resolved the way an exclusive port
+        // uses it: unset is `arduino`, an unknown spelling is a config error.
+        let written = match &text {
+            None => McuRestartMethod::Arduino,
+            Some(text) => McuRestartMethod::parse(text).ok_or_else(|| {
                 ConfigError::new(format!(
                     "MCU '{}' has an invalid restart_method: '{text}' (expected one of {})",
                     section.identifier(),
                     McuRestartMethod::CHOICES.join(", ")
                 ))
-            }),
+            })?,
+        };
+        if !shared {
+            return Ok(written);
         }
+        // A value that was written and asks for a line-wide reset cannot be
+        // honoured: say which one it was, then reset with `command` instead.
+        if let Some(text) = &text {
+            if written != McuRestartMethod::Command {
+                warn!(
+                    "MCU '{}' sets restart_method '{text}', which resets the whole line; its \
+                     serial port is shared with another MCU, so it resets with 'command'",
+                    section.identifier()
+                );
+            }
+        }
+        Ok(McuRestartMethod::Command)
     }
 
     /// Describe the transport the section asks for, without opening it.
@@ -469,12 +502,14 @@ mod tests {
     use crate::core::klippy::config::access::AccessTracking;
     use crate::core::klippy::config::section::ConfigSection;
     use crate::core::klippy::config::value::ConfigValue;
+    use crate::core::klippy::config::Config;
     use crate::core::klippy::frame::Frame;
     use crate::core::klippy::interface::devices::serial::DEFAULT_BAUD;
     use crate::core::klippy::interface::pty::Pty;
     use std::io::{Read, Write};
     use std::os::fd::AsRawFd;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::layer::SubscriberExt;
 
     /// Helper that creates a `[mcu]` section with `serial: /fake/tty`.
     fn make_section(_test_lines: &[&str]) -> ConfigSection {
@@ -517,14 +552,14 @@ mod tests {
             ConfigValue::Single("rpi_usb".to_string()),
         );
         // A serial MCU reads the option; the value is taken as written.
-        let method = McuConfig::parse_restart_method(&wrap(&section), true).unwrap();
+        let method = McuConfig::parse_restart_method(&wrap(&section), true, false).unwrap();
         assert_eq!(method, McuRestartMethod::RpiUsb);
     }
 
     #[test]
     fn test_a_serial_mcu_defaults_to_arduino() {
         let section = make_section(&["01 02"]);
-        let method = McuConfig::parse_restart_method(&wrap(&section), true).unwrap();
+        let method = McuConfig::parse_restart_method(&wrap(&section), true, false).unwrap();
         assert_eq!(method, McuRestartMethod::Arduino);
     }
 
@@ -535,7 +570,7 @@ mod tests {
             "restart_method".to_string(),
             ConfigValue::Single("bogus".to_string()),
         );
-        let err = McuConfig::parse_restart_method(&wrap(&section), true).unwrap_err();
+        let err = McuConfig::parse_restart_method(&wrap(&section), true, false).unwrap_err();
         assert!(err.to_string().contains("restart_method"), "{err}");
         assert!(err.to_string().contains("bogus"), "{err}");
         // The error names the valid choices, so the config can be fixed.
@@ -561,7 +596,7 @@ mod tests {
         );
         // Upstream does not read the option off serial, so a value that is
         // meaningless there is not an error — it simply does not apply.
-        let method = McuConfig::parse_restart_method(&wrap(&section), false).unwrap();
+        let method = McuConfig::parse_restart_method(&wrap(&section), false, false).unwrap();
         assert_eq!(method, McuRestartMethod::Command);
     }
 
@@ -579,7 +614,7 @@ mod tests {
         let access = Arc::new(AccessTracking::new());
         let wrapper = ConfigWrapper::new(&section, Arc::clone(&access));
 
-        let method = McuConfig::parse_restart_method(&wrapper, false).unwrap();
+        let method = McuConfig::parse_restart_method(&wrapper, false, false).unwrap();
 
         assert_eq!(method, McuRestartMethod::Command);
         assert!(access.contains("mcu", "restart_method"));
@@ -975,5 +1010,197 @@ mod tests {
             .await
             .expect("a shared attach succeeds and ignores the cheetah RTS");
         interface.shutdown();
+    }
+
+    // -----------------------------------------------------------------------
+    // A shared `serial:` path pins `restart_method` to `command`.
+    // -----------------------------------------------------------------------
+
+    /// Parse `text`'s `[identifier]` section the way the loader does — with the
+    /// whole config on the wrapper — and return the result with the warnings
+    /// that came with it.
+    ///
+    /// The loader's wrapper carries the whole config (`load.rs`), which is what
+    /// lets the shared-path rule see the sibling `[mcu]` sections; a bare
+    /// `wrap` would answer `false` (`mcu/serial_ports.rs`).
+    fn parse_shared(text: &str, identifier: &str) -> (Result<McuConfig, ConfigError>, String) {
+        let capture = LogCapture::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::filter::LevelFilter::WARN)
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(capture.clone())
+                    .with_ansi(false),
+            );
+        let result = tracing::subscriber::with_default(subscriber, || {
+            let (config, _) = Config::from_text(text).expect("the test config parses");
+            let section = config
+                .get_section(identifier)
+                .unwrap_or_else(|| panic!("the config has [{identifier}]"));
+            let wrapper =
+                ConfigWrapper::with_config(section, AccessTracking::shared(), None, &config);
+            McuConfig::new(&wrapper)
+        });
+        (result, capture.text())
+    }
+
+    /// A byte sink for the fmt layer above. `with_default` keeps the capture off
+    /// the process-wide subscriber, the same shape `serial_ports.rs` uses.
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<Mutex<Vec<u8>>>);
+
+    impl LogCapture {
+        fn text(&self) -> String {
+            let bytes = self
+                .0
+                .lock()
+                .expect("the capture lock is not poisoned")
+                .clone();
+            String::from_utf8(bytes).expect("tracing writes UTF-8")
+        }
+    }
+
+    impl Write for LogCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("the capture lock is not poisoned")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+        type Writer = LogCapture;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// A shared path with `restart_method: arduino` written resets with
+    /// `command` and says so: the DTR toggle acts on the whole line.
+    #[test]
+    fn a_shared_serial_forces_arduino_to_command_with_a_warning() {
+        let (config, warnings) = parse_shared(
+            "[mcu]\nserial: /dev/ttyACM0\nrestart_method: arduino\n\
+             [mcu tool]\nserial: /dev/ttyACM0\n",
+            "mcu",
+        );
+        assert_eq!(config.unwrap().restart_method, McuRestartMethod::Command);
+        assert!(
+            warnings.contains("MCU 'mcu'"),
+            "the MCU is named: {warnings}"
+        );
+        assert!(
+            warnings.contains("arduino"),
+            "the written value appears: {warnings}"
+        );
+        assert!(
+            warnings.contains("shared"),
+            "the sharing is stated: {warnings}"
+        );
+        assert!(
+            warnings.contains("command"),
+            "the fallback appears: {warnings}"
+        );
+    }
+
+    /// The Cheetah RTS sequence is line-wide too, so a shared path drops it just
+    /// the same and reports the written value.
+    #[test]
+    fn a_shared_serial_forces_cheetah_to_command_with_a_warning() {
+        let (config, warnings) = parse_shared(
+            "[mcu]\nserial: /dev/ttyACM0\nrestart_method: cheetah\n\
+             [mcu tool]\nserial: /dev/ttyACM0\n",
+            "mcu",
+        );
+        assert_eq!(config.unwrap().restart_method, McuRestartMethod::Command);
+        assert!(warnings.contains("cheetah"), "{warnings}");
+        assert!(warnings.contains("command"), "{warnings}");
+    }
+
+    /// `rpi_usb` cuts the whole port's power, so a shared path drops it too; the
+    /// `usb_power` option that only means something with `rpi_usb` is still
+    /// reported rather than swallowed by the downgrade.
+    #[test]
+    fn a_shared_serial_forces_rpi_usb_to_command_and_still_reports_usb_power() {
+        let (config, warnings) = parse_shared(
+            "[mcu]\nserial: /dev/ttyACM0\nrestart_method: rpi_usb\nusb_power: sysfs\n\
+             [mcu tool]\nserial: /dev/ttyACM0\n",
+            "mcu",
+        );
+        let config = config.unwrap();
+        assert_eq!(config.restart_method, McuRestartMethod::Command);
+        assert_eq!(config.usb_power, UsbPowerMethod::Sysfs);
+        assert!(warnings.contains("rpi_usb"), "{warnings}");
+        assert!(warnings.contains("command"), "{warnings}");
+        assert!(
+            warnings.contains("usb_power"),
+            "the usb_power report must survive the downgrade: {warnings}"
+        );
+    }
+
+    /// Nothing written is not a disagreement to report: the serial default is
+    /// `arduino`, and it is downgraded silently.
+    #[test]
+    fn a_shared_serial_without_restart_method_is_silently_command() {
+        let (config, warnings) = parse_shared(
+            "[mcu]\nserial: /dev/ttyACM0\n[mcu tool]\nserial: /dev/ttyACM0\n",
+            "mcu",
+        );
+        assert_eq!(config.unwrap().restart_method, McuRestartMethod::Command);
+        assert!(
+            warnings.is_empty(),
+            "an unset restart_method is not warned about: {warnings}"
+        );
+    }
+
+    /// A written `command` is already the shared rule, so there is nothing to
+    /// warn about.
+    #[test]
+    fn a_shared_serial_written_command_needs_no_warning() {
+        let (config, warnings) = parse_shared(
+            "[mcu]\nserial: /dev/ttyACM0\nrestart_method: command\n\
+             [mcu tool]\nserial: /dev/ttyACM0\n",
+            "mcu",
+        );
+        assert_eq!(config.unwrap().restart_method, McuRestartMethod::Command);
+        assert!(
+            warnings.is_empty(),
+            "command needs no downgrade warning: {warnings}"
+        );
+    }
+
+    /// An invalid value is a config error on a shared path too: the rule bends
+    /// the method, not the validation.
+    #[test]
+    fn a_shared_serial_still_rejects_an_invalid_restart_method() {
+        let (config, _) = parse_shared(
+            "[mcu]\nserial: /dev/ttyACM0\nrestart_method: fast\n\
+             [mcu tool]\nserial: /dev/ttyACM0\n",
+            "mcu",
+        );
+        let err = config.unwrap_err();
+        assert!(err.to_string().contains("invalid restart_method"), "{err}");
+        assert!(err.to_string().contains("fast"), "{err}");
+    }
+
+    /// An exclusive serial path is untouched: the written method is the method.
+    #[test]
+    fn an_exclusive_serial_keeps_its_written_restart_method() {
+        let (config, warnings) = parse_shared(
+            "[mcu]\nserial: /dev/ttyACM0\nrestart_method: arduino\n",
+            "mcu",
+        );
+        assert_eq!(config.unwrap().restart_method, McuRestartMethod::Arduino);
+        assert!(
+            warnings.is_empty(),
+            "an exclusive path reads the option as written: {warnings}"
+        );
     }
 }

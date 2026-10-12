@@ -171,6 +171,32 @@ pub fn ensure(
     Ok(object)
 }
 
+/// Whether two or more `[mcu]` sections name `path` — the shared-path rule on
+/// its own, without [`SerialPorts::classify`]'s baud pass and its warning.
+///
+/// The reset rule (`config/mcu.rs`) needs this answer while parsing a section,
+/// before the grouping object exists, and it must not warn: it reads the same
+/// two section families `classify` scans, by the same raw `section().get_text`
+/// (never a tracked getter), and stops at the second naming section. A wrapper
+/// that cannot reach its siblings — a test's small wrapper, or a part reading a
+/// stored section back — has no peers, so it answers `false`.
+pub fn path_is_shared(config: &ConfigWrapper, path: &str) -> bool {
+    let mut naming = 0;
+    for section in config
+        .sibling("mcu")
+        .into_iter()
+        .chain(config.sibling_prefix_sections("mcu"))
+    {
+        if section.section().get_text("serial").as_deref() == Some(path) {
+            naming += 1;
+            if naming >= 2 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// The baud a `[mcu]` section contributes: its `baud` option parsed as a
 /// positive integer, or `None` when it writes no `baud` or writes one that does
 /// not parse. Only sections that write a rate take part in choosing the path's
@@ -479,6 +505,90 @@ mod tests {
         assert!(
             access.sections().is_empty(),
             "classify read {:?}, which would exempt them from check_unused",
+            access.sections()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // `path_is_shared`, the reset rule's silent query.
+    // -----------------------------------------------------------------------
+
+    /// `path_is_shared` over `text`, asked through `identifier`'s wrapper the
+    /// way the loader hands a `[mcu]` its section.
+    fn is_shared(text: &str, identifier: &str, path: &str) -> bool {
+        let (config, _) = Config::from_text(text).expect("the test config parses");
+        let section = config
+            .get_section(identifier)
+            .unwrap_or_else(|| panic!("the config has [{identifier}]"));
+        let wrapper = ConfigWrapper::with_config(section, AccessTracking::shared(), None, &config);
+        path_is_shared(&wrapper, path)
+    }
+
+    /// A path one `[mcu]` names is not shared.
+    #[test]
+    fn a_path_one_mcu_names_is_not_shared() {
+        assert!(!is_shared(
+            "[mcu]\nserial: /dev/ttyACM0\n",
+            "mcu",
+            "/dev/ttyACM0"
+        ));
+    }
+
+    /// Two `[mcu <name>]` sections on one path are shared.
+    #[test]
+    fn path_is_shared_sees_two_prefixed_mcus() {
+        assert!(is_shared(
+            "[mcu a]\nserial: /dev/ttyACM0\n[mcu b]\nserial: /dev/ttyACM0\n",
+            "mcu a",
+            "/dev/ttyACM0"
+        ));
+    }
+
+    /// Two MCUs on different paths leave each path exclusive.
+    #[test]
+    fn two_mcus_on_different_paths_are_not_shared() {
+        let text = "[mcu a]\nserial: /dev/ttyACM0\n[mcu b]\nserial: /dev/ttyACM1\n";
+        assert!(!is_shared(text, "mcu a", "/dev/ttyACM0"));
+        assert!(!is_shared(text, "mcu b", "/dev/ttyACM1"));
+    }
+
+    /// The bare `[mcu]` and a `[mcu <name>]` naming the same path are shared:
+    /// both families are scanned.
+    #[test]
+    fn path_is_shared_sees_the_bare_section_with_a_prefixed_one() {
+        assert!(is_shared(
+            "[mcu]\nserial: /dev/ttyACM0\n[mcu tool]\nserial: /dev/ttyACM0\n",
+            "mcu",
+            "/dev/ttyACM0"
+        ));
+    }
+
+    /// A wrapper that cannot reach its siblings has no peers, so it is never
+    /// shared.
+    #[test]
+    fn a_wrapper_without_the_config_is_never_shared() {
+        let (config, _) =
+            Config::from_text("[mcu]\nserial: /dev/ttyACM0\n").expect("the test config parses");
+        let section = config.get_section("mcu").expect("the bare [mcu]");
+        let wrapper = ConfigWrapper::untracked(section);
+        assert!(!path_is_shared(&wrapper, "/dev/ttyACM0"));
+    }
+
+    /// The query reads no option through the tracker: it must not exempt a
+    /// sibling `[mcu]` section's options from `check_unused` on its own account.
+    #[test]
+    fn path_is_shared_records_no_reads() {
+        let (config, _) =
+            Config::from_text("[mcu]\nserial: /dev/ttyACM0\n[mcu tool]\nserial: /dev/ttyACM0\n")
+                .expect("the test config parses");
+        let section = config.get_section("mcu").expect("the bare [mcu]");
+        let access = AccessTracking::shared();
+        let wrapper = ConfigWrapper::with_config(section, Arc::clone(&access), None, &config);
+
+        assert!(path_is_shared(&wrapper, "/dev/ttyACM0"));
+        assert!(
+            access.sections().is_empty(),
+            "path_is_shared read {:?}, which would exempt them from check_unused",
             access.sections()
         );
     }

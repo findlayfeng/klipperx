@@ -28,7 +28,7 @@ host_library: /usr/local/lib/libklipper_host.so
 
 CAN 这条走的是 klipper 的 **can serial** 链路（就像把串口协议搬到 CAN 上跑），不是 CAN 协议本身。**配置里的键名与 Klipper 保持一致**（`canbus_uuid` / `canbus_interface`），因为它们描述的是机器怎么接线，而且现有 Klipper 配置应当照用；代码里那层实现则叫 `CanSerial*`，把 `Canbus` 这个名字留给将来真正实现 CAN 协议的接口。
 
-节点号到仲裁 ID 的映射也沿用 Klipper：`0x100 + 2 × nodeid`，主机写这个 ID、MCU 用下一个回；节点号由主机通过 admin ID `0x3f0` 的 `CMD_SET_NODEID` 报文指派，所以配置里 `canbus_uuid` 是必需的（节点号本身可由 `[mcu_ids]` 分配、不必写；历史拼写 `[canbus_ids]` 仍兼容）。
+节点号到仲裁 ID 的映射也沿用 Klipper：`0x100 + 2 × nodeid`，主机写这个 ID、MCU 用下一个回；这个映射在主机侧单一定义于 `assign.rs`（CAN 与共享串口共用，`canserial.rs` 不再自带常量），打开 CAN 链路前会校验节点号落在 `1..=255`，越界即报错而不是拼出一个非法仲裁 ID。节点号由主机通过 admin ID `0x3f0` 的 `CMD_SET_NODEID` 报文指派，所以配置里 `canbus_uuid` 是必需的（节点号本身可由 `[mcu_ids]` 分配、不必写；历史拼写 `[canbus_ids]` 仍兼容）。
 
 节点号在本仓是 **MCU 层 id**：每个 `[mcu]`（不论接口）在装载期都被分配一个唯一 id（所有接口共用同一个序列，`mcu/ids.rs`），`connect` 打开传输层之前必须持有它——CAN 用它做节点寻址（admin 帧），**共享串口**用下节的帧头与**分配期握手**把 id 交给设备、并拿它做寻址，**独占串口不使用它**；`host_library` 与 `test:` 暂不指派。显式 `canbus_nodeid` 就是这个 id 的显式覆盖：分配器
 在装载时预扫全配置、先把所有显式号保留下来（`reserve_explicit`），自动号取 `4` 起的
@@ -64,7 +64,7 @@ serial: /dev/ttyUSB0
 
 - 帧头是仲裁 id 的 **Klipper 数值编码**（VLQ：最高 7 位组在前、除末字节外都带 `0x80` 续位），本号段**恒 2 字节**：`id=1 → 82 02`、`id=255 → 85 7E`。`0x7e` **可以**出现在头里（`id ∈ {63,127,191,255}` 时主机方向的第二字节就是它）——上游协议本来就允许帧内容含 sync 字符（`third_party/klipper/docs/Protocol.md:178-183`），长度字节才是权威、CRC 负责校验。
 - 握手请求/回执 = 上面的头 **++ 一个 9 字节伪帧** `[09][0x20]["KXID"][crc16 hi][crc16 lo][0x7e]`：`seq` 字节用 `0x20`（把合法帧必置的 `MESSAGE_DEST` 清掉、改占 bit5），所以主机自己的 `Frame::parse` 必然拒收它，**id 只在帧头里出现一次**。
-- **请求对旧固件无害**：旧固件 `command_find_block`（`third_party/klipper/src/command.c`）在 seq 字节检查处就进错误分支——不读载荷、不查 CRC、永不 dispatch、序号不动，丢弃至多回一枚无害空帧后转静默；这条性质由 `assign.rs` 里的**可执行忠实移植测试**钉住。设备端要做的只是：认出请求 → 用 `+1` 方向的头 + 同形伪帧回执。
+- **请求对旧固件无害**：旧固件 `command_find_block`（`third_party/klipper/src/command.c`）在 seq 字节检查处就进错误分支——不读载荷、不查 CRC、永不 dispatch、序号不动，丢弃至多回一枚无害空帧后转静默；帧头/伪帧的编解码与这条性质都在 `interface/devices/shared_serial.rs` 里，后者由那里的**可执行忠实移植测试**钉住。设备端要做的只是：认出请求 → 用 `+1` 方向的头 + 同形伪帧回执。
 - 完整的线上规格、超时/重试、主机侧的单 reader 分派与引用计数关闭，见开发手册的 [串口复用协议](../developer-manual/serial-mux-protocol.md)。
 
 ## 固件重启方式（`restart_method`）

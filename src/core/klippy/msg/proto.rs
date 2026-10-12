@@ -679,7 +679,7 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // Klipper VLQ: the shared encoder/decoder used by the message payloads and
-    // by the frame-level serial-multiplex header (`assign.rs`).
+    // by the frame-level serial-multiplex header (`interface/devices/shared_serial.rs`).
     // -----------------------------------------------------------------------
 
     #[test]

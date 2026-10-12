@@ -4,8 +4,9 @@
 「多颗 MCU 共用一个串口」必须自己给帧加**地址头**，并且要和设备端谈妥这件事。这份文档就是
 那条线上的规格：**设备端（固件）按它实现，主机侧按它发送与分派**。
 
-主机侧代码：`src/core/klippy/assign.rs`（协议编解码）与
-`src/core/klippy/interface/devices/shared_serial.rs`（端口、reader、分派、握手）。
+主机侧代码：`src/core/klippy/interface/devices/shared_serial.rs`（端口、reader、分派、握手，
+以及帧头与 KXID 伪帧的编解码）；仲裁 id 的映射单一定义在 `src/core/klippy/assign.rs`
+（`arb_id`/`reply_arb_id`/`mcu_id_from_arb`/`is_reply_arb`，私有 `ARB_BASE`），CAN 与共享串口都从那里取。
 什么时候用它、什么时候不用，由**配置事实**决定：同一个 `serial:` 路径被
 **≥2 颗** `[mcu]` 引用即共享（`mcu/serial_ports.rs` 在装载期分组），只被 1 颗引用即
 独占——独占串口走原来的 `SerialDevice`，**不发任何指派帧、不带任何头**，
@@ -16,7 +17,7 @@
 
 ## 寻址：与 CAN 逐位同值
 
-沿用 CAN 的映射（`interface/devices/canserial.rs` 的 `NODE_ID_BASE = 0x100`）：
+沿用 CAN 的映射——单一定义在 `assign.rs`（`arb_id`/`reply_arb_id`，私有 `ARB_BASE = 0x100`）：
 
 | 方向 | 仲裁 id | 说明 |
 |------|---------|------|
@@ -73,13 +74,13 @@ block content」，帧内容本来就允许含 `0x7e`，长度字节才是权威
 回执（设备）  [VLQ(0x100+2*id+1)] [09][20]["KXID"][crc16 hi][crc16 lo][7E]
 ```
 
-- 那个 9 字节伪帧就是 `assign.rs` 的**伪帧**：与合法帧只差 seq 字节——`0x20` 把
+- 那个 9 字节伪帧就是 `shared_serial.rs` 的**伪帧**（`ASSIGN_SEQ_BYTE` / `MAGIC`）：与合法帧只差 seq 字节——`0x20` 把
   `MESSAGE_DEST`（`0x10`）清掉、改占 bit5，于是 `Frame::parse` 必然拒收它（`frame.rs`），
   这让它天然区别于数据帧。**id 只在头里出现一次**，载荷只放 `KXID` 标记（不再编一遍号）。
 - **请求对旧固件无害**：旧固件的 `command_find_block` 按「长度 → seq 字节 → …」检查，在
   seq 字节处就进错误分支——不读载荷、不查 CRC、永不 dispatch、序号不动，丢弃吞下本帧
   （至多回一枚无害空帧后转静默）。所以把共享串口误配到不支持复用的板子上，结果是
-  **握手超时、连接失败**，而不是把已有会话搞乱。这条性质由 `assign.rs` 里
+  **握手超时、连接失败**，而不是把已有会话搞乱。这条性质由 `interface/devices/shared_serial.rs` 里
   `third_party/klipper/src/command.c` 的**可执行忠实移植测试**钉住。
 - 超时与重试：默认 500 ms × 3 次（`ASSIGN_ATTACH_TIMEOUT` / `ASSIGN_ATTACH_ATTEMPTS`）；
   用尽仍无回执 → `InterfaceError::Timeout`，`connect` 失败。

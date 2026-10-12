@@ -20,15 +20,16 @@
 //! the ones the config claims explicitly.
 //!
 //! The CAN flow keeps its concrete shape: a uuid registers (a duplicate is
-//! rejected), and an explicit `canbus_nodeid` overrides the sequence. The other
-//! transports consume the number differently: serial hands
-//! it to the device as the frame-level assignment before identify
-//! (`crate::core::klippy::assign`), while `host_library` and the `test:`
-//! simulator send nothing yet. Nothing uses an id for *addressing* outside CAN
-//! — the frame-header scheme is still to be built. That is the point of moving
-//! the id to this layer: every MCU is assigned and gates communication on it
-//! (`McuObject::connect` refuses to open without one), while what each
-//! transport does with the number is its own.
+//! rejected), and an explicit `canbus_nodeid` overrides the sequence. What each
+//! transport does with the number is its own: CAN uses it as the node id, a
+//! **shared** serial port takes it as the source of its arbitration-id header
+//! and assignment handshake (`crate::core::klippy::assign`), and an
+//! **exclusive** serial port does not use it at all — `host_library` and the
+//! `test:` simulator likewise send nothing yet. Nothing uses an id for
+//! *addressing* outside CAN — the frame-header scheme is still to be built.
+//! That is the point of moving the id to this layer: every MCU is assigned —
+//! `McuObject::connect` refuses to open without one — while the number's use on
+//! the wire stays a transport's own business.
 //!
 //! # Lifecycle
 //!

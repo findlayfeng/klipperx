@@ -3,9 +3,9 @@ use crate::core::klippy::error::ConfigError;
 use crate::core::klippy::interface::usb::UsbPowerMethod;
 #[cfg(test)]
 use crate::core::klippy::interface::SimulatorDevice;
-use crate::core::klippy::interface::{Device, Interface, SerialDevice};
+use crate::core::klippy::interface::{Interface, SerialDevice};
 use crate::core::klippy::mcu::McuRestartMethod;
-use tracing::{info, warn};
+use tracing::warn;
 
 /// MCU (Microcontroller Unit) configuration parsed from config file.
 ///
@@ -375,11 +375,12 @@ impl Transport {
     /// check, happened in [`McuConfig::new`].
     ///
     /// `id` is the id the MCU was assigned at load (`mcu/ids.rs`): the CAN arm
-    /// needs it to address the node, and the serial arm sends it as the
-    /// frame-level assignment before identify (`crate::core::klippy::assign`).
-    /// The host library and the simulator carry no assignment. `rts` is the state
-    /// a serial port is left in after opening; only the [`Transport::Serial`] arm
-    /// looks at it. The other transports ignore it.
+    /// needs it to address the node. A **shared** serial port's synchronous
+    /// assignment handshake (`crate::core::klippy::assign`) is wired in on this
+    /// serial arm by a later unit; an **exclusive** serial port sends no
+    /// assignment at all. `rts` is the state a serial port is left in after
+    /// opening; only the [`Transport::Serial`] arm looks at it. The other
+    /// transports ignore it.
     ///
     /// # Errors
     /// Returns a message prefixed with the transport that failed.
@@ -389,23 +390,6 @@ impl Transport {
                 let device = SerialDevice::open(path, *baud).map_err(|e| format!("serial: {e}"))?;
                 if !rts {
                     device.set_rts(false).map_err(|e| format!("serial: {e}"))?;
-                }
-                // The frame-level id assignment goes out here — before identify,
-                // the moment the port is ready — mirroring CAN's admin frame
-                // inside `CanSerialDevice::open`. Fire-and-forget: an old
-                // firmware discards the frame without disturbing anything
-                // (`crate::core::klippy::assign`), so a failed *send* is a
-                // warning, not a reason to refuse the connection.
-                if let Some(id) = id {
-                    match device.send(&crate::core::klippy::assign::request_frame(id)) {
-                        Ok(()) => {
-                            info!("serial {}: frame-level id assignment sent (id={id})", path)
-                        }
-                        Err(err) => warn!(
-                            "serial {}: frame-level id assignment failed (id={id}): {err}",
-                            path
-                        ),
-                    }
                 }
                 Ok(Interface::from_serial(device))
             }
@@ -735,35 +719,6 @@ mod tests {
         );
         let config = McuConfig::new(&wrap(&section)).unwrap();
         assert_eq!(config.id, Some(7));
-    }
-
-    /// The serial arm of `open` performs the frame-level id assignment before
-    /// anything else talks on the port: the exact pattern bytes are on the wire
-    /// the moment the transport is up, ahead of identify
-    /// (`crate::core::klippy::assign`).
-    #[tokio::test]
-    async fn test_serial_open_sends_the_frame_level_id_assignment() {
-        use crate::core::klippy::assign;
-        use crate::core::klippy::interface::devices::serial::DEFAULT_BAUD;
-        use crate::core::klippy::interface::pty::Pty;
-        use std::io::Read;
-
-        let pty = Pty::new();
-        let transport = Transport::Serial {
-            path: pty.path.display().to_string(),
-            baud: DEFAULT_BAUD,
-        };
-        // rts = true: a pty has no modem lines, so this is the branch that
-        // leaves the port alone — the assignment must not depend on it.
-        transport.open(Some(9), true).unwrap();
-
-        let mut buf = [0u8; 64];
-        let read = (&pty.master).read(&mut buf).unwrap();
-        assert_eq!(
-            &buf[..read],
-            assign::request_frame(9).raw_bytes(),
-            "the assignment frame is the first bytes on the port"
-        );
     }
 
     #[test]

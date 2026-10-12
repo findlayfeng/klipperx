@@ -22,15 +22,6 @@ pub trait Device: Send + Sync {
     /// Block until a frame is received, or return `None` once the device has
     /// been shut down (no further frames will ever arrive).
     fn receive(&self) -> Option<Frame>;
-    /// Ids acknowledged by a device that answered the frame-level id
-    /// assignment (`crate::core::klippy::assign`), drained.
-    ///
-    /// The answer is recognized where the raw byte stream is reassembled, so
-    /// only a device that reassembles one can see it; serial and can-serial
-    /// override this, every other transport defaults to "none".
-    fn take_assignment_acks(&self) -> Vec<u32> {
-        Vec::new()
-    }
     /// Unblock any in-flight [`Device::receive`] and prevent further receives.
     ///
     /// A synchronous device read runs inside `spawn_blocking`, which cannot be
@@ -273,22 +264,6 @@ impl Interface {
                 let device = Arc::clone(device);
                 self.off_runtime(move || device.receive()).await.flatten()
             }
-        }
-    }
-
-    /// Ids acknowledged by a device that answered the frame-level id
-    /// assignment, drained (`crate::core::klippy::assign`).
-    pub fn take_assignment_acks(&self) -> Vec<u32> {
-        match &self.transport {
-            Transport::Serial(device) => device.take_assignment_acks(),
-            Transport::CanSerial(device) => device.take_assignment_acks(),
-            Transport::Host(device) => device.take_assignment_acks(),
-            #[cfg(test)]
-            Transport::FrameMock(device) => device.take_assignment_acks(),
-            #[cfg(test)]
-            Transport::Simulator(device) => device.take_assignment_acks(),
-            #[cfg(test)]
-            Transport::Recording(device) => device.take_assignment_acks(),
         }
     }
 

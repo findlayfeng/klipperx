@@ -676,14 +676,6 @@ pub struct Mcu {
     /// running firmware's unsolicited `stats`/`shutdown`, which carry ids the
     /// host does not know yet — from a genuinely unknown message afterwards.
     identified: Arc<AtomicBool>,
-    /// Whether a device answered the frame-level id assignment
-    /// (`crate::core::klippy::assign`), shared with the receive task.
-    ///
-    /// The assignment goes out before identify, fire-and-forget; a device built
-    /// to parse it answers with the patterned frame the receive task's stream
-    /// recognizes. An old device never does, and that is the recorded fact:
-    /// this is the hook the future frame-header addressing will gate on.
-    assignment_confirmed: Arc<AtomicBool>,
     /// Whether the scheduling gates ([`SendClocks`]) still hold messages back.
     ///
     /// `true` everywhere a real link runs — and on the `test:` fake transport
@@ -1657,8 +1649,6 @@ impl Mcu {
         let wire = Arc::new(Wire::default());
         let identified = Arc::new(AtomicBool::new(false));
         let identified_for_task = Arc::clone(&identified);
-        let assignment_confirmed = Arc::new(AtomicBool::new(false));
-        let assignment_confirmed_for_task = Arc::clone(&assignment_confirmed);
         // The gates start shut (holding): `gates_open` reads as "release on
         // sight", and only a fake transport opens them (`Mcu::open_send_gates`)
         // before any motion is queued.
@@ -1936,19 +1926,6 @@ impl Mcu {
             loop {
                 let received = interface_for_recv.receive().await;
 
-                // The frame-level id assignment may have been answered: the
-                // answer is recognized where the stream reassembles raw bytes
-                // (`crate::core::klippy::assign`). Drain after *every* receive,
-                // including the shutdown one — a connection that ends before
-                // any later frame still records the answer it queued.
-                for device_id in interface_for_recv.take_assignment_acks() {
-                    assignment_confirmed_for_task.store(true, Ordering::SeqCst);
-                    info!(
-                        "[{board_for_recv}] device answered the frame-level id assignment \
-                         (device id {device_id})"
-                    );
-                }
-
                 // Device shut down: no more frames will arrive.
                 let Some(frame) = received else {
                     break;
@@ -2070,7 +2047,6 @@ impl Mcu {
             handle,
             wire,
             identified: Arc::clone(&identified),
-            assignment_confirmed,
             gates_open,
             clock_estimate,
             move_slots: StdMutex::new(MoveSlots::default()),
@@ -2126,16 +2102,6 @@ impl Mcu {
     /// asked for the reset reads this to find out (`mcu/object.rs`).
     pub fn took_over_session(&self) -> bool {
         self.wire.took_over.load(Ordering::Relaxed)
-    }
-
-    /// Whether the device answered the frame-level id assignment this
-    /// connection sent before identify (`crate::core::klippy::assign`).
-    ///
-    /// `false` on every device that discards the pattern — today's firmwares,
-    /// all of them — and the recorded fact future frame-header addressing will
-    /// gate on: never answered, never addressed.
-    pub fn assignment_confirmed(&self) -> bool {
-        self.assignment_confirmed.load(Ordering::Relaxed)
     }
 
     /// Install the firmware's data dictionary.
@@ -3008,71 +2974,6 @@ mod tests {
             frame,
             sent_at: Instant::now(),
         }
-    }
-
-    /// The frame-level id assignment's answer arrives as bytes the stream
-    /// recognizes (`crate::core::klippy::assign`); the receive task drains it
-    /// with the first ordinary frame and records it on the connection.
-    #[tokio::test]
-    async fn test_a_frame_level_assignment_answer_is_recorded_on_the_connection() {
-        use crate::core::klippy::assign;
-        use crate::core::klippy::interface::devices::serial::DEFAULT_BAUD;
-        use crate::core::klippy::interface::pty::Pty;
-
-        let pty = Pty::new();
-        let interface = Interface::serial(&pty.path, DEFAULT_BAUD).unwrap();
-        let mcu = Mcu::new("mcu", interface);
-        assert!(!mcu.assignment_confirmed());
-
-        // The answer, followed by an ordinary frame: the drain runs with the
-        // first frame that comes through the receive task.
-        let mut bytes = assign::request_frame(4).raw_bytes();
-        bytes.extend_from_slice(&Frame::encode(0, b"occasion"));
-        (&pty.master).write_all(&bytes).unwrap();
-
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while !mcu.assignment_confirmed() && Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        let confirmed = mcu.assignment_confirmed();
-        mcu.close();
-        assert!(confirmed, "the answer must be recorded");
-    }
-
-    /// A device that answers and then goes quiet has its answer recorded too:
-    /// the receive task drains on the **shutdown** receive as well, not only
-    /// when a later frame arrives.
-    #[tokio::test]
-    async fn test_an_answer_recorded_at_connection_shutdown_is_not_lost() {
-        use crate::core::klippy::assign;
-        use crate::core::klippy::interface::devices::serial::DEFAULT_BAUD;
-        use crate::core::klippy::interface::pty::Pty;
-
-        let pty = Pty::new();
-        let interface = Interface::serial(&pty.path, DEFAULT_BAUD).unwrap();
-        let mcu = Mcu::new("mcu", interface.clone());
-
-        // The answer alone: no ordinary frame ever follows it.
-        (&pty.master)
-            .write_all(&assign::request_frame(4).raw_bytes())
-            .unwrap();
-        // Let the port's reader pull the bytes into the stream (the answer is
-        // consumed there and never surfaces as a frame).
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        // End the connection: `receive()` returns None, and the drain on that
-        // path is the only thing left to record the answer.
-        interface.shutdown();
-
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while !mcu.assignment_confirmed() && Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        let confirmed = mcu.assignment_confirmed();
-        mcu.close();
-        assert!(
-            confirmed,
-            "the shutdown path must drain the answer the stream already holds"
-        );
     }
 
     // -----------------------------------------------------------------------

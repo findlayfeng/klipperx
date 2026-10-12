@@ -171,6 +171,70 @@ fn vlq_len(v: u32) -> usize {
     }
 }
 
+/// Encode `v` as a Klipper VLQ, appending to `out`.
+///
+/// The most significant 7-bit group goes first; every byte but the last has
+/// its high bit set as a continuation marker. `v` is interpreted the way the
+/// signed encoder does, so values whose bit 31 is set (or that came from a
+/// negative number) use the compact sign-extended form `parse_int()` expects.
+/// This is the single implementation of the encoder: [`Payload::push_vlq`]
+/// sizes the write through [`vlq_len`] and then calls here.
+pub(crate) fn vlq_encode(v: u32, out: &mut Vec<u8>) {
+    for i in (0..vlq_len(v)).rev() {
+        let mut byte = ((v >> (i * 7)) & 0x7f) as u8;
+        if i > 0 {
+            byte |= 0x80;
+        }
+        out.push(byte);
+    }
+}
+
+/// The outcome of decoding one Klipper VLQ off the front of a byte slice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VlqDecode {
+    /// A whole value: `value`, occupying `consumed` bytes.
+    Complete { value: u32, consumed: usize },
+    /// The buffer ends inside the encoding; more bytes could complete it.
+    NeedMore,
+    /// The bytes cannot be a `u32` VLQ: a sixth continuation byte would be
+    /// needed (more than the five groups a 32-bit value can use).
+    Invalid,
+}
+
+/// Decode the first Klipper VLQ in `buf`.
+///
+/// Bit-for-bit the semantics of `PT_uint32.parse` (`klippy/msgproto.py:49-58`):
+/// the first byte's bits 5-6 are the sign bits of a signed 32-bit value, the
+/// low 7 bits of every byte are accumulated most-significant group first, and
+/// the result is reduced to `u32` (`& 0xffffffff`) — so a value written from a
+/// negative number reads back as its two's-complement form. `Invalid` is
+/// returned when five continuation bytes have been read and the encoding is
+/// not finished yet: no `u32` VLQ is longer than five bytes, so more bytes
+/// could not make it well formed.
+pub(crate) fn vlq_decode(buf: &[u8]) -> VlqDecode {
+    let Some(&first) = buf.first() else {
+        return VlqDecode::NeedMore;
+    };
+    let mut value = (first & 0x7f) as u32;
+    if first & 0x60 == 0x60 {
+        value |= 0xffff_ffe0;
+    }
+    let mut byte = first;
+    let mut consumed = 1;
+    while byte & 0x80 != 0 {
+        if consumed >= 5 {
+            return VlqDecode::Invalid;
+        }
+        let Some(&next) = buf.get(consumed) else {
+            return VlqDecode::NeedMore;
+        };
+        byte = next;
+        consumed += 1;
+        value = (value << 7) | (byte & 0x7f) as u32;
+    }
+    VlqDecode::Complete { value, consumed }
+}
+
 impl Payload {
     pub fn new() -> Self {
         Self {
@@ -234,13 +298,7 @@ impl Payload {
         if self.len() + len > MESSAGE_PAYLOAD_MAX {
             return Err(MsgError::new("payload exceeds maximum length"));
         }
-        for i in (0..len).rev() {
-            let mut byte = ((v >> (i * 7)) & 0x7f) as u8;
-            if i > 0 {
-                byte |= 0x80;
-            }
-            self.raw.push(byte);
-        }
+        vlq_encode(v, &mut self.raw);
         Ok(())
     }
 
@@ -361,20 +419,20 @@ impl PayloadParser<'_> {
 
     /// Pop a Klipper VLQ as an unsigned 32-bit value.
     ///
-    /// This mirrors `parse_int()` in the firmware (`src/command.c`). The first
-    /// byte carries a sign bit (bits 5 and 6), so values that were encoded
-    /// from negative numbers come back as their two's-complement form.
+    /// This mirrors `parse_int()` in the firmware (`src/command.c`) by way of
+    /// [`vlq_decode`] — the one decoder. The first byte carries a sign bit
+    /// (bits 5 and 6), so values that were encoded from negative numbers come
+    /// back as their two's-complement form. An encoding longer than five bytes
+    /// is rejected (`vlq_decode`'s `Invalid`) rather than wrapped.
     pub fn pop_u32(&mut self) -> MsgResult<u32> {
-        let mut byte = self.pop()?;
-        let mut val = (byte & 0x7f) as u32;
-        if byte & 0x60 == 0x60 {
-            val |= 0xffff_ffe0;
+        match vlq_decode(self.raw) {
+            VlqDecode::Complete { value, consumed } => {
+                self.raw = &self.raw[consumed..];
+                Ok(value)
+            }
+            VlqDecode::NeedMore => Err(MsgError::new("payload underflow")),
+            VlqDecode::Invalid => Err(MsgError::new("vlq encoding too long")),
         }
-        while byte & 0x80 != 0 {
-            byte = self.pop()?;
-            val = (val << 7) | (byte & 0x7f) as u32;
-        }
-        Ok(val)
     }
 
     /// Pop a signed 32-bit value (`%i`).
@@ -617,6 +675,89 @@ mod tests {
         payload.push_value(&ArgValue::Int32(-1)).unwrap();
         let popped = payload.as_parser().pop_value(ArgType::UInt32).unwrap();
         assert_eq!(popped, ArgValue::UInt32(u32::MAX));
+    }
+
+    // -----------------------------------------------------------------------
+    // Klipper VLQ: the shared encoder/decoder used by the message payloads and
+    // by the frame-level serial-multiplex header (`assign.rs`).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn vlq_golden_vectors_match_upstream() {
+        // Byte vectors produced by `PT_uint32.encode` (`klippy/msgproto.py:49-58`);
+        // these are the vectors the serial-mux header format is pinned to.
+        for (value, expected) in [
+            (0u32, &[0x00][..]),
+            (95, &[0x5f][..]),
+            (96, &[0x80, 0x60][..]),
+            (127, &[0x80, 0x7f][..]),
+            (258, &[0x82, 0x02][..]),
+            (766, &[0x85, 0x7e][..]),
+            (12287, &[0xdf, 0x7f][..]),
+            (12288, &[0x80, 0xe0, 0x00][..]),
+        ] {
+            let mut out = Vec::new();
+            vlq_encode(value, &mut out);
+            assert_eq!(out, expected, "vlq_encode({value})");
+        }
+    }
+
+    #[test]
+    fn vlq_round_trips_through_the_shared_codec() {
+        for value in [
+            0u32,
+            95,
+            96,
+            127,
+            128,
+            258,
+            766,
+            12287,
+            12288,
+            2097152,
+            268435456,
+            u32::MAX,
+        ] {
+            let mut out = Vec::new();
+            vlq_encode(value, &mut out);
+            match vlq_decode(&out) {
+                VlqDecode::Complete {
+                    value: got,
+                    consumed,
+                } => {
+                    assert_eq!(got, value);
+                    assert_eq!(consumed, out.len());
+                }
+                other => panic!("vlq_decode({out:02x?}) = {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn vlq_decode_reports_need_more_for_truncated_prefixes() {
+        // Every proper prefix of a valid encoding needs more bytes.
+        let five = [0x8fu8, 0xff, 0xff, 0xff, 0x7f]; // u32::MAX
+        for cut in 1..five.len() {
+            assert_eq!(vlq_decode(&five[..cut]), VlqDecode::NeedMore, "cut {cut}");
+        }
+        let two = [0x82u8, 0x02]; // 258
+        assert_eq!(vlq_decode(&two[..1]), VlqDecode::NeedMore);
+        assert_eq!(vlq_decode(&[]), VlqDecode::NeedMore);
+    }
+
+    #[test]
+    fn vlq_decode_reports_invalid_past_the_five_byte_limit() {
+        // Five continuation bytes cannot head a u32 VLQ: the encoding is
+        // longer than five bytes whatever follows.
+        assert_eq!(
+            vlq_decode(&[0x80, 0x80, 0x80, 0x80, 0x80, 0x00]),
+            VlqDecode::Invalid
+        );
+        // The over-length is known even with no sixth byte present.
+        assert_eq!(
+            vlq_decode(&[0x80, 0x80, 0x80, 0x80, 0x80]),
+            VlqDecode::Invalid
+        );
     }
 
     // -----------------------------------------------------------------------

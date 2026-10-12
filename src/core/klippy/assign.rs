@@ -76,16 +76,54 @@
 //!   scripted frames would refuse an unmapped send); CAN keeps its own admin
 //!   frame. [Bodies that answer]: devices reassembling a byte stream recognize
 //!   the reply wherever [`FrameStream`] sees raw bytes.
-//! * The frame-header addressing scheme this feeds is **not** built yet; today
-//!   every frame on the wire is the current format, assigned or not. A device
-//!   that was never assigned an id communicates exactly as before.
+//! * The frame-header addressing scheme this feeds has its codec here (below),
+//!   but is **not wired to any transport yet**; today every frame on the wire is
+//!   the current format, assigned or not. A device that was never assigned an
+//!   id communicates exactly as before.
+//!
+//! # The serial multiplexing protocol
+//!
+//! The frame-header scheme this module's id assignment feeds: every frame is
+//! prefixed with its sender's arbitration id, so one byte stream can carry
+//! several MCUs. The codec below is pure — nothing on the wire uses it yet.
+//!
+//! * **Arbitration id** — the mapping CAN already uses
+//!   (`interface/devices/canserial.rs`): a device's *listener* id is
+//!   `0x100 + 2 * mcu_id`, its *answer* id is one higher, both for `mcu_id` in
+//!   `1..=MAX_MCU_ID` (`0xff`). [`arb_id`] and [`reply_arb_id`] build them,
+//!   [`mcu_id_from_arb`] decodes either direction to the same `mcu_id`, and
+//!   [`is_reply_arb`] tells the directions apart.
+//! * **Frame header** — a bare Klipper VLQ of the arbitration id, *not* the
+//!   `KXID` envelope below. Over the whole assigned range (`0x102..=0x2ff`,
+//!   ids `1..=255` in both directions) the header is always exactly two bytes.
+//!   [`encode_header`] / [`decode_header`] are the codec; the VLQ itself is the
+//!   message system's own ([`crate::core::klippy::msg::proto`]), not a copy.
+//! * **Assignment unit** — the header, then a `KXID` pseudo-frame carrying
+//!   [`MAGIC`] and nothing else:
+//!
+//!   ```text
+//!   [vlq(arb)][len=9][0x20]["KXID"][crc16 hi][crc16 lo][0x7e]
+//!   ```
+//!
+//!   The id appears **once**, in the header; the pseudo-frame body is fixed
+//!   and identical in both directions. [`assignment_request`] addresses a
+//!   device, [`assignment_reply`] is the answer it sends, and
+//!   [`parse_assignment_ack`] recognizes that answer.
+//!
+//! A VLQ of an id may end in `0x7e` (`mcu_id = 63, 127, 191, 255` all do). That
+//! is not a problem: frame *content* is allowed to contain SYNC — upstream,
+//! `docs/Protocol.md:178-183`: “a sync character is not exclusive to the
+//! framing and may be present in the message block content” — so a SYNC inside
+//! the header is ordinary data.
 //!
 //! [`FrameStream`]: crate::core::klippy::frame::FrameStream
 
+use crate::core::klippy::config::mcu::MAX_MCU_ID;
 use crate::core::klippy::frame::{
-    Frame, MESSAGE_MAX, MESSAGE_MIN, MESSAGE_POS_LEN, MESSAGE_POS_SEQ, MESSAGE_SYNC,
-    MESSAGE_TRAILER_SIZE, MESSAGE_TRAILER_SYNC,
+    Frame, MESSAGE_HEADER_SIZE, MESSAGE_MAX, MESSAGE_MIN, MESSAGE_POS_LEN, MESSAGE_POS_SEQ,
+    MESSAGE_SYNC, MESSAGE_TRAILER_SIZE, MESSAGE_TRAILER_SYNC,
 };
+use crate::core::klippy::msg::proto::{vlq_decode, vlq_encode, VlqDecode};
 
 /// The sequence byte this pattern uses, as a whole byte: bit 5 set, the bits
 /// `MESSAGE_DEST` owns clear, the low nibble free.
@@ -164,6 +202,158 @@ pub fn parse_ack(raw: &[u8]) -> Option<u32> {
         return None;
     }
     parse_payload(&raw[2..len - MESSAGE_TRAILER_SIZE])
+}
+
+// ===========================================================================
+// Serial multiplexing protocol
+// ===========================================================================
+
+/// Base of the arbitration-id range, matching CAN's node mapping
+/// (`interface/devices/canserial.rs`): `0x100 + 2 * mcu_id`.
+const ARB_BASE: u32 = 0x100;
+
+/// The arbitration id an MCU listens on: `0x100 + 2 * mcu_id`.
+///
+/// `None` for an id outside `1..=MAX_MCU_ID` (`0xff`), so a caller cannot ask
+/// for an id the wire format cannot carry.
+pub fn arb_id(mcu_id: u32) -> Option<u32> {
+    if (1..=MAX_MCU_ID).contains(&mcu_id) {
+        Some(ARB_BASE + 2 * mcu_id)
+    } else {
+        None
+    }
+}
+
+/// The arbitration id an MCU answers on: [`arb_id`] plus one.
+pub fn reply_arb_id(mcu_id: u32) -> Option<u32> {
+    arb_id(mcu_id).map(|arb| arb + 1)
+}
+
+/// Decode an arbitration id back to the `mcu_id` it names.
+///
+/// Both directions decode to the same id: the listener id (`0x100 + 2n`, even)
+/// and the answer id (`0x101 + 2n`, odd) differ only in the low bit, so
+/// `offset / 2` recovers `n` either way. `None` outside the assigned range —
+/// in particular an id that would name `0` (`0x100`, `0x101`) or one past
+/// `MAX_MCU_ID` (`0x300` and up).
+pub fn mcu_id_from_arb(arb: u32) -> Option<u32> {
+    let offset = arb.checked_sub(ARB_BASE)?;
+    if !(2..=2 * MAX_MCU_ID + 1).contains(&offset) {
+        return None;
+    }
+    Some(offset / 2)
+}
+
+/// Whether `arb` is an answer id — the odd half of the mapping.
+///
+/// The device→host direction uses [`reply_arb_id`]; this is how a router
+/// reading a header tells that apart from the host→device [`arb_id`].
+pub fn is_reply_arb(arb: u32) -> bool {
+    arb.checked_sub(ARB_BASE)
+        .is_some_and(|offset| offset % 2 == 1)
+}
+
+/// Encode a frame header: the arbitration id as a bare Klipper VLQ.
+///
+/// Over the assigned range (`0x102..=0x2ff`) this is always two bytes.
+pub fn encode_header(arb: u32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(2);
+    vlq_encode(arb, &mut out);
+    out
+}
+
+/// The outcome of reading a frame header off the front of a byte slice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeaderScan {
+    /// A whole arbitration id, occupying `consumed` bytes.
+    Complete { arb: u32, consumed: usize },
+    /// The slice ends inside the id; more bytes could complete it.
+    NeedMore,
+    /// The bytes cannot be a `u32` VLQ (more than five continuation bytes).
+    Invalid,
+}
+
+/// Decode the frame header at the front of `buf`.
+pub fn decode_header(buf: &[u8]) -> HeaderScan {
+    match vlq_decode(buf) {
+        VlqDecode::Complete { value, consumed } => HeaderScan::Complete {
+            arb: value,
+            consumed,
+        },
+        VlqDecode::NeedMore => HeaderScan::NeedMore,
+        VlqDecode::Invalid => HeaderScan::Invalid,
+    }
+}
+
+/// The pseudo-frame an assignment unit carries after its header: the `KXID`
+/// pattern with a payload of [`MAGIC`] alone.
+///
+/// The id is *not* in here — it is the unit's header — so the same body goes in
+/// both directions, and the frame is
+/// `[len=9][0x20]["KXID"][crc16 hi][crc16 lo][0x7e]`.
+fn assignment_frame() -> Vec<u8> {
+    Frame::with_wire_seq(ASSIGN_SEQ_BYTE, MAGIC.to_vec()).raw_bytes()
+}
+
+/// The assignment unit addressed to `mcu_id`: the header on its listener
+/// arbitration id, then the pseudo-frame.
+pub fn assignment_request(mcu_id: u32) -> Option<Vec<u8>> {
+    let mut unit = encode_header(arb_id(mcu_id)?);
+    unit.extend_from_slice(&assignment_frame());
+    Some(unit)
+}
+
+/// The answer `mcu_id` sends for [`assignment_request`]: the header on its
+/// answer arbitration id, then the same pseudo-frame.
+pub fn assignment_reply(mcu_id: u32) -> Option<Vec<u8>> {
+    let mut unit = encode_header(reply_arb_id(mcu_id)?);
+    unit.extend_from_slice(&assignment_frame());
+    Some(unit)
+}
+
+/// Recognize an assignment answer and return the id it names.
+///
+/// Everything must be self-consistent: a whole VLQ header whose arbitration id
+/// is the reply direction ([`is_reply_arb`]) and decodes to an [`mcu_id`], then
+/// a pseudo-frame whose length byte matches the bytes present, whose sequence
+/// byte is [`ASSIGN_SEQ_BYTE`], whose trailer and CRC check out, and whose
+/// payload is exactly [`MAGIC`]. A request (even header) is rejected by the
+/// direction check.
+///
+/// [`mcu_id`]: mcu_id_from_arb
+pub fn parse_assignment_ack(unit: &[u8]) -> Option<u32> {
+    let (arb, consumed) = match decode_header(unit) {
+        HeaderScan::Complete { arb, consumed } => (arb, consumed),
+        HeaderScan::NeedMore | HeaderScan::Invalid => return None,
+    };
+    if !is_reply_arb(arb) {
+        return None;
+    }
+    let mcu_id = mcu_id_from_arb(arb)?;
+    let frame = &unit[consumed..];
+    if frame.len() < MESSAGE_MIN {
+        return None;
+    }
+    let len = frame[MESSAGE_POS_LEN] as usize;
+    if !(MESSAGE_MIN..=MESSAGE_MAX).contains(&len) || frame.len() != len {
+        return None;
+    }
+    if frame[MESSAGE_POS_SEQ] != ASSIGN_SEQ_BYTE {
+        return None;
+    }
+    if frame[len - MESSAGE_TRAILER_SYNC] != MESSAGE_SYNC {
+        return None;
+    }
+    let expected = crate::crc16_ccitt!(&frame[..len - MESSAGE_TRAILER_SIZE]);
+    let actual = ((frame[len - 3] as u16) << 8) | (frame[len - 2] as u16);
+    if expected != actual {
+        return None;
+    }
+    let payload = &frame[MESSAGE_HEADER_SIZE..len - MESSAGE_TRAILER_SIZE];
+    if payload != &MAGIC[..] {
+        return None;
+    }
+    Some(mcu_id)
 }
 
 // ===========================================================================
@@ -611,5 +801,180 @@ mod tests {
             fw_find_block(&request, &mut st),
             Outcome::Discarded { nacked: false, .. }
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Serial multiplexing protocol
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn arb_ids_map_like_can_and_round_trip() {
+        // The mapping CAN uses (`interface/devices/canserial.rs`).
+        assert_eq!(arb_id(1), Some(0x102));
+        assert_eq!(reply_arb_id(1), Some(0x103));
+        assert_eq!(arb_id(255), Some(0x2fe));
+        assert_eq!(reply_arb_id(255), Some(0x2ff));
+
+        // Both directions decode to the same id, over the whole range.
+        for id in 1..=MAX_MCU_ID {
+            let tx = arb_id(id).unwrap();
+            let rx = reply_arb_id(id).unwrap();
+            assert_eq!(mcu_id_from_arb(tx), Some(id), "listener id for {id}");
+            assert_eq!(mcu_id_from_arb(rx), Some(id), "answer id for {id}");
+            assert!(!is_reply_arb(tx), "listener id for {id} is not a reply");
+            assert!(is_reply_arb(rx), "answer id for {id} is a reply");
+        }
+
+        // Ids that would name 0 (`0x100`, `0x101`) and ids past the bound
+        // (`0x300` up) do not decode.
+        assert_eq!(mcu_id_from_arb(0x100), None);
+        assert_eq!(mcu_id_from_arb(0x101), None);
+        assert_eq!(mcu_id_from_arb(0x300), None);
+        assert_eq!(mcu_id_from_arb(0x301), None);
+        assert_eq!(mcu_id_from_arb(0), None);
+
+        // Out-of-range ids cannot be built either.
+        assert_eq!(arb_id(0), None);
+        assert_eq!(arb_id(256), None);
+        assert_eq!(reply_arb_id(0), None);
+        assert_eq!(reply_arb_id(256), None);
+
+        // The direction flag, on a concrete pair and a below-base id.
+        assert!(is_reply_arb(0x103));
+        assert!(!is_reply_arb(0x102));
+        assert!(!is_reply_arb(0));
+    }
+
+    #[test]
+    fn headers_are_two_bytes_across_the_whole_id_range() {
+        for id in 1..=MAX_MCU_ID {
+            for arb in [arb_id(id).unwrap(), reply_arb_id(id).unwrap()] {
+                let header = encode_header(arb);
+                assert_eq!(header.len(), 2, "arb {arb:#x}");
+                assert_eq!(
+                    decode_header(&header),
+                    HeaderScan::Complete { arb, consumed: 2 }
+                );
+            }
+        }
+        // The endpoints of the range are the two-byte values below.
+        assert_eq!(encode_header(0x102), vec![0x82, 0x02]);
+        assert_eq!(encode_header(0x2ff), vec![0x85, 0x7f]);
+
+        // A truncated header waits for the rest instead of guessing.
+        assert_eq!(decode_header(&[]), HeaderScan::NeedMore);
+        assert_eq!(decode_header(&[0x82]), HeaderScan::NeedMore);
+        let full = encode_header(0x2ff);
+        assert_eq!(decode_header(&full[..1]), HeaderScan::NeedMore);
+        assert_eq!(
+            decode_header(&full),
+            HeaderScan::Complete {
+                arb: 0x2ff,
+                consumed: 2
+            }
+        );
+    }
+
+    #[test]
+    fn boundary_id_headers_may_contain_a_sync_byte() {
+        // The protocol allows 0x7e in frame *content* (`docs/Protocol.md:178-183`:
+        // “a sync character is not exclusive to the framing and may be present
+        // in the message block content”). A VLQ whose last byte is 0x7e is
+        // therefore acceptable, and these values pin that behavior on purpose.
+        for (id, expected) in [
+            (63u32, [0x82u8, 0x7e]),
+            (127, [0x83, 0x7e]),
+            (191, [0x84, 0x7e]),
+            (255, [0x85, 0x7e]),
+        ] {
+            let arb = arb_id(id).unwrap();
+            let header = encode_header(arb);
+            assert_eq!(header, expected, "id {id}");
+            assert!(
+                header.contains(&MESSAGE_SYNC),
+                "id {id} should exercise the 0x7e content byte"
+            );
+            assert_eq!(
+                decode_header(&header),
+                HeaderScan::Complete { arb, consumed: 2 }
+            );
+        }
+    }
+
+    #[test]
+    fn assignment_units_round_trip_through_the_ack_parser() {
+        let request = assignment_request(42).unwrap();
+        let reply = assignment_reply(42).unwrap();
+
+        // Request: the listener header, then the fixed pseudo-frame.
+        assert_eq!(&request[..2], encode_header(arb_id(42).unwrap()).as_slice());
+        assert_eq!(request.len(), 2 + 9);
+        assert_eq!(request[2], 9); // frame length byte
+        assert_eq!(request[3], ASSIGN_SEQ_BYTE);
+        assert_eq!(&request[4..8], MAGIC);
+        assert_eq!(*request.last().unwrap(), MESSAGE_SYNC);
+
+        // Reply: the answer header; the body is byte-for-byte the request's.
+        assert_eq!(
+            &reply[..2],
+            encode_header(reply_arb_id(42).unwrap()).as_slice()
+        );
+        assert_eq!(&reply[2..], &request[2..]);
+
+        // The parser recognizes the reply and rejects the request's direction.
+        assert_eq!(parse_assignment_ack(&reply), Some(42));
+        assert_eq!(parse_assignment_ack(&request), None);
+
+        for id in [1u32, 42, 200, 255] {
+            assert_eq!(
+                parse_assignment_ack(&assignment_reply(id).unwrap()),
+                Some(id),
+                "id {id}"
+            );
+        }
+
+        // Out-of-range ids have no unit at all.
+        assert_eq!(assignment_request(0), None);
+        assert_eq!(assignment_request(256), None);
+        assert_eq!(assignment_reply(0), None);
+        assert_eq!(assignment_reply(256), None);
+    }
+
+    #[test]
+    fn a_malformed_assignment_ack_is_rejected() {
+        let reply = assignment_reply(7).unwrap();
+        assert_eq!(parse_assignment_ack(&reply), Some(7));
+
+        // Bad CRC — flip the trailer's high CRC byte.
+        let mut bad_crc = reply.clone();
+        let crc_at = bad_crc.len() - 3;
+        bad_crc[crc_at] ^= 0xff;
+        assert_eq!(parse_assignment_ack(&bad_crc), None);
+
+        // Wrong sequence byte.
+        let mut bad_seq = reply.clone();
+        bad_seq[2 + MESSAGE_POS_SEQ] = 0x10;
+        assert_eq!(parse_assignment_ack(&bad_seq), None);
+
+        // Truncation: the trailer's SYNC removed, and the header cut short.
+        assert_eq!(parse_assignment_ack(&reply[..reply.len() - 1]), None);
+        assert_eq!(parse_assignment_ack(&reply[..1]), None);
+
+        // No MAGIC: a structurally valid pseudo-frame with different payload.
+        let mut wrong_magic = encode_header(reply_arb_id(7).unwrap());
+        wrong_magic.extend_from_slice(
+            &Frame::with_wire_seq(ASSIGN_SEQ_BYTE, b"XXXX".to_vec()).raw_bytes(),
+        );
+        assert_eq!(parse_assignment_ack(&wrong_magic), None);
+
+        // Wrong trailer SYNC byte.
+        let mut bad_trailer = reply.clone();
+        *bad_trailer.last_mut().unwrap() = 0x00;
+        assert_eq!(parse_assignment_ack(&bad_trailer), None);
+
+        // Trailing bytes after the frame: not a self-consistent unit.
+        let mut extra = reply.clone();
+        extra.push(0x00);
+        assert_eq!(parse_assignment_ack(&extra), None);
     }
 }

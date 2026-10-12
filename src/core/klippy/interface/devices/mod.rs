@@ -4,6 +4,7 @@
 //! | module | transport | `[mcu]` key |
 //! |---|---|---|
 //! | [`serial`] | a tty | `serial:` |
+//! | [`shared_serial`] | a tty shared by several MCUs | — |
 //! | [`canserial`] | Klipper's can-serial link | `canbus_uuid:` |
 //! | [`host`] | Klipper's host library | `host_library:` |
 //! | `frame_mock` | a frame-level mock (test builds only) | — |
@@ -21,5 +22,6 @@ pub mod host;
 #[cfg(test)]
 pub mod responder_mcu;
 pub mod serial;
+pub mod shared_serial;
 #[cfg(test)]
 pub mod simulator;

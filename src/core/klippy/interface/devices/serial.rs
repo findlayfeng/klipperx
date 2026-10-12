@@ -273,7 +273,7 @@ fn set_modem_line(port: &File, line: libc::c_int, asserted: bool) -> Result<(), 
 /// Raw mode is what `cfmakeraw` would do: no echo, no line editing, no signal
 /// characters, no CR/LF translation and no software flow control, so the only
 /// bytes on the wire are the ones the protocol put there.
-fn set_raw_mode(port: &File, baud: u32) -> Result<(), InterfaceError> {
+pub(crate) fn set_raw_mode(port: &File, baud: u32) -> Result<(), InterfaceError> {
     let fd = port.as_raw_fd();
 
     // SAFETY: `fd` is an open tty owned by `port`, and `tio` is a plain struct the
@@ -312,7 +312,7 @@ fn set_raw_mode(port: &File, baud: u32) -> Result<(), InterfaceError> {
 }
 
 /// Undo the `O_NONBLOCK` from `open`, so reads block (bounded by `VTIME`).
-fn clear_nonblocking(port: &File) -> Result<(), InterfaceError> {
+pub(crate) fn clear_nonblocking(port: &File) -> Result<(), InterfaceError> {
     let fd = port.as_raw_fd();
     // SAFETY: F_GETFL/F_SETFL on an open descriptor.
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
@@ -326,7 +326,7 @@ fn clear_nonblocking(port: &File) -> Result<(), InterfaceError> {
 }
 
 /// The current `errno` as an `InterfaceError`, naming the call that failed.
-fn last_error(call: &str) -> InterfaceError {
+pub(crate) fn last_error(call: &str) -> InterfaceError {
     InterfaceError::Other(format!(
         "{call} failed: {}",
         std::io::Error::last_os_error()

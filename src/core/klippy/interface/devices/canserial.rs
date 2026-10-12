@@ -8,10 +8,11 @@
 //! serial device: reassembly is the same [`FrameStream`] every byte-stream device
 //! uses, and the CAN part is a chunking rule plus addressing.
 //!
-//! Addressing follows Klipper (`klippy/serialhdl.py`): a node id maps to
-//! `0x100 + 2 * nodeid`, the host writes to that id, and the MCU answers on the
-//! next one. Only classical frames are used: 11-bit ids and 8 data bytes, never
-//! extended ids or CAN FD.
+//! Addressing follows Klipper (`klippy/serialhdl.py`): a node id maps to an
+//! arbitration id through the mapping every transport shares
+//! ([`crate::core::klippy::assign::arb_id`]), the host writes to that id, and the
+//! MCU answers on the next one. Only classical frames are used: 11-bit ids and 8
+//! data bytes, never extended ids or CAN FD.
 //!
 //! ```text
 //!   send(Frame) ─► bytes ─► 8 byte CAN frames (id = tx_id) ──────► can0
@@ -38,6 +39,8 @@
 //! the printer's wiring rather than this implementation, and a Klipper config
 //! should keep working.
 
+use crate::core::klippy::assign;
+use crate::core::klippy::config::mcu::MAX_MCU_ID;
 use crate::core::klippy::frame::{Frame, FrameStream};
 use crate::core::klippy::interface::error::InterfaceError;
 use crate::core::klippy::interface::{describe_frame, Device};
@@ -57,9 +60,6 @@ pub const CAN_DATA_BYTES: usize = 8;
 /// Size of the kernel's `struct can_frame`, which is what a raw socket reads and
 /// writes one datagram at a time.
 const CAN_FRAME_SIZE: usize = 16;
-
-/// Klipper's node-id mapping: `nodeid` → `0x100 + 2 * nodeid`.
-const NODE_ID_BASE: u32 = 0x100;
 
 /// Klipper's admin arbitration id, and the commands and answers that travel on
 /// it (`klippy/serialhdl.py`, `src/generic/canserial.c`): the one that tells an
@@ -193,9 +193,13 @@ pub struct CanSerialLink {
 }
 
 impl CanSerialLink {
-    /// The link to the node `nodeid`, using Klipper's id mapping.
-    pub fn for_node(nodeid: u32) -> Self {
-        Self::with_arbitration_id(NODE_ID_BASE + 2 * nodeid)
+    /// The link to the node `nodeid`, using the shared arbitration-id mapping
+    /// ([`crate::core::klippy::assign::arb_id`]).
+    ///
+    /// `None` for a node id outside `1..=MAX_MCU_ID` (`0xff`), the range the wire
+    /// format can address.
+    pub fn for_node(nodeid: u32) -> Option<Self> {
+        assign::arb_id(nodeid).map(Self::with_arbitration_id)
     }
 
     /// The link whose MCU listens on `tx_id`.
@@ -458,11 +462,19 @@ impl CanSerialDevice {
     /// arbitration id only after it has seen its UUID and new id.
     ///
     /// # Errors
-    /// Returns [`InterfaceError`] when the interface does not exist, the socket
-    /// cannot be created (no CAN support), it cannot be bound or filtered, or the
-    /// node id could not be handed over.
+    /// Returns [`InterfaceError`] when the node id is outside `1..=MAX_MCU_ID`
+    /// (`0xff`), the interface does not exist, the socket cannot be created (no
+    /// CAN support), it cannot be bound or filtered, or the node id could not be
+    /// handed over.
     pub fn open(interface: &str, uuid: [u8; 6], nodeid: u32) -> Result<Self, InterfaceError> {
-        let link = CanSerialLink::for_node(nodeid);
+        // Checked before the socket is opened: an unaddressable node id is a
+        // configuration mistake, not a bus one, and the bus is not touched for it.
+        let tx_id = assign::arb_id(nodeid).ok_or_else(|| {
+            InterfaceError::Other(format!(
+                "node id {nodeid} is outside the CAN range 1..={MAX_MCU_ID}"
+            ))
+        })?;
+        let link = CanSerialLink::with_arbitration_id(tx_id);
         let index = interface_index(interface)?;
         let socket = open_socket()?;
         bind_interface(&socket, index)?;
@@ -500,7 +512,8 @@ impl CanSerialDevice {
     }
 
     /// This MCU's MCU-layer id, as the configuration assigned it: on this CAN
-    /// link it is the node id, addressed as `0x100 + 2 * id`.
+    /// link it is the node id, addressed by the shared mapping
+    /// ([`crate::core::klippy::assign::arb_id`]).
     pub fn nodeid(&self) -> u32 {
         self.nodeid
     }
@@ -841,17 +854,49 @@ mod tests {
     #[test]
     fn test_node_ids_follow_klipper() {
         // Klipper: `txid = canbus_nodeid * 2 + 256`, answers on the next id.
-        let link = CanSerialLink::for_node(2);
+        let link = CanSerialLink::for_node(2).unwrap();
         assert_eq!(link.tx_id(), 0x104);
         assert_eq!(link.rx_id(), 0x105);
 
-        let link = CanSerialLink::for_node(1);
+        let link = CanSerialLink::for_node(1).unwrap();
         assert_eq!((link.tx_id(), link.rx_id()), (0x102, 0x103));
     }
 
     #[test]
+    fn test_a_node_id_outside_the_range_has_no_link() {
+        // An id is `1..=0xff`: zero names no node, and `0x100` is past the last
+        // one. Both are `None` rather than a link folding onto someone else's
+        // arbitration id.
+        assert!(CanSerialLink::for_node(0).is_none());
+        assert!(CanSerialLink::for_node(0x100).is_none());
+
+        // The ends of the range do have a link.
+        assert!(CanSerialLink::for_node(1).is_some());
+        assert!(CanSerialLink::for_node(0xff).is_some());
+    }
+
+    #[test]
+    fn test_the_link_and_the_shared_mapping_agree() {
+        // CAN no longer owns the formula: the link is built from the mapping the
+        // transports share, so a node's two directions have to be one object
+        // rather than two spellings of it.
+        for nodeid in [1, 4, 5, 255] {
+            let link = CanSerialLink::for_node(nodeid).expect("this id is in range");
+            let tx_id = link.tx_id();
+            let rx_id = link.rx_id();
+
+            assert_eq!(tx_id, assign::arb_id(nodeid).unwrap());
+            assert_eq!(rx_id, assign::reply_arb_id(nodeid).unwrap());
+            assert!(!assign::is_reply_arb(tx_id));
+            assert!(assign::is_reply_arb(rx_id));
+            assert_eq!(assign::mcu_id_from_arb(tx_id), Some(nodeid));
+            assert_eq!(assign::mcu_id_from_arb(rx_id), Some(nodeid));
+        }
+    }
+
+    #[test]
     fn test_a_block_is_cut_into_eight_byte_frames() {
-        let link = CanSerialLink::for_node(3);
+        let link = CanSerialLink::for_node(3).unwrap();
         let bytes: Vec<u8> = (0..20).collect();
 
         let frames: Vec<CanFrame> = link.frames(&bytes).collect();
@@ -877,7 +922,7 @@ mod tests {
         let bytes = block.raw_bytes();
         assert_eq!(bytes.len(), 7);
 
-        let link = CanSerialLink::for_node(5);
+        let link = CanSerialLink::for_node(5).unwrap();
         let slices: Vec<CanFrame> = link.frames(&bytes).collect();
         assert_eq!(slices.len(), 1, "one CAN frame carries the whole block");
 
@@ -898,8 +943,8 @@ mod tests {
 
     #[test]
     fn test_incoming_frames_rebuild_the_block_stream() {
-        let sender = CanSerialLink::for_node(5);
-        let mut receiver = CanSerialLink::for_node(5);
+        let sender = CanSerialLink::for_node(5).unwrap();
+        let mut receiver = CanSerialLink::for_node(5).unwrap();
 
         // The MCU answers on the next id, so a frame written to `tx_id` and read
         // back on `rx_id` models a round trip.
@@ -926,7 +971,7 @@ mod tests {
 
     #[test]
     fn test_frames_for_another_node_are_ignored() {
-        let mut link = CanSerialLink::for_node(5);
+        let mut link = CanSerialLink::for_node(5).unwrap();
         let foreign = CanFrame::new(0x123, &[1, 2, 3]).unwrap();
 
         assert!(!link.accept(&foreign));
@@ -993,6 +1038,23 @@ mod tests {
             err.to_string().contains("no CAN interface named 'can99'"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn test_open_rejects_a_node_id_outside_the_range() {
+        // The node id is checked before the bus is touched, so it is reported
+        // even for an interface that does not exist: were the socket opened
+        // first, the missing interface would be the complaint instead.
+        let err = CanSerialDevice::open("can99", [0; 6], 0x100).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("node id 256 is outside the CAN range 1..={MAX_MCU_ID}")
+        );
+        assert!(err.to_string().contains("1..=255"), "{err}");
+
+        // Zero is outside the range too: those bits name no node.
+        let err = CanSerialDevice::open("can99", [0; 6], 0).unwrap_err();
+        assert!(err.to_string().contains("node id 0 is outside"), "{err}");
     }
 
     // ========================================================================

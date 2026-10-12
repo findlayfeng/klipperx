@@ -237,7 +237,7 @@ max_accel: 3000
 | `canbus_uuid` | 12 位十六进制 | 二选一 | — | MCU 芯片唯一 ID（12 位 hex），CAN 模式必给 |
 | `canbus_interface` | 字符串 | 否 | `can0` | CAN 网络接口名 |
 | `canbus_nodeid` | 整数 (1..=255) | 否 | 由 `[mcu_ids]` 分配 | **MCU 层 id**（配置键名沿用 Klipper；在 CAN 上就是节点号，见下）。**不写就由分配器发**（`4` 起的最小空位，上限 255——CAN admin 报文只给它留了 1 字节）；写了就用写的那个——分配器装载时**预扫全配置**把显式号保留下来、自动号绕开，所以显式号写在哪个位置都生效、也不会被自动号占用。装载期只在两种情况报错：两个 `[mcu]` 写了同一个号，或 `4..=255` 已占满（上游靠固件 `can_id_conflict` 兜底，本仓提前拒）。 |
-| `restart_method` | `command` / `arduino` / `cheetah` / `rpi_usb` | 否 | `arduino`（串口）/ `command`（非串口） | MCU 固件重启方式 |
+| `restart_method` | `command` / `arduino` / `cheetah` / `rpi_usb` | 否 | `arduino`（串口）/ `command`（非串口/共享串口） | MCU 固件重启方式。**共享串口强制 `command`**（线级复位会打断整条线上的所有 MCU；显式写了别的值会告警，没写则静默降级） |
 | `usb_power` | `auto` / `sysfs` / `libusb` | 否 | `auto` | `rpi_usb` 的切电机制 |
 
 > 详细参数说明见 [MCU 连接方式](mcu-connection.md)。

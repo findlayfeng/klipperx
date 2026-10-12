@@ -97,9 +97,12 @@ block content」，帧内容本来就允许含 `0x7e`，长度字节才是权威
 - **baud**：同一路径多颗 MCU 的显式 `baud` 若不一致，装载期 `warn` 并**取最小值**（未写
   `baud` 的节跟着走）；不一致不再是配置错。
 - **复位语义**：`restart_method` 的线级复位（`arduino` 的 DTR 翻转、`cheetah`、`rpi_usb`
-  切电）是**整条线**上的动作，共享端口上会把所有 MCU 一起打断；`Transport::open` 对
-  `cheetah` 的 RTS 位记 warn 并忽略，其余线级方式目前**未拦**——共享路径建议一律
-  `restart_method: command`。
+  切电）是**整条线**上的动作，共享端口上会把所有 MCU 一起打断——所以共享路径在
+  **解析层**就被强制成 `command`（`McuConfig::parse_restart_method` 收一个 `shared` 标志，
+  判定用 `mcu/serial_ports.rs::path_is_shared`）：显式写了别的值记一条 warn，未写（串口
+  默认 `arduino`）静默降级，非法拼写仍是配置错。强制在解析层发生，因此 `connect`、重连、
+  `before_firmware_restart`、`reset_firmware` **全都**拿到 `command`，没有旁路；
+  `Transport::open` 里对 cheetah 的 RTS 另有一条 warn（防御性，正常路径已不可达）。
 
 ## 与 CAN 的关系
 
@@ -113,4 +116,3 @@ CAN 不需要这套东西：总线自带仲裁 id 与硬件过滤，每颗 MCU �
 - 帧头寻址目前**只服务共享串口**；其它接口（独占串口、`host_library`、`test:`）不使用 id
   寻址，`[mcu]` 的 id 对它们只是标识与分配序列的一部分。
 - 设备端固件未实现：共享路径在固件就绪前必然握手超时（这是预期行为，不是 bug）。
-- 共享路径上的线级 `restart_method` 未做拦阻（见上）。

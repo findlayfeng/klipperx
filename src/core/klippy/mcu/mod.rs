@@ -29,6 +29,7 @@ mod pending;
 mod resource;
 mod restart;
 mod restart_method;
+pub mod serial_ports;
 
 pub use config::{
     query_slot, BuiltConfig, ConfigBuilder, ConfigCallback, Configured, PostInitCallback,

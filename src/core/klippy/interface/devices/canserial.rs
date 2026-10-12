@@ -216,6 +216,11 @@ impl CanSerialLink {
     }
 
     /// The id the MCU answers on, and the only one this link accepts.
+    ///
+    /// One past the listener id — the same `+1` as [`assign::reply_arb_id`],
+    /// which the tests below pin over the whole id range. The link stores the
+    /// resolved arbitration id (`tx_id`), not the node id, so the step is
+    /// spelled here instead of re-derived from the mapping.
     pub fn rx_id(&self) -> u32 {
         self.tx_id + 1
     }

@@ -28,8 +28,12 @@
 
 use crate::core::klippy::config::mcu::MAX_MCU_ID;
 
-/// Base of the arbitration-id range, matching CAN's node mapping
-/// (`interface/devices/canserial.rs`): `0x100 + 2 * mcu_id`.
+/// Base of the arbitration-id range: `0x100 + 2 * mcu_id`.
+///
+/// CAN's node mapping and the shared serial port's frame headers are this same
+/// mapping: `interface/devices/canserial.rs` and
+/// `interface/devices/shared_serial.rs` both consume it rather than keeping a
+/// copy of their own.
 const ARB_BASE: u32 = 0x100;
 
 /// The arbitration id an MCU listens on: `0x100 + 2 * mcu_id`.

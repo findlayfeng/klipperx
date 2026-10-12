@@ -712,10 +712,19 @@ mod tests {
         // loads `pins` and `mcu` up front), then `mcu_ids` — the id allocator
         // the first `[mcu]` registers with (`mcu/ids.rs`) — then `error_mcu`,
         // which the first `[mcu]` section also brings (`klippy/mcu.py:1159`),
-        // and the section's own object.
+        // then `serial_ports` — the serial-port grouping pass the first `[mcu]`
+        // builds (`mcu/serial_ports.rs`) — and the section's own object.
         assert_eq!(
             printer.objects(),
-            ["gcode", "configfile", "pins", "mcu_ids", "error_mcu", "mcu"]
+            [
+                "gcode",
+                "configfile",
+                "pins",
+                "mcu_ids",
+                "error_mcu",
+                "serial_ports",
+                "mcu"
+            ]
         );
     }
 
@@ -738,6 +747,7 @@ mod tests {
                 "pins",
                 "mcu_ids",
                 "error_mcu",
+                "serial_ports",
                 "mcu",
                 "mcu zboard",
                 "board_pins"
@@ -754,7 +764,15 @@ mod tests {
         printer.load_config(&config).unwrap();
         assert_eq!(
             printer.objects(),
-            ["gcode", "configfile", "pins", "mcu_ids", "error_mcu", "mcu"]
+            [
+                "gcode",
+                "configfile",
+                "pins",
+                "mcu_ids",
+                "error_mcu",
+                "serial_ports",
+                "mcu"
+            ]
         );
         // The main MCU's id, pinned across the restart below: the allocator is
         // dropped with the rest of the config, so the second load starts from an
@@ -772,7 +790,15 @@ mod tests {
 
         assert_eq!(
             printer.objects(),
-            ["gcode", "configfile", "pins", "mcu_ids", "error_mcu", "mcu"]
+            [
+                "gcode",
+                "configfile",
+                "pins",
+                "mcu_ids",
+                "error_mcu",
+                "serial_ports",
+                "mcu"
+            ]
         );
         // The reborn allocator hands the same main MCU its id again, so nothing
         // from the first load's sequence is left behind.
@@ -807,6 +833,7 @@ mod tests {
                 "pins",
                 "mcu_ids",
                 "error_mcu",
+                "serial_ports",
                 "mcu",
                 "stepper_enable",
                 // `[stepper_x]`'s build registers with the force-move helper
@@ -933,6 +960,7 @@ mod tests {
                 "pins",
                 "mcu_ids",
                 "error_mcu",
+                "serial_ports",
                 "mcu",
                 "mcu zboard",
                 "mcu toolhead"
@@ -998,7 +1026,15 @@ mod tests {
         result.unwrap();
         assert_eq!(
             printer.objects(),
-            ["gcode", "configfile", "pins", "mcu_ids", "error_mcu", "mcu"]
+            [
+                "gcode",
+                "configfile",
+                "pins",
+                "mcu_ids",
+                "error_mcu",
+                "serial_ports",
+                "mcu"
+            ]
         );
     }
 
@@ -1021,6 +1057,7 @@ mod tests {
                 "pins",
                 "mcu_ids",
                 "error_mcu",
+                "serial_ports",
                 "mcu",
                 "output_pin fan"
             ]
@@ -1046,6 +1083,7 @@ mod tests {
                 "pins",
                 "mcu_ids",
                 "error_mcu",
+                "serial_ports",
                 "mcu",
                 "board_pins",
                 "board_pins second"
@@ -1072,6 +1110,7 @@ mod tests {
                 "pins",
                 "mcu_ids",
                 "error_mcu",
+                "serial_ports",
                 "mcu",
                 "i2c_device accel"
             ]
@@ -1097,6 +1136,7 @@ mod tests {
                 "pins",
                 "mcu_ids",
                 "error_mcu",
+                "serial_ports",
                 "mcu",
                 "spi_device flash"
             ]

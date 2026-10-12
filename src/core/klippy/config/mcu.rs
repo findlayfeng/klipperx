@@ -1,10 +1,12 @@
 use super::wrapper::ConfigWrapper;
 use crate::core::klippy::error::ConfigError;
+use crate::core::klippy::interface::devices::shared_serial::{self, ASSIGN_ATTACH_TIMEOUT};
 use crate::core::klippy::interface::usb::UsbPowerMethod;
 #[cfg(test)]
 use crate::core::klippy::interface::SimulatorDevice;
 use crate::core::klippy::interface::{Interface, SerialDevice};
 use crate::core::klippy::mcu::McuRestartMethod;
+use std::path::Path;
 use tracing::warn;
 
 /// MCU (Microcontroller Unit) configuration parsed from config file.
@@ -35,6 +37,15 @@ pub struct McuConfig {
     /// `None` and [`McuObject::connect`](crate::core::klippy::mcu::object::McuObject::connect)
     /// fills it from the id the object registered with at load.
     pub id: Option<u32>,
+    /// The baud this MCU shares its serial `serial:` path at, or `None` for an
+    /// exclusive port.
+    ///
+    /// Set at load from the grouping pass (`mcu/serial_ports.rs`): when two or
+    /// more `[mcu]` sections name the same `serial:` path, the path is shared
+    /// and [`Transport::open`] takes the shared branch. `None` — the value
+    /// parsing leaves it at — means the path belongs to this MCU alone and the
+    /// transport opens it exactly as before.
+    pub shared_baud: Option<u32>,
     /// Which mechanism `rpi_usb` uses to switch the port's power.
     ///
     /// Only meaningful with `restart_method: rpi_usb`; see
@@ -201,6 +212,7 @@ impl McuConfig {
             restart_method,
             transport,
             id,
+            shared_baud: None,
             usb_power,
         })
     }
@@ -236,6 +248,11 @@ impl McuConfig {
 
     /// Open the transport this config describes.
     ///
+    /// An exclusive serial port opens the tty directly and sends **no**
+    /// assignment frame; a shared one completes the synchronous assignment
+    /// handshake inside [`shared_serial::attach`] before it is handed back (see
+    /// [`Transport::open`]).
+    ///
     /// # Errors
     /// Returns the transport's own message (`serial: …`, `canbus: …`,
     /// `host_library: …`) when it cannot be opened.
@@ -243,9 +260,10 @@ impl McuConfig {
         // Cheetah boards need RTS deasserted for the **whole** connection, not
         // just while resetting, or the board drops into its bootloader
         // (`klippy/mcu.py:703-705`). Every other method wants the line left as
-        // the driver opened it.
+        // the driver opened it. A shared serial port ignores this: several MCUs
+        // one port cannot each drive its modem lines (`Transport::open` warns).
         let rts = self.restart_method != McuRestartMethod::Cheetah;
-        self.transport.open(self.id, rts)
+        self.transport.open(self.id, rts, self.shared_baud)
     }
 
     /// Resolve `restart_method` for an MCU whose transport is (or is not) serial.
@@ -375,17 +393,49 @@ impl Transport {
     /// check, happened in [`McuConfig::new`].
     ///
     /// `id` is the id the MCU was assigned at load (`mcu/ids.rs`): the CAN arm
-    /// needs it to address the node. A **shared** serial port's synchronous
-    /// assignment handshake (`crate::core::klippy::assign`) is wired in on this
-    /// serial arm by a later unit; an **exclusive** serial port sends no
-    /// assignment at all. `rts` is the state a serial port is left in after
-    /// opening; only the [`Transport::Serial`] arm looks at it. The other
-    /// transports ignore it.
+    /// needs it to address the node, and a **shared** serial port needs it as
+    /// the source of its arbitration-id header. `shared_baud` is the baud the
+    /// path's MCUs share when two or more name this `serial:` path
+    /// (`mcu/serial_ports.rs`), or `None` when it is exclusive. The serial arm
+    /// splits on it:
+    ///
+    /// - `Some(baud)` — the path is shared: the port is opened once for every
+    ///   MCU on it, and [`shared_serial::attach`] performs the synchronous
+    ///   assignment handshake (write the assignment request, wait for the
+    ///   device's answer) before the shared handle is returned.
+    /// - `None` — the path is exclusive: a private [`SerialDevice`], and **no**
+    ///   assignment frame is ever sent.
+    ///
+    /// `rts` is the state an **exclusive** serial port is left in after
+    /// opening; a shared one ignores it — and warns when it is `false` —
+    /// because several MCUs would otherwise fight over the same modem line.
+    /// The other transports ignore it.
     ///
     /// # Errors
     /// Returns a message prefixed with the transport that failed.
-    pub fn open(&self, id: Option<u32>, rts: bool) -> Result<Interface, String> {
+    pub fn open(
+        &self,
+        id: Option<u32>,
+        rts: bool,
+        shared_baud: Option<u32>,
+    ) -> Result<Interface, String> {
         match self {
+            Transport::Serial { path, baud } if shared_baud == Some(*baud) => {
+                // A shared port is addressed by id, so it cannot be opened
+                // before the allocator has handed one out (`mcu/ids.rs`).
+                let id =
+                    id.ok_or_else(|| format!("serial {path}: the MCU id has not been assigned"))?;
+                if !rts {
+                    warn!(
+                        "serial {path}: shared port ignores restart_method 'cheetah'; \
+                         RTS is not driven"
+                    );
+                }
+                let handle =
+                    shared_serial::attach(Path::new(path), *baud, id, ASSIGN_ATTACH_TIMEOUT)
+                        .map_err(|e| format!("serial {path}: shared port attach failed: {e}"))?;
+                Ok(Interface::shared_serial(handle))
+            }
             Transport::Serial { path, baud } => {
                 let device = SerialDevice::open(path, *baud).map_err(|e| format!("serial: {e}"))?;
                 if !rts {
@@ -415,9 +465,15 @@ impl Transport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::klippy::assign;
     use crate::core::klippy::config::access::AccessTracking;
     use crate::core::klippy::config::section::ConfigSection;
     use crate::core::klippy::config::value::ConfigValue;
+    use crate::core::klippy::frame::Frame;
+    use crate::core::klippy::interface::devices::serial::DEFAULT_BAUD;
+    use crate::core::klippy::interface::pty::Pty;
+    use std::io::{Read, Write};
+    use std::os::fd::AsRawFd;
     use std::sync::Arc;
 
     /// Helper that creates a `[mcu]` section with `serial: /fake/tty`.
@@ -758,5 +814,166 @@ mod tests {
         // A `test: dict=` MCU is not serial, so it resets with `command` like
         // every non-serial transport.
         assert_eq!(config.restart_method, McuRestartMethod::Command);
+    }
+
+    // -----------------------------------------------------------------------
+    // Shared vs exclusive serial ports (`shared_baud`).
+    // -----------------------------------------------------------------------
+
+    /// Read exactly `want` bytes from the pty master (blocking).
+    fn read_n(master: &std::fs::File, want: usize) -> Vec<u8> {
+        let mut master = master;
+        let mut out = Vec::with_capacity(want);
+        let mut buf = [0u8; 64];
+        while out.len() < want {
+            let read = master.read(&mut buf).expect("pty master read");
+            assert_ne!(read, 0, "the pty closed before {want} bytes arrived");
+            out.extend_from_slice(&buf[..read]);
+        }
+        out
+    }
+
+    /// A parsed config naming `pty`'s slave path, exclusive unless a caller
+    /// stamps `shared_baud`.
+    fn serial_config(pty: &Pty) -> McuConfig {
+        let section = section_with("serial", pty.path.to_str().expect("a utf-8 pty path"));
+        McuConfig::new(&wrap(&section)).expect("a serial section parses")
+    }
+
+    /// Open `config` on a blocking thread while playing the device side of the
+    /// assignment handshake from the pty master, and return what `open` did.
+    ///
+    /// `open` blocks until the device answers, so it cannot run on the test's
+    /// own runtime thread; the reply is written here from the master.
+    async fn open_answering_assignment(
+        config: McuConfig,
+        pty: &Pty,
+        mcu_id: u32,
+    ) -> Result<Interface, String> {
+        let handle = tokio::runtime::Handle::current();
+        let opener = tokio::task::spawn_blocking(move || {
+            let _entered = handle.enter();
+            config.open()
+        });
+        let request = assign::assignment_request(mcu_id).expect("a valid mcu id");
+        assert_eq!(
+            read_n(&pty.master, request.len()),
+            request,
+            "the assignment request goes out verbatim"
+        );
+        (&pty.master)
+            .write_all(&assign::assignment_reply(mcu_id).expect("a valid mcu id"))
+            .expect("pty master write");
+        opener.await.expect("the opener task ran")
+    }
+
+    /// A shared port completes the assignment handshake before `open` returns,
+    /// and the interface it returns is the shared one — every send carries the
+    /// MCU's arbitration header.
+    #[tokio::test]
+    async fn test_a_shared_serial_open_completes_the_assignment_handshake() {
+        let pty = Pty::new();
+        let mut config = serial_config(&pty);
+        config.id = Some(7);
+        config.shared_baud = Some(DEFAULT_BAUD);
+
+        let interface = open_answering_assignment(config, &pty, 7)
+            .await
+            .expect("a shared attach succeeds once the device answers");
+
+        // The shared device frames each send with the arb header; an exclusive
+        // one would write the bare frame.
+        let frame = Frame::new(0, vec![1, 2]);
+        interface.send(frame.clone()).await.unwrap();
+        let header = assign::encode_header(assign::arb_id(7).expect("a valid id"));
+        let wire = read_n(&pty.master, header.len() + frame.raw_bytes().len());
+        assert_eq!(
+            &wire[..header.len()],
+            header.as_slice(),
+            "a shared send is prefixed with the arb header"
+        );
+        assert_eq!(&wire[header.len()..], frame.raw_bytes());
+    }
+
+    /// A shared port with no answer fails `open`, naming the path and the
+    /// attach that did not complete.
+    #[test]
+    fn test_a_shared_serial_open_fails_when_the_device_does_not_answer() {
+        let pty = Pty::new();
+        let mut config = serial_config(&pty);
+        config.id = Some(7);
+        config.shared_baud = Some(DEFAULT_BAUD);
+
+        let err = config.open().unwrap_err();
+        assert!(err.contains("shared port attach failed"), "{err}");
+        assert!(err.contains(pty.path.to_str().unwrap()), "{err}");
+    }
+
+    /// A shared port cannot be opened before the allocator has handed out an
+    /// id: the arb header it is addressed by needs one.
+    #[test]
+    fn test_a_shared_serial_open_without_an_id_is_refused() {
+        let pty = Pty::new();
+        let mut config = serial_config(&pty);
+        config.shared_baud = Some(DEFAULT_BAUD);
+
+        let err = config.open().unwrap_err();
+        assert!(err.contains("the MCU id has not been assigned"), "{err}");
+        assert!(err.contains(pty.path.to_str().unwrap()), "{err}");
+    }
+
+    /// An exclusive port opens exactly as before and writes **nothing** on the
+    /// wire: the load-time handshake is the shared path's alone.
+    #[tokio::test]
+    async fn test_an_exclusive_serial_open_sends_no_assignment_frame() {
+        let pty = Pty::new();
+        let mut config = serial_config(&pty);
+        config.id = Some(7);
+        config.shared_baud = None;
+
+        let interface = config.open().expect("an exclusive port opens");
+
+        // Non-blocking master: a read either returns data (the bug this pins)
+        // or says so with `WouldBlock` (nothing was ever sent).
+        let flags = unsafe { libc::fcntl(pty.master.as_raw_fd(), libc::F_GETFL) };
+        assert_eq!(
+            unsafe {
+                libc::fcntl(
+                    pty.master.as_raw_fd(),
+                    libc::F_SETFL,
+                    flags | libc::O_NONBLOCK,
+                )
+            },
+            0
+        );
+        let mut buf = [0u8; 32];
+        match (&pty.master).read(&mut buf) {
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            other => panic!("an exclusive open must write nothing, got {other:?}"),
+        }
+        interface.shutdown();
+    }
+
+    /// On a shared port `restart_method: cheetah` is ignored: `open` succeeds
+    /// rather than trying to drive RTS on a line several MCUs share.
+    #[tokio::test]
+    async fn test_a_shared_serial_ignores_the_cheetah_rts() {
+        let pty = Pty::new();
+        let mut section = section_with("serial", pty.path.to_str().unwrap());
+        section.parameters.insert(
+            "restart_method".to_string(),
+            ConfigValue::Single("cheetah".to_string()),
+        );
+        let mut config = McuConfig::new(&wrap(&section)).expect("a serial section parses");
+        // `cheetah` asks for RTS deasserted on an exclusive port; a pty rejects
+        // the ioctl, so a shared open that called it would fail here.
+        assert_eq!(config.restart_method, McuRestartMethod::Cheetah);
+        config.id = Some(3);
+        config.shared_baud = Some(DEFAULT_BAUD);
+
+        let interface = open_answering_assignment(config, &pty, 3)
+            .await
+            .expect("a shared attach succeeds and ignores the cheetah RTS");
+        interface.shutdown();
     }
 }

@@ -9,6 +9,7 @@ pub use devices::canserial::CanSerialDevice;
 pub use devices::frame_mock::{FrameMock, MappingEntry};
 pub use devices::host::HostDevice;
 pub use devices::serial::SerialDevice;
+use devices::shared_serial::SharedSerialHandle;
 #[cfg(test)]
 pub use devices::simulator::SimulatorDevice;
 pub use error::InterfaceError;
@@ -51,6 +52,8 @@ pub struct Interface {
 /// The device behind an [`Interface`], one variant per transport a `[mcu]`
 /// section can ask for:
 /// - `Serial(SerialDevice)` — a real MCU on a tty (`serial:`)
+/// - `SharedSerial(SharedSerialHandle)` — one MCU's handle on a tty two or more
+///   MCUs share (`serial:` named by several `[mcu]` sections)
 /// - `CanSerial(CanSerialDevice)` — a real MCU reached over CAN, using Klipper's
 ///   can-serial link (`canbus_uuid:` + `canbus_interface:`; `canbus_nodeid:` is
 ///   the Klipper-named key that explicitly overrides the MCU's layer id)
@@ -66,6 +69,9 @@ pub struct Interface {
 #[derive(Debug, Clone)]
 enum Transport {
     Serial(Arc<SerialDevice>),
+    /// One MCU's handle on a port several share: a single reader splits the byte
+    /// stream by arbitration id, and `shutdown` stops only this handle.
+    SharedSerial(Arc<SharedSerialHandle>),
     CanSerial(Arc<CanSerialDevice>),
     Host(Arc<HostDevice>),
     #[cfg(test)]
@@ -151,6 +157,15 @@ impl Interface {
         Self::with_transport(Transport::Serial(Arc::new(device)))
     }
 
+    /// Wrap an already-attached handle on a shared serial port.
+    ///
+    /// For the second and later MCU on one `serial:` path: the port is opened
+    /// once and the id handshake already ran
+    /// (`interface::devices::shared_serial`), so this only installs the handle.
+    pub fn shared_serial(handle: Arc<SharedSerialHandle>) -> Self {
+        Self::with_transport(Transport::SharedSerial(handle))
+    }
+
     /// Create an interface for the MCU `uuid` on the CAN interface `name`, brought
     /// up as node `nodeid`.
     ///
@@ -199,6 +214,12 @@ impl Interface {
                     .await
                     .unwrap_or(Err(InterfaceError::ConnectionLost))
             }
+            Transport::SharedSerial(device) => {
+                let device = Arc::clone(device);
+                self.off_runtime(move || device.send(&frame))
+                    .await
+                    .unwrap_or(Err(InterfaceError::ConnectionLost))
+            }
             Transport::CanSerial(device) => {
                 let device = Arc::clone(device);
                 self.off_runtime(move || device.send(&frame))
@@ -241,6 +262,10 @@ impl Interface {
                 let device = Arc::clone(device);
                 self.off_runtime(move || device.receive()).await.flatten()
             }
+            Transport::SharedSerial(device) => {
+                let device = Arc::clone(device);
+                self.off_runtime(move || device.receive()).await.flatten()
+            }
             Transport::CanSerial(device) => {
                 let device = Arc::clone(device);
                 self.off_runtime(move || device.receive()).await.flatten()
@@ -271,6 +296,7 @@ impl Interface {
     pub fn shutdown(&self) {
         match &self.transport {
             Transport::Serial(device) => device.shutdown(),
+            Transport::SharedSerial(device) => device.shutdown(),
             Transport::CanSerial(device) => device.shutdown(),
             Transport::Host(device) => device.shutdown(),
             #[cfg(test)]

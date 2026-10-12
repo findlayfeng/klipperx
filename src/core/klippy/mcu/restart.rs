@@ -402,6 +402,7 @@ mod tests {
                 library: String::new(),
             },
             id: None,
+            shared_baud: None,
             usb_power: usb::UsbPowerMethod::default(),
         }
     }
@@ -417,6 +418,7 @@ mod tests {
                 baud: 250_000,
             },
             id: None,
+            shared_baud: None,
             usb_power: usb::UsbPowerMethod::default(),
         }
     }
@@ -431,6 +433,7 @@ mod tests {
                 baud: 250_000,
             },
             id: None,
+            shared_baud: None,
             usb_power: usb::UsbPowerMethod::default(),
         }
     }

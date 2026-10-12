@@ -1048,6 +1048,7 @@ mod tests {
                 "pins",
                 "mcu_ids",
                 "error_mcu",
+                "serial_ports",
                 "mcu",
                 "display_status",
                 // The shipped layout's `display_template` sections bring the

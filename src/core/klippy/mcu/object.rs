@@ -32,6 +32,7 @@ use serde_json::{json, Map, Value};
 use tracing::{debug, info, warn};
 
 use super::ids;
+use super::serial_ports;
 use crate::core::klippy::cmd::clock::{ClockSync, McuClock, SecondarySync};
 use crate::core::klippy::cmd::config::Reset;
 use crate::core::klippy::cmd::shutdown::EmergencyStop;
@@ -138,6 +139,13 @@ pub struct McuObject {
     /// sequence). `None` only for an object built outside the loader, which is
     /// never the one a working machine connects.
     id: Mutex<Option<u32>>,
+    /// The baud this MCU shares its serial path at, when two or more `[mcu]`
+    /// sections name the same `serial:` path, or `None` for an exclusive one.
+    ///
+    /// Stamped at load from the grouping pass (`mcu/serial_ports.rs`) and read
+    /// back by `connect`, exactly as [`McuObject::id`] is: it is what tells the
+    /// transport layer to open the shared port instead of a private device.
+    shared_baud: Mutex<Option<u32>>,
     /// The restart method of the connection currently up.
     ///
     /// [`McuObject::before_firmware_restart`] runs on the live connection and has
@@ -212,6 +220,7 @@ impl McuObject {
             chip,
             status: Mutex::new(json!({})),
             id: Mutex::new(None),
+            shared_baud: Mutex::new(None),
             restart_method: Mutex::new(McuRestartMethod::Command),
             is_shutdown: Arc::new(AtomicBool::new(false)),
             connect_shutdown: Arc::new(Mutex::new(None)),
@@ -239,6 +248,26 @@ impl McuObject {
     /// Record the id the loader assigned this `[mcu]` (`mcu/ids.rs`).
     pub fn set_id(&self, id: u32) {
         *self.id.lock().unwrap_or_else(|poison| poison.into_inner()) = Some(id);
+    }
+
+    /// The baud this MCU shares its serial port at, if it is on a shared one.
+    ///
+    /// `None` means the `serial:` path is this MCU's alone (or the transport is
+    /// not serial at all).
+    pub fn shared_baud(&self) -> Option<u32> {
+        *self
+            .shared_baud
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    /// Record the shared-port baud the load-time grouping chose
+    /// (`mcu/serial_ports.rs`).
+    pub fn set_shared_baud(&self, baud: Option<u32>) {
+        *self
+            .shared_baud
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = baud;
     }
 
     /// Whether this firmware is stopped (or the host has marked it so).
@@ -1130,6 +1159,10 @@ impl PrinterObject for McuObject {
                     config.name
                 ))
             })?);
+            // Same pattern as the id: the shared-port baud was decided for the
+            // whole config at load, so connecting only reads it back rather
+            // than reclassifying every `[mcu]` section again.
+            config.shared_baud = self.shared_baud();
             info!(
                 "MCU '{}' restart method: {}",
                 config.name,
@@ -1512,6 +1545,18 @@ pub fn load_config(
     // The id assigned at load is the one the machine connects with; `connect`
     // refuses to open a transport without it.
     object.set_id(id);
+    // Whether this MCU's `serial:` path is shared is a property of the whole
+    // config, resolved once for every `[mcu]` by the grouping pass. A path two
+    // or more sections name is shared, and the baud they agree on is stamped on
+    // the object so `connect` can hand it to the transport without
+    // reclassifying. A path this MCU alone names stays exclusive (`None`), and
+    // its transport opens exactly as before — no assignment frame is sent.
+    let ports = serial_ports::ensure(printer, config)?;
+    let shared_baud = match &parsed.transport {
+        Transport::Serial { path, .. } if ports.is_shared(path) => ports.effective_baud(path),
+        _ => None,
+    };
+    object.set_shared_baud(shared_baud);
     // A host shutdown stops the firmware too (upstream registers the same
     // handler in `MCU.__init__`, `klippy/mcu.py:800`). Registered here
     // rather than in `connect` because the handler is `'static` and needs a
@@ -1547,10 +1592,12 @@ pub fn load_config_prefix(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::klippy::config::Config;
     use crate::core::klippy::frame::Frame;
     use crate::core::klippy::interface::devices::frame_mock::{
         FrameMock, FrameRecorder, MappingEntry,
     };
+    use crate::core::klippy::interface::devices::serial::DEFAULT_BAUD;
     use crate::core::klippy::interface::Interface;
     use crate::core::klippy::msg::proto::Payload;
     use crate::core::klippy::printer::PrinterState;
@@ -1888,6 +1935,59 @@ mod tests {
         let object = load_config(&ConfigWrapper::untracked(&section), &printer).unwrap();
 
         assert_eq!(object.get_status(0.0), json!({}));
+    }
+
+    /// Load `text` through the real loader and return the printer, so its
+    /// `[mcu]` objects can be looked up by section name.
+    fn load_printer(text: &str) -> Arc<Printer> {
+        let (config, _) = Config::from_text(text).expect("the test config parses");
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        printer.load_config(&config).expect("the config loads");
+        printer
+    }
+
+    /// The shared-port baud stamped on the object `name` registered.
+    fn shared_baud_of(printer: &Arc<Printer>, name: &str) -> Option<u32> {
+        printer
+            .lookup_object_as::<McuObject>(name)
+            .expect("the section registered")
+            .shared_baud()
+    }
+
+    /// A `serial:` path two `[mcu]` sections name is shared, and both objects
+    /// carry the same rate: the grouping is resolved once at load.
+    #[test]
+    fn test_a_serial_path_two_mcus_name_is_stamped_shared() {
+        let printer = load_printer(
+            "[mcu]\nserial: /dev/not-opened\n\
+             [mcu tool]\nserial: /dev/not-opened\n",
+        );
+        assert_eq!(shared_baud_of(&printer, "mcu"), Some(DEFAULT_BAUD));
+        assert_eq!(shared_baud_of(&printer, "mcu tool"), Some(DEFAULT_BAUD));
+    }
+
+    /// A `serial:` path one `[mcu]` alone names stays exclusive (`None`), the
+    /// shape that sends no assignment frame.
+    #[test]
+    fn test_a_serial_path_one_mcu_names_stays_exclusive() {
+        let printer = load_printer(
+            "[mcu]\nserial: /dev/not-opened\n\
+             [mcu tool]\nserial: /dev/other\n",
+        );
+        assert_eq!(shared_baud_of(&printer, "mcu"), None);
+        assert_eq!(shared_baud_of(&printer, "mcu tool"), None);
+    }
+
+    /// Sections on one path that write different rates share the **lowest**,
+    /// and both objects carry it.
+    #[test]
+    fn test_a_shared_path_is_stamped_with_the_lowest_baud() {
+        let printer = load_printer(
+            "[mcu]\nserial: /dev/not-opened\nbaud: 250000\n\
+             [mcu tool]\nserial: /dev/not-opened\nbaud: 115200\n",
+        );
+        assert_eq!(shared_baud_of(&printer, "mcu"), Some(115200));
+        assert_eq!(shared_baud_of(&printer, "mcu tool"), Some(115200));
     }
 
     /// An MCU attached to `object`'s chip whose dictionary has `emergency_stop`.

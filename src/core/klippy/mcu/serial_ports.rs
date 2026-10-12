@@ -32,10 +32,17 @@
 //! skipped here exactly as an unparsable `canbus_nodeid` is left unreserved.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
-use crate::core::klippy::config::ConfigWrapper;
+use serde_json::{json, Value};
+
+use crate::core::klippy::config::{ConfigError, ConfigWrapper};
 use crate::core::klippy::interface::devices::serial::DEFAULT_BAUD;
+use crate::core::klippy::printer::{Printer, PrinterObject};
 use tracing::warn;
+
+/// The registry key this pass is looked up and registered under.
+pub const SERIAL_PORTS_OBJECT: &str = "serial_ports";
 
 /// The serial paths the config names, grouped by path.
 ///
@@ -127,6 +134,41 @@ impl SerialPorts {
     pub fn effective_baud(&self, path: &str) -> Option<u32> {
         self.by_path.get(path).map(|group| group.baud)
     }
+}
+
+impl PrinterObject for SerialPorts {
+    /// The registry reports no status, exactly as the id allocator defines none
+    /// (`mcu/ids.rs`).
+    fn get_status(&self, _eventtime: f64) -> Value {
+        json!({})
+    }
+
+    /// Not client-visible: nothing here is a status a client can query.
+    fn is_queryable(&self) -> bool {
+        false
+    }
+}
+
+/// The single classification, created on first demand.
+///
+/// The first `[mcu]` factory to load builds it from the whole config and
+/// registers it; every later one finds it already there and **does not**
+/// re-classify, so the grouping is a load-time constant rather than something
+/// each section recomputes. Every `[mcu]` asks for it, so a config with no
+/// shared serial port still gets one (its map is simply empty).
+///
+/// # Errors
+/// A registry key that is already taken by a different object.
+pub fn ensure(
+    printer: &Arc<Printer>,
+    config: &ConfigWrapper,
+) -> Result<Arc<SerialPorts>, ConfigError> {
+    if let Some(existing) = printer.lookup_object_as::<SerialPorts>(SERIAL_PORTS_OBJECT) {
+        return Ok(existing);
+    }
+    let object = Arc::new(SerialPorts::classify(config));
+    printer.add_object(SERIAL_PORTS_OBJECT, object.clone())?;
+    Ok(object)
 }
 
 /// The baud a `[mcu]` section contributes: its `baud` option parsed as a

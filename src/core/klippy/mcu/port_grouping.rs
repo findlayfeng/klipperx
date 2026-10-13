@@ -106,7 +106,7 @@ impl PortKind {
     }
 
     /// The `[mcu]` option that references a port of this kind: `uart` or `can`.
-    fn reference_option(self) -> &'static str {
+    pub fn reference_option(self) -> &'static str {
         match self {
             PortKind::Uart => "uart",
             PortKind::Can => "can",

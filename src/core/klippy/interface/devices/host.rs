@@ -972,8 +972,9 @@ mod host_tests {
         MESSAGE_DEST, MESSAGE_HEADER_SIZE, MESSAGE_MAX, MESSAGE_MIN, MESSAGE_SYNC,
     };
     use crate::core::klippy::interface::devices::serial::{
-        decode_header, discovery_query, encode_header, set_node_id_for, HeaderScan, UnassignedNode,
-        ADMIN_REPLY, MAGIC, RESP_NEED_NODEID,
+        admin_unit, decode_header, discovery_query, encode_header, set_node_id_for,
+        set_port_node_id, HeaderScan, UnassignedNode, ADMIN_LISTEN, ADMIN_REPLY, CMD_RESET_DEVICE,
+        CMD_RESET_PORT, HEADER_BYTES, MAGIC, MUX_PORT_UNITS, RESP_NEED_NODEID,
     };
     use crate::core::klippy::interface::pty::Pty;
     use crate::core::klippy::mcu::host_libraries::HostLibraries;
@@ -981,6 +982,8 @@ mod host_tests {
     use crate::core::klippy::msg::parser::Parser;
     use crate::core::klippy::msg::proto::{ArgValue, Payload};
     use crate::core::klippy::Interface;
+    use std::io::{Read, Write};
+    use std::os::fd::AsRawFd;
     use std::time::Instant;
 
     #[test]
@@ -1603,6 +1606,257 @@ mod host_tests {
             unsafe { is_shutdown() },
             0,
             "an assignment that hands our id to another identity shuts us down"
+        );
+    }
+
+    /// Read from the pty's master end for at most `window`: everything the
+    /// firmware wrote to the port, handed over as soon as `at_least` bytes are
+    /// in hand — empty when the port stays silent the whole window. Every wait
+    /// is bounded, so no probe step can hang on a port that never writes.
+    fn read_pty(master: &std::fs::File, at_least: usize, window: Duration) -> Vec<u8> {
+        let deadline = Instant::now() + window;
+        let mut out = Vec::new();
+        let mut buf = [0u8; 256];
+        // `&File` implements `Read`, so the shared handle reads through.
+        let mut reader = master;
+        while out.len() < at_least {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let wait = deadline.saturating_duration_since(now).as_millis() as i32;
+            let mut poll = libc::pollfd {
+                fd: master.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let rc = unsafe { libc::poll(&mut poll, 1, wait.max(1)) };
+            if rc < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                panic!("polling the pty master: {error}");
+            }
+            if rc == 0 {
+                break; // the window expired with nothing more to read
+            }
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(read) => out.extend_from_slice(&buf[..read]),
+                Err(error) => panic!("reading the pty master: {error}"),
+            }
+        }
+        out
+    }
+
+    /// The bridge's port-level command family, over a real library and a real
+    /// tty: the port table in the dictionary, `SET_PORT_NODEID` routing in both
+    /// wire formats, the unmapped-id negative, and the reset family — pinned
+    /// against the firmware `make` actually built, the way
+    /// [`test_the_mux_device_half_over_the_real_library`] pins `src/mux.c`.
+    ///
+    /// The pty on the bridge path is a dumb byte port: it never answers the
+    /// admin channel, so every step here also proves the downstream side needs
+    /// no admin participation — the route a device with no admin channel of
+    /// its own gets.
+    #[test]
+    fn test_the_bridge_port_commands_over_the_real_library() {
+        let _serial = HOST_LIBRARY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+
+        // The bridge opens its port while klipper comes up, so the tty has to
+        // exist first — the same setup the device-half test uses.
+        let pty = Pty::new();
+        let bridge_path = klipperx_test_support::klipper_host_mux_serial_path();
+        let _ = std::fs::remove_file(&bridge_path);
+        std::os::unix::fs::symlink(&pty.path, &bridge_path).unwrap_or_else(|e| {
+            panic!(
+                "failed to link {} to {}: {e}",
+                bridge_path.display(),
+                pty.path.display()
+            )
+        });
+
+        let identity = [0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc];
+        let mut device = HostDevice::load_bytes(mux_library_path(), Some(identity))
+            .expect("the mux host library opens");
+        let mut pending = Vec::new();
+        let window = Duration::from_secs(5);
+        // A short window for the negative steps: enough for the task loop to
+        // have run, short enough to keep the silence checks cheap.
+        let quiet = Duration::from_millis(500);
+
+        // A. The port table is in the mux build's dictionary: the count, name,
+        //    type and path of the port `SET_PORT_NODEID`'s index travels with.
+        let dictionary = mux_dictionary();
+        assert_eq!(
+            dictionary.constant_f64("BRIDGE_PORT_COUNT"),
+            Some(1.0),
+            "the bridge reports exactly one port"
+        );
+        assert_eq!(
+            dictionary
+                .constant("BRIDGE_PORT0_TYPE")
+                .and_then(|value| value.as_str()),
+            Some("uart"),
+            "the port's type is in the dictionary"
+        );
+        for key in ["BRIDGE_PORT0_NAME", "BRIDGE_PORT0_PATH"] {
+            assert!(
+                dictionary
+                    .constant(key)
+                    .and_then(|value| value.as_str())
+                    .is_some(),
+                "{key} is in the dictionary"
+            );
+        }
+        let mut parser = Parser::new();
+        dictionary
+            .install(&mut parser)
+            .expect("install the mux build's dictionary");
+
+        // B. `SET_PORT_NODEID(0, 7, 0)` names a legacy device on port 0. It is
+        //    the bridge's own business: no receipt comes back upstream and
+        //    nothing is written to the port.
+        device
+            .write(&set_port_node_id(0, 7, 0))
+            .expect("SET_PORT_NODEID goes in");
+        assert!(
+            read_pty(&pty.master, 1, quiet).is_empty(),
+            "SET_PORT_NODEID must not be forwarded to the port"
+        );
+        assert!(
+            read_unit(&mut device, &mut pending, quiet).is_none(),
+            "SET_PORT_NODEID carries no receipt"
+        );
+
+        // C. A data unit for the port's id (7) reaches the device behind it
+        //    stripped of its header — the legacy wire format.
+        let down_frame = command_frame(&parser, "get_clock", MESSAGE_DEST);
+        let mut down_unit = encode_header(assign::arb_id(7).expect("id 7"));
+        down_unit.extend_from_slice(&down_frame);
+        device.write(&down_unit).expect("the id 7 unit goes in");
+        let down = read_pty(&pty.master, down_frame.len(), window);
+        assert_eq!(
+            down, down_frame,
+            "a legacy port strips the header and sends the frame on unchanged"
+        );
+
+        // D. A raw frame from the device behind the port comes up headed with
+        //    the reply id of the port's node id (7).
+        let up_frame = command_frame(&parser, "get_clock", MESSAGE_DEST);
+        (&pty.master)
+            .write_all(&up_frame)
+            .expect("the raw frame goes into the port");
+        let up = read_unit(&mut device, &mut pending, window).expect("the frame comes up headed");
+        let (arb, frame) = unit_parts(&up);
+        assert_eq!(
+            arb,
+            assign::reply_arb_id(7).expect("id 7"),
+            "a raw frame is headed with the reply id of the port's node id"
+        );
+        assert_eq!(
+            frame,
+            up_frame.as_slice(),
+            "the frame body travels unchanged"
+        );
+
+        // E. Port 0 switches to units (`SET_PORT_NODEID(0, 8, MUX_PORT_UNITS)`):
+        //    a unit for the port's new id travels whole — header and all — both
+        //    ways.
+        device
+            .write(&set_port_node_id(0, 8, MUX_PORT_UNITS))
+            .expect("SET_PORT_NODEID goes in");
+        let unit_frame = command_frame(&parser, "get_clock", MESSAGE_DEST);
+        let mut headed_down = encode_header(assign::arb_id(8).expect("id 8"));
+        headed_down.extend_from_slice(&unit_frame);
+        device.write(&headed_down).expect("the id 8 unit goes in");
+        let down = read_pty(&pty.master, headed_down.len(), window);
+        assert_eq!(
+            down, headed_down,
+            "a units port forwards the whole unit, header and all"
+        );
+
+        // A headed unit from the port is forwarded upstream unchanged. The
+        // header is the reply id of 8 — an ordinary data id, so it is never
+        // mistaken for an admin reply and starts no uuid learning.
+        let mut headed_up = encode_header(assign::reply_arb_id(8).expect("id 8"));
+        headed_up.extend_from_slice(&unit_frame);
+        (&pty.master)
+            .write_all(&headed_up)
+            .expect("the unit goes into the port");
+        let up = read_unit(&mut device, &mut pending, window).expect("the unit comes up");
+        let (arb, frame) = unit_parts(&up);
+        assert_eq!(
+            arb,
+            assign::reply_arb_id(8).expect("id 8"),
+            "a headed unit keeps the header it arrived with"
+        );
+        assert_eq!(
+            frame,
+            unit_frame.as_slice(),
+            "a headed unit is forwarded unchanged"
+        );
+
+        // F. A data unit for an id no port owns (9) goes nowhere.
+        let mut unmapped = encode_header(assign::arb_id(9).expect("id 9"));
+        unmapped.extend_from_slice(&command_frame(&parser, "get_clock", MESSAGE_DEST));
+        device.write(&unmapped).expect("the id 9 unit goes in");
+        assert!(
+            read_pty(&pty.master, 1, quiet).is_empty(),
+            "an id no port owns must not reach the port"
+        );
+
+        // G. The reset family. `[0x04][0]` pulses port 0's lines — a pty has no
+        //    modem lines, so it is dropped in silence, with no receipt.
+        device
+            .write(&admin_unit(&[CMD_RESET_PORT, 0]))
+            .expect("RESET_PORT goes in");
+        assert!(
+            read_pty(&pty.master, 1, quiet).is_empty(),
+            "RESET_PORT writes nothing to the port"
+        );
+        assert!(
+            read_unit(&mut device, &mut pending, quiet).is_none(),
+            "RESET_PORT carries no receipt"
+        );
+
+        // `[0x02][0]` is forwarded to port 0 alone. Port 0 speaks units since
+        // step E, so the `KXID` frame goes down headed with the arb it arrived
+        // on — the admin listen id.
+        let reset = admin_unit(&[CMD_RESET_DEVICE, 0]);
+        device.write(&reset).expect("RESET_DEVICE goes in");
+        let down = read_pty(&pty.master, reset.len(), window);
+        let (arb, frame) = unit_parts(&down);
+        assert_eq!(
+            arb, ADMIN_LISTEN,
+            "the forwarded unit keeps the arb it arrived on (the port speaks units)"
+        );
+        assert_eq!(
+            frame,
+            &reset[HEADER_BYTES..],
+            "the RESET_DEVICE KXID frame travels unchanged"
+        );
+
+        // `[0x02][99]` names no port: dropped in silence.
+        device
+            .write(&admin_unit(&[CMD_RESET_DEVICE, 99]))
+            .expect("RESET_DEVICE goes in");
+        assert!(
+            read_pty(&pty.master, 1, quiet).is_empty(),
+            "an out-of-range port index reaches no port"
+        );
+
+        // And none of the reset commands touched the library itself: the
+        // bridge consumed every one of them, so the device half never ran
+        // `RESET_DEVICE` (the same symbol the device-half test pins).
+        let is_shutdown = is_shutdown_symbol(&device);
+        assert_eq!(
+            unsafe { is_shutdown() },
+            0,
+            "a port-level reset must not take the library down"
         );
     }
 }

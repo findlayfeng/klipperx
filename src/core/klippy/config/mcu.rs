@@ -4,8 +4,8 @@ use crate::core::klippy::interface::devices::serial::{self, ASSIGN_ATTACH_TIMEOU
 use crate::core::klippy::interface::usb::UsbPowerMethod;
 #[cfg(test)]
 use crate::core::klippy::interface::SimulatorDevice;
-use crate::core::klippy::interface::{Interface, SerialDevice};
-use crate::core::klippy::mcu::{serial_ports, McuRestartMethod};
+use crate::core::klippy::interface::{HostMux, Interface, SerialDevice};
+use crate::core::klippy::mcu::{host_libraries, serial_ports, McuRestartMethod};
 use std::path::Path;
 use tracing::warn;
 
@@ -46,6 +46,16 @@ pub struct McuConfig {
     /// parsing leaves it at — means the path belongs to this MCU alone and the
     /// transport opens it exactly as before.
     pub shared_baud: Option<u32>,
+    /// What a muxed `host_library:` path attaches with, or `None` for a path the
+    /// config does not call muxed.
+    ///
+    /// Set at load from the path grouping (`mcu/host_libraries.rs`): when the
+    /// path is muxed — the section writes a `uuid`, or two or more sections name
+    /// it — [`Transport::open`] opens the library through
+    /// [`Interface::host_mux`] instead of the bare-frame [`Interface::host`].
+    /// `None` — the value parsing leaves it at — is today's single-MCU mode,
+    /// bare frames with no identity.
+    pub host_mux: Option<HostMux>,
     /// Which mechanism `rpi_usb` uses to switch the port's power.
     ///
     /// Only meaningful with `restart_method: rpi_usb`; see
@@ -83,7 +93,16 @@ pub enum Transport {
     /// consumes it when the link is opened.
     Can { interface: String, uuid: [u8; 6] },
     /// Klipper's host library, loaded from a shared object.
-    Host { library: String },
+    ///
+    /// `uuid` is the identity the board answers to when the library path is
+    /// reached through a mux (`mcu/host_libraries.rs`): a path one section names
+    /// without a `uuid` is addressed with bare frames, today's mode. The
+    /// transport holds it; whether the path **is** muxed is the whole config's
+    /// call, not this section's.
+    Host {
+        library: String,
+        uuid: Option<[u8; 6]>,
+    },
     /// A dictionary-driven fake MCU, in test builds (`test: dict=<path>`).
     #[cfg(test)]
     Simulator(String),
@@ -149,6 +168,10 @@ impl McuConfig {
     /// [mcu simulated]
     /// host_library: /path/to/libklipper_host.so
     /// ```
+    ///
+    /// A host library may carry a `uuid` too: it names the board a mux
+    /// addresses that library path by, and decides nothing on its own
+    /// (`mcu/host_libraries.rs`).
     ///
     /// A CAN-connected MCU names its uuid and the CAN interface it is on
     /// (Klipper's default is `can0`). The id is the MCU-layer id from the
@@ -236,6 +259,7 @@ impl McuConfig {
             transport,
             id,
             shared_baud: None,
+            host_mux: None,
             usb_power,
         })
     }
@@ -286,7 +310,8 @@ impl McuConfig {
         // the driver opened it. A shared serial port ignores this: several MCUs
         // one port cannot each drive its modem lines (`Transport::open` warns).
         let rts = self.restart_method != McuRestartMethod::Cheetah;
-        self.transport.open(self.id, rts, self.shared_baud)
+        self.transport
+            .open(self.id, rts, self.shared_baud, self.host_mux)
     }
 
     /// Resolve `restart_method` for an MCU whose transport is (or is not) serial.
@@ -356,8 +381,9 @@ impl McuConfig {
     /// configuration mistake, not a preference order, so it is reported rather
     /// than resolved silently — except that `uuid`/`canbus_uuid` are the
     /// *identity* the board is addressed by, not a selector: they ride on
-    /// whichever transport wins and may sit on a serial or a CAN MCU. Every
-    /// check lives here; [`Transport::open`] only performs the side effects.
+    /// whichever transport wins and may sit on a serial, a CAN or a host-library
+    /// section. Every check lives here; [`Transport::open`] only performs the
+    /// side effects.
     fn transport_for(section: &ConfigWrapper) -> Result<Transport, ConfigError> {
         // The keys that can name or configure a transport, in the order the
         // conflict error lists the present ones. `uuid`/`canbus_uuid` are the
@@ -392,22 +418,38 @@ impl McuConfig {
 
         if let Some(library) = section.get_str("host_library") {
             // The library is one transport; `serial`, `test` or anything in
-            // the CAN family with it names a second.
-            let other = [
-                "serial",
-                "test",
-                "uuid",
-                "canbus_uuid",
-                "canbus_interface",
-                "canbus_nodeid",
-            ]
-            .into_iter()
-            .filter(|key| section.has(key))
-            .collect::<Vec<_>>();
+            // the CAN family with it names a second. `uuid`/`canbus_uuid` are
+            // the *identity* here too, not a selector: a host MCU may carry one
+            // (it names the board a mux addresses the library path by).
+            let other = ["serial", "test", "canbus_interface", "canbus_nodeid"]
+                .into_iter()
+                .filter(|key| section.has(key))
+                .collect::<Vec<_>>();
             if !other.is_empty() {
                 return Err(too_many());
             }
-            return Ok(Transport::Host { library });
+            if section.has("uuid") && section.has("canbus_uuid") {
+                return Err(both_uuids());
+            }
+            let uuid = section
+                .get_str("uuid")
+                .or_else(|| section.get_str("canbus_uuid"))
+                .map(|text| {
+                    parse_uuid(&text).map_err(|e| {
+                        ConfigError::new(format!(
+                            "MCU '{}' has an invalid uuid: {e}",
+                            section.identifier()
+                        ))
+                    })
+                })
+                .transpose()?;
+            // Whether this path is muxed is a property of the whole config:
+            // what a host library path is addressed by depends on every `[mcu]`
+            // that names it. A conflict is a config error reported here, at the
+            // section's own parse, exactly as `serial_ports::path_is_shared`
+            // answers the shared-port question for a serial section.
+            host_libraries::validate(section)?;
+            return Ok(Transport::Host { library, uuid });
         }
 
         if let Some(path) = section.get_str("serial") {
@@ -539,6 +581,13 @@ impl Transport {
     ///   assignment frame is ever sent, and a `uuid` on the section is
     ///   ignored.
     ///
+    /// `host_mux` is what the host-library arm attaches a muxed path with
+    /// (`mcu/host_libraries.rs`): `Some` opens the library through
+    /// [`Interface::host_mux`], giving it the path's identity and addressing its
+    /// frames by `id`, while `None` is the bare-frame mode that sends nothing
+    /// extra. Like `shared_baud`, it is decided for the whole config at load,
+    /// not derived from this section alone.
+    ///
     /// `rts` is the state an **exclusive** serial port is left in after
     /// opening; a shared one ignores it — and warns when it is `false` —
     /// because several MCUs would otherwise fight over the same modem line.
@@ -551,6 +600,7 @@ impl Transport {
         id: Option<u32>,
         rts: bool,
         shared_baud: Option<u32>,
+        host_mux: Option<HostMux>,
     ) -> Result<Interface, String> {
         match self {
             Transport::Serial { path, baud, uuid } if shared_baud == Some(*baud) => {
@@ -590,9 +640,18 @@ impl Transport {
                     id.ok_or_else(|| "canbus: the MCU id has not been assigned".to_string())?;
                 Interface::canserial(interface, *uuid, id).map_err(|e| format!("canbus: {e}"))
             }
-            Transport::Host { library } => {
-                Interface::host(library).map_err(|e| format!("host_library: {e}"))
-            }
+            // A muxed path is addressed by id, so it cannot be opened before
+            // the allocator has handed one out (`mcu/ids.rs`); a path the config
+            // does not call muxed opens bare, today's mode.
+            Transport::Host { library, uuid: _ } => match host_mux {
+                Some(mux) => {
+                    let id = id.ok_or_else(|| {
+                        format!("host_library {library}: the MCU id has not been assigned")
+                    })?;
+                    Interface::host_mux(library, mux, id).map_err(|e| format!("host_library: {e}"))
+                }
+                None => Interface::host(library).map_err(|e| format!("host_library: {e}")),
+            },
             #[cfg(test)]
             Transport::Simulator(path) => SimulatorDevice::new(path)
                 .map(Interface::simulator)
@@ -927,17 +986,90 @@ mod tests {
         }
     }
 
-    /// A host library and a uuid name a host MCU and a CAN MCU.
+    /// `host_library:` with a `uuid:` is one transport carrying the board's
+    /// identity — the uuid a mux addresses the library path by
+    /// (`mcu/host_libraries.rs`) — not a second interface.
     #[test]
-    fn test_host_library_plus_uuid_is_rejected() {
+    fn test_host_library_with_uuid_carries_the_identity() {
         let mut section = section_with("host_library", "/nonexistent/libklipper_host.so");
         section.parameters.insert(
             "uuid".to_string(),
             ConfigValue::Single("11aa22bb33cc".to_string()),
         );
+        let config = McuConfig::new(&wrap(&section)).unwrap();
+        assert!(matches!(
+            config.transport,
+            Transport::Host {
+                uuid: Some(u),
+                ..
+            } if u == [0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc]
+        ));
+    }
+
+    /// The old spelling loads on a host MCU the same way it does on a serial or
+    /// a CAN one: aliased to the same identity.
+    #[test]
+    fn test_host_library_with_aliased_canbus_uuid_carries_the_identity() {
+        let mut section = section_with("host_library", "/nonexistent/libklipper_host.so");
+        section.parameters.insert(
+            "canbus_uuid".to_string(),
+            ConfigValue::Single("44dd55ee66ff".to_string()),
+        );
+        let config = McuConfig::new(&wrap(&section)).unwrap();
+        assert!(matches!(
+            config.transport,
+            Transport::Host {
+                uuid: Some(u),
+                ..
+            } if u == [0x44, 0xdd, 0x55, 0xee, 0x66, 0xff]
+        ));
+    }
+
+    /// Both spellings on a host MCU are the same identity written twice, so the
+    /// canonical-key-first error is the CAN one's.
+    #[test]
+    fn test_host_library_with_both_uuid_spellings_is_rejected() {
+        let mut section = section_with("host_library", "/nonexistent/libklipper_host.so");
+        section.parameters.insert(
+            "uuid".to_string(),
+            ConfigValue::Single("11aa22bb33cc".to_string()),
+        );
+        section.parameters.insert(
+            "canbus_uuid".to_string(),
+            ConfigValue::Single("44dd55ee66ff".to_string()),
+        );
         let err = McuConfig::new(&wrap(&section)).unwrap_err();
-        assert!(err.to_string().contains("more than one interface"), "{err}");
-        assert!(err.to_string().contains("host_library, uuid"), "{err}");
+        assert!(
+            err.to_string().contains("both uuid and canbus_uuid"),
+            "{err}"
+        );
+    }
+
+    /// A malformed uuid on a host MCU keeps the CAN error's wording.
+    #[test]
+    fn test_host_library_with_an_invalid_uuid_is_rejected() {
+        for bad in ["bogus", "11aa22bb33cg"] {
+            let mut section = section_with("host_library", "/nonexistent/libklipper_host.so");
+            section
+                .parameters
+                .insert("uuid".to_string(), ConfigValue::Single(bad.to_string()));
+            let err = McuConfig::new(&wrap(&section)).unwrap_err();
+            assert!(err.to_string().contains("invalid uuid"), "{bad}: {err}");
+        }
+    }
+
+    /// A CAN setting with a host library still names two transports: only
+    /// `uuid`/`canbus_uuid` became the host transport's identity.
+    #[test]
+    fn test_host_library_plus_can_settings_is_rejected() {
+        for can_key in ["canbus_interface", "canbus_nodeid"] {
+            let mut section = section_with("host_library", "/nonexistent/libklipper_host.so");
+            section
+                .parameters
+                .insert(can_key.to_string(), ConfigValue::Single("can0".to_string()));
+            let err = McuConfig::new(&wrap(&section)).unwrap_err();
+            assert!(err.to_string().contains("more than one interface"), "{err}");
+        }
     }
 
     /// `test:` and a CAN MCU are two transports even in test builds.
@@ -1581,5 +1713,49 @@ mod tests {
             warnings.is_empty(),
             "an exclusive path reads the option as written: {warnings}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // A `host_library:` path a mux addresses (`mcu/host_libraries.rs`).
+    // -----------------------------------------------------------------------
+
+    /// Two host-library MCUs on one path with no uuid cannot be told apart, so
+    /// the section's own parse reports the conflict — the config fails to load.
+    #[test]
+    fn a_host_library_path_two_mcus_share_without_a_uuid_is_rejected() {
+        let (config, _) = parse_shared(
+            "[mcu]\nhost_library: /lib/libklipper_host.so\n\
+             [mcu tool]\nhost_library: /lib/libklipper_host.so\n",
+            "mcu",
+        );
+        let err = config.unwrap_err();
+        assert!(err.to_string().contains("host library"), "{err}");
+        assert!(err.to_string().contains("'mcu tool'"), "{err}");
+    }
+
+    /// Two host-library MCUs writing the same uuid name one board twice: also a
+    /// config error, reported through the same parse.
+    #[test]
+    fn a_host_library_path_two_mcus_share_with_one_uuid_is_rejected() {
+        let (config, _) = parse_shared(
+            "[mcu a]\nhost_library: /lib/libklipper_host.so\nuuid: 11aa22bb33cc\n\
+             [mcu b]\nhost_library: /lib/libklipper_host.so\nuuid: 11aa22bb33cc\n",
+            "mcu a",
+        );
+        let err = config.unwrap_err();
+        assert!(err.to_string().contains("'mcu a'"), "{err}");
+        assert!(err.to_string().contains("'mcu b'"), "{err}");
+    }
+
+    /// Two host-library sections on one path, one of which omits the uuid, are a
+    /// shape a mux can address: the config parses.
+    #[test]
+    fn a_host_library_path_a_mux_can_address_parses() {
+        let (config, _) = parse_shared(
+            "[mcu]\nhost_library: /lib/libklipper_host.so\nuuid: 11aa22bb33cc\n\
+             [mcu tool]\nhost_library: /lib/libklipper_host.so\n",
+            "mcu",
+        );
+        assert!(config.is_ok(), "{config:?}");
     }
 }

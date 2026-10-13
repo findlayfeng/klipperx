@@ -43,14 +43,34 @@
 //! sharing — which is what "old-firmware compatibility" means here. The bridge
 //! that routes between live references will grow in the firmware later.
 //!
-//! **Two I/O modes, chosen at compile time.** In a debug build the library is
-//! read and written one byte per call, so every frame travels the whole
-//! reassembly path against real firmware. In a release build the library is
-//! asked for whole frames (`klipper_host_output_frame`, which it only has when
-//! built with `CONFIG_HOST_FRAME_API`), and reassembly is skipped entirely —
-//! the same thing `FrameMock` does, for the same reason: there is nothing to
-//! reassemble when the boundary is already known.
+//! **Two I/O modes.** The default mode is chosen at compile time: in a debug
+//! build the library is read and written one byte per call, so every frame
+//! travels the whole reassembly path against real firmware; in a release build
+//! the library is asked for whole frames (`klipper_host_output_frame`, which it
+//! only has when built with `CONFIG_HOST_FRAME_API`), and reassembly is skipped
+//! entirely — the same thing `FrameMock` does, for the same reason: there is
+//! nothing to reassemble when the boundary is already known.
+//!
+//! The other mode is the caller's, for a **bench scan**: `OutputMode::Bytes`,
+//! which reads the library's byte stream in every build
+//! ([`HostDevice::load_bytes`]). The serial mux wraps every frame in a
+//! two-byte header (the developer manual's *serial-mux-protocol* page), so a
+//! mux unit's first byte is a header byte, not the frame length the frame API
+//! cuts the buffer by — that API cannot see a unit at all, in any build. A scan
+//! therefore reads and writes the stream **as it is**
+//! ([`HostDevice::read`]/[`HostDevice::write`]) and never reassembles it.
+//!
+//! **A muxed path is addressed by id.** When the config says a `host_library:`
+//! path carries the mux (`mcu/host_libraries.rs`), the reference is opened in
+//! `OutputMode::Mux` and attached ([`HostDevice::load_mux`]): the library is
+//! given the identity the host assigned the path before klipper comes up, the
+//! attach names the device in a `SET_KLIPPER_NODEID` unit and re-confirms the
+//! assignment, and from then on every frame sent carries the mux header naming
+//! the reference's id, while `receive` keeps only the units addressed to it.
+//! A path the config does **not** call muxed keeps the bare-frame wire format
+//! exactly as before; whether a path is muxed is a config fact, never probed.
 
+use crate::core::klippy::assign;
 use crate::core::klippy::frame::Frame;
 #[cfg(debug_assertions)]
 use crate::core::klippy::frame::FrameStream;
@@ -65,9 +85,13 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{debug, info, trace, warn};
 
+use super::serial::{
+    assignment_request, encode_header, parse_assignment_ack, set_node_id_for, UnitStream,
+    ASSIGN_ATTACH_ATTEMPTS, ASSIGN_ATTACH_TIMEOUT, HEADER_BYTES,
+};
 use super::shared::resource_for;
 
 /// The process-wide registry that makes a host library a per-path singleton:
@@ -78,10 +102,79 @@ fn library_registry() -> &'static Mutex<HashMap<PathBuf, Weak<HostLibrary>>> {
     LIBRARIES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// The live library for `path`, loading it (and starting its threads) if the
-/// registry holds no live one.
-fn library_for(path: &Path) -> Result<Arc<HostLibrary>, InterfaceError> {
-    resource_for(library_registry(), path, HostLibrary::open)
+/// Serialises the tests that load the real host library.
+///
+/// The library registry is a per-path process-wide singleton, so two tests
+/// sharing the one `.so` must not overlap: the second would meet — or, at the
+/// end, unload — the first's library mid-handshake. A loaded library's output
+/// mode and identity are fixed too ([`library_for`]), which puts a scan test
+/// and an identify test on the same `.so` in exactly that pair.
+#[cfg(test)]
+pub(crate) static HOST_LIBRARY_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+/// Which of the library's two output APIs its reader thread reads.
+///
+/// A property of the **loaded library** (it picks the reader thread's read), so
+/// it is chosen when the library is opened and every reference on it shares it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OutputMode {
+    /// The default: the build's own protocol path — a debug build reads the
+    /// byte stream, a release build whole frames (see the module docs).
+    Default,
+    /// The byte stream (`klipper_host_output_wait`) in **every** build, because
+    /// a mux unit is not a frame boundary (see the module docs).
+    Bytes,
+    /// The byte stream in every build **and** the mux header on every frame: the
+    /// mode of a reference on a `host_library:` path the config says is muxed
+    /// ([`HostMux`]). It reads bytes because a unit is not a frame the frame API
+    /// could hand over, exactly as `Bytes` does, but its `send`/`receive` address
+    /// the frames with the header (see the module docs).
+    Mux,
+}
+
+/// What a muxed `host_library:` path attaches with.
+///
+/// The path is addressed by id (`mcu/host_libraries.rs` decides that from the
+/// config): the attach gives the library's own device `identity` before klipper
+/// comes up, names `named` in a `SET_KLIPPER_NODEID` unit so the bridge hands the
+/// device `mcu_id`, re-confirms the assignment, and from then on frames carry
+/// the mux header.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostMux {
+    /// The identity the library's own device answers the mux with, delivered by
+    /// `klipper_host_set_uuid` before `klipper_host_init`.
+    pub identity: [u8; 6],
+    /// The uuid the attach names in `SET_KLIPPER_NODEID`: the section's own
+    /// `uuid` when it wrote one, else `identity` (the bridge's own device).
+    pub named: [u8; 6],
+}
+
+/// The live library for `path` in `mode` with `identity`, loading it (and
+/// starting its threads) if the registry holds no live one.
+///
+/// # Errors
+/// Returns [`InterfaceError`] when opening fails, and when a live library on
+/// `path` disagrees with `mode` or `identity`: both are fixed when the library
+/// is opened (the mode picks its reader, the identity is set before klipper
+/// comes up), so reusing it under other ones would silently answer as the
+/// wrong thing.
+fn library_for(
+    path: &Path,
+    mode: OutputMode,
+    identity: Option<[u8; 6]>,
+) -> Result<Arc<HostLibrary>, InterfaceError> {
+    let library = resource_for(library_registry(), path, |path| {
+        HostLibrary::open(path, mode, identity)
+    })?;
+    let identity = identity.unwrap_or([0; 6]);
+    if library.mode != mode || library.identity != identity {
+        return Err(InterfaceError::Other(format!(
+            "klipper host library {} is already loaded with a different output mode or \
+             identity, which are fixed when the library is opened",
+            library.library_path.display()
+        )));
+    }
+    Ok(library)
 }
 
 // ===========================================================================
@@ -101,6 +194,9 @@ fn library_for(path: &Path) -> Result<Arc<HostLibrary>, InterfaceError> {
 
 type InitFn = unsafe extern "C" fn() -> c_int;
 type InputFn = unsafe extern "C" fn(*const c_uchar, usize) -> c_long;
+/// `klipper_host_set_uuid(const uint8_t uuid[6])` — the identity the device
+/// answers the serial mux with, which the host sets before klipper comes up.
+type SetUuidFn = unsafe extern "C" fn(*const c_uchar) -> c_int;
 /// One read from the library: bytes into `buf`, up to `buf_size`, waiting up to
 /// `timeout_ms`. Both the byte-stream and the frame API have this shape.
 type OutputFn = unsafe extern "C" fn(*mut c_uchar, usize, u32) -> usize;
@@ -115,10 +211,14 @@ type ShutdownFn = unsafe extern "C" fn();
 #[derive(Clone, Copy)]
 struct Symbols {
     init: InitFn,
+    /// `klipper_host_set_uuid`, absent from a library built before the host
+    /// could name the device — an identity is then refused rather than ignored
+    /// (see [`HostLibrary::open`]).
+    set_uuid: Option<SetUuidFn>,
     input: InputFn,
-    /// `klipper_host_output_wait` in a debug build, `klipper_host_output_frame` in a
-    /// release build — see [`Symbols::resolve`].
-    output: OutputFn,
+    /// `klipper_host_output_wait`, the byte stream, in **every** build: what a
+    /// debug build reads by default and what `OutputMode::Bytes` always reads.
+    output_wait: OutputFn,
     run: RunFn,
     shutdown: ShutdownFn,
 }
@@ -138,24 +238,14 @@ impl Symbols {
 
         Ok(Self {
             init: unsafe { get(library, b"klipper_host_init\0")? },
+            // Optional: only a library that knows the host may name it exports
+            // this. An identity asked of one that does not is an error, not a
+            // silently unnamed device (see [`HostLibrary::open`]).
+            set_uuid: unsafe { library.get::<SetUuidFn>(b"klipper_host_set_uuid\0") }
+                .ok()
+                .map(|symbol| *symbol),
             input: unsafe { get(library, b"klipper_host_input\0")? },
-            // A debug build takes the byte stream apart itself; a release build
-            // wants the library's frame API, which exists only when it was built
-            // with CONFIG_HOST_FRAME_API.
-            #[cfg(debug_assertions)]
-            output: unsafe { get(library, b"klipper_host_output_wait\0")? },
-            #[cfg(not(debug_assertions))]
-            output: unsafe {
-                library
-                    .get::<OutputFn>(b"klipper_host_output_frame\0")
-                    .map_err(|e| {
-                        InterfaceError::Other(format!(
-                            "klipper host library has no klipper_host_output_frame: rebuild it \
-                             with CONFIG_HOST_FRAME_API=y, or use a debug build ({e})"
-                        ))
-                    })
-                    .map(|symbol| *symbol)?
-            },
+            output_wait: unsafe { get(library, b"klipper_host_output_wait\0")? },
             run: unsafe { get(library, b"klipper_host_run\0")? },
             shutdown: unsafe { get(library, b"klipper_host_shutdown\0")? },
         })
@@ -180,6 +270,13 @@ struct HostLibrary {
     _library: Library,
     symbols: Symbols,
     library_path: PathBuf,
+    /// Which output API the reader thread reads (fixed when the library is
+    /// opened; [`library_for`] refuses a reference that asks for the other).
+    mode: OutputMode,
+    /// The identity this library was given before klipper came up, all zeros
+    /// when none was ([`HostLibrary::open`]). Printed by the firmware and
+    /// answered to the mux, so a request for another one is refused.
+    identity: [u8; 6],
     /// Raw bytes from Klipper, in arrival order. The library's own receiver is
     /// the template every [`HostDevice`] clones; it never reads it itself.
     output: Receiver<Vec<u8>>,
@@ -190,17 +287,24 @@ struct HostLibrary {
 }
 
 impl HostLibrary {
-    /// Load `path`, initialise klipper and start the two threads.
+    /// Load `path`, give it `identity`, initialise klipper and start the two
+    /// threads; `mode` picks the output API the reader thread reads.
     ///
     /// Shared by every reference on the same path; called by
     /// [`library_for`] only when no live library is registered for it yet.
     ///
     /// # Errors
     /// Returns [`InterfaceError`] when the library cannot be loaded, does not
-    /// export the expected symbols, or fails to initialize. The runtime thread
-    /// is stopped and joined again if the output reader cannot be spawned, so
-    /// no thread is left inside a library that is about to be unmapped.
-    fn open(path: &Path) -> Result<Arc<Self>, InterfaceError> {
+    /// export the expected symbols, or fails to initialize — and when an
+    /// identity is asked of a library built without `klipper_host_set_uuid`.
+    /// The runtime thread is stopped and joined again if the output reader
+    /// cannot be spawned, so no thread is left inside a library that is about
+    /// to be unmapped.
+    fn open(
+        path: &Path,
+        mode: OutputMode,
+        identity: Option<[u8; 6]>,
+    ) -> Result<Arc<Self>, InterfaceError> {
         let library_path = path.to_path_buf();
         let library = unsafe { Library::new(&library_path) }.map_err(|e| {
             InterfaceError::Other(format!(
@@ -210,6 +314,29 @@ impl HostLibrary {
         })?;
 
         let symbols = Symbols::resolve(&library)?;
+
+        // The identity is fixed once the device is up, so it is set here,
+        // before `init` — and only when the host names one: all zeros is what
+        // the library starts with anyway.
+        let identity = identity.unwrap_or([0; 6]);
+        if identity != [0; 6] {
+            let set_uuid = match symbols.set_uuid {
+                Some(set_uuid) => set_uuid,
+                None => {
+                    return Err(InterfaceError::Other(format!(
+                        "klipper host library {} does not support an identity: it was built \
+                         without klipper_host_set_uuid",
+                        library_path.display()
+                    )))
+                }
+            };
+            let result = unsafe { set_uuid(identity.as_ptr()) };
+            if result != 0 {
+                return Err(InterfaceError::Other(format!(
+                    "klipper_host_set_uuid() returned {result}"
+                )));
+            }
+        }
 
         // Ready klipper's globals. A fresh mapping has no shutdown latch to
         // clear, but on a library that was unloaded and mapped again `init` is
@@ -245,7 +372,29 @@ impl HostLibrary {
         // It holds only a clone of `stopped` (and no `Arc<HostLibrary>`), so it
         // can never keep the library alive on its own.
         let poller_stopped = Arc::clone(&stopped);
-        let poller_read = symbols.output;
+        // The reader's read is the mode's: the byte stream in a debug build and
+        // in `OutputMode::Bytes`, whole frames in a release build's default mode.
+        // The frame API only exists in a library built with
+        // CONFIG_HOST_FRAME_API, and **only the default mode asks for it**: a
+        // bytes-mode load (the bench scan) reads the stream, so it loads
+        // against the byte-stream API that every build has.
+        #[cfg(debug_assertions)]
+        let poller_read = symbols.output_wait;
+        #[cfg(not(debug_assertions))]
+        let poller_read = match mode {
+            OutputMode::Bytes | OutputMode::Mux => symbols.output_wait,
+            OutputMode::Default => unsafe {
+                library
+                    .get::<OutputFn>(b"klipper_host_output_frame\0")
+                    .map_err(|e| {
+                        InterfaceError::Other(format!(
+                            "klipper host library has no klipper_host_output_frame: rebuild it \
+                             with CONFIG_HOST_FRAME_API=y, or use a debug build ({e})"
+                        ))
+                    })
+                    .map(|symbol| *symbol)?
+            },
+        };
         let poller = thread::Builder::new()
             .name("klipper-output".to_string())
             .spawn(move || {
@@ -289,6 +438,8 @@ impl HostLibrary {
             _library: library,
             symbols,
             library_path,
+            mode,
+            identity,
             output,
             stopped,
             threads: Mutex::new(threads),
@@ -317,7 +468,8 @@ impl Drop for HostLibrary {
 /// reassembly: no read ever contains a whole frame, so every frame goes through
 /// [`FrameStream`]. A release build asks for one frame at a time, and
 /// [`MESSAGE_MAX`](crate::core::klippy::frame::MESSAGE_MAX) is the largest one
-/// the protocol can produce.
+/// the protocol can produce — and a whole mux unit fits, so it is the batch a
+/// release build's bytes-mode reader asks for too.
 #[cfg(debug_assertions)]
 const OUTPUT_BATCH: usize = 1;
 #[cfg(not(debug_assertions))]
@@ -356,6 +508,28 @@ pub struct HostDevice {
     /// A release build is handed whole frames and never needs this.
     #[cfg(debug_assertions)]
     stream: Mutex<FrameStream>,
+    /// Bytes pulled from `output` by [`HostDevice::read`] but not handed out
+    /// yet: one library read can deliver more than the caller's buffer holds.
+    raw: Mutex<Vec<u8>>,
+    /// The mux id this reference is addressed by, or `None` for the bare-frame
+    /// modes. Set when a muxed path is attached ([`HostDevice::load_mux`]).
+    mux: Option<MuxRoute>,
+    /// Bytes pulled from `output`, cut into mux units. Only a muxed reference
+    /// reads it (the handshake, then [`HostDevice::receive`]); the bare-frame
+    /// modes reassemble frames instead.
+    units: Mutex<UnitStream>,
+}
+
+/// The mux id a reference is addressed by: the id it sends under and keeps
+/// units for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MuxRoute {
+    /// The MCU-layer id ([`McuIds`](crate::core::klippy::mcu::McuIds)) this
+    /// reference was given; the header on everything it sends names it and it
+    /// keeps only the units that decode back to it.
+    mcu_id: u32,
+    /// The arbitration id its frames go out under: `0x100 + 2 * mcu_id`.
+    arb: u32,
 }
 
 impl HostDevice {
@@ -381,8 +555,83 @@ impl HostDevice {
     /// Returns [`InterfaceError`] when the library cannot be loaded, does not
     /// export the expected symbols, or fails to initialize.
     pub fn load(path: impl AsRef<Path>) -> Result<Self, InterfaceError> {
-        let library = library_for(path.as_ref())?;
+        Self::open(path.as_ref(), OutputMode::Default, None, None)
+    }
+
+    /// Open a communication reference on the klipper host library at `path`
+    /// **for a bench scan**: its reader reads the library's byte stream in every
+    /// build (`OutputMode::Bytes`), so whole units can be read and written
+    /// ([`HostDevice::read`]/[`HostDevice::write`]) — a mux unit is not a frame
+    /// the frame API could hand over (see the module docs).
+    ///
+    /// `identity` is what the library answers the serial mux with, set before
+    /// klipper comes up; `None` leaves it at the library's own default (all
+    /// zeros), and a library built without `klipper_host_set_uuid` is only an
+    /// error when an identity is actually asked for.
+    ///
+    /// The identity and the mode are fixed once the library is loaded, so
+    /// asking for another one on a path whose library is already live fails
+    /// (`library_for`) instead of answering as the wrong device.
+    ///
+    /// # Errors
+    /// Returns [`InterfaceError`] for the reasons [`HostDevice::load`] does,
+    /// and when `identity` is asked of a library that has no
+    /// `klipper_host_set_uuid`.
+    pub fn load_bytes(
+        path: impl AsRef<Path>,
+        identity: Option<[u8; 6]>,
+    ) -> Result<Self, InterfaceError> {
+        Self::open(path.as_ref(), OutputMode::Bytes, identity, None)
+    }
+
+    /// Open a communication reference on the klipper host library at `path`
+    /// **for a muxed path**, and attach it: give the library its `identity`,
+    /// name the device `mux.named` and hand it `mcu_id` with a
+    /// `SET_KLIPPER_NODEID` unit, then re-confirm the assignment before klipper
+    /// is identified.
+    ///
+    /// From then on [`Device::send`]/[`Device::receive`] carry the mux header:
+    /// every frame sent is prefixed with the header naming `mcu_id`, and only
+    /// the units that decode back to `mcu_id` are handed to `receive`.
+    ///
+    /// Which paths are muxed, and what `mux` holds, is the config layer's call
+    /// (`mcu/host_libraries.rs`); this is only the wire half. A library that
+    /// does not speak the mux never answers the handshake, so the attach times
+    /// out — the same failure a shared serial port misses its handshake on.
+    ///
+    /// # Errors
+    /// Returns [`InterfaceError`] for the reasons [`HostDevice::load`] does,
+    /// when `mcu_id` is outside the addressable range, and
+    /// [`InterfaceError::Timeout`] when the device never confirms the
+    /// assignment.
+    pub fn load_mux(
+        path: impl AsRef<Path>,
+        mux: HostMux,
+        mcu_id: u32,
+    ) -> Result<Self, InterfaceError> {
+        let device = Self::open(
+            path.as_ref(),
+            OutputMode::Mux,
+            Some(mux.identity),
+            Some(mcu_id),
+        )?;
+        device.attach(mux.named, mcu_id)?;
+        Ok(device)
+    }
+
+    /// Wrap the live library on `path` as a reference in `mode`.
+    fn open(
+        path: &Path,
+        mode: OutputMode,
+        identity: Option<[u8; 6]>,
+        mcu_id: Option<u32>,
+    ) -> Result<Self, InterfaceError> {
+        let library = library_for(path, mode, identity)?;
         let reference = NEXT_REFERENCE.fetch_add(1, Ordering::Relaxed);
+        let mux = match (mode, mcu_id) {
+            (OutputMode::Mux, Some(mcu_id)) => Some(MuxRoute::for_id(mcu_id)?),
+            _ => None,
+        };
         Ok(Self {
             output: library.output.clone(),
             library,
@@ -390,12 +639,219 @@ impl HostDevice {
             stopped: AtomicBool::new(false),
             #[cfg(debug_assertions)]
             stream: Mutex::new(FrameStream::new()),
+            raw: Mutex::new(Vec::new()),
+            mux,
+            units: Mutex::new(UnitStream::new()),
         })
     }
 
     /// Path of the library this reference was loaded from.
     pub fn library_path(&self) -> &Path {
         &self.library.library_path
+    }
+
+    /// Read raw protocol bytes from the library, for a bench scan.
+    ///
+    /// The byte stream as the library hands it over, without frame reassembly:
+    /// a mux unit's two-byte header is not a frame, so a scan has to see the
+    /// stream as it is (`OutputMode::Bytes`). A read blocks at most
+    /// `OUTPUT_WAIT_MS` and returns `0` when nothing arrived in that window —
+    /// the same contract as
+    /// [`SerialDevice::read`](crate::core::klippy::interface::devices::serial::SerialDevice::read),
+    /// so the same scan code runs over either transport.
+    pub fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.stopped.load(Ordering::Relaxed) {
+            return Ok(0); // no further bytes will arrive
+        }
+        let mut pending = self.raw.lock().unwrap();
+        if pending.is_empty() {
+            match self
+                .output
+                .recv_timeout(Duration::from_millis(OUTPUT_WAIT_MS as u64))
+            {
+                Ok(bytes) => *pending = bytes,
+                Err(RecvTimeoutError::Timeout) => return Ok(0),
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(std::io::Error::other("klipper host library stopped"))
+                }
+            }
+        }
+        let read = buf.len().min(pending.len());
+        buf[..read].copy_from_slice(&pending[..read]);
+        pending.drain(..read);
+        Ok(read)
+    }
+
+    /// Write raw protocol bytes to the library, for a bench scan.
+    ///
+    /// The unit as the mux puts it on the wire, header and all; the frame
+    /// path's [`Device::send`] cannot write one, because a unit is not an
+    /// encoded [`Frame`].
+    pub fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.write_raw(buf)
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        Ok(buf.len())
+    }
+
+    /// Hand `bytes` to the library's console input, whole.
+    ///
+    /// A debug build feeds it one byte per call, so the library's receive path
+    /// sees the stream the way a real link would deliver it; a release build
+    /// gives it the block in one call. The caller has already framed the bytes —
+    /// a bare [`Frame`], a mux unit, or a handshake unit — so this only writes.
+    fn write_raw(&self, bytes: &[u8]) -> Result<(), InterfaceError> {
+        if self.stopped.load(Ordering::Relaxed) {
+            return Err(InterfaceError::ConnectionLost);
+        }
+        #[cfg(debug_assertions)]
+        let written = {
+            let mut taken = 0;
+            for byte in bytes {
+                let n = unsafe { (self.library.symbols.input)(byte as *const c_uchar, 1) };
+                if n != 1 {
+                    break;
+                }
+                taken += n;
+            }
+            taken
+        };
+        #[cfg(not(debug_assertions))]
+        let written = unsafe { (self.library.symbols.input)(bytes.as_ptr(), bytes.len()) };
+        if written != bytes.len() as c_long {
+            return Err(InterfaceError::SendError(format!(
+                "klipper_host_input took {written} of {} bytes",
+                bytes.len()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Attach a muxed reference: name the device `named`, hand it `mcu_id`, and
+    /// re-confirm the assignment.
+    ///
+    /// The frame order mirrors the shared serial port's attach
+    /// ([`serial::attach`](super::serial::attach)): the `SET_KLIPPER_NODEID`
+    /// unit first, then the assignment request, retried
+    /// [`ASSIGN_ATTACH_ATTEMPTS`] times for [`ASSIGN_ATTACH_TIMEOUT`] each.
+    ///
+    /// # Errors
+    /// An id the wire cannot address, a write that fails, or
+    /// [`InterfaceError::Timeout`] when the answer never arrives.
+    fn attach(&self, named: [u8; 6], mcu_id: u32) -> Result<(), InterfaceError> {
+        let set = set_node_id_for(named, mcu_id).ok_or_else(|| {
+            InterfaceError::Other(format!(
+                "mcu id {mcu_id} is outside the range a mux header can address"
+            ))
+        })?;
+        let request = assignment_request(mcu_id).expect("the id was just checked");
+        self.write_raw(&set)?;
+        for _ in 0..ASSIGN_ATTACH_ATTEMPTS {
+            self.write_raw(&request)?;
+            if self.wait_for_assignment(mcu_id, ASSIGN_ATTACH_TIMEOUT) {
+                return Ok(());
+            }
+            if self.stopped.load(Ordering::Relaxed) {
+                return Err(InterfaceError::ConnectionLost);
+            }
+        }
+        Err(InterfaceError::Timeout)
+    }
+
+    /// Wait up to `timeout` for the device to answer the assignment request.
+    fn wait_for_assignment(&self, mcu_id: u32, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            {
+                let mut units = self.units.lock().unwrap();
+                while let Some(unit) = units.take_unit() {
+                    if parse_assignment_ack(&unit) == Some(mcu_id) {
+                        return true;
+                    }
+                }
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            let window = remaining.min(Duration::from_millis(OUTPUT_WAIT_MS as u64));
+            match self.output.recv_timeout(window) {
+                Ok(bytes) => self.units.lock().unwrap().feed(&bytes),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => return false,
+            }
+        }
+    }
+
+    /// Receive on a muxed reference: the next unit addressed to this reference,
+    /// its header stripped to the frame the protocol carries.
+    fn receive_mux(&self, mux: MuxRoute) -> Option<Frame> {
+        loop {
+            if self.stopped.load(Ordering::Relaxed) {
+                return None;
+            }
+            {
+                let mut units = self.units.lock().unwrap();
+                while let Some((arb, unit)) = units.take_unit_with_arb() {
+                    // A unit for another device on the path — or the admin
+                    // channel — is not this reference's.
+                    if assign::mcu_id_from_arb(arb) != Some(mux.mcu_id) {
+                        continue;
+                    }
+                    let raw = &unit[HEADER_BYTES..];
+                    match Frame::parse(raw) {
+                        Some(frame) => {
+                            trace!("rx frame [{}]: {}", self.id(), describe_frame(raw));
+                            debug!("received {} bytes from klipper", raw.len());
+                            return Some(frame);
+                        }
+                        None => warn!(
+                            "klipper sent {} bytes under a mux header that are not a frame",
+                            raw.len()
+                        ),
+                    }
+                }
+            }
+            match self
+                .output
+                .recv_timeout(Duration::from_millis(OUTPUT_WAIT_MS as u64))
+            {
+                Ok(bytes) => self.units.lock().unwrap().feed(&bytes),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => return None,
+            }
+        }
+    }
+}
+
+impl MuxRoute {
+    /// The route for `mcu_id`, or an error once it leaves the addressable
+    /// range — which the allocator never hands out, so a value that does is a
+    /// programming error reported rather than a header built from nothing.
+    fn for_id(mcu_id: u32) -> Result<Self, InterfaceError> {
+        let arb = assign::arb_id(mcu_id).ok_or_else(|| {
+            InterfaceError::Other(format!(
+                "mcu id {mcu_id} is outside the range a mux header can address"
+            ))
+        })?;
+        Ok(Self { mcu_id, arb })
+    }
+}
+
+impl std::io::Read for HostDevice {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        HostDevice::read(self, buf)
+    }
+}
+
+impl std::io::Write for HostDevice {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        HostDevice::write(self, buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        // Nothing is buffered on this side: a write is handed to klipper's
+        // console buffer whole.
+        Ok(())
     }
 }
 
@@ -411,42 +867,32 @@ impl fmt::Debug for HostDevice {
 
 impl Device for HostDevice {
     fn send(&self, frame: &Frame) -> Result<(), InterfaceError> {
-        if self.stopped.load(Ordering::Relaxed) {
-            return Err(InterfaceError::ConnectionLost);
+        let raw = frame.raw_bytes();
+        trace!("tx frame [{}]: {}", self.id(), describe_frame(&raw));
+        // A muxed reference writes the header naming its id before the frame;
+        // the bare-frame modes write the frame alone, today's wire format.
+        let mut bytes = Vec::with_capacity(raw.len() + HEADER_BYTES);
+        if let Some(mux) = &self.mux {
+            bytes.extend_from_slice(&encode_header(mux.arb));
         }
-
-        let bytes = frame.raw_bytes();
-        trace!("tx frame [{}]: {}", self.id(), describe_frame(&bytes));
-
-        // A debug build hands the frame over one byte per call, so the library's
-        // receive path sees the stream the way a real link would deliver it. A
-        // release build gives it the frame in one call.
-        #[cfg(debug_assertions)]
-        let written = {
-            let mut taken = 0;
-            for byte in &bytes {
-                let n = unsafe { (self.library.symbols.input)(byte as *const c_uchar, 1) };
-                if n != 1 {
-                    break;
-                }
-                taken += n;
-            }
-            taken
-        };
-        #[cfg(not(debug_assertions))]
-        let written = unsafe { (self.library.symbols.input)(bytes.as_ptr(), bytes.len()) };
-
-        if written != bytes.len() as c_long {
-            return Err(InterfaceError::SendError(format!(
-                "klipper_host_input took {written} of {} bytes",
-                bytes.len()
-            )));
-        }
+        bytes.extend_from_slice(&raw);
+        self.write_raw(&bytes)?;
         debug!("sent {} bytes to klipper", bytes.len());
         Ok(())
     }
 
     fn receive(&self) -> Option<Frame> {
+        // A muxed reference reads units and keeps the ones addressed to it.
+        if let Some(mux) = self.mux {
+            return self.receive_mux(mux);
+        }
+        // A bytes-mode library hands over the mux byte stream, in which a unit
+        // is not a frame — framing it here would read the unit's header byte as
+        // a length. That mode belongs to the bench scan, which reads
+        // [`HostDevice::read`] instead.
+        if self.library.mode == OutputMode::Bytes {
+            return None;
+        }
         loop {
             if self.stopped.load(Ordering::Relaxed) {
                 return None;
@@ -517,18 +963,25 @@ const OUTPUT_WAIT_MS: u32 = 100;
 #[cfg(test)]
 mod host_tests {
     use super::*;
+    use crate::core::klippy::assign;
+    use crate::core::klippy::config::access::AccessTracking;
     use crate::core::klippy::config::mcu::McuConfig;
+    use crate::core::klippy::config::Config;
     use crate::core::klippy::config::{ConfigSection, ConfigValue, ConfigWrapper};
-    use crate::core::klippy::mcu::Mcu;
-    use crate::core::klippy::msg::proto::ArgValue;
+    use crate::core::klippy::frame::{
+        MESSAGE_DEST, MESSAGE_HEADER_SIZE, MESSAGE_MAX, MESSAGE_MIN, MESSAGE_SYNC,
+    };
+    use crate::core::klippy::interface::devices::serial::{
+        decode_header, discovery_query, encode_header, set_node_id_for, HeaderScan, UnassignedNode,
+        ADMIN_REPLY, MAGIC, RESP_NEED_NODEID,
+    };
+    use crate::core::klippy::interface::pty::Pty;
+    use crate::core::klippy::mcu::host_libraries::HostLibraries;
+    use crate::core::klippy::mcu::{Dictionary, Mcu};
+    use crate::core::klippy::msg::parser::Parser;
+    use crate::core::klippy::msg::proto::{ArgValue, Payload};
     use crate::core::klippy::Interface;
-
-    /// Serialises the tests that load the real host library.
-    ///
-    /// The library registry is a per-path process-wide singleton, so two tests
-    /// sharing the one `.so` must not overlap: the second would meet — or, at
-    /// the end, unload — the first's library mid-handshake.
-    static HOST_LIBRARY_LOCK: Mutex<()> = Mutex::new(());
+    use std::time::Instant;
 
     #[test]
     fn test_load_reports_a_missing_library() {
@@ -540,6 +993,77 @@ mod host_tests {
             }
             other => panic!("expected Other, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_a_live_library_is_refused_in_another_mode_or_with_another_identity() {
+        // The mode picks the reader thread's API and the identity is fixed when
+        // klipper comes up, so a reference asking for either on a live library
+        // is refused rather than served as the wrong device. A bytes-mode
+        // reference is what a bench scan opens (`src/scan.rs`).
+        let _serial = HOST_LIBRARY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let named =
+            HostDevice::load_bytes(library_path(), Some([0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc]))
+                .expect("the real library takes an identity");
+
+        let err = HostDevice::load_bytes(library_path(), Some([0, 0, 0, 0, 0, 1]))
+            .expect_err("another identity is not this library's");
+        match err {
+            InterfaceError::Other(message) => {
+                assert!(message.contains("already loaded"), "{message}")
+            }
+            other => panic!("expected Other, got {other:?}"),
+        }
+
+        let err = HostDevice::load(library_path()).expect_err("the default mode is not the scan's");
+        match err {
+            InterfaceError::Other(message) => {
+                assert!(message.contains("already loaded"), "{message}")
+            }
+            other => panic!("expected Other, got {other:?}"),
+        }
+
+        // Dropping the last reference unloads it, so the refusal was only about
+        // the live library, not about the path.
+        drop(named);
+        HostDevice::load(library_path()).expect("the library is not loaded any more");
+    }
+
+    /// A muxed attach to a library that does not run the mux firmware sends the
+    /// handshake and never hears back, so it fails with a timeout — the same
+    /// failure a shared serial port misses its handshake on, and never a broken
+    /// session (`serial-mux-protocol.md`). The test library is built for the
+    /// host without `CONFIG_MUX_SERIAL`, so it is exactly that old firmware
+    /// (its parser drops the unit's first byte as a bad length and answers
+    /// nothing).
+    #[test]
+    fn test_a_muxed_attach_times_out_against_a_library_without_the_mux() {
+        let _serial = HOST_LIBRARY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let mux = HostMux {
+            identity: [0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc],
+            named: [0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc],
+        };
+        let err = HostDevice::load_mux(library_path(), mux, 1)
+            .expect_err("a plain library never answers the mux handshake");
+        assert!(
+            matches!(err, InterfaceError::Timeout),
+            "expected Timeout, got {err:?}"
+        );
+        // The failed attach dropped its only reference, so the library went with
+        // it; the next host test meets a fresh firmware.
+        assert!(
+            library_registry()
+                .lock()
+                .unwrap()
+                .get(library_path().as_path())
+                .and_then(Weak::upgrade)
+                .is_none(),
+            "the library should have been unloaded with the failed attach"
+        );
     }
 
     /// The host library is only built for tests, through `klipperx-test-support`.
@@ -654,9 +1178,61 @@ mod host_tests {
     /// frequency all come from the firmware.
     ///
     /// [`Dictionary`]: crate::core::klippy::mcu::Dictionary
+    /// A muxed `host_library:` path attaches **through the mux**: the identity
+    /// the load-time pass assigns the path is handed to the library before it
+    /// comes up, the assignment names it, and the firmware's own device answers
+    /// the handshake and speaks header-addressed frames from then on.
+    ///
+    /// Two sections name one library because that is what makes the path muxed,
+    /// and the one without a `uuid` claims the bridge's own device - the one
+    /// this test attaches to (the other section's device lives behind the
+    /// bridge and needs a downstream board on the tty).
+    #[tokio::test]
+    async fn test_a_muxed_host_path_attaches_to_the_real_library() {
+        let _serial = HOST_LIBRARY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+
+        // The bridge opens its port while the library comes up, so the tty has
+        // to exist first - the same trick the device-half test uses.
+        let pty = Pty::new();
+        let bridge_path = klipperx_test_support::klipper_host_mux_serial_path();
+        let _ = std::fs::remove_file(&bridge_path);
+        std::os::unix::fs::symlink(&pty.path, &bridge_path).expect("the bridge port path");
+
+        let library = mux_library_path();
+        let path = library.display().to_string();
+        let text = format!(
+            "[mcu]\nhost_library: {path}\n\
+             [mcu child]\nhost_library: {path}\nuuid: 1234567890ab\n"
+        );
+        let (config, _) = Config::from_text(&text).expect("the config parses");
+        let section = config
+            .sections()
+            .find(|section| section.id == "mcu")
+            .expect("the config has an [mcu] section");
+        let wrapper = ConfigWrapper::with_config(section, AccessTracking::shared(), None, &config);
+
+        // The config layer's own judgement: two sections on one path are muxed,
+        // and the path gets an identity - the value the library is told.
+        let libraries = HostLibraries::classify(&wrapper).expect("the path is told apart");
+        assert!(libraries.is_mux(&path), "two sections on a path are muxed");
+        let identity = libraries.identity(&path).expect("the path has an identity");
+
+        let mut mcu = McuConfig::new(&wrapper).expect("the [mcu] section");
+        mcu.id = Some(7);
+        mcu.host_mux = Some(HostMux {
+            identity,
+            named: identity,
+        });
+        let interface = mcu.open().expect("the muxed library opens and attaches");
+        let mcu = identify_and_clock(&mcu, &interface).await;
+        assert!(mcu.is_identified());
+    }
+
     #[tokio::test]
     async fn test_identify_against_the_real_library() {
-        let _serial = HOST_LIBRARY_LOCK
+        let _serial = HOST_LIBRARY_TEST_LOCK
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         let config =
@@ -720,7 +1296,7 @@ mod host_tests {
     /// firmware whose sequence starts over.
     #[tokio::test]
     async fn test_the_library_unloads_with_its_last_reference() {
-        let _serial = HOST_LIBRARY_LOCK
+        let _serial = HOST_LIBRARY_TEST_LOCK
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         let config =
@@ -761,5 +1337,272 @@ mod host_tests {
         assert_eq!(interface.receive().await, None);
         drop(interface);
         wait_for_unload().await;
+    }
+
+    // =======================================================================
+    // The firmware's serial-mux device half, over a real library
+    // =======================================================================
+
+    /// The mux build's library.
+    ///
+    /// This test lives with the other host-library tests because it drives the
+    /// same device layer ([`HostDevice::load_bytes`]) against the same real
+    /// firmware, and because it has to hold [`HOST_LIBRARY_TEST_LOCK`]: the
+    /// library registry is a per-path process-wide singleton, so every test
+    /// that loads a host library shares that one spine.
+    fn mux_library_path() -> PathBuf {
+        klipperx_test_support::klipper_host_mux_lib_path()
+    }
+
+    /// The data dictionary of the mux build, for the message ids the command
+    /// frame below is built from — the same firmware dictionary an identify
+    /// would fetch, read from the file `make` wrote instead.
+    fn mux_dictionary() -> Dictionary {
+        let path = klipperx_test_support::klipper_host_mux_dictionary_path();
+        let raw =
+            std::fs::read(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        Dictionary::from_json(serde_json::from_slice(&raw).expect("JSON"))
+            .expect("the mux build's data dictionary")
+    }
+
+    /// One command frame the host would send: the message `name` encoded with
+    /// no arguments (id plus args, the way [`Parser::encode`] produces it) in a
+    /// frame carrying the sequence byte `seq`.
+    fn command_frame(parser: &Parser, name: &str, seq: u8) -> Vec<u8> {
+        let payload = parser
+            .encode(name, &[])
+            .unwrap_or_else(|e| panic!("encode {name}: {e}"));
+        Frame::encode(seq, payload.payload())
+    }
+
+    /// A whole unit's arbitration id and the frame behind its header.
+    fn unit_parts(unit: &[u8]) -> (u32, &[u8]) {
+        match decode_header(unit) {
+            HeaderScan::Complete { arb, consumed } => (arb, &unit[consumed..]),
+            other => panic!("a unit starts with a header, got {other:?}"),
+        }
+    }
+
+    /// Cut one whole unit — the two-byte header plus the frame behind it — off
+    /// the front of `pending`, the framing
+    /// [`serial_query_unassigned`](crate::core::klippy::interface::devices::serial::serial_query_unassigned)
+    /// applies, including its resynchronisation: a byte that is not a header is
+    /// dropped and the parse picks up at the next SYNC.
+    ///
+    /// The resync is what skips the bare `starting` frame a freshly booted
+    /// firmware sends before it has a node id (see `sched.c`'s `sched_main`):
+    /// a device with no node id keeps the old wire format, so the first thing
+    /// on the stream is not a unit.
+    fn take_unit(pending: &mut Vec<u8>) -> Option<Vec<u8>> {
+        loop {
+            let consumed = match decode_header(pending) {
+                HeaderScan::Complete { consumed, .. } => consumed,
+                HeaderScan::NeedMore => return None,
+                HeaderScan::Invalid => {
+                    resync(pending)?;
+                    continue;
+                }
+            };
+            if pending.len() < consumed + 1 {
+                return None; // the length byte is still in flight
+            }
+            let length = pending[consumed] as usize;
+            if !(MESSAGE_MIN..=MESSAGE_MAX).contains(&length) {
+                resync(pending)?;
+                continue;
+            }
+            if pending.len() < consumed + length {
+                return None; // the rest of the frame is still in flight
+            }
+            return Some(pending.drain(..consumed + length).collect());
+        }
+    }
+
+    /// Drop everything up to and including the next SYNC; `None` when none is
+    /// buffered yet (the caller waits for more bytes).
+    fn resync(pending: &mut Vec<u8>) -> Option<()> {
+        let position = pending.iter().position(|&byte| byte == MESSAGE_SYNC)?;
+        pending.drain(..=position);
+        Some(())
+    }
+
+    /// Read from `device` until one whole unit is buffered, for at most
+    /// `timeout`; `None` when nothing arrived in the window.
+    fn read_unit(
+        device: &mut HostDevice,
+        pending: &mut Vec<u8>,
+        timeout: Duration,
+    ) -> Option<Vec<u8>> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(unit) = take_unit(pending) {
+                return Some(unit);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            let mut buf = [0u8; 256];
+            match device.read(&mut buf) {
+                Ok(0) => {} // the read window expired; recheck the deadline
+                Ok(read) => pending.extend_from_slice(&buf[..read]),
+                Err(e) => panic!("reading from the host library: {e}"),
+            }
+        }
+    }
+
+    /// `klipper_host_is_shutdown` out of the mapping the device already holds.
+    ///
+    /// The device's own `Library` is this test's handle to the one loaded
+    /// mapping, so the symbol reads the same firmware the device talks to.
+    fn is_shutdown_symbol(
+        device: &HostDevice,
+    ) -> libloading::Symbol<'_, unsafe extern "C" fn() -> c_uchar> {
+        unsafe {
+            device
+                .library
+                ._library
+                .get::<unsafe extern "C" fn() -> c_uchar>(b"klipper_host_is_shutdown\0")
+        }
+        .expect("the mux host library exports klipper_host_is_shutdown")
+    }
+
+    /// The firmware's serial-mux device half, over a real library.
+    ///
+    /// A device with no node id answers the discovery broadcast with the
+    /// identity the host named it; it adopts the id an assignment hands it and
+    /// goes quiet in scans; a data unit addressed to that id has its header
+    /// stripped and is dispatched, its answer led by the reply header; and an
+    /// assignment handing the id to another identity gives it up and stops the
+    /// device.
+    ///
+    /// The Rust side of these rules is covered by the serial mux's own tests;
+    /// this one pins them against the firmware `make` actually built, so a
+    /// regression in `third_party/klipper/src/mux.c` or in the console's
+    /// `mux_input` hook turns it red instead of leaving the fixtures green.
+    #[test]
+    fn test_the_mux_device_half_over_the_real_library() {
+        let _serial = HOST_LIBRARY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+
+        // The bridge opens its port while klipper comes up and init fails when
+        // it cannot, so the tty has to exist first: a pty whose slave is
+        // reachable at the path this build baked in. The `Pty` keeps both ends
+        // open for the whole test.
+        let pty = Pty::new();
+        let bridge_path = klipperx_test_support::klipper_host_mux_serial_path();
+        let _ = std::fs::remove_file(&bridge_path);
+        std::os::unix::fs::symlink(&pty.path, &bridge_path).unwrap_or_else(|e| {
+            panic!(
+                "failed to link {} to {}: {e}",
+                bridge_path.display(),
+                pty.path.display()
+            )
+        });
+
+        let identity = [0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc];
+        let mut device = HostDevice::load_bytes(mux_library_path(), Some(identity))
+            .expect("the mux host library opens");
+        let mut pending = Vec::new();
+        let window = Duration::from_secs(5);
+
+        let mut parser = Parser::new();
+        mux_dictionary()
+            .install(&mut parser)
+            .expect("install the mux build's dictionary");
+
+        // 1. The unnamed device answers the discovery broadcast with its
+        //    identity, under the admin reply header.
+        device
+            .write(&discovery_query())
+            .expect("the discovery query goes in");
+        let answer = read_unit(&mut device, &mut pending, window).expect("the scan answer");
+        let (arb, frame) = unit_parts(&answer);
+        assert_eq!(arb, ADMIN_REPLY, "the answer is on the admin reply id");
+        let node = UnassignedNode::from_unit(&answer).expect("a well-formed admin answer");
+        assert_eq!(
+            node.uuid, identity,
+            "the device answers with the identity the host named"
+        );
+        assert_eq!(
+            node.application, None,
+            "the library sends no application byte"
+        );
+        let payload = &frame[MESSAGE_HEADER_SIZE..];
+        assert_eq!(
+            &payload[..MAGIC.len()],
+            &MAGIC[..],
+            "the answer rides the KXID frame"
+        );
+        assert_eq!(
+            payload[MAGIC.len()],
+            RESP_NEED_NODEID,
+            "the answer asks for a node id"
+        );
+
+        // 2. The assignment is adopted, so a second scan is answered by
+        //    silence — what makes a scan list only unaddressed boards.
+        device
+            .write(&set_node_id_for(identity, 5).expect("id 5 is addressable"))
+            .expect("the assignment goes in");
+        device
+            .write(&discovery_query())
+            .expect("the second scan goes in");
+        assert!(
+            read_unit(&mut device, &mut pending, Duration::from_millis(500)).is_none(),
+            "an addressed device must stay quiet in a scan"
+        );
+
+        // 3. A data unit addressed to the adopted id has its header stripped and
+        //    is dispatched: `get_clock` comes back as the framed `clock`
+        //    response and the block-level ack, both led by the reply header.
+        //    The frame carries MESSAGE_DEST because that is where a freshly
+        //    booted firmware's receive sequence starts (`command.c`).
+        let reply_arb = assign::reply_arb_id(5).expect("id 5");
+        let mut unit = encode_header(assign::arb_id(5).expect("id 5"));
+        unit.extend_from_slice(&command_frame(&parser, "get_clock", MESSAGE_DEST));
+        device.write(&unit).expect("the get_clock unit goes in");
+
+        let response = read_unit(&mut device, &mut pending, window).expect("the clock response");
+        let (arb, frame) = unit_parts(&response);
+        assert_eq!(arb, reply_arb, "our frames go out on our reply header");
+        let clock = Frame::parse(frame).expect("the response is a whole frame");
+        let decoded = parser
+            .decode(Payload::from_raw(clock.payload().to_vec()))
+            .expect("the response decodes against the dictionary");
+        assert_eq!(decoded.len(), 1, "one message in the response frame");
+        assert_eq!(decoded[0].0.name, "clock", "get_clock is answered by clock");
+        assert!(
+            matches!(decoded[0].1.as_slice(), [ArgValue::UInt32(_)]),
+            "clock is a `%u` value, got {:?}",
+            decoded[0].1
+        );
+
+        let ack = read_unit(&mut device, &mut pending, window).expect("the block ack");
+        let (arb, frame) = unit_parts(&ack);
+        assert_eq!(arb, reply_arb, "the ack is headed too");
+        assert_eq!(
+            frame.len(),
+            MESSAGE_MIN,
+            "the block ack is the empty ack frame (len, seq, crc, sync)"
+        );
+
+        // 4. An assignment naming another identity for the id we hold gives the
+        //    id up and stops the device (the CAN id-conflict rule). It ends the
+        //    session, so it comes last and is all that is left to assert.
+        device
+            .write(&set_node_id_for([0xde, 0xad, 0xbe, 0xef, 0x00, 0x01], 5).expect("id 5"))
+            .expect("the conflicting assignment goes in");
+
+        let is_shutdown = is_shutdown_symbol(&device);
+        let deadline = Instant::now() + window;
+        while unsafe { is_shutdown() } == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_ne!(
+            unsafe { is_shutdown() },
+            0,
+            "an assignment that hands our id to another identity shuts us down"
+        );
     }
 }

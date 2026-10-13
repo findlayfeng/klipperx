@@ -12,8 +12,20 @@
 独占——独占串口走原来的 `SerialDevice`，**不发任何指派帧、不带任何头**，
 线格式与 Klipper 逐字节相同。
 
-> **固件侧尚未实现**。共享模式对今天的串口固件必然**握手超时**（见下），因此它现在是
-> 「主机侧就绪、设备端待做」的状态：误开到旧固件上只会连接失败，不会破坏会话。
+> **固件侧：设备半与桥半都已实现，但还没有架构默认启用它们**。`src/mux.c` 有**单元格式与
+> admin 单元族**，以及**设备半**：`mux_input()` 就地解析输入流（首字节高位置位 = 带头单元，
+> 否则 = 原始帧），未分配时答扫描、按 `0x01` 采纳 node id、被指派到已持有的 id 时照 CAN 的
+> `can_id_conflict` 弃号并 `shutdown`；已采纳 id 后自己发出的帧带应答头。`src/bridge.c`
+> （`CONFIG_BRIDGE`）有**桥半**：端口表、`uuid → 端口` 与 `id → 端口` 两张路由表、admin 扇出
+> （上游广播原样下达、下游应答**逐条**上行、不合并）、单设备路径**剥头/加头**。host 库还有
+> **下游串口端口**与 **unit 收发接口**（`klipper_host_input_unit`/`klipper_host_output_unit`，
+> 需帧接口开关**且**桥模式）。
+>
+> 但**今天没有架构把它编进共享串口的固件**：`MUX_SERIAL` 只由 host 的 `HOST_BRIDGE_SERIAL`
+> 或 `HOST_MUX_SERIAL` 选上（微控制器将来照它们给控制台选 UART 的做法加 `choice` 备选串口是
+> 同一件事）。所以**今天的串口固件仍不回执**，共享模式必然**握手超时**——误开到旧固件只会连接
+> 失败，不会破坏会话。设备半与桥半都有**永久测试**钉住（见[测试](testing.md)：第二份 mux 库
+> 变体 + mux 路径的真端到端 attach）。
 
 ## 寻址：与 CAN 逐位同值
 
@@ -53,7 +65,7 @@ id**（`mcu_id_from_arb`），方向本身由奇偶区分（`is_reply_arb`）。
 - **值域**：10 位数据位容纳 `0x000..=0x3ff`。协议占用的是分配域 `0x102..=0x2ff`（`id` 双向）与
   admin `0x3f0`/`0x3f1`；**`0x3f2..=0x3ff` 保留**，本版本不发出、读到即丢。`0x3ff`
   （`HEADER_ESCAPE`）是将来**扩展头**的起点（其后可接长度/子类型），所以 2 字节格式没有关掉
-  「加长的形式」这条路；保留带同时意味着 `nodeid` 可到 383（远超 CAN admin 报文单字节 `nodeid`
+  「加长的形式」这条路；10 位数据位本可容到 383，但保留带（`0x3f2..=0x3ff`）与 admin 的 `0x3f0`/`0x3f1` 把**现行上限压到 375**（`0x100+2*375 = 0x3ee`、应答 `0x3ef`；376 的对就撞上 admin）——仍远超 CAN admin 报文单字节 `nodeid`
   的 255 上限）。
 - **头里仍可出现 `0x7e`**：`id ∈ 120..=127` 时第二字节就是它（`id=120 → C0 7E`）。这不是缺陷——
   上游 [Protocol.md](../../../third_party/klipper/docs/Protocol.md) 明确写着「a sync character is
@@ -138,12 +150,22 @@ CAN 侧的同族常量在 `canserial.rs`。
 - **扫描**（`klipperx scan --port <tty>`，`src/scan.rs`）：
   `serial_query_unassigned()` 广播一次查询，随后按与 `dispatch` 相同的成帧语义切单元
   （`UnitStream`），窗口是**从广播起算的截止时间**（`--timeout`，默认 2 s），按 uuid
-  去重、每块板第一次被听到时回调——输出 `Found uuid=%012x, Application: …` 与总数行，`--interface <bus>` 则扫 CAN（同一个 `klipperx scan`），两者输出同形。CAN 侧的扫描实现在 `canserial.rs` 的 `query_unassigned`。
+  去重、每块板第一次被听到时回调——输出 `Found uuid=%012x, Application: …` 与总数行，`--interface <bus>` 则扫 CAN（同一个 `klipperx scan`），两者输出同形。CAN 侧的扫描实现在 `canserial.rs` 的 `query_unassigned`。`--host-library <path.so>` 则扫一份
+  host 库（配 `--host-identity <12 位十六进制>`，默认全 `0`）：加载它、在
+  `klipper_host_init()` **之前**用 `klipper_host_set_uuid()` 把身份交给它，再走同一段广播 /
+  窗口 / 去重代码；`--host-identity` 只在给了 `--host-library` 时可用。
 - **连接期**：`[mcu]` 节带 `uuid`（或别名 `canbus_uuid`）的共享串口，`attach()` 在发分配
   请求**之前**先写一枚 `SET_KLIPPER_NODEID`（按 uuid 点名 id），再走上一节的重确认
   握手——顺序与 CAN 的 `CanSerialDevice::open`（开链路时发 SET_NODEID）对应。
 
-### 固件端契约（待实现）
+### 固件端契约（设备半已实现，见 `src/mux.c`）
+
+`src/mux.c` 已实现下面的行为（`mux_input()` 在控制台任务里就地解析，`mux_admin_unit()` 处理
+admin 信道，`mux_unit()` 决定归属）。**注意两条不同的寻址**：命令走 **admin id**（`0x3f0`），
+而重新确认握手是**按 id 寻址**的（头部 `0x100+2*id`、帧体是空体 `KXID` 伪帧）——设备在自己的
+`arb(id)` 上认出它、按 `+1` 回 `assignment_reply`；把两者混为一谈会让握手永远收不到回执
+（这条是端到端测试抓出来的），并配有 `mux_query_unassigned` / `mux_set_node_id` /
+`mux_need_nodeid` / `mux_assignment_reply` 与解析用的 `mux_parse_kxid`：
 
 - 未分配的设备监听 `0x3f0`：收 `0x00` 在 `0x3f1` 回身份（uuid + application）；收
   `0x01 <uuid6> <id>` 且 uuid 是自己时**采纳 id** 并转入正常寻址。幂等：重复收到同一
@@ -180,7 +202,13 @@ CAN 不需要这套东西：总线自带仲裁 id 与硬件过滤，每颗 MCU �
 
 ## 尚未落地
 
-- 帧头寻址目前**只服务共享串口**；其它接口（独占串口、`host_library`、`test:`）不使用 id
-  寻址，`[mcu]` 的 id 对它们只是标识与分配序列的一部分。
-- 设备端固件未实现：共享路径在固件就绪前必然握手超时，发现扫描也只会等到截止窗口走空
-  （这是预期行为，不是 bug）；固件契约见「发现与指派：admin 信道与命令族」一节。
+- **微控制器架构还没启用 mux（刻意留后续）**：`MUX_SERIAL`/`BRIDGE_PORT_SERIAL` 目前只由 host
+  的两个开关选上。微控制器要照它们给控制台选 UART 的做法加一份 `choice` 备选串口（并排除控制台
+  已占用的那一路）再 select 它们；在那之前，共享**串口**仍然握手超时。
+- **host 模式的数据面**：unit 接口已定义、固件也已按单元发出自己的帧，但**主机侧（klippyx）还没
+  改用它**——`HostDevice` 仍走字节流/整帧。**分配段（扫描、`SET_NODEID`、重确认握手）走字节流
+  这条已经通了**：mux 路径的真端到端 attach 就是走它。
+- **多下游端口**：端口表支持多条，但今天只登记一条（host 那条 tty），多端口扇出与"某单元属于
+  哪个端口"的归属策略尚未被测过。
+- **host 侧读端口的时机**：`bridge_poll()` 插在任务循环的睡眠处（`src/host/timer.c` 的
+  `irq_wait()`），不额外起线程；代价是下游字节要等任务循环醒着时才被捡起。

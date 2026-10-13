@@ -400,9 +400,11 @@ mod tests {
             restart_method: method,
             transport: Transport::Host {
                 library: String::new(),
+                uuid: None,
             },
             id: None,
             shared_baud: None,
+            host_mux: None,
             usb_power: usb::UsbPowerMethod::default(),
         }
     }
@@ -420,6 +422,7 @@ mod tests {
             },
             id: None,
             shared_baud: None,
+            host_mux: None,
             usb_power: usb::UsbPowerMethod::default(),
         }
     }
@@ -436,6 +439,7 @@ mod tests {
             },
             id: None,
             shared_baud: None,
+            host_mux: None,
             usb_power: usb::UsbPowerMethod::default(),
         }
     }

@@ -1006,29 +1006,39 @@ impl UnassignedScan {
 /// else is the shared codec ([`decode_header`], [`drop_to_sync`], the
 /// `MESSAGE_*` frame constants) — one framing, not a second one.
 #[derive(Debug)]
-struct UnitStream {
+pub(crate) struct UnitStream {
     pending: Vec<u8>,
     needs_sync: bool,
 }
 
 impl UnitStream {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             pending: Vec::new(),
             needs_sync: false,
         }
     }
 
-    /// Append bytes to the stream; nothing is parsed until [`take_unit`].
-    fn feed(&mut self, bytes: &[u8]) {
+    /// Append bytes to the stream; nothing is parsed until [`Self::take_unit`].
+    pub(crate) fn feed(&mut self, bytes: &[u8]) {
         self.pending.extend_from_slice(bytes);
     }
 
     /// The next complete unit, or `None` if none is buffered.
+    pub(crate) fn take_unit(&mut self) -> Option<Vec<u8>> {
+        self.take_unit_with_arb().map(|(_, unit)| unit)
+    }
+
+    /// The next complete unit and the arbitration id its header names, or `None`
+    /// if none is buffered.
+    ///
+    /// The id is what lets an addressed reader ([`HostDevice`](super::host::HostDevice))
+    /// keep the units meant for it and drop the rest; a scan
+    /// ([`serial_query_unassigned`]) reads units whole and ignores it.
     ///
     /// Exactly the [`dispatch`] policy: an invalid header or a length byte
     /// outside the frame range resynchronises on the next [`MESSAGE_SYNC`].
-    fn take_unit(&mut self) -> Option<Vec<u8>> {
+    pub(crate) fn take_unit_with_arb(&mut self) -> Option<(u32, Vec<u8>)> {
         loop {
             if self.needs_sync {
                 match self.pending.iter().position(|&b| b == MESSAGE_SYNC) {
@@ -1042,13 +1052,13 @@ impl UnitStream {
                     }
                 }
             }
-            let consumed = match decode_header(&self.pending) {
+            let (arb, consumed) = match decode_header(&self.pending) {
                 HeaderScan::NeedMore => return None,
                 HeaderScan::Invalid => {
                     drop_to_sync(&mut self.pending, &mut self.needs_sync);
                     continue;
                 }
-                HeaderScan::Complete { consumed, .. } => consumed,
+                HeaderScan::Complete { arb, consumed } => (arb, consumed),
             };
             if self.pending.len() < consumed + 1 {
                 return None; // the length byte is still in flight
@@ -1063,7 +1073,7 @@ impl UnitStream {
                 return None; // the rest of the frame is still in flight
             }
             let unit: Vec<u8> = self.pending.drain(..unit_len).collect();
-            return Some(unit);
+            return Some((arb, unit));
         }
     }
 }

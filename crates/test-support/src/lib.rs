@@ -46,6 +46,35 @@ pub fn klipper_host_lib_path() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("KLIPPER_HOST_LIB"))
 }
 
+/// Absolute path to the mux-flavoured klipper host shared library.
+///
+/// A second host build of the same target, with the firmware's serial-mux
+/// device half compiled in (`CONFIG_HOST_BRIDGE_SERIAL`, which also selects
+/// `CONFIG_MUX` / `CONFIG_MUX_SERIAL`) and the frame API on. It has its own
+/// output directory, so the library [`klipper_host_lib_path`] names — which has
+/// neither — is untouched.
+pub fn klipper_host_mux_lib_path() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("KLIPPER_HOST_MUX_LIB"))
+}
+
+/// The tty path the mux host library's bridge opens in `klipper_host_init()`.
+///
+/// A path inside the build's own `OUT_DIR`, not a real device: the bridge fails
+/// init when it cannot open its port, so a test creates a pty there before
+/// loading the library.
+pub fn klipper_host_mux_serial_path() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("KLIPPER_HOST_MUX_SERIAL_PATH"))
+}
+
+/// The data dictionary of the mux host build, for the message ids its firmware
+/// answers (`get_clock`, `clock`, …).
+///
+/// The same `<name>.dict` JSON shape as [`test_dicts_dir`], at a path of its
+/// own because the host target is not one of `test/configs`.
+pub fn klipper_host_mux_dictionary_path() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("KLIPPER_HOST_MUX_DICT"))
+}
+
 /// Absolute path to the directory of built data dictionaries.
 ///
 /// `build.rs` builds one `test/configs/*.config` per architecture named in

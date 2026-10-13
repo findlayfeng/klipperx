@@ -7,7 +7,7 @@ pub mod usb;
 pub use devices::canserial::CanSerialDevice;
 #[cfg(test)]
 pub use devices::frame_mock::{FrameMock, MappingEntry};
-pub use devices::host::HostDevice;
+pub use devices::host::{HostDevice, HostMux};
 pub use devices::serial::SerialDevice;
 use devices::serial::SharedSerialHandle;
 #[cfg(test)]
@@ -186,6 +186,25 @@ impl Interface {
     pub fn host(path: impl AsRef<Path>) -> Result<Self, InterfaceError> {
         Ok(Self::with_transport(Transport::Host(Arc::new(
             HostDevice::load(path)?,
+        ))))
+    }
+
+    /// Create an interface running klipper's host library from `path` on a path
+    /// the config says is muxed: the library is given `mux`'s identity and the
+    /// reference is attached under `mcu_id` ([`HostDevice::load_mux`]), so its
+    /// frames carry the mux header from then on.
+    ///
+    /// # Errors
+    /// Returns [`InterfaceError`] for the reasons [`Interface::host`] does, and
+    /// [`InterfaceError::Timeout`] when the device never confirms the
+    /// assignment.
+    pub fn host_mux(
+        path: impl AsRef<Path>,
+        mux: HostMux,
+        mcu_id: u32,
+    ) -> Result<Self, InterfaceError> {
+        Ok(Self::with_transport(Transport::Host(Arc::new(
+            HostDevice::load_mux(path, mux, mcu_id)?,
         ))))
     }
 

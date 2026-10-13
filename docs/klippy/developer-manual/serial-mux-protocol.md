@@ -58,7 +58,7 @@ id**（`mcu_id_from_arb`），方向本身由奇偶区分（`is_reply_arb`）。
 - **值域**：10 位数据位容纳 `0x000..=0x3ff`。协议占用的是分配域 `0x102..=0x2ff`（`id` 双向）与
   admin `0x3f0`/`0x3f1`；**`0x3f2..=0x3ff` 保留**，本版本不发出、读到即丢。`0x3ff`
   （`HEADER_ESCAPE`）是将来**扩展头**的起点（其后可接长度/子类型），所以 2 字节格式没有关掉
-  「加长的形式」这条路；保留带同时意味着 `nodeid` 可到 383（远超 CAN admin 报文单字节 `nodeid`
+  「加长的形式」这条路；10 位数据位本可容到 383，但保留带（`0x3f2..=0x3ff`）与 admin 的 `0x3f0`/`0x3f1` 把**现行上限压到 375**（`0x100+2*375 = 0x3ee`、应答 `0x3ef`；376 的对就撞上 admin）——仍远超 CAN admin 报文单字节 `nodeid`
   的 255 上限）。
 - **头里仍可出现 `0x7e`**：`id ∈ 120..=127` 时第二字节就是它（`id=120 → C0 7E`）。这不是缺陷——
   上游 [Protocol.md](../../../third_party/klipper/docs/Protocol.md) 明确写着「a sync character is
@@ -200,6 +200,7 @@ CAN 不需要这套东西：总线自带仲裁 id 与硬件过滤，每颗 MCU �
   （`mcu/host_libraries.rs`，见[连接方式](../user-manual/mcu-connection.md)一节的规则），但
   **帧头消费**（attach 时按 mux 走、以及把 self 的帧交给本机解析器）尚未接入。独占串口与
   判定为**非 mux** 的 host 库路径、以及 `test:` 也仍不使用 id 寻址——但注意 id 本身**每个 `[mcu]` 都有**（`McuObject::connect` 没有它就拒绝开传输层），对它们只是标识与分配序列的一部分。
+- **桥的接线与路由（`CONFIG_BRIDGE`）**：今天只到"打开并持有下游端口 fd"（`host/bridge.c`）——把端口接进控制台、以及 `id ↔ 端口` 的路由表与扇出都还没有实现，除 `src/host/` 外没有代码引用 `CONFIG_BRIDGE`。
 - **host 模式的数据面**：`klipper_host_input_unit()` / `klipper_host_output_unit()` 已定义
   （一次一整单元：2 字节头 + 帧，头里就是来源设备），但固件尚未按单元发出上游帧、主机侧也
   还没改用它。**分配与扫描那段对话始终走字节流**（`klipper_host_input` /

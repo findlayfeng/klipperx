@@ -30,7 +30,7 @@ CAN 这条走的是 klipper 的 **can serial** 链路（就像把串口协议搬
 
 节点号到仲裁 ID 的映射也沿用 Klipper：`0x100 + 2 × nodeid`，主机写这个 ID、MCU 用下一个回；这个映射在主机侧单一定义于 `assign.rs`（CAN 与共享串口共用，`canserial.rs` 不再自带常量），打开 CAN 链路前会校验节点号落在 `1..=255`，越界即报错而不是拼出一个非法仲裁 ID。节点号由主机通过 admin ID `0x3f0` 的 `CMD_SET_NODEID` 报文指派，所以配置里 `uuid` 是必需的（节点号本身可由 `[mcu_ids]` 分配、不必写；历史拼写 `[canbus_ids]` 仍兼容）。
 
-节点号在本仓是 **MCU 层 id**：每个 `[mcu]`（不论接口）在装载期都被分配一个唯一 id（所有接口共用同一个序列，`mcu/ids.rs`），`connect` 打开传输层之前必须持有它——CAN 用它做节点寻址（admin 帧），**共享串口**用下节的帧头与**分配期握手**把 id 交给设备、并拿它做寻址，**独占串口不使用它**；`host_library` 与 `test:` **同样领到 id、只是暂不上线**（id 是每个 `[mcu]` 的属性——`connect` 没有它就不开传输层；host 库路径「是否按 id 寻址」的判定已在配置层落地，帧头消费尚未接入）。显式 `canbus_nodeid` 就是这个 id 的显式覆盖：分配器
+节点号在本仓是 **MCU 层 id**：每个 `[mcu]`（不论接口）在装载期都被分配一个唯一 id（所有接口共用同一个序列，`mcu/ids.rs`），`connect` 打开传输层之前必须持有它——CAN 用它做节点寻址（admin 帧），**共享串口**用下节的帧头与**分配期握手**把 id 交给设备、并拿它做寻址，**独占串口不使用它**；`host_library` 与 `test:` **同样领到 id、只是暂不上线**（id 是每个 `[mcu]` 的属性——`connect` 没有它就不开传输层；host 库路径「是否按 id 寻址」的判定已在配置层落地，帧头消费尚未接入）。显式 `canbus_nodeid` 就是这个 id 的显式覆盖（**仅 CAN 节**——写到 `serial`/`host_library`/`test` 节上会被判为"第二个接口"而在装载期报错）：分配器
 在装载时预扫全配置、先把所有显式号保留下来（`reserve_explicit`），自动号取 `4` 起的
 **最小空位**并绕开它们——所以显式号写在哪个位置都生效，发号结果与声明顺序无关。
 
@@ -47,12 +47,12 @@ serial: /dev/ttyUSB0
 ```
 
 - **baud**：共享路径上以**显式写出的** baud 为准；多颗写了不同的值就 `warn` 并**取最小值**，没写 baud 的节跟着这个值走（不一致不再是配置错）。
-- **id**：就是 `[mcu_ids]` 分给该 MCU 的号（`canbus_nodeid` 可显式覆盖），与 CAN 节点号**同一个号段**——寻址用同一套映射 `0x100 + 2*id`（设备应答 `+1`）。
+- **id**：就是 `[mcu_ids]` 分给该 MCU 的号（**仅 CAN 节**可用 `canbus_nodeid` 显式覆盖），与 CAN 节点号**同一个号段**——寻址用同一套映射 `0x100 + 2*id`（设备应答 `+1`）。
 - **握手**：每颗 MCU 在**打开（分配）这个共享端口时**同步做一次 id 指派握手，identify 之前完成；默认 **500 ms × 3 次**，无回执即连接失败。节上写了 `uuid`（或别名 `canbus_uuid`）时，握手**先按它发一枚 SET_NODEID**（`0x3f0` 的 `0x01`，按 uuid 点名 id）再发原有的重确认请求——帧序见[串口复用协议](../developer-manual/serial-mux-protocol.md)；独占串口**忽略** `uuid`（不发任何帧）。
 - **复位**：`restart_method` 的线级复位（`arduino` 的 DTR 翻转、`cheetah`、`rpi_usb` 切电）作用在**整条线**上，会把共享端口上的所有 MCU 一起打断——所以共享路径**强制 `restart_method: command`**：**显式写了**别的值（`arduino`/`cheetah`/`rpi_usb`）会在装载期告警并改用 `command`；没写则静默降级（串口默认的 `arduino` 只是默认）；非法拼写仍是配置错。
 - **发现**：还没分配 id 的设备用 `klipperx scan` 扫出可粘进配置的 uuid（`--interface <总线>` 扫 CAN、`--port <tty>` 扫串口、`--host-library <path.so>` 扫一份 host 库；单次广播查询 + 截止窗口 + 按 uuid 去重，三种传输输出同形）。扫 host 库时用 `--host-identity <12 位十六进制>`（默认全 `0`）给出库在 `init` 前要采纳的身份，它**只在给了 `--host-library` 时可用**。
 
-> 设备端**只落地了一部分**：单元格式与 admin 单元族已在固件里（`src/mux.c`），host 库还有下游串口端口与 unit 收发接口（`klipper_host_input_unit`/`klipper_host_output_unit`）；**设备半的状态机**（应答扫描、采纳 nodeid、id 冲突处理）仍待做，所以今天的固件不会回执——共享串口现在必然握手超时、连不上。这是预期状态：误配到旧固件只会连接失败，不会搞乱会话。
+> 设备端**只落地了一部分**：单元格式与 admin 单元族已在固件里（`src/mux.c`），host 库还有下游串口端口与 unit 收发接口（`klipper_host_input_unit`/`klipper_host_output_unit`）；**设备半的状态机**（应答扫描、采纳 nodeid、id 冲突处理）、以及**桥的接线与路由**（`CONFIG_BRIDGE`：把下游端口接进控制台、`id ↔ 端口` 路由表）仍待做，所以今天的固件不会回执——共享串口现在必然握手超时、连不上。这是预期状态：误配到旧固件只会连接失败，不会搞乱会话。
 
 ### 线上的形状（设备端实现规格）
 

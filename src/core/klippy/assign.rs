@@ -20,7 +20,7 @@
 //! Everything transport-specific stays with its transport:
 //!
 //! * The **serial** side — the `KXID` pseudo-frame that carries the assignment,
-//!   its VLQ frame-header codec, and the synchronous handshake — is
+//!   its fixed two-byte checked frame-header codec, and the synchronous handshake — is
 //!   `interface/devices/serial.rs`.
 //! * The **CAN** side is its own admin frame (`0x3f0` / `CMD_SET_NODEID`) in
 //!   `interface/devices/canserial.rs`, which exists on the bus itself rather

@@ -13,3 +13,4 @@
 |---|---|
 | 2026-09-23 09:10 | [H2（风扇与通用输出）动工前调查](2026-09-23-h2-notes.md) — 上游 fan/heater_fan/controller_fan 等 21 个文件的依赖盘点、344 次「运行×缺口」测算、GCodeRequestQueue/heater 注册表/tachometer 三处差距与 H2-1…H2-7 拆分 |
 | 2026-09-23 10:03 | [G4/H10（gcode_move）动工前调查](2026-09-23-gcode-move-notes.md) — 上游 g-code 坐标系的状态/命令/事件模型、`G0`/`G1` 从 toolhead 搬家的差距、`Move out of range` 49 次的算账、G4-1/G4-2 拆分与六个拍板点 |
+| 2026-10-13 20:00 | [桥下游端口模块化与「无 admin 设备」共存（M1）动工前调查](2026-10-13-bridge-port-notes.md) — 端口按 `[uart_device]`/`[can_device]` 定义、子设备引用端口节名的配置面；"桥"与"端口"由引用推算、legacy 由「无 uuid + uart」推算；固件报端口表 + 主机经桥自己的 admin 通道下发 `SET_PORT_NODEID(index, id)` 建表；六期开发计划（P1 配置面 / P2 端口表与端口级命令 / P3 attach 端到端 / P4 判定与传输正交 / P5 CAN 上游与复位）与每期验收口径 |

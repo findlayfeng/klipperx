@@ -110,8 +110,8 @@ H1–H12 是上游 extras 里按域归并的消费者（2026-09-21 全量盘点�
 
 | # | 事项 | 依赖 |
 |---|---|---|
-| M1 | 与**没有 admin 通道**的设备共存：下游是原版固件时，id 与路由归属怎么办（今天靠设备答扫描来学 `uuid → 端口`） | — |
-| M2 | 通过 **admin 流程复位固件**（per-device reset；今天的复位只有线级手段，共享路径被强制成 `command`） | — |
+| M1 | 桥下游**端口模块化**与**没有 admin 通道的设备**共存：端口按 `[uart_device]`/`[can_device]` 定义、子设备引用端口节名，归属由主机经桥自己的 admin 通道告知桥（分六期：P1 配置面 → P2 固件端口表+端口级命令 → P3 attach 端到端 → P4 判定与传输正交 → P5 CAN 上游/复位） | 见笔记 |
+| M2 | 通过 **admin 流程复位固件**（per-device reset；今天的复位只有线级手段，共享路径被强制成 `command`）——与 M1 的 §5 P5 对接（复用端口级命令与端口 `index`） | M1 |
 
 > 判为**不适用**、不进待办的上游模块：`garbage_collection.py`（Python GC 调优）、
 > `aio_executor.py`（Python 线程池）、`parsedump.py`（离线开发工具）、
@@ -355,22 +355,15 @@ endstop 资源（`mcu/resource/endstop.rs`，含 `minclock` 门控与 `home_wait
 - 备注：`printers.test` 有 2 条运行声明 `DICTIONARY pru.dict host=linuxprocess.dict`，默认不构建
   `pru`；要跑需 `KLIPPERX_ARCHES=…,pru`（需 `pru-gcc`）。
 
-### M1 与**没有 admin 通道**的设备共存（复用/桥拓扑）
+### M1 桥下游端口模块化与「无 admin 设备」共存
 
-复用（mux）与桥今天都靠 **admin 信道**点名与归属：主机按 uuid 发 `SET_KLIPPER_NODEID`、设备在
-`0x3f1` 上答扫描、桥从下游答里学 `uuid → 端口`（`third_party/klipper/src/bridge.c`）。
-**原版 klipper 串口固件**（以及任何不实现这套的设备）既不答扫描、也不能被点名：
+设计、拍板点与六期开发计划全部记在 [桥下游端口模块化与「无 admin 设备」共存（2026-10-13）](docs/work-log/2026-10-13-bridge-port-notes.md)（`docs/work-log/`）。
 
-- 当**单设备下游**时它其实能工作——桥对单设备路径**剥头/加头**，它只看到原始帧——但桥**学不到
-  `uuid → 端口`**，于是上游 `SET_NODEID(uuid, id)` 该转到哪条端口无从归属（今天只有一条端口，
-  另有"未知 uuid 先探一次"的兜底，探不到就留一条带界的 pending）。
-- 当**共享路径上的一员**时完全无法与其它设备区分（它没有 id 概念）。
-
-要定的：① 单设备下游端口是否**配置期静态建表**（该端口的 `[mcu]` 节自带 `uuid:`/id，桥据此直接
-建 `id → 端口`，不再依赖扫描）；② 是否需要一条**不依赖 admin 的归属**（首次原始帧的响应观察，或
-配置声明）；③ 与"路径上只有一台设备就剥头"这条规则如何组合。
-验收口径：一条"下游是原版 klipper 板子"的拓扑，主机能把它当普通 `[mcu]` 连上并跑通 identify +
-`get_clock`，全程不要求它答 admin。
+一句话范围：端口按 klipper 一贯的设备节形式定义（`[uart_device <名>]` / `[can_device <名>]`，
+`i2c`/`spi` 复用已有节类型），子设备引用**端口节名**；`[bridge]`/`[bridge_port]`/`bridge_admin`
+都不要（桥与端口从引用推算，legacy 从「无 `uuid:` + uart 端口」推算）；**归属由主机经桥自己的
+admin 通道**用端口级命令 `SET_PORT_NODEID(index, id)` 告知桥，**下游设备完全不参与**——这就是
+"与没有 admin 的设备共存"的答案。**依赖**：无（P1 可先做）；**状态**：已定案、尚未开工（现状见笔记 §6）。
 
 ### M2 通过 **admin 流程复位固件**（per-device reset）
 
@@ -384,6 +377,9 @@ endstop 资源（`mcu/resource/endstop.rs`，含 `minclock` 门控与 `home_wait
 内部改走它）。要明确：① 复位到哪一层（重进 `sched_main` / 清 shutdown / 真复位 MCU / 进
 bootloader）；② 幂等与回执（现在的 admin 流程**没有**回执，主机如何确认复位已发生）；
 ③ 旧固件降级（不答 admin 的设备只能继续 `command`）。
+
+与 M1 对接：复位命令族要与端口模块化的"面向设备 vs 面向端口/桥"两条分开（见
+[M1 笔记](docs/work-log/2026-10-13-bridge-port-notes.md) §5 P5），端口级复位复用端口的 `index`。
 
 相关：`third_party/klipper/src/{mux.{c,h},generic/canserial.{c,h}}`、`mcu/restart.rs`、
 `docs/klippy/developer-manual/serial-mux-protocol.md` 的 admin 命令族表、

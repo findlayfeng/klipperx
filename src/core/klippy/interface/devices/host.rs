@@ -43,13 +43,22 @@
 //! sharing — which is what "old-firmware compatibility" means here. The bridge
 //! that routes between live references will grow in the firmware later.
 //!
-//! **Two I/O modes, chosen at compile time.** In a debug build the library is
-//! read and written one byte per call, so every frame travels the whole
-//! reassembly path against real firmware. In a release build the library is
-//! asked for whole frames (`klipper_host_output_frame`, which it only has when
-//! built with `CONFIG_HOST_FRAME_API`), and reassembly is skipped entirely —
-//! the same thing `FrameMock` does, for the same reason: there is nothing to
-//! reassemble when the boundary is already known.
+//! **Two I/O modes.** The default mode is chosen at compile time: in a debug
+//! build the library is read and written one byte per call, so every frame
+//! travels the whole reassembly path against real firmware; in a release build
+//! the library is asked for whole frames (`klipper_host_output_frame`, which it
+//! only has when built with `CONFIG_HOST_FRAME_API`), and reassembly is skipped
+//! entirely — the same thing `FrameMock` does, for the same reason: there is
+//! nothing to reassemble when the boundary is already known.
+//!
+//! The other mode is the caller's, for a **bench scan**: `OutputMode::Bytes`,
+//! which reads the library's byte stream in every build
+//! ([`HostDevice::load_bytes`]). The serial mux wraps every frame in a
+//! two-byte header (the developer manual's *serial-mux-protocol* page), so a
+//! mux unit's first byte is a header byte, not the frame length the frame API
+//! cuts the buffer by — that API cannot see a unit at all, in any build. A scan
+//! therefore reads and writes the stream **as it is**
+//! ([`HostDevice::read`]/[`HostDevice::write`]) and never reassembles it.
 
 use crate::core::klippy::frame::Frame;
 #[cfg(debug_assertions)]
@@ -78,10 +87,56 @@ fn library_registry() -> &'static Mutex<HashMap<PathBuf, Weak<HostLibrary>>> {
     LIBRARIES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// The live library for `path`, loading it (and starting its threads) if the
-/// registry holds no live one.
-fn library_for(path: &Path) -> Result<Arc<HostLibrary>, InterfaceError> {
-    resource_for(library_registry(), path, HostLibrary::open)
+/// Serialises the tests that load the real host library.
+///
+/// The library registry is a per-path process-wide singleton, so two tests
+/// sharing the one `.so` must not overlap: the second would meet — or, at the
+/// end, unload — the first's library mid-handshake. A loaded library's output
+/// mode and identity are fixed too ([`library_for`]), which puts a scan test
+/// and an identify test on the same `.so` in exactly that pair.
+#[cfg(test)]
+pub(crate) static HOST_LIBRARY_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+/// Which of the library's two output APIs its reader thread reads.
+///
+/// A property of the **loaded library** (it picks the reader thread's read), so
+/// it is chosen when the library is opened and every reference on it shares it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OutputMode {
+    /// The default: the build's own protocol path — a debug build reads the
+    /// byte stream, a release build whole frames (see the module docs).
+    Default,
+    /// The byte stream (`klipper_host_output_wait`) in **every** build, because
+    /// a mux unit is not a frame boundary (see the module docs).
+    Bytes,
+}
+
+/// The live library for `path` in `mode` with `identity`, loading it (and
+/// starting its threads) if the registry holds no live one.
+///
+/// # Errors
+/// Returns [`InterfaceError`] when opening fails, and when a live library on
+/// `path` disagrees with `mode` or `identity`: both are fixed when the library
+/// is opened (the mode picks its reader, the identity is set before klipper
+/// comes up), so reusing it under other ones would silently answer as the
+/// wrong thing.
+fn library_for(
+    path: &Path,
+    mode: OutputMode,
+    identity: Option<[u8; 6]>,
+) -> Result<Arc<HostLibrary>, InterfaceError> {
+    let library = resource_for(library_registry(), path, |path| {
+        HostLibrary::open(path, mode, identity)
+    })?;
+    let identity = identity.unwrap_or([0; 6]);
+    if library.mode != mode || library.identity != identity {
+        return Err(InterfaceError::Other(format!(
+            "klipper host library {} is already loaded with a different output mode or \
+             identity, which are fixed when the library is opened",
+            library.library_path.display()
+        )));
+    }
+    Ok(library)
 }
 
 // ===========================================================================
@@ -101,6 +156,9 @@ fn library_for(path: &Path) -> Result<Arc<HostLibrary>, InterfaceError> {
 
 type InitFn = unsafe extern "C" fn() -> c_int;
 type InputFn = unsafe extern "C" fn(*const c_uchar, usize) -> c_long;
+/// `klipper_host_set_uuid(const uint8_t uuid[6])` — the identity the device
+/// answers the serial mux with, which the host sets before klipper comes up.
+type SetUuidFn = unsafe extern "C" fn(*const c_uchar) -> c_int;
 /// One read from the library: bytes into `buf`, up to `buf_size`, waiting up to
 /// `timeout_ms`. Both the byte-stream and the frame API have this shape.
 type OutputFn = unsafe extern "C" fn(*mut c_uchar, usize, u32) -> usize;
@@ -115,10 +173,14 @@ type ShutdownFn = unsafe extern "C" fn();
 #[derive(Clone, Copy)]
 struct Symbols {
     init: InitFn,
+    /// `klipper_host_set_uuid`, absent from a library built before the host
+    /// could name the device — an identity is then refused rather than ignored
+    /// (see [`HostLibrary::open`]).
+    set_uuid: Option<SetUuidFn>,
     input: InputFn,
-    /// `klipper_host_output_wait` in a debug build, `klipper_host_output_frame` in a
-    /// release build — see [`Symbols::resolve`].
-    output: OutputFn,
+    /// `klipper_host_output_wait`, the byte stream, in **every** build: what a
+    /// debug build reads by default and what `OutputMode::Bytes` always reads.
+    output_wait: OutputFn,
     run: RunFn,
     shutdown: ShutdownFn,
 }
@@ -138,24 +200,14 @@ impl Symbols {
 
         Ok(Self {
             init: unsafe { get(library, b"klipper_host_init\0")? },
+            // Optional: only a library that knows the host may name it exports
+            // this. An identity asked of one that does not is an error, not a
+            // silently unnamed device (see [`HostLibrary::open`]).
+            set_uuid: unsafe { library.get::<SetUuidFn>(b"klipper_host_set_uuid\0") }
+                .ok()
+                .map(|symbol| *symbol),
             input: unsafe { get(library, b"klipper_host_input\0")? },
-            // A debug build takes the byte stream apart itself; a release build
-            // wants the library's frame API, which exists only when it was built
-            // with CONFIG_HOST_FRAME_API.
-            #[cfg(debug_assertions)]
-            output: unsafe { get(library, b"klipper_host_output_wait\0")? },
-            #[cfg(not(debug_assertions))]
-            output: unsafe {
-                library
-                    .get::<OutputFn>(b"klipper_host_output_frame\0")
-                    .map_err(|e| {
-                        InterfaceError::Other(format!(
-                            "klipper host library has no klipper_host_output_frame: rebuild it \
-                             with CONFIG_HOST_FRAME_API=y, or use a debug build ({e})"
-                        ))
-                    })
-                    .map(|symbol| *symbol)?
-            },
+            output_wait: unsafe { get(library, b"klipper_host_output_wait\0")? },
             run: unsafe { get(library, b"klipper_host_run\0")? },
             shutdown: unsafe { get(library, b"klipper_host_shutdown\0")? },
         })
@@ -180,6 +232,13 @@ struct HostLibrary {
     _library: Library,
     symbols: Symbols,
     library_path: PathBuf,
+    /// Which output API the reader thread reads (fixed when the library is
+    /// opened; [`library_for`] refuses a reference that asks for the other).
+    mode: OutputMode,
+    /// The identity this library was given before klipper came up, all zeros
+    /// when none was ([`HostLibrary::open`]). Printed by the firmware and
+    /// answered to the mux, so a request for another one is refused.
+    identity: [u8; 6],
     /// Raw bytes from Klipper, in arrival order. The library's own receiver is
     /// the template every [`HostDevice`] clones; it never reads it itself.
     output: Receiver<Vec<u8>>,
@@ -190,17 +249,24 @@ struct HostLibrary {
 }
 
 impl HostLibrary {
-    /// Load `path`, initialise klipper and start the two threads.
+    /// Load `path`, give it `identity`, initialise klipper and start the two
+    /// threads; `mode` picks the output API the reader thread reads.
     ///
     /// Shared by every reference on the same path; called by
     /// [`library_for`] only when no live library is registered for it yet.
     ///
     /// # Errors
     /// Returns [`InterfaceError`] when the library cannot be loaded, does not
-    /// export the expected symbols, or fails to initialize. The runtime thread
-    /// is stopped and joined again if the output reader cannot be spawned, so
-    /// no thread is left inside a library that is about to be unmapped.
-    fn open(path: &Path) -> Result<Arc<Self>, InterfaceError> {
+    /// export the expected symbols, or fails to initialize — and when an
+    /// identity is asked of a library built without `klipper_host_set_uuid`.
+    /// The runtime thread is stopped and joined again if the output reader
+    /// cannot be spawned, so no thread is left inside a library that is about
+    /// to be unmapped.
+    fn open(
+        path: &Path,
+        mode: OutputMode,
+        identity: Option<[u8; 6]>,
+    ) -> Result<Arc<Self>, InterfaceError> {
         let library_path = path.to_path_buf();
         let library = unsafe { Library::new(&library_path) }.map_err(|e| {
             InterfaceError::Other(format!(
@@ -210,6 +276,29 @@ impl HostLibrary {
         })?;
 
         let symbols = Symbols::resolve(&library)?;
+
+        // The identity is fixed once the device is up, so it is set here,
+        // before `init` — and only when the host names one: all zeros is what
+        // the library starts with anyway.
+        let identity = identity.unwrap_or([0; 6]);
+        if identity != [0; 6] {
+            let set_uuid = match symbols.set_uuid {
+                Some(set_uuid) => set_uuid,
+                None => {
+                    return Err(InterfaceError::Other(format!(
+                        "klipper host library {} does not support an identity: it was built \
+                         without klipper_host_set_uuid",
+                        library_path.display()
+                    )))
+                }
+            };
+            let result = unsafe { set_uuid(identity.as_ptr()) };
+            if result != 0 {
+                return Err(InterfaceError::Other(format!(
+                    "klipper_host_set_uuid() returned {result}"
+                )));
+            }
+        }
 
         // Ready klipper's globals. A fresh mapping has no shutdown latch to
         // clear, but on a library that was unloaded and mapped again `init` is
@@ -245,7 +334,29 @@ impl HostLibrary {
         // It holds only a clone of `stopped` (and no `Arc<HostLibrary>`), so it
         // can never keep the library alive on its own.
         let poller_stopped = Arc::clone(&stopped);
-        let poller_read = symbols.output;
+        // The reader's read is the mode's: the byte stream in a debug build and
+        // in `OutputMode::Bytes`, whole frames in a release build's default mode.
+        // The frame API only exists in a library built with
+        // CONFIG_HOST_FRAME_API, and **only the default mode asks for it**: a
+        // bytes-mode load (the bench scan) reads the stream, so it loads
+        // against the byte-stream API that every build has.
+        #[cfg(debug_assertions)]
+        let poller_read = symbols.output_wait;
+        #[cfg(not(debug_assertions))]
+        let poller_read = match mode {
+            OutputMode::Bytes => symbols.output_wait,
+            OutputMode::Default => unsafe {
+                library
+                    .get::<OutputFn>(b"klipper_host_output_frame\0")
+                    .map_err(|e| {
+                        InterfaceError::Other(format!(
+                            "klipper host library has no klipper_host_output_frame: rebuild it \
+                             with CONFIG_HOST_FRAME_API=y, or use a debug build ({e})"
+                        ))
+                    })
+                    .map(|symbol| *symbol)?
+            },
+        };
         let poller = thread::Builder::new()
             .name("klipper-output".to_string())
             .spawn(move || {
@@ -289,6 +400,8 @@ impl HostLibrary {
             _library: library,
             symbols,
             library_path,
+            mode,
+            identity,
             output,
             stopped,
             threads: Mutex::new(threads),
@@ -317,7 +430,8 @@ impl Drop for HostLibrary {
 /// reassembly: no read ever contains a whole frame, so every frame goes through
 /// [`FrameStream`]. A release build asks for one frame at a time, and
 /// [`MESSAGE_MAX`](crate::core::klippy::frame::MESSAGE_MAX) is the largest one
-/// the protocol can produce.
+/// the protocol can produce — and a whole mux unit fits, so it is the batch a
+/// release build's bytes-mode reader asks for too.
 #[cfg(debug_assertions)]
 const OUTPUT_BATCH: usize = 1;
 #[cfg(not(debug_assertions))]
@@ -356,6 +470,9 @@ pub struct HostDevice {
     /// A release build is handed whole frames and never needs this.
     #[cfg(debug_assertions)]
     stream: Mutex<FrameStream>,
+    /// Bytes pulled from `output` by [`HostDevice::read`] but not handed out
+    /// yet: one library read can deliver more than the caller's buffer holds.
+    raw: Mutex<Vec<u8>>,
 }
 
 impl HostDevice {
@@ -381,7 +498,42 @@ impl HostDevice {
     /// Returns [`InterfaceError`] when the library cannot be loaded, does not
     /// export the expected symbols, or fails to initialize.
     pub fn load(path: impl AsRef<Path>) -> Result<Self, InterfaceError> {
-        let library = library_for(path.as_ref())?;
+        Self::open(path.as_ref(), OutputMode::Default, None)
+    }
+
+    /// Open a communication reference on the klipper host library at `path`
+    /// **for a bench scan**: its reader reads the library's byte stream in every
+    /// build (`OutputMode::Bytes`), so whole units can be read and written
+    /// ([`HostDevice::read`]/[`HostDevice::write`]) — a mux unit is not a frame
+    /// the frame API could hand over (see the module docs).
+    ///
+    /// `identity` is what the library answers the serial mux with, set before
+    /// klipper comes up; `None` leaves it at the library's own default (all
+    /// zeros), and a library built without `klipper_host_set_uuid` is only an
+    /// error when an identity is actually asked for.
+    ///
+    /// The identity and the mode are fixed once the library is loaded, so
+    /// asking for another one on a path whose library is already live fails
+    /// (`library_for`) instead of answering as the wrong device.
+    ///
+    /// # Errors
+    /// Returns [`InterfaceError`] for the reasons [`HostDevice::load`] does,
+    /// and when `identity` is asked of a library that has no
+    /// `klipper_host_set_uuid`.
+    pub fn load_bytes(
+        path: impl AsRef<Path>,
+        identity: Option<[u8; 6]>,
+    ) -> Result<Self, InterfaceError> {
+        Self::open(path.as_ref(), OutputMode::Bytes, identity)
+    }
+
+    /// Wrap the live library on `path` as a reference in `mode`.
+    fn open(
+        path: &Path,
+        mode: OutputMode,
+        identity: Option<[u8; 6]>,
+    ) -> Result<Self, InterfaceError> {
+        let library = library_for(path, mode, identity)?;
         let reference = NEXT_REFERENCE.fetch_add(1, Ordering::Relaxed);
         Ok(Self {
             output: library.output.clone(),
@@ -390,12 +542,84 @@ impl HostDevice {
             stopped: AtomicBool::new(false),
             #[cfg(debug_assertions)]
             stream: Mutex::new(FrameStream::new()),
+            raw: Mutex::new(Vec::new()),
         })
     }
 
     /// Path of the library this reference was loaded from.
     pub fn library_path(&self) -> &Path {
         &self.library.library_path
+    }
+
+    /// Read raw protocol bytes from the library, for a bench scan.
+    ///
+    /// The byte stream as the library hands it over, without frame reassembly:
+    /// a mux unit's two-byte header is not a frame, so a scan has to see the
+    /// stream as it is (`OutputMode::Bytes`). A read blocks at most
+    /// `OUTPUT_WAIT_MS` and returns `0` when nothing arrived in that window —
+    /// the same contract as
+    /// [`SerialDevice::read`](crate::core::klippy::interface::devices::serial::SerialDevice::read),
+    /// so the same scan code runs over either transport.
+    pub fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.stopped.load(Ordering::Relaxed) {
+            return Ok(0); // no further bytes will arrive
+        }
+        let mut pending = self.raw.lock().unwrap();
+        if pending.is_empty() {
+            match self
+                .output
+                .recv_timeout(Duration::from_millis(OUTPUT_WAIT_MS as u64))
+            {
+                Ok(bytes) => *pending = bytes,
+                Err(RecvTimeoutError::Timeout) => return Ok(0),
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(std::io::Error::other("klipper host library stopped"))
+                }
+            }
+        }
+        let read = buf.len().min(pending.len());
+        buf[..read].copy_from_slice(&pending[..read]);
+        pending.drain(..read);
+        Ok(read)
+    }
+
+    /// Write raw protocol bytes to the library, for a bench scan.
+    ///
+    /// The unit as the mux puts it on the wire, header and all; the frame
+    /// path's [`Device::send`] cannot write one, because a unit is not an
+    /// encoded [`Frame`].
+    pub fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.stopped.load(Ordering::Relaxed) {
+            return Err(std::io::Error::other(
+                "klipper host library reference is shut down",
+            ));
+        }
+        let written = unsafe { (self.library.symbols.input)(buf.as_ptr(), buf.len()) };
+        if written != buf.len() as c_long {
+            return Err(std::io::Error::other(format!(
+                "klipper_host_input took {written} of {} bytes",
+                buf.len()
+            )));
+        }
+        Ok(written as usize)
+    }
+}
+
+impl std::io::Read for HostDevice {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        HostDevice::read(self, buf)
+    }
+}
+
+impl std::io::Write for HostDevice {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        HostDevice::write(self, buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        // Nothing is buffered on this side: a write is handed to klipper's
+        // console buffer whole.
+        Ok(())
     }
 }
 
@@ -447,6 +671,13 @@ impl Device for HostDevice {
     }
 
     fn receive(&self) -> Option<Frame> {
+        // A bytes-mode library hands over the mux byte stream, in which a unit
+        // is not a frame — framing it here would read the unit's header byte as
+        // a length. That mode belongs to the bench scan, which reads
+        // [`HostDevice::read`] instead.
+        if self.library.mode == OutputMode::Bytes {
+            return None;
+        }
         loop {
             if self.stopped.load(Ordering::Relaxed) {
                 return None;
@@ -523,13 +754,6 @@ mod host_tests {
     use crate::core::klippy::msg::proto::ArgValue;
     use crate::core::klippy::Interface;
 
-    /// Serialises the tests that load the real host library.
-    ///
-    /// The library registry is a per-path process-wide singleton, so two tests
-    /// sharing the one `.so` must not overlap: the second would meet — or, at
-    /// the end, unload — the first's library mid-handshake.
-    static HOST_LIBRARY_LOCK: Mutex<()> = Mutex::new(());
-
     #[test]
     fn test_load_reports_a_missing_library() {
         let err = HostDevice::load("/nonexistent/libklipper_host.so").unwrap_err();
@@ -540,6 +764,42 @@ mod host_tests {
             }
             other => panic!("expected Other, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_a_live_library_is_refused_in_another_mode_or_with_another_identity() {
+        // The mode picks the reader thread's API and the identity is fixed when
+        // klipper comes up, so a reference asking for either on a live library
+        // is refused rather than served as the wrong device. A bytes-mode
+        // reference is what a bench scan opens (`src/scan.rs`).
+        let _serial = HOST_LIBRARY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let named =
+            HostDevice::load_bytes(library_path(), Some([0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc]))
+                .expect("the real library takes an identity");
+
+        let err = HostDevice::load_bytes(library_path(), Some([0, 0, 0, 0, 0, 1]))
+            .expect_err("another identity is not this library's");
+        match err {
+            InterfaceError::Other(message) => {
+                assert!(message.contains("already loaded"), "{message}")
+            }
+            other => panic!("expected Other, got {other:?}"),
+        }
+
+        let err = HostDevice::load(library_path()).expect_err("the default mode is not the scan's");
+        match err {
+            InterfaceError::Other(message) => {
+                assert!(message.contains("already loaded"), "{message}")
+            }
+            other => panic!("expected Other, got {other:?}"),
+        }
+
+        // Dropping the last reference unloads it, so the refusal was only about
+        // the live library, not about the path.
+        drop(named);
+        HostDevice::load(library_path()).expect("the library is not loaded any more");
     }
 
     /// The host library is only built for tests, through `klipperx-test-support`.
@@ -656,7 +916,7 @@ mod host_tests {
     /// [`Dictionary`]: crate::core::klippy::mcu::Dictionary
     #[tokio::test]
     async fn test_identify_against_the_real_library() {
-        let _serial = HOST_LIBRARY_LOCK
+        let _serial = HOST_LIBRARY_TEST_LOCK
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         let config =
@@ -720,7 +980,7 @@ mod host_tests {
     /// firmware whose sequence starts over.
     #[tokio::test]
     async fn test_the_library_unloads_with_its_last_reference() {
-        let _serial = HOST_LIBRARY_LOCK
+        let _serial = HOST_LIBRARY_TEST_LOCK
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         let config =

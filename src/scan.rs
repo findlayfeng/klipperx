@@ -15,11 +15,16 @@
 //! - `--port <tty>` — that serial port, where discovery runs **inside** the
 //!   byte stream instead: one [`discovery_query`] unit, unseen by the data
 //!   plane, and the same answers on the admin reply id.
+//! - `--host-library <path.so>` — a klipper host library loaded from disk, the
+//!   way a `[mcu] host_library:` section loads one, with `--host-identity`
+//!   (twelve hex digits, all zeros by default) naming the device first: the
+//!   same [`discovery_query`] unit, over the library's byte stream rather than
+//!   its frame API, because a mux unit is not a frame.
 //!
-//! Both scan the same way underneath: a single broadcast, then a **deadline**
-//! window (`--timeout`, two seconds by default) measured from the query —
-//! whatever has arrived when it runs out is the answer, and a board that
-//! answers late does not extend it.
+//! All three scan the same way underneath: a single broadcast, then a
+//! **deadline** window (`--timeout`, two seconds by default) measured from the
+//! query — whatever has arrived when it runs out is the answer, and a board
+//! that answers late does not extend it.
 //!
 //! This is a bench tool, not part of the host: it needs no config file, and it
 //! takes nothing over. The query changes no board's state — assigning a node id
@@ -44,6 +49,7 @@ use std::time::Duration;
 use crate::core::klippy::interface::devices::canserial::{
     query_unassigned, CanbusAdminSocket, UnassignedNode as CanNode,
 };
+use crate::core::klippy::interface::devices::host::HostDevice;
 use crate::core::klippy::interface::devices::serial::SerialDevice;
 use crate::core::klippy::interface::devices::serial::{
     serial_query_unassigned, UnassignedNode as SerialNode,
@@ -73,6 +79,21 @@ pub struct ScanArgs {
     #[arg(long)]
     pub port: Option<String>,
 
+    /// A klipper host library to scan instead of a bus or a port, as a shared
+    /// object path (`libklipper_host.so`)
+    #[arg(long)]
+    pub host_library: Option<String>,
+
+    /// The identity the host library answers the serial mux with: twelve hex
+    /// digits, the order a `[mcu] uuid:` option is written in (default
+    /// `000000000000`; host library scans only)
+    //
+    // Optional rather than defaulted, so that giving it without
+    // `--host-library` can be named as the mistake it is: the library is what
+    // the identity belongs to, and nothing else here has one.
+    #[arg(long)]
+    pub host_identity: Option<String>,
+
     /// How long to wait for answers, in seconds
     #[arg(long, default_value_t = DEFAULT_TIMEOUT)]
     pub timeout: f64,
@@ -92,13 +113,26 @@ pub fn run(args: ScanArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
     let window = Duration::from_secs_f64(args.timeout);
 
-    match (&args.port, &args.interface) {
+    // An identity is what a host library is given, and nothing else on this
+    // command has one: giving it alone asks for a device that is not there.
+    if args.host_identity.is_some() && args.host_library.is_none() {
+        return Err("--host-identity needs --host-library".into());
+    }
+
+    match (&args.port, &args.interface, &args.host_library) {
         // Two transports named at once is a mistake, not a preference: the
-        // serial one is not a fallback for a CAN bus, it is another bus.
-        (Some(_), Some(_)) => {
+        // serial one is not a fallback for a CAN bus, and neither is a host
+        // library.
+        (Some(_), Some(_), _) => {
             Err("give either --port (serial) or --interface (CAN), not both".into())
         }
-        (Some(port), None) => {
+        (Some(_), None, Some(_)) => {
+            Err("give either --port (serial) or --host-library, not both".into())
+        }
+        (None, Some(_), Some(_)) => {
+            Err("give either --interface (CAN) or --host-library, not both".into())
+        }
+        (Some(port), None, None) => {
             let baud = args.baud.unwrap_or(DEFAULT_BAUD);
             let mut device = SerialDevice::open(port, baud)?;
             let total = serial_query_unassigned(&mut device, window, |node| {
@@ -107,7 +141,7 @@ pub fn run(args: ScanArgs) -> Result<(), Box<dyn std::error::Error>> {
             println!("{}", total_line(total));
             Ok(())
         }
-        (None, Some(interface)) => {
+        (None, Some(interface), None) => {
             if args.baud.is_some() {
                 return Err("--baud needs --port: a CAN scan has no line speed".into());
             }
@@ -116,11 +150,71 @@ pub fn run(args: ScanArgs) -> Result<(), Box<dyn std::error::Error>> {
             println!("{}", total_line(scan.total()));
             Ok(())
         }
+        (None, None, Some(library)) => {
+            if args.baud.is_some() {
+                return Err("--baud needs --port: a host library has no line speed".into());
+            }
+            let identity = args
+                .host_identity
+                .as_deref()
+                .map(parse_identity)
+                .transpose()?;
+            let total = host_query_unassigned(library, identity, window, |node| {
+                println!("{}", serial_line(&node))
+            })?;
+            println!("{}", total_line(total));
+            Ok(())
+        }
         // No transport named: reachable through `ScanArgs` but not from the
         // command line, where `arg_required_else_help` prints the help instead
         // (see the `scan` variant in `main.rs`).
-        (None, None) => Err("give --interface (CAN) or --port (serial)".into()),
+        (None, None, None) => {
+            Err("give --interface (CAN), --port (serial) or --host-library".into())
+        }
     }
+}
+
+/// Ask every board with no node id behind the host `library` to identify
+/// itself, naming the device `identity` first, and read the answers for
+/// `window`.
+///
+/// The same scan as [`serial_query_unassigned`] — one [`discovery_query`] unit,
+/// then the same framing, deadline, dedup and reporting — because a host
+/// library is another byte stream a mux unit travels on: reading it as bytes is
+/// what the library device's scan mode is for. `report` is called as each board
+/// is first heard; returns how many answered.
+///
+/// [`discovery_query`]: crate::core::klippy::interface::devices::serial::discovery_query
+fn host_query_unassigned(
+    library: &str,
+    identity: Option<[u8; 6]>,
+    window: Duration,
+    report: impl FnMut(SerialNode),
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let mut device = HostDevice::load_bytes(library, identity)?;
+    Ok(serial_query_unassigned(&mut device, window, report)?)
+}
+
+/// Parse `--host-identity`: six bytes as twelve hex digits.
+///
+/// The same spelling a `[mcu] uuid:` option uses, with nothing else accepted:
+/// the identity goes on the wire as six bytes, so a value that is not twelve
+/// hex digits is a mistyped identity rather than one to round.
+fn parse_identity(text: &str) -> Result<[u8; 6], String> {
+    let digits = text.trim().as_bytes();
+    if digits.len() != 12 || !digits.iter().all(u8::is_ascii_hexdigit) {
+        return Err(format!(
+            "--host-identity expects twelve hex digits, got '{}'",
+            text.trim()
+        ));
+    }
+    let mut identity = [0u8; 6];
+    for (i, byte) in identity.iter_mut().enumerate() {
+        // Both digits are ASCII hex (checked above), so this cannot fail.
+        let pair = std::str::from_utf8(&digits[i * 2..i * 2 + 2]).expect("two ASCII digits");
+        *byte = u8::from_str_radix(pair, 16).expect("hexadecimal");
+    }
+    Ok(identity)
 }
 
 /// One CAN answer, as Klipper's own tool prints it.
@@ -170,6 +264,34 @@ fn total_line(total: usize) -> String {
 mod tests {
     use super::*;
     use crate::core::klippy::interface::devices::canserial::{query_unassigned_frame, CanFrame};
+    use crate::core::klippy::interface::devices::host::HOST_LIBRARY_TEST_LOCK;
+
+    /// The window the host scan tests listen for: long enough that the firmware
+    /// would have answered if it were going to, short enough not to spend the
+    /// default two seconds per test.
+    const HOST_SCAN_WINDOW: Duration = Duration::from_millis(300);
+
+    /// The arguments a bare `scan` gets: every transport and option at its
+    /// default, which is the shape the command line fills in.
+    fn default_args() -> ScanArgs {
+        ScanArgs {
+            interface: None,
+            port: None,
+            host_library: None,
+            host_identity: None,
+            timeout: DEFAULT_TIMEOUT,
+            baud: None,
+        }
+    }
+
+    /// The real host library the interface tests load: built from the klipper
+    /// tree by `test-support`, and **not** a mux firmware (the firmware's mux
+    /// device half is still to come), so it answers no scan.
+    fn host_library_path() -> String {
+        klipperx_test_support::klipper_host_lib_path()
+            .display()
+            .to_string()
+    }
 
     /// A CAN answer, as the admin socket would report it.
     fn can_node(uuid: [u8; 6], application: Option<u8>) -> CanNode {
@@ -234,10 +356,9 @@ mod tests {
         // nothing (or for a wait the deadline loop cannot express).
         for bad in ["0", "-1", "nan", "inf"] {
             let args = ScanArgs {
-                interface: None,
                 port: Some("/dev/not-a-port".to_string()),
                 timeout: bad.parse().expect("a number"),
-                baud: None,
+                ..default_args()
             };
             let err = run(args).expect_err("a window of nothing is not a scan");
             assert!(err.to_string().contains("--timeout"), "{err}");
@@ -249,13 +370,7 @@ mod tests {
         // No default bus: through `ScanArgs` this is an error (on the command
         // line `arg_required_else_help` never gets this far — a bare `scan`
         // prints the help).
-        let args = ScanArgs {
-            interface: None,
-            port: None,
-            timeout: DEFAULT_TIMEOUT,
-            baud: None,
-        };
-        let err = run(args).expect_err("a scan has to be told what to scan");
+        let err = run(default_args()).expect_err("a scan has to be told what to scan");
         assert!(err.to_string().contains("--interface"), "{err}");
     }
 
@@ -266,8 +381,7 @@ mod tests {
         let args = ScanArgs {
             interface: Some("can0".to_string()),
             port: Some("/dev/not-a-port".to_string()),
-            timeout: DEFAULT_TIMEOUT,
-            baud: None,
+            ..default_args()
         };
         let err = run(args).expect_err("two transports are not one scan");
         assert!(err.to_string().contains("not both"), "{err}");
@@ -280,11 +394,135 @@ mod tests {
         // socket is opened.
         let args = ScanArgs {
             interface: Some("can0".to_string()),
-            port: None,
-            timeout: DEFAULT_TIMEOUT,
             baud: Some(115_200),
+            ..default_args()
         };
         let err = run(args).expect_err("a CAN scan has no line speed");
         assert!(err.to_string().contains("--baud"), "{err}");
+    }
+
+    #[test]
+    fn test_a_host_identity_without_a_host_library_is_rejected() {
+        // An identity belongs to a host library and nothing else here has one:
+        // named alone it asks for a device that is not there, and is caught
+        // before any library is loaded.
+        let args = ScanArgs {
+            host_identity: Some("11aa22bb33cc".to_string()),
+            ..default_args()
+        };
+        let err = run(args).expect_err("an identity needs a library to name");
+        assert!(err.to_string().contains("--host-identity"), "{err}");
+    }
+
+    #[test]
+    fn test_a_host_library_and_a_port_together_are_rejected() {
+        // A host library is a third transport, not a fallback for the serial
+        // port: naming both is a mistake, caught before the port is opened.
+        let args = ScanArgs {
+            port: Some("/dev/not-a-port".to_string()),
+            host_library: Some("/nonexistent/libklipper_host.so".to_string()),
+            ..default_args()
+        };
+        let err = run(args).expect_err("two transports are not one scan");
+        assert!(err.to_string().contains("not both"), "{err}");
+    }
+
+    #[test]
+    fn test_a_baud_with_a_host_library_is_rejected() {
+        // The line speed only means something on a serial port; a host library
+        // has no line of its own, and is caught before it is loaded.
+        let args = ScanArgs {
+            host_library: Some("/nonexistent/libklipper_host.so".to_string()),
+            baud: Some(115_200),
+            ..default_args()
+        };
+        let err = run(args).expect_err("a host library has no line speed");
+        assert!(err.to_string().contains("--baud"), "{err}");
+    }
+
+    #[test]
+    fn test_the_identity_is_twelve_hex_digits() {
+        // The identity goes on the wire as six bytes, most significant first,
+        // the order a `[mcu] uuid:` option is written in.
+        assert_eq!(
+            parse_identity("11aa22bb33cc").expect("twelve hex digits"),
+            [0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc]
+        );
+        assert_eq!(
+            parse_identity("000000000000").expect("the default identity"),
+            [0u8; 6]
+        );
+        // Anything else is a mistyped identity, not one to guess at — including
+        // a string whose bytes are not all ASCII, which cannot be cut into
+        // digit pairs at all.
+        for bad in [
+            "",
+            "11aa22bb33c",
+            "11aa22bb33ccd",
+            "11aa22bb33cg",
+            "11aa22bb33日",
+        ] {
+            let err = parse_identity(bad).expect_err("not twelve hex digits");
+            assert!(err.contains("--host-identity"), "{err}");
+        }
+    }
+
+    #[test]
+    fn test_a_host_scan_ends_with_no_boards_against_the_real_library() {
+        // The end-to-end shape of a host scan against a real library: the unit
+        // goes into the library, the window runs out, and the total is zero.
+        // This is the whole answer a **non-mux** firmware can give — the test
+        // library has no mux device half — so it pins both that the scan is
+        // harmless there (no error, no garbage answer) and that nothing is
+        // reported for a device that never answered.
+        let _serial = HOST_LIBRARY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let mut heard = Vec::new();
+        let total = host_query_unassigned(&host_library_path(), None, HOST_SCAN_WINDOW, |node| {
+            heard.push(node)
+        })
+        .expect("a scan runs against the real library");
+        assert_eq!(total, 0);
+        assert_eq!(total_line(total), "Total 0 uuids found");
+        assert!(heard.is_empty(), "a device that never answered is listed");
+    }
+
+    #[test]
+    fn test_a_host_scan_with_an_identity_runs_against_the_real_library() {
+        // The identity is set before klipper comes up, so a host scan that
+        // names the device is the same empty scan — and the library that has
+        // `klipper_host_set_uuid` is not refused (an identity is only an error
+        // for one built without it).
+        let _serial = HOST_LIBRARY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let mut heard = Vec::new();
+        let total = host_query_unassigned(
+            &host_library_path(),
+            Some(parse_identity("11aa22bb33cc").expect("twelve hex digits")),
+            HOST_SCAN_WINDOW,
+            |node| heard.push(node),
+        )
+        .expect("a named host library scans");
+        assert_eq!(total_line(total), "Total 0 uuids found");
+        assert!(heard.is_empty(), "a device that never answered is listed");
+    }
+
+    #[test]
+    fn test_a_host_library_scan_prints_its_total_and_succeeds() {
+        // The command-line wiring, end to end: `--host-library` selects the
+        // scan, an all-zero identity is the default the device already has, and
+        // an empty window is a successful scan rather than an error.
+        let _serial = HOST_LIBRARY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let args = ScanArgs {
+            host_library: Some(host_library_path()),
+            host_identity: Some("000000000000".to_string()),
+            timeout: HOST_SCAN_WINDOW.as_secs_f64(),
+            ..default_args()
+        };
+        run(args).expect("an empty host scan is a scan, not an error");
     }
 }

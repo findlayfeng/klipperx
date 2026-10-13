@@ -809,6 +809,18 @@ pub const ADMIN_REPLY: u32 = 0x3f1;
 pub const CMD_QUERY_UNASSIGNED: u8 = 0x00;
 /// The frame body byte that hands a board the node id it is to take.
 pub const CMD_SET_KLIPPER_NODEID: u8 = 0x01;
+/// The frame body byte that asks the device behind a bridge port to reset
+/// itself — CAN's `CANBUS_CMD_REQUEST_BOOTLOADER` by value and meaning. A
+/// bridge routes it by the port index that follows; on a board with no bridge
+/// the device half runs it itself.
+pub const CMD_RESET_DEVICE: u8 = 0x02;
+/// The frame body byte of the port-level command that names the device behind
+/// a bridge port: `[CMD_SET_PORT_NODEID][index][id][flags]`. The bridge builds
+/// its port tables from it and consumes it — no receipt, never forwarded.
+pub const CMD_SET_PORT_NODEID: u8 = 0x03;
+/// The frame body byte that asks a bridge to pulse the lines of the port that
+/// follows — the only reset a device with no admin channel of its own can get.
+pub const CMD_RESET_PORT: u8 = 0x04;
 /// The first body byte of an unassigned board's answer.
 pub const RESP_NEED_NODEID: u8 = 0x20;
 /// The application id CanBoot reports instead of Klipper's own
@@ -837,9 +849,7 @@ fn kxid_unit(payload: &[u8]) -> Vec<u8> {
 /// [`ADMIN_LISTEN`], the same id CAN's broadcast uses; the unit is
 /// `[header(0x3f0)][len][0x20]["KXID"][0x00][crc16][0x7e]`.
 pub fn discovery_query() -> Vec<u8> {
-    let mut unit = encode_header(ADMIN_LISTEN);
-    unit.extend_from_slice(&kxid_unit(&[CMD_QUERY_UNASSIGNED]));
-    unit
+    admin_unit(&[CMD_QUERY_UNASSIGNED])
 }
 
 /// The broadcast that tells the board with `uuid` to take `mcu_id`: the admin
@@ -857,9 +867,36 @@ pub fn set_node_id_for(uuid: [u8; 6], mcu_id: u32) -> Option<Vec<u8>> {
     body.push(CMD_SET_KLIPPER_NODEID);
     body.extend_from_slice(&uuid);
     body.push(mcu_id as u8);
+    Some(admin_unit(&body))
+}
+
+/// The admin-channel unit carrying `payload` after the `KXID` marker: the
+/// header on [`ADMIN_LISTEN`], then the [`kxid_unit`] frame. Every command the
+/// host addresses to the admin channel — the handshake above and the port-level
+/// family below — travels this one shape.
+pub(crate) fn admin_unit(payload: &[u8]) -> Vec<u8> {
     let mut unit = encode_header(ADMIN_LISTEN);
-    unit.extend_from_slice(&kxid_unit(&body));
-    Some(unit)
+    unit.extend_from_slice(&kxid_unit(payload));
+    unit
+}
+
+/// The port flag of [`CMD_SET_PORT_NODEID`] that says the device behind the
+/// port speaks units: the port forwards units both ways unchanged. Clear, the
+/// port is legacy — it strips the header off a unit going down and heads a raw
+/// frame coming up with the reply id it was given — the wire format of a
+/// device that predates the mux.
+pub const MUX_PORT_UNITS: u8 = 0x01;
+
+/// The port-level command that names the device behind port `index`: the admin
+/// listen unit carrying `[CMD_SET_PORT_NODEID][index][id][flags]`.
+///
+/// The bridge builds its port tables from it and consumes it — no receipt, no
+/// copy downstream, and a repeat simply writes the same values again (`mux.h`
+/// in the firmware's serial mux). An index that names no port, or an id the
+/// wire cannot address, is dropped in silence there, so this builder validates
+/// nothing: it only spells the four payload bytes.
+pub fn set_port_node_id(index: u8, mcu_id: u8, flags: u8) -> Vec<u8> {
+    admin_unit(&[CMD_SET_PORT_NODEID, index, mcu_id, flags])
 }
 
 /// One board's answer to [`discovery_query`]: the UUID it is remembered by,
@@ -2535,6 +2572,43 @@ mod mux_tests {
                 0xe8, 0x3f, 0x11, 0x20, 0x4b, 0x58, 0x49, 0x44, 0x01, 0x7e, 0x11, 0x22, 0x33, 0x44,
                 0x55, 0x01, 0xca, 0xcd, 0x7e
             ]
+        );
+    }
+
+    #[test]
+    fn set_port_node_id_is_the_port_level_admin_unit() {
+        // The bytes on the wire, exactly: the admin listen id as a checked
+        // header, then the `KXID` frame carrying `[0x03][index][id][flags]` —
+        // the firmware's mux.h command table (SET_PORT_NODEID, payload
+        // [0x03][index][id][flags]) spelled inside the stream frame.
+        assert_eq!(
+            set_port_node_id(0, 7, 0),
+            [
+                0xe8, 0x3f, 0x0d, 0x20, 0x4b, 0x58, 0x49, 0x44, 0x03, 0x00, 0x07, 0x00, 0x53, 0xc7,
+                0x7e
+            ]
+        );
+        // The flags byte is the port's own: MUX_PORT_UNITS turns the port to
+        // unit mode, and the reserved bits the firmware masks off are ignored.
+        assert_eq!(
+            set_port_node_id(0, 8, MUX_PORT_UNITS),
+            [
+                0xe8, 0x3f, 0x0d, 0x20, 0x4b, 0x58, 0x49, 0x44, 0x03, 0x00, 0x08, 0x01, 0xc1, 0x86,
+                0x7e
+            ]
+        );
+        let unit = set_port_node_id(1, 0xff, MUX_PORT_UNITS);
+        assert_eq!(
+            unit.iter().filter(|&&b| b == MESSAGE_SYNC).count(),
+            1,
+            "no interior 0x7e in the header/payload/CRC"
+        );
+        // The frame behind the header: [len][seq]["KXID"]payload[crc16][sync],
+        // so the four payload bytes sit right after the marker.
+        assert_eq!(
+            &unit[HEADER_BYTES + 1 + 1 + MAGIC.len()..unit.len() - 3],
+            &[0x03, 0x01, 0xff, 0x01],
+            "the payload is exactly [0x03][index][id][flags] behind the KXID marker"
         );
     }
 

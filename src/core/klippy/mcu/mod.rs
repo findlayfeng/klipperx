@@ -23,6 +23,7 @@ mod config;
 mod dictionary;
 mod error;
 mod events;
+pub mod host_libraries;
 pub(crate) mod ids;
 mod object;
 mod pending;

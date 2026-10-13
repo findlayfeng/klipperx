@@ -400,6 +400,7 @@ mod tests {
             restart_method: method,
             transport: Transport::Host {
                 library: String::new(),
+                uuid: None,
             },
             id: None,
             shared_baud: None,

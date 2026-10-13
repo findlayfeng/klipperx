@@ -416,6 +416,7 @@ mod tests {
             transport: Transport::Serial {
                 path: "/dev/not-a-serial-port".to_string(),
                 baud: 250_000,
+                uuid: None,
             },
             id: None,
             shared_baud: None,
@@ -431,6 +432,7 @@ mod tests {
             transport: Transport::Serial {
                 path: path.to_string(),
                 baud: 250_000,
+                uuid: None,
             },
             id: None,
             shared_baud: None,

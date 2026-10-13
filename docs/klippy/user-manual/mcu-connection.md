@@ -1,11 +1,11 @@
 # MCU 连接方式
 
-`[mcu]` 节用**一个**连接参数说明主机怎么和这颗 MCU 通信——和 Klipper 一样（Klipper 用 `serial` 或 `canbus_uuid`）。同时给出多个是配置错误，会直接报错，而不是按某个优先级挑一个。
+`[mcu]` 节用**一个**连接参数说明主机怎么和这颗 MCU 通信——和 Klipper 一样（Klipper 用 `serial` 或 `canbus_uuid`；本仓把 CAN 的身份键规范名为 `uuid`，`canbus_uuid` 仍作兼容别名）。同时给出**接口**参数（`serial` / CAN 家族 / `host_library` / `test`）中多个是配置错误，会直接报错，而不是按某个优先级挑一个；`uuid`/`canbus_uuid` 是**身份**不是接口选择器——写在串口节上不构成冲突（见下节「共享串口」）。
 
 | 参数 | 值 | 说明 |
 |------|-----|------|
 | `serial` | 串口设备路径（如 `/dev/ttyACM0`） | 打开真实 MCU 所在的串口；可配 `baud`（默认 250000）。**同一路径被两颗及以上 `[mcu]` 引用即共享**（见下节） |
-| `canbus_uuid` | MCU 芯片的唯一 ID（12 位十六进制） | 通过 CAN 连接时必给，Klipper 同名参数 |
+| `uuid` | MCU 芯片的唯一 ID（12 位十六进制） | CAN 模式必给（Klipper 旧名 `canbus_uuid` 兼容，同节双写报错）；写在 `serial` 节上则连接期用它指派 id（见下节「共享串口」，独占串口忽略它） |
 | `canbus_interface` | CAN 网络接口名 | 可选，默认 `can0` |
 | `canbus_nodeid` | **MCU 层 id**（1..=255；CAN 上即节点号） | **可选**：不写就由 `[mcu_ids]`（历史名 `[canbus_ids]`）的分配器发 `4` 起的最小空位；写了就用写的那个（分配器装载时预扫全配置保留显式号，自动号绕开，写在哪个位置都生效）。只在两个显式号互撞、或 `4..=255` 占满时装载期报错 |
 | `host_library` | klipper host 库（`libklipper_host.so`）的路径 | 在主机进程内运行一份 klipper 固件（模拟与自测用） |
@@ -16,7 +16,7 @@ serial: /dev/serial/by-path/platform-3f980000.usb-usb-0:1.3:1.0-port0
 baud: 250000
 
 [mcu canbed]
-canbus_uuid: 11aa22bb33cc
+uuid: 11aa22bb33cc
 canbus_interface: can0
 canbus_nodeid: 2
 
@@ -26,9 +26,9 @@ host_library: /usr/local/lib/libklipper_host.so
 
 节名取自节的 sub（`[mcu zboard]` → `zboard`）。串口按 raw 模式打开：不回显、不做 CR/LF 转换、不启用协议没用到的流控。`restart_method` 见下面的[固件重启方式](#固件重启方式restart_method)。
 
-CAN 这条走的是 klipper 的 **can serial** 链路（就像把串口协议搬到 CAN 上跑），不是 CAN 协议本身。**配置里的键名与 Klipper 保持一致**（`canbus_uuid` / `canbus_interface`），因为它们描述的是机器怎么接线，而且现有 Klipper 配置应当照用；代码里那层实现则叫 `CanSerial*`，把 `Canbus` 这个名字留给将来真正实现 CAN 协议的接口。
+CAN 这条走的是 klipper 的 **can serial** 链路（就像把串口协议搬到 CAN 上跑），不是 CAN 协议本身。**CAN 的键名沿用 Klipper**（`canbus_interface` / `canbus_nodeid` 照旧），身份键则规范为 `uuid`——`canbus_uuid` 仍兼容（现有 Klipper 配置照用，同节两个都写会报错），「机器怎么接线」的语义不变。代码里那层实现叫 `CanSerial*`，把 `Canbus` 这个名字留给将来真正实现 CAN 协议的接口。
 
-节点号到仲裁 ID 的映射也沿用 Klipper：`0x100 + 2 × nodeid`，主机写这个 ID、MCU 用下一个回；这个映射在主机侧单一定义于 `assign.rs`（CAN 与共享串口共用，`canserial.rs` 不再自带常量），打开 CAN 链路前会校验节点号落在 `1..=255`，越界即报错而不是拼出一个非法仲裁 ID。节点号由主机通过 admin ID `0x3f0` 的 `CMD_SET_NODEID` 报文指派，所以配置里 `canbus_uuid` 是必需的（节点号本身可由 `[mcu_ids]` 分配、不必写；历史拼写 `[canbus_ids]` 仍兼容）。
+节点号到仲裁 ID 的映射也沿用 Klipper：`0x100 + 2 × nodeid`，主机写这个 ID、MCU 用下一个回；这个映射在主机侧单一定义于 `assign.rs`（CAN 与共享串口共用，`canserial.rs` 不再自带常量），打开 CAN 链路前会校验节点号落在 `1..=255`，越界即报错而不是拼出一个非法仲裁 ID。节点号由主机通过 admin ID `0x3f0` 的 `CMD_SET_NODEID` 报文指派，所以配置里 `uuid` 是必需的（节点号本身可由 `[mcu_ids]` 分配、不必写；历史拼写 `[canbus_ids]` 仍兼容）。
 
 节点号在本仓是 **MCU 层 id**：每个 `[mcu]`（不论接口）在装载期都被分配一个唯一 id（所有接口共用同一个序列，`mcu/ids.rs`），`connect` 打开传输层之前必须持有它——CAN 用它做节点寻址（admin 帧），**共享串口**用下节的帧头与**分配期握手**把 id 交给设备、并拿它做寻址，**独占串口不使用它**；`host_library` 与 `test:` 暂不指派。显式 `canbus_nodeid` 就是这个 id 的显式覆盖：分配器
 在装载时预扫全配置、先把所有显式号保留下来（`reserve_explicit`），自动号取 `4` 起的
@@ -48,8 +48,9 @@ serial: /dev/ttyUSB0
 
 - **baud**：共享路径上以**显式写出的** baud 为准；多颗写了不同的值就 `warn` 并**取最小值**，没写 baud 的节跟着这个值走（不一致不再是配置错）。
 - **id**：就是 `[mcu_ids]` 分给该 MCU 的号（`canbus_nodeid` 可显式覆盖），与 CAN 节点号**同一个号段**——寻址用同一套映射 `0x100 + 2*id`（设备应答 `+1`）。
-- **握手**：每颗 MCU 在**打开（分配）这个共享端口时**同步做一次 id 指派握手，identify 之前完成；默认 **500 ms × 3 次**，无回执即连接失败。
+- **握手**：每颗 MCU 在**打开（分配）这个共享端口时**同步做一次 id 指派握手，identify 之前完成；默认 **500 ms × 3 次**，无回执即连接失败。节上写了 `uuid`（或别名 `canbus_uuid`）时，握手**先按它发一枚 SET_NODEID**（`0x3f0` 的 `0x01`，按 uuid 点名 id）再发原有的重确认请求——帧序见[串口复用协议](../developer-manual/serial-mux-protocol.md)；独占串口**忽略** `uuid`（不发任何帧）。
 - **复位**：`restart_method` 的线级复位（`arduino` 的 DTR 翻转、`cheetah`、`rpi_usb` 切电）作用在**整条线**上，会把共享端口上的所有 MCU 一起打断——所以共享路径**强制 `restart_method: command`**：**显式写了**别的值（`arduino`/`cheetah`/`rpi_usb`）会在装载期告警并改用 `command`；没写则静默降级（串口默认的 `arduino` 只是默认）；非法拼写仍是配置错。
+- **发现**：还没分配 id 的设备用 `klipperx scan` 扫出可粘进配置的 uuid（不给参数扫 CAN，`--port <tty>` 扫串口；单次广播查询 + 截止窗口 + 按 uuid 去重，两种总线输出同形）。
 
 > 设备端**尚未实现**这套复用协议：今天的串口固件不会回执，所以共享串口现在必然握手超时、连不上。这是预期状态——误配到旧固件只会连接失败，不会搞乱会话。
 

@@ -35,8 +35,8 @@
 | 实现 | 配置键 | 线上是什么 |
 |------|--------|-----------|
 | `SerialDevice` | `serial:` | tty 上的字节流 |
-| `CanSerialDevice` | `canbus_uuid:` + `canbus_interface:`（`canbus_nodeid:` 可选，由 MCU id 分配器 `[mcu_ids]`——历史名 `[canbus_ids]` 兼容——分配，`mcu/ids.rs`；其它接口也各分到一个 id——**共享串口**用同一套 `0x100+2*id` 做帧头寻址、并在分配端口时同步握手，**独占串口不使用**） | SocketCAN，**承载的仍是同一份 serial 字节流**；admin 扫描（`klipperx canbus-scan`）走单独的 `CanbusAdminSocket`——它直接说 CAN 协议本身，不是 `Device` |
-| `SharedSerialHandle` | `serial:`（**同一路径被 ≥2 颗 `[mcu]` 引用**，由 `mcu/serial_ports.rs` 在装载期分组） | 同一个 tty 上按 id 分派：单元 = `[VLQ(0x100 + 2*mcu_id)] ++ 原始帧`（帧体一字节不改），设备在 `+1` 方向回；分配端口时做一次同步握手（[串口复用协议](serial-mux-protocol.md)） |
+| `CanSerialDevice` | `uuid:`（旧名 `canbus_uuid` 兼容）+ `canbus_interface:`（`canbus_nodeid:` 可选，由 MCU id 分配器 `[mcu_ids]`——历史名 `[canbus_ids]` 兼容——分配，`mcu/ids.rs`；其它接口也各分到一个 id——**共享串口**用同一套 `0x100+2*id` 做帧头寻址、并在分配端口时同步握手，**独占串口不使用**） | SocketCAN，**承载的仍是同一份 serial 字节流**；admin 扫描（`klipperx scan` 的 CAN 侧）走单独的 `CanbusAdminSocket`——它直接说 CAN 协议本身，不是 `Device` |
+| `SharedSerialHandle` | `serial:`（**同一路径被 ≥2 颗 `[mcu]` 引用**，由 `mcu/serial_ports.rs` 在装载期分组） | 同一个 tty 上按 id 分派：单元 = `[VLQ(0x100 + 2*mcu_id)] ++ 原始帧`（帧体一字节不改），设备在 `+1` 方向回；分配端口时做一次同步握手（节上带 `uuid` 时先按它发 SET_NODEID 再发重确认请求）；发现扫描（`klipperx scan --port`）走同一 admin 信道 `0x3f0/0x3f1`（[串口复用协议](serial-mux-protocol.md)） |
 | `HostDevice` | `host_library:` | `dlopen` 的 klipper host 库，输入/输出都是协议字节 |
 | `FrameMock` | —（仅测试构建，代码里直接建） | 脚本化应答 |
 | `SimulatorDevice` | `test: dict=<path>`（仅测试构建） | 字典驱动应答 |

@@ -87,6 +87,55 @@ block content」，帧内容本来就允许含 `0x7e`，长度字节才是权威
 - 端口自打开起就有**唯一 reader**：某颗 MCU 来 attach 时在该 reader 里登记一个
   「待握手槽位」（按它的 `mcu_id`），带 `+1` 头的回执被同一个分派路径投给它——所以
   **已有 MCU 在正常跑时，新 MCU 也能安全 attach**，不需要抢夺 fd。
+- 节上写了 `uuid`（或别名 `canbus_uuid`）时，这枚请求**不是第一枚出线的单元**：
+  `attach()` 先按 uuid 发一枚 `SET_KLIPPER_NODEID` 点名，再发这枚重确认请求——帧序见
+  下一节。不带 `uuid` 的节只发重确认请求，与之前完全一致。
+
+## 发现与指派：admin 信道与命令族
+
+共享串口沿用 CAN 的 admin 语义，命令帧也沿用上一节那枚 `KXID` 伪帧——命令只是标记之后多出
+的一个字节，**分配期握手的 9 字节请求一字不变**（它就是标记后不带命令的那枚）。常量单一
+定义在 `shared_serial.rs`（`ADMIN_LISTEN`/`ADMIN_REPLY`/`CMD_*`/`RESP_NEED_NODEID`），
+CAN 侧的同族常量在 `canserial.rs`。
+
+| 角色 | 仲裁 id | 说明 |
+|------|---------|------|
+| admin 收听 | `0x3f0` | 未分配设备在此收查询/指派（与 CAN 广播同一个 id） |
+| admin 应答 | `0x3f1` | 未分配设备在此回答（沿用 `+1` 奇偶约定） |
+
+两个 id 在已分配号段 `0x102..=0x2ff` 之外，所以 `dispatch` 不会把 admin 单元投给任何 MCU。
+
+### 命令族（帧体 = `[len][0x20]["KXID"]` + 命令字节）
+
+| 命令/应答 | 字节 | 方向 | 单元 |
+|-----------|------|------|------|
+| `QUERY_UNASSIGNED` | `0x00` | 主机 → 全部 | `[VLQ(0x3f0)][len][0x20]["KXID"][0x00][crc16][0x7e]`（`discovery_query()`） |
+| `SET_KLIPPER_NODEID` | `0x01` | 主机 → 点名 | `[VLQ(0x3f0)][len][0x20]["KXID"][0x01][uuid 大端 6 字节][nodeid][crc16][0x7e]`（`set_node_id_for(uuid, id)`，id 越界返回 `None`，校验同 CAN） |
+| `NEED_NODEID` | `0x20` | 设备 → 主机 | `[VLQ(0x3f1)][len][0x20]["KXID"][0x20][uuid 大端 6 字节][app?][crc16][0x7e]`（`UnassignedNode::from_unit`） |
+
+- uuid **高位字节在前**；应答末尾可带一枚 application 字节：无字节或 `0x01` = Klipper、
+  `0x11` = CanBoot、其它 = `Unknown`（`application_name()`）——一字不带的旧形状也认。
+- uuid/app 按**帧长字节定位**，所以它们里面出现 `0x7e` 是普通内容（帧内容允许 SYNC）。
+- 指派后设备按 nodeid 正常收发（`0x100+2*id` 寻址），**已分配的设备不再响应 `0x00`**。
+
+### 主机侧怎么用
+
+- **扫描**（`klipperx scan --port <tty>`，`src/scan.rs`）：
+  `serial_query_unassigned()` 广播一次查询，随后按与 `dispatch` 相同的成帧语义切单元
+  （`UnitStream`），窗口是**从广播起算的截止时间**（`--timeout`，默认 2 s），按 uuid
+  去重、每块板第一次被听到时回调——输出 `Found uuid=%012x, Application: …` 与总数行，不给 `--port` 则扫 CAN（同一个 `klipperx scan`，`--interface` 选总线），两者输出同形。CAN 侧的扫描实现在 `canserial.rs` 的 `query_unassigned`。
+- **连接期**：`[mcu]` 节带 `uuid`（或别名 `canbus_uuid`）的共享串口，`attach()` 在发分配
+  请求**之前**先写一枚 `SET_KLIPPER_NODEID`（按 uuid 点名 id），再走上一节的重确认
+  握手——顺序与 CAN 的 `CanSerialDevice::open`（开链路时发 SET_NODEID）对应。
+
+### 固件端契约（待实现）
+
+- 未分配的设备监听 `0x3f0`：收 `0x00` 在 `0x3f1` 回身份（uuid + application）；收
+  `0x01 <uuid6> <id>` 且 uuid 是自己时**采纳 id** 并转入正常寻址。幂等：重复收到同一
+  指派不改变已采纳的 id。
+- **已分配**的设备对 `0x00` 保持沉默（所以扫描只列未分配的板）。
+- 冲突处理留固件端：串口没有 CAN 的总线仲裁，同一根线上多板同时应答会撞字节——由固件
+  结合物理接口避免或重试；主机侧只做单次广播 + 截止窗口 + uuid 去重，不重发。
 
 ## 主机侧的行为约定
 
@@ -110,10 +159,13 @@ block content」，帧内容本来就允许含 `0x7e`，长度字节才是权威
 CAN 不需要这套东西：总线自带仲裁 id 与硬件过滤，每颗 MCU 各开一个 socket、各装一个只收
 自己应答 id 的内核过滤器（`canserial.rs`），节点号由 `0x3f0` 的 admin 帧 fire-and-forget
 交付。串口没有寻址，所以把同一套「`0x100 + 2*id` / 应答 `+1`」的语义搬到字节流里，多出来
-的只有**帧头**和**一次握手确认**。
+的只有**帧头**和**一次握手确认**。admin 信道与命令族也逐字镜像 CAN（`0x00` 查询 / `0x01`
+指派 / `0x20` 应答，见「发现与指派：admin 信道与命令族」一节），差别只在冲突处理：CAN 靠总线仲裁，串口留给固件端结合
+物理接口实现。
 
 ## 尚未落地
 
 - 帧头寻址目前**只服务共享串口**；其它接口（独占串口、`host_library`、`test:`）不使用 id
   寻址，`[mcu]` 的 id 对它们只是标识与分配序列的一部分。
-- 设备端固件未实现：共享路径在固件就绪前必然握手超时（这是预期行为，不是 bug）。
+- 设备端固件未实现：共享路径在固件就绪前必然握手超时，发现扫描也只会等到截止窗口走空
+  （这是预期行为，不是 bug）；固件契约见「发现与指派：admin 信道与命令族」一节。

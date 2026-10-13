@@ -117,14 +117,17 @@ enum Commands {
     #[command(arg_required_else_help = true)]
     Stress(klipperx::stress::StressArgs),
 
-    /// List the boards on a CAN bus that have no node id yet
+    /// List the boards that have no node id yet, on a CAN bus or a serial port
     //
     // A bench tool, not part of the host: it needs no config file, and the query
     // it sends is a broadcast that changes no board's state — the UUIDs it prints
-    // are what a `[mcu]` section then names in `canbus_uuid`. No
-    // `arg_required_else_help`, unlike `stress`: every argument has a default, so
-    // naming it alone is an instruction — scan `can0` for two seconds.
-    CanbusScan(klipperx::canbus::CanbusScanArgs),
+    // are what a `[mcu]` section then names in `uuid`. The transport is an
+    // argument, not a second command: no `--port` scans the CAN bus named by
+    // `--interface` (`can0` by default), and `--port <tty>` scans that serial port
+    // instead. No `arg_required_else_help`, unlike `stress`: every argument has a
+    // default or is optional, so naming it alone is an instruction — scan `can0`
+    // for two seconds.
+    Scan(klipperx::scan::ScanArgs),
 }
 
 fn main() {
@@ -137,7 +140,7 @@ fn main() {
         (Some(Commands::Api(args)), _) => client::run_api(args).map(|()| 0),
         (Some(Commands::Console(args)), _) => client::run_console(args).map(|()| 0),
         (Some(Commands::Stress(args)), _) => klipperx::stress::run(args).map(|()| 0),
-        (Some(Commands::CanbusScan(args)), _) => klipperx::canbus::run(args).map(|()| 0),
+        (Some(Commands::Scan(args)), _) => klipperx::scan::run(args).map(|()| 0),
         // No subcommand: the arguments were the host's all along.
         (None, host) => run_host(host),
     };
@@ -473,40 +476,57 @@ mod tests {
     }
 
     #[test]
-    fn test_the_canbus_scan_subcommand_has_its_own_defaults() {
-        // Every argument defaults, so naming the subcommand alone is an
-        // instruction rather than a question: scan `can0` for Klipper's two
+    fn test_the_scan_subcommand_defaults_to_a_can_bus() {
+        // Every argument is optional or defaults, so naming the subcommand alone
+        // is an instruction rather than a question: scan `can0` for Klipper's two
         // seconds.
-        let cli = parse(&["canbus-scan"]).expect("no argument is required");
+        let cli = parse(&["scan"]).expect("no argument is required");
         match cli.command {
-            Some(Commands::CanbusScan(args)) => {
-                assert_eq!(args.interface, "can0");
+            Some(Commands::Scan(args)) => {
+                assert_eq!(args.interface, None);
+                assert_eq!(args.port, None);
                 assert_eq!(args.timeout, 2.0);
+                assert_eq!(args.baud, None);
             }
-            other => panic!("expected `canbus-scan`, got {other:?}"),
+            other => panic!("expected `scan`, got {other:?}"),
         }
 
-        let cli = parse(&["canbus-scan", "--interface", "can1", "--timeout", "0.5"])
+        // The CAN side takes the interface name and the window.
+        let cli = parse(&["scan", "--interface", "can1", "--timeout", "0.5"])
             .expect("both options are the subcommand's");
         match cli.command {
-            Some(Commands::CanbusScan(args)) => {
-                assert_eq!(args.interface, "can1");
+            Some(Commands::Scan(args)) => {
+                assert_eq!(args.interface.as_deref(), Some("can1"));
                 assert_eq!(args.timeout, 0.5);
             }
-            other => panic!("expected `canbus-scan`, got {other:?}"),
+            other => panic!("expected `scan`, got {other:?}"),
+        }
+
+        // The serial side names a port, and with it the line speed.
+        let cli = parse(&["scan", "--port", "/dev/ttyACM0", "--baud", "115200"])
+            .expect("the port and the line speed are the subcommand's");
+        match cli.command {
+            Some(Commands::Scan(args)) => {
+                assert_eq!(args.port.as_deref(), Some("/dev/ttyACM0"));
+                assert_eq!(args.baud, Some(115200));
+            }
+            other => panic!("expected `scan`, got {other:?}"),
         }
     }
 
     #[test]
-    fn test_the_canbus_scan_subcommand_and_its_options_are_in_the_help() {
-        // Found by reading `--help`, like the other bench tools.
+    fn test_the_scan_subcommand_and_its_options_are_in_the_help() {
+        // Found by reading `--help`, like the other bench tools: the top level
+        // lists the one scan subcommand, and the subcommand's own help names
+        // both transports' options.
         let error = parse(&["--help"]).expect_err("the help is not a command line");
         let help = error.to_string();
-        assert!(help.contains("canbus-scan"), "{help}");
+        assert!(help.contains("scan"), "{help}");
 
-        let error = parse(&["canbus-scan", "--help"]).expect_err("the help is not a scan");
+        let error = parse(&["scan", "--help"]).expect_err("the help is not a scan");
         let help = error.to_string();
-        assert!(help.contains("--interface"), "{help}");
-        assert!(help.contains("--timeout"), "{help}");
+        for option in ["--interface", "--port", "--timeout", "--baud"] {
+            assert!(help.contains(option), "{option} is missing from:\n{help}");
+        }
     }
 }

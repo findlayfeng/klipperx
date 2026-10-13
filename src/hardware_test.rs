@@ -64,7 +64,7 @@
 //!
 //! [`HW_CONFIG_ENV`] names the same config the printer reads, and nothing else is
 //! asked of the environment. The interface is derived from it (`[mcu]`'s
-//! `serial:` with its `baud:`, or `canbus_uuid:`), and so is every section and
+//! `serial:` with its `baud:`, or `uuid:`), and so is every section and
 //! option a test names. What counts as "present" is decided by the real config
 //! parser ([`Config::from_file`]), so a commented-out `[stepper_x]` is simply
 //! absent, and `[include …]`s are resolved the way the printer resolves them.
@@ -320,7 +320,7 @@ impl Requires {
         Self::default()
     }
 
-    /// The main MCU, reachable: `[mcu]` carries `serial:` or `canbus_uuid:`.
+    /// The main MCU, reachable: `[mcu]` carries `serial:` or `uuid:`.
     ///
     /// A `[mcu <name>]` does not count — that is another board, and opening it
     /// is not what [`Machine::open_mcu`] does. Ask for it with
@@ -330,7 +330,7 @@ impl Requires {
     }
 
     /// The MCU named `name`, reachable: `[mcu <name>]` carries `serial:` or
-    /// `canbus_uuid:`. The name `"mcu"` is `[mcu]`, the same as
+    /// `uuid:`. The name `"mcu"` is `[mcu]`, the same as
     /// [`Requires::mcu`].
     ///
     /// The name is the one `Mcu::connect` takes, not the section header:
@@ -364,7 +364,7 @@ impl Requires {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Missing {
     /// The MCU in `[<section>]` is absent, or carries neither `serial:` nor
-    /// `canbus_uuid:`. The section identifier is `"mcu"` or `"mcu zboard"`.
+    /// `uuid:`. The section identifier is `"mcu"` or `"mcu zboard"`.
     Mcu(String),
     /// A section the test named is not in the config.
     Section(String),
@@ -376,7 +376,7 @@ impl fmt::Display for Missing {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Missing::Mcu(section) => {
-                write!(f, "missing [{section}] with serial: or canbus_uuid:")
+                write!(f, "missing [{section}] with serial: or uuid:")
             }
             Missing::Section(section) => write!(f, "missing [{section}]"),
             Missing::Option { section, option } => {
@@ -439,7 +439,7 @@ fn mcu_section_id(name: &str) -> String {
 fn has_mcu(config: &Config, section: &str) -> bool {
     config
         .get_section(section)
-        .is_some_and(|found| found.has("serial") || found.has("canbus_uuid"))
+        .is_some_and(|found| found.has("serial") || found.has("uuid") || found.has("canbus_uuid"))
 }
 
 /// Append `item` unless that exact thing is already in the list, so a test that
@@ -636,8 +636,8 @@ impl Machine {
     /// `Mcu::connect(name, …)` with the **same** name.
     ///
     /// The section is parsed by [`McuConfig`], so `serial:` with its `baud:`,
-    /// `canbus_uuid:`, `host_library:` and `restart_method:` all behave as they
-    /// do at run time.
+    /// `uuid:`, `host_library:` and `restart_method:` all behave as they do at
+    /// run time.
     ///
     /// # Errors
     /// A failure here is a **real** failure, not a skip: the config said the
@@ -914,7 +914,7 @@ fn print_plan(config: &Config) {
 ///
 /// Each line names the section and what a test would ask of it: `.mcu()` for
 /// `[mcu]`, `.mcu_named("zboard")` for `[mcu zboard]`, and whether that
-/// requirement passes (`serial:` or `canbus_uuid:`) or skips. A config with no
+/// requirement passes (`serial:` or `uuid:`) or skips. A config with no
 /// MCU section at all is one line saying so.
 fn mcu_plan_lines(config: &Config) -> Vec<String> {
     let sections = config.get_sections_by_id("mcu");
@@ -934,11 +934,16 @@ fn mcu_plan_lines(config: &Config) -> Vec<String> {
                     ),
                     format!("{requirement} tests run"),
                 )
-            } else if section.has("canbus_uuid") {
+            } else if section.has("uuid") || section.has("canbus_uuid") {
+                // `canbus_uuid` is the old spelling of the key; both name the
+                // same uuid.
+                let uuid = section
+                    .get_str("uuid")
+                    .or_else(|| section.get_str("canbus_uuid"));
                 (
                     format!(
-                        "canbus_uuid: {} (interface: {}, mcu id: {})",
-                        section.get_str("canbus_uuid").unwrap_or_default(),
+                        "uuid: {} (interface: {}, mcu id: {})",
+                        uuid.unwrap_or_default(),
                         section.get_str("canbus_interface").unwrap_or("can0"),
                         section
                             .get_str("canbus_nodeid")
@@ -948,7 +953,7 @@ fn mcu_plan_lines(config: &Config) -> Vec<String> {
                 )
             } else {
                 (
-                    "no serial:/canbus_uuid:".to_string(),
+                    "no serial:/uuid:".to_string(),
                     format!("{requirement} tests skip"),
                 )
             };
@@ -1132,7 +1137,7 @@ mod tests {
             Err(vec![Missing::Mcu("mcu".to_string())])
         );
 
-        // `[mcu]` with neither `serial:` nor `canbus_uuid:`.
+        // `[mcu]` with neither `serial:` nor `uuid:`.
         let bare = config("[mcu]\nrestart_method: arduino\n");
         assert_eq!(
             check(&bare, &Requires::new().mcu()),
@@ -1144,7 +1149,7 @@ mod tests {
         assert_eq!(check(&serial, &Requires::new().mcu()), Ok(()));
 
         // A CAN interface.
-        let can = config("[mcu]\ncanbus_uuid: 11aa22bb33cc\ncanbus_nodeid: 2\n");
+        let can = config("[mcu]\nuuid: 11aa22bb33cc\ncanbus_nodeid: 2\n");
         assert_eq!(check(&can, &Requires::new().mcu()), Ok(()));
     }
 
@@ -1160,7 +1165,7 @@ mod tests {
             Err(vec![Missing::Mcu("mcu zboard".to_string())])
         );
 
-        // `[mcu zboard]` with neither `serial:` nor `canbus_uuid:` — the case
+        // `[mcu zboard]` with neither `serial:` nor `uuid:` — the case
         // `Requires::section("mcu zboard")` would wave through.
         let bare = config("[mcu zboard]\nrestart_method: arduino\n");
         assert_eq!(check(&bare, &Requires::new().section("mcu zboard")), Ok(()));
@@ -1174,7 +1179,7 @@ mod tests {
         assert_eq!(check(&serial, &Requires::new().mcu_named("zboard")), Ok(()));
 
         // A CAN interface.
-        let can = config("[mcu zboard]\ncanbus_uuid: 11aa22bb33cc\n");
+        let can = config("[mcu zboard]\nuuid: 11aa22bb33cc\n");
         assert_eq!(check(&can, &Requires::new().mcu_named("zboard")), Ok(()));
 
         // The name `"mcu"` is the main section, not `[mcu mcu]`.
@@ -1235,11 +1240,11 @@ mod tests {
     fn test_a_missing_item_reads_as_what_is_missing() {
         assert_eq!(
             Missing::Mcu("mcu".to_string()).to_string(),
-            "missing [mcu] with serial: or canbus_uuid:"
+            "missing [mcu] with serial: or uuid:"
         );
         assert_eq!(
             Missing::Mcu("mcu zboard".to_string()).to_string(),
-            "missing [mcu zboard] with serial: or canbus_uuid:"
+            "missing [mcu zboard] with serial: or uuid:"
         );
         assert_eq!(
             Missing::Section("stepper_x".to_string()).to_string(),
@@ -1381,18 +1386,18 @@ mod tests {
                 "HW-MCU: [mcu zboard] serial: /dev/ttyACM1 (baud: 250000 (default)) \
                  — .mcu_named(\"zboard\") tests run"
                     .to_string(),
-                "HW-MCU: [mcu toolhead] no serial:/canbus_uuid: \
+                "HW-MCU: [mcu toolhead] no serial:/uuid: \
                  — .mcu_named(\"toolhead\") tests skip"
                     .to_string(),
             ]
         );
 
         // A CAN board prints its transport instead of a serial device.
-        let can = config("[mcu zboard]\ncanbus_uuid: 11aa22bb33cc\ncanbus_nodeid: 2\n");
+        let can = config("[mcu zboard]\nuuid: 11aa22bb33cc\ncanbus_nodeid: 2\n");
         assert_eq!(
             mcu_plan_lines(&can),
             vec![
-                "HW-MCU: [mcu zboard] canbus_uuid: 11aa22bb33cc (interface: can0, mcu id: 2) \
+                "HW-MCU: [mcu zboard] uuid: 11aa22bb33cc (interface: can0, mcu id: 2) \
                  — .mcu_named(\"zboard\") tests run"
                     .to_string()
             ]

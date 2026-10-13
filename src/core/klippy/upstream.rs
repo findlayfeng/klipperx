@@ -541,6 +541,7 @@ mod tests {
         let transport_keys = [
             "serial",
             "baud",
+            "uuid",
             "canbus_uuid",
             "canbus_interface",
             "canbus_nodeid",

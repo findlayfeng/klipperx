@@ -105,8 +105,12 @@
 //! * The handshake is a **synchronous** request/reply run by `attach` while a
 //!   **shared** serial port is being assigned. An **exclusive** serial port
 //!   sends nothing, and no transport sends the pattern fire-and-forget.
-//! * `host_library` and the `test:` simulator do not take part; CAN keeps its
-//!   own admin frame (`0x3f0` / `CMD_SET_NODEID`).
+//! * `host_library` and the `test:` simulator do not take part. Finding and
+//!   naming the boards that have no node id yet is the **discovery**
+//!   conversation at the bottom of this module: it mirrors CAN's admin
+//!   broadcast (`0x3f0`/`0x3f1`, `CMD_QUERY_UNASSIGNED`/`CMD_SET_NODEID`) but,
+//!   serial having no side channel, rides inside the same stream `KXID` frame
+//!   while CAN keeps its own admin frame.
 //! * The arbitration-id mapping these headers are built from is
 //!   [`crate::core::klippy::assign`]'s, and only that.
 //!
@@ -209,7 +213,7 @@ pub fn decode_header(buf: &[u8]) -> HeaderScan {
 /// both directions, and the frame is
 /// `[len=9][0x20]["KXID"][crc16 hi][crc16 lo][0x7e]`.
 fn assignment_frame() -> Vec<u8> {
-    Frame::with_wire_seq(ASSIGN_SEQ_BYTE, MAGIC.to_vec()).raw_bytes()
+    kxid_unit(&[])
 }
 
 /// The assignment unit addressed to `mcu_id`: the header on its listener
@@ -269,6 +273,336 @@ pub fn parse_assignment_ack(unit: &[u8]) -> Option<u32> {
         return None;
     }
     Some(mcu_id)
+}
+
+// ===========================================================================
+// Unassigned-device discovery: the admin broadcast, on the shared serial wire
+// ===========================================================================
+
+/// The discovery conversation, spelled with CAN's own values so an id or a
+/// command means the same thing on either transport.
+///
+/// The admin ids sit outside the assigned range
+/// (`0x102..=0x2ff`, [`crate::core::klippy::assign`]) the way they do for CAN,
+/// and the parity convention is the same: the even id addresses the admin, the
+/// odd id is its reply. The commands and the response byte are CAN's too — an
+/// unassigned board answers discovery the same way however it is asked.
+pub const ADMIN_LISTEN: u32 = 0x3f0;
+/// The id the admin answer arrives on, one past [`ADMIN_LISTEN`].
+pub const ADMIN_REPLY: u32 = 0x3f1;
+/// The frame body byte that asks every board with no node id to answer.
+pub const CMD_QUERY_UNASSIGNED: u8 = 0x00;
+/// The frame body byte that hands a board the node id it is to take.
+pub const CMD_SET_KLIPPER_NODEID: u8 = 0x01;
+/// The first body byte of an unassigned board's answer.
+pub const RESP_NEED_NODEID: u8 = 0x20;
+/// The application id CanBoot reports instead of Klipper's own
+/// ([`CMD_SET_KLIPPER_NODEID`]), as CAN's `CMD_SET_CANBOOT_NODEID`.
+const CMD_SET_CANBOOT_NODEID: u8 = 0x11;
+
+/// A frame in the `KXID` pattern whose payload is [`MAGIC`] followed by
+/// `payload`.
+///
+/// This is the same frame shape the assignment pseudo-frame uses
+/// ([`assignment_frame`] is exactly `kxid_unit(&[])`), so the discovery
+/// broadcast and the node-id assignment below ride the same self-delimiting
+/// frame with one opcode byte — [`CMD_QUERY_UNASSIGNED`] /
+/// [`CMD_SET_KLIPPER_NODEID`] — after the marker.
+fn kxid_unit(payload: &[u8]) -> Vec<u8> {
+    let mut body = MAGIC.to_vec();
+    body.extend_from_slice(payload);
+    Frame::with_wire_seq(ASSIGN_SEQ_BYTE, body).raw_bytes()
+}
+
+/// The broadcast that asks every board without a node id to identify itself:
+/// the admin listen id as the unit's header, then the `KXID` frame carrying
+/// [`CMD_QUERY_UNASSIGNED`].
+///
+/// A board that has never been handed a node id is addressed on
+/// [`ADMIN_LISTEN`], the same id CAN's broadcast uses; the unit is
+/// `[VLQ(0x3f0)][len][0x20]["KXID"][0x00][crc16][0x7e]`.
+pub fn discovery_query() -> Vec<u8> {
+    let mut unit = encode_header(ADMIN_LISTEN);
+    unit.extend_from_slice(&kxid_unit(&[CMD_QUERY_UNASSIGNED]));
+    unit
+}
+
+/// The broadcast that tells the board with `uuid` to take `mcu_id`: the admin
+/// listen id as the header, then the `KXID` frame carrying
+/// [`CMD_SET_KLIPPER_NODEID`], the six UUID bytes most significant first, and
+/// the node id — CAN's `[0x01][uuid][nodeid]` inside the stream frame.
+///
+/// `None` for an id outside `1..=MAX_MCU_ID`, the range the wire format can
+/// address — checked exactly the way CAN checks it ([`assign::arb_id`]).
+pub fn set_node_id_for(uuid: [u8; 6], mcu_id: u32) -> Option<Vec<u8>> {
+    if assign::arb_id(mcu_id).is_none() {
+        return None;
+    }
+    let mut body = Vec::with_capacity(1 + 6 + 1);
+    body.push(CMD_SET_KLIPPER_NODEID);
+    body.extend_from_slice(&uuid);
+    body.push(mcu_id as u8);
+    let mut unit = encode_header(ADMIN_LISTEN);
+    unit.extend_from_slice(&kxid_unit(&body));
+    Some(unit)
+}
+
+/// One board's answer to [`discovery_query`]: the UUID it is remembered by,
+/// and the application it runs.
+///
+/// This mirrors CAN's
+/// [`UnassignedNode`](crate::core::klippy::interface::devices::canserial::UnassignedNode):
+/// the board answers with [`RESP_NEED_NODEID`], the six UUID bytes most
+/// significant first, and — in the builds that send it — one more byte naming
+/// the application. The UUID and the application byte are read **by position
+/// against the frame's length byte**, so a `0x7e` inside them is ordinary
+/// content: the protocol allows SYNC in message block content.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnassignedNode {
+    /// The UUID, most significant byte first.
+    pub uuid: [u8; 6],
+    /// The application byte the board sent, if it sent one.
+    pub application: Option<u8>,
+}
+
+impl UnassignedNode {
+    /// The application's name, as Klipper's tool names it in its `Found …`
+    /// line.
+    ///
+    /// A board that sends no application byte — the shape the protocol had
+    /// before the byte existed — is named Klipper, which is what upstream's
+    /// tool reads it as; an id that means neither Klipper nor CanBoot is
+    /// reported as `Unknown` rather than guessed at.
+    pub fn application_name(&self) -> &'static str {
+        match self.application {
+            None | Some(CMD_SET_KLIPPER_NODEID) => "Klipper",
+            Some(CMD_SET_CANBOOT_NODEID) => "CanBoot",
+            Some(_) => "Unknown",
+        }
+    }
+
+    /// The board a unit reports, or `None` for a unit that is not an answer.
+    ///
+    /// What makes a unit an answer is its shape, checked the way
+    /// [`parse_assignment_ack`] checks the handshake's: a whole VLQ header
+    /// naming [`ADMIN_REPLY`], then a frame whose length byte matches the
+    /// bytes present, whose sequence byte is [`ASSIGN_SEQ_BYTE`], whose
+    /// trailer and CRC check out, and whose content after [`MAGIC`] begins
+    /// with [`RESP_NEED_NODEID`] followed by the six UUID bytes and an
+    /// optional application byte. Nothing else is checked — in particular a
+    /// UUID of six zero bytes is reported rather than treated as unset,
+    /// because the protocol has no such value.
+    pub fn from_unit(unit: &[u8]) -> Option<Self> {
+        let (arb, consumed) = match decode_header(unit) {
+            HeaderScan::Complete { arb, consumed } => (arb, consumed),
+            HeaderScan::NeedMore | HeaderScan::Invalid => return None,
+        };
+        if arb != ADMIN_REPLY {
+            return None;
+        }
+        let frame = &unit[consumed..];
+        if frame.len() < MESSAGE_MIN {
+            return None;
+        }
+        let len = frame[MESSAGE_POS_LEN] as usize;
+        if !(MESSAGE_MIN..=MESSAGE_MAX).contains(&len) || frame.len() != len {
+            return None;
+        }
+        if frame[MESSAGE_POS_SEQ] != ASSIGN_SEQ_BYTE {
+            return None;
+        }
+        if frame[len - MESSAGE_TRAILER_SYNC] != MESSAGE_SYNC {
+            return None;
+        }
+        let expected = crate::crc16_ccitt!(&frame[..len - MESSAGE_TRAILER_SIZE]);
+        let actual = ((frame[len - 3] as u16) << 8) | (frame[len - 2] as u16);
+        if expected != actual {
+            return None;
+        }
+        let content = &frame[MESSAGE_HEADER_SIZE..len - MESSAGE_TRAILER_SIZE];
+        if content.len() < MAGIC.len() + 1
+            || &content[..MAGIC.len()] != &MAGIC[..]
+            || content[MAGIC.len()] != RESP_NEED_NODEID
+        {
+            return None;
+        }
+        let after_cmd = &content[MAGIC.len() + 1..];
+        if after_cmd.len() < 6 {
+            return None;
+        }
+        let mut uuid = [0u8; 6];
+        uuid.copy_from_slice(&after_cmd[..6]);
+        // A whole 1-byte application is the only legal extra; more trailing
+        // bytes mean the unit was not this shape.
+        let application = match after_cmd.len() {
+            6 => None,
+            7 => Some(after_cmd[6]),
+            _ => return None,
+        };
+        Some(Self { uuid, application })
+    }
+}
+
+/// The boards one scan heard, in the order they first answered.
+#[derive(Debug, Default)]
+pub struct UnassignedScan {
+    nodes: Vec<UnassignedNode>,
+}
+
+impl UnassignedScan {
+    /// A scan that has heard nothing yet.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Take one unit: the node it reports, the first time that UUID is heard.
+    ///
+    /// A board answers with retries, so the same UUID can arrive twice; the
+    /// second unit is `None`, and the board is listed once. A unit that is not
+    /// an answer — garbage, or a frame addressed to a node that already has an
+    /// id — is `None` too.
+    pub fn feed(&mut self, unit: &[u8]) -> Option<UnassignedNode> {
+        let node = UnassignedNode::from_unit(unit)?;
+        if self.nodes.iter().any(|seen| seen.uuid == node.uuid) {
+            return None;
+        }
+        self.nodes.push(node.clone());
+        Some(node)
+    }
+
+    /// The boards found so far, in the order they first answered.
+    pub fn nodes(&self) -> &[UnassignedNode] {
+        &self.nodes
+    }
+
+    /// How many boards answered.
+    pub fn total(&self) -> usize {
+        self.nodes.len()
+    }
+}
+
+/// A byte stream being cut into whole units — a bare VLQ header plus one frame
+/// — with the same framing and resync policy as the reader's [`dispatch`].
+///
+/// [`dispatch`] routes each unit by its arbitration id, which is why it cannot
+/// be used here: the units a discovery scan reads carry the admin ids
+/// ([`ADMIN_LISTEN`]/[`ADMIN_REPLY`]) that are outside the assigned range, so
+/// no id check is applied and the caller decides what each unit is. Everything
+/// else is the shared codec ([`decode_header`], [`drop_to_sync`], the
+/// `MESSAGE_*` frame constants) — one framing, not a second one.
+#[derive(Debug)]
+struct UnitStream {
+    pending: Vec<u8>,
+    needs_sync: bool,
+}
+
+impl UnitStream {
+    fn new() -> Self {
+        Self {
+            pending: Vec::new(),
+            needs_sync: false,
+        }
+    }
+
+    /// Append bytes to the stream; nothing is parsed until [`take_unit`].
+    fn feed(&mut self, bytes: &[u8]) {
+        self.pending.extend_from_slice(bytes);
+    }
+
+    /// The next complete unit, or `None` if none is buffered.
+    ///
+    /// Exactly the [`dispatch`] policy: an invalid header or a length byte
+    /// outside the frame range resynchronises on the next [`MESSAGE_SYNC`].
+    fn take_unit(&mut self) -> Option<Vec<u8>> {
+        loop {
+            if self.needs_sync {
+                match self.pending.iter().position(|&b| b == MESSAGE_SYNC) {
+                    Some(pos) => {
+                        self.pending.drain(..=pos);
+                        self.needs_sync = false;
+                    }
+                    None => {
+                        self.pending.clear();
+                        return None;
+                    }
+                }
+            }
+            let consumed = match decode_header(&self.pending) {
+                HeaderScan::NeedMore => return None,
+                HeaderScan::Invalid => {
+                    drop_to_sync(&mut self.pending, &mut self.needs_sync);
+                    continue;
+                }
+                HeaderScan::Complete { consumed, .. } => consumed,
+            };
+            if self.pending.len() < consumed + 1 {
+                return None; // the length byte is still in flight
+            }
+            let length = self.pending[consumed] as usize;
+            if !(MESSAGE_MIN..=MESSAGE_MAX).contains(&length) {
+                drop_to_sync(&mut self.pending, &mut self.needs_sync);
+                continue;
+            }
+            let unit_len = consumed + length;
+            if self.pending.len() < unit_len {
+                return None; // the rest of the frame is still in flight
+            }
+            let unit: Vec<u8> = self.pending.drain(..unit_len).collect();
+            return Some(unit);
+        }
+    }
+}
+
+/// Ask every board with no node id on `port` to identify itself, and read the
+/// answers for `timeout`.
+///
+/// Writes one [`discovery_query`], then cuts the incoming stream into units
+/// with the same framing as the shared reader ([`UnitStream`]) and feeds each
+/// to a scan; `report` is called as each board is first heard, so a front-end
+/// can print answers while the window is still open.
+///
+/// The `timeout` is a **deadline**, measured from the moment the query goes
+/// out, like CAN's scan window: every read is bounded by what is left of it,
+/// and the scan ends when that runs out, whatever has arrived by then. A
+/// blocking port says “no bytes in this read window” with a zero read, a
+/// non-blocking one with `WouldBlock`/`TimedOut`; both just mean the loop has
+/// to check the deadline, and any other read error is returned as it is.
+/// Returns how many boards were found.
+pub fn serial_query_unassigned(
+    port: &mut (impl std::io::Read + std::io::Write),
+    timeout: Duration,
+    mut report: impl FnMut(UnassignedNode),
+) -> std::io::Result<usize> {
+    port.write_all(&discovery_query())?;
+    let deadline = Instant::now() + timeout;
+    let mut scan = UnassignedScan::new();
+    let mut stream = UnitStream::new();
+    let mut buf = [0u8; READ_CHUNK];
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match port.read(&mut buf) {
+            Ok(0) => continue,
+            Ok(read) => {
+                stream.feed(&buf[..read]);
+                while let Some(unit) = stream.take_unit() {
+                    if let Some(node) = scan.feed(&unit) {
+                        report(node);
+                    }
+                }
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(scan.total())
 }
 
 /// A physical serial port, its one reader thread, and a slot per attached MCU.
@@ -350,9 +684,14 @@ fn port_for(path: &Path, baud: u32) -> Result<Arc<SharedSerialPort>, InterfaceEr
 /// Open a port for one MCU, completing the frame-level id handshake.
 ///
 /// The first attach on a path opens the tty and starts the reader; later ones
-/// reuse both and only register a slot. The request is written and the answer
-/// awaited `ASSIGN_ATTACH_ATTEMPTS` times, each for `timeout`; on exhaustion the
-/// slot is unregistered and [`InterfaceError::Timeout`] returned.
+/// reuse both and only register a slot. When `uuid` is `Some`, the handshake
+/// starts by writing the SET_NODEID unit that names the board
+/// ([`set_node_id_for`]) and only then sends the assignment request — mirroring
+/// CAN's `CanSerialDevice::open`, which sends its SET_NODEID when the link
+/// opens. `None` skips that and goes straight to the request. The request is
+/// written and the answer awaited `ASSIGN_ATTACH_ATTEMPTS` times, each for
+/// `timeout`; on exhaustion the slot is unregistered and
+/// [`InterfaceError::Timeout`] returned.
 ///
 /// # Errors
 /// [`InterfaceError::Other`] for an id the wire format cannot carry or a port
@@ -363,6 +702,7 @@ pub fn attach(
     baud: u32,
     mcu_id: u32,
     timeout: Duration,
+    uuid: Option<[u8; 6]>,
 ) -> Result<Arc<SharedSerialHandle>, InterfaceError> {
     if assign::arb_id(mcu_id).is_none() {
         return Err(InterfaceError::Other(format!(
@@ -378,6 +718,18 @@ pub fn attach(
 
     let slot = Arc::new(McuSlot::new());
     port.slots.lock().unwrap().insert(mcu_id, Arc::clone(&slot));
+
+    // A discovered MCU is named before the assignment runs: frame order is the
+    // SET_NODEID unit first, the assignment request second (mirrors CAN's
+    // `CanSerialDevice::open`). `set_node_id_for` fails only for an id the
+    // wire format cannot carry, already rejected above.
+    if let Some(uuid) = uuid {
+        let unit = set_node_id_for(uuid, mcu_id).expect("arb_id checked above");
+        if let Err(e) = port.write_unit(&unit) {
+            port.slots.lock().unwrap().remove(&mcu_id);
+            return Err(e);
+        }
+    }
 
     let request = assignment_request(mcu_id).expect("arb_id checked above");
     let mut attempts = 0;
@@ -734,7 +1086,7 @@ impl Device for SharedSerialHandle {
 mod tests {
     use super::*;
     use crate::core::klippy::frame::{MESSAGE_DEST, MESSAGE_SEQ_MASK};
-    use crate::core::klippy::interface::devices::serial::DEFAULT_BAUD;
+    use crate::core::klippy::interface::devices::serial::{SerialDevice, DEFAULT_BAUD};
     use crate::core::klippy::interface::pty::Pty;
     use std::thread;
 
@@ -761,7 +1113,7 @@ mod tests {
         let request = assignment_request(mcu_id).expect("a valid mcu id");
         let path = pty.path.clone();
         let thread =
-            thread::spawn(move || attach(&path, DEFAULT_BAUD, mcu_id, ASSIGN_ATTACH_TIMEOUT));
+            thread::spawn(move || attach(&path, DEFAULT_BAUD, mcu_id, ASSIGN_ATTACH_TIMEOUT, None));
         let seen = read_n(&pty.master, request.len());
         assert_eq!(
             seen, request,
@@ -820,10 +1172,56 @@ mod tests {
         );
     }
 
+    /// With a uuid the handshake starts by naming the board: the SET_NODEID
+    /// unit goes out first, then the ordinary assignment request, then the
+    /// reply lets `attach` return a handle (mirrors CAN's SET_NODEID-on-open).
+    #[test]
+    fn attach_with_a_uuid_sends_set_node_id_before_the_assignment_request() {
+        let pty = Pty::new();
+        let uuid = [0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc];
+        let mcu_id = 6;
+
+        let path = pty.path.clone();
+        let thread = thread::spawn(move || {
+            attach(
+                &path,
+                DEFAULT_BAUD,
+                mcu_id,
+                ASSIGN_ATTACH_TIMEOUT,
+                Some(uuid),
+            )
+        });
+
+        let set = set_node_id_for(uuid, mcu_id).expect("a valid mcu id");
+        let request = assignment_request(mcu_id).expect("a valid mcu id");
+        let wire = read_n(&pty.master, set.len() + request.len());
+        assert_eq!(
+            &wire[..set.len()],
+            set.as_slice(),
+            "the SET_NODEID unit goes out first"
+        );
+        assert_eq!(
+            &wire[set.len()..],
+            request.as_slice(),
+            "the assignment request follows SET_NODEID"
+        );
+
+        master_write(
+            &pty.master,
+            &assignment_reply(mcu_id).expect("a valid mcu id"),
+        );
+        let handle = thread
+            .join()
+            .expect("attach thread")
+            .expect("attach succeeds");
+        // The returned handle is the caller's to use, like any other attach.
+        assert!(handle.send(&Frame::new(0, vec![0xab])).is_ok());
+    }
+
     #[test]
     fn attach_times_out_when_no_reply_arrives() {
         let pty = Pty::new();
-        let err = attach(&pty.path, DEFAULT_BAUD, 4, Duration::from_millis(50)).unwrap_err();
+        let err = attach(&pty.path, DEFAULT_BAUD, 4, Duration::from_millis(50), None).unwrap_err();
         assert_eq!(err, InterfaceError::Timeout);
 
         // Every attempt went out, byte for byte.
@@ -1418,5 +1816,302 @@ mod tests {
         let mut extra = reply.clone();
         extra.push(0x00);
         assert_eq!(parse_assignment_ack(&extra), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Unassigned-device discovery on the shared serial wire
+    // -----------------------------------------------------------------------
+
+    /// A device→host admin answer as a whole unit: the admin reply header,
+    /// then the `KXID` frame carrying [`RESP_NEED_NODEID`], `uuid`, and the
+    /// application byte when there is one.
+    fn admin_answer(uuid: [u8; 6], application: Option<u8>) -> Vec<u8> {
+        let mut body = vec![RESP_NEED_NODEID];
+        body.extend_from_slice(&uuid);
+        body.extend(application);
+        let mut unit = encode_header(ADMIN_REPLY);
+        unit.extend_from_slice(&kxid_unit(&body));
+        unit
+    }
+
+    #[test]
+    fn the_discovery_query_is_the_admin_broadcast_unit() {
+        // The bytes on the wire, exactly: the admin listen id as a VLQ header,
+        // then the `KXID` frame with the query byte, its computed CRC and its
+        // trailer — CAN's broadcast (`0x3f0`, `CMD_QUERY_UNASSIGNED`) carried
+        // inside the stream frame. Only the frame's own trailer is a SYNC.
+        assert_eq!(
+            discovery_query(),
+            [0x87, 0x70, 0x0a, 0x20, 0x4b, 0x58, 0x49, 0x44, 0x00, 0x12, 0xd6, 0x7e]
+        );
+        let unit = discovery_query();
+        assert_eq!(
+            unit.iter().filter(|&&b| b == MESSAGE_SYNC).count(),
+            1,
+            "no interior 0x7e in the header/payload/CRC"
+        );
+    }
+
+    #[test]
+    fn set_node_id_matches_can_s_admin_frame() {
+        // CAN's payload is `[0x01][uuid msb-first][nodeid]`; here the same
+        // payload rides inside the `KXID` stream frame on the admin listen id.
+        assert_eq!(
+            set_node_id_for([0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc], 2)
+                .expect("2 is an addressable id"),
+            [
+                0x87, 0x70, 0x11, 0x20, 0x4b, 0x58, 0x49, 0x44, 0x01, 0x11, 0xaa, 0x22, 0xbb, 0x33,
+                0xcc, 0x02, 0xa0, 0x5e, 0x7e
+            ]
+        );
+    }
+
+    #[test]
+    fn set_node_id_rejects_ids_outside_the_range() {
+        // Zero names no node, and 0x100 is past the last one — neither has an
+        // arbitration id, so neither has a unit.
+        assert_eq!(set_node_id_for([0; 6], 0), None);
+        assert_eq!(set_node_id_for([0; 6], 0x100), None);
+        // The ends of the range do.
+        assert!(set_node_id_for([0; 6], 1).is_some());
+        assert!(set_node_id_for([0; 6], 0xff).is_some());
+    }
+
+    #[test]
+    fn set_node_id_round_trips_a_uuid_containing_sync() {
+        // The protocol allows SYNC in message block content, so a UUID byte of
+        // 0x7e is ordinary content — the frame is delimited by its length
+        // byte, and this golden frame pins that the length is authoritative.
+        assert_eq!(
+            set_node_id_for([0x7e, 0x11, 0x22, 0x33, 0x44, 0x55], 1)
+                .expect("1 is an addressable id"),
+            [
+                0x87, 0x70, 0x11, 0x20, 0x4b, 0x58, 0x49, 0x44, 0x01, 0x7e, 0x11, 0x22, 0x33, 0x44,
+                0x55, 0x01, 0xca, 0xcd, 0x7e
+            ]
+        );
+    }
+
+    #[test]
+    fn an_admin_answer_gives_the_uuid_and_the_application() {
+        let unit = admin_answer([0x11, 0x22, 0x33, 0x44, 0x55, 0x66], Some(0x01));
+        let node = UnassignedNode::from_unit(&unit).expect("this is an answer");
+        assert_eq!(node.uuid, [0x11, 0x22, 0x33, 0x44, 0x55, 0x66]);
+        assert_eq!(node.application, Some(0x01));
+        assert_eq!(node.application_name(), "Klipper");
+
+        // CanBoot answers the same way and names itself.
+        let node = UnassignedNode::from_unit(&admin_answer([0; 6], Some(0x11))).expect("an answer");
+        assert_eq!(node.application_name(), "CanBoot");
+    }
+
+    #[test]
+    fn the_uuid_is_read_most_significant_byte_first() {
+        // The byte right after the response is the most significant one: read
+        // the other way round, the two answers below would collapse.
+        let node = UnassignedNode::from_unit(&admin_answer([0x01, 0, 0, 0, 0, 0], None)).unwrap();
+        assert_eq!(node.uuid, [0x01, 0, 0, 0, 0, 0]);
+
+        let node = UnassignedNode::from_unit(&admin_answer([0, 0, 0, 0, 0, 0x01], None)).unwrap();
+        assert_eq!(node.uuid, [0, 0, 0, 0, 0, 0x01]);
+    }
+
+    #[test]
+    fn an_answer_without_the_application_byte_is_klipper() {
+        let unit = admin_answer([0x11, 0x22, 0x33, 0x44, 0x55, 0x66], None);
+        let node = UnassignedNode::from_unit(&unit).expect("an answer");
+        assert_eq!(node.application, None);
+        assert_eq!(node.application_name(), "Klipper");
+    }
+
+    #[test]
+    fn an_unknown_application_is_named_unknown() {
+        let node = UnassignedNode::from_unit(&admin_answer([0; 6], Some(0x02))).unwrap();
+        assert_eq!(node.application, Some(0x02));
+        assert_eq!(node.application_name(), "Unknown");
+    }
+
+    #[test]
+    fn an_all_zero_uuid_is_still_reported() {
+        // The protocol has no “no UUID programmed” value, so the shape of the
+        // unit is all that is checked, as it is for CAN.
+        let node = UnassignedNode::from_unit(&admin_answer([0; 6], Some(0x01))).unwrap();
+        assert_eq!(node.uuid, [0; 6]);
+        assert_eq!(node.application_name(), "Klipper");
+    }
+
+    #[test]
+    fn a_unit_that_is_not_an_answer_is_rejected() {
+        // The query itself is addressed on the listen id, not the reply id.
+        assert_eq!(UnassignedNode::from_unit(&discovery_query()), None);
+        // A node's own assigned id is not an admin answer either.
+        let mut foreign = encode_header(assign::arb_id(2).unwrap());
+        foreign.extend_from_slice(&kxid_unit(&[RESP_NEED_NODEID, 1, 2, 3, 4, 5, 6, 0x01]));
+        assert_eq!(UnassignedNode::from_unit(&foreign), None);
+        // A truncated header.
+        assert_eq!(UnassignedNode::from_unit(&discovery_query()[..1]), None);
+        // Fewer than six UUID bytes after the response.
+        let mut short = encode_header(ADMIN_REPLY);
+        short.extend_from_slice(&kxid_unit(&[RESP_NEED_NODEID, 1, 2, 3]));
+        assert_eq!(UnassignedNode::from_unit(&short), None);
+        // A wrong sequence byte (with the CRC fixed, so the refusal is the
+        // sequence, as it is for the handshake's ack).
+        let mut bad_seq = admin_answer([0x11; 6], None);
+        bad_seq[MESSAGE_HEADER_SIZE + MESSAGE_POS_SEQ] = 0x10;
+        {
+            let frame = &bad_seq[MESSAGE_HEADER_SIZE..];
+            let len = frame[MESSAGE_POS_LEN] as usize;
+            let crc = crate::crc16_ccitt!(&frame[..len - MESSAGE_TRAILER_SIZE]);
+            bad_seq[MESSAGE_HEADER_SIZE + len - 3] = (crc >> 8) as u8;
+            bad_seq[MESSAGE_HEADER_SIZE + len - 2] = crc as u8;
+        }
+        assert_eq!(UnassignedNode::from_unit(&bad_seq), None);
+        // A response byte that is not RESP_NEED_NODEID.
+        let mut bad_cmd = vec![0x21];
+        bad_cmd.extend_from_slice(&[0x11; 6]);
+        let mut unit_bad_cmd = encode_header(ADMIN_REPLY);
+        unit_bad_cmd.extend_from_slice(&kxid_unit(&bad_cmd));
+        assert_eq!(UnassignedNode::from_unit(&unit_bad_cmd), None);
+        // A bad CRC.
+        let mut bad_crc = admin_answer([0x11; 6], None);
+        let crc_at = bad_crc.len() - 3;
+        bad_crc[crc_at] ^= 0xff;
+        assert_eq!(UnassignedNode::from_unit(&bad_crc), None);
+        // A bad trailer SYNC.
+        let mut bad_trailer = admin_answer([0x11; 6], None);
+        *bad_trailer.last_mut().unwrap() = 0x00;
+        assert_eq!(UnassignedNode::from_unit(&bad_trailer), None);
+        // The length byte claims more bytes than the unit holds: the frame is
+        // not self-consistent, so it is refused rather than guessed at.
+        let mut stretched = admin_answer([0x11; 6], None);
+        stretched[MESSAGE_HEADER_SIZE + MESSAGE_POS_LEN] += 1;
+        assert_eq!(UnassignedNode::from_unit(&stretched), None);
+        // Two application bytes: only one is legal, so this is not an answer.
+        let mut two_app = vec![RESP_NEED_NODEID];
+        two_app.extend_from_slice(&[0x11; 6]);
+        two_app.extend_from_slice(&[0x01, 0x11]);
+        let mut unit_two_app = encode_header(ADMIN_REPLY);
+        unit_two_app.extend_from_slice(&kxid_unit(&two_app));
+        assert_eq!(UnassignedNode::from_unit(&unit_two_app), None);
+    }
+
+    #[test]
+    fn the_scan_deduplicates_a_uuid() {
+        let uuid = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
+        let mut scan = UnassignedScan::new();
+        assert_eq!(
+            scan.feed(&admin_answer(uuid, Some(0x01))).unwrap().uuid,
+            uuid
+        );
+        assert_eq!(
+            scan.feed(&admin_answer(uuid, Some(0x01))),
+            None,
+            "the second frame of a UUID is not news"
+        );
+        assert!(scan.feed(&admin_answer([0xaa; 6], Some(0x11))).is_some());
+        assert_eq!(scan.feed(&discovery_query()), None, "not an answer");
+
+        assert_eq!(scan.total(), 2);
+        assert_eq!(
+            scan.nodes()
+                .iter()
+                .map(|node| node.uuid)
+                .collect::<Vec<_>>(),
+            vec![uuid, [0xaa; 6]],
+            "listed once each, in the order they were first heard"
+        );
+    }
+
+    #[test]
+    fn garbage_without_a_unit_shape_does_not_enter_the_scan() {
+        let mut scan = UnassignedScan::new();
+        // A bare header with no frame, and bytes that never form a unit: the
+        // extractor resynchronises past them, and the scan never lists them.
+        assert_eq!(scan.feed(&encode_header(ADMIN_REPLY)), None);
+        assert_eq!(scan.feed(b"no header here"), None);
+        assert_eq!(scan.total(), 0);
+    }
+
+    /// Drive one scan against a pty and return `(total, reported)`.
+    ///
+    /// The scan runs on the slave side (a real [`SerialDevice`]); the caller's
+    /// `responses` are written on the master once the discovery query has been
+    /// seen, and the helper then waits for the window to close.
+    fn run_scan_on_pty(
+        timeout: Duration,
+        responses: impl FnOnce(&File),
+    ) -> (usize, Vec<UnassignedNode>) {
+        let pty = Pty::new();
+        let device = SerialDevice::open(&pty.path, DEFAULT_BAUD).expect("a pty opens");
+        let handle = thread::spawn(move || {
+            let mut device = device;
+            let mut reported = Vec::new();
+            let total = serial_query_unassigned(&mut device, timeout, |node| reported.push(node))
+                .expect("the pty does not fail");
+            (total, reported)
+        });
+
+        let query = discovery_query();
+        let seen = read_n(&pty.master, query.len());
+        assert_eq!(
+            seen, query,
+            "the scan must send the discovery query verbatim"
+        );
+        responses(&pty.master);
+
+        handle.join().expect("scan thread join")
+    }
+
+    #[test]
+    fn a_scan_collects_one_answer() {
+        let uuid = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
+        let (total, reported) = run_scan_on_pty(Duration::from_millis(500), |master| {
+            master_write(master, &admin_answer(uuid, Some(0x01)));
+        });
+        assert_eq!(total, 1);
+        assert_eq!(reported.len(), 1);
+        assert_eq!(reported[0].uuid, uuid);
+        assert_eq!(reported[0].application_name(), "Klipper");
+    }
+
+    #[test]
+    fn a_scan_collects_two_answers_and_deduplicates() {
+        let uuid = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
+        let (total, reported) = run_scan_on_pty(Duration::from_millis(500), |master| {
+            // The firmware retries its answer, so the same board is heard
+            // again — and a second board answers too.
+            master_write(master, &admin_answer(uuid, Some(0x01)));
+            master_write(master, &admin_answer(uuid, Some(0x01)));
+            master_write(master, &admin_answer([0xaa; 6], Some(0x11)));
+        });
+        assert_eq!(total, 2);
+        assert_eq!(
+            reported.iter().map(|node| node.uuid).collect::<Vec<_>>(),
+            vec![uuid, [0xaa; 6]],
+            "each board once, in the order it was first heard"
+        );
+    }
+
+    #[test]
+    fn a_scan_with_no_answer_finds_nothing() {
+        // The query still goes out; the short window then closes on nothing.
+        let (total, reported) = run_scan_on_pty(Duration::from_millis(150), |_| {});
+        assert_eq!(total, 0);
+        assert!(reported.is_empty());
+    }
+
+    #[test]
+    fn a_scan_ignores_non_admin_units() {
+        // A unit addressed to an assigned node (its own arbitration id, an
+        // ordinary identify frame) sits in front of the answer: the extractor
+        // cuts it whole by its length, and the scan passes it by.
+        let mut regular = encode_header(assign::arb_id(2).unwrap());
+        regular.extend_from_slice(&Frame::encode(1, b"identify"));
+        let (total, reported) = run_scan_on_pty(Duration::from_millis(500), |master| {
+            master_write(master, &regular);
+            master_write(master, &admin_answer([0x11; 6], None));
+        });
+        assert_eq!(total, 1);
+        assert_eq!(reported[0].uuid, [0x11; 6]);
     }
 }

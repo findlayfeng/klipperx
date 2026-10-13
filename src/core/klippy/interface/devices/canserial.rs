@@ -34,10 +34,11 @@
 //! a wire — which is what [`CanbusAdminSocket`] does with the admin broadcast.
 //!
 //! Configuration keys are a different matter: they follow Klipper's `[mcu]`
-//! vocabulary (`canbus_uuid`, `canbus_interface`, and `canbus_nodeid` as Klipper's
-//! own console and `serialhdl.connect_canbus` spell it), because those describe
-//! the printer's wiring rather than this implementation, and a Klipper config
-//! should keep working.
+//! vocabulary (`uuid`, `canbus_interface`, and `canbus_nodeid` as Klipper's
+//! own console and `serialhdl.connect_canbus` spell it — `uuid` is this
+//! crate's canonical name for the key upstream writes `canbus_uuid`), because
+//! those describe the printer's wiring rather than this implementation, and a
+//! Klipper config should keep working.
 
 use crate::core::klippy::assign;
 use crate::core::klippy::config::mcu::MAX_MCU_ID;

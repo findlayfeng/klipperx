@@ -98,10 +98,29 @@ impl SerialDevice {
         self.baud
     }
 
-    /// Assert or deassert RTS on the open port.
+    /// Read raw bytes straight off the open port.
     ///
-    /// Cheetah boards need RTS deasserted for the whole connection, or a reset
-    /// triggers their built-in bootloader (`klippy/mcu.py:703-705`).
+    /// A pass-through to the tty, for a bench tool that wants the byte stream
+    /// rather than reassembled frames ([`Device::receive`]): a discovery scan
+    /// needs the uninterpreted units, admin ids and all. The line is in raw
+    /// mode, so the bytes come back exactly as they arrived; a read blocks at
+    /// most the tty's `VTIME` window and returns `0` when nothing arrived in
+    /// it.
+    pub fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        (&self.port).read(buf)
+    }
+
+    /// Write raw bytes straight to the open port.
+    ///
+    /// A pass-through for the same reason as [`SerialDevice::read`]: a
+    /// discovery scan sends units (header plus `KXID` frame) that are not
+    /// ordinary encoded [`Frame`]s. The tty has no user-space buffering, so a
+    /// write is whole, and raw mode means nothing is translated on the way.
+    pub fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        (&self.port).write(buf)
+    }
+
+    /// Assert or deassert RTS on the open port.
     ///
     /// # Errors
     /// Returns [`InterfaceError`] if the kernel rejects the ioctl.
@@ -117,6 +136,23 @@ impl fmt::Debug for SerialDevice {
             .field("baud", &self.baud)
             .field("stopped", &self.stopped.load(Ordering::Relaxed))
             .finish_non_exhaustive()
+    }
+}
+
+impl std::io::Read for SerialDevice {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        SerialDevice::read(self, buf)
+    }
+}
+
+impl std::io::Write for SerialDevice {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        SerialDevice::write(self, buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        // The tty has no user-space buffering, so there is nothing to flush.
+        Ok(())
     }
 }
 
@@ -372,6 +408,35 @@ mod tests {
         let mut buf = [0u8; 64];
         let read = (&pty.master).read(&mut buf).unwrap();
         assert_eq!(&buf[..read], Frame::encode(3, &[1, 2, 3]));
+    }
+
+    #[test]
+    fn test_raw_read_and_write_pass_through_to_the_port() {
+        // The discovery scan drives the port through these raw read/write
+        // methods rather than through the Device trait, so the pass-through has
+        // to move bytes both ways as-is, in raw mode.
+        let pty = Pty::new();
+        let mut device = SerialDevice::open(&pty.path, DEFAULT_BAUD).unwrap();
+
+        device.write(b"ping").unwrap();
+        let mut buf = [0u8; 8];
+        let mut seen = 0;
+        while seen < 4 {
+            let read = (&pty.master).read(&mut buf[seen..]).unwrap();
+            assert_ne!(read, 0, "the pty master closed");
+            seen += read;
+        }
+        assert_eq!(&buf[..seen], b"ping");
+
+        (&pty.master).write_all(b"pong").unwrap();
+        let mut out = [0u8; 8];
+        let mut got = 0;
+        while got < 4 {
+            let read = device.read(&mut out[got..]).unwrap();
+            assert_ne!(read, 0, "the read window elapsed before the bytes");
+            got += read;
+        }
+        assert_eq!(&out[..got], b"pong");
     }
 
     #[test]

@@ -4,4 +4,5 @@ pub mod core;
 mod hardware_test;
 pub mod klippy;
 pub mod logging;
+pub mod serialscan;
 pub mod stress;

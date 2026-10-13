@@ -125,6 +125,17 @@ enum Commands {
     // `arg_required_else_help`, unlike `stress`: every argument has a default, so
     // naming it alone is an instruction — scan `can0` for two seconds.
     CanbusScan(klipperx::canbus::CanbusScanArgs),
+
+    /// List the boards on a serial port that have no node id yet
+    //
+    // A bench tool, not part of the host: it needs no config file, and the
+    // query it sends changes no board's state — the UUIDs it prints are what a
+    // `[mcu]` section then names in `uuid`. The port has no default, so this
+    // subcommand does not get the no-arg `arg_required_else_help` courtesy: a
+    // bare `serial-scan` is a missing argument, not an instruction. (The scan
+    // window and the line speed, which do default, are the subcommand's own
+    // options.)
+    SerialScan(klipperx::serialscan::SerialScanArgs),
 }
 
 fn main() {
@@ -138,6 +149,7 @@ fn main() {
         (Some(Commands::Console(args)), _) => client::run_console(args).map(|()| 0),
         (Some(Commands::Stress(args)), _) => klipperx::stress::run(args).map(|()| 0),
         (Some(Commands::CanbusScan(args)), _) => klipperx::canbus::run(args).map(|()| 0),
+        (Some(Commands::SerialScan(args)), _) => klipperx::serialscan::run(args).map(|()| 0),
         // No subcommand: the arguments were the host's all along.
         (None, host) => run_host(host),
     };
@@ -508,5 +520,45 @@ mod tests {
         let help = error.to_string();
         assert!(help.contains("--interface"), "{help}");
         assert!(help.contains("--timeout"), "{help}");
+    }
+
+    #[test]
+    fn test_the_serial_scan_subcommand_and_its_options() {
+        // All three options are the subcommand's own and default sensibly: the
+        // port has no default, the window is the CAN scan's two seconds, and
+        // the line speed is the usual 250000.
+        let cli = parse(&[
+            "serial-scan",
+            "--port",
+            "/dev/ttyACM0",
+            "--timeout",
+            "1.5",
+            "--baud",
+            "115200",
+        ])
+        .expect("all three options parse");
+        match cli.command {
+            Some(Commands::SerialScan(args)) => {
+                assert_eq!(args.port, "/dev/ttyACM0");
+                assert_eq!(args.timeout, Some(1.5));
+                assert_eq!(args.baud, Some(115200));
+            }
+            other => panic!("expected `serial-scan`, got {other:?}"),
+        }
+
+        // A bare `serial-scan` is a missing argument: the port cannot default.
+        assert!(parse(&["serial-scan"]).is_err());
+
+        // Found by reading `--help`, like the other bench tools: the top level
+        // lists the subcommand, and the subcommand's own help names its options.
+        let error = parse(&["--help"]).expect_err("the help is not a command line");
+        let help = error.to_string();
+        assert!(help.contains("serial-scan"), "{help}");
+
+        let error = parse(&["serial-scan", "--help"]).expect_err("the help is not a scan");
+        let help = error.to_string();
+        assert!(help.contains("--port"), "{help}");
+        assert!(help.contains("--timeout"), "{help}");
+        assert!(help.contains("--baud"), "{help}");
     }
 }

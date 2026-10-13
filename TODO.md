@@ -111,7 +111,7 @@ H1–H12 是上游 extras 里按域归并的消费者（2026-09-21 全量盘点�
 | # | 事项 | 依赖 |
 |---|---|---|
 | M1 | 桥下游**端口模块化**与**没有 admin 通道的设备**共存：端口按 `[uart_device]`/`[can_device]` 定义、子设备引用端口节名，归属由主机经桥自己的 admin 通道告知桥（分六期：P1 配置面 → P2 固件端口表+端口级命令 → P3 attach 端到端 → P4 判定与传输正交 → P5 CAN 上游/复位） | 见笔记 |
-| M2 | 通过 **admin 流程复位固件**（per-device reset；今天的复位只有线级手段，共享路径被强制成 `command`）——与 M1 的 §5 P5 对接（复用端口级命令与端口 `index`） | M1 |
+| M2 | 通过 **admin 流程复位固件**（per-device reset；今天的复位只有线级手段，共享路径被强制成 `command`）——**并入 M1 一起做**：固件命令族落 **P2**（与 `SET_PORT_NODEID` 同机制）、主机侧 `restart_method` 接入落 **P3** | M1 |
 
 > 判为**不适用**、不进待办的上游模块：`garbage_collection.py`（Python GC 调优）、
 > `aio_executor.py`（Python 线程池）、`parsedump.py`（离线开发工具）、
@@ -365,25 +365,15 @@ endstop 资源（`mcu/resource/endstop.rs`，含 `minclock` 门控与 `home_wait
 admin 通道**用端口级命令 `SET_PORT_NODEID(index, id)` 告知桥，**下游设备完全不参与**——这就是
 "与没有 admin 的设备共存"的答案。**依赖**：无（P1 可先做）；**状态**：已定案、尚未开工（现状见笔记 §6）。
 
-### M2 通过 **admin 流程复位固件**（per-device reset）
+### M2 通过 **admin 流程复位固件**（per-device reset）——已并入 M1
 
-今天的复位只有**线级**手段（`restart_method`：`arduino` 的 DTR、`cheetah` 的 RTS、`rpi_usb` 切电），
-在共享/mux 路径上会打断**整条线上的所有 MCU**，所以配置层把共享路径**强制成 `command`**
-（`mcu/restart.rs`）。而 `command` 只是让固件重进调度/清 shutdown，**不是真复位**。
+设计与分期见 [M1 笔记](docs/work-log/2026-10-13-bridge-port-notes.md)：复位与端口级命令是**同一套机制**
+（都分"面向设备"与"面向端口/桥"两条），固件命令族落 **§5 P2**（与 `SET_PORT_NODEID` 同期，共用
+`KXID` 帧形与端口 `index`），主机侧 `restart_method` 接入落 **§5 P3**。开工时再定的点见笔记 §5.6(d)。
 
-要定的：在 admin 信道上加一条**点名让某台设备复位自己**的命令（帧形沿用 `KXID` 伪帧的
-`[cmd][args…]`；CAN 侧已有 `CMD_REQUEST_BOOTLOADER = 0x02` 与 `SET_KLIPPER_NODEID = 0x01` 两条
-先例），设备半在自己的 admin 收听后执行；主机侧把它接进 `restart_method`（新增一种，或让共享路径
-内部改走它）。要明确：① 复位到哪一层（重进 `sched_main` / 清 shutdown / 真复位 MCU / 进
-bootloader）；② 幂等与回执（现在的 admin 流程**没有**回执，主机如何确认复位已发生）；
-③ 旧固件降级（不答 admin 的设备只能继续 `command`）。
-
-与 M1 对接：复位命令族要与端口模块化的"面向设备 vs 面向端口/桥"两条分开（见
-[M1 笔记](docs/work-log/2026-10-13-bridge-port-notes.md) §5 P5），端口级复位复用端口的 `index`。
-
-相关：`third_party/klipper/src/{mux.{c,h},generic/canserial.{c,h}}`、`mcu/restart.rs`、
-`docs/klippy/developer-manual/serial-mux-protocol.md` 的 admin 命令族表、
-`docs/klippy/user-manual/mcu-connection.md` 的 `restart_method` 行。
+范围一句话：今天的复位只有线级手段（`arduino` 的 DTR、`cheetah` 的 RTS、`rpi_usb` 切电），在共享/mux
+路径上会打断整条线因而被配置层强制成 `command`，而 `command` 不是真复位；目标是让"点名复位某台设备"
+（或由桥替它做线级复位）成为可能，**无 uuid 的 legacy 设备只能走"桥替它做"**那条。
 
 ## 上游 extras 覆盖盘点
 

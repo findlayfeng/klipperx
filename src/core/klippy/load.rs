@@ -404,6 +404,12 @@ mod tests {
                 // The force-move helper, before every section that builds a
                 // stepper (`force_move` is created on first stepper load).
                 "force_move",
+                // The bridge downstream port sections (`mcu/bridge_ports.rs`,
+                // order 19): after `[mcu]` — though nothing here looks an MCU
+                // object up — and before the extras block; sorted by name
+                // within their `order` group.
+                "can_device",
+                "uart_device",
                 "adc_scaled",
                 "extruder",
                 "extruder_stepper",

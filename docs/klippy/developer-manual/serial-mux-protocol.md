@@ -17,7 +17,10 @@
 > 否则 = 原始帧），未分配时答扫描、按 `0x01` 采纳 node id、被指派到已持有的 id 时照 CAN 的
 > `can_id_conflict` 弃号并 `shutdown`；已采纳 id 后自己发出的帧带应答头。`src/bridge.c`
 > （`CONFIG_BRIDGE`）有**桥半**：端口表、`uuid → 端口` 与 `id → 端口` 两张路由表、admin 扇出
-> （上游广播原样下达、下游应答**逐条**上行、不合并）、单设备路径**剥头/加头**。host 库还有
+> （上游广播原样下达、下游应答**逐条**上行、不合并）、单设备路径**剥头/加头**；**M1-P2 起**
+> 又加上**端口级命令族**（`SET_PORT_NODEID`/`RESET_DEVICE`/`RESET_PORT`，面向桥自己、无回执，
+> 见下节「端口级命令族」）与 **identify 字典的端口表**（`BRIDGE_PORT*` 键），「单设备」由主机
+> 下发的 `flags` 运行期告知而非编译期标志。host 库还有
 > **下游串口端口**与 **unit 收发接口**（`klipper_host_input_unit`/`klipper_host_output_unit`，
 > 需帧接口开关**且**桥模式）。
 >
@@ -138,6 +141,9 @@ CAN 侧的同族常量在 `canserial.rs`。
 |-----------|------|------|------|
 | `QUERY_UNASSIGNED` | `0x00` | 主机 → 全部 | `[头(0x3f0)][len][0x20]["KXID"][0x00][crc16][0x7e]`（`discovery_query()`） |
 | `SET_KLIPPER_NODEID` | `0x01` | 主机 → 点名 | `[头(0x3f0)][len][0x20]["KXID"][0x01][uuid 大端 6 字节][nodeid][crc16][0x7e]`（`set_node_id_for(uuid, id)`，id 越界返回 `None`，校验同 CAN） |
+| `RESET_DEVICE` | `0x02` | 主机 → 桥 → 单口 | `[头(0x3f0)][len][0x20]["KXID"][0x02][index][crc16][0x7e]`（M1-P2；对照 CAN `CMD_REQUEST_BOOTLOADER` 同值同义，见下节） |
+| `SET_PORT_NODEID` | `0x03` | 主机 → 桥自己 | `[头(0x3f0)][len][0x20]["KXID"][0x03][index][id][flags][crc16][0x7e]`（`set_port_node_id(index, id, flags)`，见下节） |
+| `RESET_PORT` | `0x04` | 主机 → 桥自己 | `[头(0x3f0)][len][0x20]["KXID"][0x04][index][crc16][0x7e]`（M1-P2，见下节） |
 | `NEED_NODEID` | `0x20` | 设备 → 主机 | `[头(0x3f1)][len][0x20]["KXID"][0x20][uuid 大端 6 字节][app?][crc16][0x7e]`（`UnassignedNode::from_unit`） |
 
 - uuid **高位字节在前**；应答末尾可带一枚 application 字节：无字节或 `0x01` = Klipper、
@@ -174,6 +180,31 @@ admin 信道，`mux_unit()` 决定归属）。**注意两条不同的寻址**：
 - 冲突处理留固件端：串口没有 CAN 的总线仲裁，同一根线上多板同时应答会撞字节——由固件
   结合物理接口避免或重试；主机侧只做单次广播 + 截止窗口 + uuid 去重，不重发。
 
+### 端口级命令族（M1-P2 已落地，固件 `src/bridge.c`、主机 builder 在 `serial.rs`）
+
+命令同样走 `0x3f0` 的 `KXID` 伪帧，但**面向桥自己**——桥是端口的拥有者，主机把「哪个 id 的设备
+在哪条端口上」直接告诉桥，**下游设备全程不参与、不答任何 admin**（这就是「与没有 admin 的设备
+共存」的机制）。全部**无回执**、参数不足/越界**静默丢弃**；除 `RESET_DEVICE` 外**不下发任何
+下游端口**（桥的 admin 处理函数以「是否消费」返回值短路本机设备半，`0x00`/`0x01` 的行为与扇出
+逐位不变）。
+
+| 命令 | 载荷 | 语义 |
+|------|------|------|
+| `SET_PORT_NODEID` | `[0x03][index][id][flags]`（4 字节） | 桥建 `id → 端口` 表并记该口 `flags`。`index` 0 起（对应 identify 字典端口表 `BRIDGE_PORT<n>_` 的下标）；`id` = MCU 层 id（`1..=255`，`mux_arb_id(id)!=0`）；`flags` bit0=`MUX_PORT_UNITS`（`0x01`）：置位 = 该口设备**说单元**（收发整单元原样转发）；清零 = **legacy**（下行剥头、上行按该口记的 id 加应答头）；保留位忽略。**幂等**：重复发送 = 覆盖同值 |
+| `RESET_DEVICE` | `[0x02][index]` | 桥**只**转发到 `index` 口（UNITS 口带头转发、legacy 口剥头转发——legacy 设备的解析器会拒 seq `0x20`，属预期：无 admin 的 legacy 口只能走 `RESET_PORT`），不扇出全体、不触发本机设备半；无桥的板（纯 mux 构建）由设备半自己执行（照 `canserial.c` 的 `can_process_request_bootloader` 模式，`CONFIG_HAVE_BOOTLOADER_REQUEST` 守卫，index 字节设备忽略） |
+| `RESET_PORT` | `[0x04][index]` | 桥消费后对 `index` 口做**线级复位**：经 `bridge_port_ops.reset` 钩子（NULL=不支持 → 静默）；host 侧实现为 DTR\|RTS 断言 250 ms 的脉冲，用任务循环 idle 处的 poll 状态机延迟恢复（不阻塞不忙等；pty 等无 modem 线的 fd 返回 -1 静默） |
+
+**identify 字典的端口表**（仅桥构建出现，键名钉死供主机断言）：`BRIDGE_PORT_COUNT`（端口数）、
+`BRIDGE_PORT<n>_NAME`（该口 oid 名，host 串口为 `"uart0"`）、`BRIDGE_PORT<n>_TYPE`（`"uart"`）、
+`BRIDGE_PORT<n>_PATH`（诊断用，`CONFIG_HOST_BRIDGE_SERIAL_PATH` 的值）。`SET_PORT_NODEID` 里的
+`index` 就是这张表的下标；表随 arch 编译期声明，多端口/其他 arch 后端出现时按同样形状扩展
+（`BRIDGE_PORT<n>_*`）。
+
+**两级寻址**：第一级是「主机 ↔ 桥」——桥在上游链路上有自己的 mux id（或 host 库身份），命令走
+admin id `0x3f0`；第二级是「桥 ↔ 下游某口的设备」——用 `SET_PORT_NODEID` 登记的 `id → 端口`
+映射，数据单元按同一套 `0x100+2*id` 头路由到口（`bridge_route_unit`），口上再按该口的 `flags`
+决定剥/加头。两级互不相干：第一级寻址不需要知道下游有哪些设备，下游也不需要 admin 能力。
+
 ## 主机侧的行为约定
 
 - **端口只开一次**：按 `serial:` 路径复用（`Weak` 注册表），第二颗 MCU 只是 attach 到同一个
@@ -208,7 +239,8 @@ CAN 不需要这套东西：总线自带仲裁 id 与硬件过滤，每颗 MCU �
 - **host 模式的数据面**：unit 接口已定义、固件也已按单元发出自己的帧，但**主机侧（klippyx）还没
   改用它**——`HostDevice` 仍走字节流/整帧。**分配段（扫描、`SET_NODEID`、重确认握手）走字节流
   这条已经通了**：mux 路径的真端到端 attach 就是走它。
-- **多下游端口**：端口表支持多条，但今天只登记一条（host 那条 tty），多端口扇出与"某单元属于
-  哪个端口"的归属策略尚未被测过。
+- **多下游端口**：端口表支持多条，但今天只登记一条（host 那条 tty），多端口扇出尚未被测过。
+  「某单元属于哪个端口」的归属策略**已由主机侧命令落地并被探针钉住**（`SET_PORT_NODEID` 建
+  `id → 端口` 表，见上节；真库探针见[测试](testing.md)），余项只是多端口硬件本身。
 - **host 侧读端口的时机**：`bridge_poll()` 插在任务循环的睡眠处（`src/host/timer.c` 的
   `irq_wait()`），不额外起线程；代价是下游字节要等任务循环醒着时才被捡起。

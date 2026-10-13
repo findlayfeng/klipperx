@@ -5,7 +5,7 @@
 //! |---|---|---|
 //! | [`serial`] | a tty | `serial:` |
 //! | [`shared_serial`] | a tty shared by several MCUs | — |
-//! | [`canserial`] | Klipper's can-serial link | `canbus_uuid:` |
+//! | [`canserial`] | Klipper's can-serial link | `uuid:` |
 //! | [`host`] | Klipper's host library | `host_library:` |
 //! | `frame_mock` | a frame-level mock (test builds only) | — |
 //! | `simulator` | a dictionary-driven fake MCU (test builds only) | `test: dict=` |

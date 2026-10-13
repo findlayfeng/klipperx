@@ -81,8 +81,11 @@ pub enum Transport {
     Simulator(String),
 }
 
-/// Parse Klipper's `canbus_uuid`: six bytes as twelve hex digits.
-fn parse_canbus_uuid(text: &str) -> Result<[u8; 6], String> {
+/// Parse a CAN uuid: six bytes as twelve hex digits.
+///
+/// The canonical key is `uuid:`; `canbus_uuid:` is the older name the option
+/// still loads under (a config written for Klipper keeps working).
+fn parse_uuid(text: &str) -> Result<[u8; 6], String> {
     let text = text.trim();
     if text.len() != 12 {
         return Err(format!("expected 12 hex digits, got {}", text.len()));
@@ -97,15 +100,19 @@ fn parse_canbus_uuid(text: &str) -> Result<[u8; 6], String> {
 
 /// The connection keys a `[mcu]` section may carry, in the order errors list
 /// them. Exactly one of them names the transport, the way Klipper's own `[mcu]`
-/// works (`serial` or `canbus_uuid`): see [`McuConfig::create_interface`].
+/// works (`serial` or `uuid`): see [`McuConfig::create_interface`].
+///
+/// `uuid` is the canonical CAN key and `canbus_uuid` its backwards-compatible
+/// alias (a config written for Klipper keeps loading); both count as a CAN
+/// interface key, so neither can trip the unused-option check on its own.
 ///
 /// `test` exists in test builds only — the `upstream` harness uses
 /// `test: dict=<path>` to inject a dictionary-driven fake MCU.
 fn interface_keys() -> &'static [&'static str] {
     #[cfg(test)]
-    return &["host_library", "serial", "canbus_uuid", "test"];
+    return &["host_library", "serial", "uuid", "canbus_uuid", "test"];
     #[cfg(not(test))]
-    return &["host_library", "serial", "canbus_uuid"];
+    return &["host_library", "serial", "uuid", "canbus_uuid"];
 }
 
 /// The upper bound of an MCU-layer id.
@@ -142,11 +149,11 @@ impl McuConfig {
     ///
     /// ```ini
     /// [mcu]
-    /// canbus_uuid: 11aa22bb33cc
+    /// uuid: 11aa22bb33cc
     /// canbus_interface: can0
     ///
     /// [mcu bed]
-    /// canbus_uuid: 44dd55ee66ff
+    /// uuid: 44dd55ee66ff
     /// canbus_nodeid: 2
     /// ```
     ///
@@ -340,6 +347,17 @@ impl McuConfig {
     /// a preference order, so it is reported rather than resolved silently. Every
     /// check lives here; [`Transport::open`] only performs the side effects.
     fn transport_for(section: &ConfigWrapper) -> Result<Transport, ConfigError> {
+        // `uuid` is the canonical key; `canbus_uuid` is its earlier name and
+        // still loads (a config written for Klipper keeps working). Writing both
+        // names the uuid twice, so it is a conflict reported up front with the
+        // canonical name first — just as two different transports are.
+        if section.has("uuid") && section.has("canbus_uuid") {
+            return Err(ConfigError::new(format!(
+                "MCU '{}' sets both uuid and canbus_uuid",
+                section.identifier()
+            )));
+        }
+
         let requested: Vec<&str> = interface_keys()
             .iter()
             .copied()
@@ -353,10 +371,13 @@ impl McuConfig {
             )));
         }
 
-        if let Some(text) = section.get_str("canbus_uuid") {
-            let uuid = parse_canbus_uuid(&text).map_err(|e| {
+        if let Some(text) = section
+            .get_str("uuid")
+            .or_else(|| section.get_str("canbus_uuid"))
+        {
+            let uuid = parse_uuid(&text).map_err(|e| {
                 ConfigError::new(format!(
-                    "MCU '{}' has an invalid canbus_uuid: {e}",
+                    "MCU '{}' has an invalid uuid: {e}",
                     section.identifier()
                 ))
             })?;
@@ -372,7 +393,7 @@ impl McuConfig {
 
         if section.has("canbus_nodeid") || section.has("canbus_interface") {
             return Err(ConfigError::new(format!(
-                "MCU '{}' needs a canbus_uuid to go with its CAN settings",
+                "MCU '{}' needs a uuid to go with its CAN settings",
                 section.identifier()
             )));
         }
@@ -406,10 +427,10 @@ impl McuConfig {
         }
 
         let how = if cfg!(test) {
-            "set host_library: <libklipper_host.so>, serial: <tty>, canbus_uuid: <hex>, \
+            "set host_library: <libklipper_host.so>, serial: <tty>, uuid: <hex>, \
              or test: dict=<dictionary>"
         } else {
-            "set host_library: <libklipper_host.so>, serial: <tty>, or canbus_uuid: <hex>"
+            "set host_library: <libklipper_host.so>, serial: <tty>, or uuid: <hex>"
         };
         Err(ConfigError::new(format!(
             "MCU '{}' needs an interface: {how}",
@@ -713,7 +734,7 @@ mod tests {
 
     /// A CAN section, with `overrides` on top of a complete one.
     fn can_section(overrides: &[(&str, &str)]) -> ConfigSection {
-        let mut section = section_with("canbus_uuid", "11aa22bb33cc");
+        let mut section = section_with("uuid", "11aa22bb33cc");
         section.parameters.insert(
             "canbus_nodeid".to_string(),
             ConfigValue::Single("2".to_string()),
@@ -743,19 +764,52 @@ mod tests {
     }
 
     #[test]
-    fn test_canbus_uuid_is_parsed_as_klipper_writes_it() {
+    fn test_uuid_is_parsed_as_klipper_writes_it() {
         assert_eq!(
-            parse_canbus_uuid("11aa22bb33cc").unwrap(),
+            parse_uuid("11aa22bb33cc").unwrap(),
             [0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc]
         );
         for bad in ["11aa22bb33c", "11aa22bb33ccdd", "11aa22bb33cg", ""] {
-            let section = can_section(&[("canbus_uuid", bad)]);
+            let section = can_section(&[("uuid", bad)]);
             let err = McuConfig::new(&wrap(&section)).unwrap_err();
-            assert!(
-                err.to_string().contains("invalid canbus_uuid"),
-                "{bad}: {err}"
-            );
+            assert!(err.to_string().contains("invalid uuid"), "{bad}: {err}");
         }
+    }
+
+    /// The old spelling of the key still loads, aliased to the same transport:
+    /// a config written for Klipper's `canbus_uuid` parses to exactly the
+    /// `Transport::Can` that `uuid:` would give it.
+    #[test]
+    fn test_aliased_canbus_uuid_still_becomes_the_can_transport() {
+        let mut section = section_with("canbus_uuid", "11aa22bb33cc");
+        section.parameters.insert(
+            "canbus_interface".to_string(),
+            ConfigValue::Single("can98".to_string()),
+        );
+        let config = McuConfig::new(&wrap(&section)).unwrap();
+        assert!(matches!(
+            config.transport,
+            Transport::Can {
+                ref interface,
+                uuid,
+            } if interface == "can98" && uuid == [0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc]
+        ));
+    }
+
+    /// Both spellings in one section name the uuid twice; the canonical key
+    /// leads the error.
+    #[test]
+    fn test_uuid_and_its_alias_together_are_rejected() {
+        let mut section = section_with("uuid", "11aa22bb33cc");
+        section.parameters.insert(
+            "canbus_uuid".to_string(),
+            ConfigValue::Single("44dd55ee66ff".to_string()),
+        );
+        let err = McuConfig::new(&wrap(&section)).unwrap_err();
+        assert!(
+            err.to_string().contains("both uuid and canbus_uuid"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -793,7 +847,7 @@ mod tests {
 
     #[test]
     fn test_canbus_nodeid_is_optional_and_left_for_the_allocator() {
-        let mut section = section_with("canbus_uuid", "11aa22bb33cc");
+        let mut section = section_with("uuid", "11aa22bb33cc");
         // No `canbus_nodeid`: parsing knows no id; the allocator fills one in at
         // load (`mcu/ids.rs`), and `connect` puts it on the config before the
         // link is opened.
@@ -816,11 +870,11 @@ mod tests {
     fn test_canbus_settings_without_a_uuid_are_reported() {
         let section = section_with("canbus_nodeid", "2");
         let err = McuConfig::new(&wrap(&section)).unwrap_err();
-        assert!(err.to_string().contains("needs a canbus_uuid"), "{err}");
+        assert!(err.to_string().contains("needs a uuid"), "{err}");
 
         let section = section_with("canbus_interface", "can0");
         let err = McuConfig::new(&wrap(&section)).unwrap_err();
-        assert!(err.to_string().contains("needs a canbus_uuid"), "{err}");
+        assert!(err.to_string().contains("needs a uuid"), "{err}");
     }
 
     #[test]

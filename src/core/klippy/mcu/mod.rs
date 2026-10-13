@@ -5344,10 +5344,7 @@ mod tests {
             Ok(())
         );
         // … and over CAN. Either interface is a reachable MCU.
-        assert_eq!(
-            check(&parse("[mcu]\ncanbus_uuid: abc123\n"), &requires),
-            Ok(())
-        );
+        assert_eq!(check(&parse("[mcu]\nuuid: abc123\n"), &requires), Ok(()));
 
         // No `[mcu]` section at all.
         assert_eq!(

@@ -55,7 +55,7 @@ pub struct Interface {
 /// - `SharedSerial(SharedSerialHandle)` — one MCU's handle on a tty two or more
 ///   MCUs share (`serial:` named by several `[mcu]` sections)
 /// - `CanSerial(CanSerialDevice)` — a real MCU reached over CAN, using Klipper's
-///   can-serial link (`canbus_uuid:` + `canbus_interface:`; `canbus_nodeid:` is
+///   can-serial link (`uuid:` + `canbus_interface:`; `canbus_nodeid:` is
 ///   the Klipper-named key that explicitly overrides the MCU's layer id)
 /// - `Host(HostDevice)` — klipper's host library, loaded from a shared object
 ///   (`host_library:`)

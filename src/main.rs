@@ -121,7 +121,7 @@ enum Commands {
     //
     // A bench tool, not part of the host: it needs no config file, and the query
     // it sends is a broadcast that changes no board's state — the UUIDs it prints
-    // are what a `[mcu]` section then names in `canbus_uuid`. No
+    // are what a `[mcu]` section then names in `uuid`. No
     // `arg_required_else_help`, unlike `stress`: every argument has a default, so
     // naming it alone is an instruction — scan `can0` for two seconds.
     CanbusScan(klipperx::canbus::CanbusScanArgs),

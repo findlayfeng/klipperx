@@ -82,8 +82,7 @@ const NODEID_FIRST: u32 = 4;
 #[derive(Default)]
 struct State {
     /// uuid → assigned id. A CAN MCU is keyed by its uuid because a duplicate
-    /// `canbus_uuid` is upstream's error, and the id must be stable per uuid
-    /// within a run.
+    /// uuid is a config error, and the id must be stable per uuid within a run.
     by_uuid: HashMap<[u8; 6], u32>,
     /// id → owning mcu name. A second explicit `canbus_nodeid` landing on a
     /// taken one is a config error that names both.
@@ -135,8 +134,8 @@ impl McuIds {
     /// through `get_str`/`get_int`: those record the option as read, which
     /// would exempt `canbus_nodeid` from
     /// [`check_unused`](crate::core::klippy::config::check_unused) and let a
-    /// config that has CAN options without a `canbus_uuid` — a serial `[mcu]`
-    /// that also writes `canbus_nodeid`, say — pass silently. The option stays
+    /// config that has CAN options without a `uuid` — a serial `[mcu]` that
+    /// also writes `canbus_nodeid`, say — pass silently. The option stays
     /// unread here; the section's own factory reads and validates what it
     /// means. A value that does not parse or is outside Klipper's node-id range
     /// is ignored for the same reason: that section's factory reports it.
@@ -184,10 +183,11 @@ impl McuIds {
     /// Register a CAN MCU: `uuid`, with an optional explicit `canbus_nodeid`.
     ///
     /// # Errors
-    /// Upstream's `Duplicate canbus_uuid` when the uuid already registered
-    /// (`canbus_ids.py:15`), or a config error naming both MCUs when the
-    /// explicit id is already taken (by another explicit id; an auto id steps
-    /// over it) or when the id range is exhausted.
+    /// The duplicate-uuid error when the uuid already registered — upstream
+    /// spells it `Duplicate canbus_uuid` (`canbus_ids.py:15`), this crate's
+    /// message is reworded to its `uuid` key — or a config error naming both
+    /// MCUs when the explicit id is already taken (by another explicit id; an
+    /// auto id steps over it) or when the id range is exhausted.
     pub fn register_can(
         &self,
         name: &str,
@@ -207,7 +207,7 @@ impl McuIds {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(uuid) = uuid {
             if state.by_uuid.contains_key(&uuid) {
-                return Err(ConfigError::new("Duplicate canbus_uuid".to_string()));
+                return Err(ConfigError::new("Duplicate uuid".to_string()));
             }
         }
         let new_id = match explicit {
@@ -373,13 +373,14 @@ mod tests {
         assert!(text.contains("mcu b"), "{text}");
     }
 
-    /// Registering a uuid twice is upstream's error, word for word.
+    /// Registering a uuid twice is upstream's error, reworded to this crate's
+    /// key name.
     #[test]
     fn a_duplicate_uuid_is_rejected_with_upstreams_message() {
         let ids = McuIds::new();
         ids.register_can("mcu", A, None).unwrap();
         let err = ids.register_can("mcu other", A, None).unwrap_err();
-        assert_eq!(err.to_string(), "Duplicate canbus_uuid");
+        assert_eq!(err.to_string(), "Duplicate uuid");
     }
 
     /// A non-CAN MCU takes ids from the **same** sequence as CAN: the two kinds
@@ -438,11 +439,11 @@ mod tests {
     #[test]
     fn a_config_assigns_ids_in_declaration_order() {
         let (printer, result) = load(
-            "[mcu]\ncanbus_uuid: 11aa22bb33cc\n\
-             [mcu tool]\ncanbus_uuid: 0a0b0c0d0e0f\n\
-             [mcu bed]\ncanbus_uuid: 010203040506\n",
+            "[mcu]\nuuid: 11aa22bb33cc\n\
+             [mcu tool]\nuuid: 0a0b0c0d0e0f\n\
+             [mcu bed]\nuuid: 010203040506\n",
         );
-        result.expect("a canbus_uuid alone is enough");
+        result.expect("a uuid alone is enough");
         assert_eq!(assigned_id(&printer, "mcu"), 4);
         assert_eq!(assigned_id(&printer, "mcu tool"), 5);
         assert_eq!(assigned_id(&printer, "mcu bed"), 6);
@@ -454,8 +455,8 @@ mod tests {
     #[test]
     fn a_config_honours_an_explicit_nodeid() {
         let (printer, result) = load(
-            "[mcu]\ncanbus_uuid: 11aa22bb33cc\ncanbus_nodeid: 9\n\
-             [mcu tool]\ncanbus_uuid: 0a0b0c0d0e0f\n",
+            "[mcu]\nuuid: 11aa22bb33cc\ncanbus_nodeid: 9\n\
+             [mcu tool]\nuuid: 0a0b0c0d0e0f\n",
         );
         result.expect("explicit and auto ids do not collide here");
         assert_eq!(assigned_id(&printer, "mcu"), 9);
@@ -469,8 +470,8 @@ mod tests {
     #[test]
     fn an_explicit_nodeid_is_honoured_whatever_the_declaration_order() {
         let (printer, result) = load(
-            "[mcu]\ncanbus_uuid: 11aa22bb33cc\n\
-             [mcu tool]\ncanbus_uuid: 0a0b0c0d0e0f\ncanbus_nodeid: 5\n",
+            "[mcu]\nuuid: 11aa22bb33cc\n\
+             [mcu tool]\nuuid: 0a0b0c0d0e0f\ncanbus_nodeid: 5\n",
         );
         result.expect("the explicit claim is reserved before ids are handed out");
         assert_eq!(assigned_id(&printer, "mcu"), 4);
@@ -478,8 +479,8 @@ mod tests {
 
         // The same two sections, in the other order, get the same ids.
         let (printer, result) = load(
-            "[mcu tool]\ncanbus_uuid: 0a0b0c0d0e0f\ncanbus_nodeid: 5\n\
-             [mcu]\ncanbus_uuid: 11aa22bb33cc\n",
+            "[mcu tool]\nuuid: 0a0b0c0d0e0f\ncanbus_nodeid: 5\n\
+             [mcu]\nuuid: 11aa22bb33cc\n",
         );
         result.expect("the explicit claim is reserved before ids are handed out");
         assert_eq!(assigned_id(&printer, "mcu"), 4);
@@ -494,8 +495,8 @@ mod tests {
     #[test]
     fn an_explicit_claim_is_reserved_before_an_earlier_auto_id() {
         let (printer, result) = load(
-            "[mcu b]\ncanbus_uuid: 0a0b0c0d0e0f\n\
-             [mcu a]\ncanbus_uuid: 11aa22bb33cc\ncanbus_nodeid: 4\n",
+            "[mcu b]\nuuid: 0a0b0c0d0e0f\n\
+             [mcu a]\nuuid: 11aa22bb33cc\ncanbus_nodeid: 4\n",
         );
         result.expect("the early prefix takes the id the later claim left free");
         assert_eq!(assigned_id(&printer, "mcu b"), 5);
@@ -506,8 +507,8 @@ mod tests {
         // on its own it does **not** discriminate the pre-scan (the explicit
         // section now registers first), only the half above does.
         let (printer, result) = load(
-            "[mcu a]\ncanbus_uuid: 11aa22bb33cc\ncanbus_nodeid: 4\n\
-             [mcu b]\ncanbus_uuid: 0a0b0c0d0e0f\n",
+            "[mcu a]\nuuid: 11aa22bb33cc\ncanbus_nodeid: 4\n\
+             [mcu b]\nuuid: 0a0b0c0d0e0f\n",
         );
         result.expect("both prefix sections load in either order");
         assert_eq!(assigned_id(&printer, "mcu b"), 5);
@@ -519,8 +520,8 @@ mod tests {
     #[test]
     fn a_reserved_id_below_the_sequence_does_not_move_the_auto_id() {
         let (printer, result) = load(
-            "[mcu]\ncanbus_uuid: 11aa22bb33cc\ncanbus_nodeid: 2\n\
-             [mcu tool]\ncanbus_uuid: 0a0b0c0d0e0f\n",
+            "[mcu]\nuuid: 11aa22bb33cc\ncanbus_nodeid: 2\n\
+             [mcu tool]\nuuid: 0a0b0c0d0e0f\n",
         );
         result.expect("a nodeid below the sequence is valid");
         assert_eq!(assigned_id(&printer, "mcu"), 2);
@@ -535,7 +536,7 @@ mod tests {
     /// sequence steps over it.
     #[test]
     fn the_pre_scan_reads_the_explicit_id_without_recording_it() {
-        let (config, _) = Config::from_text("[mcu]\ncanbus_uuid: 11aa22bb33cc\ncanbus_nodeid: 5\n")
+        let (config, _) = Config::from_text("[mcu]\nuuid: 11aa22bb33cc\ncanbus_nodeid: 5\n")
             .expect("the config parses");
         let access = AccessTracking::shared();
         let section = config.get_section("mcu").expect("the section is there");
@@ -557,8 +558,8 @@ mod tests {
     /// yet" error is gone) and is given an assigned id.
     #[test]
     fn a_can_mcu_without_a_nodeid_loads() {
-        let (printer, result) = load("[mcu]\ncanbus_uuid: 11aa22bb33cc\n");
-        result.expect("a canbus_uuid alone is enough");
+        let (printer, result) = load("[mcu]\nuuid: 11aa22bb33cc\n");
+        result.expect("a uuid alone is enough");
         assert_eq!(assigned_id(&printer, "mcu"), 4);
     }
 
@@ -568,7 +569,7 @@ mod tests {
     fn a_serial_mcu_gets_an_id_from_the_same_sequence() {
         let (printer, result) = load(
             "[mcu]\nserial: /dev/a\n\
-             [mcu tool]\ncanbus_uuid: 0a0b0c0d0e0f\n\
+             [mcu tool]\nuuid: 0a0b0c0d0e0f\n\
              [mcu bed]\nserial: /dev/b\n",
         );
         result.expect("mixed transports load");
@@ -584,8 +585,8 @@ mod tests {
     fn an_explicit_canbus_ids_section_is_accepted_and_one_allocator() {
         let (printer, result) = load(
             "[canbus_ids]\n\
-             [mcu]\ncanbus_uuid: 11aa22bb33cc\n\
-             [mcu tool]\ncanbus_uuid: 0a0b0c0d0e0f\n",
+             [mcu]\nuuid: 11aa22bb33cc\n\
+             [mcu tool]\nuuid: 0a0b0c0d0e0f\n",
         );
         result.expect("the legacy allocator section loads");
         assert!(
@@ -603,8 +604,8 @@ mod tests {
     fn an_explicit_mcu_ids_section_yields_one_allocator() {
         let (printer, result) = load(
             "[mcu_ids]\n\
-             [mcu]\ncanbus_uuid: 11aa22bb33cc\n\
-             [mcu tool]\ncanbus_uuid: 0a0b0c0d0e0f\n",
+             [mcu]\nuuid: 11aa22bb33cc\n\
+             [mcu tool]\nuuid: 0a0b0c0d0e0f\n",
         );
         result.expect("the allocator section loads");
         assert_eq!(assigned_id(&printer, "mcu"), 4);
@@ -617,8 +618,8 @@ mod tests {
     #[test]
     fn a_config_rejects_two_sections_claiming_one_nodeid() {
         let (_printer, result) = load(
-            "[mcu alpha]\ncanbus_uuid: 010203040506\ncanbus_nodeid: 6\n\
-             [mcu beta]\ncanbus_uuid: 0a0b0c0d0e0f\ncanbus_nodeid: 6\n",
+            "[mcu alpha]\nuuid: 010203040506\ncanbus_nodeid: 6\n\
+             [mcu beta]\nuuid: 0a0b0c0d0e0f\ncanbus_nodeid: 6\n",
         );
         let err = result.expect_err("the second claim on id 6 is a config error");
         let text = err.to_string();

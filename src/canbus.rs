@@ -8,17 +8,19 @@
 //! only overrides it for a section that wants a fixed number.) Boards that
 //! already have a node id stay quiet, so
 //! a scan lists exactly the boards a `printer.cfg` still has to name — the UUIDs
-//! that go into `[mcu]`'s `canbus_uuid`.
+//! that go into `[mcu]`'s `uuid`.
 //!
 //! This is a bench tool, not part of the host: it needs no config file, and it
 //! takes nothing over. The query is a broadcast that changes no board's state —
 //! assigning a node id does, and that stays where it is, in the config the host
 //! reads.
 //!
-//! The output is upstream's, line for line:
+//! The output is upstream's, line for line, except the first word: upstream
+//! still writes `canbus_uuid=` (`scripts/canbus_query.py`), this crate prints
+//! `uuid=` for its canonical key.
 //!
 //! ```text
-//! Found canbus_uuid=11aa22bb33cc, Application: Klipper
+//! Found uuid=11aa22bb33cc, Application: Klipper
 //! Total 1 uuids found
 //! ```
 //!
@@ -72,7 +74,7 @@ pub fn run(args: CanbusScanArgs) -> Result<(), Box<dyn std::error::Error>> {
 /// their leading zeros, and the application's name.
 fn found_line(node: &UnassignedNode) -> String {
     format!(
-        "Found canbus_uuid={}, Application: {}",
+        "Found uuid={}, Application: {}",
         node.uuid_hex(),
         node.application_name()
     )
@@ -107,19 +109,22 @@ mod tests {
 
     #[test]
     fn test_the_found_line_is_klipper_s_own() {
+        // Upstream still prints `canbus_uuid=%012x` here
+        // (`scripts/canbus_query.py`); this crate has renamed the key to `uuid`,
+        // so the line is a deliberate deviation.
         // `scripts/canbus_query.py`: "Found canbus_uuid=%012x, Application: %s".
         assert_eq!(
             found_line(&node([0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc], Some(0x01))),
-            "Found canbus_uuid=11aa22bb33cc, Application: Klipper"
+            "Found uuid=11aa22bb33cc, Application: Klipper"
         );
         assert_eq!(
             found_line(&node([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff], Some(0x11))),
-            "Found canbus_uuid=aabbccddeeff, Application: CanBoot"
+            "Found uuid=aabbccddeeff, Application: CanBoot"
         );
         // The leading zeros of a small UUID are part of the twelve digits.
         assert_eq!(
             found_line(&node([0, 0, 0, 0, 0, 1], None)),
-            "Found canbus_uuid=000000000001, Application: Klipper"
+            "Found uuid=000000000001, Application: Klipper"
         );
     }
 

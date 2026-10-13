@@ -66,7 +66,15 @@ pub struct McuConfig {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Transport {
     /// A tty at a line speed.
-    Serial { path: String, baud: u32 },
+    ///
+    /// `uuid` is the identity the board answers to: on a **shared** port the
+    /// connect-time handshake names it before re-confirming the assignment
+    /// (see [`Transport::open`]); an exclusive port ignores it.
+    Serial {
+        path: String,
+        baud: u32,
+        uuid: Option<[u8; 6]>,
+    },
     /// A Klipper can-serial link (a CAN interface and a uuid).
     ///
     /// The id that addresses the node is **not** part of the transport: it is
@@ -343,34 +351,128 @@ impl McuConfig {
 
     /// Describe the transport the section asks for, without opening it.
     ///
-    /// One connection key selects it. Two of them is a configuration mistake, not
-    /// a preference order, so it is reported rather than resolved silently. Every
+    /// One connection selector names it: `host_library`, `serial`, `test`, or
+    /// the CAN options (`canbus_interface`/`canbus_nodeid`). Two of them is a
+    /// configuration mistake, not a preference order, so it is reported rather
+    /// than resolved silently — except that `uuid`/`canbus_uuid` are the
+    /// *identity* the board is addressed by, not a selector: they ride on
+    /// whichever transport wins and may sit on a serial or a CAN MCU. Every
     /// check lives here; [`Transport::open`] only performs the side effects.
     fn transport_for(section: &ConfigWrapper) -> Result<Transport, ConfigError> {
-        // `uuid` is the canonical key; `canbus_uuid` is its earlier name and
-        // still loads (a config written for Klipper keeps working). Writing both
-        // names the uuid twice, so it is a conflict reported up front with the
-        // canonical name first — just as two different transports are.
-        if section.has("uuid") && section.has("canbus_uuid") {
-            return Err(ConfigError::new(format!(
-                "MCU '{}' sets both uuid and canbus_uuid",
-                section.identifier()
-            )));
-        }
-
-        let requested: Vec<&str> = interface_keys()
-            .iter()
-            .copied()
-            .filter(|key| section.has(key))
-            .collect();
-        if requested.len() > 1 {
-            return Err(ConfigError::new(format!(
+        // The keys that can name or configure a transport, in the order the
+        // conflict error lists the present ones. `uuid`/`canbus_uuid` are the
+        // identity, not selectors, but they belong in the list so a conflict
+        // is reported with every key involved. `canbus_interface`/`canbus_nodeid`
+        // sit below the `interface_keys` the conflict counter used to count.
+        let present = || {
+            interface_keys()
+                .iter()
+                .copied()
+                .chain(["canbus_interface", "canbus_nodeid"].into_iter())
+                .filter(|key| section.has(key))
+                .collect::<Vec<_>>()
+        };
+        let too_many = || {
+            ConfigError::new(format!(
                 "MCU '{}' sets more than one interface: {}",
                 section.identifier(),
-                requested.join(", ")
-            )));
+                present().join(", ")
+            ))
+        };
+        let both_uuids = || {
+            // `uuid` is the canonical key; `canbus_uuid` is its earlier name
+            // and still loads (a config written for Klipper keeps working).
+            // Writing both names the identity twice, so it is a conflict
+            // reported up front with the canonical name first.
+            ConfigError::new(format!(
+                "MCU '{}' sets both uuid and canbus_uuid",
+                section.identifier()
+            ))
+        };
+
+        if let Some(library) = section.get_str("host_library") {
+            // The library is one transport; `serial`, `test` or anything in
+            // the CAN family with it names a second.
+            let other = [
+                "serial",
+                "test",
+                "uuid",
+                "canbus_uuid",
+                "canbus_interface",
+                "canbus_nodeid",
+            ]
+            .into_iter()
+            .filter(|key| section.has(key))
+            .collect::<Vec<_>>();
+            if !other.is_empty() {
+                return Err(too_many());
+            }
+            return Ok(Transport::Host { library });
         }
 
+        if let Some(path) = section.get_str("serial") {
+            let other = ["host_library", "test", "canbus_interface", "canbus_nodeid"]
+                .into_iter()
+                .filter(|key| section.has(key))
+                .collect::<Vec<_>>();
+            if !other.is_empty() {
+                return Err(too_many());
+            }
+            if section.has("uuid") && section.has("canbus_uuid") {
+                return Err(both_uuids());
+            }
+            // One uuid spelling names the board the port talks to; it only
+            // changes how the **shared** path's handshake begins (`Transport::open`).
+            let uuid = section
+                .get_str("uuid")
+                .or_else(|| section.get_str("canbus_uuid"))
+                .map(|text| {
+                    parse_uuid(&text).map_err(|e| {
+                        ConfigError::new(format!(
+                            "MCU '{}' has an invalid uuid: {e}",
+                            section.identifier()
+                        ))
+                    })
+                })
+                .transpose()?;
+            let baud = match section.get_str("baud") {
+                // A rate of zero would ask the kernel to hang the line up.
+                Some(text) => match text.parse::<u32>() {
+                    Ok(baud) if baud > 0 => baud,
+                    _ => {
+                        return Err(ConfigError::new(format!(
+                            "MCU '{}' has an invalid baud: '{text}'",
+                            section.identifier()
+                        )))
+                    }
+                },
+                None => crate::core::klippy::interface::devices::serial::DEFAULT_BAUD,
+            };
+            return Ok(Transport::Serial { path, baud, uuid });
+        }
+
+        #[cfg(test)]
+        if section.has("test") {
+            // A `test:` simulator and a CAN MCU are two transports.
+            if ["uuid", "canbus_uuid", "canbus_interface", "canbus_nodeid"]
+                .into_iter()
+                .any(|key| section.has(key))
+            {
+                return Err(too_many());
+            }
+            if let Some(test_value) = section.get_str("test") {
+                if let Some(path) = test_value.trim().strip_prefix("dict=") {
+                    return Ok(Transport::Simulator(path.trim().to_string()));
+                }
+            }
+        }
+
+        // The remaining interface is the CAN family: a uuid (either spelling)
+        // names a CAN MCU, and `canbus_interface`/`canbus_nodeid` only set its
+        // interface and id.
+        if section.has("uuid") && section.has("canbus_uuid") {
+            return Err(both_uuids());
+        }
         if let Some(text) = section
             .get_str("uuid")
             .or_else(|| section.get_str("canbus_uuid"))
@@ -396,34 +498,6 @@ impl McuConfig {
                 "MCU '{}' needs a uuid to go with its CAN settings",
                 section.identifier()
             )));
-        }
-
-        if let Some(path) = section.get_str("host_library") {
-            return Ok(Transport::Host { library: path });
-        }
-
-        if let Some(path) = section.get_str("serial") {
-            let baud = match section.get_str("baud") {
-                // A rate of zero would ask the kernel to hang the line up.
-                Some(text) => match text.parse::<u32>() {
-                    Ok(baud) if baud > 0 => baud,
-                    _ => {
-                        return Err(ConfigError::new(format!(
-                            "MCU '{}' has an invalid baud: '{text}'",
-                            section.identifier()
-                        )))
-                    }
-                },
-                None => crate::core::klippy::interface::devices::serial::DEFAULT_BAUD,
-            };
-            return Ok(Transport::Serial { path, baud });
-        }
-
-        #[cfg(test)]
-        if let Some(test_value) = section.get_str("test") {
-            if let Some(path) = test_value.trim().strip_prefix("dict=") {
-                return Ok(Transport::Simulator(path.trim().to_string()));
-            }
         }
 
         let how = if cfg!(test) {
@@ -455,10 +529,15 @@ impl Transport {
     ///
     /// - `Some(baud)` — the path is shared: the port is opened once for every
     ///   MCU on it, and [`shared_serial::attach`] performs the synchronous
-    ///   assignment handshake (write the assignment request, wait for the
-    ///   device's answer) before the shared handle is returned.
-    /// - `None` — the path is exclusive: a private [`SerialDevice`], and **no**
-    ///   assignment frame is ever sent.
+    ///   assignment handshake before the shared handle is returned. When the
+    ///   section also names a `uuid`, the handshake **starts by writing the
+    ///   SET_NODEID unit that names the board** ([`shared_serial::set_node_id_for`])
+    ///   and only then re-confirms with the ordinary assignment request —
+    ///   mirroring CAN's `CanSerialDevice::open`, which sends its SET_NODEID
+    ///   when the link opens.
+    /// - `None` — the path is exclusive: a private [`SerialDevice`], **no**
+    ///   assignment frame is ever sent, and a `uuid` on the section is
+    ///   ignored.
     ///
     /// `rts` is the state an **exclusive** serial port is left in after
     /// opening; a shared one ignores it — and warns when it is `false` —
@@ -474,7 +553,7 @@ impl Transport {
         shared_baud: Option<u32>,
     ) -> Result<Interface, String> {
         match self {
-            Transport::Serial { path, baud } if shared_baud == Some(*baud) => {
+            Transport::Serial { path, baud, uuid } if shared_baud == Some(*baud) => {
                 // A shared port is addressed by id, so it cannot be opened
                 // before the allocator has handed one out (`mcu/ids.rs`).
                 let id =
@@ -486,11 +565,17 @@ impl Transport {
                     );
                 }
                 let handle =
-                    shared_serial::attach(Path::new(path), *baud, id, ASSIGN_ATTACH_TIMEOUT)
+                    shared_serial::attach(Path::new(path), *baud, id, ASSIGN_ATTACH_TIMEOUT, *uuid)
                         .map_err(|e| format!("serial {path}: shared port attach failed: {e}"))?;
                 Ok(Interface::shared_serial(handle))
             }
-            Transport::Serial { path, baud } => {
+            // An exclusive port ignores its uuid: no SET_NODEID and no
+            // assignment frame ever go out on it (see the doc comment above).
+            Transport::Serial {
+                path,
+                baud,
+                uuid: _,
+            } => {
                 let device = SerialDevice::open(path, *baud).map_err(|e| format!("serial: {e}"))?;
                 if !rts {
                     device.set_rts(false).map_err(|e| format!("serial: {e}"))?;
@@ -732,6 +817,141 @@ mod tests {
         assert!(err.to_string().contains("/dev/not-a-serial-port"), "{err}");
     }
 
+    /// `serial:` with a `uuid:` is one transport carrying the board's identity:
+    /// it parses (a shared-path handshake names the board with it) instead of
+    /// being a two-interface conflict.
+    #[test]
+    fn test_a_serial_with_uuid_carries_the_identity() {
+        let mut section = section_with("serial", "/dev/not-a-serial-port");
+        section.parameters.insert(
+            "uuid".to_string(),
+            ConfigValue::Single("11aa22bb33cc".to_string()),
+        );
+        let config = McuConfig::new(&wrap(&section)).unwrap();
+        assert!(matches!(
+            &config.transport,
+            Transport::Serial {
+                path,
+                uuid: Some(u),
+                ..
+            } if path == "/dev/not-a-serial-port"
+                && u == &[0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc]
+        ));
+        // Still a serial transport — opening goes through the serial device.
+        let err = config.open().unwrap_err();
+        assert!(err.starts_with("serial: "), "{err}");
+        assert!(err.to_string().contains("/dev/not-a-serial-port"), "{err}");
+    }
+
+    /// The old spelling loads on a serial MCU the same way it does on a CAN
+    /// one: aliased to the same identity.
+    #[test]
+    fn test_a_serial_with_aliased_canbus_uuid_carries_the_identity() {
+        let mut section = section_with("serial", "/dev/not-a-serial-port");
+        section.parameters.insert(
+            "canbus_uuid".to_string(),
+            ConfigValue::Single("44dd55ee66ff".to_string()),
+        );
+        let config = McuConfig::new(&wrap(&section)).unwrap();
+        assert!(matches!(
+            &config.transport,
+            Transport::Serial {
+                uuid: Some(u), ..
+            } if u == &[0x44, 0xdd, 0x55, 0xee, 0x66, 0xff]
+        ));
+    }
+
+    /// Both spellings on a serial MCU are the same identity written twice, so
+    /// the canonical-key-first error is the CAN one's.
+    #[test]
+    fn test_a_serial_with_both_uuid_spellings_is_rejected() {
+        let mut section = section_with("serial", "/dev/ttyACM0");
+        section.parameters.insert(
+            "uuid".to_string(),
+            ConfigValue::Single("11aa22bb33cc".to_string()),
+        );
+        section.parameters.insert(
+            "canbus_uuid".to_string(),
+            ConfigValue::Single("44dd55ee66ff".to_string()),
+        );
+        let err = McuConfig::new(&wrap(&section)).unwrap_err();
+        assert!(
+            err.to_string().contains("both uuid and canbus_uuid"),
+            "{err}"
+        );
+    }
+
+    /// A malformed uuid on a serial MCU keeps the CAN error's wording.
+    #[test]
+    fn test_a_serial_with_an_invalid_uuid_is_rejected() {
+        for bad in ["bogus", "11aa22bb33cg"] {
+            let mut section = section_with("serial", "/dev/ttyACM0");
+            section
+                .parameters
+                .insert("uuid".to_string(), ConfigValue::Single(bad.to_string()));
+            let err = McuConfig::new(&wrap(&section)).unwrap_err();
+            assert!(err.to_string().contains("invalid uuid"), "{bad}: {err}");
+        }
+    }
+
+    /// `uuid:` alone names the default CAN interface, unchanged by the serial
+    /// identity work.
+    #[test]
+    fn test_uuid_alone_is_still_can() {
+        let section = section_with("uuid", "11aa22bb33cc");
+        let mut config = McuConfig::new(&wrap(&section)).unwrap();
+        assert!(matches!(
+            &config.transport,
+            Transport::Can {
+                ref interface,
+                uuid,
+            } if interface == "can0" && *uuid == [0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc]
+        ));
+        // With an id it gets as far as the socket, which is where it fails here.
+        config.id = Some(2);
+        let err = config.open().unwrap_err();
+        assert!(err.contains("no CAN interface named 'can0'"), "{err}");
+    }
+
+    /// CAN settings with a serial transport name two transports, not one MCU
+    /// with both a tty and a CAN link.
+    #[test]
+    fn test_serial_plus_can_settings_is_rejected() {
+        for can_key in ["canbus_interface", "canbus_nodeid"] {
+            let mut section = section_with("serial", "/dev/ttyACM0");
+            section
+                .parameters
+                .insert(can_key.to_string(), ConfigValue::Single("can0".to_string()));
+            let err = McuConfig::new(&wrap(&section)).unwrap_err();
+            assert!(err.to_string().contains("more than one interface"), "{err}");
+        }
+    }
+
+    /// A host library and a uuid name a host MCU and a CAN MCU.
+    #[test]
+    fn test_host_library_plus_uuid_is_rejected() {
+        let mut section = section_with("host_library", "/nonexistent/libklipper_host.so");
+        section.parameters.insert(
+            "uuid".to_string(),
+            ConfigValue::Single("11aa22bb33cc".to_string()),
+        );
+        let err = McuConfig::new(&wrap(&section)).unwrap_err();
+        assert!(err.to_string().contains("more than one interface"), "{err}");
+        assert!(err.to_string().contains("host_library, uuid"), "{err}");
+    }
+
+    /// `test:` and a CAN MCU are two transports even in test builds.
+    #[test]
+    fn test_the_dict_interface_plus_a_uuid_is_rejected() {
+        let mut section = section_with("test", "dict=/fake/path.dict");
+        section.parameters.insert(
+            "uuid".to_string(),
+            ConfigValue::Single("11aa22bb33cc".to_string()),
+        );
+        let err = McuConfig::new(&wrap(&section)).unwrap_err();
+        assert!(err.to_string().contains("more than one interface"), "{err}");
+    }
+
     /// A CAN section, with `overrides` on top of a complete one.
     fn can_section(overrides: &[(&str, &str)]) -> ConfigSection {
         let mut section = section_with("uuid", "11aa22bb33cc");
@@ -956,6 +1176,39 @@ mod tests {
         opener.await.expect("the opener task ran")
     }
 
+    /// Like [`open_answering_assignment`], but the config carries a serial
+    /// `uuid`: the device side sees the SET_NODEID unit first, then the
+    /// assignment request, and answers the latter.
+    async fn open_answering_assignment_with_uuid(
+        config: McuConfig,
+        pty: &Pty,
+        mcu_id: u32,
+        uuid: [u8; 6],
+    ) -> Result<Interface, String> {
+        let handle = tokio::runtime::Handle::current();
+        let opener = tokio::task::spawn_blocking(move || {
+            let _entered = handle.enter();
+            config.open()
+        });
+        let set = shared_serial::set_node_id_for(uuid, mcu_id).expect("a valid mcu id");
+        let request = shared_serial::assignment_request(mcu_id).expect("a valid mcu id");
+        let wire = read_n(&pty.master, set.len() + request.len());
+        assert_eq!(
+            &wire[..set.len()],
+            set.as_slice(),
+            "the SET_NODEID unit goes out first"
+        );
+        assert_eq!(
+            &wire[set.len()..],
+            request.as_slice(),
+            "the assignment request follows SET_NODEID"
+        );
+        (&pty.master)
+            .write_all(&shared_serial::assignment_reply(mcu_id).expect("a valid mcu id"))
+            .expect("pty master write");
+        opener.await.expect("the opener task ran")
+    }
+
     /// A shared port completes the assignment handshake before `open` returns,
     /// and the interface it returns is the shared one — every send carries the
     /// MCU's arbitration header.
@@ -982,6 +1235,38 @@ mod tests {
             "a shared send is prefixed with the arb header"
         );
         assert_eq!(&wire[header.len()..], frame.raw_bytes());
+    }
+
+    /// A shared port whose config names a `uuid` sends the SET_NODEID unit
+    /// that names the board *before* the ordinary assignment request — the
+    /// byte order a discovery-driven board expects on the wire.
+    #[tokio::test]
+    async fn test_a_shared_serial_open_with_uuid_names_the_board_before_the_handshake() {
+        let pty = Pty::new();
+        let mut section = section_with("serial", pty.path.to_str().unwrap());
+        section.parameters.insert(
+            "uuid".to_string(),
+            ConfigValue::Single("11aa22bb33cc".to_string()),
+        );
+        let mut config = McuConfig::new(&wrap(&section)).expect("a serial+uuid section parses");
+        assert!(matches!(
+            config.transport,
+            Transport::Serial { uuid: Some(_), .. }
+        ));
+        config.id = Some(5);
+        config.shared_baud = Some(DEFAULT_BAUD);
+
+        let interface = open_answering_assignment_with_uuid(
+            config,
+            &pty,
+            5,
+            [0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc],
+        )
+        .await
+        .expect("a shared attach with a uuid succeeds");
+        // The handshake it completed is the shared path's (SET_NODEID then the
+        // assignment request above); a shutdown keeps the handle well-formed.
+        interface.shutdown();
     }
 
     /// A shared port with no answer fails `open`, naming the path and the
@@ -1039,6 +1324,46 @@ mod tests {
         match (&pty.master).read(&mut buf) {
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
             other => panic!("an exclusive open must write nothing, got {other:?}"),
+        }
+        interface.shutdown();
+    }
+
+    /// An exclusive port ignores its uuid: it writes **nothing** on the wire —
+    /// not the SET_NODEID unit, not an assignment — whatever identity the
+    /// section carries.
+    #[tokio::test]
+    async fn an_exclusive_serial_open_ignores_its_uuid() {
+        let pty = Pty::new();
+        let mut section = section_with("serial", pty.path.to_str().unwrap());
+        section.parameters.insert(
+            "uuid".to_string(),
+            ConfigValue::Single("11aa22bb33cc".to_string()),
+        );
+        let mut config = McuConfig::new(&wrap(&section)).expect("a serial+uuid section parses");
+        assert!(matches!(
+            config.transport,
+            Transport::Serial { uuid: Some(_), .. }
+        ));
+        config.id = Some(7);
+        config.shared_baud = None;
+
+        let interface = config.open().expect("an exclusive port opens");
+
+        let flags = unsafe { libc::fcntl(pty.master.as_raw_fd(), libc::F_GETFL) };
+        assert_eq!(
+            unsafe {
+                libc::fcntl(
+                    pty.master.as_raw_fd(),
+                    libc::F_SETFL,
+                    flags | libc::O_NONBLOCK,
+                )
+            },
+            0
+        );
+        let mut buf = [0u8; 32];
+        match (&pty.master).read(&mut buf) {
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            other => panic!("an exclusive open with a uuid must write nothing, got {other:?}"),
         }
         interface.shutdown();
     }

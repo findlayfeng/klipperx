@@ -684,9 +684,14 @@ fn port_for(path: &Path, baud: u32) -> Result<Arc<SharedSerialPort>, InterfaceEr
 /// Open a port for one MCU, completing the frame-level id handshake.
 ///
 /// The first attach on a path opens the tty and starts the reader; later ones
-/// reuse both and only register a slot. The request is written and the answer
-/// awaited `ASSIGN_ATTACH_ATTEMPTS` times, each for `timeout`; on exhaustion the
-/// slot is unregistered and [`InterfaceError::Timeout`] returned.
+/// reuse both and only register a slot. When `uuid` is `Some`, the handshake
+/// starts by writing the SET_NODEID unit that names the board
+/// ([`set_node_id_for`]) and only then sends the assignment request — mirroring
+/// CAN's `CanSerialDevice::open`, which sends its SET_NODEID when the link
+/// opens. `None` skips that and goes straight to the request. The request is
+/// written and the answer awaited `ASSIGN_ATTACH_ATTEMPTS` times, each for
+/// `timeout`; on exhaustion the slot is unregistered and
+/// [`InterfaceError::Timeout`] returned.
 ///
 /// # Errors
 /// [`InterfaceError::Other`] for an id the wire format cannot carry or a port
@@ -697,6 +702,7 @@ pub fn attach(
     baud: u32,
     mcu_id: u32,
     timeout: Duration,
+    uuid: Option<[u8; 6]>,
 ) -> Result<Arc<SharedSerialHandle>, InterfaceError> {
     if assign::arb_id(mcu_id).is_none() {
         return Err(InterfaceError::Other(format!(
@@ -712,6 +718,18 @@ pub fn attach(
 
     let slot = Arc::new(McuSlot::new());
     port.slots.lock().unwrap().insert(mcu_id, Arc::clone(&slot));
+
+    // A discovered MCU is named before the assignment runs: frame order is the
+    // SET_NODEID unit first, the assignment request second (mirrors CAN's
+    // `CanSerialDevice::open`). `set_node_id_for` fails only for an id the
+    // wire format cannot carry, already rejected above.
+    if let Some(uuid) = uuid {
+        let unit = set_node_id_for(uuid, mcu_id).expect("arb_id checked above");
+        if let Err(e) = port.write_unit(&unit) {
+            port.slots.lock().unwrap().remove(&mcu_id);
+            return Err(e);
+        }
+    }
 
     let request = assignment_request(mcu_id).expect("arb_id checked above");
     let mut attempts = 0;
@@ -1095,7 +1113,7 @@ mod tests {
         let request = assignment_request(mcu_id).expect("a valid mcu id");
         let path = pty.path.clone();
         let thread =
-            thread::spawn(move || attach(&path, DEFAULT_BAUD, mcu_id, ASSIGN_ATTACH_TIMEOUT));
+            thread::spawn(move || attach(&path, DEFAULT_BAUD, mcu_id, ASSIGN_ATTACH_TIMEOUT, None));
         let seen = read_n(&pty.master, request.len());
         assert_eq!(
             seen, request,
@@ -1154,10 +1172,56 @@ mod tests {
         );
     }
 
+    /// With a uuid the handshake starts by naming the board: the SET_NODEID
+    /// unit goes out first, then the ordinary assignment request, then the
+    /// reply lets `attach` return a handle (mirrors CAN's SET_NODEID-on-open).
+    #[test]
+    fn attach_with_a_uuid_sends_set_node_id_before_the_assignment_request() {
+        let pty = Pty::new();
+        let uuid = [0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc];
+        let mcu_id = 6;
+
+        let path = pty.path.clone();
+        let thread = thread::spawn(move || {
+            attach(
+                &path,
+                DEFAULT_BAUD,
+                mcu_id,
+                ASSIGN_ATTACH_TIMEOUT,
+                Some(uuid),
+            )
+        });
+
+        let set = set_node_id_for(uuid, mcu_id).expect("a valid mcu id");
+        let request = assignment_request(mcu_id).expect("a valid mcu id");
+        let wire = read_n(&pty.master, set.len() + request.len());
+        assert_eq!(
+            &wire[..set.len()],
+            set.as_slice(),
+            "the SET_NODEID unit goes out first"
+        );
+        assert_eq!(
+            &wire[set.len()..],
+            request.as_slice(),
+            "the assignment request follows SET_NODEID"
+        );
+
+        master_write(
+            &pty.master,
+            &assignment_reply(mcu_id).expect("a valid mcu id"),
+        );
+        let handle = thread
+            .join()
+            .expect("attach thread")
+            .expect("attach succeeds");
+        // The returned handle is the caller's to use, like any other attach.
+        assert!(handle.send(&Frame::new(0, vec![0xab])).is_ok());
+    }
+
     #[test]
     fn attach_times_out_when_no_reply_arrives() {
         let pty = Pty::new();
-        let err = attach(&pty.path, DEFAULT_BAUD, 4, Duration::from_millis(50)).unwrap_err();
+        let err = attach(&pty.path, DEFAULT_BAUD, 4, Duration::from_millis(50), None).unwrap_err();
         assert_eq!(err, InterfaceError::Timeout);
 
         // Every attempt went out, byte for byte.

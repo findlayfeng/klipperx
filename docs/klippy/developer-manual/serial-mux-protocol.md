@@ -12,8 +12,13 @@
 独占——独占串口走原来的 `SerialDevice`，**不发任何指派帧、不带任何头**，
 线格式与 Klipper 逐字节相同。
 
-> **固件侧尚未实现**。共享模式对今天的串口固件必然**握手超时**（见下），因此它现在是
-> 「主机侧就绪、设备端待做」的状态：误开到旧固件上只会连接失败，不会破坏会话。
+> **固件侧部分落地，设备半的状态机仍待做**。已实现的是**单元格式与 admin 单元族**（固件
+> `src/mux.c`：2 字节带校验头、`KXID` 伪帧、`QUERY_UNASSIGNED`/`SET_KLIPPER_NODEID`/
+> `NEED_NODEID` 的构造与解析）、host 库的**下游串口端口**（`CONFIG_BRIDGE_PORT_SERIAL`）
+> 与 **unit 收发接口**（`klipper_host_input_unit`/`klipper_host_output_unit`，需要帧接口开关
+> **且**桥模式）。还差**设备半状态机**（应答扫描、采纳 nodeid、按 CAN 规则处理 id 冲突、把
+> self 的帧交给本机解析器），所以今天的固件仍不回执：共享模式必然**握手超时**，误开到旧固件
+> 只会连接失败，不会破坏会话。
 
 ## 寻址：与 CAN 逐位同值
 
@@ -138,12 +143,19 @@ CAN 侧的同族常量在 `canserial.rs`。
 - **扫描**（`klipperx scan --port <tty>`，`src/scan.rs`）：
   `serial_query_unassigned()` 广播一次查询，随后按与 `dispatch` 相同的成帧语义切单元
   （`UnitStream`），窗口是**从广播起算的截止时间**（`--timeout`，默认 2 s），按 uuid
-  去重、每块板第一次被听到时回调——输出 `Found uuid=%012x, Application: …` 与总数行，`--interface <bus>` 则扫 CAN（同一个 `klipperx scan`），两者输出同形。CAN 侧的扫描实现在 `canserial.rs` 的 `query_unassigned`。
+  去重、每块板第一次被听到时回调——输出 `Found uuid=%012x, Application: …` 与总数行，`--interface <bus>` 则扫 CAN（同一个 `klipperx scan`），两者输出同形。CAN 侧的扫描实现在 `canserial.rs` 的 `query_unassigned`。`--host-library <path.so>` 则扫一份
+  host 库（配 `--host-identity <12 位十六进制>`，默认全 `0`）：加载它、在
+  `klipper_host_init()` **之前**用 `klipper_host_set_uuid()` 把身份交给它，再走同一段广播 /
+  窗口 / 去重代码；`--host-identity` 只在给了 `--host-library` 时可用。
 - **连接期**：`[mcu]` 节带 `uuid`（或别名 `canbus_uuid`）的共享串口，`attach()` 在发分配
   请求**之前**先写一枚 `SET_KLIPPER_NODEID`（按 uuid 点名 id），再走上一节的重确认
   握手——顺序与 CAN 的 `CanSerialDevice::open`（开链路时发 SET_NODEID）对应。
 
-### 固件端契约（待实现）
+### 固件端契约（设备半状态机待实现）
+
+单元格式与 admin 单元族已在固件里（`src/mux.c`，含 `mux_query_unassigned` /
+`mux_set_node_id` / `mux_need_nodeid` / `mux_assignment_reply` 与解析用的 `mux_parse_kxid`）；
+**下面这条状态机行为**（谁来应答、何时采纳、冲突怎么办）还没接上：
 
 - 未分配的设备监听 `0x3f0`：收 `0x00` 在 `0x3f1` 回身份（uuid + application）；收
   `0x01 <uuid6> <id>` 且 uuid 是自己时**采纳 id** 并转入正常寻址。幂等：重复收到同一
@@ -180,7 +192,15 @@ CAN 不需要这套东西：总线自带仲裁 id 与硬件过滤，每颗 MCU �
 
 ## 尚未落地
 
-- 帧头寻址目前**只服务共享串口**；其它接口（独占串口、`host_library`、`test:`）不使用 id
-  寻址，`[mcu]` 的 id 对它们只是标识与分配序列的一部分。
-- 设备端固件未实现：共享路径在固件就绪前必然握手超时，发现扫描也只会等到截止窗口走空
-  （这是预期行为，不是 bug）；固件契约见「发现与指派：admin 信道与命令族」一节。
+- **设备半状态机**：应答 `QUERY_UNASSIGNED`、采纳 `SET_KLIPPER_NODEID`、按 CAN 的
+  `can_id_conflict` 处理 id 冲突、以及「首字节高位置位=带头单元，否则=原始帧」的双态解析。
+  共享路径在它就绪前必然握手超时，发现扫描也只会等到截止窗口走空（预期行为，不是 bug）；
+  单元格式与 admin 单元族本身已在固件里（`src/mux.c`）。
+- **host 库路径的 id 寻址**：配置层已能判定一条 `host_library:` 路径是否需要按 id 寻址
+  （`mcu/host_libraries.rs`，见[连接方式](../user-manual/mcu-connection.md)一节的规则），但
+  **帧头消费**（attach 时按 mux 走、以及把 self 的帧交给本机解析器）尚未接入。独占串口与
+  判定为**非 mux** 的 host 库路径、以及 `test:` 也仍不使用 id 寻址——但注意 id 本身**每个 `[mcu]` 都有**（`McuObject::connect` 没有它就拒绝开传输层），对它们只是标识与分配序列的一部分。
+- **host 模式的数据面**：`klipper_host_input_unit()` / `klipper_host_output_unit()` 已定义
+  （一次一整单元：2 字节头 + 帧，头里就是来源设备），但固件尚未按单元发出上游帧、主机侧也
+  还没改用它。**分配与扫描那段对话始终走字节流**（`klipper_host_input` /
+  `klipper_host_output_wait`），这套 unit 接口只是 host 的"整单元"快路径。

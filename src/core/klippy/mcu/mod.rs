@@ -28,6 +28,7 @@ pub mod host_libraries;
 pub(crate) mod ids;
 mod object;
 mod pending;
+pub mod port_grouping;
 mod resource;
 mod restart;
 mod restart_method;

@@ -4,12 +4,14 @@
 //! One command covers both transports because the question is the same one:
 //! which boards has a `printer.cfg` still to name? The answer is always a UUID
 //! (what a `[mcu]` section then writes in `uuid:`) and an application name. The
-//! transport is chosen by the arguments, not by a second command:
+//! transport is chosen by the arguments, not by a second command, and it must
+//! be named: the subcommand has no default bus, so a bare `klipperx scan`
+//! prints its help rather than guessing at one.
 //!
-//! - no `--port` — the CAN bus named by `--interface` (default `can0`), as
-//!   Klipper's `scripts/canbus_query.py` does: one broadcast of
-//!   `CMD_QUERY_UNASSIGNED` on the admin id (`0x3f0`), every board without a
-//!   node id answering on the next id (`0x3f1`).
+//! - `--interface <name>` — that CAN bus, as Klipper's
+//!   `scripts/canbus_query.py` does: one broadcast of `CMD_QUERY_UNASSIGNED` on
+//!   the admin id (`0x3f0`), every board without a node id answering on the
+//!   next id (`0x3f1`).
 //! - `--port <tty>` — that serial port, where discovery runs **inside** the
 //!   byte stream instead: one [`discovery_query`] unit, unseen by the data
 //!   plane, and the same answers on the admin reply id.
@@ -47,10 +49,6 @@ use crate::core::klippy::interface::devices::shared_serial::{
     serial_query_unassigned, UnassignedNode as SerialNode,
 };
 
-/// The interface a CAN scan reads when `--interface` is not given: Klipper's own
-/// default for `canbus_interface` (`klippy/mcu.py`).
-const DEFAULT_INTERFACE: &str = "can0";
-
 /// How long a scan listens, in seconds: the window Klipper's tool uses.
 const DEFAULT_TIMEOUT: f64 = 2.0;
 
@@ -60,11 +58,13 @@ const DEFAULT_BAUD: u32 = 250_000;
 
 #[derive(Args, Debug)]
 pub struct ScanArgs {
-    /// CAN interface to scan, as the network interface is named (`can0`)
+    /// The CAN bus to scan, as the network interface is named (`can0`)
     //
-    // Optional rather than defaulted so that giving it *and* `--port` can be
-    // named as the mistake it is; the default is applied when a CAN scan is the
-    // one that runs.
+    // One of this and `--port` is required, and there is no default bus: naming
+    // neither is not a CAN scan with a guess, it is a question (see the `scan`
+    // variant in `main.rs`, which answers a bare `scan` with the help).
+    // Optional rather than defaulted also so that giving it *and* `--port` can
+    // be named as the mistake it is.
     #[arg(long)]
     pub interface: Option<String>,
 
@@ -107,16 +107,19 @@ pub fn run(args: ScanArgs) -> Result<(), Box<dyn std::error::Error>> {
             println!("{}", total_line(total));
             Ok(())
         }
-        (None, interface) => {
+        (None, Some(interface)) => {
             if args.baud.is_some() {
                 return Err("--baud needs --port: a CAN scan has no line speed".into());
             }
-            let interface = interface.as_deref().unwrap_or(DEFAULT_INTERFACE);
             let mut bus = CanbusAdminSocket::open(interface)?;
             let scan = query_unassigned(&mut bus, window, |node| println!("{}", can_line(&node)))?;
             println!("{}", total_line(scan.total()));
             Ok(())
         }
+        // No transport named: reachable through `ScanArgs` but not from the
+        // command line, where `arg_required_else_help` prints the help instead
+        // (see the `scan` variant in `main.rs`).
+        (None, None) => Err("give --interface (CAN) or --port (serial)".into()),
     }
 }
 
@@ -242,6 +245,21 @@ mod tests {
     }
 
     #[test]
+    fn test_a_scan_without_a_transport_is_rejected() {
+        // No default bus: through `ScanArgs` this is an error (on the command
+        // line `arg_required_else_help` never gets this far — a bare `scan`
+        // prints the help).
+        let args = ScanArgs {
+            interface: None,
+            port: None,
+            timeout: DEFAULT_TIMEOUT,
+            baud: None,
+        };
+        let err = run(args).expect_err("a scan has to be told what to scan");
+        assert!(err.to_string().contains("--interface"), "{err}");
+    }
+
+    #[test]
     fn test_a_port_and_an_interface_together_are_rejected() {
         // Both named is a mistake the arguments can name before any I/O: the
         // serial port is not a fallback for the CAN bus, it is another bus.
@@ -261,7 +279,7 @@ mod tests {
         // is a mistake rather than an unused option, and is caught before the
         // socket is opened.
         let args = ScanArgs {
-            interface: None,
+            interface: Some("can0".to_string()),
             port: None,
             timeout: DEFAULT_TIMEOUT,
             baud: Some(115_200),

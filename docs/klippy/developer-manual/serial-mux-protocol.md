@@ -123,7 +123,7 @@ CAN 侧的同族常量在 `canserial.rs`。
 - **扫描**（`klipperx scan --port <tty>`，`src/scan.rs`）：
   `serial_query_unassigned()` 广播一次查询，随后按与 `dispatch` 相同的成帧语义切单元
   （`UnitStream`），窗口是**从广播起算的截止时间**（`--timeout`，默认 2 s），按 uuid
-  去重、每块板第一次被听到时回调——输出 `Found uuid=%012x, Application: …` 与总数行，不给 `--port` 则扫 CAN（同一个 `klipperx scan`，`--interface` 选总线），两者输出同形。CAN 侧的扫描实现在 `canserial.rs` 的 `query_unassigned`。
+  去重、每块板第一次被听到时回调——输出 `Found uuid=%012x, Application: …` 与总数行，`--interface <bus>` 则扫 CAN（同一个 `klipperx scan`），两者输出同形。CAN 侧的扫描实现在 `canserial.rs` 的 `query_unassigned`。
 - **连接期**：`[mcu]` 节带 `uuid`（或别名 `canbus_uuid`）的共享串口，`attach()` 在发分配
   请求**之前**先写一枚 `SET_KLIPPER_NODEID`（按 uuid 点名 id），再走上一节的重确认
   握手——顺序与 CAN 的 `CanSerialDevice::open`（开链路时发 SET_NODEID）对应。

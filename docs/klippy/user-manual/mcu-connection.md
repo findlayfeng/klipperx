@@ -50,7 +50,7 @@ serial: /dev/ttyUSB0
 - **id**：就是 `[mcu_ids]` 分给该 MCU 的号（`canbus_nodeid` 可显式覆盖），与 CAN 节点号**同一个号段**——寻址用同一套映射 `0x100 + 2*id`（设备应答 `+1`）。
 - **握手**：每颗 MCU 在**打开（分配）这个共享端口时**同步做一次 id 指派握手，identify 之前完成；默认 **500 ms × 3 次**，无回执即连接失败。节上写了 `uuid`（或别名 `canbus_uuid`）时，握手**先按它发一枚 SET_NODEID**（`0x3f0` 的 `0x01`，按 uuid 点名 id）再发原有的重确认请求——帧序见[串口复用协议](../developer-manual/serial-mux-protocol.md)；独占串口**忽略** `uuid`（不发任何帧）。
 - **复位**：`restart_method` 的线级复位（`arduino` 的 DTR 翻转、`cheetah`、`rpi_usb` 切电）作用在**整条线**上，会把共享端口上的所有 MCU 一起打断——所以共享路径**强制 `restart_method: command`**：**显式写了**别的值（`arduino`/`cheetah`/`rpi_usb`）会在装载期告警并改用 `command`；没写则静默降级（串口默认的 `arduino` 只是默认）；非法拼写仍是配置错。
-- **发现**：还没分配 id 的设备用 `klipperx scan` 扫出可粘进配置的 uuid（不给参数扫 CAN，`--port <tty>` 扫串口；单次广播查询 + 截止窗口 + 按 uuid 去重，两种总线输出同形）。
+- **发现**：还没分配 id 的设备用 `klipperx scan` 扫出可粘进配置的 uuid（`--interface <总线>` 扫 CAN、`--port <tty>` 扫串口；单次广播查询 + 截止窗口 + 按 uuid 去重，两种总线输出同形）。
 
 > 设备端**尚未实现**这套复用协议：今天的串口固件不会回执，所以共享串口现在必然握手超时、连不上。这是预期状态——误配到旧固件只会连接失败，不会搞乱会话。
 

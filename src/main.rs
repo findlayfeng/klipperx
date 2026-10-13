@@ -122,11 +122,12 @@ enum Commands {
     // A bench tool, not part of the host: it needs no config file, and the query
     // it sends is a broadcast that changes no board's state — the UUIDs it prints
     // are what a `[mcu]` section then names in `uuid`. The transport is an
-    // argument, not a second command: no `--port` scans the CAN bus named by
-    // `--interface` (`can0` by default), and `--port <tty>` scans that serial port
-    // instead. No `arg_required_else_help`, unlike `stress`: every argument has a
-    // default or is optional, so naming it alone is an instruction — scan `can0`
-    // for two seconds.
+    // argument, not a second command, and it has no default: `--interface <name>`
+    // scans that CAN bus and `--port <tty>` scans that serial port, while naming
+    // neither is not a scan but a question — hence `arg_required_else_help`, like
+    // `api` and `stress`: a bare `scan` prints the help rather than guessing at a
+    // bus.
+    #[command(arg_required_else_help = true)]
     Scan(klipperx::scan::ScanArgs),
 }
 
@@ -476,22 +477,17 @@ mod tests {
     }
 
     #[test]
-    fn test_the_scan_subcommand_defaults_to_a_can_bus() {
-        // Every argument is optional or defaults, so naming the subcommand alone
-        // is an instruction rather than a question: scan `can0` for Klipper's two
-        // seconds.
-        let cli = parse(&["scan"]).expect("no argument is required");
-        match cli.command {
-            Some(Commands::Scan(args)) => {
-                assert_eq!(args.interface, None);
-                assert_eq!(args.port, None);
-                assert_eq!(args.timeout, 2.0);
-                assert_eq!(args.baud, None);
-            }
-            other => panic!("expected `scan`, got {other:?}"),
-        }
+    fn test_the_scan_subcommand_has_no_default_transport() {
+        // A bare `scan` is a question, not an instruction: with no default bus
+        // the subcommand prints its help instead of scanning something guessed.
+        let error = parse(&["scan"]).expect_err("a scan needs a transport");
+        let help = error.to_string();
+        assert!(
+            help.contains("--interface") && help.contains("--port"),
+            "{help}"
+        );
 
-        // The CAN side takes the interface name and the window.
+        // The CAN side names the bus, and may take the window.
         let cli = parse(&["scan", "--interface", "can1", "--timeout", "0.5"])
             .expect("both options are the subcommand's");
         match cli.command {
@@ -502,13 +498,15 @@ mod tests {
             other => panic!("expected `scan`, got {other:?}"),
         }
 
-        // The serial side names a port, and with it the line speed.
+        // The serial side names a port, and with it the line speed; the window
+        // is still the subcommand's own default.
         let cli = parse(&["scan", "--port", "/dev/ttyACM0", "--baud", "115200"])
             .expect("the port and the line speed are the subcommand's");
         match cli.command {
             Some(Commands::Scan(args)) => {
                 assert_eq!(args.port.as_deref(), Some("/dev/ttyACM0"));
                 assert_eq!(args.baud, Some(115200));
+                assert_eq!(args.timeout, 2.0);
             }
             other => panic!("expected `scan`, got {other:?}"),
         }

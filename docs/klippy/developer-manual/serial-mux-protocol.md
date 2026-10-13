@@ -28,60 +28,75 @@
 节点号是同一个号段、同一个序列。主机侧把仲裁 id 解回 `mcu_id` 时**两个方向都解回同一个
 id**（`mcu_id_from_arb`），方向本身由奇偶区分（`is_reply_arb`）。
 
-## 帧头：Klipper 的数值编码
+## 帧头：2 字节带校验的码字
 
-仲裁 id 用 **Klipper 自己的数值载荷编码**（VLQ：最高 7 位组在前，除末字节外都带 `0x80`
-续位；实现与上游 `msgproto.py` 的 `PT_uint32.encode` 逐位一致，本仓单一实现在
-`msg/proto.rs` 的 `vlq_encode`/`vlq_decode`，`Payload::push_vlq` 与 `PayloadParser::pop_u32`
-都调它）。
-
-本号段（258..=767）**恒为 2 字节**：
+头**不是** Klipper 的 VLQ：它是**固定 2 字节**，装仲裁 id 的 **10 个数据位 + 4 个校验位**
+（缩短汉明码：校验位落在 1/2/4/8，数据位占其余位置，码字宽 14 位），外面保留变长编码那
+两个定界位——首字节最高位恒 `1`、次字节恒 `0`——所以两字节边界在字节流上无歧义。单一实现在
+`shared_serial.rs`（`encode_header`/`decode_header`、`HEADER_*` 常量）。
 
 | `mcu_id` | 主机 → 设备 | 设备 → 主机 |
 |----------|------------|------------|
-| 1 | `82 02` | `82 03` |
-| 63 | `82 7E` | `82 7F` |
-| 255 | `85 7E` | `85 7F` |
+| 1 | `84 42` | `F4 42` |
+| 120 | `C0 7E` | `B0 7E` |
+| 255 | `AF 7D` | `DF 7D` |
+| admin | `E8 3F`（收听） | `98 3F`（应答） |
 
-**头里可以出现 `0x7e`**：`mcu_id ∈ {63, 127, 191, 255}` 时主机方向的第二字节就是 `0x7e`。
-这不是缺陷——上游 [Protocol.md](../../../third_party/klipper/docs/Protocol.md) 明确写着
-「a sync character is **not** exclusive to the framing and **may** be present in the message
-block content」，帧内容本来就允许含 `0x7e`，长度字节才是权威、CRC 负责校验。Klipper 的
-丢弃/重同步路径（`command_find_block`）也只在**校验失败**时才去扫下一个 `0x7e`。
+- **只检不纠**：校验矩阵的 14 个列（每个位置的非零 4 位编码，去掉一个）互异且非零 ⇒ 最小距离
+  3 ⇒ **任何 1 位、2 位错误都被检出**（`HeaderScan::Invalid` → 丢单元 + 按既有策略重同步）。
+  不做纠错是刻意的：2 位错若被「当作 1 位错纠正」会落到**另一个合法 id** 上，静默把帧投给
+  错误 MCU；检测则把它变成一次丢弃。
+- **为什么需要**：帧体的 CRC-16 **不覆盖头**（只算 `[len][seq][载荷]`）。头被翻位而仍落在另一个
+  合法 id 上时，帧体完好、CRC 通过，而同一根线上各 MCU 的会话序号是同步增长的，收到方很可能
+  把它当成本会话的合法帧——发给 A 的命令在 B 上执行。CAN 侧没这个问题（CAN 自己的 CRC 覆盖
+  仲裁 id）。丢弃后有 Klipper 帧自身的块级 ack/重传兜底。
+- **值域**：10 位数据位容纳 `0x000..=0x3ff`。协议占用的是分配域 `0x102..=0x2ff`（`id` 双向）与
+  admin `0x3f0`/`0x3f1`；**`0x3f2..=0x3ff` 保留**，本版本不发出、读到即丢。`0x3ff`
+  （`HEADER_ESCAPE`）是将来**扩展头**的起点（其后可接长度/子类型），所以 2 字节格式没有关掉
+  「加长的形式」这条路；保留带同时意味着 `nodeid` 可到 383（远超 CAN admin 报文单字节 `nodeid`
+  的 255 上限）。
+- **头里仍可出现 `0x7e`**：`id ∈ 120..=127` 时第二字节就是它（`id=120 → C0 7E`）。这不是缺陷——
+  上游 [Protocol.md](../../../third_party/klipper/docs/Protocol.md) 明确写着「a sync character is
+  **not** exclusive to the framing and **may** be present in the message block content」，帧内容
+  本来就允许含 `0x7e`；定界靠长度字节与那个固定两字节边界，不靠「头上不出现 `0x7e`」。Klipper 的
+  丢弃/重同步路径（`command_find_block`）也只在**校验失败**时才去扫下一个 `0x7e`。
 
 ## 单元 = 头 + 帧体
 
 ```
-[VLQ(仲裁 id)] [原始帧字节……]           ← 主机 → 设备，头用 0x100+2*id
-[VLQ(仲裁 id)] [原始帧字节……]           ← 设备 → 主机，头用 0x100+2*id+1
+[2 字节头(仲裁 id)] [原始帧字节……]       ← 主机 → 设备，头用 0x100+2*id
+[2 字节头(仲裁 id)] [原始帧字节……]       ← 设备 → 主机，头用 0x100+2*id+1
 ```
 
 **帧体一个字节都不改**：长度、序号、载荷、CRC 的覆盖范围、尾部 `0x7e` 全是原来的
 （`frame.rs`）。主机发送时把 `encode_header(arb) ++ frame.raw_bytes()` 一次写完（端口级写锁
-串行化，单元内部不会被另一颗 MCU 的写打断）；接收时按「VLQ 自定界 → 取长度字节 →
-凑齐该长度」切出整单元，剥掉头，把帧字节推进该 `mcu_id` 自己的 `FrameStream`
+串行化，单元内部不会被另一颗 MCU 的写打断）；接收时按「固定 2 字节头（校验通过）→ 取长度
+字节 → 凑齐该长度」切出整单元，剥掉头，把帧字节推进该 `mcu_id` 自己的 `FrameStream`
 （重组与校验仍是既有那套，`shared_serial.rs`）。
 
-长度字节不在 `MESSAGE_MIN..=MESSAGE_MAX`、或头结构上不可能成立时，按 `FrameStream` 的
-重同步语义丢弃到下一个 `0x7e`。
+头校验不过（`HeaderScan::Invalid`：定界位错、1/2 位错、或落在保留带）、长度字节不在
+`MESSAGE_MIN..=MESSAGE_MAX`、或头结构上不可能成立时，按 `FrameStream` 的重同步语义丢弃到
+下一个 `0x7e`。
 
 ## 分配期握手（identify 之前）
 
 每颗 MCU 在**分配（打开）这个共享端口时**做一次同步握手，握手之后才轮到 identify：
 
 ```
-请求（主机）  [VLQ(0x100+2*id)]   [09][20]["KXID"][crc16 hi][crc16 lo][7E]
-回执（设备）  [VLQ(0x100+2*id+1)] [09][20]["KXID"][crc16 hi][crc16 lo][7E]
+请求（主机）  [头(0x100+2*id)]   [09][20]["KXID"][crc16 hi][crc16 lo][7E]
+回执（设备）  [头(0x100+2*id+1)] [09][20]["KXID"][crc16 hi][crc16 lo][7E]
 ```
 
 - 那个 9 字节伪帧就是 `shared_serial.rs` 的**伪帧**（`ASSIGN_SEQ_BYTE` / `MAGIC`）：与合法帧只差 seq 字节——`0x20` 把
   `MESSAGE_DEST`（`0x10`）清掉、改占 bit5，于是 `Frame::parse` 必然拒收它（`frame.rs`），
   这让它天然区别于数据帧。**id 只在头里出现一次**，载荷只放 `KXID` 标记（不再编一遍号）。
-- **请求对旧固件无害**：旧固件的 `command_find_block` 按「长度 → seq 字节 → …」检查，在
-  seq 字节处就进错误分支——不读载荷、不查 CRC、永不 dispatch、序号不动，丢弃吞下本帧
-  （至多回一枚无害空帧后转静默）。所以把共享串口误配到不支持复用的板子上，结果是
-  **握手超时、连接失败**，而不是把已有会话搞乱。这条性质由 `interface/devices/shared_serial.rs` 里
-  `third_party/klipper/src/command.c` 的**可执行忠实移植测试**钉住。
+- **请求对旧固件无害**：旧固件的 `command_find_block` 按「长度 → seq 字节 → …」检查，而单元
+  出线的第一个字节就是头的首字节（`0x80..=0xff`，不是合法长度），所以它在**第一个字节**处就进
+  错误分支、丢弃到下一个 `0x7e`；`id ∈ 120..=127` 时那个 `0x7e` 就是头的第二字节，伪帧留给下一次
+  调用再丢一次。两步都**不读载荷、不查 CRC、永不 dispatch、序号不动**（至多回一枚无害空帧后转
+  静默）。所以把共享串口误配到不支持复用的板子上，结果是 **握手超时、连接失败**，而不是把已有
+  会话搞乱。这条性质由 `interface/devices/shared_serial.rs` 里 `third_party/klipper/src/command.c`
+  的**可执行忠实移植测试**钉住（整单元——含新头——也补了一条）。
 - 超时与重试：默认 500 ms × 3 次（`ASSIGN_ATTACH_TIMEOUT` / `ASSIGN_ATTACH_ATTEMPTS`）；
   用尽仍无回执 → `InterfaceError::Timeout`，`connect` 失败。
 - 端口自打开起就有**唯一 reader**：某颗 MCU 来 attach 时在该 reader 里登记一个
@@ -109,9 +124,9 @@ CAN 侧的同族常量在 `canserial.rs`。
 
 | 命令/应答 | 字节 | 方向 | 单元 |
 |-----------|------|------|------|
-| `QUERY_UNASSIGNED` | `0x00` | 主机 → 全部 | `[VLQ(0x3f0)][len][0x20]["KXID"][0x00][crc16][0x7e]`（`discovery_query()`） |
-| `SET_KLIPPER_NODEID` | `0x01` | 主机 → 点名 | `[VLQ(0x3f0)][len][0x20]["KXID"][0x01][uuid 大端 6 字节][nodeid][crc16][0x7e]`（`set_node_id_for(uuid, id)`，id 越界返回 `None`，校验同 CAN） |
-| `NEED_NODEID` | `0x20` | 设备 → 主机 | `[VLQ(0x3f1)][len][0x20]["KXID"][0x20][uuid 大端 6 字节][app?][crc16][0x7e]`（`UnassignedNode::from_unit`） |
+| `QUERY_UNASSIGNED` | `0x00` | 主机 → 全部 | `[头(0x3f0)][len][0x20]["KXID"][0x00][crc16][0x7e]`（`discovery_query()`） |
+| `SET_KLIPPER_NODEID` | `0x01` | 主机 → 点名 | `[头(0x3f0)][len][0x20]["KXID"][0x01][uuid 大端 6 字节][nodeid][crc16][0x7e]`（`set_node_id_for(uuid, id)`，id 越界返回 `None`，校验同 CAN） |
+| `NEED_NODEID` | `0x20` | 设备 → 主机 | `[头(0x3f1)][len][0x20]["KXID"][0x20][uuid 大端 6 字节][app?][crc16][0x7e]`（`UnassignedNode::from_unit`） |
 
 - uuid **高位字节在前**；应答末尾可带一枚 application 字节：无字节或 `0x01` = Klipper、
   `0x11` = CanBoot、其它 = `Unknown`（`application_name()`）——一字不带的旧形状也认。

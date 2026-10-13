@@ -14,18 +14,38 @@
 //!
 //! # The frame header
 //!
-//! Every unit starts with a bare Klipper VLQ of the arbitration id. Over the
-//! whole assigned range (`0x102..=0x2ff`, ids `1..=255` in both directions) the
-//! header is always exactly two bytes. [`encode_header`] / [`decode_header`]
-//! are the codec; the VLQ itself is the message system's own
-//! ([`crate::core::klippy::msg::proto`]), not a copy, and the id mapping is
-//! [`crate::core::klippy::assign`]'s.
+//! Every unit starts with a **two-byte header**: the arbitration id as ten data
+//! bits plus four check bits, laid out as a shortened Hamming code, with the two
+//! framing bits the variable-length encoding next to it uses (`0x80` set on the
+//! first byte, clear on the second) kept in place — so the header is
+//! self-delimiting at exactly two bytes even though the bytes are now a codeword
+//! rather than a Klipper VLQ. [`encode_header`] / [`decode_header`] are the
+//! codec; the id mapping is [`crate::core::klippy::assign`]'s.
 //!
-//! A VLQ of an id may end in `0x7e` (`mcu_id = 63, 127, 191, 255` all do). That
-//! is not a problem: frame *content* is allowed to contain SYNC — upstream,
-//! `docs/Protocol.md:178-183`: “a sync character is not exclusive to the
-//! framing and may be present in the message block content” — so a SYNC inside
-//! the header is ordinary data.
+//! The check bits are **detect-only**: any one- or two-bit error in the header
+//! (and a flip of either framing bit) is rejected. That matters because the
+//! frame's CRC-16 covers the frame bytes only — *not* the header that routes
+//! them — so without it a corrupt header would hand a perfectly valid frame to
+//! the wrong MCU on the same line, whose sequence numbering runs in lockstep
+//! with its neighbours'. Detection turns that into a dropped unit and the
+//! ordinary resync ([`HeaderScan::Invalid`]).
+//!
+//! The ten data bits hold `0x000..=0x3ff`. Every id the protocol uses fits:
+//! the assigned range is `0x102..=0x2ff` (ids `1..=255` in both directions) and
+//! the admin ids are `0x3f0`/`0x3f1`. The top of the field —
+//! [`HEADER_RESERVED_FIRST`] `0x3f2` through [`HEADER_ESCAPE`] `0x3ff` — is
+//! **reserved**: this version never emits it, and a reader that decodes one
+//! drops the unit. That band is where a longer header would grow from later (the
+//! escape value would start an extended unit), so the two-byte format does not
+//! close that door. It also holds node ids up to 383, well above the 255 the CAN
+//! admin frame's one-byte node-id field allows.
+//!
+//! A header byte may still be `0x7e` (the ids around 120 put it in the second
+//! byte). That is not a problem: frame *content* is allowed to contain SYNC —
+//! upstream, `docs/Protocol.md:178-183`: “a sync character is not exclusive to
+//! the framing and may be present in the message block content” — so a SYNC
+//! inside the header is ordinary data, and the resync path scans past it as it
+//! always did.
 //!
 //! # Attaching
 //!
@@ -43,9 +63,9 @@
 //! pseudo-frame body is fixed and identical in both directions:
 //!
 //! ```text
-//! [vlq(arb)][len=9][0x20]["K" "X" "I" "D"][crc16 hi][crc16 lo][0x7e]
-//!  \______/  \____________________________________________________/
-//!   the id    a well-formed frame except for the sequence byte
+//! [2-byte header][len=9][0x20]["K" "X" "I" "D"][crc16 hi][crc16 lo][0x7e]
+//!  \_____________/  \________________________________________________/
+//!       the id        a well-formed frame except for the sequence byte
 //! ```
 //!
 //! * `len` is in `[MESSAGE_MIN, MESSAGE_MAX]`, the CRC is the ordinary
@@ -124,7 +144,6 @@ use crate::core::klippy::frame::{
 };
 use crate::core::klippy::interface::error::InterfaceError;
 use crate::core::klippy::interface::Device;
-use crate::core::klippy::msg::proto::{vlq_decode, vlq_encode, VlqDecode};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
@@ -174,13 +193,116 @@ pub const ASSIGN_SEQ_BYTE: u8 = 0x20;
 /// frame.
 pub const MAGIC: &[u8; 4] = b"KXID";
 
-/// Encode a frame header: the arbitration id as a bare Klipper VLQ.
+/// The two bytes a frame header occupies.
+pub const HEADER_BYTES: usize = 2;
+
+/// The data bits the header carries.
+const HEADER_DATA_BITS: u32 = 10;
+
+/// The largest value the ten data bits hold.
+pub const HEADER_MAX: u32 = (1 << HEADER_DATA_BITS) - 1;
+
+/// The first value of the reserved band (`0x3f2`): legal codewords that name no
+/// address. [`HEADER_ESCAPE`] is where a longer header would start, so a reader
+/// that decodes any of them drops the unit.
+pub const HEADER_RESERVED_FIRST: u32 = 0x3f2;
+
+/// The escape value (`0x3ff`): the first byte of a longer, extended header if
+/// one is ever defined. Nothing emits it today.
+pub const HEADER_ESCAPE: u32 = 0x3ff;
+
+/// The codeword's total width: ten data bits plus four check bits.
+const HEADER_CODE_BITS: u32 = 14;
+
+/// Where the four check bits sit in the codeword (1-indexed, most significant
+/// bit first): the powers of two, as in a Hamming code.
+const HEADER_CHECK_POSITIONS: [u32; 4] = [1, 2, 4, 8];
+
+/// Where the ten data bits sit: every other position. Position 15 — the one a
+/// full 15-bit Hamming code would add — is what this shortened code drops.
+const HEADER_DATA_POSITIONS: [u32; 10] = [3, 5, 6, 7, 9, 10, 11, 12, 13, 14];
+
+/// The codeword for `arb`: its ten data bits, plus the four check bits that
+/// make every column of the parity-check matrix sum to even.
 ///
-/// Over the assigned range (`0x102..=0x2ff`) this is always two bytes.
+/// The matrix's columns are the 14 positions — every non-zero four-bit pattern
+/// but 15 — so they are distinct and non-zero, the code's minimum distance is
+/// three, and **every one- or two-bit error changes the syndrome**. That is the
+/// point of the code (see the module docs); no error is ever corrected, only
+/// caught.
+fn header_codeword(arb: u32) -> u16 {
+    let mut code = 0u16;
+    for (bit, &position) in HEADER_DATA_POSITIONS.iter().enumerate() {
+        if arb & (1 << bit) != 0 {
+            code |= 1 << (HEADER_CODE_BITS - position);
+        }
+    }
+    for (check, &position) in HEADER_CHECK_POSITIONS.iter().enumerate() {
+        // This check bit covers the positions whose own encoding has bit
+        // `check` set; it is set to make the group, plus itself, even.
+        let mut covered = 0usize;
+        for (bit, &data) in HEADER_DATA_POSITIONS.iter().enumerate() {
+            if (data >> check) & 1 == 1 && arb & (1 << bit) != 0 {
+                covered += 1;
+            }
+        }
+        if covered % 2 == 1 {
+            code |= 1 << (HEADER_CODE_BITS - position);
+        }
+    }
+    code
+}
+
+/// The syndrome of a codeword: the XOR of the positions of its set bits, zero
+/// exactly for a well-formed codeword.
+///
+/// A one-bit error leaves the syndrome equal to the flipped position and a
+/// two-bit error to the XOR of the two — non-zero either way, because the 14
+/// positions are distinct non-zero values.
+fn header_syndrome(code: u16) -> u8 {
+    let mut syndrome = 0u8;
+    for position in 1..=HEADER_CODE_BITS {
+        if code & (1 << (HEADER_CODE_BITS - position)) != 0 {
+            syndrome ^= position as u8;
+        }
+    }
+    syndrome
+}
+
+/// The ten data bits of a well-formed codeword.
+fn header_data(code: u16) -> u32 {
+    let mut arb = 0u32;
+    for (bit, &position) in HEADER_DATA_POSITIONS.iter().enumerate() {
+        if code & (1 << (HEADER_CODE_BITS - position)) != 0 {
+            arb |= 1 << bit;
+        }
+    }
+    arb
+}
+
+/// A codeword as the two bytes that go on the wire. The leading `0x80` and the
+/// clear high bit of the second byte are the framing kept from the
+/// variable-length encoding this replaces: they are what makes the two-byte
+/// boundary unambiguous on the stream.
+fn header_bytes(code: u16) -> [u8; HEADER_BYTES] {
+    [0x80 | ((code >> 7) & 0x7f) as u8, (code & 0x7f) as u8]
+}
+
+/// Encode a frame header: the arbitration id as the checked, two-byte codeword
+/// above.
+///
+/// # Panics
+///
+/// Panics if `arb` is in the reserved band ([`HEADER_RESERVED_FIRST`] and up),
+/// which names no address — a programming error, since every caller validates
+/// first ([`assign::arb_id`], the admin constants).
 pub fn encode_header(arb: u32) -> Vec<u8> {
-    let mut out = Vec::with_capacity(2);
-    vlq_encode(arb, &mut out);
-    out
+    assert!(
+        arb < HEADER_RESERVED_FIRST,
+        "arbitration id {arb:#x} is reserved (0x{HEADER_RESERVED_FIRST:x}..=0x{HEADER_MAX:x}) \
+         and names no address"
+    );
+    header_bytes(header_codeword(arb)).to_vec()
 }
 
 /// The outcome of reading a frame header off the front of a byte slice.
@@ -188,21 +310,39 @@ pub fn encode_header(arb: u32) -> Vec<u8> {
 pub enum HeaderScan {
     /// A whole arbitration id, occupying `consumed` bytes.
     Complete { arb: u32, consumed: usize },
-    /// The slice ends inside the id; more bytes could complete it.
+    /// The slice ends inside the header; more bytes could complete it.
     NeedMore,
-    /// The bytes cannot be a `u32` VLQ (more than five continuation bytes).
+    /// The bytes are not a header: a framing bit is wrong, the check bits do
+    /// not match (every one- and two-bit error), or the codeword is in the
+    /// reserved band.
     Invalid,
 }
 
 /// Decode the frame header at the front of `buf`.
 pub fn decode_header(buf: &[u8]) -> HeaderScan {
-    match vlq_decode(buf) {
-        VlqDecode::Complete { value, consumed } => HeaderScan::Complete {
-            arb: value,
-            consumed,
-        },
-        VlqDecode::NeedMore => HeaderScan::NeedMore,
-        VlqDecode::Invalid => HeaderScan::Invalid,
+    if buf.len() < HEADER_BYTES {
+        return HeaderScan::NeedMore;
+    }
+    let (first, second) = (buf[0], buf[1]);
+    // The two framing bits are fixed: a pair that breaks them is not a header,
+    // whatever its check bits say (this catches two more bit errors, and keeps
+    // the two-byte boundary unambiguous).
+    if first & 0x80 == 0 || second & 0x80 != 0 {
+        return HeaderScan::Invalid;
+    }
+    let code = ((first & 0x7f) as u16) << 7 | (second & 0x7f) as u16;
+    if header_syndrome(code) != 0 {
+        return HeaderScan::Invalid;
+    }
+    let arb = header_data(code);
+    // A well-formed codeword in the reserved band names no address: the unit is
+    // dropped (this is where a longer header would be recognized instead).
+    if arb >= HEADER_RESERVED_FIRST {
+        return HeaderScan::Invalid;
+    }
+    HeaderScan::Complete {
+        arb,
+        consumed: HEADER_BYTES,
     }
 }
 
@@ -234,7 +374,7 @@ pub fn assignment_reply(mcu_id: u32) -> Option<Vec<u8>> {
 
 /// Recognize an assignment answer and return the id it names.
 ///
-/// Everything must be self-consistent: a whole VLQ header whose arbitration id
+/// Everything must be self-consistent: a whole header whose arbitration id
 /// is the reply direction ([`is_reply_arb`](assign::is_reply_arb)) and decodes
 /// to an [`mcu_id`](assign::mcu_id_from_arb), then a pseudo-frame whose length
 /// byte matches the bytes present, whose sequence byte is [`ASSIGN_SEQ_BYTE`],
@@ -320,7 +460,7 @@ fn kxid_unit(payload: &[u8]) -> Vec<u8> {
 ///
 /// A board that has never been handed a node id is addressed on
 /// [`ADMIN_LISTEN`], the same id CAN's broadcast uses; the unit is
-/// `[VLQ(0x3f0)][len][0x20]["KXID"][0x00][crc16][0x7e]`.
+/// `[header(0x3f0)][len][0x20]["KXID"][0x00][crc16][0x7e]`.
 pub fn discovery_query() -> Vec<u8> {
     let mut unit = encode_header(ADMIN_LISTEN);
     unit.extend_from_slice(&kxid_unit(&[CMD_QUERY_UNASSIGNED]));
@@ -384,7 +524,7 @@ impl UnassignedNode {
     /// The board a unit reports, or `None` for a unit that is not an answer.
     ///
     /// What makes a unit an answer is its shape, checked the way
-    /// [`parse_assignment_ack`] checks the handshake's: a whole VLQ header
+    /// [`parse_assignment_ack`] checks the handshake's: a whole header
     /// naming [`ADMIN_REPLY`], then a frame whose length byte matches the
     /// bytes present, whose sequence byte is [`ASSIGN_SEQ_BYTE`], whose
     /// trailer and CRC check out, and whose content after [`MAGIC`] begins
@@ -481,7 +621,7 @@ impl UnassignedScan {
     }
 }
 
-/// A byte stream being cut into whole units — a bare VLQ header plus one frame
+/// A byte stream being cut into whole units — a two-byte header plus one frame
 /// — with the same framing and resync policy as the reader's [`dispatch`].
 ///
 /// [`dispatch`] routes each unit by its arbitration id, which is why it cannot
@@ -923,7 +1063,7 @@ fn reader_loop(weak: Weak<SharedSerialPort>, file: Arc<File>) {
 
 /// Cut every whole unit out of `pending` and deliver it.
 ///
-/// A unit is a bare VLQ header ([`decode_header`]) followed by one frame
+/// A unit is a header ([`decode_header`]) followed by one frame
 /// (length byte + that many bytes). Anything that cannot be one — an invalid
 /// header, an arbitration id outside the assigned range, or a length byte
 /// outside `MESSAGE_MIN..=MESSAGE_MAX` — resynchronises on the next SYNC, the
@@ -1519,6 +1659,41 @@ mod tests {
     }
 
     #[test]
+    fn the_firmware_discards_the_whole_unit_header_included() {
+        // The pseudo-frame is what the old firmware's block parser chokes on,
+        // but what arrives on the wire is the header *first*: its `0x80..=0xff`
+        // first byte is already an out-of-range length, so the parser discards
+        // through the next SYNC — for most ids our own trailer, and for the ids
+        // whose header carries a `0x7e` (120..=127) that byte, leaving the
+        // pseudo-frame to be discarded on the following call. Either way the unit
+        // is thrown away in whole, with no dispatch and no sequence taken — the
+        // "harmless to old firmware" property holds for the unit, not just its
+        // body.
+        for id in [1u32, 120, 255] {
+            let unit = assignment_request(id).expect("a valid id");
+            let mut st = FwState::default();
+            let mut eaten = 0usize;
+            let mut calls = 0;
+            while eaten < unit.len() {
+                match fw_find_block(&unit[eaten..], &mut st) {
+                    Outcome::Discarded { consumed, .. } => {
+                        assert!(consumed > 0, "id {id}: the parser must make progress");
+                        eaten += consumed;
+                    }
+                    other => panic!("id {id}: expected a discard, got {other:?}"),
+                }
+                calls += 1;
+                assert!(calls <= 4, "id {id}: the parser must not spin");
+            }
+            assert_eq!(eaten, unit.len(), "id {id}: the whole unit is discarded");
+            assert_eq!(
+                st.next_sequence, MESSAGE_DEST,
+                "id {id}: no sequence consumed"
+            );
+        }
+    }
+
+    #[test]
     fn the_firmware_discards_the_request_without_dispatching_it() {
         let request = pseudo_frame();
         let mut st = FwState::default();
@@ -1694,13 +1869,18 @@ mod tests {
                 );
             }
         }
-        // The endpoints of the range are the two-byte values below.
-        assert_eq!(encode_header(0x102), vec![0x82, 0x02]);
-        assert_eq!(encode_header(0x2ff), vec![0x85, 0x7f]);
+        // The endpoints of the assigned range are the two-byte codewords below;
+        // the bytes carry check bits as well as value now, so they no longer
+        // read as an integer the way a VLQ did.
+        assert_eq!(encode_header(0x102), vec![0x84, 0x42]);
+        assert_eq!(encode_header(0x2ff), vec![0xdf, 0x7d]);
+        // The admin pair, whose headers are codewords for `0x3f0`/`0x3f1`.
+        assert_eq!(encode_header(ADMIN_LISTEN), vec![0xe8, 0x3f]);
+        assert_eq!(encode_header(ADMIN_REPLY), vec![0x98, 0x3f]);
 
         // A truncated header waits for the rest instead of guessing.
         assert_eq!(decode_header(&[]), HeaderScan::NeedMore);
-        assert_eq!(decode_header(&[0x82]), HeaderScan::NeedMore);
+        assert_eq!(decode_header(&[0x84]), HeaderScan::NeedMore);
         let full = encode_header(0x2ff);
         assert_eq!(decode_header(&full[..1]), HeaderScan::NeedMore);
         assert_eq!(
@@ -1716,26 +1896,115 @@ mod tests {
     fn boundary_id_headers_may_contain_a_sync_byte() {
         // The protocol allows 0x7e in frame *content* (`docs/Protocol.md:178-183`:
         // “a sync character is not exclusive to the framing and may be present
-        // in the message block content”). A VLQ whose last byte is 0x7e is
-        // therefore acceptable, and these values pin that behavior on purpose.
-        for (id, expected) in [
-            (63u32, [0x82u8, 0x7e]),
-            (127, [0x83, 0x7e]),
-            (191, [0x84, 0x7e]),
-            (255, [0x85, 0x7e]),
-        ] {
-            let arb = assign::arb_id(id).unwrap();
-            let header = encode_header(arb);
-            assert_eq!(header, expected, "id {id}");
-            assert!(
-                header.contains(&MESSAGE_SYNC),
-                "id {id} should exercise the 0x7e content byte"
-            );
-            assert_eq!(
-                decode_header(&header),
-                HeaderScan::Complete { arb, consumed: 2 }
-            );
+        // in the message block content”). A header whose second byte lands on
+        // 0x7e is therefore acceptable: what delimits it is the fixed two bytes,
+        // not the absence of SYNC. Id 120 is the pair that does it, and the
+        // whole range is walked so that stays the only claim.
+        let mut with_sync = Vec::new();
+        for id in 1..=MAX_MCU_ID {
+            let host = encode_header(assign::arb_id(id).unwrap());
+            let reply = encode_header(assign::reply_arb_id(id).unwrap());
+            for (arb, header) in [
+                (assign::arb_id(id).unwrap(), &host),
+                (assign::reply_arb_id(id).unwrap(), &reply),
+            ] {
+                assert_eq!(
+                    decode_header(header),
+                    HeaderScan::Complete { arb, consumed: 2 },
+                    "id {id}"
+                );
+            }
+            if host.contains(&MESSAGE_SYNC) || reply.contains(&MESSAGE_SYNC) {
+                with_sync.push(id);
+            }
         }
+        assert_eq!(
+            with_sync,
+            (120..=127).collect::<Vec<u32>>(),
+            "the ids whose header carries the SYNC byte"
+        );
+        assert_eq!(
+            encode_header(assign::arb_id(120).unwrap()),
+            vec![0xc0, 0x7e]
+        );
+        assert_eq!(
+            encode_header(assign::reply_arb_id(120).unwrap()),
+            vec![0xb0, 0x7e]
+        );
+    }
+
+    #[test]
+    fn a_single_bit_error_in_the_header_is_rejected() {
+        // The check bits exist because the frame's CRC-16 does not cover the
+        // header: every one-bit error in either byte is caught, so a corrupted
+        // header can never quietly hand a valid frame to another MCU.
+        for id in [1u32, 42, 120, 255] {
+            for arb in [
+                assign::arb_id(id).unwrap(),
+                assign::reply_arb_id(id).unwrap(),
+                ADMIN_LISTEN,
+                ADMIN_REPLY,
+            ] {
+                let good = encode_header(arb);
+                for bit in 0..8 * HEADER_BYTES {
+                    let mut bad = good.clone();
+                    bad[bit / 8] ^= 1 << (bit % 8);
+                    assert_eq!(
+                        decode_header(&bad),
+                        HeaderScan::Invalid,
+                        "arb {arb:#x}, bit {bit}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn two_bit_errors_in_the_header_are_rejected() {
+        // The parity-check columns are distinct and non-zero, so the code's
+        // minimum distance is three: no two-bit error can land on another
+        // codeword — the dangerous case, a wrong id that still checks out.
+        for id in [1u32, 120, 255] {
+            for arb in [
+                assign::arb_id(id).unwrap(),
+                assign::reply_arb_id(id).unwrap(),
+            ] {
+                let good = encode_header(arb);
+                for first in 0..8 * HEADER_BYTES {
+                    for second in first + 1..8 * HEADER_BYTES {
+                        let mut bad = good.clone();
+                        bad[first / 8] ^= 1 << (first % 8);
+                        bad[second / 8] ^= 1 << (second % 8);
+                        assert_eq!(
+                            decode_header(&bad),
+                            HeaderScan::Invalid,
+                            "arb {arb:#x}, bits {first},{second}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_reserved_codeword_is_rejected_rather_than_routed() {
+        // `0x3f2..=0x3ff` are well-formed codewords (their check bits are
+        // computed the same way) that name no address: the escape value is where
+        // a longer header would start, so a reader that meets one today drops
+        // the unit instead of routing it. That is what keeps the door open for
+        // extending the header later without a format change.
+        for arb in HEADER_RESERVED_FIRST..=HEADER_MAX {
+            let bytes = header_bytes(header_codeword(arb));
+            assert_eq!(decode_header(&bytes), HeaderScan::Invalid, "arb {arb:#x}");
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "reserved")]
+    fn encoding_a_reserved_id_panics() {
+        // The encoder refuses the reserved band: emitting one would be a
+        // programming error, not a config error (the callers validate first).
+        encode_header(HEADER_RESERVED_FIRST);
     }
 
     #[test]
@@ -1836,13 +2105,14 @@ mod tests {
 
     #[test]
     fn the_discovery_query_is_the_admin_broadcast_unit() {
-        // The bytes on the wire, exactly: the admin listen id as a VLQ header,
-        // then the `KXID` frame with the query byte, its computed CRC and its
-        // trailer — CAN's broadcast (`0x3f0`, `CMD_QUERY_UNASSIGNED`) carried
-        // inside the stream frame. Only the frame's own trailer is a SYNC.
+        // The bytes on the wire, exactly: the admin listen id as a checked
+        // header, then the `KXID` frame with the query byte, its computed CRC
+        // and its trailer — CAN's broadcast (`0x3f0`, `CMD_QUERY_UNASSIGNED`)
+        // carried inside the stream frame. Only the frame's own trailer is a
+        // SYNC.
         assert_eq!(
             discovery_query(),
-            [0x87, 0x70, 0x0a, 0x20, 0x4b, 0x58, 0x49, 0x44, 0x00, 0x12, 0xd6, 0x7e]
+            [0xe8, 0x3f, 0x0a, 0x20, 0x4b, 0x58, 0x49, 0x44, 0x00, 0x12, 0xd6, 0x7e]
         );
         let unit = discovery_query();
         assert_eq!(
@@ -1860,7 +2130,7 @@ mod tests {
             set_node_id_for([0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc], 2)
                 .expect("2 is an addressable id"),
             [
-                0x87, 0x70, 0x11, 0x20, 0x4b, 0x58, 0x49, 0x44, 0x01, 0x11, 0xaa, 0x22, 0xbb, 0x33,
+                0xe8, 0x3f, 0x11, 0x20, 0x4b, 0x58, 0x49, 0x44, 0x01, 0x11, 0xaa, 0x22, 0xbb, 0x33,
                 0xcc, 0x02, 0xa0, 0x5e, 0x7e
             ]
         );
@@ -1886,7 +2156,7 @@ mod tests {
             set_node_id_for([0x7e, 0x11, 0x22, 0x33, 0x44, 0x55], 1)
                 .expect("1 is an addressable id"),
             [
-                0x87, 0x70, 0x11, 0x20, 0x4b, 0x58, 0x49, 0x44, 0x01, 0x7e, 0x11, 0x22, 0x33, 0x44,
+                0xe8, 0x3f, 0x11, 0x20, 0x4b, 0x58, 0x49, 0x44, 0x01, 0x7e, 0x11, 0x22, 0x33, 0x44,
                 0x55, 0x01, 0xca, 0xcd, 0x7e
             ]
         );

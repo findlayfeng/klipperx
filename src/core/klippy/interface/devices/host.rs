@@ -964,7 +964,9 @@ const OUTPUT_WAIT_MS: u32 = 100;
 mod host_tests {
     use super::*;
     use crate::core::klippy::assign;
+    use crate::core::klippy::config::access::AccessTracking;
     use crate::core::klippy::config::mcu::McuConfig;
+    use crate::core::klippy::config::Config;
     use crate::core::klippy::config::{ConfigSection, ConfigValue, ConfigWrapper};
     use crate::core::klippy::frame::{
         MESSAGE_DEST, MESSAGE_HEADER_SIZE, MESSAGE_MAX, MESSAGE_MIN, MESSAGE_SYNC,
@@ -974,6 +976,7 @@ mod host_tests {
         ADMIN_REPLY, MAGIC, RESP_NEED_NODEID,
     };
     use crate::core::klippy::interface::pty::Pty;
+    use crate::core::klippy::mcu::host_libraries::HostLibraries;
     use crate::core::klippy::mcu::{Dictionary, Mcu};
     use crate::core::klippy::msg::parser::Parser;
     use crate::core::klippy::msg::proto::{ArgValue, Payload};
@@ -1175,6 +1178,58 @@ mod host_tests {
     /// frequency all come from the firmware.
     ///
     /// [`Dictionary`]: crate::core::klippy::mcu::Dictionary
+    /// A muxed `host_library:` path attaches **through the mux**: the identity
+    /// the load-time pass assigns the path is handed to the library before it
+    /// comes up, the assignment names it, and the firmware's own device answers
+    /// the handshake and speaks header-addressed frames from then on.
+    ///
+    /// Two sections name one library because that is what makes the path muxed,
+    /// and the one without a `uuid` claims the bridge's own device - the one
+    /// this test attaches to (the other section's device lives behind the
+    /// bridge and needs a downstream board on the tty).
+    #[tokio::test]
+    async fn test_a_muxed_host_path_attaches_to_the_real_library() {
+        let _serial = HOST_LIBRARY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+
+        // The bridge opens its port while the library comes up, so the tty has
+        // to exist first - the same trick the device-half test uses.
+        let pty = Pty::new();
+        let bridge_path = klipperx_test_support::klipper_host_mux_serial_path();
+        let _ = std::fs::remove_file(&bridge_path);
+        std::os::unix::fs::symlink(&pty.path, &bridge_path).expect("the bridge port path");
+
+        let library = mux_library_path();
+        let path = library.display().to_string();
+        let text = format!(
+            "[mcu]\nhost_library: {path}\n\
+             [mcu child]\nhost_library: {path}\nuuid: 1234567890ab\n"
+        );
+        let (config, _) = Config::from_text(&text).expect("the config parses");
+        let section = config
+            .sections()
+            .find(|section| section.id == "mcu")
+            .expect("the config has an [mcu] section");
+        let wrapper = ConfigWrapper::with_config(section, AccessTracking::shared(), None, &config);
+
+        // The config layer's own judgement: two sections on one path are muxed,
+        // and the path gets an identity - the value the library is told.
+        let libraries = HostLibraries::classify(&wrapper).expect("the path is told apart");
+        assert!(libraries.is_mux(&path), "two sections on a path are muxed");
+        let identity = libraries.identity(&path).expect("the path has an identity");
+
+        let mut mcu = McuConfig::new(&wrapper).expect("the [mcu] section");
+        mcu.id = Some(7);
+        mcu.host_mux = Some(HostMux {
+            identity,
+            named: identity,
+        });
+        let interface = mcu.open().expect("the muxed library opens and attaches");
+        let mcu = identify_and_clock(&mcu, &interface).await;
+        assert!(mcu.is_identified());
+    }
+
     #[tokio::test]
     async fn test_identify_against_the_real_library() {
         let _serial = HOST_LIBRARY_TEST_LOCK

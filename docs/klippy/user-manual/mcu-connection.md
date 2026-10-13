@@ -52,7 +52,7 @@ serial: /dev/ttyUSB0
 - **复位**：`restart_method` 的线级复位（`arduino` 的 DTR 翻转、`cheetah`、`rpi_usb` 切电）作用在**整条线**上，会把共享端口上的所有 MCU 一起打断——所以共享路径**强制 `restart_method: command`**：**显式写了**别的值（`arduino`/`cheetah`/`rpi_usb`）会在装载期告警并改用 `command`；没写则静默降级（串口默认的 `arduino` 只是默认）；非法拼写仍是配置错。
 - **发现**：还没分配 id 的设备用 `klipperx scan` 扫出可粘进配置的 uuid（`--interface <总线>` 扫 CAN、`--port <tty>` 扫串口、`--host-library <path.so>` 扫一份 host 库；单次广播查询 + 截止窗口 + 按 uuid 去重，三种传输输出同形）。扫 host 库时用 `--host-identity <12 位十六进制>`（默认全 `0`）给出库在 `init` 前要采纳的身份，它**只在给了 `--host-library` 时可用**。
 
-> 设备端**只落地了一部分**：单元格式与 admin 单元族已在固件里（`src/mux.c`），host 库还有下游串口端口与 unit 收发接口（`klipper_host_input_unit`/`klipper_host_output_unit`）；**设备半的状态机**（应答扫描、采纳 nodeid、id 冲突处理）、以及**桥的接线与路由**（`CONFIG_BRIDGE`：把下游端口接进控制台、`id ↔ 端口` 路由表）仍待做，所以今天的固件不会回执——共享串口现在必然握手超时、连不上。这是预期状态：误配到旧固件只会连接失败，不会搞乱会话。
+> 设备端**设备半已实现，但没有架构默认启用它**：`src/mux.c` 有单元格式、admin 单元族与设备半（`mux_input()` 就地解析：首字节高位置位=带头单元、否则=原始帧；未分配答扫描、按 `0x01` 采纳 node id、id 冲突照 CAN 弃号并 `shutdown`），host 库还有下游串口端口与 unit 收发接口。但 `MUX_SERIAL` 目前只由 host 的桥模式选上，**微控制器还没启用**——所以今天的共享**串口**固件仍不回执、必然握手超时、连不上；**桥的接线与路由**（`CONFIG_BRIDGE`：把下游端口接进这条链路、`id ↔ 端口` 路由表）也仍待做。这是预期状态：误配到旧固件只会连接失败，不会搞乱会话。
 
 ### 线上的形状（设备端实现规格）
 

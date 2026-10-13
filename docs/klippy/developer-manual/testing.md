@@ -26,6 +26,13 @@ KLIPPERX_KLIPPER_DIR=<主检出>/third_party/klipper cargo test --workspace
 
 另有一个**真实设备**测试：`interface::devices::host::host_tests` 通过 `dlopen` 加载 klipper 的 host 库（`third_party/klipper/src/host/`），在其中跑 `get_clock` 往返。该库由 dev-dependency `klipperx-test-support` 的 `build.rs` 调 `make` 构建，所以需要 `make` 与 C 工具链；库的全局状态使旧固件同一时刻只能有一路活动连接，但 host 半的**通讯复用**已落地：同路径库只加载一次、多参考共享、`shutdown` 只停本参考、最后一个参考析构才卸载——测试也用它回归旧固件兼容（覆盖详见下）。库还有**字节流模式**（`load_bytes(path, identity)`：reader 一律走 `klipper_host_output_wait`，所以在没有 `CONFIG_HOST_FRAME_API` 的库上、以及 release 下也能用——扫描测试就是这么跑的）；`host_tests` 与 `scan` 的 host 库测试共用 `HOST_LIBRARY_TEST_LOCK` 串行。
 
+> **固件侧 mux 设备半目前没有永久测试**（`third_party/klipper/src/mux.c`：单元解析、扫描应答、
+> 采纳 node id、id 冲突、剥头交付）。它经**探针**钉过（真库 + pty：扫描应答带身份、采纳后再扫
+> 沉默、数据单元剥头后被真正执行——`get_clock` 回来是带应答头的响应 + 带头的 ack、冲突触发
+> `shutdown`），但探针是临时的、不进仓库。要固化它，需要 `test-support` 再建一份**开了
+> `host_frame_api` + 桥/mux 的库**（现在那份是逐字节、无 mux），再在 klipperx 侧走一遍 admin
+> 对话——这是待补的一格。
+
 构建**不复用 klipper 子模块的 `.config` 与 `out/`**（那是开发者给自己编固件用的），而是把它们放在 build script 自己的 `OUT_DIR` 下（`target/debug/build/klipperx-test-support-*/out/klipper-host/`），并把路径通过 `cargo:rustc-env=KLIPPER_HOST_LIB` 传给测试。配置片段在 `build.rs` 里写明——kconfig 的机型 `choice` **没有默认值**（空配置会选中第一项 AVR，编出个 `klipper.elf`），而 `CONFIG_HOST_AR_LIBRARY` **默认是静态库**（产出 `libklipper_host.a` 而非 `.so`），两条都必须显式声明：
 
 ```

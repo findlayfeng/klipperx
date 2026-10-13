@@ -24,14 +24,19 @@ KLIPPERX_KLIPPER_DIR=<主检出>/third_party/klipper cargo test --workspace
 （后者直接用前者的函数），构建期与运行期看到的是同一个路径；它也进了 `build.rs` 的
 `cargo:rerun-if-env-changed`，改指向会触发重建。
 
-另有一个**真实设备**测试：`interface::devices::host::host_tests` 通过 `dlopen` 加载 klipper 的 host 库（`third_party/klipper/src/host/`），在其中跑 `get_clock` 往返。该库由 dev-dependency `klipperx-test-support` 的 `build.rs` 调 `make` 构建，所以需要 `make` 与 C 工具链；库的全局状态使旧固件同一时刻只能有一路活动连接，但 host 半的**通讯复用**已落地：同路径库只加载一次、多参考共享、`shutdown` 只停本参考、最后一个参考析构才卸载——测试也用它回归旧固件兼容（覆盖详见下）。库还有**字节流模式**（`load_bytes(path, identity)`：reader 一律走 `klipper_host_output_wait`，所以在没有 `CONFIG_HOST_FRAME_API` 的库上、以及 release 下也能用——扫描测试就是这么跑的）；`host_tests` 与 `scan` 的 host 库测试共用 `HOST_LIBRARY_TEST_LOCK` 串行。
+另有一个**真实设备**测试：`interface::devices::host::host_tests` 通过 `dlopen` 加载 klipper 的 host 库（`third_party/klipper/src/host/`），在其中跑 `get_clock` 往返。该库由 dev-dependency `klipperx-test-support` 的 `build.rs` 调 `make` 构建（**现在建两份**：原来那份逐字节、无 mux；另一份 mux 变体，见下），所以需要 `make` 与 C 工具链；库的全局状态使旧固件同一时刻只能有一路活动连接，但 host 半的**通讯复用**已落地：同路径库只加载一次、多参考共享、`shutdown` 只停本参考、最后一个参考析构才卸载——测试也用它回归旧固件兼容（覆盖详见下）。库还有**字节流模式**（`load_bytes(path, identity)`：reader 一律走 `klipper_host_output_wait`，所以在没有 `CONFIG_HOST_FRAME_API` 的库上、以及 release 下也能用——扫描测试就是这么跑的）；`host_tests` 与 `scan` 的 host 库测试共用 `HOST_LIBRARY_TEST_LOCK` 串行。
 
-> **固件侧 mux 设备半目前没有永久测试**（`third_party/klipper/src/mux.c`：单元解析、扫描应答、
-> 采纳 node id、id 冲突、剥头交付）。它经**探针**钉过（真库 + pty：扫描应答带身份、采纳后再扫
-> 沉默、数据单元剥头后被真正执行——`get_clock` 回来是带应答头的响应 + 带头的 ack、冲突触发
-> `shutdown`），但探针是临时的、不进仓库。要固化它，需要 `test-support` 再建一份**开了
-> `host_frame_api` + 桥/mux 的库**（现在那份是逐字节、无 mux），再在 klipperx 侧走一遍 admin
-> 对话——这是待补的一格。
+> **固件侧 mux 设备半与桥半现在有永久测试**（此前只有临时探针）。`crates/test-support`
+> 除了原来那份逐字节、无 mux 的库，还建**第二份 mux 变体**（`CONFIG_HOST_FRAME_API` +
+> `CONFIG_HOST_BRIDGE_SERIAL`，端口路径指到该构建 `OUT_DIR` 内的文件——桥会在 `init` 时打开它，
+> 所以不能是 `/dev/ttyACM0`；三个路径经 `cargo:rustc-env` 交给测试：`KLIPPER_HOST_MUX_LIB`、
+> `KLIPPER_HOST_MUX_SERIAL_PATH`、`KLIPPER_HOST_MUX_DICT`）。两份测试钉住它：
+> `test_the_mux_device_half_over_the_real_library`（测试自建 pty 软链到那条路径，再走五步：
+> 扫描应答带身份 → 采纳 id 后再扫沉默 → 带 id 的数据单元被真正执行（响应 + 块级 ack，都用
+> 固件字典解出 `clock`，不是只会回显头）→ 别人的 uuid 抢 id 触发 `shutdown`）；
+> `test_a_muxed_host_path_attaches_to_the_real_library`（真端到端：配置层判定 mux → 路径身份 →
+> `init` 前投递 → `SET_NODEID` + 重确认握手 → identify + `get_clock`）。**代价**：新库变体冷构建
+> 约 +1.6s，热跑无感。
 
 构建**不复用 klipper 子模块的 `.config` 与 `out/`**（那是开发者给自己编固件用的），而是把它们放在 build script 自己的 `OUT_DIR` 下（`target/debug/build/klipperx-test-support-*/out/klipper-host/`），并把路径通过 `cargo:rustc-env=KLIPPER_HOST_LIB` 传给测试。配置片段在 `build.rs` 里写明——kconfig 的机型 `choice` **没有默认值**（空配置会选中第一项 AVR，编出个 `klipper.elf`），而 `CONFIG_HOST_AR_LIBRARY` **默认是静态库**（产出 `libklipper_host.a` 而非 `.so`），两条都必须显式声明：
 
@@ -42,8 +47,11 @@ CONFIG_MACH_HOST=y
 
 `make olddefconfig` 补齐的其余默认值里还有 host 库自己的开关（例如桥模式
 `CONFIG_HOST_BRIDGE_SERIAL`——它 `select` 传输无关的公共符号 `CONFIG_BRIDGE`、`CONFIG_MUX`
-与 `CONFIG_BRIDGE_PORT_SERIAL`/`CONFIG_MUX_SERIAL`），它们都默认关闭，所以测试加载的这份
-库只走宿主 API、不打开任何设备（桥模式的分层与选项表见
+与 `CONFIG_BRIDGE_PORT_SERIAL`/`CONFIG_MUX_SERIAL`）。**第一份库**（上面两行）这些开关都关着，
+所以它只走宿主 API、不打开任何设备；**第二份（mux 变体）**另加三行
+`CONFIG_HOST_FRAME_API=y`、`CONFIG_HOST_BRIDGE_SERIAL=y`、
+`CONFIG_HOST_BRIDGE_SERIAL_PATH="<OUT_DIR>/klipper-targets/host-mux/out/bridge-tty"`——它确实会
+打开那个端口，所以测试必须先在那个路径上建出一个 pty（分层与选项表见
 `third_party/klipper/src/host/README.md`）。
 
 因此：全新检出即可复现（`make olddefconfig` 补齐其余默认值，`build.rs` 在产物缺失时报错并指出要检查哪两条），开发者正在编的固件配置与 `out/` 不受影响，测试也不会用到别人的配置。
@@ -535,7 +543,7 @@ git config core.hooksPath .githooks
 
 窗口本身（raw mode、备用屏幕、按键线程、`select!` 主循环）没有自动化测试：那需要真终端。补全那部分是例外：键位仲裁（`completion_key`）、候选匹配与候选层渲染都有单测，只有“`handle_key` → `input.take()` 之间候选层先收起”这一步靠代码路径而非用例担保。验证方式是在 tmux 里跑一遍（`tmux new-session -d … 'klippy-client console …'` + `capture-pane`），杀掉主机看它是否带着错误退出并把终端还回去，以及在 `klipperx --tui`（两种写法都试）下按 `^C` 看主机是否随窗口一起退出、socket 文件是否被清掉。
 
-主机端到端（装载 `[mcu]` → 起服务 → 查询）也没有自动化测试：集成测试要一个开了 `CONFIG_HOST_FRAME_API` 的 host 库，而 `crates/test-support` 建的是逐字节那份（非 `cfg(test)` 编译要前者）。手工验证方式：写一个只有 `[mcu]` 的配置（`host_library:` 指向一份开了该选项的库），起 `klippy`，然后 `klipperx api objects/list` 应为 `["webhooks", "mcu"]`，`objects/query '{"objects": {"mcu": null}}'` 应为 identify 快照（`mcu_version` / `mcu_build_versions` / `mcu_constants`），`objects/query webhooks` 应为 `ready`。接口不可用时同一条链应变成 `state: shutdown` 且 `state_message` 里带对象名与原因。
+主机端到端（装载 `[mcu]` → 起服务 → 查询）仍没有自动化测试（**mux 路径的传输层端到端已有**：见上 `test_a_muxed_host_path_attaches_to_the_real_library`）；`crates/test-support` 现在两份库都建（逐字节那份 + 开了 `CONFIG_HOST_FRAME_API` 的 mux 变体），所以这条限制不再来自库的可得性。手工验证方式：写一个只有 `[mcu]` 的配置（`host_library:` 指向一份开了该选项的库），起 `klippy`，然后 `klipperx api objects/list` 应为 `["webhooks", "mcu"]`，`objects/query '{"objects": {"mcu": null}}'` 应为 identify 快照（`mcu_version` / `mcu_build_versions` / `mcu_constants`），`objects/query webhooks` 应为 `ready`。接口不可用时同一条链应变成 `state: shutdown` 且 `state_message` 里带对象名与原因。
 
 `klipperx` 侧的日志合流（`src/logging.rs`）有单测：装一个线程内的 subscriber，断言字面量消息与带参数消息两条路径都能到达窗口、等级正确、顺序正确，并且 `WindowGuard` 落下之后不再复制。窗口槽是进程级的，所以这两个用例用一把互斥锁串起来跑。
 
@@ -647,7 +655,7 @@ git config core.hooksPath .githooks
 | `bus_debug.rs` | `DATA=` 十六进制往返（`test_hex_round_trips`） |
 | `mcu/ids.rs`（原 `extras/canbus_ids.rs`） | MCU 层 id 分配器（21 测）：**所有接口共用一个序列**——自动号 = `NODEID_FIRST`(4) 起的**最小空位**、上界 255（`MAX_MCU_ID = 0xff`，由 CAN admin 报文单字节字段决定）（裸分配器无预扫时同样如此：`a_bare_allocator_takes_the_lowest_free_id_from_four`）；无显式号时按声明顺序从 4 起发（`a_config_assigns_ids_in_declaration_order`）；串口 MCU 与 CAN MCU 穿插登记各自拿下一个不重复的号；显式 `canbus_nodeid` 原样生效、自动号**绕开**它（`an_explicit_nodeid_is_used_and_the_auto_sequence_steps_over_it`、`an_auto_id_avoids_an_explicitly_claimed_id`、`a_serial_id_avoids_an_explicit_can_id`、`a_config_honours_an_explicit_nodeid`）；经配置驱动时**发号与声明顺序无关**（`an_explicit_nodeid_is_honoured_whatever_the_declaration_order`）、保留区里的显式号（`canbus_nodeid: 2`）不让自动号白空（`a_reserved_id_below_the_sequence_does_not_move_the_auto_id`）；**预扫的判别性钉子**：前缀节 auto 声明在前、显式要 `4` 的节在后的 auto 让到 `5`（`an_explicit_claim_is_reserved_before_an_earlier_auto_id`，去掉预扫即报撞号错，且两节文件顺序对调后结果相同）、预扫读原始参数**不记访问**（`the_pre_scan_reads_the_explicit_id_without_recording_it`：`AccessTracking::contains("mcu", "canbus_nodeid")` 为假、号 5 被跳过）；重复 uuid 报 `Duplicate uuid`；**装载期唯一的撞号错是两个显式号互撞**（`two_explicit_ids_that_collide_are_rejected`、`a_config_rejects_two_sections_claiming_one_nodeid`，点名双方）；号段 `4..=255` 占满报 `mcu_ids: no free id …`（`the_allocator_reports_an_exhausted_id_range`：252 个之后被拒，断言完整文案含 `or reserved`）；serial 的 `[mcu]` 也登记拿号（并拉起分配器）；**节名兼容**：规范名 `[mcu_ids]` 与历史拼写 `[canbus_ids]` 都能装载且注册到同一个对象（`object = "mcu_ids"`，旧名下查不到 `canbus_ids` 键）、**双节同写**（`[mcu_ids]`+`[canbus_ids]`）撞 `Printer object 'mcu_ids' already created`；每个 `[mcu]` 把分到的 id 存在对象上 |
 | `serial_ports.rs` | **共享串口分组（17 测）**：单颗引用 → 独占、两颗同路径（`[mcu]` 与 `[mcu <name>]` 混用也算）→ 共享且 `peers` 按声明序；**显式 baud 决定有效值**——无显式 → 默认 250000；恰一颗写了 → 用它（另一颗没写的跟着走，**不报错也不告警**）；多颗不同值 → `warn`（文案逐字断言：路径 + 每个值 + 写它的 MCU + 选中值）并**取最小**；不可解析的 baud 跳过（留给该节自己的工厂报）；无 `serial` 的节被忽略；`classify` 不通过 tracked accessor 读数（不豁免 `check_unused`）；**`path_is_shared`（6 测）**：同路径两颗（含 `[mcu]` 与 `[mcu <name>]` 混用）→ true、单颗/不同路径/拿不到 sibling 的 wrapper → false，且不记任何 read |
-| `host_libraries.rs` | **host 库路径的复用判定（11 测）**：单节无 `uuid` → 非 mux、单节有 `uuid`（含 `canbus_uuid` 别名）→ mux、两节其中一节省略 `uuid` → mux、两节各写不同 uuid → mux；两条冲突（≥2 节都省略、两节同 uuid）报错并**点名涉及的节**；`validate` 的解析层入口、预扫不触发 tracked getter（不豁免 `check_unused`） |
+| `host_libraries.rs` | **host 库路径的复用判定与身份指派（17 测）**：单节无 `uuid` → 非 mux、单节有 `uuid`（含 `canbus_uuid` 别名）→ mux、两节其中一节省略 `uuid` → mux、两节各写不同 uuid → mux；两条冲突（≥2 节都省略、两节同 uuid）报错并**点名涉及的节**；**身份指派**：每条路径一个确定性身份（`FNV-1a(路径字符串)`，逐个跳过 `[0;6]` 与配置里所有已知 uuid（含 CAN、含其它路径的身份））——按**路径**而非按节、跨重启稳定，且永不与配置里任何 uuid 相同（`identity`/`named_uuid`：节上写了 `uuid:` 就用它点名桥下游那台，否则用路径自身份）；`validate` 的解析层入口、预扫不触发 tracked getter（不豁免 `check_unused`） |
 | `error_mcu.rs` | 已知固件消息拿到它的提示、MCU shutdown 被扩成原因+提示、`is_shutdown` 说“此前已停”、无关停机仍告诉用户敲什么；连接错误拿到 firmware_restart 提示；协议错误列出需要升级的 MCU（6 例，无配置节、由第一个 `[mcu]` 拉起） |
 
 ### `interface`
@@ -658,7 +666,7 @@ git config core.hooksPath .githooks
 | `scan.rs` | `klipperx scan` 的输出形状与参数校验（13 测）：**三种传输打印同一行**（CAN、串口与 host 库各自的 `UnassignedNode` 走同一个 printer：`Found uuid=…, Application: …`，12 位前导零、Klipper/CanBoot/Unknown/无字节）、结尾总数行、`--timeout` 非正/非有限被拒、`--port`+`--interface` 同给被拒、`--baud` 无 `--port` 被拒、一个传输都不给被拒（都在开端口/开 socket 前）；`--host-library <path.so>`（配 `--host-identity`）扫一份真实 host 库：窗口走空打印 `Total 0 uuids found`、不报错（非 mux 固件对带头单元按帧校验失败安全丢弃），`--host-identity` 单独给、或与 `--port`/`--interface` 同给都被拒 |
 | `serial.rs` | 用**虚拟串口**（`posix_openpt` 开的 pty 对）验证：`send` 写出的就是线上的整帧（raw 模式没有做任何转换）、`receive` 把分片的字节重新拼成帧、`shutdown` 让阻塞中的 `receive` 返回 `None`、打不开的端口报错并带上路径；另有一例走 `Interface` 的异步收发。**共享串口（串口复用）**：**共享串口设备层 + 串口复用协议编解码（41 测）**：设备层 8 测（真 pty + 脚本对端）：`attach` 写出的请求字节逐字等于 `assignment_request(id)`、对端回执后拿到句柄；**带 `uuid` 时先收 SET_NODEID 再收重确认请求**（pty 对端逐字节钉帧序）；无回执 → `Err(Timeout)`；**两颗 MCU 共用一个 pty 互不串扰**（各只收到自己 arb 的帧）；发送单元不被交错；**引用计数关闭**（drop 一个句柄另一个照常、最后一个关端口）；陌生 arb 的单元丢弃不影响他人；坏长度字节后按 `skip_to_sync` 重同步并成功分派后一单元。**帧头编解码、伪帧与握手测试（17 测，随 `assign.rs` 提纯搬入）**：`ASSIGN_SEQ_BYTE`/`MAGIC` 伪帧除 seq 字节外逐项合法（长度/尾 SYNC/标准 CRC 位置，`0x20` 在合法 `0x10..=0x1f` 之外）、**2 字节带校验帧头**（黄金码字、截断 `NeedMore`、id 1..=255 全扫恒 2 字节、**单比特错全覆盖 + 双比特错抽查一律 `Invalid`**、定界位错被拒、保留带 `0x3f2..=0x3ff` 的合法码字被拒而编码器 panic、**id ∈ 120..=127 的头含 `0x7e`** 逐字钉住）、`assignment_request`/`assignment_reply`/`parse_assignment_ack` 闭环与四类拒收（坏 CRC / 错 seq / 截断 / 无 `KXID`，偶数（请求方向）arb 必被拒）；**`command_find_block` 可执行忠实移植**（顺序与调参逐行对齐 `command.c:276-333`）：握手伪帧入 dest 错误分支、恰吞本帧、不 dispatch、序号不动、首枚回一枚空 ack 后静默、后枚无声；夹在 identify 前仍照常 dispatch、**identify 之后到达**也只丢弃不动序号；有效块重新武装一次性 nak；分片到达（半帧 `need_more`、补齐后整帧丢弃）。**发现与 SET_NODEID（16 测）**：查询帧就是 admin broadcast 单元（`0x3f0` + `KXID` + `0x00`）、`set_node_id_for` 与 CAN 的 admin 帧逐字节一致且拒绝越界 id、含 `0x7e` 的 uuid 往返、应答解出 uuid/application（`0x01`/无字节=Klipper、`0x11`=CanBoot、其余 Unknown）、**uuid 按大端**解、全 0 uuid 照报、非应答单元被拒、扫描按 uuid 去重（另有「长度字节不是单元形状的垃圾不进入扫描」「收一枚/两枚并去重」「无应答不报」「忽略非 admin 单元」）。**未覆盖**：旧固件那枚无害空 ack 在主机侧的无害性（仅代码推断）。**socket 无关**：本层只经真 pty，不触 CAN。 |
 | `shared.rs` | 复用的公共肋 `resource_for`（按路径查 `Weak` 注册表 → 无活引用则 open 并登记；最后一个引用析构即失效，下次连接重新映射）。本模块只有这一条公共形状，无独立测试——行为由串口半与 host 半各自的注册表测试覆盖（同端口/同库二次连接复用、最后引用卸载） |
-| `host.rs` | **共享 host 库设备层（4 测，`host_tests`，进程内串行跑——注册表按路径只能一份库）**：缺库报错；对真实 host 库走完整 identify 引导（见 `identify` 一节）+ `shutdown` 后 `receive()` 返 `None` 且**同库二次连接接管仍在跑的固件**（序号是库里的静态量，真 MCU 上就是没被复位，第二块 `Mcu` 必须采纳它的号才能接上；一支引用持库存活，无多余 `dlopen`/无重 init）；**最后一个引用析构即卸载**（`Weak` 注册表失效、线程 join），下一次连接是重新映射=全新上电（首连接普通握手、不接管）。测试构建走**逐字节**读写，所以这条引导的每一帧都真的经历了完整重组；发布构建走库的**整帧接口**（`CONFIG_HOST_FRAME_API`），该路径 `cargo test` 覆盖不到（`cfg(test)` 恒定成立），只有 `cargo build` 的编译校验，曾用一份开了该选项的库手工跑通 identify + `get_clock`；新增一测 `test_a_live_library_is_refused_in_another_mode_or_with_another_identity`：同一路径的库在**模式**（整帧/字节流）或**身份**上不一致时拒绝复用——两者都在开库时定死 |
+| `host.rs` | **共享 host 库设备层（7 测，`host_tests`，进程内串行跑——注册表按路径只能一份库）**：缺库报错；对真实 host 库走完整 identify 引导（见 `identify` 一节）+ `shutdown` 后 `receive()` 返 `None` 且**同库二次连接接管仍在跑的固件**（序号是库里的静态量，真 MCU 上就是没被复位，第二块 `Mcu` 必须采纳它的号才能接上；一支引用持库存活，无多余 `dlopen`/无重 init）；**最后一个引用析构即卸载**（`Weak` 注册表失效、线程 join），下一次连接是重新映射=全新上电（首连接普通握手、不接管）。测试构建走**逐字节**读写，所以这条引导的每一帧都真的经历了完整重组；发布构建走库的**整帧接口**（`CONFIG_HOST_FRAME_API`），该路径 `cargo test` 覆盖不到（`cfg(test)` 恒定成立），只有 `cargo build` 的编译校验，曾用一份开了该选项的库手工跑通 identify + `get_clock`；另四测：`test_a_live_library_is_refused_in_another_mode_or_with_another_identity`（同一路径的库在**模式**/整帧字节流或**身份**上不一致时拒绝复用）、`test_a_muxed_attach_times_out_against_a_library_without_the_mux`（对没有 mux 的库按 mux attach = 超时，非静默成功）、`test_the_mux_device_half_over_the_real_library`（第二份 mux 库上的五步 admin 对话）、`test_a_muxed_host_path_attaches_to_the_real_library`（**真端到端**：配置层判定 mux → 路径身份 → 投递 → attach → identify + get_clock） |
 | `simulator.rs` | 字典驱动的应答机（`test: dict=<file>`）：坏字典路径报错；对着它走**真实** `Mcu::connect`——identify 分块回 zlib 字典、装字典、块级 ack，再由 `get_clock` 经普通调用路径拿回响应（验证序号与发送窗口确实被推进）；**响应/回执盖 `seq+1`**（`command.c:305` 口径，与 `mcu/mod.rs settle` 的 `*seq < seen` 对齐——批 #10；`FrameMock` 仍同号，为第二套已知口径）；`trigger_analog_home` 假行为：arm 后首条 move 发 `trigger_reason=1` 一次且不复发、监控窗到期由 `receive()` 自主报 `error_reason+MONITOR`、全零 disable 不触发且保留 arm 时钟、**任何 `*_attach_trigger_analog`（`ldc1612`/`ads1220`/`ads131m0x`/`hx71x`，含 `config_ldc1612*`）都让 monitor 窗由固件侧样本续命**（`any_sensor_attach_slides_the_monitor_window` 逐个拼法钉住，样本不走线上）；**步进时序模型**（Q10）：per-oid 固件步进链 `config_stepper` 归零 / `queue_step` 空闲首拍-忙延展-首拍过期三态 / `reset_step_clock` 忙拒+重锚，`timer_is_before` u32 回绕（含 2³¹ 假阳边界），过期与忙拒走字典 `static_string_id` 发 shutdown 帧并置 `get_config is_shutdown`、关机后拒步——`timer_is_before_follows_the_firmware_wrap`、`an_expired_first_step_reports_timer_too_close`、`a_stale_chain_expires_until_reset_step_clock_reanchors`（两会话红/绿对）、`reset_of_a_running_chain_reports_the_firmware_error` 四测 + 转红实证（剪过期判定恰红 2 条）；**多实例连机（2026-10-03，`d14ce6a`）**：`linked_fake_mcus_forward_the_move_but_nothing_else`——A 的 clock 查询只从 A 回、B 沉默，B 的 endstop 由 A 的步进跨板触发且报 B 自己的 arm 时钟，未 link 两板互不相闻 |
 | `usb.rs` | 拓扑发现用假 sysfs 树：tty 上溯到 USB 设备、取**紧邻**它的 hub 与端口号（`<hub>.<port>`、根 hub 的 `<bus>-<port>`）、非 USB tty 报错；**多层 hub 取最内层那颗**（外层 hub 与它同型号也不受影响）；开关文件查找：`port<N>` / `<hub>-port<N>` 两种命名、根 hub 的 `<usb>-port<N>`、`probe` 交出该路径；告警里的两条规则（含与 `scripts/klipperx-usb-udev.sh` 同一个 glob——比 hub **深一层**，`include_str!` 对脚本兜底）。**要真硬件的几条没自动化**：hub 端口的供电能力（hub 类描述符低两位：`per-port` / `ganged` / `no power switching`，解析部分用真描述符字节对了；读描述符要能开 hub 节点）、`open_hub` 把**根 hub** 也算进来（`nusb::list_devices` 按设计不给 `usbN`，只能从 `nusb::list_buses` 取；MCU 直插机器 USB 口就是这种），以及控制传输本身；两者都在真板/真 hub 上手工验过（根 hub 收下 `SET/CLEAR_FEATURE(PORT_POWER)`，设备断开重枚举） |
 

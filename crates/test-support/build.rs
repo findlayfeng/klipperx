@@ -91,6 +91,50 @@ fn main() {
     );
     println!("cargo:rustc-env=KLIPPER_HOST_LIB={}", library.display());
 
+    // A second host target: the same library with the firmware's serial-mux
+    // device half compiled in. `CONFIG_HOST_BRIDGE_SERIAL` selects `CONFIG_MUX`
+    // / `CONFIG_MUX_SERIAL` / `CONFIG_BRIDGE` / `CONFIG_BRIDGE_PORT_SERIAL`
+    // (src/host/Kconfig), so the library answers the admin channel and adopts
+    // the node id a host hands it; `CONFIG_HOST_FRAME_API` matches the frame
+    // API the release path of the first library needs. It gets its own output
+    // directory, so the first library is built exactly as before.
+    //
+    // `CONFIG_HOST_BRIDGE_SERIAL_PATH` is a path of this build's own: the
+    // bridge opens its port during `klipper_host_init()` and init fails when it
+    // cannot, so a test makes a tty there before loading the library. The
+    // Kconfig default (`/dev/ttyACM0`) is a real device this machine need not
+    // have.
+    let host_mux_dir = build_dir.join("host-mux");
+    let bridge_serial_path = host_mux_dir.join("out").join("bridge-tty");
+    let host_mux_config = format!(
+        "{HOST_CONFIG}\
+         CONFIG_HOST_FRAME_API=y\n\
+         CONFIG_HOST_BRIDGE_SERIAL=y\n\
+         CONFIG_HOST_BRIDGE_SERIAL_PATH=\"{}\"\n",
+        bridge_serial_path.display()
+    );
+    let host_mux_out = build(&klipper_dir, &host_mux_dir, &host_mux_config);
+    let mux_library = host_mux_out.join("libklipper_host.so");
+    assert!(
+        mux_library.exists(),
+        "make did not produce {}: check that the mux host configuration still \
+         selects the shared host library",
+        mux_library.display()
+    );
+    let mux_dictionary = require_dict(&host_mux_out);
+    println!(
+        "cargo:rustc-env=KLIPPER_HOST_MUX_LIB={}",
+        mux_library.display()
+    );
+    println!(
+        "cargo:rustc-env=KLIPPER_HOST_MUX_SERIAL_PATH={}",
+        bridge_serial_path.display()
+    );
+    println!(
+        "cargo:rustc-env=KLIPPER_HOST_MUX_DICT={}",
+        mux_dictionary.display()
+    );
+
     // One dictionary per enabled target, named after the config it was built
     // from. A target that fails to build fails the build here.
     let all_architectures = std::env::var_os("KLIPPERX_ALL_ARCHES").is_some();

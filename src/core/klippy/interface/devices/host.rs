@@ -963,11 +963,22 @@ const OUTPUT_WAIT_MS: u32 = 100;
 #[cfg(test)]
 mod host_tests {
     use super::*;
+    use crate::core::klippy::assign;
     use crate::core::klippy::config::mcu::McuConfig;
     use crate::core::klippy::config::{ConfigSection, ConfigValue, ConfigWrapper};
-    use crate::core::klippy::mcu::Mcu;
-    use crate::core::klippy::msg::proto::ArgValue;
+    use crate::core::klippy::frame::{
+        MESSAGE_DEST, MESSAGE_HEADER_SIZE, MESSAGE_MAX, MESSAGE_MIN, MESSAGE_SYNC,
+    };
+    use crate::core::klippy::interface::devices::serial::{
+        decode_header, discovery_query, encode_header, set_node_id_for, HeaderScan, UnassignedNode,
+        ADMIN_REPLY, MAGIC, RESP_NEED_NODEID,
+    };
+    use crate::core::klippy::interface::pty::Pty;
+    use crate::core::klippy::mcu::{Dictionary, Mcu};
+    use crate::core::klippy::msg::parser::Parser;
+    use crate::core::klippy::msg::proto::{ArgValue, Payload};
     use crate::core::klippy::Interface;
+    use std::time::Instant;
 
     #[test]
     fn test_load_reports_a_missing_library() {
@@ -1271,5 +1282,272 @@ mod host_tests {
         assert_eq!(interface.receive().await, None);
         drop(interface);
         wait_for_unload().await;
+    }
+
+    // =======================================================================
+    // The firmware's serial-mux device half, over a real library
+    // =======================================================================
+
+    /// The mux build's library.
+    ///
+    /// This test lives with the other host-library tests because it drives the
+    /// same device layer ([`HostDevice::load_bytes`]) against the same real
+    /// firmware, and because it has to hold [`HOST_LIBRARY_TEST_LOCK`]: the
+    /// library registry is a per-path process-wide singleton, so every test
+    /// that loads a host library shares that one spine.
+    fn mux_library_path() -> PathBuf {
+        klipperx_test_support::klipper_host_mux_lib_path()
+    }
+
+    /// The data dictionary of the mux build, for the message ids the command
+    /// frame below is built from — the same firmware dictionary an identify
+    /// would fetch, read from the file `make` wrote instead.
+    fn mux_dictionary() -> Dictionary {
+        let path = klipperx_test_support::klipper_host_mux_dictionary_path();
+        let raw =
+            std::fs::read(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        Dictionary::from_json(serde_json::from_slice(&raw).expect("JSON"))
+            .expect("the mux build's data dictionary")
+    }
+
+    /// One command frame the host would send: the message `name` encoded with
+    /// no arguments (id plus args, the way [`Parser::encode`] produces it) in a
+    /// frame carrying the sequence byte `seq`.
+    fn command_frame(parser: &Parser, name: &str, seq: u8) -> Vec<u8> {
+        let payload = parser
+            .encode(name, &[])
+            .unwrap_or_else(|e| panic!("encode {name}: {e}"));
+        Frame::encode(seq, payload.payload())
+    }
+
+    /// A whole unit's arbitration id and the frame behind its header.
+    fn unit_parts(unit: &[u8]) -> (u32, &[u8]) {
+        match decode_header(unit) {
+            HeaderScan::Complete { arb, consumed } => (arb, &unit[consumed..]),
+            other => panic!("a unit starts with a header, got {other:?}"),
+        }
+    }
+
+    /// Cut one whole unit — the two-byte header plus the frame behind it — off
+    /// the front of `pending`, the framing
+    /// [`serial_query_unassigned`](crate::core::klippy::interface::devices::serial::serial_query_unassigned)
+    /// applies, including its resynchronisation: a byte that is not a header is
+    /// dropped and the parse picks up at the next SYNC.
+    ///
+    /// The resync is what skips the bare `starting` frame a freshly booted
+    /// firmware sends before it has a node id (see `sched.c`'s `sched_main`):
+    /// a device with no node id keeps the old wire format, so the first thing
+    /// on the stream is not a unit.
+    fn take_unit(pending: &mut Vec<u8>) -> Option<Vec<u8>> {
+        loop {
+            let consumed = match decode_header(pending) {
+                HeaderScan::Complete { consumed, .. } => consumed,
+                HeaderScan::NeedMore => return None,
+                HeaderScan::Invalid => {
+                    resync(pending)?;
+                    continue;
+                }
+            };
+            if pending.len() < consumed + 1 {
+                return None; // the length byte is still in flight
+            }
+            let length = pending[consumed] as usize;
+            if !(MESSAGE_MIN..=MESSAGE_MAX).contains(&length) {
+                resync(pending)?;
+                continue;
+            }
+            if pending.len() < consumed + length {
+                return None; // the rest of the frame is still in flight
+            }
+            return Some(pending.drain(..consumed + length).collect());
+        }
+    }
+
+    /// Drop everything up to and including the next SYNC; `None` when none is
+    /// buffered yet (the caller waits for more bytes).
+    fn resync(pending: &mut Vec<u8>) -> Option<()> {
+        let position = pending.iter().position(|&byte| byte == MESSAGE_SYNC)?;
+        pending.drain(..=position);
+        Some(())
+    }
+
+    /// Read from `device` until one whole unit is buffered, for at most
+    /// `timeout`; `None` when nothing arrived in the window.
+    fn read_unit(
+        device: &mut HostDevice,
+        pending: &mut Vec<u8>,
+        timeout: Duration,
+    ) -> Option<Vec<u8>> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(unit) = take_unit(pending) {
+                return Some(unit);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            let mut buf = [0u8; 256];
+            match device.read(&mut buf) {
+                Ok(0) => {} // the read window expired; recheck the deadline
+                Ok(read) => pending.extend_from_slice(&buf[..read]),
+                Err(e) => panic!("reading from the host library: {e}"),
+            }
+        }
+    }
+
+    /// `klipper_host_is_shutdown` out of the mapping the device already holds.
+    ///
+    /// The device's own `Library` is this test's handle to the one loaded
+    /// mapping, so the symbol reads the same firmware the device talks to.
+    fn is_shutdown_symbol(
+        device: &HostDevice,
+    ) -> libloading::Symbol<'_, unsafe extern "C" fn() -> c_uchar> {
+        unsafe {
+            device
+                .library
+                ._library
+                .get::<unsafe extern "C" fn() -> c_uchar>(b"klipper_host_is_shutdown\0")
+        }
+        .expect("the mux host library exports klipper_host_is_shutdown")
+    }
+
+    /// The firmware's serial-mux device half, over a real library.
+    ///
+    /// A device with no node id answers the discovery broadcast with the
+    /// identity the host named it; it adopts the id an assignment hands it and
+    /// goes quiet in scans; a data unit addressed to that id has its header
+    /// stripped and is dispatched, its answer led by the reply header; and an
+    /// assignment handing the id to another identity gives it up and stops the
+    /// device.
+    ///
+    /// The Rust side of these rules is covered by the serial mux's own tests;
+    /// this one pins them against the firmware `make` actually built, so a
+    /// regression in `third_party/klipper/src/mux.c` or in the console's
+    /// `mux_input` hook turns it red instead of leaving the fixtures green.
+    #[test]
+    fn test_the_mux_device_half_over_the_real_library() {
+        let _serial = HOST_LIBRARY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+
+        // The bridge opens its port while klipper comes up and init fails when
+        // it cannot, so the tty has to exist first: a pty whose slave is
+        // reachable at the path this build baked in. The `Pty` keeps both ends
+        // open for the whole test.
+        let pty = Pty::new();
+        let bridge_path = klipperx_test_support::klipper_host_mux_serial_path();
+        let _ = std::fs::remove_file(&bridge_path);
+        std::os::unix::fs::symlink(&pty.path, &bridge_path).unwrap_or_else(|e| {
+            panic!(
+                "failed to link {} to {}: {e}",
+                bridge_path.display(),
+                pty.path.display()
+            )
+        });
+
+        let identity = [0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc];
+        let mut device = HostDevice::load_bytes(mux_library_path(), Some(identity))
+            .expect("the mux host library opens");
+        let mut pending = Vec::new();
+        let window = Duration::from_secs(5);
+
+        let mut parser = Parser::new();
+        mux_dictionary()
+            .install(&mut parser)
+            .expect("install the mux build's dictionary");
+
+        // 1. The unnamed device answers the discovery broadcast with its
+        //    identity, under the admin reply header.
+        device
+            .write(&discovery_query())
+            .expect("the discovery query goes in");
+        let answer = read_unit(&mut device, &mut pending, window).expect("the scan answer");
+        let (arb, frame) = unit_parts(&answer);
+        assert_eq!(arb, ADMIN_REPLY, "the answer is on the admin reply id");
+        let node = UnassignedNode::from_unit(&answer).expect("a well-formed admin answer");
+        assert_eq!(
+            node.uuid, identity,
+            "the device answers with the identity the host named"
+        );
+        assert_eq!(
+            node.application, None,
+            "the library sends no application byte"
+        );
+        let payload = &frame[MESSAGE_HEADER_SIZE..];
+        assert_eq!(
+            &payload[..MAGIC.len()],
+            &MAGIC[..],
+            "the answer rides the KXID frame"
+        );
+        assert_eq!(
+            payload[MAGIC.len()],
+            RESP_NEED_NODEID,
+            "the answer asks for a node id"
+        );
+
+        // 2. The assignment is adopted, so a second scan is answered by
+        //    silence — what makes a scan list only unaddressed boards.
+        device
+            .write(&set_node_id_for(identity, 5).expect("id 5 is addressable"))
+            .expect("the assignment goes in");
+        device
+            .write(&discovery_query())
+            .expect("the second scan goes in");
+        assert!(
+            read_unit(&mut device, &mut pending, Duration::from_millis(500)).is_none(),
+            "an addressed device must stay quiet in a scan"
+        );
+
+        // 3. A data unit addressed to the adopted id has its header stripped and
+        //    is dispatched: `get_clock` comes back as the framed `clock`
+        //    response and the block-level ack, both led by the reply header.
+        //    The frame carries MESSAGE_DEST because that is where a freshly
+        //    booted firmware's receive sequence starts (`command.c`).
+        let reply_arb = assign::reply_arb_id(5).expect("id 5");
+        let mut unit = encode_header(assign::arb_id(5).expect("id 5"));
+        unit.extend_from_slice(&command_frame(&parser, "get_clock", MESSAGE_DEST));
+        device.write(&unit).expect("the get_clock unit goes in");
+
+        let response = read_unit(&mut device, &mut pending, window).expect("the clock response");
+        let (arb, frame) = unit_parts(&response);
+        assert_eq!(arb, reply_arb, "our frames go out on our reply header");
+        let clock = Frame::parse(frame).expect("the response is a whole frame");
+        let decoded = parser
+            .decode(Payload::from_raw(clock.payload().to_vec()))
+            .expect("the response decodes against the dictionary");
+        assert_eq!(decoded.len(), 1, "one message in the response frame");
+        assert_eq!(decoded[0].0.name, "clock", "get_clock is answered by clock");
+        assert!(
+            matches!(decoded[0].1.as_slice(), [ArgValue::UInt32(_)]),
+            "clock is a `%u` value, got {:?}",
+            decoded[0].1
+        );
+
+        let ack = read_unit(&mut device, &mut pending, window).expect("the block ack");
+        let (arb, frame) = unit_parts(&ack);
+        assert_eq!(arb, reply_arb, "the ack is headed too");
+        assert_eq!(
+            frame.len(),
+            MESSAGE_MIN,
+            "the block ack is the empty ack frame (len, seq, crc, sync)"
+        );
+
+        // 4. An assignment naming another identity for the id we hold gives the
+        //    id up and stops the device (the CAN id-conflict rule). It ends the
+        //    session, so it comes last and is all that is left to assert.
+        device
+            .write(&set_node_id_for([0xde, 0xad, 0xbe, 0xef, 0x00, 0x01], 5).expect("id 5"))
+            .expect("the conflicting assignment goes in");
+
+        let is_shutdown = is_shutdown_symbol(&device);
+        let deadline = Instant::now() + window;
+        while unsafe { is_shutdown() } == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_ne!(
+            unsafe { is_shutdown() },
+            0,
+            "an assignment that hands our id to another identity shuts us down"
+        );
     }
 }

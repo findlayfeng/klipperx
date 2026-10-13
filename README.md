@@ -57,7 +57,7 @@ AI 写实现」：人类负责方向与取舍、任务拆解、验收判定、�
 
 - 起宿主、连真实 MCU、装字典、配置、同步时钟、跑 g-code：`klipperx <config.cfg>`
 - 开 API 给客户端（`-a <socket>`），或在本进程里开一个终端窗口：`--tui`
-- 独立客户端：`klipperx console`（交互式窗口）/ `klipperx api`（发一条请求）/ `klipperx stress`（压测步进或链路）/ `klipperx canbus-scan`（扫出 CAN 总线上还没分配节点号的板子，打印可粘进配置的 uuid）
+- 独立客户端：`klipperx console`（交互式窗口）/ `klipperx api`（发一条请求）/ `klipperx stress`（压测步进或链路）/ `klipperx canbus-scan`（扫出 CAN 总线上还没分配节点号的板子）/ `klipperx serial-scan <port>`（扫出串口上还没分配 id 的设备），打印可粘进配置的 uuid
 - 大部分运动学（cartesian/corexy/corexz/hybrid/polar/delta/generic_cartesian/rotary_delta/winch/deltesian）、探针与调平族、TMC 驱动（UART 与 SPI 六个）、面板四驱动、断料/称重/风扇/加热等
 
 ### 离「真能打印」还缺什么
@@ -133,7 +133,7 @@ KLIPPERX_HW_CONFIG=~/printer.cfg cargo test -p klipperx --lib hardware_test::pla
 | `KLIPPERX_UPSTREAM_FILTER` | 未设置 | 只跑名字匹配的语料用例（迭代加速用；**不设置 = 237 全量原样**，默认路径零变化）。 |
 | `KLIPPERX_KEEP_GATES` | 未设置 | 设成任意值后，`test:` fake 传输也**不放行**两道时钟闸——复现「闸×语料」交互用（如 iqex 的 `Invalid sequence` 配方），默认 fake 放行。 |
 | `KLIPPERX_TRACE` | 未设置（关闭） | 非 `0` 值打开诊断 trace：模拟器与 MCU 拆除打的 `SIM-DIAG: …` / `MCU DROP …` 行（追挂起用，平时是噪声）。 |
-| `KLIPPERX_HW_CONFIG` | 未设置 | 真机用例要读的**用户 printer 配置**路径：接口（`[mcu]` 的 `serial`/`canbus_uuid`）与「哪些模块存在」都从它推导。未设置（或配置不满足该用例的声明）时，`--ignored` 显式请求也会打 `HW-IGNORED: <用例>: <原因>` 并**通过**（跳过而不是失败）；不带 `--ignored` 不执行。 |
+| `KLIPPERX_HW_CONFIG` | 未设置 | 真机用例要读的**用户 printer 配置**路径：接口（`[mcu]` 的 `serial`/`uuid`）与「哪些模块存在」都从它推导。未设置（或配置不满足该用例的声明）时，`--ignored` 显式请求也会打 `HW-IGNORED: <用例>: <原因>` 并**通过**（跳过而不是失败）；不带 `--ignored` 不执行。 |
 | `KLIPPERX_USB_IDS` | `1d50:614e 1d50:606f` | `scripts/klipperx-usb-udev.sh` 按空格分隔的 `vendor:product` 找 Klipper 设备；自编固件改了 USB id 时用。 |
 | `RUST_LOG` | `info` | 宿主与客户端的日志过滤器；与 `--verbose` 取更详细者（`--verbose` 保底 `debug`），解析不了则忽略。 |
 

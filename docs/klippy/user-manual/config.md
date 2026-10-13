@@ -234,7 +234,7 @@ max_accel: 3000
 |------|------|------|--------|------|
 | `serial` | 字符串 | 二选一 | — | 串口设备路径（如 `/dev/ttyACM0`）。**同一路径被两颗及以上 `[mcu]` 引用即共享**（见 [MCU 连接方式](mcu-connection.md)） |
 | `baud` | 整数 | 否 | `250000` | 串口波特率（仅 `serial` 模式）。共享路径以**显式写出**的值为准——多颗写了不同值就 `warn` 并**取最小值**（没写的节跟着它走） |
-| `canbus_uuid` | 12 位十六进制 | 二选一 | — | MCU 芯片唯一 ID（12 位 hex），CAN 模式必给 |
+| `uuid` | 12 位十六进制 | 二选一 | — | MCU 芯片唯一 ID（12 位 hex）：CAN 模式必给；写在 `serial` 节上则共享串口连接期按它先发 SET_NODEID 再握手（独占串口忽略）。历史键名 `canbus_uuid` 仍兼容，同节两个都写会报错 |
 | `canbus_interface` | 字符串 | 否 | `can0` | CAN 网络接口名 |
 | `canbus_nodeid` | 整数 (1..=255) | 否 | 由 `[mcu_ids]` 分配 | **MCU 层 id**（配置键名沿用 Klipper；在 CAN 上就是节点号，见下）。**不写就由分配器发**（`4` 起的最小空位，上限 255——CAN admin 报文只给它留了 1 字节）；写了就用写的那个——分配器装载时**预扫全配置**把显式号保留下来、自动号绕开，所以显式号写在哪个位置都生效、也不会被自动号占用。装载期只在两种情况报错：两个 `[mcu]` 写了同一个号，或 `4..=255` 已占满（上游靠固件 `can_id_conflict` 兜底，本仓提前拒）。 |
 | `restart_method` | `command` / `arduino` / `cheetah` / `rpi_usb` | 否 | `arduino`（串口）/ `command`（非串口/共享串口） | MCU 固件重启方式。**共享串口强制 `command`**（线级复位会打断整条线上的所有 MCU；显式写了别的值会告警，没写则静默降级） |
@@ -264,12 +264,12 @@ max_accel: 3000
 ```
 
 与上游的两处差异（详见[本项目与上游的偏移](../developer-manual/upstream-deviations.md)）：
-① `canbus_nodeid` 是本仓特有的显式覆盖选项（上游只有 `canbus_uuid`），且上游的分配器只服务
+① `canbus_nodeid` 是本仓特有的显式覆盖选项（上游只有 CAN 的 uuid 键——本仓规范名 `uuid`、旧名 `canbus_uuid` 兼容），且上游的分配器只服务
 CAN MCU、本仓把它泛化成所有接口共用一个序列；
 ② 装载期只有两种情况报配置错：**两个显式号互撞**（点明双方），或 `4..=255` **号段占满**
 （点名 MCU）；自动号永不与显式号撞（先预扫保留、再取最小空位）。不像上游那样留到固件
 `can_id_conflict` 才停机。
-发现未分配的板子（拿到可粘进配置的 uuid）见 `klipperx canbus-scan`。
+发现未分配的板子（拿到可粘进配置的 uuid）见 `klipperx canbus-scan`（CAN）与 `klipperx serial-scan --port <tty>`（串口，同一套查询/应答协议）。
 
 ### `[output_pin <name>]` — 输出引脚（数字 / PWM）
 

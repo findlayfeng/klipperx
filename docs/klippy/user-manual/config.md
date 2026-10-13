@@ -269,7 +269,7 @@ CAN MCU、本仓把它泛化成所有接口共用一个序列；
 ② 装载期只有两种情况报配置错：**两个显式号互撞**（点明双方），或 `4..=255` **号段占满**
 （点名 MCU）；自动号永不与显式号撞（先预扫保留、再取最小空位）。不像上游那样留到固件
 `can_id_conflict` 才停机。
-发现未分配的板子（拿到可粘进配置的 uuid）见 `klipperx canbus-scan`（CAN）与 `klipperx serial-scan --port <tty>`（串口，同一套查询/应答协议）。
+发现未分配的板子（拿到可粘进配置的 uuid）见 `klipperx scan`——不给参数扫 CAN（`--interface` 指定总线，默认 `can0`），给 `--port <tty>` 则扫串口（同一套查询/应答协议）。
 
 ### `[output_pin <name>]` — 输出引脚（数字 / PWM）
 

@@ -106,6 +106,13 @@ H1–H12 是上游 extras 里按域归并的消费者（2026-09-21 全量盘点�
 | S4 | 真机用例继续铺（框架两层都已就绪）：R4 归零（无加热，建议先做）→ R9 收尾 / R7 挤出 / R6 温度 / R10 急停（**带加热的最后**，需先完成 Q11 那条 reactor 定时器断环）；R8 回放 | S3、Q11 |
 | E2 | `python_path` 的取消 | 外部项目 |
 
+**串口复用 / 桥（跨主机与固件）**
+
+| # | 事项 | 依赖 |
+|---|---|---|
+| M1 | 与**没有 admin 通道**的设备共存：下游是原版固件时，id 与路由归属怎么办（今天靠设备答扫描来学 `uuid → 端口`） | — |
+| M2 | 通过 **admin 流程复位固件**（per-device reset；今天的复位只有线级手段，共享路径被强制成 `command`） | — |
+
 > 判为**不适用**、不进待办的上游模块：`garbage_collection.py`（Python GC 调优）、
 > `aio_executor.py`（Python 线程池）、`parsedump.py`（离线开发工具）、
 > `debugcmds.c`（固件调试口）。理由见括注：都是 Python 侧调优或离线/调试工具，与本主机无关。
@@ -347,6 +354,40 @@ endstop 资源（`mcu/resource/endstop.rs`，含 `minclock` 门控与 `home_wait
 
 - 备注：`printers.test` 有 2 条运行声明 `DICTIONARY pru.dict host=linuxprocess.dict`，默认不构建
   `pru`；要跑需 `KLIPPERX_ARCHES=…,pru`（需 `pru-gcc`）。
+
+### M1 与**没有 admin 通道**的设备共存（复用/桥拓扑）
+
+复用（mux）与桥今天都靠 **admin 信道**点名与归属：主机按 uuid 发 `SET_KLIPPER_NODEID`、设备在
+`0x3f1` 上答扫描、桥从下游答里学 `uuid → 端口`（`third_party/klipper/src/bridge.c`）。
+**原版 klipper 串口固件**（以及任何不实现这套的设备）既不答扫描、也不能被点名：
+
+- 当**单设备下游**时它其实能工作——桥对单设备路径**剥头/加头**，它只看到原始帧——但桥**学不到
+  `uuid → 端口`**，于是上游 `SET_NODEID(uuid, id)` 该转到哪条端口无从归属（今天只有一条端口，
+  另有"未知 uuid 先探一次"的兜底，探不到就留一条带界的 pending）。
+- 当**共享路径上的一员**时完全无法与其它设备区分（它没有 id 概念）。
+
+要定的：① 单设备下游端口是否**配置期静态建表**（该端口的 `[mcu]` 节自带 `uuid:`/id，桥据此直接
+建 `id → 端口`，不再依赖扫描）；② 是否需要一条**不依赖 admin 的归属**（首次原始帧的响应观察，或
+配置声明）；③ 与"路径上只有一台设备就剥头"这条规则如何组合。
+验收口径：一条"下游是原版 klipper 板子"的拓扑，主机能把它当普通 `[mcu]` 连上并跑通 identify +
+`get_clock`，全程不要求它答 admin。
+
+### M2 通过 **admin 流程复位固件**（per-device reset）
+
+今天的复位只有**线级**手段（`restart_method`：`arduino` 的 DTR、`cheetah` 的 RTS、`rpi_usb` 切电），
+在共享/mux 路径上会打断**整条线上的所有 MCU**，所以配置层把共享路径**强制成 `command`**
+（`mcu/restart.rs`）。而 `command` 只是让固件重进调度/清 shutdown，**不是真复位**。
+
+要定的：在 admin 信道上加一条**点名让某台设备复位自己**的命令（帧形沿用 `KXID` 伪帧的
+`[cmd][args…]`；CAN 侧已有 `CMD_REQUEST_BOOTLOADER = 0x02` 与 `SET_KLIPPER_NODEID = 0x01` 两条
+先例），设备半在自己的 admin 收听后执行；主机侧把它接进 `restart_method`（新增一种，或让共享路径
+内部改走它）。要明确：① 复位到哪一层（重进 `sched_main` / 清 shutdown / 真复位 MCU / 进
+bootloader）；② 幂等与回执（现在的 admin 流程**没有**回执，主机如何确认复位已发生）；
+③ 旧固件降级（不答 admin 的设备只能继续 `command`）。
+
+相关：`third_party/klipper/src/{mux.{c,h},generic/canserial.{c,h}}`、`mcu/restart.rs`、
+`docs/klippy/developer-manual/serial-mux-protocol.md` 的 admin 命令族表、
+`docs/klippy/user-manual/mcu-connection.md` 的 `restart_method` 行。
 
 ## 上游 extras 覆盖盘点
 

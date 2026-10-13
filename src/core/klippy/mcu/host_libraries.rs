@@ -22,6 +22,19 @@
 //! naming the sections involved: two or more sections on the path all omitting
 //! `uuid`, and two sections on the path writing the same `uuid`.
 //!
+//! The same pass gives every `host_library:` path an **identity of its own**
+//! ([`HostLibraries::identity`]): the uuid the library's own device answers the
+//! mux with, which the host assigns because the library is a file it loads and
+//! has nothing of its own to derive one from. The identity is a pure function of
+//! the path string (so it is per path, not per section and stable across runs),
+//! never all zeros (the library's "no identity" value), and steps aside of every
+//! uuid the config already names — the `uuid`/`canbus_uuid` of every `[mcu]`,
+//! CAN included — so it can never name a board that is already on the link. The
+//! [`HostLibraries::named_uuid`] rule then says which uuid an attach writes in
+//! its `SET_KLIPPER_NODEID`: the section's own `uuid` when it wrote one (it
+//! names the board the bridge routes to), else the path's own identity (the
+//! bridge's own device, which only the host knows).
+//!
 //! Like [`SerialPorts::classify`](super::serial_ports::SerialPorts), this is a
 //! pre-scan: it reads a sibling section's raw option text
 //! (`section().get_text`, never a tracked getter), so it never records a read on
@@ -30,7 +43,7 @@
 //! account. The section's own factory is the one that reads and validates
 //! `host_library`/`uuid`; a `uuid` that does not parse is left for it to report.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use serde_json::{json, Value};
@@ -61,6 +74,9 @@ struct PathGroup {
     members: Vec<String>,
     /// Whether the path's frames carry the mux header ([`HostLibraries::is_mux`]).
     is_mux: bool,
+    /// The identity the path's own device answers the mux with
+    /// ([`HostLibraries::identity`]).
+    identity: [u8; 6],
 }
 
 impl HostLibraries {
@@ -81,11 +97,18 @@ impl HostLibraries {
         // a duplicate is caught here and the section's own factory reports the
         // bad value.
         let mut groups: BTreeMap<String, Vec<(String, Option<String>)>> = BTreeMap::new();
+        // Every uuid the config already names, whatever transport carries it, so
+        // an assigned identity can never collide with a board that is already
+        // addressed by one.
+        let mut known: BTreeSet<[u8; 6]> = BTreeSet::new();
         for section in config
             .sibling("mcu")
             .into_iter()
             .chain(config.sibling_prefix_sections("mcu"))
         {
+            if let Some(uuid) = declared_uuid_bytes(&section) {
+                known.insert(uuid);
+            }
             let Some(path) = section.section().get_text("host_library") else {
                 continue;
             };
@@ -96,13 +119,16 @@ impl HostLibraries {
         }
 
         let mut by_path: BTreeMap<String, PathGroup> = BTreeMap::new();
+        let mut taken = known;
         for (path, members) in groups {
             let is_mux = path_is_mux(&path, &members)?;
+            let identity = assign_identity(&path, &mut taken);
             by_path.insert(
                 path,
                 PathGroup {
                     members: members.into_iter().map(|(name, _)| name).collect(),
                     is_mux,
+                    identity,
                 },
             );
         }
@@ -123,6 +149,26 @@ impl HostLibraries {
             .get(path)
             .map(|group| group.members.as_slice())
             .unwrap_or(&[])
+    }
+
+    /// The identity the device behind `path` answers the mux with, or `None`
+    /// when no `[mcu]` names the path at all.
+    ///
+    /// It is assigned once per path at load, a pure function of the path
+    /// string, so it is per path rather than per section
+    /// and the same config always names the same device. Every path gets one,
+    /// muxed or not; only an attach that speaks the mux consumes it.
+    pub fn identity(&self, path: &str) -> Option<[u8; 6]> {
+        self.by_path.get(path).map(|group| group.identity)
+    }
+
+    /// The uuid an attach on `path` names in its `SET_KLIPPER_NODEID`: the
+    /// section's `declared` uuid when it wrote one — it names the board the
+    /// bridge routes to — else the path's own identity, which only the host
+    /// knows (the bridge's own device). `None` when no `[mcu]` names the path.
+    pub fn named_uuid(&self, path: &str, declared: Option<[u8; 6]>) -> Option<[u8; 6]> {
+        let group = self.by_path.get(path)?;
+        Some(declared.unwrap_or(group.identity))
     }
 }
 
@@ -235,6 +281,81 @@ fn declared_uuid(section: &ConfigWrapper) -> Option<String> {
         .get_text("uuid")
         .or_else(|| section.section().get_text("canbus_uuid"))
         .map(|text| text.trim().to_ascii_lowercase())
+}
+
+/// The identity the device behind `path` answers the mux with: a pure function
+/// of the path string, stepped past every uuid `taken` already names.
+///
+/// The first candidate is [`identity_seed`] — a hash of the path — so the same
+/// path always yields the same identity, whatever sections or order the config
+/// around it has. It must be non-zero, the library's "no identity" value, and
+/// must not collide with a configured uuid or another path's identity; a
+/// collision steps to the next value. `taken` is a `BTreeSet`, so the step is
+/// deterministic.
+fn assign_identity(path: &str, taken: &mut BTreeSet<[u8; 6]>) -> [u8; 6] {
+    let mut identity = identity_seed(path);
+    while identity == [0; 6] || taken.contains(&identity) {
+        identity = next_identity(identity);
+    }
+    taken.insert(identity);
+    identity
+}
+
+/// The first identity candidate for `path`: the low six bytes of an FNV-1a hash
+/// of the path string.
+///
+/// FNV-1a is small and dependency-free, and its avalanche is enough here: the
+/// value only has to spread a handful of paths across 2^48, not resist an
+/// adversary. The low six bytes are taken so the all-zero value stays possible
+/// (and is stepped past by [`assign_identity`]) rather than being excluded
+/// inside the hash.
+fn identity_seed(path: &str) -> [u8; 6] {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in path.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let mut identity = [0u8; 6];
+    identity.copy_from_slice(&hash.to_le_bytes()[..6]);
+    identity
+}
+
+/// The identity after `identity`, as a big-endian six-byte counter that wraps.
+fn next_identity(mut identity: [u8; 6]) -> [u8; 6] {
+    for byte in identity.iter_mut().rev() {
+        let (next, carry) = byte.overflowing_add(1);
+        *byte = next;
+        if !carry {
+            break;
+        }
+    }
+    identity
+}
+
+/// The `uuid`/`canbus_uuid` a `[mcu]` section writes, parsed to its six bytes,
+/// or `None` when it writes neither or writes one that does not parse.
+///
+/// Read raw, like [`declared_uuid`], so the scan records no access. A uuid that
+/// does not parse is left out of the known set rather than reported: the
+/// section's own factory rejects the config for it.
+fn declared_uuid_bytes(section: &ConfigWrapper) -> Option<[u8; 6]> {
+    let text = section
+        .section()
+        .get_text("uuid")
+        .or_else(|| section.section().get_text("canbus_uuid"))?;
+    parse_uuid_hex(text.trim())
+}
+
+/// Six bytes as twelve hex digits, the spelling a `[mcu] uuid:` option uses.
+fn parse_uuid_hex(text: &str) -> Option<[u8; 6]> {
+    if text.len() != 12 {
+        return None;
+    }
+    let mut uuid = [0u8; 6];
+    for (i, byte) in uuid.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&text[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(uuid)
 }
 
 /// The section names as a quoted, comma-separated list for an error message.
@@ -410,5 +531,135 @@ mod tests {
         let libraries = HostLibraries::classify(&wrapper).expect("nothing to conflict");
         assert!(libraries.peers(LIB).is_empty());
         assert!(!libraries.is_mux(LIB));
+        assert_eq!(libraries.identity(LIB), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // The identity each path is given (`HostLibraries::identity`).
+    // -----------------------------------------------------------------------
+
+    /// Classify `text` through the section `identifier`, which the loader's
+    /// wrapper always can reach the whole config through.
+    fn classify_from(text: &str, identifier: &str) -> Result<HostLibraries, ConfigError> {
+        let (config, _) = Config::from_text(text).expect("the test config parses");
+        let section = config.get_section(identifier).expect("the named section");
+        let wrapper = ConfigWrapper::with_config(section, AccessTracking::shared(), None, &config);
+        HostLibraries::classify(&wrapper)
+    }
+
+    /// The twelve hex digits a uuid is written as, for building a config that
+    /// names it.
+    fn hex(uuid: [u8; 6]) -> String {
+        uuid.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// Every path gets a non-zero identity, distinct across paths, muxed or not.
+    #[test]
+    fn every_path_gets_its_own_nonzero_identity() {
+        let libraries = classify_from(
+            "[mcu a]\nhost_library: /lib/a.so\n\
+             [mcu b]\nhost_library: /lib/b.so\n",
+            "mcu a",
+        )
+        .unwrap();
+        let a = libraries.identity("/lib/a.so").expect("a has one");
+        let b = libraries.identity("/lib/b.so").expect("b has one");
+        assert_ne!(a, [0; 6], "all zeros is the library's unnamed value");
+        assert_ne!(b, [0; 6]);
+        assert_ne!(a, b, "two paths are two devices");
+        assert_eq!(libraries.identity("/lib/c.so"), None, "no section names it");
+    }
+
+    /// The identity is a function of the path string alone: the same path in two
+    /// configs gets the same identity, however the sections around it are named.
+    #[test]
+    fn identity_is_a_function_of_the_path_string() {
+        let one = classify_from("[mcu x]\nhost_library: /lib/a.so\n", "mcu x").unwrap();
+        let two = classify_from("[mcu y]\nhost_library: /lib/a.so\n", "mcu y").unwrap();
+        assert_eq!(one.identity("/lib/a.so"), two.identity("/lib/a.so"));
+    }
+
+    /// The identity never names a board the config already names: a configured
+    /// uuid equal to the path's natural candidate steps it aside.
+    #[test]
+    fn an_assigned_identity_steps_past_a_configured_uuid() {
+        let natural = classify_from("[mcu]\nhost_library: /lib/a.so\n", "mcu")
+            .unwrap()
+            .identity("/lib/a.so")
+            .expect("the path has one");
+        // A CAN MCU claims exactly the identity the path would have taken.
+        let libraries = classify_from(
+            &format!(
+                "[mcu]\nhost_library: /lib/a.so\n\
+                 [mcu can]\nuuid: {}\n",
+                hex(natural)
+            ),
+            "mcu",
+        )
+        .unwrap();
+        let identity = libraries.identity("/lib/a.so").expect("still assigned");
+        assert_ne!(identity, natural, "the configured uuid is taken");
+        assert_ne!(identity, [0; 6]);
+    }
+
+    /// A host section's own `uuid` is a configured uuid too: the path's identity
+    /// must not be it, or the bridge's own device would be the board it routes.
+    #[test]
+    fn a_host_identity_never_equals_its_sections_uuid() {
+        let natural = classify_from("[mcu]\nhost_library: /lib/a.so\n", "mcu")
+            .unwrap()
+            .identity("/lib/a.so")
+            .expect("the path has one");
+        let declared = hex(natural);
+        let libraries = classify_from(
+            &format!("[mcu]\nhost_library: /lib/a.so\nuuid: {declared}\n"),
+            "mcu",
+        )
+        .unwrap();
+        assert_ne!(libraries.identity("/lib/a.so"), Some(natural));
+        assert!(libraries.is_mux("/lib/a.so"));
+    }
+
+    /// Two paths never share an identity even when one's natural candidate is
+    /// already named by the config: the assignment steps aside, and both paths
+    /// still end up with different, unclaimed values.
+    #[test]
+    fn two_paths_never_share_an_identity() {
+        let natural = classify_from("[mcu a]\nhost_library: /lib/a.so\n", "mcu a")
+            .unwrap()
+            .identity("/lib/a.so")
+            .expect("assigned");
+        let taken = hex(natural);
+        let libraries = classify_from(
+            &format!(
+                "[mcu a]\nhost_library: /lib/a.so\n\
+                 [mcu b]\nhost_library: /lib/b.so\nuuid: {taken}\n",
+            ),
+            "mcu a",
+        )
+        .unwrap();
+        let a = libraries.identity("/lib/a.so").unwrap();
+        let b = libraries.identity("/lib/b.so").unwrap();
+        assert_ne!(a, b, "two paths are two devices");
+        assert_ne!(a, natural, "its natural candidate was claimed");
+        assert_ne!(b, natural);
+    }
+
+    /// The uuid an attach names is the section's own when it wrote one, and the
+    /// path's identity when it did not.
+    #[test]
+    fn named_uuid_prefers_the_sections_own_uuid_then_the_identity() {
+        let libraries = classify_from(
+            &format!(
+                "[mcu]\nhost_library: {LIB}\nuuid: 11aa22bb33cc\n\
+                 [mcu tool]\nhost_library: {LIB}\n"
+            ),
+            "mcu",
+        )
+        .unwrap();
+        let declared = [0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc];
+        assert_eq!(libraries.named_uuid(LIB, Some(declared)), Some(declared));
+        assert_eq!(libraries.named_uuid(LIB, None), libraries.identity(LIB));
+        assert_eq!(libraries.named_uuid("/lib/none.so", None), None);
     }
 }

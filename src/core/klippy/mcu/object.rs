@@ -31,6 +31,7 @@ use std::time::Duration;
 use serde_json::{json, Map, Value};
 use tracing::{debug, info, warn};
 
+use super::host_libraries;
 use super::ids;
 use super::serial_ports;
 use crate::core::klippy::cmd::clock::{ClockSync, McuClock, SecondarySync};
@@ -44,6 +45,7 @@ use crate::core::klippy::config::{AccessTracking, ConfigSection, ConfigWrapper};
 use crate::core::klippy::error::{ConfigError, KlippyError};
 use crate::core::klippy::event::stats::{register_stats, LastStats};
 use crate::core::klippy::event::{IsShutdown, KlippyEvent, McuEvent, Shutdown, Starting};
+use crate::core::klippy::interface::HostMux;
 use crate::core::klippy::mcu::{
     BuiltConfig, ConfigBuilder, Configured, Dictionary, I2cMode, Mcu, McuChip, McuError, McuI2c,
     McuRestartMethod, McuSpi, McuStepper, SpiMode,
@@ -146,6 +148,17 @@ pub struct McuObject {
     /// back by `connect`, exactly as [`McuObject::id`] is: it is what tells the
     /// transport layer to open the shared port instead of a private device.
     shared_baud: Mutex<Option<u32>>,
+    /// What this MCU's `host_library:` path attaches with when the config calls
+    /// it muxed, or `None` for a path that is not muxed (and for every other
+    /// transport).
+    ///
+    /// Stamped at load from the path grouping (`mcu/host_libraries.rs`) and read
+    /// back by `connect`, exactly as [`McuObject::shared_baud`] is: it is what
+    /// tells the transport to open the library through [`Interface::host_mux`]
+    /// instead of the bare-frame mode.
+    ///
+    /// [`Interface::host_mux`]: crate::core::klippy::interface::Interface::host_mux
+    host_mux: Mutex<Option<HostMux>>,
     /// The restart method of the connection currently up.
     ///
     /// [`McuObject::before_firmware_restart`] runs on the live connection and has
@@ -221,6 +234,7 @@ impl McuObject {
             status: Mutex::new(json!({})),
             id: Mutex::new(None),
             shared_baud: Mutex::new(None),
+            host_mux: Mutex::new(None),
             restart_method: Mutex::new(McuRestartMethod::Command),
             is_shutdown: Arc::new(AtomicBool::new(false)),
             connect_shutdown: Arc::new(Mutex::new(None)),
@@ -268,6 +282,27 @@ impl McuObject {
             .shared_baud
             .lock()
             .unwrap_or_else(|poison| poison.into_inner()) = baud;
+    }
+
+    /// What this MCU's `host_library:` path attaches with, when the config
+    /// calls it muxed.
+    ///
+    /// `None` means the path is not muxed (or the transport is not a host
+    /// library): it opens with bare frames, today's mode.
+    pub fn host_mux(&self) -> Option<HostMux> {
+        *self
+            .host_mux
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    /// Record what the load-time grouping decided a muxed `host_library:` path
+    /// attaches with (`mcu/host_libraries.rs`).
+    pub fn set_host_mux(&self, mux: Option<HostMux>) {
+        *self
+            .host_mux
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = mux;
     }
 
     /// Whether this firmware is stopped (or the host has marked it so).
@@ -1159,10 +1194,12 @@ impl PrinterObject for McuObject {
                     config.name
                 ))
             })?);
-            // Same pattern as the id: the shared-port baud was decided for the
-            // whole config at load, so connecting only reads it back rather
-            // than reclassifying every `[mcu]` section again.
+            // Same pattern as the id: the shared-port baud and the host-mux
+            // attach were decided for the whole config at load, so connecting
+            // only reads them back rather than reclassifying every `[mcu]`
+            // section again.
             config.shared_baud = self.shared_baud();
+            config.host_mux = self.host_mux();
             info!(
                 "MCU '{}' restart method: {}",
                 config.name,
@@ -1557,6 +1594,32 @@ pub fn load_config(
         _ => None,
     };
     object.set_shared_baud(shared_baud);
+    // Whether this MCU's `host_library:` path is muxed is likewise the whole
+    // config's call, resolved once by the path grouping pass. A muxed path
+    // brings the attach its identity pair: the library's own device gets the
+    // path's own identity, and the attach names the section's `uuid` when it
+    // wrote one (the board the bridge routes to) else that same identity. A path
+    // the config does not call muxed stays `None` and opens with bare frames.
+    //
+    // Only a host-library section asks for the grouping (as `McuConfig::new`
+    // only calls `host_libraries::validate` for one): a config with no
+    // `host_library:` has no path to group and no identity to assign, so the
+    // object is not brought in for it.
+    let host_mux = match &parsed.transport {
+        Transport::Host { library, uuid } => {
+            let libraries = host_libraries::ensure(printer, config)?;
+            libraries.is_mux(library).then(|| HostMux {
+                identity: libraries
+                    .identity(library)
+                    .expect("a path a section names has an identity"),
+                named: libraries
+                    .named_uuid(library, *uuid)
+                    .expect("a path a section names names a device"),
+            })
+        }
+        _ => None,
+    };
+    object.set_host_mux(host_mux);
     // A host shutdown stops the firmware too (upstream registers the same
     // handler in `MCU.__init__`, `klippy/mcu.py:800`). Registered here
     // rather than in `connect` because the handler is `'static` and needs a
@@ -1988,6 +2051,51 @@ mod tests {
         );
         assert_eq!(shared_baud_of(&printer, "mcu"), Some(115200));
         assert_eq!(shared_baud_of(&printer, "mcu tool"), Some(115200));
+    }
+
+    /// What the load-time host-library grouping stamped on the object `name`
+    /// registered (`mcu/host_libraries.rs`).
+    fn host_mux_of(printer: &Arc<Printer>, name: &str) -> Option<HostMux> {
+        printer
+            .lookup_object_as::<McuObject>(name)
+            .expect("the section registered")
+            .host_mux()
+    }
+
+    /// A `host_library:` path one section names without a `uuid` is not muxed:
+    /// the attach is left `None`, so the transport opens bare frames.
+    #[test]
+    fn test_a_bare_host_library_path_is_not_stamped_mux() {
+        let printer = load_printer("[mcu]\nhost_library: /lib/libklipper_host.so\n");
+        assert_eq!(host_mux_of(&printer, "mcu"), None);
+    }
+
+    /// A `host_library:` path whose section writes a `uuid` is muxed: the attach
+    /// carries the path's own identity and names the section's `uuid`.
+    #[test]
+    fn test_a_host_library_path_with_a_uuid_is_stamped_mux() {
+        let printer =
+            load_printer("[mcu]\nhost_library: /lib/libklipper_host.so\nuuid: 11aa22bb33cc\n");
+        let mux = host_mux_of(&printer, "mcu").expect("the path is muxed");
+        assert_eq!(mux.named, [0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc]);
+        assert_ne!(mux.identity, mux.named, "the bridge is not the board");
+        assert_ne!(mux.identity, [0; 6], "zero is the library's unnamed value");
+    }
+
+    /// Two sections on one path are muxed, sharing the path's identity: the one
+    /// without a `uuid` names the bridge's own device, the one with a `uuid`
+    /// names its board.
+    #[test]
+    fn test_two_host_sections_stamp_the_mux_naming_rule() {
+        let printer = load_printer(
+            "[mcu]\nhost_library: /lib/libklipper_host.so\n\
+             [mcu tool]\nhost_library: /lib/libklipper_host.so\nuuid: 22bb33cc44dd\n",
+        );
+        let bridge = host_mux_of(&printer, "mcu").expect("muxed");
+        let tool = host_mux_of(&printer, "mcu tool").expect("muxed");
+        assert_eq!(bridge.identity, tool.identity, "the identity is the path's");
+        assert_eq!(bridge.named, bridge.identity, "no uuid names the bridge");
+        assert_eq!(tool.named, [0x22, 0xbb, 0x33, 0xcc, 0x44, 0xdd]);
     }
 
     /// An MCU attached to `object`'s chip whose dictionary has `emergency_stop`.

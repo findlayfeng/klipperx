@@ -4,7 +4,7 @@ use crate::core::klippy::interface::devices::serial::{self, ASSIGN_ATTACH_TIMEOU
 use crate::core::klippy::interface::usb::UsbPowerMethod;
 #[cfg(test)]
 use crate::core::klippy::interface::SimulatorDevice;
-use crate::core::klippy::interface::{Interface, SerialDevice};
+use crate::core::klippy::interface::{HostMux, Interface, SerialDevice};
 use crate::core::klippy::mcu::{host_libraries, serial_ports, McuRestartMethod};
 use std::path::Path;
 use tracing::warn;
@@ -46,6 +46,16 @@ pub struct McuConfig {
     /// parsing leaves it at — means the path belongs to this MCU alone and the
     /// transport opens it exactly as before.
     pub shared_baud: Option<u32>,
+    /// What a muxed `host_library:` path attaches with, or `None` for a path the
+    /// config does not call muxed.
+    ///
+    /// Set at load from the path grouping (`mcu/host_libraries.rs`): when the
+    /// path is muxed — the section writes a `uuid`, or two or more sections name
+    /// it — [`Transport::open`] opens the library through
+    /// [`Interface::host_mux`] instead of the bare-frame [`Interface::host`].
+    /// `None` — the value parsing leaves it at — is today's single-MCU mode,
+    /// bare frames with no identity.
+    pub host_mux: Option<HostMux>,
     /// Which mechanism `rpi_usb` uses to switch the port's power.
     ///
     /// Only meaningful with `restart_method: rpi_usb`; see
@@ -249,6 +259,7 @@ impl McuConfig {
             transport,
             id,
             shared_baud: None,
+            host_mux: None,
             usb_power,
         })
     }
@@ -299,7 +310,8 @@ impl McuConfig {
         // the driver opened it. A shared serial port ignores this: several MCUs
         // one port cannot each drive its modem lines (`Transport::open` warns).
         let rts = self.restart_method != McuRestartMethod::Cheetah;
-        self.transport.open(self.id, rts, self.shared_baud)
+        self.transport
+            .open(self.id, rts, self.shared_baud, self.host_mux)
     }
 
     /// Resolve `restart_method` for an MCU whose transport is (or is not) serial.
@@ -569,6 +581,13 @@ impl Transport {
     ///   assignment frame is ever sent, and a `uuid` on the section is
     ///   ignored.
     ///
+    /// `host_mux` is what the host-library arm attaches a muxed path with
+    /// (`mcu/host_libraries.rs`): `Some` opens the library through
+    /// [`Interface::host_mux`], giving it the path's identity and addressing its
+    /// frames by `id`, while `None` is the bare-frame mode that sends nothing
+    /// extra. Like `shared_baud`, it is decided for the whole config at load,
+    /// not derived from this section alone.
+    ///
     /// `rts` is the state an **exclusive** serial port is left in after
     /// opening; a shared one ignores it — and warns when it is `false` —
     /// because several MCUs would otherwise fight over the same modem line.
@@ -581,6 +600,7 @@ impl Transport {
         id: Option<u32>,
         rts: bool,
         shared_baud: Option<u32>,
+        host_mux: Option<HostMux>,
     ) -> Result<Interface, String> {
         match self {
             Transport::Serial { path, baud, uuid } if shared_baud == Some(*baud) => {
@@ -620,9 +640,18 @@ impl Transport {
                     id.ok_or_else(|| "canbus: the MCU id has not been assigned".to_string())?;
                 Interface::canserial(interface, *uuid, id).map_err(|e| format!("canbus: {e}"))
             }
-            Transport::Host { library, uuid: _ } => {
-                Interface::host(library).map_err(|e| format!("host_library: {e}"))
-            }
+            // A muxed path is addressed by id, so it cannot be opened before
+            // the allocator has handed one out (`mcu/ids.rs`); a path the config
+            // does not call muxed opens bare, today's mode.
+            Transport::Host { library, uuid: _ } => match host_mux {
+                Some(mux) => {
+                    let id = id.ok_or_else(|| {
+                        format!("host_library {library}: the MCU id has not been assigned")
+                    })?;
+                    Interface::host_mux(library, mux, id).map_err(|e| format!("host_library: {e}"))
+                }
+                None => Interface::host(library).map_err(|e| format!("host_library: {e}")),
+            },
             #[cfg(test)]
             Transport::Simulator(path) => SimulatorDevice::new(path)
                 .map(Interface::simulator)

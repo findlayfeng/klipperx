@@ -33,6 +33,12 @@ CONFIG_MACH_HOST=y
 # CONFIG_HOST_AR_LIBRARY is not set
 ```
 
+`make olddefconfig` 补齐的其余默认值里还有 host 库自己的开关（例如桥模式
+`CONFIG_HOST_BRIDGE_SERIAL`——它 `select` 传输无关的公共符号 `CONFIG_BRIDGE`、`CONFIG_MUX`
+与 `CONFIG_BRIDGE_PORT_SERIAL`/`CONFIG_MUX_SERIAL`），它们都默认关闭，所以测试加载的这份
+库只走宿主 API、不打开任何设备（桥模式的分层与选项表见
+`third_party/klipper/src/host/README.md`）。
+
 因此：全新检出即可复现（`make olddefconfig` 补齐其余默认值，`build.rs` 在产物缺失时报错并指出要检查哪两条），开发者正在编的固件配置与 `out/` 不受影响，测试也不会用到别人的配置。
 
 ## 运行

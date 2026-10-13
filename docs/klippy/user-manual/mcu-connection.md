@@ -9,6 +9,8 @@
 | `canbus_interface` | CAN 网络接口名 | 可选，默认 `can0` |
 | `canbus_nodeid` | **MCU 层 id**（1..=255；CAN 上即节点号） | **可选**：不写就由 `[mcu_ids]`（历史名 `[canbus_ids]`）的分配器发 `4` 起的最小空位；写了就用写的那个（分配器装载时预扫全配置保留显式号，自动号绕开，写在哪个位置都生效）。只在两个显式号互撞、或 `4..=255` 占满时装载期报错 |
 | `host_library` | klipper host 库（`libklipper_host.so`）的路径 | 在主机进程内运行一份 klipper 固件（模拟与自测用）；**同路径被多颗 `[mcu]` 引用时库只加载一次**（通讯复用，一个 runtime/reader），各拿一个通讯引用共享它，`shutdown` 只停本引用、最后一个引用析构才卸载；旧固件没有桥/没有 mux 时，同一时刻只能有一路活动引用（设备层在 `interface/devices/host.rs`）。**可写 `uuid:`**（12 位十六进制，旧名 `canbus_uuid` 兼容，同节双写报错）：它指明这条路径上被寻址的是**哪块设备**。判定为 **mux** 的路径连接时**按 id 寻址**：先发 `SET_KLIPPER_NODEID`（节上写了 `uuid:` 就用它点名**桥下游那台板子**；没写就用**装载期为该路径指派的那条自身份**，它同时是主机在 `init` 前交给库的身份），再走重确认握手，之后收发都带帧头；非 mux 路径照旧裸帧。判定按配置事实（`mcu/host_libraries.rs`）：同路径 **1 节且无 `uuid:`** 走**裸帧**（今天的行为）；**1 节有 `uuid:`**、或同路径 **≥2 节** 则**按 id 寻址**——≥2 节时**最多一节可省略 `uuid:`**（它认领桥自身的设备），其余必须写 `uuid:`；**≥2 节都省略**、或**两节写同一个 uuid** 都在装载期报错并点名涉及的节 |
+| `uart` | 引用 `[uart_device <名>]` 端口节的名字 | 把这颗 MCU 挂到**桥的下游 uart 口**上（端口本身用 `[uart_device]` 节声明，见下节「桥下游端口」）。`uuid` 可选——不写即 legacy。与 `serial`/`host_library`/`test`/`can` 互斥 |
+| `can` | 引用 `[can_device <名>]` 端口节的名字 | 挂到桥的下游 CAN 口。**`uuid` 必填**（CAN 寻址靠它）。与 `serial`/`host_library`/`test`/`canbus_interface`/`uart` 互斥 |
 
 ```ini
 [mcu]
@@ -67,6 +69,42 @@ serial: /dev/ttyUSB0
 - 握手请求/回执 = 上面的头 **++ 一个 9 字节伪帧** `[09][0x20]["KXID"][crc16 hi][crc16 lo][0x7e]`：`seq` 字节用 `0x20`（把合法帧必置的 `MESSAGE_DEST` 清掉、改占 bit5），所以主机自己的 `Frame::parse` 必然拒收它，**id 只在帧头里出现一次**。
 - **请求对旧固件无害**：旧固件 `command_find_block`（`third_party/klipper/src/command.c`）先按长度字节判——单元出线第一个字节就是头首字节（`0x80..=0xff`，非法长度），于是立刻进错误分支、丢弃到下一个 `0x7e`（`id ∈ 120..=127` 时是头的第二字节，伪帧下一次再被丢）；不读载荷、不查 CRC、永不 dispatch、序号不动，至多回一枚无害空帧后转静默。整单元（含新头）的行为与帧头/伪帧的编解码都在 `interface/devices/serial.rs`，由那里的**可执行忠实移植测试**钉住。设备端要做的只是：认出请求 → 用 `+1` 方向的头 + 同形伪帧回执。
 - 完整的线上规格、超时/重试、主机侧的单 reader 分派与引用计数关闭，见开发手册的 [串口复用协议](../developer-manual/serial-mux-protocol.md)。
+
+## 桥下游端口（`uart:` / `can:` 引用端口节）
+
+桥的**下游端口**用 klipper 一贯的设备节形式声明（`[uart_device <名>]` / `[can_device <名>]`，
+选项见 [配置手册 → 已支持的配置节](config.md#uart_device-名--can_device-名--桥下游端口)），桥下游的
+子设备 `[mcu]` 用 `uart:` / `can:` 按**名字**引用它们——`[bridge]`/`[bridge_port]`/`bridge_admin`
+都不需要，桥是谁、口在哪、谁是 legacy 全部从引用推算：
+
+- **桥** = 端口节 `uart_mcu`/`can_mcu` 指向的那颗 `[mcu]`（必须存在，且桥不能自己又是下游子设备）；
+- **共享**（≥2 颗 `[mcu]` 引用同一端口）⇒ 每颗必须写**互异** `uuid:`，按 id 寻址；
+- **legacy**（恰 1 颗 + uart 口 + 无 `uuid:`）⇒ **原始帧**：不发 SET_NODEID、不等重确认握手——
+  这就是「与没有 admin 的设备共存」的形态（旧串口固件答不了扫描也 admin 不了，但作为单设备口照常跑）；
+- CAN 口的子设备**必须有 `uuid:`**（CAN 寻址本来就是 uuid）。
+
+分组与全部冲突校验在装载期一次完成（`mcu/port_grouping.rs`，预扫原始文本、不豁免未定义选项检查），
+报错点名涉及的节。
+
+```ini
+[mcu bridge_mcu]                 # 桥自己：上游连接照旧（host_library / serial / CAN）
+host_library: /usr/local/lib/libklipper_host.so
+
+[uart_device uartxx]
+uart_mcu: bridge_mcu
+uart_oid: uart0
+
+[mcu child_old]
+uart: uartxx                    # 无 uuid ⇒ legacy，原始帧
+```
+
+**归属告知桥、下游完全不参与**：端口与子设备的归属关系由配置声明，主机经桥自己的 admin 通道用
+端口级命令 `SET_PORT_NODEID(index, id, flags)` 直接告诉桥，**下游设备全程不答任何 admin**（线上
+帧形与命令族见[串口复用协议](../developer-manual/serial-mux-protocol.md)）。
+
+> **状态（M1 分期）**：配置面（节类型、`uart:`/`can:` 键、分组与冲突校验）已落地；**经端口 attach
+> 属 M1-P3**——现在解析与装载都通过，`connect` 会明确报错（点名 M1-P3）而非假装可连。识别后与
+> 固件端口表的对账（oid 名/类型）也在 P3。
 
 ## 固件重启方式（`restart_method`）
 

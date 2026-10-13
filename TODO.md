@@ -369,7 +369,9 @@ admin 通道**用端口级命令 `SET_PORT_NODEID(index, id)` 告知桥，**下�
 
 设计与分期见 [M1 笔记](docs/work-log/2026-10-13-bridge-port-notes.md)：复位与端口级命令是**同一套机制**
 （都分"面向设备"与"面向端口/桥"两条），固件命令族落 **§5 P2**（与 `SET_PORT_NODEID` 同期，共用
-`KXID` 帧形与端口 `index`），主机侧 `restart_method` 接入落 **§5 P3**。开工时再定的点见笔记 §5.6(d)。
+`KXID` 帧形与端口 `index`），主机侧 `restart_method` 接入落 **§5 P3**。✅ 固件命令族已落地
+（2026-10-13，见笔记 §6）：`RESET_DEVICE 0x02 [0x02][index]` 只转发到该口、`RESET_PORT 0x04
+[0x04][index]` 由桥做 DTR/RTS 线脉冲（poll 状态机非阻塞），均无回执；复位层次仍留 P3（§5.6d）。
 
 范围一句话：今天的复位只有线级手段（`arduino` 的 DTR、`cheetah` 的 RTS、`rpi_usb` 切电），在共享/mux
 路径上会打断整条线因而被配置层强制成 `command`，而 `command` 不是真复位；目标是让"点名复位某台设备"

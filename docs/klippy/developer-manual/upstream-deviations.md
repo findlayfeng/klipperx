@@ -116,6 +116,8 @@ OctoPrint 只走 pty，与本条取舍无关。
 | 项 | 位置 | 干什么 | 上游对应物 |
 |---|---|---|---|
 | `[i2c_device <name>]` | `src/core/klippy/extras/i2c_device.rs`、[配置手册](../user-manual/config.md) | 通用原始 I2C 设备节：只搬字节，不含设备协议 | **无**（上游各 I2C 器件各自走 `bus.MCU_I2C_from_config`） |
+| `[uart_device <name>]` / `[can_device <name>]` | `src/core/klippy/mcu/bridge_ports.rs`、[配置手册](../user-manual/config.md#uart_device-名--can_device-名--桥下游端口) | 桥下游端口节：声明端口长在哪颗桥 MCU（`*_mcu`）与它的 oid 名（`*_oid`），子设备按名引用 | **无**（上游没有桥/端口模块化概念，MCU 直连一条线） |
+| `[mcu]` 的 `uart:` / `can:` 键 | `src/core/klippy/config/mcu.rs`、[MCU 连接方式](../user-manual/mcu-connection.md#桥下游端口uart--can-引用端口节) | 用端口节名声明这颗 MCU 挂在桥的哪条下游口；`can:` 必带 `uuid:`，`uart:` 无 `uuid:` 即 legacy | **无**（上游 `[mcu]` 只有 `serial`/`canbus_uuid` 两类连接键） |
 | `[spi_device <name>]` | `src/core/klippy/extras/spi_device.rs`、[配置手册](../user-manual/config.md) | 通用原始 SPI 设备节：一次传输 = 一个片选脉冲 | **无**（上游走 `bus.MCU_SPI_from_config`） |
 | `IIC_WRITE` / `IIC_READ` / `SPI_TRANSFER` / `SPI_SEND` | 同上两模块、[G-Code 命令参考](../user-manual/gcode-commands.md) | 真机自测用的总线调试命令 | **无**（上游全树无这些名字） |
 | 其余调试总线命令 | [G-Code 命令参考](../user-manual/gcode-commands.md) 的「调试总线命令（KlipperX 自有）」一节 | 真机自测/诊断 | **无** |

@@ -280,5 +280,50 @@ d. **M2 的复位命令**：名字与参数（要不要带"复位到哪一层"�
 
 ## 6. 实施记录
 
-**尚未开工。** 开工后本节的每次回填写：当期的实际落地范围、验收实测数字（命令 + 结果）、
-与 §5 的偏差（以及为什么）、以及仍未收口的余项。
+**P1（配置面）与 P2（固件端口表 + 端口级命令）已于 2026-10-13 落地。** 本节同时记两期；
+为避免 P1/P2 两条分支对同一段落的合并冲突，记录统一写在 P1 分支
+（`agents/feat-m1-port-config`），P2 分支只带 `serial-mux-protocol.md` 与探针相关文档。
+
+### P1 配置面（分支 `agents/feat-m1-port-config`，4 提交）
+
+- **落地范围**：`[uart_device <名>]`/`[can_device <名>]` 端口节（`mcu/bridge_ports.rs`，order 19，
+  10 测）；端口分组与跨节冲突校验（`mcu/port_grouping.rs`，注册名 `port_groups`，14 测）；
+  `[mcu]` 传输键 `uart:`/`can:` + `Transport::BridgePort`（`config/mcu.rs`，+17 测）；共享判定
+  核心抽取（`mcu/link_grouping.rs`，host_libraries 与 port_grouping 共用，host_library 现有
+  44 测断言 0 改动）。装载 id：85 个声明文件 / 124 个（实测重核）。
+- **验收实测**：`cargo test --workspace` **3177 passed / 0 failed / 13 ignored**；
+  `cargo doc --no-deps -p klipperx` 告警 160→160（0 新增）；`cargo fmt --all` 干净。
+- **与 §5 的偏差**：① §5.6(a) 的 i2c/spi 端口写法**未在本期定案**——本期只实现 uart/can，
+  i2c/spi 复用已有节类型、其端口引用写法留待接入非 MCU 消费者的期（验收清单本就未含）；
+  ② 规则1 的「引用推出的桥与绑的桥不一致」经核查在本配置面**结构上不可达**（桥的唯一声明位点
+  就是端口节 `*_mcu`），实现的是可达形态：`*_mcu` 必须存在 + 桥不能同时是下游子设备；
+  ③ `canbus_nodeid` 扩到 CAN 端口子（id 覆盖与链路正交，非 CAN 链路仍拒）；
+  ④ `uart_restart_method` 本期仅拼写校验，语义随 P3。
+- **未收口**：经端口 attach（`Transport::BridgePort::open` 明确报 M1-P3）、识别后与固件
+  端口表对账、`uart_restart_method` 语义——均属 §5 P3。
+
+### P2 固件端口表 + 端口级命令 + M2 固件半边（子模组分支 `agents/feat-m1-port-firmware`）
+
+- **落地范围**（子模组 2 提交）：`SET_PORT_NODEID [0x03][index][id][flags]`（0x03，
+  `MUX_PORT_UNITS=0x01`；建表、幂等、无回执、不下发；`bridge_admin_unit` 返回消费标志，
+  `mux_unit` 据此短路本机设备半，0x00/0x01 行为逐位不变）；`single_device` 编译期标志退役为
+  端口运行期 `flags`（默认 legacy = 现行为，逐点语义反映射核对）；identify 字典端口表
+  `BRIDGE_PORT_COUNT`/`BRIDGE_PORT0_NAME`/`_TYPE`/`_PATH` 四键（仅桥构建出现）；复位命令族
+  `RESET_DEVICE 0x02 [0x02][index]`（桥只转发到该口；无桥板设备半照 canserial 模式执行）与
+  `RESET_PORT 0x04 [0x04][index]`（桥消费，经 `bridge_port_ops.reset` 钩子做 DTR/RTS 线脉冲；
+  host 侧用延迟恢复的 poll 状态机保持任务循环非阻塞）。
+- **主仓侧（3 提交）**：`set_port_node_id` builder 与命令字节常量（`serial.rs`，+1 测）；
+  真库探针 `test_the_bridge_port_commands_over_the_real_library`（`host.rs`，+1 测：字典端口表
+  可读、legacy 剥头/加头逐字节、UNITS 原样转发、未登记 id 不路由、无回执不下发、复位族消费性、
+  库不被误复位）；gitlink 指向子模组 `d56f9f6f`。
+- **验收实测**：m1-p2 `cargo test --workspace` **3131 passed / 0 failed**（含新固件构建的全部
+  字典——即「新固件不破坏既有测试」的回归证明）；三配置（全关/仅 mux/mux+桥）构建基线与改后
+  均 **0 告警**；dict 四键在 mux+桥构建、另两配置不含（护栏生效）；非 host 配置
+ （stm32f103 等）0 告警（sam4s8c 的 2 条为既有 ARM RWX 段告警，该配置不编译本次改动文件）。
+- **与 §5 的偏差**：① 字典端口表暂写死 1 个 host 串口（NAME 字面量 `"uart0"`，未加
+  `HOST_BRIDGE_SERIAL_NAME` Kconfig 项——单一 host 串口无变体，留待多端口/其他 arch 后端时
+  宏化）；② 探针中断言 `[0x02][0]` 的头形态依赖同测试内先行把端口切到 UNITS（顺序已注释）。
+- **未收口**：存量 flake（`klipper_host_set_uuid() returned -1`，attach 测试异步 dlclose 与
+  重 dlopen 竞速，**基线 21 次复现 2 次**、非本期引入，留独立修复）；复位极性/保持时长未真机
+  验证（RS-232 通用约定，代码已注释）；复位层次与桥自身复位留 P3（§5.6d）；主机侧何时发
+  SET_PORT_NODEID（attach 时序）留 P3。

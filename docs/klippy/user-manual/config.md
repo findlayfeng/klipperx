@@ -234,6 +234,8 @@ max_accel: 3000
 |------|------|------|--------|------|
 | `host_library` | 字符串 | 二选一 | — | klipper host 库（`libklipper_host.so`）的路径：在主机进程内跑一份 klipper 固件。与 `serial`/CAN 键互斥；同路径可被多颗 `[mcu]` 引用，判定为 mux 时连接按 id 寻址（见 [MCU 连接方式](mcu-connection.md)） |
 | `serial` | 字符串 | 二选一 | — | 串口设备路径（如 `/dev/ttyACM0`）。**同一路径被两颗及以上 `[mcu]` 引用即共享**（见 [MCU 连接方式](mcu-connection.md)） |
+| `uart` | 字符串 | 二选一 | — | 引用一个 `[uart_device <名>]` 端口节的**名字**（如 `uart: uartxx` 引 `[uart_device uartxx]`），把这颗 MCU 挂到桥的下游 uart 端口上。与 `serial`/`host_library`/`test`/`can` 互斥；`uuid` 可选——**不写就是 legacy**（原始帧，规则见 [MCU 连接方式](mcu-connection.md#桥下游端口uart--can-引用端口节)）；`canbus_nodeid` 不可用（非 CAN 链路）。**配置面已落地；经端口 attach 属 M1-P3**，`open` 会明确报错而非假装可连 |
+| `can` | 字符串 | 二选一 | — | 引用一个 `[can_device <名>]` 端口节的名字，挂到桥的下游 CAN 端口。**`uuid` 必填**（CAN 寻址靠它，装载期点名报错）；与 `serial`/`host_library`/`test`/`canbus_interface`/`uart` 互斥；`canbus_nodeid` 可用（id 覆盖与链路正交）。attach 同属 M1-P3 |
 | `baud` | 整数 | 否 | `250000` | 串口波特率（仅 `serial` 模式）。共享路径以**显式写出**的值为准——多颗写了不同值就 `warn` 并**取最小值**（没写的节跟着它走） |
 | `uuid` | 12 位十六进制 | 二选一 | — | MCU 芯片唯一 ID（12 位 hex）：CAN 模式必给；写在 `serial` 节上则共享串口连接期按它先发 SET_NODEID 再握手（独占串口忽略）。历史键名 `canbus_uuid` 仍兼容，同节两个都写会报错；**写在 `host_library` 节上**则指明这条库路径上被寻址的是哪块设备（判定见 [MCU 连接方式](mcu-connection.md)：同路径 1 节有 `uuid`、或 ≥2 节即按 id 寻址；不写 `uuid:` 的节认领桥自身设备，用装载期为该路径指派的身份点名） |
 | `canbus_interface` | 字符串 | 否 | `can0` | CAN 网络接口名 |
@@ -271,6 +273,48 @@ CAN MCU、本仓把它泛化成所有接口共用一个序列；
 （点名 MCU）；自动号永不与显式号撞（先预扫保留、再取最小空位）。不像上游那样留到固件
 `can_id_conflict` 才停机。
 发现未分配的板子（拿到可粘进配置的 uuid）见 `klipperx scan`——`--interface <总线>` 扫 CAN、`--port <tty>` 扫串口、`--host-library <path.so>` 扫一份 host 库（三者互斥、必须给其一，裸调用打 help；同一套查询/应答协议；扫 host 库时另可用 `--host-identity` 指定它在 `init` 前要采纳的身份）。
+
+### `[uart_device <名>]` / `[can_device <名>]` — 桥下游端口
+
+桥（跑 `CONFIG_BRIDGE` 固件的那颗 `[mcu]`）的**下游端口**按 klipper 一贯的设备节形式声明，
+桥下游的子设备 `[mcu]` 用 `uart:` / `can:` 按**名字**引用它们。`[bridge]` / `[bridge_port]` /
+`bridge_admin` 都不需要：桥是谁、口在哪、谁是 legacy，全部从引用推算。
+
+| 参数 | 适用节 | 类型 | 必需 | 说明 |
+|------|--------|------|------|------|
+| `uart_mcu` | `uart_device` | 字符串 | 是 | 这条 uart 口长在哪颗 `[mcu]` 上（裸 `[mcu]` 写 `mcu`，命名节写名字）。必须指向配置里存在的 `[mcu]`，否则装载报错 |
+| `uart_oid` | `uart_device` | 字符串 | 是 | 该 MCU 上对应的 oid 名（固件上报的那个，如 `uart0`） |
+| `uart_baud` | `uart_device` | 整数 | 否 | 端口自身的线参数；正整数校验 |
+| `uart_restart_method` | `uart_device` | `command` / `arduino` / `cheetah` / `rpi_usb` | 否 | 拼写装载期校验；**语义（经端口/桥的复位）随 M1-P3 接线**，现在只校验不生效 |
+| `can_mcu` | `can_device` | 字符串 | 是 | 同 `uart_mcu` |
+| `can_oid` | `can_device` | 字符串 | 是 | 同 `uart_oid` |
+
+未知选项会按未定义选项报错。**分组与冲突校验**（装载期，`mcu/port_grouping.rs`）：
+
+- 端口被 **≥2 颗 `[mcu]` 引用即共享**：每颗都必须写 `uuid:` 且互异（缺、重复都报错并点名），按 id 寻址；
+- **恰 1 颗 + `uart_device` + 无 `uuid:` ⇒ legacy**：走原始帧（不发 SET、不等握手）——这就是「与没有 admin 的设备共存」的形态；
+- **CAN 端口的子设备必须写 `uuid:`**（规则 6）；
+- 端口的 `uart_mcu`/`can_mcu` 必须指向存在的 `[mcu]`，且**桥不能自己又是下游子设备**。
+
+```ini
+[uart_device uartxx]
+uart_mcu: bridge_mcu      # 这条 uart 口长在哪颗 MCU（桥）上
+uart_oid: uart0           # 固件上报的 oid 名
+uart_baud: 250000         # 可选
+
+[can_device canxx]
+can_mcu: bridge_mcu
+can_oid: can0
+
+[mcu child_old]
+uart: uartxx              # 无 uuid ⇒ legacy，原始帧
+
+[mcu child_new]
+uart: uartxx
+uuid: 11aa22cc33dd        # 同一条口上第二台必须写互异 uuid
+```
+
+> `i2c`/`spi` 复用已有节类型（`[i2c <名>]`/`[spi <名>]`），其端口引用写法尚未定案（见笔记 §5.6 未决 a）。
 
 ### `[output_pin <name>]` — 输出引脚（数字 / PWM）
 

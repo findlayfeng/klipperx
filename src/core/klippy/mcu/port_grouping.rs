@@ -23,12 +23,15 @@
 //! - **any** member of a **CAN** port must write a `uuid` (rule 6): CAN
 //!   addressing is by uuid, so a CAN port is never legacy.
 //!
-//! A `uuid`/`canbus_uuid` is compared the way
-//! [`host_libraries`](super::host_libraries)'s `declared_uuid` compares it:
+//! A `uuid`/`canbus_uuid` is compared the way `mcu/link_grouping.rs`
+//! spells it for both link passes (`host_library:` paths and ports):
 //! trimmed and lowercased, so two spellings of one identity are one identity;
 //! whether a uuid parses is the `[mcu]` section's own factory's call, and an
 //! unparsable one still takes part in the duplicate check so two spellings of
-//! the same bad value are still one board claimed twice.
+//! the same bad value are still one board claimed twice. The grouping itself
+//! and the uuid-distinguishability judgment are that module's shared core —
+//! one judgment for both link kinds; the wording and the shared/legacy
+//! verdict stay here.
 //!
 //! Two conflicts are config errors naming the sections involved: a shared port
 //! (or a CAN port) with a member that writes no `uuid`, and two members writing
@@ -71,6 +74,9 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
+use crate::core::klippy::mcu::link_grouping::{
+    declared_uuid, distinguishability, group_by_key, quoted, Distinguishability, Member,
+};
 use crate::core::klippy::printer::{Printer, PrinterObject};
 
 /// The registry key this pass is looked up and registered under.
@@ -134,10 +140,10 @@ struct PortGroup {
     /// the order [`McuIds::reserve_explicit`](super::ids::reserve_explicit)
     /// reads them in.
     members: Vec<String>,
-    /// Each member's `uuid` (or `canbus_uuid`), trimmed and lowercased — the
-    /// `declared_uuid` spelling [`host_libraries`](super::host_libraries)
-    /// compares by, so two spellings of one identity are one identity. `None`
-    /// when it writes neither. Section identifiers are unique, so the map is
+    /// Each member's `uuid` (or `canbus_uuid`), trimmed and lowercased —
+    /// the shared `mcu/link_grouping.rs` spelling both link passes compare
+    /// by, so two spellings of one identity are one identity. `None` when
+    /// it writes neither. Section identifiers are unique, so the map is
     /// one entry per member.
     uuids: BTreeMap<String, Option<String>>,
 }
@@ -172,9 +178,6 @@ impl PortGroups {
                     section.identifier(),
                     PortSection {
                         kind,
-                        // `sibling_prefix_sections` only yields sections with a
-                        // sub, so this is the name references are written with.
-                        sub: section.section().sub.clone().expect("a subbed section"),
                         bridge: section.section().get_text(mcu_option),
                     },
                 );
@@ -193,12 +196,12 @@ impl PortGroups {
             }
         }
 
-        // The referencing `[mcu]` sections, grouped by (kind, sub): section
-        // identifier → the uuid it writes. A section that writes both `uart:`
+        // The referencing `[mcu]` sections' claims: the port section
+        // identifier they name (`uart_device uart0`, the spelling `ports` is
+        // keyed by) and the uuid they write. A section that writes both `uart:`
         // and `can:` is a conflict its own transport parse reports; here it is
         // one device, on the first reference written.
-        let mut members: BTreeMap<(PortKind, String), Vec<(String, Option<String>)>> =
-            BTreeMap::new();
+        let mut claims: Vec<(String, Member)> = Vec::new();
         for section in config
             .sibling("mcu")
             .into_iter()
@@ -218,24 +221,34 @@ impl PortGroups {
                 }
             }
             if let Some((kind, referenced)) = port_reference(&section) {
-                members
-                    .entry((kind, referenced))
-                    .or_default()
-                    .push((identifier, declared_uuid(&section)));
+                claims.push((
+                    format!("{} {referenced}", kind.section_type()),
+                    Member {
+                        identifier,
+                        uuid: declared_uuid(&section),
+                    },
+                ));
             }
         }
 
+        let mut members = group_by_key(claims);
         let mut by_identifier: BTreeMap<String, PortGroup> = BTreeMap::new();
         for (identifier, port) in ports {
-            let group_members = members.remove(&(port.kind, port.sub)).unwrap_or_default();
+            let group_members = members.remove(&identifier).unwrap_or_default();
             validate_members(&identifier, port.kind, &group_members)?;
             by_identifier.insert(
                 identifier,
                 PortGroup {
                     kind: port.kind,
                     bridge: port.bridge,
-                    members: group_members.iter().map(|(name, _)| name.clone()).collect(),
-                    uuids: group_members.into_iter().collect(),
+                    members: group_members
+                        .iter()
+                        .map(|member| member.identifier.clone())
+                        .collect(),
+                    uuids: group_members
+                        .iter()
+                        .map(|member| (member.identifier.clone(), member.uuid.clone()))
+                        .collect(),
                 },
             );
         }
@@ -339,11 +352,11 @@ pub fn ensure(
     Ok(object)
 }
 
-/// One port section as this pass sees it: what it declares, its sub, and the
-/// bridge it names.
+/// One port section as this pass sees it: what it declares and the bridge it
+/// names. Its identifier — `{type} {sub}` — is the map key and the name
+/// references are written with.
 struct PortSection {
     kind: PortKind,
-    sub: String,
     bridge: Option<String>,
 }
 
@@ -353,6 +366,9 @@ struct PortSection {
 /// parse's conflict to report.
 ///
 /// Read raw, like every scan here, so it records no access.
+///
+/// The `uuid` itself is read by the shared `mcu/link_grouping.rs` rule
+/// ([`declared_uuid`]) both link passes compare by.
 fn port_reference(section: &ConfigWrapper) -> Option<(PortKind, String)> {
     for kind in [PortKind::Uart, PortKind::Can] {
         if let Some(text) = section.section().get_text(kind.reference_option()) {
@@ -365,92 +381,51 @@ fn port_reference(section: &ConfigWrapper) -> Option<(PortKind, String)> {
     None
 }
 
-/// The `uuid` a `[mcu]` section writes for itself: the canonical `uuid` or its
-/// `canbus_uuid` alias, trimmed and lowercased so two spellings of one
-/// identity compare equal, or `None` when it writes neither.
-///
-/// The same rule [`host_libraries`](super::host_libraries)'s `declared_uuid`
-/// applies; read raw so the scan records no access (see the module docs).
-fn declared_uuid(section: &ConfigWrapper) -> Option<String> {
-    section
-        .section()
-        .get_text("uuid")
-        .or_else(|| section.section().get_text("canbus_uuid"))
-        .map(|text| text.trim().to_ascii_lowercase())
-}
-
 /// Reject a port whose members cannot be told apart or address their boards.
 ///
-/// Members are the `(identifier, declared uuid)` pairs [`PortGroups::classify`]
-/// gathered for the port, in declaration order.
+/// Members are the grouped members [`PortGroups::classify`] gathered for the
+/// port, in declaration order. The judgment is the shared distinguishability
+/// rule (`mcu/link_grouping.rs`); what differs per port is how many members
+/// may write no `uuid` and how the refusal reads:
 ///
-/// - CAN (rule 6): every member must write a `uuid` — CAN addressing is by
-///   uuid, so a uuid-less member there can never talk, legacy or not.
+/// - CAN (rule 6): every member must write one — CAN addressing is by uuid,
+///   so a uuid-less member there can never talk, legacy or not.
 /// - Shared uart (rule 4): every member must write one too — this is also the
 ///   legacy refusal, since rule 5 defines legacy as a single-device-port
 ///   shape; one condition, one message.
-/// - Duplicate `uuid` (any port): two members writing one identity name the
-///   same board twice, so a mux header built from it would address both at
-///   once. A `BTreeMap` so the reported pair is stable across runs.
+/// - Alone on a uart port one member may omit it (rule 5's legacy shape), and
+///   two members writing one identity name the same board twice on any port.
 fn validate_members(
     identifier: &str,
     kind: PortKind,
-    members: &[(String, Option<String>)],
+    members: &[Member],
 ) -> Result<(), ConfigError> {
-    if kind == PortKind::Can {
-        if let Some(without) = uuid_less(members) {
-            return Err(ConfigError::new(format!(
-                "port '{identifier}': a CAN port addresses its boards by uuid, so every MCU on \
-                 it must write one, but these name it without one: {without}"
-            )));
+    let named_by_rule = kind == PortKind::Can || members.len() >= 2;
+    let Some(violation) = distinguishability(members, usize::from(!named_by_rule)) else {
+        return Ok(());
+    };
+    let names = |identifiers: &[String]| {
+        quoted(&identifiers.iter().map(String::as_str).collect::<Vec<_>>())
+    };
+    match violation {
+        Distinguishability::MissingUuid(without) => {
+            let why = if kind == PortKind::Can {
+                "a CAN port addresses its boards by uuid, so every MCU on it must write one"
+            } else {
+                "a port two or more MCUs reference is shared, and every MCU on it must write a \
+                 uuid to be told apart"
+            };
+            Err(ConfigError::new(format!(
+                "port '{identifier}': {why}, but these name it without one: {}",
+                names(&without)
+            )))
         }
+        Distinguishability::DuplicateUuid { uuid, members } => Err(ConfigError::new(format!(
+            "port '{identifier}': {} set the same uuid {uuid}, so the boards cannot be \
+             told apart",
+            names(&members)
+        ))),
     }
-    if members.len() >= 2 {
-        if let Some(without) = uuid_less(members) {
-            return Err(ConfigError::new(format!(
-                "port '{identifier}': a port two or more MCUs reference is shared, and every \
-                 MCU on it must write a uuid to be told apart, but these name it without one: \
-                 {without}"
-            )));
-        }
-        let mut by_uuid: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-        for (name, uuid) in members {
-            if let Some(uuid) = uuid {
-                by_uuid
-                    .entry(uuid.as_str())
-                    .or_default()
-                    .push(name.as_str());
-            }
-        }
-        if let Some((uuid, names)) = by_uuid.iter().find(|(_, names)| names.len() >= 2) {
-            return Err(ConfigError::new(format!(
-                "port '{identifier}': {} set the same uuid {uuid}, so the boards cannot be \
-                 told apart",
-                quoted(names)
-            )));
-        }
-    }
-    Ok(())
-}
-
-/// The MCU names that write no `uuid`, as a quoted list — or `None` when every
-/// member writes one.
-fn uuid_less(members: &[(String, Option<String>)]) -> Option<String> {
-    let without = members
-        .iter()
-        .filter(|(_, uuid)| uuid.is_none())
-        .map(|(name, _)| name.as_str())
-        .collect::<Vec<_>>();
-    (!without.is_empty()).then(|| quoted(&without))
-}
-
-/// The section names as a quoted, comma-separated list for an error message.
-fn quoted(names: &[&str]) -> String {
-    names
-        .iter()
-        .map(|name| format!("'{name}'"))
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 // ===========================================================================

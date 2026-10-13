@@ -26,6 +26,7 @@ mod error;
 mod events;
 pub mod host_libraries;
 pub(crate) mod ids;
+pub(crate) mod link_grouping;
 mod object;
 mod pending;
 pub mod port_grouping;

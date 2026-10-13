@@ -125,14 +125,17 @@ struct State {
     /// keeps the last session's tail, which is what lets a first step land in
     /// the past (`Timer too close`).
     steppers: HashMap<u8, StepChain>,
-    /// Whether the attached sensor feeds the firmware its samples locally —
-    /// `ldc1612_attach_trigger_analog` hands the chip to the trigger module,
-    /// and from then on samples reach it without ever crossing the wire (the
-    /// host pulls bulk data occasionally; `home_start` sizes the monitor
-    /// window as one sample period, `MONITOR_MAX` 3 missed samples). The
-    /// monitor slides while this is alive and only a genuinely silent sensor
-    /// can expire it.
-    ldc_sampling: bool,
+    /// Whether the sensor attached to the trigger analog feeds the firmware
+    /// its samples locally: a `*_attach_trigger_analog` init command hands the
+    /// chip to the trigger module, and from then on its samples reach the
+    /// firmware without ever crossing the wire — every sensor driver reads its
+    /// own chip and calls `trigger_analog_update` itself
+    /// (`sensor_ads1220.c:100`, `sensor_ads131m0x.c:172`, `sensor_hx71x.c:182`,
+    /// `sensor_ldc1612.c:175`). The host pulls bulk data only occasionally,
+    /// while `home_start` sizes the monitor window as one sample period with
+    /// `MONITOR_MAX` 3 missed samples allowed — so the monitor slides while
+    /// this is set and only a genuinely silent sensor can expire it.
+    sensor_attached: bool,
     /// A shutdown the step-chain model raised, with its `static_string_id`
     /// name. Distinct from `shutdown` (the interface-level close): real
     /// firmware keeps answering `get_clock`/`stats` after a shutdown, and
@@ -273,7 +276,7 @@ impl SimulatorDevice {
                 last_host_seq: 0,
                 steppers: HashMap::new(),
                 firmware_shutdown: None,
-                ldc_sampling: false,
+                sensor_attached: false,
                 shutdown_ids,
                 peers: Vec::new(),
                 move_pending: false,
@@ -513,7 +516,7 @@ impl SimulatorDevice {
                     // reboot in uptime, not in ordering.
                     state.steppers.clear();
                     state.firmware_shutdown = None;
-                    state.ldc_sampling = false;
+                    state.sensor_attached = false;
                 }
                 // `clear_shutdown`: the host reads a shutdown, then clears it
                 // (upstream: only valid *while* shutdown — `Shutdown cleared
@@ -999,10 +1002,23 @@ impl SimulatorDevice {
                 }
                 // Everything else is accepted and ignored: `allocate_oids`,
                 // The sensor coming up arms its local sample feed: from the
-                // attach on, samples are the firmware's own business
-                // (`ldc1612_attach_trigger_analog` + `config_ldc1612*`).
-                "config_ldc1612" | "config_ldc1612_with_intb" | "ldc1612_attach_trigger_analog" => {
-                    state.ldc_sampling = true;
+                // attach on, samples are the firmware's own business, whichever
+                // chip it is. `ldc1612_attach_trigger_analog` is the eddy side
+                // (whose chip is configured by `config_ldc1612*`), and the
+                // ADCs the load cells use attach the same way
+                // (`ads1220_attach_trigger_analog`, `ads131m0x_...`,
+                // `hx71x_...`). Missing one of these is how the
+                // `load_cell.test` corpus case flaked: its ads1220 check was
+                // armed with a six-millisecond monitor window and no local
+                // feed, so a host batch delayed by CPU load read as a silent
+                // sensor.
+                "config_ldc1612"
+                | "config_ldc1612_with_intb"
+                | "ldc1612_attach_trigger_analog"
+                | "ads1220_attach_trigger_analog"
+                | "ads131m0x_attach_trigger_analog"
+                | "hx71x_attach_trigger_analog" => {
+                    state.sensor_attached = true;
                 }
                 // `config_*` (`query_ldc1612`'s arm), `emergency_stop`, and any command this
                 // fake firmware does not model yet.
@@ -1094,21 +1110,23 @@ impl SimulatorDevice {
     /// report was made.
     fn fire_monitor_if_expired(state: &mut State, seq: u8) -> bool {
         let now = Self::clock(state) as u32;
-        let ldc_sampling = state.ldc_sampling;
+        let sensor_attached = state.sensor_attached;
         let Some(armed) = state.trigger_analog.as_mut() else {
             return false;
         };
         if armed.fired {
             return false;
         }
-        if ldc_sampling {
+        if sensor_attached {
             // The attached sensor's samples reach the firmware locally —
             // the wire never carries them, so a window that waited on wire
             // traffic would false-expire a perfectly live sensor
             // (`monitor_ticks` = one sample period at `samples_per_second`,
             // `MONITOR_MAX` = 3 missed, `trigger_analog.py:374-385`; fed
-            // from `ldc1612_attach_trigger_analog`, `sensor_ldc1612.c`).
-            // The window slides until the feed itself goes quiet.
+            // from the attached chip's own driver, `sensor_ldc1612.c:175`,
+            // `sensor_ads1220.c:100`, `sensor_ads131m0x.c:172`,
+            // `sensor_hx71x.c:182`). The window slides until the feed itself
+            // goes quiet.
             armed.deadline = now.wrapping_add(armed.window);
             return false;
         }
@@ -1442,52 +1460,62 @@ mod tests {
     }
 
     #[test]
-    fn an_attached_sensor_slides_the_monitor_window() {
+    fn any_sensor_attach_slides_the_monitor_window() {
         // `home_start` sizes the window as one sample period with three
-        // missed allowed (`trigger_analog.py:374-385`); while the sensor is
-        // attached those samples reach the firmware without crossing the
-        // wire (`ldc1612_attach_trigger_analog`), so an armed monitor must
-        // slide rather than expire on wire silence — the `eddy.test` shape
-        // (the host's next batch lands well outside a sample-period window).
-        let device = armed_device();
-        issue(
-            &device,
+        // missed allowed (`trigger_analog.py:374-385`); while a sensor is
+        // attached its samples reach the firmware without crossing the wire
+        // (every driver reads its own chip — `sensor_ldc1612.c:175`,
+        // `sensor_ads1220.c:100`, `sensor_ads131m0x.c:172`,
+        // `sensor_hx71x.c:182`), so an armed monitor must slide rather than
+        // expire on wire silence — the `eddy.test` shape, and the
+        // `load_cell.test` one (its ads1220 check has a six-millisecond
+        // window: the host's next batch lands well outside it under load).
+        // The attach command reaches the fake by name, so every spelling the
+        // sensors send is pinned here.
+        for attach in [
             "config_ldc1612",
-            &[ArgValue::UInt8(1), ArgValue::UInt8(1)],
-        );
-        issue(
-            &device,
-            "trigger_analog_home",
-            &[
-                ArgValue::UInt8(1),
-                ArgValue::UInt8(2),
-                ArgValue::UInt8(1),
-                ArgValue::UInt8(5),
-                ArgValue::UInt32(0),
-                ArgValue::UInt32(1),
-                ArgValue::UInt32(3),
-            ],
-        );
-
-        // Walk far past the window: the local feed keeps it open.
-        advance_ticks(&device, 100_000);
-        {
-            let mut state = device.state.lock().unwrap_or_else(|p| p.into_inner());
-            assert!(
-                !SimulatorDevice::fire_monitor_if_expired(&mut state, 0),
-                "the attached sensor's samples slide the window"
+            "ldc1612_attach_trigger_analog",
+            "ads1220_attach_trigger_analog",
+            "ads131m0x_attach_trigger_analog",
+            "hx71x_attach_trigger_analog",
+        ] {
+            let device = armed_device();
+            issue(&device, attach, &[ArgValue::UInt8(1), ArgValue::UInt8(1)]);
+            issue(
+                &device,
+                "trigger_analog_home",
+                &[
+                    ArgValue::UInt8(1),
+                    ArgValue::UInt8(2),
+                    ArgValue::UInt8(1),
+                    ArgValue::UInt8(5),
+                    ArgValue::UInt32(0),
+                    ArgValue::UInt32(1),
+                    ArgValue::UInt32(3),
+                ],
             );
-            let armed = state.trigger_analog.as_ref().expect("still armed");
-            assert!(!armed.fired, "no monitor report while sampling");
-        }
 
-        // Detach (reboot clears the feed with everything else): the same
-        // silence then expires the window, as the untouched test below pins.
-        issue(&device, "reset", &[]);
-        assert_eq!(shutdown_reason(&device), None);
-        {
-            let state = device.state.lock().unwrap_or_else(|p| p.into_inner());
-            assert!(!state.ldc_sampling, "a reboot drops the feed");
+            // Walk far past the window: the local feed keeps it open.
+            advance_ticks(&device, 100_000);
+            {
+                let mut state = device.state.lock().unwrap_or_else(|p| p.into_inner());
+                assert!(
+                    !SimulatorDevice::fire_monitor_if_expired(&mut state, 0),
+                    "{attach}: the attached sensor's samples slide the window"
+                );
+                let armed = state.trigger_analog.as_ref().expect("still armed");
+                assert!(!armed.fired, "{attach}: no monitor report while sampling");
+            }
+
+            // Detach (reboot clears the feed with everything else): the same
+            // silence then expires the window, as the untouched test below
+            // pins.
+            issue(&device, "reset", &[]);
+            assert_eq!(shutdown_reason(&device), None);
+            {
+                let state = device.state.lock().unwrap_or_else(|p| p.into_inner());
+                assert!(!state.sensor_attached, "{attach}: a reboot drops the feed");
+            }
         }
     }
 

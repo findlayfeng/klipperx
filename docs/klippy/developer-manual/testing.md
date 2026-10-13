@@ -31,7 +31,7 @@ KLIPPERX_KLIPPER_DIR=<主检出>/third_party/klipper cargo test --workspace
 > `CONFIG_HOST_BRIDGE_SERIAL`，端口路径指到该构建 `OUT_DIR` 内的文件——桥会在 `init` 时打开它，
 > 所以不能是 `/dev/ttyACM0`；三个路径经 `cargo:rustc-env` 交给测试：`KLIPPER_HOST_MUX_LIB`、
 > `KLIPPER_HOST_MUX_SERIAL_PATH`、`KLIPPER_HOST_MUX_DICT`）。两份测试钉住它：
-> `test_the_mux_device_half_over_the_real_library`（测试自建 pty 软链到那条路径，再走五步：
+> `test_the_mux_device_half_over_the_real_library`（测试自建 pty 软链到那条路径，再走四步——第三/四步各含响应与块级 ack 两次读：
 > 扫描应答带身份 → 采纳 id 后再扫沉默 → 带 id 的数据单元被真正执行（响应 + 块级 ack，都用
 > 固件字典解出 `clock`，不是只会回显头）→ 别人的 uuid 抢 id 触发 `shutdown`）；
 > `test_a_muxed_host_path_attaches_to_the_real_library`（真端到端：配置层判定 mux → 路径身份 →

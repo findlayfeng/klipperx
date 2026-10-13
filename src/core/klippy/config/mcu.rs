@@ -1,6 +1,6 @@
 use super::wrapper::ConfigWrapper;
 use crate::core::klippy::error::ConfigError;
-use crate::core::klippy::interface::devices::shared_serial::{self, ASSIGN_ATTACH_TIMEOUT};
+use crate::core::klippy::interface::devices::serial::{self, ASSIGN_ATTACH_TIMEOUT};
 use crate::core::klippy::interface::usb::UsbPowerMethod;
 #[cfg(test)]
 use crate::core::klippy::interface::SimulatorDevice;
@@ -273,7 +273,7 @@ impl McuConfig {
     ///
     /// An exclusive serial port opens the tty directly and sends **no**
     /// assignment frame; a shared one completes the synchronous assignment
-    /// handshake inside [`shared_serial::attach`] before it is handed back (see
+    /// handshake inside [`serial::attach`] before it is handed back (see
     /// [`Transport::open`]).
     ///
     /// # Errors
@@ -528,10 +528,10 @@ impl Transport {
     /// splits on it:
     ///
     /// - `Some(baud)` — the path is shared: the port is opened once for every
-    ///   MCU on it, and [`shared_serial::attach`] performs the synchronous
+    ///   MCU on it, and [`serial::attach`] performs the synchronous
     ///   assignment handshake before the shared handle is returned. When the
     ///   section also names a `uuid`, the handshake **starts by writing the
-    ///   SET_NODEID unit that names the board** ([`shared_serial::set_node_id_for`])
+    ///   SET_NODEID unit that names the board** ([`serial::set_node_id_for`])
     ///   and only then re-confirms with the ordinary assignment request —
     ///   mirroring CAN's `CanSerialDevice::open`, which sends its SET_NODEID
     ///   when the link opens.
@@ -565,7 +565,7 @@ impl Transport {
                     );
                 }
                 let handle =
-                    shared_serial::attach(Path::new(path), *baud, id, ASSIGN_ATTACH_TIMEOUT, *uuid)
+                    serial::attach(Path::new(path), *baud, id, ASSIGN_ATTACH_TIMEOUT, *uuid)
                         .map_err(|e| format!("serial {path}: shared port attach failed: {e}"))?;
                 Ok(Interface::shared_serial(handle))
             }
@@ -1164,14 +1164,14 @@ mod tests {
             let _entered = handle.enter();
             config.open()
         });
-        let request = shared_serial::assignment_request(mcu_id).expect("a valid mcu id");
+        let request = serial::assignment_request(mcu_id).expect("a valid mcu id");
         assert_eq!(
             read_n(&pty.master, request.len()),
             request,
             "the assignment request goes out verbatim"
         );
         (&pty.master)
-            .write_all(&shared_serial::assignment_reply(mcu_id).expect("a valid mcu id"))
+            .write_all(&serial::assignment_reply(mcu_id).expect("a valid mcu id"))
             .expect("pty master write");
         opener.await.expect("the opener task ran")
     }
@@ -1190,8 +1190,8 @@ mod tests {
             let _entered = handle.enter();
             config.open()
         });
-        let set = shared_serial::set_node_id_for(uuid, mcu_id).expect("a valid mcu id");
-        let request = shared_serial::assignment_request(mcu_id).expect("a valid mcu id");
+        let set = serial::set_node_id_for(uuid, mcu_id).expect("a valid mcu id");
+        let request = serial::assignment_request(mcu_id).expect("a valid mcu id");
         let wire = read_n(&pty.master, set.len() + request.len());
         assert_eq!(
             &wire[..set.len()],
@@ -1204,7 +1204,7 @@ mod tests {
             "the assignment request follows SET_NODEID"
         );
         (&pty.master)
-            .write_all(&shared_serial::assignment_reply(mcu_id).expect("a valid mcu id"))
+            .write_all(&serial::assignment_reply(mcu_id).expect("a valid mcu id"))
             .expect("pty master write");
         opener.await.expect("the opener task ran")
     }
@@ -1227,7 +1227,7 @@ mod tests {
         // one would write the bare frame.
         let frame = Frame::new(0, vec![1, 2]);
         interface.send(frame.clone()).await.unwrap();
-        let header = shared_serial::encode_header(assign::arb_id(7).expect("a valid id"));
+        let header = serial::encode_header(assign::arb_id(7).expect("a valid id"));
         let wire = read_n(&pty.master, header.len() + frame.raw_bytes().len());
         assert_eq!(
             &wire[..header.len()],

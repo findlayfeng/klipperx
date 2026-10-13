@@ -3,10 +3,10 @@
 //!
 //! | module | transport | `[mcu]` key |
 //! |---|---|---|
-//! | [`serial`] | a tty | `serial:` |
-//! | [`shared_serial`] | a tty shared by several MCUs | — |
+//! | [`serial`] | a tty (exclusive), or a tty shared by several MCUs (the serial mux) | `serial:` |
+//! | [`shared`] | the reuse spine: one resource per path, several references (shared by serial & host) | — |
 //! | [`canserial`] | Klipper's can-serial link | `uuid:` |
-//! | [`host`] | Klipper's host library | `host_library:` |
+//! | [`host`] | Klipper's host library, loaded once, several communication references | `host_library:` |
 //! | `frame_mock` | a frame-level mock (test builds only) | — |
 //! | `simulator` | a dictionary-driven fake MCU (test builds only) | `test: dict=` |
 //! | `responder_mcu` | the test-side handle for **several** fake MCUs in one printer (test builds only) | — |
@@ -22,6 +22,6 @@ pub mod host;
 #[cfg(test)]
 pub mod responder_mcu;
 pub mod serial;
-pub mod shared_serial;
+pub mod shared;
 #[cfg(test)]
 pub mod simulator;

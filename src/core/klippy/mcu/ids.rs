@@ -24,7 +24,7 @@
 //! transport does with the number is its own: CAN uses it as the node id, a
 //! **shared** serial port takes it as the source of its arbitration-id header
 //! and assignment handshake
-//! (`crate::core::klippy::interface::devices::shared_serial`), and an
+//! (`crate::core::klippy::interface::devices::serial`), and an
 //! **exclusive** serial port does not use it at all — `host_library` and the
 //! `test:` simulator likewise send nothing yet. That is the point of moving the
 //! id to this layer: every MCU is assigned —

@@ -3,7 +3,7 @@
 //! An MCU that shares a bus with other devices is addressed by an id: CAN gets
 //! one from its admin frame on `0x3f0` (`interface/devices/canserial.rs`,
 //! `CMD_SET_NODEID`), and a **shared** serial port prefixes every unit on the
-//! wire with one (`interface/devices/shared_serial.rs`). Both transports take
+//! wire with one (`interface/devices/serial.rs`). Both transports take
 //! that id from this module and from nowhere else — the mapping is the only
 //! thing they have in common.
 //!
@@ -21,7 +21,7 @@
 //!
 //! * The **serial** side — the `KXID` pseudo-frame that carries the assignment,
 //!   its VLQ frame-header codec, and the synchronous handshake — is
-//!   `interface/devices/shared_serial.rs`.
+//!   `interface/devices/serial.rs`.
 //! * The **CAN** side is its own admin frame (`0x3f0` / `CMD_SET_NODEID`) in
 //!   `interface/devices/canserial.rs`, which exists on the bus itself rather
 //!   than inside the byte stream.
@@ -32,7 +32,7 @@ use crate::core::klippy::config::mcu::MAX_MCU_ID;
 ///
 /// CAN's node mapping and the shared serial port's frame headers are this same
 /// mapping: `interface/devices/canserial.rs` and
-/// `interface/devices/shared_serial.rs` both consume it rather than keeping a
+/// `interface/devices/serial.rs` both consume it rather than keeping a
 /// copy of their own.
 const ARB_BASE: u32 = 0x100;
 

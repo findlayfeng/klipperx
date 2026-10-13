@@ -36,7 +36,7 @@
 //! Total 1 uuids found
 //! ```
 //!
-//! [`discovery_query`]: crate::core::klippy::interface::devices::shared_serial::discovery_query
+//! [`discovery_query`]: crate::core::klippy::interface::devices::serial::discovery_query
 
 use clap::Args;
 use std::time::Duration;
@@ -45,7 +45,7 @@ use crate::core::klippy::interface::devices::canserial::{
     query_unassigned, CanbusAdminSocket, UnassignedNode as CanNode,
 };
 use crate::core::klippy::interface::devices::serial::SerialDevice;
-use crate::core::klippy::interface::devices::shared_serial::{
+use crate::core::klippy::interface::devices::serial::{
     serial_query_unassigned, UnassignedNode as SerialNode,
 };
 

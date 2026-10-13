@@ -4,7 +4,7 @@
 「多颗 MCU 共用一个串口」必须自己给帧加**地址头**，并且要和设备端谈妥这件事。这份文档就是
 那条线上的规格：**设备端（固件）按它实现，主机侧按它发送与分派**。
 
-主机侧代码：`src/core/klippy/interface/devices/shared_serial.rs`（端口、reader、分派、握手，
+主机侧代码：`src/core/klippy/interface/devices/serial.rs`（端口、reader、分派、握手，
 以及帧头与 KXID 伪帧的编解码）；仲裁 id 的映射单一定义在 `src/core/klippy/assign.rs`
 （`arb_id`/`reply_arb_id`/`mcu_id_from_arb`/`is_reply_arb`，私有 `ARB_BASE`），CAN 与共享串口都从那里取。
 什么时候用它、什么时候不用，由**配置事实**决定：同一个 `serial:` 路径被
@@ -33,7 +33,7 @@ id**（`mcu_id_from_arb`），方向本身由奇偶区分（`is_reply_arb`）。
 头**不是** Klipper 的 VLQ：它是**固定 2 字节**，装仲裁 id 的 **10 个数据位 + 4 个校验位**
 （缩短汉明码：校验位落在 1/2/4/8，数据位占其余位置，码字宽 14 位），外面保留变长编码那
 两个定界位——首字节最高位恒 `1`、次字节恒 `0`——所以两字节边界在字节流上无歧义。单一实现在
-`shared_serial.rs`（`encode_header`/`decode_header`、`HEADER_*` 常量）。
+`serial.rs`（`encode_header`/`decode_header`、`HEADER_*` 常量）。
 
 | `mcu_id` | 主机 → 设备 | 设备 → 主机 |
 |----------|------------|------------|
@@ -72,7 +72,7 @@ id**（`mcu_id_from_arb`），方向本身由奇偶区分（`is_reply_arb`）。
 （`frame.rs`）。主机发送时把 `encode_header(arb) ++ frame.raw_bytes()` 一次写完（端口级写锁
 串行化，单元内部不会被另一颗 MCU 的写打断）；接收时按「固定 2 字节头（校验通过）→ 取长度
 字节 → 凑齐该长度」切出整单元，剥掉头，把帧字节推进该 `mcu_id` 自己的 `FrameStream`
-（重组与校验仍是既有那套，`shared_serial.rs`）。
+（重组与校验仍是既有那套，`serial.rs`）。
 
 头校验不过（`HeaderScan::Invalid`：定界位错、1/2 位错、或落在保留带）、长度字节不在
 `MESSAGE_MIN..=MESSAGE_MAX`、或头结构上不可能成立时，按 `FrameStream` 的重同步语义丢弃到
@@ -87,7 +87,7 @@ id**（`mcu_id_from_arb`），方向本身由奇偶区分（`is_reply_arb`）。
 回执（设备）  [头(0x100+2*id+1)] [09][20]["KXID"][crc16 hi][crc16 lo][7E]
 ```
 
-- 那个 9 字节伪帧就是 `shared_serial.rs` 的**伪帧**（`ASSIGN_SEQ_BYTE` / `MAGIC`）：与合法帧只差 seq 字节——`0x20` 把
+- 那个 9 字节伪帧就是 `serial.rs` 的**伪帧**（`ASSIGN_SEQ_BYTE` / `MAGIC`）：与合法帧只差 seq 字节——`0x20` 把
   `MESSAGE_DEST`（`0x10`）清掉、改占 bit5，于是 `Frame::parse` 必然拒收它（`frame.rs`），
   这让它天然区别于数据帧。**id 只在头里出现一次**，载荷只放 `KXID` 标记（不再编一遍号）。
 - **请求对旧固件无害**：旧固件的 `command_find_block` 按「长度 → seq 字节 → …」检查，而单元
@@ -95,7 +95,7 @@ id**（`mcu_id_from_arb`），方向本身由奇偶区分（`is_reply_arb`）。
   错误分支、丢弃到下一个 `0x7e`；`id ∈ 120..=127` 时那个 `0x7e` 就是头的第二字节，伪帧留给下一次
   调用再丢一次。两步都**不读载荷、不查 CRC、永不 dispatch、序号不动**（至多回一枚无害空帧后转
   静默）。所以把共享串口误配到不支持复用的板子上，结果是 **握手超时、连接失败**，而不是把已有
-  会话搞乱。这条性质由 `interface/devices/shared_serial.rs` 里 `third_party/klipper/src/command.c`
+  会话搞乱。这条性质由 `interface/devices/serial.rs` 里 `third_party/klipper/src/command.c`
   的**可执行忠实移植测试**钉住（整单元——含新头——也补了一条）。
 - 超时与重试：默认 500 ms × 3 次（`ASSIGN_ATTACH_TIMEOUT` / `ASSIGN_ATTACH_ATTEMPTS`）；
   用尽仍无回执 → `InterfaceError::Timeout`，`connect` 失败。
@@ -110,7 +110,7 @@ id**（`mcu_id_from_arb`），方向本身由奇偶区分（`is_reply_arb`）。
 
 共享串口沿用 CAN 的 admin 语义，命令帧也沿用上一节那枚 `KXID` 伪帧——命令只是标记之后多出
 的一个字节，**分配期握手的 9 字节请求一字不变**（它就是标记后不带命令的那枚）。常量单一
-定义在 `shared_serial.rs`（`ADMIN_LISTEN`/`ADMIN_REPLY`/`CMD_*`/`RESP_NEED_NODEID`），
+定义在 `serial.rs`（`ADMIN_LISTEN`/`ADMIN_REPLY`/`CMD_*`/`RESP_NEED_NODEID`），
 CAN 侧的同族常量在 `canserial.rs`。
 
 | 角色 | 仲裁 id | 说明 |

@@ -8,7 +8,7 @@
 | `uuid` | MCU 芯片的唯一 ID（12 位十六进制） | CAN 模式必给（Klipper 旧名 `canbus_uuid` 兼容，同节双写报错）；写在 `serial` 节上则连接期用它指派 id（见下节「共享串口」，独占串口忽略它） |
 | `canbus_interface` | CAN 网络接口名 | 可选，默认 `can0` |
 | `canbus_nodeid` | **MCU 层 id**（1..=255；CAN 上即节点号） | **可选**：不写就由 `[mcu_ids]`（历史名 `[canbus_ids]`）的分配器发 `4` 起的最小空位；写了就用写的那个（分配器装载时预扫全配置保留显式号，自动号绕开，写在哪个位置都生效）。只在两个显式号互撞、或 `4..=255` 占满时装载期报错 |
-| `host_library` | klipper host 库（`libklipper_host.so`）的路径 | 在主机进程内运行一份 klipper 固件（模拟与自测用） |
+| `host_library` | klipper host 库（`libklipper_host.so`）的路径 | 在主机进程内运行一份 klipper 固件（模拟与自测用）；**同路径被多颗 `[mcu]` 引用时库只加载一次**（通讯复用，一个 runtime/reader），各拿一个通讯引用共享它，`shutdown` 只停本引用、最后一个引用析构才卸载；旧固件没有桥，同一时刻只能有一路活动引用（设备层在 `interface/devices/host.rs`） |
 
 ```ini
 [mcu]
@@ -36,7 +36,7 @@ CAN 这条走的是 klipper 的 **can serial** 链路（就像把串口协议搬
 
 ## 共享串口（同一 `serial:` 路径被多颗 MCU 引用）
 
-同一个 `serial:` 路径被**两颗及以上** `[mcu]` 引用，就是**共享串口**：主机只把它打开一次，每颗 MCU 用自己的 **MCU 层 id** 给帧加一个地址头，收发按 id 分派（装载期按路径分组的是 `mcu/serial_ports.rs`，端口/reader/分派是 `interface/devices/shared_serial.rs`）。只被一颗引用时仍是**独占**，行为与 Klipper 一样：**不发任何指派帧、线上不带任何头**。
+同一个 `serial:` 路径被**两颗及以上** `[mcu]` 引用，就是**共享串口**：主机只把它打开一次，每颗 MCU 用自己的 **MCU 层 id** 给帧加一个地址头，收发按 id 分派（装载期按路径分组的是 `mcu/serial_ports.rs`，端口/reader/分派是 `interface/devices/serial.rs`）。只被一颗引用时仍是**独占**，行为与 Klipper 一样：**不发任何指派帧、线上不带任何头**。
 
 ```ini
 [mcu]
@@ -65,7 +65,7 @@ serial: /dev/ttyUSB0
 
 - 帧头是**固定 2 字节的带校验码字**（**不再是** Klipper 的 VLQ）：仲裁 id 的 10 个数据位 + 4 个校验位（缩短汉明码，**只检不纠**），再加两个定界位（首字节最高位恒 1、次字节恒 0）。本号段任何 id 都是 2 字节：`id=1 → 84 42`、`id=255 → AF 7D`（应答方向 `DF 7D`）。头带校验是因为**帧体 CRC 不覆盖头**：头被翻位后落到另一个合法 id 上会把完好的帧投给错误的 MCU（同线几颗的会话序号同步增长，很容易被当成自己的帧），4 位校验把任何 1/2 位错都拦下（丢单元 + 重同步，Klipper 帧本身有块级重传兜底）。`0x7e` **仍可**出现在头里（`id ∈ 120..=127` 时第二字节就是它）——上游协议本来就允许帧内容含 sync 字符（`third_party/klipper/docs/Protocol.md:178-183`）。
 - 握手请求/回执 = 上面的头 **++ 一个 9 字节伪帧** `[09][0x20]["KXID"][crc16 hi][crc16 lo][0x7e]`：`seq` 字节用 `0x20`（把合法帧必置的 `MESSAGE_DEST` 清掉、改占 bit5），所以主机自己的 `Frame::parse` 必然拒收它，**id 只在帧头里出现一次**。
-- **请求对旧固件无害**：旧固件 `command_find_block`（`third_party/klipper/src/command.c`）先按长度字节判——单元出线第一个字节就是头首字节（`0x80..=0xff`，非法长度），于是立刻进错误分支、丢弃到下一个 `0x7e`（`id ∈ 120..=127` 时是头的第二字节，伪帧下一次再被丢）；不读载荷、不查 CRC、永不 dispatch、序号不动，至多回一枚无害空帧后转静默。整单元（含新头）的行为与帧头/伪帧的编解码都在 `interface/devices/shared_serial.rs`，由那里的**可执行忠实移植测试**钉住。设备端要做的只是：认出请求 → 用 `+1` 方向的头 + 同形伪帧回执。
+- **请求对旧固件无害**：旧固件 `command_find_block`（`third_party/klipper/src/command.c`）先按长度字节判——单元出线第一个字节就是头首字节（`0x80..=0xff`，非法长度），于是立刻进错误分支、丢弃到下一个 `0x7e`（`id ∈ 120..=127` 时是头的第二字节，伪帧下一次再被丢）；不读载荷、不查 CRC、永不 dispatch、序号不动，至多回一枚无害空帧后转静默。整单元（含新头）的行为与帧头/伪帧的编解码都在 `interface/devices/serial.rs`，由那里的**可执行忠实移植测试**钉住。设备端要做的只是：认出请求 → 用 `+1` 方向的头 + 同形伪帧回执。
 - 完整的线上规格、超时/重试、主机侧的单 reader 分派与引用计数关闭，见开发手册的 [串口复用协议](../developer-manual/serial-mux-protocol.md)。
 
 ## 固件重启方式（`restart_method`）

@@ -9,7 +9,7 @@ pub use devices::canserial::CanSerialDevice;
 pub use devices::frame_mock::{FrameMock, MappingEntry};
 pub use devices::host::HostDevice;
 pub use devices::serial::SerialDevice;
-use devices::shared_serial::SharedSerialHandle;
+use devices::serial::SharedSerialHandle;
 #[cfg(test)]
 pub use devices::simulator::SimulatorDevice;
 pub use error::InterfaceError;
@@ -161,7 +161,7 @@ impl Interface {
     ///
     /// For the second and later MCU on one `serial:` path: the port is opened
     /// once and the id handshake already ran
-    /// (`interface::devices::shared_serial`), so this only installs the handle.
+    /// (`interface::devices::serial`), so this only installs the handle.
     pub fn shared_serial(handle: Arc<SharedSerialHandle>) -> Self {
         Self::with_transport(Transport::SharedSerial(handle))
     }

@@ -363,7 +363,7 @@ endstop 资源（`mcu/resource/endstop.rs`，含 `minclock` 门控与 `home_wait
 `i2c`/`spi` 复用已有节类型），子设备引用**端口节名**；`[bridge]`/`[bridge_port]`/`bridge_admin`
 都不要（桥与端口从引用推算，legacy 从「无 `uuid:` + uart 端口」推算）；**归属由主机经桥自己的
 admin 通道**用端口级命令 `SET_PORT_NODEID(index, id)` 告知桥，**下游设备完全不参与**——这就是
-"与没有 admin 的设备共存"的答案。**依赖**：无（P1 可先做）；**状态**：已定案、尚未开工（现状见笔记 §6）。
+"与没有 admin 的设备共存"的答案。**依赖**：无（P1 可先做）；**状态**：✅ P1 配置面 + P2 固件已落地（2026-10-13，见笔记 §6）；余项 = P3 attach 端到端、P4 判定与传输正交、P5 CAN 上游。
 
 ### M2 通过 **admin 流程复位固件**（per-device reset）——已并入 M1
 

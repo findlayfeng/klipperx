@@ -289,8 +289,8 @@ d. **M2 的复位命令**：名字与参数（要不要带"复位到哪一层"�
 - **落地范围**：`[uart_device <名>]`/`[can_device <名>]` 端口节（`mcu/bridge_ports.rs`，order 19，
   10 测）；端口分组与跨节冲突校验（`mcu/port_grouping.rs`，注册名 `port_groups`，14 测）；
   `[mcu]` 传输键 `uart:`/`can:` + `Transport::BridgePort`（`config/mcu.rs`，+17 测）；共享判定
-  核心抽取（`mcu/link_grouping.rs`，host_libraries 与 port_grouping 共用，host_library 现有
-  44 测断言 0 改动）。装载 id：85 个声明文件 / 124 个（实测重核）。
+  核心抽取（`mcu/link_grouping.rs`，host_libraries 与 port_grouping 共用，口径 =
+  `host_libraries.rs` 自身 17 测 + 共享核心 `link_grouping.rs` 7 测，断言 0 改动）。装载 id：85 个声明文件 / 124 个（实测重核）。
 - **验收实测**：`cargo test --workspace` **3177 passed / 0 failed / 13 ignored**；
   `cargo doc --no-deps -p klipperx` 告警 160→160（0 新增）；`cargo fmt --all` 干净。
 - **与 §5 的偏差**：① §5.6(a) 的 i2c/spi 端口写法**未在本期定案**——本期只实现 uart/can，

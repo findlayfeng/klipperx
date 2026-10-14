@@ -9,7 +9,7 @@
 | `canbus_interface` | CAN 网络接口名 | 可选，默认 `can0` |
 | `canbus_nodeid` | **MCU 层 id**（1..=255；CAN 上即节点号） | **可选**：不写就由 `[mcu_ids]`（历史名 `[canbus_ids]`）的分配器发 `4` 起的最小空位；写了就用写的那个（分配器装载时预扫全配置保留显式号，自动号绕开，写在哪个位置都生效）。只在两个显式号互撞、或 `4..=255` 占满时装载期报错 |
 | `host_library` | klipper host 库（`libklipper_host.so`）的路径 | 在主机进程内运行一份 klipper 固件（模拟与自测用）；**同路径被多颗 `[mcu]` 引用时库只加载一次**（通讯复用，一个 runtime/reader），各拿一个通讯引用共享它，`shutdown` 只停本引用、最后一个引用析构才卸载；旧固件没有桥/没有 mux 时，同一时刻只能有一路活动引用（设备层在 `interface/devices/host.rs`）。**可写 `uuid:`**（12 位十六进制，旧名 `canbus_uuid` 兼容，同节双写报错）：它指明这条路径上被寻址的是**哪块设备**。判定为 **mux** 的路径连接时**按 id 寻址**：先发 `SET_KLIPPER_NODEID`（节上写了 `uuid:` 就用它点名**桥下游那台板子**；没写就用**装载期为该路径指派的那条自身份**，它同时是主机在 `init` 前交给库的身份），再走重确认握手，之后收发都带帧头；非 mux 路径照旧裸帧。判定按配置事实（`mcu/host_libraries.rs`）：同路径 **1 节且无 `uuid:`** 走**裸帧**（今天的行为）；**1 节有 `uuid:`**、或同路径 **≥2 节** 则**按 id 寻址**——≥2 节时**最多一节可省略 `uuid:`**（它认领桥自身的设备），其余必须写 `uuid:`；**≥2 节都省略**、或**两节写同一个 uuid** 都在装载期报错并点名涉及的节 |
-| `uart` | 引用 `[uart_device <名>]` 端口节的名字 | 把这颗 MCU 挂到**桥的下游 uart 口**上（端口本身用 `[uart_device]` 节声明，见下节「桥下游端口」）。`uuid` 可选——不写即 legacy。与 `serial`/`host_library`/`test`/`can` 互斥 |
+| `uart` | 引用 `[uart_device <名>]` 端口节的名字 | 把这颗 MCU 挂到**桥的下游 uart 口**上（端口本身用 `[uart_device]` 节声明，见下节「桥下游端口」）。`uuid` 可选——不写即 legacy。与 `serial`/`host_library`/`test`/`can`/`canbus_interface` 互斥 |
 | `can` | 引用 `[can_device <名>]` 端口节的名字 | 挂到桥的下游 CAN 口。**`uuid` 必填**（CAN 寻址靠它）。与 `serial`/`host_library`/`test`/`canbus_interface`/`uart` 互斥 |
 
 ```ini

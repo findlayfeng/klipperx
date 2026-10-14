@@ -1387,7 +1387,8 @@ mod host_tests {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
 
-        // The bridge opens its port while the library comes up, so the tty has
+        // The bridge's port is opened when the host declares it at
+        // configuration time, so the tty has
         // to exist first - the same trick the device-half test uses.
         let pty = Pty::new();
         let bridge_path = klipperx_test_support::klipper_host_mux_serial_path();
@@ -1730,10 +1731,11 @@ mod host_tests {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
 
-        // The bridge opens its port while klipper comes up and init fails when
-        // it cannot, so the tty has to exist first: a pty whose slave is
-        // reachable at the path this build baked in. The `Pty` keeps both ends
-        // open for the whole test.
+        // The port is opened when the host declares it at configuration time
+        // (`config_uart`), so the tty has to exist before that: a pty whose
+        // slave is reachable at the path this build baked in. The `Pty` keeps
+        // both ends open for the whole test. (This test sends no configuration
+        // commands of its own, so the pty is only here to keep the path valid.)
         let pty = Pty::new();
         let bridge_path = klipperx_test_support::klipper_host_mux_serial_path();
         let _ = std::fs::remove_file(&bridge_path);
@@ -1949,10 +1951,18 @@ mod host_tests {
                 "{name} is in the mux build's dictionary"
             );
         }
-        assert!(
-            dictionary.constant("BRIDGE_PORT_COUNT").is_none(),
-            "the compile-time port table is gone"
-        );
+        for gone in [
+            "BRIDGE_PORT_COUNT",
+            "BRIDGE_PORT0_NAME",
+            "BRIDGE_PORT0_TYPE",
+            "BRIDGE_PORT0_PATH",
+        ] {
+            assert!(
+                dictionary.constant(gone).is_none(),
+                "the compile-time port table ({gone}) is gone: ports are declared at \
+                 configuration time"
+            );
+        }
         let mut parser = Parser::new();
         dictionary
             .install(&mut parser)
@@ -2163,7 +2173,8 @@ mod host_tests {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
 
-        // The bridge opens its port while klipper comes up, so the tty has to
+        // The bridge's port is opened when the host declares it at
+        // configuration time, so the tty has to
         // exist first — the same setup the port-command probe uses.
         let pty = Pty::new();
         let bridge_path = klipperx_test_support::klipper_host_mux_serial_path();
@@ -2287,7 +2298,8 @@ mod host_tests {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
 
-        // The bridge opens its port while klipper comes up, so the tty has to
+        // The bridge's port is opened when the host declares it at
+        // configuration time, so the tty has to
         // exist first — the same setup the other port tests use.
         let pty = Pty::new();
         let bridge_path = klipperx_test_support::klipper_host_mux_serial_path();
@@ -2574,7 +2586,8 @@ mod host_tests {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
 
-        // The bridge opens its port while klipper comes up, so the tty has to
+        // The bridge's port is opened when the host declares it at
+        // configuration time, so the tty has to
         // exist first — the same setup the other port tests use.
         let pty = Pty::new();
         let bridge_path = klipperx_test_support::klipper_host_mux_serial_path();

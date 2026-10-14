@@ -19,14 +19,17 @@
 //! starts with: [`Mcu::new`] calls `identify::new_parser`, because the two formats
 //! it has to know before anything else are identify's.
 
+pub mod bridge_ports;
 mod config;
 mod dictionary;
 mod error;
 mod events;
 pub mod host_libraries;
 pub(crate) mod ids;
+pub(crate) mod link_grouping;
 mod object;
 mod pending;
+pub mod port_grouping;
 mod resource;
 mod restart;
 mod restart_method;

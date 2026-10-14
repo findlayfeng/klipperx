@@ -5,6 +5,7 @@ use crate::core::klippy::interface::usb::UsbPowerMethod;
 #[cfg(test)]
 use crate::core::klippy::interface::SimulatorDevice;
 use crate::core::klippy::interface::{HostMux, Interface, SerialDevice};
+use crate::core::klippy::mcu::port_grouping::{self, PortKind};
 use crate::core::klippy::mcu::{host_libraries, serial_ports, McuRestartMethod};
 use std::path::Path;
 use tracing::warn;
@@ -106,6 +107,26 @@ pub enum Transport {
     /// A dictionary-driven fake MCU, in test builds (`test: dict=<path>`).
     #[cfg(test)]
     Simulator(String),
+    /// A device on a bridge downstream port — `uart:` or `can:` naming a
+    /// `[uart_device <name>]` / `[can_device <name>]` section (M1's port
+    /// sections, `mcu/bridge_ports.rs`).
+    ///
+    /// `port` is the port **section identifier** the device hangs on
+    /// (`uart_device uart0` — the spelling the grouping pass and the section
+    /// loader both key by), `kind` what the port section is declared as, and
+    /// `uuid` the identity the board answers the mux with: mandatory on a CAN
+    /// port (rule 6 — the port grouping is the one place that refuses a
+    /// member without one, `mcu/port_grouping.rs`), optional on a uart one,
+    /// where its absence is rule 5's legacy shape. Whether the port is shared
+    /// is likewise the whole config's call, like a shared `serial:` path.
+    /// Opening one is not wired up yet: the attach goes through the bridge's
+    /// port table and port-level command (M1-P3), and [`Transport::open`]
+    /// says so rather than pretending the device came up.
+    BridgePort {
+        port: String,
+        uuid: Option<[u8; 6]>,
+        kind: PortKind,
+    },
 }
 
 /// Parse a CAN uuid: six bytes as twelve hex digits.
@@ -129,6 +150,10 @@ fn parse_uuid(text: &str) -> Result<[u8; 6], String> {
 /// them. Exactly one of them names the transport, the way Klipper's own `[mcu]`
 /// works (`serial` or `uuid`): see [`McuConfig::create_interface`].
 ///
+/// `uart` and `can` name a bridge downstream **port section** — a
+/// `[uart_device <name>]` / `[can_device <name>]` (M1's port sections) —
+/// rather than a device path.
+///
 /// `uuid` is the canonical CAN key and `canbus_uuid` its backwards-compatible
 /// alias (a config written for Klipper keeps loading); both count as a CAN
 /// interface key, so neither can trip the unused-option check on its own.
@@ -137,9 +162,24 @@ fn parse_uuid(text: &str) -> Result<[u8; 6], String> {
 /// `test: dict=<path>` to inject a dictionary-driven fake MCU.
 fn interface_keys() -> &'static [&'static str] {
     #[cfg(test)]
-    return &["host_library", "serial", "uuid", "canbus_uuid", "test"];
+    return &[
+        "host_library",
+        "serial",
+        "uart",
+        "can",
+        "uuid",
+        "canbus_uuid",
+        "test",
+    ];
     #[cfg(not(test))]
-    return &["host_library", "serial", "uuid", "canbus_uuid"];
+    return &[
+        "host_library",
+        "serial",
+        "uart",
+        "can",
+        "uuid",
+        "canbus_uuid",
+    ];
 }
 
 /// The upper bound of an MCU-layer id.
@@ -194,6 +234,17 @@ impl McuConfig {
     ///
     /// `baud` only applies to `serial`, and defaults to Klipper's 250000.
     ///
+    /// A device on a bridge downstream port names the port **section**
+    /// instead of a device path: `uart: <name>` for a `[uart_device <name>]`,
+    /// `can: <name>` for a `[can_device <name>]` (`mcu/bridge_ports.rs`).
+    /// The uuid rules follow the port: optional on uart (rule 5's legacy
+    /// shape when absent), mandatory on CAN — the port grouping is the one
+    /// place that refuses a CAN member without one
+    /// (`mcu/port_grouping.rs`). A CAN port's member is a CAN device, so
+    /// `canbus_nodeid` overrides its id the way it does on a direct CAN
+    /// link; a uart port's member refuses it, as every non-CAN transport
+    /// does.
+    ///
     /// # Arguments
     /// * `section` — The MCU configuration section from the config file.
     ///
@@ -215,9 +266,16 @@ impl McuConfig {
         // allocator's to hand out at load (`mcu/ids.rs`); the only value parsing
         // knows here is an explicit `canbus_nodeid`, read and validated now and
         // handed to the allocator when the MCU registers (`mcu/object.rs`).
-        // Every other transport has no id yet — `register` assigns one at load.
+        // A CAN port's member is a CAN device the same way, so the override
+        // rides it unchanged (the override is orthogonal to how the link is
+        // reached). Every other transport has no id yet — `register` assigns
+        // one at load.
         let id = match &transport {
-            Transport::Can { .. } => match section.get_str("canbus_nodeid") {
+            Transport::Can { .. }
+            | Transport::BridgePort {
+                kind: PortKind::Can,
+                ..
+            } => match section.get_str("canbus_nodeid") {
                 Some(text) => match text.parse::<u32>() {
                     Ok(id) if (1..=MAX_MCU_ID).contains(&id) => Some(id),
                     _ => {
@@ -376,14 +434,20 @@ impl McuConfig {
 
     /// Describe the transport the section asks for, without opening it.
     ///
-    /// One connection selector names it: `host_library`, `serial`, `test`, or
-    /// the CAN options (`canbus_interface`/`canbus_nodeid`). Two of them is a
+    /// One connection selector names it: `host_library`, `serial`, `uart`/
+    /// `can` (a bridge downstream port section), `test`, or the CAN options
+    /// (`canbus_interface`/`canbus_nodeid`). Two of them is a
     /// configuration mistake, not a preference order, so it is reported rather
     /// than resolved silently — except that `uuid`/`canbus_uuid` are the
     /// *identity* the board is addressed by, not a selector: they ride on
-    /// whichever transport wins and may sit on a serial, a CAN or a host-library
-    /// section. Every check lives here; [`Transport::open`] only performs the
-    /// side effects.
+    /// whichever transport wins and may sit on a serial, a CAN, a
+    /// port-referencing or a host-library section. Every check lives here;
+    /// [`Transport::open`] only performs the side effects. What a `uart:` /
+    /// `can:` section cannot know alone — is the port shared, is its one
+    /// unnamed device legacy, does every CAN member write a uuid — is the
+    /// port grouping's call ([`port_grouping::validate`]), run here once per
+    /// referencing section exactly as [`host_libraries::validate`] runs for a
+    /// host-library one.
     fn transport_for(section: &ConfigWrapper) -> Result<Transport, ConfigError> {
         // The keys that can name or configure a transport, in the order the
         // conflict error lists the present ones. `uuid`/`canbus_uuid` are the
@@ -421,10 +485,17 @@ impl McuConfig {
             // the CAN family with it names a second. `uuid`/`canbus_uuid` are
             // the *identity* here too, not a selector: a host MCU may carry one
             // (it names the board a mux addresses the library path by).
-            let other = ["serial", "test", "canbus_interface", "canbus_nodeid"]
-                .into_iter()
-                .filter(|key| section.has(key))
-                .collect::<Vec<_>>();
+            let other = [
+                "serial",
+                "uart",
+                "can",
+                "test",
+                "canbus_interface",
+                "canbus_nodeid",
+            ]
+            .into_iter()
+            .filter(|key| section.has(key))
+            .collect::<Vec<_>>();
             if !other.is_empty() {
                 return Err(too_many());
             }
@@ -453,10 +524,17 @@ impl McuConfig {
         }
 
         if let Some(path) = section.get_str("serial") {
-            let other = ["host_library", "test", "canbus_interface", "canbus_nodeid"]
-                .into_iter()
-                .filter(|key| section.has(key))
-                .collect::<Vec<_>>();
+            let other = [
+                "host_library",
+                "uart",
+                "can",
+                "test",
+                "canbus_interface",
+                "canbus_nodeid",
+            ]
+            .into_iter()
+            .filter(|key| section.has(key))
+            .collect::<Vec<_>>();
             if !other.is_empty() {
                 return Err(too_many());
             }
@@ -491,6 +569,79 @@ impl McuConfig {
                 None => crate::core::klippy::interface::devices::serial::DEFAULT_BAUD,
             };
             return Ok(Transport::Serial { path, baud, uuid });
+        }
+
+        // A `uart:`/`can:` section references a bridge downstream port
+        // **section** (`[uart_device <sub>]` / `[can_device <sub>]`, M1's port
+        // sections) rather than a device path, so the port branches sit after
+        // the direct ones and before the CAN-uuid fallback below — a `can:`
+        // child is a port member, never a direct CAN link.
+        for kind in [PortKind::Uart, PortKind::Can] {
+            let Some(text) = section.get_str(kind.reference_option()) else {
+                continue;
+            };
+            // Every other selector — the other port kind included — names a
+            // second transport. `canbus_nodeid` is an id override rather than
+            // a selector: a CAN port's member is a CAN device and takes it
+            // the way a direct CAN link does, while no non-CAN transport has
+            // ever accepted it (`serial:`/`host_library:` refuse it), so a
+            // uart port's member refuses it with the same conflict.
+            let mut other = [
+                "host_library",
+                "serial",
+                "uart",
+                "can",
+                "test",
+                "canbus_interface",
+            ]
+            .into_iter()
+            .filter(|key| *key != kind.reference_option() && section.has(key))
+            .collect::<Vec<_>>();
+            if kind == PortKind::Uart && section.has("canbus_nodeid") {
+                other.push("canbus_nodeid");
+            }
+            if !other.is_empty() {
+                return Err(too_many());
+            }
+            if section.has("uuid") && section.has("canbus_uuid") {
+                return Err(both_uuids());
+            }
+            // One uuid spelling names the board the port talks to. Optional on
+            // uart (the absence is rule 5's legacy shape), mandatory on CAN —
+            // and the CAN refusal is the port grouping's alone
+            // (`port_grouping::validate`), so it is not repeated here.
+            let uuid = section
+                .get_str("uuid")
+                .or_else(|| section.get_str("canbus_uuid"))
+                .map(|text| {
+                    parse_uuid(&text).map_err(|e| {
+                        ConfigError::new(format!(
+                            "MCU '{}' has an invalid uuid: {e}",
+                            section.identifier()
+                        ))
+                    })
+                })
+                .transpose()?;
+            // The reference must resolve to a port section of the kind the
+            // option spells: existence is a config-section check, so it is
+            // independent of load order. The message names both the child
+            // section and the port section asked for.
+            let sub = text.trim();
+            let port = format!("{} {sub}", kind.section_type());
+            if !section.has_sibling(&port) {
+                return Err(ConfigError::new(format!(
+                    "MCU '{}' references port '{sub}' via '{}', but the config has no [{port}] \
+                     section",
+                    section.identifier(),
+                    kind.reference_option()
+                )));
+            }
+            // The port's topology — shared or exclusive, legacy or named,
+            // every CAN member named — is the whole config's call, checked by
+            // the grouping pass once per referencing section (the same
+            // precedent `host_libraries::validate` sets above).
+            port_grouping::validate(section)?;
+            return Ok(Transport::BridgePort { port, uuid, kind });
         }
 
         #[cfg(test)]
@@ -652,6 +803,20 @@ impl Transport {
                 }
                 None => Interface::host(library).map_err(|e| format!("host_library: {e}")),
             },
+            // A bridge port's device is reached through the bridge itself —
+            // its port table and the port-level `SET_PORT_NODEID` — and that
+            // attach lands with M1-P3. Until then this build does not open
+            // such a transport, and says so where every other open failure is
+            // said, rather than pretending the device came up.
+            Transport::BridgePort {
+                port,
+                kind,
+                uuid: _,
+            } => Err(format!(
+                "{} {port}: opening a device through a bridge port is not wired up yet (M1-P3: \
+                 the attach needs the bridge's port table and SET_PORT_NODEID)",
+                kind.section_type()
+            )),
             #[cfg(test)]
             Transport::Simulator(path) => SimulatorDevice::new(path)
                 .map(Interface::simulator)
@@ -671,6 +836,8 @@ mod tests {
     use crate::core::klippy::frame::Frame;
     use crate::core::klippy::interface::devices::serial::DEFAULT_BAUD;
     use crate::core::klippy::interface::pty::Pty;
+    use crate::core::klippy::printer::Printer;
+    use crate::core::klippy::reactor::ManualReactor;
     use std::io::{Read, Write};
     use std::os::fd::AsRawFd;
     use std::sync::{Arc, Mutex};
@@ -1757,5 +1924,334 @@ mod tests {
             "mcu",
         );
         assert!(config.is_ok(), "{config:?}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Bridge downstream ports (`uart:` / `can:`, M1 P1-C).
+    // -----------------------------------------------------------------------
+
+    /// A `uart:` section parses to the bridge-port transport, carrying the
+    /// port section identifier, the port kind and the uuid when written. A
+    /// port child is not a serial MCU, so it resets with `command`.
+    #[test]
+    fn a_uart_reference_becomes_the_bridge_port_transport() {
+        let (config, _) = parse_shared(
+            "[mcu bridge]\nserial: /dev/a\n\
+             [mcu child]\nuart: uart0\nuuid: 11aa22bb33cc\n\
+             [uart_device uart0]\nuart_mcu: bridge\nuart_oid: uart0\n",
+            "mcu child",
+        );
+        let config = config.unwrap();
+        assert!(matches!(
+            &config.transport,
+            Transport::BridgePort {
+                port,
+                uuid: Some(u),
+                kind: PortKind::Uart,
+            } if port == "uart_device uart0"
+                && u == &[0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc]
+        ));
+        assert_eq!(config.restart_method, McuRestartMethod::Command);
+    }
+
+    /// A `can:` section likewise; its uuid is the identity the CAN port
+    /// addresses the board by.
+    #[test]
+    fn a_can_reference_becomes_the_bridge_port_transport() {
+        let (config, _) = parse_shared(
+            "[mcu bridge]\nserial: /dev/a\n\
+             [mcu child]\ncan: can0\nuuid: 44dd55ee66ff\n\
+             [can_device can0]\ncan_mcu: bridge\ncan_oid: can0\n",
+            "mcu child",
+        );
+        let config = config.unwrap();
+        assert!(matches!(
+            &config.transport,
+            Transport::BridgePort {
+                port,
+                uuid: Some(u),
+                kind: PortKind::Can,
+            } if port == "can_device can0"
+                && u == &[0x44, 0xdd, 0x55, 0xee, 0x66, 0xff]
+        ));
+    }
+
+    /// A uart port child with no `uuid` is rule 5's legacy shape: it parses,
+    /// carrying no identity.
+    #[test]
+    fn a_uart_reference_without_a_uuid_parses_as_legacy() {
+        let (config, _) = parse_shared(
+            "[mcu bridge]\nserial: /dev/a\n\
+             [mcu child]\nuart: uart0\n\
+             [uart_device uart0]\nuart_mcu: bridge\nuart_oid: uart0\n",
+            "mcu child",
+        );
+        let config = config.unwrap();
+        assert!(matches!(
+            &config.transport,
+            Transport::BridgePort {
+                uuid: None,
+                kind: PortKind::Uart,
+                ..
+            }
+        ));
+    }
+
+    /// Every other interface key with `uart:` names two transports, listed in
+    /// the order the keys are declared — the same refusal every selector has.
+    #[test]
+    fn a_uart_reference_with_another_interface_is_rejected() {
+        let base = "[mcu bridge]\nserial: /dev/a\n\
+             [mcu child]\nuart: uart0\n{extra}\n\
+             [uart_device uart0]\nuart_mcu: bridge\nuart_oid: uart0\n";
+        for (extra, listed) in [
+            ("serial: /dev/b", "serial, uart"),
+            (
+                "host_library: /lib/libklipper_host.so",
+                "host_library, uart",
+            ),
+            ("can: other", "uart, can"),
+            ("test: dict=/fake.dict", "uart, test"),
+        ] {
+            let (config, _) = parse_shared(&base.replace("{extra}", extra), "mcu child");
+            let err = config.unwrap_err();
+            assert!(
+                err.to_string().contains("more than one interface"),
+                "{extra}: {err}"
+            );
+            assert!(err.to_string().contains(listed), "{extra}: {err}");
+        }
+    }
+
+    /// `canbus_nodeid` is an id override, not a selector — but no non-CAN
+    /// transport has ever accepted it, so a uart port's member refuses it the
+    /// way `serial:` does.
+    #[test]
+    fn a_uart_reference_with_canbus_nodeid_is_rejected() {
+        let (config, _) = parse_shared(
+            "[mcu bridge]\nserial: /dev/a\n\
+             [mcu child]\nuart: uart0\ncanbus_nodeid: 3\n\
+             [uart_device uart0]\nuart_mcu: bridge\nuart_oid: uart0\n",
+            "mcu child",
+        );
+        let err = config.unwrap_err();
+        assert!(err.to_string().contains("more than one interface"), "{err}");
+        assert!(err.to_string().contains("uart, canbus_nodeid"), "{err}");
+    }
+
+    /// A CAN port's member is a CAN device: `canbus_nodeid` overrides its id
+    /// the way it does on a direct CAN link (the override is orthogonal to
+    /// the interface), and its range is validated the same.
+    #[test]
+    fn a_can_reference_takes_canbus_nodeid_as_its_id() {
+        let (config, _) = parse_shared(
+            "[mcu bridge]\nserial: /dev/a\n\
+             [mcu child]\ncan: can0\nuuid: 44dd55ee66ff\ncanbus_nodeid: 7\n\
+             [can_device can0]\ncan_mcu: bridge\ncan_oid: can0\n",
+            "mcu child",
+        );
+        assert_eq!(config.unwrap().id, Some(7));
+
+        let (config, _) = parse_shared(
+            "[mcu bridge]\nserial: /dev/a\n\
+             [mcu child]\ncan: can0\nuuid: 44dd55ee66ff\ncanbus_nodeid: 0\n\
+             [can_device can0]\ncan_mcu: bridge\ncan_oid: can0\n",
+            "mcu child",
+        );
+        let err = config.unwrap_err();
+        assert!(err.to_string().contains("invalid canbus_nodeid"), "{err}");
+    }
+
+    /// A `uart:` naming no `[uart_device]` section cannot open anything: the
+    /// error names the child section and the port section it asked for.
+    #[test]
+    fn a_reference_to_no_port_section_is_refused() {
+        let (config, _) = parse_shared(
+            "[mcu bridge]\nserial: /dev/a\n[mcu child]\nuart: nowhere\n",
+            "mcu child",
+        );
+        let err = config.unwrap_err();
+        assert!(err.to_string().contains("'mcu child'"), "{err}");
+        assert!(err.to_string().contains("[uart_device nowhere]"), "{err}");
+    }
+
+    /// A `uart:` naming a port declared `[can_device]` is a type mismatch, not
+    /// a second port: the error names what the config is missing.
+    #[test]
+    fn a_reference_to_the_other_port_kind_is_refused() {
+        let (config, _) = parse_shared(
+            "[mcu bridge]\nserial: /dev/a\n\
+             [mcu child]\nuart: can0\n\
+             [can_device can0]\ncan_mcu: bridge\ncan_oid: can0\n",
+            "mcu child",
+        );
+        let err = config.unwrap_err();
+        assert!(err.to_string().contains("'mcu child'"), "{err}");
+        assert!(
+            err.to_string().contains("no [uart_device can0] section"),
+            "{err}"
+        );
+    }
+
+    /// A CAN port's member with no `uuid` cannot be addressed (rule 6); the
+    /// refusal is the port grouping's alone — its wording names the port — so
+    /// the transport parse adds no second report.
+    #[test]
+    fn a_can_reference_without_a_uuid_is_the_grouping_to_refuse() {
+        let (config, _) = parse_shared(
+            "[mcu bridge]\nserial: /dev/a\n\
+             [mcu child]\ncan: can0\n\
+             [can_device can0]\ncan_mcu: bridge\ncan_oid: can0\n",
+            "mcu child",
+        );
+        let err = config.unwrap_err();
+        assert!(err.to_string().contains("can_device can0"), "{err}");
+        assert!(err.to_string().contains("'mcu child'"), "{err}");
+        assert!(err.to_string().contains("by uuid"), "{err}");
+    }
+
+    /// Both spellings of the identity on a port child are one identity written
+    /// twice, exactly as on every other transport.
+    #[test]
+    fn a_port_reference_with_both_uuid_spellings_is_rejected() {
+        let (config, _) = parse_shared(
+            "[mcu bridge]\nserial: /dev/a\n\
+             [mcu child]\nuart: uart0\nuuid: 11aa22bb33cc\ncanbus_uuid: 44dd55ee66ff\n\
+             [uart_device uart0]\nuart_mcu: bridge\nuart_oid: uart0\n",
+            "mcu child",
+        );
+        let err = config.unwrap_err();
+        assert!(
+            err.to_string().contains("both uuid and canbus_uuid"),
+            "{err}"
+        );
+    }
+
+    /// A malformed uuid on a port child keeps the CAN error's wording.
+    #[test]
+    fn a_port_reference_with_an_invalid_uuid_is_rejected() {
+        let (config, _) = parse_shared(
+            "[mcu bridge]\nserial: /dev/a\n\
+             [mcu child]\nuart: uart0\nuuid: bogus\n\
+             [uart_device uart0]\nuart_mcu: bridge\nuart_oid: uart0\n",
+            "mcu child",
+        );
+        let err = config.unwrap_err();
+        assert!(err.to_string().contains("invalid uuid"), "{err}");
+    }
+
+    /// The transport describes the port, but nothing opens it yet: the attach
+    /// through the bridge's port table lands with M1-P3, and `open` says so
+    /// where every other open failure is said.
+    #[test]
+    fn a_port_child_open_is_refused_as_not_wired_up_yet() {
+        let (config, _) = parse_shared(
+            "[mcu bridge]\nserial: /dev/a\n\
+             [mcu child]\nuart: uart0\nuuid: 11aa22bb33cc\n\
+             [uart_device uart0]\nuart_mcu: bridge\nuart_oid: uart0\n",
+            "mcu child",
+        );
+        let config = config.unwrap();
+        let err = config.open().unwrap_err();
+        assert!(err.contains("uart_device uart0"), "{err}");
+        assert!(err.contains("M1-P3"), "{err}");
+    }
+
+    /// A `restart_method` on a port child is reported and ignored: only a
+    /// serial MCU resets by line, and this transport is not one.
+    #[test]
+    fn a_port_child_resets_with_command_and_reports_the_option() {
+        let (config, warnings) = parse_shared(
+            "[mcu bridge]\nserial: /dev/a\n\
+             [mcu child]\nuart: uart0\nrestart_method: arduino\n\
+             [uart_device uart0]\nuart_mcu: bridge\nuart_oid: uart0\n",
+            "mcu child",
+        );
+        assert_eq!(config.unwrap().restart_method, McuRestartMethod::Command);
+        assert!(
+            warnings.contains("only applies to a serial MCU"),
+            "{warnings}"
+        );
+    }
+
+    /// The end-to-end load contract: a legacy child on a legal `[uart_device]`
+    /// loads clean through the whole walk — every option read, nothing left
+    /// for `check_unused` — and the port grouping the child's load built is
+    /// registered once, reporting the port as legacy.
+    #[test]
+    fn a_legacy_port_child_loads_clean() {
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        let (config, _) = Config::from_text(
+            "[mcu bridge]\nserial: /dev/not-opened-yet\n\
+             [mcu child]\nuart: uart0\n\
+             [uart_device uart0]\nuart_mcu: bridge\nuart_oid: uart0\n",
+        )
+        .expect("the test config parses");
+
+        printer.load_config(&config).expect("the config loads");
+
+        let groups = printer
+            .lookup_object_as::<port_grouping::PortGroups>(port_grouping::PORT_GROUPS_OBJECT)
+            .expect("the port grouping registered");
+        assert_eq!(groups.peers("uart_device uart0"), ["mcu child"]);
+        assert!(groups.is_legacy("uart_device uart0"));
+    }
+
+    /// A shared port whose members cannot be told apart fails the whole load
+    /// at the referencing section's parse, naming the port and the uuid-less
+    /// member — one report for one error.
+    #[test]
+    fn a_shared_port_missing_a_uuid_fails_the_load() {
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        let (config, _) = Config::from_text(
+            "[mcu bridge]\nserial: /dev/a\n\
+             [mcu one]\nuart: uart0\nuuid: 11aa22bb33cc\n\
+             [mcu two]\nuart: uart0\n\
+             [uart_device uart0]\nuart_mcu: bridge\nuart_oid: uart0\n",
+        )
+        .expect("the test config parses");
+
+        let err = printer.load_config(&config).unwrap_err();
+        assert!(err.to_string().contains("uart_device uart0"), "{err}");
+        assert!(err.to_string().contains("'mcu two'"), "{err}");
+    }
+
+    /// A CAN port's member registers its uuid the way a direct CAN link does:
+    /// two sections naming one identity are one board claimed twice, and the
+    /// load says so — proof the port child took the `register_can` arm.
+    #[test]
+    fn a_can_port_child_registers_its_uuid() {
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        let (config, _) = Config::from_text(
+            "[mcu bridge]\nserial: /dev/a\n\
+             [mcu direct]\nuuid: 11aa22bb33cc\n\
+             [mcu child]\ncan: can0\nuuid: 11aa22bb33cc\n\
+             [can_device can0]\ncan_mcu: bridge\ncan_oid: can0\n",
+        )
+        .expect("the test config parses");
+
+        let err = printer.load_config(&config).unwrap_err();
+        assert!(err.to_string().contains("Duplicate uuid"), "{err}");
+    }
+
+    /// The explicit id override rides a CAN port's member the way it does a
+    /// direct CAN link: it is reserved at load, and a second claim on it is
+    /// refused — proof the override is consumed, consistently with the
+    /// conflict decision that allows it on `can:` only.
+    #[test]
+    fn a_can_port_child_honours_its_explicit_nodeid() {
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        let (config, _) = Config::from_text(
+            "[mcu bridge]\nserial: /dev/a\n\
+             [mcu other]\nuuid: 22bb33cc44dd\ncanbus_nodeid: 3\n\
+             [mcu child]\ncan: can0\nuuid: 11aa22bb33cc\ncanbus_nodeid: 3\n\
+             [can_device can0]\ncan_mcu: bridge\ncan_oid: can0\n",
+        )
+        .expect("the test config parses");
+
+        let err = printer.load_config(&config).unwrap_err();
+        assert!(err.to_string().contains("canbus_nodeid"), "{err}");
+        // The allocator names MCUs by their section sub, not identifier.
+        assert!(err.to_string().contains("MCU 'child'"), "{err}");
     }
 }

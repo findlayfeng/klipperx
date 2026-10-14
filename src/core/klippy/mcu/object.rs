@@ -33,6 +33,7 @@ use tracing::{debug, info, warn};
 
 use super::host_libraries;
 use super::ids;
+use super::port_grouping::{self, PortKind};
 use super::serial_ports;
 use crate::core::klippy::cmd::clock::{ClockSync, McuClock, SecondarySync};
 use crate::core::klippy::cmd::config::Reset;
@@ -1569,6 +1570,19 @@ pub fn load_config(
     allocator.reserve_explicit(config);
     let id = match &parsed.transport {
         Transport::Can { uuid, .. } => allocator.register_can(&parsed.name, *uuid, parsed.id)?,
+        // A CAN port's member is addressed by its uuid exactly as a direct
+        // CAN link is, so it takes the same allocation. Rule 6 made one
+        // mandatory for it at parse (`port_grouping::validate`, which the
+        // transport parse runs), so the parse pinned it.
+        Transport::BridgePort {
+            uuid,
+            kind: PortKind::Can,
+            ..
+        } => allocator.register_can(
+            &parsed.name,
+            uuid.expect("a CAN port member writes a uuid (checked at parse, rule 6)"),
+            parsed.id,
+        )?,
         _ => allocator.register(&parsed.name)?,
     };
     // The first `[mcu]` section brings the `error_mcu` module with it, as
@@ -1620,6 +1634,17 @@ pub fn load_config(
         _ => None,
     };
     object.set_host_mux(host_mux);
+    // Whether this MCU hangs on a bridge downstream port — shared or
+    // exclusive, legacy or named — is the whole config's call too
+    // (`mcu/port_grouping.rs`). Only a `uart:`/`can:` section asks for the
+    // grouping, as the parse only calls `port_grouping::validate` for one (the
+    // precedent `host_libraries::ensure` above sets: a config with no port
+    // reference has no port to group). Nothing consumes the grouping at
+    // connect yet — the attach through the bridge's port table is M1-P3's —
+    // the registry object is what that pass will find.
+    if matches!(parsed.transport, Transport::BridgePort { .. }) {
+        port_grouping::ensure(printer, config)?;
+    }
     // A host shutdown stops the firmware too (upstream registers the same
     // handler in `MCU.__init__`, `klippy/mcu.py:800`). Registered here
     // rather than in `connect` because the handler is `'static` and needs a

@@ -20,7 +20,10 @@
 //!
 //! Two configurations leave two boards indistinguishable and are config errors
 //! naming the sections involved: two or more sections on the path all omitting
-//! `uuid`, and two sections on the path writing the same `uuid`.
+//! `uuid`, and two sections on the path writing the same `uuid`. The grouping
+//! and the uuid-distinguishability judgment behind those two rules live in
+//! `mcu/link_grouping.rs`, shared with the port grouping — one judgment for
+//! both link kinds; the wording and the muxed/not verdict stay here.
 //!
 //! The same pass gives every `host_library:` path an **identity of its own**
 //! ([`HostLibraries::identity`]): the uuid the library's own device answers the
@@ -49,6 +52,9 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
+use crate::core::klippy::mcu::link_grouping::{
+    declared_uuid, distinguishability, group_by_key, quoted, Distinguishability, Member,
+};
 use crate::core::klippy::printer::{Printer, PrinterObject};
 
 /// The registry key this pass is looked up and registered under.
@@ -92,11 +98,12 @@ impl HostLibraries {
     /// A path whose MCUs cannot be told apart — two or more sections omitting
     /// `uuid`, or two writing the same one. The error names the sections.
     pub fn classify(config: &ConfigWrapper) -> Result<Self, ConfigError> {
-        // path → (mcu name, the uuid it writes). A `None` uuid means the section
-        // writes none; a uuid that does not parse is still kept as its text, so
-        // a duplicate is caught here and the section's own factory reports the
+        // The `[mcu]` sections' claims on a host-library path: the path they
+        // name and the uuid they write. A `None` uuid means the section writes
+        // none; a uuid that does not parse is still kept as its text, so a
+        // duplicate is caught here and the section's own factory reports the
         // bad value.
-        let mut groups: BTreeMap<String, Vec<(String, Option<String>)>> = BTreeMap::new();
+        let mut claims: Vec<(String, Member)> = Vec::new();
         // Every uuid the config already names, whatever transport carries it, so
         // an assigned identity can never collide with a board that is already
         // addressed by one.
@@ -112,21 +119,27 @@ impl HostLibraries {
             let Some(path) = section.section().get_text("host_library") else {
                 continue;
             };
-            groups
-                .entry(path)
-                .or_default()
-                .push((section.identifier(), declared_uuid(&section)));
+            claims.push((
+                path,
+                Member {
+                    identifier: section.identifier(),
+                    uuid: declared_uuid(&section),
+                },
+            ));
         }
 
         let mut by_path: BTreeMap<String, PathGroup> = BTreeMap::new();
         let mut taken = known;
-        for (path, members) in groups {
+        for (path, members) in group_by_key(claims) {
             let is_mux = path_is_mux(&path, &members)?;
             let identity = assign_identity(&path, &mut taken);
             by_path.insert(
                 path,
                 PathGroup {
-                    members: members.into_iter().map(|(name, _)| name).collect(),
+                    members: members
+                        .iter()
+                        .map(|member| member.identifier.clone())
+                        .collect(),
                     is_mux,
                     identity,
                 },
@@ -230,57 +243,38 @@ pub fn ensure(
 /// which board a bare frame belongs to, and with two writing the same `uuid`
 /// there is no way to tell which of them a header names — both are reported with
 /// the sections involved.
-fn path_is_mux(path: &str, members: &[(String, Option<String>)]) -> Result<bool, ConfigError> {
-    let Some((_, first_uuid)) = members.first() else {
+fn path_is_mux(path: &str, members: &[Member]) -> Result<bool, ConfigError> {
+    let Some(first) = members.first() else {
         return Ok(false);
     };
     if members.len() == 1 {
-        return Ok(first_uuid.is_some());
+        return Ok(first.uuid.is_some());
     }
-    let without = members
-        .iter()
-        .filter(|(_, uuid)| uuid.is_none())
-        .map(|(name, _)| name.as_str())
-        .collect::<Vec<_>>();
-    if without.len() >= 2 {
-        return Err(ConfigError::new(format!(
+    // At most one member may omit its uuid: it claims the bridge's own device.
+    // The verdict is the shared distinguishability judgment
+    // (`mcu/link_grouping.rs`); the wording is this link's own.
+    match distinguishability(members, 1) {
+        None => Ok(true),
+        Some(Distinguishability::MissingUuid(without)) => Err(ConfigError::new(format!(
             "host library '{path}': {} name it without a uuid, but at most one MCU on a path \
              may omit it (it claims the bridge's own device)",
-            quoted(&without)
-        )));
-    }
-    // Two sections writing one identity name the same board twice: a mux header
-    // built from it would address both at once. A `BTreeMap` so the reported
-    // pair is stable across runs.
-    let mut by_uuid: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-    for (name, uuid) in members {
-        if let Some(uuid) = uuid {
-            by_uuid
-                .entry(uuid.as_str())
-                .or_default()
-                .push(name.as_str());
+            quoted(&names(&without))
+        ))),
+        // Two sections writing one identity name the same board twice: a mux
+        // header built from it would address both at once.
+        Some(Distinguishability::DuplicateUuid { uuid, members }) => {
+            Err(ConfigError::new(format!(
+                "host library '{path}': {} set the same uuid {uuid}, so the boards cannot be \
+                 told apart",
+                quoted(&names(&members))
+            )))
         }
     }
-    if let Some((uuid, names)) = by_uuid.iter().find(|(_, names)| names.len() >= 2) {
-        return Err(ConfigError::new(format!(
-            "host library '{path}': {} set the same uuid {uuid}, so the boards cannot be \
-             told apart",
-            quoted(names)
-        )));
-    }
-    Ok(true)
 }
 
-/// The `uuid` a `[mcu]` section writes for its host library: the canonical
-/// `uuid` or its `canbus_uuid` alias, trimmed and lowercased so two spellings of
-/// one identity compare equal, or `None` when it writes neither. Read raw so the
-/// scan records no access (see the module docs).
-fn declared_uuid(section: &ConfigWrapper) -> Option<String> {
-    section
-        .section()
-        .get_text("uuid")
-        .or_else(|| section.section().get_text("canbus_uuid"))
-        .map(|text| text.trim().to_ascii_lowercase())
+/// Member identifiers as the borrowed list `quoted` joins.
+fn names(identifiers: &[String]) -> Vec<&str> {
+    identifiers.iter().map(String::as_str).collect()
 }
 
 /// The identity the device behind `path` answers the mux with: a pure function
@@ -356,15 +350,6 @@ fn parse_uuid_hex(text: &str) -> Option<[u8; 6]> {
         *byte = u8::from_str_radix(&text[i * 2..i * 2 + 2], 16).ok()?;
     }
     Some(uuid)
-}
-
-/// The section names as a quoted, comma-separated list for an error message.
-fn quoted(names: &[&str]) -> String {
-    names
-        .iter()
-        .map(|name| format!("'{name}'"))
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 // ===========================================================================

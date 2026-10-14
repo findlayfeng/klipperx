@@ -1,0 +1,474 @@
+//! `[uart_device <name>]` / `[can_device <name>]` — a bridge downstream port.
+//!
+//! M1's configuration face (see the work-log plan): a downstream port is a
+//! named config section that later passes look up by section name, instead of
+//! the topology being learned from the wire. `*_mcu` says which `[mcu]` the
+//! port's hardware sits on (the bridge), `*_oid` names the port on that MCU as
+//! the firmware reports it. Grouping ports with the `[mcu]` sections that
+//! reference them, and everything transport-shaped, is later work — this
+//! module only parses each port section once and holds the answers.
+//!
+//! # Options
+//!
+//! | option | meaning |
+//! |---|---|
+//! | `uart_mcu` / `can_mcu` | the `[mcu]` this port sits on; a section name, `mcu` for the bare `[mcu]` (required) |
+//! | `uart_oid` / `can_oid` | the oid name the firmware reports for this port (required, non-empty) |
+//! | `uart_baud` | the port's line rate, a positive integer (optional) |
+//! | `uart_restart_method` | spelling checked against [`McuRestartMethod`]; semantics land with the port-level reset work (optional) |
+//!
+//! The `*_mcu` target is a **config-section** existence check
+//! ([`ConfigWrapper::has_sibling`]), not a printer-object lookup: the section
+//! is what the loader hands later phases, and checking the config keeps this
+//! pass independent of load order. `has_sibling` records nothing — the
+//! `[mcu]` section's own factory is what marks *its* options read — while this
+//! section's own options go through the tracked getters, so `check_unused`
+//! sees exactly what this factory read and nothing else.
+//!
+//! Options this module does not know are not read here: they are left for
+//! `check_unused` to report as invalid, the same contract every factory has.
+//!
+//! Each section registers a light description object under its own identifier
+//! (`uart_device uart0`): no status, not queryable, just the parsed values for
+//! the passes that follow — the same shape `serial_ports` and `mcu_ids` set.
+
+use std::sync::Arc;
+
+use serde_json::{json, Value};
+
+use crate::core::klippy::config::{ConfigError, ConfigWrapper};
+use crate::core::klippy::load::section;
+use crate::core::klippy::printer::{Printer, PrinterObject};
+
+use super::McuRestartMethod;
+
+// The port sections describe hardware on an `[mcu]`, but nothing here looks an
+// MCU object up — the `*_mcu` check is against the config — so the order only
+// has to sit after `[mcu]`'s 10; 19 is the first free slot before the extras
+// block at 20 (15/16/18 are taken by `multi_pin`/`sx1509`/`force_move`).
+section!("uart_device", order = 19, prefix = load_uart_device);
+section!("can_device", order = 19, prefix = load_can_device);
+
+/// One configured `[uart_device <name>]`: a bridge downstream UART port.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UartPort {
+    /// The section's sub — the name other sections reference the port by.
+    name: String,
+    /// The `[mcu]` section the port sits on: `mcu` for the bare section, the
+    /// sub otherwise (the same naming `get_printer_mcu` uses upstream).
+    mcu: String,
+    /// The oid name the firmware reports for this port.
+    oid: String,
+    /// The port's line rate, when the config writes one.
+    baud: Option<u32>,
+    /// The written restart method, spelling checked only (see the module docs).
+    restart_method: Option<McuRestartMethod>,
+}
+
+impl UartPort {
+    /// Parse one `[uart_device <name>]` section.
+    ///
+    /// # Errors
+    /// A missing or empty required option, an `uart_mcu` that names no `[mcu]`
+    /// section, a non-positive or unparsable `uart_baud`, or a
+    /// `uart_restart_method` spelling [`McuRestartMethod::parse`] refuses —
+    /// each message names the section (and the target, for an unknown MCU).
+    pub fn new(config: &ConfigWrapper) -> Result<Self, ConfigError> {
+        let name = section_name(config, "uart_device")?;
+        let mcu = require_mcu(config, "uart_mcu")?;
+        let oid = require_text(config, "uart_oid")?;
+        let baud = parse_baud(config, "uart_baud")?;
+        // Spelling only: which reset a port-level method actually performs is
+        // the port-reset work's to define, not this parse's.
+        let restart_method = match config.get_str("uart_restart_method") {
+            None => None,
+            Some(text) => Some(McuRestartMethod::parse(&text).ok_or_else(|| {
+                ConfigError::new(format!(
+                    "Section '{}' has an invalid uart_restart_method: '{text}' (expected one of {})",
+                    config.identifier(),
+                    McuRestartMethod::CHOICES.join(", ")
+                ))
+            })?),
+        };
+        Ok(Self {
+            name,
+            mcu,
+            oid,
+            baud,
+            restart_method,
+        })
+    }
+
+    /// The name other sections reference this port by (the section's sub).
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The `[mcu]` section this port sits on: `mcu` for the bare section, the
+    /// sub otherwise.
+    pub fn mcu(&self) -> &str {
+        &self.mcu
+    }
+
+    /// The oid name the firmware reports for this port.
+    pub fn oid(&self) -> &str {
+        &self.oid
+    }
+
+    /// The port's line rate, when the config writes one.
+    pub fn baud(&self) -> Option<u32> {
+        self.baud
+    }
+
+    /// The written restart method, spelling checked only.
+    pub fn restart_method(&self) -> Option<&McuRestartMethod> {
+        self.restart_method.as_ref()
+    }
+}
+
+impl PrinterObject for UartPort {
+    /// No status: this object carries parsed config, not runtime state.
+    fn get_status(&self, _eventtime: f64) -> Value {
+        json!({})
+    }
+
+    /// Not client-visible, like `serial_ports` and `mcu_ids`.
+    fn is_queryable(&self) -> bool {
+        false
+    }
+}
+
+/// One configured `[can_device <name>]`: a bridge downstream CAN port.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanPort {
+    /// The section's sub — the name other sections reference the port by.
+    name: String,
+    /// The `[mcu]` section the port sits on ([`UartPort::mcu`]'s naming).
+    mcu: String,
+    /// The oid name the firmware reports for this port.
+    oid: String,
+}
+
+impl CanPort {
+    /// Parse one `[can_device <name>]` section.
+    ///
+    /// # Errors
+    /// A missing or empty required option, or a `can_mcu` that names no `[mcu]`
+    /// section — each message names the section (and the target, for an
+    /// unknown MCU).
+    pub fn new(config: &ConfigWrapper) -> Result<Self, ConfigError> {
+        let name = section_name(config, "can_device")?;
+        let mcu = require_mcu(config, "can_mcu")?;
+        let oid = require_text(config, "can_oid")?;
+        Ok(Self { name, mcu, oid })
+    }
+
+    /// The name other sections reference this port by (the section's sub).
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The `[mcu]` section this port sits on: `mcu` for the bare section, the
+    /// sub otherwise.
+    pub fn mcu(&self) -> &str {
+        &self.mcu
+    }
+
+    /// The oid name the firmware reports for this port.
+    pub fn oid(&self) -> &str {
+        &self.oid
+    }
+}
+
+impl PrinterObject for CanPort {
+    /// No status: this object carries parsed config, not runtime state.
+    fn get_status(&self, _eventtime: f64) -> Value {
+        json!({})
+    }
+
+    /// Not client-visible, like `serial_ports` and `mcu_ids`.
+    fn is_queryable(&self) -> bool {
+        false
+    }
+}
+
+/// Upstream's `load_config_prefix` shape for `[uart_device <name>]`.
+///
+/// # Errors
+/// As [`UartPort::new`].
+pub fn load_uart_device(
+    config: &ConfigWrapper,
+    _printer: &Arc<Printer>,
+) -> Result<Arc<dyn PrinterObject>, ConfigError> {
+    Ok(Arc::new(UartPort::new(config)?))
+}
+
+/// Upstream's `load_config_prefix` shape for `[can_device <name>]`.
+///
+/// # Errors
+/// As [`CanPort::new`].
+pub fn load_can_device(
+    config: &ConfigWrapper,
+    _printer: &Arc<Printer>,
+) -> Result<Arc<dyn PrinterObject>, ConfigError> {
+    Ok(Arc::new(CanPort::new(config)?))
+}
+
+/// The section's sub, required: a port is `[<type> <name>]`, never bare.
+///
+/// The loader only calls a prefix factory for a section that has a sub, so
+/// this guards direct calls (tests, later passes reading a stored section).
+fn section_name(config: &ConfigWrapper, kind: &str) -> Result<String, ConfigError> {
+    config.section().sub.clone().ok_or_else(|| {
+        ConfigError::new(format!(
+            "Section '{}' must be a '[{kind} <name>]' section",
+            config.identifier()
+        ))
+    })
+}
+
+/// A required, non-empty string option, read through the tracked getter.
+fn require_text(config: &ConfigWrapper, option: &str) -> Result<String, ConfigError> {
+    let text = config.get(option, None)?;
+    let trimmed = text.trim().to_string();
+    if trimmed.is_empty() {
+        return Err(ConfigError::new(format!(
+            "Option '{option}' in section '{}' must be specified",
+            config.identifier()
+        )));
+    }
+    Ok(trimmed)
+}
+
+/// A required `*_mcu` option naming an existing `[mcu]` section.
+///
+/// The bare `[mcu]` is written `mcu` (upstream names it that way,
+/// `klippy/mcu.py:1151-1153`); a `[mcu <name>]` by its sub. Existence is a
+/// config-section check (`has_sibling`, which records nothing) — the section
+/// is the contract later passes consume, and the `[mcu]` factories own marking
+/// their own options read.
+fn require_mcu(config: &ConfigWrapper, option: &str) -> Result<String, ConfigError> {
+    let mcu = require_text(config, option)?;
+    let identifier = if mcu == "mcu" {
+        "mcu".to_string()
+    } else {
+        format!("mcu {mcu}")
+    };
+    if !config.has_sibling(&identifier) {
+        return Err(ConfigError::new(format!(
+            "Section '{}': unknown MCU '{mcu}'",
+            config.identifier()
+        )));
+    }
+    Ok(mcu)
+}
+
+/// An optional positive-integer option (`uart_baud`).
+///
+/// Absent is `None` (the port inherits whatever the later transport pass
+/// decides); written must parse as a positive integer, the same rule
+/// `config/mcu.rs` applies to an MCU's `baud`.
+fn parse_baud(config: &ConfigWrapper, option: &str) -> Result<Option<u32>, ConfigError> {
+    let Some(text) = config.get_str(option) else {
+        return Ok(None);
+    };
+    match text.trim().parse::<u32>() {
+        Ok(baud) if baud > 0 => Ok(Some(baud)),
+        _ => Err(ConfigError::new(format!(
+            "Section '{}' has an invalid {option}: '{text}' (expected a positive integer)",
+            config.identifier()
+        ))),
+    }
+}
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::core::klippy::config::access::AccessTracking;
+    use crate::core::klippy::config::Config;
+    use crate::core::klippy::reactor::ManualReactor;
+
+    /// Parse `text` into a config the wrappers can reach siblings through.
+    fn parse(text: &str) -> Config {
+        Config::from_text(text).expect("the test config parses").0
+    }
+
+    /// A tracked wrapper over `identifier`, with the whole config behind it so
+    /// `has_sibling` answers — the same shape the loader hands a factory.
+    fn wrap<'a>(config: &'a Config, identifier: &str) -> ConfigWrapper<'a> {
+        let section = config
+            .get_section(identifier)
+            .unwrap_or_else(|| panic!("the config has [{identifier}]"));
+        ConfigWrapper::with_config(section, AccessTracking::shared(), None, config)
+    }
+
+    /// A config with a bare `[mcu]` plus `section_text` as a port section.
+    fn with_mcu(section_text: &str) -> Config {
+        parse(&format!("[mcu]\nserial: /dev/a\n{section_text}"))
+    }
+
+    #[test]
+    fn a_uart_port_parses_every_option() {
+        let config = with_mcu(
+            "[uart_device uart0]\n\
+             uart_mcu: mcu\n\
+             uart_oid: uart0\n\
+             uart_baud: 250000\n\
+             uart_restart_method: arduino\n",
+        );
+        let port = UartPort::new(&wrap(&config, "uart_device uart0")).unwrap();
+
+        assert_eq!(port.name(), "uart0");
+        assert_eq!(port.mcu(), "mcu");
+        assert_eq!(port.oid(), "uart0");
+        assert_eq!(port.baud(), Some(250_000));
+        assert_eq!(port.restart_method(), Some(&McuRestartMethod::Arduino));
+    }
+
+    #[test]
+    fn a_uart_port_without_optional_options_parses() {
+        let config = with_mcu("[uart_device uart0]\nuart_mcu: mcu\nuart_oid: uart0\n");
+        let port = UartPort::new(&wrap(&config, "uart_device uart0")).unwrap();
+
+        assert_eq!(port.baud(), None);
+        assert_eq!(port.restart_method(), None);
+    }
+
+    #[test]
+    fn a_uart_port_may_name_a_prefixed_mcu() {
+        let config = parse(
+            "[mcu bridge]\nserial: /dev/a\n\
+             [uart_device uart0]\nuart_mcu: bridge\nuart_oid: uart0\n",
+        );
+        let port = UartPort::new(&wrap(&config, "uart_device uart0")).unwrap();
+
+        assert_eq!(port.mcu(), "bridge");
+    }
+
+    #[test]
+    fn a_uart_port_without_uart_mcu_is_refused() {
+        let config = with_mcu("[uart_device uart0]\nuart_oid: uart0\n");
+
+        let err = UartPort::new(&wrap(&config, "uart_device uart0")).unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "Option 'uart_mcu' in section 'uart_device uart0' must be specified"
+        );
+    }
+
+    #[test]
+    fn a_uart_port_naming_an_unknown_mcu_is_refused() {
+        let config = with_mcu("[uart_device uart0]\nuart_mcu: zboard\nuart_oid: uart0\n");
+
+        let err = UartPort::new(&wrap(&config, "uart_device uart0")).unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "Section 'uart_device uart0': unknown MCU 'zboard'"
+        );
+    }
+
+    #[test]
+    fn a_uart_port_without_uart_oid_is_refused() {
+        let config = with_mcu("[uart_device uart0]\nuart_mcu: mcu\n");
+
+        let err = UartPort::new(&wrap(&config, "uart_device uart0")).unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "Option 'uart_oid' in section 'uart_device uart0' must be specified"
+        );
+    }
+
+    #[test]
+    fn a_uart_port_with_an_invalid_baud_is_refused() {
+        let config =
+            with_mcu("[uart_device uart0]\nuart_mcu: mcu\nuart_oid: uart0\nuart_baud: fast\n");
+        let err = UartPort::new(&wrap(&config, "uart_device uart0")).unwrap_err();
+        assert!(err.to_string().contains("invalid uart_baud"), "{err}");
+        assert!(err.to_string().contains("fast"), "{err}");
+
+        // A rate that parses but is not positive is the same refusal.
+        let config =
+            with_mcu("[uart_device uart0]\nuart_mcu: mcu\nuart_oid: uart0\nuart_baud: 0\n");
+        let err = UartPort::new(&wrap(&config, "uart_device uart0")).unwrap_err();
+        assert!(err.to_string().contains("invalid uart_baud"), "{err}");
+    }
+
+    #[test]
+    fn a_uart_port_with_an_invalid_restart_method_is_refused() {
+        let config = with_mcu(
+            "[uart_device uart0]\nuart_mcu: mcu\nuart_oid: uart0\n\
+             uart_restart_method: wibble\n",
+        );
+
+        let err = UartPort::new(&wrap(&config, "uart_device uart0")).unwrap_err();
+
+        assert!(
+            err.to_string().contains("invalid uart_restart_method"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("wibble"), "{err}");
+    }
+
+    #[test]
+    fn a_can_port_parses_and_its_options_are_required() {
+        let config = with_mcu("[can_device can0]\ncan_mcu: mcu\ncan_oid: can0\n");
+        let port = CanPort::new(&wrap(&config, "can_device can0")).unwrap();
+        assert_eq!(port.name(), "can0");
+        assert_eq!(port.mcu(), "mcu");
+        assert_eq!(port.oid(), "can0");
+
+        let config = with_mcu("[can_device can0]\ncan_oid: can0\n");
+        let err = CanPort::new(&wrap(&config, "can_device can0")).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Option 'can_mcu' in section 'can_device can0' must be specified"
+        );
+
+        let config = with_mcu("[can_device can0]\ncan_mcu: mcu\n");
+        let err = CanPort::new(&wrap(&config, "can_device can0")).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Option 'can_oid' in section 'can_device can0' must be specified"
+        );
+
+        let config = with_mcu("[can_device can0]\ncan_mcu: zboard\ncan_oid: can0\n");
+        let err = CanPort::new(&wrap(&config, "can_device can0")).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Section 'can_device can0': unknown MCU 'zboard'"
+        );
+    }
+
+    #[test]
+    fn the_port_sections_load_and_hold_no_unused_options() {
+        // The end-to-end contract: a config with an `[mcu]` and both port
+        // sections loads clean — every port option this factory reads is
+        // recorded, so `check_unused` accepts the sections, and each section
+        // registers its description object under its own identifier.
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        let config = parse(
+            "[mcu]\nserial: /dev/not-opened-yet\n\
+             [uart_device uart0]\nuart_mcu: mcu\nuart_oid: uart0\nuart_baud: 250000\n\
+             [can_device can0]\ncan_mcu: mcu\ncan_oid: can0\n",
+        );
+
+        printer.load_config(&config).unwrap();
+
+        let uart = printer
+            .lookup_object_as::<UartPort>("uart_device uart0")
+            .expect("the uart port registered");
+        assert_eq!(uart.oid(), "uart0");
+        let can = printer
+            .lookup_object_as::<CanPort>("can_device can0")
+            .expect("the can port registered");
+        assert_eq!(can.oid(), "can0");
+    }
+}

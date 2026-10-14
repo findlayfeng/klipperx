@@ -1049,13 +1049,16 @@ const OUTPUT_WAIT_MS: u32 = 100;
 mod host_tests {
     use super::*;
     use crate::core::klippy::assign;
+    use crate::core::klippy::cmd::identify::{IdentifyChunk, IDENTIFY_CHUNK_SIZE};
+    use crate::core::klippy::cmd::{McuResponse, Params};
     use crate::core::klippy::config::access::AccessTracking;
     use crate::core::klippy::config::mcu::McuConfig;
     use crate::core::klippy::config::Config;
     use crate::core::klippy::config::{ConfigSection, ConfigValue, ConfigWrapper};
     use crate::core::klippy::frame::{
-        MESSAGE_DEST, MESSAGE_HEADER_SIZE, MESSAGE_MAX, MESSAGE_MIN, MESSAGE_SYNC,
+        FrameStream, MESSAGE_DEST, MESSAGE_HEADER_SIZE, MESSAGE_MAX, MESSAGE_MIN, MESSAGE_SYNC,
     };
+    use crate::core::klippy::identify::IDENTIFY_MESSAGES;
     use crate::core::klippy::interface::devices::serial::{
         admin_unit, assignment_request, decode_header, discovery_query, encode_header,
         set_node_id_for, set_port_node_id, HeaderScan, UnassignedNode, ADMIN_LISTEN, ADMIN_REPLY,
@@ -1063,10 +1066,12 @@ mod host_tests {
         HEADER_BYTES, MAGIC, MUX_PORT_UNITS, RESP_NEED_NODEID,
     };
     use crate::core::klippy::interface::pty::Pty;
+    use crate::core::klippy::interface::SimulatorDevice;
     use crate::core::klippy::mcu::host_libraries::HostLibraries;
     use crate::core::klippy::mcu::{Dictionary, Mcu};
     use crate::core::klippy::msg::parser::Parser;
     use crate::core::klippy::msg::proto::{ArgValue, Payload};
+    use crate::core::klippy::msg::Msg;
     use crate::core::klippy::Interface;
     use std::io::{Read, Write};
     use std::os::fd::AsRawFd;
@@ -2234,6 +2239,414 @@ mod host_tests {
         );
 
         // Same invariant as the other library tests: leave this path unloaded.
+        drop(device);
+        wait_for_unload_blocking(&mux_library_path());
+    }
+
+    // =======================================================================
+    // A device with no mux behind the bridge, over a real pty and the bridge
+    // =======================================================================
+
+    /// How long the adapter's port reader waits before it turns its loop
+    /// around; the device side of the adapter is event driven
+    /// ([`Device::receive`] blocks until an answer is queued), so this is the
+    /// only poll interval there is.
+    const PORT_POLL_MS: i32 = 5;
+
+    /// The fake board behind the bridge's port: the repo's dictionary-driven
+    /// responder ([`SimulatorDevice`]) with a byte adapter in front, so it meets
+    /// the port the way a board on the wire would.
+    ///
+    /// The bridge's port is **legacy**: what it forwards down is the request
+    /// frame with the mux header stripped, and what it expects up is a raw frame
+    /// it heads itself. The responder speaks [`Frame`]s, so two threads bridge
+    /// the gap:
+    ///
+    /// * *port → device* reframes the port's bytes ([`FrameStream`]) and hands
+    ///   each [`Frame`] to [`Device::send`], recording every byte it read for
+    ///   the test's byte-level assertions;
+    /// * *device → port* writes every [`Device::receive`] answer back as raw
+    ///   frame bytes.
+    ///
+    /// Both waits are bounded: the first thread polls the pty for
+    /// [`PORT_POLL_MS`], the second blocks in `receive`, which
+    /// [`Device::shutdown`] releases. [`Drop`] raises the stop flag, shuts the
+    /// device down, and joins both threads, so a failed assertion leaves neither
+    /// a thread nor a blocked receive behind.
+    ///
+    /// The board is simulated; the payload is not. The dictionary served is a
+    /// real `.dict` built from the klipper source tree, so what crosses the
+    /// bridge is a firmware's own identify body.
+    struct DownstreamResponder {
+        stop: Arc<AtomicBool>,
+        device: Arc<SimulatorDevice>,
+        threads: Vec<JoinHandle<()>>,
+        /// Every byte the adapter read off the pty: what the bridge wrote down
+        /// the port, in order, for the test's byte-level assertions.
+        downstream: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl DownstreamResponder {
+        /// Serve the data dictionary at `dict` on the far side of `master`, the
+        /// pty's master end (the bridge holds the slave through its path).
+        fn start(dict: &Path, master: &std::fs::File) -> Self {
+            let device = Arc::new(
+                SimulatorDevice::new(dict)
+                    .unwrap_or_else(|e| panic!("the fake firmware for {}: {e}", dict.display())),
+            );
+            let stop = Arc::new(AtomicBool::new(false));
+            let downstream = Arc::new(Mutex::new(Vec::new()));
+            let mut threads = Vec::with_capacity(2);
+
+            let master_in = master.try_clone().expect("the pty master clones");
+            let device_in = Arc::clone(&device);
+            let stop_in = Arc::clone(&stop);
+            let seen = Arc::clone(&downstream);
+            threads.push(
+                thread::Builder::new()
+                    .name("bridge-port-in".to_string())
+                    .spawn(move || port_bytes_to_device(master_in, device_in, stop_in, seen))
+                    .expect("the port reader thread spawns"),
+            );
+
+            let master_out = master.try_clone().expect("the pty master clones");
+            let device_out = Arc::clone(&device);
+            threads.push(
+                thread::Builder::new()
+                    .name("bridge-port-out".to_string())
+                    .spawn(move || device_answers_to_port(master_out, device_out))
+                    .expect("the port writer thread spawns"),
+            );
+
+            Self {
+                stop,
+                device,
+                threads,
+                downstream,
+            }
+        }
+
+        /// The bytes the bridge has written down the port so far.
+        fn downstream_bytes(&self) -> Vec<u8> {
+            self.downstream.lock().unwrap().clone()
+        }
+    }
+
+    impl Drop for DownstreamResponder {
+        fn drop(&mut self) {
+            // The stop flag retires the port reader; `shutdown` releases the
+            // device reader out of its `receive`.
+            self.stop.store(true, Ordering::SeqCst);
+            self.device.shutdown();
+            for thread in self.threads.drain(..) {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    /// Port → device: what the bridge forwarded down is a raw frame stream, so
+    /// it is reframed and handed to the device one frame at a time.
+    fn port_bytes_to_device(
+        master: std::fs::File,
+        device: Arc<SimulatorDevice>,
+        stop: Arc<AtomicBool>,
+        seen: Arc<Mutex<Vec<u8>>>,
+    ) {
+        let fd = master.as_raw_fd();
+        let mut stream = FrameStream::new();
+        let mut buf = [0u8; 256];
+        let mut reader = &master;
+        while !stop.load(Ordering::Relaxed) {
+            let mut poll = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let ready = unsafe { libc::poll(&mut poll, 1, PORT_POLL_MS) };
+            if ready <= 0 || (poll.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR)) == 0 {
+                continue;
+            }
+            match reader.read(&mut buf) {
+                // The slave side is gone: nothing further can arrive (the same
+                // reading of an empty pty read the port probes use).
+                Ok(0) => break,
+                Ok(read) => {
+                    seen.lock().unwrap().extend_from_slice(&buf[..read]);
+                    stream.push(&buf[..read]);
+                    while let Some(frame) = stream.next_frame() {
+                        if let Err(e) = device.send(&frame) {
+                            debug!("the fake board refused a frame: {e}");
+                        }
+                    }
+                }
+                // A pty master reports EIO once the slave side is gone: nothing
+                // further can arrive.
+                Err(error) => {
+                    debug!("the bridge port stopped: {error}");
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Device → port: every answer the fake board queues goes back as one raw
+    /// frame — the shape the bridge heads with the port's reply id. The loop
+    /// ends when [`Device::shutdown`] makes `receive` return `None`.
+    fn device_answers_to_port(master: std::fs::File, device: Arc<SimulatorDevice>) {
+        while let Some(frame) = device.receive() {
+            if (&master).write_all(&frame.raw_bytes()).is_err() {
+                break;
+            }
+        }
+    }
+
+    /// Read units from the bridge until a frame decoding to `name` arrives on
+    /// `reply_arb`, for at most `window`; the message and its parameters, or
+    /// `None` when the window ran out.
+    ///
+    /// Everything else the port sends — the block ack behind each accepted
+    /// request, any other answer — decodes to another message (or to nothing at
+    /// all) and is skipped. The unit's arbitration id is asserted rather than
+    /// skipped: everything the bridge forwards up from port 0 is headed with
+    /// that port's reply id, so a unit under any other id is a routing failure
+    /// reported where it happens instead of a silent timeout.
+    fn read_reply(
+        device: &mut HostDevice,
+        pending: &mut Vec<u8>,
+        parser: &Parser,
+        reply_arb: u32,
+        name: &str,
+        window: Duration,
+    ) -> Option<(Arc<Msg>, Vec<ArgValue>)> {
+        let deadline = Instant::now() + window;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            let unit = read_unit(device, pending, remaining)?;
+            let (arb, frame) = unit_parts(&unit);
+            assert_eq!(
+                arb, reply_arb,
+                "every unit from port 0 is headed with that port's reply id"
+            );
+            let Some(frame) = Frame::parse(frame) else {
+                continue;
+            };
+            let Ok(decoded) = parser.decode(Payload::from_raw(frame.payload().to_vec())) else {
+                continue;
+            };
+            let Some((message, values)) = decoded.into_iter().find(|(msg, _)| msg.name == name)
+            else {
+                continue;
+            };
+            return Some((message, values));
+        }
+    }
+
+    /// M1-P3's end-to-end shape: a device with **no mux** sits behind a bridge
+    /// port, and the host reaches it *through* the bridge.
+    ///
+    /// The bridge is the real firmware build (`make`'s mux target, loaded
+    /// through [`HostDevice::load_downstream`]), the port is a real pty, and the
+    /// frames are the protocol's own — the device behind the port is the repo's
+    /// dictionary-driven responder ([`DownstreamResponder`]) serving a real
+    /// `.dict` the klipper tree built. The only thing simulated is the board.
+    ///
+    /// The bridge's port table is the route: port 0 holds a legacy device at id
+    /// 7 ([`HostDevice::send_set_port_node_id`]), so a frame sent under that id
+    /// goes down the port stripped of its mux header, and a raw frame coming
+    /// back is headed with the reply id of 7.
+    ///
+    /// On top of the routing rules
+    /// [`test_a_downstream_reference_routes_through_the_bridge_port`] pins with
+    /// hand-built frames, this proves the traffic is *answerable* where it
+    /// lands: the identify transfer runs to completion across the bridge —
+    /// every chunk reassembled, decompressed, and parsed back into the
+    /// dictionary that was built — and the dictionary it installs is usable
+    /// through the same route, with a `get_clock` round trip.
+    ///
+    /// The route is load-bearing: without the `SET_PORT_NODEID` the bridge owns
+    /// no id for port 0, the request reaches no port, and the first reply read
+    /// runs out — the test is red at that `expect`.
+    #[test]
+    fn test_a_device_without_the_mux_behind_the_bridge_answers_identify() {
+        let _serial = HOST_LIBRARY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+
+        // The bridge opens its port while klipper comes up, so the tty has to
+        // exist first — the same setup the other port tests use.
+        let pty = Pty::new();
+        let bridge_path = klipperx_test_support::klipper_host_mux_serial_path();
+        let _ = std::fs::remove_file(&bridge_path);
+        std::os::unix::fs::symlink(&pty.path, &bridge_path).unwrap_or_else(|e| {
+            panic!(
+                "failed to link {} to {}: {e}",
+                bridge_path.display(),
+                pty.path.display()
+            )
+        });
+
+        let identity = [0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc];
+        let downstream_id = 7u32;
+        let mut device = HostDevice::load_downstream(
+            mux_library_path(),
+            HostMux {
+                identity,
+                named: identity,
+            },
+            downstream_id,
+        )
+        .expect("a downstream reference loads without a handshake");
+
+        // The bridge's port table: port 0 holds a legacy device at id 7. This is
+        // the route — until it is in, nothing sent under id 7 reaches any port.
+        device
+            .send_set_port_node_id(0, downstream_id as u8, 0)
+            .expect("SET_PORT_NODEID goes in");
+
+        // The device behind the port: a real data dictionary served by the
+        // repo's fake board, pumped against the pty's other end.
+        let dict = klipperx_test_support::test_dicts_dir().join("linuxprocess.dict");
+        let fixture = DownstreamResponder::start(&dict, &pty.master);
+
+        // The parser knows only the two host-owned identify formats — exactly
+        // what an MCU knows before its dictionary arrives.
+        let mut parser = Parser::new();
+        parser
+            .register_all(IDENTIFY_MESSAGES)
+            .expect("the host-owned identify formats");
+
+        let reply_arb = assign::reply_arb_id(downstream_id).expect("id 7");
+        let mut pending = Vec::new();
+        // Generous, because each leg crosses a thread and a pty; it is also the
+        // bound that makes a missing route a failure rather than a hang.
+        let window = Duration::from_secs(10);
+
+        // The identify transfer, chunk by chunk: ask for the payload so far,
+        // take the `identify_response` for it off the port's reply header, repeat
+        // until the empty answer. The sequence byte advances per request — the
+        // discipline the firmware's `next_sequence` checks (`command.c`).
+        let mut payload: Vec<u8> = Vec::new();
+        let mut requests: Vec<Vec<u8>> = Vec::new();
+        let mut seq = 0u8;
+        loop {
+            let request = parser
+                .encode(
+                    "identify",
+                    &[
+                        ArgValue::UInt32(payload.len() as u32),
+                        ArgValue::UInt8(IDENTIFY_CHUNK_SIZE),
+                    ],
+                )
+                .expect("the identify request encodes");
+            let frame = Frame::new(seq, request.payload().to_vec());
+            seq = seq.wrapping_add(1);
+            requests.push(frame.raw_bytes());
+            device
+                .send(&frame)
+                .expect("the request goes down the bridge");
+
+            let (message, values) = read_reply(
+                Arc::get_mut(&mut device).expect("the test holds the only reference"),
+                &mut pending,
+                &parser,
+                reply_arb,
+                "identify_response",
+                window,
+            )
+            .expect("the device behind the port answers the identify request");
+            let chunk = IdentifyChunk::decode(&Params::new(message, &values))
+                .expect("the answer is an identify chunk");
+            assert_eq!(
+                chunk.offset as usize,
+                payload.len(),
+                "the answer names the offset that was asked for"
+            );
+            if chunk.data.is_empty() {
+                break;
+            }
+            payload.extend_from_slice(&chunk.data);
+        }
+
+        // What came back is the firmware's own payload, reassembled chunk by
+        // chunk above — and it is the dictionary file itself, byte for byte.
+        let raw = std::fs::read(&dict).expect("the data dictionary file");
+        let mut body = Vec::new();
+        flate2::read::ZlibDecoder::new(&payload[..])
+            .read_to_end(&mut body)
+            .expect("the identify payload is zlib");
+        assert_eq!(
+            body, raw,
+            "the payload the bridge carried is the built dictionary, unchanged"
+        );
+        let dictionary = Dictionary::from_json(
+            serde_json::from_slice(&body).expect("the identify body is JSON"),
+        )
+        .expect("the firmware's data dictionary");
+        let message_count = dictionary.messages().count();
+        assert!(
+            message_count >= 20,
+            "expected the firmware's whole dictionary, got {message_count} messages"
+        );
+        for name in ["get_clock", "clock"] {
+            assert!(
+                dictionary.message(name).is_some(),
+                "{name} is in the dictionary identify installed"
+            );
+        }
+        assert!(
+            dictionary.constant_f64("CLOCK_FREQ").is_some(),
+            "the dictionary carries the clock its firmware runs at"
+        );
+        debug!(
+            "identify through the bridge: {} compressed bytes, {message_count} messages",
+            payload.len()
+        );
+
+        // The dictionary identify installed is usable through the same route: a
+        // `get_clock` goes down port 0 and comes back as the framed `clock`
+        // response.
+        dictionary
+            .install(&mut parser)
+            .expect("install the identified dictionary");
+        let request = parser
+            .encode("get_clock", &[])
+            .expect("the clock request encodes");
+        let frame = Frame::new(seq, request.payload().to_vec());
+        requests.push(frame.raw_bytes());
+        device
+            .send(&frame)
+            .expect("the request goes down the bridge");
+
+        let (message, values) = read_reply(
+            Arc::get_mut(&mut device).expect("the test holds the only reference"),
+            &mut pending,
+            &parser,
+            reply_arb,
+            "clock",
+            window,
+        )
+        .expect("the device behind the port answers get_clock");
+        assert_eq!(message.name, "clock", "get_clock is answered by clock");
+        assert!(
+            matches!(values.as_slice(), [ArgValue::UInt32(_)]),
+            "clock is a `%u` value, got {values:?}"
+        );
+
+        // The port's own side of the wire, byte for byte: every request reached
+        // port 0 as its bare frame, mux header stripped, and nothing else was
+        // written down the port.
+        let expected: Vec<u8> = requests.iter().flatten().copied().collect();
+        assert_eq!(
+            fixture.downstream_bytes(),
+            expected,
+            "each request is routed to port 0 and forwarded as its bare frame"
+        );
+
+        // Same invariant as the other library tests: leave this path unloaded.
+        drop(fixture);
         drop(device);
         wait_for_unload_blocking(&mux_library_path());
     }

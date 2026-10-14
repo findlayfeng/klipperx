@@ -89,8 +89,8 @@ use std::time::{Duration, Instant};
 use tracing::{debug, info, trace, warn};
 
 use super::serial::{
-    assignment_request, encode_header, parse_assignment_ack, set_node_id_for, UnitStream,
-    ASSIGN_ATTACH_ATTEMPTS, ASSIGN_ATTACH_TIMEOUT, HEADER_BYTES,
+    assignment_request, encode_header, parse_assignment_ack, set_node_id_for, set_port_node_id,
+    UnitStream, ADMIN_LISTEN, ASSIGN_ATTACH_ATTEMPTS, ASSIGN_ATTACH_TIMEOUT, HEADER_BYTES,
 };
 use super::shared::resource_for;
 
@@ -619,6 +619,43 @@ impl HostDevice {
         Ok(device)
     }
 
+    /// Open a communication reference on the klipper host library at `path`
+    /// **for a device behind a bridge port**, and do **not** attach it.
+    ///
+    /// This is [`HostDevice::load_mux`]'s first half only: the library is given
+    /// `mux`'s identity before klipper comes up, and the reference is addressed
+    /// by `mcu_id` (`MuxRoute::for_id`) — but there is no attach, because there
+    /// is no handshake a device behind a port could answer. The bridge's own
+    /// device is what `load_mux` names over the admin channel; a device behind
+    /// one of its ports has no admin channel of its own, so the library names
+    /// nothing and waits for nothing, and this load cannot time out.
+    ///
+    /// The route is the bridge's `SET_PORT_NODEID`, and **the caller sends it**
+    /// — over the bridge's own handle, with
+    /// [`HostDevice::send_set_port_node_id`] — because only the caller knows
+    /// which port the device sits behind. Until it does, `mcu_id` names no port
+    /// and units sent under it go nowhere, silently.
+    ///
+    /// `mux.named` is not used: only the bridge's own device is named in a
+    /// `SET_KLIPPER_NODEID` unit, and that is `load_mux`'s job.
+    ///
+    /// # Errors
+    /// Returns [`InterfaceError`] for the reasons [`HostDevice::load`] does —
+    /// including a library already live on `path` in another mode or with
+    /// another identity — and when `mcu_id` is outside the addressable range.
+    pub fn load_downstream(
+        path: impl AsRef<Path>,
+        mux: HostMux,
+        mcu_id: u32,
+    ) -> Result<Arc<HostDevice>, InterfaceError> {
+        Ok(Arc::new(Self::open(
+            path.as_ref(),
+            OutputMode::Mux,
+            Some(mux.identity),
+            Some(mcu_id),
+        )?))
+    }
+
     /// Wrap the live library on `path` as a reference in `mode`.
     fn open(
         path: &Path,
@@ -724,6 +761,46 @@ impl HostDevice {
             )));
         }
         Ok(())
+    }
+
+    /// Send one admin-channel unit to the bridge: the [`ADMIN_LISTEN`] header,
+    /// then `payload` — one `KXID` frame — handed to the library's input as one
+    /// whole unit.
+    ///
+    /// The admin channel belongs to the bridge: it is how a device with no admin
+    /// channel of its own is named behind a port. The unit carries this
+    /// reference's own mux id nowhere — the header is the fixed admin id, so
+    /// unlike the frame path ([`Device::send`]) this deliberately does **not**
+    /// prefix the reference's own arb.
+    ///
+    /// # Errors
+    /// [`InterfaceError::ConnectionLost`] when this reference has been shut
+    /// down, [`InterfaceError::SendError`] when the library refuses the bytes.
+    pub fn send_admin(&self, payload: &[u8]) -> Result<(), InterfaceError> {
+        let mut unit = encode_header(ADMIN_LISTEN);
+        unit.extend_from_slice(payload);
+        self.write_raw(&unit)
+    }
+
+    /// Tell the bridge which id the device behind port `index` answers to:
+    /// [`set_port_node_id`]'s unit, byte for byte, on the admin channel.
+    ///
+    /// The bridge builds its port table from it and consumes it — no receipt,
+    /// nothing sent downstream, idempotent — so this is how a downstream
+    /// reference's route is established (see [`HostDevice::load_downstream`]).
+    /// The caller decides **when**; this only spells the command and writes it.
+    ///
+    /// # Errors
+    /// The same as [`HostDevice::send_admin`].
+    pub fn send_set_port_node_id(
+        &self,
+        index: u8,
+        mcu_id: u8,
+        flags: u8,
+    ) -> Result<(), InterfaceError> {
+        // The builder spells the whole admin unit (header + frame); `send_admin`
+        // writes the header, so only the frame behind it goes to it.
+        self.send_admin(&set_port_node_id(index, mcu_id, flags)[HEADER_BYTES..])
     }
 
     /// Attach a muxed reference: name the device `named`, hand it `mcu_id`, and
@@ -1947,6 +2024,126 @@ mod host_tests {
 
         // Same invariant as the device-half test: leave this path unloaded for
         // whoever takes it next (see `wait_for_unload_blocking`).
+        drop(device);
+        wait_for_unload_blocking(&mux_library_path());
+    }
+
+    /// A downstream reference — a mux id loaded with **no** attach — is the
+    /// host's channel to a device behind a bridge port, over a real library and
+    /// a real tty.
+    ///
+    /// Loading it names nothing and waits for nothing (the pty never answers
+    /// the admin channel, so an attach could not run), and the route is the
+    /// bridge's `SET_PORT_NODEID`, sent by the caller over the new admin entry.
+    /// Once the route is in: a frame sent goes down port 0 with its header
+    /// stripped, a raw frame from the port comes up headed with the port's reply
+    /// id, and an id no port owns reaches no port.
+    #[test]
+    fn test_a_downstream_reference_routes_through_the_bridge_port() {
+        let _serial = HOST_LIBRARY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+
+        // The bridge opens its port while klipper comes up, so the tty has to
+        // exist first — the same setup the port-command probe uses.
+        let pty = Pty::new();
+        let bridge_path = klipperx_test_support::klipper_host_mux_serial_path();
+        let _ = std::fs::remove_file(&bridge_path);
+        std::os::unix::fs::symlink(&pty.path, &bridge_path).unwrap_or_else(|e| {
+            panic!(
+                "failed to link {} to {}: {e}",
+                bridge_path.display(),
+                pty.path.display()
+            )
+        });
+
+        let identity = [0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc];
+        let downstream_id = 7u32;
+        let mut device = HostDevice::load_downstream(
+            mux_library_path(),
+            HostMux {
+                identity,
+                named: identity,
+            },
+            downstream_id,
+        )
+        .expect("a downstream reference loads without a handshake");
+
+        let mut pending = Vec::new();
+        let window = Duration::from_secs(5);
+        // A short window for the negative steps, as in the port-command probe.
+        let quiet = Duration::from_millis(500);
+
+        // Naming the device behind port 0 is the bridge's business: nothing goes
+        // down the port and no receipt comes back.
+        device
+            .send_set_port_node_id(0, downstream_id as u8, 0)
+            .expect("SET_PORT_NODEID goes in");
+        assert!(
+            read_pty(&pty.master, 1, quiet).is_empty(),
+            "SET_PORT_NODEID must not be forwarded to the port"
+        );
+        assert!(
+            read_unit(
+                Arc::get_mut(&mut device).expect("the test holds the only reference"),
+                &mut pending,
+                quiet,
+            )
+            .is_none(),
+            "SET_PORT_NODEID carries no receipt"
+        );
+
+        // Host → port: the reference's frame goes down port 0 with its header
+        // stripped — the legacy wire format a device with no admin channel of
+        // its own speaks.
+        let down_frame = Frame::new(MESSAGE_DEST, b"downstream".to_vec());
+        device.send(&down_frame).expect("the frame goes down");
+        let down = read_pty(&pty.master, down_frame.raw_bytes().len(), window);
+        assert_eq!(
+            down,
+            down_frame.raw_bytes(),
+            "a legacy port strips the mux header and sends the frame on unchanged"
+        );
+
+        // Port → host: a raw frame from the device comes up headed with the
+        // reply id of the port's node id (7).
+        let up_frame = Frame::new(MESSAGE_DEST, b"upstream".to_vec());
+        (&pty.master)
+            .write_all(&up_frame.raw_bytes())
+            .expect("the raw frame goes into the port");
+        let up = read_unit(
+            Arc::get_mut(&mut device).expect("the test holds the only reference"),
+            &mut pending,
+            window,
+        )
+        .expect("the frame comes up headed");
+        let (arb, frame) = unit_parts(&up);
+        assert_eq!(
+            arb,
+            assign::reply_arb_id(downstream_id).expect("id 7"),
+            "a raw frame is headed with the reply id of the port's node id"
+        );
+        assert_eq!(
+            frame,
+            up_frame.raw_bytes().as_slice(),
+            "the frame body travels unchanged"
+        );
+
+        // An id no port owns (9) goes nowhere: without a SET_PORT_NODEID the
+        // reference's id is not routed either, which is what makes the admin
+        // entry above load-bearing.
+        let mut unmapped = encode_header(assign::arb_id(9).expect("id 9"));
+        unmapped.extend_from_slice(&Frame::new(MESSAGE_DEST, b"junk".to_vec()).raw_bytes());
+        Arc::get_mut(&mut device)
+            .expect("the test holds the only reference")
+            .write(&unmapped)
+            .expect("the id 9 unit goes in");
+        assert!(
+            read_pty(&pty.master, 1, quiet).is_empty(),
+            "an id no port owns must not reach the port"
+        );
+
+        // Same invariant as the other library tests: leave this path unloaded.
         drop(device);
         wait_for_unload_blocking(&mux_library_path());
     }

@@ -1321,6 +1321,50 @@ pub fn attach(
     Err(InterfaceError::Timeout)
 }
 
+/// Register a **downstream** device on the shared serial port at `path`,
+/// **without a handshake**.
+///
+/// The port is the same per-path singleton [`attach`] uses, and the device gets
+/// its own slot (the registration [`attach`] makes before it handshakes), so
+/// units headed with `mcu_id`'s listener or answer id reach it. Nothing is
+/// written and no answer is awaited, though: a device behind a bridge port has
+/// no admin channel of its own, so there is no assignment to run. The route to
+/// it is the bridge's `SET_PORT_NODEID` ([`set_port_node_id`]), and **the
+/// caller sends that first** — with [`SharedSerialHandle::send_set_port_node_id`]
+/// on the bridge's own handle — because only the caller knows which port the
+/// device sits behind. Until it does, `mcu_id` names no port and its units go
+/// nowhere; a missing route shows up as a silent port, never as an error here.
+///
+/// # Errors
+/// [`InterfaceError::Other`] for an id outside `1..=MAX_MCU_ID` — the same
+/// rejection [`attach`] makes — and for a port that cannot be opened;
+/// [`InterfaceError::ConnectionLost`] when the port is already stopped.
+pub fn attach_downstream(
+    path: impl AsRef<Path>,
+    baud: u32,
+    mcu_id: u32,
+) -> Result<Arc<SharedSerialHandle>, InterfaceError> {
+    if assign::arb_id(mcu_id).is_none() {
+        return Err(InterfaceError::Other(format!(
+            "mcu id {mcu_id} is outside 1..={MAX_MCU_ID}"
+        )));
+    }
+
+    let port = port_for(path.as_ref(), baud)?;
+    if port.stopped.load(Ordering::SeqCst) {
+        return Err(InterfaceError::ConnectionLost);
+    }
+
+    let slot = Arc::new(McuSlot::new());
+    port.slots.lock().unwrap().insert(mcu_id, Arc::clone(&slot));
+    Ok(Arc::new(SharedSerialHandle {
+        port,
+        mcu_id,
+        slot,
+        stopped: AtomicBool::new(false),
+    }))
+}
+
 /// Wait up to `timeout` for the reader to record an assignment answer.
 fn wait_for_ack(slot: &McuSlot, timeout: Duration) -> Option<u32> {
     let deadline = Instant::now() + timeout;
@@ -1590,6 +1634,66 @@ fn route_ack(port: &SharedSerialPort, mcu_id: u32) {
     }
 }
 
+impl SharedSerialHandle {
+    /// Write one unit on this port under an arbitrary arbitration id: the
+    /// checked two-byte header for `arb` ([`encode_header`]), then `payload`
+    /// exactly as given.
+    ///
+    /// The whole unit goes out under the port's write lock, so no other writer
+    /// can split its header from its frame. This is the entry the admin command
+    /// below is built on; an `arb` in the header's reserved band has no address
+    /// and panics in [`encode_header`].
+    ///
+    /// # Errors
+    /// [`InterfaceError::ConnectionLost`] when this handle or the port has been
+    /// shut down, [`InterfaceError::SendError`] when the write fails.
+    pub fn send_unit(&self, arb: u32, payload: &[u8]) -> Result<(), InterfaceError> {
+        if self.stopped.load(Ordering::SeqCst) || self.port.stopped.load(Ordering::SeqCst) {
+            return Err(InterfaceError::ConnectionLost);
+        }
+        let mut unit = encode_header(arb);
+        unit.extend_from_slice(payload);
+        self.port.write_unit(&unit)
+    }
+
+    /// Send one admin-channel unit to the bridge on this port: the
+    /// [`ADMIN_LISTEN`] header, then `payload` — one `KXID` frame — exactly as
+    /// given.
+    ///
+    /// The admin channel belongs to the bridge: this is how a device that has
+    /// no admin channel of its own is named behind a port ([`set_port_node_id`]
+    /// and the reset family travel this way). The unit names this handle's own
+    /// `mcu_id` nowhere — the header is the fixed admin id, not the device's.
+    ///
+    /// # Errors
+    /// The same as [`SharedSerialHandle::send_unit`].
+    pub fn send_admin(&self, payload: &[u8]) -> Result<(), InterfaceError> {
+        self.send_unit(ADMIN_LISTEN, payload)
+    }
+
+    /// Tell the bridge which id the device behind port `index` answers to:
+    /// [`set_port_node_id`]'s unit, byte for byte, on the admin channel.
+    ///
+    /// The bridge builds its port table from it and consumes it — no receipt,
+    /// nothing sent downstream, idempotent (`mux.h` in the firmware's serial
+    /// mux) — so this is how a downstream device's route is established (see
+    /// [`attach_downstream`]). The caller decides **when**; this only spells the
+    /// command and writes it.
+    ///
+    /// # Errors
+    /// The same as [`SharedSerialHandle::send_unit`].
+    pub fn send_set_port_node_id(
+        &self,
+        index: u8,
+        mcu_id: u8,
+        flags: u8,
+    ) -> Result<(), InterfaceError> {
+        // The builder spells the whole admin unit (header + frame); `send_admin`
+        // writes the header, so only the frame behind it goes to it.
+        self.send_admin(&set_port_node_id(index, mcu_id, flags)[HEADER_BYTES..])
+    }
+}
+
 impl std::fmt::Debug for SharedSerialHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SharedSerialHandle")
@@ -1659,6 +1763,23 @@ mod mux_tests {
     fn master_write(master: &File, bytes: &[u8]) {
         let mut master = master;
         master.write_all(bytes).expect("pty master write");
+    }
+
+    /// Whether the pty master has a byte waiting within `window` — how a test
+    /// proves a step wrote **nothing** without blocking on a silent port.
+    fn readable_within(master: &File, window: Duration) -> bool {
+        let mut poll = libc::pollfd {
+            fd: std::os::fd::AsRawFd::as_raw_fd(master),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let rc = unsafe { libc::poll(&mut poll, 1, window.as_millis() as i32) };
+        assert!(
+            rc >= 0,
+            "polling the pty master: {}",
+            std::io::Error::last_os_error()
+        );
+        rc > 0
     }
 
     /// Attach `mcu_id`, playing the device side of the handshake from the test.
@@ -1788,6 +1909,126 @@ mod mux_tests {
         // attach on the same path completes a handshake.
         let handle = attach_with_reply(&pty, 4);
         assert!(handle.send(&Frame::new(1, vec![0xab])).is_ok());
+    }
+
+    /// A downstream device attaches with **no handshake at all**: the peer never
+    /// answers — a handshake on the same port times out — yet the downstream
+    /// attach hands back a live handle and writes nothing. From then on the
+    /// handle is an ordinary mux slot: a frame sent goes out headed with its
+    /// id's listener header, a unit headed with either the listener or the reply
+    /// id comes back as the bare frame, and an admin unit goes out to the bridge
+    /// byte for byte.
+    #[test]
+    fn attach_downstream_does_not_handshake_and_round_trips_frames() {
+        let pty = Pty::new();
+        let mcu_id = 4;
+
+        // An id the header cannot carry is refused the way `attach` refuses it.
+        let err = attach_downstream(&pty.path, DEFAULT_BAUD, 0).unwrap_err();
+        assert!(
+            matches!(err, InterfaceError::Other(_)),
+            "id 0 is outside the addressable range, got {err:?}"
+        );
+
+        // A port whose peer never answers: the handshake attach cannot succeed.
+        let err = attach(
+            &pty.path,
+            DEFAULT_BAUD,
+            mcu_id,
+            Duration::from_millis(50),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            InterfaceError::Timeout,
+            "the peer never answers the assignment"
+        );
+        // Drain the attempts the failed handshake wrote, so the byte assertions
+        // below start from an empty port.
+        let request = assignment_request(mcu_id).expect("a valid mcu id");
+        let attempts = read_n(&pty.master, request.len() * ASSIGN_ATTACH_ATTEMPTS as usize);
+        for chunk in attempts.chunks(request.len()) {
+            assert_eq!(chunk, request.as_slice(), "one retry");
+        }
+
+        // The downstream attach succeeds where the handshake could not ...
+        let handle = attach_downstream(&pty.path, DEFAULT_BAUD, mcu_id)
+            .expect("a downstream attach does not handshake");
+        // ... and it wrote nothing: there is no admin channel on this side, so
+        // there is nothing to ask and no answer to wait for.
+        assert!(
+            !readable_within(&pty.master, Duration::from_millis(100)),
+            "attach_downstream must write nothing — it has no handshake to run"
+        );
+
+        // Host → port: the frame is prefixed with the id's listener header.
+        let frame = Frame::new(3, b"down".to_vec());
+        handle.send(&frame).expect("the handle writes");
+        let expected = {
+            let mut unit = encode_header(assign::arb_id(mcu_id).expect("a valid mcu id"));
+            unit.extend_from_slice(&frame.raw_bytes());
+            unit
+        };
+        assert_eq!(read_n(&pty.master, expected.len()), expected);
+
+        // Port → host: a unit headed with the listener id and one headed with
+        // the reply id both decode to this slot.
+        for arb in [
+            assign::arb_id(mcu_id).expect("a valid mcu id"),
+            assign::reply_arb_id(mcu_id).expect("a valid mcu id"),
+        ] {
+            let mut unit = encode_header(arb);
+            unit.extend_from_slice(&Frame::encode(5, b"up"));
+            master_write(&pty.master, &unit);
+            assert_eq!(handle.receive(), Some(Frame::new(5, b"up".to_vec())));
+        }
+
+        // The admin unit for the bridge goes out exactly as the builder spells
+        // it: the ADMIN_LISTEN header, the KXID frame and its trailing SYNC.
+        let command = set_port_node_id(0, mcu_id as u8, MUX_PORT_UNITS);
+        assert_eq!(*command.last().expect("a whole unit"), MESSAGE_SYNC);
+        handle
+            .send_set_port_node_id(0, mcu_id as u8, MUX_PORT_UNITS)
+            .expect("the admin unit goes out");
+        assert_eq!(read_n(&pty.master, command.len()), command);
+    }
+
+    /// A downstream device joins the **same** port singleton an attached MCU
+    /// opened: one reader routes both slots, so a unit for either id reaches
+    /// its own handle.
+    #[test]
+    fn attach_downstream_shares_the_port_with_an_attached_mcu() {
+        let pty = Pty::new();
+        let upstream = attach_with_reply(&pty, 4);
+        let downstream = attach_downstream(&pty.path, DEFAULT_BAUD, 5)
+            .expect("a downstream attach on a live port");
+
+        // The one reader routes them apart: each unit reaches its own handle.
+        master_write(&pty.master, &device_unit(5, &Frame::encode(2, b"five")));
+        master_write(&pty.master, &device_unit(4, &Frame::encode(3, b"four")));
+        assert_eq!(downstream.receive(), Some(Frame::new(2, b"five".to_vec())));
+        assert_eq!(upstream.receive(), Some(Frame::new(3, b"four".to_vec())));
+
+        // And both write through that one port, each under its own header.
+        let frame_a = Frame::new(6, b"aa".to_vec());
+        let frame_b = Frame::new(7, b"bb".to_vec());
+        upstream.send(&frame_a).expect("the attached MCU writes");
+        downstream
+            .send(&frame_b)
+            .expect("the downstream device writes");
+        let wire = read_n(
+            &pty.master,
+            2 + frame_a.raw_bytes().len() + 2 + frame_b.raw_bytes().len(),
+        );
+        let mut units = split_units(&wire);
+        units.sort_by_key(|(arb, _)| *arb);
+        let mut expected = vec![
+            (assign::arb_id(4).unwrap(), frame_a),
+            (assign::arb_id(5).unwrap(), frame_b),
+        ];
+        expected.sort_by_key(|(arb, _)| *arb);
+        assert_eq!(units, expected);
     }
 
     #[test]

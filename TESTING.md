@@ -117,6 +117,32 @@
 | `[output_pin]` 数字/PWM、`SET_PIN` | ✅ 真板端到端（F3/F4 索引） |
 | `temperature_mcu`（MCU 内置温度） | ✅ STM32F103 `[temperature_sensor mcu_temp] sensor_type: temperature_mcu` 读数约 **35.1 °C**（校准 `base=357.558 / slope=-767.442`，`<mcu>:ADC_TEMPERATURE`） |
 
+## M1/M2（桥下游端口 + admin 复位）——**统一真机测试（后移）**
+
+**测试策略（2026-10-14 拍板）**：M1（桥下游端口模块化）与 M2（admin 流程复位）的**真机/外设项
+一律后移**——先让全部代码路径在软件侧（pty + 回环夹具 + 假固件/裸帧库）说得通、单测与集成测
+全绿，等 **M1+M2 全部落地**后再把下面这几项**一次跑完**。期间不因缺真机而停下任何一期的开发，
+也不把「未上真板」当成未完成（与本文开头「不阻塞 `TODO.md` 开发任务」同一条约定）。
+
+- [ ] **M1-1 桥下游端口 attach（legacy）** —— 一块板做桥（固件开 `CONFIG_BRIDGE`），其 uart 端口接
+  一台**没有 mux 的旧固件**板（无 admin）。真实测试：宿主按 `[uart_device]` + 无 `uuid:` 的 `[mcu]`
+  连上，桥收到 `SET_PORT_NODEID(index, id, flags=0)` 后把该 id 的数据单元剥头下发、把下游原始帧
+  加上应答头上行。判定：identify + `get_clock` 跑通，下游板全程不参与 admin，日志无 `!!`。
+- [ ] **M1-2 桥下游端口 attach（命名设备）** —— 端口上那台**能答 admin** 的设备带 `uuid:`：主机对桥
+  发 `SET_PORT_NODEID(index, id, MUX_PORT_UNITS)`，对设备发 `SET_KLIPPER_NODEID` + 重确认握手，
+  之后按整单元原样转发。判定：同上跑通，且能与 M1-1 共存于同一桥（一条端口一种形态）。
+- [ ] **M1-3 端口 `index` 与 identify 端口表对账** —— 桥报的 `BRIDGE_PORT_COUNT/_NAME/_TYPE/_PATH`
+  与配置里的 `(桥, oid)` 对上、`index` 与线上命令一致。判定：故意写错 oid/类型时，主机在上
+  identify 后报出点名错误，而不是静默连错设备。
+- [ ] **M2-1 `RESET_PORT` 的电气极性与保持** —— 桥对某端口断言 **DTR\|RTS 250 ms** 能否真把下游
+  板复位（取决于板子是 DTR 还是 RTS 敏感、高电平还是低电平有效）。判定：下游确实重启并重新
+  identify；同时确认**桥自己**没被按在复位上（连续两条 `RESET_PORT` 也不锁存）。
+- [ ] **M2-2 `RESET_DEVICE` 经桥转发** —— 下游是**能答 admin** 的设备，桥只把 `[0x02][index]` 转发给
+  它（不扇出、不本地执行）。判定：只有该端口那台重启，其它端口与桥不受影响。
+- [ ] **M2-3 复位后的确认路径（无回执）** —— 三条端口级命令都没有回执，主机如何知道复位已发生
+  （重握手 / 等 `NEED_NODEID` / 重新 identify）。判定：`FIRMWARE_RESTART` 后会话确实重建，不出现
+  「命令发了但设备没重启」的静默假成功；旧固件（不能答 admin）仍回退到 `command`。
+
 ## 范围外的真板项（不属最小打印任务，未排期）
 
 - **双板时序/漂移**：第二块板（`[mcu zboard]`）跨 MCU 停轴、小时级运行的实际晶振漂移与

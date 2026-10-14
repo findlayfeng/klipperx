@@ -363,7 +363,7 @@ endstop 资源（`mcu/resource/endstop.rs`，含 `minclock` 门控与 `home_wait
 `i2c`/`spi` 复用已有节类型），子设备引用**端口节名**；`[bridge]`/`[bridge_port]`/`bridge_admin`
 都不要（桥与端口从引用推算，legacy 从「无 `uuid:` + uart 端口」推算）；**归属由主机经桥自己的
 admin 通道**用端口级命令 `SET_PORT_NODEID(index, id)` 告知桥，**下游设备完全不参与**——这就是
-"与没有 admin 的设备共存"的答案。**依赖**：无（P1 可先做）；**状态**：✅ P1 配置面 + P2 固件已落地（2026-10-13，见笔记 §6）；余项 = P3 attach 端到端、P4 判定与传输正交、P5 CAN 上游、P6 多站串口（RS-485，后置）。
+"与没有 admin 的设备共存"的答案。**依赖**：无（P1 可先做）；**状态**：✅ P1 配置面 + P2 固件已落地（2026-10-13，见笔记 §6）；余项 = P3 attach 端到端、P4 判定与传输正交、P5 CAN 上游、P6 多站串口（RS-485，后置）。**测试策略（2026-10-14）**：真机/外设项后移——先让全部代码在软件侧说得通，等 M1+M2 落地后统一跑一次真机，清单见 [`TESTING.md`](TESTING.md) 的「M1/M2」一节。
 
 ### M2 通过 **admin 流程复位固件**（per-device reset）——已并入 M1
 
@@ -372,6 +372,7 @@ admin 通道**用端口级命令 `SET_PORT_NODEID(index, id)` 告知桥，**下�
 `KXID` 帧形与端口 `index`），主机侧 `restart_method` 接入落 **§5 P3**。✅ 固件命令族已落地
 （2026-10-13，见笔记 §6）：`RESET_DEVICE 0x02 [0x02][index]` 只转发到该口、`RESET_PORT 0x04
 [0x04][index]` 由桥做 DTR/RTS 线脉冲（poll 状态机非阻塞），均无回执；复位层次仍留 P3（§5.6d）。
+真机项（复位极性与保持、双板接线）**已按统一策略后移**，见上面 M1 段的测试策略。
 
 范围一句话：今天的复位只有线级手段（`arduino` 的 DTR、`cheetah` 的 RTS、`rpi_usb` 切电），在共享/mux
 路径上会打断整条线因而被配置层强制成 `command`，而 `command` 不是真复位；目标是让"点名复位某台设备"

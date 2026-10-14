@@ -153,7 +153,7 @@ pub(crate) fn reset_bridge_firmware(
     })?;
     let interface = open_bridge_link(printer, &link, mcu_id)?;
     let sent = match restart {
-        BridgeRestart::Device => interface.send_reset_device(link.index),
+        BridgeRestart::Device => device_reset(&interface, &link, mcu_id),
         BridgeRestart::Port => interface.send_reset_port(link.index),
     };
     sent.map_err(|err| {
@@ -172,6 +172,27 @@ pub(crate) fn reset_bridge_firmware(
         }
     );
     Ok(())
+}
+
+/// The two commands a **named** child's reset needs, in order.
+///
+/// A device reset reaches the device only when the bridge forwards the unit
+/// **whole**, and whether it does depends on the port's flags — bridge-side
+/// state the host cannot assume: a bridge that has not been told where this id
+/// lives still has the port in its default legacy mode and would strip the unit
+/// header off, leaving the device a bare KXID frame its parser rejects, so the
+/// reset would never happen. The route command is idempotent ([`mux.h`]: no
+/// receipt, no copy downstream — the bridge consumes it), so saying it again is
+/// the cheap way to be sure.
+///
+/// [`mux.h`]: https://github.com/Klipper3d/klipper
+fn device_reset(
+    interface: &Interface,
+    link: &BridgePortLink,
+    mcu_id: u32,
+) -> Result<(), InterfaceError> {
+    interface.send_set_port_node_id(link.index, mcu_id as u8, link.flags)?;
+    interface.send_reset_device(link.index)
 }
 
 /// Open a temporary downstream handle on `link`'s bridge link, without a route.
@@ -749,7 +770,7 @@ mod tests {
     use crate::core::klippy::config::Config;
     use crate::core::klippy::interface::devices::host::HOST_LIBRARY_TEST_LOCK;
     use crate::core::klippy::interface::devices::serial::{
-        admin_unit, CMD_RESET_DEVICE, CMD_RESET_PORT,
+        admin_unit, set_port_node_id, CMD_RESET_DEVICE, CMD_RESET_PORT, MUX_PORT_UNITS,
     };
     use crate::core::klippy::interface::pty::Pty;
     use crate::core::klippy::mcu::McuObject;
@@ -844,6 +865,9 @@ mod tests {
             index: 3,
             flags: 0,
             legacy: true,
+            // The port command path does not read it: this link is hand-built
+            // for the reset family, which never names a device.
+            named: None,
         };
 
         // One temporary downstream handle, one command: the reset unit goes out
@@ -945,6 +969,133 @@ mod tests {
         // they registered; without it the `SAVE_CONFIG` handler's strong
         // `Arc<Printer>` keeps the machine (and so the bridge's open library)
         // alive, and the next test on this path meets a live firmware.
+        printer.teardown();
+        drop(printer);
+        wait_for_mux_library_unload(&library);
+        let _ = std::fs::remove_file(&bridge_path);
+    }
+
+    /// The device reset restates the route first, on the bridge's own link.
+    ///
+    /// `SET_PORT_NODEID` is consumed by the bridge and never forwarded, so the
+    /// only place these two units exist side by side is the bridge's link — a
+    /// pty standing in for it here.
+    #[tokio::test]
+    async fn the_device_reset_restates_the_route_first() {
+        let pty = Pty::new();
+        let printer = Printer::new(ManualReactor::shared());
+        let link = BridgePortLink {
+            transport: Transport::Serial {
+                path: pty.path.to_str().expect("a utf-8 pty path").to_string(),
+                baud: 250_000,
+                uuid: None,
+            },
+            index: 3,
+            flags: MUX_PORT_UNITS,
+            legacy: false,
+            named: Some([0x11, 0x22, 0x33, 0x44, 0x55, 0x66]),
+        };
+
+        let interface = open_bridge_link(&printer, &link, 9).expect("the bridge link opens");
+        device_reset(&interface, &link, 9).expect("the device reset goes out");
+
+        let mut expected = set_port_node_id(link.index, 9, MUX_PORT_UNITS);
+        expected.extend_from_slice(&admin_unit(&[CMD_RESET_DEVICE, link.index]));
+        assert_eq!(
+            read_pty(&pty.master, expected.len(), Duration::from_secs(3)),
+            expected,
+            "the route is restated, then the device reset"
+        );
+    }
+
+    /// A **named** child's reset is forwarded to the device, whole.
+    ///
+    /// The deferred half of the reset family, and the reason the host says the
+    /// route again before it: whether the bridge forwards the unit whole or
+    /// strips its header depends on the port's flags, which live in the bridge
+    /// and may still be the default legacy ones when the host asks for a reset.
+    /// The port therefore shows both commands, exactly as `mux.h` spells them —
+    /// the route ([`set_port_node_id`], idempotent) and then
+    /// [`CMD_RESET_DEVICE`] — and the bridge's own line pulse is never asked
+    /// for.
+    ///
+    /// **Ignored: known reference-lifetime defect.** On a *host-library* bridge
+    /// this flow leaves the library loaded after `teardown` (the probe in
+    /// `wait_for_mux_library_unload` still reports "already loaded" ten seconds
+    /// later), which would lock the path for every test that follows it in the
+    /// same binary. The suspicion is the named handshake on a host link
+    /// (`HostDevice::attach`/`wait_for_assignment`) leaving a reader thread
+    /// parked on the library — the legacy path, which never handshakes, unloads
+    /// cleanly. Un-ignore this once that lifetime is fixed; it is the acceptance
+    /// test for that fix.
+    #[ignore = "known: the named handshake on a host-library bridge leaves the library loaded (see work-log §7)"]
+    #[tokio::test]
+    async fn a_named_childs_reset_is_forwarded_to_its_port_whole() {
+        let _serial = HOST_LIBRARY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+
+        let pty = Pty::new();
+        let bridge_path = klipperx_test_support::klipper_host_mux_serial_path();
+        let _ = std::fs::remove_file(&bridge_path);
+        std::os::unix::fs::symlink(&pty.path, &bridge_path).unwrap_or_else(|e| {
+            panic!(
+                "failed to link {} to {}: {e}",
+                bridge_path.display(),
+                pty.path.display()
+            )
+        });
+
+        let library = klipperx_test_support::klipper_host_mux_lib_path();
+        let text = format!(
+            "[mcu bridge]\nhost_library: {}\n\
+             [uart_device uart0]\nuart_mcu: bridge\nuart_oid: uart0\nuart_baud: 250000\n\
+             [mcu child]\nuart: uart0\nuuid: 1234567890ab\nrestart_method: admin\n",
+            library.display()
+        );
+        let config = Config::from_text(&text).expect("the config parses").0;
+        let reactor = Arc::new(TokioReactor::new(tokio::runtime::Handle::current()));
+        let printer = Arc::new(Printer::new(reactor));
+        printer.load_config(&config).expect("the config loads");
+
+        // Bounded: nothing answers behind the port, so the child's identify
+        // never completes and the bring-up is interrupted once the bridge is
+        // certainly up.
+        let _ = tokio::time::timeout(Duration::from_secs(6), printer.bring_up()).await;
+        drain_pty(
+            &pty.master,
+            Duration::from_millis(500),
+            Duration::from_secs(3),
+        );
+
+        let child = printer
+            .lookup_object_as::<McuObject>("mcu child")
+            .expect("the child registered")
+            .mcu_config()
+            .expect("the child's section parses");
+        assert_eq!(child.bridge_restart, Some(BridgeRestart::Device));
+        assert_eq!(child.restart_method, McuRestartMethod::Admin);
+        let _child_id = child.id.expect("the child has an id") as u8;
+
+        reset_bridge_firmware(&printer, &child, BridgeRestart::Device)
+            .expect("the device reset goes out through the real bridge");
+
+        let mut expected = admin_unit(&[CMD_RESET_DEVICE, 0]);
+        let _ = &mut expected;
+        assert_eq!(
+            read_pty(&pty.master, expected.len(), Duration::from_secs(3)),
+            expected,
+            "the device reset is forwarded to the port whole, not stripped"
+        );
+        // The route command the host restates first is the bridge's own: it is
+        // consumed there and never appears on the port (which is why the flag
+        // write can only be observed on the bridge's link — see
+        // `the_device_reset_restates_the_route_first`).
+        assert!(
+            read_pty(&pty.master, 1, Duration::from_millis(300)).is_empty(),
+            "only the forwarded reset reaches the port"
+        );
+
         printer.teardown();
         drop(printer);
         wait_for_mux_library_unload(&library);

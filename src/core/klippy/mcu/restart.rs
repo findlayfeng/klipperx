@@ -34,14 +34,12 @@ use tokio::time::Duration;
 use tracing::{debug, info, warn};
 
 use crate::core::klippy::config::mcu::{BridgeRestart, McuConfig, Transport};
-use crate::core::klippy::error::{ConfigError, KlippyError};
-use crate::core::klippy::interface::devices::host::HostDevice;
-use crate::core::klippy::interface::devices::serial::{self, ModemLines};
+use crate::core::klippy::error::KlippyError;
+use crate::core::klippy::interface::devices::serial::ModemLines;
 use crate::core::klippy::interface::error::InterfaceError;
 use crate::core::klippy::interface::usb;
 use crate::core::klippy::interface::Interface;
 use crate::core::klippy::mcu::bridge_attach::{self, BridgePortLink};
-use crate::core::klippy::mcu::host_libraries::{HostLibraries, HOST_LIBRARIES_OBJECT};
 use crate::core::klippy::mcu::McuRestartMethod;
 use crate::core::klippy::printer::Printer;
 
@@ -199,62 +197,25 @@ fn device_reset(
 ///
 /// This is the bridge's own transport reopened for one device — a second slot on
 /// the shared serial port, or a second reference on the live host library — and
-/// it is only here to reach the bridge's **admin** channel
-/// ([`serial::attach_downstream`], [`HostDevice::load_downstream`]). The route
-/// the attach pass sends (`SET_PORT_NODEID`) is deliberately left out: the
-/// device is about to reboot, and the reference that will carry it is opened,
-/// and routed, when it connects. Dropping this handle leaves both link kinds in
-/// place.
+/// it is only here to reach the bridge's **admin** channel. The route the attach
+/// pass sends (`SET_PORT_NODEID`) is deliberately left out: the device is about
+/// to reboot, and the reference that will carry it is opened, and routed, when
+/// it connects. Dropping this handle leaves both link kinds in place.
+///
+/// The opening itself is [`bridge_attach::open_link`]'s, so a link that cannot
+/// carry a downstream device (a CAN upstream, or a transport with no mux) is
+/// refused here with the attach pass's own words.
 ///
 /// # Errors
 /// [`KlippyError::Config`] for a bridge link that cannot carry a downstream
-/// device (a CAN upstream, or a path with no mux identity);
+/// device (a CAN upstream, or a transport with no mux);
 /// [`KlippyError::Connection`] for a failed open.
 fn open_bridge_link(
     printer: &Printer,
     link: &BridgePortLink,
     mcu_id: u32,
 ) -> Result<Interface, KlippyError> {
-    match &link.transport {
-        Transport::Serial { path, baud, .. } => {
-            let handle = serial::attach_downstream(path, *baud, mcu_id).map_err(|err| {
-                KlippyError::Connection(format!("serial {path}: downstream attach failed: {err}"))
-            })?;
-            Ok(Interface::shared_serial(handle))
-        }
-        Transport::Host { library, .. } => {
-            // The reference has to carry the path's own mux identity: the
-            // library is already live on it under that identity, and a second
-            // one would be refused (or would address another board).
-            let libraries = printer
-                .lookup_object_as::<HostLibraries>(HOST_LIBRARIES_OBJECT)
-                .ok_or_else(|| {
-                    config_error(format!(
-                        "host_library {library}: a downstream device needs the path grouping, \
-                         which is not loaded"
-                    ))
-                })?;
-            let identity = libraries.identity(library).ok_or_else(|| {
-                config_error(format!(
-                    "host_library {library}: no [mcu] names this path, so it has no mux identity"
-                ))
-            })?;
-            let device = HostDevice::load_downstream(library, identity, mcu_id).map_err(|err| {
-                KlippyError::Connection(format!(
-                    "host_library {library}: downstream attach failed: {err}"
-                ))
-            })?;
-            Ok(Interface::from_host(device))
-        }
-        other => Err(config_error(format!(
-            "a bridge on {other:?} cannot carry a downstream device"
-        ))),
-    }
-}
-
-/// Wrap `message` as the config error the bridge-resolution paths report.
-fn config_error(message: String) -> KlippyError {
-    KlippyError::Config(ConfigError::new(message))
+    bridge_attach::open_link(printer, link, mcu_id)
 }
 
 /// Whether an `rpi_usb` board has to be brought up with a firmware restart
@@ -760,7 +721,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     use crate::core::klippy::config::Config;
-    use crate::core::klippy::interface::devices::host::HOST_LIBRARY_TEST_LOCK;
+    use crate::core::klippy::interface::devices::host::{HostDevice, HOST_LIBRARY_TEST_LOCK};
     use crate::core::klippy::interface::devices::serial::{
         admin_unit, set_port_node_id, CMD_RESET_DEVICE, CMD_RESET_PORT, MUX_PORT_UNITS,
     };
@@ -856,7 +817,6 @@ mod tests {
             },
             index: 3,
             flags: 0,
-            legacy: true,
             // The port command path does not read it: this link is hand-built
             // for the reset family, which never names a device.
             named: None,
@@ -886,6 +846,31 @@ mod tests {
             read_pty(&pty.master, reset.len(), Duration::from_secs(3)),
             reset,
             "the device reset is exactly the admin unit the firmware's mux.h spells"
+        );
+    }
+
+    /// A bridge reached over CAN is refused here with the attach pass's own
+    /// words — not through `{:?}` — so the reset path can never hand the user a
+    /// `Can { interface: …, uuid: […] }` dump.
+    #[test]
+    fn a_can_bridge_reset_is_refused_with_the_attach_messages_words() {
+        let printer = Printer::new(ManualReactor::shared());
+        let link = BridgePortLink {
+            transport: Transport::Can {
+                interface: "can0".to_string(),
+                uuid: [0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc],
+            },
+            index: 0,
+            flags: 0,
+            named: None,
+        };
+
+        let err = open_bridge_link(&printer, &link, 7).unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "a bridge reached over CAN cannot carry a downstream device yet: the CAN upstream \
+             attach is M5/P5"
         );
     }
 
@@ -984,7 +969,6 @@ mod tests {
             },
             index: 3,
             flags: MUX_PORT_UNITS,
-            legacy: false,
             named: Some([0x11, 0x22, 0x33, 0x44, 0x55, 0x66]),
         };
 

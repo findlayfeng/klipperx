@@ -63,21 +63,18 @@ use tracing::debug;
 /// own to open.
 #[derive(Debug)]
 pub(crate) struct BridgePortLink {
-    /// The bridge's own transport, as its section describes it (with the
-    /// load-time shared-baud / host-mux stamps covered back on, `McuObject::mcu_config`).
+    /// The bridge's own transport, from the bridge's own section parse
+    /// (`McuObject::mcu_config`). The load-time shared-baud / host-mux stamps
+    /// are [`McuConfig`] fields, not part of [`Transport`].
     pub transport: Transport,
     /// The port's index in the bridge's firmware port table — what the
     /// port-level command travels with.
     pub index: u8,
-    /// The port-level `SET_PORT_NODEID` flags byte: `0` for a legacy port, whose
+    /// The port-level `SET_PORT_NODEID` flags byte: `0` for a legacy port
+    /// ([`PortGroups::is_legacy`], one uart-port device with no `uuid:`), whose
     /// device is spoken to in raw frames; [`MUX_PORT_UNITS`] for a port whose
     /// device speaks units.
     pub flags: u8,
-    /// Whether the port is legacy ([`PortGroups::is_legacy`]): one uart-port
-    /// device with no `uuid:`. The same shape [`BridgePortLink::flags`] reports
-    /// as `0`, kept as its own answer because [`open`] branches on it: a legacy
-    /// device gets the route alone, a named one the route and a handshake.
-    pub legacy: bool,
     /// The child's own `uuid:`, or `None` for the legacy shape. It is what
     /// [`open`]'s named branch names the device with (`SET_KLIPPER_NODEID`):
     /// a device behind a port answers the mux itself, unlike a legacy one.
@@ -88,9 +85,11 @@ pub(crate) struct BridgePortLink {
 ///
 /// The port table is the **bridge's** identify answer, so this only succeeds
 /// once the bridge has connected. Bring-up connects objects in registration
-/// order, which is config-file order within a phase, so a bridge declared before
-/// its child is up by the time the child asks; a bridge declared after its child
-/// is not waited for — the error says to reorder the file.
+/// order, which is config-file order within a phase, so a named bridge declared
+/// before its child is up by the time the child asks; one declared after its
+/// child is not waited for. A bare `[mcu]` child is the exception the error
+/// names: the main section always registers before every `[mcu <name>]`, so it
+/// can never be ordered after a named bridge and has to be given a name.
 ///
 /// # Errors
 /// [`KlippyError::Config`] for everything here: a bridge that has not connected
@@ -131,9 +130,19 @@ pub(crate) fn resolve(
         format!("mcu {bridge}")
     };
     let not_up = || {
+        // A bare `[mcu]` child can never be ordered after a named bridge: the
+        // main section always registers (and so connects) before every
+        // `[mcu <name>]`, which makes the file-order advice unsatisfiable for
+        // it — the only way out is to name it.
+        let bare_child = if config.name == "mcu" {
+            "; a bare [mcu] always loads before [mcu <name>], so give this device an \
+             [mcu <name>] section of its own"
+        } else {
+            ""
+        };
         config_error(format!(
             "MCU '{}' hangs on a port of '{bridge}'; declare the bridge before it in the config \
-             file",
+             file{bare_child}",
             config.name
         ))
     };
@@ -162,23 +171,154 @@ pub(crate) fn resolve(
                 config.name
             ))
         })?;
-    let (flags, legacy) = port_flags(&groups, port);
+    let flags = port_flags(&groups, port);
     Ok(BridgePortLink {
         transport: bridge_config.transport,
         index,
         flags,
-        legacy,
         named: *uuid,
     })
 }
 
-/// Open a downstream handle on `link`'s bridge link and establish its route,
-/// then — for a named device — complete its own naming handshake.
+/// Open a downstream handle on `link`'s bridge link, **without** a route.
 ///
-/// The handle is the bridge's own transport reopened for **one downstream
-/// device**: a second reference on the same shared serial port or host library,
-/// addressed by `mcu_id`, with no handshake of its own. Two commands travel it,
-/// in this order:
+/// This is the bridge's own transport reopened for one device — a second
+/// reference on the same shared serial port or host library, addressed by
+/// `mcu_id`, with no handshake of its own. [`open`] layers the device's route
+/// and naming on top; a caller that only needs the bridge's **admin** channel
+/// (`restart.rs::open_bridge_link`, a port-level reset) opens it bare.
+///
+/// It is the one place a bridge link can refuse a downstream device (a CAN
+/// upstream, a transport with no mux), so both callers report the same words.
+///
+/// # Errors
+/// [`KlippyError::Config`] for a bridge link that cannot carry a downstream
+/// device (a CAN upstream, or a transport with no mux); [`KlippyError::Connection`]
+/// for a failed open.
+pub(crate) fn open_link(
+    printer: &Printer,
+    link: &BridgePortLink,
+    mcu_id: u32,
+) -> Result<Interface, KlippyError> {
+    let (interface, _handle) = open_link_handle(printer, link, mcu_id)?;
+    Ok(interface)
+}
+
+/// The downstream handle behind [`open_link`], alongside the interface.
+///
+/// The concrete device is what a named device's handshake needs
+/// ([`HostDevice::attach`], [`serial::SharedSerialHandle::handshake`]) and what
+/// [`Interface`] does not expose; the open itself is identical either way.
+enum LinkHandle {
+    /// A second reference on the bridge's muxed host library.
+    Host {
+        device: Arc<HostDevice>,
+        library: String,
+    },
+    /// A second slot on the bridge's shared serial port.
+    Serial {
+        handle: Arc<serial::SharedSerialHandle>,
+        path: String,
+    },
+}
+
+impl LinkHandle {
+    /// Run the named device's own handshake over the handle [`open`] just
+    /// opened: `SET_KLIPPER_NODEID` plus a re-confirm request, each answered by
+    /// the device. The route must already be in ([`open`] sends it first), or
+    /// the units reach no port and the handshake times out.
+    fn handshake(&self, named: [u8; 6], mcu_id: u32, index: u8) -> Result<(), KlippyError> {
+        match self {
+            Self::Host { device, library } => device.attach(named, mcu_id).map_err(|err| {
+                KlippyError::Connection(format!(
+                    "host_library {library}: SET_KLIPPER_NODEID handshake on port {index} failed: \
+                     {err}"
+                ))
+            }),
+            Self::Serial { handle, path } => handle
+                .handshake(named, serial::ASSIGN_ATTACH_TIMEOUT)
+                .map_err(|err| {
+                    KlippyError::Connection(format!(
+                        "serial {path}: SET_KLIPPER_NODEID handshake on port {index} failed: {err}"
+                    ))
+                }),
+        }
+    }
+}
+
+/// Open the downstream handle and keep it, for [`open`]'s handshake.
+///
+/// The single match over the bridge's transport, and so the single refusal for a
+/// link that cannot carry a downstream device; [`open_link`] drops the handle
+/// again.
+fn open_link_handle(
+    printer: &Printer,
+    link: &BridgePortLink,
+    mcu_id: u32,
+) -> Result<(Interface, LinkHandle), KlippyError> {
+    match &link.transport {
+        Transport::Host { library, .. } => {
+            // The downstream reference is addressed by the path's mux identity,
+            // the same one the bridge itself attached with. `named` is what a
+            // later `attach` names the device with; `load_downstream` itself
+            // only reads the identity.
+            let libraries = printer
+                .lookup_object_as::<HostLibraries>(HOST_LIBRARIES_OBJECT)
+                .ok_or_else(|| {
+                    config_error(format!(
+                        "host_library {library}: a downstream device needs the path grouping, \
+                         which is not loaded"
+                    ))
+                })?;
+            let identity = libraries.identity(library).ok_or_else(|| {
+                config_error(format!(
+                    "host_library {library}: no [mcu] names this path, so it has no mux identity"
+                ))
+            })?;
+            let device = HostDevice::load_downstream(library, identity, mcu_id).map_err(|err| {
+                KlippyError::Connection(format!(
+                    "host_library {library}: downstream attach failed: {err}"
+                ))
+            })?;
+            let interface = Interface::from_host(Arc::clone(&device));
+            Ok((
+                interface,
+                LinkHandle::Host {
+                    device,
+                    library: library.clone(),
+                },
+            ))
+        }
+        Transport::Serial { path, baud, .. } => {
+            let handle = serial::attach_downstream(path, *baud, mcu_id).map_err(|err| {
+                KlippyError::Connection(format!("serial {path}: downstream attach failed: {err}"))
+            })?;
+            let interface = Interface::shared_serial(Arc::clone(&handle));
+            Ok((
+                interface,
+                LinkHandle::Serial {
+                    handle,
+                    path: path.clone(),
+                },
+            ))
+        }
+        Transport::Can { .. } => Err(config_error(
+            "a bridge reached over CAN cannot carry a downstream device yet: the CAN upstream \
+             attach is M5/P5"
+                .to_string(),
+        )),
+        other => Err(config_error(format!(
+            "a bridge on {other:?} cannot carry a downstream device"
+        ))),
+    }
+}
+
+/// Turn a resolved [`BridgePortLink`] into the live [`Interface`] the caller
+/// speaks to the device through: [`open_link`] the downstream handle, then — in
+/// this order — the bridge's **route** and, for a named device, the device's own
+/// naming handshake.
+///
+/// Two commands travel the link, in this order:
 ///
 /// 1. `SET_PORT_NODEID(index, mcu_id, flags)` — the bridge's **route**. It is
 ///    sent before anything else the caller writes, because until the bridge has
@@ -204,86 +344,19 @@ pub(crate) fn open(
             "MCU id {mcu_id} is outside the range a bridge port can address (1..=255)"
         ))
     })?;
-    let interface = match &link.transport {
-        Transport::Host { library, .. } => {
-            // The downstream reference is addressed by the path's mux identity,
-            // the same one the bridge itself attached with. `named` is what a
-            // later `attach` names the device with; `load_downstream` itself
-            // only reads the identity.
-            let libraries = printer
-                .lookup_object_as::<HostLibraries>(HOST_LIBRARIES_OBJECT)
-                .ok_or_else(|| {
-                    config_error(format!(
-                        "host_library {library}: a downstream device needs the path grouping, \
-                         which is not loaded"
-                    ))
-                })?;
-            let identity = libraries.identity(library).ok_or_else(|| {
-                config_error(format!(
-                    "host_library {library}: no [mcu] names this path, so it has no mux identity"
-                ))
-            })?;
-            let device = HostDevice::load_downstream(library, identity, mcu_id).map_err(|err| {
-                KlippyError::Connection(format!(
-                    "host_library {library}: downstream attach failed: {err}"
-                ))
-            })?;
-            // The route first, then the device's own naming — see the function
-            // doc; the request below is dropped by the bridge without it.
-            let interface = Interface::from_host(Arc::clone(&device));
-            interface
-                .send_set_port_node_id(link.index, id, link.flags)
-                .map_err(|err| route_error(link.index, id, link.flags, err))?;
-            if let Some(named) = link.named {
-                device.attach(named, mcu_id).map_err(|err| {
-                    KlippyError::Connection(format!(
-                        "host_library {library}: SET_KLIPPER_NODEID handshake on port {} failed: \
-                         {err}",
-                        link.index
-                    ))
-                })?;
-            }
-            interface
-        }
-        Transport::Serial { path, baud, .. } => {
-            let handle = serial::attach_downstream(path, *baud, mcu_id).map_err(|err| {
-                KlippyError::Connection(format!("serial {path}: downstream attach failed: {err}"))
-            })?;
-            // The same order as the host arm: the route, then — a named device
-            // — its own handshake, with the timeout `attach` runs on.
-            let interface = Interface::shared_serial(Arc::clone(&handle));
-            interface
-                .send_set_port_node_id(link.index, id, link.flags)
-                .map_err(|err| route_error(link.index, id, link.flags, err))?;
-            if let Some(named) = link.named {
-                handle
-                    .handshake(named, serial::ASSIGN_ATTACH_TIMEOUT)
-                    .map_err(|err| {
-                        KlippyError::Connection(format!(
-                            "serial {path}: SET_KLIPPER_NODEID handshake on port {} failed: {err}",
-                            link.index
-                        ))
-                    })?;
-            }
-            interface
-        }
-        Transport::Can { .. } => {
-            return Err(config_error(
-                "a bridge reached over CAN cannot carry a downstream device yet: the CAN upstream \
-                 attach is M5/P5"
-                    .to_string(),
-            ));
-        }
-        other => {
-            return Err(config_error(format!(
-                "a bridge on {other:?} cannot carry a downstream device"
-            )));
-        }
-    };
+    let (interface, handle) = open_link_handle(printer, link, mcu_id)?;
+    // The route first, then the device's own naming — see the function doc; the
+    // handshake's units are dropped by the bridge without it.
+    interface
+        .send_set_port_node_id(link.index, id, link.flags)
+        .map_err(|err| route_error(link.index, id, link.flags, err))?;
+    if let Some(named) = link.named {
+        handle.handshake(named, mcu_id, link.index)?;
+    }
     debug!(
         "bridge port {}: attaching downstream device id {mcu_id} ({}, {})",
         link.index,
-        if link.legacy { "legacy" } else { "units" },
+        if link.flags == 0 { "legacy" } else { "units" },
         if link.named.is_some() {
             "named"
         } else {
@@ -298,10 +371,10 @@ pub(crate) fn open(
 ///
 /// The table is the four identifying keys the bridge build reports
 /// `BRIDGE_PORT_COUNT`, then `BRIDGE_PORT<i>_NAME` / `_TYPE` / `_PATH` per port
-/// (`third_party/klipper/src/bridge.c`). A firmware without the count is not a
-/// bridge build (or predates the table); a table without the oid names what it
-/// does have; and the type must match the section's kind — an oid reached over
-/// the wrong port kind would carry the wrong wire format.
+/// (`third_party/klipper/src/host/bridge.c`). A firmware without the count is
+/// not a bridge build (or predates the table); a table without the oid names
+/// what it does have; and the type must match the section's kind — an oid
+/// reached over the wrong port kind would carry the wrong wire format.
 ///
 /// # Errors
 /// [`KlippyError::Config`] naming the child, the bridge and the mismatch.
@@ -360,19 +433,31 @@ fn bridge_port_index(
              '{expected}', got '{got}'"
         )));
     }
-    Ok(index as u8)
+    // The port-level command carries the index in one byte, so a port the table
+    // puts past 255 cannot be named — refuse it rather than truncating the index
+    // onto some other port's route.
+    u8::try_from(index).map_err(|_| {
+        config_error(format!(
+            "MCU '{child}': bridge '{bridge_name}' port '{oid}' is at index {index}; a port \
+             command cannot address it (0..=255)"
+        ))
+    })
 }
 
-/// The port's `SET_PORT_NODEID` flags byte and whether it is legacy.
+/// The port's `SET_PORT_NODEID` flags byte.
 ///
 /// A legacy port's device does not speak the mux, so the bridge strips the
 /// header going down and heads a raw frame coming up (`0`); every other port's
 /// device speaks units, which the bridge must know ([`MUX_PORT_UNITS`]). The
 /// judgment is the port grouping's ([`PortGroups::is_legacy`]) — the same one
-/// that refused a legacy device on a shared port at load.
-fn port_flags(groups: &PortGroups, port: &str) -> (u8, bool) {
-    let legacy = groups.is_legacy(port);
-    (if legacy { 0 } else { MUX_PORT_UNITS }, legacy)
+/// that refused a legacy device on a shared port at load — and `0` is exactly
+/// its byte, so the caller has no second answer to keep.
+fn port_flags(groups: &PortGroups, port: &str) -> u8 {
+    if groups.is_legacy(port) {
+        0
+    } else {
+        MUX_PORT_UNITS
+    }
 }
 
 /// Wrap a failed `SET_PORT_NODEID` as the connection error [`open`] reports,
@@ -466,6 +551,44 @@ mod tests {
             text.contains("declare the bridge before it in the config file"),
             "{text}"
         );
+        assert!(
+            !text.contains("a bare [mcu] always loads before"),
+            "a named child gets no bare-[mcu] note: {text}"
+        );
+    }
+
+    /// A bare `[mcu]` child on a named bridge's port can never be ordered after
+    /// the bridge: the main section always registers (and so connects) before
+    /// `[mcu <name>]`. The error says so and points at the only way out — give
+    /// the device a name.
+    #[test]
+    fn resolve_names_the_bare_mcu_order_trap() {
+        let printer = printer_with(
+            "[mcu bridge]\ntest: dict=/does/not/matter\n\
+             [uart_device uart0]\nuart_mcu: bridge\nuart_oid: uart0\n\
+             [mcu]\nuart: uart0\n",
+        );
+        let config = printer
+            .lookup_object_as::<McuObject>("mcu")
+            .expect("the printer has the bare [mcu]")
+            .mcu_config()
+            .expect("the bare section parses");
+
+        let err = resolve(&printer, &config).unwrap_err();
+
+        let text = err.to_string();
+        assert!(
+            text.contains("MCU 'mcu' hangs on a port of 'bridge'"),
+            "{text}"
+        );
+        assert!(
+            text.contains("a bare [mcu] always loads before [mcu <name>]"),
+            "{text}"
+        );
+        assert!(
+            text.contains("give this device an [mcu <name>] section of its own"),
+            "{text}"
+        );
     }
 
     /// A `[mcu]`'s identify answer built in code: the `config` object of the
@@ -536,6 +659,36 @@ mod tests {
         );
     }
 
+    /// A port the firmware's table puts past 255 cannot be named: the index
+    /// travels in one byte, and truncating it would route to some other port's
+    /// node — so it is refused, naming the port and its index.
+    #[test]
+    fn a_port_past_the_index_range_is_refused() {
+        let mut config = serde_json::Map::new();
+        config.insert("BRIDGE_PORT_COUNT".to_string(), json!(257));
+        config.insert("BRIDGE_PORT256_NAME".to_string(), json!("uart0"));
+        config.insert("BRIDGE_PORT256_TYPE".to_string(), json!("uart"));
+
+        let err = bridge_port_index(
+            &dictionary(json!({ "config": config })),
+            "uart0",
+            PortKind::Uart,
+            "child",
+            "bridge",
+        )
+        .unwrap_err();
+
+        let text = err.to_string();
+        assert!(
+            text.contains("bridge 'bridge' port 'uart0' is at index 256"),
+            "{text}"
+        );
+        assert!(
+            text.contains("a port command cannot address it (0..=255)"),
+            "{text}"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // The flags byte (`SET_PORT_NODEID`'s fourth field).
     // -----------------------------------------------------------------------
@@ -550,10 +703,9 @@ mod tests {
              [uart_device uart0]\nuart_mcu: bridge\nuart_oid: uart0\n",
         );
 
-        let (flags, legacy) = port_flags(&groups, "uart_device uart0");
+        let flags = port_flags(&groups, "uart_device uart0");
 
         assert_eq!(flags, 0);
-        assert!(legacy);
     }
 
     /// A shared port (two or more members, each with its own `uuid:`) is a port
@@ -567,10 +719,34 @@ mod tests {
              [uart_device uart0]\nuart_mcu: bridge\nuart_oid: uart0\n",
         );
 
-        let (flags, legacy) = port_flags(&groups, "uart_device uart0");
+        let flags = port_flags(&groups, "uart_device uart0");
 
         assert_eq!(flags, MUX_PORT_UNITS);
-        assert!(!legacy);
+    }
+
+    /// A bridge reached over CAN is refused with the one message the attach pass
+    /// and the reset path share, and never through `{:?}`: its downstream frames
+    /// would ride the CAN payload (M5/P5).
+    #[test]
+    fn a_can_bridge_is_refused_with_the_shared_message() {
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        let link = BridgePortLink {
+            transport: Transport::Can {
+                interface: "can0".to_string(),
+                uuid: [0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc],
+            },
+            index: 0,
+            flags: 0,
+            named: None,
+        };
+
+        let err = open_link(&printer, &link, 7).unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "a bridge reached over CAN cannot carry a downstream device yet: the CAN upstream \
+             attach is M5/P5"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -798,10 +974,9 @@ mod tests {
              [uart_device uart0]\nuart_mcu: bridge\nuart_oid: uart0\n",
         );
 
-        let (flags, legacy) = port_flags(&groups, "uart_device uart0");
+        let flags = port_flags(&groups, "uart_device uart0");
 
         assert_eq!(flags, MUX_PORT_UNITS);
-        assert!(!legacy);
     }
 
     /// The order `open` exists for, over a real serial link on a pty: the
@@ -828,7 +1003,6 @@ mod tests {
             },
             index: 0,
             flags: MUX_PORT_UNITS,
-            legacy: false,
             named: Some(named),
         };
 

@@ -47,13 +47,16 @@ pub struct McuConfig {
     /// Which port-level reset this device gets, when it hangs behind a bridge
     /// port.
     ///
-    /// `None` for every transport that is not a bridge port, and for a legacy
-    /// (uuid-less) device whose port declares no `uart_restart_method`. The two
-    /// bridge-port shapes learn it differently: a **named** device writes
-    /// `restart_method: admin` itself ([`BridgeRestart::Device`]), while a
-    /// **legacy** one has no admin channel of its own and takes the **port
-    /// section's** `uart_restart_method` ([`BridgeRestart::Port`]). The command
-    /// travels the bridge's link, not a transport of this device's own.
+    /// `None` for every transport that is not a bridge port; for a legacy
+    /// (uuid-less) device whose port declares no `uart_restart_method`; and for
+    /// a **named** (uuid-bearing) device that writes no `restart_method`, or one
+    /// other than `admin` — a named device resets itself only under `admin`, and
+    /// has no port-level reset to fall back to. The two bridge-port shapes learn
+    /// it differently: a **named** device writes `restart_method: admin` itself
+    /// ([`BridgeRestart::Device`]), while a **legacy** one has no admin channel
+    /// of its own and takes the **port section's** `uart_restart_method`
+    /// ([`BridgeRestart::Port`]). The command travels the bridge's link, not a
+    /// transport of this device's own.
     pub bridge_restart: Option<BridgeRestart>,
     /// What to open, described but not opened.
     pub transport: Transport,

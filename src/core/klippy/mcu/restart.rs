@@ -9,9 +9,16 @@
 //! | method | here | elsewhere |
 //! |---|---|---|
 //! | `command` | nothing before the port opens | `reset` on the **live** connection, from `McuObject::before_firmware_restart`, before the parts come down; `config_reset` from the handshake (`mcu/object.rs`, `mcu/config.rs`) |
+//! | `admin` | nothing on this device's transport: the port-level `RESET_DEVICE` the bridge forwards ([`reset_bridge_firmware`]) | — |
 //! | `arduino` | toggle DTR at 2400 baud — **untested on hardware**, and reported | — |
 //! | `cheetah` | RTS/DTR sequence at 2400 baud — **untested on hardware**, and reported; the connection itself also needs RTS deasserted (`McuConfig::open`) | — |
 //! | `rpi_usb` | cut and restore the USB port's power — **untested on hardware**, and reported | `interface/usb.rs` |
+//!
+//! A device behind a bridge downstream port is a fourth shape: it has no
+//! transport of its own, so its reset travels the **bridge's** link and is chosen
+//! by [`McuConfig::bridge_restart`](crate::core::klippy::config::mcu::McuConfig)
+//! ([`reset_bridge_firmware`]). The physical methods above act on a transport; a
+//! bridge-port device's does not exist until the attach pass opens it.
 //!
 //! The reset paths cannot be exercised in a test — a pty does not emulate the
 //! modem lines, and there is no USB port to cut — so each one reports that it is
@@ -26,11 +33,17 @@ use std::path::{Path, PathBuf};
 use tokio::time::Duration;
 use tracing::{debug, info, warn};
 
-use crate::core::klippy::config::mcu::{McuConfig, Transport};
-use crate::core::klippy::interface::devices::serial::ModemLines;
+use crate::core::klippy::config::mcu::{BridgeRestart, McuConfig, Transport};
+use crate::core::klippy::error::{ConfigError, KlippyError};
+use crate::core::klippy::interface::devices::host::{HostDevice, HostMux};
+use crate::core::klippy::interface::devices::serial::{self, ModemLines};
 use crate::core::klippy::interface::error::InterfaceError;
 use crate::core::klippy::interface::usb;
+use crate::core::klippy::interface::Interface;
+use crate::core::klippy::mcu::bridge_attach::{self, BridgePortLink};
+use crate::core::klippy::mcu::host_libraries::{HostLibraries, HOST_LIBRARIES_OBJECT};
 use crate::core::klippy::mcu::McuRestartMethod;
+use crate::core::klippy::printer::Printer;
 
 /// How long to leave the board between the steps of a reset. Upstream pauses
 /// `0.100` s between each (`klippy/serialhdl.py:365-402`).
@@ -68,6 +81,11 @@ pub async fn reset_firmware(
         // Nothing before the connection: `config_reset` clears the firmware once
         // it is up (`mcu/config.rs`).
         McuRestartMethod::Command => Ok(()),
+        // The device resets itself, and the bridge forwards the command: that
+        // travels the bridge's link, before this device is reached
+        // (`McuObject::connect`, `reset_bridge_firmware`), so there is nothing to
+        // do on a transport of its own.
+        McuRestartMethod::Admin => Ok(()),
         McuRestartMethod::Arduino => match &config.transport {
             Transport::Serial { path, .. } => {
                 warn_untested(config);
@@ -90,6 +108,140 @@ pub async fn reset_firmware(
             _ => Ok(()),
         },
     }
+}
+
+/// Reset a device that hangs on a bridge downstream port.
+///
+/// Such a device has no transport of its own: it is reached on the bridge's link
+/// (`mcu/bridge_attach.rs`), and its reset travels the same way. Which reset is
+/// [`McuConfig::bridge_restart`]'s answer — `Device` lets the device reset
+/// itself (`RESET_DEVICE`, which the bridge forwards to the port), `Port` asks
+/// the bridge to pulse the port's lines (`RESET_PORT`). Both need the port's
+/// `index`, which only the bridge's firmware port table has: [`bridge_attach::resolve`]
+/// is where that is reconciled, so an old firmware (no port table), or a
+/// section whose oid the bridge does not report, is refused there before
+/// anything is sent.
+///
+/// The command goes out on a **temporary** downstream handle
+/// ([`open_bridge_link`]) — the bridge's admin channel, with no route sent and
+/// no handshake awaited. The handle is dropped right after and leaves the link
+/// as it found it; the attach pass opens the device's real reference when it
+/// connects.
+///
+/// Called by `McuObject::connect` on the bring-up that follows a
+/// `FIRMWARE_RESTART`, before the transport opens — the same place
+/// [`reset_firmware`] runs, and the only place a bridge-port device's reset can
+/// go out before its route is established.
+///
+/// # Errors
+/// [`KlippyError::Config`] from [`bridge_attach::resolve`] — the section is not
+/// a bridge port, the bridge has not connected, its firmware reports no port
+/// table (an old firmware, or not a bridge build), or the port is missing or of
+/// another type; [`KlippyError::Connection`] when the downstream handle cannot
+/// be opened or the command cannot be written.
+pub(crate) fn reset_bridge_firmware(
+    printer: &Printer,
+    config: &McuConfig,
+    restart: BridgeRestart,
+) -> Result<(), KlippyError> {
+    let link = bridge_attach::resolve(printer, config)?;
+    let mcu_id = config.id.ok_or_else(|| {
+        KlippyError::Connection(format!(
+            "MCU '{}' has no id assigned; cannot reset its bridge port",
+            config.name
+        ))
+    })?;
+    let interface = open_bridge_link(printer, &link, mcu_id)?;
+    let sent = match restart {
+        BridgeRestart::Device => interface.send_reset_device(link.index),
+        BridgeRestart::Port => interface.send_reset_port(link.index),
+    };
+    sent.map_err(|err| {
+        KlippyError::Connection(format!(
+            "MCU '{}': sending the bridge port reset failed: {err}",
+            config.name
+        ))
+    })?;
+    info!(
+        "MCU '{}': resetting bridge port {} with {}",
+        config.name,
+        link.index,
+        match restart {
+            BridgeRestart::Device => "RESET_DEVICE",
+            BridgeRestart::Port => "RESET_PORT",
+        }
+    );
+    Ok(())
+}
+
+/// Open a temporary downstream handle on `link`'s bridge link, without a route.
+///
+/// This is the bridge's own transport reopened for one device — a second slot on
+/// the shared serial port, or a second reference on the live host library — and
+/// it is only here to reach the bridge's **admin** channel
+/// ([`serial::attach_downstream`], [`HostDevice::load_downstream`]). The route
+/// the attach pass sends (`SET_PORT_NODEID`) is deliberately left out: the
+/// device is about to reboot, and the reference that will carry it is opened,
+/// and routed, when it connects. Dropping this handle leaves both link kinds in
+/// place.
+///
+/// # Errors
+/// [`KlippyError::Config`] for a bridge link that cannot carry a downstream
+/// device (a CAN upstream, or a path with no mux identity);
+/// [`KlippyError::Connection`] for a failed open.
+fn open_bridge_link(
+    printer: &Printer,
+    link: &BridgePortLink,
+    mcu_id: u32,
+) -> Result<Interface, KlippyError> {
+    match &link.transport {
+        Transport::Serial { path, baud, .. } => {
+            let handle = serial::attach_downstream(path, *baud, mcu_id).map_err(|err| {
+                KlippyError::Connection(format!("serial {path}: downstream attach failed: {err}"))
+            })?;
+            Ok(Interface::shared_serial(handle))
+        }
+        Transport::Host { library, .. } => {
+            // The reference has to carry the path's own mux identity: the
+            // library is already live on it under that identity, and a second
+            // one would be refused (or would address another board).
+            let libraries = printer
+                .lookup_object_as::<HostLibraries>(HOST_LIBRARIES_OBJECT)
+                .ok_or_else(|| {
+                    config_error(format!(
+                        "host_library {library}: a downstream device needs the path grouping, \
+                         which is not loaded"
+                    ))
+                })?;
+            let identity = libraries.identity(library).ok_or_else(|| {
+                config_error(format!(
+                    "host_library {library}: no [mcu] names this path, so it has no mux identity"
+                ))
+            })?;
+            let device = HostDevice::load_downstream(
+                library,
+                HostMux {
+                    identity,
+                    named: identity,
+                },
+                mcu_id,
+            )
+            .map_err(|err| {
+                KlippyError::Connection(format!(
+                    "host_library {library}: downstream attach failed: {err}"
+                ))
+            })?;
+            Ok(Interface::from_host(device))
+        }
+        other => Err(config_error(format!(
+            "a bridge on {other:?} cannot carry a downstream device"
+        ))),
+    }
+}
+
+/// Wrap `message` as the config error the bridge-resolution paths report.
+fn config_error(message: String) -> KlippyError {
+    KlippyError::Config(ConfigError::new(message))
 }
 
 /// Whether an `rpi_usb` board has to be brought up with a firmware restart
@@ -398,6 +550,7 @@ mod tests {
         McuConfig {
             name: "mcu".to_string(),
             restart_method: method,
+            bridge_restart: None,
             transport: Transport::Host {
                 library: String::new(),
                 uuid: None,
@@ -415,6 +568,7 @@ mod tests {
         McuConfig {
             name: "mcu".to_string(),
             restart_method: method,
+            bridge_restart: None,
             transport: Transport::Serial {
                 path: "/dev/not-a-serial-port".to_string(),
                 baud: 250_000,
@@ -432,6 +586,7 @@ mod tests {
         McuConfig {
             name: "mcu".to_string(),
             restart_method: method,
+            bridge_restart: None,
             transport: Transport::Serial {
                 path: path.to_string(),
                 baud: 250_000,
@@ -585,5 +740,214 @@ mod tests {
         .unwrap_err();
         assert!(err.starts_with("serial: "), "{err}");
         assert!(err.contains("/dev/not-a-serial-port"), "{err}");
+    }
+
+    // -----------------------------------------------------------------------
+    // The bridge-port reset, on the wire.
+    // -----------------------------------------------------------------------
+
+    use crate::core::klippy::config::Config;
+    use crate::core::klippy::interface::devices::host::HOST_LIBRARY_TEST_LOCK;
+    use crate::core::klippy::interface::devices::serial::{
+        admin_unit, CMD_RESET_DEVICE, CMD_RESET_PORT,
+    };
+    use crate::core::klippy::interface::pty::Pty;
+    use crate::core::klippy::mcu::McuObject;
+    use crate::core::klippy::reactor::{ManualReactor, TokioReactor};
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    /// Read from the pty's master end for at most `window`: everything the other
+    /// end wrote, handed over as soon as `at_least` bytes are in hand — empty
+    /// when the port stays silent the whole window. The `poll` is bounded, so no
+    /// step can hang on a port that never writes.
+    fn read_pty(master: &std::fs::File, at_least: usize, window: Duration) -> Vec<u8> {
+        let deadline = Instant::now() + window;
+        let mut out = Vec::new();
+        let mut buf = [0u8; 256];
+        let mut reader = master;
+        while out.len() < at_least {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let wait = deadline.saturating_duration_since(now).as_millis() as i32;
+            let mut poll = libc::pollfd {
+                fd: master.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let rc = unsafe { libc::poll(&mut poll, 1, wait.max(1)) };
+            if rc < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                panic!("polling the pty master: {error}");
+            }
+            if rc == 0 {
+                break;
+            }
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(read) => out.extend_from_slice(&buf[..read]),
+                Err(error) => panic!("reading the pty master: {error}"),
+            }
+        }
+        out
+    }
+
+    /// Eat everything the port has written until it has been quiet for `quiet`,
+    /// or `cap` expires — so an earlier step's bytes are never mistaken for the
+    /// reset's.
+    fn drain_pty(master: &std::fs::File, quiet: Duration, cap: Duration) {
+        let deadline = Instant::now() + cap;
+        while Instant::now() < deadline && !read_pty(master, 1, quiet).is_empty() {}
+    }
+
+    /// Block (bounded) until the process-wide library on `path` is unloaded, so
+    /// the next test on it meets a fresh firmware.
+    fn wait_for_mux_library_unload(path: &std::path::Path) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match HostDevice::load_bytes(path, Some([0x5a; 6])) {
+                Ok(probe) => {
+                    drop(probe);
+                    return;
+                }
+                Err(_) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "the mux host library never unloaded"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+    }
+
+    /// A pty standing in for the bridge's own link, with a hand-built
+    /// [`BridgePortLink`] and no firmware on the other end: the host's bytes are
+    /// all this asserts.
+    #[tokio::test]
+    async fn the_reset_commands_are_the_port_level_admin_units() {
+        let pty = Pty::new();
+        let printer = Printer::new(ManualReactor::shared());
+        let link = BridgePortLink {
+            transport: Transport::Serial {
+                path: pty.path.to_str().expect("a utf-8 pty path").to_string(),
+                baud: 250_000,
+                uuid: None,
+            },
+            index: 3,
+            flags: 0,
+            legacy: true,
+        };
+
+        // One temporary downstream handle, one command: the reset unit goes out
+        // whole — `e8 3f <len> 20 4b 58 49 44 04 03 <crc> 7e` — and nothing
+        // else does: the handle this path opens sends no route.
+        let reset = admin_unit(&[CMD_RESET_PORT, link.index]);
+        let interface = open_bridge_link(&printer, &link, 1).expect("the bridge link opens");
+        interface
+            .send_reset_port(link.index)
+            .expect("the port reset goes out");
+        assert_eq!(
+            read_pty(&pty.master, reset.len(), Duration::from_secs(3)),
+            reset,
+            "the port reset is exactly the admin unit the firmware's mux.h spells"
+        );
+
+        // The device reset is the same shape, one command byte apart.
+        let reset = admin_unit(&[CMD_RESET_DEVICE, link.index]);
+        let interface = open_bridge_link(&printer, &link, 2).expect("the bridge link opens");
+        interface
+            .send_reset_device(link.index)
+            .expect("the device reset goes out");
+        assert_eq!(
+            read_pty(&pty.master, reset.len(), Duration::from_secs(3)),
+            reset,
+            "the device reset is exactly the admin unit the firmware's mux.h spells"
+        );
+    }
+
+    /// The whole bridge-port reset, over the **real** bridge library and a pty.
+    ///
+    /// The legacy child's port declares `uart_restart_method: arduino`, so its
+    /// reset is the bridge's own `RESET_PORT`. The call returning `Ok` means
+    /// `resolve` found the port index from the bridge's firmware table and the
+    /// command was written to the bridge; what the port itself shows is the
+    /// firmware's contract: `RESET_PORT` is consumed by the bridge (it pulses
+    /// the lines, which a pty does not have) and **nothing** is written
+    /// downstream (`src/bridge.c` `bridge_admin_unit`).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_port_reset_reaches_the_real_bridge_and_stays_off_the_port() {
+        let _serial = HOST_LIBRARY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+
+        // The bridge opens its port during init, so the tty has to exist first.
+        let pty = Pty::new();
+        let bridge_path = klipperx_test_support::klipper_host_mux_serial_path();
+        let _ = std::fs::remove_file(&bridge_path);
+        std::os::unix::fs::symlink(&pty.path, &bridge_path).unwrap_or_else(|e| {
+            panic!(
+                "failed to link {} to {}: {e}",
+                bridge_path.display(),
+                pty.path.display()
+            )
+        });
+
+        let library = klipperx_test_support::klipper_host_mux_lib_path();
+        let text = format!(
+            "[mcu bridge]\nhost_library: {}\n\
+             [uart_device uart0]\nuart_mcu: bridge\nuart_oid: uart0\nuart_baud: 250000\n\
+             uart_restart_method: arduino\n\
+             [mcu child]\nuart: uart0\n",
+            library.display()
+        );
+        let config = Config::from_text(&text).expect("the config parses").0;
+        let reactor = Arc::new(TokioReactor::new(tokio::runtime::Handle::current()));
+        let printer = Arc::new(Printer::new(reactor));
+        printer.load_config(&config).expect("the config loads");
+
+        // Bounded: the child's identify never answers, so the bring-up is
+        // interrupted once the child has certainly spoken and the bridge is up.
+        let _ = tokio::time::timeout(Duration::from_secs(6), printer.bring_up()).await;
+        drain_pty(
+            &pty.master,
+            Duration::from_millis(500),
+            Duration::from_secs(3),
+        );
+
+        // The child's own parse: a legacy device on a port that declares a
+        // line-level reset takes that port's reset, while its own method stays
+        // `command` — the reset is not the device's.
+        let child = printer
+            .lookup_object_as::<McuObject>("mcu child")
+            .expect("the child registered")
+            .mcu_config()
+            .expect("the child's section parses");
+        assert_eq!(child.bridge_restart, Some(BridgeRestart::Port));
+        assert_eq!(child.restart_method, McuRestartMethod::Command);
+
+        reset_bridge_firmware(&printer, &child, BridgeRestart::Port)
+            .expect("the port reset goes out through the real bridge");
+
+        assert!(
+            read_pty(&pty.master, 1, Duration::from_millis(500)).is_empty(),
+            "RESET_PORT is the bridge's own business: it must write nothing to the port"
+        );
+
+        // `teardown` drops the parts the config loaded and the event handlers
+        // they registered; without it the `SAVE_CONFIG` handler's strong
+        // `Arc<Printer>` keeps the machine (and so the bridge's open library)
+        // alive, and the next test on this path meets a live firmware.
+        printer.teardown();
+        drop(printer);
+        wait_for_mux_library_unload(&library);
+        let _ = std::fs::remove_file(&bridge_path);
     }
 }

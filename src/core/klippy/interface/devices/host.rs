@@ -89,8 +89,9 @@ use std::time::{Duration, Instant};
 use tracing::{debug, info, trace, warn};
 
 use super::serial::{
-    assignment_request, encode_header, parse_assignment_ack, set_node_id_for, set_port_node_id,
-    UnitStream, ADMIN_LISTEN, ASSIGN_ATTACH_ATTEMPTS, ASSIGN_ATTACH_TIMEOUT, HEADER_BYTES,
+    admin_unit, assignment_request, encode_header, parse_assignment_ack, set_node_id_for,
+    set_port_node_id, UnitStream, ADMIN_LISTEN, ASSIGN_ATTACH_ATTEMPTS, ASSIGN_ATTACH_TIMEOUT,
+    CMD_RESET_DEVICE, CMD_RESET_PORT, HEADER_BYTES,
 };
 use super::shared::resource_for;
 
@@ -801,6 +802,32 @@ impl HostDevice {
         // The builder spells the whole admin unit (header + frame); `send_admin`
         // writes the header, so only the frame behind it goes to it.
         self.send_admin(&set_port_node_id(index, mcu_id, flags)[HEADER_BYTES..])
+    }
+
+    /// Ask the device behind port `index` to reset itself: [`CMD_RESET_DEVICE`]'s
+    /// admin unit, which the bridge forwards to that port and the device acts on.
+    ///
+    /// The reset a **named** bridge-port device gets — the one that answers the
+    /// mux itself. No receipt: the caller confirms it by whether the device can
+    /// be reached again (`mcu/restart.rs`).
+    ///
+    /// # Errors
+    /// The same as [`HostDevice::send_admin`].
+    pub fn send_reset_device(&self, index: u8) -> Result<(), InterfaceError> {
+        self.send_admin(&admin_unit(&[CMD_RESET_DEVICE, index])[HEADER_BYTES..])
+    }
+
+    /// Ask the bridge to pulse the lines of port `index` — [`CMD_RESET_PORT`]'s
+    /// admin unit. The bridge performs it; nothing is sent downstream.
+    ///
+    /// The reset a **legacy** bridge-port device gets: it has no admin channel of
+    /// its own, so its bridge's port is the only thing that can reset it. No
+    /// receipt, like [`HostDevice::send_reset_device`].
+    ///
+    /// # Errors
+    /// The same as [`HostDevice::send_admin`].
+    pub fn send_reset_port(&self, index: u8) -> Result<(), InterfaceError> {
+        self.send_admin(&admin_unit(&[CMD_RESET_PORT, index])[HEADER_BYTES..])
     }
 
     /// Attach a muxed reference: name the device `named`, hand it `mcu_id`, and

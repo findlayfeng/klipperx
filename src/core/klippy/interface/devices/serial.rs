@@ -1662,6 +1662,33 @@ impl SharedSerialHandle {
         self.send_admin(&set_port_node_id(index, mcu_id, flags)[HEADER_BYTES..])
     }
 
+    /// Ask the device behind port `index` to reset itself: [`CMD_RESET_DEVICE`]'s
+    /// admin unit, which the bridge forwards to that port and the device acts on.
+    ///
+    /// The reset a **named** bridge-port device gets — the one that answers the
+    /// mux itself. No receipt: the bridge routes the command and the device
+    /// either resets or does not, so the caller confirms it by whether the
+    /// device can be reached again (`mcu/restart.rs`).
+    ///
+    /// # Errors
+    /// The same as [`SharedSerialHandle::send_unit`].
+    pub fn send_reset_device(&self, index: u8) -> Result<(), InterfaceError> {
+        self.send_admin(&admin_unit(&[CMD_RESET_DEVICE, index])[HEADER_BYTES..])
+    }
+
+    /// Ask the bridge to pulse the lines of port `index` — [`CMD_RESET_PORT`]'s
+    /// admin unit. The bridge performs it; nothing is sent downstream.
+    ///
+    /// The reset a **legacy** bridge-port device gets: it has no admin channel of
+    /// its own, so its bridge's port is the only thing that can reset it. No
+    /// receipt, like [`SharedSerialHandle::send_reset_device`].
+    ///
+    /// # Errors
+    /// The same as [`SharedSerialHandle::send_unit`].
+    pub fn send_reset_port(&self, index: u8) -> Result<(), InterfaceError> {
+        self.send_admin(&admin_unit(&[CMD_RESET_PORT, index])[HEADER_BYTES..])
+    }
+
     /// Complete the frame-level id handshake on this already-open handle: name
     /// this device `uuid` ([`set_node_id_for`]) and have it re-confirm the
     /// assignment — exactly the segment [`attach`] runs once its slot is

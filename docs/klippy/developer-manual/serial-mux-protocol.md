@@ -19,8 +19,9 @@
 > （`CONFIG_BRIDGE`）有**桥半**：端口表、`uuid → 端口` 与 `id → 端口` 两张路由表、admin 扇出
 > （上游广播原样下达、下游应答**逐条**上行、不合并）、单设备路径**剥头/加头**；**M1-P2 起**
 > 又加上**端口级命令族**（`SET_PORT_NODEID`/`RESET_DEVICE`/`RESET_PORT`，面向桥自己、无回执，
-> 见下节「端口级命令族」）与 **identify 字典的端口表**（`BRIDGE_PORT*` 键），「单设备」由主机
-> 下发的 `flags` 运行期告知而非编译期标志。host 库还有
+> 见下节「端口级命令族」）；**M1-P7 起端口改为配置期由主机声明的 UART 对象**
+> （`config_uart`/`config_bridge_port`，字典表退役），「单设备」由主机下发的 `flags` 运行期告知
+> 而非编译期标志。host 库还有
 > **下游串口端口**与 **unit 收发接口**（`klipper_host_input_unit`/`klipper_host_output_unit`，
 > 需帧接口开关**且**桥模式）。
 >
@@ -190,15 +191,16 @@ admin 信道，`mux_unit()` 决定归属）。**注意两条不同的寻址**：
 
 | 命令 | 载荷 | 语义 |
 |------|------|------|
-| `SET_PORT_NODEID` | `[0x03][index][id][flags]`（4 字节） | 桥建 `id → 端口` 表并记该口 `flags`。`index` 0 起（对应 identify 字典端口表 `BRIDGE_PORT<n>_` 的下标）；`id` = MCU 层 id（`1..=255`，`mux_arb_id(id)!=0`）；`flags` bit0=`MUX_PORT_UNITS`（`0x01`）：置位 = 该口设备**说单元**（收发整单元原样转发）；清零 = **legacy**（下行剥头、上行按该口记的 id 加应答头）；保留位忽略。**幂等**：重复发送 = 覆盖同值；**旧映射不撤销**——同一口改登记为别的 id 后，旧 id 仍路由到该口（`bridge_map_id` 只增不删），想把下游设备改绑到别的口需另行定义 |
+| `SET_PORT_NODEID` | `[0x03][index][id][flags]`（4 字节） | 桥建 `id → 端口` 表并记该口 `flags`。`index` 0 起（= 该端口节的**声明顺序**，配置期由 `config_bridge_port` 登记）；`id` = MCU 层 id（`1..=255`，`mux_arb_id(id)!=0`）；`flags` bit0=`MUX_PORT_UNITS`（`0x01`）：置位 = 该口设备**说单元**（收发整单元原样转发）；清零 = **legacy**（下行剥头、上行按该口记的 id 加应答头）；保留位忽略。**幂等**：重复发送 = 覆盖同值；**旧映射不撤销**——同一口改登记为别的 id 后，旧 id 仍路由到该口（`bridge_map_id` 只增不删），想把下游设备改绑到别的口需另行定义 |
 | `RESET_DEVICE` | `[0x02][index]` | 桥**只**转发到 `index` 口（UNITS 口带头转发、legacy 口剥头转发——legacy 设备的解析器会拒 seq `0x20`，属预期：无 admin 的 legacy 口只能走 `RESET_PORT`），不扇出全体、不触发本机设备半；无桥的板（纯 mux 构建）由设备半自己执行（照 `canserial.c` 的 `can_process_request_bootloader` 模式，`CONFIG_HAVE_BOOTLOADER_REQUEST` 守卫，index 字节设备忽略） |
 | `RESET_PORT` | `[0x04][index]` | 桥消费后对 `index` 口做**线级复位**：经 `bridge_port_ops.reset` 钩子（NULL=不支持 → 静默）；host 侧实现为 DTR\|RTS 断言 250 ms 的脉冲，用任务循环 idle 处的 poll 状态机延迟恢复（不阻塞不忙等；pty 等无 modem 线的 fd 返回 -1 静默）；**保持窗内重复发送按已完成处理**（不把此刻已断言的线态当成「原状态」重存，否则释放时恢复断言态、设备被永久按住） |
 
-**identify 字典的端口表**（仅桥构建出现，键名钉死供主机断言）：`BRIDGE_PORT_COUNT`（端口数）、
-`BRIDGE_PORT<n>_NAME`（该口 oid 名，host 串口为 `"uart0"`）、`BRIDGE_PORT<n>_TYPE`（`"uart"`）、
-`BRIDGE_PORT<n>_PATH`（诊断用，`CONFIG_HOST_BRIDGE_SERIAL_PATH` 的值）。`SET_PORT_NODEID` 里的
-`index` 就是这张表的下标；表随 arch 编译期声明，多端口/其他 arch 后端出现时按同样形状扩展
-（`BRIDGE_PORT<n>_*`）。
+**端口不再上报字典表**（M1-P7 起）：`BRIDGE_PORT_COUNT`/`BRIDGE_PORT<n>_NAME`/`_TYPE`/`_PATH`
+四键已**删除**。端口由**主机在配置期声明**——`config_uart oid=%c baud=%u` 建一个 UART 对象，
+`config_bridge_port oid=%c uart=%c` 把它接成桥的一个端口；**端口 `index` = 该端口节的声明顺序**
+（固件 `bridge_add_port` 取表内首个空位，与主机的下发顺序一致），`SET_PORT_NODEID` 的 `index`
+就是它。配置失败（baud 不可设、端口打不开、端口数超限）由固件 `shutdown` ⇒ 主机在**配置阶段**
+拿到点名错误。
 
 **两级寻址**：第一级是「主机 ↔ 桥」——桥在上游链路上有自己的 mux id（或 host 库身份），命令走
 admin id `0x3f0`；第二级是「桥 ↔ 下游某口的设备」——用 `SET_PORT_NODEID` 登记的 `id → 端口`
@@ -247,9 +249,12 @@ CAN 不需要这套东西：总线自带仲裁 id 与硬件过滤，每颗 MCU �
 
 ## 尚未落地
 
-- **微控制器架构还没启用 mux（刻意留后续）**：`MUX_SERIAL`/`BRIDGE_PORT_SERIAL` 目前只由 host
-  的两个开关选上。微控制器要照它们给控制台选 UART 的做法加一份 `choice` 备选串口（并排除控制台
-  已占用的那一路）再 select 它们；在那之前，共享**串口**仍然握手超时。
+- **微控制器架构的串口 mux 已接线**（M1-P7 的 FW-2/FW-3）：`MUX_SERIAL` 现在是公共的、**有 prompt**
+  能力（`depends on SERIAL`），选上后 MCU 控制台在架构无关层 `src/generic/serial_irq.c` 接
+  `mux_input`/`mux_send`（与 host 逐字同构），身份由各 arch 的 `chipid_init` 按
+  `src/generic/chipid_uuid.h`（与 CAN 同一派生）设进 `mux_set_uuid()`。**默认不开**：单元格式不是
+  上游 klippy 主机说的格式，必须刻意选择（host 库由 `HOST_MUX_SERIAL` 选上）。真板扫描/指派/冲突
+  与 `irq_save()` 段内时序仍属真机项。
 - **host 模式的数据面**：unit 接口已定义、固件也已按单元发出自己的帧，但**主机侧（klippyx）还没
   改用它**——`HostDevice` 仍走字节流/整帧。**分配段（扫描、`SET_NODEID`、重确认握手）走字节流
   这条已经通了**：mux 路径的真端到端 attach 就是走它。

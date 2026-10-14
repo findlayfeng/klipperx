@@ -3,18 +3,23 @@
 //! M1's configuration face (see the work-log plan): a downstream port is a
 //! named config section that later passes look up by section name, instead of
 //! the topology being learned from the wire. `*_mcu` says which `[mcu]` the
-//! port's hardware sits on (the bridge), `*_oid` names the port on that MCU as
-//! the firmware reports it. Grouping ports with the `[mcu]` sections that
-//! reference them, and everything transport-shaped, is later work — this
-//! module only parses each port section once and holds the answers.
+//! port's hardware sits on (the bridge). For a UART port, `uart_oid` is the
+//! name the host knows the port by, and `uart_baud` the rate the host opens its
+//! stream at — the firmware reports neither, because the host creates the port
+//! at configuration time instead: [`load_uart_device`] queues the
+//! `config_uart` / `config_bridge_port` pair on the bridge's builder and takes
+//! the port's **index** (its declaration order among the bridge's ports) from
+//! the bridge. Grouping ports with the `[mcu]` sections that reference them, and
+//! everything transport-shaped, is later work — this module only parses each
+//! port section once and holds the answers.
 //!
 //! # Options
 //!
 //! | option | meaning |
 //! |---|---|
 //! | `uart_mcu` / `can_mcu` | the `[mcu]` this port sits on; a section name, `mcu` for the bare `[mcu]` (required) |
-//! | `uart_oid` / `can_oid` | the oid name the firmware reports for this port (required, non-empty) |
-//! | `uart_baud` | the port's line rate, a positive integer (optional) |
+//! | `uart_oid` / `can_oid` | the name the host knows this port by (required, non-empty) |
+//! | `uart_baud` | the port's line rate, a positive integer (optional; `250000` when absent) |
 //! | `uart_restart_method` | the **line-level** reset the bridge gives a legacy device on this port — `arduino` (DTR) or `cheetah` (RTS/DTR); any other value is a config error (optional) |
 //!
 //! The `*_mcu` target is a **config-section** existence check
@@ -37,16 +42,18 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 
+use crate::core::klippy::cmd::uart::{ConfigBridgePort, ConfigUart, DEFAULT_UART_BAUD};
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
 use crate::core::klippy::load::section;
 use crate::core::klippy::printer::{Printer, PrinterObject};
 
-use super::McuRestartMethod;
+use super::{McuObject, McuRestartMethod};
 
-// The port sections describe hardware on an `[mcu]`, but nothing here looks an
-// MCU object up — the `*_mcu` check is against the config — so the order only
-// has to sit after `[mcu]`'s 10; 19 is the first free slot before the extras
-// block at 20 (15/16/18 are taken by `multi_pin`/`sx1509`/`force_move`).
+// The port sections describe hardware on an `[mcu]`, so their order only has to
+// sit after `[mcu]`'s 10 — the factory reads the bridge's `McuObject` (already
+// registered by then) to queue its configuration commands and take its port
+// index. 19 is the first free slot before the extras block at 20 (15/16/18 are
+// taken by `multi_pin`/`sx1509`/`force_move`).
 section!("uart_device", order = 19, prefix = load_uart_device);
 section!("can_device", order = 19, prefix = load_can_device);
 
@@ -65,6 +72,14 @@ pub struct UartPort {
     /// The line-level reset the bridge gives a legacy device on this port, when
     /// the config writes one.
     restart_method: Option<McuRestartMethod>,
+    /// The port's index on its bridge: its declaration order among the bridge's
+    /// ports, which is what the port-level `SET_PORT_NODEID` travels with.
+    ///
+    /// `None` until the loader's factory has wired the port to its bridge
+    /// ([`load_uart_device`], which queues the `config_uart` /
+    /// `config_bridge_port` pair and takes the next index from the bridge); a
+    /// section parsed on its own ([`UartPort::new`], in tests) has none.
+    index: Option<u8>,
 }
 
 impl UartPort {
@@ -124,6 +139,7 @@ impl UartPort {
             oid,
             baud,
             restart_method,
+            index: None,
         })
     }
 
@@ -152,6 +168,20 @@ impl UartPort {
     /// when the config writes one.
     pub fn restart_method(&self) -> Option<&McuRestartMethod> {
         self.restart_method.as_ref()
+    }
+
+    /// The port's index on its bridge — its declaration order among the
+    /// bridge's ports, which is what the port-level `SET_PORT_NODEID` carries.
+    ///
+    /// `None` for a section parsed outside the loader (see the field); a port
+    /// the loader built always has one.
+    pub fn index(&self) -> Option<u8> {
+        self.index
+    }
+
+    /// Record the index the bridge's port counter handed out.
+    pub(crate) fn set_index(&mut self, index: u8) {
+        self.index = Some(index);
     }
 }
 
@@ -224,12 +254,15 @@ impl PrinterObject for CanPort {
 /// Upstream's `load_config_prefix` shape for `[uart_device <name>]`.
 ///
 /// # Errors
-/// As [`UartPort::new`].
+/// As [`UartPort::new`], plus the bridge's own configuration failing to take
+/// this port ([`wire_bridge_port`]).
 pub fn load_uart_device(
     config: &ConfigWrapper,
-    _printer: &Arc<Printer>,
+    printer: &Arc<Printer>,
 ) -> Result<Arc<dyn PrinterObject>, ConfigError> {
-    Ok(Arc::new(UartPort::new(config)?))
+    let mut port = UartPort::new(config)?;
+    wire_bridge_port(config, printer, &mut port)?;
+    Ok(Arc::new(port))
 }
 
 /// Upstream's `load_config_prefix` shape for `[can_device <name>]`.
@@ -241,6 +274,73 @@ pub fn load_can_device(
     _printer: &Arc<Printer>,
 ) -> Result<Arc<dyn PrinterObject>, ConfigError> {
     Ok(Arc::new(CanPort::new(config)?))
+}
+
+/// Queue one UART port's firmware configuration on its bridge, and take the
+/// port's index from the bridge.
+///
+/// The firmware has no port of its own to report: the host creates it. So this
+/// queues the pair `cmd::uart` defines on the **bridge's** builder, in order —
+/// `config_uart` creates the byte stream at the section's rate (`250000` when
+/// the section wrote none) and `config_bridge_port` hands it to the router as a
+/// downstream port — and takes the next port index from the bridge. Both
+/// commands and the index have to agree: the bridge numbers ports by the order
+/// its `config_bridge_port` commands arrive, so the section-declaration order
+/// the loader calls this in is the port's index.
+///
+/// The `[mcu]` a port named is a config-section existence check in
+/// [`require_mcu`]; the object lookup here is the next step — the builder the
+/// commands go on — and can only fail if the section is not there, which the
+/// loader guarantees for a config it accepted.
+///
+/// # Errors
+/// [`ConfigError`] when the bridge's object cannot be found or its builder
+/// refuses another command or port (oid exhaustion, or a bridge already at its
+/// port limit).
+fn wire_bridge_port(
+    config: &ConfigWrapper,
+    printer: &Arc<Printer>,
+    port: &mut UartPort,
+) -> Result<(), ConfigError> {
+    let bridge_name = port.mcu();
+    let identifier = if bridge_name == "mcu" {
+        "mcu".to_string()
+    } else {
+        format!("mcu {bridge_name}")
+    };
+    let bridge = printer
+        .lookup_object_as::<McuObject>(&identifier)
+        .ok_or_else(|| {
+            ConfigError::new(format!(
+                "Section '{}': unknown MCU '{bridge_name}'",
+                config.identifier()
+            ))
+        })?;
+    let builder = bridge.config();
+    let on = |err: crate::core::klippy::mcu::McuError| {
+        ConfigError::new(format!(
+            "Section '{}': MCU '{bridge_name}' cannot take the port: {err}",
+            config.identifier()
+        ))
+    };
+    let uart_oid = builder.create_oid().map_err(on)?;
+    let port_oid = builder.create_oid().map_err(on)?;
+    let baud = port.baud().unwrap_or(DEFAULT_UART_BAUD);
+    builder
+        .add_config_cmd(&ConfigUart {
+            oid: uart_oid,
+            baud,
+        })
+        .map_err(on)?;
+    builder
+        .add_config_cmd(&ConfigBridgePort {
+            oid: port_oid,
+            uart: uart_oid,
+        })
+        .map_err(on)?;
+    let index = bridge.next_bridge_port_index(&config.identifier())?;
+    port.set_index(index);
+    Ok(())
 }
 
 /// The `[mcu]` **names** the config makes a bridge: every port section's
@@ -561,6 +661,11 @@ mod tests {
             .lookup_object_as::<UartPort>("uart_device uart0")
             .expect("the uart port registered");
         assert_eq!(uart.oid(), "uart0");
+        assert_eq!(
+            uart.index(),
+            Some(0),
+            "the loader assigned the port its declaration order"
+        );
         let can = printer
             .lookup_object_as::<CanPort>("can_device can0")
             .expect("the can port registered");

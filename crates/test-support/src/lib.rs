@@ -50,18 +50,21 @@ pub fn klipper_host_lib_path() -> std::path::PathBuf {
 ///
 /// A second host build of the same target, with the firmware's serial-mux
 /// device half compiled in (`CONFIG_HOST_BRIDGE_SERIAL`, which also selects
-/// `CONFIG_MUX` / `CONFIG_MUX_SERIAL`) and the frame API on. It has its own
-/// output directory, so the library [`klipper_host_lib_path`] names — which has
-/// neither — is untouched.
+/// `CONFIG_MUX_SERIAL` / `CONFIG_BRIDGE_PORT_SERIAL`; the routing bridge comes
+/// with the mux half) and the frame API on. It has its own output directory, so
+/// the library [`klipper_host_lib_path`] names — which has neither — is
+/// untouched.
 pub fn klipper_host_mux_lib_path() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("KLIPPER_HOST_MUX_LIB"))
 }
 
-/// The tty path the mux host library's bridge opens in `klipper_host_init()`.
+/// The tty path the mux host library's bridge opens for the host's UART
+/// objects.
 ///
-/// A path inside the build's own `OUT_DIR`, not a real device: the bridge fails
-/// init when it cannot open its port, so a test creates a pty there before
-/// loading the library.
+/// A path inside the build's own `OUT_DIR`, not a real device: the stream is
+/// opened when the host configures a UART object (`config_uart`), and a tty
+/// that cannot be opened fails that configuration, so a test creates a pty
+/// there before it configures a port.
 pub fn klipper_host_mux_serial_path() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("KLIPPER_HOST_MUX_SERIAL_PATH"))
 }

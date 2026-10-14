@@ -24,7 +24,7 @@
 //! It comes back with the statistics consumer.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -210,6 +210,17 @@ pub struct McuObject {
     /// The secondary clock alignment, when this is not the primary MCU
     /// (`SecondarySync`); `None` for the primary.
     secondary_sync: Mutex<Option<SecondarySync>>,
+    /// How many downstream ports have claimed an index on this MCU as a bridge.
+    ///
+    /// A bridge's ports are created at configuration time, in the order the
+    /// `[uart_device]` sections are declared, and that declaration order **is**
+    /// the port's index: the firmware numbers ports by the order the host's
+    /// `config_bridge_port` commands arrive
+    /// (`third_party/klipper/src/uart.c`), and the host queues them in this
+    /// order (`mcu/bridge_ports.rs`). So this counter is both "the next index"
+    /// and "how many ports this bridge has". Only a bridge is ever asked; a
+    /// plain `[mcu]` never is.
+    bridge_ports: AtomicU16,
     /// The periodic recalibration timer, cancelled on drop.
     recalibrate_timer: Mutex<Option<TimerHandle>>,
     /// The periodic clock poll timer (`mcu_clock_poll`), cancelled on drop.
@@ -253,6 +264,7 @@ impl McuObject {
             connect_shutdown: Arc::new(Mutex::new(None)),
             last_stats: Arc::new(Mutex::new(None)),
             secondary_sync: Mutex::new(None),
+            bridge_ports: AtomicU16::new(0),
             recalibrate_timer: Mutex::new(None),
             clock_poll_timer: Mutex::new(None),
             printer: Arc::downgrade(printer),
@@ -295,6 +307,30 @@ impl McuObject {
             .shared_baud
             .lock()
             .unwrap_or_else(|poison| poison.into_inner()) = baud;
+    }
+
+    /// Take the next downstream-port index for this MCU as a bridge.
+    ///
+    /// A port's index is its declaration order among the bridge's ports (see
+    /// the field): the first port section on a bridge gets 0, the next 1, and
+    /// so on. The port-level `SET_PORT_NODEID` carries the index in one byte, so
+    /// a bridge can hold at most 256 ports; the 257th is refused here, naming
+    /// the port and the index it would have had, instead of wrapping onto an
+    /// existing port's route.
+    ///
+    /// # Errors
+    /// [`ConfigError`] when this bridge already has every port a port command
+    /// can address.
+    pub fn next_bridge_port_index(&self, port: &str) -> Result<u8, ConfigError> {
+        let index = self.bridge_ports.fetch_add(1, Ordering::Relaxed);
+        if index > u16::from(u8::MAX) {
+            return Err(ConfigError::new(format!(
+                "Section '{port}': bridge '{}' already has the 256 ports a port command can \
+                 address; port {index} cannot be named (0..=255)",
+                self.name()
+            )));
+        }
+        Ok(index as u8)
     }
 
     /// What this MCU's `host_library:` path attaches with, when the config

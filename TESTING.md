@@ -131,9 +131,10 @@
 - [ ] **M1-2 桥下游端口 attach（命名设备）** —— 端口上那台**能答 admin** 的设备带 `uuid:`：主机对桥
   发 `SET_PORT_NODEID(index, id, MUX_PORT_UNITS)`，对设备发 `SET_KLIPPER_NODEID` + 重确认握手，
   之后按整单元原样转发。判定：同上跑通，且能与 M1-1 共存于同一桥（一条端口一种形态）。
-- [ ] **M1-3 端口 `index` 与 identify 端口表对账** —— 桥报的 `BRIDGE_PORT_COUNT/_NAME/_TYPE/_PATH`
-  与配置里的 `(桥, oid)` 对上、`index` 与线上命令一致。判定：故意写错 oid/类型时，主机在上
-  identify 后报出点名错误，而不是静默连错设备。
+- [ ] **M1-3 端口配置期的显式失败与 `index` 一致**（M1-P7 起取代旧的「端口表对账」）—— 端口由主机在
+  配置期用 `config_uart`/`config_bridge_port` 声明，`index` = 端口节声明顺序。判定：把端口 tty
+  指向不存在的设备（或写一个不可设的 baud）时，主机在**配置阶段**报出点名错误（含桥名与
+  `config_uart` 原因），而不是 init 失败或静默；两个端口节时 `index` 0/1 与线上命令一致。
 - [ ] **M2-1 `RESET_PORT` 的电气极性与保持** —— 桥对某端口断言 **DTR\|RTS 250 ms** 能否真把下游
   板复位（取决于板子是 DTR 还是 RTS 敏感、高电平还是低电平有效）。判定：下游确实重启并重新
   identify；同时确认**桥自己**没被按在复位上（连续两条 `RESET_PORT` 也不锁存）。

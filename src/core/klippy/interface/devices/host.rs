@@ -1387,7 +1387,8 @@ mod host_tests {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
 
-        // The bridge opens its port while the library comes up, so the tty has
+        // The bridge's port is opened when the host declares it at
+        // configuration time, so the tty has
         // to exist first - the same trick the device-half test uses.
         let pty = Pty::new();
         let bridge_path = klipperx_test_support::klipper_host_mux_serial_path();
@@ -1572,10 +1573,52 @@ mod host_tests {
     /// no arguments (id plus args, the way [`Parser::encode`] produces it) in a
     /// frame carrying the sequence byte `seq`.
     fn command_frame(parser: &Parser, name: &str, seq: u8) -> Vec<u8> {
+        encode_command_frame(parser, name, &[], seq)
+    }
+
+    /// As [`command_frame`], with the command's arguments — the shape a
+    /// configuration command (`config_uart`, `allocate_oids`) needs.
+    fn encode_command_frame(parser: &Parser, name: &str, args: &[ArgValue], seq: u8) -> Vec<u8> {
         let payload = parser
-            .encode(name, &[])
+            .encode(name, args)
             .unwrap_or_else(|e| panic!("encode {name}: {e}"));
         Frame::encode(seq, payload.payload())
+    }
+
+    /// Create the bridge's port 0 on a freshly loaded library: the oid table,
+    /// the UART object at the tty path this build baked in, and the port that
+    /// carries it — the pair of configuration commands the loader queues
+    /// (`mcu/bridge_ports.rs`, `third_party/klipper/src/uart.c`).
+    ///
+    /// The bridge has no compile-time port, so every test that wants port 0
+    /// starts here — after the tty exists. The three frames use advancing
+    /// sequence bytes, which is the discipline the firmware's `next_sequence`
+    /// checks (`command.c`): a repeated sequence is a lost message, discarded
+    /// until retransmitted.
+    fn configure_port_zero(device: &mut HostDevice) {
+        let mut parser = Parser::new();
+        mux_dictionary()
+            .install(&mut parser)
+            .expect("install the mux build's dictionary");
+        for (seq, (name, args)) in [
+            ("allocate_oids", vec![ArgValue::UInt8(2)]),
+            (
+                "config_uart",
+                vec![ArgValue::UInt8(0), ArgValue::UInt32(250_000)],
+            ),
+            (
+                "config_bridge_port",
+                vec![ArgValue::UInt8(1), ArgValue::UInt8(0)],
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let frame = encode_command_frame(&parser, name, &args, seq as u8);
+            device
+                .write(&frame)
+                .unwrap_or_else(|e| panic!("the {name} frame goes in: {e}"));
+        }
     }
 
     /// A whole unit's arbitration id and the frame behind its header.
@@ -1688,10 +1731,11 @@ mod host_tests {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
 
-        // The bridge opens its port while klipper comes up and init fails when
-        // it cannot, so the tty has to exist first: a pty whose slave is
-        // reachable at the path this build baked in. The `Pty` keeps both ends
-        // open for the whole test.
+        // The port is opened when the host declares it at configuration time
+        // (`config_uart`), so the tty has to exist before that: a pty whose
+        // slave is reachable at the path this build baked in. The `Pty` keeps
+        // both ends open for the whole test. (This test sends no configuration
+        // commands of its own, so the pty is only here to keep the path valid.)
         let pty = Pty::new();
         let bridge_path = klipperx_test_support::klipper_host_mux_serial_path();
         let _ = std::fs::remove_file(&bridge_path);
@@ -1873,8 +1917,9 @@ mod host_tests {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
 
-        // The bridge opens its port while klipper comes up, so the tty has to
-        // exist first — the same setup the device-half test uses.
+        // The bridge opens its configured port while the host configures it,
+        // so the tty has to exist first — the same setup the device-half test
+        // uses.
         let pty = Pty::new();
         let bridge_path = klipperx_test_support::klipper_host_mux_serial_path();
         let _ = std::fs::remove_file(&bridge_path);
@@ -1895,34 +1940,37 @@ mod host_tests {
         // have run, short enough to keep the silence checks cheap.
         let quiet = Duration::from_millis(500);
 
-        // A. The port table is in the mux build's dictionary: the count, name,
-        //    type and path of the port `SET_PORT_NODEID`'s index travels with.
+        // A. The mux build's dictionary carries the two configuration commands
+        //    that create a bridge's ports (`config_uart` / `config_bridge_port`,
+        //    `third_party/klipper/src/uart.c`) and no compile-time port table:
+        //    the ports are the host's to name at configuration time.
         let dictionary = mux_dictionary();
-        assert_eq!(
-            dictionary.constant_f64("BRIDGE_PORT_COUNT"),
-            Some(1.0),
-            "the bridge reports exactly one port"
-        );
-        assert_eq!(
-            dictionary
-                .constant("BRIDGE_PORT0_TYPE")
-                .and_then(|value| value.as_str()),
-            Some("uart"),
-            "the port's type is in the dictionary"
-        );
-        for key in ["BRIDGE_PORT0_NAME", "BRIDGE_PORT0_PATH"] {
+        for name in ["config_uart", "config_bridge_port"] {
             assert!(
-                dictionary
-                    .constant(key)
-                    .and_then(|value| value.as_str())
-                    .is_some(),
-                "{key} is in the dictionary"
+                dictionary.message(name).is_some(),
+                "{name} is in the mux build's dictionary"
+            );
+        }
+        for gone in [
+            "BRIDGE_PORT_COUNT",
+            "BRIDGE_PORT0_NAME",
+            "BRIDGE_PORT0_TYPE",
+            "BRIDGE_PORT0_PATH",
+        ] {
+            assert!(
+                dictionary.constant(gone).is_none(),
+                "the compile-time port table ({gone}) is gone: ports are declared at \
+                 configuration time"
             );
         }
         let mut parser = Parser::new();
         dictionary
             .install(&mut parser)
             .expect("install the mux build's dictionary");
+
+        // The firmware's port numbering starts from the host's configuration:
+        // create port 0's stream (the tty) and hand it to the bridge.
+        configure_port_zero(&mut device);
 
         // B. `SET_PORT_NODEID(0, 7, 0)` names a legacy device on port 0. It is
         //    the bridge's own business: no receipt comes back upstream and
@@ -2125,7 +2173,8 @@ mod host_tests {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
 
-        // The bridge opens its port while klipper comes up, so the tty has to
+        // The bridge's port is opened when the host declares it at
+        // configuration time, so the tty has to
         // exist first — the same setup the port-command probe uses.
         let pty = Pty::new();
         let bridge_path = klipperx_test_support::klipper_host_mux_serial_path();
@@ -2147,6 +2196,10 @@ mod host_tests {
         let window = Duration::from_secs(5);
         // A short window for the negative steps, as in the port-command probe.
         let quiet = Duration::from_millis(500);
+
+        // The bridge starts with no ports: the host creates them at
+        // configuration time. Port 0 is a UART object handed to the bridge.
+        configure_port_zero(Arc::get_mut(&mut device).expect("the test holds the only reference"));
 
         // Naming the device behind port 0 is the bridge's business: nothing goes
         // down the port and no receipt comes back.
@@ -2245,7 +2298,8 @@ mod host_tests {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
 
-        // The bridge opens its port while klipper comes up, so the tty has to
+        // The bridge's port is opened when the host declares it at
+        // configuration time, so the tty has to
         // exist first — the same setup the other port tests use.
         let pty = Pty::new();
         let bridge_path = klipperx_test_support::klipper_host_mux_serial_path();
@@ -2264,8 +2318,9 @@ mod host_tests {
         // this a device behind a port.
         let named = [0x99, 0x88, 0x77, 0x66, 0x55, 0x44];
         let downstream_id = 7u32;
-        let device = HostDevice::load_downstream(mux_library_path(), identity, downstream_id)
+        let mut device = HostDevice::load_downstream(mux_library_path(), identity, downstream_id)
             .expect("a downstream reference loads without a handshake");
+        configure_port_zero(Arc::get_mut(&mut device).expect("the test holds the only reference"));
 
         // The route first: port 0 owns id 7, and its device speaks units — it
         // answers the admin channel itself, which is what a named device does.
@@ -2531,7 +2586,8 @@ mod host_tests {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
 
-        // The bridge opens its port while klipper comes up, so the tty has to
+        // The bridge's port is opened when the host declares it at
+        // configuration time, so the tty has to
         // exist first — the same setup the other port tests use.
         let pty = Pty::new();
         let bridge_path = klipperx_test_support::klipper_host_mux_serial_path();
@@ -2548,6 +2604,7 @@ mod host_tests {
         let downstream_id = 7u32;
         let mut device = HostDevice::load_downstream(mux_library_path(), identity, downstream_id)
             .expect("a downstream reference loads without a handshake");
+        configure_port_zero(Arc::get_mut(&mut device).expect("the test holds the only reference"));
 
         // The bridge's port table: port 0 holds a legacy device at id 7. This is
         // the route — until it is in, nothing sent under id 7 reaches any port.

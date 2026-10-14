@@ -102,7 +102,7 @@ uart: uartxx                    # 无 uuid ⇒ legacy，原始帧
 端口级命令 `SET_PORT_NODEID(index, id, flags)` 直接告诉桥，**下游设备全程不答任何 admin**（线上
 帧形与命令族见[串口复用协议](../developer-manual/serial-mux-protocol.md)）。
 
-> **状态（M1 分期）**：**已落地**。连接时：identify 后按固件报出的端口表把 `(桥, oid名)` 对成端口 `index`（类型不符 / 表里没这个口都点名报错），`legacy` 只向桥发 `SET_PORT_NODEID(index, id, 0)` 之后按原始帧收发；命名设备（写了 `uuid:`）先发同一条（`flags` 带「说单元」位）再做 `SET_KLIPPER_NODEID` + 重确认，之后整单元原样转发。**顺序约束**：桥必须**先于**该子节连接（顺序不对报点名错误，不会自愈）；又因为裸 `[mcu]` 同阶段总先于 `[mcu <名>]` 装载，**桥是裸 `[mcu]` 时子节必须写成 `[mcu <名>]`**。桥经 **CAN** 上游的下游 attach 属 **P5**，现在点名报错。
+> **状态**：**已落地**（2026-10-15 改为配置期声明）。**端口在配置期由主机声明**：主机为每个 `[uart_device]` 发 `config_uart`（带该节的 `uart_baud`）与 `config_bridge_port`（把该 UART 对象接给桥），**端口 `index` = 声明顺序**；固件侧没有端口表，`shutdown`（如 baud 不可设、tty 打不开、端口数超限）会变成**主机的配置阶段显式报错**。连接时：`legacy` 只向桥发 `SET_PORT_NODEID(index, id, 0)` 之后按原始帧收发；命名设备（写了 `uuid:`）先发同一条（`flags` 带「说单元」位）再做 `SET_KLIPPER_NODEID` + 重确认，之后整单元原样转发。**顺序约束**：桥必须**先于**该子节连接（顺序不对报点名错误，不会自愈）；又因为裸 `[mcu]` 同阶段总先于 `[mcu <名>]` 装载，**桥是裸 `[mcu]` 时子节必须写成 `[mcu <名>]`**。**`[can_device]` 端口暂不能接给桥**（属 P5），会点名报错。
 
 ## 固件重启方式（`restart_method`）
 

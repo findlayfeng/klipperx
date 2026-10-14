@@ -1069,8 +1069,9 @@ impl UnitStream {
     /// The next complete unit and the arbitration id its header names, or `None`
     /// if none is buffered.
     ///
-    /// The id is what lets an addressed reader ([`HostDevice`](super::host::HostDevice))
-    /// keep the units meant for it and drop the rest; a scan
+    /// The id is what lets an addressed reader route the unit to the reference
+    /// it belongs to — the host library's reader does exactly that with it
+    /// (`host.rs`'s `route_unit`) — while a scan
     /// ([`serial_query_unassigned`]) reads units whole and ignores it.
     ///
     /// Exactly the [`dispatch`] policy: an invalid header or a length byte

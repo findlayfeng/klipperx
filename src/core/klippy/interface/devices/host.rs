@@ -15,10 +15,10 @@
 //!
 //! **Its main loop blocks.** `klipper_host_run` only returns once
 //! `klipper_host_shutdown` is called, so it gets a thread of its own. Output is
-//! pull-only, so a second thread waits in `klipper_host_output_wait` and
-//! forwards what it reads to the references' receivers over a channel — when
-//! that thread stops, the channel disconnects and a blocked `receive` returns
-//! `None`, which is exactly [`Device::receive`]'s "no further frames" contract.
+//! pull-only, so a second thread waits in it and hands what it reads to the
+//! references — when that thread stops, the channels it feeds disconnect and a
+//! blocked `receive` returns `None`, which is exactly [`Device::receive`]'s "no
+//! further frames" contract.
 //!
 //! **One library per path, several references.** `HostLibrary` is the loaded
 //! library (one `dlopen`, one runtime thread, one reader), shared through the
@@ -30,18 +30,22 @@
 //! library unloaded (a later load maps it afresh, exactly as if the board had
 //! been power-cycled).
 //!
-//! The firmware side of sharing is **not implemented yet**: the current library
-//! runs a single firmware instance, so against that old firmware only one
-//! reference should do live I/O at a time. The references share one output
-//! queue, and a frame is taken by whichever reference reads first — a competing
-//! queue, not a broadcast — so two live readers would steal each other's frames;
-//! each reference is nonetheless a fresh handle speaking the ordinary protocol.
-//! What
-//! already holds is the communication reuse itself: the library is loaded once,
+//! **One reader, one slot per addressed reference.** The library's output is a
+//! single byte stream, so the library has **one** reader thread — and that
+//! thread is the router: on a muxed path it cuts whole units out of the stream
+//! and delivers each to the slot of the id its header names, exactly as the
+//! shared serial port's reader does. A reference on such a path reads only its
+//! own slot, so a live reference to the bridge's own device and a live
+//! reference to a device behind one of its ports no longer take turns with each
+//! other's bytes: each gets whole units, in order, and none of the other's.
+//!
+//! A **bare** path has no id to route by — the reference *is* the device — so
+//! its references still share the one output channel, and against a library
+//! whose firmware has no mux only one should do live I/O at a time. What holds
+//! either way is the communication reuse itself: the library is loaded once,
 //! several references can exist against it, and the identify handshake and
 //! `get_clock` round trip run unchanged against a library that knows nothing of
-//! sharing — which is what "old-firmware compatibility" means here. The bridge
-//! that routes between live references will grow in the firmware later.
+//! sharing — which is what "old-firmware compatibility" means here.
 //!
 //! **Two I/O modes.** The default mode is chosen at compile time: in a debug
 //! build the library is read and written one byte per call, so every frame
@@ -76,7 +80,7 @@ use crate::core::klippy::frame::Frame;
 use crate::core::klippy::frame::FrameStream;
 use crate::core::klippy::interface::error::InterfaceError;
 use crate::core::klippy::interface::{describe_frame, Device};
-use crossbeam_channel::{unbounded, Receiver, RecvTimeoutError};
+use crossbeam_channel::{unbounded, Receiver, RecvTimeoutError, Sender};
 use libloading::Library;
 use std::collections::HashMap;
 use std::fmt;
@@ -168,11 +172,11 @@ fn library_for(
         HostLibrary::open(path, mode, identity)
     })?;
     let identity = identity.unwrap_or([0; 6]);
-    if library.mode != mode || library.identity != identity {
+    if library.router.mode != mode || library.identity != identity {
         return Err(InterfaceError::Other(format!(
             "klipper host library {} is already loaded with a different output mode or \
              identity, which are fixed when the library is opened",
-            library.library_path.display()
+            library.router.library_path.display()
         )));
     }
     Ok(library)
@@ -257,29 +261,39 @@ impl Symbols {
 /// every [`HostDevice`] opened on its path.
 ///
 /// Klipper's state lives inside the library, so there is one instance per
-/// loaded mapping: the one runtime thread, the one output reader, the one
-/// output channel. Communication references ([`HostDevice`]) hold an `Arc` to
-/// this; the library is loaded when the first reference needs it and unloaded
-/// (threads joined, code unmapped) when the last one is dropped, which is also
-/// what makes it safe to call `klipper_host_init` again for a later library:
-/// unmapping and remapping starts the firmware from its initializers, exactly
-/// as a power-cycled board would.
+/// loaded mapping: the one runtime thread, the one output reader, and the
+/// per-id slots that reader routes a muxed path's units to. Communication
+/// references ([`HostDevice`]) hold an `Arc` to this; the library is loaded
+/// when the first reference needs it and unloaded (threads joined, code
+/// unmapped) when the last one is dropped, which is also what makes it safe to
+/// call `klipper_host_init` again for a later library: unmapping and remapping
+/// starts the firmware from its initializers, exactly as a power-cycled board
+/// would.
 struct HostLibrary {
     /// Keeps the mapped code the symbols point into alive. Never read: the
     /// [`Drop`] impl joins the threads before any field is dropped, and
     /// `Drop::drop` runs ahead of field drops, so unmapping here is safe.
     _library: Library,
     symbols: Symbols,
-    library_path: PathBuf,
-    /// Which output API the reader thread reads (fixed when the library is
-    /// opened; [`library_for`] refuses a reference that asks for the other).
-    mode: OutputMode,
+    /// The path the library was loaded from, and the routing state its reader
+    /// shares with its references. Both live in the [`Router`] because the
+    /// reader holds an `Arc` to **that** — never to the library, which would
+    /// let it postpone the unload (see [`Router`]).
+    router: Arc<Router>,
+    /// The read the reader thread makes — `klipper_host_output_wait` (the byte
+    /// stream) or, in a release build's default mode,
+    /// `klipper_host_output_frame` (whole frames). Resolved here because the
+    /// frame symbol exists only in the [`Library`] this struct owns.
+    read_output: OutputFn,
     /// The identity this library was given before klipper came up, all zeros
     /// when none was ([`HostLibrary::open`]). Printed by the firmware and
     /// answered to the mux, so a request for another one is refused.
     identity: [u8; 6],
-    /// Raw bytes from Klipper, in arrival order. The library's own receiver is
-    /// the template every [`HostDevice`] clones; it never reads it itself.
+    /// The one output channel a **bare** path's references share: bytes (or
+    /// whole frames) from Klipper, in arrival order, the reader the only
+    /// producer and every bare reference holding a clone of the receiver. A
+    /// muxed path sends nothing here — its units go to the router's slots — so
+    /// no reference reads it and the two ends of the channel just sit idle.
     output: Receiver<Vec<u8>>,
     /// Set by the final teardown, in [`Drop`], and polled by the reader thread
     /// it must join.
@@ -297,6 +311,47 @@ struct HostLibrary {
     /// is taken only around one unit's bytes and never across a wait, and the
     /// read path never takes it, so the two cannot deadlock.
     write_lock: Mutex<()>,
+}
+
+/// The routing state a [`HostLibrary`] and its reader share.
+///
+/// The library's one reader is the router of a muxed path: it cuts units out of
+/// the byte stream and delivers each to the slot of the id its header names.
+/// It does that through this structure — the slots, the mode that says whether
+/// there is anything to route, and the path it names in its logs — and holds an
+/// `Arc` to **it** rather than to the library. A reader holding the library, as
+/// an `Arc` or as a `Weak` it upgrades, would keep the last reference count up:
+/// the unload is that last reference's [`Drop`], so the reader could postpone it
+/// — or, having held the last count itself, run it, and the join of its own
+/// thread, on the reader thread.
+struct Router {
+    /// The path the library was loaded from; named in the reader's logs.
+    library_path: PathBuf,
+    /// Which output API the reader reads, and whether it routes at all (fixed
+    /// when the library is opened; [`library_for`] refuses a reference that asks
+    /// for another one).
+    mode: OutputMode,
+    /// One slot per muxed reference on a muxed path, keyed by the MCU id the
+    /// unit headers name — the shape
+    /// [`SharedSerialPort`](super::serial::SharedSerialPort)'s own slots have.
+    /// The reader is the only producer ([`push_unit`]); a reference reads only
+    /// its own slot, so one reference's units can never be taken by another.
+    slots: Mutex<HashMap<u32, Sender<Vec<u8>>>>,
+}
+
+impl Router {
+    /// Give `mcu_id` a slot and hand back the receiver its reference reads.
+    ///
+    /// Every unit the reader decodes to `mcu_id` is delivered here
+    /// ([`push_unit`]) and nothing else is, which is what keeps two live
+    /// references on one library from splitting the stream. An id that is
+    /// already registered is replaced, so a later reference on the same id
+    /// takes its units over.
+    fn open_slot(&self, mcu_id: u32) -> Receiver<Vec<u8>> {
+        let (sender, receiver) = unbounded::<Vec<u8>>();
+        self.slots.lock().unwrap().insert(mcu_id, sender);
+        receiver
+    }
 }
 
 impl HostLibrary {
@@ -363,38 +418,29 @@ impl HostLibrary {
 
         let (output_tx, output) = unbounded::<Vec<u8>>();
         let stopped = Arc::new(AtomicBool::new(false));
-        let mut threads = Vec::with_capacity(2);
 
         // Klipper's main loop blocks until shutdown, and drives everything else,
         // so it has to be its own thread.
         let run = symbols.run;
-        threads.push(
-            thread::Builder::new()
-                .name("klipper-runtime".to_string())
-                .spawn(move || {
-                    info!("klipper runtime started");
-                    unsafe { run() };
-                    info!("klipper runtime returned");
-                })
-                .map_err(|e| InterfaceError::Other(format!("failed to spawn runtime: {e}")))?,
-        );
+        let runtime = thread::Builder::new()
+            .name("klipper-runtime".to_string())
+            .spawn(move || {
+                info!("klipper runtime started");
+                unsafe { run() };
+                info!("klipper runtime returned");
+            })
+            .map_err(|e| InterfaceError::Other(format!("failed to spawn runtime: {e}")))?;
 
-        // Output is pull-only, so it gets a thread of its own. That thread owns
-        // the sender, so when it stops the channel disconnects and every blocked
-        // `receive` wakes up with `None` — no separate "unblock" signal needed.
-        // It holds only a clone of `stopped` (and no `Arc<HostLibrary>`), so it
-        // can never keep the library alive on its own.
-        let poller_stopped = Arc::clone(&stopped);
         // The reader's read is the mode's: the byte stream in a debug build and
-        // in `OutputMode::Bytes`, whole frames in a release build's default mode.
-        // The frame API only exists in a library built with
+        // in `OutputMode::Bytes`/`Mux`, whole frames in a release build's
+        // default mode. The frame API only exists in a library built with
         // CONFIG_HOST_FRAME_API, and **only the default mode asks for it**: a
-        // bytes-mode load (the bench scan) reads the stream, so it loads
-        // against the byte-stream API that every build has.
+        // mux unit is not a frame boundary, so a bytes- or mux-mode load reads
+        // the byte-stream API that every build has.
         #[cfg(debug_assertions)]
-        let poller_read = symbols.output_wait;
+        let read_output = symbols.output_wait;
         #[cfg(not(debug_assertions))]
-        let poller_read = match mode {
+        let read_output = match mode {
             OutputMode::Bytes | OutputMode::Mux => symbols.output_wait,
             OutputMode::Default => unsafe {
                 library
@@ -408,56 +454,59 @@ impl HostLibrary {
                     .map(|symbol| *symbol)?
             },
         };
-        let poller = thread::Builder::new()
-            .name("klipper-output".to_string())
-            .spawn(move || {
-                let mut buf = vec![0u8; OUTPUT_BATCH];
-                while !poller_stopped.load(Ordering::Relaxed) {
-                    // Blocks in the library until data arrives or the wait expires,
-                    // so no polling interval is needed here. How much arrives is
-                    // the mode's business: a byte in a debug build, a whole frame in a
-                    // release build.
-                    let read = unsafe { poller_read(buf.as_mut_ptr(), buf.len(), OUTPUT_WAIT_MS) };
-                    if read == 0 {
-                        continue;
-                    }
-                    if output_tx.send(buf[..read].to_vec()).is_err() {
-                        break; // nobody is receiving any more
-                    }
-                }
-                debug!("klipper output reader stopped");
-            });
-        match poller {
-            Ok(handle) => threads.push(handle),
-            Err(e) => {
-                // The runtime thread is already inside klipper. Stop it and wait
-                // for it, because the `Library` below is about to be unloaded and
-                // it must not be executing library code when that happens.
-                unsafe { (symbols.shutdown)() };
-                for handle in threads.drain(..) {
-                    let _ = handle.join();
-                }
-                return Err(InterfaceError::Other(format!(
-                    "failed to spawn poller: {e}"
-                )));
-            }
-        }
 
-        info!(
-            "klipper host library loaded from {}",
-            library_path.display()
-        );
-        Ok(Arc::new(Self {
+        let shared = Arc::new(Self {
             _library: library,
             symbols,
-            library_path,
-            mode,
+            router: Arc::new(Router {
+                library_path,
+                mode,
+                slots: Mutex::new(HashMap::new()),
+            }),
+            read_output,
             identity,
             output,
             stopped,
-            threads: Mutex::new(threads),
+            threads: Mutex::new(vec![runtime]),
             write_lock: Mutex::new(()),
-        }))
+        });
+
+        // Output is pull-only, so it gets a thread of its own. That thread owns
+        // the bare channel's sender, so when it stops the channel disconnects
+        // and every blocked `receive` wakes up with `None` — no separate
+        // "unblock" signal needed. It holds the [`Router`] and never the
+        // library, so it can neither keep the library alive nor run its unload.
+        //
+        // A failure to spawn it leaves `shared` to be dropped here, and
+        // [`HostLibrary`]'s `Drop` stops the runtime thread and waits for it
+        // before the library is unmapped.
+        shared.start_reader(output_tx)?;
+
+        info!(
+            "klipper host library loaded from {}",
+            shared.router.library_path.display()
+        );
+        Ok(shared)
+    }
+
+    /// Spawn the library's one output reader.
+    ///
+    /// One reader, not one per reference: the library's output is a single
+    /// byte stream, and two readers taking turns with it would each hold half a
+    /// unit ([`reader_loop`]). The thread holds the [`Router`] — the slots it
+    /// routes into, never the library — and the bare channel's sender, which is
+    /// what makes a stopped reader disconnect every bare reference's
+    /// `receive`.
+    fn start_reader(self: &Arc<Self>, bare: Sender<Vec<u8>>) -> Result<(), InterfaceError> {
+        let router = Arc::clone(&self.router);
+        let stopped = Arc::clone(&self.stopped);
+        let read = self.read_output;
+        let handle = thread::Builder::new()
+            .name("klipper-output".to_string())
+            .spawn(move || reader_loop(router, stopped, read, bare))
+            .map_err(|e| InterfaceError::Other(format!("failed to spawn poller: {e}")))?;
+        self.threads.lock().unwrap().push(handle);
+        Ok(())
     }
 }
 
@@ -476,6 +525,104 @@ impl Drop for HostLibrary {
     }
 }
 
+/// Read the library and hand what arrives to the references holding it, until
+/// the library is unloaded.
+///
+/// The library's **only** producer, and on a muxed path its **router**: the
+/// bytes are cut into whole units here ([`UnitStream`], which reassembles a
+/// unit across reads — a debug build's read is a single byte) and each unit
+/// goes to the slot of the id its header names ([`route_unit`]). Two references
+/// on one library therefore never take turns with the stream, which is what a
+/// reader per reference used to do.
+///
+/// A **bare** path has no id to route by, so nothing is decoded: the read goes
+/// to the one channel its references share, exactly as the library handed it
+/// over — raw bytes for a bench scan's `Bytes`, a frame or a byte for
+/// `Default`.
+fn reader_loop(
+    router: Arc<Router>,
+    stopped: Arc<AtomicBool>,
+    read: OutputFn,
+    bare: Sender<Vec<u8>>,
+) {
+    let mut buf = vec![0u8; OUTPUT_BATCH];
+    let mut units = UnitStream::new();
+    while !stopped.load(Ordering::Relaxed) {
+        // Blocks in the library until data arrives or the wait expires, so no
+        // polling interval is needed here. How much arrives is the mode's
+        // business: a byte in a debug build, a whole frame or a mux unit's
+        // worth of bytes in a release build.
+        let taken = unsafe { read(buf.as_mut_ptr(), buf.len(), OUTPUT_WAIT_MS) };
+        if taken == 0 {
+            continue; // the wait expired with nothing to read
+        }
+        // Nothing here holds the library — see [`Router`] — so the last
+        // reference's drop is what stops this read and unloads the library,
+        // and it can never be this thread that runs that unload.
+        match router.mode {
+            OutputMode::Mux => {
+                units.feed(&buf[..taken]);
+                while let Some((arb, unit)) = units.take_unit_with_arb() {
+                    route_unit(&router, arb, unit);
+                }
+            }
+            OutputMode::Bytes | OutputMode::Default => {
+                if bare.send(buf[..taken].to_vec()).is_err() {
+                    break; // no reference is reading the bare channel any more
+                }
+            }
+        }
+    }
+    debug!("klipper output reader stopped");
+}
+
+/// Route one whole unit the reader cut out of a muxed path's byte stream.
+///
+/// The policy is the shared serial port's router's: a unit whose header decodes
+/// to an mcu id goes to that id's slot ([`push_unit`]), and a unit that names no
+/// id is dropped. The admin ids
+/// ([`ADMIN_LISTEN`]/[`ADMIN_REPLY`]) are not assigned ids
+/// ([`assign::mcu_id_from_arb`] is `None` for them) — they belong to the bridge,
+/// which consumes and answers them itself — so nothing upstream of the bridge
+/// is ever their reader and both transports drop them for that reason.
+///
+/// The serial router also diverts the assignment answer to a field of its own,
+/// because its slot reassembles *frames* and the answer's pseudo-frame would
+/// look malformed there. A slot here carries whole **units**, which the
+/// reference cuts with [`UnitStream`] — the same stream
+/// [`HostDevice::attach`]'s handshake scans — so the answer is routed by its
+/// header like everything else and reaches the reference waiting for it.
+fn route_unit(router: &Router, arb: u32, unit: Vec<u8>) {
+    match assign::mcu_id_from_arb(arb) {
+        Some(mcu_id) => push_unit(router, mcu_id, unit),
+        None => debug!(
+            "klipper host library {}: {arb:#x} names no mcu id; dropping unit",
+            router.library_path.display()
+        ),
+    }
+}
+
+/// Hand one whole unit to the reference `mcu_id` belongs to.
+///
+/// The send is into an unbounded channel and the slot map is locked only long
+/// enough to take the sender out, so the reader never waits on a reference —
+/// which is what keeps the two from deadlocking. A unit for an id no reference
+/// holds (or whose reference is gone) is reported and dropped, like the shared
+/// serial port's `push_frame` dropping a frame for an unregistered MCU.
+fn push_unit(router: &Router, mcu_id: u32, unit: Vec<u8>) {
+    let sender = router.slots.lock().unwrap().get(&mcu_id).cloned();
+    let delivered = match sender {
+        Some(sender) => sender.send(unit).is_ok(),
+        None => false,
+    };
+    if !delivered {
+        debug!(
+            "klipper host library {}: no live reference for mcu {mcu_id}; dropping unit",
+            router.library_path.display()
+        );
+    }
+}
+
 /// Bytes asked of the library per read.
 ///
 /// A debug build reads a byte at a time, which is the hardest case for
@@ -483,7 +630,7 @@ impl Drop for HostLibrary {
 /// [`FrameStream`]. A release build asks for one frame at a time, and
 /// [`MESSAGE_MAX`](crate::core::klippy::frame::MESSAGE_MAX) is the largest one
 /// the protocol can produce — and a whole mux unit fits, so it is the batch a
-/// release build's bytes-mode reader asks for too.
+/// release build's bytes- and mux-mode reader asks for too.
 #[cfg(debug_assertions)]
 const OUTPUT_BATCH: usize = 1;
 #[cfg(not(debug_assertions))]
@@ -505,30 +652,33 @@ pub struct HostDevice {
     library: Arc<HostLibrary>,
     /// This reference's number, to tell the handles on one library apart.
     reference: usize,
-    /// Raw bytes from Klipper, in arrival order, for this reference.
+    /// What this reference reads, in arrival order.
     ///
-    /// A clone of the library's one receiver over its one output channel: with
-    /// the firmware's bridge unimplemented, all references share the single
-    /// output queue and each frame goes to whichever reference reads it first
-    /// (a competing queue, not a broadcast), so only one is live against old
-    /// firmware at a time (see the module docs).
-    output: Receiver<Vec<u8>>,
+    /// A **muxed** reference reads the slot its own id owns, which the
+    /// library's reader fills with the units addressed to it ([`push_unit`]):
+    /// no other reference's unit is ever in here, so both sides of a live mux
+    /// session get whole units. A **bare** reference reads a clone of the
+    /// library's one output channel: all bare references share that queue and a
+    /// frame goes to whichever of them reads it first (a competing queue, not a
+    /// broadcast), so only one is live against a library whose firmware has no
+    /// mux (see the module docs).
+    input: Receiver<Vec<u8>>,
     /// Set by this reference's `shutdown`, checked by its `send`, `receive`
     /// and the poll loop. This is per-handle: the library's own `stopped` is
     /// set only by the final teardown.
     stopped: AtomicBool,
-    /// Bytes pulled from `output`, reassembled into frames.
+    /// Bytes pulled from `input`, reassembled into frames.
     ///
     /// A release build is handed whole frames and never needs this.
     #[cfg(debug_assertions)]
     stream: Mutex<FrameStream>,
-    /// Bytes pulled from `output` by [`HostDevice::read`] but not handed out
+    /// Bytes pulled from `input` by [`HostDevice::read`] but not handed out
     /// yet: one library read can deliver more than the caller's buffer holds.
     raw: Mutex<Vec<u8>>,
     /// The mux id this reference is addressed by, or `None` for the bare-frame
     /// modes. Set when a muxed path is attached ([`HostDevice::load_mux`]).
     mux: Option<MuxRoute>,
-    /// Bytes pulled from `output`, cut into mux units. Only a muxed reference
+    /// Units pulled from `input`, cut out of the stream. Only a muxed reference
     /// reads it (the handshake, then [`HostDevice::receive`]); the bare-frame
     /// modes reassemble frames instead.
     units: Mutex<UnitStream>,
@@ -551,7 +701,7 @@ impl HostDevice {
     fn id(&self) -> String {
         format!(
             "{}<{}>",
-            self.library.library_path.display(),
+            self.library.router.library_path.display(),
             self.reference
         )
     }
@@ -684,8 +834,16 @@ impl HostDevice {
             (OutputMode::Mux, Some(mcu_id)) => Some(MuxRoute::for_id(mcu_id)?),
             _ => None,
         };
+        // Where this reference reads. A muxed one reads the slot its own id
+        // owns, which the library's reader fills with the units addressed to
+        // it; a bare one reads the library's whole output, which every bare
+        // reference clones (see the module docs).
+        let input = match mux {
+            Some(route) => library.router.open_slot(route.mcu_id),
+            None => library.output.clone(),
+        };
         Ok(Self {
-            output: library.output.clone(),
+            input,
             library,
             reference,
             stopped: AtomicBool::new(false),
@@ -699,7 +857,7 @@ impl HostDevice {
 
     /// Path of the library this reference was loaded from.
     pub fn library_path(&self) -> &Path {
-        &self.library.library_path
+        &self.library.router.library_path
     }
 
     /// Whether this reference is muxed: only a muxed one is addressed by an id,
@@ -727,7 +885,7 @@ impl HostDevice {
         let mut pending = self.raw.lock().unwrap();
         if pending.is_empty() {
             match self
-                .output
+                .input
                 .recv_timeout(Duration::from_millis(OUTPUT_WAIT_MS as u64))
             {
                 Ok(bytes) => *pending = bytes,
@@ -926,7 +1084,7 @@ impl HostDevice {
                 return false;
             }
             let window = remaining.min(Duration::from_millis(OUTPUT_WAIT_MS as u64));
-            match self.output.recv_timeout(window) {
+            match self.input.recv_timeout(window) {
                 Ok(bytes) => self.units.lock().unwrap().feed(&bytes),
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => return false,
@@ -936,19 +1094,20 @@ impl HostDevice {
 
     /// Receive on a muxed reference: the next unit addressed to this reference,
     /// its header stripped to the frame the protocol carries.
-    fn receive_mux(&self, mux: MuxRoute) -> Option<Frame> {
+    ///
+    /// The units come from this reference's own slot
+    /// ([`Router::slots`]), into which the library's reader puts every unit
+    /// whose header decodes to this reference's id — and nothing else. Nothing
+    /// is filtered out here, and nothing another reference owns can be consumed
+    /// here: the reader did both at the only place that sees the whole stream.
+    fn receive_mux(&self) -> Option<Frame> {
         loop {
             if self.stopped.load(Ordering::Relaxed) {
                 return None;
             }
             {
                 let mut units = self.units.lock().unwrap();
-                while let Some((arb, unit)) = units.take_unit_with_arb() {
-                    // A unit for another device on the path — or the admin
-                    // channel — is not this reference's.
-                    if assign::mcu_id_from_arb(arb) != Some(mux.mcu_id) {
-                        continue;
-                    }
+                while let Some(unit) = units.take_unit() {
                     let raw = &unit[HEADER_BYTES..];
                     match Frame::parse(raw) {
                         Some(frame) => {
@@ -963,8 +1122,11 @@ impl HostDevice {
                     }
                 }
             }
+            // `recv_timeout` rather than `recv`, so this reference's own
+            // `shutdown` is noticed within one interval even though the library
+            // — and its reader — keeps running for other references.
             match self
-                .output
+                .input
                 .recv_timeout(Duration::from_millis(OUTPUT_WAIT_MS as u64))
             {
                 Ok(bytes) => self.units.lock().unwrap().feed(&bytes),
@@ -1010,7 +1172,7 @@ impl std::io::Write for HostDevice {
 impl fmt::Debug for HostDevice {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("HostDevice")
-            .field("library", &self.library.library_path)
+            .field("library", &self.library.router.library_path)
             .field("reference", &self.reference)
             .field("stopped", &self.stopped.load(Ordering::Relaxed))
             .finish_non_exhaustive()
@@ -1034,15 +1196,15 @@ impl Device for HostDevice {
     }
 
     fn receive(&self) -> Option<Frame> {
-        // A muxed reference reads units and keeps the ones addressed to it.
-        if let Some(mux) = self.mux {
-            return self.receive_mux(mux);
+        // A muxed reference reads the units routed to its own id.
+        if self.mux.is_some() {
+            return self.receive_mux();
         }
         // A bytes-mode library hands over the mux byte stream, in which a unit
         // is not a frame — framing it here would read the unit's header byte as
         // a length. That mode belongs to the bench scan, which reads
         // [`HostDevice::read`] instead.
-        if self.library.mode == OutputMode::Bytes {
+        if self.library.router.mode == OutputMode::Bytes {
             return None;
         }
         loop {
@@ -1063,7 +1225,7 @@ impl Device for HostDevice {
             // `shutdown` is noticed within one interval even though the library
             // — and its reader — keeps running for other references.
             match self
-                .output
+                .input
                 .recv_timeout(Duration::from_millis(OUTPUT_WAIT_MS as u64))
             {
                 Ok(bytes) => {
@@ -2351,6 +2513,169 @@ mod host_tests {
 
         // Same invariant as the other library tests: leave this path unloaded.
         drop(device);
+        wait_for_unload_blocking(&mux_library_path());
+    }
+
+    /// Receive one frame from `device` within `window`.
+    ///
+    /// [`Device::receive`] blocks until a frame arrives, so the wait runs in a
+    /// worker thread and this returns `None` when the window expires first: a
+    /// routing failure is then a failed assertion, never a hung test. On the
+    /// way out the worker is released with [`Device::shutdown`] — `receive`
+    /// returns within one poll interval of it — and joined, so no thread is
+    /// left holding the library (`wait_for_unload_blocking` would never see it
+    /// go).
+    ///
+    /// A `None` therefore also means "this reference is now stopped", so a
+    /// negative check on it belongs at the end of a test.
+    fn receive_within(device: &Arc<HostDevice>, window: Duration) -> Option<Frame> {
+        let (frames, received) = unbounded();
+        let worker = Arc::clone(device);
+        let handle = thread::spawn(move || {
+            let _ = frames.send(worker.receive());
+        });
+        let frame = received.recv_timeout(window).ok().flatten();
+        if frame.is_none() {
+            device.shutdown(); // release the worker out of its blocking receive
+        }
+        let _ = handle.join();
+        frame
+    }
+
+    /// Two live references on **one** library do not steal each other's units.
+    ///
+    /// The library's output is a single byte stream, so the library has **one**
+    /// reader — and that reader, not each reference, cuts units out of the
+    /// stream and routes each to the slot of the id its header names
+    /// (`host.rs`'s router). Two references on the same loaded library, both
+    /// receiving, is exactly the session that broke when each held a clone of
+    /// the one output channel: the two readers split the bytes, so neither could
+    /// assemble a unit.
+    ///
+    /// Both references are addressed the same way a live bridge reference and a
+    /// live downstream one are — by the id in the unit's header — so they take
+    /// the routing the real pair takes. The wire is a real pty on the port the
+    /// mux build baked in, and that port has been told its device speaks units
+    /// ([`MUX_PORT_UNITS`]): a headed unit written into it is forwarded upstream
+    /// unchanged (the bridge attributes a unit to the port it *arrived on*, never
+    /// to the id in its header), which is how units of each id are put on the one
+    /// stream. Traffic is interleaved — one unit per id, in a fixed order — and
+    /// each reference is read back in turn, so what is asserted is that each is
+    /// handed only its own frames, in its own order.
+    #[test]
+    fn test_two_live_references_on_a_shared_library_do_not_steal_each_others_units() {
+        let _serial = HOST_LIBRARY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+
+        // The bridge opens its port during init, so the tty this build baked in
+        // has to exist before the library is loaded — the same setup the other
+        // bridge tests use.
+        let pty = Pty::new();
+        let bridge_path = klipperx_test_support::klipper_host_mux_serial_path();
+        let _ = std::fs::remove_file(&bridge_path);
+        std::os::unix::fs::symlink(&pty.path, &bridge_path).expect("the bridge port path");
+
+        let identity = [0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc];
+        let first_id = 7u32;
+        let second_id = 9u32;
+
+        // The first reference, and the port its id is routed to. The port is
+        // declared at configuration time, so those frames go in before anything
+        // is sent under an id.
+        let mut first = HostDevice::load_downstream(mux_library_path(), identity, first_id)
+            .expect("a downstream reference loads without a handshake");
+        configure_port_zero(Arc::get_mut(&mut first).expect("the test holds the only reference"));
+        first
+            .send_set_port_node_id(0, first_id as u8, MUX_PORT_UNITS)
+            .expect("SET_PORT_NODEID goes in");
+
+        // The second reference, on the **same** library.
+        let second = Arc::new(
+            HostDevice::load_downstream(mux_library_path(), identity, second_id)
+                .expect("a second reference shares the loaded library"),
+        );
+        assert_eq!(
+            first.library_path(),
+            second.library_path(),
+            "both references are on the one library"
+        );
+        let library = library_registry()
+            .lock()
+            .unwrap()
+            .get(mux_library_path().as_path())
+            .and_then(Weak::upgrade)
+            .expect("the library the references share is loaded");
+        assert_eq!(
+            library.router.slots.lock().unwrap().len(),
+            2,
+            "each reference has a slot of its own on the one library"
+        );
+        drop(library);
+
+        // Interleaved traffic, one unit per id: the header names the id and the
+        // frame behind it is what that reference must be handed. All four units
+        // go into the port back to back, so the one reader has to cut them out
+        // of the stream and route them apart — a reference per reader would
+        // split these very bytes between them.
+        let first_frame = Frame::new(0, b"first-one".to_vec());
+        let second_frame = Frame::new(0, b"second-one".to_vec());
+        let third_frame = Frame::new(0, b"first-two".to_vec());
+        let fourth_frame = Frame::new(0, b"second-two".to_vec());
+        for (id, frame) in [
+            (first_id, &first_frame),
+            (second_id, &second_frame),
+            (first_id, &third_frame),
+            (second_id, &fourth_frame),
+        ] {
+            let mut unit = encode_header(assign::reply_arb_id(id).expect("an addressable id"));
+            unit.extend_from_slice(&frame.raw_bytes());
+            (&pty.master)
+                .write_all(&unit)
+                .expect("the port unit goes in");
+        }
+
+        // Each reference is handed exactly its own frames, in its own order.
+        // A split stream shows up right here: half a unit's bytes cannot parse
+        // into its frame, so the frame never arrives and this runs out of
+        // window.
+        let window = Duration::from_secs(10);
+        assert_eq!(
+            receive_within(&first, window),
+            Some(first_frame.clone()),
+            "the first reference's own first frame"
+        );
+        assert_eq!(
+            receive_within(&second, window),
+            Some(second_frame.clone()),
+            "the second reference's own first frame"
+        );
+        assert_eq!(
+            receive_within(&first, window),
+            Some(third_frame.clone()),
+            "the first reference's own second frame, still in order"
+        );
+        assert_eq!(
+            receive_within(&second, window),
+            Some(fourth_frame.clone()),
+            "the second reference's own second frame, still in order"
+        );
+
+        // And neither has anything else: every unit was delivered once, to the
+        // reference its id names.
+        let quiet = Duration::from_millis(500);
+        assert!(
+            receive_within(&first, quiet).is_none(),
+            "the first reference has no unit but its own"
+        );
+        assert!(
+            receive_within(&second, quiet).is_none(),
+            "the second reference has no unit but its own"
+        );
+
+        // Same invariant as the other library tests: leave this path unloaded.
+        drop(first);
+        drop(second);
         wait_for_unload_blocking(&mux_library_path());
     }
 

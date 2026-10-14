@@ -832,6 +832,16 @@ impl HostDevice {
         let reference = NEXT_REFERENCE.fetch_add(1, Ordering::Relaxed);
         let mux = match (mode, mcu_id) {
             (OutputMode::Mux, Some(mcu_id)) => Some(MuxRoute::for_id(mcu_id)?),
+            // A muxed reference without an id would read the bare channel,
+            // while the library's reader only fills per-id slots in mux mode:
+            // it would hear nothing at all. No caller builds that pair (a mux
+            // path always names the id it addresses), so refuse it here rather
+            // than hand back a deaf reference.
+            (OutputMode::Mux, None) => {
+                return Err(InterfaceError::Other(
+                    "a muxed host library reference needs the mcu id it addresses".to_string(),
+                ))
+            }
             _ => None,
         };
         // Where this reference reads. A muxed one reads the slot its own id

@@ -514,3 +514,47 @@ fresh-context 只读复审对「①–⑤ 都成立」给了逐条证据（端�
 - **MCU 侧仍只能构建 + 不变式论证**（无运行期驱动）⇒ 真板验证照旧挂 `TESTING.md`。
   `scripts/check_whitespace.sh` 在本子模组**基线就不干净**（host/ 下多处 >80 列），P7 新引入的三处
   已顺手修掉（`6a418e63`），其余属既有面、不在本期范围。
+
+### P8（2026-10-15）：真机实测暴露的宿主库读端缺陷 + 修复
+
+**真机场景**（用户提供：`/dev/serial/by-id/usb-Klipper_stm32f103xe_39FFD7054D47323924610951-if00`
+= `/dev/ttyACM0`，一台**旧固件**板子）：宿主库当桥（以其 tty 路径构建、`CONFIG_BRIDGE`/`MUX_SERIAL`
+/`UART` 自动具备），配置 `[mcu bridge] host_library:` + `[uart_device uart0]` + `[mcu child] uart: uart0`
+（legacy 下游）。
+
+- **修前**：桥起来了（`identified: 22 messages`、端口按配置期 baud 在真板上打开），但下游
+  `identify_response` 超时、桥自己的 `clock` 也超时，日志出现 `klipper sent 17/10 bytes under a mux
+  header that are not a frame`；45s 内该类告警/超时 **54 条**。
+- **对照**：① 同一块板子**直连**串口 ⇒ `identified: 135 messages registered` ⇒ 板子/旧固件无辜；
+  ② **只起桥**（去掉下游）⇒ 25s 内 **0 条**告警/超时。
+- **根因**：`interface/devices/host.rs` 里每个 `HostDevice` 引用各自 `recv_timeout` 读**同一份库输出**
+  （`output.clone()`），`receive_mux` 把不属于自己 id 的单元 `continue` **丢掉** ⇒ 两个活引用把字节流
+  瓜分、谁都拼不齐帧（10/17 字节是「半截流」的痕迹）。共享串口那侧本来是**单读者 + 按 id 投槽**
+  （`SharedSerialPort`/`McuSlot`/`push_frame`），宿主库缺这层。
+- **修复（`7ae15c7`）**：`Router`（槽表 + 模式 + 路径）挂在 `HostLibrary` 上，`start_reader` 起**每库
+  一个**读者（两种形态共用：帧 API 与字节流），`reader_loop` 在 mux 模式喂 `UnitStream` →
+  `take_unit_with_arb` → `route_unit`（按 `assign::mcu_id_from_arb`）→ `push_unit` 投槽；admin id 丢弃
+  （与 `serial.rs` 的 `dispatch` 同策略）；引用侧只读自己的槽，旧的 id 过滤分支删除；裸路径语义不变。
+  读者**不持有**库的强引用（避免「最后一个 Drop 落在读者线程 ⇒ `pthread_join(self)` ⇒ panic」）。
+- **真机复跑（修后，同一条链路）**：桥 `identified: 22 messages` → 端口打开 → **下游 `identified: 135
+  messages`**（与直连一致），随后双机 stats 稳定，**40s 内 0 条**告警/超时、0 错误。⇒ **D13 欠项
+  「配置驱动的整链端到端」在真机上兑现**（此前记为「单进程内做不到」，根因其实是这个缺陷）。
+- 验收：`cargo test --workspace` **3221 passed / 0 failed / 14 ignored**（两遍）；新测
+  `test_two_live_references_on_a_shared_library_do_not_steal_each_others_units`（两条引用交错收，
+  各自只拿到自己的两帧且有序）单跑 3 次绿、回到旧行为即红；fmt 干净；`--all-targets` 0 告警；
+  `cargo check --release -p klipperx --lib` 覆盖帧 API 分支。
+- 复审（fresh context）：**可合入**（代码无 blocker），只要求三处手册同步（已由 main 一起改：
+  `serial-mux-protocol.md` 的「单进程做不到」段、`developer-manual/README.md` 的 `host.rs` 行、
+  `testing.md` 的 11→12 测与清单）；另报两处**既有**缺陷（下）。
+
+### 新发现的既有缺陷（报而不改，待排期）
+
+1. **`serial.rs` 的读者可能在读者线程上 join 自己**：`reader_loop` 在 `weak.upgrade()`（`serial.rs:1467`）
+   到 `drop(port)`（`:1471`）之间短暂持强引用；若此刻最后一个 `SharedSerialHandle` 析构，`SharedSerialPort::drop`
+   （`:1440-1452` 的 `handle.join()`）会跑到读者线程上 ⇒ `pthread_join(self)` = `EDEADLK` ⇒ std panic。
+   最小修法（复审给出）：`Drop` 里加自 join 守卫（比 `std::thread::current().id()`）。**窗口小但真实**
+   （链路繁忙时 `dispatch` 占的时间就是窗口）。
+2. **`SharedSerialPort.slots` 只在握手失败时移除**（`serial.rs:1288`）：句柄析构后槽仍在表里，
+   `push_frame` 会一直往无人读的槽里堆字节（host 半无此问题：引用析构后 `SEND` 失败即丢）。
+3. 复审顺带修正：P8 写手把两条 plain-library 测试的 flake 归到缺陷 1**不成立**（那是 host 侧代码），
+   真实首因仍待有界复现——候选是 `library_unloaded()` 只观察 `Weak`、不等 `dlclose` 尾巴（`host.rs:1511-1516`）。

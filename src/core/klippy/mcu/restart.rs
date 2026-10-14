@@ -1004,7 +1004,7 @@ mod tests {
     /// parked on the library — the legacy path, which never handshakes, unloads
     /// cleanly. Un-ignore this once that lifetime is fixed; it is the acceptance
     /// test for that fix.
-    #[ignore = "known: the named handshake on a host-library bridge leaves the library loaded (see work-log §7)"]
+    #[ignore = "known: the named handshake on a host-library bridge leaves the library loaded (see work-log §7); the M1-P8 single-reader fix did not change it — re-checked 2026-10-15"]
     #[tokio::test]
     async fn a_named_childs_reset_is_forwarded_to_its_port_whole() {
         let _serial = HOST_LIBRARY_TEST_LOCK

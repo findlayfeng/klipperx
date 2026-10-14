@@ -811,10 +811,18 @@ impl HostDevice {
     /// unit first, then the assignment request, retried
     /// [`ASSIGN_ATTACH_ATTEMPTS`] times for [`ASSIGN_ATTACH_TIMEOUT`] each.
     ///
+    /// [`HostDevice::load_mux`] is this run right after its reference opens;
+    /// a reference opened by [`HostDevice::load_downstream`] calls it later,
+    /// once the caller has told the bridge which port the device sits behind
+    /// ([`HostDevice::send_set_port_node_id`]) — **the caller owns that
+    /// order**, because only it knows the port. A device whose route does not
+    /// exist yet is reached by nothing, so the handshake times out like any
+    /// other unanswered one.
+    ///
     /// # Errors
     /// An id the wire cannot address, a write that fails, or
     /// [`InterfaceError::Timeout`] when the answer never arrives.
-    fn attach(&self, named: [u8; 6], mcu_id: u32) -> Result<(), InterfaceError> {
+    pub fn attach(&self, named: [u8; 6], mcu_id: u32) -> Result<(), InterfaceError> {
         let set = set_node_id_for(named, mcu_id).ok_or_else(|| {
             InterfaceError::Other(format!(
                 "mcu id {mcu_id} is outside the range a mux header can address"
@@ -1049,9 +1057,10 @@ mod host_tests {
         MESSAGE_DEST, MESSAGE_HEADER_SIZE, MESSAGE_MAX, MESSAGE_MIN, MESSAGE_SYNC,
     };
     use crate::core::klippy::interface::devices::serial::{
-        admin_unit, decode_header, discovery_query, encode_header, set_node_id_for,
-        set_port_node_id, HeaderScan, UnassignedNode, ADMIN_LISTEN, ADMIN_REPLY, CMD_RESET_DEVICE,
-        CMD_RESET_PORT, CMD_SET_PORT_NODEID, HEADER_BYTES, MAGIC, MUX_PORT_UNITS, RESP_NEED_NODEID,
+        admin_unit, assignment_request, decode_header, discovery_query, encode_header,
+        set_node_id_for, set_port_node_id, HeaderScan, UnassignedNode, ADMIN_LISTEN, ADMIN_REPLY,
+        ASSIGN_ATTACH_ATTEMPTS, CMD_RESET_DEVICE, CMD_RESET_PORT, CMD_SET_PORT_NODEID,
+        HEADER_BYTES, MAGIC, MUX_PORT_UNITS, RESP_NEED_NODEID,
     };
     use crate::core::klippy::interface::pty::Pty;
     use crate::core::klippy::mcu::host_libraries::HostLibraries;
@@ -2141,6 +2150,87 @@ mod host_tests {
         assert!(
             read_pty(&pty.master, 1, quiet).is_empty(),
             "an id no port owns must not reach the port"
+        );
+
+        // Same invariant as the other library tests: leave this path unloaded.
+        drop(device);
+        wait_for_unload_blocking(&mux_library_path());
+    }
+
+    /// A downstream reference's handshake, over a real library and a real tty:
+    /// [`HostDevice::attach`] on the reference [`HostDevice::load_downstream`]
+    /// opened, run **after** the bridge has been told the route.
+    ///
+    /// The handshake is the one `load_mux` runs — the SET_KLIPPER_NODEID unit
+    /// naming the device, then the assignment request retried
+    /// [`ASSIGN_ATTACH_ATTEMPTS`] times — but the firmware's own bridge carries
+    /// it: the naming unit is broadcast to the port with its admin header, the
+    /// assignment request is routed to id 7's port and kept whole there (a named
+    /// device answers the admin channel itself, so its port speaks units). The
+    /// pty never answers, so the handshake times out as it would against a
+    /// device that is not there.
+    ///
+    /// The order the entry point exists for is what the byte assertion pins:
+    /// with `load_mux` instead — open-and-handshake in one call, no route first —
+    /// the request has no port to be routed to when it goes out and the bridge
+    /// drops it, so the request units never reach the pty and this test is red.
+    #[test]
+    fn test_a_downstream_reference_handshakes_along_its_route() {
+        let _serial = HOST_LIBRARY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+
+        // The bridge opens its port while klipper comes up, so the tty has to
+        // exist first — the same setup the other port tests use.
+        let pty = Pty::new();
+        let bridge_path = klipperx_test_support::klipper_host_mux_serial_path();
+        let _ = std::fs::remove_file(&bridge_path);
+        std::os::unix::fs::symlink(&pty.path, &bridge_path).unwrap_or_else(|e| {
+            panic!(
+                "failed to link {} to {}: {e}",
+                bridge_path.display(),
+                pty.path.display()
+            )
+        });
+
+        let identity = [0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc];
+        // The named device is **not** the bridge's own device: only the bridge's
+        // own uuid is `load_mux`'s to name, and a different one is what makes
+        // this a device behind a port.
+        let named = [0x99, 0x88, 0x77, 0x66, 0x55, 0x44];
+        let downstream_id = 7u32;
+        let device = HostDevice::load_downstream(
+            mux_library_path(),
+            HostMux { identity, named },
+            downstream_id,
+        )
+        .expect("a downstream reference loads without a handshake");
+
+        // The route first: port 0 owns id 7, and its device speaks units — it
+        // answers the admin channel itself, which is what a named device does.
+        device
+            .send_set_port_node_id(0, downstream_id as u8, MUX_PORT_UNITS)
+            .expect("SET_PORT_NODEID goes in");
+
+        // Nothing behind the pty answers, so the handshake cannot complete.
+        let err = device
+            .attach(named, downstream_id)
+            .expect_err("the pty never answers the assignment");
+        assert_eq!(err, InterfaceError::Timeout);
+
+        // Every byte of the handshake reached the port. Naming a uuid the
+        // bridge does not know yet also makes it probe the port once
+        // (`bridge_probe_unassigned`), which is the discovery query in front.
+        let mut expected = discovery_query();
+        expected.extend_from_slice(&set_node_id_for(named, downstream_id).expect("id 7"));
+        let request = assignment_request(downstream_id).expect("id 7");
+        for _ in 0..ASSIGN_ATTACH_ATTEMPTS {
+            expected.extend_from_slice(&request);
+        }
+        let seen = read_pty(&pty.master, expected.len(), Duration::from_secs(5));
+        assert_eq!(
+            seen, expected,
+            "the discovery probe, the SET_KLIPPER_NODEID unit, then a routed request per attempt"
         );
 
         // Same invariant as the other library tests: leave this path unloaded.

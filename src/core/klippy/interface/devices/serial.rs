@@ -1238,17 +1238,16 @@ fn port_for(path: &Path, baud: u32) -> Result<Arc<SharedSerialPort>, InterfaceEr
     })
 }
 
-/// Open a port for one MCU, completing the frame-level id handshake.
+/// Open a port for one MCU and complete the frame-level id handshake.
 ///
 /// The first attach on a path opens the tty and starts the reader; later ones
-/// reuse both and only register a slot. When `uuid` is `Some`, the handshake
-/// starts by writing the SET_NODEID unit that names the board
-/// ([`set_node_id_for`]) and only then sends the assignment request — mirroring
-/// CAN's `CanSerialDevice::open`, which sends its SET_NODEID when the link
-/// opens. `None` skips that and goes straight to the request. The request is
-/// written and the answer awaited `ASSIGN_ATTACH_ATTEMPTS` times, each for
-/// `timeout`; on exhaustion the slot is unregistered and
-/// [`InterfaceError::Timeout`] returned.
+/// reuse both and only register a slot. Once the slot is registered this is
+/// [`SharedSerialHandle::handshake`] and nothing else: when `uuid` is `Some`,
+/// the SET_NODEID unit naming the board ([`set_node_id_for`]) goes out first
+/// and the assignment request follows — mirroring CAN's `CanSerialDevice::open`,
+/// which sends its SET_NODEID when the link opens. `None` skips that and goes
+/// straight to the request. On failure the slot this opened is unregistered, so
+/// the port is left as it was found.
 ///
 /// # Errors
 /// [`InterfaceError::Other`] for an id the wire format cannot carry or a port
@@ -1268,57 +1267,27 @@ pub fn attach(
     }
 
     let port = port_for(path, baud)?;
-    let _attaching = port.attach_lock.lock().unwrap();
-    if port.stopped.load(Ordering::SeqCst) {
-        return Err(InterfaceError::ConnectionLost);
-    }
-
     let slot = Arc::new(McuSlot::new());
     port.slots.lock().unwrap().insert(mcu_id, Arc::clone(&slot));
+    let handle = Arc::new(SharedSerialHandle {
+        port: Arc::clone(&port),
+        mcu_id,
+        slot,
+        stopped: AtomicBool::new(false),
+    });
 
-    // A discovered MCU is named before the assignment runs: frame order is the
-    // SET_NODEID unit first, the assignment request second (mirrors CAN's
-    // `CanSerialDevice::open`). `set_node_id_for` fails only for an id the
-    // wire format cannot carry, already rejected above.
-    if let Some(uuid) = uuid {
-        let unit = set_node_id_for(uuid, mcu_id).expect("arb_id checked above");
-        if let Err(e) = port.write_unit(&unit) {
-            port.slots.lock().unwrap().remove(&mcu_id);
-            return Err(e);
-        }
+    // The handshake is the one `handshake` runs; `attach` only registers the
+    // slot in front of it. A failure takes the slot down again — a port that
+    // never answered is left as `attach` found it.
+    let handshake = match uuid {
+        Some(uuid) => handle.handshake(uuid, timeout),
+        None => handle.run_handshake(None, timeout),
+    };
+    if let Err(e) = handshake {
+        port.slots.lock().unwrap().remove(&mcu_id);
+        return Err(e);
     }
-
-    let request = assignment_request(mcu_id).expect("arb_id checked above");
-    let mut attempts = 0;
-    loop {
-        *slot.ack.lock().unwrap() = None;
-        if let Err(e) = port.write_unit(&request) {
-            port.slots.lock().unwrap().remove(&mcu_id);
-            return Err(e);
-        }
-        if wait_for_ack(&slot, timeout) == Some(mcu_id) {
-            // The handshake is done: release the port for the next attach, then
-            // hand this one its handle.
-            drop(_attaching);
-            return Ok(Arc::new(SharedSerialHandle {
-                port,
-                mcu_id,
-                slot,
-                stopped: AtomicBool::new(false),
-            }));
-        }
-        if port.stopped.load(Ordering::SeqCst) {
-            port.slots.lock().unwrap().remove(&mcu_id);
-            return Err(InterfaceError::ConnectionLost);
-        }
-        attempts += 1;
-        if attempts >= ASSIGN_ATTACH_ATTEMPTS {
-            break;
-        }
-    }
-
-    port.slots.lock().unwrap().remove(&mcu_id);
-    Err(InterfaceError::Timeout)
+    Ok(handle)
 }
 
 /// Register a **downstream** device on the shared serial port at `path`,
@@ -1692,6 +1661,80 @@ impl SharedSerialHandle {
         // writes the header, so only the frame behind it goes to it.
         self.send_admin(&set_port_node_id(index, mcu_id, flags)[HEADER_BYTES..])
     }
+
+    /// Complete the frame-level id handshake on this already-open handle: name
+    /// this device `uuid` ([`set_node_id_for`]) and have it re-confirm the
+    /// assignment — exactly the segment [`attach`] runs once its slot is
+    /// registered.
+    ///
+    /// This is the handshake a **downstream** device runs once its route
+    /// exists. [`attach_downstream`] opens the handle without one, so the
+    /// caller can first tell the bridge which port the device sits behind
+    /// ([`SharedSerialHandle::send_set_port_node_id`] over the bridge's own
+    /// handle) and only then name it — **the caller owns that order**: until
+    /// the bridge knows the route, the assignment request reaches no device and
+    /// the handshake times out like any other unanswered one.
+    ///
+    /// The handshake runs under the port's attach lock (the one [`attach`] takes),
+    /// so two handshakes on one port cannot interleave.
+    ///
+    /// # Errors
+    /// [`InterfaceError::ConnectionLost`] when the port has been shut down,
+    /// [`InterfaceError::SendError`] when a write fails, and
+    /// [`InterfaceError::Timeout`] when the device never answers. A failure
+    /// leaves the handle live: its slot stays registered and the port keeps
+    /// round-tripping frames.
+    pub fn handshake(&self, uuid: [u8; 6], timeout: Duration) -> Result<(), InterfaceError> {
+        self.run_handshake(Some(uuid), timeout)
+    }
+
+    /// The one implementation of the frame-level id handshake, shared by
+    /// [`attach`] and [`SharedSerialHandle::handshake`]: the SET_NODEID unit
+    /// first when a `uuid` names the board, then the assignment request retried
+    /// [`ASSIGN_ATTACH_ATTEMPTS`] times for `timeout` each. Unlike [`attach`],
+    /// a failure does not unregister the slot — the handle was the caller's
+    /// before this ran.
+    fn run_handshake(
+        &self,
+        uuid: Option<[u8; 6]>,
+        timeout: Duration,
+    ) -> Result<(), InterfaceError> {
+        // The attach lock serializes the handshakes on this port; `attach`
+        // takes it for the same reason (never both, so no re-entry).
+        let _attaching = self.port.attach_lock.lock().unwrap();
+        if self.port.stopped.load(Ordering::SeqCst) {
+            return Err(InterfaceError::ConnectionLost);
+        }
+
+        // A discovered MCU is named before the assignment runs: frame order is
+        // the SET_NODEID unit first, the assignment request second (mirrors
+        // CAN's `CanSerialDevice::open`). `set_node_id_for` fails only for an id
+        // the wire format cannot carry, which the handle was opened with.
+        if let Some(uuid) = uuid {
+            let unit = set_node_id_for(uuid, self.mcu_id)
+                .expect("an attached mcu id is always addressable");
+            self.port.write_unit(&unit)?;
+        }
+
+        let request =
+            assignment_request(self.mcu_id).expect("an attached mcu id is always addressable");
+        let mut attempts = 0;
+        loop {
+            *self.slot.ack.lock().unwrap() = None;
+            self.port.write_unit(&request)?;
+            if wait_for_ack(&self.slot, timeout) == Some(self.mcu_id) {
+                return Ok(());
+            }
+            if self.port.stopped.load(Ordering::SeqCst) {
+                return Err(InterfaceError::ConnectionLost);
+            }
+            attempts += 1;
+            if attempts >= ASSIGN_ATTACH_ATTEMPTS {
+                break;
+            }
+        }
+        Err(InterfaceError::Timeout)
+    }
 }
 
 impl std::fmt::Debug for SharedSerialHandle {
@@ -1763,6 +1806,45 @@ mod mux_tests {
     fn master_write(master: &File, bytes: &[u8]) {
         let mut master = master;
         master.write_all(bytes).expect("pty master write");
+    }
+
+    /// Read exactly `want` bytes from the pty master within `window`; panics
+    /// when the window expires first, so a handshake that writes nothing fails
+    /// the test instead of leaving it blocked on a silent port.
+    fn read_n_within(master: &File, want: usize, window: Duration) -> Vec<u8> {
+        let deadline = Instant::now() + window;
+        let mut master = master;
+        let mut out = Vec::with_capacity(want);
+        let mut buf = [0u8; 64];
+        while out.len() < want {
+            let now = Instant::now();
+            assert!(
+                now < deadline,
+                "only {} of {want} bytes arrived within {window:?}",
+                out.len()
+            );
+            let mut poll = libc::pollfd {
+                fd: std::os::fd::AsRawFd::as_raw_fd(master),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let rc = unsafe {
+                libc::poll(
+                    &mut poll,
+                    1,
+                    deadline.saturating_duration_since(now).as_millis() as i32,
+                )
+            };
+            assert!(
+                rc >= 0,
+                "polling the pty master: {}",
+                std::io::Error::last_os_error()
+            );
+            let read = master.read(&mut buf).expect("pty master read");
+            assert_ne!(read, 0, "the pty closed before {want} bytes arrived");
+            out.extend_from_slice(&buf[..read]);
+        }
+        out
     }
 
     /// Whether the pty master has a byte waiting within `window` — how a test
@@ -2029,6 +2111,118 @@ mod mux_tests {
         ];
         expected.sort_by_key(|(arb, _)| *arb);
         assert_eq!(units, expected);
+    }
+
+    /// The handshake a downstream device runs once its route exists: on a
+    /// handle already open — [`attach_downstream`], which writes nothing —
+    /// `handshake` sends exactly the segment [`attach`] runs after registering
+    /// its slot: the SET_NODEID unit naming the board, then the assignment
+    /// request, until the peer answers. A caller that wanted the bridge told
+    /// the route first (`SET_PORT_NODEID`) could not express this with
+    /// `attach`/`load_mux`, which run their handshake before handing back the
+    /// handle.
+    #[test]
+    fn handshake_names_an_open_handle_and_completes_the_assignment() {
+        let pty = Pty::new();
+        let uuid = [0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc];
+        let mcu_id = 4;
+
+        // The handle is opened without a handshake and writes nothing yet.
+        let handle = attach_downstream(&pty.path, DEFAULT_BAUD, mcu_id)
+            .expect("a downstream attach does not handshake");
+        assert!(
+            !readable_within(&pty.master, Duration::from_millis(100)),
+            "attach_downstream must write nothing"
+        );
+
+        let set = set_node_id_for(uuid, mcu_id).expect("a valid mcu id");
+        let request = assignment_request(mcu_id).expect("a valid mcu id");
+        let worker = Arc::clone(&handle);
+        let thread = thread::spawn(move || worker.handshake(uuid, ASSIGN_ATTACH_TIMEOUT));
+
+        // The whole SET_NODEID unit — the admin listen header and the KXID
+        // frame naming the board — goes out first, the assignment request after.
+        let wire = read_n_within(
+            &pty.master,
+            set.len() + request.len(),
+            Duration::from_secs(5),
+        );
+        assert_eq!(&wire[..set.len()], set.as_slice(), "SET_NODEID first");
+        assert_eq!(
+            &wire[set.len()..],
+            request.as_slice(),
+            "the assignment request follows"
+        );
+
+        master_write(
+            &pty.master,
+            &assignment_reply(mcu_id).expect("a valid mcu id"),
+        );
+        thread
+            .join()
+            .expect("the handshake thread")
+            .expect("the peer answered, so the handshake completes");
+
+        // The handle the caller already held is now an ordinary mux slot.
+        let frame = Frame::new(1, b"after".to_vec());
+        handle.send(&frame).expect("the handle writes");
+        let mut expected = encode_header(assign::arb_id(mcu_id).expect("a valid mcu id"));
+        expected.extend_from_slice(&frame.raw_bytes());
+        assert_eq!(
+            read_n_within(&pty.master, expected.len(), Duration::from_secs(5)),
+            expected
+        );
+        master_write(
+            &pty.master,
+            &device_unit(mcu_id, &Frame::encode(2, b"back")),
+        );
+        assert_eq!(handle.receive(), Some(Frame::new(2, b"back".to_vec())));
+    }
+
+    /// A handshake that gets no answer times out and leaves the handle alive.
+    /// Unlike [`attach`], which unregisters the slot it opened on failure, this
+    /// handle was the caller's already — a missed handshake must not break the
+    /// port it shares.
+    #[test]
+    fn a_handshake_that_times_out_leaves_the_handle_usable() {
+        let pty = Pty::new();
+        let uuid = [0x0f, 0x1e, 0x2d, 0x3c, 0x4b, 0x5a];
+        let mcu_id = 4;
+
+        let handle = attach_downstream(&pty.path, DEFAULT_BAUD, mcu_id)
+            .expect("a downstream attach does not handshake");
+        let err = handle
+            .handshake(uuid, Duration::from_millis(50))
+            .expect_err("the peer never answers");
+        assert_eq!(err, InterfaceError::Timeout);
+
+        // Every attempt went out: one SET_NODEID, the request per attempt.
+        let set = set_node_id_for(uuid, mcu_id).expect("a valid mcu id");
+        let request = assignment_request(mcu_id).expect("a valid mcu id");
+        let mut expected = set.clone();
+        for _ in 0..ASSIGN_ATTACH_ATTEMPTS {
+            expected.extend_from_slice(&request);
+        }
+        assert_eq!(
+            read_n_within(&pty.master, expected.len(), Duration::from_secs(5)),
+            expected,
+            "one SET_NODEID and a request per attempt"
+        );
+
+        // The failed handshake did not break the slot: frames still round-trip.
+        let frame = Frame::new(5, b"still".to_vec());
+        handle.send(&frame).expect("the handle still writes");
+        let mut unit = encode_header(assign::arb_id(mcu_id).expect("a valid mcu id"));
+        unit.extend_from_slice(&frame.raw_bytes());
+        assert_eq!(
+            read_n_within(&pty.master, unit.len(), Duration::from_secs(5)),
+            unit
+        );
+        master_write(
+            &pty.master,
+            &device_unit(mcu_id, &Frame::encode(6, b"alive")),
+        );
+        assert_eq!(handle.receive(), Some(Frame::new(6, b"alive".to_vec())));
     }
 
     #[test]

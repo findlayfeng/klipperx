@@ -92,18 +92,21 @@ fn main() {
     println!("cargo:rustc-env=KLIPPER_HOST_LIB={}", library.display());
 
     // A second host target: the same library with the firmware's serial-mux
-    // device half compiled in. `CONFIG_HOST_BRIDGE_SERIAL` selects `CONFIG_MUX`
-    // / `CONFIG_MUX_SERIAL` / `CONFIG_BRIDGE` / `CONFIG_BRIDGE_PORT_SERIAL`
-    // (src/host/Kconfig), so the library answers the admin channel and adopts
-    // the node id a host hands it; `CONFIG_HOST_FRAME_API` matches the frame
-    // API the release path of the first library needs. It gets its own output
-    // directory, so the first library is built exactly as before.
+    // device half compiled in. `CONFIG_HOST_BRIDGE_SERIAL` selects
+    // `CONFIG_MUX_SERIAL` and `CONFIG_BRIDGE_PORT_SERIAL` (src/host/Kconfig);
+    // the routing bridge comes with the mux half (BRIDGE's `default y if` in
+    // src/Kconfig). So the library answers the admin channel, adopts the node id
+    // a host hands it, and can be given UART ports as its downstream ones;
+    // `CONFIG_HOST_FRAME_API` matches the frame API the release path of the
+    // first library needs. It gets its own output directory, so the first
+    // library is built exactly as before (its `HOST_CONFIG` names no tty and
+    // no bridge, so nothing there opens a device).
     //
-    // `CONFIG_HOST_BRIDGE_SERIAL_PATH` is a path of this build's own: the
-    // bridge opens its port during `klipper_host_init()` and init fails when it
-    // cannot, so a test makes a tty there before loading the library. The
-    // Kconfig default (`/dev/ttyACM0`) is a real device this machine need not
-    // have.
+    // `CONFIG_HOST_BRIDGE_SERIAL_PATH` is a path of this build's own: the tty a
+    // UART object the host configures opens (`config_uart`), and a tty that
+    // cannot be opened fails that configuration, so a test makes one there
+    // before it configures a port. The Kconfig default (`/dev/ttyACM0`) is a
+    // real device this machine need not have.
     let host_mux_dir = build_dir.join("host-mux");
     let bridge_serial_path = host_mux_dir.join("out").join("bridge-tty");
     let host_mux_config = format!(

@@ -9,11 +9,13 @@
 //! three steps are:
 //!
 //! 1. [`resolve`] — from the child's parsed transport to the bridge's link: who
-//!    the bridge is, which of its firmware ports the section names, the port's
-//!    `index` on that bridge, and the `flags` byte the port's shape asks for.
-//!    Everything that needs the firmware's identify answer — the port table — is
-//!    checked here, after the bridge has connected (`mcu/object.rs` awaits
-//!    objects in registration order, so the bridge is up when the child is).
+//!    the bridge is, the port's `index` on that bridge (the index the host
+//!    assigned the port when it created it at configuration time, so its
+//!    declaration order among the bridge's ports — `mcu/bridge_ports.rs`), and
+//!    the `flags` byte the port's shape asks for. The bridge must be up first:
+//!    what remains to check here is that its object has connected
+//!    (`mcu/object.rs` awaits objects in registration order, so the bridge is up
+//!    when the child is).
 //! 2. [`open`] — open a **downstream** handle on the bridge's own link (with no
 //!    handshake of the device's own), send `SET_PORT_NODEID(index, id, flags)` to
 //!    build the bridge's route, and then — for a **named** device — run its own
@@ -27,13 +29,17 @@
 //! - **Legacy** — one `[mcu]` on a uart port writing no `uuid:`. It has no admin
 //!   channel of its own, so [`open`] sends only `SET_PORT_NODEID`: the bridge
 //!   owns the mcu id and strips/heads the raw frames its device speaks.
-//! - **Named** — a `uuid:` on the child (a uart port's every other shape, and
-//!   every CAN port). The device answers the mux itself, so it needs **both**
-//!   commands: the bridge's route (`SET_PORT_NODEID`) *and* its own naming
-//!   handshake (`SET_KLIPPER_NODEID` + re-confirm). [`open`] sends them in that
-//!   order — the route **first**, because the handshake's units travel the route
-//!   the bridge must own before they reach the device; sent ahead of it, the
-//!   bridge drops them and the handshake times out with nothing downstream.
+//! - **Named** — a `uuid:` on the child (a uart port's every other shape). The
+//!   device answers the mux itself, so it needs **both** commands: the bridge's
+//!   route (`SET_PORT_NODEID`) *and* its own naming handshake
+//!   (`SET_KLIPPER_NODEID` + re-confirm). [`open`] sends them in that order —
+//!   the route **first**, because the handshake's units travel the route the
+//!   bridge must own before they reach the device; sent ahead of it, the bridge
+//!   drops them and the handshake times out with nothing downstream.
+//!
+//! A CAN port (`[can_device]`) has no configuration-time object yet (the
+//! firmware side of MUX_CAN does not exist), so a `can:` device is refused by
+//! name instead of being given a route to a port the bridge does not have.
 //!
 //! The bridge's own transport decides how the downstream handle is opened, and
 //! the two kinds it can be are exactly the two mux links: a shared serial port
@@ -44,7 +50,7 @@
 use super::bridge_ports::{CanPort, UartPort};
 use super::host_libraries::{HostLibraries, HOST_LIBRARIES_OBJECT};
 use super::port_grouping::{PortGroups, PortKind, PORT_GROUPS_OBJECT};
-use super::{Dictionary, McuObject};
+use super::McuObject;
 use crate::core::klippy::config::mcu::{McuConfig, Transport};
 use crate::core::klippy::config::ConfigError;
 use crate::core::klippy::error::KlippyError;
@@ -67,8 +73,9 @@ pub(crate) struct BridgePortLink {
     /// (`McuObject::mcu_config`). The load-time shared-baud / host-mux stamps
     /// are [`McuConfig`] fields, not part of [`Transport`].
     pub transport: Transport,
-    /// The port's index in the bridge's firmware port table — what the
-    /// port-level command travels with.
+    /// The port's index on the bridge: the number the host gave it when it
+    /// created the port at configuration time (its declaration order among the
+    /// bridge's ports). It is what the port-level command travels with.
     pub index: u8,
     /// The port-level `SET_PORT_NODEID` flags byte: `0` for a legacy port
     /// ([`PortGroups::is_legacy`], one uart-port device with no `uuid:`), whose
@@ -83,18 +90,20 @@ pub(crate) struct BridgePortLink {
 
 /// Resolve the child's `uart:`/`can:` transport to the bridge port it names.
 ///
-/// The port table is the **bridge's** identify answer, so this only succeeds
-/// once the bridge has connected. Bring-up connects objects in registration
-/// order, which is config-file order within a phase, so a named bridge declared
-/// before its child is up by the time the child asks; one declared after its
-/// child is not waited for. A bare `[mcu]` child is the exception the error
-/// names: the main section always registers before every `[mcu <name>]`, so it
-/// can never be ordered after a named bridge and has to be given a name.
+/// The port's index comes from the **port section** the host built at
+/// configuration time (its declaration order among the bridge's ports), so this
+/// only succeeds once the bridge object has connected. Bring-up connects objects
+/// in registration order, which is config-file order within a phase, so a named
+/// bridge declared before its child is up by the time the child asks; one
+/// declared after its child is not waited for. A bare `[mcu]` child is the
+/// exception the error names: the main section always registers before every
+/// `[mcu <name>]`, so it can never be ordered after a named bridge and has to be
+/// given a name.
 ///
 /// # Errors
-/// [`KlippyError::Config`] for everything here: a bridge that has not connected
-/// and the three port-table failures — no table, no port with that oid, or the
-/// port's type not matching the section's.
+/// [`KlippyError::Config`] for everything here: a bridge that has not connected,
+/// a port section that carries no index (a section built outside the loader), or
+/// a CAN port, which has no configuration-time object yet.
 pub(crate) fn resolve(
     printer: &Printer,
     config: &McuConfig,
@@ -105,21 +114,37 @@ pub(crate) fn resolve(
             config.name
         )));
     };
-    // The port section object: the oid the firmware names it by, and the `[mcu]`
-    // it says is the bridge.
-    let (oid, bridge) = match kind {
-        PortKind::Uart => {
-            let section = printer.lookup_object_as::<UartPort>(port).ok_or_else(|| {
-                config_error(format!("MCU '{}': no port section '{port}'", config.name))
-            })?;
-            (section.oid().to_string(), section.mcu().to_string())
-        }
-        PortKind::Can => {
-            let section = printer.lookup_object_as::<CanPort>(port).ok_or_else(|| {
-                config_error(format!("MCU '{}': no port section '{port}'", config.name))
-            })?;
-            (section.oid().to_string(), section.mcu().to_string())
-        }
+    // A CAN downstream port has no configuration-time object yet: the firmware
+    // side of MUX_CAN does not exist, so there is no port the child could be
+    // routed to. Refuse it by name instead of sending a route to a port the
+    // bridge does not have (which would drop it in silence).
+    if *kind == PortKind::Can {
+        let section = printer.lookup_object_as::<CanPort>(port).ok_or_else(|| {
+            config_error(format!("MCU '{}': no port section '{port}'", config.name))
+        })?;
+        return Err(config_error(format!(
+            "MCU '{}': bridge '{}' cannot host port '{}' (a [can_device]): a CAN downstream \
+             port is not created at configuration time yet (MUX_CAN does not exist)",
+            config.name,
+            section.mcu(),
+            section.name()
+        )));
+    }
+    // The port section object and the `[mcu]` it says is the bridge. A UART
+    // port's index is the one the host assigned it when it created the port at
+    // configuration time (`mcu/bridge_ports.rs`): its declaration order among
+    // the bridge's ports, which is the index the firmware's router gave it.
+    let (bridge, index) = {
+        let section = printer.lookup_object_as::<UartPort>(port).ok_or_else(|| {
+            config_error(format!("MCU '{}': no port section '{port}'", config.name))
+        })?;
+        let index = section.index().ok_or_else(|| {
+            config_error(format!(
+                "MCU '{}': port section '{port}' was not configured for its bridge",
+                config.name
+            ))
+        })?;
+        (section.mcu().to_string(), index)
     };
 
     // The bridge object, registered under the same spelling the port section
@@ -149,19 +174,11 @@ pub(crate) fn resolve(
     let bridge_object = printer
         .lookup_object_as::<McuObject>(&bridge_name)
         .ok_or_else(not_up)?;
-    let Some(bridge_mcu) = bridge_object.mcu() else {
+    if bridge_object.mcu().is_none() {
         return Err(not_up());
-    };
+    }
     // The bridge's transport, for `open` to reach the downstream device through.
     let bridge_config = bridge_object.mcu_config()?;
-    let dictionary = bridge_mcu.dictionary().ok_or_else(|| {
-        config_error(format!(
-            "MCU '{}': bridge '{bridge}' reports no port table (old firmware, or not a bridge \
-             build)",
-            config.name
-        ))
-    })?;
-    let index = bridge_port_index(&dictionary, &oid, *kind, &config.name, &bridge)?;
 
     let groups = printer
         .lookup_object_as::<PortGroups>(PORT_GROUPS_OBJECT)
@@ -366,84 +383,6 @@ pub(crate) fn open(
     Ok(interface)
 }
 
-/// Look up the child's oid in the bridge's firmware port table, returning its
-/// `index`.
-///
-/// The table is the four identifying keys the bridge build reports
-/// `BRIDGE_PORT_COUNT`, then `BRIDGE_PORT<i>_NAME` / `_TYPE` / `_PATH` per port
-/// (`third_party/klipper/src/host/bridge.c`). A firmware without the count is
-/// not a bridge build (or predates the table); a table without the oid names
-/// what it does have; and the type must match the section's kind — an oid
-/// reached over the wrong port kind would carry the wrong wire format.
-///
-/// # Errors
-/// [`KlippyError::Config`] naming the child, the bridge and the mismatch.
-fn bridge_port_index(
-    dictionary: &Dictionary,
-    oid: &str,
-    kind: PortKind,
-    child: &str,
-    bridge_name: &str,
-) -> Result<u8, KlippyError> {
-    let Some(count) = dictionary.constant_f64("BRIDGE_PORT_COUNT") else {
-        return Err(config_error(format!(
-            "MCU '{child}': bridge '{bridge_name}' reports no port table (old firmware, or not a \
-             bridge build)"
-        )));
-    };
-    let mut names: Vec<String> = Vec::new();
-    let mut found: Option<(usize, Option<String>)> = None;
-    for index in 0..(count as usize) {
-        let Some(name) = dictionary
-            .constant(&format!("BRIDGE_PORT{index}_NAME"))
-            .and_then(|value| value.as_str())
-            .map(str::to_string)
-        else {
-            continue;
-        };
-        let kind_text = dictionary
-            .constant(&format!("BRIDGE_PORT{index}_TYPE"))
-            .and_then(|value| value.as_str())
-            .map(str::to_string);
-        if name == oid {
-            found = Some((index, kind_text));
-        }
-        names.push(name);
-    }
-    let Some((index, kind_text)) = found else {
-        let listed = if names.is_empty() {
-            "the table is empty".to_string()
-        } else {
-            names
-                .iter()
-                .map(|name| format!("'{name}'"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
-        return Err(config_error(format!(
-            "MCU '{child}': bridge '{bridge_name}' has no port named '{oid}' (its ports are \
-             {listed})"
-        )));
-    };
-    let expected = kind.reference_option();
-    let got = kind_text.as_deref().unwrap_or("none");
-    if got != expected {
-        return Err(config_error(format!(
-            "MCU '{child}': bridge '{bridge_name}' port '{oid}' has the wrong type: expected \
-             '{expected}', got '{got}'"
-        )));
-    }
-    // The port-level command carries the index in one byte, so a port the table
-    // puts past 255 cannot be named — refuse it rather than truncating the index
-    // onto some other port's route.
-    u8::try_from(index).map_err(|_| {
-        config_error(format!(
-            "MCU '{child}': bridge '{bridge_name}' port '{oid}' is at index {index}; a port \
-             command cannot address it (0..=255)"
-        ))
-    })
-}
-
 /// The port's `SET_PORT_NODEID` flags byte.
 ///
 /// A legacy port's device does not speak the mux, so the bridge strips the
@@ -488,7 +427,6 @@ mod tests {
     use crate::core::klippy::interface::pty::Pty;
     use crate::core::klippy::printer::Printer;
     use crate::core::klippy::reactor::{ManualReactor, TokioReactor};
-    use serde_json::json;
     use std::io::Read;
     use std::os::fd::AsRawFd;
     use std::sync::Arc;
@@ -591,102 +529,88 @@ mod tests {
         );
     }
 
-    /// A `[mcu]`'s identify answer built in code: the `config` object of the
-    /// dictionary holds the compile-time constants (the port table).
-    fn dictionary(value: serde_json::Value) -> Dictionary {
-        Dictionary::from_json(value).expect("the dictionary parses")
+    // -----------------------------------------------------------------------
+    // The port index: the declaration order the host assigned the port, which
+    // is the index the firmware's router gave it.
+    // -----------------------------------------------------------------------
+
+    /// Two port sections on one bridge take the indices 0 and 1 in the order
+    /// the config declares them: the firmware numbers ports by the order the
+    /// host's `config_bridge_port` commands arrive, and the loader queues them
+    /// in declaration order (`bridge_ports::load_uart_device`).
+    #[test]
+    fn port_sections_take_their_declaration_order() {
+        let printer = printer_with(
+            "[mcu bridge]\nserial: /dev/a\n\
+             [uart_device second]\nuart_mcu: bridge\nuart_oid: uart1\n\
+             [uart_device first]\nuart_mcu: bridge\nuart_oid: uart0\n",
+        );
+        let last = printer
+            .lookup_object_as::<UartPort>("uart_device second")
+            .expect("the printer has [uart_device second]");
+        let first = printer
+            .lookup_object_as::<UartPort>("uart_device first")
+            .expect("the printer has [uart_device first]");
+
+        assert_eq!(
+            last.index(),
+            Some(0),
+            "the first declared port gets index 0"
+        );
+        assert_eq!(first.index(), Some(1), "the next gets index 1");
     }
 
-    /// A bridge whose firmware reports no port table (an old firmware, or one
-    /// that is not a bridge build) is refused: there is no index to name.
+    /// A bridge's port count is what the declaration order can address: the
+    /// port index travels in one byte, so the 257th port is refused rather than
+    /// wrapping onto an existing port's route.
     #[test]
-    fn a_bridge_without_a_port_table_is_refused() {
-        let dictionary = dictionary(json!({"config": {"CLOCK_FREQ": 1}}));
+    fn a_port_past_the_index_range_is_refused() {
+        let printer = printer_with("[mcu bridge]\nserial: /dev/a\n");
+        let bridge = printer
+            .lookup_object_as::<McuObject>("mcu bridge")
+            .expect("the printer has [mcu bridge]");
 
-        let err =
-            bridge_port_index(&dictionary, "uart0", PortKind::Uart, "child", "bridge").unwrap_err();
+        for index in 0..=u8::MAX {
+            assert_eq!(
+                bridge.next_bridge_port_index("uart_device p").unwrap(),
+                index,
+                "indices 0..=255 are addressable"
+            );
+        }
+        let err = bridge
+            .next_bridge_port_index("uart_device p")
+            .expect_err("the 257th port has no address");
+
+        let text = err.to_string();
+        assert!(text.contains("uart_device p"), "{text}");
+        assert!(text.contains("256 ports"), "{text}");
+        assert!(text.contains("0..=255"), "{text}");
+    }
+
+    /// A `can:` device is refused by name: a CAN downstream port has no
+    /// configuration-time object yet, so there is no route for it to travel.
+    ///
+    /// The refusal is the port section's own — its `can_mcu` names the bridge —
+    /// and comes before the not-yet-connected check, because no bridge state
+    /// can make a CAN port exist.
+    #[test]
+    fn a_can_port_is_refused_by_name() {
+        let printer = printer_with(
+            "[mcu bridge]\ntest: dict=/does/not/matter\n\
+             [mcu child]\ncan: can0\nuuid: 11aa22bb33cc\n\
+             [can_device can0]\ncan_mcu: bridge\ncan_oid: can0\n",
+        );
+        let config = child_config(&printer, "child");
+
+        let err = resolve(&printer, &config).unwrap_err();
 
         let text = err.to_string();
         assert!(text.contains("MCU 'child'"), "{text}");
         assert!(
-            text.contains(
-                "bridge 'bridge' reports no port table (old firmware, or not a bridge build)"
-            ),
+            text.contains("bridge 'bridge' cannot host port 'can0'"),
             "{text}"
         );
-    }
-
-    /// A port table without the child's oid is refused, and the error lists the
-    /// ports the bridge does report.
-    #[test]
-    fn a_port_table_without_the_oid_is_refused_and_lists_its_ports() {
-        let dictionary = dictionary(json!({"config": {
-            "BRIDGE_PORT_COUNT": 2,
-            "BRIDGE_PORT0_NAME": "uart0",
-            "BRIDGE_PORT0_TYPE": "uart",
-            "BRIDGE_PORT1_NAME": "uart1",
-            "BRIDGE_PORT1_TYPE": "uart",
-        }}));
-
-        let err =
-            bridge_port_index(&dictionary, "uart2", PortKind::Uart, "child", "bridge").unwrap_err();
-
-        let text = err.to_string();
-        assert!(
-            text.contains("bridge 'bridge' has no port named 'uart2'"),
-            "{text}"
-        );
-        assert!(text.contains("its ports are 'uart0', 'uart1'"), "{text}");
-    }
-
-    /// A port whose firmware type does not match the section's kind is refused:
-    /// an oid reached over the wrong kind would carry the wrong wire format.
-    #[test]
-    fn a_port_of_the_wrong_type_is_refused() {
-        let dictionary = dictionary(json!({"config": {
-            "BRIDGE_PORT_COUNT": 1,
-            "BRIDGE_PORT0_NAME": "uart0",
-            "BRIDGE_PORT0_TYPE": "can",
-        }}));
-
-        let err =
-            bridge_port_index(&dictionary, "uart0", PortKind::Uart, "child", "bridge").unwrap_err();
-
-        let text = err.to_string();
-        assert!(
-            text.contains("port 'uart0' has the wrong type: expected 'uart', got 'can'"),
-            "{text}"
-        );
-    }
-
-    /// A port the firmware's table puts past 255 cannot be named: the index
-    /// travels in one byte, and truncating it would route to some other port's
-    /// node — so it is refused, naming the port and its index.
-    #[test]
-    fn a_port_past_the_index_range_is_refused() {
-        let mut config = serde_json::Map::new();
-        config.insert("BRIDGE_PORT_COUNT".to_string(), json!(257));
-        config.insert("BRIDGE_PORT256_NAME".to_string(), json!("uart0"));
-        config.insert("BRIDGE_PORT256_TYPE".to_string(), json!("uart"));
-
-        let err = bridge_port_index(
-            &dictionary(json!({ "config": config })),
-            "uart0",
-            PortKind::Uart,
-            "child",
-            "bridge",
-        )
-        .unwrap_err();
-
-        let text = err.to_string();
-        assert!(
-            text.contains("bridge 'bridge' port 'uart0' is at index 256"),
-            "{text}"
-        );
-        assert!(
-            text.contains("a port command cannot address it (0..=255)"),
-            "{text}"
-        );
+        assert!(text.contains("MUX_CAN does not exist"), "{text}");
     }
 
     // -----------------------------------------------------------------------
@@ -918,6 +842,59 @@ mod tests {
         drop(printer);
         wait_for_mux_library_unload(&library);
         let _ = std::fs::remove_file(&bridge_path);
+    }
+
+    /// A port whose tty is not there fails the **configuration**, naming the MCU
+    /// and the reason — not the library init, and not a bridge that comes up
+    /// without its port.
+    ///
+    /// The host library opens nothing while it loads; the stream is opened when
+    /// the host configures the UART object (`third_party/klipper/src/uart.c`),
+    /// which is this bring-up. So a tty that is missing surfaces as the
+    /// firmware's own `shutdown`, and the bring-up reports it with the reason
+    /// the firmware gave (`McuObject::connect_failure`).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_missing_port_tty_fails_the_configuration() {
+        let _serial = HOST_LIBRARY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+
+        // No tty at the path this build baked in: the port cannot be opened.
+        let bridge_path = klipperx_test_support::klipper_host_mux_serial_path();
+        let _ = std::fs::remove_file(&bridge_path);
+
+        let library = klipperx_test_support::klipper_host_mux_lib_path();
+        let text = format!(
+            "[mcu bridge]\nhost_library: {}\n\
+             [uart_device uart0]\nuart_mcu: bridge\nuart_oid: uart0\n\
+             [mcu child]\nuart: uart0\n",
+            library.display()
+        );
+        let config = Config::from_text(&text).expect("the config parses").0;
+        let reactor = Arc::new(TokioReactor::new(tokio::runtime::Handle::current()));
+        let printer = Arc::new(Printer::new(reactor));
+        printer.load_config(&config).expect("the config loads");
+
+        // Bounded: the firmware fails the configuration on the first run, and a
+        // stopped firmware is retried a fixed number of times before the
+        // bring-up reports it.
+        let _ = tokio::time::timeout(Duration::from_secs(60), printer.bring_up()).await;
+
+        let state = printer.get_state_message();
+        assert!(
+            state.message.contains("MCU 'bridge'"),
+            "the failure names the bridge: {}",
+            state.message
+        );
+        assert!(
+            state.message.contains("config_uart"),
+            "the failure carries the firmware's reason: {}",
+            state.message
+        );
+
+        printer.teardown();
+        drop(printer);
+        wait_for_mux_library_unload(&library);
     }
 
     // -----------------------------------------------------------------------

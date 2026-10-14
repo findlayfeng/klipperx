@@ -221,6 +221,20 @@ admin id `0x3f0`；第二级是「桥 ↔ 下游某口的设备」——用 `SET
   默认 `arduino`）静默降级，非法拼写仍是配置错。强制在解析层发生，因此 `connect`、重连、
   `before_firmware_restart`、`reset_firmware` **全都**拿到 `command`，没有旁路；
   `Transport::open` 里对 cheetah 的 RTS 另有一条 warn（防御性，正常路径已不可达）。
+- **桥下游设备的 attach 时序**（M1-P3 已落地，只对**给桥自己的**端口级命令）：identify 之后
+  才拿得到端口表（§4.3），对账取 `index` 后主机按下面顺序发：
+  1. 开一个**不握手**的下游句柄（同一共享资源/同一库的下一个引用，按该设备的 id 寻址）；
+  2. 向桥发 `SET_PORT_NODEID(index, id, flags)`——**这一步必须在前**：路由不存在时，下面那条
+     命名单元会被桥直接丢掉（`bridge_route_unit` 查不到 `id → 端口`）；
+  3. legacy（无 `uuid:`）：到此为止，之后按**原始帧**收发；命名设备：再做
+     `SET_KLIPPER_NODEID` + 重确认握手，之后按**整单元**收发（§4.5 的「两条都要发」）。
+  顺序由调用方（`mcu/bridge_attach.rs`）持有，`serial.rs`/`host.rs` 只提供入口（`attach_downstream`/
+  `load_downstream` + `handshake`/`attach` + `send_set_port_node_id`）。
+- **复位命令的主机接线**（M2 主机半边）：命名设备用 `restart_method: admin`——先重申
+  `SET_PORT_NODEID`（端口 `flags` 是桥侧状态，未置位时 `RESET_DEVICE` 会被桥**剥头**、设备收到
+  裸 `KXID` 帧而拒绝执行），再发 `RESET_DEVICE [0x02][index]`；legacy 设备由端口节
+  `uart_restart_method`（只认 `arduino`/`cheetah`）声明，主机只发 `RESET_PORT [0x04][index]`
+  （桥自己消费、做线脉冲，**不下发**）。两条都无回执 ⇒ 确认靠「复位后能否重新握手/identify」。
 
 ## 与 CAN 的关系
 
@@ -241,6 +255,10 @@ CAN 不需要这套东西：总线自带仲裁 id 与硬件过滤，每颗 MCU �
   这条已经通了**：mux 路径的真端到端 attach 就是走它。
 - **多下游端口**：端口表支持多条，但今天只登记一条（host 那条 tty），多端口扇出尚未被测过。
   「某单元属于哪个端口」的归属策略**已由主机侧命令落地并被探针钉住**（`SET_PORT_NODEID` 建
-  `id → 端口` 表，见上节；真库探针见[测试](testing.md)），余项只是多端口硬件本身。
+  `id → 端口` 表，见上节；真库探针见[测试](testing.md)）。
+- **配置驱动的整链端到端**：夹具（真 `.dict` 假固件经真桥答 identify/`get_clock`）与配置驱动路由
+  （子设备裸帧确实到端口）**两半**都已实测，但合起来那条在**单进程内做不到**——宿主库只有一个
+  输出队列，桥自己的引用会把子设备的回包偷走（实测：子设备 identify 请求被重发 ~28 次）。要真
+  验需下游固件跑**独立进程**（或真机）。详见[工作记录](../work-log/2026-10-13-bridge-port-notes.md) §7 的欠项。
 - **host 侧读端口的时机**：`bridge_poll()` 插在任务循环的睡眠处（`src/host/timer.c` 的
   `irq_wait()`），不额外起线程；代价是下游字节要等任务循环醒着时才被捡起。

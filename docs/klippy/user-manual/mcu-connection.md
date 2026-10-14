@@ -102,9 +102,7 @@ uart: uartxx                    # 无 uuid ⇒ legacy，原始帧
 端口级命令 `SET_PORT_NODEID(index, id, flags)` 直接告诉桥，**下游设备全程不答任何 admin**（线上
 帧形与命令族见[串口复用协议](../developer-manual/serial-mux-protocol.md)）。
 
-> **状态（M1 分期）**：配置面（节类型、`uart:`/`can:` 键、分组与冲突校验）已落地；**经端口 attach
-> 属 M1-P3**——现在解析与装载都通过，`connect` 会明确报错（点名 M1-P3）而非假装可连。识别后与
-> 固件端口表的对账（oid 名/类型）也在 P3。
+> **状态（M1 分期）**：**已落地**。连接时：identify 后按固件报出的端口表把 `(桥, oid名)` 对成端口 `index`（类型不符 / 表里没这个口都点名报错），`legacy` 只向桥发 `SET_PORT_NODEID(index, id, 0)` 之后按原始帧收发；命名设备（写了 `uuid:`）先发同一条（`flags` 带「说单元」位）再做 `SET_KLIPPER_NODEID` + 重确认，之后整单元原样转发。**顺序约束**：桥必须**先于**该子节连接（顺序不对报点名错误，不会自愈）；又因为裸 `[mcu]` 同阶段总先于 `[mcu <名>]` 装载，**桥是裸 `[mcu]` 时子节必须写成 `[mcu <名>]`**。桥经 **CAN** 上游的下游 attach 属 **P5**，现在点名报错。
 
 ## 固件重启方式（`restart_method`）
 
@@ -116,6 +114,7 @@ uart: uartxx                    # 无 uuid ⇒ legacy，原始帧
 | `arduino` | 以 2400 波特打开串口，翻转 DTR | 串口**缺省**值；Arduino 及克隆板 |
 | `cheetah` | 以 2400 波特做一串 RTS/DTR 时序 | Fysetc Cheetah v1.2 等采用状态机 bootloader 电路的板子 |
 | `rpi_usb` | 切断再恢复该 USB 端口的供电 | 树莓派等能给 USB 口断电的机器 |
+| `admin` | 经桥转发 `RESET_DEVICE`，由设备自己进 bootloader | **仅用于桥下游端口上的命名设备**（写了 `uuid:`）；无 admin 通道的 legacy 设备改用端口节的 `uart_restart_method`（桥对该口做线脉冲），旧固件/非桥构建会点名报错。端口级命令都**无回执**，确认靠「能不能重新握手」 |
 
 ```ini
 [mcu]

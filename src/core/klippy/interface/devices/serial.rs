@@ -2577,6 +2577,13 @@ mod mux_tests {
 
     #[test]
     fn set_port_node_id_is_the_port_level_admin_unit() {
+        // The three port-level command bytes are the firmware's mux.h table
+        // (0x02 RESET_DEVICE / 0x03 SET_PORT_NODEID / 0x04 RESET_PORT) — pinned
+        // here so a drift from the C side fails on the host too, not only in the
+        // real-library probe.
+        assert_eq!(CMD_RESET_DEVICE, 0x02);
+        assert_eq!(CMD_SET_PORT_NODEID, 0x03);
+        assert_eq!(CMD_RESET_PORT, 0x04);
         // The bytes on the wire, exactly: the admin listen id as a checked
         // header, then the `KXID` frame carrying `[0x03][index][id][flags]` —
         // the firmware's mux.h command table (SET_PORT_NODEID, payload

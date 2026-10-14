@@ -974,7 +974,7 @@ mod host_tests {
     use crate::core::klippy::interface::devices::serial::{
         admin_unit, decode_header, discovery_query, encode_header, set_node_id_for,
         set_port_node_id, HeaderScan, UnassignedNode, ADMIN_LISTEN, ADMIN_REPLY, CMD_RESET_DEVICE,
-        CMD_RESET_PORT, HEADER_BYTES, MAGIC, MUX_PORT_UNITS, RESP_NEED_NODEID,
+        CMD_RESET_PORT, CMD_SET_PORT_NODEID, HEADER_BYTES, MAGIC, MUX_PORT_UNITS, RESP_NEED_NODEID,
     };
     use crate::core::klippy::interface::pty::Pty;
     use crate::core::klippy::mcu::host_libraries::HostLibraries;
@@ -1811,9 +1811,20 @@ mod host_tests {
 
         // G. The reset family. `[0x04][0]` pulses port 0's lines — a pty has no
         //    modem lines, so it is dropped in silence, with no receipt.
+        //    Written twice back to back so that on real hardware the second
+        //    lands inside the first pulse's 250 ms hold, where the firmware must
+        //    take it as already done rather than re-read the asserted lines as
+        //    "original state" (that would restore the asserted level at the
+        //    deadline and hold the port in reset forever — the re-entry guard in
+        //    `bridge_port_reset`). That guard is *not* what these two sends
+        //    prove: a pty never arms a pulse (TIOCMGET/TIOCMSET cannot run), so
+        //    all they pin here is consumption — no port bytes, no receipt.
         device
             .write(&admin_unit(&[CMD_RESET_PORT, 0]))
             .expect("RESET_PORT goes in");
+        device
+            .write(&admin_unit(&[CMD_RESET_PORT, 0]))
+            .expect("a second RESET_PORT goes in");
         assert!(
             read_pty(&pty.master, 1, quiet).is_empty(),
             "RESET_PORT writes nothing to the port"
@@ -1821,6 +1832,32 @@ mod host_tests {
         assert!(
             read_unit(&mut device, &mut pending, quiet).is_none(),
             "RESET_PORT carries no receipt"
+        );
+
+        // SET_PORT_NODEID drops bad arguments in silence too: an out-of-range
+        // index and a short payload are consumed without reaching any port and
+        // without a receipt.
+        device
+            .write(&set_port_node_id(99, 7, MUX_PORT_UNITS))
+            .expect("an out-of-range SET_PORT_NODEID goes in");
+        assert!(
+            read_pty(&pty.master, 1, quiet).is_empty(),
+            "an out-of-range port index reaches no port"
+        );
+        assert!(
+            read_unit(&mut device, &mut pending, quiet).is_none(),
+            "a rejected SET_PORT_NODEID carries no receipt"
+        );
+        device
+            .write(&admin_unit(&[CMD_SET_PORT_NODEID, 0]))
+            .expect("a short SET_PORT_NODEID goes in");
+        assert!(
+            read_pty(&pty.master, 1, quiet).is_empty(),
+            "a short payload reaches no port"
+        );
+        assert!(
+            read_unit(&mut device, &mut pending, quiet).is_none(),
+            "a short payload carries no receipt"
         );
 
         // `[0x02][0]` is forwarded to port 0 alone. Port 0 speaks units since

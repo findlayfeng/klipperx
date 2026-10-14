@@ -190,9 +190,9 @@ admin 信道，`mux_unit()` 决定归属）。**注意两条不同的寻址**：
 
 | 命令 | 载荷 | 语义 |
 |------|------|------|
-| `SET_PORT_NODEID` | `[0x03][index][id][flags]`（4 字节） | 桥建 `id → 端口` 表并记该口 `flags`。`index` 0 起（对应 identify 字典端口表 `BRIDGE_PORT<n>_` 的下标）；`id` = MCU 层 id（`1..=255`，`mux_arb_id(id)!=0`）；`flags` bit0=`MUX_PORT_UNITS`（`0x01`）：置位 = 该口设备**说单元**（收发整单元原样转发）；清零 = **legacy**（下行剥头、上行按该口记的 id 加应答头）；保留位忽略。**幂等**：重复发送 = 覆盖同值 |
+| `SET_PORT_NODEID` | `[0x03][index][id][flags]`（4 字节） | 桥建 `id → 端口` 表并记该口 `flags`。`index` 0 起（对应 identify 字典端口表 `BRIDGE_PORT<n>_` 的下标）；`id` = MCU 层 id（`1..=255`，`mux_arb_id(id)!=0`）；`flags` bit0=`MUX_PORT_UNITS`（`0x01`）：置位 = 该口设备**说单元**（收发整单元原样转发）；清零 = **legacy**（下行剥头、上行按该口记的 id 加应答头）；保留位忽略。**幂等**：重复发送 = 覆盖同值；**旧映射不撤销**——同一口改登记为别的 id 后，旧 id 仍路由到该口（`bridge_map_id` 只增不删），想把下游设备改绑到别的口需另行定义 |
 | `RESET_DEVICE` | `[0x02][index]` | 桥**只**转发到 `index` 口（UNITS 口带头转发、legacy 口剥头转发——legacy 设备的解析器会拒 seq `0x20`，属预期：无 admin 的 legacy 口只能走 `RESET_PORT`），不扇出全体、不触发本机设备半；无桥的板（纯 mux 构建）由设备半自己执行（照 `canserial.c` 的 `can_process_request_bootloader` 模式，`CONFIG_HAVE_BOOTLOADER_REQUEST` 守卫，index 字节设备忽略） |
-| `RESET_PORT` | `[0x04][index]` | 桥消费后对 `index` 口做**线级复位**：经 `bridge_port_ops.reset` 钩子（NULL=不支持 → 静默）；host 侧实现为 DTR\|RTS 断言 250 ms 的脉冲，用任务循环 idle 处的 poll 状态机延迟恢复（不阻塞不忙等；pty 等无 modem 线的 fd 返回 -1 静默） |
+| `RESET_PORT` | `[0x04][index]` | 桥消费后对 `index` 口做**线级复位**：经 `bridge_port_ops.reset` 钩子（NULL=不支持 → 静默）；host 侧实现为 DTR\|RTS 断言 250 ms 的脉冲，用任务循环 idle 处的 poll 状态机延迟恢复（不阻塞不忙等；pty 等无 modem 线的 fd 返回 -1 静默）；**保持窗内重复发送按已完成处理**（不把此刻已断言的线态当成「原状态」重存，否则释放时恢复断言态、设备被永久按住） |
 
 **identify 字典的端口表**（仅桥构建出现，键名钉死供主机断言）：`BRIDGE_PORT_COUNT`（端口数）、
 `BRIDGE_PORT<n>_NAME`（该口 oid 名，host 串口为 `"uart0"`）、`BRIDGE_PORT<n>_TYPE`（`"uart"`）、

@@ -15,7 +15,7 @@ use tracing::warn;
 /// Parsing does not touch a device: [`McuConfig::open`] is what opens the
 /// transport. The split lets a firmware restart reset the board on its **closed**
 /// port, between the two (`mcu/object.rs`, `mcu/restart.rs`).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct McuConfig {
     /// MCU name (from ConfigSection's sub field)
     pub name: String,
@@ -119,9 +119,10 @@ pub enum Transport {
     /// member without one, `mcu/port_grouping.rs`), optional on a uart one,
     /// where its absence is rule 5's legacy shape. Whether the port is shared
     /// is likewise the whole config's call, like a shared `serial:` path.
-    /// Opening one is not wired up yet: the attach goes through the bridge's
-    /// port table and port-level command (M1-P3), and [`Transport::open`]
-    /// says so rather than pretending the device came up.
+    /// Opening one is not [`Transport::open`]'s path: `McuObject::connect`
+    /// routes it to the attach pass (`mcu/bridge_attach.rs`), which reconciles
+    /// the bridge's port table and opens the downstream handle on the bridge's
+    /// own link.
     BridgePort {
         port: String,
         uuid: Option<[u8; 6]>,
@@ -804,17 +805,19 @@ impl Transport {
                 None => Interface::host(library).map_err(|e| format!("host_library: {e}")),
             },
             // A bridge port's device is reached through the bridge itself —
-            // its port table and the port-level `SET_PORT_NODEID` — and that
-            // attach lands with M1-P3. Until then this build does not open
-            // such a transport, and says so where every other open failure is
-            // said, rather than pretending the device came up.
+            // its port table and the port-level `SET_PORT_NODEID` — so it is
+            // not opened here: `McuObject::connect` routes this transport to
+            // the attach pass (`mcu/bridge_attach.rs`), which opens the
+            // downstream handle on the bridge's own link. This arm says so
+            // rather than pretending the device came up, in the same place
+            // every other open failure is said.
             Transport::BridgePort {
                 port,
                 kind,
                 uuid: _,
             } => Err(format!(
-                "{} {port}: opening a device through a bridge port is not wired up yet (M1-P3: \
-                 the attach needs the bridge's port table and SET_PORT_NODEID)",
+                "{} {port}: a bridge-port device is opened by the attach pass \
+                 (mcu/bridge_attach.rs), not by the transport",
                 kind.section_type()
             )),
             #[cfg(test)]
@@ -2140,11 +2143,12 @@ mod tests {
         assert!(err.to_string().contains("invalid uuid"), "{err}");
     }
 
-    /// The transport describes the port, but nothing opens it yet: the attach
-    /// through the bridge's port table lands with M1-P3, and `open` says so
-    /// where every other open failure is said.
+    /// The transport describes the port, but `Transport::open` is not its path:
+    /// the attach through the bridge's port table (`mcu/bridge_attach.rs`)
+    /// opens it, and `open` points there rather than pretending the device came
+    /// up.
     #[test]
-    fn a_port_child_open_is_refused_as_not_wired_up_yet() {
+    fn a_port_child_open_points_at_the_bridge_attach() {
         let (config, _) = parse_shared(
             "[mcu bridge]\nserial: /dev/a\n\
              [mcu child]\nuart: uart0\nuuid: 11aa22bb33cc\n\
@@ -2154,7 +2158,7 @@ mod tests {
         let config = config.unwrap();
         let err = config.open().unwrap_err();
         assert!(err.contains("uart_device uart0"), "{err}");
-        assert!(err.contains("M1-P3"), "{err}");
+        assert!(err.contains("bridge_attach"), "{err}");
     }
 
     /// A `restart_method` on a port child is reported and ignored: only a

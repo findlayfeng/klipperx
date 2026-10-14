@@ -189,6 +189,47 @@ impl Interface {
         ))))
     }
 
+    /// Wrap an already-loaded host-library reference, for a device **behind a
+    /// bridge port**.
+    ///
+    /// [`Interface::host`] loads the library; this is the case where the bridge
+    /// already has it open and the reference is a downstream device
+    /// ([`HostDevice::load_downstream`], `mcu/bridge_attach.rs`) rather than the
+    /// bridge's own device.
+    pub(crate) fn from_host(device: Arc<HostDevice>) -> Self {
+        Self::with_transport(Transport::Host(device))
+    }
+
+    /// Tell the bridge this interface's link reaches which id the device behind
+    /// port `index` answers to.
+    ///
+    /// The port-level command
+    /// ([`set_port_node_id`](devices::serial::set_port_node_id)) travels the
+    /// bridge's **admin** channel, so only a link that has one can carry it: a
+    /// shared serial port or a host library. Every other transport has no bridge
+    /// to tell, and the message says so rather than writing the unit on a link
+    /// nobody listens to.
+    ///
+    /// # Errors
+    /// The device's own error, or [`InterfaceError::Other`] when this interface
+    /// is not a bridge link.
+    pub(crate) fn send_set_port_node_id(
+        &self,
+        index: u8,
+        mcu_id: u8,
+        flags: u8,
+    ) -> Result<(), InterfaceError> {
+        match &self.transport {
+            Transport::SharedSerial(handle) => handle.send_set_port_node_id(index, mcu_id, flags),
+            Transport::Host(device) => device.send_set_port_node_id(index, mcu_id, flags),
+            _ => Err(InterfaceError::Other(
+                "SET_PORT_NODEID needs a bridge link (a shared serial port or a host library); \
+                 this interface is neither"
+                    .to_string(),
+            )),
+        }
+    }
+
     /// Create an interface running klipper's host library from `path` on a path
     /// the config says is muxed: the library is given `mux`'s identity and the
     /// reference is attached under `mcu_id` ([`HostDevice::load_mux`]), so its

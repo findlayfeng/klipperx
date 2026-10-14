@@ -558,3 +558,42 @@ fresh-context 只读复审对「①–⑤ 都成立」给了逐条证据（端�
    `push_frame` 会一直往无人读的槽里堆字节（host 半无此问题：引用析构后 `SEND` 失败即丢）。
 3. 复审顺带修正：P8 写手把两条 plain-library 测试的 flake 归到缺陷 1**不成立**（那是 host 侧代码），
    真实首因仍待有界复现——候选是 `library_unloaded()` 只观察 `Weak`、不等 `dlclose` 尾巴（`host.rs:1511-1516`）。
+
+### P9（2026-10-15）：共享串口两处既有缺陷修复 + 一个真机结论
+
+**P9 修复（`cd85007`）**——上一轮复审报出的两处既有缺陷：
+
+1. **读者可能在读者线程上 join 自己**：`reader_loop` 在 `weak.upgrade()`→`drop(port)` 之间短暂持强引用，
+   若此刻最后一个 `SharedSerialHandle` 析构，`SharedSerialPort::drop` 的 `handle.join()` 就跑在 reader
+   线程上 ⇒ `pthread_join(self)` = `EDEADLK` ⇒ std panic。**修法**：`Drop` 里自 join 守卫
+   （`thread::current().id()` 比自己就跳过，`JoinHandle` 被 detach），reader 随后在下一轮
+   `weak.upgrade()` 拿到 `None` 自然退出（不依赖 `stopped`、不持锁、不永活）。写手给了**确定性反证**：
+   持住目标槽的 `incoming` 锁把读者钉在 `dispatch` 里 ⇒ 必然命中窗口；临时改成无条件 join 即复现
+   `failed to join thread: Resource deadlock avoided (os error 35)`。
+2. **槽不回收**：`slots` 只在 `attach` 握手失败时移除，句柄正常析构后槽仍在、`push_frame` 一直往无人读的槽
+   堆字节。**修法**：新增 `impl Drop for SharedSerialHandle`，锁下用 `Arc::ptr_eq` 只移除**本句柄**的槽
+   （与 attach 的 insert、失败路径的 remove 都不打架）；新测断言「析构后该 id 槽消失、同 id 重 attach
+   无陈旧积压、之后的新单元照收」。
+
+验收：`cargo test --workspace` **3223 passed / 0 failed / 14 ignored**；fmt 干净；`--all-targets` 0 告警；
+复审（fresh context）**可合入**，要求的三处手册数字/措辞（`testing.md` 41/8/53 → **43/10/55**、
+dev-manual `README.md` 与 `serial-mux-protocol.md` 的引用计数关闭段）已由 main 同批补上。
+复审另报三条**report-only**（`shutdown()` 不注销槽 ⇒ shutdown-未析构期间该槽无界增长；`attach` 失败路径
+无条件 remove 与 Drop 的 ptr_eq 不对称；`SharedSerialHandle::shutdown` 无测试）——建议合并成一个小单元，
+把注销统一到 ptr_eq 守卫的 `unregister()` 并补 shutdown 路径测试。
+
+**真机结论（DTR/RTS）**——回答「这块板是 USB 虚拟串口，DTR/RTS 到底有没有被处理」：
+
+- 这台 `usb-Klipper_stm32f103xe_39FFD7054D47323924610951-if00` 是**原生 USB CDC**（klipper 自带 USB 栈）。
+- 固件侧（`third_party/klipper/src/generic/usb_cdc.c`）：`USB_CDC_REQ_SET_CONTROL_LINE_STATE` →
+  `usb_req_set_line()`（`:485-494`）**只是把 `wValue` 记进 `line_control_state` 并 ACK**，不做复位；
+  唯一消费者是 `check_reboot()`（`:452-459`）：**波特率 1200 且 DTR 为低**时才 `bootloader_request()`
+  （需 `CONFIG_HAVE_BOOTLOADER_REQUEST`）。
+- ⇒ **DTR\|RTS 在 250000 下的 250ms 脉冲对这类板子静默无效**（内核照常接受 `TIOCMSET`，桥也拿不到任何反馈）
+  ⇒ `RESET_PORT` 的线级复位**只对 USB-串口桥接板**（DTR\|RTS 接复位脚）有意义；
+  **原生 USB 的 legacy 设备目前没有经桥的硬复位手段**（要走命名设备 `restart_method: admin` 的
+  `RESET_DEVICE`，或断电/`rpi_usb`）。
+- 已落文档：`config.md` 的 `uart_restart_method` 行、`serial-mux-protocol.md` 的 `RESET_PORT` 行、
+  `TESTING.md` 的 **M2-1** 判定（该项在原生 USB 板上判「不适用」，其真机验证只对桥接板有意义）。
+- **留下的设计缺口**（记为欠项）：既没有「CDC 感知」的端口复位（例如把端口切到 1200 + DTR 低进 bootloader、
+  或明确报「此端口不支持线级复位」），也没有按 `by-id` 命名识别原生 USB 并给出告警。

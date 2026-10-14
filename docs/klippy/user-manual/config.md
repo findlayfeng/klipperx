@@ -285,7 +285,7 @@ CAN MCU、本仓把它泛化成所有接口共用一个序列；
 | `uart_mcu` | `uart_device` | 字符串 | 是 | 这条 uart 口长在哪颗 `[mcu]` 上（裸 `[mcu]` 写 `mcu`，命名节写名字）。必须指向配置里存在的 `[mcu]`，否则装载报错 |
 | `uart_oid` | `uart_device` | 字符串 | 是 | 该端口的名字（如 `uart0`）。固件不再上报端口表，`index` 由**声明顺序**给出；这个名字现在只用于人机对照与查端口节（MCU 后端落地后将成为固件 UART 实例名的挂点） |
 | `uart_baud` | `uart_device` | 整数 | 否 | 端口自身的线参数；**配置期由主机下发给固件**（`config_uart baud=…`），缺省 250000；非零校验，固件设置失败会 `shutdown` ⇒ 配置阶段显式报错 |
-| `uart_restart_method` | `arduino` / `cheetah` | 否 | — | 声明**该端口的板子怎么被线级复位**（写其它值报错）。声明了它，挂在该端口上的 **legacy 子设备**（无 `uuid:`）在 `FIRMWARE_RESTART` 时由桥对该口做 DTR\|RTS 脉冲（`RESET_PORT 0x04`）；不声明则子设备沿用 `command`。注意：桥的链路按 id 寻址（共享串口或“它是桥”），所以桥自己走 `serial:` + `restart_method: cheetah` 时**不会驱 RTS**（与非桥的独占串口不同，配置层会告警） |
+| `uart_restart_method` | `arduino` / `cheetah` | 否 | — | 声明**该端口的板子怎么被线级复位**（写其它值报错）。声明了它，挂在该端口上的 **legacy 子设备**（无 `uuid:`）在 `FIRMWARE_RESTART` 时由桥对该口做 DTR\|RTS 脉冲（`RESET_PORT 0x04`）；不声明则子设备沿用 `command`。注意：桥的链路按 id 寻址（共享串口或“它是桥”），所以桥自己走 `serial:` + `restart_method: cheetah` 时**不会驱 RTS**（与非桥的独占串口不同，配置层会告警）。⚠️ **只对 USB-串口桥接板有效**（CH340/CP2102/FTDI 这类，DTR\|RTS 接在复位脚上）：**原生 USB CDC 板**（klipper 自带 USB 栈，设备名形如 `usb-Klipper_<board>_<serial>-if00`）**不把 DTR/RTS 当复位**——固件只把控制线状态记进 `line_control_state`，唯一消费是「波特率 1200 且 DTR 为低」时进 bootloader（`src/generic/usb_cdc.c:452-459,485-494`），所以 250 ms 的 DTR\|RTS 脉冲在那类板子上是**静默无效**的（内核照常接受 ioctl）；这类 legacy 设备目前**没有**经桥的硬复位手段，要用命名设备 + `restart_method: admin`（设备自身复位）或断电 |
 | `can_mcu` | `can_device` | 字符串 | 是 | 同 `uart_mcu` |
 | `can_oid` | `can_device` | 字符串 | 是 | 同 `uart_oid`。注意：**CAN 端口目前无法接给桥**（`config_bridge_port` 只收 UART 对象），`can:` 子节会在此点名报错，属 P5 |
 

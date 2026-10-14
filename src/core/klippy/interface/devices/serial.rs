@@ -1176,7 +1176,9 @@ pub struct SharedSerialPort {
     /// holding an `Arc<SharedSerialPort>` (which would keep the port from ever
     /// being dropped — see the reader).
     port: Arc<File>,
-    /// One slot per attached MCU, keyed by the MCU id.
+    /// One slot per attached MCU, keyed by the MCU id. A slot is registered by
+    /// the attach that opens the id and unregistered by that handle's last
+    /// reference going away ([`SharedSerialHandle`]).
     slots: Mutex<HashMap<u32, Arc<McuSlot>>>,
     /// Serializes the handshakes on this port: two MCUs attaching together must
     /// not interleave their requests and answers.
@@ -1216,7 +1218,8 @@ impl McuSlot {
 /// The handle one MCU holds on a [`SharedSerialPort`], implementing [`Device`].
 ///
 /// `shutdown` stops only this handle: the port — and every other MCU on it —
-/// stays up until the last handle is gone.
+/// stays up until the last handle is gone. The slot this handle registered goes
+/// away with it, so the port stops feeding an id nobody reads.
 pub struct SharedSerialHandle {
     port: Arc<SharedSerialPort>,
     mcu_id: u32,
@@ -1438,6 +1441,20 @@ impl SharedSerialPort {
 }
 
 impl Drop for SharedSerialPort {
+    /// Stop the port, then take its reader down with it.
+    ///
+    /// Which thread this runs on is decided by whoever releases the last
+    /// `Arc<SharedSerialPort>` — and that can be the **reader itself**: the
+    /// reader holds a strong reference from its `weak.upgrade()` until it drops
+    /// the port again after `dispatch`, so the last handle dropped inside that
+    /// window leaves the reader's own `drop(port)` as the release that reaches
+    /// zero. Joining a thread from within that thread never returns
+    /// (`pthread_join` reports `EDEADLK`, and std turns that into a panic that
+    /// would take the reader down mid-teardown), so the join is skipped when
+    /// the handle is this thread's. The reader is not left alive by that: the
+    /// loop checks the port again after every read, and there it finds the
+    /// `Weak` dead — the same path that ends the reader when the last handle
+    /// goes for any other reason.
     fn drop(&mut self) {
         self.stop();
         // The reader may still be inside a `read` (bounded by `VTIME`); joining
@@ -1445,7 +1462,12 @@ impl Drop for SharedSerialPort {
         // need the mutex to finish — it sees `stopped` and returns.
         if let Ok(mut guard) = self.reader.lock() {
             if let Some(handle) = guard.take() {
-                let _ = handle.join();
+                // Self-join guard: on the reader thread there is no other
+                // thread to wait for — the drop itself is that thread leaving —
+                // and the detached handle still joins nothing.
+                if handle.thread().id() != std::thread::current().id() {
+                    let _ = handle.join();
+                }
             }
         }
     }
@@ -1467,7 +1489,10 @@ fn reader_loop(weak: Weak<SharedSerialPort>, file: Arc<File>) {
                 let Some(port) = weak.upgrade() else { return };
                 dispatch(&port, &mut pending, &mut needs_sync);
                 // Drop the strong reference before blocking in `read` again, or
-                // the last handle could never bring the port down.
+                // the last handle could never bring the port down. This drop
+                // can be the one that destroys the port — see `Drop for
+                // SharedSerialPort` for why running that on this thread is
+                // safe.
                 drop(port);
             }
             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
@@ -1762,6 +1787,31 @@ impl SharedSerialHandle {
             }
         }
         Err(InterfaceError::Timeout)
+    }
+}
+
+impl Drop for SharedSerialHandle {
+    /// Unregister this handle's slot, so the port stops feeding it.
+    ///
+    /// A live handle is the only reader of its slot's `incoming`; a slot left
+    /// in the map after its handle is gone only accumulates bytes nobody will
+    /// read (`push_frame` cannot tell an abandoned slot from a live one), for as
+    /// long as any **other** handle keeps the port up. This runs on whichever
+    /// thread drops the handle's last reference, under the map lock, so it
+    /// cannot race `attach`'s insert: the `ptr_eq` check only takes down the
+    /// slot **this** handle registered, never one a later attach on the same id
+    /// registered since. `attach`'s failure path already removed its own slot —
+    /// this then finds no entry to take down and leaves the port as it found it.
+    fn drop(&mut self) {
+        let Ok(mut slots) = self.port.slots.lock() else {
+            return; // a poisoned map is not repaired from a drop
+        };
+        if slots
+            .get(&self.mcu_id)
+            .is_some_and(|slot| Arc::ptr_eq(slot, &self.slot))
+        {
+            slots.remove(&self.mcu_id);
+        }
     }
 }
 
@@ -2327,6 +2377,271 @@ mod mux_tests {
         // A fresh attach on the same path builds a new port and a new reader.
         let handle = attach_with_reply(&pty, 4);
         assert!(handle.send(&Frame::new(9, vec![1])).is_ok());
+    }
+
+    /// Poll `slot` for `frame` until `window` expires.
+    ///
+    /// Frames are consumed as they arrive, so a caller asks for them in the
+    /// order they were sent. Polling — rather than a blocking `receive` — is
+    /// what lets a test that expects *nothing* end: a frame that never arrives
+    /// runs out the window instead of hanging.
+    fn wait_for_frame(slot: &McuSlot, frame: &Frame, window: Duration) -> bool {
+        let deadline = Instant::now() + window;
+        loop {
+            if let Ok(mut incoming) = slot.incoming.try_lock() {
+                if incoming.next_frame().as_ref() == Some(frame) {
+                    return true;
+                }
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// Whether the port for `path` is dropped before `window` expires: its
+    /// registry entry is dead, which says its `Drop` ran to the end.
+    fn port_is_gone(path: &Path, window: Duration) -> bool {
+        let deadline = Instant::now() + window;
+        loop {
+            if port_registry()
+                .lock()
+                .unwrap()
+                .get(path)
+                .and_then(Weak::upgrade)
+                .is_none()
+            {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// A handle's slot goes with the handle that registered it.
+    ///
+    /// `push_frame` cannot tell an abandoned slot from a live one, so a slot
+    /// left in the map after its handle is gone only piles up bytes nobody
+    /// will read — for as long as any **other** handle keeps the port up. The
+    /// dropped id's units must go nowhere from then on, the port's other ids
+    /// must be untouched, and a later attach on the same id must start on an
+    /// empty stream: the queued units went with the slot they were queued in,
+    /// they are not handed to the new handle.
+    #[test]
+    fn a_dropped_handle_unregisters_its_slot_and_the_next_attach_starts_empty() {
+        let pty = Pty::new();
+        let handle4 = attach_with_reply(&pty, 4);
+        let handle5 = attach_with_reply(&pty, 5);
+        // Holds the port up after every handle is gone, so the slot map is
+        // still there to be looked at.
+        let port = Arc::clone(&handle4.port);
+
+        // One write, one read: MCU 5's frames are the markers, and units are
+        // dispatched in order, so hearing the second one says the id-4 unit
+        // between them is queued in slot 4. MCU 4 never reads it — that is the
+        // backlog the slot must die with.
+        let stale = Frame::new(1, b"stale".to_vec());
+        let mut wire = device_unit(5, &Frame::encode(2, b"ahead"));
+        wire.extend_from_slice(&device_unit(4, &stale.raw_bytes()));
+        wire.extend_from_slice(&device_unit(5, &Frame::encode(3, b"later")));
+        master_write(&pty.master, &wire);
+        assert!(
+            wait_for_frame(
+                &handle5.slot,
+                &Frame::new(2, b"ahead".to_vec()),
+                Duration::from_secs(2)
+            ),
+            "the marker unit must be dispatched"
+        );
+        assert!(
+            wait_for_frame(
+                &handle5.slot,
+                &Frame::new(3, b"later".to_vec()),
+                Duration::from_secs(2)
+            ),
+            "the unit for the dropped id must have been dispatched in between"
+        );
+
+        // The slot leaves the map with the handle that registered it; another
+        // MCU's slot stays.
+        drop(handle4);
+        {
+            let slots = port.slots.lock().unwrap();
+            assert!(
+                slots.get(&4).is_none(),
+                "the slot must be unregistered with its last handle"
+            );
+            assert!(slots.contains_key(&5), "another MCU's slot is untouched");
+        }
+
+        // A later attach on the same id gets a fresh slot: the stale bytes are
+        // not delivered, and what follows them is.
+        let handle4 = attach_with_reply(&pty, 4);
+        assert!(
+            handle4.slot.incoming.lock().unwrap().next_frame().is_none(),
+            "a fresh slot must not inherit the abandoned slot's backlog"
+        );
+        let fresh = Frame::new(4, b"fresh".to_vec());
+        master_write(&pty.master, &device_unit(4, &Frame::encode(4, b"fresh")));
+        assert!(
+            wait_for_frame(&handle4.slot, &fresh, Duration::from_secs(2)),
+            "the fresh slot must receive the units that follow"
+        );
+    }
+
+    /// Drop `pty`'s last two handles while the reader is inside `dispatch`
+    /// holding the strong port reference it upgraded, and report the reader
+    /// thread's id (in the `{:?}` form a panic hook reports it, which is what
+    /// the caller has to match) together with whether that window was hit.
+    ///
+    /// The reader is pinned inside `dispatch` by holding the id-4 slot's
+    /// `incoming` — the lock `push_frame` wants for the id-4 unit the reader
+    /// has already read. The id-5 unit written in front of it is the proof the
+    /// reader got that far (`push_frame` for it needs no lock the test holds),
+    /// and from there the reader can neither finish the dispatch nor let go of
+    /// the port until the lock is released. Only then do the handles go, which
+    /// leaves the reader's own `drop(port)` as the release that reaches zero:
+    /// `SharedSerialPort::drop` runs on the reader thread — the case that must
+    /// not join the reader onto itself.
+    ///
+    /// `false` means the attempt missed the window (the reader looked the port
+    /// up after the handles were already gone, so it returned without pushing
+    /// anything): the caller then tries again on a fresh pty. The pinned frame
+    /// landing in the slot is what proves the port was live for the reader —
+    /// the observable a correctly torn-down port still produces.
+    fn drop_last_two_handles_mid_dispatch(pty: &Pty) -> (String, bool) {
+        let handle4 = attach_with_reply(pty, 4);
+        let handle5 = attach_with_reply(pty, 5);
+        let reader = format!(
+            "{:?}",
+            handle4
+                .port
+                .reader
+                .lock()
+                .unwrap()
+                .as_ref()
+                .expect("an open port has started its reader")
+                .thread()
+                .id()
+        );
+        let slot4 = Arc::clone(&handle4.slot);
+        let incoming = slot4.incoming.lock().unwrap();
+
+        let held = Frame::new(1, b"held".to_vec());
+        let mut wire = device_unit(5, &Frame::encode(2, b"ahead"));
+        wire.extend_from_slice(&device_unit(4, &Frame::encode(1, b"held")));
+        master_write(&pty.master, &wire);
+        assert!(
+            wait_for_frame(
+                &handle5.slot,
+                &Frame::new(2, b"ahead".to_vec()),
+                Duration::from_secs(2)
+            ),
+            "the reader dispatches the id-5 unit before it reaches the pinned id-4 one"
+        );
+
+        // The last handles go while the reader still holds its reference.
+        drop(handle5);
+        drop(handle4);
+        drop(incoming);
+
+        // The pinned frame arriving is the proof the reader had the port; and
+        // with the reader as the dropping thread, the port is gone. A miss
+        // costs the frame window and nothing else — the port is then gone
+        // already, and only the frame distinguishes the two.
+        let hit = wait_for_frame(&slot4, &held, Duration::from_millis(500))
+            && port_is_gone(&pty.path, Duration::from_secs(1));
+        (reader, hit)
+    }
+
+    /// Record the panics raised while `body` runs, as `(thread id, message)`.
+    ///
+    /// The reader thread is nobody's `JoinHandle` once the port's `Drop` has
+    /// taken it, so a panic on it fails nothing and is invisible in the test
+    /// result — a hook is the only way to assert on one. Every panic still goes
+    /// to the hook that was in place, so panics from other tests (`#[should_panic]`
+    /// ones run in the same process) behave exactly as they did.
+    fn record_panics_during<T>(body: impl FnOnce() -> T) -> (T, Vec<(String, String)>) {
+        /// Every panic seen while the hook below is installed.
+        static PANICS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+
+        let previous = Arc::new(std::panic::take_hook());
+        let forward = Arc::clone(&previous);
+        std::panic::set_hook(Box::new(move |info| {
+            PANICS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push((
+                    format!("{:?}", std::thread::current().id()),
+                    format!("{info}"),
+                ));
+            forward(info);
+        }));
+        let value = body();
+        std::panic::set_hook(Box::new(move |info| previous(info)));
+        let seen = std::mem::take(&mut *PANICS.lock().unwrap());
+        (value, seen)
+    }
+
+    /// The reader can be the thread that drops the port.
+    ///
+    /// The reader holds a strong reference from its `weak.upgrade()` until it
+    /// drops the port again after `dispatch`, so the last handle dropped inside
+    /// that window leaves the reader's own `drop(port)` as the release that
+    /// reaches zero — and `SharedSerialPort::drop` then runs **on the reader
+    /// thread**. Joining a thread from within it never returns (`pthread_join`
+    /// reports `EDEADLK`, which std turns into a panic), which would tear the
+    /// port down halfway and kill the reader in the middle of that teardown, so
+    /// the drop has to recognise its own reader, skip the join, and still take
+    /// the port down.
+    ///
+    /// The window is constructed rather than raced for — the attempt pins the
+    /// reader inside `dispatch`, and a fixed port is what delivers the pinned
+    /// frame and then dies — so a miss is a retry, not a verdict. A panic on
+    /// the reader thread is what libtest cannot see; the hook is what turns it
+    /// into the failure below.
+    #[test]
+    fn dropping_the_last_handle_mid_dispatch_does_not_join_the_reader_onto_itself() {
+        let (outcome, panics) = record_panics_during(|| {
+            let mut readers = Vec::new();
+            let mut hit = false;
+            for _ in 0..20 {
+                let pty = Pty::new();
+                let (reader, landed) = drop_last_two_handles_mid_dispatch(&pty);
+                readers.push(reader);
+                if !landed {
+                    continue; // the window was missed; a fresh pty tries again
+                }
+                // The port went down on the reader thread; the same path then
+                // opens a fresh port and routes frames again.
+                let handle = attach_with_reply(&pty, 4);
+                let frame = Frame::new(4, b"next".to_vec());
+                master_write(&pty.master, &device_unit(4, &Frame::encode(4, b"next")));
+                assert!(
+                    wait_for_frame(&handle.slot, &frame, Duration::from_secs(2)),
+                    "a fresh port on the same path must route frames again"
+                );
+                hit = true;
+                break;
+            }
+            (readers, hit)
+        });
+
+        let (readers, hit) = outcome;
+        assert!(
+            hit,
+            "the reader must be droppable mid-dispatch; the window is constructed, not raced for"
+        );
+        assert!(
+            panics
+                .iter()
+                .all(|(thread, _)| !readers.iter().any(|reader| reader == thread)),
+            "a reader thread ended in a panic — the port was dropped by the reader and joined \
+             itself: {panics:?}"
+        );
     }
 
     #[test]

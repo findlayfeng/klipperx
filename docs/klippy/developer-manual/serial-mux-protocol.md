@@ -193,7 +193,7 @@ admin 信道，`mux_unit()` 决定归属）。**注意两条不同的寻址**：
 |------|------|------|
 | `SET_PORT_NODEID` | `[0x03][index][id][flags]`（4 字节） | 桥建 `id → 端口` 表并记该口 `flags`。`index` 0 起（= 该端口节的**声明顺序**，配置期由 `config_bridge_port` 登记）；`id` = MCU 层 id（`1..=255`，`mux_arb_id(id)!=0`）；`flags` bit0=`MUX_PORT_UNITS`（`0x01`）：置位 = 该口设备**说单元**（收发整单元原样转发）；清零 = **legacy**（下行剥头、上行按该口记的 id 加应答头）；保留位忽略。**幂等**：重复发送 = 覆盖同值；**旧映射不撤销**——同一口改登记为别的 id 后，旧 id 仍路由到该口（`bridge_map_id` 只增不删），想把下游设备改绑到别的口需另行定义 |
 | `RESET_DEVICE` | `[0x02][index]` | 桥**只**转发到 `index` 口（UNITS 口带头转发、legacy 口剥头转发——legacy 设备的解析器会拒 seq `0x20`，属预期：无 admin 的 legacy 口只能走 `RESET_PORT`），不扇出全体、不触发本机设备半；无桥的板（纯 mux 构建）由设备半自己执行（照 `canserial.c` 的 `can_process_request_bootloader` 模式，`CONFIG_HAVE_BOOTLOADER_REQUEST` 守卫，index 字节设备忽略） |
-| `RESET_PORT` | `[0x04][index]` | 桥消费后对 `index` 口做**线级复位**：经 `bridge_port_ops.reset` 钩子（NULL=不支持 → 静默）；host 侧实现为 DTR\|RTS 断言 250 ms 的脉冲，用任务循环 idle 处的 poll 状态机延迟恢复（不阻塞不忙等；pty 等无 modem 线的 fd 返回 -1 静默）；**保持窗内重复发送按已完成处理**（不把此刻已断言的线态当成「原状态」重存，否则释放时恢复断言态、设备被永久按住） |
+| `RESET_PORT` | `[0x04][index]` | 桥消费后对 `index` 口做**线级复位**：经 `bridge_port_ops.reset` 钩子（NULL=不支持 → 静默）；host 侧实现为 DTR\|RTS 断言 250 ms 的脉冲（**只对 USB-串口桥接板有效**：原生 USB CDC 板记下控制线状态但不当复位，见 `config.md` 的 `uart_restart_method`），用任务循环 idle 处的 poll 状态机延迟恢复（不阻塞不忙等；pty 等无 modem 线的 fd 返回 -1 静默）；**保持窗内重复发送按已完成处理**（不把此刻已断言的线态当成「原状态」重存，否则释放时恢复断言态、设备被永久按住） |
 
 **端口不再上报字典表**（M1-P7 起）：`BRIDGE_PORT_COUNT`/`BRIDGE_PORT<n>_NAME`/`_TYPE`/`_PATH`
 四键已**删除**。端口由**主机在配置期声明**——`config_uart oid=%c baud=%u` 建一个 UART 对象，
@@ -212,8 +212,8 @@ admin id `0x3f0`；第二级是「桥 ↔ 下游某口的设备」——用 `SET
 - **端口只开一次**：按 `serial:` 路径复用（`Weak` 注册表），第二颗 MCU 只是 attach 到同一个
   `SharedSerialPort`。
 - **写锁**：`send` 与握手请求共用一把写锁，保证「头 + 帧」整段不被交错。
-- **引用计数关闭**：`shutdown` 只停**本句柄**（其它 MCU 还在用）；最后一个持有者析构时才
-  置停、唤醒所有槽位、关 fd、join reader 线程。
+- **引用计数关闭**：`shutdown` 只停**本句柄**（其它 MCU 还在用）；**句柄析构会注销自己的槽**（同 id 重 attach 不会看到陈旧积压）；最后一个持有者析构时才
+  置停、唤醒所有槽位、关 fd、join reader 线程（若这次析构正跑在 reader 线程上，则跳过自 join、由 reader 下一轮 `weak.upgrade()` 拿到 `None` 后自然退出）。
 - **baud**：同一路径多颗 MCU 的显式 `baud` 若不一致，装载期 `warn` 并**取最小值**（未写
   `baud` 的节跟着走）；不一致不再是配置错。
 - **复位语义**：`restart_method` 的线级复位（`arduino` 的 DTR 翻转、`cheetah`、`rpi_usb`

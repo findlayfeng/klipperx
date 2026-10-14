@@ -465,4 +465,28 @@ d. **M2 的复位命令**：名字与参数（要不要带"复位到哪一层"�
 1. `uart_oid` 目前**没有消费者**（index 由声明序给出，oid 名只用于查端口节）——**保留**，作为 MCU 后端落地时「固件 UART 实例名」的挂点；手册要写明「当前只作文档/查节用」。
 2. host 后端**一条流一个 UART 对象**：`host_library` 桥最多一个端口（板级后端可有多个）；「两个端口节 ⇒ index 0/1」的验收在**串口桥**路径上做。
 3. baud「真的生效」只验到下限（配置期无错 + 端口可用；pty 的 `c_ospeed` 回读不可靠），不可设的波特率会由 `TCSETS2` 失败转成 `UART_OPEN_BAD_BAUD` 的显式 `shutdown`。
-4. **MCU 侧的 mux 接线**（`generic/serial_irq.c` 接 `mux_input`/`mux_send`）是 FW-2 的正身，完成前「MUX_SERIAL 通用」只在 host 成立；真板跑 mux 属真机项。
+4. ~~MCU 侧的 mux 接线是 FW-2 的正身~~ → **FW-2/FW-3 已落地**（见下）。
+
+### FW-2/FW-3 落地（子模组 `4279e45b`、`5266e875`；README `9c144cd9`）
+
+- **FW-2（`4279e45b`）串口 mux 接进 MCU 控制台**：接缝在**架构无关层**——收：`console_task()`
+  → `mux_input(receive_buf, &count)`（`src/generic/serial_irq.c:100`，在 `irq_save()` 内读，因 RX ISR
+  正往同一缓冲 append）；发：`console_sendf()` 经 `mux_out_header()` 带头、新增 `mux_send()`
+  排整单元，两者共用抽出的 `transmit_room()`。**行为与 host 逐字同构**（裸帧原样透传、已指派带头、
+  未指派不带头）；admin 通道（扫描应答/采纳 id/冲突 shutdown）都在 elf 里可达（`nm` 证据）。
+- **FW-2 顺手修掉的真问题**：`MUX_SERIAL` 原来是**无 prompt 符号**，MCU 上写
+  `CONFIG_MUX_SERIAL=y` 会被**静默丢弃**（实测）⇒「通用能力」在 MCU 上根本打不开。现在是正经
+  `bool` + `depends on SERIAL` + `select MUX`（无 `SERIAL` 的 linux/ar100/pru 会被拒）；**仍不默认开**，
+  理由写进 help：单元格式不是上游 klippy 主机说的格式，必须是刻意选择。
+- **FW-3（`5266e875`）MCU 侧身份**：新增 `src/generic/chipid_uuid.h`（`fasthash64` 芯片 id → 6 字节，
+  **与 CAN 的 uuid 同一实现同一 seed**，`canserial.c` 改为调它）；5 个有 `chipid.c` 的 arch 在
+  `chipid_init` 里按 `CONFIG_MUX_SERIAL` 调 `mux_set_uuid()`（四个文件原有 early-return 补
+  `&& !CONFIG_MUX_SERIAL`，否则 mux-only 构建读不到芯片 id）；`mux.c`/`mux.h` 的**协议语义与
+  `mux_set_uuid([u8;6])` 未动**（host 仍用它）。`nm` 证据：`chipid.o` 有 `U mux_set_uuid`/`U fasthash64`、
+  `mux.o` 有 `T mux_set_uuid`，**非 CAN 固件里不出现 canserial**，host `.so` 里不出现 `fasthash`。
+- **构建矩阵（本次实测）**：`stm32f103-serial`（原样 / `+MUX_SERIAL=y`）、`rp2040`(+mux)、
+  `atsamd`/`atsam`/`lpc176x`(+mux)、`stm32f103` CAN、`host`、`host-mux` 全部 rc=0；stm32/rp2040
+  与 host **0 告警**（samd51/atsam/lpc176x 的告警是 baseline 就有的 `armcm_reset.c` array-bounds 与
+  atsam 的 `.ramfunc` RWX，均已对比基线复现）。
+- **只能真机验**（已挂 `TESTING.md`）：真板 **扫描 → 指派 → 采纳 → id 冲突 shutdown** 的串口 mux
+  端到端；`irq_save()` 段内的 UART 时序。

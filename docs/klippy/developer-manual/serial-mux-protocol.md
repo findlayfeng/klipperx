@@ -247,9 +247,12 @@ CAN 不需要这套东西：总线自带仲裁 id 与硬件过滤，每颗 MCU �
 
 ## 尚未落地
 
-- **微控制器架构还没启用 mux（刻意留后续）**：`MUX_SERIAL`/`BRIDGE_PORT_SERIAL` 目前只由 host
-  的两个开关选上。微控制器要照它们给控制台选 UART 的做法加一份 `choice` 备选串口（并排除控制台
-  已占用的那一路）再 select 它们；在那之前，共享**串口**仍然握手超时。
+- **微控制器架构的串口 mux 已接线**（M1-P7 的 FW-2/FW-3）：`MUX_SERIAL` 现在是公共的、**有 prompt**
+  能力（`depends on SERIAL`），选上后 MCU 控制台在架构无关层 `src/generic/serial_irq.c` 接
+  `mux_input`/`mux_send`（与 host 逐字同构），身份由各 arch 的 `chipid_init` 按
+  `src/generic/chipid_uuid.h`（与 CAN 同一派生）设进 `mux_set_uuid()`。**默认不开**：单元格式不是
+  上游 klippy 主机说的格式，必须刻意选择（host 库由 `HOST_MUX_SERIAL` 选上）。真板扫描/指派/冲突
+  与 `irq_save()` 段内时序仍属真机项。
 - **host 模式的数据面**：unit 接口已定义、固件也已按单元发出自己的帧，但**主机侧（klippyx）还没
   改用它**——`HostDevice` 仍走字节流/整帧。**分配段（扫描、`SET_NODEID`、重确认握手）走字节流
   这条已经通了**：mux 路径的真端到端 attach 就是走它。

@@ -31,6 +31,7 @@ use std::time::Duration;
 use serde_json::{json, Map, Value};
 use tracing::{debug, info, warn};
 
+use super::bridge_attach;
 use super::host_libraries;
 use super::ids;
 use super::port_grouping::{self, PortKind};
@@ -46,7 +47,7 @@ use crate::core::klippy::config::{AccessTracking, ConfigSection, ConfigWrapper};
 use crate::core::klippy::error::{ConfigError, KlippyError};
 use crate::core::klippy::event::stats::{register_stats, LastStats};
 use crate::core::klippy::event::{IsShutdown, KlippyEvent, McuEvent, Shutdown, Starting};
-use crate::core::klippy::interface::HostMux;
+use crate::core::klippy::interface::{HostMux, Interface};
 use crate::core::klippy::mcu::{
     BuiltConfig, ConfigBuilder, Configured, Dictionary, I2cMode, Mcu, McuChip, McuError, McuI2c,
     McuRestartMethod, McuSpi, McuStepper, SpiMode,
@@ -123,6 +124,16 @@ pub struct McuObject {
     /// The section as parsed, kept whole so the device is only opened at
     /// connect time.
     section: ConfigSection,
+    /// The transport description the loader parsed `section` into.
+    ///
+    /// `connect` cannot re-parse a `uart:`/`can:` section on its own: the parse
+    /// checks that the port section it names exists, which needs the whole
+    /// config, and a part holding only its section cannot see one
+    /// (`ConfigWrapper::has_sibling` answers false without it). The loader
+    /// parses where the config is in hand, and stores the answer here so
+    /// `connect` reads it instead of re-parsing. `None` only for an object built
+    /// outside the loader, which re-parses as before.
+    parsed: Mutex<Option<McuConfig>>,
     /// This MCU as a pin chip: its name, its configuration builder, and the
     /// slot resources use to reach the device once it connects (`mcu/resource/pin.rs`).
     ///
@@ -231,6 +242,7 @@ impl McuObject {
         pins.register_chip(chip.name(), Arc::new(chip.clone()))?;
         Ok(Self {
             section,
+            parsed: Mutex::new(None),
             chip,
             status: Mutex::new(json!({})),
             id: Mutex::new(None),
@@ -370,6 +382,54 @@ impl McuObject {
     /// primary) needs the handle here.
     pub fn mcu(&self) -> Option<Arc<Mcu>> {
         self.chip.mcu()
+    }
+
+    /// This MCU's section, parsed back into the transport description its
+    /// connection opened.
+    ///
+    /// The bridge-attach pass (`mcu/bridge_attach.rs`) reads the **bridge's**
+    /// transport to open a downstream device on the same link. The loader made
+    /// this parse where the whole config was in hand; an object built outside
+    /// the loader falls back to parsing its stored section alone, which serves
+    /// every transport whose parse does not need a sibling.
+    ///
+    /// # Errors
+    /// The section's own parse error, the way `connect` reports one.
+    pub(crate) fn mcu_config(&self) -> Result<McuConfig, KlippyError> {
+        if let Some(config) = self.parsed_config() {
+            return Ok(config);
+        }
+        // Parsed on the printer's tracker, exactly as the loader parses it: a
+        // read that happens now is still recorded for the undefined-option
+        // check.
+        let access = self
+            .printer
+            .upgrade()
+            .map(|printer| printer.access_tracking())
+            .unwrap_or_else(AccessTracking::shared);
+        let wrapper = ConfigWrapper::new(&self.section, access);
+        let mut config = McuConfig::new(&wrapper).map_err(KlippyError::Config)?;
+        config.id = self.id();
+        config.shared_baud = self.shared_baud();
+        config.host_mux = self.host_mux();
+        Ok(config)
+    }
+
+    /// The transport description the loader stored, if it parsed this section.
+    pub(crate) fn parsed_config(&self) -> Option<McuConfig> {
+        self.parsed
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
+    }
+
+    /// Record the transport the loader parsed this section into
+    /// ([`McuObject::mcu_config`]).
+    pub(crate) fn set_parsed_config(&self, config: McuConfig) {
+        *self
+            .parsed
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(config);
     }
 
     /// Build an I2C device on this MCU.
@@ -617,6 +677,35 @@ impl McuObject {
         Ok(())
     }
 
+    /// Open this MCU's transport, attaching through a bridge when the transport
+    /// is a downstream port.
+    ///
+    /// A `uart:`/`can:` transport's device sits behind a bridge port: it is
+    /// reached on the bridge's own link and named by a port-level
+    /// `SET_PORT_NODEID`, never by [`Transport::open`] (`mcu/bridge_attach.rs`).
+    /// Every other transport opens exactly as before. `config` must already
+    /// carry the id `connect` covered onto it — a bridge port is addressed by id
+    /// like every other MCU.
+    fn open_interface(&self, config: &McuConfig) -> Result<Interface, KlippyError> {
+        if matches!(config.transport, Transport::BridgePort { .. }) {
+            let printer = self.printer.upgrade().ok_or_else(|| {
+                KlippyError::Internal(format!(
+                    "MCU '{}': the printer is gone; cannot resolve its bridge port",
+                    config.name
+                ))
+            })?;
+            let id = config.id.ok_or_else(|| {
+                KlippyError::Connection(format!(
+                    "MCU '{}' has no id assigned; cannot open its transport",
+                    config.name
+                ))
+            })?;
+            let link = bridge_attach::resolve(&printer, config)?;
+            return bridge_attach::open(&printer, &link, id);
+        }
+        config.open().map_err(KlippyError::Connection)
+    }
+
     /// Open the port and identify the firmware, retrying while a rebooted board
     /// comes back.
     ///
@@ -629,10 +718,10 @@ impl McuObject {
         let mut last = String::new();
         for _ in 0..RECONNECT_ATTEMPTS {
             tokio::time::sleep(RECONNECT_DELAY).await;
-            let interface = match config.open() {
+            let interface = match self.open_interface(config) {
                 Ok(interface) => interface,
                 Err(err) => {
-                    last = err;
+                    last = err.to_string();
                     continue;
                 }
             };
@@ -1173,15 +1262,24 @@ impl PrinterObject for McuObject {
             // The device is opened here, not at construction: that is the point
             // of two-phase construction. The section was already parsed once
             // (by the loader, which recorded its options for the undefined-option
-            // check); parsing it again here is done on the printer's tracker so
-            // a read that happens now is still recorded.
-            let access = self
-                .printer
-                .upgrade()
-                .map(|printer| printer.access_tracking())
-                .unwrap_or_else(AccessTracking::shared);
-            let wrapper = ConfigWrapper::new(&self.section, access);
-            let mut config = McuConfig::new(&wrapper).map_err(KlippyError::Config)?;
+            // check); that parse is reused when it is there, because a `uart:`/
+            // `can:` section cannot be re-parsed without the whole config (its
+            // port-section check needs a sibling, `McuObject::parsed`). An object
+            // built outside the loader falls back to parsing its section on the
+            // printer's tracker, which serves every transport whose parse does
+            // not need a sibling.
+            let mut config = match self.parsed_config() {
+                Some(config) => config,
+                None => {
+                    let access = self
+                        .printer
+                        .upgrade()
+                        .map(|printer| printer.access_tracking())
+                        .unwrap_or_else(AccessTracking::shared);
+                    let wrapper = ConfigWrapper::new(&self.section, access);
+                    McuConfig::new(&wrapper).map_err(KlippyError::Config)?
+                }
+            };
             // An MCU must hold the id it was assigned at load before its
             // transport can be opened — a CAN MCU cannot be addressed without
             // its node id, and every transport's id is what this layer guards
@@ -1256,6 +1354,25 @@ impl PrinterObject for McuObject {
                     }
                     return Err(KlippyError::Internal(err));
                 }
+                // A device behind a bridge port has no transport of its own, so
+                // its reset travels the bridge's link — the port-level command
+                // the config chose (`config.bridge_restart`). It goes here,
+                // before the attach pass opens the device: the board is about to
+                // reboot, so the route that pass establishes would be stale, and
+                // `reset_firmware` above is a no-op for it. Resolving the port
+                // against the bridge's firmware port table is where an old
+                // firmware (no port table) or a mismatched oid is refused — a
+                // config error, with the downgrade being `restart_method:
+                // command`.
+                if let Some(restart) = config.bridge_restart {
+                    let printer = self.printer.upgrade().ok_or_else(|| {
+                        KlippyError::Internal(format!(
+                            "MCU '{}': the printer is gone; cannot reset its bridge port",
+                            config.name
+                        ))
+                    })?;
+                    super::restart::reset_bridge_firmware(&printer, &config, restart)?;
+                }
             }
             // A bring-up that follows a firmware restart finds the board
             // rebooting — `command` sent the reset on the live connection
@@ -1274,7 +1391,7 @@ impl PrinterObject for McuObject {
                     }
                 }
             } else {
-                let interface = config.open().map_err(KlippyError::Connection)?;
+                let interface = self.open_interface(&config)?;
                 match Mcu::connect(&config.name, interface).await {
                     Ok(mcu) => mcu,
                     Err(err) => {
@@ -1554,8 +1671,11 @@ pub fn load_config(
     // Parse the section now so its options are recorded for the undefined-option
     // check: the check runs at the end of the load walk, before anything
     // connects, and an MCU reads its section at connect time. The parse is pure;
-    // the device is still only opened by `connect`.
-    let parsed = McuConfig::new(config)?;
+    // the device is still only opened by `connect`. The result is kept on the
+    // object because `connect` cannot re-parse a `uart:`/`can:` section — its
+    // port-section check needs the whole config, which a stored section alone
+    // does not have (`McuObject::parsed`, `McuObject::mcu_config`).
+    let mut parsed = McuConfig::new(config)?;
     // Every `[mcu]` registers with the shared id allocator here, while the
     // config is loaded, so the whole sequence is known before any of them
     // connects (upstream registers a CAN MCU's uuid in `MCU.__init__`,
@@ -1600,11 +1720,14 @@ pub fn load_config(
     // config, resolved once for every `[mcu]` by the grouping pass. A path two
     // or more sections name is shared, and the baud they agree on is stamped on
     // the object so `connect` can hand it to the transport without
-    // reclassifying. A path this MCU alone names stays exclusive (`None`), and
-    // its transport opens exactly as before — no assignment frame is sent.
+    // reclassifying. A bridge's path is addressed by id too, even though one
+    // section names it, because its downstream devices' frames travel it
+    // (`SerialPorts::is_id_addressed`). A path neither shape covers stays
+    // exclusive (`None`), and its transport opens exactly as before — no
+    // assignment frame is sent.
     let ports = serial_ports::ensure(printer, config)?;
     let shared_baud = match &parsed.transport {
-        Transport::Serial { path, .. } if ports.is_shared(path) => ports.effective_baud(path),
+        Transport::Serial { path, .. } if ports.is_id_addressed(path) => ports.effective_baud(path),
         _ => None,
     };
     object.set_shared_baud(shared_baud);
@@ -1639,12 +1762,18 @@ pub fn load_config(
     // (`mcu/port_grouping.rs`). Only a `uart:`/`can:` section asks for the
     // grouping, as the parse only calls `port_grouping::validate` for one (the
     // precedent `host_libraries::ensure` above sets: a config with no port
-    // reference has no port to group). Nothing consumes the grouping at
-    // connect yet — the attach through the bridge's port table is M1-P3's —
-    // the registry object is what that pass will find.
+    // reference has no port to group). The attach pass reads this grouping at
+    // connect to derive the port's `flags` (`mcu/bridge_attach.rs`), which is
+    // why it is registered here rather than built on demand there.
     if matches!(parsed.transport, Transport::BridgePort { .. }) {
         port_grouping::ensure(printer, config)?;
     }
+    // Keep the parse for `connect`: the load-time stamps are part of what the
+    // connection will use, so they are covered back onto it here too.
+    parsed.id = Some(id);
+    parsed.shared_baud = shared_baud;
+    parsed.host_mux = host_mux;
+    object.set_parsed_config(parsed);
     // A host shutdown stops the firmware too (upstream registers the same
     // handler in `MCU.__init__`, `klippy/mcu.py:800`). Registered here
     // rather than in `connect` because the handler is `'static` and needs a

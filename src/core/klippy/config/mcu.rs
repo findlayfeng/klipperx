@@ -10,22 +10,54 @@ use crate::core::klippy::mcu::{host_libraries, serial_ports, McuRestartMethod};
 use std::path::Path;
 use tracing::warn;
 
+/// Which port-level reset a device behind a bridge port is given.
+///
+/// Resolved at config time into [`McuConfig::bridge_restart`]. A bridge-port
+/// device has no transport of its own — it is spoken to on the bridge's link —
+/// so its reset is a port-level command the bridge receives over its admin
+/// channel (`mcu/restart.rs`, `interface/devices::serial::send_reset_*`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BridgeRestart {
+    /// The device resets itself: the host sends `RESET_DEVICE` and the bridge
+    /// forwards it to the port. Only a **named** device (a `uuid:` on the child,
+    /// `restart_method: admin`) has the admin channel this needs.
+    Device,
+    /// The bridge pulses the port's lines (`RESET_PORT`): the only reset a
+    /// **legacy** (uuid-less) device can get, from the **port section's**
+    /// `uart_restart_method` (`mcu/bridge_ports.rs`).
+    Port,
+}
+
 /// MCU (Microcontroller Unit) configuration parsed from config file.
 ///
 /// Parsing does not touch a device: [`McuConfig::open`] is what opens the
 /// transport. The split lets a firmware restart reset the board on its **closed**
 /// port, between the two (`mcu/object.rs`, `mcu/restart.rs`).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct McuConfig {
     /// MCU name (from ConfigSection's sub field)
     pub name: String,
     /// MCU restart method.
     ///
     /// Resolved to the effective method: `command` for a non-serial MCU, the
-    /// config's own value (default `arduino`) for a serial one. The physical
-    /// restart is still pending for `cheetah`/`rpi_usb` — only `command` and
-    /// `arduino` have a path today ([`McuRestartMethod`]).
+    /// config's own value (default `arduino`) for a serial one, and `admin` for
+    /// a named bridge-port device ([`McuRestartMethod`]). The reset itself is
+    /// `mcu/restart.rs`'s, dispatched on this.
     pub restart_method: McuRestartMethod,
+    /// Which port-level reset this device gets, when it hangs behind a bridge
+    /// port.
+    ///
+    /// `None` for every transport that is not a bridge port; for a legacy
+    /// (uuid-less) device whose port declares no `uart_restart_method`; and for
+    /// a **named** (uuid-bearing) device that writes no `restart_method`, or one
+    /// other than `admin` — a named device resets itself only under `admin`, and
+    /// has no port-level reset to fall back to. The two bridge-port shapes learn
+    /// it differently: a **named** device writes `restart_method: admin` itself
+    /// ([`BridgeRestart::Device`]), while a **legacy** one has no admin channel
+    /// of its own and takes the **port section's** `uart_restart_method`
+    /// ([`BridgeRestart::Port`]). The command travels the bridge's link, not a
+    /// transport of this device's own.
+    pub bridge_restart: Option<BridgeRestart>,
     /// What to open, described but not opened.
     pub transport: Transport,
     /// The id this MCU was assigned, unique across every `[mcu]` whatever its
@@ -119,9 +151,10 @@ pub enum Transport {
     /// member without one, `mcu/port_grouping.rs`), optional on a uart one,
     /// where its absence is rule 5's legacy shape. Whether the port is shared
     /// is likewise the whole config's call, like a shared `serial:` path.
-    /// Opening one is not wired up yet: the attach goes through the bridge's
-    /// port table and port-level command (M1-P3), and [`Transport::open`]
-    /// says so rather than pretending the device came up.
+    /// Opening one is not [`Transport::open`]'s path: `McuObject::connect`
+    /// routes it to the attach pass (`mcu/bridge_attach.rs`), which reconciles
+    /// the bridge's port table and opens the downstream handle on the bridge's
+    /// own link.
     BridgePort {
         port: String,
         uuid: Option<[u8; 6]>,
@@ -300,20 +333,27 @@ impl McuConfig {
             _ => false,
         };
 
-        // The option only means something on a serial port. Say so rather than
-        // dropping it silently, then report what the MCU will actually use.
-        if !serial && section.has("restart_method") {
+        // The option only means something on a serial port or on a bridge-port
+        // device, where `admin` is the one value that applies. Say so rather
+        // than dropping it silently, then report what the MCU will actually
+        // use.
+        if !serial
+            && !matches!(transport, Transport::BridgePort { .. })
+            && section.has("restart_method")
+        {
             warn!(
                 "MCU '{name}' sets restart_method, which only applies to a serial MCU; \
                  resetting with command"
             );
         }
-        let restart_method = Self::parse_restart_method(section, serial, shared)?;
+        let (restart_method, bridge_restart) =
+            Self::parse_restart_method(section, &transport, shared)?;
         let usb_power = Self::parse_usb_power(section, &restart_method)?;
 
         Ok(Self {
             name,
             restart_method,
+            bridge_restart,
             transport,
             id,
             shared_baud: None,
@@ -372,7 +412,8 @@ impl McuConfig {
             .open(self.id, rts, self.shared_baud, self.host_mux)
     }
 
-    /// Resolve `restart_method` for an MCU whose transport is (or is not) serial.
+    /// Resolve `restart_method`, and which port-level reset (if any) a
+    /// bridge-port device takes.
     ///
     /// Upstream reads the option **only** when the MCU is on a serial port
     /// (`klippy/mcu.py:668-671`); every other transport resets with `command`.
@@ -386,13 +427,20 @@ impl McuConfig {
     /// serial default is `arduino`) is a silent downgrade, and an unknown
     /// spelling is still a config error.
     ///
-    /// The `serial` and `shared` flags are parameters rather than looks at the
-    /// interface so the rules can be exercised without a real serial port.
+    /// A device behind a bridge port is the third case, resolved by
+    /// [`McuConfig::parse_bridge_restart`].
+    ///
+    /// # Returns
+    /// The MCU's own method, and the port-level reset a bridge-port device uses
+    /// — `None` unless this section is one ([`BridgeRestart`]).
+    ///
+    /// `transport` is a parameter rather than a look at an opened interface so
+    /// the rules can be exercised without a real port.
     fn parse_restart_method(
         section: &ConfigWrapper,
-        serial: bool,
+        transport: &Transport,
         shared: bool,
-    ) -> Result<McuRestartMethod, ConfigError> {
+    ) -> Result<(McuRestartMethod, Option<BridgeRestart>), ConfigError> {
         // Read the option even when the transport is not serial: the read is
         // what marks it valid to the undefined-option check, so a
         // `restart_method` on a non-serial MCU is warned about (in `new`)
@@ -400,23 +448,31 @@ impl McuConfig {
         // a serial port; a config whose transport was substituted (the
         // regression harness's `test:` fake) still names it.
         let text = section.get_str("restart_method");
-        if !serial {
-            return Ok(McuRestartMethod::Command);
+
+        if let Transport::BridgePort { port, uuid, kind } = transport {
+            return Self::parse_bridge_restart(section, port, *kind, uuid.is_some(), text);
+        }
+
+        if !matches!(transport, Transport::Serial { .. }) {
+            if text
+                .as_deref()
+                .is_some_and(|text| McuRestartMethod::parse(text) == Some(McuRestartMethod::Admin))
+            {
+                return Err(Self::admin_needs_a_named_bridge_port(section));
+            }
+            return Ok((McuRestartMethod::Command, None));
         }
         // The value the option asks for, resolved the way an exclusive port
         // uses it: unset is `arduino`, an unknown spelling is a config error.
         let written = match &text {
             None => McuRestartMethod::Arduino,
-            Some(text) => McuRestartMethod::parse(text).ok_or_else(|| {
-                ConfigError::new(format!(
-                    "MCU '{}' has an invalid restart_method: '{text}' (expected one of {})",
-                    section.identifier(),
-                    McuRestartMethod::CHOICES.join(", ")
-                ))
-            })?,
+            Some(text) => Self::parse_method(section, text)?,
         };
+        if written == McuRestartMethod::Admin {
+            return Err(Self::admin_needs_a_named_bridge_port(section));
+        }
         if !shared {
-            return Ok(written);
+            return Ok((written, None));
         }
         // A value that was written and asks for a line-wide reset cannot be
         // honoured: say which one it was, then reset with `command` instead.
@@ -429,7 +485,116 @@ impl McuConfig {
                 );
             }
         }
-        Ok(McuRestartMethod::Command)
+        Ok((McuRestartMethod::Command, None))
+    }
+
+    /// Resolve a bridge-port device's reset.
+    ///
+    /// A **named** device (a `uuid:` on the child) answers the bridge's mux
+    /// itself, so it has an admin channel to be told to reset itself:
+    /// `restart_method: admin` is the one value that means something on such a
+    /// section, and it becomes [`BridgeRestart::Device`]. `admin` on any other
+    /// bridge-port section is a config error — a legacy device has no channel
+    /// to forward to.
+    ///
+    /// A **legacy** device (no `uuid:`) has no channel of its own, so only its
+    /// bridge can reset it, by pulsing the port's lines; that is the **port
+    /// section's** `uart_restart_method` ([`BridgeRestart::Port`]). The child
+    /// writes none of it — the port owns the choice.
+    ///
+    /// Every other value is reported and ignored, like the option off a serial
+    /// port, and leaves the device resetting with `command`.
+    fn parse_bridge_restart(
+        section: &ConfigWrapper,
+        port: &str,
+        kind: PortKind,
+        named: bool,
+        text: Option<String>,
+    ) -> Result<(McuRestartMethod, Option<BridgeRestart>), ConfigError> {
+        let method = match &text {
+            Some(text) if McuRestartMethod::parse(text) == Some(McuRestartMethod::Admin) => {
+                if !named {
+                    return Err(Self::admin_needs_a_named_bridge_port(section));
+                }
+                McuRestartMethod::Admin
+            }
+            None => McuRestartMethod::Command,
+            Some(text) => {
+                // The spelling is still validated, and a value that is not
+                // `admin` does not apply here: only a named device has a
+                // channel to reset itself, and the line-level methods act on a
+                // port the child does not own. `command` is what applies, so
+                // only a value asking for **another** method is reported.
+                let written = Self::parse_method(section, text)?;
+                if written != McuRestartMethod::Command {
+                    warn!(
+                        "MCU '{}' sets restart_method '{text}', which only applies to a serial MCU \
+                         or a named (uuid-bearing) bridge-port device; resetting with command",
+                        section.identifier()
+                    );
+                }
+                McuRestartMethod::Command
+            }
+        };
+        let restart = if method == McuRestartMethod::Admin {
+            Some(BridgeRestart::Device)
+        } else if !named && kind == PortKind::Uart {
+            Self::legacy_port_restart(section, port)
+        } else {
+            None
+        };
+        Ok((method, restart))
+    }
+
+    /// The port-level reset a legacy bridge-port device gets.
+    ///
+    /// The choice is the **port section's** `uart_restart_method`, read from the
+    /// sibling section (raw text: the port's own factory is what records the
+    /// option as read). Absent is `None` — today's behaviour, where the child
+    /// resets with `command` and nothing acts before its transport opens. A
+    /// written line-level method (`arduino`/`cheetah`) becomes
+    /// [`BridgeRestart::Port`]. Every other value is the port factory's to
+    /// refuse (`mcu/bridge_ports.rs`), so one that slips through here — the
+    /// child is parsed before the port section — is simply not a reset this
+    /// device can take.
+    fn legacy_port_restart(section: &ConfigWrapper, port: &str) -> Option<BridgeRestart> {
+        let text = section
+            .sibling(port)
+            .and_then(|port| port.section().get_text("uart_restart_method"))?;
+        match McuRestartMethod::parse(text.trim()) {
+            Some(McuRestartMethod::Arduino) | Some(McuRestartMethod::Cheetah) => {
+                Some(BridgeRestart::Port)
+            }
+            _ => None,
+        }
+    }
+
+    /// Parse one `restart_method` spelling, reporting an unknown one.
+    fn parse_method(section: &ConfigWrapper, text: &str) -> Result<McuRestartMethod, ConfigError> {
+        McuRestartMethod::parse(text).ok_or_else(|| {
+            ConfigError::new(format!(
+                "MCU '{}' has an invalid restart_method: '{text}' (expected one of {})",
+                section.identifier(),
+                McuRestartMethod::CHOICES.join(", ")
+            ))
+        })
+    }
+
+    /// The error for `restart_method: admin` on a section that is not a **named**
+    /// bridge-port device.
+    ///
+    /// `admin` is the one method that acts on the device's own admin channel,
+    /// and only a child behind a bridge port that writes a `uuid:` has one. A
+    /// serial section resets on its own line, and a legacy bridge-port device
+    /// has nothing to forward the command to — for both, the bridge's port is
+    /// the only reset available, so the error names the rule rather than
+    /// silently downgrading a *written* choice that can never work.
+    fn admin_needs_a_named_bridge_port(section: &ConfigWrapper) -> ConfigError {
+        ConfigError::new(format!(
+            "MCU '{}': restart_method 'admin' needs a bridge port with a 'uuid:' — a device with \
+             no admin channel can only be reset by its bridge's port",
+            section.identifier()
+        ))
     }
 
     /// Describe the transport the section asks for, without opening it.
@@ -804,17 +969,19 @@ impl Transport {
                 None => Interface::host(library).map_err(|e| format!("host_library: {e}")),
             },
             // A bridge port's device is reached through the bridge itself —
-            // its port table and the port-level `SET_PORT_NODEID` — and that
-            // attach lands with M1-P3. Until then this build does not open
-            // such a transport, and says so where every other open failure is
-            // said, rather than pretending the device came up.
+            // its port table and the port-level `SET_PORT_NODEID` — so it is
+            // not opened here: `McuObject::connect` routes this transport to
+            // the attach pass (`mcu/bridge_attach.rs`), which opens the
+            // downstream handle on the bridge's own link. This arm says so
+            // rather than pretending the device came up, in the same place
+            // every other open failure is said.
             Transport::BridgePort {
                 port,
                 kind,
                 uuid: _,
             } => Err(format!(
-                "{} {port}: opening a device through a bridge port is not wired up yet (M1-P3: \
-                 the attach needs the bridge's port table and SET_PORT_NODEID)",
+                "{} {port}: a bridge-port device is opened by the attach pass \
+                 (mcu/bridge_attach.rs), not by the transport",
                 kind.section_type()
             )),
             #[cfg(test)]
@@ -867,6 +1034,23 @@ mod tests {
         ConfigWrapper::untracked(section)
     }
 
+    /// A serial transport for the restart-method rules, naming no real port.
+    fn serial_transport() -> Transport {
+        Transport::Serial {
+            path: "/fake/tty".to_string(),
+            baud: 250_000,
+            uuid: None,
+        }
+    }
+
+    /// A transport that is neither serial nor a bridge port.
+    fn host_transport() -> Transport {
+        Transport::Host {
+            library: "/does/not/matter".to_string(),
+            uuid: None,
+        }
+    }
+
     #[test]
     fn test_parse_mcu_config_with_name() {
         let mut section = make_section(&["01 02"]);
@@ -884,15 +1068,19 @@ mod tests {
             ConfigValue::Single("rpi_usb".to_string()),
         );
         // A serial MCU reads the option; the value is taken as written.
-        let method = McuConfig::parse_restart_method(&wrap(&section), true, false).unwrap();
+        let (method, restart) =
+            McuConfig::parse_restart_method(&wrap(&section), &serial_transport(), false).unwrap();
         assert_eq!(method, McuRestartMethod::RpiUsb);
+        assert_eq!(restart, None);
     }
 
     #[test]
     fn test_a_serial_mcu_defaults_to_arduino() {
         let section = make_section(&["01 02"]);
-        let method = McuConfig::parse_restart_method(&wrap(&section), true, false).unwrap();
+        let (method, restart) =
+            McuConfig::parse_restart_method(&wrap(&section), &serial_transport(), false).unwrap();
         assert_eq!(method, McuRestartMethod::Arduino);
+        assert_eq!(restart, None);
     }
 
     #[test]
@@ -902,7 +1090,8 @@ mod tests {
             "restart_method".to_string(),
             ConfigValue::Single("bogus".to_string()),
         );
-        let err = McuConfig::parse_restart_method(&wrap(&section), true, false).unwrap_err();
+        let err = McuConfig::parse_restart_method(&wrap(&section), &serial_transport(), false)
+            .unwrap_err();
         assert!(err.to_string().contains("restart_method"), "{err}");
         assert!(err.to_string().contains("bogus"), "{err}");
         // The error names the valid choices, so the config can be fixed.
@@ -928,8 +1117,10 @@ mod tests {
         );
         // Upstream does not read the option off serial, so a value that is
         // meaningless there is not an error — it simply does not apply.
-        let method = McuConfig::parse_restart_method(&wrap(&section), false, false).unwrap();
+        let (method, restart) =
+            McuConfig::parse_restart_method(&wrap(&section), &host_transport(), false).unwrap();
         assert_eq!(method, McuRestartMethod::Command);
+        assert_eq!(restart, None);
     }
 
     #[test]
@@ -946,9 +1137,11 @@ mod tests {
         let access = Arc::new(AccessTracking::new());
         let wrapper = ConfigWrapper::new(&section, Arc::clone(&access));
 
-        let method = McuConfig::parse_restart_method(&wrapper, false, false).unwrap();
+        let (method, restart) =
+            McuConfig::parse_restart_method(&wrapper, &host_transport(), false).unwrap();
 
         assert_eq!(method, McuRestartMethod::Command);
+        assert_eq!(restart, None);
         assert!(access.contains("mcu", "restart_method"));
     }
 
@@ -2140,11 +2333,12 @@ mod tests {
         assert!(err.to_string().contains("invalid uuid"), "{err}");
     }
 
-    /// The transport describes the port, but nothing opens it yet: the attach
-    /// through the bridge's port table lands with M1-P3, and `open` says so
-    /// where every other open failure is said.
+    /// The transport describes the port, but `Transport::open` is not its path:
+    /// the attach through the bridge's port table (`mcu/bridge_attach.rs`)
+    /// opens it, and `open` points there rather than pretending the device came
+    /// up.
     #[test]
-    fn a_port_child_open_is_refused_as_not_wired_up_yet() {
+    fn a_port_child_open_points_at_the_bridge_attach() {
         let (config, _) = parse_shared(
             "[mcu bridge]\nserial: /dev/a\n\
              [mcu child]\nuart: uart0\nuuid: 11aa22bb33cc\n\
@@ -2154,7 +2348,7 @@ mod tests {
         let config = config.unwrap();
         let err = config.open().unwrap_err();
         assert!(err.contains("uart_device uart0"), "{err}");
-        assert!(err.contains("M1-P3"), "{err}");
+        assert!(err.contains("bridge_attach"), "{err}");
     }
 
     /// A `restart_method` on a port child is reported and ignored: only a
@@ -2253,5 +2447,153 @@ mod tests {
         assert!(err.to_string().contains("canbus_nodeid"), "{err}");
         // The allocator names MCUs by their section sub, not identifier.
         assert!(err.to_string().contains("MCU 'child'"), "{err}");
+    }
+
+    // -----------------------------------------------------------------------
+    // The bridge-port reset face: `restart_method: admin` for a named device,
+    // the port's `uart_restart_method` for a legacy one.
+    // -----------------------------------------------------------------------
+
+    /// Parse the `[<identifier>]` section of `text` with the whole config behind
+    /// the wrapper, the way the loader hands a factory one — a bridge-port parse
+    /// looks its port section up as a sibling.
+    fn parse_section(text: &str, identifier: &str) -> Result<McuConfig, ConfigError> {
+        let (config, _) = Config::from_text(text).expect("the test config parses");
+        let section = config
+            .get_section(identifier)
+            .unwrap_or_else(|| panic!("the config has [{identifier}]"));
+        let wrapper = ConfigWrapper::with_config(section, AccessTracking::shared(), None, &config);
+        McuConfig::new(&wrapper)
+    }
+
+    /// A child on a uart port, with `restart_method` and the port's
+    /// `uart_restart_method` as written.
+    fn bridge_child(child_options: &str, port_options: &str) -> String {
+        format!(
+            "[mcu bridge]\nserial: /dev/a\n\
+             [mcu child]\nuart: uart0\n{child_options}\
+             [uart_device uart0]\nuart_mcu: bridge\nuart_oid: uart0\n{port_options}"
+        )
+    }
+
+    /// A named (uuid-bearing) bridge-port device takes `restart_method: admin`:
+    /// it answers the bridge's mux itself, so it has the admin channel the
+    /// command needs, and the bridge forwards the reset.
+    #[test]
+    fn a_named_bridge_port_child_takes_admin() {
+        let config = parse_section(
+            &bridge_child("uuid: 11aa22bb33cc\nrestart_method: admin\n", ""),
+            "mcu child",
+        )
+        .expect("a named bridge-port child with admin parses");
+
+        assert_eq!(config.restart_method, McuRestartMethod::Admin);
+        assert_eq!(config.bridge_restart, Some(BridgeRestart::Device));
+    }
+
+    /// `admin` on a legacy (uuid-less) child is refused: there is no admin
+    /// channel to forward the command to, and the error names the rule.
+    #[test]
+    fn admin_on_a_legacy_bridge_port_child_is_refused() {
+        let err =
+            parse_section(&bridge_child("restart_method: admin\n", ""), "mcu child").unwrap_err();
+
+        let text = err.to_string();
+        assert!(
+            text.contains("restart_method 'admin' needs a bridge port with a 'uuid:'"),
+            "{text}"
+        );
+        assert!(
+            text.contains("a device with no admin channel can only be reset by its bridge's port"),
+            "{text}"
+        );
+    }
+
+    /// `admin` on a serial MCU is refused the same way: the method resets a
+    /// device over a bridge's admin channel, and a serial line is not one.
+    #[test]
+    fn admin_on_a_serial_mcu_is_refused() {
+        let err =
+            parse_section("[mcu]\nserial: /dev/a\nrestart_method: admin\n", "mcu").unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("restart_method 'admin' needs a bridge port with a 'uuid:'"),
+            "{err}"
+        );
+    }
+
+    /// `admin` on a non-bridge transport is refused even when the section does
+    /// write a `uuid:` — a CAN link has no bridge port to forward on.
+    #[test]
+    fn admin_on_a_can_mcu_is_refused() {
+        let err =
+            parse_section("[mcu]\nuuid: 11aa22bb33cc\nrestart_method: admin\n", "mcu").unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("restart_method 'admin' needs a bridge port with a 'uuid:'"),
+            "{err}"
+        );
+    }
+
+    /// A named child that writes anything but `admin` resets with `command`: the
+    /// line-level methods drive a port the child does not own, and `command` is
+    /// the one value it already gets. No port-level reset is asked for either.
+    #[test]
+    fn a_named_child_with_an_inapplicable_method_resets_with_command() {
+        for value in ["arduino", "cheetah", "rpi_usb", "command"] {
+            let config = parse_section(
+                &bridge_child(
+                    &format!("uuid: 11aa22bb33cc\nrestart_method: {value}\n"),
+                    "",
+                ),
+                "mcu child",
+            )
+            .unwrap_or_else(|err| panic!("{value}: {err}"));
+
+            assert_eq!(config.restart_method, McuRestartMethod::Command, "{value}");
+            assert_eq!(config.bridge_restart, None, "{value}");
+        }
+    }
+
+    /// An unknown spelling is a config error on a bridge-port section too, the
+    /// way it is on a serial one — an unreadable value is never silently the
+    /// default.
+    #[test]
+    fn an_unknown_restart_method_on_a_bridge_child_is_a_config_error() {
+        let err = parse_section(
+            &bridge_child("uuid: 11aa22bb33cc\nrestart_method: wibble\n", ""),
+            "mcu child",
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("invalid restart_method"), "{err}");
+        assert!(err.to_string().contains("wibble"), "{err}");
+    }
+
+    /// A legacy child takes no method of its own: what resets it is the port's
+    /// `uart_restart_method`, and a line-level one becomes `BridgeRestart::Port`.
+    #[test]
+    fn a_legacy_child_takes_its_ports_line_reset() {
+        let config = parse_section(
+            &bridge_child("", "uart_restart_method: arduino\n"),
+            "mcu child",
+        )
+        .expect("a legacy child on a declared port parses");
+
+        assert_eq!(config.restart_method, McuRestartMethod::Command);
+        assert_eq!(config.bridge_restart, Some(BridgeRestart::Port));
+    }
+
+    /// A port that declares nothing leaves the legacy child with no port-level
+    /// reset: today's behaviour, where nothing acts before its transport opens.
+    #[test]
+    fn a_legacy_child_on_an_undeclared_port_gets_no_reset() {
+        let config = parse_section(&bridge_child("", ""), "mcu child")
+            .expect("a legacy child on an undeclared port parses");
+
+        assert_eq!(config.restart_method, McuRestartMethod::Command);
+        assert_eq!(config.bridge_restart, None);
     }
 }

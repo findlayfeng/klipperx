@@ -229,6 +229,9 @@ identify 之后**；配置解析期先"待验放行"，identify 时补验并报�
 - **验收（端到端）**：桥下游挂"**没有 mux 的固件**"（`test-support` 那份无 mux 的库，或现有假响应器
   夹具），主机把它当普通 `[mcu]` 连上并跑通 identify + `get_clock`；另一条回归：带 `uuid:` 的设备
   走原路不退化。
+- **测试策略（2026-10-14 拍板）**：本期验收**只走软件路径**（pty + 回环夹具/假响应器 + 假固件），
+  真机项（DTR/RTS 极性、双板接线、旧固件板）**后移**，与 M2 一起排在 **M1+M2 全部落地后**统一跑，
+  清单见 `TESTING.md` 的「M1/M2（桥下游端口 + admin 复位）」一节；不因缺真机停下开发。
 - **M2 的主机半边（同一期）**：把复位命令接进 `restart_method`（新增一种方法，或让共享/桥路径内部
   改走它）；"面向端口/桥"的复位用于无 uuid 的 uart 端口（那条线只有它一台，切 DTR/RTS 不打断别人），
   带 uuid 的设备走它自己的 admin。要定：复位到哪一层（重进 `sched_main` / 清 shutdown / 真复位 MCU /
@@ -348,5 +351,83 @@ d. **M2 的复位命令**：名字与参数（要不要带"复位到哪一层"�
   的测试上）、概率上明显高于更早记的「基线 21 次 2 次」（新增的 mux 库探针多了一个暴露面）；
   修后 `host_tests` 单跑 **20/20 绿**，全量闸门 **15/15 绿**（每次均 3179 passed / 0 failed /
   13 ignored）。
-- **未收口**：复位极性/保持时长未真机验证（RS-232 通用约定，代码已注释）；复位层次与桥自身复位
-  留 P3（§5.6d）；主机侧何时发 SET_PORT_NODEID（attach 时序）留 P3。
+- **未收口**：复位层次与桥自身复位留 P3（§5.6d）；主机侧何时发 SET_PORT_NODEID（attach 时序）
+  留 P3。
+- **真机项已后移**（2026-10-14 拍板，见 §5 P3 的测试策略）：复位极性/保持时长、桥下游 attach
+  的双板接线与旧固件板、`RESET_DEVICE` 转发、复位后确认路径——一律不在本期验，等 M1+M2 全部
+  落地后统一跑一次真机，清单在 `TESTING.md` 的「M1/M2（桥下游端口 + admin 复位）」一节。
+
+---
+
+## 7. P3 实施记录（attach 走端口 + M2 主机半边）
+
+范围：① 桥下游端口 attach（legacy 与命名两条形态）；② M2 主机半边（经桥复位接进
+`restart_method`）；③ 规则 7 的**桥半边**（它是前两条的前置条件）。测试策略见 §5 P3 与
+`TESTING.md` 的「M1/M2」一节：真机项一律后移。分支 `agents/feat-m1-p3-attach` 的基底是 `ed2565f`。
+
+### 单元与提交
+
+| 单元 | 提交 | 内容 |
+|---|---|---|
+| P3-A | `d33f241` | 下游设备（无 admin）**不握手 attach** + 桥 admin 单元入口：`serial::attach_downstream`、`SharedSerialHandle::{send_unit,send_admin,send_set_port_node_id}`、`HostDevice::{load_downstream,send_admin,send_set_port_node_id}` |
+| P3-A2 | `1471177` | 已打开句柄上的握手：`SharedSerialHandle::handshake`（与 `attach` 共用 `run_handshake`）、`HostDevice::attach` 开放 |
+| P3-B1 | `fd7355a`,`e6f4b4a` | **规则 7 桥半边**（`host_libraries::path_is_mux` 的 `has_bridge`、`serial_ports::is_id_addressed`、`bridge_ports::bridge_mcus` 零 access 预扫）+ 配置驱动 legacy attach（新 `mcu/bridge_attach.rs`：`resolve`/`open`/端口表对账/四类点名错误/`object.rs` 的连接钩子） |
+| P3-B2 | `d4a391d` | 命名设备：**先** `SET_PORT_NODEID(index, id, MUX_PORT_UNITS)`、**再** `SET_KLIPPER_NODEID` + 重确认（§4.5 的「两条都要发」） |
+| P3-E1 | `528b8ff` | 夹具 `DownstreamResponder`（真 `.dict` 装的假固件 + pty 双向泵）：经真桥跑通 identify（101×40B + 终止块、解压后与 `linuxprocess.dict` 逐字节相等）与一次 `get_clock` 往返 |
+| P3-D | `344886c` | M2 主机半边：`McuRestartMethod::Admin`、`BridgeRestart::{Device,Port}`、`restart::reset_bridge_firmware`/`device_reset`、`uart_restart_method` 真语义（端口侧只认 `arduino`/`cheetah`） |
+| 集成 | `54f0f91`,`b381ba4`,`6d22e1e` | 合流修复（B2 新增 `BridgePortLink.named` 与 D 的手搭 link 的语义冲突）、D13（**设备复位先重申路由**）、host 库**写锁**（debug 构建逐字节写会让两个引用的单元交错）、接口层诚实性（三个桥命令拒绝**裸引用**）、两 lane 复审 findings 收口 |
+
+### 验收实测（分支 HEAD `6d22e1e`）
+
+- `cargo test --workspace` → **3220 passed / 0 failed / 14 ignored**；`cargo fmt --all --check` 干净；
+  `cargo build --workspace --all-targets` **0 告警**。
+- 覆盖计数（`cargo test --lib -- --list` 逐模块数）：`mcu/bridge_attach.rs` **14**、
+  `mcu/restart.rs` **14**（其中 1 条 `#[ignore]`，见缺陷②）、`devices/host.rs` **11**、
+  `devices/serial.rs` **53**、`mcu/host_libraries.rs` **20**、`mcu/serial_ports.rs` **19**、
+  `config/mcu.rs` **75**。
+
+### 决断台账（D0–D14）
+
+| # | 决断 | 理由 | 被否方案 |
+|---|---|---|---|
+| D0 | M1/M2 真机项**后移**，先让代码在软件侧说得通 | 用户拍板；清单落 `TESTING.md`（M1-1..M2-3） | 逐期等真机 —— 会空转 |
+| D1 | 下游设备**通过既有共享资源单例自开句柄**，不把桥的 `Interface` 到处传 | `port_for`/`library_registry` 已保证「一条链路一个资源、句柄按 id 分」 | 给 `Mcu`/`McuObject` 加原始单元发送口 —— 改动面更大 |
+| D2 | attach **顺序**：先建路由、再设备握手；桥必须先前连（顺序不对→点名错误，不自愈） | 路由不存在时握手单元会被桥丢掉；`connect` 是串行 await，没有拓扑等待机制 | 在 loader 里加依赖等待 —— 只为这一处引入拓扑排序 |
+| D3 | 夹具 = **真 `.dict` 假固件 + 真 pty + 真桥** | 真正要保真的部分（桥路由/剥头/加头、identify、`get_clock`）都是真的 | 手写最小响应器（更假） |
+| D4 | 规则 7 桥半边**提前到 P3** | 否则桥在自己的链路上根本不可达（单节无 uuid 会被判裸帧） | 人为加同路径第二节骗分类；或推迟到 P4 —— 两者都让 M1 本期不可用 |
+| D5 | 命名设备**两条命令都要发**（桥表 + 设备命名），路由在前 | §4.5；且握手单元要走该路由 | 只发 `SET_KLIPPER_NODEID`（桥不知道往哪送） |
+| D6 | M2 配置面：新增 `restart_method: admin`（命名设备经桥转发）；legacy 由**端口节** `uart_restart_method` 决定 | 复位能力属于端口/桥，命名设备的 admin 属于设备 | 把线级方法挂在子节上；或新造一套回执机制 |
+| D7 | 无回执的确认 = **沿用「复位后重开+重连」重试路径**，不新造确认 | 三条端口级命令都无回执；重连成功本身就是证据 | 假装有回执 / 轮询桥状态 |
+| D8 | 设备复位**先重申路由**（D13 落地为 `device_reset`） | 端口 flags 是桥侧状态：未置位时 `RESET_DEVICE` 会被**剥头**，设备收到裸 KXID 帧（其解析器拒绝）⇒ 复位不会发生；路由命令幂等 | 假定桥还记得 flags |
+| D9 | `RESET_PORT` 的观测点在**桥链路**，不在下游端口 | 固件 `bridge.c`：0x04 由桥消费、从不扇出；只有 0x02 会转发 | 我最初任务书写的「下游 pty 收到 0x04」——事实错误，已纠 |
+| D10 | 命名字节的复位字节测**后移**并由 main 补 | B2 未合入时 `resolve` 必拒；在 `restart.rs` 复刻端口表扫描会造成两个真源 | 复刻扫描（被否）/ 留 `#[ignore]` 空壳（被否） |
+| D11 | host 库写路径**加锁串行化单元** | debug 构建逐字节写；桥自己的引用与下游引用同时写是可达情形 ⇒ 交错会毁两个单元（无回执的 `SET_PORT_NODEID` 静默丢失） | 只在文档里声明 debug 限制 |
+| D12 | 三个桥命令**拒绝裸引用**（非 mux 的宿主库/非桥链路） | 文档承诺「不是桥就报错而不是写到没人听的链路上」 | 放宽文档措辞 |
+| D13 | 配置驱动的**整链端到端在本期不做**（见欠项） | 单进程内要么两份库（被缺陷②挡），要么一库两读者偷帧（E1 夹具已实测：子设备 identify 请求被重发 ~28 次、回包被桥的引用偷走） | 放宽断言凑绿 / 留 `#[ignore]` |
+| D14 | 上游/下游的**两端观测点分开写测试**（桥链路 byte 断言 + 真库端口 byte 断言） | 单条命令的可见面不同（消费 vs 转发） | 只写一条「整链」断言 |
+
+### 发现（本期不修，留档）
+
+1. **两份 host 库同进程无法一起退出**：`host.c:40-46/76-81/104-114` 每次 `klipper_host_init` 都覆盖
+   进程级 `SIGUSR1` handler，而 handler 用的是**每库各自**的 `g_shutdown_requested`/`g_main_jmp`，
+   `sched.c` 的 `run_tasks` 唯一退出路径就是那次 `longjmp`。⇒ 先卸裸帧库 → **SIGSEGV**（跳进已 unmap
+   的映射）；先卸桥库 → `HostLibrary::drop` 的 `join()` **无限挂住**。最小复现：同进程 `load_downstream`
+   载入 mux 库 + `load_bytes` 载入裸帧库，不发流量，依次 drop（日志 `/tmp/m1p3fx-t2.log`、`t3.log`）。
+   影响面：仅「同进程两份 host 库」的嵌入/测试场景（生产桥拓扑是两块板）。
+2. **命名设备的握手在宿主库桥上不释放库**：`HostDevice::attach`/`wait_for_assignment` 之后，即使
+   `teardown` + drop 掉全部引用，库在 10s 后仍报「already loaded」。已保留一条
+   `#[ignore]` 的复现与其验收测试（`a_named_childs_reset_is_forwarded_to_its_port_whole`）——
+   它就是修好后的验收测试。
+
+### 欠项
+
+- **P3 验收：配置驱动的整链端到端**（D13 的结论）。现状：夹具（假固件经真桥答 identify/`get_clock`）
+  与配置驱动路由（子设备裸帧确实到端口）**两半**都已实测；缺的是合起来那条。要真做需要
+  「下游固件跑**独立进程**」（桥引用与子引用不再是同一输出队列的两个活读者）或真机。
+- **命名子节的复位字节测**：D10 的后移项，随 D13 的整链一起补。
+- **规则 7 的 0 台下游口径**（F-6）：端口节声明了桥但没有任何 `[mcu] uart:` 引用时，桥的路径仍按
+  id 寻址——方向保守（桥本就是 mux 设备）但与规则 7 字面「下游设备数」不同口径，P4 一并重核。
+- **桥走 `serial:` + `cheetah`**（F-9）：`is_id_addressed` 让它落共享臂，因此**不再驱 RTS**（有告警）。
+  手册已写明。
+- **P4/P5/P6**：P4（下游台数泛化）、P5（CAN 上游这三条命令与端口表的帧形）、P6（多站串口）未动。
+- **真机项**：`TESTING.md` 的 M1-1..M2-3（复位极性/保持、双板接线、旧固件板、无回执确认）。

@@ -234,13 +234,13 @@ max_accel: 3000
 |------|------|------|--------|------|
 | `host_library` | 字符串 | 二选一 | — | klipper host 库（`libklipper_host.so`）的路径：在主机进程内跑一份 klipper 固件。与 `serial`/CAN 键互斥；同路径可被多颗 `[mcu]` 引用，判定为 mux 时连接按 id 寻址（见 [MCU 连接方式](mcu-connection.md)） |
 | `serial` | 字符串 | 二选一 | — | 串口设备路径（如 `/dev/ttyACM0`）。**同一路径被两颗及以上 `[mcu]` 引用即共享**（见 [MCU 连接方式](mcu-connection.md)） |
-| `uart` | 字符串 | 二选一 | — | 引用一个 `[uart_device <名>]` 端口节的**名字**（如 `uart: uartxx` 引 `[uart_device uartxx]`），把这颗 MCU 挂到桥的下游 uart 端口上。与 `serial`/`host_library`/`test`/`can`/`canbus_interface` 互斥；`uuid` 可选——**不写就是 legacy**（原始帧，规则见 [MCU 连接方式](mcu-connection.md#桥下游端口uart--can-引用端口节)）；`canbus_nodeid` 不可用（非 CAN 链路）。**配置面已落地；经端口 attach 属 M1-P3**，`open` 会明确报错而非假装可连 |
-| `can` | 字符串 | 二选一 | — | 引用一个 `[can_device <名>]` 端口节的名字，挂到桥的下游 CAN 端口。**`uuid` 必填**（CAN 寻址靠它，装载期点名报错）；与 `serial`/`host_library`/`test`/`canbus_interface`/`uart` 互斥；`canbus_nodeid` 可用（id 覆盖与链路正交）。attach 同属 M1-P3 |
+| `uart` | 字符串 | 二选一 | — | 引用一个 `[uart_device <名>]` 端口节的**名字**（如 `uart: uartxx` 引 `[uart_device uartxx]`），把这颗 MCU 挂到桥的下游 uart 端口上。与 `serial`/`host_library`/`test`/`can`/`canbus_interface` 互斥；`uuid` 可选——**不写就是 legacy**（原始帧，规则见 [MCU 连接方式](mcu-connection.md#桥下游端口uart--can-引用端口节)）；`canbus_nodeid` 不可用（非 CAN 链路）。**经端口 attach 已落地**：identify 后按固件端口表把 `(桥, oid)` 对成端口 `index`，先向桥发 `SET_PORT_NODEID(index, id, flags)`——legacy 之后按**原始帧**收发，命名设备再走 `SET_KLIPPER_NODEID` + 重确认。注意**顺序约束**：桥必须**先于**本子节连接；而裸 `[mcu]` 在同一阶段总是先于 `[mcu <名>]` 装载，所以桥是裸 `[mcu]` 时本子节**必须**写成 `[mcu <名>]`（否则报点名错误） |
+| `can` | 字符串 | 二选一 | — | 引用一个 `[can_device <名>]` 端口节的名字，挂到桥的下游 CAN 端口。**`uuid` 必填**（CAN 寻址靠它，装载期点名报错）；与 `serial`/`host_library`/`test`/`canbus_interface`/`uart` 互斥；`canbus_nodeid` 可用（id 覆盖与链路正交）。**桥经 CAN 上游的下游 attach 尚未接线（属 P5）**，现在会点名报错 |
 | `baud` | 整数 | 否 | `250000` | 串口波特率（仅 `serial` 模式）。共享路径以**显式写出**的值为准——多颗写了不同值就 `warn` 并**取最小值**（没写的节跟着它走） |
 | `uuid` | 12 位十六进制 | 二选一 | — | MCU 芯片唯一 ID（12 位 hex）：CAN 模式必给；写在 `serial` 节上则共享串口连接期按它先发 SET_NODEID 再握手（独占串口忽略）。历史键名 `canbus_uuid` 仍兼容，同节两个都写会报错；**写在 `host_library` 节上**则指明这条库路径上被寻址的是哪块设备（判定见 [MCU 连接方式](mcu-connection.md)：同路径 1 节有 `uuid`、或 ≥2 节即按 id 寻址；不写 `uuid:` 的节认领桥自身设备，用装载期为该路径指派的身份点名） |
 | `canbus_interface` | 字符串 | 否 | `can0` | CAN 网络接口名 |
 | `canbus_nodeid` | 整数 (1..=255) | 否 | 由 `[mcu_ids]` 分配 | **MCU 层 id**，**只有 CAN 节能写它**（写到其它节会被判为"第二个接口"报错；配置键名沿用 Klipper；在 CAN 上就是节点号，见下）。**不写就由分配器发**（`4` 起的最小空位，上限 255——CAN admin 报文只给它留了 1 字节）；写了就用写的那个——分配器装载时**预扫全配置**把显式号保留下来、自动号绕开，所以显式号写在哪个位置都生效、也不会被自动号占用。装载期只在两种情况报错：两个 `[mcu]` 写了同一个号，或 `4..=255` 已占满（上游靠固件 `can_id_conflict` 兜底，本仓提前拒）。 |
-| `restart_method` | `command` / `arduino` / `cheetah` / `rpi_usb` | 否 | `arduino`（串口）/ `command`（非串口/共享串口） | MCU 固件重启方式。**共享串口强制 `command`**（线级复位会打断整条线上的所有 MCU；显式写了别的值会告警，没写则静默降级） |
+| `restart_method` | `command` / `arduino` / `cheetah` / `rpi_usb` / `admin` | 否 | `arduino`（串口）/ `command`（非串口/共享串口） | MCU 固件重启方式。**共享串口强制 `command`**（线级复位会打断整条线上的所有 MCU；显式写了别的值会告警，没写则静默降级）。**桥下游端口上的设备另有一套**：命名设备（写了 `uuid:`）可用 **`admin`**——命令经桥转发 `RESET_DEVICE`、由设备自己进 bootloader；legacy 设备的复位由**端口节**的 `uart_restart_method` 决定（见下）。三条端口级命令都**无回执**，主机靠「复位后能否重新握手/identify」确认 |
 | `usb_power` | `auto` / `sysfs` / `libusb` | 否 | `auto` | `rpi_usb` 的切电机制 |
 
 > 详细参数说明见 [MCU 连接方式](mcu-connection.md)。
@@ -285,7 +285,7 @@ CAN MCU、本仓把它泛化成所有接口共用一个序列；
 | `uart_mcu` | `uart_device` | 字符串 | 是 | 这条 uart 口长在哪颗 `[mcu]` 上（裸 `[mcu]` 写 `mcu`，命名节写名字）。必须指向配置里存在的 `[mcu]`，否则装载报错 |
 | `uart_oid` | `uart_device` | 字符串 | 是 | 该 MCU 上对应的 oid 名（固件上报的那个，如 `uart0`） |
 | `uart_baud` | `uart_device` | 整数 | 否 | 端口自身的线参数；正整数校验 |
-| `uart_restart_method` | `uart_device` | `command` / `arduino` / `cheetah` / `rpi_usb` | 否 | 拼写装载期校验；**语义（经端口/桥的复位）随 M1-P3 接线**，现在只校验不生效 |
+| `uart_restart_method` | `arduino` / `cheetah` | 否 | — | 声明**该端口的板子怎么被线级复位**（写其它值报错）。声明了它，挂在该端口上的 **legacy 子设备**（无 `uuid:`）在 `FIRMWARE_RESTART` 时由桥对该口做 DTR\|RTS 脉冲（`RESET_PORT 0x04`）；不声明则子设备沿用 `command`。注意：桥的链路按 id 寻址（共享串口或“它是桥”），所以桥自己走 `serial:` + `restart_method: cheetah` 时**不会驱 RTS**（与非桥的独占串口不同，配置层会告警） |
 | `can_mcu` | `can_device` | 字符串 | 是 | 同 `uart_mcu` |
 | `can_oid` | `can_device` | 字符串 | 是 | 同 `uart_oid` |
 

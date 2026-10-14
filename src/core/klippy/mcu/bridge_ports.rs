@@ -15,7 +15,7 @@
 //! | `uart_mcu` / `can_mcu` | the `[mcu]` this port sits on; a section name, `mcu` for the bare `[mcu]` (required) |
 //! | `uart_oid` / `can_oid` | the oid name the firmware reports for this port (required, non-empty) |
 //! | `uart_baud` | the port's line rate, a positive integer (optional) |
-//! | `uart_restart_method` | spelling checked against [`McuRestartMethod`]; semantics land with the port-level reset work (optional) |
+//! | `uart_restart_method` | the **line-level** reset the bridge gives a legacy device on this port — `arduino` (DTR) or `cheetah` (RTS/DTR); any other value is a config error (optional) |
 //!
 //! The `*_mcu` target is a **config-section** existence check
 //! ([`ConfigWrapper::has_sibling`]), not a printer-object lookup: the section
@@ -32,6 +32,7 @@
 //! (`uart_device uart0`): no status, not queryable, just the parsed values for
 //! the passes that follow — the same shape `serial_ports` and `mcu_ids` set.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use serde_json::{json, Value};
@@ -61,34 +62,61 @@ pub struct UartPort {
     oid: String,
     /// The port's line rate, when the config writes one.
     baud: Option<u32>,
-    /// The written restart method, spelling checked only (see the module docs).
+    /// The line-level reset the bridge gives a legacy device on this port, when
+    /// the config writes one.
     restart_method: Option<McuRestartMethod>,
 }
 
 impl UartPort {
+    /// The line-level resets this option may ask for.
+    ///
+    /// Only `arduino` (DTR) and `cheetah` (RTS/DTR) act on the port's own
+    /// lines. `command` resets a firmware the host has a session with — a port
+    /// has no session of its own — `rpi_usb` cuts a USB power rail a port does
+    /// not own, and `admin` needs an admin channel: the device this option
+    /// describes is the **legacy** one, which has none.
+    const LINE_RESETS: &'static [&'static str] = &["arduino", "cheetah"];
+
+    /// Parse `uart_restart_method`, refusing everything that is not line-level.
+    ///
+    /// # Errors
+    /// A value that is not a line-level method — including a misspelling, which
+    /// is reported with the two that are accepted.
+    fn parse_restart_method(
+        config: &ConfigWrapper,
+        text: &str,
+    ) -> Result<McuRestartMethod, ConfigError> {
+        McuRestartMethod::parse(text)
+            .filter(|method| {
+                matches!(
+                    method,
+                    McuRestartMethod::Arduino | McuRestartMethod::Cheetah
+                )
+            })
+            .ok_or_else(|| {
+                ConfigError::new(format!(
+                    "Section '{}' has an invalid uart_restart_method: '{text}' (expected one of {})",
+                    config.identifier(),
+                    Self::LINE_RESETS.join(", ")
+                ))
+            })
+    }
+
     /// Parse one `[uart_device <name>]` section.
     ///
     /// # Errors
     /// A missing or empty required option, an `uart_mcu` that names no `[mcu]`
     /// section, a non-positive or unparsable `uart_baud`, or a
-    /// `uart_restart_method` spelling [`McuRestartMethod::parse`] refuses —
-    /// each message names the section (and the target, for an unknown MCU).
+    /// `uart_restart_method` that is not a line-level method — each message
+    /// names the section (and the target, for an unknown MCU).
     pub fn new(config: &ConfigWrapper) -> Result<Self, ConfigError> {
         let name = section_name(config, "uart_device")?;
         let mcu = require_mcu(config, "uart_mcu")?;
         let oid = require_text(config, "uart_oid")?;
         let baud = parse_baud(config, "uart_baud")?;
-        // Spelling only: which reset a port-level method actually performs is
-        // the port-reset work's to define, not this parse's.
         let restart_method = match config.get_str("uart_restart_method") {
             None => None,
-            Some(text) => Some(McuRestartMethod::parse(&text).ok_or_else(|| {
-                ConfigError::new(format!(
-                    "Section '{}' has an invalid uart_restart_method: '{text}' (expected one of {})",
-                    config.identifier(),
-                    McuRestartMethod::CHOICES.join(", ")
-                ))
-            })?),
+            Some(text) => Some(Self::parse_restart_method(config, &text)?),
         };
         Ok(Self {
             name,
@@ -120,7 +148,8 @@ impl UartPort {
         self.baud
     }
 
-    /// The written restart method, spelling checked only.
+    /// The line-level reset the bridge gives a legacy device on this port,
+    /// when the config writes one.
     pub fn restart_method(&self) -> Option<&McuRestartMethod> {
         self.restart_method.as_ref()
     }
@@ -212,6 +241,33 @@ pub fn load_can_device(
     _printer: &Arc<Printer>,
 ) -> Result<Arc<dyn PrinterObject>, ConfigError> {
     Ok(Arc::new(CanPort::new(config)?))
+}
+
+/// The `[mcu]` **names** the config makes a bridge: every port section's
+/// `*_mcu` value, trimmed (`mcu` for the bare section, the sub otherwise).
+///
+/// A bridge is the upstream side of a port, so its own link carries the
+/// downstream devices' frames too; the link passes ask this before deciding
+/// whether that link is addressed by id (`serial_ports`, `host_libraries`).
+/// Like every pre-scan here it reads raw option text (`section().get_text`,
+/// never a tracked getter), so it records no access and does not exempt a
+/// `[mcu]` option from `check_unused` on its own account. Whether a `*_mcu`
+/// names an existing `[mcu]` section is the port factory's check; an unknown
+/// name is still reported here, so a bridge the config never declares cannot
+/// make a path id-addressed by accident.
+pub(crate) fn bridge_mcus(config: &ConfigWrapper) -> BTreeSet<String> {
+    let mut bridges = BTreeSet::new();
+    for (prefix, option) in [("uart_device", "uart_mcu"), ("can_device", "can_mcu")] {
+        for section in config.sibling_prefix_sections(prefix) {
+            if let Some(name) = section.section().get_text(option) {
+                let name = name.trim();
+                if !name.is_empty() {
+                    bridges.insert(name.to_string());
+                }
+            }
+        }
+    }
+    bridges
 }
 
 /// The section's sub, required: a port is `[<type> <name>]`, never bare.
@@ -415,6 +471,45 @@ mod tests {
             "{err}"
         );
         assert!(err.to_string().contains("wibble"), "{err}");
+    }
+
+    /// Only the port's own lines can be driven: `command` resets a firmware the
+    /// host has a session with (a port has none), `rpi_usb` cuts a USB power
+    /// rail, and `admin` needs an admin channel a legacy device does not have.
+    #[test]
+    fn a_uart_port_refuses_a_restart_method_that_is_not_line_level() {
+        for value in ["command", "admin", "rpi_usb"] {
+            let config = with_mcu(&format!(
+                "[uart_device uart0]\nuart_mcu: mcu\nuart_oid: uart0\n\
+                 uart_restart_method: {value}\n"
+            ));
+
+            let err = UartPort::new(&wrap(&config, "uart_device uart0")).unwrap_err();
+
+            assert!(
+                err.to_string().contains("invalid uart_restart_method"),
+                "{value}: {err}"
+            );
+            assert!(err.to_string().contains(value), "{value}: {err}");
+            // The refusal lists what is accepted, so the config can be fixed.
+            assert!(
+                err.to_string().contains("arduino, cheetah"),
+                "{value}: {err}"
+            );
+        }
+    }
+
+    /// The other line-level method is accepted: `cheetah` is the RTS/DTR
+    /// sequence, the second thing a bridge can do to a port's lines.
+    #[test]
+    fn a_uart_port_takes_a_cheetah_restart_method() {
+        let config = with_mcu(
+            "[uart_device uart0]\nuart_mcu: mcu\nuart_oid: uart0\n\
+             uart_restart_method: cheetah\n",
+        );
+        let port = UartPort::new(&wrap(&config, "uart_device uart0")).unwrap();
+
+        assert_eq!(port.restart_method(), Some(&McuRestartMethod::Cheetah));
     }
 
     #[test]

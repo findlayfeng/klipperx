@@ -490,3 +490,27 @@ d. **M2 的复位命令**：名字与参数（要不要带"复位到哪一层"�
   atsam 的 `.ramfunc` RWX，均已对比基线复现）。
 - **只能真机验**（已挂 `TESTING.md`）：真板 **扫描 → 指派 → 采纳 → id 冲突 shutdown** 的串口 mux
   端到端；`irq_save()` 段内的 UART 时序。
+
+### 复审（P7）与 FW-4：一个真 blocker 的发现与修复
+
+fresh-context 只读复审对「①–⑤ 都成立」给了逐条证据（端口对象化、参数主机化 + 显式失败、
+桥能力自动且不成环、MCU 接线与 host 逐字同构、`chipid_uuid` 派生与 CAN 逐字节等价、
+`mux.c` 与基线完全相同），并抓到一个 **blocker**：
+
+- **F1（内存安全）**：`src/generic/serial_irq.c` 的 mux 分支把**剥头前的 `rpos`** 交给帧解析器
+  （真实有效长度是 mux 之后的 `count`）。带头正常收发时 `count < rpos` **恒成立**，而
+  `command_find_block` 的错误分支不 clamp `pop_count`（`command.c:322-329`），于是
+  `console_pop_input` 的 `uint_fast8_t needcopy = rpos - len` 在 `len > rpos` 时**回绕** ⇒
+  对 192 字节的 `receive_buf` 越界 `memmove`。**触发条件很轻**：一个尾 SYNC 被噪声打坏的单元。
+  host 侧恰恰有这一步（`host/console.c:464-472` 传 mux 后的长度并 clamp）⇒ MCU 这份是**漏了**。
+- **修法（FW-4 `a6adb68a`）**：`irq_save()` 段内 `receive_pos = count; rpos = count;`（把不变式
+  写进注释）+ `console_pop_input` 入口**防御性 clamp**（`if (len > buffered) len = buffered;`，
+  不动 `command.c`）；顺带把 `MUX_SERIAL` 的可用性收紧为 `depends on HAVE_CHIPID || MACH_HOST`
+  （avr/hc32f460/simulator 无身份来源 ⇒ 不能选；host 库身份由 `klipper_host_set_uuid` 给）。
+  验收：`stm32f103-serial`（±MUX）、`rp2040`+mux、`MACH_HOST`（±`HOST_MUX_SERIAL`）全 rc=0、
+  0 告警；对 20 份 `test/configs/*.config` 跑 `olddefconfig` 无 kconfig 警告。
+- 复审的其余 finding 由 main 当场修掉（`8bdf79f`）：协议页端口表段退役、`TESTING.md` M1-3 改写、
+  `host.rs` 五处过时注释与四键断言。
+- **MCU 侧仍只能构建 + 不变式论证**（无运行期驱动）⇒ 真板验证照旧挂 `TESTING.md`。
+  `scripts/check_whitespace.sh` 在本子模组**基线就不干净**（host/ 下多处 >80 列），P7 新引入的三处
+  已顺手修掉（`6a418e63`），其余属既有面、不在本期范围。

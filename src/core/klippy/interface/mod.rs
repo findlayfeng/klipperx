@@ -230,6 +230,52 @@ impl Interface {
         }
     }
 
+    /// Ask the device behind bridge port `index` to reset itself
+    /// ([`CMD_RESET_DEVICE`](devices::serial::CMD_RESET_DEVICE)), the bridge
+    /// forwarding the command to that port.
+    ///
+    /// The reset a **named** bridge-port device gets: it answers the bridge's mux
+    /// itself, so it has an admin channel to receive this. Like `SET_PORT_NODEID`
+    /// the command travels that channel, so only a bridge link carries it.
+    ///
+    /// # Errors
+    /// The device's own error, or [`InterfaceError::Other`] when this interface
+    /// is not a bridge link.
+    pub(crate) fn send_reset_device(&self, index: u8) -> Result<(), InterfaceError> {
+        match &self.transport {
+            Transport::SharedSerial(handle) => handle.send_reset_device(index),
+            Transport::Host(device) => device.send_reset_device(index),
+            _ => Err(InterfaceError::Other(
+                "RESET_DEVICE needs a bridge link (a shared serial port or a host library); \
+                 this interface is neither"
+                    .to_string(),
+            )),
+        }
+    }
+
+    /// Ask the bridge to pulse the lines of port `index`
+    /// ([`CMD_RESET_PORT`](devices::serial::CMD_RESET_PORT)).
+    ///
+    /// The reset a **legacy** bridge-port device gets: it has no admin channel of
+    /// its own, so its bridge's port is the only thing that can reset it. Like
+    /// `SET_PORT_NODEID` the command travels the bridge's admin channel, so only
+    /// a bridge link carries it.
+    ///
+    /// # Errors
+    /// The device's own error, or [`InterfaceError::Other`] when this interface
+    /// is not a bridge link.
+    pub(crate) fn send_reset_port(&self, index: u8) -> Result<(), InterfaceError> {
+        match &self.transport {
+            Transport::SharedSerial(handle) => handle.send_reset_port(index),
+            Transport::Host(device) => device.send_reset_port(index),
+            _ => Err(InterfaceError::Other(
+                "RESET_PORT needs a bridge link (a shared serial port or a host library); \
+                 this interface is neither"
+                    .to_string(),
+            )),
+        }
+    }
+
     /// Create an interface running klipper's host library from `path` on a path
     /// the config says is muxed: the library is given `mux`'s identity and the
     /// reference is attached under `mcu_id` ([`HostDevice::load_mux`]), so its

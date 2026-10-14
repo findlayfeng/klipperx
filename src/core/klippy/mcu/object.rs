@@ -1354,6 +1354,25 @@ impl PrinterObject for McuObject {
                     }
                     return Err(KlippyError::Internal(err));
                 }
+                // A device behind a bridge port has no transport of its own, so
+                // its reset travels the bridge's link — the port-level command
+                // the config chose (`config.bridge_restart`). It goes here,
+                // before the attach pass opens the device: the board is about to
+                // reboot, so the route that pass establishes would be stale, and
+                // `reset_firmware` above is a no-op for it. Resolving the port
+                // against the bridge's firmware port table is where an old
+                // firmware (no port table) or a mismatched oid is refused — a
+                // config error, with the downgrade being `restart_method:
+                // command`.
+                if let Some(restart) = config.bridge_restart {
+                    let printer = self.printer.upgrade().ok_or_else(|| {
+                        KlippyError::Internal(format!(
+                            "MCU '{}': the printer is gone; cannot reset its bridge port",
+                            config.name
+                        ))
+                    })?;
+                    super::restart::reset_bridge_firmware(&printer, &config, restart)?;
+                }
             }
             // A bring-up that follows a firmware restart finds the board
             // rebooting — `command` sent the reset on the live connection

@@ -333,7 +333,20 @@ d. **M2 的复位命令**：名字与参数（要不要带"复位到哪一层"�
 - **与 §5 的偏差**：① 字典端口表暂写死 1 个 host 串口（NAME 字面量 `"uart0"`，未加
   `HOST_BRIDGE_SERIAL_NAME` Kconfig 项——单一 host 串口无变体，留待多端口/其他 arch 后端时
   宏化）；② 探针中断言 `[0x02][0]` 的头形态依赖同测试内先行把端口切到 UNITS（顺序已注释）。
-- **未收口**：存量 flake（`klipper_host_set_uuid() returned -1`，attach 测试异步 dlclose 与
-  重 dlopen 竞速，**基线 21 次复现 2 次**、非本期引入，留独立修复）；复位极性/保持时长未真机
-  验证（RS-232 通用约定，代码已注释）；复位层次与桥自身复位留 P3（§5.6d）；主机侧何时发
-  SET_PORT_NODEID（attach 时序）留 P3。
+- **存量 flake 已定位并收窄**（分支 `agents/fix-host-library-unload-race`）：`klipper_host_set_uuid()
+  returned -1` 的根因是 mux 库路径的测试只在等**裸帧库**的卸载——`wait_for_unload` 写死了
+  `library_path()`，而 muxed-attach 那条异步测试干脆没等——于是下一个用 mux 库的测试可能遇上
+  一份已 `init` 的镜像（身份必须在 `init` 前给，故 `set_uuid` 答 -1）。现在按**路径**等卸载：
+  异步测试用 `wait_for_unload(path)`、同步测试用 `wait_for_unload_blocking(path)`，五条装载真实库
+  的测试（`host_tests` 8 测里的 5 条）返回前都等到本路径的 `Weak` 变死，另两条靠同步析构。
+  **残余**：`Weak` 变死只等价于「最后一个引用已释放」，镜像的 unmap 在 `HostLibrary::drop` 里
+  紧随其后（`dlclose` 在 join 之后）；要让竞态**证到**归零，得让「卸载完成」可观察（测试侧把
+  谓词收紧为「间隔一拍仍为死」，或生产侧在 `Drop` 里显式取走镜像后置完成标志）。「真的重新
+  映射」的功能探针是 `test_the_library_unloads_with_its_last_reference` 的 `took_over_session`
+  断言。
+- **实测**：同一检出（主检出、`cargo test --workspace`）——修前 6 次 4 次红（失败总落在 mux 库
+  的测试上）、概率上明显高于更早记的「基线 21 次 2 次」（新增的 mux 库探针多了一个暴露面）；
+  修后 `host_tests` 单跑 **20/20 绿**，全量闸门 **15/15 绿**（每次均 3179 passed / 0 failed /
+  13 ignored）。
+- **未收口**：复位极性/保持时长未真机验证（RS-232 通用约定，代码已注释）；复位层次与桥自身复位
+  留 P3（§5.6d）；主机侧何时发 SET_PORT_NODEID（attach 时序）留 P3。

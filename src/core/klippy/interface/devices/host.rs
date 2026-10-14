@@ -1144,7 +1144,7 @@ mod host_tests {
         mcu
     }
 
-    /// Wait — bounded — for the shared host library to be unloaded.
+    /// Wait — bounded — for the shared host library at `path` to be unloaded.
     ///
     /// Dropping the last `Interface` does not unload it the very moment the
     /// caller lets go: a transport task that [`Mcu::close`] aborted may still
@@ -1154,20 +1154,53 @@ mod host_tests {
     /// registry's [`Weak`] entry observes. Bounds a hang in a test that would
     /// otherwise leave the library loaded into the next test (which must meet a
     /// fresh firmware, not this one's session).
-    async fn wait_for_unload() {
+    ///
+    /// `path` matters: the plain library and the mux one are two registry
+    /// entries and two images, so a wait on the wrong one returns immediately
+    /// and lets the *next* test on that path meet a library that is still
+    /// initialized — `klipper_host_set_uuid` then answers -1, the identity
+    /// having to be given before `init`.
+    async fn wait_for_unload(path: &Path) {
         for _ in 0..200 {
-            let dead = library_registry()
-                .lock()
-                .unwrap()
-                .get(library_path().as_path())
-                .and_then(Weak::upgrade)
-                .is_none();
-            if dead {
+            if library_unloaded(path) {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        panic!("the host library never unloaded");
+        panic!("the host library at {} never unloaded", path.display());
+    }
+
+    /// The same bounded wait for the tests that are not async. Today's two
+    /// callers hold no transport task, so their drop is synchronous and this
+    /// returns on its first poll; the wait is here to keep the rule — *no test
+    /// leaves an initialized image of this path behind* — true if such a test
+    /// ever grows a reference of its own.
+    fn wait_for_unload_blocking(path: &Path) {
+        for _ in 0..200 {
+            if library_unloaded(path) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("the host library at {} never unloaded", path.display());
+    }
+
+    /// Has every reference to the shared library at `path` been released (its
+    /// registry `Weak` entry is dead)?
+    ///
+    /// Not quite "the image is unmapped": the strong count reaches zero before
+    /// [`HostLibrary`]'s `Drop` has run, and the `dlclose` is inside that. A
+    /// waiter therefore relies on the drop's tail being short — the functional
+    /// probe for "this really is a fresh mapping" is the session-takeover
+    /// assertion in [`test_the_library_unloads_with_its_last_reference`], not
+    /// this predicate.
+    fn library_unloaded(path: &Path) -> bool {
+        library_registry()
+            .lock()
+            .unwrap()
+            .get(path)
+            .and_then(Weak::upgrade)
+            .is_none()
     }
 
     /// The identify handshake against a real klipper inside the library, on a
@@ -1231,6 +1264,15 @@ mod host_tests {
         let interface = mcu.open().expect("the muxed library opens and attaches");
         let mcu = identify_and_clock(&mcu, &interface).await;
         assert!(mcu.is_identified());
+
+        // The attach spawned a transport task; when the references go, that task
+        // may still hold the last `Arc<HostDevice>` (and so the library) while it
+        // unwinds. Wait for *this* path's unload - not the plain library's - so
+        // the next test on it meets a fresh firmware rather than an image whose
+        // `init` has already happened (`klipper_host_set_uuid` then answers -1).
+        drop(mcu);
+        drop(interface);
+        wait_for_unload(&mux_library_path()).await;
     }
 
     #[tokio::test]
@@ -1286,7 +1328,7 @@ mod host_tests {
         // for the unload before returning.
         drop(interface2);
         drop(interface);
-        wait_for_unload().await;
+        wait_for_unload(&library_path()).await;
     }
 
     /// A library is unloaded when its last reference is dropped, and the next
@@ -1316,7 +1358,7 @@ mod host_tests {
         // The last reference is gone (the aborted transport tasks unwind, then
         // [`HostLibrary`]'s `Drop` joins the threads and unmaps the library): the
         // registry entry is dead, and a new open cannot reuse it.
-        wait_for_unload().await;
+        wait_for_unload(&library_path()).await;
         let dead = library_registry()
             .lock()
             .unwrap()
@@ -1339,7 +1381,7 @@ mod host_tests {
         drop(mcu);
         assert_eq!(interface.receive().await, None);
         drop(interface);
-        wait_for_unload().await;
+        wait_for_unload(&library_path()).await;
     }
 
     // =======================================================================
@@ -1607,6 +1649,13 @@ mod host_tests {
             0,
             "an assignment that hands our id to another identity shuts us down"
         );
+
+        // Keep the invariant the mux tests share: this path is unloaded again
+        // before the next test takes it. The drop here is synchronous, so the
+        // wait is a no-op today — it is what keeps the rule true if this test
+        // ever holds a transport task of its own.
+        drop(device);
+        wait_for_unload_blocking(&mux_library_path());
     }
 
     /// Read from the pty's master end for at most `window`: everything the
@@ -1895,5 +1944,10 @@ mod host_tests {
             0,
             "a port-level reset must not take the library down"
         );
+
+        // Same invariant as the device-half test: leave this path unloaded for
+        // whoever takes it next (see `wait_for_unload_blocking`).
+        drop(device);
+        wait_for_unload_blocking(&mux_library_path());
     }
 }
